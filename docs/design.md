@@ -1,0 +1,79 @@
+# nrc compiler design
+
+`nrc` is a single-pass-per-stage, ahead-of-time compiler for a Rust subset. It
+is deliberately small: no external crates, no LLVM, no libc. The whole pipeline
+is `source -> lexer -> parser -> sema -> codegen -> asm text`, after which the
+driver shells out to GNU `as` and `ld`.
+
+## Pipeline
+
+1. **Lexer** (`lexer.rs`) — byte-oriented scanner producing `Token { tok, pos }`.
+   Tracks byte offsets so parse and type errors can report a position.
+2. **Parser** (`parser.rs`) — recursive descent producing the AST in `ast.rs`.
+   Precedence climbing handles binary operators; `is_block_like` lets `if`,
+   `while`, `loop` and bare blocks appear as statements without a trailing `;`.
+3. **Semantic analysis** (`sema.rs`) — checks types, resolves every variable to
+   a stack slot, and records the frame size (`nslots`) per function. Runtime
+   builtins are registered as ordinary signatures here, so calls to them
+   type-check like any other function.
+4. **Code generation** (`codegen.rs`) — emits AT&T-syntax x86-64 assembly. Every
+   expression leaves its result in `%rax`; the result type is returned to the
+   caller so callers know how to use it.
+5. **Assemble and link** (`main.rs`) — writes the assembly, runs `as --64`, then
+   `ld -o <out> --build-id=none <obj>`, with the runtime text prepended.
+
+## Stack layout
+
+Each function prologue is `push %rbp; mov %rsp, %rbp; sub $N, %rsp`. Slots are
+numbered from zero and addressed as `-(slot+1)*8(%rbp)`, so they grow downward
+and never collide with the saved frame pointer or return address above `%rbp`.
+`sub $N` rounds the frame up to a multiple of 16 to keep the stack 16-byte
+aligned for calls.
+
+Arrays occupy `n` consecutive slots. Because slot addresses decrease as the slot
+index rises, an array's element 0 is at the *lowest* address,
+`-(slot+n)*8(%rbp)`, and element `i` is then `base + i*8`. Getting this layout
+consistent between `fill_array`, `gen_addr` and value loading was the source of
+an early miscompile where array writes ran upward past `%rbp`.
+
+## Expression convention
+
+- The result of every expression is in `%rax`.
+- Binary operators evaluate the left operand into `%rax` and the right into
+  `%rcx`, then apply the operation.
+- Operand folding: if an operand is a constant or a scalar local, it is emitted
+  directly as an immediate (`$5`) or memory operand (`-8(%rbp)`) instead of
+  being materialised through the stack. This removes most push/pop traffic.
+- Deep or nested operands fall back to pushing the left result on the stack
+  while the right is evaluated, then popping into `%rax`.
+
+## Control flow
+
+- `while` and `loop` push `(continue_label, break_label)` onto a loop stack so
+  `continue` and `break` can resolve to the innermost loop.
+- `if`/`while` conditions are emitted as a direct `cmp` + `jcc` when the
+  condition is a comparison, instead of materialising a 0/1 and testing it. The
+  negated condition codes are in `invert_cc`.
+
+## Calls
+
+Arguments are evaluated right-to-left and pushed, then popped into the argument
+registers in order. If an odd number of pushes is live, an extra 8-byte pad is
+inserted before the `call` so `%rsp` stays 16-byte aligned. Caller-saved
+registers are not preserved across calls; temporaries always live on the stack.
+
+## Runtime
+
+`runtime.rs` holds a freestanding assembly runtime. `_start` captures `argc` and
+`argv` from the initial stack, calls `main`, and exits via the `exit` syscall
+with `main`'s return value. I/O (`print_i64`, `print_str`, `putchar`), memory
+(`alloc`, an anonymous zero-filled `mmap`), and `arg_i64` are all implemented
+with raw syscalls. Because there is no libc, the resulting ELF is static and
+tiny.
+
+## What is intentionally missing
+
+There is no optimiser beyond the operand folding and comparison folding
+described above. No register allocation, no common-subexpression elimination, no
+inlining, no loop transforms. The compiler is optimised for compile speed and
+simplicity, not for the speed of the code it produces.

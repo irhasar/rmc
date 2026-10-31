@@ -1,0 +1,5 @@
+fn main() -> i64 {
+    print_str("hello from nrc");
+    print_i64(42);
+    return 0;
+}
