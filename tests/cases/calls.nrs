@@ -1,0 +1,31 @@
+// Recursion, nested calls, and a full six-argument call.
+fn add(a: i64, b: i64) -> i64 {
+    return a + b;
+}
+fn six(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -> i64 {
+    return a * 1 + b * 2 + c * 3 + d * 4 + e * 5 + f * 6;
+}
+fn fib(n: i64) -> i64 {
+    if n < 2 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+fn ack(m: i64, n: i64) -> i64 {
+    if m == 0 {
+        return n + 1;
+    }
+    if n == 0 {
+        return ack(m - 1, 1);
+    }
+    return ack(m - 1, ack(m, n - 1));
+}
+fn main() -> i64 {
+    print_i64(add(2, 3));
+    print_i64(add(add(1, 2), add(3, 4)));
+    print_i64(six(1, 2, 3, 4, 5, 6));
+    print_i64(fib(20));
+    print_i64(ack(2, 3));
+    print_i64(ack(3, 3));
+    return 0;
+}

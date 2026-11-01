@@ -1,0 +1,18 @@
+// Output builtins: print_str (adds a newline), putchar, print_i64, print_bool.
+fn main() -> i64 {
+    print_str("hello, world");
+    print_str("");
+    print_str("tab\there");
+    putchar(65);
+    putchar(66);
+    putchar(67);
+    putchar(10);
+    print_i64(0);
+    print_i64(-1);
+    print_i64(-12345);
+    print_i64(9223372036854775807);
+    print_bool(true);
+    print_bool(false);
+    print_bool(3 < 5);
+    return 0;
+}
