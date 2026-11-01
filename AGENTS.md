@@ -24,6 +24,9 @@ cargo build --release --manifest-path compiler/Cargo.toml
 
 # full benchmark suite (writes binaries to /tmp/nrcbench)
 python3 bench/run.py
+
+# differential test suite: nrc vs rustc on twin programs
+python3 tests/run.py -v
 ```
 
 ## Source map
@@ -64,11 +67,21 @@ python3 bench/run.py
   and LLVM are included. It raises if a produced binary exits non-zero, which
   catches the classic "measured a nonexistent path" bug.
 
+## Tests
+
+`tests/run.py` compiles each `tests/cases/NAME.{nrs,rs}` pair with both compilers
+and diffs stdout and the exit status. When adding a case, add both twins, write
+them to behave identically, and remember that `rustc` infers `i32` for unsuffixed
+literals, so large literals need an `i64` suffix on the Rust side. `args.json`
+maps a case name to a list of argv vectors. Verify a new case actually detects
+the bug it guards: revert the fix and confirm the case fails.
+
 ## Scope
 
 This is a research toy. Do not claim it is a general Rust compiler. It supports
-only the subset in `docs/language.md`, has no optimiser beyond operand,
-comparison and array-address folding, and no borrow checker.
+only the subset in `docs/language.md`, has no register allocator and only a
+small peephole optimiser (operand/comparison/array-address folding, constant
+folding, division by a constant), and no borrow checker.
 
 ## Codegen notes
 
@@ -82,3 +95,15 @@ comparison and array-address folding, and no borrow checker.
   `x = x + e` form were both tried and measured *slower* on the Zen cores this
   was tuned on, so they were removed. Keep the plain two-register form unless
   you re-measure on the target CPU.
+- Division or modulo by a literal divisor does not use `idiv`. `gen_div_const`
+  emits the Hacker's Delight magic multiply (the same algorithm LLVM uses),
+  with a sign fixup and, for roughly a quarter of divisors, an extra add of the
+  dividend. Powers of two use a shift with a `2^k-1` sign bias.
+  - **`imul` clobbers `%rax`** with the low product, so the fixups must read the
+    dividend from the `%r8` copy taken before the multiply, not from `%rax`.
+    Using `%rax` here silently produces wrong results for large dividends.
+  - **The sign bias is required** for power-of-two divisors; without it a
+    negative dividend rounds toward negative infinity instead of toward zero.
+  - `small_imm` accepts a negated literal, so `x / -1000` takes the fast path.
+  - `tests/cases/div.{nrs,rs}` covers both variants, powers of two, negatives,
+    and boundary dividends, and is the regression guard for all of the above.

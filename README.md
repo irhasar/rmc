@@ -15,11 +15,13 @@ The point of the experiment is to measure the trade-off at the extremes:
 | compiler peak RSS                | ~12 MB                                | ~188 MB                          |
 | compile time (small programs)    | ~7 ms                                 | ~2.1 s                           |
 | artifact size                    | ~6 KB (static, no libc)               | ~290 KB                          |
-| generated-code quality           | naive, unoptimised                    | highly optimised                 |
+| generated-code quality           | small peephole optimiser              | highly optimised                 |
 
-`nrc` wins big on compile time, compiler memory, and artifact size. Its
-generated code is, as expected from a compiler with no optimiser, slower than
-LLVM's on arithmetic-heavy loops.
+`nrc` wins big on compile time, compiler memory, and artifact size. On runtime
+it is now within a few percent on divide-heavy and array-heavy loops, and still
+loses on call-heavy code where LLVM's register allocator and loop
+transformations (for example turning the naive double-recursive `fib` into a
+loop) do the work a stack-machine code generator cannot.
 
 ## Layout
 
@@ -36,6 +38,10 @@ bench/
   programs/*.nrs     benchmark programs in the nrc subset
   rust/*.rs          the same programs written in real Rust
   run.py             benchmark harness (compile time, CPU, RAM, size, runtime)
+tests/
+  run.py             differential test suite: nrc vs rustc on twin programs
+  cases/*.nrs, *.rs  paired programs that must behave identically
+  args.json          per-case argv vectors (for runtime inputs)
 docs/
   language.md        the supported language subset
   design.md          compiler architecture and code generation notes
@@ -59,6 +65,26 @@ nrc input.nrs --emit-asm         # print the generated assembly to stdout
 
 Run the produced binary directly; it is a static ELF executable with no
 dynamic dependencies.
+
+## Testing
+
+`tests/run.py` is a differential test suite. Every case is a pair of programs,
+`tests/cases/NAME.nrs` and `tests/cases/NAME.rs`, written to behave identically;
+the runner compiles both, runs them, and fails if stdout or the exit status
+differs. `tests/args.json` optionally maps a case to argv vectors so the same
+program is exercised with several runtime inputs.
+
+```sh
+python3 tests/run.py -v
+```
+
+The suite covers arithmetic and division semantics (including divisors that need
+the magic-multiply add fixup and powers of two), every comparison operator with
+the immediate on either side, boolean short-circuiting, control flow, arrays,
+calls and recursion, the output builtins, and nested expressions. It is
+deliberately adversarial: reverting the folded-comparison operand-order fix
+makes the `cmp` case fail, and dropping the sign bias from division by a power
+of two makes the `div` case fail.
 
 ## Language subset
 
@@ -116,31 +142,32 @@ Representative run on the development machine (Debian 13, gcc 14.2, rustc
 
 | program | compiler | compile wall | compile CPU | peak RSS | artifact | run time |
 | ------- | -------- | -----------: | ----------: | -------: | -------: | -------: |
-| hello   | nrc      |     6.97 ms  |    6.75 ms  |  11.7 MB |   5848 B |  1.55 ms |
-| hello   | rustc    |  2055.01 ms  | 2058.05 ms  | 182.7 MB | 289416 B |  2.14 ms |
-| fib     | nrc      |     6.71 ms  |    6.50 ms  |  11.7 MB |   5904 B | 15.56 ms |
-| fib     | rustc    |  2077.26 ms  | 2081.11 ms  | 182.9 MB | 291696 B |  8.46 ms |
-| mandel  | nrc      |     6.84 ms  |    6.61 ms  |  11.7 MB |   6160 B |153.61 ms |
-| mandel  | rustc    |  2071.83 ms  | 2075.69 ms  | 185.0 MB | 291776 B |107.02 ms |
-| sieve   | nrc      |     6.88 ms  |    6.65 ms  |  11.7 MB |   6024 B |  3.19 ms |
-| sieve   | rustc    |  2103.50 ms  | 2107.02 ms  | 182.9 MB | 292016 B |  3.89 ms |
-| mix     | nrc      |     7.15 ms  |    6.80 ms  |  11.7 MB |   5992 B | 18.41 ms |
-| mix     | rustc    |  2137.37 ms  | 2140.42 ms  | 183.8 MB | 291864 B | 16.84 ms |
+| hello   | nrc      |     7.80 ms  |    7.03 ms  |  11.8 MB |   5848 B |  1.87 ms |
+| hello   | rustc    |  2079.99 ms  | 2082.03 ms  | 182.9 MB | 289416 B |  2.40 ms |
+| fib     | nrc      |     7.95 ms  |    7.49 ms  |  11.8 MB |   5888 B | 15.72 ms |
+| fib     | rustc    |  2115.85 ms  | 2119.49 ms  | 183.6 MB | 291696 B |  8.68 ms |
+| mandel  | nrc      |     7.01 ms  |    6.75 ms  |  11.8 MB |   6184 B |105.17 ms |
+| mandel  | rustc    |  2116.81 ms  | 2121.21 ms  | 184.6 MB | 291776 B |107.12 ms |
+| sieve   | nrc      |     6.99 ms  |    6.70 ms  |  11.8 MB |   6008 B |  3.15 ms |
+| sieve   | rustc    |  2089.10 ms  | 2092.67 ms  | 184.9 MB | 292016 B |  4.03 ms |
+| mix     | nrc      |     6.87 ms  |    6.60 ms  |  11.8 MB |   5976 B | 18.82 ms |
+| mix     | rustc    |  2107.53 ms  | 2111.46 ms  | 184.2 MB | 291864 B | 16.89 ms |
 
 Summary of the ratios (rustc ÷ nrc):
 
 | dimension        | ratio      |
 | ---------------- | ---------: |
-| compile wall     | ~295–310×  |
-| compile CPU      | ~305–320×  |
-| compiler peak RSS| ~15.7×     |
+| compile wall     | ~266–307×  |
+| compile CPU      | ~283–320×  |
+| compiler peak RSS| ~15.6×     |
 | artifact size    | ~47–50×    |
-| run time         | 0.7–1.4× (rustc faster on compute-bound loops) |
+| run time         | 0.9–1.8× (rustc faster on call-heavy code) |
 
 `nrc` beats rustc on `sieve` because the whole workload is a tight array loop
 that the simple code generator already handles well, and the static binary has
-no libc startup. On `fib` (call-heavy) and `mandel` (multiply/divide-heavy)
-LLVM's register allocation and loop optimisation win.
+no libc startup. `mandel` is now a dead heat after division by a constant became
+a multiply-and-shift. On `fib` (call-heavy) and `mix` (register-pressure-heavy)
+LLVM's register allocation and loop optimisation still win.
 
 ### Reproducing the comparison honestly
 
@@ -157,9 +184,11 @@ This is a research toy, not a drop-in Rust compiler.
 - The language subset is tiny (see `docs/language.md`); no structs, enums,
   traits, generics, `match`, references, borrowing, or the standard library.
 - Code generation is a straightforward stack machine. There is no register
-  allocator, no instruction scheduling, and only a small amount of peephole
-  folding (constants and locals become immediate/memory operands, comparisons
-  become direct `cmp`/`jcc`).
+  allocator and no instruction scheduling. The optimiser is a small peephole
+  pass: constants and locals become immediate/memory operands, comparisons
+  become a single `cmp`/`setcc`, array addressing folds into `disp(%rbp,%rax,8)`,
+  call arguments load straight from their operands, and division by a constant
+  becomes a magic multiply and shift instead of `idiv`.
 - Arrays live on the stack; there is no heap except the bump allocator.
 - `nrc` reads and writes programs that use `i64` and `bool`; there is no
   overflow checking, and division by zero traps at the CPU level.

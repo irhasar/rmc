@@ -44,6 +44,11 @@ an early miscompile where array writes ran upward past `%rbp`.
 - Operand folding: if an operand is a constant or a scalar local, it is emitted
   directly as an immediate (`$5`) or memory operand (`-8(%rbp)`) instead of
   being materialised through the stack. This removes most push/pop traffic.
+- Constant folding: a small integer literal on the right of `+`, `-`, `*`, `/`
+  or `%` folds into the instruction itself, so `x - 200` is `mov; sub $200`
+  rather than three instructions. `small_imm` also accepts a negated literal.
+- Division by a constant: `a / d` and `a % d` for a literal `d` become a magic
+  multiply plus a shift instead of `idiv`. See below.
 - Comparison folding: `a < b` emits a single `cmp` plus `setcc` when one side is
   a register-free operand, so no stack traffic is needed at all.
 - Array access: for a local array, `a[i]` with a variable index is addressed as
@@ -51,6 +56,31 @@ an early miscompile where array writes ran upward past `%rbp`.
   `a[3]` with a constant index needs no register. Stores use the same operand.
 - Deep or nested operands fall back to pushing the left result on the stack
   while the right is evaluated, then popping into `%rax`.
+
+### Division by a constant
+
+`idiv` is one of the slowest x86 instructions, roughly 20–40 cycles and not
+fully pipelined, and `mandel.nrs` divides three times per inner iteration. When
+the divisor is a literal, `gen_div_const` replaces it with the Hacker's Delight
+"magic number" method, the same algorithm LLVM uses:
+
+```text
+t = high64(signed(m) * x);  if add { t += x }  t >>= s
+q = t + (x >> 63)                       # sign fixup
+```
+
+`m`, `s`, and the `add` flag come from `sdiv_magic`. For roughly a quarter of
+divisors the multiplier is large enough that an extra add of the dividend is
+needed; powers of two take a separate path that is a shift plus a `2^k-1` sign
+bias. Two details are easy to get wrong and are covered by `tests/cases/div`:
+
+- `imul` overwrites `%rax` with the low product, so the fixups read the dividend
+  from a `%r8` copy taken before the multiply.
+- The sign bias is mandatory for power-of-two divisors, because an arithmetic
+  shift rounds toward negative infinity while integer division rounds toward
+  zero.
+
+Modulo reuses the quotient: `q * d - dividend` gives the remainder.
 
 ## Control flow
 
@@ -85,7 +115,9 @@ tiny.
 
 ## What is intentionally missing
 
-There is no optimiser beyond the operand folding and comparison folding
-described above. No register allocation, no common-subexpression elimination, no
-inlining, no loop transforms. The compiler is optimised for compile speed and
-simplicity, not for the speed of the code it produces.
+There is no optimiser beyond the folding described above. No register
+allocation, no common-subexpression elimination, no inlining, no loop
+transforms. The compiler is optimised for compile speed and simplicity, not for
+the speed of the code it produces. The one non-trivial peephole is division by a
+constant, which was worth a 1.4x speedup on `mandel.nrs`; everything else is
+local and cheap to compute.
