@@ -79,8 +79,12 @@ def main():
         for argv in args.get(name, [[]]):
             nrc_res, rust_res = compile_and_run(name, argv)
             for which, res in (("nrc", nrc_res), ("rustc", rust_res)):
-                if res[0] == "error":
+                if res[0] == "error" and res[1] != "not run":
                     print(f"FAIL {name} {argv}: {which}: {res[1]}")
+                    failures += 1
+                    break
+                if res[0] == "error":
+                    print(f"FAIL {name} {argv}: {which} did not run ({nrc_res if which == 'rustc' else rust_res})")
                     failures += 1
                     break
             else:
@@ -89,8 +93,17 @@ def main():
                 if nrc_out != rust_out or nrc_status != rust_status:
                     failures += 1
                     print(f"FAIL {name} {argv}")
-                    print(f"  nrc   exit={nrc_status} out={nrc_out!r}")
-                    print(f"  rustc exit={rust_status} out={rust_out!r}")
+                    print(f"  exit nrc={nrc_status} rustc={rust_status}")
+                    nrc_lines = nrc_out.split(b"\n")
+                    rust_lines = rust_out.split(b"\n")
+                    for i in range(max(len(nrc_lines), len(rust_lines))):
+                        a = nrc_lines[i] if i < len(nrc_lines) else b"<missing>"
+                        b = rust_lines[i] if i < len(rust_lines) else b"<missing>"
+                        if a != b:
+                            print(f"  first difference at output line {i + 1}:")
+                            print(f"    nrc   = {a!r}")
+                            print(f"    rustc = {b!r}")
+                            break
                 elif verbose:
                     print(f"ok   {name} {argv}")
 

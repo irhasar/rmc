@@ -472,9 +472,14 @@ impl Codegen {
             return Type::Bool;
         }
 
-        // Division/modulo: the dividend must be in `%rax` and the divisor in a
-        // register, so there is no operand-folding shortcut.
+        // Division/modulo by a constant becomes a multiply, an arithmetic
+        // shift and a sign fixup instead of a ~30-cycle `idiv`; by a variable
+        // there is no shortcut, since the dividend must be in `%rax` and the
+        // divisor in a register.
         if matches!(op, Div | Mod) {
+            if self.gen_div_const(op, a, b) {
+                return Type::I64;
+            }
             self.eval_operands(a, b);
             self.line("cqto");
             self.line("idiv %rcx");
@@ -485,8 +490,31 @@ impl Codegen {
         }
 
         // Add/Sub/Mul: keep the left operand in `%rax` and the right in `%rcx`.
-        // Folding a memory operand straight into `imul`/`add` measured slower on
-        // the cores this was tuned on, so the plain two-register form is used.
+        // A small constant operand folds straight into the instruction, which
+        // saves the constant load. Folding a *memory* operand into `imul`/`add`
+        // measured slower on the cores this was tuned on, so only immediates
+        // are folded.
+        let (imm, other) = match Self::small_imm(b) {
+            Some(k) => (Some(k), a),
+            // Commutative ops accept the constant on either side; subtraction
+            // does not, because `c - x` is not `x - c`.
+            None if matches!(op, Add | Mul) => match Self::small_imm(a) {
+                Some(k) => (Some(k), b),
+                None => (None, a),
+            },
+            None => (None, a),
+        };
+        if let Some(k) = imm {
+            self.gen_expr(other);
+            match op {
+                Add => self.line(&format!("add ${k}, %rax")),
+                Sub => self.line(&format!("sub ${k}, %rax")),
+                Mul => self.line(&format!("imul ${k}, %rax, %rax")),
+                _ => unreachable!(),
+            }
+            return Type::I64;
+        }
+
         self.eval_operands(a, b);
         match op {
             Add => self.line("add %rcx, %rax"),
@@ -495,6 +523,126 @@ impl Codegen {
             _ => unreachable!(),
         }
         Type::I64
+    }
+
+    /// The value of `e` when it is an integer literal, negated or not, that fits
+    /// in an `imm32`.
+    fn small_imm(e: &Expr) -> Option<i64> {
+        match e {
+            Expr::Int(v) if (-2_147_483_648..=2_147_483_647).contains(v) => Some(*v),
+            Expr::Un(UnOp::Neg, inner) => match inner.as_ref() {
+                Expr::Int(v) => v
+                    .checked_neg()
+                    .filter(|n| (-2_147_483_648..=2_147_483_647).contains(n)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Emit `a / d` or `a % d` for a literal divisor `d` using a multiply and a
+    /// shift instead of `idiv`. Returns `false` for a variable divisor, a zero
+    /// divisor, or a non-`i64` literal, so the caller falls back to `idiv`.
+    ///
+    /// `D` stays in `%rax` until the quotient or remainder is known; `%rdx` and
+    /// `%r8` are scratch.
+    fn gen_div_const(&mut self, op: BinOp, a: &Expr, b: &Expr) -> bool {
+        let d = match Self::small_imm(b) {
+            Some(v) if v != 0 => v,
+            _ => return false,
+        };
+        self.gen_expr(a);
+        self.line("mov %rax, %r8");
+        if d == 1 {
+            // The dividend is already in %rax.
+        } else if d == -1 {
+            self.line("neg %rax");
+        } else {
+            let mag = d.unsigned_abs();
+            if mag.is_power_of_two() {
+                // `d` is ±2^k. Arithmetic shift rounds toward -inf, so a
+                // negative dividend needs a bias of 2^k-1 to round toward zero:
+                // `%rdx` is 0 or -1 from the sign, then masked to 0 or 2^k-1.
+                let k = mag.trailing_zeros();
+                self.line("mov %rax, %rdx");
+                self.line("sar $63, %rdx");
+                self.line(&format!("shr ${}, %rdx", 64 - k));
+                self.line("add %rdx, %rax");
+                self.line(&format!("sar ${k}, %rax"));
+                if d < 0 {
+                    self.line("neg %rax");
+                }
+            } else {
+                let (m, s, add) = Self::sdiv_magic(mag);
+                self.line(&format!("movabs ${m}, %rcx"));
+                self.line("imul %rcx");
+                if add {
+                    // `imul` clobbers %rax with the low product, so the
+                    // dividend comes from the %r8 copy, not from %rax.
+                    self.line("add %r8, %rdx");
+                }
+                if s > 0 {
+                    self.line(&format!("sar ${s}, %rdx"));
+                }
+                self.line("mov %r8, %rcx");
+                self.line("shr $63, %rcx");
+                self.line("add %rcx, %rdx");
+                if d < 0 {
+                    self.line("neg %rdx");
+                }
+                self.line("mov %rdx, %rax");
+            }
+        }
+        if matches!(op, BinOp::Mod) {
+            self.line("mov %rax, %rdx");
+            self.line(&format!("movabs ${d}, %rcx"));
+            self.line("imul %rcx, %rdx");
+            self.line("sub %rdx, %r8");
+            self.line("mov %r8, %rax");
+        }
+        true
+    }
+
+    /// Magic multiplier and shift for signed division by `d > 1`, from Hacker's
+    /// Delight via LLVM's `SignedDivisionByConstantInfo`. For a dividend `x`:
+    ///
+    /// ```text
+    /// t = high64(signed(m) * x);  if add { t += x }  t >>= s
+    /// q = t + (x >> 63)
+    /// ```
+    ///
+    /// `add` is needed for roughly a quarter of divisors.
+    fn sdiv_magic(d: u64) -> (i64, u32, bool) {
+        const N: u32 = 64;
+        let smin: u128 = 1u128 << (N - 1);
+        let ad = d as u128;
+        // NC is the largest dividend whose remainder modulo `d` is `d - 1`.
+        let anc = smin - 1 - (smin % ad);
+        let (mut q1, mut r1) = (smin / anc, smin % anc);
+        let (mut q2, mut r2) = (smin / ad, smin % ad);
+        let mut p = N - 1;
+        loop {
+            p += 1;
+            q1 <<= 1;
+            r1 <<= 1;
+            if r1 >= anc {
+                q1 += 1;
+                r1 -= anc;
+            }
+            q2 <<= 1;
+            r2 <<= 1;
+            if r2 >= ad {
+                q2 += 1;
+                r2 -= ad;
+            }
+            let delta = ad - r2;
+            if !(q1 < delta || (q1 == delta && r1 == 0)) {
+                break;
+            }
+        }
+        let m = q2 + 1;
+        let add = m > i64::MAX as u128;
+        (m as i64, p - N, add)
     }
 
     /// An operand `disp(%rbp,%rax,8)` for `base[idx]` where `base` is a local
