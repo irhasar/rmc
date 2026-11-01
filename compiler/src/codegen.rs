@@ -170,12 +170,43 @@ impl Codegen {
                         self.gen_expr(value);
                         self.line(&format!("mov %rax, {}(%rbp)", Self::off(*slot)));
                     }
-                    Expr::Index(..) => {
-                        self.gen_addr(target);
-                        self.push_rax();
-                        self.gen_expr(value);
-                        self.pop_to("%rcx");
-                        self.line("mov %rax, (%rcx)");
+                    Expr::Index(base, idx) => {
+                        match Self::array_elem_operand(base, idx) {
+                            // Constant index: one store.
+                            Some(op) if !op.contains("%rax") => {
+                                self.gen_expr(value);
+                                self.line(&format!("mov %rax, {op}"));
+                            }
+                            // Variable index: load the index into %rax, then
+                            // store through `disp(%rbp,%rax,8)`.
+                            Some(op) => {
+                                match Self::simple_operand(value) {
+                                    Some(vs) if vs.starts_with('$') => {
+                                        self.gen_expr(idx);
+                                        self.line(&format!("movq {vs}, {op}"));
+                                    }
+                                    Some(vs) => {
+                                        self.gen_expr(idx);
+                                        self.line(&format!("mov {vs}, %rcx"));
+                                        self.line(&format!("mov %rcx, {op}"));
+                                    }
+                                    None => {
+                                        self.gen_expr(value);
+                                        self.push_rax();
+                                        self.gen_expr(idx);
+                                        self.pop_to("%rcx");
+                                        self.line(&format!("mov %rcx, {op}"));
+                                    }
+                                }
+                            }
+                            None => {
+                                self.gen_addr(target);
+                                self.push_rax();
+                                self.gen_expr(value);
+                                self.pop_to("%rcx");
+                                self.line("mov %rax, (%rcx)");
+                            }
+                        }
                     }
                     _ => unreachable!("sema guarantees a valid assignment target"),
                 }
@@ -305,8 +336,20 @@ impl Codegen {
                     Expr::Var { ty: Type::Array(e, _), .. } => (**e).clone(),
                     _ => Type::I64,
                 };
-                self.gen_addr(e);
-                self.line("mov (%rax), %rax");
+                match Self::array_elem_operand(base, _idx) {
+                    // `disp(%rbp,%reg,8)` addresses the element in one operand.
+                    Some(op) if op.contains("%rax") => {
+                        self.gen_expr(_idx);
+                        self.line(&format!("mov {op}, %rax"));
+                    }
+                    Some(op) => {
+                        self.line(&format!("mov {op}, %rax"));
+                    }
+                    None => {
+                        self.gen_addr(e);
+                        self.line("mov (%rax), %rax");
+                    }
+                }
                 elem
             }
             Expr::Un(op, inner) => {
@@ -357,8 +400,10 @@ impl Codegen {
         }
     }
 
-    /// Recognise an operand that can be used directly as an x86 memory or
-    /// immediate operand, avoiding a load into `%rax` and a push/pop pair.
+    /// An operand usable directly in an instruction without touching any
+    /// register: an immediate, a scalar local, or an array element with a
+    /// constant index. Anything needing a register (a variable index) returns
+    /// `None` so the caller falls back to materialising the value in `%rax`.
     fn simple_operand(e: &Expr) -> Option<String> {
         match e {
             Expr::Int(v) if (-2_147_483_648..=2_147_483_647).contains(v) => Some(format!("${v}")),
@@ -367,6 +412,13 @@ impl Codegen {
                 Type::Array(..) => None,
                 _ => Some(format!("{}(%rbp)", Self::off(*slot))),
             },
+            Expr::Index(base, idx) => {
+                match Self::array_elem_operand(base, idx) {
+                    // Only register-free operands are usable here.
+                    Some(op) if !op.contains("%rax") => Some(op),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
@@ -408,34 +460,105 @@ impl Codegen {
             _ => {}
         }
 
-        // Fold constant and local operands into the instructions as immediate
-        // or memory operands instead of routing them through the stack.
-        self.eval_operands(a, b);
+        // Comparisons: a direct `cmp`/`setcc` pair. When one side is a
+        // register-free operand the comparison needs no stack traffic at all.
+        if matches!(op, Eq | Ne | Lt | Le | Gt | Ge) {
+            if !self.emit_cmp(a, b) {
+                self.eval_operands(a, b);
+                self.line("cmp %rcx, %rax");
+            }
+            self.line(&format!("{} %al", setcc(op)));
+            self.line("movzbq %al, %rax");
+            return Type::Bool;
+        }
 
+        // Division/modulo: the dividend must be in `%rax` and the divisor in a
+        // register, so there is no operand-folding shortcut.
+        if matches!(op, Div | Mod) {
+            self.eval_operands(a, b);
+            self.line("cqto");
+            self.line("idiv %rcx");
+            if matches!(op, Mod) {
+                self.line("mov %rdx, %rax");
+            }
+            return Type::I64;
+        }
+
+        // Add/Sub/Mul: keep the left operand in `%rax` and the right in `%rcx`.
+        // Folding a memory operand straight into `imul`/`add` measured slower on
+        // the cores this was tuned on, so the plain two-register form is used.
+        self.eval_operands(a, b);
         match op {
             Add => self.line("add %rcx, %rax"),
             Sub => self.line("sub %rcx, %rax"),
             Mul => self.line("imul %rcx, %rax"),
-            Div => {
-                self.line("cqto");
-                self.line("idiv %rcx");
-            }
-            Mod => {
-                self.line("cqto");
-                self.line("idiv %rcx");
-                self.line("mov %rdx, %rax");
-            }
-            Eq | Ne | Lt | Le | Gt | Ge => {
-                self.line("cmp %rcx, %rax");
-                self.line(&format!("{} %al", setcc(op)));
-                self.line("movzbq %al, %rax");
-                return Type::Bool;
-            }
-            And | Or => unreachable!(),
+            _ => unreachable!(),
         }
-        match op {
-            Eq | Ne | Lt | Le | Gt | Ge => Type::Bool,
-            _ => Type::I64,
+        Type::I64
+    }
+
+    /// An operand `disp(%rbp,%rax,8)` for `base[idx]` where `base` is a local
+    /// array. The caller must have the index value in `%rax`. Returns `None`
+    /// for anything else, so the caller falls back to computing the address.
+    fn array_elem_operand(base: &Expr, idx: &Expr) -> Option<String> {
+        let (slot, n) = match base {
+            Expr::Var { slot, ty: Type::Array(_, n), .. } => (*slot, *n),
+            _ => return None,
+        };
+        match idx {
+            Expr::Int(v) if (-2_147_483_648..=2_147_483_647).contains(v) => {
+                // Constant index: no register needed at all.
+                Some(format!("{}(%rbp)", Self::array_off(slot, n) + *v as i32 * 8))
+            }
+            Expr::Var { slot: _, ty: Type::I64, .. } => {
+                // The index lives in a slot; the caller must load it into %rax
+                // and bake the array base offset into the displacement.
+                Some(format!("{}(%rbp,%rax,8)", Self::array_off(slot, n)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Emit a `cmp` that leaves the flags for `a op b` (i.e. `a - b`). Returns
+    /// false when neither operand can be named without a register. Immediate
+    /// and memory operands get an explicit `q` suffix where x86 requires it,
+    /// and two-memory or two-immediate forms fall back to a register.
+    fn emit_cmp(&mut self, a: &Expr, b: &Expr) -> bool {
+        let av = Self::simple_operand(a);
+        let bv = Self::simple_operand(b);
+        match (av, bv) {
+            (Some(x), Some(y)) => {
+                let xi = x.starts_with('$');
+                let yi = y.starts_with('$');
+                if xi && yi {
+                    self.line(&format!("mov {x}, %rax"));
+                    self.line(&format!("cmp {y}, %rax"));
+                } else if xi {
+                    self.line(&format!("cmpq {x}, {y}"));
+                } else if yi {
+                    self.line(&format!("cmpq {y}, {x}"));
+                } else {
+                    self.gen_expr(b);
+                    self.line(&format!("cmp %rax, {x}"));
+                }
+                true
+            }
+            (Some(x), None) => {
+                self.gen_expr(b);
+                if x.starts_with('$') {
+                    self.line(&format!("mov {x}, %rcx"));
+                    self.line("cmp %rax, %rcx");
+                } else {
+                    self.line(&format!("cmp %rax, {x}"));
+                }
+                true
+            }
+            (None, Some(y)) => {
+                self.gen_expr(a);
+                self.line(&format!("cmp {y}, %rax"));
+                true
+            }
+            (None, None) => false,
         }
     }
 
@@ -474,8 +597,10 @@ impl Codegen {
     fn gen_branch_false(&mut self, cond: &Expr, target: &str) {
         if let Expr::Bin(op, a, b) = cond {
             if let Some(cc) = invert_cc(*op) {
-                self.eval_operands(a, b);
-                self.line("cmp %rcx, %rax");
+                if !self.emit_cmp(a, b) {
+                    self.eval_operands(a, b);
+                    self.line("cmp %rcx, %rax");
+                }
                 self.line(&format!("{cc} {target}"));
                 return;
             }
@@ -484,8 +609,10 @@ impl Codegen {
         if let Expr::Un(UnOp::Not, inner) = cond {
             if let Expr::Bin(op, a, b) = inner.as_ref() {
                 if let Some(cc) = setcc_cc(*op) {
-                    self.eval_operands(a, b);
-                    self.line("cmp %rcx, %rax");
+                    if !self.emit_cmp(a, b) {
+                        self.eval_operands(a, b);
+                        self.line("cmp %rcx, %rax");
+                    }
                     self.line(&format!("{cc} {target}"));
                     return;
                 }
@@ -497,15 +624,29 @@ impl Codegen {
     }
 
     fn gen_call(&mut self, name: &str, args: &[Expr]) -> Type {
-        // Evaluate arguments right-to-left and push them, so that after popping
-        // they land in the ABI registers in the correct order.
-        for a in args.iter().rev() {
-            self.gen_expr(a);
-            self.push_rax();
-        }
         const ARG_REGS: [&str; 6] = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"];
-        for r in ARG_REGS.iter().take(args.len()) {
-            self.pop_to(r);
+        // Simple arguments evaluate with a single load that touches neither
+        // `%rcx` nor `%rdx`, so they can go straight into the argument
+        // registers for any arity. For one or two arguments the registers used
+        // are `%rdi`/`%rsi`, which expression evaluation never clobbers, so any
+        // argument without a nested call is safe too.
+        let direct = args.iter().all(Self::arg_is_simple)
+            || (args.len() <= 2 && !args.iter().any(Self::contains_call));
+        if direct {
+            for (a, r) in args.iter().zip(ARG_REGS.iter()) {
+                self.gen_expr(a);
+                self.line(&format!("mov %rax, {r}"));
+            }
+        } else {
+            // Evaluate arguments right-to-left and push them, so that after
+            // popping they land in the ABI registers in the correct order.
+            for a in args.iter().rev() {
+                self.gen_expr(a);
+                self.push_rax();
+            }
+            for r in ARG_REGS.iter().take(args.len()) {
+                self.pop_to(r);
+            }
         }
         let pad = self.sp_off % 2 != 0;
         if pad {
@@ -518,6 +659,49 @@ impl Codegen {
         // Return type is resolved by sema; nrc runtime helpers return i64.
         Type::I64
     }
+
+    /// An argument that loads into a register without using the `%rcx`/`%rdx`
+    /// scratch registers that later arguments would clobber.
+    fn arg_is_simple(e: &Expr) -> bool {
+        Self::simple_operand(e).is_some() || matches!(e, Expr::Str(_))
+    }
+
+    /// True when evaluating `e` may perform a call.
+    fn contains_call(e: &Expr) -> bool {
+        match e {
+            Expr::Call(..) => true,
+            Expr::Bin(_, a, b) => Self::contains_call(a) || Self::contains_call(b),
+            Expr::Un(_, a) | Expr::Cast(a, _) => Self::contains_call(a),
+            Expr::Index(a, b) => Self::contains_call(a) || Self::contains_call(b),
+            Expr::If(c, t, els) => {
+                Self::contains_call(c)
+                    || Self::block_has_call(t)
+                    || els.as_ref().map_or(false, Self::block_has_call)
+            }
+            Expr::Block(b) => Self::block_has_call(b),
+            _ => false,
+        }
+    }
+
+    fn block_has_call(b: &Block) -> bool {
+        b.stmts.iter().any(Self::stmt_has_call)
+            || b.tail.as_deref().map_or(false, Self::contains_call)
+    }
+
+    fn stmt_has_call(s: &Stmt) -> bool {
+        match s {
+            Stmt::Let { init, .. } => init.as_ref().map_or(false, Self::contains_call),
+            Stmt::Assign { target, value } => {
+                Self::contains_call(target) || Self::contains_call(value)
+            }
+            Stmt::Expr(e) => Self::contains_call(e),
+            Stmt::Return(v) => v.as_ref().map_or(false, Self::contains_call),
+            // A loop body might call on some iteration; be conservative.
+            Stmt::While(..) | Stmt::Loop(..) => true,
+            Stmt::Break | Stmt::Continue => false,
+        }
+    }
+
 }
 
 /// The `setcc` mnemonic for a comparison operator.

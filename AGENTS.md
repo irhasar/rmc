@@ -67,5 +67,18 @@ python3 bench/run.py
 ## Scope
 
 This is a research toy. Do not claim it is a general Rust compiler. It supports
-only the subset in `docs/language.md`, has no optimiser beyond operand and
-comparison folding, and no borrow checker.
+only the subset in `docs/language.md`, has no optimiser beyond operand,
+comparison and array-address folding, and no borrow checker.
+
+## Codegen notes
+
+- Every expression leaves its result in `%rax`; `%rcx`/`%rdx` are the only
+  scratch registers used. No other register is written by expression code, which
+  is what makes the direct-argument call shortcut safe (see `gen_call`).
+- `simple_operand` returns operands usable with no register at all: immediates,
+  scalar locals, and constant-index array elements. `array_elem_operand` returns
+  the `disp(%rbp,%rax,8)` form whose index must first be loaded into `%rax`.
+- Folding arithmetic memory operands into `add`/`imul` and the in-place
+  `x = x + e` form were both tried and measured *slower* on the Zen cores this
+  was tuned on, so they were removed. Keep the plain two-register form unless
+  you re-measure on the target CPU.

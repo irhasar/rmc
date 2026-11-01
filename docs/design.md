@@ -44,6 +44,11 @@ an early miscompile where array writes ran upward past `%rbp`.
 - Operand folding: if an operand is a constant or a scalar local, it is emitted
   directly as an immediate (`$5`) or memory operand (`-8(%rbp)`) instead of
   being materialised through the stack. This removes most push/pop traffic.
+- Comparison folding: `a < b` emits a single `cmp` plus `setcc` when one side is
+  a register-free operand, so no stack traffic is needed at all.
+- Array access: for a local array, `a[i]` with a variable index is addressed as
+  `disp(%rbp,%rax,8)` in one operand (the index is loaded into `%rax` first), and
+  `a[3]` with a constant index needs no register. Stores use the same operand.
 - Deep or nested operands fall back to pushing the left result on the stack
   while the right is evaluated, then popping into `%rax`.
 
@@ -61,6 +66,13 @@ Arguments are evaluated right-to-left and pushed, then popped into the argument
 registers in order. If an odd number of pushes is live, an extra 8-byte pad is
 inserted before the `call` so `%rsp` stays 16-byte aligned. Caller-saved
 registers are not preserved across calls; temporaries always live on the stack.
+
+Two shortcuts avoid the push/pop round trip: when every argument is a constant,
+scalar, or string literal it is loaded straight into its argument register, and
+when there are at most two arguments and none contains a call, they are
+evaluated directly into `%rdi`/`%rsi`. Both are safe because expression
+evaluation never writes `%rdi`/`%rsi`; only the `%rcx`/`%rdx` scratch registers
+are clobbered, which is why the simple-operand test matters for wider calls.
 
 ## Runtime
 

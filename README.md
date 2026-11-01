@@ -116,26 +116,26 @@ Representative run on the development machine (Debian 13, gcc 14.2, rustc
 
 | program | compiler | compile wall | compile CPU | peak RSS | artifact | run time |
 | ------- | -------- | -----------: | ----------: | -------: | -------: | -------: |
-| hello   | nrc      |     7.12 ms  |    6.85 ms  |  11.8 MB |   5840 B |  1.53 ms |
-| hello   | rustc    |  2062.09 ms  | 2065.35 ms  | 187.1 MB | 289416 B |  2.19 ms |
-| fib     | nrc      |     6.82 ms  |    6.60 ms  |  11.8 MB |   5912 B | 16.70 ms |
-| fib     | rustc    |  2096.99 ms  | 2100.78 ms  | 187.9 MB | 291696 B |  8.50 ms |
-| mandel  | nrc      |     6.92 ms  |    6.70 ms  |  11.8 MB |   6184 B |149.57 ms |
-| mandel  | rustc    |  2068.98 ms  | 2073.19 ms  | 192.3 MB | 291776 B |106.77 ms |
-| sieve   | nrc      |     7.22 ms  |    6.91 ms  |  11.8 MB |   6064 B |  3.27 ms |
-| sieve   | rustc    |  2087.31 ms  | 2091.77 ms  | 188.2 MB | 292016 B |  3.83 ms |
-| mix     | nrc      |     6.89 ms  |    6.65 ms  |  11.8 MB |   6008 B | 18.69 ms |
-| mix     | rustc    |  2068.76 ms  | 2071.55 ms  | 188.3 MB | 291864 B | 16.87 ms |
+| hello   | nrc      |     6.97 ms  |    6.75 ms  |  11.7 MB |   5848 B |  1.55 ms |
+| hello   | rustc    |  2055.01 ms  | 2058.05 ms  | 182.7 MB | 289416 B |  2.14 ms |
+| fib     | nrc      |     6.71 ms  |    6.50 ms  |  11.7 MB |   5904 B | 15.56 ms |
+| fib     | rustc    |  2077.26 ms  | 2081.11 ms  | 182.9 MB | 291696 B |  8.46 ms |
+| mandel  | nrc      |     6.84 ms  |    6.61 ms  |  11.7 MB |   6160 B |153.61 ms |
+| mandel  | rustc    |  2071.83 ms  | 2075.69 ms  | 185.0 MB | 291776 B |107.02 ms |
+| sieve   | nrc      |     6.88 ms  |    6.65 ms  |  11.7 MB |   6024 B |  3.19 ms |
+| sieve   | rustc    |  2103.50 ms  | 2107.02 ms  | 182.9 MB | 292016 B |  3.89 ms |
+| mix     | nrc      |     7.15 ms  |    6.80 ms  |  11.7 MB |   5992 B | 18.41 ms |
+| mix     | rustc    |  2137.37 ms  | 2140.42 ms  | 183.8 MB | 291864 B | 16.84 ms |
 
 Summary of the ratios (rustc ÷ nrc):
 
 | dimension        | ratio      |
 | ---------------- | ---------: |
-| compile wall     | ~290–307×  |
-| compile CPU      | ~300–318×  |
-| compiler peak RSS| ~15.9×     |
+| compile wall     | ~295–310×  |
+| compile CPU      | ~305–320×  |
+| compiler peak RSS| ~15.7×     |
 | artifact size    | ~47–50×    |
-| run time         | 0.5–2.3× (rustc usually faster) |
+| run time         | 0.7–1.4× (rustc faster on compute-bound loops) |
 
 `nrc` beats rustc on `sieve` because the whole workload is a tight array loop
 that the simple code generator already handles well, and the static binary has
