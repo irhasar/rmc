@@ -519,27 +519,37 @@ impl Codegen {
         }
     }
 
-    /// Emit a `cmp` that leaves the flags for `a op b` (i.e. `a - b`). Returns
-    /// false when neither operand can be named without a register. Immediate
-    /// and memory operands get an explicit `q` suffix where x86 requires it,
-    /// and two-memory or two-immediate forms fall back to a register.
+    /// Emit a `cmp` that leaves the flags for `a - b`, i.e. the flags for
+    /// `a op b`. Returns false when neither operand can be named without a
+    /// register, so the caller can fall back to the general path. x86 rejects
+    /// memory-vs-memory and immediate-vs-immediate, and needs an explicit `q`
+    /// suffix when an immediate is compared against memory.
     fn emit_cmp(&mut self, a: &Expr, b: &Expr) -> bool {
         let av = Self::simple_operand(a);
         let bv = Self::simple_operand(b);
         match (av, bv) {
             (Some(x), Some(y)) => {
-                let xi = x.starts_with('$');
-                let yi = y.starts_with('$');
-                if xi && yi {
-                    self.line(&format!("mov {x}, %rax"));
-                    self.line(&format!("cmp {y}, %rax"));
-                } else if xi {
-                    self.line(&format!("cmpq {x}, {y}"));
-                } else if yi {
-                    self.line(&format!("cmpq {y}, {x}"));
-                } else {
-                    self.gen_expr(b);
-                    self.line(&format!("cmp %rax, {x}"));
+                match (x.starts_with('$'), y.starts_with('$')) {
+                    // Two immediates: materialise one so they can be compared.
+                    (true, true) => {
+                        self.line(&format!("mov {x}, %rax"));
+                        self.line(&format!("cmp {y}, %rax"));
+                    }
+                    // `a` is an immediate and `b` in memory. x86 cannot compare
+                    // an immediate against memory with the immediate first, so
+                    // load `a` into `%rcx` and compare `b` against it, leaving
+                    // the flags of `a - b`.
+                    (true, false) => {
+                        self.line(&format!("mov {x}, %rcx"));
+                        self.line(&format!("cmp {y}, %rcx"));
+                    }
+                    // `a` in memory, `b` immediate: `cmpq $b, a` is `a - b`.
+                    (false, true) => self.line(&format!("cmpq {y}, {x}")),
+                    // Two memory operands: materialise `b`.
+                    (false, false) => {
+                        self.gen_expr(b);
+                        self.line(&format!("cmp %rax, {x}"));
+                    }
                 }
                 true
             }
