@@ -36,6 +36,32 @@ struct after passing it (as `bump(a)` then reading `a`), annotate it
 `#[derive(Copy, Clone)]` so the same source also compiles with rustc; rmc parses
 and ignores the attribute.
 
+## Methods
+
+```rust
+struct Point { x: i64, y: i64 }
+
+impl Point {
+    fn sum(self) -> i64 { return self.x + self.y; }
+    fn moved(self, dx: i64) -> Point { return Point { x: self.x + dx, y: self.y }; }
+}
+
+let p: Point = Point { x: 3, y: 4 };
+let q: Point = p.moved(1);
+p.sum();                     // 7
+q.sum();                     // 8
+```
+
+An `impl Type { .. }` block adds methods to a struct. A method takes `self` as
+its first parameter (the `&self` spelling is accepted and the `&` ignored, since
+rmc has no references); the receiver is passed by value like any other argument,
+so the method body works on a private copy and may assign its fields without
+affecting the caller. `Self` names the enclosing struct, in both type and
+literal position. The method is resolved from the receiver's type, so two
+structs may define a method with the same name. A method call chains
+(`p.moved(1).sum()`) and a struct literal may be a receiver directly
+(`Point { x: 1, y: 2 }.sum()`).
+
 ## Functions
 
 ```rust

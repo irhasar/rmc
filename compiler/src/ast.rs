@@ -115,6 +115,10 @@ pub enum Expr {
     /// this into a block that builds a local array; the parser cannot, because
     /// it does not type-check.
     ArrayList(Vec<Expr>),
+    /// `recv.name(args)`. Sema resolves `name` against `recv`'s struct type and
+    /// rewrites this into a `Call` to the mangled method with `recv` prepended,
+    /// so codegen never sees a method call.
+    MethodCall { recv: Box<Expr>, name: String, args: Vec<Expr> },
     /// expr as Type
     Cast(Box<Expr>, Type),
 }
@@ -178,6 +182,9 @@ pub struct StructDef {
 #[derive(Debug, Clone)]
 pub struct FnDef {
     pub name: String,
+    /// `Some(T)` when this is a method defined in `impl T { .. }`. The method
+    /// takes a leading `self` of type `T`; `self` is not listed in `params`.
+    pub self_ty: Option<String>,
     pub params: Vec<(String, Type)>,
     pub ret: Type,
     pub body: Block,

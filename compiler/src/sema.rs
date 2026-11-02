@@ -60,6 +60,14 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
             },
         );
     }
+    // A method's receiver is its first parameter, with the impl's struct type.
+    // Give it to every method up front so its signature (and later its frame)
+    // includes `self` from the start.
+    for f in &mut prog.fns {
+        if let Some(ty) = f.self_ty.clone() {
+            f.params.insert(0, ("self".to_string(), Type::Named(ty)));
+        }
+    }
     for f in &prog.fns {
         if sigs.contains_key(&f.name) {
             return Err(format!("function `{}` is defined more than once", f.name));
@@ -677,6 +685,40 @@ impl Sema {
                 // slots. Re-checking the block would allocate a *new* slot for
                 // the `let` and leave the assignments pointing at the old one.
                 Ok(arr_ty)
+            }
+            Expr::MethodCall { recv, name, args } => {
+                // Resolve the receiver's type, then look the method up as the
+                // mangled free function `Type$method` the parser produced.
+                let rt = self.check_expr(recv, scope)?;
+                let tyname = match &rt {
+                    Type::Struct(n, _) => n.clone(),
+                    other => {
+                        return Err(format!(
+                            "method `{name}` called on a value of type {other:?}, which is not a struct"
+                        ))
+                    }
+                };
+                let mangled = format!("{tyname}${name}");
+                if !self.sigs.contains_key(&mangled) {
+                    return Err(format!("no method `{name}` on `{tyname}`"));
+                }
+                // Rewrite into a call with the receiver as the first argument.
+                // The receiver was checked above; the call is checked once more
+                // as a whole, which re-checks the receiver — harmless, since a
+                // value expression has no side effects on the frame other than
+                // bumping `next_slot` for a temporary aggregate.
+                let recv = std::mem::replace(recv.as_mut(), Expr::Int(0));
+                let mut call_args = Vec::with_capacity(args.len() + 1);
+                call_args.push(recv);
+                call_args.append(args);
+                *e = Expr::Call {
+                    name: mangled,
+                    args: call_args,
+                    arg_slots: Vec::new(),
+                    ret_slot: -1,
+                    ret_ty: Type::I64,
+                };
+                self.check_expr(e, scope)
             }
             Expr::Cast(inner, to) => {
                 let it = self.check_expr(inner, scope)?;

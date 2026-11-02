@@ -15,6 +15,9 @@ pub struct Parser {
     tmp: u32,
     /// Current expression/type/block nesting depth, bounded by `MAX_DEPTH`.
     depth: u32,
+    /// Name of the struct whose `impl` block is being parsed, if any. It lets
+    /// `Self` in a method signature resolve to the right struct.
+    current_impl: Option<String>,
 }
 
 /// The deepest expression, block or type nesting the parser accepts. Deeply
@@ -38,7 +41,7 @@ type PResult<T> = Result<T, String>;
 
 impl Parser {
     pub fn new(toks: Vec<Token>) -> Self {
-        Parser { toks, i: 0, no_struct_lit: false, tmp: 0, depth: 0 }
+        Parser { toks, i: 0, no_struct_lit: false, tmp: 0, depth: 0, current_impl: None }
     }
 
     /// Count one level of nesting and fail past `MAX_DEPTH`.
@@ -114,9 +117,10 @@ impl Parser {
             match self.peek() {
                 Some(Tok::Struct) => structs.push(self.parse_struct()?),
                 Some(Tok::Fn) => fns.push(self.parse_fn()?),
+                Some(Tok::Impl) => self.parse_impl(&mut fns)?,
                 other => {
                     return Err(format!(
-                        "at byte {}: expected `fn` or `struct`, found {}",
+                        "at byte {}: expected `fn`, `struct` or `impl`, found {}",
                         self.pos(),
                         other.map(|x| x.describe()).unwrap_or_else(|| "end of input".into())
                     ))
@@ -166,7 +170,77 @@ impl Parser {
             Type::Unit
         };
         let body = self.parse_block()?;
-        Ok(FnDef { name, params, ret, body, param_slots: Vec::new(), ret_slot: -1, nslots: 0 })
+        Ok(FnDef { name, self_ty: None, params, ret, body, param_slots: Vec::new(), ret_slot: -1, nslots: 0 })
+    }
+
+    /// `impl Type { fn method(self, ..) -> .. { .. } }`. The methods are pushed
+    /// onto the program's function list with a mangled name (`Type$method`) and
+    /// a leading `self` parameter, so sema and codegen treat them as ordinary
+    /// functions once a call site has been rewritten.
+    fn parse_impl(&mut self, fns: &mut Vec<FnDef>) -> PResult<()> {
+        self.expect(Tok::Impl)?;
+        let ty = self.expect_ident()?;
+        self.expect(Tok::LBrace)?;
+        let saved = self.current_impl.take();
+        self.current_impl = Some(ty.clone());
+        while self.peek() != Some(&Tok::RBrace) {
+            if self.peek().is_none() {
+                self.current_impl = saved;
+                return Err(format!("at byte {}: unexpected end of input in `impl`", self.pos()));
+            }
+            match self.parse_method(&ty) {
+                Ok(m) => fns.push(m),
+                Err(e) => {
+                    self.current_impl = saved;
+                    return Err(e);
+                }
+            }
+        }
+        self.expect(Tok::RBrace)?;
+        self.current_impl = saved;
+        Ok(())
+    }
+
+    fn parse_method(&mut self, ty: &str) -> PResult<FnDef> {
+        self.expect(Tok::Fn)?;
+        let name = self.expect_ident()?;
+        self.expect(Tok::LParen)?;
+        // First parameter must be `self` (an immutable receiver). We accept the
+        // `&self` spelling too and ignore the `&`, since rmc has no references.
+        self.eat(&Tok::Amp);
+        let first = self.expect_ident()?;
+        if first != "self" {
+            return Err(format!(
+                "at byte {}: method `{name}` must take `self` as its first parameter",
+                self.pos()
+            ));
+        }
+        let mut params = Vec::new();
+        if self.eat(&Tok::Comma) {
+            while self.peek() != Some(&Tok::RParen) {
+                self.eat(&Tok::Mut);
+                let pname = self.expect_ident()?;
+                self.expect(Tok::Colon)?;
+                let pty = self.parse_type()?;
+                params.push((pname, pty));
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(Tok::RParen)?;
+        let ret = if self.eat(&Tok::Arrow) { self.parse_type()? } else { Type::Unit };
+        let body = self.parse_block()?;
+        Ok(FnDef {
+            name: format!("{ty}${name}"),
+            self_ty: Some(ty.to_string()),
+            params,
+            ret,
+            body,
+            param_slots: Vec::new(),
+            ret_slot: -1,
+            nslots: 0,
+        })
     }
 
     fn parse_type(&mut self) -> PResult<Type> {
@@ -178,6 +252,13 @@ impl Parser {
 
     fn parse_type_inner(&mut self) -> PResult<Type> {
         match self.peek() {
+            Some(Tok::Ident(n)) if n == "Self" => {
+                self.i += 1;
+                match self.current_impl.clone() {
+                    Some(name) => Ok(Type::Named(name)),
+                    None => Err(format!("at byte {}: `Self` outside of an `impl`", self.pos())),
+                }
+            }
             Some(Tok::TyI64) => {
                 self.i += 1;
                 Ok(Type::I64)
@@ -635,7 +716,19 @@ impl Parser {
                 e = Expr::Index(Box::new(e), Box::new(idx));
             } else if self.eat(&Tok::Dot) {
                 let name = self.expect_ident()?;
-                e = Expr::Field { base: Box::new(e), name, offset: 0, ty: Type::I64 };
+                if self.eat(&Tok::LParen) {
+                    let mut args = Vec::new();
+                    while self.peek() != Some(&Tok::RParen) {
+                        args.push(self.parse_expr()?);
+                        if !self.eat(&Tok::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(Tok::RParen)?;
+                    e = Expr::MethodCall { recv: Box::new(e), name, args };
+                } else {
+                    e = Expr::Field { base: Box::new(e), name, offset: 0, ty: Type::I64 };
+                }
             } else if self.eat(&Tok::As) {
                 let ty = self.parse_type()?;
                 e = Expr::Cast(Box::new(e), ty);
@@ -772,6 +865,20 @@ impl Parser {
             }
             Some(Tok::Ident(name)) => {
                 self.i += 1;
+                // `Self { .. }` names the struct of the enclosing `impl`.
+                let name = if name == "Self" {
+                    match self.current_impl.clone() {
+                        Some(t) => t,
+                        None => {
+                            return Err(format!(
+                                "at byte {}: `Self` outside of an `impl`",
+                                self.pos()
+                            ))
+                        }
+                    }
+                } else {
+                    name
+                };
                 if self.peek() == Some(&Tok::LBrace) && !self.no_struct_lit {
                     // struct literal `Name { field: value, ... }`
                     self.i += 1;

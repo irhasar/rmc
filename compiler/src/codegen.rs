@@ -545,6 +545,7 @@ impl Codegen {
     ) {
         match e {
             Expr::ArrayList(_) => unreachable!("sema rewrites ArrayList into a block"),
+            Expr::MethodCall { .. } => unreachable!("sema rewrites MethodCall into a Call"),
             Expr::Var { slot, ty, .. } => {
                 counts[*slot as usize] += 1;
                 if ty.is_aggregate() {
@@ -1056,6 +1057,7 @@ impl Codegen {
     fn gen_expr(&mut self, e: &Expr) -> Type {
         match e {
             Expr::ArrayList(_) => unreachable!("sema rewrites ArrayList into a block"),
+            Expr::MethodCall { .. } => unreachable!("sema rewrites MethodCall into a Call"),
             Expr::Int(v) => {
                 self.line(&format!("mov ${v}, %rax"));
                 Type::I64

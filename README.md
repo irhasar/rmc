@@ -277,7 +277,7 @@ of value per unit of effort:
    data-structure code.
 3. **More types.** `u*`/`i*` widths and `f64`, which together cover most of what
    small programs actually need. (`match` on integers is done.)
-4. **Enums and `impl` methods.** The next step after structs toward expressing
+4. **Enums.** `impl` methods are done; enums are the next step toward expressing
    real data structures.
 5. **More backends.** A second target (ARM64 or a simple VM) would force the
    code generator's assumptions out into the open.

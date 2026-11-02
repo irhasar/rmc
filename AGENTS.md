@@ -219,6 +219,13 @@ through every precedence function, so it costs several KiB); `fuzz.py --mode
 robust` and the depth tests in `tests/compile.rs` guard it. If you add a new
 recursive construct, count a level with `bump_depth` on entry.
 
+A method is an ordinary free function whose name is mangled to `Type$method` and
+whose first parameter is `self` of the impl's struct type; the parser produces
+it, sema inserts the `self` parameter before building signatures, and a method
+call is rewritten by sema into a `Call` with the receiver prepended. Codegen
+therefore has no method case — keep it that way. `Self` resolves through the
+parser's `current_impl`.
+
 An array's element type is always scalar (`i64` or `bool`); nested arrays and
 arrays of structs are rejected. A list literal `[a, b, c]` is parsed as
 `Expr::ArrayList` and rewritten by sema, which infers the element type from the

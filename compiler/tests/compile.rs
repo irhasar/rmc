@@ -562,3 +562,35 @@ fn an_empty_list_literal_is_rejected() {
     let err = compile_to_asm("fn main() -> i64 { let a = []; return 0; }", &CompileOptions::default()).unwrap_err();
     assert!(err.contains("expected an expression"), "got: {err}");
 }
+
+#[test]
+fn impl_methods_compile_and_resolve_by_receiver_type() {
+    let src = "struct P { x: i64 } impl P { fn get(self) -> i64 { return self.x; } } \
+               struct Q { x: i64 } impl Q { fn get(self) -> i64 { return self.x; } } \
+               fn main() -> i64 { let p: P = P { x: 1 }; let q: Q = Q { x: 2 }; return p.get() + q.get(); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_method_on_a_non_struct_is_rejected() {
+    let err = compile_to_asm("fn main() -> i64 { let x: i64 = 1; return x.foo(); }", &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("is not a struct"), "got: {err}");
+}
+
+#[test]
+fn an_unknown_method_is_rejected() {
+    let err = compile_to_asm("struct P { x: i64 } fn main() -> i64 { let p: P = P { x: 1 }; return p.nope(); }", &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("no method"), "got: {err}");
+}
+
+#[test]
+fn a_method_without_self_is_rejected() {
+    let err = compile_to_asm("struct P { x: i64 } impl P { fn f() -> i64 { return 1; } } fn main() -> i64 { return 0; }", &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("expected identifier"), "got: {err}");
+}
+
+#[test]
+fn self_outside_an_impl_is_rejected() {
+    let err = compile_to_asm("fn main() -> i64 { let s: Self = 1; return 0; }", &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("outside of an `impl`"), "got: {err}");
+}
