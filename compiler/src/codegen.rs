@@ -44,6 +44,14 @@ pub struct Codegen {
 /// register name keeps the generated assembly readable.
 const ALLOC_REGS: [&str; 5] = ["%rbx", "%r12", "%r13", "%r14", "%r15"];
 
+/// A `let`-declared aggregate, recorded so promotion knows whether its
+/// initialiser writes it field by field (`by_field`) or copies the whole value.
+struct LetTarget {
+    slot: i32,
+    fields: i32,
+    by_field: bool,
+}
+
 impl Codegen {
     pub fn new() -> Self {
         Codegen {
@@ -307,23 +315,67 @@ impl Codegen {
         self.line(&format!("mov {}(%rbp), %rax", self.off(self.ret_slot)));
     }
 
-    /// Choose up to `ALLOC_REGS.len()` scalar locals to keep in registers for
-    /// the whole function, ordered by how often they are mentioned. Only slots
-    /// that are never the base of an array access qualify, since an array needs
-    /// a memory address. Ties break toward the lowest slot, which is where
-    /// parameters live.
+    /// Choose up to `ALLOC_REGS.len()` slots to keep in registers for the whole
+    /// function, ordered by how often they are mentioned.
+    ///
+    /// Scalars are counted directly. A struct's scalar fields are counted too,
+    /// so a hot `acc.sum` stays in a register, but only when the struct is
+    /// never read or written as a whole: a whole-struct copy runs through
+    /// memory, so every field of such a struct must stay in memory. A field is
+    /// named by its register only where the layout is known, so the struct's
+    /// base slot (its last field, whose address is the struct's own base) and
+    /// any aggregate field always stay in memory.
     fn promote(f: &FnDef) -> Vec<(i32, &'static str)> {
-        let mut counts: Vec<(i32, u32)> = (0..f.nslots).map(|s| (s, 0u32)).collect();
-        let mut array_slots: Vec<i32> = Vec::new();
-        Self::count_block(&f.body, &mut counts, &mut array_slots);
-        // `counts` is built in slot order and not reordered until after this
-        // loop, so slot `s` lives at index `s`. Zeroing by index keeps this
-        // linear even for an array with hundreds of thousands of elements.
-        for s in &array_slots {
-            counts[*s as usize].1 = 0;
+        let n = f.nslots as usize;
+        let mut counts = vec![0u32; n];
+        let mut mem = vec![false; n];
+        // Structs used as a whole value, recorded as (base slot, field count).
+        let mut copied: Vec<(i32, i32)> = Vec::new();
+        // `let`-declared aggregates, which are copied as a whole unless their
+        // initialiser writes them field by field.
+        let mut let_tmps: Vec<LetTarget> = Vec::new();
+        Self::count_block(&f.body, &mut counts, &mut mem, &mut copied, true, &mut let_tmps);
+
+        // An aggregate parameter is copied into its slots in the prologue, so
+        // every one of its fields must stay in memory for that copy to count.
+        for (i, (_, pty)) in f.params.iter().enumerate() {
+            if pty.is_aggregate() {
+                let base = f.param_slots[i];
+                for k in 0..(pty.size() / 8) as i32 {
+                    if let Some(m) = mem.get_mut((base + k) as usize) {
+                        *m = true;
+                    }
+                }
+            }
         }
-        counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        counts
+
+        // A struct that is ever copied, returned or passed by value is read and
+        // written through memory, so none of its fields may be promoted.
+        for (base, fields) in &copied {
+            for k in 0..*fields {
+                if let Some(m) = mem.get_mut((base + k) as usize) {
+                    *m = true;
+                }
+            }
+        }
+
+        // A `let` whose initialiser is not field-by-field copies the whole
+        // value, so its fields must stay in memory too.
+        for t in &let_tmps {
+            if !t.by_field {
+                for k in 0..t.fields {
+                    if let Some(m) = mem.get_mut((t.slot + k) as usize) {
+                        *m = true;
+                    }
+                }
+            }
+        }
+
+        let mut ranked: Vec<(i32, u32)> = (0..f.nslots)
+            .map(|s| (s, if mem[s as usize] { 0 } else { counts[s as usize] }))
+            .collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        ranked
             .into_iter()
             .filter(|(_, c)| *c > 0)
             .take(ALLOC_REGS.len())
@@ -332,87 +384,183 @@ impl Codegen {
             .collect()
     }
 
-    fn count_block(b: &Block, counts: &mut Vec<(i32, u32)>, array_slots: &mut Vec<i32>) {
+    fn count_block(
+        b: &Block,
+        counts: &mut Vec<u32>,
+        mem: &mut Vec<bool>,
+        copied: &mut Vec<(i32, i32)>,
+        whole: bool,
+        let_tmps: &mut Vec<LetTarget>,
+    ) {
         for s in &b.stmts {
-            Self::count_stmt(s, counts, array_slots);
+            Self::count_stmt(s, counts, mem, copied, whole, let_tmps);
         }
         if let Some(t) = &b.tail {
-            Self::count_expr(t, counts, array_slots);
+            Self::count_expr(t, counts, mem, copied, whole, let_tmps);
         }
     }
 
-    fn count_stmt(s: &Stmt, counts: &mut Vec<(i32, u32)>, array_slots: &mut Vec<i32>) {
+    fn count_stmt(
+        s: &Stmt,
+        counts: &mut Vec<u32>,
+        mem: &mut Vec<bool>,
+        copied: &mut Vec<(i32, i32)>,
+        _whole: bool,
+        let_tmps: &mut Vec<LetTarget>,
+    ) {
         match s {
-            Stmt::Let { init, .. } => {
+            Stmt::Let { ty, init, slot, .. } => {
                 if let Some(e) = init {
-                    Self::count_expr(e, counts, array_slots);
+                    Self::count_expr(e, counts, mem, copied, true, let_tmps);
+                }
+                // A `let` of an aggregate writes the whole value, except when
+                // the initialiser is field-by-field: a struct literal, a splat
+                // (`[v; n]`), or a zero-fill. Only then may its fields live in
+                // registers.
+                match ty {
+                    Some(Type::Struct(_, size)) => {
+                        let by_field = matches!(
+                            init,
+                            None | Some(Expr::StructLit { .. }) | Some(Expr::ArrayLit(..))
+                        );
+                        let_tmps.push(LetTarget {
+                            slot: *slot,
+                            fields: (*size / 8) as i32,
+                            by_field,
+                        });
+                    }
+                    Some(Type::Array(elem, n)) => {
+                        // A splat or zero-fill writes each element; a copy does
+                        // not, and an aggregate element is never splatted.
+                        let by_field = matches!(init, None | Some(Expr::ArrayLit(..)))
+                            && !elem.is_aggregate();
+                        let_tmps.push(LetTarget {
+                            slot: *slot,
+                            fields: *n as i32,
+                            by_field,
+                        });
+                    }
+                    _ => {}
                 }
             }
             Stmt::Assign { target, value } => {
-                Self::count_expr(target, counts, array_slots);
-                Self::count_expr(value, counts, array_slots);
+                // A whole-struct target is written as a copy, so its fields
+                // must stay in memory just like a whole-struct source.
+                Self::count_expr(target, counts, mem, copied, true, let_tmps);
+                Self::count_expr(value, counts, mem, copied, true, let_tmps);
             }
-            Stmt::Expr(e) => Self::count_expr(e, counts, array_slots),
+            Stmt::Expr(e) => Self::count_expr(e, counts, mem, copied, true, let_tmps),
             Stmt::While(c, b) => {
-                Self::count_expr(c, counts, array_slots);
-                Self::count_block(b, counts, array_slots);
+                Self::count_expr(c, counts, mem, copied, true, let_tmps);
+                Self::count_block(b, counts, mem, copied, true, let_tmps);
             }
-            Stmt::Loop(b) => Self::count_block(b, counts, array_slots),
+            Stmt::Loop(b) => Self::count_block(b, counts, mem, copied, true, let_tmps),
             Stmt::For { start, end, body, .. } => {
-                Self::count_expr(start, counts, array_slots);
-                Self::count_expr(end, counts, array_slots);
-                Self::count_block(body, counts, array_slots);
+                Self::count_expr(start, counts, mem, copied, true, let_tmps);
+                Self::count_expr(end, counts, mem, copied, true, let_tmps);
+                Self::count_block(body, counts, mem, copied, true, let_tmps);
             }
             Stmt::Return(v) => {
                 if let Some(e) = v {
-                    Self::count_expr(e, counts, array_slots);
+                    Self::count_expr(e, counts, mem, copied, true, let_tmps);
                 }
             }
             Stmt::Break | Stmt::Continue => {}
         }
     }
 
-    fn count_expr(e: &Expr, counts: &mut Vec<(i32, u32)>, array_slots: &mut Vec<i32>) {
+    /// `whole` is true when the value of `e` is used as a complete aggregate,
+    /// which is what makes a struct unfit for per-field promotion. A `Field` or
+    /// `Index` base is not a whole use, so it is passed `false`.
+    fn count_expr(
+        e: &Expr,
+        counts: &mut Vec<u32>,
+        mem: &mut Vec<bool>,
+        copied: &mut Vec<(i32, i32)>,
+        whole: bool,
+        let_tmps: &mut Vec<LetTarget>,
+    ) {
         match e {
             Expr::Var { slot, ty, .. } => {
-                counts[*slot as usize].1 += 1;
-                // A promoted local is named by its register, so an aggregate
-                // (which needs an address) must keep all of its slots in memory.
+                counts[*slot as usize] += 1;
                 if ty.is_aggregate() {
-                    for k in 0..(ty.size() / 8) as i32 {
-                        array_slots.push(*slot + k);
+                    match ty {
+                        Type::Array(..) => {
+                            for k in 0..(ty.size() / 8) as i32 {
+                                mem[(*slot + k) as usize] = true;
+                            }
+                        }
+                        Type::Struct(_, size) => {
+                            // The base slot is the struct's last field, whose
+                            // address is the struct's own base, so it must stay
+                            // addressable.
+                            mem[*slot as usize] = true;
+                            if whole {
+                                copied.push((*slot, (*size / 8) as i32));
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
             Expr::Index(base, idx) => {
-                Self::count_expr(base, counts, array_slots);
-                Self::count_expr(idx, counts, array_slots);
+                Self::count_expr(base, counts, mem, copied, false, let_tmps);
+                Self::count_expr(idx, counts, mem, copied, false, let_tmps);
             }
-            Expr::Field { base, .. } => Self::count_expr(base, counts, array_slots),
-            Expr::StructLit { fields, .. } => {
+            Expr::Field { base, offset, ty, .. } => {
+                Self::count_expr(base, counts, mem, copied, false, let_tmps);
+                if let Expr::Var { slot, ty: Type::Struct(_, size), .. } = base.as_ref() {
+                    let fields = (*size / 8) as i32;
+                    let fslot = *slot + fields - 1 - *offset / 8;
+                    if fslot >= 0 {
+                        if ty.is_aggregate() {
+                            for k in 0..(ty.size() / 8) as i32 {
+                                mem[(fslot - k) as usize] = true;
+                            }
+                        } else {
+                            counts[fslot as usize] += 1;
+                        }
+                    }
+                }
+            }
+            Expr::StructLit { fields, slot, .. } => {
                 for fi in fields {
-                    Self::count_expr(&fi.value, counts, array_slots);
+                    Self::count_expr(&fi.value, counts, mem, copied, true, let_tmps);
+                }
+                // The literal yields its own address, so it is a whole use of
+                // itself: its fields stay in memory for that copy. Sema gives a
+                // literal an inferred type only as a `let` initialiser, which is
+                // already marked whole by that `let`.
+                let n = fields.len() as i32;
+                for k in 0..n {
+                    if let Some(m) = mem.get_mut((*slot + k) as usize) {
+                        *m = true;
+                    }
                 }
             }
             Expr::Bin(_, a, b) => {
-                Self::count_expr(a, counts, array_slots);
-                Self::count_expr(b, counts, array_slots);
+                Self::count_expr(a, counts, mem, copied, true, let_tmps);
+                Self::count_expr(b, counts, mem, copied, true, let_tmps);
             }
-            Expr::Un(_, a) | Expr::Cast(a, _) => Self::count_expr(a, counts, array_slots),
+            Expr::Un(_, a) | Expr::Cast(a, _) => {
+                Self::count_expr(a, counts, mem, copied, true, let_tmps)
+            }
             Expr::Call { args, .. } => {
                 for a in args {
-                    Self::count_expr(a, counts, array_slots);
+                    Self::count_expr(a, counts, mem, copied, true, let_tmps);
                 }
             }
             Expr::If(c, t, els) => {
-                Self::count_expr(c, counts, array_slots);
-                Self::count_block(t, counts, array_slots);
+                Self::count_expr(c, counts, mem, copied, true, let_tmps);
+                Self::count_block(t, counts, mem, copied, true, let_tmps);
                 if let Some(e) = els {
-                    Self::count_block(e, counts, array_slots);
+                    Self::count_block(e, counts, mem, copied, true, let_tmps);
                 }
             }
-            Expr::Block(b) => Self::count_block(b, counts, array_slots),
-            Expr::ArrayLit(v, _) => Self::count_expr(v, counts, array_slots),
+            Expr::Block(b) => Self::count_block(b, counts, mem, copied, true, let_tmps),
+            Expr::ArrayLit(v, _) => {
+                Self::count_expr(v, counts, mem, copied, true, let_tmps)
+            }
             Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) => {}
         }
     }
@@ -453,15 +601,30 @@ impl Codegen {
                 } else if let Type::Struct(_, size) = &vty {
                     match init {
                         Some(Expr::StructLit { fields, .. }) => {
+                            // The field-to-slot map uses the struct's slot
+                            // count, not its field count: an array field spans
+                            // several slots, so `fields.len() != size / 8`.
                             let base = self.array_off(*slot, size / 8);
+                            let n = (size / 8) as i32;
                             for fi in fields {
-                                self.store_field_value(base + fi.offset, fi);
+                                let reg = self.struct_field_reg(*slot, n, fi.offset);
+                                self.store_field_value(base + fi.offset, reg, fi);
                             }
                         }
-                        // No initializer: the struct is zero-filled.
+                        // No initializer: the struct is zero-filled, into the
+                        // register of each promoted field and memory otherwise.
                         None => {
+                            let base = self.array_off(*slot, size / 8);
+                            let n = (size / 8) as i32;
                             self.line("xor %eax, %eax");
-                            self.fill_aggregate(*slot, 8, size / 8);
+                            for i in 0..n {
+                                match self.reg_of(*slot + n - 1 - i) {
+                                    Some(r) => self.line(&format!("xor {r}, {r}")),
+                                    None => {
+                                        self.line(&format!("mov %rax, {}(%rbp)", base + i * 8))
+                                    }
+                                }
+                            }
                         }
                         // Any other initialiser yields the struct's address (a
                         // call's hidden return buffer, or another struct local),
@@ -517,17 +680,21 @@ impl Codegen {
                         self.copy_words_rdi_rsi(n);
                     }
                     Expr::Field { base, offset, .. } => {
-                        match self.field_operand(base, *offset) {
-                            Some(op) => {
-                                self.gen_expr(value);
-                                self.line(&format!("mov %rax, {op}"));
-                            }
-                            None => {
-                                self.gen_addr(target);
-                                self.push_rax();
-                                self.gen_expr(value);
-                                self.pop_to("%rcx");
-                                self.line("mov %rax, (%rcx)");
+                        if let Some(r) = self.field_reg(base, *offset) {
+                            self.gen_expr_into_reg(value, r);
+                        } else {
+                            match self.field_operand(base, *offset) {
+                                Some(op) => {
+                                    self.gen_expr(value);
+                                    self.line(&format!("mov %rax, {op}"));
+                                }
+                                None => {
+                                    self.gen_addr(target);
+                                    self.push_rax();
+                                    self.gen_expr(value);
+                                    self.pop_to("%rcx");
+                                    self.line("mov %rax, (%rcx)");
+                                }
                             }
                         }
                     }
@@ -709,7 +876,11 @@ impl Codegen {
         }
         if n <= 8 {
             for i in 0..n {
-                self.line(&format!("mov %rax, {}(%rbp)", base + i as i32 * 8));
+                let s = slot + n as i32 - 1 - i as i32;
+                match self.reg_of(s) {
+                    Some(r) => self.line(&format!("mov %rax, {r}")),
+                    None => self.line(&format!("mov %rax, {}(%rbp)", base + i as i32 * 8)),
+                }
             }
         } else {
             let l = self.new_label();
@@ -741,10 +912,32 @@ impl Codegen {
     fn field_operand(&self, base: &Expr, offset: i32) -> Option<String> {
         match base {
             Expr::Var { slot, ty: Type::Struct(_, size), .. } => {
+                // The struct base slot is never promoted, so `%rbp` addressing
+                // is always valid; the guard only makes a promote regression
+                // fall back to memory instead of silently reading stale data.
+                if self.reg_of(*slot).is_some() {
+                    return None;
+                }
                 Some(format!("{}(%rbp)", self.array_off(*slot, size / 8) + offset))
             }
             _ => None,
         }
+    }
+
+    /// The register holding scalar field `offset` of struct local `base`, or
+    /// `None` when the field stays in memory. Field 0 is the highest slot, so
+    /// field `offset / 8` lives at `base + fields - 1 - offset / 8`.
+    fn field_reg(&self, base: &Expr, offset: i32) -> Option<&'static str> {
+        match base {
+            Expr::Var { slot, ty: Type::Struct(_, size), .. } => {
+                self.struct_field_reg(*slot, (*size / 8) as i32, offset)
+            }
+            _ => None,
+        }
+    }
+
+    fn struct_field_reg(&self, slot: i32, fields: i32, offset: i32) -> Option<&'static str> {
+        self.reg_of(slot + fields - 1 - offset / 8)
     }
 
     /// Leaves the address of an lvalue in `%rax`.
@@ -813,6 +1006,8 @@ impl Codegen {
                         Some(op) => self.line(&format!("lea {op}, %rax")),
                         None => self.gen_addr(e),
                     }
+                } else if let Some(r) = self.field_reg(base, *offset) {
+                    self.line(&format!("mov {r}, %rax"));
                 } else {
                     match self.field_operand(base, *offset) {
                         Some(op) => self.line(&format!("mov {op}, %rax")),
@@ -829,13 +1024,20 @@ impl Codegen {
                 // address, which is how every aggregate value is represented.
                 // Fields are stored in source order, so initializer side effects
                 // run in the order they were written.
-                let n = fields.len();
-                let base = self.array_off(*slot, n);
+                // Slot count, which exceeds the field count when a field is
+                // itself an aggregate (an array field spans several slots).
+                let n = fields
+                    .iter()
+                    .map(|fi| fi.offset / 8 + (fi.ty.size() / 8) as i32)
+                    .max()
+                    .unwrap_or(0);
+                let base = self.array_off(*slot, n as usize);
                 for fi in fields {
-                    self.store_field_value(base + fi.offset, fi);
+                    let reg = self.struct_field_reg(*slot, n, fi.offset);
+                    self.store_field_value(base + fi.offset, reg, fi);
                 }
                 self.line(&format!("lea {base}(%rbp), %rax"));
-                Type::Struct(name.clone(), n * 8)
+                Type::Struct(name.clone(), (n as usize) * 8)
             }
             Expr::Index(base, _idx) => {
                 let elem = match base.as_ref() {
@@ -953,6 +1155,8 @@ impl Codegen {
             Expr::Field { base, offset, ty, .. } => {
                 if ty.is_aggregate() {
                     None
+                } else if let Some(r) = self.field_reg(base, *offset) {
+                    Some(r.to_string())
                 } else {
                     self.field_operand(base, *offset)
                 }
@@ -980,13 +1184,15 @@ impl Codegen {
     /// Store one struct-literal field value at `dest_off(%rbp)`. A scalar field
     /// is a single word store; an aggregate field is copied word by word, since
     /// the value expression yields the field's *address*, not its contents.
-    fn store_field_value(&mut self, dest_off: i32, fi: &FieldInit) {
+    fn store_field_value(&mut self, dest_off: i32, reg: Option<&'static str>, fi: &FieldInit) {
         self.gen_expr(&fi.value);
         if fi.ty.is_aggregate() {
             let n = fi.ty.size() / 8;
             self.line("mov %rax, %rsi");
             self.line(&format!("lea {dest_off}(%rbp), %rdi"));
             self.copy_words_rdi_rsi(n);
+        } else if let Some(r) = reg {
+            self.line(&format!("mov %rax, {r}"));
         } else {
             self.line(&format!("mov %rax, {dest_off}(%rbp)"));
         }

@@ -108,9 +108,26 @@ There is no allocator in the usual sense, but the hottest locals in a function
 are promoted. `promote` counts how often each scalar local is mentioned, takes
 the top five, and assigns them `%rbx`, `%r12`–`%r15` for the whole function.
 These are callee-saved, so a promoted value stays valid across a call and never
-needs spilling. Aggregates are skipped because they need a memory address, and so
-is any slot used as an index base. Everything else stays in a stack slot, now
-placed below the saved registers so the two never overlap.
+needs spilling.
+
+Scalar struct fields take part in promotion too, so a hot `acc.sum` stays in a
+register. A field is named by its register only where its slot is known: field
+`k` of a struct at `slot` lives at `slot + fields - 1 - k` (field 0 is the
+highest slot). Two kinds of field stay in memory. The struct's base slot is its
+last field, whose address *is* the struct's base, so it must stay addressable —
+this is why at most `fields - 1` fields of a struct can ever be promoted. And a
+struct that is ever read or written as a whole (copied, returned, passed by
+value, or declared by a `let` whose initialiser is a whole-value copy) is
+accessed through memory, so all of its fields stay there. `promote` records
+those cases during its walk and zeroes the whole struct's slots.
+
+Arrays are skipped entirely: an element is reached by `base + i*8` through
+memory, so no element slot may be promoted, and neither may any slot used as an
+index base. A `let` of an array is promoted element by element only when its
+initialiser writes each element (a splat `[v; n]` or a zero-fill), which
+`fill_aggregate` handles by writing promoted elements to their registers.
+Everything else stays in a stack slot, placed below the saved registers so the
+two never overlap.
 
 The frame is padded so that the saved registers plus the slots (locals and
 spill slots together) keep `%rsp` 16-byte aligned, and because spills go to

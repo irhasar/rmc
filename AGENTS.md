@@ -73,10 +73,24 @@ python3 tests/run.py -v
   `%rsp` at the lowest saved register (or add the frame size back) before
   popping, otherwise `pop` reads the frame and the return address is lost.
   `regs.rms` and `calls.rms` fail if this regresses.
-- **Aggregates cannot be promoted.** A promoted local is named by its register,
-  so an array or struct (which needs an address) must stay in memory, and so must
-  an index base. `promote` excludes *every* slot an aggregate spans, not just
-  its first.
+- **Only whole-value structs keep all their fields in memory.** A scalar field
+  of a struct is promoted like any other local, *unless* the struct is ever
+  copied, returned or passed by value, in which case the whole-value copy reads
+  and writes memory and every field must stay there. `promote` tracks that
+  during its walk (`copied` and the `let` targets) and zeroes those slots. A
+  promoted field that stays in memory on the copy path but is read from its
+  register on the field path is a silent wrong-answer bug, which is what
+  `fieldpromo.rms` guards.
+- **A struct's base slot is its last field and is never promoted.** Field `k`
+  lives at `slot + fields - 1 - k`, so field `fields - 1` *is* `slot`, whose
+  address is the struct's base; promoting it would break every `&struct`-style
+  use. At most `fields - 1` fields can be promoted.
+- **Field-to-slot uses the slot count, not the field count.** A struct with an
+  array field has more slots than fields (`WithArr` is 2 fields, 4 slots), so
+  `fields.len()` gives the wrong map. Use `size / 8`.
+- **Arrays cannot be promoted.** An element is reached by `base + i*8` through
+  memory, so no element slot may be promoted, and neither may an index base.
+  `promote` excludes *every* slot an array spans, not just its first.
 - **Aggregate element 0 is at the lowest address.** An array or struct in slots
   `s..s+n` has element/field 0 at `-(s+n+nregs)*8(%rbp)`, with item `i` at
   `base + i*8`. Mixing this up makes aggregate writes run upward past `%rbp`.

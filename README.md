@@ -165,35 +165,35 @@ Representative run on the development machine (Debian 13, gcc 14.2, rustc
 
 | program | compiler | compile wall | compile CPU | peak RSS | artifact | run time |
 | ------- | -------- | -----------: | ----------: | -------: | -------: | -------: |
-| hello   | rmc      |     8.33 ms  |    8.07 ms  |  12.1 MB |   6504 B |  1.63 ms |
-| hello   | rustc    |  2067.24 ms  | 2070.34 ms  | 185.2 MB | 289416 B |  2.16 ms |
-| fib     | rmc      |     7.63 ms  |    7.34 ms  |  12.1 MB |   6616 B | 15.47 ms |
-| fib     | rustc    |  2098.98 ms  | 2103.25 ms  | 185.5 MB | 291696 B |  8.62 ms |
-| mandel  | rmc      |     7.67 ms  |    7.42 ms  |  12.1 MB |   6880 B |104.58 ms |
-| mandel  | rustc    |  2097.84 ms  | 2102.18 ms  | 189.3 MB | 291776 B |108.63 ms |
-| sieve   | rmc      |    10.77 ms  |   10.50 ms  |  12.1 MB |   6656 B |  2.97 ms |
-| sieve   | rustc    |  2115.31 ms  | 2119.47 ms  | 186.3 MB | 292016 B |  3.81 ms |
-| mix     | rmc      |     7.60 ms  |    7.33 ms  |  12.1 MB |   6672 B | 18.27 ms |
-| mix     | rustc    |  2115.31 ms  | 2117.95 ms  | 187.2 MB | 291864 B | 16.84 ms |
-| stats   | rmc      |     7.68 ms  |    7.38 ms  |  12.1 MB |   6760 B |  5.24 ms |
-| stats   | rustc    |  2115.90 ms  | 2119.60 ms  | 185.9 MB | 292048 B |  5.12 ms |
+| hello   | rmc      |     8.28 ms  |    8.01 ms  |  12.0 MB |   6504 B |  1.67 ms |
+| hello   | rustc    |  2077.82 ms  | 2080.93 ms  | 185.3 MB | 289416 B |  2.36 ms |
+| fib     | rmc      |     8.45 ms  |    7.61 ms  |  12.0 MB |   6616 B | 15.71 ms |
+| fib     | rustc    |  2144.02 ms  | 2148.29 ms  | 186.3 MB | 291696 B |  8.77 ms |
+| mandel  | rmc      |     7.96 ms  |    7.69 ms  |  12.0 MB |   6880 B |103.74 ms |
+| mandel  | rustc    |  2135.61 ms  | 2139.86 ms  | 189.2 MB | 291776 B |107.07 ms |
+| sieve   | rmc      |     9.68 ms  |    9.45 ms  |  12.0 MB |   6656 B |  3.03 ms |
+| sieve   | rustc    |  2125.14 ms  | 2129.20 ms  | 185.8 MB | 292016 B |  3.94 ms |
+| mix     | rmc      |     7.98 ms  |    7.76 ms  |  12.0 MB |   6672 B | 18.72 ms |
+| mix     | rustc    |  2109.36 ms  | 2113.14 ms  | 187.2 MB | 291864 B | 16.98 ms |
+| stats   | rmc      |     7.64 ms  |    7.39 ms  |  12.0 MB |   6752 B |  5.29 ms |
+| stats   | rustc    |  2154.83 ms  | 2158.99 ms  | 186.8 MB | 292048 B |  5.09 ms |
 
 Summary of the ratios (rustc ÷ rmc):
 
 | dimension        | ratio      |
 | ---------------- | ---------: |
-| compile wall     | ~248–278×  |
-| compile CPU      | ~257–287×  |
-| compiler peak RSS| ~15.3×     |
+| compile wall     | ~250–285×  |
+| compile CPU      | ~260–292×  |
+| compiler peak RSS| ~15.4×     |
 | artifact size    | ~44×       |
-| run time         | 0.56–1.33× (rustc faster on call-heavy code) |
+| run time         | 0.56–1.41× (rustc faster on call-heavy code) |
 
-`rmc` beats rustc on `hello` (1.33×), `sieve` (1.28×) and `mandel` (1.04×)
+`rmc` beats rustc on `hello` (1.41×), `sieve` (1.30×) and `mandel` (1.03×)
 because the workload is a tight loop or a single call and the static binary has
-no libc startup. On `fib` (0.56×, call-heavy), `mix` (0.92×) and `stats` (0.98×)
-LLVM's loop transformations and register allocation still win. `stats` holds its
-accumulators in a struct, which rmc keeps in memory, so it is a fair illustration
-of where a real register allocator would pay off.
+no libc startup. On `fib` (0.56×, call-heavy), `mix` (0.91×) and `stats` (0.96×)
+LLVM's loop transformations and register allocation still win. These benchmarks
+are not struct-field-bound, so field promotion (below) shows up only in the
+microbenchmark, not here.
 
 ### Reproducing the comparison honestly
 
@@ -214,8 +214,9 @@ rmc is a small, self-contained compiler, not a drop-in replacement for rustc.
   pointer, but there is no way to pass one *by reference*, and a copy is made on
   every call.
 - Code generation is a stack machine for expressions. The hottest five scalar
-  locals in each function are pinned to callee-saved registers; everything else
-  is in memory. Temporaries are spilled to frame slots, not the machine stack, so
+  locals in each function — including the scalar fields of a struct that is
+  never copied, returned or passed by value — are pinned to callee-saved
+  registers; everything else is in memory. Temporaries are spilled to frame slots, not the machine stack, so
   `%rsp` never moves and a call needs no alignment pad. The optimiser is a
   peephole pass (constant operands, folded comparisons, folded array addressing,
   `lea` strength reduction of `k*x+c`, division by a constant); there is no

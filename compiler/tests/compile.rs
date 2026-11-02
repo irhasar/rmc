@@ -227,3 +227,37 @@ fn spills_use_frame_slots_not_the_stack() {
     assert!(!g.contains("sub $8, %rsp"), "no alignment pad: {g}");
     assert!(g.contains("(%rbp)"), "spill lands in a frame slot: {g}");
 }
+
+#[test]
+fn a_hot_struct_field_is_promoted_to_a_register() {
+    // `p.x` is the hottest field, so it lives in `%rbx`; its initialiser
+    // writes the register instead of a frame slot.
+    let out = asm(
+        "struct P { x: i64, y: i64 } fn main() -> i64 { let mut p: P = P { x: 0, y: 1 }; let mut i: i64 = 0; while i < 10 { p.x = p.x + p.y; i = i + 1; } return p.x; }",
+    );
+    assert!(out.contains("mov %rax, %rbx"), "p.x initialises into a register: {out}");
+}
+
+#[test]
+fn a_copied_struct_keeps_its_fields_in_memory() {
+    // `p` is copied (`let q: P = p`) and passed by value, so every field must
+    // stay in memory for the whole-value copy to work.
+    let out = asm(
+        "struct P { x: i64, y: i64 } fn f(p: P) -> i64 { return p.x; } fn main() -> i64 { let p: P = P { x: 1, y: 2 }; let q: P = p; return f(q) + p.x; }",
+    );
+    let _ = store_offset_after(&out, "mov $1, %rax"); // panics if `x` were promoted
+}
+
+#[test]
+fn a_struct_array_field_keeps_the_field_to_slot_map_consistent() {
+    // `tag` is field 0 but sits above the three slots of `data`, so the field
+    // count (2) and the slot count (4) differ. Deriving the slot from the
+    // field count puts `tag` one word too low, so the literal would write a
+    // different slot than `w.tag` reads. With the slot count the field is
+    // promoted and both sides use its register.
+    let out = asm(
+        "struct W { tag: i64, data: [i64; 3] } fn main() -> i64 { let w: W = W { tag: 4, data: [1, 2, 3] }; return w.tag; }",
+    );
+    assert!(out.contains("mov %rax, %rbx"), "literal writes `tag` to its register: {out}");
+    assert!(out.contains("mov %rbx, %rax"), "`w.tag` reads the same register: {out}");
+}
