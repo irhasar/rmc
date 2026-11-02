@@ -378,3 +378,18 @@ fn the_bounds_handler_is_in_an_executable_section() {
         "the bounds handler must follow a `.text` directive"
     );
 }
+
+#[test]
+fn a_base_with_side_effects_runs_before_the_bounds_trap() {
+    // Rust evaluates the base and index before the bounds check, so the base
+    // call must be emitted before the trap, not skipped by it.
+    let out = compile_to_asm(
+        "fn make() -> [i64; 1] { print_i64(7); return [4]; } \
+         fn main() -> i64 { return make()[2]; }",
+        &CompileOptions { bounds_checks: true, ..Default::default() },
+    )
+    .unwrap();
+    let call = out.find("call make").expect("the base call is emitted");
+    let trap = out.find("jmp __rmc_bounds").expect("the check traps");
+    assert!(call < trap, "the base call must precede the bounds trap");
+}

@@ -1134,8 +1134,13 @@ impl Codegen {
                         // a block, a struct field), so index off that address.
                         match _idx.as_ref() {
                             Expr::Int(v) if (-2_147_483_648..=2_147_483_647).contains(v) => {
-                                self.check_bounds(base, _idx);
+                                // Evaluate the base before checking, so a call or
+                                // block base runs its side effects (Rust evaluates
+                                // the base and index before the bounds check). The
+                                // check uses no register, so the base address
+                                // survives in `%rax` for the load.
                                 self.gen_expr(base);
+                                self.check_bounds(base, _idx);
                                 self.line(&format!("mov {}(%rax), %rax", *v as i32 * 8));
                             }
                             _ => {

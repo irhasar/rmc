@@ -150,6 +150,10 @@ python3 tests/run.py -v
   a `Var`/`Field`/`Call` type and from a block's or `if`'s tail. A base it does
   not recognise silently skips the bounds check; extend it alongside any new
   array-valued expression form.
+- **Evaluate the base before checking bounds.** Rust runs the base and index
+  before the bounds check, so a call or block base with a side effect must run
+  even when the index is out of range. `check_bounds` uses no register, so
+  emitting `gen_expr(base)` first leaves the address in `%rax` for the load.
 - **Benchmark inputs must be opaque.** Programs read their workload via
   `arg_i64` (rmc) or `env::args()` + `black_box` (Rust), so LLVM cannot
   constant-fold the workload away. Do not "simplify" them to constants.

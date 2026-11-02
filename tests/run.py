@@ -78,13 +78,17 @@ def check_bounds_traps():
     `.rodata`, and index paths that skip the check (a block or call base, and a
     constant index on a non-local array).
     """
+    # Each case is (source, required stdout prefix). The prefix checks that a
+    # base with a side effect runs before the trap: Rust evaluates the base and
+    # index before the bounds check, so `make()[2]` must print before it exits.
     cases = {
-        "constant": "fn main() -> i64 { let a: [i64; 1] = [1; 1]; return a[2]; }",
-        "block": "fn main() -> i64 { let i: i64 = 9; let v: i64 = { let t: [i64; 3] = [10, 20, 30]; t }[i]; return v; }",
-        "call": "fn make() -> [i64; 3] { let a: [i64; 3] = [10, 20, 30]; return a; } fn main() -> i64 { return make()[10]; }",
+        "constant": ("fn main() -> i64 { let a: [i64; 1] = [1; 1]; return a[2]; }", b""),
+        "block": ("fn main() -> i64 { let i: i64 = 9; let v: i64 = { let t: [i64; 3] = [10, 20, 30]; t }[i]; return v; }", b""),
+        "call": ("fn make() -> [i64; 3] { let a: [i64; 3] = [10, 20, 30]; return a; } fn main() -> i64 { return make()[10]; }", b""),
+        "base_effect": ("fn make() -> [i64; 1] { print_i64(7); return [4]; } fn main() -> i64 { return make()[2]; }", b"7\n"),
     }
     failures = 0
-    for name, src in cases.items():
+    for name, (src, want_stdout) in cases.items():
         rms = os.path.join(OUT, f"trap_{name}.rms")
         with open(rms, "w") as f:
             f.write(src)
@@ -112,6 +116,9 @@ def check_bounds_traps():
         p = subprocess.run([exe], capture_output=True)
         if p.returncode != 101 or b"index out of bounds" not in p.stderr:
             print(f"FAIL trap {name}: exit={p.returncode} stderr={p.stderr!r} (want 101 + message)")
+            failures += 1
+        elif not p.stdout.startswith(want_stdout):
+            print(f"FAIL trap {name}: stdout={p.stdout!r} (want prefix {want_stdout!r}; base must run first)")
             failures += 1
     if failures == 0:
         print("all bounds traps exit 101 under a plain `ld` link")
