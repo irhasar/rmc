@@ -139,6 +139,17 @@ python3 tests/run.py -v
   assembly already carries `.note.GNU-stack` so no `-z noexecstack` is needed.
   `-n` (nmagic) drops the page alignment between sections and roughly halves the
   artifact size, which is one of the benchmark's measured dimensions.
+- **A runtime function must be emitted in `.text`.** `-n` merges sections so a
+  misplaced handler still runs under the CLI link, but a library client that
+  links with a plain `ld` (no `-n`) maps `.rodata` without execute permission,
+  so a handler left there faults. `__rmc_bounds` follows a `.rodata` message, so
+  it re-opens `.text` first; check this whenever a trap is added after a
+  `.section .rodata` block. `tests/run.py` links a few traps with a plain `ld`
+  to catch it.
+- **`array_len_of` must cover every array-typed base.** It reads the length from
+  a `Var`/`Field`/`Call` type and from a block's or `if`'s tail. A base it does
+  not recognise silently skips the bounds check; extend it alongside any new
+  array-valued expression form.
 - **Benchmark inputs must be opaque.** Programs read their workload via
   `arg_i64` (rmc) or `env::args()` + `black_box` (Rust), so LLVM cannot
   constant-fold the workload away. Do not "simplify" them to constants.

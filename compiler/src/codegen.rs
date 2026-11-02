@@ -88,14 +88,30 @@ impl Codegen {
         self
     }
 
-    /// The length of the array `base`, when its type is known.
+    /// The length of the array `base`, when it can be determined. A block or
+    /// `if` base gets its length from its tail, since that expression's type is
+    /// the value's type. This must cover every base `array_elem_operand` and the
+    /// index paths handle, or the check is silently skipped.
     fn array_len_of(base: &Expr) -> Option<usize> {
         match base {
-            Expr::Var { ty: Type::Array(_, n), .. }
-            | Expr::Field { ty: Type::Array(_, n), .. }
-            | Expr::Call { ret_ty: Type::Array(_, n), .. } => Some(*n),
+            Expr::Var { ty, .. } | Expr::Field { ty, .. } => Self::array_len_ty(ty),
+            Expr::Call { ret_ty, .. } => Self::array_len_ty(ret_ty),
+            Expr::Block(b) => b.tail.as_deref().and_then(Self::array_len_of),
+            Expr::If(_, then, Some(els)) => Self::array_len_of_tail(then)
+                .or_else(|| Self::array_len_of_tail(els)),
             _ => None,
         }
+    }
+
+    fn array_len_ty(ty: &Type) -> Option<usize> {
+        match ty {
+            Type::Array(_, n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    fn array_len_of_tail(b: &Block) -> Option<usize> {
+        b.tail.as_deref().and_then(Self::array_len_of)
     }
 
     /// Emit a bounds check for `base[idx]`. For a variable index the value is
@@ -1118,6 +1134,7 @@ impl Codegen {
                         // a block, a struct field), so index off that address.
                         match _idx.as_ref() {
                             Expr::Int(v) if (-2_147_483_648..=2_147_483_647).contains(v) => {
+                                self.check_bounds(base, _idx);
                                 self.gen_expr(base);
                                 self.line(&format!("mov {}(%rax), %rax", *v as i32 * 8));
                             }

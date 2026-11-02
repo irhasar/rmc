@@ -338,3 +338,43 @@ fn bounds_checks_leave_an_in_range_constant_alone() {
     assert!(!out.contains("jae __rmc_bounds"), "an in-range constant needs no check");
     assert!(!out.contains("jmp __rmc_bounds"), "an in-range constant needs no check");
 }
+
+#[test]
+fn bounds_checks_guard_a_block_base() {
+    // `{ ... }[i]` is a non-local base; its length comes from the block's tail,
+    // so the check must still be emitted.
+    let out = compile_to_asm(
+        "fn main() -> i64 { let i: i64 = 9; let v: i64 = { let t: [i64; 3] = [1; 3]; t }[i]; return v; }",
+        &CompileOptions { bounds_checks: true, ..Default::default() },
+    )
+    .unwrap();
+    assert!(out.contains("cmp $3, %rax"), "compares to the block's array length");
+    assert!(out.contains("jae __rmc_bounds"), "traps on out of range");
+}
+
+#[test]
+fn bounds_checks_guard_a_constant_index_on_a_non_local_base() {
+    // `make()[10]` takes the non-local constant-index branch; it must check too.
+    let out = compile_to_asm(
+        "fn make() -> [i64; 3] { let a: [i64; 3] = [1; 3]; return a; } \
+         fn main() -> i64 { return make()[10]; }",
+        &CompileOptions { bounds_checks: true, ..Default::default() },
+    )
+    .unwrap();
+    assert!(out.contains("jmp __rmc_bounds"), "an out-of-range constant traps");
+}
+
+#[test]
+fn the_bounds_handler_is_in_an_executable_section() {
+    // `__rmc_bounds` is called, so it must not be left in the `.rodata` opened
+    // by the message before it; a plain `ld` link would then fault.
+    let out = asm("fn main() -> i64 { return 0; }");
+    let at = out.find(".globl __rmc_bounds").expect("handler present");
+    let before = &out[..at];
+    let text = before.rfind(".text").expect("a .text directive");
+    let section = before.rfind(".section");
+    assert!(
+        section.map_or(true, |s| text > s),
+        "the bounds handler must follow a `.text` directive"
+    );
+}

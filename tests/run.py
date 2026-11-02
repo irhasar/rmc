@@ -71,6 +71,53 @@ def compile_and_run(name, argv):
     return run(rmc_bin), run(rust_bin)
 
 
+def check_bounds_traps():
+    """Assemble and link a few out-of-range programs with a plain `ld` (no `-n`),
+    which maps sections by permission. Every one must report the error and exit
+    101, not fault. This catches a bounds handler emitted into non-executable
+    `.rodata`, and index paths that skip the check (a block or call base, and a
+    constant index on a non-local array).
+    """
+    cases = {
+        "constant": "fn main() -> i64 { let a: [i64; 1] = [1; 1]; return a[2]; }",
+        "block": "fn main() -> i64 { let i: i64 = 9; let v: i64 = { let t: [i64; 3] = [10, 20, 30]; t }[i]; return v; }",
+        "call": "fn make() -> [i64; 3] { let a: [i64; 3] = [10, 20, 30]; return a; } fn main() -> i64 { return make()[10]; }",
+    }
+    failures = 0
+    for name, src in cases.items():
+        rms = os.path.join(OUT, f"trap_{name}.rms")
+        with open(rms, "w") as f:
+            f.write(src)
+        asm = subprocess.run([RMC, "--bounds-checks", "--emit-asm", rms], capture_output=True)
+        if asm.returncode != 0:
+            print(f"FAIL trap {name}: rmc failed:\n{asm.stderr.decode(errors='replace')}")
+            failures += 1
+            continue
+        s_path = os.path.join(OUT, f"trap_{name}.s")
+        o_path = os.path.join(OUT, f"trap_{name}.o")
+        exe = os.path.join(OUT, f"trap_{name}.exe")
+        with open(s_path, "wb") as f:
+            f.write(asm.stdout)
+        p = subprocess.run(["as", s_path, "-o", o_path], capture_output=True)
+        if p.returncode != 0:
+            print(f"FAIL trap {name}: as failed:\n{p.stderr.decode(errors='replace')}")
+            failures += 1
+            continue
+        # A plain link honours section permissions, unlike the CLI's `-n`.
+        p = subprocess.run(["ld", "-o", exe, o_path], capture_output=True)
+        if p.returncode != 0:
+            print(f"FAIL trap {name}: ld failed:\n{p.stderr.decode(errors='replace')}")
+            failures += 1
+            continue
+        p = subprocess.run([exe], capture_output=True)
+        if p.returncode != 101 or b"index out of bounds" not in p.stderr:
+            print(f"FAIL trap {name}: exit={p.returncode} stderr={p.stderr!r} (want 101 + message)")
+            failures += 1
+    if failures == 0:
+        print("all bounds traps exit 101 under a plain `ld` link")
+    return failures
+
+
 def main():
     verbose = "-v" in sys.argv
     os.makedirs(OUT, exist_ok=True)
@@ -118,6 +165,8 @@ def main():
                             break
                 elif verbose:
                     print(f"ok   {name} {argv}")
+
+    failures += check_bounds_traps()
 
     total = len(names)
     if failures == 0:

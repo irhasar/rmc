@@ -370,6 +370,11 @@ __rmc_overflow:
 .section .rodata
 __rmc_overflow_msg: .ascii "rmc: arithmetic overflow\n"
 
+# Back to code: `__rmc_bounds` is called, so it must live in an executable
+# section. Without this the handler is emitted into the non-executable
+# `.rodata` left open by the message above, and a plain `ld` link (no `-n`)
+# faults instead of exiting 101.
+.text
 # void __rmc_bounds(void)  -- a checked array index was out of range; write a
 # fixed message and exit with status 101, mirroring a Rust panic.
 .globl __rmc_bounds
