@@ -439,8 +439,15 @@ impl Codegen {
                         }
                     }
                 } else if let Some(e) = init {
-                    self.gen_expr_into_reg(e, "%rax");
-                    self.store_slot(*slot);
+                    // Write straight into the target: the promoted register when
+                    // there is one, else `%rax` for the frame store.
+                    match self.reg_of(*slot) {
+                        Some(r) => self.gen_expr_into_reg(e, r),
+                        None => {
+                            self.gen_expr_into_reg(e, "%rax");
+                            self.store_slot(*slot);
+                        }
+                    }
                 } else {
                     match self.reg_of(*slot) {
                         Some(r) => self.line(&format!("xor {r}, {r}")),
@@ -460,8 +467,13 @@ impl Codegen {
                         self.copy_words_rdi_rsi(n);
                     }
                     Expr::Var { slot, .. } => {
-                        self.gen_expr_into_reg(value, "%rax");
-                        self.store_slot(*slot);
+                        match self.reg_of(*slot) {
+                            Some(r) => self.gen_expr_into_reg(value, r),
+                            None => {
+                                self.gen_expr_into_reg(value, "%rax");
+                                self.store_slot(*slot);
+                            }
+                        }
                     }
                     Expr::Field { ty, .. } if ty.is_aggregate() => {
                         let n = ty.size() / 8;
@@ -959,35 +971,15 @@ impl Codegen {
     /// for a register `x` and a small constant becomes a single `lea`, which is
     /// the common case in argument setup and in `let t = i - 1;`.
     fn gen_expr_into_reg(&mut self, e: &Expr, dst: &str) {
-        if let Expr::Bin(op, a, b) = e {
-            // A folded `lea` cannot trap, so it is only sound when overflow
-            // checks are off; with them on, fall through to `gen_bin`, which
-            // emits the `jo` after the arithmetic.
-            let k = if self.overflow {
-                None
-            } else {
-                match op {
-                    BinOp::Add => Self::small_imm(b).or_else(|| Self::small_imm(a)),
-                    BinOp::Sub => Self::small_imm(b).map(|k| -k),
-                    _ => None,
-                }
-            };
-            if let Some(k) = k {
-                // The register operand: for `Sub` it is the left side only.
-                let base = if matches!(op, BinOp::Sub) {
-                    self.simple_operand(a)
-                } else if Self::small_imm(b).is_some() {
-                    self.simple_operand(a)
-                } else {
-                    self.simple_operand(b)
-                };
-                // LEA needs a register base; an immediate or a memory operand
-                // does not qualify.
-                if let Some(base) = base {
-                    if base.starts_with('%') {
-                        self.line(&format!("lea {k}({base}), {dst}"));
-                        return;
-                    }
+        // A folded `lea` cannot trap, so the strength reductions below are only
+        // sound when overflow checks are off; with them on, fall through to
+        // `gen_expr`, which emits the `jo` after each arithmetic op.
+        if !self.overflow {
+            if let Some((reg, k, c)) = self.lea_shape(e) {
+                // `reg` alone is a plain move; anything else is one `lea`.
+                if k != 1 || c != 0 {
+                    self.line(&format!("lea {}, {dst}", Self::lea_operand(&reg, k, c)));
+                    return;
                 }
             }
         }
@@ -1000,6 +992,71 @@ impl Codegen {
         self.gen_expr(e);
         if dst != "%rax" {
             self.line(&format!("mov %rax, {dst}"));
+        }
+    }
+
+    /// The register holding `e` when it is a scalar local or field promoted to
+    /// a register. `lea` needs a register base/index, so memory operands and
+    /// immediates do not qualify.
+    fn reg_operand(&self, e: &Expr) -> Option<String> {
+        self.simple_operand(e).filter(|s| s.starts_with('%'))
+    }
+
+    /// Recognise `k * x + c` where `x` is register-resident and `k` is one of
+    /// the scales an `lea` can express, returning `(x, k, c)`. This folds
+    /// `2*i`, `3*i + 1`, `8*i` and friends into a single `lea`.
+    fn lea_shape(&self, e: &Expr) -> Option<(String, i64, i64)> {
+        if let Expr::Bin(op, a, b) = e {
+            match op {
+                BinOp::Add => {
+                    if let Some(c) = Self::small_imm(b) {
+                        if let Some((r, k, c0)) = self.lea_shape(a) {
+                            return Some((r, k, c0 + c));
+                        }
+                    }
+                    if let Some(c) = Self::small_imm(a) {
+                        if let Some((r, k, c0)) = self.lea_shape(b) {
+                            return Some((r, k, c0 + c));
+                        }
+                    }
+                }
+                BinOp::Sub => {
+                    if let Some(c) = Self::small_imm(b) {
+                        if let Some((r, k, c0)) = self.lea_shape(a) {
+                            return Some((r, k, c0 - c));
+                        }
+                    }
+                }
+                BinOp::Mul => {
+                    let (k, x) = match (Self::small_imm(a), Self::small_imm(b)) {
+                        (Some(k), None) => (k, b),
+                        (None, Some(k)) => (k, a),
+                        _ => return None,
+                    };
+                    if matches!(k, 1 | 2 | 3 | 4 | 5 | 8 | 9) {
+                        if let Some(r) = self.reg_operand(x) {
+                            return Some((r, k, 0));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.reg_operand(e).map(|r| (r, 1, 0))
+    }
+
+    /// The `lea` source operand computing `k * reg + c`, for the scales `lea`
+    /// can express: 1, 2, 3, 4, 5, 8 and 9 (as base + index*scale).
+    fn lea_operand(reg: &str, k: i64, c: i64) -> String {
+        match k {
+            1 => format!("{c}({reg})"),
+            2 => format!("{c}({reg},{reg})"),
+            3 => format!("{c}({reg},{reg},2)"),
+            4 => format!("{c}(,{reg},4)"),
+            5 => format!("{c}({reg},{reg},4)"),
+            8 => format!("{c}(,{reg},8)"),
+            9 => format!("{c}({reg},{reg},8)"),
+            _ => unreachable!("lea_shape only yields expressible scales"),
         }
     }
 
@@ -1291,10 +1348,18 @@ impl Codegen {
                     }
                     // `a` in memory, `b` immediate: `cmpq $b, a` is `a - b`.
                     (false, true) => self.line(&format!("cmpq {y}, {x}")),
-                    // Two memory operands: materialise `b`.
+                    // Two register-free operands. `cmp y, x` is legal unless
+                    // both are memory (x86 has no mem,mem compare); only then
+                    // must `b` be materialised into a register.
                     (false, false) => {
-                        self.gen_expr(b);
-                        self.line(&format!("cmp %rax, {x}"));
+                        let x_mem = !x.starts_with('%') && !x.starts_with('$');
+                        let y_mem = !y.starts_with('%') && !y.starts_with('$');
+                        if x_mem && y_mem {
+                            self.gen_expr(b);
+                            self.line(&format!("cmp %rax, {x}"));
+                        } else {
+                            self.line(&format!("cmp {y}, {x}"));
+                        }
                     }
                 }
                 true

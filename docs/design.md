@@ -22,7 +22,7 @@ driver shells out to GNU `as` and `ld`.
    expression leaves its result in `%rax`; the result type is returned to the
    caller so callers know how to use it.
 5. **Assemble and link** (`main.rs`) — writes the assembly, runs `as --64`, then
-   `ld -o <out> --build-id=none <obj>`, with the runtime text prepended.
+   `ld -o <out> --build-id=none -n <obj>`, with the runtime text prepended.
 
 ## Stack layout
 

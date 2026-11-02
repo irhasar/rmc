@@ -104,8 +104,10 @@ python3 tests/run.py -v
 - **Statements vs. tail expressions.** Assignments inside a block must be
   detected before the trailing-`;` check in `parse_block`, otherwise `x = ...;`
   is parsed as an expression and rejected.
-- **Link flags.** The driver uses `ld -o <out> --build-id=none <obj>`; the
+- **Link flags.** The driver uses `ld -o <out> --build-id=none -n <obj>`; the
   assembly already carries `.note.GNU-stack` so no `-z noexecstack` is needed.
+  `-n` (nmagic) drops the page alignment between sections and roughly halves the
+  artifact size, which is one of the benchmark's measured dimensions.
 - **Benchmark inputs must be opaque.** Programs read their workload via
   `arg_i64` (rmc) or `env::args()` + `black_box` (Rust), so LLVM cannot
   constant-fold the workload away. Do not "simplify" them to constants.
@@ -153,11 +155,17 @@ the intended next steps.
   which is why `contains_call` treats a struct/array literal as call-like: a
   literal is materialised through this copy, so it must not be selected by the
   direct-argument shortcut that requires register preservation.
-- **`gen_expr_into_reg` folds `x ± k` into one `lea`.** It is only valid when
-  overflow checks are off (a `lea` cannot trap); with `--overflow-checks` it
-  falls through to `gen_bin`, which emits the `jo`. `gen_expr_into_reg(e, dst)`
-  is also the safe way to materialise an expression straight into a destination
-  register during argument setup.
+- **`gen_expr_into_reg` folds arithmetic into one `lea`.** `lea_shape` recognises
+  `k*x + c` for the scales `lea` can express (1, 2, 3, 4, 5, 8, 9) and a constant
+  offset, so `2*i+3` becomes one instruction. It is only valid when overflow
+  checks are off (a `lea` cannot trap); with `--overflow-checks` it falls through
+  to `gen_expr`, which emits the `jo`. `gen_expr_into_reg(e, dst)` is also the
+  safe way to materialise an expression straight into a destination register
+  during argument setup, and a scalar `let`/assignment writes straight into a
+  promoted local's register rather than bouncing through `%rax`.
+- **`emit_cmp` folds a register operand.** `cmp %r, %r` and `cmp %r, mem` are
+  legal, so a comparison between two promoted locals is one instruction; only a
+  `mem, mem` compare must materialise one side into `%rax`.
 - **Aggregates are copied, not aliased.** Whole-aggregate assignment, struct
   fields of aggregate type, array elements of aggregate type, and struct-literal
   fields all copy their words. A field or element read of aggregate type yields

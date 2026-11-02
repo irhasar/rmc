@@ -148,11 +148,12 @@ fn assemble(asm: &Path, obj: &Path) -> Result<(), String> {
 }
 
 fn link(obj: &Path, exe: &Path) -> Result<(), String> {
+    // The assembly carries a `.note.GNU-stack` section, so the stack is marked
+    // non-executable without an explicit `-z noexecstack`. `-n` drops the
+    // page alignment between sections, which roughly halves the artifact size.
     let out = Command::new("ld")
         .arg("-o")
         .arg(exe)
-        .arg("-z")
-        .arg("noexecstack")
         .arg("--build-id=none")
         .arg("-n")
         .arg(obj)

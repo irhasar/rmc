@@ -191,3 +191,26 @@ fn an_inferred_array_is_initialised() {
     // The splat fill writes both elements.
     assert!(out.matches("mov %rax, ").count() >= 2, "both elements written: {out}");
 }
+
+#[test]
+fn a_small_multiply_and_offset_fold_to_one_lea() {
+    // `2*x + 3` on a promoted local is a single `lea`, with no `imul`.
+    let out = asm("fn g(i: i64) -> i64 { let mut x: i64 = i; x = 2 * x + 3; return x; } fn main() -> i64 { return 0; }");
+    // Scope to `g`: the runtime's `arg_i64` contains its own `imul`.
+    let g = &out[out.find("g:").unwrap()..out.find(".size g,").unwrap()];
+    assert!(g.contains("lea 3(%"), "folded into lea: {g}");
+    assert!(!g.contains("imul"), "no multiply remains: {g}");
+}
+
+#[test]
+fn a_comparison_of_two_promoted_locals_is_one_cmp() {
+    // Both operands live in registers, so no value is materialised in `%rax`.
+    let out = asm(
+        "fn g(a: i64, b: i64) -> bool { let mut x: i64 = a; let mut y: i64 = b; x = x + 1; y = y + 1; return x < y; } fn main() -> i64 { return 0; }",
+    );
+    let has_reg_reg_cmp = out.lines().any(|l| {
+        let l = l.trim();
+        l.starts_with("cmp %") && l.matches("%r").count() >= 2 && !l.contains("%rax")
+    });
+    assert!(has_reg_reg_cmp, "register-to-register cmp: {out}");
+}
