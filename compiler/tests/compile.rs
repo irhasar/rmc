@@ -64,7 +64,7 @@ fn overflow_checks_add_a_jo() {
     assert!(!plain.contains("jo __rmc_overflow"));
     let checked = compile_to_asm(
         "fn main() -> i64 { let mut x: i64 = 1; x = x + 1; return x; }",
-        &CompileOptions { overflow_checks: true },
+        &CompileOptions { overflow_checks: true, ..Default::default() },
     )
     .unwrap();
     assert!(checked.contains("jo __rmc_overflow"));
@@ -291,4 +291,50 @@ fn a_folded_lea_displacement_stays_in_range() {
     // fold must be abandoned, not emitted.
     let out = asm("fn main() -> i64 { let mut x: i64 = 1; x = x + 2147483647 + 1; return x; }");
     assert!(!out.contains("2147483648("), "no out-of-range displacement: {out}");
+}
+
+#[test]
+fn a_return_before_unreachable_statements_is_accepted() {
+    // The `return` ends the block; the trailing statement is unreachable and
+    // must not make `block_diverges` decide the function can fall off the end.
+    let out = asm("fn f() -> i64 { return 7; print_i64(9); } fn main() -> i64 { return f(); }");
+    assert!(out.contains("f:"), "compiles: {out}");
+}
+
+#[test]
+fn bounds_checks_are_off_by_default() {
+    let out = asm("fn main() -> i64 { let a: [i64; 2] = [1, 2]; let i: i64 = 0; return a[i]; }");
+    assert!(!out.contains("jae __rmc_bounds"), "no check without the flag");
+}
+
+#[test]
+fn bounds_checks_guard_a_variable_index() {
+    let out = compile_to_asm(
+        "fn main() -> i64 { let a: [i64; 2] = [1, 2]; let i: i64 = 0; return a[i]; }",
+        &CompileOptions { bounds_checks: true, ..Default::default() },
+    )
+    .unwrap();
+    assert!(out.contains("cmp $2, %rax"), "compares the index to the length");
+    assert!(out.contains("jae __rmc_bounds"), "traps on out of range");
+}
+
+#[test]
+fn bounds_checks_reject_an_out_of_range_constant_at_compile_time() {
+    let out = compile_to_asm(
+        "fn main() -> i64 { let a: [i64; 2] = [1, 2]; return a[5]; }",
+        &CompileOptions { bounds_checks: true, ..Default::default() },
+    )
+    .unwrap();
+    assert!(out.contains("jmp __rmc_bounds"), "a constant out of range traps");
+}
+
+#[test]
+fn bounds_checks_leave_an_in_range_constant_alone() {
+    let out = compile_to_asm(
+        "fn main() -> i64 { let a: [i64; 2] = [1, 2]; return a[1]; }",
+        &CompileOptions { bounds_checks: true, ..Default::default() },
+    )
+    .unwrap();
+    assert!(!out.contains("jae __rmc_bounds"), "an in-range constant needs no check");
+    assert!(!out.contains("jmp __rmc_bounds"), "an in-range constant needs no check");
 }

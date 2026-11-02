@@ -27,6 +27,10 @@ pub struct CompileOptions {
     /// with status 101 instead of wrapping. Off by default because it costs a
     /// branch per arithmetic operation.
     pub overflow_checks: bool,
+    /// Insert a bounds check before every array index so that an out-of-range
+    /// index exits with status 101 instead of reading or writing adjacent stack
+    /// memory. Off by default because it costs a compare and branch per index.
+    pub bounds_checks: bool,
 }
 
 /// Compile `src` (a `.rms` program) to x86-64 assembly in GNU `as` syntax.
@@ -43,6 +47,9 @@ pub fn compile_to_asm(src: &str, opts: &CompileOptions) -> Result<String, String
     let mut cg = codegen::Codegen::new();
     if opts.overflow_checks {
         cg = cg.overflow_checks();
+    }
+    if opts.bounds_checks {
+        cg = cg.bounds_checks();
     }
     let user_asm = cg.compile(&prog);
 

@@ -72,6 +72,12 @@ evaluated once, before the loop; `continue` still runs the increment.
 
 ## Overflow
 
+Array indices are `i64` and are unchecked by default, as in C. Compiling with
+`--bounds-checks` (or `CompileOptions { bounds_checks: true }`) checks every
+index against the array's length; an out-of-range index writes
+`rmc: index out of bounds` to stderr and exits with status 101. A constant index
+is checked when the program is compiled, not at run time.
+
 By default integer arithmetic wraps, as in release-mode Rust. Compiling with
 `--overflow-checks` (or `CompileOptions { overflow_checks: true }` from the
 library) inserts a trap after every `+`, `-` and `*`; on overflow the program

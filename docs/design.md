@@ -211,6 +211,13 @@ kernel.
 
 ### Overflow checks
 
+With `--bounds-checks`, every array index is preceded by a compare against the
+array's length and a `jae` to a runtime trap; `jae` catches a negative index too,
+since it is an enormous unsigned value. A constant index is folded: in range
+emits nothing, out of range is an unconditional `jmp` to the trap. When the flag
+is on, an array element is never used as a bare memory operand, so no access can
+bypass the check.
+
 With `--overflow-checks`, every `+`, `-` and `*` is followed by `jo
 __rmc_overflow`. The trap writes a fixed message to stderr and exits 101, the
 same status rustc uses for a panic. The check is off by default because it costs

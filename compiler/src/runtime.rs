@@ -369,4 +369,22 @@ __rmc_overflow:
 
 .section .rodata
 __rmc_overflow_msg: .ascii "rmc: arithmetic overflow\n"
+
+# void __rmc_bounds(void)  -- a checked array index was out of range; write a
+# fixed message and exit with status 101, mirroring a Rust panic.
+.globl __rmc_bounds
+.type __rmc_bounds, @function
+__rmc_bounds:
+    mov $1, %rax
+    mov $2, %rdi             # stderr, like a Rust panic
+    lea __rmc_bounds_msg(%rip), %rsi
+    mov $30, %rdx
+    syscall
+    mov $101, %rdi
+    mov $60, %rax
+    syscall
+.size __rmc_bounds, .-__rmc_bounds
+
+.section .rodata
+__rmc_bounds_msg: .ascii "rmc: index out of bounds\n"
 "#;

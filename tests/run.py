@@ -36,6 +36,9 @@ def extra_flags(name):
     checks for both compilers, so the case can be diffed like any other."""
     if os.path.exists(os.path.join(CASES, f"{name}.overflow")):
         return ["--overflow-checks"], ["-C", "overflow-checks=on"]
+    if os.path.exists(os.path.join(CASES, f"{name}.bounds")):
+        # rustc checks array bounds by default, so only rmc needs the flag.
+        return ["--bounds-checks"], []
     return [], []
 
 

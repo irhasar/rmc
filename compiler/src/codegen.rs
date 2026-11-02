@@ -28,6 +28,9 @@ pub struct Codegen {
     /// Slot -> callee-saved register for locals promoted out of memory in the
     /// function currently being generated. Empty means every local is in memory.
     regs: Vec<(i32, &'static str)>,
+    /// When set, every array index is checked against the array's length and an
+    /// out-of-range index traps instead of reading or writing adjacent memory.
+    bounds: bool,
     /// When set, every `+`, `-` and `*` is followed by a jump-if-overflow to the
     /// runtime trap. Off by default because it costs a branch per operation.
     overflow: bool,
@@ -66,6 +69,7 @@ impl Codegen {
             loops: Vec::new(),
             epilogue: String::new(),
             regs: Vec::new(),
+            bounds: false,
             overflow: false,
             ret_slot: -1,
             ret_ty: Type::Unit,
@@ -76,6 +80,49 @@ impl Codegen {
     pub fn overflow_checks(mut self) -> Self {
         self.overflow = true;
         self
+    }
+
+    /// Turn on array bounds checks.
+    pub fn bounds_checks(mut self) -> Self {
+        self.bounds = true;
+        self
+    }
+
+    /// The length of the array `base`, when its type is known.
+    fn array_len_of(base: &Expr) -> Option<usize> {
+        match base {
+            Expr::Var { ty: Type::Array(_, n), .. }
+            | Expr::Field { ty: Type::Array(_, n), .. }
+            | Expr::Call { ret_ty: Type::Array(_, n), .. } => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Emit a bounds check for `base[idx]`. For a variable index the value is
+    /// in `%rax`, and `jae` after `cmp` catches both `idx >= len` and a negative
+    /// index, which is an enormous unsigned value. A constant index is decided
+    /// here instead: in range emits nothing, out of range is an unconditional
+    /// trap.
+    fn check_bounds(&mut self, base: &Expr, idx: &Expr) {
+        if !self.bounds {
+            return;
+        }
+        let n = match Self::array_len_of(base) {
+            Some(n) => n,
+            None => return,
+        };
+        if let Expr::Int(v) = idx {
+            // A constant index is decided here: in range emits nothing, out of
+            // range is a trap. (`v as i128` avoids wrapping on a huge literal.)
+            if (*v as i128) < 0 || (*v as i128) >= n as i128 {
+                self.line("jmp __rmc_bounds");
+            }
+            return;
+        }
+        if n <= i32::MAX as usize {
+            self.line(&format!("cmp ${n}, %rax"));
+            self.line("jae __rmc_bounds");
+        }
     }
 
     /// The register holding local `slot`, if it was promoted out of memory.
@@ -722,6 +769,7 @@ impl Codegen {
                         match self.array_elem_operand(base, idx) {
                             // Constant index: one store.
                             Some(op) if !op.contains("%rax") => {
+                                self.check_bounds(base, idx);
                                 self.gen_expr(value);
                                 self.line(&format!("mov %rax, {op}"));
                             }
@@ -731,10 +779,12 @@ impl Codegen {
                                 match self.simple_operand(value) {
                                     Some(vs) if vs.starts_with('$') => {
                                         self.gen_expr(idx);
+                                        self.check_bounds(base, idx);
                                         self.line(&format!("movq {vs}, {op}"));
                                     }
                                     Some(vs) => {
                                         self.gen_expr(idx);
+                                        self.check_bounds(base, idx);
                                         self.line(&format!("mov {vs}, %rcx"));
                                         self.line(&format!("mov %rcx, {op}"));
                                     }
@@ -742,6 +792,7 @@ impl Codegen {
                                         self.gen_expr(value);
                                         self.push_rax();
                                         self.gen_expr(idx);
+                                        self.check_bounds(base, idx);
                                         self.pop_to("%rcx");
                                         self.line(&format!("mov %rcx, {op}"));
                                     }
@@ -964,6 +1015,7 @@ impl Codegen {
                 }
                 self.push_rax();
                 self.gen_expr(idx);
+                self.check_bounds(base, idx);
                 self.pop_to("%rcx");
                 self.line("lea (%rcx,%rax,8), %rax");
             }
@@ -1053,9 +1105,11 @@ impl Codegen {
                     // `disp(%rbp,%reg,8)` addresses the element in one operand.
                     Some(op) if op.contains("%rax") => {
                         self.gen_expr(_idx);
+                        self.check_bounds(base, _idx);
                         self.line(&format!("mov {op}, %rax"));
                     }
                     Some(op) => {
+                        self.check_bounds(base, _idx);
                         self.line(&format!("mov {op}, %rax"));
                     }
                     None => {
@@ -1071,6 +1125,7 @@ impl Codegen {
                                 self.gen_expr(base);
                                 self.push_rax();
                                 self.gen_expr(_idx);
+                                self.check_bounds(base, _idx);
                                 self.pop_to("%rcx");
                                 self.line("mov (%rcx,%rax,8), %rax");
                             }
@@ -1167,6 +1222,12 @@ impl Codegen {
                 }
             }
             Expr::Index(base, idx) => {
+                // With bounds checks on, an element is never used as a bare
+                // operand: it is materialised through `gen_expr`, which emits
+                // the check.
+                if self.bounds {
+                    return None;
+                }
                 match self.array_elem_operand(base, idx) {
                     // Only register-free operands are usable here.
                     Some(op) if !op.contains("%rax") => Some(op),

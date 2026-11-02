@@ -597,10 +597,16 @@ impl Sema {
 /// last statement does. Used to accept a value-returning function whose body
 /// ends in `return` on every path, and reject one that can fall off the end.
 fn block_diverges(b: &Block) -> bool {
-    match &b.tail {
-        Some(e) => expr_diverges(e),
-        None => b.stmts.last().map_or(false, stmt_diverges),
+    // Walk in execution order: a statement that unconditionally diverges ends
+    // the block, so everything after it (including the tail) is unreachable and
+    // must not decide the result. `fn f() -> i64 { return 7; print_i64(9); }`
+    // diverges at the `return`.
+    for s in &b.stmts {
+        if stmt_diverges(s) {
+            return true;
+        }
     }
+    b.tail.as_deref().map_or(false, expr_diverges)
 }
 
 fn stmt_diverges(s: &Stmt) -> bool {
@@ -610,6 +616,10 @@ fn stmt_diverges(s: &Stmt) -> bool {
         // treating it as diverging keeps the walk total.
         Stmt::Break | Stmt::Continue => true,
         Stmt::Expr(e) => expr_diverges(e),
+        // A `let`/assignment whose initialiser diverges never completes, so the
+        // following statements are unreachable.
+        Stmt::Let { init: Some(e), .. } => expr_diverges(e),
+        Stmt::Assign { value, .. } => expr_diverges(value),
         // A loop is not a guaranteed return: it may break or never run.
         _ => false,
     }

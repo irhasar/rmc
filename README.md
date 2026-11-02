@@ -65,6 +65,7 @@ rmc input.rms -o output            # compile, assemble and link
 rmc input.rms --emit-asm           # print the generated assembly to stdout
 rmc input.rms --keep-asm -o out    # keep the intermediate .s file
 rmc input.rms --overflow-checks    # trap on i64 +,-,* overflow (exit 101)
+rmc input.rms --bounds-checks      # trap on an out-of-range array index (exit 101)
 ```
 
 Run the produced binary directly; it is a static ELF executable with no
@@ -133,7 +134,8 @@ array elements and struct fields (including compound `+=` and friends);
 `return`; arithmetic and comparison operators; `&&`/`||`; string literals;
 attributes such as `#[derive(Copy, Clone)]` (parsed and ignored); and a small
 set of runtime builtins. Structs and arrays may be passed to and returned from
-functions by value. Overflow checks are opt-in with `--overflow-checks`. See
+functions by value. Overflow checks are opt-in with `--overflow-checks`, and
+array bounds checks with `--bounds-checks`. See
 `docs/language.md` for the full grammar.
 
 Runtime builtins (provided by `src/runtime.rs`, no imports needed):
@@ -224,8 +226,10 @@ rmc is a small, self-contained compiler, not a drop-in replacement for rustc.
   analysis.
 - The backend targets x86-64 Linux only, using the System V ABI and raw Linux
   syscalls. There is no Windows, macOS, ARM, or WebAssembly support.
-- Array indexing is unchecked: an out-of-range index reads or writes adjacent
-  stack memory, exactly as in C. There are no bounds checks.
+- Array indexing is unchecked by default: an out-of-range index reads or writes
+  adjacent stack memory, exactly as in C. `--bounds-checks` inserts a check
+  before every index that traps with `rmc: index out of bounds` (exit 101); a
+  constant index is decided at compile time.
 - The heap is a simple first-fit free-list allocator; it does not return memory
   to the kernel and has no thread safety.
 - `rmc` is one person's project with a differential test suite and CI, not a

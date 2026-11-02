@@ -16,6 +16,7 @@ struct Options {
     emit_asm: bool,
     keep_asm: bool,
     overflow_checks: bool,
+    bounds_checks: bool,
 }
 
 fn parse_args() -> Result<Options, String> {
@@ -25,6 +26,7 @@ fn parse_args() -> Result<Options, String> {
     let mut emit_asm = false;
     let mut keep_asm = false;
     let mut overflow_checks = false;
+    let mut bounds_checks = false;
 
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -35,6 +37,7 @@ fn parse_args() -> Result<Options, String> {
             "--emit-asm" => emit_asm = true,
             "--keep-asm" => keep_asm = true,
             "--overflow-checks" => overflow_checks = true,
+            "--bounds-checks" => bounds_checks = true,
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -62,6 +65,7 @@ fn parse_args() -> Result<Options, String> {
         emit_asm,
         keep_asm,
         overflow_checks,
+        bounds_checks,
     })
 }
 
@@ -76,6 +80,7 @@ fn print_help() {
          \x20   --emit-asm     print generated assembly to stdout and stop\n\
          \x20   --keep-asm     keep the intermediate .s file next to the output\n\
          \x20   --overflow-checks  trap on i64 +,-,* overflow (off by default)\n\
+         \x20   --bounds-checks    trap on an out-of-range array index (off by default)\n\
          \x20   -h, --help     show this help\n\
          \n\
          The accepted language is a strict subset of Rust. Entry point is `fn main`."
@@ -110,6 +115,7 @@ fn run(opts: Options) -> Result<(), String> {
         &src,
         &CompileOptions {
             overflow_checks: opts.overflow_checks,
+            bounds_checks: opts.bounds_checks,
         },
     )?;
 

@@ -173,9 +173,10 @@ arrays, structs, `for`, aggregates across calls), has no register allocator and
 only a small peephole optimiser (operand/comparison/array-address folding,
 constant folding, division by a constant), and no borrow checker. Aggregates
 cross a call only by value; there are no references. Array indexing is unchecked
-(the index is used as-is, like C), so an out-of-range index reads or writes
-adjacent stack memory; bounds checks are a roadmap item. The README's roadmap
-lists the intended next steps.
+by default (the index is used as-is, like C), so an out-of-range index reads or
+writes adjacent stack memory; `--bounds-checks` turns on a per-index check that
+traps (see the codegen notes). The README's roadmap lists the intended next
+steps.
 
 ## Codegen notes
 
@@ -197,6 +198,11 @@ lists the intended next steps.
   path returns, using `block_diverges`. It is deliberately conservative: an
   `if` with no `else`, a `while`, and a `loop` are not treated as guaranteed
   returns.
+- **With `--bounds-checks`, an array element is never a bare operand.**
+  `simple_operand` returns `None` for `Expr::Index` when `self.bounds` is set, so
+  every access is materialised through `gen_expr`/`gen_addr`, which emit the
+  check. If you add a code path that folds an element into an instruction
+  operand, it must also emit the check, or an out-of-range index can bypass it.
 - **`lea_shape` must keep its displacement in the signed 32-bit range.** Each
   constant in a folded `k*x + c` chain is representable alone, but their sum is
   not; `disp_ok` guards the fold, and a rejection falls back to ordinary code.
