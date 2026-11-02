@@ -72,6 +72,10 @@ python3 tests/run.py -v
 - **`for` is not a `while`.** `continue` must run the increment, so `for` keeps
   its own node with a dedicated continue label. Desugaring it to `while` would
   make `continue` skip the increment and loop forever.
+- **Promotion counting must stay linear.** `counts` is built in slot order and
+  `count_expr` indexes it directly by slot; do not reintroduce a linear `find`
+  per reference or per excluded slot, which is O(n^2) and made a 200k-element
+  array take seconds to compile. `large_array_compiles_in_linear_time` guards it.
 - **Struct layout must agree between read and write.** `sema` resolves a field
   to an offset from the aggregate base; codegen must add that offset to the same
   base used for reads (`field_operand`) and writes.
