@@ -393,3 +393,24 @@ fn a_base_with_side_effects_runs_before_the_bounds_trap() {
     let trap = out.find("jmp __rmc_bounds").expect("the check traps");
     assert!(call < trap, "the base call must precede the bounds trap");
 }
+
+#[test]
+fn a_repeat_literal_in_value_position_is_materialised() {
+    // `[v; n]` has no address of its own, so as an index base it must be built
+    // into a local array. Before this was handled the literal was emitted as a
+    // bare scalar and dereferenced as a pointer, crashing the program.
+    let out = asm("fn main() -> i64 { let i: i64 = 1; return [10; 3][i]; }");
+    // Three elements are splatted into a frame buffer, whose address is taken
+    // and indexed; no bare `mov $10, %rax` is dereferenced as a pointer.
+    assert!(out.contains("lea -") && out.contains("(%rbp), %rax"), "a buffer address is taken");
+    assert!(out.contains("mov (%rcx,%rax,8), %rax"), "the element is read from it");
+}
+
+#[test]
+fn a_repeat_literal_let_initialiser_keeps_the_splat() {
+    // The common case (`let a = [v; n]`, used by the sieve benchmark) must stay
+    // a single splat loop, not n separate stores.
+    let out = asm("fn main() -> i64 { let a: [i64; 200000] = [1; 200000]; return a[0]; }");
+    assert!(out.contains("mov %r8, (%rdx)"), "one splat loop fills the array");
+    assert!(out.contains("$200000, %rcx"), "the loop count is the array length");
+}

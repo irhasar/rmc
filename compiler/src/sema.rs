@@ -225,6 +225,22 @@ impl Sema {
             .map(|(_, s, t)| (*s, t.clone()))
     }
 
+    /// Type-check a `let` initialiser. A `[v; n]` written directly here is kept
+    /// as an `ArrayLit` so codegen splats one value across the array, rather
+    /// than materialising it element by element. Any other initialiser (and any
+    /// repeat literal nested inside one) goes through `check_expr`, which
+    /// rewrites a repeat literal to a block so it has an address.
+    fn check_let_init(&mut self, e: &mut Expr, scope: &mut Scope) -> Result<Type, String> {
+        if let Expr::ArrayLit(val, n) = e {
+            let t = self.check_expr(val, scope)?;
+            if !t.is_scalar() {
+                return Err(format!("array elements must be `i64` or `bool`, found {t:?}"));
+            }
+            return Ok(Type::Array(Box::new(t), *n));
+        }
+        self.check_expr(e, scope)
+    }
+
     fn check_block(&mut self, b: &mut Block, scope: &mut Scope) -> Result<Type, String> {
         let mark = scope.len();
         for st in &mut b.stmts {
@@ -246,7 +262,7 @@ impl Sema {
                     None => None,
                 };
                 let init_ty = match init {
-                    Some(e) => Some(self.check_expr(e, scope)?),
+                    Some(e) => Some(self.check_let_init(e, scope)?),
                     None => None,
                 };
                 let final_ty = match (declared, init_ty) {
@@ -575,7 +591,26 @@ impl Sema {
                 if !t.is_scalar() {
                     return Err(format!("array elements must be `i64` or `bool`, found {t:?}"));
                 }
-                Ok(Type::Array(Box::new(t), *n))
+                let ty = Type::Array(Box::new(t), *n);
+                // Value position: `[v; n]` has no address of its own, so rewrite
+                // it to a block that builds a local array and yields it. This
+                // reuses the `let`-initialiser splat path (a single fill loop
+                // for a large `n`), and both slots are resolved when the block
+                // is re-checked below. Without this a repeat literal used as an
+                // index base, argument, return or field would be emitted as a
+                // bare scalar and dereferenced as an address.
+                let name = "\u{0}rep".to_string();
+                let var = Expr::Var { name: name.clone(), slot: -1, ty: ty.clone() };
+                let stmts = vec![Stmt::Let {
+                    name: name.clone(),
+                    ty: Some(ty.clone()),
+                    init: Some(Expr::ArrayLit(val.clone(), *n)),
+                    slot: -1,
+                }];
+                *e = Expr::Block(Block { stmts, tail: Some(Box::new(var)) });
+                // Re-check the rewritten block so its statements are typed and
+                // slotted like any other.
+                self.check_expr(e, scope)
             }
             Expr::Cast(inner, to) => {
                 let it = self.check_expr(inner, scope)?;

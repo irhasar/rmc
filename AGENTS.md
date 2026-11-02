@@ -154,6 +154,15 @@ python3 tests/run.py -v
   before the bounds check, so a call or block base with a side effect must run
   even when the index is out of range. `check_bounds` uses no register, so
   emitting `gen_expr(base)` first leaves the address in `%rax` for the load.
+- **A repeat literal `[v; n]` has no address.** Codegen only materialises an
+  `ArrayLit` in `let`-initialiser position (the splat path); anywhere else it
+  must be built into a buffer first, or it is emitted as a bare scalar and
+  dereferenced as a pointer. Sema rewrites a value-position `[v; n]` to
+  `{ let __rep = [v; n]; __rep }` via `check_let_init`, which reuses the splat.
+  The list form `[a, b, c]` is unaffected: the parser already desugars it to a
+  block. Keep `check_let_init` special-casing only the *direct* initialiser; a
+  flag around the whole initialiser leaks into nested literals (a struct
+  literal's fields are checked while it is set).
 - **Benchmark inputs must be opaque.** Programs read their workload via
   `arg_i64` (rmc) or `env::args()` + `black_box` (Rust), so LLVM cannot
   constant-fold the workload away. Do not "simplify" them to constants.
