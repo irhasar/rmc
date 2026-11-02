@@ -18,6 +18,12 @@ pub struct Sig {
     pub ret: Type,
     /// A method receiver: such a function may only be called as `recv.name(..)`.
     pub takes_self: bool,
+    /// A `&self` / `&mut self` receiver: `params[0]` is a reference to the impl
+    /// type, and a method call passes the receiver's address, not a copy.
+    pub ref_self: bool,
+    /// True when the receiver was `&mut self`, so the synthesized parameter is
+    /// `&mut T` and matches the address the call site builds.
+    pub ref_self_mut: bool,
 }
 
 /// A laid-out struct: each field's name, resolved type and byte offset, plus the
@@ -97,6 +103,8 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
                 params: params.to_vec(),
                 ret,
                 takes_self: false,
+                ref_self: false,
+                ref_self_mut: false,
             },
         );
     }
@@ -105,7 +113,12 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
     // includes `self` from the start.
     for f in &mut prog.fns {
         if let Some(ty) = f.self_ty.clone() {
-            f.params.insert(0, ("self".to_string(), Type::Named(ty)));
+            let rt = if f.ref_self {
+                Type::Ref(Box::new(Type::Named(ty)), f.ref_self_mut)
+            } else {
+                Type::Named(ty)
+            };
+            f.params.insert(0, ("self".to_string(), rt));
         }
     }
     for f in &prog.fns {
@@ -128,7 +141,16 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         }
         // Aggregate parameters and returns are passed by pointer, so any type
         // is allowed here; the calling convention handles the rest.
-        sigs.insert(f.name.clone(), Sig { params, ret, takes_self: f.takes_self });
+        sigs.insert(
+            f.name.clone(),
+            Sig {
+                params,
+                ret,
+                takes_self: f.takes_self,
+                ref_self: f.ref_self,
+                ref_self_mut: f.ref_self_mut,
+            },
+        );
     }
 
     let mut sema = Sema {
@@ -291,6 +313,10 @@ fn resolve_ty_rec(
             }
             Ok(Type::Array(Box::new(e), *n))
         }
+        Type::Ref(inner, m) => {
+            let t = resolve_ty_rec(inner, raw_s, raw_e, so, eo, visiting)?;
+            Ok(Type::Ref(Box::new(t), *m))
+        }
         other => Ok(other.clone()),
     }
 }
@@ -323,6 +349,7 @@ fn resolve_in(
             }
             Ok(Type::Array(Box::new(e), *n))
         }
+        Type::Ref(inner, m) => Ok(Type::Ref(Box::new(resolve_in(inner, structs, enums)?), *m)),
         other => Ok(other.clone()),
     }
 }
@@ -354,7 +381,7 @@ impl Sema {
             let rt = self.resolve_ty(ty)?;
             *ty = rt.clone();
             // An aggregate parameter owns a frame buffer big enough for a copy;
-            // a scalar owns a single slot.
+            // a scalar (including a reference) owns a single slot.
             let slot = self.alloc_slots((rt.size() / 8) as i32);
             f.param_slots.push(slot);
             scope.push(Binding {
@@ -452,7 +479,7 @@ impl Sema {
                 };
                 let final_ty = match (declared, init_ty) {
                     (Some(d), Some(i)) => {
-                        if d != i {
+                        if d != i && !ref_coerces(&i, &d) {
                             return Err(format!(
                                 "variable `{name}`: declared type {d:?} does not match initializer type {i:?}"
                             ));
@@ -485,7 +512,7 @@ impl Sema {
                 let vty = self.check_expr(value, scope)?;
                 let tty = self.check_lvalue(target, scope)?;
                 self.check_writable(target, scope)?;
-                if vty != tty {
+                if vty != tty && !ref_coerces(&vty, &tty) {
                     return Err(format!("assignment type mismatch: target is {tty:?}, value is {vty:?}"));
                 }
                 Ok(())
@@ -594,8 +621,9 @@ impl Sema {
     fn check_lvalue(&mut self, e: &mut Expr, scope: &mut Scope) -> Result<Type, String> {
         match e {
             Expr::Var { .. } | Expr::Field { .. } => self.check_expr(e, scope),
+            Expr::Deref { .. } => self.check_expr(e, scope),
             Expr::Index(base, idx) => {
-                let bt = self.check_expr(base, scope)?;
+                let bt = deref_ty(self.check_expr(base, scope)?);
                 let it = self.check_expr(idx, scope)?;
                 if it != Type::I64 {
                     return Err(format!("array index must be `i64`, found {it:?}"));
@@ -699,7 +727,7 @@ impl Sema {
                 arg_slots.clear();
                 for (a, p) in args.iter_mut().zip(sig.params.iter()) {
                     let t = self.check_expr(a, scope)?;
-                    if &t != p {
+                    if &t != p && !ref_coerces(&t, p) {
                         return Err(format!("function `{name}`: argument type mismatch, expected {p:?}, found {t:?}"));
                     }
                     // An aggregate argument is passed by pointer, so give it a
@@ -745,7 +773,7 @@ impl Sema {
             }
             Expr::Block(b) => self.check_block(b, scope),
             Expr::Index(base, idx) => {
-                let bt = self.check_expr(base, scope)?;
+                let bt = deref_ty(self.check_expr(base, scope)?);
                 let it = self.check_expr(idx, scope)?;
                 if it != Type::I64 {
                     return Err(format!("array index must be `i64`, found {it:?}"));
@@ -756,7 +784,7 @@ impl Sema {
                 }
             }
             Expr::Field { base, name, offset, ty } => {
-                let bt = self.check_expr(base, scope)?;
+                let bt = deref_ty(self.check_expr(base, scope)?);
                 match bt {
                     Type::Struct(sname, _) => {
                         let info = self.structs.get(&sname).cloned().unwrap();
@@ -906,9 +934,13 @@ impl Sema {
                 // Resolve the receiver's type, then look the method up as the
                 // mangled free function `Type$method` the parser produced.
                 let rt = self.check_expr(recv, scope)?;
+                // Reading a method off a reference auto-derefs, so `r.m()`
+                // resolves against the referent's type.
+                let via_ref = matches!(rt, Type::Ref(..));
+                let base_ty = deref_ty(rt.clone());
                 // A method lives on a struct or an enum; both give the mangled
                 // prefix `Type$method`.
-                let tyname = match &rt {
+                let tyname = match &base_ty {
                     Type::Struct(n, _) | Type::Enum(n) | Type::EnumData(n, _) => n.clone(),
                     other => {
                         return Err(format!(
@@ -917,15 +949,31 @@ impl Sema {
                     }
                 };
                 let mangled = format!("{tyname}${name}");
-                if !self.sigs.contains_key(&mangled) {
-                    return Err(format!("no method `{name}` on `{tyname}`"));
-                }
+                let sig = match self.sigs.get(&mangled).cloned() {
+                    Some(s) => s,
+                    None => return Err(format!("no method `{name}` on `{tyname}`")),
+                };
                 // Rewrite into a call with the receiver as the first argument.
                 // The receiver was checked above; the call is checked once more
                 // as a whole, which re-checks the receiver — harmless, since a
                 // value expression has no side effects on the frame other than
                 // bumping `next_slot` for a temporary aggregate.
                 let recv = std::mem::replace(recv.as_mut(), Expr::Int(0));
+                // Match the receiver's form to the method's. A `&self` method
+                // takes an address, so a large receiver is not copied; `self`
+                // takes the value. A receiver that is already a reference is
+                // passed through for `&self`, and dereferenced (copied) for
+                // `self`.
+                let recv = match (sig.ref_self, via_ref) {
+                    (true, false) => Expr::AddrOf {
+                        expr: Box::new(recv),
+                        ty: Type::Named(String::new()),
+                        mutable: sig.ref_self_mut,
+                        slot: -1,
+                    },
+                    (false, true) => Expr::Deref { expr: Box::new(recv), ty: Type::Named(String::new()) },
+                    _ => recv,
+                };
                 let mut call_args = Vec::with_capacity(args.len() + 1);
                 call_args.push(recv);
                 call_args.append(args);
@@ -1098,6 +1146,31 @@ impl Sema {
                 *ty = fty.clone();
                 Ok(fty)
             }
+            Expr::AddrOf { expr, ty, mutable, slot } => {
+                // A reference is one word, whether it points at a scalar or an
+                // aggregate. An lvalue is addressed directly; anything else has
+                // no address of its own, so it is checked as a value and given a
+                // hidden frame slot to be materialised into.
+                let t = if is_lvalue(expr) {
+                    self.check_lvalue(expr, scope)?
+                } else {
+                    let t = self.check_expr(expr, scope)?;
+                    *slot = self.alloc_slots((t.size() / 8).max(1) as i32);
+                    t
+                };
+                *ty = t.clone();
+                Ok(Type::Ref(Box::new(t), *mutable))
+            }
+            Expr::Deref { expr, ty } => {
+                let it = self.check_expr(expr, scope)?;
+                match it {
+                    Type::Ref(inner, _) => {
+                        *ty = (*inner).clone();
+                        Ok(*inner)
+                    }
+                    other => Err(format!("cannot dereference a value of type {other:?}")),
+                }
+            }
             Expr::Cast(inner, to) => {
                 let it = self.check_expr(inner, scope)?;
                 // An enum may be cast to `i64` (its tag), but not the reverse:
@@ -1121,6 +1194,39 @@ impl Sema {
                 Ok(rt)
             }
         }
+    }
+}
+
+/// True when a value of type `found` may be used where `expected` is wanted.
+/// The only coercion rmc performs is `&mut T` to `&T`: both are one pointer, and
+/// Rust allows it, so a `&mut` receiver can be read by a `&self` method.
+fn ref_coerces(found: &Type, expected: &Type) -> bool {
+    match (found, expected) {
+        (Type::Ref(f, true), Type::Ref(e, false)) => f == e,
+        _ => false,
+    }
+}
+
+/// The type a reference points at, or the type itself when it is not a
+/// reference. Reading through a reference (`r.x`, `r[i]`) does not need an
+/// explicit `*r`, so every base that reaches a place goes through here.
+fn deref_ty(t: Type) -> Type {
+    match t {
+        Type::Ref(inner, _) => *inner,
+        other => other,
+    }
+}
+
+/// True when `e` denotes a place with an address: a variable, a field of a
+/// place, an element of a place, or a dereference. `&e` on such an expression is
+/// its address; anything else (a literal, a call, arithmetic) has no address and
+/// must be materialised into a temporary first.
+fn is_lvalue(e: &Expr) -> bool {
+    match e {
+        Expr::Var { .. } | Expr::Deref { .. } => true,
+        Expr::Field { base, .. } => is_lvalue(base),
+        Expr::Index(base, _) => is_lvalue(base),
+        _ => false,
     }
 }
 

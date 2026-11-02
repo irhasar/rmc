@@ -11,6 +11,7 @@ time; there are no runtime type errors.
 | `i64`        | signed 64-bit integer                         |
 | `bool`       | `true` or `false`                             |
 | `[T; N]`     | fixed-size array of `N` `i64`/`bool` elements |
+| `&T` `&mut T`| a reference to a `T` (one word)               |
 | `Name`       | a struct declared with `struct Name { .. }`   |
 | `Name`       | an enum declared with `enum Name { .. }`      |
 | `()`         | unit, the result of a statement or `main`     |
@@ -54,11 +55,12 @@ q.sum();                     // 8
 ```
 
 An `impl Type { .. }` block adds methods to a struct. A method takes `self` as
-its first parameter (the `&self` spelling is accepted and the `&` ignored, since
-rmc has no references); the receiver is passed by value like any other argument,
-so the method body works on a private copy and may assign its fields without
-affecting the caller. `Self` names the enclosing struct, in both type and
-literal position. The method is resolved from the receiver's type, so two
+its first parameter. With `self`, the receiver is passed by value like any other
+argument, so the method body works on a private copy and may assign its fields
+without affecting the caller. With `&self` (or `&mut self`), the receiver is a
+reference: the call passes the value's address instead of a copy, which matters
+for a large struct in a hot loop. `Self` names the enclosing struct, in both type
+and literal position. The method is resolved from the receiver's type, so two
 structs may define a method with the same name. A method call chains
 (`p.moved(1).sum()`) and a struct literal may be a receiver directly
 (`Point { x: 1, y: 2 }.sum()`).
@@ -173,6 +175,17 @@ Rust panic. Division by zero always traps at the CPU level.
 - Nesting is bounded: an expression, block or type may nest at most 100 levels.
   Deeper input is a compile error, not a crash. No hand-written program comes
   close; the limit exists so that pathological input cannot overflow the stack.
+- References: `&e` takes the address of a place (a variable, a field, an array
+  element, or a dereference), or of a temporary when `e` has no address of its
+  own; `*e` reads the referent, and `*e = v` writes it. `&mut e` is a distinct
+  type from `&e` but otherwise behaves the same, except that a `&mut T` coerces
+  to a `&T` where a shared reference is wanted. Reading a field, indexing, or
+  calling a method through a reference does not need an explicit `*`: `r.x`,
+  `r[i]` and `r.m()` auto-deref. A reference is one word whether it points at a
+  scalar or an aggregate, so a `&Point` parameter costs one register and no
+  copy. There is no borrow checking: rmc does not track how long a reference
+  lives, so it is the programmer's job not to outlive the referent, and `&mut` is
+  not enforced to be exclusive.
 - Calls: `f(a, b)`.
 - Indexing: `arr[i]`.
 - Array literals: `[a, b, c]` and `[value; count]`. A list literal takes its
@@ -210,7 +223,9 @@ reuse and coalesces neighbours. Memory is not zeroed.
 
 ## Not supported
 
-Traits, generics, references, borrowing, lifetimes, modules, macros, `use`,
-closures, `f32`/`f64`, `u*`/`i*` types other than `i64`, tuples, arrays of
-aggregates, and the standard library. Aggregates cross a call only by value;
-there are no `&T`/`&mut T` parameters.
+Traits, generics, borrowing, lifetimes, modules, macros, `use`, closures,
+`f32`/`f64`, `u*`/`i*` types other than `i64`, tuples, arrays of aggregates, and
+the standard library. References exist (`&T` / `&mut T`, `&e`, `*e`, `*e = v`),
+but without borrow checking: rmc does not prove that a reference outlives its
+referent, and `&mut` carries no exclusivity guarantee. An aggregate is still
+passed by value unless a reference is used.

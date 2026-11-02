@@ -207,7 +207,7 @@ impl Parser {
             Type::Unit
         };
         let body = self.parse_block()?;
-        Ok(FnDef { name, self_ty: None, takes_self: false, params, param_mut, ret, body, param_slots: Vec::new(), ret_slot: -1, nslots: 0 })
+        Ok(FnDef { name, self_ty: None, takes_self: false, ref_self: false, ref_self_mut: false, params, param_mut, ret, body, param_slots: Vec::new(), ret_slot: -1, nslots: 0 })
     }
 
     /// `impl Type { fn method(self, ..) -> .. { .. } }`. The methods are pushed
@@ -242,9 +242,11 @@ impl Parser {
         self.expect(Tok::Fn)?;
         let name = self.expect_ident()?;
         self.expect(Tok::LParen)?;
-        // First parameter must be `self` (an immutable receiver). We accept the
-        // `&self` spelling too and ignore the `&`, since rmc has no references.
-        self.eat(&Tok::Amp);
+        // First parameter must be `self`. `&self` / `&mut self` make the receiver
+        // a reference, so the call passes the value's address rather than a copy;
+        // `self` takes the receiver by value.
+        let by_ref = self.eat(&Tok::Amp);
+        let by_mut = by_ref && self.eat(&Tok::Mut);
         let first = self.expect_ident()?;
         if first != "self" {
             return Err(format!(
@@ -274,6 +276,8 @@ impl Parser {
             name: format!("{ty}${name}"),
             self_ty: Some(ty.to_string()),
             takes_self: true,
+            ref_self: by_ref,
+            ref_self_mut: by_mut,
             params,
             param_mut,
             ret,
@@ -292,6 +296,16 @@ impl Parser {
     }
 
     fn parse_type_inner(&mut self) -> PResult<Type> {
+        if self.eat(&Tok::Amp) {
+            let mutable = self.eat(&Tok::Mut);
+            let inner = self.parse_type()?;
+            return Ok(Type::Ref(Box::new(inner), mutable));
+        }
+        // `&&T` lexes as one token; treat it as two references.
+        if self.eat(&Tok::AmpAmp) {
+            let inner = self.parse_type()?;
+            return Ok(Type::Ref(Box::new(Type::Ref(Box::new(inner), false)), false));
+        }
         match self.peek() {
             Some(Tok::Ident(n)) if n == "Self" => {
                 self.i += 1;
@@ -413,6 +427,8 @@ impl Parser {
                 | Some(Tok::If)
                 | Some(Tok::Match)
                 | Some(Tok::LBracket)
+                | Some(Tok::Amp)
+                | Some(Tok::Star)
                 // A bare `{ ... }` is a block expression, valid as a statement
                 // without a `;`. Without this it fell through to `parse_stmt`,
                 // which has no arm for `{`, so a nested block failed to parse.
@@ -756,6 +772,27 @@ impl Parser {
                 self.bump_depth()?;
                 let e = self.parse_unary()?;
                 Ok(Expr::Un(UnOp::Not, Box::new(e)))
+            }
+            Some(Tok::Amp) => {
+                self.i += 1;
+                let mutable = self.eat(&Tok::Mut);
+                self.bump_depth()?;
+                let e = self.parse_unary()?;
+                Ok(Expr::AddrOf { expr: Box::new(e), ty: Type::Named(String::new()), mutable, slot: -1 })
+            }
+            // `&&e` lexes as one token; treat it as two address-ofs.
+            Some(Tok::AmpAmp) => {
+                self.i += 1;
+                self.bump_depth()?;
+                let e = self.parse_unary()?;
+                let inner = Expr::AddrOf { expr: Box::new(e), ty: Type::Named(String::new()), mutable: false, slot: -1 };
+                Ok(Expr::AddrOf { expr: Box::new(inner), ty: Type::Named(String::new()), mutable: false, slot: -1 })
+            }
+            Some(Tok::Star) => {
+                self.i += 1;
+                self.bump_depth()?;
+                let e = self.parse_unary()?;
+                Ok(Expr::Deref { expr: Box::new(e), ty: Type::Named(String::new()) })
             }
             _ => self.parse_postfix(),
         }

@@ -809,3 +809,134 @@ fn a_spill_across_a_call_uses_a_register_not_the_frame() {
     assert!(out.contains("push %r12"), "expected a saved spill register in:\n{out}");
     assert!(out.contains("mov %rax, %r12"), "expected the spill into %r12 in:\n{out}");
 }
+
+#[test]
+fn a_reference_to_a_promoted_local_forces_it_into_memory() {
+    // `&x` needs an address, so `x` cannot be held in a register: its frame
+    // slot must stay current or the `lea` would read a stale word.
+    let out = asm("fn main() -> i64 { let x: i64 = 7; let r: &i64 = &x; return *r; }");
+    assert!(out.contains("lea "), "a reference takes an address in:\n{out}");
+    assert!(
+        !out.contains("mov $7, %r12"),
+        "an addressed local must not be promoted to a register in:\n{out}"
+    );
+}
+
+#[test]
+fn a_ref_typed_parameter_is_one_slot_not_a_copy() {
+    // A reference is a scalar: `&Point` is passed in one register and is not
+    // copied, however big `Point` is.
+    let out = asm(
+        "struct P { x: i64, y: i64, z: i64 } \
+         fn f(p: &P) -> i64 { return p.x; } \
+         fn main() -> i64 { let v: P = P { x: 1, y: 2, z: 3 }; return f(&v); }",
+    );
+    // No copy loop and no hidden argument buffer for the aggregate: the call
+    // passes the address that `&v` computes.
+    assert!(out.contains("call P$") || out.contains("call f"), "calls f in:\n{out}");
+    assert!(!out.contains("rep movsq"), "no aggregate copy for a reference in:\n{out}");
+}
+
+#[test]
+fn a_method_with_a_ref_receiver_passes_an_address() {
+    let out = asm(
+        "struct P { x: i64, y: i64 } \
+         impl P { fn get(&self) -> i64 { return self.x; } } \
+         fn main() -> i64 { let v: P = P { x: 5, y: 6 }; return v.get(); }",
+    );
+    // The receiver arrives as an address: the method reads `x` through the
+    // pointer it was handed, not from a copied frame slot.
+    assert!(out.contains("P$get"), "mangled method present in:\n{out}");
+    assert!(out.contains("(%rax)"), "field read through a pointer in:\n{out}");
+}
+
+#[test]
+fn a_non_lvalue_operand_of_address_of_is_materialised() {
+    // `&(1 + 2)` has no address of its own, so sema gives it a temporary slot
+    // and codegen stores the value there and yields that address.
+    let out = asm("fn main() -> i64 { let r: &i64 = &(1 + 2); return *r; }");
+    assert!(out.contains("lea "), "the temporary's address is taken in:\n{out}");
+}
+
+#[test]
+fn a_dereference_of_a_non_reference_is_rejected() {
+    let bad = "fn main() -> i64 { let x: i64 = 1; return *x; }";
+    assert!(compile_to_asm(bad, &CompileOptions::default()).is_err());
+}
+
+#[test]
+fn address_of_a_non_lvalue_is_accepted_through_a_temporary() {
+    // `&(f())` where `f` returns a scalar: the call's result is stored in a
+    // temporary and its address is taken.
+    let out = asm(
+        "fn f() -> i64 { return 9; } fn main() -> i64 { let r: &i64 = &(f()); return *r; }",
+    );
+    assert!(out.contains("call f"), "call present in:\n{out}");
+}
+
+#[test]
+fn a_reference_may_be_stored_in_a_struct_field() {
+    // rmc's struct layout stores a reference field like any other word; this
+    // needs no lifetime in rmc even though Rust would require one.
+    let out = asm(
+        "struct H { r: &i64, n: i64 } \
+         fn main() -> i64 { let v: i64 = 7; let h: H = H { r: &v, n: 3 }; return *h.r + h.n; }",
+    );
+    assert!(out.contains("lea "), "the reference field takes an address in:\n{out}");
+}
+
+#[test]
+fn a_nested_reference_dereferences_twice() {
+    let out = asm(
+        "fn main() -> i64 { let v: i64 = 7; let r: &i64 = &v; let rr: &&i64 = &r; return **rr; }",
+    );
+    // Two loads: through `rr` to reach `r`, then through `r` to reach `v`.
+    assert!(out.matches("mov (%rax), %rax").count() >= 2, "two dereferences in:\n{out}");
+}
+
+#[test]
+fn a_write_through_a_dereference_stores_to_the_referent() {
+    let out = asm("fn main() -> i64 { let mut x: i64 = 1; let p: &i64 = &x; *p = 42; return x; }");
+    // The store's target address is the pointer value, so the store is indirect
+    // through a register rather than into a frame slot.
+    assert!(out.contains("mov %rax, (%rcx)"), "indirect store in:\n{out}");
+}
+
+#[test]
+fn a_write_through_a_reference_to_a_struct_field_stores_to_the_field() {
+    let out = asm(
+        "struct P { x: i64, y: i64 } \
+         fn main() -> i64 { let mut p: P = P { x: 1, y: 2 }; let r: &i64 = &p.y; *r = 9; return p.y; }",
+    );
+    assert!(out.contains("mov %rax, (%rcx)"), "indirect store in:\n{out}");
+}
+
+#[test]
+fn a_mut_receiver_is_passed_by_address() {
+    let out = asm(
+        "struct C { n: i64 } \
+         impl C { fn bump(&mut self) -> i64 { self.n = self.n + 1; return self.n; } } \
+         fn main() -> i64 { let mut c: C = C { n: 1 }; return c.bump(); }",
+    );
+    assert!(out.contains("C$bump"), "mangled method present in:\n{out}");
+    assert!(out.contains("lea "), "the receiver's address is taken in:\n{out}");
+}
+
+#[test]
+fn a_mut_reference_coerces_to_a_shared_reference() {
+    // `peek(&mut x)` where `peek` wants `&i64`: allowed, and no code is emitted
+    // for the coercion since both are one pointer.
+    let out = asm(
+        "fn peek(p: &i64) -> i64 { return *p; } \
+         fn main() -> i64 { let mut x: i64 = 5; return peek(&mut x); }",
+    );
+    assert!(out.contains("call peek"), "call present in:\n{out}");
+}
+
+#[test]
+fn a_shared_reference_is_not_assignable_to_a_mut_reference() {
+    // The coercion only goes `&mut` to `&`, never the other way.
+    let bad = "fn f(p: &mut i64) -> i64 { return *p; } \
+               fn main() -> i64 { let x: i64 = 1; let r: &i64 = &x; return f(r); }";
+    assert!(compile_to_asm(bad, &CompileOptions::default()).is_err());
+}

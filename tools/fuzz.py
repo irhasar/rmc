@@ -152,6 +152,20 @@ def gen_stmt_program(rng):
     )
     rms.append(f"fn mix({', '.join(params)}) -> i64 {{ return {body}; }}")
     rs.append(f"fn mix({', '.join(params)}) -> i64 {{ {body} }}")
+    # References: a `&self` method, a `&S` parameter and a `&i64` parameter, all
+    # reached through `&`/`*` and auto-deref.
+    rms.append(f"impl S {{ fn first(&self) -> i64 {{ return self.{fields[0]}; }} }}")
+    rs.append(f"impl S {{ fn first(&self) -> i64 {{ self.{fields[0]} }} }}")
+    rms.append(f"fn sref(s: &S) -> i64 {{ return s.{fields[0]}; }}")
+    rs.append(f"fn sref(s: &S) -> i64 {{ s.{fields[0]} }}")
+    rms.append("fn vref(p: &i64) -> i64 { return *p + 1; }")
+    rs.append("fn vref(p: &i64) -> i64 { *p + 1 }")
+    # A `&mut` parameter and a `&mut self` method: both write through the
+    # reference, so a wrong address shows up as a wrong final value.
+    rms.append("fn bumpv(p: &mut i64) -> i64 { *p = *p + 1; return *p; }")
+    rs.append("fn bumpv(p: &mut i64) -> i64 { *p += 1; *p }")
+    rms.append("impl S { fn bump(&mut self) -> i64 { self." + fields[0] + " = self." + fields[0] + " + 2; return self." + fields[0] + "; } }")
+    rs.append("impl S { fn bump(&mut self) -> i64 { self." + fields[0] + " += 2; self." + fields[0] + " } }")
 
     bound = rng.randint(1, 8)
     rms += ["fn main() -> i64 {", "    let mut acc: i64 = 0;",
@@ -199,6 +213,22 @@ def gen_stmt_program(rng):
     rs.append("    acc += unwrap(opt, 1000);")
     rms.append(f"    acc = acc + mix({', '.join(callargs)});")
     rs.append(f"    acc += mix({', '.join(callargs)});")
+    # Build a struct, take references to it and to a scalar, and read back
+    # through `&self`, `&S` and `&i64`.
+    rms.append(f"    let s0: S = S {{ {lit} }};")
+    rs.append(f"    let s0 = S {{ {lit} }};")
+    rms.append("    let sr: &S = &s0;")
+    rs.append("    let sr: &S = &s0;")
+    rms.append("    let vr: &i64 = &acc;")
+    rs.append("    let vr: &i64 = &acc;")
+    rms.append("    acc = acc + sr.first() + sref(sr) + sref(&s0) + vref(vr) + vref(&acc);")
+    rs.append("    acc += sr.first() + sref(sr) + sref(&s0) + vref(vr) + vref(&acc);")
+    rms.append("    let mut s1: S = S { " + lit + " };")
+    rs.append("    let mut s1: S = S { " + lit + " };")
+    rms.append("    let mut a1: i64 = 3;")
+    rs.append("    let mut a1: i64 = 3;")
+    rms.append("    acc = acc + s1.bump() + bumpv(&mut a1) + bumpv(&mut a1) + a1 + s1.first();")
+    rs.append("    acc += s1.bump() + bumpv(&mut a1) + bumpv(&mut a1) + a1 + s1.first();")
     rms.append("    print_i64(acc);")
     rs.append('    println!("{}", acc);')
     rms += ["    return 0;", "}"]
@@ -237,6 +267,9 @@ def robust_corpus():
         "empty": b"",
         "lone_keyword": b"struct",
         "unbalanced_brace": b"fn main() -> i64 { return 0;",
+        "deep_deref": b"fn main() -> i64 { let x: i64 = 0; return " + b"*" * 100000 + b"x; }",
+        "deep_ref_type": b"fn main() -> i64 { let x: " + b"&" * 5000 + b"i64 = x; return 0; }",
+        "deep_addr_of": b"fn main() -> i64 { let x: i64 = 0; return " + b"&" * 100000 + b"x; }",
     }
     return cases
 

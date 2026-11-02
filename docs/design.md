@@ -200,6 +200,33 @@ frame-based argument passing and the unoptimised prologue, not the spill.
   condition is a comparison, instead of materialising a 0/1 and testing it. The
   negated condition codes are in `invert_cc`.
 
+## References
+
+A reference is a single word: the address of its referent. It is a scalar, so it
+travels in one register whether it points at an `i64` or a 64-byte struct, and a
+`&self` method call passes the receiver's address instead of copying the receiver
+into the callee. `&e` on a place (a variable, field, element or dereference)
+yields that place's address directly; `&e` on anything else has no address, so
+`sema` allocates a temporary slot, the value is stored there, and the temporary's
+address is taken. `*e` reads the referent: for a scalar that is a load from the
+pointer, for an aggregate the pointer itself, since an aggregate value *is* its
+address.
+
+Two facts keep the code correct around references:
+
+- A local whose address is taken must live in memory. The code generator's
+  promotion pass is told this before it promotes anything, so `&x` is always a
+  valid `lea` of `x`'s frame slot and never a stale read of a register the
+  variable no longer keeps up to date.
+- A reference-typed base is a pointer, not a place. `r.x` reads through the
+  pointer; the address of the field is the pointer plus the field offset, not the
+  address of the slot that holds the pointer. `gen_addr` and the field operand
+  path both special-case a `Ref` base.
+
+Reading a field, indexing, or calling a method through a reference auto-derefs,
+so `r.x`, `r[i]` and `r.m()` need no explicit `*`. There is no borrow checker:
+nothing tracks lifetimes, and `&mut` is not enforced to be exclusive.
+
 ## Calls
 
 Scalar arguments are evaluated right-to-left and spilled to frame slots, then

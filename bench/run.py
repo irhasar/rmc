@@ -13,7 +13,7 @@ RMC = os.path.join(PROJ, "compiler", "target", "release", "rmc")
 OUT = "/tmp/rmcbench"
 RUSTFLAGS_BASE = []
 
-PROGRAMS = ["hello", "fib", "mandel", "sieve", "mix", "stats"]
+PROGRAMS = ["hello", "fib", "mandel", "sieve", "mix", "stats", "refs"]
 # Runtime input per program, passed as argv so the workload is opaque to the
 # optimizer and cannot be constant-folded away.
 ARGS = {
@@ -23,6 +23,7 @@ ARGS = {
     "sieve": ["200000"],
     "mix": ["2000000"],
     "stats": ["2000000"],
+    "refs": ["5000000"],
 }
 
 

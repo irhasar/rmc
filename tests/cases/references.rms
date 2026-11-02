@@ -1,0 +1,93 @@
+// References: `&T` / `&mut T`, `&e`, `*e`, `&self`, and auto-deref through a
+// reference for field access, indexing and method calls. rmc has no borrow
+// checking, so this case only exercises the code generation.
+#[derive(Copy, Clone)]
+struct Point { x: i64, y: i64 }
+#[derive(Copy, Clone)]
+struct Big { a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64 }
+
+impl Point {
+    // `&self`: the receiver is passed by address, not copied.
+    fn mag2(&self) -> i64 { return self.x * self.x + self.y * self.y; }
+    // `self`: the receiver is taken by value, so a copy is made at the call.
+    fn bumped(self, d: i64) -> i64 { return self.x + d; }
+}
+
+impl Big {
+    fn total(&self) -> i64 { return self.a + self.b + self.c + self.d + self.e + self.f + self.g + self.h; }
+}
+
+// A reference to a scalar, read through an explicit `*`.
+fn incr(p: &i64) -> i64 {
+    return *p + 1;
+}
+
+// A reference to an array: index through the reference without a `*`.
+fn sum_arr(a: &[i64; 4]) -> i64 {
+    let mut i: i64 = 0;
+    let mut s: i64 = 0;
+    while i < 4 {
+        s = s + a[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+// A reference to a struct: read fields and call `&self` methods through it.
+fn mag_of(p: &Point) -> i64 {
+    return p.mag2() + p.x;
+}
+
+// A reference returned from a function, and a reference to a reference.
+fn identity(p: &i64) -> &i64 { return p; }
+
+fn main() -> i64 {
+    // A reference to a scalar local, read through `*`.
+    let v: i64 = 41;
+    let r: &i64 = &v;
+    print_i64(*r);
+    print_i64(incr(r));
+
+    // A reference to a `mut` local, read through `*`.
+    let mut m: i64 = 5;
+    let mr: &i64 = &m;
+    print_i64(*mr);
+    m = 9;
+    let mr2: &i64 = &m;
+    print_i64(*mr2);
+
+    // A reference to an array, indexed through the reference.
+    let arr: [i64; 4] = [10, 20, 30, 40];
+    let ar: &[i64; 4] = &arr;
+    print_i64(sum_arr(ar));
+    print_i64(ar[2]);
+
+    // A reference to a struct: field read and `&self` method through it.
+    let p: Point = Point { x: 3, y: 4 };
+    let pr: &Point = &p;
+    print_i64(pr.mag2());
+    print_i64(pr.x);
+    print_i64(mag_of(pr));
+
+    // `self` still copies: the call sees the value it was given.
+    print_i64(p.bumped(10));
+
+    // Nested references and a reference returned from a function.
+    let r2: &&i64 = &r;
+    print_i64(**r2);
+    let r3: &i64 = identity(r);
+    print_i64(*r3);
+
+    // A reference to a field, and to an array element.
+    let fx: &i64 = &p.y;
+    print_i64(*fx);
+    let ae: &i64 = &arr[1];
+    print_i64(*ae);
+
+    // A big receiver passed by reference: no 64-byte copy at the call.
+    let big: Big = Big { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8 };
+    let br: &Big = &big;
+    print_i64(br.total());
+    print_i64(big.total());
+    return 0;
+}
