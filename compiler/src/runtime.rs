@@ -42,6 +42,10 @@ arg_i64:
     push %rbp
     mov %rsp, %rbp
     mov __rmc_argc(%rip), %rcx
+    # A negative index passes `cmp/jge` (signed: -1 < argc) and would read
+    # before argv, so reject it explicitly.
+    test %rdi, %rdi
+    js .Larg_zero
     cmp %rcx, %rdi
     jge .Larg_zero
     mov __rmc_argv(%rip), %rdx

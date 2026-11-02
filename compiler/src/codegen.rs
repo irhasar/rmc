@@ -244,17 +244,20 @@ impl Codegen {
         if n == 0 {
             return;
         }
+        // Scratch is %r8/%r9, never %rax: a caller may hold a live value in
+        // %rax across the copy (a pending operand, or an argument already
+        // loaded into a register).
         if n <= 8 {
             for i in 0..n {
-                self.line(&format!("mov {}(%rsi), %rax", i as i32 * 8));
-                self.line(&format!("mov %rax, {}(%rdi)", i as i32 * 8));
+                self.line(&format!("mov {}(%rsi), %r8", i as i32 * 8));
+                self.line(&format!("mov %r8, {}(%rdi)", i as i32 * 8));
             }
         } else {
             let l = self.new_label();
             self.line(&format!("mov ${n}, %rcx"));
             self.raw(&format!("{l}:"));
-            self.line("mov (%rsi), %rax");
-            self.line("mov %rax, (%rdi)");
+            self.line("mov (%rsi), %r8");
+            self.line("mov %r8, (%rdi)");
             self.line("add $8, %rsi");
             self.line("add $8, %rdi");
             self.line("dec %rcx");
@@ -419,9 +422,7 @@ impl Codegen {
                         Some(Expr::StructLit { fields, .. }) => {
                             let base = self.array_off(*slot, size / 8);
                             for fi in fields {
-                                self.gen_expr(&fi.value);
-                                let off = base + fi.offset;
-                                self.line(&format!("mov %rax, {off}(%rbp)"));
+                                self.store_field_value(base + fi.offset, fi);
                             }
                         }
                         // No initializer: the struct is zero-filled.
@@ -438,7 +439,7 @@ impl Codegen {
                         }
                     }
                 } else if let Some(e) = init {
-                    self.gen_expr(e);
+                    self.gen_expr_into_reg(e, "%rax");
                     self.store_slot(*slot);
                 } else {
                     match self.reg_of(*slot) {
@@ -449,9 +450,26 @@ impl Codegen {
             }
             Stmt::Assign { target, value } => {
                 match target {
-                    Expr::Var { slot, .. } => {
+                    Expr::Var { slot, ty, .. } if ty.is_aggregate() => {
+                        // Whole-aggregate assignment copies the contents, not the
+                        // source address, preserving by-value semantics.
+                        let n = ty.size() / 8;
                         self.gen_expr(value);
+                        self.line("mov %rax, %rsi");
+                        self.line(&format!("lea {}(%rbp), %rdi", self.array_off(*slot, n)));
+                        self.copy_words_rdi_rsi(n);
+                    }
+                    Expr::Var { slot, .. } => {
+                        self.gen_expr_into_reg(value, "%rax");
                         self.store_slot(*slot);
+                    }
+                    Expr::Field { ty, .. } if ty.is_aggregate() => {
+                        let n = ty.size() / 8;
+                        self.gen_addr(target);
+                        self.line("mov %rax, %rdi");
+                        self.gen_expr(value);
+                        self.line("mov %rax, %rsi");
+                        self.copy_words_rdi_rsi(n);
                     }
                     Expr::Field { base, offset, .. } => {
                         match self.field_operand(base, *offset) {
@@ -467,6 +485,21 @@ impl Codegen {
                                 self.line("mov %rax, (%rcx)");
                             }
                         }
+                    }
+                    Expr::Index(base, idx)
+                        if matches!(base.as_ref(),
+                            Expr::Var { ty: Type::Array(e, _), .. } if e.is_aggregate()) =>
+                    {
+                        let elem = match base.as_ref() {
+                            Expr::Var { ty: Type::Array(e, _), .. } => (**e).clone(),
+                            _ => unreachable!(),
+                        };
+                        let n = elem.size() / 8;
+                        self.gen_addr(target);
+                        self.line("mov %rax, %rdi");
+                        self.gen_expr(value);
+                        self.line("mov %rax, %rsi");
+                        self.copy_words_rdi_rsi(n);
                     }
                     Expr::Index(base, idx) => {
                         match self.array_elem_operand(base, idx) {
@@ -677,7 +710,15 @@ impl Codegen {
                 self.line(&format!("lea {off}(%rbp), %rax"));
             }
             Expr::Index(base, idx) => {
-                self.gen_addr(base);
+                match base.as_ref() {
+                    Expr::Var { slot, ty: Type::Array(_, n), .. } => {
+                        self.line(&format!("lea {}(%rbp), %rax", self.array_off(*slot, *n)));
+                    }
+                    // A non-local base yields its address as a value.
+                    _ => {
+                        self.gen_expr(base);
+                    }
+                }
                 self.push_rax();
                 self.gen_expr(idx);
                 self.pop_to("%rcx");
@@ -721,11 +762,19 @@ impl Codegen {
                 ty.clone()
             }
             Expr::Field { base, offset, ty, .. } => {
-                match self.field_operand(base, *offset) {
-                    Some(op) => self.line(&format!("mov {op}, %rax")),
-                    None => {
-                        self.gen_addr(e);
-                        self.line("mov (%rax), %rax");
+                if ty.is_aggregate() {
+                    // A nested struct field is named by its address.
+                    match self.field_operand(base, *offset) {
+                        Some(op) => self.line(&format!("lea {op}, %rax")),
+                        None => self.gen_addr(e),
+                    }
+                } else {
+                    match self.field_operand(base, *offset) {
+                        Some(op) => self.line(&format!("mov {op}, %rax")),
+                        None => {
+                            self.gen_addr(e);
+                            self.line("mov (%rax), %rax");
+                        }
                     }
                 }
                 ty.clone()
@@ -733,11 +782,12 @@ impl Codegen {
             Expr::StructLit { name, fields, slot } => {
                 // Materialise the literal into its frame buffer and yield that
                 // address, which is how every aggregate value is represented.
+                // Fields are stored in source order, so initializer side effects
+                // run in the order they were written.
                 let n = fields.len();
                 let base = self.array_off(*slot, n);
                 for fi in fields {
-                    self.gen_expr(&fi.value);
-                    self.line(&format!("mov %rax, {}(%rbp)", base + fi.offset));
+                    self.store_field_value(base + fi.offset, fi);
                 }
                 self.line(&format!("lea {base}(%rbp), %rax"));
                 Type::Struct(name.clone(), n * 8)
@@ -757,8 +807,22 @@ impl Codegen {
                         self.line(&format!("mov {op}, %rax"));
                     }
                     None => {
-                        self.gen_addr(e);
-                        self.line("mov (%rax), %rax");
+                        // The base is not a local array: it is a temporary whose
+                        // value *is* its address (a call's hidden return buffer,
+                        // a block, a struct field), so index off that address.
+                        match _idx.as_ref() {
+                            Expr::Int(v) if (-2_147_483_648..=2_147_483_647).contains(v) => {
+                                self.gen_expr(base);
+                                self.line(&format!("mov {}(%rax), %rax", *v as i32 * 8));
+                            }
+                            _ => {
+                                self.gen_expr(base);
+                                self.push_rax();
+                                self.gen_expr(_idx);
+                                self.pop_to("%rcx");
+                                self.line("mov (%rcx,%rax,8), %rax");
+                            }
+                        }
                     }
                 }
                 elem
@@ -766,7 +830,10 @@ impl Codegen {
             Expr::Un(op, inner) => {
                 self.gen_expr(inner);
                 match op {
-                    UnOp::Neg => self.line("neg %rax"),
+                    UnOp::Neg => {
+                        self.line("neg %rax");
+                        self.check_overflow();
+                    }
                     UnOp::Not => {
                         self.line("test %rax, %rax");
                         self.line("sete %al");
@@ -808,6 +875,13 @@ impl Codegen {
             }
             Expr::Cast(inner, to) => {
                 self.gen_expr(inner);
+                // Normalise a cast to `bool` to 0/1, so a non-canonical value
+                // such as `2 as bool` compares equal to `true` everywhere.
+                if *to == Type::Bool {
+                    self.line("test %rax, %rax");
+                    self.line("setne %al");
+                    self.line("movzbq %al, %rax");
+                }
                 to.clone()
             }
         }
@@ -831,7 +905,13 @@ impl Codegen {
                     None => Some(format!("{}(%rbp)", self.off(*slot))),
                 }
             }
-            Expr::Field { base, offset, .. } => self.field_operand(base, *offset),
+            Expr::Field { base, offset, ty, .. } => {
+                if ty.is_aggregate() {
+                    None
+                } else {
+                    self.field_operand(base, *offset)
+                }
+            }
             Expr::Index(base, idx) => {
                 match self.array_elem_operand(base, idx) {
                     // Only register-free operands are usable here.
@@ -852,10 +932,74 @@ impl Codegen {
         }
     }
 
+    /// Store one struct-literal field value at `dest_off(%rbp)`. A scalar field
+    /// is a single word store; an aggregate field is copied word by word, since
+    /// the value expression yields the field's *address*, not its contents.
+    fn store_field_value(&mut self, dest_off: i32, fi: &FieldInit) {
+        self.gen_expr(&fi.value);
+        if fi.ty.is_aggregate() {
+            let n = fi.ty.size() / 8;
+            self.line("mov %rax, %rsi");
+            self.line(&format!("lea {dest_off}(%rbp), %rdi"));
+            self.copy_words_rdi_rsi(n);
+        } else {
+            self.line(&format!("mov %rax, {dest_off}(%rbp)"));
+        }
+    }
+
     fn store_slot(&mut self, slot: i32) {
         match self.reg_of(slot) {
             Some(r) => self.line(&format!("mov %rax, {r}")),
             None => self.line(&format!("mov %rax, {}(%rbp)", self.off(slot))),
+        }
+    }
+
+    /// Materialise `e` directly into `dst` (a register), avoiding a round trip
+    /// through `%rax` where the destination is already known. `x + k` / `x - k`
+    /// for a register `x` and a small constant becomes a single `lea`, which is
+    /// the common case in argument setup and in `let t = i - 1;`.
+    fn gen_expr_into_reg(&mut self, e: &Expr, dst: &str) {
+        if let Expr::Bin(op, a, b) = e {
+            // A folded `lea` cannot trap, so it is only sound when overflow
+            // checks are off; with them on, fall through to `gen_bin`, which
+            // emits the `jo` after the arithmetic.
+            let k = if self.overflow {
+                None
+            } else {
+                match op {
+                    BinOp::Add => Self::small_imm(b).or_else(|| Self::small_imm(a)),
+                    BinOp::Sub => Self::small_imm(b).map(|k| -k),
+                    _ => None,
+                }
+            };
+            if let Some(k) = k {
+                // The register operand: for `Sub` it is the left side only.
+                let base = if matches!(op, BinOp::Sub) {
+                    self.simple_operand(a)
+                } else if Self::small_imm(b).is_some() {
+                    self.simple_operand(a)
+                } else {
+                    self.simple_operand(b)
+                };
+                // LEA needs a register base; an immediate or a memory operand
+                // does not qualify.
+                if let Some(base) = base {
+                    if base.starts_with('%') {
+                        self.line(&format!("lea {k}({base}), {dst}"));
+                        return;
+                    }
+                }
+            }
+        }
+        if let Some(op) = self.simple_operand(e) {
+            if op != dst {
+                self.line(&format!("mov {op}, {dst}"));
+            }
+            return;
+        }
+        self.gen_expr(e);
+        if dst != "%rax" {
+            self.line(&format!("mov %rax, {dst}"));
         }
     }
 
@@ -1274,8 +1418,7 @@ impl Codegen {
                 && !args.iter().any(Self::contains_call));
         if direct {
             for (a, r) in args.iter().zip(ARG_REGS.iter()) {
-                self.gen_expr(a);
-                self.line(&format!("mov %rax, {r}"));
+                self.gen_expr_into_reg(a, r);
             }
         } else {
             // Evaluate scalar arguments right-to-left and push them, so that
@@ -1343,9 +1486,14 @@ impl Codegen {
     fn contains_call(e: &Expr) -> bool {
         match e {
             Expr::Call { .. } => true,
+            // A struct or array literal is materialised through a copy that
+            // uses scratch registers, so the direct-argument shortcut (which
+            // requires register preservation) must not select it.
+            Expr::StructLit { .. } | Expr::ArrayLit(..) => true,
             Expr::Bin(_, a, b) => Self::contains_call(a) || Self::contains_call(b),
             Expr::Un(_, a) | Expr::Cast(a, _) => Self::contains_call(a),
             Expr::Index(a, b) => Self::contains_call(a) || Self::contains_call(b),
+            Expr::Field { base, .. } => Self::contains_call(base),
             Expr::If(c, t, els) => {
                 Self::contains_call(c)
                     || Self::block_has_call(t)

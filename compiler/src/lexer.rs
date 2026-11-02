@@ -234,25 +234,28 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
         if c == b'"' {
             let start = i;
             i += 1;
-            let mut s = String::new();
+            // Collect bytes, not chars: the source is UTF-8, so a multi-byte
+            // character must round-trip unchanged. Building the literal with
+            // `byte as char` would re-encode each byte and print mojibake.
+            let mut s: Vec<u8> = Vec::new();
             while i < bytes.len() && bytes[i] != b'"' {
                 let b = bytes[i];
                 if b == b'\\' && i + 1 < bytes.len() {
                     let e = bytes[i + 1];
                     i += 2;
                     match e {
-                        b'n' => s.push('\n'),
-                        b't' => s.push('\t'),
-                        b'r' => s.push('\r'),
-                        b'0' => s.push('\0'),
-                        b'\\' => s.push('\\'),
-                        b'"' => s.push('"'),
+                        b'n' => s.push(b'\n'),
+                        b't' => s.push(b'\t'),
+                        b'r' => s.push(b'\r'),
+                        b'0' => s.push(0),
+                        b'\\' => s.push(b'\\'),
+                        b'"' => s.push(b'"'),
                         other => {
                             return Err(format!("unknown escape `\\{}` at byte {}", other as char, i - 2))
                         }
                     }
                 } else {
-                    s.push(b as char);
+                    s.push(b);
                     i += 1;
                 }
             }
@@ -260,6 +263,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 return Err(format!("unterminated string literal at byte {start}"));
             }
             i += 1; // closing quote
+            let s = String::from_utf8(s)
+                .map_err(|_| format!("string literal at byte {start} is not valid UTF-8"))?;
             out.push(Token { tok: Tok::Str(s), pos });
             continue;
         }

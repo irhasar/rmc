@@ -149,3 +149,45 @@ fn struct_self_reference_is_rejected() {
     .unwrap_err();
     assert!(err.contains("contains itself"), "got: {err}");
 }
+
+#[test]
+fn argument_setup_folds_a_constant_with_lea() {
+    // `fib(n - 1)` must become one `lea`, not `mov; sub; mov`.
+    let out = asm("fn f(n: i64) -> i64 { return n; } fn g(n: i64) -> i64 { return f(n - 1); } fn main() -> i64 { return 0; }");
+    assert!(out.contains("lea -1(%"), "constant offset folded into lea: {out}");
+    assert!(!out.contains("sub $1, %rax"), "no separate subtraction");
+}
+
+#[test]
+fn a_bad_tail_return_type_is_rejected() {
+    let err = compile_to_asm("fn f() -> bool { 3 } fn main() -> i64 { return 0; }", &CompileOptions::default())
+        .unwrap_err();
+    assert!(err.contains("declared to return"), "got: {err}");
+}
+
+#[test]
+fn a_cast_to_an_aggregate_is_rejected() {
+    let err = compile_to_asm(
+        "struct P { x: i64 } fn main() -> i64 { let p: P = 5 as P; return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("cannot cast"), "got: {err}");
+}
+
+#[test]
+fn whole_array_assignment_copies_contents() {
+    // `a = b` must copy every word, not store b's address in one slot.
+    let out = asm(
+        "fn main() -> i64 { let mut a: [i64; 2] = [0; 2]; let b: [i64; 2] = [3; 2]; a = b; return a[0]; }",
+    );
+    // Two word copies into the destination array's base.
+    assert_eq!(out.matches("(%rsi), %r8").count(), 2, "copies both words");
+}
+
+#[test]
+fn an_inferred_array_is_initialised() {
+    let out = asm("fn main() -> i64 { let a = [7; 2]; return a[1]; }");
+    // The splat fill writes both elements.
+    assert!(out.matches("mov %rax, ").count() >= 2, "both elements written: {out}");
+}

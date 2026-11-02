@@ -181,7 +181,22 @@ impl Sema {
             scope.push((name.clone(), slot, rt));
         }
 
-        self.check_block(&mut f.body, &mut scope)?;
+        let body_ty = self.check_block(&mut f.body, &mut scope)?;
+        // A body whose tail is a value must match the declared return type.
+        // A body ending in `return` (or `break`) has a `Unit` tail and is fine;
+        // a completely empty body is not, for a non-unit function.
+        if body_ty != Type::Unit && body_ty != self.ret_ty {
+            return Err(format!(
+                "function `{}` returns {body_ty:?} but is declared to return {:?}",
+                f.name, self.ret_ty
+            ));
+        }
+        if self.ret_ty != Type::Unit && f.body.stmts.is_empty() && f.body.tail.is_none() {
+            return Err(format!(
+                "function `{}` is declared to return {:?} but has an empty body",
+                f.name, self.ret_ty
+            ));
+        }
         f.nslots = self.next_slot;
         Ok(())
     }
@@ -247,9 +262,9 @@ impl Sema {
                         ))
                     }
                 };
-                if let Some(t) = ty {
-                    *t = final_ty.clone();
-                }
+                // Persist the resolved type so codegen takes the aggregate path
+                // even when the source omitted the annotation (`let a = [7; 2]`).
+                *ty = Some(final_ty.clone());
                 let s = self.alloc_slots((final_ty.size() / 8) as i32);
                 *slot = s;
                 scope.push((name.clone(), s, final_ty));
@@ -522,18 +537,20 @@ impl Sema {
                         fields.len()
                     ));
                 }
-                // Type-check each field, then reorder into declaration order so
-                // codegen can store them sequentially.
-                let mut ordered: Vec<Option<FieldInit>> = vec![None; info.fields.len()];
+                // Type-check each field and attach its layout offset, but keep
+                // the fields in source order: initializer side effects must run
+                // in the order written, not in declaration order.
+                let mut seen = vec![false; info.fields.len()];
                 for fi in fields.iter_mut() {
                     let idx = info
                         .fields
                         .iter()
                         .position(|(f, _, _)| *f == fi.name)
                         .ok_or_else(|| format!("struct `{name}` has no field `{}`", fi.name))?;
-                    if ordered[idx].is_some() {
+                    if seen[idx] {
                         return Err(format!("struct `{name}`: field `{}` given twice", fi.name));
                     }
+                    seen[idx] = true;
                     let want = info.fields[idx].1.clone();
                     let got = self.check_expr(&mut fi.value, scope)?;
                     if got != want {
@@ -544,9 +561,7 @@ impl Sema {
                     }
                     fi.offset = info.fields[idx].2 as i32;
                     fi.ty = want;
-                    ordered[idx] = Some(fi.clone());
                 }
-                *fields = ordered.into_iter().map(|f| f.unwrap()).collect();
                 // A frame buffer so the literal has an address in any context.
                 *slot = self.alloc_slots((info.size / 8) as i32);
                 Ok(Type::Struct(name.clone(), info.size))
@@ -559,8 +574,14 @@ impl Sema {
                 Ok(Type::Array(Box::new(t), *n))
             }
             Expr::Cast(inner, to) => {
-                self.check_expr(inner, scope)?;
+                let it = self.check_expr(inner, scope)?;
                 let rt = resolve_type(to, &self.structs)?;
+                // Only scalars can be cast. Casting an integer to an aggregate
+                // would let codegen reinterpret the integer as an address and
+                // read arbitrary memory.
+                if !it.is_scalar() || !rt.is_scalar() {
+                    return Err(format!("cannot cast {it:?} to {rt:?}"));
+                }
                 *to = rt.clone();
                 Ok(rt)
             }

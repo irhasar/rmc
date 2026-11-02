@@ -44,8 +44,10 @@ source of an early miscompile where array writes ran upward past `%rbp`.
 A struct is a name, a list of fields, and a size. `sema` assigns each field an
 offset in declaration order and no padding is needed because every field is 8
 bytes. A field access is then just a `disp(%rbp)` operand, exactly like an array
-element with a constant index. A struct literal is reordered into declaration
-order by `sema` so codegen can store the fields sequentially.
+element with a constant index. `sema` attaches each field's offset to the literal
+but leaves the fields in source order, so initializer side effects run in the
+order written; codegen stores each field at its own offset. A field of aggregate
+type is copied word by word, and a read of such a field yields its address.
 
 Structs live in memory and are named by their address, which is also how they
 cross a call: a struct literal is materialised into a `sema`-allocated frame

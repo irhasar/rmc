@@ -10,6 +10,9 @@ pub struct Parser {
     /// `while n < 10 {` reads `{` as the loop body rather than as the start of
     /// `10 { ... }`. Parentheses lift the restriction, exactly like rustc.
     no_struct_lit: bool,
+    /// Counter for the temporaries introduced when desugaring a compound
+    /// assignment, so each one gets a distinct name.
+    tmp: u32,
 }
 
 /// Expressions that are allowed as statements without a trailing `;`.
@@ -21,7 +24,7 @@ type PResult<T> = Result<T, String>;
 
 impl Parser {
     pub fn new(toks: Vec<Token>) -> Self {
-        Parser { toks, i: 0, no_struct_lit: false }
+        Parser { toks, i: 0, no_struct_lit: false, tmp: 0 }
     }
 
     fn peek(&self) -> Option<&Tok> {
@@ -206,10 +209,7 @@ impl Parser {
                     self.i += 1;
                     let value = self.parse_expr()?;
                     self.expect(Tok::Semi)?;
-                    stmts.push(Stmt::Assign {
-                        target: e.clone(),
-                        value: Expr::Bin(op, Box::new(e), Box::new(value)),
-                    });
+                    stmts.push(self.desugar_compound(&e, op, value));
                     continue;
                 }
                 if self.eat(&Tok::Semi) {
@@ -325,15 +325,77 @@ impl Parser {
                     self.i += 1;
                     let value = self.parse_expr()?;
                     self.expect(Tok::Semi)?;
-                    return Ok(Stmt::Assign {
-                        target: e.clone(),
-                        value: Expr::Bin(op, Box::new(e), Box::new(value)),
-                    });
+                    return Ok(self.desugar_compound(&e, op, value));
                 }
                 self.expect(Tok::Semi)?;
                 Ok(Stmt::Expr(e))
             }
         }
+    }
+
+    /// Desugar `target op= value` into a block that reads the target once,
+    /// combines it with `value`, and writes it back. The read is bound to a
+    /// temporary so that an index with side effects (`a[next()] += 1`) is
+    /// evaluated exactly once, and the block yields the new value so the
+    /// statement keeps its value in tail position.
+    fn desugar_compound(&mut self, target: &Expr, op: BinOp, value: Expr) -> Stmt {
+        // Re-evaluating a `Var`/`Field` target, or an index that is not a call,
+        // has no observable effect, so the cheap form (target repeated in the
+        // right-hand side) is used. Only a call inside a subscript is bound to a
+        // temporary, since evaluating it twice would run the call twice.
+        let needs_temp = match target {
+            Expr::Index(_, idx) => expr_has_call(idx),
+            _ => false,
+        };
+        if !needs_temp {
+            return Stmt::Assign {
+                target: target.clone(),
+                value: Expr::Bin(op, Box::new(target.clone()), Box::new(value)),
+            };
+        }
+
+        let tv = |name: &str| Expr::Var { name: name.to_string(), slot: -1, ty: Type::I64 };
+        let mut stmts = Vec::new();
+
+        // Bind the read target and the write target to the *same* location.
+        // For an index the subscript is evaluated once into a temporary and
+        // reused, so `a[next()] += 1` advances the counter once, not twice.
+        // A `Var` or `Field` target has no side effect on re-evaluation.
+        let (read, write) = match target {
+            Expr::Index(base, idx) => {
+                let it = format!("__rmc_ix{}", self.tmp);
+                self.tmp += 1;
+                stmts.push(Stmt::Let {
+                    name: it.clone(),
+                    ty: Some(Type::I64),
+                    init: Some((**idx).clone()),
+                    slot: -1,
+                });
+                let idxv = Box::new(tv(&it));
+                (
+                    Expr::Index(base.clone(), idxv.clone()),
+                    Expr::Index(base.clone(), idxv),
+                )
+            }
+            other => (other.clone(), other.clone()),
+        };
+
+        let tmp = format!("__rmc_ca{}", self.tmp);
+        self.tmp += 1;
+        stmts.push(Stmt::Let {
+            name: tmp.clone(),
+            ty: Some(Type::I64),
+            init: Some(read),
+            slot: -1,
+        });
+        stmts.push(Stmt::Assign {
+            target: write,
+            value: Expr::Bin(op, Box::new(tv(&tmp)), Box::new(value)),
+        });
+        Stmt::Expr(Expr::Block(Block {
+            stmts,
+            tail: Some(Box::new(tv(&tmp))),
+        }))
     }
 
     /// The `BinOp` for a compound-assignment operator, if the next token is one.
@@ -609,5 +671,43 @@ impl Parser {
                 other.map(|x| x.describe()).unwrap_or_else(|| "end of input".into())
             )),
         }
+    }
+}
+
+/// Whether `e` syntactically contains a call, used to decide if a subscript in
+/// a compound assignment must be evaluated into a temporary.
+fn expr_has_call(e: &Expr) -> bool {
+    match e {
+        Expr::Call { .. } => true,
+        Expr::Bin(_, a, b) => expr_has_call(a) || expr_has_call(b),
+        Expr::Un(_, a) | Expr::Cast(a, _) => expr_has_call(a),
+        Expr::Index(a, b) => expr_has_call(a) || expr_has_call(b),
+        Expr::Field { base, .. } => expr_has_call(base),
+        Expr::If(c, t, els) => {
+            expr_has_call(c) || block_has_call_p(t) || els.as_ref().map_or(false, block_has_call_p)
+        }
+        Expr::Block(b) => block_has_call_p(b),
+        Expr::StructLit { fields, .. } => fields.iter().any(|f| expr_has_call(&f.value)),
+        Expr::ArrayLit(v, _) => expr_has_call(v),
+        _ => false,
+    }
+}
+
+fn block_has_call_p(b: &Block) -> bool {
+    b.stmts.iter().any(stmt_has_call_p) || b.tail.as_deref().map_or(false, expr_has_call)
+}
+
+fn stmt_has_call_p(s: &Stmt) -> bool {
+    match s {
+        Stmt::Let { init, .. } => init.as_ref().map_or(false, expr_has_call),
+        Stmt::Assign { target, value } => expr_has_call(target) || expr_has_call(value),
+        Stmt::Expr(e) => expr_has_call(e),
+        Stmt::Return(v) => v.as_ref().map_or(false, expr_has_call),
+        Stmt::While(c, b) => expr_has_call(c) || block_has_call_p(b),
+        Stmt::Loop(b) => block_has_call_p(b),
+        Stmt::For { start, end, body, .. } => {
+            expr_has_call(start) || expr_has_call(end) || block_has_call_p(body)
+        }
+        Stmt::Break | Stmt::Continue => false,
     }
 }

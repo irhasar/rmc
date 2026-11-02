@@ -91,6 +91,16 @@ python3 tests/run.py -v
 - **`%r10` carries the return buffer.** It is caller-saved and not an argument
   register, so it survives argument setup. Do not use `%r10` as scratch anywhere
   argument setup can run after the return pointer is set.
+- **`sema` persists the inferred type on every `let`.** Codegen selects the
+  aggregate path from `Stmt::Let`'s `ty`, so leaving it `None` for `let a = [7; 2]`
+  silently initialises only one word.
+- **Struct-literal fields stay in source order.** Their layout offsets are
+  attached per field, so reordering them into declaration order would change the
+  order initializer side effects run in.
+- **A compound assignment with a call in its subscript is bound to a temporary.**
+  `a[next()] += 1` must evaluate `next()` once; the parser's `desugar_compound`
+  binds the subscript when (and only when) it contains a call, so the common
+  `i += 1` keeps the cheap two-instruction form.
 - **Statements vs. tail expressions.** Assignments inside a block must be
   detected before the trailing-`;` check in `parse_block`, otherwise `x = ...;`
   is parsed as an expression and rejected.
@@ -112,7 +122,11 @@ python3 tests/run.py -v
 ## Tests
 
 `tests/run.py` compiles each `tests/cases/NAME.{rms,rs}` pair with both compilers
-and diffs stdout and the exit status. When adding a case, add both twins, write
+and diffs stdout and the exit status. `aggsem` (by-value aggregate assignment,
+inferred aggregates, nested fields, indexing a returned array), `cmpsem`
+(single evaluation of a side-effecting subscript in a compound assignment,
+struct-literal field order) and `utf8` (non-ASCII string literals) guard the
+front-end/codegen fixes below. When adding a case, add both twins, write
 them to behave identically, and remember that `rustc` infers `i32` for unsuffixed
 literals, so large literals need an `i64` suffix on the Rust side. `args.json`
 maps a case name to a list of argv vectors. Verify a new case actually detects
@@ -133,6 +147,22 @@ the intended next steps.
 - Every expression leaves its result in `%rax`; `%rcx`/`%rdx` are the only
   scratch registers used. No other register is written by expression code, which
   is what makes the direct-argument call shortcut safe (see `gen_call`).
+- **`copy_words_rdi_rsi` must not touch `%rax`.** It copies through `%r8`, so a
+  caller can hold a live value in `%rax` across the copy (a pending operand, or
+  an argument already loaded into a register). It also clobbers `%rdi`/`%rsi`,
+  which is why `contains_call` treats a struct/array literal as call-like: a
+  literal is materialised through this copy, so it must not be selected by the
+  direct-argument shortcut that requires register preservation.
+- **`gen_expr_into_reg` folds `x ± k` into one `lea`.** It is only valid when
+  overflow checks are off (a `lea` cannot trap); with `--overflow-checks` it
+  falls through to `gen_bin`, which emits the `jo`. `gen_expr_into_reg(e, dst)`
+  is also the safe way to materialise an expression straight into a destination
+  register during argument setup.
+- **Aggregates are copied, not aliased.** Whole-aggregate assignment, struct
+  fields of aggregate type, array elements of aggregate type, and struct-literal
+  fields all copy their words. A field or element read of aggregate type yields
+  an *address*, not a value, and `simple_operand` returns `None` for it so no
+  scalar path can treat the address as data.
 - `simple_operand` returns operands usable with no register at all: immediates,
   scalar locals, constant-index array elements, and struct fields of a local.
   `array_elem_operand` returns the `disp(%rbp,%rax,8)` form whose index must

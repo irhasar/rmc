@@ -29,8 +29,9 @@ q.x = q.x + 1;                          // field read and write
 
 Fields are laid out in declaration order with no padding. A struct may contain
 another struct, but not itself, and it cannot be used as an array element.
-Structs may be passed to and returned from functions by value: the value is
-copied, so a change inside the callee does not reach the caller. To reuse a
+Structs may be passed to and returned from functions by value, assigned to one
+another (`p = q`), and nested as fields; in every case the value is copied, so a
+change to one does not reach the other. To reuse a
 struct after passing it (as `bump(a)` then reading `a`), annotate it
 `#[derive(Copy, Clone)]` so the same source also compiles with rustc; rmc parses
 and ignores the attribute.
