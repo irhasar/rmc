@@ -55,6 +55,10 @@ fn main() {
 
     let r2: &&i64 = &r;
     println!("{}", **r2);
+    // A field through a double reference: the inner pointer must be loaded, not
+    // mistaken for a register operand (it is not one).
+    let ppr: &&Point = &pr;
+    println!("{}", (**ppr).x);
     let r3: &i64 = identity(r);
     println!("{}", *r3);
 

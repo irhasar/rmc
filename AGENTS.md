@@ -88,6 +88,31 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
   coercion and is checked in `let`, assignment and call arguments. Both are one
   pointer, so the coercion emits no code. `&mut` and `&` are otherwise distinct
   types, which is why `Sig` carries `ref_self_mut`.
+- **A field read through a reference folds to one `disp(%reg)` load.**
+  `field_operand` recognises a reference local kept in a register (`p.x` where
+  `p: &T` and `p` is promoted) and a dereference of one (`(*q).x`), emitting
+  `mov off(%reg), %rax` instead of `mov %reg,%rax; add $off,%rax; mov (%rax),%rax`.
+  Before this, an `&self` accessor over an 8-field struct emitted ~3 instructions
+  per field and the `refs` benchmark ran at 69 ms; the fold brought rmc's own
+  runtime down ~1.4x to ~50 ms (rustc still leads on `refs` by ~20x — it inlines
+  the accessors and keeps the struct in registers). The fold is deliberately
+  *one* level deep: a `*p` used as a
+  reference has its pointer in memory, so `ptr_reg` only matches a reference
+  *local*, never a `Deref`. `addr_reg` (local or one `Deref` of a local) is the
+  form `gen_addr` folds for a `lea`. Extending either to a deeper chain would
+  read the inner pointer from a register it is not in — the bug that
+  `(**ppr).x` in `tests/cases/references.rms` guards against.
+- **A scalar `*p` read is a memory operand.** `simple_operand` returns `(%reg)`
+  for a non-aggregate `Deref` whose pointer is a reference local, so `*p < 5`
+  is one `cmpq $5, (%reg)` and `*p` in a comparison needs no load. An aggregate
+  `Deref` is *not* a simple operand: its value is an address, not data.
+- **`trim_dead` drops unreachable instructions and self-moves.** After each
+  function body is generated it removes instructions following an unconditional
+  `jmp`/`ret` up to the next label, and `mov %r, %r`. A `return` inside an
+  expression emits `jmp epilogue` then the rest of the expression; the pass is a
+  one-sweep fixpoint because removing a line creates neither a label nor a new
+  terminator. It runs on the real body only (the dry spill pass's output is
+  truncated anyway), so it costs nothing at compile time.
 - **Stack slots grow downward.** A local in slot `s` lives at
   `-(s+1+nregs)*8(%rbp)`, where `nregs` is the number of registers holding
   promoted locals. Address them positively and you overwrite the saved
@@ -277,14 +302,16 @@ bug.
 
 This is a small, self-contained compiler, not a general Rust compiler. Do not
 claim otherwise. It supports only the subset in `docs/language.md` (scalars,
-arrays, structs, `for`, aggregates across calls), has no register allocator and
-only a small peephole optimiser (operand/comparison/array-address folding,
-constant folding, division by a constant), and no borrow checker. Aggregates
-cross a call only by value; there are no references. Array indexing is unchecked
-by default (the index is used as-is, like C), so an out-of-range index reads or
-writes adjacent stack memory; `--bounds-checks` turns on a per-index check that
-traps (see the codegen notes). The README's roadmap lists the intended next
-steps.
+arrays, structs, enums, `for`, aggregates across calls, references `&T`/`&mut T`
+with no borrow checking). It has no *general* register allocator: whole-function
+locals are promoted to callee-saved registers by mention count (`promote`), and
+temporaries crossing a call use `SPILL_REGS`, but a dying temporary's register is
+not reused for a later local (roadmap item 1). The optimiser is a small peephole
+pass (operand/comparison/array-address folding, constant folding, division by a
+constant). Array indexing is unchecked by default (the index is used as-is, like
+C), so an out-of-range index reads or writes adjacent stack memory;
+`--bounds-checks` turns on a per-index check that traps (see the codegen notes).
+The README's roadmap lists the intended next steps.
 
 ## Codegen notes
 

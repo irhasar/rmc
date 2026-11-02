@@ -197,35 +197,39 @@ Representative run on the development machine (Debian 13, gcc 14.2, rustc
 
 | program | compiler | compile wall | compile CPU | peak RSS | artifact | run time |
 | ------- | -------- | -----------: | ----------: | -------: | -------: | -------: |
-| hello   | rmc      |     8.28 ms  |    8.01 ms  |  12.0 MB |   6504 B |  1.67 ms |
-| hello   | rustc    |  2077.82 ms  | 2080.93 ms  | 185.3 MB | 289416 B |  2.36 ms |
-| fib     | rmc      |     8.45 ms  |    7.61 ms  |  12.0 MB |   6616 B | 15.71 ms |
-| fib     | rustc    |  2144.02 ms  | 2148.29 ms  | 186.3 MB | 291696 B |  8.77 ms |
-| mandel  | rmc      |     7.96 ms  |    7.69 ms  |  12.0 MB |   6880 B |103.74 ms |
-| mandel  | rustc    |  2135.61 ms  | 2139.86 ms  | 189.2 MB | 291776 B |107.07 ms |
-| sieve   | rmc      |     9.68 ms  |    9.45 ms  |  12.0 MB |   6656 B |  3.03 ms |
-| sieve   | rustc    |  2125.14 ms  | 2129.20 ms  | 185.8 MB | 292016 B |  3.94 ms |
-| mix     | rmc      |     7.98 ms  |    7.76 ms  |  12.0 MB |   6672 B | 18.72 ms |
-| mix     | rustc    |  2109.36 ms  | 2113.14 ms  | 187.2 MB | 291864 B | 16.98 ms |
-| stats   | rmc      |     7.64 ms  |    7.39 ms  |  12.0 MB |   6752 B |  5.29 ms |
-| stats   | rustc    |  2154.83 ms  | 2158.99 ms  | 186.8 MB | 292048 B |  5.09 ms |
+| hello   | rmc      |     7.49 ms  |    7.21 ms  |  11.7 MB |   6656 B |  1.59 ms |
+| hello   | rustc    |  2121.23 ms  | 2122.65 ms  | 181.3 MB | 289416 B |  2.21 ms |
+| fib     | rmc      |     7.06 ms  |    6.83 ms  |  11.7 MB |   6760 B | 15.91 ms |
+| fib     | rustc    |  2179.62 ms  | 2183.44 ms  | 181.6 MB | 291696 B |  8.63 ms |
+| mandel  | rmc      |     7.81 ms  |    7.50 ms  |  11.7 MB |   7032 B |103.28 ms |
+| mandel  | rustc    |  2210.14 ms  | 2214.71 ms  | 185.0 MB | 291776 B |107.06 ms |
+| sieve   | rmc      |     9.45 ms  |    9.17 ms  |  11.7 MB |   6800 B |  3.03 ms |
+| sieve   | rustc    |  2137.98 ms  | 2134.03 ms  | 182.6 MB | 292016 B |  3.96 ms |
+| mix     | rmc      |     8.19 ms  |    7.90 ms  |  11.7 MB |   6816 B | 18.45 ms |
+| mix     | rustc    |  2193.04 ms  | 2197.51 ms  | 182.4 MB | 291864 B | 17.15 ms |
+| stats   | rmc      |     7.40 ms  |    7.17 ms  |  11.7 MB |   6904 B |  5.21 ms |
+| stats   | rustc    |  2117.05 ms  | 2121.32 ms  | 181.6 MB | 292048 B |  5.13 ms |
+| refs    | rmc      |     7.56 ms  |    7.13 ms  |  11.7 MB |   7144 B | 50.48 ms |
+| refs    | rustc    |  2154.68 ms  | 2158.94 ms  | 183.2 MB | 292144 B |  2.30 ms |
 
 Summary of the ratios (rustc ÷ rmc):
 
 | dimension        | ratio      |
 | ---------------- | ---------: |
-| compile wall     | ~250–285×  |
-| compile CPU      | ~260–292×  |
-| compiler peak RSS| ~15.4×     |
-| artifact size    | ~44×       |
-| run time         | 0.56–1.41× (rustc faster on call-heavy code) |
+| compile wall     | ~280–300×  |
+| compile CPU      | ~290–320×  |
+| compiler peak RSS| ~15.6×     |
+| artifact size    | ~43×       |
+| run time         | 0.05–1.39× (rustc faster on call-heavy code) |
 
-`rmc` beats rustc on `hello` (1.41×), `sieve` (1.30×) and `mandel` (1.03×)
+`rmc` beats rustc on `hello` (1.39×), `sieve` (1.31×) and `mandel` (1.04×)
 because the workload is a tight loop or a single call and the static binary has
-no libc startup. On `fib` (0.56×, call-heavy), `mix` (0.91×) and `stats` (0.96×)
-LLVM's loop transformations and register allocation still win. These benchmarks
-are not struct-field-bound, so field promotion (below) shows up only in the
-microbenchmark, not here.
+no libc startup. On `fib` (0.54×, call-heavy), `mix` (0.93×) and `stats` (0.98×)
+LLVM's loop transformations and register allocation still win. `refs` is the
+worst case at 0.05×: rustc inlines the `&self` accessors and keeps the whole
+struct in registers, while rmc reloads each field from memory on every call. The
+field-through-reference fold (below) already cut rmc's own `refs` time by ~1.4×
+(69 ms → 50 ms); inlining is what it would take to close the rest.
 
 ### Reproducing the comparison honestly
 

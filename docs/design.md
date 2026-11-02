@@ -301,16 +301,19 @@ a branch per arithmetic operation.
 
 ## What is intentionally missing
 
-There is no optimiser beyond the folding and local promotion described above.
-No global register allocation, no common-subexpression elimination, no inlining,
-no loop transforms, no instruction scheduling. The compiler is optimised for
-compile speed and simplicity, not for the speed of the code it produces. The
-non-trivial passes are division by a constant (1.4x on `mandel.rms`) and the
-top-five local promotion (a few percent on `mix` and `sieve`); everything else is
-local and cheap to compute.
+There is no optimiser beyond the folding, local promotion and dead-instruction
+trim described above. No global register allocation, no common-subexpression
+elimination, no inlining, no loop transforms, no instruction scheduling. The
+compiler is optimised for compile speed and simplicity, not for the speed of the
+code it produces. The non-trivial passes are division by a constant (1.4x on
+`mandel.rms`), the top-five local promotion (a few percent on `mix` and `sieve`),
+and the reference-operand folds plus `trim_dead` (1.4x on the `refs` benchmark);
+everything else is local and cheap to compute.
 
 On the language side the notable absences are: `u*`/`i*` widths other than
-`i64`, floating point, `match`, enums, methods, and anything involving borrowing
-or generics. Aggregate arguments and returns work, but only by value: without
-references every call that takes a struct copies it. See the roadmap in the
-README for the order in which these might arrive.
+`i64`, floating point, traits and generics, closures, `for` over arbitrary
+iterators, and anything involving real borrow checking (`&T`/`&mut T` exist but
+are unchecked, and `&mut T` is not exclusivity-checked). Aggregate arguments and
+returns work by value; a `&T` parameter or `&self` receiver is passed by address
+so no copy is made. See the roadmap in the README for the order in which these
+might arrive.
