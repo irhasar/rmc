@@ -93,7 +93,9 @@ Rust panic. Division by zero always traps at the CPU level.
   value stays negative) and a shift count is taken modulo 64, matching Rust.
   Precedence, tightest first: `* / %`, `+ -`, `<< >>`, `&`, `^`, `|`, then the
   comparisons and `&& ||`. So `1 + 2 << 3` is `(1 + 2) << 3`, and
-  `if x & 1 == 0` is `(x & 1) == 0`.
+  `if x & 1 == 0` is `(x & 1) == 0`. rmc has only `i64`, so a literal count is
+  masked to 6 bits; in Rust an unconstrained literal count is `i32` and masks to
+  5, which is why a program that mixes the two types can differ.
 - Calls: `f(a, b)`.
 - Indexing: `arr[i]`.
 - Array literals: `[a, b, c]` and `[value; count]`.

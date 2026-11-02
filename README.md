@@ -40,6 +40,8 @@ bench/
   programs/*.rms     benchmark programs in the rmc subset
   rust/*.rs          the same programs written in real Rust
   run.py             benchmark harness (compile time, CPU, RAM, size, runtime)
+tools/
+  fuzz.py            differential fuzzer: random programs vs rustc
 tests/
   run.py             differential test suite: rmc vs rustc on twin programs
   cases/*.rms, *.rs  paired programs that must behave identically
@@ -104,6 +106,22 @@ calls and recursion, the output builtins, and nested expressions. It is
 deliberately adversarial: reverting the folded-comparison operand-order fix
 makes the `cmp` case fail, and dropping the sign bias from division by a power
 of two makes the `div` case fail.
+
+`tools/fuzz.py` generates random programs and checks them against `rustc -O`
+the same way, for the cases a hand-written suite does not think of. It has two
+modes: `expr` for integer expressions, and `stmt` for loops, conditionals,
+`match`, arrays and aggregate calls (including argument evaluation order). Seeds
+are reproducible, so a failure can be re-run and shrunk.
+
+```sh
+python3 tools/fuzz.py --mode expr --n 500 --seed 1
+python3 tools/fuzz.py --mode stmt --n 500 --seed 1
+```
+
+A caveat for `expr`: an integer literal in a shift amount is unconstrained, so
+rustc infers `i32` and masks the count to 5 bits, while rmc is `i64`-only and
+masks to 6. The generator therefore keeps shift operands `i64`-typed, or the two
+would disagree for a reason that is not a bug.
 
 ## Language subset
 
