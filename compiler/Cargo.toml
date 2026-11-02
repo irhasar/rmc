@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "nrc: an experimental Rust-subset compiler that emits native x86-64 machine code directly, with no LLVM and zero external crates."
 
+[lib]
+name = "nrc"
+path = "src/lib.rs"
+
 [[bin]]
 name = "nrc"
 path = "src/main.rs"

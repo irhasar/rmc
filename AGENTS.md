@@ -32,15 +32,22 @@ python3 tests/run.py -v
 
 ## Source map
 
+- `compiler/src/lib.rs` — library entry point: `compile_to_asm(src, options)`.
+  The compiler is a library plus a thin CLI, so it can be embedded.
 - `compiler/src/lexer.rs` — byte scanner, tokens carry byte positions.
 - `compiler/src/parser.rs` — recursive descent; `is_block_like` allows
-  `if`/`while`/`loop`/blocks as statements without a trailing `;`.
-- `compiler/src/ast.rs` — AST and `Type` (`I64`, `Bool`, `Unit`, `Array`).
-- `compiler/src/sema.rs` — type checking, stack-slot allocation, builtin sigs.
+  `if`/blocks as statements without a trailing `;`. `parse_cond` sets
+  `no_struct_lit` so a `{` after a condition starts the body, not a struct.
+- `compiler/src/ast.rs` — AST and `Type` (`I64`, `Bool`, `Unit`, `Array`,
+  `Struct`, and the parser-only placeholder `Named`).
+- `compiler/src/sema.rs` — type checking, struct layout, stack-slot allocation,
+  builtin sigs. Resolves `Type::Named` and fills `Field`/`FieldInit` offsets.
 - `compiler/src/codegen.rs` — AST to AT&T x86-64 assembly.
 - `compiler/src/runtime.rs` — freestanding assembly runtime (`_start`, I/O,
-  `alloc`, `arg_i64`).
-- `compiler/src/main.rs` — driver: lex -> parse -> sema -> asm -> `as` -> `ld`.
+  `alloc`/`free`, `arg_i64`, the overflow trap).
+- `compiler/src/main.rs` — CLI: reads source, calls the library, runs `as`/`ld`.
+- `compiler/tests/compile.rs` — unit tests for the front end and codegen; these
+  run without `as`/`ld`.
 
 ## Things that are easy to get wrong
 
@@ -52,11 +59,22 @@ python3 tests/run.py -v
   `%rsp` at the lowest saved register (or add the frame size back) before
   popping, otherwise `pop` reads the frame and the return address is lost.
   `regs.nrs` and `calls.nrs` fail if this regresses.
-- **Arrays cannot be promoted.** A promoted local is named by its register, so
-  an array (which needs an address) or an index base must stay in memory.
-- **Array element 0 is at the lowest address.** An array in slots `s..s+n` has
-  element 0 at `-(s+n+nregs)*8(%rbp)`, with element `i` at `base + i*8`. Mixing
-  this up makes array writes run upward past `%rbp`. See `Codegen::array_off`.
+- **Aggregates cannot be promoted.** A promoted local is named by its register,
+  so an array or struct (which needs an address) must stay in memory, and so must
+  an index base. `promote` excludes *every* slot an aggregate spans, not just
+  its first.
+- **Aggregate element 0 is at the lowest address.** An array or struct in slots
+  `s..s+n` has element/field 0 at `-(s+n+nregs)*8(%rbp)`, with item `i` at
+  `base + i*8`. Mixing this up makes aggregate writes run upward past `%rbp`.
+  `aggregate_base` returns this base for both arrays and structs; use it
+  everywhere, including the struct-literal store in `gen_stmt` (an earlier bug
+  used `off(slot)`, the wrong end of the range).
+- **`for` is not a `while`.** `continue` must run the increment, so `for` keeps
+  its own node with a dedicated continue label. Desugaring it to `while` would
+  make `continue` skip the increment and loop forever.
+- **Struct layout must agree between read and write.** `sema` resolves a field
+  to an offset from the aggregate base; codegen must add that offset to the same
+  base used for reads (`field_operand`) and writes.
 - **Statements vs. tail expressions.** Assignments inside a block must be
   detected before the trailing-`;` check in `parse_block`, otherwise `x = ...;`
   is parsed as an expression and rejected.
@@ -86,10 +104,12 @@ the bug it guards: revert the fix and confirm the case fails.
 
 ## Scope
 
-This is a research toy. Do not claim it is a general Rust compiler. It supports
-only the subset in `docs/language.md`, has no register allocator and only a
-small peephole optimiser (operand/comparison/array-address folding, constant
-folding, division by a constant), and no borrow checker.
+This is a small, self-contained compiler, not a general Rust compiler. Do not
+claim otherwise. It supports only the subset in `docs/language.md` (scalars,
+arrays, structs, `for`), has no register allocator and only a small peephole
+optimiser (operand/comparison/array-address folding, constant folding, division
+by a constant), and no borrow checker. Structs cannot cross a function boundary.
+The README's roadmap lists the intended next steps.
 
 ## Codegen notes
 
@@ -97,8 +117,9 @@ folding, division by a constant), and no borrow checker.
   scratch registers used. No other register is written by expression code, which
   is what makes the direct-argument call shortcut safe (see `gen_call`).
 - `simple_operand` returns operands usable with no register at all: immediates,
-  scalar locals, and constant-index array elements. `array_elem_operand` returns
-  the `disp(%rbp,%rax,8)` form whose index must first be loaded into `%rax`.
+  scalar locals, constant-index array elements, and struct fields of a local.
+  `array_elem_operand` returns the `disp(%rbp,%rax,8)` form whose index must
+  first be loaded into `%rax`.
 - Folding arithmetic memory operands into `add`/`imul` and the in-place
   `x = x + e` form were both tried and measured *slower* on the Zen cores this
   was tuned on, so they were removed. Keep the plain two-register form unless

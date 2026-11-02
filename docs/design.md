@@ -13,8 +13,10 @@ driver shells out to GNU `as` and `ld`.
    Precedence climbing handles binary operators; `is_block_like` lets `if`,
    `while`, `loop` and bare blocks appear as statements without a trailing `;`.
 3. **Semantic analysis** (`sema.rs`) — checks types, resolves every variable to
-   a stack slot, and records the frame size (`nslots`) per function. Runtime
-   builtins are registered as ordinary signatures here, so calls to them
+   a stack slot, lays out structs, and records the frame size (`nslots`) per
+   function. It rewrites `Expr::Var` with the resolved slot and type and
+   `Expr::Field` with the field's byte offset, so codegen never looks up a name.
+   Runtime builtins are registered as ordinary signatures here, so calls to them
    type-check like any other function.
 4. **Code generation** (`codegen.rs`) — emits AT&T-syntax x86-64 assembly. Every
    expression leaves its result in `%rax`; the result type is returned to the
@@ -30,11 +32,24 @@ and never collide with the saved frame pointer or return address above `%rbp`.
 `sub $N` rounds the frame up to a multiple of 16 to keep the stack 16-byte
 aligned for calls.
 
-Arrays occupy `n` consecutive slots. Because slot addresses decrease as the slot
-index rises, an array's element 0 is at the *lowest* address,
-`-(slot+n)*8(%rbp)`, and element `i` is then `base + i*8`. Getting this layout
-consistent between `fill_array`, `gen_addr` and value loading was the source of
-an early miscompile where array writes ran upward past `%rbp`.
+Arrays and structs occupy `n` consecutive slots. Because slot addresses decrease
+as the slot index rises, an aggregate's element 0 / field 0 is at the *lowest*
+address, `-(slot+n)*8(%rbp)`, and element or field `i` is `base + i*8`. Getting
+this layout consistent between the fill, `gen_addr` and value loading was the
+source of an early miscompile where array writes ran upward past `%rbp`.
+`aggregate_base` computes this base for both arrays and structs.
+
+## Structs
+
+A struct is a name, a list of fields, and a size. `sema` assigns each field an
+offset in declaration order and no padding is needed because every field is 8
+bytes. A field access is then just a `disp(%rbp)` operand, exactly like an array
+element with a constant index. A struct literal is reordered into declaration
+order by `sema` so codegen can store the fields sequentially.
+
+Structs live in memory and are named by their address. They cannot be function
+parameters or return values, which is the main limitation to lift next: the
+System V ABI passes large aggregates via a hidden pointer.
 
 ## Expression convention
 
@@ -88,9 +103,9 @@ There is no allocator in the usual sense, but the hottest locals in a function
 are promoted. `promote` counts how often each scalar local is mentioned, takes
 the top five, and assigns them `%rbx`, `%r12`–`%r15` for the whole function.
 These are callee-saved, so a promoted value stays valid across a call and never
-needs spilling. Arrays are skipped because an array needs a memory address, as
-are slots used as the base of an index. Everything else stays in a stack slot,
-now placed below the saved registers so the two never overlap.
+needs spilling. Aggregates are skipped because they need a memory address, and so
+is any slot used as an index base. Everything else stays in a stack slot, now
+placed below the saved registers so the two never overlap.
 
 The frame is padded so that the saved registers plus the slots together keep
 `%rsp` 16-byte aligned at every call, and the epilogue points `%rsp` at the
@@ -103,8 +118,12 @@ compile time, peak RSS and binary size are unchanged.
 
 ## Control flow
 
-- `while` and `loop` push `(continue_label, break_label)` onto a loop stack so
-  `continue` and `break` can resolve to the innermost loop.
+- `while`, `loop` and `for` push `(continue_label, break_label)` onto a loop
+  stack so `continue` and `break` resolve to the innermost loop.
+- `for i in a..b` is *not* desugared to a `while`: `continue` must still run the
+  increment, so the increment gets its own label and `continue` targets that,
+  not the loop test. Both bounds are evaluated once, the end into a hidden slot,
+  so `for i in 0..f()` calls `f` exactly once.
 - `if`/`while` conditions are emitted as a direct `cmp` + `jcc` when the
   condition is a comparison, instead of materialising a 0/1 and testing it. The
   negated condition codes are in `invert_cc`.
@@ -127,17 +146,40 @@ are clobbered, which is why the simple-operand test matters for wider calls.
 
 `runtime.rs` holds a freestanding assembly runtime. `_start` captures `argc` and
 `argv` from the initial stack, calls `main`, and exits via the `exit` syscall
-with `main`'s return value. I/O (`print_i64`, `print_str`, `putchar`), memory
-(`alloc`, an anonymous zero-filled `mmap`), and `arg_i64` are all implemented
-with raw syscalls. Because there is no libc, the resulting ELF is static and
-tiny.
+with `main`'s return value. I/O (`print_i64`, `print_str`, `print_bool`,
+`putchar`), memory (`alloc`/`free`), `arg_i64` and the overflow trap are all
+implemented with raw syscalls. Because there is no libc, the resulting ELF is
+static and tiny.
+
+### Heap
+
+`alloc` is a first-fit allocator. Memory comes from `mmap`'d chunks of at least
+1 MiB; a bump pointer carves blocks out of the current chunk, and each block
+carries an 8-byte size header immediately before the pointer handed to the
+program. `free` inserts a block into an address-ordered free list and coalesces
+it with an adjacent neighbour. The list is address-ordered (rather than a plain
+LIFO) precisely so coalescing is possible; the cost is a linear scan on both
+`alloc` and `free`, which is fine at this scale. Memory is never returned to the
+kernel.
+
+### Overflow checks
+
+With `--overflow-checks`, every `+`, `-` and `*` is followed by `jo
+__nrc_overflow`. The trap writes a fixed message to stderr and exits 101, the
+same status rustc uses for a panic. The check is off by default because it costs
+a branch per arithmetic operation.
 
 ## What is intentionally missing
 
 There is no optimiser beyond the folding and local promotion described above.
 No global register allocation, no common-subexpression elimination, no inlining,
-no loop transforms. The compiler is optimised for compile speed and simplicity,
-not for the speed of the code it produces. The two non-trivial passes are
-division by a constant, worth 1.4x on `mandel.nrs`, and the top-five local
-promotion, worth a few percent on `mix` and `sieve`; everything else is local
-and cheap to compute.
+no loop transforms, no instruction scheduling. The compiler is optimised for
+compile speed and simplicity, not for the speed of the code it produces. The
+non-trivial passes are division by a constant (1.4x on `mandel.nrs`) and the
+top-five local promotion (a few percent on `mix` and `sieve`); everything else is
+local and cheap to compute.
+
+On the language side the notable absences are: aggregates across function
+boundaries, `u*`/`i*` widths other than `i64`, floating point, `match`, enums,
+methods, and anything involving borrowing or generics. See the roadmap in the
+README for the order in which these might arrive.

@@ -27,13 +27,15 @@ loop) do the work a stack-machine code generator cannot.
 
 ```
 compiler/            the nrc compiler (Rust, std only, no dependencies)
+  src/lib.rs         library entry point: compile_to_asm(src, options)
   src/lexer.rs       source -> tokens
   src/parser.rs      tokens -> AST
   src/ast.rs         AST + type definitions
-  src/sema.rs        type checking, slot allocation, builtin signatures
+  src/sema.rs        type checking, struct layout, slot allocation, builtins
   src/codegen.rs     AST -> x86-64 assembly (System V, AT&T syntax)
   src/runtime.rs     freestanding runtime written in assembly
-  src/main.rs        driver: source -> lex -> parse -> sema -> asm -> as -> ld
+  src/main.rs        CLI driver: source -> asm -> as -> ld
+  tests/compile.rs   unit tests for the front end and code generator
 bench/
   programs/*.nrs     benchmark programs in the nrc subset
   rust/*.rs          the same programs written in real Rust
@@ -59,12 +61,28 @@ from binutils on `PATH`; no other tools are required.
 ## Usage
 
 ```sh
-nrc input.nrs -o output          # compile, assemble and link
-nrc input.nrs --emit-asm         # print the generated assembly to stdout
+nrc input.nrs -o output            # compile, assemble and link
+nrc input.nrs --emit-asm           # print the generated assembly to stdout
+nrc input.nrs --keep-asm -o out    # keep the intermediate .s file
+nrc input.nrs --overflow-checks    # trap on i64 +,-,* overflow (exit 101)
 ```
 
 Run the produced binary directly; it is a static ELF executable with no
 dynamic dependencies.
+
+## Using nrc as a library
+
+`nrc` is both a binary and a library. `compile_to_asm` turns a program into a
+complete x86-64 assembly unit (program plus runtime); you can assemble and link
+it yourself, or just inspect it.
+
+```rust
+let asm = nrc::compile_to_asm(
+    "fn main() -> i64 { let mut x: i64 = 0; for i in 0..10 { x += i; } return x; }",
+    &nrc::CompileOptions::default(),
+)?;
+std::fs::write("out.s", asm)?;
+```
 
 ## Testing
 
@@ -108,11 +126,13 @@ fn main() -> i64 {
 }
 ```
 
-Supported: `i64`, `bool`, fixed-size arrays `[i64; N]`, functions with up to six
-parameters, `let` / `let mut`, assignment, `if`/`else`, `while`, `loop`, `break`,
-`continue`, `return`, arithmetic and comparison operators, `&&`/`||`, string
-literals, and a small set of runtime builtins. See `docs/language.md` for the
-full list.
+Supported: `i64`, `bool`, fixed-size arrays, and structs with named fields;
+functions with up to six scalar parameters; `let` / `let mut`; assignment to
+variables, array elements and struct fields (including compound `+=` and
+friends); `if`/`else`, `while`, `loop`, and `for i in a..b`; `break`, `continue`,
+`return`; arithmetic and comparison operators; `&&`/`||`; string literals; and a
+small set of runtime builtins. Overflow checks are opt-in with
+`--overflow-checks`. See `docs/language.md` for the full grammar.
 
 Runtime builtins (provided by `src/runtime.rs`, no imports needed):
 
@@ -122,7 +142,8 @@ Runtime builtins (provided by `src/runtime.rs`, no imports needed):
 | `print_str(s)`  | `(i64) -> ()`        | print a string literal                 |
 | `print_bool(b)` | `(bool) -> ()`       | print `true` or `false`                |
 | `putchar(c)`    | `(i64) -> ()`        | write a single byte                    |
-| `alloc(n)`      | `(i64) -> i64`       | anonymous zero-filled `mmap` of `n` bytes |
+| `alloc(n)`      | `(i64) -> i64`       | allocate `n` bytes (first-fit free list) |
+| `free(p)`       | `(i64) -> ()`        | return a block from `alloc` to the heap |
 | `arg_i64(i)`    | `(i64) -> i64`       | parse `argv[i]` as a signed integer    |
 
 ## Benchmarks
@@ -179,21 +200,44 @@ Both binaries are measured the same way, and both read their workload from
 
 ## Honest limitations
 
-This is a research toy, not a drop-in Rust compiler.
+nrc is a small, self-contained compiler, not a drop-in replacement for rustc.
 
-- The language subset is tiny (see `docs/language.md`); no structs, enums,
-  traits, generics, `match`, references, borrowing, or the standard library.
-- Code generation is a straightforward stack machine for expressions. There is
-  no global register allocator and no instruction scheduling: the hottest five
-  scalar locals in each function are pinned to callee-saved registers, and
-  everything else lives on the stack. The optimiser is a small peephole pass:
-  constants and locals become immediate/memory operands, comparisons become a
-  single `cmp`/`setcc`, array addressing folds into `disp(%rbp,%rax,8)`, call
-  arguments load straight from their operands, and division by a constant
-  becomes a magic multiply and shift instead of `idiv`.
-- Arrays live on the stack; there is no heap except the bump allocator.
-- `nrc` reads and writes programs that use `i64` and `bool`; there is no
-  overflow checking, and division by zero traps at the CPU level.
+- The language subset is small (see `docs/language.md`). Structs, arrays, `for`
+  and overflow checks exist; enums, traits, generics, `match`, references and
+  borrowing, methods, closures, floating point and the standard library do not.
+  Structs cannot cross a function boundary.
+- Code generation is a stack machine for expressions. The hottest five scalar
+  locals in each function are pinned to callee-saved registers; everything else
+  is in memory. The optimiser is a peephole pass (constant operands, folded
+  comparisons, folded array addressing, division by a constant); there is no
+  instruction scheduling, inlining, or loop transformation.
+- The backend targets x86-64 Linux only, using the System V ABI and raw Linux
+  syscalls. There is no Windows, macOS, ARM, or WebAssembly support.
+- The heap is a simple first-fit free-list allocator; it does not return memory
+  to the kernel and has no thread safety.
+- `nrc` is one person's project with a differential test suite and CI, not a
+  funded product.
+
+## Roadmap
+
+What would move nrc from a serious toy toward something usable, roughly in order
+of value per unit of effort:
+
+1. **Aggregates across calls.** Pass and return structs (by hidden pointer, as
+   the System V ABI does) so structs are useful beyond a single function.
+2. **A real register allocator.** Linear scan over live ranges, replacing the
+   whole-function top-five heuristic. This is the single biggest win for the
+   call-heavy benchmarks that nrc still loses.
+3. **More types.** `u*`/`i*` widths, `f64`, and `match` on integers, which
+   together cover most of what small programs actually need.
+4. **Enums and `impl` methods.** The next step after structs toward expressing
+   real data structures.
+5. **More backends.** A second target (ARM64 or a simple VM) would force the
+   code generator's assumptions out into the open.
+6. **Debug info.** Line tables so a debugger can point at source.
+
+Anything involving borrowing, generics or the trait system is out of scope: it
+would make nrc a different project rather than a better one.
 
 ## License
 

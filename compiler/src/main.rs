@@ -4,13 +4,7 @@
 //! GNU as -> GNU ld. No LLVM, no external crates. The emitted program links
 //! against a freestanding assembly runtime and makes raw Linux syscalls.
 
-mod ast;
-mod codegen;
-mod lexer;
-mod parser;
-mod runtime;
-mod sema;
-
+use nrc::{compile_to_asm, CompileOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -112,18 +106,12 @@ fn run(opts: Options) -> Result<(), String> {
     let src = std::fs::read_to_string(&opts.input)
         .map_err(|e| format!("cannot read {}: {e}", opts.input.display()))?;
 
-    let toks = lexer::lex(&src)?;
-    let mut prog = parser::Parser::new(toks).parse_program()?;
-    sema::analyze(&mut prog)?;
-
-    let mut cg = codegen::Codegen::new();
-    if opts.overflow_checks {
-        cg = cg.overflow_checks();
-    }
-    let user_asm = cg.compile(&prog);
-    let mut asm = String::with_capacity(user_asm.len() + runtime::RUNTIME_ASM.len() + 64);
-    asm.push_str(&user_asm);
-    asm.push_str(runtime::RUNTIME_ASM);
+    let asm = compile_to_asm(
+        &src,
+        &CompileOptions {
+            overflow_checks: opts.overflow_checks,
+        },
+    )?;
 
     if opts.emit_asm {
         print!("{asm}");
