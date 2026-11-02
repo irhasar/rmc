@@ -127,12 +127,14 @@ fn main() -> i64 {
 ```
 
 Supported: `i64`, `bool`, fixed-size arrays, and structs with named fields;
-functions with up to six scalar parameters; `let` / `let mut`; assignment to
-variables, array elements and struct fields (including compound `+=` and
-friends); `if`/`else`, `while`, `loop`, and `for i in a..b`; `break`, `continue`,
-`return`; arithmetic and comparison operators; `&&`/`||`; string literals; and a
-small set of runtime builtins. Overflow checks are opt-in with
-`--overflow-checks`. See `docs/language.md` for the full grammar.
+functions with up to six parameters; `let` / `let mut`; assignment to variables,
+array elements and struct fields (including compound `+=` and friends);
+`if`/`else`, `while`, `loop`, and `for i in a..b`; `break`, `continue`,
+`return`; arithmetic and comparison operators; `&&`/`||`; string literals;
+attributes such as `#[derive(Copy, Clone)]` (parsed and ignored); and a small
+set of runtime builtins. Structs and arrays may be passed to and returned from
+functions by value. Overflow checks are opt-in with `--overflow-checks`. See
+`docs/language.md` for the full grammar.
 
 Runtime builtins (provided by `src/runtime.rs`, no imports needed):
 
@@ -205,10 +207,12 @@ Both binaries are measured the same way, and both read their workload from
 
 rmc is a small, self-contained compiler, not a drop-in replacement for rustc.
 
-- The language subset is small (see `docs/language.md`). Structs, arrays, `for`
-  and overflow checks exist; enums, traits, generics, `match`, references and
-  borrowing, methods, closures, floating point and the standard library do not.
-  Structs cannot cross a function boundary.
+- The language subset is small (see `docs/language.md`). Structs, arrays, `for`,
+  aggregates across calls and overflow checks exist; enums, traits, generics,
+  `match`, references and borrowing, methods, closures, floating point and the
+  standard library do not. Aggregate values are passed by value through a hidden
+  pointer, but there is no way to pass one *by reference*, and a copy is made on
+  every call.
 - Code generation is a stack machine for expressions. The hottest five scalar
   locals in each function are pinned to callee-saved registers; everything else
   is in memory. The optimiser is a peephole pass (constant operands, folded
@@ -226,11 +230,12 @@ rmc is a small, self-contained compiler, not a drop-in replacement for rustc.
 What would move rmc from a serious toy toward something usable, roughly in order
 of value per unit of effort:
 
-1. **Aggregates across calls.** Pass and return structs (by hidden pointer, as
-   the System V ABI does) so structs are useful beyond a single function.
-2. **A real register allocator.** Linear scan over live ranges, replacing the
+1. **A real register allocator.** Linear scan over live ranges, replacing the
    whole-function top-five heuristic. This is the single biggest win for the
    call-heavy benchmarks that rmc still loses.
+2. **References and borrowing.** `&T` / `&mut T` parameters would remove the
+   copy an aggregate argument makes today, and are the prerequisite for most
+   data-structure code.
 3. **More types.** `u*`/`i*` widths, `f64`, and `match` on integers, which
    together cover most of what small programs actually need.
 4. **Enums and `impl` methods.** The next step after structs toward expressing

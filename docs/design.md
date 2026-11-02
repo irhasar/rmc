@@ -47,9 +47,10 @@ bytes. A field access is then just a `disp(%rbp)` operand, exactly like an array
 element with a constant index. A struct literal is reordered into declaration
 order by `sema` so codegen can store the fields sequentially.
 
-Structs live in memory and are named by their address. They cannot be function
-parameters or return values, which is the main limitation to lift next: the
-System V ABI passes large aggregates via a hidden pointer.
+Structs live in memory and are named by their address, which is also how they
+cross a call: a struct literal is materialised into a `sema`-allocated frame
+buffer, so it has an address in every context (a `let` initialiser, an argument,
+a `return`, or a tail expression).
 
 ## Expression convention
 
@@ -130,10 +131,28 @@ compile time, peak RSS and binary size are unchanged.
 
 ## Calls
 
-Arguments are evaluated right-to-left and pushed, then popped into the argument
-registers in order. If an odd number of pushes is live, an extra 8-byte pad is
-inserted before the `call` so `%rsp` stays 16-byte aligned. Caller-saved
+Scalar arguments are evaluated right-to-left and pushed, then popped into the
+argument registers in order. If an odd number of pushes is live, an extra 8-byte
+pad is inserted before the `call` so `%rsp` stays 16-byte aligned. Caller-saved
 registers are not preserved across calls; temporaries always live on the stack.
+
+### Aggregates across a call
+
+Structs and arrays are passed by value through a hidden pointer, following the
+shape of the System V ABI. An aggregate argument is first copied into a frame
+slot allocated by `sema`; that slot's address then travels in the argument
+register, and the callee copies it into a parameter buffer it owns, so a
+mutation inside the callee never reaches the caller. An aggregate result is
+written through a buffer the caller points `%r10` at — a caller-saved register
+that is not an argument register, so it survives argument setup.
+
+Two ordering details matter. In the callee, the incoming pointers are saved on
+the stack before any copy runs, because the copy clobbers `%rsi`/`%rdi`, which
+still hold later arguments. In the caller, all aggregate arguments are copied up
+front, before any scalar argument is evaluated, so a later argument expression
+cannot disturb an earlier one's source. Copies of eight words or fewer are
+unrolled; larger ones use a counted loop. `--overflow-checks` is irrelevant
+here: a copy never traps.
 
 Two shortcuts avoid the push/pop round trip: when every argument is a constant,
 scalar, or string literal it is loaded straight into its argument register, and
@@ -179,7 +198,8 @@ non-trivial passes are division by a constant (1.4x on `mandel.rms`) and the
 top-five local promotion (a few percent on `mix` and `sieve`); everything else is
 local and cheap to compute.
 
-On the language side the notable absences are: aggregates across function
-boundaries, `u*`/`i*` widths other than `i64`, floating point, `match`, enums,
-methods, and anything involving borrowing or generics. See the roadmap in the
+On the language side the notable absences are: `u*`/`i*` widths other than
+`i64`, floating point, `match`, enums, methods, and anything involving borrowing
+or generics. Aggregate arguments and returns work, but only by value: without
+references every call that takes a struct copies it. See the roadmap in the
 README for the order in which these might arrive.

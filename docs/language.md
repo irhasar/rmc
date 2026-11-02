@@ -27,9 +27,13 @@ let mut q: Point = Point { x: 0, y: 0 };
 q.x = q.x + 1;                          // field read and write
 ```
 
-Fields are laid out in declaration order with no padding. A struct lives in
-memory, so it cannot be a function parameter or return value, and it cannot be
-used as an array element. A struct may contain another struct, but not itself.
+Fields are laid out in declaration order with no padding. A struct may contain
+another struct, but not itself, and it cannot be used as an array element.
+Structs may be passed to and returned from functions by value: the value is
+copied, so a change inside the callee does not reach the caller. To reuse a
+struct after passing it (as `bump(a)` then reading `a`), annotate it
+`#[derive(Copy, Clone)]` so the same source also compiles with rustc; rmc parses
+and ignores the attribute.
 
 ## Functions
 
@@ -37,7 +41,9 @@ used as an array element. A struct may contain another struct, but not itself.
 fn name(a: i64, b: bool) -> i64 { ... }
 ```
 
-- Up to six parameters, passed in the System V registers `rdi rsi rdx rcx r8 r9`.
+- Up to six parameters. Scalars travel in the System V registers
+  `rdi rsi rdx rcx r8 r9`; a struct or array is passed by value as a pointer to a
+  copy. A returned aggregate is written through a caller-provided buffer.
 - The return type may be omitted, in which case it is `()`.
 - Recursion is supported. `main` is the entry point; its return value becomes
   the process exit status.
@@ -106,5 +112,5 @@ reuse and coalesces neighbours. Memory is not zeroed.
 
 Enums, traits, generics, `match`, references, borrowing,
 lifetimes, `impl` blocks, methods, modules, macros, `use`, closures, `f32`/`f64`,
-`u*`/`i*` types other than `i64`, tuples, and the standard library. Structs
-cannot be passed to or returned from functions.
+`u*`/`i*` types other than `i64`, tuples, and the standard library. Aggregates
+cross a call only by value; there are no `&T`/`&mut T` parameters.

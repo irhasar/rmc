@@ -41,7 +41,8 @@ python3 tests/run.py -v
 - `compiler/src/ast.rs` — AST and `Type` (`I64`, `Bool`, `Unit`, `Array`,
   `Struct`, and the parser-only placeholder `Named`).
 - `compiler/src/sema.rs` — type checking, struct layout, stack-slot allocation,
-  builtin sigs. Resolves `Type::Named` and fills `Field`/`FieldInit` offsets.
+  builtin sigs. Resolves `Type::Named`, fills `Field`/`FieldInit` offsets, and
+  allocates the hidden slots for aggregate arguments and returns.
 - `compiler/src/codegen.rs` — AST to AT&T x86-64 assembly.
 - `compiler/src/runtime.rs` — freestanding assembly runtime (`_start`, I/O,
   `alloc`/`free`, `arg_i64`, the overflow trap).
@@ -79,6 +80,17 @@ python3 tests/run.py -v
 - **Struct layout must agree between read and write.** `sema` resolves a field
   to an offset from the aggregate base; codegen must add that offset to the same
   base used for reads (`field_operand`) and writes.
+- **Aggregates cross calls by hidden pointer.** An aggregate argument is copied
+  into a `sema` slot and its address is passed; an aggregate result is written
+  through a buffer the caller passes in `%r10`. Two orderings are load-bearing:
+  the callee must save incoming pointers on the stack *before* any copy, because
+  the copy clobbers `%rsi`/`%rdi` (which still hold later arguments), and the
+  caller must copy all aggregate arguments *before* evaluating any scalar
+  argument, so a later argument cannot disturb an earlier one's source. Getting
+  either wrong corrupts arguments silently; `aggfn.rms`/`aggbig.rms` catch it.
+- **`%r10` carries the return buffer.** It is caller-saved and not an argument
+  register, so it survives argument setup. Do not use `%r10` as scratch anywhere
+  argument setup can run after the return pointer is set.
 - **Statements vs. tail expressions.** Assignments inside a block must be
   detected before the trailing-`;` check in `parse_block`, otherwise `x = ...;`
   is parsed as an expression and rejected.
@@ -110,10 +122,11 @@ the bug it guards: revert the fix and confirm the case fails.
 
 This is a small, self-contained compiler, not a general Rust compiler. Do not
 claim otherwise. It supports only the subset in `docs/language.md` (scalars,
-arrays, structs, `for`), has no register allocator and only a small peephole
-optimiser (operand/comparison/array-address folding, constant folding, division
-by a constant), and no borrow checker. Structs cannot cross a function boundary.
-The README's roadmap lists the intended next steps.
+arrays, structs, `for`, aggregates across calls), has no register allocator and
+only a small peephole optimiser (operand/comparison/array-address folding,
+constant folding, division by a constant), and no borrow checker. Aggregates
+cross a call only by value; there are no references. The README's roadmap lists
+the intended next steps.
 
 ## Codegen notes
 
