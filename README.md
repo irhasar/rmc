@@ -160,12 +160,13 @@ array elements and struct fields (including compound `+=` and friends);
 `if`/`else`, `while`, `loop`, and `for i in a..b`; `match` on integers (literal
 patterns and `_`); `break`, `continue`,
 `return`; arithmetic, comparison, bitwise (`&`/`|`/`^`) and shift (`<<`/`>>`)
-operators; `&&`/`||`; string literals;
+operators; `&&`/`||`; string literals; references (`&T` / `&mut T`, `&e`, `*e`,
+with auto-deref for `r.x`, `r[i]` and `r.m()`, and `&self` receivers);
 attributes such as `#[derive(Copy, Clone)]` (parsed and ignored); and a small
 set of runtime builtins. Structs and arrays may be passed to and returned from
-functions by value. Overflow checks are opt-in with `--overflow-checks`, and
-array bounds checks with `--bounds-checks`. See
-`docs/language.md` for the full grammar.
+functions by value, or by reference to avoid the copy. Overflow checks are
+opt-in with `--overflow-checks`, and array bounds checks with
+`--bounds-checks`. See `docs/language.md` for the full grammar.
 
 Runtime builtins (provided by `src/runtime.rs`, no imports needed):
 
@@ -239,11 +240,12 @@ Both binaries are measured the same way, and both read their workload from
 rmc is a small, self-contained compiler, not a drop-in replacement for rustc.
 
 - The language subset is small (see `docs/language.md`). Structs, arrays, `for`,
-  aggregates across calls, overflow checks and integer `match` exist; enums,
-  traits, generics, references and borrowing, methods, closures, floating point
-  and the standard library do not. Aggregate values are passed by value through a hidden
-  pointer, but there is no way to pass one *by reference*, and a copy is made on
-  every call.
+  aggregates across calls, overflow checks, integer `match`, enums and
+  references exist; traits, generics, borrowing, closures, floating point and
+  the standard library do not. An aggregate is passed by value through a hidden
+  pointer unless a reference (`&T` / `&self`) is used, which passes the address
+  and copies nothing. References are not checked: nothing proves a reference
+  outlives its referent, and `&mut` carries no exclusivity guarantee.
 - Code generation is a stack machine for expressions. The hottest five scalar
   locals in each function — including the scalar fields of a struct that is
   never copied, returned or passed by value — are pinned to callee-saved
@@ -273,9 +275,12 @@ of value per unit of effort:
    registers (see design.md), which is the part call-heavy code notices. A full
    linear scan over live ranges would also let a dying temporary's register go to
    a local born after it.
-2. **References and borrowing.** `&T` / `&mut T` parameters would remove the
-   copy an aggregate argument makes today, and are the prerequisite for most
-   data-structure code.
+2. **Borrowing.** `&T` / `&mut T` now exist: a reference is one word, so a
+   `&T` parameter or a `&self` receiver is passed by address rather than copied,
+   and `*r = v` writes through a reference (see language.md). What is missing is
+   the check — rmc does not prove a reference outlives its referent or that
+   `&mut` is exclusive, so an aliasing bug is a wrong answer, not a compile
+   error.
 3. **More types.** `u*`/`i*` widths and `f64`, which together cover most of what
    small programs actually need. (`match` on integers is done.)
 4. **More backends.** A second target (ARM64 or a simple VM) would force the

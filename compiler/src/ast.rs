@@ -23,6 +23,11 @@ pub enum Type {
     /// carried here, so codegen needs no lookup. It is an aggregate: named by
     /// its address, passed and returned by pointer, like a struct.
     EnumData(String, usize),
+    /// A reference: `&T` or `&mut T`. It occupies one 8-byte slot holding the
+    /// address of a `T`, so it is a scalar (passed and returned in one register)
+    /// even when `T` is an aggregate. There is no lifetime or borrow checking:
+    /// rmc trusts the programmer not to outlive the referent.
+    Ref(Box<Type>, bool),
     /// Unresolved name produced by the parser; never survives sema.
     Named(String),
 }
@@ -30,7 +35,7 @@ pub enum Type {
 impl Type {
     pub fn size(&self) -> usize {
         match self {
-            Type::I64 | Type::Bool | Type::Enum(_) => 8,
+            Type::I64 | Type::Bool | Type::Enum(_) | Type::Ref(..) => 8,
             Type::EnumData(_, size) => *size,
             Type::Unit => 0,
             Type::Array(elem, n) => elem.size() * n,
@@ -43,7 +48,7 @@ impl Type {
     /// register: `i64`, `bool` and an enum. They may be parameters, fields and
     /// return values.
     pub fn is_scalar(&self) -> bool {
-        matches!(self, Type::I64 | Type::Bool | Type::Enum(_))
+        matches!(self, Type::I64 | Type::Bool | Type::Enum(_) | Type::Ref(..))
     }
 
     /// True for the primitive types an array element may have. An enum is
@@ -181,6 +186,15 @@ pub enum Expr {
     },
     /// expr as Type
     Cast(Box<Expr>, Type),
+    /// `&e` or `&mut e`: the address of an lvalue, or of a temporary
+    /// materialised into `slot` when `e` has no address of its own (a call
+    /// result, a literal, an aggregate-valued expression). `slot` is -1 when the
+    /// operand is an addressable lvalue. `ty` is the referent type.
+    AddrOf { expr: Box<Expr>, ty: Type, mutable: bool, slot: i32 },
+    /// `*e`: read the referent. `ty` is the referent type, filled in by sema.
+    /// Reading an aggregate yields its address, exactly as naming a struct local
+    /// does.
+    Deref { expr: Box<Expr>, ty: Type },
 }
 
 /// A field inside a struct literal, once sema has resolved its layout.
@@ -249,6 +263,14 @@ pub struct FnDef {
     /// already present in `params`; this only records that a call to it must go
     /// through a method call, so a free function cannot be called as one.
     pub takes_self: bool,
+    /// True when the receiver was written `&self` / `&mut self`. The receiver is
+    /// then a reference: a method call passes the value's address instead of a
+    /// copy, so a large receiver is not copied into the callee.
+    pub ref_self: bool,
+    /// True when the receiver was written `&mut self`. It only affects type
+    /// checking (`&mut T` and `&T` are distinct types); there is no exclusivity
+    /// check.
+    pub ref_self_mut: bool,
     pub params: Vec<(String, Type)>,
     pub ret: Type,
     pub body: Block,

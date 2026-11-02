@@ -589,6 +589,26 @@ impl Codegen {
         }
     }
 
+    /// Marks every local that a `&` reaches as needing memory, so its frame
+    /// slot stays current and `lea` yields a valid address.
+    fn mark_addressed(e: &Expr, mem: &mut Vec<bool>) {
+        match e {
+            Expr::Var { slot, ty, .. } => {
+                let n = if ty.is_aggregate() { (ty.size() / 8).max(1) } else { 1 };
+                for k in 0..n as i32 {
+                    if let Some(m) = mem.get_mut((*slot + k) as usize) {
+                        *m = true;
+                    }
+                }
+            }
+            Expr::Field { base, .. } => Self::mark_addressed(base, mem),
+            Expr::Index(base, _) => Self::mark_addressed(base, mem),
+            // A dereference's target already lives in memory.
+            Expr::Deref { .. } => {}
+            _ => {}
+        }
+    }
+
     /// `whole` is true when the value of `e` is used as a complete aggregate,
     /// which is what makes a struct unfit for per-field promotion. A `Field` or
     /// `Index` base is not a whole use, so it is passed `false`.
@@ -688,6 +708,26 @@ impl Codegen {
             }
             Expr::Un(_, a) | Expr::Cast(a, _) => {
                 Self::count_expr(a, counts, mem, copied, true, let_tmps)
+            }
+            // `&e` on a place is that place's address, so `e` is read as a
+            // place, never as a whole value to copy. A temporary `&e` (slot >=
+            // 0) keeps the temporary's words in memory for the copy.
+            Expr::AddrOf { expr, ty, slot, .. } => {
+                // Taking a place's address needs the place to be in memory: a
+                // register-promoted local has no address, and `lea slot(%rbp)`
+                // would read a stale frame word.
+                Self::mark_addressed(expr, mem);
+                Self::count_expr(expr, counts, mem, copied, false, let_tmps);
+                if *slot >= 0 {
+                    for k in 0..(ty.size() / 8).max(1) as i32 {
+                        if let Some(m) = mem.get_mut((*slot + k) as usize) {
+                            *m = true;
+                        }
+                    }
+                }
+            }
+            Expr::Deref { expr, .. } => {
+                Self::count_expr(expr, counts, mem, copied, false, let_tmps)
             }
             Expr::Call { args, .. } => {
                 for a in args {
@@ -917,6 +957,23 @@ impl Codegen {
                             }
                         }
                     }
+                    // `*r = v`: the target's address is the pointer `r` holds.
+                    Expr::Deref { ty, .. } if ty.is_aggregate() => {
+                        let n = ty.size() / 8;
+                        self.gen_addr(target);
+                        self.push_rax();
+                        self.gen_expr(value);
+                        self.line("mov %rax, %rsi");
+                        self.pop_to("%rdi");
+                        self.copy_words_rdi_rsi(n);
+                    }
+                    Expr::Deref { .. } => {
+                        self.gen_addr(target);
+                        self.push_rax();
+                        self.gen_expr(value);
+                        self.pop_to("%rcx");
+                        self.line("mov %rax, (%rcx)");
+                    }
                     _ => unreachable!("sema guarantees a valid assignment target"),
                 }
             }
@@ -1073,6 +1130,17 @@ impl Codegen {
         }
     }
 
+    /// True when `e`'s type is a reference, so `e`'s value is a pointer and
+    /// reaching a field or element through it uses that pointer directly.
+    fn ref_base(e: &Expr) -> bool {
+        match e {
+            Expr::Var { ty, .. } | Expr::Field { ty, .. } | Expr::Deref { ty, .. } => {
+                matches!(ty, Type::Ref(..))
+            }
+            _ => false,
+        }
+    }
+
     /// A `disp(%rbp)` operand for `base.field` when `base` is a struct local in
     /// memory, or `None` when the base is not a plain local (the caller then
     /// computes the address).
@@ -1131,10 +1199,21 @@ impl Codegen {
                 self.line("lea (%rcx,%rax,8), %rax");
             }
             Expr::Field { base, offset, .. } => {
-                self.gen_addr(base);
+                // A `Ref` base is a pointer: the address of its field is the
+                // pointer value plus the offset, not the address of the slot
+                // holding the pointer.
+                if Self::ref_base(base) {
+                    self.gen_expr(base);
+                } else {
+                    self.gen_addr(base);
+                }
                 if *offset != 0 {
                     self.line(&format!("add ${}, %rax", *offset));
                 }
+            }
+            // `*r` is a place whose address is the pointer `r` holds.
+            Expr::Deref { expr, .. } => {
+                self.gen_expr(expr);
             }
             // A field or index base that is not a named local is a temporary
             // whose value *is* its address: a call's hidden return buffer, a
@@ -1249,12 +1328,18 @@ impl Codegen {
                 Type::I64
             }
             Expr::Var { slot, ty, .. } => {
-                match self.aggregate_base(*slot, ty) {
-                    Some(base) => self.line(&format!("lea {base}(%rbp), %rax")),
-                    None => match self.reg_of(*slot) {
+                // A reference is a scalar: its value is the address it holds. An
+                // aggregate is named by its own address.
+                if ty.is_aggregate() {
+                    match self.aggregate_base(*slot, ty) {
+                        Some(base) => self.line(&format!("lea {base}(%rbp), %rax")),
+                        None => self.line(&format!("mov {}(%rbp), %rax", self.off(*slot))),
+                    }
+                } else {
+                    match self.reg_of(*slot) {
                         Some(r) => self.line(&format!("mov {r}, %rax")),
                         None => self.line(&format!("mov {}(%rbp), %rax", self.off(*slot))),
-                    },
+                    }
                 }
                 ty.clone()
             }
@@ -1341,6 +1426,35 @@ impl Codegen {
                     }
                 }
                 elem
+            }
+            Expr::AddrOf { expr, ty, slot, mutable } => {
+                if *slot >= 0 {
+                    // The operand has no address of its own (a literal, a call,
+                    // an aggregate value): evaluate it into a temporary and take
+                    // that address. An aggregate value *is* its address.
+                    let n = (ty.size() / 8).max(1);
+                    self.gen_expr(expr);
+                    if ty.is_aggregate() {
+                        self.line("mov %rax, %rsi");
+                        self.line(&format!("lea {}(%rbp), %rdi", self.array_off(*slot, n)));
+                        self.copy_words_rdi_rsi(n);
+                    } else {
+                        self.line(&format!("mov %rax, {}(%rbp)", self.off(*slot)));
+                    }
+                    self.line(&format!("lea {}(%rbp), %rax", self.array_off(*slot, n)));
+                } else {
+                    self.gen_addr(expr);
+                }
+                Type::Ref(Box::new(ty.clone()), *mutable)
+            }
+            Expr::Deref { expr, ty } => {
+                // A dereference is a place: read it. An aggregate referent is
+                // named by its address, so reading it yields the pointer itself.
+                self.gen_expr(expr);
+                if !ty.is_aggregate() {
+                    self.line("mov (%rax), %rax");
+                }
+                ty.clone()
             }
             Expr::Un(op, inner) => {
                 self.gen_expr(inner);

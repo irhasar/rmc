@@ -1,0 +1,38 @@
+// `&mut T` and `&mut self`: writing through a reference. rmc has no exclusivity
+// check, so the interesting part is that a write through `*r` reaches the
+// referent and that a `&mut` receiver can be read by a `&self` method.
+struct C { n: i64 }
+
+impl C {
+    // `&mut self`: the call passes the receiver's address and the write lands
+    // in the caller's value.
+    fn bump(&mut self) -> i64 { self.n = self.n + 1; return self.n; }
+    // `&self`: reads the same receiver.
+    fn read(&self) -> i64 { return self.n; }
+}
+
+// `*p = ..` stores through the pointer.
+fn inc(p: &mut i64) -> i64 { *p = *p + 1; return *p; }
+
+// A `&mut` parameter can be handed to a `&` parameter: the coercion is free,
+// both are one pointer.
+fn peek(p: &i64) -> i64 { return *p; }
+
+fn main() -> i64 {
+    let mut c: C = C { n: 10 };
+    let cm: &mut C = &mut c;
+    print_i64(cm.bump());
+    print_i64(cm.read());
+    print_i64(cm.bump());
+
+    let mut x: i64 = 1;
+    print_i64(inc(&mut x));
+    print_i64(inc(&mut x));
+    print_i64(x);
+    print_i64(peek(&mut x));
+
+    // `&mut self` on a mut local directly.
+    print_i64(c.bump());
+    print_i64(c.read());
+    return 0;
+}
