@@ -68,20 +68,8 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
             f.params.iter().map(|(_, t)| resolve_type(t, &structs)).collect();
         let params = params?;
         let ret = resolve_type(&f.ret, &structs)?;
-        for (p, t) in f.params.iter().zip(params.iter()) {
-            if !t.is_scalar() {
-                return Err(format!(
-                    "function `{}`: parameter `{}` must be `i64` or `bool`, not {t:?}",
-                    f.name, p.0
-                ));
-            }
-        }
-        if !ret.is_scalar() && ret != Type::Unit {
-            return Err(format!(
-                "function `{}`: return type must be `i64`, `bool` or `()`, not {ret:?}",
-                f.name
-            ));
-        }
+        // Aggregate parameters and returns are passed by pointer, so any type
+        // is allowed here; the calling convention handles the rest.
         sigs.insert(f.name.clone(), Sig { params, ret });
     }
 
@@ -173,12 +161,23 @@ impl Sema {
         self.loop_depth = 0;
         self.ret_ty = resolve_type(&f.ret, &self.structs)?;
         f.ret = self.ret_ty.clone();
+        // An aggregate return is written through a hidden pointer, so reserve a
+        // slot to hold that pointer for the whole body.
+        f.ret_slot = if self.ret_ty.is_aggregate() {
+            self.alloc_slot()
+        } else {
+            -1
+        };
 
         let mut scope: Scope = Vec::with_capacity(f.params.len() + 8);
+        f.param_slots.clear();
         for (name, ty) in &mut f.params {
             let rt = resolve_type(ty, &self.structs)?;
             *ty = rt.clone();
-            let slot = self.alloc_slot();
+            // An aggregate parameter owns a frame buffer big enough for a copy;
+            // a scalar owns a single slot.
+            let slot = self.alloc_slots((rt.size() / 8) as i32);
+            f.param_slots.push(slot);
             scope.push((name.clone(), slot, rt));
         }
 
@@ -421,7 +420,7 @@ impl Sema {
                     }
                 }
             }
-            Expr::Call(name, args) => {
+            Expr::Call { name, args, arg_slots, ret_slot, ret_ty } => {
                 let sig = self
                     .sigs
                     .get(name)
@@ -434,12 +433,27 @@ impl Sema {
                         args.len()
                     ));
                 }
+                arg_slots.clear();
                 for (a, p) in args.iter_mut().zip(sig.params.iter()) {
                     let t = self.check_expr(a, scope)?;
                     if &t != p {
                         return Err(format!("function `{name}`: argument type mismatch, expected {p:?}, found {t:?}"));
                     }
+                    // An aggregate argument is passed by pointer, so give it a
+                    // hidden frame slot to hold its address for the call.
+                    arg_slots.push(if p.is_aggregate() {
+                        let n = p.size() / 8;
+                        (self.alloc_slots(n as i32), n)
+                    } else {
+                        (-1, 0)
+                    });
                 }
+                *ret_ty = sig.ret.clone();
+                *ret_slot = if sig.ret.is_aggregate() {
+                    self.alloc_slots((sig.ret.size() / 8) as i32)
+                } else {
+                    -1
+                };
                 Ok(sig.ret)
             }
             Expr::If(cond, then, els) => {
@@ -495,7 +509,7 @@ impl Sema {
                     other => Err(format!("field access on a value of type {other:?}")),
                 }
             }
-            Expr::StructLit { name, fields } => {
+            Expr::StructLit { name, fields, slot } => {
                 let info = self
                     .structs
                     .get(name)
@@ -533,6 +547,8 @@ impl Sema {
                     ordered[idx] = Some(fi.clone());
                 }
                 *fields = ordered.into_iter().map(|f| f.unwrap()).collect();
+                // A frame buffer so the literal has an address in any context.
+                *slot = self.alloc_slots((info.size / 8) as i32);
                 Ok(Type::Struct(name.clone(), info.size))
             }
             Expr::ArrayLit(val, n) => {

@@ -136,7 +136,7 @@ impl Parser {
             Type::Unit
         };
         let body = self.parse_block()?;
-        Ok(FnDef { name, params, ret, body, nslots: 0 })
+        Ok(FnDef { name, params, ret, body, param_slots: Vec::new(), ret_slot: -1, nslots: 0 })
     }
 
     fn parse_type(&mut self) -> PResult<Type> {
@@ -532,7 +532,7 @@ impl Parser {
                         }
                     }
                     self.expect(Tok::RBrace)?;
-                    return Ok(Expr::StructLit { name, fields });
+                    return Ok(Expr::StructLit { name, fields, slot: -1 });
                 }
                 if self.eat(&Tok::LParen) {
                     let mut args = Vec::new();
@@ -543,7 +543,7 @@ impl Parser {
                         }
                     }
                     self.expect(Tok::RParen)?;
-                    Ok(Expr::Call(name, args))
+                    Ok(Expr::Call { name, args, arg_slots: Vec::new(), ret_slot: -1, ret_ty: Type::I64 })
                 } else {
                     Ok(Expr::Var { name, slot: -1, ty: Type::I64 })
                 }

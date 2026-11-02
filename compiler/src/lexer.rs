@@ -165,6 +165,38 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             i += 2;
             continue;
         }
+        // attribute such as `#[derive(Copy, Clone)]` or `#![allow(...)]`: parsed
+        // and discarded, so rmc can compile the same source as rustc. Brackets
+        // are balanced to survive nested groups.
+        if c == b'#' {
+            let start = i;
+            i += 1;
+            if i < bytes.len() && bytes[i] == b'!' {
+                i += 1;
+            }
+            if i >= bytes.len() || bytes[i] != b'[' {
+                return Err(format!("expected `[` after `#` at byte {start}"));
+            }
+            let mut depth = 0i32;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'[' => depth += 1,
+                    b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            if depth != 0 {
+                return Err(format!("unterminated attribute at byte {start}"));
+            }
+            continue;
+        }
         let pos = i as u32;
         // identifiers / keywords
         if c == b'_' || c.is_ascii_alphabetic() {

@@ -25,6 +25,11 @@ pub struct Codegen {
     /// When set, every `+`, `-` and `*` is followed by a jump-if-overflow to the
     /// runtime trap. Off by default because it costs a branch per operation.
     overflow: bool,
+    /// Frame slot holding the hidden return-buffer pointer for the function
+    /// being generated (`-1` when the return type is scalar or unit).
+    ret_slot: i32,
+    /// Return type of the function being generated, needed to route `return`.
+    ret_ty: Type,
 }
 
 /// Callee-saved registers eligible for promoting a local out of memory. They
@@ -45,6 +50,8 @@ impl Codegen {
             epilogue: String::new(),
             regs: Vec::new(),
             overflow: false,
+            ret_slot: -1,
+            ret_ty: Type::Unit,
         }
     }
 
@@ -139,6 +146,8 @@ impl Codegen {
     fn gen_fn(&mut self, f: &FnDef) {
         self.sp_off = 0;
         self.epilogue = self.new_label();
+        self.ret_slot = f.ret_slot;
+        self.ret_ty = f.ret.clone();
         // Promote the most-used scalar locals into callee-saved registers.
         self.regs = Self::promote(f);
         let saved: Vec<&'static str> = self.regs.iter().map(|(_, r)| *r).collect();
@@ -163,19 +172,55 @@ impl Codegen {
         if frame > 0 {
             self.line(&format!("sub ${frame}, %rsp"));
         }
-        // Spill incoming integer arguments into their slots, or into their
-        // registers when the parameter was promoted.
+        // An aggregate return is written through a pointer the caller leaves in
+        // `%r10`; stash it in its slot before anything can clobber it.
+        if f.ret.is_aggregate() {
+            self.line(&format!("mov %r10, {}(%rbp)", self.off(f.ret_slot)));
+        }
+        // Spill incoming arguments. A scalar goes into its slot or promoted
+        // register. An aggregate arrives as a pointer and is copied into the
+        // parameter's frame buffer so the callee owns a private copy.
+        //
+        // The copy clobbers `%rsi`/`%rdi`, which are also where later arguments
+        // live, so the aggregate pointers are saved on the stack first and the
+        // copies run afterwards. Scalars are spilled up front too; that touches
+        // neither of those registers.
         const ARG_REGS: [&str; 6] = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"];
-        for (i, _) in f.params.iter().enumerate() {
-            if i < 6 {
-                match self.reg_of(i as i32) {
+        for (i, (_, pty)) in f.params.iter().enumerate() {
+            if i >= 6 {
+                break;
+            }
+            let slot = f.param_slots[i];
+            if pty.is_aggregate() {
+                self.line(&format!("push {}", ARG_REGS[i]));
+            } else {
+                match self.reg_of(slot) {
                     Some(r) => self.line(&format!("mov {}, {r}", ARG_REGS[i])),
-                    None => self.line(&format!("mov {}, {}(%rbp)", ARG_REGS[i], self.off(i as i32))),
+                    None => self.line(&format!("mov {}, {}(%rbp)", ARG_REGS[i], self.off(slot))),
                 }
             }
         }
+        // Pop the saved pointers in reverse and copy each argument into place.
+        for (i, (_, pty)) in f.params.iter().enumerate().rev() {
+            if i >= 6 {
+                continue;
+            }
+            if pty.is_aggregate() {
+                let n = pty.size() / 8;
+                let slot = f.param_slots[i];
+                self.line("pop %rsi");
+                self.line(&format!("lea {}(%rbp), %rdi", self.array_off(slot, n)));
+                self.copy_words_rdi_rsi(n);
+            }
+        }
         let ty = self.gen_block(&f.body);
-        if ty == Type::Unit {
+        if f.ret.is_aggregate() {
+            // Implicit return of an aggregate tail expression.
+            if ty.is_aggregate() {
+                let n = f.ret.size() / 8;
+                self.gen_return_aggregate_from_rax(n);
+            }
+        } else if ty == Type::Unit {
             self.line("xor %eax, %eax");
         }
         self.raw(&format!("{}:", self.epilogue));
@@ -191,6 +236,39 @@ impl Codegen {
         self.line("ret");
         self.raw(&format!(".size {}, .-{}", f.name, f.name));
         self.regs.clear();
+    }
+
+    /// Copy `n` 8-byte words from the address in `%rsi` to the address in `%rdi`.
+    /// `%rax` and, for larger counts, `%rcx` are clobbered.
+    fn copy_words_rdi_rsi(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        if n <= 8 {
+            for i in 0..n {
+                self.line(&format!("mov {}(%rsi), %rax", i as i32 * 8));
+                self.line(&format!("mov %rax, {}(%rdi)", i as i32 * 8));
+            }
+        } else {
+            let l = self.new_label();
+            self.line(&format!("mov ${n}, %rcx"));
+            self.raw(&format!("{l}:"));
+            self.line("mov (%rsi), %rax");
+            self.line("mov %rax, (%rdi)");
+            self.line("add $8, %rsi");
+            self.line("add $8, %rdi");
+            self.line("dec %rcx");
+            self.line(&format!("jnz {l}"));
+        }
+    }
+
+    /// Copy the aggregate whose address is in `%rax` into the hidden return
+    /// buffer, then leave the buffer address in `%rax`.
+    fn gen_return_aggregate_from_rax(&mut self, n: usize) {
+        self.line("mov %rax, %rsi");
+        self.line(&format!("mov {}(%rbp), %rdi", self.off(self.ret_slot)));
+        self.copy_words_rdi_rsi(n);
+        self.line(&format!("mov {}(%rbp), %rax", self.off(self.ret_slot)));
     }
 
     /// Choose up to `ALLOC_REGS.len()` scalar locals to keep in registers for
@@ -285,7 +363,7 @@ impl Codegen {
                 Self::count_expr(b, counts, array_slots);
             }
             Expr::Un(_, a) | Expr::Cast(a, _) => Self::count_expr(a, counts, array_slots),
-            Expr::Call(_, args) => {
+            Expr::Call { args, .. } => {
                 for a in args {
                     Self::count_expr(a, counts, array_slots);
                 }
@@ -346,12 +424,18 @@ impl Codegen {
                                 self.line(&format!("mov %rax, {off}(%rbp)"));
                             }
                         }
-                        // No initializer: the struct is zero-filled below.
+                        // No initializer: the struct is zero-filled.
                         None => {
                             self.line("xor %eax, %eax");
                             self.fill_aggregate(*slot, 8, size / 8);
                         }
-                        Some(_) => unreachable!("sema: struct initializer must be a literal"),
+                        // Any other initialiser yields the struct's address (a
+                        // call's hidden return buffer, or another struct local),
+                        // so copy it into the destination.
+                        Some(e) => {
+                            self.gen_expr(e);
+                            self.copy_aggregate(*slot, size / 8, 8);
+                        }
                     }
                 } else if let Some(e) = init {
                     self.gen_expr(e);
@@ -478,6 +562,10 @@ impl Codegen {
                 match v {
                     Some(e) => {
                         self.gen_expr(e);
+                        if self.ret_ty.is_aggregate() {
+                            let n = self.ret_ty.size() / 8;
+                            self.gen_return_aggregate_from_rax(n);
+                        }
                     }
                     None => self.line("xor %eax, %eax"),
                 }
@@ -642,10 +730,17 @@ impl Codegen {
                 }
                 ty.clone()
             }
-            Expr::StructLit { .. } => {
-                // A struct value is only meaningful where its address is taken,
-                // which sema restricts to `let` initialisers.
-                unreachable!("sema restricts struct literals to let initialisers")
+            Expr::StructLit { name, fields, slot } => {
+                // Materialise the literal into its frame buffer and yield that
+                // address, which is how every aggregate value is represented.
+                let n = fields.len();
+                let base = self.array_off(*slot, n);
+                for fi in fields {
+                    self.gen_expr(&fi.value);
+                    self.line(&format!("mov %rax, {}(%rbp)", base + fi.offset));
+                }
+                self.line(&format!("lea {base}(%rbp), %rax"));
+                Type::Struct(name.clone(), n * 8)
             }
             Expr::Index(base, _idx) => {
                 let elem = match base.as_ref() {
@@ -684,7 +779,9 @@ impl Codegen {
                 }
             }
             Expr::Bin(op, a, b) => self.gen_bin(*op, a, b),
-            Expr::Call(name, args) => self.gen_call(name, args),
+            Expr::Call { name, args, arg_slots, ret_slot, ret_ty } => {
+                self.gen_call(name, args, arg_slots, *ret_slot, ret_ty)
+            }
             Expr::If(cond, then, els) => {
                 let else_l = self.new_label();
                 let end_l = self.new_label();
@@ -1138,30 +1235,90 @@ impl Codegen {
         self.line(&format!("jz {target}"));
     }
 
-    fn gen_call(&mut self, name: &str, args: &[Expr]) -> Type {
+    fn gen_call(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        arg_slots: &[(i32, usize)],
+        ret_slot: i32,
+        ret_ty: &Type,
+    ) -> Type {
         const ARG_REGS: [&str; 6] = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"];
-        // Simple arguments evaluate with a single load that touches neither
-        // `%rcx` nor `%rdx`, so they can go straight into the argument
-        // registers for any arity. For one or two arguments the registers used
-        // are `%rdi`/`%rsi`, which expression evaluation never clobbers, so any
-        // argument without a nested call is safe too.
-        let direct = args.iter().all(|a| self.arg_is_simple(a))
-            || (args.len() <= 2 && !args.iter().any(Self::contains_call));
+
+        // Aggregate arguments are passed by value: copy each into its hidden
+        // frame slot first, so later argument evaluation cannot disturb the
+        // source. A copied argument then travels as the address of that slot.
+        let mut arg_operand: Vec<Option<String>> = Vec::with_capacity(args.len());
+        for (a, (slot, n)) in args.iter().zip(arg_slots.iter()) {
+            if *slot >= 0 {
+                let base = self.array_off(*slot, *n);
+                self.gen_expr(a); // the aggregate's address is in %rax
+                self.line("mov %rax, %rsi");
+                self.line(&format!("lea {base}(%rbp), %rdi"));
+                self.copy_words_rdi_rsi(*n);
+                arg_operand.push(Some(format!("{base}(%rbp)")));
+            } else {
+                arg_operand.push(None);
+            }
+        }
+
+        // Scalars go into the argument registers. A pointer to an aggregate
+        // argument also travels in a register, but its value lives in a frame
+        // slot, so it is loaded in the fixed loop below rather than evaluated.
+        let direct = arg_operand
+            .iter()
+            .zip(args.iter())
+            .all(|(s, a)| s.is_none() && self.arg_is_simple(a))
+            || (args.len() <= 2
+                && arg_operand.iter().all(|s| s.is_none())
+                && !args.iter().any(Self::contains_call));
         if direct {
             for (a, r) in args.iter().zip(ARG_REGS.iter()) {
                 self.gen_expr(a);
                 self.line(&format!("mov %rax, {r}"));
             }
         } else {
-            // Evaluate arguments right-to-left and push them, so that after
-            // popping they land in the ABI registers in the correct order.
-            for a in args.iter().rev() {
+            // Evaluate scalar arguments right-to-left and push them, so that
+            // after popping they land in the ABI registers in order. Aggregate
+            // arguments are already copied; their addresses are loaded below.
+            let scalars: Vec<&Expr> = args
+                .iter()
+                .zip(arg_operand.iter())
+                .filter(|(_, s)| s.is_none())
+                .map(|(a, _)| a)
+                .collect();
+            for a in scalars.iter().rev() {
                 self.gen_expr(a);
                 self.push_rax();
             }
-            for r in ARG_REGS.iter().take(args.len()) {
-                self.pop_to(r);
+            // Pop the scalars into the registers, interleaved with loading the
+            // aggregate pointers in the right positions. Walking left to right,
+            // a scalar comes off the stack (reverse push order); an aggregate
+            // is addressed from its slot.
+            let mut stack_scalars: Vec<usize> = Vec::new();
+            for (i, s) in arg_operand.iter().enumerate() {
+                if s.is_none() {
+                    stack_scalars.push(i);
+                }
             }
+            let mut next_scalar = 0;
+            for (i, op) in arg_operand.iter().enumerate() {
+                if let Some(addr) = op {
+                    self.line(&format!("lea {addr}, {}", ARG_REGS[i]));
+                } else {
+                    let _ = i;
+                    // Pop in left-to-right order; pushes were right-to-left.
+                    self.pop_to(ARG_REGS[stack_scalars[next_scalar]]);
+                    next_scalar += 1;
+                }
+            }
+        }
+
+        // The return buffer pointer goes in %r10, which is caller-saved and not
+        // one of the argument registers, so it survives argument setup.
+        if ret_slot >= 0 {
+            let n = ret_ty.size() / 8;
+            self.line(&format!("lea {}(%rbp), %r10", self.array_off(ret_slot, n)));
         }
         let pad = self.sp_off % 2 != 0;
         if pad {
@@ -1171,8 +1328,9 @@ impl Codegen {
         if pad {
             self.line("add $8, %rsp");
         }
-        // Return type is resolved by sema; rmc runtime helpers return i64.
-        Type::I64
+        // An aggregate result's address (the hidden buffer) is in %rax; a
+        // scalar result is already in %rax.
+        ret_ty.clone()
     }
 
     /// An argument that loads into a register without using the `%rcx`/`%rdx`
@@ -1184,7 +1342,7 @@ impl Codegen {
     /// True when evaluating `e` may perform a call.
     fn contains_call(e: &Expr) -> bool {
         match e {
-            Expr::Call(..) => true,
+            Expr::Call { .. } => true,
             Expr::Bin(_, a, b) => Self::contains_call(a) || Self::contains_call(b),
             Expr::Un(_, a) | Expr::Cast(a, _) => Self::contains_call(a),
             Expr::Index(a, b) => Self::contains_call(a) || Self::contains_call(b),

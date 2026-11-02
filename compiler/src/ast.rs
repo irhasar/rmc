@@ -30,13 +30,15 @@ impl Type {
         }
     }
 
-    /// Element size for array indexing; only 8-byte elements are supported.
+    /// True for the types that fit in a single 8-byte slot and travel in one
+    /// register: `i64` and `bool`.
     pub fn is_scalar(&self) -> bool {
         matches!(self, Type::I64 | Type::Bool)
     }
 
-    /// True for the aggregate types that live in memory and cannot be promoted
-    /// into a register or passed to a function.
+    /// True for the aggregate types that live in memory: arrays and structs.
+    /// They are named by their address, so they are passed to and returned from
+    /// a function by pointer rather than by value.
     pub fn is_aggregate(&self) -> bool {
         matches!(self, Type::Array(..) | Type::Struct(..))
     }
@@ -79,7 +81,17 @@ pub enum Expr {
     },
     Bin(BinOp, Box<Expr>, Box<Expr>),
     Un(UnOp, Box<Expr>),
-    Call(String, Vec<Expr>),
+    /// A call. `arg_slots` holds, per argument, the frame slot and slot count of
+    /// the hidden copy used to pass an aggregate by value (`(-1, 0)` for a
+    /// scalar). `ret_slot` is the frame slot of the hidden return buffer when the
+    /// result is an aggregate (`-1` otherwise). All three are filled in by sema.
+    Call {
+        name: String,
+        args: Vec<Expr>,
+        arg_slots: Vec<(i32, usize)>,
+        ret_slot: i32,
+        ret_ty: Type,
+    },
     If(Box<Expr>, Block, Option<Block>),
     Block(Block),
     /// array[index]
@@ -88,9 +100,10 @@ pub enum Expr {
     /// address and `ty` the field's type; both are filled in by sema.
     Field { base: Box<Expr>, name: String, offset: i32, ty: Type },
     /// `Name { field: value, ... }`. Sema reorders `fields` into declaration
-    /// order and fills in each field's offset and type, so codegen can store
-    /// them sequentially without a lookup.
-    StructLit { name: String, fields: Vec<FieldInit> },
+    /// order, fills in each field's offset and type, and allocates `slot`, a
+    /// frame buffer the literal is materialised into so it can be used wherever
+    /// a struct value is expected (return, argument, tail expression).
+    StructLit { name: String, fields: Vec<FieldInit>, slot: i32 },
     /// `[value; count]`
     ArrayLit(Box<Expr>, usize),
     /// expr as Type
@@ -159,6 +172,12 @@ pub struct FnDef {
     pub params: Vec<(String, Type)>,
     pub ret: Type,
     pub body: Block,
+    /// Frame slot of each parameter, in order, filled in by `sema`. An aggregate
+    /// parameter owns `size/8` consecutive slots; a scalar owns one.
+    pub param_slots: Vec<i32>,
+    /// Frame slot of the hidden pointer buffer for an aggregate return value,
+    /// filled in by `sema` (`-1` when the return type is scalar or unit).
+    pub ret_slot: i32,
     /// Number of 8-byte stack slots the function needs, filled in by `sema`.
     pub nslots: i32,
 }
