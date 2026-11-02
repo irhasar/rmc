@@ -58,6 +58,23 @@ fn overflow_checks_add_a_jo() {
 }
 
 #[test]
+fn large_array_compiles_in_linear_time() {
+    // Promotion counts references to every slot. An array of N elements must not
+    // make that quadratic: a regression here took ~6s for 200k, this is ~7ms.
+    let src = format!(
+        "fn main() -> i64 {{ let a: [i64; 200000] = [1; 200000]; return a[0]; }}"
+    );
+    let t = std::time::Instant::now();
+    let out = compile_to_asm(&src, &CompileOptions::default()).unwrap();
+    assert!(out.contains("main:"));
+    assert!(
+        t.elapsed().as_secs_f64() < 2.0,
+        "compiling a 200k-element array took {:?}",
+        t.elapsed()
+    );
+}
+
+#[test]
 fn errors_carry_a_byte_offset() {
     let err = compile_to_asm("fn main() -> i64 { return x; }", &CompileOptions::default())
         .unwrap_err();

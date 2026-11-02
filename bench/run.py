@@ -13,7 +13,7 @@ NRC = os.path.join(PROJ, "compiler", "target", "release", "nrc")
 OUT = "/tmp/nrcbench"
 RUSTFLAGS_BASE = []
 
-PROGRAMS = ["hello", "fib", "mandel", "sieve", "mix"]
+PROGRAMS = ["hello", "fib", "mandel", "sieve", "mix", "stats"]
 # Runtime input per program, passed as argv so the workload is opaque to the
 # optimizer and cannot be constant-folded away.
 ARGS = {
@@ -22,6 +22,7 @@ ARGS = {
     "mandel": ["800"],
     "sieve": ["200000"],
     "mix": ["2000000"],
+    "stats": ["2000000"],
 }
 
 

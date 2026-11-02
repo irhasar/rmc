@@ -202,10 +202,11 @@ impl Codegen {
         let mut counts: Vec<(i32, u32)> = (0..f.nslots).map(|s| (s, 0u32)).collect();
         let mut array_slots: Vec<i32> = Vec::new();
         Self::count_block(&f.body, &mut counts, &mut array_slots);
+        // `counts` is built in slot order and not reordered until after this
+        // loop, so slot `s` lives at index `s`. Zeroing by index keeps this
+        // linear even for an array with hundreds of thousands of elements.
         for s in &array_slots {
-            if let Some(e) = counts.iter_mut().find(|(slot, _)| slot == s) {
-                e.1 = 0;
-            }
+            counts[*s as usize].1 = 0;
         }
         counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         counts
@@ -260,9 +261,7 @@ impl Codegen {
     fn count_expr(e: &Expr, counts: &mut Vec<(i32, u32)>, array_slots: &mut Vec<i32>) {
         match e {
             Expr::Var { slot, ty, .. } => {
-                if let Some(c) = counts.iter_mut().find(|(s, _)| s == slot) {
-                    c.1 += 1;
-                }
+                counts[*slot as usize].1 += 1;
                 // A promoted local is named by its register, so an aggregate
                 // (which needs an address) must keep all of its slots in memory.
                 if ty.is_aggregate() {

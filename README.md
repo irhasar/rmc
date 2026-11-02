@@ -149,7 +149,7 @@ Runtime builtins (provided by `src/runtime.rs`, no imports needed):
 ## Benchmarks
 
 `bench/run.py` compares `nrc` against `rustc -O -C lto=fat -C codegen-units=1
--C panic=abort -C strip=symbols` on five programs. It measures each compile with
+-C panic=abort -C strip=symbols` on six programs. It measures each compile with
 `wait4()` so CPU time and peak RSS cover the real process (including `as`/`ld`
 for nrc and LLVM for rustc). Programs read their workload from `argv` via
 `black_box` / `arg_i64`, so nothing is constant-folded away.
@@ -163,32 +163,35 @@ Representative run on the development machine (Debian 13, gcc 14.2, rustc
 
 | program | compiler | compile wall | compile CPU | peak RSS | artifact | run time |
 | ------- | -------- | -----------: | ----------: | -------: | -------: | -------: |
-| hello   | nrc      |     8.47 ms  |    8.02 ms  |  11.8 MB |   5848 B |  2.05 ms |
-| hello   | rustc    |  2642.76 ms  | 2647.35 ms  | 181.8 MB | 289416 B |  2.68 ms |
-| fib     | nrc      |    10.09 ms  |    9.56 ms  |  11.8 MB |   5896 B | 18.59 ms |
-| fib     | rustc    |  2684.08 ms  | 2685.58 ms  | 181.5 MB | 291696 B |  9.88 ms |
-| mandel  | nrc      |     9.49 ms  |    8.82 ms  |  11.8 MB |   6192 B |114.52 ms |
-| mandel  | rustc    |  2791.48 ms  | 2794.04 ms  | 182.2 MB | 291776 B |117.14 ms |
-| sieve   | nrc      |    12.55 ms  |   11.76 ms  |  11.8 MB |   5952 B |  3.17 ms |
-| sieve   | rustc    |  2797.49 ms  | 2802.47 ms  | 181.1 MB | 292016 B |  4.23 ms |
-| mix     | nrc      |     8.60 ms  |    8.15 ms  |  11.8 MB |   5984 B | 20.36 ms |
-| mix     | rustc    |  2729.30 ms  | 2732.15 ms  | 182.6 MB | 291864 B | 18.75 ms |
+| hello   | nrc      |     8.07 ms  |    7.73 ms  |  12.0 MB |   6504 B |  1.65 ms |
+| hello   | rustc    |  2110.48 ms  | 2113.79 ms  | 184.9 MB | 289416 B |  2.25 ms |
+| fib     | nrc      |     7.46 ms  |    7.17 ms  |  12.0 MB |   6624 B | 16.92 ms |
+| fib     | rustc    |  2232.72 ms  | 2237.28 ms  | 185.1 MB | 291696 B |  8.75 ms |
+| mandel  | nrc      |     7.60 ms  |    7.30 ms  |  12.0 MB |   6920 B |102.50 ms |
+| mandel  | rustc    |  2247.11 ms  | 2251.67 ms  | 187.1 MB | 291776 B |107.03 ms |
+| sieve   | nrc      |    11.53 ms  |   11.21 ms  |  12.0 MB |   6680 B |  2.93 ms |
+| sieve   | rustc    |  2232.87 ms  | 2237.41 ms  | 185.0 MB | 292016 B |  3.80 ms |
+| mix     | nrc      |     7.60 ms  |    7.36 ms  |  12.0 MB |   6712 B | 18.69 ms |
+| mix     | rustc    |  2177.81 ms  | 2182.40 ms  | 186.3 MB | 291864 B | 17.18 ms |
+| stats   | nrc      |     7.69 ms  |    7.38 ms  |  12.0 MB |   6792 B |  5.68 ms |
+| stats   | rustc    |  2234.89 ms  | 2239.13 ms  | 186.9 MB | 292048 B |  5.17 ms |
 
 Summary of the ratios (rustc ÷ nrc):
 
 | dimension        | ratio      |
 | ---------------- | ---------: |
-| compile wall     | ~223–317×  |
-| compile CPU      | ~238–335×  |
-| compiler peak RSS| ~15.4×     |
-| artifact size    | ~47–50×    |
-| run time         | 0.75–1.88× (rustc faster on call-heavy code) |
+| compile wall     | ~261–299×  |
+| compile CPU      | ~273–312×  |
+| compiler peak RSS| ~15.5×     |
+| artifact size    | ~42–44×    |
+| run time         | 0.52–1.36× (rustc faster on call-heavy code) |
 
-`nrc` beats rustc on `sieve` (0.75×) and `hello` (0.76×) because the workload
-is a tight loop or a single call and the static binary has no libc startup.
-`mandel` is a dead heat after division by a constant became a multiply-and-shift.
-On `fib` (1.88×, call-heavy) and `mix` (1.09×, register-pressure-heavy) LLVM's
-loop transformations and register allocation still win.
+`nrc` beats rustc on `hello` (1.36×), `sieve` (1.30×) and `mandel` (1.04×)
+because the workload is a tight loop or a single call and the static binary has
+no libc startup. On `fib` (0.52×, call-heavy), `mix` (0.92×) and `stats` (0.91×)
+LLVM's loop transformations and register allocation still win. `stats` holds its
+accumulators in a struct, which nrc keeps in memory, so it is a fair illustration
+of where a real register allocator would pay off.
 
 ### Reproducing the comparison honestly
 
