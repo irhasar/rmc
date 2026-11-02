@@ -269,9 +269,10 @@ rmc is a small, self-contained compiler, not a drop-in replacement for rustc.
 What would move rmc from a serious toy toward something usable, roughly in order
 of value per unit of effort:
 
-1. **A real register allocator.** Linear scan over live ranges, replacing the
-   whole-function top-five heuristic. This is the single biggest win for the
-   call-heavy benchmarks that rmc still loses.
+1. **A real register allocator.** Spill temporaries now live in callee-saved
+   registers (see design.md), which is the part call-heavy code notices. A full
+   linear scan over live ranges would also let a dying temporary's register go to
+   a local born after it.
 2. **References and borrowing.** `&T` / `&mut T` parameters would remove the
    copy an aggregate argument makes today, and are the prerequisite for most
    data-structure code.

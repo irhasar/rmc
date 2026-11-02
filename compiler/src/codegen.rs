@@ -28,6 +28,12 @@ pub struct Codegen {
     /// Slot -> callee-saved register for locals promoted out of memory in the
     /// function currently being generated. Empty means every local is in memory.
     regs: Vec<(i32, &'static str)>,
+    /// Callee-saved registers reserved for expression temporaries that must
+    /// survive a call — the values `push_rax`/`pop_to` used to write to the
+    /// frame. Holding the first few in a register turns each of those pairs into
+    /// a register move, which is the whole win on call-heavy code such as `fib`.
+    /// Trimmed to the number the function actually needs before it is emitted.
+    spill_regs: Vec<&'static str>,
     /// When set, every array index is checked against the array's length and an
     /// out-of-range index traps instead of reading or writing adjacent memory.
     bounds: bool,
@@ -46,6 +52,12 @@ pub struct Codegen {
 /// one. `%rbp` and `%rsp` are excluded; `%rbx` is listed first because a short
 /// register name keeps the generated assembly readable.
 const ALLOC_REGS: [&str; 5] = ["%rbx", "%r12", "%r13", "%r14", "%r15"];
+
+/// Callee-saved registers reserved for spill temporaries, after the locals have
+/// taken what they need. The deepest is two at once (a binary op whose left
+/// operand crosses a call in the right), so a handful covers every expression
+/// the parser can build; past that the spill falls back to a frame slot.
+const SPILL_REGS: [&str; 3] = ["%r12", "%r13", "%r14"];
 
 /// A `let`-declared aggregate, recorded so promotion knows whether its
 /// initialiser writes it field by field (`by_field`) or copies the whole value.
@@ -69,6 +81,7 @@ impl Codegen {
             loops: Vec::new(),
             epilogue: String::new(),
             regs: Vec::new(),
+            spill_regs: Vec::new(),
             bounds: false,
             overflow: false,
             ret_slot: -1,
@@ -162,19 +175,25 @@ impl Codegen {
         self.regs.len() as i32
     }
 
+    /// Number of callee-saved registers saved below `%rbp`, holding promoted
+    /// locals and spill temporaries. Both sit above the frame slots, so a slot
+    /// offset is shifted past the sum.
+    fn saved_regs(&self) -> i32 {
+        self.nregs() + self.spill_regs.len() as i32
+    }
+
     /// Byte offset of stack `slot` relative to `%rbp`. Slots grow downward, and
-    /// the saved promoted registers sit in the lowest bytes of the frame, so
-    /// every slot is shifted past them and never overlaps `%rbp` or a saved
-    /// register.
+    /// the saved registers sit in the lowest bytes of the frame, so every slot
+    /// is shifted past them and never overlaps `%rbp` or a saved register.
     fn off(&self, slot: i32) -> i32 {
-        -(slot + 1 + self.nregs()) * 8
+        -(slot + 1 + self.saved_regs()) * 8
     }
 
     /// Address of element 0 of an `n`-element array occupying `slot..slot+n`.
     /// Slots are laid out downward, so the lowest address is that of the last
     /// slot; elements are then addressed upward from there as `base + i*8`.
     fn array_off(&self, slot: i32, n: usize) -> i32 {
-        -(slot + n as i32 + self.nregs()) * 8
+        -(slot + n as i32 + self.saved_regs()) * 8
     }
 
     fn new_label(&mut self) -> String {
@@ -187,16 +206,28 @@ impl Codegen {
     /// `%rsp` never moves mid-function: a moving stack forces a 16-byte
     /// alignment pad around every call, which costs more than the spill saves.
     fn push_rax(&mut self) {
-        let o = self.off(self.spill_base + self.sp_off);
-        self.line(&format!("mov %rax, {o}(%rbp)"));
+        // The first few spills live in callee-saved registers, which survive
+        // the calls the spill exists to cross; only the rest reach the frame.
+        if let Some(r) = self.spill_regs.get(self.sp_off as usize) {
+            let r = *r;
+            self.line(&format!("mov %rax, {r}"));
+        } else {
+            let o = self.off(self.spill_base + self.sp_off);
+            self.line(&format!("mov %rax, {o}(%rbp)"));
+        }
         self.sp_off += 1;
         self.max_spill = self.max_spill.max(self.sp_off);
     }
 
     fn pop_to(&mut self, reg: &str) {
         self.sp_off -= 1;
-        let o = self.off(self.spill_base + self.sp_off);
-        self.line(&format!("mov {o}(%rbp), {reg}"));
+        if let Some(r) = self.spill_regs.get(self.sp_off as usize) {
+            let r = *r;
+            self.line(&format!("mov {r}, {reg}"));
+        } else {
+            let o = self.off(self.spill_base + self.sp_off);
+            self.line(&format!("mov {o}(%rbp), {reg}"));
+        }
     }
 
     pub fn compile(mut self, prog: &Program) -> String {
@@ -237,16 +268,30 @@ impl Codegen {
         // slots; the dry run's output is discarded.
         self.spill_base = f.nslots;
         self.spill_slots = 0;
+        self.spill_regs = Vec::new();
         let mark = (self.out.len(), self.label, self.str_id, self.strings.len());
+        // Dry run with every spill in the frame: it reports the deepest spill,
+        // which is exactly how many spill registers are worth reserving.
         self.gen_fn_body(f);
         let need = self.max_spill;
         self.out.truncate(mark.0);
         self.label = mark.1;
         self.str_id = mark.2;
         self.strings.truncate(mark.3);
+        // Hold the first `nres` spills in callee-saved registers; the dry run
+        // already proved nothing spills deeper than that. The pool is the same
+        // registers the promoted locals draw on, so a spill register must be one
+        // no local is already using — a promoted `%r12` and a spill `%r12` would
+        // clobber each other.
+        let used: Vec<&'static str> = self.regs.iter().map(|(_, r)| *r).collect();
+        let free: Vec<&'static str> =
+            ALLOC_REGS.iter().copied().filter(|r| !used.contains(r)).collect();
+        let nres = (need as usize).min(SPILL_REGS.len()).min(free.len());
+        self.spill_regs = free[..nres].to_vec();
         self.spill_slots = need;
         self.gen_fn_body(f);
         self.regs.clear();
+        self.spill_regs.clear();
     }
 
     fn gen_fn_body(&mut self, f: &FnDef) {
@@ -255,9 +300,12 @@ impl Codegen {
         self.epilogue = self.new_label();
         self.ret_slot = f.ret_slot;
         self.ret_ty = f.ret.clone();
-        let saved: Vec<&'static str> = self.regs.iter().map(|(_, r)| *r).collect();
+        let mut saved: Vec<&'static str> = self.regs.iter().map(|(_, r)| *r).collect();
+        // Spill registers are saved after the promoted locals, in pool order,
+        // which is the order `off` accounts for them in.
+        saved.extend(self.spill_regs.iter().copied());
 
-        let nregs = self.nregs();
+        let nregs = saved.len() as i32;
         self.raw(&format!(".globl {}", f.name));
         self.raw(&format!(".type {}, @function", f.name));
         self.raw(&format!("{}:", f.name));
