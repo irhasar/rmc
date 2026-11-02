@@ -18,6 +18,9 @@ pub enum Tok {
     Break,
     Continue,
     As,
+    Struct,
+    For,
+    In,
     True,
     False,
     // types
@@ -49,6 +52,13 @@ pub enum Tok {
     AmpAmp,
     PipePipe,
     Bang,
+    Dot,
+    DotDot,
+    PlusEq,
+    MinusEq,
+    StarEq,
+    SlashEq,
+    PercentEq,
     Underscore,
 }
 
@@ -70,6 +80,9 @@ impl Tok {
             Tok::Break => "`break`".into(),
             Tok::Continue => "`continue`".into(),
             Tok::As => "`as`".into(),
+            Tok::Struct => "`struct`".into(),
+            Tok::For => "`for`".into(),
+            Tok::In => "`in`".into(),
             Tok::True => "`true`".into(),
             Tok::False => "`false`".into(),
             Tok::TyI64 => "`i64`".into(),
@@ -105,6 +118,13 @@ impl Tok {
             Tok::AmpAmp => "&&",
             Tok::PipePipe => "||",
             Tok::Bang => "!",
+            Tok::Dot => ".",
+            Tok::DotDot => "..",
+            Tok::PlusEq => "+=",
+            Tok::MinusEq => "-=",
+            Tok::StarEq => "*=",
+            Tok::SlashEq => "/=",
+            Tok::PercentEq => "%=",
             Tok::Underscore => "_",
             _ => "?",
         }
@@ -165,6 +185,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 "break" => Tok::Break,
                 "continue" => Tok::Continue,
                 "as" => Tok::As,
+                "struct" => Tok::Struct,
+                "for" => Tok::For,
+                "in" => Tok::In,
                 "true" => Tok::True,
                 "false" => Tok::False,
                 "i64" => Tok::TyI64,
@@ -239,6 +262,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 b">=" => Some(Tok::Ge),
                 b"&&" => Some(Tok::AmpAmp),
                 b"||" => Some(Tok::PipePipe),
+                b".." => Some(Tok::DotDot),
+                b"+=" => Some(Tok::PlusEq),
+                b"-=" => Some(Tok::MinusEq),
+                b"*=" => Some(Tok::StarEq),
+                b"/=" => Some(Tok::SlashEq),
+                b"%=" => Some(Tok::PercentEq),
                 _ => None,
             }
         } else {
@@ -268,6 +297,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             b'/' => Tok::Slash,
             b'%' => Tok::Percent,
             b'!' => Tok::Bang,
+            b'.' => Tok::Dot,
             _ => return Err(format!("unexpected character `{}` at byte {}", c as char, i)),
         };
         out.push(Token { tok: one, pos });

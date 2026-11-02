@@ -31,6 +31,14 @@ def load_args():
     return {}
 
 
+def extra_flags(name):
+    """Per-case compiler flags. A `NAME.overflow` marker turns on overflow
+    checks for both compilers, so the case can be diffed like any other."""
+    if os.path.exists(os.path.join(CASES, f"{name}.overflow")):
+        return ["--overflow-checks"], ["-C", "overflow-checks=on"]
+    return [], []
+
+
 def compile_and_run(name, argv):
     """Compile both twins and run them with `argv`.
 
@@ -43,11 +51,12 @@ def compile_and_run(name, argv):
     nrc_bin = os.path.join(OUT, f"{name}.nrc")
     rust_bin = os.path.join(OUT, f"{name}.rust")
 
-    p = subprocess.run([NRC, nrs, "-o", nrc_bin], capture_output=True)
+    nrc_flags, rustc_flags = extra_flags(name)
+    p = subprocess.run([NRC] + nrc_flags + [nrs, "-o", nrc_bin], capture_output=True)
     if p.returncode != 0:
         err = ("error", f"nrc failed:\n{p.stderr.decode(errors='replace')}")
         return err, ("error", "not run")
-    p = subprocess.run(["rustc", "-O", rs, "-o", rust_bin], capture_output=True)
+    p = subprocess.run(["rustc", "-O"] + rustc_flags + [rs, "-o", rust_bin], capture_output=True)
     if p.returncode != 0:
         err = ("error", f"rustc failed:\n{p.stderr.decode(errors='replace')}")
         return ("error", "not run"), err

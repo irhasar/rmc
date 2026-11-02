@@ -21,6 +21,7 @@ struct Options {
     output: PathBuf,
     emit_asm: bool,
     keep_asm: bool,
+    overflow_checks: bool,
 }
 
 fn parse_args() -> Result<Options, String> {
@@ -29,6 +30,7 @@ fn parse_args() -> Result<Options, String> {
     let mut output: Option<PathBuf> = None;
     let mut emit_asm = false;
     let mut keep_asm = false;
+    let mut overflow_checks = false;
 
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -38,6 +40,7 @@ fn parse_args() -> Result<Options, String> {
             }
             "--emit-asm" => emit_asm = true,
             "--keep-asm" => keep_asm = true,
+            "--overflow-checks" => overflow_checks = true,
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -64,6 +67,7 @@ fn parse_args() -> Result<Options, String> {
         output,
         emit_asm,
         keep_asm,
+        overflow_checks,
     })
 }
 
@@ -77,6 +81,7 @@ fn print_help() {
          \x20   -o <path>      output binary path\n\
          \x20   --emit-asm     print generated assembly to stdout and stop\n\
          \x20   --keep-asm     keep the intermediate .s file next to the output\n\
+         \x20   --overflow-checks  trap on i64 +,-,* overflow (off by default)\n\
          \x20   -h, --help     show this help\n\
          \n\
          The accepted language is a strict subset of Rust. Entry point is `fn main`."
@@ -111,7 +116,11 @@ fn run(opts: Options) -> Result<(), String> {
     let mut prog = parser::Parser::new(toks).parse_program()?;
     sema::analyze(&mut prog)?;
 
-    let user_asm = codegen::Codegen::new().compile(&prog);
+    let mut cg = codegen::Codegen::new();
+    if opts.overflow_checks {
+        cg = cg.overflow_checks();
+    }
+    let user_asm = cg.compile(&prog);
     let mut asm = String::with_capacity(user_asm.len() + runtime::RUNTIME_ASM.len() + 64);
     asm.push_str(&user_asm);
     asm.push_str(runtime::RUNTIME_ASM);

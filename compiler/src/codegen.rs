@@ -22,6 +22,9 @@ pub struct Codegen {
     /// Slot -> callee-saved register for locals promoted out of memory in the
     /// function currently being generated. Empty means every local is in memory.
     regs: Vec<(i32, &'static str)>,
+    /// When set, every `+`, `-` and `*` is followed by a jump-if-overflow to the
+    /// runtime trap. Off by default because it costs a branch per operation.
+    overflow: bool,
 }
 
 /// Callee-saved registers eligible for promoting a local out of memory. They
@@ -41,7 +44,14 @@ impl Codegen {
             loops: Vec::new(),
             epilogue: String::new(),
             regs: Vec::new(),
+            overflow: false,
         }
+    }
+
+    /// Turn on overflow checks for `+`, `-` and `*`.
+    pub fn overflow_checks(mut self) -> Self {
+        self.overflow = true;
+        self
     }
 
     /// The register holding local `slot`, if it was promoted out of memory.
@@ -233,6 +243,11 @@ impl Codegen {
                 Self::count_block(b, counts, array_slots);
             }
             Stmt::Loop(b) => Self::count_block(b, counts, array_slots),
+            Stmt::For { start, end, body, .. } => {
+                Self::count_expr(start, counts, array_slots);
+                Self::count_expr(end, counts, array_slots);
+                Self::count_block(body, counts, array_slots);
+            }
             Stmt::Return(v) => {
                 if let Some(e) = v {
                     Self::count_expr(e, counts, array_slots);
@@ -244,17 +259,27 @@ impl Codegen {
 
     fn count_expr(e: &Expr, counts: &mut Vec<(i32, u32)>, array_slots: &mut Vec<i32>) {
         match e {
-            Expr::Var { slot, .. } => {
+            Expr::Var { slot, ty, .. } => {
                 if let Some(c) = counts.iter_mut().find(|(s, _)| s == slot) {
                     c.1 += 1;
                 }
+                // A promoted local is named by its register, so an aggregate
+                // (which needs an address) must keep all of its slots in memory.
+                if ty.is_aggregate() {
+                    for k in 0..(ty.size() / 8) as i32 {
+                        array_slots.push(*slot + k);
+                    }
+                }
             }
             Expr::Index(base, idx) => {
-                if let Expr::Var { slot, ty: Type::Array(..), .. } = base.as_ref() {
-                    array_slots.push(*slot);
-                }
                 Self::count_expr(base, counts, array_slots);
                 Self::count_expr(idx, counts, array_slots);
+            }
+            Expr::Field { base, .. } => Self::count_expr(base, counts, array_slots),
+            Expr::StructLit { fields, .. } => {
+                for fi in fields {
+                    Self::count_expr(&fi.value, counts, array_slots);
+                }
             }
             Expr::Bin(_, a, b) => {
                 Self::count_expr(a, counts, array_slots);
@@ -294,17 +319,41 @@ impl Codegen {
             Stmt::Let { ty, init, slot, .. } => {
                 let vty = ty.clone().unwrap_or(Type::I64);
                 if let Type::Array(elem, n) = &vty {
-                    let value_src = match init {
-                        Some(Expr::ArrayLit(v, _)) => Some(v.as_ref()),
-                        _ => None,
-                    };
-                    match value_src {
-                        Some(v) => {
+                    match init {
+                        // `[v; n]` splats one value across every element.
+                        Some(Expr::ArrayLit(v, _)) => {
                             self.gen_expr(v);
+                            self.fill_aggregate(*slot, elem.size(), *n);
                         }
-                        None => self.line("xor %eax, %eax"),
+                        // Anything else yields the array's address (a list
+                        // literal desugars to a block ending in a local array),
+                        // so copy the elements into the destination.
+                        Some(e) => {
+                            self.gen_expr(e);
+                            self.copy_aggregate(*slot, *n, elem.size());
+                        }
+                        None => {
+                            self.line("xor %eax, %eax");
+                            self.fill_aggregate(*slot, elem.size(), *n);
+                        }
                     }
-                    self.fill_array(*slot, elem.size(), *n);
+                } else if let Type::Struct(_, size) = &vty {
+                    match init {
+                        Some(Expr::StructLit { fields, .. }) => {
+                            let base = self.array_off(*slot, size / 8);
+                            for fi in fields {
+                                self.gen_expr(&fi.value);
+                                let off = base + fi.offset;
+                                self.line(&format!("mov %rax, {off}(%rbp)"));
+                            }
+                        }
+                        // No initializer: the struct is zero-filled below.
+                        None => {
+                            self.line("xor %eax, %eax");
+                            self.fill_aggregate(*slot, 8, size / 8);
+                        }
+                        Some(_) => unreachable!("sema: struct initializer must be a literal"),
+                    }
                 } else if let Some(e) = init {
                     self.gen_expr(e);
                     self.store_slot(*slot);
@@ -320,6 +369,21 @@ impl Codegen {
                     Expr::Var { slot, .. } => {
                         self.gen_expr(value);
                         self.store_slot(*slot);
+                    }
+                    Expr::Field { base, offset, .. } => {
+                        match self.field_operand(base, *offset) {
+                            Some(op) => {
+                                self.gen_expr(value);
+                                self.line(&format!("mov %rax, {op}"));
+                            }
+                            None => {
+                                self.gen_addr(target);
+                                self.push_rax();
+                                self.gen_expr(value);
+                                self.pop_to("%rcx");
+                                self.line("mov %rax, (%rcx)");
+                            }
+                        }
                     }
                     Expr::Index(base, idx) => {
                         match self.array_elem_operand(base, idx) {
@@ -386,6 +450,31 @@ impl Codegen {
                 self.raw(&format!("{end}:"));
                 self.loops.pop();
             }
+            Stmt::For { var_slot, start, end, end_slot, body, .. } => {
+                // Evaluate both bounds once: `var = start`, `end_slot = end`.
+                self.gen_expr(start);
+                self.store_slot(*var_slot);
+                self.gen_expr(end);
+                self.store_slot(*end_slot);
+                let top = self.new_label();
+                let cont = self.new_label();
+                let end_l = self.new_label();
+                // `continue` must still run the increment, so it targets `cont`.
+                self.loops.push((cont.clone(), end_l.clone()));
+                self.raw(&format!("{top}:"));
+                self.gen_var_operand(*var_slot, "%rax");
+                self.gen_var_operand(*end_slot, "%rcx");
+                self.line("cmp %rcx, %rax");
+                self.line(&format!("jge {end_l}"));
+                self.gen_block(body);
+                self.raw(&format!("{cont}:"));
+                self.gen_var_operand(*var_slot, "%rax");
+                self.line("add $1, %rax");
+                self.store_slot(*var_slot);
+                self.line(&format!("jmp {top}"));
+                self.raw(&format!("{end_l}:"));
+                self.loops.pop();
+            }
             Stmt::Return(v) => {
                 match v {
                     Some(e) => {
@@ -406,8 +495,45 @@ impl Codegen {
         }
     }
 
-    /// Zero-free store of `%rax` into `n` consecutive slots starting at `slot`.
-    fn fill_array(&mut self, slot: i32, elem_size: usize, n: usize) {
+    /// Load local `slot` (memory or a promoted register) into `reg`.
+    fn gen_var_operand(&mut self, slot: i32, reg: &str) {
+        match self.reg_of(slot) {
+            Some(r) => self.line(&format!("mov {r}, {reg}")),
+            None => self.line(&format!("mov {}(%rbp), {reg}", self.off(slot))),
+        }
+    }
+
+    /// Copy `n` elements of `elem_size` bytes from the address in `%rax` into
+    /// the aggregate starting at `slot`. Used to initialise an array from a list
+    /// literal, which produces its address rather than its elements.
+    fn copy_aggregate(&mut self, slot: i32, n: usize, elem_size: usize) {
+        if n == 0 || elem_size != 8 {
+            return;
+        }
+        let base = self.array_off(slot, n);
+        if n <= 8 {
+            for i in 0..n {
+                self.line(&format!("mov {}(%rax), %rdx", i as i32 * 8));
+                self.line(&format!("mov %rdx, {}(%rbp)", base + i as i32 * 8));
+            }
+        } else {
+            let l = self.new_label();
+            self.line("mov %rax, %rsi");
+            self.line(&format!("lea {base}(%rbp), %rdi"));
+            self.line(&format!("mov ${n}, %rcx"));
+            self.raw(&format!("{l}:"));
+            self.line("mov (%rsi), %rdx");
+            self.line("mov %rdx, (%rdi)");
+            self.line("add $8, %rsi");
+            self.line("add $8, %rdi");
+            self.line("dec %rcx");
+            self.line(&format!("jnz {l}"));
+        }
+    }
+
+    /// Store `%rax` into `n` consecutive slots starting at `slot`. Used to
+    /// zero-fill or splat an array or struct that lives in the frame.
+    fn fill_aggregate(&mut self, slot: i32, elem_size: usize, n: usize) {
         if elem_size != 8 {
             // Only 8-byte elements are supported by sema.
             return;
@@ -433,14 +559,34 @@ impl Codegen {
         }
     }
 
+    /// The frame offset of element 0 / field 0 of an aggregate local, or `None`
+    /// for a scalar. Aggregates occupy the low end of their slot range, so this
+    /// is the *lowest* address of the range and fields index upward from it.
+    fn aggregate_base(&self, slot: i32, ty: &Type) -> Option<i32> {
+        match ty {
+            Type::Array(_, n) => Some(self.array_off(slot, *n)),
+            Type::Struct(_, size) => Some(self.array_off(slot, size / 8)),
+            _ => None,
+        }
+    }
+
+    /// A `disp(%rbp)` operand for `base.field` when `base` is a struct local in
+    /// memory, or `None` when the base is not a plain local (the caller then
+    /// computes the address).
+    fn field_operand(&self, base: &Expr, offset: i32) -> Option<String> {
+        match base {
+            Expr::Var { slot, ty: Type::Struct(_, size), .. } => {
+                Some(format!("{}(%rbp)", self.array_off(*slot, size / 8) + offset))
+            }
+            _ => None,
+        }
+    }
+
     /// Leaves the address of an lvalue in `%rax`.
     fn gen_addr(&mut self, e: &Expr) {
         match e {
             Expr::Var { slot, ty, .. } => {
-                let off = match ty {
-                    Type::Array(_, n) => self.array_off(*slot, *n),
-                    _ => self.off(*slot),
-                };
+                let off = self.aggregate_base(*slot, ty).unwrap_or_else(|| self.off(*slot));
                 self.line(&format!("lea {off}(%rbp), %rax"));
             }
             Expr::Index(base, idx) => {
@@ -449,6 +595,12 @@ impl Codegen {
                 self.gen_expr(idx);
                 self.pop_to("%rcx");
                 self.line("lea (%rcx,%rax,8), %rax");
+            }
+            Expr::Field { base, offset, .. } => {
+                self.gen_addr(base);
+                if *offset != 0 {
+                    self.line(&format!("add ${}, %rax", *offset));
+                }
             }
             _ => unreachable!("sema guarantees a valid address expression"),
         }
@@ -472,16 +624,29 @@ impl Codegen {
                 Type::I64
             }
             Expr::Var { slot, ty, .. } => {
-                match ty {
-                    Type::Array(_, n) => {
-                        self.line(&format!("lea {}(%rbp), %rax", self.array_off(*slot, *n)));
-                    }
-                    _ => match self.reg_of(*slot) {
+                match self.aggregate_base(*slot, ty) {
+                    Some(base) => self.line(&format!("lea {base}(%rbp), %rax")),
+                    None => match self.reg_of(*slot) {
                         Some(r) => self.line(&format!("mov {r}, %rax")),
                         None => self.line(&format!("mov {}(%rbp), %rax", self.off(*slot))),
                     },
                 }
                 ty.clone()
+            }
+            Expr::Field { base, offset, ty, .. } => {
+                match self.field_operand(base, *offset) {
+                    Some(op) => self.line(&format!("mov {op}, %rax")),
+                    None => {
+                        self.gen_addr(e);
+                        self.line("mov (%rax), %rax");
+                    }
+                }
+                ty.clone()
+            }
+            Expr::StructLit { .. } => {
+                // A struct value is only meaningful where its address is taken,
+                // which sema restricts to `let` initialisers.
+                unreachable!("sema restricts struct literals to let initialisers")
             }
             Expr::Index(base, _idx) => {
                 let elem = match base.as_ref() {
@@ -561,13 +726,16 @@ impl Codegen {
         match e {
             Expr::Int(v) if (-2_147_483_648..=2_147_483_647).contains(v) => Some(format!("${v}")),
             Expr::Bool(b) => Some(format!("${}", if *b { 1 } else { 0 })),
-            Expr::Var { slot, ty, .. } => match ty {
-                Type::Array(..) => None,
-                _ => match self.reg_of(*slot) {
+            Expr::Var { slot, ty, .. } => {
+                if ty.is_aggregate() {
+                    return None;
+                }
+                match self.reg_of(*slot) {
                     Some(r) => Some(r.to_string()),
                     None => Some(format!("{}(%rbp)", self.off(*slot))),
-                },
-            },
+                }
+            }
+            Expr::Field { base, offset, .. } => self.field_operand(base, *offset),
             Expr::Index(base, idx) => {
                 match self.array_elem_operand(base, idx) {
                     // Only register-free operands are usable here.
@@ -580,6 +748,14 @@ impl Codegen {
     }
 
     /// Store `%rax` into local `slot`, honouring a register promotion.
+    /// Emit a jump to the runtime trap if the flags show signed overflow. Only
+    /// called when overflow checks are enabled.
+    fn check_overflow(&mut self) {
+        if self.overflow {
+            self.line("jo __nrc_overflow");
+        }
+    }
+
     fn store_slot(&mut self, slot: i32) {
         match self.reg_of(slot) {
             Some(r) => self.line(&format!("mov %rax, {r}")),
@@ -671,9 +847,18 @@ impl Codegen {
         if let Some(k) = imm {
             self.gen_expr(other);
             match op {
-                Add => self.line(&format!("add ${k}, %rax")),
-                Sub => self.line(&format!("sub ${k}, %rax")),
-                Mul => self.line(&format!("imul ${k}, %rax, %rax")),
+                Add => {
+                    self.line(&format!("add ${k}, %rax"));
+                    self.check_overflow();
+                }
+                Sub => {
+                    self.line(&format!("sub ${k}, %rax"));
+                    self.check_overflow();
+                }
+                Mul => {
+                    self.line(&format!("imul ${k}, %rax, %rax"));
+                    self.check_overflow();
+                }
                 _ => unreachable!(),
             }
             return Type::I64;
@@ -681,9 +866,18 @@ impl Codegen {
 
         self.eval_operands(a, b);
         match op {
-            Add => self.line("add %rcx, %rax"),
-            Sub => self.line("sub %rcx, %rax"),
-            Mul => self.line("imul %rcx, %rax"),
+            Add => {
+                self.line("add %rcx, %rax");
+                self.check_overflow();
+            }
+            Sub => {
+                self.line("sub %rcx, %rax");
+                self.check_overflow();
+            }
+            Mul => {
+                self.line("imul %rcx, %rax");
+                self.check_overflow();
+            }
             _ => unreachable!(),
         }
         Type::I64
@@ -1018,6 +1212,9 @@ impl Codegen {
             }
             Stmt::Expr(e) => Self::contains_call(e),
             Stmt::Return(v) => v.as_ref().map_or(false, Self::contains_call),
+            Stmt::For { start, end, body, .. } => {
+                Self::contains_call(start) || Self::contains_call(end) || Self::block_has_call(body)
+            }
             // A loop body might call on some iteration; be conservative.
             Stmt::While(..) | Stmt::Loop(..) => true,
             Stmt::Break | Stmt::Continue => false,

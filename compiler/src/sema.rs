@@ -1,8 +1,13 @@
-//! Semantic analysis: resolves variables to stack slots, infers and checks types.
+//! Semantic analysis: resolves variables to stack slots, lays out structs, and
+//! infers and checks types.
 //!
-//! Every local (parameters included) gets a unique 8-byte slot in the function
-//! frame. `Expr::Var` is rewritten in place with its slot and type, so codegen
-//! never needs to do name lookups.
+//! Every local (parameters included) gets a unique slot range in the function
+//! frame. `Expr::Var` is rewritten in place with its slot and type, and
+//! `Expr::Field` with its byte offset, so codegen never does a name lookup.
+//!
+//! Struct layout is declaration order with no padding: field `k` starts at the
+//! sum of the sizes of fields `0..k`. Every field is 8 bytes, so a struct is
+//! always a multiple of 8 and every field is naturally aligned.
 
 use crate::ast::*;
 use std::collections::HashMap;
@@ -13,8 +18,17 @@ pub struct Sig {
     pub ret: Type,
 }
 
+/// A laid-out struct: each field's name, resolved type and byte offset, plus the
+/// total size.
+#[derive(Clone)]
+pub struct StructInfo {
+    pub fields: Vec<(String, Type, usize)>,
+    pub size: usize,
+}
+
 pub struct Sema {
     sigs: HashMap<String, Sig>,
+    structs: HashMap<String, StructInfo>,
     next_slot: i32,
     loop_depth: u32,
     ret_ty: Type,
@@ -23,15 +37,18 @@ pub struct Sema {
 type Scope = Vec<(String, i32, Type)>;
 
 pub fn analyze(prog: &mut Program) -> Result<(), String> {
+    let structs = resolve_structs(&prog.structs)?;
+
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     // Runtime helpers provided by the freestanding assembly runtime. They are
     // linked in automatically, so they do not appear in the source program.
-    let builtins: [(&str, &[Type], Type); 6] = [
+    let builtins: [(&str, &[Type], Type); 7] = [
         ("print_i64", &[Type::I64], Type::Unit),
         ("print_str", &[Type::I64], Type::Unit),
         ("print_bool", &[Type::Bool], Type::Unit),
         ("putchar", &[Type::I64], Type::Unit),
         ("alloc", &[Type::I64], Type::I64),
+        ("free", &[Type::I64], Type::Unit),
         ("arg_i64", &[Type::I64], Type::I64),
     ];
     for (name, params, ret) in builtins {
@@ -47,25 +64,30 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         if sigs.contains_key(&f.name) {
             return Err(format!("function `{}` is defined more than once", f.name));
         }
-        for (_, t) in &f.params {
+        let params: Result<Vec<Type>, String> =
+            f.params.iter().map(|(_, t)| resolve_type(t, &structs)).collect();
+        let params = params?;
+        let ret = resolve_type(&f.ret, &structs)?;
+        for (p, t) in f.params.iter().zip(params.iter()) {
             if !t.is_scalar() {
                 return Err(format!(
-                    "function `{}`: parameter types must be `i64` or `bool`",
-                    f.name
+                    "function `{}`: parameter `{}` must be `i64` or `bool`, not {t:?}",
+                    f.name, p.0
                 ));
             }
         }
-        sigs.insert(
-            f.name.clone(),
-            Sig {
-                params: f.params.iter().map(|(_, t)| t.clone()).collect(),
-                ret: f.ret.clone(),
-            },
-        );
+        if !ret.is_scalar() && ret != Type::Unit {
+            return Err(format!(
+                "function `{}`: return type must be `i64`, `bool` or `()`, not {ret:?}",
+                f.name
+            ));
+        }
+        sigs.insert(f.name.clone(), Sig { params, ret });
     }
 
     let mut sema = Sema {
         sigs,
+        structs,
         next_slot: 0,
         loop_depth: 0,
         ret_ty: Type::Unit,
@@ -76,16 +98,88 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
     Ok(())
 }
 
+/// Map every `Type::Named` in `t` to a concrete type and reject arrays of
+/// aggregates. Struct layouts are already known, so `Struct(name, size)` comes
+/// out fully resolved.
+fn resolve_type(t: &Type, structs: &HashMap<String, StructInfo>) -> Result<Type, String> {
+    match t {
+        Type::Named(n) => match structs.get(n) {
+            Some(info) => Ok(Type::Struct(n.clone(), info.size)),
+            None => Err(format!("unknown type `{n}`")),
+        },
+        Type::Array(elem, n) => {
+            let e = resolve_type(elem, structs)?;
+            if !e.is_scalar() {
+                return Err(format!("array elements must be `i64` or `bool`, not {e:?}"));
+            }
+            Ok(Type::Array(Box::new(e), *n))
+        }
+        other => Ok(other.clone()),
+    }
+}
+
+/// Compute each struct's field offsets and size. A struct may refer to another
+/// struct declared later, but not to itself, directly or indirectly.
+fn resolve_structs(defs: &[StructDef]) -> Result<HashMap<String, StructInfo>, String> {
+    let raw: HashMap<&str, &StructDef> = defs.iter().map(|d| (d.name.as_str(), d)).collect();
+    if raw.len() != defs.len() {
+        return Err("a struct is defined more than once".into());
+    }
+    let mut out: HashMap<String, StructInfo> = HashMap::new();
+    for d in defs {
+        layout(&d.name, &raw, &mut out, &mut Vec::new())?;
+    }
+    Ok(out)
+}
+
+fn layout(
+    name: &str,
+    raw: &HashMap<&str, &StructDef>,
+    out: &mut HashMap<String, StructInfo>,
+    visiting: &mut Vec<String>,
+) -> Result<(), String> {
+    if out.contains_key(name) {
+        return Ok(());
+    }
+    if visiting.iter().any(|n| n == name) {
+        return Err(format!("struct `{name}` contains itself"));
+    }
+    let def = raw
+        .get(name)
+        .ok_or_else(|| format!("unknown type `{name}`"))?;
+    visiting.push(name.to_string());
+    let mut fields: Vec<(String, Type, usize)> = Vec::new();
+    let mut size = 0usize;
+    for (fname, fty) in &def.fields {
+        if let Type::Named(n) = fty {
+            layout(n, raw, out, visiting)?;
+        }
+        let rty = resolve_type(fty, out)?;
+        if fields.iter().any(|(n, _, _)| n == fname) {
+            return Err(format!("struct `{name}`: duplicate field `{fname}`"));
+        }
+        let off = size;
+        size += rty.size();
+        fields.push((fname.clone(), rty, off));
+    }
+    visiting.pop();
+    out.insert(name.to_string(), StructInfo { fields, size });
+    Ok(())
+}
+
 impl Sema {
     fn check_fn(&mut self, f: &mut FnDef) -> Result<(), String> {
         self.next_slot = 0;
         self.loop_depth = 0;
-        self.ret_ty = f.ret.clone();
+        self.ret_ty = resolve_type(&f.ret, &self.structs)?;
+        f.ret = self.ret_ty.clone();
 
         let mut scope: Scope = Vec::with_capacity(f.params.len() + 8);
-        for (name, ty) in &f.params {
+        for (name, ty) in &mut f.params {
+            let rt = resolve_type(ty, &self.structs)?;
+            *ty = rt.clone();
             let slot = self.alloc_slot();
-            scope.push((name.clone(), slot, ty.clone()));
+            scope.push((name.clone(), slot, rt));
         }
 
         self.check_block(&mut f.body, &mut scope)?;
@@ -129,7 +223,10 @@ impl Sema {
     fn check_stmt(&mut self, st: &mut Stmt, scope: &mut Scope) -> Result<(), String> {
         match st {
             Stmt::Let { name, ty, init, slot } => {
-                let declared = ty.clone();
+                let declared = match ty {
+                    Some(t) => Some(resolve_type(t, &self.structs)?),
+                    None => None,
+                };
                 let init_ty = match init {
                     Some(e) => Some(self.check_expr(e, scope)?),
                     None => None,
@@ -151,11 +248,8 @@ impl Sema {
                         ))
                     }
                 };
-                if !final_ty.is_scalar() {
-                    // arrays are supported as locals
-                    if !matches!(final_ty, Type::Array(_, _)) {
-                        return Err(format!("variable `{name}`: unsupported type {final_ty:?}"));
-                    }
+                if let Some(t) = ty {
+                    *t = final_ty.clone();
                 }
                 let s = self.alloc_slots((final_ty.size() / 8) as i32);
                 *slot = s;
@@ -188,6 +282,26 @@ impl Sema {
                 self.loop_depth += 1;
                 self.check_block(body, scope)?;
                 self.loop_depth -= 1;
+                Ok(())
+            }
+            Stmt::For { var, var_slot, start, end, end_slot, body } => {
+                let ts = self.check_expr(start, scope)?;
+                let te = self.check_expr(end, scope)?;
+                if ts != Type::I64 || te != Type::I64 {
+                    return Err(format!(
+                        "`for` range bounds must be `i64`, found {ts:?} and {te:?}"
+                    ));
+                }
+                // The end bound is evaluated once, before the loop starts.
+                *end_slot = self.alloc_slot();
+                let s = self.alloc_slot();
+                *var_slot = s;
+                let mark = scope.len();
+                scope.push((var.clone(), s, Type::I64));
+                self.loop_depth += 1;
+                self.check_block(body, scope)?;
+                self.loop_depth -= 1;
+                scope.truncate(mark);
                 Ok(())
             }
             Stmt::Return(v) => {
@@ -227,10 +341,10 @@ impl Sema {
         }
     }
 
-    /// Type-check an assignment target (variable or array element).
+    /// Type-check an assignment target (variable, array element or field).
     fn check_lvalue(&mut self, e: &mut Expr, scope: &mut Scope) -> Result<Type, String> {
         match e {
-            Expr::Var { .. } => self.check_expr(e, scope),
+            Expr::Var { .. } | Expr::Field { .. } => self.check_expr(e, scope),
             Expr::Index(base, idx) => {
                 let bt = self.check_expr(base, scope)?;
                 let it = self.check_expr(idx, scope)?;
@@ -364,6 +478,63 @@ impl Sema {
                     other => Err(format!("cannot index a value of type {other:?}")),
                 }
             }
+            Expr::Field { base, name, offset, ty } => {
+                let bt = self.check_expr(base, scope)?;
+                match bt {
+                    Type::Struct(sname, _) => {
+                        let info = self.structs.get(&sname).cloned().unwrap();
+                        match info.fields.iter().find(|(f, _, _)| f == name) {
+                            Some((_, fty, off)) => {
+                                *offset = *off as i32;
+                                *ty = fty.clone();
+                                Ok(fty.clone())
+                            }
+                            None => Err(format!("struct `{sname}` has no field `{name}`")),
+                        }
+                    }
+                    other => Err(format!("field access on a value of type {other:?}")),
+                }
+            }
+            Expr::StructLit { name, fields } => {
+                let info = self
+                    .structs
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| format!("unknown struct `{name}`"))?;
+                if fields.len() != info.fields.len() {
+                    return Err(format!(
+                        "struct `{name}` has {} field(s), but {} were given",
+                        info.fields.len(),
+                        fields.len()
+                    ));
+                }
+                // Type-check each field, then reorder into declaration order so
+                // codegen can store them sequentially.
+                let mut ordered: Vec<Option<FieldInit>> = vec![None; info.fields.len()];
+                for fi in fields.iter_mut() {
+                    let idx = info
+                        .fields
+                        .iter()
+                        .position(|(f, _, _)| *f == fi.name)
+                        .ok_or_else(|| format!("struct `{name}` has no field `{}`", fi.name))?;
+                    if ordered[idx].is_some() {
+                        return Err(format!("struct `{name}`: field `{}` given twice", fi.name));
+                    }
+                    let want = info.fields[idx].1.clone();
+                    let got = self.check_expr(&mut fi.value, scope)?;
+                    if got != want {
+                        return Err(format!(
+                            "struct `{name}` field `{}`: expected {want:?}, found {got:?}",
+                            fi.name
+                        ));
+                    }
+                    fi.offset = info.fields[idx].2 as i32;
+                    fi.ty = want;
+                    ordered[idx] = Some(fi.clone());
+                }
+                *fields = ordered.into_iter().map(|f| f.unwrap()).collect();
+                Ok(Type::Struct(name.clone(), info.size))
+            }
             Expr::ArrayLit(val, n) => {
                 let t = self.check_expr(val, scope)?;
                 if !t.is_scalar() {
@@ -373,7 +544,9 @@ impl Sema {
             }
             Expr::Cast(inner, to) => {
                 self.check_expr(inner, scope)?;
-                Ok(to.clone())
+                let rt = resolve_type(to, &self.structs)?;
+                *to = rt.clone();
+                Ok(rt)
             }
         }
     }

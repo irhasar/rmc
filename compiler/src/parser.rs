@@ -6,6 +6,10 @@ use crate::lexer::{Tok, Token};
 pub struct Parser {
     toks: Vec<Token>,
     i: usize,
+    /// Suppresses struct-literal parsing in expression position, so that
+    /// `while n < 10 {` reads `{` as the loop body rather than as the start of
+    /// `10 { ... }`. Parentheses lift the restriction, exactly like rustc.
+    no_struct_lit: bool,
 }
 
 /// Expressions that are allowed as statements without a trailing `;`.
@@ -17,7 +21,7 @@ type PResult<T> = Result<T, String>;
 
 impl Parser {
     pub fn new(toks: Vec<Token>) -> Self {
-        Parser { toks, i: 0 }
+        Parser { toks, i: 0, no_struct_lit: false }
     }
 
     fn peek(&self) -> Option<&Tok> {
@@ -74,11 +78,40 @@ impl Parser {
     }
 
     pub fn parse_program(&mut self) -> PResult<Program> {
+        let mut structs = Vec::new();
         let mut fns = Vec::new();
         while self.peek().is_some() {
-            fns.push(self.parse_fn()?);
+            match self.peek() {
+                Some(Tok::Struct) => structs.push(self.parse_struct()?),
+                Some(Tok::Fn) => fns.push(self.parse_fn()?),
+                other => {
+                    return Err(format!(
+                        "at byte {}: expected `fn` or `struct`, found {}",
+                        self.pos(),
+                        other.map(|x| x.describe()).unwrap_or_else(|| "end of input".into())
+                    ))
+                }
+            }
         }
-        Ok(Program { fns })
+        Ok(Program { structs, fns })
+    }
+
+    fn parse_struct(&mut self) -> PResult<StructDef> {
+        self.expect(Tok::Struct)?;
+        let name = self.expect_ident()?;
+        self.expect(Tok::LBrace)?;
+        let mut fields = Vec::new();
+        while self.peek() != Some(&Tok::RBrace) {
+            let fname = self.expect_ident()?;
+            self.expect(Tok::Colon)?;
+            let fty = self.parse_type()?;
+            fields.push((fname, fty));
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(Tok::RBrace)?;
+        Ok(StructDef { name, fields })
     }
 
     fn parse_fn(&mut self) -> PResult<FnDef> {
@@ -137,6 +170,13 @@ impl Parser {
                 self.expect(Tok::RParen)?;
                 Ok(inner)
             }
+            Some(Tok::Ident(_)) => {
+                let name = match self.bump() {
+                    Tok::Ident(s) => s,
+                    _ => unreachable!(),
+                };
+                Ok(Type::Named(name))
+            }
             other => Err(format!(
                 "at byte {}: expected a type, found {}",
                 self.pos(),
@@ -160,6 +200,16 @@ impl Parser {
                     let value = self.parse_expr()?;
                     self.expect(Tok::Semi)?;
                     stmts.push(Stmt::Assign { target: e, value });
+                    continue;
+                }
+                if let Some(op) = self.peek_compound_op() {
+                    self.i += 1;
+                    let value = self.parse_expr()?;
+                    self.expect(Tok::Semi)?;
+                    stmts.push(Stmt::Assign {
+                        target: e.clone(),
+                        value: Expr::Bin(op, Box::new(e), Box::new(value)),
+                    });
                     continue;
                 }
                 if self.eat(&Tok::Semi) {
@@ -223,7 +273,7 @@ impl Parser {
             }
             Some(Tok::While) => {
                 self.i += 1;
-                let cond = self.parse_expr()?;
+                let cond = self.parse_cond()?;
                 let body = self.parse_block()?;
                 Ok(Stmt::While(cond, body))
             }
@@ -231,6 +281,16 @@ impl Parser {
                 self.i += 1;
                 let body = self.parse_block()?;
                 Ok(Stmt::Loop(body))
+            }
+            Some(Tok::For) => {
+                self.i += 1;
+                let var = self.expect_ident()?;
+                self.expect(Tok::In)?;
+                let start = self.parse_cond()?;
+                self.expect(Tok::DotDot)?;
+                let end = self.parse_cond()?;
+                let body = self.parse_block()?;
+                Ok(Stmt::For { var, var_slot: -1, start, end, end_slot: -1, body })
             }
             Some(Tok::Return) => {
                 self.i += 1;
@@ -261,14 +321,45 @@ impl Parser {
                     self.expect(Tok::Semi)?;
                     return Ok(Stmt::Assign { target: e, value });
                 }
+                if let Some(op) = self.peek_compound_op() {
+                    self.i += 1;
+                    let value = self.parse_expr()?;
+                    self.expect(Tok::Semi)?;
+                    return Ok(Stmt::Assign {
+                        target: e.clone(),
+                        value: Expr::Bin(op, Box::new(e), Box::new(value)),
+                    });
+                }
                 self.expect(Tok::Semi)?;
                 Ok(Stmt::Expr(e))
             }
         }
     }
 
+    /// The `BinOp` for a compound-assignment operator, if the next token is one.
+    fn peek_compound_op(&self) -> Option<BinOp> {
+        match self.peek() {
+            Some(Tok::PlusEq) => Some(BinOp::Add),
+            Some(Tok::MinusEq) => Some(BinOp::Sub),
+            Some(Tok::StarEq) => Some(BinOp::Mul),
+            Some(Tok::SlashEq) => Some(BinOp::Div),
+            Some(Tok::PercentEq) => Some(BinOp::Mod),
+            _ => None,
+        }
+    }
+
     fn parse_expr(&mut self) -> PResult<Expr> {
         self.parse_or()
+    }
+
+    /// Parse an expression in a context where a following `{` must start a
+    /// block, not a struct literal (`if`/`while`/`for` conditions and bounds).
+    fn parse_cond(&mut self) -> PResult<Expr> {
+        let saved = self.no_struct_lit;
+        self.no_struct_lit = true;
+        let r = self.parse_expr();
+        self.no_struct_lit = saved;
+        r
     }
 
     fn parse_or(&mut self) -> PResult<Expr> {
@@ -362,6 +453,9 @@ impl Parser {
                 let idx = self.parse_expr()?;
                 self.expect(Tok::RBracket)?;
                 e = Expr::Index(Box::new(e), Box::new(idx));
+            } else if self.eat(&Tok::Dot) {
+                let name = self.expect_ident()?;
+                e = Expr::Field { base: Box::new(e), name, offset: 0, ty: Type::I64 };
             } else if self.eat(&Tok::As) {
                 let ty = self.parse_type()?;
                 e = Expr::Cast(Box::new(e), ty);
@@ -370,6 +464,38 @@ impl Parser {
             }
         }
         Ok(e)
+    }
+
+    /// Desugar `[a, b, c]` into
+    /// `{ let mut __arr: [i64; 3] = [0; 3]; __arr[0] = a; ...; __arr }`.
+    /// The element type is left as `i64`; sema rejects the case where the
+    /// elements turn out to be `bool`.
+    fn array_list_to_block(elems: Vec<Expr>) -> Expr {
+        let n = elems.len();
+        let ty = Type::Array(Box::new(Type::I64), n);
+        let mut stmts = vec![Stmt::Let {
+            name: "__arr".to_string(),
+            ty: Some(ty),
+            init: Some(Expr::ArrayLit(Box::new(Expr::Int(0)), n)),
+            slot: -1,
+        }];
+        for (i, e) in elems.into_iter().enumerate() {
+            stmts.push(Stmt::Assign {
+                target: Expr::Index(
+                    Box::new(Expr::Var { name: "__arr".to_string(), slot: -1, ty: Type::I64 }),
+                    Box::new(Expr::Int(i as i64)),
+                ),
+                value: e,
+            });
+        }
+        Expr::Block(Block {
+            stmts,
+            tail: Some(Box::new(Expr::Var {
+                name: "__arr".to_string(),
+                slot: -1,
+                ty: Type::I64,
+            })),
+        })
     }
 
     fn parse_primary(&mut self) -> PResult<Expr> {
@@ -392,6 +518,22 @@ impl Parser {
             }
             Some(Tok::Ident(name)) => {
                 self.i += 1;
+                if self.peek() == Some(&Tok::LBrace) && !self.no_struct_lit {
+                    // struct literal `Name { field: value, ... }`
+                    self.i += 1;
+                    let mut fields = Vec::new();
+                    while self.peek() != Some(&Tok::RBrace) {
+                        let fname = self.expect_ident()?;
+                        self.expect(Tok::Colon)?;
+                        let fval = self.parse_expr()?;
+                        fields.push(FieldInit { name: fname, offset: 0, ty: Type::I64, value: fval });
+                        if !self.eat(&Tok::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(Tok::RBrace)?;
+                    return Ok(Expr::StructLit { name, fields });
+                }
                 if self.eat(&Tok::LParen) {
                     let mut args = Vec::new();
                     while self.peek() != Some(&Tok::RParen) {
@@ -408,13 +550,17 @@ impl Parser {
             }
             Some(Tok::LParen) => {
                 self.i += 1;
-                let e = self.parse_expr()?;
+                let saved = self.no_struct_lit;
+                self.no_struct_lit = false;
+                let e = self.parse_expr();
+                self.no_struct_lit = saved;
+                let e = e?;
                 self.expect(Tok::RParen)?;
                 Ok(e)
             }
             Some(Tok::If) => {
                 self.i += 1;
-                let cond = self.parse_expr()?;
+                let cond = self.parse_cond()?;
                 let then = self.parse_block()?;
                 let els = if self.eat(&Tok::Else) {
                     if self.peek() == Some(&Tok::If) {
@@ -444,12 +590,17 @@ impl Parser {
                     self.expect(Tok::RBracket)?;
                     Ok(Expr::ArrayLit(Box::new(first), n))
                 } else {
-                    // list literal [a, b, c] -> treated as [a; n] is not general;
-                    // we support only the repeat form for now.
-                    Err(format!(
-                        "at byte {}: only array repeat literals `[value; N]` are supported",
-                        self.pos()
-                    ))
+                    // list literal `[a, b, c]`, desugared to a block that builds
+                    // the array one element at a time through a `let mut`.
+                    let mut elems = vec![first];
+                    while self.eat(&Tok::Comma) {
+                        if self.peek() == Some(&Tok::RBracket) {
+                            break;
+                        }
+                        elems.push(self.parse_expr()?);
+                    }
+                    self.expect(Tok::RBracket)?;
+                    Ok(Self::array_list_to_block(elems))
                 }
             }
             other => Err(format!(
