@@ -414,3 +414,14 @@ fn a_repeat_literal_let_initialiser_keeps_the_splat() {
     assert!(out.contains("mov %r8, (%rdx)"), "one splat loop fills the array");
     assert!(out.contains("$200000, %rcx"), "the loop count is the array length");
 }
+
+#[test]
+fn a_bare_block_parses_as_a_statement() {
+    // A `{ ... }` block needs no trailing `;`. Before this was handled the
+    // parser fell through to a statement arm with no `{` case and rejected it.
+    let out = asm("fn main() -> i64 { let x: i64 = 1; { let x: i64 = 2; print_i64(x); } print_i64(x); return 0; }");
+    // Both the inner (2) and outer (1) values are materialised and printed.
+    assert!(out.contains("$2,"), "inner block body is emitted");
+    assert!(out.contains("$1,"), "outer binding is emitted");
+    assert_eq!(out.matches("call print_i64").count(), 2, "both blocks print");
+}

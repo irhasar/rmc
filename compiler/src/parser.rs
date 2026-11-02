@@ -249,6 +249,10 @@ impl Parser {
                 | Some(Tok::Bang)
                 | Some(Tok::If)
                 | Some(Tok::LBracket)
+                // A bare `{ ... }` is a block expression, valid as a statement
+                // without a `;`. Without this it fell through to `parse_stmt`,
+                // which has no arm for `{`, so a nested block failed to parse.
+                | Some(Tok::LBrace)
         )
     }
 
