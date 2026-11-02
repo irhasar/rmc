@@ -261,3 +261,34 @@ fn a_struct_array_field_keeps_the_field_to_slot_map_consistent() {
     assert!(out.contains("mov %rax, %rbx"), "literal writes `tag` to its register: {out}");
     assert!(out.contains("mov %rbx, %rax"), "`w.tag` reads the same register: {out}");
 }
+
+#[test]
+fn a_value_function_that_falls_off_the_end_is_rejected() {
+    // A `Unit` body returns zero, which is wrong for a value function whose
+    // signature promises a value. The tail-mismatch check does not see this
+    // because there is no tail.
+    let err = compile_to_asm(
+        "fn g() -> i64 { let x: i64 = 5; } fn main() -> i64 { return g(); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("fall off the end"), "got: {err}");
+}
+
+#[test]
+fn a_function_returning_on_every_path_is_accepted() {
+    // Both arms return, so control cannot reach the end without a value.
+    let out = asm(
+        "fn f(c: bool) -> i64 { if c { return 1; } else { return 2; } } fn main() -> i64 { return f(true); }",
+    );
+    assert!(out.contains("f:"), "compiles: {out}");
+}
+
+#[test]
+fn a_folded_lea_displacement_stays_in_range() {
+    // `x + 2147483647 + 1` folds both constants into one `lea` displacement of
+    // 2147483648, which is out of the signed 32-bit range GNU `as` accepts. The
+    // fold must be abandoned, not emitted.
+    let out = asm("fn main() -> i64 { let mut x: i64 = 1; x = x + 2147483647 + 1; return x; }");
+    assert!(!out.contains("2147483648("), "no out-of-range displacement: {out}");
+}

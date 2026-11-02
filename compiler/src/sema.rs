@@ -191,9 +191,13 @@ impl Sema {
                 f.name, self.ret_ty
             ));
         }
-        if self.ret_ty != Type::Unit && f.body.stmts.is_empty() && f.body.tail.is_none() {
+        // A body whose tail yields no value (a `Unit` body: no tail, or a tail
+        // like an `if` without an `else`) falls off its end, returning zero.
+        // That is fine for a unit function, but for a value-returning one every
+        // path must `return` (or diverge) so the end is never reached.
+        if self.ret_ty != Type::Unit && body_ty == Type::Unit && !block_diverges(&f.body) {
             return Err(format!(
-                "function `{}` is declared to return {:?} but has an empty body",
+                "function `{}` is declared to return {:?} but its body can fall off the end",
                 f.name, self.ret_ty
             ));
         }
@@ -586,5 +590,38 @@ impl Sema {
                 Ok(rt)
             }
         }
+    }
+}
+
+/// True when control cannot reach the end of `b`: its tail diverges, or its
+/// last statement does. Used to accept a value-returning function whose body
+/// ends in `return` on every path, and reject one that can fall off the end.
+fn block_diverges(b: &Block) -> bool {
+    match &b.tail {
+        Some(e) => expr_diverges(e),
+        None => b.stmts.last().map_or(false, stmt_diverges),
+    }
+}
+
+fn stmt_diverges(s: &Stmt) -> bool {
+    match s {
+        Stmt::Return(_) => true,
+        // Only reachable inside a loop, so it never ends a function body, but
+        // treating it as diverging keeps the walk total.
+        Stmt::Break | Stmt::Continue => true,
+        Stmt::Expr(e) => expr_diverges(e),
+        // A loop is not a guaranteed return: it may break or never run.
+        _ => false,
+    }
+}
+
+fn expr_diverges(e: &Expr) -> bool {
+    match e {
+        Expr::Block(b) => block_diverges(b),
+        // Both arms must diverge for the `if` to diverge.
+        Expr::If(_, t, els) => {
+            block_diverges(t) && els.as_ref().map_or(false, |b| block_diverges(b))
+        }
+        _ => false,
     }
 }

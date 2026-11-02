@@ -363,7 +363,9 @@ impl Parser {
         // A `Var` or `Field` target has no side effect on re-evaluation.
         let (read, write) = match target {
             Expr::Index(base, idx) => {
-                let it = format!("__rmc_ix{}", self.tmp);
+                // NUL is not a valid identifier byte, so a generated name can
+                // never collide with one the source spells.
+                let it = format!("\u{0}ix{}", self.tmp);
                 self.tmp += 1;
                 stmts.push(Stmt::Let {
                     name: it.clone(),
@@ -380,7 +382,7 @@ impl Parser {
             other => (other.clone(), other.clone()),
         };
 
-        let tmp = format!("__rmc_ca{}", self.tmp);
+        let tmp = format!("\u{0}ca{}", self.tmp);
         self.tmp += 1;
         stmts.push(Stmt::Let {
             name: tmp.clone(),

@@ -172,14 +172,38 @@ claim otherwise. It supports only the subset in `docs/language.md` (scalars,
 arrays, structs, `for`, aggregates across calls), has no register allocator and
 only a small peephole optimiser (operand/comparison/array-address folding,
 constant folding, division by a constant), and no borrow checker. Aggregates
-cross a call only by value; there are no references. The README's roadmap lists
-the intended next steps.
+cross a call only by value; there are no references. Array indexing is unchecked
+(the index is used as-is, like C), so an out-of-range index reads or writes
+adjacent stack memory; bounds checks are a roadmap item. The README's roadmap
+lists the intended next steps.
 
 ## Codegen notes
 
 - Every expression leaves its result in `%rax`; `%rcx`/`%rdx` are the only
   scratch registers used. No other register is written by expression code, which
   is what makes the direct-argument call shortcut safe (see `gen_call`).
+- **A destination address must survive the value it is assigned.** Assigning a
+  whole aggregate to a field or element computes the destination first, and
+  `gen_expr(value)` may clobber `%rdi` (a call, or another aggregate copy), so
+  the address is pushed to a frame slot and popped back after the value. Writing
+  `%rdi` before evaluating the value silently corrupts the destination.
+- **The direct-argument call shortcut needs `%rdi`/`%rsi` preserved.**
+  `contains_call` is not enough: a block's `let` initialiser can copy a whole
+  aggregate (`copy_words_rdi_rsi`) with no call in sight. `clobbers_arg_regs`
+  catches that case; add to it, not just to `contains_call`, when a new
+  expression form can copy an aggregate.
+- **A value-returning function must not fall off the end.** `check_fn` rejects a
+  `Unit` body (no tail, or a tail like an `if` without an `else`) unless every
+  path returns, using `block_diverges`. It is deliberately conservative: an
+  `if` with no `else`, a `while`, and a `loop` are not treated as guaranteed
+  returns.
+- **`lea_shape` must keep its displacement in the signed 32-bit range.** Each
+  constant in a folded `k*x + c` chain is representable alone, but their sum is
+  not; `disp_ok` guards the fold, and a rejection falls back to ordinary code.
+- **Generated temporaries use unspellable names.** Compound-assignment
+  desugaring introduces `let`s whose names contain a NUL byte, which no source
+  identifier can contain, so they can never shadow a user variable. Do not
+  switch them back to a spellable `__rmc_...` name.
 - **`copy_words_rdi_rsi` must not touch `%rax`.** It copies through `%r8`, so a
   caller can hold a live value in `%rax` across the copy (a pending operand, or
   an argument already loaded into a register). It also clobbers `%rdi`/`%rsi`,

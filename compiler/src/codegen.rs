@@ -673,10 +673,14 @@ impl Codegen {
                     }
                     Expr::Field { ty, .. } if ty.is_aggregate() => {
                         let n = ty.size() / 8;
+                        // The destination address lives in `%rdi`, which
+                        // `gen_expr(value)` may clobber (a call, or another
+                        // aggregate copy), so stash it until the copy.
                         self.gen_addr(target);
-                        self.line("mov %rax, %rdi");
+                        self.push_rax();
                         self.gen_expr(value);
                         self.line("mov %rax, %rsi");
+                        self.pop_to("%rdi");
                         self.copy_words_rdi_rsi(n);
                     }
                     Expr::Field { base, offset, .. } => {
@@ -708,9 +712,10 @@ impl Codegen {
                         };
                         let n = elem.size() / 8;
                         self.gen_addr(target);
-                        self.line("mov %rax, %rdi");
+                        self.push_rax();
                         self.gen_expr(value);
                         self.line("mov %rax, %rsi");
+                        self.pop_to("%rdi");
                         self.copy_words_rdi_rsi(n);
                     }
                     Expr::Index(base, idx) => {
@@ -1250,19 +1255,25 @@ impl Codegen {
                 BinOp::Add => {
                     if let Some(c) = Self::small_imm(b) {
                         if let Some((r, k, c0)) = self.lea_shape(a) {
-                            return Some((r, k, c0 + c));
+                            if Self::disp_ok(c0 + c) {
+                                return Some((r, k, c0 + c));
+                            }
                         }
                     }
                     if let Some(c) = Self::small_imm(a) {
                         if let Some((r, k, c0)) = self.lea_shape(b) {
-                            return Some((r, k, c0 + c));
+                            if Self::disp_ok(c0 + c) {
+                                return Some((r, k, c0 + c));
+                            }
                         }
                     }
                 }
                 BinOp::Sub => {
                     if let Some(c) = Self::small_imm(b) {
                         if let Some((r, k, c0)) = self.lea_shape(a) {
-                            return Some((r, k, c0 - c));
+                            if Self::disp_ok(c0 - c) {
+                                return Some((r, k, c0 - c));
+                            }
                         }
                     }
                 }
@@ -1417,6 +1428,13 @@ impl Codegen {
             _ => unreachable!(),
         }
         Type::I64
+    }
+
+    /// True when `d` fits an x86-64 `lea` displacement (a signed 32-bit value).
+    /// Each constant in a folded chain is representable on its own, but their
+    /// sum need not be, and GNU `as` rejects the out-of-range instruction.
+    fn disp_ok(d: i64) -> bool {
+        (-2_147_483_648..=2_147_483_647).contains(&d)
     }
 
     /// The value of `e` when it is an integer literal, negated or not, that fits
@@ -1719,7 +1737,8 @@ impl Codegen {
             .all(|(s, a)| s.is_none() && self.arg_is_simple(a))
             || (args.len() <= 2
                 && arg_operand.iter().all(|s| s.is_none())
-                && !args.iter().any(Self::contains_call));
+                && !args.iter().any(Self::contains_call)
+                && !args.iter().any(Self::clobbers_arg_regs));
         if direct {
             for (a, r) in args.iter().zip(ARG_REGS.iter()) {
                 self.gen_expr_into_reg(a, r);
@@ -1806,6 +1825,49 @@ impl Codegen {
     fn block_has_call(b: &Block) -> bool {
         b.stmts.iter().any(Self::stmt_has_call)
             || b.tail.as_deref().map_or(false, Self::contains_call)
+    }
+
+    /// True when evaluating `e` can clobber `%rdi`/`%rsi` without
+    /// `contains_call` noticing. The only such case is copying a whole
+    /// aggregate into a local: the copy runs through `%rdi`/`%rsi`
+    /// (`copy_words_rdi_rsi`), and a block's `let` initialiser can trigger one
+    /// without containing a call, so the direct-argument shortcut must not
+    /// select it.
+    fn clobbers_arg_regs(e: &Expr) -> bool {
+        match e {
+            Expr::Block(b) => Self::block_clobbers(b),
+            Expr::If(_, t, els) => {
+                Self::block_clobbers(t)
+                    || els.as_ref().map_or(false, |b| Self::block_clobbers(b))
+            }
+            _ => false,
+        }
+    }
+
+    fn block_clobbers(b: &Block) -> bool {
+        b.stmts.iter().any(Self::stmt_clobbers)
+            || b.tail.as_deref().map_or(false, Self::clobbers_arg_regs)
+    }
+
+    fn stmt_clobbers(s: &Stmt) -> bool {
+        match s {
+            Stmt::Let { init: Some(e), .. } => Self::value_copies_aggregate(e),
+            Stmt::Assign { target, .. } => {
+                matches!(target, Expr::Var { ty, .. } if ty.is_aggregate())
+            }
+            _ => false,
+        }
+    }
+
+    /// True when `e` produces an aggregate by copying, which goes through
+    /// `%rdi`/`%rsi`. A literal is excluded because `contains_call` already
+    /// rejects it; a call result is excluded because it is a call.
+    fn value_copies_aggregate(e: &Expr) -> bool {
+        match e {
+            Expr::Var { ty, .. } | Expr::Field { ty, .. } => ty.is_aggregate(),
+            Expr::Block(_) | Expr::If(..) => Self::clobbers_arg_regs(e),
+            _ => false,
+        }
     }
 
     fn stmt_has_call(s: &Stmt) -> bool {

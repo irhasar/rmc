@@ -224,6 +224,8 @@ rmc is a small, self-contained compiler, not a drop-in replacement for rustc.
   analysis.
 - The backend targets x86-64 Linux only, using the System V ABI and raw Linux
   syscalls. There is no Windows, macOS, ARM, or WebAssembly support.
+- Array indexing is unchecked: an out-of-range index reads or writes adjacent
+  stack memory, exactly as in C. There are no bounds checks.
 - The heap is a simple first-fit free-list allocator; it does not return memory
   to the kernel and has no thread safety.
 - `rmc` is one person's project with a differential test suite and CI, not a
