@@ -96,6 +96,9 @@ Rust panic. Division by zero always traps at the CPU level.
   `if x & 1 == 0` is `(x & 1) == 0`. rmc has only `i64`, so a literal count is
   masked to 6 bits; in Rust an unconstrained literal count is `i32` and masks to
   5, which is why a program that mixes the two types can differ.
+- Nesting is bounded: an expression, block or type may nest at most 100 levels.
+  Deeper input is a compile error, not a crash. No hand-written program comes
+  close; the limit exists so that pathological input cannot overflow the stack.
 - Calls: `f(a, b)`.
 - Indexing: `arr[i]`.
 - Array literals: `[a, b, c]` and `[value; count]`.

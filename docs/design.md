@@ -12,6 +12,11 @@ driver shells out to GNU `as` and `ld`.
 2. **Parser** (`parser.rs`) — recursive descent producing the AST in `ast.rs`.
    Precedence climbing handles binary operators; `is_block_like` lets `if`,
    `while`, `loop` and bare blocks appear as statements without a trailing `;`.
+   Recursion is bounded: `bump_depth` counts one level per nested expression,
+   block, type, unary operator and postfix step, and refuses past `MAX_DEPTH`
+   (100). Without it, deeply nested or very long input overflows the native
+   stack and aborts — a crash on untrusted input. The bound is kept low enough
+   for a 2 MiB thread stack, which is what `cargo test` runs on.
 3. **Semantic analysis** (`sema.rs`) — checks types, resolves every variable to
    a stack slot, lays out structs, and records the frame size (`nslots`) per
    function. It rewrites `Expr::Var` with the resolved slot and type and

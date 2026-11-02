@@ -173,19 +173,75 @@ def gen_stmt_program(rng):
     return "\n".join(rms), "\n".join(rs)
 
 
+# -------------------------------------------------------------- robust mode
+
+def robust_corpus():
+    """Deterministic adversarial inputs. None of them is a valid program, but
+    each must produce a clean error (exit 0 or 1), never a panic or a signal.
+    A deep-nesting or long-chain input that overflows the native stack shows up
+    here as a SIGABRT, which is the crash a fuzzer is for."""
+    rng = random.Random(0)
+    cases = {
+        "random_bytes": bytes(rng.randrange(256) for _ in range(200)),
+        "valid_prefix_garbage": b"fn main() -> i64 { " + bytes(rng.randrange(256) for _ in range(200)),
+        "deep_paren": b"fn main() -> i64 { return " + b"(" * 5000 + b"1" + b")" * 5000 + b"; }",
+        "deep_block": b"fn main() -> i64 { " + b"{ " * 5000 + b"return 0; " + b"}" * 5000 + b" }",
+        "deep_type": b"fn main() -> i64 { let x: " + b"(" * 5000 + b"i64" + b")" * 5000 + b" = 0; return 0; }",
+        "deep_neg": b"fn main() -> i64 { return " + b"-" * 200000 + b"1; }",
+        "deep_not": b"fn main() -> i64 { let mut x: bool = true; x = " + b"!" * 200000 + b"true; return 0; }",
+        "long_add_chain": b"fn main() -> i64 { return " + b"1+" * 200000 + b"1; }",
+        "long_cmp_chain": b"fn main() -> i64 { return " + b"1==" * 100000 + b"1; }",
+        "long_field_chain": b"struct S { a: i64 } fn main() -> i64 { let s: S = S { a: 1 }; return s" + b".a" * 100000 + b"; }",
+        "nested_if_stmt": b"fn main() -> i64 { " + b"if true { " * 3000 + b"return 0; " + b"}" * 3000 + b" return 1; }",
+        "nested_while": b"fn main() -> i64 { " + b"while true { " * 3000 + b"break; " + b"}" * 3000 + b" return 0; }",
+        "nested_call": b"fn f(x: i64) -> i64 { return x; } fn main() -> i64 { return " + b"f(" * 3000 + b"1" + b")" * 3000 + b"; }",
+        "huge_int": b"fn main() -> i64 { return " + b"9" * 4000 + b"; }",
+        "unterminated_string": b'fn main() -> i64 { print_str("abc); return 0; }',
+        "null_bytes": b"fn main() -> i64 { return 0; }\x00\x00",
+        "truncated": b"fn ma",
+        "empty": b"",
+        "lone_keyword": b"struct",
+        "unbalanced_brace": b"fn main() -> i64 { return 0;",
+    }
+    return cases
+
+
+def run_robust():
+    tmp = "/tmp/rmc-fuzz"
+    os.makedirs(tmp, exist_ok=True)
+    failures = 0
+    for name, data in robust_corpus().items():
+        path = f"{tmp}/{name}.rms"
+        open(path, "wb").write(data)
+        p = run([RMC, path, "-o", f"{tmp}/o.bin"])
+        # A signal (negative return code) or a panic message is a crash.
+        crashed = p.returncode < 0 or b"panicked" in p.stderr or b"overflowed its stack" in p.stderr
+        if crashed:
+            print(f"[robust] {name}: CRASH (exit {p.returncode}) {p.stderr.decode(errors='replace')[:200]}")
+            failures += 1
+        elif p.returncode not in (0, 1):
+            print(f"[robust] {name}: unexpected exit {p.returncode}")
+            failures += 1
+    if failures == 0:
+        print(f"robust: all {len(robust_corpus())} adversarial inputs error cleanly")
+    return 1 if failures else 0
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "robust"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
     args = ap.parse_args()
 
-    if not rustc_available():
-        print("rustc not found; set RUSTC or install a toolchain", file=sys.stderr)
-        return 2
     if not os.path.exists(RMC):
         print(f"rmc not found at {RMC}; build with `cargo build --release`", file=sys.stderr)
+        return 2
+    if args.mode == "robust":
+        return run_robust()
+    if not rustc_available():
+        print("rustc not found; set RUSTC or install a toolchain", file=sys.stderr)
         return 2
 
     tmp = "/tmp/rmc-fuzz"

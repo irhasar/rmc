@@ -504,3 +504,30 @@ fn an_aggregate_argument_still_travels_by_pointer() {
     assert!(out.contains("lea "), "the slot address is materialised");
     assert!(out.contains("call f"));
 }
+
+#[test]
+fn deeply_nested_input_is_an_error_not_a_crash() {
+    // Thousands of nested parens used to recurse until the native stack
+    // overflowed and the process aborted. The parser now stops at a depth
+    // limit and reports it.
+    let src = format!("fn main() -> i64 {{ return {}1{}; }}", "(".repeat(4000), ")".repeat(4000));
+    let err = compile_to_asm(&src, &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("nests too deeply"), "got: {err}");
+}
+
+#[test]
+fn a_very_long_operator_chain_is_an_error_not_a_crash() {
+    // A left-deep chain `1+1+...+1` overflows the stack in sema/codegen unless
+    // the parser bounds how deep the tree it builds can be.
+    let src = format!("fn main() -> i64 {{ return {}1; }}", "1+".repeat(200_000));
+    let err = compile_to_asm(&src, &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("nests too deeply"), "got: {err}");
+}
+
+#[test]
+fn nesting_below_the_limit_still_compiles() {
+    // 30 parens (2 depth each) plus a 30-long `+` chain is ~90, under the 100
+    // limit, so this must still compile.
+    let src = format!("fn main() -> i64 {{ return {}1{} + {}; }}", "(".repeat(30), ")".repeat(30), "1+".repeat(30) + "1");
+    assert!(compile_to_asm(&src, &CompileOptions::default()).is_ok());
+}

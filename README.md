@@ -41,7 +41,7 @@ bench/
   rust/*.rs          the same programs written in real Rust
   run.py             benchmark harness (compile time, CPU, RAM, size, runtime)
 tools/
-  fuzz.py            differential fuzzer: random programs vs rustc
+  fuzz.py            differential fuzzer and robustness checker
 tests/
   run.py             differential test suite: rmc vs rustc on twin programs
   cases/*.rms, *.rs  paired programs that must behave identically
@@ -116,7 +116,15 @@ are reproducible, so a failure can be re-run and shrunk.
 ```sh
 python3 tools/fuzz.py --mode expr --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1
+python3 tools/fuzz.py --mode robust
 ```
+
+`robust` mode needs no rustc: it feeds a fixed corpus of malformed and
+adversarial inputs (random bytes, unbalanced braces, and thousands of nested
+parentheses, braces, unary operators or binary operators) and requires each to
+produce a clean error rather than a panic or a signal. This is what catches an
+unbounded parser recursion overflowing the stack on untrusted input. CI runs it
+together with a small fixed-seed differential fuzz.
 
 A caveat for `expr`: an integer literal in a shift amount is unconstrained, so
 rustc infers `i32` and masks the count to 5 bits, while rmc is `i64`-only and

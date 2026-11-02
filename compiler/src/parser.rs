@@ -13,7 +13,21 @@ pub struct Parser {
     /// Counter for the temporaries introduced when desugaring a compound
     /// assignment, so each one gets a distinct name.
     tmp: u32,
+    /// Current expression/type/block nesting depth, bounded by `MAX_DEPTH`.
+    depth: u32,
 }
+
+/// The deepest expression, block or type nesting the parser accepts. Deeply
+/// nested input (thousands of `(` or `{`) would otherwise recurse until the
+/// native stack overflows and the process aborts, which is a crash on
+/// untrusted input.
+///
+/// The value is bounded by the smallest stack the parser runs on: a spawned
+/// Rust thread has 2 MiB, and the expression grammar costs about 8 KiB of stack
+/// per level (each paren threads through all the precedence levels). 100 levels
+/// is roughly 800 KiB, which leaves room, and is far above any hand-written
+/// program.
+const MAX_DEPTH: u32 = 100;
 
 /// Expressions that are allowed as statements without a trailing `;`.
 fn is_block_like(e: &Expr) -> bool {
@@ -24,7 +38,20 @@ type PResult<T> = Result<T, String>;
 
 impl Parser {
     pub fn new(toks: Vec<Token>) -> Self {
-        Parser { toks, i: 0, no_struct_lit: false, tmp: 0 }
+        Parser { toks, i: 0, no_struct_lit: false, tmp: 0, depth: 0 }
+    }
+
+    /// Count one level of nesting and fail past `MAX_DEPTH`.
+    fn bump_depth(&mut self) -> PResult<()> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return Err(format!(
+                "at byte {}: input nests too deeply (limit {})",
+                self.pos(),
+                MAX_DEPTH
+            ));
+        }
+        Ok(())
     }
 
     fn peek(&self) -> Option<&Tok> {
@@ -143,6 +170,13 @@ impl Parser {
     }
 
     fn parse_type(&mut self) -> PResult<Type> {
+        self.bump_depth()?;
+        let r = self.parse_type_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_type_inner(&mut self) -> PResult<Type> {
         match self.peek() {
             Some(Tok::TyI64) => {
                 self.i += 1;
@@ -189,6 +223,13 @@ impl Parser {
     }
 
     fn parse_block(&mut self) -> PResult<Block> {
+        self.bump_depth()?;
+        let r = self.parse_block_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_block_inner(&mut self) -> PResult<Block> {
         self.expect(Tok::LBrace)?;
         let mut stmts = Vec::new();
         let mut tail: Option<Box<Expr>> = None;
@@ -423,7 +464,15 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> PResult<Expr> {
-        self.parse_or()
+        // `depth` is saved and restored rather than decremented, because the
+        // precedence loops below each add to it once per operator. A left-deep
+        // chain like `1+1+...+1` is only bounded if those additions accumulate
+        // over the whole expression, then reset when it is complete.
+        let saved = self.depth;
+        self.bump_depth()?;
+        let r = self.parse_or();
+        self.depth = saved;
+        r
     }
 
     /// Parse an expression in a context where a following `{` must start a
@@ -440,6 +489,7 @@ impl Parser {
         let mut lhs = self.parse_and()?;
         while self.eat(&Tok::PipePipe) {
             let rhs = self.parse_and()?;
+            self.bump_depth()?;
             lhs = Expr::Bin(BinOp::Or, Box::new(lhs), Box::new(rhs));
         }
         Ok(lhs)
@@ -449,6 +499,7 @@ impl Parser {
         let mut lhs = self.parse_cmp()?;
         while self.eat(&Tok::AmpAmp) {
             let rhs = self.parse_cmp()?;
+            self.bump_depth()?;
             lhs = Expr::Bin(BinOp::And, Box::new(lhs), Box::new(rhs));
         }
         Ok(lhs)
@@ -468,6 +519,7 @@ impl Parser {
             };
             self.i += 1;
             let rhs = self.parse_bitor()?;
+            self.bump_depth()?;
             lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs));
         }
         Ok(lhs)
@@ -479,6 +531,7 @@ impl Parser {
         let mut lhs = self.parse_bitxor()?;
         while self.eat(&Tok::Pipe) {
             let rhs = self.parse_bitxor()?;
+            self.bump_depth()?;
             lhs = Expr::Bin(BinOp::BitOr, Box::new(lhs), Box::new(rhs));
         }
         Ok(lhs)
@@ -488,6 +541,7 @@ impl Parser {
         let mut lhs = self.parse_bitand()?;
         while self.eat(&Tok::Caret) {
             let rhs = self.parse_bitand()?;
+            self.bump_depth()?;
             lhs = Expr::Bin(BinOp::BitXor, Box::new(lhs), Box::new(rhs));
         }
         Ok(lhs)
@@ -497,6 +551,7 @@ impl Parser {
         let mut lhs = self.parse_shift()?;
         while self.eat(&Tok::Amp) {
             let rhs = self.parse_shift()?;
+            self.bump_depth()?;
             lhs = Expr::Bin(BinOp::BitAnd, Box::new(lhs), Box::new(rhs));
         }
         Ok(lhs)
@@ -512,6 +567,7 @@ impl Parser {
             };
             self.i += 1;
             let rhs = self.parse_mul()?;
+            self.bump_depth()?;
             lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs));
         }
         Ok(lhs)
@@ -528,6 +584,7 @@ impl Parser {
             };
             self.i += 1;
             let rhs = self.parse_add()?;
+            self.bump_depth()?;
             lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs));
         }
         Ok(lhs)
@@ -544,6 +601,7 @@ impl Parser {
             };
             self.i += 1;
             let rhs = self.parse_unary()?;
+            self.bump_depth()?;
             lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs));
         }
         Ok(lhs)
@@ -553,11 +611,13 @@ impl Parser {
         match self.peek() {
             Some(Tok::Minus) => {
                 self.i += 1;
+                self.bump_depth()?;
                 let e = self.parse_unary()?;
                 Ok(Expr::Un(UnOp::Neg, Box::new(e)))
             }
             Some(Tok::Bang) => {
                 self.i += 1;
+                self.bump_depth()?;
                 let e = self.parse_unary()?;
                 Ok(Expr::Un(UnOp::Not, Box::new(e)))
             }
@@ -568,6 +628,7 @@ impl Parser {
     fn parse_postfix(&mut self) -> PResult<Expr> {
         let mut e = self.parse_primary()?;
         loop {
+            self.bump_depth()?;
             if self.eat(&Tok::LBracket) {
                 let idx = self.parse_expr()?;
                 self.expect(Tok::RBracket)?;
@@ -717,6 +778,13 @@ impl Parser {
     }
 
     fn parse_primary(&mut self) -> PResult<Expr> {
+        self.bump_depth()?;
+        let r = self.parse_primary_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_primary_inner(&mut self) -> PResult<Expr> {
         match self.peek().cloned() {
             Some(Tok::Int(v)) => {
                 self.i += 1;

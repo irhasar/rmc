@@ -211,6 +211,14 @@ literals, so large literals need an `i64` suffix on the Rust side. `args.json`
 maps a case name to a list of argv vectors. Verify a new case actually detects
 the bug it guards: revert the fix and confirm the case fails.
 
+The parser bounds nesting depth (`MAX_DEPTH` in `parser.rs`, currently 100). A
+recursive-descent parser with no bound overflows the native stack and aborts on
+deeply nested or very long input, which is a crash on untrusted input. The limit
+must stay low enough for a 2 MiB thread stack (each expression level threads
+through every precedence function, so it costs several KiB); `fuzz.py --mode
+robust` and the depth tests in `tests/compile.rs` guard it. If you add a new
+recursive construct, count a level with `bump_depth` on entry.
+
 `tools/fuzz.py` is the differential fuzzer. `expr` mode builds random integer
 expressions with calls and guarded division; `stmt` mode builds loops,
 conditionals, `match`, arrays and aggregate calls, and deliberately places
