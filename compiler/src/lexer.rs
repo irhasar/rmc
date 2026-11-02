@@ -49,8 +49,13 @@ pub enum Tok {
     Star,
     Slash,
     Percent,
+    Amp,
     AmpAmp,
+    Pipe,
     PipePipe,
+    Caret,
+    Shl,
+    Shr,
     Bang,
     Dot,
     DotDot,
@@ -59,6 +64,11 @@ pub enum Tok {
     StarEq,
     SlashEq,
     PercentEq,
+    AmpEq,
+    PipeEq,
+    CaretEq,
+    ShlEq,
+    ShrEq,
     Underscore,
 }
 
@@ -115,8 +125,13 @@ impl Tok {
             Tok::Star => "*",
             Tok::Slash => "/",
             Tok::Percent => "%",
+            Tok::Amp => "&",
             Tok::AmpAmp => "&&",
+            Tok::Pipe => "|",
             Tok::PipePipe => "||",
+            Tok::Caret => "^",
+            Tok::Shl => "<<",
+            Tok::Shr => ">>",
             Tok::Bang => "!",
             Tok::Dot => ".",
             Tok::DotDot => "..",
@@ -125,6 +140,11 @@ impl Tok {
             Tok::StarEq => "*=",
             Tok::SlashEq => "/=",
             Tok::PercentEq => "%=",
+            Tok::AmpEq => "&=",
+            Tok::PipeEq => "|=",
+            Tok::CaretEq => "^=",
+            Tok::ShlEq => "<<=",
+            Tok::ShrEq => ">>=",
             Tok::Underscore => "_",
             _ => "?",
         }
@@ -289,6 +309,21 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             out.push(Token { tok: Tok::Int(v), pos });
             continue;
         }
+        // three-char operators (must precede `<<`/`>>`)
+        let three = if i + 2 < bytes.len() {
+            match &bytes[i..i + 3] {
+                b"<<=" => Some(Tok::ShlEq),
+                b">>=" => Some(Tok::ShrEq),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(t) = three {
+            out.push(Token { tok: t, pos });
+            i += 3;
+            continue;
+        }
         // multi-char operators
         let two = if i + 1 < bytes.len() {
             match &bytes[i..i + 2] {
@@ -299,6 +334,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 b">=" => Some(Tok::Ge),
                 b"&&" => Some(Tok::AmpAmp),
                 b"||" => Some(Tok::PipePipe),
+                b"<<" => Some(Tok::Shl),
+                b">>" => Some(Tok::Shr),
+                b"&=" => Some(Tok::AmpEq),
+                b"|=" => Some(Tok::PipeEq),
+                b"^=" => Some(Tok::CaretEq),
                 b".." => Some(Tok::DotDot),
                 b"+=" => Some(Tok::PlusEq),
                 b"-=" => Some(Tok::MinusEq),
@@ -333,6 +373,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             b'*' => Tok::Star,
             b'/' => Tok::Slash,
             b'%' => Tok::Percent,
+            b'&' => Tok::Amp,
+            b'|' => Tok::Pipe,
+            b'^' => Tok::Caret,
             b'!' => Tok::Bang,
             b'.' => Tok::Dot,
             _ => return Err(format!("unexpected character `{}` at byte {}", c as char, i)),

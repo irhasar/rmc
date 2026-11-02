@@ -1474,8 +1474,9 @@ impl Codegen {
         let (imm, other) = match Self::small_imm(b) {
             Some(k) => (Some(k), a),
             // Commutative ops accept the constant on either side; subtraction
-            // does not, because `c - x` is not `x - c`.
-            None if matches!(op, Add | Mul) => match Self::small_imm(a) {
+            // and the shifts do not, because `c - x` is not `x - c` and
+            // `c << x` is not `x << c`.
+            None if matches!(op, Add | Mul | BitAnd | BitOr | BitXor) => match Self::small_imm(a) {
                 Some(k) => (Some(k), b),
                 None => (None, a),
             },
@@ -1496,6 +1497,13 @@ impl Codegen {
                     self.line(&format!("imul ${k}, %rax, %rax"));
                     self.check_overflow();
                 }
+                BitAnd => self.line(&format!("and ${k}, %rax")),
+                BitOr => self.line(&format!("or ${k}, %rax")),
+                BitXor => self.line(&format!("xor ${k}, %rax")),
+                // The shift count is masked to 6 bits by hardware, exactly as
+                // Rust's `<<`/`>>` on `i64`; `sal`/`sar` take the count directly.
+                Shl => self.line(&format!("sal ${}, %rax", k & 63)),
+                Shr => self.line(&format!("sar ${}, %rax", k & 63)),
                 _ => unreachable!(),
             }
             return Type::I64;
@@ -1515,6 +1523,13 @@ impl Codegen {
                 self.line("imul %rcx, %rax");
                 self.check_overflow();
             }
+            BitAnd => self.line("and %rcx, %rax"),
+            BitOr => self.line("or %rcx, %rax"),
+            BitXor => self.line("xor %rcx, %rax"),
+            // The variable shift count must be in `%cl`; `eval_operands`
+            // already leaves the right operand in `%rcx`.
+            Shl => self.line("sal %cl, %rax"),
+            Shr => self.line("sar %cl, %rax"),
             _ => unreachable!(),
         }
         Type::I64

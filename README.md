@@ -131,7 +131,8 @@ Supported: `i64`, `bool`, fixed-size arrays, and structs with named fields;
 functions with up to six parameters; `let` / `let mut`; assignment to variables,
 array elements and struct fields (including compound `+=` and friends);
 `if`/`else`, `while`, `loop`, and `for i in a..b`; `break`, `continue`,
-`return`; arithmetic and comparison operators; `&&`/`||`; string literals;
+`return`; arithmetic, comparison, bitwise (`&`/`|`/`^`) and shift (`<<`/`>>`)
+operators; `&&`/`||`; string literals;
 attributes such as `#[derive(Copy, Clone)]` (parsed and ignored); and a small
 set of runtime builtins. Structs and arrays may be passed to and returned from
 functions by value. Overflow checks are opt-in with `--overflow-checks`, and
@@ -144,7 +145,7 @@ Runtime builtins (provided by `src/runtime.rs`, no imports needed):
 | --------------- | -------------------- | -------------------------------------- |
 | `print_i64(x)`  | `(i64) -> ()`        | print an integer followed by `\n`      |
 | `print_str(s)`  | `(i64) -> ()`        | print a string literal                 |
-| `print_bool(b)` | `(bool) -> ()`       | print `true` or `false`                |
+| `print_bool(b)` | `(bool) -> ()`       | print `1` or `0`                       |
 | `putchar(c)`    | `(i64) -> ()`        | write a single byte                    |
 | `alloc(n)`      | `(i64) -> i64`       | allocate `n` bytes (first-fit free list) |
 | `free(p)`       | `(i64) -> ()`        | return a block from `alloc` to the heap |

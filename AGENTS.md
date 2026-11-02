@@ -38,6 +38,10 @@ python3 tests/run.py -v
 - `compiler/src/parser.rs` — recursive descent; `is_block_like` allows
   `if`/blocks as statements without a trailing `;`. `parse_cond` sets
   `no_struct_lit` so a `{` after a condition starts the body, not a struct.
+  Precedence, loosest to tightest: `||`, `&&`, comparison, `|`, `^`, `&`,
+  `<< >>`, `+ -`, `* / %`. Note shifts bind *looser* than `+`/`-`, matching
+  Rust: `parse_shift` consumes `parse_add`, and `parse_bitand` consumes
+  `parse_shift`. Swapping these silently mis-parses `1 + 2 << 3`.
 - `compiler/src/ast.rs` — AST and `Type` (`I64`, `Bool`, `Unit`, `Array`,
   `Struct`, and the parser-only placeholder `Named`).
 - `compiler/src/sema.rs` — type checking, struct layout, stack-slot allocation,

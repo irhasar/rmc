@@ -453,6 +453,12 @@ impl Sema {
                         }
                         Ok(Type::Bool)
                     }
+                    BitAnd | BitOr | BitXor | Shl | Shr => {
+                        if ta != Type::I64 || tb != Type::I64 {
+                            return Err(format!("bitwise operator expects `i64` operands, found {ta:?} and {tb:?}"));
+                        }
+                        Ok(Type::I64)
+                    }
                 }
             }
             Expr::Call { name, args, arg_slots, ret_slot, ret_ty } => {

@@ -1,0 +1,50 @@
+// Bitwise `& | ^` and shifts `<< >>`, with Rust's precedence: shifts bind
+// looser than `+`/`-` and tighter than `&`, which is tighter than `^`, which is
+// tighter than `|`. A shift count is taken modulo 64 (hardware masking), and
+// `>>` is arithmetic, so a negative value stays negative.
+fn main() -> i64 {
+    print_i64(0b1100 & 0b1010);
+    print_i64(0b1100 | 0b1010);
+    print_i64(0b1100 ^ 0b1010);
+    print_i64(1 << 4);
+    print_i64(3 << 10);
+    print_i64(-16 >> 2);
+    print_i64(16 >> 2);
+
+    // Variable shift counts.
+    let s: i64 = 3;
+    let x: i64 = 5;
+    print_i64(x << s);
+    print_i64(x >> s);
+
+    // Precedence: `+` before `<<`, `&` before `^` before `|`.
+    print_i64(1 + 2 << 3);
+    print_i64(1 & 3 | 4);
+    print_i64(1 ^ 2 & 3);
+    print_i64(1 << 2 + 1);
+
+    // Compound assignment forms.
+    let mut m: i64 = 0b1100;
+    m &= 0b1010;
+    print_i64(m);
+    m |= 0b0001;
+    print_i64(m);
+    m ^= 0b1111;
+    print_i64(m);
+    m <<= 2;
+    print_i64(m);
+    m >>= 1;
+    print_i64(m);
+
+    // A mask in a condition needs no parentheses in Rust either.
+    let mut i: i64 = 0;
+    let mut even: i64 = 0;
+    while i < 16 {
+        if i & 1 == 0 {
+            even = even + i;
+        }
+        i = i + 1;
+    }
+    print_i64(even);
+    return 0;
+}

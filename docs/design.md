@@ -69,6 +69,11 @@ a `return`, or a tail expression).
   multiply plus a shift instead of `idiv`. See below.
 - Comparison folding: `a < b` emits a single `cmp` plus `setcc` when one side is
   a register-free operand, so no stack traffic is needed at all.
+- Bitwise and shift: `&`, `|`, `^` and `<<`, `>>` fold a small constant operand
+  into the instruction (`and $k, %rax`). A shift count is masked to 6 bits
+  before folding, matching the hardware and Rust. With a variable count the
+  count must be in `%cl`, which `eval_operands` already arranges, so the shift
+  is a single `sal %cl`/`sar %cl` with no extra move.
 - Array access: for a local array, `a[i]` with a variable index is addressed as
   `disp(%rbp,%rax,8)` in one operand (the index is loaded into `%rax` first), and
   `a[3]` with a constant index needs no register. Stores use the same operand.

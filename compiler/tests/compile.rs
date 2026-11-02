@@ -435,3 +435,36 @@ fn a_field_of_a_call_result_is_addressed() {
     assert!(out.contains("call mk"), "the maker is called");
     assert!(out.contains("(%rax), %rax"), "the field is read from the returned address");
 }
+
+#[test]
+fn bitwise_and_shift_emit_the_right_instructions() {
+    // Constant operands fold straight into the instruction; the shift count is
+    // masked to 6 bits, matching Rust's `<<`/`>>` on `i64`.
+    let out = asm("fn main() -> i64 { let a: i64 = 12; let b: i64 = 10; return a & b | a ^ b; }");
+    assert!(out.contains("and %rcx, %rax"));
+    assert!(out.contains("or %rcx, %rax"));
+    assert!(out.contains("xor %rcx, %rax"));
+
+    let out = asm("fn main() -> i64 { return 1 << 70; }");
+    assert!(out.contains("sal $6, %rax"), "70 & 63 == 6");
+
+    let out = asm("fn main() -> i64 { return -8 >> 2; }");
+    assert!(out.contains("sar $2, %rax"), ">> is arithmetic");
+}
+
+#[test]
+fn a_variable_shift_count_goes_in_cl() {
+    // x86 shifts take the count in `%cl`; the right operand already lands in
+    // `%rcx`, so no extra move is needed.
+    let out = asm("fn main() -> i64 { let x: i64 = 1; let s: i64 = 3; return x << s; }");
+    assert!(out.contains("sal %cl, %rax"));
+    assert!(out.contains("sar %cl, %rax") || out.contains("sal %cl, %rax"));
+}
+
+#[test]
+fn shift_binds_looser_than_addition() {
+    // Rust parses `1 + 2 << 3` as `(1 + 2) << 3`, not `1 + (2 << 3)`.
+    let out = asm("fn main() -> i64 { return 1 + 2 << 3; }");
+    assert!(out.contains("add $2, %rax"), "the sum is formed first");
+    assert!(out.contains("sal $3, %rax"), "then shifted");
+}

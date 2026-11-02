@@ -89,6 +89,11 @@ Rust panic. Division by zero always traps at the CPU level.
 - Arithmetic: `+ - * / %` on `i64`.
 - Comparison: `== != < <= > >=`, producing `bool`.
 - Boolean: `&& || !`, short-circuiting.
+- Bitwise: `& | ^` on `i64`, plus `<<` and `>>`. `>>` is arithmetic (a negative
+  value stays negative) and a shift count is taken modulo 64, matching Rust.
+  Precedence, tightest first: `* / %`, `+ -`, `<< >>`, `&`, `^`, `|`, then the
+  comparisons and `&& ||`. So `1 + 2 << 3` is `(1 + 2) << 3`, and
+  `if x & 1 == 0` is `(x & 1) == 0`.
 - Calls: `f(a, b)`.
 - Indexing: `arr[i]`.
 - Array literals: `[a, b, c]` and `[value; count]`.

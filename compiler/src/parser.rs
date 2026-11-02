@@ -412,6 +412,11 @@ impl Parser {
             Some(Tok::StarEq) => Some(BinOp::Mul),
             Some(Tok::SlashEq) => Some(BinOp::Div),
             Some(Tok::PercentEq) => Some(BinOp::Mod),
+            Some(Tok::AmpEq) => Some(BinOp::BitAnd),
+            Some(Tok::PipeEq) => Some(BinOp::BitOr),
+            Some(Tok::CaretEq) => Some(BinOp::BitXor),
+            Some(Tok::ShlEq) => Some(BinOp::Shl),
+            Some(Tok::ShrEq) => Some(BinOp::Shr),
             _ => None,
         }
     }
@@ -449,7 +454,7 @@ impl Parser {
     }
 
     fn parse_cmp(&mut self) -> PResult<Expr> {
-        let mut lhs = self.parse_add()?;
+        let mut lhs = self.parse_bitor()?;
         loop {
             let op = match self.peek() {
                 Some(Tok::EqEq) => BinOp::Eq,
@@ -461,8 +466,37 @@ impl Parser {
                 _ => break,
             };
             self.i += 1;
-            let rhs = self.parse_add()?;
+            let rhs = self.parse_bitor()?;
             lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    /// `|`, then `^`, then `&`, matching Rust's precedence. Each is left
+    /// associative and sits between comparison and `+`/`-`.
+    fn parse_bitor(&mut self) -> PResult<Expr> {
+        let mut lhs = self.parse_bitxor()?;
+        while self.eat(&Tok::Pipe) {
+            let rhs = self.parse_bitxor()?;
+            lhs = Expr::Bin(BinOp::BitOr, Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_bitxor(&mut self) -> PResult<Expr> {
+        let mut lhs = self.parse_bitand()?;
+        while self.eat(&Tok::Caret) {
+            let rhs = self.parse_bitand()?;
+            lhs = Expr::Bin(BinOp::BitXor, Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_bitand(&mut self) -> PResult<Expr> {
+        let mut lhs = self.parse_shift()?;
+        while self.eat(&Tok::Amp) {
+            let rhs = self.parse_shift()?;
+            lhs = Expr::Bin(BinOp::BitAnd, Box::new(lhs), Box::new(rhs));
         }
         Ok(lhs)
     }
@@ -477,6 +511,22 @@ impl Parser {
             };
             self.i += 1;
             let rhs = self.parse_mul()?;
+            lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    /// `<<` and `>>`, which bind looser than `+`/`-` and tighter than `&`.
+    fn parse_shift(&mut self) -> PResult<Expr> {
+        let mut lhs = self.parse_add()?;
+        loop {
+            let op = match self.peek() {
+                Some(Tok::Shl) => BinOp::Shl,
+                Some(Tok::Shr) => BinOp::Shr,
+                _ => break,
+            };
+            self.i += 1;
+            let rhs = self.parse_add()?;
             lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs));
         }
         Ok(lhs)
