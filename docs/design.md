@@ -96,6 +96,13 @@ a `return`, or a tail expression).
 - Array access: for a local array, `a[i]` with a variable index is addressed as
   `disp(%rbp,%rax,8)` in one operand (the index is loaded into `%rax` first), and
   `a[3]` with a constant index needs no register. Stores use the same operand.
+- In-place accumulation: `x = x + a + b - c ...`, where `x` is promoted to a
+  register, no term reads `x`'s own register, and every term is already a single
+  operand (an immediate, a local, or an array element), folds into one
+  `add`/`sub` per term on that register instead of a tree that bounces each
+  partial result through `%rax` and the spill slots. A term that reads the
+  accumulator on the right (`x = x + x`) or that needs evaluating (a call, a
+  nested expression) falls back to the tree.
 - Deep or nested operands fall back to spilling the left result while the right
   is evaluated, then reloading it into `%rax`. The first few spills go to
   callee-saved registers (`%r12`–`%r14`), so a value held across a call costs a

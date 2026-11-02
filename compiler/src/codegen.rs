@@ -1701,6 +1701,9 @@ impl Codegen {
                     return;
                 }
             }
+            if self.gen_accumulate(e, dst) {
+                return;
+            }
         }
         if let Some(op) = self.simple_operand(e) {
             if op != dst {
@@ -1711,6 +1714,114 @@ impl Codegen {
         self.gen_expr(e);
         if dst != "%rax" {
             self.line(&format!("mov %rax, {dst}"));
+        }
+    }
+
+    /// Fold `dst = dst + a + b - c + ...` into one `add`/`sub` per term, when
+    /// `dst` already holds the chain's leftmost operand (its own previous
+    /// value) and every term is already a single operand (an immediate, a
+    /// register, or a memory reference). This replaces the generic expression
+    /// tree, which bounces every partial result through `%rax` and the spill
+    /// slots, with a flat run of `add`s and `sub`s on the accumulator's own
+    /// register — the shape of a running sum over locals and array elements.
+    ///
+    /// Returns false when `e` is not such a chain, when a term needs
+    /// evaluating (a call, a nested expression), or when a term reads the
+    /// accumulator register itself: `dst` is updated in place, so a term that
+    /// read the *original* value would see the running result instead. Each
+    /// case falls back to the tree, which keeps `dst` untouched until the end.
+    fn gen_accumulate(&mut self, e: &Expr, dst: &str) -> bool {
+        let mut terms: Vec<(bool, &Expr)> = Vec::new(); // (is_sub, operand)
+        let mut cur = e;
+        loop {
+            match cur {
+                Expr::Bin(BinOp::Add, a, b) => {
+                    terms.push((false, b));
+                    cur = a;
+                }
+                Expr::Bin(BinOp::Sub, a, b) => {
+                    terms.push((true, b));
+                    cur = a;
+                }
+                _ => break,
+            }
+        }
+        if terms.is_empty() || self.reg_operand(cur).as_deref() != Some(dst) {
+            return false;
+        }
+        if terms.iter().any(|(_, x)| self.uses_reg(x, dst)) {
+            return false;
+        }
+        // Resolve every term to a single operand before emitting anything, so a
+        // term that needs evaluating bails out without a half-written chain.
+        let mut ops: Vec<(bool, String)> = Vec::new();
+        for (is_sub, other) in terms.iter().rev() {
+            match self.simple_operand(other) {
+                Some(op) => ops.push((*is_sub, op)),
+                None => return false,
+            }
+        }
+        for (is_sub, op) in ops {
+            let mnemonic = if is_sub { "sub" } else { "add" };
+            self.line(&format!("{mnemonic} {op}, {dst}"));
+        }
+        true
+    }
+
+    /// True when evaluating `e` reads register `r`, the storage of a promoted
+    /// local. Only a `Var` or `Field` whose slot is promoted to `r` reads it
+    /// directly; every other node is checked by recursing into its operands.
+    fn uses_reg(&self, e: &Expr, r: &str) -> bool {
+        if self.reg_operand(e).as_deref() == Some(r) {
+            return true;
+        }
+        match e {
+            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::EnumVariant { .. } => false,
+            Expr::Var { .. } => false,
+            Expr::Field { base, .. } => self.uses_reg(base, r),
+            Expr::Bin(_, a, b) => self.uses_reg(a, r) || self.uses_reg(b, r),
+            Expr::Un(_, a) | Expr::Cast(a, _) => self.uses_reg(a, r),
+            Expr::Index(a, b) => self.uses_reg(a, r) || self.uses_reg(b, r),
+            Expr::Call { args, .. } => args.iter().any(|a| self.uses_reg(a, r)),
+            Expr::AddrOf { expr, .. } | Expr::Deref { expr, .. } => self.uses_reg(expr, r),
+            Expr::StructLit { fields, .. } => fields.iter().any(|f| self.uses_reg(&f.value, r)),
+            Expr::ArrayLit(v, _) => self.uses_reg(v, r),
+            Expr::EnumCtor { args, .. } => args.iter().any(|a| self.uses_reg(a, r)),
+            Expr::VariantTest { scrutinee, .. } => self.uses_reg(scrutinee, r),
+            Expr::EnumPayload { recv, .. } => self.uses_reg(recv, r),
+            Expr::If(c, t, els) => {
+                self.uses_reg(c, r)
+                    || self.block_uses_reg(t, r)
+                    || els.as_ref().map_or(false, |b| self.block_uses_reg(b, r))
+            }
+            Expr::Block(b) => self.block_uses_reg(b, r),
+            Expr::ArrayList(_) | Expr::MethodCall { .. } => {
+                unreachable!("sema rewrites ArrayList and MethodCall")
+            }
+        }
+    }
+
+    fn block_uses_reg(&self, b: &Block, r: &str) -> bool {
+        b.stmts.iter().any(|s| self.stmt_uses_reg(s, r))
+            || b.tail.as_deref().map_or(false, |e| self.uses_reg(e, r))
+    }
+
+    fn stmt_uses_reg(&self, s: &Stmt, r: &str) -> bool {
+        match s {
+            Stmt::Let { init, .. } => init.as_ref().map_or(false, |e| self.uses_reg(e, r)),
+            Stmt::Assign { target, value } => {
+                self.uses_reg(target, r) || self.uses_reg(value, r)
+            }
+            Stmt::Expr(e) => self.uses_reg(e, r),
+            Stmt::While(c, b) => self.uses_reg(c, r) || self.block_uses_reg(b, r),
+            Stmt::Loop(b) => self.block_uses_reg(b, r),
+            Stmt::For { start, end, body, .. } => {
+                self.uses_reg(start, r)
+                    || self.uses_reg(end, r)
+                    || self.block_uses_reg(body, r)
+            }
+            Stmt::Return(v) => v.as_ref().map_or(false, |e| self.uses_reg(e, r)),
+            Stmt::Break | Stmt::Continue => false,
         }
     }
 

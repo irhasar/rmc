@@ -946,3 +946,41 @@ fn a_register_to_self_move_is_dropped() {
     assert!(!out.contains("mov %rax, %rax"), "self move in:\n{out}");
     assert!(!out.contains("mov %rbx, %rbx"), "self move in:\n{out}");
 }
+
+#[test]
+fn accumulation_folds_into_in_place_adds() {
+    // `acc = acc + i + 2` should add straight into `acc`'s register, not build
+    // the sum in `%rax` and store it back.
+    let out = asm(
+        "fn main() -> i64 { let mut acc: i64 = 0; let mut i: i64 = 0; \
+         while i < 10 { acc = acc + i + 2; i = i + 1; } return acc; }",
+    );
+    let body = &out[out.find("main:").unwrap()..];
+    let body = &body[..body.find(".size main").unwrap()];
+    assert!(
+        body.contains("add %rbx, %r12") && body.contains("add $2, %r12"),
+        "in-place accumulation expected in:\n{body}"
+    );
+}
+
+#[test]
+fn accumulation_does_not_reuse_a_clobbered_accumulator() {
+    // `x = x + x` reads the accumulator on the right; folding it in place would
+    // double the running sum instead of the original value, so the tree form
+    // must be used and the result must still be correct.
+    let out = asm(
+        "fn main() -> i64 { let mut x: i64 = 3; let mut i: i64 = 0; \
+         while i < 4 { x = x + x; i = i + 1; } return x; }",
+    );
+    assert!(out.contains("main:"), "compiles");
+    // The fold is only safe when the addends do not read `x`'s register; here
+    // they do, so no single `add <x-reg>, <x-reg>` may appear.
+    let body = &out[out.find("main:").unwrap()..];
+    let body = &body[..body.find(".size main").unwrap()];
+    for reg in ["%rbx", "%r12", "%r13", "%r14", "%r15"] {
+        assert!(
+            !body.contains(&format!("add {reg}, {reg}")),
+            "self-add of the accumulator in:\n{body}"
+        );
+    }
+}

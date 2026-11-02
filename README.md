@@ -197,20 +197,20 @@ Representative run on the development machine (Debian 13, gcc 14.2, rustc
 
 | program | compiler | compile wall | compile CPU | peak RSS | artifact | run time |
 | ------- | -------- | -----------: | ----------: | -------: | -------: | -------: |
-| hello   | rmc      |     7.49 ms  |    7.21 ms  |  11.7 MB |   6656 B |  1.59 ms |
-| hello   | rustc    |  2121.23 ms  | 2122.65 ms  | 181.3 MB | 289416 B |  2.21 ms |
-| fib     | rmc      |     7.06 ms  |    6.83 ms  |  11.7 MB |   6760 B | 15.91 ms |
-| fib     | rustc    |  2179.62 ms  | 2183.44 ms  | 181.6 MB | 291696 B |  8.63 ms |
-| mandel  | rmc      |     7.81 ms  |    7.50 ms  |  11.7 MB |   7032 B |103.28 ms |
-| mandel  | rustc    |  2210.14 ms  | 2214.71 ms  | 185.0 MB | 291776 B |107.06 ms |
-| sieve   | rmc      |     9.45 ms  |    9.17 ms  |  11.7 MB |   6800 B |  3.03 ms |
-| sieve   | rustc    |  2137.98 ms  | 2134.03 ms  | 182.6 MB | 292016 B |  3.96 ms |
-| mix     | rmc      |     8.19 ms  |    7.90 ms  |  11.7 MB |   6816 B | 18.45 ms |
-| mix     | rustc    |  2193.04 ms  | 2197.51 ms  | 182.4 MB | 291864 B | 17.15 ms |
-| stats   | rmc      |     7.40 ms  |    7.17 ms  |  11.7 MB |   6904 B |  5.21 ms |
-| stats   | rustc    |  2117.05 ms  | 2121.32 ms  | 181.6 MB | 292048 B |  5.13 ms |
-| refs    | rmc      |     7.56 ms  |    7.13 ms  |  11.7 MB |   7144 B | 50.48 ms |
-| refs    | rustc    |  2154.68 ms  | 2158.94 ms  | 183.2 MB | 292144 B |  2.30 ms |
+| hello   | rmc      |     7.07 ms  |    6.82 ms  |  11.4 MB |   6656 B |  1.55 ms |
+| hello   | rustc    |  2046.09 ms  | 2048.77 ms  | 183.4 MB | 289416 B |  2.14 ms |
+| fib     | rmc      |     7.11 ms  |    6.86 ms  |  11.4 MB |   6760 B | 15.53 ms |
+| fib     | rustc    |  2087.01 ms  | 2091.01 ms  | 182.5 MB | 291696 B |  8.52 ms |
+| mandel  | rmc      |     7.99 ms  |    7.43 ms  |  11.4 MB |   7032 B |103.78 ms |
+| mandel  | rustc    |  2147.49 ms  | 2149.51 ms  | 185.9 MB | 291776 B |107.17 ms |
+| sieve   | rmc      |     9.26 ms  |    9.00 ms  |  11.4 MB |   6792 B |  2.96 ms |
+| sieve   | rustc    |  2130.07 ms  | 2134.73 ms  | 181.5 MB | 292016 B |  3.91 ms |
+| mix     | rmc      |     7.37 ms  |    7.12 ms  |  11.4 MB |   6816 B | 18.51 ms |
+| mix     | rustc    |  2127.67 ms  | 2131.74 ms  | 181.9 MB | 291864 B | 16.92 ms |
+| stats   | rmc      |     7.17 ms  |    6.90 ms  |  11.4 MB |   6904 B |  5.21 ms |
+| stats   | rustc    |  2138.75 ms  | 2143.05 ms  | 182.6 MB | 292048 B |  5.12 ms |
+| refs    | rmc      |     7.20 ms  |    6.94 ms  |  11.4 MB |   7144 B | 50.39 ms |
+| refs    | rustc    |  2124.51 ms  | 2128.73 ms  | 182.6 MB | 292144 B |  2.26 ms |
 
 Summary of the ratios (rustc ÷ rmc):
 
@@ -256,7 +256,8 @@ rmc is a small, self-contained compiler, not a drop-in replacement for rustc.
   registers; everything else is in memory. Temporaries are spilled to frame slots, not the machine stack, so
   `%rsp` never moves and a call needs no alignment pad. The optimiser is a
   peephole pass (constant operands, folded comparisons, folded array addressing,
-  `lea` strength reduction of `k*x+c`, division by a constant); there is no
+  `lea` strength reduction of `k*x+c`, division by a constant, in-place
+  accumulation of a running sum); there is no
   instruction scheduling, inlining, or loop transformation, and no live-range
   analysis.
 - The backend targets x86-64 Linux only, using the System V ABI and raw Linux
