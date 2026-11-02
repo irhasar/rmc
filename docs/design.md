@@ -31,7 +31,12 @@ driver shells out to GNU `as` and `ld`.
    a leading `self` parameter, which sema inserts before it builds signatures.
    An enum name resolves to `Type::Enum` through `resolve_ty`, which every type
    site (parameters, returns, `let`, struct fields, arrays) goes through, so an
-   enum may be used wherever a scalar is.
+   enum may be used wherever a scalar is. An enum with a payload resolves to
+   `Type::EnumData(name, size)`, an aggregate, so codegen reuses its struct
+   machinery: a constructor is materialised into a frame buffer and yields that
+   address, and a `match` binds a payload by reading a word out of that buffer.
+   Struct and enum layouts are computed together (`resolve_layouts`), because a
+   struct may have an enum field and an enum variant may have a struct payload.
 4. **Code generation** (`codegen.rs`) — emits AT&T-syntax x86-64 assembly. Every
    expression leaves its result in `%rax`; the result type is returned to the
    caller so callers know how to use it.

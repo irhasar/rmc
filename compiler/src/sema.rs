@@ -28,10 +28,33 @@ pub struct StructInfo {
     pub size: usize,
 }
 
+/// An enum's variants and its representation. A unit enum has `size == 8` and
+/// holds only a tag; a payload enum is a tagged union of `size` bytes, laid out
+/// as `{ i64 tag, <payload> }` where the payload starts at offset 8 and is as
+/// wide as the widest variant.
+#[derive(Clone)]
+pub struct EnumInfo {
+    /// Per variant: its name, its fields as `(type, offset within the payload)`,
+    /// and the payload width that variant uses.
+    pub variants: Vec<(String, Vec<(Type, usize)>, usize)>,
+    pub size: usize,
+    pub has_payload: bool,
+}
+
+impl EnumInfo {
+    fn tag_of(&self, variant: &str) -> Option<i64> {
+        self.variants.iter().position(|(n, _, _)| n == variant).map(|i| i as i64)
+    }
+
+    fn variant(&self, name: &str) -> Option<&(String, Vec<(Type, usize)>, usize)> {
+        self.variants.iter().find(|(n, _, _)| n == name)
+    }
+}
+
 pub struct Sema {
     sigs: HashMap<String, Sig>,
     structs: HashMap<String, StructInfo>,
-    enums: HashMap<String, Vec<String>>,
+    enums: HashMap<String, EnumInfo>,
     next_slot: i32,
     loop_depth: u32,
     ret_ty: Type,
@@ -40,8 +63,7 @@ pub struct Sema {
 type Scope = Vec<(String, i32, Type)>;
 
 pub fn analyze(prog: &mut Program) -> Result<(), String> {
-    let enums = resolve_enums(prog)?;
-    let structs = resolve_structs(&prog.structs, &enums)?;
+    let (structs, enums) = resolve_layouts(&prog.structs, &prog.enums)?;
 
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     // Runtime helpers provided by the freestanding assembly runtime. They are
@@ -78,9 +100,9 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
             return Err(format!("function `{}` is defined more than once", f.name));
         }
         let params: Result<Vec<Type>, String> =
-            f.params.iter().map(|(_, t)| resolve_ty_with(t, &structs, &enums)).collect();
+            f.params.iter().map(|(_, t)| resolve_in(t, &structs, &enums)).collect();
         let params = params?;
-        let ret = resolve_ty_with(&f.ret, &structs, &enums)?;
+        let ret = resolve_in(&f.ret, &structs, &enums)?;
         // Aggregate parameters and returns are passed by pointer, so any type
         // is allowed here; the calling convention handles the rest.
         sigs.insert(f.name.clone(), Sig { params, ret, takes_self: f.takes_self });
@@ -100,38 +122,147 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
     Ok(())
 }
 
-/// Collect the enums and check each has unique variant names. A variant is
-/// identified by its index, which is its `i64` tag.
-fn resolve_enums(prog: &Program) -> Result<HashMap<String, Vec<String>>, String> {
-    let mut out: HashMap<String, Vec<String>> = HashMap::new();
-    for e in &prog.enums {
-        if out.contains_key(&e.name) {
-            return Err(format!("enum `{}` is defined more than once", e.name));
-        }
-        if prog.structs.iter().any(|s| s.name == e.name) {
+/// Resolve the layouts of every struct and enum together, since they may refer
+/// to each other: a struct may have an enum field and an enum variant may have a
+/// struct payload. Returns both tables.
+fn resolve_layouts(
+    structs: &[StructDef],
+    enums: &[EnumDef],
+) -> Result<(HashMap<String, StructInfo>, HashMap<String, EnumInfo>), String> {
+    let raw_s: HashMap<&str, &StructDef> = structs.iter().map(|d| (d.name.as_str(), d)).collect();
+    if raw_s.len() != structs.len() {
+        return Err("a struct is defined more than once".into());
+    }
+    let raw_e: HashMap<&str, &EnumDef> = enums.iter().map(|d| (d.name.as_str(), d)).collect();
+    if raw_e.len() != enums.len() {
+        return Err("an enum is defined more than once".into());
+    }
+    for e in enums {
+        if raw_s.contains_key(e.name.as_str()) {
             return Err(format!("`{}` is both a struct and an enum", e.name));
         }
         for (i, v) in e.variants.iter().enumerate() {
-            if e.variants[..i].contains(v) {
-                return Err(format!("enum `{}`: duplicate variant `{v}`", e.name));
+            if e.variants[..i].iter().any(|w| w.name == v.name) {
+                return Err(format!("enum `{}`: duplicate variant `{}`", e.name, v.name));
             }
         }
-        out.insert(e.name.clone(), e.variants.clone());
     }
-    Ok(out)
+    let mut so: HashMap<String, StructInfo> = HashMap::new();
+    let mut eo: HashMap<String, EnumInfo> = HashMap::new();
+    for d in structs {
+        layout_struct(&d.name, &raw_s, &raw_e, &mut so, &mut eo, &mut Vec::new())?;
+    }
+    for d in enums {
+        layout_enum(&d.name, &raw_s, &raw_e, &mut so, &mut eo, &mut Vec::new())?;
+    }
+    Ok((so, eo))
 }
 
-/// Map every `Type::Named` in `t` to a concrete type and reject arrays of
-/// aggregates. Struct layouts are already known, so `Struct(name, size)` comes
-/// out fully resolved.
-fn resolve_type(t: &Type, structs: &HashMap<String, StructInfo>) -> Result<Type, String> {
+/// Lay out a struct: field `k` at the sum of the sizes of fields `0..k`, no
+/// padding. A struct may refer to a struct or enum declared later, but not to
+/// itself, directly or indirectly.
+fn layout_struct(
+    name: &str,
+    raw_s: &HashMap<&str, &StructDef>,
+    raw_e: &HashMap<&str, &EnumDef>,
+    so: &mut HashMap<String, StructInfo>,
+    eo: &mut HashMap<String, EnumInfo>,
+    visiting: &mut Vec<String>,
+) -> Result<(), String> {
+    if so.contains_key(name) {
+        return Ok(());
+    }
+    if visiting.iter().any(|n| n == name) {
+        return Err(format!("`{name}` contains itself"));
+    }
+    let def = raw_s.get(name).ok_or_else(|| format!("unknown type `{name}`"))?;
+    visiting.push(name.to_string());
+    let mut fields: Vec<(String, Type, usize)> = Vec::new();
+    let mut size = 0usize;
+    for (fname, fty) in &def.fields {
+        let rty = resolve_ty_rec(fty, raw_s, raw_e, so, eo, visiting)?;
+        if fields.iter().any(|(n, _, _)| n == fname) {
+            return Err(format!("struct `{name}`: duplicate field `{fname}`"));
+        }
+        let off = size;
+        size += rty.size();
+        fields.push((fname.clone(), rty, off));
+    }
+    visiting.pop();
+    so.insert(name.to_string(), StructInfo { fields, size });
+    Ok(())
+}
+
+/// Lay out an enum. A payload enum is `{ i64 tag, <widest variant payload> }`:
+/// the payload starts at 8 and the enum is `8 + max_payload` bytes, rounded up
+/// to a multiple of 8.
+fn layout_enum(
+    name: &str,
+    raw_s: &HashMap<&str, &StructDef>,
+    raw_e: &HashMap<&str, &EnumDef>,
+    so: &mut HashMap<String, StructInfo>,
+    eo: &mut HashMap<String, EnumInfo>,
+    visiting: &mut Vec<String>,
+) -> Result<(), String> {
+    if eo.contains_key(name) {
+        return Ok(());
+    }
+    if visiting.iter().any(|n| n == name) {
+        return Err(format!("`{name}` contains itself"));
+    }
+    let def = raw_e.get(name).ok_or_else(|| format!("unknown type `{name}`"))?;
+    visiting.push(name.to_string());
+    let mut variants: Vec<(String, Vec<(Type, usize)>, usize)> = Vec::new();
+    let mut max_payload = 0usize;
+    let mut has_payload = false;
+    for v in &def.variants {
+        let mut fields: Vec<(Type, usize)> = Vec::new();
+        let mut off = 0usize;
+        for fty in &v.fields {
+            let rty = resolve_ty_rec(fty, raw_s, raw_e, so, eo, visiting)?;
+            fields.push((rty.clone(), off));
+            off += rty.size();
+        }
+        if !v.fields.is_empty() {
+            has_payload = true;
+        }
+        max_payload = max_payload.max(off);
+        variants.push((v.name.clone(), fields, off));
+    }
+    visiting.pop();
+    let size = if has_payload { 8 + ((max_payload + 7) / 8) * 8 } else { 8 };
+    eo.insert(name.to_string(), EnumInfo { variants, size, has_payload });
+    Ok(())
+}
+
+/// Resolve a type, laying out any struct or enum it names first. An enum name
+/// becomes `Type::Enum` (a unit enum) or `Type::EnumData` (a payload enum); a
+/// struct name becomes `Type::Struct`. Array elements stay `i64`/`bool`.
+fn resolve_ty_rec(
+    t: &Type,
+    raw_s: &HashMap<&str, &StructDef>,
+    raw_e: &HashMap<&str, &EnumDef>,
+    so: &mut HashMap<String, StructInfo>,
+    eo: &mut HashMap<String, EnumInfo>,
+    visiting: &mut Vec<String>,
+) -> Result<Type, String> {
     match t {
-        Type::Named(n) => match structs.get(n) {
-            Some(info) => Ok(Type::Struct(n.clone(), info.size)),
-            None => Err(format!("unknown type `{n}`")),
-        },
+        Type::Named(n) => {
+            if raw_e.contains_key(n.as_str()) {
+                layout_enum(n, raw_s, raw_e, so, eo, visiting)?;
+                let info = &eo[n];
+                if info.has_payload {
+                    Ok(Type::EnumData(n.clone(), info.size))
+                } else {
+                    Ok(Type::Enum(n.clone()))
+                }
+            } else {
+                layout_struct(n, raw_s, raw_e, so, eo, visiting)?;
+                Ok(Type::Struct(n.clone(), so[n].size))
+            }
+        }
         Type::Array(elem, n) => {
-            let e = resolve_type(elem, structs)?;
+            let e = resolve_ty_rec(elem, raw_s, raw_e, so, eo, visiting)?;
             if !e.is_int_or_bool() {
                 return Err(format!("array elements must be `i64` or `bool`, not {e:?}"));
             }
@@ -141,87 +272,43 @@ fn resolve_type(t: &Type, structs: &HashMap<String, StructInfo>) -> Result<Type,
     }
 }
 
-/// Compute each struct's field offsets and size. A struct may refer to another
-/// struct declared later, but not to itself, directly or indirectly.
-/// Resolve a type in a context that knows about enums: an enum name becomes
-/// `Type::Enum`, everything else goes through `resolve_type`.
-fn resolve_ty_with(
+/// Resolve a type against finished tables, for callers that run after layout
+/// (signature building). Mirrors `resolve_ty_rec` without the recursion.
+fn resolve_in(
     t: &Type,
     structs: &HashMap<String, StructInfo>,
-    enums: &HashMap<String, Vec<String>>,
+    enums: &HashMap<String, EnumInfo>,
 ) -> Result<Type, String> {
     match t {
-        Type::Named(n) if enums.contains_key(n) => Ok(Type::Enum(n.clone())),
-        // Resolve the element here so an enum element is named correctly, then
-        // apply the array rule: elements stay `i64`/`bool`, never an enum or an
-        // aggregate, which codegen cannot size.
+        Type::Named(n) => {
+            if let Some(info) = enums.get(n) {
+                return Ok(if info.has_payload {
+                    Type::EnumData(n.clone(), info.size)
+                } else {
+                    Type::Enum(n.clone())
+                });
+            }
+            match structs.get(n) {
+                Some(info) => Ok(Type::Struct(n.clone(), info.size)),
+                None => Err(format!("unknown type `{n}`")),
+            }
+        }
         Type::Array(elem, n) => {
-            let e = resolve_ty_with(elem, structs, enums)?;
+            let e = resolve_in(elem, structs, enums)?;
             if !e.is_int_or_bool() {
                 return Err(format!("array elements must be `i64` or `bool`, not {e:?}"));
             }
             Ok(Type::Array(Box::new(e), *n))
         }
-        _ => resolve_type(t, structs),
+        other => Ok(other.clone()),
     }
-}
-
-fn resolve_structs(
-    defs: &[StructDef],
-    enums: &HashMap<String, Vec<String>>,
-) -> Result<HashMap<String, StructInfo>, String> {
-    let raw: HashMap<&str, &StructDef> = defs.iter().map(|d| (d.name.as_str(), d)).collect();
-    if raw.len() != defs.len() {
-        return Err("a struct is defined more than once".into());
-    }
-    let mut out: HashMap<String, StructInfo> = HashMap::new();
-    for d in defs {
-        layout(&d.name, &raw, enums, &mut out, &mut Vec::new())?;
-    }
-    Ok(out)
-}
-
-fn layout(
-    name: &str,
-    raw: &HashMap<&str, &StructDef>,
-    enums: &HashMap<String, Vec<String>>,
-    out: &mut HashMap<String, StructInfo>,
-    visiting: &mut Vec<String>,
-) -> Result<(), String> {
-    if out.contains_key(name) {
-        return Ok(());
-    }
-    if visiting.iter().any(|n| n == name) {
-        return Err(format!("struct `{name}` contains itself"));
-    }
-    let def = raw
-        .get(name)
-        .ok_or_else(|| format!("unknown type `{name}`"))?;
-    visiting.push(name.to_string());
-    let mut fields: Vec<(String, Type, usize)> = Vec::new();
-    let mut size = 0usize;
-    for (fname, fty) in &def.fields {
-        if let Type::Named(n) = fty {
-            if !enums.contains_key(n) {
-                layout(n, raw, enums, out, visiting)?;
-            }
-        }
-        let rty = resolve_ty_with(fty, out, enums)?;
-        if fields.iter().any(|(n, _, _)| n == fname) {
-            return Err(format!("struct `{name}`: duplicate field `{fname}`"));
-        }
-        let off = size;
-        size += rty.size();
-        fields.push((fname.clone(), rty, off));
-    }
-    visiting.pop();
-    out.insert(name.to_string(), StructInfo { fields, size });
-    Ok(())
 }
 
 impl Sema {
+    /// Every type site goes through here, so an enum name resolves wherever a
+    /// type may appear.
     fn resolve_ty(&self, t: &Type) -> Result<Type, String> {
-        resolve_ty_with(t, &self.structs, &self.enums)
+        resolve_in(t, &self.structs, &self.enums)
     }
 
     fn check_fn(&mut self, f: &mut FnDef) -> Result<(), String> {
@@ -792,19 +879,162 @@ impl Sema {
             Expr::EnumVariant { enum_name, variant, tag } => {
                 let enum_name = enum_name.clone();
                 let variant = variant.clone();
-                let variants = self
+                let info = self
                     .enums
                     .get(&enum_name)
-                    .ok_or_else(|| format!("unknown enum `{enum_name}`"))?;
-                let idx = variants
-                    .iter()
-                    .position(|v| v == &variant)
+                    .ok_or_else(|| format!("unknown enum `{enum_name}`"))?
+                    .clone();
+                let (_, fields, _) = info
+                    .variant(&variant)
                     .ok_or_else(|| format!("enum `{enum_name}` has no variant `{variant}`"))?;
+                if !fields.is_empty() {
+                    return Err(format!(
+                        "variant `{enum_name}::{variant}` takes {} argument(s)",
+                        fields.len()
+                    ));
+                }
                 // Record the tag in the node rather than rewriting to an
                 // `Int`: keeping the node keeps its enum type, so re-checking
                 // it (as a method receiver is) stays consistent.
-                *tag = idx as i64;
-                Ok(Type::Enum(enum_name))
+                let t = info.tag_of(&variant).unwrap();
+                *tag = t;
+                if info.has_payload {
+                    // A payload enum has no bare-variant value: every value
+                    // needs a frame buffer, since it may carry a payload. Rewrite
+                    // to a zero-argument constructor, which materialises one.
+                    let size = info.size;
+                    let slot = self.alloc_slots((size / 8) as i32);
+                    *e = Expr::EnumCtor {
+                        enum_name: enum_name.clone(),
+                        variant,
+                        tag: t,
+                        args: Vec::new(),
+                        arg_offsets: Vec::new(),
+                        slot,
+                        size,
+                    };
+                    Ok(Type::EnumData(enum_name, size))
+                } else {
+                    Ok(Type::Enum(enum_name))
+                }
+            }
+            Expr::EnumCtor { enum_name, variant, tag, args, arg_offsets, slot, size } => {
+                let enum_name = enum_name.clone();
+                let variant = variant.clone();
+                let info = self
+                    .enums
+                    .get(&enum_name)
+                    .ok_or_else(|| format!("unknown enum `{enum_name}`"))?
+                    .clone();
+                let (_, fields, _) = info
+                    .variant(&variant)
+                    .ok_or_else(|| format!("enum `{enum_name}` has no variant `{variant}`"))?
+                    .clone();
+                if args.len() != fields.len() {
+                    return Err(format!(
+                        "variant `{enum_name}::{variant}` takes {} argument(s), got {}",
+                        fields.len(),
+                        args.len()
+                    ));
+                }
+                // A payload enum is a tagged union; a variant constructor is
+                // only meaningful on one, and only ever builds it.
+                if !info.has_payload {
+                    return Err(format!("enum `{enum_name}` has no payload variants"));
+                }
+                // Type-check the arguments in source order (side effects must
+                // run as written) and record each field's offset in the payload.
+                let mut offsets = Vec::with_capacity(fields.len());
+                for (i, arg) in args.iter_mut().enumerate() {
+                    let got = self.check_expr(arg, scope)?;
+                    let (want, off) = fields[i].clone();
+                    if got != want {
+                        return Err(format!(
+                            "variant `{enum_name}::{variant}` field {i}: expected {want:?}, found {got:?}"
+                        ));
+                    }
+                    offsets.push(off as i32);
+                }
+                *tag = info.tag_of(&variant).unwrap();
+                *arg_offsets = offsets;
+                *size = info.size;
+                // A frame buffer for the value, like a struct literal, so it has
+                // an address in any context.
+                *slot = self.alloc_slots((info.size / 8) as i32);
+                Ok(Type::EnumData(enum_name, info.size))
+            }
+            Expr::VariantTest { scrutinee, enum_name, variant, tag, n_binds } => {
+                let n_binds = *n_binds;
+                let st = self.check_expr(scrutinee, scope)?;
+                let ename = match &st {
+                    Type::Enum(n) | Type::EnumData(n, _) => n.clone(),
+                    other => {
+                        return Err(format!(
+                            "`{enum_name}::{variant}` pattern cannot match a value of type {other:?}"
+                        ))
+                    }
+                };
+                if ename != *enum_name {
+                    return Err(format!(
+                        "`{enum_name}::{variant}` pattern cannot match a value of enum `{ename}`"
+                    ));
+                }
+                let info = self.enums.get(&ename).unwrap().clone();
+                let (_, fields, _) = info
+                    .variant(variant)
+                    .ok_or_else(|| format!("enum `{enum_name}` has no variant `{variant}`"))?;
+                // A variant that carries a payload must be destructured, so the
+                // pattern must name its fields; and it must name all of them.
+                if fields.is_empty() {
+                    if n_binds > 0 {
+                        return Err(format!(
+                            "variant `{enum_name}::{variant}` takes no arguments"
+                        ));
+                    }
+                } else if n_binds < 0 {
+                    return Err(format!(
+                        "variant `{enum_name}::{variant}` has a payload; bind it with `{enum_name}::{variant}(..)`"
+                    ));
+                } else if n_binds as usize != fields.len() {
+                    return Err(format!(
+                        "variant `{enum_name}::{variant}` has {} field(s), but the pattern binds {n_binds}",
+                        fields.len()
+                    ));
+                }
+                *tag = info.tag_of(variant).unwrap();
+                Ok(Type::Bool)
+            }
+            Expr::EnumPayload { recv, enum_name, variant, idx, offset, ty } => {
+                let enum_name = enum_name.clone();
+                let variant = variant.clone();
+                let idx = *idx;
+                let rt = self.check_expr(recv, scope)?;
+                let info = self
+                    .enums
+                    .get(&enum_name)
+                    .ok_or_else(|| format!("unknown enum `{enum_name}`"))?
+                    .clone();
+                if !matches!(&rt, Type::EnumData(n, _) if *n == enum_name) {
+                    return Err(format!(
+                        "`{enum_name}::{variant}` payload read on a value of type {rt:?}"
+                    ));
+                }
+                let (_, fields, _) = info
+                    .variant(&variant)
+                    .ok_or_else(|| format!("enum `{enum_name}` has no variant `{variant}`"))?;
+                let (fty, foff) = fields
+                    .get(idx)
+                    .ok_or_else(|| {
+                        format!(
+                            "variant `{enum_name}::{variant}` has {} field(s), but field {idx} was read",
+                            fields.len()
+                        )
+                    })?
+                    .clone();
+                // The payload sits after the tag word.
+                *offset = foff as i32 + 8;
+                *ty = fty.clone();
+                Ok(fty)
             }
             Expr::Cast(inner, to) => {
                 let it = self.check_expr(inner, scope)?;

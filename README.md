@@ -277,12 +277,9 @@ of value per unit of effort:
    data-structure code.
 3. **More types.** `u*`/`i*` widths and `f64`, which together cover most of what
    small programs actually need. (`match` on integers is done.)
-4. **Enums with a payload.** Unit enums and `impl` methods are done; variants
-   that carry data (`Option`-like) are the next step, and need codegen to lay
-   out a tagged union.
-5. **More backends.** A second target (ARM64 or a simple VM) would force the
+4. **More backends.** A second target (ARM64 or a simple VM) would force the
    code generator's assumptions out into the open.
-6. **Debug info.** Line tables so a debugger can point at source.
+5. **Debug info.** Line tables so a debugger can point at source.
 
 Anything involving borrowing, generics or the trait system is out of scope: it
 would make rmc a different project rather than a better one.

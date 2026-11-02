@@ -663,3 +663,65 @@ fn two_enums_compare_but_an_enum_and_an_integer_do_not() {
     let bad = "enum C { A } fn main() -> i64 { let x: C = C::A; if x == 0 { return 1; } return 0; }";
     assert!(compile_to_asm(bad, &CompileOptions::default()).is_err());
 }
+
+#[test]
+fn a_payload_enum_builds_and_matches() {
+    let src = "enum Opt { None, Some(i64) } \
+               fn get(o: Opt) -> i64 { match o { Opt::Some(v) => v, _ => 0 - 1 } } \
+               fn main() -> i64 { return get(Opt::Some(5)); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_payload_enum_is_a_tagged_union_in_memory() {
+    // `Opt` is `{ i64 tag, i64 payload }` = 16 bytes, so its frame use is a
+    // tagged union rather than a single slot.
+    let out = asm("enum Opt { None, Some(i64) } fn main() -> i64 { let o: Opt = Opt::Some(3); return 0; }");
+    assert!(out.contains("movq $1,"), "expected the tag store in:\n{out}");
+}
+
+#[test]
+fn a_payload_variant_needs_its_payload_bound_in_a_pattern() {
+    let err = compile_to_asm(
+        "enum O { N, S(i64) } fn main() -> i64 { let o: O = O::S(1); return match o { O::S => 0, _ => 1 }; }",
+        &CompileOptions::default(),
+    ).unwrap_err();
+    assert!(err.contains("has a payload"), "got: {err}");
+}
+
+#[test]
+fn a_payload_argument_is_type_checked() {
+    let err = compile_to_asm(
+        "enum O { N, S(i64) } fn main() -> i64 { let o: O = O::S(true); return 0; }",
+        &CompileOptions::default(),
+    ).unwrap_err();
+    assert!(err.contains("expected I64, found Bool"), "got: {err}");
+}
+
+#[test]
+fn a_payload_enum_cannot_be_compared_or_cast() {
+    let cmp = compile_to_asm(
+        "enum O { N, S(i64) } fn main() -> i64 { let a: O = O::S(1); let b: O = O::S(1); if a == b { return 1; } return 0; }",
+        &CompileOptions::default(),
+    );
+    assert!(cmp.is_err());
+    let cast = compile_to_asm(
+        "enum O { N, S(i64) } fn main() -> i64 { let a: O = O::S(1); return a as i64; }",
+        &CompileOptions::default(),
+    );
+    assert!(cast.is_err());
+}
+
+#[test]
+fn a_recursive_payload_enum_is_rejected() {
+    let err = compile_to_asm("enum L { Nil, Cons(i64, L) } fn main() -> i64 { return 0; }", &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("contains itself"), "got: {err}");
+}
+
+#[test]
+fn a_struct_may_have_a_payload_enum_field() {
+    let src = "enum O { N, S(i64) } struct W { o: O, n: i64 } \
+               fn main() -> i64 { let w: W = W { o: O::S(3), n: 4 }; \
+               return match w.o { O::S(v) => v + w.n, _ => 0 }; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}

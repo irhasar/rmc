@@ -81,6 +81,35 @@ returned by value, and used as a `match` scrutinee with `Color::Green` patterns.
 An enum may also have `impl` methods. `as` cannot convert an `i64` **to** an
 enum (rustc rejects that too); use a `match` to go from a tag back to a variant.
 
+### Enums with a payload
+
+```rust
+enum Opt { None, Some(i64) }
+
+let a: Opt = Opt::Some(3);
+match a {
+    Opt::Some(v) => v,     // binds the payload
+    Opt::None => 0,
+    _ => 0,                // rmc does not check exhaustiveness
+}
+```
+
+A variant may carry data. Such an enum is a **tagged union**: `{ i64 tag,
+<payload> }`, where the payload is as wide as the widest variant and starts at
+byte 8. It is an aggregate like a struct, so it is named by its address, passed
+and returned by pointer, and copied word by word on assignment. Its size is
+computed by sema and carried in the type, so codegen needs no lookup.
+
+A payload variant is built with `Opt::Some(3)`; a unit variant of a payload enum
+is still written `Opt::None`, and is materialised as a zero-payload value.
+A pattern that matches a payload variant must bind its fields, `Opt::Some(v)`;
+matching it bare (`Opt::Some`) is an error, because there is no way to name the
+value. A payload variant is not comparable with `==` and cannot be cast with
+`as` (it is not a scalar), and it may not be an array element.
+
+A recursive enum such as `enum L { Nil, Cons(i64, L) }` is rejected: rmc has no
+indirection, so an enum may not contain itself.
+
 ## Functions
 
 ```rust

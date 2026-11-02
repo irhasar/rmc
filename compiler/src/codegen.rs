@@ -503,6 +503,15 @@ impl Codegen {
                             by_field,
                         });
                     }
+                    // A payload enum is a tagged union copied word by word, so
+                    // its words stay in memory like a whole struct.
+                    Some(Type::EnumData(_, size)) => {
+                        let_tmps.push(LetTarget {
+                            slot: *slot,
+                            fields: (*size / 8) as i32,
+                            by_field: false,
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -547,6 +556,27 @@ impl Codegen {
             Expr::ArrayList(_) => unreachable!("sema rewrites ArrayList into a block"),
             Expr::MethodCall { .. } => unreachable!("sema rewrites MethodCall into a Call"),
             Expr::EnumVariant { .. } => {} // a tag has no subexpressions
+            Expr::EnumCtor { args, slot, size, .. } => {
+                for a in args {
+                    Self::count_expr(a, counts, mem, copied, true, let_tmps);
+                }
+                // The ctor yields its own address, so its words stay in memory.
+                for k in 0..(*size / 8) as i32 {
+                    if let Some(m) = mem.get_mut((*slot + k) as usize) {
+                        *m = true;
+                    }
+                }
+            }
+            // A tag test reads the value's first word, and a payload read
+            // offsets into it: both need the value's address, never a copy.
+            Expr::VariantTest { scrutinee, .. } => {
+                Self::count_expr(scrutinee, counts, mem, copied, false, let_tmps)
+            }
+            Expr::EnumPayload { recv, ty, .. } => {
+                Self::count_expr(recv, counts, mem, copied, false, let_tmps);
+                // A payload field of aggregate type is named by its address.
+                let _ = ty;
+            }
             Expr::Var { slot, ty, .. } => {
                 counts[*slot as usize] += 1;
                 if ty.is_aggregate() {
@@ -556,9 +586,9 @@ impl Codegen {
                                 mem[(*slot + k) as usize] = true;
                             }
                         }
-                        Type::Struct(_, size) => {
-                            // The base slot is the struct's last field, whose
-                            // address is the struct's own base, so it must stay
+                        Type::Struct(_, size) | Type::EnumData(_, size) => {
+                            // The base slot is the value's last word, whose
+                            // address is the value's own base, so it must stay
                             // addressable.
                             mem[*slot as usize] = true;
                             if whole {
@@ -662,6 +692,19 @@ impl Codegen {
                         None => {
                             self.line("xor %eax, %eax");
                             self.fill_aggregate(*slot, elem.size(), *n);
+                        }
+                    }
+                } else if let Type::EnumData(_, size) = &vty {
+                    match init {
+                        // A ctor, a call, another enum local: all yield the
+                        // value's address, so copy its words in.
+                        Some(e) => {
+                            self.gen_expr(e);
+                            self.copy_aggregate(*slot, *size / 8, 8);
+                        }
+                        None => {
+                            self.line("xor %eax, %eax");
+                            self.fill_aggregate(*slot, 8, *size / 8);
                         }
                     }
                 } else if let Type::Struct(_, size) = &vty {
@@ -977,6 +1020,7 @@ impl Codegen {
         match ty {
             Type::Array(_, n) => Some(self.array_off(slot, *n)),
             Type::Struct(_, size) => Some(self.array_off(slot, size / 8)),
+            Type::EnumData(_, size) => Some(self.array_off(slot, size / 8)),
             _ => None,
         }
     }
@@ -1048,7 +1092,16 @@ impl Codegen {
             // whose value *is* its address: a call's hidden return buffer, a
             // block or `if` yielding a struct, or a struct literal. Evaluating
             // it leaves that address in `%rax`.
-            Expr::Call { .. } | Expr::Block(_) | Expr::If(..) | Expr::StructLit { .. } => {
+            Expr::Call { .. }
+            | Expr::Block(_)
+            | Expr::If(..)
+            | Expr::StructLit { .. }
+            | Expr::EnumCtor { .. } => {
+                self.gen_expr(e);
+            }
+            // A payload field of aggregate type is named by its address, which
+            // evaluating it yields.
+            Expr::EnumPayload { ty, .. } if ty.is_aggregate() => {
                 self.gen_expr(e);
             }
             _ => unreachable!("sema guarantees a valid address expression"),
@@ -1062,6 +1115,75 @@ impl Codegen {
             Expr::EnumVariant { tag, .. } => {
                 self.line(&format!("mov ${tag}, %rax"));
                 Type::I64
+            }
+            Expr::EnumCtor { tag, args, arg_offsets, slot, size, enum_name, .. } => {
+                // Materialise the value into its frame buffer and yield that
+                // address, exactly like a struct literal: the tag word first,
+                // then each argument at its field offset after the tag.
+                let n = *size / 8;
+                let base = self.array_off(*slot, n);
+                self.line(&format!("movq ${tag}, {base}(%rbp)"));
+                // Zero the payload first so a partially-initialised variant
+                // never exposes stale frame bytes.
+                for k in 1..n {
+                    self.line(&format!("movq $0, {}(%rbp)", base + (k as i32) * 8));
+                }
+                for (i, a) in args.iter().enumerate() {
+                    let off = 8 + arg_offsets[i];
+                    // A payload field is always 8 bytes, so the store width is
+                    // fixed. An immediate or a register can be stored directly;
+                    // a memory operand (an unpromoted local, or a field) cannot,
+                    // because `mov mem, mem` is not an x86 instruction — it must
+                    // go through `%rax`.
+                    match self.simple_operand(a) {
+                        Some(op) if !op.contains('(') => {
+                            self.line(&format!("mov {op}, {}(%rbp)", base + off));
+                        }
+                        _ => {
+                        let at = self.gen_expr(a);
+                        if at.is_aggregate() {
+                            // An aggregate argument is a value named by its
+                            // address; copy its words in.
+                            let words = at.size() / 8;
+                            self.line("mov %rax, %rsi");
+                            self.line(&format!("lea {}(%rbp), %rdi", base + off));
+                            self.copy_words_rdi_rsi(words);
+                            } else {
+                                self.line(&format!("mov %rax, {}(%rbp)", base + off));
+                            }
+                        }
+                    }
+                }
+                self.line(&format!("lea {base}(%rbp), %rax"));
+                Type::EnumData(enum_name.clone(), *size)
+            }
+            Expr::VariantTest { scrutinee, tag, .. } => {
+                // Compare the value's tag word. `gen_expr` yields the address
+                // for an aggregate enum and the tag itself for a unit enum, so
+                // branch on the returned type rather than on syntax.
+                let st = self.gen_expr(scrutinee);
+                if st.is_aggregate() {
+                    self.line("mov (%rax), %rax");
+                }
+                self.line(&format!("cmp ${tag}, %rax"));
+                self.line("sete %al");
+                self.line("movzbq %al, %rax");
+                Type::Bool
+            }
+            Expr::EnumPayload { recv, offset, ty, .. } => {
+                // The receiver is a payload enum, so `gen_expr` yields its
+                // address. A payload field is at `offset` (tag word included).
+                self.gen_expr(recv);
+                if ty.is_aggregate() {
+                    if *offset != 0 {
+                        self.line(&format!("add ${}, %rax", *offset));
+                    }
+                } else if let Some(r) = self.field_reg(recv, *offset) {
+                    self.line(&format!("mov {r}, %rax"));
+                } else {
+                    self.line(&format!("mov {}(%rax), %rax", *offset));
+                }
+                ty.clone()
             }
             Expr::Int(v) => {
                 self.line(&format!("mov ${v}, %rax"));

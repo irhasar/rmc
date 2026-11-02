@@ -141,7 +141,19 @@ impl Parser {
             if self.peek().is_none() {
                 return Err(format!("at byte {}: unexpected end of input in `enum`", self.pos()));
             }
-            variants.push(self.expect_ident()?);
+            let vname = self.expect_ident()?;
+            // `Variant` or `Variant(T, T, ..)`.
+            let mut fields = Vec::new();
+            if self.eat(&Tok::LParen) {
+                while self.peek() != Some(&Tok::RParen) {
+                    fields.push(self.parse_type()?);
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
+                self.expect(Tok::RParen)?;
+            }
+            variants.push(EnumVariantDef { name: vname, fields });
             if !self.eat(&Tok::Comma) {
                 break;
             }
@@ -799,17 +811,28 @@ impl Parser {
                     self.i += 1;
                     Pat::Int(v)
                 }
-                // `Enum::Variant` — the name resolves in sema.
+                // `Enum::Variant`, `Enum::Variant(a, b)`, or a binding name.
                 Some(Tok::Ident(n)) => {
                     self.i += 1;
                     if self.eat(&Tok::ColonColon) {
                         let variant = self.expect_ident()?;
-                        Pat::Variant(n, variant)
+                        let mut bindings = None;
+                        if self.eat(&Tok::LParen) {
+                            let mut names = Vec::new();
+                            while self.peek() != Some(&Tok::RParen) {
+                                names.push(self.expect_ident()?);
+                                if !self.eat(&Tok::Comma) {
+                                    break;
+                                }
+                            }
+                            self.expect(Tok::RParen)?;
+                            bindings = Some(names);
+                        }
+                        Pat::Variant(n, variant, bindings)
                     } else {
-                        return Err(format!(
-                            "at byte {}: expected `::` after `{n}` in a pattern",
-                            self.pos()
-                        ));
+                        // A bare name binds the scrutinee; `_` already matched
+                        // the wildcard case above.
+                        Pat::Bind(n)
                     }
                 }
                 other => return Err(format!(
@@ -859,13 +882,57 @@ impl Parser {
         for (pat, body) in arms.into_iter().rev() {
             acc = Some(match pat {
                 Pat::Wild => body,
+                // `name => body` binds the whole scrutinee.
+                Pat::Bind(name) => Expr::Block(Block {
+                    stmts: vec![Stmt::Let {
+                        name,
+                        ty: None,
+                        init: Some(subj.clone()),
+                        slot: -1,
+                    }],
+                    tail: Some(Box::new(body)),
+                }),
                 Pat::Int(k) => {
-                    let rhs = Expr::Int(k);
-                    Self::match_arm(subj.clone(), rhs, body, acc)
+                    let cond = Expr::Bin(BinOp::Eq, Box::new(subj.clone()), Box::new(Expr::Int(k)));
+                    Self::match_arm(cond, body, acc)
                 }
-                Pat::Variant(enum_name, variant) => {
-                    let rhs = Expr::EnumVariant { enum_name, variant, tag: -1 };
-                    Self::match_arm(subj.clone(), rhs, body, acc)
+                Pat::Variant(enum_name, variant, bindings) => {
+                    let n_binds = match &bindings {
+                        Some(names) => names.len() as i32,
+                        None => -1,
+                    };
+                    let cond = Expr::VariantTest {
+                        scrutinee: Box::new(subj.clone()),
+                        enum_name: enum_name.clone(),
+                        variant: variant.clone(),
+                        tag: -1,
+                        n_binds,
+                    };
+                    // `Enum::V(w, x)` binds each payload field in the arm body.
+                    let body = match bindings {
+                        Some(names) if !names.is_empty() => {
+                            let stmts = names
+                                .into_iter()
+                                .enumerate()
+                                .map(|(idx, name)| Stmt::Let {
+                                    name,
+                                    ty: None,
+                                    init: Some(Expr::EnumPayload {
+                                        recv: Box::new(subj.clone()),
+                                        enum_name: enum_name.clone(),
+                                        variant: variant.clone(),
+                                        idx,
+                                        offset: 0,
+                                        ty: Type::Unit,
+                                    }),
+                                    slot: -1,
+                                })
+                                .collect();
+                            Expr::Block(Block { stmts, tail: Some(Box::new(body)) })
+                        }
+                        _ => body,
+                    };
+                    Self::match_arm(cond, body, acc)
                 }
             });
         }
@@ -876,9 +943,8 @@ impl Parser {
         }
     }
 
-    /// One `if subj == rhs { body } else { rest }` step of a desugared `match`.
-    fn match_arm(subj: Expr, rhs: Expr, body: Expr, rest: Option<Expr>) -> Expr {
-        let cond = Expr::Bin(BinOp::Eq, Box::new(subj), Box::new(rhs));
+    /// One `if cond { body } else { rest }` step of a desugared `match`.
+    fn match_arm(cond: Expr, body: Expr, rest: Option<Expr>) -> Expr {
         let els = rest.map(|e| Block { stmts: Vec::new(), tail: Some(Box::new(e)) });
         Expr::If(
             Box::new(cond),
@@ -928,9 +994,29 @@ impl Parser {
                 } else {
                     name
                 };
-                // `Enum::Variant` — resolved and range-checked by sema.
+                // `Enum::Variant` or `Enum::Variant(args)` — resolved and
+                // range-checked by sema.
                 if self.eat(&Tok::ColonColon) {
                     let variant = self.expect_ident()?;
+                    if self.eat(&Tok::LParen) {
+                        let mut args = Vec::new();
+                        while self.peek() != Some(&Tok::RParen) {
+                            args.push(self.parse_expr()?);
+                            if !self.eat(&Tok::Comma) {
+                                break;
+                            }
+                        }
+                        self.expect(Tok::RParen)?;
+                        return Ok(Expr::EnumCtor {
+                            enum_name: name,
+                            variant,
+                            tag: -1,
+                            args,
+                            arg_offsets: Vec::new(),
+                            slot: -1,
+                            size: 0,
+                        });
+                    }
                     return Ok(Expr::EnumVariant { enum_name: name, variant, tag: -1 });
                 }
                 if self.peek() == Some(&Tok::LBrace) && !self.no_struct_lit {
@@ -1035,7 +1121,12 @@ impl Parser {
 enum Pat {
     Wild,
     Int(i64),
-    Variant(String, String),
+    /// `Enum::Variant` or `Enum::Variant(..)`. The constructor is resolved by
+    /// sema; the optional bindings name the payload fields, in field order.
+    Variant(String, String, Option<Vec<String>>),
+    /// A plain name: binds the whole scrutinee (an irrefutable catch-all). Kept
+    /// distinct from `Wild` only so the binding is named.
+    Bind(String),
 }
 
 /// Whether `e` syntactically contains a call, used to decide if a subscript in

@@ -18,6 +18,11 @@ pub enum Type {
     /// A unit enum, represented by its `i64` tag. It occupies one slot like an
     /// integer, so codegen emits it exactly as it emits `i64`.
     Enum(String),
+    /// An enum with at least one payload variant: a tagged union laid out as
+    /// `{ i64 tag, <max payload bytes> }`. Its size is computed by sema and
+    /// carried here, so codegen needs no lookup. It is an aggregate: named by
+    /// its address, passed and returned by pointer, like a struct.
+    EnumData(String, usize),
     /// Unresolved name produced by the parser; never survives sema.
     Named(String),
 }
@@ -26,6 +31,7 @@ impl Type {
     pub fn size(&self) -> usize {
         match self {
             Type::I64 | Type::Bool | Type::Enum(_) => 8,
+            Type::EnumData(_, size) => *size,
             Type::Unit => 0,
             Type::Array(elem, n) => elem.size() * n,
             Type::Struct(_, s) => *s,
@@ -51,7 +57,7 @@ impl Type {
     /// They are named by their address, so they are passed to and returned from
     /// a function by pointer rather than by value.
     pub fn is_aggregate(&self) -> bool {
-        matches!(self, Type::Array(..) | Type::Struct(..))
+        matches!(self, Type::Array(..) | Type::Struct(..) | Type::EnumData(..))
     }
 }
 
@@ -135,6 +141,44 @@ pub enum Expr {
     /// enum is exactly this: a named integer with checked constructors, which
     /// makes it a zero-cost `switch`-style state value.
     EnumVariant { enum_name: String, variant: String, tag: i64 },
+    /// `Enum::Variant(a, b)`: build a payload variant. Sema checks the arguments
+    /// against the variant's fields, records each field's byte offset within the
+    /// payload, and allocates `slot` for the value, which codegen fills and
+    /// whose address it yields, exactly like a struct literal.
+    EnumCtor {
+        enum_name: String,
+        variant: String,
+        tag: i64,
+        args: Vec<Expr>,
+        arg_offsets: Vec<i32>,
+        slot: i32,
+        size: usize,
+    },
+    /// `value == Enum::Variant`, as a `bool`. The single condition a `match` arm
+    /// tests. Sema checks the value's enum and the variant, and fills `tag`;
+    /// codegen compares the value's tag word. Keeping this one node means the
+    /// parser needs no knowledge of whether the enum is a unit enum or a tagged
+    /// union, and codegen handles both in one place.
+    VariantTest {
+        scrutinee: Box<Expr>,
+        enum_name: String,
+        variant: String,
+        tag: i64,
+        /// How many payload names the pattern bound; -1 when it had no
+        /// parentheses, which is an error for a variant that has a payload.
+        n_binds: i32,
+    },
+    /// The payload of a payload enum, read after a tag check: field `idx` of
+    /// `variant`, at `offset` bytes into the value. Yields the field value, or
+    /// its address when the field is itself an aggregate.
+    EnumPayload {
+        recv: Box<Expr>,
+        enum_name: String,
+        variant: String,
+        idx: usize,
+        offset: i32,
+        ty: Type,
+    },
     /// expr as Type
     Cast(Box<Expr>, Type),
 }
@@ -218,12 +262,21 @@ pub struct FnDef {
     pub nslots: i32,
 }
 
-/// A user-defined enum. Every variant is a unit variant (no payload), so the
-/// enum is represented by its `i64` tag and codegen needs no new case for it.
+/// One variant of an enum: a name and its payload field types. An empty
+/// `fields` is a unit variant.
+#[derive(Debug, Clone)]
+pub struct EnumVariantDef {
+    pub name: String,
+    pub fields: Vec<Type>,
+}
+
+/// A user-defined enum. When every variant is a unit variant the enum is
+/// represented by its `i64` tag; when any variant carries a payload it is a
+/// tagged union (see `Type::EnumData`).
 #[derive(Debug, Clone)]
 pub struct EnumDef {
     pub name: String,
-    pub variants: Vec<String>,
+    pub variants: Vec<EnumVariantDef>,
 }
 
 #[derive(Debug, Clone)]
