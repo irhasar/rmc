@@ -484,3 +484,23 @@ fn a_match_scrutinee_call_runs_once() {
     let out = asm("fn g() -> i64 { return 3; } fn main() -> i64 { return match g() { 1 => 10, 3 => 30, _ => 0 }; }");
     assert_eq!(out.matches("call g").count(), 1, "the scrutinee call runs once");
 }
+
+#[test]
+fn arguments_are_evaluated_left_to_right() {
+    // `f(g(), mk())` must run `g` before `mk`. The old code copied every
+    // aggregate argument before any scalar one, so a scalar in a later position
+    // ran after the aggregate and the side effects came out in the wrong order.
+    let out = asm("struct S { v: i64 } fn mk() -> S { return S { v: 1 }; } fn g() -> i64 { return 2; } fn f(x: i64, s: S) -> i64 { return s.v + x; } fn main() -> i64 { return f(g(), mk()); }");
+    let g = out.find("call g").expect("g is called");
+    let mk = out.find("call mk").expect("mk is called");
+    assert!(g < mk, "the first argument's call is emitted first");
+}
+
+#[test]
+fn an_aggregate_argument_still_travels_by_pointer() {
+    // The reordering must not break the by-value copy: the aggregate is copied
+    // into its slot and the slot's address is what the callee receives.
+    let out = asm("struct S { v: i64 } fn f(s: S) -> i64 { return s.v; } fn main() -> i64 { return f(S { v: 5 }); }");
+    assert!(out.contains("lea "), "the slot address is materialised");
+    assert!(out.contains("call f"));
+}

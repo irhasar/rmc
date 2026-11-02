@@ -119,10 +119,13 @@ python3 tests/run.py -v
   into a `sema` slot and its address is passed; an aggregate result is written
   through a buffer the caller passes in `%r10`. Two orderings are load-bearing:
   the callee must save incoming pointers on the stack *before* any copy, because
-  the copy clobbers `%rsi`/`%rdi` (which still hold later arguments), and the
-  caller must copy all aggregate arguments *before* evaluating any scalar
-  argument, so a later argument cannot disturb an earlier one's source. Getting
-  either wrong corrupts arguments silently; `aggfn.rms`/`aggbig.rms` catch it.
+  the copy clobbers `%rsi`/`%rdi` (which still hold later arguments). The caller
+  evaluates arguments strictly left-to-right and pushes each one (aggregate: its
+  slot address after the copy; scalar: its value), then pops them into the ABI
+  registers right-to-left, so an earlier argument's source is already copied
+  before a later argument runs. Evaluating all aggregates before the scalars
+  would run side effects out of order: `f(g(), mk())` must print `2` then `1`,
+  not the reverse. `aggfn.rms`/`aggbig.rms` and `argorder.rms` cover this.
 - **`%r10` carries the return buffer.** It is caller-saved and not an argument
   register, so it survives argument setup. Do not use `%r10` as scratch anywhere
   argument setup can run after the return pointer is set.

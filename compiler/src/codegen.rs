@@ -1816,72 +1816,42 @@ impl Codegen {
     ) -> Type {
         const ARG_REGS: [&str; 6] = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"];
 
-        // Aggregate arguments are passed by value: copy each into its hidden
-        // frame slot first, so later argument evaluation cannot disturb the
-        // source. A copied argument then travels as the address of that slot.
-        let mut arg_operand: Vec<Option<String>> = Vec::with_capacity(args.len());
-        for (a, (slot, n)) in args.iter().zip(arg_slots.iter()) {
-            if *slot >= 0 {
-                let base = self.array_off(*slot, *n);
-                self.gen_expr(a); // the aggregate's address is in %rax
-                self.line("mov %rax, %rsi");
-                self.line(&format!("lea {base}(%rbp), %rdi"));
-                self.copy_words_rdi_rsi(*n);
-                arg_operand.push(Some(format!("{base}(%rbp)")));
-            } else {
-                arg_operand.push(None);
-            }
-        }
+        // Arguments are evaluated in source order. An aggregate is passed by
+        // value: it is copied into its hidden frame slot, and that slot's
+        // address is what travels in the argument register. Each argument is
+        // pushed as it is evaluated (aggregate: its slot address; scalar: its
+        // value), so the pushes are left-to-right and the register loads below
+        // are a single reverse walk. Copying every aggregate only after all
+        // scalars would run the arguments out of order.
+        let is_agg: Vec<bool> = arg_slots.iter().map(|(s, _)| *s >= 0).collect();
 
-        // Scalars go into the argument registers. A pointer to an aggregate
-        // argument also travels in a register, but its value lives in a frame
-        // slot, so it is loaded in the fixed loop below rather than evaluated.
-        let direct = arg_operand
-            .iter()
-            .zip(args.iter())
-            .all(|(s, a)| s.is_none() && self.arg_is_simple(a))
-            || (args.len() <= 2
-                && arg_operand.iter().all(|s| s.is_none())
-                && !args.iter().any(Self::contains_call)
-                && !args.iter().any(Self::clobbers_arg_regs));
+        let direct = is_agg.iter().all(|a| !*a)
+            && (args.iter().all(|a| self.arg_is_simple(a))
+                || (args.len() <= 2
+                    && !args.iter().any(Self::contains_call)
+                    && !args.iter().any(Self::clobbers_arg_regs)));
         if direct {
             for (a, r) in args.iter().zip(ARG_REGS.iter()) {
                 self.gen_expr_into_reg(a, r);
             }
         } else {
-            // Evaluate scalar arguments right-to-left and push them, so that
-            // after popping they land in the ABI registers in order. Aggregate
-            // arguments are already copied; their addresses are loaded below.
-            let scalars: Vec<&Expr> = args
-                .iter()
-                .zip(arg_operand.iter())
-                .filter(|(_, s)| s.is_none())
-                .map(|(a, _)| a)
-                .collect();
-            for a in scalars.iter().rev() {
-                self.gen_expr(a);
+            for ((a, agg), (slot, n)) in args.iter().zip(is_agg.iter()).zip(arg_slots.iter()) {
+                if *agg {
+                    let base = self.array_off(*slot, *n);
+                    self.gen_expr(a); // the aggregate's address is in %rax
+                    self.line("mov %rax, %rsi");
+                    self.line(&format!("lea {base}(%rbp), %rdi"));
+                    self.copy_words_rdi_rsi(*n);
+                    self.line(&format!("lea {base}(%rbp), %rax"));
+                } else {
+                    self.gen_expr(a);
+                }
                 self.push_rax();
             }
-            // Pop the scalars into the registers, interleaved with loading the
-            // aggregate pointers in the right positions. Walking left to right,
-            // a scalar comes off the stack (reverse push order); an aggregate
-            // is addressed from its slot.
-            let mut stack_scalars: Vec<usize> = Vec::new();
-            for (i, s) in arg_operand.iter().enumerate() {
-                if s.is_none() {
-                    stack_scalars.push(i);
-                }
-            }
-            let mut next_scalar = 0;
-            for (i, op) in arg_operand.iter().enumerate() {
-                if let Some(addr) = op {
-                    self.line(&format!("lea {addr}, {}", ARG_REGS[i]));
-                } else {
-                    let _ = i;
-                    // Pop in left-to-right order; pushes were right-to-left.
-                    self.pop_to(ARG_REGS[stack_scalars[next_scalar]]);
-                    next_scalar += 1;
-                }
+            // Pushes were left-to-right, so pop right-to-left into the ABI
+            // registers, one per argument.
+            for i in (0..args.len()).rev() {
+                self.pop_to(ARG_REGS[i]);
             }
         }
 
