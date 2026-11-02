@@ -12,7 +12,8 @@ no external crates). The `bench/` directory compares it against real `rustc`.
 ## Build and run
 
 ```sh
-source /workspace/.cargo/env          # rustc/cargo are installed here
+export RUSTUP_HOME=/workspace/.rustup          # toolchain lives here
+export PATH=/workspace/.cargo/bin:$PATH        # rustc/cargo are installed here
 cargo build --release --manifest-path compiler/Cargo.toml
 
 # compile a program
@@ -43,12 +44,19 @@ python3 tests/run.py -v
 
 ## Things that are easy to get wrong
 
-- **Stack slots grow downward.** A local in slot `s` lives at `-(s+1)*8(%rbp)`.
-  Address them positively and you overwrite the saved `%rbp`/return address and
-  segfault. See `Codegen::off`.
+- **Stack slots grow downward.** A local in slot `s` lives at
+  `-(s+1+nregs)*8(%rbp)`, where `nregs` is the number of registers holding
+  promoted locals. Address them positively and you overwrite the saved
+  `%rbp`/return address and segfault. See `Codegen::off`.
+- **Saved registers sit between `%rbp` and the frame.** The epilogue must point
+  `%rsp` at the lowest saved register (or add the frame size back) before
+  popping, otherwise `pop` reads the frame and the return address is lost.
+  `regs.nrs` and `calls.nrs` fail if this regresses.
+- **Arrays cannot be promoted.** A promoted local is named by its register, so
+  an array (which needs an address) or an index base must stay in memory.
 - **Array element 0 is at the lowest address.** An array in slots `s..s+n` has
-  element 0 at `-(s+n)*8(%rbp)`, with element `i` at `base + i*8`. Mixing this up
-  makes array writes run upward past `%rbp`. See `Codegen::array_off`.
+  element 0 at `-(s+n+nregs)*8(%rbp)`, with element `i` at `base + i*8`. Mixing
+  this up makes array writes run upward past `%rbp`. See `Codegen::array_off`.
 - **Statements vs. tail expressions.** Assignments inside a block must be
   detected before the trailing-`;` check in `parse_block`, otherwise `x = ...;`
   is parsed as an expression and rejected.

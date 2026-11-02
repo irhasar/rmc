@@ -82,6 +82,25 @@ bias. Two details are easy to get wrong and are covered by `tests/cases/div`:
 
 Modulo reuses the quotient: `q * d - dividend` gives the remainder.
 
+## Registers
+
+There is no allocator in the usual sense, but the hottest locals in a function
+are promoted. `promote` counts how often each scalar local is mentioned, takes
+the top five, and assigns them `%rbx`, `%r12`–`%r15` for the whole function.
+These are callee-saved, so a promoted value stays valid across a call and never
+needs spilling. Arrays are skipped because an array needs a memory address, as
+are slots used as the base of an index. Everything else stays in a stack slot,
+now placed below the saved registers so the two never overlap.
+
+The frame is padded so that the saved registers plus the slots together keep
+`%rsp` 16-byte aligned at every call, and the epilogue points `%rsp` at the
+lowest saved register before popping, which also discards the frame.
+
+Selection is whole-function, not per loop, so a local hot in one loop competes
+with one hot in another; `fib`, whose only variable is the parameter, sees no
+change. The benchmarks are call-dominated, so the win is small, but it is free:
+compile time, peak RSS and binary size are unchanged.
+
 ## Control flow
 
 - `while` and `loop` push `(continue_label, break_label)` onto a loop stack so
@@ -115,9 +134,10 @@ tiny.
 
 ## What is intentionally missing
 
-There is no optimiser beyond the folding described above. No register
-allocation, no common-subexpression elimination, no inlining, no loop
-transforms. The compiler is optimised for compile speed and simplicity, not for
-the speed of the code it produces. The one non-trivial peephole is division by a
-constant, which was worth a 1.4x speedup on `mandel.nrs`; everything else is
-local and cheap to compute.
+There is no optimiser beyond the folding and local promotion described above.
+No global register allocation, no common-subexpression elimination, no inlining,
+no loop transforms. The compiler is optimised for compile speed and simplicity,
+not for the speed of the code it produces. The two non-trivial passes are
+division by a constant, worth 1.4x on `mandel.nrs`, and the top-five local
+promotion, worth a few percent on `mix` and `sieve`; everything else is local
+and cheap to compute.

@@ -15,7 +15,7 @@ The point of the experiment is to measure the trade-off at the extremes:
 | compiler peak RSS                | ~12 MB                                | ~188 MB                          |
 | compile time (small programs)    | ~7 ms                                 | ~2.1 s                           |
 | artifact size                    | ~6 KB (static, no libc)               | ~290 KB                          |
-| generated-code quality           | small peephole optimiser              | highly optimised                 |
+| generated-code quality           | peephole + top-five local promotion   | highly optimised                 |
 
 `nrc` wins big on compile time, compiler memory, and artifact size. On runtime
 it is now within a few percent on divide-heavy and array-heavy loops, and still
@@ -142,32 +142,32 @@ Representative run on the development machine (Debian 13, gcc 14.2, rustc
 
 | program | compiler | compile wall | compile CPU | peak RSS | artifact | run time |
 | ------- | -------- | -----------: | ----------: | -------: | -------: | -------: |
-| hello   | nrc      |     7.80 ms  |    7.03 ms  |  11.8 MB |   5848 B |  1.87 ms |
-| hello   | rustc    |  2079.99 ms  | 2082.03 ms  | 182.9 MB | 289416 B |  2.40 ms |
-| fib     | nrc      |     7.95 ms  |    7.49 ms  |  11.8 MB |   5888 B | 15.72 ms |
-| fib     | rustc    |  2115.85 ms  | 2119.49 ms  | 183.6 MB | 291696 B |  8.68 ms |
-| mandel  | nrc      |     7.01 ms  |    6.75 ms  |  11.8 MB |   6184 B |105.17 ms |
-| mandel  | rustc    |  2116.81 ms  | 2121.21 ms  | 184.6 MB | 291776 B |107.12 ms |
-| sieve   | nrc      |     6.99 ms  |    6.70 ms  |  11.8 MB |   6008 B |  3.15 ms |
-| sieve   | rustc    |  2089.10 ms  | 2092.67 ms  | 184.9 MB | 292016 B |  4.03 ms |
-| mix     | nrc      |     6.87 ms  |    6.60 ms  |  11.8 MB |   5976 B | 18.82 ms |
-| mix     | rustc    |  2107.53 ms  | 2111.46 ms  | 184.2 MB | 291864 B | 16.89 ms |
+| hello   | nrc      |     8.47 ms  |    8.02 ms  |  11.8 MB |   5848 B |  2.05 ms |
+| hello   | rustc    |  2642.76 ms  | 2647.35 ms  | 181.8 MB | 289416 B |  2.68 ms |
+| fib     | nrc      |    10.09 ms  |    9.56 ms  |  11.8 MB |   5896 B | 18.59 ms |
+| fib     | rustc    |  2684.08 ms  | 2685.58 ms  | 181.5 MB | 291696 B |  9.88 ms |
+| mandel  | nrc      |     9.49 ms  |    8.82 ms  |  11.8 MB |   6192 B |114.52 ms |
+| mandel  | rustc    |  2791.48 ms  | 2794.04 ms  | 182.2 MB | 291776 B |117.14 ms |
+| sieve   | nrc      |    12.55 ms  |   11.76 ms  |  11.8 MB |   5952 B |  3.17 ms |
+| sieve   | rustc    |  2797.49 ms  | 2802.47 ms  | 181.1 MB | 292016 B |  4.23 ms |
+| mix     | nrc      |     8.60 ms  |    8.15 ms  |  11.8 MB |   5984 B | 20.36 ms |
+| mix     | rustc    |  2729.30 ms  | 2732.15 ms  | 182.6 MB | 291864 B | 18.75 ms |
 
 Summary of the ratios (rustc ÷ nrc):
 
 | dimension        | ratio      |
 | ---------------- | ---------: |
-| compile wall     | ~266–307×  |
-| compile CPU      | ~283–320×  |
-| compiler peak RSS| ~15.6×     |
+| compile wall     | ~223–317×  |
+| compile CPU      | ~238–335×  |
+| compiler peak RSS| ~15.4×     |
 | artifact size    | ~47–50×    |
-| run time         | 0.9–1.8× (rustc faster on call-heavy code) |
+| run time         | 0.75–1.88× (rustc faster on call-heavy code) |
 
-`nrc` beats rustc on `sieve` because the whole workload is a tight array loop
-that the simple code generator already handles well, and the static binary has
-no libc startup. `mandel` is now a dead heat after division by a constant became
-a multiply-and-shift. On `fib` (call-heavy) and `mix` (register-pressure-heavy)
-LLVM's register allocation and loop optimisation still win.
+`nrc` beats rustc on `sieve` (0.75×) and `hello` (0.76×) because the workload
+is a tight loop or a single call and the static binary has no libc startup.
+`mandel` is a dead heat after division by a constant became a multiply-and-shift.
+On `fib` (1.88×, call-heavy) and `mix` (1.09×, register-pressure-heavy) LLVM's
+loop transformations and register allocation still win.
 
 ### Reproducing the comparison honestly
 
@@ -183,11 +183,13 @@ This is a research toy, not a drop-in Rust compiler.
 
 - The language subset is tiny (see `docs/language.md`); no structs, enums,
   traits, generics, `match`, references, borrowing, or the standard library.
-- Code generation is a straightforward stack machine. There is no register
-  allocator and no instruction scheduling. The optimiser is a small peephole
-  pass: constants and locals become immediate/memory operands, comparisons
-  become a single `cmp`/`setcc`, array addressing folds into `disp(%rbp,%rax,8)`,
-  call arguments load straight from their operands, and division by a constant
+- Code generation is a straightforward stack machine for expressions. There is
+  no global register allocator and no instruction scheduling: the hottest five
+  scalar locals in each function are pinned to callee-saved registers, and
+  everything else lives on the stack. The optimiser is a small peephole pass:
+  constants and locals become immediate/memory operands, comparisons become a
+  single `cmp`/`setcc`, array addressing folds into `disp(%rbp,%rax,8)`, call
+  arguments load straight from their operands, and division by a constant
   becomes a magic multiply and shift instead of `idiv`.
 - Arrays live on the stack; there is no heap except the bump allocator.
 - `nrc` reads and writes programs that use `i64` and `bool`; there is no

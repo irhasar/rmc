@@ -1,9 +1,11 @@
 //! Direct x86-64 (System V, AT&T syntax) code generator.
 //!
-//! Expression results live in `%rax`. Temporaries are pushed on the machine
-//! stack, which keeps the generator simple and register allocation unnecessary.
-//! Every local variable occupies an 8-byte slot in the frame at
-//! `-(slot+1)*8(%rbp)`, growing downward from the saved frame pointer.
+//! Expression results live in `%rax` and temporaries are pushed on the machine
+//! stack, so the generator needs no register allocator. Locals are different:
+//! the hottest few scalars in each function are promoted into callee-saved
+//! registers for the whole function (see `promote`), and the rest occupy an
+//! 8-byte slot at `-(slot + 1 + nregs)*8(%rbp)`, below the saved registers and
+//! growing downward from `%rbp`.
 
 use crate::ast::*;
 use std::fmt::Write as _;
