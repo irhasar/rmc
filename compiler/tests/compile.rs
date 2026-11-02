@@ -725,3 +725,15 @@ fn a_struct_may_have_a_payload_enum_field() {
                return match w.o { O::S(v) => v + w.n, _ => 0 }; }";
     assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
 }
+
+#[test]
+fn a_spill_across_a_call_uses_a_register_not_the_frame() {
+    // `fib`'s only memory traffic is the first recursive result held across the
+    // second call. It must live in a callee-saved register, not a frame slot.
+    let out = asm(
+        "fn fib(n: i64) -> i64 { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); } \
+         fn main() -> i64 { return fib(arg_i64(1)); }",
+    );
+    assert!(out.contains("push %r12"), "expected a saved spill register in:\n{out}");
+    assert!(out.contains("mov %rax, %r12"), "expected the spill into %r12 in:\n{out}");
+}

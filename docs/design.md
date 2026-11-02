@@ -96,10 +96,12 @@ a `return`, or a tail expression).
 - Array access: for a local array, `a[i]` with a variable index is addressed as
   `disp(%rbp,%rax,8)` in one operand (the index is loaded into `%rax` first), and
   `a[3]` with a constant index needs no register. Stores use the same operand.
-- Deep or nested operands fall back to spilling the left result to a frame slot
-  while the right is evaluated, then reloading it into `%rax`. Spills use frame
-  slots rather than `push`/`pop` so `%rsp` never moves and a call needs no
-  alignment pad.
+- Deep or nested operands fall back to spilling the left result while the right
+  is evaluated, then reloading it into `%rax`. The first few spills go to
+  callee-saved registers (`%r12`–`%r14`), so a value held across a call costs a
+  register move rather than a store and a load; only a spill deeper than that
+  reaches a frame slot. Slots are used rather than `push`/`pop` so `%rsp` never
+  moves and a call needs no alignment pad.
 
 ### Division by a constant
 
@@ -128,11 +130,30 @@ Modulo reuses the quotient: `q * d - dividend` gives the remainder.
 
 ## Registers
 
-There is no allocator in the usual sense, but the hottest locals in a function
-are promoted. `promote` counts how often each scalar local is mentioned, takes
-the top five, and assigns them `%rbx`, `%r12`–`%r15` for the whole function.
-These are callee-saved, so a promoted value stays valid across a call and never
-needs spilling.
+There is no live-range allocator in the usual sense, but two kinds of value are
+kept in callee-saved registers, because a callee-saved register survives a call
+where a frame slot does not.
+
+**Hot locals** are promoted: `promote` counts how often each scalar local is
+mentioned, takes the top five, and assigns them `%rbx`, `%r12`–`%r15` for the
+whole function.
+
+**Spill temporaries** — the values that must outlive a subexpression, such as
+the first recursive result in `fib`'s `fib(n-1) + fib(n-2)` — go to registers
+too. `gen_fn` runs the body once with no spill registers reserved, which reports
+the deepest spill the function ever reaches, and reserves that many of the
+callee-saved registers the locals did not take. So the pool is shared and
+disjoint: a function that promotes five locals reserves no spill registers, and
+a function that promotes none can hold three spills in registers. Deeper spills
+than that fall back to frame slots as before.
+
+This is where a register allocator pays for itself. `fib` has one memory
+operation in its whole body, the store and reload of the first recursive result
+around the second call; putting it in a register is worth about 11% on the
+`fib` benchmark (2.04× rustc down to 1.83×) and every other benchmark is
+unchanged or slightly better. A true linear scan over live ranges would do more
+— reuse a register for a temporary that dies before a local is born — but the
+spill register is the part the call-heavy code actually notices.
 
 Scalar struct fields take part in promotion too, so a hot `acc.sum` stays in a
 register. A field is named by its register only where its slot is known: field
@@ -163,10 +184,9 @@ The number of spill slots is not known until the body is generated, so `gen_fn`
 runs the body twice: the first pass measures the deepest spill, the second sizes
 the frame and emits the final code.
 
-Selection is whole-function, not per loop, so a local hot in one loop competes
-with one hot in another; `fib`, whose only variable is the parameter, sees no
-change. The benchmarks are call-dominated, so the win is small, but it is free:
-compile time, peak RSS and binary size are unchanged.
+Local selection is whole-function, not per loop, so a local hot in one loop
+competes with one hot in another. The remaining gap to rustc on `fib` is the
+frame-based argument passing and the unoptimised prologue, not the spill.
 
 ## Control flow
 
