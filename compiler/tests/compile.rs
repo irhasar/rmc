@@ -940,3 +940,81 @@ fn a_shared_reference_is_not_assignable_to_a_mut_reference() {
                fn main() -> i64 { let x: i64 = 1; let r: &i64 = &x; return f(r); }";
     assert!(compile_to_asm(bad, &CompileOptions::default()).is_err());
 }
+
+#[test]
+fn a_field_read_through_a_reference_is_one_load() {
+    // `p.x` where `p: &Point` must fold to `disp(%reg)`, not a
+    // `mov`/`add`/`mov` sequence: three instructions per field is what made a
+    // `&self` accessor over a wide struct an order of magnitude slower than
+    // rustc on the `refs` benchmark.
+    let out = asm(
+        "struct P { x: i64, y: i64 } \
+         fn get(p: &P) -> i64 { return p.y; } \
+         fn main() -> i64 { let q: P = P { x: 1, y: 2 }; return get(&q); }",
+    );
+    let body: String = out
+        .lines()
+        .skip_while(|l| !l.starts_with("get:"))
+        .take_while(|l| !l.trim_start().starts_with("ret"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(body.contains("mov 8(%r"), "folded field load in:\n{body}");
+    assert!(!body.contains("add $8"), "no address add in:\n{body}");
+}
+
+#[test]
+fn a_field_read_through_a_double_reference_still_loads_the_inner_pointer() {
+    // The register fold only applies one level deep; `(**ppr).x` must go
+    // through the inner pointer, not treat it as a register.
+    let out = asm(
+        "struct P { x: i64, y: i64 } \
+         fn get(pp: &&P) -> i64 { return (**pp).x; } \
+         fn main() -> i64 { let q: P = P { x: 1, y: 2 }; let r: &P = &q; return get(&r); }",
+    );
+    assert!(out.contains("get:"), "function present in:\n{out}");
+}
+
+#[test]
+fn a_scalar_dereference_folds_into_a_comparison() {
+    // `*p < 5` with `p` in a register is one `cmp mem, imm`; the deref is a
+    // memory operand, not a load into `%rax` first.
+    let out = asm("fn lt(p: &i64) -> bool { return *p < 5; } fn main() -> i64 { let x: i64 = 1; if lt(&x) { return 1; } return 0; }");
+    let body: String = out
+        .lines()
+        .skip_while(|l| !l.starts_with("lt:"))
+        .take_while(|l| !l.trim_start().starts_with("ret"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(body.contains("cmpq $5, (%r"), "folded deref cmp in:\n{body}");
+}
+
+#[test]
+fn no_instructions_follow_an_unconditional_jump() {
+    // A `return` inside an expression emits `jmp epilogue` and then the rest of
+    // the expression, which is unreachable. The trim pass removes it; this
+    // checks the property directly rather than a specific instruction.
+    let out = asm("fn f(n: i64) -> i64 { if n > 0 { return 1; } return 2; } fn main() -> i64 { return f(1); }");
+    let mut dead = false;
+    for line in out.lines() {
+        let text = line.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let is_label = !line.starts_with('\t') && !line.starts_with(' ') && text.ends_with(':');
+        if is_label || line.starts_with('.') {
+            dead = false;
+            continue;
+        }
+        assert!(!dead, "unreachable instruction after a jump: {line:?}");
+        if text.starts_with("jmp ") || text == "ret" {
+            dead = true;
+        }
+    }
+}
+
+#[test]
+fn a_register_to_self_move_is_dropped() {
+    let out = asm("fn f(x: i64) -> i64 { return x; } fn main() -> i64 { return f(1); }");
+    assert!(!out.contains("mov %rax, %rax"), "self move in:\n{out}");
+    assert!(!out.contains("mov %rbx, %rbx"), "self move in:\n{out}");
+}

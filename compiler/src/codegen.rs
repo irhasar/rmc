@@ -295,6 +295,7 @@ impl Codegen {
     }
 
     fn gen_fn_body(&mut self, f: &FnDef) {
+        let fn_start = self.out.len();
         self.sp_off = 0;
         self.max_spill = 0;
         self.epilogue = self.new_label();
@@ -388,6 +389,51 @@ impl Codegen {
         self.line("leave");
         self.line("ret");
         self.raw(&format!(".size {}, .-{}", f.name, f.name));
+        self.trim_dead(fn_start);
+    }
+
+    /// Drop instructions that cannot be reached because the instruction before
+    /// them unconditionally transfers control (`jmp`, `ret`), and drop a
+    /// register-to-self `mov`. The generator emits both: a `return` inside an
+    /// expression leaves a `jmp` to the epilogue followed by the rest of the
+    /// expression, and a value already in a destination register is still
+    /// "stored". Neither changes behaviour — a `jmp`/`ret` has no fallthrough —
+    /// but both cost I-cache and decode slots.
+    ///
+    /// A label ends the unreachable run: a later `jmp` may target it, so the
+    /// instruction after a label is live even when the text before it is not.
+    /// Output from `start` onward is rewritten in place; the pass is a fixpoint
+    /// in one sweep because removing an instruction never creates a new label
+    /// or a new terminator.
+    fn trim_dead(&mut self, start: usize) {
+        let mut head = self.out[..start].to_string();
+        let body = self.out[start..].to_string();
+        let mut dead = false;
+        for raw_line in body.split_inclusive('\n') {
+            let line = raw_line.trim_end_matches('\n');
+            let is_label = !line.starts_with('\t') && !line.starts_with(' ') && line.ends_with(':');
+            let text = line.trim_start();
+            if is_label || line.starts_with('.') {
+                dead = false;
+            }
+            if dead {
+                continue;
+            }
+            if let Some(rest) = text.strip_prefix("mov ") {
+                // `mov %r, %r` with the same operand twice is a no-op.
+                if let Some((src, dst)) = rest.split_once(',') {
+                    let (src, dst) = (src.trim(), dst.trim());
+                    if src == dst && src.starts_with('%') {
+                        continue;
+                    }
+                }
+            }
+            if text == "jmp" || text.starts_with("jmp ") || text == "ret" {
+                dead = true;
+            }
+            head.push_str(raw_line);
+        }
+        self.out = head;
     }
 
     /// Copy `n` 8-byte words from the address in `%rsi` to the address in `%rdi`.
@@ -1141,9 +1187,17 @@ impl Codegen {
         }
     }
 
-    /// A `disp(%rbp)` operand for `base.field` when `base` is a struct local in
-    /// memory, or `None` when the base is not a plain local (the caller then
-    /// computes the address).
+    /// A `disp(base)` operand for `base.field`, or `None` when the base is not
+    /// a form that can be addressed directly (the caller then computes the
+    /// address). Two forms fold:
+    ///
+    /// * a struct local in memory: `disp(%rbp)`;
+    /// * a pointer held in a register — a reference local, or a dereference of
+    ///   one — which gives `disp(%reg)`, the whole `&self` field read as one
+    ///   instruction instead of `mov`/`add`/`mov`.
+    ///
+    /// A reference held in memory (never promoted, or spilled) would need its
+    /// pointer in a register first, so it does not fold here.
     fn field_operand(&self, base: &Expr, offset: i32) -> Option<String> {
         match base {
             Expr::Var { slot, ty: Type::Struct(_, size), .. } => {
@@ -1155,6 +1209,33 @@ impl Codegen {
                 }
                 Some(format!("{}(%rbp)", self.array_off(*slot, size / 8) + offset))
             }
+            Expr::Var { slot, ty: Type::Ref(..), .. } => {
+                self.reg_of(*slot).map(|r| format!("{}({r})", offset))
+            }
+            Expr::Deref { expr, .. } => self.ptr_reg(expr).map(|r| format!("{}({r})", offset)),
+            _ => None,
+        }
+    }
+
+    /// The register holding the pointer value of reference expression `e`, when
+    /// `e` is a reference *local* kept in a register. This is the only form whose
+    /// pointer needs no load: a `*p` used as a reference has its pointer in
+    /// memory, so it is not a register operand.
+    fn ptr_reg(&self, e: &Expr) -> Option<&'static str> {
+        match e {
+            Expr::Var { slot, ty: Type::Ref(..), .. } => self.reg_of(*slot),
+            _ => None,
+        }
+    }
+
+    /// The register holding the address of aggregate place `e`, when that
+    /// address is already in a register: a reference local (`r.x` where `r: &T`)
+    /// or a dereference of one (`(*q).x` where `q: &T`). A deeper chain
+    /// (`(**q).x`) has its inner pointer in memory and does not fold.
+    fn addr_reg(&self, e: &Expr) -> Option<&'static str> {
+        match e {
+            Expr::Var { slot, ty: Type::Ref(..), .. } => self.reg_of(*slot),
+            Expr::Deref { expr, .. } => self.ptr_reg(expr),
             _ => None,
         }
     }
@@ -1201,14 +1282,19 @@ impl Codegen {
             Expr::Field { base, offset, .. } => {
                 // A `Ref` base is a pointer: the address of its field is the
                 // pointer value plus the offset, not the address of the slot
-                // holding the pointer.
-                if Self::ref_base(base) {
-                    self.gen_expr(base);
+                // holding the pointer. When the pointer is already in a register
+                // this is a single `lea`.
+                if let Some(r) = self.addr_reg(base) {
+                    self.line(&format!("lea {}({r}), %rax", *offset));
                 } else {
-                    self.gen_addr(base);
-                }
-                if *offset != 0 {
-                    self.line(&format!("add ${}, %rax", *offset));
+                    if Self::ref_base(base) {
+                        self.gen_expr(base);
+                    } else {
+                        self.gen_addr(base);
+                    }
+                    if *offset != 0 {
+                        self.line(&format!("add ${}, %rax", *offset));
+                    }
                 }
             }
             // `*r` is a place whose address is the pointer `r` holds.
@@ -1542,6 +1628,12 @@ impl Codegen {
                 } else {
                     self.field_operand(base, *offset)
                 }
+            }
+            // `*p` reading a scalar through a reference in a register is a bare
+            // memory operand, so `x + *p` folds into one `add`. An aggregate
+            // referent's value is its address, which is not a simple operand.
+            Expr::Deref { expr, ty } if !ty.is_aggregate() => {
+                self.ptr_reg(expr).map(|r| format!("({r})"))
             }
             Expr::Index(base, idx) => {
                 // With bounds checks on, an element is never used as a bare
