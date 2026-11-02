@@ -17,7 +17,16 @@ pub struct Codegen {
     strings: Vec<(String, String)>, // (label, bytes)
     loops: Vec<(String, String)>,   // (continue_label, break_label)
     epilogue: String,
+    /// Slot -> callee-saved register for locals promoted out of memory in the
+    /// function currently being generated. Empty means every local is in memory.
+    regs: Vec<(i32, &'static str)>,
 }
+
+/// Callee-saved registers eligible for promoting a local out of memory. They
+/// survive calls, so a promoted variable does not need to be spilled around
+/// one. `%rbp` and `%rsp` are excluded; `%rbx` is listed first because a short
+/// register name keeps the generated assembly readable.
+const ALLOC_REGS: [&str; 5] = ["%rbx", "%r12", "%r13", "%r14", "%r15"];
 
 impl Codegen {
     pub fn new() -> Self {
@@ -29,7 +38,13 @@ impl Codegen {
             strings: Vec::new(),
             loops: Vec::new(),
             epilogue: String::new(),
+            regs: Vec::new(),
         }
+    }
+
+    /// The register holding local `slot`, if it was promoted out of memory.
+    fn reg_of(&self, slot: i32) -> Option<&'static str> {
+        self.regs.iter().find(|(s, _)| *s == slot).map(|(_, r)| *r)
     }
 
     fn line(&mut self, s: &str) {
@@ -43,17 +58,24 @@ impl Codegen {
         self.out.push('\n');
     }
 
-    /// Byte offset of stack `slot` relative to `%rbp`. Slots grow downward so
-    /// they never overlap the saved `%rbp` and return address above it.
-    fn off(slot: i32) -> i32 {
-        -(slot + 1) * 8
+    /// Number of callee-saved registers currently holding promoted locals.
+    fn nregs(&self) -> i32 {
+        self.regs.len() as i32
+    }
+
+    /// Byte offset of stack `slot` relative to `%rbp`. Slots grow downward, and
+    /// the saved promoted registers sit in the lowest bytes of the frame, so
+    /// every slot is shifted past them and never overlaps `%rbp` or a saved
+    /// register.
+    fn off(&self, slot: i32) -> i32 {
+        -(slot + 1 + self.nregs()) * 8
     }
 
     /// Address of element 0 of an `n`-element array occupying `slot..slot+n`.
     /// Slots are laid out downward, so the lowest address is that of the last
     /// slot; elements are then addressed upward from there as `base + i*8`.
-    fn array_off(slot: i32, n: usize) -> i32 {
-        -(slot + n as i32) * 8
+    fn array_off(&self, slot: i32, n: usize) -> i32 {
+        -(slot + n as i32 + self.nregs()) * 8
     }
 
     fn new_label(&mut self) -> String {
@@ -105,20 +127,39 @@ impl Codegen {
     fn gen_fn(&mut self, f: &FnDef) {
         self.sp_off = 0;
         self.epilogue = self.new_label();
+        // Promote the most-used scalar locals into callee-saved registers.
+        self.regs = Self::promote(f);
+        let saved: Vec<&'static str> = self.regs.iter().map(|(_, r)| *r).collect();
+
+        let nregs = self.regs.len();
         self.raw(&format!(".globl {}", f.name));
         self.raw(&format!(".type {}, @function", f.name));
         self.raw(&format!("{}:", f.name));
         self.line("push %rbp");
         self.line("mov %rsp, %rbp");
-        let frame = (((f.nslots * 8) + 15) / 16) * 16;
+        // Save the registers used for promoted locals. The frame is padded to a
+        // multiple of 16 so that, counting these pushes, %rsp stays 16-byte
+        // aligned at every call.
+        for r in &saved {
+            self.line(&format!("push {r}"));
+        }
+        let saved_bytes = nregs as i32 * 8;
+        let slots_bytes = f.nslots * 8;
+        // The total depth below %rbp (saved registers plus frame) must be a
+        // multiple of 16 so %rsp is 16-byte aligned at every call.
+        let frame = ((slots_bytes + saved_bytes + 15) / 16) * 16 - saved_bytes;
         if frame > 0 {
             self.line(&format!("sub ${frame}, %rsp"));
         }
-        // Spill incoming integer arguments into their slots.
+        // Spill incoming integer arguments into their slots, or into their
+        // registers when the parameter was promoted.
         const ARG_REGS: [&str; 6] = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"];
         for (i, _) in f.params.iter().enumerate() {
             if i < 6 {
-                self.line(&format!("mov {}, {}(%rbp)", ARG_REGS[i], Self::off(i as i32)));
+                match self.reg_of(i as i32) {
+                    Some(r) => self.line(&format!("mov {}, {r}", ARG_REGS[i])),
+                    None => self.line(&format!("mov {}, {}(%rbp)", ARG_REGS[i], self.off(i as i32))),
+                }
             }
         }
         let ty = self.gen_block(&f.body);
@@ -126,9 +167,114 @@ impl Codegen {
             self.line("xor %eax, %eax");
         }
         self.raw(&format!("{}:", self.epilogue));
+        // The saved registers sit just below %rbp; point %rsp at the lowest one
+        // and pop them back, which also discards the frame.
+        if nregs > 0 {
+            self.line(&format!("lea -{}(%rbp), %rsp", nregs * 8));
+            for r in saved.iter().rev() {
+                self.line(&format!("pop {r}"));
+            }
+        }
         self.line("leave");
         self.line("ret");
         self.raw(&format!(".size {}, .-{}", f.name, f.name));
+        self.regs.clear();
+    }
+
+    /// Choose up to `ALLOC_REGS.len()` scalar locals to keep in registers for
+    /// the whole function, ordered by how often they are mentioned. Only slots
+    /// that are never the base of an array access qualify, since an array needs
+    /// a memory address. Ties break toward the lowest slot, which is where
+    /// parameters live.
+    fn promote(f: &FnDef) -> Vec<(i32, &'static str)> {
+        let mut counts: Vec<(i32, u32)> = (0..f.nslots).map(|s| (s, 0u32)).collect();
+        let mut array_slots: Vec<i32> = Vec::new();
+        Self::count_block(&f.body, &mut counts, &mut array_slots);
+        for s in &array_slots {
+            if let Some(e) = counts.iter_mut().find(|(slot, _)| slot == s) {
+                e.1 = 0;
+            }
+        }
+        counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        counts
+            .into_iter()
+            .filter(|(_, c)| *c > 0)
+            .take(ALLOC_REGS.len())
+            .zip(ALLOC_REGS.iter())
+            .map(|((slot, _), reg)| (slot, *reg))
+            .collect()
+    }
+
+    fn count_block(b: &Block, counts: &mut Vec<(i32, u32)>, array_slots: &mut Vec<i32>) {
+        for s in &b.stmts {
+            Self::count_stmt(s, counts, array_slots);
+        }
+        if let Some(t) = &b.tail {
+            Self::count_expr(t, counts, array_slots);
+        }
+    }
+
+    fn count_stmt(s: &Stmt, counts: &mut Vec<(i32, u32)>, array_slots: &mut Vec<i32>) {
+        match s {
+            Stmt::Let { init, .. } => {
+                if let Some(e) = init {
+                    Self::count_expr(e, counts, array_slots);
+                }
+            }
+            Stmt::Assign { target, value } => {
+                Self::count_expr(target, counts, array_slots);
+                Self::count_expr(value, counts, array_slots);
+            }
+            Stmt::Expr(e) => Self::count_expr(e, counts, array_slots),
+            Stmt::While(c, b) => {
+                Self::count_expr(c, counts, array_slots);
+                Self::count_block(b, counts, array_slots);
+            }
+            Stmt::Loop(b) => Self::count_block(b, counts, array_slots),
+            Stmt::Return(v) => {
+                if let Some(e) = v {
+                    Self::count_expr(e, counts, array_slots);
+                }
+            }
+            Stmt::Break | Stmt::Continue => {}
+        }
+    }
+
+    fn count_expr(e: &Expr, counts: &mut Vec<(i32, u32)>, array_slots: &mut Vec<i32>) {
+        match e {
+            Expr::Var { slot, .. } => {
+                if let Some(c) = counts.iter_mut().find(|(s, _)| s == slot) {
+                    c.1 += 1;
+                }
+            }
+            Expr::Index(base, idx) => {
+                if let Expr::Var { slot, ty: Type::Array(..), .. } = base.as_ref() {
+                    array_slots.push(*slot);
+                }
+                Self::count_expr(base, counts, array_slots);
+                Self::count_expr(idx, counts, array_slots);
+            }
+            Expr::Bin(_, a, b) => {
+                Self::count_expr(a, counts, array_slots);
+                Self::count_expr(b, counts, array_slots);
+            }
+            Expr::Un(_, a) | Expr::Cast(a, _) => Self::count_expr(a, counts, array_slots),
+            Expr::Call(_, args) => {
+                for a in args {
+                    Self::count_expr(a, counts, array_slots);
+                }
+            }
+            Expr::If(c, t, els) => {
+                Self::count_expr(c, counts, array_slots);
+                Self::count_block(t, counts, array_slots);
+                if let Some(e) = els {
+                    Self::count_block(e, counts, array_slots);
+                }
+            }
+            Expr::Block(b) => Self::count_block(b, counts, array_slots),
+            Expr::ArrayLit(v, _) => Self::count_expr(v, counts, array_slots),
+            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) => {}
+        }
     }
 
     fn gen_block(&mut self, b: &Block) -> Type {
@@ -159,19 +305,22 @@ impl Codegen {
                     self.fill_array(*slot, elem.size(), *n);
                 } else if let Some(e) = init {
                     self.gen_expr(e);
-                    self.line(&format!("mov %rax, {}(%rbp)", Self::off(*slot)));
+                    self.store_slot(*slot);
                 } else {
-                    self.line(&format!("movq $0, {}(%rbp)", Self::off(*slot)));
+                    match self.reg_of(*slot) {
+                        Some(r) => self.line(&format!("xor {r}, {r}")),
+                        None => self.line(&format!("movq $0, {}(%rbp)", self.off(*slot))),
+                    }
                 }
             }
             Stmt::Assign { target, value } => {
                 match target {
                     Expr::Var { slot, .. } => {
                         self.gen_expr(value);
-                        self.line(&format!("mov %rax, {}(%rbp)", Self::off(*slot)));
+                        self.store_slot(*slot);
                     }
                     Expr::Index(base, idx) => {
-                        match Self::array_elem_operand(base, idx) {
+                        match self.array_elem_operand(base, idx) {
                             // Constant index: one store.
                             Some(op) if !op.contains("%rax") => {
                                 self.gen_expr(value);
@@ -180,7 +329,7 @@ impl Codegen {
                             // Variable index: load the index into %rax, then
                             // store through `disp(%rbp,%rax,8)`.
                             Some(op) => {
-                                match Self::simple_operand(value) {
+                                match self.simple_operand(value) {
                                     Some(vs) if vs.starts_with('$') => {
                                         self.gen_expr(idx);
                                         self.line(&format!("movq {vs}, {op}"));
@@ -261,7 +410,7 @@ impl Codegen {
             // Only 8-byte elements are supported by sema.
             return;
         }
-        let base = Self::array_off(slot, n);
+        let base = self.array_off(slot, n);
         if n == 0 {
             return;
         }
@@ -287,8 +436,8 @@ impl Codegen {
         match e {
             Expr::Var { slot, ty, .. } => {
                 let off = match ty {
-                    Type::Array(_, n) => Self::array_off(*slot, *n),
-                    _ => Self::off(*slot),
+                    Type::Array(_, n) => self.array_off(*slot, *n),
+                    _ => self.off(*slot),
                 };
                 self.line(&format!("lea {off}(%rbp), %rax"));
             }
@@ -323,11 +472,12 @@ impl Codegen {
             Expr::Var { slot, ty, .. } => {
                 match ty {
                     Type::Array(_, n) => {
-                        self.line(&format!("lea {}(%rbp), %rax", Self::array_off(*slot, *n)));
+                        self.line(&format!("lea {}(%rbp), %rax", self.array_off(*slot, *n)));
                     }
-                    _ => {
-                        self.line(&format!("mov {}(%rbp), %rax", Self::off(*slot)));
-                    }
+                    _ => match self.reg_of(*slot) {
+                        Some(r) => self.line(&format!("mov {r}, %rax")),
+                        None => self.line(&format!("mov {}(%rbp), %rax", self.off(*slot))),
+                    },
                 }
                 ty.clone()
             }
@@ -336,7 +486,7 @@ impl Codegen {
                     Expr::Var { ty: Type::Array(e, _), .. } => (**e).clone(),
                     _ => Type::I64,
                 };
-                match Self::array_elem_operand(base, _idx) {
+                match self.array_elem_operand(base, _idx) {
                     // `disp(%rbp,%reg,8)` addresses the element in one operand.
                     Some(op) if op.contains("%rax") => {
                         self.gen_expr(_idx);
@@ -404,22 +554,34 @@ impl Codegen {
     /// register: an immediate, a scalar local, or an array element with a
     /// constant index. Anything needing a register (a variable index) returns
     /// `None` so the caller falls back to materialising the value in `%rax`.
-    fn simple_operand(e: &Expr) -> Option<String> {
+    /// A local promoted to a register is returned as that register name.
+    fn simple_operand(&self, e: &Expr) -> Option<String> {
         match e {
             Expr::Int(v) if (-2_147_483_648..=2_147_483_647).contains(v) => Some(format!("${v}")),
             Expr::Bool(b) => Some(format!("${}", if *b { 1 } else { 0 })),
             Expr::Var { slot, ty, .. } => match ty {
                 Type::Array(..) => None,
-                _ => Some(format!("{}(%rbp)", Self::off(*slot))),
+                _ => match self.reg_of(*slot) {
+                    Some(r) => Some(r.to_string()),
+                    None => Some(format!("{}(%rbp)", self.off(*slot))),
+                },
             },
             Expr::Index(base, idx) => {
-                match Self::array_elem_operand(base, idx) {
+                match self.array_elem_operand(base, idx) {
                     // Only register-free operands are usable here.
                     Some(op) if !op.contains("%rax") => Some(op),
                     _ => None,
                 }
             }
             _ => None,
+        }
+    }
+
+    /// Store `%rax` into local `slot`, honouring a register promotion.
+    fn store_slot(&mut self, slot: i32) {
+        match self.reg_of(slot) {
+            Some(r) => self.line(&format!("mov %rax, {r}")),
+            None => self.line(&format!("mov %rax, {}(%rbp)", self.off(slot))),
         }
     }
 
@@ -648,7 +810,7 @@ impl Codegen {
     /// An operand `disp(%rbp,%rax,8)` for `base[idx]` where `base` is a local
     /// array. The caller must have the index value in `%rax`. Returns `None`
     /// for anything else, so the caller falls back to computing the address.
-    fn array_elem_operand(base: &Expr, idx: &Expr) -> Option<String> {
+    fn array_elem_operand(&self, base: &Expr, idx: &Expr) -> Option<String> {
         let (slot, n) = match base {
             Expr::Var { slot, ty: Type::Array(_, n), .. } => (*slot, *n),
             _ => return None,
@@ -656,12 +818,12 @@ impl Codegen {
         match idx {
             Expr::Int(v) if (-2_147_483_648..=2_147_483_647).contains(v) => {
                 // Constant index: no register needed at all.
-                Some(format!("{}(%rbp)", Self::array_off(slot, n) + *v as i32 * 8))
+                Some(format!("{}(%rbp)", self.array_off(slot, n) + *v as i32 * 8))
             }
             Expr::Var { slot: _, ty: Type::I64, .. } => {
                 // The index lives in a slot; the caller must load it into %rax
                 // and bake the array base offset into the displacement.
-                Some(format!("{}(%rbp,%rax,8)", Self::array_off(slot, n)))
+                Some(format!("{}(%rbp,%rax,8)", self.array_off(slot, n)))
             }
             _ => None,
         }
@@ -673,8 +835,8 @@ impl Codegen {
     /// memory-vs-memory and immediate-vs-immediate, and needs an explicit `q`
     /// suffix when an immediate is compared against memory.
     fn emit_cmp(&mut self, a: &Expr, b: &Expr) -> bool {
-        let av = Self::simple_operand(a);
-        let bv = Self::simple_operand(b);
+        let av = self.simple_operand(a);
+        let bv = self.simple_operand(b);
         match (av, bv) {
             (Some(x), Some(y)) => {
                 match (x.starts_with('$'), y.starts_with('$')) {
@@ -724,8 +886,8 @@ impl Codegen {
     /// in `%rcx`. Constants and locals are folded in as immediate or memory
     /// operands; anything else goes through the stack.
     fn eval_operands(&mut self, a: &Expr, b: &Expr) {
-        let ra = Self::simple_operand(a);
-        let rb = Self::simple_operand(b);
+        let ra = self.simple_operand(a);
+        let rb = self.simple_operand(b);
         match (ra, rb) {
             (Some(la), Some(rb)) => {
                 self.line(&format!("mov {la}, %rax"));
@@ -788,7 +950,7 @@ impl Codegen {
         // registers for any arity. For one or two arguments the registers used
         // are `%rdi`/`%rsi`, which expression evaluation never clobbers, so any
         // argument without a nested call is safe too.
-        let direct = args.iter().all(Self::arg_is_simple)
+        let direct = args.iter().all(|a| self.arg_is_simple(a))
             || (args.len() <= 2 && !args.iter().any(Self::contains_call));
         if direct {
             for (a, r) in args.iter().zip(ARG_REGS.iter()) {
@@ -820,8 +982,8 @@ impl Codegen {
 
     /// An argument that loads into a register without using the `%rcx`/`%rdx`
     /// scratch registers that later arguments would clobber.
-    fn arg_is_simple(e: &Expr) -> bool {
-        Self::simple_operand(e).is_some() || matches!(e, Expr::Str(_))
+    fn arg_is_simple(&self, e: &Expr) -> bool {
+        self.simple_operand(e).is_some() || matches!(e, Expr::Str(_))
     }
 
     /// True when evaluating `e` may perform a call.
