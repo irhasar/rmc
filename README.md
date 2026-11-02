@@ -130,7 +130,8 @@ fn main() -> i64 {
 Supported: `i64`, `bool`, fixed-size arrays, and structs with named fields;
 functions with up to six parameters; `let` / `let mut`; assignment to variables,
 array elements and struct fields (including compound `+=` and friends);
-`if`/`else`, `while`, `loop`, and `for i in a..b`; `break`, `continue`,
+`if`/`else`, `while`, `loop`, and `for i in a..b`; `match` on integers (literal
+patterns and `_`); `break`, `continue`,
 `return`; arithmetic, comparison, bitwise (`&`/`|`/`^`) and shift (`<<`/`>>`)
 operators; `&&`/`||`; string literals;
 attributes such as `#[derive(Copy, Clone)]` (parsed and ignored); and a small
@@ -211,9 +212,9 @@ Both binaries are measured the same way, and both read their workload from
 rmc is a small, self-contained compiler, not a drop-in replacement for rustc.
 
 - The language subset is small (see `docs/language.md`). Structs, arrays, `for`,
-  aggregates across calls and overflow checks exist; enums, traits, generics,
-  `match`, references and borrowing, methods, closures, floating point and the
-  standard library do not. Aggregate values are passed by value through a hidden
+  aggregates across calls, overflow checks and integer `match` exist; enums,
+  traits, generics, references and borrowing, methods, closures, floating point
+  and the standard library do not. Aggregate values are passed by value through a hidden
   pointer, but there is no way to pass one *by reference*, and a copy is made on
   every call.
 - Code generation is a stack machine for expressions. The hottest five scalar
@@ -247,8 +248,8 @@ of value per unit of effort:
 2. **References and borrowing.** `&T` / `&mut T` parameters would remove the
    copy an aggregate argument makes today, and are the prerequisite for most
    data-structure code.
-3. **More types.** `u*`/`i*` widths, `f64`, and `match` on integers, which
-   together cover most of what small programs actually need.
+3. **More types.** `u*`/`i*` widths and `f64`, which together cover most of what
+   small programs actually need. (`match` on integers is done.)
 4. **Enums and `impl` methods.** The next step after structs toward expressing
    real data structures.
 5. **More backends.** A second target (ARM64 or a simple VM) would force the

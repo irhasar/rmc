@@ -468,3 +468,19 @@ fn shift_binds_looser_than_addition() {
     assert!(out.contains("add $2, %rax"), "the sum is formed first");
     assert!(out.contains("sal $3, %rax"), "then shifted");
 }
+
+#[test]
+fn match_desugars_to_equality_compares() {
+    // Each integer arm becomes an `==` against the scrutinee.
+    let out = asm("fn f(x: i64) -> i64 { match x { 0 => 10, 1 => 20, _ => 30 } } fn main() -> i64 { return f(0); }");
+    assert!(out.contains("cmpq $0,"), "arm 0 compares against 0");
+    assert!(out.contains("cmpq $1,"), "arm 1 compares against 1");
+}
+
+#[test]
+fn a_match_scrutinee_call_runs_once() {
+    // A call in the scrutinee is bound to a temporary before the arm tests, so
+    // it is evaluated once no matter how many arms follow.
+    let out = asm("fn g() -> i64 { return 3; } fn main() -> i64 { return match g() { 1 => 10, 3 => 30, _ => 0 }; }");
+    assert_eq!(out.matches("call g").count(), 1, "the scrutinee call runs once");
+}

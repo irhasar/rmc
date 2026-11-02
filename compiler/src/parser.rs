@@ -248,6 +248,7 @@ impl Parser {
                 | Some(Tok::Minus)
                 | Some(Tok::Bang)
                 | Some(Tok::If)
+                | Some(Tok::Match)
                 | Some(Tok::LBracket)
                 // A bare `{ ... }` is a block expression, valid as a statement
                 // without a `;`. Without this it fell through to `parse_stmt`,
@@ -616,6 +617,105 @@ impl Parser {
         })
     }
 
+    /// `match scrutinee { pat => expr, ... }` on integers. It desugars to a
+    /// chain of `if` comparisons, so sema and codegen need no new cases. A
+    /// pattern is an integer literal (optionally negated) or `_`; the first arm
+    /// whose pattern equals the scrutinee runs, and `_` matches anything. The
+    /// scrutinee is bound to a hidden `let` when it is not already a variable,
+    /// so it is evaluated exactly once even when it is a call.
+    fn parse_match(&mut self) -> PResult<Expr> {
+        self.expect(Tok::Match)?;
+        let scrutinee = self.parse_cond()?;
+        self.expect(Tok::LBrace)?;
+        let mut arms: Vec<(Option<i64>, Expr)> = Vec::new();
+        while self.peek() != Some(&Tok::RBrace) {
+            if self.peek().is_none() {
+                return Err(format!("at byte {}: unexpected end of input in `match`", self.pos()));
+            }
+            let pat = match self.peek().cloned() {
+                Some(Tok::Underscore) => {
+                    self.i += 1;
+                    None
+                }
+                Some(Tok::Minus) => {
+                    self.i += 1;
+                    match self.bump() {
+                        Tok::Int(v) => Some(v.checked_neg().ok_or_else(|| {
+                            format!("at byte {}: pattern literal out of range", self.pos())
+                        })?),
+                        other => return Err(format!(
+                            "at byte {}: expected an integer after `-` in a pattern, found {}",
+                            self.pos(), other.describe()
+                        )),
+                    }
+                }
+                Some(Tok::Int(v)) => {
+                    self.i += 1;
+                    Some(v)
+                }
+                other => return Err(format!(
+                    "at byte {}: expected an integer or `_` pattern, found {}",
+                    self.pos(),
+                    other.map(|t| t.describe()).unwrap_or_else(|| "end of input".into())
+                )),
+            };
+            self.expect(Tok::FatArrow)?;
+            let body = self.parse_expr()?;
+            arms.push((pat, body));
+            // A comma separates arms, but a block-bodied arm may omit it, so
+            // only `}` ends the list early.
+            if self.eat(&Tok::Comma) {
+                continue;
+            }
+            if self.peek() == Some(&Tok::RBrace) {
+                break;
+            }
+        }
+        self.expect(Tok::RBrace)?;
+        if arms.is_empty() {
+            return Err(format!("at byte {}: `match` needs at least one arm", self.pos()));
+        }
+        Ok(self.desugar_match(scrutinee, arms))
+    }
+
+    /// Fold the arms into nested `if`s. The scrutinee is named once; an arm
+    /// with `_` becomes the `else` (so any arm after it is unreachable, as in
+    /// Rust). With no `_`, the chain has no final `else`, so a non-matching
+    /// value yields `()`.
+    fn desugar_match(&mut self, scrutinee: Expr, arms: Vec<(Option<i64>, Expr)>) -> Expr {
+        let (subj, prelude) = match scrutinee {
+            Expr::Var { .. } | Expr::Int(_) => (scrutinee, None),
+            other => {
+                let name = format!("\u{0}mt{}", self.tmp);
+                self.tmp += 1;
+                (
+                    Expr::Var { name: name.clone(), slot: -1, ty: Type::I64 },
+                    Some(Stmt::Let { name, ty: Some(Type::I64), init: Some(other), slot: -1 }),
+                )
+            }
+        };
+        let mut acc: Option<Expr> = None;
+        for (pat, body) in arms.into_iter().rev() {
+            acc = Some(match pat {
+                None => body,
+                Some(k) => {
+                    let cond = Expr::Bin(BinOp::Eq, Box::new(subj.clone()), Box::new(Expr::Int(k)));
+                    let els = acc.map(|e| Block { stmts: Vec::new(), tail: Some(Box::new(e)) });
+                    Expr::If(
+                        Box::new(cond),
+                        Block { stmts: Vec::new(), tail: Some(Box::new(body)) },
+                        els,
+                    )
+                }
+            });
+        }
+        let acc = acc.expect("a `match` has at least one arm");
+        match prelude {
+            None => acc,
+            Some(stmt) => Expr::Block(Block { stmts: vec![stmt], tail: Some(Box::new(acc)) }),
+        }
+    }
+
     fn parse_primary(&mut self) -> PResult<Expr> {
         match self.peek().cloned() {
             Some(Tok::Int(v)) => {
@@ -696,6 +796,7 @@ impl Parser {
                 };
                 Ok(Expr::If(Box::new(cond), then, els))
             }
+            Some(Tok::Match) => self.parse_match(),
             Some(Tok::LBrace) => Ok(Expr::Block(self.parse_block()?)),
             Some(Tok::LBracket) => {
                 self.i += 1;

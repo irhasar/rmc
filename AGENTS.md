@@ -42,6 +42,10 @@ python3 tests/run.py -v
   `<< >>`, `+ -`, `* / %`. Note shifts bind *looser* than `+`/`-`, matching
   Rust: `parse_shift` consumes `parse_add`, and `parse_bitand` consumes
   `parse_shift`. Swapping these silently mis-parses `1 + 2 << 3`.
+  `match` is parsed here and *desugared to a chain of `if`s* (`desugar_match`),
+  so sema and codegen have no `match` case. A non-`Var`/`Int` scrutinee is bound
+  to a hidden `let` first, so a call in the scrutinee runs once. An arm after
+  `_` is unreachable and dropped (the `_` body becomes the `else`).
 - `compiler/src/ast.rs` — AST and `Type` (`I64`, `Bool`, `Unit`, `Array`,
   `Struct`, and the parser-only placeholder `Named`).
 - `compiler/src/sema.rs` — type checking, struct layout, stack-slot allocation,

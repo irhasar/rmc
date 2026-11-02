@@ -99,6 +99,11 @@ Rust panic. Division by zero always traps at the CPU level.
 - Array literals: `[a, b, c]` and `[value; count]`.
 - Struct literals: `Point { x: 1, y: 2 }`, usable as a `let` initialiser.
 - Blocks and `if`/`else` are expressions.
+- `match` on integers: `match x { 0 => a, 1 => b, _ => c }`. An arm pattern is
+  an integer literal (optionally negated) or `_`. The first equal arm runs and
+  `_` matches anything; it is an expression, usable as a statement or a value,
+  and a comma before `}` may be omitted. A non-exhaustive `match` (no `_`) that
+  is used as a value is a type error, exactly as in Rust.
 - String literals, given type `i64` (a pointer to a `{len, bytes}` record), so
   they can be passed to `print_str`.
 
@@ -122,7 +127,7 @@ reuse and coalesces neighbours. Memory is not zeroed.
 
 ## Not supported
 
-Enums, traits, generics, `match`, references, borrowing,
+Enums, traits, generics, references, borrowing,
 lifetimes, `impl` blocks, methods, modules, macros, `use`, closures, `f32`/`f64`,
 `u*`/`i*` types other than `i64`, tuples, and the standard library. Aggregates
 cross a call only by value; there are no `&T`/`&mut T` parameters.
