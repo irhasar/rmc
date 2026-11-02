@@ -1041,6 +1041,13 @@ impl Codegen {
                     self.line(&format!("add ${}, %rax", *offset));
                 }
             }
+            // A field or index base that is not a named local is a temporary
+            // whose value *is* its address: a call's hidden return buffer, a
+            // block or `if` yielding a struct, or a struct literal. Evaluating
+            // it leaves that address in `%rax`.
+            Expr::Call { .. } | Expr::Block(_) | Expr::If(..) | Expr::StructLit { .. } => {
+                self.gen_expr(e);
+            }
             _ => unreachable!("sema guarantees a valid address expression"),
         }
     }

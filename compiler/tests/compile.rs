@@ -425,3 +425,13 @@ fn a_bare_block_parses_as_a_statement() {
     assert!(out.contains("$1,"), "outer binding is emitted");
     assert_eq!(out.matches("call print_i64").count(), 2, "both blocks print");
 }
+
+#[test]
+fn a_field_of_a_call_result_is_addressed() {
+    // `mk().y` is a field of an aggregate temporary. The base is not an
+    // lvalue, so `gen_addr` must evaluate it to get its address; it used to
+    // hit an `unreachable!()` and abort the compiler.
+    let out = asm("struct P { x: i64, y: i64 } fn mk(a: i64) -> P { return P { x: a, y: a * 2 }; } fn main() -> i64 { print_i64(mk(5).y); return 0; }");
+    assert!(out.contains("call mk"), "the maker is called");
+    assert!(out.contains("(%rax), %rax"), "the field is read from the returned address");
+}

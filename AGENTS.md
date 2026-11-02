@@ -163,6 +163,13 @@ python3 tests/run.py -v
   block. Keep `check_let_init` special-casing only the *direct* initialiser; a
   flag around the whole initialiser leaks into nested literals (a struct
   literal's fields are checked while it is set).
+- **`gen_addr` must handle every aggregate-valued base.** A field or index
+  whose base is a call result, a block, an `if`, or a struct literal is a
+  *temporary*: its value is its own address. `gen_addr` matches those forms and
+  evaluates the base, leaving the address in `%rax`. Only `Var`/`Field`/`Index`
+  are true lvalues; the catch-all is `unreachable!`, so a new aggregate-valued
+  expression form must be added here too or the compiler aborts on
+  `mk().y`-style access.
 - **Benchmark inputs must be opaque.** Programs read their workload via
   `arg_i64` (rmc) or `env::args()` + `black_box` (Rust), so LLVM cannot
   constant-fold the workload away. Do not "simplify" them to constants.
