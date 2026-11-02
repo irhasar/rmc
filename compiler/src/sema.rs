@@ -605,18 +605,78 @@ impl Sema {
                 // is re-checked below. Without this a repeat literal used as an
                 // index base, argument, return or field would be emitted as a
                 // bare scalar and dereferenced as an address.
+                let arr_slot = self.alloc_slots(*n as i32);
                 let name = "\u{0}rep".to_string();
-                let var = Expr::Var { name: name.clone(), slot: -1, ty: ty.clone() };
+                let var = Expr::Var { name: name.clone(), slot: arr_slot, ty: ty.clone() };
                 let stmts = vec![Stmt::Let {
                     name: name.clone(),
                     ty: Some(ty.clone()),
                     init: Some(Expr::ArrayLit(val.clone(), *n)),
-                    slot: -1,
+                    slot: arr_slot,
                 }];
                 *e = Expr::Block(Block { stmts, tail: Some(Box::new(var)) });
                 // Re-check the rewritten block so its statements are typed and
                 // slotted like any other.
                 self.check_expr(e, scope)
+            }
+            Expr::ArrayList(elems) => {
+                // The parser never produces an empty list: it requires at least
+                // one element before the `]`, so `[]` fails there.
+                let elem_ty = self.check_expr(&mut elems[0], scope)?;
+                if !elem_ty.is_scalar() {
+                    return Err(format!(
+                        "array elements must be `i64` or `bool`, found {elem_ty:?}"
+                    ));
+                }
+                for e in elems.iter_mut().skip(1) {
+                    let t = self.check_expr(e, scope)?;
+                    if t != elem_ty {
+                        return Err(format!(
+                            "array literal: element type mismatch, expected {elem_ty:?}, found {t:?}"
+                        ));
+                    }
+                }
+                let n = elems.len();
+                let arr_ty = Type::Array(Box::new(elem_ty), n);
+                // Build `{ let mut __list: [T; n]; __list[0] = e0; ...; __list }`.
+                // The `let` is left uninitialised on purpose: every element is
+                // written by an assignment, and an uninitialised local needs no
+                // default value (which an aggregate element type has no way to
+                // spell). Codegen zero-fills a scalar array anyway.
+                let arr_slot = self.alloc_slots(n as i32);
+                let name = "\u{0}list".to_string();
+                let mut stmts = vec![Stmt::Let {
+                    name: name.clone(),
+                    ty: Some(arr_ty.clone()),
+                    init: None,
+                    slot: arr_slot,
+                }];
+                for (i, e) in elems.drain(..).enumerate() {
+                    stmts.push(Stmt::Assign {
+                        target: Expr::Index(
+                            Box::new(Expr::Var {
+                                name: name.clone(),
+                                slot: arr_slot,
+                                ty: arr_ty.clone(),
+                            }),
+                            Box::new(Expr::Int(i as i64)),
+                        ),
+                        value: e,
+                    });
+                }
+                *e = Expr::Block(Block {
+                    stmts,
+                    tail: Some(Box::new(Expr::Var {
+                        name,
+                        slot: arr_slot,
+                        ty: arr_ty.clone(),
+                    })),
+                });
+                // Every piece is already resolved: the elements were checked
+                // above, and the `let` and assignments were built with their
+                // slots. Re-checking the block would allocate a *new* slot for
+                // the `let` and leave the assignments pointing at the old one.
+                Ok(arr_ty)
             }
             Expr::Cast(inner, to) => {
                 let it = self.check_expr(inner, scope)?;

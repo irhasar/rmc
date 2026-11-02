@@ -544,6 +544,7 @@ impl Codegen {
         let_tmps: &mut Vec<LetTarget>,
     ) {
         match e {
+            Expr::ArrayList(_) => unreachable!("sema rewrites ArrayList into a block"),
             Expr::Var { slot, ty, .. } => {
                 counts[*slot as usize] += 1;
                 if ty.is_aggregate() {
@@ -1054,6 +1055,7 @@ impl Codegen {
 
     fn gen_expr(&mut self, e: &Expr) -> Type {
         match e {
+            Expr::ArrayList(_) => unreachable!("sema rewrites ArrayList into a block"),
             Expr::Int(v) => {
                 self.line(&format!("mov ${v}, %rax"));
                 Type::I64

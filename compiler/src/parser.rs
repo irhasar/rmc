@@ -646,38 +646,6 @@ impl Parser {
         Ok(e)
     }
 
-    /// Desugar `[a, b, c]` into
-    /// `{ let mut __arr: [i64; 3] = [0; 3]; __arr[0] = a; ...; __arr }`.
-    /// The element type is left as `i64`; sema rejects the case where the
-    /// elements turn out to be `bool`.
-    fn array_list_to_block(elems: Vec<Expr>) -> Expr {
-        let n = elems.len();
-        let ty = Type::Array(Box::new(Type::I64), n);
-        let mut stmts = vec![Stmt::Let {
-            name: "__arr".to_string(),
-            ty: Some(ty),
-            init: Some(Expr::ArrayLit(Box::new(Expr::Int(0)), n)),
-            slot: -1,
-        }];
-        for (i, e) in elems.into_iter().enumerate() {
-            stmts.push(Stmt::Assign {
-                target: Expr::Index(
-                    Box::new(Expr::Var { name: "__arr".to_string(), slot: -1, ty: Type::I64 }),
-                    Box::new(Expr::Int(i as i64)),
-                ),
-                value: e,
-            });
-        }
-        Expr::Block(Block {
-            stmts,
-            tail: Some(Box::new(Expr::Var {
-                name: "__arr".to_string(),
-                slot: -1,
-                ty: Type::I64,
-            })),
-        })
-    }
-
     /// `match scrutinee { pat => expr, ... }` on integers. It desugars to a
     /// chain of `if` comparisons, so sema and codegen need no new cases. A
     /// pattern is an integer literal (optionally negated) or `_`; the first arm
@@ -887,7 +855,9 @@ impl Parser {
                         elems.push(self.parse_expr()?);
                     }
                     self.expect(Tok::RBracket)?;
-                    Ok(Self::array_list_to_block(elems))
+                    // The element type is not known here; sema infers it from
+                    // the values and rewrites this into an array-building block.
+                    Ok(Expr::ArrayList(elems))
                 }
             }
             other => Err(format!(

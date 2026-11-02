@@ -101,7 +101,10 @@ Rust panic. Division by zero always traps at the CPU level.
   close; the limit exists so that pathological input cannot overflow the stack.
 - Calls: `f(a, b)`.
 - Indexing: `arr[i]`.
-- Array literals: `[a, b, c]` and `[value; count]`.
+- Array literals: `[a, b, c]` and `[value; count]`. A list literal takes its
+  element type from the values, so `[true, false]` is a `[bool; 2]` and
+  `[1, 2, 3]` an `[i64; 3]`; mixing the two is an error. An array element is
+  always a scalar, so arrays of arrays and arrays of structs are not supported.
 - Struct literals: `Point { x: 1, y: 2 }`, usable as a `let` initialiser.
 - Blocks and `if`/`else` are expressions.
 - `match` on integers: `match x { 0 => a, 1 => b, _ => c }`. An arm pattern is

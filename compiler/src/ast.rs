@@ -111,6 +111,10 @@ pub enum Expr {
     StructLit { name: String, fields: Vec<FieldInit>, slot: i32 },
     /// `[value; count]`
     ArrayLit(Box<Expr>, usize),
+    /// `[a, b, c]`. Sema infers the element type from the values and rewrites
+    /// this into a block that builds a local array; the parser cannot, because
+    /// it does not type-check.
+    ArrayList(Vec<Expr>),
     /// expr as Type
     Cast(Box<Expr>, Type),
 }

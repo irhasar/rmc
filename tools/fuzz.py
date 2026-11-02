@@ -162,6 +162,18 @@ def gen_stmt_program(rng):
     rs.append("        i += 1;")
     rms += ["    }"]
     rs += ["    }"]
+    # A bool array built from a list literal, then counted. Guards the
+    # list-literal element-type inference and bool indexing.
+    rms.append("    let flags: [bool; 4] = [true, false, i < 1, true];")
+    rs.append("    let flags: [bool; 4] = [true, false, i < 1, true];")
+    rms.append("    let mut f: i64 = 0;")
+    rs.append("    let mut f: i64 = 0;")
+    rms.append("    let mut k: i64 = 0;")
+    rs.append("    let mut k: i64 = 0;")
+    rms.append("    while k < 4 { if flags[k] { f = f + 1; } k = k + 1; }")
+    rs.append("    while k < 4 { if flags[k as usize] { f += 1; } k += 1; }")
+    rms.append("    acc = acc + f * 1000;")
+    rs.append("    acc += f * 1000;")
     rms.append(f"    acc = acc + mix({', '.join(callargs)});")
     rs.append(f"    acc += mix({', '.join(callargs)});")
     rms.append("    print_i64(acc);")

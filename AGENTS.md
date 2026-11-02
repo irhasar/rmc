@@ -219,6 +219,12 @@ through every precedence function, so it costs several KiB); `fuzz.py --mode
 robust` and the depth tests in `tests/compile.rs` guard it. If you add a new
 recursive construct, count a level with `bump_depth` on entry.
 
+An array's element type is always scalar (`i64` or `bool`); nested arrays and
+arrays of structs are rejected. A list literal `[a, b, c]` is parsed as
+`Expr::ArrayList` and rewritten by sema, which infers the element type from the
+values — the parser must not guess it, because it does not type-check, and
+guessing `i64` is what made `[true, false]` fail.
+
 `tools/fuzz.py` is the differential fuzzer. `expr` mode builds random integer
 expressions with calls and guarded division; `stmt` mode builds loops,
 conditionals, `match`, arrays and aggregate calls, and deliberately places

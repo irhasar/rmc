@@ -102,7 +102,8 @@ python3 tests/run.py -v
 The suite covers arithmetic and division semantics (including divisors that need
 the magic-multiply add fixup and powers of two), every comparison operator with
 the immediate on either side, boolean short-circuiting, control flow, arrays,
-calls and recursion, the output builtins, and nested expressions. It is
+calls and recursion, the output builtins, nested expressions, and arrays of `i64` and `bool` built
+from either literal form. It is
 deliberately adversarial: reverting the folded-comparison operand-order fix
 makes the `cmp` case fail, and dropping the sign bias from division by a power
 of two makes the `div` case fail.

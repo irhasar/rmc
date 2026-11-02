@@ -531,3 +531,34 @@ fn nesting_below_the_limit_still_compiles() {
     let src = format!("fn main() -> i64 {{ return {}1{} + {}; }}", "(".repeat(30), ")".repeat(30), "1+".repeat(30) + "1");
     assert!(compile_to_asm(&src, &CompileOptions::default()).is_ok());
 }
+
+#[test]
+fn a_bool_list_literal_infers_a_bool_element_type() {
+    // The list-literal desugar used to hard-code `i64` as the element type, so
+    // `[true, false]` was rejected as an i64 array of bools.
+    assert!(compile_to_asm("fn main() -> i64 { let a: [bool; 2] = [true, false]; return 0; }", &CompileOptions::default()).is_ok());
+    assert!(compile_to_asm("fn main() -> i64 { let a = [true, false, true]; return 0; }", &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_list_literal_with_mixed_element_types_is_rejected() {
+    let err = compile_to_asm("fn main() -> i64 { let a = [1, true]; return 0; }", &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("element type mismatch"), "got: {err}");
+}
+
+#[test]
+fn an_array_of_aggregates_is_rejected_not_miscompiled() {
+    // Nested arrays and arrays of structs are out of scope; they must be a
+    // clean error rather than a segfault.
+    let e1 = compile_to_asm("fn main() -> i64 { let m: [[i64; 2]; 2] = [[1, 2], [3, 4]]; return 0; }", &CompileOptions::default()).unwrap_err();
+    assert!(e1.contains("array elements must be"), "got: {e1}");
+    let e2 = compile_to_asm("struct P { x: i64 } fn main() -> i64 { let a: [P; 1] = [P { x: 1 }]; return 0; }", &CompileOptions::default()).unwrap_err();
+    assert!(e2.contains("array elements must be"), "got: {e2}");
+}
+
+#[test]
+fn an_empty_list_literal_is_rejected() {
+    // `[]` has no element to infer from; the parser rejects it before sema.
+    let err = compile_to_asm("fn main() -> i64 { let a = []; return 0; }", &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("expected an expression"), "got: {err}");
+}
