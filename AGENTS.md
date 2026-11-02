@@ -64,6 +64,30 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
 
 ## Things that are easy to get wrong
 
+- **A local whose address is taken must be forced into memory before promotion.**
+  The promotion pass picks the hottest scalar locals and keeps them only in
+  registers, so their frame slot goes stale. `&x` needs `x` to be in memory, so
+  `count_expr` calls `mark_addressed` on an `AddrOf` operand to set `mem[]` for
+  that slot *before* promotion runs. Miss this and `lea slot(%rbp)` reads a
+  garbage word. `mark_addressed` walks `Field`/`Index` bases and marks the whole
+  aggregate, and it must run in the dry pass too (it does: `count_expr` is shared
+  by both passes).
+- **A reference is a scalar, but an aggregate referent is named by its address.**
+  `Type::Ref` is a scalar (one slot, one register) even when the referent is a
+  struct or array. So `gen_expr` on a `Ref` local is a plain `mov`, while `Deref`
+  of an aggregate is a no-op after evaluating the pointer — the pointer *is* the
+  value. `gen_addr` on a `Deref` yields the pointer, and on a `Field` whose base
+  is `Ref`-typed it adds the offset to the pointer (`ref_base`), never to the
+  slot holding the pointer.
+- **`&e` on a non-lvalue materialises a temporary.** `sema` gives `AddrOf` a
+  hidden slot (`slot >= 0`) for a literal, call result, or aggregate-valued
+  operand, and codegen stores the value there and yields that address. An
+  aggregate operand is copied with `copy_words_rdi_rsi`, a scalar with one `mov`.
+  `slot == -1` means the operand is an lvalue and `gen_addr` is used directly.
+- **`&mut T` coerces to `&T`; the reverse does not.** `ref_coerces` is the only
+  coercion and is checked in `let`, assignment and call arguments. Both are one
+  pointer, so the coercion emits no code. `&mut` and `&` are otherwise distinct
+  types, which is why `Sig` carries `ref_self_mut`.
 - **Stack slots grow downward.** A local in slot `s` lives at
   `-(s+1+nregs)*8(%rbp)`, where `nregs` is the number of registers holding
   promoted locals. Address them positively and you overwrite the saved
