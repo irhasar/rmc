@@ -1,10 +1,10 @@
-//! nrc: a small ahead-of-time compiler for a Rust subset.
+//! rmc: a small ahead-of-time compiler for a Rust subset.
 //!
 //! Pipeline: source -> lex -> parse -> semantic analysis -> x86-64 assembly ->
 //! GNU as -> GNU ld. No LLVM, no external crates. The emitted program links
 //! against a freestanding assembly runtime and makes raw Linux syscalls.
 
-use nrc::{compile_to_asm, CompileOptions};
+use rmc::{compile_to_asm, CompileOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -67,9 +67,9 @@ fn parse_args() -> Result<Options, String> {
 
 fn print_help() {
     println!(
-        "nrc - experimental Rust-subset compiler (no LLVM, no crates)\n\
+        "rmc - experimental Rust-subset compiler (no LLVM, no crates)\n\
          \n\
-         USAGE:\n    nrc [OPTIONS] <input.nrs>\n\
+         USAGE:\n    rmc [OPTIONS] <input.rms>\n\
          \n\
          OPTIONS:\n\
          \x20   -o <path>      output binary path\n\
@@ -86,19 +86,19 @@ fn main() {
     let opts = match parse_args() {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("nrc: error: {e}");
+            eprintln!("rmc: error: {e}");
             std::process::exit(2);
         }
     };
 
     let t0 = Instant::now();
     if let Err(e) = run(opts) {
-        eprintln!("nrc: error: {e}");
+        eprintln!("rmc: error: {e}");
         std::process::exit(1);
     }
     // Compile wall time (excludes nothing; used by the benchmark harness).
-    if std::env::var_os("NRC_TIMING").is_some() {
-        eprintln!("nrc: compile time {:.3} ms", t0.elapsed().as_secs_f64() * 1000.0);
+    if std::env::var_os("RMC_TIMING").is_some() {
+        eprintln!("rmc: compile time {:.3} ms", t0.elapsed().as_secs_f64() * 1000.0);
     }
 }
 

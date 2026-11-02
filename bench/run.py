@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Benchmark harness: nrc vs rustc for compile time, CPU, RAM, size, runtime.
+"""Benchmark harness: rmc vs rustc for compile time, CPU, RAM, size, runtime.
 
 Uses os.wait4() to collect per-child resource usage (ru_utime, ru_stime,
 ru_maxrss) so CPU and peak RSS are measured for the real compiler process and
-its children (as/ld for nrc, LLVM + link for rustc).
+its children (as/ld for rmc, LLVM + link for rustc).
 """
 import os, subprocess, sys, time, shutil, statistics
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 PROJ = os.path.dirname(ROOT)
-NRC = os.path.join(PROJ, "compiler", "target", "release", "nrc")
-OUT = "/tmp/nrcbench"
+RMC = os.path.join(PROJ, "compiler", "target", "release", "rmc")
+OUT = "/tmp/rmcbench"
 RUSTFLAGS_BASE = []
 
 PROGRAMS = ["hello", "fib", "mandel", "sieve", "mix", "stats"]
@@ -50,9 +50,9 @@ def median(xs):
 def measure_compile(name, kind, reps=5):
     walls, cpus, rsss, sizes = [], [], [], []
     for _ in range(reps):
-        if kind == "nrc":
-            out = os.path.join(OUT, f"{name}.nrc.bin")
-            argv = [NRC, os.path.join(ROOT, "programs", f"{name}.nrs"), "-o", out]
+        if kind == "rmc":
+            out = os.path.join(OUT, f"{name}.rmc.bin")
+            argv = [RMC, os.path.join(ROOT, "programs", f"{name}.rms"), "-o", out]
         else:
             out = os.path.join(OUT, f"{name}.rustc.bin")
             argv = ["rustc", "-O", "-C", "opt-level=3", "-C", "lto=fat",
@@ -84,16 +84,16 @@ def main():
     print("-" * len(hdr))
     for p in PROGRAMS:
         res = {}
-        for kind in ("nrc", "rustc"):
+        for kind in ("rmc", "rustc"):
             res[kind] = measure_compile(p, kind)
-        for kind in ("nrc", "rustc"):
+        for kind in ("rmc", "rustc"):
             r = res[kind]
             binpath = os.path.join(OUT, f"{p}.{kind}.bin")
             rt = measure_runtime(binpath, ARGS[p])
             print(f"{p:<8} {kind:<8} {r['wall']*1000:9.2f} {r['cpu']*1000:9.2f} "
                   f"{r['rss']:9.0f} {r['size']:9.0f} {rt*1000:9.2f}")
         # ratios
-        n, c = res["nrc"], res["rustc"]
+        n, c = res["rmc"], res["rustc"]
         print(f"{'':8} {'ratio':<8} {c['wall']/n['wall']:9.1f} {c['cpu']/n['cpu']:9.1f} "
               f"{c['rss']/n['rss']:9.1f} {c['size']/n['size']:9.1f}")
 

@@ -4,7 +4,7 @@ Repository-specific notes for future sessions. Keep this file current.
 
 ## What this is
 
-`nrc` is an experimental ahead-of-time compiler for a small Rust subset. It emits
+`rmc` is an experimental ahead-of-time compiler for a small Rust subset. It emits
 x86-64 assembly directly, assembles with GNU `as`, and links with GNU `ld`
 against a freestanding assembly runtime (raw Linux syscalls, no libc, no LLVM,
 no external crates). The `bench/` directory compares it against real `rustc`.
@@ -17,16 +17,16 @@ export PATH=/workspace/.cargo/bin:$PATH        # rustc/cargo are installed here
 cargo build --release --manifest-path compiler/Cargo.toml
 
 # compile a program
-./compiler/target/release/nrc bench/programs/fib.nrs -o /tmp/fib
+./compiler/target/release/rmc bench/programs/fib.rms -o /tmp/fib
 /tmp/fib 30
 
 # inspect generated assembly
-./compiler/target/release/nrc bench/programs/fib.nrs --emit-asm
+./compiler/target/release/rmc bench/programs/fib.rms --emit-asm
 
-# full benchmark suite (writes binaries to /tmp/nrcbench)
+# full benchmark suite (writes binaries to /tmp/rmcbench)
 python3 bench/run.py
 
-# differential test suite: nrc vs rustc on twin programs
+# differential test suite: rmc vs rustc on twin programs
 python3 tests/run.py -v
 ```
 
@@ -58,7 +58,7 @@ python3 tests/run.py -v
 - **Saved registers sit between `%rbp` and the frame.** The epilogue must point
   `%rsp` at the lowest saved register (or add the frame size back) before
   popping, otherwise `pop` reads the frame and the return address is lost.
-  `regs.nrs` and `calls.nrs` fail if this regresses.
+  `regs.rms` and `calls.rms` fail if this regresses.
 - **Aggregates cannot be promoted.** A promoted local is named by its register,
   so an array or struct (which needs an address) must stay in memory, and so must
   an index base. `promote` excludes *every* slot an aggregate spans, not just
@@ -85,7 +85,7 @@ python3 tests/run.py -v
 - **Link flags.** The driver uses `ld -o <out> --build-id=none <obj>`; the
   assembly already carries `.note.GNU-stack` so no `-z noexecstack` is needed.
 - **Benchmark inputs must be opaque.** Programs read their workload via
-  `arg_i64` (nrc) or `env::args()` + `black_box` (Rust), so LLVM cannot
+  `arg_i64` (rmc) or `env::args()` + `black_box` (Rust), so LLVM cannot
   constant-fold the workload away. Do not "simplify" them to constants.
 - **`print_bool` prints 0/1**, not `true`/`false`, despite the name.
 
@@ -99,7 +99,7 @@ python3 tests/run.py -v
 
 ## Tests
 
-`tests/run.py` compiles each `tests/cases/NAME.{nrs,rs}` pair with both compilers
+`tests/run.py` compiles each `tests/cases/NAME.{rms,rs}` pair with both compilers
 and diffs stdout and the exit status. When adding a case, add both twins, write
 them to behave identically, and remember that `rustc` infers `i32` for unsuffixed
 literals, so large literals need an `i64` suffix on the Rust side. `args.json`
@@ -138,5 +138,5 @@ The README's roadmap lists the intended next steps.
   - **The sign bias is required** for power-of-two divisors; without it a
     negative dividend rounds toward negative infinity instead of toward zero.
   - `small_imm` accepts a negated literal, so `x / -1000` takes the fast path.
-  - `tests/cases/div.{nrs,rs}` covers both variants, powers of two, negatives,
+  - `tests/cases/div.{rms,rs}` covers both variants, powers of two, negatives,
     and boundary dividends, and is the regression guard for all of the above.

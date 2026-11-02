@@ -1,4 +1,4 @@
-//! Recursive-descent parser for the nrc Rust subset.
+//! Recursive-descent parser for the rmc Rust subset.
 
 use crate::ast::*;
 use crate::lexer::{Tok, Token};

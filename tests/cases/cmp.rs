@@ -1,4 +1,4 @@
-// nrc's print_bool writes 1 or 0, so the twin mirrors that with `pb`.
+// rmc's print_bool writes 1 or 0, so the twin mirrors that with `pb`.
 fn pb(b: bool) {
     println!("{}", b as i64);
 }

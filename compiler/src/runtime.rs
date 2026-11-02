@@ -7,15 +7,15 @@
 pub const RUNTIME_ASM: &str = r#"
 .data
 .align 8
-__nrc_argc: .quad 0
-__nrc_argv: .quad 0
+__rmc_argc: .quad 0
+__rmc_argv: .quad 0
 # First free block, or 0. The free list is address-ordered so neighbouring
 # blocks can be coalesced on free.
-__nrc_freelist: .quad 0
+__rmc_freelist: .quad 0
 # Bump pointer and end of the current mmap'd chunk. Fresh blocks are carved
 # from here; freed blocks go back on the free list for reuse.
-__nrc_arena: .quad 0
-__nrc_arena_end: .quad 0
+__rmc_arena: .quad 0
+__rmc_arena_end: .quad 0
 
 .text
 .globl _start
@@ -23,9 +23,9 @@ __nrc_arena_end: .quad 0
 _start:
     xor %rbp, %rbp
     mov (%rsp), %rax
-    mov %rax, __nrc_argc(%rip)
+    mov %rax, __rmc_argc(%rip)
     lea 8(%rsp), %rax
-    mov %rax, __nrc_argv(%rip)
+    mov %rax, __rmc_argv(%rip)
     and $-16, %rsp
     call main
     mov %rax, %rdi
@@ -41,10 +41,10 @@ _start:
 arg_i64:
     push %rbp
     mov %rsp, %rbp
-    mov __nrc_argc(%rip), %rcx
+    mov __rmc_argc(%rip), %rcx
     cmp %rcx, %rdi
     jge .Larg_zero
-    mov __nrc_argv(%rip), %rdx
+    mov __rmc_argv(%rip), %rdx
     mov (%rdx,%rdi,8), %rsi
     xor %rax, %rax
     xor %r8, %r8
@@ -212,7 +212,7 @@ alloc:
     add $8, %r13
 
     # Walk the free list for the first block large enough (first fit).
-    lea __nrc_freelist(%rip), %r14   # pointer to the link we are examining
+    lea __rmc_freelist(%rip), %r14   # pointer to the link we are examining
     mov (%r14), %rax
 .Lalloc_scan:
     test %rax, %rax
@@ -230,8 +230,8 @@ alloc:
     jmp .Lalloc_done
 
 .Lalloc_from_arena:
-    mov __nrc_arena(%rip), %rax
-    mov __nrc_arena_end(%rip), %rdx
+    mov __rmc_arena(%rip), %rax
+    mov __rmc_arena_end(%rip), %rdx
     mov %rdx, %rcx
     sub %rax, %rcx           # bytes left in the current chunk
     cmp %r13, %rcx
@@ -255,15 +255,15 @@ alloc:
     syscall
     cmp $-4095, %rax
     jae .Lalloc_fail
-    mov %rax, __nrc_arena(%rip)
+    mov %rax, __rmc_arena(%rip)
     add %r15, %rax
-    mov %rax, __nrc_arena_end(%rip)
-    mov __nrc_arena(%rip), %rax
+    mov %rax, __rmc_arena_end(%rip)
+    mov __rmc_arena(%rip), %rax
 .Lalloc_carve:
     mov %r13, (%rax)         # header
     lea 8(%rax), %rdx
     add %r13, %rax
-    mov %rax, __nrc_arena(%rip)
+    mov %rax, __rmc_arena(%rip)
     mov %rdx, %rax           # payload
     jmp .Lalloc_done
 
@@ -299,7 +299,7 @@ free:
     lea -8(%rdi), %r12       # block header
     mov (%r12), %r13         # block size
     # Find the first free block that starts after this one.
-    lea __nrc_freelist(%rip), %r14
+    lea __rmc_freelist(%rip), %r14
     mov (%r14), %rax
 .Lfree_scan:
     test %rax, %rax
@@ -328,7 +328,7 @@ free:
     # %r14 points at the link we just set to %r12. If that link is the list
     # head there is no predecessor; otherwise the predecessor block starts 8
     # bytes before its own `next` field.
-    lea __nrc_freelist(%rip), %rdx
+    lea __rmc_freelist(%rip), %rdx
     cmp %rdx, %r14
     je .Lfree_ret
     lea -8(%r14), %rdx       # predecessor block header
@@ -348,21 +348,21 @@ free:
     ret
 .size free, .-free
 
-# void __nrc_overflow(void)  -- a checked +,-,* overflowed; write a fixed
+# void __rmc_overflow(void)  -- a checked +,-,* overflowed; write a fixed
 # message and exit with status 101, mirroring a Rust panic.
-.globl __nrc_overflow
-.type __nrc_overflow, @function
-__nrc_overflow:
+.globl __rmc_overflow
+.type __rmc_overflow, @function
+__rmc_overflow:
     mov $1, %rax
     mov $2, %rdi             # stderr, like a Rust panic
-    lea __nrc_overflow_msg(%rip), %rsi
+    lea __rmc_overflow_msg(%rip), %rsi
     mov $25, %rdx
     syscall
     mov $101, %rdi
     mov $60, %rax
     syscall
-.size __nrc_overflow, .-__nrc_overflow
+.size __rmc_overflow, .-__rmc_overflow
 
 .section .rodata
-__nrc_overflow_msg: .ascii "nrc: arithmetic overflow\n"
+__rmc_overflow_msg: .ascii "rmc: arithmetic overflow\n"
 "#;

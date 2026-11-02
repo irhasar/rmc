@@ -751,7 +751,7 @@ impl Codegen {
     /// called when overflow checks are enabled.
     fn check_overflow(&mut self) {
         if self.overflow {
-            self.line("jo __nrc_overflow");
+            self.line("jo __rmc_overflow");
         }
     }
 
@@ -1171,7 +1171,7 @@ impl Codegen {
         if pad {
             self.line("add $8, %rsp");
         }
-        // Return type is resolved by sema; nrc runtime helpers return i64.
+        // Return type is resolved by sema; rmc runtime helpers return i64.
         Type::I64
     }
 

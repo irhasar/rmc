@@ -1,7 +1,7 @@
 //! Unit tests that exercise the compiler front end and code generator without
 //! invoking `as` or `ld`, so they run anywhere a Rust toolchain does.
 
-use nrc::{compile_to_asm, CompileOptions};
+use rmc::{compile_to_asm, CompileOptions};
 
 fn asm(src: &str) -> String {
     compile_to_asm(src, &CompileOptions::default()).expect("should compile")
@@ -48,13 +48,13 @@ fn compound_assignment_expands() {
 #[test]
 fn overflow_checks_add_a_jo() {
     let plain = asm("fn main() -> i64 { let mut x: i64 = 1; x = x + 1; return x; }");
-    assert!(!plain.contains("jo __nrc_overflow"));
+    assert!(!plain.contains("jo __rmc_overflow"));
     let checked = compile_to_asm(
         "fn main() -> i64 { let mut x: i64 = 1; x = x + 1; return x; }",
         &CompileOptions { overflow_checks: true },
     )
     .unwrap();
-    assert!(checked.contains("jo __nrc_overflow"));
+    assert!(checked.contains("jo __rmc_overflow"));
 }
 
 #[test]

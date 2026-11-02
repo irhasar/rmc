@@ -1,7 +1,7 @@
-# The nrc language subset
+# The rmc language subset
 
-`nrc` accepts a small, statically typed subset of Rust. Programs are ordinary
-UTF-8 text files with the `.nrs` extension. Everything is checked at compile
+`rmc` accepts a small, statically typed subset of Rust. Programs are ordinary
+UTF-8 text files with the `.rms` extension. Everything is checked at compile
 time; there are no runtime type errors.
 
 ## Types
@@ -68,7 +68,7 @@ evaluated once, before the loop; `continue` still runs the increment.
 By default integer arithmetic wraps, as in release-mode Rust. Compiling with
 `--overflow-checks` (or `CompileOptions { overflow_checks: true }` from the
 library) inserts a trap after every `+`, `-` and `*`; on overflow the program
-writes `nrc: arithmetic overflow` to stderr and exits with status 101, matching a
+writes `rmc: arithmetic overflow` to stderr and exits with status 101, matching a
 Rust panic. Division by zero always traps at the CPU level.
 
 ## Expressions

@@ -1,4 +1,4 @@
-//! Abstract syntax tree for the Rust subset accepted by nrc.
+//! Abstract syntax tree for the Rust subset accepted by rmc.
 //!
 //! The tree is produced by the parser in an untyped form and then annotated in
 //! place by the semantic analyzer. `Expr::Var` carries the resolved stack slot

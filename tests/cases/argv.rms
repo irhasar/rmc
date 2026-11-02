@@ -1,5 +1,5 @@
 // Reads integers from argv. Driven by tests/args.json, which passes the same
-// argument vectors to both the nrc and rustc build of this program.
+// argument vectors to both the rmc and rustc build of this program.
 fn main() -> i64 {
     let mut i: i64 = 1;
     let mut s: i64 = 0;

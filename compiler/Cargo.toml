@@ -1,15 +1,15 @@
 [package]
-name = "nrc"
+name = "rmc"
 version = "0.1.0"
 edition = "2021"
-description = "nrc: an experimental Rust-subset compiler that emits native x86-64 machine code directly, with no LLVM and zero external crates."
+description = "rmc: an experimental Rust-subset compiler that emits native x86-64 machine code directly, with no LLVM and zero external crates."
 
 [lib]
-name = "nrc"
+name = "rmc"
 path = "src/lib.rs"
 
 [[bin]]
-name = "nrc"
+name = "rmc"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,14 +1,14 @@
-//! nrc: an ahead-of-time compiler for a small, statically-typed subset of Rust.
+//! rmc: an ahead-of-time compiler for a small, statically-typed subset of Rust.
 //!
 //! The pipeline is lex -> parse -> semantic analysis -> x86-64 assembly. This
-//! library exposes it as a single call, [`compile_to_asm`], so nrc can be
+//! library exposes it as a single call, [`compile_to_asm`], so rmc can be
 //! embedded in another program instead of only run as a command-line tool. The
-//! `nrc` binary in `src/main.rs` drives this library and then invokes `as` and
+//! `rmc` binary in `src/main.rs` drives this library and then invokes `as` and
 //! `ld`; those two are the only external dependencies, and neither is needed if
 //! you only want the assembly text.
 //!
 //! ```
-//! let asm = nrc::compile_to_asm("fn main() -> i64 { return 0; }", &Default::default())
+//! let asm = rmc::compile_to_asm("fn main() -> i64 { return 0; }", &Default::default())
 //!     .expect("compiles");
 //! assert!(asm.contains("main:"));
 //! ```
@@ -29,7 +29,7 @@ pub struct CompileOptions {
     pub overflow_checks: bool,
 }
 
-/// Compile `src` (a `.nrs` program) to x86-64 assembly in GNU `as` syntax.
+/// Compile `src` (a `.rms` program) to x86-64 assembly in GNU `as` syntax.
 ///
 /// The returned string is a complete translation unit: the compiled program
 /// followed by the freestanding runtime. Feed it to `as` and `ld` to obtain an

@@ -20,7 +20,7 @@ jobs:
       - name: Unit tests
         run: cargo test --manifest-path compiler/Cargo.toml
 
-      # Differential suite: compile every case with nrc and rustc, run both, and
+      # Differential suite: compile every case with rmc and rustc, run both, and
       # require identical stdout and exit status. Needs binutils (as/ld).
       - name: Differential tests
         run: python3 tests/run.py

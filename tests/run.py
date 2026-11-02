@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Differential test suite: every case is compiled by nrc and by rustc and the
+"""Differential test suite: every case is compiled by rmc and by rustc and the
 two programs must print identical output and exit with the same status.
 
-Each case lives in `tests/cases/` as a pair `NAME.nrs` (nrc) and `NAME.rs`
+Each case lives in `tests/cases/` as a pair `NAME.rms` (rmc) and `NAME.rs`
 (Rust). The two files are written to behave identically, so any divergence in
 stdout or exit code is a compiler bug. `tests/args.json` optionally maps a case
 name to a list of argv vectors; each vector is one run, and the case passes
@@ -18,9 +18,9 @@ import sys
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 PROJ = os.path.dirname(ROOT)
-NRC = os.path.join(PROJ, "compiler", "target", "release", "nrc")
+RMC = os.path.join(PROJ, "compiler", "target", "release", "rmc")
 CASES = os.path.join(ROOT, "cases")
-OUT = "/tmp/nrctests"
+OUT = "/tmp/rmctests"
 ARGS_FILE = os.path.join(ROOT, "args.json")
 
 
@@ -42,19 +42,19 @@ def extra_flags(name):
 def compile_and_run(name, argv):
     """Compile both twins and run them with `argv`.
 
-    Returns `(nrc_result, rust_result)` where each result is
+    Returns `(rmc_result, rust_result)` where each result is
     `("ok", exit_status, stdout_bytes)` or `("error", message)`. Both are always
     present so the caller can unpack the pair unconditionally.
     """
-    nrs = os.path.join(CASES, f"{name}.nrs")
+    rms = os.path.join(CASES, f"{name}.rms")
     rs = os.path.join(CASES, f"{name}.rs")
-    nrc_bin = os.path.join(OUT, f"{name}.nrc")
+    rmc_bin = os.path.join(OUT, f"{name}.rmc")
     rust_bin = os.path.join(OUT, f"{name}.rust")
 
-    nrc_flags, rustc_flags = extra_flags(name)
-    p = subprocess.run([NRC] + nrc_flags + [nrs, "-o", nrc_bin], capture_output=True)
+    rmc_flags, rustc_flags = extra_flags(name)
+    p = subprocess.run([RMC] + rmc_flags + [rms, "-o", rmc_bin], capture_output=True)
     if p.returncode != 0:
-        err = ("error", f"nrc failed:\n{p.stderr.decode(errors='replace')}")
+        err = ("error", f"rmc failed:\n{p.stderr.decode(errors='replace')}")
         return err, ("error", "not run")
     p = subprocess.run(["rustc", "-O"] + rustc_flags + [rs, "-o", rust_bin], capture_output=True)
     if p.returncode != 0:
@@ -65,7 +65,7 @@ def compile_and_run(name, argv):
         p = subprocess.run([binary] + argv, capture_output=True)
         return ("ok", p.returncode, p.stdout)
 
-    return run(nrc_bin), run(rust_bin)
+    return run(rmc_bin), run(rust_bin)
 
 
 def main():
@@ -73,7 +73,7 @@ def main():
     os.makedirs(OUT, exist_ok=True)
     args = load_args()
 
-    names = sorted(f[:-4] for f in os.listdir(CASES) if f.endswith(".nrs"))
+    names = sorted(f[:-4] for f in os.listdir(CASES) if f.endswith(".rms"))
     if not names:
         print("no test cases found", file=sys.stderr)
         return 1
@@ -86,31 +86,31 @@ def main():
             continue
 
         for argv in args.get(name, [[]]):
-            nrc_res, rust_res = compile_and_run(name, argv)
-            for which, res in (("nrc", nrc_res), ("rustc", rust_res)):
+            rmc_res, rust_res = compile_and_run(name, argv)
+            for which, res in (("rmc", rmc_res), ("rustc", rust_res)):
                 if res[0] == "error" and res[1] != "not run":
                     print(f"FAIL {name} {argv}: {which}: {res[1]}")
                     failures += 1
                     break
                 if res[0] == "error":
-                    print(f"FAIL {name} {argv}: {which} did not run ({nrc_res if which == 'rustc' else rust_res})")
+                    print(f"FAIL {name} {argv}: {which} did not run ({rmc_res if which == 'rustc' else rust_res})")
                     failures += 1
                     break
             else:
-                _, nrc_status, nrc_out = nrc_res
+                _, rmc_status, rmc_out = rmc_res
                 _, rust_status, rust_out = rust_res
-                if nrc_out != rust_out or nrc_status != rust_status:
+                if rmc_out != rust_out or rmc_status != rust_status:
                     failures += 1
                     print(f"FAIL {name} {argv}")
-                    print(f"  exit nrc={nrc_status} rustc={rust_status}")
-                    nrc_lines = nrc_out.split(b"\n")
+                    print(f"  exit rmc={rmc_status} rustc={rust_status}")
+                    rmc_lines = rmc_out.split(b"\n")
                     rust_lines = rust_out.split(b"\n")
-                    for i in range(max(len(nrc_lines), len(rust_lines))):
-                        a = nrc_lines[i] if i < len(nrc_lines) else b"<missing>"
+                    for i in range(max(len(rmc_lines), len(rust_lines))):
+                        a = rmc_lines[i] if i < len(rmc_lines) else b"<missing>"
                         b = rust_lines[i] if i < len(rust_lines) else b"<missing>"
                         if a != b:
                             print(f"  first difference at output line {i + 1}:")
-                            print(f"    nrc   = {a!r}")
+                            print(f"    rmc   = {a!r}")
                             print(f"    rustc = {b!r}")
                             break
                 elif verbose:

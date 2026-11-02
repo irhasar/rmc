@@ -1,6 +1,6 @@
-# nrc compiler design
+# rmc compiler design
 
-`nrc` is a single-pass-per-stage, ahead-of-time compiler for a Rust subset. It
+`rmc` is a single-pass-per-stage, ahead-of-time compiler for a Rust subset. It
 is deliberately small: no external crates, no LLVM, no libc. The whole pipeline
 is `source -> lexer -> parser -> sema -> codegen -> asm text`, after which the
 driver shells out to GNU `as` and `ld`.
@@ -75,7 +75,7 @@ System V ABI passes large aggregates via a hidden pointer.
 ### Division by a constant
 
 `idiv` is one of the slowest x86 instructions, roughly 20–40 cycles and not
-fully pipelined, and `mandel.nrs` divides three times per inner iteration. When
+fully pipelined, and `mandel.rms` divides three times per inner iteration. When
 the divisor is a literal, `gen_div_const` replaces it with the Hacker's Delight
 "magic number" method, the same algorithm LLVM uses:
 
@@ -165,7 +165,7 @@ kernel.
 ### Overflow checks
 
 With `--overflow-checks`, every `+`, `-` and `*` is followed by `jo
-__nrc_overflow`. The trap writes a fixed message to stderr and exits 101, the
+__rmc_overflow`. The trap writes a fixed message to stderr and exits 101, the
 same status rustc uses for a panic. The check is off by default because it costs
 a branch per arithmetic operation.
 
@@ -175,7 +175,7 @@ There is no optimiser beyond the folding and local promotion described above.
 No global register allocation, no common-subexpression elimination, no inlining,
 no loop transforms, no instruction scheduling. The compiler is optimised for
 compile speed and simplicity, not for the speed of the code it produces. The
-non-trivial passes are division by a constant (1.4x on `mandel.nrs`) and the
+non-trivial passes are division by a constant (1.4x on `mandel.rms`) and the
 top-five local promotion (a few percent on `mix` and `sieve`); everything else is
 local and cheap to compute.
 
