@@ -21,6 +21,7 @@ pub enum Tok {
     As,
     Struct,
     Impl,
+    Enum,
     For,
     In,
     True,
@@ -38,6 +39,7 @@ pub enum Tok {
     Semi,
     Comma,
     Colon,
+    ColonColon,
     Arrow,
     FatArrow,
     Eq,
@@ -116,6 +118,7 @@ impl Tok {
             Tok::Semi => ";",
             Tok::Comma => ",",
             Tok::Colon => ":",
+            Tok::ColonColon => "::",
             Tok::Arrow => "->",
             Tok::FatArrow => "=>",
             Tok::Eq => "=",
@@ -245,6 +248,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 "as" => Tok::As,
                 "struct" => Tok::Struct,
                 "impl" => Tok::Impl,
+                "enum" => Tok::Enum,
                 "for" => Tok::For,
                 "in" => Tok::In,
                 "true" => Tok::True,
@@ -372,6 +376,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             b']' => Tok::RBracket,
             b';' => Tok::Semi,
             b',' => Tok::Comma,
+            b':' if i + 1 < bytes.len() && bytes[i + 1] == b':' => {
+                out.push(Token { tok: Tok::ColonColon, pos });
+                i += 2;
+                continue;
+            }
             b':' => Tok::Colon,
             b'=' => Tok::Eq,
             b'<' => Tok::Lt,

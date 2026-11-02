@@ -546,6 +546,7 @@ impl Codegen {
         match e {
             Expr::ArrayList(_) => unreachable!("sema rewrites ArrayList into a block"),
             Expr::MethodCall { .. } => unreachable!("sema rewrites MethodCall into a Call"),
+            Expr::EnumVariant { .. } => {} // a tag has no subexpressions
             Expr::Var { slot, ty, .. } => {
                 counts[*slot as usize] += 1;
                 if ty.is_aggregate() {
@@ -1058,6 +1059,10 @@ impl Codegen {
         match e {
             Expr::ArrayList(_) => unreachable!("sema rewrites ArrayList into a block"),
             Expr::MethodCall { .. } => unreachable!("sema rewrites MethodCall into a Call"),
+            Expr::EnumVariant { tag, .. } => {
+                self.line(&format!("mov ${tag}, %rax"));
+                Type::I64
+            }
             Expr::Int(v) => {
                 self.line(&format!("mov ${v}, %rax"));
                 Type::I64

@@ -22,12 +22,16 @@ driver shells out to GNU `as` and `ld`.
    function. It rewrites `Expr::Var` with the resolved slot and type and
    `Expr::Field` with the field's byte offset, so codegen never looks up a name.
    Runtime builtins are registered as ordinary signatures here, so calls to them
-   type-check like any other function. Two surface constructs are lowered here
+   type-check like any other function. Three surface constructs are lowered here
    rather than in codegen: a list literal (`Expr::ArrayList`) becomes an
-   array-building block with an inferred element type, and a method call
+   array-building block with an inferred element type, a method call
    (`Expr::MethodCall`) becomes a `Call` to the mangled `Type$method` with the
-   receiver prepended. A method is itself just a free function with a leading
-   `self` parameter, which sema inserts before it builds signatures.
+   receiver prepended, and an `Enum::Variant` (`Expr::EnumVariant`) keeps its
+   node and records its `i64` tag. A method is itself just a free function with
+   a leading `self` parameter, which sema inserts before it builds signatures.
+   An enum name resolves to `Type::Enum` through `resolve_ty`, which every type
+   site (parameters, returns, `let`, struct fields, arrays) goes through, so an
+   enum may be used wherever a scalar is.
 4. **Code generation** (`codegen.rs`) — emits AT&T-syntax x86-64 assembly. Every
    expression leaves its result in `%rax`; the result type is returned to the
    caller so callers know how to use it.

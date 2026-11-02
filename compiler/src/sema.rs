@@ -16,6 +16,8 @@ use std::collections::HashMap;
 pub struct Sig {
     pub params: Vec<Type>,
     pub ret: Type,
+    /// A method receiver: such a function may only be called as `recv.name(..)`.
+    pub takes_self: bool,
 }
 
 /// A laid-out struct: each field's name, resolved type and byte offset, plus the
@@ -29,6 +31,7 @@ pub struct StructInfo {
 pub struct Sema {
     sigs: HashMap<String, Sig>,
     structs: HashMap<String, StructInfo>,
+    enums: HashMap<String, Vec<String>>,
     next_slot: i32,
     loop_depth: u32,
     ret_ty: Type,
@@ -37,7 +40,8 @@ pub struct Sema {
 type Scope = Vec<(String, i32, Type)>;
 
 pub fn analyze(prog: &mut Program) -> Result<(), String> {
-    let structs = resolve_structs(&prog.structs)?;
+    let enums = resolve_enums(prog)?;
+    let structs = resolve_structs(&prog.structs, &enums)?;
 
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     // Runtime helpers provided by the freestanding assembly runtime. They are
@@ -57,6 +61,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
             Sig {
                 params: params.to_vec(),
                 ret,
+                takes_self: false,
             },
         );
     }
@@ -73,17 +78,18 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
             return Err(format!("function `{}` is defined more than once", f.name));
         }
         let params: Result<Vec<Type>, String> =
-            f.params.iter().map(|(_, t)| resolve_type(t, &structs)).collect();
+            f.params.iter().map(|(_, t)| resolve_ty_with(t, &structs, &enums)).collect();
         let params = params?;
-        let ret = resolve_type(&f.ret, &structs)?;
+        let ret = resolve_ty_with(&f.ret, &structs, &enums)?;
         // Aggregate parameters and returns are passed by pointer, so any type
         // is allowed here; the calling convention handles the rest.
-        sigs.insert(f.name.clone(), Sig { params, ret });
+        sigs.insert(f.name.clone(), Sig { params, ret, takes_self: f.takes_self });
     }
 
     let mut sema = Sema {
         sigs,
         structs,
+        enums,
         next_slot: 0,
         loop_depth: 0,
         ret_ty: Type::Unit,
@@ -92,6 +98,27 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         sema.check_fn(f)?;
     }
     Ok(())
+}
+
+/// Collect the enums and check each has unique variant names. A variant is
+/// identified by its index, which is its `i64` tag.
+fn resolve_enums(prog: &Program) -> Result<HashMap<String, Vec<String>>, String> {
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    for e in &prog.enums {
+        if out.contains_key(&e.name) {
+            return Err(format!("enum `{}` is defined more than once", e.name));
+        }
+        if prog.structs.iter().any(|s| s.name == e.name) {
+            return Err(format!("`{}` is both a struct and an enum", e.name));
+        }
+        for (i, v) in e.variants.iter().enumerate() {
+            if e.variants[..i].contains(v) {
+                return Err(format!("enum `{}`: duplicate variant `{v}`", e.name));
+            }
+        }
+        out.insert(e.name.clone(), e.variants.clone());
+    }
+    Ok(out)
 }
 
 /// Map every `Type::Named` in `t` to a concrete type and reject arrays of
@@ -105,7 +132,7 @@ fn resolve_type(t: &Type, structs: &HashMap<String, StructInfo>) -> Result<Type,
         },
         Type::Array(elem, n) => {
             let e = resolve_type(elem, structs)?;
-            if !e.is_scalar() {
+            if !e.is_int_or_bool() {
                 return Err(format!("array elements must be `i64` or `bool`, not {e:?}"));
             }
             Ok(Type::Array(Box::new(e), *n))
@@ -116,14 +143,40 @@ fn resolve_type(t: &Type, structs: &HashMap<String, StructInfo>) -> Result<Type,
 
 /// Compute each struct's field offsets and size. A struct may refer to another
 /// struct declared later, but not to itself, directly or indirectly.
-fn resolve_structs(defs: &[StructDef]) -> Result<HashMap<String, StructInfo>, String> {
+/// Resolve a type in a context that knows about enums: an enum name becomes
+/// `Type::Enum`, everything else goes through `resolve_type`.
+fn resolve_ty_with(
+    t: &Type,
+    structs: &HashMap<String, StructInfo>,
+    enums: &HashMap<String, Vec<String>>,
+) -> Result<Type, String> {
+    match t {
+        Type::Named(n) if enums.contains_key(n) => Ok(Type::Enum(n.clone())),
+        // Resolve the element here so an enum element is named correctly, then
+        // apply the array rule: elements stay `i64`/`bool`, never an enum or an
+        // aggregate, which codegen cannot size.
+        Type::Array(elem, n) => {
+            let e = resolve_ty_with(elem, structs, enums)?;
+            if !e.is_int_or_bool() {
+                return Err(format!("array elements must be `i64` or `bool`, not {e:?}"));
+            }
+            Ok(Type::Array(Box::new(e), *n))
+        }
+        _ => resolve_type(t, structs),
+    }
+}
+
+fn resolve_structs(
+    defs: &[StructDef],
+    enums: &HashMap<String, Vec<String>>,
+) -> Result<HashMap<String, StructInfo>, String> {
     let raw: HashMap<&str, &StructDef> = defs.iter().map(|d| (d.name.as_str(), d)).collect();
     if raw.len() != defs.len() {
         return Err("a struct is defined more than once".into());
     }
     let mut out: HashMap<String, StructInfo> = HashMap::new();
     for d in defs {
-        layout(&d.name, &raw, &mut out, &mut Vec::new())?;
+        layout(&d.name, &raw, enums, &mut out, &mut Vec::new())?;
     }
     Ok(out)
 }
@@ -131,6 +184,7 @@ fn resolve_structs(defs: &[StructDef]) -> Result<HashMap<String, StructInfo>, St
 fn layout(
     name: &str,
     raw: &HashMap<&str, &StructDef>,
+    enums: &HashMap<String, Vec<String>>,
     out: &mut HashMap<String, StructInfo>,
     visiting: &mut Vec<String>,
 ) -> Result<(), String> {
@@ -148,9 +202,11 @@ fn layout(
     let mut size = 0usize;
     for (fname, fty) in &def.fields {
         if let Type::Named(n) = fty {
-            layout(n, raw, out, visiting)?;
+            if !enums.contains_key(n) {
+                layout(n, raw, enums, out, visiting)?;
+            }
         }
-        let rty = resolve_type(fty, out)?;
+        let rty = resolve_ty_with(fty, out, enums)?;
         if fields.iter().any(|(n, _, _)| n == fname) {
             return Err(format!("struct `{name}`: duplicate field `{fname}`"));
         }
@@ -164,10 +220,14 @@ fn layout(
 }
 
 impl Sema {
+    fn resolve_ty(&self, t: &Type) -> Result<Type, String> {
+        resolve_ty_with(t, &self.structs, &self.enums)
+    }
+
     fn check_fn(&mut self, f: &mut FnDef) -> Result<(), String> {
         self.next_slot = 0;
         self.loop_depth = 0;
-        self.ret_ty = resolve_type(&f.ret, &self.structs)?;
+        self.ret_ty = self.resolve_ty(&f.ret)?;
         f.ret = self.ret_ty.clone();
         // An aggregate return is written through a hidden pointer, so reserve a
         // slot to hold that pointer for the whole body.
@@ -180,7 +240,7 @@ impl Sema {
         let mut scope: Scope = Vec::with_capacity(f.params.len() + 8);
         f.param_slots.clear();
         for (name, ty) in &mut f.params {
-            let rt = resolve_type(ty, &self.structs)?;
+            let rt = self.resolve_ty(ty)?;
             *ty = rt.clone();
             // An aggregate parameter owns a frame buffer big enough for a copy;
             // a scalar owns a single slot.
@@ -241,7 +301,7 @@ impl Sema {
     fn check_let_init(&mut self, e: &mut Expr, scope: &mut Scope) -> Result<Type, String> {
         if let Expr::ArrayLit(val, n) = e {
             let t = self.check_expr(val, scope)?;
-            if !t.is_scalar() {
+            if !t.is_int_or_bool() {
                 return Err(format!("array elements must be `i64` or `bool`, found {t:?}"));
             }
             return Ok(Type::Array(Box::new(t), *n));
@@ -266,7 +326,7 @@ impl Sema {
         match st {
             Stmt::Let { name, ty, init, slot } => {
                 let declared = match ty {
-                    Some(t) => Some(resolve_type(t, &self.structs)?),
+                    Some(t) => Some(self.resolve_ty(t)?),
                     None => None,
                 };
                 let init_ty = match init {
@@ -447,6 +507,13 @@ impl Sema {
                         if ta != tb {
                             return Err(format!("comparison between different types: {ta:?} and {tb:?}"));
                         }
+                        // `is_scalar` here, so a matching enum compares but an
+                        // aggregate (array/struct) does not.
+                        if !ta.is_scalar() {
+                            return Err(format!(
+                                "comparison expects `i64`, `bool` or a matching enum, found {ta:?}"
+                            ));
+                        }
                         Ok(Type::Bool)
                     }
                     Lt | Le | Gt | Ge => {
@@ -602,7 +669,7 @@ impl Sema {
             }
             Expr::ArrayLit(val, n) => {
                 let t = self.check_expr(val, scope)?;
-                if !t.is_scalar() {
+                if !t.is_int_or_bool() {
                     return Err(format!("array elements must be `i64` or `bool`, found {t:?}"));
                 }
                 let ty = Type::Array(Box::new(t), *n);
@@ -631,7 +698,7 @@ impl Sema {
                 // The parser never produces an empty list: it requires at least
                 // one element before the `]`, so `[]` fails there.
                 let elem_ty = self.check_expr(&mut elems[0], scope)?;
-                if !elem_ty.is_scalar() {
+                if !elem_ty.is_int_or_bool() {
                     return Err(format!(
                         "array elements must be `i64` or `bool`, found {elem_ty:?}"
                     ));
@@ -690,11 +757,13 @@ impl Sema {
                 // Resolve the receiver's type, then look the method up as the
                 // mangled free function `Type$method` the parser produced.
                 let rt = self.check_expr(recv, scope)?;
+                // A method lives on a struct or an enum; both give the mangled
+                // prefix `Type$method`.
                 let tyname = match &rt {
-                    Type::Struct(n, _) => n.clone(),
+                    Type::Struct(n, _) | Type::Enum(n) => n.clone(),
                     other => {
                         return Err(format!(
-                            "method `{name}` called on a value of type {other:?}, which is not a struct"
+                            "method `{name}` called on a value of type {other:?}, which is not a struct or enum"
                         ))
                     }
                 };
@@ -720,9 +789,36 @@ impl Sema {
                 };
                 self.check_expr(e, scope)
             }
+            Expr::EnumVariant { enum_name, variant, tag } => {
+                let enum_name = enum_name.clone();
+                let variant = variant.clone();
+                let variants = self
+                    .enums
+                    .get(&enum_name)
+                    .ok_or_else(|| format!("unknown enum `{enum_name}`"))?;
+                let idx = variants
+                    .iter()
+                    .position(|v| v == &variant)
+                    .ok_or_else(|| format!("enum `{enum_name}` has no variant `{variant}`"))?;
+                // Record the tag in the node rather than rewriting to an
+                // `Int`: keeping the node keeps its enum type, so re-checking
+                // it (as a method receiver is) stays consistent.
+                *tag = idx as i64;
+                Ok(Type::Enum(enum_name))
+            }
             Expr::Cast(inner, to) => {
                 let it = self.check_expr(inner, scope)?;
-                let rt = resolve_type(to, &self.structs)?;
+                // An enum may be cast to `i64` (its tag), but not the reverse:
+                // rustc rejects `i64 as Enum`, and rmc is a subset of Rust, so
+                // it rejects it too rather than inventing a conversion.
+                if let Type::Named(n) = to.clone() {
+                    if self.enums.contains_key(&n) {
+                        return Err(format!(
+                            "cannot cast to enum `{n}`; cast the other way (`e as i64`) or use `match`"
+                        ));
+                    }
+                }
+                let rt = self.resolve_ty(to)?;
                 // Only scalars can be cast. Casting an integer to an aggregate
                 // would let codegen reinterpret the integer as an address and
                 // read arbitrary memory.

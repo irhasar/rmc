@@ -12,6 +12,7 @@ time; there are no runtime type errors.
 | `bool`       | `true` or `false`                             |
 | `[T; N]`     | fixed-size array of `N` `i64`/`bool` elements |
 | `Name`       | a struct declared with `struct Name { .. }`   |
+| `Name`       | an enum declared with `enum Name { .. }`      |
 | `()`         | unit, the result of a statement or `main`     |
 
 Integer and boolean literals are inferred. Explicit types can be given on
@@ -61,6 +62,24 @@ literal position. The method is resolved from the receiver's type, so two
 structs may define a method with the same name. A method call chains
 (`p.moved(1).sum()`) and a struct literal may be a receiver directly
 (`Point { x: 1, y: 2 }.sum()`).
+
+## Enums
+
+```rust
+enum Color { Red, Green, Blue }
+
+let c: Color = Color::Green;
+c as i64;                    // 1, the declaration index
+```
+
+An enum is a set of **unit variants** (no payload). It is represented by its
+`i64` tag, so it costs nothing over an integer and codegen needs no new case for
+it. A variant is written `Color::Green`; its value is its declaration index
+(0, 1, 2, ...). An enum value may be cast **to** `i64`, compared with `==`/`!=`
+against another value of the same enum, stored in a struct field, passed and
+returned by value, and used as a `match` scrutinee with `Color::Green` patterns.
+An enum may also have `impl` methods. `as` cannot convert an `i64` **to** an
+enum (rustc rejects that too); use a `match` to go from a tag back to a variant.
 
 ## Functions
 
@@ -133,8 +152,9 @@ Rust panic. Division by zero always traps at the CPU level.
   always a scalar, so arrays of arrays and arrays of structs are not supported.
 - Struct literals: `Point { x: 1, y: 2 }`, usable as a `let` initialiser.
 - Blocks and `if`/`else` are expressions.
-- `match` on integers: `match x { 0 => a, 1 => b, _ => c }`. An arm pattern is
-  an integer literal (optionally negated) or `_`. The first equal arm runs and
+- `match` on integers or enums: `match x { 0 => a, 1 => b, _ => c }` or
+  `match c { Color::Red => a, _ => b }`. An arm pattern is an integer literal
+  (optionally negated), an `Enum::Variant`, or `_`. The first equal arm runs and
   `_` matches anything; it is an expression, usable as a statement or a value,
   and a comma before `}` may be omitted. A non-exhaustive `match` (no `_`) that
   is used as a value is a type error, exactly as in Rust.
@@ -161,7 +181,7 @@ reuse and coalesces neighbours. Memory is not zeroed.
 
 ## Not supported
 
-Enums, traits, generics, references, borrowing,
-lifetimes, `impl` blocks, methods, modules, macros, `use`, closures, `f32`/`f64`,
-`u*`/`i*` types other than `i64`, tuples, and the standard library. Aggregates
-cross a call only by value; there are no `&T`/`&mut T` parameters.
+Traits, generics, references, borrowing, lifetimes, modules, macros, `use`,
+closures, `f32`/`f64`, `u*`/`i*` types other than `i64`, tuples, enum variants
+with a payload, arrays of aggregates, and the standard library. Aggregates cross
+a call only by value; there are no `&T`/`&mut T` parameters.

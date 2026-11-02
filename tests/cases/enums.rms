@@ -1,0 +1,67 @@
+#[derive(Copy, Clone)]
+enum Color { Red, Green, Blue }
+
+#[derive(Copy, Clone)]
+enum Dir { North, East, South, West }
+
+impl Dir {
+    fn dx(self) -> i64 {
+        match self {
+            Dir::East => 1,
+            Dir::West => 0 - 1,
+            _ => 0,
+        }
+    }
+    fn dy(self) -> i64 {
+        match self {
+            Dir::North => 1,
+            Dir::South => 0 - 1,
+            _ => 0,
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+struct Point { x: i64, y: i64 }
+
+impl Point {
+    fn shift(self, d: Dir) -> Point {
+        return Point { x: self.x + d.dx(), y: self.y + d.dy() };
+    }
+}
+
+fn is_warm(c: Color) -> bool {
+    match c {
+        Color::Red => true,
+        _ => false,
+    }
+}
+
+fn main() -> i64 {
+    // tags are declaration order
+    print_i64(Color::Red as i64);
+    print_i64(Color::Green as i64);
+    print_i64(Color::Blue as i64);
+    // match over an enum
+    let c: Color = Color::Green;
+    print_bool(is_warm(c));
+    print_bool(is_warm(Color::Red));
+    // enum stored in a struct, and used to drive a method
+    let p: Point = Point { x: 0, y: 0 };
+    let q: Point = p.shift(Dir::East).shift(Dir::East).shift(Dir::North);
+    print_i64(q.x);
+    print_i64(q.y);
+    // a state machine: an enum value drives a loop
+    let mut s: Color = Color::Red;
+    let mut n: i64 = 0;
+    let mut go: i64 = 1;
+    while go == 1 {
+        if s as i64 == 0 { s = Color::Green; }
+        else if s as i64 == 1 { s = Color::Blue; }
+        else { go = 0; }
+        n = n + 1;
+    }
+    print_i64(n);
+    print_i64(s as i64);
+    return 0;
+}

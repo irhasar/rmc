@@ -594,3 +594,72 @@ fn self_outside_an_impl_is_rejected() {
     let err = compile_to_asm("fn main() -> i64 { let s: Self = 1; return 0; }", &CompileOptions::default()).unwrap_err();
     assert!(err.contains("outside of an `impl`"), "got: {err}");
 }
+
+#[test]
+fn enum_variants_are_their_declaration_index() {
+    let src = "enum C { Red, Green, Blue } fn main() -> i64 { return C::Blue as i64; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+    // The tag appears as the immediate the variant compiles to.
+    let out = asm(src);
+    assert!(out.contains("mov $2, %rax"), "expected the tag 2 in:\n{out}");
+}
+
+#[test]
+fn an_unknown_variant_is_rejected() {
+    let err = compile_to_asm("enum C { A } fn main() -> i64 { return C::B as i64; }", &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("has no variant"), "got: {err}");
+}
+
+#[test]
+fn an_unknown_enum_is_rejected() {
+    let err = compile_to_asm("fn main() -> i64 { let c: Nope = Nope::A; return 0; }", &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("unknown type") || err.contains("unknown enum"), "got: {err}");
+}
+
+#[test]
+fn an_enum_may_be_a_field_type() {
+    let src = "enum C { A, B } struct P { c: C, n: i64 } \
+               fn main() -> i64 { let p: P = P { c: C::B, n: 7 }; return p.c as i64 + p.n; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn an_enum_method_resolves_by_receiver_type() {
+    let src = "enum D { N, E } impl D { fn dx(self) -> i64 { match self { D::E => 1, _ => 0 } } } \
+               fn main() -> i64 { return D::E.dx(); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn casting_an_integer_to_an_enum_is_rejected() {
+    // rustc rejects `i64 as Enum`; rmc matches it rather than inventing a cast.
+    let err = compile_to_asm("enum C { A } fn main() -> i64 { let x: i64 = 0; let c: C = x as C; return 0; }", &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("cannot cast to enum"), "got: {err}");
+}
+
+#[test]
+fn comparing_an_enum_with_an_integer_is_rejected() {
+    let err = compile_to_asm("enum C { A } fn main() -> i64 { let c: C = C::A; if c == 0 { return 1; } return 0; }", &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("comparison between different types"), "got: {err}");
+}
+
+#[test]
+fn a_struct_and_an_enum_cannot_share_a_name() {
+    let err = compile_to_asm("enum X { A } struct X { n: i64 } fn main() -> i64 { return 0; }", &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("both a struct and an enum"), "got: {err}");
+}
+
+#[test]
+fn an_enum_array_is_rejected() {
+    // Arrays stay `i64`/`bool`; `[E; N]` would mis-size the 8-byte element.
+    let err = compile_to_asm("enum C { A } fn main() -> i64 { let a: [C; 2] = [C::A; 2]; return 0; }", &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("array elements must be"), "got: {err}");
+}
+
+#[test]
+fn two_enums_compare_but_an_enum_and_an_integer_do_not() {
+    let ok = "enum C { A, B } fn main() -> i64 { let x: C = C::A; let y: C = C::B; if x == y { return 1; } return 0; }";
+    assert!(compile_to_asm(ok, &CompileOptions::default()).is_ok());
+    let bad = "enum C { A } fn main() -> i64 { let x: C = C::A; if x == 0 { return 1; } return 0; }";
+    assert!(compile_to_asm(bad, &CompileOptions::default()).is_err());
+}

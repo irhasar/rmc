@@ -120,6 +120,13 @@ def gen_stmt_program(rng):
     lit = ", ".join(f"{n}: {rng.randint(-9, 9)}" for n in fields)
     rms = [f"struct S {{ {fdecl} }}"]
     rs = ["#[derive(Copy, Clone)]", f"struct S {{ {fdecl} }}"]
+    # A unit enum, matched and cast, to exercise tag resolution and enum
+    # patterns alongside the struct paths.
+    rms.append("enum E { P, Q, R }")
+    rs.append("#[derive(Copy, Clone)]")
+    rs.append("enum E { P, Q, R }")
+    rms.append("fn tag(e: E) -> i64 { match e { E::P => 0, E::Q => 1, _ => 2 } }")
+    rs.append("fn tag(e: E) -> i64 { match e { E::P => 0, E::Q => 1, _ => 2 } }")
     rms.append(f"fn mk(t: i64) -> S {{ print_i64(t); return S {{ {lit} }}; }}")
     rs.append(f'fn mk(t: i64) -> S {{ println!("{{}}", t); S {{ {lit} }} }}')
     rms.append("fn sc(t: i64) -> i64 { print_i64(t); return t * 2; }")
@@ -174,6 +181,11 @@ def gen_stmt_program(rng):
     rs.append("    while k < 4 { if flags[k as usize] { f += 1; } k += 1; }")
     rms.append("    acc = acc + f * 1000;")
     rs.append("    acc += f * 1000;")
+    # An enum value chosen by the loop counter, matched and cast.
+    rms.append("    let e: E = match i % 3 { 0 => E::P, 1 => E::Q, _ => E::R };")
+    rs.append("    let e = match i % 3 { 0 => E::P, 1 => E::Q, _ => E::R };")
+    rms.append("    acc = acc + tag(e) * 100 + (e as i64);")
+    rs.append("    acc += tag(e) * 100 + (e as i64);")
     rms.append(f"    acc = acc + mix({', '.join(callargs)});")
     rs.append(f"    acc += mix({', '.join(callargs)});")
     rms.append("    print_i64(acc);")

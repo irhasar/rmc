@@ -15,6 +15,9 @@ pub enum Type {
     /// A struct: its name and its size in bytes. Sizes are computed by sema so
     /// that `size` needs no lookup table.
     Struct(String, usize),
+    /// A unit enum, represented by its `i64` tag. It occupies one slot like an
+    /// integer, so codegen emits it exactly as it emits `i64`.
+    Enum(String),
     /// Unresolved name produced by the parser; never survives sema.
     Named(String),
 }
@@ -22,7 +25,7 @@ pub enum Type {
 impl Type {
     pub fn size(&self) -> usize {
         match self {
-            Type::I64 | Type::Bool => 8,
+            Type::I64 | Type::Bool | Type::Enum(_) => 8,
             Type::Unit => 0,
             Type::Array(elem, n) => elem.size() * n,
             Type::Struct(_, s) => *s,
@@ -31,8 +34,16 @@ impl Type {
     }
 
     /// True for the types that fit in a single 8-byte slot and travel in one
-    /// register: `i64` and `bool`.
+    /// register: `i64`, `bool` and an enum. They may be parameters, fields and
+    /// return values.
     pub fn is_scalar(&self) -> bool {
+        matches!(self, Type::I64 | Type::Bool | Type::Enum(_))
+    }
+
+    /// True for the primitive types an array element may have. An enum is
+    /// deliberately excluded: codegen only lays out 8-byte integer-like
+    /// elements, and `[E; N]` would silently mis-size.
+    pub fn is_int_or_bool(&self) -> bool {
         matches!(self, Type::I64 | Type::Bool)
     }
 
@@ -119,6 +130,11 @@ pub enum Expr {
     /// rewrites this into a `Call` to the mangled method with `recv` prepended,
     /// so codegen never sees a method call.
     MethodCall { recv: Box<Expr>, name: String, args: Vec<Expr> },
+    /// `Enum::Variant`. Sema fills `tag` with the variant's index and gives the
+    /// expression the enum's type; codegen emits the tag as an `i64`. A unit
+    /// enum is exactly this: a named integer with checked constructors, which
+    /// makes it a zero-cost `switch`-style state value.
+    EnumVariant { enum_name: String, variant: String, tag: i64 },
     /// expr as Type
     Cast(Box<Expr>, Type),
 }
@@ -185,6 +201,10 @@ pub struct FnDef {
     /// `Some(T)` when this is a method defined in `impl T { .. }`. The method
     /// takes a leading `self` of type `T`; `self` is not listed in `params`.
     pub self_ty: Option<String>,
+    /// True when the first parameter is a method receiver. The parameter is
+    /// already present in `params`; this only records that a call to it must go
+    /// through a method call, so a free function cannot be called as one.
+    pub takes_self: bool,
     pub params: Vec<(String, Type)>,
     pub ret: Type,
     pub body: Block,
@@ -198,8 +218,17 @@ pub struct FnDef {
     pub nslots: i32,
 }
 
+/// A user-defined enum. Every variant is a unit variant (no payload), so the
+/// enum is represented by its `i64` tag and codegen needs no new case for it.
+#[derive(Debug, Clone)]
+pub struct EnumDef {
+    pub name: String,
+    pub variants: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Program {
     pub structs: Vec<StructDef>,
+    pub enums: Vec<EnumDef>,
     pub fns: Vec<FnDef>,
 }

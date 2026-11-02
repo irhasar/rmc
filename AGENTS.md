@@ -219,6 +219,13 @@ through every precedence function, so it costs several KiB); `fuzz.py --mode
 robust` and the depth tests in `tests/compile.rs` guard it. If you add a new
 recursive construct, count a level with `bump_depth` on entry.
 
+An enum is a set of unit variants represented by its `i64` tag (the declaration
+index). `Expr::EnumVariant` keeps its node and its enum type so re-checking it
+(as a method receiver is) stays consistent; codegen emits the tag. Enum names
+resolve to `Type::Enum` through `resolve_ty`, which every type site uses, and
+enum patterns are a `Pat::Variant` the parser desugars into an `EnumVariant`
+comparison. `as` may not target an enum, matching rustc.
+
 A method is an ordinary free function whose name is mangled to `Type$method` and
 whose first parameter is `self` of the impl's struct type; the parser produces
 it, sema inserts the `self` parameter before building signatures, and a method
