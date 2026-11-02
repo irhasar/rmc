@@ -13,8 +13,14 @@ use std::fmt::Write as _;
 pub struct Codegen {
     out: String,
     label: u32,
-    /// Number of 8-byte pushes currently live, used for 16-byte stack alignment.
+    /// Current spill depth: number of values held in spill slots.
     sp_off: i32,
+    /// First frame slot available for spills (just past the locals).
+    spill_base: i32,
+    /// Spill slots reserved for the function being generated, sized by a dry run.
+    spill_slots: i32,
+    /// High-water mark of `sp_off` during the current pass.
+    max_spill: i32,
     str_id: u32,
     strings: Vec<(String, String)>, // (label, bytes)
     loops: Vec<(String, String)>,   // (continue_label, break_label)
@@ -44,6 +50,9 @@ impl Codegen {
             out: String::with_capacity(1 << 16),
             label: 0,
             sp_off: 0,
+            spill_base: 0,
+            spill_slots: 0,
+            max_spill: 0,
             str_id: 0,
             strings: Vec::new(),
             loops: Vec::new(),
@@ -103,14 +112,20 @@ impl Codegen {
         l
     }
 
+    /// Spill `%rax` into a frame slot. A slot is used instead of `push` so that
+    /// `%rsp` never moves mid-function: a moving stack forces a 16-byte
+    /// alignment pad around every call, which costs more than the spill saves.
     fn push_rax(&mut self) {
-        self.line("push %rax");
+        let o = self.off(self.spill_base + self.sp_off);
+        self.line(&format!("mov %rax, {o}(%rbp)"));
         self.sp_off += 1;
+        self.max_spill = self.max_spill.max(self.sp_off);
     }
 
     fn pop_to(&mut self, reg: &str) {
-        self.line(&format!("pop {reg}"));
         self.sp_off -= 1;
+        let o = self.off(self.spill_base + self.sp_off);
+        self.line(&format!("mov {o}(%rbp), {reg}"));
     }
 
     pub fn compile(mut self, prog: &Program) -> String {
@@ -144,15 +159,34 @@ impl Codegen {
     }
 
     fn gen_fn(&mut self, f: &FnDef) {
+        // Promote the most-used scalar locals into callee-saved registers.
+        self.regs = Self::promote(f);
+        // Spill slots live just past the locals in the frame. Generate the body
+        // once to find the deepest spill, then regenerate with exactly that many
+        // slots; the dry run's output is discarded.
+        self.spill_base = f.nslots;
+        self.spill_slots = 0;
+        let mark = (self.out.len(), self.label, self.str_id, self.strings.len());
+        self.gen_fn_body(f);
+        let need = self.max_spill;
+        self.out.truncate(mark.0);
+        self.label = mark.1;
+        self.str_id = mark.2;
+        self.strings.truncate(mark.3);
+        self.spill_slots = need;
+        self.gen_fn_body(f);
+        self.regs.clear();
+    }
+
+    fn gen_fn_body(&mut self, f: &FnDef) {
         self.sp_off = 0;
+        self.max_spill = 0;
         self.epilogue = self.new_label();
         self.ret_slot = f.ret_slot;
         self.ret_ty = f.ret.clone();
-        // Promote the most-used scalar locals into callee-saved registers.
-        self.regs = Self::promote(f);
         let saved: Vec<&'static str> = self.regs.iter().map(|(_, r)| *r).collect();
 
-        let nregs = self.regs.len();
+        let nregs = self.nregs();
         self.raw(&format!(".globl {}", f.name));
         self.raw(&format!(".type {}, @function", f.name));
         self.raw(&format!("{}:", f.name));
@@ -165,7 +199,7 @@ impl Codegen {
             self.line(&format!("push {r}"));
         }
         let saved_bytes = nregs as i32 * 8;
-        let slots_bytes = f.nslots * 8;
+        let slots_bytes = (f.nslots + self.spill_slots) * 8;
         // The total depth below %rbp (saved registers plus frame) must be a
         // multiple of 16 so %rsp is 16-byte aligned at every call.
         let frame = ((slots_bytes + saved_bytes + 15) / 16) * 16 - saved_bytes;
@@ -235,7 +269,6 @@ impl Codegen {
         self.line("leave");
         self.line("ret");
         self.raw(&format!(".size {}, .-{}", f.name, f.name));
-        self.regs.clear();
     }
 
     /// Copy `n` 8-byte words from the address in `%rsi` to the address in `%rdi`.
@@ -1528,14 +1561,9 @@ impl Codegen {
             let n = ret_ty.size() / 8;
             self.line(&format!("lea {}(%rbp), %r10", self.array_off(ret_slot, n)));
         }
-        let pad = self.sp_off % 2 != 0;
-        if pad {
-            self.line("sub $8, %rsp");
-        }
+        // Spills live in frame slots, so `%rsp` is already 16-byte aligned at
+        // every call and needs no pad here.
         self.line(&format!("call {name}"));
-        if pad {
-            self.line("add $8, %rsp");
-        }
         // An aggregate result's address (the hidden buffer) is in %rax; a
         // scalar result is already in %rax.
         ret_ty.clone()

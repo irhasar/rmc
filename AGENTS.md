@@ -56,6 +56,19 @@ python3 tests/run.py -v
   `-(s+1+nregs)*8(%rbp)`, where `nregs` is the number of registers holding
   promoted locals. Address them positively and you overwrite the saved
   `%rbp`/return address and segfault. See `Codegen::off`.
+- **Spills live in frame slots, not on the stack.** `push_rax`/`pop_to` write a
+  slot at `spill_base + sp_off` instead of `push`/`pop`, so `%rsp` never moves
+  and no alignment pad is needed around a call. `spill_slots` is sized by a dry
+  run of the body; if the real pass spilled deeper than the reservation, spills
+  would overwrite locals. Keeping the two passes identical is what makes the
+  reservation exact.
+- **Two-pass codegen must reset every counter.** `gen_fn` runs the body twice and
+  truncates the output between passes; the label counter, string table and spill
+  high-water mark are part of that reset. Miss one and the two passes diverge.
+- **A callee-saved temporary is not worth it here.** Holding a value across a
+  call in `%r12`-`%r15` was implemented and measured *slower* (the save/restore
+  in the prologue/epilogue costs more than the spill it removes). Keep the frame
+  slot unless you re-measure.
 - **Saved registers sit between `%rbp` and the frame.** The epilogue must point
   `%rsp` at the lowest saved register (or add the frame size back) before
   popping, otherwise `pop` reads the frame and the return address is lost.
@@ -104,6 +117,10 @@ python3 tests/run.py -v
 - **Statements vs. tail expressions.** Assignments inside a block must be
   detected before the trailing-`;` check in `parse_block`, otherwise `x = ...;`
   is parsed as an expression and rejected.
+- **Spill slots are frame slots.** `push_rax`/`pop_to` spill to a frame slot
+  rather than `push`/`pop`, so `%rsp` is static and a call needs no alignment
+  pad. This measured faster on every real program (`fib` +3.3%) because the pad
+  costs two instructions per call.
 - **Link flags.** The driver uses `ld -o <out> --build-id=none -n <obj>`; the
   assembly already carries `.note.GNU-stack` so no `-z noexecstack` is needed.
   `-n` (nmagic) drops the page alignment between sections and roughly halves the

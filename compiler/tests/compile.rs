@@ -214,3 +214,16 @@ fn a_comparison_of_two_promoted_locals_is_one_cmp() {
     });
     assert!(has_reg_reg_cmp, "register-to-register cmp: {out}");
 }
+
+#[test]
+fn spills_use_frame_slots_not_the_stack() {
+    // A value held across a call is spilled to a frame slot, so `%rsp` never
+    // moves and no 16-byte alignment pad is emitted around the call.
+    let out = asm(
+        "fn f(x: i64) -> i64 { return x; } fn g(x: i64) -> i64 { return f(x - 1) + f(x - 2); } fn main() -> i64 { return 0; }",
+    );
+    let g = &out[out.find("g:").unwrap()..out.find(".size g,").unwrap()];
+    assert!(!g.contains("push %rax"), "no stack spill: {g}");
+    assert!(!g.contains("sub $8, %rsp"), "no alignment pad: {g}");
+    assert!(g.contains("(%rbp)"), "spill lands in a frame slot: {g}");
+}

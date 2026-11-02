@@ -72,8 +72,10 @@ a `return`, or a tail expression).
 - Array access: for a local array, `a[i]` with a variable index is addressed as
   `disp(%rbp,%rax,8)` in one operand (the index is loaded into `%rax` first), and
   `a[3]` with a constant index needs no register. Stores use the same operand.
-- Deep or nested operands fall back to pushing the left result on the stack
-  while the right is evaluated, then popping into `%rax`.
+- Deep or nested operands fall back to spilling the left result to a frame slot
+  while the right is evaluated, then reloading it into `%rax`. Spills use frame
+  slots rather than `push`/`pop` so `%rsp` never moves and a call needs no
+  alignment pad.
 
 ### Division by a constant
 
@@ -110,9 +112,15 @@ needs spilling. Aggregates are skipped because they need a memory address, and s
 is any slot used as an index base. Everything else stays in a stack slot, now
 placed below the saved registers so the two never overlap.
 
-The frame is padded so that the saved registers plus the slots together keep
-`%rsp` 16-byte aligned at every call, and the epilogue points `%rsp` at the
-lowest saved register before popping, which also discards the frame.
+The frame is padded so that the saved registers plus the slots (locals and
+spill slots together) keep `%rsp` 16-byte aligned, and because spills go to
+frame slots rather than the stack, `%rsp` is static for the whole body and no
+per-call alignment pad is needed. The epilogue points `%rsp` at the lowest saved
+register before popping, which also discards the frame.
+
+The number of spill slots is not known until the body is generated, so `gen_fn`
+runs the body twice: the first pass measures the deepest spill, the second sizes
+the frame and emits the final code.
 
 Selection is whole-function, not per loop, so a local hot in one loop competes
 with one hot in another; `fib`, whose only variable is the parameter, sees no
@@ -133,10 +141,11 @@ compile time, peak RSS and binary size are unchanged.
 
 ## Calls
 
-Scalar arguments are evaluated right-to-left and pushed, then popped into the
-argument registers in order. If an odd number of pushes is live, an extra 8-byte
-pad is inserted before the `call` so `%rsp` stays 16-byte aligned. Caller-saved
-registers are not preserved across calls; temporaries always live on the stack.
+Scalar arguments are evaluated right-to-left and spilled to frame slots, then
+loaded into the argument registers in order. Because spills are frame slots and
+`%rsp` is already 16-byte aligned, no pad is inserted before the `call`.
+Caller-saved registers are not preserved across calls; a temporary that must
+survive one is spilled to a frame slot.
 
 ### Aggregates across a call
 

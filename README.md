@@ -165,32 +165,32 @@ Representative run on the development machine (Debian 13, gcc 14.2, rustc
 
 | program | compiler | compile wall | compile CPU | peak RSS | artifact | run time |
 | ------- | -------- | -----------: | ----------: | -------: | -------: | -------: |
-| hello   | rmc      |     7.60 ms  |    7.32 ms  |  12.0 MB |   6504 B |  1.61 ms |
-| hello   | rustc    |  2108.84 ms  | 2111.74 ms  | 185.2 MB | 289416 B |  2.23 ms |
-| fib     | rmc      |     7.34 ms  |    7.10 ms  |  12.0 MB |   6608 B | 16.09 ms |
-| fib     | rustc    |  2188.39 ms  | 2189.06 ms  | 184.9 MB | 291696 B |  8.84 ms |
-| mandel  | rmc      |     7.54 ms  |    7.29 ms  |  12.0 MB |   6880 B |104.53 ms |
-| mandel  | rustc    |  2143.01 ms  | 2147.40 ms  | 189.9 MB | 291776 B |107.45 ms |
-| sieve   | rmc      |    10.89 ms  |   10.62 ms  |  12.0 MB |   6656 B |  3.00 ms |
-| sieve   | rustc    |  2135.67 ms  | 2140.09 ms  | 186.3 MB | 292016 B |  3.88 ms |
-| mix     | rmc      |     7.56 ms  |    7.26 ms  |  12.0 MB |   6672 B | 18.23 ms |
-| mix     | rustc    |  2158.57 ms  | 2163.11 ms  | 186.8 MB | 291864 B | 16.89 ms |
-| stats   | rmc      |     7.83 ms  |    7.63 ms  |  12.0 MB |   6760 B |  5.33 ms |
-| stats   | rustc    |  2125.59 ms  | 2129.45 ms  | 186.5 MB | 292048 B |  5.20 ms |
+| hello   | rmc      |     8.33 ms  |    8.07 ms  |  12.1 MB |   6504 B |  1.63 ms |
+| hello   | rustc    |  2067.24 ms  | 2070.34 ms  | 185.2 MB | 289416 B |  2.16 ms |
+| fib     | rmc      |     7.63 ms  |    7.34 ms  |  12.1 MB |   6616 B | 15.47 ms |
+| fib     | rustc    |  2098.98 ms  | 2103.25 ms  | 185.5 MB | 291696 B |  8.62 ms |
+| mandel  | rmc      |     7.67 ms  |    7.42 ms  |  12.1 MB |   6880 B |104.58 ms |
+| mandel  | rustc    |  2097.84 ms  | 2102.18 ms  | 189.3 MB | 291776 B |108.63 ms |
+| sieve   | rmc      |    10.77 ms  |   10.50 ms  |  12.1 MB |   6656 B |  2.97 ms |
+| sieve   | rustc    |  2115.31 ms  | 2119.47 ms  | 186.3 MB | 292016 B |  3.81 ms |
+| mix     | rmc      |     7.60 ms  |    7.33 ms  |  12.1 MB |   6672 B | 18.27 ms |
+| mix     | rustc    |  2115.31 ms  | 2117.95 ms  | 187.2 MB | 291864 B | 16.84 ms |
+| stats   | rmc      |     7.68 ms  |    7.38 ms  |  12.1 MB |   6760 B |  5.24 ms |
+| stats   | rustc    |  2115.90 ms  | 2119.60 ms  | 185.9 MB | 292048 B |  5.12 ms |
 
 Summary of the ratios (rustc ÷ rmc):
 
 | dimension        | ratio      |
 | ---------------- | ---------: |
-| compile wall     | ~194–298×  |
-| compile CPU      | ~199–308×  |
-| compiler peak RSS| ~15.5×     |
+| compile wall     | ~248–278×  |
+| compile CPU      | ~257–287×  |
+| compiler peak RSS| ~15.3×     |
 | artifact size    | ~44×       |
-| run time         | 0.55–1.39× (rustc faster on call-heavy code) |
+| run time         | 0.56–1.33× (rustc faster on call-heavy code) |
 
-`rmc` beats rustc on `hello` (1.39×), `sieve` (1.29×) and `mandel` (1.03×)
+`rmc` beats rustc on `hello` (1.33×), `sieve` (1.28×) and `mandel` (1.04×)
 because the workload is a tight loop or a single call and the static binary has
-no libc startup. On `fib` (0.55×, call-heavy), `mix` (0.93×) and `stats` (0.98×)
+no libc startup. On `fib` (0.56×, call-heavy), `mix` (0.92×) and `stats` (0.98×)
 LLVM's loop transformations and register allocation still win. `stats` holds its
 accumulators in a struct, which rmc keeps in memory, so it is a fair illustration
 of where a real register allocator would pay off.
@@ -215,10 +215,12 @@ rmc is a small, self-contained compiler, not a drop-in replacement for rustc.
   every call.
 - Code generation is a stack machine for expressions. The hottest five scalar
   locals in each function are pinned to callee-saved registers; everything else
-  is in memory. The optimiser is a peephole pass (constant operands, folded
-  comparisons, folded array addressing, `lea` strength reduction of `k*x+c`,
-  division by a constant); there is no instruction scheduling, inlining, or loop
-  transformation, and no live-range analysis.
+  is in memory. Temporaries are spilled to frame slots, not the machine stack, so
+  `%rsp` never moves and a call needs no alignment pad. The optimiser is a
+  peephole pass (constant operands, folded comparisons, folded array addressing,
+  `lea` strength reduction of `k*x+c`, division by a constant); there is no
+  instruction scheduling, inlining, or loop transformation, and no live-range
+  analysis.
 - The backend targets x86-64 Linux only, using the System V ABI and raw Linux
   syscalls. There is no Windows, macOS, ARM, or WebAssembly support.
 - The heap is a simple first-fit free-list allocator; it does not return memory
