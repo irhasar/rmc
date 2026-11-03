@@ -69,6 +69,7 @@ rmc input.rms --keep-asm -o out    # keep the intermediate .s file
 rmc input.rms --overflow-checks    # trap on i64 +,-,* overflow (exit 101)
 rmc input.rms --bounds-checks      # trap on an out-of-range array index (exit 101)
 rmc input.rms --no-inline          # disable inlining (on by default)
+rmc input.rms --no-licm            # disable loop-invariant code motion (on by default)
 ```
 
 Run the produced binary directly; it is a static ELF executable with no
@@ -184,61 +185,77 @@ Runtime builtins (provided by `src/runtime.rs`, no imports needed):
 ## Benchmarks
 
 `bench/run.py` compares `rmc` against `rustc -O -C lto=fat -C codegen-units=1
--C panic=abort -C strip=symbols` on six programs. It measures each compile with
-`wait4()` so CPU time and peak RSS cover the real process (including `as`/`ld`
-for rmc and LLVM for rustc). Programs read their workload from `argv` via
-`black_box` / `arg_i64`, so nothing is constant-folded away.
+-C panic=abort -C strip=symbols` on seven programs. It measures both halves of
+the comparison, because "faster" means two different things here:
+
+* **compile** — build wall time, compiler CPU time, compiler peak RAM, and the
+  artifact size (the linked executable on disk);
+* **run** — the wall time, CPU time and peak RAM of the compiled program.
+
+Peak RAM is read from each process's own `VmHWM`, so the number is the process
+itself, not the harness around it. Programs read their workload from `argv` via
+`black_box` / `arg_i64`, so nothing is constant-folded away. The full, dated
+result is recorded in [`bench/RESULTS.md`](bench/RESULTS.md); regenerate it with:
 
 ```sh
-python3 bench/run.py
+python3 bench/run.py --markdown bench/RESULTS.md
 ```
 
-Representative run on the development machine (Debian 13, gcc 14.2, rustc
-1.99.1 / LLVM 23.1.1, x86-64, 16 GB RAM; medians of 5 compiles and 9 runs):
+Representative run on the development machine (Debian 13, rustc 1.99.1 /
+LLVM 23.1.1, AMD EPYC 9B14, x86-64; medians of 5 compiles and 9 runs):
 
-| program | compiler | compile wall | compile CPU | peak RSS | artifact | run time |
-| ------- | -------- | -----------: | ----------: | -------: | -------: | -------: |
-| hello   | rmc      |     7.51 ms  |    7.20 ms  |  11.6 MB |   6656 B |  1.57 ms |
-| hello   | rustc    |  2028.13 ms  | 2031.40 ms  | 180.7 MB | 289416 B |  2.16 ms |
-| fib     | rmc      |     7.09 ms  |    6.85 ms  |  11.6 MB |   6760 B | 15.54 ms |
-| fib     | rustc    |  2071.85 ms  | 2075.68 ms  | 182.5 MB | 291696 B |  8.51 ms |
-| mandel  | rmc      |     7.24 ms  |    6.99 ms  |  11.6 MB |   7032 B |102.57 ms |
-| mandel  | rustc    |  2089.91 ms  | 2094.66 ms  | 182.7 MB | 291776 B |106.89 ms |
-| sieve   | rmc      |     9.52 ms  |    9.28 ms  |  11.6 MB |   6792 B |  2.95 ms |
-| sieve   | rustc    |  2066.61 ms  | 2070.60 ms  | 181.1 MB | 292016 B |  3.83 ms |
-| mix     | rmc      |     7.17 ms  |    6.93 ms  |  11.6 MB |   6816 B | 18.19 ms |
-| mix     | rustc    |  2064.99 ms  | 2068.78 ms  | 181.9 MB | 291864 B | 16.90 ms |
-| stats   | rmc      |     7.15 ms  |    6.90 ms  |  11.6 MB |   6904 B |  5.30 ms |
-| stats   | rustc    |  2068.51 ms  | 2072.77 ms  | 181.5 MB | 292048 B |  5.22 ms |
-| refs    | rmc      |     7.36 ms  |    7.11 ms  |  11.6 MB |   7416 B | 19.65 ms |
-| refs    | rustc    |  2099.44 ms  | 2103.85 ms  | 182.5 MB | 292144 B |  2.46 ms |
+| program | compiler | compile wall | compile CPU | compile RAM | artifact | run wall | run CPU | run RAM |
+| ------- | -------- | -----------: | ----------: | ----------: | -------: | -------: | ------: | ------: |
+| hello | rmc | 6.18 ms | 6.11 ms | 2.5 MB | 6656 B | 0.26 ms | 0.13 ms | 20 kB |
+| hello | rustc | 2106.35 ms | 2108.64 ms | 183.1 MB | 289416 B | 0.84 ms | 0.72 ms | 2004 kB |
+| fib | rmc | 6.14 ms | 6.08 ms | 2.6 MB | 6760 B | 14.21 ms | 14.05 ms | 24 kB |
+| fib | rustc | 2115.89 ms | 2120.37 ms | 182.6 MB | 291696 B | 7.29 ms | 7.16 ms | 2036 kB |
+| mandel | rmc | 6.12 ms | 6.07 ms | 2.5 MB | 7048 B | 101.88 ms | 101.69 ms | 24 kB |
+| mandel | rustc | 2144.51 ms | 2147.31 ms | 185.3 MB | 291776 B | 105.97 ms | 105.76 ms | 2108 kB |
+| sieve | rmc | 8.14 ms | 8.04 ms | 4.2 MB | 6792 B | 1.67 ms | 1.55 ms | 1584 kB |
+| sieve | rustc | 2133.38 ms | 2137.47 ms | 182.8 MB | 292016 B | 2.56 ms | 2.40 ms | 3604 kB |
+| mix | rmc | 6.24 ms | 6.18 ms | 2.5 MB | 6816 B | 16.87 ms | 16.73 ms | 20 kB |
+| mix | rustc | 2165.36 ms | 2169.67 ms | 183.0 MB | 291864 B | 15.56 ms | 15.40 ms | 2016 kB |
+| stats | rmc | 6.22 ms | 6.13 ms | 2.6 MB | 6904 B | 3.89 ms | 3.76 ms | 20 kB |
+| stats | rustc | 2128.05 ms | 2132.62 ms | 184.2 MB | 292048 B | 3.74 ms | 3.62 ms | 2076 kB |
+| refs | rmc | 6.34 ms | 6.29 ms | 2.6 MB | 7352 B | 6.31 ms | 6.14 ms | 20 kB |
+| refs | rustc | 2118.62 ms | 2122.41 ms | 188.3 MB | 292144 B | 0.88 ms | 0.76 ms | 2100 kB |
 
-Summary of the ratios (rustc ÷ rmc):
+Summary of the ratios (rustc ÷ rmc, so >1 means rmc is better):
 
-| dimension        | ratio      |
-| ---------------- | ---------: |
-| compile wall     | ~280–300×  |
-| compile CPU      | ~290–320×  |
-| compiler peak RSS| ~15.6×     |
-| artifact size    | ~43×       |
-| run time         | 0.13–1.38× (rustc faster on call-heavy code) |
+| dimension         | ratio      |
+| ----------------- | ---------: |
+| compile wall      | ~260–350×  |
+| compile CPU       | ~265–355×  |
+| compiler peak RAM | ~44–72×    |
+| artifact size     | ~40–43×    |
+| run wall time     | 0.14–3.16× (rustc faster on call-heavy code) |
+| run CPU           | 0.12–5.44× |
+| run peak RAM      | ~2× on the heap-heavy case, ~85–105× elsewhere |
 
-`rmc` beats rustc on `hello` (1.38×), `sieve` (1.30×) and `mandel` (1.04×)
-because the workload is a tight loop or a single call and the static binary has
-no libc startup. On `fib` (0.55×, call-heavy), `mix` (0.93×) and `stats` (0.98×)
-LLVM's loop transformations and register allocation still win. `refs` (0.13×)
-is the weakest case: rustc keeps the whole struct in registers across the loop,
-where rmc reloads each field. Inlining the `&self` accessors closed most of that
-gap — `refs` went from 50 ms to 20 ms (2.6× faster than before), and the hot
-loop no longer contains a single call.
+The compile-time win is the point of the project: `rmc` builds in about 6 ms
+where rustc needs about 2.1 s, using ~2.6 MB of RAM against ~185 MB and writing
+a ~7 KB static binary against a ~290 KB one. The run-time picture is mixed.
+`rmc` wins on `hello` (3.2×), `sieve` (1.5×) and `mandel` (1.04×) because the
+workload is a tight loop or a single call and the static binary has no libc
+startup; it loses on `fib` (0.51×, call-heavy) and is close on `mix` (0.92×) and
+`stats` (0.96×), where LLVM's loop transforms and register allocation still win.
+`refs` (0.14×) was the weakest case: rustc keeps the whole struct in registers
+across the loop, where rmc reloads each field. Two passes closed most of that
+gap — inlining the `&self` accessors removed every call from the hot loop
+(`refs` 50 → 20 ms), and loop-invariant code motion then hoisted the now-inlined
+struct reads out of the loop (`refs` 18 → 6 ms), leaving the loop adding two
+precomputed sums. The binary's tiny footprint also shows at run time: an `rmc`
+program peaks at ~20 kB of RAM, a rustc one at ~2 MB.
 
 ### Reproducing the comparison honestly
 
 The `rustc` invocation enables fat LTO and a single codegen unit, which is the
 closest equivalent to "compile everything, then link". The `rmc` time includes
 spawning `as` and `ld`; the `rustc` time includes LLVM and the system linker.
-Both binaries are measured the same way, and both read their workload from
-`argv` so neither can fold the answer at compile time.
+Both compilers and both binaries are measured the same way, peak RAM comes from
+each process's own `VmHWM`, and both programs read their workload from `argv` so
+neither can fold the answer at compile time.
 
 ## Honest limitations
 
@@ -256,13 +273,15 @@ rmc is a small, self-contained compiler, not a drop-in replacement for rustc.
   never copied, returned or passed by value — are pinned to callee-saved
   registers; everything else is in memory. Temporaries are spilled to frame slots, not the machine stack, so
   `%rsp` never moves and a call needs no alignment pad. The optimiser is an
-  inlining pass (small, straight-line, scalar functions) followed by a peephole
-  pass (constant operands, folded comparisons, folded array addressing, `lea`
-  strength reduction of `k*x+c`, division by a constant, in-place accumulation
-  of a running sum); there is no instruction scheduling or loop transformation,
-  and no live-range analysis. Inlining runs on the AST after semantic analysis
-  and expands to a fixpoint, so a wrapper is inlined once its own callees are;
-  `--no-inline` turns it off.
+  inlining pass (small, straight-line, scalar functions), a loop-invariant code
+  motion pass, and a peephole pass (constant operands, folded comparisons, folded
+  array addressing, `lea` strength reduction of `k*x+c`, division by a constant,
+  in-place accumulation of a running sum); there is no instruction scheduling or
+  other loop transformation, and no live-range analysis. Inlining runs on the AST
+  after semantic analysis and expands to a fixpoint, so a wrapper is inlined once
+  its own callees are; loop-invariant code motion then hoists the arithmetic that
+  inlining exposed out of a loop body. `--no-inline` and `--no-licm` turn them
+  off.
 - The backend targets x86-64 Linux only, using the System V ABI and raw Linux
   syscalls. There is no Windows, macOS, ARM, or WebAssembly support.
 - Array indexing is unchecked by default: an out-of-range index reads or writes

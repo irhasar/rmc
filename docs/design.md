@@ -42,10 +42,14 @@ driver shells out to GNU `as` and `ld`.
    sema, so every name already carries its slot and no lookup is needed, and
    before codegen, so the peephole pass sees the inlined arithmetic. See
    "Inlining" below.
-5. **Code generation** (`codegen.rs`) — emits AT&T-syntax x86-64 assembly. Every
+5. **Loop-invariant code motion** (`licm.rs`) — hoists a pure, invariant scalar
+   subexpression out of a loop body so it is computed once instead of every
+   iteration. Runs after inlining, because inlining is what exposes the
+   invariant arithmetic. See "Loop-invariant code motion" below.
+6. **Code generation** (`codegen.rs`) — emits AT&T-syntax x86-64 assembly. Every
    expression leaves its result in `%rax`; the result type is returned to the
    caller so callers know how to use it.
-6. **Assemble and link** (`main.rs`) — writes the assembly, runs `as --64`, then
+7. **Assemble and link** (`main.rs`) — writes the assembly, runs `as --64`, then
    `ld -o <out> --build-id=none -n <obj>`, with the runtime text prepended.
 
 ## Stack layout
@@ -305,6 +309,30 @@ A whole-program budget of 8192 expansions bounds compile time and code size; a
 loop body is inlined once, not once per iteration. `--no-inline` turns the pass
 off, which is what the tests that assert on the calling convention use.
 
+## Loop-invariant code motion
+
+Inlining exposes arithmetic that reads only loop-invariant data. After inlining,
+`refs`'s hot loop recomputes the same struct-field sum and the same two-product
+sum every iteration, even though the struct is fixed. `licm.rs` computes each
+such subexpression once, before the loop, and reads the result inside, which
+takes `refs` from 18 ms to 6 ms. It runs after inlining and before codegen.
+
+The pass only rewrites a loop *body*; a `while` condition and a `for`'s bounds
+run once per iteration by design, so hoisting them would change the loop. Inside
+a body it hoists a scalar subexpression when every local it reads is untouched
+by the loop and it cannot trap or write: no call, no division or modulo, no
+array index or dereference, and no block or `if`. A struct-field read is a
+memory read, so it is only hoisted when the loop writes no memory at all. A loop
+that contains any call is skipped entirely, because a call can write anything.
+A `for`'s variable and bound are assigned by the loop itself rather than in the
+body, so they are treated as loop-carried.
+
+Hoisting a pure, non-trapping value earlier is otherwise safe: it can only waste
+a computation when the loop does not run, never change a result. The one
+exception is an arithmetic trap, so the pass is disabled under
+`--overflow-checks`, where a hoisted `+`/`-`/`*` would trap before the loop
+instead of at the iteration that overflows. `--no-licm` turns the pass off.
+
 ## Runtime
 
 `runtime.rs` holds a freestanding assembly runtime. `_start` captures `argc` and
@@ -346,15 +374,17 @@ a branch per arithmetic operation.
 
 ## What is intentionally missing
 
-There is no optimiser beyond the folding, local promotion, inlining and
-dead-instruction trim described above. No global register allocation, no
-common-subexpression elimination, no loop transforms, no instruction
-scheduling. The compiler is optimised for compile speed and simplicity, not for
-the speed of the code it produces. The non-trivial passes are division by a
-constant (1.4x on `mandel.rms`), the top-five local promotion (a few percent on
-`mix` and `sieve`), the reference-operand folds plus `trim_dead` (1.4x on the
-`refs` benchmark), and inlining (2.6x on `refs`, by removing the three accessor
-calls from its hot loop); everything else is local and cheap to compute.
+There is no optimiser beyond the folding, local promotion, inlining, loop-
+invariant code motion and dead-instruction trim described above. No global
+register allocation, no common-subexpression elimination, no other loop
+transforms, no instruction scheduling. The compiler is optimised for compile
+speed and simplicity, not for the speed of the code it produces. The non-trivial
+passes are division by a constant (1.4x on `mandel.rms`), the top-five local
+promotion (a few percent on `mix` and `sieve`), the reference-operand folds plus
+`trim_dead` (1.4x on the `refs` benchmark), inlining (2.6x on `refs`, by removing
+the three accessor calls from its hot loop), and loop-invariant code motion (a
+further 2.9x on `refs`, by hoisting the now-inlined struct reads out of the
+loop); everything else is local and cheap to compute.
 
 On the language side the notable absences are: `u*`/`i*` widths other than
 `i64`, floating point, traits and generics, closures, `for` over arbitrary
