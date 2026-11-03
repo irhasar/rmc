@@ -107,13 +107,15 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
   entirely, taking `refs` to ~20 ms, and LICM hoisted the now-inlined struct
   reads out of the loop, taking it to ~6 ms. Flattening the accumulator fold over
   the nested sum LICM leaves (`acc + t + (t + p) + p`), and unwrapping the
-  inliner's spliced block so the fold can see it, took `refs` to ~4.7 ms (rustc
-  is still ~5.7x ahead on `refs` — it keeps the struct in registers across the
-  loop, which rmc does not). The fold is deliberately *one* level deep: a `*p`
-  used as a reference has its pointer in memory, so `ptr_reg` only matches a
-  reference *local*, never a `Deref`. `addr_reg` (local or one `Deref` of a local)
-  is the form `gen_addr` folds for a `lea`. Extending either to a deeper chain
-  would read the inner pointer from a register it is not in — the bug that
+  inliner's spliced block so the fold can see it, took `refs` to ~4.7 ms. Against
+  an honest rustc twin (which `black_box`es a term, or LLVM closes the whole loop
+  into `128 * n`) that is ~0.8x, not the ~0.14x an earlier run reported from the
+  folded loop; rustc is only ~1.2x ahead now, keeping the struct in registers
+  across the loop, which rmc does not. The fold is deliberately *one* level deep:
+  a `*p` used as a reference has its pointer in memory, so `ptr_reg` only matches
+  a reference *local*, never a `Deref`. `addr_reg` (local or one `Deref` of a
+  local) is the form `gen_addr` folds for a `lea`. Extending either to a deeper
+  chain would read the inner pointer from a register it is not in — the bug that
   `(**ppr).x` in `tests/cases/references.rms` guards against.
 - **A scalar `*p` read is a memory operand.** `simple_operand` returns `(%reg)`
   for a non-aggregate `Deref` whose pointer is a reference local, so `*p < 5`
@@ -389,6 +391,14 @@ The README's roadmap lists the intended next steps.
 - Every expression leaves its result in `%rax`; `%rcx`/`%rdx` are the only
   scratch registers used. No other register is written by expression code, which
   is what makes the direct-argument call shortcut safe (see `gen_call`).
+- **A benchmark twin must `black_box` its workload.** rmc's `arg_i64` is opaque
+  to rmc, but the Rust twin's `std::env::args().nth(1).parse()` is not opaque to
+  LLVM: it sees the whole program and can fold a loop into a closed form. The
+  `refs` twin did exactly that — LLVM reduced the loop to `acc = 128 * n`, so the
+  recorded "rustc 0.83 ms" was its own constant folding and the ratio read 0.18x
+  instead of the honest 0.82x. Every twin with a loop now threads its trip count
+  or a term through `std::hint::black_box`. When a rustc twin's time matches its
+  `hello` time, suspect folding before celebrating.
 - **A destination address must survive the value it is assigned.** Assigning a
   whole aggregate to a field or element computes the destination first, and
   `gen_expr(value)` may clobber `%rdi` (a call, or another aggregate copy), so

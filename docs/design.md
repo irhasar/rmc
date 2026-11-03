@@ -390,7 +390,8 @@ further 2.9x on `refs`, by hoisting the now-inlined struct reads out of the
 loop); everything else is local and cheap to compute. Flattening the accumulator
 fold over a nested sum, plus unwrapping the inliner's spliced block so the fold
 can see the accessor arithmetic, is what turns LICM's three hoisted values into
-a six-instruction loop (`refs` 6.4 → 4.7 ms, 0.14x → 0.18x).
+a six-instruction loop (`refs` 6.4 → 4.7 ms of rmc's own runtime, within ~20% of
+an honest rustc twin).
 
 On the language side the notable absences are: `u*`/`i*` widths other than
 `i64`, floating point, traits and generics, closures, `for` over arbitrary
