@@ -216,6 +216,67 @@ fn a_method_on_a_payload_enum_resolves() {
 }
 
 #[test]
+fn a_wildcard_arm_whose_body_is_another_match_is_not_exhaustive() {
+    // The two arms below test `E::A` and `E::B`, but the `E::B` test lives in a
+    // *nested* match reached only from the wildcard arm. The outer match is
+    // therefore not exhaustive, and the nested match itself is missing `E::A`,
+    // so as a value the whole expression is a type error, exactly as in Rust.
+    let src = "enum E { A, B } \
+               fn main() -> i64 { let a: E = E::B; let b: E = E::A; \
+               let t: i64 = match a { E::A => 1, _ => match b { E::B => 2 } }; \
+               return t; }";
+    let err = compile_to_asm(src, &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("`if` without `else`"), "got: {err}");
+}
+
+#[test]
+fn a_wildcard_arm_matching_the_same_value_is_not_exhaustive() {
+    // Same shape, but the nested match scrutinises the same value as the outer
+    // one. After desugaring the two `if` chains are structurally identical to an
+    // exhaustive `match a { E::A => 1, E::B => 2 }`, so this is the case that a
+    // naive scrutinee comparison would let through; only the match boundary
+    // keeps them apart.
+    let src = "enum E { A, B } \
+               fn main() -> i64 { let a: E = E::B; \
+               let t: i64 = match a { E::A => 1, _ => match a { E::B => 2 } }; \
+               return t; }";
+    let err = compile_to_asm(src, &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("`if` without `else`"), "got: {err}");
+}
+
+#[test]
+fn a_nested_match_with_all_variants_is_still_a_value() {
+    // The nested match names every variant, so the wildcard arm's body is a
+    // value and the outer chain is total: this must compile.
+    let src = "enum E { A, B } \
+               fn main() -> i64 { let a: E = E::B; let b: E = E::A; \
+               let t: i64 = match a { E::A => 1, _ => match b { E::A => 2, E::B => 3 } }; \
+               return t; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_match_statement_without_a_semicolon_is_allowed() {
+    // A `match` is a block-like expression, so it is a valid statement with no
+    // trailing `;`. Wrapping the desugared chain in the match-boundary node must
+    // not change that.
+    let src = "enum E { A, B } fn main() -> i64 { let e: E = E::A; let mut n: i64 = 0; \
+               match e { E::A => { n = 1; } _ => { n = 2; } } return n; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_match_whose_arms_all_return_is_accepted_as_a_body() {
+    // Every arm returns, so the desugared chain diverges on all paths and a
+    // value-returning body does not fall off the end. The match boundary must be
+    // transparent to the divergence walk.
+    let src = "fn classify(x: i64) -> i64 { \
+               match x { 0 => { return 100; } _ => { return 300; } } } \
+               fn main() -> i64 { return classify(0); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
 fn argument_setup_folds_a_constant_with_lea() {
     // `fib(n - 1)` must become one `lea`, not `mov; sub; mov`.
     let out = asm("fn f(n: i64) -> i64 { return n; } fn g(n: i64) -> i64 { return f(n - 1); } fn main() -> i64 { return 0; }");

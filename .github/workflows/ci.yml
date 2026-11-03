@@ -42,6 +42,12 @@ jobs:
       - name: Robustness (malformed input must not crash)
         run: python3 tools/fuzz.py --mode robust
 
+      # Programs rustc rejects must be rejected by rmc too. This catches the
+      # soundness class the differential run cannot see: a program rmc wrongly
+      # accepts is never run against the reference, because it does not compile.
+      - name: Rejection parity (rustc-rejected programs)
+        run: python3 tools/fuzz.py --mode reject
+
       # A bounded differential fuzz run, so a divergence found by random
       # generation fails CI rather than only failing when someone runs it by
       # hand. Small and fixed-seed: reproducible, and fast enough to gate.

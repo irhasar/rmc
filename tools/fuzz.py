@@ -315,9 +315,85 @@ def run_robust():
     return 1 if failures else 0
 
 
+# -------------------------------------------------------------- reject mode
+
+def reject_corpus():
+    """Deterministic programs that `rustc` rejects. `rmc` must reject each one
+    too, with a clean error (exit 1), never accept it and never crash.
+
+    This targets the soundness class the differential fuzzers cannot see: a
+    program `rmc` wrongly accepts is never run against the rustc reference,
+    because the reference does not compile. The exhaustiveness cases pin the
+    `match`-boundary handling: a wildcard arm whose body is itself a `match`
+    must not borrow the outer match's exhaustiveness."""
+    def both(body):
+        rms = (
+            "enum E { A, B }\n"
+            "fn main() -> i64 {\n"
+            "    let a: E = E::B;\n"
+            "    let b: E = E::A;\n"
+            f"    let t: i64 = {body};\n"
+            "    print_i64(t);\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        rs = (
+            "enum E { A, B }\n"
+            "fn main() {\n"
+            "    let a: E = E::B;\n"
+            "    let b: E = E::A;\n"
+            f"    let t: i64 = {body};\n"
+            '    println!("{}", t);\n'
+            "}\n"
+        )
+        return rms, rs
+
+    return {
+        # The outer match names A and wildcards the rest; the missing B test is
+        # only inside the nested match, so the outer chain is not exhaustive.
+        "nested_wildcard_other": both("match a { E::A => 1, _ => match b { E::B => 2 } }"),
+        # Same shape on the same value: after desugaring this is structurally
+        # identical to `match a { E::A => 1, E::B => 2 }`, so only the match
+        # boundary keeps the two apart.
+        "nested_wildcard_same": both("match a { E::A => 1, _ => match a { E::B => 2 } }"),
+        # A plain non-exhaustive match in value position.
+        "missing_variant_value": both("match a { E::A => 1 }"),
+    }
+
+
+def run_reject():
+    tmp = "/tmp/rmc-fuzz"
+    os.makedirs(tmp, exist_ok=True)
+    failures = 0
+    corpus = reject_corpus()
+    for name, (rms, rs) in corpus.items():
+        open(f"{tmp}/{name}.rms", "w").write(rms)
+        open(f"{tmp}/{name}.rs", "w").write(rs)
+        # The reference must reject it, or the corpus entry proves nothing.
+        ref = run([RUSTC, "-A", "warnings", "--edition", "2021", f"{tmp}/{name}.rs",
+                   "-o", f"{tmp}/{name}.ref"])
+        if ref.returncode == 0:
+            print(f"[reject] {name}: rustc ACCEPTED the program; corpus is wrong")
+            failures += 1
+            continue
+        p = run([RMC, f"{tmp}/{name}.rms", "-o", f"{tmp}/{name}.bin"])
+        if p.returncode < 0 or b"panicked" in p.stderr or b"overflowed its stack" in p.stderr:
+            print(f"[reject] {name}: CRASH (exit {p.returncode})")
+            failures += 1
+        elif p.returncode == 0:
+            print(f"[reject] {name}: rmc ACCEPTED a program rustc rejects\n{rms}")
+            failures += 1
+        elif p.returncode != 1:
+            print(f"[reject] {name}: unexpected exit {p.returncode}")
+            failures += 1
+    if failures == 0:
+        print(f"reject: all {len(corpus)} rustc-rejected programs are rejected cleanly")
+    return 1 if failures else 0
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "robust"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "robust", "reject"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -328,6 +404,11 @@ def main():
         return 2
     if args.mode == "robust":
         return run_robust()
+    if args.mode == "reject":
+        if not rustc_available():
+            print("rustc not found; set RUSTC or install a toolchain", file=sys.stderr)
+            return 2
+        return run_reject()
     if not rustc_available():
         print("rustc not found; set RUSTC or install a toolchain", file=sys.stderr)
         return 2

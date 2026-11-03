@@ -34,7 +34,7 @@ const MAX_DEPTH: u32 = 100;
 
 /// Expressions that are allowed as statements without a trailing `;`.
 fn is_block_like(e: &Expr) -> bool {
-    matches!(e, Expr::If(..) | Expr::Block(..))
+    matches!(e, Expr::If(..) | Expr::Block(..) | Expr::MatchBoundary(..))
 }
 
 type PResult<T> = Result<T, String>;
@@ -995,6 +995,7 @@ impl Parser {
             });
         }
         let acc = acc.expect("a `match` has at least one arm");
+        let acc = Expr::MatchBoundary(Block { stmts: Vec::new(), tail: Some(Box::new(acc)) });
         match prelude {
             None => acc,
             Some(stmt) => Expr::Block(Block { stmts: vec![stmt], tail: Some(Box::new(acc)) }),
@@ -1200,6 +1201,7 @@ fn expr_has_call(e: &Expr) -> bool {
             expr_has_call(c) || block_has_call_p(t) || els.as_ref().map_or(false, block_has_call_p)
         }
         Expr::Block(b) => block_has_call_p(b),
+        Expr::MatchBoundary(b) => block_has_call_p(b),
         Expr::StructLit { fields, .. } => fields.iter().any(|f| expr_has_call(&f.value)),
         Expr::ArrayLit(v, _) => expr_has_call(v),
         _ => false,

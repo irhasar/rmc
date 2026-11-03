@@ -456,8 +456,23 @@ outside-in, the innermost `if` is seen first; `Sema::match_chain`/`match_total`
 carry the verdict down the chain so the last `if` (no `else`) may stand for a
 value. The two flags are set only on the `else` path of a *total* chain, so a
 wildcard arm body that is itself an `if` is still checked as an ordinary root.
+
+The `match` desugaring wraps its first step in `Expr::MatchBoundary`, a
+transparent node that marks where the chain begins. It exists because a wildcard
+arm body can itself be a `match`: `match a { A => 1, _ => match a { B => 2 } }`
+and `match a { A => 1, B => 2 }` desugar to the *same* `if` chain, yet only the
+second is exhaustive. Without the marker, `if_chain_is_exhaustive` walks through
+the wildcard body into the nested match and counts both matches' variants
+together, wrongly accepting a program rustc rejects. The boundary stops that
+walk and resets `match_chain`/`match_total`, so each `match` is judged on its
+own. It is transparent everywhere else: codegen, the inliner, LICM and TCO treat
+it exactly like `Expr::Block`, and `is_block_like` lists it so a `match`
+statement still needs no trailing `;`. A subtle-scrutinee comparison would *not*
+work: the two programs above share the same scrutinee, so the boundary is the
+only thing that keeps them apart.
 `tests/cases/exhmat.{rms,rs}` covers value position, reordering, nesting,
-references and a loop; a non-exhaustive or duplicate-variant match still errors.
+references and a loop; a non-exhaustive or duplicate-variant match still errors,
+and `tools/fuzz.py --mode reject` pins the nested-wildcard cases.
 
 A method is an ordinary free function whose name is mangled to `Type$method` and
 whose first parameter is `self` of the impl's struct type; the parser produces
