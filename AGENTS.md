@@ -55,10 +55,14 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
 - `compiler/src/sema.rs` — type checking, struct layout, stack-slot allocation,
   builtin sigs. Resolves `Type::Named`, fills `Field`/`FieldInit` offsets, and
   allocates the hidden slots for aggregate arguments and returns.
+- `compiler/src/inline.rs` — AST inlining of small, straight-line, scalar
+  functions, run after sema and before codegen. See the inlining gotcha below.
 - `compiler/src/codegen.rs` — AST to AT&T x86-64 assembly.
 - `compiler/src/runtime.rs` — freestanding assembly runtime (`_start`, I/O,
   `alloc`/`free`, `arg_i64`, the overflow trap).
 - `compiler/src/main.rs` — CLI: reads source, calls the library, runs `as`/`ld`.
+  Flags: `--emit-asm`, `--keep-asm`, `--overflow-checks`, `--bounds-checks`,
+  `--no-inline`.
 - `compiler/tests/compile.rs` — unit tests for the front end and codegen; these
   run without `as`/`ld`.
 
@@ -94,9 +98,10 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
   `mov off(%reg), %rax` instead of `mov %reg,%rax; add $off,%rax; mov (%rax),%rax`.
   Before this, an `&self` accessor over an 8-field struct emitted ~3 instructions
   per field and the `refs` benchmark ran at 69 ms; the fold brought rmc's own
-  runtime down ~1.4x to ~50 ms (rustc still leads on `refs` by ~20x — it inlines
-  the accessors and keeps the struct in registers). The fold is deliberately
-  *one* level deep: a `*p` used as a
+  runtime down ~1.4x to ~50 ms. Inlining the accessors then removed the calls
+  entirely, taking `refs` to ~20 ms (rustc is still ~8x ahead on `refs` — it keeps
+  the struct in registers across the loop, which rmc does not). The fold is
+  deliberately *one* level deep: a `*p` used as a
   reference has its pointer in memory, so `ptr_reg` only matches a reference
   *local*, never a `Deref`. `addr_reg` (local or one `Deref` of a local) is the
   form `gen_addr` folds for a `lea`. Extending either to a deeper chain would
@@ -113,6 +118,18 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
   one-sweep fixpoint because removing a line creates neither a label nor a new
   terminator. It runs on the real body only (the dry spill pass's output is
   truncated anyway), so it costs nothing at compile time.
+- **Inlining is a post-sema AST pass, and slots are frame indices.** Each
+  inlined call gets a fresh region of the caller's frame (`base = f.nslots`,
+  grown as it goes), the callee's slots are shifted by that base, and a read of
+  a parameter's slot is replaced by the argument. Two expansions must not share
+  a region or an inlined local would clobber another's. An argument with a side
+  effect must be bound to one slot, never substituted into a body that reads the
+  parameter twice — `f(sc(5))` with `f(x) = x + x` must call `sc` once. A
+  candidate body must be call-free and straight-line; because it is, inlining it
+  cannot expose new calls, but the pass still runs to a *fixpoint* because a
+  function only becomes call-free after its own callees are inlined (the `refs`
+  wrapper `sum_via_ref` needs round two). `--no-inline` disables it; the tests
+  that assert on the calling convention (`call f`, argument setup) use it.
 - **Stack slots grow downward.** A local in slot `s` lives at
   `-(s+1+nregs)*8(%rbp)`, where `nregs` is the number of registers holding
   promoted locals. Address them positively and you overwrite the saved
@@ -327,8 +344,9 @@ arrays, structs, enums, `for`, aggregates across calls, references `&T`/`&mut T`
 with no borrow checking). It has no *general* register allocator: whole-function
 locals are promoted to callee-saved registers by mention count (`promote`), and
 temporaries crossing a call use `SPILL_REGS`, but a dying temporary's register is
-not reused for a later local (roadmap item 1). The optimiser is a small peephole
-pass (operand/comparison/array-address folding, constant folding, division by a
+not reused for a later local (roadmap item 1). The optimiser is an AST inlining
+pass (small, straight-line, scalar functions) plus a small peephole pass
+(operand/comparison/array-address folding, constant folding, division by a
 constant). Array indexing is unchecked by default (the index is used as-is, like
 C), so an out-of-range index reads or writes adjacent stack memory;
 `--bounds-checks` turns on a per-index check that traps (see the codegen notes).

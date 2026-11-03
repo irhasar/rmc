@@ -37,10 +37,15 @@ driver shells out to GNU `as` and `ld`.
    address, and a `match` binds a payload by reading a word out of that buffer.
    Struct and enum layouts are computed together (`resolve_layouts`), because a
    struct may have an enum field and an enum variant may have a struct payload.
-4. **Code generation** (`codegen.rs`) — emits AT&T-syntax x86-64 assembly. Every
+4. **Inlining** (`inline.rs`) — rewrites the AST so a call to a small,
+   straight-line, scalar function is replaced by the function's body. Runs after
+   sema, so every name already carries its slot and no lookup is needed, and
+   before codegen, so the peephole pass sees the inlined arithmetic. See
+   "Inlining" below.
+5. **Code generation** (`codegen.rs`) — emits AT&T-syntax x86-64 assembly. Every
    expression leaves its result in `%rax`; the result type is returned to the
    caller so callers know how to use it.
-5. **Assemble and link** (`main.rs`) — writes the assembly, runs `as --64`, then
+6. **Assemble and link** (`main.rs`) — writes the assembly, runs `as --64`, then
    `ld -o <out> --build-id=none -n <obj>`, with the runtime text prepended.
 
 ## Stack layout
@@ -267,6 +272,39 @@ evaluated directly into `%rdi`/`%rsi`. Both are safe because expression
 evaluation never writes `%rdi`/`%rsi`; only the `%rcx`/`%rdx` scratch registers
 are clobbered, which is why the simple-operand test matters for wider calls.
 
+## Inlining
+
+A call to a small, straight-line, scalar function is replaced by the function's
+body, so an accessor like `p.sum()` costs the same as the `add` it wraps and no
+argument setup, jump or return runs. This is what makes `refs` competitive: its
+hot loop reads a struct through three `&self` methods, and after inlining the
+loop contains no call at all. The pass runs on the AST after sema — every `Var`
+already carries its slot and every call its mangled name, so no lookup is needed
+— and before codegen, so the peephole pass sees the arithmetic that was behind
+the call.
+
+A function is a candidate when its return and parameters are scalar (a reference
+counts as scalar; aggregates are passed and returned by pointer and are left to
+the call path), it takes no `self` by value, and its body is call-free and
+straight-line — no loop, no `break`/`continue`, and no `return` except as the
+last statement, which is folded into the body's value. The body must also be at
+most 32 expression nodes, so a large function is never spliced in. Because a
+candidate is call-free, inlining it never adds work that could itself grow; the
+pass still runs to a fixpoint, because a function only becomes call-free *after*
+its own callees are inlined, and a wrapper like `sum_via_ref` should follow its
+accessors in.
+
+Expansion is a slot remap. Each inlined call is given a fresh region of the
+caller's frame, the callee's slots are shifted into it by a base offset, and a
+read of a parameter's slot is replaced by the argument. A trivial argument (a
+name, a literal, a string) is substituted in place; anything else is evaluated
+once into a fresh slot and the slot is substituted, so a side effect runs exactly
+once and the left-to-right order is preserved. Two expansions get disjoint
+regions, so an inlined body's locals never alias the caller's or each other's.
+A whole-program budget of 8192 expansions bounds compile time and code size; a
+loop body is inlined once, not once per iteration. `--no-inline` turns the pass
+off, which is what the tests that assert on the calling convention use.
+
 ## Runtime
 
 `runtime.rs` holds a freestanding assembly runtime. `_start` captures `argc` and
@@ -308,14 +346,15 @@ a branch per arithmetic operation.
 
 ## What is intentionally missing
 
-There is no optimiser beyond the folding, local promotion and dead-instruction
-trim described above. No global register allocation, no common-subexpression
-elimination, no inlining, no loop transforms, no instruction scheduling. The
-compiler is optimised for compile speed and simplicity, not for the speed of the
-code it produces. The non-trivial passes are division by a constant (1.4x on
-`mandel.rms`), the top-five local promotion (a few percent on `mix` and `sieve`),
-and the reference-operand folds plus `trim_dead` (1.4x on the `refs` benchmark);
-everything else is local and cheap to compute.
+There is no optimiser beyond the folding, local promotion, inlining and
+dead-instruction trim described above. No global register allocation, no
+common-subexpression elimination, no loop transforms, no instruction
+scheduling. The compiler is optimised for compile speed and simplicity, not for
+the speed of the code it produces. The non-trivial passes are division by a
+constant (1.4x on `mandel.rms`), the top-five local promotion (a few percent on
+`mix` and `sieve`), the reference-operand folds plus `trim_dead` (1.4x on the
+`refs` benchmark), and inlining (2.6x on `refs`, by removing the three accessor
+calls from its hot loop); everything else is local and cheap to compute.
 
 On the language side the notable absences are: `u*`/`i*` widths other than
 `i64`, floating point, traits and generics, closures, `for` over arbitrary

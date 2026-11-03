@@ -68,6 +68,7 @@ rmc input.rms --emit-asm           # print the generated assembly to stdout
 rmc input.rms --keep-asm -o out    # keep the intermediate .s file
 rmc input.rms --overflow-checks    # trap on i64 +,-,* overflow (exit 101)
 rmc input.rms --bounds-checks      # trap on an out-of-range array index (exit 101)
+rmc input.rms --no-inline          # disable inlining (on by default)
 ```
 
 Run the produced binary directly; it is a static ELF executable with no
@@ -197,20 +198,20 @@ Representative run on the development machine (Debian 13, gcc 14.2, rustc
 
 | program | compiler | compile wall | compile CPU | peak RSS | artifact | run time |
 | ------- | -------- | -----------: | ----------: | -------: | -------: | -------: |
-| hello   | rmc      |     7.07 ms  |    6.82 ms  |  11.4 MB |   6656 B |  1.55 ms |
-| hello   | rustc    |  2046.09 ms  | 2048.77 ms  | 183.4 MB | 289416 B |  2.14 ms |
-| fib     | rmc      |     7.11 ms  |    6.86 ms  |  11.4 MB |   6760 B | 15.53 ms |
-| fib     | rustc    |  2087.01 ms  | 2091.01 ms  | 182.5 MB | 291696 B |  8.52 ms |
-| mandel  | rmc      |     7.99 ms  |    7.43 ms  |  11.4 MB |   7032 B |103.78 ms |
-| mandel  | rustc    |  2147.49 ms  | 2149.51 ms  | 185.9 MB | 291776 B |107.17 ms |
-| sieve   | rmc      |     9.26 ms  |    9.00 ms  |  11.4 MB |   6792 B |  2.96 ms |
-| sieve   | rustc    |  2130.07 ms  | 2134.73 ms  | 181.5 MB | 292016 B |  3.91 ms |
-| mix     | rmc      |     7.37 ms  |    7.12 ms  |  11.4 MB |   6816 B | 18.51 ms |
-| mix     | rustc    |  2127.67 ms  | 2131.74 ms  | 181.9 MB | 291864 B | 16.92 ms |
-| stats   | rmc      |     7.17 ms  |    6.90 ms  |  11.4 MB |   6904 B |  5.21 ms |
-| stats   | rustc    |  2138.75 ms  | 2143.05 ms  | 182.6 MB | 292048 B |  5.12 ms |
-| refs    | rmc      |     7.20 ms  |    6.94 ms  |  11.4 MB |   7144 B | 50.39 ms |
-| refs    | rustc    |  2124.51 ms  | 2128.73 ms  | 182.6 MB | 292144 B |  2.26 ms |
+| hello   | rmc      |     7.51 ms  |    7.20 ms  |  11.6 MB |   6656 B |  1.57 ms |
+| hello   | rustc    |  2028.13 ms  | 2031.40 ms  | 180.7 MB | 289416 B |  2.16 ms |
+| fib     | rmc      |     7.09 ms  |    6.85 ms  |  11.6 MB |   6760 B | 15.54 ms |
+| fib     | rustc    |  2071.85 ms  | 2075.68 ms  | 182.5 MB | 291696 B |  8.51 ms |
+| mandel  | rmc      |     7.24 ms  |    6.99 ms  |  11.6 MB |   7032 B |102.57 ms |
+| mandel  | rustc    |  2089.91 ms  | 2094.66 ms  | 182.7 MB | 291776 B |106.89 ms |
+| sieve   | rmc      |     9.52 ms  |    9.28 ms  |  11.6 MB |   6792 B |  2.95 ms |
+| sieve   | rustc    |  2066.61 ms  | 2070.60 ms  | 181.1 MB | 292016 B |  3.83 ms |
+| mix     | rmc      |     7.17 ms  |    6.93 ms  |  11.6 MB |   6816 B | 18.19 ms |
+| mix     | rustc    |  2064.99 ms  | 2068.78 ms  | 181.9 MB | 291864 B | 16.90 ms |
+| stats   | rmc      |     7.15 ms  |    6.90 ms  |  11.6 MB |   6904 B |  5.30 ms |
+| stats   | rustc    |  2068.51 ms  | 2072.77 ms  | 181.5 MB | 292048 B |  5.22 ms |
+| refs    | rmc      |     7.36 ms  |    7.11 ms  |  11.6 MB |   7416 B | 19.65 ms |
+| refs    | rustc    |  2099.44 ms  | 2103.85 ms  | 182.5 MB | 292144 B |  2.46 ms |
 
 Summary of the ratios (rustc ÷ rmc):
 
@@ -220,16 +221,16 @@ Summary of the ratios (rustc ÷ rmc):
 | compile CPU      | ~290–320×  |
 | compiler peak RSS| ~15.6×     |
 | artifact size    | ~43×       |
-| run time         | 0.05–1.39× (rustc faster on call-heavy code) |
+| run time         | 0.13–1.38× (rustc faster on call-heavy code) |
 
-`rmc` beats rustc on `hello` (1.39×), `sieve` (1.31×) and `mandel` (1.04×)
+`rmc` beats rustc on `hello` (1.38×), `sieve` (1.30×) and `mandel` (1.04×)
 because the workload is a tight loop or a single call and the static binary has
-no libc startup. On `fib` (0.54×, call-heavy), `mix` (0.93×) and `stats` (0.98×)
-LLVM's loop transformations and register allocation still win. `refs` is the
-worst case at 0.05×: rustc inlines the `&self` accessors and keeps the whole
-struct in registers, while rmc reloads each field from memory on every call. The
-field-through-reference fold (below) already cut rmc's own `refs` time by ~1.4×
-(69 ms → 50 ms); inlining is what it would take to close the rest.
+no libc startup. On `fib` (0.55×, call-heavy), `mix` (0.93×) and `stats` (0.98×)
+LLVM's loop transformations and register allocation still win. `refs` (0.13×)
+is the weakest case: rustc keeps the whole struct in registers across the loop,
+where rmc reloads each field. Inlining the `&self` accessors closed most of that
+gap — `refs` went from 50 ms to 20 ms (2.6× faster than before), and the hot
+loop no longer contains a single call.
 
 ### Reproducing the comparison honestly
 
@@ -254,12 +255,14 @@ rmc is a small, self-contained compiler, not a drop-in replacement for rustc.
   locals in each function — including the scalar fields of a struct that is
   never copied, returned or passed by value — are pinned to callee-saved
   registers; everything else is in memory. Temporaries are spilled to frame slots, not the machine stack, so
-  `%rsp` never moves and a call needs no alignment pad. The optimiser is a
-  peephole pass (constant operands, folded comparisons, folded array addressing,
-  `lea` strength reduction of `k*x+c`, division by a constant, in-place
-  accumulation of a running sum); there is no
-  instruction scheduling, inlining, or loop transformation, and no live-range
-  analysis.
+  `%rsp` never moves and a call needs no alignment pad. The optimiser is an
+  inlining pass (small, straight-line, scalar functions) followed by a peephole
+  pass (constant operands, folded comparisons, folded array addressing, `lea`
+  strength reduction of `k*x+c`, division by a constant, in-place accumulation
+  of a running sum); there is no instruction scheduling or loop transformation,
+  and no live-range analysis. Inlining runs on the AST after semantic analysis
+  and expands to a fixpoint, so a wrapper is inlined once its own callees are;
+  `--no-inline` turns it off.
 - The backend targets x86-64 Linux only, using the System V ABI and raw Linux
   syscalls. There is no Windows, macOS, ARM, or WebAssembly support.
 - Array indexing is unchecked by default: an out-of-range index reads or writes
