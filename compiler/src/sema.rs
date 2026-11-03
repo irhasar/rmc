@@ -74,7 +74,21 @@ pub struct Sema {
     match_chain: bool,
 }
 
-type Scope = Vec<(String, i32, Type)>;
+/// A lexical scope entry. `mutable` records whether the binding was declared
+/// `mut`, so an assignment to a non-`mut` binding can be rejected the way rustc
+/// rejects it. `init` records whether the binding is definitely initialized at
+/// the current program point, so a read of a `let x: T;` that was never written
+/// is rejected like rustc's "used binding isn't initialized".
+struct Binding {
+    name: String,
+    slot: i32,
+    ty: Type,
+    mutable: bool,
+    init: bool,
+}
+
+/// A lexical scope: a stack of bindings, innermost last.
+type Scope = Vec<Binding>;
 
 pub fn analyze(prog: &mut Program) -> Result<(), String> {
     let (structs, enums) = resolve_layouts(&prog.structs, &prog.enums)?;
@@ -84,7 +98,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
     // linked in automatically, so they do not appear in the source program.
     let builtins: [(&str, &[Type], Type); 7] = [
         ("print_i64", &[Type::I64], Type::Unit),
-        ("print_str", &[Type::I64], Type::Unit),
+        ("print_str", &[Type::Str], Type::Unit),
         ("print_bool", &[Type::Bool], Type::Unit),
         ("putchar", &[Type::I64], Type::Unit),
         ("alloc", &[Type::I64], Type::I64),
@@ -114,6 +128,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
                 Type::Named(ty)
             };
             f.params.insert(0, ("self".to_string(), rt));
+            f.param_mut.insert(0, false);
         }
     }
     for f in &prog.fns {
@@ -363,14 +378,17 @@ impl Sema {
 
         let mut scope: Scope = Vec::with_capacity(f.params.len() + 8);
         f.param_slots.clear();
-        for (name, ty) in &mut f.params {
+        for (i, (name, ty)) in f.params.iter_mut().enumerate() {
             let rt = self.resolve_ty(ty)?;
             *ty = rt.clone();
             // An aggregate parameter owns a frame buffer big enough for a copy;
             // a scalar (including a reference) owns a single slot.
             let slot = self.alloc_slots((rt.size() / 8) as i32);
             f.param_slots.push(slot);
-            scope.push((name.clone(), slot, rt));
+            // A parameter is a `let` binding; it is immutable unless declared
+            // `mut`, and it is always initialized by the caller.
+            let mutable = f.param_mut.get(i).copied().unwrap_or(false);
+            scope.push(Binding { name: name.clone(), slot, ty: rt, mutable, init: true });
         }
 
         let body_ty = self.check_block(&mut f.body, &mut scope)?;
@@ -409,12 +427,31 @@ impl Sema {
         s
     }
 
-    fn lookup(scope: &Scope, name: &str) -> Option<(i32, Type)> {
+    fn lookup(scope: &Scope, name: &str) -> Option<(i32, Type, bool, bool)> {
         scope
             .iter()
             .rev()
-            .find(|(n, _, _)| n == name)
-            .map(|(_, s, t)| (*s, t.clone()))
+            .find(|b| b.name == name)
+            .map(|b| (b.slot, b.ty.clone(), b.mutable, b.init))
+    }
+
+    /// Index of the innermost binding of `name`, for mutating its state.
+    fn binding_index(scope: &Scope, name: &str) -> Option<usize> {
+        scope.iter().rposition(|b| b.name == name)
+    }
+
+    /// Snapshot the initialization state of each binding, to compare against
+    /// after checking a branch or loop body.
+    fn init_snapshot(scope: &Scope) -> Vec<bool> {
+        scope.iter().map(|b| b.init).collect()
+    }
+
+    /// After a loop body, a variable written inside is not definitely
+    /// initialized: the loop may run zero times.
+    fn init_restore(scope: &mut Scope, snap: &[bool]) {
+        for (b, &before) in scope.iter_mut().zip(snap) {
+            b.init = before;
+        }
     }
 
     /// Type-check a `let` initialiser. A `[v; n]` written directly here is kept
@@ -523,7 +560,7 @@ impl Sema {
 
     fn check_stmt(&mut self, st: &mut Stmt, scope: &mut Scope) -> Result<(), String> {
         match st {
-            Stmt::Let { name, ty, init, slot } => {
+            Stmt::Let { name, ty, init, slot, mutable } => {
                 let declared = match ty {
                     Some(t) => Some(self.resolve_ty(t)?),
                     None => None,
@@ -554,10 +591,35 @@ impl Sema {
                 *ty = Some(final_ty.clone());
                 let s = self.alloc_slots((final_ty.size() / 8) as i32);
                 *slot = s;
-                scope.push((name.clone(), s, final_ty));
+                let initialized = init.is_some();
+                scope.push(Binding {
+                    name: name.clone(),
+                    slot: s,
+                    ty: final_ty,
+                    mutable: *mutable,
+                    init: initialized,
+                });
                 Ok(())
             }
             Stmt::Assign { target, value } => {
+                // Reject a write to a non-`mut` binding before type-checking the
+                // value, so the error names the binding rather than a type. A
+                // write to a `mut` binding also makes it definitely initialized.
+                if let Expr::Var { name, .. } = target {
+                    if let Some((_, _, mutable, init)) = Self::lookup(scope, name) {
+                        // A non-`mut` binding may be written exactly once, to
+                        // initialize it (`let x; x = 1;` is legal in Rust); any
+                        // later write is E0384. A `mut` binding is always
+                        // writable. Either way the write initializes it.
+                        if init && !mutable {
+                            return Err(format!(
+                                "cannot assign to immutable variable `{name}` (add `mut`)"
+                            ));
+                        }
+                        let i = Self::binding_index(scope, name).unwrap();
+                        scope[i].init = true;
+                    }
+                }
                 let vty = self.check_expr(value, scope)?;
                 let tty = self.check_lvalue(target, scope)?;
                 if vty != tty && !ref_coerces(&vty, &tty) {
@@ -574,15 +636,21 @@ impl Sema {
                 if ct != Type::Bool {
                     return Err(format!("`while` condition must be `bool`, found {ct:?}"));
                 }
+                let init_before = Self::init_snapshot(scope);
                 self.loop_depth += 1;
                 self.check_block(body, scope)?;
                 self.loop_depth -= 1;
+                // The loop may run zero times, so nothing it initializes is
+                // guaranteed afterwards.
+                Self::init_restore(scope, &init_before);
                 Ok(())
             }
             Stmt::Loop(body) => {
+                let init_before = Self::init_snapshot(scope);
                 self.loop_depth += 1;
                 self.check_block(body, scope)?;
                 self.loop_depth -= 1;
+                Self::init_restore(scope, &init_before);
                 Ok(())
             }
             Stmt::For { var, var_slot, start, end, end_slot, body } => {
@@ -598,11 +666,20 @@ impl Sema {
                 let s = self.alloc_slot();
                 *var_slot = s;
                 let mark = scope.len();
-                scope.push((var.clone(), s, Type::I64));
+                let init_before = Self::init_snapshot(scope);
+                // The loop variable is a fresh immutable binding each iteration.
+                scope.push(Binding {
+                    name: var.clone(),
+                    slot: s,
+                    ty: Type::I64,
+                    mutable: false,
+                    init: true,
+                });
                 self.loop_depth += 1;
                 self.check_block(body, scope)?;
                 self.loop_depth -= 1;
                 scope.truncate(mark);
+                Self::init_restore(scope, &init_before);
                 Ok(())
             }
             Stmt::Return(v) => {
@@ -654,7 +731,20 @@ impl Sema {
                     return Err(format!("array index must be `i64`, found {it:?}"));
                 }
                 match bt {
-                    Type::Array(elem, _) => Ok(*elem),
+                    Type::Array(elem, n) => {
+                        // A constant index outside the array is a compile error,
+                        // exactly as rustc rejects it. A non-constant index is
+                        // checked at runtime (when bounds checks are on), so it
+                        // stays a runtime concern here.
+                        if let Some(k) = const_i64(idx) {
+                            if k < 0 || k as usize >= n {
+                                return Err(format!(
+                                    "index {k} is out of bounds for an array of length {n}"
+                                ));
+                            }
+                        }
+                        Ok(*elem)
+                    }
                     other => Err(format!("cannot index a value of type {other:?}")),
                 }
             }
@@ -666,9 +756,16 @@ impl Sema {
         match e {
             Expr::Int(_) => Ok(Type::I64),
             Expr::Bool(_) => Ok(Type::Bool),
-            Expr::Str(_) => Ok(Type::I64),
+            // A string literal has its own type, so it cannot be added to an
+            // integer or passed where an `i64` is expected.
+            Expr::Str(_) => Ok(Type::Str),
             Expr::Var { name, slot, ty } => match Self::lookup(scope, name) {
-                Some((s, t)) => {
+                Some((s, t, _mut, init)) => {
+                    if !init {
+                        return Err(format!(
+                            "use of possibly-uninitialized variable `{name}`"
+                        ));
+                    }
                     *slot = s;
                     *ty = t.clone();
                     Ok(t)
@@ -792,7 +889,12 @@ impl Sema {
                 } else {
                     total
                 };
+                // Track definite initialization across the branches: a binding
+                // is initialized afterwards only if it was before, or on both
+                // paths. `init_before` is the state on entry to the branch.
+                let init_before = Self::init_snapshot(scope);
                 let tt = self.check_block(then, scope)?;
+                let then_init = Self::init_snapshot(scope);
                 match els {
                     Some(e) => {
                         // Only a total chain's `else` continues the chain: an
@@ -802,11 +904,20 @@ impl Sema {
                         // that nested `if` must be checked as an ordinary root.
                         self.match_chain = total;
                         self.match_total = total;
+                        // Restore the entry state before the else, so the else
+                        // sees the same scope the then saw.
+                        Self::init_restore(scope, &init_before);
                         let et = self.check_block(e, scope)?;
                         self.match_chain = false;
                         self.match_total = false;
                         if tt != et {
                             return Err(format!("`if` branches have different types: {tt:?} and {et:?}"));
+                        }
+                        // Keep only what both branches initialized.
+                        let else_init = Self::init_snapshot(scope);
+                        for (i, b) in scope.iter_mut().enumerate() {
+                            b.init = then_init.get(i).copied().unwrap_or(false)
+                                && else_init.get(i).copied().unwrap_or(false);
                         }
                         Ok(tt)
                     }
@@ -816,6 +927,8 @@ impl Sema {
                                 "`if` without `else` must evaluate to `()`, but the branch is {tt:?}"
                             ));
                         }
+                        // No else: the then branch may not run.
+                        Self::init_restore(scope, &init_before);
                         Ok(tt)
                     }
                 }
@@ -863,7 +976,20 @@ impl Sema {
                     return Err(format!("array index must be `i64`, found {it:?}"));
                 }
                 match bt {
-                    Type::Array(elem, _) => Ok(*elem),
+                    Type::Array(elem, n) => {
+                        // A constant index outside the array is a compile error,
+                        // exactly as rustc rejects it. A non-constant index is
+                        // checked at runtime (when bounds checks are on), so it
+                        // stays a runtime concern here.
+                        if let Some(k) = const_i64(idx) {
+                            if k < 0 || k as usize >= n {
+                                return Err(format!(
+                                    "index {k} is out of bounds for an array of length {n}"
+                                ));
+                            }
+                        }
+                        Ok(*elem)
+                    }
                     other => Err(format!("cannot index a value of type {other:?}")),
                 }
             }
@@ -947,6 +1073,7 @@ impl Sema {
                     ty: Some(ty.clone()),
                     init: Some(Expr::ArrayLit(val.clone(), *n)),
                     slot: arr_slot,
+                    mutable: false,
                 }];
                 *e = Expr::Block(Block { stmts, tail: Some(Box::new(var)) });
                 // Re-check the rewritten block so its statements are typed and
@@ -984,6 +1111,7 @@ impl Sema {
                     ty: Some(arr_ty.clone()),
                     init: None,
                     slot: arr_slot,
+                    mutable: true,
                 }];
                 for (i, e) in elems.drain(..).enumerate() {
                     stmts.push(Stmt::Assign {
@@ -1286,6 +1414,17 @@ fn ref_coerces(found: &Type, expected: &Type) -> bool {
     match (found, expected) {
         (Type::Ref(f, true), Type::Ref(e, false)) => f == e,
         _ => false,
+    }
+}
+
+/// The value of a constant integer expression, if it is one: an integer
+/// literal, or a negated constant (`-1` parses as `Un(Neg, Int(1))`, so a
+/// constant index like `a[-1]` is still recognised).
+fn const_i64(e: &Expr) -> Option<i64> {
+    match e {
+        Expr::Int(k) => Some(*k),
+        Expr::Un(UnOp::Neg, inner) => const_i64(inner).map(|v| v.wrapping_neg()),
+        _ => None,
     }
 }
 

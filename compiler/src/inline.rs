@@ -405,6 +405,7 @@ impl Inliner {
                     ty: Some(param_tys[i].clone()),
                     init: Some(arg),
                     slot,
+                    mutable: false,
                 });
                 subst.push(Expr::Var { name: format!("\u{0}arg{i}"), slot, ty: param_tys[i].clone() });
             }

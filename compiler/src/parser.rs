@@ -188,12 +188,14 @@ impl Parser {
         let name = self.expect_ident()?;
         self.expect(Tok::LParen)?;
         let mut params = Vec::new();
+        let mut param_mut = Vec::new();
         while self.peek() != Some(&Tok::RParen) {
-            self.eat(&Tok::Mut); // `mut` on a parameter is accepted and ignored
+            let pm = self.eat(&Tok::Mut);
             let pname = self.expect_ident()?;
             self.expect(Tok::Colon)?;
             let ty = self.parse_type()?;
             params.push((pname, ty));
+            param_mut.push(pm);
             if !self.eat(&Tok::Comma) {
                 break;
             }
@@ -205,7 +207,7 @@ impl Parser {
             Type::Unit
         };
         let body = self.parse_block()?;
-        Ok(FnDef { name, self_ty: None, takes_self: false, ref_self: false, ref_self_mut: false, params, ret, body, param_slots: Vec::new(), ret_slot: -1, nslots: 0 })
+        Ok(FnDef { name, self_ty: None, takes_self: false, ref_self: false, ref_self_mut: false, params, param_mut, ret, body, param_slots: Vec::new(), ret_slot: -1, nslots: 0 })
     }
 
     /// `impl Type { fn method(self, ..) -> .. { .. } }`. The methods are pushed
@@ -253,13 +255,15 @@ impl Parser {
             ));
         }
         let mut params = Vec::new();
+        let mut param_mut = Vec::new();
         if self.eat(&Tok::Comma) {
             while self.peek() != Some(&Tok::RParen) {
-                self.eat(&Tok::Mut);
+                let pm = self.eat(&Tok::Mut);
                 let pname = self.expect_ident()?;
                 self.expect(Tok::Colon)?;
                 let pty = self.parse_type()?;
                 params.push((pname, pty));
+                param_mut.push(pm);
                 if !self.eat(&Tok::Comma) {
                     break;
                 }
@@ -275,6 +279,7 @@ impl Parser {
             ref_self: by_ref,
             ref_self_mut: by_mut,
             params,
+            param_mut,
             ret,
             body,
             param_slots: Vec::new(),
@@ -435,7 +440,7 @@ impl Parser {
         match self.peek() {
             Some(Tok::Let) => {
                 self.i += 1;
-                self.eat(&Tok::Mut);
+                let mutable = self.eat(&Tok::Mut);
                 let name = self.expect_ident()?;
                 let ty = if self.eat(&Tok::Colon) {
                     Some(self.parse_type()?)
@@ -448,7 +453,7 @@ impl Parser {
                     None
                 };
                 self.expect(Tok::Semi)?;
-                Ok(Stmt::Let { name, ty, init, slot: -1 })
+                Ok(Stmt::Let { name, ty, init, slot: -1, mutable })
             }
             Some(Tok::While) => {
                 self.i += 1;
@@ -551,6 +556,7 @@ impl Parser {
                     ty: Some(Type::I64),
                     init: Some((**idx).clone()),
                     slot: -1,
+                    mutable: true,
                 });
                 let idxv = Box::new(tv(&it));
                 (
@@ -568,6 +574,7 @@ impl Parser {
             ty: Some(Type::I64),
             init: Some(read),
             slot: -1,
+            mutable: true,
         });
         stmts.push(Stmt::Assign {
             target: write,
@@ -913,7 +920,7 @@ impl Parser {
                     Expr::Var { name: name.clone(), slot: -1, ty: Type::I64 },
                     // No annotation: the temp takes the scrutinee's type, which
                     // may be an enum rather than an integer.
-                    Some(Stmt::Let { name, ty: None, init: Some(other), slot: -1 }),
+                    Some(Stmt::Let { name, ty: None, init: Some(other), slot: -1, mutable: false }),
                 )
             }
         };
@@ -928,6 +935,7 @@ impl Parser {
                         ty: None,
                         init: Some(subj.clone()),
                         slot: -1,
+                        mutable: false,
                     }],
                     tail: Some(Box::new(body)),
                 }),
@@ -956,6 +964,7 @@ impl Parser {
                                 .map(|(idx, name)| Stmt::Let {
                                     name,
                                     ty: None,
+                                    mutable: false,
                                     init: Some(Expr::EnumPayload {
                                         recv: Box::new(subj.clone()),
                                         enum_name: enum_name.clone(),

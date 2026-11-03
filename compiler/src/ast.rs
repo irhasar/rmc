@@ -28,6 +28,13 @@ pub enum Type {
     /// even when `T` is an aggregate. There is no lifetime or borrow checking:
     /// rmc trusts the programmer not to outlive the referent.
     Ref(Box<Type>, bool),
+    /// A string literal: a pointer to a NUL-terminated byte string in static
+    /// data. It occupies one slot and travels in one register like `i64`, but it
+    /// is a distinct type so it cannot be added to an integer or passed where an
+    /// `i64` is expected (the ways rmc used to let a bad string through). There
+    /// is no way to name this type in source, so only a string literal produces
+    /// it.
+    Str,
     /// Unresolved name produced by the parser; never survives sema.
     Named(String),
 }
@@ -35,7 +42,7 @@ pub enum Type {
 impl Type {
     pub fn size(&self) -> usize {
         match self {
-            Type::I64 | Type::Bool | Type::Enum(_) | Type::Ref(..) => 8,
+            Type::I64 | Type::Bool | Type::Str | Type::Enum(_) | Type::Ref(..) => 8,
             Type::EnumData(_, size) => *size,
             Type::Unit => 0,
             Type::Array(elem, n) => elem.size() * n,
@@ -48,7 +55,7 @@ impl Type {
     /// register: `i64`, `bool` and an enum. They may be parameters, fields and
     /// return values.
     pub fn is_scalar(&self) -> bool {
-        matches!(self, Type::I64 | Type::Bool | Type::Enum(_) | Type::Ref(..))
+        matches!(self, Type::I64 | Type::Bool | Type::Str | Type::Enum(_) | Type::Ref(..))
     }
 
     /// True for the types an array element may have: the 8-byte integer-like
@@ -233,6 +240,9 @@ pub enum Stmt {
         ty: Option<Type>,
         init: Option<Expr>,
         slot: i32,
+        /// Whether the binding was declared `mut`. Stored so a later assignment
+        /// to it can be rejected when it was not.
+        mutable: bool,
     },
     Assign {
         target: Expr,
@@ -286,6 +296,10 @@ pub struct FnDef {
     /// check.
     pub ref_self_mut: bool,
     pub params: Vec<(String, Type)>,
+    /// Whether each parameter was declared `mut`, parallel to `params`. A
+    /// non-`mut` parameter is an immutable binding, so assigning it is rejected
+    /// like rustc; `mut x: T` allows the body to rebind it (a local copy).
+    pub param_mut: Vec<bool>,
     pub ret: Type,
     pub body: Block,
     /// Frame slot of each parameter, in order, filled in by `sema`. An aggregate

@@ -401,6 +401,7 @@ impl Hoister {
                     ty: Some(ty.clone()),
                     init: Some(value),
                     slot,
+                    mutable: false,
                 });
                 self.seen.insert(key, (slot, ty.clone()));
                 *e = Expr::Var { name: format!("\u{0}licm{slot}"), slot, ty };
