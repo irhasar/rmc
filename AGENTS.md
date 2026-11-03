@@ -53,11 +53,17 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
   so sema and codegen have no `match` case. A non-`Var`/`Int` scrutinee is bound
   to a hidden `let` first, so a call in the scrutinee runs once. An arm after
   `_` is unreachable and dropped (the `_` body becomes the `else`).
-- `compiler/src/ast.rs` — AST and `Type` (`I64`, `Bool`, `Unit`, `Array`,
-  `Struct`, and the parser-only placeholder `Named`).
+- `compiler/src/ast.rs` — AST and `Type` (`I64`, `Bool`, `Str`, `Unit`, `Array`,
+  `Struct`, and the parser-only placeholder `Named`). `Str` is the type of a
+  string literal: one slot holding a pointer to NUL-terminated static data. It
+  is a scalar (travels in a register) but is deliberately *not* `i64`, so a
+  string cannot be added to an integer or passed where an `i64` is expected.
+  There is no way to spell the type in source, so only a literal produces it.
 - `compiler/src/sema.rs` — type checking, struct layout, stack-slot allocation,
-  builtin sigs. Resolves `Type::Named`, fills `Field`/`FieldInit` offsets, and
-  allocates the hidden slots for aggregate arguments and returns.
+  builtin sigs, and the soundness checks (mutability, definite initialization,
+  constant array bounds, string typing — see "Soundness checks" below). Resolves
+  `Type::Named`, fills `Field`/`FieldInit` offsets, and allocates the hidden
+  slots for aggregate arguments and returns.
 - `compiler/src/inline.rs` — AST inlining of small, straight-line, scalar
   functions, run after sema and before codegen. See the inlining gotcha below.
 - `compiler/src/licm.rs` — loop-invariant code motion, run after inlining and
@@ -415,6 +421,11 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
 
 ## Tests
 
+`tools/fuzz.py --mode reject` compiles a list of programs `rustc` rejects and
+requires `rmc` to reject each one cleanly; it pins the soundness checks below,
+which the differential fuzzers cannot see (they only compare programs both
+compilers accept).
+
 `tests/run.py` compiles each `tests/cases/NAME.{rms,rs}` pair with both compilers
 and diffs stdout and the exit status. Every case is then recompiled with the
 optimiser passes disabled in turn (`--no-inline`, `--no-licm`, `--no-tco`, and
@@ -503,6 +514,50 @@ reference as array elements. A list literal `[a, b, c]` is parsed as
 values — the parser must not guess it, because it does not type-check, and
 guessing `i64` is what made `[true, false]` fail.
 
+## Soundness checks
+
+The differential fuzzers only compare programs that *both* compilers accept, so
+they are blind to the dangerous direction: a program `rmc` accepts but `rustc`
+rejects. Such a program is never run against the reference (the reference does
+not build), so a wrong-answer or memory-safety bug it triggers is invisible to
+the suite. `tools/fuzz.py --mode reject` pins this class instead: a deterministic
+list of programs `rustc` rejects, each of which `rmc` must also reject (cleanly,
+exit 1). When you find a new `rmc`-accepts/`rustc`-rejects divergence, add it
+there. The hand-audit harness that found the original set lived outside the repo
+(`/tmp/audit5/`); the durable record is the reject corpus.
+
+The checks, all in `sema.rs`:
+
+- **Mutability (`E0384`).** A `let`/parameter without `mut` may be written at
+  most once, to initialize it (`let x: i64; x = 1;` is legal Rust); any later
+  write errors. A `mut` binding is always writable. `mut` on a parameter is
+  recorded in `FnDef::param_mut` (the parser used to accept and discard it) and a
+  parameter is otherwise immutable, matching rustc: `fn f(x: i64) { x = 1; }` is
+  rejected, `fn f(mut x: i64) { x = 1; }` is not. The scope entry is a `Binding`
+  struct carrying `mutable` and `init`.
+- **Definite initialization (`E0381`).** `Binding::init` records whether a
+  binding is initialized at the current point. A read of an uninitialized one
+  errors. An `if`/`else` keeps a binding initialized only if both arms (or the
+  entry state) initialized it; a branch with no `else` and a loop body do not
+  count, because they may not run. This is deliberately conservative — it rejects
+  the uninitialized-array-filled-in-a-loop pattern (`let mut a: [i64; N]; while
+  ... { a[i] = ..; } a[0]`), which rustc also rejects. Write the array with `= [0;
+  N]` instead; the corpus cases do.
+- **Constant array bounds.** A constant index outside the array (`a[5]` on a
+  `[i64; 2]`, or the negated `a[-1]`) is a compile error, with or without
+  `--bounds-checks`, matching rustc (`E0080`/`E0608`). The index is folded with
+  `const_i64`, which sees through unary `-`. This closes the case where an
+  out-of-range constant read adjacent stack memory unless runtime checks were on.
+  A *variable* index is still unchecked by default (see Scope).
+- **String typing.** A string literal is `Type::Str`, not `i64`. It cannot be an
+  arithmetic operand (`1 + "hi"` was accepted as integer addition on the
+  string's address, `E0369`) and cannot be passed where an `i64` is expected
+  (`print_str(42)` used to compile and then segfault, dereferencing the integer
+  as a pointer). `print_str` takes `Type::Str`.
+
+`not_on_int` remains an *over*-rejection (rmc rejects a program rustc accepts),
+the safe direction; it is listed by the audit harness but is not a soundness bug.
+
 `tools/fuzz.py` is the differential fuzzer. `expr` mode builds random integer
 expressions with calls and guarded division; `stmt` mode builds loops,
 conditionals, `match`, arrays and aggregate calls, and deliberately places
@@ -533,9 +588,11 @@ pass (small, straight-line, scalar functions), a self-recursion-to-loop pass
 (`f(x) = f(g(x)) op f(h(x))` with `op` associative becomes a loop with one call
 per level, halving `fib`'s call tree), a loop-invariant code motion pass, plus a
 small peephole pass (operand/comparison/array-address folding, constant folding,
-division by a constant, a 32-bit `div` fast path for a variable divisor). Array indexing is unchecked by default (the index is used as-is, like
-C), so an out-of-range index reads or writes adjacent stack memory;
-`--bounds-checks` turns on a per-index check that traps (see the codegen notes).
+division by a constant, a 32-bit `div` fast path for a variable divisor). A *constant* index out of
+range is a compile error; a *variable* index is unchecked by default (used
+as-is, like C), so an out-of-range one reads or writes adjacent stack memory.
+`--bounds-checks` turns on a per-index runtime check that traps (see the codegen
+notes and "Soundness checks").
 The README's roadmap lists the intended next steps.
 
 ## Codegen notes

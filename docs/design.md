@@ -38,6 +38,12 @@ driver shells out to GNU `as` and `ld`.
    address, and a `match` binds a payload by reading a word out of that buffer.
    Struct and enum layouts are computed together (`resolve_layouts`), because a
    struct may have an enum field and an enum variant may have a struct payload.
+   Sema also holds the checks that keep rmc from accepting programs rustc
+   rejects: each scope entry is a `Binding` with a `mutable` and an `init` flag,
+   so a write to a non-`mut` binding (`E0384`), a read of a binding not
+   definitely initialized on every path (`E0381`), a constant index outside an
+   array, and a string literal used as an `i64` are all rejected here. See
+   "Soundness checks" in `AGENTS.md`.
 4. **Inlining** (`inline.rs`) — rewrites the AST so a call to a small,
    straight-line, scalar function is replaced by the function's body. Runs after
    sema, so every name already carries its slot and no lookup is needed, and
