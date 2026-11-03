@@ -168,6 +168,9 @@ fn has_call(e: &Expr) -> bool {
         Expr::Block(b) => {
             b.stmts.iter().any(|s| stmt_has_call(s)) || b.tail.as_deref().map_or(false, has_call)
         }
+        Expr::MatchBoundary(b) => {
+            b.stmts.iter().any(|s| stmt_has_call(s)) || b.tail.as_deref().map_or(false, has_call)
+        }
         Expr::Index(a, b) => has_call(a) || has_call(b),
         Expr::Field { base, .. } => has_call(base),
         Expr::StructLit { fields, .. } => fields.iter().any(|fi| has_call(&fi.value)),
@@ -216,6 +219,7 @@ fn has_return(e: &Expr) -> bool {
                 || e.as_ref().map_or(false, |b| block_has_return(b))
         }
         Expr::Block(b) => block_has_return(b),
+        Expr::MatchBoundary(b) => block_has_return(b),
         Expr::Index(a, b) => has_return(a) || has_return(b),
         Expr::Field { base, .. } => has_return(base),
         Expr::StructLit { fields, .. } => fields.iter().any(|fi| has_return(&fi.value)),

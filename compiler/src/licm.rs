@@ -124,6 +124,7 @@ impl Licm {
     fn expr_loops(&mut self, e: &mut Expr) {
         match e {
             Expr::Block(b) => self.block(b),
+            Expr::MatchBoundary(b) => self.block(b),
             Expr::If(c, t, els) => {
                 self.expr_loops(c);
                 self.block(t);
@@ -309,6 +310,7 @@ impl Effects {
             }
             Expr::Deref { expr, .. } => self.expr(expr),
             Expr::Block(b) => self.block(b),
+            Expr::MatchBoundary(b) => self.block(b),
             Expr::If(c, t, els) => {
                 self.expr(c);
                 self.block(t);
@@ -418,6 +420,7 @@ impl Hoister {
             }
             Expr::Deref { expr, .. } | Expr::AddrOf { expr, .. } => self.expr(expr),
             Expr::Block(b) => self.block(b),
+            Expr::MatchBoundary(b) => self.block(b),
             Expr::If(c, t, els) => {
                 self.expr(c);
                 self.block(t);

@@ -122,6 +122,15 @@ pub enum Expr {
         ret_ty: Type,
     },
     If(Box<Expr>, Block, Option<Block>),
+    /// Marks the point where a desugared `match` begins, wrapping its first
+    /// step. A `match` desugars to an `if` chain, and the chain must be
+    /// recognised as a unit when deciding whether it is exhaustive. Without this
+    /// marker a wildcard arm whose body is itself a `match` on the same enum
+    /// value would fuse with the outer chain: `match a { A => 1, _ => match a {
+    /// B => 2 } }` and `match a { A => 1, B => 2 }` desugar to the same `if`
+    /// chain, but only the second is exhaustive. The marker, inserted by
+    /// `desugar_match`, keeps them apart; it is transparent to codegen.
+    MatchBoundary(Block),
     Block(Block),
     /// array[index]
     Index(Box<Expr>, Box<Expr>),

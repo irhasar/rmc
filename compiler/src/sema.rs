@@ -808,6 +808,21 @@ impl Sema {
                     }
                 }
             }
+            // The start of a desugared `match`. It is transparent: check the
+            // chain inside as an ordinary expression, but clear any inherited
+            // chain context first so the inner chain is judged on its own. This
+            // is what stops a wildcard arm's nested `match` from borrowing the
+            // outer match's exhaustiveness.
+            Expr::MatchBoundary(b) => {
+                let outer_chain = self.match_chain;
+                let outer_total = self.match_total;
+                self.match_chain = false;
+                self.match_total = false;
+                let t = self.check_block(b, scope);
+                self.match_chain = outer_chain;
+                self.match_total = outer_total;
+                t
+            }
             Expr::Block(b) => self.check_block(b, scope),
             Expr::Index(base, idx) => {
                 let bt = deref_ty(self.check_expr(base, scope)?);
@@ -1300,6 +1315,7 @@ fn stmt_diverges(s: &Stmt) -> bool {
 fn expr_diverges(e: &Expr) -> bool {
     match e {
         Expr::Block(b) => block_diverges(b),
+        Expr::MatchBoundary(b) => block_diverges(b),
         // Both arms must diverge for the `if` to diverge.
         Expr::If(_, t, els) => {
             block_diverges(t) && els.as_ref().map_or(false, |b| block_diverges(b))
