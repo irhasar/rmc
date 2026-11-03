@@ -133,6 +133,13 @@ def gen_stmt_program(rng):
     rs.append("enum Opt { None, Some(i64) }")
     rms.append("fn unwrap(o: Opt, d: i64) -> i64 { match o { Opt::Some(v) => v, _ => d } }")
     rs.append("fn unwrap(o: Opt, d: i64) -> i64 { match o { Opt::Some(v) => v, _ => d } }")
+    # An exhaustive enum `match` with no `_` arm, used as a value: the desugared
+    # `if` chain has no final `else` and must still type-check.
+    rms.append("fn exval(e: E) -> i64 { return match e { E::P => 1, E::Q => 2, E::R => 3 }; }")
+    rs.append("fn exval(e: E) -> i64 { match e { E::P => 1, E::Q => 2, E::R => 3 } }")
+    # Methods on a payload enum, by value and by reference.
+    rms.append("impl Opt { fn or_else(self, d: i64) -> i64 { return match self { Opt::Some(v) => v, Opt::None => d }; } fn is_some(&self) -> bool { return match *self { Opt::Some(v) => true, Opt::None => false }; } }")
+    rs.append("impl Opt { fn or_else(self, d: i64) -> i64 { match self { Opt::Some(v) => v, Opt::None => d } } fn is_some(&self) -> bool { match *self { Opt::Some(v) => true, Opt::None => false } } }")
     rms.append(f"fn mk(t: i64) -> S {{ print_i64(t); return S {{ {lit} }}; }}")
     rs.append(f'fn mk(t: i64) -> S {{ println!("{{}}", t); S {{ {lit} }} }}')
     rms.append("fn sc(t: i64) -> i64 { print_i64(t); return t * 2; }")
@@ -206,9 +213,22 @@ def gen_stmt_program(rng):
     rs.append("    let e = match i % 3 { 0 => E::P, 1 => E::Q, _ => E::R };")
     rms.append("    acc = acc + tag(e) * 100 + (e as i64);")
     rs.append("    acc += tag(e) * 100 + (e as i64);")
+    # An exhaustive enum `match` with no `_` arm, used as a value.
+    rms.append("    acc = acc + exval(e);")
+    rs.append("    acc += exval(e);")
+    # An array of unit enums, indexed and matched.
+    rms.append("    let es: [E; 3] = [E::P, E::Q, E::R];")
+    rs.append("    let es: [E; 3] = [E::P, E::Q, E::R];")
+    rms.append("    acc = acc + (es[k % 3] as i64) + exval(es[(k + 1) % 3]);")
+    rs.append("    acc += (es[(k % 3) as usize] as i64) + exval(es[((k + 1) % 3) as usize]);")
     # Build a payload variant, pass it to a function, and destructure it.
     rms.append("    let opt: Opt = match i % 2 { 0 => Opt::Some(i + 1), _ => Opt::None };")
     rs.append("    let opt = match i % 2 { 0 => Opt::Some(i + 1), _ => Opt::None };")
+    # Methods on the payload enum, by value and by reference.
+    rms.append("    acc = acc + opt.or_else(77);")
+    rs.append("    acc += opt.or_else(77);")
+    rms.append("    if opt.is_some() { acc = acc + 5; }")
+    rs.append("    if opt.is_some() { acc += 5; }")
     rms.append("    acc = acc + unwrap(opt, 1000);")
     rs.append("    acc += unwrap(opt, 1000);")
     rms.append(f"    acc = acc + mix({', '.join(callargs)});")
