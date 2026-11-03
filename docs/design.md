@@ -142,6 +142,11 @@ a `return`, or a tail expression).
   register move rather than a store and a load; only a spill deeper than that
   reaches a frame slot. Slots are used rather than `push`/`pop` so `%rsp` never
   moves and a call needs no alignment pad.
+- A promoted-local divisor of `a / y` or `a % y` stays in its callee-saved
+  register and `idiv` reads it directly, instead of bouncing it through `%rcx`.
+  `gen_expr(a)` uses only `%rax`/`%rcx`/`%rdx` as scratch and `cqto` writes only
+  `%rdx`, so the divisor register is live across both — the same reasoning that
+  lets the `add`/`imul` register fold read a promoted local.
 
 ### Division by a constant
 
