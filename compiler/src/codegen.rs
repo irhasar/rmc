@@ -2036,6 +2036,22 @@ impl Codegen {
             if self.gen_div_const(op, a, b) {
                 return Type::I64;
             }
+            // A promoted-local divisor is a callee-saved register, so `idiv`
+            // can read it directly instead of bouncing it into `%rcx`. The
+            // dividend still has to reach `%rax`, but `gen_expr(a)` uses only
+            // `%rax`/`%rcx`/`%rdx` as scratch and `cqto` only writes `%rdx`, so
+            // the divisor register stays live across both.
+            if let Some(rb) = self.simple_operand(b) {
+                if rb.starts_with('%') {
+                    self.gen_expr(a);
+                    self.line("cqto");
+                    self.line(&format!("idiv {rb}"));
+                    if matches!(op, Mod) {
+                        self.line("mov %rdx, %rax");
+                    }
+                    return Type::I64;
+                }
+            }
             self.eval_operands(a, b, false);
             self.line("cqto");
             self.line("idiv %rcx");

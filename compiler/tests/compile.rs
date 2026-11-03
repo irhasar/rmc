@@ -1395,3 +1395,21 @@ fn no_inverse_move_pair_survives() {
         }
     }
 }
+
+#[test]
+fn a_variable_divisor_uses_its_register_directly() {
+    // `y` is a promoted local, so it already lives in a callee-saved register.
+    // `idiv` can read that register directly rather than bouncing the divisor
+    // through `%rcx`, which is what the order-preserving path used to do. The
+    // dividend still moves into `%rax` and `cqto` fills `%rdx`.
+    let src = "fn gcd(a: i64, b: i64) -> i64 { \
+               let mut x: i64 = a; let mut y: i64 = b; \
+               while y != 0 { let t: i64 = x % y; x = y; y = t; } \
+               return x; } \
+               fn main() -> i64 { return gcd(48, 18); }";
+    let out = asm_no_inline(src);
+    let gcd = &out[out.find("gcd:").unwrap()..];
+    let gcd = &gcd[..gcd.find(".size gcd").unwrap()];
+    assert!(gcd.contains("idiv %rbx"), "divisor read from its register:\n{gcd}");
+    assert!(!gcd.contains("idiv %rcx"), "no bounce through %rcx:\n{gcd}");
+}
