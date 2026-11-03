@@ -104,6 +104,9 @@ computed by sema and carried in the type, so codegen needs no lookup.
 
 A payload variant is built with `Opt::Some(3)`; a unit variant of a payload enum
 is still written `Opt::None`, and is materialised as a zero-payload value.
+A payload enum may have `impl` methods like a unit enum; a `self` method takes
+the value by pointer (it is an aggregate) and a `&self` method takes its
+address.
 A pattern that matches a payload variant must bind its fields, `Opt::Some(v)`;
 matching it bare (`Opt::Some`) is an error, because there is no way to name the
 value. A payload variant is not comparable with `==` and cannot be cast with
@@ -199,7 +202,10 @@ Rust panic. Division by zero always traps at the CPU level.
   (optionally negated), an `Enum::Variant`, or `_`. The first equal arm runs and
   `_` matches anything; it is an expression, usable as a statement or a value,
   and a comma before `}` may be omitted. A non-exhaustive `match` (no `_`) that
-  is used as a value is a type error, exactly as in Rust.
+  is used as a value is a type error, exactly as in Rust. rmc does not check
+  exhaustiveness in general, but it does recognise the case where the arms name
+  *every* variant of one enum with no `_`: that match is total, so it may be
+  used as a value too.
 - String literals, given type `i64` (a pointer to a `{len, bytes}` record), so
   they can be passed to `print_str`.
 

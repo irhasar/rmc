@@ -424,12 +424,28 @@ resolve to `Type::Enum` through `resolve_ty`, which every type site uses, and
 enum patterns are a `Pat::Variant` the parser desugars into an `EnumVariant`
 comparison. `as` may not target an enum, matching rustc.
 
+A `match` is desugared into a chain of `if`s, so a `match` with no `_` arm has
+no final `else` and, used as a value, would trip the "`if` without `else`" check
+in sema. When the arms name *every* variant of one enum it is total, and rustc
+accepts it as a value, so sema recognises exactly that case:
+`Sema::if_chain_is_exhaustive` walks the chain, requires every condition to be a
+`VariantTest` over one enum, and compares the number of distinct variants tested
+against the enum's variant count. Because the desugared chain is checked
+outside-in, the innermost `if` is seen first; `Sema::match_chain`/`match_total`
+carry the verdict down the chain so the last `if` (no `else`) may stand for a
+value. The two flags are set only on the `else` path of a *total* chain, so a
+wildcard arm body that is itself an `if` is still checked as an ordinary root.
+`tests/cases/exhmat.{rms,rs}` covers value position, reordering, nesting,
+references and a loop; a non-exhaustive or duplicate-variant match still errors.
+
 A method is an ordinary free function whose name is mangled to `Type$method` and
 whose first parameter is `self` of the impl's struct type; the parser produces
 it, sema inserts the `self` parameter before building signatures, and a method
 call is rewritten by sema into a `Call` with the receiver prepended. Codegen
-therefore has no method case — keep it that way. `Self` resolves through the
-parser's `current_impl`.
+therefore has no method case — keep it that way. Method resolution accepts a
+receiver whose type is `Struct`, `Enum` (unit) or `EnumData` (payload); all
+three give the same mangled prefix, and a `self` method on an aggregate receiver
+passes it by pointer. `Self` resolves through the parser's `current_impl`.
 
 An array's element type is always scalar (`i64` or `bool`); nested arrays and
 arrays of structs are rejected. A list literal `[a, b, c]` is parsed as

@@ -14,6 +14,15 @@ fn get(o: Opt) -> i64 {
     match o { Opt::Some(v) => v, Opt::None => 0 - 1, _ => 0 }
 }
 
+impl Opt {
+    fn or_else(self, d: i64) -> i64 {
+        match self { Opt::Some(v) => v, Opt::None => d }
+    }
+    fn is_some(&self) -> bool {
+        match *self { Opt::Some(v) => true, Opt::None => false }
+    }
+}
+
 fn area(s: Shape) -> i64 {
     match s {
         Shape::Dot => 0,
@@ -61,6 +70,12 @@ fn main() {
     let bx = Box2 { v: 55 };
     println!("{}", get(bx.wrap()));
     println!("{}", get(bx.empty()));
+    println!("{}", Opt::Some(8).or_else(0));
+    println!("{}", Opt::None.or_else(50));
+    println!("{}", Opt::Some(1).is_some() as i64);
+    println!("{}", Opt::None.is_some() as i64);
+    let ro: &Opt = &a;
+    println!("{}", ro.or_else(0));
     let c = Opt::None;
     match c {
         Opt::Some(v) => { println!("{}", v); }
