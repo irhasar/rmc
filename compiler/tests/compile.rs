@@ -1446,3 +1446,51 @@ fn a_while_whose_body_is_empty_still_tests_once() {
     let body = loop_body(&asm(src));
     assert!(body.contains("jl "), "the guard still gates the body:\n{body}");
 }
+
+#[test]
+fn an_accumulated_call_result_is_added_in_place() {
+    // `sum = sum + f(i)` must add the call's `%rax` straight into the promoted
+    // accumulator, not bounce it through `%rcx`: `add %rax, %r13`.
+    let src = "fn f(x: i64) -> i64 { return x + 1; } \
+               fn main() -> i64 { let mut s: i64 = 0; let mut i: i64 = 0; \
+               while i < 10 { s = s + f(i); i = i + 1; } return s; }";
+    let body = loop_body(&asm_no_inline(&src));
+    assert!(body.contains("call f"), "the call is in the loop:\n{body}");
+    assert!(
+        body.contains("add %rax, %"),
+        "the call result is added in place:\n{body}"
+    );
+    assert!(
+        !body.contains("mov %rax, %rcx"),
+        "no bounce of the call result through %rcx:\n{body}"
+    );
+}
+
+#[test]
+fn a_product_term_is_accumulated_without_a_bounce() {
+    // A non-simple term (here a product) is computed into `%rax` and added with
+    // one `add %rax, dst`, not `mov %rax, %rcx; add %rcx, %rax`.
+    let src = "fn main() -> i64 { let mut s: i64 = 0; let mut i: i64 = 0; \
+               while i < 10 { s = s + i * i; i = i + 1; } return s; }";
+    let body = loop_body(&asm_no_licm(src));
+    assert!(body.contains("add %rax, %"), "product added in place:\n{body}");
+    assert!(
+        !body.contains("mov %rax, %rcx"),
+        "no bounce of the product through %rcx:\n{body}"
+    );
+}
+
+#[test]
+fn an_accumulator_chain_with_calls_keeps_source_order() {
+    // Evaluation stays left to right even with a call that writes memory: the
+    // `h(&mut a)` term must run after `a` is read.
+    let src = "fn h(p: &mut i64) -> i64 { *p = *p + 1; return *p; } \
+               fn main() -> i64 { let mut a: i64 = 10; let mut acc: i64 = 100; \
+               acc = acc + a + h(&mut a); return acc; }";
+    let out = asm_no_inline(&src);
+    let body = main_body(&out);
+    let read_a = body.find("mov 8(%rbp), %rax").or_else(|| body.find("mov -").map(|_| 0));
+    let call = body.find("call h").expect("the call is emitted");
+    // The first operand read (`a`) precedes the call.
+    assert!(read_a.unwrap_or(0) < call, "operand read before the call:\n{body}");
+}
