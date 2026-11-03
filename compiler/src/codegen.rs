@@ -1098,13 +1098,22 @@ impl Codegen {
                 self.gen_expr(e);
             }
             Stmt::While(cond, body) => {
-                let top = self.new_label();
+                // Rotated: the test moves to the bottom and the body falls
+                // through to it, so the back edge is the conditional branch and
+                // the loop no longer pays an unconditional `jmp` every
+                // iteration. The entry `jmp` runs once and reuses the same test,
+                // so a false first condition still skips the body. `continue`
+                // targets the test (re-check), `break` targets `end`, which the
+                // test falls into.
+                let body_l = self.new_label();
+                let test_l = self.new_label();
                 let end = self.new_label();
-                self.loops.push((top.clone(), end.clone()));
-                self.raw(&format!("{top}:"));
-                self.gen_branch_false(cond, &end);
+                self.loops.push((test_l.clone(), end.clone()));
+                self.line(&format!("jmp {test_l}"));
+                self.raw(&format!("{body_l}:"));
                 self.gen_block(body);
-                self.line(&format!("jmp {top}"));
+                self.raw(&format!("{test_l}:"));
+                self.gen_branch_true(cond, &body_l);
                 self.raw(&format!("{end}:"));
                 self.loops.pop();
             }
@@ -1124,6 +1133,11 @@ impl Codegen {
                 self.store_slot(*var_slot);
                 self.gen_expr(end);
                 self.store_slot(*end_slot);
+                // Not rotated: the increment sits between the body and the
+                // guard, so the first guard must see the *un*-incremented start.
+                // A rotated form would either skip the first iteration or need
+                // the guard duplicated, which is not worth it for a construct
+                // the hot benchmarks do not use.
                 let top = self.new_label();
                 let cont = self.new_label();
                 let end_l = self.new_label();
@@ -2456,6 +2470,38 @@ impl Codegen {
         self.gen_expr(cond);
         self.line("test %rax, %rax");
         self.line(&format!("jz {target}"));
+    }
+
+    /// The dual of `gen_branch_false`: jump to `target` when `cond` holds,
+    /// otherwise fall through. Used to close a rotated loop, where the test sits
+    /// at the bottom and the back edge is the conditional jump.
+    fn gen_branch_true(&mut self, cond: &Expr, target: &str) {
+        if let Expr::Bin(op, a, b) = cond {
+            if let Some(cc) = setcc_cc(*op) {
+                if !self.emit_cmp(a, b) {
+                    self.eval_operands(a, b, false);
+                    self.line("cmp %rcx, %rax");
+                }
+                self.line(&format!("{cc} {target}"));
+                return;
+            }
+        }
+        // `!(a < b)` jumps back when the comparison is false.
+        if let Expr::Un(UnOp::Not, inner) = cond {
+            if let Expr::Bin(op, a, b) = inner.as_ref() {
+                if let Some(cc) = invert_cc(*op) {
+                    if !self.emit_cmp(a, b) {
+                        self.eval_operands(a, b, false);
+                        self.line("cmp %rcx, %rax");
+                    }
+                    self.line(&format!("{cc} {target}"));
+                    return;
+                }
+            }
+        }
+        self.gen_expr(cond);
+        self.line("test %rax, %rax");
+        self.line(&format!("jnz {target}"));
     }
 
     fn gen_call(

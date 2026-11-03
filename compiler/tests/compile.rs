@@ -1235,12 +1235,22 @@ fn loop_body(out: &str) -> String {
     let lines: Vec<&str> = body.lines().collect();
     for (i, l) in lines.iter().enumerate() {
         let t = l.trim();
-        if t.starts_with(".L") && t.ends_with(':') {
-            let label = &t[..t.len() - 1];
-            let target = format!("jmp {label}");
-            if let Some(j) = (i + 1..lines.len()).find(|&j| lines[j].trim() == target) {
-                return lines[i..=j].join("\n");
-            }
+        // The loop's back edge is the jump that targets a label emitted earlier.
+        // A `while` is rotated, so its back edge is conditional (`jne`/`jl`); a
+        // `for` and a `loop` still close with an unconditional `jmp`.
+        let target = if let Some(rest) = t.strip_prefix("jmp ") {
+            rest
+        } else if t.starts_with('j') {
+            t.split_whitespace().nth(1).unwrap_or("")
+        } else {
+            continue;
+        };
+        if target.is_empty() {
+            continue;
+        }
+        let label = format!("{target}:");
+        if let Some(start) = (0..i).rev().find(|&j| lines[j].trim() == label) {
+            return lines[start..=i].join("\n");
         }
     }
     String::new()
@@ -1412,4 +1422,27 @@ fn a_variable_divisor_uses_its_register_directly() {
     let gcd = &gcd[..gcd.find(".size gcd").unwrap()];
     assert!(gcd.contains("idiv %rbx"), "divisor read from its register:\n{gcd}");
     assert!(!gcd.contains("idiv %rcx"), "no bounce through %rcx:\n{gcd}");
+}
+
+#[test]
+fn a_while_loop_is_rotated() {
+    // The test sits at the bottom and its branch is the back edge, so the loop
+    // has no unconditional jump and each iteration is `cmp` + `jl`.
+    let src = "fn main() -> i64 { let mut s: i64 = 0; let mut i: i64 = 0; \
+               while i < 10 { s = s + i; i = i + 1; } return s; }";
+    let body = loop_body(&asm(src));
+    assert!(!body.contains("jmp .L"), "no unconditional back edge:\n{body}");
+    assert_eq!(body.matches("cmp").count(), 1, "one test per iteration:\n{body}");
+    // The condition is a comparison, so the back edge is the direct `jl`, not a
+    // materialised 0/1 fed to `test`.
+    assert!(body.contains("jl "), "comparison back edge:\n{body}");
+}
+
+#[test]
+fn a_while_whose_body_is_empty_still_tests_once() {
+    // Rotation moves the test, so an empty body must not loop forever: the
+    // entry jump and the bottom test both run.
+    let src = "fn main() -> i64 { let mut i: i64 = 0; while i < 3 { } return i; }";
+    let body = loop_body(&asm(src));
+    assert!(body.contains("jl "), "the guard still gates the body:\n{body}");
 }
