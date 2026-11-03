@@ -463,6 +463,15 @@ The README's roadmap lists the intended next steps.
     the load: a memory operand lands in the instruction's dependency chain (and
     regressed `mandel` by ~19% when tried), a register operand does not. Only
     `simple_operand` results that start with `%` fold.
+  - **Commutative spill fold.** When neither operand is simple, the
+    order-preserving path evaluates the right operand, moves it to `%rcx`, then
+    restores the left from the spill. For a commutative op (`+`, `*`, `&`, `|`,
+    `^`) the left can be popped straight into `%rcx` instead, one move fewer;
+    `eval_operands` takes a `commutative` flag and `sub`/`div`/`mod`/comparisons
+    pass `false`. Measured ~10% on `stats`.
+  - **`idiv` reads a promoted-local divisor directly.** `a / y` no longer bounces
+    `y` into `%rcx`; the divisor is already in a callee-saved register and
+    `gen_expr(a)` plus `cqto` only touch `%rax`/`%rcx`/`%rdx`, so it stays live.
   - The multi-term **accumulation fold** (`gen_accumulate`) is a narrower form
     that was measured neutral: it applies only when `x` is promoted, no term
     reads `x`'s register, and every term is already a single operand. It cuts
