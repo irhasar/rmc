@@ -352,11 +352,14 @@ caller's frame, the callee's slots are shifted into it by a base offset, and a
 read of a parameter's slot is replaced by the argument. A trivial argument (a
 name, a literal, a string) is substituted in place; anything else is evaluated
 once into a fresh slot and the slot is substituted, so a side effect runs exactly
-once and the left-to-right order is preserved. Two expansions get disjoint
-regions, so an inlined body's locals never alias the caller's or each other's.
-A whole-program budget of 8192 expansions bounds compile time and code size; a
-loop body is inlined once, not once per iteration. `--no-inline` turns the pass
-off, which is what the tests that assert on the calling convention use.
+once and the left-to-right order is preserved. A parameter the body *assigns* is
+a local copy, so it is always given a fresh slot even when the argument is
+trivial: substituting a caller variable for it would make the assignment write
+through to the caller. Two expansions get disjoint regions, so an inlined body's
+locals never alias the caller's or each other's. A whole-program budget of 8192
+expansions bounds compile time and code size; a loop body is inlined once, not
+once per iteration. `--no-inline` turns the pass off, which is what the tests
+that assert on the calling convention use.
 
 
 ## Self-recursion to loop

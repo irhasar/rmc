@@ -1258,6 +1258,21 @@ fn an_inlined_local_does_not_alias_a_caller_slot() {
     assert!(out.contains("main:"), "compiles");
 }
 
+#[test]
+fn an_inlined_parameter_assignment_does_not_reach_the_caller() {
+    // A parameter is a local copy, so a body that assigns it must write a fresh
+    // slot rather than the caller's argument. Here `a` is promoted to `%r12`, so
+    // the increment must target a different register and `%r12` must survive.
+    let out = asm(
+        "fn bump(x: i64) -> i64 { x = x + 1; return x; } \
+         fn main() -> i64 { let a: i64 = 5; return bump(a) * 100 + a; }",
+    );
+    assert!(!out.contains("call bump"), "bump is inlined in:\n{out}");
+    for store in ["add $1, %r12", "lea 1(%r12), %r12", "inc %r12"] {
+        assert!(!out.contains(store), "the parameter write reaches the caller ({store}):\n{out}");
+    }
+}
+
 /// Assembly with loop-invariant code motion disabled.
 fn asm_no_licm(src: &str) -> String {
     compile_to_asm(src, &CompileOptions { no_licm: true, ..Default::default() })

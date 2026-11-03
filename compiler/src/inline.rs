@@ -374,16 +374,22 @@ impl Inliner {
         *base += region;
         let param_slots = self.cands[cand].param_slots.clone();
         let param_tys = self.cands[cand].params.clone();
+        let assigned = assigned_slots(&self.cands[cand].stmts, self.cands[cand].tail.as_ref());
 
         // Bind each argument to what the body should read for its parameter. A
         // trivial argument (a name, a literal, a string) is substituted in
         // place; anything else may have side effects or need evaluating, so it
         // is evaluated once into a fresh slot and the slot is substituted, which
         // also keeps the evaluation order left to right.
+        //
+        // A parameter the body assigns is a special case: it is a local copy, so
+        // substituting a trivial argument for it would make the assignment write
+        // through to the caller's variable. Such a parameter is always copied
+        // into a fresh slot, and the body's assignment targets that slot.
         let mut binds: Vec<Stmt> = Vec::new();
         let mut subst: Vec<Expr> = Vec::with_capacity(args.len());
         for (i, arg) in args.into_iter().enumerate() {
-            if trivial(&arg) {
+            if trivial(&arg) && !assigned.contains(&param_slots[i]) {
                 subst.push(arg);
             } else {
                 let slot = *base;
@@ -437,6 +443,117 @@ impl Inliner {
 /// into a temporary instead.
 fn trivial(e: &Expr) -> bool {
     matches!(e, Expr::Var { .. } | Expr::Int(_) | Expr::Bool(_) | Expr::Str(_))
+}
+
+/// The slots a candidate body assigns directly (not through a pointer or an
+/// element). A parameter among them is a local the body mutates, so it must be
+/// copied rather than substituted, or the mutation would reach the caller.
+fn assigned_slots(stmts: &[Stmt], tail: Option<&Expr>) -> HashSet<i32> {
+    fn collect_block(b: &Block, out: &mut HashSet<i32>) {
+        for s in &b.stmts {
+            collect_stmt(s, out);
+        }
+        if let Some(t) = &b.tail {
+            collect_expr(t, out);
+        }
+    }
+    fn collect_stmt(s: &Stmt, out: &mut HashSet<i32>) {
+        match s {
+            Stmt::Assign { target, value } => {
+                if let Expr::Var { slot, .. } = target {
+                    out.insert(*slot);
+                }
+                collect_expr(target, out);
+                collect_expr(value, out);
+            }
+            Stmt::Let { init, .. } => {
+                if let Some(e) = init {
+                    collect_expr(e, out);
+                }
+            }
+            Stmt::Expr(e) => collect_expr(e, out),
+            Stmt::While(c, b) => {
+                collect_expr(c, out);
+                collect_block(b, out);
+            }
+            Stmt::Loop(b) => collect_block(b, out),
+            Stmt::For { start, end, body, var_slot, end_slot, .. } => {
+                out.insert(*var_slot);
+                out.insert(*end_slot);
+                collect_expr(start, out);
+                collect_expr(end, out);
+                collect_block(body, out);
+            }
+            Stmt::Return(v) => {
+                if let Some(e) = v {
+                    collect_expr(e, out);
+                }
+            }
+            Stmt::Break | Stmt::Continue => {}
+        }
+    }
+    fn collect_expr(e: &Expr, out: &mut HashSet<i32>) {
+        match e {
+            Expr::Bin(_, a, b) => {
+                collect_expr(a, out);
+                collect_expr(b, out);
+            }
+            Expr::Un(_, a) | Expr::Cast(a, _) => collect_expr(a, out),
+            Expr::Field { base, .. } => collect_expr(base, out),
+            Expr::Index(a, b) => {
+                collect_expr(a, out);
+                collect_expr(b, out);
+            }
+            Expr::Deref { expr, .. } | Expr::AddrOf { expr, .. } => collect_expr(expr, out),
+            Expr::Block(b) => collect_block(b, out),
+            Expr::If(c, t, els) => {
+                collect_expr(c, out);
+                collect_block(t, out);
+                if let Some(b) = els {
+                    collect_block(b, out);
+                }
+            }
+            Expr::Call { args, .. } => {
+                for a in args {
+                    collect_expr(a, out);
+                }
+            }
+            Expr::MethodCall { recv, args, .. } => {
+                collect_expr(recv, out);
+                for a in args {
+                    collect_expr(a, out);
+                }
+            }
+            Expr::StructLit { fields, .. } => {
+                for f in fields {
+                    collect_expr(&f.value, out);
+                }
+            }
+            Expr::EnumCtor { args, .. } => {
+                for a in args {
+                    collect_expr(a, out);
+                }
+            }
+            Expr::ArrayLit(v, _) => collect_expr(v, out),
+            Expr::ArrayList(v) => {
+                for x in v {
+                    collect_expr(x, out);
+                }
+            }
+            Expr::VariantTest { scrutinee, .. } => collect_expr(scrutinee, out),
+            Expr::EnumPayload { recv, .. } => collect_expr(recv, out),
+            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
+        }
+    }
+
+    let mut out = HashSet::new();
+    for s in stmts {
+        collect_stmt(s, &mut out);
+    }
+    if let Some(t) = tail {
+        collect_expr(t, &mut out);
+    }
+    out
 }
 
 /// Rewrites a callee body into the caller's frame: every slot is shifted by
