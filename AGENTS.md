@@ -300,6 +300,14 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
   rather than `push`/`pop`, so `%rsp` is static and a call needs no alignment
   pad. This measured faster on every real program (`fib` +3.3%) because the pad
   costs two instructions per call.
+- **`alloc`'s fast paths are a leaf.** The free-list scan, the arena carve and
+  the failure return touch only caller-saved registers, so `alloc` keeps no
+  frame pointer and saves no callee-saved registers; the prologue/epilogue that
+  a `push %rbp` + four `push`es cost was pure overhead on every allocation.
+  Measured +7% on `heap` (3.61 → 3.37 ms). Only the mmap slow path needs state
+  across the syscall: the total block size rides the stack (the syscall clobbers
+  `%rcx`/`%r11`) and the chunk length stays in `%rsi`. Keep new code off the
+  callee-saved set, or the whole-function frame comes back.
 - **Link flags.** The driver uses `ld -o <out> --build-id=none -n <obj>`; the
   assembly already carries `.note.GNU-stack` so no `-z noexecstack` is needed.
   `-n` (nmagic) drops the page alignment between sections and roughly halves the
