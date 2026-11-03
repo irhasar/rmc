@@ -19,6 +19,23 @@ fn get(o: Opt) -> i64 {
     }
 }
 
+// A method on a payload enum: `self` is an aggregate, and `&self` passes its
+// address. Both are rejected if the method-resolution match omits `EnumData`.
+impl Opt {
+    fn or_else(self, d: i64) -> i64 {
+        return match self {
+            Opt::Some(v) => v,
+            Opt::None => d,
+        };
+    }
+    fn is_some(&self) -> bool {
+        return match *self {
+            Opt::Some(v) => true,
+            Opt::None => false,
+        };
+    }
+}
+
 fn area(s: Shape) -> i64 {
     match s {
         Shape::Dot => 0,
@@ -79,6 +96,13 @@ fn main() -> i64 {
     let bx: Box2 = Box2 { v: 55 };
     print_i64(get(bx.wrap()));
     print_i64(get(bx.empty()));
+    // Methods on a payload enum, by value and by reference.
+    print_i64(Opt::Some(8).or_else(0));
+    print_i64(Opt::None.or_else(50));
+    print_bool(Opt::Some(1).is_some());
+    print_bool(Opt::None.is_some());
+    let ro: &Opt = &a;
+    print_i64(ro.or_else(0));
     // A binding pattern as the catch-all.
     let c: Opt = Opt::None;
     match c {

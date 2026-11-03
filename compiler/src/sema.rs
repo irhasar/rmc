@@ -64,6 +64,14 @@ pub struct Sema {
     next_slot: i32,
     loop_depth: u32,
     ret_ty: Type,
+    /// While checking the `else` chain of a desugared `match`: whether the
+    /// whole chain names every variant of one enum. Decided once at the chain's
+    /// first `if` and carried down, so the final `if` (which has no `else`) may
+    /// stand for a value. Cleared while checking a condition or an arm body.
+    match_total: bool,
+    /// Whether the `if` being checked is a non-root step of such a chain, so it
+    /// inherits `match_total` instead of recomputing it.
+    match_chain: bool,
 }
 
 /// One in-scope binding: its name, frame slot, type, and whether it may be
@@ -160,6 +168,8 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         next_slot: 0,
         loop_depth: 0,
         ret_ty: Type::Unit,
+        match_total: false,
+        match_chain: false,
     };
     for f in &mut prog.fns {
         sema.check_fn(f)?;
@@ -451,6 +461,69 @@ impl Sema {
             return Ok(Type::Array(Box::new(t), *n));
         }
         self.check_expr(e, scope)
+    }
+
+    /// Whether a desugared `match` `if`-chain is provably total, i.e. it tests
+    /// every variant of one enum exactly once and no other condition.
+    ///
+    /// A `match` with no `_` arm folds to `if c1 { a1 } else { if c2 { a2 } ... }`
+    /// with no final `else`, so a value that matches no arm falls through to
+    /// unit. That is exactly right when the match is non-exhaustive, but when
+    /// the arms name *every* variant the fall-through is unreachable and the
+    /// chain may be used as a value. rustc accepts that; rmc rejected it with a
+    /// spurious "`if` without `else`" error.
+    ///
+    /// `VariantTest` nodes are produced only by `match` desugaring, so a chain
+    /// whose conditions are all `VariantTest`s over one enum and whose tested
+    /// variants are pairwise distinct and cover every variant is exhaustive.
+    /// Anything else (an integer arm, a duplicate, a missing variant, a
+    /// hand-written `if` chain) is not, and keeps the old error.
+    ///
+    /// The comparison is by variant *name*, not tag: the nested `VariantTest`s
+    /// have not been visited by `check_expr` yet, so their tags are still -1.
+    fn if_chain_is_exhaustive(&self, cond: &Expr, els: &Option<Block>) -> bool {
+        let mut enum_name: Option<&str> = None;
+        let mut seen: Vec<&str> = Vec::new();
+        let mut cur_cond = cond;
+        let mut cur_els = els;
+        loop {
+            let (name, variant) = match cur_cond {
+                Expr::VariantTest { enum_name, variant, .. } => {
+                    (enum_name.as_str(), variant.as_str())
+                }
+                _ => return false,
+            };
+            match enum_name {
+                Some(existing) if existing != name => return false,
+                None => enum_name = Some(name),
+                _ => {}
+            }
+            if seen.contains(&variant) {
+                return false;
+            }
+            seen.push(variant);
+            match cur_els {
+                None => break,
+                Some(block) => {
+                    // An arm body is `{ body }`; only the nested `else` chains.
+                    if !block.stmts.is_empty() {
+                        return false;
+                    }
+                    match block.tail.as_deref() {
+                        Some(Expr::If(cond, _, els)) => {
+                            cur_cond = cond;
+                            cur_els = els;
+                        }
+                        _ => return false,
+                    }
+                }
+            }
+        }
+        let info = match enum_name.and_then(|n| self.enums.get(n)) {
+            Some(i) => i,
+            None => return false,
+        };
+        info.variants.len() == seen.len()
     }
 
     fn check_block(&mut self, b: &mut Block, scope: &mut Scope) -> Result<Type, String> {
@@ -748,26 +821,50 @@ impl Sema {
                 Ok(sig.ret)
             }
             Expr::If(cond, then, els) => {
+                // A desugared `match` is a chain of `if`s. The first step is an
+                // ordinary `if`; the steps in its `else` chain are flagged with
+                // `match_chain`, and inherit `match_total`, which records
+                // whether the whole chain names every variant of one enum. A
+                // total chain may stand for a value even though its last step
+                // has no `else`.
+                let is_root = !self.match_chain;
+                let total = self.match_total;
+                self.match_chain = false;
+                self.match_total = false;
                 let ct = self.check_expr(cond, scope)?;
                 if ct != Type::Bool {
                     return Err(format!("`if` condition must be `bool`, found {ct:?}"));
                 }
+                let total = if is_root {
+                    self.if_chain_is_exhaustive(cond, els)
+                } else {
+                    total
+                };
                 let tt = self.check_block(then, scope)?;
                 match els {
                     Some(e) => {
+                        // Only a total chain's `else` continues the chain: an
+                        // all-variant `match` has no wildcard body, so the else
+                        // block is always the next arm's test. A non-total chain
+                        // may end in a wildcard body that is itself an `if`, and
+                        // that nested `if` must be checked as an ordinary root.
+                        self.match_chain = total;
+                        self.match_total = total;
                         let et = self.check_block(e, scope)?;
+                        self.match_chain = false;
+                        self.match_total = false;
                         if tt != et {
                             return Err(format!("`if` branches have different types: {tt:?} and {et:?}"));
                         }
                         Ok(tt)
                     }
                     None => {
-                        if tt != Type::Unit {
+                        if tt != Type::Unit && !total {
                             return Err(format!(
                                 "`if` without `else` must evaluate to `()`, but the branch is {tt:?}"
                             ));
                         }
-                        Ok(Type::Unit)
+                        Ok(tt)
                     }
                 }
             }

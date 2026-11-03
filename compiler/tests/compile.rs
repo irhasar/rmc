@@ -182,6 +182,40 @@ fn struct_self_reference_is_rejected() {
 }
 
 #[test]
+fn exhaustive_match_is_a_value() {
+    // Every variant named, no `_`: the desugared `if` chain is total, so it may
+    // be used as a value even though its last `if` has no `else`.
+    let src = "enum E { A, B } \
+               fn main() -> i64 { let e: E = E::A; \
+               let t: i64 = match e { E::A => 1, E::B => 2 }; return t; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn non_exhaustive_match_as_a_value_is_rejected() {
+    // A missing variant means the chain can fall through to unit, which is a
+    // type error in value position, exactly as in Rust.
+    let err = compile_to_asm(
+        "enum E { A, B } fn main() -> i64 { let e: E = E::A; \
+         let t: i64 = match e { E::A => 1 }; return t; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("`if` without `else`"), "got: {err}");
+}
+
+#[test]
+fn a_method_on_a_payload_enum_resolves() {
+    // The receiver type is `EnumData`, which method resolution must accept just
+    // like `Struct` and the unit `Enum`.
+    let src = "enum Opt { None, Some(i64) } \
+               impl Opt { fn or_else(self, d: i64) -> i64 { \
+               return match self { Opt::Some(v) => v, Opt::None => d }; } } \
+               fn main() -> i64 { return Opt::Some(8).or_else(0); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
 fn argument_setup_folds_a_constant_with_lea() {
     // `fib(n - 1)` must become one `lea`, not `mov; sub; mov`.
     let out = asm("fn f(n: i64) -> i64 { return n; } fn g(n: i64) -> i64 { return f(n - 1); } fn main() -> i64 { return 0; }");
