@@ -902,6 +902,8 @@ impl Parser {
     /// Rust). With no `_`, the chain has no final `else`, so a non-matching
     /// value yields `()`.
     fn desugar_match(&mut self, scrutinee: Expr, arms: Vec<(Pat, Expr)>) -> Expr {
+        // A `_` or binding arm makes the match exhaustive in every position.
+        let has_catch_all = arms.iter().any(|(p, _)| matches!(p, Pat::Wild | Pat::Bind(_)));
         let (subj, prelude) = match scrutinee {
             Expr::Var { .. } | Expr::Int(_) | Expr::EnumVariant { .. } => (scrutinee, None),
             other => {
@@ -974,7 +976,10 @@ impl Parser {
             });
         }
         let acc = acc.expect("a `match` has at least one arm");
-        let acc = Expr::MatchBoundary(Block { stmts: Vec::new(), tail: Some(Box::new(acc)) });
+        let acc = Expr::MatchBoundary(
+            Block { stmts: Vec::new(), tail: Some(Box::new(acc)) },
+            has_catch_all,
+        );
         match prelude {
             None => acc,
             Some(stmt) => Expr::Block(Block { stmts: vec![stmt], tail: Some(Box::new(acc)) }),
@@ -1180,7 +1185,7 @@ fn expr_has_call(e: &Expr) -> bool {
             expr_has_call(c) || block_has_call_p(t) || els.as_ref().map_or(false, block_has_call_p)
         }
         Expr::Block(b) => block_has_call_p(b),
-        Expr::MatchBoundary(b) => block_has_call_p(b),
+        Expr::MatchBoundary(b, _) => block_has_call_p(b),
         Expr::StructLit { fields, .. } => fields.iter().any(|f| expr_has_call(&f.value)),
         Expr::ArrayLit(v, _) => expr_has_call(v),
         _ => false,

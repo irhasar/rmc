@@ -297,6 +297,65 @@ fn a_match_whose_arms_all_return_is_accepted_as_a_body() {
 }
 
 #[test]
+fn a_non_exhaustive_match_statement_is_rejected() {
+    // The arms are unit-typed, so the fall-through to `()` is harmless and rmc
+    // used to accept this; rustc still rejects it with E0004, and so must rmc.
+    let err = compile_to_asm(
+        "enum E { A, B } fn main() -> i64 { let e: E = E::A; \
+         match e { E::A => { print_i64(1); } } return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("non-exhaustive `match`"), "got: {err}");
+}
+
+#[test]
+fn a_non_exhaustive_integer_match_statement_is_rejected() {
+    // Integer patterns cannot be checked for exhaustiveness, so a match over an
+    // integer with no `_` arm is always non-exhaustive, exactly as in rustc.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let x: i64 = 5; \
+         match x { 0 => { print_i64(1); } } return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("non-exhaustive `match`"), "got: {err}");
+}
+
+#[test]
+fn an_exhaustive_match_statement_is_accepted() {
+    // Naming every variant is exhaustive even without a `_` arm, so the match is
+    // a valid statement.
+    let src = "enum E { A, B } fn main() -> i64 { let e: E = E::A; let mut n: i64 = 0; \
+               match e { E::A => { n = 1; } E::B => { n = 2; } } return n; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_non_exhaustive_match_nested_in_a_statement_is_rejected() {
+    // The match is inside a block statement, not the statement itself; it is
+    // still non-exhaustive and must be rejected.
+    let err = compile_to_asm(
+        "enum E { A, B } fn main() -> i64 { let e: E = E::A; \
+         if true { match e { E::A => { print_i64(1); } } } return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("non-exhaustive `match`"), "got: {err}");
+}
+
+#[test]
+fn a_non_exhaustive_match_in_a_loop_body_is_rejected() {
+    let err = compile_to_asm(
+        "enum E { A, B } fn main() -> i64 { let e: E = E::A; let mut i: i64 = 0; \
+         while i < 1 { match e { E::A => { print_i64(1); } } i = i + 1; } return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("non-exhaustive `match`"), "got: {err}");
+}
+
+#[test]
 fn argument_setup_folds_a_constant_with_lea() {
     // `fib(n - 1)` must become one `lea`, not `mov; sub; mov`.
     let out = asm("fn f(n: i64) -> i64 { return n; } fn g(n: i64) -> i64 { return f(n - 1); } fn main() -> i64 { return 0; }");

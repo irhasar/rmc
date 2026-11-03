@@ -130,8 +130,10 @@ pub enum Expr {
     /// match a { B => 2 } }` and `match a { A => 1, B => 2 }` desugar to the
     /// same `if` chain, but only the second is exhaustive. The marker, inserted
     /// by `desugar_match` after the whole chain is folded, keeps them apart; it
-    /// is transparent to codegen.
-    MatchBoundary(Block),
+    /// is transparent to codegen. The `bool` records whether some arm is a
+    /// catch-all (`_` or a binding), which makes the match exhaustive
+    /// regardless of the variants it names.
+    MatchBoundary(Block, bool),
     Block(Block),
     /// array[index]
     Index(Box<Expr>, Box<Expr>),

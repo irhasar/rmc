@@ -128,7 +128,7 @@ impl Codegen {
             Expr::Var { ty, .. } | Expr::Field { ty, .. } => Self::array_len_ty(ty),
             Expr::Call { ret_ty, .. } => Self::array_len_ty(ret_ty),
             Expr::Block(b) => b.tail.as_deref().and_then(Self::array_len_of),
-            Expr::MatchBoundary(b) => b.tail.as_deref().and_then(Self::array_len_of),
+            Expr::MatchBoundary(b, _) => b.tail.as_deref().and_then(Self::array_len_of),
             Expr::If(_, then, Some(els)) => Self::array_len_of_tail(then)
                 .or_else(|| Self::array_len_of_tail(els)),
             _ => None,
@@ -866,7 +866,7 @@ impl Codegen {
                 }
             }
             Expr::Block(b) => Self::count_block(b, counts, mem, copied, true, let_tmps),
-            Expr::MatchBoundary(b) => Self::count_block(b, counts, mem, copied, true, let_tmps),
+            Expr::MatchBoundary(b, _) => Self::count_block(b, counts, mem, copied, true, let_tmps),
             Expr::ArrayLit(v, _) => {
                 Self::count_expr(v, counts, mem, copied, true, let_tmps)
             }
@@ -1466,7 +1466,7 @@ impl Codegen {
             // it leaves that address in `%rax`.
             Expr::Call { .. }
             | Expr::Block(_)
-            | Expr::MatchBoundary(_)
+            | Expr::MatchBoundary(_, _)
             | Expr::If(..)
             | Expr::StructLit { .. }
             | Expr::EnumCtor { .. } => {
@@ -1751,7 +1751,7 @@ impl Codegen {
                 if tt == Type::Unit { et } else { tt }
             }
             Expr::Block(b) => self.gen_block(b),
-            Expr::MatchBoundary(b) => self.gen_block(b),
+            Expr::MatchBoundary(b, _) => self.gen_block(b),
             Expr::ArrayLit(v, n) => {
                 // Only meaningful as a `let` initializer; produce the value.
                 let _ = n;
@@ -1999,7 +1999,7 @@ impl Codegen {
                     || els.as_ref().map_or(false, |b| self.block_uses_reg(b, r))
             }
             Expr::Block(b) => self.block_uses_reg(b, r),
-            Expr::MatchBoundary(b) => self.block_uses_reg(b, r),
+            Expr::MatchBoundary(b, _) => self.block_uses_reg(b, r),
             Expr::ArrayList(_) | Expr::MethodCall { .. } => {
                 unreachable!("sema rewrites ArrayList and MethodCall")
             }
@@ -2728,7 +2728,7 @@ impl Codegen {
                     || els.as_ref().map_or(false, Self::block_has_call)
             }
             Expr::Block(b) => Self::block_has_call(b),
-            Expr::MatchBoundary(b) => Self::block_has_call(b),
+            Expr::MatchBoundary(b, _) => Self::block_has_call(b),
             _ => false,
         }
     }
@@ -2747,7 +2747,7 @@ impl Codegen {
     fn clobbers_arg_regs(e: &Expr) -> bool {
         match e {
             Expr::Block(b) => Self::block_clobbers(b),
-            Expr::MatchBoundary(b) => Self::block_clobbers(b),
+            Expr::MatchBoundary(b, _) => Self::block_clobbers(b),
             Expr::If(_, t, els) => {
                 Self::block_clobbers(t)
                     || els.as_ref().map_or(false, |b| Self::block_clobbers(b))
@@ -2777,7 +2777,7 @@ impl Codegen {
     fn value_copies_aggregate(e: &Expr) -> bool {
         match e {
             Expr::Var { ty, .. } | Expr::Field { ty, .. } => ty.is_aggregate(),
-            Expr::Block(_) | Expr::MatchBoundary(_) | Expr::If(..) => Self::clobbers_arg_regs(e),
+            Expr::Block(_) | Expr::MatchBoundary(_, _) | Expr::If(..) => Self::clobbers_arg_regs(e),
             _ => false,
         }
     }

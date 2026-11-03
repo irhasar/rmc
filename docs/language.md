@@ -92,7 +92,7 @@ let a: Opt = Opt::Some(3);
 match a {
     Opt::Some(v) => v,     // binds the payload
     Opt::None => 0,
-    _ => 0,                // rmc does not check exhaustiveness
+    _ => 0,                // a catch-all arm, as in Rust
 }
 ```
 
@@ -202,11 +202,10 @@ Rust panic. Division by zero always traps at the CPU level.
   `match c { Color::Red => a, _ => b }`. An arm pattern is an integer literal
   (optionally negated), an `Enum::Variant`, or `_`. The first equal arm runs and
   `_` matches anything; it is an expression, usable as a statement or a value,
-  and a comma before `}` may be omitted. A non-exhaustive `match` (no `_`) that
-  is used as a value is a type error, exactly as in Rust. rmc does not check
-  exhaustiveness in general, but it does recognise the case where the arms name
-  *every* variant of one enum with no `_`: that match is total, so it may be
-  used as a value too.
+  and a comma before `}` may be omitted. A `match` must be exhaustive, exactly as
+  in Rust: an arm must be `_` (or a binding name), or the arms must name *every*
+  variant of one enum. A non-exhaustive `match` is rejected with an error even
+  when it stands alone as a statement, since rustc rejects it there too.
 - String literals, given type `i64` (a pointer to a `{len, bytes}` record), so
   they can be passed to `print_str`.
 
