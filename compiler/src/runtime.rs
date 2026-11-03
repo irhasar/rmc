@@ -198,58 +198,57 @@ putchar:
 .globl alloc
 .type alloc, @function
 alloc:
-    push %rbp
-    mov %rsp, %rbp
-    push %r12
-    push %r13
-    push %r14
-    push %r15
-    # Round the request up to a whole number of 8-byte words.
+    # Leaf function: the fast paths touch only caller-saved registers, so there
+    # is no frame pointer and no callee-saved save/restore. The one slow path
+    # (mmap) preserves the request size on the stack across the syscall, which
+    # clobbers %rcx and %r11.
     add $7, %rdi
     and $-8, %rdi
-    mov %rdi, %r12           # requested payload size
-    test %r12, %r12
+    mov %rdi, %rsi           # requested payload size
+    test %rsi, %rsi
     jnz .Lalloc_sz_ok
-    mov $8, %r12             # never hand out a zero-size block
+    mov $8, %rsi             # never hand out a zero-size block
 .Lalloc_sz_ok:
-    mov %r12, %r13           # total size including the 8-byte header
-    add $8, %r13
+    mov %rsi, %r9            # total size including the 8-byte header
+    add $8, %r9
 
     # Walk the free list for the first block large enough (first fit).
-    lea __rmc_freelist(%rip), %r14   # pointer to the link we are examining
-    mov (%r14), %rax
+    lea __rmc_freelist(%rip), %r10   # pointer to the link we are examining
+    mov (%r10), %rax
 .Lalloc_scan:
     test %rax, %rax
     jz .Lalloc_from_arena
     mov (%rax), %rcx         # block total size
-    cmp %r13, %rcx
+    cmp %r9, %rcx
     jae .Lalloc_found
-    lea 8(%rax), %r14        # next link lives at block+8
-    mov (%r14), %rax
+    lea 8(%rax), %r10        # next link lives at block+8
+    mov (%r10), %rax
     jmp .Lalloc_scan
 .Lalloc_found:
     mov 8(%rax), %rdx        # successor link
-    mov %rdx, (%r14)
+    mov %rdx, (%r10)
     lea 8(%rax), %rax        # payload
-    jmp .Lalloc_done
+    ret
 
 .Lalloc_from_arena:
     mov __rmc_arena(%rip), %rax
     mov __rmc_arena_end(%rip), %rdx
-    mov %rdx, %rcx
-    sub %rax, %rcx           # bytes left in the current chunk
-    cmp %r13, %rcx
+    mov %rdx, %rcx           # bytes left in the current chunk
+    sub %rax, %rcx
+    cmp %r9, %rcx
     jae .Lalloc_carve
-    # Need a new chunk. Map max(1 MiB, 2 * request), page rounded.
+    # Need a new chunk. Map max(1 MiB, 2 * request), page rounded. The syscall
+    # clobbers %rcx/%r11, so the total size rides the stack and the chunk length
+    # stays in %rsi (preserved).
+    push %r9
     mov $1048576, %rsi
-    lea (%r13,%r13), %rcx
+    lea (%r9,%r9), %rcx
     cmp %rsi, %rcx
     jbe .Lalloc_have_size
     mov %rcx, %rsi
 .Lalloc_have_size:
     add $4095, %rsi
-    and $-4096, %rsi
-    mov %rsi, %r15           # chunk length
+    and $-4096, %rsi         # chunk length
     xor %rdi, %rdi
     mov $3, %rdx             # PROT_READ|PROT_WRITE
     mov $0x22, %r10          # MAP_PRIVATE|MAP_ANONYMOUS
@@ -257,34 +256,22 @@ alloc:
     xor %r9, %r9
     mov $9, %rax             # mmap
     syscall
+    pop %r9
     cmp $-4095, %rax
     jae .Lalloc_fail
     mov %rax, __rmc_arena(%rip)
-    add %r15, %rax
+    add %rsi, %rax
     mov %rax, __rmc_arena_end(%rip)
     mov __rmc_arena(%rip), %rax
 .Lalloc_carve:
-    mov %r13, (%rax)         # header
+    mov %r9, (%rax)          # header
     lea 8(%rax), %rdx
-    add %r13, %rax
+    add %r9, %rax
     mov %rax, __rmc_arena(%rip)
     mov %rdx, %rax           # payload
-    jmp .Lalloc_done
-
-.Lalloc_done:
-    pop %r15
-    pop %r14
-    pop %r13
-    pop %r12
-    leave
     ret
 .Lalloc_fail:
     xor %eax, %eax
-    pop %r15
-    pop %r14
-    pop %r13
-    pop %r12
-    leave
     ret
 .size alloc, .-alloc
 
