@@ -121,16 +121,21 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
   for a non-aggregate `Deref` whose pointer is a reference local, so `*p < 5`
   is one `cmpq $5, (%reg)` and `*p` in a comparison needs no load. An aggregate
   `Deref` is *not* a simple operand: its value is an address, not data.
-- **`trim_dead` drops unreachable instructions, self-moves, and a jump to the
-  next label.** After each function body is generated it removes instructions
-  following an unconditional `jmp`/`ret` up to the next label, `mov %r, %r`, and
-  a `jmp L` whose target label `L:` is the very next line (the fallthrough
-  already reaches it — a function whose last expression is a value jumps to the
+- **`trim_dead` drops unreachable instructions, self-moves, inverse-move pairs,
+  and a jump to the next label.** After each function body is generated it
+  removes instructions following an unconditional `jmp`/`ret` up to the next
+  label, `mov %r, %r`, a `mov` that exactly undoes the previous `mov` (`mov %rax,
+  X` then `mov X, %rax`, the store/reload pair a spill-and-restore emits), and a
+  `jmp L` whose target label `L:` is the very next line (the fallthrough already
+  reaches it — a function whose last expression is a value jumps to the
   epilogue label that directly follows). A `return` inside an expression emits
   `jmp epilogue` then the rest of the expression; the pass is a one-sweep
   fixpoint because removing a line creates neither a label nor a new terminator.
-  It runs on the real body only (the dry spill pass's output is truncated
-  anyway), so it costs nothing at compile time.
+  The inverse-move check compares the full source and destination strings, so it
+  only fires on `mov` (there are no `movq $imm` register forms to confuse it)
+  and never across a label or any other instruction. It runs on the real body
+  only (the dry spill pass's output is truncated anyway), so it costs nothing at
+  compile time.
 - **Inlining is a post-sema AST pass, and slots are frame indices.** Each
   inlined call gets a fresh region of the caller's frame (`base = f.nslots`,
   grown as it goes), the callee's slots are shifted by that base, and a read of
@@ -390,9 +395,11 @@ The README's roadmap lists the intended next steps.
   LLVM: it sees the whole program and can fold a loop into a closed form. The
   `refs` twin did exactly that — LLVM reduced the loop to `acc = 128 * n`, so the
   recorded "rustc 0.83 ms" was its own constant folding and the ratio read 0.18x
-  instead of the honest 0.82x. Every twin with a loop now threads its trip count
+  instead of the honest 0.96x. Every twin with a loop now threads its trip count
   or a term through `std::hint::black_box`. When a rustc twin's time matches its
-  `hello` time, suspect folding before celebrating.
+  `hello` time, suspect folding before celebrating. The `heap` twin uses a bump
+  arena rather than `Box`/`malloc`, so the comparison is the generated pointer
+  code, not rmc's free list versus glibc.
 - **A destination address must survive the value it is assigned.** Assigning a
   whole aggregate to a field or element computes the destination first, and
   `gen_expr(value)` may clobber `%rdi` (a call, or another aggregate copy), so

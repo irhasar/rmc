@@ -450,12 +450,17 @@ impl Codegen {
         let mut head = self.out[..start].to_string();
         let body = self.out[start..].to_string();
         let mut dead = false;
+        // The last live instruction, as (src, dst) for a `mov` and `None` for
+        // anything else. Used to fold a store immediately undone by its reload
+        // (or the reverse) into nothing.
+        let mut prev: Option<(String, String)> = None;
         for raw_line in body.split_inclusive('\n') {
             let line = raw_line.trim_end_matches('\n');
             let is_label = !line.starts_with('\t') && !line.starts_with(' ') && line.ends_with(':');
             let text = line.trim_start();
             if is_label || line.starts_with('.') {
                 dead = false;
+                prev = None;
                 if is_label {
                     // `jmp L` immediately followed by `L:` is a jump to the next
                     // instruction; drop it. The label is written with no leading
@@ -470,13 +475,29 @@ impl Codegen {
                 continue;
             }
             if let Some(rest) = text.strip_prefix("mov ") {
-                // `mov %r, %r` with the same operand twice is a no-op.
                 if let Some((src, dst)) = rest.split_once(',') {
                     let (src, dst) = (src.trim(), dst.trim());
+                    // `mov %r, %r` with the same operand twice is a no-op.
                     if src == dst && src.starts_with('%') {
                         continue;
                     }
+                    // A `mov` whose source and destination are the reverse of
+                    // the previous `mov`'s is a round trip that changes nothing
+                    // (both are adjacent, so nothing clobbers the register in
+                    // between): `mov %rax, X` then `mov X, %rax`. Drop the
+                    // second and keep the first, so a store survives and a
+                    // pointless reload disappears.
+                    if let Some((psrc, pdst)) = &prev {
+                        if src == pdst && dst == psrc {
+                            continue;
+                        }
+                    }
+                    prev = Some((src.to_string(), dst.to_string()));
+                } else {
+                    prev = None;
                 }
+            } else {
+                prev = None;
             }
             if text == "jmp" || text.starts_with("jmp ") || text == "ret" {
                 dead = true;
@@ -1999,7 +2020,7 @@ impl Codegen {
         // register-free operand the comparison needs no stack traffic at all.
         if matches!(op, Eq | Ne | Lt | Le | Gt | Ge) {
             if !self.emit_cmp(a, b) {
-                self.eval_operands(a, b);
+                self.eval_operands(a, b, false);
                 self.line("cmp %rcx, %rax");
             }
             self.line(&format!("{} %al", setcc(op)));
@@ -2015,7 +2036,7 @@ impl Codegen {
             if self.gen_div_const(op, a, b) {
                 return Type::I64;
             }
-            self.eval_operands(a, b);
+            self.eval_operands(a, b, false);
             self.line("cqto");
             self.line("idiv %rcx");
             if matches!(op, Mod) {
@@ -2101,7 +2122,7 @@ impl Codegen {
             }
         }
 
-        self.eval_operands(a, b);
+        self.eval_operands(a, b, matches!(op, Add | Mul | BitAnd | BitOr | BitXor));
         match op {
             Add => {
                 self.line("add %rcx, %rax");
@@ -2347,10 +2368,13 @@ impl Codegen {
         }
     }
 
-    /// Evaluate two operands into the shared convention: left in `%rax`, right
-    /// in `%rcx`. Constants and locals are folded in as immediate or memory
-    /// operands; anything else goes through the stack.
-    fn eval_operands(&mut self, a: &Expr, b: &Expr) {
+    /// Evaluate `a` into `%rax` and `b` into `%rcx`, the operand registers the
+    /// arithmetic and comparison paths read. `commutative` lets the two-operand
+    /// cases skip a register bounce: when the operation does not care about
+    /// order, the spilled operand is placed in `%rcx` directly instead of being
+    /// routed through `%rax`, collapsing two moves into one. Callers must pass
+    /// `false` for anything order-sensitive — comparisons and `sub`/`div`/`mod`.
+    fn eval_operands(&mut self, a: &Expr, b: &Expr, commutative: bool) {
         let ra = self.simple_operand(a);
         let rb = self.simple_operand(b);
         match (ra, rb) {
@@ -2364,15 +2388,25 @@ impl Codegen {
             }
             (Some(la), None) => {
                 self.gen_expr(b);
-                self.line("mov %rax, %rcx");
-                self.line(&format!("mov {la}, %rax"));
+                if commutative {
+                    // `%rax` already holds `b`; the operation reads both
+                    // registers, so `la` only needs to reach `%rcx`.
+                    self.line(&format!("mov {la}, %rcx"));
+                } else {
+                    self.line("mov %rax, %rcx");
+                    self.line(&format!("mov {la}, %rax"));
+                }
             }
             (None, None) => {
                 self.gen_expr(a);
                 self.push_rax();
                 self.gen_expr(b);
-                self.line("mov %rax, %rcx");
-                self.pop_to("%rax");
+                if commutative {
+                    self.pop_to("%rcx");
+                } else {
+                    self.line("mov %rax, %rcx");
+                    self.pop_to("%rax");
+                }
             }
         }
     }
@@ -2383,7 +2417,7 @@ impl Codegen {
         if let Expr::Bin(op, a, b) = cond {
             if let Some(cc) = invert_cc(*op) {
                 if !self.emit_cmp(a, b) {
-                    self.eval_operands(a, b);
+                    self.eval_operands(a, b, false);
                     self.line("cmp %rcx, %rax");
                 }
                 self.line(&format!("{cc} {target}"));
@@ -2395,7 +2429,7 @@ impl Codegen {
             if let Expr::Bin(op, a, b) = inner.as_ref() {
                 if let Some(cc) = setcc_cc(*op) {
                     if !self.emit_cmp(a, b) {
-                        self.eval_operands(a, b);
+                        self.eval_operands(a, b, false);
                         self.line("cmp %rcx, %rax");
                     }
                     self.line(&format!("{cc} {target}"));

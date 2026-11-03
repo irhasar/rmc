@@ -108,6 +108,12 @@ a `return`, or a tail expression).
   operand measured ~19% *slower* on the `mandel` benchmark, because the load
   lands in the instruction's dependency chain, which is why the constant path
   folds immediates only.
+- Commutative spill: when neither operand of a commutative op (`+`, `*`, `&`,
+  `|`, `^`) is a simple operand, `eval_operands` is told the op does not care
+  about order and pops the saved left operand straight into `%rcx` instead of
+  routing it back through `%rax`. The op then reads `%rax` (the right operand's
+  result) and `%rcx`, which is one instruction fewer than the order-preserving
+  path. Comparisons and `-`/`/`/`%` keep the order-preserving path.
 - Division by a constant: `a / d` and `a % d` for a literal `d` become a magic
   multiply plus a shift instead of `idiv`. See below.
 - Comparison folding: `a < b` emits a single `cmp` plus `setcc` when one side is
