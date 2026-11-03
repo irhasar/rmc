@@ -9,6 +9,11 @@ name to a list of argv vectors; each vector is one run, and the case passes
 only if every run matches. This is what catches bugs like a folded comparison
 silently inverting an inequality.
 
+Each case is also recompiled with the optimiser passes turned off in turn
+(`--no-inline`, `--no-licm`, `--no-tco`, and all three), because a bug in a pass
+can hide behind another pass or only appear on the unoptimised path. The Rust
+twin is built once and reused across the five configurations.
+
 Usage: python3 tests/run.py [-v]
 """
 import json
@@ -42,28 +47,36 @@ def extra_flags(name):
     return [], []
 
 
-def compile_and_run(name, argv):
-    """Compile both twins and run them with `argv`.
+def compile_rust(name):
+    """Compile the Rust twin once; the optimizer matrix reuses it.
 
-    Returns `(rmc_result, rust_result)` where each result is
-    `("ok", exit_status, stdout_bytes)` or `("error", message)`. Both are always
-    present so the caller can unpack the pair unconditionally.
+    The Rust binary does not depend on which rmc passes are on, so compiling it
+    per combo would be 5x the rustc cost for no extra coverage.
     """
-    rms = os.path.join(CASES, f"{name}.rms")
     rs = os.path.join(CASES, f"{name}.rs")
-    rmc_bin = os.path.join(OUT, f"{name}.rmc")
     rust_bin = os.path.join(OUT, f"{name}.rust")
-
-    rmc_flags, rustc_flags = extra_flags(name)
-    p = subprocess.run([RMC] + rmc_flags + [rms, "-o", rmc_bin], capture_output=True)
+    _, rustc_flags = extra_flags(name)
+    p = subprocess.run(["rustc", "-O"] + rustc_flags + [rs, "-o", rust_bin],
+                       capture_output=True)
     if p.returncode != 0:
-        err = ("error", f"rmc failed:\n{p.stderr.decode(errors='replace')}")
-        return err, ("error", "not run")
-    p = subprocess.run(["rustc", "-O"] + rustc_flags + [rs, "-o", rust_bin], capture_output=True)
-    if p.returncode != 0:
-        err = ("error", f"rustc failed:\n{p.stderr.decode(errors='replace')}")
-        return ("error", "not run"), err
+        return None, f"rustc failed:\n{p.stderr.decode(errors='replace')}"
+    return rust_bin, None
 
+
+def compile_rmc(name, optimizer_flags):
+    rms = os.path.join(CASES, f"{name}.rms")
+    rmc_bin = os.path.join(OUT, f"{name}.rmc")
+    rmc_flags, _ = extra_flags(name)
+    p = subprocess.run([RMC] + rmc_flags + list(optimizer_flags) + [rms, "-o", rmc_bin],
+                       capture_output=True)
+    if p.returncode != 0:
+        return None, f"rmc failed:\n{p.stderr.decode(errors='replace')}"
+    return rmc_bin, None
+
+
+def run_both(rmc_bin, rust_bin, argv):
+    """Run both binaries with `argv` and return `(rmc, rust)` results, each
+    `("ok", exit_status, stdout_bytes)`."""
     def run(binary):
         p = subprocess.run([binary] + argv, capture_output=True)
         return ("ok", p.returncode, p.stdout)
@@ -135,6 +148,19 @@ def main():
         print("no test cases found", file=sys.stderr)
         return 1
 
+    # The optimiser passes are off by default in the Rust twin (rustc runs them
+    # all), so a bug that only shows with one pass disabled would otherwise go
+    # unnoticed. Each combo recompiles the case with rmc and reruns both
+    # binaries; the Rust twin is built once. `all-off` is the strongest check -
+    # every pass off at once is the compiler's plainest code path.
+    combos = [
+        ("", []),
+        (" [no-inline]", ["--no-inline"]),
+        (" [no-licm]", ["--no-licm"]),
+        (" [no-tco]", ["--no-tco"]),
+        (" [all-off]", ["--no-inline", "--no-licm", "--no-tco"]),
+    ]
+
     failures = 0
     for name in names:
         if not os.path.exists(os.path.join(CASES, f"{name}.rs")):
@@ -142,23 +168,25 @@ def main():
             failures += 1
             continue
 
-        for argv in args.get(name, [[]]):
-            rmc_res, rust_res = compile_and_run(name, argv)
-            for which, res in (("rmc", rmc_res), ("rustc", rust_res)):
-                if res[0] == "error" and res[1] != "not run":
-                    print(f"FAIL {name} {argv}: {which}: {res[1]}")
-                    failures += 1
-                    break
-                if res[0] == "error":
-                    print(f"FAIL {name} {argv}: {which} did not run ({rmc_res if which == 'rustc' else rust_res})")
-                    failures += 1
-                    break
-            else:
+        rust_bin, err = compile_rust(name)
+        if err:
+            print(f"FAIL {name}: {err}")
+            failures += 1
+            continue
+
+        for label, opt_flags in combos:
+            rmc_bin, err = compile_rmc(name, opt_flags)
+            if err:
+                print(f"FAIL {name}{label}: {err}")
+                failures += 1
+                continue
+            for argv in args.get(name, [[]]):
+                rmc_res, rust_res = run_both(rmc_bin, rust_bin, argv)
                 _, rmc_status, rmc_out = rmc_res
                 _, rust_status, rust_out = rust_res
                 if rmc_out != rust_out or rmc_status != rust_status:
                     failures += 1
-                    print(f"FAIL {name} {argv}")
+                    print(f"FAIL {name}{label} {argv}")
                     print(f"  exit rmc={rmc_status} rustc={rust_status}")
                     rmc_lines = rmc_out.split(b"\n")
                     rust_lines = rust_out.split(b"\n")
@@ -171,13 +199,13 @@ def main():
                             print(f"    rustc = {b!r}")
                             break
                 elif verbose:
-                    print(f"ok   {name} {argv}")
+                    print(f"ok   {name}{label} {argv}")
 
     failures += check_bounds_traps()
 
     total = len(names)
     if failures == 0:
-        print(f"all {total} cases match rustc")
+        print(f"all {total} cases match rustc in {len(combos)} optimiser configurations")
     else:
         print(f"{failures} failing run(s) across {total} cases")
     return 1 if failures else 0
