@@ -155,8 +155,12 @@ aggregate leaves it uninitialised as a whole, so reading it is still an error
 immutable: assigning it (rustc's `E0384`), assigning a field or element of it
 (`E0594`), or taking `&mut` of it (`E0596`) is rejected. Add `mut` (or `mut x:
 T` on a parameter) to write it. A `&mut T` reference is writable through without
-declaring the reference binding itself `mut`, exactly as in Rust. `for` bounds
-are evaluated once, before the loop; `continue` still runs the increment.
+declaring the reference binding itself `mut`, exactly as in Rust. Parameter
+names must be unique, and `main` takes no arguments. Constant arithmetic that
+would trap — division or remainder by zero, `i64` overflow, or a shift by 64 or
+more — is a compile error, matching rustc; variable operands are still checked
+at run time only when `--overflow-checks` is on. `for` bounds are evaluated
+once, before the loop; `continue` still runs the increment.
 
 ## Overflow
 

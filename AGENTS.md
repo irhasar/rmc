@@ -566,6 +566,17 @@ The checks, all in `sema.rs`:
   string's address, `E0369`) and cannot be passed where an `i64` is expected
   (`print_str(42)` used to compile and then segfault, dereferencing the integer
   as a pointer). `print_str` takes `Type::Str`.
+- **Parameter names (`E0415`) and `main` (`E0580`).** A function's parameters
+  must be uniquely named; `check_fn` rejects a duplicate (rmc used to bind both
+  to one slot). `main` takes no parameters, checked in `analyze`.
+- **Constant arithmetic (`E0080`-like).** `const_binop` folds an operator whose
+  *both* operands are literals (`const_i64` sees through unary `-`) and rejects
+  the cases rustc denies: division/remainder by zero, `MIN / -1`, `+`/`-`/`*`
+  overflow, and a shift amount outside `0..64`. Under the overflow checks rmc
+  emits each of these traps, so an accepted one would fault at run time (rmc
+  used to emit an `idiv` that raised SIGFPE). Only literal operands are folded —
+  rmc does not propagate constants through locals, so `let d = 0; 1 / d` is not
+  diagnosed, matching the Scope note that variable values are unchecked.
 
 `not_on_int` remains an *over*-rejection (rmc rejects a program rustc accepts),
 the safe direction; it is listed by the audit harness but is not a soundness bug.
