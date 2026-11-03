@@ -39,16 +39,26 @@
 //!   method) — `x` is the only state the transform has to track;
 //! * have exactly two statements: a base-case `if cond { return guard; }` and a
 //!   `return f(g) op f(h)` with both operands calls to itself;
-//! * keep `cond`, `guard`, `g` and `h` free of calls, so evaluating them a
-//!   different number of times cannot change behaviour. rmc has no side-effecting
-//!   user function, but a `print` nested in an argument would otherwise be
-//!   duplicated by the loop, so the whole shape is required to be pure
-//!   arithmetic.
+//! * keep `cond`, `guard`, `g` and `h` free of calls and `return`s, so evaluating
+//!   them a different number of times cannot change behaviour. rmc has no
+//!   side-effecting user function, but a `print` nested in an argument would
+//!   otherwise be duplicated by the loop, and a `return` nested in an argument
+//!   would leave the transformed loop instead of the recursive frame that wrote
+//!   it, dropping the accumulator.
+//!
+//! Reassociation is only exact for wrapping arithmetic, so the pass is skipped
+//! entirely under `--overflow-checks`: the checked trap fires on the first
+//! overflowing intermediate, and the loop adds terms in a different order than
+//! the recursion, so it would trap on a sum that completes without overflow.
 
 use crate::ast::*;
 
-/// Rewrite every function that matches the right-spine shape.
-pub fn run(prog: &mut Program) {
+/// Rewrite every function that matches the right-spine shape. `overflow_checks`
+/// disables the pass, because reassociating checked arithmetic is not exact.
+pub fn run(prog: &mut Program, overflow_checks: bool) {
+    if overflow_checks {
+        return;
+    }
     for f in &mut prog.fns {
         if let Some(body) = try_transform(f) {
             f.body = body;
@@ -90,13 +100,15 @@ fn try_transform(f: &FnDef) -> Option<Block> {
         _ => return None,
     };
 
-    // Every piece must be pure, or the loop would duplicate a side effect.
-    if [&cond, &guard, &g, &h].iter().any(|e| has_call(e)) {
+    // Every piece must be pure and must not leave the function early, or the
+    // loop would duplicate a side effect or exit without adding the accumulator.
+    if [&cond, &guard, &g, &h].iter().any(|e| has_call(e) || has_return(e)) {
         return None;
     }
 
     let acc_slot = f.nslots;
-    let acc = Expr::Var { name: "__tco_acc".into(), slot: acc_slot, ty: Type::I64 };
+    let acc_name = format!("\u{0}tco{acc_slot}");
+    let acc = Expr::Var { name: acc_name.clone(), slot: acc_slot, ty: Type::I64 };
     let x = Expr::Var { name: pname.clone(), slot: pslot, ty: Type::I64 };
     let identity = if op == BinOp::Add { Expr::Int(0) } else { Expr::Int(1) };
 
@@ -119,7 +131,7 @@ fn try_transform(f: &FnDef) -> Option<Block> {
     Some(Block {
         stmts: vec![
             Stmt::Let {
-                name: "__tco_acc".into(),
+                name: acc_name,
                 ty: Some(Type::I64),
                 init: Some(identity),
                 slot: acc_slot,
@@ -185,6 +197,53 @@ fn stmt_has_call(s: &Stmt) -> bool {
             has_call(start) || has_call(end) || body.stmts.iter().any(stmt_has_call)
         }
         Stmt::Return(v) => v.as_ref().map_or(false, has_call),
+        Stmt::Break | Stmt::Continue => false,
+    }
+}
+
+/// True when `e` contains a `return`, which would leave the function from inside
+/// the transformed loop rather than from the recursive frame that wrote it.
+fn has_return(e: &Expr) -> bool {
+    match e {
+        Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::Call { .. } => false,
+        Expr::Bin(_, a, b) => has_return(a) || has_return(b),
+        Expr::Un(_, a) | Expr::Cast(a, _) | Expr::AddrOf { expr: a, .. } | Expr::Deref { expr: a, .. } => {
+            has_return(a)
+        }
+        Expr::If(c, t, e) => {
+            has_return(c)
+                || block_has_return(t)
+                || e.as_ref().map_or(false, |b| block_has_return(b))
+        }
+        Expr::Block(b) => block_has_return(b),
+        Expr::Index(a, b) => has_return(a) || has_return(b),
+        Expr::Field { base, .. } => has_return(base),
+        Expr::StructLit { fields, .. } => fields.iter().any(|fi| has_return(&fi.value)),
+        Expr::ArrayLit(v, _) => has_return(v),
+        Expr::ArrayList(v) => v.iter().any(has_return),
+        Expr::MethodCall { recv, args, .. } => has_return(recv) || args.iter().any(has_return),
+        Expr::EnumVariant { .. } => false,
+        Expr::EnumCtor { args, .. } => args.iter().any(has_return),
+        Expr::VariantTest { scrutinee, .. } => has_return(scrutinee),
+        Expr::EnumPayload { recv, .. } => has_return(recv),
+    }
+}
+
+fn block_has_return(b: &Block) -> bool {
+    b.stmts.iter().any(stmt_has_return) || b.tail.as_deref().map_or(false, has_return)
+}
+
+fn stmt_has_return(s: &Stmt) -> bool {
+    match s {
+        Stmt::Return(_) => true,
+        Stmt::Let { init, .. } => init.as_ref().map_or(false, has_return),
+        Stmt::Assign { target, value } => has_return(target) || has_return(value),
+        Stmt::Expr(e) => has_return(e),
+        Stmt::While(c, b) => has_return(c) || block_has_return(b),
+        Stmt::Loop(b) => block_has_return(b),
+        Stmt::For { start, end, body, .. } => {
+            has_return(start) || has_return(end) || block_has_return(body)
+        }
         Stmt::Break | Stmt::Continue => false,
     }
 }

@@ -53,8 +53,9 @@ fn struct_fields_are_laid_out_in_order() {
 fn field_write_targets_the_right_slot() {
     let out = asm("struct P { x: i64, y: i64 } fn main() -> i64 { let mut p: P = P { x: 1, y: 2 }; p.y = 9; return p.y; }");
     // The read of `p.y` and the write `p.y = 9` must name the same frame slot.
-    // The write folds the constant straight into the store, so it is
-    // `mov $9, <off>(%rbp)` rather than a `%rax` round trip.
+    // The write folds the constant straight into a sized `movq`, so it is
+    // `movq $9, <off>(%rbp)` rather than a `%rax` round trip. The size matters:
+    // an unsized `mov` would store 32 bits and leave the high half stale.
     let read: i32 = out
         .lines()
         .find_map(|l| {
@@ -64,7 +65,7 @@ fn field_write_targets_the_right_slot() {
         })
         .expect("a frame read of p.y");
     let write: i32 = out
-        .split("mov $9, ")
+        .split("movq $9, ")
         .nth(1)
         .and_then(|s| s.split("(%rbp)").next())
         .expect("the field store")
@@ -921,6 +922,46 @@ fn the_self_recursion_pass_leaves_a_non_associative_recursion_alone() {
 }
 
 #[test]
+fn the_self_recursion_pass_leaves_a_return_in_an_argument_alone() {
+    // A `return` inside the right argument would leave the transformed loop
+    // instead of the recursive frame, dropping the accumulator, so the pass
+    // must decline the shape and keep both calls.
+    let out = asm(
+        "fn f(n: i64) -> i64 { if n < 2 { return n; } \
+         return f({ if n == 3 { return 4; } n - 1 }) + f(n - 2); } \
+         fn main() -> i64 { return f(5); }",
+    );
+    let f = &out[out.find("f:").unwrap()..];
+    let f = &f[..f.find(".size f").unwrap()];
+    assert_eq!(f.matches("call f").count(), 2, "both calls kept:\n{f}");
+}
+
+#[test]
+fn overflow_checks_disable_the_self_recursion_pass() {
+    // Reassociation is only exact for wrapping arithmetic: with checks on, the
+    // loop would trap on an intermediate the recursion never forms. The pass
+    // must be off, leaving both calls.
+    let out = compile_to_asm(
+        "fn fib(n: i64) -> i64 { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); } \
+         fn main() -> i64 { return fib(5); }",
+        &CompileOptions { overflow_checks: true, ..Default::default() },
+    )
+    .unwrap();
+    let fib = &out[out.find("fib:").unwrap()..];
+    let fib = &fib[..fib.find(".size fib").unwrap()];
+    assert_eq!(fib.matches("call fib").count(), 2, "both calls kept under checks:\n{fib}");
+}
+
+#[test]
+fn the_accumulator_has_an_unspellable_name() {
+    // Source cannot spell a leading NUL, so a generated temporary can never
+    // collide with a user identifier.
+    let out = asm("fn fib(n: i64) -> i64 { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); } \
+                   fn main() -> i64 { return fib(5); }");
+    assert!(!out.contains("__tco_acc"), "no spellable temporary name in:\n{out}");
+}
+
+#[test]
 fn a_reference_to_a_promoted_local_forces_it_into_memory() {
     // `&x` needs an address, so `x` cannot be held in a register: its frame
     // slot must stay current or the `lea` would read a stale word.
@@ -1005,13 +1046,28 @@ fn a_nested_reference_dereferences_twice() {
 }
 
 #[test]
+fn an_immediate_store_through_a_reference_is_64_bit() {
+    // `mov $42, (%rcx)` would be a 32-bit store under `as`'s default and leave
+    // the destination's high four bytes stale, so the store must be `movq`.
+    let out = asm("fn main() -> i64 { let mut x: i64 = 1; let p: &mut i64 = &mut x; *p = 42; return x; }");
+    assert!(
+        out.lines().any(|l| l.trim_start().starts_with("movq $42, (")),
+        "immediate indirect store is sized in:\n{out}"
+    );
+    assert!(
+        !out.lines().any(|l| l.trim_start().starts_with("mov $42, (")),
+        "unsized immediate store in:\n{out}"
+    );
+}
+
+#[test]
 fn a_write_through_a_dereference_stores_to_the_referent() {
     let out = asm("fn main() -> i64 { let mut x: i64 = 1; let p: &i64 = &x; *p = 42; return x; }");
     // The store's target address is the pointer value, so the store is indirect
     // through a register rather than into a frame slot; the constant value folds
     // straight into it.
     assert!(
-        out.lines().any(|l| l.trim_start().starts_with("mov $42, (")),
+        out.lines().any(|l| l.trim_start().starts_with("movq $42, (")),
         "indirect store in:\n{out}"
     );
 }
@@ -1023,7 +1079,7 @@ fn a_write_through_a_reference_to_a_struct_field_stores_to_the_field() {
          fn main() -> i64 { let mut p: P = P { x: 1, y: 2 }; let r: &i64 = &p.y; *r = 9; return p.y; }",
     );
     assert!(
-        out.lines().any(|l| l.trim_start().starts_with("mov $9, (")),
+        out.lines().any(|l| l.trim_start().starts_with("movq $9, (")),
         "indirect store in:\n{out}"
     );
 }
@@ -1375,6 +1431,41 @@ fn no_licm_option_keeps_the_loop_work() {
                while i < 10 { s = s + a * a; i = i + 1; } return s; }";
     assert!(!loop_body(&asm(src)).contains("imul"), "the default hoists");
     assert!(loop_body(&asm_no_licm(src)).contains("imul"), "--no-licm does not");
+}
+
+#[test]
+fn a_loop_condition_that_mutates_blocks_hoisting() {
+    // The condition `tick(&mut x)` writes `x` through a reference, so `x * x` is
+    // not invariant: the condition runs before every iteration.
+    let src = "fn tick(x: &mut i64) -> bool { *x = *x + 1; return *x < 4; } \
+               fn main() -> i64 { let mut x: i64 = 0; let mut s: i64 = 0; \
+               while tick(&mut x) { s = s + x * x; } return s; }";
+    let with = loop_body(&asm(src));
+    assert!(with.contains("imul"), "a mutating condition blocks hoisting:\n{with}");
+}
+
+#[test]
+fn a_reference_to_a_reassigned_struct_blocks_hoisting() {
+    // `p = P { a: 2 }` rewrites the words `r.a` reads even though the loop never
+    // assigns `r`'s own slot, so the field read must stay in the loop.
+    let src = "struct P { a: i64 } \
+               fn main() -> i64 { let mut p: P = P { a: 1 }; let r: &P = &p; \
+               let mut s: i64 = 0; let mut i: i64 = 0; \
+               while i < 3 { s = s + r.a * r.a; p = P { a: 2 }; i = i + 1; } return s; }";
+    let with = loop_body(&asm(src));
+    assert!(with.contains("imul"), "a read through a reassigned struct stays in the loop:\n{with}");
+}
+
+#[test]
+fn a_call_in_an_assignment_target_blocks_hoisting() {
+    // `a[next(&mut x)] = 0` calls a function that writes `x` through a reference,
+    // so `x * x` is not invariant even though no statement assigns `x` directly.
+    let src = "fn next(x: &mut i64) -> i64 { *x = *x + 1; return 0; } \
+               fn main() -> i64 { let mut x: i64 = 0; let mut a: [i64; 4] = [0, 0, 0, 0]; \
+               let mut s: i64 = 0; let mut i: i64 = 0; \
+               while i < 3 { s = s + x * x; a[next(&mut x)] = 0; i = i + 1; } return s; }";
+    let with = loop_body(&asm(src));
+    assert!(with.contains("imul"), "a call in the target blocks hoisting:\n{with}");
 }
 
 #[test]
