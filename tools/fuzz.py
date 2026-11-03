@@ -456,6 +456,43 @@ def reject_corpus():
             "fn main() -> i64 { let x: i64 = 42; print_str(x); return 0; }\n",
             "fn main() { let s: &str = 42; println!(\"{}\", s); }\n",
         ),
+        # Writing through a place whose root binding is not `mut`. The first
+        # mutability check only looked at a bare `Var` target, so these all
+        # compiled. rustc rejects each (E0594/E0596).
+        "field_assign_immutable": (
+            "struct P { x: i64, y: i64 }\n"
+            "fn main() -> i64 { let p: P = P { x: 1, y: 2 }; p.x = 2; return p.x; }\n",
+            "struct P { x: i64, y: i64 }\n"
+            "fn main() -> i64 { let p = P { x: 1, y: 2 }; p.x = 2; p.x }\n",
+        ),
+        "elem_assign_immutable": (
+            "fn main() -> i64 { let a: [i64; 2] = [1, 2]; a[0] = 5; return a[0]; }\n",
+            "fn main() -> i64 { let a = [1i64, 2]; a[0] = 5; a[0] }\n",
+        ),
+        "compound_field_immutable": (
+            "struct P { x: i64, y: i64 }\n"
+            "fn main() -> i64 { let p: P = P { x: 1, y: 2 }; p.x += 1; return p.x; }\n",
+            "struct P { x: i64, y: i64 }\n"
+            "fn main() -> i64 { let p = P { x: 1, y: 2 }; p.x += 1; p.x }\n",
+        ),
+        "borrow_immutable_as_mut": (
+            "fn main() -> i64 { let x: i64 = 1; let r: &mut i64 = &mut x; return 0; }\n",
+            "fn main() { let x = 1i64; let r = &mut x; let _ = r; }\n",
+        ),
+        "write_through_shared_ref": (
+            "fn main() -> i64 { let x: i64 = 1; let r: &i64 = &x; *r = 5; return 0; }\n",
+            "fn main() { let x = 1i64; let r = &x; *r = 5; }\n",
+        ),
+        "shared_ref_field_write": (
+            "struct P { x: i64, y: i64 }\n"
+            "fn main() -> i64 { let p: P = P { x: 1, y: 2 }; let r: &P = &p; r.x = 5; return 0; }\n",
+            "struct P { x: i64, y: i64 }\n"
+            "fn main() -> i64 { let p = P { x: 1, y: 2 }; let r = &p; r.x = 5; }\n",
+        ),
+        "partial_init_then_read": (
+            "fn main() -> i64 { let a: [i64; 2]; a[0] = 1; return a[0]; }\n",
+            "fn main() -> i64 { let a: [i64; 2]; a[0] = 1; a[0] }\n",
+        ),
     }
 
 

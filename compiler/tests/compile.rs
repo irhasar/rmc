@@ -390,6 +390,89 @@ fn a_mut_binding_and_a_mut_parameter_are_assignable() {
 }
 
 #[test]
+fn assigning_to_a_field_of_an_immutable_binding_is_rejected() {
+    // The mutability check must reach a field or element, not just a bare
+    // variable: rustc rejects `p.x = 2` when `p` is not `mut` (E0594).
+    let err = compile_to_asm(
+        "struct P { x: i64, y: i64 } \
+         fn main() -> i64 { let p: P = P { x: 1, y: 2 }; p.x = 2; return p.x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("immutable variable `p`"), "got: {err}");
+}
+
+#[test]
+fn assigning_to_an_element_of_an_immutable_binding_is_rejected() {
+    let err = compile_to_asm(
+        "fn main() -> i64 { let a: [i64; 2] = [1, 2]; a[0] = 5; return a[0]; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("immutable variable `a`"), "got: {err}");
+}
+
+#[test]
+fn assigning_through_a_shared_reference_is_rejected() {
+    // `*r = ..` where `r: &i64` is E0594; only a `&mut` reference is writable.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let x: i64 = 1; let r: &i64 = &x; *r = 5; return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("shared reference"), "got: {err}");
+}
+
+#[test]
+fn borrowing_an_immutable_binding_as_mut_is_rejected() {
+    // `&mut x` on a `let` without `mut` is E0596.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let x: i64 = 1; let r: &mut i64 = &mut x; return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("immutable variable `x`"), "got: {err}");
+}
+
+#[test]
+fn writing_through_a_mut_reference_needs_no_mut_binding() {
+    // The reference binding itself may be immutable: `r.x = ..` where
+    // `r: &mut T` is writable without `let mut r`, matching rustc.
+    assert!(compile_to_asm(
+        "struct P { x: i64, y: i64 } \
+         fn main() -> i64 { let mut p: P = P { x: 1, y: 2 }; \
+         let r: &mut P = &mut p; r.x = 9; return r.x; }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_mut_self_method_can_write_its_receiver() {
+    // `self` is an immutable binding of type `&mut Self` (or `Self`), and the
+    // write must stay legal, or every `&mut self` setter breaks.
+    assert!(compile_to_asm(
+        "struct C { n: i64 } \
+         impl C { fn bump(&mut self) -> i64 { self.n = self.n + 1; return self.n; } } \
+         fn main() -> i64 { let mut c: C = C { n: 0 }; return c.bump(); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_partially_initialized_aggregate_is_not_readable() {
+    // Writing one element of a `let a: [i64; 2];` leaves the binding as a whole
+    // uninitialized, so reading it is E0381 (rustc: "partially assigned").
+    let err = compile_to_asm(
+        "fn main() -> i64 { let a: [i64; 2]; a[0] = 1; return a[0]; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("uninitialized variable `a`"), "got: {err}");
+}
+
+#[test]
 fn reading_an_uninitialized_binding_is_rejected() {
     // `let x: i64;` with no initializer and no write, then read: rustc rejects
     // it with E0381.
@@ -1307,7 +1390,7 @@ fn an_immediate_store_through_a_reference_is_64_bit() {
 
 #[test]
 fn a_write_through_a_dereference_stores_to_the_referent() {
-    let out = asm("fn main() -> i64 { let mut x: i64 = 1; let p: &i64 = &x; *p = 42; return x; }");
+    let out = asm("fn main() -> i64 { let mut x: i64 = 1; let p: &mut i64 = &mut x; *p = 42; return x; }");
     // The store's target address is the pointer value, so the store is indirect
     // through a register rather than into a frame slot; the constant value folds
     // straight into it.
@@ -1321,7 +1404,7 @@ fn a_write_through_a_dereference_stores_to_the_referent() {
 fn a_write_through_a_reference_to_a_struct_field_stores_to_the_field() {
     let out = asm(
         "struct P { x: i64, y: i64 } \
-         fn main() -> i64 { let mut p: P = P { x: 1, y: 2 }; let r: &i64 = &p.y; *r = 9; return p.y; }",
+         fn main() -> i64 { let mut p: P = P { x: 1, y: 2 }; let r: &mut i64 = &mut p.y; *r = 9; return p.y; }",
     );
     assert!(
         out.lines().any(|l| l.trim_start().starts_with("movq $9, (")),
