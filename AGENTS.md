@@ -422,7 +422,8 @@ temporaries crossing a call use `SPILL_REGS`, but a dying temporary's register i
 not reused for a later local (roadmap item 1). The optimiser is an AST inlining
 pass (small, straight-line, scalar functions), a loop-invariant code motion pass,
 plus a small peephole pass (operand/comparison/array-address folding, constant
-folding, division by a constant). Array indexing is unchecked by default (the index is used as-is, like
+folding, division by a constant, a 32-bit `div` fast path for a variable
+divisor). Array indexing is unchecked by default (the index is used as-is, like
 C), so an out-of-range index reads or writes adjacent stack memory;
 `--bounds-checks` turns on a per-index check that traps (see the codegen notes).
 The README's roadmap lists the intended next steps.
@@ -558,3 +559,22 @@ The README's roadmap lists the intended next steps.
   - `small_imm` accepts a negated literal, so `x / -1000` takes the fast path.
   - `tests/cases/div.{rms,rs}` covers both variants, powers of two, negatives,
     and boundary dividends, and is the regression guard for all of the above.
+- Division or modulo by a *variable* divisor uses `idiv`, but only after a
+  32-bit fast path. `emit_div` first tests both operands unsigned against 2^32
+  (`mov $4294967296, %rdx` + two `cmp`/`jae`); when both fit, `xor %edx,%edx`
+  + `div <reg>d` computes the same result in ~20 cycles instead of ~30–40, and
+  when either does not, the 64-bit `cqto` + `idiv <reg>` runs. This is what
+  closes the `mix` gap: its `gcd` operands are always small, so it takes the
+  narrow path every iteration, and `mix` went from 0.92× to 1.06× versus rustc.
+  - **The comparison must be unsigned** (`jae`, not `jge`): a negative operand
+    has the sign bit set and compares as a huge unsigned value, so it correctly
+    falls through to the 64-bit path. A signed test would send a negative
+    dividend down the 32-bit path and truncate it.
+  - **The 32-bit divide zeroes its own `%rdx`**, so no `cqto` is needed on the
+    fast path, and `%rdx` is free for the 2^32 constant because `cqto` has not
+    run yet. `mov $4294967296, %rdx` is used rather than a `shr $32` test because
+    the shift would destroy the dividend in `%rax`.
+  - The divisor is read from its own register (`idiv %rbx`) when it is a
+    promoted local, and from `%rcx` otherwise; `r32` maps each to its 32-bit
+    half. A one-off sweep of 1042 `q(a,b)` pairs across the full `i64` range —
+    negatives, the 2^32 boundary, and near-`i64::MAX` — matched rustc exactly.

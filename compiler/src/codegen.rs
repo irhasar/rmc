@@ -2132,20 +2132,12 @@ impl Codegen {
             if let Some(rb) = self.simple_operand(b) {
                 if rb.starts_with('%') {
                     self.gen_expr(a);
-                    self.line("cqto");
-                    self.line(&format!("idiv {rb}"));
-                    if matches!(op, Mod) {
-                        self.line("mov %rdx, %rax");
-                    }
+                    self.emit_div(op, &rb, r32(&rb));
                     return Type::I64;
                 }
             }
             self.eval_operands(a, b, false);
-            self.line("cqto");
-            self.line("idiv %rcx");
-            if matches!(op, Mod) {
-                self.line("mov %rdx, %rax");
-            }
+            self.emit_div(op, "%rcx", "%ecx");
             return Type::I64;
         }
 
@@ -2274,7 +2266,44 @@ impl Codegen {
         }
     }
 
-    /// Emit `a / d` or `a % d` for a literal divisor `d` using a multiply and a
+    /// Emit a variable `Div`/`Mod` with the dividend in `%rax` and the divisor
+    /// in `rd` (whose 32-bit half is `rd32`), leaving the result in `%rax`.
+    ///
+    /// A 64-bit `idiv` is ~30–40 cycles; the 32-bit `div`/`idiv` is ~20 and
+    /// compiles to the same microcode as the 64-bit form on the cores this was
+    /// tuned on, so when both operands fit in a 32-bit value the narrower
+    /// instruction is simply cheaper. The operands are compared unsigned
+    /// against 2^32 (`cmp`/`jae`, not a signed `jl`) so the test is exact: a
+    /// negative dividend or divisor falls through to the 64-bit path, and no
+    /// signed comparison trick is needed. `%rdx` is free — `cqto` has not run
+    /// yet and a 32-bit `div` zeroes its own `%rdx` — and the dividend and
+    /// divisor are still in `%rax`/`rd` when the fast path is taken.
+    fn emit_div(&mut self, op: BinOp, rd: &str, rd32: &str) {
+        let slow = self.new_label();
+        let done = self.new_label();
+        self.line("mov $4294967296, %rdx"); // 2^32
+        self.line("cmp %rdx, %rax");
+        self.line(&format!("jae {slow}"));
+        self.line(&format!("cmp %rdx, {rd}"));
+        self.line(&format!("jae {slow}"));
+        // Both fit in 32 bits: the 32-bit divide is exact (the dividend's high
+        // half is zero, so its `%rdx` contribution is zero).
+        self.line("xor %edx, %edx");
+        self.line(&format!("div {rd32}"));
+        if matches!(op, BinOp::Mod) {
+            self.line("mov %rdx, %rax");
+        }
+        self.line(&format!("jmp {done}"));
+        self.raw(&format!("{slow}:"));
+        self.line("cqto");
+        self.line(&format!("idiv {rd}"));
+        if matches!(op, BinOp::Mod) {
+            self.line("mov %rdx, %rax");
+        }
+        self.raw(&format!("{done}:"));
+    }
+
+    /// Division/modulo by a constant becomes a multiply, an arithmetic
     /// shift instead of `idiv`. Returns `false` for a variable divisor, a zero
     /// divisor, or a non-`i64` literal, so the caller falls back to `idiv`.
     ///
@@ -2746,6 +2775,28 @@ fn setcc(op: BinOp) -> &'static str {
         BinOp::Gt => "setg",
         BinOp::Ge => "setge",
         _ => unreachable!(),
+    }
+}
+
+/// The 32-bit half of a 64-bit register mnemonic, for the `div`/`idiv` fast
+/// path in [`Codegen::emit_div`].
+fn r32(r: &str) -> &'static str {
+    match r {
+        "%rax" => "%eax",
+        "%rbx" => "%ebx",
+        "%rcx" => "%ecx",
+        "%rdx" => "%edx",
+        "%rsi" => "%esi",
+        "%rdi" => "%edi",
+        "%r8" => "%r8d",
+        "%r9" => "%r9d",
+        "%r10" => "%r10d",
+        "%r11" => "%r11d",
+        "%r12" => "%r12d",
+        "%r13" => "%r13d",
+        "%r14" => "%r14d",
+        "%r15" => "%r15d",
+        _ => unreachable!("no 32-bit form of {r}"),
     }
 }
 
