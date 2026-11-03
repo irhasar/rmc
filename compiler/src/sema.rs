@@ -162,6 +162,16 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
             },
         );
     }
+    // `main` is the entry point: it takes no parameters (rustc E0580). rmc
+    // additionally lets it return `i64`, which becomes the exit status.
+    if let Some(main) = prog.fns.iter().find(|f| f.name == "main") {
+        if !main.params.is_empty() {
+            return Err(format!(
+                "`main` takes no parameters, but {} were declared",
+                main.params.len()
+            ));
+        }
+    }
 
     let mut sema = Sema {
         sigs,
@@ -374,6 +384,15 @@ impl Sema {
     }
 
     fn check_fn(&mut self, f: &mut FnDef) -> Result<(), String> {
+        // A parameter name must be unique within its function (rustc E0415).
+        // `self` is inserted first, so this also rejects a second `self`.
+        for (i, (name, _)) in f.params.iter().enumerate() {
+            if f.params[..i].iter().any(|(n, _)| n == name) {
+                return Err(format!(
+                    "identifier `{name}` is bound more than once in this parameter list"
+                ));
+            }
+        }
         self.next_slot = 0;
         self.loop_depth = 0;
         self.ret_ty = self.resolve_ty(&f.ret)?;
@@ -841,6 +860,9 @@ impl Sema {
                         if ta != Type::I64 || tb != Type::I64 {
                             return Err(format!("arithmetic expects `i64` operands, found {ta:?} and {tb:?}"));
                         }
+                        if let (Some(x), Some(y)) = (const_i64(a), const_i64(b)) {
+                            const_binop(*op, x, y)?;
+                        }
                         Ok(Type::I64)
                     }
                     Eq | Ne => {
@@ -871,6 +893,9 @@ impl Sema {
                     BitAnd | BitOr | BitXor | Shl | Shr => {
                         if ta != Type::I64 || tb != Type::I64 {
                             return Err(format!("bitwise operator expects `i64` operands, found {ta:?} and {tb:?}"));
+                        }
+                        if let (Some(x), Some(y)) = (const_i64(a), const_i64(b)) {
+                            const_binop(*op, x, y)?;
                         }
                         Ok(Type::I64)
                     }
@@ -1476,6 +1501,42 @@ fn const_i64(e: &Expr) -> Option<i64> {
         Expr::Un(UnOp::Neg, inner) => const_i64(inner).map(|v| v.wrapping_neg()),
         _ => None,
     }
+}
+
+/// Evaluate a constant `i64` binary operation the way rustc does at compile
+/// time: division or remainder by zero and `MIN / -1` panic at runtime, and
+/// `+`/`-`/`*` overflow and an out-of-range shift amount trap under the
+/// overflow checks rmc emits. Rejecting these where both operands are literals
+/// keeps rmc from compiling a program rustc refuses (and that would fault at
+/// run time). Only literal operands are folded; rmc does not propagate
+/// constants through locals, so `let d = 0; 1 / d` is not diagnosed here.
+fn const_binop(op: BinOp, a: i64, b: i64) -> Result<i64, String> {
+    use BinOp::*;
+    let (val, overflow) = match op {
+        Add => a.overflowing_add(b),
+        Sub => a.overflowing_sub(b),
+        Mul => a.overflowing_mul(b),
+        Div | Mod => {
+            if b == 0 {
+                return Err("division by zero panics at run time".into());
+            }
+            if a == i64::MIN && b == -1 {
+                return Err("attempt to divide with overflow panics at run time".into());
+            }
+            (if op == Div { a / b } else { a % b }, false)
+        }
+        Shl | Shr => {
+            if !(0..64).contains(&b) {
+                return Err("shift amount is out of range for `i64`".into());
+            }
+            (if op == Shl { a << b } else { a >> b }, false)
+        }
+        _ => return Ok(0),
+    };
+    if overflow {
+        return Err("this arithmetic operation overflows".into());
+    }
+    Ok(val)
 }
 
 /// The type a reference points at, or the type itself when it is not a
