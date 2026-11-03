@@ -247,6 +247,14 @@ frame-based argument passing and the unoptimised prologue, not the spill.
 - `if`/`while` conditions are emitted as a direct `cmp` + `jcc` when the
   condition is a comparison, instead of materialising a 0/1 and testing it. The
   negated condition codes are in `invert_cc`.
+- A `while` is rotated: the test is emitted once before the loop as an entry
+  jump and again at the bottom, and the bottom copy is the back edge
+  (`jl`/`jne`, via `gen_branch_true`), so an iteration is four instructions
+  instead of five and the loop has one jump rather than two. The entry jump runs
+  once, so a false first condition still skips the body. `continue` targets the
+  bottom test and `break` targets the label the test falls into. `for` is *not*
+  rotated: its increment sits between the body and the guard, so the first guard
+  must see the un-incremented start.
 
 ## References
 
