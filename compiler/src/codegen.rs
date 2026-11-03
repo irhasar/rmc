@@ -2017,6 +2017,40 @@ impl Codegen {
             return Type::I64;
         }
 
+        // For these six ops the right operand can fold straight into the
+        // instruction, so `x + y` skips the `mov y, %rcx` bounce. Only a
+        // *register* operand folds: a memory operand measured slower on the
+        // cores this was tuned on (the load lands in the instruction's critical
+        // path), which is why the immediate-only rule above exists too.
+        // `gen_expr(a)` leaves `%rax`/`%rcx`/`%rdx` alone, so a register operand
+        // read from the promoted set is still live across it. The shifts are
+        // excluded because the count must be in `%cl`.
+        if matches!(op, Add | Sub | Mul | BitAnd | BitOr | BitXor) {
+            if let Some(rb) = self.simple_operand(b) {
+                if rb.starts_with('%') {
+                    self.gen_expr(a);
+                    match op {
+                        Add => {
+                            self.line(&format!("add {rb}, %rax"));
+                            self.check_overflow();
+                        }
+                        Sub => {
+                            self.line(&format!("sub {rb}, %rax"));
+                            self.check_overflow();
+                        }
+                        Mul => {
+                            self.line(&format!("imul {rb}, %rax"));
+                            self.check_overflow();
+                        }
+                        BitAnd => self.line(&format!("and {rb}, %rax")),
+                        BitOr => self.line(&format!("or {rb}, %rax")),
+                        _ => self.line(&format!("xor {rb}, %rax")),
+                    }
+                    return Type::I64;
+                }
+            }
+        }
+
         self.eval_operands(a, b);
         match op {
             Add => {
