@@ -7,6 +7,13 @@ fn asm(src: &str) -> String {
     compile_to_asm(src, &CompileOptions::default()).expect("should compile")
 }
 
+/// Assembly with the inlining pass disabled, for tests that assert on the shape
+/// of a real call (`call f`, the argument setup) rather than on inlined code.
+fn asm_no_inline(src: &str) -> String {
+    compile_to_asm(src, &CompileOptions { no_inline: true, ..Default::default() })
+        .expect("should compile")
+}
+
 /// The frame offset stored by the first `mov %rax, <off>(%rbp)` after `marker`.
 /// Lets a test check relative layout without hard-coding absolute offsets.
 fn store_offset_after(out: &str, marker: &str) -> i32 {
@@ -481,7 +488,7 @@ fn match_desugars_to_equality_compares() {
 fn a_match_scrutinee_call_runs_once() {
     // A call in the scrutinee is bound to a temporary before the arm tests, so
     // it is evaluated once no matter how many arms follow.
-    let out = asm("fn g() -> i64 { return 3; } fn main() -> i64 { return match g() { 1 => 10, 3 => 30, _ => 0 }; }");
+    let out = asm_no_inline("fn g() -> i64 { return 3; } fn main() -> i64 { return match g() { 1 => 10, 3 => 30, _ => 0 }; }");
     assert_eq!(out.matches("call g").count(), 1, "the scrutinee call runs once");
 }
 
@@ -490,7 +497,7 @@ fn arguments_are_evaluated_left_to_right() {
     // `f(g(), mk())` must run `g` before `mk`. The old code copied every
     // aggregate argument before any scalar one, so a scalar in a later position
     // ran after the aggregate and the side effects came out in the wrong order.
-    let out = asm("struct S { v: i64 } fn mk() -> S { return S { v: 1 }; } fn g() -> i64 { return 2; } fn f(x: i64, s: S) -> i64 { return s.v + x; } fn main() -> i64 { return f(g(), mk()); }");
+    let out = asm_no_inline("struct S { v: i64 } fn mk() -> S { return S { v: 1 }; } fn g() -> i64 { return 2; } fn f(x: i64, s: S) -> i64 { return s.v + x; } fn main() -> i64 { return f(g(), mk()); }");
     let g = out.find("call g").expect("g is called");
     let mk = out.find("call mk").expect("mk is called");
     assert!(g < mk, "the first argument's call is emitted first");
@@ -754,7 +761,7 @@ fn a_reference_to_a_promoted_local_forces_it_into_memory() {
 fn a_ref_typed_parameter_is_one_slot_not_a_copy() {
     // A reference is a scalar: `&Point` is passed in one register and is not
     // copied, however big `Point` is.
-    let out = asm(
+    let out = asm_no_inline(
         "struct P { x: i64, y: i64, z: i64 } \
          fn f(p: &P) -> i64 { return p.x; } \
          fn main() -> i64 { let v: P = P { x: 1, y: 2, z: 3 }; return f(&v); }",
@@ -796,7 +803,7 @@ fn a_dereference_of_a_non_reference_is_rejected() {
 fn address_of_a_non_lvalue_is_accepted_through_a_temporary() {
     // `&(f())` where `f` returns a scalar: the call's result is stored in a
     // temporary and its address is taken.
-    let out = asm(
+    let out = asm_no_inline(
         "fn f() -> i64 { return 9; } fn main() -> i64 { let r: &i64 = &(f()); return *r; }",
     );
     assert!(out.contains("call f"), "call present in:\n{out}");
@@ -854,7 +861,7 @@ fn a_mut_receiver_is_passed_by_address() {
 fn a_mut_reference_coerces_to_a_shared_reference() {
     // `peek(&mut x)` where `peek` wants `&i64`: allowed, and no code is emitted
     // for the coercion since both are one pointer.
-    let out = asm(
+    let out = asm_no_inline(
         "fn peek(p: &i64) -> i64 { return *p; } \
          fn main() -> i64 { let mut x: i64 = 5; return peek(&mut x); }",
     );
@@ -983,4 +990,75 @@ fn accumulation_does_not_reuse_a_clobbered_accumulator() {
             "self-add of the accumulator in:\n{body}"
         );
     }
+}
+
+#[test]
+fn a_small_accessor_call_is_inlined_away() {
+    // A `&self` accessor is small and call-free, so a call to it becomes its
+    // body: no `call` and no argument setup remain.
+    let out = asm(
+        "struct P { x: i64, y: i64 } \
+         impl P { fn sum(&self) -> i64 { return self.x + self.y; } } \
+         fn main() -> i64 { let p: P = P { x: 1, y: 2 }; return p.sum(); }",
+    );
+    assert!(!out.contains("call P$sum"), "the accessor call is inlined in:\n{out}");
+}
+
+#[test]
+fn a_wrapper_is_inlined_once_its_callees_are() {
+    // `wrap` calls two accessors, so it is not a candidate until they are
+    // inlined into it; the pass must iterate to a fixpoint to reach it.
+    let out = asm(
+        "struct P { x: i64, y: i64 } \
+         impl P { fn sum(&self) -> i64 { return self.x + self.y; } } \
+         fn wrap(p: &P) -> i64 { return p.sum() + p.sum(); } \
+         fn main() -> i64 { let p: P = P { x: 1, y: 2 }; return wrap(&p); }",
+    );
+    assert!(!out.contains("call wrap"), "the wrapper call is inlined in:\n{out}");
+    assert!(!out.contains("call P$sum"), "the accessor call is inlined in:\n{out}");
+}
+
+#[test]
+fn inlining_evaluates_an_argument_with_side_effects_once() {
+    // `f(sc(5))` binds the call's result to one slot, so `sc` runs once even
+    // though `x` is read twice in the body.
+    let out = asm(
+        "fn sc(t: i64) -> i64 { print_i64(t); return t * 2; } \
+         fn f(x: i64) -> i64 { return x + x; } \
+         fn main() -> i64 { return f(sc(5)); }",
+    );
+    assert_eq!(out.matches("call sc").count(), 1, "the argument call runs once in:\n{out}");
+}
+
+#[test]
+fn a_recursive_function_is_not_inlined_into_itself() {
+    // `fib` calls itself, so its body is not call-free and it is not a
+    // candidate; the recursive call must survive as a real call.
+    let out = asm(
+        "fn fib(n: i64) -> i64 { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); } \
+         fn main() -> i64 { return fib(10); }",
+    );
+    assert!(out.contains("call fib"), "the recursive call is kept in:\n{out}");
+}
+
+#[test]
+fn no_inline_option_keeps_the_call() {
+    let out = asm_no_inline(
+        "struct P { x: i64, y: i64 } \
+         impl P { fn sum(&self) -> i64 { return self.x + self.y; } } \
+         fn main() -> i64 { let p: P = P { x: 1, y: 2 }; return p.sum(); }",
+    );
+    assert!(out.contains("call P$sum"), "inlining is off in:\n{out}");
+}
+
+#[test]
+fn an_inlined_local_does_not_alias_a_caller_slot() {
+    // Two calls to a body with a local must each get their own frame region, or
+    // the second would clobber the first's local.
+    let out = asm(
+        "fn g(v: i64) -> i64 { let t: i64 = v * 3; return t + v; } \
+         fn main() -> i64 { let a: i64 = g(1); let b: i64 = g(2); return a * 100 + b; }",
+    );
+    assert!(!out.contains("call g"), "g is inlined in:\n{out}");
+    assert!(out.contains("main:"), "compiles");
 }
