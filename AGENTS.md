@@ -162,7 +162,10 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
   a region or an inlined local would clobber another's. An argument with a side
   effect must be bound to one slot, never substituted into a body that reads the
   parameter twice — `f(sc(5))` with `f(x) = x + x` must call `sc` once. A
-  candidate body must be call-free and straight-line; because it is, inlining it
+  parameter the body assigns must also be bound to a fresh slot even when the
+  argument is a plain variable, because a parameter is a local copy: replacing
+  it by the caller's variable would make `x = x + 1` write through to the caller.
+  A candidate body must be call-free and straight-line; because it is, inlining it
   cannot expose new calls, but the pass still runs to a *fixpoint* because a
   function only becomes call-free after its own callees are inlined (the `refs`
   wrapper `sum_via_ref` needs round two). A statement-free block is unwrapped to
