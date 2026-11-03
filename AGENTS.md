@@ -121,6 +121,16 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
   for a non-aggregate `Deref` whose pointer is a reference local, so `*p < 5`
   is one `cmpq $5, (%reg)` and `*p` in a comparison needs no load. An aggregate
   `Deref` is *not* a simple operand: its value is an address, not data.
+- **A store through a computed address folds a register/immediate value.**
+  `(*np).next = head` with both operands in registers emits one `mov %r, (%rax)`
+  rather than spilling `head` to a frame slot, storing the address, and reloading
+  (`mov %rbx, -80(%rbp); mov %rax, -72(%rbp); mov -72(%rbp), %rcx; ...`). The
+  fold guards on the value operand starting with `%` or `$` so a *memory* value
+  never becomes an illegal memory-to-memory `mov`; a frame-slot operand falls
+  back to the `%rax` round trip. The same fold applies to a field in a promoted
+  register (`mov %r, %r`) and to `field_operand`'s `disp(%reg)` form. Measured
+  +5% on `heap`. The two store-shape tests (`a_write_through_a_dereference...`,
+  `field_write_targets_the_right_slot`) assert the folded form.
 - **`trim_dead` drops unreachable instructions, self-moves, inverse-move pairs,
   and a jump to the next label.** After each function body is generated it
   removes instructions following an unconditional `jmp`/`ret` up to the next
@@ -136,6 +146,15 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
   and never across a label or any other instruction. It runs on the real body
   only (the dry spill pass's output is truncated anyway), so it costs nothing at
   compile time.
+- **A statement-position `if` without `else` emits no unit value.** `gen_stmt_expr`
+  sets a `discard` flag while generating an expression whose value is thrown
+  away, and `Expr::If` reads it: with no `else` the `xor %eax, %eax` that
+  materialises unit (and the `jmp` over the empty else) is dead, so it is
+  omitted. In `fib` that removes a dead instruction from the hot path. Only a
+  bare `if` is special-cased; a block or `match` in statement position is left
+  alone because an `if` in *its* tail is a value. The flag is saved and restored,
+  so a discarded outer expression does not silence an inner value `if`.
+  Runtime-neutral (the loops are latency-bound) but trims ~40 bytes per artifact.
 - **Inlining is a post-sema AST pass, and slots are frame indices.** Each
   inlined call gets a fresh region of the caller's frame (`base = f.nslots`,
   grown as it goes), the callee's slots are shifted by that base, and a read of

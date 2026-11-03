@@ -45,9 +45,26 @@ fn struct_fields_are_laid_out_in_order() {
 #[test]
 fn field_write_targets_the_right_slot() {
     let out = asm("struct P { x: i64, y: i64 } fn main() -> i64 { let mut p: P = P { x: 1, y: 2 }; p.y = 9; return p.y; }");
-    let y = store_offset_after(&out, "mov $2, %rax");
-    let w = store_offset_after(&out, "mov $9, %rax");
-    assert_eq!(w, y, "`p.y = 9` writes the slot `p.y` reads");
+    // The read of `p.y` and the write `p.y = 9` must name the same frame slot.
+    // The write folds the constant straight into the store, so it is
+    // `mov $9, <off>(%rbp)` rather than a `%rax` round trip.
+    let read: i32 = out
+        .lines()
+        .find_map(|l| {
+            let t = l.trim();
+            let inner = t.strip_prefix("mov ")?.strip_suffix("(%rbp), %rax")?;
+            inner.trim().parse().ok()
+        })
+        .expect("a frame read of p.y");
+    let write: i32 = out
+        .split("mov $9, ")
+        .nth(1)
+        .and_then(|s| s.split("(%rbp)").next())
+        .expect("the field store")
+        .trim()
+        .parse()
+        .expect("a frame offset");
+    assert_eq!(write, read, "`p.y = 9` writes the slot `p.y` reads");
 }
 
 #[test]
@@ -956,8 +973,12 @@ fn a_nested_reference_dereferences_twice() {
 fn a_write_through_a_dereference_stores_to_the_referent() {
     let out = asm("fn main() -> i64 { let mut x: i64 = 1; let p: &i64 = &x; *p = 42; return x; }");
     // The store's target address is the pointer value, so the store is indirect
-    // through a register rather than into a frame slot.
-    assert!(out.contains("mov %rax, (%rcx)"), "indirect store in:\n{out}");
+    // through a register rather than into a frame slot; the constant value folds
+    // straight into it.
+    assert!(
+        out.lines().any(|l| l.trim_start().starts_with("mov $42, (")),
+        "indirect store in:\n{out}"
+    );
 }
 
 #[test]
@@ -966,7 +987,10 @@ fn a_write_through_a_reference_to_a_struct_field_stores_to_the_field() {
         "struct P { x: i64, y: i64 } \
          fn main() -> i64 { let mut p: P = P { x: 1, y: 2 }; let r: &i64 = &p.y; *r = 9; return p.y; }",
     );
-    assert!(out.contains("mov %rax, (%rcx)"), "indirect store in:\n{out}");
+    assert!(
+        out.lines().any(|l| l.trim_start().starts_with("mov $9, (")),
+        "indirect store in:\n{out}"
+    );
 }
 
 #[test]
@@ -1493,4 +1517,53 @@ fn an_accumulator_chain_with_calls_keeps_source_order() {
     let call = body.find("call h").expect("the call is emitted");
     // The first operand read (`a`) precedes the call.
     assert!(read_a.unwrap_or(0) < call, "operand read before the call:\n{body}");
+}
+
+#[test]
+fn an_if_without_else_in_statement_position_emits_no_unit_value() {
+    // `if n < 2 { return n; }` as a statement has no value, so the dead
+    // `xor %eax, %eax` (and the `jmp` over the empty else) must not appear.
+    let src = "fn f(n: i64) -> i64 { if n < 2 { return n; } return 0; } \
+               fn main() -> i64 { return f(3); }";
+    let out = asm_no_inline(&src);
+    let body = &out[out.find("f:").unwrap()..];
+    let body = &body[..body.find(".size f").unwrap()];
+    assert!(
+        !body.contains("xor %eax, %eax"),
+        "no unit materialisation for a statement `if`:\n{body}"
+    );
+}
+
+#[test]
+fn a_statement_if_with_else_keeps_both_branches() {
+    // `bare` must require `els.is_none()`, so an `if`/`else` in statement
+    // position still emits the else body and the jump over it.
+    let src = "fn main() -> i64 { let mut x: i64 = 0; \
+               if 1 > 0 { x = 5; } else { x = 9; } return x; }";
+    let out = asm(&src);
+    let body = main_body(&out);
+    assert!(body.contains("jmp"), "the else is jumped over:\n{body}");
+    assert!(body.contains("$5"), "then branch present:\n{body}");
+    assert!(body.contains("$9"), "else branch present:\n{body}");
+}
+
+#[test]
+fn a_store_through_a_computed_address_folds_a_simple_value() {
+    // `(*np).next = head`, both operands in registers: the value folds straight
+    // into the store (`mov %r, (%rax)`) instead of bouncing through a spill
+    // slot. The address is in `%rax`, the value in a callee-saved register.
+    let src = "struct N { val: i64, next: i64 } \
+               fn main() -> i64 { let mut head: i64 = 0; let mut i: i64 = 0; \
+               while i < 3 { let p: i64 = 16; let np: &mut N = p as &mut N; \
+               (*np).val = i; (*np).next = head; head = p; i = i + 1; } return head; }";
+    let out = asm(&src);
+    let body = main_body(&out);
+    // A folded store through a computed address: `mov %rSRC, off(%rDST)` with
+    // the destination a register other than `%rbp` (which would be a frame
+    // store). The old path emitted `mov %rax, -N(%rbp)` (spill) then reloaded.
+    let folded = body.lines().any(|l| {
+        let t = l.trim_start();
+        t.starts_with("mov %r") && t.contains("(%r") && !t.contains("%rbp")
+    });
+    assert!(folded, "value folds into the store:\n{body}");
 }

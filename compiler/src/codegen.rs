@@ -41,6 +41,11 @@ pub struct Codegen {
     /// When set, every `+`, `-` and `*` is followed by a jump-if-overflow to the
     /// runtime trap. Off by default because it costs a branch per operation.
     overflow: bool,
+    /// True while generating an expression whose value is discarded (a
+    /// statement-position expression). `if` without `else` then skips the
+    /// `xor %eax, %eax` that materialises its unit value, which in `fib` is a
+    /// dead instruction in the hot path.
+    discard: bool,
     /// Frame slot holding the hidden return-buffer pointer for the function
     /// being generated (`-1` when the return type is scalar or unit).
     ret_slot: i32,
@@ -95,6 +100,7 @@ impl Codegen {
             spill_regs: Vec::new(),
             bounds: false,
             overflow: false,
+            discard: false,
             ret_slot: -1,
             ret_ty: Type::Unit,
             frame_slots: Cell::new(0),
@@ -866,6 +872,17 @@ impl Codegen {
         }
     }
 
+    /// Generate an expression whose value is discarded, so `if` without `else`
+    /// need not materialise its unit result. Only a bare `if` is special-cased:
+    /// a block or `match` in statement position is left alone, because their
+    /// `if` arms can appear in value position within the block's own tail.
+    fn gen_stmt_expr(&mut self, e: &Expr) {
+        let saved = self.discard;
+        self.discard = true;
+        self.gen_expr(e);
+        self.discard = saved;
+    }
+
     fn gen_block(&mut self, b: &Block) -> Type {
         for st in &b.stmts {
             self.gen_stmt(st);
@@ -999,20 +1016,27 @@ impl Codegen {
                     }
                     Expr::Field { base, offset, .. } => {
                         if let Some(r) = self.field_reg(base, *offset) {
-                            self.gen_expr_into_reg(value, r);
+                            // The field lives in a promoted register. A register
+                            // or immediate value folds into the move; anything
+                            // else materialises the value, then moves it.
+                            match self.simple_operand(value) {
+                                Some(op) if op.starts_with('%') || op.starts_with('$') => {
+                                    self.line(&format!("mov {op}, {r}"));
+                                }
+                                _ => self.gen_expr_into_reg(value, r),
+                            }
                         } else {
                             match self.field_operand(base, *offset) {
-                                Some(op) => {
-                                    self.gen_expr(value);
-                                    self.line(&format!("mov %rax, {op}"));
-                                }
-                                None => {
-                                    self.gen_addr(target);
-                                    self.push_rax();
-                                    self.gen_expr(value);
-                                    self.pop_to("%rcx");
-                                    self.line("mov %rax, (%rcx)");
-                                }
+                                Some(op) => match self.simple_operand(value) {
+                                    Some(v) if v.starts_with('%') || v.starts_with('$') => {
+                                        self.line(&format!("mov {v}, {op}"));
+                                    }
+                                    _ => {
+                                        self.gen_expr(value);
+                                        self.line(&format!("mov %rax, {op}"));
+                                    }
+                                },
+                                None => self.store_through_addr(target, value, Some(0)),
                             }
                         }
                     }
@@ -1085,17 +1109,13 @@ impl Codegen {
                         self.copy_words_rdi_rsi(n);
                     }
                     Expr::Deref { .. } => {
-                        self.gen_addr(target);
-                        self.push_rax();
-                        self.gen_expr(value);
-                        self.pop_to("%rcx");
-                        self.line("mov %rax, (%rcx)");
+                        self.store_through_addr(target, value, Some(0));
                     }
                     _ => unreachable!("sema guarantees a valid assignment target"),
                 }
             }
             Stmt::Expr(e) => {
-                self.gen_expr(e);
+                self.gen_stmt_expr(e);
             }
             Stmt::While(cond, body) => {
                 // Rotated: the test moves to the bottom and the body falls
@@ -1339,6 +1359,29 @@ impl Codegen {
 
     fn struct_field_reg(&self, slot: i32, fields: i32, offset: i32) -> Option<&'static str> {
         self.reg_of(slot + fields - 1 - offset / 8)
+    }
+
+    /// Stores `value` into a place whose address `gen_addr` computes. When the
+    /// value is a register or immediate operand that no `gen_addr` clobbers,
+    /// the store folds to one instruction (`mov $k, off(%reg)` or
+    /// `mov %r, off(%reg)`) with no temporary slot. Otherwise it falls back to
+    /// materialising the address, then the value, then storing through `%rcx`.
+    /// `off` is a constant displacement added to the computed address (a
+    /// variable index passes `None` and stays on the fallback path).
+    fn store_through_addr(&mut self, target: &Expr, value: &Expr, off: Option<i32>) {
+        if let (Some(op), Some(k)) = (self.simple_operand(value), off) {
+            if op.starts_with('%') || op.starts_with('$') {
+                self.gen_addr(target);
+                let disp = if k == 0 { String::new() } else { format!("{k}") };
+                self.line(&format!("mov {op}, {disp}(%rax)"));
+                return;
+            }
+        }
+        self.gen_addr(target);
+        self.push_rax();
+        self.gen_expr(value);
+        self.pop_to("%rcx");
+        self.line("mov %rax, (%rcx)");
     }
 
     /// Leaves the address of an lvalue in `%rax`.
@@ -1652,14 +1695,23 @@ impl Codegen {
             Expr::If(cond, then, els) => {
                 let else_l = self.new_label();
                 let end_l = self.new_label();
+                // An `if` without `else` in statement position produces no
+                // value, so it needs neither the `xor` that materialises unit
+                // nor a `jmp` over an empty else. The `then` block falls
+                // straight through to the branch target.
+                let bare = self.discard && els.is_none();
                 self.gen_branch_false(cond, &else_l);
                 let tt = self.gen_block(then);
-                self.line(&format!("jmp {end_l}"));
+                if !bare {
+                    self.line(&format!("jmp {end_l}"));
+                }
                 self.raw(&format!("{else_l}:"));
                 let et = match els {
                     Some(e) => self.gen_block(e),
                     None => {
-                        self.line("xor %eax, %eax");
+                        if !bare {
+                            self.line("xor %eax, %eax");
+                        }
                         Type::Unit
                     }
                 };
