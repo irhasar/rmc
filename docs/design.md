@@ -2,7 +2,8 @@
 
 `rmc` is a single-pass-per-stage, ahead-of-time compiler for a Rust subset. It
 is deliberately small: no external crates, no LLVM, no libc. The whole pipeline
-is `source -> lexer -> parser -> sema -> codegen -> asm text`, after which the
+is `source -> lexer -> parser -> sema -> inline -> tco -> licm -> codegen
+-> asm text`, after which the
 driver shells out to GNU `as` and `ld`.
 
 ## Pipeline
@@ -42,14 +43,18 @@ driver shells out to GNU `as` and `ld`.
    sema, so every name already carries its slot and no lookup is needed, and
    before codegen, so the peephole pass sees the inlined arithmetic. See
    "Inlining" below.
-5. **Loop-invariant code motion** (`licm.rs`) — hoists a pure, invariant scalar
+5. **Self-recursion to loop** (`tco.rs`) — rewrites a function of the shape
+   `f(x) = f(g(x)) op f(h(x))` (with `op` associative, `+` or `*`) so the `h`
+   chain becomes a loop and only one recursive call per level remains. Runs after
+   inlining and before codegen. See "Self-recursion to loop" below.
+6. **Loop-invariant code motion** (`licm.rs`) — hoists a pure, invariant scalar
    subexpression out of a loop body so it is computed once instead of every
    iteration. Runs after inlining, because inlining is what exposes the
    invariant arithmetic. See "Loop-invariant code motion" below.
-6. **Code generation** (`codegen.rs`) — emits AT&T-syntax x86-64 assembly. Every
+7. **Code generation** (`codegen.rs`) — emits AT&T-syntax x86-64 assembly. Every
    expression leaves its result in `%rax`; the result type is returned to the
    caller so callers know how to use it.
-7. **Assemble and link** (`main.rs`) — writes the assembly, runs `as --64`, then
+8. **Assemble and link** (`main.rs`) — writes the assembly, runs `as --64`, then
    `ld -o <out> --build-id=none -n <obj>`, with the runtime text prepended.
 
 ## Stack layout
@@ -353,6 +358,57 @@ A whole-program budget of 8192 expansions bounds compile time and code size; a
 loop body is inlined once, not once per iteration. `--no-inline` turns the pass
 off, which is what the tests that assert on the calling convention use.
 
+
+## Self-recursion to loop
+
+The naive `fib` makes two recursive calls per level:
+
+```text
+fn fib(n: i64) -> i64 { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); }
+```
+
+LLVM folds the right spine — the `fib(n - 2)` chain — into a loop, leaving one
+call per level, and that constant factor is why `fib` used to be the one
+benchmark `rmc` lost. `tco.rs` performs the same rewrite, in the one shape where
+it is exact. Given
+
+```text
+f(x) = f(g(x)) op f(h(x))          op is `+` or `*`
+```
+
+associativity and commutativity let the `h` chain be unrolled:
+
+```text
+f(x) = f(g(x)) op f(g(h(x))) op f(g(h(h(x)))) op ... op guard(h^k(x))
+```
+
+which is exactly the loop
+
+```text
+acc = identity                     // 0 for `+`, 1 for `*`
+while !cond(x) { acc = acc op f(g(x)); x = h(x); }
+return acc op guard(x)
+```
+
+The recursive call `f(g(x))` stays a call; only the second call per level is
+removed, halving the call tree (2.0x on `fib`). The pass runs after inlining and
+before LICM, and is turned off by `--no-tco`.
+
+The shape test is deliberately narrow, because a wrong match is a wrong program.
+The function must take exactly one `i64` and return `i64` (so `x` is the only
+state), be a free function rather than a method, and consist of exactly two
+statements: a base-case `if cond { return guard; }` with no `else`, and a
+`return f(g) op f(h)` whose two operands are both calls to the function itself.
+`op` must be `+` or `*` — subtraction and division are not associative, and a
+recursion that uses them is left alone. Finally `cond`, `guard`, `g` and `h` must
+be call-free, so that evaluating them a different number of times cannot change
+behaviour: `rmc` has no side-effecting user function, but a `print` nested in an
+argument would otherwise be duplicated by the loop.
+
+The transform is validated by `tests/cases/tco.{rms,rs}`, which diffs `fib` and
+`fact` against rustc for `n` in `0..20`, and by a unit test that checks a
+non-associative recursion keeps both calls.
+
 ## Loop-invariant code motion
 
 Inlining exposes arithmetic that reads only loop-invariant data. After inlining,
@@ -418,17 +474,18 @@ a branch per arithmetic operation.
 
 ## What is intentionally missing
 
-There is no optimiser beyond the folding, local promotion, inlining, loop-
-invariant code motion and dead-instruction trim described above. No global
-register allocation, no common-subexpression elimination, no other loop
-transforms, no instruction scheduling. The compiler is optimised for compile
+There is no optimiser beyond the folding, local promotion, inlining, self-
+recursion to loop, loop-invariant code motion and dead-instruction trim described
+above. No global register allocation, no common-subexpression elimination, no
+other loop transforms, no instruction scheduling. The compiler is optimised for compile
 speed and simplicity, not for the speed of the code it produces. The non-trivial
 passes are division by a constant (1.4x on `mandel.rms`), the top-five local
 promotion (a few percent on `mix` and `sieve`), the reference-operand folds plus
 `trim_dead` (1.4x on the `refs` benchmark), inlining (2.6x on `refs`, by removing
 the three accessor calls from its hot loop), and loop-invariant code motion (a
 further 2.9x on `refs`, by hoisting the now-inlined struct reads out of the
-loop); everything else is local and cheap to compute. Flattening the accumulator
+loop), the self-recursion rewrite (2.0x on `fib`, by halving its call tree);
+everything else is local and cheap to compute. Flattening the accumulator
 fold over a nested sum, plus unwrapping the inliner's spliced block so the fold
 can see the accessor arithmetic, is what turns LICM's three hoisted values into
 a six-instruction loop (`refs` 6.4 → 4.7 ms of rmc's own runtime, within ~20% of
