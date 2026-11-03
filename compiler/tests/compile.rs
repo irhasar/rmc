@@ -767,9 +767,13 @@ fn a_struct_and_an_enum_cannot_share_a_name() {
 }
 
 #[test]
-fn an_enum_array_is_rejected() {
-    // Arrays stay `i64`/`bool`; `[E; N]` would mis-size the 8-byte element.
-    let err = compile_to_asm("enum C { A } fn main() -> i64 { let a: [C; 2] = [C::A; 2]; return 0; }", &CompileOptions::default()).unwrap_err();
+fn a_unit_enum_array_is_allowed() {
+    // A unit enum occupies one 8-byte slot and codegen emits it like `i64`, so
+    // `[E; N]` lays out and indexes correctly. A payload enum is still rejected.
+    let ok = "enum C { A, B } fn main() -> i64 { let a: [C; 2] = [C::A, C::B]; return a[1] as i64; }";
+    assert!(compile_to_asm(ok, &CompileOptions::default()).is_ok());
+    let bad = "enum O { N, S(i64) } fn main() -> i64 { let a: [O; 2] = [O::N; 2]; return 0; }";
+    let err = compile_to_asm(bad, &CompileOptions::default()).unwrap_err();
     assert!(err.contains("array elements must be"), "got: {err}");
 }
 
