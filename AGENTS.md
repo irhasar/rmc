@@ -468,8 +468,11 @@ receiver whose type is `Struct`, `Enum` (unit) or `EnumData` (payload); all
 three give the same mangled prefix, and a `self` method on an aggregate receiver
 passes it by pointer. `Self` resolves through the parser's `current_impl`.
 
-An array's element type is always scalar (`i64` or `bool`); nested arrays and
-arrays of structs are rejected. A list literal `[a, b, c]` is parsed as
+An array's element type is a scalar: `i64`, `bool` or a unit enum. Nested
+arrays, arrays of structs and arrays of payload enums are rejected. A unit enum
+is one 8-byte slot emitted like `i64`, so `[E; N]` lays out and indexes
+correctly; rustc likewise accepts a unit enum and rejects a payload enum and a
+reference as array elements. A list literal `[a, b, c]` is parsed as
 `Expr::ArrayList` and rewritten by sema, which infers the element type from the
 values — the parser must not guess it, because it does not type-check, and
 guessing `i64` is what made `[true, false]` fail.

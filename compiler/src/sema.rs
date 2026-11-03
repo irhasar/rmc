@@ -319,7 +319,7 @@ fn resolve_ty_rec(
         Type::Array(elem, n) => {
             let e = resolve_ty_rec(elem, raw_s, raw_e, so, eo, visiting)?;
             if !e.is_int_or_bool() {
-                return Err(format!("array elements must be `i64` or `bool`, not {e:?}"));
+                return Err(format!("array elements must be `i64`, `bool` or a unit enum, not {e:?}"));
             }
             Ok(Type::Array(Box::new(e), *n))
         }
@@ -355,7 +355,7 @@ fn resolve_in(
         Type::Array(elem, n) => {
             let e = resolve_in(elem, structs, enums)?;
             if !e.is_int_or_bool() {
-                return Err(format!("array elements must be `i64` or `bool`, not {e:?}"));
+                return Err(format!("array elements must be `i64`, `bool` or a unit enum, not {e:?}"));
             }
             Ok(Type::Array(Box::new(e), *n))
         }
@@ -456,7 +456,7 @@ impl Sema {
         if let Expr::ArrayLit(val, n) = e {
             let t = self.check_expr(val, scope)?;
             if !t.is_int_or_bool() {
-                return Err(format!("array elements must be `i64` or `bool`, found {t:?}"));
+                return Err(format!("array elements must be `i64`, `bool` or a unit enum, found {t:?}"));
             }
             return Ok(Type::Array(Box::new(t), *n));
         }
@@ -942,7 +942,7 @@ impl Sema {
             Expr::ArrayLit(val, n) => {
                 let t = self.check_expr(val, scope)?;
                 if !t.is_int_or_bool() {
-                    return Err(format!("array elements must be `i64` or `bool`, found {t:?}"));
+                    return Err(format!("array elements must be `i64`, `bool` or a unit enum, found {t:?}"));
                 }
                 let ty = Type::Array(Box::new(t), *n);
                 // Value position: `[v; n]` has no address of its own, so rewrite
@@ -973,7 +973,7 @@ impl Sema {
                 let elem_ty = self.check_expr(&mut elems[0], scope)?;
                 if !elem_ty.is_int_or_bool() {
                     return Err(format!(
-                        "array elements must be `i64` or `bool`, found {elem_ty:?}"
+                        "array elements must be `i64`, `bool` or a unit enum, found {elem_ty:?}"
                     ));
                 }
                 for e in elems.iter_mut().skip(1) {

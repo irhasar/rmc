@@ -10,7 +10,7 @@ time; there are no runtime type errors.
 | ------------ | --------------------------------------------- |
 | `i64`        | signed 64-bit integer                         |
 | `bool`       | `true` or `false`                             |
-| `[T; N]`     | fixed-size array of `N` `i64`/`bool` elements |
+| `[T; N]`     | fixed-size array of `N` `i64`, `bool` or unit-enum elements |
 | `&T` `&mut T`| a reference to a `T` (one word)               |
 | `Name`       | a struct declared with `struct Name { .. }`   |
 | `Name`       | an enum declared with `enum Name { .. }`      |
@@ -193,8 +193,9 @@ Rust panic. Division by zero always traps at the CPU level.
 - Indexing: `arr[i]`.
 - Array literals: `[a, b, c]` and `[value; count]`. A list literal takes its
   element type from the values, so `[true, false]` is a `[bool; 2]` and
-  `[1, 2, 3]` an `[i64; 3]`; mixing the two is an error. An array element is
-  always a scalar, so arrays of arrays and arrays of structs are not supported.
+  `[1, 2, 3]` an `[i64; 3]`; mixing the two is an error. An array element is a
+  scalar — `i64`, `bool` or a unit enum — so arrays of arrays, of structs and of
+  payload enums are not supported (rustc rejects the last two as well).
 - Struct literals: `Point { x: 1, y: 2 }`, usable as a `let` initialiser.
 - Blocks and `if`/`else` are expressions.
 - `match` on integers or enums: `match x { 0 => a, 1 => b, _ => c }` or

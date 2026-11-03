@@ -51,11 +51,13 @@ impl Type {
         matches!(self, Type::I64 | Type::Bool | Type::Enum(_) | Type::Ref(..))
     }
 
-    /// True for the primitive types an array element may have. An enum is
-    /// deliberately excluded: codegen only lays out 8-byte integer-like
-    /// elements, and `[E; N]` would silently mis-size.
+    /// True for the types an array element may have: the 8-byte integer-like
+    /// scalars `i64`, `bool` and a unit enum. A unit enum occupies one slot and
+    /// codegen emits it exactly as it emits `i64`, so `[E; N]` lays out and
+    /// indexes correctly. A payload enum or a reference is excluded, matching
+    /// rustc, which rejects both as array elements.
     pub fn is_int_or_bool(&self) -> bool {
-        matches!(self, Type::I64 | Type::Bool)
+        matches!(self, Type::I64 | Type::Bool | Type::Enum(_))
     }
 
     /// True for the aggregate types that live in memory: arrays and structs.
