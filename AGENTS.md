@@ -416,7 +416,7 @@ The README's roadmap lists the intended next steps.
   LLVM: it sees the whole program and can fold a loop into a closed form. The
   `refs` twin did exactly that — LLVM reduced the loop to `acc = 128 * n`, so the
   recorded "rustc 0.83 ms" was its own constant folding and the ratio read 0.18x
-  instead of the honest 0.96x. Every twin with a loop now threads its trip count
+  instead of the honest ~1.0x. Every twin with a loop now threads its trip count
   or a term through `std::hint::black_box`. When a rustc twin's time matches its
   `hello` time, suspect folding before celebrating. The `heap` twin uses a bump
   arena rather than `Box`/`malloc`, so the comparison is the generated pointer
