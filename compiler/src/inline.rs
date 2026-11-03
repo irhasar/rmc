@@ -151,7 +151,7 @@ fn expr_ok(e: &Expr) -> bool {
             expr_ok(c) && block_ok(t) && els.as_ref().map_or(true, block_ok)
         }
         Expr::Block(b) => block_ok(b),
-        Expr::MatchBoundary(b) => block_ok(b),
+        Expr::MatchBoundary(b, _) => block_ok(b),
         // Calls, aggregate literals and payload-enum operations are excluded.
         _ => false,
     }
@@ -204,7 +204,7 @@ fn count_expr(e: &Expr) -> usize {
             1 + b.stmts.iter().map(count_stmt).sum::<usize>()
                 + b.tail.as_deref().map_or(0, count_expr)
         }
-        Expr::MatchBoundary(b) => {
+        Expr::MatchBoundary(b, _) => {
             1 + b.stmts.iter().map(count_stmt).sum::<usize>()
                 + b.tail.as_deref().map_or(0, count_expr)
         }
@@ -308,7 +308,7 @@ impl Inliner {
                 }
             }
             Expr::Block(b) => self.walk_block(b, base, expanding),
-            Expr::MatchBoundary(b) => self.walk_block(b, base, expanding),
+            Expr::MatchBoundary(b, _) => self.walk_block(b, base, expanding),
             Expr::Call { args, .. } => {
                 for a in args {
                     self.walk_expr(a, base, expanding);
@@ -512,7 +512,7 @@ fn assigned_slots(stmts: &[Stmt], tail: Option<&Expr>) -> HashSet<i32> {
             }
             Expr::Deref { expr, .. } | Expr::AddrOf { expr, .. } => collect_expr(expr, out),
             Expr::Block(b) => collect_block(b, out),
-            Expr::MatchBoundary(b) => collect_block(b, out),
+            Expr::MatchBoundary(b, _) => collect_block(b, out),
             Expr::If(c, t, els) => {
                 collect_expr(c, out);
                 collect_block(t, out);
@@ -660,7 +660,7 @@ impl Sub<'_> {
                 }
             }
             Expr::Block(b) => self.block(b),
-            Expr::MatchBoundary(b) => self.block(b),
+            Expr::MatchBoundary(b, _) => self.block(b),
             Expr::Call { args, arg_slots, ret_slot, .. } => {
                 for (s, _) in arg_slots.iter_mut() {
                     if *s >= 0 {

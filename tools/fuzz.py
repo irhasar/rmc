@@ -348,6 +348,26 @@ def reject_corpus():
         )
         return rms, rs
 
+    def stmt(body, enum="enum E { A, B }\n", decl="let e: E = E::A;", rs_decl="let e = E::A;", rs_enum="enum E { A, B }\n"):
+        """A `match` used as a statement: rmc must reject a non-exhaustive one
+        just as rustc does, even though the fall-through to `()` is harmless."""
+        rms = (
+            f"{enum}"
+            "fn main() -> i64 {\n"
+            f"    {decl}\n"
+            f"    {body}\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        rs = (
+            f"{rs_enum}"
+            "fn main() {\n"
+            f"    {rs_decl}\n"
+            f"    {body}\n"
+            "}\n"
+        )
+        return rms, rs
+
     return {
         # The outer match names A and wildcards the rest; the missing B test is
         # only inside the nested match, so the outer chain is not exhaustive.
@@ -358,6 +378,25 @@ def reject_corpus():
         "nested_wildcard_same": both("match a { E::A => 1, _ => match a { E::B => 2 } }"),
         # A plain non-exhaustive match in value position.
         "missing_variant_value": both("match a { E::A => 1 }"),
+        # Non-exhaustive matches in *statement* position. The arms are unit
+        # typed, so the fall-through to `()` is harmless and rmc used to accept
+        # them; rustc still rejects each with E0004.
+        "stmt_enum_partial": stmt("match e { E::A => { print_i64(1); } }",
+                                  rs_decl="let e = E::A;"),
+        "stmt_enum_one_short": stmt(
+            "match e { E::A => { print_i64(1); } E::B => { print_i64(2); } }",
+            enum="enum E { A, B, C }\n", decl="let e: E = E::A;",
+            rs_enum="enum E { A, B, C }\n", rs_decl="let e = E::A;"),
+        "stmt_int_partial": stmt("match x { 0 => { print_i64(1); } }",
+                                 enum="", decl="let x: i64 = 5;",
+                                 rs_enum="", rs_decl="let x = 5;"),
+        # A non-exhaustive match nested in a statement's block (inside an `if`
+        # and a loop body) must be rejected too.
+        "stmt_in_if": stmt("if true { match e { E::A => { print_i64(1); } } }",
+                           rs_decl="let e = E::A;"),
+        "stmt_in_loop": stmt(
+            "let mut i: i64 = 0; while i < 1 { match e { E::A => { print_i64(1); } } i = i + 1; }",
+            rs_decl="let e = E::A;"),
     }
 
 

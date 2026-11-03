@@ -457,8 +457,18 @@ carry the verdict down the chain so the last `if` (no `else`) may stand for a
 value. The two flags are set only on the `else` path of a *total* chain, so a
 wildcard arm body that is itself an `if` is still checked as an ordinary root.
 
+Every `match` must be exhaustive, in *any* position, exactly as rustc requires
+(E0004). The value-position case is caught by the `if`-without-`else` check; the
+statement-position case is not, because the arms are unit-typed and the
+fall-through to `()` is harmless, so `Sema`'s `MatchBoundary` arm also decides
+exhaustiveness (`match_chain_is_exhaustive`, plus the catch-all flag the parser
+records) and errors when it fails. Do not relax this to statement position only:
+rustc rejects a non-exhaustive `match` there too, and rmc must match rustc.
+
 The `match` desugaring wraps its first step in `Expr::MatchBoundary`, a
-transparent node that marks where the chain begins. It exists because a wildcard
+transparent node that marks where the chain begins. Its `bool` field records
+whether some arm is a catch-all (`_` or a binding), which makes the match
+exhaustive regardless of the variants named. The marker exists because a wildcard
 arm body can itself be a `match`: `match a { A => 1, _ => match a { B => 2 } }`
 and `match a { A => 1, B => 2 }` desugar to the *same* `if` chain, yet only the
 second is exhaustive. Without the marker, `if_chain_is_exhaustive` walks through
@@ -472,7 +482,8 @@ work: the two programs above share the same scrutinee, so the boundary is the
 only thing that keeps them apart.
 `tests/cases/exhmat.{rms,rs}` covers value position, reordering, nesting,
 references and a loop; a non-exhaustive or duplicate-variant match still errors,
-and `tools/fuzz.py --mode reject` pins the nested-wildcard cases.
+and `tools/fuzz.py --mode reject` pins the nested-wildcard and statement-position
+cases.
 
 A method is an ordinary free function whose name is mangled to `Type$method` and
 whose first parameter is `self` of the impl's struct type; the parser produces

@@ -526,6 +526,18 @@ impl Sema {
         info.variants.len() == seen.len()
     }
 
+    /// Whether a desugared `match` (the `MatchBoundary` block `b`) names every
+    /// variant of one enum. Unlike `if_chain_is_exhaustive`, this takes the
+    /// boundary block so it can look through the binding-arm wrapper, and it is
+    /// called before the chain is checked, so a nested `match`'s own
+    /// `MatchBoundary` (not a bare `If`) still delimits the walk.
+    fn match_chain_is_exhaustive(&self, b: &Block) -> bool {
+        match b.tail.as_deref() {
+            Some(Expr::If(cond, _, els)) => self.if_chain_is_exhaustive(cond, els),
+            _ => false,
+        }
+    }
+
     fn check_block(&mut self, b: &mut Block, scope: &mut Scope) -> Result<Type, String> {
         let mark = scope.len();
         for st in &mut b.stmts {
@@ -873,15 +885,35 @@ impl Sema {
             // chain context first so the inner chain is judged on its own. This
             // is what stops a wildcard arm's nested `match` from borrowing the
             // outer match's exhaustiveness.
-            Expr::MatchBoundary(b) => {
+            Expr::MatchBoundary(b, has_catch_all) => {
                 let outer_chain = self.match_chain;
                 let outer_total = self.match_total;
                 self.match_chain = false;
                 self.match_total = false;
+                // Every `match` must be exhaustive, in any position: rustc
+                // rejects a non-exhaustive one with E0004, even in statement
+                // position where the fall-through to `()` is harmless. A `_` or
+                // binding arm is a catch-all; otherwise the arms must name every
+                // variant of one enum. Decide it before checking the body, while
+                // the `VariantTest` tags are still unset, so the walk compares
+                // variant *names*.
+                let exhaustive = *has_catch_all || self.match_chain_is_exhaustive(b);
                 let t = self.check_block(b, scope);
                 self.match_chain = outer_chain;
                 self.match_total = outer_total;
-                t
+                // A non-exhaustive match in *value* position already failed with
+                // the "`if` without `else`" error inside `check_block`; that
+                // message is more specific, so let it win. This only adds the
+                // statement-position case, where the arms are unit-typed and the
+                // chain checked clean.
+                let t = t?;
+                if !exhaustive {
+                    return Err(
+                        "non-exhaustive `match`: add the missing variant arm or a `_` arm"
+                            .to_string(),
+                    );
+                }
+                Ok(t)
             }
             Expr::Block(b) => self.check_block(b, scope),
             Expr::Index(base, idx) => {
@@ -1377,7 +1409,7 @@ fn stmt_diverges(s: &Stmt) -> bool {
 fn expr_diverges(e: &Expr) -> bool {
     match e {
         Expr::Block(b) => block_diverges(b),
-        Expr::MatchBoundary(b) => block_diverges(b),
+        Expr::MatchBoundary(b, _) => block_diverges(b),
         // Both arms must diverge for the `if` to diverge.
         Expr::If(_, t, els) => {
             block_diverges(t) && els.as_ref().map_or(false, |b| block_diverges(b))
