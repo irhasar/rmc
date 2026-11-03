@@ -474,6 +474,44 @@ fn a_register_right_operand_folds_into_arithmetic() {
 }
 
 #[test]
+fn no_jump_to_the_very_next_label() {
+    // A `jmp L` immediately followed by `L:` is a no-op the peephole must drop:
+    // a function whose last expression is a value jumps to an epilogue label
+    // that directly follows, and a `return` in the middle leaves a similar jump.
+    for src in [
+        "fn main() -> i64 { return 42; }",
+        "fn f(n: i64) -> i64 { if n < 2 { return n; } return n + 1; } fn main() -> i64 { return f(5); }",
+        "fn main() -> i64 { let mut i: i64 = 0; while i < 3 { i = i + 1; } return i; }",
+    ] {
+        let out = asm(src);
+        let lines: Vec<&str> = out.lines().collect();
+        for w in lines.windows(2) {
+            let jmp = w[0].trim();
+            if let Some(target) = jmp.strip_prefix("jmp ") {
+                assert_ne!(
+                    format!("{target}:"),
+                    w[1].trim(),
+                    "`{jmp}` jumps to the next instruction; it should be dropped"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn modulo_by_a_constant_has_no_round_trip() {
+    // `a % d` computes the quotient in `%rdx`, then the remainder from it. It
+    // used to bounce the quotient `%rdx`->`%rax`->`%rdx` through the shared
+    // division tail; assert the remainder path consumes `%rdx` directly.
+    let out = asm("fn main() -> i64 { let a: i64 = 7; return a % 1000003; }");
+    assert!(out.contains("imul %rcx, %rdx"), "remainder scales the quotient in place");
+    assert!(
+        !out.contains("mov %rdx, %rax\n\tmov %rax, %rdx"),
+        "no quotient round-trip through %rax"
+    );
+}
+
+#[test]
 fn a_variable_shift_count_goes_in_cl() {
     // x86 shifts take the count in `%cl`; the right operand already lands in
     // `%rcx`, so no extra move is needed.
