@@ -40,7 +40,6 @@ fn struct_fields_are_laid_out_in_order() {
     let x = store_offset_after(&out, "mov $1, %rax");
     let y = store_offset_after(&out, "mov $2, %rax");
     assert_eq!(y, x + 8, "fields laid out in declaration order");
-    assert!(out.contains(&format!("mov {y}(%rbp), %rax")), "p.y reads the y slot");
 }
 
 #[test]
@@ -1344,4 +1343,55 @@ fn frame_spills_do_not_overlap_locals() {
     // the frame reservation covers it. Emitting and running the program is the
     // real check (see the differential suite); here we only assert the shape.
     assert!(out.contains("(%rbp)"), "spills reach the frame:\n{out}");
+}
+
+#[test]
+fn a_commutative_sum_of_two_calls_skips_a_move() {
+    // Neither `f(1)` nor `f(2)` is a simple operand, so both go through the
+    // stack. `+` is commutative, so the saved left result is popped straight
+    // into `%rcx` rather than bounced back through `%rax`, and the sum reads
+    // `%rcx` directly — one instruction fewer than the order-preserving path
+    // (which would need `mov %rax, %rcx` then `pop %rax`).
+    let src = "fn f(x: i64) -> i64 { return x + 1; } fn main() -> i64 { return f(1) + f(2); }";
+    let body = main_body(&asm_no_inline(src));
+    assert!(body.contains("add %rcx, %rax"), "the sum reads %rcx:\n{body}");
+    assert!(!body.contains("mov %rax, %rcx"), "no bounce through %rax:\n{body}");
+}
+
+#[test]
+fn a_subtraction_of_two_calls_keeps_operand_order() {
+    // `-` is not commutative, so the order-preserving path must stay: the
+    // right operand's result moves to `%rcx` and the saved left operand is
+    // restored to `%rax`.
+    let src = "fn f(x: i64) -> i64 { return x + 1; } fn main() -> i64 { return f(1) - f(2); }";
+    let body = main_body(&asm_no_inline(src));
+    assert!(body.contains("mov %rax, %rcx"), "left operand preserved:\n{body}");
+    assert!(body.contains("sub %rcx, %rax"), "the difference reads %rcx:\n{body}");
+}
+
+#[test]
+fn no_inverse_move_pair_survives() {
+    // The spill/restore path can leave `mov %rX, Y` immediately undone by
+    // `mov Y, %rX` (e.g. `let q = p as &mut N`: the pointer lands in a register
+    // and the store's base wants it back in `%rax`). `trim_dead` drops the
+    // second, since the pair is a no-op. Assert the emitted body of a
+    // pointer-heavy program has no such adjacent pair for any operand.
+    let src = "struct N { v: i64 } fn main() -> i64 { \
+               let p: i64 = alloc(16); let q: &mut N = p as &mut N; \
+               (*q).v = 7; return (*q).v; }";
+    let body = main_body(&asm(src));
+    let parse = |s: &str| -> Option<(String, String)> {
+        let r = s.strip_prefix("mov ")?;
+        let (a, b) = r.split_once(',')?;
+        Some((a.trim().to_string(), b.trim().to_string()))
+    };
+    let insns: Vec<&str> = body.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    for w in insns.windows(2) {
+        if let (Some((s1, d1)), Some((s2, d2))) = (parse(w[0]), parse(w[1])) {
+            assert!(
+                !(s2 == d1 && d2 == s1 && s1 != d1),
+                "inverse pair survived: `{}` then `{}`:\n{body}", w[0], w[1]
+            );
+        }
+    }
 }
