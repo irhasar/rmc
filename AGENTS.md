@@ -218,10 +218,17 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
   truncates the output between passes; the label counter, string table, spill
   high-water mark and frame-size measurement are part of that reset. Miss one and
   the two passes diverge.
-- **A callee-saved temporary is not worth it here.** Holding a value across a
-  call in `%r12`-`%r15` was implemented and measured *slower* (the save/restore
-  in the prologue/epilogue costs more than the spill it removes). Keep the frame
-  slot unless you re-measure.
+- **A callee-saved *temporary* is not worth it; a callee-saved *spill* is.** An
+  early attempt kept every short-lived value in `%r12`-`%r15` and measured
+  *slower* — the unconditional save/restore in the prologue/epilogue cost more
+  than the spills it removed. The shipped `spill_regs` is narrower: it holds
+  only the temporaries that must survive a call (the dry run reports how many),
+  so a function with no spill reserves no register and pays no push/pop. On the
+  recursive `fib` (which has exactly one such value per call) that is +23%
+  (`--no-tco`: 13.1 ms to 10.1 ms); it is invisible in the default benchmark
+  table because `tco` has already rewritten `fib`'s recursion into a loop with
+  no memory operation to remove. Do not widen it back to all temporaries, and
+  re-measure with `--no-tco` before touching it, or the win hides.
 - **Don't gate promotion on a use count.** A single-use local like `gcd`'s `b`
   is copied into `%rbx` once, read once in the loop, and costs a push/pop per
   call, so promoting only slots used more than once looked like a win on `mix`.
@@ -367,6 +374,23 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
   read back as zero. It raises if a produced binary exits non-zero, which
   catches the classic "measured a nonexistent path" bug. `--markdown PATH` writes
   the dated result to a file; the current one lives at `bench/RESULTS.md`.
+- **The sampler yields, it does not spin.** The `VmHWM` poll calls
+  `os.sched_yield()` between reads. A tight `wait4(WNOHANG)` spin keeps the
+  harness runnable for the whole child lifetime and competes with the benchmark
+  on a single-core host, inflating the wall time it is trying to measure. A
+  `sleep` would fix that but drops the sample rate enough to miss the peak of a
+  sub-millisecond process (`hello` read ~0.8 MB instead of the true ~2 MB), so
+  the loop yields and keeps polling.
+- **`heap` compares equal strides, not equal allocators.** rmc's `alloc` returns
+  a payload 8 bytes past a size header, so its 16-byte nodes are 24 bytes apart.
+  The Rust twin must use the same 24-byte stride or its smaller working set
+  flatters the walk; it still does not run a free list, so the ratio is about the
+  generated pointer code, not the allocators.
+- **`refs` is not an instruction-level tie.** Keeping the Rust loop real needs
+  an in-loop `black_box`, which costs a store/reload per iteration; rmc has no
+  such barrier and hoists the invariant method results with its own `licm`. Both
+  add a constant per iteration, but only the Rust side pays the barrier, so read
+  the `refs` ratio as "two real loops doing the same arithmetic".
 
 ## Tests
 

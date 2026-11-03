@@ -63,6 +63,14 @@ def measure_spawned(argv, reps):
     it is a high-water mark, so sampling it until the child exits captures the
     peak. It is taken as the maximum over the reps, because a sub-millisecond
     run can exit between two samples and read back as zero.
+
+    The sampling loop yields between reads (`sched_yield`). A tight
+    `wait4(WNOHANG)` spin would otherwise keep this process runnable for the
+    whole child lifetime and compete with the benchmark on a single-core host,
+    inflating the very wall time being measured. A `sleep` would give up CPU
+    too, but it also drops the sample rate enough to miss the peak of a
+    sub-millisecond process (measured: ~0.8 MB vs the true ~2 MB for `hello`),
+    so the loop yields rather than sleeps and keeps polling.
     """
     exe = shutil.which(argv[0]) or argv[0]
     walls, cpus, rsss = [], [], []
@@ -82,6 +90,7 @@ def measure_spawned(argv, reps):
                 done, status, ru = os.wait4(pid, os.WNOHANG)
                 if done:
                     break
+                os.sched_yield()
             wall = time.perf_counter() - t0
             if status != 0:
                 raise RuntimeError(f"run failed for {exe}: status={status}")
