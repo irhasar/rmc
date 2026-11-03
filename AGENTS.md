@@ -182,9 +182,14 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
   `for` body gets hoisted and the loop runs wrong. It hoists only a pure,
   non-trapping scalar: no call, division/modulo, index, dereference, block or
   `if`, and a field read only when the loop writes no memory at all. Any call in
-  the loop disables the whole loop, since a call can write anything. The pass is
-  off under `--overflow-checks` (a hoisted checked `+`/`-`/`*` would trap at the
-  wrong time); `--no-licm` disables it outright.
+  the loop disables the whole loop, since a call can write anything. The effect
+  scan must also see writes that do not name a slot directly: a `while`
+  condition and a `for`'s start/end run as part of the loop, taking a local's
+  address (`&mut x`) marks that slot as written (an inlined callee's deref store
+  reaches it), an assignment target is scanned as an expression
+  (`a[next(&mut x)] = 0`), and assigning a whole aggregate marks the loop as
+  writing memory. The pass is off under `--overflow-checks` (a hoisted checked
+  `+`/`-`/`*` would trap at the wrong time); `--no-licm` disables it outright.
 - **Stack slots grow downward.** A local in slot `s` lives at
   `-(s+1+nregs)*8(%rbp)`, where `nregs` is the number of registers holding
   promoted locals. Address them positively and you overwrite the saved
@@ -588,7 +593,10 @@ The README's roadmap lists the intended next steps.
   return needs no hidden pointer. Every synthesized `Expr::Var` must carry the
   right `slot`/`ty`, or codegen emits a load from the wrong frame word.
 - **The pass is guarded to be exact, not approximate.** Only `+`/`*` (associative)
-  qualify; `cond`, `guard`, `g` and `h` must be call-free, or the loop would
-  duplicate a side effect. A shape that does not match is left completely alone.
-  `tests/cases/tco.{rms,rs}` diffs `fib` and `fact` against rustc; a unit test
-  pins the non-associative `f(x-1) - f(x-2)` case as untouched.
+  qualify; `cond`, `guard`, `g` and `h` must be call-free and return-free, or the
+  loop would duplicate a side effect or leave without adding the accumulator. It
+  is also skipped entirely under `--overflow-checks`, since reassociating checked
+  arithmetic traps on a different intermediate than the recursion. A shape that
+  does not match is left completely alone. `tests/cases/tco.{rms,rs}` diffs `fib`
+  and `fact` against rustc; unit tests pin the non-associative
+  `f(x-1) - f(x-2)` case, a `return` in an argument, and overflow checks.

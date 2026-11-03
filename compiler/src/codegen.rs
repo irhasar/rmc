@@ -1029,7 +1029,7 @@ impl Codegen {
                             match self.field_operand(base, *offset) {
                                 Some(op) => match self.simple_operand(value) {
                                     Some(v) if v.starts_with('%') || v.starts_with('$') => {
-                                        self.line(&format!("mov {v}, {op}"));
+                                        self.store_operand(&v, &op);
                                     }
                                     _ => {
                                         self.gen_expr(value);
@@ -1314,10 +1314,24 @@ impl Codegen {
                 }
                 Some(format!("{}(%rbp)", self.array_off(*slot, size / 8) + offset))
             }
-            Expr::Var { slot, ty: Type::Ref(..), .. } => {
-                self.reg_of(*slot).map(|r| format!("{}({r})", offset))
+            Expr::Var { slot, ty: Type::Ref(inner, _), .. } => {
+                // A reference local's register holds its pointer, which is the
+                // struct's address only when the referent *is* a struct. For a
+                // `&&Struct` the referent is another pointer, so `r.field` must
+                // load that inner pointer first (see the read path).
+                match self.reg_of(*slot) {
+                    Some(r) if inner.is_aggregate() => Some(format!("{}({r})", offset)),
+                    _ => None,
+                }
             }
-            Expr::Deref { expr, .. } => self.ptr_reg(expr).map(|r| format!("{}({r})", offset)),
+            // `base` is `*expr`, whose value is the place `expr` points at. That
+            // place is the struct address only when the deref's own type is the
+            // aggregate; for `(*q).field` with `q: &&Struct` the deref yields a
+            // pointer, whose address is the reference cell, not the struct.
+            Expr::Deref { expr, ty } => match self.ptr_reg(expr) {
+                Some(r) if ty.is_aggregate() => Some(format!("{}({r})", offset)),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -1339,8 +1353,12 @@ impl Codegen {
     /// (`(**q).x`) has its inner pointer in memory and does not fold.
     fn addr_reg(&self, e: &Expr) -> Option<&'static str> {
         match e {
-            Expr::Var { slot, ty: Type::Ref(..), .. } => self.reg_of(*slot),
-            Expr::Deref { expr, .. } => self.ptr_reg(expr),
+            Expr::Var { slot, ty: Type::Ref(inner, _), .. } => {
+                self.reg_of(*slot).filter(|_| inner.is_aggregate())
+            }
+            Expr::Deref { expr, ty } => {
+                self.ptr_reg(expr).filter(|_| ty.is_aggregate())
+            }
             _ => None,
         }
     }
@@ -1373,7 +1391,7 @@ impl Codegen {
             if op.starts_with('%') || op.starts_with('$') {
                 self.gen_addr(target);
                 let disp = if k == 0 { String::new() } else { format!("{k}") };
-                self.line(&format!("mov {op}, {disp}(%rax)"));
+                self.store_operand(&op, &format!("{disp}(%rax)"));
                 return;
             }
         }
@@ -1382,6 +1400,17 @@ impl Codegen {
         self.gen_expr(value);
         self.pop_to("%rcx");
         self.line("mov %rax, (%rcx)");
+    }
+
+    /// Store register-or-immediate operand `op` into memory operand `dst`.
+    ///
+    /// An immediate store must be sized `movq`. `as` has no operand to infer a
+    /// width from in `mov $imm, mem`, so it defaults to a 32-bit store and
+    /// leaves the destination's upper four bytes untouched — a stale high half.
+    /// A register operand names its own width, so a plain `mov` is already 64-bit.
+    fn store_operand(&mut self, op: &str, dst: &str) {
+        let mnemonic = if op.starts_with('$') { "movq" } else { "mov" };
+        self.line(&format!("{mnemonic} {op}, {dst}"));
     }
 
     /// Leaves the address of an lvalue in `%rax`.

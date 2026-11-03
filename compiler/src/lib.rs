@@ -59,7 +59,7 @@ pub fn compile_to_asm(src: &str, opts: &CompileOptions) -> Result<String, String
         inline::run(&mut prog);
     }
     if !opts.no_tco {
-        tco::run(&mut prog);
+        tco::run(&mut prog, opts.overflow_checks);
     }
     if !opts.no_licm {
         licm::run(&mut prog, opts.overflow_checks);

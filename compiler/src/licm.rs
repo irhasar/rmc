@@ -71,12 +71,16 @@ impl Licm {
             Stmt::While(c, body) => {
                 self.expr_loops(c);
                 self.block(body);
-                let binds = self.hoist_loop(body, &[]);
+                // The condition runs before every iteration, so its effects are
+                // part of the loop's.
+                let mut eff = Effects::of_block(body);
+                eff.expr(c);
+                let binds = self.hoist_loop(body, &[], eff);
                 out.extend(binds);
             }
             Stmt::Loop(body) => {
                 self.block(body);
-                let binds = self.hoist_loop(body, &[]);
+                let binds = self.hoist_loop(body, &[], Effects::of_block(body));
                 out.extend(binds);
             }
             Stmt::For { start, end, body, var_slot, end_slot, .. } => {
@@ -86,8 +90,13 @@ impl Licm {
                 // The loop variable is assigned every iteration, and the bound
                 // is a slot the `for` itself writes; both live on the `For` node
                 // rather than in the body, so they are handed to the effect scan
-                // explicitly.
-                let binds = self.hoist_loop(body, &[*var_slot, *end_slot]);
+                // explicitly. The start and end expressions run once before the
+                // loop, but they can still call a function, so their effects must
+                // be included or a read of a variable they mutate looks invariant.
+                let mut eff = Effects::of_block(body);
+                eff.expr(start);
+                eff.expr(end);
+                let binds = self.hoist_loop(body, &[*var_slot, *end_slot], eff);
                 out.extend(binds);
             }
             Stmt::Let { init, .. } => {
@@ -168,9 +177,9 @@ impl Licm {
 
     /// Hoist the invariant subexpressions of one loop body, returning the
     /// bindings to run before the loop. `carried` names slots the loop itself
-    /// assigns outside the body (a `for`'s variable and bound).
-    fn hoist_loop(&mut self, body: &mut Block, carried: &[i32]) -> Vec<Stmt> {
-        let mut eff = Effects::of_block(body);
+    /// assigns outside the body (a `for`'s variable and bound), and `eff` is the
+    /// already-computed effect of the body plus the loop's condition or bounds.
+    fn hoist_loop(&mut self, body: &mut Block, carried: &[i32], mut eff: Effects) -> Vec<Stmt> {
         if eff.all {
             return Vec::new();
         }
@@ -219,13 +228,22 @@ impl Effects {
             }
             Stmt::Assign { target, value } => {
                 match target {
-                    Expr::Var { slot, .. } => {
+                    Expr::Var { slot, ty, .. } => {
                         self.slots.insert(*slot);
+                        // Assigning a whole aggregate writes several words, which
+                        // a reference to it observes; the slot alone does not
+                        // cover a read through a pointer to the struct.
+                        if ty.is_aggregate() {
+                            self.mem = true;
+                        }
                     }
                     // A store through a field, element or pointer writes memory
                     // the pass cannot track.
                     _ => self.mem = true,
                 }
+                // The target is itself an expression: an index or a dereference
+                // can call a function that mutates a local through a reference.
+                self.expr(target);
                 self.expr(value);
             }
             Stmt::Expr(e) => self.expr(e),
@@ -266,9 +284,17 @@ impl Effects {
                     self.expr(a);
                 }
             }
-            // Taking an address can let a callee write through it; be safe.
+            // Taking an address can let a callee — or a later dereference —
+            // write through it; be safe. A local whose address is taken may also
+            // be written through that pointer, so it is no longer invariant even
+            // if nothing assigns it directly. This is what catches `&mut x`
+            // passed to a function that was inlined into the loop: the call is
+            // gone, but the deref store it became still writes `x`.
             Expr::AddrOf { expr, .. } => {
                 self.mem = true;
+                if let Expr::Var { slot, .. } = expr.as_ref() {
+                    self.slots.insert(*slot);
+                }
                 self.expr(expr);
             }
             Expr::Bin(_, a, b) => {

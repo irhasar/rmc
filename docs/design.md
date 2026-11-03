@@ -392,7 +392,10 @@ return acc op guard(x)
 
 The recursive call `f(g(x))` stays a call; only the second call per level is
 removed, halving the call tree (2.0x on `fib`). The pass runs after inlining and
-before LICM, and is turned off by `--no-tco`.
+before LICM, and is turned off by `--no-tco`. It is also skipped entirely under
+`--overflow-checks`: reassociation is only exact for wrapping arithmetic, and the
+checked trap fires on the first overflowing intermediate, which the loop forms in
+a different order than the recursion.
 
 The shape test is deliberately narrow, because a wrong match is a wrong program.
 The function must take exactly one `i64` and return `i64` (so `x` is the only
@@ -401,9 +404,11 @@ statements: a base-case `if cond { return guard; }` with no `else`, and a
 `return f(g) op f(h)` whose two operands are both calls to the function itself.
 `op` must be `+` or `*` — subtraction and division are not associative, and a
 recursion that uses them is left alone. Finally `cond`, `guard`, `g` and `h` must
-be call-free, so that evaluating them a different number of times cannot change
-behaviour: `rmc` has no side-effecting user function, but a `print` nested in an
-argument would otherwise be duplicated by the loop.
+be call-free and return-free, so that evaluating them a different number of times
+cannot change behaviour: `rmc` has no side-effecting user function, but a `print`
+nested in an argument would otherwise be duplicated by the loop, and a `return`
+nested in an argument would leave the transformed loop instead of the recursive
+frame, dropping the accumulator.
 
 The transform is validated by `tests/cases/tco.{rms,rs}`, which diffs `fib` and
 `fact` against rustc for `n` in `0..20`, and by a unit test that checks a
@@ -424,8 +429,17 @@ by the loop and it cannot trap or write: no call, no division or modulo, no
 array index or dereference, and no block or `if`. A struct-field read is a
 memory read, so it is only hoisted when the loop writes no memory at all. A loop
 that contains any call is skipped entirely, because a call can write anything.
-A `for`'s variable and bound are assigned by the loop itself rather than in the
-body, so they are treated as loop-carried.
+
+The effect scan has to see writes that do not name a slot directly. A `while`
+condition and a `for`'s start/end expressions run as part of the loop, so their
+calls count too. Taking a local's address (`&mut x`) marks that slot as
+written, because an inlined callee's deref store or a later `*p = ...` reaches it
+through the pointer even though no statement assigns `x`. An assignment target is
+scanned as an expression, so `a[next(&mut x)] = 0` sees the call. And assigning a
+whole aggregate (`p = P { .. }`) marks the loop as writing memory, since it
+rewrites the words a reference to `p` reads. A `for`'s variable and bound are
+assigned by the loop itself rather than in the body, so they are treated as
+loop-carried.
 
 Hoisting a pure, non-trapping value earlier is otherwise safe: it can only waste
 a computation when the loop does not run, never change a result. The one
