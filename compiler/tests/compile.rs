@@ -356,6 +356,127 @@ fn a_non_exhaustive_match_in_a_loop_body_is_rejected() {
 }
 
 #[test]
+fn assigning_to_an_immutable_binding_is_rejected() {
+    // rustc rejects a second write to a `let` without `mut` (E0384); rmc used
+    // to accept it and write the slot anyway.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let x: i64 = 1; x = 2; return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("immutable variable `x`"), "got: {err}");
+}
+
+#[test]
+fn assigning_to_an_immutable_parameter_is_rejected() {
+    // A parameter is a `let` binding without `mut`, so assigning it is E0384.
+    let err = compile_to_asm(
+        "fn f(x: i64) -> i64 { x = x + 1; return x; } fn main() -> i64 { return f(1); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("immutable variable `x`"), "got: {err}");
+}
+
+#[test]
+fn a_mut_binding_and_a_mut_parameter_are_assignable() {
+    // The positive side: `let mut` and `mut x: T` allow the writes rustc allows.
+    assert!(compile_to_asm(
+        "fn f(mut x: i64) -> i64 { x = x + 1; return x; } \
+         fn main() -> i64 { let mut y: i64 = 1; y = y + 2; return f(y); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn reading_an_uninitialized_binding_is_rejected() {
+    // `let x: i64;` with no initializer and no write, then read: rustc rejects
+    // it with E0381.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let x: i64; return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("uninitialized variable `x`"), "got: {err}");
+}
+
+#[test]
+fn a_binding_initialized_on_every_branch_is_readable() {
+    // Both arms write `x`, so after the `if` it is definitely initialized.
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let x: i64; if true { x = 1; } else { x = 2; } return x; }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_binding_initialized_on_only_one_branch_is_not_readable() {
+    let err = compile_to_asm(
+        "fn main() -> i64 { let x: i64; if true { x = 1; } return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("uninitialized variable `x`"), "got: {err}");
+}
+
+#[test]
+fn a_binding_initialized_only_inside_a_loop_is_not_readable() {
+    // The loop may run zero times, so nothing it writes is guaranteed after it.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let x: i64; let mut i: i64 = 0; \
+         while i < 3 { x = 1; i = i + 1; } return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("uninitialized variable `x`"), "got: {err}");
+}
+
+#[test]
+fn writing_an_uninitialized_binding_before_reading_it_is_accepted() {
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let mut x: i64; x = 7; return x; }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_string_literal_is_not_an_integer() {
+    // A string literal has its own type, so `1 + "hi"` is a type error rather
+    // than an integer addition on the string's address (which rustc rejects
+    // with E0369).
+    let err = compile_to_asm(
+        "fn main() -> i64 { let x: i64 = \"hi\" + 1; return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("arithmetic expects"), "got: {err}");
+}
+
+#[test]
+fn an_integer_is_not_a_string_argument() {
+    // `print_str(42)` used to compile and segfault at runtime (the integer was
+    // dereferenced as a pointer). It is now a type error.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let x: i64 = 42; print_str(x); return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("print_str"), "got: {err}");
+}
+
+#[test]
+fn print_str_accepts_a_string_literal() {
+    assert!(compile_to_asm(
+        "fn main() -> i64 { print_str(\"hello\"); return 0; }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
 fn argument_setup_folds_a_constant_with_lea() {
     // `fib(n - 1)` must become one `lea`, not `mov; sub; mov`.
     let out = asm("fn f(n: i64) -> i64 { return n; } fn g(n: i64) -> i64 { return f(n - 1); } fn main() -> i64 { return 0; }");
@@ -524,13 +645,26 @@ fn bounds_checks_guard_a_variable_index() {
 }
 
 #[test]
-fn bounds_checks_reject_an_out_of_range_constant_at_compile_time() {
-    let out = compile_to_asm(
-        "fn main() -> i64 { let a: [i64; 2] = [1, 2]; return a[5]; }",
-        &CompileOptions { bounds_checks: true, ..Default::default() },
+fn a_constant_index_out_of_range_is_a_compile_error() {
+    // A constant index outside the array is rejected outright, with or without
+    // runtime bounds checks, exactly as rustc rejects it (E0080/E0608). This is
+    // the soundness-relevant direction: a program rmc accepts must not read
+    // memory it does not own.
+    for opts in [CompileOptions::default(), CompileOptions { bounds_checks: true, ..Default::default() }] {
+        let err = compile_to_asm(
+            "fn main() -> i64 { let a: [i64; 2] = [1, 2]; return a[5]; }",
+            &opts,
+        )
+        .unwrap_err();
+        assert!(err.contains("out of bounds"), "rejected with a bounds error: {err}");
+    }
+    // A negated constant is out of range too (`-1` parses as `Un(Neg, 1)`).
+    let err = compile_to_asm(
+        "fn main() -> i64 { let a: [i64; 2] = [1, 2]; return a[-1]; }",
+        &CompileOptions::default(),
     )
-    .unwrap();
-    assert!(out.contains("jmp __rmc_bounds"), "a constant out of range traps");
+    .unwrap_err();
+    assert!(err.contains("out of bounds"), "a negative constant is out of bounds: {err}");
 }
 
 #[test]
@@ -558,15 +692,18 @@ fn bounds_checks_guard_a_block_base() {
 }
 
 #[test]
-fn bounds_checks_guard_a_constant_index_on_a_non_local_base() {
-    // `make()[10]` takes the non-local constant-index branch; it must check too.
+fn bounds_checks_guard_a_runtime_index_on_a_non_local_base() {
+    // `make()[i]` takes the non-local, non-constant index branch; it must check
+    // too. (A constant index would be rejected at compile time, so the runtime
+    // path is only reachable with a variable index.)
     let out = compile_to_asm(
         "fn make() -> [i64; 3] { let a: [i64; 3] = [1; 3]; return a; } \
-         fn main() -> i64 { return make()[10]; }",
+         fn main() -> i64 { let i: i64 = 10; return make()[i]; }",
         &CompileOptions { bounds_checks: true, ..Default::default() },
     )
     .unwrap();
-    assert!(out.contains("jmp __rmc_bounds"), "an out-of-range constant traps");
+    assert!(out.contains("cmp $3, %rax"), "compares to the array length");
+    assert!(out.contains("jae __rmc_bounds"), "traps on out of range");
 }
 
 #[test]
@@ -587,15 +724,17 @@ fn the_bounds_handler_is_in_an_executable_section() {
 #[test]
 fn a_base_with_side_effects_runs_before_the_bounds_trap() {
     // Rust evaluates the base and index before the bounds check, so the base
-    // call must be emitted before the trap, not skipped by it.
+    // call must be emitted before the trap, not skipped by it. The index is a
+    // variable so the check is a runtime branch (a constant would be rejected
+    // at compile time).
     let out = compile_to_asm(
         "fn make() -> [i64; 1] { print_i64(7); return [4]; } \
-         fn main() -> i64 { return make()[2]; }",
+         fn main() -> i64 { let i: i64 = 2; return make()[i]; }",
         &CompileOptions { bounds_checks: true, ..Default::default() },
     )
     .unwrap();
     let call = out.find("call make").expect("the base call is emitted");
-    let trap = out.find("jmp __rmc_bounds").expect("the check traps");
+    let trap = out.find("jae __rmc_bounds").expect("the check traps");
     assert!(call < trap, "the base call must precede the bounds trap");
 }
 
@@ -1514,7 +1653,7 @@ fn an_inlined_parameter_assignment_does_not_reach_the_caller() {
     // slot rather than the caller's argument. Here `a` is promoted to `%r12`, so
     // the increment must target a different register and `%r12` must survive.
     let out = asm(
-        "fn bump(x: i64) -> i64 { x = x + 1; return x; } \
+        "fn bump(mut x: i64) -> i64 { x = x + 1; return x; } \
          fn main() -> i64 { let a: i64 = 5; return bump(a) * 100 + a; }",
     );
     assert!(!out.contains("call bump"), "bump is inlined in:\n{out}");

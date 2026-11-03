@@ -397,6 +397,65 @@ def reject_corpus():
         "stmt_in_loop": stmt(
             "let mut i: i64 = 0; while i < 1 { match e { E::A => { print_i64(1); } } i = i + 1; }",
             rs_decl="let e = E::A;"),
+        # Assignment to an immutable binding. rmc used to accept these and let
+        # codegen write the slot; rustc rejects each with E0384.
+        "assign_immutable_let": (
+            "fn main() -> i64 { let x: i64 = 1; x = 2; return x; }\n",
+            "fn main() { let x: i64 = 1; x = 2; println!(\"{}\", x); }\n",
+        ),
+        "assign_immutable_param": (
+            "fn f(x: i64) -> i64 { x = x + 1; return x; }\n"
+            "fn main() -> i64 { return f(1); }\n",
+            "fn f(x: i64) -> i64 { x = x + 1; x }\n"
+            "fn main() { println!(\"{}\", f(1)); }\n",
+        ),
+        "assign_immutable_compound": (
+            "fn main() -> i64 { let x: i64 = 1; x += 1; return x; }\n",
+            "fn main() { let x: i64 = 1; x += 1; println!(\"{}\", x); }\n",
+        ),
+        # A read of a binding that was declared but never initialized (E0381).
+        "use_uninit_scalar": (
+            "fn main() -> i64 { let x: i64; return x; }\n",
+            "fn main() { let x: i64; println!(\"{}\", x); }\n",
+        ),
+        # An uninitialized array whose elements are written in a loop and then
+        # read: rustc rejects it (it cannot see that the loop covers every
+        # element), so rmc must too.
+        "use_uninit_array": (
+            "fn main() -> i64 {\n"
+            "    let mut a: [i64; 6];\n"
+            "    let mut i: i64 = 0;\n"
+            "    while i < 6 { a[i] = i + 1; i = i + 1; }\n"
+            "    return a[0];\n"
+            "}\n",
+            "fn main() {\n"
+            "    let mut a: [i64; 6];\n"
+            "    let mut i: usize = 0;\n"
+            "    while i < 6 { a[i] = i as i64 + 1; i += 1; }\n"
+            '    println!("{}", a[0]);\n'
+            "}\n",
+        ),
+        # A constant index outside the array (E0080/E0608). rmc used to emit a
+        # trap only under --bounds-checks and otherwise read adjacent memory.
+        "const_index_positive_oob": (
+            "fn main() -> i64 { let a: [i64; 2] = [1, 2]; return a[5]; }\n",
+            "fn main() { let a: [i64; 2] = [1, 2]; println!(\"{}\", a[5]); }\n",
+        ),
+        "const_index_negative_oob": (
+            "fn main() -> i64 { let a: [i64; 2] = [1, 2]; return a[-1]; }\n",
+            "fn main() { let a: [i64; 2] = [1, 2]; println!(\"{}\", a[-1]); }\n",
+        ),
+        # A string literal is a `&str`, not an integer. Adding it to an integer
+        # (E0369) and passing it where an `i64` is expected must be rejected;
+        # rmc used to treat the string's address as an `i64`.
+        "add_int_to_str": (
+            "fn main() -> i64 { let s: i64 = \"hi\"; let x: i64 = s + 1; return x; }\n",
+            "fn main() { let s = \"hi\"; let x = s + 1; println!(\"{}\", x); }\n",
+        ),
+        "print_str_int": (
+            "fn main() -> i64 { let x: i64 = 42; print_str(x); return 0; }\n",
+            "fn main() { let s: &str = 42; println!(\"{}\", s); }\n",
+        ),
     }
 
 

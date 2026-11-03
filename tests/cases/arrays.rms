@@ -1,6 +1,6 @@
 // Arrays: fill syntax, constant and variable indexing, stores, aliasing.
 fn main() -> i64 {
-    let mut a: [i64; 10];
+    let mut a: [i64; 10] = [0; 10];
     let mut i: i64 = 0;
     while i < 10 {
         a[i] = i * i;
@@ -23,7 +23,7 @@ fn main() -> i64 {
     print_i64(c[0]);
     print_i64(c[1]);
     print_i64(c[2]);
-    let mut d: [i64; 4];
+    let mut d: [i64; 4] = [0; 4];
     d[3] = 42;
     d[0] = d[3] * 2;
     print_i64(d[0]);

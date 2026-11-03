@@ -5,7 +5,7 @@
 struct Node { val: i64, next: i64 }
 
 fn main() -> i64 {
-    let n: i64 = arg_i64(1);
+    let mut n: i64 = arg_i64(1);
     if n == 0 {
         n = 200000;
     }
