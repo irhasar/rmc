@@ -1804,22 +1804,25 @@ impl Codegen {
 
     /// Fold `dst = dst + a + b - c + ...` into one `add`/`sub` per term, when
     /// `dst` already holds the chain's leftmost operand (its own previous
-    /// value) and every other term is already a single operand (an immediate, a
-    /// register, or a memory reference). This replaces the generic expression
-    /// tree, which bounces every partial result through `%rax` and the spill
-    /// slots, with a flat run of `add`s and `sub`s on the accumulator's own
-    /// register — the shape of a running sum over locals and array elements.
+    /// value). A term that is already a single operand (an immediate, a
+    /// register, or a memory reference) folds straight into the instruction; a
+    /// term that needs evaluating (a call, a product) is computed into `%rax`
+    /// and added with one `add %rax, dst`. Either way this replaces the generic
+    /// expression tree, which bounces every partial result through `%rax` and
+    /// the spill slots, with a flat run of `add`s and `sub`s on the
+    /// accumulator's own register — the shape of a running sum.
     ///
     /// The chain is flattened first, so a nested sum counts: `acc + a + (b + c)`
-    /// becomes four adds rather than evaluating `b + c` in `%rax` and adding it
+    /// becomes three adds rather than evaluating `b + c` in `%rax` and adding it
     /// once. That case is common after LICM, which hoists each invariant term
     /// into its own local and can leave the surviving expression as a sum of
     /// sums.
     ///
-    /// Returns false when `e` is not such a chain, when a term needs evaluating
-    /// (a call, an index), or when a term reads the accumulator register itself:
-    /// `dst` is updated in place, so a term that read the *original* value would
-    /// see the running result instead. Each case falls back to the tree, which
+    /// Returns false when `e` is not such a chain or when a term reads the
+    /// accumulator register itself: `dst` is updated in place, so a term that
+    /// read the *original* value would see the running result instead. The
+    /// evaluated-term form is skipped under `--overflow-checks`, where that
+    /// `add` would need its own `jo`. Each case falls back to the tree, which
     /// keeps `dst` untouched until the end.
     fn gen_accumulate(&mut self, e: &Expr, dst: &str) -> bool {
         let mut terms: Vec<(bool, &Expr)> = Vec::new(); // (is_sub, operand)
@@ -1832,18 +1835,37 @@ impl Codegen {
         if terms[1..].iter().any(|(_, x)| self.uses_reg(x, dst)) {
             return false;
         }
-        // Resolve every term to a single operand before emitting anything, so a
-        // term that needs evaluating bails out without a half-written chain.
-        let mut ops: Vec<(bool, String)> = Vec::new();
+        // Resolve every term before emitting anything, so a term that cannot be
+        // folded bails out without a half-written chain. A simple operand folds
+        // straight into the `add`/`sub`; a term that must be evaluated (a call,
+        // a product) is computed into `%rax` and added with a single `add
+        // %rax, dst`, saving the `%rax`->`%rcx`->`%rax` bounce. The evaluated
+        // form is only sound with overflow checks off — it has no `jo` — and
+        // `%rax` is free between terms because no term may read `dst` and the
+        // scratch registers never include a promoted local.
+        enum Term<'a> {
+            Simple(String),
+            Eval(&'a Expr),
+        }
+        let mut plan: Vec<(bool, Term)> = Vec::new();
         for (is_sub, other) in &terms[1..] {
-            match self.simple_operand(other) {
-                Some(op) => ops.push((*is_sub, op)),
-                None => return false,
+            if let Some(op) = self.simple_operand(other) {
+                plan.push((*is_sub, Term::Simple(op)));
+            } else if !self.overflow {
+                plan.push((*is_sub, Term::Eval(other)));
+            } else {
+                return false;
             }
         }
-        for (is_sub, op) in ops {
+        for (is_sub, term) in plan {
             let mnemonic = if is_sub { "sub" } else { "add" };
-            self.line(&format!("{mnemonic} {op}, {dst}"));
+            match term {
+                Term::Simple(op) => self.line(&format!("{mnemonic} {op}, {dst}")),
+                Term::Eval(x) => {
+                    self.gen_expr(x);
+                    self.line(&format!("{mnemonic} %rax, {dst}"));
+                }
+            }
         }
         true
     }

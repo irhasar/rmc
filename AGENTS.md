@@ -495,9 +495,18 @@ The README's roadmap lists the intended next steps.
     instruction count (a running sum over locals drops to one `add`/`sub` per
     term; the `refs` loop goes 22 → 12) with no wall-clock regression, because
     these loops are latency-bound on the serial add chain and register renaming
-    hides the extra moves. Folding *call-result* terms is a different story: it
-    regressed `refs` by ~12%, which is why `gen_accumulate` bails out on any
-    term that needs evaluating.
+    hides the extra moves.
+  - **A term that needs evaluating folds too, when overflow checks are off.**
+    `sum = sum + f(i)` emits `call f; add %rax, dst` — one `add` on the
+    accumulator — instead of `call f; mov %rax, %rcx; mov dst, %rax; add %rcx,
+    %rax; mov %rax, dst`. That is three instructions fewer per iteration in
+    `mix` (the call-heavy benchmark), byte-identical output for `refs`/`stats`
+    (their loops are fully inlined and have no such term), and neutral-to-better
+    at run time. Terms are still emitted in source order, so a call that writes
+    a local an earlier term read is unaffected (`mut_aliasing` tests cover it).
+    An earlier rejection of this idea (a ~12% `refs` regression) predates the
+    inliner: that `refs` loop still held three calls, and folding them reordered
+    reads around them. With the loop inlined there is nothing to reorder.
   - **CSE into frame slots was measured and rejected.** De-duplicating repeated
     inlined subexpressions *within* a statement by binding each to a fresh slot
     (`refs`: 18 → 28 ms) loses to recomputing: the extra slot loses the

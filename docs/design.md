@@ -135,7 +135,11 @@ a `return`, or a tail expression).
   a separately-evaluated `%rax` sum. That shape is what LICM leaves behind, since
   it hoists each invariant term into its own local and the surviving expression
   is a sum of sums. A term that reads the accumulator on the right (`x = x + x`)
-  or that needs evaluating (a call, an index) falls back to the tree.
+  falls back to the tree. A term that needs evaluating (a call, an index) is
+  computed into `%rax` and added with one `add %rax, dst` when overflow checks
+  are off; with them on it falls back, since that `add` cannot trap. Terms are
+  emitted left to right, so a call that writes a local an earlier term read still
+  sees the read happen first.
 - Deep or nested operands fall back to spilling the left result while the right
   is evaluated, then reloading it into `%rax`. The first few spills go to
   callee-saved registers (`%r12`–`%r14`), so a value held across a call costs a
