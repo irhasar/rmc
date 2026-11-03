@@ -602,25 +602,20 @@ impl Sema {
                 Ok(())
             }
             Stmt::Assign { target, value } => {
-                // Reject a write to a non-`mut` binding before type-checking the
-                // value, so the error names the binding rather than a type. A
-                // write to a `mut` binding also makes it definitely initialized.
+                // The destination must be a mutable place. Checked before the
+                // value so the error names the binding rather than a type.
+                self.place_writable(target, scope, true)?;
+                // The value is checked first, so a self-referential initializer
+                // (`let x: i64; x = x + 1;`) still reads `x` as uninitialized.
+                let vty = self.check_expr(value, scope)?;
+                // The write initializes a whole binding; mark it before
+                // checking the target as a place, so `let x: i64; x = 7;` does
+                // not read `x` back as uninitialized.
                 if let Expr::Var { name, .. } = target {
-                    if let Some((_, _, mutable, init)) = Self::lookup(scope, name) {
-                        // A non-`mut` binding may be written exactly once, to
-                        // initialize it (`let x; x = 1;` is legal in Rust); any
-                        // later write is E0384. A `mut` binding is always
-                        // writable. Either way the write initializes it.
-                        if init && !mutable {
-                            return Err(format!(
-                                "cannot assign to immutable variable `{name}` (add `mut`)"
-                            ));
-                        }
-                        let i = Self::binding_index(scope, name).unwrap();
+                    if let Some(i) = Self::binding_index(scope, name) {
                         scope[i].init = true;
                     }
                 }
-                let vty = self.check_expr(value, scope)?;
                 let tty = self.check_lvalue(target, scope)?;
                 if vty != tty && !ref_coerces(&vty, &tty) {
                     return Err(format!("assignment type mismatch: target is {tty:?}, value is {vty:?}"));
@@ -716,6 +711,44 @@ impl Sema {
                 }
                 Ok(())
             }
+        }
+    }
+
+    /// The root binding of a place must be writable: a `mut` binding, or a
+    /// reference whose referent is mutable. A shared reference (`&T`) cannot be
+    /// written through. With `allow_uninit`, a not-yet-initialized binding is
+    /// writable too — an assignment may initialize it, whole or by field/element
+    /// (rustc allows a partial initializer and only rejects reading it). A
+    /// `&mut place` borrow passes `false`: borrowing an uninitialized place is
+    /// itself E0381. Mirrors rustc's E0594/E0596 for the cases rmc can express.
+    fn place_writable(
+        &mut self,
+        e: &mut Expr,
+        scope: &mut Scope,
+        allow_uninit: bool,
+    ) -> Result<(), String> {
+        match e {
+            Expr::Var { name, .. } => {
+                let (_, ty, mutable, init) = Self::lookup(scope, name)
+                    .ok_or_else(|| format!("unknown variable `{name}`"))?;
+                if mutable || matches!(ty, Type::Ref(_, true)) || (allow_uninit && !init) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "cannot assign to immutable variable `{name}` (add `mut`)"
+                    ))
+                }
+            }
+            Expr::Field { base, .. } => self.place_writable(base, scope, allow_uninit),
+            Expr::Index(base, _) => self.place_writable(base, scope, allow_uninit),
+            Expr::Deref { expr, .. } => match self.check_expr(expr, scope)? {
+                Type::Ref(_, true) => Ok(()),
+                Type::Ref(_, false) => {
+                    Err("cannot assign through a shared reference; use `&mut`".to_string())
+                }
+                other => Err(format!("cannot dereference a value of type {other:?}")),
+            },
+            _ => Err("invalid assignment target".into()),
         }
     }
 
@@ -1362,6 +1395,13 @@ impl Sema {
                 // no address of its own, so it is checked as a value and given a
                 // hidden frame slot to be materialised into.
                 let t = if is_lvalue(expr) {
+                    // `&mut place` needs a mutable place; rustc rejects
+                    // `&mut x` on an immutable binding (E0596). A non-lvalue
+                    // operand is materialised into a temporary, which is a
+                    // fresh mutable slot, so it is always borrowable.
+                    if *mutable {
+                        self.place_writable(expr, scope, false)?;
+                    }
                     self.check_lvalue(expr, scope)?
                 } else {
                     let t = self.check_expr(expr, scope)?;
