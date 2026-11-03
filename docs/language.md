@@ -149,10 +149,14 @@ return expr;
 `let` without an initialiser defers initialisation: the binding must be written
 before it is read, exactly as in Rust. Reading a binding that is not definitely
 initialised on every path is rejected (rustc's `E0381`), so `let x: i64;` then
-`return x;` does not compile. A `let` or parameter without `mut` may be written
-once, to initialise it, but no later write is allowed (rustc's `E0384`); add
-`mut` (or `mut x: T` on a parameter) to reassign. `for` bounds are evaluated
-once, before the loop; `continue` still runs the increment.
+`return x;` does not compile. Writing one field or element of an uninitialised
+aggregate leaves it uninitialised as a whole, so reading it is still an error
+(rustc's "partially assigned"). A `let` or parameter without `mut` is
+immutable: assigning it (rustc's `E0384`), assigning a field or element of it
+(`E0594`), or taking `&mut` of it (`E0596`) is rejected. Add `mut` (or `mut x:
+T` on a parameter) to write it. A `&mut T` reference is writable through without
+declaring the reference binding itself `mut`, exactly as in Rust. `for` bounds
+are evaluated once, before the loop; `continue` still runs the increment.
 
 ## Overflow
 

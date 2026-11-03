@@ -507,16 +507,28 @@ there. The hand-audit harness that found the original set lived outside the repo
 
 The checks, all in `sema.rs`:
 
-- **Mutability (`E0384`).** A `let`/parameter without `mut` may be written at
-  most once, to initialize it (`let x: i64; x = 1;` is legal Rust); any later
-  write errors. A `mut` binding is always writable. `mut` on a parameter is
-  recorded in `FnDef::param_mut` (the parser used to accept and discard it) and a
-  parameter is otherwise immutable, matching rustc: `fn f(x: i64) { x = 1; }` is
-  rejected, `fn f(mut x: i64) { x = 1; }` is not. The scope entry is a `Binding`
-  struct carrying `mutable` and `init`.
+- **Mutability (`E0384`/`E0594`/`E0596`).** A write must target a mutable
+  *place*. The check is `Sema::place_writable`, which walks a target to its root
+  binding: a `mut` binding, or a reference whose referent is mutable
+  (`&mut T`), is writable; a shared reference (`&T`) is not; an uninitialized
+  binding is writable when the caller passes `allow_uninit` (an assignment
+  initializes it — whole, by field, or by element, matching rustc's partial
+  initializer), but not for a `&mut place` borrow (borrowing an uninitialized
+  place is itself E0381). A bare-`Var` write of a non-`mut` binding that is
+  already initialized is E0384; a field/element write through a non-`mut` root
+  is E0594; `&mut x` on a non-`mut` binding is E0596. Checking the *place* rather
+  than just the target node is what closes field/element assignment and
+  `&mut`-borrow divergences that a bare-`Var` check missed. `mut` on a parameter
+  is recorded in `FnDef::param_mut` (the parser used to accept and discard it)
+  and a parameter is otherwise immutable: `fn f(x: i64) { x = 1; }` is rejected,
+  `fn f(mut x: i64) { x = 1; }` is not. The scope entry is a `Binding` struct
+  carrying `mutable` and `init`. Because a `&mut self` receiver has type `&mut
+  Self`, `self.n = ..` stays legal without `mut self`.
 - **Definite initialization (`E0381`).** `Binding::init` records whether a
-  binding is initialized at the current point. A read of an uninitialized one
-  errors. An `if`/`else` keeps a binding initialized only if both arms (or the
+  binding is initialized at the current point, and is set only by a whole-binding
+  write — a field or element write does not initialize the aggregate, matching
+  rustc's "partially assigned" rule, so reading it afterwards errors. A read of
+  an uninitialized one errors. An `if`/`else` keeps a binding initialized only if both arms (or the
   entry state) initialized it; a branch with no `else` and a loop body do not
   count, because they may not run. This is deliberately conservative — it rejects
   the uninitialized-array-filled-in-a-loop pattern (`let mut a: [i64; N]; while
