@@ -225,7 +225,16 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
   used `off(slot)`, the wrong end of the range).
 - **`for` is not a `while`.** `continue` must run the increment, so `for` keeps
   its own node with a dedicated continue label. Desugaring it to `while` would
-  make `continue` skip the increment and loop forever.
+  make `continue` skip the increment and loop forever. For the same reason `for`
+  is *not* rotated while `while` is: its increment sits between the body and the
+  guard, so a rotated form would run the increment before the first body
+  iteration (skipping it) or need the guard duplicated.
+- **`while` is rotated.** The test is emitted at the bottom as the back edge
+  (`gen_branch_true`, a `jl`/`jne`) with an entry `jmp` reusing the same test, so
+  an iteration is one branch fewer than the top-tested form. `continue` targets
+  the bottom test and `break` the label it falls into. If you change the loop
+  shape, keep both: a rotation that forgets the entry test loops forever on a
+  false condition, and one that targets the body for `continue` skips the test.
 - **Promotion counting must stay linear.** `counts` is built in slot order and
   `count_expr` indexes it directly by slot; do not reintroduce a linear `find`
   per reference or per excluded slot, which is O(n^2) and made a 200k-element
@@ -462,6 +471,14 @@ The README's roadmap lists the intended next steps.
   safe way to materialise an expression straight into a destination register
   during argument setup, and a scalar `let`/assignment writes straight into a
   promoted local's register rather than bouncing through `%rax`.
+  - **Retargeting a trailing `mov SRC, %rax` to `dst` was measured and
+    rejected.** When `gen_expr` ends with a move into `%rax` (the modulo-by-
+    constant tail's `mov %r8, %rax`), emitting `mov SRC, dst` instead of
+    `mov SRC, %rax; mov %rax, dst` saves an instruction, but it measured neutral
+    at run time (the loops are latency-bound, and register renaming hides the
+    extra move) and shrank the artifact by only 8 bytes on two of eight programs.
+    The transform also has to be careful: truncating to the pre-expression
+    offset wipes the whole expression, not just the final move.
 - **`emit_cmp` folds a register operand.** `cmp %r, %r` and `cmp %r, mem` are
   legal, so a comparison between two promoted locals is one instruction; only a
   `mem, mem` compare must materialise one side into `%rax`.

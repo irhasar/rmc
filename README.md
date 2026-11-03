@@ -206,52 +206,52 @@ LLVM 23.1.1, AMD EPYC 9B14, x86-64; medians of 5 compiles and 9 runs):
 
 | program | compiler | compile wall | compile CPU | compile RAM | artifact | run wall | run CPU | run RAM |
 | ------- | -------- | -----------: | ----------: | ----------: | -------: | -------: | ------: | ------: |
-| hello | rmc | 6.31 ms | 6.27 ms | 2.6 MB | 6648 B | 0.28 ms | 0.14 ms | 28 kB |
-| hello | rustc | 2090.90 ms | 2091.46 ms | 186.0 MB | 289416 B | 0.89 ms | 0.76 ms | 2074 kB |
-| fib | rmc | 6.45 ms | 6.40 ms | 2.6 MB | 6744 B | 9.97 ms | 9.84 ms | 28 kB |
-| fib | rustc | 2110.88 ms | 2114.95 ms | 186.2 MB | 291696 B | 7.23 ms | 7.09 ms | 2039 kB |
-| mandel | rmc | 7.37 ms | 6.91 ms | 2.6 MB | 7032 B | 96.49 ms | 96.25 ms | 28 kB |
-| mandel | rustc | 2141.67 ms | 2142.49 ms | 189.3 MB | 291776 B | 105.79 ms | 105.53 ms | 2047 kB |
-| sieve | rmc | 8.55 ms | 8.47 ms | 4.2 MB | 6792 B | 1.65 ms | 1.51 ms | 1588 kB |
-| sieve | rustc | 2107.70 ms | 2111.99 ms | 184.9 MB | 292016 B | 2.51 ms | 2.39 ms | 3543 kB |
-| mix | rmc | 6.42 ms | 6.38 ms | 2.6 MB | 6808 B | 16.94 ms | 16.76 ms | 28 kB |
-| mix | rustc | 2100.23 ms | 2104.52 ms | 185.7 MB | 291864 B | 15.55 ms | 15.41 ms | 2008 kB |
-| stats | rmc | 6.39 ms | 6.34 ms | 2.6 MB | 6888 B | 3.27 ms | 3.14 ms | 28 kB |
-| stats | rustc | 2109.00 ms | 2108.07 ms | 185.6 MB | 292048 B | 3.76 ms | 3.62 ms | 2004 kB |
-| refs | rmc | 6.71 ms | 6.65 ms | 2.7 MB | 7376 B | 4.88 ms | 4.72 ms | 24 kB |
-| refs | rustc | 2122.76 ms | 2127.45 ms | 190.8 MB | 292240 B | 5.00 ms | 4.81 ms | 2000 kB |
-| heap | rmc | 6.54 ms | 6.45 ms | 2.6 MB | 6808 B | 3.63 ms | 3.49 ms | 4716 kB |
-| heap | rustc | 2154.70 ms | 2159.06 ms | 185.3 MB | 292368 B | 2.75 ms | 2.61 ms | 5004 kB |
+| hello | rmc | 6.55 ms | 6.48 ms | 2.6 MB | 6648 B | 0.28 ms | 0.15 ms | 28 kB |
+| hello | rustc | 2138.91 ms | 2139.95 ms | 184.9 MB | 289416 B | 0.86 ms | 0.74 ms | 2070 kB |
+| fib | rmc | 6.71 ms | 6.63 ms | 2.6 MB | 6744 B | 10.10 ms | 9.94 ms | 28 kB |
+| fib | rustc | 2129.69 ms | 2131.73 ms | 184.6 MB | 291696 B | 7.13 ms | 6.98 ms | 2016 kB |
+| mandel | rmc | 6.64 ms | 6.59 ms | 2.6 MB | 7032 B | 96.47 ms | 96.25 ms | 28 kB |
+| mandel | rustc | 2130.06 ms | 2132.37 ms | 187.9 MB | 291776 B | 105.39 ms | 105.21 ms | 2031 kB |
+| sieve | rmc | 8.60 ms | 8.52 ms | 4.2 MB | 6792 B | 1.69 ms | 1.57 ms | 1588 kB |
+| sieve | rustc | 2108.36 ms | 2113.15 ms | 184.6 MB | 292016 B | 2.50 ms | 2.36 ms | 3469 kB |
+| mix | rmc | 6.50 ms | 6.43 ms | 2.6 MB | 6808 B | 16.94 ms | 16.76 ms | 28 kB |
+| mix | rustc | 2162.07 ms | 2166.46 ms | 189.3 MB | 291864 B | 15.62 ms | 15.44 ms | 2035 kB |
+| stats | rmc | 6.60 ms | 6.50 ms | 2.6 MB | 6880 B | 3.76 ms | 3.61 ms | 24 kB |
+| stats | rustc | 2144.71 ms | 2149.35 ms | 184.8 MB | 292048 B | 3.78 ms | 3.65 ms | 2055 kB |
+| refs | rmc | 6.77 ms | 6.73 ms | 2.7 MB | 7376 B | 4.72 ms | 4.59 ms | 28 kB |
+| refs | rustc | 2121.44 ms | 2126.30 ms | 190.5 MB | 292240 B | 3.86 ms | 3.72 ms | 2063 kB |
+| heap | rmc | 6.53 ms | 6.47 ms | 2.6 MB | 6808 B | 3.61 ms | 3.47 ms | 4712 kB |
+| heap | rustc | 2133.44 ms | 2136.84 ms | 190.5 MB | 292368 B | 2.76 ms | 2.63 ms | 5023 kB |
 
 Summary of the ratios (rustc ÷ rmc, so >1 means rmc is better):
 
 | dimension         | ratio      |
 | ----------------- | ---------: |
-| compile wall      | ~246–331×  |
-| compile CPU       | ~249–334×  |
-| compiler peak RAM | ~43–74×    |
+| compile wall      | ~245–333×  |
+| compile CPU       | ~248–337×  |
+| compiler peak RAM | ~44–75×    |
 | artifact size     | ~40–44×    |
-| run wall time     | 0.73–3.16× (rustc faster on call-heavy and pointer-chasing code) |
-| run CPU           | 0.72–5.51× |
-| run peak RAM      | ~1.1× on the heap-heavy case, ~73–85× elsewhere |
+| run wall time     | 0.71–3.11× (rustc faster on call-heavy, pointer-chasing and reference-heavy code) |
+| run CPU           | 0.70–4.90× |
+| run peak RAM      | ~1.1× on the heap-heavy case, ~74–88× elsewhere |
 
-The compile-time win is the point of the project: `rmc` builds in about 6 ms
-where rustc needs about 2.1 s, using ~2.6 MB of RAM against ~186 MB and writing
+The compile-time win is the point of the project: `rmc` builds in about 6–9 ms
+where rustc needs about 2.1 s, using ~2.6 MB of RAM against ~185 MB and writing
 a ~7 KB static binary against a ~290 KB one. The run-time picture is mixed and
-close: `rmc` wins on `hello` (3.2×), `sieve` (1.5×), `stats` (1.15×), `mandel`
-(1.10×) and `refs` (1.02×) because the workload is a tight loop or a single call
-and the static binary has no libc startup; it loses on `fib` (0.73×, call-heavy
-— rustc turns the right-spine recursion into a loop, rmc keeps two calls per
-level) and on `heap` (0.76×, pointer chasing through the allocator), and is
-within 10% on `mix` (0.92×), where LLVM inlines the whole loop-bearing `gcd`
-into `main` while rmc's inliner deliberately leaves loops alone. On `refs` both
-compilers now do the same work: rmc's loop is six instructions adding two values
-hoisted out of the loop, and rustc's is a comparable register loop, so the two
-are within ~2%. (An earlier run reported `refs` at 0.14×; that was LLVM folding
-the *whole* loop into `128 * n` in the Rust twin, which is not a measurement of
-the loop. The twin now `black_box`es a term, and the honest number is ~1.0×.) On
-`heap`, rmc's first-fit free list and the Rust twin's bump arena are both
-sub-millisecond of the total, so the gap is the pointer-chasing loop itself. The
+close: `rmc` wins on `hello` (3.1×), `sieve` (1.5×) and `mandel` (1.09×) because
+the workload is a tight loop or a single call and the static binary has no libc
+startup, and is a dead heat on `stats` (~1.0×). It loses on `fib` (0.71×,
+call-heavy — rustc turns the right-spine recursion into a loop, rmc keeps two
+calls per level), on `heap` (0.76×, pointer chasing, where rustc inlines its
+allocator into a bare bump pointer and rmc makes a call per node), on `refs`
+(0.82×, where LLVM keeps the struct in registers across the loop and rmc reloads
+it) and on `mix` (0.92×, where LLVM inlines the whole loop-bearing `gcd` into
+`main` while rmc's inliner deliberately leaves loops alone). Run times are the
+noisiest column: they move ±20% between recordings on a shared machine, so treat
+a single run's ratio as indicative and re-measure with many samples before
+trusting a sub-5% difference. (An early `refs` run reported 0.14×; that was LLVM
+folding the *whole* loop into `128 * n` in the Rust twin, not a measurement of
+the loop. The twin now `black_box`es a term, and `refs` sits at ~0.82×.) The
 binary's tiny footprint also shows at run time: an `rmc` program peaks at ~28 kB
 of RAM, a rustc one at ~2 MB — except on `heap` and `sieve`, where the arena each
 program allocates dominates and the two converge.
