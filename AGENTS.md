@@ -487,6 +487,13 @@ against `rustc -O`. A generated shift amount must stay `i64`-typed: rustc infers
 `i64`-only and masks to 6, so an untyped count reports a divergence that is not a
 bug.
 
+The fuzzer's grammar is narrower than the language, so it does not reach every
+construct; three divergences found by hand-probing were an enum `match` with no
+`_` arm used as a *value* (not a statement), a method on a *payload* enum, and an
+array of a unit enum. `stmt` mode now emits all three, so a regression in any of
+them fails the fuzz job at `iter=0`. When adding a language feature, extend the
+generator to exercise it — a clean fuzz run only covers the shapes it emits.
+
 ## Scope
 
 This is a small, self-contained compiler, not a general Rust compiler. Do not
