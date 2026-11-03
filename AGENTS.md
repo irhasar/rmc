@@ -392,10 +392,19 @@ The README's roadmap lists the intended next steps.
   scalar locals, constant-index array elements, and struct fields of a local.
   `array_elem_operand` returns the `disp(%rbp,%rax,8)` form whose index must
   first be loaded into `%rax`.
-- Folding arithmetic memory operands into `add`/`imul` and the in-place
-  `x = x + e` form were both tried and measured *slower* on the Zen cores this
-  was tuned on, so they were removed. Keep the plain two-register form unless
-  you re-measure on the target CPU.
+- Folding arithmetic memory operands into `add`/`imul` and the plain two-operand
+  in-place `x = x + e` form were both tried and measured *slower* on the Zen
+  cores this was tuned on, so they were removed. Keep the plain two-register
+  form unless you re-measure on the target CPU.
+  - The multi-term **accumulation fold** (`gen_accumulate`) is a narrower form
+    that was measured neutral: it applies only when `x` is promoted, no term
+    reads `x`'s register, and every term is already a single operand. It cuts
+    instruction count (a running sum over locals drops to one `add`/`sub` per
+    term; the `refs` loop goes 22 → 12) with no wall-clock regression, because
+    these loops are latency-bound on the serial add chain and register renaming
+    hides the extra moves. Folding *call-result* terms is a different story: it
+    regressed `refs` by ~12%, which is why `gen_accumulate` bails out on any
+    term that needs evaluating.
 - Division or modulo by a literal divisor does not use `idiv`. `gen_div_const`
   emits the Hacker's Delight magic multiply (the same algorithm LLVM uses),
   with a sign fixup and, for roughly a quarter of divisors, an extra add of the
