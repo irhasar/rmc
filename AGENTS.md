@@ -416,7 +416,11 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
 ## Tests
 
 `tests/run.py` compiles each `tests/cases/NAME.{rms,rs}` pair with both compilers
-and diffs stdout and the exit status. `aggsem` (by-value aggregate assignment,
+and diffs stdout and the exit status. Every case is then recompiled with the
+optimiser passes disabled in turn (`--no-inline`, `--no-licm`, `--no-tco`, and
+all three at once), because a bug in one pass can hide behind another or only
+show on the unoptimised path; the Rust twin is built once and reused. `aggsem`
+(by-value aggregate assignment,
 inferred aggregates, nested fields, indexing a returned array), `cmpsem`
 (single evaluation of a side-effecting subscript in a compound assignment,
 struct-literal field order) and `utf8` (non-ASCII string literals) guard the

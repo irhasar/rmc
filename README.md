@@ -95,7 +95,11 @@ std::fs::write("out.s", asm)?;
 `tests/cases/NAME.rms` and `tests/cases/NAME.rs`, written to behave identically;
 the runner compiles both, runs them, and fails if stdout or the exit status
 differs. `tests/args.json` optionally maps a case to argv vectors so the same
-program is exercised with several runtime inputs.
+program is exercised with several runtime inputs. Each case is then recompiled
+with the optimiser passes turned off in turn (`--no-inline`, `--no-licm`,
+`--no-tco`, and all three at once), since a bug in one pass can hide behind
+another or only appear on the unoptimised path; the Rust twin is built once and
+reused across the five configurations.
 
 ```sh
 python3 tests/run.py -v
