@@ -195,6 +195,12 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
   call in `%r12`-`%r15` was implemented and measured *slower* (the save/restore
   in the prologue/epilogue costs more than the spill it removes). Keep the frame
   slot unless you re-measure.
+- **Don't gate promotion on a use count.** A single-use local like `gcd`'s `b`
+  is copied into `%rbx` once, read once in the loop, and costs a push/pop per
+  call, so promoting only slots used more than once looked like a win on `mix`.
+  It measured neutral (0.998–1.009× across the suite, `mix` unchanged): the
+  extra frame store/load replaces the register push/pop one-for-one. Keep the
+  `> 0` filter.
 - **Saved registers sit between `%rbp` and the frame.** The epilogue must point
   `%rsp` at the lowest saved register (or add the frame size back) before
   popping, otherwise `pop` reads the frame and the return address is lost.
