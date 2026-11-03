@@ -105,13 +105,15 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
   per field and the `refs` benchmark ran at 69 ms; the fold brought rmc's own
   runtime down ~1.4x to ~50 ms. Inlining the accessors then removed the calls
   entirely, taking `refs` to ~20 ms, and LICM hoisted the now-inlined struct
-  reads out of the loop, taking it to ~6 ms (rustc is still ~3x ahead on `refs`
-  — it keeps the struct in registers across the loop, which rmc does not). The
-  fold is deliberately *one* level deep: a `*p` used as a
-  reference has its pointer in memory, so `ptr_reg` only matches a reference
-  *local*, never a `Deref`. `addr_reg` (local or one `Deref` of a local) is the
-  form `gen_addr` folds for a `lea`. Extending either to a deeper chain would
-  read the inner pointer from a register it is not in — the bug that
+  reads out of the loop, taking it to ~6 ms. Flattening the accumulator fold over
+  the nested sum LICM leaves (`acc + t + (t + p) + p`), and unwrapping the
+  inliner's spliced block so the fold can see it, took `refs` to ~4.7 ms (rustc
+  is still ~5.7x ahead on `refs` — it keeps the struct in registers across the
+  loop, which rmc does not). The fold is deliberately *one* level deep: a `*p`
+  used as a reference has its pointer in memory, so `ptr_reg` only matches a
+  reference *local*, never a `Deref`. `addr_reg` (local or one `Deref` of a local)
+  is the form `gen_addr` folds for a `lea`. Extending either to a deeper chain
+  would read the inner pointer from a register it is not in — the bug that
   `(**ppr).x` in `tests/cases/references.rms` guards against.
 - **A scalar `*p` read is a memory operand.** `simple_operand` returns `(%reg)`
   for a non-aggregate `Deref` whose pointer is a reference local, so `*p < 5`
@@ -134,8 +136,15 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
   candidate body must be call-free and straight-line; because it is, inlining it
   cannot expose new calls, but the pass still runs to a *fixpoint* because a
   function only becomes call-free after its own callees are inlined (the `refs`
-  wrapper `sum_via_ref` needs round two). `--no-inline` disables it; the tests
+  wrapper `sum_via_ref` needs round two). A statement-free block is unwrapped to
+  its tail after expansion: the spliced body of an accessor would otherwise stay
+  wrapped in an `Expr::Block`, and later passes (`simple_operand`, the
+  accumulator fold) cannot see through a block, so the hot loop would bounce its
+  sum through `%rax` and the spill slots. `--no-inline` disables it; the tests
   that assert on the calling convention (`call f`, argument setup) use it.
+  `MAX_NODES` (48) must stay above a two-level helper — `sum_via_ref` is 35
+  nodes once its accessors land — and `count_expr` must count a block's tail,
+  or a candidate's size is understated and it is wrongly admitted.
 - **LICM hoists a loop body's invariant arithmetic, and `for` slots are
   loop-carried.** The pass rewrites only a loop *body*; a `while` condition and
   a `for`'s bounds run once per iteration by design. A `for`'s variable and

@@ -1065,6 +1065,35 @@ fn accumulation_does_not_reuse_a_clobbered_accumulator() {
 }
 
 #[test]
+fn accumulation_flattens_a_nested_sum() {
+    // `acc = acc + a + (b + c) + c`: the parenthesised sum is flattened into the
+    // same in-place chain of adds, not evaluated in `%rax` and added once.
+    let src = "fn main() -> i64 { let a: i64 = 3; let b: i64 = 5; let c: i64 = 7; \
+               let mut acc: i64 = 0; let mut i: i64 = 0; \
+               while i < 10 { acc = acc + a + (b + c) + c; i = i + 1; } return acc; }";
+    let body = loop_body(&asm_no_licm(src));
+    assert_eq!(body.matches("add ").count(), 4, "one add per term in:\n{body}");
+    assert!(!body.contains("mov %rax"), "no `%rax` bounce in:\n{body}");
+    assert!(!body.contains("mov %rax, -"), "no spill in:\n{body}");
+}
+
+#[test]
+fn an_inlined_accessor_chain_folds_into_the_accumulator() {
+    // The `refs` shape: a `&self` accessor inlined into a running sum. Once the
+    // inliner unwraps the spliced block, the accessor's fields are plain
+    // operands, so the sum folds into one add per term with no `%rax` bounce and
+    // no call.
+    let src = "struct W { a: i64, b: i64 } \
+               impl W { fn sum(&self) -> i64 { return self.a + self.b; } } \
+               fn main() -> i64 { let w: W = W { a: 3, b: 4 }; let wr: &W = &w; \
+               let mut acc: i64 = 0; let mut i: i64 = 0; \
+               while i < 10 { acc = acc + wr.sum(); i = i + 1; } return acc; }";
+    let body = loop_body(&asm(src));
+    assert!(!body.contains("call"), "the accessor is inlined:\n{body}");
+    assert!(!body.contains("mov %rax"), "the sum folds into the accumulator:\n{body}");
+}
+
+#[test]
 fn a_small_accessor_call_is_inlined_away() {
     // A `&self` accessor is small and call-free, so a call to it becomes its
     // body: no `call` and no argument setup remain.

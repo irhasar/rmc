@@ -109,9 +109,12 @@ a `return`, or a tail expression).
   register, no term reads `x`'s own register, and every term is already a single
   operand (an immediate, a local, or an array element), folds into one
   `add`/`sub` per term on that register instead of a tree that bounces each
-  partial result through `%rax` and the spill slots. A term that reads the
-  accumulator on the right (`x = x + x`) or that needs evaluating (a call, a
-  nested expression) falls back to the tree.
+  partial result through `%rax` and the spill slots. The chain is flattened
+  first, so a nested sum counts: `x + a + (b + c)` is four adds, not one add of
+  a separately-evaluated `%rax` sum. That shape is what LICM leaves behind, since
+  it hoists each invariant term into its own local and the surviving expression
+  is a sum of sums. A term that reads the accumulator on the right (`x = x + x`)
+  or that needs evaluating (a call, an index) falls back to the tree.
 - Deep or nested operands fall back to spilling the left result while the right
   is evaluated, then reloading it into `%rax`. The first few spills go to
   callee-saved registers (`%r12`–`%r14`), so a value held across a call costs a
@@ -384,7 +387,10 @@ promotion (a few percent on `mix` and `sieve`), the reference-operand folds plus
 `trim_dead` (1.4x on the `refs` benchmark), inlining (2.6x on `refs`, by removing
 the three accessor calls from its hot loop), and loop-invariant code motion (a
 further 2.9x on `refs`, by hoisting the now-inlined struct reads out of the
-loop); everything else is local and cheap to compute.
+loop); everything else is local and cheap to compute. Flattening the accumulator
+fold over a nested sum, plus unwrapping the inliner's spliced block so the fold
+can see the accessor arithmetic, is what turns LICM's three hoisted values into
+a six-instruction loop (`refs` 6.4 → 4.7 ms, 0.14x → 0.18x).
 
 On the language side the notable absences are: `u*`/`i*` widths other than
 `i64`, floating point, traits and generics, closures, `for` over arbitrary
