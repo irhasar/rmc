@@ -94,11 +94,12 @@ def check_bounds_traps():
     # Each case is (source, required stdout prefix). The prefix checks that a
     # base with a side effect runs before the trap: Rust evaluates the base and
     # index before the bounds check, so `make()[2]` must print before it exits.
+    # A constant index out of range is rejected at compile time, so every
+    # runtime trap uses a variable index (the value is known but not a literal).
     cases = {
-        "constant": ("fn main() -> i64 { let a: [i64; 1] = [1; 1]; return a[2]; }", b""),
         "block": ("fn main() -> i64 { let i: i64 = 9; let v: i64 = { let t: [i64; 3] = [10, 20, 30]; t }[i]; return v; }", b""),
-        "call": ("fn make() -> [i64; 3] { let a: [i64; 3] = [10, 20, 30]; return a; } fn main() -> i64 { return make()[10]; }", b""),
-        "base_effect": ("fn make() -> [i64; 1] { print_i64(7); return [4]; } fn main() -> i64 { return make()[2]; }", b"7\n"),
+        "call": ("fn make() -> [i64; 3] { let a: [i64; 3] = [10, 20, 30]; return a; } fn main() -> i64 { let i: i64 = 10; return make()[i]; }", b""),
+        "base_effect": ("fn make() -> [i64; 1] { print_i64(7); return [4]; } fn main() -> i64 { let i: i64 = 2; return make()[i]; }", b"7\n"),
     }
     failures = 0
     for name, (src, want_stdout) in cases.items():
