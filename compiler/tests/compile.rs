@@ -390,6 +390,72 @@ fn a_mut_binding_and_a_mut_parameter_are_assignable() {
 }
 
 #[test]
+fn a_duplicate_parameter_name_is_rejected() {
+    // rustc rejects two parameters with the same name (E0415); rmc used to
+    // accept it and bind both to the same slot.
+    let err = compile_to_asm(
+        "fn f(x: i64, x: i64) -> i64 { return x; } fn main() -> i64 { return f(1, 2); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("bound more than once"), "got: {err}");
+}
+
+#[test]
+fn main_with_a_parameter_is_rejected() {
+    // The entry point takes no arguments (rustc E0580).
+    let err = compile_to_asm(
+        "fn main(x: i64) -> i64 { return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("`main` takes no parameters"), "got: {err}");
+}
+
+#[test]
+fn constant_division_by_zero_is_rejected() {
+    // rustc denies `1 / 0` (it would panic); rmc used to emit an `idiv` that
+    // faults at run time.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let x: i64 = 1 / 0; return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("division by zero"), "got: {err}");
+}
+
+#[test]
+fn constant_overflow_is_rejected() {
+    // Under the overflow checks rmc emits, `i64::MAX + 1` traps, so a constant
+    // one is a compile error, exactly as rustc denies it.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let x: i64 = 9223372036854775807 + 1; return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("overflows"), "got: {err}");
+}
+
+#[test]
+fn an_out_of_range_constant_shift_is_rejected() {
+    let err = compile_to_asm(
+        "fn main() -> i64 { return 1 << 64; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("shift amount"), "got: {err}");
+}
+
+#[test]
+fn in_range_constant_arithmetic_is_accepted() {
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let x: i64 = (1 << 62) + 3; let y: i64 = x / 7 % 5; return y; }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
 fn assigning_to_a_field_of_an_immutable_binding_is_rejected() {
     // The mutability check must reach a field or element, not just a bare
     // variable: rustc rejects `p.x = 2` when `p` is not `mut` (E0594).
@@ -873,8 +939,12 @@ fn bitwise_and_shift_emit_the_right_instructions() {
     assert!(out.contains("xor %r12, %rax"), "a variable right operand folds in");
     assert!(out.contains("or %rcx, %rax"), "a complex right operand still bounces");
 
-    let out = asm("fn main() -> i64 { return 1 << 70; }");
-    assert!(out.contains("sal $6, %rax"), "70 & 63 == 6");
+    // An out-of-range constant shift (`1 << 70`) is rejected at compile time,
+    // matching rustc; the 6-bit mask applies only to a run-time count, which
+    // the hardware does anyway (`sal %cl` masks `%cl` to 6 bits for a 64-bit
+    // operand).
+    let out = asm("fn main() -> i64 { let n: i64 = 70; return 1 << n; }");
+    assert!(out.contains("sal %cl, %rax"), "a variable shift count goes through %cl");
 
     let out = asm("fn main() -> i64 { return -8 >> 2; }");
     assert!(out.contains("sar $2, %rax"), ">> is arithmetic");

@@ -493,6 +493,32 @@ def reject_corpus():
             "fn main() -> i64 { let a: [i64; 2]; a[0] = 1; return a[0]; }\n",
             "fn main() -> i64 { let a: [i64; 2]; a[0] = 1; a[0] }\n",
         ),
+        # Duplicate parameter names (E0415) and a `main` that takes arguments
+        # (E0580); rmc used to bind the duplicates to one slot and accept any
+        # `main`.
+        "duplicate_parameter": (
+            "fn f(x: i64, x: i64) -> i64 { return x; }\n"
+            "fn main() -> i64 { return f(1, 2); }\n",
+            "fn f(x: i64, x: i64) -> i64 { x }\nfn main() { let _ = f(1, 2); }\n",
+        ),
+        "main_with_parameter": (
+            "fn main(x: i64) -> i64 { return x; }\n",
+            "fn main(x: i64) { let _ = x; }\n",
+        ),
+        # Constant arithmetic that rustc denies: division by zero, overflow and
+        # an out-of-range shift all trap, so rmc rejects the constant case.
+        "const_div_by_zero": (
+            "fn main() -> i64 { let x: i64 = 1 / 0; return x; }\n",
+            "fn main() { let x = 1i64 / 0; let _ = x; }\n",
+        ),
+        "const_overflow_add": (
+            "fn main() -> i64 { let x: i64 = 9223372036854775807 + 1; return x; }\n",
+            "fn main() { let x = 9223372036854775807i64 + 1; let _ = x; }\n",
+        ),
+        "const_shift_out_of_range": (
+            "fn main() -> i64 { return 1 << 64; }\n",
+            "fn main() { let x = 1i64 << 64; let _ = x; }\n",
+        ),
     }
 
 
