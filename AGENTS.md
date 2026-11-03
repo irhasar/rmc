@@ -121,13 +121,16 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
   for a non-aggregate `Deref` whose pointer is a reference local, so `*p < 5`
   is one `cmpq $5, (%reg)` and `*p` in a comparison needs no load. An aggregate
   `Deref` is *not* a simple operand: its value is an address, not data.
-- **`trim_dead` drops unreachable instructions and self-moves.** After each
-  function body is generated it removes instructions following an unconditional
-  `jmp`/`ret` up to the next label, and `mov %r, %r`. A `return` inside an
-  expression emits `jmp epilogue` then the rest of the expression; the pass is a
-  one-sweep fixpoint because removing a line creates neither a label nor a new
-  terminator. It runs on the real body only (the dry spill pass's output is
-  truncated anyway), so it costs nothing at compile time.
+- **`trim_dead` drops unreachable instructions, self-moves, and a jump to the
+  next label.** After each function body is generated it removes instructions
+  following an unconditional `jmp`/`ret` up to the next label, `mov %r, %r`, and
+  a `jmp L` whose target label `L:` is the very next line (the fallthrough
+  already reaches it — a function whose last expression is a value jumps to the
+  epilogue label that directly follows). A `return` inside an expression emits
+  `jmp epilogue` then the rest of the expression; the pass is a one-sweep
+  fixpoint because removing a line creates neither a label nor a new terminator.
+  It runs on the real body only (the dry spill pass's output is truncated
+  anyway), so it costs nothing at compile time.
 - **Inlining is a post-sema AST pass, and slots are frame indices.** Each
   inlined call gets a fresh region of the caller's frame (`base = f.nslots`,
   grown as it goes), the callee's slots are shifted by that base, and a read of

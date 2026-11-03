@@ -144,7 +144,10 @@ q = t + (x >> 63)                       # sign fixup
 `m`, `s`, and the `add` flag come from `sdiv_magic`. For roughly a quarter of
 divisors the multiplier is large enough that an extra add of the dividend is
 needed; powers of two take a separate path that is a shift plus a `2^k-1` sign
-bias. Two details are easy to get wrong and are covered by `tests/cases/div`:
+bias. For `%` the quotient is computed in `%rdx`, and the remainder is taken
+from it directly (`imul d, %rdx; sub %rdx, %r8`); only `/` copies the quotient
+into `%rax`, so the modulo path has no `%rdx`→`%rax`→`%rdx` round-trip. Two
+details are easy to get wrong and are covered by `tests/cases/div`:
 
 - `imul` overwrites `%rax` with the low product, so the fixups read the dividend
   from a `%r8` copy taken before the multiply.

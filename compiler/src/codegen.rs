@@ -393,12 +393,14 @@ impl Codegen {
     }
 
     /// Drop instructions that cannot be reached because the instruction before
-    /// them unconditionally transfers control (`jmp`, `ret`), and drop a
-    /// register-to-self `mov`. The generator emits both: a `return` inside an
-    /// expression leaves a `jmp` to the epilogue followed by the rest of the
-    /// expression, and a value already in a destination register is still
-    /// "stored". Neither changes behaviour — a `jmp`/`ret` has no fallthrough —
-    /// but both cost I-cache and decode slots.
+    /// them unconditionally transfers control (`jmp`, `ret`), drop a
+    /// register-to-self `mov`, and drop a `jmp` whose target is the very next
+    /// label (the fallthrough already goes there). The generator emits all
+    /// three: a `return` inside an expression leaves a `jmp` to the epilogue
+    /// followed by the rest of the expression, a value already in a destination
+    /// register is still "stored", and a function whose last expression is a
+    /// value jumps to an epilogue label that immediately follows. None changes
+    /// behaviour but each costs I-cache and decode slots.
     ///
     /// A label ends the unreachable run: a later `jmp` may target it, so the
     /// instruction after a label is live even when the text before it is not.
@@ -415,6 +417,15 @@ impl Codegen {
             let text = line.trim_start();
             if is_label || line.starts_with('.') {
                 dead = false;
+                if is_label {
+                    // `jmp L` immediately followed by `L:` is a jump to the next
+                    // instruction; drop it. The label is written with no leading
+                    // tab, the jump with one, so the exact suffix identifies it.
+                    let jmp_line = format!("\tjmp {}\n", line.trim_end_matches(':'));
+                    if head.ends_with(&jmp_line) {
+                        head.truncate(head.len() - jmp_line.len());
+                    }
+                }
             }
             if dead {
                 continue;
@@ -2148,6 +2159,16 @@ impl Codegen {
                 self.line("add %rcx, %rdx");
                 if d < 0 {
                     self.line("neg %rdx");
+                }
+                // For `%` the quotient is already in `%rdx`; leave it there and
+                // take the remainder now, skipping the `%rdx`->`%rax`->`%rdx`
+                // round-trip the shared tail below would emit.
+                if matches!(op, BinOp::Mod) {
+                    self.line(&format!("movabs ${d}, %rcx"));
+                    self.line("imul %rcx, %rdx");
+                    self.line("sub %rdx, %r8");
+                    self.line("mov %r8, %rax");
+                    return true;
                 }
                 self.line("mov %rdx, %rax");
             }
