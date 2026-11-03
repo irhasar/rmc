@@ -1551,10 +1551,18 @@ fn a_while_loop_is_rotated() {
 #[test]
 fn a_while_whose_body_is_empty_still_tests_once() {
     // Rotation moves the test, so an empty body must not loop forever: the
-    // entry jump and the bottom test both run.
+    // guard is still evaluated at the bottom and gates a conditional back edge.
     let src = "fn main() -> i64 { let mut i: i64 = 0; while i < 3 { } return i; }";
     let body = loop_body(&asm(src));
-    assert!(body.contains("jl "), "the guard still gates the body:\n{body}");
+    assert!(body.contains("cmpq $3"), "the guard is still tested:\n{body}");
+    assert!(body.contains("jl "), "the guard gates the back edge:\n{body}");
+    // Nothing but the rotated test sits between the body label and the guard.
+    let inner: Vec<&str> = body
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.ends_with(':') && !l.starts_with('j'))
+        .collect();
+    assert_eq!(inner.len(), 1, "the body is empty but for the test:\n{body}");
 }
 
 #[test]
@@ -1592,17 +1600,21 @@ fn a_product_term_is_accumulated_without_a_bounce() {
 
 #[test]
 fn an_accumulator_chain_with_calls_keeps_source_order() {
-    // Evaluation stays left to right even with a call that writes memory: the
-    // `h(&mut a)` term must run after `a` is read.
+    // Evaluation stays left to right even with a call that writes memory: `a`
+    // (the `acc + a` operand) must be read before the `h(&mut a)` call runs, or
+    // the addition would see the post-increment value.
     let src = "fn h(p: &mut i64) -> i64 { *p = *p + 1; return *p; } \
                fn main() -> i64 { let mut a: i64 = 10; let mut acc: i64 = 100; \
                acc = acc + a + h(&mut a); return acc; }";
     let out = asm_no_inline(&src);
     let body = main_body(&out);
-    let read_a = body.find("mov 8(%rbp), %rax").or_else(|| body.find("mov -").map(|_| 0));
+    // `a` lives at `-16(%rbp)` here; the read must precede the call, and the
+    // call's result must be added after it.
+    let read_a = body.find("add -16(%rbp)").expect("the `a` operand is read");
     let call = body.find("call h").expect("the call is emitted");
-    // The first operand read (`a`) precedes the call.
-    assert!(read_a.unwrap_or(0) < call, "operand read before the call:\n{body}");
+    let add_ret = body.find("add %rax, %rbx").expect("the call result is added");
+    assert!(read_a < call, "`a` read before the call:\n{body}");
+    assert!(call < add_ret, "the call result added after the call:\n{body}");
 }
 
 #[test]
