@@ -8,6 +8,7 @@
 //! growing downward from `%rbp`.
 
 use crate::ast::*;
+use std::cell::Cell;
 use std::fmt::Write as _;
 
 pub struct Codegen {
@@ -45,6 +46,16 @@ pub struct Codegen {
     ret_slot: i32,
     /// Return type of the function being generated, needed to route `return`.
     ret_ty: Type,
+    /// Number of frame slots (locals plus reserved spill slots) to allocate in
+    /// the prologue. The parser sizes `nslots` for every local a function could
+    /// declare; the code generator touches only the ones the emitted body
+    /// actually names, so this is set to the deepest slot the body addresses.
+    /// An all-register leaf like `fib` then needs no frame at all.
+    ///
+    /// Only meaningful during the final (emitting) pass; the dry pass leaves it
+    /// at zero and the frame it emits is discarded. Recorded by `off` and
+    /// `array_off`, so it is a `Cell`.
+    frame_slots: Cell<i32>,
 }
 
 /// Callee-saved registers eligible for promoting a local out of memory. They
@@ -86,6 +97,7 @@ impl Codegen {
             overflow: false,
             ret_slot: -1,
             ret_ty: Type::Unit,
+            frame_slots: Cell::new(0),
         }
     }
 
@@ -186,6 +198,12 @@ impl Codegen {
     /// the saved registers sit in the lowest bytes of the frame, so every slot
     /// is shifted past them and never overlaps `%rbp` or a saved register.
     fn off(&self, slot: i32) -> i32 {
+        // Only a local slot sizes the frame; a spill slot lives in the reserved
+        // region past the locals (`spill_slots`), so it must not be counted or it
+        // would be added twice.
+        if slot < self.spill_base {
+            self.frame_slots.set(self.frame_slots.get().max(slot + 1));
+        }
         -(slot + 1 + self.saved_regs()) * 8
     }
 
@@ -193,6 +211,9 @@ impl Codegen {
     /// Slots are laid out downward, so the lowest address is that of the last
     /// slot; elements are then addressed upward from there as `base + i*8`.
     fn array_off(&self, slot: i32, n: usize) -> i32 {
+        if slot < self.spill_base {
+            self.frame_slots.set(self.frame_slots.get().max(slot + n as i32));
+        }
         -(slot + n as i32 + self.saved_regs()) * 8
     }
 
@@ -212,7 +233,10 @@ impl Codegen {
             let r = *r;
             self.line(&format!("mov %rax, {r}"));
         } else {
-            let o = self.off(self.spill_base + self.sp_off);
+            // Frame spills are packed just past the locals, so a deeper
+            // register-held spill does not leave a hole in the frame.
+            let idx = self.spill_base + (self.sp_off - self.spill_regs.len() as i32);
+            let o = self.off(idx);
             self.line(&format!("mov %rax, {o}(%rbp)"));
         }
         self.sp_off += 1;
@@ -225,7 +249,8 @@ impl Codegen {
             let r = *r;
             self.line(&format!("mov {r}, {reg}"));
         } else {
-            let o = self.off(self.spill_base + self.sp_off);
+            let idx = self.spill_base + (self.sp_off - self.spill_regs.len() as i32);
+            let o = self.off(idx);
             self.line(&format!("mov {o}(%rbp), {reg}"));
         }
     }
@@ -269,11 +294,16 @@ impl Codegen {
         self.spill_base = f.nslots;
         self.spill_slots = 0;
         self.spill_regs = Vec::new();
+        // Reset the frame size; `off`/`array_off` re-measure it as the dry pass
+        // emits, and the final pass is seeded with the dry pass's result.
+        self.frame_slots.set(0);
         let mark = (self.out.len(), self.label, self.str_id, self.strings.len());
         // Dry run with every spill in the frame: it reports the deepest spill,
-        // which is exactly how many spill registers are worth reserving.
+        // which is exactly how many spill registers are worth reserving, and the
+        // deepest local slot the body addresses, which sizes the frame.
         self.gen_fn_body(f);
         let need = self.max_spill;
+        let frame = self.frame_slots.get();
         self.out.truncate(mark.0);
         self.label = mark.1;
         self.str_id = mark.2;
@@ -288,7 +318,16 @@ impl Codegen {
             ALLOC_REGS.iter().copied().filter(|r| !used.contains(r)).collect();
         let nres = (need as usize).min(SPILL_REGS.len()).min(free.len());
         self.spill_regs = free[..nres].to_vec();
-        self.spill_slots = need;
+        // Only spills past the reserved registers land in the frame; the rest
+        // are held in `spill_regs`, so the frame needs just the remainder.
+        self.spill_slots = (need as usize - nres) as i32;
+        // Seed the frame size measured by the dry run so the prologue, which is
+        // emitted before the body, allocates exactly that much, and start the
+        // spill slots right after the deepest local actually used rather than
+        // after every declared local; `gen_fn_body` then re-measures and must
+        // agree (the extra spill slots do not change which locals are addressed).
+        self.frame_slots.set(frame);
+        self.spill_base = frame;
         self.gen_fn_body(f);
         self.regs.clear();
         self.spill_regs.clear();
@@ -319,7 +358,7 @@ impl Codegen {
             self.line(&format!("push {r}"));
         }
         let saved_bytes = nregs as i32 * 8;
-        let slots_bytes = (f.nslots + self.spill_slots) * 8;
+        let slots_bytes = (self.frame_slots.get() + self.spill_slots) * 8;
         // The total depth below %rbp (saved registers plus frame) must be a
         // multiple of 16 so %rsp is 16-byte aligned at every call.
         let frame = ((slots_bytes + saved_bytes + 15) / 16) * 16 - saved_bytes;
