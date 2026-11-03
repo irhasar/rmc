@@ -192,6 +192,26 @@ fn exhaustive_match_is_a_value() {
 }
 
 #[test]
+fn a_three_variant_exhaustive_match_is_a_value() {
+    // The boundary wraps the whole chain once, so the exhaustiveness walk sees
+    // all three arms; a per-arm boundary would stop it after the first and
+    // reject this with "`if` without `else`".
+    let src = "enum E { A, B, C } \
+               fn main() -> i64 { let e: E = E::C; \
+               let t: i64 = match e { E::A => 1, E::B => 2, E::C => 3 }; return t; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn an_exhaustive_match_in_return_position_is_a_value() {
+    // The chain is the function's tail expression, with no trailing `;`.
+    let src = "enum E { A, B } \
+               fn f(e: E) -> i64 { return match e { E::A => 10, E::B => 20 }; } \
+               fn main() -> i64 { return f(E::B); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
 fn non_exhaustive_match_as_a_value_is_rejected() {
     // A missing variant means the chain can fall through to unit, which is a
     // type error in value position, exactly as in Rust.
