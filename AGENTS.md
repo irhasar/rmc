@@ -441,10 +441,11 @@ with no borrow checking). It has no *general* register allocator: whole-function
 locals are promoted to callee-saved registers by mention count (`promote`), and
 temporaries crossing a call use `SPILL_REGS`, but a dying temporary's register is
 not reused for a later local (roadmap item 1). The optimiser is an AST inlining
-pass (small, straight-line, scalar functions), a loop-invariant code motion pass,
-plus a small peephole pass (operand/comparison/array-address folding, constant
-folding, division by a constant, a 32-bit `div` fast path for a variable
-divisor). Array indexing is unchecked by default (the index is used as-is, like
+pass (small, straight-line, scalar functions), a self-recursion-to-loop pass
+(`f(x) = f(g(x)) op f(h(x))` with `op` associative becomes a loop with one call
+per level, halving `fib`'s call tree), a loop-invariant code motion pass, plus a
+small peephole pass (operand/comparison/array-address folding, constant folding,
+division by a constant, a 32-bit `div` fast path for a variable divisor). Array indexing is unchecked by default (the index is used as-is, like
 C), so an out-of-range index reads or writes adjacent stack memory;
 `--bounds-checks` turns on a per-index check that traps (see the codegen notes).
 The README's roadmap lists the intended next steps.
@@ -599,3 +600,16 @@ The README's roadmap lists the intended next steps.
     promoted local, and from `%rcx` otherwise; `r32` maps each to its 32-bit
     half. A one-off sweep of 1042 `q(a,b)` pairs across the full `i64` range —
     negatives, the 2^32 boundary, and near-`i64::MAX` — matched rustc exactly.
+- **The self-recursion pass must synthesise the AST the parser would build.** It
+  runs after sema, so it has no `Sema` to allocate slots or resolve names. It
+  reuses the parameter's own `(name, slot, ty)` for the loop variable, and takes
+  one fresh slot (`f.nslots`, then `f.nslots += 1`) for the accumulator; the
+  synthesized `Call` carries `arg_slots: vec![(-1, 0)]` and `ret_slot: -1`
+  directly, because a scalar `i64` argument needs no hidden buffer and a scalar
+  return needs no hidden pointer. Every synthesized `Expr::Var` must carry the
+  right `slot`/`ty`, or codegen emits a load from the wrong frame word.
+- **The pass is guarded to be exact, not approximate.** Only `+`/`*` (associative)
+  qualify; `cond`, `guard`, `g` and `h` must be call-free, or the loop would
+  duplicate a side effect. A shape that does not match is left completely alone.
+  `tests/cases/tco.{rms,rs}` diffs `fib` and `fact` against rustc; a unit test
+  pins the non-associative `f(x-1) - f(x-2)` case as untouched.

@@ -14,6 +14,13 @@ fn asm_no_inline(src: &str) -> String {
         .expect("should compile")
 }
 
+/// Assembly with the self-recursion-to-loop pass disabled, for tests that assert
+/// on the shape of the untransformed recursion.
+fn asm_no_tco(src: &str) -> String {
+    compile_to_asm(src, &CompileOptions { no_tco: true, ..Default::default() })
+        .expect("should compile")
+}
+
 /// The frame offset stored by the first `mov %rax, <off>(%rbp)` after `marker`.
 /// Lets a test check relative layout without hard-coding absolute offsets.
 fn store_offset_after(out: &str, marker: &str) -> i32 {
@@ -875,14 +882,42 @@ fn a_method_on_a_payload_enum_is_callable() {
 
 #[test]
 fn a_spill_across_a_call_uses_a_register_not_the_frame() {
-    // `fib`'s only memory traffic is the first recursive result held across the
-    // second call. It must live in a callee-saved register, not a frame slot.
-    let out = asm(
+    // With the self-recursion pass off, `fib`'s only memory traffic is the first
+    // recursive result held across the second call. It must live in a
+    // callee-saved register, not a frame slot.
+    let out = asm_no_tco(
         "fn fib(n: i64) -> i64 { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); } \
          fn main() -> i64 { return fib(arg_i64(1)); }",
     );
     assert!(out.contains("push %r12"), "expected a saved spill register in:\n{out}");
     assert!(out.contains("mov %rax, %r12"), "expected the spill into %r12 in:\n{out}");
+}
+
+#[test]
+fn self_recursion_becomes_a_loop_with_one_call_per_level() {
+    // The right-spine rewrite halves the call tree: `fib(n-2)` no longer
+    // recurses, so the body makes exactly one `call fib` and the second operand
+    // becomes an accumulator add plus a loop-carried `n = n - 2`.
+    let out = asm("fn fib(n: i64) -> i64 { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); } \
+                   fn main() -> i64 { return fib(arg_i64(1)); }");
+    let fib = &out[out.find("fib:").unwrap()..];
+    let fib = &fib[..fib.find(".size fib").unwrap()];
+    assert_eq!(fib.matches("call fib").count(), 1, "one call per level:\n{fib}");
+    assert!(fib.contains("add %rax"), "the accumulator adds the result:\n{fib}");
+    assert!(fib.contains("lea -2(%rbx), %rbx"), "the loop advances n by -2:\n{fib}");
+}
+
+#[test]
+fn the_self_recursion_pass_leaves_a_non_associative_recursion_alone() {
+    // `alt(x) = alt(x-1) - alt(x-2)` is not associative, so the rewrite would be
+    // wrong; the pass must decline it and keep both calls.
+    let out = asm(
+        "fn alt(n: i64) -> i64 { if n < 2 { return n; } return alt(n - 1) - alt(n - 2); } \
+         fn main() -> i64 { return alt(5); }",
+    );
+    let alt = &out[out.find("alt:").unwrap()..];
+    let alt = &alt[..alt.find(".size alt").unwrap()];
+    assert_eq!(alt.matches("call alt").count(), 2, "both calls kept:\n{alt}");
 }
 
 #[test]

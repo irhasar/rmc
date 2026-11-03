@@ -18,10 +18,9 @@ The point of the experiment is to measure the trade-off at the extremes:
 | generated-code quality           | peephole + top-five local promotion   | highly optimised                 |
 
 `rmc` wins big on compile time, compiler memory, and artifact size. On runtime
-it is now within a few percent on divide-heavy and array-heavy loops, and still
-loses on call-heavy code where LLVM's register allocator and loop
-transformations (for example turning the naive double-recursive `fib` into a
-loop) do the work a stack-machine code generator cannot.
+it is now at parity or ahead on most loops — including `fib`, where rmc applies
+the same right-spine recursion-to-loop rewrite LLVM does, so both make one call
+per level — and is within a few percent on the call- and pointer-heavy cases.
 
 ## Layout
 
@@ -70,6 +69,7 @@ rmc input.rms --overflow-checks    # trap on i64 +,-,* overflow (exit 101)
 rmc input.rms --bounds-checks      # trap on an out-of-range array index (exit 101)
 rmc input.rms --no-inline          # disable inlining (on by default)
 rmc input.rms --no-licm            # disable loop-invariant code motion (on by default)
+rmc input.rms --no-tco             # disable self-recursion-to-loop (on by default)
 ```
 
 Run the produced binary directly; it is a static ELF executable with no
@@ -206,44 +206,44 @@ LLVM 23.1.1, AMD EPYC 9B14, x86-64; medians of 5 compiles and 9 runs):
 
 | program | compiler | compile wall | compile CPU | compile RAM | artifact | run wall | run CPU | run RAM |
 | ------- | -------- | -----------: | ----------: | ----------: | -------: | -------: | ------: | ------: |
-| hello | rmc | 7.39 ms | 7.30 ms | 2.6 MB | 6616 B | 0.26 ms | 0.14 ms | 28 kB |
-| hello | rustc | 2133.03 ms | 2135.61 ms | 186.0 MB | 289416 B | 0.99 ms | 0.83 ms | 2036 kB |
-| fib | rmc | 6.86 ms | 6.82 ms | 2.6 MB | 6704 B | 10.26 ms | 10.09 ms | 28 kB |
-| fib | rustc | 2161.12 ms | 2162.88 ms | 187.1 MB | 291696 B | 7.23 ms | 7.09 ms | 2032 kB |
-| mandel | rmc | 8.99 ms | 8.92 ms | 2.5 MB | 6992 B | 97.26 ms | 97.06 ms | 24 kB |
-| mandel | rustc | 2137.15 ms | 2140.84 ms | 187.7 MB | 291776 B | 105.67 ms | 105.43 ms | 2076 kB |
-| sieve | rmc | 9.11 ms | 8.99 ms | 4.1 MB | 6744 B | 1.63 ms | 1.51 ms | 1588 kB |
-| sieve | rustc | 2140.84 ms | 2143.56 ms | 187.2 MB | 292016 B | 2.49 ms | 2.34 ms | 3620 kB |
-| mix | rmc | 6.80 ms | 6.71 ms | 2.6 MB | 6792 B | 14.85 ms | 14.67 ms | 28 kB |
-| mix | rustc | 2205.05 ms | 2208.43 ms | 186.4 MB | 291864 B | 15.67 ms | 15.47 ms | 2116 kB |
-| stats | rmc | 6.89 ms | 6.79 ms | 2.7 MB | 6832 B | 3.32 ms | 3.18 ms | 24 kB |
-| stats | rustc | 2133.77 ms | 2136.69 ms | 185.6 MB | 292048 B | 3.75 ms | 3.62 ms | 2056 kB |
-| refs | rmc | 7.05 ms | 6.99 ms | 2.7 MB | 7344 B | 4.75 ms | 4.60 ms | 28 kB |
-| refs | rustc | 2155.21 ms | 2159.53 ms | 190.1 MB | 292240 B | 3.92 ms | 3.79 ms | 2068 kB |
-| heap | rmc | 6.87 ms | 6.81 ms | 2.6 MB | 6736 B | 3.20 ms | 3.08 ms | 4716 kB |
-| heap | rustc | 2132.56 ms | 2135.77 ms | 190.3 MB | 292368 B | 2.73 ms | 2.60 ms | 5096 kB |
+| hello | rmc | 7.03 ms | 6.98 ms | 2.6 MB | 6616 B | 0.26 ms | 0.15 ms | 28 kB |
+| hello | rustc | 2081 ms | 2085 ms | 184.6 MB | 289416 B | 0.89 ms | 0.75 ms | 2016 kB |
+| fib | rmc | 6.86 ms | 6.76 ms | 2.6 MB | 6704 B | 7.20 ms | 7.07 ms | 28 kB |
+| fib | rustc | 2133 ms | 2137 ms | 183.9 MB | 291696 B | 7.17 ms | 7.00 ms | 2112 kB |
+| mandel | rmc | 6.87 ms | 6.80 ms | 2.6 MB | 6992 B | 96.39 ms | 96.21 ms | 28 kB |
+| mandel | rustc | 2178 ms | 2181 ms | 188.2 MB | 291776 B | 105.36 ms | 105.12 ms | 2096 kB |
+| sieve | rmc | 8.86 ms | 8.82 ms | 4.2 MB | 6744 B | 1.64 ms | 1.52 ms | 1588 kB |
+| sieve | rustc | 2127 ms | 2131 ms | 185.9 MB | 292016 B | 2.63 ms | 2.49 ms | 3616 kB |
+| mix | rmc | 6.89 ms | 6.80 ms | 2.6 MB | 6792 B | 14.89 ms | 14.75 ms | 24 kB |
+| mix | rustc | 2152 ms | 2157 ms | 184.6 MB | 291864 B | 16.22 ms | 15.81 ms | 2036 kB |
+| stats | rmc | 9.00 ms | 8.83 ms | 2.6 MB | 6832 B | 5.46 ms | 5.33 ms | 24 kB |
+| stats | rustc | 2141 ms | 2146 ms | 188.7 MB | 292048 B | 5.02 ms | 4.85 ms | 2096 kB |
+| refs | rmc | 7.26 ms | 7.20 ms | 2.7 MB | 7344 B | 4.73 ms | 4.59 ms | 28 kB |
+| refs | rustc | 2147 ms | 2150 ms | 190.6 MB | 292240 B | 3.96 ms | 3.82 ms | 2032 kB |
+| heap | rmc | 7.02 ms | 6.96 ms | 2.6 MB | 6736 B | 3.18 ms | 3.04 ms | 4716 kB |
+| heap | rustc | 2125 ms | 2130 ms | 185.2 MB | 292368 B | 2.78 ms | 2.65 ms | 5156 kB |
 
 Summary of the ratios (rustc ÷ rmc, so >1 means rmc is better):
 
 | dimension         | ratio      |
 | ----------------- | ---------: |
-| compile wall      | ~235–324×  |
-| compile CPU       | ~238–329×  |
-| compiler peak RAM | ~69–74×    |
+| compile wall      | ~238–317×  |
+| compile CPU       | ~242–321×  |
+| compiler peak RAM | ~44–72×    |
 | artifact size     | ~40–44×    |
-| run wall time     | 0.70–3.78× (rustc faster on call-heavy `fib`; rmc ahead on most, parity-to-win on the heap- and reference-heavy cases) |
-| run CPU           | 0.70–6.01× |
+| run wall time     | 0.84–3.37× (parity on `fib` and `mix`; rmc ahead on most, rustc slightly ahead on the call- and pointer-heavy `refs`/`heap`/`stats`) |
+| run CPU           | 0.83–5.09× |
 | run peak RAM      | ~1.1× on the heap-heavy case, ~73–87× elsewhere |
 
 The compile-time win is the point of the project: `rmc` builds in about 7–9 ms
 where rustc needs about 2.1 s, using ~2.6 MB of RAM against ~186 MB and writing
-a ~7 KB static binary against a ~290 KB one. The run-time picture is mixed and
-close: `rmc` wins on `hello` (3.8×), `sieve` (1.5×), `stats` (1.1×), `mandel`
-(1.1×) and `mix` (1.06×) because the workload is a tight loop or a single call
-and the static binary has no libc startup, and it is near parity on `heap`
-(0.85×) and `refs` (0.83×) after the allocator and store-folding work below. It
-loses only on `fib` (0.70×), where rustc turns the right-spine recursion into a
-loop and rmc keeps two recursive calls per level. Run times are the noisiest
+a ~7 KB static binary against a ~290 KB one. The run-time picture is close: `rmc` wins on
+`hello` (3.4×), `sieve` (1.6×), `mandel` (1.09×) and `mix` (1.09×) because the
+workload is a tight loop or a single call and the static binary has no libc
+startup, it is at parity on `fib` (1.00×) after the recursion-to-loop rewrite
+below, and it is slightly behind on `stats` (0.92×), `heap` (0.88×) and `refs`
+(0.84×), where LLVM's register allocator does more with the call-heavy and
+pointer-chasing shapes. Run times are the noisiest
 column: they move ±20% between recordings on a shared machine, so treat a single
 run's ratio as indicative and re-measure with many samples before trusting a
 sub-5% difference. (An early `refs` run reported 0.14×; that was LLVM folding
@@ -283,16 +283,18 @@ rmc is a small, self-contained compiler, not a drop-in replacement for rustc.
   never copied, returned or passed by value — are pinned to callee-saved
   registers; everything else is in memory. Temporaries are spilled to frame slots, not the machine stack, so
   `%rsp` never moves and a call needs no alignment pad. The optimiser is an
-  inlining pass (small, straight-line, scalar functions), a loop-invariant code
-  motion pass, and a peephole pass (constant operands, folded comparisons, folded
-  array addressing, `lea` strength reduction of `k*x+c`, division by a
-  constant, a 32-bit `div` fast path for a variable divisor, in-place
-  accumulation of a running sum); there is no instruction scheduling or
-  other loop transformation, and no live-range analysis. Inlining runs on the AST
+  inlining pass (small, straight-line, scalar functions), a self-recursion-to-loop
+  pass (the right-spine rewrite that turns `f(x) = f(g(x)) + f(h(x))` into a loop
+  making one call per level), a loop-invariant code motion pass, and a peephole
+  pass (constant operands, folded comparisons, folded array addressing, `lea`
+  strength reduction of `k*x+c`, division by a constant, a 32-bit `div` fast path
+  for a variable divisor, in-place accumulation of a running sum); there is no
+  instruction scheduling and no live-range analysis. Inlining runs on the AST
   after semantic analysis and expands to a fixpoint, so a wrapper is inlined once
-  its own callees are; loop-invariant code motion then hoists the arithmetic that
-  inlining exposed out of a loop body. `--no-inline` and `--no-licm` turn them
-  off.
+  its own callees are; the recursion pass then halves the call tree of a
+  `fib`-shaped function, and loop-invariant code motion hoists the arithmetic that
+  inlining exposed out of a loop body. `--no-inline`, `--no-tco` and `--no-licm`
+  turn them off.
 - The backend targets x86-64 Linux only, using the System V ABI and raw Linux
   syscalls. There is no Windows, macOS, ARM, or WebAssembly support.
 - Array indexing is unchecked by default: an out-of-range index reads or writes

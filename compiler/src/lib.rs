@@ -1,7 +1,7 @@
 //! rmc: an ahead-of-time compiler for a small, statically-typed subset of Rust.
 //!
-//! The pipeline is lex -> parse -> semantic analysis -> inline -> loop-invariant
-//! code motion -> x86-64 assembly. This library exposes it as a single call,
+//! The pipeline is lex -> parse -> semantic analysis -> inline -> self-recursion
+//! to loop -> loop-invariant code motion -> x86-64 assembly. This library exposes it as a single call,
 //! [`compile_to_asm`], so rmc can be embedded in another program instead of only
 //! run as a command-line tool. The `rmc` binary in `src/main.rs` drives this
 //! library and then invokes `as` and `ld`; those two are the only external
@@ -21,6 +21,7 @@ pub mod lexer;
 pub mod parser;
 pub mod runtime;
 pub mod sema;
+pub mod tco;
 
 /// Options that change what the compiler emits.
 #[derive(Debug, Clone, Default)]
@@ -39,6 +40,9 @@ pub struct CompileOptions {
     /// Skip loop-invariant code motion. It is on by default and hoists
     /// invariant arithmetic out of a loop body.
     pub no_licm: bool,
+    /// Skip the self-recursion-to-loop pass. It is on by default and halves the
+    /// call tree of a `f(x) = f(g(x)) op f(h(x))` function such as `fib`.
+    pub no_tco: bool,
 }
 
 /// Compile `src` (a `.rms` program) to x86-64 assembly in GNU `as` syntax.
@@ -53,6 +57,9 @@ pub fn compile_to_asm(src: &str, opts: &CompileOptions) -> Result<String, String
     sema::analyze(&mut prog)?;
     if !opts.no_inline {
         inline::run(&mut prog);
+    }
+    if !opts.no_tco {
+        tco::run(&mut prog);
     }
     if !opts.no_licm {
         licm::run(&mut prog, opts.overflow_checks);
