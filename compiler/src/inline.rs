@@ -29,7 +29,10 @@ use std::collections::HashSet;
 
 /// Largest candidate body, in expression nodes: enough for an accessor or a
 /// small arithmetic helper, small enough that inlining cannot bloat a caller.
-const MAX_NODES: usize = 32;
+/// A two-level helper counts high once its callees are inlined into it — the
+/// `refs` `sum_via_ref` is 35 nodes after its two accessors land — so the
+/// ceiling is set above that rather than at the accessor size.
+const MAX_NODES: usize = 48;
 
 /// Most call sites expanded across the whole program. Bounds compile time and
 /// code size; a hot loop body is inlined once, not once per iteration, so this
@@ -100,10 +103,9 @@ impl Cand {
         if !stmts.iter().all(stmt_ok) || tail.as_ref().map_or(false, |e| !expr_ok(e)) {
             return None;
         }
-        if stmts.iter().map(count_stmt).sum::<usize>()
-            + tail.as_ref().map_or(0, count_expr)
-            > MAX_NODES
-        {
+        let n = stmts.iter().map(count_stmt).sum::<usize>()
+            + tail.as_ref().map_or(0, count_expr);
+        if n > MAX_NODES {
             return None;
         }
         Some(Cand {
@@ -173,6 +175,10 @@ fn count_stmt(s: &Stmt) -> usize {
     }
 }
 
+/// Count the nodes of an expression. A block's own value is included: with the
+/// inliner unwrapping a statement-free block into its tail, a nested block is
+/// usually gone by now, but a block that kept statements still carries its tail
+/// and must be counted, or a candidate's true size would be understated.
 fn count_expr(e: &Expr) -> usize {
     let n = |x: &Box<Expr>| count_expr(x);
     match e {
@@ -187,9 +193,16 @@ fn count_expr(e: &Expr) -> usize {
         Expr::If(c, t, els) => {
             1 + n(c)
                 + t.stmts.iter().map(count_stmt).sum::<usize>()
-                + els.as_ref().map_or(0, |b| b.stmts.iter().map(count_stmt).sum::<usize>())
+                + t.tail.as_deref().map_or(0, count_expr)
+                + els.as_ref().map_or(0, |b| {
+                    b.stmts.iter().map(count_stmt).sum::<usize>()
+                        + b.tail.as_deref().map_or(0, count_expr)
+                })
         }
-        Expr::Block(b) => 1 + b.stmts.iter().map(count_stmt).sum::<usize>(),
+        Expr::Block(b) => {
+            1 + b.stmts.iter().map(count_stmt).sum::<usize>()
+                + b.tail.as_deref().map_or(0, count_expr)
+        }
         Expr::StructLit { fields, .. } => 1 + fields.iter().map(|f| count_expr(&f.value)).sum::<usize>(),
         Expr::EnumCtor { args, .. } => 1 + args.iter().map(count_expr).sum::<usize>(),
         Expr::ArrayLit(v, _) => 1 + n(v),
@@ -405,7 +418,16 @@ impl Inliner {
         self.walk_block(&mut block, base, expanding);
         expanding.remove(&name);
 
-        *e = Expr::Block(block);
+        // A block with no statements is just its value, and unwrapping it lets
+        // later passes see through it: `refs`'s hot loop reads `acc + w.total()
+        // + ...`, and the inlined accessors would otherwise stay wrapped in
+        // blocks that the accumulator fold cannot inspect, forcing the whole sum
+        // through `%rax` and the spill slots every iteration.
+        *e = if block.stmts.is_empty() && block.tail.is_some() {
+            *block.tail.take().unwrap()
+        } else {
+            Expr::Block(block)
+        };
         true
     }
 }

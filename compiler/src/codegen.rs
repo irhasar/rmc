@@ -1719,43 +1719,38 @@ impl Codegen {
 
     /// Fold `dst = dst + a + b - c + ...` into one `add`/`sub` per term, when
     /// `dst` already holds the chain's leftmost operand (its own previous
-    /// value) and every term is already a single operand (an immediate, a
+    /// value) and every other term is already a single operand (an immediate, a
     /// register, or a memory reference). This replaces the generic expression
     /// tree, which bounces every partial result through `%rax` and the spill
     /// slots, with a flat run of `add`s and `sub`s on the accumulator's own
     /// register — the shape of a running sum over locals and array elements.
     ///
-    /// Returns false when `e` is not such a chain, when a term needs
-    /// evaluating (a call, a nested expression), or when a term reads the
-    /// accumulator register itself: `dst` is updated in place, so a term that
-    /// read the *original* value would see the running result instead. Each
-    /// case falls back to the tree, which keeps `dst` untouched until the end.
+    /// The chain is flattened first, so a nested sum counts: `acc + a + (b + c)`
+    /// becomes four adds rather than evaluating `b + c` in `%rax` and adding it
+    /// once. That case is common after LICM, which hoists each invariant term
+    /// into its own local and can leave the surviving expression as a sum of
+    /// sums.
+    ///
+    /// Returns false when `e` is not such a chain, when a term needs evaluating
+    /// (a call, an index), or when a term reads the accumulator register itself:
+    /// `dst` is updated in place, so a term that read the *original* value would
+    /// see the running result instead. Each case falls back to the tree, which
+    /// keeps `dst` untouched until the end.
     fn gen_accumulate(&mut self, e: &Expr, dst: &str) -> bool {
         let mut terms: Vec<(bool, &Expr)> = Vec::new(); // (is_sub, operand)
-        let mut cur = e;
-        loop {
-            match cur {
-                Expr::Bin(BinOp::Add, a, b) => {
-                    terms.push((false, b));
-                    cur = a;
-                }
-                Expr::Bin(BinOp::Sub, a, b) => {
-                    terms.push((true, b));
-                    cur = a;
-                }
-                _ => break,
-            }
-        }
-        if terms.is_empty() || self.reg_operand(cur).as_deref() != Some(dst) {
+        Self::flatten_chain(e, false, &mut terms);
+        // The first term is the chain's base and must be `dst` itself.
+        let (base_sub, base) = terms[0];
+        if terms.len() < 2 || base_sub || self.reg_operand(base).as_deref() != Some(dst) {
             return false;
         }
-        if terms.iter().any(|(_, x)| self.uses_reg(x, dst)) {
+        if terms[1..].iter().any(|(_, x)| self.uses_reg(x, dst)) {
             return false;
         }
         // Resolve every term to a single operand before emitting anything, so a
         // term that needs evaluating bails out without a half-written chain.
         let mut ops: Vec<(bool, String)> = Vec::new();
-        for (is_sub, other) in terms.iter().rev() {
+        for (is_sub, other) in &terms[1..] {
             match self.simple_operand(other) {
                 Some(op) => ops.push((*is_sub, op)),
                 None => return false,
@@ -1766,6 +1761,23 @@ impl Codegen {
             self.line(&format!("{mnemonic} {op}, {dst}"));
         }
         true
+    }
+
+    /// Flatten a `+`/`-` tree into signed terms, left to right. Subtraction
+    /// flips the sign of its right subtree, so `x - (a - b)` yields `x`, `-a`,
+    /// `+b`. Anything that is not an add or a subtract is a single term.
+    fn flatten_chain<'a>(e: &'a Expr, sub: bool, out: &mut Vec<(bool, &'a Expr)>) {
+        match e {
+            Expr::Bin(BinOp::Add, a, b) => {
+                Self::flatten_chain(a, sub, out);
+                Self::flatten_chain(b, sub, out);
+            }
+            Expr::Bin(BinOp::Sub, a, b) => {
+                Self::flatten_chain(a, sub, out);
+                Self::flatten_chain(b, !sub, out);
+            }
+            _ => out.push((sub, e)),
+        }
     }
 
     /// True when evaluating `e` reads register `r`, the storage of a promoted
