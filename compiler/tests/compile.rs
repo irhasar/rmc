@@ -1062,3 +1062,96 @@ fn an_inlined_local_does_not_alias_a_caller_slot() {
     assert!(!out.contains("call g"), "g is inlined in:\n{out}");
     assert!(out.contains("main:"), "compiles");
 }
+
+/// Assembly with loop-invariant code motion disabled.
+fn asm_no_licm(src: &str) -> String {
+    compile_to_asm(src, &CompileOptions { no_licm: true, ..Default::default() })
+        .expect("should compile")
+}
+
+/// The instructions inside `main` only, so a hoisted value appearing before the
+/// loop is visible but a runtime helper's code is not.
+fn main_body(out: &str) -> String {
+    let body = &out[out.find("main:").unwrap()..];
+    body[..body.find(".size main").unwrap()].to_string()
+}
+
+/// The first loop in `main`: the label a later `jmp` targets, through that jump.
+/// Anything LICM hoisted sits before this region.
+fn loop_body(out: &str) -> String {
+    let body = main_body(out);
+    let lines: Vec<&str> = body.lines().collect();
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim();
+        if t.starts_with(".L") && t.ends_with(':') {
+            let label = &t[..t.len() - 1];
+            let target = format!("jmp {label}");
+            if let Some(j) = (i + 1..lines.len()).find(|&j| lines[j].trim() == target) {
+                return lines[i..=j].join("\n");
+            }
+        }
+    }
+    String::new()
+}
+
+#[test]
+fn an_invariant_product_is_hoisted_out_of_a_loop() {
+    // `a` is never written in the loop, so `a * a` is computed once, before the
+    // loop, and the loop only adds the result.
+    let src = "fn main() -> i64 { let a: i64 = 3; let mut s: i64 = 0; let mut i: i64 = 0; \
+               while i < 10 { s = s + a * a; i = i + 1; } return s; }";
+    let with = loop_body(&asm(src));
+    let without = loop_body(&asm_no_licm(src));
+    assert!(!with.contains("imul"), "the product is hoisted out of the loop:\n{with}");
+    assert!(without.contains("imul"), "without LICM the product stays in the loop:\n{without}");
+}
+
+#[test]
+fn a_value_the_loop_writes_is_not_hoisted() {
+    // `x` is reassigned in the loop, so `x * 2` is loop-variant and must stay.
+    let src = "fn main() -> i64 { let mut x: i64 = 1; let mut s: i64 = 0; let mut i: i64 = 0; \
+               while i < 10 { x = x + i; s = s + x * 2; i = i + 1; } return s; }";
+    let with = loop_body(&asm(src));
+    assert!(with.contains("imul"), "a loop-variant product stays in the loop:\n{with}");
+}
+
+#[test]
+fn a_loop_that_calls_is_left_alone() {
+    // A call can write anything, so nothing in this loop is hoisted.
+    let src = "fn f(x: i64) -> i64 { print_i64(x); return x; } \
+               fn main() -> i64 { let a: i64 = 3; let b: i64 = 4; let mut s: i64 = 0; let mut i: i64 = 0; \
+               while i < 10 { s = s + a * b + f(i); i = i + 1; } return s; }";
+    let with = loop_body(&asm(src));
+    assert!(with.contains("imul"), "a call blocks hoisting:\n{with}");
+}
+
+#[test]
+fn a_for_loop_variable_is_not_hoisted() {
+    // The `for` variable is assigned every iteration by the loop itself, so the
+    // comparison against it must stay inside the body.
+    let src = "fn main() -> i64 { let mut s: i64 = 0; \
+               for i in 0..10 { if i == 3 { s = s + 1; } s = s + i; } return s; }";
+    let with = loop_body(&asm(src));
+    let without = loop_body(&asm_no_licm(src));
+    assert_eq!(with.matches("sete").count(), without.matches("sete").count(),
+        "a `for` variable is loop-carried:\n{with}");
+}
+
+#[test]
+fn overflow_checks_disable_licm() {
+    // Hoisting a checked `+` would trap before the loop, not at the overflowing
+    // iteration, so the pass is off under `--overflow-checks`.
+    let src = "fn main() -> i64 { let a: i64 = 3; let mut s: i64 = 0; let mut i: i64 = 0; \
+               while i < 10 { s = s + a * a; i = i + 1; } return s; }";
+    let out = compile_to_asm(src, &CompileOptions { overflow_checks: true, ..Default::default() })
+        .expect("should compile");
+    assert!(loop_body(&out).contains("imul"), "LICM is off under overflow checks:\n{out}");
+}
+
+#[test]
+fn no_licm_option_keeps_the_loop_work() {
+    let src = "fn main() -> i64 { let a: i64 = 3; let mut s: i64 = 0; let mut i: i64 = 0; \
+               while i < 10 { s = s + a * a; i = i + 1; } return s; }";
+    assert!(!loop_body(&asm(src)).contains("imul"), "the default hoists");
+    assert!(loop_body(&asm_no_licm(src)).contains("imul"), "--no-licm does not");
+}

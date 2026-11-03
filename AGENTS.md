@@ -26,6 +26,9 @@ cargo build --release --manifest-path compiler/Cargo.toml
 # full benchmark suite (writes binaries to /tmp/rmcbench)
 python3 bench/run.py
 
+# benchmark suite, also recording the dated result to the repo
+python3 bench/run.py --markdown bench/RESULTS.md
+
 # differential test suite: rmc vs rustc on twin programs
 python3 tests/run.py -v
 
@@ -57,12 +60,14 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
   allocates the hidden slots for aggregate arguments and returns.
 - `compiler/src/inline.rs` — AST inlining of small, straight-line, scalar
   functions, run after sema and before codegen. See the inlining gotcha below.
+- `compiler/src/licm.rs` — loop-invariant code motion, run after inlining and
+  before codegen. See the LICM gotcha below.
 - `compiler/src/codegen.rs` — AST to AT&T x86-64 assembly.
 - `compiler/src/runtime.rs` — freestanding assembly runtime (`_start`, I/O,
   `alloc`/`free`, `arg_i64`, the overflow trap).
 - `compiler/src/main.rs` — CLI: reads source, calls the library, runs `as`/`ld`.
   Flags: `--emit-asm`, `--keep-asm`, `--overflow-checks`, `--bounds-checks`,
-  `--no-inline`.
+  `--no-inline`, `--no-licm`.
 - `compiler/tests/compile.rs` — unit tests for the front end and codegen; these
   run without `as`/`ld`.
 
@@ -99,9 +104,10 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
   Before this, an `&self` accessor over an 8-field struct emitted ~3 instructions
   per field and the `refs` benchmark ran at 69 ms; the fold brought rmc's own
   runtime down ~1.4x to ~50 ms. Inlining the accessors then removed the calls
-  entirely, taking `refs` to ~20 ms (rustc is still ~8x ahead on `refs` — it keeps
-  the struct in registers across the loop, which rmc does not). The fold is
-  deliberately *one* level deep: a `*p` used as a
+  entirely, taking `refs` to ~20 ms, and LICM hoisted the now-inlined struct
+  reads out of the loop, taking it to ~6 ms (rustc is still ~3x ahead on `refs`
+  — it keeps the struct in registers across the loop, which rmc does not). The
+  fold is deliberately *one* level deep: a `*p` used as a
   reference has its pointer in memory, so `ptr_reg` only matches a reference
   *local*, never a `Deref`. `addr_reg` (local or one `Deref` of a local) is the
   form `gen_addr` folds for a `lea`. Extending either to a deeper chain would
@@ -130,6 +136,17 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
   function only becomes call-free after its own callees are inlined (the `refs`
   wrapper `sum_via_ref` needs round two). `--no-inline` disables it; the tests
   that assert on the calling convention (`call f`, argument setup) use it.
+- **LICM hoists a loop body's invariant arithmetic, and `for` slots are
+  loop-carried.** The pass rewrites only a loop *body*; a `while` condition and
+  a `for`'s bounds run once per iteration by design. A `for`'s variable and
+  bound are assigned by the loop itself, not in the body, so they are handed to
+  the effect scan as explicit `carried` slots — miss this and `if i == 3` in a
+  `for` body gets hoisted and the loop runs wrong. It hoists only a pure,
+  non-trapping scalar: no call, division/modulo, index, dereference, block or
+  `if`, and a field read only when the loop writes no memory at all. Any call in
+  the loop disables the whole loop, since a call can write anything. The pass is
+  off under `--overflow-checks` (a hoisted checked `+`/`-`/`*` would trap at the
+  wrong time); `--no-licm` disables it outright.
 - **Stack slots grow downward.** A local in slot `s` lives at
   `-(s+1+nregs)*8(%rbp)`, where `nregs` is the number of registers holding
   promoted locals. Address them positively and you overwrite the saved
@@ -260,9 +277,15 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
 
 - Runtime is process-spawn dominated for small programs; use large enough
   workloads (see `ARGS` in `bench/run.py`) for a meaningful runtime comparison.
-- `bench/run.py` measures compile time and peak RSS with `wait4()`, so `as`/`ld`
-  and LLVM are included. It raises if a produced binary exits non-zero, which
-  catches the classic "measured a nonexistent path" bug.
+- `bench/run.py` measures both compilers and both binaries the same way: wall
+  and CPU time from `wait4()`, and peak RAM from the child's own `VmHWM`. Do not
+  read peak RAM from `wait4()`'s `ru_maxrss`: a freshly spawned child shares
+  Python's address space before `exec`, so it floors at Python's RSS (~15 MB) and
+  hides the real number. `VmHWM` is sampled until the child exits and taken as
+  the max over reps, because a sub-millisecond run can exit between samples and
+  read back as zero. It raises if a produced binary exits non-zero, which
+  catches the classic "measured a nonexistent path" bug. `--markdown PATH` writes
+  the dated result to a file; the current one lives at `bench/RESULTS.md`.
 
 ## Tests
 
@@ -324,9 +347,9 @@ with no borrow checking). It has no *general* register allocator: whole-function
 locals are promoted to callee-saved registers by mention count (`promote`), and
 temporaries crossing a call use `SPILL_REGS`, but a dying temporary's register is
 not reused for a later local (roadmap item 1). The optimiser is an AST inlining
-pass (small, straight-line, scalar functions) plus a small peephole pass
-(operand/comparison/array-address folding, constant folding, division by a
-constant). Array indexing is unchecked by default (the index is used as-is, like
+pass (small, straight-line, scalar functions), a loop-invariant code motion pass,
+plus a small peephole pass (operand/comparison/array-address folding, constant
+folding, division by a constant). Array indexing is unchecked by default (the index is used as-is, like
 C), so an out-of-range index reads or writes adjacent stack memory;
 `--bounds-checks` turns on a per-index check that traps (see the codegen notes).
 The README's roadmap lists the intended next steps.
@@ -402,6 +425,12 @@ The README's roadmap lists the intended next steps.
     hides the extra moves. Folding *call-result* terms is a different story: it
     regressed `refs` by ~12%, which is why `gen_accumulate` bails out on any
     term that needs evaluating.
+  - **CSE into frame slots was measured and rejected.** De-duplicating repeated
+    inlined subexpressions *within* a statement by binding each to a fresh slot
+    (`refs`: 18 → 28 ms) loses to recomputing: the extra slot loses the
+    five-register promotion contest and the loop round-trips through memory.
+    Hoisting the same value out of the loop entirely (LICM) is what wins, because
+    the slot is written once, not per iteration.
 - Division or modulo by a literal divisor does not use `idiv`. `gen_div_const`
   emits the Hacker's Delight magic multiply (the same algorithm LLVM uses),
   with a sign fixup and, for roughly a quarter of divisors, an extra add of the

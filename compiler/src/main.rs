@@ -18,6 +18,7 @@ struct Options {
     overflow_checks: bool,
     bounds_checks: bool,
     no_inline: bool,
+    no_licm: bool,
 }
 
 fn parse_args() -> Result<Options, String> {
@@ -29,6 +30,7 @@ fn parse_args() -> Result<Options, String> {
     let mut overflow_checks = false;
     let mut bounds_checks = false;
     let mut no_inline = false;
+    let mut no_licm = false;
 
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -41,6 +43,7 @@ fn parse_args() -> Result<Options, String> {
             "--overflow-checks" => overflow_checks = true,
             "--bounds-checks" => bounds_checks = true,
             "--no-inline" => no_inline = true,
+            "--no-licm" => no_licm = true,
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -70,6 +73,7 @@ fn parse_args() -> Result<Options, String> {
         overflow_checks,
         bounds_checks,
         no_inline,
+        no_licm,
     })
 }
 
@@ -86,6 +90,7 @@ fn print_help() {
          \x20   --overflow-checks  trap on i64 +,-,* overflow (off by default)\n\
          \x20   --bounds-checks    trap on an out-of-range array index (off by default)\n\
          \x20   --no-inline        disable the inlining pass (on by default)\n\
+         \x20   --no-licm          disable loop-invariant code motion (on by default)\n\
          \x20   -h, --help     show this help\n\
          \n\
          The accepted language is a strict subset of Rust. Entry point is `fn main`."
@@ -122,6 +127,7 @@ fn run(opts: Options) -> Result<(), String> {
             overflow_checks: opts.overflow_checks,
             bounds_checks: opts.bounds_checks,
             no_inline: opts.no_inline,
+            no_licm: opts.no_licm,
         },
     )?;
 
