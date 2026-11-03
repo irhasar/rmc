@@ -146,16 +146,22 @@ continue;
 return expr;
 ```
 
-`let` without an initialiser zero-initialises the binding. `for` bounds are
-evaluated once, before the loop; `continue` still runs the increment.
+`let` without an initialiser defers initialisation: the binding must be written
+before it is read, exactly as in Rust. Reading a binding that is not definitely
+initialised on every path is rejected (rustc's `E0381`), so `let x: i64;` then
+`return x;` does not compile. A `let` or parameter without `mut` may be written
+once, to initialise it, but no later write is allowed (rustc's `E0384`); add
+`mut` (or `mut x: T` on a parameter) to reassign. `for` bounds are evaluated
+once, before the loop; `continue` still runs the increment.
 
 ## Overflow
 
 Array indices are `i64` and are unchecked by default, as in C. Compiling with
 `--bounds-checks` (or `CompileOptions { bounds_checks: true }`) checks every
-index against the array's length; an out-of-range index writes
-`rmc: index out of bounds` to stderr and exits with status 101. A constant index
-is checked when the program is compiled, not at run time.
+*variable* index against the array's length; an out-of-range index writes
+`rmc: index out of bounds` to stderr and exits with status 101. A *constant*
+index outside the array (including a negated one, `a[-1]`) is rejected at
+compile time whether or not `--bounds-checks` is set, matching rustc.
 
 By default integer arithmetic wraps, as in release-mode Rust. Compiling with
 `--overflow-checks` (or `CompileOptions { overflow_checks: true }` from the
@@ -206,8 +212,10 @@ Rust panic. Division by zero always traps at the CPU level.
   in Rust: an arm must be `_` (or a binding name), or the arms must name *every*
   variant of one enum. A non-exhaustive `match` is rejected with an error even
   when it stands alone as a statement, since rustc rejects it there too.
-- String literals, given type `i64` (a pointer to a `{len, bytes}` record), so
-  they can be passed to `print_str`.
+- String literals, given their own type (a pointer to a `{len, bytes}` record).
+  A string is not an `i64`: it cannot be an arithmetic operand and cannot be
+  passed where an `i64` is expected. The only thing to do with one is pass it to
+  `print_str`.
 
 ## Builtins
 
@@ -216,7 +224,7 @@ Provided by the runtime; no declaration or import is required.
 | builtin         | signature      |
 | --------------- | -------------- |
 | `print_i64(x)`  | `(i64) -> ()`  |
-| `print_str(s)`  | `(i64) -> ()`  |
+| `print_str(s)`  | `(&str) -> ()` |
 | `print_bool(b)` | `(bool) -> ()` |
 | `putchar(c)`    | `(i64) -> ()`  |
 | `alloc(n)`      | `(i64) -> i64` |

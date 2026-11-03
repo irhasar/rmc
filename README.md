@@ -166,7 +166,8 @@ array elements and struct fields (including compound `+=` and friends);
 `if`/`else`, `while`, `loop`, and `for i in a..b`; `match` on integers (literal
 patterns and `_`); `break`, `continue`,
 `return`; arithmetic, comparison, bitwise (`&`/`|`/`^`) and shift (`<<`/`>>`)
-operators; `&&`/`||`; string literals; references (`&T` / `&mut T`, `&e`, `*e`,
+operators; `&&`/`||`; string literals; `mut` enforcement and definite
+initialisation; references (`&T` / `&mut T`, `&e`, `*e`,
 with auto-deref for `r.x`, `r[i]` and `r.m()`, and `&self` receivers);
 attributes such as `#[derive(Copy, Clone)]` (parsed and ignored); and a small
 set of runtime builtins. Structs and arrays may be passed to and returned from
@@ -179,7 +180,7 @@ Runtime builtins (provided by `src/runtime.rs`, no imports needed):
 | builtin         | signature            | behaviour                              |
 | --------------- | -------------------- | -------------------------------------- |
 | `print_i64(x)`  | `(i64) -> ()`        | print an integer followed by `\n`      |
-| `print_str(s)`  | `(i64) -> ()`        | print a string literal                 |
+| `print_str(s)`  | `(&str) -> ()`       | print a string literal                 |
 | `print_bool(b)` | `(bool) -> ()`       | print `1` or `0`                       |
 | `putchar(c)`    | `(i64) -> ()`        | write a single byte                    |
 | `alloc(n)`      | `(i64) -> i64`       | allocate `n` bytes (first-fit free list) |
