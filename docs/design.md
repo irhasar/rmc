@@ -60,6 +60,14 @@ and never collide with the saved frame pointer or return address above `%rbp`.
 `sub $N` rounds the frame up to a multiple of 16 to keep the stack 16-byte
 aligned for calls.
 
+`N` is not `nslots`: the parser sizes `nslots` for every local a function could
+declare, but a function that promotes its locals into registers and never
+materialises an aggregate touches none of them. `off`/`array_off` record the
+deepest slot the emitted body actually names, and the prologue allocates just
+that plus the spill slots — so an all-register leaf like `fib` gets no `sub` at
+all. (The measurement is a `Cell` filled during the dry codegen pass, since
+`off` takes `&self` and the prologue is emitted before the body it sizes.)
+
 Arrays and structs occupy `n` consecutive slots. Because slot addresses decrease
 as the slot index rises, an aggregate's element 0 / field 0 is at the *lowest*
 address, `-(slot+n)*8(%rbp)`, and element or field `i` is `base + i*8`. Getting

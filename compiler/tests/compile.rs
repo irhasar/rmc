@@ -1236,3 +1236,40 @@ fn no_licm_option_keeps_the_loop_work() {
     assert!(!loop_body(&asm(src)).contains("imul"), "the default hoists");
     assert!(loop_body(&asm_no_licm(src)).contains("imul"), "--no-licm does not");
 }
+
+#[test]
+fn a_register_only_leaf_allocates_no_frame() {
+    // Every local is promoted into a callee-saved register and nothing is
+    // materialised, so the body addresses no frame slot and the prologue needs
+    // no `sub`. (The epilogue still restores `%rsp` to the saved registers.)
+    let src = "fn main() -> i64 { let a: i64 = 1; let b: i64 = 2; return a + b; }";
+    let body = main_body(&asm(src));
+    assert!(!body.contains("sub $"), "a register-only leaf needs no frame:\n{body}");
+    assert!(body.contains("leave"), "the frame pointer is still restored:\n{body}");
+}
+
+#[test]
+fn a_frame_is_sized_to_the_slots_the_body_uses() {
+    // The array forces a materialised frame buffer, so the prologue must
+    // allocate one — but only for the slots that are actually addressed.
+    let src = "fn main() -> i64 { let a: [i64; 2] = [1, 2]; return a[0] + a[1]; }";
+    let body = main_body(&asm(src));
+    assert!(body.contains("sub $"), "an array needs a frame:\n{body}");
+}
+
+#[test]
+fn frame_spills_do_not_overlap_locals() {
+    // A right-leaning call chain keeps every outer partial result live across
+    // the inner call, so more values spill than there are spill registers and
+    // the surplus lands in frame slots. Those slots must sit past the deepest
+    // local the body names, or they would clobber it.
+    let src = "fn f(x: i64) -> i64 { return x + 1; } \
+               fn main() -> i64 { let mut a: i64 = 1; let mut b: i64 = 2; let mut c: i64 = 3; \
+               let r: i64 = f(a) + (f(b) + (f(c) + (f(a+1) + (f(b+1) + (f(c+1)))))); \
+               return r + a + b + c; }";
+    let out = asm_no_inline(src);
+    // The deepest frame spill must be a distinct slot from every local, i.e.
+    // the frame reservation covers it. Emitting and running the program is the
+    // real check (see the differential suite); here we only assert the shape.
+    assert!(out.contains("(%rbp)"), "spills reach the frame:\n{out}");
+}

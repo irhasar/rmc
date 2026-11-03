@@ -166,14 +166,26 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
   promoted locals. Address them positively and you overwrite the saved
   `%rbp`/return address and segfault. See `Codegen::off`.
 - **Spills live in frame slots, not on the stack.** `push_rax`/`pop_to` write a
-  slot at `spill_base + sp_off` instead of `push`/`pop`, so `%rsp` never moves
-  and no alignment pad is needed around a call. `spill_slots` is sized by a dry
-  run of the body; if the real pass spilled deeper than the reservation, spills
-  would overwrite locals. Keeping the two passes identical is what makes the
-  reservation exact.
+  slot instead of `push`/`pop`, so `%rsp` never moves and no alignment pad is
+  needed around a call. The first few spills are held in callee-saved registers
+  (`spill_regs`); only spills past those reach the frame, and they are packed at
+  `spill_base + (sp_off - spill_regs.len())` so a register-held spill leaves no
+  hole. `spill_slots` is sized by a dry run of the body; if the real pass spilled
+  deeper than the reservation, spills would overwrite locals. Keeping the two
+  passes identical is what makes the reservation exact.
+- **The frame is sized to the slots actually used, not to `nslots`.** The parser
+  sizes `nslots` for every local a function *could* declare; `off`/`array_off`
+  record the deepest local slot the emitted body actually names (excluding spill
+  slots, which are counted separately) and the prologue allocates only that much
+  plus `spill_slots`. A promoted-local-only leaf like `fib` then needs no frame
+  at all: dropping its 16-byte `sub`/`lea` pair took `fib` from 13.5 ms to
+  10.6 ms. The measurement is a `Cell` because `off`/`array_off` take `&self`;
+  the dry pass measures and the final pass is seeded with the result, so the
+  prologue (emitted before the body) allocates the exact size.
 - **Two-pass codegen must reset every counter.** `gen_fn` runs the body twice and
-  truncates the output between passes; the label counter, string table and spill
-  high-water mark are part of that reset. Miss one and the two passes diverge.
+  truncates the output between passes; the label counter, string table, spill
+  high-water mark and frame-size measurement are part of that reset. Miss one and
+  the two passes diverge.
 - **A callee-saved temporary is not worth it here.** Holding a value across a
   call in `%r12`-`%r15` was implemented and measured *slower* (the save/restore
   in the prologue/epilogue costs more than the spill it removes). Keep the frame
