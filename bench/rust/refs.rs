@@ -24,9 +24,16 @@ fn main() {
     let mut acc: i64 = 0;
     let mut i: i64 = 0;
     while i < n {
-        // `black_box(n)` keeps the trip count opaque, and `black_box` on a
-        // term stops LLVM from closing the whole sum into `128 * n`, which it
-        // otherwise does and which would measure nothing.
+        // `black_box(n)` keeps the trip count opaque, but the body is otherwise
+        // loop-invariant, so LLVM closes the whole loop into `128 * n` and the
+        // loop disappears. `black_box` on a term is what stops that: it forces
+        // a store/reload per iteration, which is why the Rust loop is not
+        // instruction-identical to the rmc one. The rmc side has no `black_box`
+        // (it is a compiler, not a benchmark language) and instead relies on
+        // licm to hoist the invariant method results; both end up adding a
+        // constant per iteration, but only the Rust side pays the barrier.
+        // Treat the `refs` ratio as "two real loops doing the same arithmetic",
+        // not as an instruction-for-instruction tie.
         acc = acc + std::hint::black_box(wr.total()) + sum_via_ref(wr) + wr.pair();
         i += 1;
     }

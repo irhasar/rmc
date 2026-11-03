@@ -206,11 +206,15 @@ than that fall back to frame slots as before.
 
 This is where a register allocator pays for itself. `fib` has one memory
 operation in its whole body, the store and reload of the first recursive result
-around the second call; putting it in a register is worth about 11% on the
-`fib` benchmark (2.04× rustc down to 1.83×) and every other benchmark is
-unchanged or slightly better. A true linear scan over live ranges would do more
-— reuse a register for a temporary that dies before a local is born — but the
-spill register is the part the call-heavy code actually notices.
+around the second call; putting it in a register is worth about 23% on the
+*recursive* `fib` (13.1 ms down to 10.1 ms, measured with `--no-tco` so the
+self-recursion rewrite does not remove the very operation being tested). In the
+default pipeline the win is invisible: `tco` has already turned `fib`'s
+recursion into a loop with no cross-call temporary, so the benchmark is at
+parity with or without the spill register. Every other benchmark is unchanged
+within noise (±1.5%). A true linear scan over live ranges would do more — reuse
+a register for a temporary that dies before a local is born — but the spill
+register is the part the call-heavy code actually notices.
 
 Scalar struct fields take part in promotion too, so a hot `acc.sum` stays in a
 register. A field is named by its register only where its slot is known: field
