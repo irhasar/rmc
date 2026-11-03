@@ -135,6 +135,7 @@ fn try_transform(f: &FnDef) -> Option<Block> {
                 ty: Some(Type::I64),
                 init: Some(identity),
                 slot: acc_slot,
+                mutable: false,
             },
             Stmt::While(not_cond, loop_body),
             ret,

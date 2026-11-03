@@ -190,12 +190,12 @@ impl Parser {
         let mut params = Vec::new();
         let mut param_mut = Vec::new();
         while self.peek() != Some(&Tok::RParen) {
-            let m = self.eat(&Tok::Mut);
+            let pm = self.eat(&Tok::Mut);
             let pname = self.expect_ident()?;
             self.expect(Tok::Colon)?;
             let ty = self.parse_type()?;
             params.push((pname, ty));
-            param_mut.push(m);
+            param_mut.push(pm);
             if !self.eat(&Tok::Comma) {
                 break;
             }
@@ -258,12 +258,12 @@ impl Parser {
         let mut param_mut = Vec::new();
         if self.eat(&Tok::Comma) {
             while self.peek() != Some(&Tok::RParen) {
-                let m = self.eat(&Tok::Mut);
+                let pm = self.eat(&Tok::Mut);
                 let pname = self.expect_ident()?;
                 self.expect(Tok::Colon)?;
                 let pty = self.parse_type()?;
                 params.push((pname, pty));
-                param_mut.push(m);
+                param_mut.push(pm);
                 if !self.eat(&Tok::Comma) {
                     break;
                 }
@@ -932,7 +932,7 @@ impl Parser {
                     Expr::Var { name: name.clone(), slot: -1, ty: Type::I64 },
                     // No annotation: the temp takes the scrutinee's type, which
                     // may be an enum rather than an integer.
-                    Some(Stmt::Let { name, ty: None, init: Some(other), slot: -1, mutable: true }),
+                    Some(Stmt::Let { name, ty: None, init: Some(other), slot: -1, mutable: false }),
                 )
             }
         };
@@ -947,7 +947,7 @@ impl Parser {
                         ty: None,
                         init: Some(subj.clone()),
                         slot: -1,
-                        mutable: true,
+                        mutable: false,
                     }],
                     tail: Some(Box::new(body)),
                 }),
