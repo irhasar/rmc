@@ -66,21 +66,29 @@ def measure_spawned(argv, reps):
     exe = shutil.which(argv[0]) or argv[0]
     walls, cpus, rsss = [], [], []
     for _ in range(reps):
-        t0 = time.perf_counter()
-        pid = os.posix_spawn(exe, [exe] + list(argv[1:]), os.environ)
-        peak = 0
-        while True:
-            hwm = peak_rss_kb(pid)
-            if hwm > peak:
-                peak = hwm
-            done, status, ru = os.wait4(pid, os.WNOHANG)
-            if done:
+        # A sub-millisecond run can exit before Python first reads `/proc`, so a
+        # rep occasionally samples zero. Retry that rep rather than fall back to
+        # `ru_maxrss`, which is floored at this process's RSS (see the docstring)
+        # and would report a tiny program as ~15 MB.
+        for _attempt in range(5):
+            t0 = time.perf_counter()
+            pid = os.posix_spawn(exe, [exe] + list(argv[1:]), os.environ)
+            peak = 0
+            while True:
+                hwm = peak_rss_kb(pid)
+                if hwm > peak:
+                    peak = hwm
+                done, status, ru = os.wait4(pid, os.WNOHANG)
+                if done:
+                    break
+            wall = time.perf_counter() - t0
+            if status != 0:
+                raise RuntimeError(f"run failed for {exe}: status={status}")
+            if peak > 0:
                 break
-        walls.append(time.perf_counter() - t0)
+        walls.append(wall)
         cpus.append(ru.ru_utime + ru.ru_stime)
         rsss.append(peak)
-        if status != 0:
-            raise RuntimeError(f"run failed for {exe}: status={status}")
     return dict(wall=median(walls), cpu=median(cpus), rss=max(rsss))
 
 

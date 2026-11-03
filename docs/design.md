@@ -93,6 +93,13 @@ a `return`, or a tail expression).
 - Constant folding: a small integer literal on the right of `+`, `-`, `*`, `/`
   or `%` folds into the instruction itself, so `x - 200` is `mov; sub $200`
   rather than three instructions. `small_imm` also accepts a negated literal.
+- Register-operand folding: when the right operand of `+`, `-`, `*`, `&`, `|`
+  or `^` is a promoted local, it folds in as a register operand, so `x + y`
+  skips the `mov y, %rcx` bounce and emits `mov y, %rax; add x, %rax` (or one
+  `imul %reg, %rax`). Only a register folds, never a memory operand: a memory
+  operand measured ~19% *slower* on the `mandel` benchmark, because the load
+  lands in the instruction's dependency chain, which is why the constant path
+  folds immediates only.
 - Division by a constant: `a / d` and `a % d` for a literal `d` become a magic
   multiply plus a shift instead of `idiv`. See below.
 - Comparison folding: `a < b` emits a single `cmp` plus `setcc` when one side is

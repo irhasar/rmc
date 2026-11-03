@@ -445,18 +445,32 @@ fn a_field_of_a_call_result_is_addressed() {
 
 #[test]
 fn bitwise_and_shift_emit_the_right_instructions() {
-    // Constant operands fold straight into the instruction; the shift count is
-    // masked to 6 bits, matching Rust's `<<`/`>>` on `i64`.
+    // A simple right operand folds straight into the instruction, whether it is
+    // a constant or a variable; the shift count is masked to 6 bits, matching
+    // Rust's `<<`/`>>` on `i64`.
     let out = asm("fn main() -> i64 { let a: i64 = 12; let b: i64 = 10; return a & b | a ^ b; }");
-    assert!(out.contains("and %rcx, %rax"));
-    assert!(out.contains("or %rcx, %rax"));
-    assert!(out.contains("xor %rcx, %rax"));
+    assert!(out.contains("and %r12, %rax"), "a variable right operand folds in");
+    assert!(out.contains("xor %r12, %rax"), "a variable right operand folds in");
+    assert!(out.contains("or %rcx, %rax"), "a complex right operand still bounces");
 
     let out = asm("fn main() -> i64 { return 1 << 70; }");
     assert!(out.contains("sal $6, %rax"), "70 & 63 == 6");
 
     let out = asm("fn main() -> i64 { return -8 >> 2; }");
     assert!(out.contains("sar $2, %rax"), ">> is arithmetic");
+}
+
+#[test]
+fn a_register_right_operand_folds_into_arithmetic() {
+    // A promoted right operand folds into the instruction instead of bouncing
+    // through `%rcx`. `x * y` should be a single `imul`, not `mov %rcx` + `imul`.
+    let out = asm(
+        "fn main() -> i64 { let x: i64 = 3; let y: i64 = 4; let z: i64 = 5; \
+         let a: i64 = x * y; let b: i64 = x + z; let c: i64 = x - z; return a + b + c; }",
+    );
+    assert!(out.contains("imul %r13, %rax"), "mul folds the right register");
+    assert!(out.contains("add %r12, %rax"), "add folds the right register");
+    assert!(out.contains("sub %r12, %rax"), "sub folds the right register");
 }
 
 #[test]

@@ -456,6 +456,12 @@ The README's roadmap lists the intended next steps.
   in-place `x = x + e` form were both tried and measured *slower* on the Zen
   cores this was tuned on, so they were removed. Keep the plain two-register
   form unless you re-measure on the target CPU.
+  - Folding a *register* operand (never a memory one) into `+`, `-`, `*`, `&`,
+    `|`, `^` is the one exception and was measured faster: it drops the
+    `mov y, %rcx` bounce, taking `mandel` from 1.03× to 1.10×. The distinction is
+    the load: a memory operand lands in the instruction's dependency chain (and
+    regressed `mandel` by ~19% when tried), a register operand does not. Only
+    `simple_operand` results that start with `%` fold.
   - The multi-term **accumulation fold** (`gen_accumulate`) is a narrower form
     that was measured neutral: it applies only when `x` is promoted, no term
     reads `x`'s register, and every term is already a single operand. It cuts
