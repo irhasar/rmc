@@ -338,8 +338,11 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   links with a plain `ld` (no `-n`) maps `.rodata` without execute permission,
   so a handler left there faults. `__rmc_bounds` follows a `.rodata` message, so
   it re-opens `.text` first; check this whenever a trap is added after a
-  `.section .rodata` block. `tests/run.py` links a few traps with a plain `ld`
-  to catch it.
+  `.section .rodata` block. `tests/run.py` links out-of-range programs with a
+  plain `ld` to catch it, across every optimiser configuration (a hoist or
+  inline that drops the `cmp`/`jae` would let the program read or write out of
+  range), and across the index shapes: a block or call base, a local array, a
+  negative and a computed index, a struct-field array, and a store.
 - **`array_len_of` must cover every array-typed base.** It reads the length from
   a `Var`/`Field`/`Call` type and from a block's or `if`'s tail. A base it does
   not recognise silently skips the bounds check; extend it alongside any new
