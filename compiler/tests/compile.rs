@@ -74,6 +74,17 @@ fn a_constant_initialiser_stores_straight_to_the_frame() {
     assert!(!out.contains("mov $7, %rax"), "no register bounce:\n{out}");
 }
 
+#[test]
+fn a_constant_assignment_stores_straight_to_the_frame() {
+    // `x = 5` on an unpromoted local is the same store as its initialiser: one
+    // `movq $5, off(%rbp)`, not `mov $5, %rax` + `mov %rax, off(%rbp)`.
+    let out = asm(
+        "fn main() -> i64 { let mut x: i64 = 1; let p: &i64 = &x; x = 5; return *p + x; }",
+    );
+    assert!(out.contains("movq $5, "), "constant assignment stored direct:\n{out}");
+    assert!(!out.contains("mov $5, %rax"), "no register bounce:\n{out}");
+}
+
 fn struct_fields_are_laid_out_in_order() {
     // Declaration order, no padding: `y` sits exactly one word above `x`. A
     // `&p` keeps the struct in memory so both fields are stored to the frame;
@@ -1131,11 +1142,12 @@ fn spills_use_frame_slots_not_the_stack() {
 #[test]
 fn a_hot_struct_field_is_promoted_to_a_register() {
     // `p.x` is the hottest field, so it lives in `%rbx`; its initialiser
-    // writes the register instead of a frame slot.
+    // writes the register directly instead of a frame slot, with no `%rax`
+    // bounce.
     let out = asm(
         "struct P { x: i64, y: i64 } fn main() -> i64 { let mut p: P = P { x: 0, y: 1 }; let mut i: i64 = 0; while i < 10 { p.x = p.x + p.y; i = i + 1; } return p.x; }",
     );
-    assert!(out.contains("mov %rax, %rbx"), "p.x initialises into a register: {out}");
+    assert!(out.contains("mov $0, %rbx"), "p.x initialises straight into a register: {out}");
 }
 
 #[test]
@@ -1158,7 +1170,7 @@ fn a_struct_array_field_keeps_the_field_to_slot_map_consistent() {
     let out = asm(
         "struct W { tag: i64, data: [i64; 3] } fn main() -> i64 { let w: W = W { tag: 4, data: [1, 2, 3] }; return w.tag; }",
     );
-    assert!(out.contains("mov %rax, %rbx"), "literal writes `tag` to its register: {out}");
+    assert!(out.contains("mov $4, %rbx"), "literal writes `tag` to its register: {out}");
     assert!(out.contains("mov %rbx, %rax"), "`w.tag` reads the same register: {out}");
 }
 

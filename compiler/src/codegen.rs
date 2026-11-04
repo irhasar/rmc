@@ -1042,8 +1042,11 @@ impl Codegen {
                         match self.reg_of(*slot) {
                             Some(r) => self.gen_expr_into_reg(value, r),
                             None => {
-                                self.gen_expr_into_reg(value, "%rax");
-                                self.store_slot(*slot);
+                                let dst = format!("{}(%rbp)", self.off(*slot));
+                                if !self.store_imm(value, &dst) {
+                                    self.gen_expr_into_reg(value, "%rax");
+                                    self.store_slot(*slot);
+                                }
                             }
                         }
                     }
@@ -1984,16 +1987,18 @@ impl Codegen {
             self.copy_words_rdi_rsi(n);
             return;
         }
-        // An unpromoted field with a constant initialiser stores the constant
-        // directly, skipping the register bounce.
-        if reg.is_none() && self.store_imm(&fi.value, &format!("{dest_off}(%rbp)")) {
+        // A promoted field's initialiser is emitted straight into its register,
+        // and an unpromoted constant straight into its frame slot, so neither
+        // bounces through `%rax` first.
+        if let Some(r) = reg {
+            self.gen_expr_into_reg(&fi.value, r);
+            return;
+        }
+        if self.store_imm(&fi.value, &format!("{dest_off}(%rbp)")) {
             return;
         }
         self.gen_expr(&fi.value);
-        match reg {
-            Some(r) => self.line(&format!("mov %rax, {r}")),
-            None => self.line(&format!("mov %rax, {dest_off}(%rbp)")),
-        }
+        self.line(&format!("mov %rax, {dest_off}(%rbp)"));
     }
 
     fn store_slot(&mut self, slot: i32) {
