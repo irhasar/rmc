@@ -267,6 +267,109 @@ def gen_stmt_program(rng):
     return "\n".join(rms), "\n".join(rs)
 
 
+# ---------------------------------------------------------------- opt mode
+
+def gen_opt_program(rng):
+    """A program built to exercise the three optimiser passes with randomised
+    shapes, so the multi-config comparison has something to differ on.
+
+    `expr`/`stmt` mode already calls small helpers (so inlining is reached), but
+    neither emits a *self-recursive* function (TCO) or a loop with an invariant
+    subexpression (LICM). This mode emits all three:
+
+    * `rec` is in the right-spine shape `f(x) = f(g(x)) op f(h(x))` with a base
+      case, which is exactly what TCO rewrites; `g`, `h`, `op`, the guard and
+      the condition are randomised.
+    * `licmfn` has a loop whose body reads a subexpression that does not depend
+      on the loop counter, plus a counter-dependent term and a local the loop
+      writes, so a wrong hoist (or a missing one that breaks the value) shows up.
+    * helpers `id`/`bump`/`dbl` are called with trivial and non-trivial
+      arguments, the inlining hazards `inlmulti` pins.
+
+    Termination is guaranteed: `rec`'s arguments strictly decrease by 1 or 2 and
+    the base case catches every value at or below the guard, so a small call
+    argument bounds the work.
+    """
+    # --- TCO: self-recursive right-spine function ---
+    cond = rng.choice(["n < 1", "n < 2", "n <= 1"])
+    guard = rng.choice(["0", "1", "n", "2"])
+    op = rng.choice(["+", "*"])
+    g = rng.choice(["n - 1", "n - 2"])
+    h = rng.choice(["n - 1", "n - 2"])
+    n0 = rng.randint(1, 14)
+
+    # --- LICM: loop with an invariant subexpression ---
+    bound = rng.randint(1, 6)
+    inv = rng.choice([
+        "(a + b)", "(a * b)", "((a + b) * (a - b))", "(a << 2)",
+        "((a + b) & 255)", "(a / (b % 97 + 100))", "(a % (b % 97 + 100))",
+    ])
+    a0, b0 = rng.randint(-40, 40), rng.randint(-40, 40)
+
+    # --- inlining: helpers with a mutating param and a reused param ---
+    extra = rng.choice([
+        "print_i64(bump(id(3)) + dbl(a0));",
+        "print_i64(id(rec(6)) + dbl(id(5)));",
+        "print_i64(bump(a0) + id(b0));",
+        "print_i64(licmfn(a0, b0) + dbl(rec(5)));",
+    ])
+
+    rms = [
+        f"fn rec(n: i64) -> i64 {{ if {cond} {{ return {guard}; }} return rec({g}) {op} rec({h}); }}",
+        "fn id(x: i64) -> i64 { return x; }",
+        "fn bump(mut x: i64) -> i64 { x = x + 1; return x + x; }",
+        "fn dbl(x: i64) -> i64 { return x + x; }",
+        "fn licmfn(a: i64, b: i64) -> i64 {",
+        "    let mut i: i64 = 0;",
+        "    let mut t: i64 = 0;",
+        "    let mut w: i64 = a;",
+        "    while i < %d {" % bound,
+        "        t = t + %s;" % inv,
+        "        t = t + (i * 3);",
+        "        t = t + w;",
+        "        w = w + 1;",
+        "        i = i + 1;",
+        "    }",
+        "    return t;",
+        "}",
+        "fn main() -> i64 {",
+        "    let a0: i64 = %d;" % a0,
+        "    let b0: i64 = %d;" % b0,
+        "    print_i64(rec(%d));" % n0,
+        "    print_i64(licmfn(a0, b0));",
+        "    " + extra,
+        "    return 0;",
+        "}",
+    ]
+    rs = [
+        f"fn rec(n: i64) -> i64 {{ if {cond} {{ return {guard}; }} rec({g}) {op} rec({h}) }}",
+        "fn id(x: i64) -> i64 { x }",
+        "fn bump(mut x: i64) -> i64 { x = x + 1; x + x }",
+        "fn dbl(x: i64) -> i64 { x + x }",
+        "fn licmfn(a: i64, b: i64) -> i64 {",
+        "    let mut i: i64 = 0;",
+        "    let mut t: i64 = 0;",
+        "    let mut w: i64 = a;",
+        "    while i < %d {" % bound,
+        "        t = t + %s;" % inv,
+        "        t = t + (i * 3);",
+        "        t = t + w;",
+        "        w = w + 1;",
+        "        i = i + 1;",
+        "    }",
+        "    t",
+        "}",
+        "fn main() {",
+        "    let a0: i64 = %d;" % a0,
+        "    let b0: i64 = %d;" % b0,
+        '    println!("{}", rec(%d));' % n0,
+        '    println!("{}", licmfn(a0, b0));',
+        '    println!("{}", ' + extra[len("print_i64("):-2] + ");",
+        "}",
+    ]
+    return "\n".join(rms), "\n".join(rs)
+
+
 # -------------------------------------------------------------- robust mode
 
 def robust_corpus():
@@ -611,7 +714,7 @@ def run_reject():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "robust", "reject"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "robust", "reject"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -633,7 +736,7 @@ def main():
 
     tmp = "/tmp/rmc-fuzz"
     os.makedirs(tmp, exist_ok=True)
-    gen = gen_expr_program if args.mode == "expr" else gen_stmt_program
+    gen = {"expr": gen_expr_program, "stmt": gen_stmt_program, "opt": gen_opt_program}[args.mode]
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus
     # suite; a fuzz program is otherwise only checked with every pass on, so a

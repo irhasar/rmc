@@ -614,12 +614,16 @@ the safe direction; it is listed by the audit harness but is not a soundness bug
 expressions with calls and guarded division; `stmt` mode builds loops,
 conditionals, `match`, arrays and aggregate calls, and deliberately places
 side-effecting scalar and aggregate arguments in every position (this is what
-found the argument-evaluation-order bug). It compares stdout and exit status
-against `rustc -O`, and it recompiles each program with every optimiser pass off
-in turn (`--no-inline`, `--no-licm`, `--no-tco`, all three), the same matrix the
-corpus suite uses — a pass-specific bug is otherwise invisible, because the
-fuzzer used to run only the default configuration and the generator emits no
-inlinable user function. A generated shift amount must stay `i64`-typed: rustc infers
+found the argument-evaluation-order bug); `opt` mode builds a self-recursive
+right-spine function (TCO), a loop with an invariant subexpression (LICM) and
+calls to small helpers with trivial and non-trivial arguments (inlining) — the
+shapes the other two modes never emit, so the optimiser passes are exercised
+with randomised inputs rather than only the fixed corpus cases. It compares
+stdout and exit status against `rustc -O`, and it recompiles each program with
+every optimiser pass off in turn (`--no-inline`, `--no-licm`, `--no-tco`, all
+three), the same matrix the corpus suite uses — a pass-specific bug is otherwise
+invisible, because the fuzzer used to run only the default configuration. A
+generated shift amount must stay `i64`-typed: rustc infers
 `i32` for an unconstrained literal and masks the count to 5 bits, while rmc is
 `i64`-only and masks to 6, so an untyped count reports a divergence that is not a
 bug.
