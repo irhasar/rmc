@@ -154,6 +154,46 @@ def check_bounds_traps(combos):
     return failures
 
 
+def check_stripped():
+    """The default link drops the symbol table; `--no-strip` keeps it.
+
+    At this artifact size the symbol and section-name tables are a third of the
+    file (1376 -> 888 bytes on `hello`), so the strip must stay the default. A
+    regression here would be invisible in behaviour but would give back a third
+    of the size win, so pin both directions.
+    """
+    rms = os.path.join(OUT, "strip_hello.rms")
+    with open(rms, "w") as f:
+        f.write("fn main() -> i64 { print_i64(1); return 0; }\n")
+    stripped = os.path.join(OUT, "strip_hello.bin")
+    kept = os.path.join(OUT, "strip_hello_kept.bin")
+    p = subprocess.run([RMC, rms, "-o", stripped], capture_output=True)
+    if p.returncode != 0:
+        print(f"FAIL strip: rmc failed:\n{p.stderr.decode(errors='replace')}")
+        return 1
+    p = subprocess.run([RMC, "--no-strip", rms, "-o", kept], capture_output=True)
+    if p.returncode != 0:
+        print(f"FAIL strip: rmc --no-strip failed:\n{p.stderr.decode(errors='replace')}")
+        return 1
+    p = subprocess.run(["readelf", "-sW", stripped], capture_output=True)
+    if p.returncode != 0:
+        print("FAIL strip: readelf failed")
+        return 1
+    if "main" in p.stdout.decode():
+        print("FAIL strip: symbol table present in the default binary")
+        return 1
+    if os.path.getsize(stripped) >= os.path.getsize(kept):
+        print("FAIL strip: stripping did not shrink the binary "
+              f"({os.path.getsize(stripped)} >= {os.path.getsize(kept)})")
+        return 1
+    # The stripped binary must still run.
+    p = subprocess.run([stripped], capture_output=True)
+    if p.returncode != 0 or p.stdout != b"1\n":
+        print(f"FAIL strip: stripped binary misbehaved: rc={p.returncode} out={p.stdout!r}")
+        return 1
+    return 0
+
+
 def check_no_rwx():
     """The linked executable must have no writable-and-executable LOAD segment.
 
@@ -250,6 +290,10 @@ def main():
                     print(f"ok   {name}{label} {argv}")
 
     failures += check_bounds_traps(combos)
+    stripped = check_stripped()
+    failures += stripped
+    if stripped == 0:
+        print("default link strips symbols; --no-strip keeps them")
     rwx = check_no_rwx()
     failures += rwx
     if rwx == 0:

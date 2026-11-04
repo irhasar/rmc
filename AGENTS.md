@@ -102,8 +102,8 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   `PIECES`; `for_program(user_asm)` links only the pieces the program reaches
   (see "Runtime pruning" below).
 - `compiler/src/main.rs` — CLI: reads source, calls the library, runs `as`/`ld`.
-  Flags: `--emit-asm`, `--keep-asm`, `--overflow-checks`, `--bounds-checks`,
-  `--no-inline`, `--no-licm`.
+  Flags: `--emit-asm`, `--keep-asm`, `--no-strip`, `--overflow-checks`,
+  `--bounds-checks`, `--no-inline`, `--no-licm`, `--no-tco`.
 - `compiler/tests/compile.rs` — unit tests for the front end and codegen; these
   run without `as`/`ld`.
 
@@ -378,8 +378,12 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   `%rcx`/`%r11`) and the chunk length stays in `%rsi`. Keep new code off the
   callee-saved set, or the whole-function frame comes back.
 - **Link flags.** The driver uses `ld -o <out> --build-id=none -z noseparate-code
-  <obj>`; the assembly already carries `.note.GNU-stack` so no `-z noexecstack` is
-  needed. It used to use `-n` (nmagic), which packed every section into one
+  --strip-all <obj>`; the assembly already carries `.note.GNU-stack` so no
+  `-z noexecstack` is needed. `--strip-all` drops the symbol and section-name
+  tables, which at this size are about a third of the artifact (1376 → 888 bytes
+  on `hello`); it changes nothing the loader reads, and `--no-strip` keeps them
+  for `nm`/`gdb`. `tests/run.py`'s `check_stripped` pins both directions (the
+  default has no symbol table and is smaller than the `--no-strip` build). It used to use `-n` (nmagic), which packed every section into one
   read+write+execute `LOAD` segment: a W^X violation. `-z noseparate-code` keeps
   the read-only and executable sections in one read+execute segment and the
   writable data in a separate read+write one, and is *smaller* than `-n` (1376
