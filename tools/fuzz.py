@@ -662,6 +662,72 @@ def gen_opt_program(rng):
     return "\n".join(rms), "\n".join(rs)
 
 
+# ------------------------------------------------------------- order mode
+
+def gen_order_program(rng):
+    """Assignment evaluation order. `stmt` mode always assigns to a plain
+    `arr[i % 4]` with a side-effect-free value, so the ordering of the assignee
+    place against the assigned value was never exercised. rustc evaluates the
+    value first and the place second (the one expression whose operands are
+    ordered right-to-left), and a divergence is only observable when *both*
+    sides have effects, so every statement here gives the index and the value
+    their own `li` calls. The array is printed at the end so a wrong order or a
+    lost store shows up.
+    """
+    rms = ["fn li(t: i64) -> i64 { print_i64(t); return t; }"]
+    rs = ['fn li(t: i64) -> i64 { println!("{}", t); t }']
+    init = ", ".join(str(rng.randint(0, 9)) for _ in range(8))
+    rms += ["fn main() -> i64 {", f"    let mut a: [i64; 8] = [{init}];"]
+    rs += ["fn main() {", f"    let mut a: [i64; 8] = [{init}];"]
+    # `=` and every compound operator: a compound assignment desugars to a read,
+    # a combine and a write, so its operand order is its own path.
+    ops = ["=", "+=", "-=", "*=", "&=", "|=", "^=", "<<=", ">>="]
+    for _ in range(rng.randint(2, 5)):
+        idx = rng.randint(0, 7)
+        op = rng.choice(ops)
+        shape = rng.choice(["v", "v+v", "v*v"])
+        a, b = rng.randint(0, 9), rng.randint(0, 9)
+        val = {"v": f"li({a})", "v+v": f"li({a}) + li({b})", "v*v": f"li({a}) * li({b})"}[shape]
+        rms.append(f"    a[li({idx})] {op} {val};")
+        rs.append(f"    a[li({idx}) as usize] {op} {val};")
+    # A plain assignment whose target index is a variable but whose value calls:
+    # the place has no effect, so only the value's order against nothing matters.
+    rms.append("    let mut i: i64 = 3;")
+    rs.append("    let mut i: i64 = 3;")
+    rms.append("    a[i] = li(41);")
+    rs.append("    a[i as usize] = li(41);")
+    # Assignments through a `&mut` array and a `&mut` scalar: these take the
+    # generic store-through-address path rather than the array-local one.
+    rms.append("    let r: &mut [i64; 8] = &mut a;")
+    rs.append("    let r = &mut a;")
+    for _ in range(rng.randint(1, 2)):
+        idx, val = rng.randint(0, 7), rng.randint(0, 9)
+        rms.append(f"    r[li({idx})] = li({val});")
+        rs.append(f"    r[li({idx}) as usize] = li({val});")
+    rms.append("    let mut x: i64 = 0;")
+    rs.append("    let mut x: i64 = 0;")
+    rms.append("    let p: &mut i64 = &mut x;")
+    rs.append("    let p = &mut x;")
+    rms.append("    *p = li(13);")
+    rs.append("    *p = li(13);")
+    rms.append("    a[i] = a[i] + x;")
+    rs.append("    a[i as usize] += x;")
+    # A side-effecting value with a side-effecting index in one expression.
+    rms.append("    a[li(i + 1)] = li(a[li(0)]);")
+    rs.append("    a[li(i + 1) as usize] = li(a[li(0) as usize]);")
+    rms.append("    let mut acc: i64 = 0;")
+    rs.append("    let mut acc: i64 = 0;")
+    for k in range(8):
+        rms.append(f"    acc = acc + a[{k}] * {k + 1};")
+        rs.append(f"    acc += a[{k}] * {k + 1};")
+    rms.append("    print_i64(acc);")
+    rs.append('    println!("{}", acc);')
+    rms.append("    return 0;")
+    rs.append("}")
+    rms.append("}")
+    return "\n".join(rms), "\n".join(rs)
+
+
 # -------------------------------------------------------------- robust mode
 
 def robust_corpus():
@@ -1010,7 +1076,7 @@ def run_reject():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "robust", "reject"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "robust", "reject"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -1045,7 +1111,8 @@ def main():
     os.makedirs(tmp, exist_ok=True)
     gen = {"expr": gen_expr_program, "stmt": gen_stmt_program,
            "opt": gen_opt_program, "arith": gen_arith_program,
-           "nest": gen_nest_program, "pat": gen_pat_program}[args.mode]
+           "nest": gen_nest_program, "pat": gen_pat_program,
+           "order": gen_order_program}[args.mode]
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus
     # suite; a fuzz program is otherwise only checked with every pass on, so a

@@ -1008,16 +1008,7 @@ impl Codegen {
                         }
                     }
                     Expr::Field { ty, .. } if ty.is_aggregate() => {
-                        let n = ty.size() / 8;
-                        // The destination address lives in `%rdi`, which
-                        // `gen_expr(value)` may clobber (a call, or another
-                        // aggregate copy), so stash it until the copy.
-                        self.gen_addr(target);
-                        self.push_rax();
-                        self.gen_expr(value);
-                        self.line("mov %rax, %rsi");
-                        self.pop_to("%rdi");
-                        self.copy_words_rdi_rsi(n);
+                        self.assign_aggregate(target, value, ty.size() / 8);
                     }
                     Expr::Field { base, offset, .. } => {
                         if let Some(r) = self.field_reg(base, *offset) {
@@ -1053,13 +1044,7 @@ impl Codegen {
                             Expr::Var { ty: Type::Array(e, _), .. } => (**e).clone(),
                             _ => unreachable!(),
                         };
-                        let n = elem.size() / 8;
-                        self.gen_addr(target);
-                        self.push_rax();
-                        self.gen_expr(value);
-                        self.line("mov %rax, %rsi");
-                        self.pop_to("%rdi");
-                        self.copy_words_rdi_rsi(n);
+                        self.assign_aggregate(target, value, elem.size() / 8);
                     }
                     Expr::Index(base, idx) => {
                         match self.array_elem_operand(base, idx) {
@@ -1095,23 +1080,30 @@ impl Codegen {
                                 }
                             }
                             None => {
-                                self.gen_addr(target);
-                                self.push_rax();
-                                self.gen_expr(value);
-                                self.pop_to("%rcx");
-                                self.line("mov %rax, (%rcx)");
+                                // The value is evaluated before the assignee
+                                // place (see `store_through_addr`), and here the
+                                // place's index is what may call, so the value
+                                // must be stashed before the address is formed.
+                                if Self::contains_call(target) {
+                                    self.gen_expr(value);
+                                    self.push_rax();
+                                    self.gen_addr(target);
+                                    self.line("mov %rax, %rcx");
+                                    self.pop_to("%rax");
+                                    self.line("mov %rax, (%rcx)");
+                                } else {
+                                    self.gen_addr(target);
+                                    self.push_rax();
+                                    self.gen_expr(value);
+                                    self.pop_to("%rcx");
+                                    self.line("mov %rax, (%rcx)");
+                                }
                             }
                         }
                     }
                     // `*r = v`: the target's address is the pointer `r` holds.
                     Expr::Deref { ty, .. } if ty.is_aggregate() => {
-                        let n = ty.size() / 8;
-                        self.gen_addr(target);
-                        self.push_rax();
-                        self.gen_expr(value);
-                        self.line("mov %rax, %rsi");
-                        self.pop_to("%rdi");
-                        self.copy_words_rdi_rsi(n);
+                        self.assign_aggregate(target, value, ty.size() / 8);
                     }
                     Expr::Deref { .. } => {
                         self.store_through_addr(target, value, Some(0));
@@ -1392,6 +1384,22 @@ impl Codegen {
     /// `off` is a constant displacement added to the computed address (a
     /// variable index passes `None` and stays on the fallback path).
     fn store_through_addr(&mut self, target: &Expr, value: &Expr, off: Option<i32>) {
+        // rustc evaluates the assigned value before the assignee place (the one
+        // expression whose operands are ordered right-to-left). When computing
+        // the place can run a call, evaluate the value first and stash it,
+        // otherwise the place's call would be sequenced ahead of the value's.
+        if Self::contains_call(target) {
+            // The value goes first, but the place's address is what `gen_addr`
+            // leaves in `%rax`; move it aside, reload the value into `%rax`, and
+            // store the value through the address.
+            self.gen_expr(value);
+            self.push_rax();
+            self.gen_addr(target);
+            self.line("mov %rax, %rcx");
+            self.pop_to("%rax");
+            self.line("mov %rax, (%rcx)");
+            return;
+        }
         if let (Some(op), Some(k)) = (self.simple_operand(value), off) {
             if op.starts_with('%') || op.starts_with('$') {
                 self.gen_addr(target);
@@ -1405,6 +1413,28 @@ impl Codegen {
         self.gen_expr(value);
         self.pop_to("%rcx");
         self.line("mov %rax, (%rcx)");
+    }
+
+    /// Assign aggregate `value` (an address in `%rax`) into aggregate place
+    /// `target` by copying `n` words. The value is evaluated before the place,
+    /// as rustc orders assignment operands; when the place's address computation
+    /// can call, the value is stashed across it. Otherwise the place is formed
+    /// first and the value stashed across the copy's scratch use of `%rdi`.
+    fn assign_aggregate(&mut self, target: &Expr, value: &Expr, n: usize) {
+        if Self::contains_call(target) {
+            self.gen_expr(value);
+            self.push_rax();
+            self.gen_addr(target);
+            self.line("mov %rax, %rdi");
+            self.pop_to("%rsi");
+        } else {
+            self.gen_addr(target);
+            self.push_rax();
+            self.gen_expr(value);
+            self.line("mov %rax, %rsi");
+            self.pop_to("%rdi");
+        }
+        self.copy_words_rdi_rsi(n);
     }
 
     /// Store register-or-immediate operand `op` into memory operand `dst`.
@@ -2734,13 +2764,18 @@ impl Codegen {
             Expr::Un(_, a) | Expr::Cast(a, _) => Self::contains_call(a),
             Expr::Index(a, b) => Self::contains_call(a) || Self::contains_call(b),
             Expr::Field { base, .. } => Self::contains_call(base),
-            // An enum constructor, a variant test and a payload read all
-            // evaluate their children, which can call. Missing these let the
-            // direct-argument shortcut select an argument whose nested call
-            // clobbers an earlier argument register.
+            // Every expression that evaluates a child can call, so each must be
+            // covered: a missed variant lets the direct-argument shortcut pick
+            // an argument whose nested call clobbers an earlier argument
+            // register, and the assignment reorder must also see a call inside
+            // a place.
             Expr::EnumCtor { args, .. } => args.iter().any(Self::contains_call),
-            Expr::VariantTest { scrutinee, .. } => Self::contains_call(scrutinee),
+            Expr::VariantTest { scrutinee, .. } | Expr::BoolTest { scrutinee, .. } => {
+                Self::contains_call(scrutinee)
+            }
             Expr::EnumPayload { recv, .. } => Self::contains_call(recv),
+            Expr::Deref { expr, .. } | Expr::AddrOf { expr, .. } => Self::contains_call(expr),
+            Expr::ArrayList(v) => v.iter().any(Self::contains_call),
             Expr::If(c, t, els) => {
                 Self::contains_call(c)
                     || Self::block_has_call(t)
