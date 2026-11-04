@@ -95,7 +95,9 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   before codegen. See the LICM gotcha below.
 - `compiler/src/codegen.rs` — AST to AT&T x86-64 assembly.
 - `compiler/src/runtime.rs` — freestanding assembly runtime (`_start`, I/O,
-  `alloc`/`free`, `arg_i64`, the overflow trap).
+  `alloc`/`free`, `arg_i64`, the traps). Stored as a table of selectable
+  `PIECES`; `for_program(user_asm)` links only the pieces the program reaches
+  (see "Runtime pruning" below).
 - `compiler/src/main.rs` — CLI: reads source, calls the library, runs `as`/`ld`.
   Flags: `--emit-asm`, `--keep-asm`, `--overflow-checks`, `--bounds-checks`,
   `--no-inline`, `--no-licm`.
@@ -404,10 +406,22 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   needed. It used to use `-n` (nmagic), which packed every section into one
   read+write+execute `LOAD` segment: a W^X violation. `-z noseparate-code` keeps
   the read-only and executable sections in one read+execute segment and the
-  writable data in a separate read+write one, and is *smaller* than `-n` (3304
-  bytes vs 7344 for `hello`). Do not "optimise" it back to `-n`. `tests/run.py`
+  writable data in a separate read+write one, and is *smaller* than `-n` (1376
+  bytes vs 5416 for `hello`). Do not "optimise" it back to `-n`. `tests/run.py`
   runs `readelf -lW` on a compiled binary and fails if any `LOAD` segment is both
   writable and executable.
+- **Runtime pruning.** `runtime.rs` stores the runtime as `PIECES`, each naming
+  the symbols it defines; `for_program(user_asm)` keeps `_start` plus every
+  piece the program (or a kept piece) names a symbol of, to a fixpoint. A new
+  runtime helper is a new piece, and its `defines` list must include *every*
+  symbol the linker needs — the function label *and* any global it owns (e.g.
+  `alloc`'s piece must name `__rmc_arena`/`__rmc_freelist`, or the arena
+  vanishes and the link fails with an undefined symbol). Symbol matching is
+  word-boundary aware and strips `#` comments, so `free` does not match inside
+  `__rmc_freelist` or in `alloc`'s "free list" comment. If a trap stops being
+  emitted, its piece drops out — that is the point, but a test that asserts on
+  runtime text must first force the construct that pulls the piece in (see
+  `the_bounds_handler_is_in_an_executable_section`).
 - **A runtime function must be emitted in `.text`.** `-n` merged sections so a
   misplaced handler still ran under the CLI link, but with any sane link (the
   library path, or the CLI's `-z noseparate-code`) a handler left in `.rodata`
