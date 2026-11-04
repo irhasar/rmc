@@ -556,11 +556,13 @@ The checks, all in `sema.rs`:
   ... { a[i] = ..; } a[0]`), which rustc also rejects. Write the array with `= [0;
   N]` instead; the corpus cases do.
 - **Constant array bounds.** A constant index outside the array (`a[5]` on a
-  `[i64; 2]`, or the negated `a[-1]`) is a compile error, with or without
-  `--bounds-checks`, matching rustc (`E0080`/`E0608`). The index is folded with
-  `const_i64`, which sees through unary `-`. This closes the case where an
-  out-of-range constant read adjacent stack memory unless runtime checks were on.
-  A *variable* index is still unchecked by default (see Scope).
+  `[i64; 2]`, the negated `a[-1]`, or an expression like `a[1 + 4]`) is a compile
+  error, with or without `--bounds-checks`, matching rustc (`E0080`/`E0608`).
+  The index is folded with `const_i64`, which evaluates the integer operators
+  (`+ - * / % & | ^ << >>`) as well as unary `-`, so an index written as an
+  expression is caught too — an earlier version folded only literals and let
+  `a[1 + 4]` read adjacent stack memory. A *variable* index is still unchecked
+  by default (see Scope).
 - **String typing.** A string literal is `Type::Str`, not `i64`. It cannot be an
   arithmetic operand (`1 + "hi"` was accepted as integer addition on the
   string's address, `E0369`) and cannot be passed where an `i64` is expected
@@ -569,6 +571,15 @@ The checks, all in `sema.rs`:
 - **Parameter names (`E0415`) and `main` (`E0580`).** A function's parameters
   must be uniquely named; `check_fn` rejects a duplicate (rmc used to bind both
   to one slot). `main` takes no parameters, checked in `analyze`.
+- **Casts (`E0054`/`E0605`/`E0606`).** `check_cast` restricts `as` to the
+  conversions rustc allows plus rmc's two documented extensions. A reference may
+  only become a reference to the same type (`&mut T` may lose mutability to
+  `&T`, never gain it), and never a scalar; any other scalar may not become a
+  reference. The extensions are `i64 as bool` (rustc spells it `x != 0`) and the
+  raw pointer cast `i64 as &T` / `i64 as &mut T` (rustc needs `as *const T`
+  first), both used by the corpus (`boolops`, `listptr`) and the heap benchmark.
+  Before this, `r as i64`, `r as &mut T`, `&T as &U` and `bool as &T` all
+  compiled, reinterpreting a pointer as a value or forging mutability.
 - **Constant arithmetic (`E0080`-like).** `const_binop` folds an operator whose
   *both* operands are literals (`const_i64` sees through unary `-`) and rejects
   the cases rustc denies: division/remainder by zero, `MIN / -1`, `+`/`-`/`*`
