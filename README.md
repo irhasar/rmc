@@ -152,7 +152,9 @@ together with a small fixed-seed differential fuzz.
 A caveat for `expr`: an integer literal in a shift amount is unconstrained, so
 rustc infers `i32` and masks the count to 5 bits, while rmc is `i64`-only and
 masks to 6. The generator therefore keeps shift operands `i64`-typed, or the two
-would disagree for a reason that is not a bug.
+would disagree for a reason that is not a bug. For the same reason the
+`i64::MIN` literal it emits is always a typed `let m: i64` binding: untyped,
+rustc would infer `i32` and reject it while rmc accepts it.
 
 ## Language subset
 

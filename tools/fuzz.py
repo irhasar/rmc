@@ -132,12 +132,26 @@ def gen_expr_program(rng):
         else:
             e = gen_cmp(rng, 0)
         exprs.append(e)
+    # `i64::MIN` has to be a typed binding: in an untyped position rustc infers
+    # `i32` for the literal and rejects it, while rmc's only integer type is
+    # `i64`, so comparing the two there would be a false divergence.
+    min_exprs = [
+        "m",
+        "(m + 1)",
+        "(m / 2)",
+        "(!m)",
+        "((m < 0) as i64)",
+        "((m == -9223372036854775808) as i64)",
+    ]
+    if rng.random() < 0.4:
+        exprs.append(rng.choice(min_exprs))
     rms = [
         "fn h(x: i64) -> i64 { return (x * 3 + 1) % 97 - 48; }",
         "fn main() -> i64 {",
         f"    let a: i64 = {a};",
         f"    let b: i64 = {b};",
         f"    let c: i64 = {c};",
+        "    let m: i64 = -9223372036854775808;",
     ]
     rs = [
         "fn h(x: i64) -> i64 { (x * 3 + 1) % 97 - 48 }",
@@ -145,6 +159,7 @@ def gen_expr_program(rng):
         f"    let a: i64 = {a};",
         f"    let b: i64 = {b};",
         f"    let c: i64 = {c};",
+        "    let m: i64 = -9223372036854775808;",
     ]
     for e in exprs:
         rms.append(f"    print_i64({e});")
@@ -921,6 +936,17 @@ def reject_corpus():
         "const_index_negative_oob": (
             "fn main() -> i64 { let a: [i64; 2] = [1, 2]; return a[-1]; }\n",
             "fn main() { let a: [i64; 2] = [1, 2]; println!(\"{}\", a[-1]); }\n",
+        ),
+        # The magnitude `2^63` is only valid as the operand of a `-` that makes
+        # it `i64::MIN`. Standing alone (E0080) or as the operand of a second
+        # negation (E0080/E0608 overflow) rustc rejects it, and so must rmc.
+        "i64_min_magnitude_alone": (
+            "fn main() -> i64 { return 9223372036854775808; }\n",
+            "fn main() { let x: i64 = 9223372036854775808; println!(\"{}\", x); }\n",
+        ),
+        "negate_i64_min": (
+            "fn main() -> i64 { return - -9223372036854775808; }\n",
+            "fn main() { let x: i64 = - -9223372036854775808; println!(\"{}\", x); }\n",
         ),
         # A string literal is a `&str`, not an integer. Adding it to an integer
         # (E0369) and passing it where an `i64` is expected must be rejected;

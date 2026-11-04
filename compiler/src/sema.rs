@@ -1123,6 +1123,14 @@ impl Sema {
                         if t != Type::I64 {
                             return Err(format!("unary `-` expects `i64`, found {t:?}"));
                         }
+                        // Negating `i64::MIN` overflows. rustc's
+                        // `arithmetic_overflow` deny lint catches it when the
+                        // operand folds to a constant, so rmc does too; the
+                        // `i64::MIN` literal itself is parsed as `Int(i64::MIN)`,
+                        // not a negation, so only a written `-` reaches here.
+                        if self.const_of(inner, &self.const_locals) == Some(i64::MIN) {
+                            return Err("this arithmetic operation overflows".into());
+                        }
                         Ok(Type::I64)
                     }
                     UnOp::Not => match t {

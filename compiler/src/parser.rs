@@ -765,6 +765,13 @@ impl Parser {
             Some(Tok::Minus) => {
                 self.i += 1;
                 self.bump_depth()?;
+                // `-9223372036854775808` is the one literal whose magnitude
+                // exceeds `i64::MAX`; the lexer hands it over as a distinct
+                // token so only this `-` position can make it valid.
+                if self.peek() == Some(&Tok::IntMinMagnitude) {
+                    self.i += 1;
+                    return Ok(Expr::Int(i64::MIN));
+                }
                 let e = self.parse_unary()?;
                 Ok(Expr::Un(UnOp::Neg, Box::new(e)))
             }
@@ -858,6 +865,7 @@ impl Parser {
                         Tok::Int(v) => Pat::Int(v.checked_neg().ok_or_else(|| {
                             format!("at byte {}: pattern literal out of range", self.pos())
                         })?),
+                        Tok::IntMinMagnitude => Pat::Int(i64::MIN),
                         other => return Err(format!(
                             "at byte {}: expected an integer after `-` in a pattern, found {}",
                             self.pos(), other.describe()
@@ -1045,6 +1053,13 @@ impl Parser {
                 self.i += 1;
                 Ok(Expr::Int(v))
             }
+            // The magnitude `2^63` is only valid directly under a `-`, which
+            // `parse_unary` folds into `Expr::Int(i64::MIN)`. Reaching it here
+            // means it stood alone, so it is out of range, as in rustc.
+            Some(Tok::IntMinMagnitude) => Err(format!(
+                "at byte {}: integer literal `9223372036854775808` is out of range for `i64`",
+                self.pos()
+            )),
             Some(Tok::Str(s)) => {
                 self.i += 1;
                 Ok(Expr::Str(s))
