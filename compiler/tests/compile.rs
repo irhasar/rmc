@@ -276,6 +276,55 @@ fn a_nested_match_with_all_variants_is_still_a_value() {
 }
 
 #[test]
+fn a_bool_match_covering_both_values_is_a_value() {
+    // `true` and `false` together cover every `bool`, so the chain is total and
+    // may stand for a value. The two tests are `BoolTest`s, not plain
+    // `Bin(Eq, ..)`, so the exhaustiveness walk can recognise them.
+    let src = "fn f(b: bool) -> i64 { return match b { true => 1, false => 0 }; } \
+               fn main() -> i64 { return f(1 < 2); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_bool_match_missing_a_value_is_rejected() {
+    // Only `true`: the chain can fall through to unit, a type error in value
+    // position, exactly as in Rust (E0004).
+    let err = compile_to_asm(
+        "fn f(b: bool) -> i64 { return match b { true => 1 }; } \
+         fn main() -> i64 { return f(1 < 2); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("`if` without `else`"), "got: {err}");
+}
+
+#[test]
+fn a_hand_written_bool_if_chain_is_not_exhaustive() {
+    // `if b == true { .. } else if b == false { .. }` has no final `else` and
+    // rustc rejects it in value position; only the `match` desugaring's
+    // `BoolTest`s count as covering `bool`, so this must stay an error.
+    let err = compile_to_asm(
+        "fn f(b: bool) -> i64 { \
+         let t: i64 = if b == true { 1 } else if b == false { 0 }; return t; } \
+         fn main() -> i64 { return f(1 < 2); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("`if` without `else`"), "got: {err}");
+}
+
+#[test]
+fn a_bool_pattern_on_a_non_bool_is_rejected() {
+    let err = compile_to_asm(
+        "fn f(x: i64) -> i64 { return match x { true => 1, _ => 0 }; } \
+         fn main() -> i64 { return f(1); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("`true` pattern cannot match"), "got: {err}");
+}
+
+#[test]
 fn a_match_statement_without_a_semicolon_is_allowed() {
     // A `match` is a block-like expression, so it is a valid statement with no
     // trailing `;`. Wrapping the desugared chain in the match-boundary node must

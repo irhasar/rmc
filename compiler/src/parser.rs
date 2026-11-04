@@ -867,6 +867,14 @@ impl Parser {
                     self.i += 1;
                     Pat::Int(v)
                 }
+                Some(Tok::True) => {
+                    self.i += 1;
+                    Pat::Bool(true)
+                }
+                Some(Tok::False) => {
+                    self.i += 1;
+                    Pat::Bool(false)
+                }
                 // `Enum::Variant`, `Enum::Variant(a, b)`, or a binding name.
                 Some(Tok::Ident(n)) => {
                     self.i += 1;
@@ -892,7 +900,7 @@ impl Parser {
                     }
                 }
                 other => return Err(format!(
-                    "at byte {}: expected an integer, `Enum::Variant` or `_` pattern, found {}",
+                    "at byte {}: expected an integer, `true`/`false`, `Enum::Variant` or `_` pattern, found {}",
                     self.pos(),
                     other.map(|t| t.describe()).unwrap_or_else(|| "end of input".into())
                 )),
@@ -953,6 +961,12 @@ impl Parser {
                 }),
                 Pat::Int(k) => {
                     let cond = Expr::Bin(BinOp::Eq, Box::new(subj.clone()), Box::new(Expr::Int(k)));
+                    Self::match_arm(cond, body, acc)
+                }
+                // `true`/`false` become a `BoolTest`, not a `Bin(Eq, ..)`, so a
+                // chain of them can be recognised as an exhaustive bool match.
+                Pat::Bool(b) => {
+                    let cond = Expr::BoolTest { scrutinee: Box::new(subj.clone()), value: b };
                     Self::match_arm(cond, body, acc)
                 }
                 Pat::Variant(enum_name, variant, bindings) => {
@@ -1180,11 +1194,14 @@ impl Parser {
     }
 }
 
-/// A `match` pattern: a wildcard, an integer literal, or an `Enum::Variant`.
-/// The variant is resolved to its tag by sema, once the enum is known.
+/// A `match` pattern: a wildcard, an integer or `bool` literal, or an
+/// `Enum::Variant`. The variant is resolved to its tag by sema, once the enum
+/// is known.
 enum Pat {
     Wild,
     Int(i64),
+    /// `true` or `false`.
+    Bool(bool),
     /// `Enum::Variant` or `Enum::Variant(..)`. The constructor is resolved by
     /// sema; the optional bindings name the payload fields, in field order.
     Variant(String, String, Option<Vec<String>>),

@@ -467,22 +467,25 @@ resolve to `Type::Enum` through `resolve_ty`, which every type site uses, and
 enum patterns are a `Pat::Variant` the parser desugars into an `EnumVariant`
 comparison. `as` may not target an enum, matching rustc.
 
-A pattern is a wildcard, an integer literal, an `Enum::Variant`, or a bare
-binding name; a `bool` literal (`true`/`false`) is *not* accepted, so
-`match b { true => .., false => .. }` is an over-rejection — rustc accepts it,
-rmc reports "expected an integer, `Enum::Variant` or `_` pattern". The safe
-direction, not a soundness bug, but a real gap worth closing: `b` can be
-matched with `if`/`else` in the meantime. rmc's `match` desugaring also evaluates
-a non-trivial scrutinee once through a `\0mt<n>` temporary, so a side effect in
-the scrutinee runs exactly once regardless of the arm count.
+A pattern is a wildcard, an integer or `bool` literal, an `Enum::Variant`, or a
+bare binding name. A `bool` pattern (`true`/`false`) desugars to a `BoolTest`,
+a node like `VariantTest` that compares the scrutinee word; a chain of two of
+them covering both values is exhaustive, so `match b { true => .., false => .. }`
+is a value. The node exists precisely so a hand-written `if b == true { .. }
+else if b == false { .. }` (a plain `Bin(Eq, ..)`) is *not* mistaken for an
+exhaustive chain — rustc rejects that in value position, and rmc must too. A
+`bool` pattern on a non-`bool` value is rejected. rmc's `match` desugaring also
+evaluates a non-trivial scrutinee once through a `\0mt<n>` temporary, so a side
+effect in the scrutinee runs exactly once regardless of the arm count.
 
 A `match` is desugared into a chain of `if`s, so a `match` with no `_` arm has
 no final `else` and, used as a value, would trip the "`if` without `else`" check
 in sema. When the arms name *every* variant of one enum it is total, and rustc
 accepts it as a value, so sema recognises exactly that case:
 `Sema::if_chain_is_exhaustive` walks the chain, requires every condition to be a
-`VariantTest` over one enum, and compares the number of distinct variants tested
-against the enum's variant count. Because the desugared chain is checked
+`VariantTest` over one enum (or a `BoolTest` over one variable), and compares the
+number of distinct variants (or bool values) tested against the enum's variant
+count (or two). Because the desugared chain is checked
 outside-in, the innermost `if` is seen first; `Sema::match_chain`/`match_total`
 carry the verdict down the chain so the last `if` (no `else`) may stand for a
 value. The two flags are set only on the `else` path of a *total* chain, so a

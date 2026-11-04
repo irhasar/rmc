@@ -183,6 +183,7 @@ fn has_call(e: &Expr) -> bool {
         Expr::EnumVariant { .. } => false,
         Expr::EnumCtor { args, .. } => args.iter().any(has_call),
         Expr::VariantTest { scrutinee, .. } => has_call(scrutinee),
+        Expr::BoolTest { scrutinee, .. } => has_call(scrutinee),
         Expr::EnumPayload { recv, .. } => has_call(recv),
         Expr::Cast(a, _) => has_call(a),
         Expr::AddrOf { expr, .. } => has_call(expr),
@@ -230,6 +231,7 @@ fn has_return(e: &Expr) -> bool {
         Expr::EnumVariant { .. } => false,
         Expr::EnumCtor { args, .. } => args.iter().any(has_return),
         Expr::VariantTest { scrutinee, .. } => has_return(scrutinee),
+        Expr::BoolTest { scrutinee, .. } => has_return(scrutinee),
         Expr::EnumPayload { recv, .. } => has_return(recv),
     }
 }

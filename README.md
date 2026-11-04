@@ -123,8 +123,8 @@ small inlined helpers (the shapes the other two do not emit), `arith` for
 overflowing arithmetic near `i64::MAX` (the only mode that makes the
 `--overflow-checks` trap fire), `nest` for nested aggregates with a deep copy
 and a nested-path write, and `pat` for `match` expressions (multi-variant enums,
-two-field payloads, binding patterns, nested matches, and a side-effecting
-scrutinee). Every program is recompiled with each optimiser pass off in turn.
+two-field payloads, `bool` matches, binding patterns, nested matches, and a
+side-effecting scrutinee). Every program is recompiled with each optimiser pass off in turn.
 Seeds are reproducible, so a failure can be re-run and shrunk.
 
 ```sh
@@ -176,8 +176,9 @@ fn main() -> i64 {
 Supported: `i64`, `bool`, fixed-size arrays, and structs with named fields;
 functions with up to six parameters; `let` / `let mut`; assignment to variables,
 array elements and struct fields (including compound `+=` and friends);
-`if`/`else`, `while`, `loop`, and `for i in a..b`; `match` on integers (literal
-patterns and `_`); `break`, `continue`,
+`if`/`else`, `while`, `loop`, and `for i in a..b`; `match` on integers,
+`bool`s and enums (literal, `true`/`false`, `Enum::Variant` and `_` patterns,
+plus payload bindings and binding names); `break`, `continue`,
 `return`; arithmetic, comparison, bitwise (`&`/`|`/`^`) and shift (`<<`/`>>`)
 operators; `&&`/`||`; string literals; `mut` enforcement and definite
 initialisation; references (`&T` / `&mut T`, `&e`, `*e`,
