@@ -214,6 +214,14 @@ def check_stripped():
     if any(a >= b for a, b in zip(sizes, sizes[1:])):
         print(f"FAIL strip: artifact sizes not increasing {sizes}")
         return 1
+
+    # An absolute bound. A one-line program is a few hundred bytes; a 4 KB
+    # regression (e.g. a section that should be in the RX segment getting
+    # page-aligned into its own) would not change the ordering above but would
+    # blow this bound.
+    if sizes[0] >= 1024:
+        print(f"FAIL strip: default artifact is {sizes[0]} bytes (want < 1024)")
+        return 1
     return 0
 
 

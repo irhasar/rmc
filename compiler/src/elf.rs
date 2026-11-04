@@ -37,7 +37,7 @@ struct Fixup {
 
 struct Section {
     name: &'static str,
-    /// Program-header flags: 0x1 read, 0x2 write, 0x4 execute.
+    /// ELF `PF_` flags: 0x4 read, 0x2 write, 0x1 execute.
     flags: u64,
     align: u64,
     data: Vec<u8>,
@@ -152,13 +152,13 @@ impl Elf {
         let arg = it.next().unwrap_or("").trim();
         match name {
             "text" => *cur = self.text_idx,
-            "data" => *cur = self.section(".data", 0x3, 8),
-            "rodata" => *cur = self.section(".rodata", 0x2, 8),
+            "data" => *cur = self.section(".data", 0x6, 8),
+            "rodata" => *cur = self.section(".rodata", 0x4, 8),
             "section" => {
                 let sec = arg.split(',').next().unwrap_or("").trim();
                 match sec {
-                    ".rodata" => *cur = self.section(".rodata", 0x2, 8),
-                    ".data" => *cur = self.section(".data", 0x3, 8),
+                    ".rodata" => *cur = self.section(".rodata", 0x4, 8),
+                    ".data" => *cur = self.section(".data", 0x6, 8),
                     ".text" => *cur = self.text_idx,
                     // A static executable needs no PT_GNU_STACK segment to be
                     // non-executable; the note carries nothing else.
