@@ -41,6 +41,7 @@ def run(cmd, **kw):
 # ---------------------------------------------------------------- expr mode
 
 EXPR_OPS = ["+", "-", "*", "&", "|", "^", "<<", ">>"]
+CMP_OPS = ["<", ">", "<=", ">=", "==", "!="]
 
 
 def gen_expr(rng, depth):
@@ -92,11 +93,28 @@ def gen_i64(rng, depth):
     return f"({gen_i64(rng, depth + 1)} {op} {right})"
 
 
+def gen_cmp(rng, depth):
+    """A comparison used as a value: `(x op y) as i64`. rustc infers `i32` for
+    an unsuffixed literal, so both sides go through `gen_expr` (whose leaves are
+    variables and calls), and the `as i64` makes the result type agree. This is
+    the only generator that feeds `emit_cmp`, whose operand-class dispatch
+    (immediate/immediate, immediate/memory, memory/immediate, memory/memory) is
+    otherwise reached only by loop conditions."""
+    op = rng.choice(CMP_OPS)
+    return f"(({gen_expr(rng, depth + 1)}) {op} ({gen_expr(rng, depth + 1)})) as i64"
+
+
 def gen_expr_program(rng):
     a, b, c = (rng.randint(-1000, 1000) for _ in range(3))
     exprs = []
     for _ in range(rng.randint(1, 5)):
-        e = gen_expr(rng, 0) if rng.random() < 0.5 else gen_guarded_div(rng, 0)
+        r = rng.random()
+        if r < 0.4:
+            e = gen_expr(rng, 0)
+        elif r < 0.7:
+            e = gen_guarded_div(rng, 0)
+        else:
+            e = gen_cmp(rng, 0)
         exprs.append(e)
     rms = [
         "fn h(x: i64) -> i64 { return (x * 3 + 1) % 97 - 48; }",
