@@ -698,9 +698,18 @@ impl Codegen {
                 Self::count_block(b, counts, mem, copied, true, let_tmps);
             }
             Stmt::Loop(b) => Self::count_block(b, counts, mem, copied, true, let_tmps),
-            Stmt::For { start, end, body, .. } => {
+            Stmt::For { start, end, body, var_slot, end_slot, .. } => {
                 Self::count_expr(start, counts, mem, copied, true, let_tmps);
                 Self::count_expr(end, counts, mem, copied, true, let_tmps);
+                // The counter and the bound live in hidden slots no expression
+                // names, yet both are read (and the counter written) every
+                // iteration. Count them so they compete for a register like any
+                // other loop-carried local instead of being reloaded from the
+                // frame on each pass.
+                *counts.entry(*var_slot).or_insert(0) += 1;
+                if Self::small_imm(end).is_none() {
+                    *counts.entry(*end_slot).or_insert(0) += 1;
+                }
                 Self::count_block(body, counts, mem, copied, true, let_tmps);
             }
             Stmt::Return(v) => {
@@ -1162,32 +1171,45 @@ impl Codegen {
                 // Evaluate both bounds once: `var = start`, `end_slot = end`.
                 self.gen_expr(start);
                 self.store_slot(*var_slot);
-                self.gen_expr(end);
-                self.store_slot(*end_slot);
-                // Not rotated: the increment sits between the body and the
-                // guard, so the first guard must see the *un*-incremented start.
-                // A rotated form would either skip the first iteration or need
-                // the guard duplicated, which is not worth it for a construct
-                // the hot benchmarks do not use.
+                // A constant bound needs no slot: it has no side effect, so it
+                // can be compared against directly and the frame word (and its
+                // reload every iteration) disappears. A non-constant bound is
+                // evaluated once into its slot.
+                let end_imm = Self::small_imm(end);
+                if end_imm.is_none() {
+                    self.gen_expr(end);
+                    self.store_slot(*end_slot);
+                }
+                // Rotated like `while`: the guard is the back edge, with an
+                // entry `jmp` reusing it, so an iteration is one branch fewer
+                // than a top-tested form. The increment still sits between the
+                // body and the guard, so `continue` (which targets it) runs it
+                // exactly once, and the entry `jmp` reaches the guard with the
+                // un-incremented start.
                 let top = self.new_label();
                 let cont = self.new_label();
-                let end_l = self.new_label();
-                // `continue` must still run the increment, so it targets `cont`.
-                self.loops.push((cont.clone(), end_l.clone()));
+                let guard = self.new_label();
+                let exit = self.new_label();
+                // `continue` must still run the increment, so it targets `cont`;
+                // `break` leaves past the guard.
+                self.loops.push((cont.clone(), exit.clone()));
+                self.line(&format!("jmp {guard}"));
                 self.raw(&format!("{top}:"));
-                self.gen_var_operand(*var_slot, "%rax");
-                self.gen_var_operand(*end_slot, "%rcx");
-                self.line("cmp %rcx, %rax");
-                // `..=` runs the body once more when `var == end`, so it exits
-                // only once `var > end`.
-                self.line(&format!("{} {end_l}", if *inclusive { "jg" } else { "jge" }));
                 self.gen_block(body);
                 self.raw(&format!("{cont}:"));
+                self.inc_slot(*var_slot);
+                self.raw(&format!("{guard}:"));
                 self.gen_var_operand(*var_slot, "%rax");
-                self.line("add $1, %rax");
-                self.store_slot(*var_slot);
-                self.line(&format!("jmp {top}"));
-                self.raw(&format!("{end_l}:"));
+                match end_imm {
+                    Some(k) => self.line(&format!("cmp ${k}, %rax")),
+                    None => {
+                        self.gen_var_operand(*end_slot, "%rcx");
+                        self.line("cmp %rcx, %rax");
+                    }
+                }
+                // Loop back while `var < end`, or while `var <= end` for `..=`.
+                self.line(&format!("{} {top}", if *inclusive { "jle" } else { "jl" }));
+                self.raw(&format!("{exit}:"));
                 self.loops.pop();
             }
             Stmt::Return(v) => {
@@ -1928,6 +1950,14 @@ impl Codegen {
         match self.reg_of(slot) {
             Some(r) => self.line(&format!("mov %rax, {r}")),
             None => self.line(&format!("mov %rax, {}(%rbp)", self.off(slot))),
+        }
+    }
+
+    /// Add one to local `slot` in place, without routing through `%rax`.
+    fn inc_slot(&mut self, slot: i32) {
+        match self.reg_of(slot) {
+            Some(r) => self.line(&format!("add $1, {r}")),
+            None => self.line(&format!("addq $1, {}(%rbp)", self.off(slot))),
         }
     }
 

@@ -25,7 +25,7 @@ RMC = os.path.join(PROJ, "compiler", "target", "release", "rmc")
 OUT = "/tmp/rmcbench"
 RUSTFLAGS_BASE = []
 
-PROGRAMS = ["hello", "fib", "mandel", "sieve", "mix", "stats", "refs", "heap", "callrec"]
+PROGRAMS = ["hello", "fib", "mandel", "sieve", "mix", "stats", "refs", "heap", "callrec", "forloops"]
 # Runtime input per program, passed as argv so the workload is opaque to the
 # optimizer and cannot be constant-folded away.
 ARGS = {
@@ -38,6 +38,7 @@ ARGS = {
     "refs": ["5000000"],
     "heap": ["200000"],
     "callrec": ["30"],
+    "forloops": ["2000000"],
 }
 
 
@@ -54,7 +55,7 @@ def peak_rss_kb(pid):
 
 
 def measure_spawned(argv, reps):
-    """Run argv `reps` times and return median wall/CPU and peak RSS.
+    """Run argv `reps` times and return minimum wall/CPU and peak RSS.
 
     Spawns with posix_spawn, and reads peak RAM from the child's own `VmHWM`
     rather than `wait4`'s `ru_maxrss`. A freshly spawned child briefly shares
@@ -100,7 +101,12 @@ def measure_spawned(argv, reps):
         walls.append(wall)
         cpus.append(ru.ru_utime + ru.ru_stime)
         rsss.append(peak)
-    return dict(wall=median(walls), cpu=median(cpus), rss=max(rsss))
+    # The minimum, not the median: the workload is deterministic and
+    # single-threaded, so the least-contended sample is the best estimate of the
+    # program's own cost. The median folds in any host noise that happened to
+    # land on the middle sample, which on a shared machine can move a ratio by
+    # tens of percent (a `stats` run once read 0.64x where the minimum is 1.14x).
+    return dict(wall=min(walls), cpu=min(cpus), rss=max(rsss))
 
 
 def median(xs):
@@ -266,14 +272,14 @@ def write_markdown(path, rows, note):
     lines.append("better on that dimension.")
     lines.append("")
     lines.append("Run time is not uniformly in rmc's favour, and a ratio below 1 is")
-    lines.append("possible. On loop-heavy integer code rmc is competitive, and on")
-    lines.append("`forloops` it wins because the rotated `for` compares the counter")
-    lines.append("against the bound directly. `refs` is the counterexample: its loop")
-    lines.append("reads a fixed struct through `&self` accessors, and LICM will not")
-    lines.append("hoist a read through a reference (it can fault on a loop that never")
-    lines.append("runs), so the whole accessor sum is recomputed every iteration and rmc")
-    lines.append("loses to rustc by roughly 8x. A frame-based loop of the same shape is")
-    lines.append("hoisted and wins. On call-heavy code")
+    lines.append("possible. On loop-heavy integer code rmc is competitive: it wins on")
+    lines.append("`forloops` because the rotated `for` compares the counter against the")
+    lines.append("bound directly. `refs` is the counterexample: its loop reads a fixed")
+    lines.append("struct through `&self` accessors, and LICM will not hoist a read through")
+    lines.append("a reference (it can fault on a loop that never runs), so the whole")
+    lines.append("accessor sum is recomputed every iteration and rmc loses to rustc by")
+    lines.append("roughly 8x. A frame-based loop of the same shape is hoisted and wins.")
+    lines.append("On call-heavy code")
     lines.append("(`callrec`) rmc now keeps up because the self-recursion pass folds the")
     lines.append("right spine into a loop, leaving one call per level - the same")
     lines.append("transform rustc applies. That pass is narrow (one `i64` parameter, an")

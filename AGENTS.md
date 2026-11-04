@@ -338,14 +338,26 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   everywhere, including the struct-literal store in `gen_stmt` (an earlier bug
   used `off(slot)`, the wrong end of the range).
 - **`for` is not a `while`.** `continue` must run the increment, so `for` keeps
-  its own node with a dedicated continue label. Desugaring it to `while` would
-  make `continue` skip the increment and loop forever. For the same reason `for`
-  is *not* rotated while `while` is: its increment sits between the body and the
-  guard, so a rotated form would run the increment before the first body
-  iteration (skipping it) or need the guard duplicated.
-- **`..=` exits on `jg`, not `jge`.** The bound is stored in a hidden slot and
-  compared against the counter; the inclusive form must still run the body when
-  `var == end`, so its exit test is strict (`jg`). `forloop.rms` and
+  its own node with a dedicated continue label (`cont`). Desugaring it to `while`
+  would make `continue` skip the increment and loop forever. It *is* rotated like
+  `while`, but with a different shape: the guard tests the *un-incremented*
+  counter at the bottom and loops back to `top`, and the increment sits on the
+  fall-through path between the body and the guard. The entry `jmp` therefore
+  reaches the guard with `var == start`, the first body runs before any
+  increment, and `continue` targets `cont` so it still runs the increment exactly
+  once. Duplicating the guard at the top instead (the naive rotation) is what
+  would skip the first iteration or double the increment.
+- **A `for` bound is compared directly when it is a constant, and through a
+  hidden slot otherwise.** `0..=1000` needs no `end_slot`: the guard is
+  `cmp $1000, %rax`, so no frame word is written and no reload happens each
+  iteration. A non-constant bound (e.g. `0..n`) is evaluated once into `end_slot`
+  and compared register-to-register. `count_expr` must count the hidden counter
+  and bound slots so they compete for a callee-saved register like any other
+  loop-carried local; otherwise the bound is reloaded from the frame every pass.
+- **`..=` exits on `jle` back-edge, not `jl`.** The guard is the loop-back
+  condition, so the inclusive form loops while `var <= end` (`jle`) and the
+  exclusive one while `var < end` (`jl`); a `jg`/`jge` *exit* test is the
+  un-rotated mirror of the same thing. `forloop.rms` and
   `an_inclusive_range_uses_a_strict_exit_test` pin both bounds, and `..=` is a
   three-character token, so it must be lexed in the three-char table (before
   `..`), or it lexes as `..` then `=`.
