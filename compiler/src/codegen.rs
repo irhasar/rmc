@@ -999,8 +999,11 @@ impl Codegen {
                     match self.reg_of(*slot) {
                         Some(r) => self.gen_expr_into_reg(e, r),
                         None => {
-                            self.gen_expr_into_reg(e, "%rax");
-                            self.store_slot(*slot);
+                            let dst = format!("{}(%rbp)", self.off(*slot));
+                            if !self.store_imm(e, &dst) {
+                                self.gen_expr_into_reg(e, "%rax");
+                                self.store_slot(*slot);
+                            }
                         }
                     }
                 } else {
@@ -1488,6 +1491,20 @@ impl Codegen {
         self.line(&format!("{mnemonic} {op}, {dst}"));
     }
 
+    /// Store `e` straight into the memory operand `dst` when `e` is a small
+    /// immediate, so `mov $k, %rax; mov %rax, mem` collapses to `movq $k, mem`.
+    /// Returns false when `e` is not such a constant, so the caller falls back
+    /// to evaluating into a register. A literal needs no overflow check.
+    fn store_imm(&mut self, e: &Expr, dst: &str) -> bool {
+        match Self::small_imm(e) {
+            Some(k) => {
+                self.store_operand(&format!("${k}"), dst);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Leaves the address of an lvalue in `%rax`.
     fn gen_addr(&mut self, e: &Expr) {
         match e {
@@ -1933,16 +1950,23 @@ impl Codegen {
     /// is a single word store; an aggregate field is copied word by word, since
     /// the value expression yields the field's *address*, not its contents.
     fn store_field_value(&mut self, dest_off: i32, reg: Option<&'static str>, fi: &FieldInit) {
-        self.gen_expr(&fi.value);
         if fi.ty.is_aggregate() {
+            self.gen_expr(&fi.value);
             let n = fi.ty.size() / 8;
             self.line("mov %rax, %rsi");
             self.line(&format!("lea {dest_off}(%rbp), %rdi"));
             self.copy_words_rdi_rsi(n);
-        } else if let Some(r) = reg {
-            self.line(&format!("mov %rax, {r}"));
-        } else {
-            self.line(&format!("mov %rax, {dest_off}(%rbp)"));
+            return;
+        }
+        // An unpromoted field with a constant initialiser stores the constant
+        // directly, skipping the register bounce.
+        if reg.is_none() && self.store_imm(&fi.value, &format!("{dest_off}(%rbp)")) {
+            return;
+        }
+        self.gen_expr(&fi.value);
+        match reg {
+            Some(r) => self.line(&format!("mov %rax, {r}")),
+            None => self.line(&format!("mov %rax, {dest_off}(%rbp)")),
         }
     }
 
