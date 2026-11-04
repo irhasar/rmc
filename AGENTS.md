@@ -91,8 +91,9 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   (used by sema to fold a constant index or operand) and `resolve`/`eval_i64`
   (used by the parser to evaluate `const` items). A `const` item has no storage
   and no codegen; its value is substituted at every use.
-- `compiler/src/inline.rs` — AST inlining of small, straight-line, scalar
-  functions, run after sema and before codegen. See the inlining gotcha below.
+- `compiler/src/inline.rs` — AST inlining of small, call-free, scalar functions
+  (a loop is allowed, an early exit is not), run after sema and before codegen.
+  See the inlining gotcha below.
 - `compiler/src/licm.rs` — loop-invariant code motion, run after inlining and
   before codegen. See the LICM gotcha below.
 - `compiler/src/dce.rs` — dead-function elimination, run after LICM and before
@@ -217,10 +218,17 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   parameter the body assigns must also be bound to a fresh slot even when the
   argument is a plain variable, because a parameter is a local copy: replacing
   it by the caller's variable would make `x = x + 1` write through to the caller.
-  A candidate body must be call-free and straight-line; because it is, inlining it
-  cannot expose new calls, but the pass still runs to a *fixpoint* because a
-  function only becomes call-free after its own callees are inlined (the `refs`
-  wrapper `sum_via_ref` needs round two). A statement-free block is unwrapped to
+  A candidate body must be call-free with no early exit; because it is call-free,
+  inlining it cannot expose new calls, but the pass still runs to a *fixpoint*
+  because a function only becomes call-free after its own callees are inlined
+  (the `refs` wrapper `sum_via_ref` needs round two). A loop is allowed — a small
+  helper like `gcd` has one and is still worth inlining, since that removes the
+  call from the caller's hot loop (measured 1.12x on a `tri(i % 50)` shape). A
+  `break`/`continue` is *not* allowed: once spliced into the caller it would bind
+  to the caller's enclosing loop. A non-final `return` is not allowed either, for
+  the same reason. `Sub` already rewrites `while`/`loop`/`for` bodies and their
+  counter slots, and `assigned_slots` already descends into them, so a
+  loop-bearing body needs no extra splice work. A statement-free block is unwrapped to
   its tail after expansion: the spliced body of an accessor would otherwise stay
   wrapped in an `Expr::Block`, and later passes (`simple_operand`, the
   accumulator fold) cannot see through a block, so the hot loop would bounce its
