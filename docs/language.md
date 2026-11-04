@@ -207,9 +207,12 @@ so `let mut i = -1; i = 0; a[i]` stays a runtime (checked) index.
 
 By default integer arithmetic wraps, as in release-mode Rust. Compiling with
 `--overflow-checks` (or `CompileOptions { overflow_checks: true }` from the
-library) inserts a trap after every `+`, `-` and `*`; on overflow the program
-writes `rmc: arithmetic overflow` to stderr and exits with status 101, matching a
-Rust panic. Division by zero always traps at the CPU level.
+library) inserts a trap after every `+`, `-` and `*`, and range-checks every
+*variable* shift count against `0..64`; on overflow or an out-of-range shift the
+program writes `rmc: arithmetic overflow` to stderr and exits with status 101,
+matching a Rust panic. Division by zero always traps at the CPU level. (A shift
+count that is a compile-time constant is decided at compile time, not by the
+trap.)
 
 ## Expressions
 

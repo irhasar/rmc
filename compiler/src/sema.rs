@@ -1277,6 +1277,18 @@ impl Sema {
                         if ta != Type::I64 || tb != Type::I64 {
                             return Err(format!("bitwise operator expects `i64` operands, found {ta:?} and {tb:?}"));
                         }
+                        // rustc rejects a shift whose count is a known constant
+                        // outside 0..=63 even when the shifted value is a
+                        // runtime value (`x << 81` is a compile error, not a
+                        // wrapped result), so the count is checked on its own
+                        // rather than only when both sides are constant.
+                        if matches!(op, Shl | Shr) {
+                            if let Some(y) = self.const_of(b, &self.const_locals) {
+                                if !(0..64).contains(&y) {
+                                    return Err("shift amount is out of range for `i64`".into());
+                                }
+                            }
+                        }
                         if let (Some(x), Some(y)) = (self.const_of(a, &self.const_locals), self.const_of(b, &self.const_locals)) {
                             const_binop(*op, x, y)?;
                         }

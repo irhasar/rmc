@@ -363,20 +363,25 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   across the syscall: the total block size rides the stack (the syscall clobbers
   `%rcx`/`%r11`) and the chunk length stays in `%rsi`. Keep new code off the
   callee-saved set, or the whole-function frame comes back.
-- **Link flags.** The driver uses `ld -o <out> --build-id=none -n <obj>`; the
-  assembly already carries `.note.GNU-stack` so no `-z noexecstack` is needed.
-  `-n` (nmagic) drops the page alignment between sections and roughly halves the
-  artifact size, which is one of the benchmark's measured dimensions.
-- **A runtime function must be emitted in `.text`.** `-n` merges sections so a
-  misplaced handler still runs under the CLI link, but a library client that
-  links with a plain `ld` (no `-n`) maps `.rodata` without execute permission,
-  so a handler left there faults. `__rmc_bounds` follows a `.rodata` message, so
-  it re-opens `.text` first; check this whenever a trap is added after a
-  `.section .rodata` block. `tests/run.py` links out-of-range programs with a
-  plain `ld` to catch it, across every optimiser configuration (a hoist or
-  inline that drops the `cmp`/`jae` would let the program read or write out of
-  range), and across the index shapes: a block or call base, a local array, a
-  negative and a computed index, a struct-field array, and a store.
+- **Link flags.** The driver uses `ld -o <out> --build-id=none -z noseparate-code
+  <obj>`; the assembly already carries `.note.GNU-stack` so no `-z noexecstack` is
+  needed. It used to use `-n` (nmagic), which packed every section into one
+  read+write+execute `LOAD` segment: a W^X violation. `-z noseparate-code` keeps
+  the read-only and executable sections in one read+execute segment and the
+  writable data in a separate read+write one, and is *smaller* than `-n` (3304
+  bytes vs 7344 for `hello`). Do not "optimise" it back to `-n`. `tests/run.py`
+  runs `readelf -lW` on a compiled binary and fails if any `LOAD` segment is both
+  writable and executable.
+- **A runtime function must be emitted in `.text`.** `-n` merged sections so a
+  misplaced handler still ran under the CLI link, but with any sane link (the
+  library path, or the CLI's `-z noseparate-code`) a handler left in `.rodata`
+  is mapped without execute permission and faults. `__rmc_bounds` follows a
+  `.rodata` message, so it re-opens `.text` first; check this whenever a trap is
+  added after a `.section .rodata` block. `tests/run.py` links out-of-range
+  programs with a plain `ld` to catch it, across every optimiser configuration (a
+  hoist or inline that drops the `cmp`/`jae` would let the program read or write
+  out of range), and across the index shapes: a block or call base, a local
+  array, a negative and a computed index, a struct-field array, and a store.
 - **`array_len_of` must cover every array-typed base.** It reads the length from
   a `Var`/`Field`/`Call` type and from a block's or `if`'s tail. A base it does
   not recognise silently skips the bounds check; extend it alongside any new
@@ -437,6 +442,29 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   accumulation into one hoisted value, so its loop does a single add per
   iteration, and it wins the ratio by more than 2x. Read the number as "two real
   loops doing the same arithmetic", not as an instruction-for-instruction tie.
+- **`callrec` is the honest losing case.** Non-tail recursion (`tree(n) = 1 +
+  tree(n-1) + tree(n-2)`) cannot be inlined by either compiler, so it measures
+  raw call overhead plus argument setup. rmc is ~0.60x rustc there: the
+  stack-based generator spills operands around every call and has no register
+  allocator. Keep this benchmark; it is what stops the runtime story from being a
+  uniform "rmc wins" claim.
+- **Artifact size depends entirely on the rustc reference build.** The headline
+  table compares against `-O` + fat LTO + `codegen-units=1` + `panic=abort` +
+  stripped, which is the *smallest* rustc output (~290 kB) and therefore the
+  least flattering to rmc (~85x). A plain `rustc -O` is ~4.5 MB (~1335x) and a
+  stripped static build is ~1.2 MB (~350x). `bench/run.py` records all three
+  (`measure_rustc_plain`, `measure_rustc_static`) so no single choice overstates
+  the gap; report the reference whenever quoting a size ratio.
+- **Run-time ratios are noisy and machine-dependent.** A program near parity
+  (`fib`, `mandel`) flips between a small rmc win and a small rmc loss from run
+  to run and host to host. Do not quote a single ratio for such a program as a
+  stable property, and re-measure on the target machine before drawing a
+  workload-specific conclusion.
+- **A compiled rmc binary's few-kB RSS is mostly "no libc".** Its ~24 kB peak is
+  real but is a property of linking no C library, not of the generated code
+  being leaner: a dynamically linked rustc binary floors at ~2 MB because of
+  `ld.so` + `libc`. Say so when the RAM gap comes up, or it reads as a
+  code-quality claim it is not.
 
 ## Tests
 
@@ -885,6 +913,19 @@ The README's roadmap lists the intended next steps.
     promoted local, and from `%rcx` otherwise; `r32` maps each to its 32-bit
     half. A one-off sweep of 1042 `q(a,b)` pairs across the full `i64` range —
     negatives, the 2^32 boundary, and near-`i64::MAX` — matched rustc exactly.
+- **Under `--overflow-checks`, a shift count is range-checked before the shift.**
+  `check_shift_count` emits `cmp $63, <count>; ja __rmc_shift_overflow`, because
+  the hardware masks a 64-bit shift count to 6 bits: without the check `x << 64`
+  silently shifts by 0, while Rust panics. The count is only known to be in range
+  when it is a compile-time constant (`const_of`); a run-time count always gets
+  the check. With overflow checks off, the shift is unchecked, matching Rust's
+  default `<<` (which does not panic on an out-of-range count in release).
+- **`tests/cases/divtrap.rms` and `shovf.rms` pin the trap codegen.** `divtrap`
+  exercises `MIN / -1` (SIGFPE on x86 `idiv`) and division by zero under
+  `--overflow-checks`; `shovf` exercises an out-of-range shift count. Both are
+  differential (stdout and exit status must match the rustc twin built with
+  `-C overflow-checks=on`) and are what catch a trap that fires when it should
+  not, or fails to fire when it should.
 - **The self-recursion pass must synthesise the AST the parser would build.** It
   runs after sema, so it has no `Sema` to allocate slots or resolve names. It
   reuses the parameter's own `(name, slot, ty)` for the loop variable, and takes
