@@ -14,14 +14,14 @@ The point of the experiment is to measure the trade-off at the extremes:
 | third-party code                 | none (Rust `std` only)                | LLVM + rustc                          |
 | compiler peak RSS                | ~2.7 MB                               | ~188 MB                          |
 | compile time (small programs)    | ~6 ms                                 | ~2.1 s                           |
-| artifact size                    | ~1.4–2.1 KB (static, no libc)         | ~290 KB (fat-LTO stripped); ~4.5 MB (plain `-O`); ~1.2 MB (static stripped) |
+| artifact size                    | ~1.4–2.0 KB (static, no libc)         | ~290 KB (fat-LTO stripped); ~4.5 MB (plain `-O`); ~1.2 MB (static stripped) |
 | generated-code quality           | peephole + top-five local promotion   | highly optimised                 |
 
 `rmc` wins big on compile time, compiler memory, and artifact size, and those
 three are the point of the experiment. On **runtime** the result is mixed and
-program-dependent: rmc is at parity or ahead on the whole suite (`hello` 3.75×,
-`refs` 2.2×, `sieve` 1.6×, `stats` 1.1×, `mandel` 1.1×, `heap` 1.07×, `mix`
-1.05×, `callrec` 0.98×, `fib` 1.01×), but several of those are within run-to-run
+program-dependent: rmc is at parity or ahead on the whole suite (`hello` 3.2×,
+`refs` 2.2×, `sieve` 1.5×, `stats` 1.2×, `heap` 1.08×, `mandel` 1.07×, `mix`
+1.06×, `fib` 1.00×, `callrec` 0.98×), but several of those are within run-to-run
 noise, and a call-heavy shape the recursion-to-loop pass does not match would
 still lose. It is not uniformly faster and there is no single speedup number;
 `bench/RESULTS.md` reports the per-program ratio.
@@ -45,6 +45,7 @@ compiler/            the rmc compiler (Rust, std only, no dependencies)
   src/ast.rs         AST + type definitions
   src/sema.rs        type checking, struct layout, slot allocation, builtins
   src/codegen.rs     AST -> x86-64 assembly (System V, AT&T syntax)
+  src/dce.rs         dead-function elimination (drop what main cannot reach)
   src/runtime.rs     freestanding runtime written in assembly
   src/main.rs        CLI driver: source -> asm -> as -> ld
   tests/compile.rs   unit tests for the front end and code generator
@@ -250,35 +251,35 @@ LLVM 23.1.1, AMD EPYC 9B14, x86-64; medians of 5 compiles and 9 runs):
 
 | program | compiler | compile wall | compile CPU | compile RAM | artifact | run wall | run CPU | run RAM |
 | ------- | -------- | -----------: | ----------: | ----------: | -------: | -------: | ------: | ------: |
-| hello | rmc | 6.18 ms | 6.09 ms | 2.7 MB | 1384 B | 0.23 ms | 0.12 ms | 20 kB |
-| hello | rustc | 2085.20 ms | 2088.42 ms | 187.7 MB | 289416 B | 0.85 ms | 0.73 ms | 2008 kB |
-| fib | rmc | 6.29 ms | 6.19 ms | 2.6 MB | 1432 B | 7.27 ms | 7.13 ms | 24 kB |
-| fib | rustc | 2134.45 ms | 2136.42 ms | 186.7 MB | 291696 B | 7.31 ms | 7.15 ms | 2020 kB |
-| mandel | rmc | 6.56 ms | 6.46 ms | 2.7 MB | 1720 B | 96.92 ms | 96.68 ms | 24 kB |
-| mandel | rustc | 2162.97 ms | 2167.12 ms | 190.7 MB | 291776 B | 105.95 ms | 105.72 ms | 2080 kB |
-| sieve | rmc | 8.57 ms | 8.47 ms | 4.4 MB | 1472 B | 1.61 ms | 1.47 ms | 1584 kB |
-| sieve | rustc | 2183.81 ms | 2187.69 ms | 190.6 MB | 292016 B | 2.49 ms | 2.38 ms | 3564 kB |
-| mix | rmc | 6.40 ms | 6.32 ms | 2.7 MB | 2048 B | 14.71 ms | 14.57 ms | 24 kB |
-| mix | rustc | 2103.12 ms | 2104.43 ms | 190.1 MB | 291864 B | 15.46 ms | 15.29 ms | 2068 kB |
-| stats | rmc | 6.28 ms | 6.22 ms | 2.7 MB | 1560 B | 3.33 ms | 3.19 ms | 20 kB |
-| stats | rustc | 2124.61 ms | 2128.48 ms | 187.6 MB | 292048 B | 3.75 ms | 3.62 ms | 2068 kB |
-| refs | rmc | 6.76 ms | 6.69 ms | 2.8 MB | 2056 B | 1.81 ms | 1.66 ms | 24 kB |
-| refs | rustc | 2171.04 ms | 2173.98 ms | 192.5 MB | 292240 B | 3.92 ms | 3.78 ms | 2092 kB |
-| heap | rmc | 6.69 ms | 6.58 ms | 2.7 MB | 1848 B | 3.36 ms | 3.22 ms | 4712 kB |
-| heap | rustc | 2145.80 ms | 2149.91 ms | 192.8 MB | 292384 B | 3.60 ms | 3.46 ms | 6696 kB |
-| callrec | rmc | 6.35 ms | 6.24 ms | 2.7 MB | 1432 B | 2.96 ms | 2.84 ms | 24 kB |
-| callrec | rustc | 2162.88 ms | 2165.55 ms | 189.5 MB | 291680 B | 2.90 ms | 2.76 ms | 2072 kB |
+| hello | rmc | 6.30 ms | 6.21 ms | 2.7 MB | 1384 B | 0.27 ms | 0.14 ms | 24 kB |
+| hello | rustc | 2051.85 ms | 2054.88 ms | 186.6 MB | 289416 B | 0.87 ms | 0.74 ms | 2032 kB |
+| fib | rmc | 6.43 ms | 6.34 ms | 2.7 MB | 1432 B | 7.21 ms | 7.06 ms | 24 kB |
+| fib | rustc | 2115.72 ms | 2119.43 ms | 186.4 MB | 291696 B | 7.19 ms | 7.03 ms | 2000 kB |
+| mandel | rmc | 7.92 ms | 7.02 ms | 2.8 MB | 1720 B | 100.12 ms | 99.89 ms | 20 kB |
+| mandel | rustc | 2151.20 ms | 2155.12 ms | 190.4 MB | 291776 B | 106.98 ms | 106.74 ms | 2096 kB |
+| sieve | rmc | 8.60 ms | 8.52 ms | 4.5 MB | 1472 B | 1.71 ms | 1.54 ms | 1584 kB |
+| sieve | rustc | 2165.38 ms | 2163.74 ms | 191.9 MB | 292016 B | 2.53 ms | 2.39 ms | 3592 kB |
+| mix | rmc | 6.55 ms | 6.44 ms | 2.7 MB | 2048 B | 14.75 ms | 14.60 ms | 24 kB |
+| mix | rustc | 2117.75 ms | 2120.89 ms | 192.1 MB | 291864 B | 15.67 ms | 15.49 ms | 2036 kB |
+| stats | rmc | 6.62 ms | 6.52 ms | 2.7 MB | 1560 B | 3.37 ms | 3.23 ms | 24 kB |
+| stats | rustc | 2118.13 ms | 2119.83 ms | 187.6 MB | 292048 B | 4.04 ms | 3.82 ms | 2040 kB |
+| refs | rmc | 6.60 ms | 6.47 ms | 2.8 MB | 1704 B | 1.79 ms | 1.65 ms | 24 kB |
+| refs | rustc | 2131.45 ms | 2135.26 ms | 193.1 MB | 292240 B | 3.87 ms | 3.74 ms | 2068 kB |
+| heap | rmc | 6.69 ms | 6.55 ms | 2.7 MB | 1848 B | 3.39 ms | 3.23 ms | 4712 kB |
+| heap | rustc | 2255.10 ms | 2260.02 ms | 187.9 MB | 292384 B | 3.65 ms | 3.49 ms | 6688 kB |
+| callrec | rmc | 6.47 ms | 6.40 ms | 2.7 MB | 1432 B | 2.98 ms | 2.85 ms | 24 kB |
+| callrec | rustc | 2150.80 ms | 2154.89 ms | 187.7 MB | 291680 B | 2.92 ms | 2.78 ms | 2100 kB |
 
 Summary of the ratios (rustc ÷ rmc, so >1 means rmc is better):
 
 | dimension         | ratio      |
 | ----------------- | ---------: |
-| compile wall      | ~255–341×  |
-| compile CPU       | ~258–347×  |
-| compiler peak RAM | ~43–71×    |
-| artifact size     | ~142–209× vs fat-LTO stripped; ~575–853× vs static stripped; ~2210–3278× vs plain `-O` |
-| run wall time     | 0.98–3.75× (rmc ahead on `hello`, `refs`, `sieve`, `stats`, `mandel`, `heap`, `mix`; at parity on `callrec` 0.98× and `fib` 1.01×) |
-| run peak RAM      | ~1.4× on `heap`, ~2.3× on `sieve`, ~84–100× elsewhere |
+| compile wall      | ~252–337×  |
+| compile CPU       | ~254–345×  |
+| compiler peak RAM | ~43–70×    |
+| artifact size     | ~143–209× vs fat-LTO stripped; ~578–853× vs static stripped; ~2217–3278× vs plain `-O` |
+| run wall time     | 0.98–3.22× (rmc ahead on `hello`, `refs`, `sieve`, `stats`, `heap`, `mandel`, `mix`; at parity on `fib` 1.00× and `callrec` 0.98×) |
+| run peak RAM      | ~1.4× on `heap`, ~2.3× on `sieve`, ~85–105× elsewhere |
 
 The compile-time win is the point of the project: `rmc` builds in about 6–9 ms
 where rustc needs about 2.1 s, using ~2.7 MB of RAM against ~188 MB, and writing
@@ -360,7 +361,8 @@ rmc is a small, self-contained compiler, not a drop-in replacement for rustc.
   pass (the right-spine rewrite that turns `t(x) op f(h(x))` into a loop
   making one call per level, where `t` is any pure expression — so both
   `f(g(x)) + f(h(x))` and `1 + f(x-1) + f(x-2)` fold), a loop-invariant code
-  motion pass, and a peephole
+  motion pass, a dead-function pass (only what `main` reaches is emitted, which
+  also drops any runtime piece only a dead function used), and a peephole
   pass (constant operands, folded comparisons, folded array addressing, `lea`
   strength reduction of `k*x+c`, division by a constant, a 32-bit `div` fast path
   for a variable divisor, in-place accumulation of a running sum); there is no

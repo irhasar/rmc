@@ -245,6 +245,19 @@ within noise (±1.5%). A true linear scan over live ranges would do more — reu
 a register for a temporary that dies before a local is born — but the spill
 register is the part the call-heavy code actually notices.
 
+Weighting a mention by its loop depth looks like an obvious improvement — a
+variable inside a loop runs many more times than one in straight-line code — but
+it *loses* on the benchmarks, so `promote` ranks by the raw mention count alone.
+The idea was tried at weights 2, 3, 4 and 8: every one moved mandel from ~95 ms
+to ~101 ms and heap from 3.20 ms to ~3.4 ms, while leaving the rest flat. The
+mechanism is that the five registers are a fixed budget, so promoting an
+innermost-loop local demotes an outer one to memory; mandel's inner loop is
+division-bound (three 64-bit divides per iteration) and barely notices its own
+memory traffic, whereas the outer loop counters `x`, `y`, `size` and `acc` pay a
+store and reload on every iteration of the loops they drive. Depth weighting
+helps only when the innermost loop is memory-bound, which none of the benchmarks
+are. Before "fixing" this again, measure it — the intuition is wrong here.
+
 Scalar struct fields take part in promotion too, so a hot `acc.sum` stays in a
 register. A field is named by its register only where its slot is known: field
 `k` of a struct at `slot` lives at `slot + fields - 1 - k` (field 0 is the
@@ -522,6 +535,19 @@ comment. On a binary this small the dropped pieces are a large fraction of the
 artifact: `hello` shrank from 3304 to 1384 bytes, and every benchmark artifact
 lost 42–58%.
 
+Dead-function elimination runs just before codegen (`dce.rs`): only the
+functions reachable from `main` are emitted. This composes with runtime
+pruning — a function `main` never calls is dropped, and with it any runtime
+piece that only that function named, so a dead `print_str`/`alloc` helper no
+longer drags the printer and the allocator into the binary. Reachability
+over-approximates on purpose (a call in a branch that cannot run still keeps its
+callee), because dropping a live function would be a miscompile while keeping a
+dead one is only size. The pass leaves a program without a `main` untouched, so
+the existing "undefined reference to `main`" link error is preserved rather than
+turned into an empty translation unit. On the benchmark suite it removes the
+standalone method bodies inlining had already left dead, shrinking `refs` from
+2056 to 1704 bytes; the other programs have no dead function and are unchanged.
+
 ### Heap
 
 `alloc` is a first-fit allocator. Memory comes from `mmap`'d chunks of at least
@@ -555,10 +581,11 @@ a branch per arithmetic operation.
 ## What is intentionally missing
 
 There is no optimiser beyond the folding, local promotion, inlining, self-
-recursion to loop, loop-invariant code motion and dead-instruction trim described
-above. No global register allocation, no common-subexpression elimination, no
-other loop transforms, no instruction scheduling. The compiler is optimised for compile
-speed and simplicity, not for the speed of the code it produces. The non-trivial
+recursion to loop, loop-invariant code motion, dead-function elimination and
+dead-instruction trim described above. No global register allocation, no
+common-subexpression elimination, no other loop transforms, no instruction
+scheduling. The compiler is optimised for compile speed and simplicity, not for
+the speed of the code it produces. The non-trivial
 passes are division by a constant (1.4x on `mandel.rms`), the top-five local
 promotion (a few percent on `mix` and `sieve`), the reference-operand folds plus
 `trim_dead` (1.4x on the `refs` benchmark), inlining (2.6x on `refs`, by removing

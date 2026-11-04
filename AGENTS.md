@@ -93,6 +93,9 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   functions, run after sema and before codegen. See the inlining gotcha below.
 - `compiler/src/licm.rs` — loop-invariant code motion, run after inlining and
   before codegen. See the LICM gotcha below.
+- `compiler/src/dce.rs` — dead-function elimination, run after LICM and before
+  codegen. Keeps only the functions reachable from `main` (see "Runtime pruning"
+  below for why this composes with runtime selection).
 - `compiler/src/codegen.rs` — AST to AT&T x86-64 assembly.
 - `compiler/src/runtime.rs` — freestanding assembly runtime (`_start`, I/O,
   `alloc`/`free`, `arg_i64`, the traps). Stored as a table of selectable
@@ -106,6 +109,15 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 
 ## Things that are easy to get wrong
 
+- **Do not weight `promote`'s mention count by loop depth.** It looks obviously
+  right — a variable inside a loop runs many more times than one in straight-line
+  code — but it loses: weights 2, 3, 4 and 8 all moved mandel from ~95 ms to
+  ~101 ms and heap from 3.20 to ~3.4 ms. The five registers are a fixed budget,
+  so promoting an innermost-loop local demotes an outer one, and mandel's inner
+  loop is division-bound and does not notice its own memory traffic while the
+  outer counters `x`/`y`/`size`/`acc` pay a store and reload on every iteration.
+  `promote` ranks by the raw mention count on purpose; measure before touching it
+  (the full account is in `docs/design.md`).
 - **A local whose address is taken must be forced into memory before promotion.**
   The promotion pass picks the hottest scalar locals and keeps them only in
   registers, so their frame slot goes stale. `&x` needs `x` to be in memory, so
@@ -422,6 +434,16 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   emitted, its piece drops out — that is the point, but a test that asserts on
   runtime text must first force the construct that pulls the piece in (see
   `the_bounds_handler_is_in_an_executable_section`).
+- **Dead-function elimination feeds runtime pruning.** `dce.rs` runs just before
+  codegen and drops every function `main` cannot reach, so a dead function that
+  called `print_str`/`alloc` no longer drags those pieces into the binary
+  (`unused_helper` calling both: 1688 → 1016 bytes). Reachability
+  over-approximates on purpose — a call in a branch that cannot run still keeps
+  its callee — because dropping a live function is a miscompile while keeping a
+  dead one is only size. A program with no `main` is left untouched so the
+  "undefined reference to `main`" link error survives. Unit tests that inspect a
+  helper's own codegen must now either have `main` call it or use
+  `asm_no_inline`; twelve such tests were updated when the pass landed.
 - **A runtime function must be emitted in `.text`.** `-n` merged sections so a
   misplaced handler still ran under the CLI link, but with any sane link (the
   library path, or the CLI's `-z noseparate-code`) a handler left in `.rodata`
