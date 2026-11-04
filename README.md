@@ -48,6 +48,7 @@ tests/
 docs/
   language.md        the supported language subset
   design.md          compiler architecture and code generation notes
+  roadmap.md         critical audit and the plan to compete (read this)
 ```
 
 ## Building
@@ -371,6 +372,13 @@ of value per unit of effort:
 
 Anything involving borrowing, generics or the trait system is out of scope: it
 would make rmc a different project rather than a better one.
+
+This list is the short version. [`docs/roadmap.md`](docs/roadmap.md) is the
+full audit: the three correctness bugs that block a "parity with Rust" claim
+(shift overflow under `--overflow-checks`, `i64::MIN / -1`, and an RWX `LOAD`
+segment), the fuzzer coverage hole that hides the first one, the benchmark
+framing that inflates the compile-time win, and a phased plan to close the
+codegen gap.
 
 ## License
 
