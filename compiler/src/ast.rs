@@ -338,9 +338,21 @@ pub struct EnumDef {
     pub variants: Vec<EnumVariantDef>,
 }
 
+/// A `const NAME: TYPE = EXPR;` item. rmc resolves it at compile time to a
+/// single value and substitutes that value at every use, so a constant has no
+/// storage and no codegen. Only `i64` and `bool` constants are accepted, which
+/// is what an array length or a scalar expression can use.
+#[derive(Debug, Clone)]
+pub struct ConstDef {
+    pub name: String,
+    pub ty: Type,
+    pub value: Expr,
+}
+
 #[derive(Debug, Clone)]
 pub struct Program {
     pub structs: Vec<StructDef>,
     pub enums: Vec<EnumDef>,
+    pub consts: Vec<ConstDef>,
     pub fns: Vec<FnDef>,
 }

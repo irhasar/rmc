@@ -136,6 +136,30 @@ fn name(a: i64, b: bool) -> i64 { ... }
   the process exit status.
 - A function body's last expression is its value, or use `return`.
 
+## Constants
+
+```rust
+const N: i64 = 5;
+const M: i64 = N * 2;      // a constant may name one declared later
+```
+
+A `const NAME: TYPE = EXPR;` item is folded at compile time to a single value
+and substituted at every use, so it has no storage and no codegen. Only `i64`
+and `bool` constants are accepted, which is what an array length or a scalar
+expression can use; any other type is rejected. A reference to a constant is
+resolved wherever a value may appear, including an array length (`[i64; N]`), an
+array repeat count (`[x; N]`), a `for` bound, a condition, and a `match`
+pattern, where a bare constant name is that value rather than a fresh binding.
+A constant may be named before it is declared, as in Rust. Arithmetic in an
+initializer that would trap at run time — division or remainder by zero, `i64`
+overflow, or a shift by 64 or more — is rejected, as is a cycle between
+constants and an initializer that is not a constant expression. Only top-level
+`const` items are supported; a `const` inside a function body is rejected.
+
+A local binding may not reuse a constant's name (rustc's `E0530`), whether it is
+a `let`, a parameter or a `for` variable. A `const` and a function share a
+namespace, so giving both the same name is an error (rustc's `E0428`).
+
 ## Statements
 
 ```rust

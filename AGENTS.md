@@ -85,6 +85,10 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   constant array bounds, string typing — see "Soundness checks" below). Resolves
   `Type::Named`, fills `Field`/`FieldInit` offsets, and allocates the hidden
   slots for aggregate arguments and returns.
+- `compiler/src/consts.rs` — shared constant folding: `const_i64`/`const_binop`
+  (used by sema to fold a constant index or operand) and `resolve`/`eval_i64`
+  (used by the parser to evaluate `const` items). A `const` item has no storage
+  and no codegen; its value is substituted at every use.
 - `compiler/src/inline.rs` — AST inlining of small, straight-line, scalar
   functions, run after sema and before codegen. See the inlining gotcha below.
 - `compiler/src/licm.rs` — loop-invariant code motion, run after inlining and
@@ -452,9 +456,12 @@ struct-literal field order), `utf8` (non-ASCII string literals), `inlmulti`
 (a callee that assigns its parameter, a non-trivial argument evaluated once, and
 nested inlining with a call argument), `assignorder` (value-before-place
 assignment order, plain and compound), `licmref` (a field read that must not
-be hoisted past a `&mut` store in the loop) and `iflet` (the `if let`
+be hoisted past a `&mut` store in the loop), `iflet` (the `if let`
 desugaring: integer, binding, payload-binding, `else if let` chain,
-side-effecting scrutinee, and value position) guard the
+side-effecting scrutinee, and value position) and `consts` (top-level `const`
+items in expression position, as array lengths and repeat counts, as a `for`
+bound, in conditions, and as `match` patterns, including a negative constant and
+one defined in terms of another) guard the
 front-end/codegen fixes below. When adding a case, add both twins, write
 them to behave identically, and remember that `rustc` infers `i32` for unsuffixed
 literals, so large literals need an `i64` suffix on the Rust side. `args.json`
@@ -463,10 +470,13 @@ the bug it guards: revert the fix and confirm the case fails.
 
 The parser bounds nesting depth (`MAX_DEPTH` in `parser.rs`, currently 100). A
 recursive-descent parser with no bound overflows the native stack and aborts on
-deeply nested or very long input, which is a crash on untrusted input. The limit
-must stay low enough for a 2 MiB thread stack (each expression level threads
-through every precedence function, so it costs several KiB); `fuzz.py --mode
-robust` and the depth tests in `tests/compile.rs` guard it. If you add a new
+deeply nested or very long input, which is a crash on untrusted input. Each
+expression level threads through every precedence function, so a debug build
+costs on the order of 10 KiB per level and the full 100 levels is close to the
+2 MiB a default test thread gets; the two depth tests in `tests/compile.rs`
+therefore run on a dedicated 32 MiB thread via `with_big_stack`, so they test
+the limit rather than the harness's thread size. The CLI runs on the 8 MiB main
+thread. `fuzz.py --mode robust` guards the limit end to end. If you add a new
 recursive construct, count a level with `bump_depth` on entry.
 
 An enum is a set of unit variants represented by its `i64` tag (the declaration

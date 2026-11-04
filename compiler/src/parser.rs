@@ -1,6 +1,7 @@
 //! Recursive-descent parser for the rmc Rust subset.
 
 use crate::ast::*;
+use crate::consts::eval_i64;
 use crate::lexer::{Tok, Token};
 
 pub struct Parser {
@@ -18,6 +19,16 @@ pub struct Parser {
     /// Name of the struct whose `impl` block is being parsed, if any. It lets
     /// `Self` in a method signature resolve to the right struct.
     current_impl: Option<String>,
+    /// Constant `i64` items by name, collected as they are parsed. The parser
+    /// needs their values to size an array type (`[i64; N]`) and to turn a
+    /// constant used as a `match` pattern into a literal, both of which happen
+    /// before sema. Only `i64` constants that fold to a literal are entered; a
+    /// constant that is not yet known at a use site simply stays unresolved and
+    /// is diagnosed there, matching rustc's forward-reference rules.
+    consts: std::collections::HashMap<String, i64>,
+    /// Constant `bool` items by name, so a `const F: bool` used as a `match`
+    /// pattern becomes the `true`/`false` pattern.
+    const_bools: std::collections::HashMap<String, bool>,
 }
 
 /// The deepest expression, block or type nesting the parser accepts. Deeply
@@ -41,7 +52,16 @@ type PResult<T> = Result<T, String>;
 
 impl Parser {
     pub fn new(toks: Vec<Token>) -> Self {
-        Parser { toks, i: 0, no_struct_lit: false, tmp: 0, depth: 0, current_impl: None }
+        Parser {
+            toks,
+            i: 0,
+            no_struct_lit: false,
+            tmp: 0,
+            depth: 0,
+            current_impl: None,
+            consts: std::collections::HashMap::new(),
+            const_bools: std::collections::HashMap::new(),
+        }
     }
 
     /// Count one level of nesting and fail past `MAX_DEPTH`.
@@ -111,25 +131,31 @@ impl Parser {
     }
 
     pub fn parse_program(&mut self) -> PResult<Program> {
+        // A `const` may be named before it is declared (an array length
+        // `[i64; N]`, a pattern `N =>`), so collect and evaluate every `const`
+        // item first, then parse the program with the values known.
+        self.prescan_consts()?;
         let mut structs = Vec::new();
         let mut enums = Vec::new();
+        let mut consts = Vec::new();
         let mut fns = Vec::new();
         while self.peek().is_some() {
             match self.peek() {
                 Some(Tok::Struct) => structs.push(self.parse_struct()?),
                 Some(Tok::Enum) => enums.push(self.parse_enum()?),
+                Some(Tok::Const) => consts.push(self.parse_const()?),
                 Some(Tok::Fn) => fns.push(self.parse_fn()?),
                 Some(Tok::Impl) => self.parse_impl(&mut fns)?,
                 other => {
                     return Err(format!(
-                        "at byte {}: expected `fn`, `struct`, `enum` or `impl`, found {}",
+                        "at byte {}: expected `fn`, `struct`, `enum`, `const` or `impl`, found {}",
                         self.pos(),
                         other.map(|x| x.describe()).unwrap_or_else(|| "end of input".into())
                     ))
                 }
             }
         }
-        Ok(Program { structs, enums, fns })
+        Ok(Program { structs, enums, consts, fns })
     }
 
     fn parse_enum(&mut self) -> PResult<EnumDef> {
@@ -163,6 +189,122 @@ impl Parser {
             return Err(format!("enum `{name}` needs at least one variant"));
         }
         Ok(EnumDef { name, variants })
+    }
+
+    /// Scan the token stream for top-level `const` items and evaluate them, so
+    /// a use that precedes the declaration (an array length, a pattern) sees
+    /// the value. Only the item's own tokens are consumed: a `{ .. }` or
+    /// `( .. )` in its initializer is skipped by bracket matching, and every
+    /// other item's body is skipped the same way, so no nested `const` inside a
+    /// function body is collected here.
+    fn prescan_consts(&mut self) -> PResult<()> {
+        let saved = self.i;
+        let mut items: Vec<ConstDef> = Vec::new();
+        self.i = 0;
+        loop {
+            match self.peek() {
+                None => break,
+                Some(Tok::Const) => items.push(self.parse_const()?),
+                Some(Tok::Struct) | Some(Tok::Enum) => {
+                    // Skip `Name` then a balanced `{ .. }` body.
+                    self.i += 1;
+                    if matches!(self.peek(), Some(Tok::Ident(_))) {
+                        self.i += 1;
+                    }
+                    self.skip_balanced(Tok::LBrace, Tok::RBrace)?;
+                }
+                Some(Tok::Impl) => {
+                    self.i += 1;
+                    if matches!(self.peek(), Some(Tok::Ident(_))) {
+                        self.i += 1;
+                    }
+                    self.skip_balanced(Tok::LBrace, Tok::RBrace)?;
+                }
+                Some(Tok::Fn) => {
+                    // Skip the name, the parameter list, the return type and the
+                    // body, so a `const` inside a function body is not seen.
+                    self.i += 1;
+                    if matches!(self.peek(), Some(Tok::Ident(_))) {
+                        self.i += 1;
+                    }
+                    self.skip_balanced(Tok::LParen, Tok::RParen)?;
+                    // Skip the return type to the body. It is not parsed here,
+                    // because a `[T; N]` return type would need the constant
+                    // values that are still being collected.
+                    if self.eat(&Tok::Arrow) {
+                        while let Some(t) = self.peek() {
+                            if *t == Tok::LBrace {
+                                break;
+                            }
+                            self.i += 1;
+                        }
+                    }
+                    self.skip_balanced(Tok::LBrace, Tok::RBrace)?;
+                }
+                Some(_) => self.i += 1,
+            }
+        }
+        self.i = saved;
+        self.resolve_consts(&items);
+        Ok(())
+    }
+
+    /// Advance past a balanced `open .. close` group, starting at `open`.
+    fn skip_balanced(&mut self, open: Tok, close: Tok) -> PResult<()> {
+        if self.peek() != Some(&open) {
+            return Ok(());
+        }
+        let mut depth = 0i32;
+        while let Some(t) = self.peek() {
+            if *t == open {
+                depth += 1;
+            } else if *t == close {
+                depth -= 1;
+                if depth == 0 {
+                    self.i += 1;
+                    return Ok(());
+                }
+            }
+            self.i += 1;
+        }
+        Err(format!("at byte {}: unexpected end of input", self.pos()))
+    }
+
+    /// `const NAME: TYPE = EXPR;`. The declared type is resolved by sema; the
+    /// value is evaluated here, as soon as it is parsed, so a later array type
+    /// or pattern can use it. A value that does not fold yet (it names a
+    /// constant declared later) is left for `resolve_consts`, which reruns once
+    /// every item has been seen.
+    fn parse_const(&mut self) -> PResult<ConstDef> {
+        self.expect(Tok::Const)?;
+        let name = self.expect_ident()?;
+        self.expect(Tok::Colon)?;
+        let ty = self.parse_type()?;
+        self.expect(Tok::Eq)?;
+        let value = self.parse_expr()?;
+        self.expect(Tok::Semi)?;
+        Ok(ConstDef { name, ty, value })
+    }
+
+    /// Evaluate every `const` item into `self.consts`/`self.const_bools`, to a
+    /// fixpoint so a constant may name one declared later. Runs after the whole
+    /// program is parsed, so a forward reference resolves here even though it
+    /// did not while the use site was parsed.
+    fn resolve_consts(&mut self, defs: &[ConstDef]) {
+        let items: Vec<(String, Type, Expr)> = defs
+            .iter()
+            .map(|d| (d.name.clone(), d.ty.clone(), d.value.clone()))
+            .collect();
+        for (name, val) in crate::consts::resolve(&items) {
+            match val {
+                crate::consts::ConstVal::Int(v) => {
+                    self.consts.insert(name, v);
+                }
+                crate::consts::ConstVal::Bool(v) => {
+                    self.const_bools.insert(name, v);
+                }
+            }
+        }
     }
 
     fn parse_struct(&mut self) -> PResult<StructDef> {
@@ -326,9 +468,18 @@ impl Parser {
                 self.i += 1;
                 let elem = self.parse_type()?;
                 self.expect(Tok::Semi)?;
-                let n = match self.bump() {
-                    Tok::Int(v) if v >= 0 => v as usize,
-                    other => return Err(format!("array length must be a non-negative integer, found {}", other.describe())),
+                // A constant length: a literal, or an expression over constants
+                // (`[i64; N]`, `[i64; N + 1]`). It is evaluated here because the
+                // array's size is fixed at parse time.
+                let len = self.parse_expr()?;
+                let n = match eval_i64(&len, &self.consts) {
+                    Some(v) if v >= 0 => v as usize,
+                    _ => {
+                        return Err(format!(
+                            "at byte {}: array length must be a non-negative constant integer",
+                            self.pos()
+                        ))
+                    }
                 };
                 self.expect(Tok::RBracket)?;
                 Ok(Type::Array(Box::new(elem), n))
@@ -872,7 +1023,7 @@ impl Parser {
                 self.i += 1;
                 Ok(Pat::Bool(false))
             }
-            // `Enum::Variant`, `Enum::Variant(a, b)`, or a binding name.
+            // `Enum::Variant`, `Enum::Variant(a, b)`, a constant, or a binding.
             Some(Tok::Ident(n)) => {
                 self.i += 1;
                 if self.eat(&Tok::ColonColon) {
@@ -890,6 +1041,12 @@ impl Parser {
                         bindings = Some(names);
                     }
                     Ok(Pat::Variant(n, variant, bindings))
+                } else if let Some(v) = self.consts.get(&n) {
+                    // A bare name that names a constant is that constant's
+                    // value, not a fresh binding, exactly as rustc reads it.
+                    Ok(Pat::Int(*v))
+                } else if let Some(b) = self.const_bools.get(&n) {
+                    Ok(Pat::Bool(*b))
                 } else {
                     // A bare name binds the scrutinee; `_` already matched the
                     // wildcard case above.
@@ -1199,6 +1356,12 @@ impl Parser {
                     }
                     self.expect(Tok::RParen)?;
                     Ok(Expr::Call { name, args, arg_slots: Vec::new(), ret_slot: -1, ret_ty: Type::I64 })
+                } else if let Some(v) = self.consts.get(&name) {
+                    // A reference to a constant is its value, substituted here
+                    // so sema and codegen never see a constant as a variable.
+                    Ok(Expr::Int(*v))
+                } else if let Some(b) = self.const_bools.get(&name) {
+                    Ok(Expr::Bool(*b))
                 } else {
                     Ok(Expr::Var { name, slot: -1, ty: Type::I64 })
                 }
@@ -1260,9 +1423,16 @@ impl Parser {
                 self.i += 1;
                 let first = self.parse_expr()?;
                 if self.eat(&Tok::Semi) {
-                    let n = match self.bump() {
-                        Tok::Int(v) if v >= 0 => v as usize,
-                        other => return Err(format!("array length must be a non-negative integer, found {}", other.describe())),
+                    // `[v; N]`: the repeat count is a constant expression.
+                    let len = self.parse_expr()?;
+                    let n = match eval_i64(&len, &self.consts) {
+                        Some(v) if v >= 0 => v as usize,
+                        _ => {
+                            return Err(format!(
+                                "at byte {}: array length must be a non-negative constant integer",
+                                self.pos()
+                            ))
+                        }
                     };
                     self.expect(Tok::RBracket)?;
                     Ok(Expr::ArrayLit(Box::new(first), n))

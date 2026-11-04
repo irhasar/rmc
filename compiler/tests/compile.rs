@@ -1348,13 +1348,30 @@ fn an_aggregate_argument_still_travels_by_pointer() {
     assert!(out.contains("call f"));
 }
 
+/// Run `f` on a thread with a large stack. The two depth-limit tests below
+/// drive the parser to its nesting limit on purpose; a debug-build parser costs
+/// about 10 KiB of stack per level, so 100 levels is close to the 2 MiB the
+/// default test thread provides. A dedicated stack keeps these deterministic
+/// rather than dependent on the harness's thread size.
+fn with_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(f)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread")
+}
+
 #[test]
 fn deeply_nested_input_is_an_error_not_a_crash() {
     // Thousands of nested parens used to recurse until the native stack
     // overflowed and the process aborted. The parser now stops at a depth
     // limit and reports it.
-    let src = format!("fn main() -> i64 {{ return {}1{}; }}", "(".repeat(4000), ")".repeat(4000));
-    let err = compile_to_asm(&src, &CompileOptions::default()).unwrap_err();
+    let err = with_big_stack(|| {
+        let src =
+            format!("fn main() -> i64 {{ return {}1{}; }}", "(".repeat(4000), ")".repeat(4000));
+        compile_to_asm(&src, &CompileOptions::default()).unwrap_err()
+    });
     assert!(err.contains("nests too deeply"), "got: {err}");
 }
 
@@ -1362,8 +1379,10 @@ fn deeply_nested_input_is_an_error_not_a_crash() {
 fn a_very_long_operator_chain_is_an_error_not_a_crash() {
     // A left-deep chain `1+1+...+1` overflows the stack in sema/codegen unless
     // the parser bounds how deep the tree it builds can be.
-    let src = format!("fn main() -> i64 {{ return {}1; }}", "1+".repeat(200_000));
-    let err = compile_to_asm(&src, &CompileOptions::default()).unwrap_err();
+    let err = with_big_stack(|| {
+        let src = format!("fn main() -> i64 {{ return {}1; }}", "1+".repeat(200_000));
+        compile_to_asm(&src, &CompileOptions::default()).unwrap_err()
+    });
     assert!(err.contains("nests too deeply"), "got: {err}");
 }
 
@@ -2428,4 +2447,133 @@ fn a_store_through_a_computed_address_folds_a_simple_value() {
         t.starts_with("mov %r") && t.contains("(%r") && !t.contains("%rbp")
     });
     assert!(folded, "value folds into the store:\n{body}");
+}
+
+#[test]
+fn a_const_is_substituted_as_its_value_with_no_storage() {
+    // `const N: i64 = 7;` has no codegen of its own: every use of `N` is the
+    // literal 7, so `return N;` is `mov $7, %rax` and the frame allocates
+    // nothing for a constant.
+    let out = asm("const N: i64 = 7; fn main() -> i64 { return N; }");
+    let body = main_body(&out);
+    assert!(body.contains("$7"), "the value is folded in:\n{body}");
+}
+
+#[test]
+fn a_const_folds_arithmetic_over_another_const() {
+    // `M = N * 2` folds through the parser, so the emitted code has the product
+    // and not a runtime multiply.
+    let out = asm("const N: i64 = 6; const M: i64 = N * 2; fn main() -> i64 { return M; }");
+    let body = main_body(&out);
+    assert!(body.contains("$12"), "product folded:\n{body}");
+    assert!(!body.contains("imul"), "no runtime multiply:\n{body}");
+}
+
+#[test]
+fn a_const_length_sizes_an_array() {
+    // `[i64; N]` with a constant `N` is a fixed-size array of `N` elements, so
+    // the frame reserves room for the whole array.
+    let out = asm("const N: i64 = 4; fn main() -> i64 { let a: [i64; N] = [1, 2, 3, 4]; return a[3]; }");
+    let body = main_body(&out);
+    assert!(body.contains("$4"), "the element is read:\n{body}");
+}
+
+#[test]
+fn a_const_used_as_a_match_pattern_matches_its_value() {
+    // A bare name that is a constant is that value as a pattern, not a fresh
+    // binding, exactly as rustc reads it.
+    let ok = compile_to_asm(
+        "const N: i64 = 2; fn main() -> i64 { match 2 { N => { return 1; } _ => { return 0; } } }",
+        &CompileOptions::default(),
+    );
+    assert!(ok.is_ok(), "a constant pattern compiles: {ok:?}");
+}
+
+#[test]
+fn a_let_that_shadows_a_const_is_rejected() {
+    // rustc E0530: a local binding may not reuse a constant's name.
+    let err = compile_to_asm(
+        "const N: i64 = 5; fn main() -> i64 { let N = 3; return N; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("shadows a constant"), "got: {err}");
+}
+
+#[test]
+fn a_for_variable_that_shadows_a_const_is_rejected() {
+    let err = compile_to_asm(
+        "const N: i64 = 5; fn main() -> i64 { let mut s = 0; for N in 0..3 { s = s + N; } return s; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("shadows a constant"), "got: {err}");
+}
+
+#[test]
+fn a_parameter_that_shadows_a_const_is_rejected() {
+    let err = compile_to_asm(
+        "const N: i64 = 5; fn f(N: i64) -> i64 { return N; } fn main() -> i64 { return f(1); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("shadows a constant"), "got: {err}");
+}
+
+#[test]
+fn a_const_with_a_forward_reference_resolves() {
+    // `B` names `A`, declared after it; the parser's fixpoint resolves both.
+    let out = asm("const B: i64 = A + 3; const A: i64 = 2; fn main() -> i64 { return B; }");
+    let body = main_body(&out);
+    assert!(body.contains("$5"), "forward reference folded:\n{body}");
+}
+
+#[test]
+fn a_const_cycle_is_rejected() {
+    let err = compile_to_asm(
+        "const A: i64 = B; const B: i64 = A; fn main() -> i64 { return A; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("constant `A` is not a constant"), "got: {err}");
+}
+
+#[test]
+fn a_const_with_a_non_folding_initializer_is_rejected() {
+    let err = compile_to_asm(
+        "fn g() -> i64 { return 1; } const A: i64 = g(); fn main() -> i64 { return A; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("constant `A` is not a constant"), "got: {err}");
+}
+
+#[test]
+fn a_const_of_an_unsupported_type_is_rejected() {
+    let err = compile_to_asm(
+        "const P: [i64; 2] = [1, 2]; fn main() -> i64 { return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("rmc only folds"), "got: {err}");
+}
+
+#[test]
+fn a_const_and_a_fn_with_the_same_name_are_rejected() {
+    let err = compile_to_asm(
+        "const N: i64 = 5; fn N() -> i64 { return 1; } fn main() -> i64 { return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("defined multiple times"), "got: {err}");
+}
+
+#[test]
+fn a_duplicate_const_is_rejected() {
+    let err = compile_to_asm(
+        "const N: i64 = 1; const N: i64 = 2; fn main() -> i64 { return N; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("defined multiple times"), "got: {err}");
 }
