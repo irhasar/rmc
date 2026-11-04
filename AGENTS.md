@@ -472,7 +472,7 @@ binding name; a `bool` literal (`true`/`false`) is *not* accepted, so
 `match b { true => .., false => .. }` is an over-rejection — rustc accepts it,
 rmc reports "expected an integer, `Enum::Variant` or `_` pattern". The safe
 direction, not a soundness bug, but a real gap worth closing: `b` can be
-matched with `if`/`else` in the meantime. rmc's `if` desugaring also evaluates
+matched with `if`/`else` in the meantime. rmc's `match` desugaring also evaluates
 a non-trivial scrutinee once through a `\0mt<n>` temporary, so a side effect in
 the scrutinee runs exactly once regardless of the arm count.
 
