@@ -467,6 +467,15 @@ resolve to `Type::Enum` through `resolve_ty`, which every type site uses, and
 enum patterns are a `Pat::Variant` the parser desugars into an `EnumVariant`
 comparison. `as` may not target an enum, matching rustc.
 
+A pattern is a wildcard, an integer literal, an `Enum::Variant`, or a bare
+binding name; a `bool` literal (`true`/`false`) is *not* accepted, so
+`match b { true => .., false => .. }` is an over-rejection — rustc accepts it,
+rmc reports "expected an integer, `Enum::Variant` or `_` pattern". The safe
+direction, not a soundness bug, but a real gap worth closing: `b` can be
+matched with `if`/`else` in the meantime. rmc's `if` desugaring also evaluates
+a non-trivial scrutinee once through a `\0mt<n>` temporary, so a side effect in
+the scrutinee runs exactly once regardless of the arm count.
+
 A `match` is desugared into a chain of `if`s, so a `match` with no `_` arm has
 no final `else` and, used as a value, would trip the "`if` without `else`" check
 in sema. When the arms name *every* variant of one enum it is total, and rustc
