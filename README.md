@@ -12,15 +12,23 @@ The point of the experiment is to measure the trade-off at the extremes:
 | -------------------------------- | ------------------------------------- | -------------------------------- |
 | compile pipeline                 | lex → parse → typecheck → asm → `as` → `ld` | MIR → LLVM IR → LLVM opt → MC → `ld` |
 | third-party code                 | none (Rust `std` only)                | LLVM + rustc                          |
-| compiler peak RSS                | ~12 MB                                | ~188 MB                          |
-| compile time (small programs)    | ~7 ms                                 | ~2.1 s                           |
-| artifact size                    | ~6 KB (static, no libc)               | ~290 KB                          |
+| compiler peak RSS                | ~2.7 MB                               | ~188 MB                          |
+| compile time (small programs)    | ~6 ms                                 | ~2.1 s                           |
+| artifact size                    | ~3.4 KB (static, no libc)             | ~290 KB (fat-LTO stripped); ~4.5 MB (plain `-O`); ~1.2 MB (static stripped) |
 | generated-code quality           | peephole + top-five local promotion   | highly optimised                 |
 
-`rmc` wins big on compile time, compiler memory, and artifact size. On runtime
-it is now at parity or ahead on most loops — including `fib`, where rmc applies
-the same right-spine recursion-to-loop rewrite LLVM does, so both make one call
-per level — and is within a few percent on the call- and pointer-heavy cases.
+`rmc` wins big on compile time, compiler memory, and artifact size, and those
+three are the point of the experiment. On **runtime** the result is mixed and
+program-dependent: rmc is at parity or ahead on several loops (`refs` 2.2×,
+`sieve` 1.6×, `mandel` 1.1×, `stats` 1.1×) and behind on others (`fib` 0.98×,
+`mix` 0.74×, `callrec` 0.60×). It is not uniformly faster and there is no single
+speedup number; `bench/RESULTS.md` reports the per-program ratio.
+
+The artifact-size comparison depends entirely on which rustc build is the
+reference. Against a plain `rustc -O` (which statically links libstd, the panic
+runtime and the allocator) rmc is ~1300× smaller; against a stripped static
+build, ~350×; against an aggressive fat-LTO stripped build, ~85×. The first is
+the closest like-for-like, the last is the one that flatters rustc least.
 
 ## Layout
 
@@ -126,7 +134,11 @@ and a nested-path write, `pat` for `match` expressions (multi-variant enums,
 two-field payloads, `bool` matches, binding patterns, nested matches, `if let`,
 and a side-effecting scrutinee), and `order` for assignment evaluation order (a
 side-effecting index and value on both `=` and every compound operator, the
-shapes `stmt` never assigns through). Every program is recompiled with each optimiser pass off in turn.
+shapes `stmt` never assigns through). `shift` drives `<<`, `>>` and the compound
+`<<=`/`>>=` with a shift count from `argv`, so the count is opaque to the
+compiler and can be out of range (negative or >= 64): every other generator
+masks its counts with `& 63` to keep them valid, which left the shift-overflow
+trap unreachable by fuzzing. Every program is recompiled with each optimiser pass off in turn.
 Seeds are reproducible, so a failure can be re-run and shrunk.
 
 ```sh
@@ -137,6 +149,7 @@ python3 tools/fuzz.py --mode arith --n 500 --seed 1
 python3 tools/fuzz.py --mode nest --n 500 --seed 1
 python3 tools/fuzz.py --mode pat --n 500 --seed 1
 python3 tools/fuzz.py --mode order --n 500 --seed 1
+python3 tools/fuzz.py --mode shift --n 500 --seed 1
 # also exercise the trap codegen: --bounds-checks and --overflow-checks runs
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 python3 tools/fuzz.py --mode robust
@@ -211,7 +224,7 @@ Runtime builtins (provided by `src/runtime.rs`, no imports needed):
 ## Benchmarks
 
 `bench/run.py` compares `rmc` against `rustc -O -C lto=fat -C codegen-units=1
--C panic=abort -C strip=symbols` on eight programs. It measures both halves of
+-C panic=abort -C strip=symbols` on nine programs. It measures both halves of
 the comparison, because "faster" means two different things here:
 
 * **compile** — build wall time, compiler CPU time, compiler peak RAM, and the
@@ -232,52 +245,57 @@ LLVM 23.1.1, AMD EPYC 9B14, x86-64; medians of 5 compiles and 9 runs):
 
 | program | compiler | compile wall | compile CPU | compile RAM | artifact | run wall | run CPU | run RAM |
 | ------- | -------- | -----------: | ----------: | ----------: | -------: | -------: | ------: | ------: |
-| hello | rmc | 7.14 ms | 6.96 ms | 2.6 MB | 6616 B | 0.25 ms | 0.13 ms | 28 kB |
-| hello | rustc | 2131 ms | 2134 ms | 187.6 MB | 289416 B | 0.86 ms | 0.74 ms | 2064 kB |
-| fib | rmc | 7.30 ms | 6.96 ms | 2.6 MB | 6704 B | 7.21 ms | 7.08 ms | 28 kB |
-| fib | rustc | 2174 ms | 2175 ms | 190.2 MB | 291696 B | 7.24 ms | 7.10 ms | 2100 kB |
-| mandel | rmc | 7.21 ms | 7.15 ms | 2.7 MB | 6992 B | 96.18 ms | 95.95 ms | 28 kB |
-| mandel | rustc | 2233 ms | 2238 ms | 192.6 MB | 291776 B | 105.45 ms | 105.22 ms | 2120 kB |
-| sieve | rmc | 9.44 ms | 9.37 ms | 4.3 MB | 6744 B | 1.72 ms | 1.60 ms | 1588 kB |
-| sieve | rustc | 2181 ms | 2186 ms | 193.0 MB | 292016 B | 2.73 ms | 2.58 ms | 3640 kB |
-| mix | rmc | 7.06 ms | 6.99 ms | 2.7 MB | 6792 B | 14.88 ms | 14.67 ms | 24 kB |
-| mix | rustc | 2157 ms | 2159 ms | 189.2 MB | 291864 B | 15.48 ms | 15.32 ms | 2060 kB |
-| stats | rmc | 7.53 ms | 7.49 ms | 2.6 MB | 6832 B | 3.35 ms | 3.21 ms | 28 kB |
-| stats | rustc | 2219 ms | 2219 ms | 190.0 MB | 292048 B | 3.75 ms | 3.62 ms | 2092 kB |
-| refs | rmc | 7.26 ms | 7.21 ms | 2.7 MB | 7344 B | 4.73 ms | 4.60 ms | 28 kB |
-| refs | rustc | 2165 ms | 2169 ms | 195.3 MB | 292240 B | 3.88 ms | 3.73 ms | 2040 kB |
-| heap | rmc | 7.03 ms | 6.96 ms | 2.7 MB | 6736 B | 3.18 ms | 3.03 ms | 4716 kB |
-| heap | rustc | 2186 ms | 2179 ms | 191.4 MB | 292384 B | 3.47 ms | 3.33 ms | 6696 kB |
+| hello | rmc | 6.19 ms | 6.05 ms | 2.7 MB | 3304 B | 0.27 ms | 0.14 ms | 20 kB |
+| hello | rustc | 2117.72 ms | 2117.18 ms | 188.2 MB | 289416 B | 0.86 ms | 0.74 ms | 2032 kB |
+| fib | rmc | 6.01 ms | 5.93 ms | 2.7 MB | 3400 B | 7.34 ms | 7.17 ms | 24 kB |
+| fib | rustc | 2139.83 ms | 2141.40 ms | 189.6 MB | 291696 B | 7.16 ms | 7.01 ms | 2080 kB |
+| mandel | rmc | 6.22 ms | 6.12 ms | 2.7 MB | 3688 B | 97.03 ms | 96.83 ms | 24 kB |
+| mandel | rustc | 2110.10 ms | 2113.59 ms | 190.5 MB | 291776 B | 105.67 ms | 105.41 ms | 2076 kB |
+| sieve | rmc | 10.32 ms | 10.03 ms | 4.4 MB | 3432 B | 1.60 ms | 1.47 ms | 1584 kB |
+| sieve | rustc | 2118.12 ms | 2122.54 ms | 187.3 MB | 292016 B | 2.54 ms | 2.41 ms | 3636 kB |
+| mix | rmc | 6.13 ms | 6.07 ms | 2.7 MB | 3520 B | 20.98 ms | 18.86 ms | 24 kB |
+| mix | rustc | 2148.62 ms | 2151.64 ms | 188.8 MB | 291864 B | 15.51 ms | 15.36 ms | 2032 kB |
+| stats | rmc | 7.70 ms | 7.56 ms | 2.7 MB | 3512 B | 3.35 ms | 3.22 ms | 24 kB |
+| stats | rustc | 2135.19 ms | 2139.45 ms | 187.7 MB | 292048 B | 3.75 ms | 3.62 ms | 2052 kB |
+| refs | rmc | 6.40 ms | 6.33 ms | 2.8 MB | 4016 B | 1.78 ms | 1.65 ms | 24 kB |
+| refs | rustc | 2119.83 ms | 2124.52 ms | 193.3 MB | 292240 B | 3.85 ms | 3.72 ms | 2028 kB |
+| heap | rmc | 6.28 ms | 6.16 ms | 2.7 MB | 3424 B | 3.24 ms | 3.11 ms | 4708 kB |
+| heap | rustc | 2114.66 ms | 2118.77 ms | 190.3 MB | 292384 B | 3.51 ms | 3.40 ms | 6692 kB |
+| callrec | rmc | 6.81 ms | 6.61 ms | 2.7 MB | 3400 B | 4.81 ms | 4.66 ms | 24 kB |
+| callrec | rustc | 2124.80 ms | 2127.24 ms | 187.7 MB | 291680 B | 2.89 ms | 2.76 ms | 2004 kB |
 
 Summary of the ratios (rustc ÷ rmc, so >1 means rmc is better):
 
 | dimension         | ratio      |
 | ----------------- | ---------: |
-| compile wall      | ~231–311×  |
-| compile CPU       | ~233–313×  |
-| compiler peak RAM | ~44–72×    |
-| artifact size     | ~40–44×    |
-| run wall time     | 0.82–3.39× (parity on `fib`; rmc ahead on the rest, rustc ahead only on the pointer-heavy `refs`) |
-| run CPU           | 0.81–5.71× |
-| run peak RAM      | ~1.4× on `heap`, ~2.3× on `sieve`, ~72–86× elsewhere |
+| compile wall      | ~205–356×  |
+| compile CPU       | ~212–361×  |
+| compiler peak RAM | ~43–71×    |
+| artifact size     | ~73–88× vs fat-LTO stripped; ~347× vs static stripped; ~1335× vs plain `-O` |
+| run wall time     | 0.60–3.16× (rmc ahead on `refs`, `sieve`, `stats`, `mandel`, `heap`, `hello`; behind on `mix`, `callrec`; parity on `fib`) |
+| run peak RAM      | ~1.4× on `heap`, ~2.3× on `sieve`, ~85–100× elsewhere |
 
-The compile-time win is the point of the project: `rmc` builds in about 7–9 ms
-where rustc needs about 2.1 s, using ~2.6 MB of RAM against ~186 MB and writing
-a ~7 KB static binary against a ~290 KB one. The run-time picture is close: `rmc` wins on
-`hello` (3.4×), `sieve` (1.6×), `stats` (1.12×), `mandel` (1.10×), `heap` (1.09×)
-and `mix` (1.04×) because the workload is a tight loop or a single call and the
-static binary has no libc startup, it is at parity on `fib` (1.00×) after the
-recursion-to-loop rewrite below, and it is behind only on `refs` (0.82×), where
-the Rust twin's in-loop `black_box` barrier keeps the loop real but is not free
-(see the caveats below). Run times are the noisiest
-column: they move ±20% between recordings on a shared machine, so treat a single
-run's ratio as indicative and re-measure with many samples before trusting a
-sub-5% difference. (An early `refs` run reported 0.14×; that was LLVM folding
-the *whole* loop into `128 * n` in the Rust twin, not a measurement of the loop.
-The twin now `black_box`es a term.) The binary's tiny footprint also shows at
-run time: an `rmc` program peaks at ~28 kB of RAM, a rustc one at ~2 MB — except
-on `heap` and `sieve`, where the arena each program allocates dominates and the
-two converge.
+The compile-time win is the point of the project: `rmc` builds in about 6–10 ms
+where rustc needs about 2.1 s, using ~2.7 MB of RAM against ~188 MB, and writing
+a ~3.4 KB static binary against ~290 KB (fat-LTO stripped), ~1.2 MB (static
+stripped) or ~4.5 MB (plain `-O`). The run-time picture is mixed and is the
+honest weak spot: rmc wins on `hello` (3.16×, mostly process startup),
+`refs` (2.17×), `sieve` (1.59×), `stats` (1.12×), `mandel` (1.09×) and
+`heap` (1.08×), is at parity on `fib` (0.98×) after the recursion-to-loop
+rewrite below, and is *behind* on `mix` (0.74×) and the call-heavy `callrec`
+(0.60×), where a stack-based generator with no register allocator pays the
+argument setup and register save/restore on every call that LLVM avoids. Run
+times are the noisiest column: they move ±20% between recordings on a shared
+machine, and a program near parity (`fib`, `mandel`) flips sign between runs, so
+treat a single run's ratio as indicative and re-measure with many samples before
+trusting a sub-5% difference. (An early `refs` run reported 0.14×; that was LLVM
+folding the *whole* loop into `128 * n` in the Rust twin, not a measurement of
+the loop. The twin now `black_box`es a term.) The binary's tiny footprint also
+shows at run time: an `rmc` program peaks at ~24 kB of RAM, a rustc one at ~2 MB
+— except on `heap` and `sieve`, where the arena each program allocates dominates
+and the two converge. The ~2 MB floor is the dynamically linked C library
+(`ld.so` + `libc`) that a rustc binary pulls in, not the generated code; rmc
+links neither.
 
 ### Reproducing the comparison honestly
 
@@ -323,8 +341,9 @@ rmc is a small, self-contained compiler, not a drop-in replacement for rustc.
 - Code generation is a stack machine for expressions. The hottest five scalar
   locals in each function — including the scalar fields of a struct that is
   never copied, returned or passed by value — are pinned to callee-saved
-  registers; everything else is in memory. Temporaries are spilled to frame slots, not the machine stack, so
-  `%rsp` never moves and a call needs no alignment pad. The optimiser is an
+  registers; everything else is in memory. Temporaries are spilled to
+  callee-saved registers (the first few) and then to frame slots, not the machine
+  stack, so `%rsp` never moves and a call needs no alignment pad. The optimiser is an
   inlining pass (small, straight-line, scalar functions), a self-recursion-to-loop
   pass (the right-spine rewrite that turns `f(x) = f(g(x)) + f(h(x))` into a loop
   making one call per level), a loop-invariant code motion pass, and a peephole
@@ -343,8 +362,26 @@ rmc is a small, self-contained compiler, not a drop-in replacement for rustc.
   adjacent stack memory, exactly as in C. `--bounds-checks` inserts a check
   before every index that traps with `rmc: index out of bounds` (exit 101); a
   constant index is decided at compile time.
+- There is no stack probe and no stack-depth check in generated code, and rmc
+  emits no stack-overflow guard. A function that recurses too deeply, or a
+  program with a very large frame, runs off the end of the stack and dies with
+  `SIGSEGV` rather than a clean `rmc:` message or a Rust-style "thread has
+  overflowed its stack" abort. The runtime has no signal handler to turn that
+  fault into a diagnostic. Untrusted input should be size-limited before it
+  reaches a recursive rmc function.
+- The parser bounds expression nesting at `MAX_DEPTH` (100, in `parser.rs`) and
+  reports an error past that, rather than recursing until the native stack
+  overflows. The limit is a fixed constant, not derived from the available
+  stack, so a legitimately deep (but not pathological) expression near the limit
+  is rejected.
 - The heap is a simple first-fit free-list allocator; it does not return memory
   to the kernel and has no thread safety.
+- Internal invariants between passes are enforced with `unreachable!()` (19 call
+  sites), not by making the later pass handle every case. If a pass hands the
+  next one a shape it did not expect, the compiler panics with a "this should be
+  unreachable" message instead of generating wrong code. That is a deliberate
+  trade - a loud compiler bug beats a silent miscompile - but it means an
+  internal inconsistency aborts the compile rather than degrading.
 - `rmc` is one person's project with a differential test suite and CI, not a
   funded product.
 

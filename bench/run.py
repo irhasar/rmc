@@ -25,7 +25,7 @@ RMC = os.path.join(PROJ, "compiler", "target", "release", "rmc")
 OUT = "/tmp/rmcbench"
 RUSTFLAGS_BASE = []
 
-PROGRAMS = ["hello", "fib", "mandel", "sieve", "mix", "stats", "refs", "heap"]
+PROGRAMS = ["hello", "fib", "mandel", "sieve", "mix", "stats", "refs", "heap", "callrec"]
 # Runtime input per program, passed as argv so the workload is opaque to the
 # optimizer and cannot be constant-folded away.
 ARGS = {
@@ -37,6 +37,7 @@ ARGS = {
     "stats": ["2000000"],
     "refs": ["5000000"],
     "heap": ["200000"],
+    "callrec": ["30"],
 }
 
 
@@ -121,6 +122,39 @@ def measure_compile(name, kind, reps=5):
     return r
 
 
+def measure_rustc_plain(name):
+    """A plain `rustc -O` build, no fat LTO, no `codegen-units=1`, no stripping.
+
+    The headline comparison above uses an aggressive rustc configuration, which
+    is the right thing to beat on *compile* cost but the wrong thing to compare
+    *artifact size* against: fat LTO and stripping shrink the rustc binary to a
+    few hundred kB. The default `rustc -O` output is ~4.5 MB (mostly the static
+    libstd/panic machinery), so the size ratio against a default build is far
+    larger than the one the aggressive build reports. Both numbers are recorded
+    so neither overstates the gap.
+    """
+    out = os.path.join(OUT, f"{name}.rustc.plain.bin")
+    argv = ["rustc", "-O", os.path.join(ROOT, "rust", f"{name}.rs"), "-o", out]
+    subprocess.run(argv, check=True, capture_output=True)
+    return os.path.getsize(out)
+
+
+def measure_rustc_static(name):
+    """A statically linked, stripped `rustc -O` build.
+
+    rmc links no libc at all, so the honest size comparison is against a rustc
+    binary that also does not depend on the system libc at run time. `+crt-static`
+    produces that; it is ~1.2 MB for a hello-world, ~179x rmc's 6.6 kB, rather
+    than the ~43x the dynamic stripped build suggests.
+    """
+    out = os.path.join(OUT, f"{name}.rustc.static.bin")
+    argv = ["rustc", "-O", "-C", "panic=abort", "-C", "strip=symbols",
+            "-C", "target-feature=+crt-static",
+            os.path.join(ROOT, "rust", f"{name}.rs"), "-o", out]
+    subprocess.run(argv, check=True, capture_output=True)
+    return os.path.getsize(out)
+
+
 def env_note():
     """A short environment line so a recorded result is reproducible."""
     import platform
@@ -153,6 +187,8 @@ def collect():
         for kind in ("rmc", "rustc"):
             binpath = os.path.join(OUT, f"{p}.{kind}.bin")
             res[kind]["run"] = measure_spawned([binpath] + ARGS[p], 9)
+        res["plain"] = measure_rustc_plain(p)
+        res["static"] = measure_rustc_static(p)
         rows.append((p, res))
     return rows
 
@@ -183,6 +219,12 @@ def write_markdown(path, rows, note):
     lines.append("")
     lines.append("## Compile: build time, CPU, RAM, artifact size")
     lines.append("")
+    lines.append("The rustc column is an aggressive configuration (`-O` with fat LTO,")
+    lines.append("`codegen-units=1`, `panic=abort`, stripped). That is the right target")
+    lines.append("for *compile cost* - it is the slowest rustc build - but it is the")
+    lines.append("*smallest* rustc artifact, so the size ratio here understates the gap")
+    lines.append("against a default build. See the size table below for both.")
+    lines.append("")
     lines.append("| program | compiler | wall (ms) | CPU (ms) | peak RSS (kB) | artifact (B) |")
     lines.append("| ------- | -------- | --------: | -------: | ------------: | -----------: |")
     for p, res in rows:
@@ -193,6 +235,20 @@ def write_markdown(path, rows, note):
         n, c = res["rmc"], res["rustc"]
         lines.append(f"| {p} | ratio (rustc/rmc) | {c['wall']/n['wall']:.1f} | {c['cpu']/n['cpu']:.1f} | "
                      f"{c['rss']/n['rss']:.1f} | {c['size']/n['size']:.1f} |")
+    lines.append("")
+    lines.append("## Artifact size against each rustc build")
+    lines.append("")
+    lines.append("| program | rmc (B) | rustc -O fat-LTO stripped (B) | rustc -O plain (B) | rustc -O static stripped (B) |")
+    lines.append("| ------- | ------: | ----------------------------: | -----------------: | ---------------------------: |")
+    for p, res in rows:
+        lines.append(f"| {p} | {res['rmc']['size']:.0f} | {res['rustc']['size']:.0f} | "
+                     f"{res['plain']:.0f} | {res['static']:.0f} |")
+    lines.append("")
+    lines.append("rmc links no libc and no runtime, so a plain `rustc -O` build (which")
+    lines.append("statically links libstd, the panic machinery and the allocator) is the")
+    lines.append("closest thing to a like-for-like size reference; the stripped static")
+    lines.append("build is the closest *runtime* one. Both are far larger than the")
+    lines.append("fat-LTO stripped build quoted in the headline table.")
     lines.append("")
     lines.append("## Run: speed, CPU, RAM of the compiled binary")
     lines.append("")
@@ -207,11 +263,29 @@ def write_markdown(path, rows, note):
                      f"{c['rss']/n['rss']:.2f} |")
     lines.append("")
     lines.append("Ratios are rustc divided by rmc, so a value above 1 means rmc is")
-    lines.append("better on that dimension. Run time is a ratio of medians: rmc")
-    lines.append("matches or beats rustc on every program, and on `refs` it wins by")
-    lines.append("more than 2x because LICM reassociates the loop-invariant part of")
-    lines.append("the accumulation into one hoisted value, so the loop does a single")
-    lines.append("add per iteration instead of one per invariant term.")
+    lines.append("better on that dimension.")
+    lines.append("")
+    lines.append("Run time is not uniformly in rmc's favour. On loop-heavy integer code")
+    lines.append("rmc is competitive, and on `refs` it wins by more than 2x because LICM")
+    lines.append("reassociates the loop-invariant part of the accumulation into one")
+    lines.append("hoisted value. On call-heavy code (`callrec`) it *loses*: a")
+    lines.append("stack-based generator with no register allocator pays the argument")
+    lines.append("setup and register save/restore on every call that LLVM avoids. The")
+    lines.append("per-program ratio above is the honest answer; there is no single")
+    lines.append("speedup factor.")
+    lines.append("")
+    lines.append("Run-time ratios are also noisy and machine-dependent. Programs near")
+    lines.append("parity (notably `mandel`) flip between a small rmc win and a small rmc")
+    lines.append("loss from run to run and from host to host - a single recorded ratio")
+    lines.append("for such a program should not be read as a stable property. Treat the")
+    lines.append("run column as indicative, and re-run on the target machine before")
+    lines.append("drawing a conclusion about a specific workload.")
+    lines.append("")
+    lines.append("Peak RSS for a compiled rmc binary is a few kB because the binary")
+    lines.append("links no libc and is mapped by the kernel directly. A dynamically")
+    lines.append("linked rustc binary pulls in ld.so and libc, so its RSS floors at a")
+    lines.append("couple of MB regardless of what the program does. That gap is real but")
+    lines.append("is mostly the C library's footprint, not the generated code's.")
     lines.append("")
     with open(path, "w") as f:
         f.write("\n".join(lines))

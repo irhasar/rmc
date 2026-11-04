@@ -1,11 +1,15 @@
 //! Direct x86-64 (System V, AT&T syntax) code generator.
 //!
-//! Expression results live in `%rax` and temporaries are pushed on the machine
-//! stack, so the generator needs no register allocator. Locals are different:
-//! the hottest few scalars in each function are promoted into callee-saved
-//! registers for the whole function (see `promote`), and the rest occupy an
-//! 8-byte slot at `-(slot + 1 + nregs)*8(%rbp)`, below the saved registers and
-//! growing downward from `%rbp`.
+//! Expression results live in `%rax`; the temporaries a binary operator needs
+//! are spilled, not to the machine stack but to the reserved spill area: the
+//! first few go to callee-saved registers (`spill_regs`), the rest to frame
+//! slots just past the locals. `%rsp` therefore never moves mid-function and a
+//! call needs no alignment pad. There is no general register allocator: locals
+//! stay in memory, except that the hottest few scalars in each function are
+//! promoted into callee-saved registers for the whole function (see `promote`).
+//! A promoted local occupies a register instead of its stack slot; the rest
+//! occupy an 8-byte slot at `-(slot + 1 + nregs)*8(%rbp)`, below the saved
+//! registers and growing downward from `%rbp`.
 
 use crate::ast::*;
 use std::cell::Cell;
@@ -1878,6 +1882,17 @@ impl Codegen {
         }
     }
 
+    /// Trap if `reg` is not a valid shift count (0..=63). The hardware masks a
+    /// shift count to 6 bits, so without this a count of 81 silently shifts by
+    /// 17; Rust's `<<`/`>>` panics instead. Only called when overflow checks are
+    /// enabled.
+    fn check_shift_count(&mut self, reg: &str) {
+        if self.overflow {
+            self.line(&format!("cmp $63, {reg}"));
+            self.line("ja __rmc_shift_overflow");
+        }
+    }
+
     /// Store one struct-literal field value at `dest_off(%rbp)`. A scalar field
     /// is a single word store; an aggregate field is copied word by word, since
     /// the value expression yields the field's *address*, not its contents.
@@ -2259,6 +2274,8 @@ impl Codegen {
                 BitXor => self.line(&format!("xor ${k}, %rax")),
                 // The shift count is masked to 6 bits by hardware, exactly as
                 // Rust's `<<`/`>>` on `i64`; `sal`/`sar` take the count directly.
+                // A count outside 0..=63 is a compile-time error when the shift
+                // is constant (rejected in sema), so this arm only sees 0..=63.
                 Shl => self.line(&format!("sal ${}, %rax", k & 63)),
                 Shr => self.line(&format!("sar ${}, %rax", k & 63)),
                 _ => unreachable!(),
@@ -2319,8 +2336,14 @@ impl Codegen {
             BitXor => self.line("xor %rcx, %rax"),
             // The variable shift count must be in `%cl`; `eval_operands`
             // already leaves the right operand in `%rcx`.
-            Shl => self.line("sal %cl, %rax"),
-            Shr => self.line("sar %cl, %rax"),
+            Shl => {
+                self.check_shift_count("%rcx");
+                self.line("sal %cl, %rax");
+            }
+            Shr => {
+                self.check_shift_count("%rcx");
+                self.line("sar %cl, %rax");
+            }
             _ => unreachable!(),
         }
         Type::I64
@@ -2363,6 +2386,18 @@ impl Codegen {
     fn emit_div(&mut self, op: BinOp, rd: &str, rd32: &str) {
         let slow = self.new_label();
         let done = self.new_label();
+        let ok = self.new_label();
+        // Rust traps on a zero divisor and on `i64::MIN / -1` (and `% -1`) even
+        // without `overflow-checks`, because `idiv` cannot produce a result.
+        // `%rdx` is scratch here: both paths below write it before reading it.
+        self.line(&format!("test {rd}, {rd}"));
+        self.line("jz __rmc_divide_by_zero");
+        self.line("movabs $0x8000000000000000, %rdx");
+        self.line("cmp %rdx, %rax");
+        self.line(&format!("jne {ok}"));
+        self.line(&format!("cmp $-1, {rd}"));
+        self.line("je __rmc_divide_overflow");
+        self.raw(&format!("{ok}:"));
         self.line("mov $4294967296, %rdx"); // 2^32
         self.line("cmp %rdx, %rax");
         self.line(&format!("jae {slow}"));
@@ -2401,7 +2436,12 @@ impl Codegen {
         if d == 1 {
             // The dividend is already in %rax.
         } else if d == -1 {
+            // `i64::MIN / -1` and `i64::MIN % -1` overflow; `neg` sets OF for
+            // exactly that operand, so the check is free. Rust traps here even
+            // without `overflow-checks`, because `idiv` cannot produce the
+            // wrapping result.
             self.line("neg %rax");
+            self.line("jo __rmc_divide_overflow");
         } else {
             let mag = d.unsigned_abs();
             if mag.is_power_of_two() {

@@ -347,7 +347,7 @@ __rmc_overflow:
     mov $1, %rax
     mov $2, %rdi             # stderr, like a Rust panic
     lea __rmc_overflow_msg(%rip), %rsi
-    mov $25, %rdx
+    mov $__rmc_overflow_len, %rdx
     syscall
     mov $101, %rdi
     mov $60, %rax
@@ -356,6 +356,75 @@ __rmc_overflow:
 
 .section .rodata
 __rmc_overflow_msg: .ascii "rmc: arithmetic overflow\n"
+.set __rmc_overflow_len, . - __rmc_overflow_msg
+
+# Back to code: `__rmc_shift_overflow` is called, so it must live in an
+# executable section.
+.text
+# void __rmc_shift_overflow(void)  -- a checked `<<`/`>>` had a count outside
+# 0..=63; write a fixed message and exit with status 101, mirroring a Rust panic.
+.globl __rmc_shift_overflow
+.type __rmc_shift_overflow, @function
+__rmc_shift_overflow:
+    mov $1, %rax
+    mov $2, %rdi             # stderr, like a Rust panic
+    lea __rmc_shift_overflow_msg(%rip), %rsi
+    mov $__rmc_shift_overflow_len, %rdx
+    syscall
+    mov $101, %rdi
+    mov $60, %rax
+    syscall
+.size __rmc_shift_overflow, .-__rmc_shift_overflow
+
+.section .rodata
+__rmc_shift_overflow_msg: .ascii "rmc: shift count out of range\n"
+.set __rmc_shift_overflow_len, . - __rmc_shift_overflow_msg
+
+# Back to code: `__rmc_divide_overflow` is called, so it must live in an
+# executable section.
+.text
+# void __rmc_divide_overflow(void)  -- an `i64` division or remainder whose
+# result overflows (`i64::MIN / -1`, `i64::MIN % -1`); write a fixed message and
+# exit with status 101, mirroring a Rust panic. Rust checks this even without
+# `overflow-checks`, because `idiv` traps and cannot produce the wrapping value.
+.globl __rmc_divide_overflow
+.type __rmc_divide_overflow, @function
+__rmc_divide_overflow:
+    mov $1, %rax
+    mov $2, %rdi             # stderr, like a Rust panic
+    lea __rmc_divide_overflow_msg(%rip), %rsi
+    mov $__rmc_divide_overflow_len, %rdx
+    syscall
+    mov $101, %rdi
+    mov $60, %rax
+    syscall
+.size __rmc_divide_overflow, .-__rmc_divide_overflow
+
+.section .rodata
+__rmc_divide_overflow_msg: .ascii "rmc: division overflow\n"
+.set __rmc_divide_overflow_len, . - __rmc_divide_overflow_msg
+
+# Back to code: `__rmc_divide_by_zero` is called, so it must live in an
+# executable section.
+.text
+# void __rmc_divide_by_zero(void)  -- an `i64` division or remainder by zero;
+# write a fixed message and exit with status 101, mirroring a Rust panic.
+.globl __rmc_divide_by_zero
+.type __rmc_divide_by_zero, @function
+__rmc_divide_by_zero:
+    mov $1, %rax
+    mov $2, %rdi             # stderr, like a Rust panic
+    lea __rmc_divide_by_zero_msg(%rip), %rsi
+    mov $__rmc_divide_by_zero_len, %rdx
+    syscall
+    mov $101, %rdi
+    mov $60, %rax
+    syscall
+.size __rmc_divide_by_zero, .-__rmc_divide_by_zero
+
+.section .rodata
+__rmc_divide_by_zero_msg: .ascii "rmc: division by zero\n"
+.set __rmc_divide_by_zero_len, . - __rmc_divide_by_zero_msg
 
 # Back to code: `__rmc_bounds` is called, so it must live in an executable
 # section. Without this the handler is emitted into the non-executable
@@ -370,7 +439,7 @@ __rmc_bounds:
     mov $1, %rax
     mov $2, %rdi             # stderr, like a Rust panic
     lea __rmc_bounds_msg(%rip), %rsi
-    mov $30, %rdx
+    mov $__rmc_bounds_len, %rdx
     syscall
     mov $101, %rdi
     mov $60, %rax
@@ -379,4 +448,5 @@ __rmc_bounds:
 
 .section .rodata
 __rmc_bounds_msg: .ascii "rmc: index out of bounds\n"
+.set __rmc_bounds_len, . - __rmc_bounds_msg
 "#;

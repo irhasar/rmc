@@ -736,6 +736,51 @@ fn an_out_of_range_constant_shift_is_rejected() {
 }
 
 #[test]
+fn a_known_shift_count_is_checked_even_when_the_value_is_not_constant() {
+    // rustc rejects `x << 81` for any `x`: the count is a compile-time constant
+    // outside 0..=63, so the shift is an error regardless of the left operand.
+    // Checking only when *both* sides are constant would accept this.
+    for src in [
+        "fn f(x: i64) -> i64 { return x << 81; } fn main() -> i64 { return f(1); }",
+        "fn f(x: i64) -> i64 { return x >> 64; } fn main() -> i64 { return f(1); }",
+        "const K: i64 = 81; fn f(x: i64) -> i64 { return x << K; } fn main() -> i64 { return f(1); }",
+        "fn f(x: i64) -> i64 { let k: i64 = 81; return x << k; } fn main() -> i64 { return f(1); }",
+        "fn f(x: i64) -> i64 { return x << -1; } fn main() -> i64 { return f(1); }",
+    ] {
+        let err = compile_to_asm(src, &CompileOptions::default()).unwrap_err();
+        assert!(err.contains("shift amount"), "src {src:?}: got {err}");
+    }
+}
+
+#[test]
+fn an_in_range_known_shift_count_is_accepted() {
+    for src in [
+        "fn f(x: i64) -> i64 { return x << 63; } fn main() -> i64 { return f(1); }",
+        "fn f(x: i64) -> i64 { return x >> 0; } fn main() -> i64 { return f(1); }",
+    ] {
+        assert!(compile_to_asm(src, &CompileOptions::default()).is_ok(), "src {src:?}");
+    }
+}
+
+#[test]
+fn overflow_checks_guard_a_variable_shift_count() {
+    // The hardware masks a shift count to 6 bits, so `x << 64` would silently
+    // shift by 0. Under `--overflow-checks` rmc emits a `cmp`/`ja` to the trap,
+    // matching Rust's panic; without the flag it must not (the shift is then
+    // unchecked, as Rust's default `<<` is too).
+    let src = "fn f(x: i64, n: i64) -> i64 { return x << n; } fn main() -> i64 { return f(1, 2); }";
+    let plain = compile_to_asm(src, &CompileOptions::default()).unwrap();
+    assert!(!plain.contains("ja __rmc_shift_overflow"), "no guard without the flag");
+    let checked = compile_to_asm(
+        src,
+        &CompileOptions { overflow_checks: true, ..Default::default() },
+    )
+    .unwrap();
+    assert!(checked.contains("cmp $63, %rcx"), "count is range-checked");
+    assert!(checked.contains("ja __rmc_shift_overflow"), "out-of-range count traps");
+}
+
+#[test]
 fn in_range_constant_arithmetic_is_accepted() {
     assert!(compile_to_asm(
         "fn main() -> i64 { let x: i64 = (1 << 62) + 3; let y: i64 = x / 7 % 5; return y; }",

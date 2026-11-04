@@ -154,6 +154,38 @@ def check_bounds_traps(combos):
     return failures
 
 
+def check_no_rwx():
+    """The linked executable must have no writable-and-executable LOAD segment.
+
+    The CLI used to link with `ld -n`, which packs every section into one
+    read+write+execute segment: a W^X violation, and an invitation to exploit if
+    the program ever wrote to a page the kernel would then execute. A plain
+    `readelf -l` on a compiled `hello` catches a regression to `-n` (or any
+    other linker flag that reintroduces a RWX segment).
+    """
+    rms = os.path.join(OUT, "rwx_hello.rms")
+    with open(rms, "w") as f:
+        f.write("fn main() -> i64 { print_i64(1); return 0; }\n")
+    exe = os.path.join(OUT, "rwx_hello.bin")
+    p = subprocess.run([RMC, rms, "-o", exe], capture_output=True)
+    if p.returncode != 0:
+        print(f"FAIL rwx: rmc failed:\n{p.stderr.decode(errors='replace')}")
+        return 1
+    p = subprocess.run(["readelf", "-lW", exe], capture_output=True)
+    if p.returncode != 0:
+        print("FAIL rwx: readelf failed")
+        return 1
+    for line in p.stdout.decode().splitlines():
+        line = line.strip()
+        if line.startswith("LOAD"):
+            # Columns: type offset vaddr paddr filesz memsz flg align
+            flg = line.split()[6]
+            if "W" in flg and "E" in flg:
+                print(f"FAIL rwx: writable+executable LOAD segment: {line}")
+                return 1
+    return 0
+
+
 def main():
     verbose = "-v" in sys.argv
     os.makedirs(OUT, exist_ok=True)
@@ -218,6 +250,10 @@ def main():
                     print(f"ok   {name}{label} {argv}")
 
     failures += check_bounds_traps(combos)
+    rwx = check_no_rwx()
+    failures += rwx
+    if rwx == 0:
+        print("linked binary has no writable+executable LOAD segment")
 
     total = len(names)
     if failures == 0:

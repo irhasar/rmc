@@ -378,6 +378,56 @@ def gen_arith_program(rng):
     return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
 
 
+def gen_shift_program(rng):
+    """A program whose shift counts come from `argv`, so they are opaque to the
+    compiler and can be out of range (negative or >= 64). The `expr`/`stmt`
+    generators mask every shift count with `& 63` to keep it a valid `i64` shift
+    (see `gen_expr`), which means the shift-overflow trap was never exercised:
+    rmc used to mask a runtime count with the hardware's 6 bits and produce a
+    wrong value where rustc panics. The count here is a parameter, so it is
+    neither constant-folded by rmc nor rejected at compile time by rustc.
+
+    The same argument is fed to `<<`, `>>`, and the compound `<<=`/`>>=`, which
+    all reach the same code path, plus a shift inside an array index so the
+    compound-store form is covered too.
+    """
+    shape = rng.choice([
+        "y << n", "y >> n", "(y << n) + (y >> n)", "(y + 1) << n",
+        "(y * 3) >> n", "y << (n - 1)", "y >> (n + 1)",
+    ])
+    cshape = rng.choice(["y <<= n", "y >>= n", "y <<= n + 1", "y >>= n - 1"])
+    ashape = cshape.replace("y", "a[0]", 1)
+    rms = [
+        "fn main() -> i64 {",
+        "    let n: i64 = arg_i64(1);",
+        "    let mut y: i64 = arg_i64(2);",
+        f"    print_i64({shape});",
+        "    let mut a: [i64; 3] = [1, 2, 3];",
+        "    a[0] = y;",
+        f"    {ashape};",
+        "    print_i64(a[0]);",
+        f"    {cshape};",
+        "    print_i64(y);",
+        "    return 0;",
+        "}",
+    ]
+    rs = [
+        "fn main() {",
+        "    let args: Vec<i64> = std::env::args().skip(1).map(|s| s.parse().unwrap()).collect();",
+        "    let n: i64 = args[0];",
+        "    let mut y: i64 = args[1];",
+        f'    println!("{{}}", {shape});',
+        "    let mut a: [i64; 3] = [1, 2, 3];",
+        "    a[0] = y;",
+        f"    {ashape};",
+        '    println!("{}", a[0]);',
+        f"    {cshape};",
+        '    println!("{}", y);',
+        "}",
+    ]
+    return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
+
+
 def gen_nest_program(rng):
     """A program built from nested aggregates: a struct whose fields include
     another struct and an array, and an enum whose payload is a struct. `stmt`
@@ -1139,7 +1189,7 @@ def run_reject():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "robust", "reject"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "robust", "reject"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -1165,7 +1215,7 @@ def main():
         return 2
     # `arith` mode generates overflowing arithmetic, so the `--overflow-checks`
     # configs are always wanted: the whole point is to compare the trap.
-    if args.mode == "arith":
+    if args.mode in ("arith", "shift"):
         args.overflow = True
 
     # Per-process temp dir: two fuzz runs sharing one would overwrite each
@@ -1175,7 +1225,7 @@ def main():
     gen = {"expr": gen_expr_program, "stmt": gen_stmt_program,
            "opt": gen_opt_program, "arith": gen_arith_program,
            "nest": gen_nest_program, "pat": gen_pat_program,
-           "order": gen_order_program}[args.mode]
+           "order": gen_order_program, "shift": gen_shift_program}[args.mode]
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus
     # suite; a fuzz program is otherwise only checked with every pass on, so a
@@ -1215,6 +1265,14 @@ def main():
         rms, rs = gen(rng)
         open(f"{tmp}/p.rms", "w").write(rms)
         open(f"{tmp}/p.rs", "w").write(rs)
+        # Shift mode reads its counts from argv; every other mode ignores
+        # arguments. `count` is deliberately drawn from the full i64 range so
+        # out-of-range shifts (negative, >= 64) are exercised.
+        argv = []
+        if args.mode == "shift":
+            argv = [str(rng.choice([rng.randint(-4, 4), rng.randint(60, 68),
+                                    rng.randint(0, 63), -1, 64, 63, 0])),
+                    str(rng.randint(-1000, 1000))]
         # One rustc reference per distinct flag set, built once and cached.
         refs = {}
         skip = False
@@ -1225,7 +1283,7 @@ def main():
             if c.returncode != 0:
                 skip = True  # not a valid rust reference program
                 break
-            refs[rf] = (rbin, run([rbin]))
+            refs[rf] = (rbin, run([rbin] + argv))
         if skip:
             continue
         bad = None
@@ -1242,10 +1300,10 @@ def main():
                     break
                 bad = f"rmc[{label}] failed to compile:\n{c.stderr.decode(errors='replace')}"
                 break
-            o1 = run([f"{tmp}/p.bin"])
+            o1 = run([f"{tmp}/p.bin"] + argv)
             o2 = refs[tuple(rf)][1]
             if (o1.returncode, o1.stdout) != (o2.returncode, o2.stdout):
-                bad = (f"rmc[{label}] exit={o1.returncode} stdout={o1.stdout!r}\n"
+                bad = (f"rmc[{label}] argv={argv} exit={o1.returncode} stdout={o1.stdout!r}\n"
                        f"  rustc    exit={o2.returncode} stdout={o2.stdout!r}")
                 break
         if bad:
