@@ -498,12 +498,13 @@ fn scalar(e: &Expr) -> bool {
     }
 }
 
-/// The type of a hoistable expression: `Bool` for a comparison or `!`, `I64`
-/// otherwise.
+/// The type of a hoistable expression: `Bool` for a comparison or a `bool` `!`,
+/// the operand's type for a bitwise `!`, and `I64` otherwise.
 fn expr_ty(e: &Expr) -> Type {
     match e {
         Expr::Bool(_) => Type::Bool,
-        Expr::Un(UnOp::Not, _) => Type::Bool,
+        Expr::Var { ty, .. } | Expr::Field { ty, .. } => ty.clone(),
+        Expr::Un(UnOp::Not, a) => expr_ty(a),
         Expr::Bin(op, _, _)
             if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) =>
         {

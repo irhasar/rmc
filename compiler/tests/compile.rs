@@ -90,6 +90,23 @@ fn compound_assignment_expands() {
 }
 
 #[test]
+fn bang_on_int_is_bitwise_not() {
+    // Rust's `!` is bitwise not on an integer and logical not on a `bool`; the
+    // integer form emits `not %rax`, the bool form a `sete`.
+    let int = asm("fn main() -> i64 { return !5; }");
+    assert!(int.contains("not %rax"), "integer `!` is a bitwise not");
+    assert!(!int.contains("sete"), "integer `!` is not a logical not");
+    let boolean = asm("fn main() -> i64 { let b: bool = true; return (!b) as i64; }");
+    assert!(boolean.contains("sete"), "bool `!` is a logical not");
+}
+
+#[test]
+fn bang_on_a_non_int_is_rejected() {
+    let err = compile_to_asm("fn main() -> i64 { let a: [i64; 2] = [0,0]; return (!a) as i64; }", &CompileOptions::default());
+    assert!(err.is_err(), "`!` on an array must be rejected");
+}
+
+#[test]
 fn assignment_evaluates_value_before_place() {
     // rustc orders assignment operands right-to-left: the assigned value is
     // evaluated before the assignee place. With `li` calling on both sides, the

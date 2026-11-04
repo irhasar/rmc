@@ -640,10 +640,13 @@ The checks, all in `sema.rs`:
   resolved. This is the safe direction: rmc folds a strict subset of what rustc
   folds, so it never accepts a program rustc rejects.
 
-`not_on_int` remains an *over*-rejection (rmc rejects a program rustc accepts),
-the safe direction; it is listed by the audit harness but is not a soundness bug.
+`!` on an integer is bitwise not, as in Rust: sema accepts `bool` and `i64`
+operands (it yields the operand's type) and codegen emits `not %rax` for the
+integer form and a `sete` for the `bool` form, selecting on the operand's
+generated type. `licm::expr_ty` follows the operand for a `!` so a hoisted
+bitwise not is bound to an `i64` slot, not a `bool` one.
 
-The `i64::MIN` literal is over-rejected for the same reason: the lexer parses
+The `i64::MIN` literal is over-rejected: the lexer parses
 the magnitude `9223372036854775808` before the sign, and that magnitude exceeds
 `i64::MAX`, so `-9223372036854775808` is reported as an invalid literal while
 rustc accepts it. `-9223372036854775807` and the equivalent

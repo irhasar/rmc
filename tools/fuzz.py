@@ -63,6 +63,11 @@ def gen_expr(rng, depth):
         return f"h({gen_expr(rng, depth + 1)})"
     if r < 0.18:
         return f"(-{gen_expr(rng, depth + 1)})"
+    if r < 0.24:
+        # `!` is bitwise not on an integer. The operand goes through `gen_i64`
+        # so it is typed `i64` in both compilers (an unconstrained literal would
+        # default to `i32` in rustc and disagree with rmc's i64-only `!`).
+        return f"(!{gen_i64(rng, depth + 1)})"
     op = rng.choice(EXPR_OPS)
     if op in ("<<", ">>"):
         left = gen_i64(rng, depth + 1)
