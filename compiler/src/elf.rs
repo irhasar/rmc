@@ -1098,15 +1098,18 @@ fn emit_mem_op(out: &mut Vec<u8>, opcode: u8, m: &Mem, reg: u8, rex_w: bool, for
 
     let base = m.base;
     let index = m.index;
-    // A base whose rm field is 101 (%rbp or %r13) needs an explicit
-    // displacement, since mod=00/rm=101 means "disp32, no base".
-    let need_disp = m.disp != 0 || base.is_none() || base.map_or(false, |b| (b & 7) == 5);
-    let disp_size = if !need_disp {
-        0
+    // With no base the SIB base field is 101, which only means "no base" when
+    // mod=00 (mod=01/10 would select %rbp), so a base-less operand always uses
+    // mod=00 plus a disp32. A base of %rbp/%r13 (rm 101) is the mirror image:
+    // mod=00 is invalid for it, so it needs an explicit disp8 0.
+    let (modbits, disp_size) = if base.is_none() {
+        (0u8, 4usize)
+    } else if m.disp == 0 && !base.map_or(false, |b| (b & 7) == 5) {
+        (0, 0)
     } else if fits_i8(m.disp) {
-        1
+        (1, 1)
     } else {
-        4
+        (2, 4)
     };
     if base.map_or(false, |b| b >= 8) {
         rex |= 0x01;
@@ -1119,11 +1122,6 @@ fn emit_mem_op(out: &mut Vec<u8>, opcode: u8, m: &Mem, reg: u8, rex_w: bool, for
     }
     out.push(opcode);
 
-    let modbits: u8 = match disp_size {
-        0 => 0,
-        1 => 1,
-        _ => 2,
-    };
     // A SIB byte is required for an index, for no base, and for a base of
     // %rsp/%r12 (whose rm encoding is the SIB escape, 100b).
     let need_sib = index.is_some() || base.is_none() || base.map_or(false, |b| (b & 7) == 4);
@@ -1160,18 +1158,16 @@ fn emit_mem_modrm(out: &mut Vec<u8>, m: &Mem, reg: u8) {
     }
     let base = m.base;
     let index = m.index;
-    let need_disp = m.disp != 0 || base.is_none() || base.map_or(false, |b| (b & 7) == 5);
-    let disp_size = if !need_disp {
-        0
+    // See `emit_mem_op`: a base-less operand is mod=00 with a disp32, while
+    // %rbp/%r13 needs a disp8 because mod=00/rm=101 means "no base".
+    let (modbits, disp_size) = if base.is_none() {
+        (0u8, 4usize)
+    } else if m.disp == 0 && !base.map_or(false, |b| (b & 7) == 5) {
+        (0, 0)
     } else if fits_i8(m.disp) {
-        1
+        (1, 1)
     } else {
-        4
-    };
-    let modbits: u8 = match disp_size {
-        0 => 0,
-        1 => 1,
-        _ => 2,
+        (2, 4)
     };
     let need_sib = index.is_some() || base.is_none() || base.map_or(false, |b| (b & 7) == 4);
     let rm_field = if need_sib { 4 } else { base.unwrap() & 7 };
@@ -1192,5 +1188,39 @@ fn emit_mem_modrm(out: &mut Vec<u8>, m: &Mem, reg: u8) {
         1 => out.push(m.disp as u8),
         4 => out.extend_from_slice(&(m.disp as i32).to_le_bytes()),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mem(s: &str) -> Mem {
+        parse_mem(s).expect("operand parses")
+    }
+
+    #[test]
+    fn lea_with_index_and_no_base_is_mod00_disp32() {
+        // `lea 0(,%rbx,4), %rdi`: the SIB base field 101 means "no base" only
+        // with mod=00, so the operand must be mod=00 plus a disp32. A disp8
+        // here would instead select base=%rbp and read the wrong address.
+        let mut out = Vec::new();
+        emit_mem_op(&mut out, 0x8D, &mem("0(,%rbx,4)"), 7, true, false);
+        assert_eq!(out, [0x48, 0x8D, 0x3C, 0x9D, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn lea_with_index_and_no_base_is_mod00_disp32_in_modrm_form() {
+        let mut out = Vec::new();
+        emit_mem_modrm(&mut out, &mem("0(,%rbx,4)"), 0);
+        assert_eq!(out, [0x04, 0x9D, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn rbp_base_needs_an_explicit_disp8() {
+        // mod=00/rm=101 is "no base", so %rbp as a base needs a disp8 0.
+        let mut out = Vec::new();
+        emit_mem_op(&mut out, 0x8B, &mem("(%rbp)"), 0, true, false);
+        assert_eq!(out, [0x48, 0x8B, 0x45, 0x00]);
     }
 }
