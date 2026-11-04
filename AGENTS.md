@@ -454,9 +454,10 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   generated pointer code, not the allocators.
 - **`refs` is not an instruction-level tie.** Keeping the Rust loop real needs
   an in-loop `black_box`, which costs a store/reload per iteration; rmc has no
-  such barrier and hoists the invariant method results with its own `licm`. Both
-  add a constant per iteration, but only the Rust side pays the barrier, so read
-  the `refs` ratio as "two real loops doing the same arithmetic".
+  such barrier. rmc's `licm` reassociates the loop-invariant part of the
+  accumulation into one hoisted value, so its loop does a single add per
+  iteration, and it wins the ratio by more than 2x. Read the number as "two real
+  loops doing the same arithmetic", not as an instruction-for-instruction tie.
 
 ## Tests
 

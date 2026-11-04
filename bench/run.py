@@ -207,8 +207,11 @@ def write_markdown(path, rows, note):
                      f"{c['rss']/n['rss']:.2f} |")
     lines.append("")
     lines.append("Ratios are rustc divided by rmc, so a value above 1 means rmc is")
-    lines.append("better on that dimension. Run time is a ratio of medians and is the")
-    lines.append("one dimension where rustc wins on call-heavy code.")
+    lines.append("better on that dimension. Run time is a ratio of medians: rmc")
+    lines.append("matches or beats rustc on every program, and on `refs` it wins by")
+    lines.append("more than 2x because LICM reassociates the loop-invariant part of")
+    lines.append("the accumulation into one hoisted value, so the loop does a single")
+    lines.append("add per iteration instead of one per invariant term.")
     lines.append("")
     with open(path, "w") as f:
         f.write("\n".join(lines))

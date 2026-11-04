@@ -2191,6 +2191,37 @@ fn a_value_the_loop_writes_is_not_hoisted() {
 }
 
 #[test]
+fn invariant_terms_of_a_sum_are_grouped_into_one_add() {
+    // `acc + a*b + b*c + a*c` parses left-associatively, so no sub-expression is
+    // invariant and the pass would otherwise hoist each term separately, leaving
+    // one dependent add per term in the loop. Regrouping the invariant terms
+    // into a single sub-sum collapses them to one hoisted value, so the loop
+    // does one add per iteration — the reassociation LLVM performs, and what
+    // makes the `refs` hot loop competitive.
+    let src = "fn main() -> i64 { let a: i64 = 2; let b: i64 = 3; let c: i64 = 4; \
+               let mut acc: i64 = 0; let mut i: i64 = 0; \
+               while i < 10 { acc = acc + a * b + b * c + a * c; i = i + 1; } return acc; }";
+    let with = loop_body(&asm(src));
+    assert_eq!(with.matches("add ").count(), 1, "one add per iteration:\n{with}");
+    assert!(!with.contains("imul"), "the products are hoisted:\n{with}");
+    let without = loop_body(&asm_no_licm(src));
+    assert!(without.contains("imul"), "without LICM nothing is hoisted:\n{without}");
+}
+
+#[test]
+fn a_variant_term_keeps_the_sum_in_place() {
+    // `acc + inv + i` has a loop-variant term, so the invariant half is still
+    // grouped and hoisted, but the loop keeps one add for it and one for `i`.
+    let src = "fn main() -> i64 { let a: i64 = 2; let b: i64 = 3; \
+               let mut acc: i64 = 0; let mut i: i64 = 0; \
+               while i < 10 { acc = acc + a * b + i; i = i + 1; } return acc; }";
+    let with = loop_body(&asm(src));
+    assert_eq!(with.matches("add ").count(), 2, "one add for the hoist, one for `i`:\n{with}");
+    assert!(!with.contains("imul"), "the product is hoisted:\n{with}");
+}
+
+
+#[test]
 fn a_loop_that_calls_is_left_alone() {
     // A call can write anything, so nothing in this loop is hoisted.
     let src = "fn f(x: i64) -> i64 { print_i64(x); return x; } \
