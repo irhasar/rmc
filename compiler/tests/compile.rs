@@ -99,19 +99,20 @@ fn field_write_targets_the_right_slot() {
 fn for_loop_has_a_continue_label() {
     // `continue` must jump to the increment, which is why `for` is not a while.
     let out = asm("fn main() -> i64 { let mut s: i64 = 0; for i in 0..3 { if i == 1 { continue; } s = s + i; } return s; }");
-    assert!(out.contains("jge"), "range end comparison");
-    assert!(out.contains("add $1, %rax"), "increment");
+    assert!(out.contains("jl "), "range end comparison, rotated to the back edge");
+    assert!(out.contains("add $1"), "increment");
 }
 
 #[test]
-fn an_inclusive_range_uses_a_strict_exit_test() {
-    // `0..=3` must run with `i == 3`, so the guard exits on `var > end` (`jg`),
-    // not on `var >= end` (`jge`). The exclusive form keeps `jge`.
-    let incl = asm("fn main() -> i64 { let mut s: i64 = 0; for i in 0..=3 { s = s + i; } return s; }");
-    assert!(incl.contains("jg "), "inclusive range exits strictly");
-    assert!(!incl.contains("jge "), "inclusive range must not use jge");
+fn an_inclusive_range_uses_a_non_strict_back_edge() {
+    // The guard is the back edge: `0..3` loops back while `var < end` (`jl`),
+    // and `0..=3` while `var <= end` (`jle`), so the inclusive form still runs
+    // the body once more when `var == end`.
     let excl = asm("fn main() -> i64 { let mut s: i64 = 0; for i in 0..3 { s = s + i; } return s; }");
-    assert!(excl.contains("jge "), "exclusive range still uses jge");
+    assert!(excl.contains("jl "), "exclusive range loops back strictly");
+    assert!(!excl.contains("jle "), "exclusive range must not use jle");
+    let incl = asm("fn main() -> i64 { let mut s: i64 = 0; for i in 0..=3 { s = s + i; } return s; }");
+    assert!(incl.contains("jle "), "inclusive range loops back non-strictly");
 }
 
 #[test]

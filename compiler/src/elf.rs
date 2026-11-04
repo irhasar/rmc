@@ -426,7 +426,7 @@ impl Elf {
             "mov" | "movq" | "movb" | "movabs" | "movzbq" | "movzbl" => self.enc_mov(mnem, &ops, sec),
             "lea" => self.enc_lea(&ops, sec),
             "push" | "pop" => self.enc_push_pop(mnem, &ops, sec),
-            "add" | "sub" | "and" | "or" | "xor" | "cmp" | "cmpq" | "test" => {
+            "add" | "addq" | "sub" | "and" | "or" | "xor" | "cmp" | "cmpq" | "test" => {
                 self.enc_arith(mnem, &ops, sec)
             }
             "imul" => self.enc_imul(&ops, sec),
