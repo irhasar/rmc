@@ -480,6 +480,13 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
     through the zero-extending `B8+rd` form would clear the high half.
   - Symbol immediates (`mov $__rmc_overflow_len, %rdx`) come from `.set name,
     . - other`; resolve them after all labels are placed, not during the walk.
+- **`.balign`/`.p2align` pads executable sections with `nop`, not zero.** The
+  in-process encoder fills an aligned gap with `0x90` in a section whose ELF
+  flags include `X` and with `0x00` elsewhere. A zero byte decodes as
+  `add %al,(%rax)`, which faults if a jump lands in the pad; the one-byte `nop`
+  is safe (GNU `as` would emit a multi-byte `nop`, but the encoder only has the
+  single-byte form). `pad_to_align` is shared with `.rodata`/`.data`, where
+  zeros are what a reader wants, so the fill is chosen from the section flags.
 - **Runtime pruning.** `runtime.rs` stores the runtime as `PIECES`, each naming
   the symbols it defines; `for_program(user_asm)` keeps `_start` plus every
   piece the program (or a kept piece) names a symbol of, to a fixpoint. A new
@@ -977,6 +984,14 @@ The README's roadmap lists the intended next steps.
     extra move) and shrank the artifact by only 8 bytes on two of eight programs.
     The transform also has to be careful: truncating to the pre-expression
     offset wipes the whole expression, not just the final move.
+- **A constant initialiser stores straight to its frame slot.** `store_imm`
+  folds `let x: i64 = 7` and an unpromoted struct field `P { x: 1 }` into one
+  `movq $7, off(%rbp)` instead of the `mov $7, %rax` + `mov %rax, off(%rbp)`
+  bounce the value would otherwise take through the accumulator. It only fires
+  when the destination is memory (a promoted local keeps its register store) and
+  only for a constant the `small_imm` path accepts, so no overflow check is
+  owed. This is the eight-field struct literal in `refs` and the small scalars
+  in `stats`/`mandel`; the instruction count drops without changing behaviour.
 - **`emit_cmp` folds a register operand.** `cmp %r, %r` and `cmp %r, mem` are
   legal, so a comparison between two promoted locals is one instruction; only a
   `mem, mem` compare must materialise one side into `%rax`.

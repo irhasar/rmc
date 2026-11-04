@@ -206,7 +206,11 @@ impl Elf {
     fn pad_to_align(&mut self, sec: usize, n: u64) {
         let len = self.sections[sec].data.len() as u64;
         let pad = (n - (len % n)) % n;
-        self.sections[sec].data.resize(len as usize + pad as usize, 0);
+        // A zero byte is `add %al,(%rax)` in an executable section, which would
+        // fault if control ever reached it; pad with `nop` there. Other sections
+        // (`.rodata`, `.data`) want real zeros.
+        let fill = if self.sections[sec].flags & 0x1 != 0 { 0x90 } else { 0 };
+        self.sections[sec].data.resize(len as usize + pad as usize, fill);
     }
 
     fn sym_value(&self, name: &str, cur: usize) -> Result<(i64, usize), String> {
@@ -1214,6 +1218,41 @@ mod tests {
         let mut out = Vec::new();
         emit_mem_modrm(&mut out, &mem("0(,%rbx,4)"), 0);
         assert_eq!(out, [0x04, 0x9D, 0, 0, 0, 0]);
+    }
+
+    fn test_elf(flags: u64) -> Elf {
+        Elf {
+            sections: vec![Section {
+                name: ".text",
+                flags,
+                align: 16,
+                data: vec![1, 2, 3],
+                vaddr: 0,
+                file_off: 0,
+                bss: false,
+            }],
+            syms: HashMap::new(),
+            fixups: Vec::new(),
+            abs64: Vec::new(),
+            abs_imm: Vec::new(),
+            text_idx: 0,
+        }
+    }
+
+    #[test]
+    fn balign_pads_an_executable_section_with_nop() {
+        // A zero byte decodes as `add %al,(%rax)`; a jump into the pad would
+        // fault, so an executable section pads with the one-byte `nop`.
+        let mut e = test_elf(0x5);
+        e.pad_to_align(0, 8);
+        assert_eq!(e.sections[0].data, [1, 2, 3, 0x90, 0x90, 0x90, 0x90, 0x90]);
+    }
+
+    #[test]
+    fn balign_pads_a_data_section_with_zero() {
+        let mut e = test_elf(0x6);
+        e.pad_to_align(0, 8);
+        assert_eq!(e.sections[0].data, [1, 2, 3, 0, 0, 0, 0, 0]);
     }
 
     #[test]

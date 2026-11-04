@@ -23,9 +23,12 @@ fn asm_no_tco(src: &str) -> String {
 
 /// The frame offset stored by the first `mov %rax, <off>(%rbp)` after `marker`.
 /// Lets a test check relative layout without hard-coding absolute offsets.
-fn store_offset_after(out: &str, marker: &str) -> i32 {
-    let tail = &out[out.find(marker).expect("marker present")..];
-    let rest = &tail[tail.find("mov %rax, ").expect("a store") + "mov %rax, ".len()..];
+/// The frame offset of the first `movq $imm, off(%rbp)` store. Panics when the
+/// value was instead promoted to a register (no immediate store is emitted).
+fn store_offset_of(out: &str, imm: i64) -> i32 {
+    let marker = format!("movq ${imm}, ");
+    let tail = &out[out.find(&marker).expect("an immediate store")..];
+    let rest = &tail[marker.len()..];
     let end = rest.find("(%rbp)").expect("frame store");
     rest[..end].trim().parse().expect("offset")
 }
@@ -59,13 +62,25 @@ fn runtime_pieces_are_kept_only_when_used() {
 }
 
 #[test]
+fn a_constant_initialiser_stores_straight_to_the_frame() {
+    // A scalar local and a struct field both start from a constant. The value
+    // goes into the frame slot with one `movq $k, off(%rbp)`, not the two-step
+    // `mov $k, %rax` + `mov %rax, off(%rbp)` bounce.
+    let out = asm(
+        "struct P { x: i64, y: i64 } fn main() -> i64 { let a: i64 = 7; let ra: &i64 = &a; let p: P = P { x: 1, y: 2 }; let r: &P = &p; return *ra + r.x + r.y; }",
+    );
+    assert!(out.contains("movq $7, "), "scalar constant stored direct:\n{out}");
+    assert!(out.contains("movq $1, "), "field constant stored direct:\n{out}");
+    assert!(!out.contains("mov $7, %rax"), "no register bounce:\n{out}");
+}
+
 fn struct_fields_are_laid_out_in_order() {
     // Declaration order, no padding: `y` sits exactly one word above `x`. A
     // `&p` keeps the struct in memory so both fields are stored to the frame;
     // a field-only use now promotes the last field to a register.
     let out = asm("struct P { x: i64, y: i64 } fn main() -> i64 { let p: P = P { x: 1, y: 2 }; let a: &P = &p; return a.y; }");
-    let x = store_offset_after(&out, "mov $1, %rax");
-    let y = store_offset_after(&out, "mov $2, %rax");
+    let x = store_offset_of(&out, 1);
+    let y = store_offset_of(&out, 2);
     assert_eq!(y, x + 8, "fields laid out in declaration order");
 }
 
@@ -1130,7 +1145,7 @@ fn a_copied_struct_keeps_its_fields_in_memory() {
     let out = asm(
         "struct P { x: i64, y: i64 } fn f(p: P) -> i64 { return p.x; } fn main() -> i64 { let p: P = P { x: 1, y: 2 }; let q: P = p; return f(q) + p.x; }",
     );
-    let _ = store_offset_after(&out, "mov $1, %rax"); // panics if `x` were promoted
+    let _ = store_offset_of(&out, 1); // panics if `x` were promoted
 }
 
 #[test]
