@@ -191,6 +191,20 @@ def check_stripped():
     if p.returncode != 0 or p.stdout != b"1\n":
         print(f"FAIL strip: stripped binary misbehaved: rc={p.returncode} out={p.stdout!r}")
         return 1
+    # `--min-size` also drops the section-header table: smaller, still runs.
+    mini = os.path.join(OUT, "strip_hello_min.bin")
+    p = subprocess.run([RMC, "--min-size", rms, "-o", mini], capture_output=True)
+    if p.returncode != 0:
+        print(f"FAIL strip: rmc --min-size failed:\n{p.stderr.decode(errors='replace')}")
+        return 1
+    if os.path.getsize(mini) >= os.path.getsize(stripped):
+        print("FAIL strip: --min-size did not shrink the binary "
+              f"({os.path.getsize(mini)} >= {os.path.getsize(stripped)})")
+        return 1
+    p = subprocess.run([mini], capture_output=True)
+    if p.returncode != 0 or p.stdout != b"1\n":
+        print(f"FAIL strip: --min-size binary misbehaved: rc={p.returncode} out={p.stdout!r}")
+        return 1
     return 0
 
 
@@ -293,7 +307,7 @@ def main():
     stripped = check_stripped()
     failures += stripped
     if stripped == 0:
-        print("default link strips symbols; --no-strip keeps them")
+        print("default link strips symbols; --min-size drops the section headers too")
     rwx = check_no_rwx()
     failures += rwx
     if rwx == 0:

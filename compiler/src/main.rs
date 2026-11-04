@@ -16,6 +16,7 @@ struct Options {
     emit_asm: bool,
     keep_asm: bool,
     strip: bool,
+    min_size: bool,
     overflow_checks: bool,
     bounds_checks: bool,
     no_inline: bool,
@@ -30,6 +31,7 @@ fn parse_args() -> Result<Options, String> {
     let mut emit_asm = false;
     let mut keep_asm = false;
     let mut strip = true;
+    let mut min_size = false;
     let mut overflow_checks = false;
     let mut bounds_checks = false;
     let mut no_inline = false;
@@ -45,6 +47,7 @@ fn parse_args() -> Result<Options, String> {
             "--emit-asm" => emit_asm = true,
             "--keep-asm" => keep_asm = true,
             "--no-strip" => strip = false,
+            "--min-size" => min_size = true,
             "--overflow-checks" => overflow_checks = true,
             "--bounds-checks" => bounds_checks = true,
             "--no-inline" => no_inline = true,
@@ -77,6 +80,7 @@ fn parse_args() -> Result<Options, String> {
         emit_asm,
         keep_asm,
         strip,
+        min_size,
         overflow_checks,
         bounds_checks,
         no_inline,
@@ -96,6 +100,7 @@ fn print_help() {
          \x20   --emit-asm     print generated assembly to stdout and stop\n\
          \x20   --keep-asm     keep the intermediate .s file next to the output\n\
          \x20   --no-strip     keep the symbol table in the output binary\n\
+         \x20   --min-size     also drop the section-header table (slower link)\n\
          \x20   --overflow-checks  trap on i64 +,-,* overflow (off by default)\n\
          \x20   --bounds-checks    trap on an out-of-range array index (off by default)\n\
          \x20   --no-inline        disable the inlining pass (on by default)\n\
@@ -153,6 +158,9 @@ fn run(opts: Options) -> Result<(), String> {
     let obj_path = opts.output.with_extension("o");
     assemble(&asm_path, &obj_path)?;
     link(&obj_path, &opts.output, opts.strip)?;
+    if opts.min_size {
+        strip_section_headers(&opts.output)?;
+    }
 
     if !opts.keep_asm {
         let _ = std::fs::remove_file(&asm_path);
@@ -204,6 +212,29 @@ fn link(obj: &Path, exe: &Path, strip: bool) -> Result<(), String> {
     if !out.status.success() {
         let _ = std::io::stderr().write_all(&out.stderr);
         return Err("linker failed".into());
+    }
+    Ok(())
+}
+
+/// `--min-size`: run `strip --strip-section-headers` on the linked binary.
+///
+/// The section-header table is not read by the loader, so dropping it is safe
+/// and saves another 40% of the file (888 -> 536 bytes on `hello`). It needs a
+/// second binutils process (~2.3 ms), which is a third of rmc's own compile
+/// time, so it is opt-in rather than the default. `strip` ships with `as`/`ld`,
+/// so it adds no new dependency. The binary still runs and `readelf -lW` still
+/// works, but `nm`/`objdump -d` need the section table, so this is for a
+/// deployment artifact, not a debugging one.
+fn strip_section_headers(exe: &Path) -> Result<(), String> {
+    let out = Command::new("strip")
+        .arg("--strip-all")
+        .arg("--strip-section-headers")
+        .arg(exe)
+        .output()
+        .map_err(|e| format!("failed to run `strip`: {e}"))?;
+    if !out.status.success() {
+        let _ = std::io::stderr().write_all(&out.stderr);
+        return Err("strip failed".into());
     }
     Ok(())
 }

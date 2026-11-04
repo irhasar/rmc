@@ -70,6 +70,11 @@ driver shells out to GNU `as` and `ld`.
    packs *everything* into one read+write+execute segment). `--strip-all` drops
    the symbol and section-name tables, which at this size are about a third of
    the file (1376 → 888 bytes on `hello`); `--no-strip` keeps them for `nm`/`gdb`.
+   `--min-size` additionally runs `strip --strip-section-headers`, dropping the
+   section-header table too (888 → 536 bytes). The loader never reads that table,
+   but `nm`/`objdump -d` do, so it is opt-in: the extra `strip` process costs
+   ~2.3 ms, a third of rmc's own compile time, which is not worth paying by
+   default when the whole point is compile speed.
 
 ## Stack layout
 

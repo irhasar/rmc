@@ -80,6 +80,7 @@ rmc input.rms -o output            # compile, assemble and link
 rmc input.rms --emit-asm           # print the generated assembly to stdout
 rmc input.rms --keep-asm -o out    # keep the intermediate .s file
 rmc input.rms --no-strip -o out    # keep the symbol table (stripped by default)
+rmc input.rms --min-size -o out    # smallest artifact: drop section headers too
 rmc input.rms --overflow-checks    # trap on i64 +,-,* overflow (exit 101)
 rmc input.rms --bounds-checks      # trap on an out-of-range array index (exit 101)
 rmc input.rms --no-inline          # disable inlining (on by default)
