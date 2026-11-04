@@ -75,8 +75,9 @@ pub fn compile_to_asm(src: &str, opts: &CompileOptions) -> Result<String, String
     }
     let user_asm = cg.compile(&prog);
 
-    let mut asm = String::with_capacity(user_asm.len() + runtime::RUNTIME_ASM.len() + 64);
+    let runtime = runtime::for_program(&user_asm);
+    let mut asm = String::with_capacity(user_asm.len() + runtime.len() + 64);
     asm.push_str(&user_asm);
-    asm.push_str(runtime::RUNTIME_ASM);
+    asm.push_str(&runtime);
     Ok(asm)
 }

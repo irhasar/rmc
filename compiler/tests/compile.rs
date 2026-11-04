@@ -35,9 +35,27 @@ fn emits_a_global_main() {
     let out = asm("fn main() -> i64 { return 0; }");
     assert!(out.contains(".globl main"));
     assert!(out.contains("main:"));
-    // The runtime is always appended.
+    // The entry point is always appended; the runtime is pruned to what the
+    // program uses, and this one calls nothing.
     assert!(out.contains("_start:"));
-    assert!(out.contains("print_i64:"));
+    assert!(!out.contains("print_i64:"), "unused printer dropped");
+}
+
+#[test]
+fn runtime_pieces_are_kept_only_when_used() {
+    // A program that prints keeps `print_i64` but not the allocator or the
+    // bounds trap.
+    let printing = asm("fn main() -> i64 { print_i64(1); return 0; }");
+    assert!(printing.contains("print_i64:"));
+    assert!(!printing.contains("alloc:"));
+    assert!(!printing.contains("__rmc_bounds:"));
+
+    // A program that allocates keeps the allocator and its arena globals, and
+    // `free` only when it is called.
+    let allocating = asm("fn main() -> i64 { let p: i64 = alloc(16); return p; }");
+    assert!(allocating.contains("alloc:"));
+    assert!(allocating.contains("__rmc_arena:"));
+    assert!(!allocating.contains("free:"));
 }
 
 #[test]
@@ -85,8 +103,14 @@ fn for_loop_has_a_continue_label() {
 
 #[test]
 fn compound_assignment_expands() {
+    // `x += 4` folds into a single `lea` when the target is register-resident,
+    // and otherwise into an `add`. Either is the expansion; what matters is
+    // that the value is incremented in place.
     let out = asm("fn main() -> i64 { let mut x: i64 = 1; x += 4; return x; }");
-    assert!(out.contains("add $4, %rax") || out.contains("add %rcx, %rax"));
+    assert!(
+        out.contains("lea 4(") || out.contains("add $4, %rax") || out.contains("add %rcx, %rax"),
+        "no increment in:\n{out}"
+    );
 }
 
 #[test]
@@ -1197,7 +1221,12 @@ fn bounds_checks_guard_a_runtime_index_on_a_non_local_base() {
 fn the_bounds_handler_is_in_an_executable_section() {
     // `__rmc_bounds` is called, so it must not be left in the `.rodata` opened
     // by the message before it; a plain `ld` link would then fault.
-    let out = asm("fn main() -> i64 { return 0; }");
+    let out = compile_to_asm(
+        "fn f(i: i64) -> i64 { let v: i64 = { let t: [i64; 3] = [1; 3]; t }[i]; return v; } \
+         fn main() -> i64 { return f(9); }",
+        &CompileOptions { bounds_checks: true, ..Default::default() },
+    )
+    .unwrap();
     let at = out.find(".globl __rmc_bounds").expect("handler present");
     let before = &out[..at];
     let text = before.rfind(".text").expect("a .text directive");
@@ -1786,9 +1815,15 @@ fn a_method_with_a_ref_receiver_passes_an_address() {
          fn main() -> i64 { let v: P = P { x: 5, y: 6 }; return v.get(); }",
     );
     // The receiver arrives as an address: the method reads `x` through the
-    // pointer it was handed, not from a copied frame slot.
+    // pointer it was handed, not from a copied frame slot. The field read is an
+    // indirect load off the receiver register (`0(%r..)`), never a frame slot.
     assert!(out.contains("P$get"), "mangled method present in:\n{out}");
-    assert!(out.contains("(%rax)"), "field read through a pointer in:\n{out}");
+    let get = &out[out.find("P$get:").expect("method body")..];
+    let body = &get[..get.find(".size P$get").expect("method end")];
+    assert!(
+        body.contains("(%rbx)") || body.contains("(%rax)"),
+        "field read through a pointer in:\n{body}"
+    );
 }
 
 #[test]

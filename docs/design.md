@@ -63,10 +63,10 @@ driver shells out to GNU `as` and `ld`.
    caller so callers know how to use it.
 8. **Assemble and link** (`main.rs`) — writes the assembly, runs `as --64`, then
    `ld -o <out> --build-id=none -z noseparate-code <obj>`, with the runtime text
-   prepended. `-z noseparate-code` packs the read-only and executable sections
+   appended. `-z noseparate-code` packs the read-only and executable sections
    into one read+execute `LOAD` segment and leaves the writable data in its own
    read+write one, so no page is ever both writable and executable. It is also
-   the smallest layout `ld` produces here (3304 bytes vs 7344 for `-n`, which
+   the smallest layout `ld` produces here (1376 bytes vs 5416 for `-n`, which
    packs *everything* into one read+write+execute segment).
 
 ## Stack layout
@@ -510,6 +510,17 @@ with `main`'s return value. I/O (`print_i64`, `print_str`, `print_bool`,
 `putchar`), memory (`alloc`/`free`), `arg_i64` and the overflow trap are all
 implemented with raw syscalls. Because there is no libc, the resulting ELF is
 static and tiny.
+
+The runtime is stored as a table of pieces (`PIECES`), each naming the symbols it
+defines. `for_program` walks the generated assembly, keeps `_start`, and then
+keeps every piece the program — or another kept piece — names a symbol of, to a
+fixpoint. So a program that never allocates carries no allocator, one that never
+indexes an array carries no bounds trap, and one that never divides carries
+neither divide trap. Symbol matching is word-boundary aware and strips `#`
+comments, so `free` does not match inside `__rmc_freelist` or in `alloc`'s
+comment. On a binary this small the dropped pieces are a large fraction of the
+artifact: `hello` shrank from 3304 to 1384 bytes, and every benchmark artifact
+lost 42–58%.
 
 ### Heap
 
