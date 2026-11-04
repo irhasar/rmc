@@ -128,6 +128,52 @@ fn negating_a_constant_i64_min_is_rejected() {
 }
 
 #[test]
+fn if_let_need_not_be_exhaustive() {
+    // Statement position, no `else`, one integer pattern: rustc accepts it.
+    let out = asm("fn main() -> i64 { let o: i64 = 3; if let 3 = o { print_i64(1); } return 0; }");
+    assert!(out.contains("main:"), "if let compiles");
+}
+
+#[test]
+fn if_let_non_unit_without_else_is_rejected() {
+    // A non-unit `then` with no `else` is a branch-type error, as in rustc.
+    let err = compile_to_asm("fn main() -> i64 { let o: i64 = 3; if let 3 = o { 1 } return 0; }", &CompileOptions::default());
+    assert!(err.is_err(), "non-unit `if let` without `else` must be rejected");
+}
+
+#[test]
+fn if_let_binding_binds_the_scrutinee() {
+    // `if let y = o` always matches and binds `o` to `y`.
+    let out = asm("fn main() -> i64 { let o: i64 = 5; if let y = o { return y; } return 0; }");
+    assert!(out.contains("main:"), "binding if let compiles");
+}
+
+#[test]
+fn irrefutable_if_let_still_checks_the_else_type() {
+    // An irrefutable pattern makes the `else` dead, but rustc still type-checks
+    // it: a non-unit `then` with a unit `else` is rejected.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let o: i64 = 3; if let y = o { 1 } else { } return 0; }",
+        &CompileOptions::default(),
+    );
+    assert!(err.is_err(), "dead `else` with a mismatched type must be rejected");
+}
+
+#[test]
+fn irrefutable_if_let_with_matching_else_is_accepted() {
+    let out = asm("fn main() -> i64 { let o: i64 = 3; let x = if let y = o { y + 1 } else { 0 }; return x; }");
+    assert!(out.contains("main:"), "matching dead `else` is accepted");
+}
+
+#[test]
+fn match_drops_arms_after_a_catch_all() {
+    // A `match` arm after `_` is dead and dropped, so a value-position match
+    // whose `_` arm yields a value is accepted even with arms after it.
+    let out = asm("fn main() -> i64 { let o: i64 = 3; let x = match o { _ => 5, 3 => 9 }; return x; }");
+    assert!(out.contains("main:"), "arms after `_` are dropped");
+}
+
+#[test]
 fn assignment_evaluates_value_before_place() {
     // rustc orders assignment operands right-to-left: the assigned value is
     // evaluated before the assignee place. With `li` calling on both sides, the
