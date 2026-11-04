@@ -23,6 +23,10 @@ Modes:
     nest  nested aggregates (struct-in-struct, struct-with-array, an enum
           whose payload is a struct), including a deep copy and a nested-path
           write, which `stmt` never emits
+    pat   `match` expressions: a multi-variant enum, a variant with two
+          payload fields, a binding pattern, a negative literal, a nested
+          `match`, and a non-trivial side-effecting scrutinee (the temporary
+          `desugar_match` binds it to, which must be evaluated once)
 
 The reference is `rustc -O`, so a mismatch is a real semantic divergence.
 """
@@ -450,6 +454,100 @@ def gen_nest_program(rng):
         "    let mut o2: Outer = mk(base + 1);",
         "    bump(&mut o2);",
         f"    acc += o2.mid.{f0} + o2.s;",
+        '    println!("{}", acc);',
+        "}",
+    ]
+    return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
+
+
+def gen_pat_program(rng):
+    """A program whose control flow is a set of `match` expressions, so the
+    desugaring and the arm codegen are exercised. `stmt` mode only matches a
+    single-payload enum with a wildcard and an integer with a wildcard, so a
+    multi-variant enum, a variant with two payload fields, a binding pattern, a
+    negative literal, a nested `match` and — the path that matters most — a
+    non-trivial scrutinee (a call, a binary operator, an index or a field,
+    which `desugar_match` binds to a temporary) were never generated. That
+    temporary must be evaluated exactly once: re-evaluating it per arm repeats
+    a side effect, and a stale one reads the wrong value.
+    """
+    k = rng.randint(1, 9)
+    v = rng.randint(2, 9)
+    neg = rng.choice([-1, -7, -20])
+    ncolors = rng.randint(2, 4)
+    bound = rng.randint(1, 6)
+    a0, a1 = rng.randint(0, 9), rng.randint(0, 9)
+
+    colors = [f"C{j}" for j in range(ncolors)]
+    color_def = ", ".join(colors)
+    color_arms = ", ".join(f"Color::{c} => {j + 1}" for j, c in enumerate(colors))
+    color_pick = ", ".join(f"{j} => Color::{c}" for j, c in enumerate(colors))
+
+    rms = [
+        "fn side(k: i64) -> i64 { print_i64(k); return k * 3 + 1; }",
+        f"fn classify(x: i64) -> i64 {{ return match x {{ {neg} => 10, 0 => 20, 1 => 30, _ => 40 }}; }}",
+        "fn bindit(x: i64) -> i64 { return match x { y => y * 2 + 1 }; }",
+        f"fn bscr(x: i64) -> i64 {{ return match x + {k} {{ {v} => 100, _ => 0 }}; }}",
+        f"fn cscr(k: i64) -> i64 {{ return match side(k) {{ {v} => 5, _ => 7 }}; }}",
+        f"fn mscr(k: i64) -> i64 {{ return match side(k) {{ {v} => 11, {v + 1} => 22, {v + 2} => 33, _ => 44 }}; }}",
+        f"fn iscr(a: [i64; 4], i: i64) -> i64 {{ return match a[i] {{ {v} => 70, _ => 0 }}; }}",
+        "fn nested(x: i64) -> i64 { return match x { 0 => match x + 5 { 5 => 100, _ => 101 }, _ => match x { 2 => 200, _ => 201 } }; }",
+        f"enum Color {{ {color_def} }}",
+        f"fn color_code(c: Color) -> i64 {{ return match c {{ {color_arms} }}; }}",
+        "enum Shape { Dot, Line(i64), Rect(i64, i64) }",
+        "fn area(s: Shape) -> i64 { return match s { Shape::Dot => 0, Shape::Line(w) => w, Shape::Rect(w, h) => w * h }; }",
+        "struct S { a: i64, b: i64 }",
+        f"fn fscr(s: S) -> i64 {{ return match s.b {{ {v} => 20, _ => 0 }}; }}",
+        "fn main() -> i64 {",
+        "    let mut acc: i64 = 0;",
+        f"    let arr: [i64; 4] = [{a0}, {a1}, {v}, {k}];",
+        "    let mut i: i64 = 0;",
+        f"    while i < {bound} {{",
+        f"        let c: Color = match i % {ncolors} {{ {color_pick}, _ => Color::{colors[0]} }};",
+        "        acc = acc + color_code(c) * 1000;",
+        "        let s: Shape = match i % 3 { 0 => Shape::Dot, 1 => Shape::Line(i + 2), _ => Shape::Rect(i + 1, i + 2) };",
+        "        acc = acc + area(s);",
+        "        acc = acc + classify(i) + bindit(i);",
+        "        acc = acc + bscr(i) + cscr(i) + mscr(i) + iscr(arr, i % 4) + fscr(S { a: i, b: i % 5 });",
+        "        acc = acc + nested(i % 3);",
+        "        i = i + 1;",
+        "    }",
+        "    print_i64(acc);",
+        "    return 0;",
+        "}",
+    ]
+    rs = [
+        'fn side(k: i64) -> i64 { println!("{}", k); k * 3 + 1 }',
+        f"fn classify(x: i64) -> i64 {{ match x {{ {neg} => 10, 0 => 20, 1 => 30, _ => 40 }} }}",
+        "fn bindit(x: i64) -> i64 { match x { y => y * 2 + 1 } }",
+        f"fn bscr(x: i64) -> i64 {{ match x + {k} {{ {v} => 100, _ => 0 }} }}",
+        f"fn cscr(k: i64) -> i64 {{ match side(k) {{ {v} => 5, _ => 7 }} }}",
+        f"fn mscr(k: i64) -> i64 {{ match side(k) {{ {v} => 11, {v + 1} => 22, {v + 2} => 33, _ => 44 }} }}",
+        f"fn iscr(a: [i64; 4], i: i64) -> i64 {{ match a[i as usize] {{ {v} => 70, _ => 0 }} }}",
+        "fn nested(x: i64) -> i64 { match x { 0 => match x + 5 { 5 => 100, _ => 101 }, _ => match x { 2 => 200, _ => 201 } } }",
+        "#[derive(Copy, Clone)]",
+        f"enum Color {{ {color_def} }}",
+        f"fn color_code(c: Color) -> i64 {{ match c {{ {color_arms} }} }}",
+        "#[derive(Copy, Clone)]",
+        "enum Shape { Dot, Line(i64), Rect(i64, i64) }",
+        "fn area(s: Shape) -> i64 { match s { Shape::Dot => 0, Shape::Line(w) => w, Shape::Rect(w, h) => w * h } }",
+        "#[derive(Copy, Clone)]",
+        "struct S { a: i64, b: i64 }",
+        f"fn fscr(s: S) -> i64 {{ match s.b {{ {v} => 20, _ => 0 }} }}",
+        "fn main() {",
+        "    let mut acc: i64 = 0;",
+        f"    let arr: [i64; 4] = [{a0}, {a1}, {v}, {k}];",
+        "    let mut i: i64 = 0;",
+        f"    while i < {bound} {{",
+        f"        let c: Color = match i % {ncolors} {{ {color_pick}, _ => Color::{colors[0]} }};",
+        "        acc += color_code(c) * 1000;",
+        "        let s: Shape = match i % 3 { 0 => Shape::Dot, 1 => Shape::Line(i + 2), _ => Shape::Rect(i + 1, i + 2) };",
+        "        acc += area(s);",
+        "        acc += classify(i) + bindit(i);",
+        "        acc += bscr(i) + cscr(i) + mscr(i) + iscr(arr, i % 4) + fscr(S { a: i, b: i % 5 });",
+        "        acc += nested(i % 3);",
+        "        i += 1;",
+        "    }",
         '    println!("{}", acc);',
         "}",
     ]
@@ -905,7 +1003,7 @@ def run_reject():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "robust", "reject"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "robust", "reject"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -940,7 +1038,7 @@ def main():
     os.makedirs(tmp, exist_ok=True)
     gen = {"expr": gen_expr_program, "stmt": gen_stmt_program,
            "opt": gen_opt_program, "arith": gen_arith_program,
-           "nest": gen_nest_program}[args.mode]
+           "nest": gen_nest_program, "pat": gen_pat_program}[args.mode]
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus
     # suite; a fuzz program is otherwise only checked with every pass on, so a

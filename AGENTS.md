@@ -38,6 +38,7 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
 python3 tools/fuzz.py --mode opt --n 500 --seed 1
 python3 tools/fuzz.py --mode arith --n 500 --seed 1
 python3 tools/fuzz.py --mode nest --n 500 --seed 1
+python3 tools/fuzz.py --mode pat --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 ```
 
@@ -646,8 +647,13 @@ another struct and an array, and an enum whose payload is a struct — with a
 deep copy (`let mut o1 = o0`) and a nested-path write (`o1.mid.f = ...`,
 `o1.arr[0] = ...`) that the copy must not alias: `stmt` mode only ever gives a
 struct plain `i64` fields, so the field-offset arithmetic for a nested path and
-the aggregate copy were never generated. It compares stdout and exit status
-against `rustc -O`, and it recompiles each program with
+the aggregate copy were never generated. `pat` mode builds `match`
+expressions: a multi-variant unit enum, a variant with two payload fields, a
+binding pattern, a negative literal, a nested `match`, and a non-trivial
+side-effecting scrutinee (a call) tested against several arms — the last is
+what exercises `desugar_match`'s temporary, which must evaluate the scrutinee
+exactly once (re-evaluating it per arm repeats a side effect). It compares
+stdout and exit status against `rustc -O`, and it recompiles each program with
 every optimiser pass off in turn (`--no-inline`, `--no-licm`, `--no-tco`, all
 three), the same matrix the corpus suite uses — a pass-specific bug is otherwise
 invisible, because the fuzzer used to run only the default configuration.
