@@ -1155,7 +1155,7 @@ impl Codegen {
                 self.raw(&format!("{end}:"));
                 self.loops.pop();
             }
-            Stmt::For { var_slot, start, end, end_slot, body, .. } => {
+            Stmt::For { var_slot, start, end, end_slot, inclusive, body, .. } => {
                 // Evaluate both bounds once: `var = start`, `end_slot = end`.
                 self.gen_expr(start);
                 self.store_slot(*var_slot);
@@ -1175,7 +1175,9 @@ impl Codegen {
                 self.gen_var_operand(*var_slot, "%rax");
                 self.gen_var_operand(*end_slot, "%rcx");
                 self.line("cmp %rcx, %rax");
-                self.line(&format!("jge {end_l}"));
+                // `..=` runs the body once more when `var == end`, so it exits
+                // only once `var > end`.
+                self.line(&format!("{} {end_l}", if *inclusive { "jg" } else { "jge" }));
                 self.gen_block(body);
                 self.raw(&format!("{cont}:"));
                 self.gen_var_operand(*var_slot, "%rax");

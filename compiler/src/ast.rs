@@ -271,6 +271,8 @@ pub enum Stmt {
         end: Expr,
         /// Hidden slot holding the end bound, evaluated once before the loop.
         end_slot: i32,
+        /// `start..=end` includes `end`; `start..end` does not.
+        inclusive: bool,
         body: Block,
     },
     Return(Option<Expr>),

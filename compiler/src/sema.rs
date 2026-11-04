@@ -850,7 +850,7 @@ impl Sema {
                 Self::init_restore(scope, &init_before);
                 Ok(())
             }
-            Stmt::For { var, var_slot, start, end, end_slot, body } => {
+            Stmt::For { var, var_slot, start, end, end_slot, body, .. } => {
                 // The loop variable may not shadow a constant (rustc E0530).
                 if self.const_names.contains(var) {
                     return Err(format!(
