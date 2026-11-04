@@ -60,8 +60,10 @@ fn runtime_pieces_are_kept_only_when_used() {
 
 #[test]
 fn struct_fields_are_laid_out_in_order() {
-    // Declaration order, no padding: `y` sits exactly one word above `x`.
-    let out = asm("struct P { x: i64, y: i64 } fn main() -> i64 { let p: P = P { x: 1, y: 2 }; return p.y; }");
+    // Declaration order, no padding: `y` sits exactly one word above `x`. A
+    // `&p` keeps the struct in memory so both fields are stored to the frame;
+    // a field-only use now promotes the last field to a register.
+    let out = asm("struct P { x: i64, y: i64 } fn main() -> i64 { let p: P = P { x: 1, y: 2 }; let a: &P = &p; return a.y; }");
     let x = store_offset_after(&out, "mov $1, %rax");
     let y = store_offset_after(&out, "mov $2, %rax");
     assert_eq!(y, x + 8, "fields laid out in declaration order");
@@ -69,7 +71,7 @@ fn struct_fields_are_laid_out_in_order() {
 
 #[test]
 fn field_write_targets_the_right_slot() {
-    let out = asm("struct P { x: i64, y: i64 } fn main() -> i64 { let mut p: P = P { x: 1, y: 2 }; p.y = 9; return p.y; }");
+    let out = asm("struct P { x: i64, y: i64 } fn main() -> i64 { let mut p: P = P { x: 1, y: 2 }; let a: &P = &p; p.y = 9; return p.y; }");
     // The read of `p.y` and the write `p.y = 9` must name the same frame slot.
     // The write folds the constant straight into a sized `movq`, so it is
     // `movq $9, <off>(%rbp)` rather than a `%rax` round trip. The size matters:

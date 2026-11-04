@@ -773,7 +773,9 @@ impl Codegen {
                 let _ = ty;
             }
             Expr::Var { slot, ty, .. } => {
-                *counts.entry(*slot).or_insert(0) += 1;
+                if !ty.is_aggregate() {
+                    *counts.entry(*slot).or_insert(0) += 1;
+                }
                 if ty.is_aggregate() {
                     match ty {
                         Type::Array(..) => {
@@ -784,10 +786,20 @@ impl Codegen {
                             // here would be O(length) per mention for no gain.
                             mem.insert(*slot);
                         }
-                        Type::Struct(_, size) | Type::EnumData(_, size) => {
-                            // The base slot is the value's last word, whose
-                            // address is the value's own base, so it must stay
-                            // addressable.
+                        // A struct's base slot is its *last* field. It is only
+                        // needed when the value is copied as a whole, which is
+                        // what `copied` records; a field-by-field use reaches
+                        // every field by address off `array_off`, so the base
+                        // slot stays promotable and the last field competes for
+                        // a register like any other.
+                        Type::Struct(_, size) => {
+                            if whole {
+                                copied.push((*slot, (*size / 8) as i32));
+                            }
+                        }
+                        // A payload enum is a tagged union read as a whole, so
+                        // its base word stays in memory.
+                        Type::EnumData(_, size) => {
                             mem.insert(*slot);
                             if whole {
                                 copied.push((*slot, (*size / 8) as i32));
@@ -1302,10 +1314,12 @@ impl Codegen {
     fn field_operand(&self, base: &Expr, offset: i32) -> Option<String> {
         match base {
             Expr::Var { slot, ty: Type::Struct(_, size), .. } => {
-                // The struct base slot is never promoted, so `%rbp` addressing
-                // is always valid; the guard only makes a promote regression
-                // fall back to memory instead of silently reading stale data.
-                if self.reg_of(*slot).is_some() {
+                // The operand addresses field `offset`, which lives in slot
+                // `slot + n - 1 - offset/8`. If that field was promoted, its
+                // frame word is stale and the caller must use the register
+                // instead, so decline and let it fall back.
+                let fslot = *slot + (*size / 8) as i32 - 1 - offset / 8;
+                if self.reg_of(fslot).is_some() {
                     return None;
                 }
                 Some(format!("{}(%rbp)", self.array_off(*slot, size / 8) + offset))

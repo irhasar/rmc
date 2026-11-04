@@ -299,10 +299,24 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   promoted field that stays in memory on the copy path but is read from its
   register on the field path is a silent wrong-answer bug, which is what
   `fieldpromo.rms` guards.
-- **A struct's base slot is its last field and is never promoted.** Field `k`
-  lives at `slot + fields - 1 - k`, so field `fields - 1` *is* `slot`, whose
-  address is the struct's base; promoting it would break every `&struct`-style
-  use. At most `fields - 1` fields can be promoted.
+- **A struct's base slot is its last field, and it stays promotable unless the
+  struct is used as a whole.** Field `k` lives at `slot + fields - 1 - k`, so
+  field `fields - 1` *is* `slot`. A whole-value use (copy, return, pass by
+  value, `let` of a whole copy) already marks every slot via `copied`, so the
+  base slot needs no special case; a field-by-field use reaches every field by
+  address off `array_off` or by register, so the last field competes for a
+  register like any other. `field_operand` must test the *field's own* slot
+  (`slot + n - 1 - offset/8`), not the struct's base slot, before trusting a
+  `%rbp` operand — otherwise a promoted last field reads a stale frame word.
+  A payload enum is the exception: it is read as a whole through its base word,
+  so that word always stays in memory. Promoting `stats`'s last field is worth
+  0.88x -> 1.14x of its rustc twin.
+- **A base-less SIB operand must use mod=00 with a disp32.** `lea 0(,%rax,8)` is
+  SIB base field 101, which means "no base" only at mod=00; at mod=01/10 it
+  selects `%rbp` instead. Emitting a disp8 there reads the wrong address (a
+  silent miscompile that surfaced as `4 * c` printing a stack pointer). The
+  mirror case is `%rbp`/`%r13` as a base (rm 101), which is invalid at mod=00
+  and needs a disp8 0. `elf.rs` unit tests pin both.
 - **Field-to-slot uses the slot count, not the field count.** A struct with an
   array field has more slots than fields (`WithArr` is 2 fields, 4 slots), so
   `fields.len()` gives the wrong map. Use `size / 8`.

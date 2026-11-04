@@ -272,13 +272,17 @@ are. Before "fixing" this again, measure it — the intuition is wrong here.
 Scalar struct fields take part in promotion too, so a hot `acc.sum` stays in a
 register. A field is named by its register only where its slot is known: field
 `k` of a struct at `slot` lives at `slot + fields - 1 - k` (field 0 is the
-highest slot). Two kinds of field stay in memory. The struct's base slot is its
-last field, whose address *is* the struct's base, so it must stay addressable —
-this is why at most `fields - 1` fields of a struct can ever be promoted. And a
-struct that is ever read or written as a whole (copied, returned, passed by
-value, or declared by a `let` whose initialiser is a whole-value copy) is
-accessed through memory, so all of its fields stay there. `promote` records
-those cases during its walk and zeroes the whole struct's slots.
+highest slot). A struct that is ever read or written as a whole (copied,
+returned, passed by value, or declared by a `let` whose initialiser is a
+whole-value copy) is accessed through memory, so all of its fields stay there;
+`promote` records those cases during its walk and zeroes the whole struct's
+slots. A struct used only field by field keeps every field promotable, the last
+one included: a field access names a register through `field_reg` or an address
+`base + offset` off `array_off`, and neither needs the last field's own slot to
+be addressable. This is worth a real benchmark — promoting `stats`'s last field
+(`sum`, the hot one) takes it from 0.88x to 1.14x of its rustc twin. A payload
+enum is the exception: it is read as a whole through its base word, so that word
+stays in memory.
 
 Arrays are skipped entirely: an element is reached by `base + i*8` through
 memory, so no element slot may be promoted, and neither may any slot used as an
