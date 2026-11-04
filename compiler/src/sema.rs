@@ -782,6 +782,47 @@ impl Sema {
     }
 
     /// Type-check an assignment target (variable, array element or field).
+    /// Check a cast `from as to`, mirroring rustc's allowed conversions plus
+    /// rmc's two intentional extensions. Both extensions are documented: the
+    /// raw pointer cast `i64 as &T` (rustc would require `as *const T` first;
+    /// the heap benchmark builds a linked list with it) and `i64 as bool`
+    /// (rustc requires `!= 0`; `boolops.rms` uses it). Everything else rmc
+    /// accepts here is valid Rust, so no accidental reinterpretation slips
+    /// through — in particular a reference may only become a reference to the
+    /// same referent, and may never gain mutability or become a scalar.
+    fn check_cast(&self, from: &Type, to: &Type) -> Result<(), String> {
+        match (from, to) {
+            (Type::Ref(a, a_mut), Type::Ref(b, b_mut)) => {
+                if a != b {
+                    return Err(format!(
+                        "cannot cast a `{a:?}` reference to a `{b:?}` reference"
+                    ));
+                }
+                if *b_mut && !*a_mut {
+                    return Err("cannot cast a shared reference `&T` to `&mut T`".into());
+                }
+                Ok(())
+            }
+            // A reference cannot become a scalar: `&T as i64` would expose the
+            // address as an integer, which rustc forbids (E0606).
+            (Type::Ref(..), _) => {
+                Err(format!("cannot cast a reference `{from:?}` to `{to:?}`"))
+            }
+            // The raw pointer cast extension: an integer becomes a reference.
+            (Type::I64, Type::Ref(..)) => Ok(()),
+            // Any other scalar may not become a reference (rustc E0605).
+            (_, Type::Ref(..)) => {
+                Err(format!("cannot cast `{from:?}` to a reference `{to:?}`"))
+            }
+            // A string literal is not castable in rmc.
+            (Type::Str, _) | (_, Type::Str) => {
+                Err(format!("cannot cast `{from:?}` to `{to:?}`"))
+            }
+            // `i64`, `bool` and an enum tag convert among themselves.
+            _ => Ok(()),
+        }
+    }
+
     fn check_lvalue(&mut self, e: &mut Expr, scope: &mut Scope) -> Result<Type, String> {
         match e {
             Expr::Var { .. } | Expr::Field { .. } => self.check_expr(e, scope),
@@ -1475,6 +1516,7 @@ impl Sema {
                 if !it.is_scalar() || !rt.is_scalar() {
                     return Err(format!("cannot cast {it:?} to {rt:?}"));
                 }
+                self.check_cast(&it, &rt)?;
                 *to = rt.clone();
                 Ok(rt)
             }
@@ -1498,7 +1540,29 @@ fn ref_coerces(found: &Type, expected: &Type) -> bool {
 fn const_i64(e: &Expr) -> Option<i64> {
     match e {
         Expr::Int(k) => Some(*k),
-        Expr::Un(UnOp::Neg, inner) => const_i64(inner).map(|v| v.wrapping_neg()),
+        Expr::Un(UnOp::Neg, inner) => const_i64(inner)?.checked_neg(),
+        // Fold the integer operators too, so a constant index written as an
+        // expression (`a[1 + 4]`) is bounds-checked exactly like a literal.
+        Expr::Bin(op, a, b) => {
+            let x = const_i64(a)?;
+            let y = const_i64(b)?;
+            use BinOp::*;
+            match op {
+                Add => x.checked_add(y),
+                Sub => x.checked_sub(y),
+                Mul => x.checked_mul(y),
+                Div => x.checked_div(y),
+                Mod => x.checked_rem(y),
+                BitAnd => Some(x & y),
+                BitOr => Some(x | y),
+                BitXor => Some(x ^ y),
+                // A shift of 64 or more is out of range, so it is not a usable
+                // constant here; the operator itself reports it via `const_binop`.
+                Shl => (0..64).contains(&y).then(|| x.wrapping_shl(y as u32)),
+                Shr => (0..64).contains(&y).then(|| x.wrapping_shr(y as u32)),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
