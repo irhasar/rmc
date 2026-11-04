@@ -635,38 +635,55 @@ def main():
     os.makedirs(tmp, exist_ok=True)
     gen = gen_expr_program if args.mode == "expr" else gen_stmt_program
     rng = random.Random(args.seed)
+    # The optimiser passes are off in the rustc reference only in the corpus
+    # suite; a fuzz program is otherwise only checked with every pass on, so a
+    # bug that a single pass introduces (a mis-inlined assignment, a bad hoist)
+    # is invisible here. Recompile each program with each pass off, like the
+    # corpus matrix. `all-off` is the plainest code path.
+    configs = [
+        ("", []),
+        ("no-inline", ["--no-inline"]),
+        ("no-licm", ["--no-licm"]),
+        ("no-tco", ["--no-tco"]),
+        ("all-off", ["--no-inline", "--no-licm", "--no-tco"]),
+    ]
     failures = 0
     for t in range(args.n):
         rms, rs = gen(rng)
         open(f"{tmp}/p.rms", "w").write(rms)
         open(f"{tmp}/p.rs", "w").write(rs)
-        c = run([RMC, f"{tmp}/p.rms", "-o", f"{tmp}/p.bin"])
-        if c.returncode != 0:
-            # rmc rejects the program. If rustc rejects it too the generator
-            # produced an ill-formed program (a constant shift or overflow that
-            # rmc now folds), so skip it; only an rmc-only rejection is a bug.
-            r = run([RUSTC, "-O", "-A", "warnings", "--edition", "2021", f"{tmp}/p.rs", "-o", f"{tmp}/q.bin"])
-            if r.returncode != 0:
-                continue
-            print(f"[{args.mode} seed={args.seed} iter={t}] rmc failed to compile:\n{rms}\n{c.stderr.decode(errors='replace')}")
-            failures += 1
-            break
         c = run([RUSTC, "-O", "-A", "warnings", "--edition", "2021", f"{tmp}/p.rs", "-o", f"{tmp}/q.bin"])
         if c.returncode != 0:
             continue  # not a valid rust reference program; skip
-        o1 = run([f"{tmp}/p.bin"])
         o2 = run([f"{tmp}/q.bin"])
-        if (o1.returncode, o1.stdout) != (o2.returncode, o2.stdout):
-            print(f"[{args.mode} seed={args.seed} iter={t}] DIVERGENCE\n{rms}\n"
-                  f"  rmc   exit={o1.returncode} stdout={o1.stdout!r}\n"
-                  f"  rustc exit={o2.returncode} stdout={o2.stdout!r}")
+        bad = None
+        for label, flags in configs:
+            c = run([RMC] + flags + [f"{tmp}/p.rms", "-o", f"{tmp}/p.bin"])
+            if c.returncode != 0:
+                # rmc rejects the program. If rustc rejects it too the generator
+                # produced an ill-formed program (a constant shift or overflow
+                # that rmc now folds), so skip it; only an rmc-only rejection is
+                # a bug.
+                r = run([RUSTC, "-O", "-A", "warnings", "--edition", "2021", f"{tmp}/p.rs", "-o", f"{tmp}/q.bin"])
+                if r.returncode != 0:
+                    bad = None
+                    break
+                bad = f"rmc[{label}] failed to compile:\n{c.stderr.decode(errors='replace')}"
+                break
+            o1 = run([f"{tmp}/p.bin"])
+            if (o1.returncode, o1.stdout) != (o2.returncode, o2.stdout):
+                bad = (f"rmc[{label}] exit={o1.returncode} stdout={o1.stdout!r}\n"
+                       f"  rustc    exit={o2.returncode} stdout={o2.stdout!r}")
+                break
+        if bad:
+            print(f"[{args.mode} seed={args.seed} iter={t}] DIVERGENCE\n{rms}\n  {bad}")
             if args.keep:
                 os.makedirs(args.keep, exist_ok=True)
                 open(f"{args.keep}/fuzz-{args.mode}-{args.seed}-{t}.rms", "w").write(rms)
             failures += 1
             break
     if failures == 0:
-        print(f"{args.n} {args.mode} programs, seed {args.seed}: all match rustc")
+        print(f"{args.n} {args.mode} programs x {len(configs)} configs, seed {args.seed}: all match rustc")
     return 1 if failures else 0
 
 
