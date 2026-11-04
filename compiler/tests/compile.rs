@@ -390,6 +390,88 @@ fn a_mut_binding_and_a_mut_parameter_are_assignable() {
 }
 
 #[test]
+fn a_constant_index_expression_out_of_bounds_is_rejected() {
+    // The index `1 + 4` folds to 5, so it is out of bounds for `[i64; 2]` and
+    // must be rejected exactly like the literal `a[5]`; the earlier check only
+    // folded a bare literal.
+    for idx in ["1 + 4", "2 * 3", "0 - 1", "1 << 3"] {
+        let err = compile_to_asm(
+            &format!("fn main() -> i64 {{ let a: [i64; 2] = [1, 2]; return a[{idx}]; }}"),
+            &CompileOptions::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("out of bounds"), "a[{idx}]: got: {err}");
+    }
+}
+
+#[test]
+fn an_in_range_constant_index_expression_is_accepted() {
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let a: [i64; 4] = [1, 2, 3, 4]; return a[1 + 2]; }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn casting_a_reference_to_a_scalar_is_rejected() {
+    // `r as i64` would expose the address as an integer; rustc forbids it.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let x: i64 = 1; let r: &i64 = &x; return r as i64; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("reference"), "got: {err}");
+}
+
+#[test]
+fn casting_a_shared_reference_to_mut_is_rejected() {
+    let err = compile_to_asm(
+        "fn main() -> i64 { let x: i64 = 1; let r: &i64 = &x; let s: &mut i64 = r as &mut i64; return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("shared reference"), "got: {err}");
+}
+
+#[test]
+fn casting_a_reference_to_another_type_is_rejected() {
+    let err = compile_to_asm(
+        "fn main() -> i64 { let x: i64 = 1; let r: &i64 = &x; let s: &bool = r as &bool; return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("reference"), "got: {err}");
+}
+
+#[test]
+fn casting_bool_to_a_reference_is_rejected() {
+    let err = compile_to_asm(
+        "fn main() -> i64 { let b: bool = true; let r: &i64 = b as &i64; return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("reference"), "got: {err}");
+}
+
+#[test]
+fn the_documented_casts_are_accepted() {
+    // rustc-valid casts plus rmc's two documented extensions: `i64 as bool`
+    // (rustc needs `!= 0`) and the raw pointer cast `i64 as &mut T`.
+    assert!(compile_to_asm(
+        "struct N { v: i64 } \
+         fn main() -> i64 { \
+           let b: bool = true; let x: i64 = b as i64; \
+           let y: bool = x as bool; \
+           let mut z: i64 = 0; let rz: &mut i64 = &mut z; let rs: &i64 = rz as &i64; \
+           let p: i64 = 0; let np: &mut N = p as &mut N; \
+           return x; }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
 fn a_duplicate_parameter_name_is_rejected() {
     // rustc rejects two parameters with the same name (E0415); rmc used to
     // accept it and bind both to the same slot.

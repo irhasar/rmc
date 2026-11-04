@@ -519,6 +519,33 @@ def reject_corpus():
             "fn main() -> i64 { return 1 << 64; }\n",
             "fn main() { let x = 1i64 << 64; let _ = x; }\n",
         ),
+        # A constant index written as an expression must fold like a literal, or
+        # an out-of-range one reads past the array (E0080 in rustc).
+        "const_index_expr_oob": (
+            "fn main() -> i64 { let a: [i64; 2] = [1, 2]; return a[1 + 4]; }\n",
+            "fn main() -> i64 { let a = [1i64, 2]; a[1 + 4] }\n",
+        ),
+        # A reference may only be cast to a reference of the same type, may not
+        # gain mutability, and may not become a scalar (E0605/E0606). rmc's
+        # `i64 as &T` raw pointer cast is a documented extension and stays.
+        "cast_ref_to_scalar": (
+            "fn main() -> i64 { let x: i64 = 1; let r: &i64 = &x; return r as i64; }\n",
+            "fn main() { let x = 1i64; let r = &x; let _ = r as i64; }\n",
+        ),
+        "cast_shared_ref_to_mut": (
+            "fn main() -> i64 { let x: i64 = 1; let r: &i64 = &x; "
+            "let s: &mut i64 = r as &mut i64; return 0; }\n",
+            "fn main() { let x = 1i64; let r = &x; let s = r as &mut i64; let _ = s; }\n",
+        ),
+        "cast_ref_to_other_ref": (
+            "fn main() -> i64 { let x: i64 = 1; let r: &i64 = &x; "
+            "let s: &bool = r as &bool; return 0; }\n",
+            "fn main() { let x = 1i64; let r = &x; let s = r as &bool; let _ = s; }\n",
+        ),
+        "cast_bool_to_ref": (
+            "fn main() -> i64 { let b: bool = true; let r: &i64 = b as &i64; return 0; }\n",
+            "fn main() { let b = true; let r = b as &i64; let _ = r; }\n",
+        ),
     }
 
 
