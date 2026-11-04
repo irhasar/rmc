@@ -432,8 +432,17 @@ non-associative recursion keeps both calls.
 Inlining exposes arithmetic that reads only loop-invariant data. After inlining,
 `refs`'s hot loop recomputes the same struct-field sum and the same two-product
 sum every iteration, even though the struct is fixed. `licm.rs` computes each
-such subexpression once, before the loop, and reads the result inside, which
-takes `refs` from 18 ms to 6 ms. It runs after inlining and before codegen.
+such subexpression once, before the loop, and reads the result inside. It runs
+after inlining and before codegen.
+
+A sum needs one extra step. `acc + a + b + c` parses left-associatively, so no
+sub-expression is invariant and the pass would hoist `a`, `b` and `c`
+separately, leaving one dependent add per term in the loop. The pass first
+regroups the invariant terms of a `+` chain into a single sub-sum
+(`acc + (a + b + c)`), which is one hoistable value and one add per iteration.
+That is the reassociation a backend such as LLVM performs, and it is what makes
+the `refs` loop match the Rust one; it is exact for the wrapping arithmetic the
+pass runs on.
 
 The pass only rewrites a loop *body*; a `while` condition and a `for`'s bounds
 run once per iteration by design, so hoisting them would change the loop. Inside

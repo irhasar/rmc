@@ -388,7 +388,45 @@ impl Hoister {
         }
     }
 
+    /// Rewrite `e`, if it is a chain of `+`, so that its invariant terms are
+    /// grouped into one sub-sum. `+` is the only arithmetic the codegen folds
+    /// into an in-place chain, so it is the only one worth regrouping.
+    fn regroup_sum(&mut self, e: &mut Expr) {
+        if !matches!(e, Expr::Bin(BinOp::Add, _, _)) {
+            return;
+        }
+        let terms = collect_add_terms(e);
+        if terms.len() < 2 {
+            return;
+        }
+        let (mut inv, mut rest): (Vec<Expr>, Vec<Expr>) = (Vec::new(), Vec::new());
+        for t in terms {
+            if self.invariant(&t) && scalar(&t) {
+                inv.push(t);
+            } else {
+                rest.push(t);
+            }
+        }
+        // Nothing to gain unless the invariant terms form a real sub-sum.
+        if inv.len() < 2 || rest.is_empty() {
+            return;
+        }
+        let inv_sum = fold_add_terms(inv);
+        let mut combined = rest;
+        combined.push(inv_sum);
+        *e = fold_add_terms(combined);
+    }
+
     fn expr(&mut self, e: &mut Expr) {
+        // Group the invariant terms of a sum before hoisting. `acc + inv_a +
+        // inv_b` parses left-associatively, so no sub-expression is invariant
+        // and the pass would otherwise hoist each term separately, leaving the
+        // loop with one dependent add per term. Regrouping to `acc + (inv_a +
+        // inv_b)` makes the invariant half a single hoistable value, so the loop
+        // does one add per iteration. This is the reassociation a backend such
+        // as LLVM performs, and is what makes a hot accumulation loop compile to
+        // one add per iteration instead of one per invariant operand.
+        self.regroup_sum(e);
         if self.invariant(e) && count_expr(e) >= MIN_NODES && scalar(e) {
             let key = fmt_expr(e);
             if let Some((slot, ty)) = self.seen.get(&key).cloned() {
@@ -484,6 +522,29 @@ impl Hoister {
             _ => false,
         }
     }
+}
+
+/// Flatten a `+` chain into its operands, left to right. A non-`Add` node is a
+/// single term. Only `+` is flattened, so a nested `*` stays one operand.
+fn collect_add_terms(e: &Expr) -> Vec<Expr> {
+    match e {
+        Expr::Bin(BinOp::Add, a, b) => {
+            let mut v = collect_add_terms(a);
+            v.extend(collect_add_terms(b));
+            v
+        }
+        other => vec![other.clone()],
+    }
+}
+
+/// Rebuild a `+` chain from `terms`, left to right, so it nests the same way the
+/// parser would have produced it. Fewer than two terms yields the term itself.
+fn fold_add_terms(mut terms: Vec<Expr>) -> Expr {
+    let mut acc = terms.remove(0);
+    for t in terms {
+        acc = Expr::Bin(BinOp::Add, Box::new(acc), Box::new(t));
+    }
+    acc
 }
 
 /// True when `e` is a scalar value (integer, boolean or reference).
