@@ -2227,6 +2227,35 @@ fn a_recursive_function_is_not_inlined_into_itself() {
 }
 
 #[test]
+fn a_loop_bearing_helper_is_inlined_into_its_caller() {
+    // `gcd` has a `while` loop, but it is call-free and small, so it is still a
+    // candidate: inlining it removes the call from the caller's hot loop. The
+    // loop lives in the caller's frame now, so no `call gcd` remains.
+    let out = asm(
+        "fn gcd(a: i64, b: i64) -> i64 { \
+             let mut x: i64 = a; let mut y: i64 = b; \
+             while y != 0 { let t: i64 = x % y; x = y; y = t; } \
+             return x; } \
+         fn main() -> i64 { return gcd(12, 18); }",
+    );
+    assert!(!out.contains("call gcd"), "the loop-bearing helper is inlined in:\n{out}");
+}
+
+#[test]
+fn a_loop_bearing_helper_with_break_is_not_inlined() {
+    // A `break`/`continue` in a candidate would bind to the *caller's* enclosing
+    // loop once spliced, so a body containing one must stay a real call.
+    let out = asm(
+        "fn first_over(limit: i64) -> i64 { \
+             let mut i: i64 = 0; \
+             while i < 100 { if i > limit { break; } i = i + 1; } \
+             return i; } \
+         fn main() -> i64 { return first_over(3); }",
+    );
+    assert!(out.contains("call first_over"), "the early-exit helper is kept in:\n{out}");
+}
+
+#[test]
 fn no_inline_option_keeps_the_call() {
     let out = asm_no_inline(
         "struct P { x: i64, y: i64 } \

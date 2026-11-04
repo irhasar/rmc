@@ -302,9 +302,13 @@ allocator, and one that never indexes an array carries no bounds trap. The
 run-time picture is mixed and remains the honest weak spot: rmc wins on `hello`
 (3.76×, mostly process startup), `forloops` (1.61×), `sieve` (1.57×), `refs`
 (1.19×), `stats` (1.14×), `mandel` (1.10×), `heap` (1.05×) and `callrec`
-(1.00×), and is at parity on `fib` (0.99×); only `mix` (0.91×) still trails,
-where a `gcd` in a hot loop pays rmc's checked `idiv` sequence while LLVM elides
-the checks. The call-heavy cases (`fib`, `mix`,
+(1.00×), and is at parity on `fib` (0.99×); only `mix` (0.92×) still trails,
+where the inner loop is dominated by `x % y` in `gcd`. Both compilers inline
+`gcd` into `main` (the inliner now accepts a small loop-bearing helper) and both
+emit a 32-bit `div` fast path with a 64-bit `idiv` fallback, so the gap is the
+code around the divide rather than the divide's checks: rmc reloads the bound and
+the swapped operands from the frame each iteration where LLVM keeps them in
+registers. The call-heavy cases (`fib`, `mix`,
 `callrec`) used to lose; they no longer do because the recursion-to-loop pass now
 folds the right spine of a shape like `1 + f(n-1) + f(n-2)`, leaving one call per
 level the way rustc does. That pass is still narrow — one `i64` parameter, an

@@ -1,7 +1,7 @@
 //! Function inlining, run on the AST after semantic analysis and before code
 //! generation.
 //!
-//! Only small, straight-line, scalar functions are inlined. A getter like
+//! Only small, scalar, call-free functions are inlined. A getter like
 //! `Wide::total` is a handful of `add`s around a reference, and the call it
 //! replaces (argument setup, a jump, a return) costs more than the body.
 //! Inlining it also exposes the arithmetic to the code generator's peephole
@@ -14,9 +14,11 @@
 //! * have a scalar or unit return and scalar parameters (a reference is a
 //!   scalar; aggregates are passed and returned by pointer and are left alone),
 //!   and take no `self` by value;
-//! * have a body with no loop, no nested call and no `return` except possibly
-//!   as its last statement (so it is straight-line and inlining cannot add
-//!   control flow or unbounded work);
+//! * have a body with no nested call and no early exit: no `break`, no
+//!   `continue`, and no `return` except possibly as its last statement. A loop
+//!   is allowed - it adds no call and no unbounded work beyond what the callee
+//!   already did, and inlining a small loop-bearing helper like `gcd` removes
+//!   the call from the caller's hot loop;
 //! * be small, at most [`MAX_NODES`] expression nodes.
 //!
 //! Expansion is a slot remap: each inlined call is given a fresh region of the
@@ -119,13 +121,20 @@ impl Cand {
     }
 }
 
-/// True when `s` is straight-line: no loop and no early exit.
+/// True when `s` is call-free with no early exit. A loop is allowed: it adds no
+/// call, and inlining a small loop-bearing helper removes the call from the
+/// caller's hot loop. `break`/`continue` are still rejected - they would bind to
+/// the *caller's* enclosing loop - and so is any `return`, which would return
+/// from the caller. A candidate's sole `return` is split off as its tail by
+/// `Cand::new` before this is consulted.
 fn stmt_ok(s: &Stmt) -> bool {
     match s {
         Stmt::Let { init, .. } => init.as_ref().map_or(true, expr_ok),
         Stmt::Assign { target, value } => expr_ok(target) && expr_ok(value),
         Stmt::Expr(e) => expr_ok(e),
-        Stmt::While(..) | Stmt::Loop(..) | Stmt::For { .. } => false,
+        Stmt::While(c, b) => expr_ok(c) && block_ok(b),
+        Stmt::Loop(b) => block_ok(b),
+        Stmt::For { start, end, body, .. } => expr_ok(start) && expr_ok(end) && block_ok(body),
         Stmt::Return(_) | Stmt::Break | Stmt::Continue => false,
     }
 }
