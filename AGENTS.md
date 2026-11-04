@@ -998,7 +998,16 @@ The README's roadmap lists the intended next steps.
   `k*x + c` for the scales `lea` can express (1, 2, 3, 4, 5, 8, 9) and a constant
   offset, so `2*i+3` becomes one instruction. It is only valid when overflow
   checks are off (a `lea` cannot trap); with `--overflow-checks` it falls through
-  to `gen_expr`, which emits the `jo`. `gen_expr_into_reg(e, dst)` is also the
+  to `gen_expr`, which emits the `jo`.
+- **`x * k` for a small constant `k` is a `lea`, not an `imul`.** The immediate
+  arm of `gen_bin`'s `Mul` calls `lea_mul_scale`: for a positive `k` in
+  {1,2,3,4,5,8,9} it emits one `lea 0(,%rax,scale)` (1 cycle) instead of
+  `imul $k` (3 cycles), and `k == 1` drops the multiply entirely. This is the
+  `2 * zr` in `mandel`'s inner loop — worth ~3% there. It needs the same
+  overflow-checks guard as the `lea_shape` fold, because `lea` sets no flags and
+  `imul`'s `OF` is what the trap test reads. `imul` is still used for a
+  non-`lea` scale (`7 * x`) and for a negative constant (`-2 * x`, where the
+  scale cannot be encoded). `gen_expr_into_reg(e, dst)` is also the
   safe way to materialise an expression straight into a destination register
   during argument setup, and a scalar `let`/assignment writes straight into a
   promoted local's register rather than bouncing through `%rax`.

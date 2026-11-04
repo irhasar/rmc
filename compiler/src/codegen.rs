@@ -2193,6 +2193,13 @@ impl Codegen {
         self.reg_operand(e).map(|r| (r, 1, 0))
     }
 
+    /// The scale for `x * k` when `k` is positive and expressible as a `lea`
+    /// scale (`base + index*scale`), or `None`. `1` means the multiply is the
+    /// identity and can be dropped.
+    fn lea_mul_scale(k: i64) -> Option<i64> {
+        (matches!(k, 1 | 2 | 3 | 4 | 5 | 8 | 9)).then_some(k)
+    }
+
     /// The `lea` source operand computing `k * reg + c`, for the scales `lea`
     /// can express: 1, 2, 3, 4, 5, 8 and 9 (as base + index*scale).
     fn lea_operand(reg: &str, k: i64, c: i64) -> String {
@@ -2310,6 +2317,23 @@ impl Codegen {
                     self.check_overflow();
                 }
                 Mul => {
+                    // `x * k` for a `lea`-expressible `k` is one 1-cycle `lea`;
+                    // `imul $k` is 3 cycles. This needs the same overflow-checks
+                    // guard as the `lea_shape` fold above, because `lea` sets no
+                    // flags and `imul`'s `OF` is what the trap test reads.
+                    if !self.overflow {
+                        match Self::lea_mul_scale(k) {
+                            Some(1) => return Type::I64, // `x * 1` is `x`.
+                            Some(scale) => {
+                                self.line(&format!(
+                                    "lea {}, %rax",
+                                    Self::lea_operand("%rax", scale, 0)
+                                ));
+                                return Type::I64;
+                            }
+                            None => {}
+                        }
+                    }
                     self.line(&format!("imul ${k}, %rax, %rax"));
                     self.check_overflow();
                 }
