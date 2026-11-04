@@ -231,6 +231,14 @@ Rust panic. Division by zero always traps at the CPU level.
   in Rust: an arm must be `_` (or a binding name), or the arms must name *every*
   variant of one enum. A non-exhaustive `match` is rejected with an error even
   when it stands alone as a statement, since rustc rejects it there too.
+- `if let PAT = EXPR { .. } else { .. }`, sugar for
+  `match EXPR { PAT => then, _ => else_or_unit }`. It reuses the `match` pattern
+  grammar, but unlike `match` it need not be exhaustive: a non-matching value
+  falls through to the `_` arm. An `else` is optional; with none and a non-unit
+  `then`, the branch types differ and the program is rejected, exactly as rustc
+  rejects it — including when the pattern is irrefutable (`if let y = o { 1 }`
+  with no `else` is an error). `else if let` chains, and `if let` in value
+  position, work like `if`.
 - String literals, given their own type (a pointer to a `{len, bytes}` record).
   A string is not an `i64`: it cannot be an arithmetic operand and cannot be
   passed where an `i64` is expected. The only thing to do with one is pass it to

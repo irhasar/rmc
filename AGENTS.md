@@ -59,6 +59,21 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   so sema and codegen have no `match` case. A non-`Var`/`Int` scrutinee is bound
   to a hidden `let` first, so a call in the scrutinee runs once. An arm after
   `_` is unreachable and dropped (the `_` body becomes the `else`).
+  `if let PAT = EXPR { .. } else { .. }` is parsed here too and desugared by
+  `desugar_if_let` into a two-arm `match` (`PAT => then, _ => else_or_unit`),
+  reusing `desugar_match_arms` and the `parse_pattern` shared with `match` arms,
+  so sema and codegen gain no new case. The `_` fallback arm is what makes an
+  `if let` need not be exhaustive; a non-unit `then` with no `else` then trips
+  the ordinary branch-type check, as in rustc. But note the two desugarings
+  differ in how an *irrefutable* arm (`_` or a binding) treats what follows it.
+  `match` drops the dead arms, as before. `if let` must not: rustc type-checks
+  the dead `else` and rejects `if let y = o { 1 } else { }` (E0308), so
+  `desugar_match_arms` takes a `check_dead_arms` flag and `irrefutable_arm`
+  wraps the dead arm in `if true { body } else { rest }` to carry that check
+  through the ordinary branch-type rule. Dropping the dead `else` for `if let`
+  accepts a program rustc rejects; wrapping the dead arms for `match` instead
+  rejects a program rustc accepts (`match o { _ => 5, 3 => 9 }` in value
+  position), which is why the flag exists.
 - `compiler/src/ast.rs` — AST and `Type` (`I64`, `Bool`, `Str`, `Unit`, `Array`,
   `Struct`, and the parser-only placeholder `Named`). `Str` is the type of a
   string literal: one slot holding a pointer to NUL-terminated static data. It
@@ -436,8 +451,10 @@ inferred aggregates, nested fields, indexing a returned array), `cmpsem`
 struct-literal field order), `utf8` (non-ASCII string literals), `inlmulti`
 (a callee that assigns its parameter, a non-trivial argument evaluated once, and
 nested inlining with a call argument), `assignorder` (value-before-place
-assignment order, plain and compound) and `licmref` (a field read that must not
-be hoisted past a `&mut` store in the loop) guard the
+assignment order, plain and compound), `licmref` (a field read that must not
+be hoisted past a `&mut` store in the loop) and `iflet` (the `if let`
+desugaring: integer, binding, payload-binding, `else if let` chain,
+side-effecting scrutinee, and value position) guard the
 front-end/codegen fixes below. When adding a case, add both twins, write
 them to behave identically, and remember that `rustc` infers `i32` for unsuffixed
 literals, so large literals need an `i64` suffix on the Rust side. `args.json`
@@ -659,7 +676,9 @@ deep copy (`let mut o1 = o0`) and a nested-path write (`o1.mid.f = ...`,
 struct plain `i64` fields, so the field-offset arithmetic for a nested path and
 the aggregate copy were never generated. `pat` mode builds `match`
 expressions: a multi-variant unit enum, a variant with two payload fields, a
-binding pattern, a negative literal, a nested `match`, and a non-trivial
+binding pattern, a negative literal, a nested `match`, an `if let` (integer,
+binding, payload-binding, `else if let` chain and a side-effecting scrutinee),
+and a non-trivial
 side-effecting scrutinee (a call) tested against several arms — the last is
 what exercises `desugar_match`'s temporary, which must evaluate the scrutinee
 exactly once (re-evaluating it per arm repeats a side effect). It compares

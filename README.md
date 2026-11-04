@@ -123,8 +123,8 @@ small inlined helpers (the shapes the other two do not emit), `arith` for
 overflowing arithmetic near `i64::MAX` (the only mode that makes the
 `--overflow-checks` trap fire), `nest` for nested aggregates with a deep copy
 and a nested-path write, `pat` for `match` expressions (multi-variant enums,
-two-field payloads, `bool` matches, binding patterns, nested matches, and a
-side-effecting scrutinee), and `order` for assignment evaluation order (a
+two-field payloads, `bool` matches, binding patterns, nested matches, `if let`,
+and a side-effecting scrutinee), and `order` for assignment evaluation order (a
 side-effecting index and value on both `=` and every compound operator, the
 shapes `stmt` never assigns through). Every program is recompiled with each optimiser pass off in turn.
 Seeds are reproducible, so a failure can be re-run and shrunk.
@@ -183,7 +183,8 @@ functions with up to six parameters; `let` / `let mut`; assignment to variables,
 array elements and struct fields (including compound `+=` and friends);
 `if`/`else`, `while`, `loop`, and `for i in a..b`; `match` on integers,
 `bool`s and enums (literal, `true`/`false`, `Enum::Variant` and `_` patterns,
-plus payload bindings and binding names); `break`, `continue`,
+plus payload bindings and binding names) and `if let` with the same patterns
+(desugared to a two-arm `match`); `break`, `continue`,
 `return`; arithmetic, comparison, bitwise (`!`/`&`/`|`/`^`) and shift (`<<`/`>>`)
 operators; `&&`/`||`; string literals; `mut` enforcement and definite
 initialisation; references (`&T` / `&mut T`, `&e`, `*e`,

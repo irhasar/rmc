@@ -520,6 +520,12 @@ def gen_pat_program(rng):
         "fn area(s: Shape) -> i64 { return match s { Shape::Dot => 0, Shape::Line(w) => w, Shape::Rect(w, h) => w * h }; }",
         "struct S { a: i64, b: i64 }",
         f"fn fscr(s: S) -> i64 {{ return match s.b {{ {v} => 20, _ => 0 }}; }}",
+        f"fn iflet_int(x: i64) -> i64 {{ if let {v} = x {{ 50 }} else {{ 60 }} }}",
+        "fn iflet_bind(x: i64) -> i64 { if let y = x { y + 1 } else { 0 } }",
+        f"fn iflet_side(k: i64) -> i64 {{ if let {v} = side(k) {{ 5 }} else {{ 7 }} }}",
+        f"fn iflet_color(c: Color) -> i64 {{ if let Color::{colors[0]} = c {{ 1 }} else {{ 2 }} }}",
+        "fn iflet_rect(s: Shape) -> i64 { if let Shape::Rect(w, h) = s { w * h } else { 0 } }",
+        f"fn iflet_chain(x: i64) -> i64 {{ if let {v} = x {{ 10 }} else if let {v + 1} = x {{ 20 }} else {{ 30 }} }}",
         "fn main() -> i64 {",
         "    let mut acc: i64 = 0;",
         f"    let arr: [i64; 4] = [{a0}, {a1}, {v}, {k}];",
@@ -534,6 +540,8 @@ def gen_pat_program(rng):
         "        acc = acc + nested(i % 3);",
         "        acc = acc + bmatch(i % 2 == 0);",
         f"        acc = acc + bmatch(side(i) > {v});",
+        "        acc = acc + iflet_int(i) + iflet_bind(i) + iflet_side(i) + iflet_chain(i);",
+        "        acc = acc + iflet_color(c) + iflet_rect(s);",
         "        i = i + 1;",
         "    }",
         "    print_i64(acc);",
@@ -559,6 +567,12 @@ def gen_pat_program(rng):
         "#[derive(Copy, Clone)]",
         "struct S { a: i64, b: i64 }",
         f"fn fscr(s: S) -> i64 {{ match s.b {{ {v} => 20, _ => 0 }} }}",
+        f"fn iflet_int(x: i64) -> i64 {{ if let {v} = x {{ 50 }} else {{ 60 }} }}",
+        "fn iflet_bind(x: i64) -> i64 { if let y = x { y + 1 } else { 0 } }",
+        f"fn iflet_side(k: i64) -> i64 {{ if let {v} = side(k) {{ 5 }} else {{ 7 }} }}",
+        f"fn iflet_color(c: Color) -> i64 {{ if let Color::{colors[0]} = c {{ 1 }} else {{ 2 }} }}",
+        "fn iflet_rect(s: Shape) -> i64 { if let Shape::Rect(w, h) = s { w * h } else { 0 } }",
+        f"fn iflet_chain(x: i64) -> i64 {{ if let {v} = x {{ 10 }} else if let {v + 1} = x {{ 20 }} else {{ 30 }} }}",
         "fn main() {",
         "    let mut acc: i64 = 0;",
         f"    let arr: [i64; 4] = [{a0}, {a1}, {v}, {k}];",
@@ -573,6 +587,8 @@ def gen_pat_program(rng):
         "        acc += nested(i % 3);",
         "        acc += bmatch(i % 2 == 0);",
         f"        acc += bmatch(side(i) > {v});",
+        "        acc += iflet_int(i) + iflet_bind(i) + iflet_side(i) + iflet_chain(i);",
+        "        acc += iflet_color(c) + iflet_rect(s);",
         "        i += 1;",
         "    }",
         '    println!("{}", acc);',
@@ -1069,6 +1085,22 @@ def reject_corpus():
         "cast_bool_to_ref": (
             "fn main() -> i64 { let b: bool = true; let r: &i64 = b as &i64; return 0; }\n",
             "fn main() { let b = true; let r = b as &i64; let _ = r; }\n",
+        ),
+        # `if let` is sugar for `match`, but unlike `match` it need not be
+        # exhaustive. What it may *not* do is have a non-unit `then` with no
+        # `else` (E0308): the fall-through `_` arm is `()`, so the branch types
+        # differ. rmc must reject it too.
+        "iflet_nonunit_without_else": (
+            "fn main() -> i64 { let o: i64 = 3; if let 3 = o { 1 } return 0; }\n",
+            "fn main() { let o = 3i64; if let 3 = o { 1 } }\n",
+        ),
+        # An *irrefutable* pattern makes the fall-through `_` arm dead, but rustc
+        # still type-checks it: a non-unit `then` with a `()` fallback is
+        # rejected. The `if true` wrapper in `irrefutable_arm` is what carries
+        # this check; dropping the dead arm (as for `match`) would accept it.
+        "iflet_irrefutable_nonunit_without_else": (
+            "fn main() -> i64 { let o: i64 = 3; if let y = o { 1 } return 0; }\n",
+            "fn main() { let o = 3i64; if let y = o { 1 } }\n",
         ),
     }
 
