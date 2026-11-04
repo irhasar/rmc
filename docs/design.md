@@ -230,7 +230,10 @@ where a frame slot does not.
 
 **Hot locals** are promoted: `promote` counts how often each scalar local is
 mentioned, takes the top five, and assigns them `%rbx`, `%r12`–`%r15` for the
-whole function.
+whole function. The counts are a sparse map keyed by slot, not a table over
+every slot: an array's element slots are never named, so a 200k-element array
+would otherwise make the pass O(length) for no promotion it could not already
+reject.
 
 **Spill temporaries** — the values that must outlive a subexpression, such as
 the first recursive result in `fib`'s `fib(n-1) + fib(n-2)` — go to registers
@@ -539,7 +542,10 @@ fixpoint. So a program that never allocates carries no allocator, one that never
 indexes an array carries no bounds trap, and one that never divides carries
 neither divide trap. Symbol matching is word-boundary aware and strips `#`
 comments, so `free` does not match inside `__rmc_freelist` or in `alloc`'s
-comment. On a binary this small the dropped pieces are a large fraction of the
+comment. The piece texts are static, so their identifier sets are computed once
+and cached; the generated assembly is tokenised once and each symbol looked up
+in the set. Scanning every piece's text for every symbol instead is
+O(text × symbols) and dominated compile time. On a binary this small the dropped pieces are a large fraction of the
 artifact: `hello` shrank from 3304 to 1384 bytes, and every benchmark artifact
 lost 42–58%.
 

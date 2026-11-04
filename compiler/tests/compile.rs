@@ -239,7 +239,7 @@ fn large_array_compiles_in_linear_time() {
     let out = compile_to_asm(&src, &CompileOptions::default()).unwrap();
     assert!(out.contains("main:"));
     assert!(
-        t.elapsed().as_secs_f64() < 2.0,
+        t.elapsed().as_secs_f64() < 0.5,
         "compiling a 200k-element array took {:?}",
         t.elapsed()
     );

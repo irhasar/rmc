@@ -22,14 +22,14 @@ The point of the experiment is to measure the trade-off at the extremes:
 
 `rmc` wins big on compile time, compiler memory, and artifact size, and those
 three are the point of the experiment. Because it links in-process rather than
-forking `as` and `ld`, a small program compiles in about 1.3 ms against rustc's
-~2.1 s. On **runtime** the result is mixed and program-dependent: rmc is at
-parity or ahead on almost the whole suite (`hello` 3.1×, `sieve` 1.6×, `refs`
-1.2×, `stats` 1.1×, `mandel` 1.1×, `heap` 1.05×), ties on `fib` and `callrec`,
-and loses slightly on `mix` (0.92×), but several of those are within run-to-run
-noise, and a call-heavy shape the recursion-to-loop pass does not match would
-lose. It is not uniformly faster and there is no single speedup number;
-`bench/RESULTS.md` reports the per-program ratio.
+forking `as` and `ld`, a small program compiles in about 1.3–1.9 ms against
+rustc's ~2.1 s. On **runtime** the result is mixed and program-dependent: rmc is
+at parity or ahead on most of the suite (`hello` 2.6×, `sieve` 1.5×, `refs`
+1.2×, `mandel` 1.1×), roughly ties on `fib`, `heap` and `callrec`, and loses
+slightly on `mix` (0.92×) and `stats` (0.88×). Several of those are within
+run-to-run noise, and a call-heavy shape the recursion-to-loop pass does not
+match would lose. It is not uniformly faster and there is no single speedup
+number; `bench/RESULTS.md` reports the per-program ratio.
 
 The artifact-size comparison depends entirely on which rustc build is the
 reference. Against a plain `rustc -O` (which statically links libstd, the panic

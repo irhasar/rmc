@@ -13,6 +13,7 @@
 
 use crate::ast::*;
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 pub struct Codegen {
@@ -568,9 +569,11 @@ impl Codegen {
     /// base slot (its last field, whose address is the struct's own base) and
     /// any aggregate field always stay in memory.
     fn promote(f: &FnDef) -> Vec<(i32, &'static str)> {
-        let n = f.nslots as usize;
-        let mut counts = vec![0u32; n];
-        let mut mem = vec![false; n];
+        // Sparse maps: a local that is never named never gets a key, so a
+        // function with one large array does not pay for a dense table over
+        // every element slot (which is what made codegen O(array length)).
+        let mut counts: HashMap<i32, u32> = HashMap::new();
+        let mut mem: HashSet<i32> = HashSet::new();
         // Structs used as a whole value, recorded as (base slot, field count).
         let mut copied: Vec<(i32, i32)> = Vec::new();
         // `let`-declared aggregates, which are copied as a whole unless their
@@ -584,9 +587,7 @@ impl Codegen {
             if pty.is_aggregate() {
                 let base = f.param_slots[i];
                 for k in 0..(pty.size() / 8) as i32 {
-                    if let Some(m) = mem.get_mut((base + k) as usize) {
-                        *m = true;
-                    }
+                    mem.insert(base + k);
                 }
             }
         }
@@ -595,9 +596,7 @@ impl Codegen {
         // written through memory, so none of its fields may be promoted.
         for (base, fields) in &copied {
             for k in 0..*fields {
-                if let Some(m) = mem.get_mut((base + k) as usize) {
-                    *m = true;
-                }
+                mem.insert(base + k);
             }
         }
 
@@ -606,15 +605,14 @@ impl Codegen {
         for t in &let_tmps {
             if !t.by_field {
                 for k in 0..t.fields {
-                    if let Some(m) = mem.get_mut((t.slot + k) as usize) {
-                        *m = true;
-                    }
+                    mem.insert(t.slot + k);
                 }
             }
         }
 
-        let mut ranked: Vec<(i32, u32)> = (0..f.nslots)
-            .map(|s| (s, if mem[s as usize] { 0 } else { counts[s as usize] }))
+        let mut ranked: Vec<(i32, u32)> = counts
+            .iter()
+            .map(|(&s, &c)| (s, if mem.contains(&s) { 0 } else { c }))
             .collect();
         ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         ranked
@@ -628,8 +626,8 @@ impl Codegen {
 
     fn count_block(
         b: &Block,
-        counts: &mut Vec<u32>,
-        mem: &mut Vec<bool>,
+        counts: &mut HashMap<i32, u32>,
+        mem: &mut HashSet<i32>,
         copied: &mut Vec<(i32, i32)>,
         whole: bool,
         let_tmps: &mut Vec<LetTarget>,
@@ -644,8 +642,8 @@ impl Codegen {
 
     fn count_stmt(
         s: &Stmt,
-        counts: &mut Vec<u32>,
-        mem: &mut Vec<bool>,
+        counts: &mut HashMap<i32, u32>,
+        mem: &mut HashSet<i32>,
         copied: &mut Vec<(i32, i32)>,
         _whole: bool,
         let_tmps: &mut Vec<LetTarget>,
@@ -671,16 +669,10 @@ impl Codegen {
                             by_field,
                         });
                     }
-                    Some(Type::Array(elem, n)) => {
-                        // A splat or zero-fill writes each element; a copy does
-                        // not, and an aggregate element is never splatted.
-                        let by_field = matches!(init, None | Some(Expr::ArrayLit(..)))
-                            && !elem.is_aggregate();
-                        let_tmps.push(LetTarget {
-                            slot: *slot,
-                            fields: *n as i32,
-                            by_field,
-                        });
+                    Some(Type::Array(..)) => {
+                        // Like any array, only the base slot can be named, so
+                        // only it must stay in memory.
+                        mem.insert(*slot);
                     }
                     // A payload enum is a tagged union copied word by word, so
                     // its words stay in memory like a whole struct.
@@ -722,14 +714,20 @@ impl Codegen {
 
     /// Marks every local that a `&` reaches as needing memory, so its frame
     /// slot stays current and `lea` yields a valid address.
-    fn mark_addressed(e: &Expr, mem: &mut Vec<bool>) {
+    fn mark_addressed(e: &Expr, mem: &mut HashSet<i32>) {
         match e {
             Expr::Var { slot, ty, .. } => {
-                let n = if ty.is_aggregate() { (ty.size() / 8).max(1) } else { 1 };
+                // An array's address is its base slot's; its elements are
+                // reached relative to that base and are never promoted.
+                let n = if matches!(ty, Type::Array(..)) {
+                    1
+                } else if ty.is_aggregate() {
+                    (ty.size() / 8).max(1)
+                } else {
+                    1
+                };
                 for k in 0..n as i32 {
-                    if let Some(m) = mem.get_mut((*slot + k) as usize) {
-                        *m = true;
-                    }
+                    mem.insert(*slot + k);
                 }
             }
             Expr::Field { base, .. } => Self::mark_addressed(base, mem),
@@ -745,8 +743,8 @@ impl Codegen {
     /// `Index` base is not a whole use, so it is passed `false`.
     fn count_expr(
         e: &Expr,
-        counts: &mut Vec<u32>,
-        mem: &mut Vec<bool>,
+        counts: &mut HashMap<i32, u32>,
+        mem: &mut HashSet<i32>,
         copied: &mut Vec<(i32, i32)>,
         whole: bool,
         let_tmps: &mut Vec<LetTarget>,
@@ -761,9 +759,7 @@ impl Codegen {
                 }
                 // The ctor yields its own address, so its words stay in memory.
                 for k in 0..(*size / 8) as i32 {
-                    if let Some(m) = mem.get_mut((*slot + k) as usize) {
-                        *m = true;
-                    }
+                    mem.insert(*slot + k);
                 }
             }
             // A tag test reads the value's first word, and a payload read
@@ -780,19 +776,22 @@ impl Codegen {
                 let _ = ty;
             }
             Expr::Var { slot, ty, .. } => {
-                counts[*slot as usize] += 1;
+                *counts.entry(*slot).or_insert(0) += 1;
                 if ty.is_aggregate() {
                     match ty {
                         Type::Array(..) => {
-                            for k in 0..(ty.size() / 8) as i32 {
-                                mem[(*slot + k) as usize] = true;
-                            }
+                            // An array is only ever reached through its base
+                            // address, so its base slot must stay in memory.
+                            // Element slots are never counted (nothing names
+                            // them) and so are never promoted; marking them
+                            // here would be O(length) per mention for no gain.
+                            mem.insert(*slot);
                         }
                         Type::Struct(_, size) | Type::EnumData(_, size) => {
                             // The base slot is the value's last word, whose
                             // address is the value's own base, so it must stay
                             // addressable.
-                            mem[*slot as usize] = true;
+                            mem.insert(*slot);
                             if whole {
                                 copied.push((*slot, (*size / 8) as i32));
                             }
@@ -813,10 +812,10 @@ impl Codegen {
                     if fslot >= 0 {
                         if ty.is_aggregate() {
                             for k in 0..(ty.size() / 8) as i32 {
-                                mem[(fslot - k) as usize] = true;
+                                mem.insert(fslot - k);
                             }
                         } else {
-                            counts[fslot as usize] += 1;
+                            *counts.entry(fslot).or_insert(0) += 1;
                         }
                     }
                 }
@@ -831,9 +830,7 @@ impl Codegen {
                 // already marked whole by that `let`.
                 let n = fields.len() as i32;
                 for k in 0..n {
-                    if let Some(m) = mem.get_mut((*slot + k) as usize) {
-                        *m = true;
-                    }
+                    mem.insert(*slot + k);
                 }
             }
             Expr::Bin(_, a, b) => {
@@ -854,9 +851,7 @@ impl Codegen {
                 Self::count_expr(expr, counts, mem, copied, false, let_tmps);
                 if *slot >= 0 {
                     for k in 0..(ty.size() / 8).max(1) as i32 {
-                        if let Some(m) = mem.get_mut((*slot + k) as usize) {
-                            *m = true;
-                        }
+                        mem.insert(*slot + k);
                     }
                 }
             }
