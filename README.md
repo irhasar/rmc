@@ -121,9 +121,11 @@ loops, conditionals, `match`, arrays and aggregate calls (including argument
 evaluation order), `opt` for a self-recursive function, an invariant loop and
 small inlined helpers (the shapes the other two do not emit), `arith` for
 overflowing arithmetic near `i64::MAX` (the only mode that makes the
-`--overflow-checks` trap fire), and `nest` for nested aggregates with a deep
-copy and a nested-path write. Every program is recompiled with each optimiser
-pass off in turn. Seeds are reproducible, so a failure can be re-run and shrunk.
+`--overflow-checks` trap fire), `nest` for nested aggregates with a deep copy
+and a nested-path write, and `pat` for `match` expressions (multi-variant enums,
+two-field payloads, binding patterns, nested matches, and a side-effecting
+scrutinee). Every program is recompiled with each optimiser pass off in turn.
+Seeds are reproducible, so a failure can be re-run and shrunk.
 
 ```sh
 python3 tools/fuzz.py --mode expr --n 500 --seed 1
@@ -131,6 +133,7 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
 python3 tools/fuzz.py --mode opt --n 500 --seed 1
 python3 tools/fuzz.py --mode arith --n 500 --seed 1
 python3 tools/fuzz.py --mode nest --n 500 --seed 1
+python3 tools/fuzz.py --mode pat --n 500 --seed 1
 # also exercise the trap codegen: --bounds-checks and --overflow-checks runs
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 python3 tools/fuzz.py --mode robust
