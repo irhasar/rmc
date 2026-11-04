@@ -254,6 +254,17 @@ def gen_stmt_program(rng):
     rs.append("        i += 1;")
     rms += ["    }"]
     rs += ["    }"]
+    # A `for` range over i64 variables, exclusive or inclusive. The bounds are
+    # named `i64` locals so Rust does not default the literals to `i32`; that
+    # also exercises a non-literal bound and `..=`'s strict exit test.
+    fa, fb = rng.randint(-3, 3), rng.randint(-3, 3)
+    op = rng.choice(["..", "..="])
+    rms.append(f"    let fa: i64 = {fa};")
+    rs.append(f"    let fa: i64 = {fa};")
+    rms.append(f"    let fb: i64 = {fb};")
+    rs.append(f"    let fb: i64 = {fb};")
+    rms.append(f"    for fi in fa{op}fb {{ acc = acc + fi * 3; }}")
+    rs.append(f"    for fi in fa{op}fb {{ acc += fi * 3; }}")
     # A bool array built from a list literal, then counted. Guards the
     # list-literal element-type inference and bool indexing.
     rms.append("    let flags: [bool; 4] = [true, false, i < 1, true];")

@@ -343,6 +343,12 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   is *not* rotated while `while` is: its increment sits between the body and the
   guard, so a rotated form would run the increment before the first body
   iteration (skipping it) or need the guard duplicated.
+- **`..=` exits on `jg`, not `jge`.** The bound is stored in a hidden slot and
+  compared against the counter; the inclusive form must still run the body when
+  `var == end`, so its exit test is strict (`jg`). `forloop.rms` and
+  `an_inclusive_range_uses_a_strict_exit_test` pin both bounds, and `..=` is a
+  three-character token, so it must be lexed in the three-char table (before
+  `..`), or it lexes as `..` then `=`.
 - **`while` is rotated.** The test is emitted at the bottom as the back edge
   (`gen_branch_true`, a `jl`/`jne`) with an entry `jmp` reusing the same test, so
   an iteration is one branch fewer than the top-tested form. `continue` targets

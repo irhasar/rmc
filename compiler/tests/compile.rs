@@ -104,6 +104,17 @@ fn for_loop_has_a_continue_label() {
 }
 
 #[test]
+fn an_inclusive_range_uses_a_strict_exit_test() {
+    // `0..=3` must run with `i == 3`, so the guard exits on `var > end` (`jg`),
+    // not on `var >= end` (`jge`). The exclusive form keeps `jge`.
+    let incl = asm("fn main() -> i64 { let mut s: i64 = 0; for i in 0..=3 { s = s + i; } return s; }");
+    assert!(incl.contains("jg "), "inclusive range exits strictly");
+    assert!(!incl.contains("jge "), "inclusive range must not use jge");
+    let excl = asm("fn main() -> i64 { let mut s: i64 = 0; for i in 0..3 { s = s + i; } return s; }");
+    assert!(excl.contains("jge "), "exclusive range still uses jge");
+}
+
+#[test]
 fn compound_assignment_expands() {
     // `x += 4` folds into a single `lea` when the target is register-resident,
     // and otherwise into an `add`. Either is the expansion; what matters is

@@ -622,10 +622,15 @@ impl Parser {
                 let var = self.expect_ident()?;
                 self.expect(Tok::In)?;
                 let start = self.parse_cond()?;
-                self.expect(Tok::DotDot)?;
+                let inclusive = if self.eat(&Tok::DotDotEq) {
+                    true
+                } else {
+                    self.expect(Tok::DotDot)?;
+                    false
+                };
                 let end = self.parse_cond()?;
                 let body = self.parse_block()?;
-                Ok(Stmt::For { var, var_slot: -1, start, end, end_slot: -1, body })
+                Ok(Stmt::For { var, var_slot: -1, start, end, end_slot: -1, inclusive, body })
             }
             Some(Tok::Return) => {
                 self.i += 1;

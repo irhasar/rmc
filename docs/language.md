@@ -171,6 +171,7 @@ x;                       // expression statement
 if cond { ... } else { ... }
 while cond { ... }
 for i in 0..10 { ... }   // i64 range, end exclusive
+for i in 0..=10 { ... }  // i64 range, end inclusive
 loop { ... }
 break;
 continue;

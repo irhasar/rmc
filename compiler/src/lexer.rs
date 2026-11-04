@@ -70,6 +70,7 @@ pub enum Tok {
     Bang,
     Dot,
     DotDot,
+    DotDotEq,
     PlusEq,
     MinusEq,
     StarEq,
@@ -151,6 +152,7 @@ impl Tok {
             Tok::Bang => "!",
             Tok::Dot => ".",
             Tok::DotDot => "..",
+            Tok::DotDotEq => "..=",
             Tok::PlusEq => "+=",
             Tok::MinusEq => "-=",
             Tok::StarEq => "*=",
@@ -343,6 +345,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             match &bytes[i..i + 3] {
                 b"<<=" => Some(Tok::ShlEq),
                 b">>=" => Some(Tok::ShrEq),
+                b"..=" => Some(Tok::DotDotEq),
                 _ => None,
             }
         } else {
