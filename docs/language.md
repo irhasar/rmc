@@ -173,8 +173,11 @@ Array indices are `i64` and are unchecked by default, as in C. Compiling with
 `--bounds-checks` (or `CompileOptions { bounds_checks: true }`) checks every
 *variable* index against the array's length; an out-of-range index writes
 `rmc: index out of bounds` to stderr and exits with status 101. A *constant*
-index outside the array (including a negated one, `a[-1]`) is rejected at
-compile time whether or not `--bounds-checks` is set, matching rustc.
+index outside the array (including a negated one, `a[-1]`, and one held in a
+constant local, `let i = -1; a[i]`) is rejected at compile time whether or not
+`--bounds-checks` is set, matching rustc. A local counts as constant only when
+it is assigned at most once and never taken by `&mut`, the same rule rustc uses,
+so `let mut i = -1; i = 0; a[i]` stays a runtime (checked) index.
 
 By default integer arithmetic wraps, as in release-mode Rust. Compiling with
 `--overflow-checks` (or `CompileOptions { overflow_checks: true }` from the

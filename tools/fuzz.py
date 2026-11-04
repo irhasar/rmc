@@ -54,7 +54,11 @@ def gen_expr(rng, depth):
     op = rng.choice(EXPR_OPS)
     if op in ("<<", ">>"):
         left = gen_i64(rng, depth + 1)
-        right = gen_i64(rng, depth + 1)
+        # Bound the count to 0..63 so it is a valid `i64` shift. Otherwise a
+        # constant local (or one rustc folds through) can be negative or >= 64,
+        # which rustc denies; rmc now folds constant locals too and would reject
+        # the program, which is correct but not a differential signal.
+        right = f"({gen_i64(rng, depth + 1)} & 63)"
     else:
         left = gen_expr(rng, depth + 1)
         right = gen_expr(rng, depth + 1)
@@ -80,7 +84,12 @@ def gen_i64(rng, depth):
     if depth >= 3 or rng.random() < 0.5:
         return rng.choice(["a", "b", "c", f"h({gen_expr(rng, depth + 1)})"])
     op = rng.choice(EXPR_OPS)
-    return f"({gen_i64(rng, depth + 1)} {op} {gen_i64(rng, depth + 1)})"
+    right = gen_i64(rng, depth + 1)
+    if op in ("<<", ">>"):
+        # Keep the count in 0..63, a valid `i64` shift; see the note in
+        # `gen_expr`.
+        right = f"({right} & 63)"
+    return f"({gen_i64(rng, depth + 1)} {op} {right})"
 
 
 def gen_expr_program(rng):
@@ -525,6 +534,27 @@ def reject_corpus():
             "fn main() -> i64 { let a: [i64; 2] = [1, 2]; return a[1 + 4]; }\n",
             "fn main() -> i64 { let a = [1i64, 2]; a[1 + 4] }\n",
         ),
+        # A constant *local* used as an index must fold too. rustc's constant
+        # propagation knows `i`'s value, so it denies the out-of-range index;
+        # rmc used to read past the array (the memory-safety gap).
+        "const_local_index_oob": (
+            "fn main() -> i64 { let a: [i64; 2] = [1, 2]; let i: i64 = -1; return a[i]; }\n",
+            "fn main() { let a = [1i64, 2]; let i: i64 = -1; println!(\"{}\", a[i as usize]); }\n",
+        ),
+        "const_local_index_expr_oob": (
+            "fn main() -> i64 { let a: [i64; 2] = [1, 2]; let i: i64 = 1 - 3; return a[i]; }\n",
+            "fn main() { let a = [1i64, 2]; let i: i64 = 1 - 3; println!(\"{}\", a[i as usize]); }\n",
+        ),
+        # A constant local that overflows or divides by zero is folded like a
+        # literal (E0080 in rustc).
+        "const_local_overflow": (
+            "fn main() -> i64 { let x: i64 = 9223372036854775807; let y: i64 = x + 1; return y; }\n",
+            "fn main() { let x = 9223372036854775807i64; let y = x + 1; let _ = y; }\n",
+        ),
+        "const_local_div_zero": (
+            "fn main() -> i64 { let d: i64 = 0; let y: i64 = 1 / d; return y; }\n",
+            "fn main() { let d = 0i64; let y = 1i64 / d; let _ = y; }\n",
+        ),
         # A reference may only be cast to a reference of the same type, may not
         # gain mutability, and may not become a scalar (E0605/E0606). rmc's
         # `i64 as &T` raw pointer cast is a documented extension and stays.
@@ -612,6 +642,12 @@ def main():
         open(f"{tmp}/p.rs", "w").write(rs)
         c = run([RMC, f"{tmp}/p.rms", "-o", f"{tmp}/p.bin"])
         if c.returncode != 0:
+            # rmc rejects the program. If rustc rejects it too the generator
+            # produced an ill-formed program (a constant shift or overflow that
+            # rmc now folds), so skip it; only an rmc-only rejection is a bug.
+            r = run([RUSTC, "-O", "-A", "warnings", "--edition", "2021", f"{tmp}/p.rs", "-o", f"{tmp}/q.bin"])
+            if r.returncode != 0:
+                continue
             print(f"[{args.mode} seed={args.seed} iter={t}] rmc failed to compile:\n{rms}\n{c.stderr.decode(errors='replace')}")
             failures += 1
             break

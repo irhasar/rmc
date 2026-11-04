@@ -96,10 +96,13 @@ def check_bounds_traps():
     # index before the bounds check, so `make()[2]` must print before it exits.
     # A constant index out of range is rejected at compile time, so every
     # runtime trap uses a variable index (the value is known but not a literal).
+    # The index is a parameter, so it is not a constant local: rmc would fold
+    # `let i = 9` (matching rustc, which rejects it), leaving the runtime path
+    # unreachable. A parameter value is only known at run time.
     cases = {
-        "block": ("fn main() -> i64 { let i: i64 = 9; let v: i64 = { let t: [i64; 3] = [10, 20, 30]; t }[i]; return v; }", b""),
-        "call": ("fn make() -> [i64; 3] { let a: [i64; 3] = [10, 20, 30]; return a; } fn main() -> i64 { let i: i64 = 10; return make()[i]; }", b""),
-        "base_effect": ("fn make() -> [i64; 1] { print_i64(7); return [4]; } fn main() -> i64 { let i: i64 = 2; return make()[i]; }", b"7\n"),
+        "block": ("fn f(i: i64) -> i64 { let v: i64 = { let t: [i64; 3] = [10, 20, 30]; t }[i]; return v; } fn main() -> i64 { return f(9); }", b""),
+        "call": ("fn make() -> [i64; 3] { let a: [i64; 3] = [10, 20, 30]; return a; } fn f(i: i64) -> i64 { return make()[i]; } fn main() -> i64 { return f(10); }", b""),
+        "base_effect": ("fn make() -> [i64; 1] { print_i64(7); return [4]; } fn f(i: i64) -> i64 { return make()[i]; } fn main() -> i64 { return f(2); }", b"7\n"),
     }
     failures = 0
     for name, (src, want_stdout) in cases.items():
