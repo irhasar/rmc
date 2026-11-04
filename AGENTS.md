@@ -102,8 +102,9 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   `PIECES`; `for_program(user_asm)` links only the pieces the program reaches
   (see "Runtime pruning" below).
 - `compiler/src/main.rs` — CLI: reads source, calls the library, runs `as`/`ld`.
-  Flags: `--emit-asm`, `--keep-asm`, `--no-strip`, `--overflow-checks`,
-  `--bounds-checks`, `--no-inline`, `--no-licm`, `--no-tco`.
+  Flags: `--emit-asm`, `--keep-asm`, `--no-strip`, `--min-size`,
+  `--overflow-checks`, `--bounds-checks`, `--no-inline`, `--no-licm`,
+  `--no-tco`.
 - `compiler/tests/compile.rs` — unit tests for the front end and codegen; these
   run without `as`/`ld`.
 
@@ -418,8 +419,13 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   `-z noexecstack` is needed. `--strip-all` drops the symbol and section-name
   tables, which at this size are about a third of the artifact (1376 → 888 bytes
   on `hello`); it changes nothing the loader reads, and `--no-strip` keeps them
-  for `nm`/`gdb`. `tests/run.py`'s `check_stripped` pins both directions (the
-  default has no symbol table and is smaller than the `--no-strip` build). It used to use `-n` (nmagic), which packed every section into one
+  for `nm`/`gdb`. `--min-size` goes further and runs `strip
+  --strip-section-headers`, dropping the section-header table as well (888 → 536
+  bytes on `hello`); the loader does not read it but `nm`/`objdump -d` do, and
+  the extra `strip` process costs ~2.3 ms (a third of rmc's compile time), so it
+  is opt-in, not the default. `tests/run.py`'s `check_stripped` pins all three
+  directions (the default has no symbol table and is smaller than `--no-strip`;
+  `--min-size` is smaller still; every variant runs). It used to use `-n` (nmagic), which packed every section into one
   read+write+execute `LOAD` segment: a W^X violation. `-z noseparate-code` keeps
   the read-only and executable sections in one read+execute segment and the
   writable data in a separate read+write one, and is *smaller* than `-n` (1376
