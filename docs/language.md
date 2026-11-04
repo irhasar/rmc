@@ -17,7 +17,12 @@ time; there are no runtime type errors.
 | `()`         | unit, the result of a statement or `main`     |
 
 Integer and boolean literals are inferred. Explicit types can be given on
-`let` bindings and function signatures. `as` casts between `i64` and `bool`.
+`let` bindings and function signatures. `as` converts among `i64`, `bool` and an
+enum tag, and casts a `&mut T` to a `&T`. A reference may only be cast to a
+reference of the same type, never to a scalar or to `&mut T`. Two casts go
+beyond Rust: `i64 as bool` (Rust spells this `x != 0`) and the raw pointer cast
+`i64 as &T` / `i64 as &mut T` (used to turn an `alloc` address into a node
+pointer).
 
 ## Structs
 
