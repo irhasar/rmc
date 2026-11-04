@@ -1045,20 +1045,26 @@ The README's roadmap lists the intended next steps.
   - `tests/cases/div.{rms,rs}` covers both variants, powers of two, negatives,
     and boundary dividends, and is the regression guard for all of the above.
 - Division or modulo by a *variable* divisor uses `idiv`, but only after a
-  32-bit fast path. `emit_div` first tests both operands unsigned against 2^32
-  (`mov $4294967296, %rdx` + two `cmp`/`jae`); when both fit, `xor %edx,%edx`
-  + `div <reg>d` computes the same result in ~20 cycles instead of ~30–40, and
-  when either does not, the 64-bit `cqto` + `idiv <reg>` runs. This is what
-  closes the `mix` gap: its `gcd` operands are always small, so it takes the
-  narrow path every iteration, and `mix` went from 0.92× to 1.06× versus rustc.
-  - **The comparison must be unsigned** (`jae`, not `jge`): a negative operand
-    has the sign bit set and compares as a huge unsigned value, so it correctly
-    falls through to the 64-bit path. A signed test would send a negative
-    dividend down the 32-bit path and truncate it.
-  - **The 32-bit divide zeroes its own `%rdx`**, so no `cqto` is needed on the
-    fast path, and `%rdx` is free for the 2^32 constant because `cqto` has not
-    run yet. `mov $4294967296, %rdx` is used rather than a `shr $32` test because
-    the shift would destroy the dividend in `%rax`.
+  32-bit fast path. `emit_div` tests whether both operands fit in 32 bits by
+  ORing them and shifting the top 32 bits out (`mov %rax, %rdx` + `or <rd>`,
+  `%rdx` + `shr $32, %rdx` + `jnz <slow>`); when both fit, `div <reg>d`
+  computes the same result in ~20 cycles instead of ~30–40, and when either does
+  not, the 64-bit `cqto` + `idiv <reg>` runs. Its `gcd` operands are always
+  small, so `mix` takes the narrow path every iteration — this is what keeps
+  `mix` close, though it is still the documented weak spot (0.92×, division-
+  bound; see `bench/RESULTS.md`).
+  - **The fit test must be unsigned.** ORing the two operands and reading the
+    top 32 bits is an unsigned test: a negative operand has a high bit set and
+    the shift leaves a non-zero result, so it falls through to the 64-bit path,
+    exactly as the earlier `cmp $2^32`/`jae` pair did. A signed test would send
+    a negative dividend down the 32-bit path and truncate it. (This replaced the
+    pair of `cmp`/`jae` against `mov $4294967296, %rdx`; the OR form is one
+    instruction fewer and needs no 10-byte `movabs` in the loop. Copying the
+    dividend into `%rdx` first is what lets the shift run without destroying
+    `%rax`, which the old 2^32 form could not do.)
+  - **The 32-bit divide reads `%rdx` as the dividend's high half**, and the
+    `shr $32, %rdx` above already left it zero, so no `xor` is needed before
+    `div <reg>d`. `%rdx` is scratch on the fast path because `cqto` has not run.
   - The divisor is read from its own register (`idiv %rbx`) when it is a
     promoted local, and from `%rcx` otherwise; `r32` maps each to its 32-bit
     half. A one-off sweep of 1042 `q(a,b)` pairs across the full `i64` range —

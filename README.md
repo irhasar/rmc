@@ -24,9 +24,9 @@ The point of the experiment is to measure the trade-off at the extremes:
 three are the point of the experiment. Because it links in-process rather than
 forking `as` and `ld`, a small program compiles in about 1.2–1.6 ms against
 rustc's ~2.1 s. On **runtime** the result is mixed and program-dependent: rmc is
-at parity or ahead on most of the suite (`hello` 3.9×, `forloops` 1.6×, `sieve`
-1.6×, `refs` 1.2×, `stats` 1.14×, `mandel` 1.14×, `heap` 1.06×), and roughly
-ties on `fib` (0.99×) and `callrec` (0.98×) while trailing on `mix` (0.92×).
+at parity or ahead on most of the suite (`hello` 3.4×, `forloops` 1.6×, `sieve`
+1.6×, `stats` 1.16×, `refs` 1.15×, `mandel` 1.14×, `heap` 1.05×), and roughly
+ties on `fib` (0.99×) and `callrec` (0.97×) while trailing on `mix` (0.92×).
 Several of those are within run-to-run noise, and a call-heavy shape the
 recursion-to-loop pass does not match would lose. It is not uniformly faster and
 there is no single speedup number; `bench/RESULTS.md` reports the per-program
@@ -264,37 +264,37 @@ host):
 
 | program | compiler | compile wall | compile CPU | compile RAM | artifact | run wall | run CPU | run RAM |
 | ------- | -------- | -----------: | ----------: | ----------: | -------: | -------: | ------: | ------: |
-| hello | rmc | 1.2 ms | 1.07 ms | 2.8 MB | 478 B | 0.22 ms | 0.12 ms | 20 kB |
-| hello | rustc | 2060.86 ms | 2063.22 ms | 189.6 MB | 289416 B | 0.85 ms | 0.74 ms | 2100 kB |
-| fib | rmc | 1.27 ms | 1.15 ms | 2.7 MB | 609 B | 7.17 ms | 7.04 ms | 24 kB |
-| fib | rustc | 2057.14 ms | 2061.58 ms | 187.3 MB | 291696 B | 7.12 ms | 6.97 ms | 2080 kB |
-| mandel | rmc | 1.41 ms | 1.29 ms | 2.8 MB | 922 B | 92.08 ms | 91.88 ms | 24 kB |
-| mandel | rustc | 2063.72 ms | 2068.58 ms | 190.6 MB | 291776 B | 105.35 ms | 105.12 ms | 2040 kB |
-| sieve | rmc | 1.32 ms | 1.19 ms | 2.8 MB | 689 B | 1.61 ms | 1.45 ms | 1584 kB |
-| sieve | rustc | 2084.12 ms | 2087.12 ms | 186.5 MB | 292016 B | 2.51 ms | 2.36 ms | 3668 kB |
-| mix | rmc | 1.32 ms | 1.22 ms | 2.7 MB | 861 B | 16.88 ms | 16.7 ms | 20 kB |
-| mix | rustc | 2095.04 ms | 2097.0 ms | 192.2 MB | 291864 B | 15.57 ms | 15.38 ms | 2072 kB |
-| stats | rmc | 1.36 ms | 1.23 ms | 2.8 MB | 771 B | 3.25 ms | 3.13 ms | 24 kB |
-| stats | rustc | 2083.55 ms | 2088.23 ms | 188.2 MB | 292048 B | 3.72 ms | 3.58 ms | 2076 kB |
-| refs | rmc | 1.48 ms | 1.36 ms | 2.9 MB | 912 B | 3.21 ms | 3.08 ms | 24 kB |
-| refs | rustc | 2116.81 ms | 2121.92 ms | 192.9 MB | 292240 B | 3.86 ms | 3.72 ms | 2060 kB |
-| heap | rmc | 1.33 ms | 1.2 ms | 2.8 MB | 930 B | 3.22 ms | 3.1 ms | 4712 kB |
-| heap | rustc | 2138.48 ms | 2141.3 ms | 188.7 MB | 292384 B | 3.42 ms | 3.29 ms | 6716 kB |
-| callrec | rmc | 1.64 ms | 1.49 ms | 2.8 MB | 613 B | 2.9 ms | 2.78 ms | 24 kB |
-| callrec | rustc | 2160.5 ms | 2165.46 ms | 187.2 MB | 291680 B | 2.85 ms | 2.74 ms | 2084 kB |
-| forloops | rmc | 1.35 ms | 1.23 ms | 2.8 MB | 739 B | 2.06 ms | 1.96 ms | 24 kB |
-| forloops | rustc | 2079.17 ms | 2084.01 ms | 189.2 MB | 292480 B | 3.33 ms | 3.2 ms | 2008 kB |
+| hello | rmc | 1.23 ms | 1.1 ms | 2.8 MB | 478 B | 0.24 ms | 0.11 ms | 24 kB |
+| hello | rustc | 2046.66 ms | 2049.55 ms | 187.8 MB | 289416 B | 0.82 ms | 0.71 ms | 2072 kB |
+| fib | rmc | 1.35 ms | 1.17 ms | 2.8 MB | 609 B | 7.17 ms | 7.03 ms | 24 kB |
+| fib | rustc | 2058.64 ms | 2060.9 ms | 188.6 MB | 291696 B | 7.1 ms | 6.96 ms | 2028 kB |
+| mandel | rmc | 1.38 ms | 1.27 ms | 2.8 MB | 922 B | 92.28 ms | 92.09 ms | 24 kB |
+| mandel | rustc | 2097.08 ms | 2101.71 ms | 190.8 MB | 291776 B | 105.24 ms | 105.03 ms | 2096 kB |
+| sieve | rmc | 1.29 ms | 1.17 ms | 2.8 MB | 689 B | 1.56 ms | 1.43 ms | 1584 kB |
+| sieve | rustc | 2076.34 ms | 2081.05 ms | 188.5 MB | 292016 B | 2.44 ms | 2.32 ms | 3636 kB |
+| mix | rmc | 1.33 ms | 1.21 ms | 2.8 MB | 845 B | 16.83 ms | 16.68 ms | 24 kB |
+| mix | rustc | 2068.68 ms | 2072.93 ms | 188.4 MB | 291864 B | 15.43 ms | 15.27 ms | 2100 kB |
+| stats | rmc | 1.35 ms | 1.22 ms | 2.8 MB | 771 B | 3.24 ms | 3.11 ms | 24 kB |
+| stats | rustc | 2066.64 ms | 2071.12 ms | 191.3 MB | 292048 B | 3.75 ms | 3.62 ms | 2120 kB |
+| refs | rmc | 1.56 ms | 1.39 ms | 2.8 MB | 912 B | 3.34 ms | 3.16 ms | 24 kB |
+| refs | rustc | 2095.74 ms | 2098.82 ms | 193.2 MB | 292240 B | 3.83 ms | 3.71 ms | 2036 kB |
+| heap | rmc | 1.36 ms | 1.25 ms | 2.8 MB | 930 B | 3.25 ms | 3.11 ms | 4712 kB |
+| heap | rustc | 2117.16 ms | 2121.7 ms | 192.5 MB | 292384 B | 3.4 ms | 3.27 ms | 6704 kB |
+| callrec | rmc | 1.28 ms | 1.16 ms | 2.7 MB | 613 B | 2.89 ms | 2.78 ms | 24 kB |
+| callrec | rustc | 2079.19 ms | 2084.3 ms | 187.5 MB | 291680 B | 2.81 ms | 2.7 ms | 2100 kB |
+| forloops | rmc | 1.34 ms | 1.21 ms | 2.8 MB | 739 B | 2.07 ms | 1.96 ms | 24 kB |
+| forloops | rustc | 2093.35 ms | 2093.61 ms | 188.1 MB | 292480 B | 3.32 ms | 3.2 ms | 2068 kB |
 
 Summary of the ratios (rustc ÷ rmc, so >1 means rmc is better):
 
 | dimension         | ratio      |
 | ----------------- | ---------: |
-| compile wall      | ~1314–1721× |
-| compile CPU       | ~1456–1926× |
-| compiler peak RAM | ~67–71×    |
-| artifact size     | ~314–606× vs fat-LTO stripped; ~1273–2470× vs static stripped; ~4884–9500× vs plain `-O` |
-| run wall time     | 0.92–3.90× (rmc ahead on `hello`, `forloops`, `sieve`, `refs`, `stats`, `mandel`, `heap`; at parity on `fib` 0.99× and `callrec` 0.98×; behind on `mix` 0.92×) |
-| run peak RAM      | ~1.43× on `heap`, ~2.32× on `sieve`, ~84–105× elsewhere |
+| compile wall      | ~1343–1664× |
+| compile CPU       | ~1510–1863× |
+| compiler peak RAM | ~67–70×    |
+| artifact size     | ~314–605× vs fat-LTO stripped; ~1273–2469× vs static stripped; ~4884–9492× vs plain `-O` |
+| run wall time     | 0.92–3.42× (rmc ahead on `hello`, `forloops`, `sieve`, `stats`, `refs`, `mandel`, `heap`; at parity on `fib` 0.99× and `callrec` 0.97×; behind on `mix` 0.92×) |
+| run peak RAM      | ~1.42× on `heap`, ~2.30× on `sieve`, ~85–88× elsewhere |
 
 The compile-time win is the point of the project: `rmc` builds in about 1.2–1.6 ms
 where rustc needs about 2.1 s, using ~2.8 MB of RAM against ~188 MB, and writing
@@ -303,9 +303,9 @@ stripped) or ~4.5 MB (plain `-O`). The binary is small because it links only the
 runtime pieces the program reaches: a program that never allocates carries no
 allocator, and one that never indexes an array carries no bounds trap. The
 run-time picture is mixed and remains the honest weak spot: rmc wins on `hello`
-(3.90×, mostly process startup), `forloops` (1.61×), `sieve` (1.56×), `refs`
-(1.20×), `stats` (1.14×), `mandel` (1.14×) and `heap` (1.06×), and is at parity
-on `fib` (0.99×) and `callrec` (0.98×); only `mix` (0.92×) still trails,
+(3.42×, mostly process startup), `forloops` (1.60×), `sieve` (1.56×), `stats`
+(1.16×), `refs` (1.15×), `mandel` (1.14×) and `heap` (1.05×), and is at parity
+on `fib` (0.99×) and `callrec` (0.97×); only `mix` (0.92×) still trails,
 where the inner loop is dominated by `x % y` in `gcd`. Both compilers inline
 `gcd` into `main` (the inliner now accepts a small loop-bearing helper) and both
 emit a 32-bit `div` fast path with a 64-bit `idiv` fallback, so the gap is the

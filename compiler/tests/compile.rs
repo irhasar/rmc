@@ -2533,14 +2533,16 @@ fn a_variable_divisor_uses_its_register_directly() {
 #[test]
 fn a_variable_division_has_a_32_bit_fast_path() {
     // Both operands usually fit in 32 bits, where `div`/`idiv` is cheaper than
-    // the 64-bit form. The guard compares against 2^32 unsigned, so a negative
-    // operand takes the 64-bit `idiv` path and the result is still correct.
+    // the 64-bit form. The guard ORs the two operands and shifts the top 32 bits
+    // out, so a negative operand (whose high bit is set) takes the 64-bit `idiv`
+    // path and the result is still correct.
     let src = "fn q(a: i64, b: i64) -> i64 { return a / b; } \
                fn main() -> i64 { return q(100, 7); }";
     let out = asm_no_inline(src);
     let q = &out[out.find("q:").unwrap()..];
     let q = &q[..q.find(".size q").unwrap()];
-    assert!(q.contains("mov $4294967296, %rdx"), "2^32 guard:\n{q}");
+    assert!(q.contains("shr $32, %rdx"), "32-bit-fit guard:\n{q}");
+    assert!(q.contains("jnz "), "guard branches to the slow path:\n{q}");
     // The 32-bit divide names a `d`-suffixed register (`div %r12d`), never the
     // 64-bit `idiv`.
     assert!(q.contains("div %") && q.lines().any(|l| l.trim_start().starts_with("div %")), "32-bit fast path:\n{q}");

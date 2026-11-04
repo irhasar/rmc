@@ -2457,14 +2457,21 @@ impl Codegen {
         // and fault in `div`; check it before the fast/slow split.
         self.line(&format!("test {rd}, {rd}"));
         self.line("jz __rmc_divide_by_zero");
-        self.line("mov $4294967296, %rdx"); // 2^32
-        self.line("cmp %rdx, %rax");
-        self.line(&format!("jae {slow}"));
-        self.line(&format!("cmp %rdx, {rd}"));
-        self.line(&format!("jae {slow}"));
+        // Both operands fit in 32 bits iff their OR has no bit above 31 set, so
+        // one `or` and a `shr $32` replace the two compares against 2^32 (and
+        // the 10-byte `movabs` that materialised it, which otherwise ran on
+        // every iteration of a hot divide). The `or` is read unsigned: a
+        // negative operand has a high bit set and takes the slow path, exactly
+        // as the `jae` pair did. `%rdx` is scratch here (the slow path reloads
+        // it, the fast path zeroes it below).
+        self.line("mov %rax, %rdx");
+        self.line(&format!("or {rd}, %rdx"));
+        self.line("shr $32, %rdx");
+        self.line(&format!("jnz {slow}"));
         // Both fit in 32 bits: the 32-bit divide is exact (the dividend's high
         // half is zero, so its `%rdx` contribution is zero) and cannot overflow.
-        self.line("xor %edx, %edx");
+        // The `shr $32, %rdx` above already left `%rdx` zero, which is the high
+        // half the 32-bit `div` reads, so no `xor` is needed here.
         self.line(&format!("div {rd32}"));
         if matches!(op, BinOp::Mod) {
             self.line("mov %rdx, %rax");
