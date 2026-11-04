@@ -3,8 +3,9 @@
 `rmc` is a single-pass-per-stage, ahead-of-time compiler for a Rust subset. It
 is deliberately small: no external crates, no LLVM, no libc. The whole pipeline
 is `source -> lexer -> parser -> sema -> inline -> tco -> licm -> codegen
--> asm text`, after which the
-driver shells out to GNU `as` and `ld`.
+-> asm text -> ELF64`, where the last step is an in-process assembler and linker
+(`elf.rs`). By default the driver shells out to nothing; `--binutils` restores a
+path through GNU `as` and `ld` for comparison.
 
 ## Pipeline
 
@@ -61,20 +62,20 @@ driver shells out to GNU `as` and `ld`.
 7. **Code generation** (`codegen.rs`) — emits AT&T-syntax x86-64 assembly. Every
    expression leaves its result in `%rax`; the result type is returned to the
    caller so callers know how to use it.
-8. **Assemble and link** (`main.rs`) — writes the assembly, runs `as --64`, then
-   `ld -o <out> --build-id=none -z noseparate-code --strip-all <obj>`, with the
-   runtime text appended. `-z noseparate-code` packs the read-only and executable
-   sections into one read+execute `LOAD` segment and leaves the writable data in
-   its own read+write one, so no page is ever both writable and executable. It is
-   also the smallest layout `ld` produces here (1376 bytes vs 5416 for `-n`, which
-   packs *everything* into one read+write+execute segment). `--strip-all` drops
-   the symbol and section-name tables, which at this size are about a third of
-   the file (1376 → 888 bytes on `hello`); `--no-strip` keeps them for `nm`/`gdb`.
-   `--min-size` additionally runs `strip --strip-section-headers`, dropping the
-   section-header table too (888 → 536 bytes). The loader never reads that table,
-   but `nm`/`objdump -d` do, so it is opt-in: the extra `strip` process costs
-   ~2.3 ms, a third of rmc's own compile time, which is not worth paying by
-   default when the whole point is compile speed.
+8. **Assemble and link** (`elf.rs`) — the assembly text, with the runtime text
+   appended, is assembled and linked into a static ELF64 executable in-process.
+   The encoder implements the narrow subset of instructions the code generator
+   emits; a form it does not know is a compile error, not a silent miscompile.
+   The output has two `PT_LOAD` segments: read+execute for `.text`/`.rodata` and
+   read+write for `.data`, so no page is ever both writable and executable. The
+   runtime's writable globals are all zero, so they are emitted as `.bss`
+   (`p_filesz = 0`) and cost no file space. This path never writes a symbol
+   table or a section-header table, so it is both the fastest (no `as`/`ld`
+   process to fork and exec) and the smallest artifact.
+   `--binutils` instead writes the assembly and runs `as --64` then
+   `ld -o <out> --build-id=none -z noseparate-code --strip-all <obj>`, with
+   `--no-strip` keeping the symbol table and `--min-size` additionally running
+   `strip --strip-section-headers`.
 
 ## Stack layout
 
