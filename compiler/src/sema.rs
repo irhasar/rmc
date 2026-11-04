@@ -513,8 +513,9 @@ impl Sema {
         self.check_expr(e, scope)
     }
 
-    /// Whether a desugared `match` `if`-chain is provably total, i.e. it tests
-    /// every variant of one enum exactly once and no other condition.
+    /// Whether a desugared `match` `if`-chain is provably total: it tests every
+    /// variant of one enum exactly once, or both values of one `bool`, and no
+    /// other condition.
     ///
     /// A `match` with no `_` arm folds to `if c1 { a1 } else { if c2 { a2 } ... }`
     /// with no final `else`, so a value that matches no arm falls through to
@@ -523,35 +524,65 @@ impl Sema {
     /// chain may be used as a value. rustc accepts that; rmc rejected it with a
     /// spurious "`if` without `else`" error.
     ///
-    /// `VariantTest` nodes are produced only by `match` desugaring, so a chain
-    /// whose conditions are all `VariantTest`s over one enum and whose tested
-    /// variants are pairwise distinct and cover every variant is exhaustive.
-    /// Anything else (an integer arm, a duplicate, a missing variant, a
-    /// hand-written `if` chain) is not, and keeps the old error.
+    /// `VariantTest` and `BoolTest` nodes are produced only by `match`
+    /// desugaring, so a chain whose conditions are all of one kind, test the
+    /// same enum (or the same bool variable), and whose tested variants (or
+    /// bool values) are pairwise distinct and complete is exhaustive. Anything
+    /// else (an integer arm, a duplicate, a missing case, a hand-written `if`
+    /// chain) is not, and keeps the old error.
     ///
     /// The comparison is by variant *name*, not tag: the nested `VariantTest`s
     /// have not been visited by `check_expr` yet, so their tags are still -1.
     fn if_chain_is_exhaustive(&self, cond: &Expr, els: &Option<Block>) -> bool {
-        let mut enum_name: Option<&str> = None;
-        let mut seen: Vec<&str> = Vec::new();
+        // Every condition must test the same thing: all the variants of one
+        // enum, or both values of one `bool`. A chain that mixes the two, or
+        // tests two different enums, is never exhaustive. The `BoolTest` case
+        // is why the node exists: `match b { true => .., false => .. }` is
+        // exhaustive, but the equivalent hand-written `if b == true { .. }
+        // else if b == false { .. }` (a plain `Bin(Eq, ..)`, not a `BoolTest`)
+        // is not, and rustc rejects it in value position.
+        enum Kind<'a> {
+            Enum(&'a str),
+            Bool(&'a str),
+        }
+        let mut kind: Option<Kind> = None;
+        let mut seen_variants: Vec<&str> = Vec::new();
+        let mut seen_bools: Vec<bool> = Vec::new();
         let mut cur_cond = cond;
         let mut cur_els = els;
         loop {
-            let (name, variant) = match cur_cond {
+            match cur_cond {
                 Expr::VariantTest { enum_name, variant, .. } => {
-                    (enum_name.as_str(), variant.as_str())
+                    match kind {
+                        Some(Kind::Enum(e)) if e == enum_name.as_str() => {}
+                        None => kind = Some(Kind::Enum(enum_name.as_str())),
+                        _ => return false,
+                    }
+                    if seen_variants.contains(&variant.as_str()) {
+                        return false;
+                    }
+                    seen_variants.push(variant.as_str());
+                }
+                Expr::BoolTest { scrutinee, value } => {
+                    // `desugar_match` only tests a `Var` (the temporary it bound
+                    // the scrutinee to, or a bool variable); anything else cannot
+                    // be proven the same across arms.
+                    let name = match scrutinee.as_ref() {
+                        Expr::Var { name, .. } => name.as_str(),
+                        _ => return false,
+                    };
+                    match kind {
+                        Some(Kind::Bool(s)) if s == name => {}
+                        None => kind = Some(Kind::Bool(name)),
+                        _ => return false,
+                    }
+                    if seen_bools.contains(value) {
+                        return false;
+                    }
+                    seen_bools.push(*value);
                 }
                 _ => return false,
-            };
-            match enum_name {
-                Some(existing) if existing != name => return false,
-                None => enum_name = Some(name),
-                _ => {}
             }
-            if seen.contains(&variant) {
-                return false;
-            }
-            seen.push(variant);
             match cur_els {
                 None => break,
                 Some(block) => {
@@ -569,11 +600,14 @@ impl Sema {
                 }
             }
         }
-        let info = match enum_name.and_then(|n| self.enums.get(n)) {
-            Some(i) => i,
-            None => return false,
-        };
-        info.variants.len() == seen.len()
+        match kind {
+            Some(Kind::Enum(name)) => {
+                self.enums.get(name).map_or(false, |i| i.variants.len() == seen_variants.len())
+            }
+            // Both `true` and `false` tested, pairwise distinct.
+            Some(Kind::Bool(_)) => seen_bools.len() == 2,
+            None => false,
+        }
     }
 
     /// Whether a desugared `match` (the `MatchBoundary` block `b`) names every
@@ -998,6 +1032,7 @@ impl Sema {
                 }
             }
             Expr::VariantTest { scrutinee, .. } => Self::collect_mut_borrows(scrutinee, a, mb),
+            Expr::BoolTest { scrutinee, .. } => Self::collect_mut_borrows(scrutinee, a, mb),
             Expr::EnumPayload { recv, .. } => Self::collect_mut_borrows(recv, a, mb),
             Expr::Cast(inner, _) => Self::collect_mut_borrows(inner, a, mb),
             Expr::AddrOf { expr, mutable, .. } => {
@@ -1597,6 +1632,15 @@ impl Sema {
                 // an address in any context.
                 *slot = self.alloc_slots((info.size / 8) as i32);
                 Ok(Type::EnumData(enum_name, info.size))
+            }
+            Expr::BoolTest { scrutinee, value } => {
+                let st = self.check_expr(scrutinee, scope)?;
+                if st != Type::Bool {
+                    return Err(format!(
+                        "`{value}` pattern cannot match a value of type {st:?}"
+                    ));
+                }
+                Ok(Type::Bool)
             }
             Expr::VariantTest { scrutinee, enum_name, variant, tag, n_binds } => {
                 let n_binds = *n_binds;

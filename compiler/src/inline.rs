@@ -213,6 +213,7 @@ fn count_expr(e: &Expr) -> usize {
         Expr::ArrayLit(v, _) => 1 + n(v),
         Expr::ArrayList(v) => 1 + v.iter().map(count_expr).sum::<usize>(),
         Expr::VariantTest { scrutinee, .. } => 1 + n(scrutinee),
+        Expr::BoolTest { scrutinee, .. } => 1 + n(scrutinee),
         Expr::EnumPayload { recv, .. } => 1 + n(recv),
     }
 }
@@ -337,6 +338,7 @@ impl Inliner {
                 }
             }
             Expr::VariantTest { scrutinee, .. } => self.walk_expr(scrutinee, base, expanding),
+            Expr::BoolTest { scrutinee, .. } => self.walk_expr(scrutinee, base, expanding),
             Expr::EnumPayload { recv, .. } => self.walk_expr(recv, base, expanding),
             Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
         }
@@ -549,6 +551,7 @@ fn assigned_slots(stmts: &[Stmt], tail: Option<&Expr>) -> HashSet<i32> {
                 }
             }
             Expr::VariantTest { scrutinee, .. } => collect_expr(scrutinee, out),
+            Expr::BoolTest { scrutinee, .. } => collect_expr(scrutinee, out),
             Expr::EnumPayload { recv, .. } => collect_expr(recv, out),
             Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
         }
@@ -700,6 +703,7 @@ impl Sub<'_> {
                 }
             }
             Expr::VariantTest { scrutinee, .. } => self.expr(scrutinee),
+            Expr::BoolTest { scrutinee, .. } => self.expr(scrutinee),
             Expr::EnumPayload { recv, .. } => self.expr(recv),
             Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::EnumVariant { .. } => {}
         }

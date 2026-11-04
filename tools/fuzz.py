@@ -465,9 +465,10 @@ def gen_pat_program(rng):
     desugaring and the arm codegen are exercised. `stmt` mode only matches a
     single-payload enum with a wildcard and an integer with a wildcard, so a
     multi-variant enum, a variant with two payload fields, a binding pattern, a
-    negative literal, a nested `match` and — the path that matters most — a
-    non-trivial scrutinee (a call, a binary operator, an index or a field,
-    which `desugar_match` binds to a temporary) were never generated. That
+    negative literal, a nested `match`, a `bool` match covering both values,
+    and — the path that matters most — a non-trivial scrutinee (a call, a binary
+    operator, an index or a field, which `desugar_match` binds to a temporary)
+    were never generated. That
     temporary must be evaluated exactly once: re-evaluating it per arm repeats
     a side effect, and a stale one reads the wrong value.
     """
@@ -492,6 +493,7 @@ def gen_pat_program(rng):
         f"fn mscr(k: i64) -> i64 {{ return match side(k) {{ {v} => 11, {v + 1} => 22, {v + 2} => 33, _ => 44 }}; }}",
         f"fn iscr(a: [i64; 4], i: i64) -> i64 {{ return match a[i] {{ {v} => 70, _ => 0 }}; }}",
         "fn nested(x: i64) -> i64 { return match x { 0 => match x + 5 { 5 => 100, _ => 101 }, _ => match x { 2 => 200, _ => 201 } }; }",
+        "fn bmatch(b: bool) -> i64 { return match b { true => 7, false => 9 }; }",
         f"enum Color {{ {color_def} }}",
         f"fn color_code(c: Color) -> i64 {{ return match c {{ {color_arms} }}; }}",
         "enum Shape { Dot, Line(i64), Rect(i64, i64) }",
@@ -510,6 +512,8 @@ def gen_pat_program(rng):
         "        acc = acc + classify(i) + bindit(i);",
         "        acc = acc + bscr(i) + cscr(i) + mscr(i) + iscr(arr, i % 4) + fscr(S { a: i, b: i % 5 });",
         "        acc = acc + nested(i % 3);",
+        "        acc = acc + bmatch(i % 2 == 0);",
+        f"        acc = acc + bmatch(side(i) > {v});",
         "        i = i + 1;",
         "    }",
         "    print_i64(acc);",
@@ -525,6 +529,7 @@ def gen_pat_program(rng):
         f"fn mscr(k: i64) -> i64 {{ match side(k) {{ {v} => 11, {v + 1} => 22, {v + 2} => 33, _ => 44 }} }}",
         f"fn iscr(a: [i64; 4], i: i64) -> i64 {{ match a[i as usize] {{ {v} => 70, _ => 0 }} }}",
         "fn nested(x: i64) -> i64 { match x { 0 => match x + 5 { 5 => 100, _ => 101 }, _ => match x { 2 => 200, _ => 201 } } }",
+        "fn bmatch(b: bool) -> i64 { match b { true => 7, false => 9 } }",
         "#[derive(Copy, Clone)]",
         f"enum Color {{ {color_def} }}",
         f"fn color_code(c: Color) -> i64 {{ match c {{ {color_arms} }} }}",
@@ -546,6 +551,8 @@ def gen_pat_program(rng):
         "        acc += classify(i) + bindit(i);",
         "        acc += bscr(i) + cscr(i) + mscr(i) + iscr(arr, i % 4) + fscr(S { a: i, b: i % 5 });",
         "        acc += nested(i % 3);",
+        "        acc += bmatch(i % 2 == 0);",
+        f"        acc += bmatch(side(i) > {v});",
         "        i += 1;",
         "    }",
         '    println!("{}", acc);',

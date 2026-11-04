@@ -194,6 +194,15 @@ pub enum Expr {
         /// parentheses, which is an error for a variant that has a payload.
         n_binds: i32,
     },
+    /// `value == true`/`false`, as a `bool`. The arm test a `bool` literal
+    /// pattern desugars to. It is a distinct node rather than a plain
+    /// `Bin(Eq, ..)` so `if_chain_is_exhaustive` can tell a `match` over a
+    /// `bool` (whose `true` and `false` arms together are exhaustive) from a
+    /// hand-written `if b == true { .. } else if b == false { .. }`, which rustc
+    /// does *not* treat as exhaustive in value position. `desugar_match` only
+    /// ever produces it over a `Var` — the scrutinee it bound to a temporary or
+    /// a bool variable — so no side effect is evaluated here.
+    BoolTest { scrutinee: Box<Expr>, value: bool },
     /// The payload of a payload enum, read after a tag check: field `idx` of
     /// `variant`, at `offset` bytes into the value. Yields the field value, or
     /// its address when the field is itself an aggregate.

@@ -764,6 +764,9 @@ impl Codegen {
             Expr::VariantTest { scrutinee, .. } => {
                 Self::count_expr(scrutinee, counts, mem, copied, false, let_tmps)
             }
+            Expr::BoolTest { scrutinee, .. } => {
+                Self::count_expr(scrutinee, counts, mem, copied, false, let_tmps)
+            }
             Expr::EnumPayload { recv, ty, .. } => {
                 Self::count_expr(recv, counts, mem, copied, false, let_tmps);
                 // A payload field of aggregate type is named by its address.
@@ -1530,6 +1533,14 @@ impl Codegen {
                 self.line(&format!("lea {base}(%rbp), %rax"));
                 Type::EnumData(enum_name.clone(), *size)
             }
+            Expr::BoolTest { scrutinee, value } => {
+                // The scrutinee is a bool word (0 or 1); compare it directly.
+                self.gen_expr(scrutinee);
+                self.line(&format!("cmp ${}, %rax", *value as i64));
+                self.line("sete %al");
+                self.line("movzbq %al, %rax");
+                Type::Bool
+            }
             Expr::VariantTest { scrutinee, tag, .. } => {
                 // Compare the value's tag word. `gen_expr` yields the address
                 // for an aggregate enum and the tag itself for a unit enum, so
@@ -1992,6 +2003,7 @@ impl Codegen {
             Expr::ArrayLit(v, _) => self.uses_reg(v, r),
             Expr::EnumCtor { args, .. } => args.iter().any(|a| self.uses_reg(a, r)),
             Expr::VariantTest { scrutinee, .. } => self.uses_reg(scrutinee, r),
+            Expr::BoolTest { scrutinee, .. } => self.uses_reg(scrutinee, r),
             Expr::EnumPayload { recv, .. } => self.uses_reg(recv, r),
             Expr::If(c, t, els) => {
                 self.uses_reg(c, r)

@@ -171,6 +171,7 @@ impl Licm {
                 }
             }
             Expr::VariantTest { scrutinee, .. } => self.expr_loops(scrutinee),
+            Expr::BoolTest { scrutinee, .. } => self.expr_loops(scrutinee),
             Expr::EnumPayload { recv, .. } => self.expr_loops(recv),
             Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
         }
@@ -335,6 +336,7 @@ impl Effects {
                 }
             }
             Expr::VariantTest { scrutinee, .. } => self.expr(scrutinee),
+            Expr::BoolTest { scrutinee, .. } => self.expr(scrutinee),
             Expr::EnumPayload { recv, .. } => self.expr(recv),
             Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
         }
@@ -457,6 +459,7 @@ impl Hoister {
                 }
             }
             Expr::VariantTest { scrutinee, .. } => self.expr(scrutinee),
+            Expr::BoolTest { scrutinee, .. } => self.expr(scrutinee),
             Expr::EnumPayload { recv, .. } => self.expr(recv),
             Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
         }
