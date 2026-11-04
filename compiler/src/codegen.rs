@@ -911,6 +911,23 @@ impl Codegen {
         self.discard = saved;
     }
 
+    /// The label to branch to when an `if`-without-`else` body is a lone
+    /// `break`/`continue`, so the branch can target the loop's exit/continue
+    /// label directly and skip the `jmp`. Returns `None` when the body is
+    /// anything else (including a `break` nested in a block), which falls back
+    /// to the ordinary `if` lowering.
+    fn bare_exit(&self, then: &Block, els: &Option<Block>) -> Option<String> {
+        if els.is_some() || then.tail.is_some() || then.stmts.len() != 1 {
+            return None;
+        }
+        let (top, end) = self.loops.last()?;
+        match &then.stmts[0] {
+            Stmt::Break => Some(end.clone()),
+            Stmt::Continue => Some(top.clone()),
+            _ => None,
+        }
+    }
+
     fn gen_block(&mut self, b: &Block) -> Type {
         for st in &b.stmts {
             self.gen_stmt(st);
@@ -1836,6 +1853,18 @@ impl Codegen {
                 // nor a `jmp` over an empty else. The `then` block falls
                 // straight through to the branch target.
                 let bare = self.discard && els.is_none();
+                // `if c { break; }` (or `continue;`) as the last statement of a
+                // loop body: branching to `else` to reach an unconditional
+                // `jmp` to the loop's exit costs two jumps. Branch to the exit
+                // directly on the *negated* condition instead, so the taken path
+                // is one jump and the fall-through path is none. This is the
+                // escape test in `mandel`'s inner loop.
+                if self.discard {
+                    if let Some(dst) = self.bare_exit(then, els) {
+                        self.gen_branch_true(cond, &dst);
+                        return Type::Unit;
+                    }
+                }
                 self.gen_branch_false(cond, &else_l);
                 let tt = self.gen_block(then);
                 if !bare {
