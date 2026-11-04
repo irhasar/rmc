@@ -957,3 +957,15 @@ The README's roadmap lists the intended next steps.
   `1 + f(n-1) + f(n-2)` shape; unit tests pin the non-associative
   `f(x-1) - f(x-2)` case, a `return` in an argument, a foreign call in the left
   operand, and overflow checks.
+
+## Pushing
+
+Pushing needs a token with `contents: write`. The token seen so far in this
+environment was **read-only**: it authenticated as the repo owner and the REST
+API even reported `admin` on the repo, yet `git push` and the Git Data API both
+returned `403 Resource not accessible by integration` (`receive-pack` is refused
+while `git fetch` works). That combination — API says `push: true`, push says
+"not accessible by integration" — is the signature of a read-only token, not a
+missing scope. If a push is rejected that way, do not re-derive it: report the
+committed-and-ready state and ask the user to push, or to supply a writable
+token.
