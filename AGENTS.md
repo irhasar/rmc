@@ -1002,12 +1002,13 @@ The README's roadmap lists the intended next steps.
 
 ## Pushing
 
-Pushing needs a token with `contents: write`. The token seen so far in this
-environment was **read-only**: it authenticated as the repo owner and the REST
-API even reported `admin` on the repo, yet `git push` and the Git Data API both
-returned `403 Resource not accessible by integration` (`receive-pack` is refused
-while `git fetch` works). That combination — API says `push: true`, push says
-"not accessible by integration" — is the signature of a read-only token, not a
-missing scope. If a push is rejected that way, do not re-derive it: report the
-committed-and-ready state and ask the user to push, or to supply a writable
-token.
+Pushing needs a token with `contents: write`. The `GITHUB_TOKEN` provided in
+this environment is **read-only**: it authenticates as the repo owner and the
+REST API even reports `admin` on the repo, yet `git push` and the Git Data API
+both return `403 Resource not accessible by integration` (`receive-pack` is
+refused while `git fetch` works). That combination — API says `push: true`, push
+says "not accessible by integration" — is the signature of a read-only token,
+not a missing scope. Do not re-derive it: ask the user for a token with
+`contents: write` and push with it once, inline in the URL
+(`git push https://<token>@github.com/irhasar/rmc.git <branch>`), so it is not
+written to `.git/config`. Never persist the token in a remote URL or a file.
