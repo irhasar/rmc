@@ -413,7 +413,10 @@ show on the unoptimised path; the Rust twin is built once and reused. `aggsem`
 (by-value aggregate assignment,
 inferred aggregates, nested fields, indexing a returned array), `cmpsem`
 (single evaluation of a side-effecting subscript in a compound assignment,
-struct-literal field order) and `utf8` (non-ASCII string literals) guard the
+struct-literal field order), `utf8` (non-ASCII string literals), `inlmulti`
+(a callee that assigns its parameter, a non-trivial argument evaluated once, and
+nested inlining with a call argument) and `licmref` (a field read that must not
+be hoisted past a `&mut` store in the loop) guard the
 front-end/codegen fixes below. When adding a case, add both twins, write
 them to behave identically, and remember that `rustc` infers `i32` for unsuffixed
 literals, so large literals need an `i64` suffix on the Rust side. `args.json`
@@ -591,7 +594,11 @@ expressions with calls and guarded division; `stmt` mode builds loops,
 conditionals, `match`, arrays and aggregate calls, and deliberately places
 side-effecting scalar and aggregate arguments in every position (this is what
 found the argument-evaluation-order bug). It compares stdout and exit status
-against `rustc -O`. A generated shift amount must stay `i64`-typed: rustc infers
+against `rustc -O`, and it recompiles each program with every optimiser pass off
+in turn (`--no-inline`, `--no-licm`, `--no-tco`, all three), the same matrix the
+corpus suite uses — a pass-specific bug is otherwise invisible, because the
+fuzzer used to run only the default configuration and the generator emits no
+inlinable user function. A generated shift amount must stay `i64`-typed: rustc infers
 `i32` for an unconstrained literal and masks the count to 5 bits, while rmc is
 `i64`-only and masks to 6, so an untyped count reports a divergence that is not a
 bug.
