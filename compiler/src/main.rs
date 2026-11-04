@@ -15,6 +15,7 @@ struct Options {
     output: PathBuf,
     emit_asm: bool,
     keep_asm: bool,
+    strip: bool,
     overflow_checks: bool,
     bounds_checks: bool,
     no_inline: bool,
@@ -28,6 +29,7 @@ fn parse_args() -> Result<Options, String> {
     let mut output: Option<PathBuf> = None;
     let mut emit_asm = false;
     let mut keep_asm = false;
+    let mut strip = true;
     let mut overflow_checks = false;
     let mut bounds_checks = false;
     let mut no_inline = false;
@@ -42,6 +44,7 @@ fn parse_args() -> Result<Options, String> {
             }
             "--emit-asm" => emit_asm = true,
             "--keep-asm" => keep_asm = true,
+            "--no-strip" => strip = false,
             "--overflow-checks" => overflow_checks = true,
             "--bounds-checks" => bounds_checks = true,
             "--no-inline" => no_inline = true,
@@ -73,6 +76,7 @@ fn parse_args() -> Result<Options, String> {
         output,
         emit_asm,
         keep_asm,
+        strip,
         overflow_checks,
         bounds_checks,
         no_inline,
@@ -91,6 +95,7 @@ fn print_help() {
          \x20   -o <path>      output binary path\n\
          \x20   --emit-asm     print generated assembly to stdout and stop\n\
          \x20   --keep-asm     keep the intermediate .s file next to the output\n\
+         \x20   --no-strip     keep the symbol table in the output binary\n\
          \x20   --overflow-checks  trap on i64 +,-,* overflow (off by default)\n\
          \x20   --bounds-checks    trap on an out-of-range array index (off by default)\n\
          \x20   --no-inline        disable the inlining pass (on by default)\n\
@@ -147,7 +152,7 @@ fn run(opts: Options) -> Result<(), String> {
 
     let obj_path = opts.output.with_extension("o");
     assemble(&asm_path, &obj_path)?;
-    link(&obj_path, &opts.output)?;
+    link(&obj_path, &opts.output, opts.strip)?;
 
     if !opts.keep_asm {
         let _ = std::fs::remove_file(&asm_path);
@@ -171,7 +176,7 @@ fn assemble(asm: &Path, obj: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn link(obj: &Path, exe: &Path) -> Result<(), String> {
+fn link(obj: &Path, exe: &Path, strip: bool) -> Result<(), String> {
     // The assembly carries a `.note.GNU-stack` section, so the stack is marked
     // non-executable without an explicit `-z noexecstack`.
     //
@@ -180,12 +185,19 @@ fn link(obj: &Path, exe: &Path) -> Result<(), String> {
     // read+write one. That is both smaller than `-n` (which packs *everything*
     // into one read+write+execute segment, an avoidable W^X hazard) and the
     // smallest layout `ld` offers here: 3304 bytes vs 7344 for the hello case.
-    let out = Command::new("ld")
-        .arg("-o")
+    let mut cmd = Command::new("ld");
+    cmd.arg("-o")
         .arg(exe)
         .arg("--build-id=none")
         .arg("-z")
-        .arg("noseparate-code")
+        .arg("noseparate-code");
+    // Dropping the symbol and section-name tables is worth about a third of
+    // the artifact at this size (1376 -> 888 bytes on `hello`) and changes
+    // nothing the loader reads. `--no-strip` keeps them for `nm`/`gdb`.
+    if strip {
+        cmd.arg("--strip-all");
+    }
+    let out = cmd
         .arg(obj)
         .output()
         .map_err(|e| format!("failed to run `ld`: {e}"))?;

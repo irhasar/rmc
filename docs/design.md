@@ -62,12 +62,14 @@ driver shells out to GNU `as` and `ld`.
    expression leaves its result in `%rax`; the result type is returned to the
    caller so callers know how to use it.
 8. **Assemble and link** (`main.rs`) — writes the assembly, runs `as --64`, then
-   `ld -o <out> --build-id=none -z noseparate-code <obj>`, with the runtime text
-   appended. `-z noseparate-code` packs the read-only and executable sections
-   into one read+execute `LOAD` segment and leaves the writable data in its own
-   read+write one, so no page is ever both writable and executable. It is also
-   the smallest layout `ld` produces here (1376 bytes vs 5416 for `-n`, which
-   packs *everything* into one read+write+execute segment).
+   `ld -o <out> --build-id=none -z noseparate-code --strip-all <obj>`, with the
+   runtime text appended. `-z noseparate-code` packs the read-only and executable
+   sections into one read+execute `LOAD` segment and leaves the writable data in
+   its own read+write one, so no page is ever both writable and executable. It is
+   also the smallest layout `ld` produces here (1376 bytes vs 5416 for `-n`, which
+   packs *everything* into one read+write+execute segment). `--strip-all` drops
+   the symbol and section-name tables, which at this size are about a third of
+   the file (1376 → 888 bytes on `hello`); `--no-strip` keeps them for `nm`/`gdb`.
 
 ## Stack layout
 
