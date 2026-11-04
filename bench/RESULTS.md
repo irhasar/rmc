@@ -1,6 +1,6 @@
 # Benchmark results: rmc vs rustc
 
-Recorded 2026-11-04 17:23 UTC on Linux-6.8.0-1055-gke-x86_64-with-glibc2.41.
+Recorded 2026-11-04 17:59 UTC on Linux-6.8.0-1055-gke-x86_64-with-glibc2.41.
 CPU: AMD EPYC 9B14.
 `rustc 1.99.1 (58cf8f9c3 2026-10-13)`.
 
@@ -16,36 +16,36 @@ against a default build. See the size table below for both.
 
 | program | compiler | wall (ms) | CPU (ms) | peak RSS (kB) | artifact (B) |
 | ------- | -------- | --------: | -------: | ------------: | -----------: |
-| hello | rmc | 1.17 | 1.07 | 2748 | 478 |
-| hello | rustc | 2055.22 | 2058.01 | 186000 | 289416 |
-| hello | ratio (rustc/rmc) | 1749.7 | 1928.8 | 67.7 | 605.5 |
-| fib | rmc | 1.28 | 1.16 | 2796 | 609 |
-| fib | rustc | 2071.73 | 2075.70 | 188076 | 291696 |
-| fib | ratio (rustc/rmc) | 1616.5 | 1786.3 | 67.3 | 479.0 |
-| mandel | rmc | 1.38 | 1.26 | 2780 | 916 |
-| mandel | rustc | 2098.17 | 2102.40 | 190320 | 291776 |
-| mandel | ratio (rustc/rmc) | 1515.3 | 1663.3 | 68.5 | 318.5 |
-| sieve | rmc | 1.33 | 1.21 | 2796 | 689 |
-| sieve | rustc | 2146.48 | 2150.59 | 187000 | 292016 |
-| sieve | ratio (rustc/rmc) | 1611.4 | 1778.8 | 66.9 | 423.8 |
-| mix | rmc | 1.39 | 1.23 | 2816 | 845 |
-| mix | rustc | 2118.96 | 2123.16 | 188744 | 291864 |
-| mix | ratio (rustc/rmc) | 1523.6 | 1731.8 | 67.0 | 345.4 |
-| stats | rmc | 1.32 | 1.19 | 2760 | 765 |
-| stats | rustc | 2072.23 | 2077.02 | 188660 | 292048 |
-| stats | ratio (rustc/rmc) | 1568.9 | 1742.5 | 68.4 | 381.8 |
-| refs | rmc | 1.48 | 1.35 | 2788 | 888 |
-| refs | rustc | 2123.79 | 2111.12 | 193272 | 292240 |
-| refs | ratio (rustc/rmc) | 1436.7 | 1558.0 | 69.3 | 329.1 |
-| heap | rmc | 1.36 | 1.24 | 2800 | 930 |
-| heap | rustc | 2107.21 | 2111.32 | 187852 | 292384 |
-| heap | ratio (rustc/rmc) | 1551.9 | 1701.3 | 67.1 | 314.4 |
-| callrec | rmc | 1.33 | 1.18 | 2820 | 613 |
-| callrec | rustc | 2114.64 | 2119.42 | 186476 | 291680 |
-| callrec | ratio (rustc/rmc) | 1593.4 | 1794.6 | 66.1 | 475.8 |
-| forloops | rmc | 1.32 | 1.20 | 2744 | 739 |
-| forloops | rustc | 2088.65 | 2091.33 | 188744 | 292480 |
-| forloops | ratio (rustc/rmc) | 1586.5 | 1738.4 | 68.8 | 395.8 |
+| hello | rmc | 1.45 | 1.27 | 2776 | 478 |
+| hello | rustc | 2072.38 | 2073.71 | 185944 | 289416 |
+| hello | ratio (rustc/rmc) | 1430.7 | 1627.7 | 67.0 | 605.5 |
+| fib | rmc | 1.31 | 1.19 | 2804 | 609 |
+| fib | rustc | 2117.21 | 2121.35 | 187216 | 291696 |
+| fib | ratio (rustc/rmc) | 1617.8 | 1784.1 | 66.8 | 479.0 |
+| mandel | rmc | 1.39 | 1.28 | 2792 | 911 |
+| mandel | rustc | 2069.21 | 2073.83 | 190144 | 291776 |
+| mandel | ratio (rustc/rmc) | 1487.2 | 1624.0 | 68.1 | 320.3 |
+| sieve | rmc | 1.30 | 1.18 | 2816 | 689 |
+| sieve | rustc | 2095.32 | 2099.72 | 191824 | 292016 |
+| sieve | ratio (rustc/rmc) | 1611.3 | 1779.4 | 68.1 | 423.8 |
+| mix | rmc | 1.35 | 1.23 | 2740 | 845 |
+| mix | rustc | 2101.67 | 2106.03 | 187860 | 291864 |
+| mix | ratio (rustc/rmc) | 1554.8 | 1716.4 | 68.6 | 345.4 |
+| stats | rmc | 1.36 | 1.23 | 2748 | 765 |
+| stats | rustc | 2111.98 | 2116.24 | 188108 | 292048 |
+| stats | ratio (rustc/rmc) | 1556.4 | 1726.1 | 68.5 | 381.8 |
+| refs | rmc | 1.48 | 1.36 | 2796 | 888 |
+| refs | rustc | 2161.62 | 2166.47 | 192624 | 292240 |
+| refs | ratio (rustc/rmc) | 1462.9 | 1588.3 | 68.9 | 329.1 |
+| heap | rmc | 1.40 | 1.26 | 2788 | 930 |
+| heap | rustc | 2170.66 | 2175.56 | 192992 | 292384 |
+| heap | ratio (rustc/rmc) | 1549.3 | 1728.0 | 69.2 | 314.4 |
+| callrec | rmc | 1.27 | 1.13 | 2752 | 613 |
+| callrec | rustc | 2107.95 | 2112.31 | 186596 | 291680 |
+| callrec | ratio (rustc/rmc) | 1658.4 | 1867.6 | 67.8 | 475.8 |
+| forloops | rmc | 1.33 | 1.21 | 2776 | 733 |
+| forloops | rustc | 2148.18 | 2148.51 | 188892 | 292480 |
+| forloops | ratio (rustc/rmc) | 1620.5 | 1781.5 | 68.0 | 399.0 |
 
 ## Artifact size against each rustc build
 
@@ -53,14 +53,14 @@ against a default build. See the size table below for both.
 | ------- | ------: | ----------------------------: | -----------------: | ---------------------------: |
 | hello | 478 | 289416 | 4537096 | 1180416 |
 | fib | 609 | 291696 | 4541112 | 1183104 |
-| mandel | 916 | 291776 | 4541208 | 1183168 |
+| mandel | 911 | 291776 | 4541208 | 1183168 |
 | sieve | 689 | 292016 | 4541424 | 1183392 |
 | mix | 845 | 291864 | 4541416 | 1183328 |
 | stats | 765 | 292048 | 4541392 | 1183360 |
 | refs | 888 | 292240 | 4542008 | 1183648 |
 | heap | 930 | 292384 | 4542224 | 1183840 |
 | callrec | 613 | 291680 | 4541144 | 1183104 |
-| forloops | 739 | 292480 | 4541808 | 1183808 |
+| forloops | 733 | 292480 | 4541808 | 1183808 |
 
 rmc links no libc and no runtime, so a plain `rustc -O` build (which
 statically links libstd, the panic machinery and the allocator) is the
@@ -72,36 +72,36 @@ fat-LTO stripped build quoted in the headline table.
 
 | program | compiler | wall (ms) | CPU (ms) | peak RSS (kB) |
 | ------- | -------- | --------: | -------: | ------------: |
-| hello | rmc | 0.26 | 0.15 | 24 |
-| hello | rustc | 0.86 | 0.72 | 2096 |
-| hello | ratio (rustc/rmc) | 3.30 | 4.83 | 87.33 |
-| fib | rmc | 7.18 | 7.02 | 24 |
-| fib | rustc | 7.10 | 6.98 | 2028 |
-| fib | ratio (rustc/rmc) | 0.99 | 0.99 | 84.50 |
-| mandel | rmc | 92.75 | 92.55 | 24 |
-| mandel | rustc | 105.38 | 105.14 | 2028 |
-| mandel | ratio (rustc/rmc) | 1.14 | 1.14 | 84.50 |
-| sieve | rmc | 1.55 | 1.42 | 1584 |
-| sieve | rustc | 2.43 | 2.30 | 3632 |
-| sieve | ratio (rustc/rmc) | 1.56 | 1.62 | 2.29 |
-| mix | rmc | 16.86 | 16.72 | 24 |
-| mix | rustc | 15.44 | 15.29 | 2052 |
-| mix | ratio (rustc/rmc) | 0.92 | 0.91 | 85.50 |
-| stats | rmc | 3.36 | 3.22 | 24 |
-| stats | rustc | 3.77 | 3.64 | 2096 |
-| stats | ratio (rustc/rmc) | 1.12 | 1.13 | 87.33 |
-| refs | rmc | 1.75 | 1.63 | 24 |
-| refs | rustc | 3.85 | 3.72 | 2024 |
-| refs | ratio (rustc/rmc) | 2.20 | 2.28 | 84.33 |
+| hello | rmc | 0.25 | 0.13 | 24 |
+| hello | rustc | 0.83 | 0.71 | 2080 |
+| hello | ratio (rustc/rmc) | 3.29 | 5.63 | 86.67 |
+| fib | rmc | 8.98 | 8.72 | 24 |
+| fib | rustc | 7.15 | 7.00 | 2068 |
+| fib | ratio (rustc/rmc) | 0.80 | 0.80 | 86.17 |
+| mandel | rmc | 92.30 | 92.11 | 24 |
+| mandel | rustc | 105.32 | 105.12 | 2092 |
+| mandel | ratio (rustc/rmc) | 1.14 | 1.14 | 87.17 |
+| sieve | rmc | 1.51 | 1.41 | 1584 |
+| sieve | rustc | 2.44 | 2.31 | 3604 |
+| sieve | ratio (rustc/rmc) | 1.61 | 1.64 | 2.28 |
+| mix | rmc | 16.83 | 16.66 | 24 |
+| mix | rustc | 15.47 | 15.31 | 2064 |
+| mix | ratio (rustc/rmc) | 0.92 | 0.92 | 86.00 |
+| stats | rmc | 3.34 | 3.22 | 24 |
+| stats | rustc | 3.74 | 3.62 | 2060 |
+| stats | ratio (rustc/rmc) | 1.12 | 1.12 | 85.83 |
+| refs | rmc | 1.76 | 1.62 | 24 |
+| refs | rustc | 3.85 | 3.73 | 2028 |
+| refs | ratio (rustc/rmc) | 2.19 | 2.30 | 84.50 |
 | heap | rmc | 3.31 | 3.17 | 4712 |
-| heap | rustc | 3.43 | 3.27 | 6708 |
-| heap | ratio (rustc/rmc) | 1.04 | 1.03 | 1.42 |
-| callrec | rmc | 2.88 | 2.76 | 24 |
-| callrec | rustc | 2.81 | 2.70 | 1996 |
-| callrec | ratio (rustc/rmc) | 0.97 | 0.98 | 83.17 |
-| forloops | rmc | 2.09 | 1.96 | 24 |
-| forloops | rustc | 3.33 | 3.20 | 2024 |
-| forloops | ratio (rustc/rmc) | 1.60 | 1.63 | 84.33 |
+| heap | rustc | 3.51 | 3.38 | 6692 |
+| heap | ratio (rustc/rmc) | 1.06 | 1.06 | 1.42 |
+| callrec | rmc | 2.91 | 2.78 | 24 |
+| callrec | rustc | 2.82 | 2.71 | 2004 |
+| callrec | ratio (rustc/rmc) | 0.97 | 0.97 | 83.50 |
+| forloops | rmc | 1.46 | 1.35 | 24 |
+| forloops | rustc | 3.31 | 3.20 | 2076 |
+| forloops | ratio (rustc/rmc) | 2.26 | 2.37 | 86.50 |
 
 Ratios are rustc divided by rmc, so a value above 1 means rmc is
 better on that dimension.
