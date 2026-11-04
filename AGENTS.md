@@ -36,6 +36,7 @@ python3 tests/run.py -v
 python3 tools/fuzz.py --mode expr --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1
 python3 tools/fuzz.py --mode opt --n 500 --seed 1
+python3 tools/fuzz.py --mode arith --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 ```
 
@@ -626,8 +627,12 @@ found the argument-evaluation-order bug); `opt` mode builds a self-recursive
 right-spine function (TCO), a loop with an invariant subexpression (LICM) and
 calls to small helpers with trivial and non-trivial arguments (inlining) — the
 shapes the other two modes never emit, so the optimiser passes are exercised
-with randomised inputs rather than only the fixed corpus cases. It compares
-stdout and exit status against `rustc -O`, and it recompiles each program with
+with randomised inputs rather than only the fixed corpus cases. `arith` mode
+builds overflowing arithmetic near `i64::MAX` — a `lea`/`imul` shape and a
+loop-carried accumulator, the two strength reductions `gen_expr_into_reg` makes
+— so the `--overflow-checks` trap actually fires: the other modes use small
+values, so no generated program ever traps and the trap was reached only by the
+`ovf` corpus case. It compares stdout and exit status against `rustc -O`, and it recompiles each program with
 every optimiser pass off in turn (`--no-inline`, `--no-licm`, `--no-tco`, all
 three), the same matrix the corpus suite uses — a pass-specific bug is otherwise
 invisible, because the fuzzer used to run only the default configuration.

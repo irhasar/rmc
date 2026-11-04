@@ -12,10 +12,14 @@ Usage:
     tools/fuzz.py --mode expr --n 200 --seed 7 --keep /tmp/fail
 
 Modes:
-    expr  random integer expressions over three variables, with calls and
-          guarded division
+    expr  random integer expressions over three variables, with calls,
+          guarded division and comparisons
     stmt  loops, conditionals, match, arrays and aggregate calls, with
           side-effecting argument order and bounds-checked indexing
+    opt   a self-recursive function, an invariant loop and inlined helpers,
+          to exercise TCO, LICM and inlining
+    arith overflowing arithmetic near i64::MAX, to exercise the overflow
+          trap and the strength reductions that must be off under it
 
 The reference is `rustc -O`, so a mismatch is a real semantic divergence.
 """
@@ -286,6 +290,66 @@ def gen_stmt_program(rng):
 
 
 # ---------------------------------------------------------------- opt mode
+
+def gen_arith_program(rng):
+    """A program whose arithmetic actually overflows, so `--overflow-checks`
+    traps and the strength reductions that must be disabled under it are
+    exercised. `expr`/`stmt`/`opt` use small values, so no generated program
+    ever traps: the trap path was reached only by the single `ovf` corpus case,
+    and the `lea`/accumulate folds (`gen_expr_into_reg`, which have no `jo` and
+    are skipped under `--overflow-checks`) were never checked for it.
+
+    Values sit near `i64::MAX`, and every operator can overflow. The program is
+    run both ways: with checks off, where rmc and rustc must wrap identically,
+    and with checks on against a `-C overflow-checks=on` rustc, where both must
+    trap at the same point. A missing `jo` after a folded `add`, or a fold that
+    wrongly survives the check, shows up as a divergence.
+
+    Literals stay in `0..=i64::MAX`: rmc parses the magnitude before the sign,
+    so `-9223372036854775808` is rejected as an out-of-range literal.
+    """
+    MAX = 9223372036854775807
+    big = rng.choice([MAX, MAX - 1, MAX - 2, MAX - rng.randint(3, 999)])
+    # `x + c`/`x - c` are one `lea`; `x * k`/`x * k + c` are the scaled form;
+    # `x + x` is the doubled form. Each must fall back to `add`/`imul` + `jo`
+    # under `--overflow-checks`.
+    shape = rng.choice([
+        "x + 1", "x - 1", "x + 7 - 3", "x + x", "x * 2", "x * 3", "x * 3 + 1",
+        "x * 9 - 2", "x * 2 + 5", "x + x + 3",
+    ])
+    # A loop-carried accumulator: `a` is `dst`, so `gen_accumulate` flattens the
+    # chain into a run of `add`s on `a`'s register, which has no `jo`.
+    step = rng.choice(["a + 1 + 1", "a + i + 1", "a + i * 2 + 3", "a + a", "a + i + i"])
+    n0 = rng.randint(1, 4)
+    rms = [
+        f"fn f(x: i64) -> i64 {{ return {shape}; }}",
+        "fn acc(n: i64) -> i64 {",
+        "    let mut a: i64 = 9223372036854775807;",
+        "    let mut i: i64 = 0;",
+        f"    while i < n {{ a = {step}; i = i + 1; }}",
+        "    return a;",
+        "}",
+        "fn main() -> i64 {",
+        f"    print_i64(f({big}));",
+        f"    print_i64(acc({n0}));",
+        "    return 0;",
+        "}",
+    ]
+    rs = [
+        f"fn f(x: i64) -> i64 {{ {shape} }}",
+        "fn acc(n: i64) -> i64 {",
+        "    let mut a: i64 = 9223372036854775807;",
+        "    let mut i: i64 = 0;",
+        f"    while i < n {{ a = {step}; i = i + 1; }}",
+        "    a",
+        "}",
+        "fn main() {",
+        f'    println!("{{}}", f({big}));',
+        f'    println!("{{}}", acc({n0}));',
+        "}",
+    ]
+    return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
+
 
 def gen_opt_program(rng):
     """A program built to exercise the three optimiser passes with randomised
@@ -736,7 +800,7 @@ def run_reject():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "robust", "reject"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "robust", "reject"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -760,12 +824,17 @@ def main():
     if not rustc_available():
         print("rustc not found; set RUSTC or install a toolchain", file=sys.stderr)
         return 2
+    # `arith` mode generates overflowing arithmetic, so the `--overflow-checks`
+    # configs are always wanted: the whole point is to compare the trap.
+    if args.mode == "arith":
+        args.overflow = True
 
     # Per-process temp dir: two fuzz runs sharing one would overwrite each
     # other's p.s/p.rms and report a bogus assembler failure.
     tmp = f"/tmp/rmc-fuzz-{os.getpid()}"
     os.makedirs(tmp, exist_ok=True)
-    gen = {"expr": gen_expr_program, "stmt": gen_stmt_program, "opt": gen_opt_program}[args.mode]
+    gen = {"expr": gen_expr_program, "stmt": gen_stmt_program,
+           "opt": gen_opt_program, "arith": gen_arith_program}[args.mode]
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus
     # suite; a fuzz program is otherwise only checked with every pass on, so a
