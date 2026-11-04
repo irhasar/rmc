@@ -1737,6 +1737,40 @@ fn self_recursion_becomes_a_loop_with_one_call_per_level() {
 }
 
 #[test]
+fn a_left_operand_that_is_not_a_self_call_still_folds_the_right_spine() {
+    // `tree(n) = 1 + tree(n-1) + tree(n-2)` parses as `(1 + tree(n-1)) + tree(n-2)`,
+    // so the left operand of the top `+` is *not* a self-call. The right operand
+    // still is, and the right spine can still be folded into a loop, so the body
+    // must make exactly one `call tree` per level (rustc does the same).
+    let out = asm(
+        "fn tree(n: i64) -> i64 { if n <= 1 { return n; } \
+         return 1 + tree(n - 1) + tree(n - 2); } \
+         fn main() -> i64 { return tree(arg_i64(1)); }",
+    );
+    let tree = &out[out.find("tree:").unwrap()..];
+    let tree = &tree[..tree.find(".size tree").unwrap()];
+    assert_eq!(tree.matches("call tree").count(), 1, "one call per level:\n{tree}");
+    assert!(tree.contains("lea -2(%rbx), %rbx"), "the loop advances n by -2:\n{tree}");
+}
+
+#[test]
+fn the_self_recursion_pass_leaves_a_foreign_call_in_the_left_operand_alone() {
+    // The loop evaluates the left operand once per level, so a call to *another*
+    // function there could be duplicated or reordered relative to the recursion;
+    // only a self-call is safe. Both calls must stay. `g` is itself recursive, so
+    // the inliner cannot remove its call and the pass must see it.
+    let out = asm(
+        "fn g(n: i64) -> i64 { if n < 2 { return n; } return g(n - 1) + g(n - 2); } \
+         fn f(n: i64) -> i64 { if n < 2 { return n; } return g(n) + f(n - 1); } \
+         fn main() -> i64 { return f(5); }",
+    );
+    let f = &out[out.find("f:").unwrap()..];
+    let f = &f[..f.find(".size f").unwrap()];
+    assert_eq!(f.matches("call f").count(), 1, "the self-call is not folded away:\n{f}");
+    assert!(f.contains("call g"), "the foreign call is kept:\n{f}");
+}
+
+#[test]
 fn the_self_recursion_pass_leaves_a_non_associative_recursion_alone() {
     // `alt(x) = alt(x-1) - alt(x-2)` is not associative, so the rewrite would be
     // wrong; the pass must decline it and keep both calls.

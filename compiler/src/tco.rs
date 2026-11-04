@@ -8,39 +8,46 @@
 //!
 //! which makes *two* recursive calls per level. rustc folds the right spine —
 //! the `fib(n - 2)` chain — into a loop so only one call per level remains, and
-//! this pass does the same, in the one shape where the rewrite is exact:
+//! this pass does the same, in the shapes where the rewrite is exact:
 //!
 //! ```text
-//! f(x) = f(g(x)) op f(h(x))        op is `+` or `*`
+//! f(x) = t(x) op f(h(x))           op is `+` or `*`
 //! ```
 //!
-//! Because `op` is associative and commutative, unrolling the `h` chain gives
+//! Here `t` is any pure expression — it may itself contain a self-call, which
+//! is what `tree(n) = 1 + tree(n - 1) + tree(n - 2)` needs: parsed left to
+//! right that is `t op f(h)` with `t = 1 + f(n - 1)` and `h = n - 2`. When both
+//! operands are self-calls (`fib`), `t` is just `f(g)` and this is the original
+//! shape.
+//!
+//! Because `op` is associative, unrolling the `h` chain gives
 //!
 //! ```text
-//! f(x) = f(g(x)) op f(g(h(x))) op f(g(h(h(x)))) op ... op guard(h^k(x))
+//! f(x) = t(x) op t(h(x)) op t(h(h(x))) op ... op guard(h^k(x))
 //! ```
 //!
 //! which is exactly the loop
 //!
 //! ```text
 //! acc = identity                  // 0 for `+`, 1 for `*`
-//! while !cond(x) { acc = acc op f(g(x)); x = h(x); }
+//! while !cond(x) { acc = acc op t(x); x = h(x); }
 //! return acc op guard(x)
 //! ```
 //!
-//! This is not a tail-call rewrite: the recursive call `f(g(x))` stays a call.
+//! This is not a tail-call rewrite: the recursive call inside `t` stays a call.
 //! It removes the *second* call per level, so the tree is halved — the same
-//! constant-factor win rustc gets, and the reason `fib` is the one benchmark
-//! rmc used to lose.
+//! constant-factor win rustc gets, and the reason `fib` and `tree` are the
+//! call-heavy benchmarks rmc used to lose.
 //!
 //! The pass is deliberately narrow. The function must
 //!
 //! * take exactly one `i64` parameter and return `i64` (a free function, not a
 //!   method) — `x` is the only state the transform has to track;
 //! * have exactly two statements: a base-case `if cond { return guard; }` and a
-//!   `return f(g) op f(h)` with both operands calls to itself;
-//! * keep `cond`, `guard`, `g` and `h` free of calls and `return`s, so evaluating
-//!   them a different number of times cannot change behaviour. rmc has no
+//!   `return t op f(h)` whose right operand is a call to itself;
+//! * keep `cond`, `guard` and `h` free of calls and `return`s, and `t` free of
+//!   `return`s and of calls to anything but itself, so evaluating them a
+//!   different number of times cannot change behaviour. rmc has no
 //!   side-effecting user function, but a `print` nested in an argument would
 //!   otherwise be duplicated by the loop, and a `return` nested in an argument
 //!   would leave the transformed loop instead of the recursive frame that wrote
@@ -90,19 +97,24 @@ fn try_transform(f: &FnDef) -> Option<Block> {
         _ => return None,
     };
 
-    // Statement 1: `return f(g) op f(h)`, `op` associative.
-    let (op, g, h) = match &f.body.stmts[1] {
+    // Statement 1: `return t op f(h)`, `op` associative, `f(h)` a self-call.
+    let (op, t, h) = match &f.body.stmts[1] {
         Stmt::Return(Some(Expr::Bin(op @ (BinOp::Add | BinOp::Mul), l, r))) => {
-            let g = self_arg(l, &f.name)?;
             let h = self_arg(r, &f.name)?;
-            (*op, g, h)
+            (*op, l.as_ref().clone(), h)
         }
         _ => return None,
     };
 
-    // Every piece must be pure and must not leave the function early, or the
-    // loop would duplicate a side effect or exit without adding the accumulator.
-    if [&cond, &guard, &g, &h].iter().any(|e| has_call(e) || has_return(e)) {
+    // `cond`, `guard` and `h` must be pure and must not leave the function
+    // early, or the loop would duplicate a side effect or exit without adding
+    // the accumulator. `t` is evaluated once per level in both forms, but it
+    // may call only the function being transformed (so the loop cannot duplicate
+    // a side effect of some *other* function).
+    if [&cond, &guard, &h].iter().any(|e| has_call(e) || has_return(e))
+        || has_return(&t)
+        || calls_other(&t, &f.name)
+    {
         return None;
     }
 
@@ -112,16 +124,9 @@ fn try_transform(f: &FnDef) -> Option<Block> {
     let x = Expr::Var { name: pname.clone(), slot: pslot, ty: Type::I64 };
     let identity = if op == BinOp::Add { Expr::Int(0) } else { Expr::Int(1) };
 
-    let call_g = Expr::Call {
-        name: f.name.clone(),
-        args: vec![g],
-        arg_slots: vec![(-1, 0)],
-        ret_slot: -1,
-        ret_ty: Type::I64,
-    };
     let step = Stmt::Assign {
         target: acc.clone(),
-        value: Expr::Bin(op, Box::new(acc.clone()), Box::new(call_g)),
+        value: Expr::Bin(op, Box::new(acc.clone()), Box::new(t)),
     };
     let advance = Stmt::Assign { target: x.clone(), value: h };
     let loop_body = Block { stmts: vec![step, advance], tail: None };
@@ -149,6 +154,68 @@ fn self_arg(e: &Expr, name: &str) -> Option<Expr> {
     match e {
         Expr::Call { name: n, args, .. } if n == name && args.len() == 1 => Some(args[0].clone()),
         _ => None,
+    }
+}
+
+/// True when `e` contains a call to a function other than `name`. The loop
+/// evaluates `t` once per level, so a call inside it is fine only if it is the
+/// self-call whose tree the rewrite is already halving; a call to any other
+/// function could be duplicated or reordered relative to the recursion.
+fn calls_other(e: &Expr, name: &str) -> bool {
+    match e {
+        Expr::Call { name: n, args, .. } => {
+            n != name || args.iter().any(|a| calls_other(a, name))
+        }
+        Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } => false,
+        Expr::Bin(_, a, b) => calls_other(a, name) || calls_other(b, name),
+        Expr::Un(_, a) | Expr::Cast(a, _) | Expr::AddrOf { expr: a, .. } | Expr::Deref { expr: a, .. } => {
+            calls_other(a, name)
+        }
+        Expr::If(c, t, e) => {
+            calls_other(c, name)
+                || t.stmts.iter().any(|s| stmt_calls_other(s, name))
+                || t.tail.as_deref().map_or(false, |x| calls_other(x, name))
+                || e.as_ref().map_or(false, |b| {
+                    b.stmts.iter().any(|s| stmt_calls_other(s, name))
+                        || b.tail.as_deref().map_or(false, |x| calls_other(x, name))
+                })
+        }
+        Expr::Block(b) | Expr::MatchBoundary(b, _) => {
+            b.stmts.iter().any(|s| stmt_calls_other(s, name))
+                || b.tail.as_deref().map_or(false, |x| calls_other(x, name))
+        }
+        Expr::Index(a, b) => calls_other(a, name) || calls_other(b, name),
+        Expr::Field { base, .. } => calls_other(base, name),
+        Expr::StructLit { fields, .. } => fields.iter().any(|fi| calls_other(&fi.value, name)),
+        Expr::ArrayLit(v, _) => calls_other(v, name),
+        Expr::ArrayList(v) => v.iter().any(|x| calls_other(x, name)),
+        Expr::MethodCall { recv, args, .. } => {
+            calls_other(recv, name) || args.iter().any(|a| calls_other(a, name))
+        }
+        Expr::EnumVariant { .. } => false,
+        Expr::EnumCtor { args, .. } => args.iter().any(|a| calls_other(a, name)),
+        Expr::VariantTest { scrutinee, .. } => calls_other(scrutinee, name),
+        Expr::BoolTest { scrutinee, .. } => calls_other(scrutinee, name),
+        Expr::EnumPayload { recv, .. } => calls_other(recv, name),
+    }
+}
+
+fn stmt_calls_other(s: &Stmt, name: &str) -> bool {
+    match s {
+        Stmt::Let { init, .. } => init.as_ref().map_or(false, |e| calls_other(e, name)),
+        Stmt::Assign { target, value } => calls_other(target, name) || calls_other(value, name),
+        Stmt::Expr(e) => calls_other(e, name),
+        Stmt::While(c, b) => {
+            calls_other(c, name) || b.stmts.iter().any(|s| stmt_calls_other(s, name))
+        }
+        Stmt::Loop(b) => b.stmts.iter().any(|s| stmt_calls_other(s, name)),
+        Stmt::For { start, end, body, .. } => {
+            calls_other(start, name)
+                || calls_other(end, name)
+                || body.stmts.iter().any(|s| stmt_calls_other(s, name))
+        }
+        Stmt::Return(v) => v.as_ref().map_or(false, |e| calls_other(e, name)),
+        Stmt::Break | Stmt::Continue => false,
     }
 }
 
@@ -210,7 +277,9 @@ fn stmt_has_call(s: &Stmt) -> bool {
 /// the transformed loop rather than from the recursive frame that wrote it.
 fn has_return(e: &Expr) -> bool {
     match e {
-        Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::Call { .. } => false,
+        Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } => false,
+        // A `return` can hide in a call argument, e.g. `f({ if c { return 0; } x })`.
+        Expr::Call { args, .. } => args.iter().any(has_return),
         Expr::Bin(_, a, b) => has_return(a) || has_return(b),
         Expr::Un(_, a) | Expr::Cast(a, _) | Expr::AddrOf { expr: a, .. } | Expr::Deref { expr: a, .. } => {
             has_return(a)

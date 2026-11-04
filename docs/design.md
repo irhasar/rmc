@@ -50,8 +50,9 @@ driver shells out to GNU `as` and `ld`.
    before codegen, so the peephole pass sees the inlined arithmetic. See
    "Inlining" below.
 5. **Self-recursion to loop** (`tco.rs`) — rewrites a function of the shape
-   `f(x) = f(g(x)) op f(h(x))` (with `op` associative, `+` or `*`) so the `h`
-   chain becomes a loop and only one recursive call per level remains. Runs after
+   `f(x) = t(x) op f(h(x))` (with `op` associative, `+` or `*`, and `t` any pure
+   expression that may itself contain a self-call) so the `h` chain becomes a
+   loop and only one recursive call per level remains. Runs after
    inlining and before codegen. See "Self-recursion to loop" below.
 6. **Loop-invariant code motion** (`licm.rs`) — hoists a pure, invariant scalar
    subexpression out of a loop body so it is computed once instead of every
@@ -195,6 +196,23 @@ details are easy to get wrong and are covered by `tests/cases/div`:
   zero.
 
 Modulo reuses the quotient: `q * d - dividend` gives the remainder.
+
+### Division by a run-time divisor
+
+A variable divisor cannot use a magic number, but it can often use a narrower
+`div`. `emit_div` first tests both operands unsigned against 2^32; when both fit,
+`xor %edx, %edx` plus a 32-bit `div <reg>d` computes the exact result in about 20
+cycles instead of the 30–40 of a 64-bit `idiv`. The test must be unsigned
+(`jae`): a negative operand has the sign bit set and compares as a huge unsigned
+value, so it correctly falls through to `idiv` rather than being truncated.
+`mix`'s `gcd` has small operands, so it takes the narrow path every iteration.
+
+Two divisors have no quotient and must trap rather than fault: zero, and `-1`
+with an `i64::MIN` dividend. The zero check runs before the split, because zero
+fits in 32 bits and would otherwise reach `div`. The `MIN / -1` check runs only on
+the `idiv` path, because a dividend that fits in 32 bits is never `MIN`; putting
+it before the split would cost every division a `movabs` plus a branch for
+nothing.
 
 ## Registers
 
@@ -387,30 +405,37 @@ fn fib(n: i64) -> i64 { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); }
 
 LLVM folds the right spine — the `fib(n - 2)` chain — into a loop, leaving one
 call per level, and that constant factor is why `fib` used to be the one
-benchmark `rmc` lost. `tco.rs` performs the same rewrite, in the one shape where
-it is exact. Given
+benchmark `rmc` lost. `tco.rs` performs the same rewrite, in the shapes where it
+is exact. Given
 
 ```text
-f(x) = f(g(x)) op f(h(x))          op is `+` or `*`
+f(x) = t(x) op f(h(x))             op is `+` or `*`
 ```
 
-associativity and commutativity let the `h` chain be unrolled:
+where `t` is any pure expression — it may itself contain a self-call, which is
+what `tree(n) = 1 + tree(n - 1) + tree(n - 2)` needs (parsed left to right that
+is `t op f(h)` with `t = 1 + f(n - 1)` and `h = n - 2`; when both operands are
+self-calls, `t` is just `f(g)`). Associativity lets the `h` chain be unrolled:
 
 ```text
-f(x) = f(g(x)) op f(g(h(x))) op f(g(h(h(x)))) op ... op guard(h^k(x))
+f(x) = t(x) op t(h(x)) op t(h(h(x))) op ... op guard(h^k(x))
 ```
 
 which is exactly the loop
 
 ```text
 acc = identity                     // 0 for `+`, 1 for `*`
-while !cond(x) { acc = acc op f(g(x)); x = h(x); }
+while !cond(x) { acc = acc op t(x); x = h(x); }
 return acc op guard(x)
 ```
 
-The recursive call `f(g(x))` stays a call; only the second call per level is
-removed, halving the call tree (2.0x on `fib`). The pass runs after inlining and
-before LICM, and is turned off by `--no-tco`. It is also skipped entirely under
+The recursive call inside `t` stays a call; only the second call per level is
+removed, halving the call tree (2.0x on `fib`). `t` is evaluated once per level
+in both forms, so it may call the function being transformed but no other
+function (that call could be duplicated or reordered), and it may not contain a
+`return` (which would leave the loop instead of the recursive frame). The pass
+runs after inlining and before LICM, and is turned off by `--no-tco`. It is also
+skipped entirely under
 `--overflow-checks`: reassociation is only exact for wrapping arithmetic, and the
 checked trap fires on the first overflowing intermediate, which the loop forms in
 a different order than the recursion.
@@ -419,18 +444,21 @@ The shape test is deliberately narrow, because a wrong match is a wrong program.
 The function must take exactly one `i64` and return `i64` (so `x` is the only
 state), be a free function rather than a method, and consist of exactly two
 statements: a base-case `if cond { return guard; }` with no `else`, and a
-`return f(g) op f(h)` whose two operands are both calls to the function itself.
-`op` must be `+` or `*` — subtraction and division are not associative, and a
-recursion that uses them is left alone. Finally `cond`, `guard`, `g` and `h` must
-be call-free and return-free, so that evaluating them a different number of times
-cannot change behaviour: `rmc` has no side-effecting user function, but a `print`
-nested in an argument would otherwise be duplicated by the loop, and a `return`
-nested in an argument would leave the transformed loop instead of the recursive
-frame, dropping the accumulator.
+`return t op f(h)` whose right operand is a call to the function itself. `op`
+must be `+` or `*` — subtraction and division are not associative, and a
+recursion that uses them is left alone. Finally `cond`, `guard` and `h` must be
+call-free and return-free, and `t` must be return-free and call only the function
+being transformed, so that evaluating them a different number of times cannot
+change behaviour: `rmc` has no side-effecting user function, but a `print` nested
+in an argument would otherwise be duplicated by the loop, and a `return` nested
+in an argument would leave the transformed loop instead of the recursive frame,
+dropping the accumulator.
 
 The transform is validated by `tests/cases/tco.{rms,rs}`, which diffs `fib` and
-`fact` against rustc for `n` in `0..20`, and by a unit test that checks a
-non-associative recursion keeps both calls.
+`fact` against rustc for `n` in `0..20`, and `tests/cases/callrec.{rms,rs}`,
+which covers the `1 + f(n-1) + f(n-2)` shape, plus unit tests that check a
+non-associative recursion keeps both calls and a foreign call in the left operand
+is not folded.
 
 ## Loop-invariant code motion
 

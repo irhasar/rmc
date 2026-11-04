@@ -463,11 +463,14 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   accumulation into one hoisted value, so its loop does a single add per
   iteration, and it wins the ratio by more than 2x. Read the number as "two real
   loops doing the same arithmetic", not as an instruction-for-instruction tie.
-- **`callrec` is the honest losing case.** Non-tail recursion (`tree(n) = 1 +
-  tree(n-1) + tree(n-2)`) cannot be inlined by either compiler, so it measures
-  raw call overhead plus argument setup. rmc is ~0.60x rustc there: the
-  stack-based generator spills operands around every call and has no register
-  allocator. Keep this benchmark; it is what stops the runtime story from being a
+- **`callrec` is the call-heavy case, and it used to lose.** Non-tail recursion
+  (`tree(n) = 1 + tree(n-1) + tree(n-2)`) cannot be inlined by either compiler,
+  so it measures raw call overhead plus argument setup, where the stack-based
+  generator with no register allocator is weakest. It was ~0.60x rustc until the
+  self-recursion pass learned to fold the right spine of `1 + f(n-1) + f(n-2)`
+  (not just the `f(g) + f(h)` shape), which leaves one call per level like rustc;
+  it now sits at parity. The shape the pass still does not match is the losing
+  case, so keep this benchmark: it is what stops the runtime story from being a
   uniform "rmc wins" claim.
 - **Artifact size depends entirely on the rustc reference build.** The headline
   table compares against `-O` + fat LTO + `codegen-units=1` + `panic=abort` +
@@ -774,8 +777,9 @@ locals are promoted to callee-saved registers by mention count (`promote`), and
 temporaries crossing a call use `SPILL_REGS`, but a dying temporary's register is
 not reused for a later local (roadmap item 1). The optimiser is an AST inlining
 pass (small, straight-line, scalar functions), a self-recursion-to-loop pass
-(`f(x) = f(g(x)) op f(h(x))` with `op` associative becomes a loop with one call
-per level, halving `fib`'s call tree), a loop-invariant code motion pass, plus a
+(`f(x) = t(x) op f(h(x))` with `op` associative and `t` any pure expression that
+may contain a self-call becomes a loop with one call per level, halving the call
+tree of both `fib` and `tree`), a loop-invariant code motion pass, plus a
 small peephole pass (operand/comparison/array-address folding, constant folding,
 division by a constant, a 32-bit `div` fast path for a variable divisor). A *constant* index out of
 range is a compile error; a *variable* index is unchecked by default (used
@@ -942,11 +946,19 @@ The README's roadmap lists the intended next steps.
   the check. With overflow checks off, the shift is unchecked, matching Rust's
   default `<<` (which does not panic on an out-of-range count in release).
 - **`tests/cases/divtrap.rms` and `shovf.rms` pin the trap codegen.** `divtrap`
-  exercises `MIN / -1` (SIGFPE on x86 `idiv`) and division by zero under
-  `--overflow-checks`; `shovf` exercises an out-of-range shift count. Both are
-  differential (stdout and exit status must match the rustc twin built with
-  `-C overflow-checks=on`) and are what catch a trap that fires when it should
-  not, or fails to fire when it should.
+  exercises `MIN / -1` (SIGFPE on x86 `idiv`) and division by zero, both of which
+  trap *without* `--overflow-checks` (Rust panics on them by default); it covers
+  the constant `-1` divisor (strength-reduced) and a runtime divisor (`idiv`).
+  `shovf` (with a `.overflow` marker) exercises an out-of-range shift count under
+  `--overflow-checks`. Both are differential (stdout and exit status must match
+  the rustc twin) and are what catch a trap that fires when it should not, or
+  fails to fire when it should.
+- **The `MIN / -1` guard sits in the 64-bit slow path, not before the split.**
+  `emit_div` splits on whether both operands fit in 32 bits; a dividend that does
+  is never `MIN` (its high bit is clear), so the `movabs $0x8000...; cmp; jne`
+  guard only runs on the `idiv` path. Putting it before the split cost every
+  division a `movabs`+`cmp`+branch for nothing. The zero-divisor check *must*
+  stay before the split: zero fits in 32 bits and would otherwise reach `div`.
 - **The self-recursion pass must synthesise the AST the parser would build.** It
   runs after sema, so it has no `Sema` to allocate slots or resolve names. It
   reuses the parameter's own `(name, slot, ty)` for the loop variable, and takes
@@ -956,10 +968,13 @@ The README's roadmap lists the intended next steps.
   return needs no hidden pointer. Every synthesized `Expr::Var` must carry the
   right `slot`/`ty`, or codegen emits a load from the wrong frame word.
 - **The pass is guarded to be exact, not approximate.** Only `+`/`*` (associative)
-  qualify; `cond`, `guard`, `g` and `h` must be call-free and return-free, or the
-  loop would duplicate a side effect or leave without adding the accumulator. It
+  qualify; `cond`, `guard` and `h` must be call-free and return-free, and `t` must
+  be return-free and call only the function being transformed, or the loop would
+  duplicate a side effect or leave without adding the accumulator. It
   is also skipped entirely under `--overflow-checks`, since reassociating checked
   arithmetic traps on a different intermediate than the recursion. A shape that
   does not match is left completely alone. `tests/cases/tco.{rms,rs}` diffs `fib`
-  and `fact` against rustc; unit tests pin the non-associative
-  `f(x-1) - f(x-2)` case, a `return` in an argument, and overflow checks.
+  and `fact` against rustc and `tests/cases/callrec.{rms,rs}` covers the
+  `1 + f(n-1) + f(n-2)` shape; unit tests pin the non-associative
+  `f(x-1) - f(x-2)` case, a `return` in an argument, a foreign call in the left
+  operand, and overflow checks.

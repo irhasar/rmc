@@ -1,8 +1,9 @@
 // A call-heavy workload: non-tail recursion. Neither compiler can inline a
-// recursive callee, so this measures raw call/return overhead plus the
-// argument setup, which is where a stack-based code generator with no register
-// allocator is weakest. rmc is expected to be *slower* here than rustc; the
-// point of the program is to report that honestly rather than to win.
+// recursive callee, so this measures raw call/return overhead plus the argument
+// setup, which is where a stack-based code generator with no register allocator
+// is weakest. The recursion-to-loop pass folds the right spine (the `tree(n-2)`
+// chain) into a loop, so only one call per level remains - the same transform
+// rustc applies - which is what keeps rmc at parity here.
 fn tree(n: i64) -> i64 {
     if n <= 1 {
         return n;
