@@ -595,7 +595,10 @@ The checks, all in `sema.rs`:
 the safe direction; it is listed by the audit harness but is not a soundness bug.
 
 `tools/fuzz.py` is the differential fuzzer. `expr` mode builds random integer
-expressions with calls and guarded division; `stmt` mode builds loops,
+expressions with calls, guarded division and comparisons (`(x < y) as i64`,
+which is the only generator that feeds `emit_cmp`'s operand-class dispatch:
+immediate/immediate, immediate/memory, memory/immediate, memory/memory);
+`stmt` mode builds loops,
 conditionals, `match`, arrays and aggregate calls, and deliberately places
 side-effecting scalar and aggregate arguments in every position (this is what
 found the argument-evaluation-order bug); `opt` mode builds a self-recursive

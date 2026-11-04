@@ -116,7 +116,8 @@ of two makes the `div` case fail.
 
 `tools/fuzz.py` generates random programs and checks them against `rustc -O`
 the same way, for the cases a hand-written suite does not think of. It has three
-modes: `expr` for integer expressions, `stmt` for loops, conditionals, `match`,
+modes: `expr` for integer expressions (including comparisons), `stmt` for
+loops, conditionals, `match`,
 arrays and aggregate calls (including argument evaluation order), and `opt` for
 a self-recursive function, an invariant loop and small inlined helpers, the
 shapes the other two do not emit. Every program is recompiled with each
