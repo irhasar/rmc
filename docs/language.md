@@ -16,7 +16,9 @@ time; there are no runtime type errors.
 | `Name`       | an enum declared with `enum Name { .. }`      |
 | `()`         | unit, the result of a statement or `main`     |
 
-Integer and boolean literals are inferred. Explicit types can be given on
+Integer and boolean literals are inferred. The smallest `i64` value is written
+`-9223372036854775808` (or `-0x8000000000000000`); the magnitude alone is out of
+range, as in Rust. Explicit types can be given on
 `let` bindings and function signatures. `as` converts among `i64`, `bool` and an
 enum tag, and casts a `&mut T` to a `&T`. A reference may only be cast to a
 reference of the same type, never to a scalar or to `&mut T`. Two casts go

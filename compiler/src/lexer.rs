@@ -5,6 +5,11 @@ pub enum Tok {
     // literals / identifiers
     Ident(String),
     Int(i64),
+    /// The magnitude `2^63`, which does not fit an `i64` but is the operand of
+    /// the `i64::MIN` literal `-9223372036854775808`. The parser folds it into
+    /// `Expr::Int(i64::MIN)` only when it directly follows a `-`; anywhere else
+    /// it is out of range, matching rustc.
+    IntMinMagnitude,
     Str(String),
     // keywords
     Fn,
@@ -83,6 +88,7 @@ impl Tok {
         match self {
             Tok::Ident(s) => format!("identifier `{s}`"),
             Tok::Int(v) => format!("integer `{v}`"),
+            Tok::IntMinMagnitude => "integer `9223372036854775808`".into(),
             Tok::Str(_) => "string literal".into(),
             Tok::Fn => "`fn`".into(),
             Tok::Let => "`let`".into(),
@@ -315,9 +321,18 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             } else {
                 (raw.as_str(), 10)
             };
-            let v = i64::from_str_radix(digits, radix)
-                .map_err(|_| format!("invalid integer literal `{raw}` at byte {start}"))?;
-            out.push(Token { tok: Tok::Int(v), pos });
+            let v = i64::from_str_radix(digits, radix);
+            match v {
+                Ok(v) => out.push(Token { tok: Tok::Int(v), pos }),
+                // The one magnitude above `i64::MAX` that a `-` can make valid:
+                // the operand of `i64::MIN`. Defer the sign check to the parser.
+                Err(_) if is_i64_min_magnitude(digits, radix) => {
+                    out.push(Token { tok: Tok::IntMinMagnitude, pos })
+                }
+                Err(_) => {
+                    return Err(format!("invalid integer literal `{raw}` at byte {start}"));
+                }
+            }
             continue;
         }
         // three-char operators (must precede `<<`/`>>`)
@@ -401,4 +416,19 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
         i += 1;
     }
     Ok(out)
+}
+
+/// True when `digits` in `radix` is exactly `2^63`, the magnitude of
+/// `i64::MIN`. `from_str_radix` rejects it because it exceeds `i64::MAX`, so the
+/// lexer recognizes it structurally and lets the parser decide whether the
+/// preceding `-` makes it valid.
+fn is_i64_min_magnitude(digits: &str, radix: u32) -> bool {
+    let trimmed = digits.trim_start_matches('0');
+    match radix {
+        10 => trimmed == "9223372036854775808",
+        16 => trimmed.eq_ignore_ascii_case("8000000000000000"),
+        2 => trimmed.len() == 64 && trimmed.starts_with('1') && trimmed[1..].bytes().all(|b| b == b'0'),
+        8 => trimmed.len() == 22 && trimmed.starts_with('1') && trimmed[1..].bytes().all(|b| b == b'0'),
+        _ => false,
+    }
 }

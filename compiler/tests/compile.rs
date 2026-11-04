@@ -107,6 +107,27 @@ fn bang_on_a_non_int_is_rejected() {
 }
 
 #[test]
+fn i64_min_literal_is_accepted() {
+    let out = asm("fn main() -> i64 { let m: i64 = -9223372036854775808; return m; }");
+    // The folded value reaches codegen as a single immediate. A bare magnitude
+    // is rejected (`i64_min_magnitude_alone_is_rejected`), so this can only come
+    // from the `-` fold, not from a negation of a positive value.
+    assert!(out.contains("mov $-9223372036854775808, %rax"), "the value reaches codegen");
+}
+
+#[test]
+fn i64_min_magnitude_alone_is_rejected() {
+    let err = compile_to_asm("fn main() -> i64 { return 9223372036854775808; }", &CompileOptions::default());
+    assert!(err.is_err(), "2^63 without a `-` is out of range");
+}
+
+#[test]
+fn negating_a_constant_i64_min_is_rejected() {
+    let err = compile_to_asm("fn main() -> i64 { return - -9223372036854775808; }", &CompileOptions::default());
+    assert!(err.is_err(), "negating i64::MIN overflows");
+}
+
+#[test]
 fn assignment_evaluates_value_before_place() {
     // rustc orders assignment operands right-to-left: the assigned value is
     // evaluated before the assignee place. With `li` calling on both sides, the

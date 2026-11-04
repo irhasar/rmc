@@ -646,13 +646,16 @@ integer form and a `sete` for the `bool` form, selecting on the operand's
 generated type. `licm::expr_ty` follows the operand for a `!` so a hoisted
 bitwise not is bound to an `i64` slot, not a `bool` one.
 
-The `i64::MIN` literal is over-rejected: the lexer parses
-the magnitude `9223372036854775808` before the sign, and that magnitude exceeds
-`i64::MAX`, so `-9223372036854775808` is reported as an invalid literal while
-rustc accepts it. `-9223372036854775807` and the equivalent
-`0 - 9223372036854775807 - 1` both compile, so only the literal form is lost.
-Safe direction, not a soundness bug; the `arith` fuzz mode keeps its values
-non-negative so it never trips on it.
+The `i64::MIN` literal `-9223372036854775808` is accepted: the lexer parses the
+magnitude `9223372036854775808`, which exceeds `i64::MAX`, as a distinct
+`IntMinMagnitude` token rather than an error, and the parser folds a `-` that
+directly precedes it into `Int(i64::MIN)`. Anywhere else the magnitude is out of
+range and rejected, as in rustc — `9223372036854775808` alone, `0x10000000000000000`,
+and `- -9223372036854775808` all error. Negating a constant `i64::MIN` (from the
+literal or a constant local) is rejected by the same `arithmetic_overflow` check
+rmc applies to constant arithmetic, matching rustc's deny lint. The magnitude
+test is structural (`is_i64_min_magnitude`), covering decimal, hex, binary and
+octal; a spaced `- 9223372036854775808` still folds, as in rustc.
 
 `tools/fuzz.py` is the differential fuzzer. `expr` mode builds random integer
 expressions with calls, guarded division and comparisons (`(x < y) as i64`,
