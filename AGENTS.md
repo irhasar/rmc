@@ -616,6 +616,14 @@ The checks, all in `sema.rs`:
 `not_on_int` remains an *over*-rejection (rmc rejects a program rustc accepts),
 the safe direction; it is listed by the audit harness but is not a soundness bug.
 
+The `i64::MIN` literal is over-rejected for the same reason: the lexer parses
+the magnitude `9223372036854775808` before the sign, and that magnitude exceeds
+`i64::MAX`, so `-9223372036854775808` is reported as an invalid literal while
+rustc accepts it. `-9223372036854775807` and the equivalent
+`0 - 9223372036854775807 - 1` both compile, so only the literal form is lost.
+Safe direction, not a soundness bug; the `arith` fuzz mode keeps its values
+non-negative so it never trips on it.
+
 `tools/fuzz.py` is the differential fuzzer. `expr` mode builds random integer
 expressions with calls, guarded division and comparisons (`(x < y) as i64`,
 which is the only generator that feeds `emit_cmp`'s operand-class dispatch:
