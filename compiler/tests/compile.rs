@@ -1056,6 +1056,38 @@ fn a_small_multiply_and_offset_fold_to_one_lea() {
 }
 
 #[test]
+fn a_small_constant_multiply_is_a_lea() {
+    // `2 * x`, `5 * x` and `8 * x` are one 1-cycle `lea`, not a 3-cycle `imul`.
+    // `7` is not a `lea` scale, so it stays an `imul`.
+    for (expr, want_lea) in [("2 * x", true), ("5 * x", true), ("8 * x", true), ("7 * x", false)] {
+        let out = asm_no_inline(&format!(
+            "fn f(x: i64) -> i64 {{ return {expr}; }} fn main() -> i64 {{ return f(3); }}"
+        ));
+        let f = &out[out.find("f:").unwrap()..out.find(".size f,").unwrap()];
+        if want_lea {
+            assert!(f.contains("lea "), "`{expr}` folds to a lea: {f}");
+            assert!(!f.contains("imul"), "`{expr}` has no imul: {f}");
+        } else {
+            assert!(f.contains("imul"), "`{expr}` stays an imul: {f}");
+        }
+    }
+}
+
+#[test]
+fn a_multiply_by_one_is_dropped() {
+    // `1 * x` is `x`; the multiply disappears entirely.
+    let out = asm_no_inline("fn f(x: i64) -> i64 { return 1 * x; } fn main() -> i64 { return f(3); }");
+    let f = &out[out.find("f:").unwrap()..out.find(".size f,").unwrap()];
+    assert!(!f.contains("imul"), "no multiply remains: {f}");
+    // The only `lea` in `f` is the frame restore (`... , %rsp`); a `lea` into
+    // `%rax` would mean the multiply was not actually dropped.
+    assert!(
+        !f.lines().any(|l| l.contains("lea") && l.contains("%rax")),
+        "no value-computing lea either: {f}"
+    );
+}
+
+#[test]
 fn a_comparison_of_two_promoted_locals_is_one_cmp() {
     // Both operands live in registers, so no value is materialised in `%rax`.
     let out = asm_no_inline(
@@ -2274,9 +2306,13 @@ fn an_invariant_product_is_hoisted_out_of_a_loop() {
 
 #[test]
 fn a_value_the_loop_writes_is_not_hoisted() {
-    // `x` is reassigned in the loop, so `x * 2` is loop-variant and must stay.
+    // `x` is reassigned in the loop, so `x * 7` is loop-variant and must stay.
+    // The multiplier is deliberately not `lea`-expressible (2/3/4/5/8/9), so the
+    // product still compiles to an `imul` and this asserts on the multiply
+    // itself rather than on a `lea` that also appears in the loop's own
+    // increment.
     let src = "fn main() -> i64 { let mut x: i64 = 1; let mut s: i64 = 0; let mut i: i64 = 0; \
-               while i < 10 { x = x + i; s = s + x * 2; i = i + 1; } return s; }";
+               while i < 10 { x = x + i; s = s + x * 7; i = i + 1; } return s; }";
     let with = loop_body(&asm(src));
     assert!(with.contains("imul"), "a loop-variant product stays in the loop:\n{with}");
 }
