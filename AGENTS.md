@@ -37,6 +37,7 @@ python3 tools/fuzz.py --mode expr --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1
 python3 tools/fuzz.py --mode opt --n 500 --seed 1
 python3 tools/fuzz.py --mode arith --n 500 --seed 1
+python3 tools/fuzz.py --mode nest --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 ```
 
@@ -640,7 +641,13 @@ builds overflowing arithmetic near `i64::MAX` — a `lea`/`imul` shape and a
 loop-carried accumulator, the two strength reductions `gen_expr_into_reg` makes
 — so the `--overflow-checks` trap actually fires: the other modes use small
 values, so no generated program ever traps and the trap was reached only by the
-`ovf` corpus case. It compares stdout and exit status against `rustc -O`, and it recompiles each program with
+`ovf` corpus case. `nest` mode builds nested aggregates — a struct holding
+another struct and an array, and an enum whose payload is a struct — with a
+deep copy (`let mut o1 = o0`) and a nested-path write (`o1.mid.f = ...`,
+`o1.arr[0] = ...`) that the copy must not alias: `stmt` mode only ever gives a
+struct plain `i64` fields, so the field-offset arithmetic for a nested path and
+the aggregate copy were never generated. It compares stdout and exit status
+against `rustc -O`, and it recompiles each program with
 every optimiser pass off in turn (`--no-inline`, `--no-licm`, `--no-tco`, all
 three), the same matrix the corpus suite uses — a pass-specific bug is otherwise
 invisible, because the fuzzer used to run only the default configuration.

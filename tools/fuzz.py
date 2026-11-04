@@ -20,6 +20,9 @@ Modes:
           to exercise TCO, LICM and inlining
     arith overflowing arithmetic near i64::MAX, to exercise the overflow
           trap and the strength reductions that must be off under it
+    nest  nested aggregates (struct-in-struct, struct-with-array, an enum
+          whose payload is a struct), including a deep copy and a nested-path
+          write, which `stmt` never emits
 
 The reference is `rustc -O`, so a mismatch is a real semantic divergence.
 """
@@ -346,6 +349,108 @@ def gen_arith_program(rng):
         "fn main() {",
         f'    println!("{{}}", f({big}));',
         f'    println!("{{}}", acc({n0}));',
+        "}",
+    ]
+    return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
+
+
+def gen_nest_program(rng):
+    """A program built from nested aggregates: a struct whose fields include
+    another struct and an array, and an enum whose payload is a struct. `stmt`
+    mode only ever gives a struct plain `i64` fields, so the field-offset
+    arithmetic for a nested path (`o.mid.f`, `o.arr[i]`) and the deep copy of an
+    aggregate local were never generated. A wrong nested offset reads the wrong
+    field; a shallow copy aliases the source, so mutating the copy would change
+    the original. Both show up as a wrong final value.
+
+    Every value descends from a call (`seed`), not a literal, so no local is
+    constant-folded and the nested paths stay live.
+    """
+    inner = [f"i{j}" for j in range(rng.randint(2, 3))]
+    na = rng.randint(2, 4)
+    idecl = ", ".join(f"{f}: i64" for f in inner)
+    inner_mk = ", ".join(f"{f}: n + {j + 1}" for j, f in enumerate(inner))
+    arr_mk = ", ".join(f"n + {j}" for j in range(na))
+    inner_lit = ", ".join(f"{f}: base + {j + 1}" for j, f in enumerate(inner))
+    sum_terms = ["o.s"] + [f"o.mid.{f}" for f in inner] + [f"o.arr[{j}]" for j in range(na)]
+    wval = " + ".join(
+        f"v.{f} * {10 ** (len(inner) - 1 - j)}" for j, f in enumerate(inner)
+    )
+    m1, m2 = rng.randint(10, 30), rng.randint(50, 99)
+    base_k = rng.randint(1, 6)
+    f0 = inner[0]
+
+    rms = [
+        "fn seed(x: i64) -> i64 { return x * 7 + 1; }",
+        f"struct Inner {{ {idecl} }}",
+        f"struct Outer {{ s: i64, mid: Inner, arr: [i64; {na}] }}",
+        "enum W { Z, V(Inner) }",
+        "struct Wrap { w: W, t: i64 }",
+        f"fn mk(n: i64) -> Outer {{ return Outer {{ s: n, mid: Inner {{ {inner_mk} }}, arr: [{arr_mk}] }}; }}",
+        f"fn sum(o: Outer) -> i64 {{ return {' + '.join(sum_terms)}; }}",
+        f"fn wval(w: W) -> i64 {{ return match w {{ W::Z => 0, W::V(v) => {wval} }}; }}",
+        f"fn wwrap(p: Wrap) -> i64 {{ return match p.w {{ W::Z => p.t, W::V(v) => p.t + v.{f0} }}; }}",
+        f"fn bump(o: &mut Outer) {{ o.mid.{f0} = o.mid.{f0} + 5; o.s = o.s + 1; }}",
+        "fn main() -> i64 {",
+        f"    let base: i64 = seed({base_k});",
+        "    let mut acc: i64 = 0;",
+        "    let o0: Outer = mk(base);",
+        f"    acc = acc + sum(o0) + o0.mid.{inner[1]} + o0.arr[{na - 1}];",
+        "    let mut o1: Outer = o0;",
+        f"    o1.mid.{f0} = o1.mid.{f0} + {m1};",
+        f"    o1.arr[0] = o1.arr[0] + {m2};",
+        f"    acc = acc + o1.mid.{f0} + o0.mid.{f0} + o1.arr[0] + o0.arr[0];",
+        "    let mut k: i64 = 0;",
+        f"    while k < {na} {{ acc = acc + o0.arr[k]; k = k + 1; }}",
+        f"    let w0: W = W::V(Inner {{ {inner_lit} }});",
+        "    let w1: W = W::Z;",
+        "    acc = acc + wval(w0) + wval(w1);",
+        "    let wr: Wrap = Wrap { w: w0, t: 3 };",
+        "    let wz: Wrap = Wrap { w: w1, t: 4 };",
+        "    acc = acc + wwrap(wr) + wwrap(wz);",
+        "    let mut o2: Outer = mk(base + 1);",
+        "    bump(&mut o2);",
+        f"    acc = acc + o2.mid.{f0} + o2.s;",
+        "    print_i64(acc);",
+        "    return 0;",
+        "}",
+    ]
+    rs = [
+        "fn seed(x: i64) -> i64 { x * 7 + 1 }",
+        "#[derive(Copy, Clone)]",
+        f"struct Inner {{ {idecl} }}",
+        "#[derive(Copy, Clone)]",
+        f"struct Outer {{ s: i64, mid: Inner, arr: [i64; {na}] }}",
+        "#[derive(Copy, Clone)]",
+        "enum W { Z, V(Inner) }",
+        "#[derive(Copy, Clone)]",
+        "struct Wrap { w: W, t: i64 }",
+        f"fn mk(n: i64) -> Outer {{ Outer {{ s: n, mid: Inner {{ {inner_mk} }}, arr: [{arr_mk}] }} }}",
+        f"fn sum(o: Outer) -> i64 {{ {' + '.join(sum_terms)} }}",
+        f"fn wval(w: W) -> i64 {{ match w {{ W::Z => 0, W::V(v) => {wval} }} }}",
+        f"fn wwrap(p: Wrap) -> i64 {{ match p.w {{ W::Z => p.t, W::V(v) => p.t + v.{f0} }} }}",
+        f"fn bump(o: &mut Outer) {{ o.mid.{f0} += 5; o.s += 1; }}",
+        "fn main() {",
+        f"    let base: i64 = seed({base_k});",
+        "    let mut acc: i64 = 0;",
+        "    let o0: Outer = mk(base);",
+        f"    acc += sum(o0) + o0.mid.{inner[1]} + o0.arr[{na - 1}];",
+        "    let mut o1: Outer = o0;",
+        f"    o1.mid.{f0} += {m1};",
+        f"    o1.arr[0] += {m2};",
+        f"    acc += o1.mid.{f0} + o0.mid.{f0} + o1.arr[0] + o0.arr[0];",
+        "    let mut k: i64 = 0;",
+        f"    while k < {na} {{ acc += o0.arr[k as usize]; k += 1; }}",
+        f"    let w0: W = W::V(Inner {{ {inner_lit} }});",
+        "    let w1: W = W::Z;",
+        "    acc += wval(w0) + wval(w1);",
+        "    let wr: Wrap = Wrap { w: w0, t: 3 };",
+        "    let wz: Wrap = Wrap { w: w1, t: 4 };",
+        "    acc += wwrap(wr) + wwrap(wz);",
+        "    let mut o2: Outer = mk(base + 1);",
+        "    bump(&mut o2);",
+        f"    acc += o2.mid.{f0} + o2.s;",
+        '    println!("{}", acc);',
         "}",
     ]
     return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
@@ -800,7 +905,7 @@ def run_reject():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "robust", "reject"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "robust", "reject"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -834,7 +939,8 @@ def main():
     tmp = f"/tmp/rmc-fuzz-{os.getpid()}"
     os.makedirs(tmp, exist_ok=True)
     gen = {"expr": gen_expr_program, "stmt": gen_stmt_program,
-           "opt": gen_opt_program, "arith": gen_arith_program}[args.mode]
+           "opt": gen_opt_program, "arith": gen_arith_program,
+           "nest": gen_nest_program}[args.mode]
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus
     # suite; a fuzz program is otherwise only checked with every pass on, so a
