@@ -210,9 +210,10 @@ By default integer arithmetic wraps, as in release-mode Rust. Compiling with
 library) inserts a trap after every `+`, `-` and `*`, and range-checks every
 *variable* shift count against `0..64`; on overflow or an out-of-range shift the
 program writes `rmc: arithmetic overflow` to stderr and exits with status 101,
-matching a Rust panic. Division by zero always traps at the CPU level. (A shift
-count that is a compile-time constant is decided at compile time, not by the
-trap.)
+matching a Rust panic. Division or remainder by zero, and `i64::MIN / -1` (whose
+quotient has no `i64` value), trap the same way whether or not checks are on,
+because Rust panics on them in every build mode; a shift count that is a
+compile-time constant is decided at compile time, not by the trap.
 
 ## Expressions
 

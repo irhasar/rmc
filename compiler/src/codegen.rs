@@ -2387,24 +2387,18 @@ impl Codegen {
         let slow = self.new_label();
         let done = self.new_label();
         let ok = self.new_label();
-        // Rust traps on a zero divisor and on `i64::MIN / -1` (and `% -1`) even
-        // without `overflow-checks`, because `idiv` cannot produce a result.
-        // `%rdx` is scratch here: both paths below write it before reading it.
+        // Rust traps on a zero divisor even without `overflow-checks`. A zero
+        // divisor is < 2^32, so without this it would take the 32-bit path below
+        // and fault in `div`; check it before the fast/slow split.
         self.line(&format!("test {rd}, {rd}"));
         self.line("jz __rmc_divide_by_zero");
-        self.line("movabs $0x8000000000000000, %rdx");
-        self.line("cmp %rdx, %rax");
-        self.line(&format!("jne {ok}"));
-        self.line(&format!("cmp $-1, {rd}"));
-        self.line("je __rmc_divide_overflow");
-        self.raw(&format!("{ok}:"));
         self.line("mov $4294967296, %rdx"); // 2^32
         self.line("cmp %rdx, %rax");
         self.line(&format!("jae {slow}"));
         self.line(&format!("cmp %rdx, {rd}"));
         self.line(&format!("jae {slow}"));
         // Both fit in 32 bits: the 32-bit divide is exact (the dividend's high
-        // half is zero, so its `%rdx` contribution is zero).
+        // half is zero, so its `%rdx` contribution is zero) and cannot overflow.
         self.line("xor %edx, %edx");
         self.line(&format!("div {rd32}"));
         if matches!(op, BinOp::Mod) {
@@ -2412,6 +2406,17 @@ impl Codegen {
         }
         self.line(&format!("jmp {done}"));
         self.raw(&format!("{slow}:"));
+        // `i64::MIN / -1` (and `% -1`) has no representable quotient and the
+        // 64-bit `idiv` would fault; trap like Rust. Only a 64-bit-path dividend
+        // can be `MIN` (a 32-bit one has the high bit clear), so the check sits
+        // in the slow path and the fast path pays nothing for it. `%rdx` is
+        // scratch here: `cqto` below overwrites it before it is read.
+        self.line("movabs $0x8000000000000000, %rdx");
+        self.line("cmp %rdx, %rax");
+        self.line(&format!("jne {ok}"));
+        self.line(&format!("cmp $-1, {rd}"));
+        self.line("je __rmc_divide_overflow");
+        self.raw(&format!("{ok}:"));
         self.line("cqto");
         self.line(&format!("idiv {rd}"));
         if matches!(op, BinOp::Mod) {
