@@ -10,6 +10,9 @@
 //! never indexes an array should not carry the bounds-check trap; on a binary
 //! this small that dead weight is a large fraction of the artifact.
 
+use std::collections::HashSet;
+use std::sync::OnceLock;
+
 /// One selectable piece of the runtime: its assembly text and the global
 /// symbols it defines. A piece is kept when the program — or another kept
 /// piece — names one of its symbols.
@@ -538,36 +541,38 @@ __rmc_bounds_msg: .ascii "rmc: index out of bounds\n"
     },
 ];
 
-/// True when `needle` appears in `haystack` as a whole symbol: the bytes on
-/// either side are not identifier characters. Comments are stripped first, so a
-/// word in prose (the "free list" in `alloc`'s comment) is not mistaken for a
-/// symbol reference. This also keeps `free` from matching inside
-/// `__rmc_freelist` and `alloc` from matching inside a longer name.
-fn mentions(haystack: &str, needle: &str) -> bool {
-    let n = needle.as_bytes();
-    if n.is_empty() {
-        return false;
-    }
-    let ident = |b: u8| b == b'_' || b.is_ascii_alphanumeric();
-    for line in haystack.lines() {
-        // `#` starts a comment on x86 GNU as; drop it and everything after.
-        let code = match line.find('#') {
-            Some(i) => &line[..i],
-            None => line,
-        };
-        let h = code.as_bytes();
-        if n.len() > h.len() {
-            continue;
-        }
-        if (0..=h.len() - n.len()).any(|i| {
-            &h[i..i + n.len()] == n
-                && (i == 0 || !ident(h[i - 1]))
-                && (i + n.len() == h.len() || !ident(h[i + n.len()]))
-        }) {
-            return true;
+/// The identifiers in `src`, with `#`-to-end-of-line comments dropped. Matching
+/// on whole identifiers keeps `free` from matching inside `__rmc_freelist`,
+/// `alloc` from matching inside `alloc_big`, and a word in prose (the "free
+/// list" in `alloc`'s comment) from counting as a symbol reference.
+fn idents(src: &str) -> HashSet<&str> {
+    let b = src.as_bytes();
+    let mut out = HashSet::new();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'#' {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+        } else if c == b'_' || c.is_ascii_alphanumeric() {
+            let start = i;
+            while i < b.len() && (b[i] == b'_' || b[i].is_ascii_alphanumeric()) {
+                i += 1;
+            }
+            out.insert(&src[start..i]);
+        } else {
+            i += 1;
         }
     }
-    false
+    out
+}
+
+/// The identifiers of each piece, computed once per process. A piece's text
+/// never changes, so its scan is not worth repeating per compile.
+fn piece_idents() -> &'static [HashSet<&'static str>] {
+    static CACHE: OnceLock<Vec<HashSet<&'static str>>> = OnceLock::new();
+    CACHE.get_or_init(|| PIECES.iter().map(|p| idents(p.text)).collect())
 }
 
 /// The subset of the runtime that `user_asm` reaches.
@@ -578,43 +583,55 @@ fn mentions(haystack: &str, needle: &str) -> bool {
 /// A program that never allocates does not carry the allocator, and one that
 /// never indexes an array does not carry the bounds trap.
 pub fn for_program(user_asm: &str) -> String {
-    let mut wanted: Vec<&'static str> = vec!["_start"];
-    fn add(name: &'static str, wanted: &mut Vec<&'static str>) {
-        if !wanted.contains(&name) {
-            wanted.push(name);
+    // Tokenise the program once and look each symbol up in the set, rather than
+    // rescanning the whole text per symbol: the scan is O(text * symbols) and
+    // was the single largest cost in a compile. The piece texts are static, so
+    // their token sets are cached across calls.
+    let pids = piece_idents();
+    let uids = idents(user_asm);
+    let all: Vec<&'static str> = PIECES.iter().flat_map(|p| p.defines.iter().copied()).collect();
+
+    // Seed: `_start` is the process entry and is always kept, plus any runtime
+    // symbol the program names directly.
+    let mut wanted = vec![false; all.len()];
+    for (j, d) in all.iter().enumerate() {
+        if *d == "_start" || uids.contains(d) {
+            wanted[j] = true;
         }
     }
-    // Seed: any runtime symbol the program names directly.
-    for p in PIECES {
-        for d in p.defines {
-            if mentions(user_asm, d) {
-                add(d, &mut wanted);
-            }
-        }
-    }
-    // Fixpoint: keep every piece that defines a wanted symbol, then add the
+
+    // For each piece, the symbols it names. This relation is fixed, so it is
+    // derived from the cached token sets rather than rescanned.
+    let names: Vec<Vec<usize>> = pids
+        .iter()
+        .map(|set| (0..all.len()).filter(|&j| set.contains(all[j])).collect())
+        .collect();
+
+    // Fixpoint: keep every piece that defines a wanted symbol, then mark the
     // symbols each kept piece names.
     let mut included = vec![false; PIECES.len()];
-    loop {
-        let mut changed = false;
+    let mut dirty = true;
+    while dirty {
+        dirty = false;
         for (i, p) in PIECES.iter().enumerate() {
-            if included[i] || !p.defines.iter().any(|d| wanted.contains(d)) {
+            if included[i] {
+                continue;
+            }
+            let defines_wanted = p
+                .defines
+                .iter()
+                .any(|d| all.iter().position(|x| x == d).is_some_and(|j| wanted[j]));
+            if !defines_wanted {
                 continue;
             }
             included[i] = true;
-            changed = true;
-            for q in PIECES {
-                for d in q.defines {
-                    if mentions(p.text, d) {
-                        add(d, &mut wanted);
-                    }
-                }
+            dirty = true;
+            for &j in &names[i] {
+                wanted[j] = true;
             }
         }
-        if !changed {
-            break;
-        }
     }
+
     let mut out = String::new();
     for (i, p) in PIECES.iter().enumerate() {
         if included[i] {
@@ -629,14 +646,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mentions_matches_whole_symbols_only() {
-        assert!(mentions("call print_i64", "print_i64"));
-        assert!(mentions("print_i64:", "print_i64"));
+    fn idents_matches_whole_symbols_only() {
+        assert!(idents("call print_i64").contains("print_i64"));
+        assert!(idents("print_i64:").contains("print_i64"));
         // `free` must not match inside `__rmc_freelist`.
-        assert!(!mentions("__rmc_freelist: .quad 0", "free"));
-        assert!(!mentions("call alloc_big", "alloc"));
+        assert!(!idents("__rmc_freelist: .quad 0").contains("free"));
+        assert!(!idents("call alloc_big").contains("alloc"));
         // A trailing/leading non-identifier boundary counts.
-        assert!(mentions("(free)", "free"));
+        assert!(idents("(free)").contains("free"));
+        // A comment is dropped, but only to end of line.
+        assert!(!idents("# print_i64\n\tret").contains("print_i64"));
+        assert!(idents("# x\n\tcall print_i64").contains("print_i64"));
     }
 
     #[test]

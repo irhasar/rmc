@@ -327,10 +327,18 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   the bottom test and `break` the label it falls into. If you change the loop
   shape, keep both: a rotation that forgets the entry test loops forever on a
   false condition, and one that targets the body for `continue` skips the test.
-- **Promotion counting must stay linear.** `counts` is built in slot order and
-  `count_expr` indexes it directly by slot; do not reintroduce a linear `find`
-  per reference or per excluded slot, which is O(n^2) and made a 200k-element
-  array take seconds to compile. `large_array_compiles_in_linear_time` guards it.
+- **Promotion counting is sparse, not a dense table over `nslots`.** `counts`
+  and `mem` are a `HashMap`/`HashSet` keyed by slot, and only slots something
+  actually names get an entry. A dense `vec![_; nslots]` plus a sort over
+  `0..nslots` is O(array length) — and the array's *element* slots are never
+  named, so the table is almost all zeros. A 200k-element array made that path
+  take ~1.9 ms (codegen was 90% of the compile); the sparse form is ~20 µs.
+  `large_array_compiles_in_linear_time` guards it.
+- **An array never needs its element slots marked in memory.** Only the base
+  slot can be named (elements are reached as `base + i*8`), so `Expr::Var` on an
+  array, a `let` of one, and `mark_addressed` all mark just the base. Marking
+  every element is O(length) per mention and promotes nothing that was not
+  already unpromotable.
 - **Struct layout must agree between read and write.** `sema` resolves a field
   to an offset from the aggregate base; codegen must add that offset to the same
   base used for reads (`field_operand`) and writes.
@@ -444,6 +452,13 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   emitted, its piece drops out — that is the point, but a test that asserts on
   runtime text must first force the construct that pulls the piece in (see
   `the_bounds_handler_is_in_an_executable_section`).
+- **`for_program` must tokenise, not rescan per symbol.** The piece texts are
+  static, so their identifier sets are built once (`piece_idents`, a
+  `OnceLock`); the program is tokenised once (`idents`) and each symbol looked
+  up in the set. The old form called `mentions` for every (piece, symbol) pair
+  over the *whole* text — O(text × symbols), the single largest cost in a
+  compile. Keep the whole-identifier matching: a substring test would pull in
+  `free` for `__rmc_freelist`.
 - **Dead-function elimination feeds runtime pruning.** `dce.rs` runs just before
   codegen and drops every function `main` cannot reach, so a dead function that
   called `print_str`/`alloc` no longer drags those pieces into the binary
