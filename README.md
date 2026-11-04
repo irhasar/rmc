@@ -19,9 +19,9 @@ The point of the experiment is to measure the trade-off at the extremes:
 
 `rmc` wins big on compile time, compiler memory, and artifact size, and those
 three are the point of the experiment. On **runtime** the result is mixed and
-program-dependent: rmc is at parity or ahead on the whole suite (`refs` 2.2×,
-`sieve` 1.6×, `callrec` 1.4×, `stats` 1.1×, `mandel` 1.1×, `heap` 1.1×, `mix`
-1.04×, `fib` 0.99×), but several of those are within run-to-run noise, and a
+program-dependent: rmc is at parity or ahead on the whole suite (`refs` 2.0×,
+`sieve` 1.7×, `stats` 1.1×, `mandel` 1.1×, `heap` 1.06×, `mix` 1.05×, `callrec`
+0.99×, `fib` 0.95×), but several of those are within run-to-run noise, and a
 call-heavy shape the recursion-to-loop pass does not match would still lose. It
 is not uniformly faster and there is no single speedup number;
 `bench/RESULTS.md` reports the per-program ratio.
@@ -247,43 +247,43 @@ LLVM 23.1.1, AMD EPYC 9B14, x86-64; medians of 5 compiles and 9 runs):
 
 | program | compiler | compile wall | compile CPU | compile RAM | artifact | run wall | run CPU | run RAM |
 | ------- | -------- | -----------: | ----------: | ----------: | -------: | -------: | ------: | ------: |
-| hello | rmc | 6.26 ms | 6.16 ms | 2.7 MB | 3304 B | 0.27 ms | 0.14 ms | 24 kB |
-| hello | rustc | 2072.56 ms | 2074.89 ms | 188.8 MB | 289416 B | 0.85 ms | 0.73 ms | 2068 kB |
-| fib | rmc | 6.81 ms | 6.65 ms | 2.7 MB | 3400 B | 7.23 ms | 7.09 ms | 24 kB |
-| fib | rustc | 2113.11 ms | 2114.99 ms | 191.3 MB | 291696 B | 7.14 ms | 7.00 ms | 2004 kB |
-| mandel | rmc | 6.29 ms | 6.24 ms | 2.7 MB | 3688 B | 96.00 ms | 95.76 ms | 24 kB |
-| mandel | rustc | 2164.12 ms | 2167.95 ms | 190.8 MB | 291776 B | 105.53 ms | 105.33 ms | 2108 kB |
-| sieve | rmc | 9.34 ms | 9.13 ms | 4.4 MB | 3432 B | 1.59 ms | 1.47 ms | 1584 kB |
-| sieve | rustc | 2160.47 ms | 2164.39 ms | 192.1 MB | 292016 B | 2.52 ms | 2.40 ms | 3572 kB |
-| mix | rmc | 6.31 ms | 6.23 ms | 2.8 MB | 3520 B | 15.09 ms | 14.91 ms | 24 kB |
-| mix | rustc | 2115.19 ms | 2119.15 ms | 187.4 MB | 291864 B | 15.72 ms | 15.58 ms | 2112 kB |
-| stats | rmc | 6.29 ms | 6.18 ms | 2.8 MB | 3512 B | 3.40 ms | 3.27 ms | 20 kB |
-| stats | rustc | 2145.54 ms | 2148.38 ms | 189.4 MB | 292048 B | 3.88 ms | 3.73 ms | 2084 kB |
-| refs | rmc | 6.80 ms | 6.66 ms | 2.8 MB | 4016 B | 1.77 ms | 1.66 ms | 24 kB |
-| refs | rustc | 2123.17 ms | 2127.48 ms | 192.0 MB | 292240 B | 3.93 ms | 3.81 ms | 2052 kB |
-| heap | rmc | 8.10 ms | 7.99 ms | 2.7 MB | 3424 B | 3.29 ms | 3.16 ms | 4712 kB |
-| heap | rustc | 2096.58 ms | 2100.90 ms | 189.7 MB | 292384 B | 3.49 ms | 3.33 ms | 6720 kB |
-| callrec | rmc | 6.16 ms | 6.09 ms | 2.7 MB | 3400 B | 2.93 ms | 2.80 ms | 24 kB |
-| callrec | rustc | 2107.72 ms | 2110.98 ms | 186.7 MB | 291680 B | 3.98 ms | 3.73 ms | 2088 kB |
+| hello | rmc | 6.32 ms | 6.22 ms | 2.7 MB | 3304 B | 0.37 ms | 0.18 ms | 24 kB |
+| hello | rustc | 2189.60 ms | 2192.63 ms | 187.4 MB | 289416 B | 0.91 ms | 0.79 ms | 2060 kB |
+| fib | rmc | 6.12 ms | 6.05 ms | 2.7 MB | 3400 B | 7.60 ms | 7.48 ms | 24 kB |
+| fib | rustc | 2102.52 ms | 2105.88 ms | 187.1 MB | 291696 B | 7.21 ms | 7.03 ms | 2096 kB |
+| mandel | rmc | 6.47 ms | 6.39 ms | 2.7 MB | 3688 B | 96.62 ms | 96.42 ms | 24 kB |
+| mandel | rustc | 2133.47 ms | 2137.74 ms | 190.3 MB | 291776 B | 107.00 ms | 106.80 ms | 2088 kB |
+| sieve | rmc | 8.74 ms | 8.62 ms | 4.4 MB | 3432 B | 1.59 ms | 1.46 ms | 1584 kB |
+| sieve | rustc | 2125.23 ms | 2127.12 ms | 189.3 MB | 292016 B | 2.76 ms | 2.61 ms | 3640 kB |
+| mix | rmc | 6.23 ms | 6.14 ms | 2.7 MB | 3520 B | 14.80 ms | 14.64 ms | 24 kB |
+| mix | rustc | 2110.16 ms | 2114.80 ms | 187.1 MB | 291864 B | 15.52 ms | 15.38 ms | 2032 kB |
+| stats | rmc | 6.41 ms | 6.27 ms | 2.8 MB | 3512 B | 3.51 ms | 3.35 ms | 24 kB |
+| stats | rustc | 2102.33 ms | 2106.25 ms | 187.7 MB | 292048 B | 3.98 ms | 3.85 ms | 2080 kB |
+| refs | rmc | 6.68 ms | 6.54 ms | 2.8 MB | 4016 B | 2.04 ms | 1.87 ms | 24 kB |
+| refs | rustc | 2153.18 ms | 2157.38 ms | 192.9 MB | 292240 B | 4.12 ms | 3.94 ms | 2112 kB |
+| heap | rmc | 6.43 ms | 6.31 ms | 2.8 MB | 3424 B | 3.48 ms | 3.34 ms | 4712 kB |
+| heap | rustc | 2133.79 ms | 2138.32 ms | 188.5 MB | 292384 B | 3.70 ms | 3.58 ms | 6704 kB |
+| callrec | rmc | 6.18 ms | 6.10 ms | 2.7 MB | 3400 B | 2.91 ms | 2.79 ms | 24 kB |
+| callrec | rustc | 2093.53 ms | 2097.62 ms | 188.5 MB | 291680 B | 2.89 ms | 2.75 ms | 2036 kB |
 
 Summary of the ratios (rustc ÷ rmc, so >1 means rmc is better):
 
 | dimension         | ratio      |
 | ----------------- | ---------: |
-| compile wall      | ~205–356×  |
-| compile CPU       | ~212–361×  |
-| compiler peak RAM | ~43–71×    |
+| compile wall      | ~243–347×  |
+| compile CPU       | ~247–353×  |
+| compiler peak RAM | ~43–70×    |
 | artifact size     | ~73–88× vs fat-LTO stripped; ~347× vs static stripped; ~1335× vs plain `-O` |
-| run wall time     | 0.99–3.18× (rmc ahead on `refs`, `sieve`, `callrec`, `stats`, `mandel`, `heap`, `hello`; at parity on `mix` 1.04× and `fib` 0.99×) |
-| run peak RAM      | ~1.4× on `heap`, ~2.3× on `sieve`, ~85–104× elsewhere |
+| run wall time     | 0.95–2.46× (rmc ahead on `hello`, `refs`, `sieve`, `stats`, `mandel`, `heap`, `mix`; at parity on `callrec` 0.99× and `fib` 0.95×) |
+| run peak RAM      | ~1.4× on `heap`, ~2.3× on `sieve`, ~85–87× elsewhere |
 
-The compile-time win is the point of the project: `rmc` builds in about 6–10 ms
+The compile-time win is the point of the project: `rmc` builds in about 6–9 ms
 where rustc needs about 2.1 s, using ~2.7 MB of RAM against ~188 MB, and writing
 a ~3.4 KB static binary against ~290 KB (fat-LTO stripped), ~1.2 MB (static
 stripped) or ~4.5 MB (plain `-O`). The run-time picture is mixed and remains the
-honest weak spot: rmc wins on `hello` (3.18×, mostly process startup), `refs`
-(2.22×), `sieve` (1.59×), `callrec` (1.36×), `stats` (1.14×), `mandel` (1.10×)
-and `heap` (1.06×), and is at parity on `mix` (1.04×) and `fib` (0.99×). The
+honest weak spot: rmc wins on `hello` (2.46×, mostly process startup), `refs`
+(2.02×), `sieve` (1.74×), `stats` (1.13×), `mandel` (1.11×), `heap` (1.06×) and
+`mix` (1.05×), and is at parity on `callrec` (0.99×) and `fib` (0.95×). The
 call-heavy cases (`fib`, `mix`, `callrec`) used to lose; they no longer do
 because the recursion-to-loop pass now folds the right spine of a shape like
 `1 + f(n-1) + f(n-2)`, leaving one call per level the way rustc does. That pass
