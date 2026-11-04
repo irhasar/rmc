@@ -184,6 +184,23 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   register (`mov %r, %r`) and to `field_operand`'s `disp(%reg)` form. Measured
   +5% on `heap`. The two store-shape tests (`a_write_through_a_dereference...`,
   `field_write_targets_the_right_slot`) assert the folded form.
+- **A constant initialiser or assignment stores straight into its home.**
+  `store_imm` collapses `mov $k, %rax; mov %rax, dst` into `movq $k, dst` for
+  every scalar constant `small_imm` accepts, and it is used from all four
+  store sites: a `let` into an unpromoted local, an assignment to one, a struct
+  field in a promoted register (via `gen_expr_into_reg`, so `mov $k, %rbx`), and
+  a field in memory. A promoted *local* still uses `gen_expr_into_reg`, so its
+  constant becomes `mov $k, %r` directly. A literal needs no overflow check, so
+  the fold never changes when a trap would fire; it only ever removes a `%rax`
+  bounce. `refs` loses eight instructions from its struct literal.
+- **An `if` whose whole body is `break`/`continue` branches straight to the
+  loop label.** In statement position (`discard`), `bare_exit` recognises a
+  single-statement body that is a lone `break` or `continue` and has the `if`
+  emit `gen_branch_true(cond, exit)` instead of branch-over-a-jump
+  (`jle .L12; jmp .L11; .L12:`). The taken path is one jump, the fall-through
+  path none. This is the escape test in `mandel`'s inner loop and the guards in
+  `sieve`/`forloops`. Guarded on `discard` so a value-position `if` still
+  materialises its unit.
 - **`trim_dead` drops unreachable instructions, self-moves, inverse-move pairs,
   and a jump to the next label.** After each function body is generated it
   removes instructions following an unconditional `jmp`/`ret` up to the next
