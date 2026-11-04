@@ -35,6 +35,8 @@ python3 tests/run.py -v
 # differential fuzzer: random programs vs rustc (reproducible seeds)
 python3 tools/fuzz.py --mode expr --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1
+python3 tools/fuzz.py --mode opt --n 500 --seed 1
+python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 ```
 
 ## Source map
@@ -601,8 +603,14 @@ with randomised inputs rather than only the fixed corpus cases. It compares
 stdout and exit status against `rustc -O`, and it recompiles each program with
 every optimiser pass off in turn (`--no-inline`, `--no-licm`, `--no-tco`, all
 three), the same matrix the corpus suite uses — a pass-specific bug is otherwise
-invisible, because the fuzzer used to run only the default configuration. A
-generated shift amount must stay `i64`-typed: rustc infers
+invisible, because the fuzzer used to run only the default configuration.
+`--bounds` adds `--bounds-checks` runs (every generated index is in bounds, so a
+spurious trap or a check-codegen miscompile shows up) and `--overflow` adds
+`--overflow-checks` runs, each compared against a `rustc` built with
+`-C overflow-checks=on` (the default `rustc -O` wraps, so it would disagree by
+design). The temp directory is per-PID: two concurrent fuzz runs sharing one
+would overwrite each other's `p.s` and report a bogus assembler failure.
+A generated shift amount must stay `i64`-typed: rustc infers
 `i32` for an unconstrained literal and masks the count to 5 bits, while rmc is
 `i64`-only and masks to 6, so an untyped count reports a divergence that is not a
 bug.

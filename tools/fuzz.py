@@ -407,7 +407,9 @@ def robust_corpus():
 
 
 def run_robust():
-    tmp = "/tmp/rmc-fuzz"
+    # Per-process temp dir: two fuzz runs sharing one would overwrite each
+    # other's p.s/p.rms and report a bogus assembler failure.
+    tmp = f"/tmp/rmc-fuzz-{os.getpid()}"
     os.makedirs(tmp, exist_ok=True)
     failures = 0
     for name, data in robust_corpus().items():
@@ -683,7 +685,9 @@ def reject_corpus():
 
 
 def run_reject():
-    tmp = "/tmp/rmc-fuzz"
+    # Per-process temp dir: two fuzz runs sharing one would overwrite each
+    # other's p.s/p.rms and report a bogus assembler failure.
+    tmp = f"/tmp/rmc-fuzz-{os.getpid()}"
     os.makedirs(tmp, exist_ok=True)
     failures = 0
     corpus = reject_corpus()
@@ -718,6 +722,11 @@ def main():
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
+    ap.add_argument("--bounds", action="store_true",
+                    help="also compile with --bounds-checks, to exercise the trap codegen")
+    ap.add_argument("--overflow", action="store_true",
+                    help="also compile with --overflow-checks, against a rustc built "
+                         "with -C overflow-checks=on")
     args = ap.parse_args()
 
     if not os.path.exists(RMC):
@@ -734,7 +743,9 @@ def main():
         print("rustc not found; set RUSTC or install a toolchain", file=sys.stderr)
         return 2
 
-    tmp = "/tmp/rmc-fuzz"
+    # Per-process temp dir: two fuzz runs sharing one would overwrite each
+    # other's p.s/p.rms and report a bogus assembler failure.
+    tmp = f"/tmp/rmc-fuzz-{os.getpid()}"
     os.makedirs(tmp, exist_ok=True)
     gen = {"expr": gen_expr_program, "stmt": gen_stmt_program, "opt": gen_opt_program}[args.mode]
     rng = random.Random(args.seed)
@@ -743,24 +754,54 @@ def main():
     # bug that a single pass introduces (a mis-inlined assignment, a bad hoist)
     # is invisible here. Recompile each program with each pass off, like the
     # corpus matrix. `all-off` is the plainest code path.
+    # Each config is (label, rmc flags, rustc flags). The rustc flags select the
+    # reference build: the default `rustc -O` wraps on overflow, so an
+    # `--overflow-checks` run must be compared against `-C overflow-checks=on`.
     configs = [
-        ("", []),
-        ("no-inline", ["--no-inline"]),
-        ("no-licm", ["--no-licm"]),
-        ("no-tco", ["--no-tco"]),
-        ("all-off", ["--no-inline", "--no-licm", "--no-tco"]),
+        ("", [], []),
+        ("no-inline", ["--no-inline"], []),
+        ("no-licm", ["--no-licm"], []),
+        ("no-tco", ["--no-tco"], []),
+        ("all-off", ["--no-inline", "--no-licm", "--no-tco"], []),
     ]
+    # `--bounds-checks` turns on the trap path, which the default configs never
+    # reach: every generated index is in bounds (see the generators), so no
+    # program should trap and the outputs must still match rustc. A spurious
+    # trap, or a miscompile the check codegen introduces, shows up here.
+    if args.bounds:
+        configs += [
+            ("bounds", ["--bounds-checks"], []),
+            ("bounds-all-off", ["--bounds-checks", "--no-inline", "--no-licm", "--no-tco"], []),
+        ]
+    # `--overflow-checks` traps on `+`/`-`/`*` overflow at runtime; the reference
+    # must overflow-check too or the two disagree by design. `<<`/`>>` are not
+    # value-checked by either, so a shifted value that overflows wraps in both.
+    if args.overflow:
+        ovf = ["-C", "overflow-checks=on"]
+        configs += [
+            ("ovf", ["--overflow-checks"], ovf),
+            ("ovf-all-off", ["--overflow-checks", "--no-inline", "--no-licm", "--no-tco"], ovf),
+        ]
     failures = 0
     for t in range(args.n):
         rms, rs = gen(rng)
         open(f"{tmp}/p.rms", "w").write(rms)
         open(f"{tmp}/p.rs", "w").write(rs)
-        c = run([RUSTC, "-O", "-A", "warnings", "--edition", "2021", f"{tmp}/p.rs", "-o", f"{tmp}/q.bin"])
-        if c.returncode != 0:
-            continue  # not a valid rust reference program; skip
-        o2 = run([f"{tmp}/q.bin"])
+        # One rustc reference per distinct flag set, built once and cached.
+        refs = {}
+        skip = False
+        for rf in {tuple(cf) for (_, _, cf) in configs}:
+            rbin = f"{tmp}/q{len(refs)}.bin"
+            c = run([RUSTC, "-O", "-A", "warnings", "--edition", "2021",
+                     *rf, f"{tmp}/p.rs", "-o", rbin])
+            if c.returncode != 0:
+                skip = True  # not a valid rust reference program
+                break
+            refs[rf] = (rbin, run([rbin]))
+        if skip:
+            continue
         bad = None
-        for label, flags in configs:
+        for label, flags, rf in configs:
             c = run([RMC] + flags + [f"{tmp}/p.rms", "-o", f"{tmp}/p.bin"])
             if c.returncode != 0:
                 # rmc rejects the program. If rustc rejects it too the generator
@@ -774,6 +815,7 @@ def main():
                 bad = f"rmc[{label}] failed to compile:\n{c.stderr.decode(errors='replace')}"
                 break
             o1 = run([f"{tmp}/p.bin"])
+            o2 = refs[tuple(rf)][1]
             if (o1.returncode, o1.stdout) != (o2.returncode, o2.stdout):
                 bad = (f"rmc[{label}] exit={o1.returncode} stdout={o1.stdout!r}\n"
                        f"  rustc    exit={o2.returncode} stdout={o2.stdout!r}")
