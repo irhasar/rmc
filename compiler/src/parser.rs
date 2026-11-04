@@ -541,6 +541,19 @@ impl Parser {
         let tv = |name: &str| Expr::Var { name: name.to_string(), slot: -1, ty: Type::I64 };
         let mut stmts = Vec::new();
 
+        // The modifying operand is evaluated before the assignee place (the one
+        // right-to-left expression), so its side effects run first: bind it now,
+        // ahead of the index temporary, or a call in the index would overtake it.
+        let rv = format!("\u{0}rv{}", self.tmp);
+        self.tmp += 1;
+        stmts.push(Stmt::Let {
+            name: rv.clone(),
+            ty: Some(Type::I64),
+            init: Some(value),
+            slot: -1,
+            mutable: true,
+        });
+
         // Bind the read target and the write target to the *same* location.
         // For an index the subscript is evaluated once into a temporary and
         // reused, so `a[next()] += 1` advances the counter once, not twice.
@@ -578,7 +591,7 @@ impl Parser {
         });
         stmts.push(Stmt::Assign {
             target: write,
-            value: Expr::Bin(op, Box::new(tv(&tmp)), Box::new(value)),
+            value: Expr::Bin(op, Box::new(tv(&tmp)), Box::new(tv(&rv))),
         });
         Stmt::Expr(Expr::Block(Block {
             stmts,

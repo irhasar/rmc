@@ -90,6 +90,25 @@ fn compound_assignment_expands() {
 }
 
 #[test]
+fn assignment_evaluates_value_before_place() {
+    // rustc orders assignment operands right-to-left: the assigned value is
+    // evaluated before the assignee place. With `li` calling on both sides, the
+    // value's `call li` must appear before the index's `call li`.
+    let out = asm("fn li(t: i64) -> i64 { print_i64(t); return t; } fn main() -> i64 { let mut a: [i64; 4] = [0,0,0,0]; a[li(1)] = li(5); return 0; }");
+    let value_call = out.find("call li").expect("a call to li");
+    let index_call = out[value_call + 1..].find("call li").expect("a second call to li");
+    // The value call's argument is 5; the index call's is 1. Locate them by the
+    // immediate that precedes each `mov ..., %rdi` argument load.
+    let first_arg = &out[..value_call];
+    let second_arg = &out[value_call..value_call + 1 + index_call];
+    let last_imm = |s: &str| {
+        s.rfind("$").map(|i| s[i + 1..].chars().take_while(|c| c.is_ascii_digit()).collect::<String>())
+    };
+    assert_eq!(last_imm(first_arg).as_deref(), Some("5"), "value (5) is the first call");
+    assert_eq!(last_imm(second_arg).as_deref(), Some("1"), "place index (1) is the second call");
+}
+
+#[test]
 fn overflow_checks_add_a_jo() {
     let plain = asm("fn main() -> i64 { let mut x: i64 = 1; x = x + 1; return x; }");
     assert!(!plain.contains("jo __rmc_overflow"));

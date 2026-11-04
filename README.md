@@ -115,16 +115,18 @@ makes the `cmp` case fail, and dropping the sign bias from division by a power
 of two makes the `div` case fail.
 
 `tools/fuzz.py` generates random programs and checks them against `rustc -O`
-the same way, for the cases a hand-written suite does not think of. It has four
-modes: `expr` for integer expressions (including comparisons), `stmt` for
-loops, conditionals, `match`, arrays and aggregate calls (including argument
+the same way, for the cases a hand-written suite does not think of. It has
+several modes: `expr` for integer expressions (including comparisons), `stmt`
+for loops, conditionals, `match`, arrays and aggregate calls (including argument
 evaluation order), `opt` for a self-recursive function, an invariant loop and
 small inlined helpers (the shapes the other two do not emit), `arith` for
 overflowing arithmetic near `i64::MAX` (the only mode that makes the
 `--overflow-checks` trap fire), `nest` for nested aggregates with a deep copy
-and a nested-path write, and `pat` for `match` expressions (multi-variant enums,
+and a nested-path write, `pat` for `match` expressions (multi-variant enums,
 two-field payloads, `bool` matches, binding patterns, nested matches, and a
-side-effecting scrutinee). Every program is recompiled with each optimiser pass off in turn.
+side-effecting scrutinee), and `order` for assignment evaluation order (a
+side-effecting index and value on both `=` and every compound operator, the
+shapes `stmt` never assigns through). Every program is recompiled with each optimiser pass off in turn.
 Seeds are reproducible, so a failure can be re-run and shrunk.
 
 ```sh
@@ -134,6 +136,7 @@ python3 tools/fuzz.py --mode opt --n 500 --seed 1
 python3 tools/fuzz.py --mode arith --n 500 --seed 1
 python3 tools/fuzz.py --mode nest --n 500 --seed 1
 python3 tools/fuzz.py --mode pat --n 500 --seed 1
+python3 tools/fuzz.py --mode order --n 500 --seed 1
 # also exercise the trap codegen: --bounds-checks and --overflow-checks runs
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 python3 tools/fuzz.py --mode robust

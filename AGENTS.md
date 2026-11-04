@@ -39,6 +39,7 @@ python3 tools/fuzz.py --mode opt --n 500 --seed 1
 python3 tools/fuzz.py --mode arith --n 500 --seed 1
 python3 tools/fuzz.py --mode nest --n 500 --seed 1
 python3 tools/fuzz.py --mode pat --n 500 --seed 1
+python3 tools/fuzz.py --mode order --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 ```
 
@@ -313,10 +314,21 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 - **Struct-literal fields stay in source order.** Their layout offsets are
   attached per field, so reordering them into declaration order would change the
   order initializer side effects run in.
-- **A compound assignment with a call in its subscript is bound to a temporary.**
-  `a[next()] += 1` must evaluate `next()` once; the parser's `desugar_compound`
-  binds the subscript when (and only when) it contains a call, so the common
-  `i += 1` keeps the cheap two-instruction form.
+- **Assignment evaluates its value before its place.** rustc orders assignment
+  operands right-to-left (the one expression that does), so `a[li(1)] = li(5)`
+  must run `li(5)` before `li(1)`. Codegen's general index/deref store path and
+  `store_through_addr` evaluate the value first and stash it across the address
+  computation whenever that computation can call (`contains_call`), and the
+  aggregate copy is factored into `assign_aggregate` for the same reason. The
+  `contains_call` walk must reach every place form (`Deref`, `AddrOf`,
+  `EnumPayload`, ...), or a target like `*f()` is mis-ordered. `assignorder.rms`
+  and `tools/fuzz.py --mode order` pin this.
+- **A compound assignment binds its modifying operand first.** `desugar_compound`
+  evaluates the right-hand operand into a temporary ahead of the subscript
+  temporary, so `a[next()] += val()` runs `val()` before `next()`, matching the
+  right-to-left rule above. The subscript is still bound once, so `a[next()] += 1`
+  advances the counter once, not twice, and the cheap two-instruction form is
+  kept when the subscript has no call.
 - **Statements vs. tail expressions.** Assignments inside a block must be
   detected before the trailing-`;` check in `parse_block`, otherwise `x = ...;`
   is parsed as an expression and rejected.
@@ -423,7 +435,8 @@ inferred aggregates, nested fields, indexing a returned array), `cmpsem`
 (single evaluation of a side-effecting subscript in a compound assignment,
 struct-literal field order), `utf8` (non-ASCII string literals), `inlmulti`
 (a callee that assigns its parameter, a non-trivial argument evaluated once, and
-nested inlining with a call argument) and `licmref` (a field read that must not
+nested inlining with a call argument), `assignorder` (value-before-place
+assignment order, plain and compound) and `licmref` (a field read that must not
 be hoisted past a `&mut` store in the loop) guard the
 front-end/codegen fixes below. When adding a case, add both twins, write
 them to behave identically, and remember that `rustc` infers `i32` for unsuffixed
