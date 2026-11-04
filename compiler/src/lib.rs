@@ -16,6 +16,7 @@
 pub mod ast;
 pub mod codegen;
 pub mod consts;
+pub mod dce;
 pub mod inline;
 pub mod licm;
 pub mod lexer;
@@ -65,6 +66,7 @@ pub fn compile_to_asm(src: &str, opts: &CompileOptions) -> Result<String, String
     if !opts.no_licm {
         licm::run(&mut prog, opts.overflow_checks);
     }
+    dce::run(&mut prog);
 
     let mut cg = codegen::Codegen::new();
     if opts.overflow_checks {

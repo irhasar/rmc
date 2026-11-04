@@ -793,11 +793,17 @@ fn overflow_checks_guard_a_variable_shift_count() {
     // matching Rust's panic; without the flag it must not (the shift is then
     // unchecked, as Rust's default `<<` is too).
     let src = "fn f(x: i64, n: i64) -> i64 { return x << n; } fn main() -> i64 { return f(1, 2); }";
-    let plain = compile_to_asm(src, &CompileOptions::default()).unwrap();
+    // Inlining would fold the constant shift into `main` and leave `f` dead;
+    // disable it so the guard is inspected in the function that carries it.
+    let plain = compile_to_asm(
+        src,
+        &CompileOptions { no_inline: true, ..Default::default() },
+    )
+    .unwrap();
     assert!(!plain.contains("ja __rmc_shift_overflow"), "no guard without the flag");
     let checked = compile_to_asm(
         src,
-        &CompileOptions { overflow_checks: true, ..Default::default() },
+        &CompileOptions { overflow_checks: true, no_inline: true, ..Default::default() },
     )
     .unwrap();
     assert!(checked.contains("cmp $63, %rcx"), "count is range-checked");
@@ -986,7 +992,7 @@ fn print_str_accepts_a_string_literal() {
 #[test]
 fn argument_setup_folds_a_constant_with_lea() {
     // `fib(n - 1)` must become one `lea`, not `mov; sub; mov`.
-    let out = asm("fn f(n: i64) -> i64 { return n; } fn g(n: i64) -> i64 { return f(n - 1); } fn main() -> i64 { return 0; }");
+    let out = asm_no_inline("fn f(n: i64) -> i64 { return n; } fn g(n: i64) -> i64 { return f(n - 1); } fn main() -> i64 { return g(5); }");
     assert!(out.contains("lea -1(%"), "constant offset folded into lea: {out}");
     assert!(!out.contains("sub $1, %rax"), "no separate subtraction");
 }
@@ -1028,7 +1034,7 @@ fn an_inferred_array_is_initialised() {
 #[test]
 fn a_small_multiply_and_offset_fold_to_one_lea() {
     // `2*x + 3` on a promoted local is a single `lea`, with no `imul`.
-    let out = asm("fn g(i: i64) -> i64 { let mut x: i64 = i; x = 2 * x + 3; return x; } fn main() -> i64 { return 0; }");
+    let out = asm_no_inline("fn g(i: i64) -> i64 { let mut x: i64 = i; x = 2 * x + 3; return x; } fn main() -> i64 { return g(4); }");
     // Scope to `g`: the runtime's `arg_i64` contains its own `imul`.
     let g = &out[out.find("g:").unwrap()..out.find(".size g,").unwrap()];
     assert!(g.contains("lea 3(%"), "folded into lea: {g}");
@@ -1038,8 +1044,8 @@ fn a_small_multiply_and_offset_fold_to_one_lea() {
 #[test]
 fn a_comparison_of_two_promoted_locals_is_one_cmp() {
     // Both operands live in registers, so no value is materialised in `%rax`.
-    let out = asm(
-        "fn g(a: i64, b: i64) -> bool { let mut x: i64 = a; let mut y: i64 = b; x = x + 1; y = y + 1; return x < y; } fn main() -> i64 { return 0; }",
+    let out = asm_no_inline(
+        "fn g(a: i64, b: i64) -> bool { let mut x: i64 = a; let mut y: i64 = b; x = x + 1; y = y + 1; return x < y; } fn main() -> i64 { if g(1, 2) { return 1; } return 0; }",
     );
     let has_reg_reg_cmp = out.lines().any(|l| {
         let l = l.trim();
@@ -1052,8 +1058,8 @@ fn a_comparison_of_two_promoted_locals_is_one_cmp() {
 fn spills_use_frame_slots_not_the_stack() {
     // A value held across a call is spilled to a frame slot, so `%rsp` never
     // moves and no 16-byte alignment pad is emitted around the call.
-    let out = asm(
-        "fn f(x: i64) -> i64 { return x; } fn g(x: i64) -> i64 { return f(x - 1) + f(x - 2); } fn main() -> i64 { return 0; }",
+    let out = asm_no_inline(
+        "fn f(x: i64) -> i64 { return x; } fn g(x: i64) -> i64 { return f(x - 1) + f(x - 2); } fn main() -> i64 { return g(5); }",
     );
     let g = &out[out.find("g:").unwrap()..out.find(".size g,").unwrap()];
     assert!(!g.contains("push %rax"), "no stack spill: {g}");
@@ -1311,7 +1317,7 @@ fn bitwise_and_shift_emit_the_right_instructions() {
     // matching rustc; the 6-bit mask applies only to a run-time count, which
     // the hardware does anyway (`sal %cl` masks `%cl` to 6 bits for a 64-bit
     // operand).
-    let out = asm("fn f(n: i64) -> i64 { return 1 << n; } fn main() -> i64 { return f(70); }");
+    let out = asm_no_inline("fn f(n: i64) -> i64 { return 1 << n; } fn main() -> i64 { return f(70); }");
     assert!(out.contains("sal %cl, %rax"), "a variable shift count goes through %cl");
 
     let out = asm("fn main() -> i64 { return -8 >> 2; }");
@@ -1389,7 +1395,7 @@ fn shift_binds_looser_than_addition() {
 #[test]
 fn match_desugars_to_equality_compares() {
     // Each integer arm becomes an `==` against the scrutinee.
-    let out = asm("fn f(x: i64) -> i64 { match x { 0 => 10, 1 => 20, _ => 30 } } fn main() -> i64 { return f(0); }");
+    let out = asm_no_inline("fn f(x: i64) -> i64 { match x { 0 => 10, 1 => 20, _ => 30 } } fn main() -> i64 { return f(0); }");
     assert!(out.contains("cmpq $0,"), "arm 0 compares against 0");
     assert!(out.contains("cmpq $1,"), "arm 1 compares against 1");
 }
@@ -1809,7 +1815,7 @@ fn a_ref_typed_parameter_is_one_slot_not_a_copy() {
 
 #[test]
 fn a_method_with_a_ref_receiver_passes_an_address() {
-    let out = asm(
+    let out = asm_no_inline(
         "struct P { x: i64, y: i64 } \
          impl P { fn get(&self) -> i64 { return self.x; } } \
          fn main() -> i64 { let v: P = P { x: 5, y: 6 }; return v.get(); }",
@@ -1911,7 +1917,7 @@ fn a_write_through_a_reference_to_a_struct_field_stores_to_the_field() {
 
 #[test]
 fn a_mut_receiver_is_passed_by_address() {
-    let out = asm(
+    let out = asm_no_inline(
         "struct C { n: i64 } \
          impl C { fn bump(&mut self) -> i64 { self.n = self.n + 1; return self.n; } } \
          fn main() -> i64 { let mut c: C = C { n: 1 }; return c.bump(); }",
@@ -1945,7 +1951,7 @@ fn a_field_read_through_a_reference_is_one_load() {
     // `mov`/`add`/`mov` sequence: three instructions per field is what made a
     // `&self` accessor over a wide struct an order of magnitude slower than
     // rustc on the `refs` benchmark.
-    let out = asm(
+    let out = asm_no_inline(
         "struct P { x: i64, y: i64 } \
          fn get(p: &P) -> i64 { return p.y; } \
          fn main() -> i64 { let q: P = P { x: 1, y: 2 }; return get(&q); }",
@@ -1964,7 +1970,7 @@ fn a_field_read_through_a_reference_is_one_load() {
 fn a_field_read_through_a_double_reference_still_loads_the_inner_pointer() {
     // The register fold only applies one level deep; `(**ppr).x` must go
     // through the inner pointer, not treat it as a register.
-    let out = asm(
+    let out = asm_no_inline(
         "struct P { x: i64, y: i64 } \
          fn get(pp: &&P) -> i64 { return (**pp).x; } \
          fn main() -> i64 { let q: P = P { x: 1, y: 2 }; let r: &P = &q; return get(&r); }",
@@ -1976,7 +1982,7 @@ fn a_field_read_through_a_double_reference_still_loads_the_inner_pointer() {
 fn a_scalar_dereference_folds_into_a_comparison() {
     // `*p < 5` with `p` in a register is one `cmp mem, imm`; the deref is a
     // memory operand, not a load into `%rax` first.
-    let out = asm("fn lt(p: &i64) -> bool { return *p < 5; } fn main() -> i64 { let x: i64 = 1; if lt(&x) { return 1; } return 0; }");
+    let out = asm_no_inline("fn lt(p: &i64) -> bool { return *p < 5; } fn main() -> i64 { let x: i64 = 1; if lt(&x) { return 1; } return 0; }");
     let body: String = out
         .lines()
         .skip_while(|l| !l.starts_with("lt:"))
