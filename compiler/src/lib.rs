@@ -15,6 +15,7 @@
 
 pub mod ast;
 pub mod codegen;
+pub mod consts;
 pub mod inline;
 pub mod licm;
 pub mod lexer;

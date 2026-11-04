@@ -187,7 +187,8 @@ plus payload bindings and binding names) and `if let` with the same patterns
 (desugared to a two-arm `match`); `break`, `continue`,
 `return`; arithmetic, comparison, bitwise (`!`/`&`/`|`/`^`) and shift (`<<`/`>>`)
 operators; `&&`/`||`; string literals; `mut` enforcement and definite
-initialisation; references (`&T` / `&mut T`, `&e`, `*e`,
+initialisation; `const` items (folded to a value and substituted at every use,
+including array lengths and `match` patterns); references (`&T` / `&mut T`, `&e`, `*e`,
 with auto-deref for `r.x`, `r[i]` and `r.m()`, and `&self` receivers);
 attributes such as `#[derive(Copy, Clone)]` (parsed and ignored); and a small
 set of runtime builtins. Structs and arrays may be passed to and returned from

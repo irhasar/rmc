@@ -10,6 +10,7 @@
 //! always a multiple of 8 and every field is naturally aligned.
 
 use crate::ast::*;
+use crate::consts::{const_binop, const_binop_checked, const_i64};
 use std::collections::HashMap;
 
 #[derive(Clone)]
@@ -89,6 +90,10 @@ pub struct Sema {
     /// Binding names taken by `&mut` anywhere in the function; such a local is
     /// never folded, since the callee may write it.
     mut_borrowed: std::collections::HashSet<String>,
+    /// Names of the program's `const` items. A local binding may not reuse one
+    /// (rustc E0530), so a `let`, a parameter or a `for` variable is checked
+    /// against this set.
+    const_names: std::collections::HashSet<String>,
 }
 
 /// A lexical scope entry. `mutable` records whether the binding was declared
@@ -109,6 +114,11 @@ type Scope = Vec<Binding>;
 
 pub fn analyze(prog: &mut Program) -> Result<(), String> {
     let (structs, enums) = resolve_layouts(&prog.structs, &prog.enums)?;
+
+    // Validate the `const` items. Their values were folded by the parser (which
+    // needs them for array lengths and patterns); here each is checked for a
+    // duplicate name, a usable type, and an initializer that actually folds.
+    let const_names = check_consts(prog, &structs, &enums)?;
 
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     // Runtime helpers provided by the freestanding assembly runtime. They are
@@ -202,6 +212,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         const_locals: HashMap::new(),
         assign_count: HashMap::new(),
         mut_borrowed: std::collections::HashSet::new(),
+        const_names,
     };
     for f in &mut prog.fns {
         sema.check_fn(f)?;
@@ -396,6 +407,68 @@ fn resolve_in(
     }
 }
 
+/// Validate every `const` item: unique name, a type rmc can fold (`i64` or
+/// `bool`), and an initializer that evaluates to that type. Returns the set of
+/// constant names so local bindings can be checked against it. The parser
+/// already folded the values; this only checks them, so a constant whose
+/// initializer does not fold (a call, a cycle, an out-of-range arithmetic) is
+/// reported here rather than silently dropped.
+fn check_consts(
+    prog: &Program,
+    structs: &HashMap<String, StructInfo>,
+    enums: &HashMap<String, EnumInfo>,
+) -> Result<std::collections::HashSet<String>, String> {
+    let mut names = std::collections::HashSet::new();
+    // A `const` and a function share a namespace in rustc (E0428).
+    let fn_names: std::collections::HashSet<&str> =
+        prog.fns.iter().map(|f| f.name.as_str()).collect();
+    let items: Vec<(String, Type, Expr)> = prog
+        .consts
+        .iter()
+        .map(|c| (c.name.clone(), c.ty.clone(), c.value.clone()))
+        .collect();
+    let resolved = crate::consts::resolve(&items);
+    for c in &prog.consts {
+        if !names.insert(c.name.clone()) {
+            return Err(format!("the name `{}` is defined multiple times", c.name));
+        }
+        if fn_names.contains(c.name.as_str()) {
+            return Err(format!("the name `{}` is defined multiple times", c.name));
+        }
+        let ty = resolve_in(&c.ty, structs, enums)?;
+        match ty {
+            Type::I64 | Type::Bool => {}
+            other => {
+                return Err(format!(
+                    "constant `{}` has type {other:?}; rmc only folds `i64` and `bool` constants",
+                    c.name
+                ))
+            }
+        }
+        // `resolved` holds only items whose initializer folded, so a missing
+        // name means the initializer is not a constant expression (or is part
+        // of a cycle).
+        match (ty, resolved.get(&c.name)) {
+            (Type::I64, Some(crate::consts::ConstVal::Int(_))) => {}
+            (Type::Bool, Some(crate::consts::ConstVal::Bool(_))) => {}
+            (Type::I64, _) => {
+                return Err(format!(
+                    "constant `{}` is not a constant `i64` expression",
+                    c.name
+                ))
+            }
+            (Type::Bool, _) => {
+                return Err(format!(
+                    "constant `{}` is not a constant `bool` expression",
+                    c.name
+                ))
+            }
+            _ => unreachable!(),
+        }
+    }
+    Ok(names)
+}
+
 impl Sema {
     /// Every type site goes through here, so an enum name resolves wherever a
     /// type may appear.
@@ -410,6 +483,13 @@ impl Sema {
             if f.params[..i].iter().any(|(n, _)| n == name) {
                 return Err(format!(
                     "identifier `{name}` is bound more than once in this parameter list"
+                ));
+            }
+            // A parameter may not shadow a constant (rustc E0530). `self` is
+            // never a constant, so it needs no special case.
+            if self.const_names.contains(name) {
+                return Err(format!(
+                    "identifier `{name}` shadows a constant of the same name"
                 ));
             }
         }
@@ -648,6 +728,13 @@ impl Sema {
     fn check_stmt(&mut self, st: &mut Stmt, scope: &mut Scope) -> Result<(), String> {
         match st {
             Stmt::Let { name, ty, init, slot, mutable } => {
+                // A `let` may not shadow a constant (rustc E0530). Checked
+                // before the initializer so the error names the binding.
+                if self.const_names.contains(name) {
+                    return Err(format!(
+                        "identifier `{name}` shadows a constant of the same name"
+                    ));
+                }
                 let declared = match ty {
                     Some(t) => Some(self.resolve_ty(t)?),
                     None => None,
@@ -774,6 +861,12 @@ impl Sema {
                 Ok(())
             }
             Stmt::For { var, var_slot, start, end, end_slot, body } => {
+                // The loop variable may not shadow a constant (rustc E0530).
+                if self.const_names.contains(var) {
+                    return Err(format!(
+                        "identifier `{var}` shadows a constant of the same name"
+                    ));
+                }
                 let ts = self.check_expr(start, scope)?;
                 let te = self.check_expr(end, scope)?;
                 if ts != Type::I64 || te != Type::I64 {
@@ -1800,106 +1893,6 @@ fn ref_coerces(found: &Type, expected: &Type) -> bool {
         (Type::Ref(f, true), Type::Ref(e, false)) => f == e,
         _ => false,
     }
-}
-
-/// The value of a constant integer expression, if it is one: an integer
-/// literal, or a negated constant (`-1` parses as `Un(Neg, Int(1))`, so a
-/// constant index like `a[-1]` is still recognised).
-fn const_i64(e: &Expr) -> Option<i64> {
-    match e {
-        Expr::Int(k) => Some(*k),
-        Expr::Un(UnOp::Neg, inner) => const_i64(inner)?.checked_neg(),
-        // Fold the integer operators too, so a constant index written as an
-        // expression (`a[1 + 4]`) is bounds-checked exactly like a literal.
-        Expr::Bin(op, a, b) => {
-            let x = const_i64(a)?;
-            let y = const_i64(b)?;
-            use BinOp::*;
-            match op {
-                Add => x.checked_add(y),
-                Sub => x.checked_sub(y),
-                Mul => x.checked_mul(y),
-                Div => x.checked_div(y),
-                Mod => x.checked_rem(y),
-                BitAnd => Some(x & y),
-                BitOr => Some(x | y),
-                BitXor => Some(x ^ y),
-                // A shift of 64 or more is out of range, so it is not a usable
-                // constant here; the operator itself reports it via `const_binop`.
-                Shl => (0..64).contains(&y).then(|| x.wrapping_shl(y as u32)),
-                Shr => (0..64).contains(&y).then(|| x.wrapping_shr(y as u32)),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
-/// Evaluate a constant `i64` binary operation the way rustc does at compile
-/// time: division or remainder by zero and `MIN / -1` panic at runtime, and
-/// `+`/`-`/`*` overflow and an out-of-range shift amount trap under the
-/// overflow checks rmc emits. Rejecting these where both operands are literals
-/// keeps rmc from compiling a program rustc refuses (and that would fault at
-/// run time). Only literal operands are folded; rmc does not propagate
-/// constants through locals, so `let d = 0; 1 / d` is not diagnosed here.
-fn const_binop(op: BinOp, a: i64, b: i64) -> Result<i64, String> {
-    use BinOp::*;
-    let (val, overflow) = match op {
-        Add => a.overflowing_add(b),
-        Sub => a.overflowing_sub(b),
-        Mul => a.overflowing_mul(b),
-        Div | Mod => {
-            if b == 0 {
-                return Err("division by zero panics at run time".into());
-            }
-            if a == i64::MIN && b == -1 {
-                return Err("attempt to divide with overflow panics at run time".into());
-            }
-            (if op == Div { a / b } else { a % b }, false)
-        }
-        Shl | Shr => {
-            if !(0..64).contains(&b) {
-                return Err("shift amount is out of range for `i64`".into());
-            }
-            (if op == Shl { a << b } else { a >> b }, false)
-        }
-        _ => return Ok(0),
-    };
-    if overflow {
-        return Err("this arithmetic operation overflows".into());
-    }
-    Ok(val)
-}
-
-/// The value of a constant binary operation, or `None` if it is not defined
-/// (division by zero, `MIN / -1`, overflow, or an out-of-range shift). Used
-/// both to diagnose a constant expression (`const_binop`) and to fold one while
-/// evaluating a constant local (`const_of`), where an undefined result simply
-/// means the value is not a usable constant.
-fn const_binop_checked(op: BinOp, a: i64, b: i64) -> Option<i64> {
-    use BinOp::*;
-    let (val, overflow) = match op {
-        Add => a.overflowing_add(b),
-        Sub => a.overflowing_sub(b),
-        Mul => a.overflowing_mul(b),
-        Div | Mod => {
-            if b == 0 || (a == i64::MIN && b == -1) {
-                return None;
-            }
-            (if op == Div { a / b } else { a % b }, false)
-        }
-        Shl | Shr => {
-            if !(0..64).contains(&b) {
-                return None;
-            }
-            (if op == Shl { a << b } else { a >> b }, false)
-        }
-        _ => return None,
-    };
-    if overflow {
-        return None;
-    }
-    Some(val)
 }
 
 /// The type a reference points at, or the type itself when it is not a
