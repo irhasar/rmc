@@ -72,6 +72,23 @@ pub struct Sema {
     /// Whether the `if` being checked is a non-root step of such a chain, so it
     /// inherits `match_total` instead of recomputing it.
     match_chain: bool,
+    /// The constant value of each local, by slot, if it is known. A local is
+    /// entered only when rustc's constant propagation would know it: its
+    /// initializer is constant and it is never written or mutably borrowed
+    /// anywhere in the function (see `collect_written`). Used to fold an index
+    /// or arithmetic operand that is a constant *local* (`let i = -1; a[i]`),
+    /// which rustc folds and rmc otherwise missed.
+    const_locals: HashMap<i32, i64>,
+    /// How many times each binding name is assigned by an `=` statement in the
+    /// current function (the `let` initializer is not counted). rustc folds a
+    /// local only when it is assigned at most once in total, so a name with any
+    /// `=` assignment is folded only if it was declared without an initializer
+    /// and this is that one assignment. Keyed by name because the scan runs
+    /// before sema assigns slots.
+    assign_count: HashMap<String, u32>,
+    /// Binding names taken by `&mut` anywhere in the function; such a local is
+    /// never folded, since the callee may write it.
+    mut_borrowed: std::collections::HashSet<String>,
 }
 
 /// A lexical scope entry. `mutable` records whether the binding was declared
@@ -172,6 +189,9 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         ret_ty: Type::Unit,
         match_total: false,
         match_chain: false,
+        const_locals: HashMap::new(),
+        assign_count: HashMap::new(),
+        mut_borrowed: std::collections::HashSet::new(),
     };
     for f in &mut prog.fns {
         sema.check_fn(f)?;
@@ -385,6 +405,10 @@ impl Sema {
         }
         self.next_slot = 0;
         self.loop_depth = 0;
+        self.const_locals.clear();
+        self.assign_count.clear();
+        self.mut_borrowed.clear();
+        Self::collect_assigns(&f.body, &mut self.assign_count, &mut self.mut_borrowed);
         self.ret_ty = self.resolve_ty(&f.ret)?;
         f.ret = self.ret_ty.clone();
         // An aggregate return is written through a hidden pointer, so reserve a
@@ -618,6 +642,22 @@ impl Sema {
                     mutable: *mutable,
                     init: initialized,
                 });
+                // Track an `i64` local whose initializer is constant and that
+                // is never written or mutably borrowed anywhere in the function
+                // (`written`), so a later `a[i]` or `x + i` folds it the way
+                // rustc's constant propagation does. The whole-function test
+                // matters: `let mut x = i64::MAX; x = x + 1;` is accepted by
+                // rustc because `x` is assigned twice, so its constant is not
+                // propagated — folding the first `x` here would wrongly reject
+                // the program.
+                let assigned = self.assign_count.get(name).copied().unwrap_or(0);
+                if init.is_some() && assigned == 0 && !self.mut_borrowed.contains(name) {
+                    if let Some(e) = init.as_ref() {
+                        if let Some(k) = self.const_of(e, &self.const_locals) {
+                            self.const_locals.insert(s, k);
+                        }
+                    }
+                }
                 Ok(())
             }
             Stmt::Assign { target, value } => {
@@ -630,12 +670,34 @@ impl Sema {
                 // The write initializes a whole binding; mark it before
                 // checking the target as a place, so `let x: i64; x = 7;` does
                 // not read `x` back as uninitialized.
+                let mut deferred_init = None;
                 if let Expr::Var { name, .. } = target {
                     if let Some(i) = Self::binding_index(scope, name) {
+                        let was_uninit = !scope[i].init;
                         scope[i].init = true;
+                        if was_uninit {
+                            deferred_init = Some(name.clone());
+                        }
                     }
                 }
                 let tty = self.check_lvalue(target, scope)?;
+                // A deferred single init (`let i; i = -1;`) is the one
+                // assignment rustc folds; a second assignment would make the
+                // count 2 and the gate fail. This runs after `check_lvalue`,
+                // which is what resolves the target's slot.
+                if let Some(name) = deferred_init {
+                    if let Expr::Var { slot, .. } = target {
+                        let assigned = self.assign_count.get(&name).copied().unwrap_or(0);
+                        if assigned == 1
+                            && !self.mut_borrowed.contains(&name)
+                            && *slot >= 0
+                        {
+                            if let Some(k) = self.const_of(value, &self.const_locals) {
+                                self.const_locals.insert(*slot, k);
+                            }
+                        }
+                    }
+                }
                 if vty != tty && !ref_coerces(&vty, &tty) {
                     return Err(format!("assignment type mismatch: target is {tty:?}, value is {vty:?}"));
                 }
@@ -813,6 +875,160 @@ impl Sema {
         }
     }
 
+    /// Count the `=` assignments to each binding name in a function and record
+    /// the names taken by `&mut`. rustc's constant propagation folds a local
+    /// only when it is assigned at most once in total, so a name with a second
+    /// assignment must not be folded even when a fold would be correct on the
+    /// path actually taken. The scan is whole-function and order-independent:
+    /// `let mut x = i64::MAX; x = x + 1;` is accepted by rustc because `x` is
+    /// assigned twice, so its constant is not propagated. Keyed by name because
+    /// it runs before sema assigns slots.
+    fn collect_assigns(
+        block: &Block,
+        a: &mut HashMap<String, u32>,
+        mb: &mut std::collections::HashSet<String>,
+    ) {
+        for st in &block.stmts {
+            Self::collect_assigns_stmt(st, a, mb);
+        }
+        if let Some(t) = &block.tail {
+            Self::collect_mut_borrows(t, a, mb);
+        }
+    }
+
+    fn collect_assigns_stmt(
+        st: &Stmt,
+        a: &mut HashMap<String, u32>,
+        mb: &mut std::collections::HashSet<String>,
+    ) {
+        match st {
+            Stmt::Let { init, .. } => {
+                if let Some(e) = init {
+                    Self::collect_mut_borrows(e, a, mb);
+                }
+            }
+            Stmt::Assign { target, value } => {
+                if let Some(n) = Self::place_root_name(target) {
+                    *a.entry(n).or_insert(0) += 1;
+                }
+                Self::collect_mut_borrows(value, a, mb);
+            }
+            Stmt::Expr(e) => Self::collect_mut_borrows(e, a, mb),
+            Stmt::While(c, b) => {
+                Self::collect_mut_borrows(c, a, mb);
+                Self::collect_assigns(b, a, mb);
+            }
+            Stmt::Loop(b) => Self::collect_assigns(b, a, mb),
+            Stmt::For { start, end, body, .. } => {
+                Self::collect_mut_borrows(start, a, mb);
+                Self::collect_mut_borrows(end, a, mb);
+                Self::collect_assigns(body, a, mb);
+            }
+            Stmt::Return(v) => {
+                if let Some(e) = v {
+                    Self::collect_mut_borrows(e, a, mb);
+                }
+            }
+            Stmt::Break | Stmt::Continue => {}
+        }
+    }
+
+    /// The root name of a place expression, if it names a local.
+    fn place_root_name(e: &Expr) -> Option<String> {
+        match e {
+            Expr::Var { name, .. } => Some(name.clone()),
+            Expr::Deref { expr, .. } | Expr::Field { base: expr, .. } => Self::place_root_name(expr),
+            Expr::Index(base, _) => Self::place_root_name(base),
+            _ => None,
+        }
+    }
+
+    /// Record every `&mut place` name, and recurse into nested blocks so their
+    /// assignments are counted too.
+    fn collect_mut_borrows(
+        e: &Expr,
+        a: &mut HashMap<String, u32>,
+        mb: &mut std::collections::HashSet<String>,
+    ) {
+        match e {
+            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
+            Expr::Bin(_, x, y) => {
+                Self::collect_mut_borrows(x, a, mb);
+                Self::collect_mut_borrows(y, a, mb);
+            }
+            Expr::Un(_, x) => Self::collect_mut_borrows(x, a, mb),
+            Expr::Call { args, .. } => {
+                for x in args {
+                    Self::collect_mut_borrows(x, a, mb);
+                }
+            }
+            Expr::If(c, t, el) => {
+                Self::collect_mut_borrows(c, a, mb);
+                Self::collect_assigns(t, a, mb);
+                if let Some(b) = el {
+                    Self::collect_assigns(b, a, mb);
+                }
+            }
+            Expr::MatchBoundary(b, _) | Expr::Block(b) => Self::collect_assigns(b, a, mb),
+            Expr::Index(base, idx) => {
+                Self::collect_mut_borrows(base, a, mb);
+                Self::collect_mut_borrows(idx, a, mb);
+            }
+            Expr::Field { base, .. } => Self::collect_mut_borrows(base, a, mb),
+            Expr::StructLit { fields, .. } => {
+                for f in fields {
+                    Self::collect_mut_borrows(&f.value, a, mb);
+                }
+            }
+            Expr::ArrayLit(v, _) => Self::collect_mut_borrows(v, a, mb),
+            Expr::ArrayList(vs) => {
+                for v in vs {
+                    Self::collect_mut_borrows(v, a, mb);
+                }
+            }
+            Expr::MethodCall { recv, args, .. } => {
+                Self::collect_mut_borrows(recv, a, mb);
+                for x in args {
+                    Self::collect_mut_borrows(x, a, mb);
+                }
+            }
+            Expr::EnumCtor { args, .. } => {
+                for x in args {
+                    Self::collect_mut_borrows(x, a, mb);
+                }
+            }
+            Expr::VariantTest { scrutinee, .. } => Self::collect_mut_borrows(scrutinee, a, mb),
+            Expr::EnumPayload { recv, .. } => Self::collect_mut_borrows(recv, a, mb),
+            Expr::Cast(inner, _) => Self::collect_mut_borrows(inner, a, mb),
+            Expr::AddrOf { expr, mutable, .. } => {
+                if *mutable {
+                    if let Some(n) = Self::place_root_name(expr) {
+                        mb.insert(n);
+                    }
+                }
+                Self::collect_mut_borrows(expr, a, mb);
+            }
+            Expr::Deref { expr, .. } => Self::collect_mut_borrows(expr, a, mb),
+        }
+    }
+
+    /// The constant value of an expression: a literal (with `const_i64`'s
+    /// arithmetic folding), a constant local read, or an operator applied to
+    /// two constants. `snap` is the current `const_locals`, passed so this can
+    /// be a pure function over an immutable snapshot (it is called while the
+    /// AST is mutably borrowed).
+    fn const_of(&self, e: &Expr, snap: &HashMap<i32, i64>) -> Option<i64> {
+        const_i64(e).or_else(|| match e {
+            Expr::Var { slot, ty, .. } if *ty == Type::I64 && *slot >= 0 => snap.get(slot).copied(),
+            Expr::Bin(op, a, b) => {
+                let x = self.const_of(a, snap)?;
+                let y = self.const_of(b, snap)?;
+                const_binop_checked(*op, x, y)
+            }
+            _ => None,
+        })
+    }
+
     fn check_lvalue(&mut self, e: &mut Expr, scope: &mut Scope) -> Result<Type, String> {
         match e {
             Expr::Var { .. } | Expr::Field { .. } => self.check_expr(e, scope),
@@ -829,7 +1045,7 @@ impl Sema {
                         // exactly as rustc rejects it. A non-constant index is
                         // checked at runtime (when bounds checks are on), so it
                         // stays a runtime concern here.
-                        if let Some(k) = const_i64(idx) {
+                        if let Some(k) = self.const_of(idx, &self.const_locals) {
                             if k < 0 || k as usize >= n {
                                 return Err(format!(
                                     "index {k} is out of bounds for an array of length {n}"
@@ -891,7 +1107,7 @@ impl Sema {
                         if ta != Type::I64 || tb != Type::I64 {
                             return Err(format!("arithmetic expects `i64` operands, found {ta:?} and {tb:?}"));
                         }
-                        if let (Some(x), Some(y)) = (const_i64(a), const_i64(b)) {
+                        if let (Some(x), Some(y)) = (self.const_of(a, &self.const_locals), self.const_of(b, &self.const_locals)) {
                             const_binop(*op, x, y)?;
                         }
                         Ok(Type::I64)
@@ -925,7 +1141,7 @@ impl Sema {
                         if ta != Type::I64 || tb != Type::I64 {
                             return Err(format!("bitwise operator expects `i64` operands, found {ta:?} and {tb:?}"));
                         }
-                        if let (Some(x), Some(y)) = (const_i64(a), const_i64(b)) {
+                        if let (Some(x), Some(y)) = (self.const_of(a, &self.const_locals), self.const_of(b, &self.const_locals)) {
                             const_binop(*op, x, y)?;
                         }
                         Ok(Type::I64)
@@ -1080,7 +1296,7 @@ impl Sema {
                         // exactly as rustc rejects it. A non-constant index is
                         // checked at runtime (when bounds checks are on), so it
                         // stays a runtime concern here.
-                        if let Some(k) = const_i64(idx) {
+                        if let Some(k) = self.const_of(idx, &self.const_locals) {
                             if k < 0 || k as usize >= n {
                                 return Err(format!(
                                     "index {k} is out of bounds for an array of length {n}"
@@ -1591,6 +1807,37 @@ fn const_binop(op: BinOp, a: i64, b: i64) -> Result<i64, String> {
         return Err("this arithmetic operation overflows".into());
     }
     Ok(val)
+}
+
+/// The value of a constant binary operation, or `None` if it is not defined
+/// (division by zero, `MIN / -1`, overflow, or an out-of-range shift). Used
+/// both to diagnose a constant expression (`const_binop`) and to fold one while
+/// evaluating a constant local (`const_of`), where an undefined result simply
+/// means the value is not a usable constant.
+fn const_binop_checked(op: BinOp, a: i64, b: i64) -> Option<i64> {
+    use BinOp::*;
+    let (val, overflow) = match op {
+        Add => a.overflowing_add(b),
+        Sub => a.overflowing_sub(b),
+        Mul => a.overflowing_mul(b),
+        Div | Mod => {
+            if b == 0 || (a == i64::MIN && b == -1) {
+                return None;
+            }
+            (if op == Div { a / b } else { a % b }, false)
+        }
+        Shl | Shr => {
+            if !(0..64).contains(&b) {
+                return None;
+            }
+            (if op == Shl { a << b } else { a >> b }, false)
+        }
+        _ => return None,
+    };
+    if overflow {
+        return None;
+    }
+    Some(val)
 }
 
 /// The type a reference points at, or the type itself when it is not a

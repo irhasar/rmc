@@ -540,8 +540,10 @@ The checks, all in `sema.rs`:
   The index is folded with `const_i64`, which evaluates the integer operators
   (`+ - * / % & | ^ << >>`) as well as unary `-`, so an index written as an
   expression is caught too — an earlier version folded only literals and let
-  `a[1 + 4]` read adjacent stack memory. A *variable* index is still unchecked
-  by default (see Scope).
+  `a[1 + 4]` read adjacent stack memory. `Sema::const_of` extends this to a
+  constant *local*: `let i = -1; a[i]` is folded the way rustc's constant
+  propagation folds it, which an earlier version did not, letting `a[i]` read
+  past the array. A *variable* index is still unchecked by default (see Scope).
 - **String typing.** A string literal is `Type::Str`, not `i64`. It cannot be an
   arithmetic operand (`1 + "hi"` was accepted as integer addition on the
   string's address, `E0369`) and cannot be passed where an `i64` is expected
@@ -560,13 +562,26 @@ The checks, all in `sema.rs`:
   Before this, `r as i64`, `r as &mut T`, `&T as &U` and `bool as &T` all
   compiled, reinterpreting a pointer as a value or forging mutability.
 - **Constant arithmetic (`E0080`-like).** `const_binop` folds an operator whose
-  *both* operands are literals (`const_i64` sees through unary `-`) and rejects
-  the cases rustc denies: division/remainder by zero, `MIN / -1`, `+`/`-`/`*`
-  overflow, and a shift amount outside `0..64`. Under the overflow checks rmc
-  emits each of these traps, so an accepted one would fault at run time (rmc
-  used to emit an `idiv` that raised SIGFPE). Only literal operands are folded —
-  rmc does not propagate constants through locals, so `let d = 0; 1 / d` is not
-  diagnosed, matching the Scope note that variable values are unchecked.
+  operands are both constant (through `Sema::const_of`) and rejects the cases
+  rustc denies: division/remainder by zero, `MIN / -1`, `+`/`-`/`*` overflow,
+  and a shift amount outside `0..64`. Under the overflow checks rmc emits each
+  of these traps, so an accepted one would fault at run time (rmc used to emit an
+  `idiv` that raised SIGFPE). A constant local counts as constant, so `let d =
+  0; 1 / d` and `let x = i64::MAX; x + 1` are diagnosed like the literals, as
+  rustc does.
+- **Constant-local propagation, matching rustc.** `Sema::const_locals` maps a
+  slot to a known constant, and `const_of` reads it. A local is entered only
+  when rustc would know it: its initializer is constant and it is assigned at
+  most once in the whole function and never taken by `&mut`. `collect_assigns`
+  pre-scans the body (before slots exist, so it keys on names) for `=`
+  assignments and `&mut` borrows. The whole-function, order-independent test is
+  what keeps the fold in step with rustc: `let mut x = i64::MAX; x = x + 1;` is
+  *accepted* because `x` is assigned twice, so rustc does not propagate its
+  constant and neither must rmc (folding it would wrongly reject the program).
+  A deferred single init (`let i; i = -1;`) is the one assignment that is
+  folded, via the `Assign` arm, which is also where the target's slot is
+  resolved. This is the safe direction: rmc folds a strict subset of what rustc
+  folds, so it never accepts a program rustc rejects.
 
 `not_on_int` remains an *over*-rejection (rmc rejects a program rustc accepts),
 the safe direction; it is listed by the audit harness but is not a soundness bug.

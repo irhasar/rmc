@@ -405,6 +405,61 @@ fn a_constant_index_expression_out_of_bounds_is_rejected() {
 }
 
 #[test]
+fn a_constant_local_index_out_of_bounds_is_rejected() {
+    // rustc's constant propagation knows the value of `i`, so it denies the
+    // index. rmc must fold a constant local too, or it reads past the array.
+    for (decl, idx) in [
+        ("let i: i64 = -1;", "i"),
+        ("let i: i64 = 2;", "i"),
+        ("let i: i64 = 1 - 3;", "i"),
+        ("let mut i: i64 = -1;", "i"),
+        ("let i: i64; i = -1;", "i"),
+        ("let i: i64 = -1; let i: i64 = 2;", "i"),
+    ] {
+        let err = compile_to_asm(
+            &format!("fn main() -> i64 {{ let a: [i64; 2] = [1, 2]; {decl} return a[{idx}]; }}"),
+            &CompileOptions::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("out of bounds"), "{decl} a[{idx}]: got: {err}");
+    }
+}
+
+#[test]
+fn a_written_constant_local_index_is_not_folded() {
+    // rustc assigns `i` twice, so its constant is not propagated and the
+    // program is accepted; folding the first `i` here would wrongly reject it.
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let a: [i64; 2] = [1, 2]; let mut i: i64 = -1; i = 0; return a[i]; }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_constant_local_that_overflows_is_rejected() {
+    // A constant local participates in the trapping-constant check: rustc
+    // denies `let x = i64::MAX; x + 1` (E0080).
+    let err = compile_to_asm(
+        "fn main() -> i64 { let x: i64 = 9223372036854775807; let y: i64 = x + 1; return y; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("overflow"), "got: {err}");
+}
+
+#[test]
+fn a_second_assignment_stops_constant_folding() {
+    // The overflow is only denied when the value is a propagated constant; with
+    // a second assignment rustc treats `x` as runtime data and accepts it.
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let mut x: i64 = 9223372036854775807; x = x + 1; return x; }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
 fn an_in_range_constant_index_expression_is_accepted() {
     assert!(compile_to_asm(
         "fn main() -> i64 { let a: [i64; 4] = [1, 2, 3, 4]; return a[1 + 2]; }",
@@ -913,8 +968,11 @@ fn bounds_checks_leave_an_in_range_constant_alone() {
 fn bounds_checks_guard_a_block_base() {
     // `{ ... }[i]` is a non-local base; its length comes from the block's tail,
     // so the check must still be emitted.
+    // The index is a parameter, so it is not a constant and the runtime check
+    // is reached (a constant index is now folded and rejected at compile time).
     let out = compile_to_asm(
-        "fn main() -> i64 { let i: i64 = 9; let v: i64 = { let t: [i64; 3] = [1; 3]; t }[i]; return v; }",
+        "fn f(i: i64) -> i64 { let v: i64 = { let t: [i64; 3] = [1; 3]; t }[i]; return v; } \
+         fn main() -> i64 { return f(9); }",
         &CompileOptions { bounds_checks: true, ..Default::default() },
     )
     .unwrap();
@@ -929,7 +987,8 @@ fn bounds_checks_guard_a_runtime_index_on_a_non_local_base() {
     // path is only reachable with a variable index.)
     let out = compile_to_asm(
         "fn make() -> [i64; 3] { let a: [i64; 3] = [1; 3]; return a; } \
-         fn main() -> i64 { let i: i64 = 10; return make()[i]; }",
+         fn f(i: i64) -> i64 { return make()[i]; } \
+         fn main() -> i64 { return f(10); }",
         &CompileOptions { bounds_checks: true, ..Default::default() },
     )
     .unwrap();
@@ -960,7 +1019,8 @@ fn a_base_with_side_effects_runs_before_the_bounds_trap() {
     // at compile time).
     let out = compile_to_asm(
         "fn make() -> [i64; 1] { print_i64(7); return [4]; } \
-         fn main() -> i64 { let i: i64 = 2; return make()[i]; }",
+         fn f(i: i64) -> i64 { return make()[i]; } \
+         fn main() -> i64 { return f(2); }",
         &CompileOptions { bounds_checks: true, ..Default::default() },
     )
     .unwrap();
@@ -1025,7 +1085,7 @@ fn bitwise_and_shift_emit_the_right_instructions() {
     // matching rustc; the 6-bit mask applies only to a run-time count, which
     // the hardware does anyway (`sal %cl` masks `%cl` to 6 bits for a 64-bit
     // operand).
-    let out = asm("fn main() -> i64 { let n: i64 = 70; return 1 << n; }");
+    let out = asm("fn f(n: i64) -> i64 { return 1 << n; } fn main() -> i64 { return f(70); }");
     assert!(out.contains("sal %cl, %rax"), "a variable shift count goes through %cl");
 
     let out = asm("fn main() -> i64 { return -8 >> 2; }");
