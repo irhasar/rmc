@@ -84,12 +84,16 @@ def run_both(rmc_bin, rust_bin, argv):
     return run(rmc_bin), run(rust_bin)
 
 
-def check_bounds_traps():
-    """Assemble and link a few out-of-range programs with a plain `ld` (no `-n`),
+def check_bounds_traps(combos):
+    """Assemble and link out-of-range programs with a plain `ld` (no `-n`),
     which maps sections by permission. Every one must report the error and exit
     101, not fault. This catches a bounds handler emitted into non-executable
-    `.rodata`, and index paths that skip the check (a block or call base, and a
-    constant index on a non-local array).
+    `.rodata`, and index paths that skip the check (a block or call base, a
+    struct-field array, a computed or negative index, and a store).
+
+    Each case is run under every optimiser configuration in `combos`, so a pass
+    cannot hide a check: a hoist or inline that drops the `cmp`/`jae` would let
+    the program read or write out of range and exit without the message.
     """
     # Each case is (source, required stdout prefix). The prefix checks that a
     # base with a side effect runs before the trap: Rust evaluates the base and
@@ -103,42 +107,50 @@ def check_bounds_traps():
         "block": ("fn f(i: i64) -> i64 { let v: i64 = { let t: [i64; 3] = [10, 20, 30]; t }[i]; return v; } fn main() -> i64 { return f(9); }", b""),
         "call": ("fn make() -> [i64; 3] { let a: [i64; 3] = [10, 20, 30]; return a; } fn f(i: i64) -> i64 { return make()[i]; } fn main() -> i64 { return f(10); }", b""),
         "base_effect": ("fn make() -> [i64; 1] { print_i64(7); return [4]; } fn f(i: i64) -> i64 { return make()[i]; } fn main() -> i64 { return f(2); }", b"7\n"),
+        "local": ("fn f(i: i64) -> i64 { let a: [i64; 3] = [1, 2, 3]; return a[i]; } fn main() -> i64 { return f(3); }", b""),
+        "negative": ("fn f(i: i64) -> i64 { let a: [i64; 3] = [1, 2, 3]; return a[i]; } fn main() -> i64 { return f(-1); }", b""),
+        "computed": ("fn f(i: i64) -> i64 { let a: [i64; 3] = [1, 2, 3]; return a[i + 1]; } fn main() -> i64 { return f(3); }", b""),
+        "field": ("struct S { n: i64, a: [i64; 3] } fn f(i: i64) -> i64 { let s: S = S { n: 0, a: [4, 5, 6] }; return s.a[i]; } fn main() -> i64 { return f(5); }", b""),
+        "store": ("fn f(i: i64) -> i64 { let mut a: [i64; 3] = [1, 2, 3]; a[i] = 9; return a[0]; } fn main() -> i64 { return f(4); }", b""),
     }
     failures = 0
     for name, (src, want_stdout) in cases.items():
         rms = os.path.join(OUT, f"trap_{name}.rms")
         with open(rms, "w") as f:
             f.write(src)
-        asm = subprocess.run([RMC, "--bounds-checks", "--emit-asm", rms], capture_output=True)
-        if asm.returncode != 0:
-            print(f"FAIL trap {name}: rmc failed:\n{asm.stderr.decode(errors='replace')}")
-            failures += 1
-            continue
-        s_path = os.path.join(OUT, f"trap_{name}.s")
-        o_path = os.path.join(OUT, f"trap_{name}.o")
-        exe = os.path.join(OUT, f"trap_{name}.exe")
-        with open(s_path, "wb") as f:
-            f.write(asm.stdout)
-        p = subprocess.run(["as", s_path, "-o", o_path], capture_output=True)
-        if p.returncode != 0:
-            print(f"FAIL trap {name}: as failed:\n{p.stderr.decode(errors='replace')}")
-            failures += 1
-            continue
-        # A plain link honours section permissions, unlike the CLI's `-n`.
-        p = subprocess.run(["ld", "-o", exe, o_path], capture_output=True)
-        if p.returncode != 0:
-            print(f"FAIL trap {name}: ld failed:\n{p.stderr.decode(errors='replace')}")
-            failures += 1
-            continue
-        p = subprocess.run([exe], capture_output=True)
-        if p.returncode != 101 or b"index out of bounds" not in p.stderr:
-            print(f"FAIL trap {name}: exit={p.returncode} stderr={p.stderr!r} (want 101 + message)")
-            failures += 1
-        elif not p.stdout.startswith(want_stdout):
-            print(f"FAIL trap {name}: stdout={p.stdout!r} (want prefix {want_stdout!r}; base must run first)")
-            failures += 1
+        for label, opt_flags in combos:
+            asm = subprocess.run([RMC, "--bounds-checks"] + list(opt_flags)
+                                 + ["--emit-asm", rms], capture_output=True)
+            if asm.returncode != 0:
+                print(f"FAIL trap {name}{label}: rmc failed:\n{asm.stderr.decode(errors='replace')}")
+                failures += 1
+                continue
+            s_path = os.path.join(OUT, f"trap_{name}.s")
+            o_path = os.path.join(OUT, f"trap_{name}.o")
+            exe = os.path.join(OUT, f"trap_{name}.exe")
+            with open(s_path, "wb") as f:
+                f.write(asm.stdout)
+            p = subprocess.run(["as", s_path, "-o", o_path], capture_output=True)
+            if p.returncode != 0:
+                print(f"FAIL trap {name}{label}: as failed:\n{p.stderr.decode(errors='replace')}")
+                failures += 1
+                continue
+            # A plain link honours section permissions, unlike the CLI's `-n`.
+            p = subprocess.run(["ld", "-o", exe, o_path], capture_output=True)
+            if p.returncode != 0:
+                print(f"FAIL trap {name}{label}: ld failed:\n{p.stderr.decode(errors='replace')}")
+                failures += 1
+                continue
+            p = subprocess.run([exe], capture_output=True)
+            if p.returncode != 101 or b"index out of bounds" not in p.stderr:
+                print(f"FAIL trap {name}{label}: exit={p.returncode} stderr={p.stderr!r} (want 101 + message)")
+                failures += 1
+            elif not p.stdout.startswith(want_stdout):
+                print(f"FAIL trap {name}{label}: stdout={p.stdout!r} (want prefix {want_stdout!r}; base must run first)")
+                failures += 1
     if failures == 0:
-        print("all bounds traps exit 101 under a plain `ld` link")
+        print(f"all {len(cases)} bounds traps exit 101 under a plain `ld` link, "
+              f"in {len(combos)} optimiser configurations")
     return failures
 
 
@@ -205,7 +217,7 @@ def main():
                 elif verbose:
                     print(f"ok   {name}{label} {argv}")
 
-    failures += check_bounds_traps()
+    failures += check_bounds_traps(combos)
 
     total = len(names)
     if failures == 0:
