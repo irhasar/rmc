@@ -189,7 +189,8 @@ Rust panic. Division by zero always traps at the CPU level.
 
 - Arithmetic: `+ - * / %` on `i64`.
 - Comparison: `== != < <= > >=`, producing `bool`.
-- Boolean: `&& || !`, short-circuiting.
+- Boolean: `&& || !`, short-circuiting. `!` is logical not on a `bool` and
+  bitwise not on an `i64`, as in Rust; it yields its operand's type.
 - Bitwise: `& | ^` on `i64`, plus `<<` and `>>`. `>>` is arithmetic (a negative
   value stays negative) and a shift count is taken modulo 64, matching Rust.
   Precedence, tightest first: `* / %`, `+ -`, `<< >>`, `&`, `^`, `|`, then the

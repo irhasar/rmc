@@ -182,7 +182,7 @@ array elements and struct fields (including compound `+=` and friends);
 `if`/`else`, `while`, `loop`, and `for i in a..b`; `match` on integers,
 `bool`s and enums (literal, `true`/`false`, `Enum::Variant` and `_` patterns,
 plus payload bindings and binding names); `break`, `continue`,
-`return`; arithmetic, comparison, bitwise (`&`/`|`/`^`) and shift (`<<`/`>>`)
+`return`; arithmetic, comparison, bitwise (`!`/`&`/`|`/`^`) and shift (`<<`/`>>`)
 operators; `&&`/`||`; string literals; `mut` enforcement and definite
 initialisation; references (`&T` / `&mut T`, `&e`, `*e`,
 with auto-deref for `r.x`, `r[i]` and `r.m()`, and `&self` receivers);

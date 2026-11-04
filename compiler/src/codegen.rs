@@ -1744,21 +1744,27 @@ impl Codegen {
                 ty.clone()
             }
             Expr::Un(op, inner) => {
-                self.gen_expr(inner);
+                let inner_ty = self.gen_expr(inner);
                 match op {
                     UnOp::Neg => {
                         self.line("neg %rax");
                         self.check_overflow();
                     }
-                    UnOp::Not => {
+                    // `!` is logical not on `bool` (1 when the operand is zero)
+                    // and bitwise not on an integer, matching Rust. Sema has
+                    // already checked the operand is `bool` or `i64`.
+                    UnOp::Not if inner_ty == Type::Bool => {
                         self.line("test %rax, %rax");
                         self.line("sete %al");
                         self.line("movzbq %al, %rax");
                     }
+                    UnOp::Not => {
+                        self.line("not %rax");
+                    }
                 }
                 match op {
                     UnOp::Neg => Type::I64,
-                    UnOp::Not => Type::Bool,
+                    UnOp::Not => inner_ty,
                 }
             }
             Expr::Bin(op, a, b) => self.gen_bin(*op, a, b),

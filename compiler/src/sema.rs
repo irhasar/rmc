@@ -1125,12 +1125,12 @@ impl Sema {
                         }
                         Ok(Type::I64)
                     }
-                    UnOp::Not => {
-                        if t != Type::Bool {
-                            return Err(format!("unary `!` expects `bool`, found {t:?}"));
-                        }
-                        Ok(Type::Bool)
-                    }
+                    UnOp::Not => match t {
+                        // `!` is logical not on `bool` and bitwise not on an
+                        // integer, matching Rust. It yields its operand's type.
+                        Type::Bool | Type::I64 => Ok(t),
+                        _ => Err(format!("unary `!` expects `bool` or `i64`, found {t:?}")),
+                    },
                 }
             }
             Expr::Bin(op, a, b) => {
