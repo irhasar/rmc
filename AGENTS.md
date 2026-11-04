@@ -5,9 +5,11 @@ Repository-specific notes for future sessions. Keep this file current.
 ## What this is
 
 `rmc` is an experimental ahead-of-time compiler for a small Rust subset. It emits
-x86-64 assembly directly, assembles with GNU `as`, and links with GNU `ld`
-against a freestanding assembly runtime (raw Linux syscalls, no libc, no LLVM,
-no external crates). The `bench/` directory compares it against real `rustc`.
+x86-64 assembly directly, then assembles and links it in-process into a static
+ELF64 executable (`src/elf.rs`) against a freestanding assembly runtime (raw
+Linux syscalls, no libc, no LLVM, no external crates, and by default no `as` or
+`ld`). `--binutils` restores the old `as`+`ld` path. The `bench/` directory
+compares it against real `rustc`.
 
 ## Build and run
 
@@ -101,8 +103,12 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   `alloc`/`free`, `arg_i64`, the traps). Stored as a table of selectable
   `PIECES`; `for_program(user_asm)` links only the pieces the program reaches
   (see "Runtime pruning" below).
-- `compiler/src/main.rs` — CLI: reads source, calls the library, runs `as`/`ld`.
-  Flags: `--emit-asm`, `--keep-asm`, `--no-strip`, `--min-size`,
+- `compiler/src/elf.rs` — the in-process assembler and ELF64 linker. Parses the
+  assembly text `codegen`/`runtime` produce and emits a static executable with
+  two `PT_LOAD` segments (R+X for text/rodata, R+W for data). See "In-process
+  assembler" below before adding an instruction or a codegen form.
+- `compiler/src/main.rs` — CLI: reads source, calls the library, writes the ELF.
+  Flags: `--emit-asm`, `--keep-asm`, `--binutils`, `--no-strip`, `--min-size`,
   `--overflow-checks`, `--bounds-checks`, `--no-inline`, `--no-licm`,
   `--no-tco`.
 - `compiler/tests/compile.rs` — unit tests for the front end and codegen; these
@@ -378,24 +384,54 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   across the syscall: the total block size rides the stack (the syscall clobbers
   `%rcx`/`%r11`) and the chunk length stays in `%rsi`. Keep new code off the
   callee-saved set, or the whole-function frame comes back.
-- **Link flags.** The driver uses `ld -o <out> --build-id=none -z noseparate-code
-  --strip-all <obj>`; the assembly already carries `.note.GNU-stack` so no
-  `-z noexecstack` is needed. `--strip-all` drops the symbol and section-name
-  tables, which at this size are about a third of the artifact (1376 → 888 bytes
-  on `hello`); it changes nothing the loader reads, and `--no-strip` keeps them
-  for `nm`/`gdb`. `--min-size` goes further and runs `strip
-  --strip-section-headers`, dropping the section-header table as well (888 → 536
-  bytes on `hello`); the loader does not read it but `nm`/`objdump -d` do, and
-  the extra `strip` process costs ~2.3 ms (a third of rmc's compile time), so it
-  is opt-in, not the default. `tests/run.py`'s `check_stripped` pins all three
-  directions (the default has no symbol table and is smaller than `--no-strip`;
-  `--min-size` is smaller still; every variant runs). It used to use `-n` (nmagic), which packed every section into one
-  read+write+execute `LOAD` segment: a W^X violation. `-z noseparate-code` keeps
-  the read-only and executable sections in one read+execute segment and the
-  writable data in a separate read+write one, and is *smaller* than `-n` (1376
-  bytes vs 5416 for `hello`). Do not "optimise" it back to `-n`. `tests/run.py`
-  runs `readelf -lW` on a compiled binary and fails if any `LOAD` segment is both
-  writable and executable.
+- **Linking.** By default `src/elf.rs` assembles and links in-process; `as` and
+  `ld` are only used under `--binutils`. The in-process path is what makes rmc
+  ~4–5x faster to compile than the binutils path (the two child processes were
+  ~80% of the wall time) and gives a *smaller* artifact, because it never emits
+  a symbol table or a section-header table to begin with. It writes exactly two
+  `PT_LOAD` segments — one R+X for `.text`/`.rodata`, one R+W for `.data` — so
+  there is no W^X segment. Writable sections start on their own page: the kernel
+  maps each `PT_LOAD` rounded down to a page, so a RW segment sharing a page with
+  the RX one would have its `mprotect`-like mapping replace the execute
+  permission. The runtime's writable globals are all zero, so they are emitted
+  as `.bss` (`p_filesz = 0`, `p_memsz` set): mapping them from the file would
+  cost a page of padding and about 4 KB on every artifact. When adding an
+  instruction or a codegen form, remember the encoder only implements the subset
+  the code generator emits and errors on anything else — run `tests/run.py`,
+  which compiles every case through both paths and requires identical output.
+  The `--binutils` path still uses `ld --build-id=none -z noseparate-code
+  --strip-all`; `--no-strip` keeps the symbol table, `--min-size` also runs
+  `strip --strip-section-headers`. Do not change the `--binutils` link back to
+  `-n` (nmagic): it packs every section into one read+write+execute `LOAD`
+  segment, a W^X violation, and is *larger*. `tests/run.py`'s `check_stripped`
+  pins the size ordering of all four variants, `check_no_rwx` fails on any
+  writable+executable `LOAD` segment, and `check_link_paths_agree` requires the
+  two link paths to behave identically.
+- **In-process assembler gotchas.** The encoder in `src/elf.rs` is deliberately
+  narrow; these are the encodings that are easy to get wrong and were each a
+  real bug:
+  - Group opcodes: `inc`/`dec` are group-5 (`FF /0,/1`) but `not`/`neg` are
+    group-3 (`F7 /2,/3`). `FF /3` is `call far`, which faults at run time.
+  - ModRM direction: for `mov src, dst` and `op src, dst` the *source* is the
+    reg field (REX.R) and the *destination* is r/m (REX.B). Swapping them
+    silently moves the wrong register.
+  - SIB: a byte is required for an index, for no base, and for a base of
+    `%rsp`/`%r12` (rm encoding 100). `(%base,%index)` is two parts with an
+    implied scale of 1; parsing only three-part forms drops the index (a
+    `lea 0(%r,%r)` used as `x*2` came out as `x`).
+  - A base of `%rbp`/`%r13` (rm encoding 101) needs an explicit displacement,
+    or mod=00/rm=101 means "disp32, no base".
+  - RIP-relative memory (`sym(%rip)`) writes the disp32 *after* the ModRM, not
+    before the opcode; the fixup is recorded at the trailing four bytes.
+  - Byte operands: `mov $imm, mem` and byte `mov %dl, mem` use the byte opcodes
+    (the mnemonic `mov` carries no `b` suffix but a byte-width register makes it
+    a byte move). A byte register `%sil`/`%dil` (>= 4) needs a bare `0x40` REX
+    prefix to mean itself; `setcc` does *not* (a byte name is not an extended
+    register). `movzbq` sets REX.W, `movzbl` does not.
+  - `mov $imm, %r64` sign-extends a 32-bit immediate (`C7 /0`); a negative value
+    through the zero-extending `B8+rd` form would clear the high half.
+  - Symbol immediates (`mov $__rmc_overflow_len, %rdx`) come from `.set name,
+    . - other`; resolve them after all labels are placed, not during the walk.
 - **Runtime pruning.** `runtime.rs` stores the runtime as `PIECES`, each naming
   the symbols it defines; `for_program(user_asm)` keeps `_start` plus every
   piece the program (or a kept piece) names a symbol of, to a fixpoint. A new

@@ -155,57 +155,101 @@ def check_bounds_traps(combos):
 
 
 def check_stripped():
-    """The default link drops the symbol table; `--no-strip` keeps it.
+    """Size behaviour of both link paths.
 
-    At this artifact size the symbol and section-name tables are a third of the
-    file (1376 -> 888 bytes on `hello`), so the strip must stay the default. A
-    regression here would be invisible in behaviour but would give back a third
-    of the size win, so pin both directions.
+    The default in-process link writes no symbol table and no section-header
+    table, so it is the smallest artifact and needs no strip step. The
+    `--binutils` fallback links with `ld`, which keeps the symbol table by
+    default; there `--no-strip` keeps it and `--min-size` drops the section
+    headers as well. Pin the ordering and that every artifact runs.
     """
     rms = os.path.join(OUT, "strip_hello.rms")
     with open(rms, "w") as f:
         f.write("fn main() -> i64 { print_i64(1); return 0; }\n")
-    stripped = os.path.join(OUT, "strip_hello.bin")
-    kept = os.path.join(OUT, "strip_hello_kept.bin")
-    p = subprocess.run([RMC, rms, "-o", stripped], capture_output=True)
+
+    default = os.path.join(OUT, "strip_default.bin")
+    binstrip = os.path.join(OUT, "strip_binutils.bin")
+    binkeep = os.path.join(OUT, "strip_binutils_kept.bin")
+    binmin = os.path.join(OUT, "strip_binutils_min.bin")
+
+    builds = [
+        (default, [RMC, rms, "-o", default]),
+        (binstrip, [RMC, "--binutils", rms, "-o", binstrip]),
+        (binkeep, [RMC, "--binutils", "--no-strip", rms, "-o", binkeep]),
+        (binmin, [RMC, "--binutils", "--min-size", rms, "-o", binmin]),
+    ]
+    for path, cmd in builds:
+        p = subprocess.run(cmd, capture_output=True)
+        if p.returncode != 0:
+            print(f"FAIL strip: {cmd[1:-2]} failed:\n{p.stderr.decode(errors='replace')}")
+            return 1
+        p = subprocess.run([path], capture_output=True)
+        if p.returncode != 0 or p.stdout != b"1\n":
+            print(f"FAIL strip: {path} misbehaved: rc={p.returncode} out={p.stdout!r}")
+            return 1
+
+    # The default link carries no section-header table at all.
+    p = subprocess.run(["readelf", "-SW", default], capture_output=True)
+    if p.returncode != 0 or b"There are no sections" not in p.stdout:
+        print("FAIL strip: default binary has a section-header table")
+        return 1
+
+    # `--binutils` strips symbols by default; `--no-strip` keeps them.
+    p = subprocess.run(["readelf", "-sW", binstrip], capture_output=True)
     if p.returncode != 0:
-        print(f"FAIL strip: rmc failed:\n{p.stderr.decode(errors='replace')}")
+        print("FAIL strip: readelf failed on the binutils binary")
         return 1
-    p = subprocess.run([RMC, "--no-strip", rms, "-o", kept], capture_output=True)
-    if p.returncode != 0:
-        print(f"FAIL strip: rmc --no-strip failed:\n{p.stderr.decode(errors='replace')}")
+    if b"main" in p.stdout:
+        print("FAIL strip: symbol table present in the binutils default binary")
         return 1
-    p = subprocess.run(["readelf", "-sW", stripped], capture_output=True)
-    if p.returncode != 0:
-        print("FAIL strip: readelf failed")
+    p = subprocess.run(["readelf", "-sW", binkeep], capture_output=True)
+    if p.returncode != 0 or b"main" not in p.stdout:
+        print("FAIL strip: --no-strip dropped the symbol table")
         return 1
-    if "main" in p.stdout.decode():
-        print("FAIL strip: symbol table present in the default binary")
-        return 1
-    if os.path.getsize(stripped) >= os.path.getsize(kept):
-        print("FAIL strip: stripping did not shrink the binary "
-              f"({os.path.getsize(stripped)} >= {os.path.getsize(kept)})")
-        return 1
-    # The stripped binary must still run.
-    p = subprocess.run([stripped], capture_output=True)
-    if p.returncode != 0 or p.stdout != b"1\n":
-        print(f"FAIL strip: stripped binary misbehaved: rc={p.returncode} out={p.stdout!r}")
-        return 1
-    # `--min-size` also drops the section-header table: smaller, still runs.
-    mini = os.path.join(OUT, "strip_hello_min.bin")
-    p = subprocess.run([RMC, "--min-size", rms, "-o", mini], capture_output=True)
-    if p.returncode != 0:
-        print(f"FAIL strip: rmc --min-size failed:\n{p.stderr.decode(errors='replace')}")
-        return 1
-    if os.path.getsize(mini) >= os.path.getsize(stripped):
-        print("FAIL strip: --min-size did not shrink the binary "
-              f"({os.path.getsize(mini)} >= {os.path.getsize(stripped)})")
-        return 1
-    p = subprocess.run([mini], capture_output=True)
-    if p.returncode != 0 or p.stdout != b"1\n":
-        print(f"FAIL strip: --min-size binary misbehaved: rc={p.returncode} out={p.stdout!r}")
+
+    # Size ordering: direct < binutils --min-size < binutils stripped < kept.
+    order = [default, binmin, binstrip, binkeep]
+    sizes = [os.path.getsize(x) for x in order]
+    if any(a >= b for a, b in zip(sizes, sizes[1:])):
+        print(f"FAIL strip: artifact sizes not increasing {sizes}")
         return 1
     return 0
+
+
+def check_link_paths_agree():
+    """The in-process assembler and the `as`+`ld` path must agree.
+
+    The default link no longer shells out, so the two paths can drift. Compile
+    a handful of cases that between them exercise every encoding the in-process
+    assembler implements (immediates, byte moves, sign extension, RIP-relative
+    data, traps) and require identical stdout and exit status from both.
+    """
+    cases = ["arith", "div", "io", "utf8", "structs", "match", "bounds", "heap"]
+    failures = 0
+    for name in cases:
+        rms = os.path.join(CASES, f"{name}.rms")
+        if not os.path.exists(rms):
+            continue
+        direct = os.path.join(OUT, f"paths_{name}.direct")
+        binut = os.path.join(OUT, f"paths_{name}.binutils")
+        p = subprocess.run([RMC, rms, "-o", direct], capture_output=True)
+        q = subprocess.run([RMC, "--binutils", rms, "-o", binut], capture_output=True)
+        if p.returncode != 0 or q.returncode != 0:
+            print(f"FAIL paths {name}: compile failed "
+                  f"(direct={p.returncode} binutils={q.returncode})")
+            failures += 1
+            continue
+        for argv in load_args().get(name, [[]]):
+            a = subprocess.run([direct] + argv, capture_output=True)
+            b = subprocess.run([binut] + argv, capture_output=True)
+            if (a.returncode, a.stdout) != (b.returncode, b.stdout):
+                print(f"FAIL paths {name} {argv}: direct={a.returncode}/{a.stdout[:40]!r} "
+                      f"binutils={b.returncode}/{b.stdout[:40]!r}")
+                failures += 1
+                break
+    if failures == 0:
+        print("in-process link and the `as`+`ld` path produce identical behaviour")
+    return failures
 
 
 def check_no_rwx():
@@ -307,11 +351,12 @@ def main():
     stripped = check_stripped()
     failures += stripped
     if stripped == 0:
-        print("default link strips symbols; --min-size drops the section headers too")
+        print("default link is smallest; --binutils strip/--min-size behave")
     rwx = check_no_rwx()
     failures += rwx
     if rwx == 0:
         print("linked binary has no writable+executable LOAD segment")
+    failures += check_link_paths_agree()
 
     total = len(names)
     if failures == 0:

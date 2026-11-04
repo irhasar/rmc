@@ -1,8 +1,11 @@
 //! rmc: a small ahead-of-time compiler for a Rust subset.
 //!
 //! Pipeline: source -> lex -> parse -> semantic analysis -> x86-64 assembly ->
-//! GNU as -> GNU ld. No LLVM, no external crates. The emitted program links
-//! against a freestanding assembly runtime and makes raw Linux syscalls.
+//! ELF64 executable. No LLVM, no external crates, and by default no external
+//! assembler or linker: the assembly the code generator emits is assembled and
+//! linked in-process. The emitted program links against a freestanding assembly
+//! runtime and makes raw Linux syscalls. `--binutils` falls back to GNU `as`
+//! and `ld` when the assembly text must be handed to the system tools.
 
 use rmc::{compile_to_asm, CompileOptions};
 use std::io::Write;
@@ -17,6 +20,7 @@ struct Options {
     keep_asm: bool,
     strip: bool,
     min_size: bool,
+    binutils: bool,
     overflow_checks: bool,
     bounds_checks: bool,
     no_inline: bool,
@@ -32,6 +36,7 @@ fn parse_args() -> Result<Options, String> {
     let mut keep_asm = false;
     let mut strip = true;
     let mut min_size = false;
+    let mut binutils = false;
     let mut overflow_checks = false;
     let mut bounds_checks = false;
     let mut no_inline = false;
@@ -48,6 +53,7 @@ fn parse_args() -> Result<Options, String> {
             "--keep-asm" => keep_asm = true,
             "--no-strip" => strip = false,
             "--min-size" => min_size = true,
+            "--binutils" => binutils = true,
             "--overflow-checks" => overflow_checks = true,
             "--bounds-checks" => bounds_checks = true,
             "--no-inline" => no_inline = true,
@@ -81,6 +87,7 @@ fn parse_args() -> Result<Options, String> {
         keep_asm,
         strip,
         min_size,
+        binutils,
         overflow_checks,
         bounds_checks,
         no_inline,
@@ -100,7 +107,8 @@ fn print_help() {
          \x20   --emit-asm     print generated assembly to stdout and stop\n\
          \x20   --keep-asm     keep the intermediate .s file next to the output\n\
          \x20   --no-strip     keep the symbol table in the output binary\n\
-         \x20   --min-size     also drop the section-header table (slower link)\n\
+         \x20   --min-size     with --binutils, also drop the section headers\n\
+         \x20   --binutils     use GNU `as` and `ld` instead of linking in-process\n\
          \x20   --overflow-checks  trap on i64 +,-,* overflow (off by default)\n\
          \x20   --bounds-checks    trap on an out-of-range array index (off by default)\n\
          \x20   --no-inline        disable the inlining pass (on by default)\n\
@@ -149,6 +157,29 @@ fn run(opts: Options) -> Result<(), String> {
 
     if opts.emit_asm {
         print!("{asm}");
+        return Ok(());
+    }
+
+    if !opts.binutils {
+        // Assemble and link in-process. This is the default: it removes the two
+        // binutils processes that dominate compile time and produces a smaller
+        // executable (no symbol or section-header tables to begin with).
+        let bytes = rmc::elf::assemble(&asm)?;
+        std::fs::write(&opts.output, &bytes)
+            .map_err(|e| format!("cannot write {}: {e}", opts.output.display()))?;
+        if opts.keep_asm {
+            let asm_path = opts.output.with_extension("s");
+            std::fs::write(&asm_path, &asm)
+                .map_err(|e| format!("cannot write {}: {e}", asm_path.display()))?;
+        }
+        // `ld` marks its output executable; the in-process path must too.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::Permissions::from_mode(0o755);
+            std::fs::set_permissions(&opts.output, mode)
+                .map_err(|e| format!("cannot chmod {}: {e}", opts.output.display()))?;
+        }
         return Ok(());
     }
 

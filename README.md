@@ -1,35 +1,40 @@
 # rmc — an experimental Rust-subset ahead-of-time compiler
 
 `rmc` compiles a small, statically-typed subset of Rust straight to x86-64
-assembly. It does **not** use LLVM, does **not** use any external crate, and
-does **not** link a C runtime. The emitted assembly is assembled with GNU `as`
-and linked with GNU `ld` against a freestanding runtime that talks to the Linux
-kernel through raw syscalls.
+assembly, and then to a static ELF64 executable. It does **not** use LLVM, does
+**not** use any external crate, and does **not** link a C runtime. By default it
+does not even shell out to an assembler or linker: the assembly the code
+generator emits is assembled and linked in-process, and the result runs against
+a freestanding runtime that talks to the Linux kernel through raw syscalls.
+`--binutils` keeps the old path through GNU `as` and `ld` for the cases where
+the assembly text is what you want.
 
 The point of the experiment is to measure the trade-off at the extremes:
 
 | property                         | rmc                                   | rustc (LLVM)                     |
 | -------------------------------- | ------------------------------------- | -------------------------------- |
-| compile pipeline                 | lex → parse → typecheck → asm → `as` → `ld` | MIR → LLVM IR → LLVM opt → MC → `ld` |
+| compile pipeline                 | lex → parse → typecheck → asm → ELF encoder | MIR → LLVM IR → LLVM opt → MC → `ld` |
 | third-party code                 | none (Rust `std` only)                | LLVM + rustc                          |
 | compiler peak RSS                | ~2.7 MB                               | ~188 MB                          |
-| compile time (small programs)    | ~6 ms                                 | ~2.1 s                           |
-| artifact size                    | ~0.9–1.2 KB (static, no libc)         | ~290 KB (fat-LTO stripped); ~4.5 MB (plain `-O`); ~1.2 MB (static stripped) |
+| compile time (small programs)    | ~1.5 ms                               | ~2.1 s                           |
+| artifact size                    | ~0.5–0.9 KB (static, no libc)         | ~290 KB (fat-LTO stripped); ~4.5 MB (plain `-O`); ~1.2 MB (static stripped) |
 | generated-code quality           | peephole + top-five local promotion   | highly optimised                 |
 
 `rmc` wins big on compile time, compiler memory, and artifact size, and those
-three are the point of the experiment. On **runtime** the result is mixed and
-program-dependent: rmc is at parity or ahead on the whole suite (`hello` 3.3×,
-`refs` 2.2×, `sieve` 1.6×, `heap` 1.13×, `stats` 1.11×, `mandel` 1.10×, `mix`
-1.05×, `fib` 0.99×, `callrec` 0.99×), but several of those are within run-to-run
+three are the point of the experiment. Because it links in-process rather than
+forking `as` and `ld`, a small program compiles in about 1.3 ms against rustc's
+~2.1 s. On **runtime** the result is mixed and program-dependent: rmc is at
+parity or ahead on almost the whole suite (`hello` 3.1×, `sieve` 1.6×, `refs`
+1.2×, `stats` 1.1×, `mandel` 1.1×, `heap` 1.05×), ties on `fib` and `callrec`,
+and loses slightly on `mix` (0.92×), but several of those are within run-to-run
 noise, and a call-heavy shape the recursion-to-loop pass does not match would
-still lose. It is not uniformly faster and there is no single speedup number;
+lose. It is not uniformly faster and there is no single speedup number;
 `bench/RESULTS.md` reports the per-program ratio.
 
 The artifact-size comparison depends entirely on which rustc build is the
 reference. Against a plain `rustc -O` (which statically links libstd, the panic
-runtime and the allocator) rmc is ~3700–5100× smaller; against a stripped static
-build, ~950–1330×; against an aggressive fat-LTO stripped build, ~235–325×. The
+runtime and the allocator) rmc is ~4900–6300× smaller; against a stripped static
+build, ~1300–1900×; against an aggressive fat-LTO stripped build, ~320–610×. The
 first is the closest like-for-like, the last is the one that flatters rustc
 least. The gap is this wide because the linker keeps only the runtime pieces a
 program reaches: a program that never allocates carries no allocator, and one
@@ -45,9 +50,10 @@ compiler/            the rmc compiler (Rust, std only, no dependencies)
   src/ast.rs         AST + type definitions
   src/sema.rs        type checking, struct layout, slot allocation, builtins
   src/codegen.rs     AST -> x86-64 assembly (System V, AT&T syntax)
+  src/elf.rs         in-process assembler + ELF64 linker (no `as`, no `ld`)
   src/dce.rs         dead-function elimination (drop what main cannot reach)
   src/runtime.rs     freestanding runtime written in assembly
-  src/main.rs        CLI driver: source -> asm -> as -> ld
+  src/main.rs        CLI driver: source -> asm -> ELF executable
   tests/compile.rs   unit tests for the front end and code generator
 bench/
   programs/*.rms     benchmark programs in the rmc subset
@@ -70,17 +76,18 @@ docs/
 cargo build --release --manifest-path compiler/Cargo.toml
 ```
 
-The compiler binary is `compiler/target/release/rmc`. It needs `as` and `ld`
-from binutils on `PATH`; no other tools are required.
+The compiler binary is `compiler/target/release/rmc`. Nothing else is required
+to build a program: the default path needs no assembler and no linker. `as` and
+`ld` from binutils are needed only for `--binutils`, and `--emit-asm`.
 
 ## Usage
 
 ```sh
-rmc input.rms -o output            # compile, assemble and link
+rmc input.rms -o output            # compile and link in-process (default)
 rmc input.rms --emit-asm           # print the generated assembly to stdout
-rmc input.rms --keep-asm -o out    # keep the intermediate .s file
-rmc input.rms --no-strip -o out    # keep the symbol table (stripped by default)
-rmc input.rms --min-size -o out    # smallest artifact: drop section headers too
+rmc input.rms --binutils -o out    # assemble and link with `as`/`ld` instead
+rmc input.rms --binutils --no-strip -o out   # keep the symbol table
+rmc input.rms --binutils --min-size -o out   # drop the section headers too
 rmc input.rms --overflow-checks    # trap on i64 +,-,* overflow (exit 101)
 rmc input.rms --bounds-checks      # trap on an out-of-range array index (exit 101)
 rmc input.rms --no-inline          # disable inlining (on by default)
