@@ -136,7 +136,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     // Runtime helpers provided by the freestanding assembly runtime. They are
     // linked in automatically, so they do not appear in the source program.
-    let builtins: [(&str, &[Type], Type); 7] = [
+    let builtins: [(&str, &[Type], Type); 8] = [
         ("print_i64", &[Type::I64], Type::Unit),
         ("print_str", &[Type::Str], Type::Unit),
         ("print_bool", &[Type::Bool], Type::Unit),
@@ -144,6 +144,9 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         ("alloc", &[Type::I64], Type::I64),
         ("free", &[Type::I64], Type::Unit),
         ("arg_i64", &[Type::I64], Type::I64),
+        // Byte-wise lexicographic `str` compare; emitted by sema for a string
+        // comparison and never written in source.
+        ("__rmc_str_lt", &[Type::Str, Type::Str], Type::Bool),
     ];
     for (name, params, ret) in builtins {
         sigs.insert(
@@ -1279,6 +1282,34 @@ impl Sema {
         }
     }
 
+    /// Rewrite a comparison of two `str` values into calls to the runtime
+    /// lexicographic helper `__rmc_str_lt`. A `str` is a pointer to a
+    /// `{len, bytes}` record, so the machine `cmp` would compare pointers, not
+    /// contents: `"abc" == "abc"` would be false because the two literals live
+    /// at different addresses. `lt(a, b)` is emitted once for `a < b` and
+    /// `b < a`, and `Eq`/`Ne`/`Le`/`Ge` are built from them, so the comparison
+    /// matches Rust's byte-wise `str` ordering.
+    fn str_cmp(op: BinOp, a: &Expr, b: &Expr) -> Expr {
+        let lt = |x: &Expr, y: &Expr| Expr::Call {
+            name: "__rmc_str_lt".into(),
+            args: vec![x.clone(), y.clone()],
+            arg_slots: vec![(-1, 0), (-1, 0)],
+            ret_slot: -1,
+            ret_ty: Type::Bool,
+        };
+        let not = |e: Expr| Expr::Un(UnOp::Not, Box::new(e));
+        use BinOp::*;
+        match op {
+            Lt => lt(a, b),
+            Gt => lt(b, a),
+            Le => not(lt(b, a)),
+            Ge => not(lt(a, b)),
+            Eq => Expr::Bin(And, Box::new(not(lt(a, b))), Box::new(not(lt(b, a)))),
+            Ne => Expr::Bin(Or, Box::new(lt(a, b)), Box::new(lt(b, a))),
+            _ => unreachable!(),
+        }
+    }
+
     fn check_expr(&mut self, e: &mut Expr, scope: &mut Scope) -> Result<Type, String> {
         match e {
             Expr::Int(_) => Ok(Type::I64),
@@ -1328,6 +1359,21 @@ impl Sema {
                 let ta = self.check_expr(a, scope)?;
                 let tb = self.check_expr(b, scope)?;
                 use BinOp::*;
+                // Two `str` operands compare by content through a runtime
+                // helper, not by pointer. Rewrite the whole node and re-check
+                // it, so the emitted code is an ordinary `bool` expression.
+                if matches!(op, Eq | Ne | Lt | Le | Gt | Ge)
+                    && (ta == Type::Str || tb == Type::Str)
+                {
+                    if ta != tb {
+                        return Err(format!(
+                            "comparison between different types: {ta:?} and {tb:?}"
+                        ));
+                    }
+                    let rewritten = Self::str_cmp(*op, a, b);
+                    *e = rewritten;
+                    return self.check_expr(e, scope);
+                }
                 match op {
                     Add | Sub | Mul | Div | Mod => {
                         if ta != Type::I64 || tb != Type::I64 {

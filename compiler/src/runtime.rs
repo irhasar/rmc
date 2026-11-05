@@ -205,6 +205,52 @@ print_str:
     },
     Piece {
         text: r#"
+# bool __rmc_str_lt(long a, long b)  -- a and b point at {len: i64, bytes...}
+# records. Returns 1 when the byte string a is lexicographically less than b,
+# 0 otherwise. A `str` value is the address of its record, so a string
+# comparison must look at the bytes rather than the pointers; sema lowers
+# `==`, `!=`, `<`, `<=`, `>` and `>=` on two strings to calls to this helper.
+.globl __rmc_str_lt
+.type __rmc_str_lt, @function
+__rmc_str_lt:
+    mov (%rdi), %r8          # len(a)
+    mov (%rsi), %r9          # len(b)
+    lea 8(%rdi), %rdi        # first byte of a
+    lea 8(%rsi), %rsi        # first byte of b
+    mov %r8, %rdx
+    cmp %r9, %rdx
+    jbe .Lsl_min
+    mov %r9, %rdx            # rdx = min(len(a), len(b))
+.Lsl_min:
+    xor %rcx, %rcx           # i = 0
+.Lsl_loop:
+    cmp %rdx, %rcx
+    jae .Lsl_prefix
+    movzbl (%rdi,%rcx), %eax
+    movzbl (%rsi,%rcx), %r10d
+    cmp %r10d, %eax
+    jb .Lsl_true
+    ja .Lsl_false
+    inc %rcx
+    jmp .Lsl_loop
+.Lsl_prefix:
+    # Equal up to the shorter length: a < b iff a is shorter.
+    xor %eax, %eax
+    cmp %r9, %r8
+    setb %al
+    ret
+.Lsl_true:
+    mov $1, %eax
+    ret
+.Lsl_false:
+    xor %eax, %eax
+    ret
+.size __rmc_str_lt, .-__rmc_str_lt
+"#,
+        defines: &["__rmc_str_lt"],
+    },
+    Piece {
+        text: r#"
 # void print_bool(bool b)  -- prints 0 or 1 followed by a newline
 .globl print_bool
 .type print_bool, @function

@@ -1,0 +1,41 @@
+// Comparing `str` values by content. A `str` is a pointer to a `{len, bytes}`
+// record, so a machine compare of the pointers would answer "not equal" for two
+// identical literals at different addresses. Every operator is exercised, on
+// literals, on `let`-bound strings, and across the two.
+fn main() -> i64 {
+    // Literal against literal.
+    print_bool("abc" == "abc");
+    print_bool("abc" == "abd");
+    print_bool("abc" != "abc");
+    print_bool("abc" != "abd");
+    print_bool("abc" < "abd");
+    print_bool("abd" < "abc");
+    print_bool("abc" < "abc");
+    print_bool("ab" < "abc");
+    print_bool("abc" < "ab");
+    print_bool("" < "a");
+    print_bool("a" < "");
+    print_bool("abc" <= "abc");
+    print_bool("abc" >= "abc");
+    print_bool("abc" <= "abd");
+    print_bool("abd" >= "abc");
+    print_bool("" == "");
+    // Through variables, which is where a pointer compare would show up.
+    let s = "hello";
+    let t = "hello";
+    let u = "world";
+    print_bool(s == t);
+    print_bool(s == u);
+    print_bool(s != u);
+    print_bool(s < u);
+    print_bool(u < s);
+    print_bool(s == "hello");
+    print_bool("hello" == s);
+    // A shared prefix longer than one byte.
+    print_bool("abcdef" < "abcdeg");
+    print_bool("abcdeg" < "abcdef");
+    print_bool("abc" < "abcdef");
+    print_bool("abcdef" <= "abcdef");
+    print_bool("abcdef" >= "abcdef");
+    return 0;
+}

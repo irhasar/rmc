@@ -1057,6 +1057,45 @@ fn print_str_accepts_a_string_literal() {
 }
 
 #[test]
+fn comparing_strings_lowers_to_the_byte_wise_helper() {
+    // A `str` is a pointer to its record, so a machine compare would answer
+    // "not equal" for two identical literals. The comparison must call the
+    // runtime helper instead.
+    let out = asm("fn main() -> i64 { if \"abc\" == \"abc\" { return 1; } return 0; }");
+    assert!(out.contains("call __rmc_str_lt"), "content compare emitted: {out}");
+    assert!(out.contains("__rmc_str_lt:"), "helper linked in");
+}
+
+#[test]
+fn a_string_equality_compares_by_content() {
+    // The two literals are distinct objects at run time; the comparison is
+    // decided by their bytes, so `==` is true and `!=` is false.
+    let out = asm(
+        "fn main() -> i64 { \
+         let mut n: i64 = 0; \
+         if \"abc\" == \"abc\" { n = n + 1; } \
+         if \"abc\" != \"abc\" { n = n + 10; } \
+         return n; }",
+    );
+    assert!(out.contains("call __rmc_str_lt"));
+    // No `str` is left to compare with a raw `cmp`, so the program must not
+    // contain a bare string-pointer comparison.
+    assert!(!out.contains("cmp %rcx, %rax"), "no pointer compare: {out}");
+}
+
+#[test]
+fn comparing_a_string_with_an_integer_is_rejected() {
+    let bad = "fn main() -> i64 { if \"a\" == 1 { return 1; } return 0; }";
+    assert!(compile_to_asm(bad, &CompileOptions::default()).is_err());
+}
+
+#[test]
+fn the_string_helper_is_dropped_when_unused() {
+    let out = asm("fn main() -> i64 { print_str(\"hi\"); return 0; }");
+    assert!(!out.contains("__rmc_str_lt"), "unused helper dropped: {out}");
+}
+
+#[test]
 fn argument_setup_folds_a_constant_with_lea() {
     // `fib(n - 1)` must become one `lea`, not `mov; sub; mov`.
     let out = asm_no_inline("fn f(n: i64) -> i64 { return n; } fn g(n: i64) -> i64 { return f(n - 1); } fn main() -> i64 { return g(5); }");

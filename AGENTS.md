@@ -459,6 +459,16 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   unchanged and only the `--binutils` artifact and the emitted `.s` shrink
   (~0.7% across the corpus). `a_small_divisor_uses_a_short_immediate` and
   `a_wide_magic_multiplier_keeps_movabs` pin both directions.
+- **`mov $imm, %reg` width follows the destination register.** The encoder
+  (`enc_mov_generic`/`emit_mov_imm`) picks the encoding from the register name
+  and the mnemonic: an unsuffixed `mov` to a 32-bit register (`%eax`) is the
+  5-byte `B8+rd` form with no REX.W, an unsuffixed `mov` to a 64-bit register
+  (`%rax`) is `C7 /0` (a sign-extended 32-bit immediate) unless the value does
+  not fit i32, `movq` is always 64-bit, and `movabs` is always the 10-byte
+  `B8+rd` form even for a small value. Getting this wrong is a silent
+  disagreement with `as`, which the `--encoding` fuzz oracle and the
+  `tests/cases/strcmp` case (a `mov $1, %eax`) catch; `elf.rs`'s unit tests pin
+  each form.
 - **`while` is rotated.** The test is emitted at the bottom as the back edge
   (`gen_branch_true`, a `jl`/`jne`) with an entry `jmp` reusing the same test, so
   an iteration is one branch fewer than the top-tested form. `continue` targets
@@ -927,6 +937,15 @@ The checks, all in `sema.rs`:
   string's address, `E0369`) and cannot be passed where an `i64` is expected
   (`print_str(42)` used to compile and then segfault, dereferencing the integer
   as a pointer). `print_str` takes `Type::Str`.
+- **String comparison.** A `str` value is the address of its `{len, bytes}`
+  record, so a machine `cmp` compares *pointers*: `"abc" == "abc"` answered
+  false because the two literals live at different addresses (a silent
+  wrong-answer bug — rustc says true). `Sema::str_cmp` rewrites `==`/`!=`/`<`/
+  `<=`/`>`/`>=` on two strings into calls to the runtime helper `__rmc_str_lt`,
+  which walks the bytes, so ordering matches Rust's. `str` has no source syntax
+  (no type, no return type), so both operands are pure literals or variables and
+  the helper is never double-evaluated. Comparing a `str` with an `i64` is
+  rejected (`E0308`), as rustc does.
 - **Parameter names (`E0415`) and `main` (`E0580`).** A function's parameters
   must be uniquely named; `check_fn` rejects a duplicate (rmc used to bind both
   to one slot). `main` takes no parameters, checked in `analyze`.
