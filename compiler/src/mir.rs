@@ -2252,6 +2252,7 @@ impl Function {
                     .iter()
                     .copied()
                     .find(|s| hot[*s as usize] && Some(*s) == taken)
+                    .or_else(|| live.iter().copied().find(|s| hot[*s as usize] && Some(*s) == taken))
                     .or_else(|| live.iter().copied().find(|s| hot[*s as usize]))
                     .or(taken)
                     .filter(|p| live.contains(p))
@@ -2305,8 +2306,16 @@ impl Function {
 fn explicit_target(t: &Terminator) -> Option<u32> {
     match t {
         Terminator::Goto(b) => Some(*b),
+        // A `switchInt` over a `bool` (a loop test or an `if`) has one real
+        // target and an `otherwise`. rustc puts the branch taken when the
+        // condition holds in `otherwise`, and for a loop that is the body, so
+        // that is the arm worth falling through to.
         Terminator::SwitchInt { targets, otherwise, .. } => {
-            targets.first().map(|(_, b)| *b).or(Some(*otherwise))
+            if targets.len() == 1 {
+                Some(*otherwise)
+            } else {
+                targets.first().map(|(_, b)| *b).or(Some(*otherwise))
+            }
         }
         Terminator::Call { target, .. } => *target,
         Terminator::Assert { target, .. } => Some(*target),
