@@ -572,8 +572,18 @@ impl<'a> FnGen<'a> {
             let _ = writeln!(self.out, "  pop {r}");
         }
         self.out.push_str("  leave\n  ret\n");
-        let body = std::mem::take(&mut self.out);
-        Ok(dead_stores(&peephole(&forward_stores(&body))))
+        let mut body = peephole(&std::mem::take(&mut self.out));
+        // Each pass exposes work for the others: forwarding a store to its
+        // reader lets the store be dropped, which lets the arithmetic that fed
+        // it fuse into a `lea`. Two rounds reach the fixed point.
+        for _ in 0..2 {
+            body = fuse_lea(&body);
+            body = coalesce_scratch(&body);
+            body = forward_stores(&body);
+            body = fold_addresses(&body);
+            body = dead_stores(&body);
+        }
+        Ok(body)
     }
 
     /// Argument setup plus every basic block. Run twice (dry, then real).
@@ -1572,6 +1582,261 @@ impl<'a> FnGen<'a> {
             Operand::Const(_) => Ty::I64,
         }
     }
+}
+
+/// Collapse a scratch-register round trip into the register it came from.
+///
+/// A value that lives in a promoted register is copied into `%rax` to be
+/// updated (`mov %r8, %rax; add -128(%rbp), %rax; add -136(%rbp), %rax; mov
+/// %rax, %r8`), because the generator uses `%rax` as its accumulator. When the
+/// instructions in between touch only the scratch register, the copy back is
+/// unnecessary and every use can name the promoted register directly, turning
+/// five instructions into three.
+///
+/// The search stops at a label, a jump, or a call, so the rewrite never crosses
+/// a point where the scratch register could hold something else.
+fn coalesce_scratch(body: &str) -> String {
+    const SCRATCH: &[&str] = &["%rax", "%rcx", "%rdx", "%r10", "%r11"];
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    'outer: while i < lines.len() {
+        if let Some((a, t)) = mov_reg_reg(lines[i]) {
+            if SCRATCH.contains(&t) && !SCRATCH.contains(&a) {
+                let mut k = i + 1;
+                while k < lines.len() {
+                    let lt = lines[k].trim();
+                    let op = lt.split_whitespace().next().unwrap_or("");
+                    if lt.ends_with(':')
+                        || lt.starts_with('.')
+                        || op.starts_with('j')
+                        || op == "ret"
+                        || op == "call"
+                        || op == "syscall"
+                    {
+                        break;
+                    }
+                    if reg_mentions(lines[k], a) {
+                        if mov_reg_reg(lines[k]) == Some((t, a)) {
+                            for m in &lines[i + 1..k] {
+                                out.push_str(&replace_reg(m, t, a));
+                                out.push('\n');
+                            }
+                            i = k + 1;
+                            continue 'outer;
+                        }
+                        break;
+                    }
+                    k += 1;
+                }
+            }
+        }
+        out.push_str(lines[i]);
+        out.push('\n');
+        i += 1;
+    }
+    out
+}
+
+/// Fold `mov %src, %t; add $k, %t; mov ...(%t)...` into a single instruction
+/// that uses `%src` as the base with `k` as the displacement.
+///
+/// A field or element access is generated as "copy the base pointer into a
+/// scratch register, add the byte offset, then load or store through it". On
+/// x86-64 the offset belongs in the addressing mode: `mov 8(%r13), %rax` does in
+/// one instruction what the three did.
+///
+/// The fold is safe when the third instruction overwrites `%t` (the address is
+/// dead either way), or when `%t` occurs exactly three times in the function, so
+/// the folded add cannot be observed elsewhere.
+fn fold_addresses(body: &str) -> String {
+    const SCRATCH: &[&str] = &["%rax", "%rcx", "%rdx", "%r10", "%r11"];
+    let lines: Vec<&str> = body.lines().collect();
+    let mut uses: HashMap<&str, usize> = HashMap::new();
+    for line in &lines {
+        for r in SCRATCH {
+            if reg_mentions(line, r) {
+                *uses.entry(r).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i + 2 < lines.len() {
+        if let Some((src, t)) = mov_reg_reg(lines[i]) {
+            if SCRATCH.contains(&t) && src != t {
+                if let Some(("add", k, arith_dst)) = addsub_imm(lines[i + 1]) {
+                    if arith_dst == t && k.unsigned_abs() < (1 << 31) {
+                        if let Some((rewritten, writes_t)) = fold_base(lines[i + 2], t, src, k) {
+                            if writes_t || uses.get(t).copied() == Some(3) {
+                                out.push_str(&rewritten);
+                                out.push('\n');
+                                i += 3;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out.push_str(lines[i]);
+        out.push('\n');
+        i += 1;
+    }
+    while i < lines.len() {
+        out.push_str(lines[i]);
+        out.push('\n');
+        i += 1;
+    }
+    out
+}
+
+/// Replace every whole-operand occurrence of `from` with `to`.
+fn replace_reg(line: &str, from: &str, to: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(p) = rest.find(from) {
+        let before = &rest[..p];
+        let after = &rest[p + from.len()..];
+        let left_ok = before
+            .chars()
+            .last()
+            .map(|c| !(c.is_ascii_alphanumeric() || c == '%' || c == '_'))
+            .unwrap_or(true);
+        let right_ok = after
+            .chars()
+            .next()
+            .map(|c| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(true);
+        out.push_str(before);
+        if left_ok && right_ok {
+            out.push_str(to);
+        } else {
+            out.push_str(from);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Rewrite a memory operand `(%t)` as `<k>(%src)`, reporting whether the
+/// instruction writes `%t`. Returns `None` unless `(%t)` is `%t`'s only use.
+fn fold_base(line: &str, t: &str, src: &str, k: i64) -> Option<(String, bool)> {
+    let old = format!("({t})");
+    if !line.contains(&old) {
+        return None;
+    }
+    // `%t` must not appear anywhere else (e.g. as the source of a store).
+    if replace_reg(line, t, "\u{1}").contains(t) {
+        return None;
+    }
+    let disp = if k == 0 { format!("({src})") } else { format!("{k}({src})") };
+    let rewritten = line.replacen(&old, &disp, 1);
+    let dst = line.trim().split_once(',').map(|(_, d)| d.trim());
+    let writes_t = dst == Some(t);
+    Some((rewritten, writes_t))
+}
+
+/// Fold `mov %a, %t; add|sub $k, %t; ...; mov %t, %d` into `lea ±k(%a), %d`.
+///
+/// The generator materialises every offset in a scratch register (`mov %rbx,
+/// %rax; sub $1, %rax; mov %rax, %rdi`), which costs three instructions for what
+/// `lea -1(%rbx), %rdi` does in one. This runs before the register forwarding so
+/// the source register is still named directly.
+///
+/// The pattern only fires when the scratch register appears exactly three times
+/// in the whole function — the two `mov`s and the `add`/`sub` — so it is provably
+/// dead afterwards and the rewrite cannot lose a value. Any instruction between
+/// the arithmetic and the final `mov` must not read `%a` or `%d`, or the `lea`
+/// could not be moved down past it.
+fn fuse_lea(body: &str) -> String {
+    const SCRATCH: &[&str] = &["%rax", "%rcx", "%rdx", "%r10", "%r11"];
+    let lines: Vec<&str> = body.lines().collect();
+    let mut uses: HashMap<&str, usize> = HashMap::new();
+    for line in &lines {
+        for r in SCRATCH {
+            if reg_mentions(line, r) {
+                *uses.entry(r).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i + 1 < lines.len() {
+        if let Some((a, t)) = mov_reg_reg(lines[i]) {
+            if SCRATCH.contains(&t) && uses.get(t).copied() == Some(3) {
+                if let Some((op, k, arith_dst)) = addsub_imm(lines[i + 1]) {
+                    if arith_dst == t && a != t && k.unsigned_abs() < (1 << 31) {
+                        if let Some(j) = (i + 2..lines.len()).find(|j| reg_mentions(lines[*j], t)) {
+                            if let Some((t2, d)) = mov_reg_reg(lines[j]) {
+                                // Nothing between may touch `a` or `d`, and the
+                                // scratch value must not be read again after it
+                                // reaches `d`, or dropping the write would lose it.
+                                if t2 == t && !writes_or_reads(&lines[i + 1..j], a, d) {
+                                    let disp = if op == "add" { k } else { -k };
+                                    if disp == 0 {
+                                        out.push_str(&format!("  mov {a}, {d}\n"));
+                                    } else {
+                                        out.push_str(&format!("  lea {disp}({a}), {d}\n"));
+                                    }
+                                    // The instructions between the arithmetic and
+                                    // the final move are independent of both
+                                    // registers, so they run unchanged after it.
+                                    for mid in &lines[i + 2..j] {
+                                        out.push_str(mid);
+                                        out.push('\n');
+                                    }
+                                    i = j + 1;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out.push_str(lines[i]);
+        out.push('\n');
+        i += 1;
+    }
+    if i < lines.len() {
+        out.push_str(lines[i]);
+        out.push('\n');
+    }
+    out
+}
+
+/// Count occurrences of register `r` as a whole operand in `line`.
+fn reg_mentions(line: &str, r: &str) -> bool {
+    line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '%' || c == '_'))
+        .any(|tok| tok == r)
+}
+
+/// `mov %a, %b` where both operands are registers.
+fn mov_reg_reg(line: &str) -> Option<(&str, &str)> {
+    let t = line.trim();
+    let rest = t.strip_prefix("mov ")?;
+    let (a, b) = rest.split_once(',')?;
+    let (a, b) = (a.trim(), b.trim());
+    (is_reg(a) && is_reg(b)).then_some((a, b))
+}
+
+/// `add $k, %t` or `sub $k, %t`.
+fn addsub_imm(line: &str) -> Option<(&str, i64, &str)> {
+    let t = line.trim();
+    let (op, rest) = t.split_once(' ')?;
+    if op != "add" && op != "sub" {
+        return None;
+    }
+    let (imm, dst) = rest.split_once(',')?;
+    let k: i64 = imm.trim().strip_prefix('$')?.parse().ok()?;
+    Some((op, k, dst.trim()))
+}
+
+/// True when any line reads or writes either register.
+fn writes_or_reads(lines: &[&str], a: &str, b: &str) -> bool {
+    lines.iter().any(|l| reg_mentions(l, a) || reg_mentions(l, b))
 }
 
 /// Forward a store to a frame slot into a later load of that slot.
