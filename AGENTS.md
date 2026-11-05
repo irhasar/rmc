@@ -61,11 +61,15 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   so sema and codegen have no `match` case. A non-`Var`/`Int` scrutinee is bound
   to a hidden `let` first, so a call in the scrutinee runs once. An arm after
   `_` is unreachable and dropped (the `_` body becomes the `else`).
-  An arm pattern may be an integer, a *range* `lo..hi`/`lo..=hi`, an
-  `Enum::Variant`, an *or-pattern* `a | b | c`, or `_`. A range desugars to
-  `Bin(And, Le, Lt/Le)`, an or-pattern to `Bin(Or, ..)` over the alternatives'
-  tests with the *same* body (`or_cond` builds only the test, so the body is not
-  duplicated), so neither needs a sema or codegen case. An or-pattern with a
+  An arm pattern may be an integer, a *range* `lo..hi`/`lo..=hi`, a *string
+  literal*, an `Enum::Variant`, an *or-pattern* `a | b | c`, or `_`. A range
+  desugars to `Bin(And, Le, Lt/Le)`, an or-pattern to `Bin(Or, ..)` over the
+  alternatives' tests with the *same* body (`or_cond` builds only the test, so
+  the body is not duplicated), so neither needs a sema or codegen case. A
+  *string* pattern desugars to `Bin(Eq, scrutinee, Str(s))`, which sema already
+  lowers to the byte-wise `__rmc_str_lt` helper: the scrutinee is a pointer, so
+  a machine compare would never match two distinct-but-equal literals. An
+  or-pattern with a
   `_` alternative, and one whose alternatives cover every variant, are handled
   by `pat_irrefutable` and `or_leaves` (in sema) respectively. A *binding*
   alternative is rejected, as rustc's E0408 rejects it.
@@ -587,7 +591,12 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   the RX one would have its `mprotect`-like mapping replace the execute
   permission. The runtime's writable globals are all zero, so they are emitted
   as `.bss` (`p_filesz = 0`, `p_memsz` set): mapping them from the file would
-  cost a page of padding and about 4 KB on every artifact. When adding an
+  cost a page of padding and about 4 KB on every artifact. Only a *writable*
+  section may be demoted to `.bss`. A read-only `.rodata` that happens to be all
+  zeros — a program whose only string literal is `""` emits just `.quad 0` — is
+  still file-backed and part of the RX segment; demoting it left `rx_end`
+  reading its unassigned `file_off` of 0, so the RX segment covered 8 bytes and
+  the binary segfaulted on entry while the `--binutils` path worked. When adding an
   instruction or a codegen form, remember the encoder only implements the subset
   the code generator emits and errors on anything else — run `tests/run.py`,
   which compiles every case through both paths and requires identical output.

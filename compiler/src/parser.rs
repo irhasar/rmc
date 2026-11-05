@@ -1103,6 +1103,11 @@ impl Parser {
                 self.i += 1;
                 Ok(Pat::Bool(false))
             }
+            // A string literal pattern, matched by content.
+            Some(Tok::Str(s)) => {
+                self.i += 1;
+                Ok(Pat::Str(s))
+            }
             // `Enum::Variant`, `Enum::Variant(a, b)`, a constant, or a binding.
             Some(Tok::Ident(n)) => {
                 self.i += 1;
@@ -1134,7 +1139,7 @@ impl Parser {
                 }
             }
             other => Err(format!(
-                "at byte {}: expected an integer, `true`/`false`, `Enum::Variant` or `_` pattern, found {}",
+                "at byte {}: expected an integer, `true`/`false`, a string literal, `Enum::Variant` or `_` pattern, found {}",
                 self.pos(),
                 other.map(|t| t.describe()).unwrap_or_else(|| "end of input".into())
             )),
@@ -1314,6 +1319,14 @@ impl Parser {
         match pat {
             Pat::Int(k) => Expr::Bin(BinOp::Eq, Box::new(subj.clone()), Box::new(Expr::Int(*k))),
             Pat::Bool(b) => Expr::BoolTest { scrutinee: Box::new(subj.clone()), value: *b },
+            // A string pattern tests by content: `Bin(Eq, ..)` over a `str`,
+            // which sema lowers to the byte-wise helper. A pointer compare
+            // would never match two distinct-but-equal literals.
+            Pat::Str(s) => Expr::Bin(
+                BinOp::Eq,
+                Box::new(subj.clone()),
+                Box::new(Expr::Str(s.clone())),
+            ),
             Pat::Range(lo, hi, inclusive) => {
                 let lower = Expr::Bin(BinOp::Le, Box::new(Expr::Int(*lo)), Box::new(subj.clone()));
                 let upper = Expr::Bin(
@@ -1353,6 +1366,12 @@ impl Parser {
             }),
             Pat::Int(k) => {
                 let cond = Expr::Bin(BinOp::Eq, Box::new(subj.clone()), Box::new(Expr::Int(k)));
+                Self::match_arm(cond, body, rest)
+            }
+            // A string literal pattern: a content compare, which sema lowers to
+            // the byte-wise helper (a pointer compare would never match).
+            Pat::Str(s) => {
+                let cond = Expr::Bin(BinOp::Eq, Box::new(subj.clone()), Box::new(Expr::Str(s)));
                 Self::match_arm(cond, body, rest)
             }
             // `lo..hi` is `lo <= s && s < hi`; `lo..=hi` uses `<=` on both
@@ -1696,6 +1715,10 @@ enum Pat {
     Or(Vec<Pat>),
     /// `true` or `false`.
     Bool(bool),
+    /// A string literal, matched by content. A `str` is a pointer to its
+    /// record, so the test is a content comparison (sema lowers it to the
+    /// byte-wise helper), never a pointer compare.
+    Str(String),
     /// `Enum::Variant` or `Enum::Variant(..)`. The constructor is resolved by
     /// sema; the optional bindings name the payload fields, in field order.
     Variant(String, String, Option<Vec<String>>),

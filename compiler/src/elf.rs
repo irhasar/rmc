@@ -239,11 +239,18 @@ impl Elf {
         let nphdr = 2usize; // RX and RW
         let mut off = (64 + nphdr * 56) as u64;
         for s in self.sections.iter_mut() {
-            // An all-zero section is carried as `.bss`: memory only, no file
-            // bytes and no page of padding. This matters because the runtime's
-            // writable globals are all zero, and page-aligning them in the file
-            // would otherwise add ~4 KB to every artifact.
-            s.bss = !s.data.is_empty() && s.data.iter().all(|&b| b == 0);
+            // An all-zero *writable* section is carried as `.bss`: memory only,
+            // no file bytes and no page of padding. This matters because the
+            // runtime's writable globals are all zero, and page-aligning them in
+            // the file would otherwise add ~4 KB to every artifact. Only a
+            // writable section may be bss: a read-only `.rodata` that happens to
+            // be all zeros (a lone empty-string record is `.quad 0`) is still
+            // file-backed and part of the RX segment, and demoting it would
+            // leave `rx_end` at its unassigned offset 0, dropping the code from
+            // every segment.
+            s.bss = !s.data.is_empty()
+                && s.data.iter().all(|&b| b == 0)
+                && s.flags & 0x2 != 0;
             if s.bss {
                 continue;
             }
@@ -1378,6 +1385,24 @@ mod tests {
         let (mut cur, mut sets) = (0usize, Vec::new());
         e.directive("balign 8", &mut cur, &mut sets).unwrap();
         assert_eq!(e.sections[0].data.len(), 8);
+    }
+
+    #[test]
+    fn an_all_zero_read_only_section_is_not_demoted_to_bss() {
+        // A `.rodata` holding only an empty-string record (`.quad 0`) is all
+        // zeros. Demoting it to `.bss` left `rx_end` reading its unassigned
+        // `file_off` of 0, so the RX segment covered 8 bytes and the program
+        // segfaulted on entry; the `as`+`ld` path was unaffected. Only a
+        // writable section may become `.bss`.
+        let elf = assemble(
+            ".section .rodata\n.Lstr0:\n.quad 0\n\
+             .text\nmain:\nmov $1, %rax\nret\n\
+             .globl _start\n_start:\ncall main\nret\n",
+        )
+        .unwrap();
+        // The RX segment's file size must cover the whole image, not 8 bytes.
+        let filesz = u64::from_le_bytes(elf[96..104].try_into().unwrap());
+        assert!(filesz > 64, "RX segment covers the code, got {filesz}");
     }
 
     #[test]
