@@ -47,6 +47,7 @@ python3 tools/fuzz.py --mode cast --n 500 --seed 1
 python3 tools/fuzz.py --mode assoc --n 500 --seed 1
 python3 tools/fuzz.py --mode ref --n 500 --seed 1
 python3 tools/fuzz.py --mode update --n 500 --seed 1
+python3 tools/fuzz.py --mode letdestr --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 ```
 
@@ -88,15 +89,27 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   by `pat_irrefutable` and `or_leaves` (in sema) respectively. A *binding*
   alternative is rejected, as rustc's E0408 rejects it.
   A *struct pattern* `S { f, g: h, i: _, .. }` is irrefutable, so it also has no
-  sema or codegen case: `desugar_arm` turns each bound field into a `let` whose
-  initialiser is `Expr::Field { base: scrutinee, .. }`, which sema already types
-  and locates (so a field may auto-deref a `&S` scrutinee). The prescan records
+  sema or codegen case: `struct_pat_binds` turns each bound field into a `let`
+  whose initialiser is `Expr::Field { base: scrutinee, .. }`, which sema already
+  types and locates (so a field may auto-deref a `&S` scrutinee). `mut` is a
+  per-binding flag carried in `Pat::Struct` (`f: mut h`, `mut f`), so a bound
+  field becomes a `let mut`. The prescan records
   each struct's field names before the real parse (`struct_fields`), so a field
   name is checked even for `i: _` (which emits no read) and a later-declared
   struct still matches; a field the struct lacks, or one bound twice, is a parse
   error. A struct pattern is a catch-all arm, so it joins `pat_irrefutable`, and
   `or_cond` treats it as `true` (a *binding* struct pattern in an or-pattern is
   rejected like any other binding alternative).
+  *`let` destructuring* `let S { f, g: h, .. } = e;` reuses the same parser
+  (`parse_pattern_primary`) and the same `struct_pat_binds` helper. Because the
+  bindings must outlive the statement, the expansion cannot be a nested block:
+  `parse_stmt` was split into `parse_stmt_into(&mut Vec<Stmt>)`, and a
+  destructuring `let` pushes the hidden scrutinee (a `\0lp<n>` temporary, unless
+  the scrutinee is already a plain place, in which case its field reads read it
+  directly, as in `desugar_match_arms`) followed by the per-field bindings into
+  the enclosing block. `let mut S { .. }` is rejected (rustc's "`mut` must be
+  attached to each individual binding"); a type annotation goes on the temporary.
+  No sema or codegen case.
   An arm may carry a *guard*, `PAT if COND => body`. `parse_match` reads the
   optional `if COND` after the pattern (`parse_cond`, so a struct literal needs
   parentheses) and threads it through `desugar_arm` as an `Option<Expr>`. The
@@ -139,6 +152,12 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   every arm diverges: its last step is an `if` with no `else`, which completes
   as `()`, so `Sema::match_chain_diverges` walks the chain and the no-`else`
   branch propagates `Never` for a `total` chain.
+  An *unannotated* binding whose initializer diverges keeps `Never`, and rmc
+  has no usage-based inference to refine it, so using it as a place is an error:
+  `let x = { return 3; }; x + 1` and `let S { a } = { return 3; };` are rejected
+  where rustc accepts them. This is a documented limitation, not a regression —
+  an annotation (`let x: i64 = ..`) makes the type concrete and both compile.
+  `let_destructuring_{accepts,rejects}_an_*_diverging_initialiser` pin it.
 - `compiler/src/ast.rs` — AST and `Type` (`I64`, `Bool`, `Str`, `Unit`, `Array`,
   `Struct`, and the parser-only placeholder `Named`). `Str` is the type of a
   string literal: one slot holding a pointer to NUL-terminated static data. It
@@ -541,7 +560,9 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   and a stale read across iterations is impossible. `continue`/`break` work
   because the desugared loop is the ordinary `For` node. Two guards matter:
   the loop variable must be a binding or `_` (a compound pattern is rejected
-  rather than mis-bound, since rmc has no destructuring `let`), and `for x in
+  rather than mis-bound; a struct pattern in `for` would need the array element
+  to be a struct, which `for x in arr` never yields, so it is not wired up), and
+  `for x in
   &arr` is rejected — Rust iterates a reference by reference (`x: &i64`), so
   accepting it would silently mistype `x`. `parse_for` also checks the pattern
   name against the constant table *before* `parse_pattern`, because a bare

@@ -438,6 +438,147 @@ fn a_struct_pattern_works_in_while_let() {
 }
 
 #[test]
+fn let_destructuring_binds_its_fields_in_the_enclosing_block() {
+    // The bindings must outlive the statement, so the expansion is spliced into
+    // the block rather than wrapped in a nested block.
+    let src = "struct P { x: i64, y: i64 } \
+               fn main() -> i64 { let p: P = P { x: 3, y: 4 }; \
+               let P { x, y } = p; return x * 10 + y; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn let_destructuring_accepts_rest_and_ignored_fields() {
+    let src = "struct P { x: i64, y: i64, z: i64 } \
+               fn main() -> i64 { let p: P = P { x: 1, y: 2, z: 3 }; \
+               let P { x: a, y: _, .. } = p; return a; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn let_destructuring_binds_nothing_for_a_bare_rest() {
+    // `let P { .. } = e;` names the struct but binds nothing.
+    let src = "struct P { x: i64 } \
+               fn main() -> i64 { let p: P = P { x: 1 }; \
+               let P { .. } = p; return 0; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn let_destructuring_allows_a_type_annotation() {
+    let src = "struct P { x: i64, y: i64 } \
+               fn main() -> i64 { let p: P = P { x: 1, y: 2 }; \
+               let P { x, y }: P = p; return x + y; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn let_destructuring_attaches_mut_per_binding() {
+    // `mut` goes on each binding, not on the pattern as a whole.
+    let src = "struct P { x: i64, y: i64 } \
+               fn main() -> i64 { let p: P = P { x: 1, y: 2 }; \
+               let P { mut x, y: mut z } = p; x = 5; z = 6; return x + z; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn let_destructuring_reads_through_a_reference() {
+    let src = "struct P { x: i64, y: i64 } \
+               fn f(p: &P) -> i64 { let P { x, y } = p; return x + y; } \
+               fn main() -> i64 { let p: P = P { x: 1, y: 2 }; return f(&p); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn let_destructuring_compiles_like_the_equivalent_field_reads() {
+    // The expansion must be exactly a hidden scrutinee plus one field read per
+    // binding. A single-field struct keeps the two forms comparable.
+    let pat = "struct P { x: i64 } \
+               fn f(p: &P) -> i64 { let P { x } = p; return x + 1; }";
+    let reads = "struct P { x: i64 } \
+                 fn f(p: &P) -> i64 { let x: i64 = p.x; return x + 1; }";
+    assert_eq!(asm(pat), asm(reads));
+}
+
+#[test]
+fn let_destructuring_evaluates_the_scrutinee_once() {
+    // The scrutinee is a call, so it must be stored in a temporary rather than
+    // re-evaluated for each field. The hidden temporary is named with a
+    // NUL-prefixed identifier, which no source name can produce.
+    let out = asm(
+        "struct P { x: i64, y: i64 } \
+         fn mk() -> P { return P { x: 1, y: 2 }; } \
+         fn main() -> i64 { let P { x, y } = mk(); return x + y; }",
+    );
+    assert!(out.contains("mk"), "the scrutinee is evaluated");
+    // One call site in `main` (plus the definition), not two.
+    assert_eq!(out.matches("call mk").count(), 1, "scrutinee runs once");
+}
+
+#[test]
+fn let_destructuring_accepts_an_annotated_diverging_initialiser() {
+    // The annotation gives the scrutinee temporary a real type, so the field
+    // reads are well typed even though the block cannot complete. rustc
+    // accepts this; the unannotated form, which rmc rejects, is the next test.
+    let src = "struct P { x: i64 } \
+               fn f() -> i64 { let P { x }: P = { return 3; }; return x; } \
+               fn main() -> i64 { return f(); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn let_destructuring_rejects_an_unannotated_diverging_initialiser() {
+    // An unannotated diverging initialiser keeps type `!`, and rmc has no
+    // usage-based inference to refine it, so the field read is rejected. This
+    // is a deliberate, documented limitation shared with the `match` path (a
+    // diverging scrutinee errors the same way), not a regression: if this ever
+    // starts compiling, update the note in `docs/language.md`.
+    let err = compile_to_asm(
+        "struct P { x: i64 } \
+         fn f() -> i64 { let P { x } = { return 3; }; return x; } \
+         fn main() -> i64 { return f(); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("Never"), "got: {err}");
+}
+
+#[test]
+fn a_mut_before_a_let_destructuring_pattern_is_rejected() {
+    let err = compile_to_asm(
+        "struct P { x: i64 } \
+         fn main() -> i64 { let p: P = P { x: 1 }; \
+         let mut P { x } = p; return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("attached to each individual binding"), "got: {err}");
+}
+
+#[test]
+fn a_let_destructuring_pattern_on_a_non_struct_is_rejected() {
+    let err = compile_to_asm(
+        "struct P { x: i64 } \
+         fn main() -> i64 { let P { x } = 5; return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("field access"), "got: {err}");
+}
+
+#[test]
+fn an_unknown_field_in_a_let_destructuring_pattern_is_rejected() {
+    let err = compile_to_asm(
+        "struct P { x: i64 } \
+         fn main() -> i64 { let p: P = P { x: 1 }; \
+         let P { z } = p; return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("has no field `z`"), "got: {err}");
+}
+
+#[test]
 fn a_diverging_match_is_never_and_fits_any_return_type() {
     // Every arm `return`s, so the match cannot yield a value: it is `!` and
     // satisfies `-> i64`. rustc accepts this; rmc used to reject it with a

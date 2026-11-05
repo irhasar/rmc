@@ -155,7 +155,9 @@ and a nested-path write, `pat` for `match` expressions (multi-variant enums,
 two-field payloads, explicit discriminants, `bool` matches, binding patterns,
 struct patterns, nested matches, `if let`, string patterns, per-arm guards, and
 a side-effecting
-scrutinee), and `order` for assignment evaluation order (a
+scrutinee), `letdestr` for `let` struct destructuring (shorthand, renamed and
+`mut` bindings, `_` and `..`, a call and a reference scrutinee, and a
+struct-typed field destructured in turn), and `order` for assignment evaluation order (a
 side-effecting index and value on both `=` and every compound operator, the
 shapes `stmt` never assigns through). `shift` drives `<<`, `>>` and the compound
 `<<=`/`>>=` with a shift count from `argv`, so the count is opaque to the
@@ -215,8 +217,9 @@ fn main() -> i64 {
 ```
 
 Supported: `i64`, `bool`, `str`, fixed-size arrays, and structs with named fields
-(including field init shorthand, `P { x, y }`, and struct update syntax,
-`P { x: 9, ..base }`, and struct patterns `P { x, y: z, .. }` in `match`/`if let`);
+(including field init shorthand, `P { x, y }`, struct update syntax,
+`P { x: 9, ..base }`, struct patterns `P { x, y: z, .. }` in `match`/`if let`,
+and `let` destructuring `let P { x, y: z, .. } = p;`);
 functions with up to six parameters; `let` / `let mut` / `let _` (discard); assignment to variables,
 array elements and struct fields (including compound `+=` and friends);
 `if`/`else`, `while`, `loop`, `for i in a..b` / `a..=b` and `for x in arr`

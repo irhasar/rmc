@@ -660,7 +660,7 @@ impl Parser {
                 if self.peek2() == Some(&Tok::Colon)
                     && self.toks.get(self.i + 2).map(|t| &t.tok) != Some(&Tok::Loop)
                 {
-                    stmts.push(self.parse_stmt()?);
+                    self.parse_stmt_into(&mut stmts)?;
                     continue;
                 }
             }
@@ -705,7 +705,7 @@ impl Parser {
                     self.pos()
                 ));
             }
-            stmts.push(self.parse_stmt()?);
+            self.parse_stmt_into(&mut stmts)?;
         }
         self.expect(Tok::RBrace)?;
         Ok(Block { stmts, tail })
@@ -923,24 +923,35 @@ impl Parser {
                 | Some(Tok::Amp)
                 | Some(Tok::Star)
                 // A bare `{ ... }` is a block expression, valid as a statement
-                // without a `;`. Without this it fell through to `parse_stmt`,
-                // which has no arm for `{`, so a nested block failed to parse.
+                // without a `;`. Without this it fell through to the statement
+                // parser, which has no arm for `{`, so a nested block failed to
+                // parse.
                 | Some(Tok::LBrace)
         )
     }
 
-    fn parse_stmt(&mut self) -> PResult<Stmt> {
+    /// Parse one statement and append it to `out`. A statement is usually one
+    /// `Stmt`, but `let` destructuring expands to several (a hidden scrutinee
+    /// plus one binding per field), so the caller passes the enclosing block's
+    /// statement list: the expansion is spliced into it rather than wrapped in
+    /// a nested block, which would hide the bindings from the rest of the block.
+    fn parse_stmt_into(&mut self, out: &mut Vec<Stmt>) -> PResult<()> {
         // A loop label may prefix `while` or `for`; a labelled `loop` is an
         // expression and is handled by `parse_primary` (routed here or there by
         // `parse_block_inner` depending on whether it is a tail expression).
         if let Some(Tok::Label(n)) = self.peek().cloned() {
             self.i += 1;
             self.expect(Tok::Colon)?;
-            return self.parse_labeled_loop_stmt(n);
+            let s = self.parse_labeled_loop_stmt(n)?;
+            out.push(s);
+            return Ok(());
         }
         match self.peek() {
             Some(Tok::Let) => {
                 self.i += 1;
+                // `mut` before the name marks that binding mutable. A struct
+                // pattern attaches `mut` to each field instead, so `let mut
+                // S { .. }` is rejected, as in rustc.
                 let mutable = self.eat(&Tok::Mut);
                 // `let _ = e;` (and `let _: T = e;`, and bare `let _;`) binds
                 // nothing. Desugar to a block holding a hidden binding so the
@@ -983,7 +994,62 @@ impl Parser {
                         }
                         None => Vec::new(),
                     };
-                    return Ok(Stmt::Expr(Expr::Block(Block { stmts, tail: None })));
+                    out.push(Stmt::Expr(Expr::Block(Block { stmts, tail: None })));
+                    return Ok(());
+                }
+                // `let S { f, g: h } [: T] = e;` destructures a struct. The
+                // pattern is read by the same parser as a `match` pattern, but
+                // here it is irrefutable by construction, so the annotation goes
+                // on the scrutinee temporary below and the fields are bound from
+                // it. `..` and `f: _` are the only way to drop fields.
+                if matches!(self.peek(), Some(Tok::Ident(_)))
+                    && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::LBrace)
+                {
+                    if mutable {
+                        return Err(format!(
+                            "at byte {}: `mut` must be attached to each individual binding, as `S {{ mut f }}`",
+                            self.pos()
+                        ));
+                    }
+                    let pat = self.parse_pattern_primary()?;
+                    let fields = match pat {
+                        Pat::Struct(_, fields) => fields,
+                        _ => unreachable!("`{{` follows the name, so this is a struct pattern"),
+                    };
+                    let ty = if self.eat(&Tok::Colon) {
+                        Some(self.parse_type()?)
+                    } else {
+                        None
+                    };
+                    self.expect(Tok::Eq)?;
+                    let init = self.parse_expr()?;
+                    self.expect(Tok::Semi)?;
+                    // Bind each field from the scrutinee. Both the scrutinee
+                    // temporary and the bindings go into the enclosing block, so
+                    // the bindings stay visible for the rest of it. As in
+                    // `desugar_match_arms`, a plain place is read directly (its
+                    // re-read has no side effects and this avoids a copy); an
+                    // annotation is kept on the temporary so it is still checked.
+                    let subj = if ty.is_none()
+                        && matches!(
+                            init,
+                            Expr::Var { .. } | Expr::Int(_) | Expr::EnumVariant { .. }
+                        ) {
+                        init
+                    } else {
+                        let tmp = format!("\u{0}lp{}", self.tmp);
+                        self.tmp += 1;
+                        out.push(Stmt::Let {
+                            name: tmp.clone(),
+                            ty,
+                            init: Some(init),
+                            slot: -1,
+                            mutable: false,
+                        });
+                        Expr::Var { name: tmp, slot: -1, ty: Type::I64 }
+                    };
+                    out.extend(Self::struct_pat_binds(&fields, &subj));
+                    return Ok(());
                 }
                 let name = self.expect_ident()?;
                 let ty = if self.eat(&Tok::Colon) {
@@ -997,7 +1063,8 @@ impl Parser {
                     None
                 };
                 self.expect(Tok::Semi)?;
-                Ok(Stmt::Let { name, ty, init, slot: -1, mutable })
+                out.push(Stmt::Let { name, ty, init, slot: -1, mutable });
+                Ok(())
             }
             Some(Tok::While) => {
                 self.i += 1;
@@ -1009,15 +1076,20 @@ impl Parser {
                     self.expect(Tok::Eq)?;
                     let scrutinee = self.parse_cond()?;
                     let body = self.parse_block()?;
-                    return self.desugar_while_let(pat, scrutinee, body);
+                    let s = self.desugar_while_let(pat, scrutinee, body)?;
+                    out.push(s);
+                    return Ok(());
                 }
                 let cond = self.parse_cond()?;
                 let body = self.parse_block()?;
-                Ok(Stmt::While(cond, body, None))
+                out.push(Stmt::While(cond, body, None));
+                Ok(())
             }
             Some(Tok::For) => {
                 self.i += 1;
-                self.parse_for()
+                let s = self.parse_for()?;
+                out.push(s);
+                Ok(())
             }
             Some(Tok::Return) => {
                 self.i += 1;
@@ -1025,11 +1097,13 @@ impl Parser {
                 // `;` may be omitted when the `return` is the last thing in the
                 // block (`{ return 2 }`), as in Rust.
                 if self.eat(&Tok::Semi) || self.peek() == Some(&Tok::RBrace) {
-                    return Ok(Stmt::Return(None));
+                    out.push(Stmt::Return(None));
+                    return Ok(());
                 }
                 let e = self.parse_expr()?;
                 self.eat_semi_at_block_end()?;
-                Ok(Stmt::Return(Some(e)))
+                out.push(Stmt::Return(Some(e)));
+                Ok(())
             }
             Some(Tok::Break) => {
                 self.i += 1;
@@ -1038,17 +1112,20 @@ impl Parser {
                 // legal in a `loop`, checked by sema.
                 let label = self.eat_label()?;
                 if self.eat(&Tok::Semi) || self.peek() == Some(&Tok::RBrace) {
-                    return Ok(Stmt::Break(None, label));
+                    out.push(Stmt::Break(None, label));
+                    return Ok(());
                 }
                 let e = self.parse_expr()?;
                 self.eat_semi_at_block_end()?;
-                Ok(Stmt::Break(Some(e), label))
+                out.push(Stmt::Break(Some(e), label));
+                Ok(())
             }
             Some(Tok::Continue) => {
                 self.i += 1;
                 let label = self.eat_label()?;
                 self.eat_semi_at_block_end()?;
-                Ok(Stmt::Continue(label))
+                out.push(Stmt::Continue(label));
+                Ok(())
             }
             _ => {
                 // expression statement, possibly an assignment
@@ -1056,16 +1133,20 @@ impl Parser {
                 if self.eat(&Tok::Eq) {
                     let value = self.parse_expr()?;
                     self.expect(Tok::Semi)?;
-                    return Ok(Stmt::Assign { target: e, value });
+                    out.push(Stmt::Assign { target: e, value });
+                    return Ok(());
                 }
                 if let Some(op) = self.peek_compound_op() {
                     self.i += 1;
                     let value = self.parse_expr()?;
                     self.expect(Tok::Semi)?;
-                    return Ok(self.desugar_compound(&e, op, value));
+                    let s = self.desugar_compound(&e, op, value);
+                    out.push(s);
+                    return Ok(());
                 }
                 self.expect(Tok::Semi)?;
-                Ok(Stmt::Expr(e))
+                out.push(Stmt::Expr(e));
+                Ok(())
             }
         }
     }
@@ -1495,7 +1576,9 @@ impl Parser {
         // appear as an irrefutable alternative only when it binds nothing.
         if let Some(n) = alts.iter().find_map(|a| match a {
             Pat::Bind(n) => Some(n.clone()),
-            Pat::Struct(_, fields) => fields.iter().find_map(|(_, b)| b.clone()),
+            Pat::Struct(_, fields) => {
+                fields.iter().find_map(|(_, b)| b.as_ref().map(|(_, n)| n.clone()))
+            }
             _ => None,
         }) {
             return Err(format!(
@@ -1590,7 +1673,7 @@ impl Parser {
                             ))
                         }
                     };
-                    let mut fields: Vec<(String, Option<String>)> = Vec::new();
+                    let mut fields: Vec<(String, Option<(bool, String)>)> = Vec::new();
                     while self.peek() != Some(&Tok::RBrace) {
                         if self.peek().is_none() {
                             return Err(format!(
@@ -1602,6 +1685,9 @@ impl Parser {
                         if self.eat(&Tok::DotDot) {
                             break;
                         }
+                        // `mut` may precede a shorthand field (`S { mut f }`),
+                        // but not the field name of a renamed one.
+                        let leading_mut = self.eat(&Tok::Mut);
                         let fname = self.expect_ident()?;
                         // A field the struct does not have is an error here, not
                         // a silent no-op: a `f: _` field emits no read for sema
@@ -1619,15 +1705,32 @@ impl Parser {
                             ));
                         }
                         let bind = if self.eat(&Tok::Colon) {
+                            // `f: mut b` marks just this binding mutable, as in
+                            // rustc. A leading `mut` before the field name is
+                            // only legal on a shorthand field.
+                            if leading_mut {
+                                return Err(format!(
+                                    "at byte {}: `mut` must be attached to the binding, as `{fname}: mut b`",
+                                    self.pos()
+                                ));
+                            }
+                            let m = self.eat(&Tok::Mut);
                             if self.peek() == Some(&Tok::Underscore) {
                                 self.i += 1;
+                                if m {
+                                    return Err(format!(
+                                        "at byte {}: `mut` is not allowed on `_`",
+                                        self.pos()
+                                    ));
+                                }
                                 None
                             } else {
-                                Some(self.expect_ident()?)
+                                Some((m, self.expect_ident()?))
                             }
                         } else {
-                            // Shorthand: `S { f }` binds `f`.
-                            Some(fname.clone())
+                            // Shorthand: `S { f }` binds `f`, or `S { mut f }`
+                            // binds a mutable `f`.
+                            Some((leading_mut, fname.clone()))
                         };
                         fields.push((fname, bind));
                         if !self.eat(&Tok::Comma) {
@@ -1934,6 +2037,32 @@ impl Parser {
         }
     }
 
+    /// The `let` statements a struct pattern introduces: one per bound field,
+    /// each a read of that field on `subj`. Shared by the `match` arm path and
+    /// `let` destructuring, which differ only in what they do with the result.
+    /// The reads are left for sema to type and locate, so a non-struct
+    /// scrutinee is a sema error naming the field and a field may auto-deref a
+    /// `&S` scrutinee. `f: _` contributes no binding.
+    fn struct_pat_binds(fields: &[(String, Option<(bool, String)>)], subj: &Expr) -> Vec<Stmt> {
+        fields
+            .iter()
+            .filter_map(|(fname, bind)| {
+                bind.as_ref().map(|(m, b)| Stmt::Let {
+                    name: b.clone(),
+                    ty: None,
+                    mutable: *m,
+                    init: Some(Expr::Field {
+                        base: Box::new(subj.clone()),
+                        name: fname.clone(),
+                        offset: -1,
+                        ty: Type::Unit,
+                    }),
+                    slot: -1,
+                })
+            })
+            .collect()
+    }
+
     fn desugar_arm(
         &mut self,
         pat: Pat,
@@ -1956,26 +2085,7 @@ impl Parser {
             // scrutinee by auto-deref. The struct name and each field name were
             // already checked against the prescan, so `f: _` (which emits no
             // read) is validated too.
-            Pat::Struct(_name, fields) => {
-                let binds: Vec<Stmt> = fields
-                    .iter()
-                    .filter_map(|(fname, bind)| {
-                        bind.as_ref().map(|b| Stmt::Let {
-                            name: b.clone(),
-                            ty: None,
-                            mutable: false,
-                            init: Some(Expr::Field {
-                                base: Box::new(subj.clone()),
-                                name: fname.clone(),
-                                offset: -1,
-                                ty: Type::Unit,
-                            }),
-                            slot: -1,
-                        })
-                    })
-                    .collect();
-                (binds, None)
-            }
+            Pat::Struct(_name, fields) => (Self::struct_pat_binds(&fields, &subj), None),
             // `name => body` binds the whole scrutinee.
             Pat::Bind(name) => (
                 vec![Stmt::Let {
@@ -2420,13 +2530,15 @@ enum Pat {
     /// distinct from `Wild` only so the binding is named.
     Bind(String),
     /// `S { f, g: h }`: a struct pattern, matched by name against the
-    /// scrutinee's type. Each field is `(name, Some(binding))` when written
-    /// `f: b` (or the shorthand `f`, which binds `f`), and `(name, None)` for
-    /// `f: _`. A struct pattern is irrefutable, so it has no test: sema
-    /// replaces it with the field reads its bindings name (see
-    /// `desugar_match_arms`). The struct name is resolved by sema, so it may
-    /// name a struct declared later in the file.
-    Struct(String, Vec<(String, Option<String>)>),
+    /// scrutinee's type. Each field is `(name, Some((mut, binding)))` when
+    /// written `f: b` (or the shorthand `f`, which binds `f`), and
+    /// `(name, None)` for `f: _`. `mut` is a per-binding flag, as in rustc: it
+    /// is written on the binding (`f: mut b`, `mut f`) and there is no
+    /// `mut` on the pattern as a whole. A struct pattern is irrefutable, so it
+    /// has no test: it desugars to the field reads its bindings name (see
+    /// `desugar_arm` and `let` destructuring). The struct name is resolved by
+    /// sema, so it may name a struct declared later in the file.
+    Struct(String, Vec<(String, Option<(bool, String)>)>),
 }
 
 /// Whether `e` syntactically contains a call, used to decide if a subscript in

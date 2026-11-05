@@ -209,6 +209,8 @@ namespace, so giving both the same name is an error (rustc's `E0428`).
 ```rust
 let x: i64 = 1;          // immutable binding
 let mut y: i64 = 0;      // mutable binding
+let S { a, b: c, .. } = s;  // struct destructuring: bind `a` and `c`
+let S { mut a, b }: S = s;  // per-binding `mut`, optional annotation
 let _ = e;               // discard: evaluate `e` for side effects, bind nothing
 let _: T;                // annotated discard, no initialiser (a no-op)
 y = y + 1;               // assignment (target may be a variable, array element or field)
@@ -243,6 +245,14 @@ aggregate leaves it uninitialised as a whole, so reading it is still an error
 for its side effects and binds nothing, and any annotation is still checked
 (`let _: bool = 5;` is rejected, rustc's `E0308`). `let _;` with no annotation
 has no type to infer and is rejected (rustc's `E0282`); `let _: T;` is a no-op.
+A `let S { .. } = e;` destructures a struct: each named field is bound as a
+fresh local in the enclosing block, so it stays visible for the rest of the
+block. The scrutinee is evaluated exactly once, and a type annotation after the
+pattern (`let S { x, y }: S = e;`) is checked against it. `mut` is per binding —
+`let S { mut x, y: mut z } = e;` is accepted, `let mut S { .. } = e;` is
+rejected (`mut` must be attached to each individual binding, as in rustc).
+Nested sub-patterns are not supported, so a struct-typed field is destructured
+by a second `let`; see Struct patterns for the full field grammar.
 A `let` or parameter without `mut` is
 immutable: assigning it (rustc's `E0384`), assigning a field or element of it
 (`E0594`), or taking `&mut` of it (`E0596`) is rejected. Add `mut` (or `mut x:
@@ -269,7 +279,12 @@ since those diverge and no expression can follow them. A whole block that
 cannot complete is `!` too, so it fits any expected type: `fn f(e: E) -> i64 {
 match e { E::A => { return 1; } E::B => { return 2; } } }` (every arm returns),
 `let x: i64 = if c { return 1; } else { return 2; };`, and `fn g() -> i64 {
-loop {} }` are all accepted, matching rustc.
+loop {} }` are all accepted, matching rustc. An *unannotated* binding whose
+initializer diverges keeps type `!`, though, and rmc has no usage-based
+inference to refine it, so using it as a place is rejected: both
+`let x = { return 3; }; x + 1` and `let S { a } = { return 3; };` are errors
+where rustc accepts them (it never needs the value). Add an annotation
+(`let x: i64 = { return 3; };`) to accept them.
 
 `loop` is an expression: `break v` makes the loop itself evaluate to `v`, so
 `let x: i64 = loop { ... break 5; };` is accepted. Every `break` in the loop
@@ -395,15 +410,27 @@ compile-time constant is decided at compile time, not by the trap.
 - Struct patterns: `S { f, g: h, i: _, .. }` matches a `S` scrutinee and binds
   its fields. A field may be shorthand (`f` binds `f`), renamed (`g: h` binds
   `h`), or ignored (`i: _`); a trailing `..` drops the fields not named, and
-  `S { .. }` binds nothing. A struct pattern is *irrefutable*: it has no runtime
+  `S { .. }` binds nothing. A binding may be made mutable with `mut`, written on
+  the binding (`mut f`, `g: mut h`), not on the pattern: `mut` is a per-binding
+  flag, as in rustc. A struct pattern is *irrefutable*: it has no runtime
   test and always matches, so it acts as a catch-all arm (like `_`) and needs no
   other arm to make a `match` exhaustive. A field is an ordinary place read, so
   it may auto-deref a `&S` scrutinee. Each field binds a whole value; a
-  sub-pattern (`i: I { a }`) is not supported, as the subset has no
-  destructuring `let` and an enum payload pattern likewise only binds fields.
-  A wrong field name is an error, even for `i: _`, and a field
-  bound twice is an error. Because a struct pattern is irrefutable, a *binding*
-  struct pattern in an or-pattern is rejected, as is any binding alternative.
+  sub-pattern (`i: I { a }`) is not supported — an enum payload pattern likewise
+  only binds fields. A wrong field name is an error, even for `i: _`, and a
+  field bound twice is an error. Because a struct pattern is irrefutable, a
+  *binding* struct pattern in an or-pattern is rejected, as is any binding
+  alternative.
+- `let` destructuring: `let S { f, g: h, i: _, .. } = e;` uses the same struct
+  pattern grammar and binds the named fields as fresh locals in the enclosing
+  block, so they stay visible for the rest of it. The pattern is irrefutable by
+  construction, so there is no test; a type annotation is allowed after the
+  pattern (`let S { x, y }: S = e;`) and is checked against the scrutinee. The
+  scrutinee is evaluated exactly once. `mut` goes on each binding, so
+  `let mut S { .. } = e;` is rejected (`mut` must be attached to each individual
+  binding), while `let S { mut x, y: mut z } = e;` is accepted. As in `match`, a
+  field read may auto-deref a `&S` scrutinee. Nested sub-patterns are not
+  supported, so a struct-typed field is destructured by a second `let`.
 - `if let PAT = EXPR { .. } else { .. }`, sugar for
   `match EXPR { PAT => then, _ => else_or_unit }`. It reuses the `match` pattern
   grammar (including or-patterns, ranges and struct patterns,
