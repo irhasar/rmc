@@ -1202,8 +1202,38 @@ fn large_array_compiles_in_linear_time() {
     let out = compile_to_asm(&src, &CompileOptions::default()).unwrap();
     assert!(out.contains("main:"));
     assert!(
-        t.elapsed().as_secs_f64() < 0.5,
+        t.elapsed().as_secs_f64() < 0.15,
         "compiling a 200k-element array took {:?}",
+        t.elapsed()
+    );
+}
+
+#[test]
+fn mir_large_array_compiles_in_linear_time() {
+    // The MIR back end marks a frame region used slot-by-slot; hashing each
+    // slot of a `[i64; N]` local is quadratic and dominated the back end (a
+    // 2M-element array took ~1.5 s). A slice fill is linear, so this must stay
+    // well under the bound.
+    let mir = "\
+fn main() -> i64 {
+    let mut _0: i64;
+    let mut _1: [i64; 2000000];
+
+    bb0: {
+        _1 = [const 1_i64; 2000000];
+        _0 = const 0_i64;
+        return;
+    }
+}
+";
+    let t = std::time::Instant::now();
+    let prog = rmc::mir::parse(mir).expect("parse");
+    let asm = rmc::compile_mir_to_asm(&prog, &rmc::mir_codegen::Options::default())
+        .expect("compile");
+    assert!(asm.contains("main:"));
+    assert!(
+        t.elapsed().as_secs_f64() < 0.15,
+        "compiling a 2M-element array through MIR took {:?}",
         t.elapsed()
     );
 }
@@ -4755,3 +4785,136 @@ fn a_struct_update_base_of_the_wrong_type_is_rejected() {
     assert!(err.contains("does not match"), "got: {err}");
 }
 
+
+#[test]
+fn mir_unit_main_returns_zero() {
+    // `_start` hands `%rax` to the kernel as the exit status. A `main` that
+    // returns `()` sets no return value, so the epilogue must zero `%rax`;
+    // otherwise the process exits with whatever the last instruction left in
+    // the register, and the differential suite never caught it because every
+    // case there returns `i64`.
+    let mir = "\
+fn main() {
+    let mut _0: ();
+
+    bb0: {
+        _0 = const ();
+        return;
+    }
+}
+";
+    let prog = rmc::mir::parse(mir).expect("parse");
+    let asm = rmc::compile_mir_to_asm(&prog, &rmc::mir_codegen::Options::default())
+        .expect("compile");
+    // The unit main's return path must clear the status register before the
+    // frame is torn down.
+    let ret = asm.split(".Lret_main:").nth(1).expect("a main epilogue");
+    assert!(
+        ret.contains("xor %eax, %eax") || ret.contains("mov $0, %rax"),
+        "unit main epilogue does not zero %rax:\n{ret}"
+    );
+}
+
+#[test]
+fn mir_overflow_checks_switch_folds_to_the_off_arm() {
+    // `switchInt(OverflowChecks)` is a compile-time constant: the front end
+    // runs with checks off, so the `0:` arm is the live one. Folding it keeps
+    // an impossible branch out of the back end, and a `wrapping_*` sequence
+    // (which lowers to `OverflowChecks`) must still compile.
+    let mir = "\
+fn main() -> i64 {
+    let mut _0: i64;
+    let mut _1: i64;
+
+    bb0: {
+        switchInt(OverflowChecks) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _1 = const 1_i64;
+        goto -> bb3;
+    }
+
+    bb2: {
+        _1 = const 0_i64;
+        goto -> bb3;
+    }
+
+    bb3: {
+        _0 = move _1;
+        return;
+    }
+}
+";
+    let prog = rmc::mir::parse(mir).expect("parse");
+    // The fold is at the parse level: bb0 must be an unconditional jump to the
+    // `0:` arm, not a `SwitchInt` the back end would have to evaluate.
+    let bb0 = &prog.funcs[0].blocks[0];
+    assert!(
+        matches!(bb0.term, rmc::mir::Terminator::Goto(2)),
+        "OverflowChecks did not fold to bb2: {:?}",
+        bb0.term
+    );
+    let asm = rmc::compile_mir_to_asm(&prog, &rmc::mir_codegen::Options::default())
+        .expect("compile");
+    assert!(asm.contains("main:"));
+}
+
+#[test]
+fn mir_unsupported_fragment_names_the_rust_feature() {
+    // A rejected MIR fragment must be reported as the Rust construct the user
+    // wrote, not as a rustc-internal type name.
+    let fmt = rmc::mir::classify_unsupported(
+        "_11 = <i64 as std::fmt::Display>::fmt as for<'a> fn(&'a i64, \
+         &'a mut std::fmt::Formatter<'a>) -> std::result::Result<(), \
+         std::fmt::Error> (PointerCoercion(ReifyFnPointer(Safe), Implicit));",
+    );
+    assert!(fmt.unwrap().contains("formatting"), "got: {fmt:?}");
+    let closure = rmc::mir::classify_unsupported("_3 = const {closure@src/main.rs:1:9}");
+    assert!(closure.unwrap().contains("closure"), "got: {closure:?}");
+    let float = rmc::mir::classify_unsupported("_4 = const 1.5_f64;");
+    assert!(float.unwrap().contains("floating"), "got: {float:?}");
+    // An unknown fragment has no hint rather than a wrong one.
+    assert!(rmc::mir::classify_unsupported("_1 = const 1_i64;").is_none());
+}
+
+#[test]
+fn mir_rejected_program_is_a_diagnostic_not_a_panic() {
+    // The back end parses rustc's MIR text. A shape it does not model must
+    // come back as an `Err`, never a panic: the parse is the untrusted-input
+    // boundary of this path. A truncated function is the shape a hostile or
+    // interrupted input takes, so it must be a clean error.
+    let err = rmc::mir::parse("fn main() {\n").unwrap_err();
+    assert!(!err.is_empty(), "empty diagnostic");
+    // A well-formed header with no body parses to an empty program rather than
+    // failing; the driver then reports the missing `main`.
+    let empty = rmc::mir::parse("// only a comment\n").expect("lenient parse");
+    assert!(empty.funcs.is_empty());
+}
+
+#[test]
+fn mir_function_with_no_blocks_is_rejected() {
+    // The optimiser passes index `blocks[0]` as the entry, so a function that
+    // declares no `bb` must be rejected by the parser, not panic later.
+    let err = rmc::mir::parse("fn main() -> i64 {\n}\n").unwrap_err();
+    assert!(err.contains("no basic blocks"), "got: {err}");
+}
+
+#[test]
+fn mir_dangling_jump_target_is_rejected() {
+    // A terminator that targets a block the function never declares must be a
+    // parse error; `merge_blocks` (and others) index `blocks[target]` directly.
+    let mir = "\
+fn main() -> i64 {
+    let mut _0: i64;
+
+    bb0: {
+        _0 = const 0_i64;
+        return;
+    assert(!move _0, \"x\") -> [success: bb1, unwind unreachable];
+    }
+}
+";
+    let err = rmc::mir::parse(mir).unwrap_err();
+    assert!(err.contains("does not exist"), "got: {err}");
+}

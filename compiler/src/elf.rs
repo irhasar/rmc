@@ -486,7 +486,7 @@ impl Elf {
                 Ok(())
             }
             "sete" | "setne" | "setl" | "setle" | "setg" | "setge" | "setb" | "setbe" | "seta"
-            | "setae" => self.enc_setcc(mnem, &ops, sec),
+            | "setae" | "seto" | "setno" | "sets" | "setns" => self.enc_setcc(mnem, &ops, sec),
             j if j.starts_with('j') => self.enc_jcc(j, &ops, sec),
             other => Err(format!("elf: unsupported instruction `{other}`")),
         }
@@ -646,7 +646,12 @@ impl Elf {
             // because there is no operand to infer a width from; only an explicit
             // `movq` stores 64 bits. Matching that keeps the encoder a faithful
             // stand-in and stops an unsuffixed store silently leaving the high
-            // half of the destination stale.
+            // half of the destination stale. Either form sign-extends a 32-bit
+            // immediate, so a wider one has no encoding at all and must be
+            // materialised in a register by the caller.
+            if !fits_i32(v) {
+                return Err(format!("elf: `{mnem}` immediate {v} does not fit i32; use a register"));
+            }
             self.mem_op(sec, 0xC7, &m, 0, mnem != "mov", false);
             self.sections[sec].data.extend_from_slice(&(v as i32).to_le_bytes());
             return Ok(());
@@ -739,6 +744,9 @@ impl Elf {
             }
             if let Some(m) = parse_mem(&dst) {
                 // `cmp $imm, mem`: 81 /7 id, or the sign-extended 83 /7 ib.
+                if !fits_i32(v) {
+                    return Err(format!("elf: `{mnem}` immediate {v} does not fit i32"));
+                }
                 if fits_i8(v) {
                     self.mem_op(sec, 0x83, &m, ext, true, false);
                     self.sections[sec].data.push(v as u8);
@@ -766,6 +774,9 @@ impl Elf {
             }
             // Width follows the destination: `add $1, %eax` must stay 32-bit
             // (`83 /0 ib`, no REX.W), like every other register form.
+            if !fits_i32(v) {
+                return Err(format!("elf: `{mnem}` immediate {v} does not fit i32"));
+            }
             if let Some(r) = rex_if_needed(!reg_is_32(&dst), ext, dreg) {
                 self.sections[sec].data.push(r);
             }
@@ -826,6 +837,23 @@ impl Elf {
             self.sections[sec].data.extend_from_slice(&(v as i32).to_le_bytes());
             return Ok(());
         }
+        if ops.len() == 2 && ops[0].starts_with('$') {
+            // `imul $imm, %reg`: the two-operand immediate form, which is the
+            // three-operand form with source and destination the same register.
+            // The immediate is sign-extended from 32 bits, so a value that does
+            // not fit i32 would silently multiply by a different number; refuse
+            // it so the caller materialises the constant in a register instead.
+            let v = parse_imm(&ops[0][1..])?;
+            if !fits_i32(v) {
+                return Err(format!("elf: imul immediate {v} does not fit in 32 bits"));
+            }
+            let (reg, _) = parse_reg(&ops[1])?;
+            self.sections[sec].data.push(rex(true, reg, reg));
+            self.sections[sec].data.push(0x69);
+            modrm_reg_reg(&mut self.sections[sec].data, reg, reg);
+            self.sections[sec].data.extend_from_slice(&(v as i32).to_le_bytes());
+            return Ok(());
+        }
         if ops.len() == 1 {
             // One-operand `imul %reg`: signed multiply of %rax by the operand,
             // result in %rdx:%rax. Used by the division magic multiply.
@@ -833,6 +861,25 @@ impl Elf {
             self.sections[sec].data.push(rex(true, 5, reg));
             self.sections[sec].data.push(0xF7);
             modrm_reg_reg(&mut self.sections[sec].data, 5, reg);
+            return Ok(());
+        }
+        if let Some(m) = parse_mem(&ops[0]) {
+            // `imul mem, %reg`: two-operand form with a memory source.
+            let (dreg, _) = parse_reg(&ops[1])?;
+            let before = self.sections[sec].data.len();
+            self.mem_op(sec, 0x0F, &m, dreg, true, false);
+            // `mem_op` writes the opcode byte, but `imul r/m64` is the two-byte
+            // `0F AF`; the second byte must follow the first, before the ModRM.
+            // REX.W is always set here, so the layout is `[REX] 0F <ModRM...>`
+            // and the splice point is right after the `0F`.
+            let data = &mut self.sections[sec].data;
+            data.insert(before + 2, 0xAF);
+            // The splice shifted everything after the opcode, so any fixup the
+            // memory operand registered (a RIP-relative disp32) moves by one.
+            for fx in self.fixups.iter_mut().filter(|f| f.sec == sec && f.next_off > before) {
+                fx.disp_off += 1;
+                fx.next_off += 1;
+            }
             return Ok(());
         }
         let (sreg, _) = parse_reg(&ops[0])?;
@@ -910,6 +957,10 @@ impl Elf {
             "setbe" => 0x96,
             "seta" => 0x97,
             "setae" => 0x93,
+            "seto" => 0x90,
+            "setno" => 0x91,
+            "sets" => 0x98,
+            "setns" => 0x99,
             _ => unreachable!(),
         };
         let (reg, _) = parse_reg(&ops[0])?;
@@ -1003,6 +1054,10 @@ fn parse_imm(s: &str) -> Result<i64, String> {
 
 fn fits_i8(v: i64) -> bool {
     (-128..=127).contains(&v)
+}
+
+fn fits_i32(v: i64) -> bool {
+    (i32::MIN as i64..=i32::MAX as i64).contains(&v)
 }
 
 /// Register number, plus whether it was named with a byte-width name.

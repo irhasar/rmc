@@ -701,9 +701,26 @@ pub fn for_program(user_asm: &str) -> String {
     out
 }
 
+/// The whole freestanding runtime as one assembly translation unit, `_start`
+/// included. This is what lets a *differential* test build the rustc reference
+/// against the very same runtime rmc links: compile the rustc output to an
+/// object and link it with this text and nothing else, and the two binaries
+/// share one ABI, one entry point and one syscall layer.
+pub fn support_asm() -> String {
+    PIECES.iter().map(|p| p.text).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn support_asm_is_the_whole_runtime() {
+        let s = support_asm();
+        assert!(s.contains("_start:"), "the reference links against this entry");
+        assert!(s.contains("print_i64:"), "the printers are exported");
+        assert!(s.contains("arg_i64:"), "so is the argv reader");
+    }
 
     #[test]
     fn idents_matches_whole_symbols_only() {

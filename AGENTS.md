@@ -25,11 +25,23 @@ cargo build --release --manifest-path compiler/Cargo.toml
 # inspect generated assembly
 ./compiler/target/release/rmc bench/programs/fib.rms --emit-asm
 
+# compile a real Rust file through the rustc-MIR front end + rmc back end
+./compiler/target/release/rmc bench/mir/fib.rs -o /tmp/fib-mir
+/tmp/fib-mir 32
+
+# the back end on its own: MIR text -> ELF (no rustc, no LLVM)
+./compiler/target/release/rmc bench/mir/fib.rs --keep-mir -o /tmp/fib-mir
+./compiler/target/release/examples/rmcmir bench/mir/fib.mir -o /tmp/fib-mir2
+
 # full benchmark suite (writes binaries to /tmp/rmcbench)
 python3 bench/run.py
 
+# three-pipeline suite: mir vs ast vs llvm (writes binaries to /tmp/rmcmirbench)
+python3 bench/run_mir.py
+
 # benchmark suite, also recording the dated result to the repo
 python3 bench/run.py --markdown bench/RESULTS.md
+python3 bench/run_mir.py --markdown bench/RESULTS-MIR.md
 
 # differential test suite: rmc vs rustc on twin programs
 python3 tests/run.py -v
@@ -55,10 +67,16 @@ python3 tools/fuzz.py --mode parampat --n 500 --seed 1
 python3 tools/fuzz.py --mode enumpat --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 
-# robustness / soundness: rmc must error cleanly, never crash
-python3 tools/fuzz.py --mode robust
-python3 tools/fuzz.py --mode reject
-python3 tools/fuzz.py --mode mutate --n 500 --seed 1
+# differential fuzzer over the rustc-MIR path (rustc --emit=mir -> rmc back end)
+python3 tools/fuzz.py --mode mir --n 500 --seed 1
+python3 tools/fuzz.py --mode mir --gen width --n 500 --seed 1
+
+# robustness / soundness: rmc must error cleanly, never crash (no rustc)
+python3 tools/fuzz.py --mode robust        # rmc's own .rms parser
+python3 tools/fuzz.py --mode reject        # programs rustc rejects
+python3 tools/fuzz.py --mode mutate --n 500 --seed 1     # random edits
+python3 tools/fuzz.py --mode mirrobust     # .rs programs the MIR path rejects
+python3 tools/fuzz.py --mode mirmut --n 500 --seed 1     # mutated .mir text
 ```
 
 ## Source map
@@ -245,9 +263,82 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
 - `compiler/src/main.rs` — CLI: reads source, calls the library, writes the ELF.
   Flags: `--emit-asm`, `--keep-asm`, `--binutils`, `--no-strip`, `--min-size`,
   `--overflow-checks`, `--bounds-checks`, `--no-inline`, `--no-licm`,
-  `--no-tco`.
+  `--no-tco`, `--keep-mir`.
+- `compiler/src/mir.rs` — parses the MIR text `rustc --emit=mir` prints into an
+  in-memory MIR, and holds the MIR-level optimiser passes. See "The rustc-MIR
+  front end" below. `mir.rs::parse` is the untrusted-input boundary: it rejects a
+  function with no basic block and a terminator whose target block the function
+  never declares, because the passes index `blocks[0]` and `blocks[target]`
+  directly (`mirmut` found both as panics; see the fuzzing section).
+- `compiler/src/mir_codegen.rs` — lowers that MIR to x86-64, sharing `elf.rs`
+  with the `.rms` path. It has its own peephole/register planner; see "MIR
+  codegen" below.
+- `compiler/examples/rmcmir.rs` — `rmcmir` CLI: a `.mir` text file to ELF, i.e.
+  the MIR back end with no rustc in the loop. The benchmark harness times it
+  separately from the front end. `rmc file.mir` is the same path through the
+  main binary (via `main.rs::run_mir_text`), which is what the `mirmut` fuzzer
+  drives.
 - `compiler/tests/compile.rs` — unit tests for the front end and codegen; these
   run without `as`/`ld`.
+
+## The rustc-MIR front end
+
+A `.rs` input takes the second pipeline: `main.rs::run_mir_pipeline` runs
+`rustc --emit=mir -O -C panic=abort --crate-type=bin --edition 2021`,
+`mir.rs::parse` reads the MIR text, the MIR-level passes run, and
+`mir_codegen.rs` emits x86-64 that goes through the same `elf.rs`
+assembler/linker and `runtime.rs` as the `.rms` path. LLVM never runs. A `.mir`
+input skips the front end and enters `main.rs::run_mir_text` directly, which is
+the same back-end sequence; `rmcmir` (`examples/rmcmir.rs`) is the older
+standalone CLI for the same thing, and the benchmark times the two stages apart.
+
+- The MIR text format is rustc's *internal* dump, not a stable interface. It
+  changes between rustc releases; `mir.rs::parse` is written against the shape
+  `rustc 1.99.1` prints and will need revisiting on an upgrade. Keep the parse
+  errors specific so a format change fails loudly rather than miscompiling.
+- `rustc -O` leaves the safety checks in the MIR even when they are provably
+  dead: `_6 = Eq(_5, 0)` then `assert(!move _6)` for a div-by-zero, and an
+  `assert(!(_7 & _8))` for the `i64::MIN / -1` overflow. They cost a compare and
+  a branch on every iteration of a `%` loop, which is where the `mix` gap came
+  from. `mir.rs::drop_redundant_asserts` removes them.
+- That pass is a **must**-analysis, and it must stay one. At a join it takes the
+  *intersection* of what each predecessor proves, never the union - a union
+  would claim a local is non-zero when one path could reach the assert with it
+  zero, and the trap would be dropped from a program that needs it. Each field
+  only ever loses entries at a join, which is what makes the fixed point
+  terminate.
+- The div-by-zero check's condition is a `bool` local defined by a statement *in
+  the assert's own block*, so the fact has to be computed from the state after
+  the block's statements, not the block's entry state. Checking the entry state
+  finds nothing.
+- `copy` aliasing is needed to see the guard's fact at the divisor: the loop test
+  proves `_2 != 0`, but the divisor is a later `copy` of `_2`. The pass follows
+  those copies (`AssertFacts::alias`) within a block only.
+- Dropping the assert leaves the `Eq` that fed it dead. `drop_dead_pure_assignments`
+  removes it, but only for the comparison rvalues and only when nothing reads the
+  destination - a wider "drop any unread assignment" pass removed an assignment
+  whose operand the backend still needed and broke `heap`. Do not widen it
+  without a differential run.
+- Local `_0` is the return value; `return` reads it without naming it, so
+  `use_counts` does not see that read. Any "unread local" test must special-case
+  `_0` or it will delete a function's result.
+- A trap block is emitted inline in the fall-through position, so the common path
+  takes a taken branch over it. `mix`'s `%` loop pays that branch once per
+  iteration; it is not free.
+- **An x86 ALU immediate is only i32 wide.** `add $imm, %rax` sign-extends its
+  i32 field, so a 64-bit MIR constant used as an operand, a `switchInt`
+  discriminant, or a frame store must be materialised in a register first.
+  `mir_codegen.rs::wide_imm` does that at every ALU site and `store_scalar` routes
+  a wide immediate through `%rcx`; the assembler (`elf.rs`) now *rejects* an
+  out-of-range immediate rather than silently truncating it, so a missed site
+  fails loudly instead of miscompiling. `tests/mir/wideimm.rs` pins the paths.
+- **Evaluating a shift count can call, and a call clobbers every scratch
+  register.** The value being shifted is parked in a frame slot across the count
+  evaluation, not in `%rdx` (the MIR back end has no spill of caller-saved
+  registers around an arbitrary call).
+- `main.rs::run_mir_pipeline` honours `--no-inline`/`--no-licm`/`--no-tco`, the
+  same gates the `.rms` path uses, so the fuzzer's per-pass matrix applies to
+  both pipelines.
 
 ## Things that are easy to get wrong
 
@@ -972,6 +1063,17 @@ random splices, deletions and duplications to the generators' programs and the
 signal, no panic). It needs no rustc, so it runs anywhere, and it reaches error
 paths the hand-written corpora miss.
 
+`tests/mir/run.py` is the differential suite for the rustc-MIR path. Each
+`tests/mir/NAME.rs` is a freestanding `#![no_std]` program that includes
+`prelude.rs` and calls the runtime's `print_i64`/`print_bool`. The case is built
+twice: a reference from `rustc --emit=obj` linked against the *same* runtime
+(`rmc --emit-runtime-asm`) with `cc -static -nostdlib`, and rmc's own
+`rustc --emit=mir` + back-end build. Both binaries share one runtime and one
+entry point, so the only variable is the code generator; they must print
+identical stdout and exit with the same status. `ARGS` maps a case to its argv
+vectors. This is the suite that actually exercises `mir_codegen.rs`; `tests/run.py`
+covers the `.rms` path and never reaches it.
+
 `tests/run.py` compiles each `tests/cases/NAME.{rms,rs}` pair with both compilers
 and diffs stdout and the exit status. Every case is then recompiled with the
 optimiser passes disabled in turn (`--no-inline`, `--no-licm`, `--no-tco`, and
@@ -1394,6 +1496,47 @@ array of a unit enum. `stmt` mode now emits all three, so a regression in any of
 them fails the fuzz job at `iter=0`. `expr` mode emits `str::len` and array
 `.len()`. When adding a language feature, extend the
 generator to exercise it — a clean fuzz run only covers the shapes it emits.
+
+`mir` mode (`tools/fuzz.py --mode mir`) fuzzes the *other* pipeline: it builds a
+freestanding `#![no_std]` program (the `MIR_PRELUDE` plus the `expr` grammar's
+expressions), compiles it with `rustc --emit=obj` and links the object against
+the *same* freestanding runtime rmc uses (`rmc --emit-runtime-asm`), then
+compiles the same source through `rmc <src.rs>` (the rustc-MIR front end) and
+compares stdout and exit status. Because both binaries share one runtime and one
+entry point, the only variable is the code generator. It recompiles the rmc side
+with each MIR-level pass off in turn (`--no-inline`, `--no-licm`, `--no-tco`),
+which now also gates the MIR pipeline in `main.rs::run_mir_pipeline` — without
+that wiring the flags were silently ignored for a `.rs` input. The `.rms` modes
+never reach `mir_codegen.rs`; this is the only randomised coverage of the MIR
+back end. `--gen <mode>` reuses one of the `.rms` generators instead (only its
+`.rs` half is freestanding enough to link). It immediately found two real MIR
+codegen bugs: a shift whose count is computed by a call clobbered the value
+parked in `%rdx` (now parked in a frame slot), and a 64-bit constant used as an
+ALU immediate or a frame store was silently truncated to i32 (now materialised
+in a register; the assembler rejects an out-of-range immediate loudly instead of
+truncating). Both are pinned by `tests/mir/wideimm.rs`.
+
+`--gen width` (with `--mode mir`) is a differential generator that mixes every
+integer width (`u8`..`i64`, `usize`/`isize`) with `wrapping_add`/`sub`/`mul` and
+a cast back down. Every width shares one 64-bit word in the back end, so a wrong
+sign/zero extension or a missing wrap is the miscompile it hunts; none found.
+
+`mirrobust` mode (`tools/fuzz.py --mode mirrobust`) is `robust` for the MIR path:
+a fixed corpus of `.rs` programs (formatting, the containers, closures, floats,
+traits, generics, plus rustc-rejected and malformed input) that must each end in
+a diagnostic, never a panic or a signal. This is the failure a user hits first on
+this path — an unsupported MIR shape — so the corpus keeps it a message.
+
+`mirmut` mode (`tools/fuzz.py --mode mirmut`) mutates real `rustc --emit=mir`
+text and lowers it through the `.mir` input path (`rmc file.mir`). This is the
+only mode that reaches the back end's internal invariants with structurally
+broken input: the `.rs` modes cannot, because rustc rejects malformed source
+before it emits MIR. Every result must be a clean exit 0 or 1. It found two real
+panics on the first run — a function declaring no basic block (`facts_in[0]`
+indexed an empty vector) and a terminator targeting a block the function never
+declares (`merge_blocks` indexes `blocks[target]`) — both now rejected in
+`mir.rs::parse` and pinned by tests. It needs no rustc. When you add a MIR shape
+the passes assume, add a seed or a `MIR_TOKENS` fragment that violates it.
 
 `--mode mutate` is the counterpart to the differential modes: it needs no rustc
 reference at all. It seeds from the generators' programs and the `robust` corpus,

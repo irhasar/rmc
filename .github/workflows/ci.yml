@@ -25,6 +25,13 @@ jobs:
       - name: Differential tests
         run: python3 tests/run.py
 
+      # Differential suite for the rustc-MIR path: rustc --emit=obj linked
+      # against rmc's own runtime versus rmc's `rustc --emit=mir` + MIR back end.
+      # Needs cc for the reference link. This is the suite that exercises
+      # mir_codegen.rs; tests/run.py never reaches it.
+      - name: Differential tests (MIR path)
+        run: python3 tests/mir/run.py
+
   fuzz:
     runs-on: ubuntu-latest
     steps:
@@ -66,3 +73,34 @@ jobs:
           python3 tools/fuzz.py --mode stmt --n 400 --seed 1
           python3 tools/fuzz.py --mode stmt --n 400 --seed 2
           python3 tools/fuzz.py --mode shift --n 400 --seed 1
+
+      # The MIR path has its own code generator; fuzz it too. `mir` mode needs
+      # cc to link the reference object against rmc's runtime.
+      - name: Differential fuzz (MIR path)
+        run: |
+          python3 tools/fuzz.py --mode mir --n 200 --seed 1
+          python3 tools/fuzz.py --mode mir --n 200 --seed 2
+
+      # Every integer narrower than 64 bits shares one word in the back end;
+      # `width` mode is the differential that would catch a wrong sign/zero
+      # extension or a missing wrap at a narrow width.
+      - name: Differential fuzz (MIR integer widths)
+        run: |
+          python3 tools/fuzz.py --mode mir --gen width --n 150 --seed 1
+          python3 tools/fuzz.py --mode mir --gen width --n 150 --seed 2
+
+      # The MIR path rejects the standard library's formatting and container
+      # machinery. A rejected program must be a diagnostic, not a panic: the
+      # failure a user hits first on this path is an unsupported MIR shape.
+      - name: MIR robustness (unsupported input must not crash)
+        run: python3 tools/fuzz.py --mode mirrobust
+
+      # Mutate real `rustc --emit=mir` text and lower it directly. rustc rejects
+      # malformed source before it emits MIR, so this is the only mode that
+      # reaches the back end's internal invariants with structurally broken
+      # input - where a dangling jump target or a blockless function used to
+      # panic. Needs no rustc.
+      - name: MIR text mutation (back end invariants)
+        run: |
+          python3 tools/fuzz.py --mode mirmut --n 400 --seed 1
+          python3 tools/fuzz.py --mode mirmut --n 400 --seed 2

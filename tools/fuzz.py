@@ -2379,6 +2379,204 @@ def run_robust():
     return 1 if failures else 0
 
 
+# ---------------------------------------------------- MIR-path robust mode
+
+def mir_robust_corpus():
+    """`.rs` programs the rustc-MIR back end may not support. Each must produce
+    a clean error (exit 1) with no panic and no signal. The back end parses
+    rustc's MIR text, so the failure mode a user hits first is not a syntax
+    error in their own source but a MIR shape the parser does not model; this
+    corpus is weighted toward the Rust constructs that produce those shapes
+    (formatting, the standard-library containers, closures, floating point,
+    traits) plus malformed programs that must fail at the rustc front end."""
+    return {
+        # --- ordinary programs whose MIR the back end does not model ---
+        "fmt_display": 'fn main() { let n = 42; println!("n = {}", n); }\n',
+        "fmt_debug": 'fn main() { let t = (1, 2); println!("{:?}", t); }\n',
+        "fmt_hex": 'fn main() { println!("{:#x}", 255); }\n',
+        "fmt_width": 'fn main() { println!("{:>5}", 1); }\n',
+        "fmt_named": 'fn main() { println!("{n}", n = 3); }\n',
+        "print_macro": 'fn main() { print!("no newline"); }\n',
+        "eprintln_macro": 'fn main() { eprintln!("to stderr"); }\n',
+        "format_macro": 'fn main() { let s = format!("{}-{}", 1, 2); println!("{}", s); }\n',
+        "vec_push": "fn main() { let mut v = Vec::new(); v.push(1); }\n",
+        "vec_macro": "fn main() { let v = vec![1, 2, 3]; let _ = v[0]; }\n",
+        "string_new": "fn main() { let s = String::new(); }\n",
+        "box_new": "fn main() { let b = Box::new(5); }\n",
+        "hashmap": "use std::collections::HashMap;\nfn main() { let mut m = HashMap::new(); m.insert(1, 2); }\n",
+        "closure": "fn main() { let f = |x: i64| x + 1; let _ = f(2); }\n",
+        "closure_capture": "fn main() { let n = 3; let f = |x: i64| x + n; let _ = f(2); }\n",
+        "float": "fn main() { let x = 1.5; let _ = x * 2.0; }\n",
+        "float_fmt": 'fn main() { println!("{:.2}", 3.14159); }\n',
+        "i128": "fn main() { let a: i128 = 1; let _ = a; }\n",
+        "trait_method": "trait S { fn a(&self) -> i64; }\nstruct Q;\nimpl S for Q { fn a(&self) -> i64 { 3 } }\nfn main() { let _ = Q.a(); }\n",
+        "generic_fn": "fn id<T>(x: T) -> T { x }\nfn main() { let _ = id(5); }\n",
+        "dyn_trait": "trait S { fn a(&self) -> i64; }\nfn f(s: &dyn S) -> i64 { s.a() }\nstruct Q;\nimpl S for Q { fn a(&self) -> i64 { 1 } }\nfn main() { let _ = f(&Q); }\n",
+        "iterator_chain": "fn main() { let s: i64 = (1..10).filter(|x| x % 2 == 0).sum(); let _ = s; }\n",
+        "slice_len": 'fn main() { let s = "abc"; let _ = s.len(); }\n',
+        "option_debug": "fn main() { let o: Option<i64> = Some(5); println!(\"{:?}\", o); }\n",
+        "panic_macro": 'fn main() { panic!("boom"); }\n',
+        "assert_macro": "fn main() { assert!(1 == 2); }\n",
+        "derive_debug": '#[derive(Debug)]\nstruct P { x: i64 }\nfn main() { println!("{:?}", P { x: 1 }); }\n',
+        "string_index": 'fn main() { let s = "hello"; let _ = &s[1..3]; }\n',
+        "char_type": "fn main() { let c = 'x'; println!(\"{}\", c); }\n",
+        # --- programs rustc itself rejects: must fail, cleanly ---
+        "rustc_reject_type": "fn main() { let x: i64 = \"str\"; }\n",
+        "rustc_reject_move": "fn main() { let s = String::from(\"a\"); let t = s; let u = s; }\n",
+        "rustc_reject_undef": "fn main() { undefined_function(); }\n",
+        "rustc_reject_main_sig": "fn main() -> i64 { 0 }\n",
+        "rustc_reject_no_main": "fn f() -> i64 { 0 }\n",
+        "rustc_reject_syntax": "fn main( { }\n",
+        "rustc_reject_empty": "",
+        "rustc_reject_lone": "fn",
+        # --- malformed that must not crash the MIR parser either ---
+        "truncated_fn": "fn main() {\n",
+        "stray_brace": "}\n",
+        "binary_garbage": "\x00\x01\x02\x03",
+        "deep_nest": "fn main() { let x = " + "(" * 2000 + "1" + ")" * 2000 + "; }\n",
+        "huge_literal": "fn main() { let x: i64 = " + "9" * 3000 + "; }\n",
+    }
+
+
+def run_mir_robust():
+    """Compile each `.rs` corpus entry through the MIR path and require a clean
+    failure: exit 1, no signal, no panic, no stack overflow. A program that
+    compiles is fine too (exit 0), as long as it does not crash. Unlike
+    `robust`, which is about rmc's own parser, this exercises the MIR parser and
+    back end, where a rejected construct must still be a diagnostic."""
+    tmp = f"/tmp/rmc-fuzz-mirrobust-{os.getpid()}"
+    os.makedirs(tmp, exist_ok=True)
+    failures = 0
+    compiled = 0
+    for name, src in mir_robust_corpus().items():
+        path = f"{tmp}/{name}.rs"
+        with open(path, "w") as f:
+            f.write(src)
+        p = run([RMC, path, "-o", f"{tmp}/{name}.bin"])
+        crashed = (p.returncode < 0 or b"panicked" in p.stderr
+                   or b"overflowed its stack" in p.stderr)
+        if crashed:
+            print(f"[mirrobust] {name}: CRASH (exit {p.returncode}) "
+                  f"{p.stderr.decode(errors='replace')[:200]}")
+            failures += 1
+        elif p.returncode not in (0, 1):
+            print(f"[mirrobust] {name}: unexpected exit {p.returncode}")
+            failures += 1
+        elif p.returncode == 0:
+            compiled += 1
+    if failures == 0:
+        n = len(mir_robust_corpus())
+        print(f"mirrobust: all {n} inputs handled cleanly ({compiled} compiled, "
+              f"{n - compiled} rejected with a diagnostic)")
+    return 1 if failures else 0
+
+
+# ------------------------------------------------------ MIR text mutate mode
+
+def mirmut_seeds():
+    """Real `rustc --emit=mir` text for programs the back end *does* compile.
+    These are the seeds the mutator perturbs: valid MIR is the only input that
+    reaches the back end's internal invariants, which is exactly where an
+    `unreachable!` would turn a malformed input into a panic."""
+    seeds = {
+        "add": "fn main() -> i64 {\n    let mut _0: i64;\n\n    bb0: {\n        _0 = const 7_i64;\n        return;\n    }\n}\n",
+        "arith": "fn main() -> i64 {\n    let mut _0: i64;\n    let mut _1: i64;\n    let mut _2: i64;\n\n    bb0: {\n        _1 = const 3_i64;\n        _2 = const 4_i64;\n        _0 = Add(move _1, move _2);\n        return;\n    }\n}\n",
+        "cmp": "fn main() -> i64 {\n    let mut _0: i64;\n    let mut _1: bool;\n\n    bb0: {\n        _1 = const 1_i64 < const 2_i64;\n        _0 = const 0_i64;\n        return;\n    }\n}\n",
+        "call": "fn add(a: i64, b: i64) -> i64 {\n    let mut _0: i64;\n\n    bb0: {\n        _0 = Add(move a, move b);\n        return;\n    }\n}\n\nfn main() -> i64 {\n    let mut _0: i64;\n    let mut _1: i64;\n\n    bb0: {\n        _1 = const 2_i64;\n        _0 = add(const 1_i64, move _1) -> [return: bb1, unwind unreachable];\n    }\n\n    bb1: {\n        return;\n    }\n}\n",
+        "if": "fn main() -> i64 {\n    let mut _0: i64;\n    let mut _1: bool;\n\n    bb0: {\n        _1 = const 1_i64 < const 2_i64;\n        switchInt(move _1) -> [0: bb2, otherwise: bb1];\n    }\n\n    bb1: {\n        _0 = const 10_i64;\n        goto -> bb3;\n    }\n\n    bb2: {\n        _0 = const 20_i64;\n        goto -> bb3;\n    }\n\n    bb3: {\n        return;\n    }\n}\n",
+        "loop": "fn main() -> i64 {\n    let mut _0: i64;\n    let mut _1: i64;\n    let mut _2: bool;\n\n    bb0: {\n        _1 = const 0_i64;\n        goto -> bb1;\n    }\n\n    bb1: {\n        _2 = Lt(copy _1, const 10_i64);\n        switchInt(move _2) -> [0: bb3, otherwise: bb2];\n    }\n\n    bb2: {\n        _1 = Add(move _1, const 1_i64);\n        goto -> bb1;\n    }\n\n    bb3: {\n        _0 = move _1;\n        return;\n    }\n}\n",
+        "div": "fn main() -> i64 {\n    let mut _0: i64;\n    let mut _1: i64;\n    let mut _2: i64;\n\n    bb0: {\n        _1 = const 20_i64;\n        _2 = const 3_i64;\n        _0 = Div(move _1, move _2);\n        return;\n    }\n}\n",
+        "ref": "fn main() -> i64 {\n    let mut _0: i64;\n    let mut _1: i64;\n    let mut _2: &i64;\n\n    bb0: {\n        _1 = const 5_i64;\n        _2 = &_1;\n        _0 = (*_2);\n        return;\n    }\n}\n",
+        "struct": "struct P {\n    x: i64,\n    y: i64,\n}\n\nfn main() -> i64 {\n    let mut _0: i64;\n    let mut _1: P;\n\n    bb0: {\n        _1 = P { x: const 1_i64, y: const 2_i64 };\n        _0 = (_1.0);\n        return;\n    }\n}\n",
+        "shift": "fn main() -> i64 {\n    let mut _0: i64;\n    let mut _1: i64;\n\n    bb0: {\n        _1 = const 1_i64;\n        _0 = Shl(move _1, const 4_i32);\n        return;\n    }\n}\n",
+        "unit": "fn main() {\n    let mut _0: ();\n\n    bb0: {\n        _0 = const ();\n        return;\n    }\n}\n",
+    }
+    return seeds
+
+
+# Fragments the mutator splices in. Each is a plausible-looking MIR token that
+# is either semantically impossible (a bad jump target, a type mismatch) or
+# simply absent from the seeds (an operator or cast the parser must handle).
+MIR_TOKENS = [
+    "goto -> bb99;", "goto -> bb0;", "switchInt(move _1) -> [0: bb9, otherwise: bb8];",
+    "_0 = Div(move _1, const 0_i64);", "_0 = Rem(move _1, const 0_i64);",
+    "_0 = Add(move _0, move _0);", "_0 = Neg(move _1);", "_0 = Not(move _1);",
+    "_0 = Shl(move _1, const 200_i32);", "_0 = Shr(move _1, const 200_i32);",
+    "_0 = (_1.99);", "_0 = (*_2);", "_0 = Len((*_3));", "_0 = Discriminant(_1);",
+    "_0 = copy _1 as u8;", "_0 = move _1 as i128;", "_0 = &raw const _1;",
+    "drop(_1) -> [return: bb1, unwind unreachable];",
+    "assert(!move _1, \"overflow\") -> [success: bb1, unwind unreachable];",
+    "_0 = const 99999999999999999999999999_i64;", "_0 = const 1.5_f64;",
+    "_0 = const \"unterminated;", "unreachable;", "return;", "StorageLive(_0);",
+    "StorageDead(_0);", "_0 = Rvalue::Unsupported;", "_0 = PtrMetadata(move _1);",
+    "bb4: {", "}", "    ", "_0 = Add(move _1, const 1_i64) -> [return: bb9, unwind unreachable];",
+]
+
+
+def mutate_mir(rng, text):
+    """One random structural edit of a MIR program. Returns the mutated text."""
+    lines = text.split("\n")
+    kind = rng.randrange(5)
+    if kind == 0 and lines:  # delete a line
+        del lines[rng.randrange(len(lines))]
+    elif kind == 1:  # splice a token as a new statement line
+        at = rng.randrange(len(lines) + 1)
+        lines.insert(at, MIR_TOKENS[rng.randrange(len(MIR_TOKENS))])
+    elif kind == 2 and lines:  # duplicate a line
+        i = rng.randrange(len(lines))
+        lines.insert(i, lines[i])
+    elif kind == 3 and lines:  # truncate the program
+        lines = lines[: rng.randrange(1, len(lines) + 1)]
+    else:  # append a token to a random line
+        if lines:
+            i = rng.randrange(len(lines))
+            tok = MIR_TOKENS[rng.randrange(len(MIR_TOKENS))]
+            lines[i] = lines[i] + " " + tok
+    return "\n".join(lines)
+
+
+def run_mirmut(args):
+    """Mutate real `rustc --emit=mir` text and feed it to the `.mir` input path.
+    Every result must be a clean exit 0 (compiled) or exit 1 (diagnostic): a
+    panic, a signal, or any other status is a bug. This is the mode that
+    reaches the back end's internal invariants, which the `.rs` modes cannot
+    because rustc rejects malformed source before it ever emits MIR."""
+    tmp = f"/tmp/rmc-fuzz-mirmut-{os.getpid()}"
+    os.makedirs(tmp, exist_ok=True)
+    rng = random.Random(args.seed)
+    seeds = list(mirmut_seeds().items())
+    failures = 0
+    compiled = 0
+    for i in range(args.n):
+        name, base = seeds[rng.randrange(len(seeds))]
+        text = base
+        for _ in range(rng.randint(1, 3)):
+            text = mutate_mir(rng, text)
+        path = f"{tmp}/m{i}.mir"
+        with open(path, "w") as f:
+            f.write(text)
+        p = run([RMC, path, "-o", f"{tmp}/m{i}.bin"])
+        crashed = (p.returncode < 0 or b"panicked" in p.stderr
+                   or b"overflowed its stack" in p.stderr)
+        if crashed:
+            keep = f"{args.keep or tmp}/crash-{i}-{name}.mir"
+            os.makedirs(os.path.dirname(keep) or ".", exist_ok=True)
+            with open(keep, "w") as f:
+                f.write(text)
+            print(f"[mirmut] seed={name} #{i}: CRASH (exit {p.returncode}) "
+                  f"kept {keep}\n{p.stderr.decode(errors='replace')[:300]}")
+            failures += 1
+        elif p.returncode not in (0, 1):
+            print(f"[mirmut] seed={name} #{i}: unexpected exit {p.returncode}")
+            failures += 1
+        elif p.returncode == 0:
+            compiled += 1
+    if failures == 0:
+        print(f"mirmut: all {args.n} mutated MIR inputs handled cleanly "
+              f"({compiled} compiled, {args.n - compiled} rejected)")
+    return 1 if failures else 0
+
+
 # -------------------------------------------------------------- reject mode
 
 def reject_corpus():
@@ -2937,6 +3135,222 @@ def run_reject():
     return 1 if failures else 0
 
 
+# ---------------------------------------------------------------- MIR mode
+
+# The prelude each generated freestanding program includes. It mirrors
+# `tests/mir/prelude.rs`: the same source builds both against rustc and through
+# rmc's MIR path, linked against the same runtime.
+MIR_PRELUDE = """#![no_std]
+#![no_main]
+extern "C" {
+    fn print_i64(x: i64);
+    fn print_bool(b: i64);
+    fn arg_i64(i: i64) -> i64;
+    fn alloc(n: i64) -> i64;
+    fn free(p: i64);
+}
+#[inline(always)]
+fn out(x: i64) { unsafe { print_i64(x) } }
+#[inline(always)]
+fn outb(b: bool) { unsafe { print_bool(b as i64) } }
+#[inline(always)]
+fn arg(i: i64) -> i64 { unsafe { arg_i64(i) } }
+#[inline(always)]
+fn alc(n: i64) -> i64 { unsafe { alloc(n) } }
+#[inline(always)]
+fn rel(p: i64) { unsafe { free(p) } }
+#[panic_handler]
+fn panic(_i: &core::panic::PanicInfo) -> ! { unsafe { extern "C" { fn exit(c: i64) -> !; } exit(101) } }
+"""
+
+
+def gen_mir_program(rng):
+    """A freestanding program for the MIR path.
+
+    It reuses the `.rms` expression grammar but prints through the runtime's
+    `print_i64`/`print_bool` and returns from `main`, so rustc's reference (an
+    object linked against the same runtime) and rmc produce identical output.
+    """
+    a, b, c = (rng.randint(-1000, 1000) for _ in range(3))
+    exprs = []
+    for _ in range(rng.randint(2, 6)):
+        r = rng.random()
+        if r < 0.45:
+            exprs.append(gen_expr(rng, 0))
+        elif r < 0.7:
+            exprs.append(gen_guarded_div(rng, 0))
+        else:
+            exprs.append(gen_cmp(rng, 0))
+    lines = [
+        f"fn h(x: i64) -> i64 {{ (x * 3 + 1) % 97 - 48 }}",
+        "#[no_mangle]",
+        'pub extern "C" fn main() -> i64 {',
+        f"    let a: i64 = {a};",
+        f"    let b: i64 = {b};",
+        f"    let c: i64 = {c};",
+        "    let mut acc: i64 = 0;",
+    ]
+    for e in exprs:
+        lines.append(f"    out({e});")
+        lines.append(f"    acc = acc.wrapping_add({e});")
+    lines += [
+        "    let mut i: i64 = 0;",
+        "    while i < 8 {",
+        "        acc = acc.wrapping_add(i * 3 - 7);",
+        "        i += 1;",
+        "    }",
+        "    out(acc);",
+        "    outb(acc > 0);",
+        "    0",
+        "}",
+    ]
+    return MIR_PRELUDE + "\n".join(lines) + "\n"
+
+
+# Integer types narrower than 64 bits all live in one 64-bit word in the back
+# end; the width only matters to the operation. That is the assumption most
+# likely to hide a miscompile, so the generator below exercises every width
+# with a value that distinguishes a correct sign/zero extension from a wrong
+# one, and with a `wrapping_*` result that a plain 64-bit op would get wrong.
+_MIR_INT_TYPES = ["u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "usize", "isize"]
+
+
+def _mir_width_value(rng, ty):
+    """A value that is distinctive at `ty`'s width, as a Rust literal."""
+    bits = {"u8": 8, "i8": 8, "u16": 16, "i16": 16, "u32": 32, "i32": 32,
+            "u64": 64, "i64": 64, "usize": 64, "isize": 64}[ty]
+    if ty.startswith("u"):
+        return str(rng.randrange(1 << bits)) if bits < 64 else str(rng.randrange(1 << 63, 1 << 64))
+    lo, hi = -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+    return str(rng.randint(lo, hi))
+
+
+def gen_mir_width_program(rng):
+    """A freestanding program that mixes integer widths.
+
+    Every value is printed after a `as i64` cast, so a wrong extension (a
+    sign-extension of an unsigned value, or a truncation of a wider one) shows
+    up as a printed mismatch against the rustc reference. It also computes
+    `wrapping_add`/`wrapping_sub`/`wrapping_mul` at the narrow width, where the
+    result is `(a op b) mod 2^width` interpreted at that width — a 64-bit
+    operation would not wrap and would diverge."""
+    lines = [
+        "fn h(x: i64) -> i64 { (x * 7 + 3) % 101 - 50 }",
+        "#[no_mangle]",
+        'pub extern "C" fn main() -> i64 {',
+    ]
+    for _ in range(rng.randint(3, 6)):
+        ty = rng.choice(_MIR_INT_TYPES)
+        a = _mir_width_value(rng, ty)
+        b = _mir_width_value(rng, ty)
+        lines.append(f"    let a: {ty} = {a};")
+        lines.append(f"    let b: {ty} = {b};")
+        lines.append(f"    out(a as i64);")
+        lines.append(f"    out(b as i64);")
+        lines.append(f"    out(a.wrapping_add(b) as i64);")
+        lines.append(f"    out(a.wrapping_sub(b) as i64);")
+        lines.append(f"    out(a.wrapping_mul(b) as i64);")
+        # A comparison and a cast back down, to exercise both directions.
+        lines.append(f"    out((a > b) as i64);")
+        lines.append(f"    let c: {ty} = {_mir_width_value(rng, ty)};")
+        lines.append(f"    out((c as i64).wrapping_add(a as i64) as {ty} as i64);")
+    lines += ["    0", "}"]
+    return MIR_PRELUDE + "\n".join(lines) + "\n"
+
+
+def mir_runtime(tmp):
+    """The freestanding runtime as assembly, written once per temp dir. The
+    rustc reference is linked against the *same* runtime rmc uses, so the only
+    variable between the two binaries is the code generator."""
+    rt = f"{tmp}/runtime.s"
+    if not os.path.exists(rt):
+        p = run([RMC, "--emit-runtime-asm"])
+        if p.returncode != 0:
+            return None, f"rmc --emit-runtime-asm failed:\n{p.stderr.decode(errors='replace')}"
+        open(rt, "wb").write(p.stdout)
+    return rt, None
+
+
+def mir_build_reference(rs, obj, ref, rt):
+    """`rustc --emit=obj` -> static link against the shared runtime."""
+    c = run([RUSTC, "-O", "-C", "opt-level=3", "-C", "panic=abort",
+             "--crate-type=bin", "--edition", "2021",
+             "-C", "relocation-model=static", "--emit=obj", rs, "-o", obj])
+    if c.returncode != 0:
+        return f"rustc reference failed:\n{c.stderr.decode(errors='replace')}"
+    c = run(["cc", "-static", "-nostdlib", "-no-pie", obj, rt, "-o", ref])
+    if c.returncode != 0:
+        return f"cc link failed:\n{c.stderr.decode(errors='replace')}"
+    return None
+
+
+def run_mir(args):
+    """Fuzz the rustc-MIR front end + rmc back end against a rustc reference
+    linked against the same freestanding runtime. The `.rms` modes above never
+    reach this path; this one does."""
+    tmp = f"/tmp/rmc-fuzz-mir-{os.getpid()}"
+    os.makedirs(tmp, exist_ok=True)
+    rt, err = mir_runtime(tmp)
+    if err:
+        print(err, file=sys.stderr)
+        return 2
+    gen_name = args.gen or "mir"
+    gen = {"mir": gen_mir_program,
+           "expr": gen_expr_program, "stmt": gen_stmt_program,
+           "opt": gen_opt_program, "arith": gen_arith_program,
+           "nest": gen_nest_program, "pat": gen_pat_program,
+           "order": gen_order_program, "shift": gen_shift_program,
+           "cast": gen_cast_program, "assoc": gen_assoc_program,
+           "ref": gen_ref_program, "update": gen_update_program,
+           "letdestr": gen_letdestr_program, "fordestr": gen_fordestr_program,
+           "nestpat": gen_nestpat_program, "arrpat": gen_arrpat_program,
+           "parampat": gen_parampat_program,
+           "width": gen_mir_width_program}[gen_name]
+    rng = random.Random(args.seed)
+    flags = ["--no-inline", "--no-licm", "--no-tco"]
+    failures = 0
+    built = 0
+    for t in range(args.n):
+        if gen_name in ("mir", "width"):
+            rs = gen(rng)
+        else:
+            # The `.rms` generators produce a std program; only its `.rs` half
+            # is freestanding enough to link against the runtime.
+            _, rs = gen(rng)
+        open(f"{tmp}/p.rs", "w").write(rs)
+        argv = []
+        if args.mode == "shift":
+            argv = [str(rng.choice([rng.randint(-4, 4), rng.randint(60, 68),
+                                    rng.randint(0, 63), -1, 64, 63, 0])),
+                    str(rng.randint(-1000, 1000))]
+        ref = f"{tmp}/p.ref"
+        err = mir_build_reference(f"{tmp}/p.rs", f"{tmp}/p.ref.o", ref, rt)
+        if err:
+            # The generator can emit a program the freestanding reference
+            # cannot build (it targets `std`); skip it rather than fail.
+            continue
+        expected = run([ref] + argv)
+        built += 1
+        bad = None
+        for label, extra in [("", [])] + [(f, [f]) for f in flags]:
+            c = run([RMC] + extra + [f"{tmp}/p.rs", "-o", f"{tmp}/p.bin"])
+            if c.returncode != 0:
+                bad = f"rmc{extra} failed to compile:\n{c.stderr.decode(errors='replace')}"
+                break
+            got = run([f"{tmp}/p.bin"] + argv)
+            if (got.returncode, got.stdout) != (expected.returncode, expected.stdout):
+                bad = (f"rmc{extra} argv={argv} exit={got.returncode} stdout={got.stdout!r}\n"
+                       f"  rustc    exit={expected.returncode} stdout={expected.stdout!r}")
+                break
+        if bad:
+            print(f"[mir {args.mode} seed={args.seed} iter={t}] DIVERGENCE\n{rs}\n  {bad}")
+            if args.keep:
+                os.makedirs(args.keep, exist_ok=True)
+                open(f"{args.keep}/fuzz-mir-{args.mode}-{args.seed}-{t}.rs", "w").write(rs)
+            failures += 1
+            break
+    if failures == 0:
+        print(f"{built} {args.mode} programs (of {args.n}) through the MIR path, seed {args.seed}: all match rustc")
 # -------------------------------------------------------------- mutate mode
 
 # Tokens a mutation may splice in. A mix of valid fragments, delimiters that
@@ -3018,10 +3432,12 @@ def run_mutate(n, seed, keep=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "robust", "reject", "mutate"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "robust", "mirrobust", "mirmut", "reject", "mutate", "mir"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
+    ap.add_argument("--gen", default=None,
+                    help="with --mode mir, which generator to run (default: expr)")
     ap.add_argument("--bounds", action="store_true",
                     help="also compile with --bounds-checks, to exercise the trap codegen")
     ap.add_argument("--encoding", action="store_true",
@@ -3038,6 +3454,18 @@ def main():
         return 2
     if args.mode == "robust":
         return run_robust()
+    if args.mode == "mirrobust":
+        if not rustc_available():
+            print("rustc not found; set RUSTC or install a toolchain", file=sys.stderr)
+            return 2
+        return run_mir_robust()
+    if args.mode == "mirmut":
+        return run_mirmut(args)
+    if args.mode == "mir":
+        if not rustc_available():
+            print("rustc not found; set RUSTC or install a toolchain", file=sys.stderr)
+            return 2
+        return run_mir(args)
     if args.mode == "reject":
         if not rustc_available():
             print("rustc not found; set RUSTC or install a toolchain", file=sys.stderr)
