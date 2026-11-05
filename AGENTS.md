@@ -198,7 +198,12 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   literal, and the frame store of a promoted field copied into an address-taken
   local loses one. A *store-to-load forwarding* rewrite of the same shape
   (`mov %r, X; mov X, %rY` -> `mov %r, %rY`) was measured perf-neutral on the
-  whole suite and not kept. `gen_expr_to_slot(e, slot)` is the one entry point
+  whole suite and not kept. A fuller textual version that tracked the live
+  register per frame slot (`forward_stores`) removed one instruction across the
+  whole corpus and cost 3-30% of compile time (`div.rms` 1.30x) for no runtime
+  change, so it was reverted too: the generator already keeps the value in a
+  register or reloads where a load is genuinely needed, and a whole-body rewrite
+  pass is the wrong price for the project's headline metric. `gen_expr_to_slot(e, slot)` is the one entry point
   for "evaluate into a local": the promoted register when there is one, else a
   folded frame store. `let`, assignment and both `for` bounds go through it, so
   a constant `for` start is `mov $0, %rbx` rather than a bounce through `%rax`.
@@ -397,6 +402,15 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   leading `.`, because `.p2align` is emitted indented and otherwise looks like
   dead text after the entry `jmp`. `a_loop_body_starts_on_a_sixteen_byte_boundary`
   pins it.
+- **A divisor that fits i32 uses `mov` not `movabs`.** `gen_div_const`
+  materialises the divisor and the magic multiplier; `mov_imm64` picks the
+  7-byte `mov $k, reg` when the value is a sign-extended 32-bit immediate and
+  the 10-byte `movabs` only when it is not. Small divisors are common, so this
+  trims the divide sequence and the artifact. The in-process ELF encoder
+  (`emit_mov_imm` in `elf.rs`) already made this choice, so the default path is
+  unchanged and only the `--binutils` artifact and the emitted `.s` shrink
+  (~0.7% across the corpus). `a_small_divisor_uses_a_short_immediate` and
+  `a_wide_magic_multiplier_keeps_movabs` pin both directions.
 - **`while` is rotated.** The test is emitted at the bottom as the back edge
   (`gen_branch_true`, a `jl`/`jne`) with an entry `jmp` reusing the same test, so
   an iteration is one branch fewer than the top-tested form. `continue` targets
