@@ -440,25 +440,22 @@ impl Parser {
         self.expect(Tok::LParen)?;
         let mut params = Vec::new();
         let mut param_mut = Vec::new();
+        let mut param_pats = Vec::new();
         while self.peek() != Some(&Tok::RParen) {
-            let pm = self.eat(&Tok::Mut);
-            let pname = self.expect_ident()?;
-            self.expect(Tok::Colon)?;
-            let ty = self.parse_type()?;
-            params.push((pname, ty));
-            param_mut.push(pm);
+            self.parse_param(&mut params, &mut param_mut, &mut param_pats)?;
             if !self.eat(&Tok::Comma) {
                 break;
             }
         }
         self.expect(Tok::RParen)?;
+        Self::check_dup_param_names(&params, &param_pats)?;
         let ret = if self.eat(&Tok::Arrow) {
             self.parse_type()?
         } else {
             Type::Unit
         };
         let body = self.parse_block()?;
-        Ok(FnDef { name, self_ty: None, takes_self: false, ref_self: false, ref_self_mut: false, params, param_mut, ret, body, param_slots: Vec::new(), ret_slot: -1, nslots: 0 })
+        Ok(FnDef { name, self_ty: None, takes_self: false, ref_self: false, ref_self_mut: false, params, param_mut, param_pats, ret, body, param_slots: Vec::new(), ret_slot: -1, nslots: 0 })
     }
 
     /// `impl Type { fn method(self, ..) -> .. { .. } }`. The methods are pushed
@@ -505,22 +502,24 @@ impl Parser {
         };
         let mut params = Vec::new();
         let mut param_mut = Vec::new();
+        let mut param_pats = Vec::new();
         let (by_ref, by_mut) = if takes_self {
             let by_ref = self.eat(&Tok::Amp);
             let by_mut = by_ref && self.eat(&Tok::Mut);
             let first = self.expect_ident()?;
             debug_assert_eq!(first, "self");
             if self.eat(&Tok::Comma) {
-                self.parse_param_list(&mut params, &mut param_mut)?;
+                self.parse_param_list(&mut params, &mut param_mut, &mut param_pats)?;
             }
             (by_ref, by_mut)
         } else {
             if self.peek() != Some(&Tok::RParen) {
-                self.parse_param_list(&mut params, &mut param_mut)?;
+                self.parse_param_list(&mut params, &mut param_mut, &mut param_pats)?;
             }
             (false, false)
         };
         self.expect(Tok::RParen)?;
+        Self::check_dup_param_names(&params, &param_pats)?;
         let ret = if self.eat(&Tok::Arrow) { self.parse_type()? } else { Type::Unit };
         let body = self.parse_block()?;
         Ok(FnDef {
@@ -531,6 +530,7 @@ impl Parser {
             ref_self_mut: by_mut,
             params,
             param_mut,
+            param_pats,
             ret,
             body,
             param_slots: Vec::new(),
@@ -545,16 +545,118 @@ impl Parser {
         &mut self,
         params: &mut Vec<(String, Type)>,
         param_mut: &mut Vec<bool>,
+        param_pats: &mut Vec<Option<Vec<Stmt>>>,
     ) -> PResult<()> {
         while self.peek() != Some(&Tok::RParen) {
-            let pm = self.eat(&Tok::Mut);
-            let pname = self.expect_ident()?;
-            self.expect(Tok::Colon)?;
-            let pty = self.parse_type()?;
-            params.push((pname, pty));
-            param_mut.push(pm);
+            self.parse_param(params, param_mut, param_pats)?;
             if !self.eat(&Tok::Comma) {
                 break;
+            }
+        }
+        Ok(())
+    }
+
+    /// One parameter, `p: T`, `mut p: T`, or an aggregate pattern, `S { x, y }:
+    /// S` / `[a, b]: [i64; 2]`. A pattern parameter is stored as an ordinary
+    /// parameter (a hidden name of the annotation's type) plus the statements
+    /// that bind the pattern's names from it, spliced at the top of the body.
+    fn parse_param(
+        &mut self,
+        params: &mut Vec<(String, Type)>,
+        param_mut: &mut Vec<bool>,
+        param_pats: &mut Vec<Option<Vec<Stmt>>>,
+    ) -> PResult<()> {
+        let pm = self.eat(&Tok::Mut);
+        // `S {` or `[` at the start of a parameter is a destructuring pattern,
+        // not a name: neither can begin a plain `p: T`. A leading `mut` on a
+        // pattern is rejected, as rustc rejects `mut S { x }: S` (the `mut`
+        // belongs on each binding).
+        let pat = if matches!(self.peek(), Some(Tok::LBracket))
+            || matches!(self.peek(), Some(Tok::Ident(_))
+                if self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::LBrace))
+        {
+            if pm {
+                return Err(format!(
+                    "at byte {}: `mut` must be attached to each individual binding",
+                    self.pos()
+                ));
+            }
+            Some(self.parse_pattern()?)
+        } else {
+            None
+        };
+        if let Some(p) = pat {
+            self.expect(Tok::Colon)?;
+            let ty = self.parse_type()?;
+            let pname = format!("\u{0}p{}", self.tmp);
+            self.tmp += 1;
+            let subj = Expr::Var { name: pname.clone(), slot: -1, ty: ty.clone() };
+            let binds = self.param_pat_binds(p, &subj)?;
+            params.push((pname, ty));
+            param_mut.push(false);
+            param_pats.push(Some(binds));
+        } else {
+            let pname = self.expect_ident()?;
+            self.expect(Tok::Colon)?;
+            let ty = self.parse_type()?;
+            params.push((pname, ty));
+            param_mut.push(pm);
+            param_pats.push(None);
+        }
+        Ok(())
+    }
+
+    /// The statements that bind a parameter pattern's names from the parameter
+    /// variable `subj`. A struct or array pattern is irrefutable, so this reuses
+    /// the `let` destructuring expansion; a refutable pattern (a literal, a
+    /// variant, an or-pattern) is rejected, as rustc rejects it for a parameter.
+    fn param_pat_binds(&mut self, p: Pat, subj: &Expr) -> PResult<Vec<Stmt>> {
+        match p {
+            Pat::Struct(_, fields) => Ok(Self::struct_pat_binds(&fields, subj)),
+            Pat::Array { elems, rest, front } => {
+                Ok(Self::array_pat_binds(&elems, rest, front, subj))
+            }
+            Pat::Bind(name) => Ok(vec![Stmt::Let {
+                name,
+                ty: None,
+                mutable: false,
+                init: Some(subj.clone()),
+                slot: -1,
+            }]),
+            _ => Err(format!(
+                "at byte {}: a parameter pattern must be irrefutable (a struct or array pattern)",
+                self.pos()
+            )),
+        }
+    }
+
+    /// Reject a parameter list where a name is bound twice (rustc E0415),
+    /// counting both plain parameters and the names a pattern parameter binds.
+    /// A pattern parameter's own hidden variable is skipped: it is not written
+    /// in source and cannot collide.
+    fn check_dup_param_names(
+        params: &[(String, Type)],
+        pats: &[Option<Vec<Stmt>>],
+    ) -> PResult<()> {
+        let mut seen: Vec<&str> = Vec::new();
+        for (i, (name, _)) in params.iter().enumerate() {
+            let names: Vec<&str> = match &pats[i] {
+                Some(binds) => binds
+                    .iter()
+                    .filter_map(|s| match s {
+                        Stmt::Let { name, .. } => Some(name.as_str()),
+                        _ => None,
+                    })
+                    .collect(),
+                None => vec![name.as_str()],
+            };
+            for n in names {
+                if seen.contains(&n) {
+                    return Err(format!(
+                        "identifier `{n}` is bound more than once in this parameter list"
+                    ));
+                }
+                seen.push(n);
             }
         }
         Ok(())

@@ -175,6 +175,13 @@ fn name(a: i64, b: bool) -> i64 { ... }
 - Up to six parameters. Scalars travel in the System V registers
   `rdi rsi rdx rcx r8 r9`; a struct or array is passed by value as a pointer to a
   copy. A returned aggregate is written through a caller-provided buffer.
+- A parameter may be written as an aggregate pattern, `fn f(S { x, y }: S)` or
+  `fn f([a, b]: [i64; 2])`, including a nested one (`S { a: [x, y], .. }`). The
+  parameter itself is an ordinary argument of the annotation's type; the pattern
+  binds its names at the top of the body, exactly as the matching `let`
+  destructuring would, so `mut` is per binding and a name may not collide with
+  another parameter (rustc's `E0415`). A refutable pattern (a literal, a variant,
+  an or-pattern) is rejected, as is `mut` on the whole pattern.
 - The return type may be omitted, in which case it is `()`.
 - Recursion is supported. `main` is the entry point; its return value becomes
   the process exit status.
@@ -488,6 +495,16 @@ compile-time constant is decided at compile time, not by the trap.
   `for`. The pattern must be irrefutable, so only a binding, `_`, a struct
   pattern or an array pattern is allowed; `mut` goes on each binding, as in
   `let` destructuring.
+- Parameter patterns: `fn f(S { f, g: h, i: _, .. }: S)` or
+  `fn f([a, b]: [i64; 2])` writes a parameter as a pattern. The parameter itself
+  is an ordinary argument of the annotation's type; the pattern binds its names
+  at the top of the body, exactly as the matching `let` destructuring would, so
+  the same field- and element-read expansion applies and the names read through
+  the parameter. The pattern must be irrefutable, so only a binding, a struct
+  pattern or an array pattern is allowed (a literal or variant is rejected, as
+  rustc rejects it); `mut` goes on each binding, so `mut S { x }: S` is rejected.
+  A name a pattern binds may not collide with another parameter (rustc's
+  `E0415`).
 - `if let PAT = EXPR { .. } else { .. }`, sugar for
   `match EXPR { PAT => then, _ => else_or_unit }`. It reuses the `match` pattern
   grammar (including or-patterns, ranges, struct patterns and array patterns,

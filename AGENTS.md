@@ -51,6 +51,7 @@ python3 tools/fuzz.py --mode letdestr --n 500 --seed 1
 python3 tools/fuzz.py --mode fordestr --n 500 --seed 1
 python3 tools/fuzz.py --mode nestpat --n 500 --seed 1
 python3 tools/fuzz.py --mode arrpat --n 500 --seed 1
+python3 tools/fuzz.py --mode parampat --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 ```
 
@@ -1208,7 +1209,20 @@ The checks, all in `sema.rs`:
   where rustc's is `usize`, so a differential twin casts with `as i64`.
 - **Parameter names (`E0415`) and `main` (`E0580`).** A function's parameters
   must be uniquely named; `check_fn` rejects a duplicate (rmc used to bind both
-  to one slot). `main` takes no parameters, checked in `analyze`.
+  to one slot). The parser applies the same check earlier
+  (`check_dup_param_names`), because a parameter *pattern* binds names the
+  semantic pass never sees as parameters: `fn f(S { x }: S, x: i64)` is rejected
+  at parse time. `main` takes no parameters, checked in `analyze`.
+- **Aggregate parameter patterns.** A parameter may be written as a struct or
+  array pattern, `fn f(S { x, y }: S)` / `fn f([a, b]: [i64; 2])`. The parser
+  (`parse_param`) keeps an ordinary parameter of the annotation's type (a hidden
+  `\0p<n>` name) and stores the per-binding `let` statements in `FnDef::param_pats`
+  (parallel to `params`); `check_fn` splices them at the top of the body before
+  checking, so sema and codegen gain no case — the expansion is exactly the
+  matching `let` destructuring, reading through the parameter. A refutable
+  pattern (literal, variant, or-pattern) is rejected (`param_pat_binds`), and
+  `mut` on the whole pattern is rejected. `sema` inserts a `None` into
+  `param_pats` when it prepends the `self` receiver, keeping the vectors aligned.
 - **Casts (`E0054`/`E0605`/`E0606`).** `check_cast` restricts `as` to the
   conversions rustc allows plus rmc's two documented extensions. A reference may
   only become a reference to the same type (`&mut T` may lose mutability to

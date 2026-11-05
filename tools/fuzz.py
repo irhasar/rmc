@@ -1480,6 +1480,140 @@ def gen_arrpat_program(rng):
     return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
 
 
+def _pat_fn_body(binds, b, tail):
+    """Body lines for a function whose parameter pattern binds `binds`: mutate
+    each `mut` binding, then return the weighted sum of the bindings plus
+    `tail` (a text fragment, e.g. `self.z`, or `""`). Returns `(rms, rs)`.
+    """
+    rms, rs = [], []
+    for (nm, mutable, _f) in binds:
+        if mutable:
+            rms.append(f"    {nm} = {nm} + {b};")
+            rs.append(f"    {nm} += {b};")
+    terms = " + ".join(f"{nm} * {i + 2}" for i, (nm, _m, _f) in enumerate(binds))
+    if tail:
+        terms = f"{terms} + {tail}" if terms else tail
+    if not terms:
+        terms = "0"
+    rms.append(f"    return {terms};")
+    rs.append(f"    {terms}")
+    return rms, rs
+
+
+def gen_parampat_program(rng):
+    """Aggregate parameter patterns, `fn f(S { x, y }: S)` and
+    `fn f([a, b]: [i64; 2])`, including a nested one and one mixed with plain
+    parameters. The parameter itself is an ordinary argument; the pattern binds
+    its names at the top of the body, so the expansion is the matching `let`
+    destructuring. The check is that each name reads the right field or element,
+    and that a `mut` binding writes a local copy rather than the caller's value:
+    each function is called twice with different arguments, so a mis-bound name,
+    a shared slot or a leaked `mut` write changes the total. No other mode emits
+    a parameter pattern.
+    """
+    b = rng.randint(1, 9)
+    fields = ["x", "y", "z"]
+    rms = [
+        "fn mk(n: i64) -> i64 { print_i64(n); return n; }",
+        "struct P { x: i64, y: i64, z: i64 }",
+        "struct S { a: [i64; 2], b: i64 }",
+    ]
+    rs = [
+        'fn mk(n: i64) -> i64 { println!("{}", n); n }',
+        "#[derive(Copy, Clone)]",
+        "struct P { x: i64, y: i64, z: i64 }",
+        "#[derive(Copy, Clone)]",
+        "struct S { a: [i64; 2], b: i64 }",
+    ]
+
+    # A struct parameter pattern.
+    pat, binds = _let_pat(rng, fields, "A")
+    rms.append(f"fn f_struct(P {{ {pat} }}: P) -> i64 {{")
+    rs.append(f"fn f_struct(P {{ {pat} }}: P) -> i64 {{")
+    body, body_rs = _pat_fn_body(binds, b, "")
+    rms += body
+    rs += body_rs
+    rms.append("}")
+    rs.append("}")
+
+    # An array parameter pattern.
+    apat, abinds = _array_pat(rng, 2, "B")
+    rms.append(f"fn f_array({apat}: [i64; 2]) -> i64 {{")
+    rs.append(f"fn f_array({apat}: [i64; 2]) -> i64 {{")
+    body, body_rs = _pat_fn_body(abinds, b, "")
+    rms += body
+    rs += body_rs
+    rms.append("}")
+    rs.append("}")
+
+    # A nested parameter pattern: an array-typed field destructured in place
+    # plus a scalar field.
+    spat, nabinds, fbind = _struct_arr_field_pat(rng, 2, "N")
+    nbinds = nabinds + [(nm, mu, 0) for (nm, mu, _f) in fbind]
+    rms.append(f"fn f_nested({spat}: S) -> i64 {{")
+    rs.append(f"fn f_nested({spat}: S) -> i64 {{")
+    body, body_rs = _pat_fn_body(nbinds, b, "")
+    rms += body
+    rs += body_rs
+    rms.append("}")
+    rs.append("}")
+
+    # A pattern parameter mixed with plain ones.
+    mpat, mbinds = _let_pat(rng, fields, "M")
+    rms.append(f"fn f_mixed(k: i64, P {{ {mpat} }}: P, m: i64) -> i64 {{")
+    rs.append(f"fn f_mixed(k: i64, P {{ {mpat} }}: P, m: i64) -> i64 {{")
+    body, body_rs = _pat_fn_body(mbinds, b, "k + m")
+    rms += body
+    rs += body_rs
+    rms.append("}")
+    rs.append("}")
+
+    # A method receiver plus a pattern parameter.
+    rpat, rbinds = _let_pat(rng, fields, "R")
+    rms.append(f"impl P {{ fn add(self, P {{ {rpat} }}: P) -> i64 {{")
+    rs.append(f"impl P {{ fn add(self, P {{ {rpat} }}: P) -> i64 {{")
+    body, body_rs = _pat_fn_body(rbinds, b, "self.z")
+    rms += body
+    rs += body_rs
+    rms.append("    } }")
+    rs.append("    } }")
+
+    rms += [
+        "fn main() -> i64 {",
+        "    let mut acc: i64 = 0;",
+        f"    let s: i64 = mk({b});",
+        f"    acc = acc + f_struct(P {{ x: s, y: s + 1, z: s + 2 }});",
+        f"    acc = acc + f_struct(P {{ x: s + 3, y: s + 4, z: s + 5 }});",
+        f"    acc = acc + f_array([s + 6, s + 7]);",
+        f"    acc = acc + f_array([s + 8, s + 9]);",
+        f"    acc = acc + f_nested(S {{ a: [s + 10, s + 11], b: s + 12 }});",
+        f"    acc = acc + f_nested(S {{ a: [s + 13, s + 14], b: s + 15 }});",
+        f"    acc = acc + f_mixed(s + 16, P {{ x: s + 17, y: s + 18, z: s + 19 }}, s + 20);",
+        f"    acc = acc + f_mixed(s + 21, P {{ x: s + 22, y: s + 23, z: s + 24 }}, s + 25);",
+        f"    acc = acc + P {{ x: s + 26, y: s + 27, z: s + 28 }}.add(P {{ x: s + 29, y: s + 30, z: s + 31 }});",
+        "    print_i64(acc);",
+        "    return 0;",
+        "}",
+    ]
+    rs += [
+        "fn main() {",
+        "    let mut acc: i64 = 0;",
+        f"    let s: i64 = mk({b});",
+        f"    acc += f_struct(P {{ x: s, y: s + 1, z: s + 2 }});",
+        f"    acc += f_struct(P {{ x: s + 3, y: s + 4, z: s + 5 }});",
+        f"    acc += f_array([s + 6, s + 7]);",
+        f"    acc += f_array([s + 8, s + 9]);",
+        f"    acc += f_nested(S {{ a: [s + 10, s + 11], b: s + 12 }});",
+        f"    acc += f_nested(S {{ a: [s + 13, s + 14], b: s + 15 }});",
+        f"    acc += f_mixed(s + 16, P {{ x: s + 17, y: s + 18, z: s + 19 }}, s + 20);",
+        f"    acc += f_mixed(s + 21, P {{ x: s + 22, y: s + 23, z: s + 24 }}, s + 25);",
+        f"    acc += P {{ x: s + 26, y: s + 27, z: s + 28 }}.add(P {{ x: s + 29, y: s + 30, z: s + 31 }});",
+        '    println!("{}", acc);',
+        "}",
+    ]
+    return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
+
+
 def gen_ref_program(rng):
     """A program built from references (`&T` / `&mut T`), which no other mode
     exercises. A reference is one word holding an address, so `*r = v` writes
@@ -2061,6 +2195,16 @@ def robust_corpus():
         "array_pattern_refutable_element": b"fn main() -> i64 { let a: [i64; 2] = [1, 2]; let [1, y] = a; return y; }",
         "struct_array_field_mut_nested": b"struct S { a: [i64; 2] } fn main() -> i64 { let s: S = S { a: [1, 2] }; let S { a: mut [x, y] } = s; return x; }",
         "struct_array_field_two_rests": b"struct S { a: [i64; 3] } fn main() -> i64 { let s: S = S { a: [1, 2, 3] }; let S { a: [.., x, ..] } = s; return x; }",
+        # A parameter pattern shares the pattern parser, so a malformed or
+        # deeply nested one must error cleanly rather than overflow the stack.
+        "param_pat_unterminated": b"struct S { a: i64 } fn f(S { a ",
+        "param_pat_missing_name": b"struct S { a: i64 } fn f(S { : a }: S) -> i64 { return 0; } fn main() -> i64 { return 0; }",
+        "param_pat_double_dotdot": b"struct S { a: i64 } fn f(S { .. .. }: S) -> i64 { return 0; } fn main() -> i64 { return 0; }",
+        "param_pat_deep": b"struct S { a: S } fn f(" + b"S { a: " * 3000 + b"S { .. }" + b" }" * 3000 + b": S) -> i64 { return 0; } fn main() -> i64 { return 0; }",
+        "param_pat_mut_nested": b"struct S { a: [i64; 2] } fn f(S { a: mut [x, y] }: S) -> i64 { return x; } fn main() -> i64 { return 0; }",
+        "param_pat_unknown_field": b"struct S { a: i64 } fn f(S { z }: S) -> i64 { return z; } fn main() -> i64 { return 0; }",
+        "param_pat_refutable": b"fn f(1: i64) -> i64 { return 1; } fn main() -> i64 { return 0; }",
+        "param_pat_empty_paren": b"fn f(: i64) -> i64 { return 0; } fn main() -> i64 { return 0; }",
     }
     return cases
 
@@ -2494,6 +2638,61 @@ def reject_corpus():
             "struct S { a: [i64; 2] }\n"
             "fn main() { let s = S { a: [1, 2] }; let S { z: [x, y] } = s; let _ = x; }\n",
         ),
+        # A parameter pattern runs the same checks in a parameter position: a
+        # `mut` on the whole pattern, a name bound twice (E0415), and an unknown
+        # field or struct are all rejected by rustc.
+        "param_pat_mut_on_pattern": (
+            "struct S { x: i64 }\n"
+            "fn f(mut S { x }: S) -> i64 { return x; }\n"
+            "fn main() -> i64 { return 0; }\n",
+            "struct S { x: i64 }\n"
+            "fn f(mut S { x }: S) -> i64 { x }\n"
+            "fn main() { let _ = f(S { x: 1 }); }\n",
+        ),
+        "param_pat_dup_name": (
+            "struct S { x: i64 }\n"
+            "fn f(S { x }: S, x: i64) -> i64 { return x; }\n"
+            "fn main() -> i64 { return 0; }\n",
+            "struct S { x: i64 }\n"
+            "fn f(S { x }: S, x: i64) -> i64 { x }\n"
+            "fn main() { let _ = f(S { x: 1 }, 2); }\n",
+        ),
+        "param_pat_dup_name_reversed": (
+            "struct S { x: i64 }\n"
+            "fn f(x: i64, S { x }: S) -> i64 { return x; }\n"
+            "fn main() -> i64 { return 0; }\n",
+            "struct S { x: i64 }\n"
+            "fn f(x: i64, S { x }: S) -> i64 { x }\n"
+            "fn main() { let _ = f(1, S { x: 2 }); }\n",
+        ),
+        "param_pat_unknown_field": (
+            "struct S { x: i64 }\n"
+            "fn f(S { z }: S) -> i64 { return z; }\n"
+            "fn main() -> i64 { return 0; }\n",
+            "struct S { x: i64 }\n"
+            "fn f(S { z }: S) -> i64 { z }\n"
+            "fn main() { let _ = f(S { x: 1 }); }\n",
+        ),
+        "param_pat_unknown_struct": (
+            "struct S { x: i64 }\n"
+            "fn f(Q { x }: Q) -> i64 { return x; }\n"
+            "fn main() -> i64 { return 0; }\n",
+            "struct S { x: i64 }\n"
+            "fn f(Q { x }: Q) -> i64 { x }\n"
+            "fn main() { let _ = f(S { x: 1 }); }\n",
+        ),
+        "param_pat_refutable_literal": (
+            "fn f(1: i64) -> i64 { return 1; }\n"
+            "fn main() -> i64 { return 0; }\n",
+            "fn f(1: i64) -> i64 { 1 }\n"
+            "fn main() { let _ = f(1); }\n",
+        ),
+        "param_pat_dup_element": (
+            "fn f([a, a]: [i64; 2]) -> i64 { return a; }\n"
+            "fn main() -> i64 { return 0; }\n",
+            "fn f([a, a]: [i64; 2]) -> i64 { a }\n"
+            "fn main() { let _ = f([1, 2]); }\n",
+        ),
     }
 
 
@@ -2531,7 +2730,7 @@ def run_reject():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "robust", "reject"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "robust", "reject"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -2577,7 +2776,8 @@ def main():
            "letdestr": gen_letdestr_program,
            "fordestr": gen_fordestr_program,
            "nestpat": gen_nestpat_program,
-           "arrpat": gen_arrpat_program}[args.mode]
+           "arrpat": gen_arrpat_program,
+           "parampat": gen_parampat_program}[args.mode]
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus
     # suite; a fuzz program is otherwise only checked with every pass on, so a
