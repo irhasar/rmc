@@ -694,20 +694,31 @@ impl<'a> FnGen<'a> {
         // An aggregate's slots are reached as `base + k`, so only the base
         // appears in the text. Pin every slot of a multi-slot region: they must
         // stay contiguous, or an element access would fall outside the frame.
+        // A `[i64; 200000]` local is 250k slots, so mark the runs directly
+        // instead of hashing each slot -- that loop was the whole compile cost
+        // of a large-array program.
+        let mut used = vec![false; frame_slots as usize];
+        for &s in &used_slots {
+            if let Some(b) = used.get_mut(s as usize) {
+                *b = true;
+            }
+        }
         for l in 0..self.func.locals.len() {
             let slots = (self.size[l] + 7) / 8;
             if slots > 1 {
                 let base = self.local_base[l];
-                for k in 0..slots {
-                    used_slots.insert(base - k);
+                let lo = (base - slots + 1).max(0) as usize;
+                let hi = (base.min(frame_slots - 1)) as usize;
+                if lo <= hi {
+                    used[lo..=hi].fill(true);
                 }
             }
         }
         let mut map = vec![-1i64; frame_slots as usize];
         let mut next = 0i64;
-        for slot in 0..frame_slots {
-            if used_slots.contains(&slot) {
-                map[slot as usize] = next;
+        for (slot, &is_used) in used.iter().enumerate() {
+            if is_used {
+                map[slot] = next;
                 next += 1;
             }
         }

@@ -510,8 +510,38 @@ fn large_array_compiles_in_linear_time() {
     let out = compile_to_asm(&src, &CompileOptions::default()).unwrap();
     assert!(out.contains("main:"));
     assert!(
-        t.elapsed().as_secs_f64() < 0.5,
+        t.elapsed().as_secs_f64() < 0.15,
         "compiling a 200k-element array took {:?}",
+        t.elapsed()
+    );
+}
+
+#[test]
+fn mir_large_array_compiles_in_linear_time() {
+    // The MIR back end marks a frame region used slot-by-slot; hashing each
+    // slot of a `[i64; N]` local is quadratic and dominated the back end (a
+    // 2M-element array took ~1.5 s). A slice fill is linear, so this must stay
+    // well under the bound.
+    let mir = "\
+fn main() -> i64 {
+    let mut _0: i64;
+    let mut _1: [i64; 2000000];
+
+    bb0: {
+        _1 = [const 1_i64; 2000000];
+        _0 = const 0_i64;
+        return;
+    }
+}
+";
+    let t = std::time::Instant::now();
+    let prog = rmc::mir::parse(mir).expect("parse");
+    let asm = rmc::compile_mir_to_asm(&prog, &rmc::mir_codegen::Options::default())
+        .expect("compile");
+    assert!(asm.contains("main:"));
+    assert!(
+        t.elapsed().as_secs_f64() < 0.15,
+        "compiling a 2M-element array through MIR took {:?}",
         t.elapsed()
     );
 }
