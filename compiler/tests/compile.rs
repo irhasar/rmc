@@ -264,6 +264,35 @@ fn a_label_on_while_let_is_rejected() {
 }
 
 #[test]
+fn struct_field_init_shorthand_reuses_the_local() {
+    // `P { x, y }` is `P { x: x, y: y }`; the shorthand must read the locals of
+    // those names, not a placeholder.
+    let src = "struct P { x: i64, y: i64 } \
+               fn main() -> i64 { let x: i64 = 3; let y: i64 = 4; let p: P = P { x, y }; \
+               return p.x * 10 + p.y; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn struct_field_init_shorthand_mixes_with_explicit_fields() {
+    let src = "struct P { x: i64, y: i64 } \
+               fn main() -> i64 { let x: i64 = 3; let p: P = P { y: 10, x }; \
+               return p.x * 10 + p.y; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn struct_field_init_shorthand_for_an_unbound_name_is_rejected() {
+    let err = compile_to_asm(
+        "struct P { x: i64, y: i64 } \
+         fn main() -> i64 { let p: P = P { x, y }; return p.x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("unknown variable"), "got: {err}");
+}
+
+#[test]
 fn compound_assignment_expands() {
     // `x += 4` folds into a single `lea` when the target is register-resident,
     // and otherwise into an `add`. Either is the expansion; what matters is

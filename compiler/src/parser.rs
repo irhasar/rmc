@@ -1859,8 +1859,14 @@ impl Parser {
                     let mut fields = Vec::new();
                     while self.peek() != Some(&Tok::RBrace) {
                         let fname = self.expect_ident()?;
-                        self.expect(Tok::Colon)?;
-                        let fval = self.parse_expr()?;
+                        // Field init shorthand: `P { x, y }` means `P { x: x, y: y }`,
+                        // so a bare name (no `:`) reuses the local of that name.
+                        let fval = if self.peek() == Some(&Tok::Colon) {
+                            self.i += 1;
+                            self.parse_expr()?
+                        } else {
+                            Expr::Var { name: fname.clone(), slot: -1, ty: Type::I64 }
+                        };
                         fields.push(FieldInit { name: fname, offset: 0, ty: Type::I64, value: fval });
                         if !self.eat(&Tok::Comma) {
                             break;
