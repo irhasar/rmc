@@ -1426,16 +1426,35 @@ impl Sema {
                         let et = self.check_block(e, scope)?;
                         self.match_chain = false;
                         self.match_total = false;
-                        if tt != et {
-                            return Err(format!("`if` branches have different types: {tt:?} and {et:?}"));
-                        }
-                        // Keep only what both branches initialized.
                         let else_init = Self::init_snapshot(scope);
+                        // `!` unifies with any type: a branch that diverges
+                        // (returns, or loops forever) never yields a value, so
+                        // the `if` takes the other branch's type. rustc accepts
+                        // `if c { 1 } else { return 2 }` for this reason.
+                        let then_div = block_diverges(then);
+                        let else_div = block_diverges(e);
+                        let ty = if tt == et || else_div && !then_div {
+                            tt
+                        } else if then_div && !else_div {
+                            et
+                        } else {
+                            return Err(format!(
+                                "`if` branches have different types: {tt:?} and {et:?}"
+                            ));
+                        };
+                        // A diverging branch never falls through, so only the
+                        // surviving branch decides what is initialized after.
                         for (i, b) in scope.iter_mut().enumerate() {
-                            b.init = then_init.get(i).copied().unwrap_or(false)
-                                && else_init.get(i).copied().unwrap_or(false);
+                            let ti = then_init.get(i).copied().unwrap_or(false);
+                            let ei = else_init.get(i).copied().unwrap_or(false);
+                            b.init = match (then_div, else_div) {
+                                (false, false) => ti && ei,
+                                (false, true) => ti,
+                                (true, false) => ei,
+                                (true, true) => false,
+                            };
                         }
-                        Ok(tt)
+                        Ok(ty)
                     }
                     None => {
                         if tt != Type::Unit && !total {
@@ -1995,12 +2014,46 @@ fn stmt_diverges(s: &Stmt) -> bool {
         // Only reachable inside a loop, so it never ends a function body, but
         // treating it as diverging keeps the walk total.
         Stmt::Break | Stmt::Continue => true,
+        // `loop { .. }` diverges unless some `break` can leave it. A `while` or
+        // `for` may run zero times, so it never diverges.
+        Stmt::Loop(body) => !block_has_break(body),
         Stmt::Expr(e) => expr_diverges(e),
         // A `let`/assignment whose initialiser diverges never completes, so the
         // following statements are unreachable.
         Stmt::Let { init: Some(e), .. } => expr_diverges(e),
         Stmt::Assign { value, .. } => expr_diverges(value),
         // A loop is not a guaranteed return: it may break or never run.
+        _ => false,
+    }
+}
+
+/// True when a `break` in `b` targets the loop `b` is the body of. A nested
+/// loop captures its own `break`s, so the walk stops at one; an `if`/block does
+/// not, so it descends.
+fn block_has_break(b: &Block) -> bool {
+    b.stmts.iter().any(stmt_has_break) || b.tail.as_deref().map_or(false, expr_has_break)
+}
+
+fn stmt_has_break(s: &Stmt) -> bool {
+    match s {
+        Stmt::Break => true,
+        // A `while`/`loop`/`for` body's `break`s belong to that loop, not the
+        // enclosing one, so the walk does not descend into it.
+        Stmt::While(..) | Stmt::Loop(..) | Stmt::For { .. } => false,
+        Stmt::Expr(e) => expr_has_break(e),
+        Stmt::Let { init: Some(e), .. } => expr_has_break(e),
+        Stmt::Assign { value, .. } => expr_has_break(value),
+        _ => false,
+    }
+}
+
+fn expr_has_break(e: &Expr) -> bool {
+    match e {
+        Expr::Block(b) => block_has_break(b),
+        Expr::MatchBoundary(b, _) => block_has_break(b),
+        Expr::If(_, t, els) => {
+            block_has_break(t) || els.as_ref().map_or(false, |b| block_has_break(b))
+        }
         _ => false,
     }
 }

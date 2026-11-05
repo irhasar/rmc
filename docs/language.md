@@ -170,12 +170,13 @@ y += 1;                  // compound assignment: += -= *= /= %=
 x;                       // expression statement
 if cond { ... } else { ... }
 while cond { ... }
+while let PAT = expr { ... }  // re-tests expr each iteration; stops on no match
 for i in 0..10 { ... }   // i64 range, end exclusive
 for i in 0..=10 { ... }  // i64 range, end inclusive
 loop { ... }
 break;
 continue;
-return expr;
+return expr;             // `;` may be omitted at the end of a block
 ```
 
 `let` without an initialiser defers initialisation: the binding must be written
@@ -192,7 +193,16 @@ names must be unique, and `main` takes no arguments. Constant arithmetic that
 would trap — division or remainder by zero, `i64` overflow, or a shift by 64 or
 more — is a compile error, matching rustc; variable operands are still checked
 at run time only when `--overflow-checks` is on. `for` bounds are evaluated
-once, before the loop; `continue` still runs the increment.
+once, before the loop; `continue` still runs the increment. `while let` is
+`loop { if let PAT = expr { body } else { break; } }`: the scrutinee is
+re-evaluated every iteration, and `continue` re-tests it rather than jumping to
+the top.
+
+A branch whose type diverges (`return`, or a `loop` with no reachable `break`)
+unifies with any other branch's type, as Rust's `!` does, so
+`if c { 1 } else { return 2 }` is accepted. The trailing `;` after
+`return`/`break`/`continue` may be omitted when it is the last thing in a block,
+since those diverge and no expression can follow them.
 
 ## Overflow
 

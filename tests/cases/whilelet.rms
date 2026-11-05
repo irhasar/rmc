@@ -1,0 +1,58 @@
+// `while let PAT = EXPR { body }` re-tests EXPR each iteration and stops at the
+// first value PAT does not match. It desugars to `loop { if let PAT = EXPR {
+// body } else { break; } }`, so the scrutinee is re-evaluated every iteration:
+// a call there must run once per iteration, not once for the whole loop.
+// Also covers a diverging `if` branch: a branch that returns (or loops forever)
+// never yields a value, so `if c { 1 } else { return 2 }` is well typed, as in
+// Rust, where `!` unifies with any type.
+enum Opt { None, Some(i64) }
+
+fn step(k: i64) -> Opt {
+    if k < 5 {
+        return Opt::Some(k * 10);
+    }
+    return Opt::None;
+}
+
+fn first_div(c: i64) -> i64 {
+    // The `else` diverges, so the `if` takes the `then` branch's type.
+    if c > 0 { 1 } else { return 2 }
+}
+
+fn main() -> i64 {
+    // The scrutinee is a call, so it runs once per iteration and stops at the
+    // first `None`; `i` counts the iterations that matched.
+    let mut i: i64 = 0;
+    let mut sum: i64 = 0;
+    while let Opt::Some(v) = step(i) {
+        sum = sum + v;
+        i = i + 1;
+    }
+    print_i64(sum);
+    print_i64(i);
+
+    // The guard fails on entry, so the body never runs.
+    let mut j: i64 = 10;
+    while let Opt::Some(v) = step(j) {
+        print_i64(v);
+        j = j + 1;
+    }
+    print_i64(j);
+
+    // `continue` in a while let body targets the re-test, not the top.
+    let mut k: i64 = 0;
+    let mut odd: i64 = 0;
+    while let Opt::Some(v) = step(k) {
+        k = k + 1;
+        if v % 20 == 0 {
+            continue;
+        }
+        odd = odd + v;
+    }
+    print_i64(odd);
+    print_i64(k);
+
+    print_i64(first_div(3));
+    print_i64(first_div(-3));
+    return 0;
+}

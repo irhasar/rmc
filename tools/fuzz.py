@@ -333,6 +333,26 @@ def gen_stmt_program(rng):
     rs.append("        i += 1;")
     rms += ["    }"]
     rs += ["    }"]
+    # `while let` over a payload enum: the scrutinee is a variable here (a
+    # call scrutinee is covered in `pat` mode), and the loop stops when the
+    # value becomes `None`. A `continue` before the `break` check keeps the
+    # re-test path live.
+    rms.append("    let mut wl: i64 = 0;")
+    rs.append("    let mut wl: i64 = 0;")
+    rms.append("    let mut wo: Opt = Opt::Some(2);")
+    rs.append("    let mut wo: Opt = Opt::Some(2);")
+    rms.append("    while let Opt::Some(v) = wo { wl = wl + v; if wl > 100 { wo = Opt::None; continue; } if wl > 6 { wo = Opt::None; } }")
+    rs.append("    while let Opt::Some(v) = wo { wl += v; if wl > 100 { wo = Opt::None; continue; } if wl > 6 { wo = Opt::None; } }")
+    rms.append("    acc = acc + wl * 7 + nodiv(i);")
+    rs.append("    acc += wl * 7 + nodiv(i);")
+    # A bare `loop` whose `break` is the last thing in the block, so the `;` is
+    # omitted (rustc allows it because `break` diverges).
+    rms.append("    let mut lc: i64 = 0;")
+    rs.append("    let mut lc: i64 = 0;")
+    rms.append("    loop { lc = lc + 1; if lc >= 3 { break } }")
+    rs.append("    loop { lc += 1; if lc >= 3 { break } }")
+    rms.append("    acc = acc + lc * 11;")
+    rs.append("    acc += lc * 11;")
     # A `for` range over i64 variables, exclusive or inclusive. The bounds are
     # named `i64` locals so Rust does not default the literals to `i32`; that
     # also exercises a non-literal bound and `..=`'s strict exit test.
@@ -401,9 +421,11 @@ def gen_stmt_program(rng):
     rs.append('    println!("{}", acc);')
     rms += ["    return 0;", "}"]
     rs += ["}"]
+    rms.insert(0, "fn nodiv(c: i64) -> i64 { if c > 0 { 1 } else { return 2 } }")
     rms.insert(0, "fn h(x: i64) -> i64 { return (x * 3 + 1) % 97; }")
     # `rs[0]` is the struct's `#[derive]`, so the helper has to go *before* it:
     # inserting at 1 puts the attribute on `fn h`, which rustc rejects.
+    rs.insert(0, "fn nodiv(c: i64) -> i64 { if c > 0 { 1 } else { return 2 } }")
     rs.insert(0, "fn h(x: i64) -> i64 { (x * 3 + 1) % 97 }")
     return "\n".join(rms), "\n".join(rs)
 
