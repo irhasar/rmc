@@ -398,8 +398,10 @@ compile-time constant is decided at compile time, not by the trap.
   `S { .. }` binds nothing. A struct pattern is *irrefutable*: it has no runtime
   test and always matches, so it acts as a catch-all arm (like `_`) and needs no
   other arm to make a `match` exhaustive. A field is an ordinary place read, so
-  it may auto-deref a `&S` scrutinee, and a struct-typed field may itself be
-  destructured. A wrong field name is an error, even for `i: _`, and a field
+  it may auto-deref a `&S` scrutinee. Each field binds a whole value; a
+  sub-pattern (`i: I { a }`) is not supported, as the subset has no
+  destructuring `let` and an enum payload pattern likewise only binds fields.
+  A wrong field name is an error, even for `i: _`, and a field
   bound twice is an error. Because a struct pattern is irrefutable, a *binding*
   struct pattern in an or-pattern is rejected, as is any binding alternative.
 - `if let PAT = EXPR { .. } else { .. }`, sugar for
