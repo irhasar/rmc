@@ -578,7 +578,21 @@ fn a_mut_on_a_nested_struct_sub_pattern_is_rejected() {
         &CompileOptions::default(),
     )
     .unwrap_err();
-    assert!(err.contains("`mut` is not allowed on a nested struct pattern"), "got: {err}");
+    assert!(err.contains("`mut` is not allowed on a nested pattern"), "got: {err}");
+}
+
+#[test]
+fn a_mut_on_a_nested_array_sub_pattern_is_rejected() {
+    // The same rule for an array-typed field: `mut` binds an element, not the
+    // nested array pattern.
+    let err = compile_to_asm(
+        "struct S { a: [i64; 2] } \
+         fn main() -> i64 { let s: S = S { a: [1, 2] }; \
+         let S { a: mut [x, y] } = s; return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("`mut` is not allowed on a nested pattern"), "got: {err}");
 }
 
 #[test]
@@ -899,6 +913,64 @@ fn an_array_pattern_with_an_out_of_range_element_is_rejected() {
     )
     .unwrap_err();
     assert!(err.contains("out of bounds"), "got: {err}");
+}
+
+#[test]
+fn a_struct_field_may_be_destructured_by_an_array_pattern() {
+    let src = "struct S { a: [i64; 2], b: i64 } \
+               fn main() -> i64 { let s: S = S { a: [3, 4], b: 5 }; \
+               let S { a: [x, y], b } = s; return x * 100 + y * 10 + b; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn an_array_sub_pattern_in_a_struct_may_ignore_elements_and_rest() {
+    let src = "struct S { a: [i64; 3], b: i64 } \
+               fn main() -> i64 { let s: S = S { a: [1, 2, 3], b: 4 }; \
+               let S { a: [_, y, ..], .. } = s; return y; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_struct_array_sub_pattern_nests_through_a_struct_element() {
+    // `S { a: [I { u }, ..] }`: an array element is itself a struct pattern, so
+    // the two nesting directions compose.
+    let src = "struct I { u: i64, v: i64 } struct S { a: [I; 2], b: i64 } \
+               fn main() -> i64 { let s: S = S { a: [I { u: 3, v: 4 }, I { u: 5, v: 6 }], b: 7 }; \
+               let S { a: [I { u, .. }, I { v, .. }], b } = s; \
+               return u * 100 + v * 10 + b; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_struct_array_sub_pattern_reads_through_a_reference() {
+    let src = "struct S { a: [i64; 2] } \
+               fn main() -> i64 { let s: S = S { a: [3, 4] }; let r: &S = &s; \
+               match r { S { a: [x, y] } => { return x * 10 + y; } } }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_struct_array_sub_pattern_compiles_like_the_equivalent_field_reads() {
+    // `S { a: [x, y] }` expands to `let x = s.a[0]; let y = s.a[1];`.
+    let pat = "struct S { a: [i64; 2], b: i64 } \
+               fn f(s: &S) -> i64 { let S { a: [x, y], b } = s; return x * 100 + y * 10 + b; }";
+    let reads = "struct S { a: [i64; 2], b: i64 } \
+                 fn f(s: &S) -> i64 { let x: i64 = s.a[0]; let y: i64 = s.a[1]; let b: i64 = s.b; \
+                 return x * 100 + y * 10 + b; }";
+    assert_eq!(asm(pat), asm(reads));
+}
+
+#[test]
+fn a_refutable_element_in_a_struct_array_sub_pattern_is_rejected() {
+    let err = compile_to_asm(
+        "struct S { a: [i64; 2] } \
+         fn main() -> i64 { let s: S = S { a: [1, 2] }; \
+         let S { a: [1, y] } = s; return y; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("must be bindings"), "got: {err}");
 }
 
 #[test]
