@@ -68,6 +68,12 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 
 # differential fuzzer over the rustc-MIR path (rustc --emit=mir -> rmc back end)
 python3 tools/fuzz.py --mode mir --n 500 --seed 1
+python3 tools/fuzz.py --mode mir --gen width --n 500 --seed 1
+
+# robustness: malformed input must be a diagnostic, never a crash (no rustc)
+python3 tools/fuzz.py --mode robust        # rmc's own .rms parser
+python3 tools/fuzz.py --mode mirrobust     # .rs programs the MIR path rejects
+python3 tools/fuzz.py --mode mirmut --n 500 --seed 1   # mutated .mir text
 ```
 
 ## Source map
@@ -257,25 +263,31 @@ python3 tools/fuzz.py --mode mir --n 500 --seed 1
   `--no-tco`, `--keep-mir`.
 - `compiler/src/mir.rs` — parses the MIR text `rustc --emit=mir` prints into an
   in-memory MIR, and holds the MIR-level optimiser passes. See "The rustc-MIR
-  front end" below.
+  front end" below. `mir.rs::parse` is the untrusted-input boundary: it rejects a
+  function with no basic block and a terminator whose target block the function
+  never declares, because the passes index `blocks[0]` and `blocks[target]`
+  directly (`mirmut` found both as panics; see the fuzzing section).
 - `compiler/src/mir_codegen.rs` — lowers that MIR to x86-64, sharing `elf.rs`
   with the `.rms` path. It has its own peephole/register planner; see "MIR
   codegen" below.
 - `compiler/examples/rmcmir.rs` — `rmcmir` CLI: a `.mir` text file to ELF, i.e.
   the MIR back end with no rustc in the loop. The benchmark harness times it
-  separately from the front end.
+  separately from the front end. `rmc file.mir` is the same path through the
+  main binary (via `main.rs::run_mir_text`), which is what the `mirmut` fuzzer
+  drives.
 - `compiler/tests/compile.rs` — unit tests for the front end and codegen; these
   run without `as`/`ld`.
 
 ## The rustc-MIR front end
 
-A `.rs` input (anything that is not `.rms`) takes the second pipeline:
-`main.rs::run_mir_pipeline` runs `rustc --emit=mir -O -C panic=abort
---crate-type=bin --edition 2021`, `mir.rs::parse` reads the MIR text, the
-MIR-level passes run, and `mir_codegen.rs` emits x86-64 that goes through the
-same `elf.rs` assembler/linker and `runtime.rs` as the `.rms` path. LLVM never
-runs. `rmcmir` (`examples/rmcmir.rs`) is the same back end reading a `.mir` file,
-so the benchmark can time the two stages apart.
+A `.rs` input takes the second pipeline: `main.rs::run_mir_pipeline` runs
+`rustc --emit=mir -O -C panic=abort --crate-type=bin --edition 2021`,
+`mir.rs::parse` reads the MIR text, the MIR-level passes run, and
+`mir_codegen.rs` emits x86-64 that goes through the same `elf.rs`
+assembler/linker and `runtime.rs` as the `.rms` path. LLVM never runs. A `.mir`
+input skips the front end and enters `main.rs::run_mir_text` directly, which is
+the same back-end sequence; `rmcmir` (`examples/rmcmir.rs`) is the older
+standalone CLI for the same thing, and the benchmark times the two stages apart.
 
 - The MIR text format is rustc's *internal* dump, not a stable interface. It
   changes between rustc releases; `mir.rs::parse` is written against the shape
@@ -1476,6 +1488,28 @@ parked in `%rdx` (now parked in a frame slot), and a 64-bit constant used as an
 ALU immediate or a frame store was silently truncated to i32 (now materialised
 in a register; the assembler rejects an out-of-range immediate loudly instead of
 truncating). Both are pinned by `tests/mir/wideimm.rs`.
+
+`--gen width` (with `--mode mir`) is a differential generator that mixes every
+integer width (`u8`..`i64`, `usize`/`isize`) with `wrapping_add`/`sub`/`mul` and
+a cast back down. Every width shares one 64-bit word in the back end, so a wrong
+sign/zero extension or a missing wrap is the miscompile it hunts; none found.
+
+`mirrobust` mode (`tools/fuzz.py --mode mirrobust`) is `robust` for the MIR path:
+a fixed corpus of `.rs` programs (formatting, the containers, closures, floats,
+traits, generics, plus rustc-rejected and malformed input) that must each end in
+a diagnostic, never a panic or a signal. This is the failure a user hits first on
+this path — an unsupported MIR shape — so the corpus keeps it a message.
+
+`mirmut` mode (`tools/fuzz.py --mode mirmut`) mutates real `rustc --emit=mir`
+text and lowers it through the `.mir` input path (`rmc file.mir`). This is the
+only mode that reaches the back end's internal invariants with structurally
+broken input: the `.rs` modes cannot, because rustc rejects malformed source
+before it emits MIR. Every result must be a clean exit 0 or 1. It found two real
+panics on the first run — a function declaring no basic block (`facts_in[0]`
+indexed an empty vector) and a terminator targeting a block the function never
+declares (`merge_blocks` indexes `blocks[target]`) — both now rejected in
+`mir.rs::parse` and pinned by tests. It needs no rustc. When you add a MIR shape
+the passes assume, add a seed or a `MIR_TOKENS` fragment that violates it.
 
 A new generator must be checked for *validity*, not just a clean run. The first
 `ref` generator wrote `r.i0` (a field of the referent struct, not of the nested
