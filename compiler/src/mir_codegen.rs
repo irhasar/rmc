@@ -1542,10 +1542,15 @@ fn peephole(body: &str) -> String {
         if let Some((reg, slot)) = store_pair(lines[i]) {
             if i + 1 < lines.len() {
                 if let Some((lsrc, ldst)) = load_pair(lines[i + 1]) {
-                    if ldst == reg && lsrc == slot {
-                        // The load is redundant; keep the store and skip it.
+                    if lsrc == slot {
+                        // The value just stored is still in `reg`, so the load
+                        // is a memory round-trip for nothing: read `reg` instead
+                        // (and drop the load when it targets the same register).
                         out.push_str(lines[i]);
                         out.push('\n');
+                        if ldst != reg {
+                            out.push_str(&format!("  mov {reg}, {ldst}\n"));
+                        }
                         i += 2;
                         continue;
                     }

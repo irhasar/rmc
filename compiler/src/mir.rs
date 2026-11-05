@@ -1578,7 +1578,347 @@ fn split_top_semi(s: &str) -> Option<(&str, &str)> {
     None
 }
 
-/// Split at a top-level ` as ` (for a cast rvalue).
+// ---------------------------------------------------------------------------
+// Inlining
+// ---------------------------------------------------------------------------
+
+/// How many inlining rounds to run. Each round can expose fresh call sites (a
+/// call in a body that was itself inlined), so a couple of rounds are enough to
+/// flatten the small accessor chains the benchmarks use.
+const INLINE_ROUNDS: usize = 3;
+/// Never inline a body larger than this many blocks; it would grow the caller
+/// without bound and slow the compile down.
+const INLINE_MAX_BLOCKS: usize = 48;
+/// Stop inlining into a function once it grows past this many blocks. Guards
+/// against a deep call chain multiplying the body out of control.
+const INLINE_FUNC_MAX: usize = 400;
+
+/// Inline direct calls, repeatedly, until no more calls can be inlined. A call
+/// is inlined only when the callee is small, is not (transitively) able to call
+/// back into the caller, and every argument is a plain operand.
+///
+/// Inlining is what lets the AST backend's `licm` see through the `&self`
+/// accessors in `refs`; rustc leaves those calls in place at `-O`, so the MIR
+/// backend has to do it here.
+pub fn inline_calls(prog: &mut Program) {
+    for _ in 0..INLINE_ROUNDS {
+        let index: HashMap<String, Function> =
+            prog.funcs.iter().map(|f| (f.name.clone(), f.clone())).collect();
+        let reach = reachability(&index);
+        let mut changed = false;
+        for f in &mut prog.funcs {
+            let (blocks, locals, did) = inline_func(f, &index, &reach);
+            if did {
+                f.blocks = blocks;
+                f.locals = locals;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// For each function, the set of functions it can reach through direct calls
+/// (not including itself unless it recurses).
+fn reachability(index: &HashMap<String, Function>) -> HashMap<String, HashSet<String>> {
+    let mut reach = HashMap::new();
+    for name in index.keys() {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut stack = vec![name.clone()];
+        while let Some(n) = stack.pop() {
+            let Some(f) = index.get(&n) else { continue };
+            for b in &f.blocks {
+                if let Terminator::Call { func: CallTarget::Direct(c), .. } = &b.term {
+                    if seen.insert(c.clone()) {
+                        stack.push(c.clone());
+                    }
+                }
+            }
+        }
+        reach.insert(name.clone(), seen);
+    }
+    reach
+}
+
+/// Inline every eligible call in `f`, returning the rewritten body. `did` is
+/// false when nothing changed, so the caller can stop iterating.
+fn inline_func(
+    f: &Function,
+    index: &HashMap<String, Function>,
+    reach: &HashMap<String, HashSet<String>>,
+) -> (Vec<BasicBlock>, Vec<LocalDecl>, bool) {
+    let mut blocks: Vec<BasicBlock> = f.blocks.clone();
+    let mut locals: Vec<LocalDecl> = f.locals.clone();
+    let mut did = false;
+    let mut bb = 0;
+    // New blocks are appended as calls are inlined; scanning them too lets a
+    // call inside an inlined body be inlined in the same round.
+    while bb < blocks.len() {
+        if blocks.len() > INLINE_FUNC_MAX {
+            break;
+        }
+        let Terminator::Call { dest, func, args, target: Some(target) } = blocks[bb].term.clone()
+        else {
+            bb += 1;
+            continue;
+        };
+        let CallTarget::Direct(name) = &func else {
+            bb += 1;
+            continue;
+        };
+        if !can_inline(f, name, &dest, &args, &locals, index, reach) {
+            bb += 1;
+            continue;
+        }
+        let callee = &index[name];
+        do_inline(&mut blocks, &mut locals, bb, callee, &dest, &args, target);
+        did = true;
+        bb += 1;
+    }
+    (blocks, locals, did)
+}
+
+fn can_inline(
+    caller: &Function,
+    name: &str,
+    dest: &Place,
+    args: &[Operand],
+    locals: &[LocalDecl],
+    index: &HashMap<String, Function>,
+    reach: &HashMap<String, HashSet<String>>,
+) -> bool {
+    if name == caller.name {
+        return false;
+    }
+    let Some(callee) = index.get(name) else { return false };
+    // The callee must not be able to call back into the caller, or inlining
+    // would turn the caller recursive (and unroll forever). A self-recursive
+    // callee is refused for the same reason: its inlined copy would still hold
+    // the recursive call, which the next round would inline again.
+    if let Some(r) = reach.get(name) {
+        if r.contains(&caller.name) || r.contains(name) {
+            return false;
+        }
+    }
+    if callee.blocks.len() > INLINE_MAX_BLOCKS {
+        return false;
+    }
+    // A scalar destination keeps the return-value rewrite simple.
+    if !dest.proj.is_empty() || dest.local as usize >= locals.len() {
+        return false;
+    }
+    if callee.local_ty(0).is_aggregate() {
+        return false;
+    }
+    let params = callee_arg_locals(callee);
+    if params.len() != args.len() {
+        return false;
+    }
+    // A body the backend cannot model would just move the failure inward.
+    callee.blocks.iter().all(|b| !block_has_unsupported(b))
+}
+
+fn do_inline(
+    blocks: &mut Vec<BasicBlock>,
+    locals: &mut Vec<LocalDecl>,
+    bb: usize,
+    callee: &Function,
+    dest: &Place,
+    args: &[Operand],
+    target: u32,
+) {
+    let base = locals.len() as u32;
+    let block_base = blocks.len() as u32;
+    let join = block_base + callee.blocks.len() as u32;
+    let ctx = Remap { base, block_base, join };
+
+    // The callee's locals are copied in with fresh indices; none of them is an
+    // argument of the caller.
+    for l in &callee.locals {
+        locals.push(LocalDecl { ty: l.ty.clone(), is_arg: false, name: None });
+    }
+
+    // Parameter assignments, prepended to the callee entry block so the body
+    // reads `_1`, `_2`, ... as before. The arguments are the *caller's*
+    // operands, so they are copied verbatim, not remapped.
+    let mut entry_stmts: Vec<Stmt> = Vec::new();
+    for (p, a) in callee_arg_locals(callee).iter().zip(args.iter()) {
+        entry_stmts.push(Stmt::Assign(
+            Place { local: base + *p, proj: Vec::new() },
+            Rvalue::Use(a.clone()),
+        ));
+    }
+
+    // Clone and remap the callee body. `_0` becomes the caller's destination,
+    // and every `return` jumps to the join block.
+    let dest_local = dest.local;
+    let mut new_blocks: Vec<BasicBlock> = Vec::with_capacity(callee.blocks.len() + 1);
+    for (i, b) in callee.blocks.iter().enumerate() {
+        let mut stmts: Vec<Stmt> = b.stmts.iter().map(|s| ctx.stmt(s, dest_local)).collect();
+        if i == 0 {
+            let mut v = entry_stmts.clone();
+            v.append(&mut stmts);
+            stmts = v;
+        }
+        new_blocks.push(BasicBlock { stmts, term: ctx.term(&b.term, dest_local) });
+    }
+    // The join block returns to the original continuation.
+    new_blocks.push(BasicBlock { stmts: Vec::new(), term: Terminator::Goto(target) });
+
+    // The call site becomes a jump into the inlined entry block.
+    blocks[bb].term = Terminator::Goto(block_base);
+    blocks.extend(new_blocks);
+}
+
+/// The locals a function's signature binds as parameters, in order.
+fn callee_arg_locals(f: &Function) -> Vec<u32> {
+    let mut params: Vec<u32> = f
+        .locals
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.is_arg)
+        .map(|(i, _)| i as u32)
+        .collect();
+    params.sort_unstable();
+    params
+}
+
+/// Remapping of a callee's locals and blocks into the caller's namespace.
+struct Remap {
+    base: u32,
+    block_base: u32,
+    join: u32,
+}
+
+impl Remap {
+    fn block(&self, b: u32) -> u32 {
+        self.block_base + b
+    }
+
+    /// A callee local maps to a fresh caller local; the return slot (`_0`) is
+    /// left alone here and redirected by `place_ret`.
+    fn place(&self, p: &Place) -> Place {
+        Place {
+            local: if p.local == 0 { 0 } else { self.base + p.local },
+            proj: p
+                .proj
+                .iter()
+                .map(|pr| match pr {
+                    Proj::IndexLocal(l) => Proj::IndexLocal(self.base + l),
+                    other => other.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Like `place`, but a reference to the callee's `_0` is redirected to the
+    /// caller's call destination.
+    fn place_ret(&self, p: &Place, dest_local: u32) -> Place {
+        let mut q = self.place(p);
+        if p.local == 0 {
+            q.local = dest_local;
+        }
+        q
+    }
+
+    fn op(&self, o: &Operand) -> Operand {
+        match o {
+            Operand::Copy(p) => Operand::Copy(self.place(p)),
+            Operand::Move(p) => Operand::Move(self.place(p)),
+            Operand::Const(c) => Operand::Const(self.const_(c)),
+        }
+    }
+
+    fn op_ret(&self, o: &Operand, dest_local: u32) -> Operand {
+        match o {
+            Operand::Copy(p) => Operand::Copy(self.place_ret(p, dest_local)),
+            Operand::Move(p) => Operand::Move(self.place_ret(p, dest_local)),
+            Operand::Const(c) => Operand::Const(self.const_(c)),
+        }
+    }
+
+    fn const_(&self, c: &Const) -> Const {
+        match c {
+            Const::Alloc { id, place } => Const::Alloc {
+                id: *id,
+                place: place.as_ref().map(|p| Box::new(self.place(p))),
+            },
+            other => other.clone(),
+        }
+    }
+
+    fn stmt(&self, s: &Stmt, dest_local: u32) -> Stmt {
+        match s {
+            Stmt::Nop => Stmt::Nop,
+            Stmt::Assign(p, rv) => {
+                Stmt::Assign(self.place_ret(p, dest_local), self.rv(rv, dest_local))
+            }
+        }
+    }
+
+    fn rv(&self, rv: &Rvalue, dest_local: u32) -> Rvalue {
+        match rv {
+            Rvalue::Use(o) => Rvalue::Use(self.op_ret(o, dest_local)),
+            Rvalue::Binary(op, a, b) => Rvalue::Binary(*op, self.op(a), self.op(b)),
+            Rvalue::Unary(op, a) => Rvalue::Unary(*op, self.op(a)),
+            Rvalue::Cast { from, to, op, kind } => Rvalue::Cast {
+                from: from.clone(),
+                to: to.clone(),
+                op: self.op(op),
+                kind: *kind,
+            },
+            Rvalue::Ref { mutbl, place } => {
+                Rvalue::Ref { mutbl: *mutbl, place: self.place(place) }
+            }
+            Rvalue::RawRef { mutbl, place } => {
+                Rvalue::RawRef { mutbl: *mutbl, place: self.place(place) }
+            }
+            Rvalue::Repeat { op, count } => Rvalue::Repeat { op: self.op(op), count: *count },
+            Rvalue::Array(ops) => Rvalue::Array(ops.iter().map(|o| self.op(o)).collect()),
+            Rvalue::Aggregate(ops) => Rvalue::Aggregate(ops.iter().map(|o| self.op(o)).collect()),
+            Rvalue::Len(p) => Rvalue::Len(self.place(p)),
+            Rvalue::WithOverflow { op, a, b } => {
+                Rvalue::WithOverflow { op: *op, a: self.op(a), b: self.op(b) }
+            }
+            Rvalue::Discriminant(p) => Rvalue::Discriminant(self.place(p)),
+            Rvalue::Unsupported(s) => Rvalue::Unsupported(s.clone()),
+        }
+    }
+
+    fn term(&self, t: &Terminator, dest_local: u32) -> Terminator {
+        match t {
+            Terminator::Goto(b) => Terminator::Goto(self.block(*b)),
+            Terminator::SwitchInt { discr, targets, otherwise } => Terminator::SwitchInt {
+                discr: self.op(discr),
+                targets: targets.iter().map(|(v, b)| (*v, self.block(*b))).collect(),
+                otherwise: self.block(*otherwise),
+            },
+            Terminator::Return => Terminator::Goto(self.join),
+            Terminator::Call { dest, func, args, target } => Terminator::Call {
+                dest: self.place_ret(dest, dest_local),
+                func: func.clone(),
+                args: args.iter().map(|a| self.op(a)).collect(),
+                target: target.map(|b| self.block(b)),
+            },
+            Terminator::Unreachable => Terminator::Unreachable,
+            Terminator::Abort => Terminator::Abort,
+            Terminator::Assert { cond, negate, target } => Terminator::Assert {
+                cond: self.op(cond),
+                negate: *negate,
+                target: self.block(*target),
+            },
+        }
+    }
+}
+
+/// True when a block contains an rvalue the backend cannot lower, so inlining it
+/// would not help.
+fn block_has_unsupported(b: &BasicBlock) -> bool {
+    b.stmts.iter().any(|s| matches!(s, Stmt::Assign(_, Rvalue::Unsupported(_))))
+}
+
 fn split_top_as(s: &str) -> Option<(&str, &str)> {
     let bytes = s.as_bytes();
     let mut depth = 0i32;
@@ -1617,10 +1957,20 @@ fn pure_call(name: &str) -> bool {
     !matches!(name, "alloc" | "print_i64" | "print_str" | "putchar" | "free")
 }
 
-/// Run loop-invariant code motion over the whole crate.
+/// Run loop-invariant code motion over the whole crate, to a fixpoint: hoisting
+/// a binding can make the loads that read through it invariant on the next
+/// round.
 pub fn licm(prog: &mut Program) {
-    for f in &mut prog.funcs {
-        f.licm();
+    for _ in 0..INLINE_ROUNDS {
+        let mut changed = false;
+        for f in &mut prog.funcs {
+            if f.licm_once() {
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
     }
 }
 
@@ -1644,10 +1994,10 @@ impl Function {
     ///
     /// The preheader is the loop header's only predecessor. Hoisting to it is
     /// safe because it is entered on the way to the loop and executed once.
-    fn licm(&mut self) {
+    fn licm_once(&mut self) -> bool {
         let nblocks = self.blocks.len();
         if nblocks == 0 {
-            return;
+            return false;
         }
         let defs = self.def_counts();
         let use_counts = self.use_counts();
@@ -1679,9 +2029,13 @@ impl Function {
         let mut headers: Vec<u32> = latches.keys().copied().collect();
         headers.sort_unstable();
 
+        let mut any_changed = false;
         for header in headers {
-            self.licm_loop(header, &latches, &preds, &defs, &use_counts, &writes_mem, &impure_call);
+            if self.licm_loop(header, &latches, &preds, &defs, &use_counts, &writes_mem, &impure_call) {
+                any_changed = true;
+            }
         }
+        any_changed
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1694,7 +2048,7 @@ impl Function {
         use_counts: &HashMap<u32, u32>,
         writes_mem: &[bool],
         impure_call: &[bool],
-    ) {
+    ) -> bool {
         // The preheader is the header's only predecessor from *outside* the
         // loop: then the loop is entered from exactly one place, and hoisting to
         // it runs once. (The latches are predecessors too, but they are inside.)
@@ -1705,17 +2059,17 @@ impl Function {
             .filter(|p| !loop_blocks.contains(p))
             .collect();
         if outside.len() != 1 {
-            return;
+            return false;
         }
         let preheader = outside.pop().unwrap();
         if preheader == header {
-            return;
+            return false;
         }
         // Redirecting the preheader into the hoisted-call chain replaces its
         // terminator, so it must be a plain `goto` to the header; a conditional
         // preheader would lose its other edge.
         if !matches!(self.blocks[preheader as usize].term, Terminator::Goto(t) if t == header) {
-            return;
+            return false;
         }
         // A loop that writes memory, or calls anything impure, gives up: a call
         // can read or write state a hoisted load would have to observe.
@@ -1723,7 +2077,7 @@ impl Function {
             .iter()
             .any(|b| writes_mem[*b as usize] || impure_call[*b as usize])
         {
-            return;
+            return false;
         }
         // Values defined inside the loop cannot be read outside it. Call
         // destinations are terminators, not statements, so they are collected
@@ -1821,7 +2175,7 @@ impl Function {
         }
 
         if hoisted.is_empty() && hoisted_calls.is_empty() {
-            return;
+            return false;
         }
 
         // Remove the hoisted statements from their blocks. A statement is
@@ -1876,6 +2230,7 @@ impl Function {
         new_stmts.append(&mut pre.stmts);
         pre.stmts = new_stmts;
         pre.term = Terminator::Goto(chain_entry);
+        true
     }
 
     /// The set of blocks that make up the loop with the given header: every
@@ -1926,19 +2281,23 @@ fn call_args_invariant(args: &[Operand], is_invariant: &impl Fn(u32) -> bool) ->
     })
 }
 
-/// True when a block contains anything that could write memory: a store, an
-/// address-taking rvalue, or a call to a function that is not known pure. A
-/// pure call is not a store, so it does not block hoisting a load past it.
+/// True when a block contains anything that could write memory: a store through
+/// a projection (`*p = x`, `arr[i] = x`), an address-taking rvalue, or a call to
+/// a function that is not known pure. A pure call is not a store, so it does not
+/// block hoisting a load past it.
 fn block_writes_mem(b: &BasicBlock) -> bool {
     b.stmts.iter().any(|s| match s {
-        Stmt::Assign(_, rv) => matches!(
-            rv,
-            Rvalue::Ref { .. }
-                | Rvalue::RawRef { .. }
-                | Rvalue::Array(_)
-                | Rvalue::Aggregate(_)
-                | Rvalue::Repeat { .. }
-        ),
+        Stmt::Assign(dest, rv) => {
+            !dest.proj.is_empty()
+                || matches!(
+                    rv,
+                    Rvalue::Ref { .. }
+                        | Rvalue::RawRef { .. }
+                        | Rvalue::Array(_)
+                        | Rvalue::Aggregate(_)
+                        | Rvalue::Repeat { .. }
+                )
+        }
         Stmt::Nop => false,
     }) || block_has_impure_call(b)
 }
@@ -1952,11 +2311,14 @@ fn block_has_impure_call(b: &BasicBlock) -> bool {
     }
 }
 
-/// True when an rvalue is cheap and pure enough to hoist: a use, a scalar
-/// arithmetic op, or a direct call to a pure function.
+/// True when an rvalue is cheap and pure enough to hoist: a load or copy, a
+/// scalar arithmetic op, or a cast. A copy of an invariant value is hoisted too,
+/// because it is often the binding of an inlined call's argument: hoisting it
+/// first is what makes the loads that read through it invariant on a later
+/// round.
 fn hoistable_rv(rv: &Rvalue) -> bool {
     match rv {
-        Rvalue::Use(_) => false, // a bare move is not worth hoisting
+        Rvalue::Use(_) => true,
         Rvalue::Binary(op, _, _) => !matches!(op, BinOp::Div | BinOp::Rem),
         Rvalue::Unary(_, _) => true,
         Rvalue::Cast { .. } => true,
