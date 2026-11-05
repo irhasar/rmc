@@ -1144,15 +1144,22 @@ impl Parser {
         self.expect(Tok::Match)?;
         let scrutinee = self.parse_cond()?;
         self.expect(Tok::LBrace)?;
-        let mut arms: Vec<(Pat, Expr)> = Vec::new();
+        let mut arms: Vec<(Pat, Option<Expr>, Expr)> = Vec::new();
         while self.peek() != Some(&Tok::RBrace) {
             if self.peek().is_none() {
                 return Err(format!("at byte {}: unexpected end of input in `match`", self.pos()));
             }
             let pat = self.parse_pattern()?;
+            // An optional guard: `pat if cond => body`. The condition is parsed
+            // like an `if` condition, so a struct literal needs parentheses.
+            let guard = if self.eat(&Tok::If) {
+                Some(self.parse_cond()?)
+            } else {
+                None
+            };
             self.expect(Tok::FatArrow)?;
             let body = self.parse_arm_body()?;
-            arms.push((pat, body));
+            arms.push((pat, guard, body));
             // A comma separates arms, but a block-bodied arm may omit it, so
             // only `}` ends the list early.
             if self.eat(&Tok::Comma) {
@@ -1258,7 +1265,7 @@ impl Parser {
     /// with `_` becomes the `else` (so any arm after it is unreachable, as in
     /// Rust). With no `_`, the chain has no final `else`, so a non-matching
     /// value yields `()`.
-    fn desugar_match(&mut self, scrutinee: Expr, arms: Vec<(Pat, Expr)>) -> Expr {
+    fn desugar_match(&mut self, scrutinee: Expr, arms: Vec<(Pat, Option<Expr>, Expr)>) -> Expr {
         self.desugar_match_arms(scrutinee, arms, false)
     }
 
@@ -1269,12 +1276,14 @@ impl Parser {
     fn desugar_match_arms(
         &mut self,
         scrutinee: Expr,
-        arms: Vec<(Pat, Expr)>,
+        arms: Vec<(Pat, Option<Expr>, Expr)>,
         check_dead_arms: bool,
     ) -> Expr {
         // A `_` or binding arm makes the match exhaustive in every position;
-        // an or-pattern is irrefutable when any alternative is (`1 | _`).
-        let has_catch_all = arms.iter().any(|(p, _)| Self::pat_irrefutable(p));
+        // an or-pattern is irrefutable when any alternative is (`1 | _`). A
+        // *guarded* irrefutable arm is not a catch-all: `_ if c` can fail, so
+        // the arms after it are still reachable.
+        let has_catch_all = arms.iter().any(|(p, g, _)| g.is_none() && Self::pat_irrefutable(p));
         let (subj, prelude) = match scrutinee {
             Expr::Var { .. } | Expr::Int(_) | Expr::EnumVariant { .. } => (scrutinee, None),
             other => {
@@ -1289,8 +1298,8 @@ impl Parser {
             }
         };
         let mut acc: Option<Expr> = None;
-        for (pat, body) in arms.into_iter().rev() {
-            acc = Some(Self::desugar_arm(pat, &subj, body, acc, check_dead_arms));
+        for (pat, guard, body) in arms.into_iter().rev() {
+            acc = Some(Self::desugar_arm(pat, guard, &subj, body, acc, check_dead_arms));
         }
         let acc = acc.expect("a `match` has at least one arm");
         let acc = Expr::MatchBoundary(
@@ -1314,7 +1323,7 @@ impl Parser {
             Some(b) => Expr::Block(b),
             None => Expr::Block(Block { stmts: Vec::new(), tail: None }),
         };
-        let arms = vec![(pat, Expr::Block(then)), (Pat::Wild, fallback)];
+        let arms = vec![(pat, None, Expr::Block(then)), (Pat::Wild, None, fallback)];
         self.desugar_match_arms(scrutinee, arms, true)
     }
 
@@ -1387,76 +1396,78 @@ impl Parser {
         }
     }
 
-    fn desugar_arm(pat: Pat, subj: &Expr, body: Expr, rest: Option<Expr>, check_dead: bool) -> Expr {
-        match pat {
-            Pat::Wild => Self::irrefutable_arm(body, rest, check_dead),
+    fn desugar_arm(
+        pat: Pat,
+        guard: Option<Expr>,
+        subj: &Expr,
+        body: Expr,
+        rest: Option<Expr>,
+        check_dead: bool,
+    ) -> Expr {
+        // Each pattern yields its test (`None` when it is irrefutable) and any
+        // bindings it introduces. The test is an ordinary expression, so sema
+        // and codegen need no new case for a guard: it is folded in with `&&`,
+        // and an irrefutable arm's guard becomes the whole `if` condition.
+        let (bindings, test): (Vec<Stmt>, Option<Expr>) = match pat {
+            Pat::Wild => (Vec::new(), None),
             // `name => body` binds the whole scrutinee.
-            Pat::Bind(name) => Expr::Block(Block {
-                stmts: vec![Stmt::Let {
+            Pat::Bind(name) => (
+                vec![Stmt::Let {
                     name,
                     ty: None,
                     init: Some(subj.clone()),
                     slot: -1,
                     mutable: false,
                 }],
-                tail: Some(Box::new(Self::irrefutable_arm(body, rest, check_dead))),
-            }),
-            Pat::Int(k) => {
-                let cond = Expr::Bin(BinOp::Eq, Box::new(subj.clone()), Box::new(Expr::Int(k)));
-                Self::match_arm(cond, body, rest)
-            }
+                None,
+            ),
+            Pat::Int(k) => (
+                Vec::new(),
+                Some(Expr::Bin(BinOp::Eq, Box::new(subj.clone()), Box::new(Expr::Int(k)))),
+            ),
             // A string literal pattern: a content compare, which sema lowers to
             // the byte-wise helper (a pointer compare would never match).
-            Pat::Str(s) => {
-                let cond = Expr::Bin(BinOp::Eq, Box::new(subj.clone()), Box::new(Expr::Str(s)));
-                Self::match_arm(cond, body, rest)
-            }
+            Pat::Str(s) => (
+                Vec::new(),
+                Some(Expr::Bin(BinOp::Eq, Box::new(subj.clone()), Box::new(Expr::Str(s)))),
+            ),
             // `lo..hi` is `lo <= s && s < hi`; `lo..=hi` uses `<=` on both
             // sides. A plain `Bin(And, ..)` of comparisons, so sema and codegen
             // need no new case.
             Pat::Range(lo, hi, inclusive) => {
-                let lower = Expr::Bin(
-                    BinOp::Le,
-                    Box::new(Expr::Int(lo)),
-                    Box::new(subj.clone()),
-                );
+                let lower =
+                    Expr::Bin(BinOp::Le, Box::new(Expr::Int(lo)), Box::new(subj.clone()));
                 let upper = Expr::Bin(
                     if inclusive { BinOp::Le } else { BinOp::Lt },
                     Box::new(subj.clone()),
                     Box::new(Expr::Int(hi)),
                 );
-                let cond = Expr::Bin(BinOp::And, Box::new(lower), Box::new(upper));
-                Self::match_arm(cond, body, rest)
+                (Vec::new(), Some(Expr::Bin(BinOp::And, Box::new(lower), Box::new(upper))))
             }
             // `a | b | c => body` runs `body` when any alternative matches, so
-            // fold the alternatives into `cond_a || cond_b || cond_c` with the
-            // *same* body and `rest`. `or_cond` builds just the test; the body
-            // is not duplicated.
+            // fold the alternatives into `cond_a || cond_b || cond_c`. `or_cond`
+            // builds just the test; the body is not duplicated.
             Pat::Or(alts) => {
                 // An or-pattern with a `_` alternative matches every value, so
-                // the arm is irrefutable: build `body` directly instead of an
-                // `if` that would need an `else`.
+                // the arm is irrefutable.
                 if alts.iter().any(|a| matches!(a, Pat::Wild)) {
-                    return Self::irrefutable_arm(body, rest, check_dead);
+                    (Vec::new(), None)
+                } else {
+                    let mut cond = Self::or_cond(&alts[0], subj);
+                    for alt in &alts[1..] {
+                        cond = Expr::Bin(BinOp::Or, Box::new(cond), Box::new(Self::or_cond(alt, subj)));
+                    }
+                    (Vec::new(), Some(cond))
                 }
-                let mut cond = Self::or_cond(&alts[0], subj);
-                for alt in &alts[1..] {
-                    cond = Expr::Bin(
-                        BinOp::Or,
-                        Box::new(cond),
-                        Box::new(Self::or_cond(alt, subj)),
-                    );
-                }
-                Self::match_arm(cond, body, rest)
             }
             // `true`/`false` become a `BoolTest`, not a `Bin(Eq, ..)`, so a
             // chain of them can be recognised as an exhaustive bool match.
-            Pat::Bool(b) => {
-                let cond = Expr::BoolTest { scrutinee: Box::new(subj.clone()), value: b };
-                Self::match_arm(cond, body, rest)
-            }
-            Pat::Variant(enum_name, variant, bindings) => {
-                let n_binds = match &bindings {
+            Pat::Bool(b) => (
+                Vec::new(),
+                Some(Expr::BoolTest { scrutinee: Box::new(subj.clone()), value: b }),
+            ),
+            Pat::Variant(enum_name, variant, payload) => {
+                let n_binds = match &payload {
                     Some(names) => names.len() as i32,
                     None => -1,
                 };
@@ -1468,32 +1479,59 @@ impl Parser {
                     n_binds,
                 };
                 // `Enum::V(w, x)` binds each payload field in the arm body.
-                let body = match bindings {
-                    Some(names) if !names.is_empty() => {
-                        let stmts = names
-                            .into_iter()
-                            .enumerate()
-                            .map(|(idx, name)| Stmt::Let {
-                                name,
-                                ty: None,
-                                mutable: false,
-                                init: Some(Expr::EnumPayload {
-                                    recv: Box::new(subj.clone()),
-                                    enum_name: enum_name.clone(),
-                                    variant: variant.clone(),
-                                    idx,
-                                    offset: 0,
-                                    ty: Type::Unit,
-                                }),
-                                slot: -1,
-                            })
-                            .collect();
-                        Expr::Block(Block { stmts, tail: Some(Box::new(body)) })
-                    }
-                    _ => body,
+                let binds = match payload {
+                    Some(names) => names
+                        .into_iter()
+                        .enumerate()
+                        .map(|(idx, name)| Stmt::Let {
+                            name,
+                            ty: None,
+                            mutable: false,
+                            init: Some(Expr::EnumPayload {
+                                recv: Box::new(subj.clone()),
+                                enum_name: enum_name.clone(),
+                                variant: variant.clone(),
+                                idx,
+                                offset: 0,
+                                ty: Type::Unit,
+                            }),
+                            slot: -1,
+                        })
+                        .collect(),
+                    None => Vec::new(),
+                };
+                (binds, Some(cond))
+            }
+        };
+        let arm = match test {
+            Some(cond) => {
+                // `pat if g => body` is `pat => body` only when `g` holds, so
+                // the guard joins the pattern test with `&&` and a failed guard
+                // falls through to `rest`.
+                let cond = match guard {
+                    Some(g) => Expr::Bin(BinOp::And, Box::new(cond), Box::new(g)),
+                    None => cond,
                 };
                 Self::match_arm(cond, body, rest)
             }
+            // An irrefutable arm: without a guard it always matches (and `rest`
+            // is dead); with one it is `if g { body } else { rest }`. The guard
+            // is paired with a literal `true` pattern test so the
+            // exhaustiveness walk can tell a guarded binding arm (covers
+            // nothing) from an unguarded one (covers everything).
+            None => match guard {
+                None => Self::irrefutable_arm(body, rest, check_dead),
+                Some(g) => Self::match_arm(
+                    Expr::Bin(BinOp::And, Box::new(Expr::Bool(true)), Box::new(g)),
+                    body,
+                    rest,
+                ),
+            },
+        };
+        if bindings.is_empty() {
+            arm
+        } else {
+            Expr::Block(Block { stmts: bindings, tail: Some(Box::new(arm)) })
         }
     }
 

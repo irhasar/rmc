@@ -653,6 +653,55 @@ impl Sema {
         }
     }
 
+    /// Whether `e` is a pattern test as `desugar_arm` emits it: a variant or
+    /// bool test, an or-pattern folded into a tree of `Bin(Or, ..)`, or the
+    /// literal `true` a guarded binding arm uses as a stand-in pattern test
+    /// (`n if g` binds everything, so its only test is the guard).
+    fn is_pattern_test(e: &Expr) -> bool {
+        match e {
+            Expr::VariantTest { .. } | Expr::BoolTest { .. } | Expr::Bool(true) => true,
+            Expr::Bin(BinOp::Or, a, b) => Self::is_pattern_test(a) && Self::is_pattern_test(b),
+            _ => false,
+        }
+    }
+
+    /// The pattern test of a `match` arm condition, with any guard stripped.
+    /// `desugar_arm` folds `pat if g` into `Bin(And, test, g)`, so the
+    /// exhaustiveness walk must look through that `And` to see the test. A
+    /// range pattern also folds to `And` (`lo <= s && s < hi`), which is why
+    /// the strip only fires when the left side is a pattern test.
+    fn arm_pattern_test(cond: &Expr) -> &Expr {
+        match cond {
+            Expr::Bin(BinOp::And, a, _) if Self::is_pattern_test(a) => a,
+            _ => cond,
+        }
+    }
+
+    /// The guard of a `match` arm condition, if any. A guarded arm covers
+    /// *nothing* for exhaustiveness (the guard may be false), exactly as in
+    /// rustc, so the walk skips it entirely.
+    fn arm_guard(cond: &Expr) -> Option<&Expr> {
+        match cond {
+            Expr::Bin(BinOp::And, a, b) if Self::is_pattern_test(a) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// The `if` that continues a desugared `match` chain. An arm that binds
+    /// payload fields (`O::S(v) => ..`) wraps its `if` in a block holding the
+    /// binding `let`s, so the chain walk must look through those wrappers to
+    /// reach the next test.
+    fn chain_tail(expr: Option<&Expr>) -> Option<(&Expr, &Option<Block>)> {
+        let mut e = expr?;
+        loop {
+            match e {
+                Expr::Block(b) => e = b.tail.as_deref()?,
+                Expr::If(cond, _, els) => return Some((cond, els)),
+                _ => return None,
+            }
+        }
+    }
+
     fn if_chain_is_exhaustive(&self, cond: &Expr, els: &Option<Block>) -> bool {
         // Every condition must test the same thing: all the variants of one
         // enum, or both values of one `bool`. A chain that mixes the two, or
@@ -671,65 +720,64 @@ impl Sema {
         let mut cur_cond = cond;
         let mut cur_els = els;
         loop {
-            // An arm's condition may be an or-pattern, folded into a tree of
-            // `Bin(Or, ..)`; flatten it and treat every leaf as a distinct case,
-            // so `C::R | C::G` contributes both variants. A range pattern folds
-            // to `Bin(And, ..)`, which is not a leaf and makes the chain
-            // non-exhaustive by these rules (rustc would need interval
-            // reasoning), so it is rejected here.
-            let mut leaves: Vec<&Expr> = Vec::new();
-            if !Self::or_leaves(cur_cond, &mut leaves) {
-                return false;
-            }
-            for leaf in leaves {
-                match leaf {
-                    Expr::VariantTest { enum_name, variant, .. } => {
-                        match kind {
-                            Some(Kind::Enum(e)) if e == enum_name.as_str() => {}
-                            None => kind = Some(Kind::Enum(enum_name.as_str())),
-                            _ => return false,
-                        }
-                        if seen_variants.contains(&variant.as_str()) {
-                            return false;
-                        }
-                        seen_variants.push(variant.as_str());
-                    }
-                    Expr::BoolTest { scrutinee, value } => {
-                        // `desugar_match` only tests a `Var` (the temporary it
-                        // bound the scrutinee to, or a bool variable); anything
-                        // else cannot be proven the same across arms.
-                        let name = match scrutinee.as_ref() {
-                            Expr::Var { name, .. } => name.as_str(),
-                            _ => return false,
-                        };
-                        match kind {
-                            Some(Kind::Bool(s)) if s == name => {}
-                            None => kind = Some(Kind::Bool(name)),
-                            _ => return false,
-                        }
-                        if seen_bools.contains(value) {
-                            return false;
-                        }
-                        seen_bools.push(*value);
-                    }
-                    _ => return false,
+            // A guarded arm covers nothing for exhaustiveness: its guard may be
+            // false, so the arm can always be skipped. rustc's rule (RFC 2005),
+            // so `match x { n if n > 3 => 1 }` is non-exhaustive even though
+            // `n` binds every value. The guard's leaves are simply not counted.
+            if Self::arm_guard(cur_cond).is_none() {
+                // An arm's condition may be an or-pattern, folded into a tree of
+                // `Bin(Or, ..)`; flatten it and treat every leaf as a distinct
+                // case, so `C::R | C::G` contributes both variants. A range
+                // pattern folds to `Bin(And, ..)`, which is not a leaf and makes
+                // the chain non-exhaustive by these rules (rustc would need
+                // interval reasoning), so it is rejected here.
+                let mut leaves: Vec<&Expr> = Vec::new();
+                if !Self::or_leaves(Self::arm_pattern_test(cur_cond), &mut leaves) {
+                    return false;
                 }
-            }
-            match cur_els {
-                None => break,
-                Some(block) => {
-                    // An arm body is `{ body }`; only the nested `else` chains.
-                    if !block.stmts.is_empty() {
-                        return false;
-                    }
-                    match block.tail.as_deref() {
-                        Some(Expr::If(cond, _, els)) => {
-                            cur_cond = cond;
-                            cur_els = els;
+                for leaf in leaves {
+                    match leaf {
+                        Expr::VariantTest { enum_name, variant, .. } => {
+                            match kind {
+                                Some(Kind::Enum(e)) if e == enum_name.as_str() => {}
+                                None => kind = Some(Kind::Enum(enum_name.as_str())),
+                                _ => return false,
+                            }
+                            // A repeated variant (a guarded arm that covered it
+                            // is skipped above, so this only sees unguarded
+                            // ones) is redundant, not a gap: rustc accepts it.
+                            if !seen_variants.contains(&variant.as_str()) {
+                                seen_variants.push(variant.as_str());
+                            }
+                        }
+                        Expr::BoolTest { scrutinee, value } => {
+                            // `desugar_match` only tests a `Var` (the temporary
+                            // it bound the scrutinee to, or a bool variable);
+                            // anything else cannot be proven the same across
+                            // arms.
+                            let name = match scrutinee.as_ref() {
+                                Expr::Var { name, .. } => name.as_str(),
+                                _ => return false,
+                            };
+                            match kind {
+                                Some(Kind::Bool(s)) if s == name => {}
+                                None => kind = Some(Kind::Bool(name)),
+                                _ => return false,
+                            }
+                            if !seen_bools.contains(value) {
+                                seen_bools.push(*value);
+                            }
                         }
                         _ => return false,
                     }
                 }
+            }
+            match Self::chain_tail(cur_els.as_ref().and_then(|b| b.tail.as_deref())) {
+                Some((c, e)) => {
+                    cur_cond = c;
+                    cur_els = e;
+                }
+                None => break,
             }
         }
         match kind {
@@ -748,9 +796,9 @@ impl Sema {
     /// called before the chain is checked, so a nested `match`'s own
     /// `MatchBoundary` (not a bare `If`) still delimits the walk.
     fn match_chain_is_exhaustive(&self, b: &Block) -> bool {
-        match b.tail.as_deref() {
-            Some(Expr::If(cond, _, els)) => self.if_chain_is_exhaustive(cond, els),
-            _ => false,
+        match Self::chain_tail(b.tail.as_deref()) {
+            Some((cond, els)) => self.if_chain_is_exhaustive(cond, els),
+            None => false,
         }
     }
 

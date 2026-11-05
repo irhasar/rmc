@@ -756,6 +756,14 @@ def gen_pat_program(rng):
         f"fn striflet(sel: i64) -> i64 {{ let s = if sel == 0 {{ {s0} }} else {{ {s1} }}; if let {s0} = s {{ 5 }} else {{ 6 }} }}",
         f"fn strbind(sel: i64) -> i64 {{ let s = if sel == 0 {{ {s0} }} else {{ {s1} }}; return match s {{ {s0} => 1, other => if other == {s1} {{ 2 }} else {{ 3 }} }}; }}",
         f"fn armassign(x: i64) -> i64 {{ let mut a: i64 = 100; match x % 3 {{ 0 => a = a + 1, 1 => a += 10, _ => a = a - 5 }} return a; }}",
+        f"fn gguard(x: i64) -> i64 {{ return match x {{ n if n > {v} => 100, n if n > {v} - 3 => 200, _ => 0 }}; }}",
+        f"fn gbind(x: i64) -> i64 {{ return match x {{ n if n % 2 == 1 => n * 3, _ => 0 }}; }}",
+        f"fn gcolor(c: Color) -> i64 {{ return match c {{ Color::{colors[0]} if c as i64 == 0 => 1, _ => 2 }}; }}",
+        "fn gshape(s: Shape) -> i64 { return match s { Shape::Line(w) if w > 3 => w, Shape::Line(w) => 0 - w, _ => 0 }; }",
+        f"fn gorpat(x: i64) -> i64 {{ return match x {{ {v} | {v + 1} if x > {v} => 1, _ => 0 }}; }}",
+        f"fn grange(x: i64) -> i64 {{ return match x {{ n if n > 0 && n < {v + 5} => 1, _ => 0 }}; }}",
+        "fn gbool(b: bool) -> i64 { return match b { true if b => 1, _ => 0 }; }",
+        f"fn gwild(x: i64) -> i64 {{ return match x {{ _ if x == {v} => 9, _ => 8 }}; }}",
         "fn main() -> i64 {",
         "    let mut acc: i64 = 0;",
         f"    let arr: [i64; 4] = [{a0}, {a1}, {v}, {k}];",
@@ -776,6 +784,8 @@ def gen_pat_program(rng):
         "        acc = acc + iflet_color(c) + iflet_rect(s);",
         "        acc = acc + strmatch(i % 2) + stror(i % 2) + striflet(i % 2) + strbind(i % 2);",
         "        acc = acc + armassign(i);",
+        "        acc = acc + gguard(i) + gbind(i) + gorpat(i) + grange(i);",
+        "        acc = acc + gcolor(c) + gshape(s) + gbool(i % 2 == 0) + gwild(i);",
         "        i = i + 1;",
         "    }",
         "    print_i64(acc);",
@@ -819,6 +829,14 @@ def gen_pat_program(rng):
         f"fn striflet(sel: i64) -> i64 {{ let s = if sel == 0 {{ {s0} }} else {{ {s1} }}; if let {s0} = s {{ 5 }} else {{ 6 }} }}",
         f"fn strbind(sel: i64) -> i64 {{ let s = if sel == 0 {{ {s0} }} else {{ {s1} }}; match s {{ {s0} => 1, other => if other == {s1} {{ 2 }} else {{ 3 }} }} }}",
         f"fn armassign(x: i64) -> i64 {{ let mut a: i64 = 100; match x % 3 {{ 0 => a = a + 1, 1 => a += 10, _ => a = a - 5 }} return a; }}",
+        f"fn gguard(x: i64) -> i64 {{ match x {{ n if n > {v} => 100, n if n > {v} - 3 => 200, _ => 0 }} }}",
+        f"fn gbind(x: i64) -> i64 {{ match x {{ n if n % 2 == 1 => n * 3, _ => 0 }} }}",
+        f"fn gcolor(c: Color) -> i64 {{ match c {{ Color::{colors[0]} if c as i64 == 0 => 1, _ => 2 }} }}",
+        "fn gshape(s: Shape) -> i64 { match s { Shape::Line(w) if w > 3 => w, Shape::Line(w) => 0 - w, _ => 0 } }",
+        f"fn gorpat(x: i64) -> i64 {{ match x {{ {v} | {v + 1} if x > {v} => 1, _ => 0 }} }}",
+        f"fn grange(x: i64) -> i64 {{ match x {{ n if n > 0 && n < {v + 5} => 1, _ => 0 }} }}",
+        "fn gbool(b: bool) -> i64 { match b { true if b => 1, _ => 0 } }",
+        f"fn gwild(x: i64) -> i64 {{ match x {{ _ if x == {v} => 9, _ => 8 }} }}",
         "fn main() {",
         "    let mut acc: i64 = 0;",
         f"    let arr: [i64; 4] = [{a0}, {a1}, {v}, {k}];",
@@ -839,6 +857,8 @@ def gen_pat_program(rng):
         "        acc += iflet_color(c) + iflet_rect(s);",
         "        acc += strmatch(i % 2) + stror(i % 2) + striflet(i % 2) + strbind(i % 2);",
         "        acc += armassign(i);",
+        "        acc += gguard(i) + gbind(i) + gorpat(i) + grange(i);",
+        "        acc += gcolor(c) + gshape(s) + gbool(i % 2 == 0) + gwild(i);",
         "        i += 1;",
         "    }",
         '    println!("{}", acc);',
@@ -1155,6 +1175,16 @@ def reject_corpus():
         "stmt_in_loop": stmt(
             "let mut i: i64 = 0; while i < 1 { match e { E::A => { print_i64(1); } } i = i + 1; }",
             rs_decl="let e = E::A;"),
+        # A guarded arm covers nothing for exhaustiveness — the guard may be
+        # false, so `E::A if ..` does not cover `A` (rustc's E0004). A match
+        # that would be exhaustive without the guard is non-exhaustive with it.
+        "guard_variant_gap": both("match a { E::A if a as i64 == 0 => 1, E::B => 2 }"),
+        # A *guarded binding* arm covers nothing either, even though a bare
+        # binding would: `e if ..` is not a catch-all.
+        "guard_binding_not_catchall": both("match a { e if e as i64 == 0 => 1 }"),
+        # Same, in statement position: the arms are unit-typed, so only the
+        # exhaustiveness walk rejects it.
+        "stmt_guard_gap": stmt("match e { E::A if 1 == 1 => { print_i64(1); } }"),
         # Assignment to an immutable binding. rmc used to accept these and let
         # codegen write the slot; rustc rejects each with E0384.
         "assign_immutable_let": (

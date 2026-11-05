@@ -82,6 +82,12 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   `_` alternative, and one whose alternatives cover every variant, are handled
   by `pat_irrefutable` and `or_leaves` (in sema) respectively. A *binding*
   alternative is rejected, as rustc's E0408 rejects it.
+  An arm may carry a *guard*, `PAT if COND => body`. `parse_match` reads the
+  optional `if COND` after the pattern (`parse_cond`, so a struct literal needs
+  parentheses) and threads it through `desugar_arm` as an `Option<Expr>`. The
+  guard folds into the arm's condition rather than becoming a node, so sema and
+  codegen gain no case; see the exhaustiveness notes below for the three rules a
+  guard changes.
   `while let PAT = EXPR { body }` is parsed here and desugared by
   `desugar_while_let` to `loop { if let PAT = EXPR { body } else { break; } }`,
   reusing the `if let` path, so sema and codegen gain no case. The scrutinee sits
@@ -881,6 +887,36 @@ fall-through to `()` is harmless, so `Sema`'s `MatchBoundary` arm also decides
 exhaustiveness (`match_chain_is_exhaustive`, plus the catch-all flag the parser
 records) and errors when it fails. Do not relax this to statement position only:
 rustc rejects a non-exhaustive `match` there too, and rmc must match rustc.
+
+A guard (`PAT if COND => body`) is desugared, not given a node: `desugar_arm`
+folds it into the pattern test as `Bin(And, test, cond)`, and an *irrefutable*
+arm's guard (no test of its own) becomes the whole `if` condition, paired with a
+literal `true` test so the exhaustiveness walk can still recognise the arm. A
+failed guard falls through to the next arm, so the guard is evaluated at most
+once and only after its pattern matched. Three rules matter for exhaustiveness,
+all matching rustc (RFC 2005):
+  - a *guarded* arm covers **nothing** — the guard may be false — so
+    `if_chain_is_exhaustive` skips it entirely (`arm_guard`). Counting it would
+    wrongly accept `match e { E::A if c => 1, E::B => 2 }`, which rustc rejects
+    (E0004).
+  - a guarded *binding* arm (`n if c`) is not a catch-all, so `has_catch_all`
+    is set only for an *unguarded* irrefutable arm. The parser's `true`-test
+    marker is what distinguishes the two: without it, `n if c` would either be
+    miscounted as a catch-all or (with no pattern test) abort the walk.
+  - a repeated variant (only reachable when one of the duplicates is guarded and
+    therefore skipped) is redundant, not a gap: `seen_variants` is a set, and a
+    duplicate is ignored rather than treated as non-exhaustive.
+`arm_pattern_test`/`arm_guard`/`is_pattern_test` peel the guard off a condition.
+They must not mistake a *range* pattern (which also folds to `Bin(And, ..)`) for
+a guarded one, so they strip only when the left operand is itself a pattern test.
+
+Two exhaustiveness-walk bugs this exposed are fixed. A payload-binding arm
+(`O::S(v) => ..`) wraps its `if` in a block holding the binding `let`s, and that
+block used to hide the chain: `match o { O::Some(v) => v, O::None => 0 }` (no
+`_`) was wrongly rejected. `chain_tail` now unwraps block wrappers while
+descending the chain, and the walk no longer requires an arm's `else` block to
+have empty `stmts`. `tests/cases/guard.{rms,rs}` and the `pat` fuzzer cover
+guards; the `reject` fuzzer's `guard_*` cases pin the exhaustiveness rules.
 
 The `match` desugaring wraps its first step in `Expr::MatchBoundary`, a
 transparent node that marks where the chain begins. Its `bool` field records

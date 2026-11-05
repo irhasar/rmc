@@ -466,6 +466,86 @@ fn non_exhaustive_match_as_a_value_is_rejected() {
 }
 
 #[test]
+fn a_guarded_arm_folds_the_guard_into_the_pattern_test() {
+    // `pat if g` becomes `if pat_test && g`; the guard is an ordinary
+    // expression, so no new node reaches codegen.
+    let out = asm("fn main() -> i64 { let x: i64 = 5; \
+                   let t: i64 = match x { n if n > 3 => 1, _ => 2 }; return t; }");
+    assert!(out.contains("main:"), "{out}");
+    assert!(
+        compile_to_asm(
+            "fn main() -> i64 { let x: i64 = 5; \
+             let t: i64 = match x { n if n > 3 => 1, _ => 2 }; return t; }",
+            &CompileOptions::default()
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn a_guard_makes_an_otherwise_irrefutable_arm_not_a_catch_all() {
+    // `n if c` can fail, so the arms after it are still reachable: the match
+    // below is accepted and the `_` arm is live. If the guard were dropped the
+    // `_` arm would be dead and the body would differ.
+    let src = "fn main() -> i64 { let x: i64 = 5; \
+               let t: i64 = match x { n if n > 100 => 1, _ => 2 }; return t; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_guarded_arm_covers_nothing_for_exhaustiveness() {
+    // Every variant named, but one arm is guarded, so the match can still fall
+    // through: rustc rejects it (E0004) and rmc must too.
+    let err = compile_to_asm(
+        "enum E { A, B } fn main() -> i64 { let e: E = E::A; \
+         let t: i64 = match e { E::A if e as i64 == 0 => 1, E::B => 2 }; return t; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("exhaustive") || err.contains("`if` without `else`"), "got: {err}");
+}
+
+#[test]
+fn a_guarded_binding_arm_is_not_a_catch_all() {
+    // A bare binding arm is a catch-all; a guarded one is not.
+    let err = compile_to_asm(
+        "enum E { A, B } fn main() -> i64 { let e: E = E::A; \
+         let t: i64 = match e { v if v as i64 == 0 => 1 }; return t; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("exhaustive") || err.contains("`if` without `else`"), "got: {err}");
+}
+
+#[test]
+fn a_guard_on_a_payload_binding_sees_the_binding() {
+    let src = "enum Opt { None, Some(i64) } \
+               fn f(o: Opt) -> i64 { return match o { \
+               Opt::Some(v) if v > 10 => 100 + v, Opt::Some(v) => v, Opt::None => -1 }; } \
+               fn main() -> i64 { return f(Opt::Some(5)); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_payload_enum_match_naming_every_variant_is_a_value() {
+    // Pre-existing gap: the payload-binding block hid the chain from the
+    // exhaustiveness walk, so this was wrongly rejected without a `_` arm.
+    let src = "enum Opt { None, Some(i64) } \
+               fn f(o: Opt) -> i64 { return match o { Opt::Some(v) => v, Opt::None => 0 }; } \
+               fn main() -> i64 { return f(Opt::Some(5)); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_repeated_variant_arm_is_not_a_gap() {
+    // Two unguarded arms naming the same variant are redundant, not a hole;
+    // rustc accepts this and rmc must not report it non-exhaustive.
+    let src = "enum E { A, B } fn main() -> i64 { let e: E = E::A; \
+               let t: i64 = match e { E::A => 1, E::A => 2, E::B => 3 }; return t; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
 fn a_method_on_a_payload_enum_resolves() {
     // The receiver type is `EnumData`, which method resolution must accept just
     // like `Struct` and the unit `Enum`.
