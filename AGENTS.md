@@ -588,11 +588,22 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
     source. The generator picks the 32-bit form deliberately (see `emit_div`),
     so the encoder must honour it. `enc_div` now derives REX.W from
     `reg_is_64`; a `None` REX byte is omitted entirely, matching `as`.
+  - Register-operand width must survive encoding. A 32-bit register name
+    selects the narrow form and must not set REX.W: `xor %eax,%eax` is the
+    two-byte zeroing idiom (`31 C0`), `mov %ebx,%eax` is `89 D8`. Forcing W
+    gave `xor %rax,%rax`/`mov %rbx,%rax`, which grows the artifact and
+    disagrees with `as`. A bare `0x40` REX byte (no W, no R/X/B) is dropped
+    entirely, matching `as`; an extended register (`%r8d`) still needs its
+    REX.R. `reg_is_64`/`reg_is_32` decide, and `rex_if_needed` omits the
+    no-op byte.
   - `.p2align n` means "align to 2^n", `.balign`/`.align n` mean "align to n
     bytes". They shared one arm that treated both as a byte count, so every loop
     the generator padded with `.p2align 4` came out 4-byte aligned in-process
     where `as` gave 16. The bug was invisible to the behaviour-only
-    in-process-vs-`as` test; only a byte-level check catches it.
+    in-process-vs-`as` test; only a byte-level check catches it. `run.py`'s
+    `check_encoding_matches_as` now compares the decoded instruction streams
+    (folding branch targets and dropping alignment `nop`s), so an operand-size
+    or alignment regression fails the suite.
 - **`.balign`/`.p2align` pads executable sections with `nop`, not zero.** The
   in-process encoder fills an aligned gap with `0x90` in a section whose ELF
   flags include `X` and with `0x00` elsewhere. A zero byte decodes as
