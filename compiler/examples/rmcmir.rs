@@ -37,6 +37,7 @@ fn main() {
     rmc::mir::coalesce_call_results(&mut prog);
     rmc::mir::merge_blocks(&mut prog);
     prog.copy_propagate();
+    rmc::mir::drop_redundant_asserts(&mut prog);
     rmc::mir::licm(&mut prog);
     rmc::mir::fold_accumulators(&mut prog);
     rmc::mir::jump_thread(&mut prog);

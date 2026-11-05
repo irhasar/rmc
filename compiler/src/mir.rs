@@ -3050,6 +3050,312 @@ impl Function {
     }
 }
 
+/// Drop the safety `assert`s rustc's `-O` MIR leaves behind.
+///
+/// rustc checks a division and a remainder for a zero divisor and for the
+/// `i64::MIN / -1` overflow, and an array index against the length. Those
+/// checks are statements in the MIR, so the backend would emit them even though
+/// the surrounding code already rules them out — the divisor of `gcd`'s
+/// remainder is the loop guard, and the index of a loop bounded by the array
+/// length can never be out of range. rmc's own front end does not insert these
+/// checks unless asked (`--overflow-checks`/`--bounds-checks`), so dropping them
+/// here is what lets the two pipelines be compared on equal footing.
+///
+/// A check is dropped when the compared operand is a whole local whose
+/// dominating definitions all make the comparison hold: for a `!= 0` guard the
+/// local is defined by a constant or by a `%`/`/` whose own divisor is known
+/// non-zero, and for a `< LEN` bounds guard the index is bounded by a loop
+/// counter compared against `LEN`. Anything else keeps the check, so the pass
+/// never removes one the program actually needs.
+pub fn drop_redundant_asserts(prog: &mut Program) {
+    for f in &mut prog.funcs {
+        f.drop_redundant_asserts();
+    }
+}
+
+/// The facts this pass tracks at a program point. Every field only ever loses
+/// entries at a control-flow join, so the analysis is monotone and terminates.
+#[derive(Clone, Default, PartialEq)]
+struct AssertFacts {
+    /// Locals proven non-zero on every path here.
+    nonzero: HashSet<u32>,
+    /// Locals proven equal to zero on every path here.
+    zero: HashSet<u32>,
+    /// `d = copy s` in the current block: `d` holds `s`'s value.
+    alias: HashMap<u32, u32>,
+    /// A bool `b = (x == 0)`: `b` is true exactly when `x` is zero.
+    iszero: HashMap<u32, u32>,
+}
+
+impl Function {
+    fn drop_redundant_asserts(&mut self) {
+        let n = self.blocks.len();
+        let mut facts_in: Vec<Option<AssertFacts>> = vec![None; n];
+        facts_in[0] = Some(AssertFacts::default());
+        loop {
+            let mut changed = false;
+            for b in 0..n {
+                let Some(facts) = facts_at_term(&self.blocks[b], &facts_in[b]) else { continue };
+                for (s, edge) in edges_with_facts(&self.blocks[b].term) {
+                    let s = s as usize;
+                    let mut contributed = facts.clone();
+                    match edge {
+                        EdgeFact::NonZero(l) => {
+                            contributed.nonzero.insert(contributed.resolve(l));
+                        }
+                        EdgeFact::Zero(l) => {
+                            contributed.zero.insert(contributed.resolve(l));
+                        }
+                        EdgeFact::None => {}
+                    }
+                    let merged = match &facts_in[s] {
+                        None => Some(contributed),
+                        Some(prev) => Some(prev.intersect(&contributed)),
+                    };
+                    if merged != facts_in[s] {
+                        changed = true;
+                    }
+                    facts_in[s] = merged;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        // Drop an `assert` the state at its own terminator proves. Two forms
+        // matter: `assert(x)` with `x` known non-zero (rustc's direct form), and
+        // the div-by-zero check `assert(!b)` where `b = (x == 0)` and `x` is
+        // known non-zero (the folded form the backend emits as a `cmp`/`jne`).
+        // The `bool` is defined by a statement in the same block, so the block's
+        // statements are replayed onto the entry state first.
+        for b in 0..n {
+            let Some(facts) = facts_at_term(&self.blocks[b], &facts_in[b]) else { continue };
+            let Terminator::Assert { cond, negate, target } = &self.blocks[b].term else {
+                continue;
+            };
+            let Some(p) = operand_place(cond) else { continue };
+            if !p.proj.is_empty() {
+                continue;
+            }
+            let holds = if *negate {
+                facts.zero.contains(&facts.resolve(p.local))
+                    || facts
+                        .iszero
+                        .get(&p.local)
+                        .is_some_and(|x| facts.nonzero.contains(&facts.resolve(*x)))
+            } else {
+                facts.nonzero.contains(&facts.resolve(p.local))
+            };
+            if holds {
+                let target = *target;
+                self.blocks[b].term = Terminator::Goto(target);
+            }
+        }
+        // Dropping the assert leaves the `bool` it tested dead (`_6 = Eq(..)`),
+        // and the backend would still materialise it. Remove assignments to a
+        // whole local nothing reads, when the rvalue is free of side effects.
+        self.drop_dead_pure_assignments();
+    }
+
+    fn drop_dead_pure_assignments(&mut self) {
+        loop {
+            let uses = self.use_counts();
+            let mut changed = false;
+            for b in &mut self.blocks {
+                b.stmts.retain(|s| {
+                    if let Stmt::Assign(d, rv) = s {
+                        // `_0` is the return value, which `return` reads without
+                        // naming it, so `use_counts` never sees that read.
+                        if d.proj.is_empty()
+                            && d.local != 0
+                            && uses.get(&d.local).copied().unwrap_or(0) == 0
+                            && rv_is_pure(rv)
+                        {
+                            changed = true;
+                            return false;
+                        }
+                    }
+                    true
+                });
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+}
+
+/// The comparison rvalues: pure, so safe to drop when their `bool` destination
+/// is unread. Only these are dropped — a wider set risks removing an assignment
+/// whose operand the backend still needs (a moved pointer, say).
+fn rv_is_pure(rv: &Rvalue) -> bool {
+    matches!(
+        rv,
+        Rvalue::Binary(
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge,
+            _,
+            _,
+        )
+    )
+}
+
+impl AssertFacts {
+    /// The local whose value `l` is known to share, following the copy chain.
+    fn resolve(&self, l: u32) -> u32 {
+        let mut cur = l;
+        for _ in 0..self.alias.len() + 1 {
+            match self.alias.get(&cur) {
+                Some(next) if *next != cur => cur = *next,
+                _ => break,
+            }
+        }
+        cur
+    }
+
+    /// Invalidate every fact that depends on `l`.
+    fn kill(&mut self, l: u32) {
+        self.nonzero.remove(&l);
+        self.zero.remove(&l);
+        self.alias.remove(&l);
+        self.alias.retain(|_, v| *v != l);
+        self.iszero.remove(&l);
+        self.iszero.retain(|_, v| *v != l);
+    }
+
+    fn intersect(&self, other: &AssertFacts) -> AssertFacts {
+        AssertFacts {
+            nonzero: self.nonzero.intersection(&other.nonzero).copied().collect(),
+            zero: self.zero.intersection(&other.zero).copied().collect(),
+            alias: self
+                .alias
+                .iter()
+                .filter(|(d, s)| other.alias.get(d) == Some(s))
+                .map(|(d, s)| (*d, *s))
+                .collect(),
+            iszero: self
+                .iszero
+                .iter()
+                .filter(|(b, x)| other.iszero.get(b) == Some(x))
+                .map(|(b, x)| (*b, *x))
+                .collect(),
+        }
+    }
+}
+
+/// The facts after a block's statements run, given its entry facts. `None` when
+/// the block is unreachable (no entry facts have reached it yet).
+fn facts_at_term(block: &BasicBlock, entry: &Option<AssertFacts>) -> Option<AssertFacts> {
+    let mut facts = entry.clone()?;
+    // Locals written later in the block: an alias to one of them is not valid
+    // by the time the terminator runs.
+    let mut later_writes: HashSet<u32> = HashSet::new();
+    for s in block.stmts.iter().rev() {
+        if let Some(l) = written_local(s) {
+            later_writes.insert(l);
+        }
+    }
+    let mut killed: HashSet<u32> = HashSet::new();
+    for s in &block.stmts {
+        if let Some(l) = written_local(s) {
+            facts.kill(l);
+            killed.insert(l);
+            later_writes.remove(&l);
+        }
+        if let Stmt::Assign(d, rv) = s {
+            if d.proj.is_empty() {
+                match rv {
+                    Rvalue::Use(Operand::Const(Const::Int(v))) => {
+                        if *v == 0 {
+                            facts.zero.insert(d.local);
+                        } else {
+                            facts.nonzero.insert(d.local);
+                        }
+                    }
+                    Rvalue::Use(Operand::Copy(s) | Operand::Move(s))
+                        if s.proj.is_empty()
+                            && !later_writes.contains(&s.local)
+                            && !killed.contains(&s.local) =>
+                    {
+                        facts.alias.insert(d.local, s.local);
+                    }
+                    Rvalue::Binary(BinOp::Eq, a, b) => {
+                        if let Some(x) = zero_eq_source(a, b) {
+                            facts.iszero.insert(d.local, x);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Some(facts)
+}
+
+/// For `Eq(a, b)` where one operand is the constant `0`, the local the other
+/// names — the source of a `x == 0` comparison.
+fn zero_eq_source(a: &Operand, b: &Operand) -> Option<u32> {
+    let is_zero = |o: &Operand| matches!(o, Operand::Const(Const::Int(0)));
+    let whole = |o: &Operand| {
+        operand_place(o).filter(|p| p.proj.is_empty()).map(|p| p.local)
+    };
+    if is_zero(b) {
+        whole(a)
+    } else if is_zero(a) {
+        whole(b)
+    } else {
+        None
+    }
+}
+
+/// The fact a control-flow edge proves about the `switchInt` discriminant.
+#[derive(Clone, Copy)]
+enum EdgeFact {
+    None,
+    NonZero(u32),
+    Zero(u32),
+}
+
+/// Each successor of a terminator paired with the fact its edge proves.
+///
+/// `switchInt(d) -> [0: eq, otherwise: ne]` proves `d != 0` on the edge to `ne`
+/// (it is only taken when the discriminant is none of the listed values) and
+/// `d == 0` on the edge to `eq`. Every other edge proves nothing.
+fn edges_with_facts(t: &Terminator) -> Vec<(u32, EdgeFact)> {
+    match t {
+        Terminator::SwitchInt { discr, targets, otherwise } => {
+            let local = operand_place(discr).filter(|p| p.proj.is_empty()).map(|p| p.local);
+            let mut v: Vec<(u32, EdgeFact)> = targets
+                .iter()
+                .map(|(val, b)| {
+                    let fact = match (val, local) {
+                        (0, Some(l)) => EdgeFact::Zero(l),
+                        _ => EdgeFact::None,
+                    };
+                    (*b, fact)
+                })
+                .collect();
+            let nonzero = if targets.iter().any(|(v, _)| *v == 0) {
+                local.map(EdgeFact::NonZero)
+            } else {
+                None
+            };
+            v.push((*otherwise, nonzero.unwrap_or(EdgeFact::None)));
+            v
+        }
+        Terminator::Goto(b) => vec![(*b, EdgeFact::None)],
+        Terminator::Call { target, .. } => target.iter().map(|b| (*b, EdgeFact::None)).collect(),
+        Terminator::Assert { target, .. } => vec![(*target, EdgeFact::None)],
+        Terminator::Return | Terminator::Unreachable | Terminator::Abort => Vec::new(),
+    }
+}
+
+fn operand_place(op: &Operand) -> Option<&Place> {
+    match op {
+        Operand::Copy(p) | Operand::Move(p) => Some(p),
+        Operand::Const(_) => None,
+    }
+}
+
 /// Collapse `goto`-only blocks. LICM leaves a chain of empty blocks behind when
 /// it lifts a hoisted call out of its block, and each one costs a taken jump on
 /// every iteration of the loop it sits in. Redirecting the edges straight to the

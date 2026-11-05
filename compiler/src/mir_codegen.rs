@@ -2461,6 +2461,11 @@ fn forward_stores(body: &str) -> String {
         }
         let rest = t[op.len()..].trim();
         let pair = rest.split_once(',').map(|(a, b)| (a.trim(), b.trim()));
+        // `cmp`/`test` read both operands, so the second one is not a write: a
+        // slot there can be forwarded to the register that still holds it (the
+        // bounds check compares an index slot the code just stored), and the
+        // slot must stay valid in `holding` afterwards.
+        let read_only = op == "cmp" || op == "test";
         let mut rewritten: String = line.to_string();
         if let Some((src, dst)) = pair {
             // A store of a register into a slot records the register.
@@ -2475,20 +2480,27 @@ fn forward_stores(body: &str) -> String {
             // register instead. This covers both a plain load and a memory
             // operand (`add -8(%rbp), %rax`), and once the slot has no readers
             // left the store into it is dropped as dead.
-            if is_slot(src) {
-                if let Some(r) = holding.get(src).cloned() {
-                    rewritten = if op == "mov" || op == "movq" {
-                        if r == dst {
-                            continue;
-                        }
-                        format!("  mov {r}, {dst}")
-                    } else {
-                        format!("  {op} {r}, {dst}")
-                    };
+            let mut a = src;
+            let mut b = dst;
+            if is_slot(a) {
+                if let Some(r) = holding.get(a) {
+                    if (op == "mov" || op == "movq") && r == b {
+                        continue;
+                    }
+                    a = r;
                 }
             }
-            // Any other write to a slot invalidates the value it held.
-            if is_slot(dst) {
+            if read_only && is_slot(b) {
+                if let Some(r) = holding.get(b) {
+                    b = r;
+                }
+            }
+            if a != src || b != dst {
+                rewritten = format!("  {op} {a}, {b}");
+            }
+            // Any write to a slot (other than the read-only second operand of
+            // `cmp`/`test`) invalidates the value it held.
+            if !read_only && is_slot(dst) {
                 holding.remove(dst);
             }
         }
