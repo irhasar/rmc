@@ -13,7 +13,8 @@ Usage:
 
 Modes:
     expr  random integer expressions over three variables, with calls,
-          guarded division and comparisons
+          guarded division, comparisons, string comparisons and `.len()` on
+          strings and arrays
     stmt  loops, conditionals, match, arrays and aggregate calls, with
           side-effecting argument order and bounds-checked indexing
     opt   a self-recursive function, an invariant loop and inlined helpers,
@@ -266,6 +267,22 @@ def gen_expr_program(rng):
         s = gen_strcmp(rng)
         rms.append(f"    print_bool({s});")
         rs.append(f'    println!("{{}}", ({s}) as i64);')
+    # Lengths. `"lit".len()` reads the string record's length word, so it must be
+    # an indirect load through the pointer, not a struct field; an array's length
+    # is a compile-time constant. rustc's `len()` is `usize`, so the twin casts.
+    for lit in (gen_str_lit(rng) for _ in range(rng.randint(1, 3))):
+        rms.append(f"    print_i64({lit}.len());")
+        rs.append(f'    println!("{{}}", {lit}.len() as i64);')
+    sv = gen_str_lit(rng)
+    n = rng.randint(1, 6)
+    rms.append(f"    let sv = {sv};")
+    rms.append("    print_i64(sv.len());")
+    rs.append(f"    let sv = {sv};")
+    rs.append('    println!("{}", sv.len() as i64);')
+    rms.append(f"    let arr: [i64; {n}] = [0; {n}];")
+    rms.append("    print_i64(arr.len());")
+    rs.append(f"    let arr: [i64; {n}] = [0; {n}];")
+    rs.append('    println!("{}", arr.len() as i64);')
     rms += ["    return 0;", "}"]
     rs += ["}"]
     return "\n".join(rms), "\n".join(rs)

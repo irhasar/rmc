@@ -136,7 +136,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     // Runtime helpers provided by the freestanding assembly runtime. They are
     // linked in automatically, so they do not appear in the source program.
-    let builtins: [(&str, &[Type], Type); 8] = [
+    let builtins: [(&str, &[Type], Type); 9] = [
         ("print_i64", &[Type::I64], Type::Unit),
         ("print_str", &[Type::Str], Type::Unit),
         ("print_bool", &[Type::Bool], Type::Unit),
@@ -147,6 +147,8 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         // Byte-wise lexicographic `str` compare; emitted by sema for a string
         // comparison and never written in source.
         ("__rmc_str_lt", &[Type::Str, Type::Str], Type::Bool),
+        // `str::len`, the record's length word; emitted by sema for `s.len()`.
+        ("__rmc_str_len", &[Type::Str], Type::I64),
     ];
     for (name, params, ret) in builtins {
         sigs.insert(
@@ -1841,6 +1843,57 @@ impl Sema {
                 // resolves against the referent's type.
                 let via_ref = matches!(rt, Type::Ref(..));
                 let base_ty = deref_ty(rt.clone());
+                // `len()` is built in for `str` and arrays. rustc's `str::len`
+                // reads the record's length word and `<[T; N]>::len` is the
+                // constant `N`, so neither is a user method — and neither is a
+                // struct field, so a fixed-offset load would not do for a
+                // string. A user `len` on a struct or enum still falls through
+                // to the mangled-method path below.
+                if name == "len" {
+                    if !args.is_empty() {
+                        return Err("method `len` takes no arguments".into());
+                    }
+                    match &base_ty {
+                        Type::Str => {
+                            // `str::len` is the record's first word. The
+                            // receiver is one word (the record's address); a
+                            // `&str` receiver is dereferenced to that word.
+                            let recv = std::mem::replace(recv.as_mut(), Expr::Int(0));
+                            let recv = if via_ref {
+                                Expr::Deref { expr: Box::new(recv), ty: Type::Str }
+                            } else {
+                                recv
+                            };
+                            *e = Expr::Call {
+                                name: "__rmc_str_len".into(),
+                                args: vec![recv],
+                                arg_slots: vec![(-1, 0)],
+                                ret_slot: -1,
+                                ret_ty: Type::I64,
+                            };
+                            return self.check_expr(e, scope);
+                        }
+                        Type::Array(_, n) => {
+                            // The length is known at compile time. Keep the
+                            // receiver only for its side effects; a named local
+                            // has none, so `a.len()` folds to the constant with
+                            // the load removed entirely.
+                            let n = *n as i64;
+                            let recv = std::mem::replace(recv.as_mut(), Expr::Int(0));
+                            let stmts = if matches!(recv, Expr::Var { .. }) {
+                                Vec::new()
+                            } else {
+                                vec![Stmt::Expr(recv)]
+                            };
+                            *e = Expr::Block(Block {
+                                stmts,
+                                tail: Some(Box::new(Expr::Int(n))),
+                            });
+                            return Ok(Type::I64);
+                        }
+                        _ => {}
+                    }
+                }
                 // A method lives on a struct or an enum; both give the mangled
                 // prefix `Type$method`.
                 let tyname = match &base_ty {

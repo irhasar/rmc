@@ -955,6 +955,13 @@ The checks, all in `sema.rs`:
   (no type, no return type), so both operands are pure literals or variables and
   the helper is never double-evaluated. Comparing a `str` with an `i64` is
   rejected (`E0308`), as rustc does.
+- **`str::len` and array `.len()`.** `len()` is special-cased in the `MethodCall`
+  arm of sema *before* the struct/enum method lookup, because `str` is a pointer:
+  a `str` receiver lowers to `Call __rmc_str_len` (the record's first word), and
+  an array receiver folds to the constant `N`, keeping the receiver only for side
+  effects (dropped entirely when it is a named local). A user `len` on a struct or
+  enum still falls through to the mangled-method path. rmc's `.len()` is `i64`
+  where rustc's is `usize`, so a differential twin casts with `as i64`.
 - **Parameter names (`E0415`) and `main` (`E0580`).** A function's parameters
   must be uniquely named; `check_fn` rejects a duplicate (rmc used to bind both
   to one slot). `main` takes no parameters, checked in `analyze`.
@@ -1070,7 +1077,8 @@ The fuzzer's grammar is narrower than the language, so it does not reach every
 construct; three divergences found by hand-probing were an enum `match` with no
 `_` arm used as a *value* (not a statement), a method on a *payload* enum, and an
 array of a unit enum. `stmt` mode now emits all three, so a regression in any of
-them fails the fuzz job at `iter=0`. When adding a language feature, extend the
+them fails the fuzz job at `iter=0`. `expr` mode emits `str::len` and array
+`.len()`. When adding a language feature, extend the
 generator to exercise it — a clean fuzz run only covers the shapes it emits.
 
 ## Scope
