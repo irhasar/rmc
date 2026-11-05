@@ -54,6 +54,11 @@ python3 tools/fuzz.py --mode arrpat --n 500 --seed 1
 python3 tools/fuzz.py --mode parampat --n 500 --seed 1
 python3 tools/fuzz.py --mode enumpat --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
+
+# robustness / soundness: rmc must error cleanly, never crash
+python3 tools/fuzz.py --mode robust
+python3 tools/fuzz.py --mode reject
+python3 tools/fuzz.py --mode mutate --n 500 --seed 1
 ```
 
 ## Source map
@@ -961,7 +966,11 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 `tools/fuzz.py --mode reject` compiles a list of programs `rustc` rejects and
 requires `rmc` to reject each one cleanly; it pins the soundness checks below,
 which the differential fuzzers cannot see (they only compare programs both
-compilers accept).
+compilers accept). `tools/fuzz.py --mode mutate` is the complement: it applies
+random splices, deletions and duplications to the generators' programs and the
+`robust` corpus and requires every mutant to fail cleanly (exit 0 or 1, no
+signal, no panic). It needs no rustc, so it runs anywhere, and it reaches error
+paths the hand-written corpora miss.
 
 `tests/run.py` compiles each `tests/cases/NAME.{rms,rs}` pair with both compilers
 and diffs stdout and the exit status. Every case is then recompiled with the
@@ -1385,6 +1394,16 @@ array of a unit enum. `stmt` mode now emits all three, so a regression in any of
 them fails the fuzz job at `iter=0`. `expr` mode emits `str::len` and array
 `.len()`. When adding a language feature, extend the
 generator to exercise it — a clean fuzz run only covers the shapes it emits.
+
+`--mode mutate` is the counterpart to the differential modes: it needs no rustc
+reference at all. It seeds from the generators' programs and the `robust` corpus,
+applies one to four random edits (splice a token, delete a run, duplicate a run),
+and requires every mutant to fail cleanly — exit 0 or 1, no signal, no
+`panicked`/`overflowed its stack` in stderr. A differential mode only compares
+programs *both* compilers accept, so a crash on invalid input is invisible to it;
+`mutate` and `robust` are the two modes that look for exactly that, the first
+reaching error paths the fixed `robust` corpus does not. `--keep` writes a
+failing mutant out for shrinking.
 
 A new generator must be checked for *validity*, not just a clean run. The first
 `ref` generator wrote `r.i0` (a field of the referent struct, not of the nested

@@ -49,8 +49,18 @@ Modes:
           copying every field, chaining, a struct-typed field, and a field
           value that mutates the base so the evaluation order and the
           independence of the result are both observable
+    robust
+          a fixed set of adversarial inputs (random bytes, deep nesting, long
+          chains), each of which must error cleanly rather than crash
+    reject
+          programs `rustc` rejects, each of which `rmc` must reject too
+    mutate
+          mutation fuzzer: random edits to the generators' programs, requiring
+          `rmc` to fail cleanly on every one. Needs no rustc reference
 
 The reference is `rustc -O`, so a mismatch is a real semantic divergence.
+The `robust`, `reject` and `mutate` modes instead assert only that `rmc`
+errors cleanly, never panics or crashes.
 """
 import argparse
 import os
@@ -2372,8 +2382,7 @@ def run_robust():
 # -------------------------------------------------------------- reject mode
 
 def reject_corpus():
-    """Deterministic programs that `rustc` rejects. `rmc` must reject each one
-    too, with a clean error (exit 1), never accept it and never crash.
+    """Deterministic programs that `rustc` rejects.
 
     This targets the soundness class the differential fuzzers cannot see: a
     program `rmc` wrongly accepts is never run against the rustc reference,
@@ -2928,9 +2937,88 @@ def run_reject():
     return 1 if failures else 0
 
 
+# -------------------------------------------------------------- mutate mode
+
+# Tokens a mutation may splice in. A mix of valid fragments, delimiters that
+# unbalance a construct, and keywords that only make sense in another context,
+# so the mutated program stays on the parser/sema error paths rather than
+# producing a boring "unknown token".
+MUTATION_TOKENS = [
+    "(", ")", "{", "}", "[", "]", "|", "..", "...", ",", ";", ":", "::", "->",
+    "=>", "=", "==", "+", "-", "*", "&", "&&", "!", "<", ">", "..=", "#",
+    "fn", "let", "mut", "if", "else", "while", "for", "loop", "match", "return",
+    "break", "continue", "struct", "enum", "impl", "as", "true", "false",
+    "i64", "bool", "str", "self", "_", "'a", "0", "1", "99999999999999999999",
+    '"x"', "S", "E", "E::A", "E::A(x)", "x", "y", "0..1",
+]
+
+
+def _mutate_once(rng, text):
+    """One random edit of `text`: splice, delete a run, or duplicate a run."""
+    if not text:
+        return rng.choice(MUTATION_TOKENS)
+    op = rng.random()
+    if op < 0.5:
+        i = rng.randrange(len(text))
+        tok = rng.choice(MUTATION_TOKENS)
+        # A space around a word token keeps `fnx` from forming by accident.
+        if tok[-1].isalnum() and i and text[i - 1].isalnum():
+            tok = " " + tok
+        return text[:i] + tok + text[i:]
+    if op < 0.8:
+        i = rng.randrange(len(text))
+        n = rng.randint(1, max(1, min(40, len(text) - i)))
+        return text[:i] + text[i + n:]
+    i = rng.randrange(len(text))
+    n = rng.randint(1, max(1, min(40, len(text) - i)))
+    return text[:i + n] + text[i:i + n] + text[i + n:]
+
+
+def run_mutate(n, seed, keep=None):
+    """Mutation-based robustness fuzzer: no reference, only "rmc must not
+    crash". Start from the differential generators (and the two corpora), apply
+    a few random edits, and require every mutated input to fail cleanly - exit
+    0 or 1, no signal, no panic message. This reaches error paths the hand-
+    written corpora miss (a delimiter that unbalances a nested pattern, a
+    keyword where an expression is expected) without needing rustc at all."""
+    tmp = f"/tmp/rmc-fuzz-{os.getpid()}"
+    os.makedirs(tmp, exist_ok=True)
+    rng = random.Random(seed)
+    gens = [gen_expr_program, gen_stmt_program, gen_opt_program, gen_pat_program,
+            gen_ref_program, gen_update_program, gen_nestpat_program,
+            gen_arrpat_program, gen_parampat_program, gen_enumpat_program]
+    # Seeds to mutate: the generated programs plus the corpora's byte inputs.
+    bases = [gens[rng.randrange(len(gens))](rng)[0] for _ in range(max(1, n // 4))]
+    bases += [d.decode("latin-1") for d in robust_corpus().values() if isinstance(d, bytes)]
+    failures = 0
+    for it in range(n):
+        base = bases[rng.randrange(len(bases))]
+        text = base
+        for _ in range(rng.randint(1, 4)):
+            text = _mutate_once(rng, text)
+        path = f"{tmp}/m{it}.rms"
+        open(path, "w").write(text)
+        p = run([RMC, path, "-o", f"{tmp}/m{it}.bin"])
+        crashed = (p.returncode < 0 or b"panicked" in p.stderr
+                   or b"overflowed its stack" in p.stderr)
+        if crashed or p.returncode not in (0, 1):
+            failures += 1
+            print(f"[mutate] iteration {it} (seed {seed}): "
+                  f"{'CRASH' if crashed else 'exit ' + str(p.returncode)}")
+            print(p.stderr.decode(errors="replace")[:300])
+            if keep:
+                os.makedirs(keep, exist_ok=True)
+                open(f"{keep}/m{it}.rms", "w").write(text)
+            if failures >= 5:
+                break
+    if failures == 0:
+        print(f"mutate: {n} mutated programs, seed {seed}: no crash, all clean")
+    return 1 if failures else 0
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "robust", "reject"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "robust", "reject", "mutate"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -2955,6 +3043,8 @@ def main():
             print("rustc not found; set RUSTC or install a toolchain", file=sys.stderr)
             return 2
         return run_reject()
+    if args.mode == "mutate":
+        return run_mutate(args.n, args.seed, args.keep)
     if not rustc_available():
         print("rustc not found; set RUSTC or install a toolchain", file=sys.stderr)
         return 2
