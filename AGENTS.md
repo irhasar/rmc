@@ -953,6 +953,15 @@ resolve to `Type::Enum` through `resolve_ty`, which every type site uses, and
 enum patterns are a `Pat::Variant` the parser desugars into an `EnumVariant`
 comparison. `as` may not target an enum, matching rustc.
 
+A variant may write its tag explicitly (`enum E { A = 5, B, C }`). The tag is
+then the written value, not the index, so it is computed once in `layout_enum`
+(a variant with no `= N` is the previous tag plus one) and carried in the fourth
+field of `EnumInfo::variants`. Every tag use goes through `tag_of`/the tuple, so
+a `match` arm and an `as i64` both read the written value. `layout_enum` also
+rejects a duplicate tag, and a variant with no `= N` after `i64::MAX` (rustc
+E0370) — the check is lazy, so a final `= i64::MAX` is fine. The parser rejects
+`= N` on a payload variant and folds `-9223372036854775808` to `i64::MIN`.
+
 A pattern is a wildcard, an integer or `bool` literal, an `Enum::Variant`, or a
 bare binding name. A `bool` pattern (`true`/`false`) desugars to a `BoolTest`,
 a node like `VariantTest` that compares the scrutinee word; a chain of two of

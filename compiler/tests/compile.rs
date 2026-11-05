@@ -2263,6 +2263,51 @@ fn enum_variants_are_their_declaration_index() {
 }
 
 #[test]
+fn an_explicit_discriminant_replaces_the_index() {
+    // `B = 10` makes B's value 10, not its index 1.
+    let out = asm("enum C { A = 5, B = 10 } fn main() -> i64 { return C::B as i64; }");
+    assert!(out.contains("mov $10, %rax"), "expected the written tag 10 in:\n{out}");
+}
+
+#[test]
+fn a_variant_without_a_discriminant_takes_the_previous_plus_one() {
+    let out = asm("enum C { A = 4, B, C } fn main() -> i64 { return C::C as i64; }");
+    assert!(out.contains("mov $6, %rax"), "expected 4+1+1 = 6 in:\n{out}");
+}
+
+#[test]
+fn a_match_arm_keys_on_the_written_discriminant() {
+    // The arm for B must compare against 10, not 1, or the wrong arm fires.
+    let out = asm("enum C { A = 5, B = 10 } fn f(c: C) -> i64 { return match c { C::A => 1, C::B => 2 }; } fn main() -> i64 { return f(C::B); }");
+    assert!(out.contains("$10") || out.contains("10,"), "expected a compare against 10 in:\n{out}");
+}
+
+#[test]
+fn a_duplicate_discriminant_is_rejected() {
+    let err = compile_to_asm("enum C { A = 5, B = 5 } fn main() -> i64 { return 0; }", &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("discriminant 5"), "got: {err}");
+}
+
+#[test]
+fn a_payload_variant_cannot_have_a_discriminant() {
+    let err = compile_to_asm("enum C { A(i64) = 5 } fn main() -> i64 { return 0; }", &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("payload cannot have an explicit discriminant"), "got: {err}");
+}
+
+#[test]
+fn a_discriminant_that_overflows_the_next_variant_is_rejected() {
+    // The variant after `i64::MAX` has no in-range value (rustc E0370).
+    let err = compile_to_asm("enum C { A = 9223372036854775807, B } fn main() -> i64 { return 0; }", &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("discriminant overflowed"), "got: {err}");
+}
+
+#[test]
+fn the_extreme_discriminants_are_representable() {
+    let out = asm("enum C { A = -9223372036854775808, B = 9223372036854775807 } fn main() -> i64 { return C::A as i64 + C::B as i64; }");
+    assert!(out.contains("9223372036854775807"), "expected i64::MAX in:\n{out}");
+}
+
+#[test]
 fn an_unknown_variant_is_rejected() {
     let err = compile_to_asm("enum C { A } fn main() -> i64 { return C::B as i64; }", &CompileOptions::default()).unwrap_err();
     assert!(err.contains("has no variant"), "got: {err}");

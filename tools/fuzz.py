@@ -1039,7 +1039,9 @@ def gen_pat_program(rng):
     operator, an index or a field, which `desugar_match` binds to a temporary)
     were never generated. That
     temporary must be evaluated exactly once: re-evaluating it per arm repeats
-    a side effect, and a stale one reads the wrong value.
+    a side effect, and a stale one reads the wrong value. An enum with explicit
+    discriminants is generated too, so a tag that is the variant's index rather
+    than its written value shows up in a `match` arm and in an `as i64`.
     """
     k = rng.randint(1, 9)
     v = rng.randint(2, 9)
@@ -1080,6 +1082,12 @@ def gen_pat_program(rng):
         f"fn color_code(c: Color) -> i64 {{ return match c {{ {color_arms} }}; }}",
         "enum Shape { Dot, Line(i64), Rect(i64, i64) }",
         "fn area(s: Shape) -> i64 { return match s { Shape::Dot => 0, Shape::Line(w) => w, Shape::Rect(w, h) => w * h }; }",
+        # Explicit discriminants: the tag is the written value, not the
+        # variant's index, so a `match` arm or an `as i64` that still used the
+        # index would read a different number.
+        "enum Disc { D0 = 4, D1, D2 = 10 }",
+        "fn disc_code(d: Disc) -> i64 { return match d { Disc::D0 => 1, Disc::D1 => 2, Disc::D2 => 3 }; }",
+        "fn disc_cast(d: Disc) -> i64 { return d as i64; }",
         "struct S { a: i64, b: i64 }",
         f"fn fscr(s: S) -> i64 {{ return match s.b {{ {v} => 20, _ => 0 }}; }}",
         f"fn iflet_int(x: i64) -> i64 {{ if let {v} = x {{ 50 }} else {{ 60 }} }}",
@@ -1130,6 +1138,8 @@ def gen_pat_program(rng):
         "        acc = acc + armassign(i);",
         "        acc = acc + gguard(i) + gbind(i) + gorpat(i) + grange(i);",
         "        acc = acc + gcolor(c) + gshape(s) + gbool(i % 2 == 0) + gwild(i);",
+        "        let d: Disc = match i % 3 { 0 => Disc::D0, 1 => Disc::D1, _ => Disc::D2 };",
+        "        acc = acc + disc_code(d) * 100 + disc_cast(d);",
         "        i = i + 1;",
         "    }",
         "    print_i64(acc);",
@@ -1152,6 +1162,10 @@ def gen_pat_program(rng):
         "#[derive(Copy, Clone)]",
         "enum Shape { Dot, Line(i64), Rect(i64, i64) }",
         "fn area(s: Shape) -> i64 { match s { Shape::Dot => 0, Shape::Line(w) => w, Shape::Rect(w, h) => w * h } }",
+        "#[derive(Copy, Clone)]",
+        "enum Disc { D0 = 4, D1, D2 = 10 }",
+        "fn disc_code(d: Disc) -> i64 { match d { Disc::D0 => 1, Disc::D1 => 2, Disc::D2 => 3 } }",
+        "fn disc_cast(d: Disc) -> i64 { d as i64 }",
         "#[derive(Copy, Clone)]",
         "struct S { a: i64, b: i64 }",
         f"fn fscr(s: S) -> i64 {{ match s.b {{ {v} => 20, _ => 0 }} }}",
@@ -1203,6 +1217,8 @@ def gen_pat_program(rng):
         "        acc += armassign(i);",
         "        acc += gguard(i) + gbind(i) + gorpat(i) + grange(i);",
         "        acc += gcolor(c) + gshape(s) + gbool(i % 2 == 0) + gwild(i);",
+        "        let d: Disc = match i % 3 { 0 => Disc::D0, 1 => Disc::D1, _ => Disc::D2 };",
+        "        acc += disc_code(d) * 100 + disc_cast(d);",
         "        i += 1;",
         "    }",
         '    println!("{}", acc);',
