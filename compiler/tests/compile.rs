@@ -2079,6 +2079,36 @@ fn an_empty_list_literal_is_rejected() {
 }
 
 #[test]
+fn a_let_underscore_discards_its_initializer() {
+    // `let _ = e;` evaluates `e` for its side effects and binds nothing.
+    assert!(compile_to_asm(
+        "fn g() -> i64 { return 7; } fn main() -> i64 { let _ = g(); let _ = 3 + 4; let _: i64 = 5; return 0; }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_let_underscore_still_type_checks_its_initializer() {
+    // The discard does not skip the annotation check (rustc E0308).
+    let err = compile_to_asm(
+        "fn main() -> i64 { let _: bool = 5; return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("does not match"), "got: {err}");
+}
+
+#[test]
+fn a_let_underscore_without_a_type_is_rejected() {
+    // `let _;` has nothing to infer from (rustc E0282); `let _: i64;` is fine.
+    let err = compile_to_asm("fn main() -> i64 { let _; return 0; }", &CompileOptions::default())
+        .unwrap_err();
+    assert!(err.contains("needs a type annotation"), "got: {err}");
+    assert!(compile_to_asm("fn main() -> i64 { let _: i64; return 0; }", &CompileOptions::default()).is_ok());
+}
+
+#[test]
 fn impl_methods_compile_and_resolve_by_receiver_type() {
     let src = "struct P { x: i64 } impl P { fn get(self) -> i64 { return self.x; } } \
                struct Q { x: i64 } impl Q { fn get(self) -> i64 { return self.x; } } \

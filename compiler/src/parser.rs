@@ -842,6 +842,49 @@ impl Parser {
             Some(Tok::Let) => {
                 self.i += 1;
                 let mutable = self.eat(&Tok::Mut);
+                // `let _ = e;` (and `let _: T = e;`, and bare `let _;`) binds
+                // nothing. Desugar to a block holding a hidden binding so the
+                // initializer is still evaluated once and any annotation is
+                // still type-checked, then dropped; with no initializer there is
+                // nothing to check.
+                if self.peek() == Some(&Tok::Underscore) {
+                    self.i += 1;
+                    let ty = if self.eat(&Tok::Colon) {
+                        Some(self.parse_type()?)
+                    } else {
+                        None
+                    };
+                    let init = if self.eat(&Tok::Eq) {
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
+                    self.expect(Tok::Semi)?;
+                    let stmts = match init {
+                        Some(e) => {
+                            // Bind to `_` so a type-mismatch diagnostic names the
+                            // discard, not an internal temporary. `_` cannot be
+                            // written as an ordinary binding, so it never clashes.
+                            vec![Stmt::Let {
+                                name: "_".to_string(),
+                                ty,
+                                init: Some(e),
+                                slot: -1,
+                                mutable: false,
+                            }]
+                        }
+                        // `let _;` with no annotation has no type to infer, which
+                        // rustc rejects (E0282); `let _: T;` is a no-op.
+                        None if ty.is_none() => {
+                            return Err(format!(
+                                "at byte {}: `let _;` needs a type annotation",
+                                self.pos()
+                            ))
+                        }
+                        None => Vec::new(),
+                    };
+                    return Ok(Stmt::Expr(Expr::Block(Block { stmts, tail: None })));
+                }
                 let name = self.expect_ident()?;
                 let ty = if self.eat(&Tok::Colon) {
                     Some(self.parse_type()?)
