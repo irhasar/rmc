@@ -75,6 +75,13 @@ pub enum Const {
     },
     /// A named `alloc` (string) or a `const` item reference we do not fold.
     Named(String),
+    /// A struct, tuple, array or enum-variant constant the MIR printer spells
+    /// out inline (`const P {{ x: 1_i64, y: 2_i64 }}`, `const E::A`). Its bytes
+    /// are materialised in `.rodata` at codegen time.
+    Agg {
+        name: String,
+        ops: Vec<Operand>,
+    },
 }
 
 /// A memory location: a base local plus a path of projections.
@@ -93,6 +100,10 @@ pub enum Proj {
     IndexConst(u64),
     /// `[*i]` with a local index.
     IndexLocal(u32),
+    /// `(x as Variant)` — the payload of an enum variant, e.g. `(_1 as B).0`.
+    /// The variant name lets the backend find the payload's offset within the
+    /// enum's tagged-union layout.
+    Variant(String),
     /// `*p` — dereference the pointer held in this place.
     Deref,
     /// `&raw const ...` / `&raw mut ...` — the *address* of the place rather
@@ -116,6 +127,8 @@ pub enum Rvalue {
     Repeat { op: Operand, count: u64 },
     /// `[a, b, c]` — a list array literal.
     Array(Vec<Operand>),
+    /// `Enum::Variant { .. }` — build an enum variant. The name is `Enum::Variant`.
+    Enum { name: String, ops: Vec<Operand> },
     /// `Struct { f: v, .. }` — a struct/tuple literal. Field names are printed
     /// in declaration order, which is the layout order.
     Aggregate(Vec<Operand>),
@@ -411,7 +424,19 @@ impl Function {
 /// Call `f` for every operand a statement reads.
 fn scan_rv_operands(rv: &Rvalue, f: &mut impl FnMut(&Operand)) {
     match rv {
-        Rvalue::Use(op) => f(op),
+        Rvalue::Use(op) => {
+            // A place used as an operand (`_1[_7]`) reads its index locals as
+            // well as its base. Missing them would let a dead-copy pass drop the
+            // index's definition and leave a stale slot behind.
+            if let Operand::Copy(p) | Operand::Move(p) = op {
+                for proj in &p.proj {
+                    if let Proj::IndexLocal(i) = proj {
+                        f(&Operand::Copy(Place { local: *i, proj: Vec::new() }));
+                    }
+                }
+            }
+            f(op);
+        }
         Rvalue::Binary(_, a, b) => {
             f(a);
             f(b);
@@ -420,6 +445,7 @@ fn scan_rv_operands(rv: &Rvalue, f: &mut impl FnMut(&Operand)) {
         Rvalue::Cast { op, .. } => f(op),
         Rvalue::Repeat { op, .. } => f(op),
         Rvalue::Array(ops) | Rvalue::Aggregate(ops) => ops.iter().for_each(|op| f(op)),
+        Rvalue::Enum { ops, .. } => ops.iter().for_each(|op| f(op)),
         Rvalue::WithOverflow { a, b, .. } => {
             f(a);
             f(b);
@@ -454,6 +480,7 @@ fn for_each_operand_mut(rv: &mut Rvalue, f: &mut impl FnMut(&mut Operand)) {
         Rvalue::Cast { op, .. } => f(op),
         Rvalue::Repeat { op, .. } => f(op),
         Rvalue::Array(ops) | Rvalue::Aggregate(ops) => ops.iter_mut().for_each(|op| f(op)),
+        Rvalue::Enum { ops, .. } => ops.iter_mut().for_each(|op| f(op)),
         Rvalue::WithOverflow { a, b, .. } => {
             f(a);
             f(b);
@@ -494,21 +521,29 @@ fn place_aliasable(p: &Place, mutated: &HashSet<u32>) -> bool {
 
 fn rewrite_op(op: &mut Operand, subst: &HashMap<u32, Place>) {
     if let Operand::Copy(p) | Operand::Move(p) = op {
-        if p.proj.is_empty() {
-            if let Some(src) = subst.get(&p.local) {
-                *p = src.clone();
-            }
-        }
+        rewrite_place(p, subst);
     }
 }
 
-/// Rewrite every place a statement reads through the alias map. A `Ref`/`RawRef`
+/// Rewrite a place read through the alias map: its index locals (`_1[_7]`), and
+/// its base local when the alias has no projection of its own. A `Ref`/`RawRef`
 /// target is rewritten too, but only when the alias is a plain local: aliasing a
 /// projection would change which address is taken.
 fn rewrite_place(p: &mut Place, subst: &HashMap<u32, Place>) {
-    if p.proj.is_empty() {
-        if let Some(src) = subst.get(&p.local) {
+    for proj in &mut p.proj {
+        if let Proj::IndexLocal(i) = proj {
+            if let Some(src) = subst.get(i) {
+                if src.proj.is_empty() {
+                    *i = src.local;
+                }
+            }
+        }
+    }
+    if let Some(src) = subst.get(&p.local) {
+        if p.proj.is_empty() || src.proj.is_empty() {
+            let proj = std::mem::take(&mut p.proj);
             *p = src.clone();
+            p.proj.extend(proj);
         }
     }
 }
@@ -527,7 +562,7 @@ fn rewrite_stmt(s: &mut Stmt, subst: &HashMap<u32, Place>) {
         Rvalue::Unary(_, a) => rewrite_op(a, subst),
         Rvalue::Cast { op, .. } => rewrite_op(op, subst),
         Rvalue::Repeat { op, .. } => rewrite_op(op, subst),
-        Rvalue::Array(ops) | Rvalue::Aggregate(ops) => {
+        Rvalue::Array(ops) | Rvalue::Aggregate(ops) | Rvalue::Enum { ops, .. } => {
             for op in ops {
                 rewrite_op(op, subst);
             }
@@ -541,9 +576,7 @@ fn rewrite_stmt(s: &mut Stmt, subst: &HashMap<u32, Place>) {
         // `Ref`/`RawRef` deliberately are not rewritten: `_d = copy _s` gives
         // `_d` its own storage, so `&_d` is not `&_s`.
         Rvalue::Len(place) | Rvalue::Discriminant(place) => {
-            if place.proj.is_empty() {
-                rewrite_place(place, subst);
-            }
+            rewrite_place(place, subst);
         }
         _ => {}
     }
@@ -1098,6 +1131,13 @@ fn parse_projections(mut rest: &str) -> Result<Vec<Proj>, String> {
                 return Err(format!("mir: unsupported index `{rest}`"));
             }
             rest = &r2[close + 1..];
+        } else if let Some(r2) = r.strip_prefix("as ") {
+            // `as Variant` — the payload of an enum variant, e.g. `(_1 as B).0`.
+            // The variant name runs up to the `)` that closes the enclosing
+            // `(PLACE as Variant)`.
+            let end = r2.find(')').unwrap_or(r2.len());
+            proj.push(Proj::Variant(r2[..end].trim().to_string()));
+            rest = &r2[end..];
         } else {
             break;
         }
@@ -1188,8 +1228,7 @@ fn parse_rvalue(s: &str) -> Result<Rvalue, String> {
     if let Some(brace) = s.find('{') {
         let name = s[..brace].trim();
         if !name.is_empty() && !name.contains("const ") && !name.contains('(') {
-            let close = matching(s, brace, '{', '}').ok_or_else(|| format!("mir: unbalanced aggregate `{s}`"))?;
-            let inner = &s[brace + 1..close];
+            let inner = braced_inner(s, brace).ok_or_else(|| format!("mir: unbalanced aggregate `{s}`"))?;
             let mut ops = Vec::new();
             for part in split_top_args(inner) {
                 let p = part.trim();
@@ -1203,7 +1242,27 @@ fn parse_rvalue(s: &str) -> Result<Rvalue, String> {
                     ops.push(parse_operand(p)?);
                 }
             }
+            // An enum variant carries its name so the backend can find the
+            // variant's payload offset; a plain struct is an `Aggregate`.
+            if name.contains("::") {
+                return Ok(Rvalue::Enum { name: name.to_string(), ops });
+            }
             return Ok(Rvalue::Aggregate(ops));
+        }
+    }
+    // `Enum::Variant(a, b)` — a tuple-variant constructor.
+    if let Some(open) = s.find('(') {
+        let name = s[..open].trim();
+        if name.contains("::") && s.ends_with(')') && matching(s, open, '(', ')') == Some(s.len() - 1) {
+            let args = split_top_args(&s[open + 1..s.len() - 1]);
+            let mut ops = Vec::new();
+            for a in args {
+                if a.trim().is_empty() {
+                    continue;
+                }
+                ops.push(parse_operand(a.trim())?);
+            }
+            return Ok(Rvalue::Enum { name: name.to_string(), ops });
         }
     }
     // An enum variant constructor `Enum::Variant { .. }` was handled above; a
@@ -1344,11 +1403,21 @@ fn parse_operand(s: &str) -> Result<Operand, String> {
     if s.starts_with('_') || s.starts_with("(*") {
         return Ok(Operand::Copy(parse_place(s)?));
     }
+    // A bare constant, e.g. `()`, a `"str"` literal, or a named constant the
+    // printer wrote without the `const` keyword.
+    if let Some(c) = parse_const(s) {
+        return Ok(Operand::Const(c));
+    }
     Err(format!("mir: not an operand `{s}`"))
 }
 
 fn parse_const(s: &str) -> Option<Const> {
     let s = s.trim();
+    // An aggregate constant is printed with its own `const` prefix, e.g. the
+    // elements of `[const P {{ .. }}, ..]`; strip it and parse the value.
+    if let Some(r) = s.strip_prefix("const ") {
+        return parse_const(r.trim());
+    }
     if s == "()" {
         return Some(Const::Unit);
     }
@@ -1365,9 +1434,9 @@ fn parse_const(s: &str) -> Option<Const> {
     if let Some(n) = parse_named_const(s) {
         return Some(Const::Int(n));
     }
+    // `{allocN: TY}` — a static allocation, possibly with an interior
+    // offset printed as `{allocN: TY[place]}`.
     if s.starts_with('{') {
-        // `{allocN: TY}` — a static allocation, possibly with an interior
-        // offset printed as `{allocN: TY[place]}`.
         if let Some(rest) = s.strip_prefix("{alloc") {
             if let Some(colon) = rest.find(':') {
                 if let Ok(id) = rest[..colon].trim().parse::<u32>() {
@@ -1381,7 +1450,59 @@ fn parse_const(s: &str) -> Option<Const> {
                 }
             }
         }
+        // `{ x: 1_i64, y: 2_i64 }` — an unnamed aggregate, or a named one the
+        // printer wrote as `Name { .. }` (handled before the brace fallback).
+        if let Some(inner) = braced_inner(s, 0) {
+            let mut ops = Vec::new();
+            for part in split_top_args(inner) {
+                let p = part.trim();
+                if p.is_empty() {
+                    continue;
+                }
+                let v = p.split_once(':').map(|(_, v)| v).unwrap_or(p);
+                ops.push(parse_operand(v.trim()).ok()?);
+            }
+            return Some(Const::Agg { name: String::new(), ops });
+        }
         return Some(Const::Named(s.to_string()));
+    }
+    // `Name { f: v, .. }` — a struct or enum-variant constant.
+    if let Some(brace) = s.find('{') {
+        let name = s[..brace].trim();
+        if !name.is_empty() && !name.contains(' ') && !name.contains('(') {
+            if let Some(inner) = braced_inner(s, brace) {
+                let mut ops = Vec::new();
+                for part in split_top_args(inner) {
+                    let p = part.trim();
+                    if p.is_empty() {
+                        continue;
+                    }
+                    let v = p.split_once(':').map(|(_, v)| v).unwrap_or(p);
+                    ops.push(parse_operand(v.trim()).ok()?);
+                }
+                return Some(Const::Agg { name: name.to_string(), ops });
+            }
+        }
+    }
+    // `E::A` / `E::Variant(args)` — an enum-variant constant.
+    if let Some(open) = s.find('(') {
+        if s.ends_with(')') && !s.starts_with('{') {
+            let name = s[..open].trim();
+            if !name.is_empty() && name.contains("::") {
+                let args = split_top_args(&s[open + 1..s.len() - 1]);
+                let mut ops = Vec::new();
+                for a in args {
+                    if a.trim().is_empty() {
+                        continue;
+                    }
+                    ops.push(parse_operand(a.trim()).ok()?);
+                }
+                return Some(Const::Agg { name: name.to_string(), ops });
+            }
+        }
+    }
+    if s.contains("::") && s.split("::").all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')) {
+        return Some(Const::Agg { name: s.to_string(), ops: Vec::new() });
     }
     if let Some(n) = parse_int_literal(s) {
         return Some(Const::Int(n));
@@ -1529,7 +1650,17 @@ pub fn parse_ty(s: &str) -> Result<Ty, String> {
         "()" => Ok(Ty::Unit),
         "!" => Ok(Ty::Unit),
         _ => {
-            if s.contains("fn(") || s.contains("dyn ") || s.contains("::") {
+            if s.contains("fn(") || s.contains("dyn ") {
+                return Ok(Ty::Other);
+            }
+            // `core::option::Option<i64>` and `core::ops::Range<i64>` are
+            // aggregates the backend models by their last path segment.
+            let base = s.split('<').next().unwrap_or(s).trim();
+            let last = base.rsplit("::").next().unwrap_or(base).trim();
+            if last == "Option" || last == "Range" {
+                return Ok(Ty::Struct(last.to_string()));
+            }
+            if s.contains("::") {
                 Ok(Ty::Other)
             } else {
                 Ok(Ty::Struct(s.to_string()))
@@ -1554,6 +1685,19 @@ fn matching(s: &str, open: usize, oc: char, cc: char) -> Option<usize> {
         }
     }
     None
+}
+
+/// The content between the braces at `open`. The MIR printer doubles the
+/// braces of an aggregate constant (`P {{ x: 1_i64 }}`), so a leading `{{` means
+/// the real group starts one character later.
+fn braced_inner(s: &str, open: usize) -> Option<&str> {
+    if s[open..].starts_with("{{") {
+        let close = matching(s, open + 1, '{', '}')?;
+        Some(&s[open + 2..close])
+    } else {
+        let close = matching(s, open, '{', '}')?;
+        Some(&s[open + 1..close])
+    }
 }
 
 /// Split a comma-separated list at the top nesting level.
@@ -1902,6 +2046,9 @@ impl Remap {
             Rvalue::Repeat { op, count } => Rvalue::Repeat { op: self.op(op), count: *count },
             Rvalue::Array(ops) => Rvalue::Array(ops.iter().map(|o| self.op(o)).collect()),
             Rvalue::Aggregate(ops) => Rvalue::Aggregate(ops.iter().map(|o| self.op(o)).collect()),
+            Rvalue::Enum { name, ops } => {
+                Rvalue::Enum { name: name.clone(), ops: ops.iter().map(|o| self.op(o)).collect() }
+            }
             Rvalue::Len(p) => Rvalue::Len(self.place(p)),
             Rvalue::WithOverflow { op, a, b } => {
                 Rvalue::WithOverflow { op: *op, a: self.op(a), b: self.op(b) }
@@ -3771,6 +3918,7 @@ fn block_writes_mem(b: &BasicBlock) -> bool {
                         | Rvalue::RawRef { .. }
                         | Rvalue::Array(_)
                         | Rvalue::Aggregate(_)
+                        | Rvalue::Enum { .. }
                         | Rvalue::Repeat { .. }
                 )
         }
@@ -3809,6 +3957,13 @@ fn rv_operands(rv: &Rvalue) -> Vec<Place> {
     let mut v = Vec::new();
     let mut push = |op: &Operand| {
         if let Operand::Copy(p) | Operand::Move(p) = op {
+            // A projected place (`_1[_7].0`) reads its index locals as well; the
+            // value it loads is only loop-invariant when every one of them is.
+            for proj in &p.proj {
+                if let Proj::IndexLocal(i) = proj {
+                    v.push(Place { local: *i, proj: Vec::new() });
+                }
+            }
             v.push(p.clone());
         }
     };
@@ -3821,7 +3976,9 @@ fn rv_operands(rv: &Rvalue) -> Vec<Place> {
         Rvalue::Unary(_, a) => push(a),
         Rvalue::Cast { op, .. } => push(op),
         Rvalue::Repeat { op, .. } => push(op),
-        Rvalue::Array(ops) | Rvalue::Aggregate(ops) => ops.iter().for_each(|op| push(op)),
+        Rvalue::Array(ops) | Rvalue::Aggregate(ops) | Rvalue::Enum { ops, .. } => {
+            ops.iter().for_each(|op| push(op))
+        }
         Rvalue::WithOverflow { a, b, .. } => {
             push(a);
             push(b);

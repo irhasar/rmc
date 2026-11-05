@@ -66,18 +66,18 @@ never runs. The trade-off is the whole point of the experiment:
 
 | dimension            | rmc MIR path vs `rustc -O -C lto=fat` |
 | -------------------- | ------------------------------------: |
-| compile wall time    |                            49–56×    |
-| compile CPU time     |                            49–55×    |
-| compiler peak RAM    |                            ~2.1×     |
-| artifact size        |                            196–577×  |
-| run wall time        |                            1.05–3.18× |
-| run CPU time         |                            1.05–5.17× |
-| run peak RAM         |                            1.4–87×   |
+| compile wall time    |                            49–55×    |
+| compile CPU time     |                            48–53×    |
+| compiler peak RAM    |                            ~2.0–2.2× |
+| artifact size        |                            204–577×  |
+| run wall time        |                            1.03–3.70× |
+| run CPU time         |                            1.04–5.88× |
+| run peak RAM         |                            1.4–88×   |
 
 Every ratio is above 1, so the MIR path is faster to build, smaller, and faster
 and lighter to run than the LLVM build on all ten programs. The run-time win is
-narrowest on `mix` (1.05×) and `heap` (1.06×) and widest on `hello` (3.18×) and
-`forloops` (2.18×). The full, dated table is in
+narrowest on `mix` and `heap` (both 1.03×) and widest on `hello` (3.70×),
+`forloops` (2.27×) and `refs` (2.20×). The full, dated table is in
 [`bench/RESULTS-MIR.md`](bench/RESULTS-MIR.md); regenerate it with:
 
 ```sh
@@ -121,6 +121,8 @@ tests/
   run.py             differential test suite: rmc vs rustc on twin programs
   cases/*.rms, *.rs  paired programs that must behave identically
   args.json          per-case argv vectors (for runtime inputs)
+  mir/run.py         differential suite for the rustc-MIR path (mir_codegen)
+  mir/*.rs           freestanding cases, each linked against rmc's runtime
 docs/
   language.md        the supported language subset
   design.md          compiler architecture and code generation notes
@@ -195,6 +197,20 @@ makes the `cmp` case fail, dropping the sign bias from division by a power of
 two makes the `div` case fail, and comparing string pointers instead of their
 bytes makes the `strcmp` case fail.
 
+`tests/mir/run.py` is the differential suite for the other pipeline. Each
+`tests/mir/NAME.rs` is a freestanding `#![no_std]` program that includes
+`prelude.rs` and calls the runtime's `print_i64`/`print_bool`. The case is built
+twice - once from `rustc --emit=obj` linked against rmc's own freestanding
+runtime (`rmc --emit-runtime-asm`), and once through rmc's `rustc --emit=mir`
+front end and MIR back end - and the two must print identical output and exit
+with the same status. Both binaries share one runtime and one entry point, so
+the only variable is the code generator. This is the suite that actually
+exercises `mir_codegen.rs`; `tests/run.py` never reaches it.
+
+```sh
+python3 tests/mir/run.py -v
+```
+
 `tools/fuzz.py` generates random programs and checks them against `rustc -O`
 the same way, for the cases a hand-written suite does not think of. It has
 several modes: `expr` for integer expressions (including comparisons) and
@@ -216,6 +232,20 @@ masks its counts with `& 63` to keep them valid, which left the shift-overflow
 trap unreachable by fuzzing. Every program is recompiled with each optimiser pass off in turn.
 Seeds are reproducible, so a failure can be re-run and shrunk.
 
+`mir` mode fuzzes the *other* pipeline. It builds a freestanding `#![no_std]`
+program (the `expr` grammar plus a prelude with `out`/`outb` externs), compiles
+it with `rustc --emit=obj` and links the object against the *same* freestanding
+runtime rmc uses (`rmc --emit-runtime-asm`), then compiles the same source
+through `rmc <src.rs>` (the rustc-MIR front end) and compares stdout and exit
+status. Because both binaries share one runtime and one entry point, the only
+variable is the code generator. It is the only randomised coverage of the MIR
+back end - the `.rms` modes never reach `mir_codegen.rs`. `--gen <mode>` reuses
+one of the `.rms` generators instead. It found two real MIR codegen bugs on its
+first run: a shift whose count is computed by a call clobbered the value parked
+in `%rdx` (now parked in a frame slot), and a 64-bit constant used as an ALU
+immediate or a frame store was silently truncated to i32 (now materialised in a
+register). Both are pinned by `tests/mir/wideimm.rs`.
+
 ```sh
 python3 tools/fuzz.py --mode expr --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1
@@ -225,6 +255,7 @@ python3 tools/fuzz.py --mode nest --n 500 --seed 1
 python3 tools/fuzz.py --mode pat --n 500 --seed 1
 python3 tools/fuzz.py --mode order --n 500 --seed 1
 python3 tools/fuzz.py --mode shift --n 500 --seed 1
+python3 tools/fuzz.py --mode mir --n 500 --seed 1
 # also exercise the trap codegen: --bounds-checks and --overflow-checks runs
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 python3 tools/fuzz.py --mode robust

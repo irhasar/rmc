@@ -486,7 +486,7 @@ impl Elf {
                 Ok(())
             }
             "sete" | "setne" | "setl" | "setle" | "setg" | "setge" | "setb" | "setbe" | "seta"
-            | "setae" => self.enc_setcc(mnem, &ops, sec),
+            | "setae" | "seto" | "setno" | "sets" | "setns" => self.enc_setcc(mnem, &ops, sec),
             j if j.starts_with('j') => self.enc_jcc(j, &ops, sec),
             other => Err(format!("elf: unsupported instruction `{other}`")),
         }
@@ -646,7 +646,12 @@ impl Elf {
             // because there is no operand to infer a width from; only an explicit
             // `movq` stores 64 bits. Matching that keeps the encoder a faithful
             // stand-in and stops an unsuffixed store silently leaving the high
-            // half of the destination stale.
+            // half of the destination stale. Either form sign-extends a 32-bit
+            // immediate, so a wider one has no encoding at all and must be
+            // materialised in a register by the caller.
+            if !fits_i32(v) {
+                return Err(format!("elf: `{mnem}` immediate {v} does not fit i32; use a register"));
+            }
             self.mem_op(sec, 0xC7, &m, 0, mnem != "mov", false);
             self.sections[sec].data.extend_from_slice(&(v as i32).to_le_bytes());
             return Ok(());
@@ -739,6 +744,9 @@ impl Elf {
             }
             if let Some(m) = parse_mem(&dst) {
                 // `cmp $imm, mem`: 81 /7 id, or the sign-extended 83 /7 ib.
+                if !fits_i32(v) {
+                    return Err(format!("elf: `{mnem}` immediate {v} does not fit i32"));
+                }
                 if fits_i8(v) {
                     self.mem_op(sec, 0x83, &m, ext, true, false);
                     self.sections[sec].data.push(v as u8);
@@ -766,6 +774,9 @@ impl Elf {
             }
             // Width follows the destination: `add $1, %eax` must stay 32-bit
             // (`83 /0 ib`, no REX.W), like every other register form.
+            if !fits_i32(v) {
+                return Err(format!("elf: `{mnem}` immediate {v} does not fit i32"));
+            }
             if let Some(r) = rex_if_needed(!reg_is_32(&dst), ext, dreg) {
                 self.sections[sec].data.push(r);
             }
@@ -946,6 +957,10 @@ impl Elf {
             "setbe" => 0x96,
             "seta" => 0x97,
             "setae" => 0x93,
+            "seto" => 0x90,
+            "setno" => 0x91,
+            "sets" => 0x98,
+            "setns" => 0x99,
             _ => unreachable!(),
         };
         let (reg, _) = parse_reg(&ops[0])?;

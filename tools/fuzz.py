@@ -1875,12 +1875,178 @@ def run_reject():
     return 1 if failures else 0
 
 
+# ---------------------------------------------------------------- MIR mode
+
+# The prelude each generated freestanding program includes. It mirrors
+# `tests/mir/prelude.rs`: the same source builds both against rustc and through
+# rmc's MIR path, linked against the same runtime.
+MIR_PRELUDE = """#![no_std]
+#![no_main]
+extern "C" {
+    fn print_i64(x: i64);
+    fn print_bool(b: i64);
+    fn arg_i64(i: i64) -> i64;
+    fn alloc(n: i64) -> i64;
+    fn free(p: i64);
+}
+#[inline(always)]
+fn out(x: i64) { unsafe { print_i64(x) } }
+#[inline(always)]
+fn outb(b: bool) { unsafe { print_bool(b as i64) } }
+#[inline(always)]
+fn arg(i: i64) -> i64 { unsafe { arg_i64(i) } }
+#[inline(always)]
+fn alc(n: i64) -> i64 { unsafe { alloc(n) } }
+#[inline(always)]
+fn rel(p: i64) { unsafe { free(p) } }
+#[panic_handler]
+fn panic(_i: &core::panic::PanicInfo) -> ! { unsafe { extern "C" { fn exit(c: i64) -> !; } exit(101) } }
+"""
+
+
+def gen_mir_program(rng):
+    """A freestanding program for the MIR path.
+
+    It reuses the `.rms` expression grammar but prints through the runtime's
+    `print_i64`/`print_bool` and returns from `main`, so rustc's reference (an
+    object linked against the same runtime) and rmc produce identical output.
+    """
+    a, b, c = (rng.randint(-1000, 1000) for _ in range(3))
+    exprs = []
+    for _ in range(rng.randint(2, 6)):
+        r = rng.random()
+        if r < 0.45:
+            exprs.append(gen_expr(rng, 0))
+        elif r < 0.7:
+            exprs.append(gen_guarded_div(rng, 0))
+        else:
+            exprs.append(gen_cmp(rng, 0))
+    lines = [
+        f"fn h(x: i64) -> i64 {{ (x * 3 + 1) % 97 - 48 }}",
+        "#[no_mangle]",
+        'pub extern "C" fn main() -> i64 {',
+        f"    let a: i64 = {a};",
+        f"    let b: i64 = {b};",
+        f"    let c: i64 = {c};",
+        "    let mut acc: i64 = 0;",
+    ]
+    for e in exprs:
+        lines.append(f"    out({e});")
+        lines.append(f"    acc = acc.wrapping_add({e});")
+    lines += [
+        "    let mut i: i64 = 0;",
+        "    while i < 8 {",
+        "        acc = acc.wrapping_add(i * 3 - 7);",
+        "        i += 1;",
+        "    }",
+        "    out(acc);",
+        "    outb(acc > 0);",
+        "    0",
+        "}",
+    ]
+    return MIR_PRELUDE + "\n".join(lines) + "\n"
+
+
+def mir_runtime(tmp):
+    """The freestanding runtime as assembly, written once per temp dir. The
+    rustc reference is linked against the *same* runtime rmc uses, so the only
+    variable between the two binaries is the code generator."""
+    rt = f"{tmp}/runtime.s"
+    if not os.path.exists(rt):
+        p = run([RMC, "--emit-runtime-asm"])
+        if p.returncode != 0:
+            return None, f"rmc --emit-runtime-asm failed:\n{p.stderr.decode(errors='replace')}"
+        open(rt, "wb").write(p.stdout)
+    return rt, None
+
+
+def mir_build_reference(rs, obj, ref, rt):
+    """`rustc --emit=obj` -> static link against the shared runtime."""
+    c = run([RUSTC, "-O", "-C", "opt-level=3", "-C", "panic=abort",
+             "--crate-type=bin", "--edition", "2021",
+             "-C", "relocation-model=static", "--emit=obj", rs, "-o", obj])
+    if c.returncode != 0:
+        return f"rustc reference failed:\n{c.stderr.decode(errors='replace')}"
+    c = run(["cc", "-static", "-nostdlib", "-no-pie", obj, rt, "-o", ref])
+    if c.returncode != 0:
+        return f"cc link failed:\n{c.stderr.decode(errors='replace')}"
+    return None
+
+
+def run_mir(args):
+    """Fuzz the rustc-MIR front end + rmc back end against a rustc reference
+    linked against the same freestanding runtime. The `.rms` modes above never
+    reach this path; this one does."""
+    tmp = f"/tmp/rmc-fuzz-mir-{os.getpid()}"
+    os.makedirs(tmp, exist_ok=True)
+    rt, err = mir_runtime(tmp)
+    if err:
+        print(err, file=sys.stderr)
+        return 2
+    gen_name = args.gen or "mir"
+    gen = {"mir": gen_mir_program,
+           "expr": gen_expr_program, "stmt": gen_stmt_program,
+           "opt": gen_opt_program, "arith": gen_arith_program,
+           "nest": gen_nest_program, "pat": gen_pat_program,
+           "order": gen_order_program, "shift": gen_shift_program,
+           "cast": gen_cast_program, "assoc": gen_assoc_program,
+           "ref": gen_ref_program, "update": gen_update_program}[gen_name]
+    rng = random.Random(args.seed)
+    flags = ["--no-inline", "--no-licm", "--no-tco"]
+    failures = 0
+    built = 0
+    for t in range(args.n):
+        if gen_name == "mir":
+            rs = gen(rng)
+        else:
+            # The `.rms` generators produce a std program; only its `.rs` half
+            # is freestanding enough to link against the runtime.
+            _, rs = gen(rng)
+        open(f"{tmp}/p.rs", "w").write(rs)
+        argv = []
+        if args.mode == "shift":
+            argv = [str(rng.choice([rng.randint(-4, 4), rng.randint(60, 68),
+                                    rng.randint(0, 63), -1, 64, 63, 0])),
+                    str(rng.randint(-1000, 1000))]
+        ref = f"{tmp}/p.ref"
+        err = mir_build_reference(f"{tmp}/p.rs", f"{tmp}/p.ref.o", ref, rt)
+        if err:
+            # The generator can emit a program the freestanding reference
+            # cannot build (it targets `std`); skip it rather than fail.
+            continue
+        expected = run([ref] + argv)
+        built += 1
+        bad = None
+        for label, extra in [("", [])] + [(f, [f]) for f in flags]:
+            c = run([RMC] + extra + [f"{tmp}/p.rs", "-o", f"{tmp}/p.bin"])
+            if c.returncode != 0:
+                bad = f"rmc{extra} failed to compile:\n{c.stderr.decode(errors='replace')}"
+                break
+            got = run([f"{tmp}/p.bin"] + argv)
+            if (got.returncode, got.stdout) != (expected.returncode, expected.stdout):
+                bad = (f"rmc{extra} argv={argv} exit={got.returncode} stdout={got.stdout!r}\n"
+                       f"  rustc    exit={expected.returncode} stdout={expected.stdout!r}")
+                break
+        if bad:
+            print(f"[mir {args.mode} seed={args.seed} iter={t}] DIVERGENCE\n{rs}\n  {bad}")
+            if args.keep:
+                os.makedirs(args.keep, exist_ok=True)
+                open(f"{args.keep}/fuzz-mir-{args.mode}-{args.seed}-{t}.rs", "w").write(rs)
+            failures += 1
+            break
+    if failures == 0:
+        print(f"{built} {args.mode} programs (of {args.n}) through the MIR path, seed {args.seed}: all match rustc")
+    return 1 if failures else 0
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "robust", "reject"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "robust", "reject", "mir"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
+    ap.add_argument("--gen", default=None,
+                    help="with --mode mir, which generator to run (default: expr)")
     ap.add_argument("--bounds", action="store_true",
                     help="also compile with --bounds-checks, to exercise the trap codegen")
     ap.add_argument("--encoding", action="store_true",
@@ -1897,6 +2063,11 @@ def main():
         return 2
     if args.mode == "robust":
         return run_robust()
+    if args.mode == "mir":
+        if not rustc_available():
+            print("rustc not found; set RUSTC or install a toolchain", file=sys.stderr)
+            return 2
+        return run_mir(args)
     if args.mode == "reject":
         if not rustc_available():
             print("rustc not found; set RUSTC or install a toolchain", file=sys.stderr)

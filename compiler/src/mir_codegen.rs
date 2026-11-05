@@ -67,6 +67,12 @@ struct FnGen<'a> {
     string_ids: &'a HashMap<String, String>,
     /// Static allocation id -> its data label.
     alloc_labels: &'a HashMap<u32, String>,
+    /// Struct name -> field types, learned from aggregate constructions. Used to
+    /// size a struct and to stride over an array of them.
+    structs: &'a HashMap<String, Vec<Ty>>,
+    /// Enum name -> its layout, learned from constructions and `discriminant`
+    /// switches.
+    enums: &'a HashMap<String, EnumLayout>,
     /// Local index -> its byte size (`8` for a scalar, `8*n` for an aggregate).
     size: Vec<i64>,
     /// Local index -> type.
@@ -117,11 +123,14 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<String, String> {
     let alloc_labels: HashMap<u32, String> =
         prog.allocs.keys().map(|id| (*id, format!("__rmc_alloc{id}"))).collect();
 
+    let structs = collect_structs(prog);
+    let enums = collect_enums(prog);
+
     for f in &order {
         if is_unsupported_builtin(&f.name) {
             continue;
         }
-        let mut g = FnGen::new(prog, f, opts, &string_ids, &alloc_labels);
+        let mut g = FnGen::new(prog, f, opts, &string_ids, &alloc_labels, &structs, &enums);
         let body = g.gen_fn()?;
         asm.push_str(&body);
         if !g.errors.is_empty() {
@@ -248,6 +257,331 @@ fn collect_strings(prog: &Program) -> (Vec<String>, HashMap<String, String>) {
     (order, map)
 }
 
+/// Struct name -> field types, learned from aggregate constructions.
+fn collect_structs(prog: &Program) -> HashMap<String, Vec<Ty>> {
+    let mut structs: HashMap<String, Vec<Ty>> = HashMap::new();
+    for f in &prog.funcs {
+        for l in &f.locals {
+            if let Ty::Struct(name) = &*l.ty {
+                structs.entry(name.clone()).or_default();
+            }
+        }
+        for b in &f.blocks {
+            for s in &b.stmts {
+                if let Stmt::Assign(dest, rv) = s {
+                    if let Rvalue::Aggregate(ops) = rv {
+                        if let Some(Ty::Struct(name)) =
+                            f.locals.get(dest.local as usize).map(|l| (*l.ty).clone())
+                        {
+                            let tys = ops.iter().map(|op| rv_operand_ty(f, op)).collect();
+                            structs.insert(name, tys);
+                        }
+                    }
+                    // An aggregate *constant* (`const P { .. }`) carries its own
+                    // field list, so learn the struct's shape from it too.
+                    let mut aggs = Vec::new();
+                    rv_const_aggs(rv, &mut aggs);
+                    for (name, ops) in aggs {
+                        if !name.is_empty() && !name.contains("::") {
+                            let tys = ops.iter().map(|op| rv_operand_ty(f, op)).collect();
+                            structs.insert(name, tys);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    structs
+}
+
+/// Every `Const::Agg` operand in `rv`, as `(name, ops)`, including nested ones.
+fn rv_const_aggs(rv: &Rvalue, out: &mut Vec<(String, Vec<Operand>)>) {
+    let mut visit = |op: &Operand| op_const_aggs(op, out);
+    match rv {
+        Rvalue::Use(op) => visit(op),
+        Rvalue::Binary(_, a, b) => {
+            visit(a);
+            visit(b);
+        }
+        Rvalue::Unary(_, a) => visit(a),
+        Rvalue::Cast { op, .. } => visit(op),
+        Rvalue::Repeat { op, .. } => visit(op),
+        Rvalue::Array(ops) | Rvalue::Aggregate(ops) | Rvalue::Enum { ops, .. } => {
+            ops.iter().for_each(|op| visit(op))
+        }
+        _ => {}
+    }
+}
+
+fn op_const_aggs(op: &Operand, out: &mut Vec<(String, Vec<Operand>)>) {
+    if let Operand::Const(Const::Agg { name, ops }) = op {
+        out.push((name.clone(), ops.clone()));
+        for o in ops {
+            op_const_aggs(o, out);
+        }
+    }
+}
+
+/// How an enum is laid out: the tag value of each variant, its payload fields,
+/// and where the tag and payload sit in the value.
+#[derive(Debug, Clone, Default)]
+struct EnumLayout {
+    /// Variant name -> its tag value.
+    tags: HashMap<String, u64>,
+    /// Variant name -> payload field types.
+    fields: HashMap<String, Vec<Ty>>,
+    /// Byte offset of the tag.
+    tag_off: i64,
+    /// Byte offset of a payload variant's fields.
+    payload_off: i64,
+    /// Total byte size of the value.
+    size: i64,
+    /// True when every variant is a unit variant (the value is just the tag).
+    fieldless: bool,
+}
+
+/// Split `Enum::Variant` or `Option::<i64>::Some` into the enum and variant
+/// names, dropping any generic arguments.
+fn split_ev(name: &str) -> (String, String) {
+    let idx = name.rfind("::").unwrap_or(0);
+    let variant = name[idx + 2..].trim().to_string();
+    let head = &name[..idx];
+    let head = head.split("::<").next().unwrap_or(head);
+    let head = head.rsplit("::").next().unwrap_or(head);
+    (head.trim().to_string(), variant)
+}
+
+/// Learn each enum's layout from how the program uses it: its constructions
+/// give the payload field types, and a `discriminant` switch gives the tag
+/// values. Only the shapes the backend models are described; an enum with a
+/// payload field narrower than a word is left out (and rejected at codegen).
+fn collect_enums(prog: &Program) -> HashMap<String, EnumLayout> {
+    let mut fields: HashMap<String, HashMap<String, Vec<Ty>>> = HashMap::new();
+    let mut order: HashMap<String, Vec<String>> = HashMap::new();
+    for f in &prog.funcs {
+        for b in &f.blocks {
+            for s in &b.stmts {
+                if let Stmt::Assign(_, rv) = s {
+                    // Both an explicit construction (`E::B(..)`) and an inline
+                    // constant (`const E::A`) name a variant and its payload.
+                    if let Rvalue::Enum { name, ops } = rv {
+                        let (e, v) = split_ev(name);
+                        let tys: Vec<Ty> = ops.iter().map(|op| rv_operand_ty(f, op)).collect();
+                        fields.entry(e.clone()).or_default().entry(v.clone()).or_insert(tys);
+                        let ord = order.entry(e).or_default();
+                        if !ord.contains(&v) {
+                            ord.push(v);
+                        }
+                    }
+                    let mut aggs = Vec::new();
+                    rv_const_aggs(rv, &mut aggs);
+                    for (name, ops) in aggs {
+                        if !name.contains("::") {
+                            continue;
+                        }
+                        let (e, v) = split_ev(&name);
+                        let tys: Vec<Ty> = ops.iter().map(|op| rv_operand_ty(f, op)).collect();
+                        fields.entry(e.clone()).or_default().entry(v.clone()).or_insert(tys);
+                        let ord = order.entry(e).or_default();
+                        if !ord.contains(&v) {
+                            ord.push(v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Tag values from `_d = discriminant(_x); switchInt(_d) -> [tag: arm, ...]`.
+    let mut tags: HashMap<String, HashMap<String, u64>> = HashMap::new();
+    for f in &prog.funcs {
+        for b in &f.blocks {
+            let Some((enum_name, disc_local)) = block_discriminant(f, b) else { continue };
+            let Terminator::SwitchInt { discr, targets, .. } = &b.term else { continue };
+            if operand_local(discr) != Some(disc_local) {
+                continue;
+            }
+            // Each arm's tag is the switch value; the variant it handles is the
+            // one whose payload the arm (or the blocks it falls through to)
+            // reads. A fieldless variant reads none.
+            let arm_blocks: Vec<u32> = targets.iter().map(|(_, t)| *t).collect();
+            let mut fieldless_tags: Vec<u64> = Vec::new();
+            for (tag, target) in targets {
+                match arm_variant(f, *target, &arm_blocks) {
+                    Some(v) => {
+                        tags.entry(enum_name.clone()).or_default().insert(v, *tag as u64);
+                    }
+                    None => fieldless_tags.push(*tag as u64),
+                }
+            }
+            // Fieldless variants take the remaining tag values in the order they
+            // are constructed, which matches declaration order for the shapes
+            // this backend accepts.
+            if let Some(ord) = order.get(&enum_name) {
+                let mut ft = fieldless_tags.into_iter();
+                for v in ord {
+                    let has_payload = fields
+                        .get(&enum_name)
+                        .and_then(|m| m.get(v))
+                        .map(|t| !t.is_empty())
+                        .unwrap_or(false);
+                    if has_payload || tags.get(&enum_name).map(|m| m.contains_key(v)).unwrap_or(false) {
+                        continue;
+                    }
+                    if let Some(t) = ft.next() {
+                        tags.entry(enum_name.clone()).or_default().insert(v.clone(), t);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut enums = HashMap::new();
+    for (name, variants) in &fields {
+        let fieldless = variants.values().all(|tys| tys.is_empty());
+        let mut tag_map: HashMap<String, u64> = tags.remove(name).unwrap_or_default();
+        // Assign any variant without a tag a fresh value, in construction order.
+        let mut next = tag_map.values().copied().max().map(|m| m + 1).unwrap_or(0);
+        for v in order.get(name).cloned().unwrap_or_default() {
+            tag_map.entry(v).or_insert_with(|| {
+                let t = next;
+                next += 1;
+                t
+            });
+        }
+        // The backend models a payload enum only when every payload field is one
+        // word wide: the tag is then one word and the payload follows it.
+        let modelled = fieldless
+            || variants.values().all(|tys| tys.iter().all(|t| scalar_word(t)));
+        let (payload_off, size) = if fieldless {
+            (0, 8)
+        } else if modelled {
+            (8, 16)
+        } else {
+            (0, 0)
+        };
+        enums.insert(
+            name.clone(),
+            EnumLayout {
+                tags: tag_map,
+                fields: variants.clone(),
+                tag_off: 0,
+                payload_off,
+                size,
+                fieldless,
+            },
+        );
+    }
+    // An enum seen only through `discriminant` (never constructed) still needs
+    // an entry so its size is known.
+    for (name, tag_map) in tags {
+        enums.entry(name).or_insert_with(|| EnumLayout {
+            tags: tag_map,
+            fields: HashMap::new(),
+            tag_off: 0,
+            payload_off: 0,
+            size: 8,
+            fieldless: true,
+        });
+    }
+    enums
+}
+
+/// A field type the backend can store in one word.
+fn scalar_word(t: &Ty) -> bool {
+    matches!(t, Ty::I64 | Ty::Bool | Ty::Int | Ty::Ptr(_) | Ty::Ref(_) | Ty::Unit | Ty::Other)
+}
+
+/// The `(_d = discriminant(_x))` in `b`, as `(enum name, _d)`.
+fn block_discriminant(f: &Function, b: &BasicBlock) -> Option<(String, u32)> {
+    for s in &b.stmts {
+        if let Stmt::Assign(d, Rvalue::Discriminant(p)) = s {
+            if let Some(Ty::Struct(en)) = f.locals.get(p.local as usize).map(|l| &*l.ty) {
+                return Some((en.clone(), d.local));
+            }
+        }
+    }
+    None
+}
+
+/// The variant an arm block handles, by the payload it reads. `None` when the
+/// arm reads no payload (a fieldless variant).
+fn arm_variant(f: &Function, start: u32, arms: &[u32]) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![start];
+    while let Some(b) = stack.pop() {
+        if !seen.insert(b) {
+            continue;
+        }
+        let Some(block) = f.blocks.get(b as usize) else { continue };
+        for s in &block.stmts {
+            if let Stmt::Assign(_, rv) = s {
+                if let Some(v) = rv_variant(rv) {
+                    return Some(v);
+                }
+            }
+        }
+        match &block.term {
+            Terminator::Goto(next) => {
+                // Stop at a join: a block that another arm also reaches.
+                if *next != start && !arms.contains(next) {
+                    stack.push(*next);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The variant name a rvalue reads through `(x as Variant)`, if any.
+fn rv_variant(rv: &Rvalue) -> Option<String> {
+    let ops: Vec<&Operand> = match rv {
+        Rvalue::Use(op) => vec![op],
+        Rvalue::Binary(_, a, b) => vec![a, b],
+        Rvalue::Unary(_, a) => vec![a],
+        Rvalue::Cast { op, .. } => vec![op],
+        Rvalue::Repeat { op, .. } => vec![op],
+        Rvalue::Array(ops) | Rvalue::Aggregate(ops) => ops.iter().collect(),
+        Rvalue::Enum { ops, .. } => ops.iter().collect(),
+        _ => Vec::new(),
+    };
+    for op in ops {
+        if let Operand::Copy(p) | Operand::Move(p) = op {
+            for proj in &p.proj {
+                if let Proj::Variant(v) = proj {
+                    return Some(v.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn operand_local(op: &Operand) -> Option<u32> {
+    match op {
+        Operand::Copy(p) | Operand::Move(p) if p.proj.is_empty() => Some(p.local),
+        _ => None,
+    }
+}
+
+/// The type of an operand, from its local's declared type when it names one.
+fn rv_operand_ty(f: &Function, op: &Operand) -> Ty {
+    match op {
+        Operand::Copy(p) | Operand::Move(p) => {
+            f.locals.get(p.local as usize).map(|l| (*l.ty).clone()).unwrap_or(Ty::I64)
+        }
+        Operand::Const(Const::Bool(_)) => Ty::Bool,
+        Operand::Const(Const::Agg { name, .. }) => {
+            if name.is_empty() {
+                Ty::I64
+            } else {
+                Ty::Struct(name.clone())
+            }
+        }
+        _ => Ty::I64,
+    }
+}
+
 fn collect_strings_rv(rv: &Rvalue, order: &mut Vec<String>, map: &mut HashMap<String, String>) {
     let mut add = |c: &Const| {
         if let Const::Str(s) = c {
@@ -286,7 +620,7 @@ fn collect_strings_rv(rv: &Rvalue, order: &mut Vec<String>, map: &mut HashMap<St
                 add(c)
             }
         }
-        Rvalue::Array(ops) | Rvalue::Aggregate(ops) => {
+        Rvalue::Array(ops) | Rvalue::Aggregate(ops) | Rvalue::Enum { ops, .. } => {
             for op in ops {
                 if let Operand::Const(c) = op {
                     add(c)
@@ -304,6 +638,8 @@ impl<'a> FnGen<'a> {
         opts: &'a Options,
         string_ids: &'a HashMap<String, String>,
         alloc_labels: &'a HashMap<u32, String>,
+        structs: &'a HashMap<String, Vec<Ty>>,
+        enums: &'a HashMap<String, EnumLayout>,
     ) -> Self {
         FnGen {
             prog,
@@ -311,6 +647,8 @@ impl<'a> FnGen<'a> {
             opts,
             string_ids,
             alloc_labels,
+            structs,
+            enums,
             size: Vec::new(),
             ty: Vec::new(),
             local_base: Vec::new(),
@@ -390,7 +728,7 @@ impl<'a> FnGen<'a> {
         // be indexed directly.
         let mut slot = 0i64;
         for l in &self.func.locals {
-            let size = ty_size(&l.ty);
+            let size = self.size_of_ty(&l.ty);
             let slots = ((size + 7) / 8).max(1);
             self.ty.push((*l.ty).clone());
             self.size.push(size);
@@ -1053,7 +1391,12 @@ impl<'a> FnGen<'a> {
                 self.gen_switch(bb, discr, targets, *otherwise)?;
             }
             Terminator::Call { dest, func, args, target } => {
-                self.gen_call(dest, func, args)?;
+                // `cold_path` is an optimisation hint with no effect here; it
+                // has no body to call, so skip it and continue.
+                let cold = matches!(func, CallTarget::Direct(n) if n == "cold_path" || n.ends_with("::cold_path"));
+                if !cold {
+                    self.gen_call(dest, func, args)?;
+                }
                 let t = target.unwrap_or_else(|| {
                     // A call with no return edge is `-> []` (noreturn).
                     u32::MAX
@@ -1088,12 +1431,14 @@ impl<'a> FnGen<'a> {
         if is_mem {
             self.emit(&format!("  mov {src}, %rax"));
             for (val, t) in targets {
-                self.emit(&format!("  cmp ${val}, %rax"));
+                let v = self.wide_imm(&format!("${val}"), "%rcx");
+                self.emit(&format!("  cmp {v}, %rax"));
                 self.emit(&format!("  je .Lbb{}", self.bb_label(*t)));
             }
         } else {
             for (val, t) in targets {
-                self.emit(&format!("  cmp ${val}, {src}"));
+                let v = self.wide_imm(&format!("${val}"), "%rcx");
+                self.emit(&format!("  cmp {v}, {src}"));
                 self.emit(&format!("  je .Lbb{}", self.bb_label(*t)));
             }
         }
@@ -1171,13 +1516,26 @@ impl<'a> FnGen<'a> {
     /// is returned directly, a complex one is loaded into `%rcx`.
     fn eval_operand_keep_rax(&mut self, op: &Operand) -> Result<(String, bool), String> {
         match op {
-            Operand::Const(c) => Ok((self.const_operand(c)?, false)),
+            Operand::Const(c) => {
+                if let Const::Str(s) = c {
+                    let label = self.str_label(s);
+                    self.emit(&format!("  lea {label}(%rip), %rcx"));
+                    return Ok(("%rcx".to_string(), false));
+                }
+                Ok((self.const_operand(c)?, false))
+            }
             Operand::Copy(p) | Operand::Move(p) => {
                 if self.place_is_simple(p) {
                     let mem = !self.promo.contains_key(&p.local);
                     Ok((self.local_operand(p.local), mem))
                 } else {
+                    // `place_addr` computes into `%rax`, so the caller's `%rax`
+                    // (which for a binary op is the left operand) is saved in a
+                    // scratch slot and restored afterwards.
+                    let tmp = self.alloc_slot();
+                    self.emit(&format!("  mov %rax, {}", self.off(tmp)));
                     self.load_place_to(p, "%rcx")?;
+                    self.emit(&format!("  mov {}, %rax", self.off(tmp)));
                     Ok(("%rcx".to_string(), false))
                 }
             }
@@ -1192,9 +1550,20 @@ impl<'a> FnGen<'a> {
 
     fn operand_is_simple(&self, op: &Operand) -> bool {
         match op {
+            // A string literal is an address, not an immediate: reading it needs
+            // a `lea`, so it is never a directly usable operand.
+            Operand::Const(Const::Str(_)) => false,
             Operand::Const(_) => true,
             Operand::Copy(p) | Operand::Move(p) => self.place_is_simple(p),
         }
+    }
+
+    /// The `.rodata` label for a string literal's content.
+    fn str_label(&self, s: &str) -> String {
+        self.string_ids
+            .get(s)
+            .cloned()
+            .unwrap_or_else(|| s.to_string())
     }
 
     fn const_operand(&mut self, c: &Const) -> Result<String, String> {
@@ -1203,15 +1572,18 @@ impl<'a> FnGen<'a> {
             Const::Bool(b) => format!("${}", *b as i64),
             Const::Unit => "$0".to_string(),
             Const::Str(s) => {
-                let label = self
-                    .string_ids
-                    .get(s)
-                    .cloned()
-                    .unwrap_or_else(|| s.clone());
-                format!("${label}")
+                // A string literal is the address of its `.rodata` record, so it
+                // must be materialised with `lea`; the in-process assembler has
+                // no relocation form for `mov $symbol`.
+                let label = self.str_label(s);
+                self.emit(&format!("  lea {label}(%rip), %rax"));
+                "%rax".to_string()
             }
             Const::Named(n) => {
                 return Err(format!("mir_codegen: unsupported constant `{n}`"));
+            }
+            Const::Agg { .. } => {
+                return Err("mir_codegen: aggregate constant not yet materialised".into());
             }
             Const::Alloc { id, place } => {
                 let label = self
@@ -1236,6 +1608,20 @@ impl<'a> FnGen<'a> {
         })
     }
 
+    /// The value of `op` as an ALU immediate, or `op` moved into a scratch
+    /// register when it does not fit the instruction's sign-extended i32 field.
+    /// An ALU immediate is only i32 wide, so a 64-bit constant must be
+    /// materialised first or it would be silently truncated.
+    fn wide_imm(&mut self, op: &str, scratch: &str) -> String {
+        if let Some(v) = imm_value(op) {
+            if !(i32::MIN as i64..=i32::MAX as i64).contains(&v) {
+                self.emit(&format!("  mov ${v}, {scratch}"));
+                return scratch.to_string();
+            }
+        }
+        op.to_string()
+    }
+
     /// Leave the address of `place` in `%rax`.
     fn place_addr(&mut self, p: &Place) -> Result<(), String> {
         let starts_deref = matches!(p.proj.first(), Some(Proj::Deref));
@@ -1257,20 +1643,167 @@ impl<'a> FnGen<'a> {
             self.emit(&format!("  lea {}, %rax", self.off(self.local_base(p.local))));
         }
         let rest = if starts_deref { &p.proj[1..] } else { &p.proj[..] };
+        // Track the type at each step so an array index scales by the element
+        // size, not a fixed 8: `[[i64; 3]; 2]` strides 24 bytes, and a struct
+        // field's offset is the sum of the sizes before it.
+        let mut ty = self.local_ty(p.local);
+        if starts_deref {
+            ty = match &ty {
+                Ty::Ref(t) | Ty::Ptr(t) => (**t).clone(),
+                _ => Ty::I64,
+            };
+        }
+        let mut variant_ctx: Option<(String, String)> = None;
         for proj in rest {
             match proj {
-                Proj::Field(k) => self.emit(&format!("  add ${}, %rax", *k as i64 * 8)),
-                Proj::IndexConst(i) => self.emit(&format!("  add ${}, %rax", *i as i64 * 8)),
+                Proj::Field(k) => {
+                    // After `(x as Variant)`, the payload offset is already
+                    // applied, so the field index is a word offset within it.
+                    if let Some((en, v)) = &variant_ctx {
+                        self.emit(&format!("  add ${}, %rax", *k as i64 * 8));
+                        ty = self.enum_field_ty(en, v, *k as u64);
+                        variant_ctx = None;
+                        continue;
+                    }
+                    let off = self.field_offset(&ty, *k as u64);
+                    self.emit(&format!("  add ${off}, %rax"));
+                    ty = self.field_ty(&ty, *k as u64);
+                }
+                Proj::Variant(v) => {
+                    // `(x as Variant)` selects the variant's payload: move to the
+                    // payload offset (0 for a fieldless enum) and remember the
+                    // variant for the field that follows.
+                    if let Ty::Struct(en) = &ty {
+                        let off = self.enum_field_offset(en, v, 0);
+                        self.emit(&format!("  add ${off}, %rax"));
+                        variant_ctx = Some((en.clone(), v.clone()));
+                    }
+                }
+                Proj::IndexConst(i) => {
+                    let stride = self.size_of_ty(&elem_ty(&ty)).max(8);
+                    self.emit(&format!("  add ${}, %rax", *i as i64 * stride));
+                    ty = elem_ty(&ty);
+                }
                 Proj::IndexLocal(l) => {
+                    let stride = self.size_of_ty(&elem_ty(&ty)).max(8);
                     let src = self.local_operand(*l);
                     self.emit(&format!("  mov {src}, %rcx"));
-                    self.emit("  lea (%rax,%rcx,8), %rax");
+                    match stride {
+                        1 => self.emit("  add %rcx, %rax"),
+                        2 => self.emit("  lea (%rax,%rcx,2), %rax"),
+                        4 => self.emit("  lea (%rax,%rcx,4), %rax"),
+                        8 => self.emit("  lea (%rax,%rcx,8), %rax"),
+                        s => {
+                            self.emit(&format!("  imul ${s}, %rcx, %rcx"));
+                            self.emit("  add %rcx, %rax");
+                        }
+                    }
+                    ty = elem_ty(&ty);
                 }
-                Proj::Deref => self.emit("  mov (%rax), %rax"),
+                Proj::Deref => {
+                    self.emit("  mov (%rax), %rax");
+                    ty = match &ty {
+                        Ty::Ref(t) | Ty::Ptr(t) => (**t).clone(),
+                        _ => Ty::I64,
+                    };
+                }
                 Proj::RawRef => {}
             }
         }
         Ok(())
+    }
+
+    /// The byte offset of field `k` within `ty`, for the layouts the backend
+    /// models: a tuple is packed in order, and a struct of equally sized fields
+    /// is in declaration order (rustc only reorders to improve alignment, which
+    /// cannot change the offsets of equal-sized fields).
+    fn field_offset(&self, ty: &Ty, k: u64) -> i64 {
+        match ty {
+            Ty::Tuple(tys) => tys
+                .iter()
+                .take(k as usize)
+                .map(|t| self.size_of_ty(t))
+                .sum::<i64>()
+                .max(8 * k as i64),
+            Ty::Struct(name) => self.struct_layout(name).map(|(offs, _)| offs.get(k as usize).copied().unwrap_or(k as i64 * 8)).unwrap_or(k as i64 * 8),
+            _ => k as i64 * 8,
+        }
+    }
+
+    fn field_ty(&self, ty: &Ty, k: u64) -> Ty {
+        match ty {
+            Ty::Tuple(tys) => tys.get(k as usize).map(|t| (**t).clone()).unwrap_or(Ty::I64),
+            Ty::Struct(name) => self
+                .struct_layout(name)
+                .and_then(|(_, f)| f.get(k as usize).cloned())
+                .unwrap_or(Ty::I64),
+            _ => Ty::I64,
+        }
+    }
+
+    /// Byte size of a type as the backend lays it out. A struct is the sum of
+    /// its fields, which `structs` supplies.
+    fn size_of_ty(&self, ty: &Ty) -> i64 {
+        match ty {
+            Ty::Struct(name) => {
+                if let Some(l) = self.enums.get(name) {
+                    return l.size.max(8);
+                }
+                self.structs
+                    .get(name)
+                    .map(|fs| fs.iter().map(|t| self.size_of_ty(t)).sum::<i64>())
+                    .unwrap_or(8)
+                    .max(8)
+            }
+            Ty::Array(elem, n) => self.size_of_ty(elem) * (*n as i64).max(1),
+            Ty::Tuple(tys) => tys.iter().map(|t| self.size_of_ty(t)).sum::<i64>().max(8),
+            _ => 8,
+        }
+    }
+
+    /// The layout of an enum, if the backend models it.
+    fn enum_layout(&self, name: &str) -> Option<&EnumLayout> {
+        self.enums.get(name)
+    }
+
+    /// The byte offset of variant `v`'s field `k` within an enum, or the offset
+    /// of the tag when `k` is `None`.
+    fn enum_field_offset(&self, name: &str, v: &str, k: u64) -> i64 {
+        let Some(l) = self.enums.get(name) else { return k as i64 * 8 };
+        let base = if l.fieldless { l.tag_off } else { l.payload_off };
+        base + k as i64 * 8
+    }
+
+    /// The type of variant `v`'s field `k` within an enum.
+    fn enum_field_ty(&self, name: &str, v: &str, k: u64) -> Ty {
+        self.enums
+            .get(name)
+            .and_then(|l| l.fields.get(v))
+            .and_then(|f| f.get(k as usize).cloned())
+            .unwrap_or(Ty::I64)
+    }
+
+    /// The tag value of variant `v` of an enum.
+    fn variant_tag(&self, name: &str, v: &str) -> u64 {
+        self.enums
+            .get(name)
+            .and_then(|l| l.tags.get(v))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// The field offsets and types of a struct, learned from its aggregate
+    /// constructions: fields are laid out in declaration order, which matches
+    /// rustc's `repr(Rust)` layout for the programs the backend compiles.
+    fn struct_layout(&self, name: &str) -> Option<(Vec<i64>, Vec<Ty>)> {
+        let tys = self.structs.get(name)?;
+        let mut offs = Vec::with_capacity(tys.len());
+        let mut acc = 0i64;
+        for t in tys {
+            offs.push(acc);
+            acc += self.size_of_ty(t);
+        }
+        Some((offs, tys.clone()))
     }
 
     /// Leave the scalar value at `place` in `%rax`.
@@ -1290,12 +1823,86 @@ impl<'a> FnGen<'a> {
     }
 
     /// Evaluate an operand that names an aggregate, leaving its address in
-    /// `%rax`.
+    /// `%rax`. An aggregate *constant* is materialised into a fresh frame region
+    /// first, so the caller can copy from a stable address.
     fn eval_aggregate_addr(&mut self, op: &Operand) -> Result<(), String> {
         match op {
             Operand::Copy(p) | Operand::Move(p) => self.place_addr(p),
-            Operand::Const(_) => Err("mir_codegen: aggregate constant unsupported".into()),
+            Operand::Const(c) => self.materialize_const_agg(c),
         }
+    }
+
+    /// Write an aggregate constant into a fresh frame region and leave its
+    /// address in `%rax`.
+    fn materialize_const_agg(&mut self, c: &Const) -> Result<(), String> {
+        let Const::Agg { name, ops } = c else {
+            return Err("mir_codegen: aggregate constant unsupported".into());
+        };
+        // The aggregate's kind and the byte offset of each field.
+        let (offs, size): (Vec<i64>, i64) = if name.contains("::") {
+            let (en, v) = split_ev(name);
+            let Some(l) = self.enums.get(&en) else {
+                return Err(format!("mir_codegen: unknown enum `{en}`"));
+            };
+            // Word 0 is the tag; a payload variant's fields follow it.
+            let mut offs = vec![0i64];
+            if !l.fieldless {
+                for k in 0..ops.len() {
+                    offs.push(self.enum_field_offset(&en, &v, k as u64));
+                }
+            }
+            (offs, l.size.max(8))
+        } else if name.is_empty() {
+            ((0..ops.len()).map(|k| k as i64 * 8).collect(), (ops.len() as i64 * 8).max(8))
+        } else {
+            let tys = self.structs.get(name).cloned().unwrap_or_default();
+            let mut offs = Vec::new();
+            let mut acc = 0i64;
+            for t in &tys {
+                offs.push(acc);
+                acc += self.size_of_ty(t);
+            }
+            (offs, acc.max(8))
+        };
+
+        let slots = ((size + 7) / 8).max(1);
+        let first = self.next_slot;
+        for _ in 0..slots {
+            self.alloc_slot();
+        }
+        let base = first + slots - 1;
+
+        // Evaluate each field value into its own scratch word first, so a later
+        // `lea` for the region base cannot clobber an earlier value. An enum's
+        // first word is its tag, an immediate.
+        let mut vals: Vec<(i64, Option<i64>, Option<i64>)> = Vec::new();
+        let tag_first = name.contains("::");
+        for (k, op) in ops.iter().enumerate() {
+            let (src, _) = self.eval_operand(op)?;
+            let tmp = self.alloc_slot();
+            self.emit(&format!("  mov {src}, {}", self.off(tmp)));
+            let off = offs.get(k + tag_first as usize).copied().unwrap_or(k as i64 * 8);
+            vals.push((off, None, Some(tmp)));
+        }
+        if tag_first {
+            let (en, v) = split_ev(name);
+            let tag = self.variant_tag(&en, &v) as i64;
+            vals.insert(0, (0, Some(tag), None));
+        }
+        for (off, imm, tmp) in vals {
+            self.emit(&format!("  lea {}, %rax", self.off(base)));
+            if off != 0 {
+                self.emit(&format!("  add ${off}, %rax"));
+            }
+            if let Some(v) = imm {
+                self.emit(&format!("  mov ${v}, %rcx"));
+            } else if let Some(t) = tmp {
+                self.emit(&format!("  mov {}, %rcx", self.off(t)));
+            }
+            self.emit("  mov %rcx, (%rax)");
+        }
+        self.emit(&format!("  lea {}, %rax", self.off(base)));
+        Ok(())
     }
 
     /// Copy `size` bytes from the address in `%rsi` to the address in `%rdi`.
@@ -1410,6 +2017,23 @@ impl<'a> FnGen<'a> {
                     }
                 }
             }
+            Rvalue::Enum { name, ops } => {
+                let (en, v) = split_ev(name);
+                let (tag, fieldless) = match self.enums.get(&en) {
+                    Some(l) => (l.tags.get(&v).copied().unwrap_or(0), l.fieldless),
+                    None => (0, false),
+                };
+                // The tag is word 0; a payload variant's fields follow it.
+                let tag_place = self.subplace(dest, 0);
+                self.store_scalar(&tag_place, &format!("${tag}"))?;
+                if !fieldless {
+                    for (i, op) in ops.iter().enumerate() {
+                        let target = self.subplace(dest, i as u64 + 1);
+                        let (src, _) = self.eval_operand(op)?;
+                        self.store_scalar(&target, &src)?;
+                    }
+                }
+            }
             Rvalue::Len(place) => {
                 let len = self.array_len(place);
                 self.emit(&format!("  mov ${len}, %rax"));
@@ -1470,7 +2094,9 @@ impl<'a> FnGen<'a> {
         // through `%rcx`.
         if dest.proj.is_empty() {
             let dst = self.off(self.local_base(dest.local));
-            if src.contains('(') {
+            // A wide immediate has no `mov $imm, mem` encoding, so it goes
+            // through `%rcx` like a memory source.
+            if src.contains('(') || is_wide_imm(src) {
                 self.emit(&format!("  mov {src}, %rcx"));
                 self.emit(&format!("  mov %rcx, {dst}"));
             } else {
@@ -1494,12 +2120,27 @@ impl<'a> FnGen<'a> {
 
     fn place_ty(&self, p: &Place) -> Ty {
         let mut ty = self.local_ty(p.local);
+        let mut variant_ctx: Option<String> = None;
         for proj in &p.proj {
             ty = match proj {
-                Proj::Field(k) => match &ty {
-                    Ty::Tuple(tys) => tys.get(*k as usize).map(|t| (**t).clone()).unwrap_or(Ty::I64),
-                    _ => Ty::I64,
-                },
+                Proj::Field(k) => {
+                    if let Some(en) = &variant_ctx {
+                        if let Ty::Struct(name) = &ty {
+                            let (name, en) = (name.clone(), en.clone());
+                            variant_ctx = None;
+                            self.enum_field_ty(&name, &en, *k as u64)
+                        } else {
+                            variant_ctx = None;
+                            self.field_ty(&ty, *k as u64)
+                        }
+                    } else {
+                        self.field_ty(&ty, *k as u64)
+                    }
+                }
+                Proj::Variant(v) => {
+                    variant_ctx = Some(v.clone());
+                    ty.clone()
+                }
                 Proj::IndexConst(_) | Proj::IndexLocal(_) => match &ty {
                     Ty::Array(elem, _) => (**elem).clone(),
                     _ => Ty::I64,
@@ -1515,7 +2156,7 @@ impl<'a> FnGen<'a> {
     }
 
     fn place_size(&self, p: &Place) -> i64 {
-        ty_size(&self.place_ty(p))
+        self.size_of_ty(&self.place_ty(p))
     }
 
     fn array_len(&self, p: &Place) -> u64 {
@@ -1560,15 +2201,8 @@ impl<'a> FnGen<'a> {
                     self.emit(&format!("  mov {av}, {reg}"));
                 }
             }
-            let (mut bv, _) = self.eval_operand_keep_rax(b)?;
-            if op == BinOp::Mul {
-                if let Some(v) = imm_value(&bv) {
-                    if !(i32::MIN as i64..=i32::MAX as i64).contains(&v) {
-                        self.emit(&format!("  mov ${v}, %rcx"));
-                        bv = "%rcx".to_string();
-                    }
-                }
-            }
+            let (bv, _) = self.eval_operand_keep_rax(b)?;
+            let bv = self.wide_imm(&bv, "%rcx");
             self.emit(&format!("  {} {bv}, {reg}", alu_mnem(op)));
             if self.opts.overflow_checks && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
                 self.emit("  jo __rmc_overflow");
@@ -1624,32 +2258,26 @@ impl<'a> FnGen<'a> {
                     BinOp::BitOr => "or",
                     _ => "xor",
                 };
-                // An immediate larger than 32 bits cannot be an `imul` operand
-                // (the immediate is sign-extended from i32), so it is
+                // An immediate is sign-extended from i32, so a wider one is
                 // materialised in a register first.
-                let mut bv = bv;
-                if op == BinOp::Mul {
-                    if let Some(v) = imm_value(&bv) {
-                        if !(i32::MIN as i64..=i32::MAX as i64).contains(&v) {
-                            self.emit(&format!("  mov ${v}, %rcx"));
-                            bv = "%rcx".to_string();
-                        }
-                    }
-                }
+                let bv = self.wide_imm(&bv, "%rcx");
                 self.emit(&format!("  {m} {bv}, %rax"));
                 if self.opts.overflow_checks && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
                     self.emit("  jo __rmc_overflow");
                 }
             }
             BinOp::Shl | BinOp::Shr => {
-                // The shift count must be in `%cl`. Save `%rax` (the value) in
-                // `%rdx` while the count is evaluated, then move it to `%rcx`.
-                self.emit("  mov %rax, %rdx");
+                // The shift count must be in `%cl`. Evaluating it may make a
+                // call, which clobbers every scratch register, so the value is
+                // parked in a frame slot rather than `%rdx` while the count is
+                // computed, then reloaded once the count is in `%rcx`.
+                let tmp = self.alloc_slot();
+                self.emit(&format!("  mov %rax, {}", self.off(tmp)));
                 let (bv, _) = self.eval_operand(b)?;
                 if bv != "%rcx" {
                     self.emit(&format!("  mov {bv}, %rcx"));
                 }
-                self.emit("  mov %rdx, %rax");
+                self.emit(&format!("  mov {}, %rax", self.off(tmp)));
                 let m = if op == BinOp::Shl { "sal" } else { "sar" };
                 self.emit(&format!("  {m} %cl, %rax"));
             }
@@ -1772,9 +2400,14 @@ impl<'a> FnGen<'a> {
 
     /// Emit `cmp` so that the flags read as `a op b` (i.e. `a - b`).
     fn emit_cmp(&mut self, _op: BinOp, a: &Operand, b: &Operand) -> Result<(), String> {
-        if self.operand_is_simple(a) && self.operand_is_simple(b) {
+        // x86 has no `cmp imm, reg` form: an immediate may only be the source.
+        // The fast path would emit exactly that when `a` is a constant, so an
+        // immediate on the left is routed through the general path, which loads
+        // it into `%rax` first.
+        if !matches!(a, Operand::Const(_)) && self.operand_is_simple(a) && self.operand_is_simple(b) {
             let (av, _) = self.eval_operand(a)?;
             let (bv, _) = self.eval_operand(b)?;
+            let bv = self.wide_imm(&bv, "%rcx");
             self.emit(&format!("  cmp {bv}, {av}"));
             return Ok(());
         }
@@ -1785,6 +2418,7 @@ impl<'a> FnGen<'a> {
             self.emit(&format!("  mov {av}, %rax"));
         }
         let (bv, _) = self.eval_operand_keep_rax(b)?;
+        let bv = self.wide_imm(&bv, "%rcx");
         self.emit(&format!("  cmp {bv}, %rax"));
         Ok(())
     }
@@ -2326,6 +2960,17 @@ fn reads_reg(line: &str, r: &str) -> bool {
     let Some((mnem, rest)) = t.split_once(char::is_whitespace) else {
         return reg_mentions(t, r);
     };
+    // The one-operand multiply/divide forms read the accumulator implicitly:
+    // `imul r/m64` reads `%rax` and writes `%rax:%rdx`; `idiv`/`div` read
+    // `%rdx:%rax`. Missing this would let a pass treat `%rax` as dead across
+    // them and delete the `mov` that sets up the dividend.
+    if !rest.contains(',') {
+        match mnem {
+            "imul" | "mul" => return r == "%rax" || reg_mentions(rest, r),
+            "idiv" | "div" => return r == "%rax" || r == "%rdx" || reg_mentions(rest, r),
+            _ => {}
+        }
+    }
     let write_only_dst = matches!(
         mnem,
         "mov" | "lea" | "movabs" | "pop" | "sete" | "setne" | "setl" | "setg"
@@ -2858,6 +3503,12 @@ fn imm_value(op: &str) -> Option<i64> {
     op.trim().strip_prefix('$')?.parse::<i64>().ok()
 }
 
+/// Whether `op` is an immediate that does not fit a sign-extended i32 field, so
+/// it cannot be encoded as an ALU or memory-store operand.
+fn is_wide_imm(op: &str) -> bool {
+    imm_value(op).map_or(false, |v| !(i32::MIN as i64..=i32::MAX as i64).contains(&v))
+}
+
 fn ty_size(ty: &Ty) -> i64 {
     match ty {
         Ty::I64 | Ty::Bool | Ty::Int | Ty::Ptr(_) | Ty::Ref(_) | Ty::Other | Ty::Unit => 8,
@@ -2867,6 +3518,16 @@ fn ty_size(ty: &Ty) -> i64 {
         _ => 8,
         #[allow(unreachable_patterns)]
         _ => 8,
+    }
+}
+
+/// The element type of an array, or the pointee of a reference; anything else
+/// is treated as an 8-byte scalar.
+fn elem_ty(ty: &Ty) -> Ty {
+    match ty {
+        Ty::Array(elem, _) => (**elem).clone(),
+        Ty::Ref(t) | Ty::Ptr(t) => (**t).clone(),
+        _ => Ty::I64,
     }
 }
 
@@ -2968,7 +3629,7 @@ fn scan_rv(
         Rvalue::Unary(_, a) => scan_operand(a, counts, projected),
         Rvalue::Cast { op, .. } => scan_operand(op, counts, projected),
         Rvalue::Repeat { op, .. } => scan_operand(op, counts, projected),
-        Rvalue::Array(ops) | Rvalue::Aggregate(ops) => {
+        Rvalue::Array(ops) | Rvalue::Aggregate(ops) | Rvalue::Enum { ops, .. } => {
             for op in ops {
                 scan_operand(op, counts, projected);
             }
@@ -2995,6 +3656,13 @@ fn scan_rv(
 
 fn scan_operand(op: &Operand, counts: &mut HashMap<u32, u32>, projected: &mut HashSet<u32>) {
     if let Operand::Copy(p) | Operand::Move(p) = op {
+        // An index local inside a place (`_1[_7]`) is read as often as the place
+        // is, so count it toward promotion.
+        for proj in &p.proj {
+            if let Proj::IndexLocal(i) = proj {
+                *counts.entry(*i).or_insert(0) += 1;
+            }
+        }
         bump(p, counts, projected);
     }
 }

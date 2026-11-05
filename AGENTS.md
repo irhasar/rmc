@@ -60,6 +60,9 @@ python3 tools/fuzz.py --mode assoc --n 500 --seed 1
 python3 tools/fuzz.py --mode ref --n 500 --seed 1
 python3 tools/fuzz.py --mode update --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
+
+# differential fuzzer over the rustc-MIR path (rustc --emit=mir -> rmc back end)
+python3 tools/fuzz.py --mode mir --n 500 --seed 1
 ```
 
 ## Source map
@@ -235,6 +238,20 @@ so the benchmark can time the two stages apart.
 - A trap block is emitted inline in the fall-through position, so the common path
   takes a taken branch over it. `mix`'s `%` loop pays that branch once per
   iteration; it is not free.
+- **An x86 ALU immediate is only i32 wide.** `add $imm, %rax` sign-extends its
+  i32 field, so a 64-bit MIR constant used as an operand, a `switchInt`
+  discriminant, or a frame store must be materialised in a register first.
+  `mir_codegen.rs::wide_imm` does that at every ALU site and `store_scalar` routes
+  a wide immediate through `%rcx`; the assembler (`elf.rs`) now *rejects* an
+  out-of-range immediate rather than silently truncating it, so a missed site
+  fails loudly instead of miscompiling. `tests/mir/wideimm.rs` pins the paths.
+- **Evaluating a shift count can call, and a call clobbers every scratch
+  register.** The value being shifted is parked in a frame slot across the count
+  evaluation, not in `%rdx` (the MIR back end has no spill of caller-saved
+  registers around an arbitrary call).
+- `main.rs::run_mir_pipeline` honours `--no-inline`/`--no-licm`/`--no-tco`, the
+  same gates the `.rms` path uses, so the fuzzer's per-pass matrix applies to
+  both pipelines.
 
 ## Things that are easy to get wrong
 
@@ -948,6 +965,17 @@ requires `rmc` to reject each one cleanly; it pins the soundness checks below,
 which the differential fuzzers cannot see (they only compare programs both
 compilers accept).
 
+`tests/mir/run.py` is the differential suite for the rustc-MIR path. Each
+`tests/mir/NAME.rs` is a freestanding `#![no_std]` program that includes
+`prelude.rs` and calls the runtime's `print_i64`/`print_bool`. The case is built
+twice: a reference from `rustc --emit=obj` linked against the *same* runtime
+(`rmc --emit-runtime-asm`) with `cc -static -nostdlib`, and rmc's own
+`rustc --emit=mir` + back-end build. Both binaries share one runtime and one
+entry point, so the only variable is the code generator; they must print
+identical stdout and exit with the same status. `ARGS` maps a case to its argv
+vectors. This is the suite that actually exercises `mir_codegen.rs`; `tests/run.py`
+covers the `.rms` path and never reaches it.
+
 `tests/run.py` compiles each `tests/cases/NAME.{rms,rs}` pair with both compilers
 and diffs stdout and the exit status. Every case is then recompiled with the
 optimiser passes disabled in turn (`--no-inline`, `--no-licm`, `--no-tco`, and
@@ -1332,6 +1360,25 @@ array of a unit enum. `stmt` mode now emits all three, so a regression in any of
 them fails the fuzz job at `iter=0`. `expr` mode emits `str::len` and array
 `.len()`. When adding a language feature, extend the
 generator to exercise it — a clean fuzz run only covers the shapes it emits.
+
+`mir` mode (`tools/fuzz.py --mode mir`) fuzzes the *other* pipeline: it builds a
+freestanding `#![no_std]` program (the `MIR_PRELUDE` plus the `expr` grammar's
+expressions), compiles it with `rustc --emit=obj` and links the object against
+the *same* freestanding runtime rmc uses (`rmc --emit-runtime-asm`), then
+compiles the same source through `rmc <src.rs>` (the rustc-MIR front end) and
+compares stdout and exit status. Because both binaries share one runtime and one
+entry point, the only variable is the code generator. It recompiles the rmc side
+with each MIR-level pass off in turn (`--no-inline`, `--no-licm`, `--no-tco`),
+which now also gates the MIR pipeline in `main.rs::run_mir_pipeline` — without
+that wiring the flags were silently ignored for a `.rs` input. The `.rms` modes
+never reach `mir_codegen.rs`; this is the only randomised coverage of the MIR
+back end. `--gen <mode>` reuses one of the `.rms` generators instead (only its
+`.rs` half is freestanding enough to link). It immediately found two real MIR
+codegen bugs: a shift whose count is computed by a call clobbered the value
+parked in `%rdx` (now parked in a frame slot), and a 64-bit constant used as an
+ALU immediate or a frame store was silently truncated to i32 (now materialised
+in a register; the assembler rejects an out-of-range immediate loudly instead of
+truncating). Both are pinned by `tests/mir/wideimm.rs`.
 
 A new generator must be checked for *validity*, not just a clean run. The first
 `ref` generator wrote `r.i0` (a field of the referent struct, not of the nested

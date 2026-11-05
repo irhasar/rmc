@@ -17,6 +17,7 @@ struct Options {
     input: PathBuf,
     output: PathBuf,
     emit_asm: bool,
+    emit_runtime_asm: bool,
     keep_mir: bool,
     keep_asm: bool,
     strip: bool,
@@ -34,6 +35,7 @@ fn parse_args() -> Result<Options, String> {
     let mut input: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
     let mut emit_asm = false;
+    let mut emit_runtime_asm = false;
     let mut keep_mir = false;
     let mut keep_asm = false;
     let mut strip = true;
@@ -52,6 +54,7 @@ fn parse_args() -> Result<Options, String> {
                 output = Some(PathBuf::from(v));
             }
             "--emit-asm" => emit_asm = true,
+            "--emit-runtime-asm" => emit_runtime_asm = true,
             "--keep-mir" => keep_mir = true,
             "--keep-asm" => keep_asm = true,
             "--no-strip" => strip = false,
@@ -78,7 +81,12 @@ fn parse_args() -> Result<Options, String> {
         }
     }
 
-    let input = input.ok_or("no input file given (see --help)")?;
+    // `--emit-runtime-asm` needs no input; every other mode does.
+    let input = match input {
+        Some(p) => p,
+        None if emit_runtime_asm => PathBuf::new(),
+        None => return Err("no input file given (see --help)".into()),
+    };
     let output = output.unwrap_or_else(|| {
         let stem = input.file_stem().unwrap_or_default();
         Path::new(".").join(stem)
@@ -87,6 +95,7 @@ fn parse_args() -> Result<Options, String> {
         input,
         output,
         emit_asm,
+        emit_runtime_asm,
         keep_mir,
         keep_asm,
         strip,
@@ -110,6 +119,7 @@ fn print_help() {
          OPTIONS:\n\
          \x20   -o <path>      output binary path\n\
          \x20   --emit-asm     print generated assembly to stdout and stop\n\
+         \x20   --emit-runtime-asm  print the freestanding runtime as assembly and stop\n\
          \x20   --keep-mir     keep the MIR text next to the output (a .rs input)\n\
          \x20   --keep-asm     keep the intermediate .s file next to the output\n\
          \x20   --no-strip     keep the symbol table in the output binary\n\
@@ -184,13 +194,19 @@ fn run_mir_pipeline(opts: &Options) -> Result<(), String> {
             .map_err(|e| format!("cannot write {}: {e}", mir_path.display()))?;
     }
     let mut prog = rmc::mir::parse(&mir)?;
-    rmc::mir::tco(&mut prog, opts.overflow_checks);
-    rmc::mir::inline_calls(&mut prog);
+    if !opts.no_tco {
+        rmc::mir::tco(&mut prog, opts.overflow_checks);
+    }
+    if !opts.no_inline {
+        rmc::mir::inline_calls(&mut prog);
+    }
     rmc::mir::coalesce_call_results(&mut prog);
     rmc::mir::merge_blocks(&mut prog);
     prog.copy_propagate();
     rmc::mir::drop_redundant_asserts(&mut prog);
-    rmc::mir::licm(&mut prog);
+    if !opts.no_licm {
+        rmc::mir::licm(&mut prog);
+    }
     rmc::mir::fold_accumulators(&mut prog);
     rmc::mir::jump_thread(&mut prog);
     rmc::mir::rotate_loops(&mut prog);
@@ -223,6 +239,13 @@ fn run_mir_pipeline(opts: &Options) -> Result<(), String> {
 }
 
 fn run(opts: Options) -> Result<(), String> {
+    // Emit the freestanding runtime alone. The differential test suite uses
+    // this to link a rustc reference against the same runtime rmc uses, so the
+    // two binaries differ only in the code generator.
+    if opts.emit_runtime_asm {
+        print!("{}", rmc::runtime::support_asm());
+        return Ok(());
+    }
     // A `.rs` input selects the rustc-front-end pipeline; anything else is
     // rmc's own source language, compiled end to end.
     if opts.input.extension().and_then(|e| e.to_str()) == Some("rs") {

@@ -25,6 +25,13 @@ jobs:
       - name: Differential tests
         run: python3 tests/run.py
 
+      # Differential suite for the rustc-MIR path: rustc --emit=obj linked
+      # against rmc's own runtime versus rmc's `rustc --emit=mir` + MIR back end.
+      # Needs cc for the reference link. This is the suite that exercises
+      # mir_codegen.rs; tests/run.py never reaches it.
+      - name: Differential tests (MIR path)
+        run: python3 tests/mir/run.py
+
   fuzz:
     runs-on: ubuntu-latest
     steps:
@@ -58,3 +65,10 @@ jobs:
           python3 tools/fuzz.py --mode stmt --n 400 --seed 1
           python3 tools/fuzz.py --mode stmt --n 400 --seed 2
           python3 tools/fuzz.py --mode shift --n 400 --seed 1
+
+      # The MIR path has its own code generator; fuzz it too. `mir` mode needs
+      # cc to link the reference object against rmc's runtime.
+      - name: Differential fuzz (MIR path)
+        run: |
+          python3 tools/fuzz.py --mode mir --n 200 --seed 1
+          python3 tools/fuzz.py --mode mir --n 200 --seed 2
