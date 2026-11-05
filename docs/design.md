@@ -125,6 +125,13 @@ cross a call: a struct literal is materialised into a `sema`-allocated frame
 buffer, so it has an address in every context (a `let` initialiser, an argument,
 a `return`, or a tail expression).
 
+Struct update syntax `S { f: v, ..base }` is desugared by the parser into a block
+that binds each written field value to a temporary, binds `base` to a fresh
+mutable local, assigns the temporaries into it, and yields it. Sema and codegen
+never see the update, so no new layout or copy path is needed. The desugaring
+mirrors rustc's evaluation order — field values first, left to right, then the
+base — so a field value that mutates the base is read back consistently.
+
 ## Expression convention
 
 - The result of every expression is in `%rax`.

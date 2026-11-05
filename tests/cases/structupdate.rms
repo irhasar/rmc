@@ -1,0 +1,65 @@
+// Struct update syntax `S { field: value, ..base }`: the fields written above
+// the base take the values given, and every other field is copied from `base`.
+// The written fields are evaluated left to right, then the base, and the result
+// is a fresh value, so mutating it must not write through to `base`.
+
+struct P { x: i64, y: i64 }
+struct Inner { a: i64 }
+struct Q { i: Inner, y: i64 }
+
+fn mk() -> P { return P { x: 7, y: 8 }; }
+
+fn mkq(g: Inner) -> Q { return Q { i: g, y: 2 }; }
+
+fn sum(p: P) -> i64 { return p.x + p.y; }
+
+fn main() -> i64 {
+    let a: P = P { x: 1, y: 2 };
+
+    // The written field overrides the base; the rest come from the base.
+    let b: P = P { x: 5, ..a };
+    print_i64(b.x);
+    print_i64(b.y);
+
+    // Field order in source need not match declaration order.
+    let c: P = P { y: 20, ..a };
+    print_i64(c.x);
+    print_i64(c.y);
+
+    // The base may be an arbitrary expression.
+    let d: P = P { x: 1, ..mk() };
+    print_i64(d.x);
+    print_i64(d.y);
+
+    // A value produced by an update is independent of its base: mutating it
+    // does not change `a`.
+    let mut e: P = P { x: 100, ..a };
+    e.y = 99;
+    print_i64(a.y);
+    print_i64(e.y);
+
+    // The update may copy every field, and it may be chained.
+    let f: P = P { ..a };
+    let g: P = P { x: 3, ..f };
+    print_i64(g.x + g.y);
+
+    // A struct-typed field is copied by value, not by address.
+    let inner: Inner = Inner { a: 5 };
+    let q: Q = mkq(inner);
+    let r: Q = Q { y: 9, ..q };
+    print_i64(r.i.a);
+    print_i64(r.y);
+
+    // In an argument, in a return position and in a loop.
+    print_i64(sum(P { x: 30, ..a }));
+    print_i64(sum(P { x: 40, ..P { y: 50, ..a } }));
+    let mut acc: i64 = 0;
+    let mut i: i64 = 0;
+    while i < 4 {
+        let p: P = P { x: i, ..a };
+        acc = acc + p.x + p.y;
+        i = i + 1;
+    }
+    print_i64(acc);
+    return 0;
+}

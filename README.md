@@ -214,7 +214,8 @@ fn main() -> i64 {
 ```
 
 Supported: `i64`, `bool`, `str`, fixed-size arrays, and structs with named fields
-(including field init shorthand, `P { x, y }`);
+(including field init shorthand, `P { x, y }`, and struct update syntax,
+`P { x: 9, ..base }`);
 functions with up to six parameters; `let` / `let mut` / `let _` (discard); assignment to variables,
 array elements and struct fields (including compound `+=` and friends);
 `if`/`else`, `while`, `loop`, `for i in a..b` / `a..=b` and `for x in arr`
