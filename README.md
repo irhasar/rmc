@@ -66,18 +66,18 @@ never runs. The trade-off is the whole point of the experiment:
 
 | dimension            | rmc MIR path vs `rustc -O -C lto=fat` |
 | -------------------- | ------------------------------------: |
-| compile wall time    |                            49–55×    |
-| compile CPU time     |                            47–54×    |
+| compile wall time    |                            49–56×    |
+| compile CPU time     |                            49–55×    |
 | compiler peak RAM    |                            ~2.1×     |
-| artifact size        |                            196–576×  |
-| run wall time        |                            1.04–3.52× |
-| run CPU time         |                            1.04–5.92× |
-| run peak RAM         |                            1.4–75×   |
+| artifact size        |                            196–577×  |
+| run wall time        |                            1.05–3.18× |
+| run CPU time         |                            1.05–5.17× |
+| run peak RAM         |                            1.4–87×   |
 
 Every ratio is above 1, so the MIR path is faster to build, smaller, and faster
 and lighter to run than the LLVM build on all ten programs. The run-time win is
-narrowest on `mix` (1.04×) and `heap` (1.06×) and widest on `hello` (3.52×) and
-`forloops` (2.23×). The full, dated table is in
+narrowest on `mix` (1.05×) and `heap` (1.06×) and widest on `hello` (3.18×) and
+`forloops` (2.18×). The full, dated table is in
 [`bench/RESULTS-MIR.md`](bench/RESULTS-MIR.md); regenerate it with:
 
 ```sh
