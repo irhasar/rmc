@@ -1753,27 +1753,22 @@ fn fold_base(line: &str, t: &str, src: &str, k: i64) -> Option<(String, bool)> {
 fn fuse_lea(body: &str) -> String {
     const SCRATCH: &[&str] = &["%rax", "%rcx", "%rdx", "%r10", "%r11"];
     let lines: Vec<&str> = body.lines().collect();
-    let mut uses: HashMap<&str, usize> = HashMap::new();
-    for line in &lines {
-        for r in SCRATCH {
-            if reg_mentions(line, r) {
-                *uses.entry(r).or_insert(0) += 1;
-            }
-        }
-    }
     let mut out = String::with_capacity(body.len());
     let mut i = 0;
     while i + 1 < lines.len() {
         if let Some((a, t)) = mov_reg_reg(lines[i]) {
-            if SCRATCH.contains(&t) && uses.get(t).copied() == Some(3) {
+            if SCRATCH.contains(&t) {
                 if let Some((op, k, arith_dst)) = addsub_imm(lines[i + 1]) {
                     if arith_dst == t && a != t && k.unsigned_abs() < (1 << 31) {
                         if let Some(j) = (i + 2..lines.len()).find(|j| reg_mentions(lines[*j], t)) {
                             if let Some((t2, d)) = mov_reg_reg(lines[j]) {
-                                // Nothing between may touch `a` or `d`, and the
-                                // scratch value must not be read again after it
-                                // reaches `d`, or dropping the write would lose it.
-                                if t2 == t && !writes_or_reads(&lines[i + 1..j], a, d) {
+                                // Nothing between may touch `a` or `d`; the
+                                // scratch value must be dead once it reaches `d`,
+                                // or dropping the write would lose it.
+                                if t2 == t
+                                    && !writes_or_reads(&lines[i + 1..j], a, d)
+                                    && scratch_dead_after(&lines, j + 1, t)
+                                {
                                     let disp = if op == "add" { k } else { -k };
                                     if disp == 0 {
                                         out.push_str(&format!("  mov {a}, {d}\n"));
@@ -1807,7 +1802,57 @@ fn fuse_lea(body: &str) -> String {
     out
 }
 
-/// Count occurrences of register `r` as a whole operand in `line`.
+/// True when `t` is not read again before it is overwritten, scanning forward
+/// from `start` and stopping at any control transfer.
+fn scratch_dead_after(lines: &[&str], start: usize, t: &str) -> bool {
+    for line in &lines[start.min(lines.len())..] {
+        let lt = line.trim();
+        let op = lt.split_whitespace().next().unwrap_or("");
+        if lt.ends_with(':')
+            || lt.starts_with('.')
+            || op.starts_with('j')
+            || op == "ret"
+            || op == "call"
+            || op == "syscall"
+        {
+            return true;
+        }
+        if reads_reg(line, t) {
+            return false;
+        }
+        if written_regs(op, line).iter().any(|r| r == t) {
+            return true;
+        }
+    }
+    true
+}
+
+/// True when `line` reads `r` (as opposed to merely writing it).
+///
+/// For the destination-only forms (`mov`, `lea`, `pop`, the `mov`-extend
+/// family) the last operand is written and not read; every other mention of a
+/// register reads it. Used to prove a scratch register dead after a rewrite:
+/// a register with no remaining reads does not need its old value.
+fn reads_reg(line: &str, r: &str) -> bool {
+    let t = line.trim();
+    let Some((mnem, rest)) = t.split_once(char::is_whitespace) else {
+        return reg_mentions(t, r);
+    };
+    let write_only_dst = matches!(
+        mnem,
+        "mov" | "lea" | "movabs" | "pop" | "sete" | "setne" | "setl" | "setg"
+            | "setle" | "setge" | "setb" | "seta" | "movzbl" | "movsbl" | "movslq"
+    );
+    if write_only_dst {
+        match rest.rsplit_once(',') {
+            Some((src, _dst)) => reg_mentions(src, r),
+            None => reg_mentions(rest, r),
+        }
+    } else {
+        reg_mentions(rest, r)
+    }
+}
+
 fn reg_mentions(line: &str, r: &str) -> bool {
     line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '%' || c == '_'))
         .any(|tok| tok == r)
