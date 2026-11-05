@@ -626,7 +626,9 @@ impl Elf {
         if let Ok((sreg, s8)) = parse_reg(src) {
             if let Ok((dreg, d8)) = parse_reg(dst) {
                 let byte = s8 || d8;
-                let mut rex = if byte { 0x40 } else { 0x48 };
+                // A 32-bit source selects the narrow move (`mov %eax,%ebx`);
+                // only a 64-bit one sets REX.W.
+                let mut rex = if byte || reg_is_32(src) { 0x40 } else { 0x48 };
                 if sreg >= 8 {
                     rex |= 0x04; // source is the ModRM.reg field (REX.R)
                 }
@@ -734,7 +736,11 @@ impl Elf {
                 self.sections[sec].data.push(v as u8);
                 return Ok(());
             }
-            self.sections[sec].data.push(rex(true, ext, dreg));
+            // Width follows the destination: `add $1, %eax` must stay 32-bit
+            // (`83 /0 ib`, no REX.W), like every other register form.
+            if let Some(r) = rex_if_needed(!reg_is_32(&dst), ext, dreg) {
+                self.sections[sec].data.push(r);
+            }
             if fits_i8(v) {
                 self.sections[sec].data.push(0x83);
                 modrm_reg_reg(&mut self.sections[sec].data, ext, dreg);
@@ -746,11 +752,23 @@ impl Elf {
             }
             return Ok(());
         }
-        if let Ok((sreg, _)) = parse_reg(&src) {
-            if let Ok((dreg, _)) = parse_reg(&dst) {
+        if let Ok((sreg, s8)) = parse_reg(&src) {
+            if let Ok((dreg, d8)) = parse_reg(&dst) {
                 // `op src, dst` writes dst, which is the r/m operand; src is
-                // the reg field. (0x01 is `add r/m64, r64`.)
-                self.sections[sec].data.push(rex(true, sreg, dreg));
+                // the reg field. (0x01 is `add r/m64, r64`.) REX.W follows the
+                // operand width: `xor %eax,%eax` is the narrow, two-byte form
+                // and must not be widened to `xor %rax,%rax`.
+                let byte = s8 || d8;
+                let mut rex = if byte || reg_is_32(&src) { 0x40 } else { 0x48 };
+                if sreg >= 8 {
+                    rex |= 0x04; // source is the ModRM.reg field (REX.R)
+                }
+                if dreg >= 8 {
+                    rex |= 0x01; // destination is ModRM.rm (REX.B)
+                }
+                if rex != 0x40 || (byte && (sreg >= 4 || dreg >= 4)) {
+                    self.sections[sec].data.push(rex);
+                }
                 self.sections[sec].data.push(rr);
                 modrm_reg_reg(&mut self.sections[sec].data, sreg, dreg);
                 return Ok(());
@@ -1074,6 +1092,18 @@ fn reg_is_64(s: &str) -> bool {
     )
 }
 
+/// True when a register name is a 32-bit one (`%eax`..`%r15d`). A 32-bit
+/// operand must not set REX.W; `xor %eax,%eax` is the two-byte zeroing idiom,
+/// and widening it to `xor %rax,%rax` both grows the artifact and disagrees with
+/// `as`.
+fn reg_is_32(s: &str) -> bool {
+    matches!(
+        s.trim().trim_start_matches('%'),
+        "eax" | "ecx" | "edx" | "ebx" | "esp" | "ebp" | "esi" | "edi"
+            | "r8d" | "r9d" | "r10d" | "r11d" | "r12d" | "r13d" | "r14d" | "r15d"
+    )
+}
+
 /// The REX byte for an instruction, or `None` when the bare `0x40` prefix would
 /// carry no information and `as` omits it.
 fn rex_if_needed(w: bool, reg: u8, rm: u8) -> Option<u8> {
@@ -1325,6 +1355,37 @@ mod tests {
         let mut e = test_elf(0x5);
         e.instruction("div %ebx", 0).unwrap();
         assert_eq!(e.sections[0].data[3..], [0xF7, 0xF3]);
+    }
+
+    #[test]
+    fn a_32_bit_zeroing_xor_does_not_set_rex_w() {
+        // `xor %eax,%eax` is the two-byte zeroing idiom; widening it to
+        // `xor %rax,%rax` grows the artifact and disagrees with `as`.
+        let mut e = test_elf(0x5);
+        e.instruction("xor %eax, %eax", 0).unwrap();
+        assert_eq!(e.sections[0].data[3..], [0x31, 0xC0]);
+    }
+
+    #[test]
+    fn a_32_bit_immediate_add_does_not_set_rex_w() {
+        let mut e = test_elf(0x5);
+        e.instruction("add $1, %eax", 0).unwrap();
+        assert_eq!(e.sections[0].data[3..], [0x83, 0xC0, 0x01]);
+    }
+
+    #[test]
+    fn a_32_bit_register_move_does_not_set_rex_w() {
+        let mut e = test_elf(0x5);
+        e.instruction("mov %ebx, %eax", 0).unwrap();
+        assert_eq!(e.sections[0].data[3..], [0x89, 0xD8]);
+    }
+
+    #[test]
+    fn an_extended_32_bit_register_still_needs_rex() {
+        // `mov %r8d, %eax` needs REX.R (no REX.W); the bare 0x40 is dropped.
+        let mut e = test_elf(0x5);
+        e.instruction("mov %r8d, %eax", 0).unwrap();
+        assert_eq!(e.sections[0].data[3..], [0x44, 0x89, 0xC0]);
     }
 
     #[test]
