@@ -115,6 +115,15 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   finds a `break` that targets it (a nested loop captures its own `break`s).
   Definite initialization follows: only the non-diverging branch's writes
   survive the `if`.
+  `check_block` returns `Never` for a block that cannot complete, and every
+  consumer of a block type accepts `Never` where a value is expected (`let`,
+  `return`, the function-body check, and both arms of an `if`). That is what
+  makes `fn f(e: E) -> i64 { match e { E::A => { return 1; } E::B => { return 2;
+  } } }` and `let x: i64 = if c { return 1; } else { return 2; };` compile, as
+  in rustc. The one case a block type cannot express is a `match` chain whose
+  every arm diverges: its last step is an `if` with no `else`, which completes
+  as `()`, so `Sema::match_chain_diverges` walks the chain and the no-`else`
+  branch propagates `Never` for a `total` chain.
 - `compiler/src/ast.rs` — AST and `Type` (`I64`, `Bool`, `Str`, `Unit`, `Array`,
   `Struct`, and the parser-only placeholder `Named`). `Str` is the type of a
   string literal: one slot holding a pointer to NUL-terminated static data. It
