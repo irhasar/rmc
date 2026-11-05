@@ -89,6 +89,9 @@ struct FnGen<'a> {
     allocates: bool,
     /// Callee-saved registers saved below `%rbp`; frame slots start past them.
     saved_regs: i64,
+    /// Dry-pass slot index -> compacted slot index. `None` until the dry pass
+    /// has revealed which slots the body actually touches.
+    slot_map: Option<Vec<i64>>,
     next_slot: i64,
     out: String,
     label: u64,
@@ -317,6 +320,7 @@ impl<'a> FnGen<'a> {
             loop_operands: Vec::new(),
             allocates: func_calls(prog, &func.name, "alloc"),
             saved_regs: 0,
+            slot_map: None,
             next_slot: 0,
             out: String::new(),
             label: 0,
@@ -341,6 +345,10 @@ impl<'a> FnGen<'a> {
     }
 
     fn off(&self, slot: i64) -> String {
+        let slot = match &self.slot_map {
+            Some(m) => m.get(slot as usize).copied().unwrap_or(slot),
+            None => slot,
+        };
         format!("{}(%rbp)", -(slot + 1 + self.saved_regs) * 8)
     }
 
@@ -649,22 +657,48 @@ impl<'a> FnGen<'a> {
         }
         let base_slots = self.next_slot;
 
-        // Dry pass: discover how many spill slots the body needs, then run the
-        // real pass with the frame sized to include them. The two passes
-        // allocate slots identically, so the reservation is exact.
+        // Dry pass: discover which frame slots and which callee-saved registers
+        // the body actually uses, then run the real pass against a frame packed
+        // with only those. A promoted local keeps its value in a register, so
+        // its frame region is dead unless its address is taken; dropping the
+        // dead slots and unused saved registers shrinks every frame, which is
+        // what a recursive call pays for at each level.
         self.gen_body()?;
+        let dry = std::mem::take(&mut self.out);
         let frame_slots = self.next_slot;
-        self.out.clear();
+        let mut used_slots = rbp_slots(&dry);
+        // An aggregate's slots are reached as `base + k`, so only the base
+        // appears in the text. Pin every slot of a multi-slot region: they must
+        // stay contiguous, or an element access would fall outside the frame.
+        for l in 0..self.func.locals.len() {
+            let slots = (self.size[l] + 7) / 8;
+            if slots > 1 {
+                let base = self.local_base[l];
+                for k in 0..slots {
+                    used_slots.insert(base - k);
+                }
+            }
+        }
+        let mut map = vec![-1i64; frame_slots as usize];
+        let mut next = 0i64;
+        for slot in 0..frame_slots {
+            if used_slots.contains(&slot) {
+                map[slot as usize] = next;
+                next += 1;
+            }
+        }
+        let packed_slots = next;
+        self.slot_map = Some(map);
         self.label = 0;
         self.next_slot = base_slots;
 
-        // Save the callee-saved promoted registers (the ABI requires it). A
-        // caller-saved register is preserved by the caller, so it is spilled
-        // only around a call (see `gen_call`).
+        // Save the callee-saved registers the body actually names (the ABI
+        // requires it). A caller-saved register is preserved by the caller, so
+        // it is spilled only around a call (see `gen_call`).
         let saved: Vec<&'static str> = PROMOTE_REGS
             .iter()
             .copied()
-            .filter(|r| self.promo.values().any(|p| p.reg == *r))
+            .filter(|r| reg_mentions(&dry, r))
             .collect();
         // The saved registers sit below `%rbp`, so every frame slot is shifted
         // past them; `off` reads this.
@@ -678,7 +712,7 @@ impl<'a> FnGen<'a> {
         // Keep `%rsp` 16-byte aligned at every call: the saved registers plus
         // the frame must together be a multiple of 16.
         let saved_bytes = self.saved_regs * 8;
-        let frame_bytes = align_up(frame_slots * 8 + saved_bytes, 16) - saved_bytes;
+        let frame_bytes = align_up(packed_slots * 8 + saved_bytes, 16) - saved_bytes;
         if frame_bytes > 0 {
             let _ = writeln!(self.out, "  sub ${frame_bytes}, %rsp");
         }
@@ -2102,6 +2136,34 @@ fn reads_reg(line: &str, r: &str) -> bool {
 fn reg_mentions(line: &str, r: &str) -> bool {
     line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '%' || c == '_'))
         .any(|tok| tok == r)
+}
+
+/// Every frame slot the body reads or writes, from the `-N(%rbp)` operands in
+/// its text. `off` numbers slots so a reference is `-(slot + 1) * 8` at
+/// `saved_regs == 0`, which the dry pass runs at.
+fn rbp_slots(body: &str) -> HashSet<i64> {
+    let mut set = HashSet::new();
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while let Some(p) = body[i..].find("(%rbp)") {
+        let at = i + p;
+        let mut j = at;
+        while j > 0 && (bytes[j - 1].is_ascii_digit() || bytes[j - 1] == b'-') {
+            j -= 1;
+        }
+        if j < at {
+            if let Ok(v) = body[j..at].parse::<i64>() {
+                if v < 0 {
+                    let slot = (-v) / 8 - 1;
+                    if slot >= 0 {
+                        set.insert(slot);
+                    }
+                }
+            }
+        }
+        i = at + "(%rbp)".len();
+    }
+    set
 }
 
 /// `mov %a, %b` where both operands are registers.
