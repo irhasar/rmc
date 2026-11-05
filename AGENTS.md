@@ -1287,6 +1287,13 @@ them fails the fuzz job at `iter=0`. `expr` mode emits `str::len` and array
 `.len()`. When adding a language feature, extend the
 generator to exercise it — a clean fuzz run only covers the shapes it emits.
 
+A new generator must be checked for *validity*, not just a clean run. The first
+`ref` generator wrote `r.i0` (a field of the referent struct, not of the nested
+one), which rustc rejected for every seed; the fuzzer skips a program rustc
+cannot compile, so the mode reported "all match rustc" while generating nothing.
+Run a new mode's programs through both compilers and count the rejections before
+trusting the summary — a mode with a 100% skip rate is silent, not clean.
+
 ## Scope
 
 This is a small, self-contained compiler, not a general Rust compiler. Do not
