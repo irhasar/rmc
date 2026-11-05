@@ -185,6 +185,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
                 };
                 f.params.insert(0, ("self".to_string(), rt));
                 f.param_mut.insert(0, false);
+                f.param_pats.insert(0, None);
             }
         }
     }
@@ -574,6 +575,23 @@ impl Sema {
             // `mut`, and it is always initialized by the caller.
             let mutable = f.param_mut.get(i).copied().unwrap_or(false);
             scope.push(Binding { name: name.clone(), slot, ty: rt, mutable, init: true });
+        }
+
+        // A pattern parameter binds its names at the top of the body, before
+        // any other statement, exactly as if the body opened with the matching
+        // `let` destructuring. The parameter variable itself stays in scope, so
+        // the pattern reads through it; `check_block` sees the spliced `let`s
+        // and binds the names in the body scope.
+        if f.param_pats.iter().any(|p| p.is_some()) {
+            let mut pats: Vec<Stmt> = Vec::new();
+            for p in f.param_pats.drain(..) {
+                if let Some(mut binds) = p {
+                    pats.append(&mut binds);
+                }
+            }
+            let mut stmts = std::mem::take(&mut f.body.stmts);
+            pats.append(&mut stmts);
+            f.body.stmts = pats;
         }
 
         let body_ty = self.check_block(&mut f.body, &mut scope)?;

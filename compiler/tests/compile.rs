@@ -1776,6 +1776,98 @@ fn a_duplicate_parameter_name_is_rejected() {
 }
 
 #[test]
+fn a_struct_parameter_pattern_binds_through_the_parameter() {
+    // `fn f(S { x, y }: S)` is the `let` destructuring applied to the
+    // parameter, so the body sees `x` and `y` bound from the argument.
+    let src = "struct S { x: i64, y: i64 } \
+               fn f(S { x, y }: S) -> i64 { return x * 10 + y; } \
+               fn main() -> i64 { return f(S { x: 1, y: 2 }); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn an_array_parameter_pattern_binds_through_the_parameter() {
+    let src = "fn f([a, b]: [i64; 2]) -> i64 { return a * 10 + b; } \
+               fn main() -> i64 { return f([3, 4]); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_parameter_pattern_compiles_like_a_let_destructuring() {
+    // The expansion is the same one a `let` uses: a plain parameter plus the
+    // per-field reads at the top of the body.
+    let pat = "struct S { x: i64, y: i64 } \
+               fn f(S { x, y }: S) -> i64 { return x + y; } \
+               fn main() -> i64 { return f(S { x: 1, y: 2 }); }";
+    let plain = "struct S { x: i64, y: i64 } \
+                 fn f(s: S) -> i64 { let x: i64 = s.x; let y: i64 = s.y; return x + y; } \
+                 fn main() -> i64 { return f(S { x: 1, y: 2 }); }";
+    assert_eq!(asm(pat), asm(plain));
+}
+
+#[test]
+fn a_parameter_pattern_may_rename_ignore_and_mutate() {
+    let src = "struct S { x: i64, y: i64, z: i64 } \
+               fn f(S { x: v, y: _, mut z }: S) -> i64 { z = z + 1; return v + z; } \
+               fn main() -> i64 { return f(S { x: 1, y: 2, z: 3 }); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_parameter_pattern_may_be_nested() {
+    // A struct-typed field destructured in turn, and an array-typed field
+    // destructured by an array pattern, both in a parameter position.
+    let src = "struct I { x: i64 } struct S { a: [i64; 2], b: I } \
+               fn f(S { a: [p, q], b: I { x } }: S) -> i64 { return p + q + x; } \
+               fn main() -> i64 { return f(S { a: [1, 2], b: I { x: 3 } }); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_parameter_pattern_works_on_a_method() {
+    let src = "struct S { x: i64, y: i64 } \
+               impl S { fn add(self, S { x, y }: S) -> i64 { return self.x + x + y; } } \
+               fn main() -> i64 { return S { x: 1, y: 2 }.add(S { x: 3, y: 4 }); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_mut_on_a_parameter_pattern_is_rejected() {
+    // `mut` attaches to each binding, not to the whole pattern.
+    let err = compile_to_asm(
+        "struct S { x: i64 } fn f(mut S { x }: S) -> i64 { return x; } \
+         fn main() -> i64 { return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("`mut` must be attached to each individual binding"), "got: {err}");
+}
+
+#[test]
+fn a_refutable_parameter_pattern_is_rejected() {
+    // A literal (or variant, or or-pattern) is refutable, so rustc rejects it
+    // as a parameter; rmc rejects it too rather than mis-binding it.
+    let err = compile_to_asm(
+        "fn f(1: i64) -> i64 { return 1; } fn main() -> i64 { return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("expected identifier"), "got: {err}");
+}
+
+#[test]
+fn a_parameter_pattern_name_may_not_collide_with_a_parameter() {
+    // E0415 counts the names a pattern binds, not just the written parameters.
+    let err = compile_to_asm(
+        "struct S { x: i64 } fn f(S { x }: S, x: i64) -> i64 { return x; } \
+         fn main() -> i64 { return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("bound more than once"), "got: {err}");
+}
+
+#[test]
 fn main_with_a_parameter_is_rejected() {
     // The entry point takes no arguments (rustc E0580).
     let err = compile_to_asm(

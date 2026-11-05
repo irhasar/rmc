@@ -1,0 +1,54 @@
+// Aggregate parameter patterns: a parameter may be written as a struct or
+// array pattern, `fn f(S { x, y }: S)`. The parameter itself is an ordinary
+// argument; the pattern binds its names at the top of the body, so the
+// expansion is exactly the matching `let` destructuring. The two nesting
+// directions compose, and a method receiver is unaffected.
+struct P { x: i64, y: i64 }
+struct I { u: i64 }
+struct S { a: [i64; 2], b: I }
+
+fn sum_struct(P { x, y }: P) -> i64 {
+    return x * 10 + y;
+}
+
+fn sum_array([a, b]: [i64; 2]) -> i64 {
+    return a * 100 + b;
+}
+
+fn nested(S { a: [p, q], b: I { u } }: S) -> i64 {
+    return p + q + u;
+}
+
+fn renamed(P { x: v, mut y }: P) -> i64 {
+    y = y + 1;
+    return v + y;
+}
+
+fn rest(P { x, .. }: P) -> i64 {
+    return x;
+}
+
+fn mixed(k: i64, P { x, y }: P, m: i64) -> i64 {
+    return k + x + y + m;
+}
+
+impl P {
+    fn add(self, P { x, y }: P) -> i64 {
+        return self.x + x + y;
+    }
+}
+
+fn main() -> i64 {
+    print_i64(sum_struct(P { x: 1, y: 2 }));
+    print_i64(sum_array([3, 4]));
+    print_i64(nested(S { a: [5, 6], b: I { u: 7 } }));
+    print_i64(renamed(P { x: 8, y: 9 }));
+    print_i64(rest(P { x: 10, y: 11 }));
+    print_i64(P { x: 1, y: 2 }.add(P { x: 3, y: 4 }));
+
+    // A pattern parameter mixed with plain ones, and the pattern's names used
+    // alongside them.
+    print_i64(mixed(100, P { x: 12, y: 13 }, 200));
+
+    return 0;
+}
