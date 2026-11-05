@@ -564,6 +564,18 @@ impl Parser {
         Ok(Block { stmts, tail })
     }
 
+    /// Consume the `;` that ends a statement, but allow it to be omitted when
+    /// the statement is the last thing in a block (`{ return 2 }`, `{ break }`).
+    /// Rust treats `return`/`break`/`continue` as diverging, so a trailing
+    /// expression is impossible after them and the `;` is optional.
+    fn eat_semi_at_block_end(&mut self) -> PResult<()> {
+        if self.eat(&Tok::Semi) || self.peek() == Some(&Tok::RBrace) {
+            Ok(())
+        } else {
+            Err(format!("at byte {}: expected `;`", self.pos()))
+        }
+    }
+
     fn starts_expr(&self) -> bool {
         matches!(
             self.peek(),
@@ -608,6 +620,16 @@ impl Parser {
             }
             Some(Tok::While) => {
                 self.i += 1;
+                // `while let PAT = EXPR { body }` re-tests `EXPR` each iteration
+                // and stops at the first value `PAT` does not match.
+                if self.peek() == Some(&Tok::Let) {
+                    self.i += 1;
+                    let pat = self.parse_pattern()?;
+                    self.expect(Tok::Eq)?;
+                    let scrutinee = self.parse_cond()?;
+                    let body = self.parse_block()?;
+                    return Ok(self.desugar_while_let(pat, scrutinee, body));
+                }
                 let cond = self.parse_cond()?;
                 let body = self.parse_block()?;
                 Ok(Stmt::While(cond, body))
@@ -634,23 +656,24 @@ impl Parser {
             }
             Some(Tok::Return) => {
                 self.i += 1;
-                let v = if self.eat(&Tok::Semi) {
-                    None
-                } else {
-                    let e = self.parse_expr()?;
-                    self.expect(Tok::Semi)?;
-                    Some(e)
-                };
-                Ok(Stmt::Return(v))
+                // `return`, `return expr` and `return;` are all valid, and the
+                // `;` may be omitted when the `return` is the last thing in the
+                // block (`{ return 2 }`), as in Rust.
+                if self.eat(&Tok::Semi) || self.peek() == Some(&Tok::RBrace) {
+                    return Ok(Stmt::Return(None));
+                }
+                let e = self.parse_expr()?;
+                self.eat_semi_at_block_end()?;
+                Ok(Stmt::Return(Some(e)))
             }
             Some(Tok::Break) => {
                 self.i += 1;
-                self.expect(Tok::Semi)?;
+                self.eat_semi_at_block_end()?;
                 Ok(Stmt::Break)
             }
             Some(Tok::Continue) => {
                 self.i += 1;
-                self.expect(Tok::Semi)?;
+                self.eat_semi_at_block_end()?;
                 Ok(Stmt::Continue)
             }
             _ => {
@@ -1230,6 +1253,27 @@ impl Parser {
         };
         let arms = vec![(pat, Expr::Block(then)), (Pat::Wild, fallback)];
         self.desugar_match_arms(scrutinee, arms, true)
+    }
+
+    /// `while let PAT = EXPR { body }` re-tests `EXPR` each iteration and stops
+    /// at the first value `PAT` does not match. It is exactly an `if let` whose
+    /// `else` breaks out of an enclosing `loop`:
+    ///
+    /// ```text
+    /// loop { if let PAT = EXPR { body } else { break; } }
+    /// ```
+    ///
+    /// so it desugars to those two existing statements and sema and codegen
+    /// need no new case. `EXPR` sits inside the loop, so it is re-evaluated
+    /// every iteration (as in Rust); the `if let` binds its non-`Var` scrutinee
+    /// to a fresh temporary each time.
+    fn desugar_while_let(&mut self, pat: Pat, scrutinee: Expr, body: Block) -> Stmt {
+        let break_else = Block {
+            stmts: vec![Stmt::Break],
+            tail: None,
+        };
+        let test = self.desugar_if_let(pat, scrutinee, body, Some(break_else));
+        Stmt::Loop(Block { stmts: vec![Stmt::Expr(test)], tail: None })
     }
 
     /// One arm of a desugared `match` or `if let`: the pattern test, the

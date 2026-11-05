@@ -69,6 +69,12 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   `_` alternative, and one whose alternatives cover every variant, are handled
   by `pat_irrefutable` and `or_leaves` (in sema) respectively. A *binding*
   alternative is rejected, as rustc's E0408 rejects it.
+  `while let PAT = EXPR { body }` is parsed here and desugared by
+  `desugar_while_let` to `loop { if let PAT = EXPR { body } else { break; } }`,
+  reusing the `if let` path, so sema and codegen gain no case. The scrutinee sits
+  inside the loop, so it is re-evaluated each iteration and `continue` re-tests
+  it. The `;` after `return`/`break`/`continue` may be omitted at the end of a
+  block (`eat_semi_at_block_end`), as in Rust.
   `if let PAT = EXPR { .. } else { .. }` is parsed here too and desugared by
   `desugar_if_let` into a two-arm `match` (`PAT => then, _ => else_or_unit`),
   reusing `desugar_match_arms` and the `parse_pattern` shared with `match` arms,
@@ -84,6 +90,12 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   accepts a program rustc rejects; wrapping the dead arms for `match` instead
   rejects a program rustc accepts (`match o { _ => 5, 3 => 9 }` in value
   position), which is why the flag exists.
+  `sema` also unifies a diverging branch: `if c { 1 } else { return 2 }` is
+  well typed because `!` unifies with any type. `block_diverges` decides it,
+  and `stmt_diverges` treats `loop { .. }` as diverging unless `block_has_break`
+  finds a `break` that targets it (a nested loop captures its own `break`s).
+  Definite initialization follows: only the non-diverging branch's writes
+  survive the `if`.
 - `compiler/src/ast.rs` — AST and `Type` (`I64`, `Bool`, `Str`, `Unit`, `Array`,
   `Struct`, and the parser-only placeholder `Named`). `Str` is the type of a
   string literal: one slot holding a pointer to NUL-terminated static data. It
