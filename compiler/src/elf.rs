@@ -621,7 +621,17 @@ impl Elf {
                 }
             };
             if let Ok((dreg, _)) = parse_reg(dst) {
-                emit_mov_imm(&mut self.sections[sec].data, dreg, v);
+                // The suffix pins the width when written; otherwise the
+                // destination register's name does, so `mov $1, %eax` is 32-bit.
+                // `movabs` is always the full 64-bit `B8+rd` form, even for a
+                // value that would fit a shorter encoding.
+                let (w, abs) = match mnem {
+                    "movabs" => (true, true),
+                    "movq" => (true, false),
+                    "mov" => (reg_is_64(dst), false),
+                    _ => (false, false),
+                };
+                emit_mov_imm(&mut self.sections[sec].data, dreg, v, w, abs);
                 return Ok(());
             }
             let m = parse_mem(dst).ok_or_else(|| format!("elf: bad mov dst `{dst}`"))?;
@@ -1145,10 +1155,22 @@ fn modrm_reg_reg(out: &mut Vec<u8>, reg: u8, rm: u8) {
     out.push(0xC0 | ((reg & 7) << 3) | (rm & 7));
 }
 
-fn emit_mov_imm(out: &mut Vec<u8>, reg: u8, v: i64) {
-    // `mov $imm, %r64` sign-extends a 32-bit immediate, so a value that fits
-    // i32 uses `C7 /0` and anything larger uses the 64-bit `movabs`.
-    if (i32::MIN as i64..=i32::MAX as i64).contains(&v) {
+fn emit_mov_imm(out: &mut Vec<u8>, reg: u8, v: i64, w: bool, abs: bool) {
+    // `mov $imm, %r32` is `B8+rd` with a 32-bit immediate and no REX.W. This is
+    // the form `as` emits for an unsuffixed `mov $1, %eax`; widening it to the
+    // 64-bit `C7 /0` form both disagrees with `as` and changes the bytes.
+    if !w {
+        if reg >= 8 {
+            out.push(0x41); // REX.B
+        }
+        out.push(0xB8 + (reg & 7));
+        out.extend_from_slice(&(v as i32).to_le_bytes());
+        return;
+    }
+    // `movabs` is always the 10-byte `B8+rd` form, whatever the value. A plain
+    // 64-bit `mov` sign-extends a 32-bit immediate, so a value that fits i32
+    // uses `C7 /0` and anything larger needs the full immediate.
+    if !abs && (i32::MIN as i64..=i32::MAX as i64).contains(&v) {
         out.push(rex(true, 0, reg));
         out.push(0xC7);
         modrm_reg_reg(out, 0, reg);
@@ -1405,6 +1427,55 @@ mod tests {
         let mut e = test_elf(0x5);
         e.instruction("mov %ebx, %eax", 0).unwrap();
         assert_eq!(e.sections[0].data[3..], [0x89, 0xD8]);
+    }
+
+    #[test]
+    fn an_unsuffixed_immediate_to_a_32_bit_register_is_32_bit_like_as() {
+        // `mov $1, %eax` is the `B8+rd` form with no REX.W; emitting the 64-bit
+        // `C7 /0` form instead both grows the bytes and disagrees with `as`.
+        let mut e = test_elf(0x5);
+        e.instruction("mov $1, %eax", 0).unwrap();
+        assert_eq!(e.sections[0].data[3..], [0xB8, 0x01, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn an_unsuffixed_immediate_to_a_64_bit_register_sign_extends() {
+        let mut e = test_elf(0x5);
+        e.instruction("mov $1, %rax", 0).unwrap();
+        assert_eq!(e.sections[0].data[3..], [0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn movabs_is_always_the_ten_byte_form() {
+        // `movabs` names the 64-bit `B8+rd` form even for a small immediate, so
+        // it must not fall back to the shorter `C7 /0` encoding.
+        let mut e = test_elf(0x5);
+        e.instruction("movabs $1, %rax", 0).unwrap();
+        assert_eq!(
+            e.sections[0].data[3..],
+            [0x48, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn a_wide_immediate_to_a_64_bit_register_uses_the_full_form() {
+        // `0x1_0000_0000` does not fit a sign-extended 32-bit immediate, so it
+        // needs `movabs` (`B8+rd` with a 64-bit immediate).
+        let mut e = test_elf(0x5);
+        e.instruction("mov $4294967296, %rax", 0).unwrap();
+        assert_eq!(
+            e.sections[0].data[3..],
+            [0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn a_wide_immediate_to_a_32_bit_register_is_truncated_like_as() {
+        // `mov $0xFFFFFFFF, %ecx` truncates the immediate to 32 bits (`as`
+        // warns and shortens), so the encoder must write the low half.
+        let mut e = test_elf(0x5);
+        e.instruction("mov $4294967295, %ecx", 0).unwrap();
+        assert_eq!(e.sections[0].data[3..], [0xB9, 0xFF, 0xFF, 0xFF, 0xFF]);
     }
 
     #[test]

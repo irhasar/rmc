@@ -198,6 +198,23 @@ def gen_cmp(rng, depth):
     return f"(({gen_expr(rng, depth + 1)}) {op} ({gen_expr(rng, depth + 1)})) as i64"
 
 
+def gen_str_lit(rng):
+    """A random `str` literal over a two-letter alphabet. The small alphabet is
+    deliberate: it makes equal literals and long shared prefixes common, which
+    is where a pointer comparison instead of a content comparison shows up."""
+    n = rng.randint(0, 5)
+    return '"' + "".join(rng.choice("ab") for _ in range(n)) + '"'
+
+
+def gen_strcmp(rng):
+    """A string comparison, `(lit op lit)`. A `str` is a pointer to its record,
+    so rmc must lower this to a byte-wise helper; comparing the pointers would
+    answer "not equal" for two identical literals. Both sides are literals so
+    the two compilers agree on the type."""
+    op = rng.choice(["==", "!=", "<", "<=", ">", ">="])
+    return f"({gen_str_lit(rng)} {op} {gen_str_lit(rng)})"
+
+
 def gen_expr_program(rng):
     a, b, c = (rng.randint(-1000, 1000) for _ in range(3))
     exprs = []
@@ -242,6 +259,12 @@ def gen_expr_program(rng):
     for e in exprs:
         rms.append(f"    print_i64({e});")
         rs.append(f'    println!("{{}}", {e});')
+    # String comparisons: printed as `bool`, which both compilers render as
+    # `0`/`1` through the `pb` twin. A pointer compare would diverge here.
+    for _ in range(rng.randint(1, 4)):
+        s = gen_strcmp(rng)
+        rms.append(f"    print_bool({s});")
+        rs.append(f'    println!("{{}}", ({s}) as i64);')
     rms += ["    return 0;", "}"]
     rs += ["}"]
     return "\n".join(rms), "\n".join(rs)
@@ -1171,6 +1194,13 @@ def reject_corpus():
         "print_str_int": (
             "fn main() -> i64 { let x: i64 = 42; print_str(x); return 0; }\n",
             "fn main() { let s: &str = 42; println!(\"{}\", s); }\n",
+        ),
+        # Comparing a `str` with an integer. rmc used to compare the string's
+        # address against the integer, which compiled to nonsense; rustc rejects
+        # it (E0308). The two are different types, so both must refuse.
+        "str_vs_int": (
+            "fn main() -> i64 { if \"a\" == 1 { return 1; } return 0; }\n",
+            "fn main() { if \"a\" == 1 { } }\n",
         ),
         # Writing through a place whose root binding is not `mut`. The first
         # mutability check only looked at a bare `Var` target, so these all

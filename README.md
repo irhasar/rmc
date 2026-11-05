@@ -133,17 +133,20 @@ python3 tests/run.py -v
 
 The suite covers arithmetic and division semantics (including divisors that need
 the magic-multiply add fixup and powers of two), every comparison operator with
-the immediate on either side, boolean short-circuiting, control flow, arrays,
+the immediate on either side, string comparison by content (which a pointer
+compare would get wrong), boolean short-circuiting, control flow, arrays,
 calls and recursion, the output builtins, nested expressions, and arrays of `i64` and `bool` built
 from either literal form. It is
 deliberately adversarial: reverting the folded-comparison operand-order fix
-makes the `cmp` case fail, and dropping the sign bias from division by a power
-of two makes the `div` case fail.
+makes the `cmp` case fail, dropping the sign bias from division by a power of
+two makes the `div` case fail, and comparing string pointers instead of their
+bytes makes the `strcmp` case fail.
 
 `tools/fuzz.py` generates random programs and checks them against `rustc -O`
 the same way, for the cases a hand-written suite does not think of. It has
-several modes: `expr` for integer expressions (including comparisons), `stmt`
-for loops, conditionals, `match`, arrays and aggregate calls (including argument
+several modes: `expr` for integer expressions (including comparisons) and
+string comparisons, `stmt` for loops, conditionals, `match`, arrays and
+aggregate calls (including argument
 evaluation order), `opt` for a self-recursive function, an invariant loop and
 small inlined helpers (the shapes the other two do not emit), `arith` for
 overflowing arithmetic near `i64::MAX` (the only mode that makes the
@@ -218,7 +221,7 @@ plus payload bindings and binding names) and `if let` with the same patterns
 (desugared to a two-arm `match`); `break` (with a value in a `loop`, so `loop`
 works as an expression), `continue`,
 `return`; arithmetic, comparison, bitwise (`!`/`&`/`|`/`^`) and shift (`<<`/`>>`)
-operators; `&&`/`||`; string literals; `mut` enforcement and definite
+operators; `&&`/`||`; string literals (compared by content with `==`/`!=`/`<`/`<=`/`>`/`>=`); `mut` enforcement and definite
 initialisation; `const` items (folded to a value and substituted at every use,
 including array lengths and `match` patterns); references (`&T` / `&mut T`, `&e`, `*e`,
 with auto-deref for `r.x`, `r[i]` and `r.m()`, and `&self` receivers);

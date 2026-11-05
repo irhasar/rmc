@@ -303,8 +303,9 @@ compile-time constant is decided at compile time, not by the trap.
   position, work like `if`.
 - String literals, given their own type (a pointer to a `{len, bytes}` record).
   A string is not an `i64`: it cannot be an arithmetic operand and cannot be
-  passed where an `i64` is expected. The only thing to do with one is pass it to
-  `print_str`.
+  passed where an `i64` is expected. Two strings may be compared with `==`,
+  `!=`, `<`, `<=`, `>` and `>=`, which compare their bytes, not their addresses;
+  `print_str` writes one to standard output.
 
 ## Builtins
 
