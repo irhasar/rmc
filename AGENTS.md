@@ -1052,6 +1052,14 @@ reference as array elements. A list literal `[a, b, c]` is parsed as
 values — the parser must not guess it, because it does not type-check, and
 guessing `i64` is what made `[true, false]` fail.
 
+`let _ = e;` (and `let _: T = e;`, and the no-op `let _: T;`) is a **discard**.
+The parser lowers it to a block holding a hidden `let _ = e;` binding, so the
+initializer is still evaluated once and an annotation is still checked, then the
+binding is dropped. The hidden binding is literally named `_` so a type-mismatch
+diagnostic reads `variable `_``; `_` cannot be written as an ordinary binding
+(`expect_ident` rejects it), so the name never clashes with user code. Bare
+`let _;` with no annotation is rejected at parse time (rustc's E0282).
+
 ## Soundness checks
 
 The differential fuzzers only compare programs that *both* compilers accept, so

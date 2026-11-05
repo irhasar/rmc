@@ -577,6 +577,17 @@ def gen_stmt_program(rng):
     rs.append("    let e = match i % 3 { 0 => E::P, 1 => E::Q, _ => E::R };")
     rms.append("    acc = acc + tag(e) * 100 + (e as i64);")
     rs.append("    acc += tag(e) * 100 + (e as i64);")
+    # `let _ = e;` discards `e`: a side-effecting call must still run once and a
+    # discarded aggregate must not corrupt the frame. Annotated and unannotated
+    # forms both appear.
+    rms.append("    let _ = sc(5);")
+    rs.append("    let _ = sc(5);")
+    rms.append("    let _: i64 = sc(6);")
+    rs.append("    let _: i64 = sc(6);")
+    rms.append("    let _ = mk(7);")
+    rs.append("    let _ = mk(7);")
+    rms.append("    let _ = [1, 2, 3];")
+    rs.append("    let _ = [1, 2, 3];")
     # An exhaustive enum `match` with no `_` arm, used as a value.
     rms.append("    acc = acc + exval(e);")
     rs.append("    acc += exval(e);")

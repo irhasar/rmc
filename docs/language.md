@@ -184,6 +184,8 @@ namespace, so giving both the same name is an error (rustc's `E0428`).
 ```rust
 let x: i64 = 1;          // immutable binding
 let mut y: i64 = 0;      // mutable binding
+let _ = e;               // discard: evaluate `e` for side effects, bind nothing
+let _: T;                // annotated discard, no initialiser (a no-op)
 y = y + 1;               // assignment (target may be a variable, array element or field)
 y += 1;                  // compound assignment: += -= *= /= %=
 x;                       // expression statement
@@ -212,7 +214,11 @@ before it is read, exactly as in Rust. Reading a binding that is not definitely
 initialised on every path is rejected (rustc's `E0381`), so `let x: i64;` then
 `return x;` does not compile. Writing one field or element of an uninitialised
 aggregate leaves it uninitialised as a whole, so reading it is still an error
-(rustc's "partially assigned"). A `let` or parameter without `mut` is
+(rustc's "partially assigned"). `let _ = e;` discards `e`: it is evaluated once
+for its side effects and binds nothing, and any annotation is still checked
+(`let _: bool = 5;` is rejected, rustc's `E0308`). `let _;` with no annotation
+has no type to infer and is rejected (rustc's `E0282`); `let _: T;` is a no-op.
+A `let` or parameter without `mut` is
 immutable: assigning it (rustc's `E0384`), assigning a field or element of it
 (`E0594`), or taking `&mut` of it (`E0596`) is rejected. Add `mut` (or `mut x:
 T` on a parameter) to write it. A `&mut T` reference is writable through without
