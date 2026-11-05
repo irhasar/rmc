@@ -573,7 +573,7 @@ impl<'a> FnGen<'a> {
         }
         self.out.push_str("  leave\n  ret\n");
         let body = std::mem::take(&mut self.out);
-        Ok(peephole(&body))
+        Ok(dead_stores(&peephole(&forward_stores(&body))))
     }
 
     /// Argument setup plus every basic block. Run twice (dry, then real).
@@ -592,10 +592,25 @@ impl<'a> FnGen<'a> {
             let _ = writeln!(self.out, "  mov {}, {}", ARG_REGS[ord], dst);
         }
         for i in 0..self.func.blocks.len() as u32 {
+            // Align a loop header: the target of a back edge (an edge from a
+            // later block). Aligning it to a cache line keeps the hot loop's
+            // instructions from straddling a boundary, which matters most for a
+            // tight inner loop.
+            if self.opts.align_loops && self.is_loop_header(i) {
+                let _ = writeln!(self.out, "  .p2align 4");
+            }
             let _ = writeln!(self.out, ".Lbb{}:", self.bb_label(i));
             self.gen_block(i)?;
         }
         Ok(())
+    }
+
+    /// True when `bb` is the target of an edge from a later block — the top of a
+    /// loop, given that the layout puts a loop's body after its header.
+    fn is_loop_header(&self, bb: u32) -> bool {
+        self.func.blocks.iter().enumerate().any(|(i, b)| {
+            i as u32 > bb && successors(&b.term).contains(&bb)
+        })
     }
 
     /// A basic-block label, qualified by the function name so that labels from
@@ -1557,6 +1572,219 @@ impl<'a> FnGen<'a> {
             Operand::Const(_) => Ty::I64,
         }
     }
+}
+
+/// Forward a store to a frame slot into a later load of that slot.
+///
+/// The generator writes a scalar to its slot and later reads it back, because
+/// the value has to survive other statements. When the register that was stored
+/// still holds the value at the load, the load can read the register instead,
+/// removing a memory round-trip. A slot's register is forgotten as soon as
+/// anything writes that register or the slot, and the map is cleared at every
+/// label and control transfer, so the forwarding never crosses a place where
+/// the two could diverge.
+fn forward_stores(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut holding: HashMap<String, String> = HashMap::new();
+    for line in body.lines() {
+        let t = line.trim();
+        let op = t.split_whitespace().next().unwrap_or("");
+        if t.is_empty() || t.starts_with('.') || t.ends_with(':') || t.starts_with('#') {
+            holding.clear();
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if op == "call" || op == "ret" || op == "syscall" || op.starts_with('j') {
+            holding.clear();
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if !KNOWN_OPS.contains(&op) {
+            holding.clear();
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        let rest = t[op.len()..].trim();
+        let pair = rest.split_once(',').map(|(a, b)| (a.trim(), b.trim()));
+        let mut rewritten: String = line.to_string();
+        if let Some((src, dst)) = pair {
+            // A store of a register into a slot records the register.
+            if is_reg(src) && is_slot(dst) && (op == "mov" || op == "movq") {
+                holding.retain(|_, r| r != dst);
+                holding.insert(dst.to_string(), src.to_string());
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            }
+            // A read of a slot whose value is still in a register: read the
+            // register instead. This covers both a plain load and a memory
+            // operand (`add -8(%rbp), %rax`), and once the slot has no readers
+            // left the store into it is dropped as dead.
+            if is_slot(src) {
+                if let Some(r) = holding.get(src).cloned() {
+                    rewritten = if op == "mov" || op == "movq" {
+                        if r == dst {
+                            continue;
+                        }
+                        format!("  mov {r}, {dst}")
+                    } else {
+                        format!("  {op} {r}, {dst}")
+                    };
+                }
+            }
+            // Any other write to a slot invalidates the value it held.
+            if is_slot(dst) {
+                holding.remove(dst);
+            }
+        }
+        for r in written_regs(op, &rewritten) {
+            drop_holding(&mut holding, &r);
+        }
+        out.push_str(&rewritten);
+        out.push('\n');
+    }
+    out
+}
+
+/// Instructions the forwarding pass understands well enough not to clear its
+/// map. Anything else may write a register in a way the pass does not model.
+const KNOWN_OPS: &[&str] = &[
+    "mov", "movq", "movabs", "movzbl", "movzbq", "movslq", "add", "addq", "sub", "subq", "imul",
+    "and", "or", "xor", "cmp", "test", "lea", "sar", "shr", "shl", "neg", "inc", "dec", "sete",
+    "setne", "setl", "setle", "setg", "setge", "seta", "setae", "setb", "setbe", "cqto", "cltd",
+    "idiv", "div", "push", "pop", "nop", "ud2", "hlt",
+];
+
+fn is_reg(s: &str) -> bool {
+    s.starts_with('%')
+}
+
+fn is_slot(s: &str) -> bool {
+    s.ends_with("(%rbp)") || s.ends_with("(%rip)")
+}
+
+/// The canonical 64-bit register a possibly-narrower name refers to, so that a
+/// write to `%al` invalidates a value held in `%rax`.
+fn canon_reg(r: &str) -> String {
+    const PARENTS: &[(&str, &str)] = &[
+        ("%rax", "%rax"), ("%eax", "%rax"), ("%ax", "%rax"), ("%al", "%rax"),
+        ("%rbx", "%rbx"), ("%ebx", "%rbx"), ("%bx", "%rbx"), ("%bl", "%rbx"),
+        ("%rcx", "%rcx"), ("%ecx", "%rcx"), ("%cx", "%rcx"), ("%cl", "%rcx"),
+        ("%rdx", "%rdx"), ("%edx", "%rdx"), ("%dx", "%rdx"), ("%dl", "%rdx"),
+    ];
+    for (k, v) in PARENTS {
+        if r == *k {
+            return (*v).to_string();
+        }
+    }
+    r.to_string()
+}
+
+fn drop_holding(holding: &mut HashMap<String, String>, reg: &str) {
+    holding.retain(|_, r| canon_reg(r) != reg);
+}
+
+/// Registers an instruction definitely writes. The destination operand covers
+/// most forms; the multiply/divide forms write `%rax`/`%rdx` implicitly.
+fn written_regs(op: &str, line: &str) -> Vec<String> {
+    let mut w = Vec::new();
+    match op {
+        "cmp" | "test" | "push" | "nop" => return w,
+        "cqto" | "cltd" => {
+            w.push("%rdx".to_string());
+            return w;
+        }
+        "idiv" | "div" | "mul" => {
+            w.push("%rax".to_string());
+            w.push("%rdx".to_string());
+            return w;
+        }
+        "imul" if !line.contains(',') => {
+            w.push("%rax".to_string());
+            w.push("%rdx".to_string());
+            return w;
+        }
+        _ => {}
+    }
+    if let Some((_, dst)) = line.split_once(',') {
+        let dst = dst.trim();
+        if is_reg(dst) {
+            w.push(canon_reg(dst));
+        }
+    }
+    w
+}
+
+/// Drop a store to a frame slot that the function never reads.
+///
+/// The generator stores every scalar result to its destination slot, but a
+/// temporary that is only read back through the register that still holds it
+/// (the very next statement) never has its slot read. Such a slot is mentioned
+/// exactly once in the whole body — the store itself — so removing it is safe
+/// without any liveness analysis: a slot read anywhere (a load, an ALU memory
+/// operand, an address computation) would be mentioned again.
+fn dead_stores(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut counts: HashMap<&str, u32> = HashMap::new();
+    for line in &lines {
+        for slot in slots_in(line) {
+            *counts.entry(slot).or_insert(0) += 1;
+        }
+    }
+    let mut out = String::with_capacity(body.len());
+    for line in &lines {
+        if let Some(slot) = store_slot(line) {
+            if counts.get(slot).copied().unwrap_or(0) <= 1 {
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Every `-N(%rbp)` slot mentioned on `line`, as borrowed slices of it.
+fn slots_in(line: &str) -> Vec<&str> {
+    let mut found = Vec::new();
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'(' {
+            // Walk back over the digits and the sign to the start of the offset.
+            let mut j = i;
+            while j > 0 && (bytes[j - 1].is_ascii_digit() || bytes[j - 1] == b'-') {
+                j -= 1;
+            }
+            if let Some(end) = line[i..].find(')') {
+                found.push(&line[j..i + end + 1]);
+            }
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    found
+}
+
+/// The slot a line stores to, when it is a plain store (`mov <src>, <slot>` or
+/// an ALU op whose destination is memory). Returns `None` for a load.
+fn store_slot(line: &str) -> Option<&str> {
+    let t = line.trim();
+    let (_, dst) = t.split_once(',')?;
+    let dst = dst.trim();
+    if !dst.ends_with("(%rbp)") {
+        return None;
+    }
+    let op = t.split_whitespace().next()?;
+    // `mov`, `add`, `sub`, `imul`, `and`, `or`, `xor` write their destination;
+    // a load (`mov <slot>, %reg`) has a register destination and is excluded
+    // above by the `%rbp` suffix check.
+    matches!(op, "mov" | "movq" | "add" | "sub" | "imul" | "and" | "or" | "xor")
+        .then_some(dst)
 }
 
 /// Drop a register store that the very next instruction reloads into the same

@@ -2772,7 +2772,7 @@ fn reaches(preds: &[Vec<u32>], from: u32, to: u32) -> bool {
 }
 
 /// The successor blocks of a terminator.
-fn successors(t: &Terminator) -> Vec<u32> {
+pub(crate) fn successors(t: &Terminator) -> Vec<u32> {
     match t {
         Terminator::Goto(b) => vec![*b],
         Terminator::SwitchInt { targets, otherwise, .. } => {
