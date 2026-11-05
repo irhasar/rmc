@@ -829,6 +829,27 @@ fn parse_fn(lines: &[String], start: usize) -> Result<(Function, usize), String>
         }
     }
 
+    // rustc always emits at least `bb0`, and the optimiser passes assume a
+    // function has a first block (`facts_in[0]`, the entry). A hand-written or
+    // corrupted MIR file can declare none, so reject it here rather than
+    // indexing an empty vector later.
+    if blocks.is_empty() {
+        return Err(format!("mir: fn `{name}` has no basic blocks"));
+    }
+    // Every terminator must target a block that exists. rustc never emits a
+    // dangling target, but a corrupted or hand-written `.mir` file can, and a
+    // later pass indexes `blocks[target]` directly. Reject it at the boundary.
+    let n_blocks = blocks.len() as u32;
+    for (b, blk) in blocks.iter().enumerate() {
+        for s in successors(&blk.term) {
+            if s >= n_blocks {
+                return Err(format!(
+                    "mir: fn `{name}`: bb{b} targets bb{s}, which does not exist"
+                ));
+            }
+        }
+    }
+
     let f = Function { name, locals, blocks, consts: HashMap::new() };
     Ok((f, end + 1))
 }

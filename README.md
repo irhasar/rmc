@@ -275,6 +275,7 @@ python3 tools/fuzz.py --mode mir --gen width --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 python3 tools/fuzz.py --mode robust
 python3 tools/fuzz.py --mode mirrobust
+python3 tools/fuzz.py --mode mirmut --n 500 --seed 1
 ```
 
 `robust` mode needs no rustc: it feeds a fixed corpus of malformed and
@@ -298,6 +299,15 @@ crash.
 down. Every integer narrower than 64 bits shares one word in the back end, so a
 wrong sign/zero extension or a missing wrap at a narrow width is the miscompile
 this generator exists to find; it has not found one.
+
+`mirmut` mode needs no rustc and mutates real `rustc --emit=mir` text, then
+lowers it through the `.mir` input path (`rmc file.mir`). This is the only mode
+that reaches the back end's internal invariants with structurally broken input:
+the `.rs` modes cannot, because rustc rejects malformed source before it emits
+MIR. It found two real panics on its first run — a function that declares no
+basic block, and a terminator that jumps to a block the function never declares
+— both now rejected at the parser boundary. Every mutated input must end in a
+clean exit 0 (compiled) or exit 1 (diagnostic), never a panic or a signal.
 
 A caveat for `expr`: an integer literal in a shift amount is unconstrained, so
 rustc infers `i32` and masks the count to 5 bits, while rmc is `i64`-only and

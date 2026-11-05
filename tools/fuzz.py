@@ -2324,6 +2324,112 @@ def run_mir_robust():
     return 1 if failures else 0
 
 
+# ------------------------------------------------------ MIR text mutate mode
+
+def mirmut_seeds():
+    """Real `rustc --emit=mir` text for programs the back end *does* compile.
+    These are the seeds the mutator perturbs: valid MIR is the only input that
+    reaches the back end's internal invariants, which is exactly where an
+    `unreachable!` would turn a malformed input into a panic."""
+    seeds = {
+        "add": "fn main() -> i64 {\n    let mut _0: i64;\n\n    bb0: {\n        _0 = const 7_i64;\n        return;\n    }\n}\n",
+        "arith": "fn main() -> i64 {\n    let mut _0: i64;\n    let mut _1: i64;\n    let mut _2: i64;\n\n    bb0: {\n        _1 = const 3_i64;\n        _2 = const 4_i64;\n        _0 = Add(move _1, move _2);\n        return;\n    }\n}\n",
+        "cmp": "fn main() -> i64 {\n    let mut _0: i64;\n    let mut _1: bool;\n\n    bb0: {\n        _1 = const 1_i64 < const 2_i64;\n        _0 = const 0_i64;\n        return;\n    }\n}\n",
+        "call": "fn add(a: i64, b: i64) -> i64 {\n    let mut _0: i64;\n\n    bb0: {\n        _0 = Add(move a, move b);\n        return;\n    }\n}\n\nfn main() -> i64 {\n    let mut _0: i64;\n    let mut _1: i64;\n\n    bb0: {\n        _1 = const 2_i64;\n        _0 = add(const 1_i64, move _1) -> [return: bb1, unwind unreachable];\n    }\n\n    bb1: {\n        return;\n    }\n}\n",
+        "if": "fn main() -> i64 {\n    let mut _0: i64;\n    let mut _1: bool;\n\n    bb0: {\n        _1 = const 1_i64 < const 2_i64;\n        switchInt(move _1) -> [0: bb2, otherwise: bb1];\n    }\n\n    bb1: {\n        _0 = const 10_i64;\n        goto -> bb3;\n    }\n\n    bb2: {\n        _0 = const 20_i64;\n        goto -> bb3;\n    }\n\n    bb3: {\n        return;\n    }\n}\n",
+        "loop": "fn main() -> i64 {\n    let mut _0: i64;\n    let mut _1: i64;\n    let mut _2: bool;\n\n    bb0: {\n        _1 = const 0_i64;\n        goto -> bb1;\n    }\n\n    bb1: {\n        _2 = Lt(copy _1, const 10_i64);\n        switchInt(move _2) -> [0: bb3, otherwise: bb2];\n    }\n\n    bb2: {\n        _1 = Add(move _1, const 1_i64);\n        goto -> bb1;\n    }\n\n    bb3: {\n        _0 = move _1;\n        return;\n    }\n}\n",
+        "div": "fn main() -> i64 {\n    let mut _0: i64;\n    let mut _1: i64;\n    let mut _2: i64;\n\n    bb0: {\n        _1 = const 20_i64;\n        _2 = const 3_i64;\n        _0 = Div(move _1, move _2);\n        return;\n    }\n}\n",
+        "ref": "fn main() -> i64 {\n    let mut _0: i64;\n    let mut _1: i64;\n    let mut _2: &i64;\n\n    bb0: {\n        _1 = const 5_i64;\n        _2 = &_1;\n        _0 = (*_2);\n        return;\n    }\n}\n",
+        "struct": "struct P {\n    x: i64,\n    y: i64,\n}\n\nfn main() -> i64 {\n    let mut _0: i64;\n    let mut _1: P;\n\n    bb0: {\n        _1 = P { x: const 1_i64, y: const 2_i64 };\n        _0 = (_1.0);\n        return;\n    }\n}\n",
+        "shift": "fn main() -> i64 {\n    let mut _0: i64;\n    let mut _1: i64;\n\n    bb0: {\n        _1 = const 1_i64;\n        _0 = Shl(move _1, const 4_i32);\n        return;\n    }\n}\n",
+        "unit": "fn main() {\n    let mut _0: ();\n\n    bb0: {\n        _0 = const ();\n        return;\n    }\n}\n",
+    }
+    return seeds
+
+
+# Fragments the mutator splices in. Each is a plausible-looking MIR token that
+# is either semantically impossible (a bad jump target, a type mismatch) or
+# simply absent from the seeds (an operator or cast the parser must handle).
+MIR_TOKENS = [
+    "goto -> bb99;", "goto -> bb0;", "switchInt(move _1) -> [0: bb9, otherwise: bb8];",
+    "_0 = Div(move _1, const 0_i64);", "_0 = Rem(move _1, const 0_i64);",
+    "_0 = Add(move _0, move _0);", "_0 = Neg(move _1);", "_0 = Not(move _1);",
+    "_0 = Shl(move _1, const 200_i32);", "_0 = Shr(move _1, const 200_i32);",
+    "_0 = (_1.99);", "_0 = (*_2);", "_0 = Len((*_3));", "_0 = Discriminant(_1);",
+    "_0 = copy _1 as u8;", "_0 = move _1 as i128;", "_0 = &raw const _1;",
+    "drop(_1) -> [return: bb1, unwind unreachable];",
+    "assert(!move _1, \"overflow\") -> [success: bb1, unwind unreachable];",
+    "_0 = const 99999999999999999999999999_i64;", "_0 = const 1.5_f64;",
+    "_0 = const \"unterminated;", "unreachable;", "return;", "StorageLive(_0);",
+    "StorageDead(_0);", "_0 = Rvalue::Unsupported;", "_0 = PtrMetadata(move _1);",
+    "bb4: {", "}", "    ", "_0 = Add(move _1, const 1_i64) -> [return: bb9, unwind unreachable];",
+]
+
+
+def mutate_mir(rng, text):
+    """One random structural edit of a MIR program. Returns the mutated text."""
+    lines = text.split("\n")
+    kind = rng.randrange(5)
+    if kind == 0 and lines:  # delete a line
+        del lines[rng.randrange(len(lines))]
+    elif kind == 1:  # splice a token as a new statement line
+        at = rng.randrange(len(lines) + 1)
+        lines.insert(at, MIR_TOKENS[rng.randrange(len(MIR_TOKENS))])
+    elif kind == 2 and lines:  # duplicate a line
+        i = rng.randrange(len(lines))
+        lines.insert(i, lines[i])
+    elif kind == 3 and lines:  # truncate the program
+        lines = lines[: rng.randrange(1, len(lines) + 1)]
+    else:  # append a token to a random line
+        if lines:
+            i = rng.randrange(len(lines))
+            tok = MIR_TOKENS[rng.randrange(len(MIR_TOKENS))]
+            lines[i] = lines[i] + " " + tok
+    return "\n".join(lines)
+
+
+def run_mirmut(args):
+    """Mutate real `rustc --emit=mir` text and feed it to the `.mir` input path.
+    Every result must be a clean exit 0 (compiled) or exit 1 (diagnostic): a
+    panic, a signal, or any other status is a bug. This is the mode that
+    reaches the back end's internal invariants, which the `.rs` modes cannot
+    because rustc rejects malformed source before it ever emits MIR."""
+    tmp = f"/tmp/rmc-fuzz-mirmut-{os.getpid()}"
+    os.makedirs(tmp, exist_ok=True)
+    rng = random.Random(args.seed)
+    seeds = list(mirmut_seeds().items())
+    failures = 0
+    compiled = 0
+    for i in range(args.n):
+        name, base = seeds[rng.randrange(len(seeds))]
+        text = base
+        for _ in range(rng.randint(1, 3)):
+            text = mutate_mir(rng, text)
+        path = f"{tmp}/m{i}.mir"
+        with open(path, "w") as f:
+            f.write(text)
+        p = run([RMC, path, "-o", f"{tmp}/m{i}.bin"])
+        crashed = (p.returncode < 0 or b"panicked" in p.stderr
+                   or b"overflowed its stack" in p.stderr)
+        if crashed:
+            keep = f"{args.keep or tmp}/crash-{i}-{name}.mir"
+            os.makedirs(os.path.dirname(keep) or ".", exist_ok=True)
+            with open(keep, "w") as f:
+                f.write(text)
+            print(f"[mirmut] seed={name} #{i}: CRASH (exit {p.returncode}) "
+                  f"kept {keep}\n{p.stderr.decode(errors='replace')[:300]}")
+            failures += 1
+        elif p.returncode not in (0, 1):
+            print(f"[mirmut] seed={name} #{i}: unexpected exit {p.returncode}")
+            failures += 1
+        elif p.returncode == 0:
+            compiled += 1
+    if failures == 0:
+        print(f"mirmut: all {args.n} mutated MIR inputs handled cleanly "
+              f"({compiled} compiled, {args.n - compiled} rejected)")
+    return 1 if failures else 0
+
+
 # -------------------------------------------------------------- reject mode
 
 def reject_corpus():
@@ -3041,7 +3147,7 @@ def run_mir(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "robust", "mirrobust", "reject", "mir"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "robust", "mirrobust", "mirmut", "reject", "mir"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -3068,6 +3174,8 @@ def main():
             print("rustc not found; set RUSTC or install a toolchain", file=sys.stderr)
             return 2
         return run_mir_robust()
+    if args.mode == "mirmut":
+        return run_mirmut(args)
     if args.mode == "mir":
         if not rustc_available():
             print("rustc not found; set RUSTC or install a toolchain", file=sys.stderr)

@@ -115,6 +115,7 @@ fn print_help() {
          \n\
          USAGE:\n    rmc [OPTIONS] <input.rms>\n\
          \x20   rmc [OPTIONS] <input.rs>    use rustc --emit=mir as the front end\n\
+         \x20   rmc [OPTIONS] <input.mir>   lower `rustc --emit=mir` text directly\n\
          \n\
          OPTIONS:\n\
          \x20   -o <path>      output binary path\n\
@@ -193,7 +194,13 @@ fn run_mir_pipeline(opts: &Options) -> Result<(), String> {
         std::fs::write(&mir_path, &mir)
             .map_err(|e| format!("cannot write {}: {e}", mir_path.display()))?;
     }
-    let mut prog = rmc::mir::parse(&mir)?;
+    run_mir_text(opts, &mir)
+}
+
+/// Lower `rustc --emit=mir` text with the rmc back end. Shared by the `.rs`
+/// front end and the `.mir` input path, so both go through the same passes.
+fn run_mir_text(opts: &Options, mir: &str) -> Result<(), String> {
+    let mut prog = rmc::mir::parse(mir)?;
     if !opts.no_tco {
         rmc::mir::tco(&mut prog, opts.overflow_checks);
     }
@@ -250,6 +257,14 @@ fn run(opts: Options) -> Result<(), String> {
     // rmc's own source language, compiled end to end.
     if opts.input.extension().and_then(|e| e.to_str()) == Some("rs") {
         return run_mir_pipeline(&opts);
+    }
+    // A `.mir` input is already MIR text (as `rustc --emit=mir` prints it), so
+    // it skips the front end and enters the back end directly. This is the
+    // entry point the MIR fuzzer mutates into.
+    if opts.input.extension().and_then(|e| e.to_str()) == Some("mir") {
+        let mir = std::fs::read_to_string(&opts.input)
+            .map_err(|e| format!("cannot read {}: {e}", opts.input.display()))?;
+        return run_mir_text(&opts, &mir);
     }
     let src = std::fs::read_to_string(&opts.input)
         .map_err(|e| format!("cannot read {}: {e}", opts.input.display()))?;

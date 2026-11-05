@@ -4707,3 +4707,30 @@ fn mir_rejected_program_is_a_diagnostic_not_a_panic() {
     let empty = rmc::mir::parse("// only a comment\n").expect("lenient parse");
     assert!(empty.funcs.is_empty());
 }
+
+#[test]
+fn mir_function_with_no_blocks_is_rejected() {
+    // The optimiser passes index `blocks[0]` as the entry, so a function that
+    // declares no `bb` must be rejected by the parser, not panic later.
+    let err = rmc::mir::parse("fn main() -> i64 {\n}\n").unwrap_err();
+    assert!(err.contains("no basic blocks"), "got: {err}");
+}
+
+#[test]
+fn mir_dangling_jump_target_is_rejected() {
+    // A terminator that targets a block the function never declares must be a
+    // parse error; `merge_blocks` (and others) index `blocks[target]` directly.
+    let mir = "\
+fn main() -> i64 {
+    let mut _0: i64;
+
+    bb0: {
+        _0 = const 0_i64;
+        return;
+    assert(!move _0, \"x\") -> [success: bb1, unwind unreachable];
+    }
+}
+";
+    let err = rmc::mir::parse(mir).unwrap_err();
+    assert!(err.contains("does not exist"), "got: {err}");
+}
