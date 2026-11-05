@@ -77,7 +77,6 @@ fn collect_stmt(s: &Stmt, out: &mut HashSet<String>) {
             collect_expr(c, out);
             collect_block(b, out);
         }
-        Stmt::Loop(b) => collect_block(b, out),
         Stmt::For { start, end, body, .. } => {
             collect_expr(start, out);
             collect_expr(end, out);
@@ -88,7 +87,12 @@ fn collect_stmt(s: &Stmt, out: &mut HashSet<String>) {
                 collect_expr(e, out);
             }
         }
-        Stmt::Break | Stmt::Continue => {}
+        Stmt::Break(v) => {
+            if let Some(e) = v {
+                collect_expr(e, out);
+            }
+        }
+        Stmt::Continue => {}
     }
 }
 
@@ -113,7 +117,7 @@ fn collect_expr(e: &Expr, out: &mut HashSet<String>) {
                 collect_block(e, out);
             }
         }
-        Expr::MatchBoundary(b, _) | Expr::Block(b) => collect_block(b, out),
+        Expr::MatchBoundary(b, _) | Expr::Block(b) | Expr::Loop(b, _, _) => collect_block(b, out),
         Expr::Index(a, b) => {
             collect_expr(a, out);
             collect_expr(b, out);

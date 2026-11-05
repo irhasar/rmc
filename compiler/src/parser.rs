@@ -45,7 +45,7 @@ const MAX_DEPTH: u32 = 100;
 
 /// Expressions that are allowed as statements without a trailing `;`.
 fn is_block_like(e: &Expr) -> bool {
-    matches!(e, Expr::If(..) | Expr::Block(..) | Expr::MatchBoundary(..))
+    matches!(e, Expr::If(..) | Expr::Block(..) | Expr::MatchBoundary(..) | Expr::Loop(..))
 }
 
 type PResult<T> = Result<T, String>;
@@ -549,7 +549,14 @@ impl Parser {
                     break;
                 }
                 if is_block_like(&e) {
-                    // `if`/block expressions are valid statements without a `;`
+                    // `if`/block/`loop` expressions are valid statements without
+                    // a `;`. A `loop` here is a statement, so a value it yields
+                    // (via `break value`) is discarded: wrap it so it is typed
+                    // as `()`, not as its break type.
+                    let e = match e {
+                        Expr::Loop(b, _, ty) => Expr::Loop(b, -2, ty),
+                        other => other,
+                    };
                     stmts.push(Stmt::Expr(e));
                     continue;
                 }
@@ -589,6 +596,7 @@ impl Parser {
                 | Some(Tok::Bang)
                 | Some(Tok::If)
                 | Some(Tok::Match)
+                | Some(Tok::Loop)
                 | Some(Tok::LBracket)
                 | Some(Tok::Amp)
                 | Some(Tok::Star)
@@ -634,11 +642,6 @@ impl Parser {
                 let body = self.parse_block()?;
                 Ok(Stmt::While(cond, body))
             }
-            Some(Tok::Loop) => {
-                self.i += 1;
-                let body = self.parse_block()?;
-                Ok(Stmt::Loop(body))
-            }
             Some(Tok::For) => {
                 self.i += 1;
                 let var = self.expect_ident()?;
@@ -668,8 +671,14 @@ impl Parser {
             }
             Some(Tok::Break) => {
                 self.i += 1;
+                // `break` and `break expr`; the `;` may be omitted at the end of
+                // a block. The value is only legal in a `loop`, checked by sema.
+                if self.eat(&Tok::Semi) || self.peek() == Some(&Tok::RBrace) {
+                    return Ok(Stmt::Break(None));
+                }
+                let e = self.parse_expr()?;
                 self.eat_semi_at_block_end()?;
-                Ok(Stmt::Break)
+                Ok(Stmt::Break(Some(e)))
             }
             Some(Tok::Continue) => {
                 self.i += 1;
@@ -1269,11 +1278,17 @@ impl Parser {
     /// to a fresh temporary each time.
     fn desugar_while_let(&mut self, pat: Pat, scrutinee: Expr, body: Block) -> Stmt {
         let break_else = Block {
-            stmts: vec![Stmt::Break],
+            stmts: vec![Stmt::Break(None)],
             tail: None,
         };
+        // The `if let` is a *statement* in the loop body, so its value is
+        // discarded and the loop body is unit even when `body` yields a value.
         let test = self.desugar_if_let(pat, scrutinee, body, Some(break_else));
-        Stmt::Loop(Block { stmts: vec![Stmt::Expr(test)], tail: None })
+        let loop_body = Block { stmts: vec![Stmt::Expr(test)], tail: None };
+        // The loop is unit-valued: the `else` arm always contains a plain
+        // `break;`, so a `break value` in the body is rejected as a type
+        // mismatch (rustc E0571 rejects it too).
+        Stmt::Expr(Expr::Loop(loop_body, -1, Type::Unit))
     }
 
     /// One arm of a desugared `match` or `if let`: the pattern test, the
@@ -1605,6 +1620,15 @@ impl Parser {
                 Ok(Expr::If(Box::new(cond), then, els))
             }
             Some(Tok::Match) => self.parse_match(),
+            Some(Tok::Loop) => {
+                self.i += 1;
+                // `loop` is always parsed as `Expr::Loop`; a `loop` in statement
+                // position is wrapped in `Stmt::Expr` by `parse_block`, which
+                // rewrites its result slot to `-2` so a `break value` is
+                // discarded and the statement is typed as `()`.
+                let body = self.parse_block()?;
+                Ok(Expr::Loop(body, -1, Type::Unit))
+            }
             Some(Tok::LBrace) => Ok(Expr::Block(self.parse_block()?)),
             Some(Tok::LBracket) => {
                 self.i += 1;
@@ -1699,10 +1723,10 @@ fn stmt_has_call_p(s: &Stmt) -> bool {
         Stmt::Expr(e) => expr_has_call(e),
         Stmt::Return(v) => v.as_ref().map_or(false, expr_has_call),
         Stmt::While(c, b) => expr_has_call(c) || block_has_call_p(b),
-        Stmt::Loop(b) => block_has_call_p(b),
         Stmt::For { start, end, body, .. } => {
             expr_has_call(start) || expr_has_call(end) || block_has_call_p(body)
         }
-        Stmt::Break | Stmt::Continue => false,
+        Stmt::Break(v) => v.as_ref().map_or(false, expr_has_call),
+        Stmt::Continue => false,
     }
 }

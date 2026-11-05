@@ -58,12 +58,25 @@ impl EnumInfo {
     }
 }
 
+/// A loop being type-checked, for the `break`s that target it. A `while`/`for`
+/// carries `NoValue` (a `break` may not carry a value, rustc E0571); a `loop`
+/// carries `Valued`, accumulating the type its `break`s yield.
+enum LoopCtx {
+    NoValue,
+    /// A `loop` with no `break value` yet seen. `ty` stays `Unit` until a value
+    /// arrives, so an unbroken `loop` is `Unit`/`!` rather than a value.
+    Valued { ty: Type, seen: bool },
+}
+
 pub struct Sema {
     sigs: HashMap<String, Sig>,
     structs: HashMap<String, StructInfo>,
     enums: HashMap<String, EnumInfo>,
     next_slot: i32,
     loop_depth: u32,
+    /// The loops currently being checked, innermost last, so a `break` can see
+    /// the type of the loop it targets.
+    loop_stack: Vec<LoopCtx>,
     ret_ty: Type,
     /// While checking the `else` chain of a desugared `match`: whether the
     /// whole chain names every variant of one enum. Decided once at the chain's
@@ -196,6 +209,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         enums,
         next_slot: 0,
         loop_depth: 0,
+        loop_stack: Vec::new(),
         ret_ty: Type::Unit,
         match_total: false,
         match_chain: false,
@@ -485,6 +499,7 @@ impl Sema {
         }
         self.next_slot = 0;
         self.loop_depth = 0;
+        self.loop_stack.clear();
         self.const_locals.clear();
         self.assign_count.clear();
         self.mut_borrowed.clear();
@@ -865,18 +880,12 @@ impl Sema {
                 }
                 let init_before = Self::init_snapshot(scope);
                 self.loop_depth += 1;
+                self.loop_stack.push(LoopCtx::NoValue);
                 self.check_block(body, scope)?;
+                self.loop_stack.pop();
                 self.loop_depth -= 1;
                 // The loop may run zero times, so nothing it initializes is
                 // guaranteed afterwards.
-                Self::init_restore(scope, &init_before);
-                Ok(())
-            }
-            Stmt::Loop(body) => {
-                let init_before = Self::init_snapshot(scope);
-                self.loop_depth += 1;
-                self.check_block(body, scope)?;
-                self.loop_depth -= 1;
                 Self::init_restore(scope, &init_before);
                 Ok(())
             }
@@ -909,7 +918,9 @@ impl Sema {
                     init: true,
                 });
                 self.loop_depth += 1;
+                self.loop_stack.push(LoopCtx::NoValue);
                 self.check_block(body, scope)?;
+                self.loop_stack.pop();
                 self.loop_depth -= 1;
                 scope.truncate(mark);
                 Self::init_restore(scope, &init_before);
@@ -937,9 +948,52 @@ impl Sema {
                 }
                 Ok(())
             }
-            Stmt::Break => {
+            Stmt::Break(v) => {
                 if self.loop_depth == 0 {
                     return Err("`break` outside of a loop".into());
+                }
+                match v {
+                    Some(e) => {
+                        let t = self.check_expr(e, scope)?;
+                        match self.loop_stack.last_mut() {
+                            Some(LoopCtx::NoValue) | None => {
+                                return Err(
+                                    "`break` with a value is only allowed in a `loop` (rustc E0571)"
+                                        .into(),
+                                )
+                            }
+                            Some(LoopCtx::Valued { ty, seen }) => {
+                                // `!` unifies with anything: a `break` whose
+                                // value never materialises must not pin the
+                                // loop's type, so upgrade `!` to the first real
+                                // type that shows up and ignore later `!`s.
+                                if !*seen {
+                                    *ty = t;
+                                    *seen = true;
+                                } else if *ty == Type::Never {
+                                    *ty = t;
+                                } else if t != Type::Never && t != *ty {
+                                    return Err(format!(
+                                        "`break` value type mismatch: loop yields {ty:?}, found {t:?}"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        // `break;` yields `()` for that break, so it only fits a
+                        // loop that already yields `()` (or has no value yet).
+                        if let Some(LoopCtx::Valued { ty, seen }) = self.loop_stack.last_mut() {
+                            if !*seen || *ty == Type::Never {
+                                *ty = Type::Unit;
+                                *seen = true;
+                            } else if *ty != Type::Unit {
+                                return Err(format!(
+                                    "`break` with no value in a loop that yields {ty:?}"
+                                ));
+                            }
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -1075,7 +1129,6 @@ impl Sema {
                 Self::collect_mut_borrows(c, a, mb);
                 Self::collect_assigns(b, a, mb);
             }
-            Stmt::Loop(b) => Self::collect_assigns(b, a, mb),
             Stmt::For { start, end, body, .. } => {
                 Self::collect_mut_borrows(start, a, mb);
                 Self::collect_mut_borrows(end, a, mb);
@@ -1086,7 +1139,12 @@ impl Sema {
                     Self::collect_mut_borrows(e, a, mb);
                 }
             }
-            Stmt::Break | Stmt::Continue => {}
+            Stmt::Break(v) => {
+                if let Some(e) = v {
+                    Self::collect_mut_borrows(e, a, mb);
+                }
+            }
+            Stmt::Continue => {}
         }
     }
 
@@ -1126,7 +1184,9 @@ impl Sema {
                     Self::collect_assigns(b, a, mb);
                 }
             }
-            Expr::MatchBoundary(b, _) | Expr::Block(b) => Self::collect_assigns(b, a, mb),
+            Expr::MatchBoundary(b, _) | Expr::Block(b) | Expr::Loop(b, _, _) => {
+                Self::collect_assigns(b, a, mb)
+            }
             Expr::Index(base, idx) => {
                 Self::collect_mut_borrows(base, a, mb);
                 Self::collect_mut_borrows(idx, a, mb);
@@ -1434,16 +1494,91 @@ impl Sema {
                         Ok(ty)
                     }
                     None => {
-                        if tt != Type::Unit && !total {
+                        // A then-branch that diverges (`!`) never falls through,
+                        // so the `if` can only complete through the implicit
+                        // else and its type is `()`. rustc accepts
+                        // `if c { loop {} }` and `if c { return 1; }` for this
+                        // reason.
+                        if tt != Type::Unit && tt != Type::Never && !total {
                             return Err(format!(
                                 "`if` without `else` must evaluate to `()`, but the branch is {tt:?}"
                             ));
                         }
                         // No else: the then branch may not run.
                         Self::init_restore(scope, &init_before);
-                        Ok(tt)
+                        Ok(if tt == Type::Never { Type::Unit } else { tt })
                     }
                 }
+            }
+            Expr::Loop(body, slot, lty) => {
+                // A `loop` in value position yields the type of its `break`s.
+                // Track definite initialization only from a `break`: the body
+                // runs at least once, but the value flows out through the
+                // `break`, so nothing the body initializes is guaranteed after
+                // the loop unless a `break` guarantees it too. Keep it simple and
+                // restore the entry state, exactly as for `while`/`for`.
+                let init_before = Self::init_snapshot(scope);
+                self.loop_depth += 1;
+                self.loop_stack.push(LoopCtx::Valued { ty: Type::Unit, seen: false });
+                let body_ty = self.check_block(body, scope)?;
+                let ctx = self.loop_stack.pop().unwrap();
+                self.loop_depth -= 1;
+                Self::init_restore(scope, &init_before);
+                // The body's value is discarded: only `break value` reaches the
+                // loop's result. A body that can complete must therefore be
+                // `()`, unless it is unreachable (a `!`-typed body, e.g. a
+                // trailing `return`).
+                if !block_diverges(body) && body_ty != Type::Unit {
+                    return Err(format!(
+                        "`loop` body must evaluate to `()`, but it is {body_ty:?}"
+                    ));
+                }
+                // `!` unifies with anything: a `break` whose value never
+                // materialises must not pin the loop's type, so upgrade `!` to
+                // the first real type that shows up and ignore later `!`s.
+                let ty = match ctx {
+                    LoopCtx::Valued { ty, seen: true } => ty,
+                    // No `break value`: the loop is `!` when no `break` can
+                    // leave it (it never finishes), otherwise `()`.
+                    _ => {
+                        if block_has_break(body) {
+                            Type::Unit
+                        } else {
+                            Type::Never
+                        }
+                    }
+                };
+                // A loop that yields a value needs a slot to carry it out; a
+                // unit/`!` loop needs none, and neither does a `loop` used as a
+                // statement (the parser marks that with slot `-2`), whose value
+                // is discarded.
+                let discard = *slot == -2;
+                if discard && ty != Type::Unit && ty != Type::Never {
+                    // A `loop` in statement position is typed as `()`, so a
+                    // `break value` is rejected exactly as rustc does (E0308):
+                    // the break's value is checked against the loop's `()`.
+                    return Err(format!(
+                        "`break` with a value in a `loop` used as a statement \
+                         (expected `()`, found {ty:?})"
+                    ));
+                }
+                let result = if discard { Type::Unit } else { ty };
+                // A value-yielding loop carries its result in a hidden slot; an
+                // aggregate is stored as its own words, so it occupies one slot
+                // per word.
+                let words = if result == Type::Unit || result == Type::Never {
+                    0
+                } else if result.is_aggregate() {
+                    (result.size() / 8).max(1)
+                } else {
+                    1
+                };
+                *slot = if words == 0 { -1 } else { self.alloc_slots(words as i32) };
+                // Record the loop's own type so codegen can report it to the
+                // loop's consumer (a `!` loop reports `Unit`, like any other
+                // diverging expression).
+                *lty = if result == Type::Never { Type::Unit } else { result.clone() };
+                Ok(result)
             }
             // The start of a desugared `match`. It is transparent: check the
             // chain inside as an ordinary expression, but clear any inherited
@@ -1988,12 +2123,12 @@ fn block_diverges(b: &Block) -> bool {
 fn stmt_diverges(s: &Stmt) -> bool {
     match s {
         Stmt::Return(_) => true,
-        // Only reachable inside a loop, so it never ends a function body, but
-        // treating it as diverging keeps the walk total.
-        Stmt::Break | Stmt::Continue => true,
-        // `loop { .. }` diverges unless some `break` can leave it. A `while` or
-        // `for` may run zero times, so it never diverges.
-        Stmt::Loop(body) => !block_has_break(body),
+        // `break`/`continue` diverge (they never reach the following statement),
+        // and a `break` is only reachable inside a loop, so it never ends a
+        // function body; treating both as diverging keeps the walk total.
+        Stmt::Break(_) | Stmt::Continue => true,
+        // A `loop` expression diverges when no `break` can leave it. A `while`
+        // or `for` may run zero times, so it never diverges.
         Stmt::Expr(e) => expr_diverges(e),
         // A `let`/assignment whose initialiser diverges never completes, so the
         // following statements are unreachable.
@@ -2013,10 +2148,10 @@ fn block_has_break(b: &Block) -> bool {
 
 fn stmt_has_break(s: &Stmt) -> bool {
     match s {
-        Stmt::Break => true,
-        // A `while`/`loop`/`for` body's `break`s belong to that loop, not the
+        Stmt::Break(_) => true,
+        // A `while`/`for` body's `break`s belong to that loop, not the
         // enclosing one, so the walk does not descend into it.
-        Stmt::While(..) | Stmt::Loop(..) | Stmt::For { .. } => false,
+        Stmt::While(..) | Stmt::For { .. } => false,
         Stmt::Expr(e) => expr_has_break(e),
         Stmt::Let { init: Some(e), .. } => expr_has_break(e),
         Stmt::Assign { value, .. } => expr_has_break(value),
@@ -2028,6 +2163,9 @@ fn expr_has_break(e: &Expr) -> bool {
     match e {
         Expr::Block(b) => block_has_break(b),
         Expr::MatchBoundary(b, _) => block_has_break(b),
+        // A nested `loop`/`while`/`for` captures its own `break`s, so the walk
+        // does not descend into it.
+        Expr::Loop(..) => false,
         Expr::If(_, t, els) => {
             block_has_break(t) || els.as_ref().map_or(false, |b| block_has_break(b))
         }
@@ -2039,6 +2177,8 @@ fn expr_diverges(e: &Expr) -> bool {
     match e {
         Expr::Block(b) => block_diverges(b),
         Expr::MatchBoundary(b, _) => block_diverges(b),
+        // A `loop` diverges when no `break` can leave it.
+        Expr::Loop(body, _, _) => !block_has_break(body),
         // Both arms must diverge for the `if` to diverge.
         Expr::If(_, t, els) => {
             block_diverges(t) && els.as_ref().map_or(false, |b| block_diverges(b))

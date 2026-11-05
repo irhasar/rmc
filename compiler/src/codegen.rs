@@ -29,7 +29,10 @@ pub struct Codegen {
     max_spill: i32,
     str_id: u32,
     strings: Vec<(String, String)>, // (label, bytes)
-    loops: Vec<(String, String)>,   // (continue_label, break_label)
+    /// (continue_label, break_label, result_slot). `result_slot >= 0`
+    /// for a value-yielding `loop`, whose `break value` stores into it before
+    /// jumping to `break_label`; the loop loads it after `break_label`.
+    loops: Vec<(String, String, i32)>,
     epilogue: String,
     /// Slot -> callee-saved register for locals promoted out of memory in the
     /// function currently being generated. Empty means every local is in memory.
@@ -734,7 +737,6 @@ impl Codegen {
                 Self::count_expr(c, counts, mem, copied, true, let_tmps);
                 Self::count_block(b, counts, mem, copied, true, let_tmps);
             }
-            Stmt::Loop(b) => Self::count_block(b, counts, mem, copied, true, let_tmps),
             Stmt::For { start, end, body, var_slot, end_slot, .. } => {
                 Self::count_expr(start, counts, mem, copied, true, let_tmps);
                 Self::count_expr(end, counts, mem, copied, true, let_tmps);
@@ -754,7 +756,12 @@ impl Codegen {
                     Self::count_expr(e, counts, mem, copied, true, let_tmps);
                 }
             }
-            Stmt::Break | Stmt::Continue => {}
+            Stmt::Break(v) => {
+                if let Some(e) = v {
+                    Self::count_expr(e, counts, mem, copied, true, let_tmps);
+                }
+            }
+            Stmt::Continue => {}
         }
     }
 
@@ -929,7 +936,9 @@ impl Codegen {
                 }
             }
             Expr::Block(b) => Self::count_block(b, counts, mem, copied, true, let_tmps),
-            Expr::MatchBoundary(b, _) => Self::count_block(b, counts, mem, copied, true, let_tmps),
+            Expr::MatchBoundary(b, _) | Expr::Loop(b, _, _) => {
+                Self::count_block(b, counts, mem, copied, true, let_tmps)
+            }
             Expr::ArrayLit(v, _) => {
                 Self::count_expr(v, counts, mem, copied, true, let_tmps)
             }
@@ -957,11 +966,31 @@ impl Codegen {
         if els.is_some() || then.tail.is_some() || then.stmts.len() != 1 {
             return None;
         }
-        let (top, end) = self.loops.last()?;
+        let (top, end, _) = self.loops.last()?;
         match &then.stmts[0] {
-            Stmt::Break => Some(end.clone()),
+            Stmt::Break(None) => Some(end.clone()),
             Stmt::Continue => Some(top.clone()),
             _ => None,
+        }
+    }
+
+    /// Generate a `loop` in value position. The body repeats until a `break`
+    /// jumps to `end`. When `slot >= 0` the loop yields a value: a `break value`
+    /// stores into the slot before jumping, and `end` is followed by a load of
+    /// that slot so the value is in `%rax`. A unit/`!` loop (`slot < 0`) needs
+    /// neither.
+    fn gen_loop_expr(&mut self, body: &Block, slot: i32) {
+        let top = self.new_label();
+        let end = self.new_label();
+        self.loops.push((top.clone(), end.clone(), slot));
+        self.raw("\t.p2align 4");
+        self.raw(&format!("{top}:"));
+        self.gen_block(body);
+        self.line(&format!("jmp {top}"));
+        self.raw(&format!("{end}:"));
+        self.loops.pop();
+        if slot >= 0 {
+            self.gen_var_operand(slot, "%rax");
         }
     }
 
@@ -1196,7 +1225,7 @@ impl Codegen {
                 let body_l = self.new_label();
                 let test_l = self.new_label();
                 let end = self.new_label();
-                self.loops.push((test_l.clone(), end.clone()));
+                self.loops.push((test_l.clone(), end.clone(), -1));
                 self.line(&format!("jmp {test_l}"));
                 // Align the loop body to a 16-byte fetch boundary so its
                 // layout does not shift with unrelated code-size changes.
@@ -1205,17 +1234,6 @@ impl Codegen {
                 self.gen_block(body);
                 self.raw(&format!("{test_l}:"));
                 self.gen_branch_true(cond, &body_l);
-                self.raw(&format!("{end}:"));
-                self.loops.pop();
-            }
-            Stmt::Loop(body) => {
-                let top = self.new_label();
-                let end = self.new_label();
-                self.loops.push((top.clone(), end.clone()));
-                self.raw("\t.p2align 4");
-                self.raw(&format!("{top}:"));
-                self.gen_block(body);
-                self.line(&format!("jmp {top}"));
                 self.raw(&format!("{end}:"));
                 self.loops.pop();
             }
@@ -1242,7 +1260,7 @@ impl Codegen {
                 let exit = self.new_label();
                 // `continue` must still run the increment, so it targets `cont`;
                 // `break` leaves past the guard.
-                self.loops.push((cont.clone(), exit.clone()));
+                self.loops.push((cont.clone(), exit.clone(), -1));
                 self.line(&format!("jmp {guard}"));
                 self.raw("\t.p2align 4");
                 self.raw(&format!("{top}:"));
@@ -1276,8 +1294,13 @@ impl Codegen {
                 }
                 self.line(&format!("jmp {}", self.epilogue));
             }
-            Stmt::Break => {
-                let end = self.loops.last().unwrap().1.clone();
+            Stmt::Break(v) => {
+                let (_, end, slot) = self.loops.last().unwrap().clone();
+                if let Some(e) = v {
+                    // Store the break value into the loop's result slot, then
+                    // leave; the loop expression loads it after `end`.
+                    self.gen_expr_to_slot(e, slot);
+                }
                 self.line(&format!("jmp {end}"));
             }
             Stmt::Continue => {
@@ -1614,6 +1637,7 @@ impl Codegen {
             Expr::Call { .. }
             | Expr::Block(_)
             | Expr::MatchBoundary(_, _)
+            | Expr::Loop(..)
             | Expr::If(..)
             | Expr::StructLit { .. }
             | Expr::EnumCtor { .. } => {
@@ -1926,6 +1950,10 @@ impl Codegen {
                 self.raw(&format!("{end_l}:"));
                 if tt == Type::Unit { et } else { tt }
             }
+            Expr::Loop(body, slot, lty) => {
+                self.gen_loop_expr(body, *slot);
+                lty.clone()
+            }
             Expr::Block(b) => self.gen_block(b),
             Expr::MatchBoundary(b, _) => self.gen_block(b),
             Expr::ArrayLit(v, n) => {
@@ -2057,13 +2085,6 @@ impl Codegen {
                     self.line(&format!("mov %rax, {dst}"));
                 }
             }
-        }
-    }
-
-    fn store_slot(&mut self, slot: i32) {
-        match self.reg_of(slot) {
-            Some(r) => self.line(&format!("mov %rax, {r}")),
-            None => self.line(&format!("mov %rax, {}(%rbp)", self.off(slot))),
         }
     }
 
@@ -2219,7 +2240,7 @@ impl Codegen {
                     || self.block_uses_reg(t, r)
                     || els.as_ref().map_or(false, |b| self.block_uses_reg(b, r))
             }
-            Expr::Block(b) => self.block_uses_reg(b, r),
+            Expr::Block(b) | Expr::Loop(b, _, _) => self.block_uses_reg(b, r),
             Expr::MatchBoundary(b, _) => self.block_uses_reg(b, r),
             Expr::ArrayList(_) | Expr::MethodCall { .. } => {
                 unreachable!("sema rewrites ArrayList and MethodCall")
@@ -2240,14 +2261,14 @@ impl Codegen {
             }
             Stmt::Expr(e) => self.uses_reg(e, r),
             Stmt::While(c, b) => self.uses_reg(c, r) || self.block_uses_reg(b, r),
-            Stmt::Loop(b) => self.block_uses_reg(b, r),
             Stmt::For { start, end, body, .. } => {
                 self.uses_reg(start, r)
                     || self.uses_reg(end, r)
                     || self.block_uses_reg(body, r)
             }
             Stmt::Return(v) => v.as_ref().map_or(false, |e| self.uses_reg(e, r)),
-            Stmt::Break | Stmt::Continue => false,
+            Stmt::Break(v) => v.as_ref().map_or(false, |e| self.uses_reg(e, r)),
+            Stmt::Continue => false,
         }
     }
 
@@ -3045,7 +3066,7 @@ impl Codegen {
                     || Self::block_has_call(t)
                     || els.as_ref().map_or(false, Self::block_has_call)
             }
-            Expr::Block(b) => Self::block_has_call(b),
+            Expr::Block(b) | Expr::Loop(b, _, _) => Self::block_has_call(b),
             Expr::MatchBoundary(b, _) => Self::block_has_call(b),
             _ => false,
         }
@@ -3064,7 +3085,7 @@ impl Codegen {
     /// select it.
     fn clobbers_arg_regs(e: &Expr) -> bool {
         match e {
-            Expr::Block(b) => Self::block_clobbers(b),
+            Expr::Block(b) | Expr::Loop(b, _, _) => Self::block_clobbers(b),
             Expr::MatchBoundary(b, _) => Self::block_clobbers(b),
             Expr::If(_, t, els) => {
                 Self::block_clobbers(t)
@@ -3095,7 +3116,9 @@ impl Codegen {
     fn value_copies_aggregate(e: &Expr) -> bool {
         match e {
             Expr::Var { ty, .. } | Expr::Field { ty, .. } => ty.is_aggregate(),
-            Expr::Block(_) | Expr::MatchBoundary(_, _) | Expr::If(..) => Self::clobbers_arg_regs(e),
+            Expr::Block(_) | Expr::MatchBoundary(_, _) | Expr::Loop(..) | Expr::If(..) => {
+                Self::clobbers_arg_regs(e)
+            }
             _ => false,
         }
     }
@@ -3112,8 +3135,9 @@ impl Codegen {
                 Self::contains_call(start) || Self::contains_call(end) || Self::block_has_call(body)
             }
             // A loop body might call on some iteration; be conservative.
-            Stmt::While(..) | Stmt::Loop(..) => true,
-            Stmt::Break | Stmt::Continue => false,
+            Stmt::While(..) => true,
+            Stmt::Break(v) => v.as_ref().map_or(false, Self::contains_call),
+            Stmt::Continue => false,
         }
     }
 

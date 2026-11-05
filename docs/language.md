@@ -174,7 +174,9 @@ while let PAT = expr { ... }  // re-tests expr each iteration; stops on no match
 for i in 0..10 { ... }   // i64 range, end exclusive
 for i in 0..=10 { ... }  // i64 range, end inclusive
 loop { ... }
+loop { ... break v; }    // `loop` is an expression: `break v` yields `v`
 break;
+break v;                 // only legal inside a `loop` (rustc's E0571 otherwise)
 continue;
 return expr;             // `;` may be omitted at the end of a block
 ```
@@ -203,6 +205,13 @@ unifies with any other branch's type, as Rust's `!` does, so
 `if c { 1 } else { return 2 }` is accepted. The trailing `;` after
 `return`/`break`/`continue` may be omitted when it is the last thing in a block,
 since those diverge and no expression can follow them.
+
+`loop` is an expression: `break v` makes the loop itself evaluate to `v`, so
+`let x: i64 = loop { ... break 5; };` is accepted. Every `break` in the loop
+must agree on one type, with `!` unifying with anything; a `loop` with no
+reachable `break` is `!` and so unifies with any context. `break v` is only
+legal inside a `loop` (not a `while`/`for`), matching rustc's `E0571`, and a
+`loop` used as a statement is typed `()`, so `break v` there is an error.
 
 ## Overflow
 

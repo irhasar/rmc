@@ -137,6 +137,20 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 
 ## Things that are easy to get wrong
 
+- **`loop` is an expression, and codegen must report its own type, not `I64`.**
+  `loop { .. }` parses to `Expr::Loop(body, slot, ty)`; a `loop` in statement
+  position is a `Stmt::Expr` around it with `slot == -2`, so its value is
+  discarded and it is typed `()`. Sema fills `ty` with the type of the loop's
+  `break`s (or `Unit` for a `!` loop, matching every other diverging
+  expression), and codegen returns that `ty`. Hardcoding `Type::I64` there
+  compiles but silently mis-types a loop that yields a `bool` (so `!loop { break
+  true }` becomes a bitwise `not` instead of a logical one) and a loop that
+  yields an aggregate (so an enum-constructor argument or `value_copies_aggregate`
+  takes the wrong path). A value-yielding loop carries its result in a hidden
+  slot sized by the result's word count (`slot >= 0`); `break value` stores into
+  it and the loop loads it after `break_label`. The slot's `-1`/`-2` sentinels
+  are load-bearing: `-1` means "no value to carry", `-2` means "statement
+  position, value discarded".
 - **Do not weight `promote`'s mention count by loop depth.** It looks obviously
   right — a variable inside a loop runs many more times than one in straight-line
   code — but it loses: weights 2, 3, 4 and 8 all moved mandel from ~95 ms to
