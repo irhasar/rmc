@@ -49,6 +49,7 @@ python3 tools/fuzz.py --mode ref --n 500 --seed 1
 python3 tools/fuzz.py --mode update --n 500 --seed 1
 python3 tools/fuzz.py --mode letdestr --n 500 --seed 1
 python3 tools/fuzz.py --mode fordestr --n 500 --seed 1
+python3 tools/fuzz.py --mode nestpat --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 ```
 
@@ -101,9 +102,18 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   each struct's field names before the real parse (`struct_fields`), so a field
   name is checked even for `i: _` (which emits no read) and a later-declared
   struct still matches; a field the struct lacks, or one bound twice, is a parse
-  error. A struct pattern is a catch-all arm, so it joins `pat_irrefutable`, and
-  `or_cond` treats it as `true` (a *binding* struct pattern in an or-pattern is
-  rejected like any other binding alternative).
+  error. A field's value may be a *nested* struct sub-pattern (`a: I { x }`), to
+  any depth: `parse_nested_struct_pat` recognises `Ident {` after the `:` and
+  recurses into `parse_struct_pat_fields` (the field-list loop, factored out of
+  `parse_pattern_primary`), which checks the inner struct against `struct_fields`
+  too. `struct_pat_binds` recurses with the field read as the sub-scrutinee, so a
+  nested name expands to an ordinary chain of field reads (`s.a.x`) and sema and
+  codegen gain no case; `mut` is rejected on a sub-pattern, since it only applies
+  to a binding. `first_bound_name` walks the pattern (through struct and or
+  alternatives) to keep rejecting a binding in an or-pattern (rustc's E0408) one
+  level down. A struct pattern is a catch-all arm, so it joins
+  `pat_irrefutable`, and `or_cond` treats it as `true` (a *binding* struct
+  pattern in an or-pattern is rejected like any other binding alternative).
   *`let` destructuring* `let S { f, g: h, .. } = e;` reuses the same parser
   (`parse_pattern_primary`) and the same `struct_pat_binds` helper. Because the
   bindings must outlive the statement, the expansion cannot be a nested block:
@@ -559,8 +569,10 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   destructuring expansion) in place of the single `let`, so the element is read
   into a hidden temporary and the fields are bound from it; the element type is
   `S`, so this is the same read-through as `let`. The pattern must be
-  irrefutable: a binding, `_`, or a struct pattern (a refutable one like an enum
-  variant is rejected rather than mis-bound). `for x in
+  irrefutable: a binding, `_`, or a struct pattern — including a nested
+  sub-pattern, which `struct_pat_binds` recurses into like the `let`/`match`
+  paths (a refutable pattern like an enum variant is rejected rather than
+  mis-bound). `for x in
   &arr` is rejected — Rust iterates a reference by reference (`x: &i64`), so
   accepting it would silently mistype `x`. `parse_for` also checks the pattern
   name against the constant table *before* `parse_pattern`, because a bare
@@ -1265,7 +1277,13 @@ binding, payload-binding, `else if let` chain and a side-effecting scrutinee),
 and a non-trivial
 side-effecting scrutinee (a call) tested against several arms — the last is
 what exercises `desugar_match`'s temporary, which must evaluate the scrutinee
-exactly once (re-evaluating it per arm repeats a side effect). It compares
+exactly once (re-evaluating it per arm repeats a side effect). `nestpat` mode
+builds nested struct sub-patterns (`S { a: A { m: B { .. }, n }, b }`) through a
+chain of distinct struct types, so the pattern nests several levels deep, and
+emits each pattern in `let`, `match` (through a reference), `if let` and `for`.
+The expansion is a chain of field reads, so a wrong field order or a missing
+intermediate read shows up as a wrong final value; `letdestr`/`fordestr` only
+reach one level, so a deeper sub-pattern had no randomised coverage. It compares
 stdout and exit status against `rustc -O`, and it recompiles each program with
 every optimiser pass off in turn (`--no-inline`, `--no-licm`, `--no-tco`, all
 three), the same matrix the corpus suite uses — a pass-specific bug is otherwise

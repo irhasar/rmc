@@ -485,6 +485,116 @@ fn a_binding_struct_pattern_in_an_or_pattern_is_rejected() {
 }
 
 #[test]
+fn a_nested_struct_sub_pattern_binds_through_the_field() {
+    // `S { a: I { x, y }, b }` reads `s.a` then binds `x` and `y` from it, the
+    // same chain of field reads the explicit form writes out.
+    let src = "struct I { x: i64, y: i64 } struct S { a: I, b: i64 } \
+               fn main() -> i64 { let s: S = S { a: I { x: 3, y: 4 }, b: 5 }; \
+               let S { a: I { x, y }, b } = s; return x * 100 + y * 10 + b; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_nested_struct_sub_pattern_compiles_like_chained_field_reads() {
+    let nested = "struct I { x: i64 } struct S { a: I } \
+        fn f(s: &S) -> i64 { let S { a: I { x } } = s; return x + 1; }";
+    let reads = "struct I { x: i64 } struct S { a: I } \
+        fn f(s: &S) -> i64 { let x: i64 = s.a.x; return x + 1; }";
+    assert_eq!(asm(nested), asm(reads));
+}
+
+#[test]
+fn a_nested_struct_sub_pattern_may_rename_and_ignore() {
+    let src = "struct I { x: i64, y: i64 } struct S { a: I } \
+               fn main() -> i64 { let s: S = S { a: I { x: 1, y: 2 } }; \
+               let S { a: I { x: v, y: _ } } = s; return v; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_nested_struct_sub_pattern_may_use_rest() {
+    let src = "struct I { x: i64, y: i64, z: i64 } struct S { a: I } \
+               fn main() -> i64 { let s: S = S { a: I { x: 1, y: 2, z: 3 } }; \
+               let S { a: I { x, .. } } = s; return x; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_nested_struct_sub_pattern_may_bind_nothing() {
+    let src = "struct I { x: i64 } struct S { a: I } \
+               fn main() -> i64 { let s: S = S { a: I { x: 1 } }; \
+               let S { a: I { .. } } = s; return 0; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_nested_struct_sub_pattern_works_in_match_and_through_a_reference() {
+    let src = "struct I { x: i64, y: i64 } struct S { a: I, b: i64 } \
+               fn main() -> i64 { let s: S = S { a: I { x: 7, y: 8 }, b: 9 }; \
+               let r: &S = &s; \
+               match r { S { a: I { x, y }, b } => { return x * 100 + y * 10 + b; } } }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_nested_struct_sub_pattern_may_be_deep() {
+    let src = "struct L3 { n: i64 } struct L2 { c: L3 } struct L1 { b: L2 } struct S { a: L1 } \
+               fn main() -> i64 { let s: S = S { a: L1 { b: L2 { c: L3 { n: 42 } } } }; \
+               let S { a: L1 { b: L2 { c: L3 { n } } } } = s; return n; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_nested_struct_sub_pattern_with_an_unknown_struct_is_rejected() {
+    let err = compile_to_asm(
+        "struct I { x: i64 } struct S { a: I } \
+         fn main() -> i64 { let s: S = S { a: I { x: 1 } }; \
+         let S { a: Q { x } } = s; return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("unknown struct `Q`"), "got: {err}");
+}
+
+#[test]
+fn a_nested_struct_sub_pattern_with_an_unknown_field_is_rejected() {
+    let err = compile_to_asm(
+        "struct I { x: i64 } struct S { a: I } \
+         fn main() -> i64 { let s: S = S { a: I { x: 1 } }; \
+         let S { a: I { z } } = s; return z; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("has no field `z`"), "got: {err}");
+}
+
+#[test]
+fn a_mut_on_a_nested_struct_sub_pattern_is_rejected() {
+    // `mut` attaches to a binding, not to a nested pattern, as in rustc.
+    let err = compile_to_asm(
+        "struct I { x: i64 } struct S { a: I } \
+         fn main() -> i64 { let s: S = S { a: I { x: 1 } }; \
+         let S { a: mut I { x } } = s; return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("`mut` is not allowed on a nested struct pattern"), "got: {err}");
+}
+
+#[test]
+fn a_nested_struct_sub_pattern_binding_in_an_or_pattern_is_rejected() {
+    // A nested binding still cannot appear in an or-pattern alternative.
+    let err = compile_to_asm(
+        "struct I { x: i64 } struct S { a: I } \
+         fn main() -> i64 { let s: S = S { a: I { x: 1 } }; \
+         match s { S { a: I { x } } | S { a: I { x: y } } => { return x + y; } } }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("not bound in all patterns"), "got: {err}");
+}
+
+#[test]
 fn a_struct_pattern_works_in_while_let() {
     let src = "struct P { x: i64, y: i64 } \
                fn main() -> i64 { let mut p: P = P { x: 1, y: 2 }; \

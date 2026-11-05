@@ -1559,13 +1559,7 @@ impl Parser {
         // E0408); rmc has no name-consistency check, so it rejects a binding in
         // an or-pattern outright rather than mis-bind it. A struct pattern may
         // appear as an irrefutable alternative only when it binds nothing.
-        if let Some(n) = alts.iter().find_map(|a| match a {
-            Pat::Bind(n) => Some(n.clone()),
-            Pat::Struct(_, fields) => {
-                fields.iter().find_map(|(_, b)| b.as_ref().map(|(_, n)| n.clone()))
-            }
-            _ => None,
-        }) {
+        if let Some(n) = alts.iter().find_map(Self::first_bound_name) {
             return Err(format!(
                 "at byte {}: variable `{n}` is not bound in all patterns of the or-pattern",
                 self.pos()
@@ -1658,71 +1652,7 @@ impl Parser {
                             ))
                         }
                     };
-                    let mut fields: Vec<(String, Option<(bool, String)>)> = Vec::new();
-                    while self.peek() != Some(&Tok::RBrace) {
-                        if self.peek().is_none() {
-                            return Err(format!(
-                                "at byte {}: unexpected end of input in struct pattern",
-                                self.pos()
-                            ));
-                        }
-                        // `..` ignores the remaining fields; nothing may follow it.
-                        if self.eat(&Tok::DotDot) {
-                            break;
-                        }
-                        // `mut` may precede a shorthand field (`S { mut f }`),
-                        // but not the field name of a renamed one.
-                        let leading_mut = self.eat(&Tok::Mut);
-                        let fname = self.expect_ident()?;
-                        // A field the struct does not have is an error here, not
-                        // a silent no-op: a `f: _` field emits no read for sema
-                        // to catch, and a wrong name is a typo either way.
-                        if !known.contains(&fname) {
-                            return Err(format!(
-                                "at byte {}: struct `{n}` has no field `{fname}`",
-                                self.pos()
-                            ));
-                        }
-                        if fields.iter().any(|(f, _)| *f == fname) {
-                            return Err(format!(
-                                "at byte {}: field `{fname}` bound twice in struct pattern",
-                                self.pos()
-                            ));
-                        }
-                        let bind = if self.eat(&Tok::Colon) {
-                            // `f: mut b` marks just this binding mutable, as in
-                            // rustc. A leading `mut` before the field name is
-                            // only legal on a shorthand field.
-                            if leading_mut {
-                                return Err(format!(
-                                    "at byte {}: `mut` must be attached to the binding, as `{fname}: mut b`",
-                                    self.pos()
-                                ));
-                            }
-                            let m = self.eat(&Tok::Mut);
-                            if self.peek() == Some(&Tok::Underscore) {
-                                self.i += 1;
-                                if m {
-                                    return Err(format!(
-                                        "at byte {}: `mut` is not allowed on `_`",
-                                        self.pos()
-                                    ));
-                                }
-                                None
-                            } else {
-                                Some((m, self.expect_ident()?))
-                            }
-                        } else {
-                            // Shorthand: `S { f }` binds `f`, or `S { mut f }`
-                            // binds a mutable `f`.
-                            Some((leading_mut, fname.clone()))
-                        };
-                        fields.push((fname, bind));
-                        if !self.eat(&Tok::Comma) {
-                            break;
-                        }
-                    }
-                    self.expect(Tok::RBrace)?;
+                    let fields = self.parse_struct_pat_fields(&n, &known)?;
                     Ok(Pat::Struct(n, fields))
                 } else if let Some(v) = self.consts.get(&n) {
                     // A bare name that names a constant is that constant's
@@ -1742,6 +1672,125 @@ impl Parser {
                 other.map(|t| t.describe()).unwrap_or_else(|| "end of input".into())
             )),
         }
+    }
+
+    /// The field list of a struct pattern, `{ f, g: h, i: _, .. }`, with the
+    /// opening `{` already consumed and the closing `}` consumed here. `n` is
+    /// the struct name (for error messages) and `known` its field set, from the
+    /// prescan. A field's value may be a binding (`f`, `f: b`, `f: mut b`) or a
+    /// nested struct pattern (`f: I { a }`); the latter is stored as a
+    /// `Pat::Struct` with `mut` cleared, since `mut` is only legal on a binding.
+    fn parse_struct_pat_fields(
+        &mut self,
+        n: &str,
+        known: &std::collections::HashSet<String>,
+    ) -> PResult<Vec<FieldPat>> {
+        let mut fields: Vec<FieldPat> = Vec::new();
+        while self.peek() != Some(&Tok::RBrace) {
+            if self.peek().is_none() {
+                return Err(format!(
+                    "at byte {}: unexpected end of input in struct pattern",
+                    self.pos()
+                ));
+            }
+            // `..` ignores the remaining fields; nothing may follow it.
+            if self.eat(&Tok::DotDot) {
+                break;
+            }
+            // `mut` may precede a shorthand field (`S { mut f }`), but not the
+            // field name of a renamed one.
+            let leading_mut = self.eat(&Tok::Mut);
+            let fname = self.expect_ident()?;
+            // A field the struct does not have is an error here, not a silent
+            // no-op: a `f: _` field emits no read for sema to catch, and a wrong
+            // name is a typo either way.
+            if !known.contains(&fname) {
+                return Err(format!(
+                    "at byte {}: struct `{n}` has no field `{fname}`",
+                    self.pos()
+                ));
+            }
+            if fields.iter().any(|(f, _)| *f == fname) {
+                return Err(format!(
+                    "at byte {}: field `{fname}` bound twice in struct pattern",
+                    self.pos()
+                ));
+            }
+            let bind = if self.eat(&Tok::Colon) {
+                // `f: mut b` marks just this binding mutable, as in rustc. A
+                // leading `mut` before the field name is only legal on a
+                // shorthand field.
+                if leading_mut {
+                    return Err(format!(
+                        "at byte {}: `mut` must be attached to the binding, as `{fname}: mut b`",
+                        self.pos()
+                    ));
+                }
+                let m = self.eat(&Tok::Mut);
+                if self.peek() == Some(&Tok::Underscore) {
+                    self.i += 1;
+                    if m {
+                        return Err(format!(
+                            "at byte {}: `mut` is not allowed on `_`",
+                            self.pos()
+                        ));
+                    }
+                    None
+                } else if let Some(inner) = self.parse_nested_struct_pat()? {
+                    // `f: I { a }` — a nested struct pattern, so `mut` (which
+                    // only applies to a binding) is rejected, as rustc rejects
+                    // `f: mut I { a }`.
+                    if m {
+                        return Err(format!(
+                            "at byte {}: `mut` is not allowed on a nested struct pattern",
+                            self.pos()
+                        ));
+                    }
+                    Some((false, inner))
+                } else {
+                    Some((m, Pat::Bind(self.expect_ident()?)))
+                }
+            } else {
+                // Shorthand: `S { f }` binds `f`, or `S { mut f }` binds a
+                // mutable `f`.
+                Some((leading_mut, Pat::Bind(fname.clone())))
+            };
+            fields.push((fname, bind));
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(Tok::RBrace)?;
+        Ok(fields)
+    }
+
+    /// A nested struct pattern after a field name and `:`, i.e. `I { .. }`. The
+    /// struct name must be in the prescan, as at the top level. Returns `None`
+    /// when the next token is not an identifier followed by `{`, so the caller
+    /// falls through to a plain binding (or a rename).
+    fn parse_nested_struct_pat(&mut self) -> PResult<Option<Pat>> {
+        let name = match self.peek().cloned() {
+            Some(Tok::Ident(name)) => name,
+            _ => return Ok(None),
+        };
+        // `Ident {` starts a nested pattern; anything else (`Ident`, `Ident,`,
+        // `Ident }`) is a binding.
+        if self.toks.get(self.i + 1).map(|t| &t.tok) != Some(&Tok::LBrace) {
+            return Ok(None);
+        }
+        let known = match self.struct_fields.get(&name) {
+            Some(f) => f.clone(),
+            None => {
+                return Err(format!(
+                    "at byte {}: unknown struct `{name}` in a pattern",
+                    self.pos()
+                ))
+            }
+        };
+        self.i += 1; // the struct name
+        self.i += 1; // the `{`
+        let fields = self.parse_struct_pat_fields(&name, &known)?;
+        Ok(Some(Pat::Struct(name, fields)))
     }
 
     /// `match scrutinee { pat => expr, ... }` on integers. It desugars to a
@@ -2031,7 +2080,7 @@ impl Parser {
     /// it is still checked.
     fn let_destructure_stmts(
         &mut self,
-        fields: Vec<(String, Option<(bool, String)>)>,
+        fields: Vec<FieldPat>,
         ty: Option<Type>,
         init: Expr,
     ) -> Vec<Stmt> {
@@ -2061,25 +2110,51 @@ impl Parser {
     /// `let` destructuring and `for` destructuring, which differ only in what
     /// they do with the result. The reads are left for sema to type and locate,
     /// so a non-struct scrutinee is a sema error naming the field and a field
-    /// may auto-deref a `&S` scrutinee. `f: _` contributes no binding.
-    fn struct_pat_binds(fields: &[(String, Option<(bool, String)>)], subj: &Expr) -> Vec<Stmt> {
-        fields
-            .iter()
-            .filter_map(|(fname, bind)| {
-                bind.as_ref().map(|(m, b)| Stmt::Let {
+    /// may auto-deref a `&S` scrutinee. `f: _` contributes no binding. A nested
+    /// sub-pattern (`f: I { a }`) recurses with the field read as its
+    /// sub-scrutinee, so the nested names become ordinary chained reads.
+    fn struct_pat_binds(fields: &[FieldPat], subj: &Expr) -> Vec<Stmt> {
+        let mut out = Vec::new();
+        for (fname, bind) in fields {
+            let (m, pat) = match bind {
+                Some(x) => x,
+                None => continue,
+            };
+            let field = Expr::Field {
+                base: Box::new(subj.clone()),
+                name: fname.clone(),
+                offset: -1,
+                ty: Type::Unit,
+            };
+            match pat {
+                Pat::Bind(b) => out.push(Stmt::Let {
                     name: b.clone(),
                     ty: None,
                     mutable: *m,
-                    init: Some(Expr::Field {
-                        base: Box::new(subj.clone()),
-                        name: fname.clone(),
-                        offset: -1,
-                        ty: Type::Unit,
-                    }),
+                    init: Some(field),
                     slot: -1,
-                })
-            })
-            .collect()
+                }),
+                Pat::Struct(_, inner) => out.extend(Self::struct_pat_binds(inner, &field)),
+                // Only a binding or a nested struct pattern is parsed here.
+                _ => unreachable!("unexpected struct sub-pattern"),
+            }
+        }
+        out
+    }
+
+    /// The first variable a pattern binds, if any. A struct pattern binds the
+    /// names of its sub-patterns; an or-pattern binds through its alternatives.
+    /// Used to reject a binding in an or-pattern (rustc's E0408), which rmc
+    /// cannot bind consistently across alternatives.
+    fn first_bound_name(p: &Pat) -> Option<String> {
+        match p {
+            Pat::Bind(n) => Some(n.clone()),
+            Pat::Struct(_, fields) => fields.iter().find_map(|(_, b)| {
+                b.as_ref().and_then(|(_, sub)| Self::first_bound_name(sub))
+            }),
+            Pat::Or(alts) => alts.iter().find_map(Self::first_bound_name),
+            _ => None,
+        }
     }
 
     fn desugar_arm(
@@ -2557,8 +2632,14 @@ enum Pat {
     /// has no test: it desugars to the field reads its bindings name (see
     /// `desugar_arm` and `let` destructuring). The struct name is resolved by
     /// sema, so it may name a struct declared later in the file.
-    Struct(String, Vec<(String, Option<(bool, String)>)>),
+    Struct(String, Vec<FieldPat>),
 }
+
+/// One field of a struct pattern: its name and what it binds. `None` is
+/// `f: _` (ignored); `Some((mut, pat))` binds the field, where `pat` is a
+/// binding (`f`/`f: b`) or a nested struct pattern (`f: I { a }`). `mut` is only
+/// meaningful on a binding, so a nested sub-pattern is stored with `false`.
+type FieldPat = (String, Option<(bool, Pat)>);
 
 /// Whether `e` syntactically contains a call, used to decide if a subscript in
 /// a compound assignment must be evaluated into a temporary.
