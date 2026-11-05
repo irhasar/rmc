@@ -17,6 +17,7 @@ struct Options {
     input: PathBuf,
     output: PathBuf,
     emit_asm: bool,
+    keep_mir: bool,
     keep_asm: bool,
     strip: bool,
     min_size: bool,
@@ -33,6 +34,7 @@ fn parse_args() -> Result<Options, String> {
     let mut input: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
     let mut emit_asm = false;
+    let mut keep_mir = false;
     let mut keep_asm = false;
     let mut strip = true;
     let mut min_size = false;
@@ -50,6 +52,7 @@ fn parse_args() -> Result<Options, String> {
                 output = Some(PathBuf::from(v));
             }
             "--emit-asm" => emit_asm = true,
+            "--keep-mir" => keep_mir = true,
             "--keep-asm" => keep_asm = true,
             "--no-strip" => strip = false,
             "--min-size" => min_size = true,
@@ -84,6 +87,7 @@ fn parse_args() -> Result<Options, String> {
         input,
         output,
         emit_asm,
+        keep_mir,
         keep_asm,
         strip,
         min_size,
@@ -105,6 +109,7 @@ fn print_help() {
          OPTIONS:\n\
          \x20   -o <path>      output binary path\n\
          \x20   --emit-asm     print generated assembly to stdout and stop\n\
+         \x20   --keep-mir     keep the MIR text next to the output (a .rs input)\n\
          \x20   --keep-asm     keep the intermediate .s file next to the output\n\
          \x20   --no-strip     keep the symbol table in the output binary\n\
          \x20   --min-size     with --binutils, also drop the section headers\n\
@@ -140,7 +145,87 @@ fn main() {
     }
 }
 
+/// Drive the rustc front end: run `rustc --emit=mir` and return the MIR text.
+/// This is the second pipeline — rustc's parser, type checker and MIR
+/// optimiser feed rmc's own x86-64 back end, so the compile is dominated by
+/// rmc's in-process assembler rather than by LLVM.
+fn front_end_mir(input: &Path) -> Result<String, String> {
+    let out = Command::new("rustc")
+        .arg("--emit=mir")
+        .arg("-o")
+        .arg("-")
+        .arg("-O")
+        .arg("-C")
+        .arg("panic=abort")
+        .arg("--crate-type=bin")
+        .arg("--edition")
+        .arg("2021")
+        .arg(input)
+        .output()
+        .map_err(|e| format!("failed to run `rustc`: {e}"))?;
+    if !out.status.success() {
+        let _ = std::io::stderr().write_all(&out.stderr);
+        return Err("rustc front end failed".into());
+    }
+    let mir = out.stdout;
+    if mir.is_empty() {
+        return Err("rustc emitted no MIR".into());
+    }
+    Ok(String::from_utf8_lossy(&mir).into_owned())
+}
+
+/// Compile a `.rs` input through the rustc-MIR front end and the rmc back end.
+fn run_mir_pipeline(opts: &Options) -> Result<(), String> {
+    let mir = front_end_mir(&opts.input)?;
+    if opts.keep_mir {
+        let mir_path = opts.output.with_extension("mir");
+        std::fs::write(&mir_path, &mir)
+            .map_err(|e| format!("cannot write {}: {e}", mir_path.display()))?;
+    }
+    let mut prog = rmc::mir::parse(&mir)?;
+    rmc::mir::tco(&mut prog, opts.overflow_checks);
+    rmc::mir::inline_calls(&mut prog);
+    rmc::mir::coalesce_call_results(&mut prog);
+    rmc::mir::merge_blocks(&mut prog);
+    prog.copy_propagate();
+    rmc::mir::licm(&mut prog);
+    rmc::mir::fold_accumulators(&mut prog);
+    rmc::mir::jump_thread(&mut prog);
+    rmc::mir::rotate_loops(&mut prog);
+    rmc::mir::layout_blocks(&mut prog);
+    let mir_opts = rmc::mir_codegen::Options {
+        overflow_checks: opts.overflow_checks,
+        promote: true,
+        align_loops: true,
+    };
+    let asm = rmc::compile_mir_to_asm(&prog, &mir_opts)?;
+
+    if opts.emit_asm {
+        print!("{asm}");
+        return Ok(());
+    }
+    let bytes = rmc::elf::assemble(&asm)?;
+    std::fs::write(&opts.output, &bytes)
+        .map_err(|e| format!("cannot write {}: {e}", opts.output.display()))?;
+    if opts.keep_asm {
+        std::fs::write(opts.output.with_extension("s"), &asm)
+            .map_err(|e| format!("cannot write assembly: {e}"))?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&opts.output, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("cannot chmod {}: {e}", opts.output.display()))?;
+    }
+    Ok(())
+}
+
 fn run(opts: Options) -> Result<(), String> {
+    // A `.rs` input selects the rustc-front-end pipeline; anything else is
+    // rmc's own source language, compiled end to end.
+    if opts.input.extension().and_then(|e| e.to_str()) == Some("rs") {
+        return run_mir_pipeline(&opts);
+    }
     let src = std::fs::read_to_string(&opts.input)
         .map_err(|e| format!("cannot read {}: {e}", opts.input.display()))?;
 

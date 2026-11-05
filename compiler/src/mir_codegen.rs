@@ -2094,6 +2094,19 @@ fn fuse_imm(body: &str) -> String {
         if let Some((k, t)) = mov_imm(lines[i]) {
             if SCRATCH.contains(&t) {
                 if let Some((op, a, d)) = binop_reg(lines[i + 1]) {
+                    // `mov $k, %t; imul %s, %t` for a small `k` is a scaled
+                    // `lea`, which has one-cycle latency instead of `imul`'s
+                    // three. A loop-carried multiply by a small constant sits on
+                    // the critical path, so this is worth two cycles an
+                    // iteration even though it is the same instruction count.
+                    if op == "imul" && d == t && a != t {
+                        if let Some(lea) = scaled_lea(k, a, t) {
+                            out.push_str(&lea);
+                            out.push('\n');
+                            i += 2;
+                            continue;
+                        }
+                    }
                     // `mov $k, %t; add %s, %t` -> `lea k(%s), %t`. The result
                     // stays in `%t`, so the fold does not care whether `%t` is
                     // read later; only `%s` has to be a register.
@@ -2140,6 +2153,24 @@ fn fuse_imm(body: &str) -> String {
         i += 1;
     }
     out
+}
+
+/// `lea` for `k * s` when `k` is small enough for an x86 scale factor.
+///
+/// The scale factor is 1, 2, 4 or 8, so only the multipliers expressible as
+/// `(1 + scale) * s` or `scale * s` qualify: 2, 3, 4, 5, 8 and 9. Anything else
+/// has to go through `imul`.
+fn scaled_lea(k: i64, s: &str, t: &str) -> Option<String> {
+    let body = match k {
+        2 => format!("({s},{s},1)"),
+        3 => format!("({s},{s},2)"),
+        4 => format!("0(,{s},4)"),
+        5 => format!("({s},{s},4)"),
+        8 => format!("0(,{s},8)"),
+        9 => format!("({s},{s},8)"),
+        _ => return None,
+    };
+    Some(format!("  lea {body}, {t}"))
 }
 
 /// `mov $k, %t` (or `movabs $k, %t`), returning the value and destination.
