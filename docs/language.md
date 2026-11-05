@@ -160,7 +160,16 @@ the value by pointer (it is an aggregate) and a `&self` method takes its
 address.
 A pattern that matches a payload variant must bind its fields, `Opt::Some(v)`;
 matching it bare (`Opt::Some`) is an error, because there is no way to name the
-value. A payload variant is not comparable with `==` and cannot be cast with
+value. An argument may be a wildcard (`Opt::Some(_)`), a `mut` binding
+(`Opt::Some(mut v)`), a nested struct or array sub-pattern (`E::A(S { x })`,
+`E::A([a, b])`), or a trailing `..` that ignores the remaining fields
+(`E::A(x, ..)`, `E::A(..)`). Each argument is the payload read at its field
+index, fed to the same sub-pattern expansion a `let` destructuring uses, so the
+naming directions compose. An argument must be irrefutable — a literal
+(`E::A(1)`) would need a per-field test rmc does not generate, so it is
+rejected, as is `mut` on a nested pattern. Naming more fields than the variant
+has, or fewer without a `..`, is an error.
+A payload variant is not comparable with `==` and cannot be cast with
 `as` (it is not a scalar), and it may not be an array element.
 
 A recursive enum such as `enum L { Nil, Cons(i64, L) }` is rejected: rmc has no
@@ -452,8 +461,8 @@ compile-time constant is decided at compile time, not by the trap.
   may in turn be struct patterns, so the two nesting directions compose. `mut`
   attaches to a
   binding, so `i: mut I { a }` and `a: mut [x, y]` are rejected, as in rustc. An
-  enum payload pattern,
-  by contrast, still only binds whole fields. A wrong field name is an error,
+  enum payload pattern's arguments take the same sub-patterns (see the payload
+  enum section). A wrong field name is an error,
   even for `i: _`, and a field bound twice is an error. Because a struct pattern
   is irrefutable, a *binding* struct pattern in an or-pattern is rejected, as is
   any binding alternative (a nested binding counts).

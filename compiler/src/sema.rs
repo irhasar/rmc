@@ -2304,8 +2304,9 @@ impl Sema {
                 }
                 Ok(Type::Bool)
             }
-            Expr::VariantTest { scrutinee, enum_name, variant, tag, n_binds } => {
+            Expr::VariantTest { scrutinee, enum_name, variant, tag, n_binds, has_rest } => {
                 let n_binds = *n_binds;
+                let has_rest = *has_rest;
                 let st = self.check_expr(scrutinee, scope)?;
                 let ename = match &st {
                     Type::Enum(n) | Type::EnumData(n, _) => n.clone(),
@@ -2325,7 +2326,8 @@ impl Sema {
                     .variant(variant)
                     .ok_or_else(|| format!("enum `{enum_name}` has no variant `{variant}`"))?;
                 // A variant that carries a payload must be destructured, so the
-                // pattern must name its fields; and it must name all of them.
+                // pattern must name its fields; a trailing `..` may ignore the
+                // rest, but the named prefix may not overrun the field list.
                 if fields.is_empty() {
                     if n_binds > 0 {
                         return Err(format!(
@@ -2336,7 +2338,9 @@ impl Sema {
                     return Err(format!(
                         "variant `{enum_name}::{variant}` has a payload; bind it with `{enum_name}::{variant}(..)`"
                     ));
-                } else if n_binds as usize != fields.len() {
+                } else if n_binds as usize > fields.len()
+                    || ((n_binds as usize) < fields.len() && !has_rest)
+                {
                     return Err(format!(
                         "variant `{enum_name}::{variant}` has {} field(s), but the pattern binds {n_binds}",
                         fields.len()

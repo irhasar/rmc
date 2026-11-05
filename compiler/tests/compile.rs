@@ -1879,6 +1879,135 @@ fn main_with_a_parameter_is_rejected() {
 }
 
 #[test]
+fn a_variant_payload_pattern_may_use_a_wildcard() {
+    // `E::A(_, y)` ignores the first field and binds the second.
+    let src = "enum E { A(i64, i64), B } \
+               fn main() -> i64 { let e: E = E::A(3, 4); \
+               return match e { E::A(_, y) => y, E::B => 0 }; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_variant_payload_pattern_may_be_mut() {
+    // `E::A(mut x)` binds the field mutably, exactly as a `let` binding would.
+    let src = "enum E { A(i64), B } \
+               fn main() -> i64 { let e: E = E::A(3); \
+               return match e { E::A(mut x) => { x = x + 1; x }, E::B => 0 }; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_variant_payload_pattern_may_end_in_rest() {
+    // `E::A(x, ..)` names a prefix and ignores the rest; `E::A(..)` names none.
+    let prefix = "enum E { A(i64, i64, i64), B } \
+                  fn main() -> i64 { let e: E = E::A(1, 2, 3); \
+                  return match e { E::A(x, ..) => x, E::B => 0 }; }";
+    let bare = "enum E { A(i64, i64), B } \
+                fn main() -> i64 { let e: E = E::A(1, 2); \
+                return match e { E::A(..) => 1, E::B => 0 }; }";
+    // A trailing comma after `..` is allowed, as in rustc.
+    let comma = "enum E { A(i64, i64, i64), B } \
+                 fn main() -> i64 { let e: E = E::A(1, 2, 3); \
+                 return match e { E::A(x, ..,) => x, E::B => 0 }; }";
+    assert!(compile_to_asm(prefix, &CompileOptions::default()).is_ok());
+    assert!(compile_to_asm(bare, &CompileOptions::default()).is_ok());
+    assert!(compile_to_asm(comma, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_variant_payload_pattern_may_be_nested() {
+    // A struct-typed and an array-typed payload field, each destructured in
+    // turn, and a mix of a scalar, a struct and an array field.
+    let src = "struct I { u: i64 } struct S { a: [i64; 2], b: I } \
+               enum E { A(S), B([i64; 2]), C(i64, S, [i64; 2]) } \
+               fn main() -> i64 { \
+                 let e: E = E::A(S { a: [1, 2], b: I { u: 3 } }); \
+                 let f: E = E::B([4, 5]); \
+                 let g: E = E::C(6, S { a: [7, 8], b: I { u: 9 } }, [10, 11]); \
+                 let s = match e { E::A(S { a: [p, q], b: I { u } }) => p + q + u, _ => 0 }; \
+                 let t = match f { E::B([a, b]) => a * 10 + b, _ => 0 }; \
+                 let r = match g { E::C(n, S { a: [p, q], b: I { u } }, [x, y]) => n + p + q + u + x + y, _ => 0 }; \
+                 return s + t + r; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_variant_payload_pattern_reads_through_the_payload() {
+    // A nested payload pattern reads its fields straight from the payload,
+    // offset past the tag word, rather than copying the whole aggregate payload
+    // into a name first: `E::A(S { x })` is leaner than
+    // `E::A(v) => { let S { x } = v; .. }`.
+    let out = asm("struct S { x: i64 } enum E { A(S), B } \
+                   fn main() -> i64 { let e: E = E::A(S { x: 5 }); \
+                   return match e { E::A(S { x }) => x, E::B => 0 }; }");
+    // The payload's first field starts after the 8-byte tag word, and the read
+    // is the very next instruction (no intervening whole-payload copy).
+    let at = out.find("add $8, %rax").expect("reads the payload at its offset");
+    let next = out[at..].lines().nth(1).unwrap_or("").trim();
+    assert_eq!(next, "mov (%rax), %rax", "direct payload field read:\n{out}");
+}
+
+#[test]
+fn a_variant_payload_pattern_may_not_overrun_the_fields() {
+    // Naming more fields than the variant has is rejected, as rustc rejects it.
+    let err = compile_to_asm(
+        "enum E { A(i64), B } \
+         fn main() -> i64 { let e: E = E::A(3); \
+         return match e { E::A(x, y) => x, E::B => 0 }; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("has 1 field"), "got: {err}");
+}
+
+#[test]
+fn a_variant_payload_pattern_may_not_omit_a_field_without_rest() {
+    // Naming fewer fields without a trailing `..` is rejected.
+    let err = compile_to_asm(
+        "enum E { A(i64, i64), B } \
+         fn main() -> i64 { let e: E = E::A(3, 4); \
+         return match e { E::A(x) => x, E::B => 0 }; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("has 2 field"), "got: {err}");
+}
+
+#[test]
+fn a_refutable_variant_payload_argument_is_rejected() {
+    // `E::A(1)` would need a per-field test, which rmc does not generate.
+    let err = compile_to_asm(
+        "enum E { A(i64), B } \
+         fn main() -> i64 { let e: E = E::A(3); \
+         return match e { E::A(1) => 1, E::A(_) => 0, E::B => 0 }; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("variant pattern arguments"), "got: {err}");
+}
+
+#[test]
+fn a_mut_on_a_nested_variant_payload_pattern_is_rejected() {
+    // `mut` attaches to a binding, not a nested pattern.
+    let err = compile_to_asm(
+        "struct S { x: i64 } enum E { A(S), B } \
+         fn main() -> i64 { let e: E = E::A(S { x: 5 }); \
+         return match e { E::A(mut S { x }) => x, E::B => 0 }; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("`mut` is not allowed here"), "got: {err}");
+}
+
+#[test]
+fn a_variant_payload_pattern_works_in_an_if_let() {
+    let src = "struct S { x: i64 } enum E { A(S), B } \
+               fn main() -> i64 { let e: E = E::A(S { x: 5 }); \
+               if let E::A(S { x }) = e { return x; } return 0; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
 fn constant_division_by_zero_is_rejected() {
     // rustc denies `1 / 0` (it would panic); rmc used to emit an `idiv` that
     // faults at run time.

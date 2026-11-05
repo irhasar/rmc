@@ -214,9 +214,15 @@ pub enum Expr {
         enum_name: String,
         variant: String,
         tag: i64,
-        /// How many payload names the pattern bound; -1 when it had no
-        /// parentheses, which is an error for a variant that has a payload.
+        /// How many payload fields the pattern bound with an explicit argument
+        /// pattern (`E::V(a, b)`, a `_`, a nested pattern or a trailing `..`);
+        /// -1 when the pattern had no parentheses, which is an error for a
+        /// variant that has a payload.
         n_binds: i32,
+        /// The pattern ended in `..` (`E::V(a, ..)`), so the remaining payload
+        /// fields are ignored rather than named. Only meaningful when the
+        /// pattern has an argument list (`n_binds >= 0`).
+        has_rest: bool,
     },
     /// `value == true`/`false`, as a `bool`. The arm test a `bool` literal
     /// pattern desugars to. It is a distinct node rather than a plain

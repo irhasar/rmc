@@ -166,7 +166,10 @@ the same pattern grammar as `let`), `nestpat` for nested struct sub-patterns
 `_` elements, `mut` bindings, nested and struct element patterns, `..` rests
 in every position, and an array-typed struct field destructured in place),
 `parampat` for aggregate parameter patterns (struct and array patterns, a
-nested one, one mixed with plain parameters, and one on a method receiver), and
+nested one, one mixed with plain parameters, and one on a method receiver),
+`enumpat` for payload variant patterns with sub-patterns (`_`, `mut x`, a
+trailing `..`, and a nested struct or array pattern inside `E::V(..)`, in
+`match`, `if let` and a method), and
 `order` for assignment evaluation order (a
 side-effecting index and value on both `=` and every compound operator, the
 shapes `stmt` never assigns through). `shift` drives `<<`, `>>` and the compound
