@@ -254,15 +254,29 @@ compile-time constant is decided at compile time, not by the trap.
 - Blocks and `if`/`else` are expressions.
 - `match` on integers or enums: `match x { 0 => a, 1 => b, _ => c }` or
   `match c { Color::Red => a, _ => b }`. An arm pattern is an integer literal
-  (optionally negated), an `Enum::Variant`, or `_`. The first equal arm runs and
-  `_` matches anything; it is an expression, usable as a statement or a value,
-  and a comma before `}` may be omitted. A `match` must be exhaustive, exactly as
-  in Rust: an arm must be `_` (or a binding name), or the arms must name *every*
-  variant of one enum. A non-exhaustive `match` is rejected with an error even
-  when it stands alone as a statement, since rustc rejects it there too.
+  (optionally negated), an integer *range* `lo..hi` / `lo..=hi`, an
+  `Enum::Variant`, an *or-pattern* `a | b | c`, or `_`. The first matching arm
+  runs and `_` matches anything; it is an expression, usable as a statement or a
+  value, and a comma before `}` may be omitted. A `match` must be exhaustive,
+  exactly as in Rust: an arm must be `_` (or a binding name), or the arms must
+  name *every* variant of one enum (including across or-patterns, so
+  `Color::Red | Color::Green => .., Color::Blue => ..` is exhaustive). A
+  non-exhaustive `match` is rejected with an error even when it stands alone as
+  a statement, since rustc rejects it there too.
+- Or-patterns: `a | b | c` matches when any alternative matches, and the arm
+  body runs once. Alternatives may be integers, ranges, `Enum::Variant`s, or
+  `_` (an or-pattern containing `_` is irrefutable). A *binding* alternative
+  (`x | 1`) is rejected, as rustc's `E0408` rejects it, because rmc does not
+  check that the name is bound in every alternative.
+- Range patterns: `lo..hi` is half-open (`lo <= v && v < hi`) and `lo..=hi`
+  inclusive. Both bounds are `i64` and either may be negative; a range whose
+  bounds are out of order (`5..5`, `6..5`) is an empty range and a compile
+  error, as in rustc. A range is not by itself exhaustive, so a `_` arm is
+  still needed unless the other arms cover every value.
 - `if let PAT = EXPR { .. } else { .. }`, sugar for
   `match EXPR { PAT => then, _ => else_or_unit }`. It reuses the `match` pattern
-  grammar, but unlike `match` it need not be exhaustive: a non-matching value
+  grammar (including or-patterns and ranges, `if let 1..=5 = x`), but unlike
+  `match` it need not be exhaustive: a non-matching value
   falls through to the `_` arm. An `else` is optional; with none and a non-unit
   `then`, the branch types differ and the program is rejected, exactly as rustc
   rejects it — including when the pattern is irrefutable (`if let y = o { 1 }`

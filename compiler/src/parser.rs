@@ -998,27 +998,58 @@ impl Parser {
     /// One pattern: an integer, `true`/`false`, `Enum::Variant`, `Enum::Variant(a, b)`,
     /// a bare binding name, or `_`. Shared by `match` arms and `if let`.
     fn parse_pattern(&mut self) -> PResult<Pat> {
+        let first = self.parse_pattern_primary()?;
+        if self.peek() != Some(&Tok::Pipe) {
+            return Ok(first);
+        }
+        let mut alts = vec![first];
+        while self.eat(&Tok::Pipe) {
+            alts.push(self.parse_pattern_primary()?);
+        }
+        // A binding must bind the same names in every alternative (rustc's
+        // E0408); rmc has no name-consistency check, so it rejects a binding in
+        // an or-pattern outright rather than mis-bind it.
+        if let Some(Pat::Bind(n)) = alts.iter().find(|a| matches!(a, Pat::Bind(_))) {
+            return Err(format!(
+                "at byte {}: variable `{n}` is not bound in all patterns of the or-pattern",
+                self.pos()
+            ));
+        }
+        Ok(Pat::Or(alts))
+    }
+
+    /// An integer pattern literal: `123` or `-123`. The magnitude `2^63` is in
+    /// range only directly under a `-`, where it is `i64::MIN`; standing alone
+    /// it is out of range, as in rustc. Shared by a plain integer pattern and
+    /// both bounds of a range pattern.
+    fn parse_signed_pat_int(&mut self) -> PResult<i64> {
+        let neg = self.eat(&Tok::Minus);
+        match self.bump() {
+            Tok::Int(v) if neg => Ok(v.checked_neg().ok_or_else(|| {
+                format!("at byte {}: pattern literal out of range", self.pos())
+            })?),
+            Tok::Int(v) => Ok(v),
+            Tok::IntMinMagnitude if neg => Ok(i64::MIN),
+            Tok::IntMinMagnitude => Err(format!(
+                "at byte {}: integer literal `9223372036854775808` is out of range for `i64`",
+                self.pos()
+            )),
+            other => Err(format!(
+                "at byte {}: expected an integer in a pattern, found {}",
+                self.pos(), other.describe()
+            )),
+        }
+    }
+
+    fn parse_pattern_primary(&mut self) -> PResult<Pat> {
         match self.peek().cloned() {
             Some(Tok::Underscore) => {
                 self.i += 1;
                 Ok(Pat::Wild)
             }
-            Some(Tok::Minus) => {
-                self.i += 1;
-                match self.bump() {
-                    Tok::Int(v) => Ok(Pat::Int(v.checked_neg().ok_or_else(|| {
-                        format!("at byte {}: pattern literal out of range", self.pos())
-                    })?)),
-                    Tok::IntMinMagnitude => Ok(Pat::Int(i64::MIN)),
-                    other => Err(format!(
-                        "at byte {}: expected an integer after `-` in a pattern, found {}",
-                        self.pos(), other.describe()
-                    )),
-                }
-            }
-            Some(Tok::Int(v)) => {
-                self.i += 1;
-                Ok(Pat::Int(v))
+            Some(Tok::Minus) | Some(Tok::Int(_)) => {
+                let lo = self.parse_signed_pat_int()?;
+                self.maybe_range(lo)
             }
             Some(Tok::True) => {
                 self.i += 1;
@@ -1101,6 +1132,42 @@ impl Parser {
         Ok(self.desugar_match(scrutinee, arms))
     }
 
+    /// If a `..`/`..=` follows the integer just parsed, consume it and the
+    /// upper bound to build a range pattern; otherwise the integer stands
+    /// alone. Both bounds are `i64`, so `1..=5` and `-3..0` both work.
+    fn maybe_range(&mut self, lo: i64) -> PResult<Pat> {
+        let inclusive = match self.peek() {
+            Some(Tok::DotDot) => false,
+            Some(Tok::DotDotEq) => true,
+            _ => return Ok(Pat::Int(lo)),
+        };
+        self.i += 1;
+        let hi = self.parse_signed_pat_int()?;
+        if !inclusive && lo >= hi {
+            return Err(format!(
+                "at byte {}: empty range pattern `{}..{}`",
+                self.pos(), lo, hi
+            ));
+        }
+        if inclusive && lo > hi {
+            return Err(format!(
+                "at byte {}: empty range pattern `{}..={}`",
+                self.pos(), lo, hi
+            ));
+        }
+        Ok(Pat::Range(lo, hi, inclusive))
+    }
+
+    /// Whether a pattern matches every value: `_`, a binding, or an
+    /// or-pattern with such an alternative.
+    fn pat_irrefutable(p: &Pat) -> bool {
+        match p {
+            Pat::Wild | Pat::Bind(_) => true,
+            Pat::Or(alts) => alts.iter().any(Self::pat_irrefutable),
+            _ => false,
+        }
+    }
+
     /// Fold the arms into nested `if`s. The scrutinee is named once; an arm
     /// with `_` becomes the `else` (so any arm after it is unreachable, as in
     /// Rust). With no `_`, the chain has no final `else`, so a non-matching
@@ -1119,8 +1186,9 @@ impl Parser {
         arms: Vec<(Pat, Expr)>,
         check_dead_arms: bool,
     ) -> Expr {
-        // A `_` or binding arm makes the match exhaustive in every position.
-        let has_catch_all = arms.iter().any(|(p, _)| matches!(p, Pat::Wild | Pat::Bind(_)));
+        // A `_` or binding arm makes the match exhaustive in every position;
+        // an or-pattern is irrefutable when any alternative is (`1 | _`).
+        let has_catch_all = arms.iter().any(|(p, _)| Self::pat_irrefutable(p));
         let (subj, prelude) = match scrutinee {
             Expr::Var { .. } | Expr::Int(_) | Expr::EnumVariant { .. } => (scrutinee, None),
             other => {
@@ -1166,6 +1234,38 @@ impl Parser {
 
     /// One arm of a desugared `match` or `if let`: the pattern test, the
     /// bindings it introduces, and the fallback `rest` for a non-match.
+    /// The boolean test for one alternative of an or-pattern. Only a test, not
+    /// an arm: the shared body and fallback stay outside, so an or-pattern does
+    /// not duplicate the body. A binding or `_` alternative is always true, but
+    /// rmc does not support bindings in an or-pattern, so `_` is the only
+    /// irrefutable alternative here.
+    fn or_cond(pat: &Pat, subj: &Expr) -> Expr {
+        match pat {
+            Pat::Int(k) => Expr::Bin(BinOp::Eq, Box::new(subj.clone()), Box::new(Expr::Int(*k))),
+            Pat::Bool(b) => Expr::BoolTest { scrutinee: Box::new(subj.clone()), value: *b },
+            Pat::Range(lo, hi, inclusive) => {
+                let lower = Expr::Bin(BinOp::Le, Box::new(Expr::Int(*lo)), Box::new(subj.clone()));
+                let upper = Expr::Bin(
+                    if *inclusive { BinOp::Le } else { BinOp::Lt },
+                    Box::new(subj.clone()),
+                    Box::new(Expr::Int(*hi)),
+                );
+                Expr::Bin(BinOp::And, Box::new(lower), Box::new(upper))
+            }
+            Pat::Variant(enum_name, variant, _) => Expr::VariantTest {
+                scrutinee: Box::new(subj.clone()),
+                enum_name: enum_name.clone(),
+                variant: variant.clone(),
+                tag: -1,
+                n_binds: -1,
+            },
+            // `_` in an or-pattern: always true, so the whole condition is true.
+            Pat::Wild => Expr::Bool(true),
+            // A binding inside an or-pattern is rejected before this point.
+            Pat::Bind(_) | Pat::Or(_) => unreachable!("or-pattern alternative"),
+        }
+    }
+
     fn desugar_arm(pat: Pat, subj: &Expr, body: Expr, rest: Option<Expr>, check_dead: bool) -> Expr {
         match pat {
             Pat::Wild => Self::irrefutable_arm(body, rest, check_dead),
@@ -1182,6 +1282,44 @@ impl Parser {
             }),
             Pat::Int(k) => {
                 let cond = Expr::Bin(BinOp::Eq, Box::new(subj.clone()), Box::new(Expr::Int(k)));
+                Self::match_arm(cond, body, rest)
+            }
+            // `lo..hi` is `lo <= s && s < hi`; `lo..=hi` uses `<=` on both
+            // sides. A plain `Bin(And, ..)` of comparisons, so sema and codegen
+            // need no new case.
+            Pat::Range(lo, hi, inclusive) => {
+                let lower = Expr::Bin(
+                    BinOp::Le,
+                    Box::new(Expr::Int(lo)),
+                    Box::new(subj.clone()),
+                );
+                let upper = Expr::Bin(
+                    if inclusive { BinOp::Le } else { BinOp::Lt },
+                    Box::new(subj.clone()),
+                    Box::new(Expr::Int(hi)),
+                );
+                let cond = Expr::Bin(BinOp::And, Box::new(lower), Box::new(upper));
+                Self::match_arm(cond, body, rest)
+            }
+            // `a | b | c => body` runs `body` when any alternative matches, so
+            // fold the alternatives into `cond_a || cond_b || cond_c` with the
+            // *same* body and `rest`. `or_cond` builds just the test; the body
+            // is not duplicated.
+            Pat::Or(alts) => {
+                // An or-pattern with a `_` alternative matches every value, so
+                // the arm is irrefutable: build `body` directly instead of an
+                // `if` that would need an `else`.
+                if alts.iter().any(|a| matches!(a, Pat::Wild)) {
+                    return Self::irrefutable_arm(body, rest, check_dead);
+                }
+                let mut cond = Self::or_cond(&alts[0], subj);
+                for alt in &alts[1..] {
+                    cond = Expr::Bin(
+                        BinOp::Or,
+                        Box::new(cond),
+                        Box::new(Self::or_cond(alt, subj)),
+                    );
+                }
                 Self::match_arm(cond, body, rest)
             }
             // `true`/`false` become a `BoolTest`, not a `Bin(Eq, ..)`, so a
@@ -1472,6 +1610,10 @@ impl Parser {
 enum Pat {
     Wild,
     Int(i64),
+    /// `lo..hi` / `lo..=hi`, inclusive flag set for `..=`.
+    Range(i64, i64, bool),
+    /// `a | b | c`, alternatives tried left to right.
+    Or(Vec<Pat>),
     /// `true` or `false`.
     Bool(bool),
     /// `Enum::Variant` or `Enum::Variant(..)`. The constructor is resolved by
