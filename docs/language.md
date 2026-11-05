@@ -278,7 +278,10 @@ compile-time constant is decided at compile time, not by the trap.
   `lo..hi` / `lo..=hi`, a *string* literal, an `Enum::Variant`, an *or-pattern*
   `a | b | c`, or `_`. The first matching arm
   runs and `_` matches anything; it is an expression, usable as a statement or a
-  value, and a comma before `}` may be omitted. A `match` must be exhaustive,
+  value, and a comma before `}` may be omitted. An arm body is an expression,
+  but a bare assignment (`0 => acc = 1`), a compound assignment
+  (`1 => acc += 10`), or a `return`/`break`/`continue` is accepted as well, as
+  in Rust; a block-bodied arm (`_ => {}`) also works. A `match` must be exhaustive,
   exactly as in Rust: an arm must be `_` (or a binding name), or the arms must
   name *every* variant of one enum (including across or-patterns, so
   `Color::Red | Color::Green => .., Color::Blue => ..` is exhaustive). A

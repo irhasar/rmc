@@ -269,6 +269,13 @@ store and reload on every iteration of the loops they drive. Depth weighting
 helps only when the innermost loop is memory-bound, which none of the benchmarks
 are. Before "fixing" this again, measure it — the intuition is wrong here.
 
+A softer variant — keep the raw count, but break a *tie* toward the deeper loop
+— fails for the same reason. mandel has five locals tied at four mentions
+(`size`, `acc`, `y`, `x`, `i`), so the tiebreak promotes `i`, the innermost
+counter, and demotes `x`; mandel went from 31.7 to 32.4 ms (min of 7 runs). The
+innermost loop does not profit from one more register, and the loop that runs it
+now pays a reload. Ties are broken by slot index instead.
+
 Scalar struct fields take part in promotion too, so a hot `acc.sum` stays in a
 register. A field is named by its register only where its slot is known: field
 `k` of a struct at `slot` lives at `slot + fields - 1 - k` (field 0 is the

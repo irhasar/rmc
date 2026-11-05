@@ -257,6 +257,53 @@ fn irrefutable_if_let_with_matching_else_is_accepted() {
 }
 
 #[test]
+fn match_arm_body_may_be_a_bare_assignment() {
+    // A `match` arm body is an expression in Rust, but `x = 1` and `x += 1` are
+    // accepted too. rmc parses assignment only as a statement, so the arm body
+    // parser must accept it explicitly; without that, `0 => acc = 1` fails.
+    let out = asm(
+        "fn main() -> i64 { let mut acc: i64 = 0; let x: i64 = 1; \
+         match x { 0 => acc = acc + 1, 1 => acc += 10, _ => {} } return acc; }",
+    );
+    assert!(out.contains("main:"), "an assignment arm body compiles");
+}
+
+#[test]
+fn assignment_arm_bodies_work_with_or_patterns_and_ranges() {
+    // The assignment arm body composes with every pattern form, and with a
+    // `match` used as a statement (its value discarded).
+    let out = asm(
+        "fn main() -> i64 { let mut acc: i64 = 0; let mut i: i64 = 0; \
+         while i < 6 { match i { 0 | 1 => acc += 10, 2..=4 => acc = acc - 1, _ => {} } i = i + 1; } return acc; }",
+    );
+    assert!(out.contains("main:"), "assignment bodies compose with or-patterns and ranges");
+}
+
+#[test]
+fn if_let_and_while_let_bodies_may_assign() {
+    // `if let`/`while let` bodies are blocks, so an assignment inside them is an
+    // ordinary statement; this guards that path stays working.
+    let out = asm(
+        "fn main() -> i64 { let mut acc: i64 = 0; let x: i64 = 1; \
+         if let 1 = x { acc = acc + 5; } \
+         let mut y: i64 = 0; while let 0..=2 = y { y += 1; } return acc + y; }",
+    );
+    assert!(out.contains("main:"), "assignment bodies compile under `if let`/`while let`");
+}
+
+#[test]
+fn match_arm_body_may_be_a_return_or_break() {
+    // As in Rust, an arm body may be a `return`/`break` statement, not just an
+    // expression; `parse_arm_body` builds the statement and leaves the arm's
+    // terminator for the caller.
+    let out = asm(
+        "fn f(x: i64) -> i64 { match x { 0 => return 5, _ => 0 } } \
+         fn main() -> i64 { let mut i: i64 = 0; while i < 9 { match i { 3 => break, _ => {} } i = i + 1; } return f(0); }",
+    );
+    assert!(out.contains("main:"), "return/break arm bodies compile");
+}
+
+#[test]
 fn match_drops_arms_after_a_catch_all() {
     // A `match` arm after `_` is dead and dropped, so a value-position match
     // whose `_` arm yields a value is accepted even with arms after it.
