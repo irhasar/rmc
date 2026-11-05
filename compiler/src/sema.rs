@@ -555,9 +555,11 @@ impl Sema {
 
         let body_ty = self.check_block(&mut f.body, &mut scope)?;
         // A body whose tail is a value must match the declared return type.
-        // A body ending in `return` (or `break`) has a `Unit` tail and is fine;
-        // a completely empty body is not, for a non-unit function.
-        if body_ty != Type::Unit && body_ty != self.ret_ty {
+        // `!` unifies with anything: a body that diverges on every path never
+        // yields a value, so it satisfies any declared return type. A body
+        // ending in `return` (or `break`) is fine; a completely empty body is
+        // not, for a non-unit function.
+        if body_ty != Type::Unit && body_ty != Type::Never && body_ty != self.ret_ty {
             return Err(format!(
                 "function `{}` returns {body_ty:?} but is declared to return {:?}",
                 f.name, self.ret_ty
@@ -719,6 +721,41 @@ impl Sema {
         }
     }
 
+    /// The `then` block and `else` of one desugared `match` step, looking
+    /// through the `Block` wrapper an arm with payload bindings uses.
+    fn chain_if(e: &Expr) -> Option<(&Block, &Option<Block>)> {
+        match e {
+            Expr::Block(b) => Self::chain_if(b.tail.as_deref()?),
+            Expr::If(_, then, els) => Some((then, els)),
+            _ => None,
+        }
+    }
+
+    /// True when a desugared `match` chain diverges on every path: every arm
+    /// body diverges, so no value can fall out of the match. Such a match is
+    /// `!`, which unifies with any expected type — `fn f(e: E) -> i64 { match e
+    /// { E::A => { return 1; } E::B => { return 2; } } }` is accepted, as in
+    /// rustc, because the tail never completes.
+    fn match_chain_diverges(b: &Block) -> bool {
+        let mut cur = match b.tail.as_deref() {
+            Some(e) => e,
+            None => return false,
+        };
+        loop {
+            let (then, els) = match Self::chain_if(cur) {
+                Some(t) => t,
+                None => return false,
+            };
+            if !block_diverges(then) {
+                return false;
+            }
+            match els.as_ref().and_then(|blk| blk.tail.as_deref()) {
+                Some(next) => cur = next,
+                None => return true,
+            }
+        }
+    }
+
     fn if_chain_is_exhaustive(&self, cond: &Expr, els: &Option<Block>) -> bool {
         // Every condition must test the same thing: all the variants of one
         // enum, or both values of one `bool`. A chain that mixes the two, or
@@ -829,7 +866,17 @@ impl Sema {
             None => Type::Unit,
         };
         scope.truncate(mark);
-        Ok(ty)
+        // A block that cannot complete normally (a `return`/`break`/`continue`
+        // statement, or a diverging tail) is `!`. That unifies with any expected
+        // type, so `fn f() -> i64 { return 7; }` and
+        // `let x: i64 = { return 7; };` are accepted, as in rustc. The tail is
+        // still checked above, so its slots are assigned even though it is
+        // unreachable.
+        if block_diverges(b) {
+            Ok(Type::Never)
+        } else {
+            Ok(ty)
+        }
     }
 
     fn check_stmt(&mut self, st: &mut Stmt, scope: &mut Scope) -> Result<(), String> {
@@ -852,7 +899,11 @@ impl Sema {
                 };
                 let final_ty = match (declared, init_ty) {
                     (Some(d), Some(i)) => {
-                        if d != i && !ref_coerces(&i, &d) {
+                        // `!` unifies with any expected type: a diverging
+                        // initializer (`let x: i64 = if c { return 1 } else
+                        // { return 2 };`) never produces a value, so its type is
+                        // the declared one.
+                        if d != i && i != Type::Never && !ref_coerces(&i, &d) {
                             return Err(format!(
                                 "variable `{name}`: declared type {d:?} does not match initializer type {i:?}"
                             ));
@@ -1008,7 +1059,9 @@ impl Sema {
                 match v {
                     Some(e) => {
                         let t = self.check_expr(e, scope)?;
-                        if t != self.ret_ty {
+                        // `!` unifies with anything: `return loop {};` never
+                        // actually returns a value.
+                        if t != self.ret_ty && t != Type::Never {
                             return Err(format!(
                                 "`return` type mismatch: function returns {:?}, value is {:?}",
                                 self.ret_ty, t
@@ -1632,10 +1685,22 @@ impl Sema {
                         // `!` unifies with any type: a branch that diverges
                         // (returns, or loops forever) never yields a value, so
                         // the `if` takes the other branch's type. rustc accepts
-                        // `if c { 1 } else { return 2 }` for this reason.
-                        let then_div = block_diverges(then);
-                        let else_div = block_diverges(e);
-                        let ty = if tt == et || else_div && !then_div {
+                        // `if c { 1 } else { return 2 }` for this reason. The
+                        // branch type is authoritative: `check_block` returns
+                        // `Never` for a block that cannot complete (a `return`
+                        // statement, or a diverging `match`/`loop` tail), so the
+                        // structural walk below only has to recognise the
+                        // remaining case — a tail that is an `if` with no `else`
+                        // and a diverging then-branch, which completes as `()`.
+                        let then_div = tt == Type::Never || block_diverges(then);
+                        let else_div = et == Type::Never || block_diverges(e);
+                        // Both branches diverge, so the `if` never yields a
+                        // value: it is `!`, which unifies with the expected type
+                        // wherever one is known (`let x: i64 = if c { return 1 }
+                        // else { return 2 };`).
+                        let ty = if then_div && else_div {
+                            Type::Never
+                        } else if tt == et || else_div && !then_div {
                             tt
                         } else if then_div && !else_div {
                             et
@@ -1669,9 +1734,22 @@ impl Sema {
                                 "`if` without `else` must evaluate to `()`, but the branch is {tt:?}"
                             ));
                         }
-                        // No else: the then branch may not run.
+                        // No else: the then branch may not run. When the chain
+                        // is `total`, the implicit fall-through is unreachable
+                        // (every variant is named), so a diverging then-branch
+                        // makes the whole step `!` rather than `()` — which is
+                        // what lets an all-`return` exhaustive match stand as a
+                        // `!` tail.
                         Self::init_restore(scope, &init_before);
-                        Ok(if tt == Type::Never { Type::Unit } else { tt })
+                        Ok(if tt == Type::Never {
+                            if total {
+                                Type::Never
+                            } else {
+                                Type::Unit
+                            }
+                        } else {
+                            tt
+                        })
                     }
                 }
             }
@@ -2395,7 +2473,12 @@ fn expr_has_break(e: &Expr) -> bool {
 fn expr_diverges(e: &Expr) -> bool {
     match e {
         Expr::Block(b) => block_diverges(b),
-        Expr::MatchBoundary(b, _) => block_diverges(b),
+        // A desugared `match` diverges when every arm body diverges, so the
+        // whole chain is `!` even though its last step is an `if` with no
+        // `else` (which `Expr::If` alone would call non-diverging).
+        Expr::MatchBoundary(b, _) => {
+            Sema::match_chain_diverges(b) || block_diverges(b)
+        }
         // A `loop` diverges when no `break` can leave it.
         Expr::Loop(body, _, _, _) => !block_has_break(body),
         // Both arms must diverge for the `if` to diverge.

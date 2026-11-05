@@ -293,6 +293,39 @@ fn struct_field_init_shorthand_for_an_unbound_name_is_rejected() {
 }
 
 #[test]
+fn a_diverging_match_is_never_and_fits_any_return_type() {
+    // Every arm `return`s, so the match cannot yield a value: it is `!` and
+    // satisfies `-> i64`. rustc accepts this; rmc used to reject it with a
+    // spurious "falls off the end".
+    let src = "enum E { A, B } \
+               fn f(e: E) -> i64 { match e { E::A => { return 1; } E::B => { return 2; } } } \
+               fn main() -> i64 { return f(E::A); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_diverging_if_else_initializes_a_typed_let() {
+    let src = "fn f(c: bool) -> i64 { let x: i64 = if c { return 1; } else { return 2; }; return x; } \
+               fn main() -> i64 { return f(true); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_loop_with_no_break_satisfies_any_return_type() {
+    let src = "fn f() -> i64 { loop {} } fn main() -> i64 { return f(); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_mixed_value_and_diverging_arm_keeps_the_value_type() {
+    // One arm yields `i64`, the other diverges: the match is `i64`.
+    let src = "enum E { A, B } \
+               fn f(e: E) -> i64 { match e { E::A => 10, E::B => { return 20; } } } \
+               fn main() -> i64 { return f(E::A); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
 fn compound_assignment_expands() {
     // `x += 4` folds into a single `lea` when the target is register-resident,
     // and otherwise into an `add`. Either is the expansion; what matters is

@@ -222,7 +222,11 @@ A branch whose type diverges (`return`, or a `loop` with no reachable `break`)
 unifies with any other branch's type, as Rust's `!` does, so
 `if c { 1 } else { return 2 }` is accepted. The trailing `;` after
 `return`/`break`/`continue` may be omitted when it is the last thing in a block,
-since those diverge and no expression can follow them.
+since those diverge and no expression can follow them. A whole block that
+cannot complete is `!` too, so it fits any expected type: `fn f(e: E) -> i64 {
+match e { E::A => { return 1; } E::B => { return 2; } } }` (every arm returns),
+`let x: i64 = if c { return 1; } else { return 2; };`, and `fn g() -> i64 {
+loop {} }` are all accepted, matching rustc.
 
 `loop` is an expression: `break v` makes the loop itself evaluate to `v`, so
 `let x: i64 = loop { ... break 5; };` is accepted. Every `break` in the loop
