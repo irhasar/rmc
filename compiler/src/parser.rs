@@ -1007,6 +1007,68 @@ impl Parser {
         }
     }
 
+    /// `Name { f: v, ..base }`: fill the fields not written from `base`. The
+    /// desugaring matches rustc's evaluation order — the written field values
+    /// first, left to right, then the base — and produces a fresh value that
+    /// does not alias `base`:
+    ///
+    /// ```text
+    /// { let v = <field value>; ...; let mut t = base; t.f = v; ...; t }
+    /// ```
+    ///
+    /// Every field value is bound to a temporary *before* the base runs, so its
+    /// side effects happen first. `t` and the temporaries get fresh NUL-prefixed
+    /// names, so they can never collide with a source identifier. An `i64` field
+    /// is written straight into `t` (which stays in a register when it is hot);
+    /// an aggregate field is copied into `t`'s storage from its temporary,
+    /// because `t.f = v` would otherwise store the temporary's address rather
+    /// than its words.
+    fn desugar_struct_update(
+        &mut self,
+        name: String,
+        fields: Vec<FieldInit>,
+        base: Box<Expr>,
+    ) -> Expr {
+        let tname = format!("\u{0}su{}", self.tmp);
+        self.tmp += 1;
+        let tvar = || Expr::Var { name: tname.clone(), slot: -1, ty: Type::I64 };
+
+        let mut stmts = Vec::new();
+        // Evaluate the written fields first, in source order, each into its own
+        // temporary. The type is left unresolved so sema checks the value
+        // against the field (an `i64` literal is not forced to be the struct).
+        let mut writes: Vec<(String, Type, String)> = Vec::new();
+        for fi in fields {
+            let vname = format!("\u{0}sv{}", self.tmp);
+            self.tmp += 1;
+            stmts.push(Stmt::Let {
+                name: vname.clone(),
+                ty: None,
+                init: Some(fi.value),
+                slot: -1,
+                mutable: false,
+            });
+            writes.push((vname, fi.ty, fi.name));
+        }
+
+        // Then the base, into the value the block yields.
+        stmts.push(Stmt::Let {
+            name: tname.clone(),
+            ty: Some(Type::Named(name)),
+            init: Some(*base),
+            slot: -1,
+            mutable: true,
+        });
+
+        for (vname, ty, fname) in writes {
+            let target = Expr::Field { base: Box::new(tvar()), name: fname, offset: 0, ty: Type::I64 };
+            let value = Expr::Var { name: vname, slot: -1, ty };
+            stmts.push(Stmt::Assign { target, value });
+        }
+
+        Expr::Block(Block { stmts, tail: Some(Box::new(tvar())) })
+    }
+
     /// Desugar `target op= value` into a block that reads the target once,
     /// combines it with `value`, and writes it back. The read is bound to a
     /// temporary so that an index with side effects (`a[next()] += 1`) is
@@ -1967,10 +2029,23 @@ impl Parser {
                     return Ok(Expr::EnumVariant { enum_name: name, variant, tag: -1 });
                 }
                 if self.peek() == Some(&Tok::LBrace) && !self.no_struct_lit {
-                    // struct literal `Name { field: value, ... }`
+                    // struct literal `Name { field: value, ... }`, optionally
+                    // ending in a struct update base `..expr`.
                     self.i += 1;
                     let mut fields = Vec::new();
+                    let mut base: Option<Box<Expr>> = None;
                     while self.peek() != Some(&Tok::RBrace) {
+                        if self.eat(&Tok::DotDot) {
+                            // `..expr` fills the fields not written above. It is
+                            // the last thing before `}`, so the base parses
+                            // greedily; rustc allows any expression here,
+                            // including another struct literal.
+                            let b = self.parse_expr()?;
+                            base = Some(Box::new(b));
+                            // No comma may follow the base: it must be the last
+                            // thing before `}` (rustc E0747-style error).
+                            break;
+                        }
                         let fname = self.expect_ident()?;
                         // Field init shorthand: `P { x, y }` means `P { x: x, y: y }`,
                         // so a bare name (no `:`) reuses the local of that name.
@@ -1986,6 +2061,22 @@ impl Parser {
                         }
                     }
                     self.expect(Tok::RBrace)?;
+                    if let Some(base) = base {
+                        // A field written twice is an error (rustc: "field `x`
+                        // specified more than once"). The plain literal path
+                        // catches this in sema; the update path desugars to
+                        // assignments, so it must check here.
+                        for (i, f) in fields.iter().enumerate() {
+                            if fields[..i].iter().any(|g| g.name == f.name) {
+                                return Err(format!(
+                                    "at byte {}: field `{}` specified more than once",
+                                    self.pos(),
+                                    f.name
+                                ));
+                            }
+                        }
+                        return Ok(self.desugar_struct_update(name, fields, base));
+                    }
                     return Ok(Expr::StructLit { name, fields, slot: -1 });
                 }
                 if self.eat(&Tok::LParen) {

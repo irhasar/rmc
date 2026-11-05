@@ -39,7 +39,18 @@ let r: Point = Point { x, y };         // field init shorthand: `x` means `x: x`
 let s: Point = Point { y: 5, x };      // shorthand and explicit fields mix
 let mut q: Point = Point { x: 0, y: 0 };
 q.x = q.x + 1;                          // field read and write
+
+let base: Point = Point { x: 1, y: 2 };
+let u: Point = Point { x: 9, ..base }; // struct update: y is copied from base
 ```
+
+Struct update syntax `Point { field: value, ..base }` fills every field not
+written above the base from `base`. The written field values are evaluated first,
+left to right, then the base — the order rustc uses — so a field value with a
+side effect runs before the base. The result is a fresh value, so mutating it
+does not change `base`. `Point { ..base }` with no written fields is allowed, as
+is a struct literal as the base (`Point { x: 3, ..Point { y: 4, ..base } }`); a
+comma may not follow the base.
 
 Fields are laid out in declaration order with no padding. A struct may contain
 another struct or an array, but not itself. Field init shorthand is supported: `Point { x, y }` is `Point { x: x, y: y }`,

@@ -41,6 +41,10 @@ Modes:
           field, a nested field, an array element and a nested array element,
           read and written through directly and via a callee, plus a whole
           aggregate read/written through a reference
+    update struct update syntax (`S { f: v, ..base }`): overriding a field,
+          copying every field, chaining, a struct-typed field, and a field
+          value that mutates the base so the evaluation order and the
+          independence of the result are both observable
 
 The reference is `rustc -O`, so a mismatch is a real semantic divergence.
 """
@@ -898,6 +902,93 @@ def gen_nest_program(rng):
         "    let mut si: i64 = 0;",
         f"    while si < {ns} {{ acc += sa[si as usize].{f0} + sa[si as usize].{inner[1]}; si += 1; }}",
         f"    acc += sc[0].{f0} + sc[1].{inner[1]};",
+        '    println!("{}", acc);',
+        "}",
+    ]
+    return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
+
+def gen_update_program(rng):
+    """Struct update syntax `S { field: value, ..base }`. No other mode emits
+    it, so the desugaring's two invariants were untested: the result must be an
+    independent value (a shallow copy would alias the base), and the written
+    field values must be evaluated before the base. The `mutate` call below
+    makes both observable — it bumps the base's `y` as a side effect of
+    evaluating a field value, so if the base were evaluated first the update
+    would pick up the bumped `y`, and if the result aliased the base a later
+    write through the result would change the base.
+
+    Values descend from a call (`seed`) so nothing is constant-folded.
+    """
+    b = rng.randint(1, 9)
+    d = rng.randint(1, 9)
+    rms = [
+        "struct P { x: i64, y: i64 }",
+        "struct Q { p: P, t: i64 }",
+        f"fn seed(n: i64) -> i64 {{ return n * 3 + {b}; }}",
+        "fn mk(n: i64) -> P { return P { x: n, y: n + 1 }; }",
+        # Bumps the base's `y` and returns the value to store, so the order in
+        # which the update evaluates it against the base is observable.
+        "fn mutate(p: &mut P, v: i64) -> i64 { p.y = p.y + 100; return v; }",
+        "fn sumq(q: Q) -> i64 { return q.p.x + q.p.y + q.t; }",
+        "fn main() -> i64 {",
+        f"    let n: i64 = seed({d});",
+        "    let mut acc: i64 = 0;",
+        "    let mut base: P = mk(n);",
+        # Written field value mutates the base before the base is read.
+        "    let a: P = P { x: mutate(&mut base, n), ..base };",
+        "    acc = acc + a.x + a.y + base.y;",
+        # Overriding one field, copying the rest.
+        "    let b2: P = P { y: n + 7, ..base };",
+        "    acc = acc + b2.x + b2.y;",
+        # The result is independent of the base.
+        "    let mut c: P = P { x: n + 1, ..base };",
+        "    c.y = c.y + 50;",
+        "    acc = acc + c.y + base.y;",
+        # Copy every field.
+        "    let e: P = P { ..base };",
+        "    acc = acc + e.x + e.y;",
+        # Chained, and through a struct-typed field.
+        "    let f: P = P { x: n + 2, ..e };",
+        "    let g: P = P { y: n + 3, ..f };",
+        "    let q: Q = Q { p: g, t: n };",
+        "    let r: Q = Q { t: n + 4, ..q };",
+        "    acc = acc + r.p.x + r.p.y + r.t + sumq(r);",
+        # In a loop and as an argument.
+        "    let mut i: i64 = 0;",
+        "    while i < 3 { let p: P = P { x: i, ..base }; acc = acc + p.x + p.y; i = i + 1; }",
+        "    print_i64(acc);",
+        "    return 0;",
+        "}",
+    ]
+    rs = [
+        "#[derive(Copy, Clone)]",
+        "struct P { x: i64, y: i64 }",
+        "#[derive(Copy, Clone)]",
+        "struct Q { p: P, t: i64 }",
+        f"fn seed(n: i64) -> i64 {{ n * 3 + {b} }}",
+        "fn mk(n: i64) -> P { P { x: n, y: n + 1 } }",
+        "fn mutate(p: &mut P, v: i64) -> i64 { p.y = p.y + 100; v }",
+        "fn sumq(q: Q) -> i64 { q.p.x + q.p.y + q.t }",
+        "fn main() {",
+        f"    let n: i64 = seed({d});",
+        "    let mut acc: i64 = 0;",
+        "    let mut base: P = mk(n);",
+        "    let a: P = P { x: mutate(&mut base, n), ..base };",
+        "    acc += a.x + a.y + base.y;",
+        "    let b2: P = P { y: n + 7, ..base };",
+        "    acc += b2.x + b2.y;",
+        "    let mut c: P = P { x: n + 1, ..base };",
+        "    c.y = c.y + 50;",
+        "    acc += c.y + base.y;",
+        "    let e: P = P { ..base };",
+        "    acc += e.x + e.y;",
+        "    let f: P = P { x: n + 2, ..e };",
+        "    let g: P = P { y: n + 3, ..f };",
+        "    let q: Q = Q { p: g, t: n };",
+        "    let r: Q = Q { t: n + 4, ..q };",
+        "    acc += r.p.x + r.p.y + r.t + sumq(r);",
+        "    let mut i: i64 = 0;",
+        "    while i < 3 { let p: P = P { x: i, ..base }; acc += p.x + p.y; i += 1; }",
         '    println!("{}", acc);',
         "}",
     ]
@@ -1792,7 +1883,7 @@ def run_reject():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "robust", "reject"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "robust", "reject"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -1834,7 +1925,7 @@ def main():
            "nest": gen_nest_program, "pat": gen_pat_program,
            "order": gen_order_program, "shift": gen_shift_program,
            "cast": gen_cast_program, "assoc": gen_assoc_program,
-           "ref": gen_ref_program}[args.mode]
+           "ref": gen_ref_program, "update": gen_update_program}[args.mode]
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus
     # suite; a fuzz program is otherwise only checked with every pass on, so a

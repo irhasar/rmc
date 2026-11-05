@@ -3751,3 +3751,123 @@ fn a_break_value_in_a_while_let_is_rejected() {
     .unwrap_err();
     assert!(err.contains("break`"), "got: {err}");
 }
+
+// ---------------------------------------------------------------------------
+// Struct update syntax `S { field: value, ..base }`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_struct_update_fills_the_unwritten_fields_from_the_base() {
+    let out = asm(
+        "struct P { x: i64, y: i64 } \
+         fn main() -> i64 { let a: P = P { x: 1, y: 2 }; let b: P = P { x: 5, ..a }; return b.x + b.y; }",
+    );
+    assert!(out.contains("main:"), "accepted:\n{out}");
+}
+
+#[test]
+fn a_struct_update_evaluates_the_field_values_before_the_base() {
+    // rustc evaluates the written fields left to right, then the base. The
+    // desugaring binds each field value before `call mk`, so `call f` precedes
+    // `call mk` in the emitted code.
+    let out = asm_no_inline(
+        "struct P { x: i64, y: i64 } \
+         fn f(t: i64) -> i64 { return t; } \
+         fn mk() -> P { return P { x: 7, y: 8 }; } \
+         fn main() -> i64 { let b: P = P { x: f(1), ..mk() }; return b.x + b.y; }",
+    );
+    let f_at = out.find("call f").expect("call f");
+    let mk_at = out.find("call mk").expect("call mk");
+    assert!(f_at < mk_at, "field value must be evaluated before the base:\n{out}");
+}
+
+#[test]
+fn a_struct_update_copies_an_aggregate_field_by_value() {
+    // A struct-typed field must be copied word by word, not stored as an
+    // address, so the result does not alias the field's source.
+    let out = asm(
+        "struct Inner { a: i64 } struct P { i: Inner, y: i64 } \
+         fn main() -> i64 { let g: Inner = Inner { a: 5 }; let a: P = P { i: g, y: 2 }; \
+         let b: P = P { y: 9, ..a }; return b.i.a + b.y; }",
+    );
+    assert!(out.contains("main:"), "accepted:\n{out}");
+}
+
+#[test]
+fn a_struct_update_may_copy_every_field() {
+    // `P { ..a }` with no written fields is valid Rust.
+    let out = asm(
+        "struct P { x: i64, y: i64 } \
+         fn main() -> i64 { let a: P = P { x: 1, y: 2 }; let b: P = P { ..a }; return b.x + b.y; }",
+    );
+    assert!(out.contains("main:"), "accepted:\n{out}");
+}
+
+#[test]
+fn a_struct_update_base_may_be_another_struct_literal() {
+    let out = asm(
+        "struct P { x: i64, y: i64 } \
+         fn main() -> i64 { let a: P = P { x: 1, y: 2 }; \
+         let b: P = P { x: 3, ..P { y: 4, ..a } }; return b.x + b.y; }",
+    );
+    assert!(out.contains("main:"), "accepted:\n{out}");
+}
+
+#[test]
+fn a_struct_update_uses_a_local_that_does_not_alias_the_base() {
+    // The desugaring binds the base to a fresh local, so the result is an
+    // independent value: mutating it must not write through to the base.
+    let out = asm(
+        "struct P { x: i64, y: i64 } \
+         fn main() -> i64 { let a: P = P { x: 1, y: 2 }; let mut b: P = P { x: 5, ..a }; \
+         b.y = 9; return a.y + b.y; }",
+    );
+    assert!(out.contains("main:"), "accepted:\n{out}");
+}
+
+#[test]
+fn a_field_written_twice_in_a_struct_update_is_rejected() {
+    let err = compile_to_asm(
+        "struct P { x: i64, y: i64 } \
+         fn main() -> i64 { let a: P = P { x: 1, y: 2 }; let b: P = P { x: 5, x: 6, ..a }; return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("more than once"), "got: {err}");
+}
+
+#[test]
+fn a_struct_update_with_an_unknown_field_is_rejected() {
+    let err = compile_to_asm(
+        "struct P { x: i64, y: i64 } \
+         fn main() -> i64 { let a: P = P { x: 1, y: 2 }; let b: P = P { z: 5, ..a }; return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("has no field `z`"), "got: {err}");
+}
+
+#[test]
+fn a_struct_update_with_a_wrong_field_type_is_rejected() {
+    // The field value is bound to a temporary and assigned into the result, so
+    // the mismatch surfaces as an assignment type error.
+    let err = compile_to_asm(
+        "struct P { x: i64, y: i64 } \
+         fn main() -> i64 { let a: P = P { x: 1, y: 2 }; let b: P = P { x: true, ..a }; return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("mismatch"), "got: {err}");
+}
+
+#[test]
+fn a_struct_update_base_of_the_wrong_type_is_rejected() {
+    let err = compile_to_asm(
+        "struct P { x: i64, y: i64 } struct Q { z: i64 } \
+         fn main() -> i64 { let q: Q = Q { z: 1 }; let b: P = P { x: 5, ..q }; return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("does not match"), "got: {err}");
+}
+

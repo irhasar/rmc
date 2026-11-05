@@ -45,6 +45,8 @@ python3 tools/fuzz.py --mode order --n 500 --seed 1
 python3 tools/fuzz.py --mode shift --n 500 --seed 1
 python3 tools/fuzz.py --mode cast --n 500 --seed 1
 python3 tools/fuzz.py --mode assoc --n 500 --seed 1
+python3 tools/fuzz.py --mode ref --n 500 --seed 1
+python3 tools/fuzz.py --mode update --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 ```
 
@@ -656,6 +658,18 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   right-to-left rule above. The subscript is still bound once, so `a[next()] += 1`
   advances the counter once, not twice, and the cheap two-instruction form is
   kept when the subscript has no call.
+- **A struct update evaluates its fields before its base.** `S { f: v, ..base }`
+  is desugared by `desugar_struct_update` into
+  `{ let v = <field value>; ...; let mut t = base; t.f = v; ...; t }`: every
+  written field value is bound to a temporary *before* the base runs, which is
+  rustc's order (verified against `rustc -O`). Evaluating the base first is a
+  silent wrong answer when a field value mutates the base, so
+  `tools/fuzz.py --mode update` emits `S { x: mutate(&mut base, ..), ..base }`
+  and pins it. The result is a fresh local, so it never aliases the base, and a
+  field written twice is rejected at parse time (the plain-literal path catches
+  that in sema). A comma may not follow the base (rustc rejects it), and a
+  struct literal *is* allowed as the base (`..P { ..a }`), unlike the
+  struct-literal-in-condition restriction.
 - **Statements vs. tail expressions.** Assignments inside a block must be
   detected before the trailing-`;` check in `parse_block`, otherwise `x = ...;`
   is parsed as an expression and rejected.
