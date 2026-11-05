@@ -363,6 +363,24 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   10.6 ms. The measurement is a `Cell` because `off`/`array_off` take `&self`;
   the dry pass measures and the final pass is seeded with the result, so the
   prologue (emitted before the body) allocates the exact size.
+- **A function that addresses no frame slot also omits `%rbp`.** When
+  `frame_slots == 0 && spill_slots == 0` nothing is ever addressed through the
+  frame pointer, so `push %rbp`/`mov %rsp, %rbp`/`leave` are dropped and the
+  epilogue `add`s the frame back instead of pointing `%rsp` at the saved
+  registers. This is the same reasoning the hand-written `alloc` already uses
+  (see below), generalised to compiled functions. On the current benchmark set
+  it is a wash at run time — the out-of-order core hides a three-instruction
+  prologue — but it is strictly fewer instructions and a couple of bytes smaller
+  on a register-only leaf like `fib`. `uses_frame` is read *before* the body is
+  emitted, because emitting re-measures `frame_slots` and `off` is `&self`.
+- **The no-frame-pointer path needs its own alignment pad.** The call ABI wants
+  `%rsp ≡ 8 (mod 16)` at a call. With a frame pointer `push %rbp` supplies the
+  8; without it, the saved registers plus the frame must total 8 mod 16, so an
+  even number of saved registers (16 bytes) is followed by an 8-byte `sub`.
+  A misalignment is silent — rmc's runtime makes no aligned SSE access, so it
+  never faults — which is why it is checked statically over every program in
+  `bench/` and `tests/cases/` (every call-site function must show
+  `%rsp ≡ 8 (mod 16)`) rather than trusted to the behavioural suite.
 - **Two-pass codegen must reset every counter.** `gen_fn` runs the body twice and
   truncates the output between passes; the label counter, string table, spill
   high-water mark and frame-size measurement are part of that reset. Miss one and

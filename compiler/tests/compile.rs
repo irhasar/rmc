@@ -1341,16 +1341,17 @@ fn a_comparison_of_two_promoted_locals_is_one_cmp() {
 }
 
 #[test]
-fn spills_use_frame_slots_not_the_stack() {
-    // A value held across a call is spilled to a frame slot, so `%rsp` never
-    // moves and no 16-byte alignment pad is emitted around the call.
+fn spills_use_registers_not_the_stack() {
+    // A value held across a call is spilled to a callee-saved register (or, when
+    // those run out, a frame slot), never `push`ed: `%rsp` stays put mid-body,
+    // so no alignment pad is emitted around the call.
     let out = asm_no_inline(
         "fn f(x: i64) -> i64 { return x; } fn g(x: i64) -> i64 { return f(x - 1) + f(x - 2); } fn main() -> i64 { return g(5); }",
     );
     let g = &out[out.find("g:").unwrap()..out.find(".size g,").unwrap()];
     assert!(!g.contains("push %rax"), "no stack spill: {g}");
-    assert!(!g.contains("sub $8, %rsp"), "no alignment pad: {g}");
-    assert!(g.contains("(%rbp)"), "spill lands in a frame slot: {g}");
+    assert!(!g.contains("push %rcx"), "no stack spill: {g}");
+    assert!(g.contains("%r12"), "the cross-call value lives in a spill register: {g}");
 }
 
 #[test]
@@ -2597,6 +2598,49 @@ fn main_body(out: &str) -> String {
     body[..body.find(".size main").unwrap()].to_string()
 }
 
+/// Every `name: .. .size name` function body in the assembly.
+fn fn_bodies(out: &str) -> Vec<(String, String)> {
+    let lines: Vec<&str> = out.lines().collect();
+    let mut v = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let l = lines[i].trim();
+        if l.ends_with(':') && !l.starts_with('.') {
+            let name = l.trim_end_matches(':').to_string();
+            let mut body = String::new();
+            let mut j = i + 1;
+            while j < lines.len() && !lines[j].trim_start().starts_with(".size ") {
+                body.push_str(lines[j]);
+                body.push('\n');
+                j += 1;
+            }
+            v.push((name, body));
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    v
+}
+
+/// The depth a function's prologue pushes `%rsp` below its entry value, mod 16.
+/// Entry `%rsp` is 8 mod 16 (the caller's `call` pushed the return address), so
+/// the call ABI wants this to be 8: at a `call`, `%rsp` is then 0 mod 16.
+fn prologue_depth_mod16(body: &str) -> i32 {
+    let mut d = 0i32;
+    for l in body.lines() {
+        let t = l.trim();
+        if t.starts_with("push ") {
+            d += 8;
+        } else if let Some(rest) = t.strip_prefix("sub $") {
+            if let Some(n) = rest.strip_suffix(", %rsp") {
+                d += n.parse::<i32>().unwrap();
+            }
+        }
+    }
+    d % 16
+}
+
 /// The first loop in `main`: the label a later `jmp` targets, through that jump.
 /// Anything LICM hoisted sits before this region.
 fn loop_body(out: &str) -> String {
@@ -2758,14 +2802,49 @@ fn a_call_in_an_assignment_target_blocks_hoisting() {
 }
 
 #[test]
-fn a_register_only_leaf_allocates_no_frame() {
+fn a_register_only_leaf_has_no_frame_pointer() {
     // Every local is promoted into a callee-saved register and nothing is
-    // materialised, so the body addresses no frame slot and the prologue needs
-    // no `sub`. (The epilogue still restores `%rsp` to the saved registers.)
+    // materialised, so the body addresses no frame slot. Nothing is addressed
+    // through `%rbp`, so the prologue omits the frame pointer entirely — no
+    // `push %rbp`/`mov %rsp, %rbp`/`leave`. The two saved registers push 16
+    // bytes, which is 0 mod 16, so an 8-byte pad restores the 8 mod 16 the call
+    // ABI wants; that pad is the only `sub`.
     let src = "fn main() -> i64 { let a: i64 = 1; let b: i64 = 2; return a + b; }";
     let body = main_body(&asm(src));
-    assert!(!body.contains("sub $"), "a register-only leaf needs no frame:\n{body}");
-    assert!(body.contains("leave"), "the frame pointer is still restored:\n{body}");
+    assert!(!body.contains("push %rbp"), "no frame pointer without frame slots:\n{body}");
+    assert!(!body.contains("leave"), "no `leave` without a frame pointer:\n{body}");
+    assert!(!body.contains("sub $16"), "only the alignment pad, no local frame:\n{body}");
+}
+
+#[test]
+fn every_function_keeps_rsp_aligned_at_calls() {
+    // The call ABI wants `%rsp ≡ 8 (mod 16)` at entry (so 0 at a `call`). Both
+    // prologue paths must honour it: with a frame pointer the `push %rbp`
+    // supplies the 8, without one an explicit pad does. A violation is silent
+    // (rmc's runtime never touches aligned SSE), so it is asserted here over a
+    // mix of leaf, spill-heavy and frame-heavy functions.
+    let srcs = [
+        "fn main() -> i64 { return 1; }",
+        "fn main() -> i64 { let a: i64 = 1; let b: i64 = 2; return a + b; }",
+        "fn f(x: i64) -> i64 { return x; } fn g(x: i64) -> i64 { return f(x - 1) + f(x - 2); } fn main() -> i64 { return g(5); }",
+        "fn main() -> i64 { let a: [i64; 3] = [1, 2, 3]; return a[0] + a[1] + a[2]; }",
+        "fn main() -> i64 { let mut s: i64 = 0; let mut i: i64 = 0; while i < 10 { s = s + i; i = i + 1; } return s; }",
+    ];
+    for src in srcs {
+        for out in [asm(src), asm_no_inline(src)] {
+            for (name, body) in fn_bodies(&out) {
+                // `_start` realigns `%rsp` itself (`and $-16, %rsp`) and is not
+                // a compiled function; the other runtime helpers take no calls.
+                if name.starts_with('_') || !body.contains("call ") {
+                    continue;
+                }
+                assert_eq!(
+                    prologue_depth_mod16(&body), 8,
+                    "`{name}` misaligns `%rsp` at a call:\n{body}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
