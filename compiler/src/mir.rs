@@ -2016,11 +2016,14 @@ impl Function {
             }
         }
 
-        // Each backward branch is a latch; group latches by their header.
+        // Each back edge (an edge `p -> s` where `s` can reach `p`) is a latch;
+        // group latches by their header. Numeric order is not enough: rustc can
+        // lay a loop out so its preheader has a *lower* block number than the
+        // header, which would misread that edge as a back edge.
         let mut latches: HashMap<u32, Vec<u32>> = HashMap::new();
         for (b, blk) in self.blocks.iter().enumerate() {
             for s in successors(&blk.term) {
-                if s <= b as u32 {
+                if s == b as u32 || reaches(&preds, s, b as u32) {
                     latches.entry(s).or_default().push(b as u32);
                 }
             }
@@ -2101,24 +2104,23 @@ impl Function {
                     .chain(term_defs(blk))
             })
             .collect();
-        // ...nor can values that would be `Move`d inside the loop: the hoisted
-        // read happens before that move.
-        let moved_in: HashSet<u32> = self
-            .blocks
-            .iter()
-            .enumerate()
-            .filter(|(b, _)| loop_blocks.contains(&(*b as u32)))
-            .flat_map(|(_, blk)| blk.stmts.iter().filter_map(stmt_moved_local))
-            .collect();
-        let defined_in: HashSet<u32> = defined_in.union(&moved_in).copied().collect();
+        // A `Move` is not an invalidation here: the back end copies the value,
+        // so a `move`d scalar still holds it. Excluding moved locals would block
+        // hoisting the very loads the inliner creates, because rustc emits the
+        // accumulator fold over them with `move`.
 
         // `_0` (the return slot) is written by `return` and by calls; never hoist
         // a definition of it, and never treat it as invariant.
         let is_invariant = |l: u32| !defined_in.contains(&l) && l != 0;
 
+        // A deterministic block order, so the hoisted statements come out in
+        // the same order on every run.
+        let mut ordered: Vec<u32> = loop_blocks.iter().copied().collect();
+        ordered.sort_unstable();
+
         // Collect hoistable statements, in block order.
         let mut hoisted: Vec<Stmt> = Vec::new();
-        for &b in &loop_blocks {
+        for &b in &ordered {
             let blk = &self.blocks[b as usize];
             for s in &blk.stmts {
                 let Stmt::Assign(dest, rv) = s else { continue };
@@ -2150,7 +2152,7 @@ impl Function {
         // instead. rustc keeps the accessor calls in `refs`' hot loop; hoisting
         // them is what the AST backend's `licm` achieves by inlining first.
         let mut hoisted_calls: Vec<(u32, u32, CallTarget, Vec<Operand>, u32)> = Vec::new();
-        for &b in &loop_blocks {
+        for &b in &ordered {
             if b == header {
                 continue; // the header's terminator is the loop test
             }
@@ -2225,10 +2227,12 @@ impl Function {
 
         // Prepend the hoisted statements to the preheader and redirect it into
         // the call chain (or straight to the header when there is none).
+        // The hoisted statements are appended to the preheader, *after* its own
+        // statements: the loop-invariant operands they read are defined there
+        // (rustc emits the loop setup in the preheader), so prepending would
+        // read them before they are written.
         let pre = &mut self.blocks[preheader as usize];
-        let mut new_stmts = hoisted;
-        new_stmts.append(&mut pre.stmts);
-        pre.stmts = new_stmts;
+        pre.stmts.extend(hoisted);
         pre.term = Terminator::Goto(chain_entry);
         true
     }
@@ -2255,6 +2259,26 @@ impl Function {
         }
         in_loop
     }
+}
+
+/// Whether `from` can reach `to` by following predecessor edges, i.e. `from`
+/// dominates-or-equals `to` in the block order. Used to tell a back edge from a
+/// forward one without relying on block numbering.
+fn reaches(preds: &[Vec<u32>], from: u32, to: u32) -> bool {
+    let mut seen = HashSet::new();
+    let mut stack = vec![to];
+    while let Some(b) = stack.pop() {
+        if b == from {
+            return true;
+        }
+        if !seen.insert(b) {
+            continue;
+        }
+        for &p in &preds[b as usize] {
+            stack.push(p);
+        }
+    }
+    false
 }
 
 /// The successor blocks of a terminator.
@@ -2353,29 +2377,4 @@ fn rv_operands(rv: &Rvalue) -> Vec<Place> {
         _ => {}
     }
     v
-}
-
-/// The local a statement moves out of, if it is a `Move` of a whole scalar
-/// local (so the loop would consume it).
-fn stmt_moved_local(s: &Stmt) -> Option<u32> {
-    let Stmt::Assign(_, rv) = s else { return None };
-    let mut found = None;
-    let mut note = |op: &Operand| {
-        if let Operand::Move(p) = op {
-            if p.proj.is_empty() {
-                found = Some(p.local);
-            }
-        }
-    };
-    match rv {
-        Rvalue::Use(op) => note(op),
-        Rvalue::Binary(_, a, b) => {
-            note(a);
-            note(b);
-        }
-        Rvalue::Unary(_, a) => note(a),
-        Rvalue::Cast { op, .. } => note(op),
-        _ => {}
-    }
-    found
 }

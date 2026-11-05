@@ -40,5 +40,6 @@ fn short_term(t: &rmc::mir::Terminator) -> String {
             format!("switch {} targets -> else {otherwise}", targets.len())
         }
         rmc::mir::Terminator::Call { func, .. } => format!("call {func:?}"),
+        rmc::mir::Terminator::Assert { negate, .. } => format!("assert negate={negate}"),
     }
 }
