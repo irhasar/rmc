@@ -75,6 +75,35 @@ impl E {
     }
 }
 
+// A pattern reads through a reference to the scrutinee, as match ergonomics
+// does: `&e` is dereferenced to the `E` underneath, so the test and every
+// payload read go through the one deref.
+fn via_ref(e: &E) -> i64 {
+    match e {
+        E::Pair(x, _) => return x * 2,
+        E::Trip(x, ..) => return x * 3,
+        _ => return 0,
+    }
+}
+
+fn unit_via_ref(e: &E) -> i64 {
+    match e {
+        E::None => return 100,
+        E::Pair(_, _) => return 200,
+        E::Trip(_, _, _) => return 300,
+        E::Hold(_) => return 400,
+        E::Arr(_) => return 500,
+        E::Mix(_, _, _) => return 600,
+    }
+}
+
+fn nested_via_ref(e: &E) -> i64 {
+    match e {
+        E::Hold(S { a: [p, q], b: I { u } }) => return p * 100 + q * 10 + u,
+        _ => return 0,
+    }
+}
+
 fn main() -> i64 {
     print_i64(wildcard(E::Pair(3, 4)));
     print_i64(mutate(E::Pair(3, 4)));
@@ -91,6 +120,20 @@ fn main() -> i64 {
     let e: E = E::Hold(S { a: [4, 5], b: I { u: 6 } });
     if let E::Hold(S { a: [p, q], b: I { u } }) = e {
         print_i64(p + q + u);
+    }
+
+    // Patterns through a reference to the scrutinee.
+    print_i64(via_ref(&E::Pair(7, 8)));
+    print_i64(via_ref(&E::Trip(9, 10, 11)));
+    print_i64(via_ref(&E::None));
+    print_i64(unit_via_ref(&E::None));
+    print_i64(unit_via_ref(&E::Arr([1, 2])));
+    print_i64(nested_via_ref(&E::Hold(S { a: [1, 2], b: I { u: 3 } })));
+
+    // `if let` through a reference.
+    let f: E = E::Pair(21, 22);
+    if let E::Pair(x, y) = &f {
+        print_i64(x * 100 + y);
     }
 
     return 0;

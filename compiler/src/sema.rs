@@ -2377,6 +2377,19 @@ impl Sema {
                 let n_binds = *n_binds;
                 let has_rest = *has_rest;
                 let st = self.check_expr(scrutinee, scope)?;
+                // A pattern reads through a reference to the scrutinee, as a
+                // struct pattern does: match ergonomics dereferences `&E` to the
+                // `E` underneath, so `match &e { E::A(x) => .. }` works. The
+                // test and every payload read then go through the one `Deref`.
+                let st = match st {
+                    Type::Ref(inner, _) => {
+                        let inner = *inner;
+                        let r = std::mem::replace(scrutinee.as_mut(), Expr::Int(0));
+                        **scrutinee = Expr::Deref { expr: Box::new(r), ty: inner.clone() };
+                        inner
+                    }
+                    other => other,
+                };
                 let ename = match &st {
                     Type::Enum(n) | Type::EnumData(n, _) => n.clone(),
                     other => {
@@ -2423,6 +2436,18 @@ impl Sema {
                 let variant = variant.clone();
                 let idx = *idx;
                 let rt = self.check_expr(recv, scope)?;
+                // A payload read auto-derefs a reference to the enum, matching
+                // the test that gates it: the desugared `E::A(x)` reads through
+                // `&e`, so the read goes through the same one `Deref`.
+                let rt = match rt {
+                    Type::Ref(inner, _) => {
+                        let inner = *inner;
+                        let r = std::mem::replace(recv.as_mut(), Expr::Int(0));
+                        **recv = Expr::Deref { expr: Box::new(r), ty: inner.clone() };
+                        inner
+                    }
+                    other => other,
+                };
                 let info = self
                     .enums
                     .get(&enum_name)

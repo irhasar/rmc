@@ -2008,6 +2008,50 @@ fn a_variant_payload_pattern_works_in_an_if_let() {
 }
 
 #[test]
+fn a_variant_pattern_reads_through_a_reference() {
+    // Match ergonomics dereferences a `&E` scrutinee, exactly as a struct
+    // pattern reads through a `&S`: `match &e { E::A(x) => .. }` must compile,
+    // and the payload read goes through the same `Deref` the test does. The
+    // scrutinee is a reference, so codegen emits a load of the tag word before
+    // the compare; a payload field is then read at its offset past the tag.
+    let src = "enum E { A(i64, i64), B } \
+               fn main() -> i64 { let e: E = E::A(3, 4); \
+               return match &e { E::A(_, y) => y, E::B => 0 }; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+
+    // A unit variant through a reference, and an `if let`.
+    let unit = "enum E { A, B } \
+                fn main() -> i64 { let e: E = E::B; \
+                return match &e { E::A => 1, E::B => 2 }; }";
+    assert!(compile_to_asm(unit, &CompileOptions::default()).is_ok());
+    let iflet = "enum E { A(i64), B } \
+                 fn main() -> i64 { let e: E = E::A(9); \
+                 if let E::A(x) = &e { return x; } return 0; }";
+    assert!(compile_to_asm(iflet, &CompileOptions::default()).is_ok());
+
+    // The auto-deref must not accept a reference to a *different* enum: the
+    // referent is what the pattern is checked against.
+    let err = compile_to_asm(
+        "enum E { A, B } enum F { C, D } \
+         fn main() -> i64 { let e: E = E::A; \
+         return match &e { F::C => 1, _ => 0 }; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("cannot match"), "got: {err}");
+}
+
+#[test]
+fn a_variant_pattern_reads_through_a_nested_aggregate_reference() {
+    // A reference to an enum whose payload is an aggregate: the nested
+    // sub-pattern reads through the one `Deref` into the payload's fields.
+    let src = "struct S { a: [i64; 2] } enum E { A(S), B } \
+               fn main() -> i64 { let e: E = E::A(S { a: [3, 4] }); \
+               return match &e { E::A(S { a: [p, q] }) => p * 10 + q, E::B => 0 }; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
 fn constant_division_by_zero_is_rejected() {
     // rustc denies `1 / 0` (it would panic); rmc used to emit an `idiv` that
     // faults at run time.
