@@ -52,6 +52,7 @@ python3 tools/fuzz.py --mode fordestr --n 500 --seed 1
 python3 tools/fuzz.py --mode nestpat --n 500 --seed 1
 python3 tools/fuzz.py --mode arrpat --n 500 --seed 1
 python3 tools/fuzz.py --mode parampat --n 500 --seed 1
+python3 tools/fuzz.py --mode enumpat --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 ```
 
@@ -1265,6 +1266,20 @@ The checks, all in `sema.rs`:
   pattern (literal, variant, or-pattern) is rejected (`param_pat_binds`), and
   `mut` on the whole pattern is rejected. `sema` inserts a `None` into
   `param_pats` when it prepends the `self` receiver, keeping the vectors aligned.
+- **Enum payload sub-patterns.** A payload variant's argument list takes the
+  same sub-patterns a struct field or array element does: `E::A(_, y)`,
+  `E::A(mut x)`, `E::A(S { x })`, `E::A([a, b])`, and a trailing `..`
+  (`E::A(x, ..)`, `E::A(..)`). `Pat::Variant` carries `Option<(Vec<(bool, Pat)>,
+  bool)>` — the argument patterns and the `..` flag. `desugar_arm` reads each
+  argument as `EnumPayload { idx }` (the payload at its field index) and feeds it
+  to `pat_binds_into`, which recurses through `struct_pat_binds` /
+  `array_pat_binds`, so a nested pattern reads *through* the payload at its
+  offset rather than copying the whole aggregate first. `VariantTest` carries
+  `n_binds` (the argument count) and `has_rest`; `check_expr` requires
+  `n_binds == fields.len()` unless `has_rest`, and rejects a payload read past
+  the last field. A nested *variant* argument (`E::A(Inner::X(v))`) is
+  refutable, so `parse_variant_pat_args` rejects it, as it rejects a literal
+  argument, since rmc generates no per-field test.
 - **Casts (`E0054`/`E0605`/`E0606`).** `check_cast` restricts `as` to the
   conversions rustc allows plus rmc's two documented extensions. A reference may
   only become a reference to the same type (`&mut T` may lose mutability to
@@ -1367,7 +1382,11 @@ chain of distinct struct types, so the pattern nests several levels deep, and
 emits each pattern in `let`, `match` (through a reference), `if let` and `for`.
 The expansion is a chain of field reads, so a wrong field order or a missing
 intermediate read shows up as a wrong final value; `letdestr`/`fordestr` only
-reach one level, so a deeper sub-pattern had no randomised coverage. It compares
+reach one level, so a deeper sub-pattern had no randomised coverage. `enumpat`
+mode builds payload variant patterns with sub-patterns (`_`, `mut x`, a trailing
+`..`, and a nested struct or array pattern inside `E::V(..)`), in `match`,
+`if let` and a method, which no other mode emits; each function is called twice
+so a shared slot or a leaked `mut` write is observable. It compares
 stdout and exit status against `rustc -O`, and it recompiles each program with
 every optimiser pass off in turn (`--no-inline`, `--no-licm`, `--no-tco`, all
 three), the same matrix the corpus suite uses — a pass-specific bug is otherwise
