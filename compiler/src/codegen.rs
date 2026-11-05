@@ -2617,7 +2617,7 @@ impl Codegen {
                 }
             } else {
                 let (m, s, add) = Self::sdiv_magic(mag);
-                self.line(&format!("movabs ${m}, %rcx"));
+                self.mov_imm64(m, "%rcx");
                 self.line("imul %rcx");
                 if add {
                     // `imul` clobbers %rax with the low product, so the
@@ -2637,7 +2637,7 @@ impl Codegen {
                 // take the remainder now, skipping the `%rdx`->`%rax`->`%rdx`
                 // round-trip the shared tail below would emit.
                 if matches!(op, BinOp::Mod) {
-                    self.line(&format!("movabs ${d}, %rcx"));
+                    self.mov_imm64(d, "%rcx");
                     self.line("imul %rcx, %rdx");
                     self.line("sub %rdx, %r8");
                     self.line("mov %r8, %rax");
@@ -2648,7 +2648,7 @@ impl Codegen {
         }
         if matches!(op, BinOp::Mod) {
             self.line("mov %rax, %rdx");
-            self.line(&format!("movabs ${d}, %rcx"));
+            self.mov_imm64(d, "%rcx");
             self.line("imul %rcx, %rdx");
             self.line("sub %rdx, %r8");
             self.line("mov %r8, %rax");
@@ -2665,6 +2665,20 @@ impl Codegen {
     /// ```
     ///
     /// `add` is needed for roughly a quarter of divisors.
+    /// Load a 64-bit constant into `reg`. `movabs` is only needed when the
+    /// value does not fit in a sign-extended 32-bit immediate; otherwise the
+    /// shorter `mov $k, reg` encodes the same value in 7 bytes instead of 10.
+    /// The magic multiplier and the divisor are frequently small (a benchmark
+    /// dividing by a small constant), so this trims the divide sequence and the
+    /// artifact with it.
+    fn mov_imm64(&mut self, v: i64, reg: &str) {
+        if (-2_147_483_648..=2_147_483_647).contains(&v) {
+            self.line(&format!("mov ${v}, {reg}"));
+        } else {
+            self.line(&format!("movabs ${v}, {reg}"));
+        }
+    }
+
     fn sdiv_magic(d: u64) -> (i64, u32, bool) {
         const N: u32 = 64;
         let smin: u128 = 1u128 << (N - 1);

@@ -1476,6 +1476,25 @@ fn modulo_by_a_constant_has_no_round_trip() {
 }
 
 #[test]
+fn a_small_divisor_uses_a_short_immediate() {
+    // `movabs` is 10 bytes; when the divisor (or the magic multiplier) fits in a
+    // sign-extended 32-bit immediate the 7-byte `mov` encodes the same value.
+    // The remainder path materialises the divisor itself (`/` folds it into the
+    // magic multiply), so a small `%` divisor is where the short form shows.
+    let out = asm("fn main() -> i64 { let a: i64 = 7; return a % 3; }");
+    assert!(out.contains("mov $3, %rcx"), "small divisor is a short immediate:\n{out}");
+    assert!(!out.contains("movabs $3,"), "no movabs for a value that fits i32");
+}
+
+#[test]
+fn a_wide_magic_multiplier_keeps_movabs() {
+    // A divisor whose magic multiplier needs all 64 bits must still use
+    // `movabs`; the short form would truncate it.
+    let out = asm("fn main() -> i64 { let a: i64 = 7; return a / 1000003; }");
+    assert!(out.contains("movabs $"), "wide multiplier keeps movabs:\n{out}");
+}
+
+#[test]
 fn a_variable_shift_count_goes_in_cl() {
     // x86 shifts take the count in `%cl`; the right operand already lands in
     // `%rcx`, so no extra move is needed.
