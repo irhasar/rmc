@@ -174,6 +174,7 @@ while cond { ... }
 while let PAT = expr { ... }  // re-tests expr each iteration; stops on no match
 for i in 0..10 { ... }   // i64 range, end exclusive
 for i in 0..=10 { ... }  // i64 range, end inclusive
+for x in arr { ... }     // array, by value, left to right (x is the element)
 loop { ... }
 loop { ... break v; }    // `loop` is an expression: `break v` yields `v`
 break;
@@ -196,7 +197,11 @@ names must be unique, and `main` takes no arguments. Constant arithmetic that
 would trap — division or remainder by zero, `i64` overflow, or a shift by 64 or
 more — is a compile error, matching rustc; variable operands are still checked
 at run time only when `--overflow-checks` is on. `for` bounds are evaluated
-once, before the loop; `continue` still runs the increment. `while let` is
+once, before the loop; `continue` still runs the increment. `for x in arr`
+iterates an array by value: the head is evaluated once, the bound is the
+array's compile-time length, and `x` is a fresh immutable binding each
+iteration. Only a binding or `_` may be the loop variable; `for x in &arr`
+(which Rust iterates by reference) is rejected rather than mistyped. `while let` is
 `loop { if let PAT = expr { body } else { break; } }`: the scrutinee is
 re-evaluated every iteration, and `continue` re-tests it rather than jumping to
 the top.

@@ -571,6 +571,141 @@ impl Parser {
         Ok(Block { stmts, tail })
     }
 
+    /// `for PAT in ITER { body }`. Two iterables are supported: an integer
+    /// range (`a..b` / `a..=b`) and an array.
+    ///
+    /// The range form keeps its own node, because `continue` must still run the
+    /// increment, so it cannot be desugared to a `while`.
+    ///
+    /// The array form desugars to that same range loop, indexing the array:
+    ///
+    /// ```text
+    /// { let arr = EXPR; for i in 0..arr.len() { let PAT = arr[i]; body } }
+    /// ```
+    ///
+    /// `EXPR` is bound to a hidden temporary so an array expression with a side
+    /// effect (a call, a literal) runs exactly once, and `arr.len()` folds to
+    /// the array's compile-time length, so the loop bound is a literal and the
+    /// loop carries no hidden slot.
+    fn parse_for(&mut self) -> PResult<Stmt> {
+        // A loop variable that names a constant shadows it (rustc E0530).
+        // `parse_pattern` would otherwise read the name as that constant's
+        // value, so the check happens here, before the pattern is parsed.
+        if let Some(Tok::Ident(n)) = self.peek() {
+            if self.consts.contains_key(n) || self.const_bools.contains_key(n) {
+                return Err(format!(
+                    "identifier `{n}` shadows a constant of the same name"
+                ));
+            }
+        }
+        let pat = self.parse_pattern()?;
+        self.expect(Tok::In)?;
+        let head = self.parse_cond()?;
+        // `for x in &arr` iterates by *reference* in Rust: `x` is `&i64`, not
+        // `i64`. rmc iterates by value, so accepting the `&` form would silently
+        // give `x` the wrong type (and diverge from rustc's typing). Reject it
+        // rather than mis-compile; the by-value form is `for x in arr`.
+        if matches!(head, Expr::AddrOf { .. }) {
+            return Err(format!(
+                "at byte {}: `for` over a reference is not supported; \
+                 iterate by value with `for x in arr`",
+                self.pos()
+            ));
+        }
+        if self.peek() == Some(&Tok::DotDot) || self.peek() == Some(&Tok::DotDotEq) {
+            let inclusive = self.eat(&Tok::DotDotEq);
+            if !inclusive {
+                self.expect(Tok::DotDot)?;
+            }
+            let end = self.parse_cond()?;
+            let body = self.parse_block()?;
+            let var = match pat {
+                Pat::Bind(n) => n,
+                Pat::Wild => {
+                    let n = format!("\u{0}fi{}", self.tmp);
+                    self.tmp += 1;
+                    n
+                }
+                _ => {
+                    return Err(format!(
+                        "at byte {}: `for` over a range needs a binding or `_`",
+                        self.pos()
+                    ))
+                }
+            };
+            return Ok(Stmt::For {
+                var,
+                var_slot: -1,
+                start: head,
+                end,
+                end_slot: -1,
+                inclusive,
+                body,
+            });
+        }
+        let body = self.parse_block()?;
+        Ok(self.desugar_for_array(pat, head, body))
+    }
+
+    /// `for PAT in ARRAY { body }` -> an index loop over the array (see
+    /// `parse_for`). `PAT` must be a binding or `_`; a compound pattern is
+    /// rejected rather than mis-bound, since rmc has no destructuring `let`.
+    fn desugar_for_array(&mut self, pat: Pat, arr: Expr, body: Block) -> Stmt {
+        let n = self.tmp;
+        self.tmp += 1;
+        let arr_name = format!("\u{0}fa{n}");
+        let idx_name = format!("\u{0}fi{n}");
+        let bind_name = match pat {
+            Pat::Bind(name) => name,
+            Pat::Wild => format!("\u{0}fd{n}"),
+            _ => {
+                return Stmt::Expr(Expr::Block(Block {
+                    stmts: vec![Stmt::Expr(Expr::Int(0))],
+                    tail: None,
+                }))
+            }
+        };
+        let arr_var =
+            Expr::Var { name: arr_name.clone(), slot: -1, ty: Type::I64 };
+        let idx_var =
+            Expr::Var { name: idx_name.clone(), slot: -1, ty: Type::I64 };
+        // `arr.len()` — a `MethodCall` sema folds to the array's constant length.
+        let len = Expr::MethodCall {
+            recv: Box::new(arr_var.clone()),
+            name: "len".to_string(),
+            args: Vec::new(),
+        };
+        let elem = Expr::Index(Box::new(arr_var), Box::new(idx_var));
+        // `let PAT = arr[i];` runs before the user body each iteration.
+        let mut stmts = vec![Stmt::Let {
+            name: bind_name,
+            ty: None,
+            init: Some(elem),
+            slot: -1,
+            mutable: false,
+        }];
+        stmts.extend(body.stmts);
+        let loop_body = Block { stmts, tail: body.tail };
+        let for_stmt = Stmt::For {
+            var: idx_name,
+            var_slot: -1,
+            start: Expr::Int(0),
+            end: len,
+            end_slot: -1,
+            inclusive: false,
+            body: loop_body,
+        };
+        // Bind the array once, outside the loop.
+        let arr_let = Stmt::Let {
+            name: arr_name,
+            ty: None,
+            init: Some(arr),
+            slot: -1,
+            mutable: false,
+        };
+        Stmt::Expr(Expr::Block(Block { stmts: vec![arr_let, for_stmt], tail: None }))
+    }
+
     /// Consume the `;` that ends a statement, but allow it to be omitted when
     /// the statement is the last thing in a block (`{ return 2 }`, `{ break }`).
     /// Rust treats `return`/`break`/`continue` as diverging, so a trailing
@@ -644,18 +779,7 @@ impl Parser {
             }
             Some(Tok::For) => {
                 self.i += 1;
-                let var = self.expect_ident()?;
-                self.expect(Tok::In)?;
-                let start = self.parse_cond()?;
-                let inclusive = if self.eat(&Tok::DotDotEq) {
-                    true
-                } else {
-                    self.expect(Tok::DotDot)?;
-                    false
-                };
-                let end = self.parse_cond()?;
-                let body = self.parse_block()?;
-                Ok(Stmt::For { var, var_slot: -1, start, end, end_slot: -1, inclusive, body })
+                self.parse_for()
             }
             Some(Tok::Return) => {
                 self.i += 1;

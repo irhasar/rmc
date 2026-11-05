@@ -169,6 +169,53 @@ fn an_inclusive_range_uses_a_non_strict_back_edge() {
 }
 
 #[test]
+fn for_over_an_array_iterates_by_value() {
+    // `for x in arr` desugars to an index loop over the array; the length folds
+    // to a literal, so the loop carries no hidden end slot.
+    let src = "fn main() -> i64 { let a: [i64; 3] = [1, 2, 3]; \
+               let mut s: i64 = 0; for x in a { s = s + x; } return s; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn for_over_an_array_runs_an_array_expression_once() {
+    // The iterated expression is bound to a hidden temporary before the loop,
+    // so a call in the head is evaluated exactly once, not once per iteration.
+    let src = "fn mk() -> [i64; 3] { return [1, 2, 3]; } \
+               fn main() -> i64 { let mut s: i64 = 0; for x in mk() { s = s + x; } return s; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn for_over_an_array_supports_continue_and_break() {
+    // The desugared loop is a `for`, so `continue` runs the index increment and
+    // `break` leaves; both must still be legal in the body.
+    let src = "fn main() -> i64 { let a: [i64; 4] = [1, 2, 3, 4]; let mut s: i64 = 0; \
+               for x in a { if x == 2 { continue; } if x == 4 { break; } s = s + x; } return s; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn for_over_an_array_with_a_wildcard_binding_is_accepted() {
+    let src = "fn main() -> i64 { let a: [i64; 3] = [1, 2, 3]; \
+               let mut c: i64 = 0; for _ in a { c = c + 1; } return c; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn for_over_a_reference_is_rejected() {
+    // `for x in &a` would iterate by reference in Rust; rmc iterates by value,
+    // so it rejects the form rather than silently mistype `x`.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let a: [i64; 3] = [1, 2, 3]; \
+         let mut s: i64 = 0; for x in &a { s = s + x; } return s; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("reference"), "got: {err}");
+}
+
+#[test]
 fn compound_assignment_expands() {
     // `x += 4` folds into a single `lea` when the target is register-resident,
     // and otherwise into an `add`. Either is the expansion; what matters is

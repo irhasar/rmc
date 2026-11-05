@@ -405,6 +405,21 @@ def gen_stmt_program(rng):
     rs.append(f"    let fb: i64 = {fb};")
     rms.append(f"    for fi in fa{op}fb {{ acc = acc + fi * 3; }}")
     rs.append(f"    for fi in fa{op}fb {{ acc += fi * 3; }}")
+    # `for x in ARRAY`: the array is iterated by value, and the head is a local
+    # (not a literal) so a stale read shows up. A `continue` keeps the increment
+    # path live, and a wildcard counts the elements.
+    rms.append("    let farr: [i64; 3] = [1, 2, 3];")
+    rs.append("    let farr: [i64; 3] = [1, 2, 3];")
+    rms.append("    for fv in farr { acc = acc + fv * 5; }")
+    rs.append("    for fv in farr { acc += fv * 5; }")
+    rms.append("    let mut fc: i64 = 0;")
+    rs.append("    let mut fc: i64 = 0;")
+    rms.append("    for fv in farr { if fv == 2 { continue; } fc = fc + fv; }")
+    rs.append("    for fv in farr { if fv == 2 { continue; } fc += fv; }")
+    rms.append("    for _ in farr { fc = fc + 1; }")
+    rs.append("    for _ in farr { fc += 1; }")
+    rms.append("    acc = acc + fc * 17;")
+    rs.append("    acc += fc * 17;")
     # A bool array built from a list literal, then counted. Guards the
     # list-literal element-type inference and bool indexing.
     rms.append("    let flags: [bool; 4] = [true, false, i < 1, true];")
