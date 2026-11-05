@@ -25,8 +25,9 @@ Modes:
           write, which `stmt` never emits
     pat   `match` expressions: a multi-variant enum, a variant with two
           payload fields, a binding pattern, a negative literal, a nested
-          `match`, and a non-trivial side-effecting scrutinee (the temporary
-          `desugar_match` binds it to, which must be evaluated once)
+          `match`, string literal patterns, and a non-trivial side-effecting
+          scrutinee (the temporary `desugar_match` binds it to, which must be
+          evaluated once)
 
 The reference is `rustc -O`, so a mismatch is a real semantic divergence.
 """
@@ -699,6 +700,10 @@ def gen_pat_program(rng):
     # A non-empty integer range, half-open and inclusive.
     rlo = rng.randint(-5, 2)
     rhi = rlo + rng.randint(1, 5)
+    # Two string literals from the shared two-letter alphabet, so collisions
+    # and shared prefixes are common: a pointer compare and a content compare
+    # then disagree on which arm fires.
+    s0, s1 = gen_str_lit(rng), gen_str_lit(rng)
 
     rms = [
         "fn side(k: i64) -> i64 { print_i64(k); return k * 3 + 1; }",
@@ -729,6 +734,10 @@ def gen_pat_program(rng):
         f"fn orrange(x: i64) -> i64 {{ return match x {{ {rlo}..={rhi} => 1, {v} | {v + 5} => 2, _ => 0 }}; }}",
         f"fn oriflet(x: i64) -> i64 {{ if let {v} | {v + 1} = x {{ 5 }} else {{ 6 }} }}",
         f"fn rangeiflet(x: i64) -> i64 {{ if let {rlo}..={rhi} = x {{ 7 }} else {{ 8 }} }}",
+        f"fn strmatch(sel: i64) -> i64 {{ let s = if sel == 0 {{ {s0} }} else {{ {s1} }}; return match s {{ {s0} => 1, {s1} => 2, _ => 3 }}; }}",
+        f"fn stror(sel: i64) -> i64 {{ let s = if sel == 0 {{ {s0} }} else {{ {s1} }}; return match s {{ {s0} | {s1} => 1, _ => 2 }}; }}",
+        f"fn striflet(sel: i64) -> i64 {{ let s = if sel == 0 {{ {s0} }} else {{ {s1} }}; if let {s0} = s {{ 5 }} else {{ 6 }} }}",
+        f"fn strbind(sel: i64) -> i64 {{ let s = if sel == 0 {{ {s0} }} else {{ {s1} }}; return match s {{ {s0} => 1, other => if other == {s1} {{ 2 }} else {{ 3 }} }}; }}",
         "fn main() -> i64 {",
         "    let mut acc: i64 = 0;",
         f"    let arr: [i64; 4] = [{a0}, {a1}, {v}, {k}];",
@@ -747,6 +756,7 @@ def gen_pat_program(rng):
         "        acc = acc + orpat(i) + orpat_color(c) + rangepat(i) + range_excl(i);",
         "        acc = acc + orrange(i) + oriflet(i) + rangeiflet(i);",
         "        acc = acc + iflet_color(c) + iflet_rect(s);",
+        "        acc = acc + strmatch(i % 2) + stror(i % 2) + striflet(i % 2) + strbind(i % 2);",
         "        i = i + 1;",
         "    }",
         "    print_i64(acc);",
@@ -785,6 +795,10 @@ def gen_pat_program(rng):
         f"fn orrange(x: i64) -> i64 {{ match x {{ {rlo}..={rhi} => 1, {v} | {v + 5} => 2, _ => 0 }} }}",
         f"fn oriflet(x: i64) -> i64 {{ if let {v} | {v + 1} = x {{ 5 }} else {{ 6 }} }}",
         f"fn rangeiflet(x: i64) -> i64 {{ if let {rlo}..={rhi} = x {{ 7 }} else {{ 8 }} }}",
+        f"fn strmatch(sel: i64) -> i64 {{ let s = if sel == 0 {{ {s0} }} else {{ {s1} }}; match s {{ {s0} => 1, {s1} => 2, _ => 3 }} }}",
+        f"fn stror(sel: i64) -> i64 {{ let s = if sel == 0 {{ {s0} }} else {{ {s1} }}; match s {{ {s0} | {s1} => 1, _ => 2 }} }}",
+        f"fn striflet(sel: i64) -> i64 {{ let s = if sel == 0 {{ {s0} }} else {{ {s1} }}; if let {s0} = s {{ 5 }} else {{ 6 }} }}",
+        f"fn strbind(sel: i64) -> i64 {{ let s = if sel == 0 {{ {s0} }} else {{ {s1} }}; match s {{ {s0} => 1, other => if other == {s1} {{ 2 }} else {{ 3 }} }} }}",
         "fn main() {",
         "    let mut acc: i64 = 0;",
         f"    let arr: [i64; 4] = [{a0}, {a1}, {v}, {k}];",
@@ -803,6 +817,7 @@ def gen_pat_program(rng):
         "        acc += orpat(i) + orpat_color(c) + rangepat(i) + range_excl(i);",
         "        acc += orrange(i) + oriflet(i) + rangeiflet(i);",
         "        acc += iflet_color(c) + iflet_rect(s);",
+        "        acc += strmatch(i % 2) + stror(i % 2) + striflet(i % 2) + strbind(i % 2);",
         "        i += 1;",
         "    }",
         '    println!("{}", acc);',

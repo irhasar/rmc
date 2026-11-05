@@ -1096,6 +1096,49 @@ fn the_string_helper_is_dropped_when_unused() {
 }
 
 #[test]
+fn a_string_pattern_matches_by_content() {
+    // A `str` scrutinee is a pointer, so a `match` on it must compare bytes,
+    // not addresses: `match s { "a" => .. }` has to fire for a `let s = "a"`.
+    let out = asm(
+        "fn main() -> i64 { \
+         let s = \"a\"; \
+         return match s { \"a\" => 1, _ => 2 }; }",
+    );
+    assert!(out.contains("call __rmc_str_lt"), "content compare emitted: {out}");
+}
+
+#[test]
+fn a_string_pattern_composes_with_an_or_pattern() {
+    // An or-pattern over two literals must test both, not fall through to `_`.
+    // Each string `==` lowers to two helper calls (`!(a<b) && !(b<a)`), so two
+    // alternatives give four.
+    let out = asm(
+        "fn main() -> i64 { \
+         let s = \"b\"; \
+         return match s { \"a\" | \"b\" => 1, _ => 2 }; }",
+    );
+    assert_eq!(out.matches("call __rmc_str_lt").count(), 4, "both alternatives tested");
+}
+
+#[test]
+fn a_string_pattern_in_if_let_lowers_the_same_way() {
+    let out = asm(
+        "fn main() -> i64 { \
+         let s = \"a\"; \
+         if let \"a\" = s { return 1; } \
+         return 0; }",
+    );
+    assert!(out.contains("call __rmc_str_lt"));
+}
+
+#[test]
+fn an_integer_pattern_against_a_string_is_rejected() {
+    // The pattern test is a `str`/`i64` comparison, which rustc rejects (E0308).
+    let bad = "fn main() -> i64 { let s = \"a\"; return match s { 1 => 1, _ => 2 }; }";
+    assert!(compile_to_asm(bad, &CompileOptions::default()).is_err());
+}
+
+#[test]
 fn argument_setup_folds_a_constant_with_lea() {
     // `fib(n - 1)` must become one `lea`, not `mov; sub; mov`.
     let out = asm_no_inline("fn f(n: i64) -> i64 { return n; } fn g(n: i64) -> i64 { return f(n - 1); } fn main() -> i64 { return g(5); }");

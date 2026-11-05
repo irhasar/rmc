@@ -271,10 +271,11 @@ compile-time constant is decided at compile time, not by the trap.
   payload enums are not supported (rustc rejects the last two as well).
 - Struct literals: `Point { x: 1, y: 2 }`, usable as a `let` initialiser.
 - Blocks and `if`/`else` are expressions.
-- `match` on integers or enums: `match x { 0 => a, 1 => b, _ => c }` or
-  `match c { Color::Red => a, _ => b }`. An arm pattern is an integer literal
-  (optionally negated), an integer *range* `lo..hi` / `lo..=hi`, an
-  `Enum::Variant`, an *or-pattern* `a | b | c`, or `_`. The first matching arm
+- `match` on integers, enums or strings: `match x { 0 => a, 1 => b, _ => c }`,
+  `match c { Color::Red => a, _ => b }` or `match s { "on" => a, _ => b }`. An
+  arm pattern is an integer literal (optionally negated), an integer *range*
+  `lo..hi` / `lo..=hi`, a *string* literal, an `Enum::Variant`, an *or-pattern*
+  `a | b | c`, or `_`. The first matching arm
   runs and `_` matches anything; it is an expression, usable as a statement or a
   value, and a comma before `}` may be omitted. A `match` must be exhaustive,
   exactly as in Rust: an arm must be `_` (or a binding name), or the arms must
@@ -292,6 +293,12 @@ compile-time constant is decided at compile time, not by the trap.
   bounds are out of order (`5..5`, `6..5`) is an empty range and a compile
   error, as in rustc. A range is not by itself exhaustive, so a `_` arm is
   still needed unless the other arms cover every value.
+- String patterns: `"lit"` matches a `str` scrutinee by *content*, not by
+  pointer. A `str` value is the address of its `{len, bytes}` record, so a
+  machine compare of two equal literals at different addresses would answer
+  "not equal"; the pattern test is instead the same byte-wise comparison
+  `==` uses, and so calls the runtime helper. A string pattern is never
+  exhaustive on its own, so a `_` (or binding) arm is still required.
 - `if let PAT = EXPR { .. } else { .. }`, sugar for
   `match EXPR { PAT => then, _ => else_or_unit }`. It reuses the `match` pattern
   grammar (including or-patterns and ranges, `if let 1..=5 = x`), but unlike
