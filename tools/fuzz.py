@@ -645,6 +645,15 @@ def gen_pat_program(rng):
     color_def = ", ".join(colors)
     color_arms = ", ".join(f"Color::{c} => {j + 1}" for j, c in enumerate(colors))
     color_pick = ", ".join(f"{j} => Color::{c}" for j, c in enumerate(colors))
+    # An or-pattern arm naming a group of variants: `C0 | C1 => 1`. Splitting the
+    # variants into two groups covers every variant, so the match is exhaustive
+    # and usable as a value, which exercises or-pattern exhaustiveness.
+    half = max(1, ncolors // 2)
+    or_arms = " | ".join(f"Color::{c}" for c in colors[:half]) + " => 1, " \
+        + " | ".join(f"Color::{c}" for c in colors[half:]) + " => 2"
+    # A non-empty integer range, half-open and inclusive.
+    rlo = rng.randint(-5, 2)
+    rhi = rlo + rng.randint(1, 5)
 
     rms = [
         "fn side(k: i64) -> i64 { print_i64(k); return k * 3 + 1; }",
@@ -668,6 +677,13 @@ def gen_pat_program(rng):
         f"fn iflet_color(c: Color) -> i64 {{ if let Color::{colors[0]} = c {{ 1 }} else {{ 2 }} }}",
         "fn iflet_rect(s: Shape) -> i64 { if let Shape::Rect(w, h) = s { w * h } else { 0 } }",
         f"fn iflet_chain(x: i64) -> i64 {{ if let {v} = x {{ 10 }} else if let {v + 1} = x {{ 20 }} else {{ 30 }} }}",
+        f"fn orpat(x: i64) -> i64 {{ return match x {{ {v} | {v + 1} | {v + 2} => 77, _ => 0 }}; }}",
+        f"fn orpat_color(c: Color) -> i64 {{ return match c {{ {or_arms} }}; }}",
+        f"fn rangepat(x: i64) -> i64 {{ return match x {{ {rlo}..={rhi} => 88, _ => 0 }}; }}",
+        f"fn range_excl(x: i64) -> i64 {{ return match x {{ {rlo}..{rhi} => 99, _ => 0 }}; }}",
+        f"fn orrange(x: i64) -> i64 {{ return match x {{ {rlo}..={rhi} => 1, {v} | {v + 5} => 2, _ => 0 }}; }}",
+        f"fn oriflet(x: i64) -> i64 {{ if let {v} | {v + 1} = x {{ 5 }} else {{ 6 }} }}",
+        f"fn rangeiflet(x: i64) -> i64 {{ if let {rlo}..={rhi} = x {{ 7 }} else {{ 8 }} }}",
         "fn main() -> i64 {",
         "    let mut acc: i64 = 0;",
         f"    let arr: [i64; 4] = [{a0}, {a1}, {v}, {k}];",
@@ -683,6 +699,8 @@ def gen_pat_program(rng):
         "        acc = acc + bmatch(i % 2 == 0);",
         f"        acc = acc + bmatch(side(i) > {v});",
         "        acc = acc + iflet_int(i) + iflet_bind(i) + iflet_side(i) + iflet_chain(i);",
+        "        acc = acc + orpat(i) + orpat_color(c) + rangepat(i) + range_excl(i);",
+        "        acc = acc + orrange(i) + oriflet(i) + rangeiflet(i);",
         "        acc = acc + iflet_color(c) + iflet_rect(s);",
         "        i = i + 1;",
         "    }",
@@ -715,6 +733,13 @@ def gen_pat_program(rng):
         f"fn iflet_color(c: Color) -> i64 {{ if let Color::{colors[0]} = c {{ 1 }} else {{ 2 }} }}",
         "fn iflet_rect(s: Shape) -> i64 { if let Shape::Rect(w, h) = s { w * h } else { 0 } }",
         f"fn iflet_chain(x: i64) -> i64 {{ if let {v} = x {{ 10 }} else if let {v + 1} = x {{ 20 }} else {{ 30 }} }}",
+        f"fn orpat(x: i64) -> i64 {{ match x {{ {v} | {v + 1} | {v + 2} => 77, _ => 0 }} }}",
+        f"fn orpat_color(c: Color) -> i64 {{ match c {{ {or_arms} }} }}",
+        f"fn rangepat(x: i64) -> i64 {{ match x {{ {rlo}..={rhi} => 88, _ => 0 }} }}",
+        f"fn range_excl(x: i64) -> i64 {{ match x {{ {rlo}..{rhi} => 99, _ => 0 }} }}",
+        f"fn orrange(x: i64) -> i64 {{ match x {{ {rlo}..={rhi} => 1, {v} | {v + 5} => 2, _ => 0 }} }}",
+        f"fn oriflet(x: i64) -> i64 {{ if let {v} | {v + 1} = x {{ 5 }} else {{ 6 }} }}",
+        f"fn rangeiflet(x: i64) -> i64 {{ if let {rlo}..={rhi} = x {{ 7 }} else {{ 8 }} }}",
         "fn main() {",
         "    let mut acc: i64 = 0;",
         f"    let arr: [i64; 4] = [{a0}, {a1}, {v}, {k}];",
@@ -730,6 +755,8 @@ def gen_pat_program(rng):
         "        acc += bmatch(i % 2 == 0);",
         f"        acc += bmatch(side(i) > {v});",
         "        acc += iflet_int(i) + iflet_bind(i) + iflet_side(i) + iflet_chain(i);",
+        "        acc += orpat(i) + orpat_color(c) + rangepat(i) + range_excl(i);",
+        "        acc += orrange(i) + oriflet(i) + rangeiflet(i);",
         "        acc += iflet_color(c) + iflet_rect(s);",
         "        i += 1;",
         "    }",

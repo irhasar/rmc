@@ -623,6 +623,24 @@ impl Sema {
     ///
     /// The comparison is by variant *name*, not tag: the nested `VariantTest`s
     /// have not been visited by `check_expr` yet, so their tags are still -1.
+    /// Flatten an arm condition into its leaf tests. An or-pattern folds to
+    /// `Bin(Or, ..)`; every other condition is a single leaf. Returns false when
+    /// a leaf is neither a `VariantTest` nor a `BoolTest` (an integer arm, a
+    /// range's `Bin(And, ..)`, a hand-written comparison), which is never
+    /// exhaustive under these rules.
+    fn or_leaves<'a>(cond: &'a Expr, out: &mut Vec<&'a Expr>) -> bool {
+        match cond {
+            Expr::Bin(BinOp::Or, a, b) => {
+                Self::or_leaves(a, out) && Self::or_leaves(b, out)
+            }
+            Expr::VariantTest { .. } | Expr::BoolTest { .. } => {
+                out.push(cond);
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn if_chain_is_exhaustive(&self, cond: &Expr, els: &Option<Block>) -> bool {
         // Every condition must test the same thing: all the variants of one
         // enum, or both values of one `bool`. A chain that mixes the two, or
@@ -641,37 +659,49 @@ impl Sema {
         let mut cur_cond = cond;
         let mut cur_els = els;
         loop {
-            match cur_cond {
-                Expr::VariantTest { enum_name, variant, .. } => {
-                    match kind {
-                        Some(Kind::Enum(e)) if e == enum_name.as_str() => {}
-                        None => kind = Some(Kind::Enum(enum_name.as_str())),
-                        _ => return false,
+            // An arm's condition may be an or-pattern, folded into a tree of
+            // `Bin(Or, ..)`; flatten it and treat every leaf as a distinct case,
+            // so `C::R | C::G` contributes both variants. A range pattern folds
+            // to `Bin(And, ..)`, which is not a leaf and makes the chain
+            // non-exhaustive by these rules (rustc would need interval
+            // reasoning), so it is rejected here.
+            let mut leaves: Vec<&Expr> = Vec::new();
+            if !Self::or_leaves(cur_cond, &mut leaves) {
+                return false;
+            }
+            for leaf in leaves {
+                match leaf {
+                    Expr::VariantTest { enum_name, variant, .. } => {
+                        match kind {
+                            Some(Kind::Enum(e)) if e == enum_name.as_str() => {}
+                            None => kind = Some(Kind::Enum(enum_name.as_str())),
+                            _ => return false,
+                        }
+                        if seen_variants.contains(&variant.as_str()) {
+                            return false;
+                        }
+                        seen_variants.push(variant.as_str());
                     }
-                    if seen_variants.contains(&variant.as_str()) {
-                        return false;
+                    Expr::BoolTest { scrutinee, value } => {
+                        // `desugar_match` only tests a `Var` (the temporary it
+                        // bound the scrutinee to, or a bool variable); anything
+                        // else cannot be proven the same across arms.
+                        let name = match scrutinee.as_ref() {
+                            Expr::Var { name, .. } => name.as_str(),
+                            _ => return false,
+                        };
+                        match kind {
+                            Some(Kind::Bool(s)) if s == name => {}
+                            None => kind = Some(Kind::Bool(name)),
+                            _ => return false,
+                        }
+                        if seen_bools.contains(value) {
+                            return false;
+                        }
+                        seen_bools.push(*value);
                     }
-                    seen_variants.push(variant.as_str());
+                    _ => return false,
                 }
-                Expr::BoolTest { scrutinee, value } => {
-                    // `desugar_match` only tests a `Var` (the temporary it bound
-                    // the scrutinee to, or a bool variable); anything else cannot
-                    // be proven the same across arms.
-                    let name = match scrutinee.as_ref() {
-                        Expr::Var { name, .. } => name.as_str(),
-                        _ => return false,
-                    };
-                    match kind {
-                        Some(Kind::Bool(s)) if s == name => {}
-                        None => kind = Some(Kind::Bool(name)),
-                        _ => return false,
-                    }
-                    if seen_bools.contains(value) {
-                        return false;
-                    }
-                    seen_bools.push(*value);
-                }
-                _ => return false,
             }
             match cur_els {
                 None => break,

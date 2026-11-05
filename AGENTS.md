@@ -61,6 +61,14 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   so sema and codegen have no `match` case. A non-`Var`/`Int` scrutinee is bound
   to a hidden `let` first, so a call in the scrutinee runs once. An arm after
   `_` is unreachable and dropped (the `_` body becomes the `else`).
+  An arm pattern may be an integer, a *range* `lo..hi`/`lo..=hi`, an
+  `Enum::Variant`, an *or-pattern* `a | b | c`, or `_`. A range desugars to
+  `Bin(And, Le, Lt/Le)`, an or-pattern to `Bin(Or, ..)` over the alternatives'
+  tests with the *same* body (`or_cond` builds only the test, so the body is not
+  duplicated), so neither needs a sema or codegen case. An or-pattern with a
+  `_` alternative, and one whose alternatives cover every variant, are handled
+  by `pat_irrefutable` and `or_leaves` (in sema) respectively. A *binding*
+  alternative is rejected, as rustc's E0408 rejects it.
   `if let PAT = EXPR { .. } else { .. }` is parsed here too and desugared by
   `desugar_if_let` into a two-arm `match` (`PAT => then, _ => else_or_unit`),
   reusing `desugar_match_arms` and the `parse_pattern` shared with `match` arms,
@@ -692,6 +700,14 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 
 - Runtime is process-spawn dominated for small programs; use large enough
   workloads (see `ARGS` in `bench/run.py`) for a meaningful runtime comparison.
+  At the recorded sizes the small-program ratios swing several percent run to
+  run (a re-measure of `fib`/`mandel` at the same `ARGS` landed at 0.99/1.00
+  where `RESULTS.md` had 0.80/0.85), so treat the run column as indicative and
+  never chase a sub-percent runtime difference without many repetitions.
+- **A `*` of two runtime values is not provably non-negative.** `(x*x)/C` looks
+  like it can skip the signed-division sign fixup, but `i64` multiplication
+  wraps, so `x*x` may be negative and rustc keeps the fixup. Removing it is
+  unsound; do not add a "square is non-negative" case to `gen_div_const`.
 - `bench/run.py` measures both compilers and both binaries the same way: wall
   and CPU time from `wait4()`, and peak RAM from the child's own `VmHWM`. Do not
   read peak RAM from `wait4()`'s `ru_maxrss`: a freshly spawned child shares
