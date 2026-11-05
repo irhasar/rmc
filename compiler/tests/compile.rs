@@ -216,6 +216,54 @@ fn for_over_a_reference_is_rejected() {
 }
 
 #[test]
+fn a_labelled_break_leaves_the_named_outer_loop() {
+    // `break 'outer` from a nested loop must target the labelled loop, not the
+    // innermost one. The body runs `i` up to 5 and then leaves both loops.
+    let src = "fn main() -> i64 { let mut i: i64 = 0; \
+               'outer: loop { let mut j: i64 = 0; while j < 10 { j = j + 1; i = i + 1; \
+               if i == 5 { break 'outer; } } } return i; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_labelled_continue_targets_the_named_outer_loop() {
+    let src = "fn main() -> i64 { let mut s: i64 = 0; \
+               'a: for x in 0..3 { for y in 0..3 { if y == 1 { continue 'a; } s = s + 1; } } \
+               return s; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_labelled_loop_yields_a_value() {
+    let src = "fn main() -> i64 { let mut k: i64 = 0; \
+               let v: i64 = 'l: loop { k = k + 1; if k == 7 { break 'l k * 2; } }; return v; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn an_undeclared_loop_label_is_rejected() {
+    let err = compile_to_asm(
+        "fn main() -> i64 { loop { break 'nope; } return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("undeclared label"), "got: {err}");
+}
+
+#[test]
+fn a_label_on_while_let_is_rejected() {
+    // `while let` desugars to a plain `loop`, so the label would be lost; it is
+    // rejected rather than silently dropped.
+    let err = compile_to_asm(
+        "enum E { A(i64), B } \
+         fn main() -> i64 { let mut e: E = E::A(1); 'a: while let E::A(x) = e { break 'a; } return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("label on `while let`"), "got: {err}");
+}
+
+#[test]
 fn compound_assignment_expands() {
     // `x += 4` folds into a single `lea` when the target is register-resident,
     // and otherwise into an `add`. Either is the expansion; what matters is

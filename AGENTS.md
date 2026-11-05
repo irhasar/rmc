@@ -474,6 +474,16 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   increment, and `continue` targets `cont` so it still runs the increment exactly
   once. Duplicating the guard at the top instead (the naive rotation) is what
   would skip the first iteration or double the increment.
+- **A loop label selects the target loop, not the innermost one.** `sema` and
+  `codegen` each keep a stack of the enclosing loops (`loop_stack` / `loops`)
+  with the loop's label, and resolve a `break 'a` / `continue 'a` by searching
+  that stack from the top for the label (an unlabelled `break`/`continue` takes
+  the innermost entry). The label is carried through the desugarings that build
+  a loop: `'a: for x in arr` copies the label onto the index `for` it expands
+  to. `while let` desugars to a plain `loop`, so a label on it is rejected in the
+  parser rather than silently dropped. The `if`-with-a-lone-`break`/`continue`
+  fast path in `bare_exit` only fires for an *unlabelled* `break`/`continue`,
+  since a labelled one may leave an outer loop.
 - **A `for` bound is compared directly when it is a constant, and through a
   hidden slot otherwise.** `0..=1000` needs no `end_slot`: the guard is
   `cmp $1000, %rax`, so no frame word is written and no reload happens each

@@ -180,6 +180,12 @@ loop { ... break v; }    // `loop` is an expression: `break v` yields `v`
 break;
 break v;                 // only legal inside a `loop` (rustc's E0571 otherwise)
 continue;
+'a: loop { ... }         // labelled loops
+'a: while cond { ... }
+'a: for i in 0..10 { ... }
+break 'a;                // leave the loop labelled `'a` (any enclosing one)
+break 'a v;              // ... yielding `v`, when `'a` is a `loop`
+continue 'a;             // next iteration of the loop labelled `'a`
 return expr;             // `;` may be omitted at the end of a block
 ```
 
@@ -218,6 +224,14 @@ must agree on one type, with `!` unifying with anything; a `loop` with no
 reachable `break` is `!` and so unifies with any context. `break v` is only
 legal inside a `loop` (not a `while`/`for`), matching rustc's `E0571`, and a
 `loop` used as a statement is typed `()`, so `break v` there is an error.
+
+A loop may carry a label (`'a: loop`, `'a: while`, `'a: for`), and `break 'a` /
+`continue 'a` target the innermost enclosing loop with that label rather than the
+innermost loop overall, so `break 'a` can leave several nested loops at once.
+`break 'a v` yields `v` from a labelled `loop` exactly as `break v` does. A label
+that names no enclosing loop is rejected (rustc's `E0426`). A label on `while
+let` is rejected rather than silently dropped, because `while let` desugars to a
+plain `loop` and the label would be lost.
 
 ## Overflow
 
