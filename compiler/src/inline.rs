@@ -132,9 +132,9 @@ fn stmt_ok(s: &Stmt) -> bool {
         Stmt::Let { init, .. } => init.as_ref().map_or(true, expr_ok),
         Stmt::Assign { target, value } => expr_ok(target) && expr_ok(value),
         Stmt::Expr(e) => expr_ok(e),
-        Stmt::While(c, b) => expr_ok(c) && block_ok(b),
+        Stmt::While(c, b, _) => expr_ok(c) && block_ok(b),
         Stmt::For { start, end, body, .. } => expr_ok(start) && expr_ok(end) && block_ok(body),
-        Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue => false,
+        Stmt::Return(_) | Stmt::Break(..) | Stmt::Continue(_) => false,
     }
 }
 
@@ -159,7 +159,7 @@ fn expr_ok(e: &Expr) -> bool {
             expr_ok(c) && block_ok(t) && els.as_ref().map_or(true, block_ok)
         }
         Expr::Block(b) => block_ok(b),
-        Expr::MatchBoundary(b, _) | Expr::Loop(b, _, _) => block_ok(b),
+        Expr::MatchBoundary(b, _) | Expr::Loop(b, _, _, _) => block_ok(b),
         // Calls, aggregate literals and payload-enum operations are excluded.
         _ => false,
     }
@@ -174,12 +174,12 @@ fn count_stmt(s: &Stmt) -> usize {
         Stmt::Let { init, .. } => init.as_ref().map_or(0, count_expr),
         Stmt::Assign { target, value } => count_expr(target) + count_expr(value),
         Stmt::Expr(e) => count_expr(e),
-        Stmt::While(c, b) => count_expr(c) + b.stmts.iter().map(count_stmt).sum::<usize>(),
+        Stmt::While(c, b, _) => count_expr(c) + b.stmts.iter().map(count_stmt).sum::<usize>(),
         Stmt::For { start, end, body, .. } => {
             count_expr(start) + count_expr(end) + body.stmts.iter().map(count_stmt).sum::<usize>()
         }
         Stmt::Return(v) => v.as_ref().map_or(0, count_expr),
-        Stmt::Break(_) | Stmt::Continue => 0,
+        Stmt::Break(..) | Stmt::Continue(_) => 0,
     }
 }
 
@@ -211,7 +211,7 @@ fn count_expr(e: &Expr) -> usize {
             1 + b.stmts.iter().map(count_stmt).sum::<usize>()
                 + b.tail.as_deref().map_or(0, count_expr)
         }
-        Expr::MatchBoundary(b, _) | Expr::Loop(b, _, _) => {
+        Expr::MatchBoundary(b, _) | Expr::Loop(b, _, _, _) => {
             1 + b.stmts.iter().map(count_stmt).sum::<usize>()
                 + b.tail.as_deref().map_or(0, count_expr)
         }
@@ -269,7 +269,7 @@ impl Inliner {
                 self.walk_expr(value, base, expanding);
             }
             Stmt::Expr(e) => self.walk_expr(e, base, expanding),
-            Stmt::While(c, b) => {
+            Stmt::While(c, b, _) => {
                 self.walk_expr(c, base, expanding);
                 self.walk_block(b, base, expanding);
             }
@@ -283,12 +283,12 @@ impl Inliner {
                     self.walk_expr(e, base, expanding);
                 }
             }
-            Stmt::Break(v) => {
+            Stmt::Break(v, _) => {
                 if let Some(e) = v {
                     self.walk_expr(e, base, expanding);
                 }
             }
-            Stmt::Continue => {}
+            Stmt::Continue(_) => {}
         }
     }
 
@@ -320,7 +320,7 @@ impl Inliner {
                 }
             }
             Expr::Block(b) => self.walk_block(b, base, expanding),
-            Expr::MatchBoundary(b, _) | Expr::Loop(b, _, _) => self.walk_block(b, base, expanding),
+            Expr::MatchBoundary(b, _) | Expr::Loop(b, _, _, _) => self.walk_block(b, base, expanding),
             Expr::Call { args, .. } => {
                 for a in args {
                     self.walk_expr(a, base, expanding);
@@ -492,7 +492,7 @@ fn assigned_slots(stmts: &[Stmt], tail: Option<&Expr>) -> HashSet<i32> {
                 }
             }
             Stmt::Expr(e) => collect_expr(e, out),
-            Stmt::While(c, b) => {
+            Stmt::While(c, b, _) => {
                 collect_expr(c, out);
                 collect_block(b, out);
             }
@@ -508,12 +508,12 @@ fn assigned_slots(stmts: &[Stmt], tail: Option<&Expr>) -> HashSet<i32> {
                     collect_expr(e, out);
                 }
             }
-            Stmt::Break(v) => {
+            Stmt::Break(v, _) => {
                 if let Some(e) = v {
                     collect_expr(e, out);
                 }
             }
-            Stmt::Continue => {}
+            Stmt::Continue(_) => {}
         }
     }
     fn collect_expr(e: &Expr, out: &mut HashSet<i32>) {
@@ -530,7 +530,7 @@ fn assigned_slots(stmts: &[Stmt], tail: Option<&Expr>) -> HashSet<i32> {
             }
             Expr::Deref { expr, .. } | Expr::AddrOf { expr, .. } => collect_expr(expr, out),
             Expr::Block(b) => collect_block(b, out),
-            Expr::MatchBoundary(b, _) | Expr::Loop(b, _, _) => collect_block(b, out),
+            Expr::MatchBoundary(b, _) | Expr::Loop(b, _, _, _) => collect_block(b, out),
             Expr::If(c, t, els) => {
                 collect_expr(c, out);
                 collect_block(t, out);
@@ -622,7 +622,7 @@ impl Sub<'_> {
                 self.expr(value);
             }
             Stmt::Expr(e) => self.expr(e),
-            Stmt::While(c, b) => {
+            Stmt::While(c, b, _) => {
                 self.expr(c);
                 self.block(b);
             }
@@ -638,12 +638,12 @@ impl Sub<'_> {
                     self.expr(e);
                 }
             }
-            Stmt::Break(v) => {
+            Stmt::Break(v, _) => {
                 if let Some(e) = v {
                     self.expr(e);
                 }
             }
-            Stmt::Continue => {}
+            Stmt::Continue(_) => {}
         }
     }
 
@@ -684,7 +684,7 @@ impl Sub<'_> {
             }
             Expr::Block(b) => self.block(b),
             Expr::MatchBoundary(b, _) => self.block(b),
-            Expr::Loop(b, slot, _) => {
+            Expr::Loop(b, slot, _, _) => {
                 if *slot >= 0 {
                     *slot = self.slot(*slot);
                 }

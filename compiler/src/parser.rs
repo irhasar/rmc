@@ -81,6 +81,11 @@ impl Parser {
         self.toks.get(self.i).map(|t| &t.tok)
     }
 
+    /// The token after the next one, for a two-token lookahead (`'a: loop`).
+    fn peek2(&self) -> Option<&Tok> {
+        self.toks.get(self.i + 1).map(|t| &t.tok)
+    }
+
     fn pos(&self) -> u32 {
         self.toks.get(self.i).map(|t| t.pos).unwrap_or(u32::MAX)
     }
@@ -110,6 +115,16 @@ impl Parser {
                 .map(|x| x.describe())
                 .unwrap_or_else(|| "end of input".into());
             Err(format!("at byte {}: expected {}, found {}", self.pos(), t.describe(), got))
+        }
+    }
+
+    /// Consume a `'label` token if one is next, returning its name.
+    fn eat_label(&mut self) -> PResult<Option<String>> {
+        if let Some(Tok::Label(n)) = self.peek().cloned() {
+            self.i += 1;
+            Ok(Some(n))
+        } else {
+            Ok(None)
         }
     }
 
@@ -524,6 +539,16 @@ impl Parser {
             if self.peek().is_none() {
                 return Err(format!("at byte {}: unexpected end of input, expected `}}`", self.pos()));
             }
+            // `'a: while ..` / `'a: for ..` are statements; `'a: loop ..` is an
+            // expression and flows through the tail-expression path below.
+            if let Some(Tok::Label(_)) = self.peek() {
+                if self.peek2() == Some(&Tok::Colon)
+                    && self.toks.get(self.i + 2).map(|t| &t.tok) != Some(&Tok::Loop)
+                {
+                    stmts.push(self.parse_stmt()?);
+                    continue;
+                }
+            }
             // tail expression: an expression not followed by `;`
             if self.starts_expr() {
                 let e = self.parse_expr()?;
@@ -554,7 +579,7 @@ impl Parser {
                     // (via `break value`) is discarded: wrap it so it is typed
                     // as `()`, not as its break type.
                     let e = match e {
-                        Expr::Loop(b, _, ty) => Expr::Loop(b, -2, ty),
+                        Expr::Loop(b, _, ty, label) => Expr::Loop(b, -2, ty, label),
                         other => other,
                     };
                     stmts.push(Stmt::Expr(e));
@@ -569,6 +594,41 @@ impl Parser {
         }
         self.expect(Tok::RBrace)?;
         Ok(Block { stmts, tail })
+    }
+
+    fn parse_for(&mut self) -> PResult<Stmt> {
+        self.parse_for_labeled(None)
+    }
+
+    /// A labelled loop statement, `'name: while ..` or `'name: for ..`. A
+    /// labelled `loop` is an expression, so it does not reach here.
+    fn parse_labeled_loop_stmt(&mut self, label: String) -> PResult<Stmt> {
+        match self.peek() {
+            Some(Tok::While) => {
+                self.i += 1;
+                // `'a: while let PAT = EXPR { body }`: the label would be lost
+                // in the desugar to `loop { if let .. }`, so reject it rather
+                // than silently drop the label.
+                if self.peek() == Some(&Tok::Let) {
+                    return Err(format!(
+                        "at byte {}: a label on `while let` is not supported",
+                        self.pos()
+                    ));
+                }
+                let cond = self.parse_cond()?;
+                let body = self.parse_block()?;
+                Ok(Stmt::While(cond, body, Some(label)))
+            }
+            Some(Tok::For) => {
+                self.i += 1;
+                self.parse_for_labeled(Some(label))
+            }
+            other => Err(format!(
+                "at byte {}: a label must prefix `loop`, `while` or `for`, found {}",
+                self.pos(),
+                other.map(|t| t.describe()).unwrap_or_else(|| "end of input".into())
+            )),
+        }
     }
 
     /// `for PAT in ITER { body }`. Two iterables are supported: an integer
@@ -587,7 +647,7 @@ impl Parser {
     /// effect (a call, a literal) runs exactly once, and `arr.len()` folds to
     /// the array's compile-time length, so the loop bound is a literal and the
     /// loop carries no hidden slot.
-    fn parse_for(&mut self) -> PResult<Stmt> {
+    fn parse_for_labeled(&mut self, label: Option<String>) -> PResult<Stmt> {
         // A loop variable that names a constant shadows it (rustc E0530).
         // `parse_pattern` would otherwise read the name as that constant's
         // value, so the check happens here, before the pattern is parsed.
@@ -641,16 +701,19 @@ impl Parser {
                 end_slot: -1,
                 inclusive,
                 body,
+                label,
             });
         }
         let body = self.parse_block()?;
-        Ok(self.desugar_for_array(pat, head, body))
+        Ok(self.desugar_for_array(pat, head, body, label))
     }
 
     /// `for PAT in ARRAY { body }` -> an index loop over the array (see
     /// `parse_for`). `PAT` must be a binding or `_`; a compound pattern is
     /// rejected rather than mis-bound, since rmc has no destructuring `let`.
-    fn desugar_for_array(&mut self, pat: Pat, arr: Expr, body: Block) -> Stmt {
+    /// A label on the `for` is carried to the desugared loop, so `break 'a`
+    /// still targets it.
+    fn desugar_for_array(&mut self, pat: Pat, arr: Expr, body: Block, label: Option<String>) -> Stmt {
         let n = self.tmp;
         self.tmp += 1;
         let arr_name = format!("\u{0}fa{n}");
@@ -694,6 +757,7 @@ impl Parser {
             end_slot: -1,
             inclusive: false,
             body: loop_body,
+            label,
         };
         // Bind the array once, outside the loop.
         let arr_let = Stmt::Let {
@@ -732,6 +796,8 @@ impl Parser {
                 | Some(Tok::If)
                 | Some(Tok::Match)
                 | Some(Tok::Loop)
+                // `'a: loop { .. }` is a labelled loop expression.
+                | Some(Tok::Label(_))
                 | Some(Tok::LBracket)
                 | Some(Tok::Amp)
                 | Some(Tok::Star)
@@ -743,6 +809,14 @@ impl Parser {
     }
 
     fn parse_stmt(&mut self) -> PResult<Stmt> {
+        // A loop label may prefix `while` or `for`; a labelled `loop` is an
+        // expression and is handled by `parse_primary` (routed here or there by
+        // `parse_block_inner` depending on whether it is a tail expression).
+        if let Some(Tok::Label(n)) = self.peek().cloned() {
+            self.i += 1;
+            self.expect(Tok::Colon)?;
+            return self.parse_labeled_loop_stmt(n);
+        }
         match self.peek() {
             Some(Tok::Let) => {
                 self.i += 1;
@@ -775,7 +849,7 @@ impl Parser {
                 }
                 let cond = self.parse_cond()?;
                 let body = self.parse_block()?;
-                Ok(Stmt::While(cond, body))
+                Ok(Stmt::While(cond, body, None))
             }
             Some(Tok::For) => {
                 self.i += 1;
@@ -795,19 +869,22 @@ impl Parser {
             }
             Some(Tok::Break) => {
                 self.i += 1;
-                // `break` and `break expr`; the `;` may be omitted at the end of
-                // a block. The value is only legal in a `loop`, checked by sema.
+                // `break`, `break 'label`, `break expr` or `break 'label expr`;
+                // the `;` may be omitted at the end of a block. A value is only
+                // legal in a `loop`, checked by sema.
+                let label = self.eat_label()?;
                 if self.eat(&Tok::Semi) || self.peek() == Some(&Tok::RBrace) {
-                    return Ok(Stmt::Break(None));
+                    return Ok(Stmt::Break(None, label));
                 }
                 let e = self.parse_expr()?;
                 self.eat_semi_at_block_end()?;
-                Ok(Stmt::Break(Some(e)))
+                Ok(Stmt::Break(Some(e), label))
             }
             Some(Tok::Continue) => {
                 self.i += 1;
+                let label = self.eat_label()?;
                 self.eat_semi_at_block_end()?;
-                Ok(Stmt::Continue)
+                Ok(Stmt::Continue(label))
             }
             _ => {
                 // expression statement, possibly an assignment
@@ -1317,11 +1394,13 @@ impl Parser {
             }
             Some(Tok::Break) => {
                 self.i += 1;
-                Stmt::Break(self.arm_terminator_value()?)
+                let label = self.eat_label()?;
+                Stmt::Break(self.arm_terminator_value()?, label)
             }
             Some(Tok::Continue) => {
                 self.i += 1;
-                Stmt::Continue
+                let label = self.eat_label()?;
+                Stmt::Continue(label)
             }
             _ => {
                 let target = self.parse_expr()?;
@@ -1465,7 +1544,7 @@ impl Parser {
     /// to a fresh temporary each time.
     fn desugar_while_let(&mut self, pat: Pat, scrutinee: Expr, body: Block) -> Stmt {
         let break_else = Block {
-            stmts: vec![Stmt::Break(None)],
+            stmts: vec![Stmt::Break(None, None)],
             tail: None,
         };
         // The `if let` is a *statement* in the loop body, so its value is
@@ -1475,7 +1554,7 @@ impl Parser {
         // The loop is unit-valued: the `else` arm always contains a plain
         // `break;`, so a `break value` in the body is rejected as a type
         // mismatch (rustc E0571 rejects it too).
-        Stmt::Expr(Expr::Loop(loop_body, -1, Type::Unit))
+        Stmt::Expr(Expr::Loop(loop_body, -1, Type::Unit, None))
     }
 
     /// One arm of a desugared `match` or `if let`: the pattern test, the
@@ -1857,7 +1936,25 @@ impl Parser {
                 // rewrites its result slot to `-2` so a `break value` is
                 // discarded and the statement is typed as `()`.
                 let body = self.parse_block()?;
-                Ok(Expr::Loop(body, -1, Type::Unit))
+                Ok(Expr::Loop(body, -1, Type::Unit, None))
+            }
+            // `'a: loop { .. }`. A label only labels a loop; `'a: while`/`'a: for`
+            // are statements and never reach here.
+            Some(Tok::Label(name)) => {
+                self.i += 1;
+                self.expect(Tok::Colon)?;
+                match self.peek() {
+                    Some(Tok::Loop) => {
+                        self.i += 1;
+                        let body = self.parse_block()?;
+                        Ok(Expr::Loop(body, -1, Type::Unit, Some(name)))
+                    }
+                    other => Err(format!(
+                        "at byte {}: expected `loop` after the label `'{name}`, found {}",
+                        self.pos(),
+                        other.map(|t| t.describe()).unwrap_or_else(|| "end of input".into())
+                    )),
+                }
             }
             Some(Tok::LBrace) => Ok(Expr::Block(self.parse_block()?)),
             Some(Tok::LBracket) => {
@@ -1956,11 +2053,11 @@ fn stmt_has_call_p(s: &Stmt) -> bool {
         Stmt::Assign { target, value } => expr_has_call(target) || expr_has_call(value),
         Stmt::Expr(e) => expr_has_call(e),
         Stmt::Return(v) => v.as_ref().map_or(false, expr_has_call),
-        Stmt::While(c, b) => expr_has_call(c) || block_has_call_p(b),
+        Stmt::While(c, b, _) => expr_has_call(c) || block_has_call_p(b),
         Stmt::For { start, end, body, .. } => {
             expr_has_call(start) || expr_has_call(end) || block_has_call_p(body)
         }
-        Stmt::Break(v) => v.as_ref().map_or(false, expr_has_call),
-        Stmt::Continue => false,
+        Stmt::Break(v, _) => v.as_ref().map_or(false, expr_has_call),
+        Stmt::Continue(_) => false,
     }
 }

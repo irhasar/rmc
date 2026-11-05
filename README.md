@@ -223,7 +223,9 @@ array elements and struct fields (including compound `+=` and friends);
 same patterns
 (desugared to a two-arm `match`); `break` (with a value in a `loop`, so `loop`
 works as an expression), `continue`,
-`return`; arithmetic, comparison, bitwise (`!`/`&`/`|`/`^`) and shift (`<<`/`>>`)
+`return`; loop labels (`'a: loop` / `'a: while` / `'a: for`, with
+`break 'a` / `break 'a value` / `continue 'a` targeting any enclosing labelled
+loop); arithmetic, comparison, bitwise (`!`/`&`/`|`/`^`) and shift (`<<`/`>>`)
 operators; `&&`/`||`; strings (a `str` literal or `str`-typed parameter, return
 or field, compared by content with `==`/`!=`/`<`/`<=`/`>`/`>=`, with `.len()` for
 the byte length); array `.len()` (a compile-time constant); `mut` enforcement and definite

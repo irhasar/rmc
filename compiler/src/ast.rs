@@ -140,8 +140,10 @@ pub enum Expr {
     /// that type here. `slot` is the hidden frame slot holding the loop's value
     /// (`-1` when it yields none, `-2` while untyped, meaning "used as a
     /// statement"). `ty` is `Unit` until sema fills it in; codegen needs it to
-    /// report the loop's type to its consumer.
-    Loop(Block, i32, Type),
+    /// report the loop's type to its consumer. The last field is the loop's
+    /// label (`'a: loop { .. }` -> `Some("a")`), which a `break 'a` /
+    /// `continue 'a` targets; `None` for an unlabelled loop.
+    Loop(Block, i32, Type, Option<String>),
     /// Marks a desugared `match`, wrapping the *whole* `if` chain exactly once
     /// (not each arm). A `match` desugars to an `if` chain, and the chain must
     /// be recognised as a unit when deciding whether it is exhaustive. Without
@@ -272,7 +274,9 @@ pub enum Stmt {
     },
     /// An expression evaluated for its side effects.
     Expr(Expr),
-    While(Expr, Block),
+    /// `while cond { body }`. The last field is the loop label
+    /// (`'a: while c { .. }` -> `Some("a")`), or `None` when unlabelled.
+    While(Expr, Block, Option<String>),
     /// `for var in start..end { body }`. A `for` cannot be desugared to a
     /// `while` because `continue` must still run the increment, so it keeps its
     /// own node and the code generator gives the increment its own label.
@@ -286,12 +290,16 @@ pub enum Stmt {
         /// `start..=end` includes `end`; `start..end` does not.
         inclusive: bool,
         body: Block,
+        /// The loop label (`'a: for .. { .. }` -> `Some("a")`), else `None`.
+        label: Option<String>,
     },
     Return(Option<Expr>),
-    /// `break` or `break value`. A value is only legal in a `loop`; sema
-    /// rejects it in a `while`/`for` (rustc E0571).
-    Break(Option<Expr>),
-    Continue,
+    /// `break`, `break value`, or `break 'label [value]`. A value is only legal
+    /// in a `loop`; sema rejects it in a `while`/`for` (rustc E0571). The second
+    /// field names the target loop when the `break` is labelled.
+    Break(Option<Expr>, Option<String>),
+    /// `continue` or `continue 'label`.
+    Continue(Option<String>),
 }
 
 /// A user-defined struct. Field offsets are assigned by sema in declaration

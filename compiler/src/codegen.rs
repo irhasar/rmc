@@ -29,10 +29,12 @@ pub struct Codegen {
     max_spill: i32,
     str_id: u32,
     strings: Vec<(String, String)>, // (label, bytes)
-    /// (continue_label, break_label, result_slot). `result_slot >= 0`
+    /// (continue_label, break_label, result_slot, label). `result_slot >= 0`
     /// for a value-yielding `loop`, whose `break value` stores into it before
-    /// jumping to `break_label`; the loop loads it after `break_label`.
-    loops: Vec<(String, String, i32)>,
+    /// jumping to `break_label`; the loop loads it after `break_label`. `label`
+    /// is the loop's own label, so a labelled `break`/`continue` finds its
+    /// target (`None` for an unlabelled loop).
+    loops: Vec<(String, String, i32, Option<String>)>,
     epilogue: String,
     /// Slot -> callee-saved register for locals promoted out of memory in the
     /// function currently being generated. Empty means every local is in memory.
@@ -756,7 +758,7 @@ impl Codegen {
                 Self::count_expr(value, counts, mem, copied, true, let_tmps);
             }
             Stmt::Expr(e) => Self::count_expr(e, counts, mem, copied, true, let_tmps),
-            Stmt::While(c, b) => {
+            Stmt::While(c, b, _) => {
                 Self::count_expr(c, counts, mem, copied, true, let_tmps);
                 Self::count_block(b, counts, mem, copied, true, let_tmps);
             }
@@ -779,12 +781,12 @@ impl Codegen {
                     Self::count_expr(e, counts, mem, copied, true, let_tmps);
                 }
             }
-            Stmt::Break(v) => {
+            Stmt::Break(v, _) => {
                 if let Some(e) = v {
                     Self::count_expr(e, counts, mem, copied, true, let_tmps);
                 }
             }
-            Stmt::Continue => {}
+            Stmt::Continue(_) => {}
         }
     }
 
@@ -959,7 +961,7 @@ impl Codegen {
                 }
             }
             Expr::Block(b) => Self::count_block(b, counts, mem, copied, true, let_tmps),
-            Expr::MatchBoundary(b, _) | Expr::Loop(b, _, _) => {
+            Expr::MatchBoundary(b, _) | Expr::Loop(b, _, _, _) => {
                 Self::count_block(b, counts, mem, copied, true, let_tmps)
             }
             Expr::ArrayLit(v, _) => {
@@ -989,11 +991,29 @@ impl Codegen {
         if els.is_some() || then.tail.is_some() || then.stmts.len() != 1 {
             return None;
         }
-        let (top, end, _) = self.loops.last()?;
+        let (top, end, _, _) = self.loops.last()?;
         match &then.stmts[0] {
-            Stmt::Break(None) => Some(end.clone()),
-            Stmt::Continue => Some(top.clone()),
+            // Only an unlabelled `break`/`continue` targets the innermost loop;
+            // a labelled one may name an outer loop, so it falls back to the
+            // ordinary `if` lowering.
+            Stmt::Break(None, None) => Some(end.clone()),
+            Stmt::Continue(None) => Some(top.clone()),
             _ => None,
+        }
+    }
+
+    /// The loop a `break`/`continue` targets, as an index into `loops`: the
+    /// innermost loop when `label` is `None`, else the innermost loop carrying
+    /// that label. Sema has already rejected an unmatched label, so the lookup
+    /// always succeeds here.
+    fn loop_target(&self, label: &Option<String>) -> usize {
+        match label {
+            None => self.loops.len() - 1,
+            Some(name) => self
+                .loops
+                .iter()
+                .rposition(|l| l.3.as_deref() == Some(name))
+                .expect("sema checked the label"),
         }
     }
 
@@ -1002,10 +1022,10 @@ impl Codegen {
     /// stores into the slot before jumping, and `end` is followed by a load of
     /// that slot so the value is in `%rax`. A unit/`!` loop (`slot < 0`) needs
     /// neither.
-    fn gen_loop_expr(&mut self, body: &Block, slot: i32) {
+    fn gen_loop_expr(&mut self, body: &Block, slot: i32, label: &Option<String>) {
         let top = self.new_label();
         let end = self.new_label();
-        self.loops.push((top.clone(), end.clone(), slot));
+        self.loops.push((top.clone(), end.clone(), slot, label.clone()));
         self.raw("\t.p2align 4");
         self.raw(&format!("{top}:"));
         self.gen_block(body);
@@ -1237,7 +1257,7 @@ impl Codegen {
             Stmt::Expr(e) => {
                 self.gen_stmt_expr(e);
             }
-            Stmt::While(cond, body) => {
+            Stmt::While(cond, body, label) => {
                 // Rotated: the test moves to the bottom and the body falls
                 // through to it, so the back edge is the conditional branch and
                 // the loop no longer pays an unconditional `jmp` every
@@ -1248,7 +1268,7 @@ impl Codegen {
                 let body_l = self.new_label();
                 let test_l = self.new_label();
                 let end = self.new_label();
-                self.loops.push((test_l.clone(), end.clone(), -1));
+                self.loops.push((test_l.clone(), end.clone(), -1, label.clone()));
                 self.line(&format!("jmp {test_l}"));
                 // Align the loop body to a 16-byte fetch boundary so its
                 // layout does not shift with unrelated code-size changes.
@@ -1260,7 +1280,7 @@ impl Codegen {
                 self.raw(&format!("{end}:"));
                 self.loops.pop();
             }
-            Stmt::For { var_slot, start, end, end_slot, inclusive, body, .. } => {
+            Stmt::For { var_slot, start, end, end_slot, inclusive, body, label, .. } => {
                 // Evaluate both bounds once: `var = start`, `end_slot = end`.
                 self.gen_expr_to_slot(start, *var_slot);
                 // A constant bound needs no slot: it has no side effect, so it
@@ -1283,7 +1303,7 @@ impl Codegen {
                 let exit = self.new_label();
                 // `continue` must still run the increment, so it targets `cont`;
                 // `break` leaves past the guard.
-                self.loops.push((cont.clone(), exit.clone(), -1));
+                self.loops.push((cont.clone(), exit.clone(), -1, label.clone()));
                 self.line(&format!("jmp {guard}"));
                 self.raw("\t.p2align 4");
                 self.raw(&format!("{top}:"));
@@ -1317,8 +1337,9 @@ impl Codegen {
                 }
                 self.line(&format!("jmp {}", self.epilogue));
             }
-            Stmt::Break(v) => {
-                let (_, end, slot) = self.loops.last().unwrap().clone();
+            Stmt::Break(v, label) => {
+                let i = self.loop_target(label);
+                let (_, end, slot, _) = self.loops[i].clone();
                 if let Some(e) = v {
                     // Store the break value into the loop's result slot, then
                     // leave; the loop expression loads it after `end`.
@@ -1326,8 +1347,9 @@ impl Codegen {
                 }
                 self.line(&format!("jmp {end}"));
             }
-            Stmt::Continue => {
-                let top = self.loops.last().unwrap().0.clone();
+            Stmt::Continue(label) => {
+                let i = self.loop_target(label);
+                let top = self.loops[i].0.clone();
                 self.line(&format!("jmp {top}"));
             }
         }
@@ -1973,8 +1995,8 @@ impl Codegen {
                 self.raw(&format!("{end_l}:"));
                 if tt == Type::Unit { et } else { tt }
             }
-            Expr::Loop(body, slot, lty) => {
-                self.gen_loop_expr(body, *slot);
+            Expr::Loop(body, slot, lty, label) => {
+                self.gen_loop_expr(body, *slot, label);
                 lty.clone()
             }
             Expr::Block(b) => self.gen_block(b),
@@ -2263,7 +2285,7 @@ impl Codegen {
                     || self.block_uses_reg(t, r)
                     || els.as_ref().map_or(false, |b| self.block_uses_reg(b, r))
             }
-            Expr::Block(b) | Expr::Loop(b, _, _) => self.block_uses_reg(b, r),
+            Expr::Block(b) | Expr::Loop(b, _, _, _) => self.block_uses_reg(b, r),
             Expr::MatchBoundary(b, _) => self.block_uses_reg(b, r),
             Expr::ArrayList(_) | Expr::MethodCall { .. } => {
                 unreachable!("sema rewrites ArrayList and MethodCall")
@@ -2283,15 +2305,15 @@ impl Codegen {
                 self.uses_reg(target, r) || self.uses_reg(value, r)
             }
             Stmt::Expr(e) => self.uses_reg(e, r),
-            Stmt::While(c, b) => self.uses_reg(c, r) || self.block_uses_reg(b, r),
+            Stmt::While(c, b, _) => self.uses_reg(c, r) || self.block_uses_reg(b, r),
             Stmt::For { start, end, body, .. } => {
                 self.uses_reg(start, r)
                     || self.uses_reg(end, r)
                     || self.block_uses_reg(body, r)
             }
             Stmt::Return(v) => v.as_ref().map_or(false, |e| self.uses_reg(e, r)),
-            Stmt::Break(v) => v.as_ref().map_or(false, |e| self.uses_reg(e, r)),
-            Stmt::Continue => false,
+            Stmt::Break(v, _) => v.as_ref().map_or(false, |e| self.uses_reg(e, r)),
+            Stmt::Continue(_) => false,
         }
     }
 
@@ -3089,7 +3111,7 @@ impl Codegen {
                     || Self::block_has_call(t)
                     || els.as_ref().map_or(false, Self::block_has_call)
             }
-            Expr::Block(b) | Expr::Loop(b, _, _) => Self::block_has_call(b),
+            Expr::Block(b) | Expr::Loop(b, _, _, _) => Self::block_has_call(b),
             Expr::MatchBoundary(b, _) => Self::block_has_call(b),
             _ => false,
         }
@@ -3108,7 +3130,7 @@ impl Codegen {
     /// select it.
     fn clobbers_arg_regs(e: &Expr) -> bool {
         match e {
-            Expr::Block(b) | Expr::Loop(b, _, _) => Self::block_clobbers(b),
+            Expr::Block(b) | Expr::Loop(b, _, _, _) => Self::block_clobbers(b),
             Expr::MatchBoundary(b, _) => Self::block_clobbers(b),
             Expr::If(_, t, els) => {
                 Self::block_clobbers(t)
@@ -3159,8 +3181,8 @@ impl Codegen {
             }
             // A loop body might call on some iteration; be conservative.
             Stmt::While(..) => true,
-            Stmt::Break(v) => v.as_ref().map_or(false, Self::contains_call),
-            Stmt::Continue => false,
+            Stmt::Break(v, _) => v.as_ref().map_or(false, Self::contains_call),
+            Stmt::Continue(_) => false,
         }
     }
 

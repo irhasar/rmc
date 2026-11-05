@@ -11,6 +11,10 @@ pub enum Tok {
     /// it is out of range, matching rustc.
     IntMinMagnitude,
     Str(String),
+    /// A loop label, `'name` (the quote is part of the token). Rust labels are
+    /// written `'outer: loop { .. }` and targeted by `break 'outer` /
+    /// `continue 'outer`.
+    Label(String),
     // keywords
     Fn,
     Let,
@@ -92,6 +96,7 @@ impl Tok {
             Tok::Int(v) => format!("integer `{v}`"),
             Tok::IntMinMagnitude => "integer `9223372036854775808`".into(),
             Tok::Str(_) => "string literal".into(),
+            Tok::Label(n) => format!("label `'{n}`"),
             Tok::Fn => "`fn`".into(),
             Tok::Let => "`let`".into(),
             Tok::Mut => "`mut`".into(),
@@ -270,6 +275,22 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 _ => Tok::Ident(s.to_string()),
             };
             out.push(Token { tok, pos });
+            continue;
+        }
+        // A loop label: `'name`. A `'` starts a label only when followed by an
+        // identifier; Rust has no character literals, so there is no ambiguity.
+        if c == b'\'' {
+            let start = i;
+            i += 1;
+            if i >= bytes.len() || !(bytes[i] == b'_' || bytes[i].is_ascii_alphabetic()) {
+                return Err(format!("expected a label name after `'` at byte {start}"));
+            }
+            let name_start = i;
+            while i < bytes.len() && (bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric()) {
+                i += 1;
+            }
+            let name = src[name_start..i].to_string();
+            out.push(Token { tok: Tok::Label(name), pos: start as u32 });
             continue;
         }
         // string literals
