@@ -42,6 +42,9 @@ python3 tools/fuzz.py --mode arith --n 500 --seed 1
 python3 tools/fuzz.py --mode nest --n 500 --seed 1
 python3 tools/fuzz.py --mode pat --n 500 --seed 1
 python3 tools/fuzz.py --mode order --n 500 --seed 1
+python3 tools/fuzz.py --mode shift --n 500 --seed 1
+python3 tools/fuzz.py --mode cast --n 500 --seed 1
+python3 tools/fuzz.py --mode assoc --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 ```
 
@@ -1027,6 +1030,19 @@ receiver whose type is `Struct`, `Enum` (unit) or `EnumData` (payload); all
 three give the same mangled prefix, and a `self` method on an aggregate receiver
 passes it by pointer. `Self` resolves through the parser's `current_impl`.
 
+A function in an `impl` block with no `self` is an **associated function**. The
+parser sets `takes_self = false` and emits the same `Type$name` mangling with no
+receiver parameter; sema inserts the `self` parameter only when `takes_self` is
+true, so an associated function registers like a free function. A call
+`Type::name(..)` arrives as `Expr::EnumCtor` (the parser cannot tell a
+payload-variant constructor from an associated function), so sema checks whether
+the enum has that variant; if not and `Type$name` is in `sigs`, it rewrites the
+node to a `Call`. A struct qualifier always takes this path. `Qual::name` with
+no call and no matching variant is reported as an associated function that must
+be called (rmc has no function values), not as an unknown enum. Calling an
+associated function with `.` (`p.new(1)`) passes the receiver as an extra
+argument, so it fails on arity — which matches rustc's E0599 closely enough.
+
 An array's element type is a scalar: `i64`, `bool` or a unit enum. Nested
 arrays, arrays of structs and arrays of payload enums are rejected. A unit enum
 is one 8-byte slot emitted like `i64`, so `[E; N]` lays out and indexes
@@ -1122,6 +1138,13 @@ The checks, all in `sema.rs`:
   first), both used by the corpus (`boolops`, `listptr`) and the heap benchmark.
   Before this, `r as i64`, `r as &mut T`, `&T as &U` and `bool as &T` all
   compiled, reinterpreting a pointer as a value or forging mutability.
+  `as` is parsed at its own precedence level (`parse_cast`, between `parse_mul`
+  and `parse_unary`), looser than the unary operators and tighter than `*`. It
+  used to live in `parse_postfix`, which bound it tighter than unary, so
+  `*r as i64` parsed as `*(r as i64)` and a valid program failed with a
+  reference-cast error. Rust's `as` sits just above `*` in the binary chain; this
+  level is the same place, and the right-hand side is a type, so there is no
+  operand recursion and no depth cost.
 - **Constant arithmetic (`E0080`-like).** `const_binop` folds an operator whose
   operands are both constant (through `Sema::const_of`) and rejects the cases
   rustc denies: division/remainder by zero, `MIN / -1`, `+`/`-`/`*` overflow,

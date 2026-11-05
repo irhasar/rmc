@@ -1054,6 +1054,35 @@ fn the_documented_casts_are_accepted() {
 }
 
 #[test]
+fn a_cast_binds_looser_than_a_deref() {
+    // `*r as i64` is `(*r) as i64`, not `*(r as i64)`: in Rust `as` sits above
+    // the unary operators in the precedence chain, so rmc used to reject this
+    // valid program with a reference-cast error.
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let x: i64 = 5; let r: &i64 = &x; return *r as i64; }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_cast_binds_looser_than_unary_minus() {
+    // `-x as i64` is `(-x) as i64`.
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let x: i64 = 5; return -x as i64; }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_cast_binds_tighter_than_multiplication() {
+    // `b as i64 * 2` is `(b as i64) * 2`, so the `as` applies to `b` alone.
+    let asm = asm("fn main() -> i64 { let b: bool = true; return b as i64 * 2; }");
+    assert!(!asm.is_empty());
+}
+
+#[test]
 fn a_duplicate_parameter_name_is_rejected() {
     // rustc rejects two parameters with the same name (E0415); rmc used to
     // accept it and bind both to the same slot.
@@ -2070,9 +2099,35 @@ fn an_unknown_method_is_rejected() {
 }
 
 #[test]
-fn a_method_without_self_is_rejected() {
-    let err = compile_to_asm("struct P { x: i64 } impl P { fn f() -> i64 { return 1; } } fn main() -> i64 { return 0; }", &CompileOptions::default()).unwrap_err();
-    assert!(err.contains("expected identifier"), "got: {err}");
+fn an_associated_function_is_callable_through_the_type() {
+    // `fn f()` with no `self` in an `impl` is an associated function, called as
+    // `P::f(..)`, not a method. rustc accepts this, so rmc must too.
+    let asm = asm_no_inline(
+        "struct P { x: i64 } impl P { fn twice(n: i64) -> i64 { return n * 2; } } fn main() -> i64 { return P::twice(21); }",
+    );
+    assert!(asm.contains("P$twice"), "expected the mangled assoc fn in the asm");
+}
+
+#[test]
+fn an_associated_function_called_as_a_method_is_rejected() {
+    // A method call passes the receiver as the first argument, so `p.twice()`
+    // has one argument too many for a receiver-less associated function.
+    let err = compile_to_asm(
+        "struct P { x: i64 } impl P { fn twice(n: i64) -> i64 { return n * 2; } } fn main() -> i64 { let p: P = P { x: 1 }; return p.twice(1); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("expects 1 argument"), "got: {err}");
+}
+
+#[test]
+fn an_unknown_associated_function_is_rejected() {
+    let err = compile_to_asm(
+        "struct P { x: i64 } impl P { fn new(x: i64) -> P { return P { x }; } } fn main() -> i64 { let p: P = P::nope(1); return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("no associated function"), "got: {err}");
 }
 
 #[test]

@@ -399,40 +399,40 @@ impl Parser {
         self.expect(Tok::Fn)?;
         let name = self.expect_ident()?;
         self.expect(Tok::LParen)?;
-        // First parameter must be `self`. `&self` / `&mut self` make the receiver
-        // a reference, so the call passes the value's address rather than a copy;
-        // `self` takes the receiver by value.
-        let by_ref = self.eat(&Tok::Amp);
-        let by_mut = by_ref && self.eat(&Tok::Mut);
-        let first = self.expect_ident()?;
-        if first != "self" {
-            return Err(format!(
-                "at byte {}: method `{name}` must take `self` as its first parameter",
-                self.pos()
-            ));
-        }
+        // A method takes `self` as its first parameter; an associated function
+        // (`P::new(..)`) does not. `&self` / `&mut self` make the receiver a
+        // reference, so the call passes the value's address rather than a copy;
+        // `self` takes the receiver by value. An associated function is parsed
+        // exactly like a free function, minus the `self` receiver.
+        let takes_self = match self.peek() {
+            Some(Tok::Amp) => true,
+            Some(Tok::Ident(n)) => n == "self",
+            _ => false,
+        };
         let mut params = Vec::new();
         let mut param_mut = Vec::new();
-        if self.eat(&Tok::Comma) {
-            while self.peek() != Some(&Tok::RParen) {
-                let pm = self.eat(&Tok::Mut);
-                let pname = self.expect_ident()?;
-                self.expect(Tok::Colon)?;
-                let pty = self.parse_type()?;
-                params.push((pname, pty));
-                param_mut.push(pm);
-                if !self.eat(&Tok::Comma) {
-                    break;
-                }
+        let (by_ref, by_mut) = if takes_self {
+            let by_ref = self.eat(&Tok::Amp);
+            let by_mut = by_ref && self.eat(&Tok::Mut);
+            let first = self.expect_ident()?;
+            debug_assert_eq!(first, "self");
+            if self.eat(&Tok::Comma) {
+                self.parse_param_list(&mut params, &mut param_mut)?;
             }
-        }
+            (by_ref, by_mut)
+        } else {
+            if self.peek() != Some(&Tok::RParen) {
+                self.parse_param_list(&mut params, &mut param_mut)?;
+            }
+            (false, false)
+        };
         self.expect(Tok::RParen)?;
         let ret = if self.eat(&Tok::Arrow) { self.parse_type()? } else { Type::Unit };
         let body = self.parse_block()?;
         Ok(FnDef {
             name: format!("{ty}${name}"),
             self_ty: Some(ty.to_string()),
-            takes_self: true,
+            takes_self,
             ref_self: by_ref,
             ref_self_mut: by_mut,
             params,
@@ -443,6 +443,27 @@ impl Parser {
             ret_slot: -1,
             nslots: 0,
         })
+    }
+
+    /// Parse `p: T, q: T, ..` up to (not including) the closing `)`. The caller
+    /// has already consumed the comma that follows the previous parameter.
+    fn parse_param_list(
+        &mut self,
+        params: &mut Vec<(String, Type)>,
+        param_mut: &mut Vec<bool>,
+    ) -> PResult<()> {
+        while self.peek() != Some(&Tok::RParen) {
+            let pm = self.eat(&Tok::Mut);
+            let pname = self.expect_ident()?;
+            self.expect(Tok::Colon)?;
+            let pty = self.parse_type()?;
+            params.push((pname, pty));
+            param_mut.push(pm);
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        Ok(())
     }
 
     fn parse_type(&mut self) -> PResult<Type> {
@@ -1145,7 +1166,7 @@ impl Parser {
     }
 
     fn parse_mul(&mut self) -> PResult<Expr> {
-        let mut lhs = self.parse_unary()?;
+        let mut lhs = self.parse_cast()?;
         loop {
             let op = match self.peek() {
                 Some(Tok::Star) => BinOp::Mul,
@@ -1154,11 +1175,26 @@ impl Parser {
                 _ => break,
             };
             self.i += 1;
-            let rhs = self.parse_unary()?;
+            let rhs = self.parse_cast()?;
             self.bump_depth()?;
             lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs));
         }
         Ok(lhs)
+    }
+
+    /// `e as T`. `as` binds looser than every unary operator, so `*r as i64`
+    /// is `(*r) as i64` and `-x as i64` is `(-x) as i64`, as in Rust; it binds
+    /// tighter than `* / %`. Rust places `as` in the binary precedence chain
+    /// just above `*`, which is where this level sits. The right-hand side is a
+    /// type, not an expression, so there is no operand recursion.
+    fn parse_cast(&mut self) -> PResult<Expr> {
+        let mut e = self.parse_unary()?;
+        while self.eat(&Tok::As) {
+            self.bump_depth()?;
+            let ty = self.parse_type()?;
+            e = Expr::Cast(Box::new(e), ty);
+        }
+        Ok(e)
     }
 
     fn parse_unary(&mut self) -> PResult<Expr> {
@@ -1230,9 +1266,6 @@ impl Parser {
                 } else {
                     e = Expr::Field { base: Box::new(e), name, offset: 0, ty: Type::I64 };
                 }
-            } else if self.eat(&Tok::As) {
-                let ty = self.parse_type()?;
-                e = Expr::Cast(Box::new(e), ty);
             } else {
                 break;
             }

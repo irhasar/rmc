@@ -171,16 +171,19 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
     }
     // A method's receiver is its first parameter, with the impl's struct type.
     // Give it to every method up front so its signature (and later its frame)
-    // includes `self` from the start.
+    // includes `self` from the start. An associated function (`P::new(..)`) has
+    // no receiver, so it is registered exactly like a free function.
     for f in &mut prog.fns {
-        if let Some(ty) = f.self_ty.clone() {
-            let rt = if f.ref_self {
-                Type::Ref(Box::new(Type::Named(ty)), f.ref_self_mut)
-            } else {
-                Type::Named(ty)
-            };
-            f.params.insert(0, ("self".to_string(), rt));
-            f.param_mut.insert(0, false);
+        if f.takes_self {
+            if let Some(ty) = f.self_ty.clone() {
+                let rt = if f.ref_self {
+                    Type::Ref(Box::new(Type::Named(ty)), f.ref_self_mut)
+                } else {
+                    Type::Named(ty)
+                };
+                f.params.insert(0, ("self".to_string(), rt));
+                f.param_mut.insert(0, false);
+            }
         }
     }
     for f in &prog.fns {
@@ -2143,6 +2146,24 @@ impl Sema {
             Expr::EnumVariant { enum_name, variant, tag } => {
                 let enum_name = enum_name.clone();
                 let variant = variant.clone();
+                // `Qual::name` with no call is a variant only when the enum has
+                // it. Otherwise it names an associated function, which rmc has no
+                // function values to represent, so report it rather than the
+                // misleading "unknown enum".
+                let is_variant = self
+                    .enums
+                    .get(&enum_name)
+                    .is_some_and(|info| info.variant(&variant).is_some());
+                if !is_variant {
+                    if self.sigs.contains_key(&format!("{enum_name}${variant}")) {
+                        return Err(format!(
+                            "associated function `{enum_name}::{variant}` must be called"
+                        ));
+                    }
+                    if !self.enums.contains_key(&enum_name) {
+                        return Err(format!("unknown enum `{enum_name}`"));
+                    }
+                }
                 let info = self
                     .enums
                     .get(&enum_name)
@@ -2185,6 +2206,34 @@ impl Sema {
             Expr::EnumCtor { enum_name, variant, tag, args, arg_offsets, slot, size } => {
                 let enum_name = enum_name.clone();
                 let variant = variant.clone();
+                // `Qual::name(..)` is either a payload-variant constructor or an
+                // associated function. The qualifier is a struct, or an enum that
+                // has no such variant, for an associated function; either way the
+                // parser mangled it to `Qual$name`, exactly like a method.
+                let is_variant = self
+                    .enums
+                    .get(&enum_name)
+                    .is_some_and(|info| info.variant(&variant).is_some());
+                if !is_variant {
+                    let mangled = format!("{enum_name}${variant}");
+                    if self.sigs.contains_key(&mangled) {
+                        let args = std::mem::take(args);
+                        *e = Expr::Call {
+                            name: mangled,
+                            args,
+                            arg_slots: Vec::new(),
+                            ret_slot: -1,
+                            ret_ty: Type::I64,
+                        };
+                        return self.check_expr(e, scope);
+                    }
+                    if self.structs.contains_key(&enum_name) || self.enums.contains_key(&enum_name) {
+                        return Err(format!(
+                            "no associated function `{variant}` on `{enum_name}`"
+                        ));
+                    }
+                    return Err(format!("unknown enum `{enum_name}`"));
+                }
                 let info = self
                     .enums
                     .get(&enum_name)
