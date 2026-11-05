@@ -153,7 +153,8 @@ overflowing arithmetic near `i64::MAX` (the only mode that makes the
 `--overflow-checks` trap fire), `nest` for nested aggregates with a deep copy
 and a nested-path write, `pat` for `match` expressions (multi-variant enums,
 two-field payloads, explicit discriminants, `bool` matches, binding patterns,
-nested matches, `if let`, string patterns, per-arm guards, and a side-effecting
+struct patterns, nested matches, `if let`, string patterns, per-arm guards, and
+a side-effecting
 scrutinee), and `order` for assignment evaluation order (a
 side-effecting index and value on both `=` and every compound operator, the
 shapes `stmt` never assigns through). `shift` drives `<<`, `>>` and the compound
@@ -215,12 +216,13 @@ fn main() -> i64 {
 
 Supported: `i64`, `bool`, `str`, fixed-size arrays, and structs with named fields
 (including field init shorthand, `P { x, y }`, and struct update syntax,
-`P { x: 9, ..base }`);
+`P { x: 9, ..base }`, and struct patterns `P { x, y: z, .. }` in `match`/`if let`);
 functions with up to six parameters; `let` / `let mut` / `let _` (discard); assignment to variables,
 array elements and struct fields (including compound `+=` and friends);
 `if`/`else`, `while`, `loop`, `for i in a..b` / `a..=b` and `for x in arr`
 (array iteration, by value); `match` on integers,
-`bool`s, enums and strings (literal, `true`/`false`, string, `Enum::Variant` and
+`bool`s, enums and strings (literal, `true`/`false`, string, `Enum::Variant`,
+struct and
 `_` patterns, plus payload bindings and binding names, and a per-arm guard
 `PAT if COND`) and `if let` with the
 same patterns

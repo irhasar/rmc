@@ -353,8 +353,9 @@ compile-time constant is decided at compile time, not by the trap.
 - `match` on integers, enums or strings: `match x { 0 => a, 1 => b, _ => c }`,
   `match c { Color::Red => a, _ => b }` or `match s { "on" => a, _ => b }`. An
   arm pattern is an integer literal (optionally negated), an integer *range*
-  `lo..hi` / `lo..=hi`, a *string* literal, an `Enum::Variant`, an *or-pattern*
-  `a | b | c`, or `_`. The first matching arm
+  `lo..hi` / `lo..=hi`, a *string* literal, an `Enum::Variant`, a struct
+  pattern `S { f, .. }` (see below), an *or-pattern* `a | b | c`, or `_`. The
+  first matching arm
   runs and `_` matches anything; it is an expression, usable as a statement or a
   value, and a comma before `}` may be omitted. An arm body is an expression,
   but a bare assignment (`0 => acc = 1`), a compound assignment
@@ -391,9 +392,20 @@ compile-time constant is decided at compile time, not by the trap.
   "not equal"; the pattern test is instead the same byte-wise comparison
   `==` uses, and so calls the runtime helper. A string pattern is never
   exhaustive on its own, so a `_` (or binding) arm is still required.
+- Struct patterns: `S { f, g: h, i: _, .. }` matches a `S` scrutinee and binds
+  its fields. A field may be shorthand (`f` binds `f`), renamed (`g: h` binds
+  `h`), or ignored (`i: _`); a trailing `..` drops the fields not named, and
+  `S { .. }` binds nothing. A struct pattern is *irrefutable*: it has no runtime
+  test and always matches, so it acts as a catch-all arm (like `_`) and needs no
+  other arm to make a `match` exhaustive. A field is an ordinary place read, so
+  it may auto-deref a `&S` scrutinee, and a struct-typed field may itself be
+  destructured. A wrong field name is an error, even for `i: _`, and a field
+  bound twice is an error. Because a struct pattern is irrefutable, a *binding*
+  struct pattern in an or-pattern is rejected, as is any binding alternative.
 - `if let PAT = EXPR { .. } else { .. }`, sugar for
   `match EXPR { PAT => then, _ => else_or_unit }`. It reuses the `match` pattern
-  grammar (including or-patterns and ranges, `if let 1..=5 = x`), but unlike
+  grammar (including or-patterns, ranges and struct patterns,
+  `if let 1..=5 = x`), but unlike
   `match` it need not be exhaustive: a non-matching value
   falls through to the `_` arm. An `else` is optional; with none and a non-unit
   `then`, the branch types differ and the program is rejected, exactly as rustc

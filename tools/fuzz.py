@@ -1132,8 +1132,10 @@ def gen_pat_program(rng):
     single-payload enum with a wildcard and an integer with a wildcard, so a
     multi-variant enum, a variant with two payload fields, a binding pattern, a
     negative literal, a nested `match`, a `bool` match covering both values,
-    and — the path that matters most — a non-trivial scrutinee (a call, a binary
-    operator, an index or a field, which `desugar_match` binds to a temporary)
+    a struct pattern (shorthand, rename, `_` and `..`, plus a guard and an
+    `if let`), and — the path that matters most — a non-trivial scrutinee (a
+    call, a binary operator, an index or a field, which `desugar_match` binds to
+    a temporary)
     were never generated. That
     temporary must be evaluated exactly once: re-evaluating it per arm repeats
     a side effect, and a stale one reads the wrong value. An enum with explicit
@@ -1187,6 +1189,15 @@ def gen_pat_program(rng):
         "fn disc_cast(d: Disc) -> i64 { return d as i64; }",
         "struct S { a: i64, b: i64 }",
         f"fn fscr(s: S) -> i64 {{ return match s.b {{ {v} => 20, _ => 0 }}; }}",
+        # Struct patterns: irrefutable, so the arm needs no `_`, and the two
+        # bindings read the two fields. A renamed field and a `..` rest are
+        # generated too, so the shorthand, the rename and the dropped field all
+        # reach codegen.
+        "fn spbind(s: S) -> i64 { return match s { S { a, b } => a * 10 + b }; }",
+        "fn sprename(s: S) -> i64 { return match s { S { a: x, b: _ } => x + 1 }; }",
+        "fn sprest(s: S) -> i64 { return match s { S { b, .. } => b * 3 }; }",
+        f"fn spguard(s: S) -> i64 {{ return match s {{ S {{ a, b }} if a > b => 1, _ => 0 }}; }}",
+        f"fn spiflet(s: S) -> i64 {{ if let S {{ a, b }} = s {{ a - b }} else {{ 0 }} }}",
         f"fn iflet_int(x: i64) -> i64 {{ if let {v} = x {{ 50 }} else {{ 60 }} }}",
         "fn iflet_bind(x: i64) -> i64 { if let y = x { y + 1 } else { 0 } }",
         f"fn iflet_side(k: i64) -> i64 {{ if let {v} = side(k) {{ 5 }} else {{ 7 }} }}",
@@ -1224,6 +1235,8 @@ def gen_pat_program(rng):
         "        acc = acc + area(s);",
         "        acc = acc + classify(i) + bindit(i);",
         "        acc = acc + bscr(i) + cscr(i) + mscr(i) + iscr(arr, i % 4) + fscr(S { a: i, b: i % 5 });",
+        "        let sv: S = S { a: i, b: i % 5 };",
+        "        acc = acc + spbind(sv) + sprename(sv) + sprest(sv) + spguard(sv) + spiflet(sv);",
         "        acc = acc + nested(i % 3);",
         "        acc = acc + bmatch(i % 2 == 0);",
         f"        acc = acc + bmatch(side(i) > {v});",
@@ -1266,6 +1279,11 @@ def gen_pat_program(rng):
         "#[derive(Copy, Clone)]",
         "struct S { a: i64, b: i64 }",
         f"fn fscr(s: S) -> i64 {{ match s.b {{ {v} => 20, _ => 0 }} }}",
+        "fn spbind(s: S) -> i64 { match s { S { a, b } => a * 10 + b } }",
+        "fn sprename(s: S) -> i64 { match s { S { a: x, b: _ } => x + 1 } }",
+        "fn sprest(s: S) -> i64 { match s { S { b, .. } => b * 3 } }",
+        f"fn spguard(s: S) -> i64 {{ match s {{ S {{ a, b }} if a > b => 1, _ => 0 }} }}",
+        f"fn spiflet(s: S) -> i64 {{ if let S {{ a, b }} = s {{ a - b }} else {{ 0 }} }}",
         f"fn iflet_int(x: i64) -> i64 {{ if let {v} = x {{ 50 }} else {{ 60 }} }}",
         "fn iflet_bind(x: i64) -> i64 { if let y = x { y + 1 } else { 0 } }",
         f"fn iflet_side(k: i64) -> i64 {{ if let {v} = side(k) {{ 5 }} else {{ 7 }} }}",
@@ -1303,6 +1321,8 @@ def gen_pat_program(rng):
         "        acc += area(s);",
         "        acc += classify(i) + bindit(i);",
         "        acc += bscr(i) + cscr(i) + mscr(i) + iscr(arr, i % 4) + fscr(S { a: i, b: i % 5 });",
+        "        let sv: S = S { a: i, b: i % 5 };",
+        "        acc += spbind(sv) + sprename(sv) + sprest(sv) + spguard(sv) + spiflet(sv);",
         "        acc += nested(i % 3);",
         "        acc += bmatch(i % 2 == 0);",
         f"        acc += bmatch(side(i) > {v});",
@@ -1529,6 +1549,14 @@ def robust_corpus():
         "deep_deref": b"fn main() -> i64 { let x: i64 = 0; return " + b"*" * 100000 + b"x; }",
         "deep_ref_type": b"fn main() -> i64 { let x: " + b"&" * 5000 + b"i64 = x; return 0; }",
         "deep_addr_of": b"fn main() -> i64 { let x: i64 = 0; return " + b"&" * 100000 + b"x; }",
+        # A struct pattern recurses through `parse_pattern`, so a deep one must
+        # error rather than overflow the parser stack.
+        "deep_struct_pattern": b"struct S { a: S } fn main() -> i64 { let s: S = S { a: s }; return match s { "
+            + b"S { a: " * 3000 + b"_" + b" }" * 3000 + b" => 0 }; }",
+        "unterminated_struct_pattern": b"struct S { a: i64 } fn main() -> i64 { let s: S = S { a: 1 }; return match s { S { a ",
+        "struct_pattern_missing_name": b"struct S { a: i64 } fn main() -> i64 { let s: S = S { a: 1 }; return match s { S { : a } => 0 }; }",
+        "struct_pattern_double_dotdot": b"struct S { a: i64 } fn main() -> i64 { let s: S = S { a: 1 }; return match s { S { .. .. } => 0 }; }",
+        "struct_pattern_field_after_rest": b"struct S { a: i64 } fn main() -> i64 { let s: S = S { a: 1 }; return match s { S { .., a } => 0 }; }",
     }
     return cases
 
