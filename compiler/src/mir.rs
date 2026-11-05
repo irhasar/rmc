@@ -442,6 +442,26 @@ fn scan_rv_operands(rv: &Rvalue, f: &mut impl FnMut(&Operand)) {
     }
 }
 
+/// Call `f` for every operand a statement reads, mutably.
+fn for_each_operand_mut(rv: &mut Rvalue, f: &mut impl FnMut(&mut Operand)) {
+    match rv {
+        Rvalue::Use(op) => f(op),
+        Rvalue::Binary(_, a, b) => {
+            f(a);
+            f(b);
+        }
+        Rvalue::Unary(_, a) => f(a),
+        Rvalue::Cast { op, .. } => f(op),
+        Rvalue::Repeat { op, .. } => f(op),
+        Rvalue::Array(ops) | Rvalue::Aggregate(ops) => ops.iter_mut().for_each(|op| f(op)),
+        Rvalue::WithOverflow { a, b, .. } => {
+            f(a);
+            f(b);
+        }
+        _ => {}
+    }
+}
+
 fn is_self_assign(s: &Stmt) -> bool {
     let Stmt::Assign(d, Rvalue::Use(Operand::Copy(src) | Operand::Move(src))) = s else {
         return false;
@@ -2301,9 +2321,494 @@ impl Function {
     }
 }
 
+/// A natural loop: its header, the blocks it contains, and the preheader that
+/// falls into it (when it has exactly one entry).
+struct LoopInfo {
+    header: u32,
+    blocks: HashSet<u32>,
+    preheader: Option<u32>,
+}
+
+/// Combine the invariant addends of a loop-carried accumulator.
+///
+/// `acc = acc + a + b + c` compiles to a chain of adds in the loop body, one per
+/// addend. When the addends are invariant (computed outside the loop), summing
+/// them once in the preheader turns the body into a single `acc += sum`. The AST
+/// backend reaches this form through inlining and constant folding; doing it
+/// here lets a `rustc` front end produce the same tight loop.
+pub fn fold_accumulators(prog: &mut Program) {
+    for f in &mut prog.funcs {
+        f.fold_accumulators();
+    }
+}
+
+/// A rewrite the accumulator fold will apply, found while borrowing the blocks
+/// immutably and applied afterwards.
+struct AccFold {
+    preheader: u32,
+    final_site: (usize, usize),
+    chain_sites: Vec<(usize, usize)>,
+    acc: u32,
+    addends: Vec<u32>,
+}
+
+impl Function {
+    fn fold_accumulators(&mut self) {
+        for _ in 0..8 {
+            if !self.fold_one_accumulator() {
+                break;
+            }
+        }
+    }
+
+    fn fold_one_accumulator(&mut self) -> bool {
+        let loops = self.natural_loops();
+        let uses = self.use_counts();
+        let fold = self.find_acc_fold(&loops, &uses);
+        let Some(fold) = fold else { return false };
+        self.apply_acc_fold(fold);
+        true
+    }
+
+    fn find_acc_fold(&self, loops: &[LoopInfo], uses: &HashMap<u32, u32>) -> Option<AccFold> {
+        // Where each whole local is defined, as `(block, statement index)`.
+        let mut def_sites: HashMap<u32, Vec<(usize, usize)>> = HashMap::new();
+        for (b, blk) in self.blocks.iter().enumerate() {
+            for (i, s) in blk.stmts.iter().enumerate() {
+                if let Stmt::Assign(d, _) = s {
+                    if d.proj.is_empty() {
+                        def_sites.entry(d.local).or_default().push((b, i));
+                    }
+                }
+            }
+        }
+        for lp in loops {
+            let Some(preheader) = lp.preheader else { continue };
+            if !matches!(self.blocks[preheader as usize].term, Terminator::Goto(t) if t == lp.header) {
+                continue;
+            }
+            let mut defined_in: HashSet<u32> = HashSet::new();
+            for &b in &lp.blocks {
+                for s in &self.blocks[b as usize].stmts {
+                    if let Stmt::Assign(d, _) = s {
+                        if d.proj.is_empty() {
+                            defined_in.insert(d.local);
+                        }
+                    }
+                }
+                if let Terminator::Call { dest, .. } = &self.blocks[b as usize].term {
+                    if dest.proj.is_empty() {
+                        defined_in.insert(dest.local);
+                    }
+                }
+            }
+            let invariant = |l: u32| !defined_in.contains(&l) && l != 0;
+            // A local continues the chain when it is defined inside the loop by
+            // one more `add`.
+            let chain_def = |l: u32| -> Option<(usize, usize)> {
+                let v = def_sites.get(&l)?;
+                if v.len() != 1 {
+                    return None;
+                }
+                let (b, i) = v[0];
+                if !lp.blocks.contains(&(b as u32)) {
+                    return None;
+                }
+                matches!(self.blocks[b].stmts[i], Stmt::Assign(_, Rvalue::Binary(BinOp::Add, _, _)))
+                    .then_some((b, i))
+            };
+            let is_link = |l: u32| chain_def(l).is_some();
+
+            for b in 0..self.blocks.len() {
+                if !lp.blocks.contains(&(b as u32)) {
+                    continue;
+                }
+                for i in 0..self.blocks[b].stmts.len() {
+                    let Stmt::Assign(dest, Rvalue::Binary(BinOp::Add, x, y)) =
+                        &self.blocks[b].stmts[i]
+                    else {
+                        continue;
+                    };
+                    if !dest.proj.is_empty() {
+                        continue;
+                    }
+                    let acc = dest.local;
+                    if def_sites
+                        .get(&acc)
+                        .map(|v| v.iter().filter(|(bb, _)| lp.blocks.contains(&(*bb as u32))).count())
+                        != Some(1)
+                    {
+                        continue;
+                    }
+                    for (chain, first) in [(x, y), (y, x)] {
+                        let (Operand::Copy(cp) | Operand::Move(cp)) = chain else { continue };
+                        if !cp.proj.is_empty() {
+                            continue;
+                        }
+                        let start = cp.local;
+                        if start != acc && !is_link(start) {
+                            continue;
+                        }
+                        let (Operand::Copy(fp) | Operand::Move(fp)) = first else { continue };
+                        if !fp.proj.is_empty() {
+                            continue;
+                        }
+                        let mut addends = vec![fp.local];
+                        let mut chain_sites: Vec<(usize, usize)> = vec![(b, i)];
+                        let mut cur = start;
+                        let mut ok = true;
+                        let mut steps = 0;
+                        while cur != acc {
+                            steps += 1;
+                            if steps > 64 {
+                                ok = false;
+                                break;
+                            }
+                            let Some((cb, ci)) = chain_def(cur) else { ok = false; break };
+                            if uses.get(&cur).copied().unwrap_or(0) != 1 {
+                                ok = false;
+                                break;
+                            }
+                            let Stmt::Assign(_, Rvalue::Binary(BinOp::Add, l, r)) =
+                                &self.blocks[cb].stmts[ci]
+                            else {
+                                ok = false;
+                                break;
+                            };
+                            // One operand continues the chain; the other is an
+                            // addend. Require a unique choice.
+                            let mut choices = Vec::new();
+                            for (side, other) in [(l, r), (r, l)] {
+                                let (Operand::Copy(sp) | Operand::Move(sp)) = side else { continue };
+                                let (Operand::Copy(op) | Operand::Move(op)) = other else { continue };
+                                if !op.proj.is_empty() {
+                                    continue;
+                                }
+                                if sp.local == acc || is_link(sp.local) {
+                                    choices.push((sp.local, op.local));
+                                }
+                            }
+                            if choices.len() != 1 {
+                                ok = false;
+                                break;
+                            }
+                            let (next, addend) = choices[0];
+                            addends.push(addend);
+                            chain_sites.push((cb, ci));
+                            cur = next;
+                        }
+                        if !ok || addends.len() < 2 {
+                            continue;
+                        }
+                        if !addends
+                            .iter()
+                            .all(|l| invariant(*l) && !self.local_ty(*l).is_aggregate())
+                        {
+                            continue;
+                        }
+                        return Some(AccFold {
+                            preheader,
+                            final_site: (b, i),
+                            chain_sites,
+                            acc,
+                            addends,
+                        });
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn apply_acc_fold(&mut self, fold: AccFold) {
+        // Sum the addends in the preheader, one add at a time.
+        let mut prev = fold.addends[0];
+        for &a in fold.addends.iter().skip(1) {
+            let target = self.fresh_local();
+            self.blocks[fold.preheader as usize].stmts.push(Stmt::Assign(
+                Place { local: target, proj: Vec::new() },
+                Rvalue::Binary(
+                    BinOp::Add,
+                    Operand::Copy(Place { local: prev, proj: Vec::new() }),
+                    Operand::Copy(Place { local: a, proj: Vec::new() }),
+                ),
+            ));
+            prev = target;
+        }
+        let sum = prev;
+        // The final site becomes `acc += sum`; the rest of the chain is dropped.
+        let (fb, fi) = fold.final_site;
+        self.blocks[fb].stmts[fi] = Stmt::Assign(
+            Place { local: fold.acc, proj: Vec::new() },
+            Rvalue::Binary(
+                BinOp::Add,
+                Operand::Copy(Place { local: fold.acc, proj: Vec::new() }),
+                Operand::Copy(Place { local: sum, proj: Vec::new() }),
+            ),
+        );
+        let drop: HashSet<(usize, usize)> =
+            fold.chain_sites.iter().copied().filter(|s| *s != fold.final_site).collect();
+        for (b, blk) in self.blocks.iter_mut().enumerate() {
+            if drop.is_empty() {
+                break;
+            }
+            let mut k = 0;
+            let mut kept = Vec::with_capacity(blk.stmts.len());
+            for s in std::mem::take(&mut blk.stmts) {
+                if !drop.contains(&(b, k)) {
+                    kept.push(s);
+                }
+                k += 1;
+            }
+            blk.stmts = kept;
+        }
+    }
+
+    fn fresh_local(&mut self) -> u32 {
+        let l = self.locals.len() as u32;
+        self.locals.push(LocalDecl { ty: Box::new(Ty::I64), is_arg: false, name: None });
+        l
+    }
+
+    /// Every natural loop in the function, with the preheader when it has
+    /// exactly one entry.
+    fn natural_loops(&self) -> Vec<LoopInfo> {
+        let n = self.blocks.len();
+        let succ: Vec<Vec<u32>> = self.blocks.iter().map(|b| successors(&b.term)).collect();
+        let mut preds: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for (b, ss) in succ.iter().enumerate() {
+            for &s in ss {
+                if !preds[s as usize].contains(&(b as u32)) {
+                    preds[s as usize].push(b as u32);
+                }
+            }
+        }
+        let mut reach: Vec<Vec<bool>> = vec![vec![false; n]; n];
+        for b in 0..n {
+            reach[b][b] = true;
+            let mut stack = vec![b];
+            while let Some(x) = stack.pop() {
+                for &s in &succ[x] {
+                    if !reach[b][s as usize] {
+                        reach[b][s as usize] = true;
+                        stack.push(s as usize);
+                    }
+                }
+            }
+        }
+        let mut dom: Vec<HashSet<usize>> = vec![HashSet::new(); n];
+        for b in 0..n {
+            if b == 0 {
+                dom[b].insert(0);
+            } else {
+                dom[b].extend(0..n);
+            }
+        }
+        loop {
+            let mut changed = false;
+            for b in 1..n {
+                let mut new: HashSet<usize> = HashSet::new();
+                if let Some((first, rest)) = preds[b].split_first() {
+                    new = dom[*first as usize].clone();
+                    for p in rest {
+                        new.retain(|x| dom[*p as usize].contains(x));
+                    }
+                }
+                new.insert(b);
+                if new != dom[b] {
+                    dom[b] = new;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut loops = Vec::new();
+        for h in 0..n {
+            let backs: Vec<u32> = preds[h]
+                .iter()
+                .copied()
+                .filter(|&u| u != h as u32 && dom[u as usize].contains(&h))
+                .collect();
+            if backs.len() != 1 {
+                continue;
+            }
+            let latch = backs[0];
+            let in_loop = |b: usize| dom[b].contains(&h) && reach[b][latch as usize];
+            let mut blocks: HashSet<u32> = HashSet::new();
+            for b in 0..n {
+                if in_loop(b) {
+                    blocks.insert(b as u32);
+                }
+            }
+            let outside: Vec<u32> = preds[h]
+                .iter()
+                .copied()
+                .filter(|&p| !in_loop(p as usize))
+                .collect();
+            let preheader = if outside.len() == 1 { Some(outside[0]) } else { None };
+            loops.push(LoopInfo { header: h as u32, blocks, preheader });
+        }
+        loops
+    }
+}
+
 pub fn layout_blocks(prog: &mut Program) {
     for f in &mut prog.funcs {
         f.layout_blocks();
+    }
+}
+
+/// Replace every local whose only definition is an inlined call result with the
+/// call destination, so the value has one definition and one name.
+///
+/// Inlining a call keeps its destination local and copies the result into the
+/// caller's own temporary (`_16 = _44; _17 = _16; ...`), because the inlined
+/// body ends in `goto` to the call's target, which needs a return slot. That
+/// copy chain both hides the value from promotion (the local is written more
+/// than once) and forces it through memory. Rewriting the readers of the
+/// destination to name it directly removes the copy and lets the value be
+/// promoted like any other single-definition temporary.
+pub fn coalesce_call_results(prog: &mut Program) {
+    for f in &mut prog.funcs {
+        f.coalesce_call_results();
+    }
+}
+
+impl Function {
+    fn coalesce_call_results(&mut self) {
+        // The definition count of every local, from statements and calls.
+        let mut defs: HashMap<u32, u32> = HashMap::new();
+        for b in &self.blocks {
+            for s in &b.stmts {
+                if let Stmt::Assign(p, _) = s {
+                    *defs.entry(p.local).or_insert(0) += 1;
+                }
+            }
+            if let Terminator::Call { dest, .. } = &b.term {
+                *defs.entry(dest.local).or_insert(0) += 1;
+            }
+        }
+        // Every call destination: a chain source must be one, so the value is a
+        // call result rather than a re-definable local.
+        let mut call_dest: HashSet<u32> = HashSet::new();
+        for b in &self.blocks {
+            if let Terminator::Call { dest, .. } = &b.term {
+                if dest.proj.is_empty() {
+                    call_dest.insert(dest.local);
+                }
+            }
+        }
+        // How many times each local is read.
+        let mut uses: HashMap<u32, u32> = HashMap::new();
+        for b in &self.blocks {
+            for s in &b.stmts {
+                if let Stmt::Assign(_, rv) = s {
+                    scan_rv_operands(rv, &mut |op| {
+                        if let Operand::Copy(p) | Operand::Move(p) = op {
+                            *uses.entry(p.local).or_insert(0) += 1;
+                        }
+                    });
+                }
+            }
+            match &b.term {
+                Terminator::SwitchInt { discr, .. } | Terminator::Assert { cond: discr, .. } => {
+                    if let Operand::Copy(p) | Operand::Move(p) = discr {
+                        *uses.entry(p.local).or_insert(0) += 1;
+                    }
+                }
+                Terminator::Call { args, .. } => {
+                    for a in args {
+                        if let Operand::Copy(p) | Operand::Move(p) = a {
+                            *uses.entry(p.local).or_insert(0) += 1;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // `src` is a call result copied once into `dest`; rewrite readers of
+        // `dest` to name `src`, and drop the copy.
+        let mut cand: HashMap<u32, u32> = HashMap::new();
+        for b in &self.blocks {
+            for s in &b.stmts {
+                let Stmt::Assign(dest, Rvalue::Use(Operand::Copy(src) | Operand::Move(src))) = s
+                else {
+                    continue;
+                };
+                if !dest.proj.is_empty() || !src.proj.is_empty() || dest.local == src.local {
+                    continue;
+                }
+                // The copy must be the source's only reader, and the source's
+                // only other definition must be a call, so its value is the same
+                // at every rewritten use.
+                if !call_dest.contains(&src.local) {
+                    continue;
+                }
+                if uses.get(&src.local).copied().unwrap_or(0) != 1 {
+                    continue;
+                }
+                if defs.get(&src.local).copied().unwrap_or(0) != 2 {
+                    continue;
+                }
+                if defs.get(&dest.local).copied().unwrap_or(0) != 1 {
+                    continue;
+                }
+                cand.insert(dest.local, src.local);
+            }
+        }
+        if cand.is_empty() {
+            return;
+        }
+        let rewrite = |p: &mut Place| {
+            if p.proj.is_empty() {
+                if let Some(&to) = cand.get(&p.local) {
+                    p.local = to;
+                }
+            }
+        };
+        for b in &mut self.blocks {
+            for s in &mut b.stmts {
+                if let Stmt::Assign(_, rv) = s {
+                    for_each_operand_mut(rv, &mut |op| {
+                        if let Operand::Copy(p) | Operand::Move(p) = op {
+                            rewrite(p);
+                        }
+                    });
+                }
+            }
+            match &mut b.term {
+                Terminator::SwitchInt { discr, .. } => {
+                    if let Operand::Copy(p) | Operand::Move(p) = discr {
+                        rewrite(p);
+                    }
+                }
+                Terminator::Assert { cond, .. } => {
+                    if let Operand::Copy(p) | Operand::Move(p) = cond {
+                        rewrite(p);
+                    }
+                }
+                Terminator::Call { args, .. } => {
+                    for a in args {
+                        if let Operand::Copy(p) | Operand::Move(p) = a {
+                            rewrite(p);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Drop the now-unused copies, so the call result keeps its single
+        // definition and its register is written once.
+        for b in &mut self.blocks {
+            b.stmts.retain(|s| {
+                !matches!(s, Stmt::Assign(d, Rvalue::Use(Operand::Copy(src) | Operand::Move(src)))
+                    if d.proj.is_empty()
+                        && src.proj.is_empty()
+                        && cand.get(&d.local) == Some(&src.local))
+            });
+        }
     }
 }
 

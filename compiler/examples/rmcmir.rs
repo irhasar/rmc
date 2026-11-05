@@ -34,9 +34,11 @@ fn main() {
     let mut prog = rmc::mir::parse(&text).expect("mir parse");
     rmc::mir::tco(&mut prog, overflow_checks);
     rmc::mir::inline_calls(&mut prog);
+    rmc::mir::coalesce_call_results(&mut prog);
     rmc::mir::merge_blocks(&mut prog);
     prog.copy_propagate();
     rmc::mir::licm(&mut prog);
+    rmc::mir::fold_accumulators(&mut prog);
     rmc::mir::jump_thread(&mut prog);
     rmc::mir::rotate_loops(&mut prog);
     rmc::mir::layout_blocks(&mut prog);

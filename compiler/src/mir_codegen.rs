@@ -433,39 +433,163 @@ impl<'a> FnGen<'a> {
         for l in self.loop_operands.clone() {
             self.promote_local(l, &mut used);
         }
-        // Then the hottest remaining scalar locals. A local with a projection
-        // (a struct field, an array element) is left in memory: promoting it
-        // would mean tracking its address, which the cheap rules here do not.
-        let mut counts: HashMap<u32, u32> = HashMap::new();
-        let mut projected: HashSet<u32> = HashSet::new();
-        let mut addr_taken: HashSet<u32> = HashSet::new();
-        for b in &self.func.blocks {
+        // A value computed before a loop and read inside it is loop-invariant:
+        // keeping it in a register removes a load from every iteration. These
+        // are promoted ahead of the general ranking, because the general count
+        // weighs a value read once per iteration the same as one read once.
+        let depths = self.loop_depths();
+        let mut in_loop_use: HashMap<u32, u32> = HashMap::new();
+        let mut defined_in_loop: HashSet<u32> = HashSet::new();
+        for (bi, b) in self.func.blocks.iter().enumerate() {
+            let hot = depths.get(bi).copied().unwrap_or(0) > 0;
             for s in &b.stmts {
                 if let Stmt::Assign(p, rv) = s {
-                    if !p.proj.is_empty() {
-                        projected.insert(p.local);
+                    if hot && p.proj.is_empty() {
+                        defined_in_loop.insert(p.local);
                     }
-                    scan_rv(rv, &mut counts, &mut projected, &mut addr_taken);
+                    let mut lc: HashMap<u32, u32> = HashMap::new();
+                    let mut pj: HashSet<u32> = HashSet::new();
+                    let mut at: HashSet<u32> = HashSet::new();
+                    scan_rv(rv, &mut lc, &mut pj, &mut at);
+                    if hot {
+                        for l in lc.keys() {
+                            *in_loop_use.entry(*l).or_insert(0) += 1;
+                        }
+                    }
                 }
             }
-            scan_term(&b.term, &mut counts, &mut projected, &mut addr_taken);
+            let mut lc: HashMap<u32, u32> = HashMap::new();
+            let mut pj: HashSet<u32> = HashSet::new();
+            let mut at: HashSet<u32> = HashSet::new();
+            scan_term(&b.term, &mut lc, &mut pj, &mut at);
+            if hot {
+                for l in lc.keys() {
+                    *in_loop_use.entry(*l).or_insert(0) += 1;
+                }
+            }
+            if hot {
+                if let Terminator::Call { dest, .. } = &b.term {
+                    if dest.proj.is_empty() {
+                        defined_in_loop.insert(dest.local);
+                    }
+                }
+            }
         }
-        let mut ranked: Vec<(u32, u32)> = counts
-            .into_iter()
-            .filter(|(l, c)| *c >= 2 && !projected.contains(l) && !addr_taken.contains(l))
+        let mut invariant: Vec<(u32, u32)> = in_loop_use
+            .iter()
+            .filter(|(l, _)| !defined_in_loop.contains(l))
             .filter(|(l, _)| !self.promo.contains_key(l))
-            .filter(|(l, _)| !self.size.get(*l as usize).copied().unwrap_or(8).eq(&8) || {
-                !self.ty.get(*l as usize).map(|t| t.is_aggregate()).unwrap_or(false)
-            })
+            .filter(|(l, _)| !self.ty.get(**l as usize).map(|t| t.is_aggregate()).unwrap_or(false))
+            .map(|(l, c)| (*l, *c))
             .collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        invariant.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         let pool = self.reg_pool();
-        for (l, _) in ranked {
+        for (l, _) in invariant {
             if self.promo.len() >= pool.len() {
                 break;
             }
             self.promote_local(l, &mut used);
         }
+
+        // Then the hottest remaining scalar locals. A local with a projection
+        // (a struct field, an array element) is left in memory: promoting it
+        // would mean tracking its address, which the cheap rules here do not.
+        //
+        // A use inside a loop counts more than one outside it, weighted by the
+        // loop's nesting depth: a value carried across a hot loop is worth a
+        // callee-saved register even when it is named less often overall than a
+        // one-shot temporary, which the frame absorbs for free.
+        let mut counts: HashMap<u32, u32> = HashMap::new();
+        let mut weighted: HashMap<u32, u32> = HashMap::new();
+        let mut projected: HashSet<u32> = HashSet::new();
+        let mut addr_taken: HashSet<u32> = HashSet::new();
+        for (bi, b) in self.func.blocks.iter().enumerate() {
+            let w = depths.get(bi).copied().unwrap_or(0) + 1;
+            let mut local_counts: HashMap<u32, u32> = HashMap::new();
+            for s in &b.stmts {
+                if let Stmt::Assign(p, rv) = s {
+                    if !p.proj.is_empty() {
+                        projected.insert(p.local);
+                    }
+                    scan_rv(rv, &mut local_counts, &mut projected, &mut addr_taken);
+                }
+            }
+            scan_term(&b.term, &mut local_counts, &mut projected, &mut addr_taken);
+            for (l, c) in local_counts {
+                *counts.entry(l).or_insert(0) += c;
+                *weighted.entry(l).or_insert(0) += c * w;
+            }
+        }
+        let mut ranked: Vec<(u32, u32, u32)> = counts
+            .into_iter()
+            .filter(|(l, c)| {
+                *c >= 2 && !projected.contains(l) && !addr_taken.contains(l)
+            })
+            .filter(|(l, _)| !self.promo.contains_key(l))
+            .filter(|(l, _)| !self.size.get(*l as usize).copied().unwrap_or(8).eq(&8) || {
+                !self.ty.get(*l as usize).map(|t| t.is_aggregate()).unwrap_or(false)
+            })
+            .map(|(l, c)| (l, weighted.get(&l).copied().unwrap_or(c), c))
+            .collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)).then(a.0.cmp(&b.0)));
+        let pool = self.reg_pool();
+        for (l, _, _) in ranked {
+            if self.promo.len() >= pool.len() {
+                break;
+            }
+            self.promote_local(l, &mut used);
+        }
+    }
+
+    /// The nesting depth of each block: how many natural loops contain it.
+    ///
+    /// A back edge `latch -> header` (the header dominates the latch) defines a
+    /// natural loop as the header plus every block that both the header reaches
+    /// and that reaches the latch. Blocks in several loops get a higher depth, so
+    /// a use in a doubly-nested inner loop outweighs one in the loop around it.
+    fn loop_depths(&self) -> Vec<u32> {
+        let n = self.func.blocks.len();
+        let succ: Vec<Vec<u32>> = self
+            .func
+            .blocks
+            .iter()
+            .map(|b| successors(&b.term).into_iter().filter(|s| (*s as usize) < n).collect())
+            .collect();
+        // Transitive closure: `reach[i][j]` when `i` can reach `j`.
+        let mut reach: Vec<Vec<bool>> = vec![vec![false; n]; n];
+        for (i, s) in succ.iter().enumerate() {
+            for &t in s {
+                reach[i][t as usize] = true;
+            }
+        }
+        for k in 0..n {
+            for i in 0..n {
+                if reach[i][k] {
+                    for j in 0..n {
+                        if reach[k][j] {
+                            reach[i][j] = true;
+                        }
+                    }
+                }
+            }
+        }
+        let mut depths = vec![0u32; n];
+        for (latch, s) in succ.iter().enumerate() {
+            for &header in s {
+                let h = header as usize;
+                if h == latch || !reach[h][latch] {
+                    continue;
+                }
+                // The natural loop of `h`: every block `x` with
+                // `h` reaches `x` and `x` reaches `latch` (plus the header).
+                for x in 0..n {
+                    if x == h || (reach[h][x] && reach[x][latch]) {
+                        depths[x] += 1;
+                    }
+                }
+            }
+        }
+        depths
     }
 
     /// The registers this function may promote into. Caller-saved registers are
