@@ -21,6 +21,8 @@ pub mod elf;
 pub mod inline;
 pub mod licm;
 pub mod lexer;
+pub mod mir;
+pub mod mir_codegen;
 pub mod parser;
 pub mod runtime;
 pub mod sema;
@@ -83,4 +85,31 @@ pub fn compile_to_asm(src: &str, opts: &CompileOptions) -> Result<String, String
     asm.push_str(&user_asm);
     asm.push_str(&runtime);
     Ok(asm)
+}
+
+/// Compile a parsed MIR [`mir::Program`] to x86-64 assembly, using rustc as the
+/// front end and the in-process [`mir_codegen`] back end.
+///
+/// The result is a complete translation unit (program plus the freestanding
+/// runtime) ready for [`elf::assemble`].
+pub fn compile_mir_to_asm(
+    prog: &mir::Program,
+    opts: &mir_codegen::Options,
+) -> Result<String, String> {
+    let user_asm = mir_codegen::compile(prog, opts)?;
+    let runtime = runtime::for_program(&user_asm);
+    let mut asm = String::with_capacity(user_asm.len() + runtime.len() + 64);
+    asm.push_str(&user_asm);
+    asm.push_str(&runtime);
+    Ok(asm)
+}
+
+/// Compile MIR text (as printed by `rustc --emit=mir`) to an ELF executable.
+pub fn compile_mir_text_to_elf(
+    mir_text: &str,
+    opts: &mir_codegen::Options,
+) -> Result<Vec<u8>, String> {
+    let prog = mir::parse(mir_text)?;
+    let asm = compile_mir_to_asm(&prog, opts)?;
+    elf::assemble(&asm)
 }

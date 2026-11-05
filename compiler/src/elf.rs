@@ -826,6 +826,17 @@ impl Elf {
             self.sections[sec].data.extend_from_slice(&(v as i32).to_le_bytes());
             return Ok(());
         }
+        if ops.len() == 2 && ops[0].starts_with('$') {
+            // `imul $imm, %reg`: the two-operand immediate form, which is the
+            // three-operand form with source and destination the same register.
+            let v = parse_imm(&ops[0][1..])?;
+            let (reg, _) = parse_reg(&ops[1])?;
+            self.sections[sec].data.push(rex(true, reg, reg));
+            self.sections[sec].data.push(0x69);
+            modrm_reg_reg(&mut self.sections[sec].data, reg, reg);
+            self.sections[sec].data.extend_from_slice(&(v as i32).to_le_bytes());
+            return Ok(());
+        }
         if ops.len() == 1 {
             // One-operand `imul %reg`: signed multiply of %rax by the operand,
             // result in %rdx:%rax. Used by the division magic multiply.
