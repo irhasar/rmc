@@ -133,6 +133,78 @@ exit:
     },
     Piece {
         text: r#"
+# void __rmc_write(long ptr, long len)  -- write `len` bytes at `ptr` to
+# stdout, no newline. This is the primitive the `core::fmt` lowering uses to
+# emit a literal run; unlike `print_str` it neither prefixes a length word nor
+# appends a newline.
+.globl __rmc_write
+.type __rmc_write, @function
+__rmc_write:
+    mov %rsi, %rdx           # count
+    mov %rdi, %rsi           # buffer
+    mov $1, %rdi             # fd = stdout
+    mov $1, %rax             # SYS_write
+    syscall
+    ret
+.size __rmc_write, .-__rmc_write
+"#,
+        defines: &["__rmc_write"],
+    },
+    Piece {
+        text: r#"
+# void __rmc_print(long a)  -- the sink for `print!`/`println!`. `a` is the
+# address of a `core::fmt::Arguments` {template: ptr, args: ptr}. When the low
+# bit of `args` is set the value came from `Arguments::from_str`, which is what
+# rustc folds a format string with no runtime arguments to: `template` points
+# at rmc's `{len: i64, bytes..}` string record and the bytes are written
+# verbatim (the macro's trailing newline is already in them). A template with
+# placeholders needs a formatter per argument and is rejected by the parser
+# before codegen, so it cannot reach here; the trap below is belt-and-braces.
+.globl __rmc_print
+.type __rmc_print, @function
+__rmc_print:
+    mov $1, %r8              # fd = stdout
+    jmp __rmc_write_args
+.size __rmc_print, .-__rmc_print
+
+.globl __rmc_eprint
+.type __rmc_eprint, @function
+__rmc_eprint:
+    mov $2, %r8              # fd = stderr
+    jmp __rmc_write_args
+.size __rmc_eprint, .-__rmc_eprint
+
+__rmc_write_args:
+    mov (%rdi), %rsi         # template pointer
+    mov 8(%rdi), %rdx        # args pointer, or len<<1|1 for `from_str`
+    mov %rdx, %rax
+    and $1, %rax             # low bit set => `from_str` (no placeholders)
+    jz __rmc_fmt_unsupported
+    mov (%rsi), %rdx         # string length (record word 0)
+    add $8, %rsi             # -> the bytes
+    mov %r8, %rdi            # fd
+    mov $1, %rax             # SYS_write
+    syscall
+    ret
+
+__rmc_fmt_unsupported:
+    mov $1, %rax
+    mov $2, %rdi
+    lea __rmc_fmt_msg(%rip), %rsi
+    mov $__rmc_fmt_msg_len, %rdx
+    syscall
+    mov $101, %rdi
+    mov $60, %rax
+    syscall
+
+.section .rodata
+__rmc_fmt_msg: .ascii "rmc: runtime format arguments are not supported\n"
+.set __rmc_fmt_msg_len, . - __rmc_fmt_msg
+"#,
+        defines: &["__rmc_print", "__rmc_eprint", "__rmc_fmt_msg", "__rmc_fmt_msg_len"],
+    },
+    Piece {
+        text: r#"
 # void print_i64(long n)  -- decimal value followed by a newline
 .globl print_i64
 .type print_i64, @function

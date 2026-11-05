@@ -4861,6 +4861,108 @@ fn main() -> i64 {
 }
 
 #[test]
+fn mir_string_literal_is_a_length_prefixed_record() {
+    // `println!("hi")` folds to `Arguments::from_str`, and `str::len` reads the
+    // length from word 0 of the literal. The record must therefore start with
+    // the byte length, not the first byte of the text.
+    let mir = "\
+fn main() -> i64 {
+    let mut _0: i64;
+    let mut _1: &str;
+
+    bb0: {
+        _1 = const \"hi\";
+        _0 = const 0_i64;
+        return;
+    }
+}
+";
+    let prog = rmc::mir::parse(mir).expect("parse");
+    let asm = rmc::compile_mir_to_asm(&prog, &rmc::mir_codegen::Options::default())
+        .expect("compile");
+    // `hi` is two bytes: `.quad 2` then the two bytes, not a NUL-terminated run.
+    assert!(asm.contains(".quad 2"), "no length word for the literal:\n{asm}");
+    assert!(asm.contains(".byte 104, 105"), "literal bytes missing:\n{asm}");
+}
+
+#[test]
+fn mir_print_of_a_constant_string_reaches_the_runtime_sink() {
+    // The `print!`/`println!` sink is `std::io::_print`, whose last path
+    // segment starts with `_`. It must be rewritten to the runtime helper
+    // rather than becoming an indirect call the back end rejects.
+    let mir = "\
+fn main() -> () {
+    let mut _0: ();
+    let mut _2: std::fmt::Arguments<'_>;
+    let mut _4: std::ptr::NonNull<u8>;
+    let mut _5: *const u8;
+    let mut _6: std::ptr::NonNull<core::fmt::rt::Argument<'_>>;
+    let mut _7: usize;
+    let mut _8: usize;
+    let mut _9: usize;
+    let mut _10: *const str;
+
+    bb0: {
+        _10 = &raw const (*_3);
+        _5 = copy _10 as *const u8 (PtrToPtr);
+        _4 = copy _5 as std::ptr::NonNull<u8> (Transmute);
+        _11 = const \"hi\\n\" as &[u8] (Transmute);
+        _9 = PtrMetadata(copy _11);
+        _8 = Shl(move _9, const 1_i32);
+        _7 = BitOr(move _8, const 1_usize);
+        _6 = move _7 as std::ptr::NonNull<core::fmt::rt::Argument<'_>> (Transmute);
+        _2 = Arguments::<'_> { template: move _4, args: move _6 };
+        _1 = std::io::_print(move _2) -> [return: bb1, unwind unreachable];
+    }
+
+    bb1: {
+        return;
+    }
+}
+";
+    let prog = rmc::mir::parse(mir).expect("parse");
+    // `_print` must be a direct call to the runtime sink, not `Indirect`.
+    let call = prog.funcs[0]
+        .blocks
+        .iter()
+        .find_map(|b| match &b.term {
+            rmc::mir::Terminator::Call { func, .. } => Some(func.clone()),
+            _ => None,
+        })
+        .expect("a call");
+    assert!(
+        matches!(call, rmc::mir::CallTarget::Direct(ref n) if n == "__rmc_print"),
+        "print sink not rewritten: {call:?}"
+    );
+    let asm = rmc::compile_mir_to_asm(&prog, &rmc::mir_codegen::Options::default())
+        .expect("compile");
+    assert!(asm.contains("__rmc_print:"), "the sink is not linked in");
+}
+
+#[test]
+fn mir_runtime_format_argument_is_a_clear_diagnostic() {
+    // `println!("{}", x)` for a variable `x` reifies `Display::fmt` as a fn
+    // pointer, which this back end does not model. It must be a clean error
+    // that names the construct, not a panic.
+    let mir = "\
+fn main() -> () {
+    let mut _0: ();
+    let mut _1: i32;
+    let mut _2: std::fmt::Arguments<'_>;
+    let mut _6: core::fmt::rt::Argument<'_>;
+
+    bb0: {
+        _1 = const 5_i32;
+        _11 = <i32 as std::fmt::Display>::fmt as for<'a, 'b, 'c> fn(&'a i32, &'b mut std::fmt::Formatter<'c>) -> std::result::Result<(), std::fmt::Error> (PointerCoercion(ReifyFnPointer(Safe), Implicit));
+        return;
+    }
+}
+";
+    let err = rmc::mir::parse(mir).unwrap_err();
+    assert!(err.contains("formatting") || err.contains("Display"), "got: {err}");
+}
+
+#[test]
 fn mir_unsupported_fragment_names_the_rust_feature() {
     // A rejected MIR fragment must be reported as the Rust construct the user
     // wrote, not as a rustc-internal type name.

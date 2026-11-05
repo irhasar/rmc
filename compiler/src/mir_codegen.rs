@@ -143,13 +143,17 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<String, String> {
         rodata.push_str("\n.section .rodata\n");
         for s in &strings {
             let label = &string_ids[s];
+            // A `&str`/`&[u8]` literal is a `{len: i64, bytes..}` record, the
+            // same shape the `.rms` path uses and the one `print_str` and
+            // `PtrMetadata` (`str::len`) read. The record's address is the
+            // value, so word 0 must be the byte length, not the first byte.
+            let _ = writeln!(rodata, ".balign 8");
             let _ = writeln!(rodata, "{label}:");
-            let mut parts = Vec::new();
-            for b in s.bytes() {
-                parts.push(b.to_string());
+            let _ = writeln!(rodata, "  .quad {}", s.len());
+            if !s.is_empty() {
+                let parts: Vec<String> = s.bytes().map(|b| b.to_string()).collect();
+                let _ = writeln!(rodata, "  .byte {}", parts.join(", "));
             }
-            parts.push("0".to_string()); // NUL-terminate
-            let _ = writeln!(rodata, "  .byte {}", parts.join(", "));
         }
     }
     let mut alloc_ids: Vec<&u32> = prog.allocs.keys().collect();
@@ -1980,10 +1984,11 @@ impl<'a> FnGen<'a> {
                     UnOp::Not => self.emit("  xor $1, %rax"),
                     UnOp::Neg => self.emit("  neg %rax"),
                     UnOp::PtrMetadata => {
-                        return Err(unsupported_note(
-                            "mir_codegen: PtrMetadata (slice length) unsupported",
-                            "PtrMetadata",
-                        ))
+                        // `str::len` / slice length. rmc represents a `&str`
+                        // (or `&[T]`) literal as the address of a
+                        // `{len: i64, bytes...}` record, so the length is the
+                        // record's first word.
+                        self.emit("  mov (%rax), %rax");
                     }
                 }
                 self.store_scalar(dest, "%rax")?;

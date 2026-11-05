@@ -339,6 +339,23 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
 - `main.rs::run_mir_pipeline` honours `--no-inline`/`--no-licm`/`--no-tco`, the
   same gates the `.rms` path uses, so the fuzzer's per-pass matrix applies to
   both pipelines.
+- **A `&str`/`&[u8]` literal on the MIR path is a `{len: i64, bytes..}` record,
+  not a NUL-terminated C string.** `mir_codegen.rs` emits `.quad <len>` before
+  the bytes. `str::len` lowers to `PtrMetadata`, which reads word 0, and the
+  `print!` sink reads word 0 as the length; a C string here makes both read the
+  first byte as a huge length (the "runtime format arguments are not supported"
+  path fired because the length word was `0x0a6968`, not the text). This is the
+  same representation the `.rms` path uses (`Type::Str` is the record address).
+- **`println!("hi")` works; `println!("{}", x)` for a variable does not.**
+  rustc's `-O` MIR folds an all-constant format string to
+  `Arguments::from_str`, which is a string-record pointer plus a
+  `len << 1 | 1` word: no `Display::fmt` machinery. `mir.rs` rewrites the
+  `std::io::_print`/`_eprint` sink (the trailing path segment starts with `_`)
+  to the runtime helpers `__rmc_print`/`__rmc_eprint`, and `__rmc_write_args`
+  branches on the low bit of the args word. A *runtime* argument reifies
+  `<T as Display>::fmt` as a fn pointer and builds the full type-erased
+  `Argument` array, which the back end does not model, so it is a diagnostic
+  (`classify_unsupported`), never a miscompile.
 
 ## Things that are easy to get wrong
 

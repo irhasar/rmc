@@ -914,10 +914,17 @@ fn parse_call_terminator(t: &str) -> Option<Terminator> {
     let (func, args) = parse_call_head(head).ok()?;
     let dest = parse_place(lhs).ok()?;
     let target = parse_success_target(targets);
-    let func = if let Some(name) = normalize_call_name(&func) {
-        CallTarget::Direct(name)
-    } else {
-        CallTarget::Indirect
+    // `std::io::_print`/`_eprint` are the `print!`/`println!` sinks. Their last
+    // path segment starts with `_`, so `normalize_call_name` would reject them
+    // as indirect; map them to the runtime helpers that consume a
+    // `core::fmt::Arguments` before that happens.
+    let func = match func.trim() {
+        "std::io::_print" | "core::fmt::_print" => CallTarget::Direct("__rmc_print".to_string()),
+        "std::io::_eprint" | "core::fmt::_eprint" => CallTarget::Direct("__rmc_eprint".to_string()),
+        _ => match normalize_call_name(&func) {
+            Some(name) => CallTarget::Direct(name),
+            None => CallTarget::Indirect,
+        },
     };
     Some(Terminator::Call { dest, func, args, target })
 }
@@ -1307,7 +1314,9 @@ fn parse_rvalue(s: &str) -> Result<Rvalue, String> {
             }
             // An enum variant carries its name so the backend can find the
             // variant's payload offset; a plain struct is an `Aggregate`.
-            if name.contains("::") {
+            // `core::fmt::Arguments` is a plain struct whose path happens to
+            // contain `::`, so it must not be mistaken for a variant.
+            if name.contains("::") && !name.contains("Arguments") {
                 return Ok(Rvalue::Enum { name: name.to_string(), ops });
             }
             return Ok(Rvalue::Aggregate(ops));
@@ -1492,8 +1501,8 @@ pub fn classify_unsupported(fragment: &str) -> Option<&'static str> {
     {
         return Some("`{}`/`{:?}` formatting (rustc's `core::fmt`) is not implemented on the MIR path; write the value with `print_i64`/`print_str` instead");
     }
-    if has("core::fmt::Arguments") || has("core::fmt::rt::Argument") || has("std::io::_print") {
-        return Some("`print!`/`println!` formatting is not implemented on the MIR path; write the value with `print_i64`/`print_str` instead");
+    if has("core::fmt::rt::Argument") {
+        return Some("`print!`/`println!` with a *runtime* argument (`{}` of a variable) is not implemented on the MIR path; format only literals/constants, or write the value with `print_i64`/`print_str`");
     }
     if has("PointerCoercion(ReifyFnPointer") {
         return Some("taking a function or method as a value is not implemented on the MIR path");
@@ -1505,7 +1514,7 @@ pub fn classify_unsupported(fragment: &str) -> Option<&'static str> {
         return Some("`dyn Trait` objects are not implemented on the MIR path");
     }
     if has("PtrMetadata") {
-        return Some("slice length / `str::len` (`PtrMetadata`) is not implemented on the MIR path");
+        return Some("`PtrMetadata` on a value that is not a `&str`/`&[T]` literal is not implemented on the MIR path");
     }
     if has("PhantomData") {
         return Some("a zero-sized marker field (e.g. `PhantomData`) is not implemented on the MIR path");
@@ -1781,6 +1790,13 @@ pub fn parse_ty(s: &str) -> Result<Ty, String> {
         _ => {
             if s.contains("fn(") || s.contains("dyn ") {
                 return Ok(Ty::Other);
+            }
+            // `core::fmt::Arguments` is the `format_args!` payload: two words,
+            // a template pointer and an argument-array pointer. It is passed by
+            // address like any other two-field struct, so the backend must know
+            // its shape rather than treat it as one scalar word.
+            if s.contains("fmt::Arguments") {
+                return Ok(Ty::Struct("Arguments".to_string()));
             }
             // `core::option::Option<i64>` and `core::ops::Range<i64>` are
             // aggregates the backend models by their last path segment.

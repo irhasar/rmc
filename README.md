@@ -539,14 +539,18 @@ rmc is a small, self-contained compiler, not a drop-in replacement for rustc.
 
 - **The `.rs` (MIR) path only compiles freestanding `#![no_std]` programs.** It
   lowers a *subset* of rustc's MIR, so it does not model `println!`/`format!`
-  (rustc's `core::fmt` argument machinery), the heap containers (`Vec`, `String`,
-  `Box`, `HashMap`), closures and the `Fn` traits, floating point, `i128`,
-  `dyn Trait`, or generic instantiation. A program that uses one of those is
-  rejected with a diagnostic that names the feature (for example, "`{}`/`{:?}`
-  formatting (rustc's `core::fmt`) is not implemented on the MIR path"), never
-  miscompiled. `rustc` still does the lexing, parsing, name resolution and type
-  checking; rmc only replaces LLVM. The `.rms` path (rmc's own front end) has the
-  subset in `docs/language.md`; the two paths do not accept the same programs.
+  with *runtime* arguments (rustc's `core::fmt` argument machinery), the heap
+  containers (`Vec`, `String`, `Box`, `HashMap`), closures and the `Fn` traits,
+  floating point, `i128`, `dyn Trait`, or generic instantiation. A program that
+  uses one of those is rejected with a diagnostic that names the feature (for
+  example, "`{}`/`{:?}` formatting (rustc's `core::fmt`) is not implemented on
+  the MIR path"), never miscompiled. `println!`/`print!`/`eprintln!` of a
+  *literal or constant* argument do work: rustc folds those to
+  `Arguments::from_str`, and the back end lowers `PtrMetadata` (`str::len`) and
+  the `_print` sink to a raw write. `rustc` still does the lexing, parsing, name
+  resolution and type checking; rmc only replaces LLVM. The `.rms` path (rmc's
+  own front end) has the subset in `docs/language.md`; the two paths do not
+  accept the same programs.
 - The language subset is small (see `docs/language.md`). Structs, arrays, `for`,
   aggregates across calls, overflow checks, integer `match`, enums and
   references exist; traits, generics, borrowing, closures, floating point and
