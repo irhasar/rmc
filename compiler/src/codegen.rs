@@ -1660,7 +1660,10 @@ impl Codegen {
                     // go through `%rax`.
                     match self.simple_operand(a) {
                         Some(op) if !op.contains('(') => {
-                            self.line(&format!("mov {op}, {}(%rbp)", base + off));
+                            // An immediate payload field needs the `movq` suffix:
+                            // `as` reads an unsuffixed `mov $imm, mem` as a
+                            // 32-bit store and leaves the field's high half stale.
+                            self.store_operand(&op, &format!("{}(%rbp)", base + off));
                         }
                         _ => {
                         let at = self.gen_expr(a);

@@ -333,46 +333,51 @@ def check_encoding_matches_as():
     time on a divide-bound loop. This compares the decoded instruction streams,
     so an operand-size or alignment regression fails the suite.
     """
-    cases = ["arith", "div", "io", "utf8", "structs", "match", "bounds", "heap"]
+    names = sorted(f[:-4] for f in os.listdir(CASES) if f.endswith(".rms"))
+    # Encoding is chosen by the codegen, so the optimiser passes can change which
+    # instruction forms appear. Check the default and the plainest path.
+    combos = [("", []), (" [no-inline]", ["--no-inline"])]
     failures = 0
-    for name in cases:
+    for name in names:
         rms = os.path.join(CASES, f"{name}.rms")
-        if not os.path.exists(rms):
-            continue
-        direct = os.path.join(OUT, f"enc_{name}.direct")
-        binut = os.path.join(OUT, f"enc_{name}.binutils")
-        p = subprocess.run([RMC, rms, "-o", direct], capture_output=True)
-        q = subprocess.run([RMC, "--binutils", rms, "-o", binut], capture_output=True)
-        if p.returncode != 0 or q.returncode != 0:
-            print(f"FAIL encoding {name}: compile failed")
-            failures += 1
-            continue
-        raw = in_process_text(direct)
-        # dump the as+ld `.text` with objcopy for the same treatment
-        blob = os.path.join(OUT, f"_enc_{name}.text")
-        r = subprocess.run(["objcopy", "-O", "binary", "--only-section=.text",
-                            binut, blob], capture_output=True)
-        if raw is None or r.returncode != 0:
-            print(f"FAIL encoding {name}: could not extract .text")
-            failures += 1
-            continue
-        a = disassemble_text(direct, raw)
-        b = disassemble_text(binut, open(blob, "rb").read())
-        if a is None or b is None:
-            print(f"FAIL encoding {name}: objdump failed")
-            failures += 1
-            continue
-        # The in-process RX segment packs `.rodata` after `.text`, so the
-        # disassembly of its tail is string data, not code. Compare the common
-        # prefix; a genuine encoding difference shows up mid-stream, where the
-        # instruction counts still line up.
-        n = min(len(a), len(b))
-        if a[:n] != b[:n]:
-            k = next((i for i in range(n) if a[i] != b[i]), n)
-            print(f"FAIL encoding {name}: in-process vs as differ at instruction {k}")
-            print(f"    in-process = {a[k] if k < len(a) else '<end>'}")
-            print(f"    as+ld      = {b[k] if k < len(b) else '<end>'}")
-            failures += 1
+        for label, flags in combos:
+            tag = name + label.replace(" ", "_").replace("[", "").replace("]", "")
+            direct = os.path.join(OUT, f"enc_{tag}.direct")
+            binut = os.path.join(OUT, f"enc_{tag}.binutils")
+            p = subprocess.run([RMC, rms, "-o", direct] + flags, capture_output=True)
+            q = subprocess.run([RMC, "--binutils", rms, "-o", binut] + flags,
+                               capture_output=True)
+            if p.returncode != 0 or q.returncode != 0:
+                print(f"FAIL encoding {name}{label}: compile failed")
+                failures += 1
+                continue
+            raw = in_process_text(direct)
+            # dump the as+ld `.text` with objcopy for the same treatment
+            blob = os.path.join(OUT, f"_enc_{tag}.text")
+            r = subprocess.run(["objcopy", "-O", "binary", "--only-section=.text",
+                                binut, blob], capture_output=True)
+            if raw is None or r.returncode != 0:
+                print(f"FAIL encoding {name}{label}: could not extract .text")
+                failures += 1
+                continue
+            a = disassemble_text(direct, raw)
+            b = disassemble_text(binut, open(blob, "rb").read())
+            if a is None or b is None:
+                print(f"FAIL encoding {name}{label}: objdump failed")
+                failures += 1
+                continue
+            # The in-process RX segment packs `.rodata` after `.text`, so the
+            # disassembly of its tail is string data, not code. Compare the
+            # common prefix; a genuine encoding difference shows up mid-stream,
+            # where the instruction counts still line up.
+            n = min(len(a), len(b))
+            if a[:n] != b[:n]:
+                k = next((i for i in range(n) if a[i] != b[i]), n)
+                print(f"FAIL encoding {name}{label}: in-process vs as differ at "
+                      f"instruction {k}")
+                print(f"    in-process = {a[k] if k < len(a) else '<end>'}")
+                print(f"    as+ld      = {b[k] if k < len(b) else '<end>'}")
+                failures += 1
     if failures == 0:
         print("in-process encoder matches `as` instruction-for-instruction")
     return failures
