@@ -767,6 +767,7 @@ def gen_nest_program(rng):
     inner_mk = ", ".join(f"{f}: n + {j + 1}" for j, f in enumerate(inner))
     arr_mk = ", ".join(f"n + {j}" for j in range(na))
     inner_lit = ", ".join(f"{f}: base + {j + 1}" for j, f in enumerate(inner))
+    inner_lit2 = ", ".join(f"{f}: base + {j + 5}" for j, f in enumerate(inner))
     sum_terms = ["o.s"] + [f"o.mid.{f}" for f in inner] + [f"o.arr[{j}]" for j in range(na)]
     wval = " + ".join(
         f"v.{f} * {10 ** (len(inner) - 1 - j)}" for j, f in enumerate(inner)
@@ -774,6 +775,24 @@ def gen_nest_program(rng):
     m1, m2 = rng.randint(10, 30), rng.randint(50, 99)
     base_k = rng.randint(1, 6)
     f0 = inner[0]
+
+    # A 2D array `[[i64; c2]; r2]` and an array of structs `[Inner; ns]`, so the
+    # stride-aware indexing and the aggregate element copy are exercised. The
+    # element stride is the element's size in slots, not one: a wrong stride
+    # reads a neighbouring element and shows up as a wrong final value. Every
+    # struct element gets distinct field values for the same reason.
+    r2, c2 = rng.randint(2, 3), rng.randint(2, 3)
+    ns = rng.randint(2, 3)
+    grid_lit = ", ".join(
+        "[" + ", ".join(f"base + {r * c2 + c}" for c in range(c2)) + "]"
+        for r in range(r2)
+    )
+    st_lit = ", ".join(
+        "Inner { "
+        + ", ".join(f"{f}: base + {r * 10 + j + 1}" for j, f in enumerate(inner))
+        + " }"
+        for r in range(ns)
+    )
 
     rms = [
         "fn seed(x: i64) -> i64 { return x * 7 + 1; }",
@@ -806,6 +825,22 @@ def gen_nest_program(rng):
         "    let mut o2: Outer = mk(base + 1);",
         "    bump(&mut o2);",
         f"    acc = acc + o2.mid.{f0} + o2.s;",
+        # Nested arrays and arrays of structs: literal, splat, variable-index
+        # reads, element write, whole-element copy.
+        f"    let g: [[i64; {c2}]; {r2}] = [{grid_lit}];",
+        "    let mut gi: i64 = 0;",
+        f"    while gi < {r2} {{ let mut gj: i64 = 0; while gj < {c2} {{ acc = acc + g[gi][gj]; gj = gj + 1; }} gi = gi + 1; }}",
+        f"    acc = acc + g[0][0] + g[{r2 - 1}][{c2 - 1}];",
+        f"    let mut gm: [[i64; {c2}]; {r2}] = [[3; {c2}]; {r2}];",
+        f"    gm[{r2 - 1}][0] = acc;",
+        f"    acc = acc + gm[0][0] + gm[{r2 - 1}][0] + gm[{r2 - 1}][{c2 - 1}];",
+        f"    let mut sa: [Inner; {ns}] = [{st_lit}];",
+        f"    sa[{ns - 1}].{f0} = sa[{ns - 1}].{f0} + 3;",
+        f"    let sc: [Inner; 2] = [Inner {{ {inner_lit2} }}; 2];",
+        f"    sa[0] = sc[1];",
+        "    let mut si: i64 = 0;",
+        f"    while si < {ns} {{ acc = acc + sa[si].{f0} + sa[si].{inner[1]}; si = si + 1; }}",
+        f"    acc = acc + sc[0].{f0} + sc[1].{inner[1]};",
         "    print_i64(acc);",
         "    return 0;",
         "}",
@@ -845,6 +880,20 @@ def gen_nest_program(rng):
         "    let mut o2: Outer = mk(base + 1);",
         "    bump(&mut o2);",
         f"    acc += o2.mid.{f0} + o2.s;",
+        f"    let g: [[i64; {c2}]; {r2}] = [{grid_lit}];",
+        "    let mut gi: i64 = 0;",
+        f"    while gi < {r2} {{ let mut gj: i64 = 0; while gj < {c2} {{ acc += g[gi as usize][gj as usize]; gj += 1; }} gi += 1; }}",
+        f"    acc += g[0][0] + g[{r2 - 1}][{c2 - 1}];",
+        f"    let mut gm: [[i64; {c2}]; {r2}] = [[3; {c2}]; {r2}];",
+        f"    gm[{r2 - 1}][0] = acc;",
+        f"    acc += gm[0][0] + gm[{r2 - 1}][0] + gm[{r2 - 1}][{c2 - 1}];",
+        f"    let mut sa: [Inner; {ns}] = [{st_lit}];",
+        f"    sa[{ns - 1}].{f0} += 3;",
+        f"    let sc: [Inner; 2] = [Inner {{ {inner_lit2} }}; 2];",
+        "    sa[0] = sc[1];",
+        "    let mut si: i64 = 0;",
+        f"    while si < {ns} {{ acc += sa[si as usize].{f0} + sa[si as usize].{inner[1]}; si += 1; }}",
+        f"    acc += sc[0].{f0} + sc[1].{inner[1]};",
         '    println!("{}", acc);',
         "}",
     ]

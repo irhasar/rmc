@@ -150,6 +150,8 @@ impl Codegen {
         match base {
             Expr::Var { ty, .. } | Expr::Field { ty, .. } => Self::array_len_ty(ty),
             Expr::Call { ret_ty, .. } => Self::array_len_ty(ret_ty),
+            // `m[i][j]`: the inner base `m[i]` has the element type of `m`.
+            Expr::Index(b, _) => Self::array_elem_ty(b).and_then(|t| Self::array_len_ty(&t)),
             Expr::Block(b) => b.tail.as_deref().and_then(Self::array_len_of),
             Expr::MatchBoundary(b, _) => b.tail.as_deref().and_then(Self::array_len_of),
             Expr::If(_, then, Some(els)) => Self::array_len_of_tail(then)
@@ -167,6 +169,57 @@ impl Codegen {
 
     fn array_len_of_tail(b: &Block) -> Option<usize> {
         b.tail.as_deref().and_then(Self::array_len_of)
+    }
+
+    /// The element type of an array-valued expression `base`, when it can be
+    /// determined. Mirrors `array_len_of` over the same base forms, so an
+    /// element's stride is known wherever its length is. `None` means "assume a
+    /// one-slot element", which is what a base of unknown type used to imply.
+    fn array_elem_ty(base: &Expr) -> Option<Type> {
+        let t = match base {
+            Expr::Var { ty, .. } | Expr::Field { ty, .. } => ty,
+            Expr::Call { ret_ty, .. } => ret_ty,
+            Expr::Deref { ty, .. } => ty,
+            // `m[i][j]`: the element of `m[i]` is the element of `m`'s element
+            // type. Without this, an inner index of a nested array is taken to
+            // have stride one and reads a neighbouring element.
+            Expr::Index(b, _) => {
+                return Self::array_elem_ty(b).and_then(|t| Self::array_elem_of_ty(&t))
+            }
+            Expr::Block(b) => return b.tail.as_deref().and_then(Self::array_elem_ty),
+            Expr::MatchBoundary(b, _) => {
+                return b.tail.as_deref().and_then(Self::array_elem_ty)
+            }
+            Expr::If(_, then, Some(els)) => {
+                return Self::array_elem_ty_tail(then)
+                    .or_else(|| Self::array_elem_ty_tail(els))
+            }
+            _ => return None,
+        };
+        Self::array_elem_of_ty(t)
+    }
+
+    /// The element type of an array type, looking through a reference (which
+    /// auto-derefs for indexing). `None` for a non-array.
+    fn array_elem_of_ty(t: &Type) -> Option<Type> {
+        let t = match t {
+            Type::Ref(inner, _) => inner.as_ref(),
+            other => other,
+        };
+        match t {
+            Type::Array(e, _) => Some((**e).clone()),
+            _ => None,
+        }
+    }
+
+    fn array_elem_ty_tail(b: &Block) -> Option<Type> {
+        b.tail.as_deref().and_then(Self::array_elem_ty)
+    }
+
+    /// The stride of `base`'s elements in 8-byte slots. One for a scalar array,
+    /// more for an array of nested arrays or structs.
+    fn elem_stride(base: &Expr) -> usize {
+        Self::array_elem_ty(base).map(|e| (e.size() / 8).max(1)).unwrap_or(1)
     }
 
     /// Emit a bounds check for `base[idx]`. For a variable index the value is
@@ -1053,10 +1106,16 @@ impl Codegen {
                 let vty = ty.clone().unwrap_or(Type::I64);
                 if let Type::Array(elem, n) = &vty {
                     match init {
-                        // `[v; n]` splats one value across every element.
+                        // `[v; n]` splats one value across every element. A
+                        // scalar `v` broadcasts its word; an aggregate `v` is a
+                        // copy of its bytes into each element.
                         Some(Expr::ArrayLit(v, _)) => {
                             self.gen_expr(v);
-                            self.fill_aggregate(*slot, elem.size(), *n);
+                            if elem.is_aggregate() {
+                                self.splat_aggregate(*slot, elem.size(), *n);
+                            } else {
+                                self.fill_aggregate(*slot, elem.size(), *n);
+                            }
                         }
                         // Anything else yields the array's address (a list
                         // literal desugars to a block ending in a local array),
@@ -1180,13 +1239,12 @@ impl Codegen {
                         }
                     }
                     Expr::Index(base, idx)
-                        if matches!(base.as_ref(),
-                            Expr::Var { ty: Type::Array(e, _), .. } if e.is_aggregate()) =>
+                        if Self::array_elem_ty(base).map_or(false, |e| e.is_aggregate()) =>
                     {
-                        let elem = match base.as_ref() {
-                            Expr::Var { ty: Type::Array(e, _), .. } => (**e).clone(),
-                            _ => unreachable!(),
-                        };
+                        // An aggregate element (`m[i] = [..]`, `a[i] = P{..}`) is
+                        // copied word by word; `assign_aggregate` forms the
+                        // element address, which scales by the element size.
+                        let elem = Self::array_elem_ty(base).unwrap();
                         self.assign_aggregate(target, value, elem.size() / 8);
                     }
                     Expr::Index(base, idx) => {
@@ -1363,16 +1421,19 @@ impl Codegen {
         }
     }
 
-    /// Copy `n` elements of `elem_size` bytes from the address in `%rax` into
-    /// the aggregate starting at `slot`. Used to initialise an array from a list
-    /// literal, which produces its address rather than its elements.
+    /// Copy the `n`-element aggregate whose address is in `%rax` into the
+    /// aggregate starting at `slot`. Each element is `elem_size` bytes, so the
+    /// copy moves `n * elem_size / 8` words. Used to initialise an array (from a
+    /// list literal, or an element-wise copy) or a struct, which produce their
+    /// address rather than their elements.
     fn copy_aggregate(&mut self, slot: i32, n: usize, elem_size: usize) {
-        if n == 0 || elem_size != 8 {
+        if n == 0 || elem_size == 0 {
             return;
         }
-        let base = self.array_off(slot, n);
-        if n <= 8 {
-            for i in 0..n {
+        let words = n * elem_size / 8;
+        let base = self.array_off(slot, words);
+        if words <= 8 {
+            for i in 0..words {
                 self.line(&format!("mov {}(%rax), %rdx", i as i32 * 8));
                 self.line(&format!("mov %rdx, {}(%rbp)", base + i as i32 * 8));
             }
@@ -1380,7 +1441,7 @@ impl Codegen {
             let l = self.new_label();
             self.line("mov %rax, %rsi");
             self.line(&format!("lea {base}(%rbp), %rdi"));
-            self.line(&format!("mov ${n}, %rcx"));
+            self.line(&format!("mov ${words}, %rcx"));
             self.raw(&format!("{l}:"));
             self.line("mov (%rsi), %rdx");
             self.line("mov %rdx, (%rdi)");
@@ -1391,20 +1452,21 @@ impl Codegen {
         }
     }
 
-    /// Store `%rax` into `n` consecutive slots starting at `slot`. Used to
-    /// zero-fill or splat an array or struct that lives in the frame.
+    /// Store `%rax` into the `n`-element aggregate starting at `slot`. Each
+    /// element is `elem_size` bytes, so `n * elem_size / 8` words are filled.
+    /// Used to zero-fill or splat an array or struct that lives in the frame.
     fn fill_aggregate(&mut self, slot: i32, elem_size: usize, n: usize) {
-        if elem_size != 8 {
-            // Only 8-byte elements are supported by sema.
+        if elem_size == 0 {
             return;
         }
-        let base = self.array_off(slot, n);
-        if n == 0 {
+        let words = n * elem_size / 8;
+        let base = self.array_off(slot, words);
+        if words == 0 {
             return;
         }
-        if n <= 8 {
-            for i in 0..n {
-                let s = slot + n as i32 - 1 - i as i32;
+        if words <= 8 {
+            for i in 0..words {
+                let s = slot + words as i32 - 1 - i as i32;
                 match self.reg_of(s) {
                     Some(r) => self.line(&format!("mov %rax, {r}")),
                     None => self.line(&format!("mov %rax, {}(%rbp)", base + i as i32 * 8)),
@@ -1413,11 +1475,50 @@ impl Codegen {
         } else {
             let l = self.new_label();
             self.line("mov %rax, %r8");
-            self.line(&format!("mov ${n}, %rcx"));
+            self.line(&format!("mov ${words}, %rcx"));
             self.line(&format!("lea {base}(%rbp), %rdx"));
             self.raw(&format!("{l}:"));
             self.line("mov %r8, (%rdx)");
             self.line("add $8, %rdx");
+            self.line("dec %rcx");
+            self.line(&format!("jnz {l}"));
+        }
+    }
+
+    /// Splat the aggregate of `elem_size` bytes at the address in `%rax` into
+    /// each of `n` elements starting at `slot`. Used for `[v; n]` when `v` is
+    /// itself an aggregate (a nested array or a struct), where every element is
+    /// a copy of `v`'s bytes rather than a broadcast of one word.
+    fn splat_aggregate(&mut self, slot: i32, elem_size: usize, n: usize) {
+        let ew = elem_size / 8;
+        if n == 0 || ew == 0 {
+            return;
+        }
+        let words = n * ew;
+        let base = self.array_off(slot, words);
+        if words <= 8 {
+            for i in 0..n {
+                for w in 0..ew {
+                    self.line(&format!("mov {}(%rax), %rdx", w as i32 * 8));
+                    self.line(&format!(
+                        "mov %rdx, {}(%rbp)",
+                        base + (i * ew + w) as i32 * 8
+                    ));
+                }
+            }
+        } else {
+            let l = self.new_label();
+            self.line("mov %rax, %rsi");
+            self.line(&format!("lea {base}(%rbp), %rdi"));
+            self.line(&format!("mov ${n}, %rcx"));
+            self.raw(&format!("{l}:"));
+            for w in 0..ew {
+                self.line(&format!("mov {}(%rsi), %r8", w as i32 * 8));
+                self.line(&format!("mov %r8, {}(%rdi)", w as i32 * 8));
+            }
+            // Only the destination advances: every element is a copy of the
+            // one source value, which stays put.
+            self.line(&format!("add ${elem_size}, %rdi"));
             self.line("dec %rcx");
             self.line(&format!("jnz {l}"));
         }
@@ -1428,7 +1529,9 @@ impl Codegen {
     /// is the *lowest* address of the range and fields index upward from it.
     fn aggregate_base(&self, slot: i32, ty: &Type) -> Option<i32> {
         match ty {
-            Type::Array(_, n) => Some(self.array_off(slot, *n)),
+            Type::Array(elem, n) => {
+                Some(self.array_off(slot, n * (elem.size() / 8).max(1)))
+            }
             Type::Struct(_, size) => Some(self.array_off(slot, size / 8)),
             Type::EnumData(_, size) => Some(self.array_off(slot, size / 8)),
             _ => None,
@@ -1639,8 +1742,9 @@ impl Codegen {
             }
             Expr::Index(base, idx) => {
                 match base.as_ref() {
-                    Expr::Var { slot, ty: Type::Array(_, n), .. } => {
-                        self.line(&format!("lea {}(%rbp), %rax", self.array_off(*slot, *n)));
+                    Expr::Var { slot, ty: Type::Array(elem, n), .. } => {
+                        let slots = n * (elem.size() / 8).max(1);
+                        self.line(&format!("lea {}(%rbp), %rax", self.array_off(*slot, slots)));
                     }
                     // A non-local base yields its address as a value.
                     _ => {
@@ -1651,7 +1755,15 @@ impl Codegen {
                 self.gen_expr(idx);
                 self.check_bounds(base, idx);
                 self.pop_to("%rcx");
-                self.line("lea (%rcx,%rax,8), %rax");
+                // Scale the index by the element size: 8 bytes for a scalar
+                // element, more for a nested array or a struct.
+                let stride = Self::elem_stride(base);
+                if stride == 1 {
+                    self.line("lea (%rcx,%rax,8), %rax");
+                } else {
+                    self.line(&format!("imul ${}, %rax, %rax", stride * 8));
+                    self.line("lea (%rcx,%rax), %rax");
+                }
             }
             Expr::Field { base, offset, .. } => {
                 // A `Ref` base is a pointer: the address of its field is the
@@ -1857,10 +1969,14 @@ impl Codegen {
                 Type::Struct(name.clone(), (n as usize) * 8)
             }
             Expr::Index(base, _idx) => {
-                let elem = match base.as_ref() {
-                    Expr::Var { ty: Type::Array(e, _), .. } => (**e).clone(),
-                    _ => Type::I64,
-                };
+                let elem = Self::array_elem_ty(base).unwrap_or(Type::I64);
+                // An aggregate element is named by its address, not loaded: hand
+                // the whole place to `gen_addr`, which scales by the element size.
+                if elem.is_aggregate() {
+                    self.gen_addr(e);
+                    return elem;
+                }
+                let stride = (elem.size() / 8).max(1);
                 match self.array_elem_operand(base, _idx) {
                     // `disp(%rbp,%reg,8)` addresses the element in one operand.
                     Some(op) if op.contains("%rax") => {
@@ -1873,9 +1989,11 @@ impl Codegen {
                         self.line(&format!("mov {op}, %rax"));
                     }
                     None => {
-                        // The base is not a local array: it is a temporary whose
-                        // value *is* its address (a call's hidden return buffer,
-                        // a block, a struct field), so index off that address.
+                        // The base is not a local array of 8-byte elements: it is
+                        // a temporary whose value *is* its address (a call's
+                        // hidden return buffer, a block, a struct field), or a
+                        // local array of wider elements, so index off the address
+                        // with the element stride applied.
                         match _idx.as_ref() {
                             Expr::Int(v) if (-2_147_483_648..=2_147_483_647).contains(v) => {
                                 // Evaluate the base before checking, so a call or
@@ -1885,7 +2003,10 @@ impl Codegen {
                                 // survives in `%rax` for the load.
                                 self.gen_expr(base);
                                 self.check_bounds(base, _idx);
-                                self.line(&format!("mov {}(%rax), %rax", *v as i32 * 8));
+                                self.line(&format!(
+                                    "mov {}(%rax), %rax",
+                                    *v as i32 * 8 * stride as i32
+                                ));
                             }
                             _ => {
                                 self.gen_expr(base);
@@ -1893,7 +2014,12 @@ impl Codegen {
                                 self.gen_expr(_idx);
                                 self.check_bounds(base, _idx);
                                 self.pop_to("%rcx");
-                                self.line("mov (%rcx,%rax,8), %rax");
+                                if stride == 1 {
+                                    self.line("mov (%rcx,%rax,8), %rax");
+                                } else {
+                                    self.line(&format!("imul ${}, %rax, %rax", stride * 8));
+                                    self.line("mov (%rcx,%rax), %rax");
+                                }
                             }
                         }
                     }
@@ -2828,13 +2954,20 @@ impl Codegen {
     }
 
     /// An operand `disp(%rbp,%rax,8)` for `base[idx]` where `base` is a local
-    /// array. The caller must have the index value in `%rax`. Returns `None`
-    /// for anything else, so the caller falls back to computing the address.
+    /// array of 8-byte elements. The caller must have the index value in `%rax`.
+    /// Returns `None` for anything else (a wider element, a non-local base, an
+    /// index that is neither a constant nor a plain variable), so the caller
+    /// falls back to computing the address with the element stride applied.
     fn array_elem_operand(&self, base: &Expr, idx: &Expr) -> Option<String> {
         let (slot, n) = match base {
             Expr::Var { slot, ty: Type::Array(_, n), .. } => (*slot, *n),
             _ => return None,
         };
+        // A wide element (a nested array or a struct) is addressed by the
+        // general path, which scales the index by the element size.
+        if Self::elem_stride(base) != 1 {
+            return None;
+        }
         match idx {
             Expr::Int(v) if (-2_147_483_648..=2_147_483_647).contains(v) => {
                 // Constant index: no register needed at all.
@@ -2844,6 +2977,23 @@ impl Codegen {
                 // The index lives in a slot; the caller must load it into %rax
                 // and bake the array base offset into the displacement.
                 Some(format!("{}(%rbp,%rax,8)", self.array_off(slot, n)))
+            }
+            _ => None,
+        }
+    }
+
+    /// The frame displacement of element `idx` of the local array at `slot` with
+    /// `n` slots and a `stride`-slot element, for a *constant* index. `None`
+    /// when `base` is not a local array. Used where an element is named directly
+    /// rather than through `array_elem_operand` (which handles only stride 1).
+    fn const_elem_off(&self, base: &Expr, idx: &Expr) -> Option<i32> {
+        let (slot, n) = match base {
+            Expr::Var { slot, ty: Type::Array(_, n), .. } => (*slot, *n),
+            _ => return None,
+        };
+        match idx {
+            Expr::Int(v) if (-2_147_483_648..=2_147_483_647).contains(v) => {
+                Some(self.array_off(slot, n) + *v as i32 * 8 * Self::elem_stride(base) as i32)
             }
             _ => None,
         }

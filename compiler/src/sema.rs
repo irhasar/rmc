@@ -381,8 +381,8 @@ fn resolve_ty_rec(
         }
         Type::Array(elem, n) => {
             let e = resolve_ty_rec(elem, raw_s, raw_e, so, eo, visiting)?;
-            if !e.is_int_or_bool() {
-                return Err(format!("array elements must be `i64`, `bool` or a unit enum, not {e:?}"));
+            if !e.is_array_elem() {
+                return Err(format!("array elements must be `i64`, `bool`, a unit enum, a struct or an array, not {e:?}"));
             }
             Ok(Type::Array(Box::new(e), *n))
         }
@@ -418,8 +418,8 @@ fn resolve_in(
         }
         Type::Array(elem, n) => {
             let e = resolve_in(elem, structs, enums)?;
-            if !e.is_int_or_bool() {
-                return Err(format!("array elements must be `i64`, `bool` or a unit enum, not {e:?}"));
+            if !e.is_array_elem() {
+                return Err(format!("array elements must be `i64`, `bool`, a unit enum, a struct or an array, not {e:?}"));
             }
             Ok(Type::Array(Box::new(e), *n))
         }
@@ -619,8 +619,8 @@ impl Sema {
     fn check_let_init(&mut self, e: &mut Expr, scope: &mut Scope) -> Result<Type, String> {
         if let Expr::ArrayLit(val, n) = e {
             let t = self.check_expr(val, scope)?;
-            if !t.is_int_or_bool() {
-                return Err(format!("array elements must be `i64`, `bool` or a unit enum, found {t:?}"));
+            if !t.is_array_elem() {
+                return Err(format!("array elements must be `i64`, `bool`, a unit enum, a struct or an array, found {t:?}"));
             }
             return Ok(Type::Array(Box::new(t), *n));
         }
@@ -1927,8 +1927,8 @@ impl Sema {
             }
             Expr::ArrayLit(val, n) => {
                 let t = self.check_expr(val, scope)?;
-                if !t.is_int_or_bool() {
-                    return Err(format!("array elements must be `i64`, `bool` or a unit enum, found {t:?}"));
+                if !t.is_array_elem() {
+                    return Err(format!("array elements must be `i64`, `bool`, a unit enum, a struct or an array, found {t:?}"));
                 }
                 let ty = Type::Array(Box::new(t), *n);
                 // Value position: `[v; n]` has no address of its own, so rewrite
@@ -1938,7 +1938,10 @@ impl Sema {
                 // is re-checked below. Without this a repeat literal used as an
                 // index base, argument, return or field would be emitted as a
                 // bare scalar and dereferenced as an address.
-                let arr_slot = self.alloc_slots(*n as i32);
+                // The local needs one slot per element *word*: a nested array or
+                // a struct element spans several slots, so `n` alone would
+                // under-allocate and the elements would overlap.
+                let arr_slot = self.alloc_slots(*n as i32 * (ty.size() / 8).max(1) as i32);
                 let name = "\u{0}rep".to_string();
                 let var = Expr::Var { name: name.clone(), slot: arr_slot, ty: ty.clone() };
                 let stmts = vec![Stmt::Let {
@@ -1957,9 +1960,9 @@ impl Sema {
                 // The parser never produces an empty list: it requires at least
                 // one element before the `]`, so `[]` fails there.
                 let elem_ty = self.check_expr(&mut elems[0], scope)?;
-                if !elem_ty.is_int_or_bool() {
+                if !elem_ty.is_array_elem() {
                     return Err(format!(
-                        "array elements must be `i64`, `bool` or a unit enum, found {elem_ty:?}"
+                        "array elements must be `i64`, `bool`, a unit enum, a struct or an array, found {elem_ty:?}"
                     ));
                 }
                 for e in elems.iter_mut().skip(1) {
@@ -1972,12 +1975,13 @@ impl Sema {
                 }
                 let n = elems.len();
                 let arr_ty = Type::Array(Box::new(elem_ty), n);
+                let elem_words = (arr_ty.size() / 8 / n.max(1)).max(1);
                 // Build `{ let mut __list: [T; n]; __list[0] = e0; ...; __list }`.
                 // The `let` is left uninitialised on purpose: every element is
                 // written by an assignment, and an uninitialised local needs no
                 // default value (which an aggregate element type has no way to
                 // spell). Codegen zero-fills a scalar array anyway.
-                let arr_slot = self.alloc_slots(n as i32);
+                let arr_slot = self.alloc_slots(n as i32 * elem_words as i32);
                 let name = "\u{0}list".to_string();
                 let mut stmts = vec![Stmt::Let {
                     name: name.clone(),
