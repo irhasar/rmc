@@ -479,6 +479,20 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   `aggregate_base` returns this base for both arrays and structs; use it
   everywhere, including the struct-literal store in `gen_stmt` (an earlier bug
   used `off(slot)`, the wrong end of the range).
+- **A wide element has stride `size()/8`, not 1.** An array of nested arrays or
+  of structs addresses element `i` at `base + i * stride`, so `array_off` must be
+  called with the *slot* count `n * stride`, never the element count `n`. Every
+  load, store, copy and splat scales by that stride. The stride comes from
+  `elem_stride(base)`, which reads `array_elem_ty(base)`; that must look through
+  an `Index` base (`m[i][j]` uses the inner array's element type), or the inner
+  index silently uses stride 1 and reads a neighbouring element. `sema`'s
+  list-literal and repeat-literal desugars must also allocate `n * stride` slots:
+  allocating `n` makes wide elements overlap.
+- **A splat copies one value into every element.** In `splat_aggregate`'s
+  counting loop only the destination pointer advances; the source stays put. An
+  earlier version stepped both, so element `i` was read from `v + i*elem_size`
+  and only element 0 held `v` — invisible for a scalar splat, wrong for a wide
+  element over the 8-word small-path threshold.
 - **`for` is not a `while`.** `continue` must run the increment, so `for` keeps
   its own node with a dedicated continue label (`cont`). Desugaring it to `while`
   would make `continue` skip the increment and loop forever. It *is* rotated like
@@ -1213,7 +1227,13 @@ another struct and an array, and an enum whose payload is a struct — with a
 deep copy (`let mut o1 = o0`) and a nested-path write (`o1.mid.f = ...`,
 `o1.arr[0] = ...`) that the copy must not alias: `stmt` mode only ever gives a
 struct plain `i64` fields, so the field-offset arithmetic for a nested path and
-the aggregate copy were never generated. `pat` mode builds `match`
+the aggregate copy were never generated. `nest` mode also builds nested arrays
+(`[[i64; c]; r]`) and arrays of structs: a list literal, a nested splat, a
+variable-index read, an element write and a whole-element copy. Those pin the
+stride (`size()/8` slots per element, so `array_off` takes `n * stride`) and the
+splat loop, which for a wide element over the 8-word threshold copies one source
+value into every element instead of walking the source along with the
+destination. `pat` mode builds `match`
 expressions: a multi-variant unit enum, a variant with two payload fields, a
 binding pattern, a negative literal, a nested `match`, an `if let` (integer,
 binding, payload-binding, `else if let` chain and a side-effecting scrutinee),
