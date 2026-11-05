@@ -85,6 +85,16 @@ fn a_constant_assignment_stores_straight_to_the_frame() {
     assert!(!out.contains("mov $5, %rax"), "no register bounce:\n{out}");
 }
 
+#[test]
+fn a_register_initialiser_stores_straight_to_the_frame() {
+    // `q.x` is promoted to `%rbx`; copying it into `a`, whose address is taken,
+    // is one `mov %rbx, off(%rbp)`, not `mov %rbx, %rax; mov %rax, off(%rbp)`.
+    let out = asm(
+        "struct P { x: i64, y: i64 } fn main() -> i64 { let mut q: P = P { x: 1, y: 2 }; let mut i: i64 = 0; while i < 10 { q.x = q.x + q.y; i = i + 1; } let mut a: i64 = 0; let ra: &i64 = &a; a = q.x; return a + *ra; }",
+    );
+    assert!(out.contains("mov %rbx, -"), "register stored direct:\n{out}");
+}
+
 fn struct_fields_are_laid_out_in_order() {
     // Declaration order, no padding: `y` sits exactly one word above `x`. A
     // `&p` keeps the struct in memory so both fields are stored to the frame;
