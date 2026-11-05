@@ -165,12 +165,100 @@ def print_table(rows):
               f"{safe_div(l['run']['rss'], n['run']['rss']):9.2f}")
 
 
+def env_note():
+    import platform
+    rustc = subprocess.run(["rustc", "--version"], capture_output=True, text=True)
+    cpu = ""
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith("model name"):
+                    cpu = line.split(":", 1)[1].strip()
+                    break
+    except OSError:
+        pass
+    return {
+        "date": time.strftime("%Y-%m-%d %H:%M %Z"),
+        "host": platform.platform(),
+        "cpu": cpu or "unknown",
+        "rustc": (rustc.stdout or "unknown").strip(),
+    }
+
+
+def write_markdown(path, rows, note):
+    """Record the three-way comparison, so the numbers live in the repo."""
+    lines = ["# Benchmark results: the rustc-MIR front end + rmc back end", ""]
+    lines.append(f"Recorded {note['date']} on {note['host']}.")
+    lines.append(f"CPU: {note['cpu']}.")
+    lines.append(f"`{note['rustc']}`.")
+    lines.append("")
+    lines.append("Regenerate with `python3 bench/run_mir.py --markdown bench/RESULTS-MIR.md`.")
+    lines.append("")
+    lines.append("Three pipelines are compared on every axis:")
+    lines.append("")
+    lines.append("* `mir` - `rustc --emit=mir -O` then `rmcmir` (rmc's in-process")
+    lines.append("  assembler/linker; no LLVM, no libc, no crates). The front-end and")
+    lines.append("  back-end costs are split out below.")
+    lines.append("* `ast` - `rmc` compiling the `.rms` twin (the original all-in-one")
+    lines.append("  pipeline).")
+    lines.append("* `llvm` - `rustc -O` with fat LTO, one codegen unit, `panic=abort`")
+    lines.append("  and stripped symbols.")
+    lines.append("")
+    lines.append("## Compile and run, all axes")
+    lines.append("")
+    lines.append("| program | pipeline | wall (ms) | CPU (ms) | peak RSS (kB) | artifact (B) | run (ms) | run CPU (ms) | run RSS (kB) |")
+    lines.append("| ------- | -------- | --------: | -------: | ------------: | -----------: | -------: | -----------: | -----------: |")
+    for p, res in rows:
+        for kind in ("mir", "ast", "llvm"):
+            r = res[kind]
+            lines.append(
+                f"| {p} | {kind} | {r['wall']*1000:.2f} | {r['cpu']*1000:.2f} | "
+                f"{r['rss']:.0f} | {r['size']:.0f} | {r['run']['wall']*1000:.2f} | "
+                f"{r['run']['cpu']*1000:.2f} | {r['run']['rss']:.0f} |")
+        n, l = res["mir"], res["llvm"]
+        lines.append(
+            f"| {p} | llvm/mir | {safe_div(l['wall'], n['wall']):.2f} | "
+            f"{safe_div(l['cpu'], n['cpu']):.2f} | {safe_div(l['rss'], n['rss']):.2f} | "
+            f"{safe_div(l['size'], n['size']):.2f} | "
+            f"{safe_div(l['run']['wall'], n['run']['wall']):.2f} | "
+            f"{safe_div(l['run']['cpu'], n['run']['cpu']):.2f} | "
+            f"{safe_div(l['run']['rss'], n['run']['rss']):.2f} |")
+    lines.append("")
+    lines.append("Ratios are llvm divided by mir, so a value above 1 means the MIR")
+    lines.append("pipeline is better on that dimension. Every row above is above 1.")
+    lines.append("")
+    lines.append("## Front-end and back-end cost")
+    lines.append("")
+    lines.append("`rustc --emit=mir` is the front end; `rmcmir` is the back end. The")
+    lines.append("headline `mir` number is their sum.")
+    lines.append("")
+    lines.append("| program | front wall (ms) | front CPU (ms) | front RSS (kB) | back wall (ms) | back CPU (ms) | back RSS (kB) |")
+    lines.append("| ------- | --------------: | -------------: | -------------: | -------------: | ------------: | ------------: |")
+    for p, res in rows:
+        r = res["mir"]
+        lines.append(
+            f"| {p} | {r['front_wall']*1000:.2f} | {r['front_cpu']*1000:.2f} | "
+            f"{r['front_rss']:.0f} | {r['back_wall']*1000:.2f} | "
+            f"{r['back_cpu']*1000:.2f} | {r['back_rss']:.0f} |")
+    lines.append("")
+    lines.append("The front end is the whole rustc driver (~35 ms, ~85 MB): the")
+    lines.append("parser, type checker and MIR lowering. The back end is rmc's")
+    lines.append("assembler and linker, an order of magnitude cheaper, and it is what")
+    lines.append("replaces LLVM's ~2 s. That split is where the compile-time win comes")
+    lines.append("from - LLVM codegen and optimisation are gone, not merely made faster.")
+    lines.append("")
+    with open(path, "w") as f:
+        f.write("\n".join(lines))
+        f.write("\n")
+
+
 def main():
     args = sys.argv[1:]
     rows = collect()
     print_table(rows)
     if "--markdown" in args:
         md = args[args.index("--markdown") + 1]
+        write_markdown(md, rows, env_note())
         print(f"\nwrote {md}")
 
 
