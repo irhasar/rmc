@@ -664,9 +664,15 @@ impl<'a> FnGen<'a> {
         // dead slots and unused saved registers shrinks every frame, which is
         // what a recursive call pays for at each level.
         self.gen_body()?;
-        let dry = std::mem::take(&mut self.out);
+        let raw = std::mem::take(&mut self.out);
         let frame_slots = self.next_slot;
-        let mut used_slots = rbp_slots(&dry);
+        // Slots come from the raw body: the peephole passes fold `(%rbp)`
+        // operands into register-based addresses, which would hide a live slot.
+        let mut used_slots = rbp_slots(&raw);
+        // Registers come from the optimised body: coalescing can free a
+        // callee-saved register the raw body named, and a `push`/`pop` for a
+        // register nothing reads is pure overhead in every call.
+        let opt = optimize(&raw);
         // An aggregate's slots are reached as `base + k`, so only the base
         // appears in the text. Pin every slot of a multi-slot region: they must
         // stay contiguous, or an element access would fall outside the frame.
@@ -698,7 +704,7 @@ impl<'a> FnGen<'a> {
         let saved: Vec<&'static str> = PROMOTE_REGS
             .iter()
             .copied()
-            .filter(|r| reg_mentions(&dry, r))
+            .filter(|r| reg_mentions(&opt, r))
             .collect();
         // The saved registers sit below `%rbp`, so every frame slot is shifted
         // past them; `off` reads this.
@@ -730,18 +736,7 @@ impl<'a> FnGen<'a> {
             let _ = writeln!(self.out, "  pop {r}");
         }
         self.out.push_str("  leave\n  ret\n");
-        let mut body = peephole(&std::mem::take(&mut self.out));
-        // Each pass exposes work for the others: forwarding a store to its
-        // reader lets the store be dropped, which lets the arithmetic that fed
-        // it fuse into a `lea`. Two rounds reach the fixed point.
-        for _ in 0..2 {
-            body = fuse_lea(&body);
-            body = coalesce_scratch(&body);
-            body = forward_stores(&body);
-            body = fold_addresses(&body);
-            body = dead_stores(&body);
-        }
-        Ok(body)
+        Ok(optimize(&std::mem::take(&mut self.out)))
     }
 
     /// Argument setup plus every basic block. Run twice (dry, then real).
@@ -765,7 +760,8 @@ impl<'a> FnGen<'a> {
             // instructions from straddling a boundary, which matters most for a
             // tight inner loop.
             if self.opts.align_loops && self.is_loop_header(i) {
-                let _ = writeln!(self.out, "  .p2align 4");
+                let n = std::env::var("RMC_ALIGN").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+                if n > 0 { let _ = writeln!(self.out, "  .p2align {n}"); }
             }
             let _ = writeln!(self.out, ".Lbb{}:", self.bb_label(i));
             self.gen_block(i)?;
@@ -1882,33 +1878,60 @@ fn coalesce_scratch(body: &str) -> String {
     let mut i = 0;
     'outer: while i < lines.len() {
         if let Some((a, t)) = mov_reg_reg(lines[i]) {
-            if SCRATCH.contains(&t) && !SCRATCH.contains(&a) {
-                let mut k = i + 1;
-                while k < lines.len() {
-                    let lt = lines[k].trim();
-                    let op = lt.split_whitespace().next().unwrap_or("");
-                    if lt.ends_with(':')
-                        || lt.starts_with('.')
-                        || op.starts_with('j')
-                        || op == "ret"
-                        || op == "call"
-                        || op == "syscall"
-                    {
-                        break;
-                    }
-                    if reg_mentions(lines[k], a) {
-                        if mov_reg_reg(lines[k]) == Some((t, a)) {
-                            for m in &lines[i + 1..k] {
-                                out.push_str(&replace_reg(m, t, a));
-                                out.push('\n');
-                            }
-                            i = k + 1;
-                            continue 'outer;
-                        }
-                        break;
-                    }
+            // `mov %a, %t` copies a value into `%t`. When exactly one of the
+            // two is a scratch register, the copy only exists to park the value
+            // somewhere the other register is not reused: carry it in the
+            // non-scratch register and rename the scratch one's uses. A call
+            // result is the common case -- `%rax` holds it, and the generator
+            // copies it into a callee-saved register for the second call.
+            let (keep, dead) = if SCRATCH.contains(&t) && !SCRATCH.contains(&a) {
+                (a, t)
+            } else if SCRATCH.contains(&a) && !SCRATCH.contains(&t) {
+                (t, a)
+            } else {
+                out.push_str(lines[i]);
+                out.push('\n');
+                i += 1;
+                continue;
+            };
+            // The straight-line region over which the copy can carry the value:
+            // it ends at a control-flow edge, when `dead` is overwritten (the
+            // value is lost), or when `keep` is overwritten (a new value).
+            let mut k = i + 1;
+            let mut last_use = i;
+            while k < lines.len() {
+                let lt = lines[k].trim();
+                let op = lt.split_whitespace().next().unwrap_or("");
+                if lt.ends_with(':') || lt.starts_with('.') {
                     k += 1;
+                    continue;
                 }
+                if op.starts_with('j')
+                    || op == "ret"
+                    || op == "call"
+                    || op == "syscall"
+                {
+                    break;
+                }
+                let writes = written_regs(op, lt);
+                if writes.iter().any(|r| r == dead) || writes.iter().any(|r| r == keep) {
+                    break;
+                }
+                if reg_mentions(lines[k], keep) {
+                    last_use = k;
+                }
+                k += 1;
+            }
+            // `keep` must be dead past the region, or renaming its uses would
+            // drop a value a later block still reads. Its only mentions outside
+            // the region may be the prologue save and the epilogue restore.
+            if last_use > i && dead_after(&lines, i, k, keep) {
+                for m in &lines[i + 1..k] {
+                    out.push_str(&replace_reg(m, keep, dead));
+                    out.push('\n');
+                }
+                i = k;
+                continue 'outer;
             }
         }
         out.push_str(lines[i]);
@@ -1916,6 +1939,24 @@ fn coalesce_scratch(body: &str) -> String {
         i += 1;
     }
     out
+}
+
+/// True when `reg` is mentioned outside `lines[start..end]` only by a `push` or
+/// a `pop`, i.e. it carries nothing across the region.
+fn dead_after(lines: &[&str], start: usize, end: usize, reg: &str) -> bool {
+    for (idx, line) in lines.iter().enumerate() {
+        if (idx >= start + 1 && idx < end) || idx == start {
+            continue;
+        }
+        if !reg_mentions(line, reg) {
+            continue;
+        }
+        let op = line.trim().split_whitespace().next().unwrap_or("");
+        if op != "push" && op != "pop" {
+            return false;
+        }
+    }
+    true
 }
 
 /// Fold `mov %src, %t; add $k, %t; mov ...(%t)...` into a single instruction
@@ -2413,6 +2454,21 @@ fn store_slot(line: &str) -> Option<&str> {
 /// -216(%rbp), %rax`). Those pairs are adjacent by construction and removing
 /// them is purely local: a store to memory is not observable, so skipping a
 /// load of a value that is already in the register cannot change behaviour.
+/// The peephole pipeline, run to a fixed point. Each pass exposes work for the
+/// others: forwarding a store to its reader lets the store be dropped, which
+/// lets the arithmetic that fed it fuse into a `lea`.
+fn optimize(body: &str) -> String {
+    let mut body = peephole(body);
+    for _ in 0..2 {
+        body = fuse_lea(&body);
+        body = coalesce_scratch(&body);
+        body = forward_stores(&body);
+        body = fold_addresses(&body);
+        body = dead_stores(&body);
+    }
+    body
+}
+
 fn peephole(body: &str) -> String {
     let lines: Vec<&str> = body.lines().collect();
     let mut out = String::with_capacity(body.len());
