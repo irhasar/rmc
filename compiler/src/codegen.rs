@@ -51,6 +51,10 @@ pub struct Codegen {
     /// `xor %eax, %eax` that materialises its unit value, which in `fib` is a
     /// dead instruction in the hot path.
     discard: bool,
+    /// True during the throwaway dry run whose output is discarded. The dead
+    /// and redundant instructions `trim_dead` removes do not affect the frame
+    /// size or spill depth the dry run measures, so the pass is skipped there.
+    dry: bool,
     /// Frame slot holding the hidden return-buffer pointer for the function
     /// being generated (`-1` when the return type is scalar or unit).
     ret_slot: i32,
@@ -109,6 +113,7 @@ impl Codegen {
             ret_slot: -1,
             ret_ty: Type::Unit,
             frame_slots: Cell::new(0),
+            dry: false,
         }
     }
 
@@ -313,6 +318,7 @@ impl Codegen {
         // emits, and the final pass is seeded with the dry pass's result.
         self.frame_slots.set(0);
         let mark = (self.out.len(), self.label, self.str_id, self.strings.len());
+        self.dry = true;
         // Dry run with every spill in the frame: it reports the deepest spill,
         // which is exactly how many spill registers are worth reserving, and the
         // deepest local slot the body addresses, which sizes the frame.
@@ -343,6 +349,7 @@ impl Codegen {
         // agree (the extra spill slots do not change which locals are addressed).
         self.frame_slots.set(frame);
         self.spill_base = frame;
+        self.dry = false;
         self.gen_fn_body(f);
         self.regs.clear();
         self.spill_regs.clear();
@@ -443,7 +450,9 @@ impl Codegen {
         self.line("leave");
         self.line("ret");
         self.raw(&format!(".size {}, .-{}", f.name, f.name));
-        self.trim_dead(fn_start);
+        if !self.dry {
+            self.trim_dead(fn_start);
+        }
     }
 
     /// Drop instructions that cannot be reached because the instruction before

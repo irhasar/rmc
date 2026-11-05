@@ -317,6 +317,12 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   truncates the output between passes; the label counter, string table, spill
   high-water mark and frame-size measurement are part of that reset. Miss one and
   the two passes diverge.
+- **The dry pass skips `trim_dead`.** The dry run only measures the spill
+  high-water mark and the deepest slot, and the dead/round-trip instructions
+  `trim_dead` removes change neither, so `Codegen::dry` turns the pass off for
+  it. That is a pure compile-time saving on a function whose body is one long
+  straight line: `div.rms` (a 531-line `main`) drops 6% of its compile time, and
+  the emitted assembly is byte-for-byte identical to running the pass twice.
 - **A callee-saved *temporary* is not worth it; a callee-saved *spill* is.** An
   early attempt kept every short-lived value in `%r12`-`%r15` and measured
   *slower* — the unconditional save/restore in the prologue/epilogue cost more
