@@ -270,9 +270,11 @@ python3 tools/fuzz.py --mode pat --n 500 --seed 1
 python3 tools/fuzz.py --mode order --n 500 --seed 1
 python3 tools/fuzz.py --mode shift --n 500 --seed 1
 python3 tools/fuzz.py --mode mir --n 500 --seed 1
+python3 tools/fuzz.py --mode mir --gen width --n 500 --seed 1
 # also exercise the trap codegen: --bounds-checks and --overflow-checks runs
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 python3 tools/fuzz.py --mode robust
+python3 tools/fuzz.py --mode mirrobust
 ```
 
 `robust` mode needs no rustc: it feeds a fixed corpus of malformed and
@@ -281,6 +283,21 @@ parentheses, braces, unary operators or binary operators) and requires each to
 produce a clean error rather than a panic or a signal. This is what catches an
 unbounded parser recursion overflowing the stack on untrusted input. CI runs it
 together with a small fixed-seed differential fuzz.
+
+`mirrobust` mode is `robust` for the MIR path. It feeds a fixed corpus of `.rs`
+programs — the standard-library formatting and containers, closures, floating
+point, traits, generics, plus programs rustc itself rejects and a few malformed
+ones — through `rmc <src.rs>` and requires each to end in a diagnostic (exit 1),
+never a panic or a signal. The failure a user hits first on this path is not a
+syntax error in their own source but a MIR shape the back end does not model, so
+this is the corpus that keeps a rejected construct a message rather than a
+crash.
+
+`--gen width` is a differential generator that mixes every integer width
+(`u8`..`i64`, `usize`/`isize`) with `wrapping_add`/`sub`/`mul` and a cast back
+down. Every integer narrower than 64 bits shares one word in the back end, so a
+wrong sign/zero extension or a missing wrap at a narrow width is the miscompile
+this generator exists to find; it has not found one.
 
 A caveat for `expr`: an integer literal in a shift amount is unconstrained, so
 rustc infers `i32` and masks the count to 5 bits, while rmc is `i64`-only and
@@ -495,6 +512,16 @@ Two benchmarks need a word of caution when reading their ratio:
 
 rmc is a small, self-contained compiler, not a drop-in replacement for rustc.
 
+- **The `.rs` (MIR) path only compiles freestanding `#![no_std]` programs.** It
+  lowers a *subset* of rustc's MIR, so it does not model `println!`/`format!`
+  (rustc's `core::fmt` argument machinery), the heap containers (`Vec`, `String`,
+  `Box`, `HashMap`), closures and the `Fn` traits, floating point, `i128`,
+  `dyn Trait`, or generic instantiation. A program that uses one of those is
+  rejected with a diagnostic that names the feature (for example, "`{}`/`{:?}`
+  formatting (rustc's `core::fmt`) is not implemented on the MIR path"), never
+  miscompiled. `rustc` still does the lexing, parsing, name resolution and type
+  checking; rmc only replaces LLVM. The `.rms` path (rmc's own front end) has the
+  subset in `docs/language.md`; the two paths do not accept the same programs.
 - The language subset is small (see `docs/language.md`). Structs, arrays, `for`,
   aggregates across calls, overflow checks, integer `match`, enums and
   references exist; traits, generics, borrowing, closures, floating point and
