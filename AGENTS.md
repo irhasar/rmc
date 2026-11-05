@@ -978,7 +978,23 @@ would overwrite each other's `p.s` and report a bogus assembler failure.
 A generated shift amount must stay `i64`-typed: rustc infers
 `i32` for an unconstrained literal and masks the count to 5 bits, while rmc is
 `i64`-only and masks to 6, so an untyped count reports a divergence that is not a
-bug.
+bug. `stmt` mode's reference build also has to be valid Rust in its own right:
+`rustc` indexes an array with `usize`, so every generated `arr[...]` in the
+reference carries an `as usize` cast (rmc is `i64`-only), and the `fn h` helper
+is inserted at the *front* of the reference — inserting it after the struct's
+`#[derive(Copy, Clone)]` puts that attribute on a function, which rustc rejects
+outright. When that happened the whole `stmt` mode was vacuous: rustc refused
+every generated program, the fuzzer skipped all of them, and the mode reported a
+clean run while testing nothing. If a fuzz mode ever reports a suspiciously
+pristine run, check its skip rate rather than trusting the summary.
+
+`--encoding` makes the fuzzer compile each program both ways and compare the
+decoded `.text` instruction-for-instruction (branch targets folded, alignment
+nops dropped, immediates reduced to a placeholder), the same normalisation the
+corpus suite's `check_encoding_matches_as` uses. This is what catches an
+operand-size or alignment bug that both builds execute identically — the
+in-process encoder and `as`/`ld` can produce the same behaviour from different
+bytes, and only the decoded stream shows it.
 
 The fuzzer's grammar is narrower than the language, so it does not reach every
 construct; three divergences found by hand-probing were an enum `match` with no

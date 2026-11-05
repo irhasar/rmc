@@ -45,6 +45,84 @@ def rustc_available():
     return shutil.which(RUSTC) is not None
 
 
+def _inproc_text(path):
+    """The RX LOAD segment's file bytes, i.e. the in-process assembled `.text`."""
+    import struct
+    data = open(path, "rb").read()
+    phoff = struct.unpack_from("<Q", data, 0x20)[0]
+    phentsize = struct.unpack_from("<H", data, 0x36)[0]
+    phnum = struct.unpack_from("<H", data, 0x38)[0]
+    for i in range(phnum):
+        o = phoff + i * phentsize
+        p_type, p_flags = struct.unpack_from("<II", data, o)
+        p_offset = struct.unpack_from("<Q", data, o + 8)[0]
+        p_filesz = struct.unpack_from("<Q", data, o + 32)[0]
+        if p_type == 1 and (p_flags & 1):
+            start = phoff + phnum * phentsize
+            return data[start:p_offset + p_filesz]
+    return None
+
+
+def _binutils_text(path, scratch):
+    subprocess.run(["objcopy", "-O", "binary", "--only-section=.text", path, scratch],
+                   capture_output=True)
+    try:
+        return open(scratch, "rb").read()
+    except OSError:
+        return None
+
+
+def _disasm(raw, scratch):
+    """Normalised instruction list: branch targets folded, alignment nops and
+    immediates reduced to placeholders, so only the instruction *stream* is
+    compared. This is what catches an operand-size or alignment bug, which a
+    behaviour comparison cannot see."""
+    import re
+    open(scratch, "wb").write(raw)
+    out = run(["objdump", "-D", "-b", "binary", "-m", "i386:x86-64", scratch])
+    ins = []
+    for line in out.stdout.decode(errors="replace").splitlines():
+        m = re.match(r"^\s*[0-9a-f]+:\s+(?:[0-9a-f]{2} )+\s*(.*)$", line)
+        if not m:
+            continue
+        t = m.group(1).strip()
+        t = re.sub(r"\$-?0x[0-9a-f]+", "$I", t)
+        t = re.sub(r"\$-?[0-9]+", "$I", t)
+        t = re.sub(r"0x[0-9a-f]+", "A", t)
+        t = re.sub(r"\s+", " ", t)
+        if not t:
+            continue
+        if "nop" in t or t == "xchg %ax,%ax" or t.startswith("data16"):
+            continue
+        ins.append(t)
+    return ins
+
+
+def encoding_divergence(rms, flags, tmp):
+    """Compile both ways and compare the decoded `.text`.
+
+    Returns `None` when either build fails (nothing to compare), `True` when the
+    instruction streams agree, or a `(index, in_process, as)` tuple on a
+    divergence."""
+    direct = f"{tmp}/enc.direct"
+    binut = f"{tmp}/enc.binutils"
+    if run([RMC] + flags + [rms, "-o", direct]).returncode != 0:
+        return None
+    if run([RMC, "--binutils"] + flags + [rms, "-o", binut]).returncode != 0:
+        return None
+    raw = _inproc_text(direct)
+    bu = _binutils_text(binut, f"{tmp}/enc.text")
+    if raw is None or bu is None:
+        return None
+    a = _disasm(raw, f"{tmp}/enc.a.bin")
+    b = _disasm(bu, f"{tmp}/enc.b.bin")
+    n = min(len(a), len(b))
+    if a[:n] != b[:n]:
+        k = next((i for i in range(n) if a[i] != b[i]), n)
+        return (k, a[k] if k < len(a) else "<end>", b[k] if k < len(b) else "<end>")
+    return True
+
+
 def run(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, **kw)
 
@@ -245,11 +323,12 @@ def gen_stmt_program(rng):
         "acc = acc + (i ^ (i >> 1));",
     ])
     rms.append("        " + inner)
-    rs.append("        " + inner.replace("acc = acc +", "acc +=", 1))
+    rs.append("        " + inner.replace("acc = acc +", "acc +=", 1)
+               .replace("arr[i % 4]", "arr[(i % 4) as usize]"))
     rms.append("        acc = acc + match i % 3 { 0 => 5, 1 => 7, _ => 11 };")
     rs.append("        acc += match i % 3 { 0 => 5, 1 => 7, _ => 11 };")
     rms.append("        arr[i % 4] = arr[i % 4] + i;")
-    rs.append("        arr[i % 4] += i;")
+    rs.append("        arr[(i % 4) as usize] += i;")
     rms.append("        i = i + 1;")
     rs.append("        i += 1;")
     rms += ["    }"]
@@ -323,7 +402,9 @@ def gen_stmt_program(rng):
     rms += ["    return 0;", "}"]
     rs += ["}"]
     rms.insert(0, "fn h(x: i64) -> i64 { return (x * 3 + 1) % 97; }")
-    rs.insert(1, "fn h(x: i64) -> i64 { (x * 3 + 1) % 97 }")
+    # `rs[0]` is the struct's `#[derive]`, so the helper has to go *before* it:
+    # inserting at 1 puts the attribute on `fn h`, which rustc rejects.
+    rs.insert(0, "fn h(x: i64) -> i64 { (x * 3 + 1) % 97 }")
     return "\n".join(rms), "\n".join(rs)
 
 
@@ -1206,6 +1287,10 @@ def main():
     ap.add_argument("--keep", default=None, help="write failing programs here")
     ap.add_argument("--bounds", action="store_true",
                     help="also compile with --bounds-checks, to exercise the trap codegen")
+    ap.add_argument("--encoding", action="store_true",
+                    help="also compare the in-process .text against the as+ld "
+                         ".text instruction-for-instruction (catches encoding "
+                         "drift that a behaviour comparison cannot see)")
     ap.add_argument("--overflow", action="store_true",
                     help="also compile with --overflow-checks, against a rustc built "
                          "with -C overflow-checks=on")
@@ -1317,6 +1402,13 @@ def main():
                 bad = (f"rmc[{label}] argv={argv} exit={o1.returncode} stdout={o1.stdout!r}\n"
                        f"  rustc    exit={o2.returncode} stdout={o2.stdout!r}")
                 break
+            if args.encoding:
+                enc = encoding_divergence(f"{tmp}/p.rms", flags, tmp)
+                if enc is not None and enc is not True:
+                    k, ip, asm = enc
+                    bad = (f"rmc[{label}] in-process vs as differ at instruction {k}\n"
+                           f"  in-process = {ip}\n  as+ld      = {asm}")
+                    break
         if bad:
             print(f"[{args.mode} seed={args.seed} iter={t}] DIVERGENCE\n{rms}\n  {bad}")
             if args.keep:
