@@ -308,16 +308,27 @@ fn an_undeclared_loop_label_is_rejected() {
 }
 
 #[test]
-fn a_label_on_while_let_is_rejected() {
-    // `while let` desugars to a plain `loop`, so the label would be lost; it is
-    // rejected rather than silently dropped.
-    let err = compile_to_asm(
+fn a_label_on_while_let_is_threaded_into_the_desugared_loop() {
+    // `while let` desugars to a labelled `loop { if let .. else { break; } }`,
+    // so `break 'a` / `continue 'a` in the body target it. Before, the label
+    // was dropped and the statement was rejected.
+    asm(
         "enum E { A(i64), B } \
          fn main() -> i64 { let mut e: E = E::A(1); 'a: while let E::A(x) = e { break 'a; } return 0; }",
+    );
+    asm(
+        "enum E { A(i64), B } \
+         fn main() -> i64 { let mut e: E = E::A(1); let mut n: i64 = 0; \
+         'a: while let E::A(x) = e { n = n + x; if n < 3 { continue 'a; } break; } return n; }",
+    );
+    // The label is a real loop label, so an undeclared one is still an error.
+    let err = compile_to_asm(
+        "enum E { A(i64), B } \
+         fn main() -> i64 { let mut e: E = E::A(1); while let E::A(x) = e { break 'nope; } return 0; }",
         &CompileOptions::default(),
     )
     .unwrap_err();
-    assert!(err.contains("label on `while let`"), "got: {err}");
+    assert!(err.contains("undeclared label"), "got: {err}");
 }
 
 #[test]

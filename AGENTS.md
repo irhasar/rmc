@@ -584,8 +584,9 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   that stack from the top for the label (an unlabelled `break`/`continue` takes
   the innermost entry). The label is carried through the desugarings that build
   a loop: `'a: for x in arr` copies the label onto the index `for` it expands
-  to. `while let` desugars to a plain `loop`, so a label on it is rejected in the
-  parser rather than silently dropped. The `if`-with-a-lone-`break`/`continue`
+  to, and `'a: while let PAT = EXPR { .. }` passes the label to the `loop` it
+  desugars to, so `break 'a` / `continue 'a` in the body target it. The
+  `if`-with-a-lone-`break`/`continue`
   fast path in `bare_exit` only fires for an *unlabelled* `break`/`continue`,
   since a labelled one may leave an outer loop.
 - **A `for` bound is compared directly when it is a constant, and through a

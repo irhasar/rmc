@@ -255,7 +255,7 @@ same patterns
 explicit discriminant, `enum E { A = 5, B }`) and payload variants; `break`
 (with a value in a `loop`, so `loop`
 works as an expression), `continue`,
-`return`; loop labels (`'a: loop` / `'a: while` / `'a: for`, with
+`return`; loop labels (`'a: loop` / `'a: while` / `'a: while let` / `'a: for`, with
 `break 'a` / `break 'a value` / `continue 'a` targeting any enclosing labelled
 loop); arithmetic, comparison, bitwise (`!`/`&`/`|`/`^`) and shift (`<<`/`>>`)
 operators; `&&`/`||`; strings (a `str` literal or `str`-typed parameter, return

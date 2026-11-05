@@ -823,14 +823,18 @@ impl Parser {
         match self.peek() {
             Some(Tok::While) => {
                 self.i += 1;
-                // `'a: while let PAT = EXPR { body }`: the label would be lost
-                // in the desugar to `loop { if let .. }`, so reject it rather
-                // than silently drop the label.
+                // `'a: while let PAT = EXPR { body }` desugars to a labelled
+                // `loop { if let PAT = EXPR { body } else { break; } }`: the
+                // label attaches to the `loop`, so `break 'a` / `continue 'a`
+                // in the body target it just as they would a labelled `while`.
                 if self.peek() == Some(&Tok::Let) {
-                    return Err(format!(
-                        "at byte {}: a label on `while let` is not supported",
-                        self.pos()
-                    ));
+                    self.i += 1;
+                    let pat = self.parse_pattern()?;
+                    self.expect(Tok::Eq)?;
+                    let scrutinee = self.parse_cond()?;
+                    let body = self.parse_block()?;
+                    let s = self.desugar_while_let(pat, scrutinee, body, Some(label))?;
+                    return Ok(s);
                 }
                 let cond = self.parse_cond()?;
                 let body = self.parse_block()?;
@@ -1170,7 +1174,7 @@ impl Parser {
                     self.expect(Tok::Eq)?;
                     let scrutinee = self.parse_cond()?;
                     let body = self.parse_block()?;
-                    let s = self.desugar_while_let(pat, scrutinee, body)?;
+                    let s = self.desugar_while_let(pat, scrutinee, body, None)?;
                     out.push(s);
                     return Ok(());
                 }
@@ -2316,7 +2320,13 @@ impl Parser {
     /// need no new case. `EXPR` sits inside the loop, so it is re-evaluated
     /// every iteration (as in Rust); the `if let` binds its non-`Var` scrutinee
     /// to a fresh temporary each time.
-    fn desugar_while_let(&mut self, pat: Pat, scrutinee: Expr, body: Block) -> PResult<Stmt> {
+    fn desugar_while_let(
+        &mut self,
+        pat: Pat,
+        scrutinee: Expr,
+        body: Block,
+        label: Option<String>,
+    ) -> PResult<Stmt> {
         let break_else = Block {
             stmts: vec![Stmt::Break(None, None)],
             tail: None,
@@ -2327,8 +2337,10 @@ impl Parser {
         let loop_body = Block { stmts: vec![Stmt::Expr(test)], tail: None };
         // The loop is unit-valued: the `else` arm always contains a plain
         // `break;`, so a `break value` in the body is rejected as a type
-        // mismatch (rustc E0571 rejects it too).
-        Ok(Stmt::Expr(Expr::Loop(loop_body, -1, Type::Unit, None)))
+        // mismatch (rustc E0571 rejects it too). A label on the `while let`
+        // attaches to the desugared `loop`, so `break 'a` / `continue 'a` in
+        // the body still target it.
+        Ok(Stmt::Expr(Expr::Loop(loop_body, -1, Type::Unit, label)))
     }
 
     /// One arm of a desugared `match` or `if let`: the pattern test, the
