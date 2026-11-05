@@ -2105,9 +2105,10 @@ impl<'a> FnGen<'a> {
             return Ok(());
         }
         // A memory source cannot be the source of a memory destination, and
-        // `%rax` is clobbered by `place_addr`, so both go through `%rcx`.
+        // `%rax` is clobbered by `place_addr`, so both go through `%rcx`. A
+        // wide immediate has no `mov $imm, mem` encoding either.
         let is_mem = src.contains('(');
-        let src = if src == "%rax" || is_mem {
+        let src = if src == "%rax" || is_mem || is_wide_imm(src) {
             self.emit(&format!("  mov {src}, %rcx"));
             "%rcx"
         } else {
