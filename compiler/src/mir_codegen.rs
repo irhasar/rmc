@@ -770,7 +770,7 @@ impl<'a> FnGen<'a> {
         // statement that computed the `bool` is then dead, so skip it.
         let skip = self.compare_branch_skip(bb, &term);
         for (i, s) in stmts.iter().enumerate() {
-            if Some(i) == skip {
+            if skip.contains(&i) {
                 continue;
             }
             if let Stmt::Assign(p, rv) = s {
@@ -784,22 +784,29 @@ impl<'a> FnGen<'a> {
     /// Both a `switchInt(bool)` (an `if`/loop test) and an `assert(bool)` (a
     /// bounds check) read a `bool` local that was just computed by a comparison;
     /// the terminator emits the `cmp`+`jcc` itself, so the `bool` store is dead.
-    fn compare_branch_skip(&self, bb: u32, term: &Terminator) -> Option<usize> {
+    fn compare_branch_skip(&self, bb: u32, term: &Terminator) -> Vec<usize> {
         let cond = match term {
             Terminator::SwitchInt { discr, targets, .. } => {
                 if targets.len() != 1 {
-                    return None;
+                    return Vec::new();
                 }
                 discr
             }
             Terminator::Assert { cond, .. } => cond,
-            _ => return None,
+            _ => return Vec::new(),
         };
-        let pl = operand_place(cond)?;
+        let Some(pl) = operand_place(cond) else { return Vec::new() };
         if !pl.proj.is_empty() {
-            return None;
+            return Vec::new();
         }
-        let block = self.func.blocks.get(bb as usize)?;
+        let Some(block) = self.func.blocks.get(bb as usize) else { return Vec::new() };
+        // `assert(!(c1 && c2))` (the overflow check) folds the `and` and both
+        // comparisons into the terminator, so all three are dead.
+        if matches!(term, Terminator::Assert { negate: true, .. }) {
+            if let Some((ai, c1i, c2i)) = self.and_chain(bb, pl.local) {
+                return vec![ai, c1i, c2i];
+            }
+        }
         let mut last = None;
         for (i, s) in block.stmts.iter().enumerate() {
             if let Stmt::Assign(p, Rvalue::Binary(op, _, _)) = s {
@@ -808,7 +815,75 @@ impl<'a> FnGen<'a> {
                 }
             }
         }
-        last
+        last.into_iter().collect()
+    }
+
+    /// Recognise `_b = c1 & c2` in `bb`, where `c1`/`c2` are comparisons that
+    /// each have `_b`'s block as their only definition site, and `_b` is the
+    /// last statement. Returns the `and`'s statement index and the two
+    /// comparisons' `(operator, lhs, rhs)`.
+    #[allow(clippy::type_complexity)]
+    fn and_chain(
+        &self,
+        bb: u32,
+        b: u32,
+    ) -> Option<(usize, usize, usize)> {
+        let block = self.func.blocks.get(bb as usize)?;
+        let ai = block.stmts.len().checked_sub(1)?;
+        let Stmt::Assign(d, Rvalue::Binary(BinOp::BitAnd, x, y)) = &block.stmts[ai] else {
+            return None;
+        };
+        if d.local != b || !d.proj.is_empty() {
+            return None;
+        }
+        let (Operand::Copy(xp) | Operand::Move(xp)) = x else { return None };
+        let (Operand::Copy(yp) | Operand::Move(yp)) = y else { return None };
+        if !xp.proj.is_empty() || !yp.proj.is_empty() {
+            return None;
+        }
+        let cmp_of = |l: u32| -> Option<(usize, BinOp, Operand, Operand)> {
+            for (i, s) in block.stmts[..ai].iter().enumerate() {
+                if let Stmt::Assign(p, Rvalue::Binary(op, a, c)) = s {
+                    if p.local == l && p.proj.is_empty() && is_compare(*op) {
+                        return Some((i, *op, a.clone(), c.clone()));
+                    }
+                }
+            }
+            None
+        };
+        let (c1i, _, _, _) = cmp_of(xp.local)?;
+        let (c2i, _, _, _) = cmp_of(yp.local)?;
+        Some((ai, c1i, c2i))
+    }
+
+    /// The two comparisons behind an `assert(!(c1 && c2))` terminator, as
+    /// `(operator, lhs, rhs)` pairs.
+    fn and_chain_cmps(
+        &self,
+        bb: u32,
+        b: u32,
+    ) -> Option<((BinOp, Operand, Operand), (BinOp, Operand, Operand))> {
+        let block = self.func.blocks.get(bb as usize)?;
+        let ai = block.stmts.len().checked_sub(1)?;
+        let Stmt::Assign(d, Rvalue::Binary(BinOp::BitAnd, x, y)) = &block.stmts[ai] else {
+            return None;
+        };
+        if d.local != b || !d.proj.is_empty() {
+            return None;
+        }
+        let (Operand::Copy(xp) | Operand::Move(xp)) = x else { return None };
+        let (Operand::Copy(yp) | Operand::Move(yp)) = y else { return None };
+        let cmp_of = |l: u32| -> Option<(BinOp, Operand, Operand)> {
+            for s in &block.stmts[..ai] {
+                if let Stmt::Assign(p, Rvalue::Binary(op, a, c)) = s {
+                    if p.local == l && p.proj.is_empty() && is_compare(*op) {
+                        return Some((*op, a.clone(), c.clone()));
+                    }
+                }
+            }
+            None
+        };
+        Some((cmp_of(xp.local)?, cmp_of(yp.local)?))
     }
 
     /// Emit the `cmp` for the comparison that produced `cond` in `bb`, when
@@ -865,6 +940,31 @@ impl<'a> FnGen<'a> {
                 self.emit("  syscall");
             }
             Terminator::Assert { cond, negate, target } => {
+                // `assert(!(c1 && c2))`, the overflow check: emit the two
+                // comparisons with a short-circuit jump, so neither `bool` is
+                // materialised. Success needs one of them false, i.e. one
+                // comparison to fail.
+                if *negate {
+                    if let Some(pl) = operand_place(cond) {
+                        if pl.proj.is_empty() {
+                            if let Some((c1, c2)) = self.and_chain_cmps(bb, pl.local) {
+                                let ok = self.new_label();
+                                self.emit_cmp(c1.0, &c1.1, &c1.2)?;
+                                self.emit(&format!("  {} {ok}", jcc(negate_cc(c1.0))));
+                                self.emit_cmp(c2.0, &c2.1, &c2.2)?;
+                                self.emit(&format!("  {} {ok}", jcc(negate_cc(c2.0))));
+                                self.emit("  mov $101, %rdi");
+                                self.emit("  mov $60, %rax");
+                                self.emit("  syscall");
+                                self.emit(&format!("{ok}:"));
+                                if *target != bb + 1 || *target as usize >= self.func.blocks.len() {
+                                    self.emit(&format!("  jmp .Lbb{}", self.bb_label(*target)));
+                                }
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
                 // A `assert(cmp, ..)` folds the comparison into the flags, so
                 // the `bool` local is never materialised.
                 let jcc = match self.emit_fused_compare(bb, cond)? {
@@ -1505,11 +1605,33 @@ impl<'a> FnGen<'a> {
                 if bv != "%rcx" {
                     self.emit(&format!("  mov {bv}, %rcx"));
                 }
+                // Fast path: when both operands are non-negative and below 2^32,
+                // the 32-bit unsigned `div` is correct and roughly half the
+                // latency of the 64-bit `idiv`. `dividend | divisor` has a zero
+                // high half exactly in that case, so `or`/`shr`/`jnz` selects the
+                // path; a negative operand, a value past 2^32, or the
+                // `i64::MIN / -1` overflow all take the slow path, which the
+                // surrounding `assert`s already guard.
+                let slow = self.new_label();
+                let done = self.new_label();
+                self.emit("  mov %rax, %rdx");
+                self.emit("  or %rcx, %rdx");
+                self.emit("  shr $32, %rdx");
+                self.emit(&format!("  jnz {slow}"));
+                self.emit("  div %ecx");
+                if op == BinOp::Rem {
+                    self.emit("  mov %rdx, %rax");
+                } else {
+                    self.emit("  mov %eax, %eax");
+                }
+                self.emit(&format!("  jmp {done}"));
+                self.emit(&format!("{slow}:"));
                 self.emit("  cqto");
                 self.emit("  idiv %rcx");
                 if op == BinOp::Rem {
                     self.emit("  mov %rdx, %rax");
                 }
+                self.emit(&format!("{done}:"));
             }
             _ => unreachable!(),
         }

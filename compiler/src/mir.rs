@@ -2740,16 +2740,18 @@ impl Function {
                 if !dest.proj.is_empty() || !src.proj.is_empty() || dest.local == src.local {
                     continue;
                 }
-                // The copy must be the source's only reader, and the source's
-                // only other definition must be a call, so its value is the same
-                // at every rewritten use.
+                // The copy must be the source's only reader, and the source must
+                // be a call destination, so the value at the copy is the call's
+                // result. The call counts once in `defs`, so a source defined
+                // once is the call alone; a second definition is a write whose
+                // position cannot change the call's result at the copy.
                 if !call_dest.contains(&src.local) {
                     continue;
                 }
                 if uses.get(&src.local).copied().unwrap_or(0) != 1 {
                     continue;
                 }
-                if defs.get(&src.local).copied().unwrap_or(0) != 2 {
+                if !(1..=2).contains(&defs.get(&src.local).copied().unwrap_or(0)) {
                     continue;
                 }
                 if defs.get(&dest.local).copied().unwrap_or(0) != 1 {
