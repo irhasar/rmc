@@ -87,6 +87,16 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   `_` alternative, and one whose alternatives cover every variant, are handled
   by `pat_irrefutable` and `or_leaves` (in sema) respectively. A *binding*
   alternative is rejected, as rustc's E0408 rejects it.
+  A *struct pattern* `S { f, g: h, i: _, .. }` is irrefutable, so it also has no
+  sema or codegen case: `desugar_arm` turns each bound field into a `let` whose
+  initialiser is `Expr::Field { base: scrutinee, .. }`, which sema already types
+  and locates (so a field may auto-deref a `&S` scrutinee). The prescan records
+  each struct's field names before the real parse (`struct_fields`), so a field
+  name is checked even for `i: _` (which emits no read) and a later-declared
+  struct still matches; a field the struct lacks, or one bound twice, is a parse
+  error. A struct pattern is a catch-all arm, so it joins `pat_irrefutable`, and
+  `or_cond` treats it as `true` (a *binding* struct pattern in an or-pattern is
+  rejected like any other binding alternative).
   An arm may carry a *guard*, `PAT if COND => body`. `parse_match` reads the
   optional `if COND` after the pattern (`parse_cond`, so a struct literal needs
   parentheses) and threads it through `desugar_arm` as an `Option<Expr>`. The

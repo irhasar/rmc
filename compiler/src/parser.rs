@@ -29,6 +29,13 @@ pub struct Parser {
     /// Constant `bool` items by name, so a `const F: bool` used as a `match`
     /// pattern becomes the `true`/`false` pattern.
     const_bools: std::collections::HashMap<String, bool>,
+    /// Struct field names by struct name, collected before parsing so a struct
+    /// pattern (`S { f, .. }`) can be checked at parse time. A struct pattern
+    /// has no runtime test, so the parser rewrites it into field reads; that
+    /// rewrite needs the field list, which sema does not reach until later. A
+    /// struct declared later in the file is covered because the whole list is
+    /// scanned first.
+    struct_fields: std::collections::HashMap<String, std::collections::HashSet<String>>,
 }
 
 /// The deepest expression, block or type nesting the parser accepts. Deeply
@@ -61,6 +68,7 @@ impl Parser {
             current_impl: None,
             consts: std::collections::HashMap::new(),
             const_bools: std::collections::HashMap::new(),
+            struct_fields: std::collections::HashMap::new(),
         }
     }
 
@@ -147,9 +155,10 @@ impl Parser {
 
     pub fn parse_program(&mut self) -> PResult<Program> {
         // A `const` may be named before it is declared (an array length
-        // `[i64; N]`, a pattern `N =>`), so collect and evaluate every `const`
-        // item first, then parse the program with the values known.
-        self.prescan_consts()?;
+        // `[i64; N]`, a pattern `N =>`), and a struct pattern `S { f }` names a
+        // struct that may be declared later, so collect both first, then parse
+        // the program with the values and field lists known.
+        self.prescan()?;
         let mut structs = Vec::new();
         let mut enums = Vec::new();
         let mut consts = Vec::new();
@@ -243,13 +252,14 @@ impl Parser {
         Ok(EnumDef { name, variants })
     }
 
-    /// Scan the token stream for top-level `const` items and evaluate them, so
-    /// a use that precedes the declaration (an array length, a pattern) sees
-    /// the value. Only the item's own tokens are consumed: a `{ .. }` or
-    /// `( .. )` in its initializer is skipped by bracket matching, and every
-    /// other item's body is skipped the same way, so no nested `const` inside a
-    /// function body is collected here.
-    fn prescan_consts(&mut self) -> PResult<()> {
+    /// Scan the token stream once, before the real parse, for two things that a
+    /// use may need before their declaration: the value of every top-level
+    /// `const` (an array length `[i64; N]`, a pattern `N =>`), and the field
+    /// names of every struct (a struct pattern `S { f }`). Only an item's own
+    /// tokens are consumed: a `{ .. }` or `( .. )` in an initializer is skipped
+    /// by bracket matching, and every other item's body is skipped the same way,
+    /// so no nested `const` inside a function body is collected here.
+    fn prescan(&mut self) -> PResult<()> {
         let saved = self.i;
         let mut items: Vec<ConstDef> = Vec::new();
         self.i = 0;
@@ -257,7 +267,54 @@ impl Parser {
             match self.peek() {
                 None => break,
                 Some(Tok::Const) => items.push(self.parse_const()?),
-                Some(Tok::Struct) | Some(Tok::Enum) => {
+                Some(Tok::Struct) => {
+                    // Record the field names, then skip the body. Only a braced
+                    // struct has named fields to collect; a later `struct S { .. }`
+                    // is what a pattern `S { f }` needs.
+                    self.i += 1;
+                    let name = if let Some(Tok::Ident(n)) = self.peek() {
+                        let n = n.clone();
+                        self.i += 1;
+                        Some(n)
+                    } else {
+                        None
+                    };
+                    if self.peek() == Some(&Tok::LBrace) {
+                        self.i += 1;
+                        let mut fields = std::collections::HashSet::new();
+                        while self.peek() != Some(&Tok::RBrace) && self.peek().is_some() {
+                            if let Some(Tok::Ident(f)) = self.peek() {
+                                fields.insert(f.clone());
+                                self.i += 1;
+                            } else {
+                                self.i += 1;
+                                continue;
+                            }
+                            // Skip the `: Type`, which may contain braces in an
+                            // array type; stop at the next `,` or `}`.
+                            while let Some(t) = self.peek() {
+                                if *t == Tok::Comma || *t == Tok::RBrace {
+                                    break;
+                                }
+                                if *t == Tok::LBracket {
+                                    self.skip_balanced(Tok::LBracket, Tok::RBracket)?;
+                                } else {
+                                    self.i += 1;
+                                }
+                            }
+                            if !self.eat(&Tok::Comma) {
+                                break;
+                            }
+                        }
+                        self.expect(Tok::RBrace)?;
+                        if let Some(n) = name {
+                            self.struct_fields.insert(n, fields);
+                        }
+                    } else {
+                        self.skip_balanced(Tok::LBrace, Tok::RBrace)?;
+                    }
+                }
+                Some(Tok::Enum) => {
                     // Skip `Name` then a balanced `{ .. }` body.
                     self.i += 1;
                     if matches!(self.peek(), Some(Tok::Ident(_))) {
@@ -763,7 +820,7 @@ impl Parser {
             });
         }
         let body = self.parse_block()?;
-        Ok(self.desugar_for_array(pat, head, body, label))
+        self.desugar_for_array(pat, head, body, label)
     }
 
     /// `for PAT in ARRAY { body }` -> an index loop over the array (see
@@ -771,7 +828,13 @@ impl Parser {
     /// rejected rather than mis-bound, since rmc has no destructuring `let`.
     /// A label on the `for` is carried to the desugared loop, so `break 'a`
     /// still targets it.
-    fn desugar_for_array(&mut self, pat: Pat, arr: Expr, body: Block, label: Option<String>) -> Stmt {
+    fn desugar_for_array(
+        &mut self,
+        pat: Pat,
+        arr: Expr,
+        body: Block,
+        label: Option<String>,
+    ) -> PResult<Stmt> {
         let n = self.tmp;
         self.tmp += 1;
         let arr_name = format!("\u{0}fa{n}");
@@ -780,10 +843,10 @@ impl Parser {
             Pat::Bind(name) => name,
             Pat::Wild => format!("\u{0}fd{n}"),
             _ => {
-                return Stmt::Expr(Expr::Block(Block {
-                    stmts: vec![Stmt::Expr(Expr::Int(0))],
-                    tail: None,
-                }))
+                return Err(format!(
+                    "at byte {}: `for` over an array needs a binding or `_`",
+                    self.pos()
+                ))
             }
         };
         let arr_var =
@@ -825,7 +888,7 @@ impl Parser {
             slot: -1,
             mutable: false,
         };
-        Stmt::Expr(Expr::Block(Block { stmts: vec![arr_let, for_stmt], tail: None }))
+        Ok(Stmt::Expr(Expr::Block(Block { stmts: vec![arr_let, for_stmt], tail: None })))
     }
 
     /// Consume the `;` that ends a statement, but allow it to be omitted when
@@ -946,7 +1009,7 @@ impl Parser {
                     self.expect(Tok::Eq)?;
                     let scrutinee = self.parse_cond()?;
                     let body = self.parse_block()?;
-                    return Ok(self.desugar_while_let(pat, scrutinee, body));
+                    return self.desugar_while_let(pat, scrutinee, body);
                 }
                 let cond = self.parse_cond()?;
                 let body = self.parse_block()?;
@@ -1416,8 +1479,13 @@ impl Parser {
         }
         // A binding must bind the same names in every alternative (rustc's
         // E0408); rmc has no name-consistency check, so it rejects a binding in
-        // an or-pattern outright rather than mis-bind it.
-        if let Some(Pat::Bind(n)) = alts.iter().find(|a| matches!(a, Pat::Bind(_))) {
+        // an or-pattern outright rather than mis-bind it. A struct pattern may
+        // appear as an irrefutable alternative only when it binds nothing.
+        if let Some(n) = alts.iter().find_map(|a| match a {
+            Pat::Bind(n) => Some(n.clone()),
+            Pat::Struct(_, fields) => fields.iter().find_map(|(_, b)| b.clone()),
+            _ => None,
+        }) {
             return Err(format!(
                 "at byte {}: variable `{n}` is not bound in all patterns of the or-pattern",
                 self.pos()
@@ -1490,6 +1558,72 @@ impl Parser {
                         bindings = Some(names);
                     }
                     Ok(Pat::Variant(n, variant, bindings))
+                } else if self.peek() == Some(&Tok::LBrace) {
+                    // `S { f, g: h, i: _, .. }`: a struct pattern. Fields may be
+                    // written in any order, and each is either a shorthand
+                    // binding (`f`), an explicit binding (`g: h`) or a wildcard
+                    // (`i: _`); a trailing `..` ignores the fields not named.
+                    // The field list comes from the prescan, so a struct
+                    // declared later in the file still matches, as rustc allows.
+                    self.i += 1;
+                    // A name that is not a struct cannot be destructured; the
+                    // prescan saw every struct, so an unknown one is an error
+                    // here rather than a field read on the wrong type later.
+                    let known = match self.struct_fields.get(&n) {
+                        Some(f) => f.clone(),
+                        None => {
+                            return Err(format!(
+                                "at byte {}: unknown struct `{n}` in a pattern",
+                                self.pos()
+                            ))
+                        }
+                    };
+                    let mut fields: Vec<(String, Option<String>)> = Vec::new();
+                    while self.peek() != Some(&Tok::RBrace) {
+                        if self.peek().is_none() {
+                            return Err(format!(
+                                "at byte {}: unexpected end of input in struct pattern",
+                                self.pos()
+                            ));
+                        }
+                        // `..` ignores the remaining fields; nothing may follow it.
+                        if self.eat(&Tok::DotDot) {
+                            break;
+                        }
+                        let fname = self.expect_ident()?;
+                        // A field the struct does not have is an error here, not
+                        // a silent no-op: a `f: _` field emits no read for sema
+                        // to catch, and a wrong name is a typo either way.
+                        if !known.contains(&fname) {
+                            return Err(format!(
+                                "at byte {}: struct `{n}` has no field `{fname}`",
+                                self.pos()
+                            ));
+                        }
+                        if fields.iter().any(|(f, _)| *f == fname) {
+                            return Err(format!(
+                                "at byte {}: field `{fname}` bound twice in struct pattern",
+                                self.pos()
+                            ));
+                        }
+                        let bind = if self.eat(&Tok::Colon) {
+                            if self.peek() == Some(&Tok::Underscore) {
+                                self.i += 1;
+                                None
+                            } else {
+                                Some(self.expect_ident()?)
+                            }
+                        } else {
+                            // Shorthand: `S { f }` binds `f`.
+                            Some(fname.clone())
+                        };
+                        fields.push((fname, bind));
+                        if !self.eat(&Tok::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(Tok::RBrace)?;
+                    Ok(Pat::Struct(n, fields))
                 } else if let Some(v) = self.consts.get(&n) {
                     // A bare name that names a constant is that constant's
                     // value, not a fresh binding, exactly as rustc reads it.
@@ -1549,7 +1683,7 @@ impl Parser {
         if arms.is_empty() {
             return Err(format!("at byte {}: `match` needs at least one arm", self.pos()));
         }
-        Ok(self.desugar_match(scrutinee, arms))
+        self.desugar_match(scrutinee, arms)
     }
 
     /// Parse a `match` arm body. As in Rust, an arm body is an expression, but a
@@ -1633,7 +1767,9 @@ impl Parser {
     /// or-pattern with such an alternative.
     fn pat_irrefutable(p: &Pat) -> bool {
         match p {
-            Pat::Wild | Pat::Bind(_) => true,
+            // A struct pattern always matches: it binds the named fields and
+            // ignores the rest, with no test, so an arm using one is a catch-all.
+            Pat::Wild | Pat::Bind(_) | Pat::Struct(..) => true,
             Pat::Or(alts) => alts.iter().any(Self::pat_irrefutable),
             _ => false,
         }
@@ -1643,7 +1779,11 @@ impl Parser {
     /// with `_` becomes the `else` (so any arm after it is unreachable, as in
     /// Rust). With no `_`, the chain has no final `else`, so a non-matching
     /// value yields `()`.
-    fn desugar_match(&mut self, scrutinee: Expr, arms: Vec<(Pat, Option<Expr>, Expr)>) -> Expr {
+    fn desugar_match(
+        &mut self,
+        scrutinee: Expr,
+        arms: Vec<(Pat, Option<Expr>, Expr)>,
+    ) -> PResult<Expr> {
         self.desugar_match_arms(scrutinee, arms, false)
     }
 
@@ -1656,7 +1796,7 @@ impl Parser {
         scrutinee: Expr,
         arms: Vec<(Pat, Option<Expr>, Expr)>,
         check_dead_arms: bool,
-    ) -> Expr {
+    ) -> PResult<Expr> {
         // A `_` or binding arm makes the match exhaustive in every position;
         // an or-pattern is irrefutable when any alternative is (`1 | _`). A
         // *guarded* irrefutable arm is not a catch-all: `_ if c` can fail, so
@@ -1677,17 +1817,17 @@ impl Parser {
         };
         let mut acc: Option<Expr> = None;
         for (pat, guard, body) in arms.into_iter().rev() {
-            acc = Some(Self::desugar_arm(pat, guard, &subj, body, acc, check_dead_arms));
+            acc = Some(self.desugar_arm(pat, guard, &subj, body, acc, check_dead_arms)?);
         }
         let acc = acc.expect("a `match` has at least one arm");
         let acc = Expr::MatchBoundary(
             Block { stmts: Vec::new(), tail: Some(Box::new(acc)) },
             has_catch_all,
         );
-        match prelude {
+        Ok(match prelude {
             None => acc,
             Some(stmt) => Expr::Block(Block { stmts: vec![stmt], tail: Some(Box::new(acc)) }),
-        }
+        })
     }
 
     /// `if let PAT = EXPR { then } else { els }` is Rust's sugar for
@@ -1696,7 +1836,13 @@ impl Parser {
     /// not be exhaustive: a non-matching value falls through to the `_` arm,
     /// which is the `else` block or `()` — so a non-unit `then` with no `else`
     /// is a branch-type error, as in rustc.
-    fn desugar_if_let(&mut self, pat: Pat, scrutinee: Expr, then: Block, els: Option<Block>) -> Expr {
+    fn desugar_if_let(
+        &mut self,
+        pat: Pat,
+        scrutinee: Expr,
+        then: Block,
+        els: Option<Block>,
+    ) -> PResult<Expr> {
         let fallback = match els {
             Some(b) => Expr::Block(b),
             None => Expr::Block(Block { stmts: Vec::new(), tail: None }),
@@ -1717,19 +1863,19 @@ impl Parser {
     /// need no new case. `EXPR` sits inside the loop, so it is re-evaluated
     /// every iteration (as in Rust); the `if let` binds its non-`Var` scrutinee
     /// to a fresh temporary each time.
-    fn desugar_while_let(&mut self, pat: Pat, scrutinee: Expr, body: Block) -> Stmt {
+    fn desugar_while_let(&mut self, pat: Pat, scrutinee: Expr, body: Block) -> PResult<Stmt> {
         let break_else = Block {
             stmts: vec![Stmt::Break(None, None)],
             tail: None,
         };
         // The `if let` is a *statement* in the loop body, so its value is
         // discarded and the loop body is unit even when `body` yields a value.
-        let test = self.desugar_if_let(pat, scrutinee, body, Some(break_else));
+        let test = self.desugar_if_let(pat, scrutinee, body, Some(break_else))?;
         let loop_body = Block { stmts: vec![Stmt::Expr(test)], tail: None };
         // The loop is unit-valued: the `else` arm always contains a plain
         // `break;`, so a `break value` in the body is rejected as a type
         // mismatch (rustc E0571 rejects it too).
-        Stmt::Expr(Expr::Loop(loop_body, -1, Type::Unit, None))
+        Ok(Stmt::Expr(Expr::Loop(loop_body, -1, Type::Unit, None)))
     }
 
     /// One arm of a desugared `match` or `if let`: the pattern test, the
@@ -1768,26 +1914,56 @@ impl Parser {
                 n_binds: -1,
             },
             // `_` in an or-pattern: always true, so the whole condition is true.
-            Pat::Wild => Expr::Bool(true),
+            // A struct pattern is likewise always true; a binding one is
+            // rejected before this point.
+            Pat::Wild | Pat::Struct(..) => Expr::Bool(true),
             // A binding inside an or-pattern is rejected before this point.
             Pat::Bind(_) | Pat::Or(_) => unreachable!("or-pattern alternative"),
         }
     }
 
     fn desugar_arm(
+        &mut self,
         pat: Pat,
         guard: Option<Expr>,
         subj: &Expr,
         body: Expr,
         rest: Option<Expr>,
         check_dead: bool,
-    ) -> Expr {
+    ) -> PResult<Expr> {
         // Each pattern yields its test (`None` when it is irrefutable) and any
         // bindings it introduces. The test is an ordinary expression, so sema
         // and codegen need no new case for a guard: it is folded in with `&&`,
         // and an irrefutable arm's guard becomes the whole `if` condition.
         let (bindings, test): (Vec<Stmt>, Option<Expr>) = match pat {
             Pat::Wild => (Vec::new(), None),
+            // `S { f, g: h } => body` is irrefutable, so it has no test: it binds
+            // each named field to a fresh local via a field read. The reads are
+            // left for sema to type and locate, so a non-struct scrutinee is a
+            // sema error naming the field, and a field may be matched on a `&S`
+            // scrutinee by auto-deref. The struct name and each field name were
+            // already checked against the prescan, so `f: _` (which emits no
+            // read) is validated too.
+            Pat::Struct(_name, fields) => {
+                let binds: Vec<Stmt> = fields
+                    .iter()
+                    .filter_map(|(fname, bind)| {
+                        bind.as_ref().map(|b| Stmt::Let {
+                            name: b.clone(),
+                            ty: None,
+                            mutable: false,
+                            init: Some(Expr::Field {
+                                base: Box::new(subj.clone()),
+                                name: fname.clone(),
+                                offset: -1,
+                                ty: Type::Unit,
+                            }),
+                            slot: -1,
+                        })
+                    })
+                    .collect();
+                (binds, None)
+            }
             // `name => body` binds the whole scrutinee.
             Pat::Bind(name) => (
                 vec![Stmt::Let {
@@ -1907,9 +2083,9 @@ impl Parser {
             },
         };
         if bindings.is_empty() {
-            arm
+            Ok(arm)
         } else {
-            Expr::Block(Block { stmts: bindings, tail: Some(Box::new(arm)) })
+            Ok(Expr::Block(Block { stmts: bindings, tail: Some(Box::new(arm)) }))
         }
     }
 
@@ -2118,7 +2294,7 @@ impl Parser {
                     } else {
                         None
                     };
-                    return Ok(self.desugar_if_let(pat, scrutinee, then, els));
+                    return self.desugar_if_let(pat, scrutinee, then, els);
                 }
                 let cond = self.parse_cond()?;
                 let then = self.parse_block()?;
@@ -2231,6 +2407,14 @@ enum Pat {
     /// A plain name: binds the whole scrutinee (an irrefutable catch-all). Kept
     /// distinct from `Wild` only so the binding is named.
     Bind(String),
+    /// `S { f, g: h }`: a struct pattern, matched by name against the
+    /// scrutinee's type. Each field is `(name, Some(binding))` when written
+    /// `f: b` (or the shorthand `f`, which binds `f`), and `(name, None)` for
+    /// `f: _`. A struct pattern is irrefutable, so it has no test: sema
+    /// replaces it with the field reads its bindings name (see
+    /// `desugar_match_arms`). The struct name is resolved by sema, so it may
+    /// name a struct declared later in the file.
+    Struct(String, Vec<(String, Option<String>)>),
 }
 
 /// Whether `e` syntactically contains a call, used to decide if a subscript in

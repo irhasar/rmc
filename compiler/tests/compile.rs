@@ -293,6 +293,151 @@ fn struct_field_init_shorthand_for_an_unbound_name_is_rejected() {
 }
 
 #[test]
+fn a_struct_pattern_binds_its_fields() {
+    // `P { x, y }` binds `x` and `y` to the scrutinee's fields. The pattern is
+    // irrefutable, so the match needs no `_` arm and the arm body reads the two
+    // bindings. A renamed field and an ignored one are accepted too.
+    let src = "struct P { x: i64, y: i64 } \
+               fn main() -> i64 { let p: P = P { x: 3, y: 4 }; \
+               match p { P { x: a, y: _ } => { return a; } } }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_struct_pattern_with_rest_ignores_the_other_fields() {
+    let src = "struct P { x: i64, y: i64, z: i64 } \
+               fn main() -> i64 { let p: P = P { x: 1, y: 2, z: 3 }; \
+               match p { P { y, .. } => { return y; } } }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_struct_pattern_with_only_rest_is_accepted() {
+    // `P { .. }` binds nothing but still names the struct.
+    let src = "struct P { x: i64 } \
+               fn main() -> i64 { let p: P = P { x: 1 }; \
+               match p { P { .. } => { return 0; } } }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_struct_pattern_may_name_a_later_struct() {
+    // The struct is declared after the function that patterns on it, so the
+    // field list must come from the prescan, not the parse order.
+    let src = "fn f(p: P) -> i64 { match p { P { n, .. } => n } } \
+               struct P { n: i64, m: i64 } \
+               fn main() -> i64 { return f(P { n: 5, m: 6 }); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_struct_pattern_reads_through_a_reference() {
+    // A field read auto-derefs, so a `&P` scrutinee works like `P`.
+    let src = "struct P { x: i64, y: i64 } \
+               fn f(p: &P) -> i64 { match p { P { x, y } => x + y } } \
+               fn main() -> i64 { let p: P = P { x: 1, y: 2 }; return f(&p); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_struct_pattern_compiles_like_the_equivalent_field_reads() {
+    // The pattern has no test, so it must lower to exactly the field reads its
+    // bindings name, and nothing more. Compare against the hand-written form.
+    let pat = "struct P { x: i64, y: i64 } \
+               fn f(p: &P) -> i64 { match p { P { x, y } => x * 10 + y } }";
+    let reads = "struct P { x: i64, y: i64 } \
+                 fn f(p: &P) -> i64 { let x: i64 = p.x; let y: i64 = p.y; \
+                 return x * 10 + y; }";
+    assert_eq!(asm(pat), asm(reads));
+}
+
+#[test]
+fn an_unknown_struct_pattern_field_is_rejected() {
+    let err = compile_to_asm(
+        "struct P { x: i64, y: i64 } \
+         fn main() -> i64 { let p: P = P { x: 1, y: 2 }; \
+         match p { P { z } => { return z; } } }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("has no field `z`"), "got: {err}");
+}
+
+#[test]
+fn an_ignored_unknown_struct_pattern_field_is_rejected() {
+    // `z: _` emits no read for sema to catch, so the field name is checked at
+    // parse time against the prescanned field list.
+    let err = compile_to_asm(
+        "struct P { x: i64 } \
+         fn main() -> i64 { let p: P = P { x: 1 }; \
+         match p { P { z: _ } => { return 0; } } }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("has no field `z`"), "got: {err}");
+}
+
+#[test]
+fn a_struct_pattern_field_bound_twice_is_rejected() {
+    let err = compile_to_asm(
+        "struct P { x: i64 } \
+         fn main() -> i64 { let p: P = P { x: 1 }; \
+         match p { P { x, x: a } => { return a; } } }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("bound twice"), "got: {err}");
+}
+
+#[test]
+fn an_unknown_struct_in_a_pattern_is_rejected() {
+    let err = compile_to_asm(
+        "struct P { x: i64 } \
+         fn main() -> i64 { let p: P = P { x: 1 }; \
+         match p { Q { x } => { return x; } } }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("unknown struct `Q`"), "got: {err}");
+}
+
+#[test]
+fn a_struct_pattern_on_a_non_struct_scrutinee_is_rejected() {
+    let err = compile_to_asm(
+        "struct P { x: i64 } \
+         fn main() -> i64 { let v: i64 = 5; \
+         match v { P { x } => { return x; } } }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("field access"), "got: {err}");
+}
+
+#[test]
+fn a_binding_struct_pattern_in_an_or_pattern_is_rejected() {
+    // A struct pattern is irrefutable, but a *binding* one cannot appear as an
+    // or-pattern alternative: the name would not be bound in every branch.
+    let err = compile_to_asm(
+        "struct P { x: i64 } \
+         fn main() -> i64 { let p: P = P { x: 1 }; \
+         match p { P { x } | P { x: x } => { return x; } } }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("not bound in all patterns"), "got: {err}");
+}
+
+#[test]
+fn a_struct_pattern_works_in_while_let() {
+    let src = "struct P { x: i64, y: i64 } \
+               fn main() -> i64 { let mut p: P = P { x: 1, y: 2 }; \
+               let mut n: i64 = 0; \
+               while let P { x, .. } = p { n = n + x; \
+               if n > 3 { break; } p = P { x: x + 1, y: 2 }; } return n; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
 fn a_diverging_match_is_never_and_fits_any_return_type() {
     // Every arm `return`s, so the match cannot yield a value: it is `!` and
     // satisfies `-> i64`. rustc accepts this; rmc used to reject it with a
