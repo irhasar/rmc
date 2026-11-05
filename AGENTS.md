@@ -184,15 +184,21 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   register (`mov %r, %r`) and to `field_operand`'s `disp(%reg)` form. Measured
   +5% on `heap`. The two store-shape tests (`a_write_through_a_dereference...`,
   `field_write_targets_the_right_slot`) assert the folded form.
-- **A constant initialiser or assignment stores straight into its home.**
-  `store_imm` collapses `mov $k, %rax; mov %rax, dst` into `movq $k, dst` for
-  every scalar constant `small_imm` accepts, and it is used from all four
-  store sites: a `let` into an unpromoted local, an assignment to one, a struct
-  field in a promoted register (via `gen_expr_into_reg`, so `mov $k, %rbx`), and
-  a field in memory. A promoted *local* still uses `gen_expr_into_reg`, so its
-  constant becomes `mov $k, %r` directly. A literal needs no overflow check, so
-  the fold never changes when a trap would fire; it only ever removes a `%rax`
-  bounce. `refs` loses eight instructions from its struct literal.
+- **A simple initialiser or assignment stores straight into its home.**
+  `store_simple` collapses `mov X, %rax; mov %rax, dst` into `mov X, dst` when
+  `X` is already a bare operand: a small immediate (`movq $k, dst`) or a
+  register (`mov %r, dst`). It is used from all four store sites — a `let` into
+  an unpromoted local, an assignment to one, a struct field in a promoted
+  register (via `gen_expr_into_reg`, so `mov $k, %rbx`), and a field in memory —
+  and never accepts a memory operand, which would make an illegal
+  `mov mem, mem`. A promoted *local* still uses `gen_expr_into_reg`, so its
+  constant becomes `mov $k, %r` directly. Neither an immediate nor a register
+  copy can trap, so the fold never changes when a trap would fire; it only ever
+  removes a `%rax` bounce. `refs` loses eight instructions from its struct
+  literal, and the frame store of a promoted field copied into an address-taken
+  local loses one. A *store-to-load forwarding* rewrite of the same shape
+  (`mov %r, X; mov X, %rY` -> `mov %r, %rY`) was measured perf-neutral on the
+  whole suite and not kept.
 - **An `if` whose whole body is `break`/`continue` branches straight to the
   loop label.** In statement position (`discard`), `bare_exit` recognises a
   single-statement body that is a lone `break` or `continue` and has the `if`
