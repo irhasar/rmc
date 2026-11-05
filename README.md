@@ -143,6 +143,7 @@ to build a program: the default path needs no assembler and no linker. `as` and
 ```sh
 rmc input.rms -o output            # compile and link in-process (default)
 rmc input.rms --emit-asm           # print the generated assembly to stdout
+rmc --emit-runtime-asm             # print the freestanding runtime as assembly
 rmc input.rms --binutils -o out    # assemble and link with `as`/`ld` instead
 rmc input.rms --binutils --no-strip -o out   # keep the symbol table
 rmc input.rms --binutils --min-size -o out   # drop the section headers too
