@@ -33,13 +33,19 @@ pointer).
 struct Point { x: i64, y: i64 }
 
 let p: Point = Point { x: 3, y: 4 };   // fields may be given in any order
+let x: i64 = 3;
+let y: i64 = 4;
+let r: Point = Point { x, y };         // field init shorthand: `x` means `x: x`
+let s: Point = Point { y: 5, x };      // shorthand and explicit fields mix
 let mut q: Point = Point { x: 0, y: 0 };
 q.x = q.x + 1;                          // field read and write
 ```
 
 Fields are laid out in declaration order with no padding. A struct may contain
 another struct, but not itself, and it cannot be used as an array element.
-Structs may be passed to and returned from functions by value, assigned to one
+Field init shorthand is supported: `Point { x, y }` is `Point { x: x, y: y }`,
+and a bare name must resolve to a local of that name. Structs may be passed to
+and returned from functions by value, assigned to one
 another (`p = q`), and nested as fields; in every case the value is copied, so a
 change to one does not reach the other. To reuse a
 struct after passing it (as `bump(a)` then reading `a`), annotate it

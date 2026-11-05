@@ -125,7 +125,10 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   builtin sigs, and the soundness checks (mutability, definite initialization,
   constant array bounds, string typing — see "Soundness checks" below). Resolves
   `Type::Named`, fills `Field`/`FieldInit` offsets, and allocates the hidden
-  slots for aggregate arguments and returns.
+  slots for aggregate arguments and returns. Field init shorthand
+  (`P { x, y }`) is resolved by the *parser*, which rewrites a bare field name
+  to `x: x`; sema then checks the `Var` it built like any other, so an unbound
+  name reports `unknown variable` rather than a missing-field error.
 - `compiler/src/consts.rs` — shared constant folding: `const_i64`/`const_binop`
   (used by sema to fold a constant index or operand) and `resolve`/`eval_i64`
   (used by the parser to evaluate `const` items). A `const` item has no storage
