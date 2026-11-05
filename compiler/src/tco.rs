@@ -167,6 +167,9 @@ fn calls_other(e: &Expr, name: &str) -> bool {
             n != name || args.iter().any(|a| calls_other(a, name))
         }
         Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } => false,
+        Expr::PatScrutinee(_) => {
+            unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+        }
         Expr::Bin(_, a, b) => calls_other(a, name) || calls_other(b, name),
         Expr::Un(_, a) | Expr::Cast(a, _) | Expr::AddrOf { expr: a, .. } | Expr::Deref { expr: a, .. } => {
             calls_other(a, name)
@@ -222,6 +225,9 @@ fn has_call(e: &Expr) -> bool {
     match e {
         Expr::Call { .. } => true,
         Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } => false,
+        Expr::PatScrutinee(_) => {
+            unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+        }
         Expr::Bin(_, a, b) => has_call(a) || has_call(b),
         Expr::Un(_, a) => has_call(a),
         Expr::If(c, t, e) => {
@@ -276,6 +282,9 @@ fn stmt_has_call(s: &Stmt) -> bool {
 fn has_return(e: &Expr) -> bool {
     match e {
         Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } => false,
+        Expr::PatScrutinee(_) => {
+            unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+        }
         // A `return` can hide in a call argument, e.g. `f({ if c { return 0; } x })`.
         Expr::Call { args, .. } => args.iter().any(has_return),
         Expr::Bin(_, a, b) => has_return(a) || has_return(b),

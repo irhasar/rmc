@@ -2331,8 +2331,16 @@ impl Parser {
         Ok(Stmt::Expr(Expr::Loop(loop_body, -1, Type::Unit, label)))
     }
 
-    /// One arm of a desugared `match` or `if let`: the pattern test, the
-    /// bindings it introduces, and the fallback `rest` for a non-match.
+    /// The scrutinee of a *scalar* pattern test, wrapped so sema can apply
+    /// match ergonomics. rustc derefs a `&T` scrutinee for a literal, range or
+    /// bool pattern (`match &x { 5 => .. }`), and the desugared test is a plain
+    /// comparison that sema would otherwise reject on a `&i64`. The parser does
+    /// not know the scrutinee's type, so it marks the node and `sema` rewrites
+    /// it — to a `Deref` for a reference, to the bare expression otherwise.
+    fn scalar_scrutinee(subj: &Expr) -> Expr {
+        Expr::PatScrutinee(Box::new(subj.clone()))
+    }
+
     /// The boolean test for one alternative of an or-pattern. Only a test, not
     /// an arm: the shared body and fallback stay outside, so an or-pattern does
     /// not duplicate the body. A binding or `_` alternative is always true, but
@@ -2340,21 +2348,34 @@ impl Parser {
     /// irrefutable alternative here.
     fn or_cond(pat: &Pat, subj: &Expr) -> Expr {
         match pat {
-            Pat::Int(k) => Expr::Bin(BinOp::Eq, Box::new(subj.clone()), Box::new(Expr::Int(*k))),
-            Pat::Bool(b) => Expr::BoolTest { scrutinee: Box::new(subj.clone()), value: *b },
+            Pat::Int(k) => Expr::Bin(
+                BinOp::Eq,
+                Box::new(Self::scalar_scrutinee(subj)),
+                Box::new(Expr::Int(*k)),
+            ),
+            Pat::Bool(b) => {
+                Expr::BoolTest { scrutinee: Box::new(Self::scalar_scrutinee(subj)), value: *b }
+            }
             // A string pattern tests by content: `Bin(Eq, ..)` over a `str`,
             // which sema lowers to the byte-wise helper. A pointer compare
-            // would never match two distinct-but-equal literals.
+            // would never match two distinct-but-equal literals. A `str`
+            // scrutinee is the string type itself (rmc has no unsized `str`), so
+            // it is not auto-deref'd: `match &s { "hi" => .. }` on a `&str`
+            // is rejected, as rustc rejects it for `&&str`.
             Pat::Str(s) => Expr::Bin(
                 BinOp::Eq,
                 Box::new(subj.clone()),
                 Box::new(Expr::Str(s.clone())),
             ),
             Pat::Range(lo, hi, inclusive) => {
-                let lower = Expr::Bin(BinOp::Le, Box::new(Expr::Int(*lo)), Box::new(subj.clone()));
+                let lower = Expr::Bin(
+                    BinOp::Le,
+                    Box::new(Expr::Int(*lo)),
+                    Box::new(Self::scalar_scrutinee(subj)),
+                );
                 let upper = Expr::Bin(
                     if *inclusive { BinOp::Le } else { BinOp::Lt },
-                    Box::new(subj.clone()),
+                    Box::new(Self::scalar_scrutinee(subj)),
                     Box::new(Expr::Int(*hi)),
                 );
                 Expr::Bin(BinOp::And, Box::new(lower), Box::new(upper))
@@ -2529,6 +2550,8 @@ impl Parser {
         }
     }
 
+    /// One arm of a desugared `match` or `if let`: the pattern test, the
+    /// bindings it introduces, and the fallback `rest` for a non-match.
     fn desugar_arm(
         &mut self,
         pat: Pat,
@@ -2571,10 +2594,15 @@ impl Parser {
             ),
             Pat::Int(k) => (
                 Vec::new(),
-                Some(Expr::Bin(BinOp::Eq, Box::new(subj.clone()), Box::new(Expr::Int(k)))),
+                Some(Expr::Bin(
+                    BinOp::Eq,
+                    Box::new(Self::scalar_scrutinee(subj)),
+                    Box::new(Expr::Int(k)),
+                )),
             ),
             // A string literal pattern: a content compare, which sema lowers to
-            // the byte-wise helper (a pointer compare would never match).
+            // the byte-wise helper (a pointer compare would never match). Not
+            // auto-deref'd: see `or_cond`.
             Pat::Str(s) => (
                 Vec::new(),
                 Some(Expr::Bin(BinOp::Eq, Box::new(subj.clone()), Box::new(Expr::Str(s)))),
@@ -2583,11 +2611,14 @@ impl Parser {
             // sides. A plain `Bin(And, ..)` of comparisons, so sema and codegen
             // need no new case.
             Pat::Range(lo, hi, inclusive) => {
-                let lower =
-                    Expr::Bin(BinOp::Le, Box::new(Expr::Int(lo)), Box::new(subj.clone()));
+                let lower = Expr::Bin(
+                    BinOp::Le,
+                    Box::new(Expr::Int(lo)),
+                    Box::new(Self::scalar_scrutinee(subj)),
+                );
                 let upper = Expr::Bin(
                     if inclusive { BinOp::Le } else { BinOp::Lt },
-                    Box::new(subj.clone()),
+                    Box::new(Self::scalar_scrutinee(subj)),
                     Box::new(Expr::Int(hi)),
                 );
                 (Vec::new(), Some(Expr::Bin(BinOp::And, Box::new(lower), Box::new(upper))))
@@ -2612,7 +2643,10 @@ impl Parser {
             // chain of them can be recognised as an exhaustive bool match.
             Pat::Bool(b) => (
                 Vec::new(),
-                Some(Expr::BoolTest { scrutinee: Box::new(subj.clone()), value: b }),
+                Some(Expr::BoolTest {
+                    scrutinee: Box::new(Self::scalar_scrutinee(subj)),
+                    value: b,
+                }),
             ),
             Pat::Variant(enum_name, variant, args) => {
                 let n_binds = args.as_ref().map_or(-1, |(a, _)| a.len() as i32);

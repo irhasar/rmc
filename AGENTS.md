@@ -96,8 +96,20 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   the body is not duplicated), so neither needs a sema or codegen case. A
   *string* pattern desugars to `Bin(Eq, scrutinee, Str(s))`, which sema already
   lowers to the byte-wise `__rmc_str_lt` helper: the scrutinee is a pointer, so
-  a machine compare would never match two distinct-but-equal literals. An
-  or-pattern with a
+  a machine compare would never match two distinct-but-equal literals. A
+  *scalar* pattern (a literal, a range or a bool) desugars to a plain compare
+  too, but match ergonomics must deref a `&T` scrutinee (`match &x { 5 => .. }`
+  reads the `i64` under the `&i64`), and the parser does not know the
+  scrutinee's type. So `scalar_scrutinee` wraps it in `Expr::PatScrutinee`, a
+  marker sema rewrites: `check_expr` replaces it with a `Deref` for a `Ref`
+  scrutinee, or with the bare expression otherwise (a scalar scrutinee stays
+  untouched). Only a pattern auto-derefs; a bare `r < 6` still needs `*r`, as in
+  rustc. The rewrite moves the inner expression out with `std::mem::replace`
+  rather than re-checking it, so a side-effecting scrutinee is type-checked and
+  its slots allocated exactly once. The marker never survives to codegen; the
+  later passes (`inline`, `tco`, `licm`, `dce`, `codegen`) treat it as
+  unreachable, like `ArrayList` and `MethodCall`.
+  An or-pattern with a
   `_` alternative, and one whose alternatives cover every variant, are handled
   by `pat_irrefutable` and `or_leaves` (in sema) respectively. A *binding*
   alternative is rejected, as rustc's E0408 rejects it.
