@@ -166,10 +166,21 @@ impl Elf {
                     other => return Err(format!("elf: unsupported section `{other}`")),
                 }
             }
-            "align" | "balign" | "p2align" => {
+            // `.balign`/`.align` take a byte count; `.p2align` takes a power of
+            // two, matching GNU `as`. Conflating them under-aligned every loop
+            // body the generator pads with `.p2align 4`: the in-process binary
+            // was 4-byte aligned where `as`+`ld` gave 16, which cost 14% on a
+            // divide-bound loop (its fetch window straddled a cache line).
+            "align" | "balign" => {
                 let n: u64 = arg.parse().map_err(|_| format!("elf: bad .align `{arg}`"))?;
                 if n > 1 {
                     self.pad_to_align(*cur, n);
+                }
+            }
+            "p2align" => {
+                let n: u32 = arg.parse().map_err(|_| format!("elf: bad .p2align `{arg}`"))?;
+                if n > 0 {
+                    self.pad_to_align(*cur, 1u64 << n);
                 }
             }
             "globl" | "type" | "size" => {}
@@ -806,7 +817,14 @@ impl Elf {
     fn enc_div(&mut self, mnem: &str, ops: &[String], sec: usize) -> Result<(), String> {
         let (reg, _) = parse_reg(&ops[0])?;
         let ext = if mnem == "div" { 6u8 } else { 7u8 };
-        self.sections[sec].data.push(rex(true, ext, reg));
+        // Operand size comes from the register the caller named: `div %ebx` is
+        // a 32-bit divide and must not set REX.W. Hardcoding W turned every
+        // 32-bit divide into the 64-bit form, which is ~14% slower on the
+        // divide-bound `mix` loop and made the in-process output differ from
+        // `as`+`ld` for the same source.
+        if let Some(r) = rex_if_needed(reg_is_64(&ops[0]), ext, reg) {
+            self.sections[sec].data.push(r);
+        }
         self.sections[sec].data.push(0xF7);
         modrm_reg_reg(&mut self.sections[sec].data, ext, reg);
         Ok(())
@@ -1044,6 +1062,28 @@ fn parse_mem(s: &str) -> Option<Mem> {
 // Instruction byte emitters
 // ---------------------------------------------------------------------------
 
+/// True when a register name is a 64-bit one (`%rax`..`%r15`). The encoder
+/// needs this to choose REX.W: the 32-bit aliases (`%eax`..) select the narrow
+/// form, which for `div`/`idiv` is both shorter and measurably faster.
+fn reg_is_64(s: &str) -> bool {
+    let s = s.trim().trim_start_matches('%');
+    matches!(
+        s,
+        "rax" | "rcx" | "rdx" | "rbx" | "rsp" | "rbp" | "rsi" | "rdi"
+            | "r8" | "r9" | "r10" | "r11" | "r12" | "r13" | "r14" | "r15"
+    )
+}
+
+/// The REX byte for an instruction, or `None` when the bare `0x40` prefix would
+/// carry no information and `as` omits it.
+fn rex_if_needed(w: bool, reg: u8, rm: u8) -> Option<u8> {
+    if w || reg >= 8 || rm >= 8 {
+        Some(rex(w, reg, rm))
+    } else {
+        None
+    }
+}
+
 /// REX byte with W set, `reg` in the ModRM.reg field and `rm` in ModRM.rm.
 fn rex(w: bool, reg: u8, rm: u8) -> u8 {
     let mut rex = 0x40;
@@ -1253,6 +1293,45 @@ mod tests {
         let mut e = test_elf(0x6);
         e.pad_to_align(0, 8);
         assert_eq!(e.sections[0].data, [1, 2, 3, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn p2align_aligns_to_a_power_of_two() {
+        // `.p2align 4` means "align to 2^4 = 16", not "align to 4". The two
+        // were conflated, so every loop body the generator padded with
+        // `.p2align 4` came out 4-byte aligned instead of 16, and the
+        // in-process binary differed from the `as`+`ld` one for the same
+        // source. Three bytes of text then pad to 16, not to 4.
+        let mut e = test_elf(0x5);
+        let (mut cur, mut sets) = (0usize, Vec::new());
+        e.directive("p2align 4", &mut cur, &mut sets).unwrap();
+        assert_eq!(e.sections[0].data.len(), 16);
+    }
+
+    #[test]
+    fn balign_aligns_to_a_byte_count() {
+        // `.balign n` is a byte count, unlike `.p2align n`.
+        let mut e = test_elf(0x5);
+        let (mut cur, mut sets) = (0usize, Vec::new());
+        e.directive("balign 8", &mut cur, &mut sets).unwrap();
+        assert_eq!(e.sections[0].data.len(), 8);
+    }
+
+    #[test]
+    fn a_32_bit_divide_does_not_set_rex_w() {
+        // `div %ebx` is the 32-bit form: `F7 /6` with no REX.W. Forcing W made
+        // it a 64-bit divide, which is ~14% slower on a divide-bound loop and
+        // disagreed with what `as` assembles from the same line.
+        let mut e = test_elf(0x5);
+        e.instruction("div %ebx", 0).unwrap();
+        assert_eq!(e.sections[0].data[3..], [0xF7, 0xF3]);
+    }
+
+    #[test]
+    fn a_64_bit_divide_sets_rex_w() {
+        let mut e = test_elf(0x5);
+        e.instruction("idiv %rbx", 0).unwrap();
+        assert_eq!(e.sections[0].data[3..], [0x48, 0xF7, 0xFB]);
     }
 
     #[test]

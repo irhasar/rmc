@@ -55,6 +55,12 @@ pub struct Codegen {
     /// and redundant instructions `trim_dead` removes do not affect the frame
     /// size or spill depth the dry run measures, so the pass is skipped there.
     dry: bool,
+    /// Code that is correct but almost never runs, buffered here and appended
+    /// after the function body so it does not sit in the hot fall-through path.
+    /// The only producer is the 64-bit divide slow path; see `emit_div`.
+    cold: String,
+    /// True while `line`/`raw` write to `cold` instead of `out`.
+    in_cold: bool,
     /// Frame slot holding the hidden return-buffer pointer for the function
     /// being generated (`-1` when the return type is scalar or unit).
     ret_slot: i32,
@@ -114,6 +120,8 @@ impl Codegen {
             ret_ty: Type::Unit,
             frame_slots: Cell::new(0),
             dry: false,
+            cold: String::new(),
+            in_cold: false,
         }
     }
 
@@ -189,14 +197,26 @@ impl Codegen {
     }
 
     fn line(&mut self, s: &str) {
-        self.out.push_str("\t");
-        self.out.push_str(s);
-        self.out.push('\n');
+        let buf = if self.in_cold { &mut self.cold } else { &mut self.out };
+        buf.push_str("\t");
+        buf.push_str(s);
+        buf.push('\n');
     }
 
     fn raw(&mut self, s: &str) {
-        self.out.push_str(s);
-        self.out.push('\n');
+        let buf = if self.in_cold { &mut self.cold } else { &mut self.out };
+        buf.push_str(s);
+        buf.push('\n');
+    }
+
+    /// Route subsequent `line`/`raw` output into the cold buffer, to be
+    /// appended after the function body. Paired with `cold_end`.
+    fn cold_start(&mut self) {
+        self.in_cold = true;
+    }
+
+    fn cold_end(&mut self) {
+        self.in_cold = false;
     }
 
     /// Number of callee-saved registers currently holding promoted locals.
@@ -354,6 +374,8 @@ impl Codegen {
 
     fn gen_fn_body(&mut self, f: &FnDef) {
         let fn_start = self.out.len();
+        self.cold.clear();
+        self.in_cold = false;
         self.sp_off = 0;
         self.max_spill = 0;
         self.epilogue = self.new_label();
@@ -446,6 +468,11 @@ impl Codegen {
         }
         self.line("leave");
         self.line("ret");
+        // Append the cold blocks now that the hot path is complete.
+        if !self.cold.is_empty() {
+            let cold = std::mem::take(&mut self.cold);
+            self.out.push_str(&cold);
+        }
         self.raw(&format!(".size {}, .-{}", f.name, f.name));
         if !self.dry {
             self.trim_dead(fn_start);
@@ -2564,6 +2591,14 @@ impl Codegen {
             self.line("mov %rdx, %rax");
         }
         self.line(&format!("jmp {done}"));
+        // The 64-bit slow path is correct but rarely taken: both operands fit
+        // in 32 bits on the overwhelming majority of divides. Left in the
+        // fall-through it puts ~30 bytes of never-executed code between the
+        // hot loop's `div` and its back edge; `mix`, whose `gcd` divides every
+        // iteration, measures ~14% slower with it inline. Emit it as a cold
+        // block after the function body instead. The `jmp {done}` above then
+        // falls through to `{done}:`, so `trim_dead` drops it.
+        self.cold_start();
         self.raw(&format!("{slow}:"));
         // `i64::MIN / -1` (and `% -1`) has no representable quotient and the
         // 64-bit `idiv` would fault; trap like Rust. Only a 64-bit-path dividend
@@ -2581,6 +2616,11 @@ impl Codegen {
         if matches!(op, BinOp::Mod) {
             self.line("mov %rdx, %rax");
         }
+        // The cold block sits after the body, so it must jump back to the join
+        // point; the hot path reaches `{done}` by fall-through (its own `jmp` is
+        // dropped by `trim_dead`).
+        self.line(&format!("jmp {done}"));
+        self.cold_end();
         self.raw(&format!("{done}:"));
     }
 

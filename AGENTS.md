@@ -309,6 +309,14 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   truncates the output between passes; the label counter, string table, spill
   high-water mark and frame-size measurement are part of that reset. Miss one and
   the two passes diverge.
+- **Cold blocks keep the hot path straight.** The 64-bit divide slow path
+  (the `i64::MIN`/`-1` check and `idiv`) is correct but almost never taken, so
+  `emit_div` routes it through `cold_start`/`cold_end` into a buffer appended
+  after the function body. Inlined, its ~30 bytes sat between the hot loop's
+  `div` and its back edge. The hot path then falls through to the join point and
+  `trim_dead` drops the `jmp` it used to need; the cold block keeps its own jump
+  back. The measured win is small (~0.5% on `mix`) but consistent, and the
+  layout no longer depends on where the slow path happens to land.
 - **The dry pass skips `trim_dead`.** The dry run only measures the spill
   high-water mark and the deepest slot, and the dead/round-trip instructions
   `trim_dead` removes change neither, so `Codegen::dry` turns the pass off for
@@ -536,6 +544,19 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
     through the zero-extending `B8+rd` form would clear the high half.
   - Symbol immediates (`mov $__rmc_overflow_len, %rdx`) come from `.set name,
     . - other`; resolve them after all labels are placed, not during the walk.
+  - Operand size comes from the register the caller names, *not* from the
+    mnemonic. `div %ebx` is the 32-bit form (`F7 /6`, no REX.W) and `div %rbx`
+    is the 64-bit one; forcing REX.W turned every 32-bit divide into the 64-bit
+    instruction. On the divide-bound `mix` loop that was **14% slower** at run
+    time, and it made the in-process binary disagree with `as`+`ld` for the same
+    source. The generator picks the 32-bit form deliberately (see `emit_div`),
+    so the encoder must honour it. `enc_div` now derives REX.W from
+    `reg_is_64`; a `None` REX byte is omitted entirely, matching `as`.
+  - `.p2align n` means "align to 2^n", `.balign`/`.align n` mean "align to n
+    bytes". They shared one arm that treated both as a byte count, so every loop
+    the generator padded with `.p2align 4` came out 4-byte aligned in-process
+    where `as` gave 16. The bug was invisible to the behaviour-only
+    in-process-vs-`as` test; only a byte-level check catches it.
 - **`.balign`/`.p2align` pads executable sections with `nop`, not zero.** The
   in-process encoder fills an aligned gap with `0x90` in a section whose ELF
   flags include `X` and with `0x00` elsewhere. A zero byte decodes as
