@@ -951,10 +951,12 @@ The checks, all in `sema.rs`:
   false because the two literals live at different addresses (a silent
   wrong-answer bug — rustc says true). `Sema::str_cmp` rewrites `==`/`!=`/`<`/
   `<=`/`>`/`>=` on two strings into calls to the runtime helper `__rmc_str_lt`,
-  which walks the bytes, so ordering matches Rust's. `str` has no source syntax
-  (no type, no return type), so both operands are pure literals or variables and
-  the helper is never double-evaluated. Comparing a `str` with an `i64` is
-  rejected (`E0308`), as rustc does.
+  which walks the bytes, so ordering matches Rust's. Both operands are pure
+  literals or variables, so the helper is never double-evaluated. Comparing a
+  `str` with an `i64` is rejected (`E0308`), as rustc does. `str` is a builtin
+  type nameable in a signature, field or `let` (`fn f(s: str) -> str`,
+  `struct M { s: str, n: i64 }`): `resolve_ty_rec`/`resolve_in` map `Named("str")`
+  to `Type::Str`, one word passed by value, rather than reporting "unknown type".
 - **`str::len` and array `.len()`.** `len()` is special-cased in the `MethodCall`
   arm of sema *before* the struct/enum method lookup, because `str` is a pointer:
   a `str` receiver lowers to `Call __rmc_str_len` (the record's first word), and

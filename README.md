@@ -212,7 +212,7 @@ fn main() -> i64 {
 }
 ```
 
-Supported: `i64`, `bool`, fixed-size arrays, and structs with named fields;
+Supported: `i64`, `bool`, `str`, fixed-size arrays, and structs with named fields;
 functions with up to six parameters; `let` / `let mut`; assignment to variables,
 array elements and struct fields (including compound `+=` and friends);
 `if`/`else`, `while`, `loop`, and `for i in a..b` / `a..=b`; `match` on integers,
@@ -222,7 +222,9 @@ same patterns
 (desugared to a two-arm `match`); `break` (with a value in a `loop`, so `loop`
 works as an expression), `continue`,
 `return`; arithmetic, comparison, bitwise (`!`/`&`/`|`/`^`) and shift (`<<`/`>>`)
-operators; `&&`/`||`; string literals (compared by content with `==`/`!=`/`<`/`<=`/`>`/`>=`, with `.len()` for the byte length); array `.len()` (a compile-time constant); `mut` enforcement and definite
+operators; `&&`/`||`; strings (a `str` literal or `str`-typed parameter, return
+or field, compared by content with `==`/`!=`/`<`/`<=`/`>`/`>=`, with `.len()` for
+the byte length); array `.len()` (a compile-time constant); `mut` enforcement and definite
 initialisation; `const` items (folded to a value and substituted at every use,
 including array lengths and `match` patterns); references (`&T` / `&mut T`, `&e`, `*e`,
 with auto-deref for `r.x`, `r[i]` and `r.m()`, and `&self` receivers);
@@ -237,7 +239,7 @@ Runtime builtins (provided by `src/runtime.rs`, no imports needed):
 | builtin         | signature            | behaviour                              |
 | --------------- | -------------------- | -------------------------------------- |
 | `print_i64(x)`  | `(i64) -> ()`        | print an integer followed by `\n`      |
-| `print_str(s)`  | `(&str) -> ()`       | print a string literal                 |
+| `print_str(s)`  | `(str) -> ()`        | print a string followed by `\n`       |
 | `print_bool(b)` | `(bool) -> ()`       | print `1` or `0`                       |
 | `putchar(c)`    | `(i64) -> ()`        | write a single byte                    |
 | `alloc(n)`      | `(i64) -> i64`       | allocate `n` bytes (first-fit free list) |
