@@ -1233,7 +1233,14 @@ variable-index read, an element write and a whole-element copy. Those pin the
 stride (`size()/8` slots per element, so `array_off` takes `n * stride`) and the
 splat loop, which for a wide element over the 8-word threshold copies one source
 value into every element instead of walking the source along with the
-destination. `pat` mode builds `match`
+destination. `ref` mode builds references (`&T` / `&mut T`): a reference to a
+scalar local, a struct field, a nested field, an array element and a nested
+array element, each read and written both directly and through a callee, plus a
+whole aggregate read and written through a reference. A reference is one word
+holding an address, so a wrong address on a *place* that is not a plain local
+(`&mut o.mid.f`, `&mut a[i]`, `&mut m[i][j]`) writes a neighbouring word; no
+other mode generates `&`/`*` at all, so this is the only randomised coverage of
+the reference codegen. `pat` mode builds `match`
 expressions: a multi-variant unit enum, a variant with two payload fields, a
 binding pattern, a negative literal, a nested `match`, an `if let` (integer,
 binding, payload-binding, `else if let` chain and a side-effecting scrutinee),
