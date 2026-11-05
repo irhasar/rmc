@@ -265,7 +265,9 @@ at run time only when `--overflow-checks` is on. `for` bounds are evaluated
 once, before the loop; `continue` still runs the increment. `for x in arr`
 iterates an array by value: the head is evaluated once, the bound is the
 array's compile-time length, and `x` is a fresh immutable binding each
-iteration. Only a binding or `_` may be the loop variable; `for x in &arr`
+iteration. The loop variable may be a binding, `_`, or a struct pattern
+(`for S { f, .. } in arr`), which binds each element's fields fresh each
+iteration; any other pattern is refutable and rejected. `for x in &arr`
 (which Rust iterates by reference) is rejected rather than mistyped. `while let` is
 `loop { if let PAT = expr { body } else { break; } }`: the scrutinee is
 re-evaluated every iteration, and `continue` re-tests it rather than jumping to
@@ -431,6 +433,13 @@ compile-time constant is decided at compile time, not by the trap.
   binding), while `let S { mut x, y: mut z } = e;` is accepted. As in `match`, a
   field read may auto-deref a `&S` scrutinee. Nested sub-patterns are not
   supported, so a struct-typed field is destructured by a second `let`.
+- `for` destructuring: `for S { f, g: h, i: _, .. } in arr { .. }` iterates the
+  array as above but destructures each element with the same struct-pattern
+  grammar, binding the named fields fresh each iteration. The array head is
+  evaluated once, outside the loop. `break`/`continue` and a label behave as for
+  any other `for`. The pattern must be irrefutable, so only a binding, `_` or a
+  struct pattern is allowed; `mut` goes on each binding, as in `let`
+  destructuring.
 - `if let PAT = EXPR { .. } else { .. }`, sugar for
   `match EXPR { PAT => then, _ => else_or_unit }`. It reuses the `match` pattern
   grammar (including or-patterns, ranges and struct patterns,

@@ -824,10 +824,10 @@ impl Parser {
     }
 
     /// `for PAT in ARRAY { body }` -> an index loop over the array (see
-    /// `parse_for`). `PAT` must be a binding or `_`; a compound pattern is
-    /// rejected rather than mis-bound, since rmc has no destructuring `let`.
-    /// A label on the `for` is carried to the desugared loop, so `break 'a`
-    /// still targets it.
+    /// `parse_for`). `PAT` may be a binding, `_`, or a struct pattern; any other
+    /// pattern is refutable (rustc requires an irrefutable `for` pattern) and is
+    /// rejected rather than mis-bound. A label on the `for` is carried to the
+    /// desugared loop, so `break 'a` still targets it.
     fn desugar_for_array(
         &mut self,
         pat: Pat,
@@ -839,16 +839,6 @@ impl Parser {
         self.tmp += 1;
         let arr_name = format!("\u{0}fa{n}");
         let idx_name = format!("\u{0}fi{n}");
-        let bind_name = match pat {
-            Pat::Bind(name) => name,
-            Pat::Wild => format!("\u{0}fd{n}"),
-            _ => {
-                return Err(format!(
-                    "at byte {}: `for` over an array needs a binding or `_`",
-                    self.pos()
-                ))
-            }
-        };
         let arr_var =
             Expr::Var { name: arr_name.clone(), slot: -1, ty: Type::I64 };
         let idx_var =
@@ -860,14 +850,32 @@ impl Parser {
             args: Vec::new(),
         };
         let elem = Expr::Index(Box::new(arr_var), Box::new(idx_var));
-        // `let PAT = arr[i];` runs before the user body each iteration.
-        let mut stmts = vec![Stmt::Let {
-            name: bind_name,
-            ty: None,
-            init: Some(elem),
-            slot: -1,
-            mutable: false,
-        }];
+        // The per-iteration bindings, run before the user body: `let PAT =
+        // arr[i];` for a binding or `_`, or a hidden temporary plus the field
+        // reads for a struct pattern.
+        let mut stmts = match pat {
+            Pat::Bind(name) => vec![Stmt::Let {
+                name,
+                ty: None,
+                init: Some(elem),
+                slot: -1,
+                mutable: false,
+            }],
+            Pat::Wild => vec![Stmt::Let {
+                name: format!("\u{0}fd{n}"),
+                ty: None,
+                init: Some(elem),
+                slot: -1,
+                mutable: false,
+            }],
+            Pat::Struct(_, fields) => self.let_destructure_stmts(fields, None, elem),
+            _ => {
+                return Err(format!(
+                    "at byte {}: `for` over an array needs a binding, `_` or a struct pattern",
+                    self.pos()
+                ))
+            }
+        };
         stmts.extend(body.stmts);
         let loop_body = Block { stmts, tail: body.tail };
         let for_stmt = Stmt::For {
@@ -1024,31 +1032,7 @@ impl Parser {
                     self.expect(Tok::Eq)?;
                     let init = self.parse_expr()?;
                     self.expect(Tok::Semi)?;
-                    // Bind each field from the scrutinee. Both the scrutinee
-                    // temporary and the bindings go into the enclosing block, so
-                    // the bindings stay visible for the rest of it. As in
-                    // `desugar_match_arms`, a plain place is read directly (its
-                    // re-read has no side effects and this avoids a copy); an
-                    // annotation is kept on the temporary so it is still checked.
-                    let subj = if ty.is_none()
-                        && matches!(
-                            init,
-                            Expr::Var { .. } | Expr::Int(_) | Expr::EnumVariant { .. }
-                        ) {
-                        init
-                    } else {
-                        let tmp = format!("\u{0}lp{}", self.tmp);
-                        self.tmp += 1;
-                        out.push(Stmt::Let {
-                            name: tmp.clone(),
-                            ty,
-                            init: Some(init),
-                            slot: -1,
-                            mutable: false,
-                        });
-                        Expr::Var { name: tmp, slot: -1, ty: Type::I64 }
-                    };
-                    out.extend(Self::struct_pat_binds(&fields, &subj));
+                    out.extend(self.let_destructure_stmts(fields, ty, init));
                     return Ok(());
                 }
                 let name = self.expect_ident()?;
@@ -1346,6 +1330,19 @@ impl Parser {
         r
     }
 
+    /// Parse an expression inside a bracketing delimiter (`(`, `[`), where a `{`
+    /// is always a struct literal — even inside a `for`/`while`/`if` head, whose
+    /// `no_struct_lit` flag exists only to stop the head from swallowing the
+    /// body's `{`. rustc scopes that restriction to the head itself, not to a
+    /// nested delimiter, so `for p in [P { x: 1 }] { .. }` is legal.
+    fn parse_bracketed_expr(&mut self) -> PResult<Expr> {
+        let saved = self.no_struct_lit;
+        self.no_struct_lit = false;
+        let r = self.parse_expr();
+        self.no_struct_lit = saved;
+        r
+    }
+
     fn parse_or(&mut self) -> PResult<Expr> {
         let mut lhs = self.parse_and()?;
         while self.eat(&Tok::PipePipe) {
@@ -1534,7 +1531,7 @@ impl Parser {
         loop {
             self.bump_depth()?;
             if self.eat(&Tok::LBracket) {
-                let idx = self.parse_expr()?;
+                let idx = self.parse_bracketed_expr()?;
                 self.expect(Tok::RBracket)?;
                 e = Expr::Index(Box::new(e), Box::new(idx));
             } else if self.eat(&Tok::Dot) {
@@ -1542,7 +1539,7 @@ impl Parser {
                 if self.eat(&Tok::LParen) {
                     let mut args = Vec::new();
                     while self.peek() != Some(&Tok::RParen) {
-                        args.push(self.parse_expr()?);
+                        args.push(self.parse_bracketed_expr()?);
                         if !self.eat(&Tok::Comma) {
                             break;
                         }
@@ -2037,12 +2034,46 @@ impl Parser {
         }
     }
 
+    /// The statements a `let` struct destructuring expands to: a hidden
+    /// scrutinee binding (unless the initialiser is already a plain place, as in
+    /// `desugar_match_arms`, so its re-read has no side effects and no copy is
+    /// made) followed by one field read per binding. The statements are spliced
+    /// into the enclosing block by the caller, so the bindings stay visible for
+    /// the rest of it. `ty` is the optional annotation, kept on the temporary so
+    /// it is still checked.
+    fn let_destructure_stmts(
+        &mut self,
+        fields: Vec<(String, Option<(bool, String)>)>,
+        ty: Option<Type>,
+        init: Expr,
+    ) -> Vec<Stmt> {
+        let mut out = Vec::new();
+        let subj = if ty.is_none()
+            && matches!(init, Expr::Var { .. } | Expr::Int(_) | Expr::EnumVariant { .. })
+        {
+            init
+        } else {
+            let tmp = format!("\u{0}lp{}", self.tmp);
+            self.tmp += 1;
+            out.push(Stmt::Let {
+                name: tmp.clone(),
+                ty,
+                init: Some(init),
+                slot: -1,
+                mutable: false,
+            });
+            Expr::Var { name: tmp, slot: -1, ty: Type::I64 }
+        };
+        out.extend(Self::struct_pat_binds(&fields, &subj));
+        out
+    }
+
     /// The `let` statements a struct pattern introduces: one per bound field,
-    /// each a read of that field on `subj`. Shared by the `match` arm path and
-    /// `let` destructuring, which differ only in what they do with the result.
-    /// The reads are left for sema to type and locate, so a non-struct
-    /// scrutinee is a sema error naming the field and a field may auto-deref a
-    /// `&S` scrutinee. `f: _` contributes no binding.
+    /// each a read of that field on `subj`. Shared by the `match` arm path,
+    /// `let` destructuring and `for` destructuring, which differ only in what
+    /// they do with the result. The reads are left for sema to type and locate,
+    /// so a non-struct scrutinee is a sema error naming the field and a field
+    /// may auto-deref a `&S` scrutinee. `f: _` contributes no binding.
     fn struct_pat_binds(fields: &[(String, Option<(bool, String)>)], subj: &Expr) -> Vec<Stmt> {
         fields
             .iter()
@@ -2296,7 +2327,7 @@ impl Parser {
                     if self.eat(&Tok::LParen) {
                         let mut args = Vec::new();
                         while self.peek() != Some(&Tok::RParen) {
-                            args.push(self.parse_expr()?);
+                            args.push(self.parse_bracketed_expr()?);
                             if !self.eat(&Tok::Comma) {
                                 break;
                             }
@@ -2368,7 +2399,7 @@ impl Parser {
                 if self.eat(&Tok::LParen) {
                     let mut args = Vec::new();
                     while self.peek() != Some(&Tok::RParen) {
-                        args.push(self.parse_expr()?);
+                        args.push(self.parse_bracketed_expr()?);
                         if !self.eat(&Tok::Comma) {
                             break;
                         }
@@ -2467,7 +2498,7 @@ impl Parser {
             Some(Tok::LBrace) => Ok(Expr::Block(self.parse_block()?)),
             Some(Tok::LBracket) => {
                 self.i += 1;
-                let first = self.parse_expr()?;
+                let first = self.parse_bracketed_expr()?;
                 if self.eat(&Tok::Semi) {
                     // `[v; N]`: the repeat count is a constant expression.
                     let len = self.parse_expr()?;
@@ -2490,7 +2521,7 @@ impl Parser {
                         if self.peek() == Some(&Tok::RBracket) {
                             break;
                         }
-                        elems.push(self.parse_expr()?);
+                        elems.push(self.parse_bracketed_expr()?);
                     }
                     self.expect(Tok::RBracket)?;
                     // The element type is not known here; sema infers it from

@@ -203,6 +203,63 @@ fn for_over_an_array_with_a_wildcard_binding_is_accepted() {
 }
 
 #[test]
+fn for_over_an_array_destructures_a_struct_element() {
+    let src = "struct P { x: i64, y: i64 } \
+               fn main() -> i64 { let a: [P; 2] = [P { x: 1, y: 2 }, P { x: 3, y: 4 }]; \
+               let mut s: i64 = 0; for P { x, y } in a { s = s + x * 10 + y; } return s; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn for_over_an_array_struct_pattern_compiles_like_reading_the_fields() {
+    // The destructuring `for` must read each element once into a temporary and
+    // then read its fields, exactly like the explicit form it stands for.
+    let destructured = "struct P { x: i64, y: i64 } \
+        fn main() -> i64 { let a: [P; 2] = [P { x: 1, y: 2 }, P { x: 3, y: 4 }]; \
+        let mut s: i64 = 0; for P { x, y } in a { s = s + x + y; } return s; }";
+    let explicit = "struct P { x: i64, y: i64 } \
+        fn main() -> i64 { let a: [P; 2] = [P { x: 1, y: 2 }, P { x: 3, y: 4 }]; \
+        let mut s: i64 = 0; for p in a { let x = p.x; let y = p.y; s = s + x + y; } return s; }";
+    let opts = CompileOptions::default();
+    assert_eq!(
+        compile_to_asm(destructured, &opts).unwrap(),
+        compile_to_asm(explicit, &opts).unwrap()
+    );
+}
+
+#[test]
+fn a_struct_literal_is_allowed_inside_a_for_head_bracket() {
+    // The `no_struct_lit` restriction on a `for` head is scoped to the head
+    // itself, not to a nested delimiter, as in rustc: `[P { .. }]` is a struct
+    // literal, while a bare `P { .. }` head would be rejected (it looks like the
+    // loop body).
+    let src = "struct P { x: i64 } \
+               fn main() -> i64 { let mut s: i64 = 0; \
+               for p in [P { x: 1 }, P { x: 2 }] { s = s + p.x; } return s; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn for_over_an_array_struct_pattern_allows_a_per_field_mut() {
+    let src = "struct P { x: i64, y: i64 } \
+               fn main() -> i64 { let a: [P; 1] = [P { x: 1, y: 2 }]; \
+               let mut s: i64 = 0; for P { mut x, y } in a { x = x + 10; s = s + x + y; } return s; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn for_over_an_array_rejects_a_refutable_pattern() {
+    // A `for` pattern must be irrefutable, as in rustc; an enum variant is not.
+    let err = compile_to_asm(
+        "enum E { A, B } fn main() -> i64 { let a: [E; 1] = [E::A]; \
+         let mut s: i64 = 0; for E::A in a { s = s + 1; } return s; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("binding, `_` or a struct pattern"), "got: {err}");
+}
+
+#[test]
 fn for_over_a_reference_is_rejected() {
     // `for x in &a` would iterate by reference in Rust; rmc iterates by value,
     // so it rejects the form rather than silently mistype `x`.
