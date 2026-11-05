@@ -79,19 +79,29 @@ path through GNU `as` and `ld` for comparison.
 
 ## Stack layout
 
-Each function prologue is `push %rbp; mov %rsp, %rbp; sub $N, %rsp`. Slots are
+A function that addresses a frame slot has the prologue
+`push %rbp; mov %rsp, %rbp; sub $N, %rsp`; slots are
 numbered from zero and addressed as `-(slot+1)*8(%rbp)`, so they grow downward
 and never collide with the saved frame pointer or return address above `%rbp`.
-`sub $N` rounds the frame up to a multiple of 16 to keep the stack 16-byte
-aligned for calls.
+A function that touches no frame slot — every local promoted into a register,
+no materialised aggregate, no frame spill — omits `%rbp` altogether, so a
+register-only leaf like `fib` pays no `push %rbp`/`mov %rsp, %rbp`/`leave` on
+its (recursive) calls. Its epilogue then `add`s the frame back instead of
+`leave`.
 
 `N` is not `nslots`: the parser sizes `nslots` for every local a function could
 declare, but a function that promotes its locals into registers and never
 materialises an aggregate touches none of them. `off`/`array_off` record the
 deepest slot the emitted body actually names, and the prologue allocates just
-that plus the spill slots — so an all-register leaf like `fib` gets no `sub` at
-all. (The measurement is a `Cell` filled during the dry codegen pass, since
+that plus the spill slots — so an all-register leaf like `fib` gets no local
+frame. (The measurement is a `Cell` filled during the dry codegen pass, since
 `off` takes `&self` and the prologue is emitted before the body it sizes.)
+
+`N` is padded so that `%rsp` is 8 mod 16 at every call, as the ABI requires.
+With a frame pointer, `push %rbp` supplies the 8 mod 16 and `N` rounds the
+saved registers plus slots up to a multiple of 16. Without one, the saved
+registers and slots must themselves total 8 mod 16, so an even number of saved
+registers (16 bytes) is followed by an 8-byte pad.
 
 Arrays and structs occupy `n` consecutive slots. Because slot addresses decrease
 as the slot index rises, an aggregate's element 0 / field 0 is at the *lowest*
@@ -310,8 +320,10 @@ runs the body twice: the first pass measures the deepest spill, the second sizes
 the frame and emits the final code.
 
 Local selection is whole-function, not per loop, so a local hot in one loop
-competes with one hot in another. The remaining gap to rustc on `fib` is the
-frame-based argument passing and the unoptimised prologue, not the spill.
+competes with one hot in another. `fib` now has a minimal prologue (no frame
+pointer); what remains of the gap to rustc is that rmc passes arguments through
+frame slots rather than keeping them in the argument registers, and that it has
+no cross-call register allocator, not the spill.
 
 ## Control flow
 

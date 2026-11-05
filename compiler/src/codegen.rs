@@ -390,22 +390,34 @@ impl Codegen {
         saved.extend(self.spill_regs.iter().copied());
 
         let nregs = saved.len() as i32;
+        // The frame pointer is only needed when something is addressed through
+        // it: a local slot, a spill slot, or an aggregate's frame buffer. When
+        // the whole function lives in registers (`fib`), `%rbp` would cost a
+        // push, a `mov` and a `leave` on every call for nothing, so it is left
+        // out and `%rsp` alone carries the frame. Captured before the body is
+        // emitted because emitting re-measures `frame_slots`.
+        let uses_frame = self.frame_slots.get() > 0 || self.spill_slots > 0;
         self.raw(&format!(".globl {}", f.name));
         self.raw(&format!(".type {}, @function", f.name));
         self.raw(&format!("{}:", f.name));
-        self.line("push %rbp");
-        self.line("mov %rsp, %rbp");
-        // Save the registers used for promoted locals. The frame is padded to a
-        // multiple of 16 so that, counting these pushes, %rsp stays 16-byte
-        // aligned at every call.
+        if uses_frame {
+            self.line("push %rbp");
+            self.line("mov %rsp, %rbp");
+        }
+        // Save the registers used for promoted locals.
         for r in &saved {
             self.line(&format!("push {r}"));
         }
         let saved_bytes = nregs as i32 * 8;
         let slots_bytes = (self.frame_slots.get() + self.spill_slots) * 8;
-        // The total depth below %rbp (saved registers plus frame) must be a
-        // multiple of 16 so %rsp is 16-byte aligned at every call.
-        let frame = ((slots_bytes + saved_bytes + 15) / 16) * 16 - saved_bytes;
+        // `%rsp` must be 16-byte aligned at every call: it is 8 mod 16 at entry
+        // (the return address), so the total pushed must be 8 mod 16. With a
+        // frame pointer `push %rbp` supplies the 8; without it the frame does.
+        let frame = if uses_frame {
+            ((slots_bytes + saved_bytes + 15) / 16) * 16 - saved_bytes
+        } else {
+            slots_bytes + (8 - saved_bytes - slots_bytes).rem_euclid(16)
+        };
         if frame > 0 {
             self.line(&format!("sub ${frame}, %rsp"));
         }
@@ -461,15 +473,26 @@ impl Codegen {
             self.line("xor %eax, %eax");
         }
         self.raw(&format!("{}:", self.epilogue));
-        // The saved registers sit just below %rbp; point %rsp at the lowest one
-        // and pop them back, which also discards the frame.
-        if nregs > 0 {
-            self.line(&format!("lea -{}(%rbp), %rsp", nregs * 8));
+        if uses_frame {
+            // The saved registers sit just below %rbp; point %rsp at the lowest
+            // one and pop them back, which also discards the frame.
+            if nregs > 0 {
+                self.line(&format!("lea -{}(%rbp), %rsp", nregs * 8));
+                for r in saved.iter().rev() {
+                    self.line(&format!("pop {r}"));
+                }
+            }
+            self.line("leave");
+        } else {
+            // No frame pointer: undo the frame allocation, then pop the saved
+            // registers back to their caller's values.
+            if frame > 0 {
+                self.line(&format!("add ${frame}, %rsp"));
+            }
             for r in saved.iter().rev() {
                 self.line(&format!("pop {r}"));
             }
         }
-        self.line("leave");
         self.line("ret");
         // Append the cold blocks now that the hot path is complete.
         if !self.cold.is_empty() {
