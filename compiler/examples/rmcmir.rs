@@ -32,6 +32,7 @@ fn main() {
     let text = std::fs::read_to_string(&input).expect("cannot read input");
     let opts = Options { overflow_checks, promote: !no_promote, align_loops: true };
     let mut prog = rmc::mir::parse(&text).expect("mir parse");
+    rmc::mir::tco(&mut prog, overflow_checks);
     rmc::mir::inline_calls(&mut prog);
     rmc::mir::merge_blocks(&mut prog);
     prog.copy_propagate();

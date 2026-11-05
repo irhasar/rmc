@@ -1458,6 +1458,16 @@ impl<'a> FnGen<'a> {
         // a scalar in a frame slot or an immediate is stable and used directly;
         // only a value that landed in `%rax`/`%rcx` is stashed in a spill slot,
         // because evaluating a later argument may clobber it.
+        // An argument that is already in `%rax`/`%rcx` need not be stashed when
+        // nothing after it clobbers the register: only the *last* argument that
+        // needs evaluation can leave its value in a register, because every
+        // argument before it is followed by an evaluation that may overwrite
+        // it. This is the common case for a call whose argument is a freshly
+        // computed scalar, and it removes a store/reload pair from every call.
+        let is_stable = |a: &Operand| {
+            !self.operand_ty(a).is_aggregate() && self.operand_is_simple(a)
+        };
+        let last_unstable = args.iter().rposition(|a| !is_stable(a));
         let mut reg_ops: Vec<(usize, String)> = Vec::new();
         for (i, arg) in args.iter().enumerate() {
             if i >= ARG_REGS.len() {
@@ -1465,13 +1475,17 @@ impl<'a> FnGen<'a> {
             }
             if self.operand_ty(arg).is_aggregate() {
                 self.eval_aggregate_addr(arg)?;
-                let tmp = self.alloc_slot();
-                self.emit(&format!("  mov %rax, {}", self.off(tmp)));
-                reg_ops.push((i, self.off(tmp)));
+                if Some(i) == last_unstable {
+                    reg_ops.push((i, "%rax".to_string()));
+                } else {
+                    let tmp = self.alloc_slot();
+                    self.emit(&format!("  mov %rax, {}", self.off(tmp)));
+                    reg_ops.push((i, self.off(tmp)));
+                }
             } else {
                 let (v, _) = self.eval_operand(arg)?;
                 let stable = v.starts_with('$') || v.contains('(');
-                if stable {
+                if stable || Some(i) == last_unstable {
                     reg_ops.push((i, v));
                 } else {
                     let tmp = self.alloc_slot();

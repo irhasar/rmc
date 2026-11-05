@@ -1961,6 +1961,227 @@ fn pure_call(name: &str) -> bool {
     !matches!(name, "alloc" | "print_i64" | "print_str" | "putchar" | "free")
 }
 
+/// Halve the call tree of a single self-recursive function.
+///
+/// `f(x) = t(x) op f(h(x))` recurses twice per level, so `fib(32)` makes
+/// `2^32` calls. `op` is associative, so the `f(h(x))` spine can be unrolled
+/// into an accumulator loop:
+///
+/// ```text
+/// acc = identity                  // 0 for `+`, 1 for `*`
+/// while !cond(x) { acc = acc op t(x); x = h(x); }
+/// return acc op guard(x)
+/// ```
+///
+/// One call per level remains — the one inside `t` — so the tree is halved.
+/// This is the same rewrite `tco.rs` does on the AST; rustc emits the shape as
+/// a chain of blocks (`t` may be a self-call, then `h` and a second self-call,
+/// then the `op`), which is what the recogniser below walks.
+///
+/// The rewrite is only exact for wrapping arithmetic, so it is skipped under
+/// `--overflow-checks`: the loop adds terms in a different order, and a checked
+/// trap would fire on a different intermediate.
+pub fn tco(prog: &mut Program, overflow_checks: bool) {
+    if overflow_checks {
+        return;
+    }
+    for f in &mut prog.funcs {
+        f.tco_self();
+    }
+}
+
+impl Function {
+    fn tco_self(&mut self) -> bool {
+        if self.blocks.is_empty() {
+            return false;
+        }
+        // A free function of one scalar argument returning a scalar.
+        let args: Vec<u32> = (0..self.locals.len() as u32)
+            .filter(|l| self.locals[*l as usize].is_arg)
+            .collect();
+        if args.len() != 1 {
+            return false;
+        }
+        let param = args[0];
+        if self.locals[param as usize].ty.is_aggregate()
+            || self.locals.first().map(|l| l.ty.is_aggregate()).unwrap_or(true)
+        {
+            return false;
+        }
+        // The entry block must be the only entry (no back edge into `bb0`).
+        if self.blocks.iter().any(|b| successors(&b.term).contains(&0)) {
+            return false;
+        }
+
+        // Entry: `discr = cmp(a, b); switchInt(discr) -> [0: X, otherwise: Y]`.
+        let Terminator::SwitchInt { discr, targets, otherwise } = self.blocks[0].term.clone() else {
+            return false;
+        };
+        if targets.len() != 1 || targets[0].0 != 0 {
+            return false;
+        }
+        let discr_local = match &discr {
+            Operand::Copy(p) | Operand::Move(p) if p.proj.is_empty() => p.local,
+            _ => return false,
+        };
+        let Some((cmp_op, cmp_a, cmp_b)) = self.blocks[0].stmts.iter().find_map(|s| match s {
+            Stmt::Assign(p, Rvalue::Binary(op, a, b))
+                if p.proj.is_empty()
+                    && p.local == discr_local
+                    && matches!(
+                        op,
+                        BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne
+                    ) =>
+            {
+                Some((*op, a.clone(), b.clone()))
+            }
+            _ => None,
+        }) else {
+            return false;
+        };
+
+        let Some(ret_block) = self.blocks.iter().position(|b| matches!(b.term, Terminator::Return))
+        else {
+            return false;
+        };
+        let ret_block = ret_block as u32;
+
+        // One switch arm is the base case: `_0 = guard; goto ret_block`.
+        let arm_guard = |this: &Self, b: u32| -> Option<Operand> {
+            let blk = &this.blocks[b as usize];
+            if !matches!(blk.term, Terminator::Goto(t) if t == ret_block) {
+                return None;
+            }
+            let mut guard = None;
+            for s in &blk.stmts {
+                if let Stmt::Assign(p, Rvalue::Use(op)) = s {
+                    if p.proj.is_empty() && p.local == 0 {
+                        if guard.is_some() {
+                            return None;
+                        }
+                        guard = Some(op.clone());
+                    }
+                }
+            }
+            guard
+        };
+        let x = targets[0].1;
+        let y = otherwise;
+        let (base_block, chain_start, guard) = if let Some(g) = arm_guard(self, x) {
+            (x, y, g)
+        } else if let Some(g) = arm_guard(self, y) {
+            (y, x, g)
+        } else {
+            return false;
+        };
+
+        // Walk the recursive spine from the entry arm to the `op` combine.
+        let mut chain: Vec<u32> = Vec::new();
+        let mut cur = chain_start;
+        let combine;
+        loop {
+            if chain.len() > 64 {
+                return false;
+            }
+            chain.push(cur);
+            match self.blocks[cur as usize].term.clone() {
+                Terminator::Goto(t) if t == ret_block => {
+                    combine = cur;
+                    break;
+                }
+                Terminator::Goto(t) => cur = t,
+                Terminator::Call { target: Some(t), func: CallTarget::Direct(n), .. }
+                    if n == self.name =>
+                {
+                    cur = t;
+                }
+                _ => return false,
+            }
+        }
+
+        // The combine is `_0 = op(t, f(h))`; `op` must be associative.
+        let Some((op, a, b)) = self.blocks[combine as usize].stmts.iter().find_map(|s| match s {
+            Stmt::Assign(p, Rvalue::Binary(op @ (BinOp::Add | BinOp::Mul), a, b))
+                if p.proj.is_empty() && p.local == 0 =>
+            {
+                Some((*op, a.clone(), b.clone()))
+            }
+            _ => None,
+        }) else {
+            return false;
+        };
+
+        // The last self-call on the spine is `f(h)`; its result is one operand
+        // of the combine and its argument is `h`.
+        let mut last_call = None;
+        for &b in chain.iter().take(chain.len() - 1) {
+            if let Terminator::Call { dest, args, func: CallTarget::Direct(n), .. } =
+                &self.blocks[b as usize].term
+            {
+                if *n == self.name && args.len() == 1 {
+                    last_call = Some((b, dest.local, args[0].clone()));
+                }
+            }
+        }
+        let Some((call_block, call_dest, h)) = last_call else { return false };
+        // The combine must read the call's result exactly once, and its other
+        // operand is the value of `t(x)`.
+        let uses_dest = |o: &Operand| matches!(o, Operand::Copy(p) | Operand::Move(p) if p.proj.is_empty() && p.local == call_dest);
+        let t_result = if uses_dest(&a) && !uses_dest(&b) {
+            b
+        } else if uses_dest(&b) && !uses_dest(&a) {
+            a
+        } else {
+            return false;
+        };
+
+        // Rewrite the spine's tail into the loop body: drop the `f(h)` call and
+        // the combine, add `param = h` and `acc = acc op t`.
+        let acc = self.locals.len() as u32;
+        self.locals.push(LocalDecl { ty: Box::new(Ty::I64), is_arg: false, name: None });
+        let acc_place = Place { local: acc, proj: Vec::new() };
+        let param_place = Place { local: param, proj: Vec::new() };
+
+        let identity = if op == BinOp::Add { 0 } else { 1 };
+        self.blocks[call_block as usize].term = Terminator::Goto(combine);
+        // The header block is new; the base block becomes the exit.
+        let header = self.blocks.len() as u32;
+        let body = &mut self.blocks[combine as usize];
+        body.stmts.retain(|s| !matches!(s, Stmt::Assign(p, _) if p.proj.is_empty() && p.local == 0));
+        body.stmts.push(Stmt::Assign(
+            acc_place.clone(),
+            Rvalue::Binary(op, Operand::Copy(acc_place.clone()), t_result),
+        ));
+        body.stmts.push(Stmt::Assign(param_place, Rvalue::Use(h)));
+        body.term = Terminator::Goto(header);
+
+        self.blocks[base_block as usize].stmts = vec![Stmt::Assign(
+            Place { local: 0, proj: Vec::new() },
+            Rvalue::Binary(op, Operand::Copy(acc_place.clone()), guard),
+        )];
+        self.blocks[base_block as usize].term = Terminator::Goto(ret_block);
+
+        self.blocks.push(BasicBlock {
+            stmts: vec![Stmt::Assign(
+                Place { local: discr_local, proj: Vec::new() },
+                Rvalue::Binary(cmp_op, cmp_a, cmp_b),
+            )],
+            term: Terminator::SwitchInt {
+                discr: Operand::Copy(Place { local: discr_local, proj: Vec::new() }),
+                targets: vec![(0, chain_start)],
+                otherwise: base_block,
+            },
+        });
+
+        self.blocks[0].stmts = vec![Stmt::Assign(
+            acc_place,
+            Rvalue::Use(Operand::Const(Const::Int(identity))),
+        )];
+        self.blocks[0].term = Terminator::Goto(header);
+        true
+    }
+}
+
 /// Merge a block into its only successor when that successor has no other
 /// predecessor. The two then form one block, so a value defined in the first is
 /// visible to the second without a block boundary; the register allocator can
