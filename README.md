@@ -57,6 +57,7 @@ selects which:
 | -------- | ---------------------------- | ------------------------------------- |
 | `*.rms`  | rmc's own lexer/parser/sema  | `codegen.rs` -> `elf.rs` (in-process) |
 | `*.rs`   | `rustc --emit=mir -O`        | `mir.rs` -> `mir_codegen.rs` -> `elf.rs` |
+| `*.mir`  | none (already MIR text)      | `mir.rs` -> `mir_codegen.rs` -> `elf.rs` |
 
 The `.rs` path exists to test the thesis that LLVM is the expensive part of a
 Rust build. `rustc` still does the parsing and type checking, but it stops at
@@ -143,6 +144,8 @@ to build a program: the default path needs no assembler and no linker. `as` and
 ```sh
 rmc input.rms -o output            # compile and link in-process (default)
 rmc input.rms --emit-asm           # print the generated assembly to stdout
+rmc input.rs -o output             # rustc --emit=mir front end, rmc back end
+rmc input.mir -o output            # lower `rustc --emit=mir` text directly
 rmc --emit-runtime-asm             # print the freestanding runtime as assembly
 rmc input.rms --binutils -o out    # assemble and link with `as`/`ld` instead
 rmc input.rms --binutils --no-strip -o out   # keep the symbol table
