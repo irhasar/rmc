@@ -668,11 +668,16 @@ impl<'a> FnGen<'a> {
         let frame_slots = self.next_slot;
         // Slots come from the raw body: the peephole passes fold `(%rbp)`
         // operands into register-based addresses, which would hide a live slot.
-        let mut used_slots = rbp_slots(&raw);
+        // A slot the raw body only ever stores to and never reads is dead, and
+        // stays dead: the peephole passes rewrite reads, they never create one.
+        // The optimised body is scanned whole -- a folded address may name a
+        // slot the raw text no longer does.
+        let mut used_slots = read_slots(&raw);
         // Registers come from the optimised body: coalescing can free a
         // callee-saved register the raw body named, and a `push`/`pop` for a
         // register nothing reads is pure overhead in every call.
         let opt = optimize(&raw);
+        used_slots.extend(rbp_slots(&opt));
         // An aggregate's slots are reached as `base + k`, so only the base
         // appears in the text. Pin every slot of a multi-slot region: they must
         // stay contiguous, or an element access would fall outside the frame.
@@ -760,8 +765,7 @@ impl<'a> FnGen<'a> {
             // instructions from straddling a boundary, which matters most for a
             // tight inner loop.
             if self.opts.align_loops && self.is_loop_header(i) {
-                let n = std::env::var("RMC_ALIGN").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
-                if n > 0 { let _ = writeln!(self.out, "  .p2align {n}"); }
+                let _ = writeln!(self.out, "  .p2align 4");
             }
             let _ = writeln!(self.out, ".Lbb{}:", self.bb_label(i));
             self.gen_block(i)?;
@@ -1879,11 +1883,12 @@ fn coalesce_scratch(body: &str) -> String {
     'outer: while i < lines.len() {
         if let Some((a, t)) = mov_reg_reg(lines[i]) {
             // `mov %a, %t` copies a value into `%t`. When exactly one of the
-            // two is a scratch register, the copy only exists to park the value
+            // two is a scratch register, the copy exists only to park the value
             // somewhere the other register is not reused: carry it in the
-            // non-scratch register and rename the scratch one's uses. A call
-            // result is the common case -- `%rax` holds it, and the generator
-            // copies it into a callee-saved register for the second call.
+            // non-scratch register (`keep`) and rename the scratch one's uses
+            // (`dead`). A call result is the common case -- `%rax` holds it and
+            // the generator copies it into a callee-saved register so the next
+            // call can overwrite `%rax`.
             let (keep, dead) = if SCRATCH.contains(&t) && !SCRATCH.contains(&a) {
                 (a, t)
             } else if SCRATCH.contains(&a) && !SCRATCH.contains(&t) {
@@ -1894,11 +1899,13 @@ fn coalesce_scratch(body: &str) -> String {
                 i += 1;
                 continue;
             };
-            // The straight-line region over which the copy can carry the value:
-            // it ends at a control-flow edge, when `dead` is overwritten (the
-            // value is lost), or when `keep` is overwritten (a new value).
+            // The region over which the copy carries the value: it ends at the
+            // first control transfer, when `dead` is overwritten (the value is
+            // lost), or *after* the instruction that overwrites `keep` (the
+            // value's last use). Block labels do not end it -- the value is
+            // still live across a fall-through.
             let mut k = i + 1;
-            let mut last_use = i;
+            let mut used = false;
             while k < lines.len() {
                 let lt = lines[k].trim();
                 let op = lt.split_whitespace().next().unwrap_or("");
@@ -1907,25 +1914,26 @@ fn coalesce_scratch(body: &str) -> String {
                     continue;
                 }
                 if op.starts_with('j')
-                    || op == "ret"
-                    || op == "call"
-                    || op == "syscall"
+                    || matches!(op, "ret" | "call" | "syscall" | "ud2" | "hlt")
                 {
                     break;
                 }
+                // The instruction that overwrites `dead` is still part of the
+                // region when it reads the value (a `lea` that rebases it, say),
+                // so note the use before ending the region there.
+                if reg_mentions(lines[k], keep) || reg_mentions(lines[k], dead) {
+                    used = true;
+                }
                 let writes = written_regs(op, lt);
+                k += 1;
                 if writes.iter().any(|r| r == dead) || writes.iter().any(|r| r == keep) {
                     break;
                 }
-                if reg_mentions(lines[k], keep) {
-                    last_use = k;
-                }
-                k += 1;
             }
-            // `keep` must be dead past the region, or renaming its uses would
-            // drop a value a later block still reads. Its only mentions outside
-            // the region may be the prologue save and the epilogue restore.
-            if last_use > i && dead_after(&lines, i, k, keep) {
+            // Only rewrite when the value is actually read in the region, and
+            // only when `keep` carries nothing past it -- otherwise renaming
+            // would change a value a later block still reads.
+            if used && dead_after(&lines, i, k, keep) {
                 for m in &lines[i + 1..k] {
                     out.push_str(&replace_reg(m, keep, dead));
                     out.push('\n');
@@ -2059,6 +2067,87 @@ fn fold_base(line: &str, t: &str, src: &str, k: i64) -> Option<(String, bool)> {
     Some((rewritten, writes_t))
 }
 
+/// Fold a constant materialised in a scratch register into the arithmetic that
+/// uses it: `mov $k, %t; add %t, %d` becomes `add $k, %d`, and
+/// `mov $k, %t; add %s, %t` becomes `lea k(%s), %t`. The generator loads every
+/// constant into a register, so a loop that multiplies by one pays an extra
+/// instruction on each iteration.
+fn fuse_imm(body: &str) -> String {
+    const SCRATCH: &[&str] = &["%rax", "%rcx", "%rdx", "%r10", "%r11"];
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i + 1 < lines.len() {
+        if let Some((k, t)) = mov_imm(lines[i]) {
+            if SCRATCH.contains(&t) {
+                if let Some((op, a, d)) = binop_reg(lines[i + 1]) {
+                    // `mov $k, %t; add %s, %t` -> `lea k(%s), %t`. The result
+                    // stays in `%t`, so the fold does not care whether `%t` is
+                    // read later; only `%s` has to be a register.
+                    if d == t && a != t && (op == "add" || op == "sub") {
+                        let disp = if op == "add" { k } else { -k };
+                        if disp == 0 {
+                            out.push_str(&format!("  mov {a}, {t}\n"));
+                            i += 2;
+                            continue;
+                        }
+                        if (-2_147_483_648..=2_147_483_647).contains(&disp) {
+                            out.push_str(&format!("  lea {disp}({a}), {t}\n"));
+                            i += 2;
+                            continue;
+                        }
+                    }
+                    // `mov $k, %t; <op> %t, %d` -> `<op> $k, %d`, which drops
+                    // `%t`, so it must be dead afterwards. `imul` needs the
+                    // three-operand encoding and its immediate is sign
+                    // extended, so only a value that fits `i32` is equivalent.
+                    let foldable = matches!(op, "add" | "sub" | "and" | "or" | "xor" | "cmp");
+                    let fits = (-2_147_483_648..=2_147_483_647).contains(&k);
+                    if a == t && d != t && fits && (foldable || op == "imul")
+                        && scratch_dead_after(&lines, i + 2, t)
+                    {
+                        if op == "imul" {
+                            out.push_str(&format!("  imul ${k}, {d}, {d}\n"));
+                        } else {
+                            out.push_str(&format!("  {op} ${k}, {d}\n"));
+                        }
+                        i += 2;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push_str(lines[i]);
+        out.push('\n');
+        i += 1;
+    }
+    while i < lines.len() {
+        out.push_str(lines[i]);
+        out.push('\n');
+        i += 1;
+    }
+    out
+}
+
+/// `mov $k, %t` (or `movabs $k, %t`), returning the value and destination.
+fn mov_imm(line: &str) -> Option<(i64, &str)> {
+    let t = line.trim();
+    let rest = t.strip_prefix("mov ").or_else(|| t.strip_prefix("movabs "))?;
+    let (imm, dst) = rest.split_once(',')?;
+    let k: i64 = imm.trim().strip_prefix('$')?.parse().ok()?;
+    let dst = dst.trim();
+    is_reg(dst).then_some((k, dst))
+}
+
+/// `<op> <a>, <d>` with two register operands.
+fn binop_reg(line: &str) -> Option<(&str, &str, &str)> {
+    let t = line.trim();
+    let (op, rest) = t.split_once(' ')?;
+    let (a, d) = rest.split_once(',')?;
+    let (a, d) = (a.trim(), d.trim());
+    (is_reg(a) && is_reg(d)).then_some((op, a, d))
+}
+
 /// Fold `mov %a, %t; add|sub $k, %t; ...; mov %t, %d` into `lea ±k(%a), %d`.
 ///
 /// The generator materialises every offset in a scratch register (`mov %rbx,
@@ -2077,6 +2166,29 @@ fn fuse_lea(body: &str) -> String {
     let mut out = String::with_capacity(body.len());
     let mut i = 0;
     while i + 1 < lines.len() {
+        // `mov %a, %t; mov %t, %d` -> `mov %a, %d`, when `%t` is a scratch
+        // register that is dead afterwards. The generator parks a result in a
+        // scratch register and then copies it into the local that owns it.
+        if let Some((a, t)) = mov_reg_reg(lines[i]) {
+            if SCRATCH.contains(&t) && a != t && scratch_dead_after(&lines, i + 2, t) {
+                if let Some((t2, d)) = mov_reg_reg(lines[i + 1]) {
+                    if t2 == t && d != t {
+                        out.push_str(&format!("  mov {a}, {d}\n"));
+                        i += 2;
+                        continue;
+                    }
+                }
+                // `mov %a, %t; lea k(%t), %d` -> `lea k(%a), %d`: the copy only
+                // rebased the `lea`.
+                if let Some((k, base, d)) = lea_disp(lines[i + 1]) {
+                    if base == t && d != t {
+                        out.push_str(&format!("  lea {k}({a}), {d}\n"));
+                        i += 2;
+                        continue;
+                    }
+                }
+            }
+        }
         if let Some((a, t)) = mov_reg_reg(lines[i]) {
             if SCRATCH.contains(&t) {
                 if let Some((op, k, arith_dst)) = addsub_imm(lines[i + 1]) {
@@ -2207,6 +2319,29 @@ fn rbp_slots(body: &str) -> HashSet<i64> {
     set
 }
 
+/// Frame slots the body reads, i.e. every `-N(%rbp)` operand that is not the
+/// sole destination of a `mov`. A slot written and never read is dead.
+fn read_slots(body: &str) -> HashSet<i64> {
+    let mut set = HashSet::new();
+    for line in body.lines() {
+        let slots = rbp_slots(line);
+        if slots.is_empty() {
+            continue;
+        }
+        // `mov <non-slot>, <slot>` writes the slot without reading it.
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("mov ").or_else(|| t.strip_prefix("movq ")) {
+            if let Some((src, dst)) = rest.split_once(',') {
+                if !src.contains("(%rbp)") && dst.trim().ends_with("(%rbp)") {
+                    continue;
+                }
+            }
+        }
+        set.extend(slots);
+    }
+    set
+}
+
 /// `mov %a, %b` where both operands are registers.
 fn mov_reg_reg(line: &str) -> Option<(&str, &str)> {
     let t = line.trim();
@@ -2214,6 +2349,20 @@ fn mov_reg_reg(line: &str) -> Option<(&str, &str)> {
     let (a, b) = rest.split_once(',')?;
     let (a, b) = (a.trim(), b.trim());
     (is_reg(a) && is_reg(b)).then_some((a, b))
+}
+
+/// `lea <disp>(%base), %dst`, returning the displacement, base and destination.
+fn lea_disp(line: &str) -> Option<(i64, &str, &str)> {
+    let t = line.trim();
+    let rest = t.strip_prefix("lea ")?;
+    let (mem, dst) = rest.split_once(',')?;
+    let mem = mem.trim();
+    let open = mem.find('(')?;
+    let close = mem.find(')')?;
+    let disp: i64 = mem[..open].trim().parse().ok()?;
+    let base = mem[open + 1..close].trim();
+    let dst = dst.trim();
+    (is_reg(base) && is_reg(dst)).then_some((disp, base, dst))
 }
 
 /// `add $k, %t` or `sub $k, %t`.
@@ -2459,7 +2608,9 @@ fn store_slot(line: &str) -> Option<&str> {
 /// lets the arithmetic that fed it fuse into a `lea`.
 fn optimize(body: &str) -> String {
     let mut body = peephole(body);
+    body = drop_dead_jumps(&body);
     for _ in 0..2 {
+        body = fuse_imm(&body);
         body = fuse_lea(&body);
         body = coalesce_scratch(&body);
         body = forward_stores(&body);
@@ -2467,6 +2618,25 @@ fn optimize(body: &str) -> String {
         body = dead_stores(&body);
     }
     body
+}
+
+/// Drop a `jmp` whose target is the very next label. The return path always
+/// jumps to the epilogue, which the block emitter places immediately after it.
+fn drop_dead_jumps(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out = String::with_capacity(body.len());
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(target) = line.trim().strip_prefix("jmp ") {
+            if let Some(next) = lines.get(i + 1) {
+                if next.trim() == format!("{target}:") {
+                    continue;
+                }
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 fn peephole(body: &str) -> String {
