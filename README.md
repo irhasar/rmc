@@ -215,7 +215,8 @@ fn main() -> i64 {
 Supported: `i64`, `bool`, `str`, fixed-size arrays, and structs with named fields;
 functions with up to six parameters; `let` / `let mut`; assignment to variables,
 array elements and struct fields (including compound `+=` and friends);
-`if`/`else`, `while`, `loop`, and `for i in a..b` / `a..=b`; `match` on integers,
+`if`/`else`, `while`, `loop`, `for i in a..b` / `a..=b` and `for x in arr`
+(array iteration, by value); `match` on integers,
 `bool`s, enums and strings (literal, `true`/`false`, string, `Enum::Variant` and
 `_` patterns, plus payload bindings and binding names, and a per-arm guard
 `PAT if COND`) and `if let` with the

@@ -481,6 +481,22 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   and compared register-to-register. `count_expr` must count the hidden counter
   and bound slots so they compete for a callee-saved register like any other
   loop-carried local; otherwise the bound is reloaded from the frame every pass.
+- **`for x in ARRAY` desugars to an index loop**, not a new node:
+  `{ let a = EXPR; for i in 0..a.len() { let x = a[i]; body } }`. `parse_for`
+  binds `EXPR` to a hidden `\0fa<n>` temporary so an array expression with a
+  side effect (a call, a literal) runs once, and `a.len()` folds to the array's
+  compile-time length, so the loop bound is a constant and `end_slot` is unused
+  (see the note above). `x` is a fresh `let` per iteration, so it is immutable
+  and a stale read across iterations is impossible. `continue`/`break` work
+  because the desugared loop is the ordinary `For` node. Two guards matter:
+  the loop variable must be a binding or `_` (a compound pattern is rejected
+  rather than mis-bound, since rmc has no destructuring `let`), and `for x in
+  &arr` is rejected — Rust iterates a reference by reference (`x: &i64`), so
+  accepting it would silently mistype `x`. `parse_for` also checks the pattern
+  name against the constant table *before* `parse_pattern`, because a bare
+  constant name there resolves to its value (not a binding), which would turn
+  `for N in 0..3` into an iteration over a literal and lose the E0530 error.
+  `tests/cases/forarr.{rms,rs}` and the `stmt` fuzzer cover it.
 - **`..=` exits on `jle` back-edge, not `jl`.** The guard is the loop-back
   condition, so the inclusive form loops while `var <= end` (`jle`) and the
   exclusive one while `var < end` (`jl`); a `jg`/`jge` *exit* test is the
