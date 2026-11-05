@@ -1961,6 +1961,86 @@ fn pure_call(name: &str) -> bool {
     !matches!(name, "alloc" | "print_i64" | "print_str" | "putchar" | "free")
 }
 
+/// Merge a block into its only successor when that successor has no other
+/// predecessor. The two then form one block, so a value defined in the first is
+/// visible to the second without a block boundary; the register allocator can
+/// keep it in a register instead of spilling it. rustc emits a chain of
+/// single-successor blocks for a folded expression, which is exactly the shape
+/// that benefits.
+pub fn merge_blocks(prog: &mut Program) {
+    for f in &mut prog.funcs {
+        f.merge_blocks();
+    }
+}
+
+impl Function {
+    fn merge_blocks(&mut self) {
+        loop {
+            let mut preds: Vec<Vec<u32>> = vec![Vec::new(); self.blocks.len()];
+            for (b, blk) in self.blocks.iter().enumerate() {
+                for s in successors(&blk.term) {
+                    preds[s as usize].push(b as u32);
+                }
+            }
+            let mut merged = false;
+            let mut dead: HashSet<u32> = HashSet::new();
+            for b in 0..self.blocks.len() {
+                if dead.contains(&(b as u32)) {
+                    continue;
+                }
+                let Terminator::Goto(s) = self.blocks[b].term else { continue };
+                // Never merge into the entry block (a jump back to bb0 is a loop
+                // entry, not a fall-through) or into itself, and only when the
+                // successor has exactly this one predecessor.
+                if s == 0 || s as usize == b || dead.contains(&s) || preds[s as usize].len() != 1 {
+                    continue;
+                }
+                let tail = std::mem::replace(
+                    &mut self.blocks[s as usize],
+                    BasicBlock { stmts: Vec::new(), term: Terminator::Unreachable },
+                );
+                self.blocks[b].stmts.extend(tail.stmts);
+                self.blocks[b].term = tail.term;
+                dead.insert(s);
+                merged = true;
+            }
+            if !merged {
+                break;
+            }
+            self.compact_blocks(&dead);
+        }
+    }
+
+    /// Drop the blocks in `dead` and renumber every terminator target.
+    fn compact_blocks(&mut self, dead: &HashSet<u32>) {
+        let mut new_index: Vec<u32> = vec![u32::MAX; self.blocks.len()];
+        let mut kept: Vec<BasicBlock> = Vec::with_capacity(self.blocks.len() - dead.len());
+        for (b, blk) in self.blocks.drain(..).enumerate() {
+            if dead.contains(&(b as u32)) {
+                continue;
+            }
+            new_index[b] = kept.len() as u32;
+            kept.push(blk);
+        }
+        let remap = |t: u32| new_index[t as usize];
+        for blk in &mut kept {
+            match &mut blk.term {
+                Terminator::Goto(t) => *t = remap(*t),
+                Terminator::SwitchInt { targets, otherwise, .. } => {
+                    for (_, t) in targets.iter_mut() {
+                        *t = remap(*t);
+                    }
+                    *otherwise = remap(*otherwise);
+                }
+                Terminator::Call { target: Some(t), .. } => *t = remap(*t),
+                Terminator::Assert { target, .. } => *target = remap(*target),
+                _ => {}
+            }
+        }
+        self.blocks = kept;
+    }
+}
+
 /// Collapse `goto`-only blocks. LICM leaves a chain of empty blocks behind when
 /// it lifts a hoisted call out of its block, and each one costs a taken jump on
 /// every iteration of the loop it sits in. Redirecting the edges straight to the

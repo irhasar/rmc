@@ -33,6 +33,7 @@ fn main() {
     let opts = Options { overflow_checks, promote: !no_promote, align_loops: true };
     let mut prog = rmc::mir::parse(&text).expect("mir parse");
     rmc::mir::inline_calls(&mut prog);
+    rmc::mir::merge_blocks(&mut prog);
     prog.copy_propagate();
     rmc::mir::licm(&mut prog);
     rmc::mir::jump_thread(&mut prog);
