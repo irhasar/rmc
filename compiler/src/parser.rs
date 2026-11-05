@@ -869,9 +869,12 @@ impl Parser {
                 mutable: false,
             }],
             Pat::Struct(_, fields) => self.let_destructure_stmts(fields, None, elem),
+            Pat::Array { elems, rest, front } => {
+                self.let_destructure_array_stmts(elems, rest, front, None, elem)
+            }
             _ => {
                 return Err(format!(
-                    "at byte {}: `for` over an array needs a binding, `_` or a struct pattern",
+                    "at byte {}: `for` over an array needs a binding, `_`, a struct or an array pattern",
                     self.pos()
                 ))
             }
@@ -1005,14 +1008,15 @@ impl Parser {
                     out.push(Stmt::Expr(Expr::Block(Block { stmts, tail: None })));
                     return Ok(());
                 }
-                // `let S { f, g: h } [: T] = e;` destructures a struct. The
-                // pattern is read by the same parser as a `match` pattern, but
-                // here it is irrefutable by construction, so the annotation goes
-                // on the scrutinee temporary below and the fields are bound from
-                // it. `..` and `f: _` are the only way to drop fields.
-                if matches!(self.peek(), Some(Tok::Ident(_)))
-                    && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::LBrace)
-                {
+                // `let S { f, g: h } [: T] = e;` destructures a struct, and
+                // `let [a, b] [: T] = e;` destructures an array. The pattern is
+                // read by the same parser as a `match` pattern, but here it is
+                // irrefutable by construction, so the annotation goes on the
+                // scrutinee temporary below and the fields/elements are bound
+                // from it. `..` and `f: _` are the only way to drop fields.
+                let struct_pat = matches!(self.peek(), Some(Tok::Ident(_)))
+                    && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::LBrace);
+                if struct_pat || self.peek() == Some(&Tok::LBracket) {
                     if mutable {
                         return Err(format!(
                             "at byte {}: `mut` must be attached to each individual binding, as `S {{ mut f }}`",
@@ -1020,10 +1024,6 @@ impl Parser {
                         ));
                     }
                     let pat = self.parse_pattern_primary()?;
-                    let fields = match pat {
-                        Pat::Struct(_, fields) => fields,
-                        _ => unreachable!("`{{` follows the name, so this is a struct pattern"),
-                    };
                     let ty = if self.eat(&Tok::Colon) {
                         Some(self.parse_type()?)
                     } else {
@@ -1032,7 +1032,15 @@ impl Parser {
                     self.expect(Tok::Eq)?;
                     let init = self.parse_expr()?;
                     self.expect(Tok::Semi)?;
-                    out.extend(self.let_destructure_stmts(fields, ty, init));
+                    match pat {
+                        Pat::Struct(_, fields) => {
+                            out.extend(self.let_destructure_stmts(fields, ty, init))
+                        }
+                        Pat::Array { elems, rest, front } => {
+                            out.extend(self.let_destructure_array_stmts(elems, rest, front, ty, init))
+                        }
+                        _ => unreachable!("`{{` or `[` starts a destructuring pattern"),
+                    }
                     return Ok(());
                 }
                 let name = self.expect_ident()?;
@@ -1605,6 +1613,9 @@ impl Parser {
 
     fn parse_pattern_primary(&mut self) -> PResult<Pat> {
         match self.peek().cloned() {
+            // `[a, b, .., c]`: an array pattern. `[` cannot start a binding or a
+            // constant, so it is unambiguous here.
+            Some(Tok::LBracket) => self.parse_array_pat(),
             Some(Tok::Underscore) => {
                 self.i += 1;
                 Ok(Pat::Wild)
@@ -1805,6 +1816,123 @@ impl Parser {
         Ok(Some(Pat::Struct(name, fields)))
     }
 
+    /// `[a, b, .., c]`: an array pattern, with the opening `[` already peeked.
+    /// Each element is a sub-pattern; a single `..` matches any number of middle
+    /// elements and records how many elements precede it in `front`. rustc
+    /// allows `..` at most once per pattern, so a second one is rejected.
+    fn parse_array_pat(&mut self) -> PResult<Pat> {
+        self.i += 1; // the `[`
+        let mut elems: Vec<Option<(bool, Pat)>> = Vec::new();
+        let mut rest = false;
+        let mut front = 0usize;
+        while self.peek() != Some(&Tok::RBracket) {
+            if self.peek().is_none() {
+                return Err(format!(
+                    "at byte {}: unexpected end of input in array pattern",
+                    self.pos()
+                ));
+            }
+            if self.eat(&Tok::DotDot) {
+                if rest {
+                    return Err(format!(
+                        "at byte {}: `..` can only be used once per array pattern",
+                        self.pos()
+                    ));
+                }
+                rest = true;
+                front = elems.len();
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+                continue;
+            }
+            // `mut` may precede an element binding (`[mut a, b]`), as in rustc.
+            let m = self.eat(&Tok::Mut);
+            let p = self.parse_pattern_primary()?;
+            if m && !matches!(p, Pat::Bind(_)) {
+                return Err(format!(
+                    "at byte {}: `mut` is not allowed here; it attaches to a binding",
+                    self.pos()
+                ));
+            }
+            elems.push(Some((m, p)));
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(Tok::RBracket)?;
+        // Every element must be irrefutable: a refutable one (`[1, x]`) would
+        // need a per-element test, which rmc does not generate. Reject it here
+        // rather than mis-bind it as an always-true read.
+        if elems.iter().flatten().any(|(_, p)| !Self::pat_irrefutable(p)) {
+            return Err(format!(
+                "at byte {}: array pattern elements must be bindings, `_`, or nested patterns",
+                self.pos()
+            ));
+        }
+        // `elems` stays in source order; `front` separates the elements before
+        // `..` from those after it, and `array_pat_binds` reads the tail
+        // relative to the array's length.
+        Ok(Pat::Array { elems, rest, front })
+    }
+
+    /// The `let` statements an array pattern introduces: one per bound element,
+    /// each an index read of `subj` at that element's position. Shared by the
+    /// `let`, `for` and `match` paths. A `..` rest shifts the elements after it
+    /// to the back of the array: with `front` elements ahead and `k` behind, an
+    /// element at pattern index `j` reads array index `j` (j < front) or
+    /// `len - (k - (j - front))` (j >= front), where `len` is the array's length.
+    fn array_pat_binds(
+        &self,
+        elems: &[Option<(bool, Pat)>],
+        rest: bool,
+        front: usize,
+        subj: &Expr,
+    ) -> Vec<Stmt> {
+        let mut out = Vec::new();
+        for (j, elem) in elems.iter().enumerate() {
+            let (m, pat) = match elem {
+                Some(x) => x,
+                None => continue,
+            };
+            let idx = if !rest || j < front {
+                Expr::Int(j as i64)
+            } else {
+                let behind = elems.len() - front;
+                let from_end = behind - (j - front);
+                let len = Expr::MethodCall {
+                    recv: Box::new(subj.clone()),
+                    name: "len".to_string(),
+                    args: Vec::new(),
+                };
+                Expr::Bin(
+                    BinOp::Sub,
+                    Box::new(len),
+                    Box::new(Expr::Int(from_end as i64)),
+                )
+            };
+            let index = Expr::Index(Box::new(subj.clone()), Box::new(idx));
+            match pat {
+                // `_` matches an element without binding it: no read.
+                Pat::Wild => {}
+                Pat::Bind(name) => out.push(Stmt::Let {
+                    name: name.clone(),
+                    ty: None,
+                    mutable: *m,
+                    init: Some(index),
+                    slot: -1,
+                }),
+                Pat::Array { elems, rest, front } => {
+                    out.extend(self.array_pat_binds(elems, *rest, *front, &index))
+                }
+                // A struct sub-pattern inside an array element.
+                Pat::Struct(_, fields) => out.extend(Self::struct_pat_binds(fields, &index)),
+                _ => unreachable!("unexpected array sub-pattern"),
+            }
+        }
+        out
+    }
+
     /// `match scrutinee { pat => expr, ... }` on integers. It desugars to a
     /// chain of `if` comparisons, so sema and codegen need no new cases. A
     /// pattern is an integer literal (optionally negated) or `_`; the first arm
@@ -1931,6 +2059,10 @@ impl Parser {
             // A struct pattern always matches: it binds the named fields and
             // ignores the rest, with no test, so an arm using one is a catch-all.
             Pat::Wild | Pat::Bind(_) | Pat::Struct(..) => true,
+            // An array pattern matches when every element pattern does.
+            Pat::Array { elems, .. } => elems
+                .iter()
+                .all(|e| e.as_ref().map_or(true, |(_, p)| Self::pat_irrefutable(p))),
             Pat::Or(alts) => alts.iter().any(Self::pat_irrefutable),
             _ => false,
         }
@@ -2078,8 +2210,11 @@ impl Parser {
             // A struct pattern is likewise always true; a binding one is
             // rejected before this point.
             Pat::Wild | Pat::Struct(..) => Expr::Bool(true),
-            // A binding inside an or-pattern is rejected before this point.
-            Pat::Bind(_) | Pat::Or(_) => unreachable!("or-pattern alternative"),
+            // A binding inside an or-pattern is rejected before this point; an
+            // array pattern is not supported as an or-alternative.
+            Pat::Bind(_) | Pat::Or(_) | Pat::Array { .. } => {
+                unreachable!("or-pattern alternative")
+            }
         }
     }
 
@@ -2096,25 +2231,50 @@ impl Parser {
         ty: Option<Type>,
         init: Expr,
     ) -> Vec<Stmt> {
-        let mut out = Vec::new();
-        let subj = if ty.is_none()
+        let (mut out, subj) = self.let_destructure_prelude(ty, init);
+        out.extend(Self::struct_pat_binds(&fields, &subj));
+        out
+    }
+
+    /// The same expansion for an array pattern: bind the scrutinee to a hidden
+    /// temporary (unless it is already a plain place) and read each named
+    /// element out of it. The temporary carries the annotation, so `let [a, b]:
+    /// [i64; 2] = e;` is still checked.
+    fn let_destructure_array_stmts(
+        &mut self,
+        elems: Vec<Option<(bool, Pat)>>,
+        rest: bool,
+        front: usize,
+        ty: Option<Type>,
+        init: Expr,
+    ) -> Vec<Stmt> {
+        let (mut out, subj) = self.let_destructure_prelude(ty, init);
+        out.extend(self.array_pat_binds(&elems, rest, front, &subj));
+        out
+    }
+
+    /// The hidden scrutinee a `let` destructuring binds from: the initializer
+    /// itself when it is a plain place with no annotation to carry, otherwise a
+    /// fresh temporary that holds it (so the initializer's side effects run
+    /// once and the annotation is checked against the value). Shared by the
+    /// struct and array destructuring paths.
+    fn let_destructure_prelude(&mut self, ty: Option<Type>, init: Expr) -> (Vec<Stmt>, Expr) {
+        if ty.is_none()
             && matches!(init, Expr::Var { .. } | Expr::Int(_) | Expr::EnumVariant { .. })
         {
-            init
+            (Vec::new(), init)
         } else {
             let tmp = format!("\u{0}lp{}", self.tmp);
             self.tmp += 1;
-            out.push(Stmt::Let {
+            let stmt = Stmt::Let {
                 name: tmp.clone(),
                 ty,
                 init: Some(init),
                 slot: -1,
                 mutable: false,
-            });
-            Expr::Var { name: tmp, slot: -1, ty: Type::I64 }
-        };
-        out.extend(Self::struct_pat_binds(&fields, &subj));
-        out
+            };
+            (vec![stmt], Expr::Var { name: tmp, slot: -1, ty: Type::I64 })
+        }
     }
 
     /// The `let` statements a struct pattern introduces: one per bound field,
@@ -2164,6 +2324,9 @@ impl Parser {
             Pat::Struct(_, fields) => fields.iter().find_map(|(_, b)| {
                 b.as_ref().and_then(|(_, sub)| Self::first_bound_name(sub))
             }),
+            Pat::Array { elems, .. } => elems
+                .iter()
+                .find_map(|e| e.as_ref().and_then(|(_, p)| Self::first_bound_name(p))),
             Pat::Or(alts) => alts.iter().find_map(Self::first_bound_name),
             _ => None,
         }
@@ -2192,6 +2355,12 @@ impl Parser {
             // already checked against the prescan, so `f: _` (which emits no
             // read) is validated too.
             Pat::Struct(_name, fields) => (Self::struct_pat_binds(&fields, &subj), None),
+            // `[a, b] => body` is irrefutable in the same way: it binds each
+            // named element via an index read, with no test. A `..` rest shifts
+            // the trailing bindings to the back of the array.
+            Pat::Array { elems, rest, front } => {
+                (self.array_pat_binds(&elems, rest, front, &subj), None)
+            }
             // `name => body` binds the whole scrutinee.
             Pat::Bind(name) => (
                 vec![Stmt::Let {
@@ -2645,6 +2814,14 @@ enum Pat {
     /// `desugar_arm` and `let` destructuring). The struct name is resolved by
     /// sema, so it may name a struct declared later in the file.
     Struct(String, Vec<FieldPat>),
+    /// `[a, b, .., c]`: an array pattern. Each element is a sub-pattern with its
+    /// own `mut` flag (`[mut a, b]`); `None` marks the single `..` rest, which
+    /// matches any number of middle elements. `front` counts the elements
+    /// before the rest (and, with no rest, is the element count). Irrefutable
+    /// when every element pattern is, so a `for` or `let` may use one; a `match`
+    /// arm using one has no test. Desugars to the indexed reads its bindings
+    /// name.
+    Array { elems: Vec<Option<(bool, Pat)>>, rest: bool, front: usize },
 }
 
 /// One field of a struct pattern: its name and what it binds. `None` is

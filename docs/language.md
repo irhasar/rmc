@@ -211,6 +211,9 @@ let x: i64 = 1;          // immutable binding
 let mut y: i64 = 0;      // mutable binding
 let S { a, b: c, .. } = s;  // struct destructuring: bind `a` and `c`
 let S { mut a, b }: S = s;  // per-binding `mut`, optional annotation
+let [a, b] = arr;        // array destructuring: bind `a` = arr[0], `b` = arr[1]
+let [x, _, .., z] = arr; // `_` ignores an element, `..` absorbs the middle
+let [mut a, b] = arr;    // per-element `mut`, optional annotation
 let _ = e;               // discard: evaluate `e` for side effects, bind nothing
 let _: T;                // annotated discard, no initialiser (a no-op)
 y = y + 1;               // assignment (target may be a variable, array element or field)
@@ -253,6 +256,20 @@ pattern (`let S { x, y }: S = e;`) is checked against it. `mut` is per binding â
 rejected (`mut` must be attached to each individual binding, as in rustc).
 A struct-typed field may be destructured by a nested sub-pattern
 (`let S { a: I { x } } = e;`); see Struct patterns for the full field grammar.
+A `let [a, b, .., c] = e;` destructures an array the same way: each named element
+is bound as a fresh local in the enclosing block, the scrutinee is evaluated
+exactly once, and a type annotation after the pattern (`let [x, y]: [i64; 2] =
+e;`) is checked against it. The expansion is one index read per element, so
+`let [a, b] = e;` lowers to exactly `let a = e[0]; let b = e[1];`. A `_` element
+binds nothing, `mut` is per element (`let [mut a, b] = e;`), and a single `..`
+absorbs any number of middle elements â€” its trailing bindings read relative to
+the array's length, so `let [x, .., z] = a;` binds `a[0]` and `a[a.len() - 1]`
+(the latter folds to the constant length). Elements may be nested array or
+struct patterns to any depth. An element pattern must be irrefutable, so a
+literal element (`let [1, y] = a;`) is rejected rather than mis-bound; a
+two-`..` pattern, an out-of-range fixed index, and `mut` on a non-binding are
+rejected too. Array patterns are also accepted in `match`, `if let` and `while
+let` arms, and as a `for` head (`for [x, y] in pairs`), with the same grammar.
 A `let` or parameter without `mut` is
 immutable: assigning it (rustc's `E0384`), assigning a field or element of it
 (`E0594`), or taking `&mut` of it (`E0596`) is rejected. Add `mut` (or `mut x:
@@ -266,8 +283,9 @@ once, before the loop; `continue` still runs the increment. `for x in arr`
 iterates an array by value: the head is evaluated once, the bound is the
 array's compile-time length, and `x` is a fresh immutable binding each
 iteration. The loop variable may be a binding, `_`, or a struct pattern
-(`for S { f, .. } in arr`), which binds each element's fields fresh each
-iteration; any other pattern is refutable and rejected. `for x in &arr`
+(`for S { f, .. } in arr`), an array pattern (`for [x, y] in pairs`), which binds
+each element's fields or elements fresh each iteration; any other pattern is
+refutable and rejected. `for x in &arr`
 (which Rust iterates by reference) is rejected rather than mistyped. `while let` is
 `loop { if let PAT = expr { body } else { break; } }`: the scrutinee is
 re-evaluated every iteration, and `continue` re-tests it rather than jumping to
@@ -437,16 +455,32 @@ compile-time constant is decided at compile time, not by the trap.
   field read may auto-deref a `&S` scrutinee, and a struct-typed field may be
   destructured by a nested sub-pattern (`let S { a: I { x } } = e;`), which
   expands to a chain of field reads.
-- `for` destructuring: `for S { f, g: h, i: _, .. } in arr { .. }` iterates the
-  array as above but destructures each element with the same struct-pattern
-  grammar, binding the named fields fresh each iteration. The array head is
-  evaluated once, outside the loop. `break`/`continue` and a label behave as for
-  any other `for`. The pattern must be irrefutable, so only a binding, `_` or a
-  struct pattern is allowed; `mut` goes on each binding, as in `let`
-  destructuring.
+- Array patterns: `[a, b, .., c]` matches an array and binds its elements. Each
+  element is a sub-pattern: a binding (`a`), an ignored element (`_`), or a
+  nested array or struct pattern (`[[p, q], s]`, `[P { x }, y]`). A single `..`
+  absorbs any number of middle elements, so `[first, ..]`, `[.., last]` and
+  `[x, .., z]` all work; a second `..` is rejected. An element may be made
+  mutable with `mut` on the binding (`[mut a, b]`), not on the pattern as a
+  whole (`let mut [a, b] = e;` is rejected, as in rustc). An array pattern is
+  *irrefutable* when every element pattern is, so it has no runtime test and
+  acts as a catch-all: it works in `let` (`let [a, b] = e;`), `for`
+  (`for [x, y] in pairs`), `match` (`match m { [a, b] => .. }`), `if let` and
+  `while let`. It expands to one index read per element, so a fixed element `j`
+  reads `subj[j]` and a trailing element reads `subj[subj.len() - k]` relative to
+  the array's length. An element pattern must be irrefutable: a literal element
+  (`[1, y]`) is rejected rather than mis-bound. An array pattern that binds
+  nothing (`[_, _]`, `[..]`) is accepted and still evaluates the scrutinee once.
+- `for` destructuring: `for S { f, g: h, i: _, .. } in arr { .. }` or
+  `for [x, y] in arr { .. }` iterates the array as above but destructures each
+  element with the same struct- or array-pattern grammar, binding the named
+  fields or elements fresh each iteration. The array head is evaluated once,
+  outside the loop. `break`/`continue` and a label behave as for any other
+  `for`. The pattern must be irrefutable, so only a binding, `_`, a struct
+  pattern or an array pattern is allowed; `mut` goes on each binding, as in
+  `let` destructuring.
 - `if let PAT = EXPR { .. } else { .. }`, sugar for
   `match EXPR { PAT => then, _ => else_or_unit }`. It reuses the `match` pattern
-  grammar (including or-patterns, ranges and struct patterns,
+  grammar (including or-patterns, ranges, struct patterns and array patterns,
   `if let 1..=5 = x`), but unlike
   `match` it need not be exhaustive: a non-matching value
   falls through to the `_` arm. An `else` is optional; with none and a non-unit

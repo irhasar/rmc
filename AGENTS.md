@@ -50,6 +50,7 @@ python3 tools/fuzz.py --mode update --n 500 --seed 1
 python3 tools/fuzz.py --mode letdestr --n 500 --seed 1
 python3 tools/fuzz.py --mode fordestr --n 500 --seed 1
 python3 tools/fuzz.py --mode nestpat --n 500 --seed 1
+python3 tools/fuzz.py --mode arrpat --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 ```
 
@@ -124,6 +125,28 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   the enclosing block. `let mut S { .. }` is rejected (rustc's "`mut` must be
   attached to each individual binding"); a type annotation goes on the temporary.
   No sema or codegen case.
+  *Array patterns* `[a, b, .., c]` are the third irrefutable aggregate pattern,
+  alongside struct patterns: `Pat::Array { elems, rest, front }` is parsed by
+  `parse_array_pat` (`[` is routed from `parse_pattern_primary`) and desugared by
+  `array_pat_binds` into one `let` per bound element whose initialiser is
+  `Expr::Index { base: scrutinee, index: .. }`, which sema already types, bounds
+  checks and locates. No sema or codegen case. `elems` stays in source order and
+  is `Option<(bool, Pat)>` per element (`None` only for the `..` slot the builder
+  skips): `front` counts the elements before `..`, and an element at pattern
+  index `j` reads `subj[j]` when `j < front` (or with no rest) and
+  `subj[subj.len() - (behind - (j - front))]` otherwise, so a trailing binding
+  reads relative to the length (which folds to the constant, see `sema`'s
+  `arr.len()`). An element may be `_` (no read), a `mut` binding (the per-element
+  `mut` flag), or a nested array/struct sub-pattern (recursion, with the index
+  read as the sub-scrutinee). `parse_array_pat` rejects a second `..`, `mut` on a
+  non-binding, and any *refutable* element (`[1, y]`) — the last would need a
+  per-element test rmc does not generate, so it is rejected rather than
+  mis-bound. The pattern is irrefutable when every element is, so it joins
+  `pat_irrefutable`, `first_bound_name` (recursing so a binding element in an
+  or-pattern is still rejected) and the `let`/`for`/`match`/`if let` paths through
+  `let_destructure_array_stmts` (the `let_destructure_prelude` helper shares the
+  hidden-scrutinee logic with the struct path). `or_cond` does not treat it as
+  true: an array pattern is not a supported or-alternative.
   An arm may carry a *guard*, `PAT if COND => body`. `parse_match` reads the
   optional `if COND` after the pattern (`parse_cond`, so a struct literal needs
   parentheses) and threads it through `desugar_arm` as an `Option<Expr>`. The

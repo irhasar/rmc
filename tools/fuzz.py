@@ -1324,6 +1324,113 @@ def gen_nestpat_program(rng):
     return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
 
 
+def _array_pat(rng, n, prefix):
+    """A random array pattern over `n` elements. Returns the pattern text and the
+    bindings as `(name, mutable, index)` triples, `index` the element each name
+    reads. A `..` rest may appear, in which case only the elements before and
+    after it are written and the middle is absorbed; the trailing elements read
+    relative to `n`. An element may be ignored with `_` and a binding may be
+    `mut`. At least the index of every binding is fixed here, so the caller can
+    check each name against the element it must read.
+    """
+    has_rest = n >= 2 and rng.random() < 0.5
+    if has_rest:
+        front = rng.randint(0, n)
+        behind = rng.randint(0, n - front)
+        written = list(range(front)) + list(range(n - behind, n))
+    else:
+        written = list(range(n))
+    slots = {}
+    binds = []
+    for idx in written:
+        if rng.random() < 0.25:
+            slots[idx] = "_"
+        else:
+            nm = f"{prefix}{idx}"
+            mutable = rng.random() < 0.5
+            slots[idx] = f"mut {nm}" if mutable else nm
+            binds.append((nm, mutable, idx))
+    if not has_rest:
+        tokens = [slots[i] for i in range(n)]
+    else:
+        tokens = [slots[i] for i in range(front)] + [".."] + [slots[i] for i in range(n - behind, n)]
+    return "[ " + ", ".join(tokens) + " ]", binds
+
+
+def gen_arrpat_program(rng):
+    """Array destructuring patterns, `let [a, b, .., c] = arr`, in `let`, `match`,
+    `if let` and `for`. The expansion is one index read per bound element, with a
+    `..` rest reading its trailing bindings relative to `arr.len()`. The check is
+    that every name reads the right element: a wrong rest offset, a shifted index
+    or a leaked `mut` write shows up as a wrong final value. The array is built
+    from a call result, so its elements are not constants and no read is folded
+    away. No other mode emits an array pattern.
+    """
+    b = rng.randint(1, 9)
+    n = rng.randint(2, 4)
+    lit = ", ".join(f"s + {i}" for i in range(n))
+
+    rms = [
+        "fn mk(n: i64) -> i64 { print_i64(n); return n; }",
+        "fn main() -> i64 {",
+        "    let mut acc: i64 = 0;",
+        f"    let s: i64 = mk({b});",
+        f"    let arr: [i64; {n}] = [{lit}];",
+    ]
+    rs = [
+        'fn mk(n: i64) -> i64 { println!("{}", n); n }',
+        "fn main() {",
+        "    let mut acc: i64 = 0;",
+        f"    let s: i64 = mk({b});",
+        f"    let arr: [i64; {n}] = [{lit}];",
+    ]
+
+    def emit(indent, binds, w0):
+        for (name, mutable, _idx) in binds:
+            if mutable:
+                rms.append(f"{indent}{name} = {name} + {b};")
+                rs.append(f"{indent}{name} += {b};")
+        if binds:
+            terms = " + ".join(f"{nm} * {w0 + i}" for i, (nm, _m, _x) in enumerate(binds))
+            rms.append(f"{indent}acc = acc + {terms};")
+            rs.append(f"{indent}acc += {terms};")
+        else:
+            rms.append(f"{indent}acc = acc + 1;")
+            rs.append(f"{indent}acc += 1;")
+
+    pat, binds = _array_pat(rng, n, "L")
+    rms.append(f"    let {pat} = arr;")
+    rs.append(f"    let {pat} = arr;")
+    emit("    ", binds, 2)
+
+    pat, binds = _array_pat(rng, n, "M")
+    rms.append(f"    match arr {{ {pat} => {{")
+    rs.append(f"    match arr {{ {pat} => {{")
+    emit("        ", binds, 2)
+    rms.append("    } }")
+    rs.append("    } }")
+
+    pat, binds = _array_pat(rng, n, "I")
+    rms.append(f"    if let {pat} = arr {{")
+    rs.append(f"    if let {pat} = arr {{")
+    emit("        ", binds, 2)
+    rms.append("    }")
+    rs.append("    }")
+
+    # `for` over an array of 2-element arrays, destructuring each element.
+    rows = ", ".join(f"[s + {10 * r}, s + {10 * r + 1}]" for r in range(3))
+    rms.append(f"    let rows: [[i64; 2]; 3] = [{rows}];")
+    rs.append(f"    let rows: [[i64; 2]; 3] = [{rows}];")
+    pat, binds = _array_pat(rng, 2, "F")
+    rms.append(f"    for {pat} in rows {{")
+    rs.append(f"    for {pat} in rows {{")
+    emit("        ", binds, 3)
+
+    rms += ["    }", "    print_i64(acc);", "    return 0;", "}"]
+    rs += ["    }", '    println!("{}", acc);', "}"]
+    return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
+
+
 def gen_ref_program(rng):
     """A program built from references (`&T` / `&mut T`), which no other mode
     exercises. A reference is one word holding an address, so `*r = v` writes
@@ -2380,7 +2487,7 @@ def run_reject():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "robust", "reject"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "robust", "reject"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -2425,7 +2532,8 @@ def main():
            "ref": gen_ref_program, "update": gen_update_program,
            "letdestr": gen_letdestr_program,
            "fordestr": gen_fordestr_program,
-           "nestpat": gen_nestpat_program}[args.mode]
+           "nestpat": gen_nestpat_program,
+           "arrpat": gen_arrpat_program}[args.mode]
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus
     # suite; a fuzz program is otherwise only checked with every pass on, so a
