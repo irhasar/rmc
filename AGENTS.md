@@ -110,7 +110,12 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   too. `struct_pat_binds` recurses with the field read as the sub-scrutinee, so a
   nested name expands to an ordinary chain of field reads (`s.a.x`) and sema and
   codegen gain no case; `mut` is rejected on a sub-pattern, since it only applies
-  to a binding. `first_bound_name` walks the pattern (through struct and or
+  to a binding. A field whose type is an array may also be destructured by an
+  array sub-pattern, `S { a: [x, y], b }`: `struct_pat_binds` recurses into
+  `array_pat_binds` with the field read as the sub-scrutinee, so the field read
+  and the index read compose (`s.a[0]`) and the two nesting directions (a struct
+  inside an array element, an array inside a struct field) both work.
+  `first_bound_name` walks the pattern (through struct and or
   alternatives) to keep rejecting a binding in an or-pattern (rustc's E0408) one
   level down. A struct pattern is a catch-all arm, so it joins
   `pat_irrefutable`, and `or_cond` treats it as `true` (a *binding* struct

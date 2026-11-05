@@ -1753,11 +1753,21 @@ impl Parser {
                     // `f: mut I { a }`.
                     if m {
                         return Err(format!(
-                            "at byte {}: `mut` is not allowed on a nested struct pattern",
+                            "at byte {}: `mut` is not allowed on a nested pattern",
                             self.pos()
                         ));
                     }
                     Some((false, inner))
+                } else if self.peek() == Some(&Tok::LBracket) {
+                    // `f: [x, y]` — a nested array pattern for an array-typed
+                    // field; `mut` is likewise rejected.
+                    if m {
+                        return Err(format!(
+                            "at byte {}: `mut` is not allowed on a nested pattern",
+                            self.pos()
+                        ));
+                    }
+                    Some((false, self.parse_array_pat()?))
                 } else {
                     Some((m, Pat::Bind(self.expect_ident()?)))
                 }
@@ -1871,7 +1881,6 @@ impl Parser {
     /// element at pattern index `j` reads array index `j` (j < front) or
     /// `len - (k - (j - front))` (j >= front), where `len` is the array's length.
     fn array_pat_binds(
-        &self,
         elems: &[Option<(bool, Pat)>],
         rest: bool,
         front: usize,
@@ -1911,7 +1920,7 @@ impl Parser {
                     slot: -1,
                 }),
                 Pat::Array { elems, rest, front } => {
-                    out.extend(self.array_pat_binds(elems, *rest, *front, &index))
+                    out.extend(Self::array_pat_binds(elems, *rest, *front, &index))
                 }
                 // A struct sub-pattern inside an array element.
                 Pat::Struct(_, fields) => out.extend(Self::struct_pat_binds(fields, &index)),
@@ -2237,7 +2246,7 @@ impl Parser {
         init: Expr,
     ) -> Vec<Stmt> {
         let (mut out, subj) = self.let_destructure_prelude(ty, init);
-        out.extend(self.array_pat_binds(&elems, rest, front, &subj));
+        out.extend(Self::array_pat_binds(&elems, rest, front, &subj));
         out
     }
 
@@ -2295,7 +2304,12 @@ impl Parser {
                     slot: -1,
                 }),
                 Pat::Struct(_, inner) => out.extend(Self::struct_pat_binds(inner, &field)),
-                // Only a binding or a nested struct pattern is parsed here.
+                // An array-typed field may be destructured by an array pattern.
+                Pat::Array { elems, rest, front } => {
+                    out.extend(Self::array_pat_binds(elems, *rest, *front, &field))
+                }
+                // Only a binding, a nested struct pattern or a nested array
+                // pattern is parsed here.
                 _ => unreachable!("unexpected struct sub-pattern"),
             }
         }
@@ -2347,7 +2361,7 @@ impl Parser {
             // named element via an index read, with no test. A `..` rest shifts
             // the trailing bindings to the back of the array.
             Pat::Array { elems, rest, front } => {
-                (self.array_pat_binds(&elems, rest, front, &subj), None)
+                (Self::array_pat_binds(&elems, rest, front, &subj), None)
             }
             // `name => body` binds the whole scrutinee.
             Pat::Bind(name) => (

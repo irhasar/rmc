@@ -163,8 +163,9 @@ the same pattern grammar as `let`), `nestpat` for nested struct sub-patterns
 (a chain of struct types so the pattern nests several levels deep, exercised in
 `let`, `match`, `if let` and `for`), `arrpat` for array destructuring patterns
 (`let [a, b, .., c] = arr`, `for [x, y] in pairs`, `match`/`if let` arms, with
-`_` elements, `mut` bindings, nested and struct element patterns, and `..` rests
-in every position), and `order` for assignment evaluation order (a
+`_` elements, `mut` bindings, nested and struct element patterns, `..` rests
+in every position, and an array-typed struct field destructured in place), and
+`order` for assignment evaluation order (a
 side-effecting index and value on both `=` and every compound operator, the
 shapes `stmt` never assigns through). `shift` drives `<<`, `>>` and the compound
 `<<=`/`>>=` with a shift count from `argv`, so the count is opaque to the
@@ -230,7 +231,8 @@ Supported: `i64`, `bool`, `str`, fixed-size arrays, and structs with named field
 `let P { x, y: z, .. } = p;`, `for` destructuring
 `for P { x, y: z, .. } in arr { .. }`, and array patterns
 `[a, b, .., c]` (in `let`/`for`/`match`/`if let`, with `_`, `mut`, nested
-patterns and `..` rests));
+patterns and `..` rests, also usable on an array-typed struct field,
+`let P { a: [x, y], .. } = p;`));
 functions with up to six parameters; `let` / `let mut` / `let _` (discard); assignment to variables,
 array elements and struct fields (including compound `+=` and friends);
 `if`/`else`, `while`, `loop`, `for i in a..b` / `a..=b` and `for x in arr`

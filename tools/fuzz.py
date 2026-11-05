@@ -1351,32 +1351,70 @@ def _array_pat(rng, n, prefix):
     return "[ " + ", ".join(tokens) + " ]", binds
 
 
+def _struct_arr_field_pat(rng, n, prefix):
+    """A struct pattern `S { a: [..], b }` whose array-typed field `a` is
+    destructured by a random array pattern. Returns the pattern text, the array
+    element bindings as `(name, mutable, index)` triples, and the scalar field
+    bindings as `(name, mutable, field)` triples.
+    """
+    apat, abinds = _array_pat(rng, n, prefix + "A")
+    tokens = [f"a: {apat}"]
+    fbind = []
+    r = rng.random()
+    if r < 0.2:
+        tokens.append("b: _")
+    elif r < 0.5:
+        tokens.append("b")
+        fbind.append(("b", False, "b"))
+    elif r < 0.7:
+        nm = prefix + "b"
+        tokens.append(f"b: {nm}")
+        fbind.append((nm, False, "b"))
+    elif r < 0.85:
+        nm = prefix + "b"
+        tokens.append(f"b: mut {nm}")
+        fbind.append((nm, True, "b"))
+    else:
+        tokens.append("..")
+    if ".." not in tokens and rng.random() < 0.4:
+        tokens.append("..")
+    return "S { " + ", ".join(tokens) + " }", abinds, fbind
+
+
 def gen_arrpat_program(rng):
     """Array destructuring patterns, `let [a, b, .., c] = arr`, in `let`, `match`,
-    `if let` and `for`. The expansion is one index read per bound element, with a
-    `..` rest reading its trailing bindings relative to `arr.len()`. The check is
-    that every name reads the right element: a wrong rest offset, a shifted index
-    or a leaked `mut` write shows up as a wrong final value. The array is built
-    from a call result, so its elements are not constants and no read is folded
-    away. No other mode emits an array pattern.
+    `if let` and `for`, plus an array-typed struct field destructured in place
+    (`S { a: [x, y], b }`). The expansion is one index read per bound element,
+    with a `..` rest reading its trailing bindings relative to `arr.len()`. The
+    check is that every name reads the right element: a wrong rest offset, a
+    shifted index or a leaked `mut` write shows up as a wrong final value. The
+    array is built from a call result, so its elements are not constants and no
+    read is folded away. No other mode emits an array pattern.
     """
     b = rng.randint(1, 9)
     n = rng.randint(2, 4)
+    n_s = rng.randint(2, 4)
     lit = ", ".join(f"s + {i}" for i in range(n))
+    slit = ", ".join(f"s + {100 + i}" for i in range(n_s))
 
     rms = [
         "fn mk(n: i64) -> i64 { print_i64(n); return n; }",
+        f"struct SA {{ a: [i64; {n_s}], b: i64 }}",
         "fn main() -> i64 {",
         "    let mut acc: i64 = 0;",
         f"    let s: i64 = mk({b});",
         f"    let arr: [i64; {n}] = [{lit}];",
+        f"    let sv: SA = SA {{ a: [{slit}], b: s + {50} }};",
     ]
     rs = [
         'fn mk(n: i64) -> i64 { println!("{}", n); n }',
+        "#[derive(Copy, Clone)]",
+        f"struct SA {{ a: [i64; {n_s}], b: i64 }}",
         "fn main() {",
         "    let mut acc: i64 = 0;",
         f"    let s: i64 = mk({b});",
         f"    let arr: [i64; {n}] = [{lit}];",
+        f"    let sv: SA = SA {{ a: [{slit}], b: s + {50} }};",
     ]
 
     def emit(indent, binds, w0):
@@ -1419,9 +1457,26 @@ def gen_arrpat_program(rng):
     rms.append(f"    for {pat} in rows {{")
     rs.append(f"    for {pat} in rows {{")
     emit("        ", binds, 3)
+    rms.append("    }")
+    rs.append("    }")
 
-    rms += ["    }", "    print_i64(acc);", "    return 0;", "}"]
-    rs += ["    }", '    println!("{}", acc);', "}"]
+    # An array-typed struct field destructured in place, in `let` and `match`.
+    spat, abinds, fbind = _struct_arr_field_pat(rng, n_s, "P")
+    allbinds = abinds + [(nm, mu, 0) for (nm, mu, _f) in fbind]
+    rms.append(f"    let {spat} = sv;")
+    rs.append(f"    let {spat} = sv;")
+    emit("    ", allbinds, 2)
+
+    spat, abinds, fbind = _struct_arr_field_pat(rng, n_s, "Q")
+    allbinds = abinds + [(nm, mu, 0) for (nm, mu, _f) in fbind]
+    rms.append(f"    match sv {{ {spat} => {{")
+    rs.append(f"    match sv {{ {spat} => {{")
+    emit("        ", allbinds, 2)
+    rms.append("    } }")
+    rs.append("    } }")
+
+    rms += ["    print_i64(acc);", "    return 0;", "}"]
+    rs += ['    println!("{}", acc);', "}"]
     return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
 
 
@@ -1996,6 +2051,16 @@ def robust_corpus():
         "nested_pat_missing_brace": b"struct I { x: i64 } struct S { a: I } fn main() -> i64 { let s: S = S { a: I { x: 1 } }; let S { a: I x } = s; return 0; }",
         "nested_pat_deep": b"struct S { a: S } fn main() -> i64 { let s: S = S { a: s }; "
             + b"let S { a: " * 3000 + b"S { .. }" + b" }" * 3000 + b" = s; return 0; }",
+        # An array pattern recurses through the same parser, both at the top
+        # level and as a struct field's sub-pattern, so a malformed or deeply
+        # nested one must error cleanly rather than overflow the stack.
+        "deep_array_pattern": b"struct S { a: [S; 1] } fn main() -> i64 { let s: S = S { a: s }; "
+            + b"let [S { a: " * 3000 + b"[_]" + b" }] " * 3000 + b"= s; return 0; }",
+        "unterminated_array_pattern": b"struct S { a: [i64; 2] } fn main() -> i64 { let s: S = S { a: [1, 2] }; let S { a: [x, ",
+        "array_pattern_two_rests": b"fn main() -> i64 { let a: [i64; 3] = [1, 2, 3]; let [.., x, ..] = a; return x; }",
+        "array_pattern_refutable_element": b"fn main() -> i64 { let a: [i64; 2] = [1, 2]; let [1, y] = a; return y; }",
+        "struct_array_field_mut_nested": b"struct S { a: [i64; 2] } fn main() -> i64 { let s: S = S { a: [1, 2] }; let S { a: mut [x, y] } = s; return x; }",
+        "struct_array_field_two_rests": b"struct S { a: [i64; 3] } fn main() -> i64 { let s: S = S { a: [1, 2, 3] }; let S { a: [.., x, ..] } = s; return x; }",
     }
     return cases
 
@@ -2404,6 +2469,30 @@ def reject_corpus():
             "fn main() -> i64 { let s: S = S { a: I { x: 1 } }; let S { a: mut I { x } } = s; return x; }\n",
             "struct I { x: i64 } struct S { a: I }\n"
             "fn main() { let s = S { a: I { x: 1 } }; let S { a: mut I { x } } = s; let _ = x; }\n",
+        ),
+        "struct_arr_field_mut_on_nested": (
+            "struct S { a: [i64; 2] }\n"
+            "fn main() -> i64 { let s: S = S { a: [1, 2] }; let S { a: mut [x, y] } = s; return x; }\n",
+            "struct S { a: [i64; 2] }\n"
+            "fn main() { let s = S { a: [1, 2] }; let S { a: mut [x, y] } = s; let _ = x; }\n",
+        ),
+        "struct_arr_field_refutable_element": (
+            "struct S { a: [i64; 2] }\n"
+            "fn main() -> i64 { let s: S = S { a: [1, 2] }; let S { a: [1, y] } = s; return y; }\n",
+            "struct S { a: [i64; 2] }\n"
+            "fn main() { let s = S { a: [1, 2] }; let S { a: [1, y] } = s; let _ = y; }\n",
+        ),
+        "struct_arr_field_out_of_range": (
+            "struct S { a: [i64; 2] }\n"
+            "fn main() -> i64 { let s: S = S { a: [1, 2] }; let S { a: [x, y, z] } = s; return x; }\n",
+            "struct S { a: [i64; 2] }\n"
+            "fn main() { let s = S { a: [1, 2] }; let S { a: [x, y, z] } = s; let _ = x; }\n",
+        ),
+        "struct_arr_field_unknown_field": (
+            "struct S { a: [i64; 2] }\n"
+            "fn main() -> i64 { let s: S = S { a: [1, 2] }; let S { z: [x, y] } = s; return x; }\n",
+            "struct S { a: [i64; 2] }\n"
+            "fn main() { let s = S { a: [1, 2] }; let S { z: [x, y] } = s; let _ = x; }\n",
         ),
     }
 

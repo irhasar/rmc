@@ -214,6 +214,7 @@ let S { mut a, b }: S = s;  // per-binding `mut`, optional annotation
 let [a, b] = arr;        // array destructuring: bind `a` = arr[0], `b` = arr[1]
 let [x, _, .., z] = arr; // `_` ignores an element, `..` absorbs the middle
 let [mut a, b] = arr;    // per-element `mut`, optional annotation
+let S { a: [x, y], b } = s; // array-typed field destructured in place
 let _ = e;               // discard: evaluate `e` for side effects, bind nothing
 let _: T;                // annotated discard, no initialiser (a no-op)
 y = y + 1;               // assignment (target may be a variable, array element or field)
@@ -255,7 +256,8 @@ pattern (`let S { x, y }: S = e;`) is checked against it. `mut` is per binding â
 `let S { mut x, y: mut z } = e;` is accepted, `let mut S { .. } = e;` is
 rejected (`mut` must be attached to each individual binding, as in rustc).
 A struct-typed field may be destructured by a nested sub-pattern
-(`let S { a: I { x } } = e;`); see Struct patterns for the full field grammar.
+(`let S { a: I { x } } = e;`), and an array-typed field by an array pattern
+(`let S { a: [x, y], b } = e;`); see Struct patterns for the full field grammar.
 A `let [a, b, .., c] = e;` destructures an array the same way: each named element
 is bound as a fresh local in the enclosing block, the scrutinee is evaluated
 exactly once, and a type annotation after the pattern (`let [x, y]: [i64; 2] =
@@ -438,8 +440,12 @@ compile-time constant is decided at compile time, not by the trap.
   it may auto-deref a `&S` scrutinee. A struct-typed field may itself be
   destructured by a nested struct sub-pattern, `i: I { a }` (to any depth), which
   expands to a chain of field reads; the sub-pattern binds its own fields and may
-  use shorthand, renames, `_` and `..` like the top level. `mut` attaches to a
-  binding, so `i: mut I { a }` is rejected, as in rustc. An enum payload pattern,
+  use shorthand, renames, `_` and `..` like the top level. An array-typed field
+  may likewise be destructured by an array pattern, `a: [x, y]`, whose elements
+  may in turn be struct patterns, so the two nesting directions compose. `mut`
+  attaches to a
+  binding, so `i: mut I { a }` and `a: mut [x, y]` are rejected, as in rustc. An
+  enum payload pattern,
   by contrast, still only binds whole fields. A wrong field name is an error,
   even for `i: _`, and a field bound twice is an error. Because a struct pattern
   is irrefutable, a *binding* struct pattern in an or-pattern is rejected, as is
@@ -454,7 +460,9 @@ compile-time constant is decided at compile time, not by the trap.
   binding), while `let S { mut x, y: mut z } = e;` is accepted. As in `match`, a
   field read may auto-deref a `&S` scrutinee, and a struct-typed field may be
   destructured by a nested sub-pattern (`let S { a: I { x } } = e;`), which
-  expands to a chain of field reads.
+  expands to a chain of field reads; an array-typed field may be destructured by
+  an array pattern (`let S { a: [x, y] } = e;`), which expands to field reads
+  followed by index reads.
 - Array patterns: `[a, b, .., c]` matches an array and binds its elements. Each
   element is a sub-pattern: a binding (`a`), an ignored element (`_`), or a
   nested array or struct pattern (`[[p, q], s]`, `[P { x }, y]`). A single `..`
@@ -465,10 +473,12 @@ compile-time constant is decided at compile time, not by the trap.
   *irrefutable* when every element pattern is, so it has no runtime test and
   acts as a catch-all: it works in `let` (`let [a, b] = e;`), `for`
   (`for [x, y] in pairs`), `match` (`match m { [a, b] => .. }`), `if let` and
-  `while let`. It expands to one index read per element, so a fixed element `j`
-  reads `subj[j]` and a trailing element reads `subj[subj.len() - k]` relative to
-  the array's length. An element pattern must be irrefutable: a literal element
-  (`[1, y]`) is rejected rather than mis-bound. An array pattern that binds
+  `while let`, and as an array-typed struct field's sub-pattern
+  (`let S { a: [x, y], b } = s;`). It expands to one index read per element, so
+  a fixed element `j` reads `subj[j]` and a trailing element reads
+  `subj[subj.len() - k]` relative to the array's length. An element pattern must
+  be irrefutable: a literal element (`[1, y]`) is rejected rather than
+  mis-bound. An array pattern that binds
   nothing (`[_, _]`, `[..]`) is accepted and still evaluates the scrutinee once.
 - `for` destructuring: `for S { f, g: h, i: _, .. } in arr { .. }` or
   `for [x, y] in arr { .. }` iterates the array as above but destructures each
