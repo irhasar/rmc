@@ -446,23 +446,33 @@ impl<'a> FnGen<'a> {
         // are promoted ahead of the general ranking, because the general count
         // weighs a value read once per iteration the same as one read once.
         let depths = self.loop_depths();
-        let mut in_loop_use: HashMap<u32, u32> = HashMap::new();
-        let mut defined_in_loop: HashSet<u32> = HashSet::new();
+        // A local's definition depth and its deepest use. A local that is only
+        // ever defined above a loop and read inside it is loop-invariant for
+        // that loop: it is worth a register even when a shallower loop holds
+        // the rest of the budget, because it saves a load on every iteration.
+        let mut def_depth: HashMap<u32, u32> = HashMap::new();
+        let mut use_depth: HashMap<u32, u32> = HashMap::new();
+        let mut use_count: HashMap<u32, u32> = HashMap::new();
         for (bi, b) in self.func.blocks.iter().enumerate() {
-            let hot = depths.get(bi).copied().unwrap_or(0) > 0;
+            let d = depths.get(bi).copied().unwrap_or(0);
             for s in &b.stmts {
                 if let Stmt::Assign(p, rv) = s {
-                    if hot && p.proj.is_empty() {
-                        defined_in_loop.insert(p.local);
+                    if p.proj.is_empty() {
+                        def_depth
+                            .entry(p.local)
+                            .and_modify(|v| *v = (*v).max(d))
+                            .or_insert(d);
                     }
                     let mut lc: HashMap<u32, u32> = HashMap::new();
                     let mut pj: HashSet<u32> = HashSet::new();
                     let mut at: HashSet<u32> = HashSet::new();
                     scan_rv(rv, &mut lc, &mut pj, &mut at);
-                    if hot {
-                        for l in lc.keys() {
-                            *in_loop_use.entry(*l).or_insert(0) += 1;
-                        }
+                    for (l, c) in lc {
+                        use_depth
+                            .entry(l)
+                            .and_modify(|v| *v = (*v).max(d))
+                            .or_insert(d);
+                        *use_count.entry(l).or_insert(0) += c;
                     }
                 }
             }
@@ -470,29 +480,32 @@ impl<'a> FnGen<'a> {
             let mut pj: HashSet<u32> = HashSet::new();
             let mut at: HashSet<u32> = HashSet::new();
             scan_term(&b.term, &mut lc, &mut pj, &mut at);
-            if hot {
-                for l in lc.keys() {
-                    *in_loop_use.entry(*l).or_insert(0) += 1;
-                }
+            for (l, c) in lc {
+                use_depth
+                    .entry(l)
+                    .and_modify(|v| *v = (*v).max(d))
+                    .or_insert(d);
+                *use_count.entry(l).or_insert(0) += c;
             }
-            if hot {
-                if let Terminator::Call { dest, .. } = &b.term {
-                    if dest.proj.is_empty() {
-                        defined_in_loop.insert(dest.local);
-                    }
+            if let Terminator::Call { dest, .. } = &b.term {
+                if dest.proj.is_empty() {
+                    def_depth
+                        .entry(dest.local)
+                        .and_modify(|v| *v = (*v).max(d))
+                        .or_insert(d);
                 }
             }
         }
-        let mut invariant: Vec<(u32, u32)> = in_loop_use
+        let mut invariant: Vec<(u32, u32, u32)> = use_depth
             .iter()
-            .filter(|(l, _)| !defined_in_loop.contains(l))
+            .filter(|(l, ud)| **ud > def_depth.get(l).copied().unwrap_or(0))
             .filter(|(l, _)| !self.promo.contains_key(l))
             .filter(|(l, _)| !self.ty.get(**l as usize).map(|t| t.is_aggregate()).unwrap_or(false))
-            .map(|(l, c)| (*l, *c))
+            .map(|(l, ud)| (*l, *ud, use_count.get(l).copied().unwrap_or(1)))
             .collect();
-        invariant.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        invariant.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
         let pool = self.reg_pool();
-        for (l, _) in invariant {
+        for (l, _, _) in invariant {
             if self.promo.len() >= pool.len() {
                 break;
             }
@@ -2555,6 +2568,50 @@ fn dead_stores(body: &str) -> String {
     out
 }
 
+/// Drop every `mov` store to a slot the body never reads. The generator stores
+/// each local to its own frame slot as it is produced, even when the value is
+/// then only read out of a scratch slot or a register; once the peephole passes
+/// rewrite the reads, those stores have no reader left.
+fn drop_unread_stores(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut read: HashSet<String> = HashSet::new();
+    for line in &lines {
+        let t = line.trim();
+        let Some((_, rest)) = t.split_once(char::is_whitespace) else { continue };
+        // A `mov`'s destination is write-only; every other operand is a read.
+        match rest.split_once(',') {
+            Some((src, dst)) => {
+                for slot in slots_in(src) {
+                    read.insert(slot.to_string());
+                }
+                if !dst.trim().ends_with("(%rbp)") || store_slot(line).is_none() {
+                    for slot in slots_in(dst) {
+                        read.insert(slot.to_string());
+                    }
+                }
+            }
+            None => {
+                for slot in slots_in(rest) {
+                    read.insert(slot.to_string());
+                }
+            }
+        }
+    }
+    let mut out = String::with_capacity(body.len());
+    for line in &lines {
+        if line.trim().starts_with("mov") {
+            if let Some(slot) = store_slot(line) {
+                if !read.contains(slot) {
+                    continue;
+                }
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 /// Every `-N(%rbp)` slot mentioned on `line`, as borrowed slices of it.
 fn slots_in(line: &str) -> Vec<&str> {
     let mut found = Vec::new();
@@ -2616,6 +2673,7 @@ fn optimize(body: &str) -> String {
         body = forward_stores(&body);
         body = fold_addresses(&body);
         body = dead_stores(&body);
+        body = drop_unread_stores(&body);
     }
     body
 }
