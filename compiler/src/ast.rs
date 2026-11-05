@@ -71,6 +71,15 @@ impl Type {
         matches!(self, Type::I64 | Type::Bool | Type::Enum(_))
     }
 
+    /// True for the types an array element may have now that nested aggregates
+    /// are supported: the integer-like scalars plus a nested array or a struct.
+    /// Every such type is a multiple of 8 bytes, so an element's stride is
+    /// `size() / 8` slots. A payload enum, a reference and `str` stay excluded
+    /// (rustc rejects a payload enum and a reference as array elements too).
+    pub fn is_array_elem(&self) -> bool {
+        matches!(self, Type::I64 | Type::Bool | Type::Enum(_) | Type::Array(..) | Type::Struct(..))
+    }
+
     /// True for the aggregate types that live in memory: arrays and structs.
     /// They are named by their address, so they are passed to and returned from
     /// a function by pointer rather than by value.

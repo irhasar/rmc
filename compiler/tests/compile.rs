@@ -2062,13 +2062,100 @@ fn a_list_literal_with_mixed_element_types_is_rejected() {
 }
 
 #[test]
-fn an_array_of_aggregates_is_rejected_not_miscompiled() {
-    // Nested arrays and arrays of structs are out of scope; they must be a
-    // clean error rather than a segfault.
-    let e1 = compile_to_asm("fn main() -> i64 { let m: [[i64; 2]; 2] = [[1, 2], [3, 4]]; return 0; }", &CompileOptions::default()).unwrap_err();
-    assert!(e1.contains("array elements must be"), "got: {e1}");
-    let e2 = compile_to_asm("struct P { x: i64 } fn main() -> i64 { let a: [P; 1] = [P { x: 1 }]; return 0; }", &CompileOptions::default()).unwrap_err();
-    assert!(e2.contains("array elements must be"), "got: {e2}");
+fn a_large_nested_splat_keeps_the_source_fixed() {
+    // The counting-loop path for `[v; n]` with a wide element must advance only
+    // the destination: every element is a copy of the *same* source value. An
+    // earlier version stepped the source too, so element `i` was read from
+    // `v + i * elem_size` and the tail of the array was garbage.
+    let out = asm("fn main() -> i64 { let m: [[i64; 3]; 4] = [[5; 3]; 4]; return m[3][2]; }");
+    assert!(out.contains("mov $4, %rcx"), "the splat loop counts elements:\n{out}");
+    assert!(out.contains("add $24, %rdi"), "the destination advances:\n{out}");
+    assert!(
+        !out.contains("add $24, %rsi"),
+        "the source must not advance:\n{out}"
+    );
+}
+
+#[test]
+fn nested_array_slots_are_allocated_per_element_word() {
+    // A nested array of `n` elements of `w` words needs `n * w` frame slots. If
+    // the `let` allocated only `n`, the elements would overlap and a write to
+    // the last row would clobber an earlier one. A 4x3 `i64` array is 12 slots
+    // (96 bytes), so the frame must reserve at least that much.
+    let out = asm("fn main() -> i64 { let mut m: [[i64; 3]; 4] = [[0; 3]; 4]; m[3][2] = 1; return m[3][2]; }");
+    let frame: i32 = out
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("sub $")?.strip_suffix(", %rsp")?.parse().ok())
+        .expect("a frame reservation");
+    assert!(frame >= 96, "frame {frame} must hold 12 words:\n{out}");
+}
+
+#[test]
+fn a_large_struct_splat_keeps_the_source_fixed() {
+    // The same loop-path requirement for an array of structs.
+    let out = asm(
+        "struct P { x: i64, y: i64 } \
+         fn main() -> i64 { let a: [P; 5] = [P { x: 4, y: 6 }; 5]; return a[4].y; }",
+    );
+    assert!(out.contains("mov $5, %rcx"), "the splat loop counts elements:\n{out}");
+    assert!(out.contains("add $16, %rdi"), "the destination advances:\n{out}");
+    assert!(
+        !out.contains("add $16, %rsi"),
+        "the source must not advance:\n{out}"
+    );
+}
+
+#[test]
+fn nested_arrays_compile_and_index() {
+    // An array of arrays is laid out row-major: `m[i]` has the element type of
+    // `m`, and `m[i][j]` indexes into it. The stride is the inner array's size,
+    // not one slot, so both a constant and a variable index must scale.
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let m: [[i64; 2]; 3] = [[1, 2], [3, 4], [5, 6]]; return m[0][0] + m[2][1]; }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let m: [[i64; 2]; 3] = [[1, 2], [3, 4], [5, 6]]; \
+         let mut i: i64 = 0; let mut s: i64 = 0; \
+         while i < 3 { s = s + m[i][1]; i = i + 1; } return s; }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+    // A nested splat `[[v; k]; n]` copies `v`'s bytes into each inner array.
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let m: [[i64; 2]; 3] = [[5; 2]; 3]; return m[1][1]; }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn an_array_of_structs_compiles() {
+    // A struct is a wide element: `a[i].field` indexes with a stride of the
+    // struct's size, and a whole-element assignment copies the struct's words.
+    let src = "struct P { x: i64, y: i64 } \
+               fn main() -> i64 { let mut a: [P; 2] = [P { x: 1, y: 2 }, P { x: 3, y: 4 }]; \
+               a[1].x = 9; let b: P = P { x: 8, y: 7 }; a[0] = b; return a[0].x + a[1].x; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+    // A struct splat `[P { .. }; n]`.
+    assert!(compile_to_asm(
+        "struct P { x: i64 } fn main() -> i64 { let a: [P; 3] = [P { x: 2 }; 3]; return a[2].x; }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn an_array_of_payload_enums_is_still_rejected() {
+    // A payload enum is not a fixed-width scalar; rustc rejects it as an array
+    // element too, so rmc must give a clean error rather than miscompile.
+    let err = compile_to_asm(
+        "enum O { N, S(i64) } fn main() -> i64 { let a: [O; 2] = [O::N, O::S(1)]; return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("array elements must be"), "got: {err}");
 }
 
 #[test]
