@@ -72,3 +72,17 @@ jobs:
         run: |
           python3 tools/fuzz.py --mode mir --n 200 --seed 1
           python3 tools/fuzz.py --mode mir --n 200 --seed 2
+
+      # Every integer narrower than 64 bits shares one word in the back end;
+      # `width` mode is the differential that would catch a wrong sign/zero
+      # extension or a missing wrap at a narrow width.
+      - name: Differential fuzz (MIR integer widths)
+        run: |
+          python3 tools/fuzz.py --mode mir --gen width --n 150 --seed 1
+          python3 tools/fuzz.py --mode mir --gen width --n 150 --seed 2
+
+      # The MIR path rejects the standard library's formatting and container
+      # machinery. A rejected program must be a diagnostic, not a panic: the
+      # failure a user hits first on this path is an unsupported MIR shape.
+      - name: MIR robustness (unsupported input must not crash)
+        run: python3 tools/fuzz.py --mode mirrobust

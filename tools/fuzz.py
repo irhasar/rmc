@@ -2892,6 +2892,57 @@ def gen_mir_program(rng):
     return MIR_PRELUDE + "\n".join(lines) + "\n"
 
 
+# Integer types narrower than 64 bits all live in one 64-bit word in the back
+# end; the width only matters to the operation. That is the assumption most
+# likely to hide a miscompile, so the generator below exercises every width
+# with a value that distinguishes a correct sign/zero extension from a wrong
+# one, and with a `wrapping_*` result that a plain 64-bit op would get wrong.
+_MIR_INT_TYPES = ["u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "usize", "isize"]
+
+
+def _mir_width_value(rng, ty):
+    """A value that is distinctive at `ty`'s width, as a Rust literal."""
+    bits = {"u8": 8, "i8": 8, "u16": 16, "i16": 16, "u32": 32, "i32": 32,
+            "u64": 64, "i64": 64, "usize": 64, "isize": 64}[ty]
+    if ty.startswith("u"):
+        return str(rng.randrange(1 << bits)) if bits < 64 else str(rng.randrange(1 << 63, 1 << 64))
+    lo, hi = -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+    return str(rng.randint(lo, hi))
+
+
+def gen_mir_width_program(rng):
+    """A freestanding program that mixes integer widths.
+
+    Every value is printed after a `as i64` cast, so a wrong extension (a
+    sign-extension of an unsigned value, or a truncation of a wider one) shows
+    up as a printed mismatch against the rustc reference. It also computes
+    `wrapping_add`/`wrapping_sub`/`wrapping_mul` at the narrow width, where the
+    result is `(a op b) mod 2^width` interpreted at that width — a 64-bit
+    operation would not wrap and would diverge."""
+    lines = [
+        "fn h(x: i64) -> i64 { (x * 7 + 3) % 101 - 50 }",
+        "#[no_mangle]",
+        'pub extern "C" fn main() -> i64 {',
+    ]
+    for _ in range(rng.randint(3, 6)):
+        ty = rng.choice(_MIR_INT_TYPES)
+        a = _mir_width_value(rng, ty)
+        b = _mir_width_value(rng, ty)
+        lines.append(f"    let a: {ty} = {a};")
+        lines.append(f"    let b: {ty} = {b};")
+        lines.append(f"    out(a as i64);")
+        lines.append(f"    out(b as i64);")
+        lines.append(f"    out(a.wrapping_add(b) as i64);")
+        lines.append(f"    out(a.wrapping_sub(b) as i64);")
+        lines.append(f"    out(a.wrapping_mul(b) as i64);")
+        # A comparison and a cast back down, to exercise both directions.
+        lines.append(f"    out((a > b) as i64);")
+        lines.append(f"    let c: {ty} = {_mir_width_value(rng, ty)};")
+        lines.append(f"    out((c as i64).wrapping_add(a as i64) as {ty} as i64);")
+    lines += ["    0", "}"]
+    return MIR_PRELUDE + "\n".join(lines) + "\n"
+
+
 def mir_runtime(tmp):
     """The freestanding runtime as assembly, written once per temp dir. The
     rustc reference is linked against the *same* runtime rmc uses, so the only
@@ -2938,13 +2989,14 @@ def run_mir(args):
            "ref": gen_ref_program, "update": gen_update_program,
            "letdestr": gen_letdestr_program, "fordestr": gen_fordestr_program,
            "nestpat": gen_nestpat_program, "arrpat": gen_arrpat_program,
-           "parampat": gen_parampat_program}[gen_name]
+           "parampat": gen_parampat_program,
+           "width": gen_mir_width_program}[gen_name]
     rng = random.Random(args.seed)
     flags = ["--no-inline", "--no-licm", "--no-tco"]
     failures = 0
     built = 0
     for t in range(args.n):
-        if gen_name == "mir":
+        if gen_name in ("mir", "width"):
             rs = gen(rng)
         else:
             # The `.rms` generators produce a std program; only its `.rs` half
