@@ -109,7 +109,8 @@ pub fn compile_mir_text_to_elf(
     mir_text: &str,
     opts: &mir_codegen::Options,
 ) -> Result<Vec<u8>, String> {
-    let prog = mir::parse(mir_text)?;
+    let mut prog = mir::parse(mir_text)?;
+    prog.copy_propagate();
     let asm = compile_mir_to_asm(&prog, opts)?;
     elf::assemble(&asm)
 }

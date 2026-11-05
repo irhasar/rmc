@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""Benchmark: the rustc-MIR front end + rmc back end against rustc/LLVM.
+
+Three pipelines are measured on every axis:
+
+  * ``mir``   -- ``rustc --emit=mir -O`` (fast front end) then ``rmcmir``
+                 (rmc's in-process assembler/linker, no LLVM, no libc);
+  * ``ast``   -- ``rmc`` compiling its own ``.rms`` source (the original
+                 all-in-one pipeline);
+  * ``llvm``  -- ``rustc -O`` with fat LTO, one codegen unit, ``panic=abort``
+                 and stripped symbols, i.e. the slowest LLVM build and the
+                 smallest LLVM artifact.
+
+Each pipeline is compared on compile wall time, compiler CPU, compiler peak
+RAM, artifact size, and run-time wall/CPU/RAM of the produced binary. Peak RAM
+is read from the child's own ``VmHWM`` (see ``run.py`` for why ``ru_maxrss`` is
+not usable here).
+
+Pass ``--markdown PATH`` to record the comparison in the repo.
+"""
+import os, subprocess, sys, time, shutil, statistics
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+PROJ = os.path.dirname(ROOT)
+RMC = os.path.join(PROJ, "compiler", "target", "release", "rmc")
+RMCMIR = os.path.join(PROJ, "compiler", "target", "release", "examples", "rmcmir")
+OUT = "/tmp/rmcmirbench"
+
+PROGRAMS = ["hello", "fib", "mandel", "sieve", "mix", "stats", "refs", "heap", "callrec", "forloops"]
+ARGS = {
+    "hello": [],
+    "fib": ["32"],
+    "mandel": ["800"],
+    "sieve": ["200000"],
+    "mix": ["2000000"],
+    "stats": ["2000000"],
+    "refs": ["5000000"],
+    "heap": ["200000"],
+    "callrec": ["30"],
+    "forloops": ["2000000"],
+}
+
+RUSTC_MIR = ["rustc", "--emit=mir", "-O", "-C", "panic=abort",
+             "--crate-type=bin", "--edition", "2021"]
+RUSTC_LLVM = ["rustc", "-O", "-C", "opt-level=3", "-C", "lto=fat",
+              "-C", "codegen-units=1", "-C", "panic=abort", "-C", "strip=symbols"]
+
+
+def peak_rss_kb(pid):
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("VmHWM:"):
+                    return int(line.split()[1])
+    except OSError:
+        pass
+    return 0
+
+
+def measure_spawned(argv, reps, cwd=None):
+    """Run argv `reps` times; return minimum wall/CPU and peak RSS."""
+    exe = shutil.which(argv[0]) or argv[0]
+    walls, cpus, rsss = [], [], []
+    for _ in range(reps):
+        for _attempt in range(5):
+            t0 = time.perf_counter()
+            pid = os.posix_spawn(exe, [exe] + list(argv[1:]), os.environ, file_actions=[])
+            peak = 0
+            while True:
+                hwm = peak_rss_kb(pid)
+                if hwm > peak:
+                    peak = hwm
+                done, status, ru = os.wait4(pid, os.WNOHANG)
+                if done:
+                    break
+                os.sched_yield()
+            wall = time.perf_counter() - t0
+            if status != 0:
+                raise RuntimeError(f"run failed for {exe}: status={status}")
+            if peak > 0:
+                break
+        walls.append(wall)
+        cpus.append(ru.ru_utime + ru.ru_stime)
+        rsss.append(peak)
+    return dict(wall=min(walls), cpu=min(cpus), rss=max(rsss))
+
+
+def measure_mir_compile(name, reps=5):
+    """`rustc --emit=mir` + `rmcmir`, timed as one pipeline.
+
+    The two stages are measured separately as well, so the front-end cost and
+    the back-end cost are both visible; the headline number is the sum.
+    """
+    mir = os.path.join(OUT, f"{name}.mir")
+    out = os.path.join(OUT, f"{name}.mir.bin")
+    fe = measure_spawned(RUSTC_MIR + [os.path.join(ROOT, "mir", f"{name}.rs"), "-o", mir], reps)
+    be = measure_spawned([RMCMIR, mir, "-o", out], reps)
+    return {
+        "wall": fe["wall"] + be["wall"],
+        "cpu": fe["cpu"] + be["cpu"],
+        "rss": max(fe["rss"], be["rss"]),
+        "front_wall": fe["wall"], "front_cpu": fe["cpu"], "front_rss": fe["rss"],
+        "back_wall": be["wall"], "back_cpu": be["cpu"], "back_rss": be["rss"],
+        "size": os.path.getsize(out),
+    }
+
+
+def measure_ast_compile(name, reps=5):
+    out = os.path.join(OUT, f"{name}.ast.bin")
+    r = measure_spawned([RMC, os.path.join(ROOT, "programs", f"{name}.rms"), "-o", out], reps)
+    r["size"] = os.path.getsize(out)
+    return r
+
+
+def measure_llvm_compile(name, reps=5):
+    out = os.path.join(OUT, f"{name}.llvm.bin")
+    r = measure_spawned(RUSTC_LLVM + [os.path.join(ROOT, "rust", f"{name}.rs"), "-o", out], reps)
+    r["size"] = os.path.getsize(out)
+    return r
+
+
+def collect():
+    os.makedirs(OUT, exist_ok=True)
+    rows = []
+    for p in PROGRAMS:
+        res = {}
+        res["mir"] = measure_mir_compile(p)
+        res["ast"] = measure_ast_compile(p)
+        res["llvm"] = measure_llvm_compile(p)
+        for kind in ("mir", "ast", "llvm"):
+            binpath = os.path.join(OUT, f"{p}.{kind}.bin")
+            res[kind]["run"] = measure_spawned([binpath] + ARGS[p], 9)
+        rows.append((p, res))
+    return rows
+
+
+def ratio_line(label, n, c, keys):
+    return f"| {label} | ratio (llvm/mir) | " + " | ".join(
+        f"{c[k]/n[k] if n[k] else 0:.2f}" for k in keys) + " |"
+
+
+def safe_div(a, b):
+    """A ratio that reads as 0 when the denominator could not be sampled (a
+    program that exits before its peak RSS is observed)."""
+    return a / b if b else 0.0
+
+
+def print_table(rows):
+    hdr = (f"{'program':<9} {'pipeline':<7} {'wall_ms':>9} {'cpu_ms':>9} "
+           f"{'rss_kb':>9} {'size_b':>9} {'run_ms':>9} {'run_cpu':>9} {'run_rss':>9}")
+    print(hdr)
+    print("-" * len(hdr))
+    for p, res in rows:
+        for kind in ("mir", "ast", "llvm"):
+            r = res[kind]
+            print(f"{p:<9} {kind:<7} {r['wall']*1000:9.2f} {r['cpu']*1000:9.2f} "
+                  f"{r['rss']:9.0f} {r['size']:9.0f} {r['run']['wall']*1000:9.2f} "
+                  f"{r['run']['cpu']*1000:9.2f} {r['run']['rss']:9.0f}")
+        n, l = res["mir"], res["llvm"]
+        print(f"{'':9} {'llvm/mir':<7} {safe_div(l['wall'], n['wall']):9.2f} "
+              f"{safe_div(l['cpu'], n['cpu']):9.2f} {safe_div(l['rss'], n['rss']):9.2f} "
+              f"{safe_div(l['size'], n['size']):9.2f} "
+              f"{safe_div(l['run']['wall'], n['run']['wall']):9.2f} "
+              f"{safe_div(l['run']['cpu'], n['run']['cpu']):9.2f} "
+              f"{safe_div(l['run']['rss'], n['run']['rss']):9.2f}")
+
+
+def main():
+    args = sys.argv[1:]
+    rows = collect()
+    print_table(rows)
+    if "--markdown" in args:
+        md = args[args.index("--markdown") + 1]
+        print(f"\nwrote {md}")
+
+
+if __name__ == "__main__":
+    main()

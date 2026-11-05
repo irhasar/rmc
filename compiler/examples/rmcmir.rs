@@ -31,7 +31,10 @@ fn main() {
 
     let text = std::fs::read_to_string(&input).expect("cannot read input");
     let opts = Options { overflow_checks, promote: !no_promote, align_loops: true };
-    match rmc::compile_mir_to_asm(&rmc::mir::parse(&text).expect("mir parse"), &opts) {
+    let mut prog = rmc::mir::parse(&text).expect("mir parse");
+    prog.copy_propagate();
+    rmc::mir::licm(&mut prog);
+    match rmc::compile_mir_to_asm(&prog, &opts) {
         Ok(asm) => {
             if emit_asm {
                 print!("{asm}");

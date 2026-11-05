@@ -14,7 +14,7 @@
 //! error naming the line, so an unhandled MIR shape fails loudly instead of
 //! silently miscompiling.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// A resolved type, in the narrow sense the backend needs.
 ///
@@ -65,6 +65,14 @@ pub enum Const {
     Bool(bool),
     Unit,
     Str(String),
+    /// `{allocN: TY}` — the address of a static allocation (a promoted
+    /// constant, a string, or a `static`'s data). `place` is the optional
+    /// `[place]` offset the printer appends when the constant is an interior
+    /// pointer.
+    Alloc {
+        id: u32,
+        place: Option<Box<Place>>,
+    },
     /// A named `alloc` (string) or a `const` item reference we do not fold.
     Named(String),
 }
@@ -113,6 +121,11 @@ pub enum Rvalue {
     Aggregate(Vec<Operand>),
     /// `Len(place)` — the array length of a place.
     Len(Place),
+    /// `AddWithOverflow(a, b)` — a wrapping `a OP b` whose result and overflow
+    /// flag are stored as `(result, flag)` into the destination aggregate.
+    WithOverflow { op: BinOp, a: Operand, b: Operand },
+    /// `discriminant(place)` — the tag of an enum place.
+    Discriminant(Place),
     /// A value the backend does not model (a constant expression, a vtable
     /// pointer, ...). Treated as 0 with a diagnostic.
     Unsupported(String),
@@ -168,6 +181,13 @@ pub enum Terminator {
         target: Option<u32>,
     },
     Unreachable,
+    /// `assert(cond) -> [success: bbX, unwind ...]`: continue to `target` when
+    /// the condition holds, otherwise trap (exit 101).
+    Assert {
+        cond: Operand,
+        negate: bool,
+        target: u32,
+    },
     /// A trap (e.g. `assert` failure with `unwind terminate`); the backend
     /// emits an `exit(101)`.
     Abort,
@@ -207,15 +227,321 @@ pub struct Function {
 #[derive(Debug, Clone)]
 pub struct Program {
     pub funcs: Vec<Function>,
-    /// `allocN` static data blobs (string literals), by allocation id.
-    pub allocs: HashMap<u32, Vec<u8>>,
+    /// `allocN` static data blobs (string literals, promoted constants,
+    /// `static` data), by allocation id.
+    pub allocs: HashMap<u32, AllocData>,
     /// `const NAME: TY = ...;` items at the crate scope.
     pub consts: HashMap<String, i64>,
+}
+
+/// A static allocation: its bytes, any pointer relocations into other
+/// allocations, and the `static` name it backs (when it is one).
+#[derive(Debug, Clone, Default)]
+pub struct AllocData {
+    pub bytes: Vec<u8>,
+    /// `(byte offset, target alloc id)` for each interior pointer.
+    pub relocs: Vec<(usize, u32)>,
+    /// The `static NAME` this allocation initialises, if any.
+    pub static_name: Option<String>,
 }
 
 impl Program {
     pub fn func(&self, name: &str) -> Option<&Function> {
         self.funcs.iter().find(|f| f.name == name)
+    }
+
+    /// Copy-propagate the whole crate.
+    pub fn copy_propagate(&mut self) {
+        for f in &mut self.funcs {
+            f.copy_propagate();
+        }
+    }
+}
+
+impl Function {
+    /// Coalesce `_d = copy _x` temporaries: within a block, rewrite later uses
+    /// of `_d` to read `_x` directly.
+    ///
+    /// rustc's MIR routes almost every value through a fresh temporary
+    /// (`_6 = copy _4; _5 = Lt(move _6, move _7)`), so without this pass each
+    /// operand costs a store to a frame slot and a reload, and the register
+    /// allocator spends its budget on single-use temporaries instead of the
+    /// variables that live across the loop. Substituting the source local keeps
+    /// the value in one place instead of two.
+    ///
+    /// Only single-definition, non-argument locals are substituted (a
+    /// rustc temporary), and the alias is dropped at any write to the source,
+    /// so a source that is reassigned later in the block is never read stale.
+    /// The alias is block-local, so a use in another block still reads the
+    /// temporary's slot, which is still written.
+    fn copy_propagate(&mut self) {
+        let defs = self.def_counts();
+        let subst_local: HashSet<u32> = (0..self.locals.len() as u32)
+            .filter(|l| self.safe_subst(*l, &defs))
+            .collect();
+        // Locals written through a projection anywhere (`_s.0 = x`, `(*_s).1 = y`).
+        // A value read out of such a local can change without a whole-local
+        // write, so aliasing it is unsafe.
+        let mutated: HashSet<u32> = self
+            .blocks
+            .iter()
+            .flat_map(|b| b.stmts.iter())
+            .filter_map(|s| match s {
+                Stmt::Assign(d, _) if !d.proj.is_empty() => Some(d.local),
+                _ => None,
+            })
+            .collect();
+        for b in &mut self.blocks {
+            let mut subst: HashMap<u32, Place> = HashMap::new();
+            let mut kept: Vec<Stmt> = Vec::with_capacity(b.stmts.len());
+            for mut s in b.stmts.drain(..) {
+                rewrite_stmt(&mut s, &subst);
+                if let Some(l) = written_local(&s) {
+                    // A write to `l` invalidates every alias that reads it, and
+                    // every alias that reads through it (a projection of `l`).
+                    subst.retain(|k, v| *k != l && v.local != l);
+                }
+                if let Stmt::Assign(d, Rvalue::Use(Operand::Copy(src) | Operand::Move(src))) = &s {
+                    if d.proj.is_empty()
+                        && subst_local.contains(&d.local)
+                        && place_aliasable(src, &mutated)
+                    {
+                        subst.insert(d.local, src.clone());
+                    }
+                }
+                if !is_self_assign(&s) {
+                    kept.push(s);
+                }
+            }
+            b.stmts = kept;
+            rewrite_term(&mut b.term, &subst);
+        }
+        self.drop_dead_copies();
+    }
+
+    /// Drop `_d = copy _s` when nothing reads `_d` any more.
+    ///
+    /// Copy propagation rewrites every use of the temporary away, which leaves
+    /// the copy itself dead. It is a plain move of one scalar, so removing it
+    /// cannot drop work: only a `Use` of a scalar whole-local is removed, never
+    /// a call, an aggregate copy or a trapping arithmetic op.
+    fn drop_dead_copies(&mut self) {
+        let uses = self.use_counts();
+        let live: HashSet<u32> = (0..self.locals.len() as u32)
+            .filter(|l| {
+                if self.local_ty(*l).is_aggregate() {
+                    return true;
+                }
+                if self.locals.get(*l as usize).map(|x| x.is_arg).unwrap_or(true) {
+                    return true;
+                }
+                uses.get(l).copied().unwrap_or(0) > 0
+            })
+            .collect();
+        for b in &mut self.blocks {
+            b.stmts.retain(|s| {
+                let Stmt::Assign(d, Rvalue::Use(_)) = s else { return true };
+                !d.proj.is_empty() || d.local == 0 || live.contains(&d.local)
+            });
+        }
+    }
+
+    /// The number of reads of each local, over the (already rewritten) body.
+    fn use_counts(&self) -> HashMap<u32, u32> {
+        let mut uses: HashMap<u32, u32> = HashMap::new();
+        let mut read_op = |op: &Operand, uses: &mut HashMap<u32, u32>| {
+            if let Operand::Copy(p) | Operand::Move(p) = op {
+                *uses.entry(p.local).or_insert(0) += 1;
+            }
+        };
+        for b in &self.blocks {
+            for s in &b.stmts {
+                if let Stmt::Assign(_, rv) = s {
+                    scan_rv_operands(rv, &mut |op| read_op(op, &mut uses));
+                }
+            }
+            match &b.term {
+                Terminator::SwitchInt { discr, .. } => read_op(discr, &mut uses),
+                Terminator::Assert { cond, .. } => read_op(cond, &mut uses),
+                Terminator::Call { args, .. } => {
+                    for a in args {
+                        read_op(a, &mut uses);
+                    }
+                }
+                _ => {}
+            }
+        }
+        uses
+    }
+
+    /// The number of statements that assign each local (including calls).
+    fn def_counts(&self) -> HashMap<u32, u32> {
+        let mut defs: HashMap<u32, u32> = HashMap::new();
+        for b in &self.blocks {
+            for s in &b.stmts {
+                if let Stmt::Assign(p, _) = s {
+                    *defs.entry(p.local).or_insert(0) += 1;
+                }
+            }
+            if let Terminator::Call { dest, .. } = &b.term {
+                *defs.entry(dest.local).or_insert(0) += 1;
+            }
+        }
+        defs
+    }
+
+    /// A destination local is safe to substitute when it is written exactly
+    /// once (so it is a single-use temporary rather than a live variable that
+    /// could be observed while holding its old value) and is not an argument.
+    fn safe_subst(&self, local: u32, defs: &HashMap<u32, u32>) -> bool {
+        if self.locals.get(local as usize).map(|l| l.is_arg).unwrap_or(true) {
+            return false;
+        }
+        defs.get(&local).copied().unwrap_or(0) == 1
+    }
+
+    fn local_ty(&self, local: u32) -> Ty {
+        self.locals
+            .get(local as usize)
+            .map(|l| (*l.ty).clone())
+            .unwrap_or(Ty::I64)
+    }
+}
+
+/// Call `f` for every operand a statement reads.
+fn scan_rv_operands(rv: &Rvalue, f: &mut impl FnMut(&Operand)) {
+    match rv {
+        Rvalue::Use(op) => f(op),
+        Rvalue::Binary(_, a, b) => {
+            f(a);
+            f(b);
+        }
+        Rvalue::Unary(_, a) => f(a),
+        Rvalue::Cast { op, .. } => f(op),
+        Rvalue::Repeat { op, .. } => f(op),
+        Rvalue::Array(ops) | Rvalue::Aggregate(ops) => ops.iter().for_each(|op| f(op)),
+        Rvalue::WithOverflow { a, b, .. } => {
+            f(a);
+            f(b);
+        }
+        // These read a place rather than an operand: the place's base local is
+        // still a read (its address is taken or its length/tag inspected), and
+        // any `[i]` index is read too.
+        Rvalue::Ref { place, .. }
+        | Rvalue::RawRef { place, .. }
+        | Rvalue::Len(place)
+        | Rvalue::Discriminant(place) => {
+            f(&Operand::Copy(place.clone()));
+            for proj in &place.proj {
+                if let Proj::IndexLocal(i) = proj {
+                    f(&Operand::Copy(Place { local: *i, proj: Vec::new() }));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_self_assign(s: &Stmt) -> bool {
+    let Stmt::Assign(d, Rvalue::Use(Operand::Copy(src) | Operand::Move(src))) = s else {
+        return false;
+    };
+    d == src
+}
+
+/// The local a statement writes, if it writes a whole local.
+fn written_local(s: &Stmt) -> Option<u32> {
+    match s {
+        Stmt::Assign(d, _) if d.proj.is_empty() => Some(d.local),
+        _ => None,
+    }
+}
+
+/// Whether `p` can stand in for another place in an alias.
+///
+/// Only a plain local or a projection that does not read through a pointer is
+/// aliased. A projection rooted at a `Deref`/`RawRef` (e.g. `(*_5).0`) is
+/// skipped: a later store through the same pointer would invalidate the value,
+/// and the cheap invalidation here only watches whole-local writes.
+fn place_aliasable(p: &Place, mutated: &HashSet<u32>) -> bool {
+    if mutated.contains(&p.local) {
+        return false;
+    }
+    p.proj.iter().all(|proj| {
+        !matches!(proj, Proj::Deref | Proj::RawRef)
+    })
+}
+
+fn rewrite_op(op: &mut Operand, subst: &HashMap<u32, Place>) {
+    if let Operand::Copy(p) | Operand::Move(p) = op {
+        if p.proj.is_empty() {
+            if let Some(src) = subst.get(&p.local) {
+                *p = src.clone();
+            }
+        }
+    }
+}
+
+/// Rewrite every place a statement reads through the alias map. A `Ref`/`RawRef`
+/// target is rewritten too, but only when the alias is a plain local: aliasing a
+/// projection would change which address is taken.
+fn rewrite_place(p: &mut Place, subst: &HashMap<u32, Place>) {
+    if p.proj.is_empty() {
+        if let Some(src) = subst.get(&p.local) {
+            *p = src.clone();
+        }
+    }
+}
+
+fn rewrite_stmt(s: &mut Stmt, subst: &HashMap<u32, Place>) {
+    if subst.is_empty() {
+        return;
+    }
+    let Stmt::Assign(_, rv) = s else { return };
+    match rv {
+        Rvalue::Use(op) => rewrite_op(op, subst),
+        Rvalue::Binary(_, a, b) => {
+            rewrite_op(a, subst);
+            rewrite_op(b, subst);
+        }
+        Rvalue::Unary(_, a) => rewrite_op(a, subst),
+        Rvalue::Cast { op, .. } => rewrite_op(op, subst),
+        Rvalue::Repeat { op, .. } => rewrite_op(op, subst),
+        Rvalue::Array(ops) | Rvalue::Aggregate(ops) => {
+            for op in ops {
+                rewrite_op(op, subst);
+            }
+        }
+        Rvalue::WithOverflow { a, b, .. } => {
+            rewrite_op(a, subst);
+            rewrite_op(b, subst);
+        }
+        // `Len`/`Discriminant` read a type-determined property of a whole
+        // local, which a value copy preserves, so the place can be substituted.
+        // `Ref`/`RawRef` deliberately are not rewritten: `_d = copy _s` gives
+        // `_d` its own storage, so `&_d` is not `&_s`.
+        Rvalue::Len(place) | Rvalue::Discriminant(place) => {
+            if place.proj.is_empty() {
+                rewrite_place(place, subst);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_term(t: &mut Terminator, subst: &HashMap<u32, Place>) {
+    if subst.is_empty() {
+        return;
+    }
+    match t {
+        Terminator::SwitchInt { discr, .. } => rewrite_op(discr, subst),
+        Terminator::Assert { cond, .. } => rewrite_op(cond, subst),
+        Terminator::Call { args, .. } => {
+            for a in args {
+                rewrite_op(a, subst);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -243,9 +569,9 @@ pub fn parse(text: &str) -> Result<Program, String> {
                 prog.consts.insert(name, val);
             }
             i += 1;
-        } else if l.starts_with("alloc") && l.contains("(size:") {
-            let (id, bytes, next) = parse_alloc(&lines, i)?;
-            prog.allocs.insert(id, bytes);
+        } else if l.starts_with("alloc") && l.contains("size:") {
+            let (id, data, next) = parse_alloc(&lines, i)?;
+            prog.allocs.insert(id, data);
             i = next;
         } else {
             i += 1;
@@ -278,26 +604,63 @@ fn parse_const_item(line: &str) -> Option<(String, i64)> {
 }
 
 /// `allocN (size: S, align: A) {` followed by hex rows until `}`.
-fn parse_alloc(lines: &[String], start: usize) -> Result<(u32, Vec<u8>, usize), String> {
+///
+/// A row may also carry a pointer relocation, printed as a run of box-drawing
+/// characters, then `allocK<imm>`, then the offset's little-endian bytes and a
+/// `│`-separated preview. The relocation is recorded as `(offset, allocK)` and
+/// its bytes are skipped.
+fn parse_alloc(lines: &[String], start: usize) -> Result<(u32, AllocData, usize), String> {
     let header = lines[start].trim();
     let id: u32 = header
         .strip_prefix("alloc")
         .and_then(|r| r.split_whitespace().next())
         .and_then(|n| n.parse().ok())
         .ok_or_else(|| format!("mir: bad alloc header `{header}`"))?;
-    let mut bytes = Vec::new();
+    let static_name = header
+        .split_once("static:")
+        .and_then(|(_, r)| r.split(',').next())
+        .map(|n| n.trim().to_string());
+    let mut data = AllocData { bytes: Vec::new(), relocs: Vec::new(), static_name };
     let mut i = start + 1;
     while i < lines.len() {
         let l = lines[i].trim();
         if l.starts_with('}') {
-            return Ok((id, bytes, i + 1));
+            return Ok((id, data, i + 1));
         }
-        // A row is `68 65 6c ...` optionally followed by `│ ascii`. Split at
-        // the box-drawing character, then read hex pairs.
-        let hex = l.split('│').next().unwrap_or(l);
-        for tok in hex.split_whitespace() {
-            if let Ok(b) = u8::from_str_radix(tok, 16) {
-                bytes.push(b);
+        // The dump is a table split by the box-drawing `│`. Two shapes appear:
+        //   `╾──alloc1<imm>──╼ 0f 00 .. │ ascii`   (data, then a preview)
+        //   `0x00 │ 0e 00 .. │ ascii`              (offset, data, preview)
+        // so the data field is the first one unless the line opens with a
+        // `0x..` offset column, in which case it is the second.
+        let fields: Vec<&str> = l.split('│').collect();
+        let data_field = if fields[0].trim().starts_with("0x") && fields.len() >= 2 {
+            fields[1]
+        } else {
+            fields[0]
+        };
+        for tok in data_field.split_whitespace() {
+            // A `__` marks padding past the initialised bytes, not a byte.
+            if tok == "__" {
+                continue;
+            }
+            if tok.contains("alloc") && tok.contains("<imm>") {
+                let Some(pos) = tok.find("alloc") else { continue };
+                let Some(target) = tok[pos + 5..]
+                    .split(|c: char| !c.is_ascii_digit())
+                    .next()
+                    .and_then(|n| n.parse::<u32>().ok())
+                else {
+                    continue;
+                };
+                let off = data.bytes.len();
+                data.relocs.push((off, target));
+                data.bytes.extend_from_slice(&[0u8; 8]);
+            } else if let Some(hex) = tok.strip_prefix("0x") {
+                if let Ok(b) = u8::from_str_radix(hex, 16) {
+                    data.bytes.push(b);
+                }
+            } else if let Ok(b) = u8::from_str_radix(tok, 16) {
+                data.bytes.push(b);
             }
         }
         i += 1;
@@ -310,6 +673,10 @@ fn parse_fn(lines: &[String], start: usize) -> Result<(Function, usize), String>
     let rest = header.strip_prefix("fn ").unwrap();
     let open = rest.find('(').ok_or_else(|| format!("mir: bad fn header `{header}`"))?;
     let name = rest[..open].trim().to_string();
+    // The emitted symbol is the bare definition name, but a call prints the
+    // qualified path. Map `...::name` (and `<T as Tr>::name`) back to `name` so
+    // direct calls resolve to the definition.
+    let name = normalize_call_name(&name).unwrap_or(name);
     let close = matching(rest, open, '(', ')').ok_or_else(|| format!("mir: unbalanced fn args `{header}`"))?;
     let arg_tys = parse_arg_tys(&rest[open + 1..close])?;
     let after = rest[close + 1..].trim();
@@ -464,12 +831,40 @@ fn parse_call_terminator(t: &str) -> Option<Terminator> {
     let (func, args) = parse_call_head(head).ok()?;
     let dest = parse_place(lhs).ok()?;
     let target = parse_success_target(targets);
-    let func = if func.contains("::") || func.starts_with('<') || func.contains(" as ") {
-        CallTarget::Indirect
+    let func = if let Some(name) = normalize_call_name(&func) {
+        CallTarget::Direct(name)
     } else {
-        CallTarget::Direct(func)
+        CallTarget::Indirect
     };
     Some(Terminator::Call { dest, func, args, target })
+}
+
+/// The name a call should target, or `None` for a call that is not a plain
+/// direct call (a function pointer, or an unresolved generic instantiation).
+///
+/// An inherent or trait method prints qualified (`Wide::total`,
+/// `<core::ops::Range<i64> as Iterator>::next`). rmc's frontend drops the
+/// qualifier, so the last path segment is the definition name; a leading
+/// `::`-less segment after stripping an `<...>` qualifier is that name.
+fn normalize_call_name(name: &str) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() || name.starts_with('_') {
+        return None;
+    }
+    if !name.contains("::") && !name.contains('<') {
+        return Some(name.to_string());
+    }
+    // Drop a leading `<...>` qualifier, then take the final path segment.
+    let mut rest = name;
+    if let Some(stripped) = rest.strip_prefix('<') {
+        let close = matching(rest, 0, '<', '>')?;
+        rest = &rest[close + 1..];
+    }
+    let last = rest.rsplit("::").next()?.trim();
+    if last.is_empty() || last.starts_with('_') || last.contains('<') {
+        return None;
+    }
+    Some(last.to_string())
 }
 
 fn is_ignorable(t: &str) -> bool {
@@ -559,7 +954,21 @@ fn parse_terminator(t: &str) -> Option<Terminator> {
         return Some(Terminator::Unreachable);
     }
     if t.starts_with("assert(") {
-        return Some(Terminator::Abort);
+        // `assert(COND, "msg") -> [success: bbX, unwind ...]`. The condition is
+        // an operand that may be negated (`!move _6`); a false condition traps.
+        let open = t.find('(')?;
+        let close = matching(t, open, '(', ')')?;
+        let inner = &t[open + 1..close];
+        let cond_part = split_top_args(inner).into_iter().next()?;
+        let cond_part = cond_part.trim();
+        let (negate, rest) = match cond_part.strip_prefix('!') {
+            Some(r) => (true, r.trim()),
+            None => (false, cond_part),
+        };
+        let cond = parse_operand(rest).ok()?;
+        let (_, targets) = split_arrow(t)?;
+        let target = parse_success_target(targets)?;
+        return Some(Terminator::Assert { cond, negate, target });
     }
     if t.starts_with("resume") {
         return Some(Terminator::Abort);
@@ -701,6 +1110,11 @@ fn strip_top_type(s: &str) -> &str {
 
 fn parse_rvalue(s: &str) -> Result<Rvalue, String> {
     let s = s.trim();
+    // `no_retag` marks a value that the borrow checker does not retag; it does
+    // not change the value itself.
+    if let Some(r) = s.strip_prefix("no_retag ") {
+        return parse_rvalue(r.trim());
+    }
     // `&raw const PLACE` / `&raw mut PLACE`
     if let Some(r) = s.strip_prefix("&raw const ") {
         return Ok(Rvalue::RawRef { mutbl: false, place: parse_place(r.trim())? });
@@ -723,6 +1137,11 @@ fn parse_rvalue(s: &str) -> Result<Rvalue, String> {
         let op = parse_operand(op_part.trim())?;
         let from = operand_ty(&op);
         return Ok(Rvalue::Cast { from: Box::new(from), to: Box::new(ty), op, kind });
+    }
+    // A bare constant operand, e.g. `const {alloc2: &&[u8]}` or `const 0_i64`.
+    if let Some(r) = s.strip_prefix("const ") {
+        let c = parse_const(r.trim()).ok_or_else(|| format!("mir: bad const `{s}`"))?;
+        return Ok(Rvalue::Use(Operand::Const(c)));
     }
     if s == "[]" {
         return Ok(Rvalue::Array(Vec::new()));
@@ -773,6 +1192,28 @@ fn parse_rvalue(s: &str) -> Result<Rvalue, String> {
     if let Some(r) = s.strip_prefix("Len(") {
         let inner = r.trim_end_matches(')');
         return Ok(Rvalue::Len(parse_place(inner.trim())?));
+    }
+    // `discriminant(PLACE)`
+    if let Some(r) = s.strip_prefix("discriminant(") {
+        let inner = r.trim_end_matches(')');
+        return Ok(Rvalue::Discriminant(parse_place(inner.trim())?));
+    }
+    // `AddWithOverflow(a, b)` / `SubWithOverflow` / `MulWithOverflow`.
+    for (name, op) in [("AddWithOverflow", BinOp::Add), ("SubWithOverflow", BinOp::Sub), ("MulWithOverflow", BinOp::Mul)] {
+        if let Some(r) = s.strip_prefix(name) {
+            let r = r.trim();
+            if let Some(open) = r.find('(') {
+                let close = matching(r, open, '(', ')').ok_or_else(|| format!("mir: unbalanced op `{s}`"))?;
+                let args = split_top_args(&r[open + 1..close]);
+                if args.len() == 2 {
+                    return Ok(Rvalue::WithOverflow {
+                        op,
+                        a: parse_operand(args[0].trim())?,
+                        b: parse_operand(args[1].trim())?,
+                    });
+                }
+            }
+        }
     }
     // `f(args)` without a `->` is a function-pointer value; unsupported.
     // Binary and unary ops: `Op(a, b)`.
@@ -905,6 +1346,21 @@ fn parse_const(s: &str) -> Option<Const> {
         return Some(Const::Int(n));
     }
     if s.starts_with('{') {
+        // `{allocN: TY}` — a static allocation, possibly with an interior
+        // offset printed as `{allocN: TY[place]}`.
+        if let Some(rest) = s.strip_prefix("{alloc") {
+            if let Some(colon) = rest.find(':') {
+                if let Ok(id) = rest[..colon].trim().parse::<u32>() {
+                    let after = &rest[colon + 1..];
+                    let place = after
+                        .find('[')
+                        .and_then(|open| matching(after, open, '[', ']').map(|close| &after[open + 1..close]))
+                        .and_then(|p| parse_place(p).ok())
+                        .map(Box::new);
+                    return Some(Const::Alloc { id, place });
+                }
+            }
+        }
         return Some(Const::Named(s.to_string()));
     }
     if let Some(n) = parse_int_literal(s) {
@@ -1142,4 +1598,422 @@ fn split_top_as(s: &str) -> Option<(&str, &str)> {
         i += 1;
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Loop-invariant code motion
+// ---------------------------------------------------------------------------
+
+/// The functions a MIR function may call without observable side effects, so a
+/// call to one can be hoisted out of a loop. This is the MIR analogue of the
+/// AST backend's `licm` pass, which runs after inlining; rustc leaves the
+/// accessor calls in place, so they are hoisted here instead.
+///
+/// A call is only *hoisted* when every operand it reads is invariant and the
+/// callee does not write the caller's frame, which the purity list plus the
+/// no-memory-write rule below guarantee. Calls that allocate (`alloc`) or write
+/// (`print_i64`, `putchar`) are never pure.
+fn pure_call(name: &str) -> bool {
+    !matches!(name, "alloc" | "print_i64" | "print_str" | "putchar" | "free")
+}
+
+/// Run loop-invariant code motion over the whole crate.
+pub fn licm(prog: &mut Program) {
+    for f in &mut prog.funcs {
+        f.licm();
+    }
+}
+
+impl Function {
+    /// Hoist loop-invariant computations out of each natural loop.
+    ///
+    /// Only a *backward* branch is treated as a loop (its header is the target
+    /// and its latches are the blocks that jump back). The pass hoists a
+    /// statement to the header's sole predecessor — the preheader, which rustc
+    /// emits for every loop — and only when:
+    ///
+    /// * the statement is a pure call or a scalar arithmetic rvalue;
+    /// * every operand it reads is defined *outside* the loop and never
+    ///   redefined inside it (so no value in the loop can be a `Move` that the
+    ///   hoisted statement would then read as already-consumed);
+    /// * the loop writes no memory at all, and every call in it is to a pure
+    ///   function (a call is a barrier: it can read or write anything);
+    /// * every destination is written exactly once in the whole function, so the
+    ///   hoisted definition dominates all its uses and no second definition can
+    ///   clobber it.
+    ///
+    /// The preheader is the loop header's only predecessor. Hoisting to it is
+    /// safe because it is entered on the way to the loop and executed once.
+    fn licm(&mut self) {
+        let nblocks = self.blocks.len();
+        if nblocks == 0 {
+            return;
+        }
+        let defs = self.def_counts();
+        let use_counts = self.use_counts();
+
+        // Which blocks write memory (a store, a call, or an address-taking op).
+        let writes_mem: Vec<bool> = self.blocks.iter().map(|b| block_writes_mem(b)).collect();
+        let impure_call: Vec<bool> = self.blocks.iter().map(|b| block_has_impure_call(b)).collect();
+
+        // Predecessors, from the terminator successors.
+        let mut preds: Vec<Vec<u32>> = vec![Vec::new(); nblocks];
+        for (b, blk) in self.blocks.iter().enumerate() {
+            for s in successors(&blk.term) {
+                if let Some(p) = preds.get_mut(s as usize) {
+                    p.push(b as u32);
+                }
+            }
+        }
+
+        // Each backward branch is a latch; group latches by their header.
+        let mut latches: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (b, blk) in self.blocks.iter().enumerate() {
+            for s in successors(&blk.term) {
+                if s <= b as u32 {
+                    latches.entry(s).or_default().push(b as u32);
+                }
+            }
+        }
+        // Deterministic order so the output is stable across runs.
+        let mut headers: Vec<u32> = latches.keys().copied().collect();
+        headers.sort_unstable();
+
+        for header in headers {
+            self.licm_loop(header, &latches, &preds, &defs, &use_counts, &writes_mem, &impure_call);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn licm_loop(
+        &mut self,
+        header: u32,
+        latches: &HashMap<u32, Vec<u32>>,
+        preds: &[Vec<u32>],
+        defs: &HashMap<u32, u32>,
+        use_counts: &HashMap<u32, u32>,
+        writes_mem: &[bool],
+        impure_call: &[bool],
+    ) {
+        // The preheader is the header's only predecessor from *outside* the
+        // loop: then the loop is entered from exactly one place, and hoisting to
+        // it runs once. (The latches are predecessors too, but they are inside.)
+        let loop_blocks = self.loop_blocks(header, latches);
+        let mut outside: Vec<u32> = preds[header as usize]
+            .iter()
+            .copied()
+            .filter(|p| !loop_blocks.contains(p))
+            .collect();
+        if outside.len() != 1 {
+            return;
+        }
+        let preheader = outside.pop().unwrap();
+        if preheader == header {
+            return;
+        }
+        // Redirecting the preheader into the hoisted-call chain replaces its
+        // terminator, so it must be a plain `goto` to the header; a conditional
+        // preheader would lose its other edge.
+        if !matches!(self.blocks[preheader as usize].term, Terminator::Goto(t) if t == header) {
+            return;
+        }
+        // A loop that writes memory, or calls anything impure, gives up: a call
+        // can read or write state a hoisted load would have to observe.
+        if loop_blocks
+            .iter()
+            .any(|b| writes_mem[*b as usize] || impure_call[*b as usize])
+        {
+            return;
+        }
+        // Values defined inside the loop cannot be read outside it. Call
+        // destinations are terminators, not statements, so they are collected
+        // separately: a hoisted statement must never read one, because the
+        // hoisted call is emitted after the hoisted statements.
+        let term_defs = |blk: &BasicBlock| -> Option<u32> {
+            match &blk.term {
+                Terminator::Call { dest, .. } if dest.proj.is_empty() => Some(dest.local),
+                _ => None,
+            }
+        };
+        let defined_in: HashSet<u32> = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(b, _)| loop_blocks.contains(&(*b as u32)))
+            .flat_map(|(_, blk)| {
+                blk.stmts
+                    .iter()
+                    .filter_map(written_local)
+                    .chain(term_defs(blk))
+            })
+            .collect();
+        // ...nor can values that would be `Move`d inside the loop: the hoisted
+        // read happens before that move.
+        let moved_in: HashSet<u32> = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(b, _)| loop_blocks.contains(&(*b as u32)))
+            .flat_map(|(_, blk)| blk.stmts.iter().filter_map(stmt_moved_local))
+            .collect();
+        let defined_in: HashSet<u32> = defined_in.union(&moved_in).copied().collect();
+
+        // `_0` (the return slot) is written by `return` and by calls; never hoist
+        // a definition of it, and never treat it as invariant.
+        let is_invariant = |l: u32| !defined_in.contains(&l) && l != 0;
+
+        // Collect hoistable statements, in block order.
+        let mut hoisted: Vec<Stmt> = Vec::new();
+        for &b in &loop_blocks {
+            let blk = &self.blocks[b as usize];
+            for s in &blk.stmts {
+                let Stmt::Assign(dest, rv) = s else { continue };
+                if !dest.proj.is_empty() {
+                    continue;
+                }
+                // The destination must be single-definition in the whole
+                // function, so hoisting dominates its uses and nothing else
+                // writes it.
+                if defs.get(&dest.local).copied().unwrap_or(0) != 1 {
+                    continue;
+                }
+                // A dead destination (no uses) is not worth hoisting.
+                if use_counts.get(&dest.local).copied().unwrap_or(0) == 0 {
+                    continue;
+                }
+                if !hoistable_rv(rv) {
+                    continue;
+                }
+                if !rv_operands(rv).iter().all(|p| is_invariant(p.local)) {
+                    continue;
+                }
+                hoisted.push(s.clone());
+            }
+        }
+
+        // Collect hoistable calls. A pure call with invariant arguments produces
+        // the same value every iteration, so it runs once in the preheader
+        // instead. rustc keeps the accessor calls in `refs`' hot loop; hoisting
+        // them is what the AST backend's `licm` achieves by inlining first.
+        let mut hoisted_calls: Vec<(u32, u32, CallTarget, Vec<Operand>, u32)> = Vec::new();
+        for &b in &loop_blocks {
+            if b == header {
+                continue; // the header's terminator is the loop test
+            }
+            let blk = &self.blocks[b as usize];
+            let Terminator::Call { dest, func, args, target: Some(t) } = &blk.term else {
+                continue;
+            };
+            if !dest.proj.is_empty() || dest.local == 0 {
+                continue;
+            }
+            if defs.get(&dest.local).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            let CallTarget::Direct(name) = func else { continue };
+            if !pure_call(name) {
+                continue;
+            }
+            if !call_args_invariant(args, &is_invariant) {
+                continue;
+            }
+            hoisted_calls.push((b, dest.local, func.clone(), args.clone(), *t));
+        }
+
+        if hoisted.is_empty() && hoisted_calls.is_empty() {
+            return;
+        }
+
+        // Remove the hoisted statements from their blocks. A statement is
+        // identified by its destination local, which the single-definition test
+        // already made unique.
+        let moved: HashSet<u32> = hoisted.iter().filter_map(written_local).collect();
+        if !moved.is_empty() {
+            for b in &loop_blocks {
+                let blk = &mut self.blocks[*b as usize];
+                blk.stmts.retain(|s| match written_local(s) {
+                    Some(l) => !moved.contains(&l),
+                    None => true,
+                });
+            }
+        }
+        // A hoisted call leaves a plain `goto` behind, keeping the loop's
+        // control flow intact.
+        for (b, _, _, _, t) in &hoisted_calls {
+            self.blocks[*b as usize].term = Terminator::Goto(*t);
+        }
+
+        // Append a chain of blocks holding the hoisted calls, in their original
+        // order, ending at the loop header, and route the preheader into it.
+        let mut chain_entry = header;
+        if !hoisted_calls.is_empty() {
+            let mut blocks: Vec<BasicBlock> = Vec::with_capacity(hoisted_calls.len());
+            for i in 0..hoisted_calls.len() {
+                let next = if i + 1 < hoisted_calls.len() {
+                    (self.blocks.len() + i + 1) as u32
+                } else {
+                    header
+                };
+                let (_, dest_local, func, args, _) = &hoisted_calls[i];
+                blocks.push(BasicBlock {
+                    stmts: Vec::new(),
+                    term: Terminator::Call {
+                        dest: Place { local: *dest_local, proj: Vec::new() },
+                        func: func.clone(),
+                        args: args.clone(),
+                        target: Some(next),
+                    },
+                });
+            }
+            chain_entry = self.blocks.len() as u32;
+            self.blocks.extend(blocks);
+        }
+
+        // Prepend the hoisted statements to the preheader and redirect it into
+        // the call chain (or straight to the header when there is none).
+        let pre = &mut self.blocks[preheader as usize];
+        let mut new_stmts = hoisted;
+        new_stmts.append(&mut pre.stmts);
+        pre.stmts = new_stmts;
+        pre.term = Terminator::Goto(chain_entry);
+    }
+
+    /// The set of blocks that make up the loop with the given header: every
+    /// block that can reach a latch without passing through the header, plus
+    /// the header itself.
+    fn loop_blocks(&self, header: u32, latches: &HashMap<u32, Vec<u32>>) -> HashSet<u32> {
+        let mut in_loop: HashSet<u32> = HashSet::new();
+        in_loop.insert(header);
+        let mut worklist: Vec<u32> = latches.get(&header).cloned().unwrap_or_default();
+        while let Some(b) = worklist.pop() {
+            if !in_loop.insert(b) {
+                continue;
+            }
+            // Walk predecessors, stopping at the header (its other predecessors
+            // are outside the loop).
+            for (p, blk) in self.blocks.iter().enumerate() {
+                let _ = blk;
+                if successors(&self.blocks[p].term).contains(&b) && p as u32 != header {
+                    worklist.push(p as u32);
+                }
+            }
+        }
+        in_loop
+    }
+}
+
+/// The successor blocks of a terminator.
+fn successors(t: &Terminator) -> Vec<u32> {
+    match t {
+        Terminator::Goto(b) => vec![*b],
+        Terminator::SwitchInt { targets, otherwise, .. } => {
+            let mut v: Vec<u32> = targets.iter().map(|(_, b)| *b).collect();
+            v.push(*otherwise);
+            v
+        }
+        Terminator::Call { target, .. } => target.iter().copied().collect(),
+        Terminator::Assert { target, .. } => vec![*target],
+        Terminator::Return | Terminator::Unreachable | Terminator::Abort => Vec::new(),
+    }
+}
+
+/// True when a call's arguments are all invariant: each is a constant, or a
+/// read of a whole local that the loop neither defines nor moves.
+fn call_args_invariant(args: &[Operand], is_invariant: &impl Fn(u32) -> bool) -> bool {
+    args.iter().all(|a| match a {
+        Operand::Const(_) => true,
+        Operand::Copy(p) | Operand::Move(p) => p.proj.is_empty() && is_invariant(p.local),
+    })
+}
+
+/// True when a block contains anything that could write memory: a store, an
+/// address-taking rvalue, or a call to a function that is not known pure. A
+/// pure call is not a store, so it does not block hoisting a load past it.
+fn block_writes_mem(b: &BasicBlock) -> bool {
+    b.stmts.iter().any(|s| match s {
+        Stmt::Assign(_, rv) => matches!(
+            rv,
+            Rvalue::Ref { .. }
+                | Rvalue::RawRef { .. }
+                | Rvalue::Array(_)
+                | Rvalue::Aggregate(_)
+                | Rvalue::Repeat { .. }
+        ),
+        Stmt::Nop => false,
+    }) || block_has_impure_call(b)
+}
+
+/// True when a block contains a call that is not to a known-pure function.
+fn block_has_impure_call(b: &BasicBlock) -> bool {
+    match &b.term {
+        Terminator::Call { func: CallTarget::Direct(name), .. } => !pure_call(name),
+        Terminator::Call { func: CallTarget::Indirect, .. } => true,
+        _ => false,
+    }
+}
+
+/// True when an rvalue is cheap and pure enough to hoist: a use, a scalar
+/// arithmetic op, or a direct call to a pure function.
+fn hoistable_rv(rv: &Rvalue) -> bool {
+    match rv {
+        Rvalue::Use(_) => false, // a bare move is not worth hoisting
+        Rvalue::Binary(op, _, _) => !matches!(op, BinOp::Div | BinOp::Rem),
+        Rvalue::Unary(_, _) => true,
+        Rvalue::Cast { .. } => true,
+        Rvalue::Discriminant(_) => false,
+        _ => false,
+    }
+}
+
+/// The locals a statement reads. Used to test invariance. A call is handled by
+/// the block-level purity rule, so only its arguments matter here.
+fn rv_operands(rv: &Rvalue) -> Vec<Place> {
+    let mut v = Vec::new();
+    let mut push = |op: &Operand| {
+        if let Operand::Copy(p) | Operand::Move(p) = op {
+            v.push(p.clone());
+        }
+    };
+    match rv {
+        Rvalue::Use(op) => push(op),
+        Rvalue::Binary(_, a, b) => {
+            push(a);
+            push(b);
+        }
+        Rvalue::Unary(_, a) => push(a),
+        Rvalue::Cast { op, .. } => push(op),
+        Rvalue::Repeat { op, .. } => push(op),
+        Rvalue::Array(ops) | Rvalue::Aggregate(ops) => ops.iter().for_each(|op| push(op)),
+        Rvalue::WithOverflow { a, b, .. } => {
+            push(a);
+            push(b);
+        }
+        _ => {}
+    }
+    v
+}
+
+/// The local a statement moves out of, if it is a `Move` of a whole scalar
+/// local (so the loop would consume it).
+fn stmt_moved_local(s: &Stmt) -> Option<u32> {
+    let Stmt::Assign(_, rv) = s else { return None };
+    let mut found = None;
+    let mut note = |op: &Operand| {
+        if let Operand::Move(p) = op {
+            if p.proj.is_empty() {
+                found = Some(p.local);
+            }
+        }
+    };
+    match rv {
+        Rvalue::Use(op) => note(op),
+        Rvalue::Binary(_, a, b) => {
+            note(a);
+            note(b);
+        }
+        Rvalue::Unary(_, a) => note(a),
+        Rvalue::Cast { op, .. } => note(op),
+        _ => {}
+    }
+    found
 }

@@ -31,6 +31,10 @@ use std::fmt::Write as _;
 
 /// Callee-saved registers the generator may hand to a promoted local.
 const PROMOTE_REGS: [&str; 5] = ["%rbx", "%r12", "%r13", "%r14", "%r15"];
+/// Caller-saved registers used to hold a local across a region that makes no
+/// call. They must be spilled around any call, so they are only handed out to
+/// functions that contain no call at all.
+const CALLER_REGS: [&str; 4] = ["%rsi", "%rdi", "%r8", "%r9"];
 
 pub struct Options {
     /// Emit `jo __rmc_overflow` after `+`/`-`/`*` (rustc's overflow-checks).
@@ -61,17 +65,28 @@ struct FnGen<'a> {
     opts: &'a Options,
     /// String literal content -> its `.rodata` label.
     string_ids: &'a HashMap<String, String>,
+    /// Static allocation id -> its data label.
+    alloc_labels: &'a HashMap<u32, String>,
     /// Local index -> its byte size (`8` for a scalar, `8*n` for an aggregate).
     size: Vec<i64>,
     /// Local index -> type.
     ty: Vec<Ty>,
+    /// Local index -> the slot index its region starts at.
+    local_base: Vec<i64>,
     /// Local index -> promoted register, when promoted.
     promo: HashMap<u32, Promo>,
     /// Local index -> shadow slot, for a promoted local whose address is taken.
     shadow: HashMap<u32, i64>,
+    /// Local index -> spill slot, for a promoted *caller-saved* local (spilled
+    /// around a call).
+    caller_spill: HashMap<u32, i64>,
     /// Locals that are an operand of a loop's counted comparison (the counter
     /// and its bound), promoted first.
     loop_operands: Vec<u32>,
+    /// Whether the function can reach a call to `alloc`. `alloc` keeps the heap
+    /// pointer in a caller-saved register, so such a function cannot promote a
+    /// value into one and keep it live across the call.
+    allocates: bool,
     /// Callee-saved registers saved below `%rbp`; frame slots start past them.
     saved_regs: i64,
     next_slot: i64,
@@ -93,11 +108,17 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<String, String> {
     // String literals become `.rodata` labels, emitted once.
     let (strings, string_ids) = collect_strings(prog);
 
+    // Every static allocation becomes a `.rodata` blob: its bytes, plus a
+    // `.quad` for each interior pointer relocation. `alloc1` (string data) and
+    // `alloc2` (the promoted `static` pointer) are both reached this way.
+    let alloc_labels: HashMap<u32, String> =
+        prog.allocs.keys().map(|id| (*id, format!("__rmc_alloc{id}"))).collect();
+
     for f in &order {
         if is_unsupported_builtin(&f.name) {
             continue;
         }
-        let mut g = FnGen::new(prog, f, opts, &string_ids);
+        let mut g = FnGen::new(prog, f, opts, &string_ids, &alloc_labels);
         let body = g.gen_fn()?;
         asm.push_str(&body);
         if !g.errors.is_empty() {
@@ -105,19 +126,54 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<String, String> {
         }
     }
 
+    let mut rodata = String::new();
     if !strings.is_empty() {
-        asm.push_str("\n.section .rodata\n");
+        rodata.push_str("\n.section .rodata\n");
         for s in &strings {
             let label = &string_ids[s];
-            let _ = writeln!(asm, "{label}:");
+            let _ = writeln!(rodata, "{label}:");
             let mut parts = Vec::new();
             for b in s.bytes() {
                 parts.push(b.to_string());
             }
             parts.push("0".to_string()); // NUL-terminate
-            let _ = writeln!(asm, "  .byte {}", parts.join(", "));
+            let _ = writeln!(rodata, "  .byte {}", parts.join(", "));
         }
     }
+    let mut alloc_ids: Vec<&u32> = prog.allocs.keys().collect();
+    alloc_ids.sort();
+    if !alloc_ids.is_empty() {
+        if strings.is_empty() {
+            rodata.push_str("\n.section .rodata\n");
+        }
+        for id in alloc_ids {
+            let data = &prog.allocs[id];
+            let label = &alloc_labels[id];
+            let _ = writeln!(rodata, "{label}:");
+            // Emit a byte run between relocations, then the pointer word.
+            let mut off = 0usize;
+            let mut relocs = data.relocs.clone();
+            relocs.sort_by_key(|(o, _)| *o);
+            for (ro, target) in relocs {
+                if ro > off {
+                    let bytes: Vec<String> =
+                        data.bytes[off..ro.min(data.bytes.len())].iter().map(|b| b.to_string()).collect();
+                    let _ = writeln!(rodata, "  .byte {}", bytes.join(", "));
+                }
+                let tlabel = alloc_labels
+                    .get(&target)
+                    .cloned()
+                    .unwrap_or_else(|| format!("__rmc_alloc{target}"));
+                let _ = writeln!(rodata, "  .quad {tlabel}");
+                off = ro + 8;
+            }
+            if off < data.bytes.len() {
+                let bytes: Vec<String> = data.bytes[off..].iter().map(|b| b.to_string()).collect();
+                let _ = writeln!(rodata, "  .byte {}", bytes.join(", "));
+            }
+        }
+    }
+    asm.push_str(&rodata);
     Ok(asm)
 }
 
@@ -141,6 +197,28 @@ fn reachable(prog: &Program) -> HashSet<String> {
         }
     }
     live
+}
+
+/// Whether `name` can reach a call to `callee` through direct calls.
+fn func_calls(prog: &Program, name: &str, callee: &str) -> bool {
+    let mut seen = HashSet::new();
+    let mut stack = vec![name.to_string()];
+    while let Some(n) = stack.pop() {
+        if !seen.insert(n.clone()) {
+            continue;
+        }
+        if n == callee {
+            return true;
+        }
+        if let Some(f) = prog.func(&n) {
+            for b in &f.blocks {
+                if let Terminator::Call { func: CallTarget::Direct(c), .. } = &b.term {
+                    stack.push(c.clone());
+                }
+            }
+        }
+    }
+    false
 }
 
 fn is_unsupported_builtin(name: &str) -> bool {
@@ -222,19 +300,24 @@ impl<'a> FnGen<'a> {
         func: &'a Function,
         opts: &'a Options,
         string_ids: &'a HashMap<String, String>,
+        alloc_labels: &'a HashMap<u32, String>,
     ) -> Self {
         FnGen {
             prog,
             func,
             opts,
             string_ids,
+            alloc_labels,
             size: Vec::new(),
             ty: Vec::new(),
+            local_base: Vec::new(),
             promo: HashMap::new(),
             shadow: HashMap::new(),
+            caller_spill: HashMap::new(),
             loop_operands: Vec::new(),
+            allocates: func_calls(prog, &func.name, "alloc"),
             saved_regs: 0,
-            next_slot: func.locals.len() as i64,
+            next_slot: 0,
             out: String::new(),
             label: 0,
             errors: Vec::new(),
@@ -261,6 +344,11 @@ impl<'a> FnGen<'a> {
         format!("{}(%rbp)", -(slot + 1 + self.saved_regs) * 8)
     }
 
+    /// The slot index at which `local`'s storage begins.
+    fn local_base(&self, local: u32) -> i64 {
+        self.local_base.get(local as usize).copied().unwrap_or(local as i64)
+    }
+
     fn local_size(&self, local: u32) -> i64 {
         self.size.get(local as usize).copied().unwrap_or(8)
     }
@@ -273,7 +361,7 @@ impl<'a> FnGen<'a> {
     fn local_operand(&self, local: u32) -> String {
         match self.promo.get(&local) {
             Some(p) => p.reg.to_string(),
-            None => self.off(local as i64),
+            None => self.off(self.local_base(local)),
         }
     }
 
@@ -288,10 +376,24 @@ impl<'a> FnGen<'a> {
     /// Compute each local's size and type, and find the operands of counted
     /// loop tests (`switchInt(Lt(counter, bound))`).
     fn analyze(&mut self) {
+        // Give every local its own region sized to its type: an aggregate such
+        // as `[i64; 200000]` needs 1.6 MB of frame, not one 8-byte slot. A
+        // scalar takes one slot. Regions are laid out first so `local_base` can
+        // be indexed directly.
+        let mut slot = 0i64;
         for l in &self.func.locals {
+            let size = ty_size(&l.ty);
+            let slots = ((size + 7) / 8).max(1);
             self.ty.push((*l.ty).clone());
-            self.size.push(ty_size(&l.ty));
+            self.size.push(size);
+            // Frame slots grow downward from `%rbp`, but an aggregate is
+            // addressed upward from its base, so the base is the region's
+            // *lowest* slot (the highest index). `off` then names the bottom of
+            // the region and a projection adds its byte offset.
+            self.local_base.push(slot + slots - 1);
+            slot += slots;
         }
+        self.next_slot = slot;
         // For each `switchInt(cmp) -> [0: exit, otherwise: body]`, the `cmp` is
         // a comparison assignment in the same block; its operands are the loop
         // counter and bound.
@@ -357,12 +459,26 @@ impl<'a> FnGen<'a> {
             })
             .collect();
         ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let pool = self.reg_pool();
         for (l, _) in ranked {
-            if self.promo.len() >= PROMOTE_REGS.len() {
+            if self.promo.len() >= pool.len() {
                 break;
             }
             self.promote_local(l, &mut used);
         }
+    }
+
+    /// The registers this function may promote into. Caller-saved registers are
+    /// usable too; the generator spills them around any call. A function that
+    /// allocates gets only the callee-saved registers, whose values survive
+    /// `alloc`: the heap pointer lives in a caller-saved register, and a
+    /// promotion would keep a stale copy across the call.
+    fn reg_pool(&self) -> Vec<&'static str> {
+        let mut pool: Vec<&'static str> = PROMOTE_REGS.to_vec();
+        if !self.allocates {
+            pool.extend_from_slice(&CALLER_REGS);
+        }
+        pool
     }
 
     fn promote_local(&mut self, local: u32, used: &mut HashSet<&'static str>) {
@@ -373,16 +489,18 @@ impl<'a> FnGen<'a> {
         if ty.is_aggregate() {
             return;
         }
-        let Some(reg) = PROMOTE_REGS.iter().find(|r| !used.contains(*r)).copied() else {
+        // An argument is copied out of its ABI register at entry, in parallel,
+        // so a caller-saved register cannot be its destination: it may still
+        // hold a later argument that has not been moved yet. Restrict arguments
+        // to the callee-saved pool, which never overlaps the argument registers.
+        let is_arg = self.func.locals.get(local as usize).map(|l| l.is_arg).unwrap_or(false);
+        let pool = if is_arg { PROMOTE_REGS.to_vec() } else { self.reg_pool() };
+        let Some(reg) = pool.iter().find(|r| !used.contains(*r)).copied() else {
             return;
         };
         used.insert(reg);
-        // A local that survives a call needs its register saved, which a
-        // `%rbx`/`%r12`-`%r15` (callee-saved) register gets for free; the
-        // generator saves every register it promotes in the prologue anyway,
-        // so a call site never has to spill.
-        let _ = local;
-        self.promo.insert(local, Promo { reg, caller_saved: false });
+        let caller_saved = CALLER_REGS.contains(&reg);
+        self.promo.insert(local, Promo { reg, caller_saved });
     }
 
     // --- function ----------------------------------------------------------
@@ -398,6 +516,13 @@ impl<'a> FnGen<'a> {
                 self.shadow.insert(l, s);
             }
         }
+        // A promoted caller-saved local needs a home across a call.
+        for l in 0..self.func.locals.len() as u32 {
+            if self.promo.get(&l).map(|p| p.caller_saved).unwrap_or(false) {
+                let s = self.alloc_slot();
+                self.caller_spill.insert(l, s);
+            }
+        }
         let base_slots = self.next_slot;
 
         // Dry pass: discover how many spill slots the body needs, then run the
@@ -409,7 +534,9 @@ impl<'a> FnGen<'a> {
         self.label = 0;
         self.next_slot = base_slots;
 
-        // Save the promoted registers (callee-saved: the ABI requires it).
+        // Save the callee-saved promoted registers (the ABI requires it). A
+        // caller-saved register is preserved by the caller, so it is spilled
+        // only around a call (see `gen_call`).
         let saved: Vec<&'static str> = PROMOTE_REGS
             .iter()
             .copied()
@@ -445,7 +572,8 @@ impl<'a> FnGen<'a> {
             let _ = writeln!(self.out, "  pop {r}");
         }
         self.out.push_str("  leave\n  ret\n");
-        Ok(std::mem::take(&mut self.out))
+        let body = std::mem::take(&mut self.out);
+        Ok(peephole(&body))
     }
 
     /// Argument setup plus every basic block. Run twice (dry, then real).
@@ -503,13 +631,22 @@ impl<'a> FnGen<'a> {
         self.gen_term(bb, &term)
     }
 
-    /// The index of the statement a comparison switch folds away, if any.
+    /// The index of the statement a comparison terminator folds away, if any.
+    /// Both a `switchInt(bool)` (an `if`/loop test) and an `assert(bool)` (a
+    /// bounds check) read a `bool` local that was just computed by a comparison;
+    /// the terminator emits the `cmp`+`jcc` itself, so the `bool` store is dead.
     fn compare_branch_skip(&self, bb: u32, term: &Terminator) -> Option<usize> {
-        let Terminator::SwitchInt { discr, targets, .. } = term else { return None };
-        if targets.len() != 1 {
-            return None;
-        }
-        let pl = operand_place(discr)?;
+        let cond = match term {
+            Terminator::SwitchInt { discr, targets, .. } => {
+                if targets.len() != 1 {
+                    return None;
+                }
+                discr
+            }
+            Terminator::Assert { cond, .. } => cond,
+            _ => return None,
+        };
+        let pl = operand_place(cond)?;
         if !pl.proj.is_empty() {
             return None;
         }
@@ -523,6 +660,28 @@ impl<'a> FnGen<'a> {
             }
         }
         last
+    }
+
+    /// Emit the `cmp` for the comparison that produced `cond` in `bb`, when
+    /// there is one, and return the comparison's operator. `None` when `cond`
+    /// is not a just-computed compare.
+    fn emit_fused_compare(&mut self, bb: u32, cond: &Operand) -> Result<Option<BinOp>, String> {
+        let Some(pl) = operand_place(cond) else { return Ok(None) };
+        if !pl.proj.is_empty() {
+            return Ok(None);
+        }
+        let Some(block) = self.func.blocks.get(bb as usize) else { return Ok(None) };
+        let mut cmp = None;
+        for s in &block.stmts {
+            if let Stmt::Assign(p, Rvalue::Binary(op, a, b)) = s {
+                if p.local == pl.local && p.proj.is_empty() && is_compare(*op) {
+                    cmp = Some((*op, a.clone(), b.clone()));
+                }
+            }
+        }
+        let Some((op, a, b)) = cmp else { return Ok(None) };
+        self.emit_cmp(op, &a, &b)?;
+        Ok(Some(op))
     }
 
     fn gen_term(&mut self, bb: u32, term: &Terminator) -> Result<(), String> {
@@ -545,6 +704,33 @@ impl<'a> FnGen<'a> {
             }
             Terminator::Abort => {
                 // A trap: exit 101, matching rustc's panic status.
+                self.emit("  mov $101, %rdi");
+                self.emit("  mov $60, %rax");
+                self.emit("  syscall");
+            }
+            Terminator::Assert { cond, negate, target } => {
+                // A `assert(cmp, ..)` folds the comparison into the flags, so
+                // the `bool` local is never materialised.
+                let jcc = match self.emit_fused_compare(bb, cond)? {
+                    Some(op) => {
+                        // `assert(!cmp, ..)` succeeds when the comparison is
+                        // false, so jump on the complement of the comparison.
+                        let op = if *negate { negate_cc(op) } else { op };
+                        jcc(op)
+                    }
+                    None => {
+                        // Otherwise evaluate the condition into `%rax` and test.
+                        let (cv, _) = self.eval_operand(cond)?;
+                        if cv != "%rax" {
+                            self.emit(&format!("  mov {cv}, %rax"));
+                        }
+                        self.emit("  test %rax, %rax");
+                        // `!x` succeeds when `x == 0`; a plain condition
+                        // succeeds when it is non-zero.
+                        if *negate { "je" } else { "jne" }
+                    }
+                };
+                self.emit(&format!("  {jcc} .Lbb{}", self.bb_label(*target)));
                 self.emit("  mov $101, %rdi");
                 self.emit("  mov $60, %rax");
                 self.emit("  syscall");
@@ -577,8 +763,12 @@ impl<'a> FnGen<'a> {
     ) -> Result<(), String> {
         // A two-way `Lt/Le/Gt/Ge` switch is a loop/if test: emit a `cmp` plus
         // the matching `jcc` straight to the taken block.
-        if targets.len() == 1 && self.try_branch_compare(bb, discr, targets[0].1, otherwise)? {
-            return Ok(());
+        if targets.len() == 1 {
+            let (val, t) = targets[0];
+            let (taken, fallthrough) = if val == 0 { (otherwise, t) } else { (t, otherwise) };
+            if self.try_branch_compare(bb, discr, taken, fallthrough)? {
+                return Ok(());
+            }
         }
         let (src, is_mem) = self.eval_operand(discr)?;
         if is_mem {
@@ -597,15 +787,16 @@ impl<'a> FnGen<'a> {
         Ok(())
     }
 
-    /// Try to emit a `switchInt(bool) -> [0: false_target, otherwise: true_target]`
-    /// as one `cmp`+`jcc`, folding the comparison away entirely. Returns false
-    /// when the discriminant is not a comparison.
+    /// Try to emit a `switchInt(bool) -> [0: .., otherwise: ..]` as one
+    /// `cmp`+`jcc`, folding the comparison away entirely. `taken` is the target
+    /// when the comparison is true and `fallthrough` the target when it is
+    /// false. Returns false when the discriminant is not a comparison.
     fn try_branch_compare(
         &mut self,
         bb: u32,
         discr: &Operand,
-        false_target: u32,
-        true_target: u32,
+        taken: u32,
+        fallthrough: u32,
     ) -> Result<bool, String> {
         let Some(pl) = operand_place(discr) else { return Ok(false) };
         if !pl.proj.is_empty() {
@@ -623,10 +814,9 @@ impl<'a> FnGen<'a> {
         }
         let Some((op, a, b)) = cmp else { return Ok(false) };
         self.emit_cmp(op, &a, &b)?;
-        // The comparison being *true* selects `otherwise`; being false selects
-        // the `0:` target.
-        self.emit(&format!("  {} .Lbb{}", jcc(op), self.bb_label(true_target)));
-        self.emit(&format!("  jmp .Lbb{}", self.bb_label(false_target)));
+        // Jump to `taken` when the comparison holds, else to `fallthrough`.
+        self.emit(&format!("  {} .Lbb{}", jcc(op), self.bb_label(taken)));
+        self.emit(&format!("  jmp .Lbb{}", self.bb_label(fallthrough)));
         Ok(true)
     }
 
@@ -697,6 +887,26 @@ impl<'a> FnGen<'a> {
             Const::Named(n) => {
                 return Err(format!("mir_codegen: unsupported constant `{n}`"));
             }
+            Const::Alloc { id, place } => {
+                let label = self
+                    .alloc_labels
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("__rmc_alloc{id}"));
+                // Materialise the address into `%rax`: a `.rodata` label is not
+                // an immediate, and an interior pointer adds a projected offset.
+                self.emit(&format!("  lea {label}(%rip), %rax"));
+                if let Some(p) = place {
+                    for proj in &p.proj {
+                        match proj {
+                            Proj::Field(k) => self.emit(&format!("  add ${}, %rax", *k as i64 * 8)),
+                            Proj::IndexConst(k) => self.emit(&format!("  add ${}, %rax", *k as i64 * 8)),
+                            _ => {}
+                        }
+                    }
+                }
+                "%rax".to_string()
+            }
         })
     }
 
@@ -715,10 +925,10 @@ impl<'a> FnGen<'a> {
                 self.emit(&format!("  mov {reg}, {}", self.off(slot)));
                 self.emit(&format!("  lea {}, %rax", self.off(slot)));
             } else {
-                self.emit(&format!("  lea {}, %rax", self.off(p.local as i64)));
+                self.emit(&format!("  lea {}, %rax", self.off(self.local_base(p.local))));
             }
         } else {
-            self.emit(&format!("  lea {}, %rax", self.off(p.local as i64)));
+            self.emit(&format!("  lea {}, %rax", self.off(self.local_base(p.local))));
         }
         let rest = if starts_deref { &p.proj[1..] } else { &p.proj[..] };
         for proj in rest {
@@ -834,14 +1044,27 @@ impl<'a> FnGen<'a> {
                 self.store_scalar(dest, "%rax")?;
             }
             Rvalue::Repeat { op, count } => {
+                // Materialise the value once, then store it `count` times with a
+                // small runtime loop. The value must survive `place_addr` (which
+                // uses `%rax`), so it lives in a scratch slot; the destination
+                // base address is kept in `%rcx` and the count in `%rdx`.
                 let (src, _) = self.eval_operand(op)?;
-                if src != "%rax" {
-                    self.emit(&format!("  mov {src}, %rax"));
-                }
-                // `[v; n]`: store v into each of the n words.
-                for i in 0..*count {
-                    let target = self.subplace(dest, i);
-                    self.store_scalar(&target, "%rax")?;
+                let tmp = self.alloc_slot();
+                self.emit(&format!("  mov {src}, {}", self.off(tmp)));
+                self.place_addr(dest)?;
+                self.emit("  mov %rax, %rcx");
+                let val = self.off(tmp);
+                if *count == 0 {
+                    // Nothing to store.
+                } else {
+                    let loop_lbl = self.new_label();
+                    self.emit(&format!("  mov ${count}, %rdx"));
+                    self.emit(&format!("  mov {val}, %rax"));
+                    self.emit(&format!("{loop_lbl}:"));
+                    self.emit("  mov %rax, (%rcx)");
+                    self.emit("  add $8, %rcx");
+                    self.emit("  dec %rdx");
+                    self.emit(&format!("  jne {loop_lbl}"));
                 }
             }
             Rvalue::Array(ops) | Rvalue::Aggregate(ops) => {
@@ -865,6 +1088,28 @@ impl<'a> FnGen<'a> {
                 let len = self.array_len(place);
                 self.emit(&format!("  mov ${len}, %rax"));
                 self.store_scalar(dest, "%rax")?;
+            }
+            Rvalue::Discriminant(place) => {
+                // The tag of an enum place lives at its first word.
+                self.place_addr(place)?;
+                self.emit("  mov (%rax), %rax");
+                self.store_scalar(dest, "%rax")?;
+            }
+            Rvalue::WithOverflow { op, a, b } => {
+                let res = self.subplace(dest, 0);
+                let flag = self.subplace(dest, 1);
+                self.gen_binary(&res, *op, a, b)?;
+                // Recompute the flags for the overflow condition: `seto` after
+                // the operation. Reload the operands so the flags match the op.
+                let (av, _) = self.eval_operand(a)?;
+                if av != "%rax" {
+                    self.emit(&format!("  mov {av}, %rax"));
+                }
+                let (bv, _) = self.eval_operand_keep_rax(b)?;
+                self.emit(&format!("  {} {bv}, %rax", ovf_mnem(*op)));
+                self.emit("  seto %al");
+                self.emit("  movzbq %al, %rax");
+                self.store_scalar(&flag, "%rax")?;
             }
             Rvalue::Unsupported(s) => {
                 return Err(format!("mir_codegen: unsupported rvalue `{s}`"));
@@ -891,6 +1136,20 @@ impl<'a> FnGen<'a> {
                 return Ok(());
             }
             self.emit(&format!("  mov {src}, {dst}"));
+            return Ok(());
+        }
+        // A whole-local destination is one frame slot, so store into it
+        // directly instead of materialising its address with an `lea` first.
+        // `mov mem, mem` is not encodable, so a memory source still goes
+        // through `%rcx`.
+        if dest.proj.is_empty() {
+            let dst = self.off(self.local_base(dest.local));
+            if src.contains('(') {
+                self.emit(&format!("  mov {src}, %rcx"));
+                self.emit(&format!("  mov %rcx, {dst}"));
+            } else {
+                self.emit(&format!("  mov {src}, {dst}"));
+            }
             return Ok(());
         }
         // A memory source cannot be the source of a memory destination, and
@@ -956,6 +1215,40 @@ impl<'a> FnGen<'a> {
         a: &Operand,
         b: &Operand,
     ) -> Result<(), String> {
+        // When the destination is a promoted register and the operator maps to
+        // a single ALU instruction, update the register in place. This is the
+        // accumulator pattern (`_acc = Add(_acc, k)`), which copy propagation
+        // exposes by rewriting `_acc = Add(_tmp, k); _tmp = copy _acc` into a
+        // self-update. It saves the value's trip through `%rax`.
+        if dest.proj.is_empty()
+            && matches!(
+                op,
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor
+            )
+            && self.promo.contains_key(&dest.local)
+        {
+            let reg = self.promo[&dest.local].reg.to_string();
+            if !operand_is_local(a, dest.local) {
+                let (av, _) = self.eval_operand(a)?;
+                if av != reg {
+                    self.emit(&format!("  mov {av}, {reg}"));
+                }
+            }
+            let (mut bv, _) = self.eval_operand_keep_rax(b)?;
+            if op == BinOp::Mul {
+                if let Some(v) = imm_value(&bv) {
+                    if !(i32::MIN as i64..=i32::MAX as i64).contains(&v) {
+                        self.emit(&format!("  mov ${v}, %rcx"));
+                        bv = "%rcx".to_string();
+                    }
+                }
+            }
+            self.emit(&format!("  {} {bv}, {reg}", alu_mnem(op)));
+            if self.opts.overflow_checks && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
+                self.emit("  jo __rmc_overflow");
+            }
+            return Ok(());
+        }
         match op {
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 self.emit_cmp(op, a, b)?;
@@ -1005,6 +1298,18 @@ impl<'a> FnGen<'a> {
                     BinOp::BitOr => "or",
                     _ => "xor",
                 };
+                // An immediate larger than 32 bits cannot be an `imul` operand
+                // (the immediate is sign-extended from i32), so it is
+                // materialised in a register first.
+                let mut bv = bv;
+                if op == BinOp::Mul {
+                    if let Some(v) = imm_value(&bv) {
+                        if !(i32::MIN as i64..=i32::MAX as i64).contains(&v) {
+                            self.emit(&format!("  mov ${v}, %rcx"));
+                            bv = "%rcx".to_string();
+                        }
+                    }
+                }
                 self.emit(&format!("  {m} {bv}, %rax"));
                 if self.opts.overflow_checks && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
                     self.emit("  jo __rmc_overflow");
@@ -1023,7 +1328,12 @@ impl<'a> FnGen<'a> {
                 self.emit(&format!("  {m} %cl, %rax"));
             }
             BinOp::Div | BinOp::Rem => {
-                let (bv, _) = self.eval_operand(b)?;
+                if self.gen_div_const(op, b)? {
+                    return Ok(());
+                }
+                // `%rax` holds the dividend; the divisor must be materialised
+                // without clobbering it, so a complex operand goes to `%rcx`.
+                let (bv, _) = self.eval_operand_keep_rax(b)?;
                 if bv != "%rcx" {
                     self.emit(&format!("  mov {bv}, %rcx"));
                 }
@@ -1036,6 +1346,80 @@ impl<'a> FnGen<'a> {
             _ => unreachable!(),
         }
         Ok(())
+    }
+
+    /// Division/modulo by a constant becomes a multiply and an arithmetic shift
+    /// instead of a ~30-cycle `idiv`. Returns `false` for a variable divisor, a
+    /// zero divisor, or a non-`i64` literal, so the caller falls back to `idiv`.
+    ///
+    /// The dividend is in `%rax` on entry; `%rax` holds the result on return.
+    /// `%rcx`, `%rdx`, `%r10` and `%r11` are scratch; `%r10` holds a copy of the
+    /// dividend and `%r11` the divisor.
+    fn gen_div_const(&mut self, op: BinOp, b: &Operand) -> Result<bool, String> {
+        let d = match b {
+            Operand::Const(Const::Int(v)) => *v,
+            _ => return Ok(false),
+        };
+        if d == 0 {
+            return Ok(false);
+        }
+        self.emit("  mov %rax, %r10");
+        if d == 1 {
+            // The dividend is already in `%rax`.
+        } else if d == -1 {
+            self.emit("  neg %rax");
+            if self.opts.overflow_checks {
+                self.emit("  jo __rmc_overflow");
+            }
+        } else {
+            let mag = d.unsigned_abs();
+            if mag.is_power_of_two() {
+                // `d` is ±2^k. An arithmetic shift rounds toward -inf, so a
+                // negative dividend is biased by 2^k-1 to round toward zero.
+                let k = mag.trailing_zeros();
+                self.emit("  mov %rax, %rdx");
+                self.emit("  sar $63, %rdx");
+                self.emit(&format!("  shr ${}, %rdx", 64 - k));
+                self.emit("  add %rdx, %rax");
+                self.emit(&format!("  sar ${k}, %rax"));
+                if d < 0 {
+                    self.emit("  neg %rax");
+                }
+            } else {
+                let (m, s, add) = sdiv_magic(mag);
+                self.emit(&format!("  movabs ${m}, %rcx"));
+                self.emit("  imul %rcx");
+                if add {
+                    self.emit("  add %r10, %rdx");
+                }
+                if s > 0 {
+                    self.emit(&format!("  sar ${s}, %rdx"));
+                }
+                self.emit("  mov %r10, %rcx");
+                self.emit("  shr $63, %rcx");
+                self.emit("  add %rcx, %rdx");
+                if d < 0 {
+                    self.emit("  neg %rdx");
+                }
+                if op == BinOp::Rem {
+                    // The quotient is in `%rdx`; the remainder is `x - q*d`.
+                    self.emit(&mov_imm_str(d, "%r11"));
+                    self.emit("  imul %r11, %rdx");
+                    self.emit("  sub %rdx, %r10");
+                    self.emit("  mov %r10, %rax");
+                    return Ok(true);
+                }
+                self.emit("  mov %rdx, %rax");
+            }
+        }
+        if op == BinOp::Rem {
+            self.emit("  mov %rax, %rdx");
+            self.emit(&mov_imm_str(d, "%r11"));
+            self.emit("  imul %r11, %rdx");
+            self.emit("  sub %rdx, %r10");
+            self.emit("  mov %r10, %rax");
+        }
+        Ok(true)
     }
 
     /// Emit `cmp` so that the flags read as `a op b` (i.e. `a - b`).
@@ -1096,12 +1480,30 @@ impl<'a> FnGen<'a> {
                 }
             }
         }
+        // Spill the promoted caller-saved registers before the argument moves,
+        // which overwrite them, and restore afterwards. `%rax` carries the
+        // result, so the spills use memory operands directly.
+        let mut caller_promos: Vec<(u32, &'static str)> = self
+            .promo
+            .iter()
+            .filter(|(_, p)| p.caller_saved)
+            .map(|(l, p)| (*l, p.reg))
+            .collect();
+        caller_promos.sort_unstable();
+        for (l, reg) in &caller_promos {
+            let slot = self.off(self.caller_spill[l]);
+            self.emit(&format!("  mov {reg}, {slot}"));
+        }
         for (i, v) in &reg_ops {
             if ARG_REGS[*i] != *v {
                 self.emit(&format!("  mov {v}, {}", ARG_REGS[*i]));
             }
         }
         self.emit(&format!("  call {name}"));
+        for (l, reg) in &caller_promos {
+            let slot = self.off(self.caller_spill[l]);
+            self.emit(&format!("  mov {slot}, {reg}"));
+        }
         if self.place_ty(dest).is_aggregate() {
             // Aggregates return by hidden pointer in %rdi; rmc's builtins do
             // not, so this only appears for functions this backend owns.
@@ -1124,8 +1526,114 @@ impl<'a> FnGen<'a> {
     }
 }
 
+/// Drop a register store that the very next instruction reloads into the same
+/// register: the value is already there, so the reload is dead.
+///
+/// The generator stores almost every scalar result to its frame slot and then
+/// loads it back for the next statement (`mov %rax, -216(%rbp)` / `mov
+/// -216(%rbp), %rax`). Those pairs are adjacent by construction and removing
+/// them is purely local: a store to memory is not observable, so skipping a
+/// load of a value that is already in the register cannot change behaviour.
+fn peephole(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if let Some((reg, slot)) = store_pair(lines[i]) {
+            if i + 1 < lines.len() {
+                if let Some((lsrc, ldst)) = load_pair(lines[i + 1]) {
+                    if ldst == reg && lsrc == slot {
+                        // The load is redundant; keep the store and skip it.
+                        out.push_str(lines[i]);
+                        out.push('\n');
+                        i += 2;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push_str(lines[i]);
+        out.push('\n');
+        i += 1;
+    }
+    out
+}
+
+/// `mov <reg>, <slot>` with a register source, returning `(reg, slot)`.
+fn store_pair(line: &str) -> Option<(&str, &str)> {
+    let rest = line.trim().strip_prefix("mov ")?;
+    let (src, dst) = rest.split_once(',')?;
+    let (src, dst) = (src.trim(), dst.trim());
+    if !src.starts_with('%') || src.contains('(') || !dst.contains('(') {
+        return None;
+    }
+    Some((src, dst))
+}
+
+/// `mov <slot>, <reg>` with a memory source, returning `(slot, reg)`.
+fn load_pair(line: &str) -> Option<(&str, &str)> {
+    let rest = line.trim().strip_prefix("mov ")?;
+    let (src, dst) = rest.split_once(',')?;
+    let (src, dst) = (src.trim(), dst.trim());
+    if !src.contains('(') || !dst.starts_with('%') {
+        return None;
+    }
+    Some((src, dst))
+}
+
 fn align_up(v: i64, a: i64) -> i64 {
     (v + a - 1) / a * a
+}
+
+/// `mov $v, reg`, using `movabs` only when `v` does not fit a sign-extended
+/// 32-bit immediate (the shorter encoding for the common small divisor).
+fn mov_imm_str(v: i64, reg: &str) -> String {
+    if (-2_147_483_648..=2_147_483_647).contains(&v) {
+        format!("  mov ${v}, {reg}")
+    } else {
+        format!("  movabs ${v}, {reg}")
+    }
+}
+
+/// Magic multiplier, shift and add-flag for signed division by `d > 1`, from
+/// Hacker's Delight via LLVM's `SignedDivisionByConstantInfo`. For a dividend
+/// `x`: `t = high64(signed(m) * x); if add { t += x } t >>= s; q = t + (x >> 63)`.
+fn sdiv_magic(d: u64) -> (i64, u32, bool) {
+    const N: u32 = 64;
+    let smin: u128 = 1u128 << (N - 1);
+    let ad = d as u128;
+    // NC is the largest dividend whose remainder modulo `d` is `d - 1`.
+    let anc = smin - 1 - (smin % ad);
+    let (mut q1, mut r1) = (smin / anc, smin % anc);
+    let (mut q2, mut r2) = (smin / ad, smin % ad);
+    let mut p = N - 1;
+    loop {
+        p += 1;
+        q1 <<= 1;
+        r1 <<= 1;
+        if r1 >= anc {
+            q1 += 1;
+            r1 -= anc;
+        }
+        q2 <<= 1;
+        r2 <<= 1;
+        if r2 >= ad {
+            q2 += 1;
+            r2 -= ad;
+        }
+        let delta = ad - r2;
+        if !(q1 < delta || (q1 == delta && r1 == 0)) {
+            break;
+        }
+    }
+    let m = q2 + 1;
+    let add = m > i64::MAX as u128;
+    (m as i64, p - N, add)
+}
+
+/// The value of an `$imm` operand string, or `None` when it is not an immediate.
+fn imm_value(op: &str) -> Option<i64> {
+    op.trim().strip_prefix('$')?.parse::<i64>().ok()
 }
 
 fn ty_size(ty: &Ty) -> i64 {
@@ -1144,6 +1652,38 @@ fn is_compare(op: BinOp) -> bool {
     matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
 }
 
+/// The ALU mnemonic for a binary op that maps to one instruction.
+fn alu_mnem(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "add",
+        BinOp::Sub => "sub",
+        BinOp::Mul => "imul",
+        BinOp::BitAnd => "and",
+        BinOp::BitOr => "or",
+        BinOp::BitXor => "xor",
+        _ => unreachable!(),
+    }
+}
+
+/// True when `op` is a bare read of `local` (so an in-place update can skip the
+/// `mov reg, reg` that would load it into its own destination).
+fn operand_is_local(op: &Operand, local: u32) -> bool {
+    match op {
+        Operand::Copy(p) | Operand::Move(p) => p.local == local && p.proj.is_empty(),
+        Operand::Const(_) => false,
+    }
+}
+
+/// The ALU mnemonic whose `OF` flag is the overflow condition of a
+/// `*WithOverflow` rvalue.
+fn ovf_mnem(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Sub => "sub",
+        BinOp::Mul => "imul",
+        _ => "add",
+    }
+}
+
 fn jcc(op: BinOp) -> &'static str {
     match op {
         BinOp::Eq => "je",
@@ -1153,6 +1693,19 @@ fn jcc(op: BinOp) -> &'static str {
         BinOp::Gt => "jg",
         BinOp::Ge => "jge",
         _ => "je",
+    }
+}
+
+/// The complement of a condition, so a test can jump on `!cond` directly.
+fn negate_cc(op: BinOp) -> BinOp {
+    match op {
+        BinOp::Eq => BinOp::Ne,
+        BinOp::Ne => BinOp::Eq,
+        BinOp::Lt => BinOp::Ge,
+        BinOp::Le => BinOp::Gt,
+        BinOp::Gt => BinOp::Le,
+        BinOp::Ge => BinOp::Lt,
+        _ => op,
     }
 }
 
@@ -1206,6 +1759,14 @@ fn scan_rv(
             bump(p, counts, projected);
             addr_taken.insert(p.local);
         }
+        Rvalue::Discriminant(p) => {
+            bump(p, counts, projected);
+            addr_taken.insert(p.local);
+        }
+        Rvalue::WithOverflow { a, b, .. } => {
+            scan_operand(a, counts, projected);
+            scan_operand(b, counts, projected);
+        }
         Rvalue::Unsupported(_) => {}
     }
 }
@@ -1236,7 +1797,12 @@ fn scan_term(
 
 fn bump(p: &Place, counts: &mut HashMap<u32, u32>, projected: &mut HashSet<u32>) {
     *counts.entry(p.local).or_insert(0) += 1;
-    if !p.proj.is_empty() {
+    // A projection that starts with `Deref` reads the local's *value* (a
+    // pointer) and then dereferences it, so the local can still be promoted: a
+    // promoted pointer is just its register. A projection with no leading
+    // `Deref` (`_2.0`, `_2[3]`) reads out of the local's own storage, which a
+    // promoted scalar no longer has, so it disqualifies promotion.
+    if !p.proj.is_empty() && !matches!(p.proj.first(), Some(Proj::Deref)) {
         projected.insert(p.local);
     }
 }
