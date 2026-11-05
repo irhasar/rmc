@@ -473,7 +473,11 @@ impl Codegen {
             let line = raw_line.trim_end_matches('\n');
             let is_label = !line.starts_with('\t') && !line.starts_with(' ') && line.ends_with(':');
             let text = line.trim_start();
-            if is_label || line.starts_with('.') {
+            // A directive (`.p2align`, `.section`, ...) is live even when it
+            // follows a `jmp`/`ret`, so it resets the unreachable run like a
+            // label. It may be indented (`\t.p2align 4`), so test the trimmed
+            // text; no instruction starts with `.`, so this cannot catch one.
+            if is_label || text.starts_with('.') {
                 dead = false;
                 prev = None;
                 if is_label {
@@ -1015,13 +1019,7 @@ impl Codegen {
                     // there is one, else `%rax` for the frame store.
                     match self.reg_of(*slot) {
                         Some(r) => self.gen_expr_into_reg(e, r),
-                        None => {
-                            let dst = format!("{}(%rbp)", self.off(*slot));
-                            if !self.store_simple(e, &dst) {
-                                self.gen_expr_into_reg(e, "%rax");
-                                self.store_slot(*slot);
-                            }
-                        }
+                        None => self.gen_expr_to_slot(e, *slot),
                     }
                 } else {
                     match self.reg_of(*slot) {
@@ -1044,13 +1042,7 @@ impl Codegen {
                     Expr::Var { slot, .. } => {
                         match self.reg_of(*slot) {
                             Some(r) => self.gen_expr_into_reg(value, r),
-                            None => {
-                                let dst = format!("{}(%rbp)", self.off(*slot));
-                                if !self.store_simple(value, &dst) {
-                                    self.gen_expr_into_reg(value, "%rax");
-                                    self.store_slot(*slot);
-                                }
-                            }
+                            None => self.gen_expr_to_slot(value, *slot),
                         }
                     }
                     Expr::Field { ty, .. } if ty.is_aggregate() => {
@@ -1173,6 +1165,9 @@ impl Codegen {
                 let end = self.new_label();
                 self.loops.push((test_l.clone(), end.clone()));
                 self.line(&format!("jmp {test_l}"));
+                // Align the loop body to a 16-byte fetch boundary so its
+                // layout does not shift with unrelated code-size changes.
+                self.raw("\t.p2align 4");
                 self.raw(&format!("{body_l}:"));
                 self.gen_block(body);
                 self.raw(&format!("{test_l}:"));
@@ -1184,6 +1179,7 @@ impl Codegen {
                 let top = self.new_label();
                 let end = self.new_label();
                 self.loops.push((top.clone(), end.clone()));
+                self.raw("\t.p2align 4");
                 self.raw(&format!("{top}:"));
                 self.gen_block(body);
                 self.line(&format!("jmp {top}"));
@@ -1192,16 +1188,14 @@ impl Codegen {
             }
             Stmt::For { var_slot, start, end, end_slot, inclusive, body, .. } => {
                 // Evaluate both bounds once: `var = start`, `end_slot = end`.
-                self.gen_expr(start);
-                self.store_slot(*var_slot);
+                self.gen_expr_to_slot(start, *var_slot);
                 // A constant bound needs no slot: it has no side effect, so it
                 // can be compared against directly and the frame word (and its
                 // reload every iteration) disappears. A non-constant bound is
                 // evaluated once into its slot.
                 let end_imm = Self::small_imm(end);
                 if end_imm.is_none() {
-                    self.gen_expr(end);
-                    self.store_slot(*end_slot);
+                    self.gen_expr_to_slot(end, *end_slot);
                 }
                 // Rotated like `while`: the guard is the back edge, with an
                 // entry `jmp` reusing it, so an iteration is one branch fewer
@@ -1217,6 +1211,7 @@ impl Codegen {
                 // `break` leaves past the guard.
                 self.loops.push((cont.clone(), exit.clone()));
                 self.line(&format!("jmp {guard}"));
+                self.raw("\t.p2align 4");
                 self.raw(&format!("{top}:"));
                 self.gen_block(body);
                 self.raw(&format!("{cont}:"));
@@ -2011,6 +2006,22 @@ impl Codegen {
         }
         self.gen_expr(&fi.value);
         self.line(&format!("mov %rax, {dest_off}(%rbp)"));
+    }
+
+    /// Evaluate `e` into local `slot`: the promoted register when there is one,
+    /// else its frame word, folding a bare register/immediate initialiser
+    /// straight into the store so no `%rax` bounce is emitted.
+    fn gen_expr_to_slot(&mut self, e: &Expr, slot: i32) {
+        match self.reg_of(slot) {
+            Some(r) => self.gen_expr_into_reg(e, r),
+            None => {
+                let dst = format!("{}(%rbp)", self.off(slot));
+                if !self.store_simple(e, &dst) {
+                    self.gen_expr_into_reg(e, "%rax");
+                    self.line(&format!("mov %rax, {dst}"));
+                }
+            }
+        }
     }
 
     fn store_slot(&mut self, slot: i32) {
