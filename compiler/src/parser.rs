@@ -823,14 +823,18 @@ impl Parser {
         match self.peek() {
             Some(Tok::While) => {
                 self.i += 1;
-                // `'a: while let PAT = EXPR { body }`: the label would be lost
-                // in the desugar to `loop { if let .. }`, so reject it rather
-                // than silently drop the label.
+                // `'a: while let PAT = EXPR { body }` desugars to a labelled
+                // `loop { if let PAT = EXPR { body } else { break; } }`: the
+                // label attaches to the `loop`, so `break 'a` / `continue 'a`
+                // in the body target it just as they would a labelled `while`.
                 if self.peek() == Some(&Tok::Let) {
-                    return Err(format!(
-                        "at byte {}: a label on `while let` is not supported",
-                        self.pos()
-                    ));
+                    self.i += 1;
+                    let pat = self.parse_pattern()?;
+                    self.expect(Tok::Eq)?;
+                    let scrutinee = self.parse_cond()?;
+                    let body = self.parse_block()?;
+                    let s = self.desugar_while_let(pat, scrutinee, body, Some(label))?;
+                    return Ok(s);
                 }
                 let cond = self.parse_cond()?;
                 let body = self.parse_block()?;
@@ -1170,7 +1174,7 @@ impl Parser {
                     self.expect(Tok::Eq)?;
                     let scrutinee = self.parse_cond()?;
                     let body = self.parse_block()?;
-                    let s = self.desugar_while_let(pat, scrutinee, body)?;
+                    let s = self.desugar_while_let(pat, scrutinee, body, None)?;
                     out.push(s);
                     return Ok(());
                 }
@@ -1732,19 +1736,11 @@ impl Parser {
                 self.i += 1;
                 if self.eat(&Tok::ColonColon) {
                     let variant = self.expect_ident()?;
-                    let mut bindings = None;
+                    let mut args = None;
                     if self.eat(&Tok::LParen) {
-                        let mut names = Vec::new();
-                        while self.peek() != Some(&Tok::RParen) {
-                            names.push(self.expect_ident()?);
-                            if !self.eat(&Tok::Comma) {
-                                break;
-                            }
-                        }
-                        self.expect(Tok::RParen)?;
-                        bindings = Some(names);
+                        args = Some(self.parse_variant_pat_args()?);
                     }
-                    Ok(Pat::Variant(n, variant, bindings))
+                    Ok(Pat::Variant(n, variant, args))
                 } else if self.peek() == Some(&Tok::LBrace) {
                     // `S { f, g: h, i: _, .. }`: a struct pattern. Fields may be
                     // written in any order, and each is either a shorthand
@@ -1785,6 +1781,63 @@ impl Parser {
                 other.map(|t| t.describe()).unwrap_or_else(|| "end of input".into())
             )),
         }
+    }
+
+    /// The argument list of a payload variant pattern, `(v, _, mut w, [a, b],
+    /// S { x }, ..)`, with the opening `(` already consumed and the closing `)`
+    /// consumed here. Each argument is `(mut, pat)`; `mut` is only legal on a
+    /// binding. A trailing `..` ignores the remaining fields (the returned
+    /// flag). A bare identifier is a fresh binding, exactly as in a struct field
+    /// or an array element. A nested *variant* pattern (`E::A(Inner::X(v))`) is
+    /// refutable and so rejected by the irrefutability check below: rmc
+    /// generates no per-field test.
+    fn parse_variant_pat_args(&mut self) -> PResult<(Vec<(bool, Pat)>, bool)> {
+        let mut args: Vec<(bool, Pat)> = Vec::new();
+        let mut rest = false;
+        while self.peek() != Some(&Tok::RParen) {
+            if self.peek().is_none() {
+                return Err(format!(
+                    "at byte {}: unexpected end of input in variant pattern",
+                    self.pos()
+                ));
+            }
+            if self.eat(&Tok::DotDot) {
+                rest = true;
+                // A trailing comma after `..` is allowed, as in rustc; anything
+                // else after it is left for the `)` check below to reject.
+                self.eat(&Tok::Comma);
+                break;
+            }
+            let m = self.eat(&Tok::Mut);
+            // `_` ignores the field: it binds nothing and tests nothing.
+            let p = if self.peek() == Some(&Tok::Underscore) {
+                self.i += 1;
+                Pat::Wild
+            } else {
+                self.parse_pattern_primary()?
+            };
+            if m && !matches!(p, Pat::Bind(_)) {
+                return Err(format!(
+                    "at byte {}: `mut` is not allowed here; it attaches to a binding",
+                    self.pos()
+                ));
+            }
+            args.push((m, p));
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(Tok::RParen)?;
+        // Every argument must be irrefutable: a refutable one (`E::V(1)`) would
+        // need a per-field test, which rmc does not generate. Reject it here
+        // rather than mis-bind it as an always-true read.
+        if args.iter().any(|(_, p)| !Self::pat_irrefutable(p)) {
+            return Err(format!(
+                "at byte {}: variant pattern arguments must be bindings, `_`, or nested patterns",
+                self.pos()
+            ));
+        }
+        Ok((args, rest))
     }
 
     /// The field list of a struct pattern, `{ f, g: h, i: _, .. }`, with the
@@ -2255,7 +2308,13 @@ impl Parser {
     /// need no new case. `EXPR` sits inside the loop, so it is re-evaluated
     /// every iteration (as in Rust); the `if let` binds its non-`Var` scrutinee
     /// to a fresh temporary each time.
-    fn desugar_while_let(&mut self, pat: Pat, scrutinee: Expr, body: Block) -> PResult<Stmt> {
+    fn desugar_while_let(
+        &mut self,
+        pat: Pat,
+        scrutinee: Expr,
+        body: Block,
+        label: Option<String>,
+    ) -> PResult<Stmt> {
         let break_else = Block {
             stmts: vec![Stmt::Break(None, None)],
             tail: None,
@@ -2266,8 +2325,10 @@ impl Parser {
         let loop_body = Block { stmts: vec![Stmt::Expr(test)], tail: None };
         // The loop is unit-valued: the `else` arm always contains a plain
         // `break;`, so a `break value` in the body is rejected as a type
-        // mismatch (rustc E0571 rejects it too).
-        Ok(Stmt::Expr(Expr::Loop(loop_body, -1, Type::Unit, None)))
+        // mismatch (rustc E0571 rejects it too). A label on the `while let`
+        // attaches to the desugared `loop`, so `break 'a` / `continue 'a` in
+        // the body still target it.
+        Ok(Stmt::Expr(Expr::Loop(loop_body, -1, Type::Unit, label)))
     }
 
     /// One arm of a desugared `match` or `if let`: the pattern test, the
@@ -2298,12 +2359,13 @@ impl Parser {
                 );
                 Expr::Bin(BinOp::And, Box::new(lower), Box::new(upper))
             }
-            Pat::Variant(enum_name, variant, _) => Expr::VariantTest {
+            Pat::Variant(enum_name, variant, args) => Expr::VariantTest {
                 scrutinee: Box::new(subj.clone()),
                 enum_name: enum_name.clone(),
                 variant: variant.clone(),
                 tag: -1,
-                n_binds: -1,
+                n_binds: args.as_ref().map_or(-1, |(a, _)| a.len() as i32),
+                has_rest: args.as_ref().map_or(false, |(_, rest)| *rest),
             },
             // `_` in an or-pattern: always true, so the whole condition is true.
             // A struct pattern is likewise always true; a binding one is
@@ -2418,6 +2480,31 @@ impl Parser {
         out
     }
 
+    /// The `let` statements one sub-pattern introduces, reading from `subj`.
+    /// `m` is a `mut` written before the pattern; only a binding may carry it.
+    /// A binding becomes one `let`; a wildcard binds nothing; a struct or array
+    /// pattern recurses, reading through `subj` (its own fields/elements). Used
+    /// by a payload variant's arguments, so `E::A(S { x })` and `E::A([a, b])`
+    /// expand to the same reads the equivalent `let` would.
+    fn pat_binds_into(pat: Pat, m: bool, subj: &Expr, out: &mut Vec<Stmt>) {
+        match pat {
+            Pat::Bind(name) => out.push(Stmt::Let {
+                name,
+                ty: None,
+                mutable: m,
+                init: Some(subj.clone()),
+                slot: -1,
+            }),
+            Pat::Wild => {}
+            Pat::Struct(_, fields) => out.extend(Self::struct_pat_binds(&fields, subj)),
+            Pat::Array { elems, rest, front } => {
+                out.extend(Self::array_pat_binds(&elems, rest, front, subj))
+            }
+            // `parse_variant_pat_args` rejects anything else.
+            _ => unreachable!("unexpected variant argument pattern"),
+        }
+    }
+
     /// The first variable a pattern binds, if any. A struct pattern binds the
     /// names of its sub-patterns; an or-pattern binds through its alternatives.
     /// Used to reject a binding in an or-pattern (rustc's E0408), which rmc
@@ -2425,6 +2512,12 @@ impl Parser {
     fn first_bound_name(p: &Pat) -> Option<String> {
         match p {
             Pat::Bind(n) => Some(n.clone()),
+            // A payload variant pattern binds the names of its argument
+            // sub-patterns; a nested variant pattern would too, but it is
+            // rejected before this point.
+            Pat::Variant(_, _, Some((args, _))) => {
+                args.iter().find_map(|(_, sub)| Self::first_bound_name(sub))
+            }
             Pat::Struct(_, fields) => fields.iter().find_map(|(_, b)| {
                 b.as_ref().and_then(|(_, sub)| Self::first_bound_name(sub))
             }),
@@ -2521,38 +2614,38 @@ impl Parser {
                 Vec::new(),
                 Some(Expr::BoolTest { scrutinee: Box::new(subj.clone()), value: b }),
             ),
-            Pat::Variant(enum_name, variant, payload) => {
-                let n_binds = match &payload {
-                    Some(names) => names.len() as i32,
-                    None => -1,
-                };
+            Pat::Variant(enum_name, variant, args) => {
+                let n_binds = args.as_ref().map_or(-1, |(a, _)| a.len() as i32);
+                let has_rest = args.as_ref().map_or(false, |(_, rest)| *rest);
                 let cond = Expr::VariantTest {
                     scrutinee: Box::new(subj.clone()),
                     enum_name: enum_name.clone(),
                     variant: variant.clone(),
                     tag: -1,
                     n_binds,
+                    has_rest,
                 };
-                // `Enum::V(w, x)` binds each payload field in the arm body.
-                let binds = match payload {
-                    Some(names) => names
-                        .into_iter()
-                        .enumerate()
-                        .map(|(idx, name)| Stmt::Let {
-                            name,
-                            ty: None,
-                            mutable: false,
-                            init: Some(Expr::EnumPayload {
+                // `Enum::V(w, x)` binds each payload field in the arm body. Each
+                // argument is the payload read at its field index, fed to the
+                // same per-pattern expansion the `let` and `match` paths use, so
+                // `_` reads nothing and a nested struct/array sub-pattern reads
+                // through the payload.
+                let binds = match args {
+                    Some((args, _)) => {
+                        let mut out = Vec::new();
+                        for (idx, (m, pat)) in args.into_iter().enumerate() {
+                            let payload = Expr::EnumPayload {
                                 recv: Box::new(subj.clone()),
                                 enum_name: enum_name.clone(),
                                 variant: variant.clone(),
                                 idx,
                                 offset: 0,
                                 ty: Type::Unit,
-                            }),
-                            slot: -1,
-                        })
-                        .collect(),
+                            };
+                            Self::pat_binds_into(pat, m, &payload, &mut out);
+                        }
+                        out
+                    }
                     None => Vec::new(),
                 };
                 (binds, Some(cond))
@@ -2903,8 +2996,11 @@ enum Pat {
     /// byte-wise helper), never a pointer compare.
     Str(String),
     /// `Enum::Variant` or `Enum::Variant(..)`. The constructor is resolved by
-    /// sema; the optional bindings name the payload fields, in field order.
-    Variant(String, String, Option<Vec<String>>),
+    /// sema; the optional argument patterns name the payload fields, in field
+    /// order. Each argument is `(mut, pat)`, where `pat` is a binding (`v`), a
+    /// wildcard (`_`), or a nested struct/array/variant sub-pattern; the flag is
+    /// whether a trailing `..` ignored the remaining fields.
+    Variant(String, String, Option<(Vec<(bool, Pat)>, bool)>),
     /// A plain name: binds the whole scrutinee (an irrefutable catch-all). Kept
     /// distinct from `Wild` only so the binding is named.
     Bind(String),

@@ -64,16 +64,19 @@ python3 tools/fuzz.py --mode fordestr --n 500 --seed 1
 python3 tools/fuzz.py --mode nestpat --n 500 --seed 1
 python3 tools/fuzz.py --mode arrpat --n 500 --seed 1
 python3 tools/fuzz.py --mode parampat --n 500 --seed 1
+python3 tools/fuzz.py --mode enumpat --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 
 # differential fuzzer over the rustc-MIR path (rustc --emit=mir -> rmc back end)
 python3 tools/fuzz.py --mode mir --n 500 --seed 1
 python3 tools/fuzz.py --mode mir --gen width --n 500 --seed 1
 
-# robustness: malformed input must be a diagnostic, never a crash (no rustc)
+# robustness / soundness: rmc must error cleanly, never crash (no rustc)
 python3 tools/fuzz.py --mode robust        # rmc's own .rms parser
+python3 tools/fuzz.py --mode reject        # programs rustc rejects
+python3 tools/fuzz.py --mode mutate --n 500 --seed 1     # random edits
 python3 tools/fuzz.py --mode mirrobust     # .rs programs the MIR path rejects
-python3 tools/fuzz.py --mode mirmut --n 500 --seed 1   # mutated .mir text
+python3 tools/fuzz.py --mode mirmut --n 500 --seed 1     # mutated .mir text
 ```
 
 ## Source map
@@ -669,8 +672,9 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   that stack from the top for the label (an unlabelled `break`/`continue` takes
   the innermost entry). The label is carried through the desugarings that build
   a loop: `'a: for x in arr` copies the label onto the index `for` it expands
-  to. `while let` desugars to a plain `loop`, so a label on it is rejected in the
-  parser rather than silently dropped. The `if`-with-a-lone-`break`/`continue`
+  to, and `'a: while let PAT = EXPR { .. }` passes the label to the `loop` it
+  desugars to, so `break 'a` / `continue 'a` in the body target it. The
+  `if`-with-a-lone-`break`/`continue`
   fast path in `bare_exit` only fires for an *unlabelled* `break`/`continue`,
   since a labelled one may leave an outer loop.
 - **A `for` bound is compared directly when it is a constant, and through a
@@ -1053,7 +1057,11 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
 `tools/fuzz.py --mode reject` compiles a list of programs `rustc` rejects and
 requires `rmc` to reject each one cleanly; it pins the soundness checks below,
 which the differential fuzzers cannot see (they only compare programs both
-compilers accept).
+compilers accept). `tools/fuzz.py --mode mutate` is the complement: it applies
+random splices, deletions and duplications to the generators' programs and the
+`robust` corpus and requires every mutant to fail cleanly (exit 0 or 1, no
+signal, no panic). It needs no rustc, so it runs anywhere, and it reaches error
+paths the hand-written corpora miss.
 
 `tests/mir/run.py` is the differential suite for the rustc-MIR path. Each
 `tests/mir/NAME.rs` is a freestanding `#![no_std]` program that includes
@@ -1328,6 +1336,20 @@ The checks, all in `sema.rs`:
   pattern (literal, variant, or-pattern) is rejected (`param_pat_binds`), and
   `mut` on the whole pattern is rejected. `sema` inserts a `None` into
   `param_pats` when it prepends the `self` receiver, keeping the vectors aligned.
+- **Enum payload sub-patterns.** A payload variant's argument list takes the
+  same sub-patterns a struct field or array element does: `E::A(_, y)`,
+  `E::A(mut x)`, `E::A(S { x })`, `E::A([a, b])`, and a trailing `..`
+  (`E::A(x, ..)`, `E::A(..)`). `Pat::Variant` carries `Option<(Vec<(bool, Pat)>,
+  bool)>` — the argument patterns and the `..` flag. `desugar_arm` reads each
+  argument as `EnumPayload { idx }` (the payload at its field index) and feeds it
+  to `pat_binds_into`, which recurses through `struct_pat_binds` /
+  `array_pat_binds`, so a nested pattern reads *through* the payload at its
+  offset rather than copying the whole aggregate first. `VariantTest` carries
+  `n_binds` (the argument count) and `has_rest`; `check_expr` requires
+  `n_binds == fields.len()` unless `has_rest`, and rejects a payload read past
+  the last field. A nested *variant* argument (`E::A(Inner::X(v))`) is
+  refutable, so `parse_variant_pat_args` rejects it, as it rejects a literal
+  argument, since rmc generates no per-field test.
 - **Casts (`E0054`/`E0605`/`E0606`).** `check_cast` restricts `as` to the
   conversions rustc allows plus rmc's two documented extensions. A reference may
   only become a reference to the same type (`&mut T` may lose mutability to
@@ -1430,7 +1452,12 @@ chain of distinct struct types, so the pattern nests several levels deep, and
 emits each pattern in `let`, `match` (through a reference), `if let` and `for`.
 The expansion is a chain of field reads, so a wrong field order or a missing
 intermediate read shows up as a wrong final value; `letdestr`/`fordestr` only
-reach one level, so a deeper sub-pattern had no randomised coverage. It compares
+reach one level, so a deeper sub-pattern had no randomised coverage. `enumpat`
+mode builds payload variant patterns with sub-patterns (`_`, `mut x`, a trailing
+`..`, and a nested struct or array pattern inside `E::V(..)`), in `match`,
+`if let` and a method, and reads them through a `&E` scrutinee (match
+ergonomics), which no other mode emits; each function is called twice
+so a shared slot or a leaked `mut` write is observable. It compares
 stdout and exit status against `rustc -O`, and it recompiles each program with
 every optimiser pass off in turn (`--no-inline`, `--no-licm`, `--no-tco`, all
 three), the same matrix the corpus suite uses — a pass-specific bug is otherwise
@@ -1510,6 +1537,16 @@ indexed an empty vector) and a terminator targeting a block the function never
 declares (`merge_blocks` indexes `blocks[target]`) — both now rejected in
 `mir.rs::parse` and pinned by tests. It needs no rustc. When you add a MIR shape
 the passes assume, add a seed or a `MIR_TOKENS` fragment that violates it.
+
+`--mode mutate` is the counterpart to the differential modes: it needs no rustc
+reference at all. It seeds from the generators' programs and the `robust` corpus,
+applies one to four random edits (splice a token, delete a run, duplicate a run),
+and requires every mutant to fail cleanly — exit 0 or 1, no signal, no
+`panicked`/`overflowed its stack` in stderr. A differential mode only compares
+programs *both* compilers accept, so a crash on invalid input is invisible to it;
+`mutate` and `robust` are the two modes that look for exactly that, the first
+reaching error paths the fixed `robust` corpus does not. `--keep` writes a
+failing mutant out for shrinking.
 
 A new generator must be checked for *validity*, not just a clean run. The first
 `ref` generator wrote `r.i0` (a field of the referent struct, not of the nested

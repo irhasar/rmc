@@ -55,6 +55,14 @@ jobs:
       - name: Rejection parity (rustc-rejected programs)
         run: python3 tools/fuzz.py --mode reject
 
+      # Mutation fuzzing: random edits to valid programs, every mutant must
+      # fail cleanly. Needs no rustc, and reaches error paths the fixed
+      # `robust` corpus does not.
+      - name: Mutation fuzz (malformed input must not crash)
+        run: |
+          python3 tools/fuzz.py --mode mutate --n 400 --seed 1
+          python3 tools/fuzz.py --mode mutate --n 400 --seed 2
+
       # A bounded differential fuzz run, so a divergence found by random
       # generation fails CI rather than only failing when someone runs it by
       # hand. Small and fixed-seed: reproducible, and fast enough to gate.

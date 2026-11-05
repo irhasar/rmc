@@ -29,6 +29,10 @@ Modes:
           `match`, string literal patterns, and a non-trivial side-effecting
           scrutinee (the temporary `desugar_match` binds it to, which must be
           evaluated once)
+    enumpat
+          payload variant patterns with sub-patterns: `_`, `mut x`, a trailing
+          `..`, and a nested struct/array pattern inside `E::V(..)`, which no
+          other mode emits
     order side-effecting arguments, to pin evaluation order
     shift `<<`/`>>` over the full count range (negative, >= 64, boundary)
     cast  expressions on the `as` / unary precedence boundary (`*r as i64`,
@@ -45,8 +49,18 @@ Modes:
           copying every field, chaining, a struct-typed field, and a field
           value that mutates the base so the evaluation order and the
           independence of the result are both observable
+    robust
+          a fixed set of adversarial inputs (random bytes, deep nesting, long
+          chains), each of which must error cleanly rather than crash
+    reject
+          programs `rustc` rejects, each of which `rmc` must reject too
+    mutate
+          mutation fuzzer: random edits to the generators' programs, requiring
+          `rmc` to fail cleanly on every one. Needs no rustc reference
 
 The reference is `rustc -O`, so a mismatch is a real semantic divergence.
+The `robust`, `reject` and `mutate` modes instead assert only that `rmc`
+errors cleanly, never panics or crashes.
 """
 import argparse
 import os
@@ -1614,6 +1628,115 @@ def gen_parampat_program(rng):
     return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
 
 
+def gen_enumpat_program(rng):
+    """Payload variant patterns with sub-patterns: a wildcard (`_`), a `mut`
+    binding, a trailing `..`, and a nested struct/array sub-pattern inside
+    `E::V(..)`. Each argument is the payload read at its field index, fed to the
+    same sub-pattern expansion a `let` uses, so a mis-indexed payload read, a
+    `_` that still reads, or a wrong nested offset changes the total. Every
+    function is called twice with different arguments, so a shared slot or a
+    leaked `mut` write is observable. No other mode emits a nested payload
+    sub-pattern, a `..` inside a variant's parentheses, or a payload read
+    through a `&E` scrutinee (match ergonomics dereferences it).
+    """
+    b = rng.randint(1, 9)
+    m = rng.randint(1, 9)
+    o = [rng.randint(0, 30) for _ in range(20)]
+    # Ignore the first or the second field of `E::Pair`, at random.
+    wild_first = rng.random() < 0.5
+    wild_pat = "E::Pair(_, y) => y" if wild_first else "E::Pair(x, _) => x"
+
+    rms = [
+        "struct I { u: i64 }",
+        "struct S { a: [i64; 2], b: I }",
+        "enum E { Pair(i64, i64), Trip(i64, i64, i64), Hold(S), Arr([i64; 2]), Mix(i64, S, [i64; 2]), None }",
+        "fn mk(n: i64) -> i64 { print_i64(n); return n; }",
+        f"fn wild(e: E) -> i64 {{ return match e {{ {wild_pat}, _ => 0 }}; }}",
+        f"fn mutate(e: E) -> i64 {{ return match e {{ E::Pair(mut x, y) => {{ x = x + {b}; x * 10 + y }}, _ => 0 }}; }}",
+        "fn restp(e: E) -> i64 { return match e { E::Trip(x, ..) => x, _ => 0 }; }",
+        "fn restonly(e: E) -> i64 { return match e { E::Trip(..) => 1, E::None => 0, _ => 0 - 1 }; }",
+        "fn nstruct(e: E) -> i64 { return match e { E::Hold(S { a: [p, q], b: I { u } }) => p * 100 + q * 10 + u, _ => 0 }; }",
+        "fn narr(e: E) -> i64 { return match e { E::Arr([a, c]) => a * 10 + c, _ => 0 }; }",
+        "fn mix(e: E) -> i64 { return match e { E::Mix(n, S { a: [p, q], b: I { u } }, [r, s]) => n + p + q + u + r + s, _ => 0 }; }",
+        "impl E { fn first(self) -> i64 { return match self { E::Pair(x, ..) => x, E::Trip(x, ..) => x, _ => 0 }; } }",
+        "fn wref(e: &E) -> i64 { return match e { E::Pair(x, _) => x * 2, E::Trip(x, ..) => x * 3, _ => 0 }; }",
+        "fn nref(e: &E) -> i64 { return match e { E::Hold(S { a: [p, q], b: I { u } }) => p * 100 + q * 10 + u, _ => 0 }; }",
+        "fn uref(e: &E) -> i64 { return match e { E::None => 100, E::Pair(_, _) => 200, E::Trip(_, _, _) => 300, E::Hold(_) => 400, E::Arr(_) => 500, E::Mix(_, _, _) => 600 }; }",
+    ]
+    rs = [
+        "#[derive(Copy, Clone)]",
+        "struct I { u: i64 }",
+        "#[derive(Copy, Clone)]",
+        "struct S { a: [i64; 2], b: I }",
+        "#[derive(Copy, Clone)]",
+        "enum E { Pair(i64, i64), Trip(i64, i64, i64), Hold(S), Arr([i64; 2]), Mix(i64, S, [i64; 2]), None }",
+        'fn mk(n: i64) -> i64 { println!("{}", n); n }',
+        f"fn wild(e: E) -> i64 {{ match e {{ {wild_pat}, _ => 0 }} }}",
+        f"fn mutate(e: E) -> i64 {{ match e {{ E::Pair(mut x, y) => {{ x += {b}; x * 10 + y }}, _ => 0 }} }}",
+        "fn restp(e: E) -> i64 { match e { E::Trip(x, ..) => x, _ => 0 } }",
+        "fn restonly(e: E) -> i64 { match e { E::Trip(..) => 1, E::None => 0, _ => 0 - 1 } }",
+        "fn nstruct(e: E) -> i64 { match e { E::Hold(S { a: [p, q], b: I { u } }) => p * 100 + q * 10 + u, _ => 0 } }",
+        "fn narr(e: E) -> i64 { match e { E::Arr([a, c]) => a * 10 + c, _ => 0 } }",
+        "fn mix(e: E) -> i64 { match e { E::Mix(n, S { a: [p, q], b: I { u } }, [r, s]) => n + p + q + u + r + s, _ => 0 } }",
+        "impl E { fn first(self) -> i64 { match self { E::Pair(x, ..) => x, E::Trip(x, ..) => x, _ => 0 } } }",
+        "fn wref(e: &E) -> i64 { match e { E::Pair(x, _) => x * 2, E::Trip(x, ..) => x * 3, _ => 0 } }",
+        "fn nref(e: &E) -> i64 { match e { E::Hold(S { a: [p, q], b: I { u } }) => p * 100 + q * 10 + u, _ => 0 } }",
+        "fn uref(e: &E) -> i64 { match e { E::None => 100, E::Pair(_, _) => 200, E::Trip(_, _, _) => 300, E::Hold(_) => 400, E::Arr(_) => 500, E::Mix(_, _, _) => 600 } }",
+    ]
+
+    def acc_add(expr):
+        return f"    acc = acc + {expr};"
+
+    def acc_add_rs(expr):
+        return f"    acc += {expr};"
+
+    calls = [
+        f"wild(E::Pair(s + {o[0]}, s + {o[1]}))",
+        f"wild(E::Pair(s + {o[2]}, s + {o[3]}))",
+        f"mutate(E::Pair(s + {o[4]}, s + {o[5]}))",
+        f"restp(E::Trip(s + {o[6]}, s + {o[7]}, s + {o[8]}))",
+        f"restp(E::Trip(s + {o[9]}, s + {o[10]}, s + {o[11]}))",
+        "restonly(E::Trip(1, 2, 3))",
+        "restonly(E::None)",
+        f"nstruct(E::Hold(S {{ a: [s + {o[12]}, s + {o[13]}], b: I {{ u: s + {o[14]} }} }}))",
+        f"nstruct(E::Hold(S {{ a: [s + {o[15]}, s + {o[16]}], b: I {{ u: s + {o[17]} }} }}))",
+        f"narr(E::Arr([s + {o[18]}, s + {o[19]}]))",
+        f"mix(E::Mix(s + {m}, S {{ a: [s + 1, s + 2], b: I {{ u: s + 3 }} }}, [s + 4, s + 5]))",
+        f"E::Pair(s + {m}, s + 6).first()",
+        f"E::Trip(s + {m}, s + 7, s + 8).first()",
+        f"wref(&E::Pair(s + {o[0]}, s + {o[1]}))",
+        f"wref(&E::Trip(s + {o[6]}, s + {o[7]}, s + {o[8]}))",
+        f"nref(&E::Hold(S {{ a: [s + {o[12]}, s + {o[13]}], b: I {{ u: s + {o[14]} }} }}))",
+        "uref(&E::None)",
+        f"uref(&E::Arr([s + {o[18]}, s + {o[19]}]))",
+    ]
+    body_rms = ["fn main() -> i64 {", "    let mut acc: i64 = 0;", f"    let s: i64 = mk({b});"]
+    body_rs = ["fn main() {", "    let mut acc: i64 = 0;", f"    let s: i64 = mk({b});"]
+    for c in calls:
+        body_rms.append(acc_add(c))
+        body_rs.append(acc_add_rs(c))
+    body_rms += [
+        "    let e: E = E::Hold(S { a: [s + 9, s + 10], b: I { u: s + 11 } });",
+        "    if let E::Hold(S { a: [p, q], b: I { u } }) = e {",
+        "        print_i64(p + q + u);",
+        "    }",
+        "    print_i64(acc);",
+        "    return 0;",
+        "}",
+    ]
+    body_rs += [
+        "    let e: E = E::Hold(S { a: [s + 9, s + 10], b: I { u: s + 11 } });",
+        "    if let E::Hold(S { a: [p, q], b: I { u } }) = e {",
+        '        println!("{}", p + q + u);',
+        "    }",
+        '    println!("{}", acc);',
+        "}",
+    ]
+    rms += body_rms
+    rs += body_rs
+    return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
+
+
 def gen_ref_program(rng):
     """A program built from references (`&T` / `&mut T`), which no other mode
     exercises. A reference is one word holding an address, so `*r = v` writes
@@ -2205,6 +2328,30 @@ def robust_corpus():
         "param_pat_unknown_field": b"struct S { a: i64 } fn f(S { z }: S) -> i64 { return z; } fn main() -> i64 { return 0; }",
         "param_pat_refutable": b"fn f(1: i64) -> i64 { return 1; } fn main() -> i64 { return 0; }",
         "param_pat_empty_paren": b"fn f(: i64) -> i64 { return 0; } fn main() -> i64 { return 0; }",
+        # A payload variant pattern shares the pattern parser, so a malformed or
+        # deeply nested argument list must error cleanly rather than panic.
+        "enum_pat_unterminated": b"enum E { A(i64), B } fn main() -> i64 { let e: E = E::A(1); return match e { E::A(x ",
+        "enum_pat_empty_arg": b"enum E { A(i64), B } fn main() -> i64 { let e: E = E::A(1); return match e { E::A(, x) => 0, E::B => 0 }; }",
+        "enum_pat_double_rest": b"enum E { A(i64, i64), B } fn main() -> i64 { let e: E = E::A(1, 2); return match e { E::A(.., ..) => 0, E::B => 0 }; }",
+        "enum_pat_arg_after_rest": b"enum E { A(i64, i64), B } fn main() -> i64 { let e: E = E::A(1, 2); return match e { E::A(.., x) => 0, E::B => 0 }; }",
+        "enum_pat_deep_nested": b"struct S { a: S } enum E { A(S) } fn main() -> i64 { let e: E = E::A(S { a: e }); return match e { "
+            + b"E::A(S { a: " * 3000 + b"_" + b" })" * 3000 + b" => 0 }; }",
+        # A refutable argument (a literal or a nested array literal) is a valid
+        # Rust pattern rmc does not generate a per-field test for, so it must
+        # reject the program cleanly rather than mis-bind it.
+        "enum_pat_refutable_literal": b"enum E { A(i64), B } fn main() -> i64 { let e: E = E::A(1); return match e { E::A(1) => 1, E::A(_) => 0, E::B => 0 }; }",
+        "enum_pat_refutable_arr": b"enum E { A([i64; 2]), B } fn main() -> i64 { let e: E = E::A([1, 2]); return match e { E::A([1, y]) => y, E::B => 0 }; }",
+        # A payload read through a `&E` scrutinee auto-derefs, so the same
+        # malformed or deeply nested argument list must error cleanly when the
+        # scrutinee is a reference.
+        "enum_pat_ref_unterminated": b"enum E { A(i64), B } fn main() -> i64 { let e: E = E::A(1); return match &e { E::A(x ",
+        "enum_pat_ref_deep_nested": b"struct S { a: S } enum E { A(S) } fn main() -> i64 { let e: E = E::A(S { a: e }); return match &e { "
+            + b"E::A(S { a: " * 3000 + b"_" + b" })" * 3000 + b" => 0 }; }",
+        # A label on `while let` reaches the desugared `loop`; a malformed or
+        # deeply nested one must still error cleanly rather than panic.
+        "labelled_while_let_unterminated": b"enum E { A(i64), B } fn main() -> i64 { let mut e: E = E::A(1); 'a: while let E::A(x ",
+        "labelled_while_let_deep": b"enum E { A(i64), B } fn main() -> i64 { let mut e: E = E::A(1); 'a: while let E::A(x) = e { "
+            + b"if true { " * 3000 + b"break; " + b"}" * 3000 + b" break; } return 0; }",
     }
     return cases
 
@@ -2433,8 +2580,7 @@ def run_mirmut(args):
 # -------------------------------------------------------------- reject mode
 
 def reject_corpus():
-    """Deterministic programs that `rustc` rejects. `rmc` must reject each one
-    too, with a clean error (exit 1), never accept it and never crash.
+    """Deterministic programs that `rustc` rejects.
 
     This targets the soundness class the differential fuzzers cannot see: a
     program `rmc` wrongly accepts is never run against the rustc reference,
@@ -2891,6 +3037,69 @@ def reject_corpus():
             "fn f([a, a]: [i64; 2]) -> i64 { a }\n"
             "fn main() { let _ = f([1, 2]); }\n",
         ),
+        # A payload variant pattern runs the same checks in its argument list:
+        # naming more fields than the variant has, naming fewer without a `..`,
+        # a refutable argument (a literal), a `mut` on a nested pattern, and a
+        # field the nested struct lacks are each rejected by rustc.
+        "enum_pat_too_many_fields": (
+            "enum E { A(i64), B }\n"
+            "fn main() -> i64 { let e: E = E::A(1); return match e { E::A(x, y) => x, E::B => 0 }; }\n",
+            "enum E { A(i64), B }\n"
+            "fn main() { let e = E::A(1); let _ = match e { E::A(x, y) => x, E::B => 0 }; }\n",
+        ),
+        "enum_pat_too_few_fields": (
+            "enum E { A(i64, i64), B }\n"
+            "fn main() -> i64 { let e: E = E::A(1, 2); return match e { E::A(x) => x, E::B => 0 }; }\n",
+            "enum E { A(i64, i64), B }\n"
+            "fn main() { let e = E::A(1, 2); let _ = match e { E::A(x) => x, E::B => 0 }; }\n",
+        ),
+        "enum_pat_mut_on_nested": (
+            "struct S { x: i64 } enum E { A(S), B }\n"
+            "fn main() -> i64 { let e: E = E::A(S { x: 1 }); return match e { E::A(mut S { x }) => x, E::B => 0 }; }\n",
+            "struct S { x: i64 } enum E { A(S), B }\n"
+            "fn main() { let e = E::A(S { x: 1 }); let _ = match e { E::A(mut S { x }) => x, E::B => 0 }; }\n",
+        ),
+        "enum_pat_nested_unknown_field": (
+            "struct S { x: i64 } enum E { A(S), B }\n"
+            "fn main() -> i64 { let e: E = E::A(S { x: 1 }); return match e { E::A(S { z }) => z, E::B => 0 }; }\n",
+            "struct S { x: i64 } enum E { A(S), B }\n"
+            "fn main() { let e = E::A(S { x: 1 }); let _ = match e { E::A(S { z }) => z, E::B => 0 }; }\n",
+        ),
+        "enum_pat_nested_unknown_struct": (
+            "struct S { x: i64 } enum E { A(S), B }\n"
+            "fn main() -> i64 { let e: E = E::A(S { x: 1 }); return match e { E::A(Q { x }) => x, E::B => 0 }; }\n",
+            "struct S { x: i64 } enum E { A(S), B }\n"
+            "fn main() { let e = E::A(S { x: 1 }); let _ = match e { E::A(Q { x }) => x, E::B => 0 }; }\n",
+        ),
+        "enum_pat_nested_arr_out_of_range": (
+            "enum E { A([i64; 2]), B }\n"
+            "fn main() -> i64 { let e: E = E::A([1, 2]); return match e { E::A([x, y, z]) => x, E::B => 0 }; }\n",
+            "enum E { A([i64; 2]), B }\n"
+            "fn main() { let e = E::A([1, 2]); let _ = match e { E::A([x, y, z]) => x, E::B => 0 }; }\n",
+        ),
+        # A pattern reads through a `&E` scrutinee (match ergonomics), but the
+        # referent is what it is checked against: a variant of a *different*
+        # enum, or of no enum at all, must still be rejected.
+        "enum_pat_ref_wrong_enum": (
+            "enum E { A, B } enum F { C, D }\n"
+            "fn main() -> i64 { let e: E = E::A; return match &e { F::C => 1, _ => 0 }; }\n",
+            "enum E { A, B } enum F { C, D }\n"
+            "fn main() { let e = E::A; let _ = match &e { F::C => 1, _ => 0 }; }\n",
+        ),
+        "enum_pat_ref_scalar": (
+            "enum E { A, B }\n"
+            "fn main() -> i64 { let x: i64 = 0; return match &x { E::A => 1, _ => 0 }; }\n",
+            "enum E { A, B }\n"
+            "fn main() { let x = 0i64; let _ = match &x { E::A => 1, _ => 0 }; }\n",
+        ),
+        # A label on `while let` now names the desugared `loop`, so an
+        # undeclared label there is still rustc's E0426.
+        "labelled_while_let_undeclared": (
+            "enum E { A(i64), B }\n"
+            "fn main() -> i64 { let mut e: E = E::A(1); while let E::A(x) = e { break 'nope; } return 0; }\n",
+            "enum E { A(i64), B }\n"
+            "fn main() { let mut e = E::A(1); while let E::A(x) = e { break 'nope; } }\n",
+        ),
     }
 
 
@@ -3142,12 +3351,88 @@ def run_mir(args):
             break
     if failures == 0:
         print(f"{built} {args.mode} programs (of {args.n}) through the MIR path, seed {args.seed}: all match rustc")
+# -------------------------------------------------------------- mutate mode
+
+# Tokens a mutation may splice in. A mix of valid fragments, delimiters that
+# unbalance a construct, and keywords that only make sense in another context,
+# so the mutated program stays on the parser/sema error paths rather than
+# producing a boring "unknown token".
+MUTATION_TOKENS = [
+    "(", ")", "{", "}", "[", "]", "|", "..", "...", ",", ";", ":", "::", "->",
+    "=>", "=", "==", "+", "-", "*", "&", "&&", "!", "<", ">", "..=", "#",
+    "fn", "let", "mut", "if", "else", "while", "for", "loop", "match", "return",
+    "break", "continue", "struct", "enum", "impl", "as", "true", "false",
+    "i64", "bool", "str", "self", "_", "'a", "0", "1", "99999999999999999999",
+    '"x"', "S", "E", "E::A", "E::A(x)", "x", "y", "0..1",
+]
+
+
+def _mutate_once(rng, text):
+    """One random edit of `text`: splice, delete a run, or duplicate a run."""
+    if not text:
+        return rng.choice(MUTATION_TOKENS)
+    op = rng.random()
+    if op < 0.5:
+        i = rng.randrange(len(text))
+        tok = rng.choice(MUTATION_TOKENS)
+        # A space around a word token keeps `fnx` from forming by accident.
+        if tok[-1].isalnum() and i and text[i - 1].isalnum():
+            tok = " " + tok
+        return text[:i] + tok + text[i:]
+    if op < 0.8:
+        i = rng.randrange(len(text))
+        n = rng.randint(1, max(1, min(40, len(text) - i)))
+        return text[:i] + text[i + n:]
+    i = rng.randrange(len(text))
+    n = rng.randint(1, max(1, min(40, len(text) - i)))
+    return text[:i + n] + text[i:i + n] + text[i + n:]
+
+
+def run_mutate(n, seed, keep=None):
+    """Mutation-based robustness fuzzer: no reference, only "rmc must not
+    crash". Start from the differential generators (and the two corpora), apply
+    a few random edits, and require every mutated input to fail cleanly - exit
+    0 or 1, no signal, no panic message. This reaches error paths the hand-
+    written corpora miss (a delimiter that unbalances a nested pattern, a
+    keyword where an expression is expected) without needing rustc at all."""
+    tmp = f"/tmp/rmc-fuzz-{os.getpid()}"
+    os.makedirs(tmp, exist_ok=True)
+    rng = random.Random(seed)
+    gens = [gen_expr_program, gen_stmt_program, gen_opt_program, gen_pat_program,
+            gen_ref_program, gen_update_program, gen_nestpat_program,
+            gen_arrpat_program, gen_parampat_program, gen_enumpat_program]
+    # Seeds to mutate: the generated programs plus the corpora's byte inputs.
+    bases = [gens[rng.randrange(len(gens))](rng)[0] for _ in range(max(1, n // 4))]
+    bases += [d.decode("latin-1") for d in robust_corpus().values() if isinstance(d, bytes)]
+    failures = 0
+    for it in range(n):
+        base = bases[rng.randrange(len(bases))]
+        text = base
+        for _ in range(rng.randint(1, 4)):
+            text = _mutate_once(rng, text)
+        path = f"{tmp}/m{it}.rms"
+        open(path, "w").write(text)
+        p = run([RMC, path, "-o", f"{tmp}/m{it}.bin"])
+        crashed = (p.returncode < 0 or b"panicked" in p.stderr
+                   or b"overflowed its stack" in p.stderr)
+        if crashed or p.returncode not in (0, 1):
+            failures += 1
+            print(f"[mutate] iteration {it} (seed {seed}): "
+                  f"{'CRASH' if crashed else 'exit ' + str(p.returncode)}")
+            print(p.stderr.decode(errors="replace")[:300])
+            if keep:
+                os.makedirs(keep, exist_ok=True)
+                open(f"{keep}/m{it}.rms", "w").write(text)
+            if failures >= 5:
+                break
+    if failures == 0:
+        print(f"mutate: {n} mutated programs, seed {seed}: no crash, all clean")
     return 1 if failures else 0
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "robust", "mirrobust", "mirmut", "reject", "mir"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "robust", "mirrobust", "mirmut", "reject", "mutate", "mir"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -3186,6 +3471,8 @@ def main():
             print("rustc not found; set RUSTC or install a toolchain", file=sys.stderr)
             return 2
         return run_reject()
+    if args.mode == "mutate":
+        return run_mutate(args.n, args.seed, args.keep)
     if not rustc_available():
         print("rustc not found; set RUSTC or install a toolchain", file=sys.stderr)
         return 2
@@ -3208,7 +3495,8 @@ def main():
            "fordestr": gen_fordestr_program,
            "nestpat": gen_nestpat_program,
            "arrpat": gen_arrpat_program,
-           "parampat": gen_parampat_program}[args.mode]
+           "parampat": gen_parampat_program,
+           "enumpat": gen_enumpat_program}[args.mode]
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus
     # suite; a fuzz program is otherwise only checked with every pass on, so a

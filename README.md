@@ -227,6 +227,8 @@ overflowing arithmetic near `i64::MAX` (the only mode that makes the
 and a nested-path write, `pat` for `match` expressions (multi-variant enums,
 two-field payloads, explicit discriminants, `bool` matches, binding patterns,
 struct patterns, nested matches, `if let`, string patterns, per-arm guards, and
+payload variant patterns whose arguments take sub-patterns (`_`, `mut x`, a
+trailing `..`, a nested struct/array pattern) and read through a `&E` scrutinee;
 a side-effecting
 scrutinee), `letdestr` for `let` struct destructuring (shorthand, renamed and
 `mut` bindings, `_` and `..`, a call and a reference scrutinee, and a
@@ -239,7 +241,10 @@ the same pattern grammar as `let`), `nestpat` for nested struct sub-patterns
 `_` elements, `mut` bindings, nested and struct element patterns, `..` rests
 in every position, and an array-typed struct field destructured in place),
 `parampat` for aggregate parameter patterns (struct and array patterns, a
-nested one, one mixed with plain parameters, and one on a method receiver), and
+nested one, one mixed with plain parameters, and one on a method receiver),
+`enumpat` for payload variant patterns with sub-patterns (`_`, `mut x`, a
+trailing `..`, and a nested struct or array pattern inside `E::V(..)`, in
+`match`, `if let` and a method, and read through a `&E` scrutinee), and
 `order` for assignment evaluation order (a
 side-effecting index and value on both `=` and every compound operator, the
 shapes `stmt` never assigns through). `shift` drives `<<`, `>>` and the compound
@@ -277,6 +282,8 @@ python3 tools/fuzz.py --mode mir --gen width --n 500 --seed 1
 # also exercise the trap codegen: --bounds-checks and --overflow-checks runs
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 python3 tools/fuzz.py --mode robust
+python3 tools/fuzz.py --mode reject
+python3 tools/fuzz.py --mode mutate --n 500 --seed 1
 python3 tools/fuzz.py --mode mirrobust
 python3 tools/fuzz.py --mode mirmut --n 500 --seed 1
 ```
@@ -285,8 +292,13 @@ python3 tools/fuzz.py --mode mirmut --n 500 --seed 1
 adversarial inputs (random bytes, unbalanced braces, and thousands of nested
 parentheses, braces, unary operators or binary operators) and requires each to
 produce a clean error rather than a panic or a signal. This is what catches an
-unbounded parser recursion overflowing the stack on untrusted input. CI runs it
-together with a small fixed-seed differential fuzz.
+unbounded parser recursion overflowing the stack on untrusted input. `reject`
+mode is the soundness mirror: it holds a corpus of programs `rustc` rejects and
+requires `rmc` to reject each one too, never accept it. `mutate` mode applies
+random edits (splices, deletions, duplications) to the generators' programs and
+the `robust` corpus, and requires every mutant to fail cleanly; it needs no
+rustc and reaches error paths the fixed corpora miss. CI runs `robust` together
+with a small fixed-seed differential fuzz.
 
 `mirrobust` mode is `robust` for the MIR path. It feeds a fixed corpus of `.rs`
 programs — the standard-library formatting and containers, closures, floating
@@ -365,7 +377,7 @@ same patterns
 explicit discriminant, `enum E { A = 5, B }`) and payload variants; `break`
 (with a value in a `loop`, so `loop`
 works as an expression), `continue`,
-`return`; loop labels (`'a: loop` / `'a: while` / `'a: for`, with
+`return`; loop labels (`'a: loop` / `'a: while` / `'a: while let` / `'a: for`, with
 `break 'a` / `break 'a value` / `continue 'a` targeting any enclosing labelled
 loop); arithmetic, comparison, bitwise (`!`/`&`/`|`/`^`) and shift (`<<`/`>>`)
 operators; `&&`/`||`; strings (a `str` literal or `str`-typed parameter, return
