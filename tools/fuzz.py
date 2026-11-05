@@ -994,6 +994,121 @@ def gen_update_program(rng):
     ]
     return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
 
+def _let_pat(rng, fields, prefix):
+    """A random `let` struct pattern over `fields`. Returns the pattern text and
+    the bindings it introduces, as `(name, mutable, field)` triples. A field may
+    be bound by shorthand, renamed, made `mut`, ignored (`f: _`) or dropped with
+    `..`; at least one field must be named unless `..` covers them all.
+    """
+    tokens = []
+    binds = []
+    mentioned = set()
+    for f in fields:
+        r = rng.random()
+        if r < 0.15:
+            continue  # dropped; needs `..`
+        mentioned.add(f)
+        if r < 0.35:
+            tokens.append(f"{f}: _")
+        elif r < 0.55:
+            tokens.append(f)
+            binds.append((f, False, f))
+        elif r < 0.7:
+            tokens.append(f"mut {f}")
+            binds.append((f, True, f))
+        elif r < 0.85:
+            nm = f"{prefix}{f}"
+            tokens.append(f"{f}: {nm}")
+            binds.append((nm, False, f))
+        else:
+            nm = f"{prefix}{f}"
+            tokens.append(f"{f}: mut {nm}")
+            binds.append((nm, True, f))
+    if len(mentioned) < len(fields) or rng.random() < 0.4:
+        tokens.append("..")
+    return ", ".join(tokens), binds
+
+
+def gen_letdestr_program(rng):
+    """`let` destructuring `let S { f, g: h, i: _, .. } = e;`. The expansion is a
+    hidden scrutinee plus one field read per binding, spliced into the enclosing
+    block. Checks the invariants: the bindings outlive the statement, the
+    scrutinee is evaluated exactly once (observable through the `print_i64` in
+    `mk`), `mut` is per binding, the pattern may read through a reference, and a
+    struct-typed field may be destructured in turn. No other mode emits `let`
+    destructuring, so a mis-scoped expansion would be invisible here.
+    """
+    b = rng.randint(1, 9)
+    d = rng.randint(1, 9)
+    fields = ["x", "y", "z"]
+    pat, binds = _let_pat(rng, fields, "a")
+    # The scrutinee: a plain local (no temporary), a call (temporary, side
+    # effect), or a reference (temporary, auto-deref on the field reads).
+    src = rng.choice(["local", "call", "ref"])
+
+    rms = [
+        "struct P { x: i64, y: i64, z: i64 }",
+        "struct Q { p: P, t: i64 }",
+        f"fn mk(n: i64) -> P {{ print_i64(n); return P {{ x: n, y: n + 1, z: n + 2 }}; }}",
+        "fn main() -> i64 {",
+        "    let mut acc: i64 = 0;",
+        f"    let s: P = mk({d});",
+    ]
+    rs = [
+        "#[derive(Copy, Clone)]",
+        "struct P { x: i64, y: i64, z: i64 }",
+        "#[derive(Copy, Clone)]",
+        "struct Q { p: P, t: i64 }",
+        f"fn mk(n: i64) -> P {{ println!(\"{{}}\", n); P {{ x: n, y: n + 1, z: n + 2 }} }}",
+        "fn main() {",
+        "    let mut acc: i64 = 0;",
+        f"    let s: P = mk({d});",
+    ]
+    if src == "local":
+        scrut, scrut_rs = "s", "s"
+    elif src == "call":
+        scrut, scrut_rs = f"mk({d + 1})", f"mk({d + 1})"
+    else:
+        scrut, scrut_rs = "&s", "&s"
+    rms.append(f"    let P {{ {pat} }} = {scrut};")
+    rs.append(f"    let P {{ {pat} }} = {scrut_rs};")
+    # Mutate every `mut` binding, so an ignored `mut` (a compile error if the
+    # flag is dropped) and a mis-bound one are both observable.
+    for (name, mutable, _f) in binds:
+        if mutable:
+            rms.append(f"    {name} = {name} + {b};")
+            rs.append(f"    {name} += {b};")
+    if binds:
+        terms = " + ".join(f"{n} * {i + 2}" for i, (n, _m, _f) in enumerate(binds))
+        rms.append(f"    acc = acc + {terms};")
+        rs.append(f"    acc += {terms};")
+    else:
+        # `P { .. }` binds nothing; the scrutinee still runs once.
+        rms.append("    acc = acc + 1;")
+        rs.append("    acc += 1;")
+    # Destructure a struct-typed field in a second statement.
+    pat2, binds2 = _let_pat(rng, fields, "c")
+    rms.append(f"    let q: Q = Q {{ p: mk({d + 2}), t: {b} }};")
+    rs.append(f"    let q: Q = Q {{ p: mk({d + 2}), t: {b} }};")
+    rms.append(f"    let Q {{ p, t }} = q;")
+    rs.append(f"    let Q {{ p, t }} = q;")
+    rms.append(f"    let P {{ {pat2} }} = p;")
+    rs.append(f"    let P {{ {pat2} }} = p;")
+    for (name, mutable, _f) in binds2:
+        if mutable:
+            rms.append(f"    {name} = {name} + {b};")
+            rs.append(f"    {name} += {b};")
+    if binds2:
+        terms2 = " + ".join(f"{n} * {i + 3}" for i, (n, _m, _f) in enumerate(binds2))
+        rms.append(f"    acc = acc + {terms2} + t;")
+        rs.append(f"    acc += {terms2} + t;")
+    else:
+        rms.append("    acc = acc + t;")
+        rs.append("    acc += t;")
+    rms += ["    print_i64(acc);", "    return 0;", "}"]
+    rs += ['    println!("{}", acc);', "}"]
+    return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
+
 def gen_ref_program(rng):
     """A program built from references (`&T` / `&mut T`), which no other mode
     exercises. A reference is one word holding an address, so `*r = v` writes
@@ -1545,6 +1660,14 @@ def robust_corpus():
         "struct_pattern_missing_name": b"struct S { a: i64 } fn main() -> i64 { let s: S = S { a: 1 }; return match s { S { : a } => 0 }; }",
         "struct_pattern_double_dotdot": b"struct S { a: i64 } fn main() -> i64 { let s: S = S { a: 1 }; return match s { S { .. .. } => 0 }; }",
         "struct_pattern_field_after_rest": b"struct S { a: i64 } fn main() -> i64 { let s: S = S { a: 1 }; return match s { S { .., a } => 0 }; }",
+        # `let` destructuring shares the struct-pattern parser, so the same
+        # malformed patterns must error cleanly in a `let` too.
+        "unterminated_let_destructure": b"struct S { a: i64 } fn main() -> i64 { let s: S = S { a: 1 }; let S { a ",
+        "let_destructure_missing_name": b"struct S { a: i64 } fn main() -> i64 { let s: S = S { a: 1 }; let S { : a } = s; return 0; }",
+        "let_destructure_double_dotdot": b"struct S { a: i64 } fn main() -> i64 { let s: S = S { a: 1 }; let S { .. .. } = s; return 0; }",
+        "let_destructure_field_after_rest": b"struct S { a: i64 } fn main() -> i64 { let s: S = S { a: 1 }; let S { .., a } = s; return 0; }",
+        "let_destructure_mut_underscore": b"struct S { a: i64 } fn main() -> i64 { let s: S = S { a: 1 }; let S { mut a: _ } = s; return 0; }",
+        "let_destructure_leading_mut_renamed": b"struct S { a: i64 } fn main() -> i64 { let s: S = S { a: 1 }; let S { mut a: b } = s; return b; }",
     }
     return cases
 
@@ -1868,6 +1991,42 @@ def reject_corpus():
             "fn main() -> i64 { let o: i64 = 3; if let y = o { 1 } return 0; }\n",
             "fn main() { let o = 3i64; if let y = o { 1 } }\n",
         ),
+        # `let` destructuring. `mut` goes on each binding, not on the pattern
+        # (E0658); a field the struct lacks (E0026), a field bound twice (E0416)
+        # and an unknown struct (E0422) are all rejected; a non-struct
+        # scrutinee is a field-access error. A partial pattern (one that does
+        # not mention every field and has no `..`) is *accepted*, as in the
+        # `match` path — a documented subset relaxation, so it is not here.
+        "let_destructure_mut_before_pattern": (
+            "struct S { x: i64, y: i64 }\n"
+            "fn main() -> i64 { let s: S = S { x: 1, y: 2 }; let mut S { x, y } = s; return x; }\n",
+            "struct S { x: i64, y: i64 }\n"
+            "fn main() { let s = S { x: 1, y: 2 }; let mut S { x, y } = s; let _ = (x, y); }\n",
+        ),
+        "let_destructure_unknown_field": (
+            "struct S { x: i64 }\n"
+            "fn main() -> i64 { let s: S = S { x: 1 }; let S { z } = s; return 0; }\n",
+            "struct S { x: i64 }\n"
+            "fn main() { let s = S { x: 1 }; let S { z } = s; let _ = z; }\n",
+        ),
+        "let_destructure_field_bound_twice": (
+            "struct S { x: i64 }\n"
+            "fn main() -> i64 { let s: S = S { x: 1 }; let S { x, x: a } = s; return a; }\n",
+            "struct S { x: i64 }\n"
+            "fn main() { let s = S { x: 1 }; let S { x, x: a } = s; let _ = (x, a); }\n",
+        ),
+        "let_destructure_unknown_struct": (
+            "struct S { x: i64 }\n"
+            "fn main() -> i64 { let s: S = S { x: 1 }; let Q { x } = s; return x; }\n",
+            "struct S { x: i64 }\n"
+            "fn main() { let s = S { x: 1 }; let Q { x } = s; let _ = x; }\n",
+        ),
+        "let_destructure_non_struct": (
+            "struct S { x: i64 }\n"
+            "fn main() -> i64 { let S { x } = 5; return x; }\n",
+            "struct S { x: i64 }\n"
+            "fn main() { let S { x } = 5; let _ = x; }\n",
+        ),
     }
 
 
@@ -1905,7 +2064,7 @@ def run_reject():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "robust", "reject"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "robust", "reject"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -1947,7 +2106,8 @@ def main():
            "nest": gen_nest_program, "pat": gen_pat_program,
            "order": gen_order_program, "shift": gen_shift_program,
            "cast": gen_cast_program, "assoc": gen_assoc_program,
-           "ref": gen_ref_program, "update": gen_update_program}[args.mode]
+           "ref": gen_ref_program, "update": gen_update_program,
+           "letdestr": gen_letdestr_program}[args.mode]
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus
     # suite; a fuzz program is otherwise only checked with every pass on, so a
