@@ -180,7 +180,7 @@ fn calls_other(e: &Expr, name: &str) -> bool {
                         || b.tail.as_deref().map_or(false, |x| calls_other(x, name))
                 })
         }
-        Expr::Block(b) | Expr::MatchBoundary(b, _) => {
+        Expr::Block(b) | Expr::MatchBoundary(b, _) | Expr::Loop(b, _, _) => {
             b.stmts.iter().any(|s| stmt_calls_other(s, name))
                 || b.tail.as_deref().map_or(false, |x| calls_other(x, name))
         }
@@ -208,14 +208,13 @@ fn stmt_calls_other(s: &Stmt, name: &str) -> bool {
         Stmt::While(c, b) => {
             calls_other(c, name) || b.stmts.iter().any(|s| stmt_calls_other(s, name))
         }
-        Stmt::Loop(b) => b.stmts.iter().any(|s| stmt_calls_other(s, name)),
         Stmt::For { start, end, body, .. } => {
             calls_other(start, name)
                 || calls_other(end, name)
                 || body.stmts.iter().any(|s| stmt_calls_other(s, name))
         }
         Stmt::Return(v) => v.as_ref().map_or(false, |e| calls_other(e, name)),
-        Stmt::Break | Stmt::Continue => false,
+        Stmt::Break(_) | Stmt::Continue => false,
     }
 }
 
@@ -233,7 +232,7 @@ fn has_call(e: &Expr) -> bool {
                         || b.tail.as_deref().map_or(false, has_call)
                 })
         }
-        Expr::Block(b) => {
+        Expr::Block(b) | Expr::Loop(b, _, _) => {
             b.stmts.iter().any(|s| stmt_has_call(s)) || b.tail.as_deref().map_or(false, has_call)
         }
         Expr::MatchBoundary(b, _) => {
@@ -264,12 +263,11 @@ fn stmt_has_call(s: &Stmt) -> bool {
         Stmt::Assign { target, value } => has_call(target) || has_call(value),
         Stmt::Expr(e) => has_call(e),
         Stmt::While(c, b) => has_call(c) || b.stmts.iter().any(stmt_has_call),
-        Stmt::Loop(b) => b.stmts.iter().any(stmt_has_call),
         Stmt::For { start, end, body, .. } => {
             has_call(start) || has_call(end) || body.stmts.iter().any(stmt_has_call)
         }
         Stmt::Return(v) => v.as_ref().map_or(false, has_call),
-        Stmt::Break | Stmt::Continue => false,
+        Stmt::Break(_) | Stmt::Continue => false,
     }
 }
 
@@ -289,7 +287,7 @@ fn has_return(e: &Expr) -> bool {
                 || block_has_return(t)
                 || e.as_ref().map_or(false, |b| block_has_return(b))
         }
-        Expr::Block(b) => block_has_return(b),
+        Expr::Block(b) | Expr::Loop(b, _, _) => block_has_return(b),
         Expr::MatchBoundary(b, _) => block_has_return(b),
         Expr::Index(a, b) => has_return(a) || has_return(b),
         Expr::Field { base, .. } => has_return(base),
@@ -316,10 +314,9 @@ fn stmt_has_return(s: &Stmt) -> bool {
         Stmt::Assign { target, value } => has_return(target) || has_return(value),
         Stmt::Expr(e) => has_return(e),
         Stmt::While(c, b) => has_return(c) || block_has_return(b),
-        Stmt::Loop(b) => block_has_return(b),
         Stmt::For { start, end, body, .. } => {
             has_return(start) || has_return(end) || block_has_return(body)
         }
-        Stmt::Break | Stmt::Continue => false,
+        Stmt::Break(_) | Stmt::Continue => false,
     }
 }

@@ -1,0 +1,160 @@
+// `loop` as an expression: `break value` yields a value from the loop, which
+// can then be bound, used in arithmetic, passed as an argument, or nested. A
+// `loop` whose body never breaks is `!` and unifies with any type.
+
+fn find(n: i64) -> i64 {
+    // Value-position loop in tail position: the whole function body's value.
+    let mut i: i64 = 0;
+    loop {
+        if i * i >= n {
+            break i;
+        }
+        i = i + 1;
+    }
+}
+
+fn dbl(x: i64) -> i64 {
+    return x * 2;
+}
+
+fn spin(flag: i64) -> i64 {
+    // A diverging loop as an `if` branch without `else`: the branch is `!`, so
+    // the `if` is `()` and the code after it is still reachable when flag == 0.
+    if flag > 0 {
+        loop {
+            return -1;
+        }
+    }
+    return 7;
+}
+
+// A loop that yields a `bool`, consumed by `!`: the loop's type must reach the
+// unary operator, not be assumed `i64`.
+fn negate(x: i64) -> bool {
+    let b: bool = !loop {
+        break x > 0;
+    };
+    return b;
+}
+
+struct P {
+    x: i64,
+    y: i64,
+}
+
+enum E {
+    V(P),
+    W,
+}
+
+fn from_loop(n: i64) -> i64 {
+    // A loop yielding a struct, used as an enum-constructor argument.
+    let e: E = E::V(loop {
+        break P { x: n, y: n + 1 };
+    });
+    let r: i64 = match e {
+        E::V(p) => p.x + p.y,
+        E::W => 0,
+    };
+    return r;
+}
+
+fn array_from_loop() -> i64 {
+    let mut i: i64 = 0;
+    let a: [i64; 3] = loop {
+        i = i + 1;
+        if i == 2 {
+            break [7, 8, 9];
+        }
+    };
+    return a[0] + a[1] + a[2];
+}
+
+fn main() -> i64 {
+    // Straight-line value.
+    let a: i64 = loop {
+        break 5;
+    };
+    print_i64(a);
+
+    // A value computed on some iteration, with a side effect on the counter.
+    let mut k: i64 = 0;
+    let b: i64 = loop {
+        k = k + 1;
+        if k == 7 {
+            break k * 10;
+        }
+    };
+    print_i64(b);
+    print_i64(k);
+
+    // Loop nested inside a loop, both yielding values.
+    let mut i: i64 = 0;
+    let outer: i64 = loop {
+        i = i + 1;
+        let inner: i64 = loop {
+            if i > 3 {
+                break i * 100;
+            }
+            break 1;
+        };
+        if i == 5 {
+            break inner + i;
+        }
+    };
+    print_i64(outer);
+
+    // Value used directly in arithmetic and as a call argument.
+    let mut m: i64 = 0;
+    let c: i64 = loop {
+        m = m + 1;
+        if m == 4 {
+            break m;
+        }
+    } * 10 + 1;
+    print_i64(c);
+    print_i64(dbl(loop {
+        break 21;
+    }));
+
+    // The tail expression of a function is a value-position loop.
+    print_i64(find(20));
+    print_i64(find(0));
+    print_i64(find(100));
+
+    // A diverging loop branch leaves the `if` typed as `()`.
+    print_i64(spin(0));
+
+    // A unit loop (`break;`) used as a statement, and one bound to `()`.
+    let mut n: i64 = 0;
+    loop {
+        n = n + 1;
+        if n == 3 {
+            break;
+        }
+    }
+    let u: () = loop {
+        n = n + 1;
+        if n == 6 {
+            break;
+        }
+    };
+    print_i64(n);
+
+    // Regression: a bool-valued loop through `!`, a struct-valued loop through
+    // an enum constructor, and an array-valued loop.
+    if negate(3) {
+        print_i64(1);
+    } else {
+        print_i64(0);
+    }
+    if negate(-1) {
+        print_i64(1);
+    } else {
+        print_i64(0);
+    }
+    print_i64(from_loop(10));
+    print_i64(from_loop(-4));
+    print_i64(array_from_loop());
+    return 0;
+}

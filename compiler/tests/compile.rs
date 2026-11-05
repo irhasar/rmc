@@ -2955,3 +2955,79 @@ fn a_duplicate_const_is_rejected() {
     .unwrap_err();
     assert!(err.contains("defined multiple times"), "got: {err}");
 }
+
+#[test]
+fn a_value_loop_binds_its_break_value() {
+    // `loop` is an expression: the `break` value is stored into the loop's
+    // result slot, which the code after the loop reads.
+    let out = asm("fn main() -> i64 { let x: i64 = loop { break 5; }; return x; }");
+    assert!(out.contains("movq $5, "), "break value stored to the result slot:\n{out}");
+}
+
+#[test]
+fn a_break_value_in_a_while_is_rejected() {
+    // rustc E0571: only a `loop` can be broken out of with a value.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let mut i: i64 = 0; while i < 2 { break 5; } return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("only allowed in a `loop`"), "got: {err}");
+}
+
+#[test]
+fn a_break_value_in_a_statement_loop_is_rejected() {
+    // A `loop` in statement position is typed `()`, so a value cannot break out
+    // of it: the `break` value is checked against `()`.
+    let err = compile_to_asm(
+        "fn main() -> i64 { loop { break 5; } return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("used as a statement"), "got: {err}");
+}
+
+#[test]
+fn a_diverging_loop_branch_without_else_is_accepted() {
+    // `if c { loop {} }`: the branch is `!`, so the `if` is `()` and the code
+    // after it is still reachable.
+    let out = asm("fn main() -> i64 { let mut n: i64 = 0; if n > 0 { loop {} } n = n + 1; return n; }");
+    assert!(out.contains("main:"), "accepted:\n{out}");
+}
+
+#[test]
+fn a_completing_loop_body_must_be_unit() {
+    // A body that can fall through cannot yield a value; only `break` does.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let x: i64 = loop { 5 }; return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("`loop` body must evaluate to `()`"), "got: {err}");
+}
+
+#[test]
+fn mismatched_break_values_are_rejected() {
+    let err = compile_to_asm(
+        "fn main() -> i64 { let x: i64 = loop { break 1; break true; }; return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("break` value type mismatch"), "got: {err}");
+}
+
+#[test]
+fn a_break_value_in_a_while_let_is_rejected() {
+    // `while let` desugars to a `loop` whose `else` arm always ends in a plain
+    // `break;`, so a `break value` in the body is a type mismatch. rustc
+    // rejects it too (E0571).
+    let err = compile_to_asm(
+        "enum Opt { Some(i64), None } \
+         fn main() -> i64 { let mut i: i64 = 0; \
+         while let Opt::Some(x) = Opt::Some(i) { i = i + 1; if i == 3 { break 5; } } \
+         return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("break`"), "got: {err}");
+}

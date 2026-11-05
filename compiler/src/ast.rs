@@ -37,6 +37,10 @@ pub enum Type {
     Str,
     /// Unresolved name produced by the parser; never survives sema.
     Named(String),
+    /// The type of an expression that never produces a value (`!`). Only ever
+    /// produced by sema (e.g. a `loop` with no reachable `break`), never named
+    /// in source. It unifies with every other type.
+    Never,
 }
 
 impl Type {
@@ -44,7 +48,7 @@ impl Type {
         match self {
             Type::I64 | Type::Bool | Type::Str | Type::Enum(_) | Type::Ref(..) => 8,
             Type::EnumData(_, size) => *size,
-            Type::Unit => 0,
+            Type::Unit | Type::Never => 0,
             Type::Array(elem, n) => elem.size() * n,
             Type::Struct(_, s) => *s,
             Type::Named(_) => 0,
@@ -129,6 +133,15 @@ pub enum Expr {
         ret_ty: Type,
     },
     If(Box<Expr>, Block, Option<Block>),
+    /// `loop { .. }`. It is always an expression: a `loop` in statement
+    /// position is a `Stmt::Expr` around this node with `slot == -2`, so its
+    /// value is discarded and it is typed `()`. Otherwise sema types it as the
+    /// type of its `break`s, or `!` when no `break` can be reached, and records
+    /// that type here. `slot` is the hidden frame slot holding the loop's value
+    /// (`-1` when it yields none, `-2` while untyped, meaning "used as a
+    /// statement"). `ty` is `Unit` until sema fills it in; codegen needs it to
+    /// report the loop's type to its consumer.
+    Loop(Block, i32, Type),
     /// Marks a desugared `match`, wrapping the *whole* `if` chain exactly once
     /// (not each arm). A `match` desugars to an `if` chain, and the chain must
     /// be recognised as a unit when deciding whether it is exhaustive. Without
@@ -260,7 +273,6 @@ pub enum Stmt {
     /// An expression evaluated for its side effects.
     Expr(Expr),
     While(Expr, Block),
-    Loop(Block),
     /// `for var in start..end { body }`. A `for` cannot be desugared to a
     /// `while` because `continue` must still run the increment, so it keeps its
     /// own node and the code generator gives the increment its own label.
@@ -276,7 +288,9 @@ pub enum Stmt {
         body: Block,
     },
     Return(Option<Expr>),
-    Break,
+    /// `break` or `break value`. A value is only legal in a `loop`; sema
+    /// rejects it in a `while`/`for` (rustc E0571).
+    Break(Option<Expr>),
     Continue,
 }
 

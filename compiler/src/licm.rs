@@ -86,11 +86,6 @@ impl Licm {
                 let binds = self.hoist_loop(body, &[], eff);
                 out.extend(binds);
             }
-            Stmt::Loop(body) => {
-                self.block(body);
-                let binds = self.hoist_loop(body, &[], Effects::of_block(body));
-                out.extend(binds);
-            }
             Stmt::For { start, end, body, var_slot, end_slot, .. } => {
                 self.expr_loops(start);
                 self.expr_loops(end);
@@ -122,7 +117,12 @@ impl Licm {
                     self.expr_loops(e);
                 }
             }
-            Stmt::Break | Stmt::Continue => {}
+            Stmt::Break(v) => {
+                if let Some(e) = v {
+                    self.expr_loops(e);
+                }
+            }
+            Stmt::Continue => {}
         }
         out.push(s);
     }
@@ -131,7 +131,7 @@ impl Licm {
     /// process them. A loop is a statement, so it only appears inside a block.
     fn expr_loops(&mut self, e: &mut Expr) {
         match e {
-            Expr::Block(b) => self.block(b),
+            Expr::Block(b) | Expr::Loop(b, _, _) => self.block(b),
             Expr::MatchBoundary(b, _) => self.block(b),
             Expr::If(c, t, els) => {
                 self.expr_loops(c);
@@ -261,7 +261,6 @@ impl Effects {
                 self.expr(c);
                 self.block(b);
             }
-            Stmt::Loop(b) => self.block(b),
             Stmt::For { start, end, body, var_slot, end_slot, .. } => {
                 self.slots.insert(*var_slot);
                 self.slots.insert(*end_slot);
@@ -274,7 +273,12 @@ impl Effects {
                     self.expr(e);
                 }
             }
-            Stmt::Break | Stmt::Continue => {}
+            Stmt::Break(v) => {
+                if let Some(e) = v {
+                    self.expr(e);
+                }
+            }
+            Stmt::Continue => {}
         }
     }
 
@@ -318,7 +322,7 @@ impl Effects {
                 self.expr(b);
             }
             Expr::Deref { expr, .. } => self.expr(expr),
-            Expr::Block(b) => self.block(b),
+            Expr::Block(b) | Expr::Loop(b, _, _) => self.block(b),
             Expr::MatchBoundary(b, _) => self.block(b),
             Expr::If(c, t, els) => {
                 self.expr(c);
@@ -381,7 +385,6 @@ impl Hoister {
                 self.expr(c);
                 self.block(b);
             }
-            Stmt::Loop(b) => self.block(b),
             Stmt::For { start, end, body, .. } => {
                 self.expr(start);
                 self.expr(end);
@@ -392,7 +395,12 @@ impl Hoister {
                     self.expr(e);
                 }
             }
-            Stmt::Break | Stmt::Continue => {}
+            Stmt::Break(v) => {
+                if let Some(e) = v {
+                    self.expr(e);
+                }
+            }
+            Stmt::Continue => {}
         }
     }
 
@@ -468,7 +476,7 @@ impl Hoister {
                 self.expr(b);
             }
             Expr::Deref { expr, .. } | Expr::AddrOf { expr, .. } => self.expr(expr),
-            Expr::Block(b) => self.block(b),
+            Expr::Block(b) | Expr::Loop(b, _, _) => self.block(b),
             Expr::MatchBoundary(b, _) => self.block(b),
             Expr::If(c, t, els) => {
                 self.expr(c);

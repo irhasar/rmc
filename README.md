@@ -215,7 +215,8 @@ array elements and struct fields (including compound `+=` and friends);
 `if`/`else`, `while`, `loop`, and `for i in a..b` / `a..=b`; `match` on integers,
 `bool`s and enums (literal, `true`/`false`, `Enum::Variant` and `_` patterns,
 plus payload bindings and binding names) and `if let` with the same patterns
-(desugared to a two-arm `match`); `break`, `continue`,
+(desugared to a two-arm `match`); `break` (with a value in a `loop`, so `loop`
+works as an expression), `continue`,
 `return`; arithmetic, comparison, bitwise (`!`/`&`/`|`/`^`) and shift (`<<`/`>>`)
 operators; `&&`/`||`; string literals; `mut` enforcement and definite
 initialisation; `const` items (folded to a value and substituted at every use,
