@@ -544,7 +544,7 @@ impl Elf {
                 Ok(())
             }
             "movb" => self.enc_mov_bytes(&src, &dst, sec),
-            _ => self.enc_mov_generic(&src, &dst, sec),
+            _ => self.enc_mov_generic(mnem, &src, &dst, sec),
         }
     }
 
@@ -597,7 +597,13 @@ impl Elf {
         }
     }
 
-    fn enc_mov_generic(&mut self, src: &str, dst: &str, sec: usize) -> Result<(), String> {
+    fn enc_mov_generic(
+        &mut self,
+        mnem: &str,
+        src: &str,
+        dst: &str,
+        sec: usize,
+    ) -> Result<(), String> {
         if let Some(rest) = src.strip_prefix('$') {
             let v = match parse_imm(rest) {
                 Ok(v) => v,
@@ -619,7 +625,12 @@ impl Elf {
                 return Ok(());
             }
             let m = parse_mem(dst).ok_or_else(|| format!("elf: bad mov dst `{dst}`"))?;
-            self.mem_op(sec, 0xC7, &m, 0, true, false);
+            // `as` reads an unsuffixed `mov $imm, mem` as a 32-bit store (`movl`)
+            // because there is no operand to infer a width from; only an explicit
+            // `movq` stores 64 bits. Matching that keeps the encoder a faithful
+            // stand-in and stops an unsuffixed store silently leaving the high
+            // half of the destination stale.
+            self.mem_op(sec, 0xC7, &m, 0, mnem != "mov", false);
             self.sections[sec].data.extend_from_slice(&(v as i32).to_le_bytes());
             return Ok(());
         }
@@ -1355,6 +1366,22 @@ mod tests {
         let mut e = test_elf(0x5);
         e.instruction("div %ebx", 0).unwrap();
         assert_eq!(e.sections[0].data[3..], [0xF7, 0xF3]);
+    }
+
+    #[test]
+    fn an_unsuffixed_immediate_store_is_32_bit_like_as() {
+        // `mov $1, -8(%rbp)` assembles to `movl` (`c7 45 f8 ...`); only an
+        // explicit `movq` sets REX.W.
+        let mut e = test_elf(0x5);
+        e.instruction("mov $1, -8(%rbp)", 0).unwrap();
+        assert_eq!(e.sections[0].data[3..], [0xC7, 0x45, 0xF8, 0x01, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn a_q_suffixed_immediate_store_is_64_bit() {
+        let mut e = test_elf(0x5);
+        e.instruction("movq $1, -8(%rbp)", 0).unwrap();
+        assert_eq!(e.sections[0].data[3..], [0x48, 0xC7, 0x45, 0xF8, 0x01, 0x00, 0x00, 0x00]);
     }
 
     #[test]

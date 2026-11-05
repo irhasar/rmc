@@ -560,6 +560,15 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
     entirely, matching `as`; an extended register (`%r8d`) still needs its
     REX.R. `reg_is_64`/`reg_is_32` decide, and `rex_if_needed` omits the
     no-op byte.
+  - An unsuffixed `mov $imm, mem` is a *32-bit* store. `as` has no register
+    operand to infer a width from, so it picks `movl` and warns; only an
+    explicit `movq` stores 64 bits. The generator must therefore size every
+    immediate-to-memory store (`store_operand` does), and the encoder must
+    reproduce `as`'s default rather than promoting the store to 64 bits.
+    Getting this wrong leaves the destination's high four bytes stale, which
+    is only observable when the slot previously held a value with a set high
+    half — the payload-enum path zeroes the slot first, so the encoding test,
+    not a behaviour test, is what catches it.
   - `.p2align n` means "align to 2^n", `.balign`/`.align n` mean "align to n
     bytes". They shared one arm that treated both as a byte count, so every loop
     the generator padded with `.p2align 4` came out 4-byte aligned in-process
