@@ -255,6 +255,17 @@ pub enum Expr {
     /// Reading an aggregate yields its address, exactly as naming a struct local
     /// does.
     Deref { expr: Box<Expr>, ty: Type },
+    /// The scrutinee of a *scalar* pattern (`match x { 5 => .. }`), which match
+    /// ergonomics may need to dereference. A variant or struct pattern already
+    /// derefs its scrutinee in `sema`, but a literal, range or bool pattern
+    /// desugars to a plain comparison (`s == 5`), which `sema` rejects for a
+    /// `&i64` scrutinee. The parser cannot insert the deref itself: it does not
+    /// know the scrutinee's type, and rustc derefs only a *reference* (a scalar
+    /// scrutinee must stay untouched). This marker wraps such a scrutinee so
+    /// `sema`, which knows the type, can rewrite it to `Deref` when it is a
+    /// reference and to the bare expression otherwise. It is consumed by
+    /// `sema::check_expr` and never survives to codegen.
+    PatScrutinee(Box<Expr>),
 }
 
 /// A field inside a struct literal, once sema has resolved its layout.

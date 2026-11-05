@@ -847,12 +847,26 @@ impl Sema {
                         }
                         Expr::BoolTest { scrutinee, value } => {
                             // `desugar_match` only tests a `Var` (the temporary
-                            // it bound the scrutinee to, or a bool variable);
-                            // anything else cannot be proven the same across
-                            // arms.
-                            let name = match scrutinee.as_ref() {
-                                Expr::Var { name, .. } => name.as_str(),
-                                _ => return false,
+                            // it bound the scrutinee to, or a bool variable), so
+                            // two arms can be proven to test the same value.
+                            // Anything else cannot, so the chain is not total.
+                            // A scalar pattern through a reference
+                            // (`match &b { true => .., false => .. }`) reads the
+                            // referent, so the same `Var` appears under one
+                            // `Deref` in every arm; accept that too, and look
+                            // through a `PatScrutinee` marker should one still be
+                            // present.
+                            fn bool_scrutinee_var(e: &Expr) -> Option<&str> {
+                                match e {
+                                    Expr::Var { name, .. } => Some(name.as_str()),
+                                    Expr::Deref { expr, .. } => bool_scrutinee_var(expr),
+                                    Expr::PatScrutinee(inner) => bool_scrutinee_var(inner),
+                                    _ => None,
+                                }
+                            }
+                            let name = match bool_scrutinee_var(scrutinee.as_ref()) {
+                                Some(n) => n,
+                                None => return false,
                             };
                             match kind {
                                 Some(Kind::Bool(s)) if s == name => {}
@@ -1383,6 +1397,10 @@ impl Sema {
     ) {
         match e {
             Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
+            // A scalar-pattern scrutinee is rewritten by `check_expr`, which runs
+            // after this pre-pass, so recurse into it here to see any `&mut` it
+            // borrows (`match &mut x { 5 => .. }`).
+            Expr::PatScrutinee(x) => Self::collect_mut_borrows(x, a, mb),
             Expr::Bin(_, x, y) => {
                 Self::collect_mut_borrows(x, a, mb);
                 Self::collect_mut_borrows(y, a, mb);
@@ -2505,6 +2523,28 @@ impl Sema {
                         Ok(*inner)
                     }
                     other => Err(format!("cannot dereference a value of type {other:?}")),
+                }
+            }
+            // The scrutinee of a scalar pattern. Match ergonomics deref a
+            // reference scrutinee (`match &x { 5 => .. }` reads the `i64` under
+            // the `&i64`), while a scalar scrutinee is left alone. The parser
+            // marks the node; here the type is known, so rewrite it in place.
+            // `std::mem::replace` moves the inner expression out rather than
+            // re-checking it, so a side-effecting scrutinee is type-checked (and
+            // its slots allocated) exactly once.
+            Expr::PatScrutinee(inner) => {
+                let t = self.check_expr(inner, scope)?;
+                let r = std::mem::replace(inner.as_mut(), Expr::Int(0));
+                match t {
+                    Type::Ref(referent, _) => {
+                        let referent = *referent;
+                        *e = Expr::Deref { expr: Box::new(r), ty: referent.clone() };
+                        Ok(referent)
+                    }
+                    other => {
+                        *e = r;
+                        Ok(other)
+                    }
                 }
             }
             Expr::Cast(inner, to) => {

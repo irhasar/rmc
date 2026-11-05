@@ -131,6 +131,9 @@ impl Licm {
     /// process them. A loop is a statement, so it only appears inside a block.
     fn expr_loops(&mut self, e: &mut Expr) {
         match e {
+            Expr::PatScrutinee(_) => {
+                unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+            }
             Expr::Block(b) | Expr::Loop(b, _, _, _) => self.block(b),
             Expr::MatchBoundary(b, _) => self.block(b),
             Expr::If(c, t, els) => {
@@ -284,6 +287,9 @@ impl Effects {
 
     fn expr(&mut self, e: &Expr) {
         match e {
+            Expr::PatScrutinee(_) => {
+                unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+            }
             Expr::Call { args, .. } => {
                 // A call may write anything, so no local is known invariant.
                 self.all = true;
@@ -465,6 +471,9 @@ impl Hoister {
             return;
         }
         match e {
+            Expr::PatScrutinee(_) => {
+                unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+            }
             Expr::Bin(_, a, b) => {
                 self.expr(a);
                 self.expr(b);

@@ -886,6 +886,9 @@ impl Codegen {
         match e {
             Expr::ArrayList(_) => unreachable!("sema rewrites ArrayList into a block"),
             Expr::MethodCall { .. } => unreachable!("sema rewrites MethodCall into a Call"),
+            Expr::PatScrutinee(_) => {
+                unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+            }
             Expr::EnumVariant { .. } => {} // a tag has no subexpressions
             Expr::EnumCtor { args, slot, size, .. } => {
                 for a in args {
@@ -1832,6 +1835,9 @@ impl Codegen {
         match e {
             Expr::ArrayList(_) => unreachable!("sema rewrites ArrayList into a block"),
             Expr::MethodCall { .. } => unreachable!("sema rewrites MethodCall into a Call"),
+            Expr::PatScrutinee(_) => {
+                unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+            }
             Expr::EnumVariant { tag, .. } => {
                 self.line(&format!("mov ${tag}, %rax"));
                 Type::I64
@@ -2434,6 +2440,9 @@ impl Codegen {
             Expr::MatchBoundary(b, _) => self.block_uses_reg(b, r),
             Expr::ArrayList(_) | Expr::MethodCall { .. } => {
                 unreachable!("sema rewrites ArrayList and MethodCall")
+            }
+            Expr::PatScrutinee(_) => {
+                unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
             }
         }
     }
