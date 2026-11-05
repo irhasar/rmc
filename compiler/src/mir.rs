@@ -2192,6 +2192,115 @@ impl Function {
 /// it is the hot edge; the exit is taken once. This matters for an early-exit
 /// test (`if c { break; }`), where the explicit target is the cold exit, not
 /// the body.
+/// Move a loop's test to the bottom of the loop.
+///
+/// A `while` loop is emitted as `header(test) -> body -> header`. Every
+/// iteration therefore ends with an unconditional jump back to the header,
+/// which the layout then cannot avoid. Copying the header's test to a block
+/// after the body lets the latch fall through into the test, so an iteration
+/// ends with a single conditional branch. The original header keeps its test and
+/// runs once before the loop, which preserves `while` semantics: a loop whose
+/// condition is false on entry still exits without running the body.
+pub fn rotate_loops(prog: &mut Program) {
+    for f in &mut prog.funcs {
+        f.rotate_loops();
+    }
+}
+
+impl Function {
+    fn rotate_loops(&mut self) {
+        for _ in 0..16 {
+            let n = self.blocks.len();
+            let succs: Vec<Vec<u32>> = self.blocks.iter().map(|b| successors(&b.term)).collect();
+            let mut preds: Vec<Vec<u32>> = vec![Vec::new(); n];
+            for (b, ss) in succs.iter().enumerate() {
+                for &s in ss {
+                    if !preds[s as usize].contains(&(b as u32)) {
+                        preds[s as usize].push(b as u32);
+                    }
+                }
+            }
+            let mut reach: Vec<Vec<bool>> = vec![vec![false; n]; n];
+            for b in 0..n {
+                reach[b][b] = true;
+                let mut stack = vec![b];
+                while let Some(x) = stack.pop() {
+                    for &s in &succs[x] {
+                        if !reach[b][s as usize] {
+                            reach[b][s as usize] = true;
+                            stack.push(s as usize);
+                        }
+                    }
+                }
+            }
+            // Dominators, by the usual iterative intersection over the
+            // predecessors. A back edge is an edge whose head dominates its
+            // tail, which is what distinguishes a loop's own latch from the
+            // block that merely feeds the loop.
+            let mut dom: Vec<HashSet<usize>> = vec![HashSet::new(); n];
+            for b in 0..n {
+                if b == 0 {
+                    dom[b].insert(0);
+                } else {
+                    dom[b].extend(0..n);
+                }
+            }
+            loop {
+                let mut changed = false;
+                for b in 1..n {
+                    let mut new: HashSet<usize> = HashSet::new();
+                    if let Some((first, rest)) = preds[b].split_first() {
+                        new = dom[*first as usize].clone();
+                        for p in rest {
+                            new.retain(|x| dom[*p as usize].contains(x));
+                        }
+                    }
+                    new.insert(b);
+                    if new != dom[b] {
+                        dom[b] = new;
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+
+            let mut rotated = false;
+            for h in 0..n {
+                if !matches!(self.blocks[h].term, Terminator::SwitchInt { .. }) {
+                    continue;
+                }
+                let backs: Vec<u32> = preds[h]
+                    .iter()
+                    .copied()
+                    .filter(|&u| u != h as u32 && dom[u as usize].contains(&h))
+                    .collect();
+                if backs.len() != 1 {
+                    continue;
+                }
+                let latch = backs[0];
+                // The loop is the blocks the header dominates that can still
+                // reach the latch. An edge into the header from outside that set
+                // is the loop's entry, so the test has not moved yet.
+                let in_loop = |b: usize| dom[b].contains(&h) && reach[b][latch as usize];
+                if !preds[h].iter().any(|&p| !in_loop(p as usize)) {
+                    continue;
+                }
+                let test = self.blocks[h].clone();
+                self.blocks.push(test);
+                let t = (self.blocks.len() - 1) as u32;
+                redirect_target(&mut self.blocks[latch as usize].term, h as u32, t);
+                rotated = true;
+                break;
+            }
+            if !rotated {
+                break;
+            }
+        }
+    }
+}
+
 pub fn layout_blocks(prog: &mut Program) {
     for f in &mut prog.funcs {
         f.layout_blocks();
@@ -2252,7 +2361,6 @@ impl Function {
                     .iter()
                     .copied()
                     .find(|s| hot[*s as usize] && Some(*s) == taken)
-                    .or_else(|| live.iter().copied().find(|s| hot[*s as usize] && Some(*s) == taken))
                     .or_else(|| live.iter().copied().find(|s| hot[*s as usize]))
                     .or(taken)
                     .filter(|p| live.contains(p))
@@ -2298,6 +2406,38 @@ impl Function {
             }
         }
         self.blocks = kept;
+    }
+}
+
+/// Rewrite a terminator so that every edge to `from` goes to `to` instead.
+fn redirect_target(t: &mut Terminator, from: u32, to: u32) {
+    match t {
+        Terminator::Goto(b) => {
+            if *b == from {
+                *b = to;
+            }
+        }
+        Terminator::SwitchInt { targets, otherwise, .. } => {
+            for (_, b) in targets.iter_mut() {
+                if *b == from {
+                    *b = to;
+                }
+            }
+            if *otherwise == from {
+                *otherwise = to;
+            }
+        }
+        Terminator::Call { target: Some(b), .. } => {
+            if *b == from {
+                *b = to;
+            }
+        }
+        Terminator::Assert { target, .. } => {
+            if *target == from {
+                *target = to;
+            }
+        }
+        _ => {}
     }
 }
 
