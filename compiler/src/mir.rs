@@ -1586,6 +1586,10 @@ fn split_top_semi(s: &str) -> Option<(&str, &str)> {
 /// call in a body that was itself inlined), so a couple of rounds are enough to
 /// flatten the small accessor chains the benchmarks use.
 const INLINE_ROUNDS: usize = 3;
+/// LICM runs to a fixpoint, but the chain of loads an inlined accessor leaves
+/// can be deep (one round per level), so the cap is generous; the loop exits as
+/// soon as a round hoists nothing.
+const LICM_ROUNDS: usize = 64;
 /// Never inline a body larger than this many blocks; it would grow the caller
 /// without bound and slow the compile down.
 const INLINE_MAX_BLOCKS: usize = 48;
@@ -1957,11 +1961,64 @@ fn pure_call(name: &str) -> bool {
     !matches!(name, "alloc" | "print_i64" | "print_str" | "putchar" | "free")
 }
 
+/// Collapse `goto`-only blocks. LICM leaves a chain of empty blocks behind when
+/// it lifts a hoisted call out of its block, and each one costs a taken jump on
+/// every iteration of the loop it sits in. Redirecting the edges straight to the
+/// final target removes them; the skipped blocks become unreachable and the back
+/// end drops them.
+pub fn jump_thread(prog: &mut Program) {
+    for f in &mut prog.funcs {
+        f.jump_thread();
+    }
+}
+
+impl Function {
+    fn jump_thread(&mut self) {
+        // A block worth skipping is empty and jumps unconditionally.
+        let is_trampoline = |b: usize| {
+            self.blocks[b].stmts.is_empty()
+                && matches!(self.blocks[b].term, Terminator::Goto(_))
+        };
+        // `target[b]` is the first non-trampoline block reached from `b`.
+        let mut target: Vec<u32> = (0..self.blocks.len() as u32).collect();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for b in 0..self.blocks.len() {
+                if !is_trampoline(b) {
+                    continue;
+                }
+                if let Terminator::Goto(t) = self.blocks[b].term {
+                    let resolved = target[t as usize];
+                    if target[b] != resolved {
+                        target[b] = resolved;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        let resolve = |t: u32| target[t as usize];
+        for b in &mut self.blocks {
+            match &mut b.term {
+                Terminator::Goto(t) => *t = resolve(*t),
+                Terminator::SwitchInt { targets, otherwise, .. } => {
+                    for (_, t) in targets.iter_mut() {
+                        *t = resolve(*t);
+                    }
+                    *otherwise = resolve(*otherwise);
+                }
+                Terminator::Call { target: Some(t), .. } => *t = resolve(*t),
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Run loop-invariant code motion over the whole crate, to a fixpoint: hoisting
 /// a binding can make the loads that read through it invariant on the next
 /// round.
 pub fn licm(prog: &mut Program) {
-    for _ in 0..INLINE_ROUNDS {
+    for _ in 0..LICM_ROUNDS {
         let mut changed = false;
         for f in &mut prog.funcs {
             if f.licm_once() {
