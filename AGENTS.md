@@ -48,6 +48,7 @@ python3 tools/fuzz.py --mode assoc --n 500 --seed 1
 python3 tools/fuzz.py --mode ref --n 500 --seed 1
 python3 tools/fuzz.py --mode update --n 500 --seed 1
 python3 tools/fuzz.py --mode letdestr --n 500 --seed 1
+python3 tools/fuzz.py --mode fordestr --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 ```
 
@@ -59,6 +60,9 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 - `compiler/src/parser.rs` — recursive descent; `is_block_like` allows
   `if`/blocks as statements without a trailing `;`. `parse_cond` sets
   `no_struct_lit` so a `{` after a condition starts the body, not a struct.
+  The flag is scoped to the head itself: `parse_bracketed_expr` clears it while
+  parsing inside `(...)`/`[...]`, so `for p in [P { x: 1 }] { .. }` (and a struct
+  literal in a call argument or index) still parses, matching rustc.
   Precedence, loosest to tightest: `||`, `&&`, comparison, `|`, `^`, `&`,
   `<< >>`, `+ -`, `* / %`. Note shifts bind *looser* than `+`/`-`, matching
   Rust: `parse_shift` consumes `parse_add`, and `parse_bitand` consumes
@@ -550,11 +554,13 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   compile-time length, so the loop bound is a constant and `end_slot` is unused
   (see the note above). `x` is a fresh `let` per iteration, so it is immutable
   and a stale read across iterations is impossible. `continue`/`break` work
-  because the desugared loop is the ordinary `For` node. Two guards matter:
-  the loop variable must be a binding or `_` (a compound pattern is rejected
-  rather than mis-bound; a struct pattern in `for` would need the array element
-  to be a struct, which `for x in arr` never yields, so it is not wired up), and
-  `for x in
+  because the desugared loop is the ordinary `For` node. A **struct pattern**
+  `for S { f, .. } in arr` reuses `let_destructure_stmts` (the `let`
+  destructuring expansion) in place of the single `let`, so the element is read
+  into a hidden temporary and the fields are bound from it; the element type is
+  `S`, so this is the same read-through as `let`. The pattern must be
+  irrefutable: a binding, `_`, or a struct pattern (a refutable one like an enum
+  variant is rejected rather than mis-bound). `for x in
   &arr` is rejected — Rust iterates a reference by reference (`x: &i64`), so
   accepting it would silently mistype `x`. `parse_for` also checks the pattern
   name against the constant table *before* `parse_pattern`, because a bare

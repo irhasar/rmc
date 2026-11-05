@@ -1109,6 +1109,82 @@ def gen_letdestr_program(rng):
     rs += ['    println!("{}", acc);', "}"]
     return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
 
+
+def gen_fordestr_program(rng):
+    """`for S { f, g: h, .. } in arr` destructuring. Each iteration reads the
+    element into a hidden temporary and binds the named fields from it, the same
+    shape as `let` destructuring run inside the loop body. Checks the invariants
+    a `for` pattern adds over `let`: the head is evaluated once, the bindings are
+    fresh per iteration (a `mut` write must not leak into the next), the loop
+    still runs when the pattern binds nothing, and `break`/`continue` still work.
+    No other mode emits a destructuring `for`.
+    """
+    b = rng.randint(1, 9)
+    fields = ["x", "y", "z"]
+    pat, binds = _let_pat(rng, fields, "a")
+    # Iterate a plain array local, or an array built inline (the head is an
+    # expression with a side effect, so it must run exactly once).
+    src = rng.choice(["local", "inline"])
+
+    rms = [
+        "struct P { x: i64, y: i64, z: i64 }",
+        f"fn mk(n: i64) -> P {{ print_i64(n); return P {{ x: n, y: n + 1, z: n + 2 }}; }}",
+        "fn main() -> i64 {",
+        "    let mut acc: i64 = 0;",
+        f"    let arr: [P; 3] = [mk({b}), mk({b + 10}), mk({b + 20})];",
+    ]
+    rs = [
+        "#[derive(Copy, Clone)]",
+        "struct P { x: i64, y: i64, z: i64 }",
+        f"fn mk(n: i64) -> P {{ println!(\"{{}}\", n); P {{ x: n, y: n + 1, z: n + 2 }} }}",
+        "fn main() {",
+        "    let mut acc: i64 = 0;",
+        f"    let arr: [P; 3] = [mk({b}), mk({b + 10}), mk({b + 20})];",
+    ]
+    head, head_rs = ("arr", "arr") if src == "local" else \
+        (f"[mk({b + 30}), mk({b + 40})]", f"[mk({b + 30}), mk({b + 40})]")
+    rms.append(f"    for P {{ {pat} }} in {head} {{")
+    rs.append(f"    for P {{ {pat} }} in {head_rs} {{")
+    for (name, mutable, _f) in binds:
+        if mutable:
+            rms.append(f"        {name} = {name} + {b};")
+            rs.append(f"        {name} += {b};")
+    if binds:
+        terms = " + ".join(f"{n} * {i + 2}" for i, (n, _m, _f) in enumerate(binds))
+        rms.append(f"        acc = acc + {terms};")
+        rs.append(f"        acc += {terms};")
+    else:
+        # `P { .. }` binds nothing; the loop still runs.
+        rms.append("        acc = acc + 1;")
+        rs.append("        acc += 1;")
+    rms.append("    }")
+    rs.append("    }")
+    # A second loop with `continue` and a `break`, so the per-iteration
+    # rebinding is exercised across a non-fallthrough exit.
+    pat2, binds2 = _let_pat(rng, fields, "c")
+    rms.append(f"    for P {{ {pat2} }} in arr {{")
+    rs.append(f"    for P {{ {pat2} }} in arr {{")
+    if binds2:
+        n0 = binds2[0][0]
+        rms.append(f"        if {n0} > {b + 15} {{ break; }}")
+        rs.append(f"        if {n0} > {b + 15} {{ break; }}")
+        for (name, mutable, _f) in binds2:
+            if mutable:
+                rms.append(f"        {name} = {name} + {b};")
+                rs.append(f"        {name} += {b};")
+        terms2 = " + ".join(f"{n} * {i + 3}" for i, (n, _m, _f) in enumerate(binds2))
+        rms.append(f"        acc = acc + {terms2};")
+        rs.append(f"        acc += {terms2};")
+    else:
+        rms.append("        acc = acc + 1;")
+        rs.append("        acc += 1;")
+    rms.append("    }")
+    rs.append("    }")
+    rms += ["    print_i64(acc);", "    return 0;", "}"]
+    rs += ['    println!("{}", acc);', "}"]
+    return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
+
+
 def gen_ref_program(rng):
     """A program built from references (`&T` / `&mut T`), which no other mode
     exercises. A reference is one word holding an address, so `*r = v` writes
@@ -1668,6 +1744,12 @@ def robust_corpus():
         "let_destructure_field_after_rest": b"struct S { a: i64 } fn main() -> i64 { let s: S = S { a: 1 }; let S { .., a } = s; return 0; }",
         "let_destructure_mut_underscore": b"struct S { a: i64 } fn main() -> i64 { let s: S = S { a: 1 }; let S { mut a: _ } = s; return 0; }",
         "let_destructure_leading_mut_renamed": b"struct S { a: i64 } fn main() -> i64 { let s: S = S { a: 1 }; let S { mut a: b } = s; return b; }",
+        # A `for` destructuring shares the same pattern parser, so a malformed
+        # pattern there must also error cleanly rather than panic.
+        "for_destructure_unterminated": b"struct S { a: i64 } fn main() -> i64 { let a: [S; 1] = [S { a: 1 }]; for S { a ",
+        "for_destructure_missing_name": b"struct S { a: i64 } fn main() -> i64 { let a: [S; 1] = [S { a: 1 }]; for S { : a } in a {} return 0; }",
+        "for_destructure_double_dotdot": b"struct S { a: i64 } fn main() -> i64 { let a: [S; 1] = [S { a: 1 }]; for S { .. .. } in a {} return 0; }",
+        "for_destructure_field_after_rest": b"struct S { a: i64 } fn main() -> i64 { let a: [S; 1] = [S { a: 1 }]; for S { .., a } in a {} return 0; }",
     }
     return cases
 
@@ -2027,6 +2109,34 @@ def reject_corpus():
             "struct S { x: i64 }\n"
             "fn main() { let S { x } = 5; let _ = x; }\n",
         ),
+        # A destructuring `for` shares the same checks: an unknown field
+        # (E0026), an unknown struct (E0422), a non-struct element (E0308) and
+        # a `mut` on the pattern (E0596-style) are each rejected by rustc, so
+        # rmc must reject them too.
+        "for_destructure_unknown_field": (
+            "struct S { x: i64 }\n"
+            "fn main() -> i64 { let a: [S; 1] = [S { x: 1 }]; for S { z } in a {} return 0; }\n",
+            "struct S { x: i64 }\n"
+            "fn main() { let a = [S { x: 1 }]; for S { z } in a { let _ = z; } }\n",
+        ),
+        "for_destructure_unknown_struct": (
+            "struct S { x: i64 }\n"
+            "fn main() -> i64 { let a: [S; 1] = [S { x: 1 }]; for Q { x } in a {} return 0; }\n",
+            "struct S { x: i64 }\n"
+            "fn main() { let a = [S { x: 1 }]; for Q { x } in a { let _ = x; } }\n",
+        ),
+        "for_destructure_non_struct": (
+            "struct S { x: i64 }\n"
+            "fn main() -> i64 { let a: [i64; 1] = [5]; for S { x } in a {} return 0; }\n",
+            "struct S { x: i64 }\n"
+            "fn main() { let a = [5i64]; for S { x } in a { let _ = x; } }\n",
+        ),
+        "for_destructure_mut_on_pattern": (
+            "struct S { x: i64 }\n"
+            "fn main() -> i64 { let a: [S; 1] = [S { x: 1 }]; for mut S { x } in a {} return 0; }\n",
+            "struct S { x: i64 }\n"
+            "fn main() { let a = [S { x: 1 }]; for mut S { x } in a { let _ = x; } }\n",
+        ),
     }
 
 
@@ -2064,7 +2174,7 @@ def run_reject():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "robust", "reject"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "robust", "reject"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -2107,7 +2217,8 @@ def main():
            "order": gen_order_program, "shift": gen_shift_program,
            "cast": gen_cast_program, "assoc": gen_assoc_program,
            "ref": gen_ref_program, "update": gen_update_program,
-           "letdestr": gen_letdestr_program}[args.mode]
+           "letdestr": gen_letdestr_program,
+           "fordestr": gen_fordestr_program}[args.mode]
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus
     # suite; a fuzz program is otherwise only checked with every pass on, so a
