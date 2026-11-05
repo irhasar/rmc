@@ -9,6 +9,11 @@ a freestanding runtime that talks to the Linux kernel through raw syscalls.
 `--binutils` keeps the old path through GNU `as` and `ld` for the cases where
 the assembly text is what you want.
 
+It also has a second front end: given a `.rs` file it runs `rustc --emit=mir -O`
+and lowers the MIR it prints to the same x86-64, so LLVM is replaced by rmc's own
+back end (see [Two pipelines](#two-pipelines)). That path builds a real Rust
+program tens of times faster than LLVM and still beats it at run time.
+
 The point of the experiment is to measure the trade-off at the extremes:
 
 | property                         | rmc                                   | rustc (LLVM)                     |
@@ -43,6 +48,49 @@ least. The gap is this wide because the linker keeps only the runtime pieces a
 program reaches: a program that never allocates carries no allocator, and one
 that never indexes an array carries no bounds trap.
 
+## Two pipelines
+
+`rmc` ships two front ends over one x86-64 back end. The extension of the input
+selects which:
+
+| input    | front end                    | back end                              |
+| -------- | ---------------------------- | ------------------------------------- |
+| `*.rms`  | rmc's own lexer/parser/sema  | `codegen.rs` -> `elf.rs` (in-process) |
+| `*.rs`   | `rustc --emit=mir -O`        | `mir.rs` -> `mir_codegen.rs` -> `elf.rs` |
+
+The `.rs` path exists to test the thesis that LLVM is the expensive part of a
+Rust build. `rustc` still does the parsing and type checking, but it stops at
+MIR (`--emit=mir`, ~35 ms); a new back end in `mir.rs` lowers that MIR to the
+same x86-64 the `.rms` path emits, through the same assembler and linker. LLVM
+never runs. The trade-off is the whole point of the experiment:
+
+| dimension            | rmc MIR path vs `rustc -O -C lto=fat` |
+| -------------------- | ------------------------------------: |
+| compile wall time    |                            39–58×    |
+| compile CPU time     |                            38–56×    |
+| compiler peak RAM    |                            ~2.1×     |
+| artifact size        |                            196–576×  |
+| run wall time        |                            1.03–3.20× |
+| run CPU time         |                            1.03–5.85× |
+| run peak RAM         |                            1.4–88×   |
+
+Every ratio is above 1, so the MIR path is faster to build, smaller, and faster
+and lighter to run than the LLVM build on all ten programs. The run-time win is
+narrowest on `mix` (1.03×) and `heap` (1.05×) and widest on `hello` (3.20×) and
+`forloops` (2.11×). The full, dated table is in
+[`bench/RESULTS-MIR.md`](bench/RESULTS-MIR.md); regenerate it with:
+
+```sh
+python3 bench/run_mir.py --markdown bench/RESULTS-MIR.md
+```
+
+The back end is where the compile-time win comes from: `rustc --emit=mir` is
+~35 ms and ~85 MB, and `rmcmir` is under 5 ms and ~4 MB. Against the `.rms`
+pipeline the `.rs` path still pays the rustc front end, so it is ~35× slower to
+compile - the `.rms` path remains the fastest. The point of the `.rs` path is
+that dropping LLVM makes a real Rust build competitive, not that it beats rmc's
+own front end.
+
 ## Layout
 
 ```
@@ -53,15 +101,20 @@ compiler/            the rmc compiler (Rust, std only, no dependencies)
   src/ast.rs         AST + type definitions
   src/sema.rs        type checking, struct layout, slot allocation, builtins
   src/codegen.rs     AST -> x86-64 assembly (System V, AT&T syntax)
+  src/mir.rs         rustc MIR text -> in-memory MIR + MIR-level optimiser
+  src/mir_codegen.rs MIR -> x86-64 assembly, sharing the register/frame planner
   src/elf.rs         in-process assembler + ELF64 linker (no `as`, no `ld`)
   src/dce.rs         dead-function elimination (drop what main cannot reach)
   src/runtime.rs     freestanding runtime written in assembly
   src/main.rs        CLI driver: source -> asm -> ELF executable
+  examples/rmcmir.rs `rmcmir` CLI: a `.mir` file -> ELF (the MIR back end alone)
   tests/compile.rs   unit tests for the front end and code generator
 bench/
   programs/*.rms     benchmark programs in the rmc subset
   rust/*.rs          the same programs written in real Rust
+  mir/*.rs           the same programs for the rustc-MIR front end
   run.py             benchmark harness (compile time, CPU, RAM, size, runtime)
+  run_mir.py         three-pipeline harness: mir vs ast vs llvm
 tools/
   fuzz.py            differential fuzzer and robustness checker
 tests/

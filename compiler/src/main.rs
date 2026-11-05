@@ -105,6 +105,7 @@ fn print_help() {
         "rmc - experimental Rust-subset compiler (no LLVM, no crates)\n\
          \n\
          USAGE:\n    rmc [OPTIONS] <input.rms>\n\
+         \x20   rmc [OPTIONS] <input.rs>    use rustc --emit=mir as the front end\n\
          \n\
          OPTIONS:\n\
          \x20   -o <path>      output binary path\n\

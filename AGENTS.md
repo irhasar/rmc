@@ -25,11 +25,23 @@ cargo build --release --manifest-path compiler/Cargo.toml
 # inspect generated assembly
 ./compiler/target/release/rmc bench/programs/fib.rms --emit-asm
 
+# compile a real Rust file through the rustc-MIR front end + rmc back end
+./compiler/target/release/rmc bench/mir/fib.rs -o /tmp/fib-mir
+/tmp/fib-mir 32
+
+# the back end on its own: MIR text -> ELF (no rustc, no LLVM)
+./compiler/target/release/rmc bench/mir/fib.rs --keep-mir -o /tmp/fib-mir
+./compiler/target/release/examples/rmcmir bench/mir/fib.mir -o /tmp/fib-mir2
+
 # full benchmark suite (writes binaries to /tmp/rmcbench)
 python3 bench/run.py
 
+# three-pipeline suite: mir vs ast vs llvm (writes binaries to /tmp/rmcmirbench)
+python3 bench/run_mir.py
+
 # benchmark suite, also recording the dated result to the repo
 python3 bench/run.py --markdown bench/RESULTS.md
+python3 bench/run_mir.py --markdown bench/RESULTS-MIR.md
 
 # differential test suite: rmc vs rustc on twin programs
 python3 tests/run.py -v
@@ -167,9 +179,62 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 - `compiler/src/main.rs` — CLI: reads source, calls the library, writes the ELF.
   Flags: `--emit-asm`, `--keep-asm`, `--binutils`, `--no-strip`, `--min-size`,
   `--overflow-checks`, `--bounds-checks`, `--no-inline`, `--no-licm`,
-  `--no-tco`.
+  `--no-tco`, `--keep-mir`.
+- `compiler/src/mir.rs` — parses the MIR text `rustc --emit=mir` prints into an
+  in-memory MIR, and holds the MIR-level optimiser passes. See "The rustc-MIR
+  front end" below.
+- `compiler/src/mir_codegen.rs` — lowers that MIR to x86-64, sharing `elf.rs`
+  with the `.rms` path. It has its own peephole/register planner; see "MIR
+  codegen" below.
+- `compiler/examples/rmcmir.rs` — `rmcmir` CLI: a `.mir` text file to ELF, i.e.
+  the MIR back end with no rustc in the loop. The benchmark harness times it
+  separately from the front end.
 - `compiler/tests/compile.rs` — unit tests for the front end and codegen; these
   run without `as`/`ld`.
+
+## The rustc-MIR front end
+
+A `.rs` input (anything that is not `.rms`) takes the second pipeline:
+`main.rs::run_mir_pipeline` runs `rustc --emit=mir -O -C panic=abort
+--crate-type=bin --edition 2021`, `mir.rs::parse` reads the MIR text, the
+MIR-level passes run, and `mir_codegen.rs` emits x86-64 that goes through the
+same `elf.rs` assembler/linker and `runtime.rs` as the `.rms` path. LLVM never
+runs. `rmcmir` (`examples/rmcmir.rs`) is the same back end reading a `.mir` file,
+so the benchmark can time the two stages apart.
+
+- The MIR text format is rustc's *internal* dump, not a stable interface. It
+  changes between rustc releases; `mir.rs::parse` is written against the shape
+  `rustc 1.99.1` prints and will need revisiting on an upgrade. Keep the parse
+  errors specific so a format change fails loudly rather than miscompiling.
+- `rustc -O` leaves the safety checks in the MIR even when they are provably
+  dead: `_6 = Eq(_5, 0)` then `assert(!move _6)` for a div-by-zero, and an
+  `assert(!(_7 & _8))` for the `i64::MIN / -1` overflow. They cost a compare and
+  a branch on every iteration of a `%` loop, which is where the `mix` gap came
+  from. `mir.rs::drop_redundant_asserts` removes them.
+- That pass is a **must**-analysis, and it must stay one. At a join it takes the
+  *intersection* of what each predecessor proves, never the union - a union
+  would claim a local is non-zero when one path could reach the assert with it
+  zero, and the trap would be dropped from a program that needs it. Each field
+  only ever loses entries at a join, which is what makes the fixed point
+  terminate.
+- The div-by-zero check's condition is a `bool` local defined by a statement *in
+  the assert's own block*, so the fact has to be computed from the state after
+  the block's statements, not the block's entry state. Checking the entry state
+  finds nothing.
+- `copy` aliasing is needed to see the guard's fact at the divisor: the loop test
+  proves `_2 != 0`, but the divisor is a later `copy` of `_2`. The pass follows
+  those copies (`AssertFacts::alias`) within a block only.
+- Dropping the assert leaves the `Eq` that fed it dead. `drop_dead_pure_assignments`
+  removes it, but only for the comparison rvalues and only when nothing reads the
+  destination - a wider "drop any unread assignment" pass removed an assignment
+  whose operand the backend still needed and broke `heap`. Do not widen it
+  without a differential run.
+- Local `_0` is the return value; `return` reads it without naming it, so
+  `use_counts` does not see that read. Any "unread local" test must special-case
+  `_0` or it will delete a function's result.
+- A trap block is emitted inline in the fall-through position, so the common path
+  takes a taken branch over it. `mix`'s `%` loop pays that branch once per
+  iteration; it is not free.
 
 ## Things that are easy to get wrong
 
