@@ -1166,6 +1166,30 @@ fn the_string_len_helper_is_dropped_when_unused() {
 }
 
 #[test]
+fn str_is_a_nameable_type_in_signatures_and_fields() {
+    // `str` is a builtin type, not a struct, so writing it as a parameter,
+    // return or field type must resolve to `Type::Str` rather than "unknown
+    // type". A string parameter is passed as its one-word pointer.
+    let out = asm(
+        "fn n(s: str) -> i64 { return s.len(); } \
+         fn id(s: str) -> str { return s; } \
+         fn main() -> i64 { return n(id(\"hi\")); }",
+    );
+    assert!(out.contains("call __rmc_str_len"), "str param lowers: {out}");
+    assert!(!out.contains("unknown type"), "str is a known type");
+}
+
+#[test]
+fn a_str_struct_field_round_trips_through_a_copy() {
+    let out = asm(
+        "struct M { s: str, n: i64 } \
+         fn pick(m: M) -> str { return m.s; } \
+         fn main() -> i64 { let m = M { s: \"abc\", n: 2 }; return pick(m).len() + m.n; }",
+    );
+    assert!(out.contains("call __rmc_str_len"), "field read then len: {out}");
+}
+
+#[test]
 fn len_with_arguments_is_rejected() {
     let bad = "fn main() -> i64 { return \"x\".len(1); }";
     let err = compile_to_asm(bad, &CompileOptions::default()).unwrap_err();

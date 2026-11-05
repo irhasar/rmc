@@ -364,6 +364,7 @@ fn resolve_ty_rec(
     visiting: &mut Vec<String>,
 ) -> Result<Type, String> {
     match t {
+        Type::Named(n) if n == "str" => Ok(Type::Str),
         Type::Named(n) => {
             if raw_e.contains_key(n.as_str()) {
                 layout_enum(n, raw_s, raw_e, so, eo, visiting)?;
@@ -401,6 +402,7 @@ fn resolve_in(
     enums: &HashMap<String, EnumInfo>,
 ) -> Result<Type, String> {
     match t {
+        Type::Named(n) if n == "str" => Ok(Type::Str),
         Type::Named(n) => {
             if let Some(info) = enums.get(n) {
                 return Ok(if info.has_payload {

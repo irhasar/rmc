@@ -10,6 +10,7 @@ time; there are no runtime type errors.
 | ------------ | --------------------------------------------- |
 | `i64`        | signed 64-bit integer                         |
 | `bool`       | `true` or `false`                             |
+| `str`        | a string (one word: a pointer to a `{len, bytes}` record) |
 | `[T; N]`     | fixed-size array of `N` `i64`, `bool` or unit-enum elements |
 | `&T` `&mut T`| a reference to a `T` (one word)               |
 | `Name`       | a struct declared with `struct Name { .. }`   |
@@ -316,6 +317,11 @@ compile-time constant is decided at compile time, not by the trap.
   it reads the record's length word (a runtime helper, since a `str` is a
   pointer), and is an `i64` where rustc's is a `usize`. `a.len()` on an array of
   length `N` is the compile-time constant `N`, with no runtime work.
+- The type of a string literal is named `str` and may be written wherever a type
+  goes: a `let` annotation, a parameter, a return type or a struct field
+  (`fn f(s: str) -> str`, `struct M { s: str, n: i64 }`). A `str` is one word, so
+  a `str` parameter is passed by value as its pointer, and a `str` field is
+  copied as one word — unlike Rust's `&str`, which is a two-word fat pointer.
 
 ## Builtins
 
@@ -324,7 +330,7 @@ Provided by the runtime; no declaration or import is required.
 | builtin         | signature      |
 | --------------- | -------------- |
 | `print_i64(x)`  | `(i64) -> ()`  |
-| `print_str(s)`  | `(&str) -> ()` |
+| `print_str(s)`  | `(str) -> ()`  |
 | `print_bool(b)` | `(bool) -> ()` |
 | `putchar(c)`    | `(i64) -> ()`  |
 | `alloc(n)`      | `(i64) -> i64` |
