@@ -251,8 +251,8 @@ block. The scrutinee is evaluated exactly once, and a type annotation after the
 pattern (`let S { x, y }: S = e;`) is checked against it. `mut` is per binding —
 `let S { mut x, y: mut z } = e;` is accepted, `let mut S { .. } = e;` is
 rejected (`mut` must be attached to each individual binding, as in rustc).
-Nested sub-patterns are not supported, so a struct-typed field is destructured
-by a second `let`; see Struct patterns for the full field grammar.
+A struct-typed field may be destructured by a nested sub-pattern
+(`let S { a: I { x } } = e;`); see Struct patterns for the full field grammar.
 A `let` or parameter without `mut` is
 immutable: assigning it (rustc's `E0384`), assigning a field or element of it
 (`E0594`), or taking `&mut` of it (`E0596`) is rejected. Add `mut` (or `mut x:
@@ -417,12 +417,15 @@ compile-time constant is decided at compile time, not by the trap.
   flag, as in rustc. A struct pattern is *irrefutable*: it has no runtime
   test and always matches, so it acts as a catch-all arm (like `_`) and needs no
   other arm to make a `match` exhaustive. A field is an ordinary place read, so
-  it may auto-deref a `&S` scrutinee. Each field binds a whole value; a
-  sub-pattern (`i: I { a }`) is not supported — an enum payload pattern likewise
-  only binds fields. A wrong field name is an error, even for `i: _`, and a
-  field bound twice is an error. Because a struct pattern is irrefutable, a
-  *binding* struct pattern in an or-pattern is rejected, as is any binding
-  alternative.
+  it may auto-deref a `&S` scrutinee. A struct-typed field may itself be
+  destructured by a nested struct sub-pattern, `i: I { a }` (to any depth), which
+  expands to a chain of field reads; the sub-pattern binds its own fields and may
+  use shorthand, renames, `_` and `..` like the top level. `mut` attaches to a
+  binding, so `i: mut I { a }` is rejected, as in rustc. An enum payload pattern,
+  by contrast, still only binds whole fields. A wrong field name is an error,
+  even for `i: _`, and a field bound twice is an error. Because a struct pattern
+  is irrefutable, a *binding* struct pattern in an or-pattern is rejected, as is
+  any binding alternative (a nested binding counts).
 - `let` destructuring: `let S { f, g: h, i: _, .. } = e;` uses the same struct
   pattern grammar and binds the named fields as fresh locals in the enclosing
   block, so they stay visible for the rest of it. The pattern is irrefutable by
@@ -431,8 +434,9 @@ compile-time constant is decided at compile time, not by the trap.
   scrutinee is evaluated exactly once. `mut` goes on each binding, so
   `let mut S { .. } = e;` is rejected (`mut` must be attached to each individual
   binding), while `let S { mut x, y: mut z } = e;` is accepted. As in `match`, a
-  field read may auto-deref a `&S` scrutinee. Nested sub-patterns are not
-  supported, so a struct-typed field is destructured by a second `let`.
+  field read may auto-deref a `&S` scrutinee, and a struct-typed field may be
+  destructured by a nested sub-pattern (`let S { a: I { x } } = e;`), which
+  expands to a chain of field reads.
 - `for` destructuring: `for S { f, g: h, i: _, .. } in arr { .. }` iterates the
   array as above but destructures each element with the same struct-pattern
   grammar, binding the named fields fresh each iteration. The array head is

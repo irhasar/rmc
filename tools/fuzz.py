@@ -1191,6 +1191,139 @@ def gen_fordestr_program(rng):
     return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
 
 
+# A chain of struct types for the nested-pattern fuzzer: each entry is
+# `(struct_field_name, struct_field_type, [i64 field names])`. The chain ends at
+# a type with no struct field, so a pattern nests at most `len(CHAIN)` deep.
+_NEST_CHAIN = {
+    "S": ("a", "A", ["b", "c"]),
+    "A": ("m", "B", ["n", "o"]),
+    "B": ("h", "C", ["j"]),
+    "C": (None, None, ["u", "v"]),
+}
+
+
+def _nested_pat(rng, ty, prefix, depth):
+    """A struct pattern `Ty { ... }` for a type in `_NEST_CHAIN`, whose fields
+    are bound (shorthand, renamed, `mut` or ignored) or, for the struct-typed
+    field, recursed into as another nested pattern while `depth` remains. The
+    struct field is never bound as a whole (that name would have struct type,
+    useless in the arithmetic the caller writes); it is either recursed into or
+    dropped with `..`. Returns the pattern text and the `(name, mutable, path)`
+    bindings, `path` the chain of field reads the binding expands to.
+    """
+    sfield, stype, ifields = _NEST_CHAIN[ty]
+    tokens = []
+    binds = []
+    dropped = False
+    if sfield is not None:
+        if depth <= 0 or rng.random() < 0.25:
+            dropped = True  # the struct field is not mentioned; needs `..`
+        else:
+            sub, sb = _nested_pat(rng, stype, prefix, depth - 1)
+            tokens.append(f"{sfield}: {sub}")
+            binds.extend((n, m, f"{sfield}.{p}") for (n, m, p) in sb)
+    mentioned = 0
+    for f in ifields:
+        r = rng.random()
+        if r < 0.15:
+            dropped = True
+            continue
+        mentioned += 1
+        if r < 0.35:
+            tokens.append(f"{f}: _")
+        elif r < 0.6:
+            tokens.append(f)
+            binds.append((f, False, f))
+        elif r < 0.8:
+            nm = f"{prefix}{f}"
+            tokens.append(f"{f}: {nm}")
+            binds.append((nm, False, f))
+        else:
+            nm = f"{prefix}{f}"
+            tokens.append(f"{f}: mut {nm}")
+            binds.append((nm, True, f))
+    if dropped or rng.random() < 0.4:
+        tokens.append("..")
+    return f"{ty} {{ " + ", ".join(tokens) + " }", binds
+
+
+def gen_nestpat_program(rng):
+    """Nested struct sub-patterns, `S { a: A { m: B { .. }, n }, b }`, in `let`,
+    `match`, `if let` and `for`. The expansion is a chain of field reads, so the
+    check is that every nested name is bound to the right word: a wrong field
+    order, a missing intermediate read or a leaked binding shows up as a wrong
+    final value. The pattern nests through a chain of distinct struct types
+    (`_NEST_CHAIN`), so the recursion is genuinely deeper than one level. No
+    other mode emits a sub-pattern.
+    """
+    b = rng.randint(1, 9)
+    depth = rng.randint(1, 4)
+    spat, binds = _nested_pat(rng, "S", "p", depth)
+
+    def terms():
+        return " + ".join(f"{n} * {i + 2}" for i, (n, _m, _p) in enumerate(binds))
+
+    # The whole chain, built from `mk`, so no value is a constant.
+    decls = [
+        "struct C { u: i64, v: i64 }",
+        "struct B { h: C, j: i64 }",
+        "struct A { m: B, n: i64, o: i64 }",
+        "struct S { a: A, b: i64, c: i64 }",
+    ]
+    mk = ("fn mk(n: i64) -> S { print_i64(n); return S { a: A { m: B { h: C { u: n, v: n + 1 }, "
+          "j: n + 2 }, n: n + 3, o: n + 4 }, b: n + 5, c: n + 6 }; }")
+    mk_rs = ("fn mk(n: i64) -> S { println!(\"{}\", n); S { a: A { m: B { h: C { u: n, v: n + 1 }, "
+             "j: n + 2 }, n: n + 3, o: n + 4 }, b: n + 5, c: n + 6 } }")
+    rms = decls + [mk, "fn main() -> i64 {", "    let mut acc: i64 = 0;", f"    let s: S = mk({b});"]
+    rs = []
+    for d in decls:
+        rs.append("#[derive(Copy, Clone)]")
+        rs.append(d)
+    rs += [mk_rs, "fn main() {", "    let mut acc: i64 = 0;", f"    let s: S = mk({b});"]
+
+    def emit(indent):
+        for (name, mutable, _p) in binds:
+            if mutable:
+                rms.append(f"{indent}{name} = {name} + {b};")
+                rs.append(f"{indent}{name} += {b};")
+        if binds:
+            rms.append(f"{indent}acc = acc + {terms()};")
+            rs.append(f"{indent}acc += {terms()};")
+        else:
+            rms.append(f"{indent}acc = acc + 1;")
+            rs.append(f"{indent}acc += 1;")
+
+    # `let` destructuring.
+    rms.append(f"    let {spat} = s;")
+    rs.append(f"    let {spat} = s;")
+    emit("    ")
+    # `match` through a reference (auto-deref).
+    rms.append("    let r: &S = &s;")
+    rs.append("    let r = &s;")
+    rms.append(f"    match r {{ {spat} => {{")
+    rs.append(f"    match r {{ {spat} => {{")
+    emit("        ")
+    rms.append("    } }")
+    rs.append("    } }")
+    # `for` over an array of `S`, with the nested pattern in the head.
+    rms.append(f"    let arr: [S; 2] = [s, mk({b + 10})];")
+    rs.append(f"    let arr: [S; 2] = [s, mk({b + 10})];")
+    rms.append(f"    for {spat} in arr {{")
+    rs.append(f"    for {spat} in arr {{")
+    emit("        ")
+    rms.append("    }")
+    rs.append("    }")
+    # `if let` with a nested pattern.
+    rms.append(f"    if let {spat} = s {{")
+    rs.append(f"    if let {spat} = s {{")
+    emit("        ")
+    rms.append("    }")
+    rs.append("    }")
+    rms += ["    print_i64(acc);", "    return 0;", "}"]
+    rs += ['    println!("{}", acc);', "}"]
+    return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
+
+
 def gen_ref_program(rng):
     """A program built from references (`&T` / `&mut T`), which no other mode
     exercises. A reference is one word holding an address, so `*r = v` writes
@@ -1762,6 +1895,12 @@ def robust_corpus():
         "for_destructure_missing_name": b"struct S { a: i64 } fn main() -> i64 { let a: [S; 1] = [S { a: 1 }]; for S { : a } in a {} return 0; }",
         "for_destructure_double_dotdot": b"struct S { a: i64 } fn main() -> i64 { let a: [S; 1] = [S { a: 1 }]; for S { .. .. } in a {} return 0; }",
         "for_destructure_field_after_rest": b"struct S { a: i64 } fn main() -> i64 { let a: [S; 1] = [S { a: 1 }]; for S { .., a } in a {} return 0; }",
+        # Nested struct sub-patterns recurse through the same parser, so a
+        # malformed or deeply nested one must error cleanly rather than panic.
+        "nested_pat_unterminated": b"struct I { x: i64 } struct S { a: I } fn main() -> i64 { let s: S = S { a: I { x: 1 } }; let S { a: I { x ",
+        "nested_pat_missing_brace": b"struct I { x: i64 } struct S { a: I } fn main() -> i64 { let s: S = S { a: I { x: 1 } }; let S { a: I x } = s; return 0; }",
+        "nested_pat_deep": b"struct S { a: S } fn main() -> i64 { let s: S = S { a: s }; "
+            + b"let S { a: " * 3000 + b"S { .. }" + b" }" * 3000 + b" = s; return 0; }",
     }
     return cases
 
@@ -2182,6 +2321,28 @@ def reject_corpus():
             "struct S { x: i64 }\n"
             "fn main() { let a = [S { x: 1 }]; for mut S { x } in a { let _ = x; } }\n",
         ),
+        # A nested struct sub-pattern runs the same field checks one level
+        # deeper: an unknown inner struct (E0422), an unknown inner field
+        # (E0026) and a `mut` on a nested pattern (E0596-style) are all
+        # rejected by rustc, so rmc must reject them too.
+        "nested_pat_unknown_struct": (
+            "struct I { x: i64 } struct S { a: I }\n"
+            "fn main() -> i64 { let s: S = S { a: I { x: 1 } }; let S { a: Q { x } } = s; return x; }\n",
+            "struct I { x: i64 } struct S { a: I }\n"
+            "fn main() { let s = S { a: I { x: 1 } }; let S { a: Q { x } } = s; let _ = x; }\n",
+        ),
+        "nested_pat_unknown_field": (
+            "struct I { x: i64 } struct S { a: I }\n"
+            "fn main() -> i64 { let s: S = S { a: I { x: 1 } }; let S { a: I { z } } = s; return z; }\n",
+            "struct I { x: i64 } struct S { a: I }\n"
+            "fn main() { let s = S { a: I { x: 1 } }; let S { a: I { z } } = s; let _ = z; }\n",
+        ),
+        "nested_pat_mut_on_nested": (
+            "struct I { x: i64 } struct S { a: I }\n"
+            "fn main() -> i64 { let s: S = S { a: I { x: 1 } }; let S { a: mut I { x } } = s; return x; }\n",
+            "struct I { x: i64 } struct S { a: I }\n"
+            "fn main() { let s = S { a: I { x: 1 } }; let S { a: mut I { x } } = s; let _ = x; }\n",
+        ),
     }
 
 
@@ -2219,7 +2380,7 @@ def run_reject():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "robust", "reject"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "robust", "reject"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -2263,7 +2424,8 @@ def main():
            "cast": gen_cast_program, "assoc": gen_assoc_program,
            "ref": gen_ref_program, "update": gen_update_program,
            "letdestr": gen_letdestr_program,
-           "fordestr": gen_fordestr_program}[args.mode]
+           "fordestr": gen_fordestr_program,
+           "nestpat": gen_nestpat_program}[args.mode]
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus
     # suite; a fuzz program is otherwise only checked with every pass on, so a
