@@ -909,7 +909,7 @@ fn normalize_call_name(name: &str) -> Option<String> {
     }
     // Drop a leading `<...>` qualifier, then take the final path segment.
     let mut rest = name;
-    if let Some(stripped) = rest.strip_prefix('<') {
+    if rest.starts_with('<') {
         let close = matching(rest, 0, '<', '>')?;
         rest = &rest[close + 1..];
     }

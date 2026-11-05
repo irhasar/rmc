@@ -29,6 +29,13 @@ pub struct Parser {
     /// Constant `bool` items by name, so a `const F: bool` used as a `match`
     /// pattern becomes the `true`/`false` pattern.
     const_bools: std::collections::HashMap<String, bool>,
+    /// Struct field names by struct name, collected before parsing so a struct
+    /// pattern (`S { f, .. }`) can be checked at parse time. A struct pattern
+    /// has no runtime test, so the parser rewrites it into field reads; that
+    /// rewrite needs the field list, which sema does not reach until later. A
+    /// struct declared later in the file is covered because the whole list is
+    /// scanned first.
+    struct_fields: std::collections::HashMap<String, std::collections::HashSet<String>>,
 }
 
 /// The deepest expression, block or type nesting the parser accepts. Deeply
@@ -61,6 +68,7 @@ impl Parser {
             current_impl: None,
             consts: std::collections::HashMap::new(),
             const_bools: std::collections::HashMap::new(),
+            struct_fields: std::collections::HashMap::new(),
         }
     }
 
@@ -147,9 +155,10 @@ impl Parser {
 
     pub fn parse_program(&mut self) -> PResult<Program> {
         // A `const` may be named before it is declared (an array length
-        // `[i64; N]`, a pattern `N =>`), so collect and evaluate every `const`
-        // item first, then parse the program with the values known.
-        self.prescan_consts()?;
+        // `[i64; N]`, a pattern `N =>`), and a struct pattern `S { f }` names a
+        // struct that may be declared later, so collect both first, then parse
+        // the program with the values and field lists known.
+        self.prescan()?;
         let mut structs = Vec::new();
         let mut enums = Vec::new();
         let mut consts = Vec::new();
@@ -243,13 +252,14 @@ impl Parser {
         Ok(EnumDef { name, variants })
     }
 
-    /// Scan the token stream for top-level `const` items and evaluate them, so
-    /// a use that precedes the declaration (an array length, a pattern) sees
-    /// the value. Only the item's own tokens are consumed: a `{ .. }` or
-    /// `( .. )` in its initializer is skipped by bracket matching, and every
-    /// other item's body is skipped the same way, so no nested `const` inside a
-    /// function body is collected here.
-    fn prescan_consts(&mut self) -> PResult<()> {
+    /// Scan the token stream once, before the real parse, for two things that a
+    /// use may need before their declaration: the value of every top-level
+    /// `const` (an array length `[i64; N]`, a pattern `N =>`), and the field
+    /// names of every struct (a struct pattern `S { f }`). Only an item's own
+    /// tokens are consumed: a `{ .. }` or `( .. )` in an initializer is skipped
+    /// by bracket matching, and every other item's body is skipped the same way,
+    /// so no nested `const` inside a function body is collected here.
+    fn prescan(&mut self) -> PResult<()> {
         let saved = self.i;
         let mut items: Vec<ConstDef> = Vec::new();
         self.i = 0;
@@ -257,7 +267,54 @@ impl Parser {
             match self.peek() {
                 None => break,
                 Some(Tok::Const) => items.push(self.parse_const()?),
-                Some(Tok::Struct) | Some(Tok::Enum) => {
+                Some(Tok::Struct) => {
+                    // Record the field names, then skip the body. Only a braced
+                    // struct has named fields to collect; a later `struct S { .. }`
+                    // is what a pattern `S { f }` needs.
+                    self.i += 1;
+                    let name = if let Some(Tok::Ident(n)) = self.peek() {
+                        let n = n.clone();
+                        self.i += 1;
+                        Some(n)
+                    } else {
+                        None
+                    };
+                    if self.peek() == Some(&Tok::LBrace) {
+                        self.i += 1;
+                        let mut fields = std::collections::HashSet::new();
+                        while self.peek() != Some(&Tok::RBrace) && self.peek().is_some() {
+                            if let Some(Tok::Ident(f)) = self.peek() {
+                                fields.insert(f.clone());
+                                self.i += 1;
+                            } else {
+                                self.i += 1;
+                                continue;
+                            }
+                            // Skip the `: Type`, which may contain braces in an
+                            // array type; stop at the next `,` or `}`.
+                            while let Some(t) = self.peek() {
+                                if *t == Tok::Comma || *t == Tok::RBrace {
+                                    break;
+                                }
+                                if *t == Tok::LBracket {
+                                    self.skip_balanced(Tok::LBracket, Tok::RBracket)?;
+                                } else {
+                                    self.i += 1;
+                                }
+                            }
+                            if !self.eat(&Tok::Comma) {
+                                break;
+                            }
+                        }
+                        self.expect(Tok::RBrace)?;
+                        if let Some(n) = name {
+                            self.struct_fields.insert(n, fields);
+                        }
+                    } else {
+                        self.skip_balanced(Tok::LBrace, Tok::RBrace)?;
+                    }
+                }
+                Some(Tok::Enum) => {
                     // Skip `Name` then a balanced `{ .. }` body.
                     self.i += 1;
                     if matches!(self.peek(), Some(Tok::Ident(_))) {
@@ -383,25 +440,22 @@ impl Parser {
         self.expect(Tok::LParen)?;
         let mut params = Vec::new();
         let mut param_mut = Vec::new();
+        let mut param_pats = Vec::new();
         while self.peek() != Some(&Tok::RParen) {
-            let pm = self.eat(&Tok::Mut);
-            let pname = self.expect_ident()?;
-            self.expect(Tok::Colon)?;
-            let ty = self.parse_type()?;
-            params.push((pname, ty));
-            param_mut.push(pm);
+            self.parse_param(&mut params, &mut param_mut, &mut param_pats)?;
             if !self.eat(&Tok::Comma) {
                 break;
             }
         }
         self.expect(Tok::RParen)?;
+        Self::check_dup_param_names(&params, &param_pats)?;
         let ret = if self.eat(&Tok::Arrow) {
             self.parse_type()?
         } else {
             Type::Unit
         };
         let body = self.parse_block()?;
-        Ok(FnDef { name, self_ty: None, takes_self: false, ref_self: false, ref_self_mut: false, params, param_mut, ret, body, param_slots: Vec::new(), ret_slot: -1, nslots: 0 })
+        Ok(FnDef { name, self_ty: None, takes_self: false, ref_self: false, ref_self_mut: false, params, param_mut, param_pats, ret, body, param_slots: Vec::new(), ret_slot: -1, nslots: 0 })
     }
 
     /// `impl Type { fn method(self, ..) -> .. { .. } }`. The methods are pushed
@@ -448,22 +502,24 @@ impl Parser {
         };
         let mut params = Vec::new();
         let mut param_mut = Vec::new();
+        let mut param_pats = Vec::new();
         let (by_ref, by_mut) = if takes_self {
             let by_ref = self.eat(&Tok::Amp);
             let by_mut = by_ref && self.eat(&Tok::Mut);
             let first = self.expect_ident()?;
             debug_assert_eq!(first, "self");
             if self.eat(&Tok::Comma) {
-                self.parse_param_list(&mut params, &mut param_mut)?;
+                self.parse_param_list(&mut params, &mut param_mut, &mut param_pats)?;
             }
             (by_ref, by_mut)
         } else {
             if self.peek() != Some(&Tok::RParen) {
-                self.parse_param_list(&mut params, &mut param_mut)?;
+                self.parse_param_list(&mut params, &mut param_mut, &mut param_pats)?;
             }
             (false, false)
         };
         self.expect(Tok::RParen)?;
+        Self::check_dup_param_names(&params, &param_pats)?;
         let ret = if self.eat(&Tok::Arrow) { self.parse_type()? } else { Type::Unit };
         let body = self.parse_block()?;
         Ok(FnDef {
@@ -474,6 +530,7 @@ impl Parser {
             ref_self_mut: by_mut,
             params,
             param_mut,
+            param_pats,
             ret,
             body,
             param_slots: Vec::new(),
@@ -488,16 +545,118 @@ impl Parser {
         &mut self,
         params: &mut Vec<(String, Type)>,
         param_mut: &mut Vec<bool>,
+        param_pats: &mut Vec<Option<Vec<Stmt>>>,
     ) -> PResult<()> {
         while self.peek() != Some(&Tok::RParen) {
-            let pm = self.eat(&Tok::Mut);
-            let pname = self.expect_ident()?;
-            self.expect(Tok::Colon)?;
-            let pty = self.parse_type()?;
-            params.push((pname, pty));
-            param_mut.push(pm);
+            self.parse_param(params, param_mut, param_pats)?;
             if !self.eat(&Tok::Comma) {
                 break;
+            }
+        }
+        Ok(())
+    }
+
+    /// One parameter, `p: T`, `mut p: T`, or an aggregate pattern, `S { x, y }:
+    /// S` / `[a, b]: [i64; 2]`. A pattern parameter is stored as an ordinary
+    /// parameter (a hidden name of the annotation's type) plus the statements
+    /// that bind the pattern's names from it, spliced at the top of the body.
+    fn parse_param(
+        &mut self,
+        params: &mut Vec<(String, Type)>,
+        param_mut: &mut Vec<bool>,
+        param_pats: &mut Vec<Option<Vec<Stmt>>>,
+    ) -> PResult<()> {
+        let pm = self.eat(&Tok::Mut);
+        // `S {` or `[` at the start of a parameter is a destructuring pattern,
+        // not a name: neither can begin a plain `p: T`. A leading `mut` on a
+        // pattern is rejected, as rustc rejects `mut S { x }: S` (the `mut`
+        // belongs on each binding).
+        let pat = if matches!(self.peek(), Some(Tok::LBracket))
+            || matches!(self.peek(), Some(Tok::Ident(_))
+                if self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::LBrace))
+        {
+            if pm {
+                return Err(format!(
+                    "at byte {}: `mut` must be attached to each individual binding",
+                    self.pos()
+                ));
+            }
+            Some(self.parse_pattern()?)
+        } else {
+            None
+        };
+        if let Some(p) = pat {
+            self.expect(Tok::Colon)?;
+            let ty = self.parse_type()?;
+            let pname = format!("\u{0}p{}", self.tmp);
+            self.tmp += 1;
+            let subj = Expr::Var { name: pname.clone(), slot: -1, ty: ty.clone() };
+            let binds = self.param_pat_binds(p, &subj)?;
+            params.push((pname, ty));
+            param_mut.push(false);
+            param_pats.push(Some(binds));
+        } else {
+            let pname = self.expect_ident()?;
+            self.expect(Tok::Colon)?;
+            let ty = self.parse_type()?;
+            params.push((pname, ty));
+            param_mut.push(pm);
+            param_pats.push(None);
+        }
+        Ok(())
+    }
+
+    /// The statements that bind a parameter pattern's names from the parameter
+    /// variable `subj`. A struct or array pattern is irrefutable, so this reuses
+    /// the `let` destructuring expansion; a refutable pattern (a literal, a
+    /// variant, an or-pattern) is rejected, as rustc rejects it for a parameter.
+    fn param_pat_binds(&mut self, p: Pat, subj: &Expr) -> PResult<Vec<Stmt>> {
+        match p {
+            Pat::Struct(_, fields) => Ok(Self::struct_pat_binds(&fields, subj)),
+            Pat::Array { elems, rest, front } => {
+                Ok(Self::array_pat_binds(&elems, rest, front, subj))
+            }
+            Pat::Bind(name) => Ok(vec![Stmt::Let {
+                name,
+                ty: None,
+                mutable: false,
+                init: Some(subj.clone()),
+                slot: -1,
+            }]),
+            _ => Err(format!(
+                "at byte {}: a parameter pattern must be irrefutable (a struct or array pattern)",
+                self.pos()
+            )),
+        }
+    }
+
+    /// Reject a parameter list where a name is bound twice (rustc E0415),
+    /// counting both plain parameters and the names a pattern parameter binds.
+    /// A pattern parameter's own hidden variable is skipped: it is not written
+    /// in source and cannot collide.
+    fn check_dup_param_names(
+        params: &[(String, Type)],
+        pats: &[Option<Vec<Stmt>>],
+    ) -> PResult<()> {
+        let mut seen: Vec<&str> = Vec::new();
+        for (i, (name, _)) in params.iter().enumerate() {
+            let names: Vec<&str> = match &pats[i] {
+                Some(binds) => binds
+                    .iter()
+                    .filter_map(|s| match s {
+                        Stmt::Let { name, .. } => Some(name.as_str()),
+                        _ => None,
+                    })
+                    .collect(),
+                None => vec![name.as_str()],
+            };
+            for n in names {
+                if seen.contains(&n) {
+                    return Err(format!(
+                        "identifier `{n}` is bound more than once in this parameter list"
+                    ));
+                }
+                seen.push(n);
             }
         }
         Ok(())
@@ -603,7 +762,7 @@ impl Parser {
                 if self.peek2() == Some(&Tok::Colon)
                     && self.toks.get(self.i + 2).map(|t| &t.tok) != Some(&Tok::Loop)
                 {
-                    stmts.push(self.parse_stmt()?);
+                    self.parse_stmt_into(&mut stmts)?;
                     continue;
                 }
             }
@@ -648,7 +807,7 @@ impl Parser {
                     self.pos()
                 ));
             }
-            stmts.push(self.parse_stmt()?);
+            self.parse_stmt_into(&mut stmts)?;
         }
         self.expect(Tok::RBrace)?;
         Ok(Block { stmts, tail })
@@ -763,29 +922,25 @@ impl Parser {
             });
         }
         let body = self.parse_block()?;
-        Ok(self.desugar_for_array(pat, head, body, label))
+        self.desugar_for_array(pat, head, body, label)
     }
 
     /// `for PAT in ARRAY { body }` -> an index loop over the array (see
-    /// `parse_for`). `PAT` must be a binding or `_`; a compound pattern is
-    /// rejected rather than mis-bound, since rmc has no destructuring `let`.
-    /// A label on the `for` is carried to the desugared loop, so `break 'a`
-    /// still targets it.
-    fn desugar_for_array(&mut self, pat: Pat, arr: Expr, body: Block, label: Option<String>) -> Stmt {
+    /// `parse_for`). `PAT` may be a binding, `_`, or a struct pattern; any other
+    /// pattern is refutable (rustc requires an irrefutable `for` pattern) and is
+    /// rejected rather than mis-bound. A label on the `for` is carried to the
+    /// desugared loop, so `break 'a` still targets it.
+    fn desugar_for_array(
+        &mut self,
+        pat: Pat,
+        arr: Expr,
+        body: Block,
+        label: Option<String>,
+    ) -> PResult<Stmt> {
         let n = self.tmp;
         self.tmp += 1;
         let arr_name = format!("\u{0}fa{n}");
         let idx_name = format!("\u{0}fi{n}");
-        let bind_name = match pat {
-            Pat::Bind(name) => name,
-            Pat::Wild => format!("\u{0}fd{n}"),
-            _ => {
-                return Stmt::Expr(Expr::Block(Block {
-                    stmts: vec![Stmt::Expr(Expr::Int(0))],
-                    tail: None,
-                }))
-            }
-        };
         let arr_var =
             Expr::Var { name: arr_name.clone(), slot: -1, ty: Type::I64 };
         let idx_var =
@@ -797,14 +952,35 @@ impl Parser {
             args: Vec::new(),
         };
         let elem = Expr::Index(Box::new(arr_var), Box::new(idx_var));
-        // `let PAT = arr[i];` runs before the user body each iteration.
-        let mut stmts = vec![Stmt::Let {
-            name: bind_name,
-            ty: None,
-            init: Some(elem),
-            slot: -1,
-            mutable: false,
-        }];
+        // The per-iteration bindings, run before the user body: `let PAT =
+        // arr[i];` for a binding or `_`, or a hidden temporary plus the field
+        // reads for a struct pattern.
+        let mut stmts = match pat {
+            Pat::Bind(name) => vec![Stmt::Let {
+                name,
+                ty: None,
+                init: Some(elem),
+                slot: -1,
+                mutable: false,
+            }],
+            Pat::Wild => vec![Stmt::Let {
+                name: format!("\u{0}fd{n}"),
+                ty: None,
+                init: Some(elem),
+                slot: -1,
+                mutable: false,
+            }],
+            Pat::Struct(_, fields) => self.let_destructure_stmts(fields, None, elem),
+            Pat::Array { elems, rest, front } => {
+                self.let_destructure_array_stmts(elems, rest, front, None, elem)
+            }
+            _ => {
+                return Err(format!(
+                    "at byte {}: `for` over an array needs a binding, `_`, a struct or an array pattern",
+                    self.pos()
+                ))
+            }
+        };
         stmts.extend(body.stmts);
         let loop_body = Block { stmts, tail: body.tail };
         let for_stmt = Stmt::For {
@@ -825,7 +1001,7 @@ impl Parser {
             slot: -1,
             mutable: false,
         };
-        Stmt::Expr(Expr::Block(Block { stmts: vec![arr_let, for_stmt], tail: None }))
+        Ok(Stmt::Expr(Expr::Block(Block { stmts: vec![arr_let, for_stmt], tail: None })))
     }
 
     /// Consume the `;` that ends a statement, but allow it to be omitted when
@@ -860,24 +1036,35 @@ impl Parser {
                 | Some(Tok::Amp)
                 | Some(Tok::Star)
                 // A bare `{ ... }` is a block expression, valid as a statement
-                // without a `;`. Without this it fell through to `parse_stmt`,
-                // which has no arm for `{`, so a nested block failed to parse.
+                // without a `;`. Without this it fell through to the statement
+                // parser, which has no arm for `{`, so a nested block failed to
+                // parse.
                 | Some(Tok::LBrace)
         )
     }
 
-    fn parse_stmt(&mut self) -> PResult<Stmt> {
+    /// Parse one statement and append it to `out`. A statement is usually one
+    /// `Stmt`, but `let` destructuring expands to several (a hidden scrutinee
+    /// plus one binding per field), so the caller passes the enclosing block's
+    /// statement list: the expansion is spliced into it rather than wrapped in
+    /// a nested block, which would hide the bindings from the rest of the block.
+    fn parse_stmt_into(&mut self, out: &mut Vec<Stmt>) -> PResult<()> {
         // A loop label may prefix `while` or `for`; a labelled `loop` is an
         // expression and is handled by `parse_primary` (routed here or there by
         // `parse_block_inner` depending on whether it is a tail expression).
         if let Some(Tok::Label(n)) = self.peek().cloned() {
             self.i += 1;
             self.expect(Tok::Colon)?;
-            return self.parse_labeled_loop_stmt(n);
+            let s = self.parse_labeled_loop_stmt(n)?;
+            out.push(s);
+            return Ok(());
         }
         match self.peek() {
             Some(Tok::Let) => {
                 self.i += 1;
+                // `mut` before the name marks that binding mutable. A struct
+                // pattern attaches `mut` to each field instead, so `let mut
+                // S { .. }` is rejected, as in rustc.
                 let mutable = self.eat(&Tok::Mut);
                 // `let _ = e;` (and `let _: T = e;`, and bare `let _;`) binds
                 // nothing. Desugar to a block holding a hidden binding so the
@@ -920,7 +1107,43 @@ impl Parser {
                         }
                         None => Vec::new(),
                     };
-                    return Ok(Stmt::Expr(Expr::Block(Block { stmts, tail: None })));
+                    out.push(Stmt::Expr(Expr::Block(Block { stmts, tail: None })));
+                    return Ok(());
+                }
+                // `let S { f, g: h } [: T] = e;` destructures a struct, and
+                // `let [a, b] [: T] = e;` destructures an array. The pattern is
+                // read by the same parser as a `match` pattern, but here it is
+                // irrefutable by construction, so the annotation goes on the
+                // scrutinee temporary below and the fields/elements are bound
+                // from it. `..` and `f: _` are the only way to drop fields.
+                let struct_pat = matches!(self.peek(), Some(Tok::Ident(_)))
+                    && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::LBrace);
+                if struct_pat || self.peek() == Some(&Tok::LBracket) {
+                    if mutable {
+                        return Err(format!(
+                            "at byte {}: `mut` must be attached to each individual binding, as `S {{ mut f }}`",
+                            self.pos()
+                        ));
+                    }
+                    let pat = self.parse_pattern_primary()?;
+                    let ty = if self.eat(&Tok::Colon) {
+                        Some(self.parse_type()?)
+                    } else {
+                        None
+                    };
+                    self.expect(Tok::Eq)?;
+                    let init = self.parse_expr()?;
+                    self.expect(Tok::Semi)?;
+                    match pat {
+                        Pat::Struct(_, fields) => {
+                            out.extend(self.let_destructure_stmts(fields, ty, init))
+                        }
+                        Pat::Array { elems, rest, front } => {
+                            out.extend(self.let_destructure_array_stmts(elems, rest, front, ty, init))
+                        }
+                        _ => unreachable!("`{{` or `[` starts a destructuring pattern"),
+                    }
+                    return Ok(());
                 }
                 let name = self.expect_ident()?;
                 let ty = if self.eat(&Tok::Colon) {
@@ -934,7 +1157,8 @@ impl Parser {
                     None
                 };
                 self.expect(Tok::Semi)?;
-                Ok(Stmt::Let { name, ty, init, slot: -1, mutable })
+                out.push(Stmt::Let { name, ty, init, slot: -1, mutable });
+                Ok(())
             }
             Some(Tok::While) => {
                 self.i += 1;
@@ -946,15 +1170,20 @@ impl Parser {
                     self.expect(Tok::Eq)?;
                     let scrutinee = self.parse_cond()?;
                     let body = self.parse_block()?;
-                    return Ok(self.desugar_while_let(pat, scrutinee, body));
+                    let s = self.desugar_while_let(pat, scrutinee, body)?;
+                    out.push(s);
+                    return Ok(());
                 }
                 let cond = self.parse_cond()?;
                 let body = self.parse_block()?;
-                Ok(Stmt::While(cond, body, None))
+                out.push(Stmt::While(cond, body, None));
+                Ok(())
             }
             Some(Tok::For) => {
                 self.i += 1;
-                self.parse_for()
+                let s = self.parse_for()?;
+                out.push(s);
+                Ok(())
             }
             Some(Tok::Return) => {
                 self.i += 1;
@@ -962,11 +1191,13 @@ impl Parser {
                 // `;` may be omitted when the `return` is the last thing in the
                 // block (`{ return 2 }`), as in Rust.
                 if self.eat(&Tok::Semi) || self.peek() == Some(&Tok::RBrace) {
-                    return Ok(Stmt::Return(None));
+                    out.push(Stmt::Return(None));
+                    return Ok(());
                 }
                 let e = self.parse_expr()?;
                 self.eat_semi_at_block_end()?;
-                Ok(Stmt::Return(Some(e)))
+                out.push(Stmt::Return(Some(e)));
+                Ok(())
             }
             Some(Tok::Break) => {
                 self.i += 1;
@@ -975,17 +1206,20 @@ impl Parser {
                 // legal in a `loop`, checked by sema.
                 let label = self.eat_label()?;
                 if self.eat(&Tok::Semi) || self.peek() == Some(&Tok::RBrace) {
-                    return Ok(Stmt::Break(None, label));
+                    out.push(Stmt::Break(None, label));
+                    return Ok(());
                 }
                 let e = self.parse_expr()?;
                 self.eat_semi_at_block_end()?;
-                Ok(Stmt::Break(Some(e), label))
+                out.push(Stmt::Break(Some(e), label));
+                Ok(())
             }
             Some(Tok::Continue) => {
                 self.i += 1;
                 let label = self.eat_label()?;
                 self.eat_semi_at_block_end()?;
-                Ok(Stmt::Continue(label))
+                out.push(Stmt::Continue(label));
+                Ok(())
             }
             _ => {
                 // expression statement, possibly an assignment
@@ -993,16 +1227,20 @@ impl Parser {
                 if self.eat(&Tok::Eq) {
                     let value = self.parse_expr()?;
                     self.expect(Tok::Semi)?;
-                    return Ok(Stmt::Assign { target: e, value });
+                    out.push(Stmt::Assign { target: e, value });
+                    return Ok(());
                 }
                 if let Some(op) = self.peek_compound_op() {
                     self.i += 1;
                     let value = self.parse_expr()?;
                     self.expect(Tok::Semi)?;
-                    return Ok(self.desugar_compound(&e, op, value));
+                    let s = self.desugar_compound(&e, op, value);
+                    out.push(s);
+                    return Ok(());
                 }
                 self.expect(Tok::Semi)?;
-                Ok(Stmt::Expr(e))
+                out.push(Stmt::Expr(e));
+                Ok(())
             }
         }
     }
@@ -1185,6 +1423,19 @@ impl Parser {
     fn parse_cond(&mut self) -> PResult<Expr> {
         let saved = self.no_struct_lit;
         self.no_struct_lit = true;
+        let r = self.parse_expr();
+        self.no_struct_lit = saved;
+        r
+    }
+
+    /// Parse an expression inside a bracketing delimiter (`(`, `[`), where a `{`
+    /// is always a struct literal — even inside a `for`/`while`/`if` head, whose
+    /// `no_struct_lit` flag exists only to stop the head from swallowing the
+    /// body's `{`. rustc scopes that restriction to the head itself, not to a
+    /// nested delimiter, so `for p in [P { x: 1 }] { .. }` is legal.
+    fn parse_bracketed_expr(&mut self) -> PResult<Expr> {
+        let saved = self.no_struct_lit;
+        self.no_struct_lit = false;
         let r = self.parse_expr();
         self.no_struct_lit = saved;
         r
@@ -1378,7 +1629,7 @@ impl Parser {
         loop {
             self.bump_depth()?;
             if self.eat(&Tok::LBracket) {
-                let idx = self.parse_expr()?;
+                let idx = self.parse_bracketed_expr()?;
                 self.expect(Tok::RBracket)?;
                 e = Expr::Index(Box::new(e), Box::new(idx));
             } else if self.eat(&Tok::Dot) {
@@ -1386,7 +1637,7 @@ impl Parser {
                 if self.eat(&Tok::LParen) {
                     let mut args = Vec::new();
                     while self.peek() != Some(&Tok::RParen) {
-                        args.push(self.parse_expr()?);
+                        args.push(self.parse_bracketed_expr()?);
                         if !self.eat(&Tok::Comma) {
                             break;
                         }
@@ -1416,8 +1667,9 @@ impl Parser {
         }
         // A binding must bind the same names in every alternative (rustc's
         // E0408); rmc has no name-consistency check, so it rejects a binding in
-        // an or-pattern outright rather than mis-bind it.
-        if let Some(Pat::Bind(n)) = alts.iter().find(|a| matches!(a, Pat::Bind(_))) {
+        // an or-pattern outright rather than mis-bind it. A struct pattern may
+        // appear as an irrefutable alternative only when it binds nothing.
+        if let Some(n) = alts.iter().find_map(Self::first_bound_name) {
             return Err(format!(
                 "at byte {}: variable `{n}` is not bound in all patterns of the or-pattern",
                 self.pos()
@@ -1451,6 +1703,9 @@ impl Parser {
 
     fn parse_pattern_primary(&mut self) -> PResult<Pat> {
         match self.peek().cloned() {
+            // `[a, b, .., c]`: an array pattern. `[` cannot start a binding or a
+            // constant, so it is unambiguous here.
+            Some(Tok::LBracket) => self.parse_array_pat(),
             Some(Tok::Underscore) => {
                 self.i += 1;
                 Ok(Pat::Wild)
@@ -1490,6 +1745,28 @@ impl Parser {
                         bindings = Some(names);
                     }
                     Ok(Pat::Variant(n, variant, bindings))
+                } else if self.peek() == Some(&Tok::LBrace) {
+                    // `S { f, g: h, i: _, .. }`: a struct pattern. Fields may be
+                    // written in any order, and each is either a shorthand
+                    // binding (`f`), an explicit binding (`g: h`) or a wildcard
+                    // (`i: _`); a trailing `..` ignores the fields not named.
+                    // The field list comes from the prescan, so a struct
+                    // declared later in the file still matches, as rustc allows.
+                    self.i += 1;
+                    // A name that is not a struct cannot be destructured; the
+                    // prescan saw every struct, so an unknown one is an error
+                    // here rather than a field read on the wrong type later.
+                    let known = match self.struct_fields.get(&n) {
+                        Some(f) => f.clone(),
+                        None => {
+                            return Err(format!(
+                                "at byte {}: unknown struct `{n}` in a pattern",
+                                self.pos()
+                            ))
+                        }
+                    };
+                    let fields = self.parse_struct_pat_fields(&n, &known)?;
+                    Ok(Pat::Struct(n, fields))
                 } else if let Some(v) = self.consts.get(&n) {
                     // A bare name that names a constant is that constant's
                     // value, not a fresh binding, exactly as rustc reads it.
@@ -1508,6 +1785,251 @@ impl Parser {
                 other.map(|t| t.describe()).unwrap_or_else(|| "end of input".into())
             )),
         }
+    }
+
+    /// The field list of a struct pattern, `{ f, g: h, i: _, .. }`, with the
+    /// opening `{` already consumed and the closing `}` consumed here. `n` is
+    /// the struct name (for error messages) and `known` its field set, from the
+    /// prescan. A field's value may be a binding (`f`, `f: b`, `f: mut b`) or a
+    /// nested struct pattern (`f: I { a }`); the latter is stored as a
+    /// `Pat::Struct` with `mut` cleared, since `mut` is only legal on a binding.
+    fn parse_struct_pat_fields(
+        &mut self,
+        n: &str,
+        known: &std::collections::HashSet<String>,
+    ) -> PResult<Vec<FieldPat>> {
+        let mut fields: Vec<FieldPat> = Vec::new();
+        while self.peek() != Some(&Tok::RBrace) {
+            if self.peek().is_none() {
+                return Err(format!(
+                    "at byte {}: unexpected end of input in struct pattern",
+                    self.pos()
+                ));
+            }
+            // `..` ignores the remaining fields; nothing may follow it.
+            if self.eat(&Tok::DotDot) {
+                break;
+            }
+            // `mut` may precede a shorthand field (`S { mut f }`), but not the
+            // field name of a renamed one.
+            let leading_mut = self.eat(&Tok::Mut);
+            let fname = self.expect_ident()?;
+            // A field the struct does not have is an error here, not a silent
+            // no-op: a `f: _` field emits no read for sema to catch, and a wrong
+            // name is a typo either way.
+            if !known.contains(&fname) {
+                return Err(format!(
+                    "at byte {}: struct `{n}` has no field `{fname}`",
+                    self.pos()
+                ));
+            }
+            if fields.iter().any(|(f, _)| *f == fname) {
+                return Err(format!(
+                    "at byte {}: field `{fname}` bound twice in struct pattern",
+                    self.pos()
+                ));
+            }
+            let bind = if self.eat(&Tok::Colon) {
+                // `f: mut b` marks just this binding mutable, as in rustc. A
+                // leading `mut` before the field name is only legal on a
+                // shorthand field.
+                if leading_mut {
+                    return Err(format!(
+                        "at byte {}: `mut` must be attached to the binding, as `{fname}: mut b`",
+                        self.pos()
+                    ));
+                }
+                let m = self.eat(&Tok::Mut);
+                if self.peek() == Some(&Tok::Underscore) {
+                    self.i += 1;
+                    if m {
+                        return Err(format!(
+                            "at byte {}: `mut` is not allowed on `_`",
+                            self.pos()
+                        ));
+                    }
+                    None
+                } else if let Some(inner) = self.parse_nested_struct_pat()? {
+                    // `f: I { a }` — a nested struct pattern, so `mut` (which
+                    // only applies to a binding) is rejected, as rustc rejects
+                    // `f: mut I { a }`.
+                    if m {
+                        return Err(format!(
+                            "at byte {}: `mut` is not allowed on a nested pattern",
+                            self.pos()
+                        ));
+                    }
+                    Some((false, inner))
+                } else if self.peek() == Some(&Tok::LBracket) {
+                    // `f: [x, y]` — a nested array pattern for an array-typed
+                    // field; `mut` is likewise rejected.
+                    if m {
+                        return Err(format!(
+                            "at byte {}: `mut` is not allowed on a nested pattern",
+                            self.pos()
+                        ));
+                    }
+                    Some((false, self.parse_array_pat()?))
+                } else {
+                    Some((m, Pat::Bind(self.expect_ident()?)))
+                }
+            } else {
+                // Shorthand: `S { f }` binds `f`, or `S { mut f }` binds a
+                // mutable `f`.
+                Some((leading_mut, Pat::Bind(fname.clone())))
+            };
+            fields.push((fname, bind));
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(Tok::RBrace)?;
+        Ok(fields)
+    }
+
+    /// A nested struct pattern after a field name and `:`, i.e. `I { .. }`. The
+    /// struct name must be in the prescan, as at the top level. Returns `None`
+    /// when the next token is not an identifier followed by `{`, so the caller
+    /// falls through to a plain binding (or a rename).
+    fn parse_nested_struct_pat(&mut self) -> PResult<Option<Pat>> {
+        let name = match self.peek().cloned() {
+            Some(Tok::Ident(name)) => name,
+            _ => return Ok(None),
+        };
+        // `Ident {` starts a nested pattern; anything else (`Ident`, `Ident,`,
+        // `Ident }`) is a binding.
+        if self.toks.get(self.i + 1).map(|t| &t.tok) != Some(&Tok::LBrace) {
+            return Ok(None);
+        }
+        let known = match self.struct_fields.get(&name) {
+            Some(f) => f.clone(),
+            None => {
+                return Err(format!(
+                    "at byte {}: unknown struct `{name}` in a pattern",
+                    self.pos()
+                ))
+            }
+        };
+        self.i += 1; // the struct name
+        self.i += 1; // the `{`
+        let fields = self.parse_struct_pat_fields(&name, &known)?;
+        Ok(Some(Pat::Struct(name, fields)))
+    }
+
+    /// `[a, b, .., c]`: an array pattern, with the opening `[` already peeked.
+    /// Each element is a sub-pattern; a single `..` matches any number of middle
+    /// elements and records how many elements precede it in `front`. rustc
+    /// allows `..` at most once per pattern, so a second one is rejected.
+    fn parse_array_pat(&mut self) -> PResult<Pat> {
+        self.i += 1; // the `[`
+        let mut elems: Vec<Option<(bool, Pat)>> = Vec::new();
+        let mut rest = false;
+        let mut front = 0usize;
+        while self.peek() != Some(&Tok::RBracket) {
+            if self.peek().is_none() {
+                return Err(format!(
+                    "at byte {}: unexpected end of input in array pattern",
+                    self.pos()
+                ));
+            }
+            if self.eat(&Tok::DotDot) {
+                if rest {
+                    return Err(format!(
+                        "at byte {}: `..` can only be used once per array pattern",
+                        self.pos()
+                    ));
+                }
+                rest = true;
+                front = elems.len();
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+                continue;
+            }
+            // `mut` may precede an element binding (`[mut a, b]`), as in rustc.
+            let m = self.eat(&Tok::Mut);
+            let p = self.parse_pattern_primary()?;
+            if m && !matches!(p, Pat::Bind(_)) {
+                return Err(format!(
+                    "at byte {}: `mut` is not allowed here; it attaches to a binding",
+                    self.pos()
+                ));
+            }
+            elems.push(Some((m, p)));
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(Tok::RBracket)?;
+        // Every element must be irrefutable: a refutable one (`[1, x]`) would
+        // need a per-element test, which rmc does not generate. Reject it here
+        // rather than mis-bind it as an always-true read.
+        if elems.iter().flatten().any(|(_, p)| !Self::pat_irrefutable(p)) {
+            return Err(format!(
+                "at byte {}: array pattern elements must be bindings, `_`, or nested patterns",
+                self.pos()
+            ));
+        }
+        // `elems` stays in source order; `front` separates the elements before
+        // `..` from those after it, and `array_pat_binds` reads the tail
+        // relative to the array's length.
+        Ok(Pat::Array { elems, rest, front })
+    }
+
+    /// The `let` statements an array pattern introduces: one per bound element,
+    /// each an index read of `subj` at that element's position. Shared by the
+    /// `let`, `for` and `match` paths. A `..` rest shifts the elements after it
+    /// to the back of the array: with `front` elements ahead and `k` behind, an
+    /// element at pattern index `j` reads array index `j` (j < front) or
+    /// `len - (k - (j - front))` (j >= front), where `len` is the array's length.
+    fn array_pat_binds(
+        elems: &[Option<(bool, Pat)>],
+        rest: bool,
+        front: usize,
+        subj: &Expr,
+    ) -> Vec<Stmt> {
+        let mut out = Vec::new();
+        for (j, elem) in elems.iter().enumerate() {
+            let (m, pat) = match elem {
+                Some(x) => x,
+                None => continue,
+            };
+            let idx = if !rest || j < front {
+                Expr::Int(j as i64)
+            } else {
+                let behind = elems.len() - front;
+                let from_end = behind - (j - front);
+                let len = Expr::MethodCall {
+                    recv: Box::new(subj.clone()),
+                    name: "len".to_string(),
+                    args: Vec::new(),
+                };
+                Expr::Bin(
+                    BinOp::Sub,
+                    Box::new(len),
+                    Box::new(Expr::Int(from_end as i64)),
+                )
+            };
+            let index = Expr::Index(Box::new(subj.clone()), Box::new(idx));
+            match pat {
+                // `_` matches an element without binding it: no read.
+                Pat::Wild => {}
+                Pat::Bind(name) => out.push(Stmt::Let {
+                    name: name.clone(),
+                    ty: None,
+                    mutable: *m,
+                    init: Some(index),
+                    slot: -1,
+                }),
+                Pat::Array { elems, rest, front } => {
+                    out.extend(Self::array_pat_binds(elems, *rest, *front, &index))
+                }
+                // A struct sub-pattern inside an array element.
+                Pat::Struct(_, fields) => out.extend(Self::struct_pat_binds(fields, &index)),
+                _ => unreachable!("unexpected array sub-pattern"),
+            }
+        }
+        out
     }
 
     /// `match scrutinee { pat => expr, ... }` on integers. It desugars to a
@@ -1549,7 +2071,7 @@ impl Parser {
         if arms.is_empty() {
             return Err(format!("at byte {}: `match` needs at least one arm", self.pos()));
         }
-        Ok(self.desugar_match(scrutinee, arms))
+        self.desugar_match(scrutinee, arms)
     }
 
     /// Parse a `match` arm body. As in Rust, an arm body is an expression, but a
@@ -1633,7 +2155,13 @@ impl Parser {
     /// or-pattern with such an alternative.
     fn pat_irrefutable(p: &Pat) -> bool {
         match p {
-            Pat::Wild | Pat::Bind(_) => true,
+            // A struct pattern always matches: it binds the named fields and
+            // ignores the rest, with no test, so an arm using one is a catch-all.
+            Pat::Wild | Pat::Bind(_) | Pat::Struct(..) => true,
+            // An array pattern matches when every element pattern does.
+            Pat::Array { elems, .. } => elems
+                .iter()
+                .all(|e| e.as_ref().map_or(true, |(_, p)| Self::pat_irrefutable(p))),
             Pat::Or(alts) => alts.iter().any(Self::pat_irrefutable),
             _ => false,
         }
@@ -1643,7 +2171,11 @@ impl Parser {
     /// with `_` becomes the `else` (so any arm after it is unreachable, as in
     /// Rust). With no `_`, the chain has no final `else`, so a non-matching
     /// value yields `()`.
-    fn desugar_match(&mut self, scrutinee: Expr, arms: Vec<(Pat, Option<Expr>, Expr)>) -> Expr {
+    fn desugar_match(
+        &mut self,
+        scrutinee: Expr,
+        arms: Vec<(Pat, Option<Expr>, Expr)>,
+    ) -> PResult<Expr> {
         self.desugar_match_arms(scrutinee, arms, false)
     }
 
@@ -1656,7 +2188,7 @@ impl Parser {
         scrutinee: Expr,
         arms: Vec<(Pat, Option<Expr>, Expr)>,
         check_dead_arms: bool,
-    ) -> Expr {
+    ) -> PResult<Expr> {
         // A `_` or binding arm makes the match exhaustive in every position;
         // an or-pattern is irrefutable when any alternative is (`1 | _`). A
         // *guarded* irrefutable arm is not a catch-all: `_ if c` can fail, so
@@ -1677,17 +2209,17 @@ impl Parser {
         };
         let mut acc: Option<Expr> = None;
         for (pat, guard, body) in arms.into_iter().rev() {
-            acc = Some(Self::desugar_arm(pat, guard, &subj, body, acc, check_dead_arms));
+            acc = Some(self.desugar_arm(pat, guard, &subj, body, acc, check_dead_arms)?);
         }
         let acc = acc.expect("a `match` has at least one arm");
         let acc = Expr::MatchBoundary(
             Block { stmts: Vec::new(), tail: Some(Box::new(acc)) },
             has_catch_all,
         );
-        match prelude {
+        Ok(match prelude {
             None => acc,
             Some(stmt) => Expr::Block(Block { stmts: vec![stmt], tail: Some(Box::new(acc)) }),
-        }
+        })
     }
 
     /// `if let PAT = EXPR { then } else { els }` is Rust's sugar for
@@ -1696,7 +2228,13 @@ impl Parser {
     /// not be exhaustive: a non-matching value falls through to the `_` arm,
     /// which is the `else` block or `()` — so a non-unit `then` with no `else`
     /// is a branch-type error, as in rustc.
-    fn desugar_if_let(&mut self, pat: Pat, scrutinee: Expr, then: Block, els: Option<Block>) -> Expr {
+    fn desugar_if_let(
+        &mut self,
+        pat: Pat,
+        scrutinee: Expr,
+        then: Block,
+        els: Option<Block>,
+    ) -> PResult<Expr> {
         let fallback = match els {
             Some(b) => Expr::Block(b),
             None => Expr::Block(Block { stmts: Vec::new(), tail: None }),
@@ -1717,19 +2255,19 @@ impl Parser {
     /// need no new case. `EXPR` sits inside the loop, so it is re-evaluated
     /// every iteration (as in Rust); the `if let` binds its non-`Var` scrutinee
     /// to a fresh temporary each time.
-    fn desugar_while_let(&mut self, pat: Pat, scrutinee: Expr, body: Block) -> Stmt {
+    fn desugar_while_let(&mut self, pat: Pat, scrutinee: Expr, body: Block) -> PResult<Stmt> {
         let break_else = Block {
             stmts: vec![Stmt::Break(None, None)],
             tail: None,
         };
         // The `if let` is a *statement* in the loop body, so its value is
         // discarded and the loop body is unit even when `body` yields a value.
-        let test = self.desugar_if_let(pat, scrutinee, body, Some(break_else));
+        let test = self.desugar_if_let(pat, scrutinee, body, Some(break_else))?;
         let loop_body = Block { stmts: vec![Stmt::Expr(test)], tail: None };
         // The loop is unit-valued: the `else` arm always contains a plain
         // `break;`, so a `break value` in the body is rejected as a type
         // mismatch (rustc E0571 rejects it too).
-        Stmt::Expr(Expr::Loop(loop_body, -1, Type::Unit, None))
+        Ok(Stmt::Expr(Expr::Loop(loop_body, -1, Type::Unit, None)))
     }
 
     /// One arm of a desugared `match` or `if let`: the pattern test, the
@@ -1768,26 +2306,165 @@ impl Parser {
                 n_binds: -1,
             },
             // `_` in an or-pattern: always true, so the whole condition is true.
-            Pat::Wild => Expr::Bool(true),
-            // A binding inside an or-pattern is rejected before this point.
-            Pat::Bind(_) | Pat::Or(_) => unreachable!("or-pattern alternative"),
+            // A struct pattern is likewise always true; a binding one is
+            // rejected before this point.
+            Pat::Wild | Pat::Struct(..) => Expr::Bool(true),
+            // A binding inside an or-pattern is rejected before this point; an
+            // array pattern is not supported as an or-alternative.
+            Pat::Bind(_) | Pat::Or(_) | Pat::Array { .. } => {
+                unreachable!("or-pattern alternative")
+            }
+        }
+    }
+
+    /// The statements a `let` struct destructuring expands to: a hidden
+    /// scrutinee binding (unless the initialiser is already a plain place, as in
+    /// `desugar_match_arms`, so its re-read has no side effects and no copy is
+    /// made) followed by one field read per binding. The statements are spliced
+    /// into the enclosing block by the caller, so the bindings stay visible for
+    /// the rest of it. `ty` is the optional annotation, kept on the temporary so
+    /// it is still checked.
+    fn let_destructure_stmts(
+        &mut self,
+        fields: Vec<FieldPat>,
+        ty: Option<Type>,
+        init: Expr,
+    ) -> Vec<Stmt> {
+        let (mut out, subj) = self.let_destructure_prelude(ty, init);
+        out.extend(Self::struct_pat_binds(&fields, &subj));
+        out
+    }
+
+    /// The same expansion for an array pattern: bind the scrutinee to a hidden
+    /// temporary (unless it is already a plain place) and read each named
+    /// element out of it. The temporary carries the annotation, so `let [a, b]:
+    /// [i64; 2] = e;` is still checked.
+    fn let_destructure_array_stmts(
+        &mut self,
+        elems: Vec<Option<(bool, Pat)>>,
+        rest: bool,
+        front: usize,
+        ty: Option<Type>,
+        init: Expr,
+    ) -> Vec<Stmt> {
+        let (mut out, subj) = self.let_destructure_prelude(ty, init);
+        out.extend(Self::array_pat_binds(&elems, rest, front, &subj));
+        out
+    }
+
+    /// The hidden scrutinee a `let` destructuring binds from: the initializer
+    /// itself when it is a plain place with no annotation to carry, otherwise a
+    /// fresh temporary that holds it (so the initializer's side effects run
+    /// once and the annotation is checked against the value). Shared by the
+    /// struct and array destructuring paths.
+    fn let_destructure_prelude(&mut self, ty: Option<Type>, init: Expr) -> (Vec<Stmt>, Expr) {
+        if ty.is_none()
+            && matches!(init, Expr::Var { .. } | Expr::Int(_) | Expr::EnumVariant { .. })
+        {
+            (Vec::new(), init)
+        } else {
+            let tmp = format!("\u{0}lp{}", self.tmp);
+            self.tmp += 1;
+            let stmt = Stmt::Let {
+                name: tmp.clone(),
+                ty,
+                init: Some(init),
+                slot: -1,
+                mutable: false,
+            };
+            (vec![stmt], Expr::Var { name: tmp, slot: -1, ty: Type::I64 })
+        }
+    }
+
+    /// The `let` statements a struct pattern introduces: one per bound field,
+    /// each a read of that field on `subj`. Shared by the `match` arm path,
+    /// `let` destructuring and `for` destructuring, which differ only in what
+    /// they do with the result. The reads are left for sema to type and locate,
+    /// so a non-struct scrutinee is a sema error naming the field and a field
+    /// may auto-deref a `&S` scrutinee. `f: _` contributes no binding. A nested
+    /// sub-pattern (`f: I { a }`) recurses with the field read as its
+    /// sub-scrutinee, so the nested names become ordinary chained reads.
+    fn struct_pat_binds(fields: &[FieldPat], subj: &Expr) -> Vec<Stmt> {
+        let mut out = Vec::new();
+        for (fname, bind) in fields {
+            let (m, pat) = match bind {
+                Some(x) => x,
+                None => continue,
+            };
+            let field = Expr::Field {
+                base: Box::new(subj.clone()),
+                name: fname.clone(),
+                offset: -1,
+                ty: Type::Unit,
+            };
+            match pat {
+                Pat::Bind(b) => out.push(Stmt::Let {
+                    name: b.clone(),
+                    ty: None,
+                    mutable: *m,
+                    init: Some(field),
+                    slot: -1,
+                }),
+                Pat::Struct(_, inner) => out.extend(Self::struct_pat_binds(inner, &field)),
+                // An array-typed field may be destructured by an array pattern.
+                Pat::Array { elems, rest, front } => {
+                    out.extend(Self::array_pat_binds(elems, *rest, *front, &field))
+                }
+                // Only a binding, a nested struct pattern or a nested array
+                // pattern is parsed here.
+                _ => unreachable!("unexpected struct sub-pattern"),
+            }
+        }
+        out
+    }
+
+    /// The first variable a pattern binds, if any. A struct pattern binds the
+    /// names of its sub-patterns; an or-pattern binds through its alternatives.
+    /// Used to reject a binding in an or-pattern (rustc's E0408), which rmc
+    /// cannot bind consistently across alternatives.
+    fn first_bound_name(p: &Pat) -> Option<String> {
+        match p {
+            Pat::Bind(n) => Some(n.clone()),
+            Pat::Struct(_, fields) => fields.iter().find_map(|(_, b)| {
+                b.as_ref().and_then(|(_, sub)| Self::first_bound_name(sub))
+            }),
+            Pat::Array { elems, .. } => elems
+                .iter()
+                .find_map(|e| e.as_ref().and_then(|(_, p)| Self::first_bound_name(p))),
+            Pat::Or(alts) => alts.iter().find_map(Self::first_bound_name),
+            _ => None,
         }
     }
 
     fn desugar_arm(
+        &mut self,
         pat: Pat,
         guard: Option<Expr>,
         subj: &Expr,
         body: Expr,
         rest: Option<Expr>,
         check_dead: bool,
-    ) -> Expr {
+    ) -> PResult<Expr> {
         // Each pattern yields its test (`None` when it is irrefutable) and any
         // bindings it introduces. The test is an ordinary expression, so sema
         // and codegen need no new case for a guard: it is folded in with `&&`,
         // and an irrefutable arm's guard becomes the whole `if` condition.
         let (bindings, test): (Vec<Stmt>, Option<Expr>) = match pat {
             Pat::Wild => (Vec::new(), None),
+            // `S { f, g: h } => body` is irrefutable, so it has no test: it binds
+            // each named field to a fresh local via a field read. The reads are
+            // left for sema to type and locate, so a non-struct scrutinee is a
+            // sema error naming the field, and a field may be matched on a `&S`
+            // scrutinee by auto-deref. The struct name and each field name were
+            // already checked against the prescan, so `f: _` (which emits no
+            // read) is validated too.
+            Pat::Struct(_name, fields) => (Self::struct_pat_binds(&fields, &subj), None),
+            // `[a, b] => body` is irrefutable in the same way: it binds each
+            // named element via an index read, with no test. A `..` rest shifts
+            // the trailing bindings to the back of the array.
+            Pat::Array { elems, rest, front } => {
+                (Self::array_pat_binds(&elems, rest, front, &subj), None)
+            }
             // `name => body` binds the whole scrutinee.
             Pat::Bind(name) => (
                 vec![Stmt::Let {
@@ -1907,9 +2584,9 @@ impl Parser {
             },
         };
         if bindings.is_empty() {
-            arm
+            Ok(arm)
         } else {
-            Expr::Block(Block { stmts: bindings, tail: Some(Box::new(arm)) })
+            Ok(Expr::Block(Block { stmts: bindings, tail: Some(Box::new(arm)) }))
         }
     }
 
@@ -1998,7 +2675,7 @@ impl Parser {
                     if self.eat(&Tok::LParen) {
                         let mut args = Vec::new();
                         while self.peek() != Some(&Tok::RParen) {
-                            args.push(self.parse_expr()?);
+                            args.push(self.parse_bracketed_expr()?);
                             if !self.eat(&Tok::Comma) {
                                 break;
                             }
@@ -2070,7 +2747,7 @@ impl Parser {
                 if self.eat(&Tok::LParen) {
                     let mut args = Vec::new();
                     while self.peek() != Some(&Tok::RParen) {
-                        args.push(self.parse_expr()?);
+                        args.push(self.parse_bracketed_expr()?);
                         if !self.eat(&Tok::Comma) {
                             break;
                         }
@@ -2118,7 +2795,7 @@ impl Parser {
                     } else {
                         None
                     };
-                    return Ok(self.desugar_if_let(pat, scrutinee, then, els));
+                    return self.desugar_if_let(pat, scrutinee, then, els);
                 }
                 let cond = self.parse_cond()?;
                 let then = self.parse_block()?;
@@ -2169,7 +2846,7 @@ impl Parser {
             Some(Tok::LBrace) => Ok(Expr::Block(self.parse_block()?)),
             Some(Tok::LBracket) => {
                 self.i += 1;
-                let first = self.parse_expr()?;
+                let first = self.parse_bracketed_expr()?;
                 if self.eat(&Tok::Semi) {
                     // `[v; N]`: the repeat count is a constant expression.
                     let len = self.parse_expr()?;
@@ -2192,7 +2869,7 @@ impl Parser {
                         if self.peek() == Some(&Tok::RBracket) {
                             break;
                         }
-                        elems.push(self.parse_expr()?);
+                        elems.push(self.parse_bracketed_expr()?);
                     }
                     self.expect(Tok::RBracket)?;
                     // The element type is not known here; sema infers it from
@@ -2231,7 +2908,31 @@ enum Pat {
     /// A plain name: binds the whole scrutinee (an irrefutable catch-all). Kept
     /// distinct from `Wild` only so the binding is named.
     Bind(String),
+    /// `S { f, g: h }`: a struct pattern, matched by name against the
+    /// scrutinee's type. Each field is `(name, Some((mut, binding)))` when
+    /// written `f: b` (or the shorthand `f`, which binds `f`), and
+    /// `(name, None)` for `f: _`. `mut` is a per-binding flag, as in rustc: it
+    /// is written on the binding (`f: mut b`, `mut f`) and there is no
+    /// `mut` on the pattern as a whole. A struct pattern is irrefutable, so it
+    /// has no test: it desugars to the field reads its bindings name (see
+    /// `desugar_arm` and `let` destructuring). The struct name is resolved by
+    /// sema, so it may name a struct declared later in the file.
+    Struct(String, Vec<FieldPat>),
+    /// `[a, b, .., c]`: an array pattern. Each element is a sub-pattern with its
+    /// own `mut` flag (`[mut a, b]`); `None` marks the single `..` rest, which
+    /// matches any number of middle elements. `front` counts the elements
+    /// before the rest (and, with no rest, is the element count). Irrefutable
+    /// when every element pattern is, so a `for` or `let` may use one; a `match`
+    /// arm using one has no test. Desugars to the indexed reads its bindings
+    /// name.
+    Array { elems: Vec<Option<(bool, Pat)>>, rest: bool, front: usize },
 }
+
+/// One field of a struct pattern: its name and what it binds. `None` is
+/// `f: _` (ignored); `Some((mut, pat))` binds the field, where `pat` is a
+/// binding (`f`/`f: b`) or a nested struct pattern (`f: I { a }`). `mut` is only
+/// meaningful on a binding, so a nested sub-pattern is stored with `false`.
+type FieldPat = (String, Option<(bool, Pat)>);
 
 /// Whether `e` syntactically contains a call, used to decide if a subscript in
 /// a compound assignment must be evaluated into a temporary.

@@ -342,6 +342,14 @@ pub struct FnDef {
     /// non-`mut` parameter is an immutable binding, so assigning it is rejected
     /// like rustc; `mut x: T` allows the body to rebind it (a local copy).
     pub param_mut: Vec<bool>,
+    /// Per-parameter destructuring patterns, parallel to `params`. A `None`
+    /// entry is a plain `p: T` parameter. A `Some(pattern)` entry is an
+    /// aggregate parameter written as a pattern (`S { x, y }: S`, `[a, b]:
+    /// [i64; 2]`): the parameter itself is an ordinary named parameter, and
+    /// these statements (spliced at the top of the body by `sema`) bind the
+    /// pattern's names from it. The pattern has no separate type, so its names
+    /// read through the parameter.
+    pub param_pats: Vec<Option<Vec<Stmt>>>,
     pub ret: Type,
     pub body: Block,
     /// Frame slot of each parameter, in order, filled in by `sema`. An aggregate

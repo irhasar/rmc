@@ -1,0 +1,56 @@
+// Nested struct sub-patterns: `S { a: I { x }, b }` binds through the field.
+// The expansion is `let a = s.a; let x = a.x; let b = s.b;`, so each nested
+// name is an ordinary chained field read.
+struct I { x: i64, y: i64 }
+struct S { a: I, b: i64 }
+
+fn sum(i: &I) -> i64 {
+    return i.x * 10 + i.y;
+}
+
+fn main() -> i64 {
+    let s: S = S { a: I { x: 3, y: 4 }, b: 5 };
+
+    // `let` destructuring with a nested pattern.
+    let S { a: I { x, y }, b } = s;
+    print_i64(x * 100 + y * 10 + b);
+
+    // Renamed and ignored nested fields, plus `..` at both levels.
+    let S { a: I { x: p, y: _ }, .. } = s;
+    print_i64(p);
+
+    // A nested pattern that binds nothing is still a valid destructuring.
+    let S { a: I { .. }, b: _ } = s;
+    print_i64(0);
+
+    // `match` with a nested pattern, through a reference (auto-deref).
+    let r: &S = &s;
+    let mut acc: i64 = 0;
+    match r {
+        S { a: I { x, y }, b } => { acc = acc + x * 100 + y * 10 + b; }
+    }
+    print_i64(acc);
+
+    // Deeper nesting: three levels.
+    let deep: S = S { a: I { x: 7, y: 8 }, b: 9 };
+    let S { a: I { x: dx, y: dy }, b: db } = deep;
+    print_i64(dx * 100 + dy * 10 + db);
+
+    // A nested pattern in a `for` loop over an array of structs.
+    let arr: [S; 2] = [s, deep];
+    let mut total: i64 = 0;
+    for S { a: I { x, y }, b } in arr {
+        total = total + x + y + b;
+    }
+    print_i64(total);
+
+    // A nested pattern in an `if let`.
+    if let S { a: I { x, .. }, .. } = s {
+        print_i64(x);
+    }
+
+    // A reference to the inner struct, destructured in a helper.
+    print_i64(sum(&s.a));
+
+    return 0;
+}

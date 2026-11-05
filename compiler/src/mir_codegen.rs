@@ -1768,7 +1768,7 @@ impl<'a> FnGen<'a> {
 
     /// The byte offset of variant `v`'s field `k` within an enum, or the offset
     /// of the tag when `k` is `None`.
-    fn enum_field_offset(&self, name: &str, v: &str, k: u64) -> i64 {
+    fn enum_field_offset(&self, name: &str, _v: &str, k: u64) -> i64 {
         let Some(l) = self.enums.get(name) else { return k as i64 * 8 };
         let base = if l.fieldless { l.tag_off } else { l.payload_off };
         base + k as i64 * 8
@@ -3513,7 +3513,7 @@ fn is_wide_imm(op: &str) -> bool {
 fn ty_size(ty: &Ty) -> i64 {
     match ty {
         Ty::I64 | Ty::Bool | Ty::Int | Ty::Ptr(_) | Ty::Ref(_) | Ty::Other | Ty::Unit => 8,
-        Ty::Struct(name) => 8, // refined by the aggregate's own length
+        Ty::Struct(_) => 8, // refined by the aggregate's own length
         Ty::Array(elem, n) => ty_size(elem) * (*n as i64).max(1),
         Ty::Tuple(tys) => tys.iter().map(|t| ty_size(t)).sum::<i64>().max(8),
         _ => 8,

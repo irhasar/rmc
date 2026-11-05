@@ -1,0 +1,98 @@
+// Struct destructuring patterns `S { f, g: h, i: _, .. }` in `match` and
+// `if let`. A struct pattern is irrefutable, so it binds the named fields and
+// ignores the rest with no runtime test; a field may be renamed (`g: h`), bound
+// by shorthand (`f`), or ignored (`i: _`), and a trailing `..` drops the fields
+// not named.
+
+struct P { x: i64, y: i64 }
+struct Inner { a: i64, b: i64 }
+struct Q { i: Inner, y: i64 }
+
+// A struct pattern names a struct that may be declared later in the file.
+fn early(p: Late) -> i64 {
+    match p {
+        Late { n, .. } => n * 2,
+    }
+}
+
+struct Late { n: i64, m: i64 }
+
+fn mkp() -> P { return P { x: 8, y: 9 }; }
+
+fn classify(p: P) -> i64 {
+    match p {
+        P { x, y } => x * 100 + y,
+    }
+}
+
+// A struct pattern also matches through a reference: the field read auto-derefs.
+fn sum_ref(p: &P) -> i64 {
+    match p {
+        P { x, y } => x + y,
+    }
+}
+
+fn main() -> i64 {
+    let p: P = P { x: 3, y: 4 };
+
+    // Both fields bound by shorthand.
+    match p {
+        P { x, y } => {
+            print_i64(x);
+            print_i64(y);
+        }
+    }
+    print_i64(classify(p));
+
+    // A renamed field and an ignored one.
+    match p {
+        P { x: a, y: _ } => print_i64(a),
+    }
+
+    // `..` ignores the rest; the pattern has no test, so the value always binds.
+    match p {
+        P { y, .. } => print_i64(y * 10),
+    }
+
+    // `if let` with a struct pattern, and its `else` on a value that cannot
+    // fail to match is still type-checked.
+    if let P { x, y } = p {
+        print_i64(x + y);
+    } else {
+        print_i64(-1);
+    }
+
+    // A guard on a struct pattern: the arm is taken only when the guard holds.
+    match p {
+        P { x, y } if x > y => print_i64(1),
+        _ => print_i64(0),
+    }
+
+    // A struct-typed field is destructured by value.
+    let q: Q = Q { i: Inner { a: 5, b: 6 }, y: 7 };
+    match q {
+        Q { i, y } => {
+            match i {
+                Inner { a, b } => print_i64(a * 1000 + b * 100 + y),
+            }
+        }
+    }
+
+    // Forward-declared struct.
+    print_i64(early(Late { n: 21, m: 0 }));
+
+    // Through a reference.
+    print_i64(sum_ref(&p));
+
+    // A field read in a struct pattern is an ordinary place read, so it also
+    // works on a value produced by a call.
+    match mkp() {
+        P { x, y } => print_i64(x - y),
+    }
+
+    // `..` alone binds nothing but still names the struct.
+    match p {
+        P { .. } => print_i64(0),
+    }
+    return 0;
+}

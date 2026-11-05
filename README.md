@@ -222,8 +222,21 @@ overflowing arithmetic near `i64::MAX` (the only mode that makes the
 `--overflow-checks` trap fire), `nest` for nested aggregates with a deep copy
 and a nested-path write, `pat` for `match` expressions (multi-variant enums,
 two-field payloads, explicit discriminants, `bool` matches, binding patterns,
-nested matches, `if let`, string patterns, per-arm guards, and a side-effecting
-scrutinee), and `order` for assignment evaluation order (a
+struct patterns, nested matches, `if let`, string patterns, per-arm guards, and
+a side-effecting
+scrutinee), `letdestr` for `let` struct destructuring (shorthand, renamed and
+`mut` bindings, `_` and `..`, a call and a reference scrutinee, and a
+struct-typed field destructured in turn), `fordestr` for `for S { .. } in arr`
+destructuring (the head evaluated once, per-iteration rebinding, `break`, and
+the same pattern grammar as `let`), `nestpat` for nested struct sub-patterns
+(a chain of struct types so the pattern nests several levels deep, exercised in
+`let`, `match`, `if let` and `for`), `arrpat` for array destructuring patterns
+(`let [a, b, .., c] = arr`, `for [x, y] in pairs`, `match`/`if let` arms, with
+`_` elements, `mut` bindings, nested and struct element patterns, `..` rests
+in every position, and an array-typed struct field destructured in place),
+`parampat` for aggregate parameter patterns (struct and array patterns, a
+nested one, one mixed with plain parameters, and one on a method receiver), and
+`order` for assignment evaluation order (a
 side-effecting index and value on both `=` and every compound operator, the
 shapes `stmt` never assigns through). `shift` drives `<<`, `>>` and the compound
 `<<=`/`>>=` with a shift count from `argv`, so the count is opaque to the
@@ -298,13 +311,22 @@ fn main() -> i64 {
 ```
 
 Supported: `i64`, `bool`, `str`, fixed-size arrays, and structs with named fields
-(including field init shorthand, `P { x, y }`, and struct update syntax,
-`P { x: 9, ..base }`);
-functions with up to six parameters; `let` / `let mut` / `let _` (discard); assignment to variables,
+(including field init shorthand, `P { x, y }`, struct update syntax,
+`P { x: 9, ..base }`, struct patterns `P { x, y: z, .. }` in `match`/`if let`
+(including nested sub-patterns `P { a: I { x }, .. }`), `let` destructuring
+`let P { x, y: z, .. } = p;`, `for` destructuring
+`for P { x, y: z, .. } in arr { .. }`, and array patterns
+`[a, b, .., c]` (in `let`/`for`/`match`/`if let`, with `_`, `mut`, nested
+patterns and `..` rests, also usable on an array-typed struct field,
+`let P { a: [x, y], .. } = p;`));
+functions with up to six parameters, which may be written as an aggregate
+pattern (`fn f(P { x, y }: P)`, `fn f([a, b]: [i64; 2])`, nested and mixed with
+plain parameters); `let` / `let mut` / `let _` (discard); assignment to variables,
 array elements and struct fields (including compound `+=` and friends);
 `if`/`else`, `while`, `loop`, `for i in a..b` / `a..=b` and `for x in arr`
 (array iteration, by value); `match` on integers,
-`bool`s, enums and strings (literal, `true`/`false`, string, `Enum::Variant` and
+`bool`s, enums and strings (literal, `true`/`false`, string, `Enum::Variant`,
+struct and
 `_` patterns, plus payload bindings and binding names, and a per-arm guard
 `PAT if COND`) and `if let` with the
 same patterns

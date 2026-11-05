@@ -59,6 +59,11 @@ python3 tools/fuzz.py --mode cast --n 500 --seed 1
 python3 tools/fuzz.py --mode assoc --n 500 --seed 1
 python3 tools/fuzz.py --mode ref --n 500 --seed 1
 python3 tools/fuzz.py --mode update --n 500 --seed 1
+python3 tools/fuzz.py --mode letdestr --n 500 --seed 1
+python3 tools/fuzz.py --mode fordestr --n 500 --seed 1
+python3 tools/fuzz.py --mode nestpat --n 500 --seed 1
+python3 tools/fuzz.py --mode arrpat --n 500 --seed 1
+python3 tools/fuzz.py --mode parampat --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 
 # differential fuzzer over the rustc-MIR path (rustc --emit=mir -> rmc back end)
@@ -73,6 +78,9 @@ python3 tools/fuzz.py --mode mir --n 500 --seed 1
 - `compiler/src/parser.rs` — recursive descent; `is_block_like` allows
   `if`/blocks as statements without a trailing `;`. `parse_cond` sets
   `no_struct_lit` so a `{` after a condition starts the body, not a struct.
+  The flag is scoped to the head itself: `parse_bracketed_expr` clears it while
+  parsing inside `(...)`/`[...]`, so `for p in [P { x: 1 }] { .. }` (and a struct
+  literal in a call argument or index) still parses, matching rustc.
   Precedence, loosest to tightest: `||`, `&&`, comparison, `|`, `^`, `&`,
   `<< >>`, `+ -`, `* / %`. Note shifts bind *looser* than `+`/`-`, matching
   Rust: `parse_shift` consumes `parse_add`, and `parse_bitand` consumes
@@ -102,6 +110,64 @@ python3 tools/fuzz.py --mode mir --n 500 --seed 1
   `_` alternative, and one whose alternatives cover every variant, are handled
   by `pat_irrefutable` and `or_leaves` (in sema) respectively. A *binding*
   alternative is rejected, as rustc's E0408 rejects it.
+  A *struct pattern* `S { f, g: h, i: _, .. }` is irrefutable, so it also has no
+  sema or codegen case: `struct_pat_binds` turns each bound field into a `let`
+  whose initialiser is `Expr::Field { base: scrutinee, .. }`, which sema already
+  types and locates (so a field may auto-deref a `&S` scrutinee). `mut` is a
+  per-binding flag carried in `Pat::Struct` (`f: mut h`, `mut f`), so a bound
+  field becomes a `let mut`. The prescan records
+  each struct's field names before the real parse (`struct_fields`), so a field
+  name is checked even for `i: _` (which emits no read) and a later-declared
+  struct still matches; a field the struct lacks, or one bound twice, is a parse
+  error. A field's value may be a *nested* struct sub-pattern (`a: I { x }`), to
+  any depth: `parse_nested_struct_pat` recognises `Ident {` after the `:` and
+  recurses into `parse_struct_pat_fields` (the field-list loop, factored out of
+  `parse_pattern_primary`), which checks the inner struct against `struct_fields`
+  too. `struct_pat_binds` recurses with the field read as the sub-scrutinee, so a
+  nested name expands to an ordinary chain of field reads (`s.a.x`) and sema and
+  codegen gain no case; `mut` is rejected on a sub-pattern, since it only applies
+  to a binding. A field whose type is an array may also be destructured by an
+  array sub-pattern, `S { a: [x, y], b }`: `struct_pat_binds` recurses into
+  `array_pat_binds` with the field read as the sub-scrutinee, so the field read
+  and the index read compose (`s.a[0]`) and the two nesting directions (a struct
+  inside an array element, an array inside a struct field) both work.
+  `first_bound_name` walks the pattern (through struct and or
+  alternatives) to keep rejecting a binding in an or-pattern (rustc's E0408) one
+  level down. A struct pattern is a catch-all arm, so it joins
+  `pat_irrefutable`, and `or_cond` treats it as `true` (a *binding* struct
+  pattern in an or-pattern is rejected like any other binding alternative).
+  *`let` destructuring* `let S { f, g: h, .. } = e;` reuses the same parser
+  (`parse_pattern_primary`) and the same `struct_pat_binds` helper. Because the
+  bindings must outlive the statement, the expansion cannot be a nested block:
+  `parse_stmt` was split into `parse_stmt_into(&mut Vec<Stmt>)`, and a
+  destructuring `let` pushes the hidden scrutinee (a `\0lp<n>` temporary, unless
+  the scrutinee is already a plain place, in which case its field reads read it
+  directly, as in `desugar_match_arms`) followed by the per-field bindings into
+  the enclosing block. `let mut S { .. }` is rejected (rustc's "`mut` must be
+  attached to each individual binding"); a type annotation goes on the temporary.
+  No sema or codegen case.
+  *Array patterns* `[a, b, .., c]` are the third irrefutable aggregate pattern,
+  alongside struct patterns: `Pat::Array { elems, rest, front }` is parsed by
+  `parse_array_pat` (`[` is routed from `parse_pattern_primary`) and desugared by
+  `array_pat_binds` into one `let` per bound element whose initialiser is
+  `Expr::Index { base: scrutinee, index: .. }`, which sema already types, bounds
+  checks and locates. No sema or codegen case. `elems` stays in source order and
+  is `Option<(bool, Pat)>` per element (`None` only for the `..` slot the builder
+  skips): `front` counts the elements before `..`, and an element at pattern
+  index `j` reads `subj[j]` when `j < front` (or with no rest) and
+  `subj[subj.len() - (behind - (j - front))]` otherwise, so a trailing binding
+  reads relative to the length (which folds to the constant, see `sema`'s
+  `arr.len()`). An element may be `_` (no read), a `mut` binding (the per-element
+  `mut` flag), or a nested array/struct sub-pattern (recursion, with the index
+  read as the sub-scrutinee). `parse_array_pat` rejects a second `..`, `mut` on a
+  non-binding, and any *refutable* element (`[1, y]`) — the last would need a
+  per-element test rmc does not generate, so it is rejected rather than
+  mis-bound. The pattern is irrefutable when every element is, so it joins
+  `pat_irrefutable`, `first_bound_name` (recursing so a binding element in an
+  or-pattern is still rejected) and the `let`/`for`/`match`/`if let` paths through
+  `let_destructure_array_stmts` (the `let_destructure_prelude` helper shares the
+  hidden-scrutinee logic with the struct path). `or_cond` does not treat it as
+  true: an array pattern is not a supported or-alternative.
   An arm may carry a *guard*, `PAT if COND => body`. `parse_match` reads the
   optional `if COND` after the pattern (`parse_cond`, so a struct literal needs
   parentheses) and threads it through `desugar_arm` as an `Option<Expr>`. The
@@ -144,6 +210,12 @@ python3 tools/fuzz.py --mode mir --n 500 --seed 1
   every arm diverges: its last step is an `if` with no `else`, which completes
   as `()`, so `Sema::match_chain_diverges` walks the chain and the no-`else`
   branch propagates `Never` for a `total` chain.
+  An *unannotated* binding whose initializer diverges keeps `Never`, and rmc
+  has no usage-based inference to refine it, so using it as a place is an error:
+  `let x = { return 3; }; x + 1` and `let S { a } = { return 3; };` are rejected
+  where rustc accepts them. This is a documented limitation, not a regression —
+  an annotation (`let x: i64 = ..`) makes the type concrete and both compile.
+  `let_destructuring_{accepts,rejects}_an_*_diverging_initialiser` pin it.
 - `compiler/src/ast.rs` — AST and `Type` (`I64`, `Bool`, `Str`, `Unit`, `Array`,
   `Struct`, and the parser-only placeholder `Named`). `Str` is the type of a
   string literal: one slot holding a pointer to NUL-terminated static data. It
@@ -603,9 +675,15 @@ so the benchmark can time the two stages apart.
   compile-time length, so the loop bound is a constant and `end_slot` is unused
   (see the note above). `x` is a fresh `let` per iteration, so it is immutable
   and a stale read across iterations is impossible. `continue`/`break` work
-  because the desugared loop is the ordinary `For` node. Two guards matter:
-  the loop variable must be a binding or `_` (a compound pattern is rejected
-  rather than mis-bound, since rmc has no destructuring `let`), and `for x in
+  because the desugared loop is the ordinary `For` node. A **struct pattern**
+  `for S { f, .. } in arr` reuses `let_destructure_stmts` (the `let`
+  destructuring expansion) in place of the single `let`, so the element is read
+  into a hidden temporary and the fields are bound from it; the element type is
+  `S`, so this is the same read-through as `let`. The pattern must be
+  irrefutable: a binding, `_`, or a struct pattern — including a nested
+  sub-pattern, which `struct_pat_binds` recurses into like the `let`/`match`
+  paths (a refutable pattern like an enum variant is rejected rather than
+  mis-bound). `for x in
   &arr` is rejected — Rust iterates a reference by reference (`x: &i64`), so
   accepting it would silently mistype `x`. `parse_for` also checks the pattern
   name against the constant table *before* `parse_pattern`, because a bare
@@ -1224,7 +1302,20 @@ The checks, all in `sema.rs`:
   where rustc's is `usize`, so a differential twin casts with `as i64`.
 - **Parameter names (`E0415`) and `main` (`E0580`).** A function's parameters
   must be uniquely named; `check_fn` rejects a duplicate (rmc used to bind both
-  to one slot). `main` takes no parameters, checked in `analyze`.
+  to one slot). The parser applies the same check earlier
+  (`check_dup_param_names`), because a parameter *pattern* binds names the
+  semantic pass never sees as parameters: `fn f(S { x }: S, x: i64)` is rejected
+  at parse time. `main` takes no parameters, checked in `analyze`.
+- **Aggregate parameter patterns.** A parameter may be written as a struct or
+  array pattern, `fn f(S { x, y }: S)` / `fn f([a, b]: [i64; 2])`. The parser
+  (`parse_param`) keeps an ordinary parameter of the annotation's type (a hidden
+  `\0p<n>` name) and stores the per-binding `let` statements in `FnDef::param_pats`
+  (parallel to `params`); `check_fn` splices them at the top of the body before
+  checking, so sema and codegen gain no case — the expansion is exactly the
+  matching `let` destructuring, reading through the parameter. A refutable
+  pattern (literal, variant, or-pattern) is rejected (`param_pat_binds`), and
+  `mut` on the whole pattern is rejected. `sema` inserts a `None` into
+  `param_pats` when it prepends the `self` receiver, keeping the vectors aligned.
 - **Casts (`E0054`/`E0605`/`E0606`).** `check_cast` restricts `as` to the
   conversions rustc allows plus rmc's two documented extensions. A reference may
   only become a reference to the same type (`&mut T` may lose mutability to
@@ -1321,7 +1412,13 @@ binding, payload-binding, `else if let` chain and a side-effecting scrutinee),
 and a non-trivial
 side-effecting scrutinee (a call) tested against several arms — the last is
 what exercises `desugar_match`'s temporary, which must evaluate the scrutinee
-exactly once (re-evaluating it per arm repeats a side effect). It compares
+exactly once (re-evaluating it per arm repeats a side effect). `nestpat` mode
+builds nested struct sub-patterns (`S { a: A { m: B { .. }, n }, b }`) through a
+chain of distinct struct types, so the pattern nests several levels deep, and
+emits each pattern in `let`, `match` (through a reference), `if let` and `for`.
+The expansion is a chain of field reads, so a wrong field order or a missing
+intermediate read shows up as a wrong final value; `letdestr`/`fordestr` only
+reach one level, so a deeper sub-pattern had no randomised coverage. It compares
 stdout and exit status against `rustc -O`, and it recompiles each program with
 every optimiser pass off in turn (`--no-inline`, `--no-licm`, `--no-tco`, all
 three), the same matrix the corpus suite uses — a pass-specific bug is otherwise

@@ -175,6 +175,13 @@ fn name(a: i64, b: bool) -> i64 { ... }
 - Up to six parameters. Scalars travel in the System V registers
   `rdi rsi rdx rcx r8 r9`; a struct or array is passed by value as a pointer to a
   copy. A returned aggregate is written through a caller-provided buffer.
+- A parameter may be written as an aggregate pattern, `fn f(S { x, y }: S)` or
+  `fn f([a, b]: [i64; 2])`, including a nested one (`S { a: [x, y], .. }`). The
+  parameter itself is an ordinary argument of the annotation's type; the pattern
+  binds its names at the top of the body, exactly as the matching `let`
+  destructuring would, so `mut` is per binding and a name may not collide with
+  another parameter (rustc's `E0415`). A refutable pattern (a literal, a variant,
+  an or-pattern) is rejected, as is `mut` on the whole pattern.
 - The return type may be omitted, in which case it is `()`.
 - Recursion is supported. `main` is the entry point; its return value becomes
   the process exit status.
@@ -209,6 +216,12 @@ namespace, so giving both the same name is an error (rustc's `E0428`).
 ```rust
 let x: i64 = 1;          // immutable binding
 let mut y: i64 = 0;      // mutable binding
+let S { a, b: c, .. } = s;  // struct destructuring: bind `a` and `c`
+let S { mut a, b }: S = s;  // per-binding `mut`, optional annotation
+let [a, b] = arr;        // array destructuring: bind `a` = arr[0], `b` = arr[1]
+let [x, _, .., z] = arr; // `_` ignores an element, `..` absorbs the middle
+let [mut a, b] = arr;    // per-element `mut`, optional annotation
+let S { a: [x, y], b } = s; // array-typed field destructured in place
 let _ = e;               // discard: evaluate `e` for side effects, bind nothing
 let _: T;                // annotated discard, no initialiser (a no-op)
 y = y + 1;               // assignment (target may be a variable, array element or field)
@@ -243,6 +256,29 @@ aggregate leaves it uninitialised as a whole, so reading it is still an error
 for its side effects and binds nothing, and any annotation is still checked
 (`let _: bool = 5;` is rejected, rustc's `E0308`). `let _;` with no annotation
 has no type to infer and is rejected (rustc's `E0282`); `let _: T;` is a no-op.
+A `let S { .. } = e;` destructures a struct: each named field is bound as a
+fresh local in the enclosing block, so it stays visible for the rest of the
+block. The scrutinee is evaluated exactly once, and a type annotation after the
+pattern (`let S { x, y }: S = e;`) is checked against it. `mut` is per binding —
+`let S { mut x, y: mut z } = e;` is accepted, `let mut S { .. } = e;` is
+rejected (`mut` must be attached to each individual binding, as in rustc).
+A struct-typed field may be destructured by a nested sub-pattern
+(`let S { a: I { x } } = e;`), and an array-typed field by an array pattern
+(`let S { a: [x, y], b } = e;`); see Struct patterns for the full field grammar.
+A `let [a, b, .., c] = e;` destructures an array the same way: each named element
+is bound as a fresh local in the enclosing block, the scrutinee is evaluated
+exactly once, and a type annotation after the pattern (`let [x, y]: [i64; 2] =
+e;`) is checked against it. The expansion is one index read per element, so
+`let [a, b] = e;` lowers to exactly `let a = e[0]; let b = e[1];`. A `_` element
+binds nothing, `mut` is per element (`let [mut a, b] = e;`), and a single `..`
+absorbs any number of middle elements — its trailing bindings read relative to
+the array's length, so `let [x, .., z] = a;` binds `a[0]` and `a[a.len() - 1]`
+(the latter folds to the constant length). Elements may be nested array or
+struct patterns to any depth. An element pattern must be irrefutable, so a
+literal element (`let [1, y] = a;`) is rejected rather than mis-bound; a
+two-`..` pattern, an out-of-range fixed index, and `mut` on a non-binding are
+rejected too. Array patterns are also accepted in `match`, `if let` and `while
+let` arms, and as a `for` head (`for [x, y] in pairs`), with the same grammar.
 A `let` or parameter without `mut` is
 immutable: assigning it (rustc's `E0384`), assigning a field or element of it
 (`E0594`), or taking `&mut` of it (`E0596`) is rejected. Add `mut` (or `mut x:
@@ -255,7 +291,10 @@ at run time only when `--overflow-checks` is on. `for` bounds are evaluated
 once, before the loop; `continue` still runs the increment. `for x in arr`
 iterates an array by value: the head is evaluated once, the bound is the
 array's compile-time length, and `x` is a fresh immutable binding each
-iteration. Only a binding or `_` may be the loop variable; `for x in &arr`
+iteration. The loop variable may be a binding, `_`, or a struct pattern
+(`for S { f, .. } in arr`), an array pattern (`for [x, y] in pairs`), which binds
+each element's fields or elements fresh each iteration; any other pattern is
+refutable and rejected. `for x in &arr`
 (which Rust iterates by reference) is rejected rather than mistyped. `while let` is
 `loop { if let PAT = expr { body } else { break; } }`: the scrutinee is
 re-evaluated every iteration, and `continue` re-tests it rather than jumping to
@@ -269,7 +308,12 @@ since those diverge and no expression can follow them. A whole block that
 cannot complete is `!` too, so it fits any expected type: `fn f(e: E) -> i64 {
 match e { E::A => { return 1; } E::B => { return 2; } } }` (every arm returns),
 `let x: i64 = if c { return 1; } else { return 2; };`, and `fn g() -> i64 {
-loop {} }` are all accepted, matching rustc.
+loop {} }` are all accepted, matching rustc. An *unannotated* binding whose
+initializer diverges keeps type `!`, though, and rmc has no usage-based
+inference to refine it, so using it as a place is rejected: both
+`let x = { return 3; }; x + 1` and `let S { a } = { return 3; };` are errors
+where rustc accepts them (it never needs the value). Add an annotation
+(`let x: i64 = { return 3; };`) to accept them.
 
 `loop` is an expression: `break v` makes the loop itself evaluate to `v`, so
 `let x: i64 = loop { ... break 5; };` is accepted. Every `break` in the loop
@@ -353,8 +397,9 @@ compile-time constant is decided at compile time, not by the trap.
 - `match` on integers, enums or strings: `match x { 0 => a, 1 => b, _ => c }`,
   `match c { Color::Red => a, _ => b }` or `match s { "on" => a, _ => b }`. An
   arm pattern is an integer literal (optionally negated), an integer *range*
-  `lo..hi` / `lo..=hi`, a *string* literal, an `Enum::Variant`, an *or-pattern*
-  `a | b | c`, or `_`. The first matching arm
+  `lo..hi` / `lo..=hi`, a *string* literal, an `Enum::Variant`, a struct
+  pattern `S { f, .. }` (see below), an *or-pattern* `a | b | c`, or `_`. The
+  first matching arm
   runs and `_` matches anything; it is an expression, usable as a statement or a
   value, and a comma before `}` may be omitted. An arm body is an expression,
   but a bare assignment (`0 => acc = 1`), a compound assignment
@@ -391,9 +436,79 @@ compile-time constant is decided at compile time, not by the trap.
   "not equal"; the pattern test is instead the same byte-wise comparison
   `==` uses, and so calls the runtime helper. A string pattern is never
   exhaustive on its own, so a `_` (or binding) arm is still required.
+- Struct patterns: `S { f, g: h, i: _, .. }` matches a `S` scrutinee and binds
+  its fields. A field may be shorthand (`f` binds `f`), renamed (`g: h` binds
+  `h`), or ignored (`i: _`); a trailing `..` drops the fields not named, and
+  `S { .. }` binds nothing. A binding may be made mutable with `mut`, written on
+  the binding (`mut f`, `g: mut h`), not on the pattern: `mut` is a per-binding
+  flag, as in rustc. A struct pattern is *irrefutable*: it has no runtime
+  test and always matches, so it acts as a catch-all arm (like `_`) and needs no
+  other arm to make a `match` exhaustive. A field is an ordinary place read, so
+  it may auto-deref a `&S` scrutinee. A struct-typed field may itself be
+  destructured by a nested struct sub-pattern, `i: I { a }` (to any depth), which
+  expands to a chain of field reads; the sub-pattern binds its own fields and may
+  use shorthand, renames, `_` and `..` like the top level. An array-typed field
+  may likewise be destructured by an array pattern, `a: [x, y]`, whose elements
+  may in turn be struct patterns, so the two nesting directions compose. `mut`
+  attaches to a
+  binding, so `i: mut I { a }` and `a: mut [x, y]` are rejected, as in rustc. An
+  enum payload pattern,
+  by contrast, still only binds whole fields. A wrong field name is an error,
+  even for `i: _`, and a field bound twice is an error. Because a struct pattern
+  is irrefutable, a *binding* struct pattern in an or-pattern is rejected, as is
+  any binding alternative (a nested binding counts).
+- `let` destructuring: `let S { f, g: h, i: _, .. } = e;` uses the same struct
+  pattern grammar and binds the named fields as fresh locals in the enclosing
+  block, so they stay visible for the rest of it. The pattern is irrefutable by
+  construction, so there is no test; a type annotation is allowed after the
+  pattern (`let S { x, y }: S = e;`) and is checked against the scrutinee. The
+  scrutinee is evaluated exactly once. `mut` goes on each binding, so
+  `let mut S { .. } = e;` is rejected (`mut` must be attached to each individual
+  binding), while `let S { mut x, y: mut z } = e;` is accepted. As in `match`, a
+  field read may auto-deref a `&S` scrutinee, and a struct-typed field may be
+  destructured by a nested sub-pattern (`let S { a: I { x } } = e;`), which
+  expands to a chain of field reads; an array-typed field may be destructured by
+  an array pattern (`let S { a: [x, y] } = e;`), which expands to field reads
+  followed by index reads.
+- Array patterns: `[a, b, .., c]` matches an array and binds its elements. Each
+  element is a sub-pattern: a binding (`a`), an ignored element (`_`), or a
+  nested array or struct pattern (`[[p, q], s]`, `[P { x }, y]`). A single `..`
+  absorbs any number of middle elements, so `[first, ..]`, `[.., last]` and
+  `[x, .., z]` all work; a second `..` is rejected. An element may be made
+  mutable with `mut` on the binding (`[mut a, b]`), not on the pattern as a
+  whole (`let mut [a, b] = e;` is rejected, as in rustc). An array pattern is
+  *irrefutable* when every element pattern is, so it has no runtime test and
+  acts as a catch-all: it works in `let` (`let [a, b] = e;`), `for`
+  (`for [x, y] in pairs`), `match` (`match m { [a, b] => .. }`), `if let` and
+  `while let`, and as an array-typed struct field's sub-pattern
+  (`let S { a: [x, y], b } = s;`). It expands to one index read per element, so
+  a fixed element `j` reads `subj[j]` and a trailing element reads
+  `subj[subj.len() - k]` relative to the array's length. An element pattern must
+  be irrefutable: a literal element (`[1, y]`) is rejected rather than
+  mis-bound. An array pattern that binds
+  nothing (`[_, _]`, `[..]`) is accepted and still evaluates the scrutinee once.
+- `for` destructuring: `for S { f, g: h, i: _, .. } in arr { .. }` or
+  `for [x, y] in arr { .. }` iterates the array as above but destructures each
+  element with the same struct- or array-pattern grammar, binding the named
+  fields or elements fresh each iteration. The array head is evaluated once,
+  outside the loop. `break`/`continue` and a label behave as for any other
+  `for`. The pattern must be irrefutable, so only a binding, `_`, a struct
+  pattern or an array pattern is allowed; `mut` goes on each binding, as in
+  `let` destructuring.
+- Parameter patterns: `fn f(S { f, g: h, i: _, .. }: S)` or
+  `fn f([a, b]: [i64; 2])` writes a parameter as a pattern. The parameter itself
+  is an ordinary argument of the annotation's type; the pattern binds its names
+  at the top of the body, exactly as the matching `let` destructuring would, so
+  the same field- and element-read expansion applies and the names read through
+  the parameter. The pattern must be irrefutable, so only a binding, a struct
+  pattern or an array pattern is allowed (a literal or variant is rejected, as
+  rustc rejects it); `mut` goes on each binding, so `mut S { x }: S` is rejected.
+  A name a pattern binds may not collide with another parameter (rustc's
+  `E0415`).
 - `if let PAT = EXPR { .. } else { .. }`, sugar for
   `match EXPR { PAT => then, _ => else_or_unit }`. It reuses the `match` pattern
-  grammar (including or-patterns and ranges, `if let 1..=5 = x`), but unlike
+  grammar (including or-patterns, ranges, struct patterns and array patterns,
+  `if let 1..=5 = x`), but unlike
   `match` it need not be exhaustive: a non-matching value
   falls through to the `_` arm. An `else` is optional; with none and a non-unit
   `then`, the branch types differ and the program is rejected, exactly as rustc
