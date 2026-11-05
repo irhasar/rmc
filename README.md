@@ -222,7 +222,7 @@ same patterns
 (desugared to a two-arm `match`); `break` (with a value in a `loop`, so `loop`
 works as an expression), `continue`,
 `return`; arithmetic, comparison, bitwise (`!`/`&`/`|`/`^`) and shift (`<<`/`>>`)
-operators; `&&`/`||`; string literals (compared by content with `==`/`!=`/`<`/`<=`/`>`/`>=`); `mut` enforcement and definite
+operators; `&&`/`||`; string literals (compared by content with `==`/`!=`/`<`/`<=`/`>`/`>=`, with `.len()` for the byte length); array `.len()` (a compile-time constant); `mut` enforcement and definite
 initialisation; `const` items (folded to a value and substituted at every use,
 including array lengths and `match` patterns); references (`&T` / `&mut T`, `&e`, `*e`,
 with auto-deref for `r.x`, `r[i]` and `r.m()`, and `&self` receivers);

@@ -1139,6 +1139,40 @@ fn an_integer_pattern_against_a_string_is_rejected() {
 }
 
 #[test]
+fn str_len_lowers_to_the_runtime_helper() {
+    // `s.len()` is the string record's first word, read by the runtime helper;
+    // a struct field access would read the wrong offset (the record is
+    // `{len, bytes..}`, so field 0 is the length, but a `str` is a pointer, so
+    // the load must be indirect).
+    let out = asm("fn main() -> i64 { let s = \"hello\"; return s.len(); }");
+    assert!(out.contains("call __rmc_str_len"), "len helper emitted: {out}");
+}
+
+#[test]
+fn array_len_folds_to_the_constant() {
+    // An array's length is known at compile time, so `a.len()` is a constant
+    // with no runtime work at all.
+    let out = asm("fn main() -> i64 { let a = [1, 2, 3]; return a.len(); }");
+    assert!(out.contains("mov $3, %rax"), "length folded: {out}");
+    assert!(!out.contains("call __rmc_str_len"), "no runtime helper: {out}");
+}
+
+#[test]
+fn the_string_len_helper_is_dropped_when_unused() {
+    // The runtime is linked piece by piece; a program that never calls
+    // `str::len` must not carry the helper.
+    let out = asm("fn main() -> i64 { return 0; }");
+    assert!(!out.contains("__rmc_str_len"), "unused helper dropped: {out}");
+}
+
+#[test]
+fn len_with_arguments_is_rejected() {
+    let bad = "fn main() -> i64 { return \"x\".len(1); }";
+    let err = compile_to_asm(bad, &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("takes no arguments"), "got: {err}");
+}
+
+#[test]
 fn argument_setup_folds_a_constant_with_lea() {
     // `fib(n - 1)` must become one `lea`, not `mov; sub; mov`.
     let out = asm_no_inline("fn f(n: i64) -> i64 { return n; } fn g(n: i64) -> i64 { return f(n - 1); } fn main() -> i64 { return g(5); }");

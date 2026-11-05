@@ -312,7 +312,10 @@ compile-time constant is decided at compile time, not by the trap.
   A string is not an `i64`: it cannot be an arithmetic operand and cannot be
   passed where an `i64` is expected. Two strings may be compared with `==`,
   `!=`, `<`, `<=`, `>` and `>=`, which compare their bytes, not their addresses;
-  `print_str` writes one to standard output.
+  `print_str` writes one to standard output. `s.len()` gives the byte length:
+  it reads the record's length word (a runtime helper, since a `str` is a
+  pointer), and is an `i64` where rustc's is a `usize`. `a.len()` on an array of
+  length `N` is the compile-time constant `N`, with no runtime work.
 
 ## Builtins
 

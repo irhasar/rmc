@@ -251,6 +251,20 @@ __rmc_str_lt:
     },
     Piece {
         text: r#"
+# long __rmc_str_len(long s)  -- the byte length of the string record at `s`,
+# which is `{len: i64, bytes...}`. A `str` value is the address of its record,
+# so `s.len()` is the record's first word; sema lowers it to a call here.
+.globl __rmc_str_len
+.type __rmc_str_len, @function
+__rmc_str_len:
+    mov (%rdi), %rax         # len(s)
+    ret
+.size __rmc_str_len, .-__rmc_str_len
+"#,
+        defines: &["__rmc_str_len"],
+    },
+    Piece {
+        text: r#"
 # void print_bool(bool b)  -- prints 0 or 1 followed by a newline
 .globl print_bool
 .type print_bool, @function
