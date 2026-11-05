@@ -61,6 +61,15 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   so sema and codegen have no `match` case. A non-`Var`/`Int` scrutinee is bound
   to a hidden `let` first, so a call in the scrutinee runs once. An arm after
   `_` is unreachable and dropped (the `_` body becomes the `else`).
+  An arm *body* is parsed by `parse_arm_body`, not `parse_expr`: assignment is
+  only a statement here, so a bare `0 => acc = 1` would otherwise stop at the
+  `=` and fail, and `return`/`break`/`continue` would be rejected outright.
+  `parse_arm_body` builds an `Assign` for `expr = value` and `expr op= value`
+  (via `desugar_compound`), or a `Return`/`Break`/`Continue` statement, and
+  wraps it in a `Block`; the block is what `match_arm` places as the branch
+  expression. A terminator's optional value stops at the arm's `,`/`}`
+  (`arm_terminator_value`), so `0 => return 5,` keeps the comma for the arm
+  list. Only `match` arms use it: `if let`/`while let` bodies are blocks.
   An arm pattern may be an integer, a *range* `lo..hi`/`lo..=hi`, a *string
   literal*, an `Enum::Variant`, an *or-pattern* `a | b | c`, or `_`. A range
   desugars to `Bin(And, Le, Lt/Le)`, an or-pattern to `Bin(Or, ..)` over the
@@ -163,7 +172,10 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   loop is division-bound and does not notice its own memory traffic while the
   outer counters `x`/`y`/`size`/`acc` pay a store and reload on every iteration.
   `promote` ranks by the raw mention count on purpose; measure before touching it
-  (the full account is in `docs/design.md`).
+  (the full account is in `docs/design.md`). A depth *tiebreak* (same count,
+  prefer the deeper loop) fails the same way: mandel's five locals tie at four
+  mentions, the tiebreak promotes the innermost `i` and demotes `x`, and mandel
+  goes 31.7 -> 32.4 ms.
 - **A local whose address is taken must be forced into memory before promotion.**
   The promotion pass picks the hottest scalar locals and keeps them only in
   registers, so their frame slot goes stale. `&x` needs `x` to be in memory, so

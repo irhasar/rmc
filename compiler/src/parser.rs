@@ -1163,7 +1163,7 @@ impl Parser {
             }
             let pat = self.parse_pattern()?;
             self.expect(Tok::FatArrow)?;
-            let body = self.parse_expr()?;
+            let body = self.parse_arm_body()?;
             arms.push((pat, body));
             // A comma separates arms, but a block-bodied arm may omit it, so
             // only `}` ends the list early.
@@ -1179,6 +1179,55 @@ impl Parser {
             return Err(format!("at byte {}: `match` needs at least one arm", self.pos()));
         }
         Ok(self.desugar_match(scrutinee, arms))
+    }
+
+    /// Parse a `match` arm body. As in Rust, an arm body is an expression, but a
+    /// statement is also accepted: a bare assignment (`1 => x = 1`), or a
+    /// `return`/`break`/`continue`. rmc parses those only as statements, so
+    /// `parse_expr` would stop at the `=` or reject the keyword outright.
+    /// Accepting them here keeps an arm body from having to be wrapped in a
+    /// block. `if let`/`while let` bodies are blocks, so they do not reach this.
+    fn parse_arm_body(&mut self) -> PResult<Expr> {
+        // A terminator is a statement, not an expression: build the block and
+        // leave the arm's `,`/`}` for the caller. The value, if any, is an
+        // expression that stops before that terminator.
+        let stmt = match self.peek() {
+            Some(Tok::Return) => {
+                self.i += 1;
+                Stmt::Return(self.arm_terminator_value()?)
+            }
+            Some(Tok::Break) => {
+                self.i += 1;
+                Stmt::Break(self.arm_terminator_value()?)
+            }
+            Some(Tok::Continue) => {
+                self.i += 1;
+                Stmt::Continue
+            }
+            _ => {
+                let target = self.parse_expr()?;
+                if self.eat(&Tok::Eq) {
+                    Stmt::Assign { target, value: self.parse_expr()? }
+                } else if let Some(op) = self.peek_compound_op() {
+                    self.i += 1;
+                    let value = self.parse_expr()?;
+                    self.desugar_compound(&target, op, value)
+                } else {
+                    return Ok(target);
+                }
+            }
+        };
+        Ok(Expr::Block(Block { stmts: vec![stmt], tail: None }))
+    }
+
+    /// The optional value of a `return`/`break` arm body: absent when the arm
+    /// ends right there (`,` or `}`), otherwise the following expression.
+    fn arm_terminator_value(&mut self) -> PResult<Option<Expr>> {
+        if self.peek() == Some(&Tok::Comma) || self.peek() == Some(&Tok::RBrace) {
+            Ok(None)
+        } else {
+            Ok(Some(self.parse_expr()?))
+        }
     }
 
     /// If a `..`/`..=` follows the integer just parsed, consume it and the
