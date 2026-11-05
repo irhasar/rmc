@@ -237,6 +237,16 @@ fn is_unsupported_builtin(name: &str) -> bool {
     name.contains("::") || name.starts_with('<') || name == "rust_begin_unwind"
 }
 
+/// Append the user-visible feature name to a back-end error, when the rejected
+/// fragment matches a known Rust construct. Keeps the raw MIR in the message
+/// (useful in a bug report) but tells the user what they actually wrote.
+fn unsupported_note(msg: &str, fragment: &str) -> String {
+    match crate::mir::classify_unsupported(fragment) {
+        Some(h) => format!("{msg}\n  note: {h}"),
+        None => msg.to_string(),
+    }
+}
+
 /// The System V integer argument registers, in order.
 const ARG_REGS: [&str; 6] = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"];
 
@@ -1096,6 +1106,13 @@ impl<'a> FnGen<'a> {
         // registers live directly below `%rbp`, but `%rsp` is still at the
         // bottom of the frame, so it has to be moved back up first.
         let _ = writeln!(self.out, ".Lret_{}:", self.func.name);
+        // `_start` passes `main`'s `%rax` straight to `exit(2)`, so a `main`
+        // that returns `()` must define it. The ABI leaves `%rax` unspecified
+        // for a unit return, so without this the process exits with whatever
+        // the last statement happened to leave in the register.
+        if self.func.name == "main" && self.local_ty(0) == Ty::Unit {
+            self.out.push_str("  xor %eax, %eax\n");
+        }
         if saved_bytes > 0 {
             let _ = writeln!(self.out, "  lea -{saved_bytes}(%rbp), %rsp");
         }
@@ -1963,7 +1980,10 @@ impl<'a> FnGen<'a> {
                     UnOp::Not => self.emit("  xor $1, %rax"),
                     UnOp::Neg => self.emit("  neg %rax"),
                     UnOp::PtrMetadata => {
-                        return Err("mir_codegen: PtrMetadata (slice length) unsupported".into())
+                        return Err(unsupported_note(
+                            "mir_codegen: PtrMetadata (slice length) unsupported",
+                            "PtrMetadata",
+                        ))
                     }
                 }
                 self.store_scalar(dest, "%rax")?;
@@ -2062,7 +2082,10 @@ impl<'a> FnGen<'a> {
                 self.store_scalar(&flag, "%rax")?;
             }
             Rvalue::Unsupported(s) => {
-                return Err(format!("mir_codegen: unsupported rvalue `{s}`"));
+                return Err(unsupported_note(
+                    &format!("mir_codegen: unsupported rvalue `{s}`"),
+                    s,
+                ));
             }
         }
         Ok(())

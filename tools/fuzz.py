@@ -2232,6 +2232,98 @@ def run_robust():
     return 1 if failures else 0
 
 
+# ---------------------------------------------------- MIR-path robust mode
+
+def mir_robust_corpus():
+    """`.rs` programs the rustc-MIR back end may not support. Each must produce
+    a clean error (exit 1) with no panic and no signal. The back end parses
+    rustc's MIR text, so the failure mode a user hits first is not a syntax
+    error in their own source but a MIR shape the parser does not model; this
+    corpus is weighted toward the Rust constructs that produce those shapes
+    (formatting, the standard-library containers, closures, floating point,
+    traits) plus malformed programs that must fail at the rustc front end."""
+    return {
+        # --- ordinary programs whose MIR the back end does not model ---
+        "fmt_display": 'fn main() { let n = 42; println!("n = {}", n); }\n',
+        "fmt_debug": 'fn main() { let t = (1, 2); println!("{:?}", t); }\n',
+        "fmt_hex": 'fn main() { println!("{:#x}", 255); }\n',
+        "fmt_width": 'fn main() { println!("{:>5}", 1); }\n',
+        "fmt_named": 'fn main() { println!("{n}", n = 3); }\n',
+        "print_macro": 'fn main() { print!("no newline"); }\n',
+        "eprintln_macro": 'fn main() { eprintln!("to stderr"); }\n',
+        "format_macro": 'fn main() { let s = format!("{}-{}", 1, 2); println!("{}", s); }\n',
+        "vec_push": "fn main() { let mut v = Vec::new(); v.push(1); }\n",
+        "vec_macro": "fn main() { let v = vec![1, 2, 3]; let _ = v[0]; }\n",
+        "string_new": "fn main() { let s = String::new(); }\n",
+        "box_new": "fn main() { let b = Box::new(5); }\n",
+        "hashmap": "use std::collections::HashMap;\nfn main() { let mut m = HashMap::new(); m.insert(1, 2); }\n",
+        "closure": "fn main() { let f = |x: i64| x + 1; let _ = f(2); }\n",
+        "closure_capture": "fn main() { let n = 3; let f = |x: i64| x + n; let _ = f(2); }\n",
+        "float": "fn main() { let x = 1.5; let _ = x * 2.0; }\n",
+        "float_fmt": 'fn main() { println!("{:.2}", 3.14159); }\n',
+        "i128": "fn main() { let a: i128 = 1; let _ = a; }\n",
+        "trait_method": "trait S { fn a(&self) -> i64; }\nstruct Q;\nimpl S for Q { fn a(&self) -> i64 { 3 } }\nfn main() { let _ = Q.a(); }\n",
+        "generic_fn": "fn id<T>(x: T) -> T { x }\nfn main() { let _ = id(5); }\n",
+        "dyn_trait": "trait S { fn a(&self) -> i64; }\nfn f(s: &dyn S) -> i64 { s.a() }\nstruct Q;\nimpl S for Q { fn a(&self) -> i64 { 1 } }\nfn main() { let _ = f(&Q); }\n",
+        "iterator_chain": "fn main() { let s: i64 = (1..10).filter(|x| x % 2 == 0).sum(); let _ = s; }\n",
+        "slice_len": 'fn main() { let s = "abc"; let _ = s.len(); }\n',
+        "option_debug": "fn main() { let o: Option<i64> = Some(5); println!(\"{:?}\", o); }\n",
+        "panic_macro": 'fn main() { panic!("boom"); }\n',
+        "assert_macro": "fn main() { assert!(1 == 2); }\n",
+        "derive_debug": '#[derive(Debug)]\nstruct P { x: i64 }\nfn main() { println!("{:?}", P { x: 1 }); }\n',
+        "string_index": 'fn main() { let s = "hello"; let _ = &s[1..3]; }\n',
+        "char_type": "fn main() { let c = 'x'; println!(\"{}\", c); }\n",
+        # --- programs rustc itself rejects: must fail, cleanly ---
+        "rustc_reject_type": "fn main() { let x: i64 = \"str\"; }\n",
+        "rustc_reject_move": "fn main() { let s = String::from(\"a\"); let t = s; let u = s; }\n",
+        "rustc_reject_undef": "fn main() { undefined_function(); }\n",
+        "rustc_reject_main_sig": "fn main() -> i64 { 0 }\n",
+        "rustc_reject_no_main": "fn f() -> i64 { 0 }\n",
+        "rustc_reject_syntax": "fn main( { }\n",
+        "rustc_reject_empty": "",
+        "rustc_reject_lone": "fn",
+        # --- malformed that must not crash the MIR parser either ---
+        "truncated_fn": "fn main() {\n",
+        "stray_brace": "}\n",
+        "binary_garbage": "\x00\x01\x02\x03",
+        "deep_nest": "fn main() { let x = " + "(" * 2000 + "1" + ")" * 2000 + "; }\n",
+        "huge_literal": "fn main() { let x: i64 = " + "9" * 3000 + "; }\n",
+    }
+
+
+def run_mir_robust():
+    """Compile each `.rs` corpus entry through the MIR path and require a clean
+    failure: exit 1, no signal, no panic, no stack overflow. A program that
+    compiles is fine too (exit 0), as long as it does not crash. Unlike
+    `robust`, which is about rmc's own parser, this exercises the MIR parser and
+    back end, where a rejected construct must still be a diagnostic."""
+    tmp = f"/tmp/rmc-fuzz-mirrobust-{os.getpid()}"
+    os.makedirs(tmp, exist_ok=True)
+    failures = 0
+    compiled = 0
+    for name, src in mir_robust_corpus().items():
+        path = f"{tmp}/{name}.rs"
+        with open(path, "w") as f:
+            f.write(src)
+        p = run([RMC, path, "-o", f"{tmp}/{name}.bin"])
+        crashed = (p.returncode < 0 or b"panicked" in p.stderr
+                   or b"overflowed its stack" in p.stderr)
+        if crashed:
+            print(f"[mirrobust] {name}: CRASH (exit {p.returncode}) "
+                  f"{p.stderr.decode(errors='replace')[:200]}")
+            failures += 1
+        elif p.returncode not in (0, 1):
+            print(f"[mirrobust] {name}: unexpected exit {p.returncode}")
+            failures += 1
+        elif p.returncode == 0:
+            compiled += 1
+    if failures == 0:
+        n = len(mir_robust_corpus())
+        print(f"mirrobust: all {n} inputs handled cleanly ({compiled} compiled, "
+              f"{n - compiled} rejected with a diagnostic)")
+    return 1 if failures else 0
+
+
 # -------------------------------------------------------------- reject mode
 
 def reject_corpus():
@@ -2897,7 +2989,7 @@ def run_mir(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "robust", "reject", "mir"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "robust", "mirrobust", "reject", "mir"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -2919,6 +3011,11 @@ def main():
         return 2
     if args.mode == "robust":
         return run_robust()
+    if args.mode == "mirrobust":
+        if not rustc_available():
+            print("rustc not found; set RUSTC or install a toolchain", file=sys.stderr)
+            return 2
+        return run_mir_robust()
     if args.mode == "mir":
         if not rustc_available():
             print("rustc not found; set RUSTC or install a toolchain", file=sys.stderr)

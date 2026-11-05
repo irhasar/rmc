@@ -816,7 +816,16 @@ fn parse_fn(lines: &[String], start: usize) -> Result<(Function, usize), String>
         match parse_line_stmt(t) {
             Ok(Some(s)) => blocks[n as usize].stmts.push(s),
             Ok(None) => {}
-            Err(e) => return Err(format!("mir: {e} (in `{name}`): {t}")),
+            Err(e) => {
+                // `parse_line_stmt` and its callees both prefix with `mir: `;
+                // keep one. Then name the Rust feature when we recognise it.
+                let e = e.strip_prefix("mir: ").unwrap_or(&e);
+                let hint = match classify_unsupported(t) {
+                    Some(h) => format!("\n  note: {h}"),
+                    None => String::new(),
+                };
+                return Err(format!("mir: {e} (in `{name}`): {t}{hint}"));
+            }
         }
     }
 
@@ -928,6 +937,9 @@ fn is_ignorable(t: &str) -> bool {
             | "Nop" | "Retag" | "PlaceMention" | "Deinit" | "ConstEvalCounter"
             | "SetDiscriminant" | "discriminant" | "debug" | "storage" | "var_debug_info"
             | "SourceScope" | "SourceScopeData"
+            // `assume(cond)` is an optimisation hint: rustc already relied on it
+            // to justify the surrounding code, and codegen needs no action.
+            | "assume"
     ) || t.starts_with("//")
 }
 
@@ -998,6 +1010,14 @@ fn parse_terminator(t: &str) -> Option<Terminator> {
         return Some(Terminator::Goto(parse_bb_id(rest.trim())?));
     }
     if t.starts_with("switchInt(") {
+        // `switchInt(OverflowChecks)` branches on whether the crate was built
+        // with overflow checks. The front end always runs `-O` with them off,
+        // so the `0:` arm is the one taken; the `otherwise` arm is dead. Folding
+        // it here keeps the branch out of the back end rather than teaching it
+        // about a compile-time constant it can never see vary.
+        if let Some(target) = parse_overflow_checks_switch(t) {
+            return Some(target);
+        }
         return Some(parse_switch(t).ok()?);
     }
     if t == "return;" || t == "return" {
@@ -1039,6 +1059,28 @@ fn parse_terminator(t: &str) -> Option<Terminator> {
     }
     if t.starts_with("StorageLive") || t.starts_with("StorageDead") || t == "Nop;" {
         return None;
+    }
+    None
+}
+
+/// `switchInt(OverflowChecks) -> [0: bbX, otherwise: bbY]` folds to `goto bbX`:
+/// the front end always compiles with overflow checks off, so `0` is the only
+/// arm that can be taken.
+fn parse_overflow_checks_switch(t: &str) -> Option<Terminator> {
+    let open = t.find('(')?;
+    let close = matching(t, open, '(', ')')?;
+    if t[open + 1..close].trim() != "OverflowChecks" {
+        return None;
+    }
+    let after = t[close + 1..].trim().strip_prefix("->")?.trim();
+    let inner = after.trim_start_matches('[').trim_end_matches(']').trim_end_matches(';');
+    for part in inner.split(',') {
+        let p = part.trim();
+        if let Some((val, bb)) = p.split_once(':') {
+            if val.trim().trim_end_matches("_bool").trim() == "0" {
+                return Some(Terminator::Goto(parse_bb_id(bb.trim())?));
+            }
+        }
     }
     None
 }
@@ -1409,6 +1451,72 @@ fn parse_operand(s: &str) -> Result<Operand, String> {
         return Ok(Operand::Const(c));
     }
     Err(format!("mir: not an operand `{s}`"))
+}
+
+/// Map a raw MIR fragment the parser rejected to the user-visible Rust feature
+/// it comes from, so the diagnostic names the limitation instead of quoting a
+/// rustc-internal type. This is a message-quality layer only: an unrecognised
+/// fragment still fails, it just fails with advice.
+pub fn classify_unsupported(fragment: &str) -> Option<&'static str> {
+    let s = fragment;
+    let has = |needle: &str| s.contains(needle);
+    // Order matters: the most specific construct first.
+    if has("::fmt::Display>::fmt")
+        || has("::fmt::Debug>::fmt")
+        || has("::fmt::LowerHex>::fmt")
+        || has("::fmt::UpperHex>::fmt")
+        || has("::fmt::Binary>::fmt")
+        || has("::fmt::Pointer>::fmt")
+        || has("::fmt::Octal>::fmt")
+    {
+        return Some("`{}`/`{:?}` formatting (rustc's `core::fmt`) is not implemented on the MIR path; write the value with `print_i64`/`print_str` instead");
+    }
+    if has("core::fmt::Arguments") || has("core::fmt::rt::Argument") || has("std::io::_print") {
+        return Some("`print!`/`println!` formatting is not implemented on the MIR path; write the value with `print_i64`/`print_str` instead");
+    }
+    if has("PointerCoercion(ReifyFnPointer") {
+        return Some("taking a function or method as a value is not implemented on the MIR path");
+    }
+    if has("ReifyFnPointer") || has("as *const ()") && has("unsafe fn") {
+        return Some("function pointers are not implemented on the MIR path");
+    }
+    if has("as &dyn ") || has("Unsize") && has("dyn") {
+        return Some("`dyn Trait` objects are not implemented on the MIR path");
+    }
+    if has("PtrMetadata") {
+        return Some("slice length / `str::len` (`PtrMetadata`) is not implemented on the MIR path");
+    }
+    if has("PhantomData") {
+        return Some("a zero-sized marker field (e.g. `PhantomData`) is not implemented on the MIR path");
+    }
+    if has("NonZero") || has("UsizeNoHighBit") || has("Unique::") || has("alloc::raw_vec") {
+        return Some("the standard library's container internals (`Vec`/`String`) are not implemented on the MIR path");
+    }
+    if has("Vec<") || has("String") || has("HashMap") || has("Box<") || has("Rc<") {
+        return Some("the standard library's heap containers (`Vec`/`String`/`Box`/`Rc`) are not implemented on the MIR path");
+    }
+    if has("Option<") && has("as core::fmt") {
+        return Some("`{:?}` on an `Option` is not implemented on the MIR path");
+    }
+    if has("::from_iter") || has("SpecFromIter") {
+        return Some("iterator adapters (`map`/`filter`/`collect`) are not implemented on the MIR path");
+    }
+    if has("as Fn<") || has("FnOnce") || has("FnMut") {
+        return Some("closures and the `Fn` traits are not implemented on the MIR path");
+    }
+    if has("{closure@") || has("closure#") {
+        return Some("closures are not implemented on the MIR path");
+    }
+    if has("f64") || has("f32") {
+        return Some("floating-point types are not implemented on the MIR path");
+    }
+    if has("i128") || has("u128") {
+        return Some("128-bit integers are not implemented on the MIR path");
+    }
+    if has("::promoted[") {
+        return Some("a promoted constant the back end cannot fold is not implemented on the MIR path");
+    }
+    None
 }
 
 fn parse_const(s: &str) -> Option<Const> {
