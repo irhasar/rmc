@@ -153,7 +153,7 @@ overflowing arithmetic near `i64::MAX` (the only mode that makes the
 `--overflow-checks` trap fire), `nest` for nested aggregates with a deep copy
 and a nested-path write, `pat` for `match` expressions (multi-variant enums,
 two-field payloads, `bool` matches, binding patterns, nested matches, `if let`,
-string patterns, and a side-effecting scrutinee), and `order` for assignment evaluation order (a
+string patterns, per-arm guards, and a side-effecting scrutinee), and `order` for assignment evaluation order (a
 side-effecting index and value on both `=` and every compound operator, the
 shapes `stmt` never assigns through). `shift` drives `<<`, `>>` and the compound
 `<<=`/`>>=` with a shift count from `argv`, so the count is opaque to the
@@ -217,7 +217,8 @@ functions with up to six parameters; `let` / `let mut`; assignment to variables,
 array elements and struct fields (including compound `+=` and friends);
 `if`/`else`, `while`, `loop`, and `for i in a..b` / `a..=b`; `match` on integers,
 `bool`s, enums and strings (literal, `true`/`false`, string, `Enum::Variant` and
-`_` patterns, plus payload bindings and binding names) and `if let` with the
+`_` patterns, plus payload bindings and binding names, and a per-arm guard
+`PAT if COND`) and `if let` with the
 same patterns
 (desugared to a two-arm `match`); `break` (with a value in a `loop`, so `loop`
 works as an expression), `continue`,

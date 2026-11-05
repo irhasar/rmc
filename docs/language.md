@@ -281,7 +281,17 @@ compile-time constant is decided at compile time, not by the trap.
   value, and a comma before `}` may be omitted. An arm body is an expression,
   but a bare assignment (`0 => acc = 1`), a compound assignment
   (`1 => acc += 10`), or a `return`/`break`/`continue` is accepted as well, as
-  in Rust; a block-bodied arm (`_ => {}`) also works. A `match` must be exhaustive,
+  in Rust; a block-bodied arm (`_ => {}`) also works.
+- Guards: an arm may carry a condition, `PAT if COND => body`. `COND` is any
+  `bool` expression, parsed like an `if` condition, and may read the pattern's
+  bindings (`Opt::Some(v) if v > 10 => ..`). The arm runs only when the pattern
+  matches *and* the guard holds; otherwise the following arms are tried, so a
+  guard is evaluated at most once, in order, and only after its pattern
+  matched. A guarded arm covers **nothing** for exhaustiveness — the guard may
+  be false — so `match x { n if n > 3 => 1 }` is non-exhaustive even though `n`
+  binds every value, and `match e { E::A if c => 1, E::B => 2 }` still needs a
+  `_` or a `E::A` arm without a guard, exactly as rustc's E0004 requires.
+- A `match` must be exhaustive,
   exactly as in Rust: an arm must be `_` (or a binding name), or the arms must
   name *every* variant of one enum (including across or-patterns, so
   `Color::Red | Color::Green => .., Color::Blue => ..` is exhaustive). A
