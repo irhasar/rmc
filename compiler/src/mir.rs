@@ -2182,6 +2182,138 @@ impl Function {
     }
 }
 
+/// Order the blocks so that a branch and its likely target are adjacent, and
+/// the target is the fall-through. The back end emits blocks in index order and
+/// drops a `goto` to the next block, so a good order removes one taken branch
+/// per conditional.
+///
+/// The fall-through is chosen as the successor that stays inside a loop when
+/// there is one. A loop's body is reached from its header every iteration, so
+/// it is the hot edge; the exit is taken once. This matters for an early-exit
+/// test (`if c { break; }`), where the explicit target is the cold exit, not
+/// the body.
+pub fn layout_blocks(prog: &mut Program) {
+    for f in &mut prog.funcs {
+        f.layout_blocks();
+    }
+}
+
+impl Function {
+    fn layout_blocks(&mut self) {
+        let n = self.blocks.len();
+        if n <= 1 {
+            return;
+        }
+        let succs: Vec<Vec<u32>> = self.blocks.iter().map(|b| successors(&b.term)).collect();
+        // `reach[b]` marks every block reachable from `b`. A block on a cycle
+        // (it can reach itself) is loop-internal, and any block that reaches one
+        // is on the loop's path from the entry.
+        let mut reach: Vec<Vec<bool>> = vec![vec![false; n]; n];
+        for b in 0..n {
+            reach[b][b] = true;
+            let mut stack = vec![b];
+            while let Some(x) = stack.pop() {
+                for &s in &succs[x] {
+                    if !reach[b][s as usize] {
+                        reach[b][s as usize] = true;
+                        stack.push(s as usize);
+                    }
+                }
+            }
+        }
+        let hot: Vec<bool> = (0..n)
+            .map(|b| (0..n).any(|c| c != b && reach[b][c] && reach[c][b]))
+            .collect();
+
+        let mut placed = vec![false; n];
+        let mut order: Vec<u32> = Vec::with_capacity(n);
+        let mut stack: Vec<u32> = vec![0];
+        while let Some(start) = stack.pop() {
+            if placed[start as usize] {
+                continue;
+            }
+            let mut cur = start;
+            loop {
+                placed[cur as usize] = true;
+                order.push(cur);
+                let live: Vec<u32> = succs[cur as usize]
+                    .iter()
+                    .copied()
+                    .filter(|s| !placed[*s as usize])
+                    .collect();
+                if live.is_empty() {
+                    break;
+                }
+                // The loop-internal edge is the hot one; among those, the
+                // branch's taken arm is the likely one (a loop body, not its
+                // exit). Otherwise the explicit target of the terminator.
+                let taken = explicit_target(&self.blocks[cur as usize].term);
+                let next = live
+                    .iter()
+                    .copied()
+                    .find(|s| hot[*s as usize] && Some(*s) == taken)
+                    .or_else(|| live.iter().copied().find(|s| hot[*s as usize]))
+                    .or(taken)
+                    .filter(|p| live.contains(p))
+                    .unwrap_or(live[0]);
+                for s in live.iter().rev() {
+                    if *s != next {
+                        stack.push(*s);
+                    }
+                }
+                cur = next;
+            }
+        }
+        // Any block unreachable from the entry keeps its relative position.
+        for b in 0..n as u32 {
+            if !placed[b as usize] {
+                order.push(b);
+            }
+        }
+        let mut new_index = vec![u32::MAX; n];
+        for (i, b) in order.iter().enumerate() {
+            new_index[*b as usize] = i as u32;
+        }
+        let mut kept: Vec<BasicBlock> = Vec::with_capacity(n);
+        for b in &order {
+            kept.push(std::mem::replace(
+                &mut self.blocks[*b as usize],
+                BasicBlock { stmts: Vec::new(), term: Terminator::Unreachable },
+            ));
+        }
+        let remap = |t: u32| new_index[t as usize];
+        for blk in &mut kept {
+            match &mut blk.term {
+                Terminator::Goto(t) => *t = remap(*t),
+                Terminator::SwitchInt { targets, otherwise, .. } => {
+                    for (_, t) in targets.iter_mut() {
+                        *t = remap(*t);
+                    }
+                    *otherwise = remap(*otherwise);
+                }
+                Terminator::Call { target: Some(t), .. } => *t = remap(*t),
+                Terminator::Assert { target, .. } => *target = remap(*target),
+                _ => {}
+            }
+        }
+        self.blocks = kept;
+    }
+}
+
+/// The target a branch is most likely to take: the explicit arm of a
+/// conditional, the return block of a call, the target of a `goto`.
+fn explicit_target(t: &Terminator) -> Option<u32> {
+    match t {
+        Terminator::Goto(b) => Some(*b),
+        Terminator::SwitchInt { targets, otherwise, .. } => {
+            targets.first().map(|(_, b)| *b).or(Some(*otherwise))
+        }
+        Terminator::Call { target, .. } => *target,
+        Terminator::Assert { target, .. } => Some(*target),
+        _ => None,
+    }
+}
+
 /// Merge a block into its only successor when that successor has no other
 /// predecessor. The two then form one block, so a value defined in the first is
 /// visible to the second without a block boundary; the register allocator can

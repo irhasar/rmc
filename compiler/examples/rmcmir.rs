@@ -38,6 +38,7 @@ fn main() {
     prog.copy_propagate();
     rmc::mir::licm(&mut prog);
     rmc::mir::jump_thread(&mut prog);
+    rmc::mir::layout_blocks(&mut prog);
     match rmc::compile_mir_to_asm(&prog, &opts) {
         Ok(asm) => {
             if emit_asm {

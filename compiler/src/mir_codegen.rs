@@ -753,7 +753,7 @@ impl<'a> FnGen<'a> {
                 });
                 if t == u32::MAX {
                     self.emit(&format!("  jmp .Lret_{}", self.func.name));
-                } else {
+                } else if t != bb + 1 || t as usize >= self.func.blocks.len() {
                     self.emit(&format!("  jmp .Lbb{}", self.bb_label(t)));
                 }
             }
@@ -790,7 +790,9 @@ impl<'a> FnGen<'a> {
                 self.emit(&format!("  je .Lbb{}", self.bb_label(*t)));
             }
         }
-        self.emit(&format!("  jmp .Lbb{}", self.bb_label(otherwise)));
+        if otherwise != bb + 1 || otherwise as usize >= self.func.blocks.len() {
+            self.emit(&format!("  jmp .Lbb{}", self.bb_label(otherwise)));
+        }
         Ok(())
     }
 
@@ -822,8 +824,18 @@ impl<'a> FnGen<'a> {
         let Some((op, a, b)) = cmp else { return Ok(false) };
         self.emit_cmp(op, &a, &b)?;
         // Jump to `taken` when the comparison holds, else to `fallthrough`.
-        self.emit(&format!("  {} .Lbb{}", jcc(op), self.bb_label(taken)));
-        self.emit(&format!("  jmp .Lbb{}", self.bb_label(fallthrough)));
+        // Whichever arm is the next emitted block becomes the fall-through: when
+        // it is `taken` the branch is emitted on the complement, so a loop body
+        // that follows its header needs no jump at all.
+        let next = bb + 1;
+        if taken == next {
+            self.emit(&format!("  {} .Lbb{}", jcc(negate_cc(op)), self.bb_label(fallthrough)));
+        } else {
+            self.emit(&format!("  {} .Lbb{}", jcc(op), self.bb_label(taken)));
+            if fallthrough != next || fallthrough as usize >= self.func.blocks.len() {
+                self.emit(&format!("  jmp .Lbb{}", self.bb_label(fallthrough)));
+            }
+        }
         Ok(true)
     }
 
