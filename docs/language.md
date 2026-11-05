@@ -341,8 +341,9 @@ A loop may carry a label (`'a: loop`, `'a: while`, `'a: for`), and `break 'a` /
 innermost loop overall, so `break 'a` can leave several nested loops at once.
 `break 'a v` yields `v` from a labelled `loop` exactly as `break v` does. A label
 that names no enclosing loop is rejected (rustc's `E0426`). A label on `while
-let` is rejected rather than silently dropped, because `while let` desugars to a
-plain `loop` and the label would be lost.
+let` (`'a: while let PAT = EXPR { .. }`) attaches to the `loop` the statement
+desugars to, so `break 'a` / `continue 'a` in the body target it just as they
+would a labelled `while`.
 
 ## Overflow
 

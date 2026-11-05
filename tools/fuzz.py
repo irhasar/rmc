@@ -2337,6 +2337,11 @@ def robust_corpus():
         "enum_pat_ref_unterminated": b"enum E { A(i64), B } fn main() -> i64 { let e: E = E::A(1); return match &e { E::A(x ",
         "enum_pat_ref_deep_nested": b"struct S { a: S } enum E { A(S) } fn main() -> i64 { let e: E = E::A(S { a: e }); return match &e { "
             + b"E::A(S { a: " * 3000 + b"_" + b" })" * 3000 + b" => 0 }; }",
+        # A label on `while let` reaches the desugared `loop`; a malformed or
+        # deeply nested one must still error cleanly rather than panic.
+        "labelled_while_let_unterminated": b"enum E { A(i64), B } fn main() -> i64 { let mut e: E = E::A(1); 'a: while let E::A(x ",
+        "labelled_while_let_deep": b"enum E { A(i64), B } fn main() -> i64 { let mut e: E = E::A(1); 'a: while let E::A(x) = e { "
+            + b"if true { " * 3000 + b"break; " + b"}" * 3000 + b" break; } return 0; }",
     }
     return cases
 
@@ -2879,6 +2884,14 @@ def reject_corpus():
             "fn main() -> i64 { let x: i64 = 0; return match &x { E::A => 1, _ => 0 }; }\n",
             "enum E { A, B }\n"
             "fn main() { let x = 0i64; let _ = match &x { E::A => 1, _ => 0 }; }\n",
+        ),
+        # A label on `while let` now names the desugared `loop`, so an
+        # undeclared label there is still rustc's E0426.
+        "labelled_while_let_undeclared": (
+            "enum E { A(i64), B }\n"
+            "fn main() -> i64 { let mut e: E = E::A(1); while let E::A(x) = e { break 'nope; } return 0; }\n",
+            "enum E { A(i64), B }\n"
+            "fn main() { let mut e = E::A(1); while let E::A(x) = e { break 'nope; } }\n",
         ),
     }
 
