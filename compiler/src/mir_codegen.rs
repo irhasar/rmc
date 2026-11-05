@@ -687,6 +687,13 @@ impl<'a> FnGen<'a> {
     fn gen_term(&mut self, bb: u32, term: &Terminator) -> Result<(), String> {
         match term {
             Terminator::Goto(t) => {
+                // Falling through to the next block needs no jump; the blocks
+                // are emitted in index order, so `bb+1` is already the next
+                // instruction. This removes a taken jump from every block that
+                // would otherwise jump to its successor.
+                if *t == bb + 1 && (*t as usize) < self.func.blocks.len() {
+                    return Ok(());
+                }
                 self.emit(&format!("  jmp .Lbb{}", self.bb_label(*t)));
             }
             Terminator::Return => {
