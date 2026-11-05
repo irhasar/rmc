@@ -154,6 +154,8 @@ overflowing arithmetic near `i64::MAX` (the only mode that makes the
 and a nested-path write, `pat` for `match` expressions (multi-variant enums,
 two-field payloads, explicit discriminants, `bool` matches, binding patterns,
 struct patterns, nested matches, `if let`, string patterns, per-arm guards, and
+payload variant patterns whose arguments take sub-patterns (`_`, `mut x`, a
+trailing `..`, a nested struct/array pattern) and read through a `&E` scrutinee;
 a side-effecting
 scrutinee), `letdestr` for `let` struct destructuring (shorthand, renamed and
 `mut` bindings, `_` and `..`, a call and a reference scrutinee, and a
@@ -169,7 +171,7 @@ in every position, and an array-typed struct field destructured in place),
 nested one, one mixed with plain parameters, and one on a method receiver),
 `enumpat` for payload variant patterns with sub-patterns (`_`, `mut x`, a
 trailing `..`, and a nested struct or array pattern inside `E::V(..)`, in
-`match`, `if let` and a method), and
+`match`, `if let` and a method, and read through a `&E` scrutinee), and
 `order` for assignment evaluation order (a
 side-effecting index and value on both `=` and every compound operator, the
 shapes `stmt` never assigns through). `shift` drives `<<`, `>>` and the compound

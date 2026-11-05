@@ -1626,7 +1626,8 @@ def gen_enumpat_program(rng):
     `_` that still reads, or a wrong nested offset changes the total. Every
     function is called twice with different arguments, so a shared slot or a
     leaked `mut` write is observable. No other mode emits a nested payload
-    sub-pattern or a `..` inside a variant's parentheses.
+    sub-pattern, a `..` inside a variant's parentheses, or a payload read
+    through a `&E` scrutinee (match ergonomics dereferences it).
     """
     b = rng.randint(1, 9)
     m = rng.randint(1, 9)
@@ -1648,6 +1649,9 @@ def gen_enumpat_program(rng):
         "fn narr(e: E) -> i64 { return match e { E::Arr([a, c]) => a * 10 + c, _ => 0 }; }",
         "fn mix(e: E) -> i64 { return match e { E::Mix(n, S { a: [p, q], b: I { u } }, [r, s]) => n + p + q + u + r + s, _ => 0 }; }",
         "impl E { fn first(self) -> i64 { return match self { E::Pair(x, ..) => x, E::Trip(x, ..) => x, _ => 0 }; } }",
+        "fn wref(e: &E) -> i64 { return match e { E::Pair(x, _) => x * 2, E::Trip(x, ..) => x * 3, _ => 0 }; }",
+        "fn nref(e: &E) -> i64 { return match e { E::Hold(S { a: [p, q], b: I { u } }) => p * 100 + q * 10 + u, _ => 0 }; }",
+        "fn uref(e: &E) -> i64 { return match e { E::None => 100, E::Pair(_, _) => 200, E::Trip(_, _, _) => 300, E::Hold(_) => 400, E::Arr(_) => 500, E::Mix(_, _, _) => 600 }; }",
     ]
     rs = [
         "#[derive(Copy, Clone)]",
@@ -1665,6 +1669,9 @@ def gen_enumpat_program(rng):
         "fn narr(e: E) -> i64 { match e { E::Arr([a, c]) => a * 10 + c, _ => 0 } }",
         "fn mix(e: E) -> i64 { match e { E::Mix(n, S { a: [p, q], b: I { u } }, [r, s]) => n + p + q + u + r + s, _ => 0 } }",
         "impl E { fn first(self) -> i64 { match self { E::Pair(x, ..) => x, E::Trip(x, ..) => x, _ => 0 } } }",
+        "fn wref(e: &E) -> i64 { match e { E::Pair(x, _) => x * 2, E::Trip(x, ..) => x * 3, _ => 0 } }",
+        "fn nref(e: &E) -> i64 { match e { E::Hold(S { a: [p, q], b: I { u } }) => p * 100 + q * 10 + u, _ => 0 } }",
+        "fn uref(e: &E) -> i64 { match e { E::None => 100, E::Pair(_, _) => 200, E::Trip(_, _, _) => 300, E::Hold(_) => 400, E::Arr(_) => 500, E::Mix(_, _, _) => 600 } }",
     ]
 
     def acc_add(expr):
@@ -1687,6 +1694,11 @@ def gen_enumpat_program(rng):
         f"mix(E::Mix(s + {m}, S {{ a: [s + 1, s + 2], b: I {{ u: s + 3 }} }}, [s + 4, s + 5]))",
         f"E::Pair(s + {m}, s + 6).first()",
         f"E::Trip(s + {m}, s + 7, s + 8).first()",
+        f"wref(&E::Pair(s + {o[0]}, s + {o[1]}))",
+        f"wref(&E::Trip(s + {o[6]}, s + {o[7]}, s + {o[8]}))",
+        f"nref(&E::Hold(S {{ a: [s + {o[12]}, s + {o[13]}], b: I {{ u: s + {o[14]} }} }}))",
+        "uref(&E::None)",
+        f"uref(&E::Arr([s + {o[18]}, s + {o[19]}]))",
     ]
     body_rms = ["fn main() -> i64 {", "    let mut acc: i64 = 0;", f"    let s: i64 = mk({b});"]
     body_rs = ["fn main() {", "    let mut acc: i64 = 0;", f"    let s: i64 = mk({b});"]
@@ -2319,6 +2331,12 @@ def robust_corpus():
         # reject the program cleanly rather than mis-bind it.
         "enum_pat_refutable_literal": b"enum E { A(i64), B } fn main() -> i64 { let e: E = E::A(1); return match e { E::A(1) => 1, E::A(_) => 0, E::B => 0 }; }",
         "enum_pat_refutable_arr": b"enum E { A([i64; 2]), B } fn main() -> i64 { let e: E = E::A([1, 2]); return match e { E::A([1, y]) => y, E::B => 0 }; }",
+        # A payload read through a `&E` scrutinee auto-derefs, so the same
+        # malformed or deeply nested argument list must error cleanly when the
+        # scrutinee is a reference.
+        "enum_pat_ref_unterminated": b"enum E { A(i64), B } fn main() -> i64 { let e: E = E::A(1); return match &e { E::A(x ",
+        "enum_pat_ref_deep_nested": b"struct S { a: S } enum E { A(S) } fn main() -> i64 { let e: E = E::A(S { a: e }); return match &e { "
+            + b"E::A(S { a: " * 3000 + b"_" + b" })" * 3000 + b" => 0 }; }",
     }
     return cases
 
@@ -2846,6 +2864,21 @@ def reject_corpus():
             "fn main() -> i64 { let e: E = E::A([1, 2]); return match e { E::A([x, y, z]) => x, E::B => 0 }; }\n",
             "enum E { A([i64; 2]), B }\n"
             "fn main() { let e = E::A([1, 2]); let _ = match e { E::A([x, y, z]) => x, E::B => 0 }; }\n",
+        ),
+        # A pattern reads through a `&E` scrutinee (match ergonomics), but the
+        # referent is what it is checked against: a variant of a *different*
+        # enum, or of no enum at all, must still be rejected.
+        "enum_pat_ref_wrong_enum": (
+            "enum E { A, B } enum F { C, D }\n"
+            "fn main() -> i64 { let e: E = E::A; return match &e { F::C => 1, _ => 0 }; }\n",
+            "enum E { A, B } enum F { C, D }\n"
+            "fn main() { let e = E::A; let _ = match &e { F::C => 1, _ => 0 }; }\n",
+        ),
+        "enum_pat_ref_scalar": (
+            "enum E { A, B }\n"
+            "fn main() -> i64 { let x: i64 = 0; return match &x { E::A => 1, _ => 0 }; }\n",
+            "enum E { A, B }\n"
+            "fn main() { let x = 0i64; let _ = match &x { E::A => 1, _ => 0 }; }\n",
         ),
     }
 

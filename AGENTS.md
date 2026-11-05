@@ -1343,7 +1343,8 @@ intermediate read shows up as a wrong final value; `letdestr`/`fordestr` only
 reach one level, so a deeper sub-pattern had no randomised coverage. `enumpat`
 mode builds payload variant patterns with sub-patterns (`_`, `mut x`, a trailing
 `..`, and a nested struct or array pattern inside `E::V(..)`), in `match`,
-`if let` and a method, which no other mode emits; each function is called twice
+`if let` and a method, and reads them through a `&E` scrutinee (match
+ergonomics), which no other mode emits; each function is called twice
 so a shared slot or a leaked `mut` write is observable. It compares
 stdout and exit status against `rustc -O`, and it recompiles each program with
 every optimiser pass off in turn (`--no-inline`, `--no-licm`, `--no-tco`, all

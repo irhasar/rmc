@@ -169,6 +169,11 @@ naming directions compose. An argument must be irrefutable — a literal
 (`E::A(1)`) would need a per-field test rmc does not generate, so it is
 rejected, as is `mut` on a nested pattern. Naming more fields than the variant
 has, or fewer without a `..`, is an error.
+A pattern reads through a reference to the scrutinee, as Rust's match ergonomics
+do: `match &e { Opt::Some(v) => .. }` dereferences `&E` to the `E` underneath, so
+the test and every payload read go through the one deref (a struct pattern
+auto-derefs a `&S` scrutinee in the same way). The referent is what the pattern
+is checked against, so a variant of a different enum is still rejected.
 A payload variant is not comparable with `==` and cannot be cast with
 `as` (it is not a scalar), and it may not be an array element.
 
@@ -413,7 +418,11 @@ compile-time constant is decided at compile time, not by the trap.
   value, and a comma before `}` may be omitted. An arm body is an expression,
   but a bare assignment (`0 => acc = 1`), a compound assignment
   (`1 => acc += 10`), or a `return`/`break`/`continue` is accepted as well, as
-  in Rust; a block-bodied arm (`_ => {}`) also works.
+  in Rust; a block-bodied arm (`_ => {}`) also works. If the scrutinee is a
+  reference, the pattern reads through it, as Rust's match ergonomics do:
+  `match &e { Opt::Some(v) => .. }` dereferences `&E` to the `E` underneath, and
+  a struct pattern likewise auto-derefs a `&S` scrutinee. The referent is what
+  the pattern is checked against.
 - Guards: an arm may carry a condition, `PAT if COND => body`. `COND` is any
   `bool` expression, parsed like an `if` condition, and may read the pattern's
   bindings (`Opt::Some(v) if v > 10 => ..`). The arm runs only when the pattern
