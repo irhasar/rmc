@@ -256,7 +256,7 @@ fn for_over_an_array_rejects_a_refutable_pattern() {
         &CompileOptions::default(),
     )
     .unwrap_err();
-    assert!(err.contains("binding, `_` or a struct pattern"), "got: {err}");
+    assert!(err.contains("binding, `_`, a struct or an array pattern"), "got: {err}");
 }
 
 #[test]
@@ -743,6 +743,162 @@ fn an_unknown_field_in_a_let_destructuring_pattern_is_rejected() {
     )
     .unwrap_err();
     assert!(err.contains("has no field `z`"), "got: {err}");
+}
+
+#[test]
+fn let_array_destructuring_binds_its_elements_in_the_enclosing_block() {
+    let src = "fn main() -> i64 { let a: [i64; 2] = [3, 4]; \
+               let [x, y] = a; return x * 10 + y; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn let_array_destructuring_ignores_wildcard_elements() {
+    let src = "fn main() -> i64 { let a: [i64; 3] = [1, 2, 3]; \
+               let [_, y, _] = a; return y; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn let_array_destructuring_places_a_middle_rest() {
+    // `[x, .., z]` binds the first and last elements of a longer array; the
+    // trailing binding reads `a.len() - 1`, which folds to the constant length.
+    let src = "fn main() -> i64 { let a: [i64; 4] = [1, 2, 3, 4]; \
+               let [x, .., z] = a; return x * 10 + z; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn let_array_destructuring_allows_leading_and_trailing_rests() {
+    let leading = "fn main() -> i64 { let a: [i64; 3] = [1, 2, 3]; \
+                   let [.., z] = a; return z; }";
+    let trailing = "fn main() -> i64 { let a: [i64; 3] = [1, 2, 3]; \
+                    let [x, ..] = a; return x; }";
+    assert!(compile_to_asm(leading, &CompileOptions::default()).is_ok());
+    assert!(compile_to_asm(trailing, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn let_array_destructuring_nests() {
+    // An element pattern may itself be an array pattern.
+    let src = "fn main() -> i64 { let m: [[i64; 2]; 2] = [[1, 2], [3, 4]]; \
+               let [[a, b], [c, d]] = m; return a + b * 10 + c * 100 + d * 1000; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn let_array_destructuring_allows_a_type_annotation() {
+    let src = "fn main() -> i64 { let [x, y]: [i64; 2] = [1, 2]; return x + y; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn let_array_destructuring_attaches_mut_per_element() {
+    let src = "fn main() -> i64 { let a: [i64; 2] = [1, 2]; \
+               let [mut x, y] = a; x = x + 10; return x + y; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn let_array_destructuring_compiles_like_the_equivalent_index_reads() {
+    // The expansion is a hidden scrutinee plus one index read per binding, so
+    // it must lower to exactly the hand-written indexing form.
+    let pat = "fn f(a: &[i64; 3]) -> i64 { let [x, y, z] = a; return x * 100 + y * 10 + z; }";
+    let reads = "fn f(a: &[i64; 3]) -> i64 { \
+                 let x: i64 = a[0]; let y: i64 = a[1]; let z: i64 = a[2]; \
+                 return x * 100 + y * 10 + z; }";
+    assert_eq!(asm(pat), asm(reads));
+}
+
+#[test]
+fn let_array_destructuring_evaluates_the_scrutinee_once() {
+    let out = asm(
+        "fn mk() -> [i64; 2] { return [1, 2]; } \
+         fn main() -> i64 { let [x, y] = mk(); return x + y; }",
+    );
+    assert_eq!(out.matches("call mk").count(), 1, "scrutinee runs once");
+}
+
+#[test]
+fn let_array_destructuring_reads_through_a_reference() {
+    let src = "fn f(a: &[i64; 2]) -> i64 { let [x, y] = a; return x + y; } \
+               fn main() -> i64 { return f(&[1, 2]); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_for_over_an_array_destructures_an_array_element() {
+    let src = "fn main() -> i64 { let m: [[i64; 2]; 2] = [[1, 2], [3, 4]]; \
+               let mut s: i64 = 0; for [x, y] in m { s = s + x + y; } return s; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_match_arm_may_use_an_array_pattern() {
+    let src = "fn main() -> i64 { let a: [i64; 2] = [1, 2]; \
+               match a { [x, y] => { return x * 10 + y; } } }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn an_array_pattern_with_a_refutable_element_is_rejected() {
+    // `[1, y]` needs a per-element test rmc does not generate, so it is
+    // rejected rather than mis-bound as an always-true read.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let a: [i64; 2] = [1, 2]; let [1, y] = a; return y; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("must be bindings"), "got: {err}");
+}
+
+#[test]
+fn an_array_pattern_with_two_rests_is_rejected() {
+    let err = compile_to_asm(
+        "fn main() -> i64 { let a: [i64; 3] = [1, 2, 3]; let [.., x, ..] = a; return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("only be used once"), "got: {err}");
+}
+
+#[test]
+fn mut_on_an_array_wildcard_or_nested_pattern_is_rejected() {
+    let wild = compile_to_asm(
+        "fn main() -> i64 { let a: [i64; 2] = [1, 2]; let [mut _, y] = a; return y; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(wild.contains("attaches to a binding"), "got: {wild}");
+
+    let nested = compile_to_asm(
+        "fn main() -> i64 { let m: [[i64; 2]; 1] = [[1, 2]]; \
+         let [mut [x, y]] = m; return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(nested.contains("attaches to a binding"), "got: {nested}");
+}
+
+#[test]
+fn a_mut_before_a_let_array_pattern_is_rejected() {
+    let err = compile_to_asm(
+        "fn main() -> i64 { let a: [i64; 2] = [1, 2]; let mut [x, y] = a; return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("attached to each individual binding"), "got: {err}");
+}
+
+#[test]
+fn an_array_pattern_with_an_out_of_range_element_is_rejected() {
+    // `[x, y, z]` on a length-2 array reads index 2, which sema rejects.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let a: [i64; 2] = [1, 2]; let [x, y, z] = a; return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("out of bounds"), "got: {err}");
 }
 
 #[test]
