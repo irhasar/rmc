@@ -95,6 +95,23 @@ fn a_register_initialiser_stores_straight_to_the_frame() {
     assert!(out.contains("mov %rbx, -"), "register stored direct:\n{out}");
 }
 
+#[test]
+fn a_loop_body_starts_on_a_sixteen_byte_boundary() {
+    // The body is aligned so its layout does not shift with unrelated code-size
+    // changes; the directive must survive the dead-code pass, which otherwise
+    // drops it as text after the entry `jmp`.
+    let out = asm("fn main() -> i64 { let mut i: i64 = 0; while i < 3 { i = i + 1; } return i; }");
+    assert!(out.contains(".p2align 4"), "loop body aligned:\n{out}");
+}
+
+#[test]
+fn a_constant_for_bound_folds_into_its_home() {
+    // `for i in 0..n` evaluates the start once; a constant start stores
+    // straight to the counter register instead of bouncing through `%rax`.
+    let out = asm("fn main() -> i64 { let mut s: i64 = 0; for i in 0..3 { s = s + i; } return s; }");
+    assert!(!out.contains("mov $0, %rax\n\tmov %rax, %r"), "no counter bounce:\n{out}");
+}
+
 fn struct_fields_are_laid_out_in_order() {
     // Declaration order, no padding: `y` sits exactly one word above `x`. A
     // `&p` keeps the struct in memory so both fields are stored to the frame;
