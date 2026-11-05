@@ -29,6 +29,14 @@ Modes:
           `match`, string literal patterns, and a non-trivial side-effecting
           scrutinee (the temporary `desugar_match` binds it to, which must be
           evaluated once)
+    order side-effecting arguments, to pin evaluation order
+    shift `<<`/`>>` over the full count range (negative, >= 64, boundary)
+    cast  expressions on the `as` / unary precedence boundary (`*r as i64`,
+          `-x as i64`, `!x as i64`, `x * y as i64`), where a wrong `as` level
+          changes the value
+    assoc associated functions (`Type::name(..)`) and methods on the same
+          struct and enum, so a wrongly passed receiver or a mis-resolved
+          constructor changes the result
 
 The reference is `rustc -O`, so a mismatch is a real semantic divergence.
 """
@@ -283,6 +291,138 @@ def gen_expr_program(rng):
     rms.append("    print_i64(arr.len());")
     rs.append(f"    let arr: [i64; {n}] = [0; {n}];")
     rs.append('    println!("{}", arr.len() as i64);')
+    rms += ["    return 0;", "}"]
+    rs += ["}"]
+    return "\n".join(rms), "\n".join(rs)
+
+
+def gen_cast_program(rng):
+    """Expressions that sit on the `as` / unary precedence boundary. `as` binds
+    looser than `* - ! &`, so `*r as i64` is `(*r) as i64` and `-a as i64` is
+    `(-a) as i64`, but tighter than `* / %`, so `a * b as i64` is `a * (b as
+    i64)`. Every shape below changes value if `as` is parsed at the wrong level,
+    which is exactly the bug this mode pins: rmc used to parse `as` in
+    `parse_postfix`, binding it tighter than unary, and rejected `*r as i64`."""
+    a, b, c = (rng.randint(-1000, 1000) for _ in range(3))
+    bl = rng.choice(["true", "false"])
+    i64_leaves = ["a", "b", "c", "*r", "(a - b)", "(-a)", "(!b)", "h(a)"]
+    bool_leaves = ["bl", "(a < b)", "(a == c)", "(!bl)"]
+
+    def X():
+        return rng.choice(i64_leaves)
+
+    def B():
+        return rng.choice(bool_leaves)
+
+    tmpl = [
+        lambda: "(*r as i64)",
+        lambda: f"(-{X()} as i64)",
+        lambda: f"(!{X()} as i64)",
+        lambda: "(-*r as i64)",
+        lambda: "(!*r as i64)",
+        lambda: f"(-{X()} * {X()})",
+        lambda: f"({X()} * -{X()})",
+        lambda: f"({X()} as i64 * {X()})",
+        lambda: f"(-{X()} as i64 * {X()})",
+        lambda: f"(!{X()} as i64 + {X()})",
+        lambda: f"({B()} as i64 * {X()})",
+        lambda: f"(!{B()} as i64 + {X()})",
+        lambda: f"({X()} - {X()} as i64)",
+        lambda: f"(*r as i64 - {X()})",
+        lambda: f"(!({X()} as i64))",
+        lambda: f"(-({X()} as i64))",
+        lambda: f"({X()} + -{X()} as i64)",
+        lambda: f"(a as i64 as i64 + {X()})",
+        lambda: f"({B()} as i64 as i64 - {X()})",
+    ]
+    exprs = [rng.choice(tmpl)() for _ in range(rng.randint(4, 12))]
+    rms = [
+        "fn h(x: i64) -> i64 { return (x * 3 + 1) % 97 - 48; }",
+        "fn main() -> i64 {",
+        f"    let a: i64 = {a};",
+        f"    let b: i64 = {b};",
+        f"    let c: i64 = {c};",
+        f"    let bl: bool = {bl};",
+        "    let r: &i64 = &a;",
+    ]
+    rs = [
+        "fn h(x: i64) -> i64 { (x * 3 + 1) % 97 - 48 }",
+        "fn main() {",
+        f"    let a: i64 = {a};",
+        f"    let b: i64 = {b};",
+        f"    let c: i64 = {c};",
+        f"    let bl: bool = {bl};",
+        "    let r: &i64 = &a;",
+    ]
+    for e in exprs:
+        rms.append(f"    print_i64({e});")
+        rs.append(f'    println!("{{}}", {e});')
+    rms += ["    return 0;", "}"]
+    rs += ["}"]
+    return "\n".join(rms), "\n".join(rs)
+
+
+def gen_assoc_program(rng):
+    """Associated functions (`Type::name(..)`) and methods on the same types.
+    Random constants are baked into constructor calls, and each value is read
+    back through a method, so a receiver wrongly passed to an associated
+    function, or an associated function wrongly resolved, changes the result."""
+    a, b, k = (rng.randint(-500, 500) for _ in range(3))
+    calls = []
+    for _ in range(rng.randint(3, 8)):
+        x, y, m = (rng.randint(-50, 50) for _ in range(3))
+        calls.append((x, y, m))
+    rms = [
+        "struct S { a: i64, b: i64 }",
+        "impl S {",
+        "    fn new(a: i64, b: i64) -> S { return S { a, b }; }",
+        "    fn zero() -> S { return S { a: 0, b: 0 }; }",
+        "    fn scale_of(v: i64) -> i64 { return v * 3; }",
+        "    fn sum(self) -> i64 { return self.a + self.b; }",
+        "    fn bump(self, d: i64) -> S { return S::new(self.a + d, self.b + d); }",
+        "}",
+        "enum E { Off, On }",
+        "impl E {",
+        "    fn from(n: i64) -> E { if n % 2 == 0 { return E::Off; } return E::On; }",
+        "    fn tag(self) -> i64 { return self as i64; }",
+        "}",
+        "fn main() -> i64 {",
+        f"    let s: S = S::new({a}, {b});",
+        "    print_i64(s.sum());",
+        "    print_i64(S::zero().sum());",
+        f"    print_i64(S::scale_of({k}));",
+        f"    print_i64(s.bump({k}).sum());",
+        f"    print_i64(S::new({k}, {k}).bump({a}).sum());",
+        "    print_i64(E::from(0).tag());",
+        "    print_i64(E::from(1).tag());",
+    ]
+    rs = [
+        "struct S { a: i64, b: i64 }",
+        "impl S {",
+        "    fn new(a: i64, b: i64) -> S { S { a, b } }",
+        "    fn zero() -> S { S { a: 0, b: 0 } }",
+        "    fn scale_of(v: i64) -> i64 { v * 3 }",
+        "    fn sum(&self) -> i64 { self.a + self.b }",
+        "    fn bump(&self, d: i64) -> S { S::new(self.a + d, self.b + d) }",
+        "}",
+        "enum E { Off, On }",
+        "impl E {",
+        "    fn from(n: i64) -> E { if n % 2 == 0 { E::Off } else { E::On } }",
+        "    fn tag(self) -> i64 { self as i64 }",
+        "}",
+        "fn main() {",
+        f"    let s = S::new({a}, {b});",
+        '    println!("{}", s.sum());',
+        '    println!("{}", S::zero().sum());',
+        f'    println!("{{}}", S::scale_of({k}));',
+        f'    println!("{{}}", s.bump({k}).sum());',
+        f'    println!("{{}}", S::new({k}, {k}).bump({a}).sum());',
+        '    println!("{}", E::from(0).tag());',
+        '    println!("{}", E::from(1).tag());',
+    ]
+    for (x, y, m) in calls:
+        rms.append(f"    print_i64(S::new({x}, {y}).bump({m}).sum() + E::from({m}).tag());")
+        rs.append(f'    println!("{{}}", S::new({x}, {y}).bump({m}).sum() + E::from({m}).tag());')
     rms += ["    return 0;", "}"]
     rs += ["}"]
     return "\n".join(rms), "\n".join(rs)
@@ -1441,7 +1581,7 @@ def run_reject():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "robust", "reject"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "robust", "reject"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -1481,7 +1621,8 @@ def main():
     gen = {"expr": gen_expr_program, "stmt": gen_stmt_program,
            "opt": gen_opt_program, "arith": gen_arith_program,
            "nest": gen_nest_program, "pat": gen_pat_program,
-           "order": gen_order_program, "shift": gen_shift_program}[args.mode]
+           "order": gen_order_program, "shift": gen_shift_program,
+           "cast": gen_cast_program, "assoc": gen_assoc_program}[args.mode]
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus
     # suite; a fuzz program is otherwise only checked with every pass on, so a

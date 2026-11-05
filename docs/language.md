@@ -58,11 +58,12 @@ and ignores the attribute.
 struct Point { x: i64, y: i64 }
 
 impl Point {
+    fn new(x: i64, y: i64) -> Point { return Point { x, y }; }  // associated fn
     fn sum(self) -> i64 { return self.x + self.y; }
     fn moved(self, dx: i64) -> Point { return Point { x: self.x + dx, y: self.y }; }
 }
 
-let p: Point = Point { x: 3, y: 4 };
+let p: Point = Point::new(3, 4);
 let q: Point = p.moved(1);
 p.sum();                     // 7
 q.sum();                     // 8
@@ -78,6 +79,17 @@ and literal position. The method is resolved from the receiver's type, so two
 structs may define a method with the same name. A method call chains
 (`p.moved(1).sum()`) and a struct literal may be a receiver directly
 (`Point { x: 1, y: 2 }.sum()`).
+
+A function in an `impl` block that does **not** take `self` is an **associated
+function**: it is called through the type, `Point::new(3, 4)`, not on a value.
+This is the usual constructor idiom (`String::new`, `Vec::with_capacity`), and
+it works on enums too (`Tag::from_flag(true)`). An associated function is
+resolved to the mangled free function `Type$name` the same way a method is; the
+only difference is that no receiver is inserted as the first argument. Calling
+one with `.` (`p.new(1, 2)`) is therefore an arity error — the receiver would be
+an extra argument — and naming one without a call (`let f = Point::new;`) is
+rejected, since rmc has no function values. A name in `Type::name` that is not a
+variant of that enum and not an associated function is reported as such.
 
 ## Enums
 
@@ -275,9 +287,11 @@ compile-time constant is decided at compile time, not by the trap.
   value stays negative) and a shift count is taken modulo 64, matching Rust.
   Precedence, tightest first: `* / %`, `+ -`, `<< >>`, `&`, `^`, `|`, then the
   comparisons and `&& ||`. So `1 + 2 << 3` is `(1 + 2) << 3`, and
-  `if x & 1 == 0` is `(x & 1) == 0`. rmc has only `i64`, so a literal count is
-  masked to 6 bits; in Rust an unconstrained literal count is `i32` and masks to
-  5, which is why a program that mixes the two types can differ.
+  `if x & 1 == 0` is `(x & 1) == 0`. A cast `e as T` binds looser than the unary
+  operators and tighter than `*`, so `*r as i64` is `(*r) as i64` and
+  `-x as i64` is `(-x) as i64`, as in Rust. rmc has only `i64`, so a literal
+  count is masked to 6 bits; in Rust an unconstrained literal count is `i32` and
+  masks to 5, which is why a program that mixes the two types can differ.
 - Nesting is bounded: an expression, block or type may nest at most 100 levels.
   Deeper input is a compile error, not a crash. No hand-written program comes
   close; the limit exists so that pathological input cannot overflow the stack.

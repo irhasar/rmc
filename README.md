@@ -232,7 +232,10 @@ or field, compared by content with `==`/`!=`/`<`/`<=`/`>`/`>=`, with `.len()` fo
 the byte length); array `.len()` (a compile-time constant); `mut` enforcement and definite
 initialisation; `const` items (folded to a value and substituted at every use,
 including array lengths and `match` patterns); references (`&T` / `&mut T`, `&e`, `*e`,
-with auto-deref for `r.x`, `r[i]` and `r.m()`, and `&self` receivers);
+with auto-deref for `r.x`, `r[i]` and `r.m()`, and `&self` receivers); methods
+(`self` / `&self` / `&mut self`) and associated functions (`fn name(..)` with no
+`self`, called as `Type::name(..)`, the constructor idiom); `as` casts at Rust's
+precedence (looser than the unary operators, so `*r as i64` is `(*r) as i64`);
 attributes such as `#[derive(Copy, Clone)]` (parsed and ignored); and a small
 set of runtime builtins. Structs and arrays may be passed to and returned from
 functions by value, or by reference to avoid the copy. Overflow checks are
