@@ -198,7 +198,10 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   literal, and the frame store of a promoted field copied into an address-taken
   local loses one. A *store-to-load forwarding* rewrite of the same shape
   (`mov %r, X; mov X, %rY` -> `mov %r, %rY`) was measured perf-neutral on the
-  whole suite and not kept.
+  whole suite and not kept. `gen_expr_to_slot(e, slot)` is the one entry point
+  for "evaluate into a local": the promoted register when there is one, else a
+  folded frame store. `let`, assignment and both `for` bounds go through it, so
+  a constant `for` start is `mov $0, %rbx` rather than a bounce through `%rax`.
 - **An `if` whose whole body is `break`/`continue` branches straight to the
   loop label.** In statement position (`discard`), `bare_exit` recognises a
   single-statement body that is a lone `break` or `continue` and has the `if`
@@ -384,6 +387,16 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   `an_inclusive_range_uses_a_strict_exit_test` pin both bounds, and `..=` is a
   three-character token, so it must be lexed in the three-char table (before
   `..`), or it lexes as `..` then `=`.
+- **Loop bodies are aligned to 16 bytes.** Each loop's body label is preceded
+  by `.p2align 4`. Without it the body's start address drifts whenever unrelated
+  code elsewhere in the function changes size, and a one- or two-byte shift can
+  flip a hot loop between fetch-friendly and straddling alignments - a
+  two-byte *shrink* once cost `forloops` 0.69x. Aligning pins the body so the
+  same loop compiles to the same speed regardless of what moves around it. This
+  needs `trim_dead` to keep directives: it must test the *trimmed* line for a
+  leading `.`, because `.p2align` is emitted indented and otherwise looks like
+  dead text after the entry `jmp`. `a_loop_body_starts_on_a_sixteen_byte_boundary`
+  pins it.
 - **`while` is rotated.** The test is emitted at the bottom as the back edge
   (`gen_branch_true`, a `jl`/`jne`) with an entry `jmp` reusing the same test, so
   an iteration is one branch fewer than the top-tested form. `continue` targets
