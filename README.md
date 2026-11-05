@@ -193,14 +193,21 @@ python3 tools/fuzz.py --mode shift --n 500 --seed 1
 # also exercise the trap codegen: --bounds-checks and --overflow-checks runs
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 python3 tools/fuzz.py --mode robust
+python3 tools/fuzz.py --mode reject
+python3 tools/fuzz.py --mode mutate --n 500 --seed 1
 ```
 
 `robust` mode needs no rustc: it feeds a fixed corpus of malformed and
 adversarial inputs (random bytes, unbalanced braces, and thousands of nested
 parentheses, braces, unary operators or binary operators) and requires each to
 produce a clean error rather than a panic or a signal. This is what catches an
-unbounded parser recursion overflowing the stack on untrusted input. CI runs it
-together with a small fixed-seed differential fuzz.
+unbounded parser recursion overflowing the stack on untrusted input. `reject`
+mode is the soundness mirror: it holds a corpus of programs `rustc` rejects and
+requires `rmc` to reject each one too, never accept it. `mutate` mode applies
+random edits (splices, deletions, duplications) to the generators' programs and
+the `robust` corpus, and requires every mutant to fail cleanly; it needs no
+rustc and reaches error paths the fixed corpora miss. CI runs `robust` together
+with a small fixed-seed differential fuzz.
 
 A caveat for `expr`: an integer literal in a shift amount is unconstrained, so
 rustc infers `i32` and masks the count to 5 bits, while rmc is `i64`-only and
