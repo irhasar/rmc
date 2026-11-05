@@ -1017,7 +1017,7 @@ impl Codegen {
                         Some(r) => self.gen_expr_into_reg(e, r),
                         None => {
                             let dst = format!("{}(%rbp)", self.off(*slot));
-                            if !self.store_imm(e, &dst) {
+                            if !self.store_simple(e, &dst) {
                                 self.gen_expr_into_reg(e, "%rax");
                                 self.store_slot(*slot);
                             }
@@ -1046,7 +1046,7 @@ impl Codegen {
                             Some(r) => self.gen_expr_into_reg(value, r),
                             None => {
                                 let dst = format!("{}(%rbp)", self.off(*slot));
-                                if !self.store_imm(value, &dst) {
+                                if !self.store_simple(value, &dst) {
                                     self.gen_expr_into_reg(value, "%rax");
                                     self.store_slot(*slot);
                                 }
@@ -1513,15 +1513,24 @@ impl Codegen {
 
     /// Store `e` straight into the memory operand `dst` when `e` is a small
     /// immediate, so `mov $k, %rax; mov %rax, mem` collapses to `movq $k, mem`.
-    /// Returns false when `e` is not such a constant, so the caller falls back
-    /// to evaluating into a register. A literal needs no overflow check.
-    fn store_imm(&mut self, e: &Expr, dst: &str) -> bool {
-        match Self::small_imm(e) {
-            Some(k) => {
-                self.store_operand(&format!("${k}"), dst);
+    /// Store `e` straight into the memory operand `dst` when `e` is already a
+    /// bare register or a small immediate, so `mov $k, %rax; mov %rax, mem`
+    /// collapses to `movq $k, mem` and `mov %r, %rax; mov %rax, mem` to
+    /// `mov %r, mem`. Returns false when `e` needs evaluating, so the caller
+    /// falls back to evaluating it into `%rax`. A literal needs no overflow
+    /// check and a register copy cannot trap.
+    fn store_simple(&mut self, e: &Expr, dst: &str) -> bool {
+        if let Some(k) = Self::small_imm(e) {
+            self.store_operand(&format!("${k}"), dst);
+            return true;
+        }
+        match self.simple_operand(e) {
+            // A memory operand would make `mov mem, mem`, which is illegal.
+            Some(op) if op.starts_with('%') => {
+                self.line(&format!("mov {op}, {dst}"));
                 true
             }
-            None => false,
+            _ => false,
         }
     }
 
@@ -1997,7 +2006,7 @@ impl Codegen {
             self.gen_expr_into_reg(&fi.value, r);
             return;
         }
-        if self.store_imm(&fi.value, &format!("{dest_off}(%rbp)")) {
+        if self.store_simple(&fi.value, &format!("{dest_off}(%rbp)")) {
             return;
         }
         self.gen_expr(&fi.value);
