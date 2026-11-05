@@ -354,12 +354,15 @@ pub struct FnDef {
     pub nslots: i32,
 }
 
-/// One variant of an enum: a name and its payload field types. An empty
-/// `fields` is a unit variant.
+/// One variant of an enum: a name, its payload field types, and an optional
+/// explicit discriminant. An empty `fields` is a unit variant.
 #[derive(Debug, Clone)]
 pub struct EnumVariantDef {
     pub name: String,
     pub fields: Vec<Type>,
+    /// An explicit `= N` discriminant, if written. `None` means the variant
+    /// takes the previous variant's value plus one (starting at 0).
+    pub discr: Option<i64>,
 }
 
 /// A user-defined enum. When every variant is a unit variant the enum is

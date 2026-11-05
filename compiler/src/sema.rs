@@ -42,19 +42,21 @@ pub struct StructInfo {
 #[derive(Clone)]
 pub struct EnumInfo {
     /// Per variant: its name, its fields as `(type, offset within the payload)`,
-    /// and the payload width that variant uses.
-    pub variants: Vec<(String, Vec<(Type, usize)>, usize)>,
+    /// the payload width that variant uses, and its discriminant (the value the
+    /// enum holds when it is that variant, i.e. its `as i64` and the tag a
+    /// `match` tests).
+    pub variants: Vec<(String, Vec<(Type, usize)>, usize, i64)>,
     pub size: usize,
     pub has_payload: bool,
 }
 
 impl EnumInfo {
     fn tag_of(&self, variant: &str) -> Option<i64> {
-        self.variants.iter().position(|(n, _, _)| n == variant).map(|i| i as i64)
+        self.variants.iter().find(|(n, _, _, _)| n == variant).map(|(_, _, _, d)| *d)
     }
 
-    fn variant(&self, name: &str) -> Option<&(String, Vec<(Type, usize)>, usize)> {
-        self.variants.iter().find(|(n, _, _)| n == name)
+    fn variant(&self, name: &str) -> Option<&(String, Vec<(Type, usize)>, usize, i64)> {
+        self.variants.iter().find(|(n, _, _, _)| n == name)
     }
 }
 
@@ -329,9 +331,15 @@ fn layout_enum(
     }
     let def = raw_e.get(name).ok_or_else(|| format!("unknown type `{name}`"))?;
     visiting.push(name.to_string());
-    let mut variants: Vec<(String, Vec<(Type, usize)>, usize)> = Vec::new();
+    let mut variants: Vec<(String, Vec<(Type, usize)>, usize, i64)> = Vec::new();
     let mut max_payload = 0usize;
     let mut has_payload = false;
+    // The discriminant of the next variant with no `= N`: the previous value
+    // plus one, starting at 0. `None` means the previous value was `i64::MAX`,
+    // so the next *implicit* variant has no in-range value (rustc's E0370) —
+    // but only if a variant actually needs it, since a final `= i64::MAX` is
+    // fine. rustc also rejects a duplicate discriminant.
+    let mut next_discr: Option<i64> = Some(0);
     for v in &def.variants {
         let mut fields: Vec<(Type, usize)> = Vec::new();
         let mut off = 0usize;
@@ -343,8 +351,20 @@ fn layout_enum(
         if !v.fields.is_empty() {
             has_payload = true;
         }
+        let discr = match v.discr {
+            Some(d) => d,
+            None => next_discr.ok_or_else(|| {
+                format!("enum `{name}`: discriminant overflowed (`{}` has no in-range value after `i64::MAX`)", v.name)
+            })?,
+        };
+        next_discr = discr.checked_add(1);
         max_payload = max_payload.max(off);
-        variants.push((v.name.clone(), fields, off));
+        variants.push((v.name.clone(), fields, off, discr));
+    }
+    for (i, (n, _, _, d)) in variants.iter().enumerate() {
+        if variants[..i].iter().any(|(_, _, _, e)| e == d) {
+            return Err(format!("enum `{name}`: discriminant {d} is used by more than one variant (`{n}`)"));
+        }
     }
     visiting.pop();
     let size = if has_payload { 8 + ((max_payload + 7) / 8) * 8 } else { 8 };
@@ -2150,7 +2170,7 @@ impl Sema {
                     .get(&enum_name)
                     .ok_or_else(|| format!("unknown enum `{enum_name}`"))?
                     .clone();
-                let (_, fields, _) = info
+                let (_, fields, _, _) = info
                     .variant(&variant)
                     .ok_or_else(|| format!("enum `{enum_name}` has no variant `{variant}`"))?;
                 if !fields.is_empty() {
@@ -2220,7 +2240,7 @@ impl Sema {
                     .get(&enum_name)
                     .ok_or_else(|| format!("unknown enum `{enum_name}`"))?
                     .clone();
-                let (_, fields, _) = info
+                let (_, fields, _, _) = info
                     .variant(&variant)
                     .ok_or_else(|| format!("enum `{enum_name}` has no variant `{variant}`"))?
                     .clone();
@@ -2283,7 +2303,7 @@ impl Sema {
                     ));
                 }
                 let info = self.enums.get(&ename).unwrap().clone();
-                let (_, fields, _) = info
+                let (_, fields, _, _) = info
                     .variant(variant)
                     .ok_or_else(|| format!("enum `{enum_name}` has no variant `{variant}`"))?;
                 // A variant that carries a payload must be destructured, so the
@@ -2322,7 +2342,7 @@ impl Sema {
                         "`{enum_name}::{variant}` payload read on a value of type {rt:?}"
                     ));
                 }
-                let (_, fields, _) = info
+                let (_, fields, _, _) = info
                     .variant(&variant)
                     .ok_or_else(|| format!("enum `{enum_name}` has no variant `{variant}`"))?;
                 let (fty, foff) = fields

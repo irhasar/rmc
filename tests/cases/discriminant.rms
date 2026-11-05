@@ -1,0 +1,51 @@
+// Enums with explicit discriminants: the value a variant holds is the number
+// written after `=`, not its declaration index, and a variant with no `= N`
+// takes the previous value plus one. A `match` arm and an `as i64` must both
+// read the written value, so a tag that is still the index shows up as a
+// different number.
+enum Code { Ok = 0, Warn = 4, Err }         // 0, 4, 5
+enum Flags { A = 1, B = 2, C = 4, D = 8 }   // powers of two
+enum Signed { Neg = -3, Zero, Pos }         // -3, -2, -1
+enum Plain { X, Y, Z }                       // 0, 1, 2 - the default
+enum Edge { Min = -9223372036854775808, Max = 9223372036854775807 }  // the extremes
+
+fn code_val(c: Code) -> i64 {
+    return match c { Code::Ok => 100, Code::Warn => 200, Code::Err => 300 };
+}
+
+fn flag_sum(f: Flags) -> i64 {
+    return match f { Flags::A => 1, Flags::B => 2, Flags::C => 4, Flags::D => 8 };
+}
+
+fn main() -> i64 {
+    // `as i64` reads the written value.
+    print_i64(Code::Ok as i64);
+    print_i64(Code::Warn as i64);
+    print_i64(Code::Err as i64);
+    print_i64(Flags::D as i64);
+    print_i64(Signed::Neg as i64);
+    print_i64(Signed::Zero as i64);
+    print_i64(Signed::Pos as i64);
+    print_i64(Plain::Z as i64);
+
+    // A `match` arm must key on the written value, so every variant still
+    // selects its own arm.
+    print_i64(code_val(Code::Ok) + code_val(Code::Warn) + code_val(Code::Err));
+    print_i64(flag_sum(Flags::A) + flag_sum(Flags::B) + flag_sum(Flags::C) + flag_sum(Flags::D));
+
+    // The value is stable through a copy, a struct field and an array element.
+    let c: Code = Code::Warn;
+    let d: Code = c;
+    print_i64(d as i64);
+    let arr: [Flags; 3] = [Flags::A, Flags::B, Flags::C];
+    print_i64(arr[0] as i64 + arr[1] as i64 + arr[2] as i64);
+
+    // The distance between two variants is the distance between their values.
+    print_i64((Code::Err as i64) - (Code::Ok as i64));
+    print_i64((Flags::D as i64) - (Flags::A as i64));
+
+    // The extremes are representable.
+    print_i64(Edge::Min as i64);
+    print_i64(Edge::Max as i64);
+    return 0;
+}

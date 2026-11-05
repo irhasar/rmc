@@ -194,7 +194,44 @@ impl Parser {
                 }
                 self.expect(Tok::RParen)?;
             }
-            variants.push(EnumVariantDef { name: vname, fields });
+            // `Variant = N`: an explicit discriminant. Only a unit variant may
+            // have one, as in rustc (a payload variant's tag is an
+            // implementation detail there).
+            let mut discr = None;
+            if self.eat(&Tok::Eq) {
+                if !fields.is_empty() {
+                    return Err(format!(
+                        "at byte {}: a variant with a payload cannot have an explicit discriminant",
+                        self.pos()
+                    ));
+                }
+                let neg = self.eat(&Tok::Minus);
+                match self.peek().cloned() {
+                    Some(Tok::Int(n)) => {
+                        self.bump();
+                        discr = Some(if neg {
+                            n.checked_neg().ok_or_else(|| {
+                                format!("at byte {}: discriminant out of range", self.pos())
+                            })?
+                        } else {
+                            n
+                        });
+                    }
+                    // `-9223372036854775808` is `i64::MIN`; the magnitude alone
+                    // does not fit, so it is only valid under a `-`.
+                    Some(Tok::IntMinMagnitude) if neg => {
+                        self.bump();
+                        discr = Some(i64::MIN);
+                    }
+                    _ => {
+                        return Err(format!(
+                            "at byte {}: expected an integer after `=` in a variant discriminant",
+                            self.pos()
+                        ))
+                    }
+                }
+            }
+            variants.push(EnumVariantDef { name: vname, fields, discr });
             if !self.eat(&Tok::Comma) {
                 break;
             }

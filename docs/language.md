@@ -108,6 +108,21 @@ returned by value, and used as a `match` scrutinee with `Color::Green` patterns.
 An enum may also have `impl` methods. `as` cannot convert an `i64` **to** an
 enum (rustc rejects that too); use a `match` to go from a tag back to a variant.
 
+A variant may write its value explicitly with `= N`, and the value need not be
+its index:
+
+```rust
+enum Code { Ok = 0, Warn = 4, Err }   // Err is 5, the previous value plus one
+
+Code::Warn as i64;                    // 4, the written value
+```
+
+A variant with no `= N` takes the previous variant's value plus one, starting at
+0. A `match` arm and an `as i64` both read the written value. Only a unit
+variant may have a discriminant — a payload variant's tag is an implementation
+detail, so `Variant(i64) = 5` is rejected, as in rustc. Two variants may not
+share a value.
+
 ### Enums with a payload
 
 ```rust

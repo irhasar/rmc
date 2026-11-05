@@ -152,8 +152,9 @@ small inlined helpers (the shapes the other two do not emit), `arith` for
 overflowing arithmetic near `i64::MAX` (the only mode that makes the
 `--overflow-checks` trap fire), `nest` for nested aggregates with a deep copy
 and a nested-path write, `pat` for `match` expressions (multi-variant enums,
-two-field payloads, `bool` matches, binding patterns, nested matches, `if let`,
-string patterns, per-arm guards, and a side-effecting scrutinee), and `order` for assignment evaluation order (a
+two-field payloads, explicit discriminants, `bool` matches, binding patterns,
+nested matches, `if let`, string patterns, per-arm guards, and a side-effecting
+scrutinee), and `order` for assignment evaluation order (a
 side-effecting index and value on both `=` and every compound operator, the
 shapes `stmt` never assigns through). `shift` drives `<<`, `>>` and the compound
 `<<=`/`>>=` with a shift count from `argv`, so the count is opaque to the
@@ -222,7 +223,9 @@ array elements and struct fields (including compound `+=` and friends);
 `_` patterns, plus payload bindings and binding names, and a per-arm guard
 `PAT if COND`) and `if let` with the
 same patterns
-(desugared to a two-arm `match`); `break` (with a value in a `loop`, so `loop`
+(desugared to a two-arm `match`); enums with unit variants (an optional
+explicit discriminant, `enum E { A = 5, B }`) and payload variants; `break`
+(with a value in a `loop`, so `loop`
 works as an expression), `continue`,
 `return`; loop labels (`'a: loop` / `'a: while` / `'a: for`, with
 `break 'a` / `break 'a value` / `continue 'a` targeting any enclosing labelled
