@@ -37,6 +37,10 @@ Modes:
     assoc associated functions (`Type::name(..)`) and methods on the same
           struct and enum, so a wrongly passed receiver or a mis-resolved
           constructor changes the result
+    ref   references (`&T` / `&mut T`): a reference to a scalar, a struct
+          field, a nested field, an array element and a nested array element,
+          read and written through directly and via a callee, plus a whole
+          aggregate read/written through a reference
 
 The reference is `rustc -O`, so a mismatch is a real semantic divergence.
 """
@@ -899,6 +903,131 @@ def gen_nest_program(rng):
     ]
     return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
 
+def gen_ref_program(rng):
+    """A program built from references (`&T` / `&mut T`), which no other mode
+    exercises. A reference is one word holding an address, so `*r = v` writes
+    through it, `r.field` / `r[i]` reach the referent, and a reference travels
+    to a callee in one register. The shapes that are easy to get wrong are a
+    reference to a *place* that is not a plain local: a struct field
+    (`&mut o.mid.f`), an array element (`&mut a[i]`), a nested array element
+    (`&mut m[i][j]`), and the local that *is* the destination (`&mut acc`). A
+    wrong address reads or writes a neighbouring word and shows up as a wrong
+    final value.
+
+    Every value descends from a call (`seed`), so no local is constant-folded
+    and the addresses stay live.
+    """
+    inner = [f"i{j}" for j in range(rng.randint(2, 3))]
+    na = rng.randint(2, 4)
+    r2, c2 = rng.randint(2, 3), rng.randint(2, 3)
+    idecl = ", ".join(f"{f}: i64" for f in inner)
+    arr_lit = ", ".join(f"base + {j}" for j in range(na))
+    inner_lit = ", ".join(f"{f}: base + {j + 1}" for j, f in enumerate(inner))
+    grid_lit = ", ".join(
+        "[" + ", ".join(f"base + {r * c2 + c}" for c in range(c2)) + "]"
+        for r in range(r2)
+    )
+    sumf = " + ".join([f"r.mid.{f}" for f in inner] + ["r.s", "r.arr[0]"])
+    f0 = inner[0]
+    k = rng.randint(1, 9)
+
+    rms = [
+        "fn seed(x: i64) -> i64 { return x * 7 + 1; }",
+        f"struct Inner {{ {idecl} }}",
+        f"struct Outer {{ s: i64, mid: Inner, arr: [i64; {na}] }}",
+        "fn inc(r: &mut i64) { *r = *r + 1; }",
+        "fn addto(r: &mut i64, v: i64) { *r = *r + v; }",
+        "fn twice(r: &mut i64) { inc(r); inc(r); }",
+        "fn get(r: &i64) -> i64 { return *r; }",
+        f"fn sumfields(r: &Outer) -> i64 {{ return {sumf}; }}",
+        f"fn setfield(r: &mut Outer, v: i64) {{ r.s = r.s + v; r.mid.{f0} = r.mid.{f0} + v; }}",
+        f"fn sumarr(a: &[i64; {na}]) -> i64 {{ let mut s: i64 = 0; let mut i: i64 = 0; "
+        f"while i < {na} {{ s = s + a[i]; i = i + 1; }} return s; }}",
+        "fn main() -> i64 {",
+        f"    let base: i64 = seed({k});",
+        "    let mut acc: i64 = 0;",
+        # A reference to a scalar local, written through directly and by callee.
+        "    let mut x: i64 = base;",
+        "    let r: &mut i64 = &mut x;",
+        "    *r = *r + 3;",
+        "    inc(&mut x);",
+        "    twice(&mut x);",
+        "    acc = acc + x + get(&x);",
+        # A reference to a struct field, including a nested one.
+        f"    let mut o: Outer = Outer {{ s: base, mid: Inner {{ {inner_lit} }}, arr: [{arr_lit}] }};",
+        "    addto(&mut o.s, 5);",
+        f"    inc(&mut o.mid.{f0});",
+        f"    acc = acc + o.s + o.mid.{f0};",
+        # A reference to an array element.
+        f"    let mut a: [i64; {na}] = [{arr_lit}];",
+        "    inc(&mut a[0]);",
+        f"    addto(&mut a[{na - 1}], 9);",
+        f"    acc = acc + a[0] + a[{na - 1}];",
+        # Read and write a whole aggregate through a reference.
+        "    acc = acc + sumfields(&o);",
+        "    setfield(&mut o, 7);",
+        f"    acc = acc + o.s + o.mid.{f0};",
+        "    acc = acc + sumarr(&a);",
+        # A reference to a nested array element.
+        f"    let mut m: [[i64; {c2}]; {r2}] = [{grid_lit}];",
+        f"    inc(&mut m[{r2 - 1}][{c2 - 1}]);",
+        f"    acc = acc + m[0][0] + m[{r2 - 1}][{c2 - 1}];",
+        # A reference local that is the destination of an accumulator update.
+        "    let rl: &mut i64 = &mut acc;",
+        "    *rl = *rl + 1;",
+        "    let mut y: i64 = base;",
+        "    twice(&mut y);",
+        "    acc = acc + y;",
+        "    print_i64(acc);",
+        "    return 0;",
+        "}",
+    ]
+    rs = [
+        "fn seed(x: i64) -> i64 { x * 7 + 1 }",
+        f"struct Inner {{ {idecl} }}",
+        f"struct Outer {{ s: i64, mid: Inner, arr: [i64; {na}] }}",
+        "fn inc(r: &mut i64) { *r += 1; }",
+        "fn addto(r: &mut i64, v: i64) { *r += v; }",
+        "fn twice(r: &mut i64) { inc(r); inc(r); }",
+        "fn get(r: &i64) -> i64 { *r }",
+        f"fn sumfields(r: &Outer) -> i64 {{ {sumf} }}",
+        f"fn setfield(r: &mut Outer, v: i64) {{ r.s += v; r.mid.{f0} += v; }}",
+        f"fn sumarr(a: &[i64; {na}]) -> i64 {{ let mut s = 0i64; let mut i = 0usize; "
+        f"while i < {na} {{ s += a[i]; i += 1; }} s }}",
+        "fn main() {",
+        f"    let base: i64 = seed({k});",
+        "    let mut acc: i64 = 0;",
+        "    let mut x: i64 = base;",
+        "    let r = &mut x;",
+        "    *r += 3;",
+        "    inc(&mut x);",
+        "    twice(&mut x);",
+        "    acc += x + get(&x);",
+        f"    let mut o: Outer = Outer {{ s: base, mid: Inner {{ {inner_lit} }}, arr: [{arr_lit}] }};",
+        "    addto(&mut o.s, 5);",
+        f"    inc(&mut o.mid.{f0});",
+        f"    acc += o.s + o.mid.{f0};",
+        f"    let mut a: [i64; {na}] = [{arr_lit}];",
+        "    inc(&mut a[0]);",
+        f"    addto(&mut a[{na - 1}], 9);",
+        f"    acc += a[0] + a[{na - 1}];",
+        "    acc += sumfields(&o);",
+        "    setfield(&mut o, 7);",
+        f"    acc += o.s + o.mid.{f0};",
+        "    acc += sumarr(&a);",
+        f"    let mut m: [[i64; {c2}]; {r2}] = [{grid_lit}];",
+        f"    inc(&mut m[{r2 - 1}][{c2 - 1}]);",
+        f"    acc += m[0][0] + m[{r2 - 1}][{c2 - 1}];",
+        "    let rl = &mut acc;",
+        "    *rl += 1;",
+        "    let mut y: i64 = base;",
+        "    twice(&mut y);",
+        "    acc += y;",
+        '    println!("{}", acc);',
+        "}",
+    ]
+    return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
+
 
 def gen_pat_program(rng):
     """A program whose control flow is a set of `match` expressions, so the
@@ -1641,7 +1770,7 @@ def run_reject():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "robust", "reject"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "robust", "reject"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -1682,7 +1811,8 @@ def main():
            "opt": gen_opt_program, "arith": gen_arith_program,
            "nest": gen_nest_program, "pat": gen_pat_program,
            "order": gen_order_program, "shift": gen_shift_program,
-           "cast": gen_cast_program, "assoc": gen_assoc_program}[args.mode]
+           "cast": gen_cast_program, "assoc": gen_assoc_program,
+           "ref": gen_ref_program}[args.mode]
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus
     # suite; a fuzz program is otherwise only checked with every pass on, so a

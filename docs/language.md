@@ -11,7 +11,7 @@ time; there are no runtime type errors.
 | `i64`        | signed 64-bit integer                         |
 | `bool`       | `true` or `false`                             |
 | `str`        | a string (one word: a pointer to a `{len, bytes}` record) |
-| `[T; N]`     | fixed-size array of `N` `i64`, `bool` or unit-enum elements |
+| `[T; N]`     | fixed-size array of `N` `T` elements, where `T` is a scalar, a struct or another array |
 | `&T` `&mut T`| a reference to a `T` (one word)               |
 | `Name`       | a struct declared with `struct Name { .. }`   |
 | `Name`       | an enum declared with `enum Name { .. }`      |
@@ -42,8 +42,7 @@ q.x = q.x + 1;                          // field read and write
 ```
 
 Fields are laid out in declaration order with no padding. A struct may contain
-another struct, but not itself, and it cannot be used as an array element.
-Field init shorthand is supported: `Point { x, y }` is `Point { x: x, y: y }`,
+another struct or an array, but not itself. Field init shorthand is supported: `Point { x, y }` is `Point { x: x, y: y }`,
 and a bare name must resolve to a local of that name. Structs may be passed to
 and returned from functions by value, assigned to one
 another (`p = q`), and nested as fields; in every case the value is copied, so a
@@ -316,9 +315,13 @@ compile-time constant is decided at compile time, not by the trap.
 - Indexing: `arr[i]`.
 - Array literals: `[a, b, c]` and `[value; count]`. A list literal takes its
   element type from the values, so `[true, false]` is a `[bool; 2]` and
-  `[1, 2, 3]` an `[i64; 3]`; mixing the two is an error. An array element is a
-  scalar — `i64`, `bool` or a unit enum — so arrays of arrays, of structs and of
-  payload enums are not supported (rustc rejects the last two as well).
+  `[1, 2, 3]` an `[i64; 3]`; mixing the two is an error. An array element may be
+  a scalar (`i64`, `bool`, a unit enum), a struct or another array, so
+  `[[i64; 3]; 2]`, `[Point; 4]` and `[[[i64; 2]; 2]; 2]` are all valid; a payload
+  enum and a reference are rejected (rustc rejects both as well). Element `i`
+  lives at `base + i * sizeof(T)`, so a wide element (a nested array or a struct)
+  occupies `size / 8` slots, and a whole element may be read, written or copied
+  (`a[i] = b[j]`, `m[i]` as a `[i64; 3]` value).
 - Struct literals: `Point { x: 1, y: 2 }`, usable as a `let` initialiser.
 - Blocks and `if`/`else` are expressions.
 - `match` on integers, enums or strings: `match x { 0 => a, 1 => b, _ => c }`,
@@ -406,7 +409,7 @@ reuse and coalesces neighbours. Memory is not zeroed.
 ## Not supported
 
 Traits, generics, borrowing, lifetimes, modules, macros, `use`, closures,
-`f32`/`f64`, `u*`/`i*` types other than `i64`, tuples, arrays of aggregates, and
+`f32`/`f64`, `u*`/`i*` types other than `i64`, tuples, and
 the standard library. References exist (`&T` / `&mut T`, `&e`, `*e`, `*e = v`),
 but without borrow checking: rmc does not prove that a reference outlives its
 referent, and `&mut` carries no exclusivity guarantee. An aggregate is still
