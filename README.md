@@ -171,7 +171,10 @@ in every position, and an array-typed struct field destructured in place),
 nested one, one mixed with plain parameters, and one on a method receiver),
 `enumpat` for payload variant patterns with sub-patterns (`_`, `mut x`, a
 trailing `..`, and a nested struct or array pattern inside `E::V(..)`, in
-`match`, `if let` and a method, and read through a `&E` scrutinee), `tuple` for
+`match`, `if let` and a method, and read through a `&E` scrutinee), `atpat` for
+`@` bindings (`n @ _`, `n @ m`, `t @ (a, b)`, a struct field `f: n @ _`, a `for`
+head, a refutable `n @ 1..=5` in a `match` arm and an `if let`, and `n @ _` /
+`mut n @ _` parameters), `tuple` for
 tuples (construction, `.0` element access, destructuring in a `let`, a `match`
 arm and a parameter, nesting, a tuple-typed struct field, an array of tuples,
 and a tuple behind a reference, used as parameter and return types), and
@@ -251,7 +254,10 @@ structs with named fields
 `[a, b, .., c]` (in `let`/`for`/`match`/`if let`, with `_`, `mut`, nested
 patterns and `..` rests, also usable on an array-typed struct field,
 `let P { a: [x, y], .. } = p;`), and tuple patterns
-`(a, b)` / `(x, _, mut z)` (the same positions, and `.0`/`.1` element access));
+`(a, b)` / `(x, _, mut z)` (the same positions, and `.0`/`.1` element access),
+and `@` bindings `n @ PAT` (`n @ _`, `n @ m`, `t @ (a, b)`, a struct field
+`f: n @ _`, a `for` head, and `n @ _` / `mut n @ _` parameters, with the
+sub-pattern required to be irrefutable in an irrefutable position));
 functions with up to six parameters, which may be written as an aggregate
 pattern (`fn f(P { x, y }: P)`, `fn f([a, b]: [i64; 2])`, nested and mixed with
 plain parameters); `let` / `let mut` / `let _` (discard); assignment to variables,

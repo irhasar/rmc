@@ -86,6 +86,8 @@ pub enum Tok {
     ShlEq,
     ShrEq,
     Underscore,
+    /// `@`, the binding operator in a pattern: `name @ subpat`.
+    At,
 }
 
 impl Tok {
@@ -169,6 +171,7 @@ impl Tok {
             Tok::ShlEq => "<<=",
             Tok::ShrEq => ">>=",
             Tok::Underscore => "_",
+            Tok::At => "@",
             _ => "?",
         }
     }
@@ -437,6 +440,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             b'^' => Tok::Caret,
             b'!' => Tok::Bang,
             b'.' => Tok::Dot,
+            b'@' => Tok::At,
             _ => return Err(format!("unexpected character `{}` at byte {}", c as char, i)),
         };
         out.push(Token { tok: one, pos });

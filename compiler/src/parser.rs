@@ -614,19 +614,29 @@ impl Parser {
         // `S {`, `[` or `(` at the start of a parameter is a destructuring
         // pattern, not a name: none can begin a plain `p: T`. A leading `mut`
         // on a pattern is rejected, as rustc rejects `mut S { x }: S` (the
-        // `mut` belongs on each binding).
+        // `mut` belongs on each binding). `n @ subpat` is likewise a pattern,
+        // but there `mut` is legal and attaches to `n`.
+        let at_pat = matches!(self.peek(), Some(Tok::Ident(_)))
+            && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::At);
         let pat = if matches!(self.peek(), Some(Tok::LBracket))
             || matches!(self.peek(), Some(Tok::LParen))
+            || at_pat
             || matches!(self.peek(), Some(Tok::Ident(_))
                 if self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::LBrace))
         {
-            if pm {
+            if pm && !at_pat {
                 return Err(format!(
                     "at byte {}: `mut` must be attached to each individual binding",
                     self.pos()
                 ));
             }
-            Some(self.parse_pattern()?)
+            let mut p = self.parse_pattern()?;
+            if at_pat {
+                if let Pat::At(_, ref mut m, _) = p {
+                    *m = pm;
+                }
+            }
+            Some(p)
         } else {
             None
         };
@@ -669,6 +679,26 @@ impl Parser {
                 init: Some(subj.clone()),
                 slot: -1,
             }]),
+            // `n @ subpat: T` binds the whole argument to `n` and also
+            // destructures it. `subpat` must be irrefutable, as for any
+            // parameter pattern.
+            Pat::At(name, am, sub) => {
+                if !Self::pat_irrefutable(&sub) {
+                    return Err(format!(
+                        "at byte {}: a parameter pattern must be irrefutable (a struct, tuple or array pattern)",
+                        self.pos()
+                    ));
+                }
+                let mut binds = vec![Stmt::Let {
+                    name,
+                    ty: None,
+                    mutable: am,
+                    init: Some(subj.clone()),
+                    slot: -1,
+                }];
+                Self::pat_binds(&sub, false, subj, &mut binds);
+                Ok(binds)
+            }
             _ => Err(format!(
                 "at byte {}: a parameter pattern must be irrefutable (a struct, tuple or array pattern)",
                 self.pos()
@@ -958,13 +988,28 @@ impl Parser {
                 self.expect(Tok::DotDot)?;
             }
             let end = self.parse_cond()?;
-            let body = self.parse_block()?;
-            let var = match pat {
-                Pat::Bind(n) => n,
+            let mut body = self.parse_block()?;
+            // A range's loop variable is bound directly, so only an irrefutable
+            // pattern is allowed: `for n @ _ in 0..5` binds `n`, and
+            // `for n @ m in 0..5` also binds `m` (an alias) in the body.
+            let (var, extra) = match pat {
+                Pat::Bind(n) => (n, Vec::new()),
                 Pat::Wild => {
                     let n = format!("\u{0}fi{}", self.tmp);
                     self.tmp += 1;
-                    n
+                    (n, Vec::new())
+                }
+                Pat::At(n, _, sub) => {
+                    if !Self::pat_irrefutable(&sub) {
+                        return Err(format!(
+                            "at byte {}: refutable pattern in `for` binding",
+                            self.pos()
+                        ));
+                    }
+                    let subj = Expr::Var { name: n.clone(), slot: -1, ty: Type::I64 };
+                    let mut binds = Vec::new();
+                    Self::pat_binds(&sub, false, &subj, &mut binds);
+                    (n, binds)
                 }
                 _ => {
                     return Err(format!(
@@ -973,6 +1018,11 @@ impl Parser {
                     ))
                 }
             };
+            if !extra.is_empty() {
+                let mut stmts = extra;
+                stmts.extend(body.stmts);
+                body = Block { stmts, tail: body.tail };
+            }
             return Ok(Stmt::For {
                 var,
                 var_slot: -1,
@@ -1037,6 +1087,26 @@ impl Parser {
             Pat::Tuple(elems) => self.let_destructure_tuple_stmts(elems, None, elem),
             Pat::Array { elems, rest, front } => {
                 self.let_destructure_array_stmts(elems, rest, front, None, elem)
+            }
+            // `for n @ subpat in arr` binds the element to `n` and also matches
+            // it against `subpat`. The sub-pattern must be irrefutable (a `for`
+            // pattern is), which rustc enforces too.
+            Pat::At(name, am, sub) => {
+                if !Self::pat_irrefutable(&sub) {
+                    return Err(format!(
+                        "at byte {}: refutable pattern in `for` binding",
+                        self.pos()
+                    ));
+                }
+                let mut stmts = vec![Stmt::Let {
+                    name,
+                    ty: None,
+                    init: Some(elem.clone()),
+                    slot: -1,
+                    mutable: am,
+                }];
+                Self::pat_binds(&sub, false, &elem, &mut stmts);
+                stmts
             }
             _ => {
                 return Err(format!(
@@ -1182,11 +1252,16 @@ impl Parser {
                 // from it. `..` and `f: _` are the only way to drop fields.
                 let struct_pat = matches!(self.peek(), Some(Tok::Ident(_)))
                     && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::LBrace);
+                // `let n @ subpat = e;` binds the whole value to `n` and also
+                // destructures it. Detected by the `@` after the name.
+                let at_pat = matches!(self.peek(), Some(Tok::Ident(_)))
+                    && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::At);
                 if struct_pat
+                    || at_pat
                     || self.peek() == Some(&Tok::LBracket)
                     || self.peek() == Some(&Tok::LParen)
                 {
-                    if mutable {
+                    if mutable && !at_pat {
                         return Err(format!(
                             "at byte {}: `mut` must be attached to each individual binding, as `S {{ mut f }}`",
                             self.pos()
@@ -1221,6 +1296,29 @@ impl Parser {
                             slot: -1,
                             mutable: false,
                         }),
+                        // `let n @ subpat = e;` binds the whole value to `n`
+                        // and also matches it against `subpat`. It is a local
+                        // binding, so `subpat` must be irrefutable: `let n @
+                        // 1..=5 = e;` is a refutable local binding, which rustc
+                        // rejects (E0005).
+                        Pat::At(name, am, sub) => {
+                            if !Self::pat_irrefutable(&sub) {
+                                return Err(format!(
+                                    "at byte {}: refutable pattern in local binding",
+                                    self.pos()
+                                ));
+                            }
+                            let (mut stmts, subj) = self.let_destructure_prelude(ty, init);
+                            stmts.push(Stmt::Let {
+                                name,
+                                ty: None,
+                                init: Some(subj.clone()),
+                                slot: -1,
+                                mutable: mutable || am,
+                            });
+                            Self::pat_binds(&sub, false, &subj, &mut stmts);
+                            out.extend(stmts)
+                        }
                         Pat::Wild => out.push(Stmt::Let {
                             name: "\u{0}wild".to_string(),
                             ty,
@@ -1823,6 +1921,21 @@ impl Parser {
 
     fn parse_pattern_primary(&mut self) -> PResult<Pat> {
         match self.peek().cloned() {
+            // `mut name @ subpat` / `mut name`: a mutable binding. Only a
+            // refutable position (a `match` arm or an `if let` / `while let`
+            // scrutinee) writes `mut` here; a `let` or `for` writes it before
+            // the whole pattern. Represented as `name @ subpat` with the
+            // binding flag set, `_` standing in for the absent sub-pattern.
+            Some(Tok::Mut) if self.pat_refutable_ok => {
+                self.i += 1;
+                let n = self.expect_ident()?;
+                let sub = if self.eat(&Tok::At) {
+                    self.parse_pattern_primary()?
+                } else {
+                    Pat::Wild
+                };
+                Ok(Pat::At(n, true, Box::new(sub)))
+            }
             // `(a, b)`: a tuple pattern. `(` cannot start a binding, a constant
             // or a literal pattern, so it is unambiguous here.
             Some(Tok::LParen) => self.parse_tuple_pat(),
@@ -1850,7 +1963,17 @@ impl Parser {
                 self.i += 1;
                 Ok(Pat::Str(s))
             }
-            // `Enum::Variant`, `Enum::Variant(a, b)`, a constant, or a binding.
+            // `name @ subpat`: bind the whole value and also match it against
+            // the sub-pattern. `@` cannot begin any other pattern, so it is
+            // unambiguous here; a `mut` may precede the name.
+            Some(Tok::Ident(n)) if self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::At) => {
+                self.i += 2;
+                let sub = self.parse_pattern_primary()?;
+                Ok(Pat::At(n, false, Box::new(sub)))
+            }
+            // A bare name that is a constant is that constant's value, a name
+            // that is a struct starts a struct pattern, and anything else binds
+            // the scrutinee; `_` already matched the wildcard case above.
             Some(Tok::Ident(n)) => {
                 self.i += 1;
                 if self.eat(&Tok::ColonColon) {
@@ -1935,7 +2058,7 @@ impl Parser {
             } else {
                 self.parse_pattern_primary()?
             };
-            if m && !matches!(p, Pat::Bind(_)) {
+            if m && !matches!(p, Pat::Bind(_) | Pat::At(..)) {
                 return Err(format!(
                     "at byte {}: `mut` is not allowed here; it attaches to a binding",
                     self.pos()
@@ -2042,6 +2165,22 @@ impl Parser {
                         ));
                     }
                     Some((false, self.parse_array_pat()?))
+                } else if matches!(self.peek(), Some(Tok::Ident(_)))
+                    && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::At)
+                {
+                    // `f: n @ subpat` binds the field to `n` and also
+                    // destructures it. The sub-pattern must be irrefutable,
+                    // since rmc generates no per-field test.
+                    let name = self.expect_ident()?;
+                    self.i += 1; // the `@`
+                    let sub = self.parse_pattern_primary()?;
+                    if !Self::pat_irrefutable(&sub) {
+                        return Err(format!(
+                            "at byte {}: a struct field sub-pattern must be irrefutable",
+                            self.pos()
+                        ));
+                    }
+                    Some((m, Pat::At(name, m, Box::new(sub))))
                 } else {
                     Some((m, Pat::Bind(self.expect_ident()?)))
                 }
@@ -2121,7 +2260,7 @@ impl Parser {
             // `mut` may precede an element binding (`[mut a, b]`), as in rustc.
             let m = self.eat(&Tok::Mut);
             let p = self.parse_pattern_primary()?;
-            if m && !matches!(p, Pat::Bind(_)) {
+            if m && !matches!(p, Pat::Bind(_) | Pat::At(..)) {
                 return Err(format!(
                     "at byte {}: `mut` is not allowed here; it attaches to a binding",
                     self.pos()
@@ -2162,7 +2301,7 @@ impl Parser {
         // An element may be an or-pattern (`(0 | 1, x)`), which `parse_pattern`
         // collects; a lone primary is returned unchanged.
         let first = self.parse_pattern()?;
-        if m && !matches!(first, Pat::Bind(_)) {
+        if m && !matches!(first, Pat::Bind(_) | Pat::At(..)) {
             return Err(format!(
                 "at byte {}: `mut` is not allowed here; it attaches to a binding",
                 self.pos()
@@ -2183,7 +2322,7 @@ impl Parser {
             }
             let m = self.eat(&Tok::Mut);
             let p = self.parse_pattern()?;
-            if m && !matches!(p, Pat::Bind(_)) {
+            if m && !matches!(p, Pat::Bind(_) | Pat::At(..)) {
                 return Err(format!(
                     "at byte {}: `mut` is not allowed here; it attaches to a binding",
                     self.pos()
@@ -2239,6 +2378,18 @@ impl Parser {
                     slot: -1,
                 }),
                 Pat::Wild => {}
+                // `name @ subpat`: bind the element to `name`, then bind the
+                // sub-pattern's names from the same element read.
+                Pat::At(name, am, sub) => {
+                    out.push(Stmt::Let {
+                        name: name.clone(),
+                        ty: None,
+                        mutable: *m || *am,
+                        init: Some(field.clone()),
+                        slot: -1,
+                    });
+                    Self::pat_binds(sub, false, &field, &mut out);
+                }
                 Pat::Struct(_, inner) => out.extend(Self::struct_pat_binds(inner, &field)),
                 Pat::Tuple(inner) => out.extend(Self::tuple_pat_binds(inner, &field)),
                 Pat::Array { elems, rest, front } => {
@@ -2300,6 +2451,18 @@ impl Parser {
                     init: Some(index),
                     slot: -1,
                 }),
+                // `name @ subpat`: bind the element to `name`, then bind the
+                // sub-pattern's names from the same index read.
+                Pat::At(name, am, sub) => {
+                    out.push(Stmt::Let {
+                        name: name.clone(),
+                        ty: None,
+                        mutable: *m || *am,
+                        init: Some(index.clone()),
+                        slot: -1,
+                    });
+                    Self::pat_binds(sub, false, &index, &mut out);
+                }
                 Pat::Array { elems, rest, front } => {
                     out.extend(Self::array_pat_binds(elems, *rest, *front, &index))
                 }
@@ -2439,6 +2602,9 @@ impl Parser {
     fn pat_test(p: &Pat, subj: &Expr) -> Option<Expr> {
         match p {
             Pat::Wild | Pat::Bind(_) | Pat::Struct(..) => None,
+            // `name @ subpat`: the binding itself adds no test; the sub-pattern's
+            // test is the whole test.
+            Pat::At(_, _, sub) => Self::pat_test(sub, subj),
             Pat::Tuple(elems) => Self::tuple_pat_test(elems, subj),
             // `a | b | c` as an element: any alternative matching passes. A `_`
             // alternative makes the whole element always true, so there is no
@@ -2515,6 +2681,8 @@ impl Parser {
     fn tuple_element_ok(p: &Pat) -> bool {
         match p {
             Pat::Wild | Pat::Bind(_) | Pat::Struct(..) | Pat::Tuple(_) => true,
+            // `name @ subpat` is allowed when its sub-pattern is.
+            Pat::At(_, _, sub) => Self::tuple_element_ok(sub),
             Pat::Array { .. } => Self::pat_irrefutable(p),
             Pat::Int(_) | Pat::Bool(_) | Pat::Str(_) | Pat::Range(..) => true,
             // An or-pattern is allowed when every alternative is a scalar test
@@ -2534,6 +2702,8 @@ impl Parser {
             // ignores the rest, with no test, so an arm using one is a catch-all.
             // A tuple pattern matches when every element pattern does.
             Pat::Wild | Pat::Bind(_) | Pat::Struct(..) => true,
+            // `name @ subpat` is irrefutable exactly when its sub-pattern is.
+            Pat::At(_, _, sub) => Self::pat_irrefutable(sub),
             Pat::Tuple(elems) => elems.iter().all(|(_, p)| Self::pat_irrefutable(p)),
             // An array pattern matches when every element pattern does.
             Pat::Array { elems, .. } => elems
@@ -2717,6 +2887,10 @@ impl Parser {
             // rejected before this point. A tuple alternative folds its
             // elements' tests with `&&`, or is `true` when it has none.
             Pat::Wild | Pat::Struct(..) => Expr::Bool(true),
+            // `n @ subpat` as an alternative: its test is the sub-pattern's
+            // (the binding is emitted separately, and an or-alternative binds
+            // nothing, so `n` is rejected here like any other binding).
+            Pat::At(_, _, sub) => Self::or_cond(sub, subj),
             Pat::Tuple(elems) => Self::tuple_pat_test(elems, subj).unwrap_or(Expr::Bool(true)),
             // A binding inside an or-pattern is rejected before this point; an
             // array pattern is not supported as an or-alternative.
@@ -2829,6 +3003,18 @@ impl Parser {
                     init: Some(field),
                     slot: -1,
                 }),
+                // `f: name @ subpat`: bind the field to `name`, then bind the
+                // sub-pattern's names from the same field read.
+                Pat::At(name, am, sub) => {
+                    out.push(Stmt::Let {
+                        name: name.clone(),
+                        ty: None,
+                        mutable: *m || *am,
+                        init: Some(field.clone()),
+                        slot: -1,
+                    });
+                    Self::pat_binds(sub, false, &field, &mut out);
+                }
                 Pat::Struct(_, inner) => out.extend(Self::struct_pat_binds(inner, &field)),
                 Pat::Tuple(inner) => out.extend(Self::tuple_pat_binds(inner, &field)),
                 // An array-typed field may be destructured by an array pattern.
@@ -2845,27 +3031,43 @@ impl Parser {
 
     /// The `let` statements one sub-pattern introduces, reading from `subj`.
     /// `m` is a `mut` written before the pattern; only a binding may carry it.
-    /// A binding becomes one `let`; a wildcard binds nothing; a struct or array
-    /// pattern recurses, reading through `subj` (its own fields/elements). Used
-    /// by a payload variant's arguments, so `E::A(S { x })` and `E::A([a, b])`
-    /// expand to the same reads the equivalent `let` would.
-    fn pat_binds_into(pat: Pat, m: bool, subj: &Expr, out: &mut Vec<Stmt>) {
+    /// A binding becomes one `let`; a wildcard binds nothing; a struct, tuple
+    /// or array pattern recurses, reading through `subj` (its own fields or
+    /// elements). Shared by the `let`/`for`/`match` paths and a payload
+    /// variant's arguments, so `E::A(S { x })` expands to the same read the
+    /// equivalent `let` would.
+    fn pat_binds(pat: &Pat, m: bool, subj: &Expr, out: &mut Vec<Stmt>) {
         match pat {
             Pat::Bind(name) => out.push(Stmt::Let {
-                name,
+                name: name.clone(),
                 ty: None,
                 mutable: m,
                 init: Some(subj.clone()),
                 slot: -1,
             }),
             Pat::Wild => {}
-            Pat::Struct(_, fields) => out.extend(Self::struct_pat_binds(&fields, subj)),
-            Pat::Tuple(elems) => out.extend(Self::tuple_pat_binds(&elems, subj)),
-            Pat::Array { elems, rest, front } => {
-                out.extend(Self::array_pat_binds(&elems, rest, front, subj))
+            // `name @ subpat`: bind the whole value to `name`, then bind the
+            // sub-pattern's names from the same value.
+            Pat::At(name, am, sub) => {
+                out.push(Stmt::Let {
+                    name: name.clone(),
+                    ty: None,
+                    mutable: m || *am,
+                    init: Some(subj.clone()),
+                    slot: -1,
+                });
+                Self::pat_binds(sub, false, subj, out);
             }
-            // `parse_variant_pat_args` rejects anything else.
-            _ => unreachable!("unexpected variant argument pattern"),
+            Pat::Struct(_, fields) => out.extend(Self::struct_pat_binds(fields, subj)),
+            Pat::Tuple(elems) => out.extend(Self::tuple_pat_binds(elems, subj)),
+            Pat::Array { elems, rest, front } => {
+                out.extend(Self::array_pat_binds(elems, *rest, *front, subj))
+            }
+            // A scalar element binds nothing (its test is generated
+            // separately); an or-pattern binds nothing (rmc rejects a binding
+            // in an or-pattern when it is parsed).
+            Pat::Int(_) | Pat::Bool(_) | Pat::Str(_) | Pat::Range(..) | Pat::Or(_) => {}
+            _ => unreachable!("unexpected sub-pattern"),
         }
     }
 
@@ -2876,6 +3078,9 @@ impl Parser {
     fn first_bound_name(p: &Pat) -> Option<String> {
         match p {
             Pat::Bind(n) => Some(n.clone()),
+            // `name @ subpat` binds `name` first, then whatever the sub-pattern
+            // binds.
+            Pat::At(n, _, _) => Some(n.clone()),
             // A payload variant pattern binds the names of its argument
             // sub-patterns; a nested variant pattern would too, but it is
             // rejected before this point.
@@ -2894,23 +3099,29 @@ impl Parser {
         }
     }
 
-    /// One arm of a desugared `match` or `if let`: the pattern test, the
-    /// bindings it introduces, and the fallback `rest` for a non-match.
-    fn desugar_arm(
-        &mut self,
-        pat: Pat,
-        guard: Option<Expr>,
-        subj: &Expr,
-        body: Expr,
-        rest: Option<Expr>,
-        check_dead: bool,
-    ) -> PResult<Expr> {
-        // Each pattern yields its test (`None` when it is irrefutable) and any
-        // bindings it introduces. The test is an ordinary expression, so sema
-        // and codegen need no new case for a guard: it is folded in with `&&`,
-        // and an irrefutable arm's guard becomes the whole `if` condition.
-        let (bindings, test): (Vec<Stmt>, Option<Expr>) = match pat {
+    /// The bindings and the optional test a pattern contributes to an arm.
+    /// A test is `None` when the pattern is irrefutable, so the arm is a
+    /// catch-all. `Pat::At` binds the whole value and recurses into its
+    /// sub-pattern, so `n @ 1..=5` binds `n` and adds the range test.
+    fn arm_pattern_parts(pat: Pat, subj: &Expr) -> (Vec<Stmt>, Option<Expr>) {
+        match pat {
             Pat::Wild => (Vec::new(), None),
+            // `name @ subpat` binds the whole value to `name`, then matches the
+            // same value against `subpat`, which contributes its own bindings
+            // and test: `n @ 1..=5` binds `n` and adds the range test, and
+            // `n @ (a, b)` binds all three.
+            Pat::At(name, m, sub) => {
+                let mut binds = vec![Stmt::Let {
+                    name,
+                    ty: None,
+                    mutable: m,
+                    init: Some(subj.clone()),
+                    slot: -1,
+                }];
+                let (sub_binds, test) = Self::arm_pattern_parts(*sub, subj);
+                binds.extend(sub_binds);
+                (binds, test)
+            }
             // `S { f, g: h } => body` is irrefutable, so it has no test: it binds
             // each named field to a fresh local via a field read. The reads are
             // left for sema to type and locate, so a non-struct scrutinee is a
@@ -3027,7 +3238,7 @@ impl Parser {
                                 offset: 0,
                                 ty: Type::Unit,
                             };
-                            Self::pat_binds_into(pat, m, &payload, &mut out);
+                            Self::pat_binds(&pat, m, &payload, &mut out);
                         }
                         out
                     }
@@ -3035,7 +3246,25 @@ impl Parser {
                 };
                 (binds, Some(cond))
             }
-        };
+        }
+    }
+
+    /// One arm of a desugared `match` or `if let`: the pattern test, the
+    /// bindings it introduces, and the fallback `rest` for a non-match.
+    fn desugar_arm(
+        &mut self,
+        pat: Pat,
+        guard: Option<Expr>,
+        subj: &Expr,
+        body: Expr,
+        rest: Option<Expr>,
+        check_dead: bool,
+    ) -> PResult<Expr> {
+        // Each pattern yields its test (`None` when it is irrefutable) and any
+        // bindings it introduces. The test is an ordinary expression, so sema
+        // and codegen need no new case for a guard: it is folded in with `&&`,
+        // and an irrefutable arm's guard becomes the whole `if` condition.
+        let (bindings, test) = Self::arm_pattern_parts(pat, &subj);
         let arm = match test {
             Some(cond) => {
                 // `pat if g => body` is `pat => body` only when `g` holds, so
@@ -3440,6 +3669,12 @@ enum Pat {
     /// struct, so element `k` is the field `"k"`). The element count must match
     /// the scrutinee's arity, which sema enforces through those reads.
     Tuple(Vec<(bool, Pat)>),
+    /// `name @ subpat`: bind the whole value to `name` and also match it
+    /// against `subpat`, so `n @ 1..=5` binds `n` and tests the range. The
+    /// flag is a `mut` written before the name (`mut n @ pat`). The binding
+    /// is emitted like any other, and the sub-pattern contributes its own test
+    /// and bindings, so `n @ (a, b)` binds all three.
+    At(String, bool, Box<Pat>),
 }
 
 /// One field of a struct pattern: its name and what it binds. `None` is

@@ -241,7 +241,9 @@ fn name(a: i64, b: bool) -> i64 { ... }
   binds its names at the top of the body, exactly as the matching `let`
   destructuring would, so `mut` is per binding and a name may not collide with
   another parameter (rustc's `E0415`). A refutable pattern (a literal, a variant,
-  an or-pattern) is rejected, as is `mut` on the whole pattern.
+  an or-pattern) is rejected, as is `mut` on the whole pattern. An at-binding is
+  accepted here too (`fn f(n @ _: i64)`, `fn f(t @ (a, b): (i64, i64))`), with
+  `mut` allowed before the name; its sub-pattern must be irrefutable.
 - The return type may be omitted, in which case it is `()`.
 - Recursion is supported. `main` is the entry point; its return value becomes
   the process exit status.
@@ -351,8 +353,9 @@ at run time only when `--overflow-checks` is on. `for` bounds are evaluated
 once, before the loop; `continue` still runs the increment. `for x in arr`
 iterates an array by value: the head is evaluated once, the bound is the
 array's compile-time length, and `x` is a fresh immutable binding each
-iteration. The loop variable may be a binding, `_`, or a struct pattern
-(`for S { f, .. } in arr`), an array pattern (`for [x, y] in pairs`), which binds
+iteration. The loop variable may be a binding, `_`, a struct pattern
+(`for S { f, .. } in arr`), an array pattern (`for [x, y] in pairs`), or an
+at-binding (`for n @ _ in arr`, `for i @ j in 0..3`), which binds
 each element's fields or elements fresh each iteration; any other pattern is
 refutable and rejected. `for x in &arr`
 (which Rust iterates by reference) is rejected rather than mistyped. `while let` is
@@ -460,7 +463,7 @@ compile-time constant is decided at compile time, not by the trap.
   arm pattern is an integer literal (optionally negated), an integer *range*
   `lo..hi` / `lo..=hi`, a *string* literal, an `Enum::Variant`, a struct
   pattern `S { f, .. }` (see below), a *tuple* pattern `(a, b)` (see below),
-  an *or-pattern* `a | b | c`, or `_`. The
+  an *or-pattern* `a | b | c`, an *at-binding* `n @ PAT` (see below), or `_`. The
   first matching arm
   runs and `_` matches anything; it is an expression, usable as a statement or a
   value, and a comma before `}` may be omitted. An arm body is an expression,
@@ -526,6 +529,23 @@ compile-time constant is decided at compile time, not by the trap.
   even for `i: _`, and a field bound twice is an error. Because a struct pattern
   is irrefutable, a *binding* struct pattern in an or-pattern is rejected, as is
   any binding alternative (a nested binding counts).
+- At-bindings: `name @ subpat` binds the whole value to `name` and also matches
+  it against `subpat`, so the arm body (or the rest of the block) sees both the
+  whole value and the sub-pattern's bindings. `name @ _` is the plain alias, and
+  the two compose: `n @ m @ _` binds the value to both `n` and `m`. A `mut`
+  before the name (`mut n @ subpat`) makes the alias mutable. `subpat` may be
+  `_`, a binding, a struct, tuple or array pattern, or — in a refutable position
+  — a literal, a range, an or-pattern or a variant. An at-binding is accepted
+  everywhere a pattern is: a `match` arm (`n @ 1..=5 => ..`), an `if let` /
+  `while let`, a struct field (`S { x: n @ _ }`), an array element
+  (`[n @ _, m]`), a `let`, a `for` head and a parameter
+  (`fn f(n @ _: i64)`). Where the position is irrefutable (`let`, `for`,
+  parameters, and the sub-pattern of a struct field), `subpat` must be
+  irrefutable too, so `let n @ 1..=5 = e;` and `for n @ 1..=5 in ..` are
+  rejected, as rustc rejects a refutable local binding (`E0005`). A binding
+  alternative inside an or-pattern is still rejected: `n @ 1 | 2` is `E0408`.
+  An at-binding whose sub-pattern is a `..` rest (`first @ ..`, a sub-slice
+  binding) is not supported, as rmc has no slice type.
 - `let` destructuring: `let S { f, g: h, i: _, .. } = e;` uses the same struct
   pattern grammar and binds the named fields as fresh locals in the enclosing
   block, so they stay visible for the rest of it. The pattern is irrefutable by
@@ -538,7 +558,10 @@ compile-time constant is decided at compile time, not by the trap.
   destructured by a nested sub-pattern (`let S { a: I { x } } = e;`), which
   expands to a chain of field reads; an array-typed field may be destructured by
   an array pattern (`let S { a: [x, y] } = e;`), which expands to field reads
-  followed by index reads.
+  followed by index reads. An at-binding is accepted here too
+  (`let n @ _ = e;`, `let t @ (a, b) = e;`, `let S { x: n @ _ } = e;`), binding
+  the whole value as well as the sub-pattern's names; `subpat` must be
+  irrefutable, so `let n @ 1..=5 = e;` is rejected.
 - Array patterns: `[a, b, .., c]` matches an array and binds its elements. Each
   element is a sub-pattern: a binding (`a`), an ignored element (`_`), or a
   nested array or struct pattern (`[[p, q], s]`, `[P { x }, y]`). A single `..`

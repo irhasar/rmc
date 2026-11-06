@@ -4923,3 +4923,156 @@ fn a_tuple_element_test_reads_the_element_field() {
     let body = &out[out.find("f:").expect("f")..out.find("main:").expect("main")];
     assert!(body.contains("cmpq $0,"), "expected an equality test:\n{body}");
 }
+
+
+#[test]
+fn an_at_binding_binds_the_whole_value() {
+    let out = asm("fn main() -> i64 { let x = 3; let n @ _ = x; return n; }");
+    assert!(out.contains("main:"));
+}
+
+#[test]
+fn an_at_binding_chain_binds_every_name() {
+    let out = asm("fn main() -> i64 { let x = 3; let p @ q @ _ = x; return p + q; }");
+    assert!(out.contains("main:"));
+}
+
+#[test]
+fn an_at_binding_may_be_mutable() {
+    let out = asm("fn main() -> i64 { let x = 3; let mut n @ _ = x; n = n + 1; return n; }");
+    assert!(out.contains("main:"));
+}
+
+#[test]
+fn an_at_binding_binds_a_tuple_sub_pattern() {
+    let out = asm("fn main() -> i64 { let t @ (a, b) = (1, 2); return t.0 + t.1 + a + b; }");
+    assert!(out.contains("main:"));
+}
+
+#[test]
+fn an_at_binding_on_a_struct_field_binds_the_field() {
+    let out = asm(
+        "struct S { x: i64 } fn main() -> i64 { let s = S { x: 1 }; let S { x: n @ _ } = s; return n; }",
+    );
+    assert!(out.contains("main:"));
+}
+
+#[test]
+fn an_at_binding_on_a_struct_field_may_be_mutable() {
+    let out = asm(
+        "struct S { x: i64 } fn main() -> i64 { let s = S { x: 1 }; \
+         let S { x: mut n @ _ } = s; n = n + 1; return n; }",
+    );
+    assert!(out.contains("main:"));
+}
+
+#[test]
+fn an_at_binding_in_a_for_range_head_is_accepted() {
+    let out = asm(
+        "fn main() -> i64 { let mut s = 0; for i @ j in 0..3 { s = s + i + j; } return s; }",
+    );
+    assert!(out.contains("main:"));
+}
+
+#[test]
+fn an_at_binding_in_a_for_array_head_is_accepted() {
+    let out = asm("fn main() -> i64 { let a = [1, 2, 3]; let mut s = 0; \
+         for e @ _ in a { s = s + e; } return s; }");
+    assert!(out.contains("main:"));
+}
+
+#[test]
+fn an_at_binding_in_a_match_arm_may_test_the_sub_pattern() {
+    let out = asm(
+        "fn main() -> i64 { match 3 { n @ 1..=5 => { return n; } _ => { return 0; } } }",
+    );
+    assert!(out.contains("main:"));
+}
+
+#[test]
+fn an_at_binding_in_an_if_let_is_accepted() {
+    let out = asm("fn main() -> i64 { if let n @ 1..=5 = 3 { return n; } return 0; }");
+    assert!(out.contains("main:"));
+}
+
+#[test]
+fn an_at_binding_in_a_match_arm_may_be_mutable() {
+    let out = asm(
+        "fn main() -> i64 { match 3 { mut n @ 1..=5 => { n = n + 1; return n; } _ => { return 0; } } }",
+    );
+    assert!(out.contains("main:"));
+}
+
+#[test]
+fn an_at_binding_in_a_parameter_is_accepted() {
+    let out = asm(
+        "fn f(n @ _: i64) -> i64 { return n; } fn main() -> i64 { return f(3); }",
+    );
+    assert!(out.contains("main:"));
+}
+
+#[test]
+fn an_at_binding_in_a_parameter_may_be_mutable() {
+    let out = asm(
+        "fn f(mut n @ _: i64) -> i64 { n = n + 1; return n; } fn main() -> i64 { return f(3); }",
+    );
+    assert!(out.contains("main:"));
+}
+
+#[test]
+fn an_at_binding_in_a_tuple_parameter_is_accepted() {
+    let out = asm(
+        "fn f(t @ (a, b): (i64, i64)) -> i64 { return t.0 + a + b; } \
+         fn main() -> i64 { return f((1, 2)); }",
+    );
+    assert!(out.contains("main:"));
+}
+
+#[test]
+fn a_refutable_at_binding_in_a_let_is_rejected() {
+    // rustc rejects `let n @ 1..=5 = e;` as a refutable local binding (E0005).
+    let err = compile_to_asm(
+        "fn main() -> i64 { let x = 3; let n @ 1..=5 = x; return n; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("refutable pattern in local binding"), "got: {err}");
+}
+
+#[test]
+fn a_refutable_at_binding_in_a_for_range_is_rejected() {
+    let err = compile_to_asm(
+        "fn main() -> i64 { let mut s = 0; for n @ 1..=5 in 0..3 { s = s + n; } return s; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("refutable pattern in `for` binding"), "got: {err}");
+}
+
+#[test]
+fn an_at_binding_test_reads_the_scrutinee() {
+    // `n @ 1..=5` adds the range test, exactly as `n` alone would.
+    let out = asm_no_inline(
+        "fn f(x: i64) -> i64 { match x { n @ 1..=5 => { return n; } _ => { return 0; } } } \
+         fn main() -> i64 { return f(3); }",
+    );
+    let body = &out[out.find("f:").expect("f")..out.find("main:").expect("main")];
+    assert!(body.contains("cmpq $5,"), "expected a range test:\n{body}");
+}
+
+#[test]
+fn a_mutable_at_binding_in_an_array_element_is_accepted() {
+    let out = asm(
+        "fn main() -> i64 { let a = [1, 2]; let [mut n @ _, m] = a; \
+         n = n + 1; return n + m; }",
+    );
+    assert!(out.contains("main:"));
+}
+
+#[test]
+fn a_mutable_at_binding_in_a_tuple_element_is_accepted() {
+    let out = asm(
+        "fn main() -> i64 { let (mut n @ _, m) = (1, 2); n = n + 1; return n + m; }",
+    );
+    assert!(out.contains("main:"));
+}
