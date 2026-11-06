@@ -186,9 +186,21 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   `struct_pat_binds` (a nested struct/tuple/array element recurses with the field
   read as the sub-scrutinee). No sema or codegen case. It is irrefutable when
   every element is, so it joins `pat_irrefutable`, `first_bound_name`, `or_cond`
-  (treated as `true`, like a struct pattern) and the
+  and the
   `let`/`for`/`match`/parameter paths through `let_destructure_tuple_stmts` (the
   `let_destructure_prelude` helper shares the hidden-scrutinee logic).
+  In a *refutable* position (a `match` arm or an `if let` / `while let`
+  scrutinee) a tuple element may be a scalar test. The parser tracks this with
+  `pat_refutable_ok`, set by `parse_refutable_pattern` at the four refutable
+  call sites; `parse_tuple_pat` rejects a non-irrefutable element when it is
+  clear. `tuple_pat_test` builds the arm's test as the `&&` of each element's
+  test (`pat_test`), each read through the element's field; `None` when every
+  element is irrefutable, so the arm stays a catch-all. A refutable element may
+  not bind or be a variant (`tuple_element_ok` rejects `E::V(x)`), since the
+  test carries no payload. `pat_test` also handles an or-pattern element
+  (`(0 | 1, x)`) by folding `or_cond` with `||`, and `or_cond` handles a tuple
+  alternative the same way; `parse_tuple_pat` therefore parses each element with
+  `parse_pattern` (not `parse_pattern_primary`) so an or-pattern is collected.
   A tuple *type* `(A, B)` is lowered by `lower_tuple_type` (in `parse_type`) to
   the same anonymous struct, named by the canonical element-type keys
   (`ast::tuple_struct_name`), and a tuple *literal* `(a, b)` stays `Expr::TupleLit`

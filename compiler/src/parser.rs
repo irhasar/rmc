@@ -44,6 +44,14 @@ pub struct Parser {
     /// `tuple_defs` and appended to the program's structs once parsing is done.
     tuple_structs: std::collections::HashSet<String>,
     tuple_defs: Vec<StructDef>,
+    /// True while parsing a pattern that may be refutable (a `match` arm, an
+    /// `if let` / `while let` scrutinee). A tuple pattern is irrefutable only
+    /// when every element is, but in a refutable position its elements may be
+    /// literal or range tests, exactly as an array pattern's may not (rmc has
+    /// no array-element test, but it does have the scalar tests a tuple element
+    /// reuses). A `let`, a `for` head and a parameter are irrefutable, so there
+    /// the flag is false and a literal element is rejected.
+    pat_refutable_ok: bool,
 }
 
 /// The deepest expression, block or type nesting the parser accepts. Deeply
@@ -79,6 +87,7 @@ impl Parser {
             struct_fields: std::collections::HashMap::new(),
             tuple_structs: std::collections::HashSet::new(),
             tuple_defs: Vec::new(),
+            pat_refutable_ok: false,
         }
     }
 
@@ -879,7 +888,7 @@ impl Parser {
                 // in the body target it just as they would a labelled `while`.
                 if self.peek() == Some(&Tok::Let) {
                     self.i += 1;
-                    let pat = self.parse_pattern()?;
+                    let pat = self.parse_refutable_pattern()?;
                     self.expect(Tok::Eq)?;
                     let scrutinee = self.parse_cond()?;
                     let body = self.parse_block()?;
@@ -1244,7 +1253,7 @@ impl Parser {
                 // and stops at the first value `PAT` does not match.
                 if self.peek() == Some(&Tok::Let) {
                     self.i += 1;
-                    let pat = self.parse_pattern()?;
+                    let pat = self.parse_refutable_pattern()?;
                     self.expect(Tok::Eq)?;
                     let scrutinee = self.parse_cond()?;
                     let body = self.parse_block()?;
@@ -1742,6 +1751,17 @@ impl Parser {
         Ok(e)
     }
 
+    /// One pattern in a *refutable* position (a `match` arm or an `if let` /
+    /// `while let` scrutinee): the same as `parse_pattern`, but a tuple element
+    /// may be a scalar test.
+    fn parse_refutable_pattern(&mut self) -> PResult<Pat> {
+        let saved = self.pat_refutable_ok;
+        self.pat_refutable_ok = true;
+        let r = self.parse_pattern();
+        self.pat_refutable_ok = saved;
+        r
+    }
+
     /// One pattern: an integer, `true`/`false`, `Enum::Variant`, `Enum::Variant(a, b)`,
     /// a bare binding name, or `_`. Shared by `match` arms and `if let`.
     fn parse_pattern(&mut self) -> PResult<Pat> {
@@ -2127,7 +2147,9 @@ impl Parser {
             return Ok(Pat::Tuple(Vec::new()));
         }
         let m = self.eat(&Tok::Mut);
-        let first = self.parse_pattern_primary()?;
+        // An element may be an or-pattern (`(0 | 1, x)`), which `parse_pattern`
+        // collects; a lone primary is returned unchanged.
+        let first = self.parse_pattern()?;
         if m && !matches!(first, Pat::Bind(_)) {
             return Err(format!(
                 "at byte {}: `mut` is not allowed here; it attaches to a binding",
@@ -2148,7 +2170,7 @@ impl Parser {
                 ));
             }
             let m = self.eat(&Tok::Mut);
-            let p = self.parse_pattern_primary()?;
+            let p = self.parse_pattern()?;
             if m && !matches!(p, Pat::Bind(_)) {
                 return Err(format!(
                     "at byte {}: `mut` is not allowed here; it attaches to a binding",
@@ -2161,11 +2183,25 @@ impl Parser {
             }
         }
         self.expect(Tok::RParen)?;
-        if elems.iter().any(|(_, p)| !Self::pat_irrefutable(p)) {
-            return Err(format!(
-                "at byte {}: tuple pattern elements must be bindings, `_`, or nested patterns",
-                self.pos()
-            ));
+        // A tuple element must be irrefutable in a `let`, `for` head or
+        // parameter, where the pattern has no test; in a `match` arm or an
+        // `if let` / `while let` scrutinee it may instead be a scalar test
+        // (an integer, bool, string or range), which rmc generates. Anything
+        // else (a variant pattern, which would bind its payload through the
+        // test) is rejected in both.
+        for (_, p) in &elems {
+            if !Self::pat_irrefutable(p) && !self.pat_refutable_ok {
+                return Err(format!(
+                    "at byte {}: tuple pattern elements must be bindings, `_`, or nested patterns",
+                    self.pos()
+                ));
+            }
+            if !Self::tuple_element_ok(p) {
+                return Err(format!(
+                    "at byte {}: a tuple pattern element must be irrefutable or a scalar test (an integer, `true`/`false`, a string or a range)",
+                    self.pos()
+                ));
+            }
         }
         Ok(Pat::Tuple(elems))
     }
@@ -2196,7 +2232,12 @@ impl Parser {
                 Pat::Array { elems, rest, front } => {
                     out.extend(Self::array_pat_binds(elems, *rest, *front, &field))
                 }
-                _ => unreachable!("tuple pattern elements are irrefutable"),
+                // A scalar element (`(1, x)`) binds nothing here: its test is
+                // generated separately by `tuple_pat_test`. An or-pattern element
+                // is allowed in an irrefutable context only when a `_`
+                // alternative makes it irrefutable, so it too binds nothing.
+                Pat::Int(_) | Pat::Bool(_) | Pat::Str(_) | Pat::Range(..) | Pat::Or(_) => {}
+                _ => unreachable!("a tuple element is validated when the tuple is parsed"),
             }
         }
         out
@@ -2274,7 +2315,7 @@ impl Parser {
             if self.peek().is_none() {
                 return Err(format!("at byte {}: unexpected end of input in `match`", self.pos()));
             }
-            let pat = self.parse_pattern()?;
+            let pat = self.parse_refutable_pattern()?;
             // An optional guard: `pat if cond => body`. The condition is parsed
             // like an `if` condition, so a struct literal needs parentheses.
             let guard = if self.eat(&Tok::If) {
@@ -2376,6 +2417,101 @@ impl Parser {
             ));
         }
         Ok(Pat::Range(lo, hi, inclusive))
+    }
+
+    /// The boolean test for one tuple *element* pattern, if it has one. A
+    /// binding, `_`, a struct pattern and a nested irrefutable tuple are
+    /// test-free (`None`); a scalar pattern reuses the same test the top-level
+    /// `match` builds. A variant pattern is rejected when the tuple is parsed,
+    /// so it is not reached here.
+    fn pat_test(p: &Pat, subj: &Expr) -> Option<Expr> {
+        match p {
+            Pat::Wild | Pat::Bind(_) | Pat::Struct(..) => None,
+            Pat::Tuple(elems) => Self::tuple_pat_test(elems, subj),
+            // `a | b | c` as an element: any alternative matching passes. A `_`
+            // alternative makes the whole element always true, so there is no
+            // test; otherwise fold the alternatives' tests with `||`.
+            Pat::Or(alts) => {
+                if alts.iter().any(|a| matches!(a, Pat::Wild)) {
+                    return None;
+                }
+                let mut cond = Self::or_cond(&alts[0], subj);
+                for alt in &alts[1..] {
+                    cond = Expr::Bin(BinOp::Or, Box::new(cond), Box::new(Self::or_cond(alt, subj)));
+                }
+                Some(cond)
+            }
+            Pat::Int(k) => Some(Expr::Bin(
+                BinOp::Eq,
+                Box::new(Self::scalar_scrutinee(subj)),
+                Box::new(Expr::Int(*k)),
+            )),
+            Pat::Bool(b) => Some(Expr::BoolTest {
+                scrutinee: Box::new(Self::scalar_scrutinee(subj)),
+                value: *b,
+            }),
+            Pat::Str(s) => Some(Expr::Bin(
+                BinOp::Eq,
+                Box::new(subj.clone()),
+                Box::new(Expr::Str(s.clone())),
+            )),
+            Pat::Range(lo, hi, inclusive) => {
+                let lower = Expr::Bin(
+                    BinOp::Le,
+                    Box::new(Expr::Int(*lo)),
+                    Box::new(Self::scalar_scrutinee(subj)),
+                );
+                let upper = Expr::Bin(
+                    if *inclusive { BinOp::Le } else { BinOp::Lt },
+                    Box::new(Self::scalar_scrutinee(subj)),
+                    Box::new(Expr::Int(*hi)),
+                );
+                Some(Expr::Bin(BinOp::And, Box::new(lower), Box::new(upper)))
+            }
+            _ => unreachable!("a tuple element is validated when the tuple is parsed"),
+        }
+    }
+
+    /// The boolean test for a tuple pattern: the `&&` of its elements' tests,
+    /// each read through the element's field (`"k"` on the anonymous struct a
+    /// tuple lowers to). `None` when every element is irrefutable, so the arm is
+    /// a catch-all.
+    fn tuple_pat_test(elems: &[(bool, Pat)], subj: &Expr) -> Option<Expr> {
+        let mut cond: Option<Expr> = None;
+        for (k, (_, p)) in elems.iter().enumerate() {
+            let field = Expr::Field {
+                base: Box::new(subj.clone()),
+                name: k.to_string(),
+                offset: -1,
+                ty: Type::Unit,
+            };
+            if let Some(t) = Self::pat_test(p, &field) {
+                cond = Some(match cond {
+                    None => t,
+                    Some(c) => Expr::Bin(BinOp::And, Box::new(c), Box::new(t)),
+                });
+            }
+        }
+        cond
+    }
+
+    /// True for a pattern a tuple element may hold: an irrefutable one, or a
+    /// scalar test rmc can generate (an integer, `true`/`false`, a string or a
+    /// range). A nested tuple is validated when it is parsed. A variant or an
+    /// or-pattern is rejected: rmc would have to bind a payload or merge the
+    /// alternatives through the element test.
+    fn tuple_element_ok(p: &Pat) -> bool {
+        match p {
+            Pat::Wild | Pat::Bind(_) | Pat::Struct(..) | Pat::Tuple(_) => true,
+            Pat::Array { .. } => Self::pat_irrefutable(p),
+            Pat::Int(_) | Pat::Bool(_) | Pat::Str(_) | Pat::Range(..) => true,
+            // An or-pattern is allowed when every alternative is a scalar test
+            // or a `_` (no alternative binds or is a variant).
+            Pat::Or(alts) => alts.iter().all(|a| {
+                matches!(a, Pat::Wild | Pat::Int(_) | Pat::Bool(_) | Pat::Str(_) | Pat::Range(..))
+            }),
+            Pat::Variant(..) => false,
+        }
     }
 
     /// Whether a pattern matches every value: `_`, a binding, or an
@@ -2565,9 +2701,11 @@ impl Parser {
                 has_rest: args.as_ref().map_or(false, |(_, rest)| *rest),
             },
             // `_` in an or-pattern: always true, so the whole condition is true.
-            // A struct or tuple pattern is likewise always true; a binding one
-            // is rejected before this point.
-            Pat::Wild | Pat::Struct(..) | Pat::Tuple(..) => Expr::Bool(true),
+            // A struct pattern is likewise always true; a binding one is
+            // rejected before this point. A tuple alternative folds its
+            // elements' tests with `&&`, or is `true` when it has none.
+            Pat::Wild | Pat::Struct(..) => Expr::Bool(true),
+            Pat::Tuple(elems) => Self::tuple_pat_test(elems, subj).unwrap_or(Expr::Bool(true)),
             // A binding inside an or-pattern is rejected before this point; an
             // array pattern is not supported as an or-alternative.
             Pat::Bind(_) | Pat::Or(_) | Pat::Array { .. } => {
@@ -2769,9 +2907,13 @@ impl Parser {
             // already checked against the prescan, so `f: _` (which emits no
             // read) is validated too.
             Pat::Struct(_name, fields) => (Self::struct_pat_binds(&fields, &subj), None),
-            // `(a, b) => body` is irrefutable in the same way: it binds each
-            // named element via a field read, with no test.
-            Pat::Tuple(elems) => (Self::tuple_pat_binds(&elems, &subj), None),
+            // `(a, b) => body` binds each named element via a field read. When
+            // every element is irrefutable there is no test (a catch-all); a
+            // scalar element (`(0, x)`) adds its test, folded into the arm's
+            // condition like any other.
+            Pat::Tuple(elems) => {
+                (Self::tuple_pat_binds(&elems, &subj), Self::tuple_pat_test(&elems, &subj))
+            }
             // `[a, b] => body` is irrefutable in the same way: it binds each
             // named element via an index read, with no test. A `..` rest shifts
             // the trailing bindings to the back of the array.
@@ -3131,7 +3273,7 @@ impl Parser {
                 // codegen need no new case.
                 if self.peek() == Some(&Tok::Let) {
                     self.i += 1;
-                    let pat = self.parse_pattern()?;
+                    let pat = self.parse_refutable_pattern()?;
                     self.expect(Tok::Eq)?;
                     let scrutinee = self.parse_cond()?;
                     let then = self.parse_block()?;
