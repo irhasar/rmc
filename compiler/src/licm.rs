@@ -181,6 +181,11 @@ impl Licm {
                     self.expr_loops(x);
                 }
             }
+            Expr::TupleLit(v) => {
+                for x in v {
+                    self.expr_loops(x);
+                }
+            }
             Expr::VariantTest { scrutinee, .. } => self.expr_loops(scrutinee),
             Expr::BoolTest { scrutinee, .. } => self.expr_loops(scrutinee),
             Expr::EnumPayload { recv, .. } => self.expr_loops(recv),
@@ -353,6 +358,11 @@ impl Effects {
                     self.expr(x);
                 }
             }
+            Expr::TupleLit(v) => {
+                for x in v {
+                    self.expr(x);
+                }
+            }
             Expr::VariantTest { scrutinee, .. } => self.expr(scrutinee),
             Expr::BoolTest { scrutinee, .. } => self.expr(scrutinee),
             Expr::EnumPayload { recv, .. } => self.expr(recv),
@@ -517,6 +527,11 @@ impl Hoister {
             }
             Expr::ArrayLit(v, _) => self.expr(v),
             Expr::ArrayList(v) => {
+                for x in v {
+                    self.expr(x);
+                }
+            }
+            Expr::TupleLit(v) => {
                 for x in v {
                     self.expr(x);
                 }

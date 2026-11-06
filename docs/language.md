@@ -12,6 +12,7 @@ time; there are no runtime type errors.
 | `bool`       | `true` or `false`                             |
 | `str`        | a string (one word: a pointer to a `{len, bytes}` record) |
 | `[T; N]`     | fixed-size array of `N` `T` elements, where `T` is a scalar, a struct or another array |
+| `(A, B)`     | a tuple of the given element types (an aggregate) |
 | `&T` `&mut T`| a reference to a `T` (one word)               |
 | `Name`       | a struct declared with `struct Name { .. }`   |
 | `Name`       | an enum declared with `enum Name { .. }`      |
@@ -180,6 +181,32 @@ A payload variant is not comparable with `==` and cannot be cast with
 
 A recursive enum such as `enum L { Nil, Cons(i64, L) }` is rejected: rmc has no
 indirection, so an enum may not contain itself.
+
+## Tuples
+
+```rust
+fn swap(p: (i64, i64)) -> (i64, i64) { return (p.1, p.0); }
+
+let t: (i64, bool) = (1, true);
+let a: i64 = t.0;               // element access by position
+let (x, y) = swap(t);           // destructuring
+let (_, y) = swap(t);           // `_` ignores an element
+let (mut x, y) = swap(t);       // a `mut` element is reassignable
+```
+
+A tuple is an aggregate: it is named by its address, passed to and returned from
+a function by pointer, and may be a struct field, an enum payload, an array
+element, or the referent of a reference, exactly like a struct. Elements are laid
+out in order with no padding; `()` is unit (no storage) and `(T)` is just `T`, so
+a one-element tuple must be written `(T,)` with a trailing comma, as in Rust.
+Tuples nest, and `t.0.1` reaches into a nested tuple.
+
+Element access `.0`, `.1`, ... requires the base to be a tuple (or a reference
+to one, which auto-derefs); an index past the end is rejected. A tuple may be
+destructured in a `let`, a `for` head, a function parameter or an irrefutable
+`match` arm, with `_` to ignore an element and `mut` on a binding. A tuple
+pattern's element count must match the tuple's arity for a field read to resolve;
+a mismatch is reported as a missing field.
 
 ## Functions
 
@@ -573,7 +600,7 @@ reuse and coalesces neighbours. Memory is not zeroed.
 ## Not supported
 
 Traits, generics, borrowing, lifetimes, modules, macros, `use`, closures,
-`f32`/`f64`, `u*`/`i*` types other than `i64`, tuples, and
+`f32`/`f64`, `u*`/`i*` types other than `i64`, and
 the standard library. References exist (`&T` / `&mut T`, `&e`, `*e`, `*e = v`),
 but without borrow checking: rmc does not prove that a reference outlives its
 referent, and `&mut` carries no exclusivity guarantee. An aggregate is still

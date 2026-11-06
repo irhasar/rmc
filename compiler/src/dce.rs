@@ -137,6 +137,11 @@ fn collect_expr(e: &Expr, out: &mut HashSet<String>) {
                 collect_expr(v, out);
             }
         }
+        Expr::TupleLit(vs) => {
+            for v in vs {
+                collect_expr(v, out);
+            }
+        }
         Expr::MethodCall { recv, args, .. } => {
             collect_expr(recv, out);
             for a in args {

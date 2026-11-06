@@ -192,6 +192,7 @@ fn calls_other(e: &Expr, name: &str) -> bool {
         Expr::StructLit { fields, .. } => fields.iter().any(|fi| calls_other(&fi.value, name)),
         Expr::ArrayLit(v, _) => calls_other(v, name),
         Expr::ArrayList(v) => v.iter().any(|x| calls_other(x, name)),
+        Expr::TupleLit(v) => v.iter().any(|x| calls_other(x, name)),
         Expr::MethodCall { recv, args, .. } => {
             calls_other(recv, name) || args.iter().any(|a| calls_other(a, name))
         }
@@ -249,6 +250,7 @@ fn has_call(e: &Expr) -> bool {
         Expr::StructLit { fields, .. } => fields.iter().any(|fi| has_call(&fi.value)),
         Expr::ArrayLit(v, _) => has_call(v),
         Expr::ArrayList(v) => v.iter().any(has_call),
+        Expr::TupleLit(v) => v.iter().any(has_call),
         Expr::MethodCall { recv, args, .. } => {
             has_call(recv) || args.iter().any(has_call)
         }
@@ -303,6 +305,7 @@ fn has_return(e: &Expr) -> bool {
         Expr::StructLit { fields, .. } => fields.iter().any(|fi| has_return(&fi.value)),
         Expr::ArrayLit(v, _) => has_return(v),
         Expr::ArrayList(v) => v.iter().any(has_return),
+        Expr::TupleLit(v) => v.iter().any(has_return),
         Expr::MethodCall { recv, args, .. } => has_return(recv) || args.iter().any(has_return),
         Expr::EnumVariant { .. } => false,
         Expr::EnumCtor { args, .. } => args.iter().any(has_return),

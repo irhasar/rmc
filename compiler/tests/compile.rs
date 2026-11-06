@@ -256,7 +256,7 @@ fn for_over_an_array_rejects_a_refutable_pattern() {
         &CompileOptions::default(),
     )
     .unwrap_err();
-    assert!(err.contains("binding, `_`, a struct or an array pattern"), "got: {err}");
+    assert!(err.contains("binding, `_`, a struct, tuple or array pattern"), "got: {err}");
 }
 
 #[test]
