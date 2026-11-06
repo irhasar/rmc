@@ -3033,6 +3033,25 @@ def reject_corpus():
             "enum E { A(i64), B }\n"
             "fn main() { let mut e = E::A(1); while let E::A(x) = e { break 'nope; } }\n",
         ),
+        # An at-binding in an irrefutable position requires an irrefutable
+        # sub-pattern (E0005), and a binding alternative in an or-pattern is
+        # still rejected (E0408) even when the binding is an at-binding.
+        "at_pat_refutable_in_let": (
+            "fn main() -> i64 { let x = 3; let n @ 1..=5 = x; return n; }\n",
+            "fn main() { let x = 3; let n @ 1..=5 = x; let _ = n; }\n",
+        ),
+        "at_pat_refutable_in_for": (
+            "fn main() -> i64 { let mut s = 0; for n @ 1..=5 in 0..3 { s = s + n; } return s; }\n",
+            "fn main() { let mut s = 0; for n @ 1..=5 in 0..3 { s += n; } }\n",
+        ),
+        "at_pat_refutable_in_param": (
+            "fn f(n @ 1..=5: i64) -> i64 { return n; }\nfn main() -> i64 { return 0; }\n",
+            "fn f(n @ 1..=5: i64) -> i64 { n }\nfn main() { let _ = f(1); }\n",
+        ),
+        "at_pat_binding_alt_in_or": (
+            "fn main() -> i64 { let x = 3; match x { n @ 1 | 2 => return 1, _ => return 0 } }\n",
+            "fn main() { let x = 3; let _ = match x { n @ 1 | 2 => 1, _ => 0 }; }\n",
+        ),
     }
 
 
@@ -3066,6 +3085,114 @@ def run_reject():
     if failures == 0:
         print(f"reject: all {len(corpus)} rustc-rejected programs are rejected cleanly")
     return 1 if failures else 0
+
+
+# -------------------------------------------------------------- atpat mode
+def gen_atpat_program(rng):
+    """`name @ subpat` bindings, the whole value bound alongside a sub-pattern:
+    `n @ _`, `n @ m` (an alias), `t @ (a, b)`, `f: n @ _` on a struct field,
+    `for n @ _ in ..`, a refutable `n @ 1..=5` in a `match` arm and an `if let`,
+    and a `n @ _` / `mut n @ _` parameter. The binding must name the whole value
+    (a wrong read, a duplicated binding or a dropped alias changes the total),
+    the sub-pattern's own bindings must still be made, and a `mut` alias must
+    write a local copy. Every function is called twice with different
+    arguments, so a shared slot or a leaked `mut` write is observable. No other
+    mode emits an `@` binding.
+    """
+    b = rng.randint(1, 9)
+    rms = [
+        "struct P { x: i64, y: i64, z: i64 }",
+        "fn mk(n: i64) -> i64 { print_i64(n); return n; }",
+        "fn f(n @ _: i64, mut m @ _: i64) -> i64 { m = m + n; return m; }",
+        "fn g(t @ (a, b): (i64, i64)) -> i64 { return t.0 + a + b; }",
+        "fn main() -> i64 {",
+        "    let mut acc: i64 = 0;",
+        f"    let x: i64 = mk({b});",
+    ]
+    rs = [
+        "#[derive(Copy, Clone)]",
+        "struct P { x: i64, y: i64, z: i64 }",
+        f"fn mk(n: i64) -> i64 {{ println!(\"{{}}\", n); n }}",
+        "fn f(n @ _: i64, mut m @ _: i64) -> i64 { m += n; m }",
+        "fn g(t @ (a, b): (i64, i64)) -> i64 { t.0 + a + b }",
+        "fn main() {",
+        "    let mut acc: i64 = 0;",
+        f"    let x: i64 = mk({b});",
+    ]
+
+    def add(expr):
+        rms.append(f"    acc = acc + {expr};")
+        rs.append(f"    acc += {expr};")
+
+    # `let` with an alias and a chain of aliases.
+    rms.append("    let n @ _ = x;")
+    rs.append("    let n @ _ = x;")
+    rms.append("    let p @ q @ _ = x;")
+    rs.append("    let p @ q @ _ = x;")
+    add("n + p + q")
+    # A tuple sub-pattern: the whole tuple and each element bound.
+    rms.append("    let t @ (a, c) = (x, x + 1);")
+    rs.append("    let t @ (a, c) = (x, x + 1);")
+    add("t.0 + t.1 + a + c")
+    # A struct field sub-pattern, with a `mut` alias that is then written.
+    rms.append(f"    let s: P = P {{ x: x, y: x + 1, z: x + 2 }};")
+    rs.append(f"    let s: P = P {{ x: x, y: x + 1, z: x + 2 }};")
+    rms.append("    let P { x: r @ _, y: mut w @ _, .. } = s;")
+    rs.append("    let P { x: r @ _, y: mut w @ _, .. } = s;")
+    rms.append("    w = w + 1;")
+    rs.append("    w += 1;")
+    add("r + w")
+    # `for` over a range and over an array.
+    rms.append("    for i @ _ in 0..3 {")
+    rs.append("    for i @ _ in 0..3 {")
+    rms.append("        acc = acc + i;")
+    rs.append("        acc += i;")
+    rms.append("    }")
+    rs.append("    }")
+    rms.append("    for i @ j in 0..3 {")
+    rs.append("    for i @ j in 0..3 {")
+    rms.append("        acc = acc + i + j;")
+    rs.append("        acc += i + j;")
+    rms.append("    }")
+    rs.append("    }")
+    rms.append("    let arr: [i64; 3] = [x, x + 1, x + 2];")
+    rs.append("    let arr: [i64; 3] = [x, x + 1, x + 2];")
+    rms.append("    for e @ _ in arr {")
+    rs.append("    for e @ _ in arr {")
+    rms.append("        acc = acc + e;")
+    rs.append("        acc += e;")
+    rms.append("    }")
+    rs.append("    }")
+    # A `mut` alias inside an array and a tuple element.
+    rms.append("    let [mut d @ _, h] = arr;")
+    rs.append("    let [mut d @ _, h] = arr;")
+    rms.append("    d = d + 1;")
+    rs.append("    d += 1;")
+    add("d + h")
+    rms.append("    let (mut u @ _, v) = (x, x + 1);")
+    rs.append("    let (mut u @ _, v) = (x, x + 1);")
+    rms.append("    u = u + 1;")
+    rs.append("    u += 1;")
+    add("u + v")
+    # A refutable `@` in a `match` arm and an `if let`.
+    rms.append("    match x { k @ 1..=1000000 => {")
+    rs.append("    match x { k @ 1..=1000000 => {")
+    rms.append("        acc = acc + k;")
+    rs.append("        acc += k;")
+    rms.append("    } _ => {} }")
+    rs.append("    } _ => {} }")
+    rms.append("    if let k @ 1..=1000000 = x {")
+    rs.append("    if let k @ 1..=1000000 = x {")
+    rms.append("        acc = acc + k;")
+    rs.append("        acc += k;")
+    rms.append("    }")
+    rs.append("    }")
+    # Parameters, including a `mut` alias and a tuple sub-pattern.
+    add(f"f(x, x + 1) + f(x + 2, x + 3)")
+    add(f"g((x, x + 4)) + g((x + 5, x + 6))")
+    rms += ["    print_i64(acc);", "    return 0;", "}"]
+    rs += ['    println!("{}", acc);', "}"]
+    return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
 
 
 # -------------------------------------------------------------- mutate mode
@@ -3117,7 +3244,8 @@ def run_mutate(n, seed, keep=None):
     rng = random.Random(seed)
     gens = [gen_expr_program, gen_stmt_program, gen_opt_program, gen_pat_program,
             gen_ref_program, gen_update_program, gen_nestpat_program,
-            gen_arrpat_program, gen_parampat_program, gen_enumpat_program]
+            gen_arrpat_program, gen_parampat_program, gen_enumpat_program,
+            gen_atpat_program]
     # Seeds to mutate: the generated programs plus the corpora's byte inputs.
     bases = [gens[rng.randrange(len(gens))](rng)[0] for _ in range(max(1, n // 4))]
     bases += [d.decode("latin-1") for d in robust_corpus().values() if isinstance(d, bytes)]
@@ -3149,7 +3277,7 @@ def run_mutate(n, seed, keep=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "tuple", "robust", "reject", "mutate"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "robust", "reject", "mutate"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -3200,6 +3328,7 @@ def main():
            "arrpat": gen_arrpat_program,
            "parampat": gen_parampat_program,
            "enumpat": gen_enumpat_program,
+           "atpat": gen_atpat_program,
            "tuple": gen_tuple_program}[args.mode]
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus

@@ -53,6 +53,7 @@ python3 tools/fuzz.py --mode nestpat --n 500 --seed 1
 python3 tools/fuzz.py --mode arrpat --n 500 --seed 1
 python3 tools/fuzz.py --mode parampat --n 500 --seed 1
 python3 tools/fuzz.py --mode enumpat --n 500 --seed 1
+python3 tools/fuzz.py --mode atpat --n 500 --seed 1
 python3 tools/fuzz.py --mode tuple --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 
@@ -208,6 +209,25 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   struct (`tuple_struct_for` introduces the layout if the parser did not). An
   element is written `.0`, `.1`, ...: `parse_postfix` accepts a decimal literal
   after `.` as the field name.
+  *At-bindings* `name @ subpat` bind the whole value to `name` and also match it
+  against `subpat`. `Pat::At(String, bool, Box<Pat>)` is parsed by
+  `parse_pattern_primary` (an identifier followed by `@`), so it is reachable in
+  every pattern position; `mut` before the name (`mut n @ sub`) sets the flag.
+  The name is an ordinary binding (the whole scrutinee) and `subpat`'s own names
+  are bound from the same value, which is exactly what `pat_binds(pat, m, subj,
+  out)` does: the uniform binding helper every position calls, which emits a
+  `Stmt::Let` for the name then recurses on `subpat`. `pat_irrefutable` treats an
+  at-binding as irrefutable only when its sub-pattern is, and `first_bound_name`
+  returns the name. In a refutable position (`pat_test`, `arm_pattern_parts`,
+  `or_cond`) the sub-pattern contributes its own test and the name binds when it
+  passes. The irrefutable positions (`let`, `for`, parameters, a struct field's
+  sub-pattern) each reject a refutable sub-pattern rather than mis-bind it, so
+  `let n @ 1..=5 = e;` is a refutable local binding (E0005), as in rustc. A
+  binding alternative inside an or-pattern stays rejected: `n @ 1 | 2` is E0408.
+  The element-level `mut` of an array or tuple element (`[mut n @ _, m]`,
+  `(mut n @ _, m)`) is OR-ed into the binding's flag, since `mut` before the
+  element attaches to the element binding. An at-binding whose sub-pattern is a
+  `..` rest (`first @ ..`) is rejected cleanly: rmc has no slice type.
   An arm may carry a *guard*, `PAT if COND => body`. `parse_match` reads the
   optional `if COND` after the pattern (`parse_cond`, so a struct literal needs
   parentheses) and threads it through `desugar_arm` as an `Option<Expr>`. The
