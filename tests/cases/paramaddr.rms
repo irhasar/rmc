@@ -1,0 +1,24 @@
+// Borrowing a by-value parameter, and the inliner. A callee that takes the
+// address of its own parameter (`&x`, `&mut x`) must be handed a private copy:
+// the inliner used to substitute a trivial caller argument in place, so a
+// `&mut x` write aliased the caller's variable (`y` became 5), and a literal
+// argument produced `&3`, an address with no place to name.
+fn readref(x: i64) -> i64 { let r = &x; return *r; }
+
+fn writeback(mut x: i64) -> i64 { let r = &mut x; *r = 5; return x; }
+
+fn bumpmut(mut x: i64) -> i64 { let r = &mut x; *r = *r + 10; return *r; }
+
+fn main() -> i64 {
+    // A literal argument: the parameter must be copied, not substituted.
+    print_i64(readref(3));
+    // A caller variable: a copy keeps the write local, so `y` stays 3.
+    let mut y: i64 = 3;
+    print_i64(writeback(y));
+    print_i64(y);
+    print_i64(bumpmut(y));
+    print_i64(y);
+    // A non-lvalue argument to the writing callee as well.
+    print_i64(writeback(2 + 4));
+    return 0;
+}

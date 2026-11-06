@@ -415,6 +415,15 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   A trivial argument (a name or literal) is substituted in place only when no
   *later* argument can write memory (`has_effect`); otherwise it is copied to a
   fresh slot, so `sum(x, set(&mut x))` reads the `x` from before `set` ran.
+  The same holds for a parameter whose *address* the body takes (`let r = &x;`,
+  `&mut x`): it must be bound to a fresh slot too, or a substituted variable
+  argument would let `*r = ..` write through to the caller (`f(y)` with
+  `f(mut x) { let r = &mut x; *r = 5; }` left `y` at 5 instead of 3), and a
+  substituted non-lvalue argument (a literal, a call) would produce `&3`, an
+  address with no place to name, which `gen_addr` rejects. `escaped_slots`
+  collects both kinds — a slot assigned directly and a slot whose address is
+  taken — and its `Expr::AddrOf` arm records the operand slot when it is a bare
+  `Var`, so the copy is forced.
   A candidate body must be call-free with no early exit; because it is call-free,
   inlining it cannot expose new calls, but the pass still runs to a *fixpoint*
   because a function only becomes call-free after its own callees are inlined
@@ -424,7 +433,7 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   `break`/`continue` is *not* allowed: once spliced into the caller it would bind
   to the caller's enclosing loop. A non-final `return` is not allowed either, for
   the same reason. `Sub` already rewrites `while`/`loop`/`for` bodies and their
-  counter slots, and `assigned_slots` already descends into them, so a
+  counter slots, and `escaped_slots` already descends into them, so a
   loop-bearing body needs no extra splice work. A statement-free block is unwrapped to
   its tail after expansion: the spliced body of an accessor would otherwise stay
   wrapped in an `Expr::Block`, and later passes (`simple_operand`, the

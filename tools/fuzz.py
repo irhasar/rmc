@@ -1779,6 +1779,12 @@ def gen_ref_program(rng):
         "fn addto(r: &mut i64, v: i64) { *r = *r + v; }",
         "fn twice(r: &mut i64) { inc(r); inc(r); }",
         "fn get(r: &i64) -> i64 { return *r; }",
+        # A callee that takes its parameter *by value* and then addresses it.
+        # The inliner must copy such an argument rather than substitute it:
+        # a substituted literal has no place to name (`&3`), and a substituted
+        # variable would let `*r = ..` write through to the caller.
+        "fn byrefval(x: i64) -> i64 { let r = &x; return *r * 2 + 1; }",
+        "fn byrefmut(mut x: i64) -> i64 { let r = &mut x; *r = *r + 3; return x; }",
         f"fn sumfields(r: &Outer) -> i64 {{ return {sumf}; }}",
         f"fn setfield(r: &mut Outer, v: i64) {{ r.s = r.s + v; r.mid.{f0} = r.mid.{f0} + v; }}",
         f"fn sumarr(a: &[i64; {na}]) -> i64 {{ let mut s: i64 = 0; let mut i: i64 = 0; "
@@ -1818,6 +1824,11 @@ def gen_ref_program(rng):
         "    let mut y: i64 = base;",
         "    twice(&mut y);",
         "    acc = acc + y;",
+        # Call the by-value-parameter callees with both a literal and a variable,
+        # so the inliner's copy-instead-of-substitute rule is exercised for a
+        # non-lvalue and for a named argument.
+        "    acc = acc + byrefval(4) + byrefval(base);",
+        "    acc = acc + byrefmut(4) + byrefmut(base) + y;",
         "    print_i64(acc);",
         "    return 0;",
         "}",
@@ -1830,6 +1841,8 @@ def gen_ref_program(rng):
         "fn addto(r: &mut i64, v: i64) { *r += v; }",
         "fn twice(r: &mut i64) { inc(r); inc(r); }",
         "fn get(r: &i64) -> i64 { *r }",
+        "fn byrefval(x: i64) -> i64 { let r = &x; *r * 2 + 1 }",
+        "fn byrefmut(mut x: i64) -> i64 { let r = &mut x; *r += 3; x }",
         f"fn sumfields(r: &Outer) -> i64 {{ {sumf} }}",
         f"fn setfield(r: &mut Outer, v: i64) {{ r.s += v; r.mid.{f0} += v; }}",
         f"fn sumarr(a: &[i64; {na}]) -> i64 {{ let mut s = 0i64; let mut i = 0usize; "
@@ -1863,6 +1876,8 @@ def gen_ref_program(rng):
         "    let mut y: i64 = base;",
         "    twice(&mut y);",
         "    acc += y;",
+        "    acc += byrefval(4) + byrefval(base);",
+        "    acc += byrefmut(4) + byrefmut(base) + y;",
         '    println!("{}", acc);',
         "}",
     ]
