@@ -13,9 +13,9 @@ both binaries must print identical stdout and exit with the same status:
     MIR through rmc's own back end.
 
 Only the `println!`/`print!`/`eprintln!` shapes the MIR path models belong
-here: an all-constant format string (rustc folds it to `Arguments::from_str`).
-A case with a runtime argument is *expected* to be rejected by rmc, and is not
-a case for this suite.
+here: an all-constant format string (rustc folds it to `Arguments::from_str`)
+or a format string whose placeholders take runtime arguments (rustc builds an
+`Arguments` with a `&[Argument]` array).
 
 Usage: python3 tests/std/run.py [-v]
 """

@@ -4940,26 +4940,146 @@ fn main() -> () {
 }
 
 #[test]
-fn mir_runtime_format_argument_is_a_clear_diagnostic() {
-    // `println!("{}", x)` for a variable `x` reifies `Display::fmt` as a fn
-    // pointer, which this back end does not model. It must be a clean error
-    // that names the construct, not a panic.
+fn mir_runtime_format_argument_lowers_to_the_formatter() {
+    // `println!("x={}", x)` for a variable `x` reifies `Display::fmt` as a
+    // function pointer inside an `ArgumentType::Placeholder`, which the runtime
+    // template walker calls. The back end must lay the `Argument`/`ArgumentType`
+    // structs out as rustc does (16 bytes each, the `PhantomData` lifetime
+    // taking no space) and materialise the formatter's address.
     let mir = "\
 fn main() -> () {
     let mut _0: ();
-    let mut _1: i32;
-    let mut _2: std::fmt::Arguments<'_>;
+    let mut _1: i64;
+    let mut _2: ();
+    let mut _3: std::fmt::Arguments<'_>;
+    let mut _4: &i64;
+    let mut _5: [core::fmt::rt::Argument<'_>; 1];
     let mut _6: core::fmt::rt::Argument<'_>;
+    let _7: &[core::fmt::rt::Argument<'_>; 1];
+    let mut _8: core::fmt::rt::ArgumentType<'_>;
+    let mut _9: std::ptr::NonNull<()>;
+    let mut _10: for<'a, 'b> unsafe fn(std::ptr::NonNull<()>, &'a mut std::fmt::Formatter<'b>) -> std::result::Result<(), std::fmt::Error>;
+    let _11: for<'a, 'b, 'c> fn(&'a i64, &'b mut std::fmt::Formatter<'c>) -> std::result::Result<(), std::fmt::Error>;
+    let mut _12: *const i64;
+    let mut _13: std::ptr::NonNull<u8>;
+    let mut _14: std::ptr::NonNull<core::fmt::rt::Argument<'_>>;
 
     bb0: {
-        _1 = const 5_i32;
-        _11 = <i32 as std::fmt::Display>::fmt as for<'a, 'b, 'c> fn(&'a i32, &'b mut std::fmt::Formatter<'c>) -> std::result::Result<(), std::fmt::Error> (PointerCoercion(ReifyFnPointer(Safe), Implicit));
+        _1 = const -7_i64;
+        _4 = &_1;
+        _12 = &raw const (*_4);
+        _9 = copy _12 as std::ptr::NonNull<()> (Transmute);
+        _11 = <i64 as std::fmt::Display>::fmt as for<'a, 'b, 'c> fn(&'a i64, &'b mut std::fmt::Formatter<'c>) -> std::result::Result<(), std::fmt::Error> (PointerCoercion(ReifyFnPointer(Safe), Implicit));
+        _10 = copy _11 as for<'a, 'b> unsafe fn(std::ptr::NonNull<()>, &'a mut std::fmt::Formatter<'b>) -> std::result::Result<(), std::fmt::Error> (Transmute);
+        _8 = core::fmt::rt::ArgumentType::<'_>::Placeholder { value: move _9, formatter: copy _10, _lifetime: const PhantomData::<&()> };
+        _6 = core::fmt::rt::Argument::<'_> { ty: move _8 };
+        _5 = [move _6];
+        _7 = &_5;
+        _13 = const b\"\\x02x=\\xc0\\x01\\n\\x00\" as std::ptr::NonNull<u8> (Transmute);
+        _14 = copy _7 as std::ptr::NonNull<core::fmt::rt::Argument<'_>> (Transmute);
+        _3 = Arguments::<'_> { template: move _13, args: move _14 };
+        _2 = std::io::_print(move _3) -> [return: bb1, unwind unreachable];
+    }
+
+    bb1: {
         return;
     }
 }
 ";
-    let err = rmc::mir::parse(mir).unwrap_err();
-    assert!(err.contains("formatting") || err.contains("Display"), "got: {err}");
+    let prog = rmc::mir::parse(mir).expect("parse");
+    let asm = rmc::compile_mir_to_asm(&prog, &rmc::mir_codegen::Options::default())
+        .expect("compile");
+    assert!(
+        asm.contains("__rmc_fmt_i64"),
+        "the formatter's address is not materialised:\n{asm}"
+    );
+    assert!(asm.contains("__rmc_print:"), "the sink is not linked in");
+}
+
+/// Build the MIR for `println!` of one runtime argument, with `trait_path` as
+/// the reified formatter and `template` as the format template's bytes. The
+/// template is spliced in as a byte-string constant, exactly as rustc prints it.
+fn runtime_format_mir(trait_path: &str, template: &str) -> String {
+    format!(
+        "\
+fn main() -> () {{
+    let mut _0: ();
+    let mut _1: i64;
+    let mut _2: ();
+    let mut _3: std::fmt::Arguments<'_>;
+    let mut _4: &i64;
+    let mut _5: [core::fmt::rt::Argument<'_>; 1];
+    let mut _6: core::fmt::rt::Argument<'_>;
+    let _7: &[core::fmt::rt::Argument<'_>; 1];
+    let mut _8: core::fmt::rt::ArgumentType<'_>;
+    let mut _9: std::ptr::NonNull<()>;
+    let mut _10: for<'a, 'b> unsafe fn(std::ptr::NonNull<()>, &'a mut std::fmt::Formatter<'b>) -> std::result::Result<(), std::fmt::Error>;
+    let _11: for<'a, 'b, 'c> fn(&'a i64, &'b mut std::fmt::Formatter<'c>) -> std::result::Result<(), std::fmt::Error>;
+    let mut _12: *const i64;
+    let mut _13: std::ptr::NonNull<u8>;
+    let mut _14: std::ptr::NonNull<core::fmt::rt::Argument<'_>>;
+
+    bb0: {{
+        _1 = const -7_i64;
+        _4 = &_1;
+        _12 = &raw const (*_4);
+        _9 = copy _12 as std::ptr::NonNull<()> (Transmute);
+        _11 = <i64 as {trait_path}>::fmt as for<'a, 'b, 'c> fn(&'a i64, &'b mut std::fmt::Formatter<'c>) -> std::result::Result<(), std::fmt::Error> (PointerCoercion(ReifyFnPointer(Safe), Implicit));
+        _10 = copy _11 as for<'a, 'b> unsafe fn(std::ptr::NonNull<()>, &'a mut std::fmt::Formatter<'b>) -> std::result::Result<(), std::fmt::Error> (Transmute);
+        _8 = core::fmt::rt::ArgumentType::<'_>::Placeholder {{ value: move _9, formatter: copy _10, _lifetime: const PhantomData::<&()> }};
+        _6 = core::fmt::rt::Argument::<'_> {{ ty: move _8 }};
+        _5 = [move _6];
+        _7 = &_5;
+        _13 = const {template} as std::ptr::NonNull<u8> (Transmute);
+        _14 = copy _7 as std::ptr::NonNull<core::fmt::rt::Argument<'_>> (Transmute);
+        _3 = Arguments::<'_> {{ template: move _13, args: move _14 }};
+        _2 = std::io::_print(move _3) -> [return: bb1, unwind unreachable];
+    }}
+
+    bb1: {{
+        return;
+    }}
+}}
+"
+    )
+}
+
+#[test]
+fn mir_hex_formatter_lowers_to_the_base_formatter() {
+    // `println!("{:x}", x)` reifies `LowerHex::fmt`. The runtime has no generic
+    // base printer, so the back end must pick the width-specific one.
+    let mir = runtime_format_mir(
+        "std::fmt::LowerHex",
+        "b\"\\xc0\\x01\\n\\x00\"",
+    );
+    let prog = rmc::mir::parse(&mir).expect("parse");
+    let asm = rmc::compile_mir_to_asm(&prog, &rmc::mir_codegen::Options::default())
+        .expect("compile");
+    assert!(
+        asm.contains("__rmc_fmt_hex_64"),
+        "the hex formatter is not selected:\n{asm}"
+    );
+    assert!(
+        asm.contains("__rmc_put_base_unsigned:"),
+        "the base printer is not linked in"
+    );
+}
+
+#[test]
+fn mir_format_width_is_a_clear_diagnostic() {
+    // The runtime walker renders a placeholder's value in full; a width or
+    // precision would be silently dropped, so the back end must reject it.
+    let mir = runtime_format_mir(
+        "std::fmt::Display",
+        "b\"\\xc3 \\x00\\x00h\\x05\\x00\\x01\\n\\x00\"",
+    );
+    let prog = rmc::mir::parse(&mir).expect("parse");
+    let err = rmc::compile_mir_to_asm(&prog, &rmc::mir_codegen::Options::default())
+        .expect_err("a width must be rejected");
+    assert!(
+        err.contains("not implemented on the MIR path"),
+        "unhelpful diagnostic: {err}"
+    );
 }
 
 #[test]

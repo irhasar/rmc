@@ -343,19 +343,48 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   not a NUL-terminated C string.** `mir_codegen.rs` emits `.quad <len>` before
   the bytes. `str::len` lowers to `PtrMetadata`, which reads word 0, and the
   `print!` sink reads word 0 as the length; a C string here makes both read the
-  first byte as a huge length (the "runtime format arguments are not supported"
-  path fired because the length word was `0x0a6968`, not the text). This is the
-  same representation the `.rms` path uses (`Type::Str` is the record address).
-- **`println!("hi")` works; `println!("{}", x)` for a variable does not.**
-  rustc's `-O` MIR folds an all-constant format string to
-  `Arguments::from_str`, which is a string-record pointer plus a
-  `len << 1 | 1` word: no `Display::fmt` machinery. `mir.rs` rewrites the
-  `std::io::_print`/`_eprint` sink (the trailing path segment starts with `_`)
-  to the runtime helpers `__rmc_print`/`__rmc_eprint`, and `__rmc_write_args`
-  branches on the low bit of the args word. A *runtime* argument reifies
-  `<T as Display>::fmt` as a fn pointer and builds the full type-erased
-  `Argument` array, which the back end does not model, so it is a diagnostic
-  (`classify_unsupported`), never a miscompile.
+  first byte as a huge length (the old "runtime format arguments are not
+  supported" path fired because the length word was `0x0a6968`, not the text).
+  This is the same representation the `.rms` path uses (`Type::Str` is the
+  record address).
+- **`println!("{}", x)` for a variable builds the full `core::fmt` argument
+  machinery and now works.** An all-constant format string folds to
+  `Arguments::from_str` (a string-record pointer plus a `len << 1 | 1` word);
+  a placeholder with a runtime argument instead reifies `<T as Display>::fmt`
+  as a fn pointer inside a `core::fmt::rt::ArgumentType::Placeholder`, and the
+  back end models the `Argument`/`ArgumentType`/`NonNull`/`PhantomData` structs
+  by their last path segment. `mir.rs` rewrites the `std::io::_print`/`_eprint`
+  sink (the trailing path segment starts with `_`) to the runtime helpers
+  `__rmc_print`/`__rmc_eprint`, and `__rmc_write_args` branches on the low bit
+  of the args word. The runtime template walker calls each argument's formatter
+  (`__rmc_fmt_i64`, `__rmc_fmt_bool`, ...). The formatter is picked from the
+  reified type/trait pair: `Display`/`Debug` give the decimal (or string)
+  printer, `LowerHex`/`UpperHex`/`Octal`/`Binary` the base printers, one entry
+  point per width so a narrow type prints its own width (`{:x}` of `-2i16` is
+  `fffe`, not the 16-digit 64-bit pattern; `{:X}` has its own symbol because the
+  digit alphabet differs). A template whose placeholder carries
+  flags, a width or a precision (`{:>5}`, `{:.2}`) is rejected: the walker skips
+  those fields to reach the argument index but renders the value in full, so
+  silently dropping them would mis-render. Two layout invariants are load
+  bearing: `Argument` and `ArgumentType` are 16 bytes each (the `PhantomData`
+  lifetime field is zero-sized and must not reserve a word), and a struct field
+  is a `Field` projection so the element keeps its real type — using
+  `IndexConst` there would scale by 8 and type the element `i64`, dropping the
+  formatter pointer. A negative immediate stored into a frame slot must use a
+  64-bit store (`movq $imm, mem`); the unsuffixed form is a 32-bit store that
+  leaves the high half stale.
+- **The MIR scanners must skip string literals.** `matching`, `split_top_args`,
+  `split_top_semi` and `split_top_as` walk a line by bracket depth, but a
+  `format_args!` template or a `b"..."` byte string can contain `)`/`,`/`;`/`as`
+  in its bytes. Without the `string_end` skip, a template like `b"\x03a)b..."`
+  mis-splits and the constant fails to parse. `string_end` handles both `"..."` 
+  and `b"..."`, and skips backslash escapes so an escaped quote does not end the
+  literal early.
+- **A 32-bit register selects a 32-bit memory access.** `mov (%rdi), %eax` is
+  the 32-bit load (`8B /r`), `mov (%rdi), %rax` the 64-bit one (`48 8B /r`);
+  likewise for stores. `elf.rs`'s `mov` must derive the operand width from the
+  register name (or a `movl`/`movq` suffix), not default to 64-bit, or a narrow
+  type read through a pointer picks up the neighbouring bytes.
 
 ## Things that are easy to get wrong
 

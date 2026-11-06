@@ -445,7 +445,10 @@ impl Elf {
         };
         let ops = split_ops(rest);
         match mnem {
-            "mov" | "movq" | "movb" | "movabs" | "movzbq" | "movzbl" => self.enc_mov(mnem, &ops, sec),
+            "mov" | "movq" | "movb" | "movabs" | "movzbq" | "movzbl" | "movzwq" | "movzwl"
+            | "movsbq" | "movsbl" | "movswq" | "movswl" | "movslq" => {
+                self.enc_mov(mnem, &ops, sec)
+            }
             "lea" => self.enc_lea(&ops, sec),
             "push" | "pop" => self.enc_push_pop(mnem, &ops, sec),
             "add" | "addq" | "sub" | "and" | "or" | "xor" | "cmp" | "cmpq" | "test" => {
@@ -465,6 +468,23 @@ impl Elf {
                 Ok(())
             }
             "call" => {
+                // `call *%reg` is the indirect register form (FF /2, mod=11),
+                // `call *mem` indirects through memory (FF /2 with an r/m
+                // operand), and the bare form is a PC-relative `E8 rel32`.
+                if let Some(reg) = ops[0].strip_prefix('*') {
+                    if let Ok((r, _)) = parse_reg(reg) {
+                        if r >= 8 {
+                            self.sections[sec].data.push(0x41);
+                        }
+                        self.sections[sec].data.push(0xFF);
+                        modrm_reg_reg(&mut self.sections[sec].data, 2, r);
+                        return Ok(());
+                    }
+                    let m = parse_mem(reg)
+                        .ok_or_else(|| format!("elf: bad indirect call operand `{}`", ops[0]))?;
+                    self.mem_op(sec, 0xFF, &m, 2, false, false);
+                    return Ok(());
+                }
                 self.sections[sec].data.push(0xE8);
                 self.pc_rel(sec, &ops[0]);
                 Ok(())
@@ -501,58 +521,96 @@ impl Elf {
 
     fn enc_mov(&mut self, mnem: &str, ops: &[String], sec: usize) -> Result<(), String> {
         let (src, dst) = (ops[0].clone(), ops[1].clone());
+        // `movz`/`movs` loads: a 2-byte opcode (`0F B6`/`0F B7`/`0F BE`/`0F BF`/
+        // `63`), an optional REX.W, and a byte-width source that forces a REX
+        // prefix for %sil/%dil. `movslq` is the sign-extending `63 /r`.
+        let ext = match mnem {
+            "movzbq" => Some((false, 1u8, true)),
+            "movzbl" => Some((false, 1u8, false)),
+            "movzwq" => Some((false, 2u8, true)),
+            "movzwl" => Some((false, 2u8, false)),
+            "movsbq" => Some((true, 1u8, true)),
+            "movsbl" => Some((true, 1u8, false)),
+            "movswq" => Some((true, 2u8, true)),
+            "movswl" => Some((true, 2u8, false)),
+            "movslq" => Some((true, 4u8, true)),
+            _ => None,
+        };
+        if let Some((sign, srcw, w)) = ext {
+            return self.enc_movx(&src, &dst, sec, sign, srcw, w);
+        }
         match mnem {
-            "movzbq" | "movzbl" => {
-                let (dreg, _) = parse_reg(&dst)?;
-                let w = mnem == "movzbq";
-                if let Ok((sreg, s8)) = parse_reg(&src) {
-                    let mut rex = 0x40;
-                    if w {
-                        rex |= 0x08;
-                    }
-                    if dreg >= 8 {
-                        rex |= 0x04;
-                    }
-                    if sreg >= 8 {
-                        rex |= 0x01;
-                    }
-                    // A byte source of %sil/%dil needs the prefix even with no
-                    // extended register in play.
-                    if rex != 0x40 || (s8 && sreg >= 4) {
-                        self.sections[sec].data.push(rex);
-                    }
-                    self.sections[sec].data.extend_from_slice(&[0x0F, 0xB6]);
-                    modrm_reg_reg(&mut self.sections[sec].data, dreg, sreg);
-                    return Ok(());
-                }
-                let m = parse_mem(&src).ok_or_else(|| format!("elf: bad movz src `{src}`"))?;
-                let mut rex = 0x40;
-                if w {
-                    rex |= 0x08;
-                }
-                if dreg >= 8 {
-                    rex |= 0x04;
-                }
-                if m.base.map_or(false, |b| b >= 8) {
-                    rex |= 0x01;
-                }
-                if m.index.map_or(false, |i| i >= 8) {
-                    rex |= 0x02;
-                }
-                if rex != 0x40 {
-                    self.sections[sec].data.push(rex);
-                }
-                self.sections[sec].data.extend_from_slice(&[0x0F, 0xB6]);
-                emit_mem_modrm(&mut self.sections[sec].data, &m, dreg);
-                if let Some(sym) = m.rip_label.clone() {
-                    let len = self.sections[sec].data.len();
-                    self.fixups.push(Fixup { sec, disp_off: len - 4, next_off: len, sym });
-                }
-                Ok(())
-            }
             "movb" => self.enc_mov_bytes(&src, &dst, sec),
             _ => self.enc_mov_generic(mnem, &src, &dst, sec),
         }
+    }
+
+    /// A sign/zero-extending move: `movz{b,w}`/`movs{b,w,l}` into a 64-bit (or
+    /// 32-bit) destination register. `sign` selects movs over movz, `srcw` is
+    /// the source width in bytes, and `w` sets REX.W for a 64-bit destination.
+    fn enc_movx(
+        &mut self,
+        src: &str,
+        dst: &str,
+        sec: usize,
+        sign: bool,
+        srcw: u8,
+        w: bool,
+    ) -> Result<(), String> {
+        let (dreg, _) = parse_reg(dst)?;
+        let opcode = if sign {
+            if srcw == 4 {
+                vec![0x63]
+            } else {
+                vec![0x0F, if srcw == 1 { 0xBE } else { 0xBF }]
+            }
+        } else {
+            vec![0x0F, if srcw == 1 { 0xB6 } else { 0xB7 }]
+        };
+        if let Ok((sreg, s8)) = parse_reg(src) {
+            let mut rex = 0x40;
+            if w {
+                rex |= 0x08;
+            }
+            if dreg >= 8 {
+                rex |= 0x04;
+            }
+            if sreg >= 8 {
+                rex |= 0x01;
+            }
+            // A byte source of %sil/%dil needs the prefix even with no extended
+            // register in play.
+            if rex != 0x40 || (srcw == 1 && s8 && sreg >= 4) {
+                self.sections[sec].data.push(rex);
+            }
+            self.sections[sec].data.extend_from_slice(&opcode);
+            modrm_reg_reg(&mut self.sections[sec].data, dreg, sreg);
+            return Ok(());
+        }
+        let m = parse_mem(src).ok_or_else(|| format!("elf: bad movx src `{src}`"))?;
+        let mut rex = 0x40;
+        if w {
+            rex |= 0x08;
+        }
+        if dreg >= 8 {
+            rex |= 0x04;
+        }
+        if m.base.map_or(false, |b| b >= 8) {
+            rex |= 0x01;
+        }
+        if m.index.map_or(false, |i| i >= 8) {
+            rex |= 0x02;
+        }
+        if rex != 0x40 {
+            self.sections[sec].data.push(rex);
+        }
+        self.sections[sec].data.extend_from_slice(&opcode);
+        emit_mem_modrm(&mut self.sections[sec].data, &m, dreg);
+        if let Some(sym) = m.rip_label.clone() {
+            let len = self.sections[sec].data.len();
+            self.fixups.push(Fixup { sec, disp_off: len - 4, next_off: len, sym });
+        }
+        Ok(())
     }
 
     fn enc_mov_bytes(&mut self, src: &str, dst: &str, sec: usize) -> Result<(), String> {
@@ -677,15 +735,34 @@ impl Elf {
             }
             if let Some(m) = parse_mem(dst) {
                 // `mov %dl, (%rsi)` is a one-byte store even though the
-                // mnemonic carries no `b` suffix.
-                self.mem_op(sec, if s8 { 0x88 } else { 0x89 }, &m, sreg, !s8, s8 && sreg >= 4);
+                // mnemonic carries no `b` suffix. A `movl`/`movq` suffix pins
+                // the width; otherwise the source register's name does, so
+                // `mov %eax, (%rdi)` is a 32-bit store, not a 64-bit one.
+                let wide = if mnem == "movl" {
+                    false
+                } else if mnem == "movq" || mnem == "movabs" {
+                    true
+                } else {
+                    reg_is_64(src)
+                };
+                self.mem_op(sec, if s8 { 0x88 } else { 0x89 }, &m, sreg, wide, s8 && sreg >= 4);
                 return Ok(());
             }
             return Err(format!("elf: bad mov dst `{dst}`"));
         }
         if let Some(m) = parse_mem(src) {
             let (dreg, d8) = parse_reg(dst)?;
-            self.mem_op(sec, if d8 { 0x8A } else { 0x8B }, &m, dreg, !d8, d8 && dreg >= 4);
+            // The destination register's width selects the load: `mov (%rdi),
+            // %eax` is a 32-bit load (`8B /r`), `mov (%rdi), %rax` a 64-bit one
+            // (`48 8B /r`). A `movl`/`movq` suffix pins it too.
+            let wide = if mnem == "movl" {
+                false
+            } else if mnem == "movq" || mnem == "movabs" {
+                true
+            } else {
+                reg_is_64(dst)
+            };
+            self.mem_op(sec, if d8 { 0x8A } else { 0x8B }, &m, dreg, wide, d8 && dreg >= 4);
             return Ok(());
         }
         Err(format!("elf: unsupported mov `{src}, {dst}`"))
@@ -740,7 +817,39 @@ impl Elf {
         if let Some(rest) = src.strip_prefix('$') {
             let v = parse_imm(rest)?;
             if base == "test" {
-                return Err("elf: test with an immediate operand is not emitted".into());
+                // `test` has no sign-extended byte form: always `F7 /0 id`.
+                // The width follows the r/m operand, so only a 64-bit operand
+                // takes REX.W.
+                if !fits_i32(v) {
+                    return Err(format!("elf: `{mnem}` immediate {v} does not fit i32"));
+                }
+                if let Some(m) = parse_mem(&dst) {
+                    self.mem_op(sec, 0xF7, &m, 0, true, false);
+                    self.sections[sec].data.extend_from_slice(&(v as i32).to_le_bytes());
+                    return Ok(());
+                }
+                let (dreg, d8) = parse_reg(&dst)?;
+                if d8 {
+                    // `test $imm8, %r8b`: F6 /0 ib.
+                    let mut rex = 0x40;
+                    if dreg >= 8 {
+                        rex |= 0x01;
+                    }
+                    if rex != 0x40 || dreg >= 4 {
+                        self.sections[sec].data.push(rex);
+                    }
+                    self.sections[sec].data.push(0xF6);
+                    modrm_reg_reg(&mut self.sections[sec].data, 0, dreg);
+                    self.sections[sec].data.push(v as u8);
+                    return Ok(());
+                }
+                if let Some(r) = rex_if_needed(!reg_is_32(&dst), 0, dreg) {
+                    self.sections[sec].data.push(r);
+                }
+                self.sections[sec].data.push(0xF7);
+                modrm_reg_reg(&mut self.sections[sec].data, 0, dreg);
+                self.sections[sec].data.extend_from_slice(&(v as i32).to_le_bytes());
+                return Ok(());
             }
             if let Some(m) = parse_mem(&dst) {
                 // `cmp $imm, mem`: 81 /7 id, or the sign-extended 83 /7 ib.

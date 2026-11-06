@@ -56,6 +56,14 @@ pub enum Operand {
     Copy(Place),
     Move(Place),
     Const(Const),
+    /// `<T as Trait>::fmt` — a reified method. `ty_name` and `trait_name`
+    /// identify which runtime formatter the back end must materialise the
+    /// address of; the MIR path never calls it indirectly. The type is kept as
+    /// its source text so width and signedness (`i32` vs `u64`) survive.
+    Fmt {
+        ty_name: String,
+        trait_name: String,
+    },
 }
 
 /// A constant operand.
@@ -75,6 +83,13 @@ pub enum Const {
     },
     /// A named `alloc` (string) or a `const` item reference we do not fold.
     Named(String),
+    /// `b"..."` — a byte-string literal. `format_args!` lowers its template to
+    /// one of these, so the MIR path must carry the bytes rather than treat the
+    /// literal as text.
+    Bytes(Vec<u8>),
+    /// A zero-sized value (`PhantomData`). It occupies no space, so an
+    /// aggregate that lists one must not reserve a word for it.
+    Zst,
     /// A struct, tuple, array or enum-variant constant the MIR printer spells
     /// out inline (`const P {{ x: 1_i64, y: 2_i64 }}`, `const E::A`). Its bytes
     /// are materialised in `.rodata` at codegen time.
@@ -1261,6 +1276,28 @@ fn parse_rvalue(s: &str) -> Result<Rvalue, String> {
             return Ok(Rvalue::Ref { mutbl: false, place: parse_place(r.trim())? });
         }
     }
+    // A reified formatter, `format_args!`'s lowering of a placeholder. It may
+    // stand alone (`<i64 as fmt::Display>::fmt`) or be cast to a function
+    // pointer (`... as unsafe fn(NonNull<()>, &mut Formatter) -> Result
+    // (Transmute)`); either way the value is the formatter, so keep it as a
+    // `Fmt` operand. This must run before the generic cast split, which would
+    // otherwise split at the ` as ` inside the `<i64 as ...>` path.
+    if let Some(pos) = s.find(">::fmt") {
+        let end = pos + ">::fmt".len();
+        if let Some((ty_name, trait_name)) = parse_reify_fn(&s[..end]) {
+            let rest = s[end..].trim();
+            if let Some(ty_kind) = rest.strip_prefix("as ") {
+                let (ty, kind) = parse_cast_target(ty_kind)?;
+                return Ok(Rvalue::Cast {
+                    from: Box::new(Ty::Other),
+                    to: Box::new(ty),
+                    op: Operand::Fmt { ty_name, trait_name },
+                    kind,
+                });
+            }
+            return Ok(Rvalue::Use(Operand::Fmt { ty_name, trait_name }));
+        }
+    }
     // A cast: `OPERAND as TY (KIND)`.
     if let Some((op_part, ty_kind)) = split_top_as(s) {
         let (ty, kind) = parse_cast_target(ty_kind)?;
@@ -1314,9 +1351,12 @@ fn parse_rvalue(s: &str) -> Result<Rvalue, String> {
             }
             // An enum variant carries its name so the backend can find the
             // variant's payload offset; a plain struct is an `Aggregate`.
-            // `core::fmt::Arguments` is a plain struct whose path happens to
-            // contain `::`, so it must not be mistaken for a variant.
-            if name.contains("::") && !name.contains("Arguments") {
+            // The `format_args!` lowering spells its structs with paths that
+            // contain `::` (`core::fmt::rt::Argument::<'_> { .. }`,
+            // `...ArgumentType::<'_>::Placeholder { .. }`), so those are
+            // normalised to a bare name instead of being mistaken for variants.
+            let name = normalize_fmt_struct(name);
+            if name.contains("::") {
                 return Ok(Rvalue::Enum { name: name.to_string(), ops });
             }
             return Ok(Rvalue::Aggregate(ops));
@@ -1460,6 +1500,12 @@ fn cast_kind(k: &str) -> CastKind {
 
 fn parse_operand(s: &str) -> Result<Operand, String> {
     let s = s.trim();
+    // `<T as core::fmt::Display>::fmt` — a reified formatter. `format_args!`
+    // lowers every `{}`/`{:?}`/... placeholder to one of these, so the back end
+    // must recognise it rather than treat it as a function pointer.
+    if let Some((ty_name, trait_name)) = parse_reify_fn(s) {
+        return Ok(Operand::Fmt { ty_name, trait_name });
+    }
     if let Some(r) = s.strip_prefix("copy ") {
         return Ok(Operand::Copy(parse_place(r.trim())?));
     }
@@ -1501,9 +1547,6 @@ pub fn classify_unsupported(fragment: &str) -> Option<&'static str> {
     {
         return Some("`{}`/`{:?}` formatting (rustc's `core::fmt`) is not implemented on the MIR path; write the value with `print_i64`/`print_str` instead");
     }
-    if has("core::fmt::rt::Argument") {
-        return Some("`print!`/`println!` with a *runtime* argument (`{}` of a variable) is not implemented on the MIR path; format only literals/constants, or write the value with `print_i64`/`print_str`");
-    }
     if has("PointerCoercion(ReifyFnPointer") {
         return Some("taking a function or method as a value is not implemented on the MIR path");
     }
@@ -1515,9 +1558,6 @@ pub fn classify_unsupported(fragment: &str) -> Option<&'static str> {
     }
     if has("PtrMetadata") {
         return Some("`PtrMetadata` on a value that is not a `&str`/`&[T]` literal is not implemented on the MIR path");
-    }
-    if has("PhantomData") {
-        return Some("a zero-sized marker field (e.g. `PhantomData`) is not implemented on the MIR path");
     }
     if has("NonZero") || has("UsizeNoHighBit") || has("Unique::") || has("alloc::raw_vec") {
         return Some("the standard library's container internals (`Vec`/`String`) are not implemented on the MIR path");
@@ -1564,6 +1604,14 @@ fn parse_const(s: &str) -> Option<Const> {
     }
     if s == "false" {
         return Some(Const::Bool(false));
+    }
+    // A zero-sized constant: `PhantomData::<..>` and the like. It takes no
+    // storage, so the aggregate that lists it must not reserve a word.
+    if s.starts_with("PhantomData") {
+        return Some(Const::Zst);
+    }
+    if let Some(bytes) = parse_byte_string(s) {
+        return Some(Const::Bytes(bytes));
     }
     if s.starts_with('"') {
         let inner = s.trim_start_matches('"').trim_end_matches('"');
@@ -1664,7 +1712,10 @@ fn parse_named_const(s: &str) -> Option<i64> {
     match name {
         "MIN" if signed => Some(-(1i64 << (bits - 1))),
         "MAX" if signed => Some((1i64 << (bits - 1)) - 1),
-        "MAX" => Some(-1), // unsigned max fits the 64-bit word as all ones
+        // An unsigned max is its own bit pattern, not all ones: `u8::MAX` is
+        // 255. Only `u64`/`usize` fill the 64-bit word (and overflow the shift).
+        "MAX" if bits == 64 => Some(-1),
+        "MAX" => Some((1i64 << bits) - 1),
         _ => None,
     }
 }
@@ -1719,6 +1770,75 @@ fn unescape(s: &str) -> String {
         }
     }
     out
+}
+
+/// `b"..."` — a byte-string literal, as `rustc --emit=mir` prints it. The
+/// escapes are the Rust byte-string escapes (`\xNN`, `\n`, `\t`, `\\`, `\"`,
+/// `\0`, `\r`); the content is raw bytes, not a `str`.
+fn parse_byte_string(s: &str) -> Option<Vec<u8>> {
+    let body = s.strip_prefix("b\"")?.strip_suffix('"')?;
+    let mut out = Vec::new();
+    let b = body.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'\\' {
+            out.push(b[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let c = *b.get(i)?;
+        i += 1;
+        match c {
+            b'n' => out.push(b'\n'),
+            b't' => out.push(b'\t'),
+            b'r' => out.push(b'\r'),
+            b'0' => out.push(0),
+            b'\\' => out.push(b'\\'),
+            b'"' => out.push(b'"'),
+            b'\'' => out.push(b'\''),
+            b'x' => {
+                let hi = (*b.get(i)? as char).to_digit(16)?;
+                let lo = (*b.get(i + 1)? as char).to_digit(16)?;
+                out.push((hi * 16 + lo) as u8);
+                i += 2;
+            }
+            _ => out.push(c),
+        }
+    }
+    Some(out)
+}
+
+/// `<T as core::fmt::Trait>::fmt` — a reified formatter, as `format_args!`
+/// lowers it. Returns the formatted type and the trait name (`Display`,
+/// `Debug`, `LowerHex`, ...). The MIR path maps this to one of its own
+/// runtime formatters, so the exact trait only selects the numeric base.
+fn parse_reify_fn(s: &str) -> Option<(String, String)> {
+    let s = s.trim();
+    let rest = s.strip_prefix('<')?;
+    let as_pos = rest.find(" as ")?;
+    let ty = rest[..as_pos].trim();
+    let after = &rest[as_pos + 4..];
+    let trait_path = after.strip_suffix(">::fmt")?;
+    if !trait_path.contains("fmt") {
+        return None;
+    }
+    let trait_name = trait_path.rsplit("::").next().unwrap_or(trait_path).trim();
+    Some((ty.to_string(), trait_name.to_string()))
+}
+
+/// The `format_args!` lowering names its own structs with full paths
+/// (`core::fmt::rt::Argument::<'_>`, `core::fmt::rt::ArgumentType::<'_>`,
+/// `Arguments::<'_>`). Reduce those to a bare name so the backend's aggregate
+/// handling sees the shape rather than an `Enum::Variant`. Any other path is
+/// left alone, so a genuine `Enum::Variant` is still treated as one.
+fn normalize_fmt_struct(name: &str) -> &str {
+    let head = name.split("::<").next().unwrap_or(name);
+    let last = head.rsplit("::").next().unwrap_or(head).trim();
+    if last == "Argument" || last == "ArgumentType" || last == "Arguments" {
+        return last;
+    }
+    name
 }
 
 /// Function arguments, as `(local index, type)` pairs. The index matters: MIR
@@ -1805,6 +1925,17 @@ pub fn parse_ty(s: &str) -> Result<Ty, String> {
             if last == "Option" || last == "Range" {
                 return Ok(Ty::Struct(last.to_string()));
             }
+            // The `format_args!` lowering builds a tree of these types. The
+            // backend models each by its last path segment so the aggregate
+            // layout (`Argument` = one 16-byte `ArgumentType`, `ArgumentType`
+            // = one word) matches what rustc's MIR stores into.
+            if last == "Argument"
+                || last == "ArgumentType"
+                || last == "NonNull"
+                || last == "PhantomData"
+            {
+                return Ok(Ty::Struct(last.to_string()));
+            }
             if s.contains("::") {
                 Ok(Ty::Other)
             } else {
@@ -1818,18 +1949,52 @@ pub fn parse_ty(s: &str) -> Result<Ty, String> {
 
 /// Index of the matching close bracket for the opener at `open`.
 fn matching(s: &str, open: usize, oc: char, cc: char) -> Option<usize> {
+    let bytes = s.as_bytes();
     let mut depth = 0i32;
-    for (i, c) in s.char_indices().skip_while(|(i, _)| *i < open) {
-        if c == oc {
-            depth += 1;
-        } else if c == cc {
-            depth -= 1;
-            if depth == 0 {
-                return Some(i);
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(end) = string_end(bytes, i) {
+            i = end;
+            continue;
+        }
+        if i >= open {
+            let c = bytes[i] as char;
+            if c == oc {
+                depth += 1;
+            } else if c == cc {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
             }
         }
+        i += 1;
     }
     None
+}
+
+/// If `bytes[i]` starts a string literal (`"..."` or `b"..."`), return the
+/// index just past its closing quote; otherwise `None`. Escapes are skipped so
+/// an escaped quote does not end the literal early. The MIR scanners must not
+/// treat a `)`/`,`/`;`/`as` inside a literal (e.g. a `format_args!` template or
+/// a `b"\x03a)b..."` byte string) as syntax.
+fn string_end(bytes: &[u8], i: usize) -> Option<usize> {
+    let start = if bytes[i] == b'"' {
+        i
+    } else if bytes[i] == b'b' && bytes.get(i + 1) == Some(&b'"') {
+        i + 1
+    } else {
+        return None;
+    };
+    let mut j = start + 1;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'\\' => j += 2,
+            b'"' => return Some(j + 1),
+            _ => j += 1,
+        }
+    }
+    Some(bytes.len())
 }
 
 /// The content between the braces at `open`. The MIR printer doubles the
@@ -1850,7 +2015,15 @@ fn split_top_args(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut depth = 0i32;
     let mut cur = String::new();
-    for c in s.chars() {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(end) = string_end(bytes, i) {
+            cur.push_str(&s[i..end]);
+            i = end;
+            continue;
+        }
+        let c = bytes[i] as char;
         match c {
             '(' | '[' | '{' | '<' => {
                 depth += 1;
@@ -1866,6 +2039,7 @@ fn split_top_args(s: &str) -> Vec<String> {
             }
             _ => cur.push(c),
         }
+        i += 1;
     }
     if !cur.trim().is_empty() {
         out.push(cur);
@@ -1875,14 +2049,21 @@ fn split_top_args(s: &str) -> Vec<String> {
 
 /// Split at the top-level `;` (for `[value; count]` and `[T; N]`).
 fn split_top_semi(s: &str) -> Option<(&str, &str)> {
+    let bytes = s.as_bytes();
     let mut depth = 0i32;
-    for (i, c) in s.char_indices() {
-        match c {
-            '(' | '[' | '{' | '<' => depth += 1,
-            ')' | ']' | '}' | '>' => depth -= 1,
-            ';' if depth == 0 => return Some((&s[..i], &s[i + 1..])),
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(end) = string_end(bytes, i) {
+            i = end;
+            continue;
+        }
+        match bytes[i] {
+            b'(' | b'[' | b'{' | b'<' => depth += 1,
+            b')' | b']' | b'}' | b'>' => depth -= 1,
+            b';' if depth == 0 => return Some((&s[..i], &s[i + 1..])),
             _ => {}
         }
+        i += 1;
     }
     None
 }
@@ -2141,6 +2322,7 @@ impl Remap {
             Operand::Copy(p) => Operand::Copy(self.place(p)),
             Operand::Move(p) => Operand::Move(self.place(p)),
             Operand::Const(c) => Operand::Const(self.const_(c)),
+            Operand::Fmt { .. } => o.clone(),
         }
     }
 
@@ -2149,6 +2331,7 @@ impl Remap {
             Operand::Copy(p) => Operand::Copy(self.place_ret(p, dest_local)),
             Operand::Move(p) => Operand::Move(self.place_ret(p, dest_local)),
             Operand::Const(c) => Operand::Const(self.const_(c)),
+            Operand::Fmt { .. } => o.clone(),
         }
     }
 
@@ -2240,6 +2423,10 @@ fn split_top_as(s: &str) -> Option<(&str, &str)> {
     let mut depth = 0i32;
     let mut i = 0;
     while i < bytes.len() {
+        if let Some(end) = string_end(bytes, i) {
+            i = end;
+            continue;
+        }
         match bytes[i] {
             b'(' | b'[' | b'{' => depth += 1,
             b')' | b']' | b'}' => depth -= 1,
@@ -3644,7 +3831,7 @@ fn edges_with_facts(t: &Terminator) -> Vec<(u32, EdgeFact)> {
 fn operand_place(op: &Operand) -> Option<&Place> {
     match op {
         Operand::Copy(p) | Operand::Move(p) => Some(p),
-        Operand::Const(_) => None,
+        Operand::Const(_) | Operand::Fmt { .. } => None,
     }
 }
 
@@ -4046,6 +4233,7 @@ fn call_args_invariant(args: &[Operand], is_invariant: &impl Fn(u32) -> bool) ->
     args.iter().all(|a| match a {
         Operand::Const(_) => true,
         Operand::Copy(p) | Operand::Move(p) => p.proj.is_empty() && is_invariant(p.local),
+        Operand::Fmt { .. } => true,
     })
 }
 

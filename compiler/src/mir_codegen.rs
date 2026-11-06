@@ -65,6 +65,8 @@ struct FnGen<'a> {
     opts: &'a Options,
     /// String literal content -> its `.rodata` label.
     string_ids: &'a HashMap<String, String>,
+    /// `format_args!` template bytes -> its `.rodata` label.
+    template_ids: &'a HashMap<Vec<u8>, String>,
     /// Static allocation id -> its data label.
     alloc_labels: &'a HashMap<u32, String>,
     /// Struct name -> field types, learned from aggregate constructions. Used to
@@ -116,6 +118,21 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<String, String> {
 
     // String literals become `.rodata` labels, emitted once.
     let (strings, string_ids) = collect_strings(prog);
+    // `format_args!` templates are byte-string literals: raw bytes, no length
+    // word, because the runtime walks them and reads the length from the first
+    // byte of each piece.
+    let (templates, template_ids) = collect_templates(prog);
+    // The runtime walker renders a placeholder's value in full; it does not
+    // honour a width or precision (`{:>5}`, `{:.2}`). Reject those templates
+    // here so they are a diagnostic rather than silently mis-rendered.
+    for t in &templates {
+        if let Some(field) = template_unrendered_field(t) {
+            return Err(format!(
+                "mir: `format_args!` placeholder with `{field}` is not implemented on the MIR path; \
+                 format the value without flags, width or precision"
+            ));
+        }
+    }
 
     // Every static allocation becomes a `.rodata` blob: its bytes, plus a
     // `.quad` for each interior pointer relocation. `alloc1` (string data) and
@@ -130,7 +147,7 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<String, String> {
         if is_unsupported_builtin(&f.name) {
             continue;
         }
-        let mut g = FnGen::new(prog, f, opts, &string_ids, &alloc_labels, &structs, &enums);
+        let mut g = FnGen::new(prog, f, opts, &string_ids, &template_ids, &alloc_labels, &structs, &enums);
         let body = g.gen_fn()?;
         asm.push_str(&body);
         if !g.errors.is_empty() {
@@ -139,8 +156,10 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<String, String> {
     }
 
     let mut rodata = String::new();
-    if !strings.is_empty() {
+    if !strings.is_empty() || !templates.is_empty() {
         rodata.push_str("\n.section .rodata\n");
+    }
+    if !strings.is_empty() {
         for s in &strings {
             let label = &string_ids[s];
             // A `&str`/`&[u8]` literal is a `{len: i64, bytes..}` record, the
@@ -156,10 +175,20 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<String, String> {
             }
         }
     }
+    for t in &templates {
+        let label = &template_ids[t];
+        // A `format_args!` template: raw bytes with no length word. The runtime
+        // walks it, reading a piece length from each piece's first byte, so the
+        // first byte must be part of the encoding, not a word count.
+        let _ = writeln!(rodata, ".balign 1");
+        let _ = writeln!(rodata, "{label}:");
+        let parts: Vec<String> = t.iter().map(|b| b.to_string()).collect();
+        let _ = writeln!(rodata, "  .byte {}", parts.join(", "));
+    }
     let mut alloc_ids: Vec<&u32> = prog.allocs.keys().collect();
     alloc_ids.sort();
     if !alloc_ids.is_empty() {
-        if strings.is_empty() {
+        if strings.is_empty() && templates.is_empty() {
             rodata.push_str("\n.section .rodata\n");
         }
         for id in alloc_ids {
@@ -254,6 +283,105 @@ fn unsupported_note(msg: &str, fragment: &str) -> String {
 /// The System V integer argument registers, in order.
 const ARG_REGS: [&str; 6] = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"];
 
+/// A reified formatter, reduced to the runtime helper that implements it. The
+/// type text is matched loosely (a `&str` and a `&&str` share the string
+/// formatter; an integer keeps its width and signedness) and the trait selects
+/// the numeric base.
+fn resolve_fmt(ty_name: &str, trait_name: &str) -> &'static str {
+    // A reference formats as the thing it points at (`&str`, `&&str`).
+    let base = ty_name.trim().trim_start_matches('&').trim_start_matches("mut ").trim();
+    let debug = trait_name.contains("Debug");
+    let is_str = base == "str" || base.starts_with("[u8]") || base.starts_with("[u8;");
+    if is_str {
+        return if debug { "__rmc_fmt_str_debug" } else { "__rmc_fmt_str" };
+    }
+    // Integers keep their width and signedness. `char`/`bool` have their own
+    // helpers; every other scalar (a `usize` width, a pointer) is formatted
+    // as a 64-bit value.
+    let (signed, bits) = int_kind(base);
+    if base == "bool" {
+        return "__rmc_fmt_bool";
+    }
+    if base == "char" {
+        return "__rmc_fmt_char";
+    }
+    let hex = trait_name.contains("Hex");
+    let upper = trait_name.contains("UpperHex");
+    let oct = trait_name.contains("Octal");
+    let bin = trait_name.contains("Binary");
+    if hex || oct || bin {
+        // Hex/octal/binary print the value as an unsigned integer of its own
+        // width (Rust: `{:x}` of `-2i16` is `fffe`), so the runtime has one
+        // entry point per width and it loads exactly that many bytes. `usize`
+        // and the non-integer scalars are 64-bit. `{:X}` shares the hex entry
+        // points' shape but a distinct symbol, since the alphabet differs.
+        let base = if hex {
+            if upper {
+                "HEX"
+            } else {
+                "hex"
+            }
+        } else if oct {
+            "oct"
+        } else {
+            "bin"
+        };
+        let width = match bits {
+            8 => 8,
+            16 => 16,
+            32 => 32,
+            _ => 64,
+        };
+        return match (base, width) {
+            ("hex", 8) => "__rmc_fmt_hex_8",
+            ("hex", 16) => "__rmc_fmt_hex_16",
+            ("hex", 32) => "__rmc_fmt_hex_32",
+            ("hex", _) => "__rmc_fmt_hex_64",
+            ("HEX", 8) => "__rmc_fmt_HEX_8",
+            ("HEX", 16) => "__rmc_fmt_HEX_16",
+            ("HEX", 32) => "__rmc_fmt_HEX_32",
+            ("HEX", _) => "__rmc_fmt_HEX_64",
+            ("oct", 8) => "__rmc_fmt_oct_8",
+            ("oct", 16) => "__rmc_fmt_oct_16",
+            ("oct", 32) => "__rmc_fmt_oct_32",
+            ("oct", _) => "__rmc_fmt_oct_64",
+            ("bin", 8) => "__rmc_fmt_bin_8",
+            ("bin", 16) => "__rmc_fmt_bin_16",
+            ("bin", 32) => "__rmc_fmt_bin_32",
+            _ => "__rmc_fmt_bin_64",
+        };
+    }
+    match signed {
+        true if bits == 32 => "__rmc_fmt_i32",
+        true => "__rmc_fmt_i64",
+        false if bits == 32 => "__rmc_fmt_u32",
+        false => "__rmc_fmt_u64",
+    }
+}
+
+/// The signedness and bit width of an integer type name (`i32` -> signed 32,
+/// `usize`/`u64` -> unsigned 64). A non-integer falls back to a signed word.
+fn int_kind(name: &str) -> (bool, u32) {
+    let n = name.trim();
+    if let Some(rest) = n.strip_prefix('i') {
+        if let Ok(bits) = rest.parse::<u32>() {
+            return (true, bits);
+        }
+        if rest == "size" {
+            return (true, 64);
+        }
+    }
+    if let Some(rest) = n.strip_prefix('u') {
+        if let Ok(bits) = rest.parse::<u32>() {
+            return (false, bits);
+        }
+        if rest == "size" {
+            return (false, 64);
+        }
+    }
+    (true, 64)
+}
+
 /// Every distinct string literal in the program, in first-seen order, and a map
 /// from its content to a `.rodata` label.
 fn collect_strings(prog: &Program) -> (Vec<String>, HashMap<String, String>) {
@@ -269,6 +397,94 @@ fn collect_strings(prog: &Program) -> (Vec<String>, HashMap<String, String>) {
         }
     }
     (order, map)
+}
+
+/// Walk a `format_args!` template and return a description of the first
+/// placeholder that carries flags, a width or a precision, or `None` if every
+/// placeholder is plain. The runtime walker skips those fields (it must, to
+/// reach the argument index) but renders the value in full, so such a template
+/// would be silently mis-rendered; the caller rejects it instead.
+///
+/// A placeholder byte is `0b11xxxxxx`; bits 0..3 mark a present `flags` (u32),
+/// `width` (u16), `precision` (u16) and `arg_index` (u16). Only the optional
+/// `arg_index` is harmless.
+fn template_unrendered_field(t: &[u8]) -> Option<&'static str> {
+    let mut i = 0;
+    while i < t.len() {
+        let b = t[i];
+        if b < 0x80 {
+            i += 1 + b as usize; // literal piece: length byte, then the bytes
+        } else if b < 0xC0 {
+            if i + 3 > t.len() {
+                return None;
+            }
+            let len = t[i + 1] as usize | ((t[i + 2] as usize) << 8);
+            i += 3 + len; // long literal: 0x80, u16 length, then the bytes
+        } else {
+            let bits = b & 0x0F;
+            if bits & 0x01 != 0 {
+                return Some("flags");
+            }
+            if bits & 0x02 != 0 {
+                return Some("width");
+            }
+            if bits & 0x04 != 0 {
+                return Some("precision");
+            }
+            i += 1;
+            if bits & 0x08 != 0 {
+                i += 2; // arg_index
+            }
+        }
+    }
+    None
+}
+
+/// Every distinct `format_args!` template byte string, in first-seen order, and
+/// a map from its bytes to a `.rodata` label.
+fn collect_templates(prog: &Program) -> (Vec<Vec<u8>>, HashMap<Vec<u8>, String>) {
+    let mut order = Vec::new();
+    let mut map = HashMap::new();
+    for f in &prog.funcs {
+        for b in &f.blocks {
+            for s in &b.stmts {
+                if let Stmt::Assign(_, rv) = s {
+                    collect_templates_rv(rv, &mut order, &mut map);
+                }
+            }
+        }
+    }
+    (order, map)
+}
+
+fn collect_templates_rv(rv: &Rvalue, order: &mut Vec<Vec<u8>>, map: &mut HashMap<Vec<u8>, String>) {
+    let mut add = |c: &Const| {
+        if let Const::Bytes(b) = c {
+            if !map.contains_key(b) {
+                map.insert(b.clone(), format!("__rmc_tmpl{}", map.len()));
+                order.push(b.clone());
+            }
+        }
+    };
+    let mut visit = |op: &Operand| {
+        if let Operand::Const(c) = op {
+            add(c)
+        }
+    };
+    match rv {
+        Rvalue::Use(op) => visit(op),
+        Rvalue::Binary(_, a, b) => {
+            visit(a);
+            visit(b);
+        }
+        Rvalue::Unary(_, a) => visit(a),
+        Rvalue::Cast { op, .. } => visit(op),
+        Rvalue::Repeat { op, .. } => visit(op),
+        Rvalue::Array(ops) | Rvalue::Aggregate(ops) | Rvalue::Enum { ops, .. } => {
+            ops.iter().for_each(|op| visit(op))
+        }
+        _ => {}
+    }
 }
 
 /// Struct name -> field types, learned from aggregate constructions.
@@ -585,6 +801,7 @@ fn rv_operand_ty(f: &Function, op: &Operand) -> Ty {
             f.locals.get(p.local as usize).map(|l| (*l.ty).clone()).unwrap_or(Ty::I64)
         }
         Operand::Const(Const::Bool(_)) => Ty::Bool,
+        Operand::Const(Const::Zst) => Ty::Unit,
         Operand::Const(Const::Agg { name, .. }) => {
             if name.is_empty() {
                 Ty::I64
@@ -651,6 +868,7 @@ impl<'a> FnGen<'a> {
         func: &'a Function,
         opts: &'a Options,
         string_ids: &'a HashMap<String, String>,
+        template_ids: &'a HashMap<Vec<u8>, String>,
         alloc_labels: &'a HashMap<u32, String>,
         structs: &'a HashMap<String, Vec<Ty>>,
         enums: &'a HashMap<String, EnumLayout>,
@@ -660,6 +878,7 @@ impl<'a> FnGen<'a> {
             func,
             opts,
             string_ids,
+            template_ids,
             alloc_labels,
             structs,
             enums,
@@ -1521,6 +1740,13 @@ impl<'a> FnGen<'a> {
     fn eval_operand(&mut self, op: &Operand) -> Result<(String, bool), String> {
         match op {
             Operand::Const(c) => Ok((self.const_operand(c)?, false)),
+            Operand::Fmt { ty_name, trait_name } => {
+                // A reified formatter is the address of rmc's own runtime
+                // formatter for this type/trait pair.
+                let label = self.fmt_label(ty_name, trait_name);
+                self.emit(&format!("  lea {label}(%rip), %rax"));
+                Ok(("%rax".to_string(), false))
+            }
             Operand::Copy(p) | Operand::Move(p) => {
                 if self.place_is_simple(p) {
                     let mem = !self.promo.contains_key(&p.local);
@@ -1537,9 +1763,19 @@ impl<'a> FnGen<'a> {
     /// is returned directly, a complex one is loaded into `%rcx`.
     fn eval_operand_keep_rax(&mut self, op: &Operand) -> Result<(String, bool), String> {
         match op {
+            Operand::Fmt { ty_name, trait_name } => {
+                let label = self.fmt_label(ty_name, trait_name);
+                self.emit(&format!("  lea {label}(%rip), %rcx"));
+                Ok(("%rcx".to_string(), false))
+            }
             Operand::Const(c) => {
                 if let Const::Str(s) = c {
                     let label = self.str_label(s);
+                    self.emit(&format!("  lea {label}(%rip), %rcx"));
+                    return Ok(("%rcx".to_string(), false));
+                }
+                if let Const::Bytes(b) = c {
+                    let label = self.template_label(b);
                     self.emit(&format!("  lea {label}(%rip), %rcx"));
                     return Ok(("%rcx".to_string(), false));
                 }
@@ -1572,8 +1808,12 @@ impl<'a> FnGen<'a> {
     fn operand_is_simple(&self, op: &Operand) -> bool {
         match op {
             // A string literal is an address, not an immediate: reading it needs
-            // a `lea`, so it is never a directly usable operand.
-            Operand::Const(Const::Str(_)) => false,
+            // a `lea`, so it is never a directly usable operand. A reified
+            // formatter likewise needs a `lea`, and so does a `format_args!`
+            // template byte string.
+            Operand::Const(Const::Str(_))
+            | Operand::Const(Const::Bytes(_))
+            | Operand::Fmt { .. } => false,
             Operand::Const(_) => true,
             Operand::Copy(p) | Operand::Move(p) => self.place_is_simple(p),
         }
@@ -1585,6 +1825,22 @@ impl<'a> FnGen<'a> {
             .get(s)
             .cloned()
             .unwrap_or_else(|| s.to_string())
+    }
+
+    /// The `.rodata` label for a `format_args!` template's bytes.
+    fn template_label(&self, b: &[u8]) -> String {
+        self.template_ids
+            .get(b)
+            .cloned()
+            .unwrap_or_else(|| "__rmc_tmpl_missing".to_string())
+    }
+
+    /// The `.rodata` label for the runtime formatter of `ty` under `trait_name`.
+    /// The runtime defines one per scalar type and numeric base; the trait name
+    /// only selects the base (`Display` = decimal, `Debug` = decimal with
+    /// quoting for strings, `LowerHex` = hex, ...).
+    fn fmt_label(&self, ty_name: &str, trait_name: &str) -> String {
+        resolve_fmt(ty_name, trait_name).to_string()
     }
 
     fn const_operand(&mut self, c: &Const) -> Result<String, String> {
@@ -1603,6 +1859,14 @@ impl<'a> FnGen<'a> {
             Const::Named(n) => {
                 return Err(format!("mir_codegen: unsupported constant `{n}`"));
             }
+            Const::Bytes(b) => {
+                // A `format_args!` template: the address of its raw `.rodata`
+                // bytes, materialised with `lea` like a string literal.
+                let label = self.template_label(b);
+                self.emit(&format!("  lea {label}(%rip), %rax"));
+                "%rax".to_string()
+            }
+            Const::Zst => "$0".to_string(),
             Const::Agg { .. } => {
                 return Err("mir_codegen: aggregate constant not yet materialised".into());
             }
@@ -1766,6 +2030,12 @@ impl<'a> FnGen<'a> {
     /// its fields, which `structs` supplies.
     fn size_of_ty(&self, ty: &Ty) -> i64 {
         match ty {
+            // `()` occupies no storage, so a zero-sized field (`PhantomData`,
+            // which the MIR printer spells as a unit const) must not reserve a
+            // word: `core::fmt::rt::ArgumentType` is 16 bytes, not 24. A
+            // *whole* local of type `()` still gets a slot from `analyze`'s
+            // `.max(1)`.
+            Ty::Unit => 0,
             Ty::Struct(name) => {
                 if let Some(l) = self.enums.get(name) {
                     return l.size.max(8);
@@ -1850,6 +2120,9 @@ impl<'a> FnGen<'a> {
         match op {
             Operand::Copy(p) | Operand::Move(p) => self.place_addr(p),
             Operand::Const(c) => self.materialize_const_agg(c),
+            Operand::Fmt { .. } => {
+                Err("mir_codegen: a reified formatter is not an aggregate".into())
+            }
         }
     }
 
@@ -1899,6 +2172,11 @@ impl<'a> FnGen<'a> {
         let mut vals: Vec<(i64, Option<i64>, Option<i64>)> = Vec::new();
         let tag_first = name.contains("::");
         for (k, op) in ops.iter().enumerate() {
+            // A zero-sized field stores nothing and takes no word, so it must
+            // not consume a slot (nor shift the fields after it).
+            if matches!(rv_operand_ty(&self.func, op), Ty::Unit) {
+                continue;
+            }
             let (src, _) = self.eval_operand(op)?;
             let tmp = self.alloc_slot();
             self.emit(&format!("  mov {src}, {}", self.off(tmp)));
@@ -2026,9 +2304,17 @@ impl<'a> FnGen<'a> {
                 }
             }
             Rvalue::Array(ops) | Rvalue::Aggregate(ops) => {
-                for (i, op) in ops.iter().enumerate() {
-                    let target = self.subplace(dest, i as u64);
+                let mut field = 0u64;
+                for op in ops.iter() {
+                    let target = self.subplace(dest, field);
                     let ty = self.place_ty(&target);
+                    // A zero-sized field (`PhantomData`) takes no storage and
+                    // must not advance the field index, or the next field would
+                    // land one word too far.
+                    if matches!(ty, Ty::Unit) {
+                        continue;
+                    }
+                    field += 1;
                     if ty.is_aggregate() {
                         let size = self.place_size(&target);
                         self.eval_aggregate_addr(op)?;
@@ -2099,10 +2385,21 @@ impl<'a> FnGen<'a> {
     /// A sub-place for aggregate element/field `i`.
     fn subplace(&self, dest: &Place, i: u64) -> Place {
         let mut p = dest.clone();
-        // A field and an array element are both `+ i*8`; `Field` reads better
-        // for a struct literal, `IndexConst` for an array.
-        p.proj.push(Proj::IndexConst(i));
+        // A struct/tuple element is a `Field` (so the field type and offset come
+        // from the aggregate layout); an array element is an `IndexConst`. Using
+        // `IndexConst` for a struct would scale by 8 and type the element `i64`,
+        // which loses a multi-word field (e.g. a `format_args!` `Argument`).
+        p.proj.push(self.aggregate_elem_proj(dest, i));
         p
+    }
+
+    /// The projection that selects element `i` of `dest`: `Field` for a
+    /// struct/tuple, `IndexConst` for an array or anything else.
+    fn aggregate_elem_proj(&self, dest: &Place, i: u64) -> Proj {
+        match self.place_ty(dest) {
+            Ty::Struct(_) | Ty::Tuple(_) => Proj::Field(i as u32),
+            _ => Proj::IndexConst(i),
+        }
     }
 
     /// Store the scalar in `src` (a register, immediate, or frame slot) at
@@ -2127,6 +2424,11 @@ impl<'a> FnGen<'a> {
             if src.contains('(') || is_wide_imm(src) {
                 self.emit(&format!("  mov {src}, %rcx"));
                 self.emit(&format!("  mov %rcx, {dst}"));
+            } else if src.starts_with('$') {
+                // An unsuffixed `mov $imm, mem` is a 32-bit store, which would
+                // leave the high half of this 8-byte slot stale for a negative
+                // value; `movq` forces the sign-extending 64-bit form.
+                self.emit(&format!("  movq {src}, {dst}"));
             } else {
                 self.emit(&format!("  mov {src}, {dst}"));
             }
@@ -2547,6 +2849,7 @@ impl<'a> FnGen<'a> {
             Operand::Const(Const::Bool(_)) => Ty::Bool,
             Operand::Const(Const::Str(_)) => Ty::Ptr(Box::new(Ty::Unit)),
             Operand::Const(_) => Ty::I64,
+            Operand::Fmt { .. } => Ty::Ptr(Box::new(Ty::Unit)),
         }
     }
 }
@@ -3167,7 +3470,10 @@ fn forward_stores(body: &str) -> String {
             // left the store into it is dropped as dead.
             let mut a = src;
             let mut b = dst;
-            if is_slot(a) {
+            // `lea`'s source is an addressing expression, not a memory read:
+            // `lea -8(%rbp), %rax` computes an address, so the slot there must
+            // not be replaced by the register that happens to hold its value.
+            if op != "lea" && is_slot(a) {
                 if let Some(r) = holding.get(a) {
                     if (op == "mov" || op == "movq") && r == b {
                         continue;
@@ -3545,8 +3851,6 @@ fn ty_size(ty: &Ty) -> i64 {
         Ty::Array(elem, n) => ty_size(elem) * (*n as i64).max(1),
         Ty::Tuple(tys) => tys.iter().map(|t| ty_size(t)).sum::<i64>().max(8),
         _ => 8,
-        #[allow(unreachable_patterns)]
-        _ => 8,
     }
 }
 
@@ -3582,7 +3886,7 @@ fn alu_mnem(op: BinOp) -> &'static str {
 fn operand_is_local(op: &Operand, local: u32) -> bool {
     match op {
         Operand::Copy(p) | Operand::Move(p) => p.local == local && p.proj.is_empty(),
-        Operand::Const(_) => false,
+        Operand::Const(_) | Operand::Fmt { .. } => false,
     }
 }
 
