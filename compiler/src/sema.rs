@@ -102,6 +102,16 @@ pub struct Sema {
     /// or arithmetic operand that is a constant *local* (`let i = -1; a[i]`),
     /// which rustc folds and rmc otherwise missed.
     const_locals: HashMap<i32, i64>,
+    /// A monotonic counter for synthesised temporary names, so each desugar
+    /// gets a distinct identifier. Names carry a leading NUL, which no source
+    /// identifier can contain, so they cannot collide with a user binding.
+    tmp: u32,
+    /// Set while re-checking the body of a built-in `abs`. Its `-x` is
+    /// compiler-generated, so the `arithmetic_overflow` lint that rejects a
+    /// written `-i64::MIN` must not fire: rustc accepts `i64::MIN.abs()` (it
+    /// yields `i64::MIN` in release and traps under overflow checks), because
+    /// the negation happens inside a generic stdlib body that never folds.
+    in_builtin_abs: bool,
     /// How many times each binding name is assigned by an `=` statement in the
     /// current function (the `let` initializer is not counted). rustc folds a
     /// local only when it is assigned at most once in total, so a name with any
@@ -241,6 +251,8 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         ret_ty: Type::Unit,
         match_total: false,
         match_chain: false,
+        tmp: 0,
+        in_builtin_abs: false,
         const_locals: HashMap::new(),
         assign_count: HashMap::new(),
         mut_borrowed: std::collections::HashSet::new(),
@@ -653,6 +665,102 @@ impl Sema {
         let s = self.next_slot;
         self.next_slot += n.max(1);
         s
+    }
+
+    /// Rewrite a built-in integer method call into an expression over `i64`
+    /// operators. `recv` is already checked and, for a `&i64` receiver,
+    /// auto-dereferenced to an `i64` place. `min`/`max` need a second operand;
+    /// `abs`/`signum` take none.
+    ///
+    /// Every desugaring reads its operands more than once (the receiver appears
+    /// in both arms, an argument in the test and in a result), so each
+    /// non-trivial operand is bound to a temporary first — `g().abs()` must call
+    /// `g` once, as rustc does. A plain variable or literal has no side effect
+    /// and is reused directly, so `x.abs()` stays a bare branch.
+    fn desugar_i64_method(
+        &mut self,
+        name: &str,
+        recv: Expr,
+        args: &[Expr],
+    ) -> Result<Expr, String> {
+        use BinOp::*;
+
+        /// Bind `e` to a fresh `\0im<n>` temporary unless it is a plain variable
+        /// or literal, appending the `let` to `stmts` in evaluation order.
+        fn bind(sema: &mut Sema, e: Expr, stmts: &mut Vec<Stmt>) -> Expr {
+            if matches!(e, Expr::Var { .. } | Expr::Int(_)) {
+                return e;
+            }
+            let name = format!("\u{0}im{}", sema.tmp);
+            sema.tmp += 1;
+            let var = Expr::Var { name: name.clone(), slot: -1, ty: Type::I64 };
+            stmts.push(Stmt::Let {
+                name,
+                ty: Some(Type::I64),
+                init: Some(e),
+                slot: -1,
+                mutable: false,
+            });
+            var
+        }
+
+        let mut stmts = Vec::new();
+        let x = bind(self, recv, &mut stmts);
+        let body = match name {
+            "abs" => {
+                if !args.is_empty() {
+                    return Err("method `abs` takes no arguments".into());
+                }
+                // `x.abs()` is `if x < 0 { -x } else { x }`, so `i64::MIN`
+                // maps to itself rather than trapping — `rustc -O` semantics.
+                let cond = Expr::Bin(Lt, Box::new(x.clone()), Box::new(Expr::Int(0)));
+                let neg = Expr::Un(UnOp::Neg, Box::new(x.clone()));
+                Expr::If(
+                    Box::new(cond),
+                    Block { stmts: Vec::new(), tail: Some(Box::new(neg)) },
+                    Some(Block { stmts: Vec::new(), tail: Some(Box::new(x)) }),
+                )
+            }
+            "signum" => {
+                if !args.is_empty() {
+                    return Err("method `signum` takes no arguments".into());
+                }
+                // `(x > 0) as i64 - (x < 0) as i64` gives -1, 0 or 1 without
+                // ever negating `i64::MIN`.
+                let pos = Expr::Cast(
+                    Box::new(Expr::Bin(Gt, Box::new(x.clone()), Box::new(Expr::Int(0)))),
+                    Type::I64,
+                );
+                let neg = Expr::Cast(
+                    Box::new(Expr::Bin(Lt, Box::new(x), Box::new(Expr::Int(0)))),
+                    Type::I64,
+                );
+                Expr::Bin(Sub, Box::new(pos), Box::new(neg))
+            }
+            "min" | "max" => {
+                if args.len() != 1 {
+                    return Err(format!("method `{name}` takes exactly one argument"));
+                }
+                // The receiver is bound first, then the argument, matching
+                // rustc's left-to-right evaluation of `x.min(y)`.
+                let y = bind(self, args[0].clone(), &mut stmts);
+                // `x.min(y)` is `if y < x { y } else { x }` and `x.max(y)` is
+                // `if y > x { y } else { x }`; both return `x` on a tie.
+                let cmp = if name == "min" { Lt } else { Gt };
+                let cond = Expr::Bin(cmp, Box::new(y.clone()), Box::new(x.clone()));
+                Expr::If(
+                    Box::new(cond),
+                    Block { stmts: Vec::new(), tail: Some(Box::new(y)) },
+                    Some(Block { stmts: Vec::new(), tail: Some(Box::new(x)) }),
+                )
+            }
+            _ => unreachable!("checked by the caller"),
+        };
+        if stmts.is_empty() {
+            Ok(body)
+        } else {
+            Ok(Expr::Block(Block { stmts, tail: Some(Box::new(body)) }))
+        }
     }
 
     fn lookup(scope: &Scope, name: &str) -> Option<(i32, Type, bool, bool)> {
@@ -1647,7 +1755,11 @@ impl Sema {
                         // operand folds to a constant, so rmc does too; the
                         // `i64::MIN` literal itself is parsed as `Int(i64::MIN)`,
                         // not a negation, so only a written `-` reaches here.
-                        if self.const_of(inner, &self.const_locals) == Some(i64::MIN) {
+                        // The negation inside a built-in `abs` is exempt: it is
+                        // not a written `-`, and rustc accepts it.
+                        if !self.in_builtin_abs
+                            && self.const_of(inner, &self.const_locals) == Some(i64::MIN)
+                        {
                             return Err("this arithmetic operation overflows".into());
                         }
                         Ok(Type::I64)
@@ -2255,6 +2367,34 @@ impl Sema {
                         }
                         _ => {}
                     }
+                }
+                // Built-in integer methods on an `i64` receiver. They desugar
+                // to expressions over the operators rmc already lowers, so
+                // codegen is untouched, and they mirror `rustc -O` exactly:
+                // `abs` of `i64::MIN` is `i64::MIN` (no trap), `signum` of zero
+                // is zero. A method of the same name on a struct or enum still
+                // reaches the user-method path below, because this only fires
+                // when the receiver's type is `i64`.
+                if matches!(base_ty, Type::I64)
+                    && matches!(name.as_str(), "abs" | "min" | "max" | "signum")
+                {
+                    let is_abs = name == "abs";
+                    let recv = std::mem::replace(recv.as_mut(), Expr::Int(0));
+                    // A `&i64` receiver auto-derefs to its referent.
+                    let recv = if via_ref {
+                        Expr::Deref { expr: Box::new(recv), ty: Type::I64 }
+                    } else {
+                        recv
+                    };
+                    let rewritten = self.desugar_i64_method(name, recv, args)?;
+                    *e = rewritten;
+                    // `abs` synthesises a `-x`; mark the re-check so the
+                    // neg-overflow lint does not fire on it (see the field).
+                    let saved = self.in_builtin_abs;
+                    self.in_builtin_abs = is_abs;
+                    let r = self.check_expr(e, scope);
+                    self.in_builtin_abs = saved;
+                    return r;
                 }
                 // A method lives on a struct or an enum; both give the mangled
                 // prefix `Type$method`.

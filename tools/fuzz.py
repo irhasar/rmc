@@ -49,6 +49,11 @@ Modes:
           copying every field, chaining, a struct-typed field, and a field
           value that mutates the base so the evaluation order and the
           independence of the result are both observable
+    intmeth
+          built-in `i64` methods (`abs`/`signum`/`min`/`max`) over `argv`-sourced
+          operands, so `i64::MIN`, `-1`, `0` and `1` are all reachable and the
+          receiver's single evaluation and the tie/overflow behaviour are
+          compared against `rustc -O`
     robust
           a fixed set of adversarial inputs (random bytes, deep nesting, long
           chains), each of which must error cleanly rather than crash
@@ -1859,6 +1864,62 @@ def gen_tuple_program(rng):
     return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
 
 
+def gen_intmeth_program(rng):
+    """A program built from the built-in `i64` methods. Each method desugars to
+    operators, so the shapes that matter are the receiver being a non-trivial
+    expression (evaluated once), the `i64::MIN` edge for `abs`/`signum`, and a
+    method chained onto another. Operands go through `gen_i64` so they are typed
+    `i64` in both compilers (an unsuffixed literal receiver is ambiguous in
+    rustc)."""
+    def recv():
+        return gen_i64(rng, 1)
+
+    def call():
+        k = rng.random()
+        if k < 0.3:
+            return f"({recv()}).abs()"
+        if k < 0.55:
+            return f"({recv()}).signum()"
+        if k < 0.8:
+            return f"({recv()}).min({gen_i64(rng, 1)})"
+        return f"({recv()}).max({gen_i64(rng, 1)})"
+
+    exprs = [call() for _ in range(6)]
+    # A constant `i64::MIN` exercises `abs` (maps to itself) and `signum` (-1).
+    exprs.append("(MIN).abs()")
+    exprs.append("(MIN).signum()")
+    exprs.append("(MIN).min(0)")
+    exprs.append("(MIN).max(0)")
+    # A chain, so the outer method's receiver is another method call.
+    exprs.append(f"({call()}).min({call()})")
+    rms = [
+        # `h` prints before returning, so a receiver or argument evaluated more
+        # than once shows up as extra output and the diff catches it.
+        "fn h(x: i64) -> i64 { print_i64(x); return x; }",
+        "const MIN: i64 = -9223372036854775808;",
+        "fn main() -> i64 {",
+        "    let a: i64 = arg_i64(1);",
+        "    let b: i64 = arg_i64(2);",
+        "    let c: i64 = arg_i64(3);",
+    ]
+    rs = [
+        "fn h(x: i64) -> i64 { println!(\"{}\", x); return x; }",
+        "const MIN: i64 = -9223372036854775808;",
+        "fn main() {",
+        "    let args: Vec<i64> = std::env::args().skip(1).map(|s| s.parse().unwrap()).collect();",
+        "    let a: i64 = args[0];",
+        "    let b: i64 = args[1];",
+        "    let c: i64 = args[2];",
+    ]
+    for e in exprs:
+        rms.append(f"    print_i64({e});")
+        rs.append(f'    println!("{{}}", {e});')
+    rms.append("    return 0;")
+    rms.append("}")
+    rs.append("}")
+    return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
+
+
 def gen_ref_program(rng):
     """A program built from references (`&T` / `&mut T`), which no other mode
     exercises. A reference is one word holding an address, so `*r = v` writes
@@ -3322,7 +3383,7 @@ def run_mutate(n, seed, keep=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "robust", "reject", "mutate"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "intmeth", "robust", "reject", "mutate"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -3374,7 +3435,8 @@ def main():
            "parampat": gen_parampat_program,
            "enumpat": gen_enumpat_program,
            "atpat": gen_atpat_program,
-           "tuple": gen_tuple_program}[args.mode]
+           "tuple": gen_tuple_program,
+           "intmeth": gen_intmeth_program}[args.mode]
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus
     # suite; a fuzz program is otherwise only checked with every pass on, so a
@@ -3422,6 +3484,12 @@ def main():
             argv = [str(rng.choice([rng.randint(-4, 4), rng.randint(60, 68),
                                     rng.randint(0, 63), -1, 64, 63, 0])),
                     str(rng.randint(-1000, 1000))]
+        if args.mode == "intmeth":
+            # Mix small values, the extremes, and a couple of larger draws so
+            # `abs`/`signum`/`min`/`max` see `i64::MIN`, `-1`, `0` and `1`.
+            pick = [rng.randint(-20, 20), -1, 0, 1,
+                    -9223372036854775808, 9223372036854775807, 4, -4]
+            argv = [str(rng.choice(pick)) for _ in range(3)]
         # One rustc reference per distinct flag set, built once and cached.
         refs = {}
         skip = False

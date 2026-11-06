@@ -5076,3 +5076,85 @@ fn a_mutable_at_binding_in_a_tuple_element_is_accepted() {
     );
     assert!(out.contains("main:"));
 }
+
+#[test]
+fn abs_desugars_to_a_conditional_negation() {
+    // `x.abs()` is `if x < 0 { -x } else { x }`, so it emits a sign test and a
+    // `neg`, and never a call. A positive literal avoids the `neg` the parser
+    // would emit for a negative constant.
+    let out = asm_no_inline("fn main() -> i64 { let x: i64 = 3; return x.abs(); }");
+    assert!(out.contains("cmpq $0,") || out.contains("cmp $0,"), "expected a sign test:\n{out}");
+    assert!(out.contains("neg %rax"), "expected a negation:\n{out}");
+    assert!(!out.contains("call abs"), "abs must not be a call:\n{out}");
+}
+
+#[test]
+fn signum_needs_no_negation() {
+    // `(x > 0) as i64 - (x < 0) as i64` produces -1/0/1 with only comparisons,
+    // so `i64::MIN` is safe and no `neg` is emitted. A positive literal keeps
+    // the parser from emitting a `neg` of its own.
+    let out = asm_no_inline("fn main() -> i64 { let x: i64 = 3; return x.signum(); }");
+    assert!(out.contains("setg %al"), "expected a `> 0` test:\n{out}");
+    assert!(out.contains("setl %al"), "expected a `< 0` test:\n{out}");
+    assert!(!out.contains("neg %rax"), "signum must not negate:\n{out}");
+}
+
+#[test]
+fn min_compares_the_argument_against_the_receiver() {
+    // `x.min(y)` is `if y < x { y } else { x }`, so the comparison is
+    // `y < x` — not `x < y`, which would return `y` on a tie. The receiver is
+    // evaluated into a temporary first, so it is `cmp <recv>, <arg>` and a
+    // branch, not a `setcc`.
+    let out = asm_no_inline("fn main() -> i64 { let x: i64 = 4; return x.min(4); }");
+    let body = &out[out.find("main:").expect("main")..];
+    assert!(body.contains("cmp "), "expected a comparison:\n{body}");
+    assert!(body.contains("jge "), "expected a `y < x` branch:\n{body}");
+}
+
+#[test]
+fn abs_of_a_const_min_is_accepted() {
+    // `MIN.abs()` is not a written `-`, so the compile-time neg-overflow lint
+    // must not fire on the `-x` that `abs` synthesises: rustc accepts this and
+    // yields `i64::MIN` in release. A written `-MIN` is still rejected.
+    let out = asm("const MIN: i64 = -9223372036854775808; fn main() -> i64 { return MIN.abs(); }");
+    assert!(out.contains("main:"));
+    let err = compile_to_asm(
+        "const MIN: i64 = -9223372036854775808; fn main() -> i64 { return -MIN; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("overflow"), "expected a neg-overflow error: {err}");
+}
+
+#[test]
+fn a_side_effecting_receiver_is_evaluated_once() {
+    // Each desugaring reads the receiver more than once, so it must be bound to
+    // a temporary: `g()` is called once, not once per arm.
+    let out = asm_no_inline(
+        "fn g() -> i64 { return 3; } \
+         fn main() -> i64 { return g().abs(); }",
+    );
+    let body = &out[out.find("main:").expect("main")..];
+    assert_eq!(body.matches("call g").count(), 1, "receiver must be called once:\n{body}");
+}
+
+#[test]
+fn a_side_effecting_min_argument_is_evaluated_once() {
+    let out = asm_no_inline(
+        "fn g() -> i64 { return 3; } \
+         fn main() -> i64 { return g().min(g()); }",
+    );
+    let body = &out[out.find("main:").expect("main")..];
+    assert_eq!(body.matches("call g").count(), 2, "each operand called once:\n{body}");
+}
+
+#[test]
+fn a_builtin_integer_method_on_a_struct_is_not_shadowed() {
+    // A struct may still define its own `min`; the built-in only fires on an
+    // `i64` receiver.
+    let out = asm(
+        "struct S { v: i64 } impl S { fn min(self, o: i64) -> i64 { return self.v - o; } } \
+         fn main() -> i64 { let s = S { v: 10 }; return s.min(3); }",
+    );
+    assert!(out.contains("main:"));
+}
