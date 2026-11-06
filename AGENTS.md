@@ -43,8 +43,15 @@ python3 bench/run_mir.py
 python3 bench/run.py --markdown bench/RESULTS.md
 python3 bench/run_mir.py --markdown bench/RESULTS-MIR.md
 
+# fail if the MIR pipeline does not beat LLVM on every axis
+python3 bench/run_mir.py --check
+
 # differential test suite: rmc vs rustc on twin programs
 python3 tests/run.py -v
+
+# differential suite for the MIR path with `std`: each case is compiled by
+# rustc (reference) and by rmc, and the stdout/exit status must match
+python3 tests/std/run.py -v
 
 # differential fuzzer: random programs vs rustc (reproducible seeds)
 python3 tools/fuzz.py --mode expr --n 500 --seed 1
@@ -1119,6 +1126,15 @@ entry point, so the only variable is the code generator; they must print
 identical stdout and exit with the same status. `ARGS` maps a case to its argv
 vectors. This is the suite that actually exercises `mir_codegen.rs`; `tests/run.py`
 covers the `.rms` path and never reaches it.
+
+`tests/std/run.py` is the same idea but with `std` available, so it can exercise
+`println!`/`print!`/`eprintln!`. Each `tests/std/NAME.rs` is a plain `std`
+program compiled by `rustc -O` (reference, the full LLVM pipeline) and by `rmc`
+(`rustc --emit=mir -O` then the back end); both must print identical stdout and
+exit with the same status. The `mir` suite cannot cover formatting (it is
+`#![no_std]`), so this is where the formatter machinery - literal and runtime
+arguments, `{:x}`/`{:X}`/`{:o}`/`{:b}` - is diffed against rustc. `ARGS` maps a
+case to its argv vectors.
 
 `tests/run.py` compiles each `tests/cases/NAME.{rms,rs}` pair with both compilers
 and diffs stdout and the exit status. Every case is then recompiled with the
