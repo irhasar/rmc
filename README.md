@@ -171,7 +171,10 @@ in every position, and an array-typed struct field destructured in place),
 nested one, one mixed with plain parameters, and one on a method receiver),
 `enumpat` for payload variant patterns with sub-patterns (`_`, `mut x`, a
 trailing `..`, and a nested struct or array pattern inside `E::V(..)`, in
-`match`, `if let` and a method, and read through a `&E` scrutinee), and
+`match`, `if let` and a method, and read through a `&E` scrutinee), `tuple` for
+tuples (construction, `.0` element access, destructuring in a `let`, a `match`
+arm and a parameter, nesting, a tuple-typed struct field, an array of tuples,
+and a tuple behind a reference, used as parameter and return types), and
 `order` for assignment evaluation order (a
 side-effecting index and value on both `=` and every compound operator, the
 shapes `stmt` never assigns through). `shift` drives `<<`, `>>` and the compound
@@ -238,7 +241,8 @@ fn main() -> i64 {
 }
 ```
 
-Supported: `i64`, `bool`, `str`, fixed-size arrays, and structs with named fields
+Supported: `i64`, `bool`, `str`, fixed-size arrays, tuples `(A, B, ..)`, and
+structs with named fields
 (including field init shorthand, `P { x, y }`, struct update syntax,
 `P { x: 9, ..base }`, struct patterns `P { x, y: z, .. }` in `match`/`if let`
 (including nested sub-patterns `P { a: I { x }, .. }`), `let` destructuring
@@ -246,7 +250,8 @@ Supported: `i64`, `bool`, `str`, fixed-size arrays, and structs with named field
 `for P { x, y: z, .. } in arr { .. }`, and array patterns
 `[a, b, .., c]` (in `let`/`for`/`match`/`if let`, with `_`, `mut`, nested
 patterns and `..` rests, also usable on an array-typed struct field,
-`let P { a: [x, y], .. } = p;`));
+`let P { a: [x, y], .. } = p;`), and tuple patterns
+`(a, b)` / `(x, _, mut z)` (the same positions, and `.0`/`.1` element access));
 functions with up to six parameters, which may be written as an aggregate
 pattern (`fn f(P { x, y }: P)`, `fn f([a, b]: [i64; 2])`, nested and mixed with
 plain parameters); `let` / `let mut` / `let _` (discard); assignment to variables,

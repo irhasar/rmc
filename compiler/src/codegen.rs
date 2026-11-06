@@ -882,6 +882,7 @@ impl Codegen {
     ) {
         match e {
             Expr::ArrayList(_) => unreachable!("sema rewrites ArrayList into a block"),
+            Expr::TupleLit(_) => unreachable!("sema rewrites TupleLit into a StructLit"),
             Expr::MethodCall { .. } => unreachable!("sema rewrites MethodCall into a Call"),
             Expr::PatScrutinee(_) => {
                 unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
@@ -1815,6 +1816,7 @@ impl Codegen {
     fn gen_expr(&mut self, e: &Expr) -> Type {
         match e {
             Expr::ArrayList(_) => unreachable!("sema rewrites ArrayList into a block"),
+            Expr::TupleLit(_) => unreachable!("sema rewrites TupleLit into a StructLit"),
             Expr::MethodCall { .. } => unreachable!("sema rewrites MethodCall into a Call"),
             Expr::PatScrutinee(_) => {
                 unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
@@ -2419,8 +2421,8 @@ impl Codegen {
             }
             Expr::Block(b) | Expr::Loop(b, _, _, _) => self.block_uses_reg(b, r),
             Expr::MatchBoundary(b, _) => self.block_uses_reg(b, r),
-            Expr::ArrayList(_) | Expr::MethodCall { .. } => {
-                unreachable!("sema rewrites ArrayList and MethodCall")
+            Expr::ArrayList(_) | Expr::TupleLit(_) | Expr::MethodCall { .. } => {
+                unreachable!("sema rewrites ArrayList, TupleLit and MethodCall")
             }
             Expr::PatScrutinee(_) => {
                 unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")

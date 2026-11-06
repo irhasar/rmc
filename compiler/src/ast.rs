@@ -82,10 +82,66 @@ impl Type {
 
     /// True for the aggregate types that live in memory: arrays and structs.
     /// They are named by their address, so they are passed to and returned from
-    /// a function by pointer rather than by value.
+    /// a function by pointer rather than by value. A tuple is lowered to an
+    /// anonymous struct by the parser, so it is a `Struct` here too.
     pub fn is_aggregate(&self) -> bool {
         matches!(self, Type::Array(..) | Type::Struct(..) | Type::EnumData(..))
     }
+
+    /// A canonical, injective key for a type, used to name the anonymous struct
+    /// that holds a tuple. Two tuples share one struct exactly when their
+    /// element-type keys match, so a tuple *type* `(i64, i64)` the user wrote and
+    /// a tuple *literal* `(1, 2)` sema inferred resolve to the same struct.
+    ///
+    /// The parser computes a tuple type's key before it knows whether a named
+    /// type is a struct or an enum, so every user type keys by its *name* alone
+    /// (`T{name}`); sema then keys the resolved `Struct`/`Enum` the same way, and
+    /// the two agree. Atoms carry no `(`/`,`/`)`, a nested tuple keys as its own
+    /// already-balanced `\0tuple(..)` name, and every other type keys as a prefix
+    /// code over those characters, so the encoding stays unambiguous.
+    pub fn key(&self) -> String {
+        match self {
+            Type::I64 => "i".to_string(),
+            Type::Bool => "b".to_string(),
+            Type::Str => "s".to_string(),
+            Type::Unit => "u".to_string(),
+            Type::Never => "!".to_string(),
+            Type::Ref(t, m) => format!("r{}{}", if *m { "m" } else { "" }, t.key()),
+            Type::Array(t, n) => format!("a{n}:{}", t.key()),
+            // A lowered tuple is a struct whose name is the canonical
+            // `\0tuple(..)`; key it as itself so nesting is unambiguous.
+            Type::Struct(n, _) | Type::Enum(n) | Type::EnumData(n, _) => {
+                if is_tuple_name(n) {
+                    n.clone()
+                } else {
+                    format!("T{n}")
+                }
+            }
+            // `str` is spelled `Named("str")` until sema resolves it.
+            Type::Named(n) if n == "str" => "s".to_string(),
+            Type::Named(n) => {
+                if is_tuple_name(n) {
+                    n.clone()
+                } else {
+                    format!("T{n}")
+                }
+            }
+        }
+    }
+}
+
+/// The name of the anonymous struct laying out a tuple with these element-type
+/// keys, in order. Injective: the keys are a balanced-parenthesis term encoding,
+/// so two different element lists never share a name.
+pub fn tuple_struct_name(elem_keys: &[String]) -> String {
+    format!("\u{0}tuple({})", elem_keys.join(","))
+}
+
+/// True for the anonymous structs `tuple_struct_name` produces. The name starts
+/// with a NUL, which no source identifier can contain, so it can never collide
+/// with a user struct or be written in source.
+pub fn is_tuple_name(name: &str) -> bool {
+    name.starts_with("\u{0}tuple(")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +197,11 @@ pub enum Expr {
         ret_slot: i32,
         ret_ty: Type,
     },
+    /// `(a, b, ...)`: a tuple literal. `sema` resolves its element types and
+    /// rewrites it into a `StructLit` of the anonymous struct that lays the
+    /// elements out, so codegen never sees this node. It is produced by the
+    /// parser, which does not type-check.
+    TupleLit(Vec<Expr>),
     If(Box<Expr>, Block, Option<Block>),
     /// `loop { .. }`. It is always an expression: a `loop` in statement
     /// position is a `Stmt::Expr` around this node with `slot == -2`, so its

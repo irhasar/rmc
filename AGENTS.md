@@ -53,6 +53,7 @@ python3 tools/fuzz.py --mode nestpat --n 500 --seed 1
 python3 tools/fuzz.py --mode arrpat --n 500 --seed 1
 python3 tools/fuzz.py --mode parampat --n 500 --seed 1
 python3 tools/fuzz.py --mode enumpat --n 500 --seed 1
+python3 tools/fuzz.py --mode tuple --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 
 # robustness / soundness: rmc must error cleanly, never crash
@@ -108,7 +109,10 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   rather than re-checking it, so a side-effecting scrutinee is type-checked and
   its slots allocated exactly once. The marker never survives to codegen; the
   later passes (`inline`, `tco`, `licm`, `dce`, `codegen`) treat it as
-  unreachable, like `ArrayList` and `MethodCall`.
+  unreachable, like `ArrayList` and `MethodCall`. `TupleLit` is the same kind of
+  marker: sema's `check_expr` rewrites it to a `StructLit` of the anonymous
+  struct that lays the tuple out (so it is visible only to the sema pre-pass,
+  `collect_mut_borrows`, which recurses into its elements).
   An or-pattern with a
   `_` alternative, and one whose alternatives cover every variant, are handled
   by `pat_irrefutable` and `or_leaves` (in sema) respectively. A *binding*
@@ -169,8 +173,29 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   `pat_irrefutable`, `first_bound_name` (recursing so a binding element in an
   or-pattern is still rejected) and the `let`/`for`/`match`/`if let` paths through
   `let_destructure_array_stmts` (the `let_destructure_prelude` helper shares the
-  hidden-scrutinee logic with the struct path). `or_cond` does not treat it as
+  hidden-scrutinee logic with the struct path).   `or_cond` does not treat it as
   true: an array pattern is not a supported or-alternative.
+  *Tuple patterns* `(a, b)` are the fourth irrefutable aggregate pattern:
+  `Pat::Tuple(Vec<(bool, Pat)>)` is parsed by `parse_tuple_pat` (`(` is routed
+  from `parse_pattern_primary`; `()` is the unit pattern and `(a)` is a
+  parenthesised sub-pattern, so a one-tuple needs a trailing comma `(a,)`, as in
+  Rust) and desugared by `tuple_pat_binds` into one `let` per bound element whose
+  initialiser is a *field read* `Expr::Field { name: "k" }`. A tuple is an
+  aggregate lowered to an anonymous struct (element `k` is field `"k"`), so a
+  tuple pattern reuses the whole struct path: `tuple_pat_binds` mirrors
+  `struct_pat_binds` (a nested struct/tuple/array element recurses with the field
+  read as the sub-scrutinee). No sema or codegen case. It is irrefutable when
+  every element is, so it joins `pat_irrefutable`, `first_bound_name`, `or_cond`
+  (treated as `true`, like a struct pattern) and the
+  `let`/`for`/`match`/parameter paths through `let_destructure_tuple_stmts` (the
+  `let_destructure_prelude` helper shares the hidden-scrutinee logic).
+  A tuple *type* `(A, B)` is lowered by `lower_tuple_type` (in `parse_type`) to
+  the same anonymous struct, named by the canonical element-type keys
+  (`ast::tuple_struct_name`), and a tuple *literal* `(a, b)` stays `Expr::TupleLit`
+  until sema resolves its element types and rewrites it to a `StructLit` of that
+  struct (`tuple_struct_for` introduces the layout if the parser did not). An
+  element is written `.0`, `.1`, ...: `parse_postfix` accepts a decimal literal
+  after `.` as the field name.
   An arm may carry a *guard*, `PAT if COND => body`. `parse_match` reads the
   optional `if COND` after the pattern (`parse_cond`, so a struct literal needs
   parentheses) and threads it through `desugar_arm` as an `Option<Expr>`. The

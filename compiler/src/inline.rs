@@ -222,6 +222,7 @@ fn count_expr(e: &Expr) -> usize {
         Expr::EnumCtor { args, .. } => 1 + args.iter().map(count_expr).sum::<usize>(),
         Expr::ArrayLit(v, _) => 1 + n(v),
         Expr::ArrayList(v) => 1 + v.iter().map(count_expr).sum::<usize>(),
+        Expr::TupleLit(v) => 1 + v.iter().map(count_expr).sum::<usize>(),
         Expr::VariantTest { scrutinee, .. } => 1 + n(scrutinee),
         Expr::BoolTest { scrutinee, .. } => 1 + n(scrutinee),
         Expr::EnumPayload { recv, .. } => 1 + n(recv),
@@ -350,6 +351,11 @@ impl Inliner {
             }
             Expr::ArrayLit(v, _) => self.walk_expr(v, base, expanding),
             Expr::ArrayList(v) => {
+                for x in v {
+                    self.walk_expr(x, base, expanding);
+                }
+            }
+            Expr::TupleLit(v) => {
                 for x in v {
                     self.walk_expr(x, base, expanding);
                 }
@@ -587,6 +593,11 @@ fn escaped_slots(stmts: &[Stmt], tail: Option<&Expr>) -> HashSet<i32> {
                     collect_expr(x, out);
                 }
             }
+            Expr::TupleLit(v) => {
+                for x in v {
+                    collect_expr(x, out);
+                }
+            }
             Expr::VariantTest { scrutinee, .. } => collect_expr(scrutinee, out),
             Expr::BoolTest { scrutinee, .. } => collect_expr(scrutinee, out),
             Expr::EnumPayload { recv, .. } => collect_expr(recv, out),
@@ -748,6 +759,11 @@ impl Sub<'_> {
             }
             Expr::ArrayLit(v, _) => self.expr(v),
             Expr::ArrayList(v) => {
+                for x in v {
+                    self.expr(x);
+                }
+            }
+            Expr::TupleLit(v) => {
                 for x in v {
                     self.expr(x);
                 }

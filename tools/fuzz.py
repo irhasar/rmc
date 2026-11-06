@@ -1737,6 +1737,106 @@ def gen_enumpat_program(rng):
     return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
 
 
+def gen_tuple_program(rng):
+    """Tuples: construction, field access (`.0`), destructuring in a `let`, a
+    `match` arm and a parameter, nesting, and use as parameter/return types. A
+    tuple is lowered to an anonymous struct (element `k` is field `"k"`), so a
+    mis-chosen struct, a wrong element offset, or a shared slot changes the
+    total. Element values are re-derived through the random offsets, and every
+    accessor is called with several tuples, so a leaked or aliased slot is
+    observable.
+    """
+    b = rng.randint(1, 9)
+    o = [rng.randint(0, 40) for _ in range(16)]
+
+    rms = [
+        "struct P { x: i64, y: i64 }",
+        "fn add2(t: (i64, i64)) -> i64 { return t.0 + t.1; }",
+        "fn swap(t: (i64, i64)) -> (i64, i64) { return (t.1, t.0); }",
+        "fn add3(t: (i64, i64, i64)) -> i64 { return t.0 + t.1 + t.2; }",
+        "fn mk(n: i64) -> i64 { print_i64(n); return n; }",
+        "fn decon(t: (i64, i64)) -> i64 { let (a, b) = t; return a * 10 + b; }",
+        "fn decon3(t: (i64, i64, i64)) -> i64 { let (a, _, c) = t; return a * 100 + c; }",
+        "fn nest(t: ((i64, i64), i64)) -> i64 { let ((a, b), c) = t; return a * 100 + b * 10 + c; }",
+        "fn firstx(t: (P, i64)) -> i64 { return t.0.x + t.1; }",
+        "fn mtu(t: (i64, i64)) -> i64 { return match t { (a, b) => a * 7 + b }; }",
+        "fn ptup(t: (i64, i64)) -> i64 { let (mut a, b) = t; a = a + b; return a; }",
+        "fn ppat((a, b): (i64, i64)) -> i64 { return a * 3 + b; }",
+        "fn ford(a: [(i64, i64); 2]) -> i64 { let mut s = 0; for (x, y) in a { s = s + x * 2 + y; } return s; }",
+    ]
+    rs = [
+        "#[derive(Copy, Clone)]",
+        "struct P { x: i64, y: i64 }",
+        "fn add2(t: (i64, i64)) -> i64 { t.0 + t.1 }",
+        "fn swap(t: (i64, i64)) -> (i64, i64) { (t.1, t.0) }",
+        "fn add3(t: (i64, i64, i64)) -> i64 { t.0 + t.1 + t.2 }",
+        'fn mk(n: i64) -> i64 { println!("{}", n); n }',
+        "fn decon(t: (i64, i64)) -> i64 { let (a, b) = t; a * 10 + b }",
+        "fn decon3(t: (i64, i64, i64)) -> i64 { let (a, _, c) = t; a * 100 + c }",
+        "fn nest(t: ((i64, i64), i64)) -> i64 { let ((a, b), c) = t; a * 100 + b * 10 + c }",
+        "fn firstx(t: (P, i64)) -> i64 { t.0.x + t.1 }",
+        "fn mtu(t: (i64, i64)) -> i64 { match t { (a, b) => a * 7 + b } }",
+        "fn ptup(t: (i64, i64)) -> i64 { let (mut a, b) = t; a = a + b; a }",
+        "fn ppat((a, b): (i64, i64)) -> i64 { a * 3 + b }",
+        "fn ford(a: [(i64, i64); 2]) -> i64 { let mut s = 0; for (x, y) in a { s = s + x * 2 + y; } s }",
+    ]
+
+    calls = [
+        f"add2((s + {o[0]}, s + {o[1]}))",
+        f"add2((s + {o[2]}, s + {o[3]}))",
+        f"decon((s + {o[4]}, s + {o[5]}))",
+        f"decon3((s + {o[6]}, s + {o[7]}, s + {o[8]}))",
+        f"add3((s + {o[9]}, s + {o[10]}, s + {o[11]}))",
+        f"nest(((s + {o[12]}, s + {o[13]}), s + {o[14]}))",
+        f"firstx((P {{ x: s + {o[15]}, y: 0 }}, s + {b}))",
+        f"mtu((s + {b}, s + {o[0]}))",
+        f"ptup((s + {o[1]}, s + {o[2]}))",
+        f"ppat((s + {o[3]}, s + {o[4]}))",
+        f"ford([(s + {o[5]}, s + {o[6]}), (s + {o[7]}, s + {o[8]})])",
+        f"swap((s + {o[3]}, s + {o[4]})).0",
+        f"swap((s + {o[5]}, s + {o[6]})).1",
+    ]
+    body_rms = ["fn main() -> i64 {", "    let mut acc: i64 = 0;", f"    let s: i64 = mk({b});"]
+    body_rs = ["fn main() {", "    let mut acc: i64 = 0;", f"    let s: i64 = mk({b});"]
+    for c in calls:
+        body_rms.append(f"    acc = acc + {c};")
+        body_rs.append(f"    acc += {c};")
+    body_rms += [
+        f"    let t: (i64, i64) = (s + {o[7]}, s + {o[8]});",
+        "    acc = acc + t.0 + t.1;",
+        f"    let mut u = (s + {o[9]}, s + {o[10]});",
+        f"    u.0 = u.0 + {b};",
+        "    acc = acc + u.0 + u.1;",
+        "    let arr: [(i64, i64); 2] = [(s, s + 1), (s + 2, s + 3)];",
+        "    acc = acc + arr[0].0 + arr[1].1;",
+        "    let r = &t;",
+        "    acc = acc + r.0 + r.1;",
+        "    let (p, q) = t;",
+        "    print_i64(p * 100 + q);",
+        "    print_i64(acc);",
+        "    return 0;",
+        "}",
+    ]
+    body_rs += [
+        f"    let t: (i64, i64) = (s + {o[7]}, s + {o[8]});",
+        "    acc += t.0 + t.1;",
+        f"    let mut u = (s + {o[9]}, s + {o[10]});",
+        f"    u.0 = u.0 + {b};",
+        "    acc += u.0 + u.1;",
+        "    let arr: [(i64, i64); 2] = [(s, s + 1), (s + 2, s + 3)];",
+        "    acc += arr[0].0 + arr[1].1;",
+        "    let r = &t;",
+        "    acc += r.0 + r.1;",
+        "    let (p, q) = t;",
+        '    println!("{}", p * 100 + q);',
+        '    println!("{}", acc);',
+        "}",
+    ]
+    rms += body_rms
+    rs += body_rs
+    return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
+
+
 def gen_ref_program(rng):
     """A program built from references (`&T` / `&mut T`), which no other mode
     exercises. A reference is one word holding an address, so `*r = v` writes
@@ -3033,7 +3133,7 @@ def run_mutate(n, seed, keep=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "robust", "reject", "mutate"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "tuple", "robust", "reject", "mutate"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -3083,7 +3183,8 @@ def main():
            "nestpat": gen_nestpat_program,
            "arrpat": gen_arrpat_program,
            "parampat": gen_parampat_program,
-           "enumpat": gen_enumpat_program}[args.mode]
+           "enumpat": gen_enumpat_program,
+           "tuple": gen_tuple_program}[args.mode]
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus
     # suite; a fuzz program is otherwise only checked with every pass on, so a

@@ -36,6 +36,14 @@ pub struct Parser {
     /// struct declared later in the file is covered because the whole list is
     /// scanned first.
     struct_fields: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// Anonymous structs introduced by tuple *types*, keyed by the canonical
+    /// name `ast::tuple_struct_name` produces. A tuple is lowered to a struct
+    /// (element `k` is field `"k"`), so it reuses the whole struct path through
+    /// sema and codegen; this set only deduplicates the definitions so the same
+    /// tuple type is not declared twice. The definitions are collected in
+    /// `tuple_defs` and appended to the program's structs once parsing is done.
+    tuple_structs: std::collections::HashSet<String>,
+    tuple_defs: Vec<StructDef>,
 }
 
 /// The deepest expression, block or type nesting the parser accepts. Deeply
@@ -69,6 +77,8 @@ impl Parser {
             consts: std::collections::HashMap::new(),
             const_bools: std::collections::HashMap::new(),
             struct_fields: std::collections::HashMap::new(),
+            tuple_structs: std::collections::HashSet::new(),
+            tuple_defs: Vec::new(),
         }
     }
 
@@ -179,6 +189,11 @@ impl Parser {
                 }
             }
         }
+        // Append the anonymous structs that tuple types introduced, so
+        // `resolve_layouts` sees them alongside the user's structs. They are
+        // added after the scan so a tuple element naming a user struct declared
+        // later still resolves.
+        structs.append(&mut self.tuple_defs);
         Ok(Program { structs, enums, consts, fns })
     }
 
@@ -434,6 +449,26 @@ impl Parser {
         Ok(StructDef { name, fields })
     }
 
+    /// Lower a parsed tuple *type* `(A, B)` into its anonymous struct. The
+    /// element types may themselves be tuples, which are lowered first. The
+    /// struct definition is recorded in `tuple_defs` (once per distinct tuple
+    /// type) and appended to the program once parsing is done, so
+    /// `resolve_layouts` lays it out exactly like a user struct; the returned
+    /// `Type::Named` is what `resolve_in` then resolves to `Type::Struct`.
+    fn lower_tuple_type(&mut self, elems: Vec<Type>) -> Type {
+        let mut fields = Vec::with_capacity(elems.len());
+        let mut keys = Vec::with_capacity(elems.len());
+        for (k, e) in elems.into_iter().enumerate() {
+            keys.push(e.key());
+            fields.push((k.to_string(), e));
+        }
+        let name = crate::ast::tuple_struct_name(&keys);
+        if self.tuple_structs.insert(name.clone()) {
+            self.tuple_defs.push(StructDef { name: name.clone(), fields });
+        }
+        Type::Named(name)
+    }
+
     fn parse_fn(&mut self) -> PResult<FnDef> {
         self.expect(Tok::Fn)?;
         let name = self.expect_ident()?;
@@ -567,11 +602,12 @@ impl Parser {
         param_pats: &mut Vec<Option<Vec<Stmt>>>,
     ) -> PResult<()> {
         let pm = self.eat(&Tok::Mut);
-        // `S {` or `[` at the start of a parameter is a destructuring pattern,
-        // not a name: neither can begin a plain `p: T`. A leading `mut` on a
-        // pattern is rejected, as rustc rejects `mut S { x }: S` (the `mut`
-        // belongs on each binding).
+        // `S {`, `[` or `(` at the start of a parameter is a destructuring
+        // pattern, not a name: none can begin a plain `p: T`. A leading `mut`
+        // on a pattern is rejected, as rustc rejects `mut S { x }: S` (the
+        // `mut` belongs on each binding).
         let pat = if matches!(self.peek(), Some(Tok::LBracket))
+            || matches!(self.peek(), Some(Tok::LParen))
             || matches!(self.peek(), Some(Tok::Ident(_))
                 if self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::LBrace))
         {
@@ -613,6 +649,7 @@ impl Parser {
     fn param_pat_binds(&mut self, p: Pat, subj: &Expr) -> PResult<Vec<Stmt>> {
         match p {
             Pat::Struct(_, fields) => Ok(Self::struct_pat_binds(&fields, subj)),
+            Pat::Tuple(elems) => Ok(Self::tuple_pat_binds(&elems, subj)),
             Pat::Array { elems, rest, front } => {
                 Ok(Self::array_pat_binds(&elems, rest, front, subj))
             }
@@ -624,7 +661,7 @@ impl Parser {
                 slot: -1,
             }]),
             _ => Err(format!(
-                "at byte {}: a parameter pattern must be irrefutable (a struct or array pattern)",
+                "at byte {}: a parameter pattern must be irrefutable (a struct, tuple or array pattern)",
                 self.pos()
             )),
         }
@@ -717,14 +754,27 @@ impl Parser {
                 Ok(Type::Array(Box::new(elem), n))
             }
             Some(Tok::LParen) => {
-                // allow `()` and `(T)` for unit / grouping
                 self.i += 1;
+                // `()` is unit; `(T)` is grouping; `(A, B)` and `(A,)` are
+                // tuples, lowered to an anonymous struct so the whole struct
+                // path (layout, by-pointer passing, field reads) is reused.
                 if self.eat(&Tok::RParen) {
                     return Ok(Type::Unit);
                 }
-                let inner = self.parse_type()?;
+                let first = self.parse_type()?;
+                if !self.eat(&Tok::Comma) {
+                    self.expect(Tok::RParen)?;
+                    return Ok(first);
+                }
+                let mut elems = vec![first];
+                while self.peek() != Some(&Tok::RParen) {
+                    elems.push(self.parse_type()?);
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
                 self.expect(Tok::RParen)?;
-                Ok(inner)
+                Ok(self.lower_tuple_type(elems))
             }
             Some(Tok::Ident(_)) => {
                 let name = match self.bump() {
@@ -975,12 +1025,13 @@ impl Parser {
                 mutable: false,
             }],
             Pat::Struct(_, fields) => self.let_destructure_stmts(fields, None, elem),
+            Pat::Tuple(elems) => self.let_destructure_tuple_stmts(elems, None, elem),
             Pat::Array { elems, rest, front } => {
                 self.let_destructure_array_stmts(elems, rest, front, None, elem)
             }
             _ => {
                 return Err(format!(
-                    "at byte {}: `for` over an array needs a binding, `_`, a struct or an array pattern",
+                    "at byte {}: `for` over an array needs a binding, `_`, a struct, tuple or array pattern",
                     self.pos()
                 ))
             }
@@ -1122,7 +1173,10 @@ impl Parser {
                 // from it. `..` and `f: _` are the only way to drop fields.
                 let struct_pat = matches!(self.peek(), Some(Tok::Ident(_)))
                     && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::LBrace);
-                if struct_pat || self.peek() == Some(&Tok::LBracket) {
+                if struct_pat
+                    || self.peek() == Some(&Tok::LBracket)
+                    || self.peek() == Some(&Tok::LParen)
+                {
                     if mutable {
                         return Err(format!(
                             "at byte {}: `mut` must be attached to each individual binding, as `S {{ mut f }}`",
@@ -1142,10 +1196,30 @@ impl Parser {
                         Pat::Struct(_, fields) => {
                             out.extend(self.let_destructure_stmts(fields, ty, init))
                         }
+                        Pat::Tuple(elems) => {
+                            out.extend(self.let_destructure_tuple_stmts(elems, ty, init))
+                        }
                         Pat::Array { elems, rest, front } => {
                             out.extend(self.let_destructure_array_stmts(elems, rest, front, ty, init))
                         }
-                        _ => unreachable!("`{{` or `[` starts a destructuring pattern"),
+                        // A parenthesised pattern that is not a tuple: `(x)` is
+                        // an ordinary binding and `(_)` ignores the value, as
+                        // rustc reads them.
+                        Pat::Bind(name) => out.push(Stmt::Let {
+                            name,
+                            ty,
+                            init: Some(init),
+                            slot: -1,
+                            mutable: false,
+                        }),
+                        Pat::Wild => out.push(Stmt::Let {
+                            name: "\u{0}wild".to_string(),
+                            ty,
+                            init: Some(init),
+                            slot: -1,
+                            mutable: false,
+                        }),
+                        _ => unreachable!("a `(` starts a tuple, binding or wildcard pattern"),
                     }
                     return Ok(());
                 }
@@ -1637,7 +1711,17 @@ impl Parser {
                 self.expect(Tok::RBracket)?;
                 e = Expr::Index(Box::new(e), Box::new(idx));
             } else if self.eat(&Tok::Dot) {
-                let name = self.expect_ident()?;
+                // A tuple field is written `.0`, `.1`, ...: the "name" is a
+                // decimal literal, which becomes the field name `"k"` of the
+                // anonymous struct a tuple lowers to. A named field keeps its
+                // identifier.
+                let name = match self.peek().cloned() {
+                    Some(Tok::Int(n)) if n >= 0 => {
+                        self.i += 1;
+                        n.to_string()
+                    }
+                    _ => self.expect_ident()?,
+                };
                 if self.eat(&Tok::LParen) {
                     let mut args = Vec::new();
                     while self.peek() != Some(&Tok::RParen) {
@@ -1707,6 +1791,9 @@ impl Parser {
 
     fn parse_pattern_primary(&mut self) -> PResult<Pat> {
         match self.peek().cloned() {
+            // `(a, b)`: a tuple pattern. `(` cannot start a binding, a constant
+            // or a literal pattern, so it is unambiguous here.
+            Some(Tok::LParen) => self.parse_tuple_pat(),
             // `[a, b, .., c]`: an array pattern. `[` cannot start a binding or a
             // constant, so it is unambiguous here.
             Some(Tok::LBracket) => self.parse_array_pat(),
@@ -2029,6 +2116,92 @@ impl Parser {
         Ok(Pat::Array { elems, rest, front })
     }
 
+    /// `(a, b)`: a tuple pattern, with the opening `(` already peeked. `()` is
+    /// the unit pattern (binds nothing); `(a)` is a parenthesised sub-pattern,
+    /// not a one-tuple, matching rustc's rule that a one-tuple needs a trailing
+    /// comma `(a,)`. Every element must be irrefutable, since a tuple pattern has
+    /// no test.
+    fn parse_tuple_pat(&mut self) -> PResult<Pat> {
+        self.i += 1; // the `(`
+        if self.eat(&Tok::RParen) {
+            return Ok(Pat::Tuple(Vec::new()));
+        }
+        let m = self.eat(&Tok::Mut);
+        let first = self.parse_pattern_primary()?;
+        if m && !matches!(first, Pat::Bind(_)) {
+            return Err(format!(
+                "at byte {}: `mut` is not allowed here; it attaches to a binding",
+                self.pos()
+            ));
+        }
+        // `(a)`: a parenthesised pattern, not a tuple.
+        if !self.eat(&Tok::Comma) {
+            self.expect(Tok::RParen)?;
+            return Ok(first);
+        }
+        let mut elems = vec![(m, first)];
+        while self.peek() != Some(&Tok::RParen) {
+            if self.peek().is_none() {
+                return Err(format!(
+                    "at byte {}: unexpected end of input in tuple pattern",
+                    self.pos()
+                ));
+            }
+            let m = self.eat(&Tok::Mut);
+            let p = self.parse_pattern_primary()?;
+            if m && !matches!(p, Pat::Bind(_)) {
+                return Err(format!(
+                    "at byte {}: `mut` is not allowed here; it attaches to a binding",
+                    self.pos()
+                ));
+            }
+            elems.push((m, p));
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(Tok::RParen)?;
+        if elems.iter().any(|(_, p)| !Self::pat_irrefutable(p)) {
+            return Err(format!(
+                "at byte {}: tuple pattern elements must be bindings, `_`, or nested patterns",
+                self.pos()
+            ));
+        }
+        Ok(Pat::Tuple(elems))
+    }
+
+    /// The `let` statements a tuple pattern introduces: one per bound element,
+    /// each a read of the element's field (`"k"` on the anonymous struct a tuple
+    /// lowers to). Shared by the `let`, `for`, `match` and parameter paths.
+    fn tuple_pat_binds(elems: &[(bool, Pat)], subj: &Expr) -> Vec<Stmt> {
+        let mut out = Vec::new();
+        for (k, (m, pat)) in elems.iter().enumerate() {
+            let field = Expr::Field {
+                base: Box::new(subj.clone()),
+                name: k.to_string(),
+                offset: -1,
+                ty: Type::Unit,
+            };
+            match pat {
+                Pat::Bind(b) => out.push(Stmt::Let {
+                    name: b.clone(),
+                    ty: None,
+                    mutable: *m,
+                    init: Some(field),
+                    slot: -1,
+                }),
+                Pat::Wild => {}
+                Pat::Struct(_, inner) => out.extend(Self::struct_pat_binds(inner, &field)),
+                Pat::Tuple(inner) => out.extend(Self::tuple_pat_binds(inner, &field)),
+                Pat::Array { elems, rest, front } => {
+                    out.extend(Self::array_pat_binds(elems, *rest, *front, &field))
+                }
+                _ => unreachable!("tuple pattern elements are irrefutable"),
+            }
+        }
+        out
+    }
+
     /// The `let` statements an array pattern introduces: one per bound element,
     /// each an index read of `subj` at that element's position. Shared by the
     /// `let`, `for` and `match` paths. A `..` rest shifts the elements after it
@@ -2077,8 +2250,9 @@ impl Parser {
                 Pat::Array { elems, rest, front } => {
                     out.extend(Self::array_pat_binds(elems, *rest, *front, &index))
                 }
-                // A struct sub-pattern inside an array element.
+                // A struct or tuple sub-pattern inside an array element.
                 Pat::Struct(_, fields) => out.extend(Self::struct_pat_binds(fields, &index)),
+                Pat::Tuple(elems) => out.extend(Self::tuple_pat_binds(elems, &index)),
                 _ => unreachable!("unexpected array sub-pattern"),
             }
         }
@@ -2210,7 +2384,9 @@ impl Parser {
         match p {
             // A struct pattern always matches: it binds the named fields and
             // ignores the rest, with no test, so an arm using one is a catch-all.
+            // A tuple pattern matches when every element pattern does.
             Pat::Wild | Pat::Bind(_) | Pat::Struct(..) => true,
+            Pat::Tuple(elems) => elems.iter().all(|(_, p)| Self::pat_irrefutable(p)),
             // An array pattern matches when every element pattern does.
             Pat::Array { elems, .. } => elems
                 .iter()
@@ -2389,9 +2565,9 @@ impl Parser {
                 has_rest: args.as_ref().map_or(false, |(_, rest)| *rest),
             },
             // `_` in an or-pattern: always true, so the whole condition is true.
-            // A struct pattern is likewise always true; a binding one is
-            // rejected before this point.
-            Pat::Wild | Pat::Struct(..) => Expr::Bool(true),
+            // A struct or tuple pattern is likewise always true; a binding one
+            // is rejected before this point.
+            Pat::Wild | Pat::Struct(..) | Pat::Tuple(..) => Expr::Bool(true),
             // A binding inside an or-pattern is rejected before this point; an
             // array pattern is not supported as an or-alternative.
             Pat::Bind(_) | Pat::Or(_) | Pat::Array { .. } => {
@@ -2432,6 +2608,21 @@ impl Parser {
     ) -> Vec<Stmt> {
         let (mut out, subj) = self.let_destructure_prelude(ty, init);
         out.extend(Self::array_pat_binds(&elems, rest, front, &subj));
+        out
+    }
+
+    /// The same expansion for a tuple pattern: bind the scrutinee to a hidden
+    /// temporary (unless it is already a plain place) and read each named
+    /// element out of it. The temporary carries the annotation, so `let (a, b):
+    /// (i64, i64) = e;` is still checked.
+    fn let_destructure_tuple_stmts(
+        &mut self,
+        elems: Vec<(bool, Pat)>,
+        ty: Option<Type>,
+        init: Expr,
+    ) -> Vec<Stmt> {
+        let (mut out, subj) = self.let_destructure_prelude(ty, init);
+        out.extend(Self::tuple_pat_binds(&elems, &subj));
         out
     }
 
@@ -2489,12 +2680,13 @@ impl Parser {
                     slot: -1,
                 }),
                 Pat::Struct(_, inner) => out.extend(Self::struct_pat_binds(inner, &field)),
+                Pat::Tuple(inner) => out.extend(Self::tuple_pat_binds(inner, &field)),
                 // An array-typed field may be destructured by an array pattern.
                 Pat::Array { elems, rest, front } => {
                     out.extend(Self::array_pat_binds(elems, *rest, *front, &field))
                 }
-                // Only a binding, a nested struct pattern or a nested array
-                // pattern is parsed here.
+                // Only a binding, a nested struct/tuple pattern or a nested
+                // array pattern is parsed here.
                 _ => unreachable!("unexpected struct sub-pattern"),
             }
         }
@@ -2518,6 +2710,7 @@ impl Parser {
             }),
             Pat::Wild => {}
             Pat::Struct(_, fields) => out.extend(Self::struct_pat_binds(&fields, subj)),
+            Pat::Tuple(elems) => out.extend(Self::tuple_pat_binds(&elems, subj)),
             Pat::Array { elems, rest, front } => {
                 out.extend(Self::array_pat_binds(&elems, rest, front, subj))
             }
@@ -2542,6 +2735,7 @@ impl Parser {
             Pat::Struct(_, fields) => fields.iter().find_map(|(_, b)| {
                 b.as_ref().and_then(|(_, sub)| Self::first_bound_name(sub))
             }),
+            Pat::Tuple(elems) => elems.iter().find_map(|(_, sub)| Self::first_bound_name(sub)),
             Pat::Array { elems, .. } => elems
                 .iter()
                 .find_map(|e| e.as_ref().and_then(|(_, p)| Self::first_bound_name(p))),
@@ -2575,6 +2769,9 @@ impl Parser {
             // already checked against the prescan, so `f: _` (which emits no
             // read) is validated too.
             Pat::Struct(_name, fields) => (Self::struct_pat_binds(&fields, &subj), None),
+            // `(a, b) => body` is irrefutable in the same way: it binds each
+            // named element via a field read, with no test.
+            Pat::Tuple(elems) => (Self::tuple_pat_binds(&elems, &subj), None),
             // `[a, b] => body` is irrefutable in the same way: it binds each
             // named element via an index read, with no test. A `..` rest shifts
             // the trailing bindings to the back of the array.
@@ -2895,11 +3092,37 @@ impl Parser {
                 self.i += 1;
                 let saved = self.no_struct_lit;
                 self.no_struct_lit = false;
-                let e = self.parse_expr();
+                // `()` is unit; `(e)` is grouping; `(a, b)` and `(a,)` are
+                // tuple literals. Sema resolves the literal's element types and
+                // rewrites it to the anonymous struct that lays them out.
+                if self.eat(&Tok::RParen) {
+                    self.no_struct_lit = saved;
+                    return Ok(Expr::Block(Block { stmts: Vec::new(), tail: None }));
+                }
+                let first = self.parse_expr();
+                let first = match first {
+                    Ok(e) => e,
+                    Err(e) => {
+                        self.no_struct_lit = saved;
+                        return Err(e);
+                    }
+                };
+                let r = if self.eat(&Tok::Comma) {
+                    let mut elems = vec![first];
+                    while self.peek() != Some(&Tok::RParen) {
+                        elems.push(self.parse_expr()?);
+                        if !self.eat(&Tok::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(Tok::RParen)?;
+                    Ok(Expr::TupleLit(elems))
+                } else {
+                    self.expect(Tok::RParen)?;
+                    Ok(first)
+                };
                 self.no_struct_lit = saved;
-                let e = e?;
-                self.expect(Tok::RParen)?;
-                Ok(e)
+                r
             }
             Some(Tok::If) => {
                 self.i += 1;
@@ -3056,6 +3279,13 @@ enum Pat {
     /// arm using one has no test. Desugars to the indexed reads its bindings
     /// name.
     Array { elems: Vec<Option<(bool, Pat)>>, rest: bool, front: usize },
+    /// `(a, b, c)`: a tuple pattern. Each element is a sub-pattern with its own
+    /// `mut` flag (`(mut a, b)`). It is irrefutable when every element is, so a
+    /// `let`/`for`/parameter may use one; a `match` arm using one has no test.
+    /// Desugars to the field reads its bindings name (a tuple is an anonymous
+    /// struct, so element `k` is the field `"k"`). The element count must match
+    /// the scrutinee's arity, which sema enforces through those reads.
+    Tuple(Vec<(bool, Pat)>),
 }
 
 /// One field of a struct pattern: its name and what it binds. `None` is

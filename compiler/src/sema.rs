@@ -518,6 +518,29 @@ impl Sema {
         resolve_in(t, &self.structs, &self.enums)
     }
 
+    /// The anonymous struct that lays out a tuple with these element types: its
+    /// name and layout. A tuple *type* the user wrote was already lowered by the
+    /// parser and laid out by `resolve_layouts`, so its name is found in the
+    /// table; a tuple *literal* the parser could not type introduces the struct
+    /// here, laid out exactly like a struct with fields `"0"`, `"1"`, ... at
+    /// consecutive offsets, and it is recorded so a later use finds it.
+    fn tuple_struct_for(&mut self, tys: &[Type]) -> (String, StructInfo) {
+        let keys: Vec<String> = tys.iter().map(|t| t.key()).collect();
+        let name = crate::ast::tuple_struct_name(&keys);
+        if let Some(info) = self.structs.get(&name) {
+            return (name, info.clone());
+        }
+        let mut fields = Vec::with_capacity(tys.len());
+        let mut size = 0usize;
+        for (k, ty) in tys.iter().enumerate() {
+            fields.push((k.to_string(), ty.clone(), size));
+            size += ty.size();
+        }
+        let info = StructInfo { fields, size };
+        self.structs.insert(name.clone(), info.clone());
+        (name, info)
+    }
+
     fn check_fn(&mut self, f: &mut FnDef) -> Result<(), String> {
         // A parameter name must be unique within its function (rustc E0415).
         // `self` is inserted first, so this also rejects a second `self`.
@@ -1383,6 +1406,11 @@ impl Sema {
                 Self::collect_mut_borrows(y, a, mb);
             }
             Expr::Un(_, x) => Self::collect_mut_borrows(x, a, mb),
+            Expr::TupleLit(xs) => {
+                for x in xs {
+                    Self::collect_mut_borrows(x, a, mb);
+                }
+            }
             Expr::Call { args, .. } => {
                 for x in args {
                     Self::collect_mut_borrows(x, a, mb);
@@ -1938,6 +1966,33 @@ impl Sema {
                     }
                     other => Err(format!("field access on a value of type {other:?}")),
                 }
+            }
+            Expr::TupleLit(elems) => {
+                // Type each element in order, then lower the tuple to the
+                // anonymous struct that lays them out (element `k` is field
+                // `"k"`). The struct is chosen by the element-type keys, exactly
+                // as the parser chose it for a tuple *type*, so a literal and an
+                // annotated type with the same elements are the same struct.
+                let mut tys = Vec::with_capacity(elems.len());
+                for e in elems.iter_mut() {
+                    tys.push(self.check_expr(e, scope)?);
+                }
+                let (name, info) = self.tuple_struct_for(&tys);
+                // A frame buffer so the literal has an address in any context,
+                // exactly like a struct literal.
+                let fields: Vec<FieldInit> = elems
+                    .drain(..)
+                    .enumerate()
+                    .map(|(k, v)| FieldInit {
+                        name: k.to_string(),
+                        offset: info.fields[k].2 as i32,
+                        ty: info.fields[k].1.clone(),
+                        value: v,
+                    })
+                    .collect();
+                let slot = self.alloc_slots((info.size / 8) as i32);
+                *e = Expr::StructLit { name: name.clone(), fields, slot };
+                Ok(Type::Struct(name, info.size))
             }
             Expr::StructLit { name, fields, slot } => {
                 let info = self
