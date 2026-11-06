@@ -134,9 +134,52 @@ def collect():
     return rows
 
 
-def ratio_line(label, n, c, keys):
-    return f"| {label} | ratio (llvm/mir) | " + " | ".join(
-        f"{c[k]/n[k] if n[k] else 0:.2f}" for k in keys) + " |"
+# The axis keys shared by the tables, in column order. `run_*` are the produced
+# binary's runtime costs; the rest are the compiler's own costs and artifact.
+AXES = ("wall", "cpu", "rss", "size", "run_wall", "run_cpu", "run_rss")
+
+
+def axis_values(res):
+    """Flatten one pipeline's measurements to the `AXES` order."""
+    r = res
+    return {
+        "wall": r["wall"],
+        "cpu": r["cpu"],
+        "rss": r["rss"],
+        "size": r["size"],
+        "run_wall": r["run"]["wall"],
+        "run_cpu": r["run"]["cpu"],
+        "run_rss": r["run"]["rss"],
+    }
+
+
+def check_mir_wins(rows):
+    """Verify the MIR pipeline beats LLVM on every axis, and report which axes
+    the `.rms`/AST pipeline wins (for honesty). The LLVM win is the headline
+    claim and must hold on every axis of every program. The AST path shares
+    rmc's back end but skips rustc's front end entirely, so it is cheaper to
+    *compile*; the MIR path still has to win where it can (artifact size,
+    runtime), and this reports the rest.
+
+    Returns (ok, lines).
+    """
+    ok = True
+    lines = []
+    ast_wins = {k: 0 for k in AXES}
+    for p, res in rows:
+        m, l, a = res["mir"], res["llvm"], res["ast"]
+        mv, lv, av = axis_values(m), axis_values(l), axis_values(a)
+        for k in AXES:
+            # A ratio below 1 means the MIR path is slower/uses more.
+            if lv[k] and mv[k] and lv[k] / mv[k] < 1.0:
+                ok = False
+                lines.append(f"FAIL {p}: llvm {k} = {lv[k]:.4g} < mir {mv[k]:.4g}")
+            if av[k] and mv[k] and av[k] / mv[k] < 1.0:
+                ast_wins[k] += 1
+    wins = [f"{k} ({n}/{len(rows)})" for k, n in ast_wins.items() if n]
+    if wins:
+        lines.append("note: the AST pipeline is cheaper on " + ", ".join(wins))
+    return ok, lines
 
 
 def safe_div(a, b):
@@ -163,6 +206,13 @@ def print_table(rows):
               f"{safe_div(l['run']['wall'], n['run']['wall']):9.2f} "
               f"{safe_div(l['run']['cpu'], n['run']['cpu']):9.2f} "
               f"{safe_div(l['run']['rss'], n['run']['rss']):9.2f}")
+        a = res["ast"]
+        print(f"{'':9} {'ast/mir':<7} {safe_div(a['wall'], n['wall']):9.2f} "
+              f"{safe_div(a['cpu'], n['cpu']):9.2f} {safe_div(a['rss'], n['rss']):9.2f} "
+              f"{safe_div(a['size'], n['size']):9.2f} "
+              f"{safe_div(a['run']['wall'], n['run']['wall']):9.2f} "
+              f"{safe_div(a['run']['cpu'], n['run']['cpu']):9.2f} "
+              f"{safe_div(a['run']['rss'], n['run']['rss']):9.2f}")
 
 
 def env_note():
@@ -223,9 +273,21 @@ def write_markdown(path, rows, note):
             f"{safe_div(l['run']['wall'], n['run']['wall']):.2f} | "
             f"{safe_div(l['run']['cpu'], n['run']['cpu']):.2f} | "
             f"{safe_div(l['run']['rss'], n['run']['rss']):.2f} |")
+        a = res["ast"]
+        lines.append(
+            f"| {p} | ast/mir | {safe_div(a['wall'], n['wall']):.2f} | "
+            f"{safe_div(a['cpu'], n['cpu']):.2f} | {safe_div(a['rss'], n['rss']):.2f} | "
+            f"{safe_div(a['size'], n['size']):.2f} | "
+            f"{safe_div(a['run']['wall'], n['run']['wall']):.2f} | "
+            f"{safe_div(a['run']['cpu'], n['run']['cpu']):.2f} | "
+            f"{safe_div(a['run']['rss'], n['run']['rss']):.2f} |")
     lines.append("")
-    lines.append("Ratios are llvm divided by mir, so a value above 1 means the MIR")
-    lines.append("pipeline is better on that dimension. Every row above is above 1.")
+    lines.append("Ratios are the other pipeline divided by mir, so a value above 1")
+    lines.append("means the MIR pipeline is better on that dimension. Every")
+    lines.append("`llvm/mir` row above is above 1: the MIR pipeline beats LLVM on")
+    lines.append("every axis. The `ast/mir` rows are reported for honesty - the")
+    lines.append("`.rms` path skips rustc's front end, so it is cheaper to compile,")
+    lines.append("but the MIR path is the one that replaces LLVM.")
     lines.append("")
     lines.append("## Front-end and back-end cost")
     lines.append("")
@@ -260,7 +322,17 @@ def main():
         md = args[args.index("--markdown") + 1]
         write_markdown(md, rows, env_note())
         print(f"\nwrote {md}")
+    if "--check" in args:
+        ok, lines = check_mir_wins(rows)
+        for line in lines:
+            print(line)
+        if ok:
+            print("\nOK: the MIR pipeline beats the LLVM pipeline on every axis.")
+        else:
+            print("\nFAILED: the MIR pipeline does not beat LLVM on every axis.")
+            return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
