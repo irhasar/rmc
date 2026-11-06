@@ -4828,3 +4828,98 @@ fn a_struct_update_base_of_the_wrong_type_is_rejected() {
     assert!(err.contains("does not match"), "got: {err}");
 }
 
+
+#[test]
+fn a_tuple_pattern_in_a_match_arm_may_test_an_element() {
+    // A refutable element adds a test; the arm still binds the other element.
+    let out = asm_no_inline(
+        "fn main() -> i64 { match (1, 2) { (0, _) => { return 10; } (a, b) => { return a + b; } } }",
+    );
+    assert!(out.contains("main:"), "compiled:\n{out}");
+}
+
+#[test]
+fn a_tuple_pattern_with_a_range_element_is_accepted() {
+    let out = asm(
+        "fn main() -> i64 { match (3, 2) { (1..=5, x) => { return x; } _ => { return 0; } } }",
+    );
+    assert!(out.contains("main:"));
+}
+
+#[test]
+fn a_tuple_pattern_with_an_or_element_is_accepted() {
+    let out = asm(
+        "fn main() -> i64 { match (2, 5) { (0 | 1 | 2, x) => { return x; } _ => { return 0; } } }",
+    );
+    assert!(out.contains("main:"));
+}
+
+#[test]
+fn a_refutable_tuple_pattern_in_if_let_is_accepted() {
+    let out = asm("fn main() -> i64 { if let (1, x) = (1, 5) { return x; } return 0; }");
+    assert!(out.contains("main:"));
+}
+
+#[test]
+fn a_refutable_tuple_pattern_in_while_let_is_accepted() {
+    let out = asm(
+        "fn main() -> i64 { let mut i = 0; let mut a = 0; \
+         while let (1, x) = (1, i) { a = a + x; i = i + 1; if i > 2 { break; } } return a; }",
+    );
+    assert!(out.contains("main:"));
+}
+
+#[test]
+fn a_literal_tuple_element_in_a_let_is_rejected() {
+    // A `let` pattern is irrefutable, so a literal element is rejected, as rustc.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let (1, x) = (1, 2); return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("tuple pattern elements must be bindings"), "got: {err}");
+}
+
+#[test]
+fn a_literal_tuple_element_in_a_parameter_is_rejected() {
+    let err = compile_to_asm(
+        "fn f((1, b): (i64, i64)) -> i64 { return b; } fn main() -> i64 { return f((1, 2)); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("tuple pattern elements must be bindings"), "got: {err}");
+}
+
+#[test]
+fn a_variant_tuple_element_is_rejected_even_in_a_match() {
+    // rmc generates no element test that would carry a variant payload.
+    let err = compile_to_asm(
+        "enum E { A, B } fn main() -> i64 { match (E::A, 1) { (E::A, x) => { return x; } _ => { return 0; } } }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("must be irrefutable or a scalar test"), "got: {err}");
+}
+
+#[test]
+fn a_binding_tuple_element_in_an_or_pattern_is_rejected() {
+    let err = compile_to_asm(
+        "fn main() -> i64 { match (1, 2) { (x | 1, y) => { return y; } _ => { return 0; } } }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("not bound in all patterns"), "got: {err}");
+}
+
+#[test]
+fn a_tuple_element_test_reads_the_element_field() {
+    // The element test must read field "0" of the scrutinee, exactly as the
+    // equivalent `t.0 == 0` would; assert on that read rather than on the whole
+    // function, whose label numbering is not stable across forms.
+    let out = asm_no_inline(
+        "fn f(t: (i64, i64)) -> i64 { match t { (0, b) => { return b; } _ => { return 0; } } } \
+         fn main() -> i64 { return f((0, 7)); }",
+    );
+    let body = &out[out.find("f:").expect("f")..out.find("main:").expect("main")];
+    assert!(body.contains("cmpq $0,"), "expected an equality test:\n{body}");
+}

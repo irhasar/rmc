@@ -74,5 +74,67 @@ fn main() -> i64 {
     // A tuple stored in a struct field, then read back.
     print_i64(add((4, 5)));
 
+    // A refutable tuple pattern: a literal element test, then a catch-all.
+    match (3, 4) {
+        (0, _) => {
+            print_i64(-1);
+        }
+        (a, b) => {
+            print_i64(a * 10 + b);
+        }
+    }
+
+    // A bool element test and a range element test.
+    match (true, 6) {
+        (true, 0..=9) => {
+            print_i64(1);
+        }
+        _ => {
+            print_i64(0);
+        }
+    }
+
+    // An or-pattern element: any alternative matching passes.
+    match (2, 5) {
+        (0 | 1 | 2, x) => {
+            print_i64(x);
+        }
+        _ => {
+            print_i64(-1);
+        }
+    }
+
+    // `if let` with a refutable tuple, hit and missed.
+    if let (7, x) = (7, 8) {
+        print_i64(x);
+    }
+    if let (7, x) = (9, 8) {
+        print_i64(x);
+    } else {
+        print_i64(100);
+    }
+
+    // A nested refutable tuple element.
+    match (1, (0, 3)) {
+        (a, (0, c)) => {
+            print_i64(a + c);
+        }
+        _ => {
+            print_i64(-1);
+        }
+    }
+
+    // `while let` re-tests a refutable tuple each iteration.
+    let mut k = 0;
+    let mut acc = 0;
+    while let (0, x) = (0, k) {
+        acc = acc + x;
+        k = k + 1;
+        if k >= 4 {
+            break;
+        }
+    }
+    print_i64(acc);
+
     return 0;
 }

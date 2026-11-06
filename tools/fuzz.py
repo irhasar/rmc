@@ -1769,6 +1769,10 @@ def gen_tuple_program(rng):
         "fn ptup(t: (i64, i64)) -> i64 { let (mut a, b) = t; a = a + b; return a; }",
         "fn ppat((a, b): (i64, i64)) -> i64 { return a * 3 + b; }",
         "fn ford(a: [(i64, i64); 2]) -> i64 { let mut s = 0; for (x, y) in a { s = s + x * 2 + y; } return s; }",
+        "fn refut(t: (i64, i64)) -> i64 { return match t { (0, x) => x, (a, b) => a * 10 + b }; }",
+        "fn refut_or(t: (i64, i64)) -> i64 { return match t { (0 | 1, x) => x, _ => 0 - 1 }; }",
+        "fn refut_rng(t: (i64, i64)) -> i64 { return match t { (a, 5..=9) => a, _ => 0 - 2 }; }",
+        "fn iflet(t: (i64, i64)) -> i64 { if let (3, x) = t { return x; } return 0 - 3; }",
     ]
     rs = [
         "#[derive(Copy, Clone)]",
@@ -1785,6 +1789,10 @@ def gen_tuple_program(rng):
         "fn ptup(t: (i64, i64)) -> i64 { let (mut a, b) = t; a = a + b; a }",
         "fn ppat((a, b): (i64, i64)) -> i64 { a * 3 + b }",
         "fn ford(a: [(i64, i64); 2]) -> i64 { let mut s = 0; for (x, y) in a { s = s + x * 2 + y; } s }",
+        "fn refut(t: (i64, i64)) -> i64 { match t { (0, x) => x, (a, b) => a * 10 + b } }",
+        "fn refut_or(t: (i64, i64)) -> i64 { match t { (0 | 1, x) => x, _ => 0 - 1 } }",
+        "fn refut_rng(t: (i64, i64)) -> i64 { match t { (a, 5..=9) => a, _ => 0 - 2 } }",
+        "fn iflet(t: (i64, i64)) -> i64 { if let (3, x) = t { x } else { 0 - 3 } }",
     ]
 
     calls = [
@@ -1799,6 +1807,14 @@ def gen_tuple_program(rng):
         f"ptup((s + {o[1]}, s + {o[2]}))",
         f"ppat((s + {o[3]}, s + {o[4]}))",
         f"ford([(s + {o[5]}, s + {o[6]}), (s + {o[7]}, s + {o[8]})])",
+        f"refut((0, s + {o[0]}))",
+        f"refut((s + {o[1]}, s + {o[2]}))",
+        f"refut_or((1, s + {o[3]}))",
+        f"refut_or((s + {o[4]}, s + {o[5]}))",
+        f"refut_rng((s + {o[6]}, 7))",
+        f"refut_rng((s + {o[7]}, s + {o[8]}))",
+        f"iflet((3, s + {o[9]}))",
+        f"iflet((s + {o[10]}, s + {o[11]}))",
         f"swap((s + {o[3]}, s + {o[4]})).0",
         f"swap((s + {o[5]}, s + {o[6]})).1",
     ]

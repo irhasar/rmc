@@ -203,10 +203,28 @@ Tuples nest, and `t.0.1` reaches into a nested tuple.
 
 Element access `.0`, `.1`, ... requires the base to be a tuple (or a reference
 to one, which auto-derefs); an index past the end is rejected. A tuple may be
-destructured in a `let`, a `for` head, a function parameter or an irrefutable
-`match` arm, with `_` to ignore an element and `mut` on a binding. A tuple
-pattern's element count must match the tuple's arity for a field read to resolve;
-a mismatch is reported as a missing field.
+destructured in a `let`, a `for` head, a function parameter or a `match` arm,
+with `_` to ignore an element and `mut` on a binding. A tuple pattern's element
+count must match the tuple's arity for a field read to resolve; a mismatch is
+reported as a missing field.
+
+In a `match` arm or an `if let` / `while let` scrutinee a tuple pattern may be
+*refutable*: an element may be a scalar test (an integer, `true`/`false`, a
+string, a range, or an or-pattern of those), and the arm runs only when every
+element matches:
+
+```rust
+match (1, 2) {
+    (0, _) => 0,            // the first element must be 0
+    (a, b) => a * 10 + b,   // binds both elements
+}
+if let (7, x) = (7, 8) { print_i64(x); }
+while let (0, x) = (0, k) { ... }
+```
+
+A refutable element may not bind (rmc generates no test that would carry a
+payload), so `(E::V(x), y)` is rejected. A `let`, a `for` head and a parameter
+are irrefutable, so a literal element there is rejected (`let (1, x) = e;`).
 
 ## Functions
 
@@ -441,7 +459,8 @@ compile-time constant is decided at compile time, not by the trap.
   `match c { Color::Red => a, _ => b }` or `match s { "on" => a, _ => b }`. An
   arm pattern is an integer literal (optionally negated), an integer *range*
   `lo..hi` / `lo..=hi`, a *string* literal, an `Enum::Variant`, a struct
-  pattern `S { f, .. }` (see below), an *or-pattern* `a | b | c`, or `_`. The
+  pattern `S { f, .. }` (see below), a *tuple* pattern `(a, b)` (see below),
+  an *or-pattern* `a | b | c`, or `_`. The
   first matching arm
   runs and `_` matches anything; it is an expression, usable as a statement or a
   value, and a comma before `}` may be omitted. An arm body is an expression,
@@ -537,6 +556,19 @@ compile-time constant is decided at compile time, not by the trap.
   be irrefutable: a literal element (`[1, y]`) is rejected rather than
   mis-bound. An array pattern that binds
   nothing (`[_, _]`, `[..]`) is accepted and still evaluates the scrutinee once.
+- Tuple patterns: `(a, b)` matches a tuple and binds its elements, in a `let`,
+  `for` head, parameter, `match` arm, `if let` or `while let`. An element is a
+  binding, `_`, or a nested struct/array/tuple pattern, exactly as an array
+  element is; `mut` goes on the binding. A tuple pattern expands to one field
+  read per element (element `k` is field `"k"` of the anonymous struct the tuple
+  lowers to). In a `match` arm or an `if let` / `while let` a tuple pattern may
+  be *refutable*: an element may be a scalar test (an integer, `true`/`false`, a
+  string, a range, or an or-pattern of those), and the arm runs only when every
+  element matches; a binding element is read through the test. A refutable
+  element may not itself bind or be a variant (`(E::V(x), y)`), since rmc
+  generates no test that carries a payload. In a `let`, `for` head or parameter
+  the pattern is irrefutable, so a literal element is rejected, as rustc
+  rejects it.
 - `for` destructuring: `for S { f, g: h, i: _, .. } in arr { .. }` or
   `for [x, y] in arr { .. }` iterates the array as above but destructures each
   element with the same struct- or array-pattern grammar, binding the named
