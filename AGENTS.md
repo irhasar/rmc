@@ -387,6 +387,15 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   mis-splits and the constant fails to parse. `string_end` handles both `"..."` 
   and `b"..."`, and skips backslash escapes so an escaped quote does not end the
   literal early.
+- **A literal format argument (`println!("{:x}", 255)`) hits a promoted
+  constant the back end cannot fold.** rustc promotes the literal to
+  `const main::promoted[0]: &i32` (a `static` holding the value, returned as a
+  reference), and `mir.rs::classify_unsupported` rejects any `::promoted[` with
+  a named diagnostic rather than miscompiling. The value case is what works
+  (`let z = 0; println!("{:b}", z)`) and what the `tests/std` cases use; only a
+  literal directly in the argument position is affected. Folding it would mean
+  parsing the promoted body's `_1 = const N; _0 = &_1;` and materialising the
+  value in `.rodata`.
 - **A 32-bit register selects a 32-bit memory access.** `mov (%rdi), %eax` is
   the 32-bit load (`8B /r`), `mov (%rdi), %rax` the 64-bit one (`48 8B /r`);
   likewise for stores. `elf.rs`'s `mov` must derive the operand width from the
