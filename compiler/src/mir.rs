@@ -657,7 +657,7 @@ pub fn parse(text: &str) -> Result<Program, String> {
             prog.funcs.push(f);
             i = next;
         } else if l.starts_with("const ") && l.contains("::promoted[") {
-            let (name, p, next) = parse_promoted(&lines, i)?;
+            let (name, p, next) = parse_promoted(&lines, i, &prog.consts)?;
             // A promoted constant the parser cannot fold is left out of the map,
             // so a use of it is a clear back-end error rather than a wrong value.
             if let Some(p) = p {
@@ -771,7 +771,11 @@ fn parse_alloc(lines: &[String], start: usize) -> Result<(u32, AllocData, usize)
 /// `const main::promoted[N]: &T = { ... }` — a promoted constant, reduced to
 /// the bytes of the value it returns the address of. `None` means the shape is
 /// not one the back end can fold.
-fn parse_promoted(lines: &[String], start: usize) -> Result<(String, Option<Promoted>, usize), String> {
+fn parse_promoted(
+    lines: &[String],
+    start: usize,
+    consts: &HashMap<String, i64>,
+) -> Result<(String, Option<Promoted>, usize), String> {
     let header = lines[start].trim().trim_end_matches(';');
     let name = header
         .strip_prefix("const ")
@@ -834,7 +838,7 @@ fn parse_promoted(lines: &[String], start: usize) -> Result<(String, Option<Prom
         let t = line.trim();
         if let Some((lhs, rhs)) = split_assign(t) {
             if parse_local_id(lhs.trim()) == Some(ref_local) {
-                if let Some(v) = parse_promoted_value(rhs.trim(), ty_text) {
+                if let Some(v) = parse_promoted_value(rhs.trim(), ty_text, consts) {
                     bytes.push((0, v));
                 }
             }
@@ -847,11 +851,25 @@ fn parse_promoted(lines: &[String], start: usize) -> Result<(String, Option<Prom
 }
 
 /// The scalar a promoted referent is set to: a literal, a binary op folded over
-/// two literals, or a zero-sized construction (the type name used as a value).
-fn parse_promoted_value(rhs: &str, ty_text: &str) -> Option<i64> {
+/// two literals, a `const` item reference, or a `size_of`/zero-sized
+/// construction (the type name used as a value).
+fn parse_promoted_value(rhs: &str, ty_text: &str, consts: &HashMap<String, i64>) -> Option<i64> {
     let s = rhs.trim().trim_end_matches(';').trim();
     if let Some(v) = parse_const_value(s) {
         return Some(v);
+    }
+    // `_1 = const X;` — a reference to a `const` item, resolved to its value.
+    if let Some(name) = s.strip_prefix("const ") {
+        if let Some(v) = consts.get(name.trim()) {
+            return Some(*v);
+        }
+    }
+    // `_1 = std::mem::size_of::<i64>();` — a size query the front end left in
+    // the promoted body rather than folding.
+    if let Some(r) = s.strip_prefix("std::mem::size_of") {
+        if let Some(t) = r.split('<').nth(1).and_then(|t| t.split('>').next()) {
+            return Some(size_of_type_text(t.trim()));
+        }
     }
     // `_1 = Q;` where `_1: Q` — a unit struct or unit variant, so a zero-sized
     // value with no bytes to store.
@@ -870,6 +888,17 @@ fn parse_promoted_value(rhs: &str, ty_text: &str) -> Option<i64> {
     let x = parse_const_value(a.trim())?;
     let y = parse_const_value(b.trim())?;
     eval_binop(op, x, y, ty_text)
+}
+
+/// The byte size of a primitive type named in source text, for the `size_of`
+/// shapes a promoted constant carries.
+fn size_of_type_text(t: &str) -> i64 {
+    match t {
+        "i8" | "u8" | "bool" => 1,
+        "i16" | "u16" => 2,
+        "i32" | "u32" | "f32" | "char" => 4,
+        _ => 8,
+    }
 }
 
 /// Split `a, b` at the top-level comma (one not nested in brackets).
@@ -911,6 +940,22 @@ fn eval_binop(op: &str, a: i64, b: i64, ty_text: &str) -> Option<i64> {
                 ((a >> shift) as u64) & mask
             } else {
                 ua >> shift
+            }
+        }
+        // Division and remainder trap on a zero divisor, so a promoted body
+        // that carries one is left unfolded rather than made to fault.
+        "Div" if ub != 0 => {
+            if ty_text.trim().starts_with('i') {
+                (a.wrapping_div(b as i64)) as u64
+            } else {
+                ua / ub
+            }
+        }
+        "Rem" if ub != 0 => {
+            if ty_text.trim().starts_with('i') {
+                (a.wrapping_rem(b as i64)) as u64
+            } else {
+                ua % ub
             }
         }
         _ => return None,
