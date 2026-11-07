@@ -1567,6 +1567,17 @@ fn parse_rvalue(s: &str) -> Result<Rvalue, String> {
         }
         return Ok(Rvalue::Array(ops));
     }
+    // A tuple literal `(a, b, ..)` — consecutive words, like an array.
+    if s.starts_with('(') && s.ends_with(')') && matching(s, 0, '(', ')') == Some(s.len() - 1) {
+        let mut ops = Vec::new();
+        for p in split_top_args(&s[1..s.len() - 1]) {
+            if p.trim().is_empty() {
+                continue;
+            }
+            ops.push(parse_operand(p.trim())?);
+        }
+        return Ok(Rvalue::Aggregate(ops));
+    }
     // A struct/tuple literal: `Name { f: v, .. }` or `Name(v, ..)`.
     if let Some(brace) = s.find('{') {
         let name = s[..brace].trim();
@@ -1917,10 +1928,12 @@ fn parse_const(s: &str) -> Option<Const> {
             }
         }
     }
-    // `E::A` / `E::Variant(args)` — an enum-variant constant.
+    // `E::A` / `E::Variant(args)` — an enum-variant constant. The qualifier may
+    // carry generic arguments (`Option::<i32>::Some(1_i32)`), which are dropped
+    // so the name matches the one `split_ev` produces at codegen.
     if let Some(open) = s.find('(') {
         if s.ends_with(')') && !s.starts_with('{') {
-            let name = s[..open].trim();
+            let name = strip_generics(s[..open].trim());
             if !name.is_empty() && name.contains("::") {
                 let args = split_top_args(&s[open + 1..s.len() - 1]);
                 let mut ops = Vec::new();
@@ -1930,17 +1943,56 @@ fn parse_const(s: &str) -> Option<Const> {
                     }
                     ops.push(parse_operand(a.trim()).ok()?);
                 }
-                return Some(Const::Agg { name: name.to_string(), ops });
+                return Some(Const::Agg { name, ops });
             }
         }
     }
-    if s.contains("::") && s.split("::").all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')) {
-        return Some(Const::Agg { name: s.to_string(), ops: Vec::new() });
+    // `(a, b, ..)` — a tuple constant, laid out as consecutive words.
+    if s.starts_with('(') && s.ends_with(')') {
+        let inner = &s[1..s.len() - 1];
+        let mut ops = Vec::new();
+        for part in split_top_args(inner) {
+            let p = part.trim();
+            if p.is_empty() {
+                continue;
+            }
+            ops.push(parse_operand(p).ok()?);
+        }
+        return Some(Const::Agg { name: String::new(), ops });
+    }
+    if s.contains("::") {
+        let bare = strip_generics(s);
+        if bare.split("::").all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')) {
+            return Some(Const::Agg { name: bare, ops: Vec::new() });
+        }
     }
     if let Some(n) = parse_int_literal(s) {
         return Some(Const::Int(n));
     }
     None
+}
+
+/// Drop `<...>` generic-argument groups from a path, so `Option::<i32>::None`
+/// and `Option::None` are the same name. Nesting is handled by depth counting.
+fn strip_generics(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut depth = 0u32;
+    for c in s.chars() {
+        match c {
+            '<' => {
+                depth += 1;
+                // `Option::<i32>::None` — the `::` introducing the group goes
+                // with it, or the name keeps a stray `::`.
+                if out.ends_with("::") {
+                    out.truncate(out.len() - 2);
+                }
+            }
+            '>' if depth > 0 => depth -= 1,
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// `i64::MIN`, `u64::MAX`, `usize::MAX`, `i32::MIN`, ... — the associated
