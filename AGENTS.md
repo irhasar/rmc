@@ -369,10 +369,22 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   printer, `LowerHex`/`UpperHex`/`Octal`/`Binary` the base printers, one entry
   point per width so a narrow type prints its own width (`{:x}` of `-2i16` is
   `fffe`, not the 16-digit 64-bit pattern; `{:X}` has its own symbol because the
-  digit alphabet differs). A template whose placeholder carries
-  flags, a width or a precision (`{:>5}`, `{:.2}`) is rejected: the walker skips
-  those fields to reach the argument index but renders the value in full, so
-  silently dropping them would mis-render. Two layout invariants are load
+  digit alphabet differs). The walker decodes the whole template: the optional
+  fields are gated by a bitmask (`bit0` flags u32, `bit1` width u16, `bit2`
+  precision u16, `bit3` arg index u16, `bit4` width-indirect, `bit5`
+  precision-indirect), and it renders fill/alignment/width/precision and the
+  sign, alternate, `+`/` ` and `0` flags itself. Precision is stored as
+  `prec + 1`, so `{:.0}` has a precision field of 0 but still sets the
+  precision flag: the walker re-creates a 0 from the flag, because the packed
+  `__rmc_fmt_mode` word reads 0 both for "no precision" and for `{:.0}`.
+  Precision truncates a text value at a UTF-8 character boundary
+  (`__rmc_utf8_trunc`) and is ignored by numbers, which matches rustc. An
+  indirect width/precision (`{:w$}`, `{:.*}`) reads the value from a `Count`
+  argument: the field is an argument index, and the `usize` sits at `+8` in
+  that 16-byte `Argument`. `{:?}` of a `&str` goes through
+  `__rmc_fmt_str_debug`, which quotes and escapes it exactly as rustc does
+  (control characters as `\u{N}`), and — like rustc — ignores width and
+  precision. Two layout invariants are load
   bearing: `Argument` and `ArgumentType` are 16 bytes each (the `PhantomData`
   lifetime field is zero-sized and must not reserve a word), and a struct field
   is a `Field` projection so the element keeps its real type — using
@@ -408,6 +420,23 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   likewise for stores. `elf.rs`'s `mov` must derive the operand width from the
   register name (or a `movl`/`movq` suffix), not default to 64-bit, or a narrow
   type read through a pointer picks up the neighbouring bytes.
+
+- **The MIR peephole pipeline is where the back end's quality lives.**
+  `mir_codegen.rs::optimize` runs, twice, `fuse_imm`, `fuse_lea`,
+  `coalesce_scratch`, `forward_stores`, `fold_addresses`, `fold_local_offsets`,
+  `dead_stores` and `drop_unread_stores`, each pass exposing work for the next.
+  `fold_addresses` turns the generator's "copy the base pointer, add the byte
+  offset, load through it" into one `disp(%base)` addressing mode;
+  `fold_local_offsets` does the same for a local (`lea D(%rbp), %t; add $K, %t`
+  -> `lea (D+K)(%rbp), %t`, and drops a bare `add $0, %t`). Both drop an `add`,
+  which is the only flag-setting instruction in the pair, so they check
+  `flags_used_by` before folding — a following `j*`/`set*`/`adc`/`sbb`/`cmov`
+  reads those flags. Every pass is textual and must leave a rewrite that is
+  legal for the in-process assembler (no memory-to-memory `mov`).
+- **A zero-sized alloc prints on one line.** A promoted empty `&str` is
+  `allocN (size: 0, align: 1) {}`; `mir.rs::parse_alloc` has to accept that
+  shape, or it reads past the header looking for the closing `}` and reports
+  "unterminated alloc block".
 
 ## Things that are easy to get wrong
 
