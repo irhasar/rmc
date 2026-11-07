@@ -266,6 +266,11 @@ pub struct Promoted {
     pub size: i64,
     /// `(byte offset, value)` for each scalar written into the blob.
     pub bytes: Vec<(i64, i64)>,
+    /// When the referent is itself a `&str`, the string literal it points at.
+    /// `&&str` is what rustc promotes for `"a" == "a"` and `match s { "x" => }`:
+    /// the outer pointer addresses a word that holds the address of the string
+    /// record, so the blob word is a relocation, not a scalar.
+    pub str_ref: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -834,20 +839,28 @@ fn parse_promoted(
     // construction `_1 = Q;`. Only a scalar referent is folded; anything else is
     // left unmodelled.
     let mut bytes: Vec<(i64, i64)> = Vec::new();
+    let mut str_ref: Option<String> = None;
     for line in body {
         let t = line.trim();
         if let Some((lhs, rhs)) = split_assign(t) {
             if parse_local_id(lhs.trim()) == Some(ref_local) {
-                if let Some(v) = parse_promoted_value(rhs.trim(), ty_text, consts) {
+                let r = rhs.trim();
+                if let Some(v) = parse_promoted_value(r, ty_text, consts) {
                     bytes.push((0, v));
+                } else if ty_text.trim() == "&str" {
+                    // A `&str` referent: the promoted blob holds the address of
+                    // the string record the literal becomes.
+                    if let Some(Const::Str(s)) = parse_const(r.strip_prefix("const ").unwrap_or(r)) {
+                        str_ref = Some(s);
+                    }
                 }
             }
         }
     }
-    if bytes.is_empty() {
+    if bytes.is_empty() && str_ref.is_none() {
         return Ok((name, None, end + 1));
     }
-    Ok((name, Some(Promoted { size, bytes }), end + 1))
+    Ok((name, Some(Promoted { size, bytes, str_ref }), end + 1))
 }
 
 /// The scalar a promoted referent is set to: a literal, a binary op folded over
@@ -1198,6 +1211,8 @@ fn parse_call_terminator(t: &str) -> Option<Terminator> {
     let func = match func.trim() {
         "std::io::_print" | "core::fmt::_print" => CallTarget::Direct("__rmc_print".to_string()),
         "std::io::_eprint" | "core::fmt::_eprint" => CallTarget::Direct("__rmc_eprint".to_string()),
+        "compare_bytes" => CallTarget::Direct("__rmc_compare_bytes".to_string()),
+        _ if is_panic_fn(func.trim()) => CallTarget::Direct("__rmc_panic".to_string()),
         _ => match std_intrinsic_name(&func) {
             Some(name) => CallTarget::Direct(name),
             None => match normalize_call_name(&func) {
@@ -1207,6 +1222,25 @@ fn parse_call_terminator(t: &str) -> Option<Terminator> {
         },
     };
     Some(Terminator::Call { dest, func, args, target })
+}
+
+/// The `panic!`/`todo!`/`unreachable!`/`assert!` sinks. They print a message and
+/// abort the process; the back end maps them to `__rmc_panic`, which writes a
+/// fixed line to stderr and exits non-zero. The message text is a `&str` (or an
+/// `Arguments`), so the helper ignores the argument rather than modelling the
+/// `core::fmt` machinery these bring in.
+fn is_panic_fn(name: &str) -> bool {
+    matches!(
+        name,
+        "std::rt::panic_fmt"
+            | "core::panicking::panic_fmt"
+            | "core::panicking::panic"
+            | "core::panicking::panic_str"
+            | "core::panicking::panic_nounwind"
+            | "core::panicking::panic_nounwind_fmt"
+            | "std::panicking::begin_panic"
+            | "core::panicking::panic_display"
+    )
 }
 
 /// A std call the back end implements as a runtime helper, rewritten to that

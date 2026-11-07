@@ -245,8 +245,14 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<String, String> {
                     }
                 }
             }
-            for v in &data {
-                let _ = writeln!(rodata, "  .quad {}", *v as u64);
+            if let Some(s) = &p.str_ref {
+                // The referent is a `&str`: the blob word is the address of the
+                // string record, a relocation rather than a scalar.
+                let _ = writeln!(rodata, "  .quad {}", string_ids[s]);
+            } else {
+                for v in &data {
+                    let _ = writeln!(rodata, "  .quad {}", *v as u64);
+                }
             }
         }
     }
@@ -439,6 +445,18 @@ fn collect_strings(prog: &Program) -> (Vec<String>, HashMap<String, String>) {
                 if let Stmt::Assign(_, rv) = s {
                     collect_strings_rv(rv, &mut order, &mut map);
                 }
+            }
+        }
+    }
+    // A promoted `&&str` constant's literal appears only in the promoted body,
+    // never in a function statement, so collect it here to give it a label.
+    let mut names: Vec<&String> = prog.promoted.keys().collect();
+    names.sort();
+    for name in names {
+        if let Some(s) = &prog.promoted[name].str_ref {
+            if !map.contains_key(s) {
+                map.insert(s.clone(), format!("__rmc_lit{}", map.len()));
+                order.push(s.clone());
             }
         }
     }

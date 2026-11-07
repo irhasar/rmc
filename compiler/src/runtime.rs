@@ -287,6 +287,64 @@ __rmc_write_template:
     },
     Piece {
         text: r#"
+# void __rmc_panic(long msg)  -- the `panic!`/`todo!`/`unreachable!` sink. A
+# freestanding program has no unwinder, so it writes a fixed diagnostic to
+# stderr and exits non-zero, which is the observable behaviour of
+# `panic=abort`. The message argument is ignored: the `&str`/`Arguments` it
+# carries would drag in the whole `core::fmt` machinery for text nothing
+# checks.
+.globl __rmc_panic
+.type __rmc_panic, @function
+__rmc_panic:
+    mov $2, %rdi             # fd = stderr
+    lea __rmc_panic_msg(%rip), %rsi
+    mov $9, %rdx             # "panicked\n"
+    mov $1, %rax
+    syscall
+    mov $101, %rdi
+    mov $60, %rax
+    syscall
+.size __rmc_panic, .-__rmc_panic
+
+.section .rodata
+__rmc_panic_msg: .ascii "panicked\n"
+"#,
+        defines: &["__rmc_panic"],
+    },
+    Piece {
+        text: r#"
+# int __rmc_compare_bytes(const u8 *a, const u8 *b, usize n)  -- the
+# `compare_bytes` intrinsic `str`/`[u8]` equality lowers to. rmc represents a
+# string literal as the address of a `{len: i64, bytes..}` record and the
+# `&[u8]` cast of one as the record's address, so the pointers the caller
+# passes are record addresses, not byte pointers: skip each record's length
+# word. Returns a negative, zero or positive int, so the caller's `== 0`
+# test is the equality.
+.globl __rmc_compare_bytes
+.type __rmc_compare_bytes, @function
+__rmc_compare_bytes:
+    add $8, %rdi
+    add $8, %rsi
+    xor %rcx, %rcx
+.Lcb_loop:
+    cmp %rdx, %rcx
+    jae .Lcb_equal
+    movzbl (%rdi,%rcx), %eax
+    movzbl (%rsi,%rcx), %r8d
+    sub %r8d, %eax
+    jnz .Lcb_done
+    inc %rcx
+    jmp .Lcb_loop
+.Lcb_equal:
+    xor %eax, %eax
+.Lcb_done:
+    ret
+.size __rmc_compare_bytes, .-__rmc_compare_bytes
+"#,
+        defines: &["__rmc_compare_bytes"],
+    },
+    Piece {
+        text: r#"
 # The `core::fmt` formatters. `format_args!` reifies one per placeholder and
 # the `Argument` array carries its address; the template walker calls it with a
 # pointer to the value. Each writes to stdout with a raw syscall. They are kept
@@ -358,8 +416,12 @@ __rmc_fmt_char:
 .globl __rmc_fmt_str
 .type __rmc_fmt_str, @function
 __rmc_fmt_str:
-    mov (%rdi), %rsi         # `&str` is {ptr, len}
-    mov 8(%rdi), %rdx
+    # `%rdi` points at the `&str` slot the formatter was handed; the slot holds
+    # the address of rmc's `{len: i64, bytes..}` record. Deref once to reach the
+    # record, then word 0 is the byte length and the bytes follow.
+    mov (%rdi), %rdi         # -> the string record
+    mov (%rdi), %rdx         # length
+    lea 8(%rdi), %rsi        # -> the bytes
     mov $1, %rdi
     mov $1, %rax
     syscall
@@ -370,8 +432,9 @@ __rmc_fmt_str:
 .type __rmc_fmt_str_debug, @function
 __rmc_fmt_str_debug:
     # Debug for a string quotes it and escapes `"` `\` and control characters.
-    mov (%rdi), %rsi
-    mov 8(%rdi), %rdx
+    mov (%rdi), %rdi
+    mov (%rdi), %rdx
+    lea 8(%rdi), %rsi
     mov $1, %rdi
     mov $1, %rax
     syscall
