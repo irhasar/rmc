@@ -65,4 +65,40 @@ fn main() {
     println!("{} and {:>5} and {:#x}", 1, 2, 255);
     println!("{0} {1} {0}", 7, 8);
     println!("{name} = {value:>6}", name = "n", value = 42);
+
+    // Precision: `.N` truncates text to N characters and is ignored by
+    // integers; `.*` takes the precision from an argument.
+    println!("[{:.3}]", "abcdef");
+    println!("[{:.0}]", "abcdef");
+    println!("[{:.10}]", "abcdef");
+    println!("[{:.3}]", "héllo");
+    println!("[{:.2}]", "héllo");
+    println!("[{:.3}]", true);
+    println!("[{:.0}]", true);
+    println!("[{:.3}]", 'x');
+    println!("[{:.0}]", 'x');
+    println!("[{:.3}]", 42);
+    println!("[{:.0}]", 42);
+    println!("[{:.3}]", 0);
+    println!("[{:.*}]", 2, "abcdef");
+    println!("[{:.*}]", 0, "abcdef");
+    println!("[{:.*}]", 4, "abcdef");
+    println!("[{:>8.3}]", "abcdef");
+    println!("[{:*^8.3}]", "abcdef");
+    println!("[{:.3}]", "");
+
+    // Dynamic width: `{:N$}` and `{:.*}` read their value from a `Count`
+    // argument.
+    println!("[{:1$}]", 42, 6);
+    println!("[{:*>1$}]", 42, 6);
+    println!("[{:1$}]", "ab", 5);
+
+    // Debug for a string quotes and escapes it; every option is ignored.
+    println!("[{:?}]", "ab");
+    println!("[{:?}]", "a\"b");
+    println!("[{:?}]", "a\\b");
+    println!("[{:?}]", "a\nb\tc\rd");
+    println!("[{:?}]", "a\u{1}b\u{7f}c");
+    println!("[{:>8?}]", "ab");
+    println!("[{:.3?}]", "abcdef");
 }

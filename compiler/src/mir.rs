@@ -726,6 +726,10 @@ fn parse_alloc(lines: &[String], start: usize) -> Result<(u32, AllocData, usize)
         .and_then(|(_, r)| r.split(',').next())
         .map(|n| n.trim().to_string());
     let mut data = AllocData { bytes: Vec::new(), relocs: Vec::new(), static_name };
+    // A zero-sized alloc is printed on one line, `allocN (..) {}`.
+    if header.ends_with("{}") {
+        return Ok((id, data, start + 1));
+    }
     let mut i = start + 1;
     while i < lines.len() {
         let l = lines[i].trim();
