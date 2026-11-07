@@ -5234,6 +5234,62 @@ fn clamp_pulls_in_the_trap_helper_only_when_used() {
 }
 
 #[test]
+fn a_nested_fn_is_hoisted_and_callable() {
+    // A `fn` inside a block is an item, not a closure: it captures nothing, so
+    // it is hoisted to the top level and emitted like any other function.
+    let out = asm_no_inline("fn main() -> i64 { fn g(x: i64) -> i64 { return x + 1; } return g(1); }");
+    assert!(out.contains("rmc$nf0$g:"), "nested fn emitted:\n{out}");
+    assert!(out.contains("call rmc$nf0$g"), "nested fn called:\n{out}");
+}
+
+#[test]
+fn a_nested_fn_shadows_a_top_level_fn_of_the_same_name() {
+    // The nested `fn` wins inside its block (rustc's scoping), so it is hoisted
+    // under a distinct symbol and the call resolves to it, not the outer one.
+    let out = asm_no_inline(
+        "fn g() -> i64 { return 1; } \
+         fn main() -> i64 { fn g() -> i64 { return 2; } return g(); }",
+    );
+    assert!(out.contains("g:"), "top-level g kept:\n{out}");
+    assert!(out.contains("rmc$nf0$g:"), "nested g hoisted under a unique name:\n{out}");
+    let body = &out[out.find("main:").expect("main")..];
+    assert!(body.contains("call rmc$nf0$g"), "call resolves to the nested fn:\n{body}");
+}
+
+#[test]
+fn a_nested_fn_may_call_a_sibling_declared_later() {
+    // Items are hoisted, so the whole block sees every nested `fn` regardless of
+    // order; `a` calls `b`, declared after it.
+    let out = asm_no_inline(
+        "fn main() -> i64 { fn a() -> i64 { return b(); } fn b() -> i64 { return 9; } return a(); }",
+    );
+    let a_body = &out[out.find("rmc$nf0$a:").expect("a")..];
+    assert!(a_body.contains("call rmc$nf1$b"), "a calls the later b:\n{a_body}");
+}
+
+#[test]
+fn two_nested_fns_with_the_same_name_in_one_block_are_rejected() {
+    let err = compile_to_asm(
+        "fn main() -> i64 { fn g() -> i64 { return 1; } fn g() -> i64 { return 2; } return g(); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("defined multiple times"), "E0428-like error:\n{err}");
+}
+
+#[test]
+fn a_nested_fn_cannot_capture_a_local() {
+    // A nested `fn` is not a closure, so a local of the enclosing block is not
+    // in scope inside it (rustc's E0434).
+    let err = compile_to_asm(
+        "fn main() -> i64 { let x: i64 = 5; fn g() -> i64 { return x; } return g(); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("unknown variable `x`"), "capture rejected:\n{err}");
+}
+
+#[test]
 fn a_builtin_integer_method_on_a_struct_is_not_shadowed() {
     // A struct may still define its own `min`; the built-in only fires on an
     // `i64` receiver.

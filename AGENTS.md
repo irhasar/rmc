@@ -56,6 +56,7 @@ python3 tools/fuzz.py --mode enumpat --n 500 --seed 1
 python3 tools/fuzz.py --mode atpat --n 500 --seed 1
 python3 tools/fuzz.py --mode tuple --n 500 --seed 1
 python3 tools/fuzz.py --mode intmeth --n 500 --seed 1
+python3 tools/fuzz.py --mode nestedfn --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 
 # robustness / soundness: rmc must error cleanly, never crash
@@ -1247,6 +1248,34 @@ no call and no matching variant is reported as an associated function that must
 be called (rmc has no function values), not as an unknown enum. Calling an
 associated function with `.` (`p.new(1)`) passes the receiver as an extra
 argument, so it fails on arity — which matches rustc's E0599 closely enough.
+
+A **nested `fn`** (`fn f() { .. }` as a statement) is an item, not a closure:
+Rust forbids it from capturing an enclosing local (`E0434`), so it sees only the
+program's items. That is what makes it cheap to support: the parser hoists it to
+the top level and appends it to `Program::fns`, so sema, codegen and every later
+pass treat it as an ordinary free function with no new case. Two things make it
+behave like rustc's block scoping, both in the parser:
+
+- *Name resolution and shadowing.* `parse_block_inner` pushes a scope frame
+  filled by `scan_block_fns`, a token-index pre-scan of the block's direct
+  statements (it skips any `{ .. }`/`( .. )`/`[ .. ]` region, so a `fn` inside an
+  inner block or a body is not seen here). The pre-scan gives each nested `fn` a
+  unique symbol (`rmc$nf<n>$<name>`, keyed in `fn_at` by the `fn` keyword's token
+  index) and records `name -> unique` in the frame. Because the frame is filled
+  before the statements are parsed, a nested `fn` is in scope for its whole block
+  (a call before its declaration, or a sibling declared later, both resolve), and
+  a nested `fn` shadows a top-level one of the same name inside the block.
+  `resolve_fn_name` rewrites a call through the innermost frame that names it.
+  Two `fn`s of one name in a block is rustc's `E0428`, reported by the pre-scan.
+- *The symbol.* `$` is used, not a NUL: the in-process encoder takes any bytes,
+  but the `--binutils` path writes the label into GNU `as`, which rejects a NUL.
+  A user identifier is `[A-Za-z0-9_]`, and a method mangles to `Type$method`
+  (one `$`), so `rmc$nf<n>$name` (two `$`) cannot collide with either.
+
+The definition is parsed under its pre-scanned name (`fn_at`), so the hoisted
+function and its call sites agree. A nested `fn` captures nothing, so this is
+exactly rustc's semantics for the subset — including that a nested `fn` in a
+`loop` body is the same function every iteration (it is not re-created).
 
 An array's element type is a scalar: `i64`, `bool` or a unit enum. Nested
 arrays, arrays of structs and arrays of payload enums are rejected. A unit enum
