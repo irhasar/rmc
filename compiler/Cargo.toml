@@ -1,0 +1,22 @@
+[package]
+name = "rmc"
+version = "0.1.0"
+edition = "2021"
+description = "rmc: an experimental Rust-subset compiler that emits native x86-64 machine code directly, with no LLVM and zero external crates."
+
+[lib]
+name = "rmc"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rmc"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

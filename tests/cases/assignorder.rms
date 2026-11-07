@@ -1,0 +1,34 @@
+// Assignment evaluation order: rustc evaluates the assigned value first, then
+// the assignee place (assignment is the one expression whose operands are
+// ordered right-to-left). `li` prints its argument, so the trace shows the
+// order; the array is printed at the end so a lost or misplaced store shows up.
+fn li(t: i64) -> i64 {
+    print_i64(t);
+    return t;
+}
+
+fn main() -> i64 {
+    let mut a: [i64; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+
+    // Plain assignment: value (5) before index (1).
+    a[li(1)] = li(5);
+    // Compound assignment: value (3) before index (2); reads a[2] first.
+    a[li(2)] += li(3);
+    // Compound with a value that is itself an expression.
+    a[li(4)] = li(7) + li(8);
+    // A side-effecting value whose index also calls.
+    a[li(6)] = li(a[li(0)]);
+    // A variable index (no effect) with a call value.
+    let mut i: i64 = 3;
+    a[i] = li(41);
+
+    let mut acc: i64 = 0;
+    acc = acc + a[0] * 1;
+    acc = acc + a[1] * 2;
+    acc = acc + a[2] * 3;
+    acc = acc + a[3] * 4;
+    acc = acc + a[4] * 5;
+    acc = acc + a[6] * 7;
+    print_i64(acc);
+    return 0;
+}

@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release --manifest-path compiler/Cargo.toml
+
+      # Front-end and codegen unit tests; no `as`/`ld` needed.
+      - name: Unit tests
+        run: cargo test --manifest-path compiler/Cargo.toml
+
+      # Differential suite: compile every case with rmc and rustc, run both, and
+      # require identical stdout and exit status. Needs binutils (as/ld).
+      - name: Differential tests
+        run: python3 tests/run.py
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release --manifest-path compiler/Cargo.toml
+
+      # Malformed and adversarial input must produce a clean error, never a
+      # panic or a signal. This is the check that catches an unbounded parser
+      # recursion overflowing the stack on untrusted input. It needs no rustc.
+      - name: Robustness (malformed input must not crash)
+        run: python3 tools/fuzz.py --mode robust
+
+      # Programs rustc rejects must be rejected by rmc too. This catches the
+      # soundness class the differential run cannot see: a program rmc wrongly
+      # accepts is never run against the reference, because it does not compile.
+      - name: Rejection parity (rustc-rejected programs)
+        run: python3 tools/fuzz.py --mode reject
+
+      # Mutation fuzzing: random edits to valid programs, every mutant must
+      # fail cleanly. Needs no rustc, and reaches error paths the fixed
+      # `robust` corpus does not.
+      - name: Mutation fuzz (malformed input must not crash)
+        run: |
+          python3 tools/fuzz.py --mode mutate --n 400 --seed 1
+          python3 tools/fuzz.py --mode mutate --n 400 --seed 2
+
+      # A bounded differential fuzz run, so a divergence found by random
+      # generation fails CI rather than only failing when someone runs it by
+      # hand. Small and fixed-seed: reproducible, and fast enough to gate.
+      - name: Differential fuzz (bounded)
+        run: |
+          python3 tools/fuzz.py --mode expr --n 400 --seed 1
+          python3 tools/fuzz.py --mode expr --n 400 --seed 2
+          python3 tools/fuzz.py --mode stmt --n 400 --seed 1
+          python3 tools/fuzz.py --mode stmt --n 400 --seed 2
+          python3 tools/fuzz.py --mode shift --n 400 --seed 1

@@ -1,0 +1,22 @@
+fn main() -> i64 {
+    let mut limit: i64 = arg_i64(1);
+    if limit == 0 {
+        limit = 200000;
+    }
+    let mut flags: [i64; 200000] = [1; 200000];
+    let mut count: i64 = 0;
+    let mut i: i64 = 2;
+    while i < limit {
+        if flags[i] == 1 {
+            count = count + 1;
+            let mut j: i64 = i * i;
+            while j < limit {
+                flags[j] = 0;
+                j = j + i;
+            }
+        }
+        i = i + 1;
+    }
+    print_i64(count);
+    return 0;
+}

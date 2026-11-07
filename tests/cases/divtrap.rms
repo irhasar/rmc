@@ -1,0 +1,15 @@
+// Division and remainder whose result overflows. `i64::MIN / -1` and
+// `i64::MIN % -1` have no representable quotient, so Rust traps even without
+// overflow checks (an `idiv` would fault); rmc must trap too rather than emit a
+// silently wrong value. Division by zero traps the same way. The first two
+// prints use a constant `-1` divisor (the strength-reduced path), the last two
+// a runtime divisor (the `idiv` path), so both guards are exercised.
+fn main() -> i64 {
+    let x: i64 = arg_i64(1);
+    let d: i64 = arg_i64(2);
+    print_i64(x / -1);
+    print_i64(x % -1);
+    print_i64(x / d);
+    print_i64(x % d);
+    return 0;
+}

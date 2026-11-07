@@ -1,0 +1,33 @@
+// Values held across a call must survive it. The first few go to callee-saved
+// registers; a spill deeper than the register pool falls back to the frame.
+// Both paths must agree with rustc.
+fn mix(a: i64, b: i64) -> i64 {
+    return (a + b) + (a * b) + (a - b) + (b - a) + (a + a) + (b + b);
+}
+
+fn deep(a: i64, b: i64) -> i64 {
+    // Six partial sums are live at once, past the register pool, so the deepest
+    // ones spill to the frame.
+    return ((a + b) + (a * b)) + ((a - b) + (b - a)) + ((a + a) + (b + b))
+        + ((a * a) + (b * b)) + ((a - 1) + (b + 1)) + ((a + 2) - (b - 2));
+}
+
+fn heap(a: i64, b: i64) -> i64 {
+    // `p` and `q` stay live across the allocator calls, and a running sum is
+    // live across them too. p - p and q - q are zero, so the result is pure.
+    let p: i64 = alloc(16);
+    let q: i64 = alloc(24);
+    free(p);
+    free(q);
+    return (a + b) + (a * b) + p - p + (a - b) + (b - a) + q - q;
+}
+
+fn main() -> i64 {
+    print_i64(mix(6, 7));
+    print_i64(mix(-5, 9));
+    print_i64(deep(3, 4));
+    print_i64(deep(-8, 5));
+    print_i64(heap(6, 7));
+    print_i64(heap(-5, 9));
+    return 0;
+}

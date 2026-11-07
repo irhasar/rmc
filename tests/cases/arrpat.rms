@@ -1,0 +1,73 @@
+// Array destructuring patterns: `let [a, b] = arr;`, `for [x, y] in pairs`,
+// `match m { [a, b] => .. }`. The expansion is an index read per element:
+// `let [a, b] = arr;` becomes `let a = arr[0]; let b = arr[1];`, and a `..`
+// rest reads its trailing bindings relative to `arr.len()`.
+fn sum2(p: [i64; 2]) -> i64 {
+    let [x, y] = p;
+    return x + y;
+}
+
+fn main() -> i64 {
+    let a: [i64; 4] = [1, 2, 3, 4];
+
+    // Bind every element.
+    let [w, x, y, z] = a;
+    print_i64(w * 1000 + x * 100 + y * 10 + z);
+
+    // `_` ignores an element without binding it.
+    let [_, b, _, d] = a;
+    print_i64(b * 10 + d);
+
+    // A `..` rest absorbs the middle; leading and trailing rests bind the last
+    // and first elements of a longer array.
+    let [.., last] = a;
+    print_i64(last);
+    let [first, ..] = a;
+    print_i64(first);
+    let [f2, .., l2] = a;
+    print_i64(f2 * 10 + l2);
+
+    // Nested array patterns.
+    let m: [[i64; 2]; 2] = [[5, 6], [7, 8]];
+    let [[p, q], [r, s]] = m;
+    print_i64(p * 1000 + q * 100 + r * 10 + s);
+
+    // An element may bind a whole inner array.
+    let [head, tail] = m;
+    print_i64(head[0] * 10 + head[1] + tail[0] + tail[1]);
+
+    // `for` over an array of arrays destructures each element.
+    let mut acc: i64 = 0;
+    for [u, v] in m {
+        acc = acc + u * 10 + v;
+    }
+    print_i64(acc);
+
+    // A rest in the `for` element pattern.
+    let mut acc2: i64 = 0;
+    for [u, ..] in m {
+        acc2 = acc2 + u;
+    }
+    print_i64(acc2);
+
+    // `match` with an array pattern (irrefutable, so no `_` arm is needed).
+    let k: [i64; 2] = [9, 8];
+    match k {
+        [aa, bb] => print_i64(aa * 10 + bb),
+    }
+
+    // `if let` with an array pattern.
+    if let [aa, bb] = k {
+        print_i64(aa + bb);
+    }
+
+    // `mut` attaches to an individual element binding.
+    let [mut mm, nn] = k;
+    mm = mm + 100;
+    print_i64(mm + nn);
+
+    // A pattern may bind through a reference.
+    print_i64(sum2(k));
+
+    return 0;
+}

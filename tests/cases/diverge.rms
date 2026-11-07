@@ -1,0 +1,50 @@
+// Divergence (`!`) handling. An expression or block that cannot complete
+// normally is `!`, which unifies with any expected type. In particular a
+// `match` whose every arm diverges, or a `loop` with no `break`, may stand
+// where a value of any type is expected — as a function tail, as a `let`
+// initializer, or under a `return`. rustc accepts all of these; before this
+// case rmc rejected most of them with spurious "falls off the end" /
+// "declared type does not match initializer" errors.
+enum E { A, B }
+
+// Every arm returns: the match is `!`, so it satisfies `-> i64`.
+fn all_return(e: E) -> i64 {
+    match e {
+        E::A => { return 1; }
+        E::B => { return 2; }
+    }
+}
+
+// A mix of a value arm and a diverging arm.
+fn value_or_return(e: E) -> i64 {
+    match e {
+        E::A => 10,
+        E::B => { return 20; }
+    }
+}
+
+// A diverging `if`/`else` as a `let` initializer.
+fn let_from_diverge(c: bool) -> i64 {
+    let x: i64 = if c { return 1; } else { return 2; };
+    return x;
+}
+
+// A diverging match under an explicit `return`.
+fn return_diverge(e: E) -> i64 {
+    return match e {
+        E::A => { return 3; }
+        E::B => { return 4; }
+    };
+}
+
+fn main() -> i64 {
+    print_i64(all_return(E::A));
+    print_i64(all_return(E::B));
+    print_i64(value_or_return(E::A));
+    print_i64(value_or_return(E::B));
+    print_i64(let_from_diverge(true));
+    print_i64(let_from_diverge(false));
+    print_i64(return_diverge(E::A));
+    print_i64(return_diverge(E::B));
+    return 0;
+}

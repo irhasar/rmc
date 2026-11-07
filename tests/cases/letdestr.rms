@@ -1,0 +1,92 @@
+// `let` destructuring: `let S { f, g: h, i: _, .. } = e;` binds the named
+// fields as fresh locals in the enclosing block. The scrutinee is evaluated
+// once into a hidden temporary and each binding is a field read of it, so a
+// non-struct scrutinee is a type error, a `&S` scrutinee auto-derefs, and the
+// bindings stay visible for the rest of the block.
+
+struct P { x: i64, y: i64 }
+struct Inner { a: i64, b: i64 }
+struct Q { i: Inner, y: i64 }
+struct Arr { v: [i64; 3], n: i64 }
+
+// A side effect per call, to show the scrutinee runs exactly once.
+fn side(k: i64) -> i64 {
+    print_i64(k);
+    return k * 2;
+}
+
+fn mkp(k: i64) -> P {
+    print_i64(k);
+    return P { x: k, y: k + 1 };
+}
+
+fn first(p: P) -> i64 {
+    let P { x, .. } = p;
+    return x;
+}
+
+fn main() -> i64 {
+    let p: P = P { x: 3, y: 4 };
+
+    // Shorthand binding and a renamed one.
+    let P { x, y: z } = p;
+    print_i64(x * 10 + z);
+
+    // An ignored field, `..`, and a pattern that binds nothing at all.
+    let P { x: a, y: _ } = p;
+    print_i64(a);
+    let P { y, .. } = p;
+    print_i64(y);
+    let P { .. } = p;
+
+    // A type annotation on the scrutinee temporary.
+    let P { x, y }: P = p;
+    print_i64(x + y);
+
+    // `mut` is per binding, so each field may be written independently.
+    let P { mut x, y: mut w } = p;
+    x = 100;
+    w = 200;
+    print_i64(x + w);
+
+    // The bindings shadow and scope like any other `let`.
+    let P { x, y } = P { x: 7, y: 8 };
+    print_i64(x * 10 + y);
+    if true {
+        let P { x, .. } = p;
+        print_i64(x + 1000);
+    }
+    print_i64(x);
+
+    // The scrutinee is evaluated exactly once.
+    let P { x, y } = mkp(50);
+    print_i64(x + y);
+
+    // A struct literal initialiser also runs its field expressions once.
+    let P { x, y } = P { x: side(1), y: side(2) };
+    print_i64(x + y);
+
+    // Through a reference: the field read auto-derefs.
+    let r: &P = &p;
+    let P { x, y } = r;
+    print_i64(x * 100 + y);
+
+    // A struct-typed field is destructured in turn.
+    let q: Q = Q { i: Inner { a: 5, b: 6 }, y: 7 };
+    let Q { i, y } = q;
+    let Inner { a, b } = i;
+    print_i64(a * 1000 + b * 100 + y);
+
+    // An array field binds as an array.
+    let ar: Arr = Arr { v: [4, 5, 6], n: 9 };
+    let Arr { v, n } = ar;
+    print_i64(v[0] + v[1] + v[2] + n);
+
+    // A call whose result is destructured.
+    print_i64(first(P { x: 11, y: 22 }));
+
+    // `let S { .. } = e;` binds nothing but still evaluates the scrutinee.
+    let P { .. } = P { x: side(7), y: side(8) };
+
+    return 0;
+}

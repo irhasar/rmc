@@ -1,0 +1,105 @@
+// Built-in `i64` methods: `abs`, `min`, `max`, `signum`.
+const MIN: i64 = -9223372036854775808;
+
+fn pick(x: i64, y: i64) -> i64 {
+    return x.min(y) + x.max(y);
+}
+
+fn main() -> i64 {
+    let a: i64 = -7;
+    let b: i64 = 3;
+    print_i64(a.abs());
+    print_i64(b.abs());
+    print_i64(a.min(b));
+    print_i64(a.max(b));
+    print_i64(b.min(a));
+    print_i64(b.max(a));
+    print_i64(a.signum());
+    print_i64(b.signum());
+    let z: i64 = 0;
+    print_i64(z.signum());
+    // A tie returns the receiver, for both `min` and `max`.
+    let c: i64 = 4;
+    print_i64(c.min(4));
+    print_i64(c.max(4));
+    // `i64::MIN`: `abs` maps to itself, `signum` is -1.
+    let m: i64 = -9223372036854775808;
+    print_i64(m.abs());
+    print_i64(m.signum());
+    // The same through a `const`, which the parser folds: `abs` must not be
+    // rejected as a compile-time neg overflow.
+    print_i64(MIN.abs());
+    print_i64(MIN.signum());
+    print_i64(MIN.min(0));
+    print_i64(MIN.max(0));
+    // In a helper function, and chained.
+    print_i64(pick(-5, 9));
+    print_i64(a.abs().min(2));
+    print_i64(a.abs().max(100).signum());
+    // Through a reference receiver, which auto-derefs.
+    let r = &a;
+    print_i64(r.abs());
+    // In a loop.
+    let mut s = 0;
+    let mut i: i64 = -3;
+    while i < 3 {
+        s += i.abs();
+        i += 1;
+    }
+    print_i64(s);
+
+    // `div_euclid` / `rem_euclid`: the quotient rounded toward the
+    // mathematical value and the remainder in `[0, |y|)`. `i64::MIN`
+    // as the divisor must not overflow the `r - MIN` arm, which never
+    // runs.
+    print_i64(a.div_euclid(b));
+    print_i64(a.rem_euclid(b));
+    print_i64(b.div_euclid(a));
+    print_i64(b.rem_euclid(a));
+    print_i64(a.div_euclid(-b));
+    print_i64(a.rem_euclid(-b));
+    print_i64(b.div_euclid(-a));
+    print_i64(b.rem_euclid(-a));
+    print_i64(m.div_euclid(b));
+    print_i64(m.rem_euclid(b));
+    print_i64(a.rem_euclid(m));
+    print_i64(a.div_euclid(m));
+    print_i64(b.rem_euclid(m));
+    print_i64(b.div_euclid(m));
+    print_i64(a.div_euclid(MIN));
+    print_i64(a.rem_euclid(MIN));
+    print_i64(r.div_euclid(b));
+    print_i64(r.rem_euclid(b));
+    // `is_positive` / `is_negative` yield `bool`; `0` is neither, `i64::MIN`
+    // is negative and not positive.
+    print_i64(a.is_negative() as i64);
+    print_i64(a.is_positive() as i64);
+    print_i64(b.is_positive() as i64);
+    print_i64(z.is_positive() as i64);
+    print_i64(z.is_negative() as i64);
+    print_i64(m.is_negative() as i64);
+    print_i64(m.is_positive() as i64);
+    print_i64(MIN.is_negative() as i64);
+    print_i64(r.is_positive() as i64);
+    if a.is_negative() {
+        print_i64(1);
+    } else {
+        print_i64(0);
+    }
+
+    // `clamp`: `x` bounded to `[lo, hi]`, a tie with either bound returning
+    // that bound. `min > max` is a run-time panic, so every call here has
+    // `lo <= hi`; `MIN` as a bound must not overflow the comparisons.
+    print_i64(a.clamp(-10, 10));
+    print_i64(a.clamp(-5, 10));
+    print_i64(a.clamp(-10, -8));
+    print_i64(a.clamp(a, b));
+    print_i64(b.clamp(a, b));
+    print_i64(z.clamp(a, b));
+    print_i64(MIN.clamp(MIN, b));
+    print_i64(b.clamp(MIN, MIN));
+    print_i64(a.clamp(b, b));
+    print_i64(pick(-5, 9).clamp(0, 100));
+    print_i64(a.abs().clamp(0, 3));
+    return 0;
+}

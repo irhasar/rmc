@@ -1,0 +1,82 @@
+// A `match` that names every variant of an enum (no `_`) is exhaustive, so it
+// may be used as a value even though it desugars to a chain of `if`s with no
+// final `else`. rmc used to reject that with a spurious "`if` without `else`"
+// error. A non-exhaustive match used as a value is still an error, as in Rust.
+enum Color { Red, Green, Blue }
+
+fn name(c: Color) -> i64 {
+    return match c {
+        Color::Red => 10,
+        Color::Green => 20,
+        Color::Blue => 30,
+    };
+}
+
+enum Opt { None, Some(i64) }
+
+fn get(o: Opt, d: i64) -> i64 {
+    // Exhaustive over both variants, payload and unit.
+    return match o {
+        Opt::Some(v) => v,
+        Opt::None => d,
+    };
+}
+
+fn main() -> i64 {
+    // Value position, every variant, in declaration order.
+    print_i64(name(Color::Red));
+    print_i64(name(Color::Green));
+    print_i64(name(Color::Blue));
+
+    // Value position with the arms in a different order.
+    let c: Color = Color::Blue;
+    let t: i64 = match c {
+        Color::Blue => 3,
+        Color::Red => 1,
+        Color::Green => 2,
+    };
+    print_i64(t);
+
+    // Exhaustive match in a `let`, as a `return` value, and as a call argument.
+    let o: Opt = Opt::Some(7);
+    print_i64(get(o, 0));
+    print_i64(get(Opt::None, 99));
+
+    // A payload read through a reference and matched exhaustively.
+    let r: &Opt = &o;
+    let via_ref: i64 = match *r {
+        Opt::Some(v) => v,
+        Opt::None => 0 - 1,
+    };
+    print_i64(via_ref);
+
+    // Exhaustive match inside a loop, re-evaluated each iteration.
+    let mut acc: i64 = 0;
+    let mut i: i64 = 0;
+    while i < 6 {
+        let col: Color = match i % 3 {
+            0 => Color::Red,
+            1 => Color::Green,
+            _ => Color::Blue,
+        };
+        acc = acc + match col {
+            Color::Red => 1,
+            Color::Green => 2,
+            Color::Blue => 4,
+        };
+        i = i + 1;
+    }
+    print_i64(acc);
+
+    // A nested exhaustive match as an arm body.
+    let nested: i64 = match c {
+        Color::Red => 100,
+        Color::Green => 200,
+        Color::Blue => match o {
+            Opt::Some(v) => v,
+            Opt::None => 0,
+        },
+    };
+    print_i64(nested);
+    return 0;
+}

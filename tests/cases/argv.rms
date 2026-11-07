@@ -1,0 +1,14 @@
+// Reads integers from argv. Driven by tests/args.json, which passes the same
+// argument vectors to both the rmc and rustc build of this program.
+fn main() -> i64 {
+    let mut i: i64 = 1;
+    let mut s: i64 = 0;
+    while i <= 4 {
+        let v: i64 = arg_i64(i);
+        print_i64(v);
+        s = s + v;
+        i = i + 1;
+    }
+    print_i64(s);
+    return 0;
+}

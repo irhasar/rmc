@@ -1,0 +1,35 @@
+// Integer Mandelbrot-ish escape counter; heavy on 64-bit multiply and divide.
+fn main() -> i64 {
+    let mut size: i64 = arg_i64(1);
+    if size == 0 {
+        size = 400;
+    }
+    let mut acc: i64 = 0;
+    let mut y: i64 = 0;
+    while y < size {
+        let mut x: i64 = 0;
+        while x < size {
+            let mut zr: i64 = 0;
+            let mut zi: i64 = 0;
+            let cr: i64 = x - 200;
+            let ci: i64 = y - 200;
+            let mut i: i64 = 0;
+            while i < 50 {
+                let zr2: i64 = (zr * zr) / 1000;
+                let zi2: i64 = (zi * zi) / 1000;
+                if zr2 + zi2 > 4000 {
+                    break;
+                }
+                let nzi: i64 = (2 * zr * zi) / 1000 + ci;
+                zr = zr2 - zi2 + cr;
+                zi = nzi;
+                i = i + 1;
+            }
+            acc = acc + i;
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    print_i64(acc);
+    return 0;
+}

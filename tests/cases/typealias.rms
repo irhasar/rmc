@@ -1,0 +1,65 @@
+// `type` aliases: a transparent name for a type. A use is rewritten to the
+// target at parse time, so an alias never reaches layout or codegen and a
+// struct alias is the struct itself. An alias may be used before it is
+// declared, and one alias may name another.
+type N = i64;
+
+fn main() -> i64 {
+    // A scalar alias in a `let`, a parameter and a return type.
+    let a: N = 5;
+    print_i64(a + 1);
+    print_i64(add(2, 3));
+    // A forward reference: `Later` is declared after this use.
+    let f: Later = 9;
+    print_i64(f);
+    // A chain: `A` names `B`, which names `i64`.
+    let c: A = 7;
+    print_i64(c);
+    // A struct alias is the struct itself, with the same layout and fields.
+    let p: Pt = P { x: 4, y: 5 };
+    print_i64(p.x + p.y);
+    // An alias for a tuple and for an array, the latter with a `const` length.
+    let t: Pair = (3, 6);
+    print_i64(t.0 * t.1);
+    let arr: Arr = [1, 2, 3, 4];
+    print_i64(arr[0] + arr[3]);
+    // An alias behind a reference and in a cast.
+    let x: N = 11;
+    let r: &N = &x;
+    print_i64(*r);
+    print_i64((300 as N) - 300);
+    // An enum alias is the enum itself, matched by its variants.
+    let e: E = Ev::B;
+    match e {
+        Ev::A => print_i64(0),
+        Ev::B => print_i64(2),
+    }
+    // A nested-array alias, indexed twice.
+    let grid: Grid = [[1, 2], [3, 4]];
+    print_i64(grid[1][0]);
+    return 0;
+}
+
+fn add(a: N, b: N) -> N {
+    return a + b;
+}
+
+type Later = i64;
+type A = B;
+type B = i64;
+
+struct P {
+    x: i64,
+    y: i64,
+}
+
+enum Ev {
+    A,
+    B,
+}
+
+type Pt = P;
+type Pair = (i64, i64);
+type Arr = [i64; 4];
+type E = Ev;
+type Grid = [[i64; 2]; 2];
