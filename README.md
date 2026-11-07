@@ -181,7 +181,9 @@ and a tuple behind a reference, used as parameter and return types), `nestedfn`
 for nested `fn` items (hoisting, a call before the declaration, a sibling called
 after it, a nested `fn` inside another body, a nested `fn` shadowing a top-level
 one of the same name, and the shadowed name called to confirm the inner one
-wins), and
+wins), `typealias` for `type` aliases (a scalar, tuple, array and struct alias,
+an alias as a parameter and return type, one alias naming another, an alias used
+before it is declared, an alias behind a reference and in a cast), and
 `order` for assignment evaluation order (a
 side-effecting index and value on both `=` and every compound operator, the
 shapes `stmt` never assigns through). `shift` drives `<<`, `>>` and the compound
@@ -198,6 +200,7 @@ python3 tools/fuzz.py --mode opt --n 500 --seed 1
 python3 tools/fuzz.py --mode arith --n 500 --seed 1
 python3 tools/fuzz.py --mode nest --n 500 --seed 1
 python3 tools/fuzz.py --mode nestedfn --n 500 --seed 1
+python3 tools/fuzz.py --mode typealias --n 500 --seed 1
 python3 tools/fuzz.py --mode pat --n 500 --seed 1
 python3 tools/fuzz.py --mode order --n 500 --seed 1
 python3 tools/fuzz.py --mode shift --n 500 --seed 1
@@ -289,7 +292,9 @@ the byte length); array `.len()` (a compile-time constant); built-in `i64` metho
 desugared to operators, so `i64::MIN.abs()` maps to itself as in `rustc -O`);
 `mut` enforcement and definite
 initialisation; `const` items (folded to a value and substituted at every use,
-including array lengths and `match` patterns); references (`&T` / `&mut T`, `&e`, `*e`,
+including array lengths and `match` patterns); `type` aliases (a transparent
+second name for any type, resolved at parse time, usable before declaration);
+references (`&T` / `&mut T`, `&e`, `*e`,
 with auto-deref for `r.x`, `r[i]` and `r.m()`, and `&self` receivers); methods
 (`self` / `&self` / `&mut self`) and associated functions (`fn name(..)` with no
 `self`, called as `Type::name(..)`, the constructor idiom); nested `fn` items (a

@@ -76,6 +76,10 @@ pub struct Parser {
     /// Monotonic counter for the unique names of hoisted nested functions, so
     /// two `fn`s of the same name in different blocks get distinct symbols.
     nf_counter: u32,
+    /// `type` aliases, name -> target, collected by `prescan` so an alias may be
+    /// used before it is declared. A use is rewritten to its target at parse
+    /// time, so no later pass sees the alias and layout is unaffected.
+    aliases: std::collections::HashMap<String, Type>,
 }
 
 /// The deepest expression, block or type nesting the parser accepts. Deeply
@@ -116,6 +120,7 @@ impl Parser {
             fn_scopes: vec![Vec::new()],
             fn_at: std::collections::HashMap::new(),
             nf_counter: 0,
+            aliases: std::collections::HashMap::new(),
         }
     }
 
@@ -215,11 +220,12 @@ impl Parser {
                 Some(Tok::Struct) => structs.push(self.parse_struct()?),
                 Some(Tok::Enum) => enums.push(self.parse_enum()?),
                 Some(Tok::Const) => consts.push(self.parse_const()?),
+                Some(Tok::Type) => self.parse_type_alias()?,
                 Some(Tok::Fn) => fns.push(self.parse_fn()?),
                 Some(Tok::Impl) => self.parse_impl(&mut fns)?,
                 other => {
                     return Err(format!(
-                        "at byte {}: expected `fn`, `struct`, `enum`, `const` or `impl`, found {}",
+                        "at byte {}: expected `fn`, `struct`, `enum`, `const`, `type` or `impl`, found {}",
                         self.pos(),
                         other.map(|x| x.describe()).unwrap_or_else(|| "end of input".into())
                     ))
@@ -317,11 +323,32 @@ impl Parser {
     fn prescan(&mut self) -> PResult<()> {
         let saved = self.i;
         let mut items: Vec<ConstDef> = Vec::new();
+        // `type` aliases are deferred: (name, token index of the target). Their
+        // targets are parsed after `resolve_consts`, so a `[T; N]` target sees
+        // the constants, and after the first pass so `type A = B;` may name a
+        // later `type B`.
+        let mut alias_spans: Vec<(String, usize)> = Vec::new();
+        // Struct and enum names, for the type-namespace collision check below.
+        let mut struct_names: Vec<String> = Vec::new();
+        let mut enum_names: Vec<String> = Vec::new();
         self.i = 0;
         loop {
             match self.peek() {
                 None => break,
                 Some(Tok::Const) => items.push(self.parse_const()?),
+                Some(Tok::Type) => {
+                    // `type NAME = TYPE;`. The target is not parsed yet: a
+                    // `[T; N]` target needs the constant values, which are still
+                    // being collected. Record the name and where its target
+                    // starts, skip to the `;`, and parse the target after
+                    // `resolve_consts` (below) so it sees them.
+                    self.i += 1;
+                    let name = self.expect_ident()?;
+                    self.expect(Tok::Eq)?;
+                    let start = self.i;
+                    self.skip_to_semi()?;
+                    alias_spans.push((name, start));
+                }
                 Some(Tok::Struct) => {
                     // Record the field names, then skip the body. Only a braced
                     // struct has named fields to collect; a later `struct S { .. }`
@@ -334,6 +361,9 @@ impl Parser {
                     } else {
                         None
                     };
+                    if let Some(n) = &name {
+                        struct_names.push(n.clone());
+                    }
                     if self.peek() == Some(&Tok::LBrace) {
                         self.i += 1;
                         let mut fields = std::collections::HashSet::new();
@@ -370,9 +400,10 @@ impl Parser {
                     }
                 }
                 Some(Tok::Enum) => {
-                    // Skip `Name` then a balanced `{ .. }` body.
+                    // Record the name, then skip a balanced `{ .. }` body.
                     self.i += 1;
-                    if matches!(self.peek(), Some(Tok::Ident(_))) {
+                    if let Some(Tok::Ident(n)) = self.peek() {
+                        enum_names.push(n.clone());
                         self.i += 1;
                     }
                     self.skip_balanced(Tok::LBrace, Tok::RBrace)?;
@@ -410,7 +441,57 @@ impl Parser {
         }
         self.i = saved;
         self.resolve_consts(&items);
+        // Parse each alias target now that the constants are known. Two passes
+        // let `type A = B; type B = i64;` resolve: the first lays down every
+        // direct target, the second fills any left as a bare `Named` (a target
+        // that named a not-yet-parsed alias).
+        for (name, start) in &alias_spans {
+            self.i = *start;
+            let ty = self.parse_type()?;
+            self.aliases.insert(name.clone(), ty);
+        }
+        for (name, _) in &alias_spans {
+            if let Some(t) = self.aliases.get(name).cloned() {
+                let expanded = self.expand_alias_ty(&t, 0)?;
+                self.aliases.insert(name.clone(), expanded);
+            }
+        }
+        // A `type` shares the type namespace with a struct and an enum, so a
+        // collision is an error (rustc's E0428). It does *not* collide with a
+        // `const` or a `fn`, which live in the value namespace. rmc keeps a
+        // single map for the target, so a duplicate `type` is detected by the
+        // count rather than by the map's length.
+        let mut alias_names: Vec<&str> = alias_spans.iter().map(|(n, _)| n.as_str()).collect();
+        alias_names.sort_unstable();
+        if let Some(dup) = alias_names.windows(2).find(|w| w[0] == w[1]) {
+            return Err(format!("the name `{}` is defined multiple times", dup[0]));
+        }
+        for n in &alias_names {
+            if struct_names.iter().any(|s| s == n) || enum_names.iter().any(|e| e == n) {
+                return Err(format!("the name `{}` is defined multiple times", n));
+            }
+        }
+        self.i = saved;
         Ok(())
+    }
+
+    /// Advance past the next `;` at bracket depth 0, used to skip an alias
+    /// target in the pre-scan before it is parsed.
+    fn skip_to_semi(&mut self) -> PResult<()> {
+        let mut depth = 0i32;
+        while let Some(t) = self.peek() {
+            match t {
+                Tok::LParen | Tok::LBracket => depth += 1,
+                Tok::RParen | Tok::RBracket => depth -= 1,
+                Tok::Semi if depth <= 0 => {
+                    self.i += 1;
+                    return Ok(());
+                }
+                _ => {}
+            }
+            self.i += 1;
+        }
+        Err(format!("at byte {}: unexpected end of input", self.pos()))
     }
 
     /// Advance past a balanced `open .. close` group, starting at `open`.
@@ -448,6 +529,41 @@ impl Parser {
         let value = self.parse_expr()?;
         self.expect(Tok::Semi)?;
         Ok(ConstDef { name, ty, value })
+    }
+
+    /// Rewrite every alias name in `t` to its target, so no later pass sees an
+    /// alias. `depth` bounds a cycle (`type A = B; type B = A;`), which would
+    /// otherwise expand forever; a cycle is reported as an error, matching
+    /// rustc's E0391 rather than hanging or emitting a wrong layout. The limit
+    /// is generous because each step is one named type.
+    fn expand_alias_ty(&self, t: &Type, depth: u32) -> PResult<Type> {
+        if depth > 64 {
+            return Err("type alias cycle detected".into());
+        }
+        match t {
+            Type::Named(n) => match self.aliases.get(n) {
+                Some(target) => self.expand_alias_ty(target, depth + 1),
+                None => Ok(t.clone()),
+            },
+            Type::Ref(inner, m) => Ok(Type::Ref(Box::new(self.expand_alias_ty(inner, depth + 1)?), *m)),
+            Type::Array(elem, n) => Ok(Type::Array(Box::new(self.expand_alias_ty(elem, depth + 1)?), *n)),
+            _ => Ok(t.clone()),
+        }
+    }
+
+    /// `type NAME = TYPE;`. The target is parsed here (aliases in it expanded by
+    /// `parse_type_inner`) and stored; a use is rewritten to it by
+    /// `expand_alias_ty`, so the alias never reaches sema. The name was
+    /// registered by `prescan`, so it may be used before this point, which means
+    /// `type A = B;` and `type B = i64;` resolve in either order.
+    fn parse_type_alias(&mut self) -> PResult<()> {
+        self.expect(Tok::Type)?;
+        let name = self.expect_ident()?;
+        self.expect(Tok::Eq)?;
+        let ty = self.parse_type()?;
+        self.expect(Tok::Semi)?;
+        self.aliases.insert(name, ty);
+        Ok(())
     }
 
     /// Evaluate every `const` item into `self.consts`/`self.const_bools`, to a
@@ -851,7 +967,10 @@ impl Parser {
                     Tok::Ident(s) => s,
                     _ => unreachable!(),
                 };
-                Ok(Type::Named(name))
+                // An alias is transparent: a use is rewritten to its target here,
+                // at parse time, so no later pass sees it. A struct name is not an
+                // alias and stays `Type::Named` for sema to lay out.
+                self.expand_alias_ty(&Type::Named(name), 0)
             }
             other => Err(format!(
                 "at byte {}: expected a type, found {}",

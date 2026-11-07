@@ -3190,6 +3190,25 @@ def reject_corpus():
             "fn main() -> i64 { let x = 3; match x { n @ 1 | 2 => return 1, _ => return 0 } }\n",
             "fn main() { let x = 3; let _ = match x { n @ 1 | 2 => 1, _ => 0 }; }\n",
         ),
+        # A cyclic `type` alias is E0391, not a hang; a duplicate `type` and a
+        # `type` that collides with a struct are E0428. rmc resolves aliases in
+        # the parser, so each must be caught there rather than reaching sema.
+        "type_alias_cycle": (
+            "type A = B; type B = A;\nfn main() -> i64 { return 0; }\n",
+            "type A = B; type B = A;\nfn main() {}\n",
+        ),
+        "type_alias_duplicate": (
+            "type N = i64; type N = bool;\nfn main() -> i64 { return 0; }\n",
+            "type N = i64; type N = bool;\nfn main() {}\n",
+        ),
+        "type_alias_struct_collision": (
+            "struct S { x: i64 } type S = i64;\nfn main() -> i64 { return 0; }\n",
+            "struct S { x: i64 } type S = i64;\nfn main() {}\n",
+        ),
+        "type_alias_enum_collision": (
+            "enum E { A } type E = i64;\nfn main() -> i64 { return 0; }\n",
+            "enum E { A } type E = i64;\nfn main() {}\n",
+        ),
     }
 
 
@@ -3481,9 +3500,121 @@ def gen_nestedfn_program(rng):
     return "\n".join(lines_rms), "\n".join(lines_rs)
 
 
+def gen_typealias_program(rng):
+    """Programs that name types through `type` aliases. An alias is transparent,
+    so a scalar alias is the scalar, a struct alias is the struct (same layout
+    and fields), an alias may be used before it is declared, and one alias may
+    name another. Every alias target here is something rmc and rustc agree on;
+    the values printed are fixed by the generator, so a wrong expansion shows up
+    as a value difference, not only a compile error."""
+    # A struct and its alias, plus a tuple and an array alias. The array length
+    # is a literal because rustc's array length must be `usize`.
+    arr_len = rng.randint(1, 5)
+    struct_name = "S"
+    lines_rms = [
+        "type N = i64;",
+        "type Flag = bool;",
+        f"struct {struct_name} {{ x: i64, y: i64 }}",
+        f"type SA = {struct_name};",
+        "type Tup = (i64, i64);",
+        "type Chain = N;",
+        f"type Arr = [i64; {arr_len}];",
+        "enum Ev { A, B, C }",
+        "type EA = Ev;",
+        "type Grid = [[i64; 2]; 2];",
+        "fn sum(a: N, b: Chain) -> N { return a + b; }",
+        "fn main() -> i64 {",
+    ]
+    lines_rs = [
+        "type N = i64;",
+        "type Flag = bool;",
+        f"struct {struct_name} {{ x: i64, y: i64 }}",
+        f"type SA = {struct_name};",
+        "type Tup = (i64, i64);",
+        "type Chain = N;",
+        f"type Arr = [i64; {arr_len}];",
+        "enum Ev { A, B, C }",
+        "type EA = Ev;",
+        "type Grid = [[i64; 2]; 2];",
+        "fn sum(a: N, b: Chain) -> N { return a + b; }",
+        "fn main() {",
+    ]
+
+    a = rng.randint(-1000, 1000)
+    b = rng.randint(-1000, 1000)
+    lines_rms.append(f"    let a: N = {a};")
+    lines_rs.append(f"    let a: N = {a};")
+    lines_rms.append(f"    let b: Chain = {b};")
+    lines_rs.append(f"    let b: Chain = {b};")
+    lines_rms.append("    print_i64(sum(a, b));")
+    lines_rs.append('    println!("{}", sum(a, b));')
+
+    flag = rng.choice(["true", "false"])
+    lines_rms.append(f"    let f: Flag = {flag};")
+    lines_rs.append(f"    let f: Flag = {flag};")
+    lines_rms.append("    if f { print_i64(1); } else { print_i64(0); }")
+    lines_rs.append('    if f { println!("{}", 1); } else { println!("{}", 0); }')
+
+    sx, sy = rng.randint(-50, 50), rng.randint(-50, 50)
+    lines_rms.append(f"    let s: SA = {struct_name} {{ x: {sx}, y: {sy} }};")
+    lines_rs.append(f"    let s: SA = {struct_name} {{ x: {sx}, y: {sy} }};")
+    lines_rms.append("    print_i64(s.x * 100 + s.y);")
+    lines_rs.append('    println!("{}", s.x * 100 + s.y);')
+
+    t0, t1 = rng.randint(-20, 20), rng.randint(-20, 20)
+    lines_rms.append(f"    let t: Tup = ({t0}, {t1});")
+    lines_rs.append(f"    let t: Tup = ({t0}, {t1});")
+    lines_rms.append("    print_i64(t.0 * 10 + t.1);")
+    lines_rs.append('    println!("{}", t.0 * 10 + t.1);')
+
+    elems = [rng.randint(-100, 100) for _ in range(arr_len)]
+    init = ", ".join(str(e) for e in elems)
+    lines_rms.append(f"    let arr: Arr = [{init}];")
+    lines_rs.append(f"    let arr: Arr = [{init}];")
+    lines_rms.append(f"    print_i64(arr[0] + arr[{arr_len - 1}]);")
+    lines_rs.append(f'    println!("{{}}", arr[0] + arr[{arr_len - 1}]);')
+
+    # A reference to an alias-typed local, and an alias in a cast.
+    lines_rms.append("    let r: &N = &a;")
+    lines_rs.append("    let r: &N = &a;")
+    lines_rms.append("    print_i64(*r + 7);")
+    lines_rs.append('    println!("{}", *r + 7);')
+    lines_rms.append("    print_i64((a as N) - 1);")
+    lines_rs.append('    println!("{}", (a as N) - 1);')
+
+    # An enum alias: the alias is the enum, matched by its variants.
+    variant, _ = rng.choice([("Ev::A", 1), ("Ev::B", 2), ("Ev::C", 3)])
+    lines_rms.append(f"    let e: EA = {variant};")
+    lines_rs.append(f"    let e: EA = {variant};")
+    lines_rms.append(
+        "    match e { Ev::A => print_i64(1), Ev::B => print_i64(2), Ev::C => print_i64(3) }"
+    )
+    lines_rs.append(
+        '    match e { Ev::A => println!("{}", 1), Ev::B => println!("{}", 2), Ev::C => println!("{}", 3) }'
+    )
+
+    # A nested-array alias, indexed twice.
+    g = [[rng.randint(-9, 9) for _ in range(2)] for _ in range(2)]
+    lines_rms.append(f"    let grid: Grid = [[{g[0][0]}, {g[0][1]}], [{g[1][0]}, {g[1][1]}]];")
+    lines_rs.append(f"    let grid: Grid = [[{g[0][0]}, {g[0][1]}], [{g[1][0]}, {g[1][1]}]];")
+    lines_rms.append("    print_i64(grid[1][0] + grid[0][1]);")
+    lines_rs.append('    println!("{}", grid[1][0] + grid[0][1]);')
+
+    # A use of an alias declared after `main` (the pre-scan registers it first).
+    later = rng.randint(-1000, 1000)
+    lines_rms.append(f"    let z: Later = {later};")
+    lines_rs.append(f"    let z: Later = {later};")
+    lines_rms.append("    print_i64(z);")
+    lines_rs.append('    println!("{}", z);')
+
+    lines_rms += ["    return 0;", "}", "type Later = i64;"]
+    lines_rs += ["}", "type Later = i64;"]
+    return "\n".join(lines_rms), "\n".join(lines_rs)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "intmeth", "nestedfn", "robust", "reject", "mutate"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "intmeth", "nestedfn", "typealias", "robust", "reject", "mutate"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -3537,7 +3668,8 @@ def main():
            "atpat": gen_atpat_program,
            "tuple": gen_tuple_program,
            "intmeth": gen_intmeth_program,
-           "nestedfn": gen_nestedfn_program}[args.mode]
+           "nestedfn": gen_nestedfn_program,
+           "typealias": gen_typealias_program}[args.mode]
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus
     # suite; a fuzz program is otherwise only checked with every pass on, so a
