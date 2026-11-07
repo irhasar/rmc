@@ -3413,9 +3413,77 @@ def run_mutate(n, seed, keep=None):
     return 1 if failures else 0
 
 
+def gen_nestedfn_program(rng):
+    """Programs with nested `fn` items. A nested `fn` is hoisted to the top
+    level, so a call must resolve to the innermost declaration of that name
+    (rustc's block scoping), a sibling declared later must be callable, and a
+    same-named top-level `fn` must be shadowed inside the block. Each program
+    prints a fixed sequence of results, so a wrong resolution shows up as a
+    value difference rather than only a compile error."""
+    # A nested `fn` of each shape, and its rustc spelling (identical body, so a
+    # value difference is a resolution bug, not a codegen one).
+    shapes = [
+        ("add1", "x + 1", "x + 1"),
+        ("dbl", "x * 2", "x * 2"),
+        ("sub3", "x - 3", "x - 3"),
+        ("mix", "(x * 5 + 2) % 13", "(x * 5 + 2) % 13"),
+    ]
+    # A top-level `fn` whose name some nested `fn` may shadow.
+    shadow_name = rng.choice(["add1", "dbl", "sub3", "mix"])
+    # rustc spelling of the top-level function, distinct from every nested body.
+    top_body = "x - 100"
+
+    lines_rms = [
+        f"fn {shadow_name}(x: i64) -> i64 {{ return {top_body}; }}",
+        "fn main() -> i64 {",
+    ]
+    lines_rs = [
+        f"fn {shadow_name}(x: i64) -> i64 {{ {top_body} }}",
+        "fn main() {",
+    ]
+
+    # 1..3 nested fns declared directly in `main`, each with a distinct name.
+    chosen = rng.sample(shapes, rng.randint(1, 3))
+    for (name, body_rms, body_rs) in chosen:
+        lines_rms.append(f"    fn {name}(x: i64) -> i64 {{ return {body_rms}; }}")
+        lines_rs.append(f"    fn {name}(x: i64) -> i64 {{ {body_rs} }}")
+
+    # A nested fn that calls a sibling declared after it (hoisting), and one
+    # nested inside another fn's body.
+    lines_rms.append("    fn call_later(x: i64) -> i64 { return later(x) + 1; }")
+    lines_rs.append("    fn call_later(x: i64) -> i64 { later(x) + 1 }")
+    lines_rms.append("    fn outer(x: i64) -> i64 {")
+    lines_rs.append("    fn outer(x: i64) -> i64 {")
+    lines_rms.append("        fn inner(y: i64) -> i64 { return y * 7; }")
+    lines_rs.append("        fn inner(y: i64) -> i64 { y * 7 }")
+    lines_rms.append("        return inner(x) - 2;")
+    lines_rs.append("        inner(x) - 2")
+    lines_rms.append("    }")
+    lines_rs.append("    }")
+    lines_rms.append("    fn later(x: i64) -> i64 { return x + 50; }")
+    lines_rs.append("    fn later(x: i64) -> i64 { x + 50 }")
+
+    # Call every name, so a mis-resolved call shows up as a wrong value.
+    calls = [name for (name, _, _) in chosen] + ["call_later", "outer"]
+    for _ in range(rng.randint(3, 8)):
+        name = rng.choice(calls)
+        v = rng.randint(-500, 500)
+        lines_rms.append(f"    print_i64({name}({v}));")
+        lines_rs.append(f'    println!("{{}}", {name}({v}));')
+    # Also call the (possibly shadowed) top-level name to confirm the nested one
+    # wins when it exists.
+    if shadow_name in calls:
+        lines_rms.append(f"    print_i64({shadow_name}(7));")
+        lines_rs.append(f'    println!("{{}}", {shadow_name}(7));')
+
+    lines_rms += ["    return 0;", "}"]
+    lines_rs += ["}"]
+    return "\n".join(lines_rms), "\n".join(lines_rs)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "intmeth", "robust", "reject", "mutate"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "intmeth", "nestedfn", "robust", "reject", "mutate"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -3468,7 +3536,8 @@ def main():
            "enumpat": gen_enumpat_program,
            "atpat": gen_atpat_program,
            "tuple": gen_tuple_program,
-           "intmeth": gen_intmeth_program}[args.mode]
+           "intmeth": gen_intmeth_program,
+           "nestedfn": gen_nestedfn_program}[args.mode]
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus
     # suite; a fuzz program is otherwise only checked with every pass on, so a

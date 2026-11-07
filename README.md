@@ -177,7 +177,11 @@ head, a refutable `n @ 1..=5` in a `match` arm and an `if let`, and `n @ _` /
 `mut n @ _` parameters), `tuple` for
 tuples (construction, `.0` element access, destructuring in a `let`, a `match`
 arm and a parameter, nesting, a tuple-typed struct field, an array of tuples,
-and a tuple behind a reference, used as parameter and return types), and
+and a tuple behind a reference, used as parameter and return types), `nestedfn`
+for nested `fn` items (hoisting, a call before the declaration, a sibling called
+after it, a nested `fn` inside another body, a nested `fn` shadowing a top-level
+one of the same name, and the shadowed name called to confirm the inner one
+wins), and
 `order` for assignment evaluation order (a
 side-effecting index and value on both `=` and every compound operator, the
 shapes `stmt` never assigns through). `shift` drives `<<`, `>>` and the compound
@@ -193,6 +197,7 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
 python3 tools/fuzz.py --mode opt --n 500 --seed 1
 python3 tools/fuzz.py --mode arith --n 500 --seed 1
 python3 tools/fuzz.py --mode nest --n 500 --seed 1
+python3 tools/fuzz.py --mode nestedfn --n 500 --seed 1
 python3 tools/fuzz.py --mode pat --n 500 --seed 1
 python3 tools/fuzz.py --mode order --n 500 --seed 1
 python3 tools/fuzz.py --mode shift --n 500 --seed 1
@@ -287,7 +292,10 @@ initialisation; `const` items (folded to a value and substituted at every use,
 including array lengths and `match` patterns); references (`&T` / `&mut T`, `&e`, `*e`,
 with auto-deref for `r.x`, `r[i]` and `r.m()`, and `&self` receivers); methods
 (`self` / `&self` / `&mut self`) and associated functions (`fn name(..)` with no
-`self`, called as `Type::name(..)`, the constructor idiom); `as` casts at Rust's
+`self`, called as `Type::name(..)`, the constructor idiom); nested `fn` items (a
+`fn` declared in a block, hoisted to the top level since it captures nothing —
+block-scoped, so it shadows a top-level `fn` of the same name and is visible
+throughout its block, exactly as rustc); `as` casts at Rust's
 precedence (looser than the unary operators, so `*r as i64` is `(*r) as i64`);
 attributes such as `#[derive(Copy, Clone)]` (parsed and ignored); and a small
 set of runtime builtins. Structs and arrays may be passed to and returned from

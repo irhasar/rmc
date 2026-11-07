@@ -283,6 +283,16 @@ fn name(a: i64, b: bool) -> i64 { ... }
 - Recursion is supported. `main` is the entry point; its return value becomes
   the process exit status.
 - A function body's last expression is its value, or use `return`.
+- A `fn` may be declared inside a block, including another `fn`'s body. It is an
+  item, not a closure: it captures no locals, so it sees only the program's
+  items (a top-level `fn`, `struct`, `enum` or `const`), never an enclosing
+  binding. Reading an enclosing local from it is rejected (rustc's `E0434`). A
+  nested `fn` is visible in its whole block, so it may be called before its own
+  declaration and a sibling may call a `fn` declared later. It shadows a
+  top-level `fn` of the same name inside that block, exactly as rustc's scoping
+  does; two `fn`s with the same name in one block is an error (rustc's `E0428`).
+  Because it captures nothing, a nested `fn` is hoisted to the top level and
+  compiled like any other function, so it costs nothing over a free function.
 
 ## Constants
 

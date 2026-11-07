@@ -44,6 +44,13 @@ pub struct Parser {
     /// `tuple_defs` and appended to the program's structs once parsing is done.
     tuple_structs: std::collections::HashSet<String>,
     tuple_defs: Vec<StructDef>,
+    /// Functions declared inside a block (`fn f() { .. }` as a statement),
+    /// collected here and appended to the program's flat function list. A nested
+    /// `fn` is an item, not a closure: it captures no locals, so it is hoisted
+    /// to the top level and the flat list carries it like any other. It sees
+    /// only the program's items (a top-level `fn`, `struct`, `enum` or `const`),
+    /// never an enclosing local, so nothing needs to be closed over.
+    nested_fns: Vec<FnDef>,
     /// True while parsing a pattern that may be refutable (a `match` arm, an
     /// `if let` / `while let` scrutinee). A tuple pattern is irrefutable only
     /// when every element is, but in a refutable position its elements may be
@@ -52,6 +59,23 @@ pub struct Parser {
     /// reuses). A `let`, a `for` head and a parameter are irrefutable, so there
     /// the flag is false and a literal element is rejected.
     pat_refutable_ok: bool,
+    /// One frame per block being parsed, innermost last, mapping the original
+    /// name of each nested `fn` declared directly in that block to the unique
+    /// name it is hoisted under. A nested `fn` shadows a top-level one of the
+    /// same name inside its block, as rustc's scoping does, so a call is
+    /// rewritten through the innermost frame that names it; a block with no
+    /// nested `fn` pushes an empty frame. A frame is filled by `scan_block_fns`
+    /// before the block's statements are parsed, so a `fn` is in scope for the
+    /// whole block and siblings may call each other in either order, exactly as
+    /// Rust hoists items.
+    fn_scopes: Vec<Vec<(String, String)>>,
+    /// Unique name of each nested `fn`, keyed by the token index of its `fn`
+    /// keyword. Filled in by `scan_block_fns` and read when the `fn` is parsed,
+    /// so a name discovered by the pre-scan is the one the definition is given.
+    fn_at: std::collections::HashMap<usize, String>,
+    /// Monotonic counter for the unique names of hoisted nested functions, so
+    /// two `fn`s of the same name in different blocks get distinct symbols.
+    nf_counter: u32,
 }
 
 /// The deepest expression, block or type nesting the parser accepts. Deeply
@@ -87,7 +111,11 @@ impl Parser {
             struct_fields: std::collections::HashMap::new(),
             tuple_structs: std::collections::HashSet::new(),
             tuple_defs: Vec::new(),
+            nested_fns: Vec::new(),
             pat_refutable_ok: false,
+            fn_scopes: vec![Vec::new()],
+            fn_at: std::collections::HashMap::new(),
+            nf_counter: 0,
         }
     }
 
@@ -203,6 +231,9 @@ impl Parser {
         // added after the scan so a tuple element naming a user struct declared
         // later still resolves.
         structs.append(&mut self.tuple_defs);
+        // Nested functions are hoisted to the top level, so the flat list sema
+        // and codegen walk holds them like any other function.
+        fns.append(&mut self.nested_fns);
         Ok(Program { structs, enums, consts, fns })
     }
 
@@ -839,6 +870,87 @@ impl Parser {
 
     fn parse_block_inner(&mut self) -> PResult<Block> {
         self.expect(Tok::LBrace)?;
+        // A block is a `fn` scope: a nested `fn` declared directly in it is
+        // visible throughout, shadows a same-named one outside, and is gone when
+        // the block ends. The frame is filled before the statements are parsed,
+        // so a `fn` is in scope for the whole block and siblings may call each
+        // other in either order, as Rust hoists items. It is popped on every
+        // exit, so an error part way through does not leave a stale binding.
+        let frame = self.scan_block_fns()?;
+        self.fn_scopes.push(frame);
+        let r = self.parse_block_body();
+        self.fn_scopes.pop();
+        r
+    }
+
+    /// Collect the nested `fn`s declared directly in the block whose `{` has
+    /// just been consumed, without parsing the block. Each gets a unique hoisted
+    /// name, recorded both in the frame returned (name -> unique) and in `fn_at`
+    /// keyed by its `fn` keyword, so the definition is later parsed under the
+    /// same name. A `fn` nested in an inner block or a nested item's body is
+    /// skipped, since it belongs to that block's frame, not this one.
+    fn scan_block_fns(&mut self) -> PResult<Vec<(String, String)>> {
+        let mut frame: Vec<(String, String)> = Vec::new();
+        let mut depth = 0u32;
+        let mut i = self.i;
+        while i < self.toks.len() {
+            match &self.toks[i].tok {
+                Tok::LBrace | Tok::LParen | Tok::LBracket => depth += 1,
+                Tok::RBrace => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                Tok::RParen | Tok::RBracket => {
+                    depth = depth.saturating_sub(1);
+                }
+                Tok::Fn if depth == 0 => {
+                    // `fn name ( .. ) -> .. { body }`. The body brace is skipped
+                    // as a unit by the `depth` counter, so a `fn` inside it is
+                    // not seen here.
+                    if let Some(Token { tok: Tok::Ident(name), .. }) = self.toks.get(i + 1) {
+                        let name = name.clone();
+                        // Two `fn`s with the same name in one block is rustc's
+                        // E0428. A later one shadowing an outer one is fine and
+                        // keeps its own unique symbol.
+                        if frame.iter().any(|(n, _)| *n == name) {
+                            return Err(format!(
+                                "at byte {}: the name `{name}` is defined multiple times in this block",
+                                self.toks[i].pos
+                            ));
+                        }
+                        // The name carries two `$`, which no source identifier
+                        // can contain (a method's mangled name has one), so it
+                        // cannot collide with a user function. A NUL would break
+                        // the `--binutils` path, whose label goes through GNU
+                        // `as`; `$` is a valid symbol character there.
+                        let unique = format!("rmc$nf{}${}", self.nf_counter, name);
+                        self.nf_counter += 1;
+                        self.fn_at.insert(i, unique.clone());
+                        frame.push((name, unique));
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        Ok(frame)
+    }
+
+    /// The hoisted name of the nested `fn` called `name` in the innermost block
+    /// that declares one, or `name` itself when no enclosing block does (so a
+    /// top-level `fn` and a builtin are left alone).
+    fn resolve_fn_name(&self, name: String) -> String {
+        for frame in self.fn_scopes.iter().rev() {
+            if let Some((_, unique)) = frame.iter().rev().find(|(n, _)| *n == name) {
+                return unique.clone();
+            }
+        }
+        name
+    }
+
+    fn parse_block_body(&mut self) -> PResult<Block> {
         let mut stmts = Vec::new();
         let mut tail: Option<Box<Expr>> = None;
         while self.peek() != Some(&Tok::RBrace) {
@@ -1194,6 +1306,24 @@ impl Parser {
             return Ok(());
         }
         match self.peek() {
+            // A nested `fn` is an item, not an expression: it binds a name for
+            // the whole enclosing block (and, since it captures nothing, is
+            // hoisted to the top level by `parse_program`). It is parsed here so
+            // it may appear among statements; the trailing `;` is not required.
+            // `scan_block_fns` already gave it a unique name and put it in the
+            // block's frame, so a call in this block resolves to it.
+            Some(Tok::Fn) => {
+                let at = self.i;
+                let mut f = self.parse_fn()?;
+                // The pre-scan already named this `fn` and put it in the block's
+                // frame; the definition takes that same name. A `fn` the scan
+                // did not see (it never should) falls back to its own name.
+                if let Some(unique) = self.fn_at.get(&at).cloned() {
+                    f.name = unique;
+                }
+                self.nested_fns.push(f);
+                return Ok(());
+            }
             Some(Tok::Let) => {
                 self.i += 1;
                 // `mut` before the name marks that binding mutable. A struct
@@ -3448,6 +3578,10 @@ impl Parser {
                         }
                     }
                     self.expect(Tok::RParen)?;
+                    // A call names a nested `fn` if one is in scope, so a nested
+                    // `fn` shadows a top-level one of the same name. The rewrite
+                    // is to the hoisted function's unique name.
+                    let name = self.resolve_fn_name(name);
                     Ok(Expr::Call { name, args, arg_slots: Vec::new(), ret_slot: -1, ret_ty: Type::I64 })
                 } else if let Some(v) = self.consts.get(&name) {
                     // A reference to a constant is its value, substituted here
