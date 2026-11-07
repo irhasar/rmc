@@ -839,6 +839,59 @@ __rmc_str_lt:
     },
     Piece {
         text: r#"
+# long __rmc_imin(long a, long b) / __rmc_imax  -- signed
+# long __rmc_umin(long a, long b) / __rmc_umax  -- unsigned
+# `a.min(b)` and `a.max(b)` on an integer lower to `<T as Ord>::min`/`max`,
+# which the back end rewrites to one of these. A branch rather than `cmov` keeps
+# them encodable by the in-process assembler.
+.globl __rmc_imin
+.type __rmc_imin, @function
+__rmc_imin:
+    mov %rdi, %rax
+    cmp %rsi, %rax
+    jle .Limin_done
+    mov %rsi, %rax
+.Limin_done:
+    ret
+.size __rmc_imin, .-__rmc_imin
+
+.globl __rmc_imax
+.type __rmc_imax, @function
+__rmc_imax:
+    mov %rdi, %rax
+    cmp %rsi, %rax
+    jge .Limax_done
+    mov %rsi, %rax
+.Limax_done:
+    ret
+.size __rmc_imax, .-__rmc_imax
+
+.globl __rmc_umin
+.type __rmc_umin, @function
+__rmc_umin:
+    mov %rdi, %rax
+    cmp %rsi, %rax
+    jbe .Lumin_done
+    mov %rsi, %rax
+.Lumin_done:
+    ret
+.size __rmc_umin, .-__rmc_umin
+
+.globl __rmc_umax
+.type __rmc_umax, @function
+__rmc_umax:
+    mov %rdi, %rax
+    cmp %rsi, %rax
+    jae .Lumax_done
+    mov %rsi, %rax
+.Lumax_done:
+    ret
+.size __rmc_umax, .-__rmc_umax
+"#,
+        defines: &["__rmc_imin", "__rmc_imax", "__rmc_umin", "__rmc_umax"],
+    },
+    Piece {
+        text: r#"
 # long __rmc_str_len(long s)  -- the byte length of the string record at `s`,
 # which is `{len: i64, bytes...}`. A `str` value is the address of its record,
 # so `s.len()` is the record's first word; sema lowers it to a call here.

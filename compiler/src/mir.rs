@@ -1153,12 +1153,31 @@ fn parse_call_terminator(t: &str) -> Option<Terminator> {
     let func = match func.trim() {
         "std::io::_print" | "core::fmt::_print" => CallTarget::Direct("__rmc_print".to_string()),
         "std::io::_eprint" | "core::fmt::_eprint" => CallTarget::Direct("__rmc_eprint".to_string()),
-        _ => match normalize_call_name(&func) {
+        _ => match std_intrinsic_name(&func) {
             Some(name) => CallTarget::Direct(name),
-            None => CallTarget::Indirect,
+            None => match normalize_call_name(&func) {
+                Some(name) => CallTarget::Direct(name),
+                None => CallTarget::Indirect,
+            },
         },
     };
     Some(Terminator::Call { dest, func, args, target })
+}
+
+/// A std call the back end implements as a runtime helper, rewritten to that
+/// helper's symbol so it survives `normalize_call_name` (which keeps only the
+/// final path segment, `min`, which is not a symbol the runtime defines).
+fn std_intrinsic_name(name: &str) -> Option<String> {
+    // `<T as Ord>::min(a, b)` and `max`, for an integer `T`.
+    let rest = name.trim().strip_prefix('<')?;
+    let (ty, tail) = rest.split_once(" as ")?;
+    let (trait_name, method) = tail.split_once(">::")?;
+    if trait_name == "Ord" && (method == "min" || method == "max") {
+        let signed = ty.starts_with('i') || ty == "isize";
+        let kind = if signed { "i" } else { "u" };
+        return Some(format!("__rmc_{kind}{method}"));
+    }
+    None
 }
 
 /// The name a call should target, or `None` for a call that is not a plain
