@@ -157,7 +157,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     // Runtime helpers provided by the freestanding assembly runtime. They are
     // linked in automatically, so they do not appear in the source program.
-    let builtins: [(&str, &[Type], Type); 10] = [
+    let builtins: [(&str, &[Type], Type); 13] = [
         ("print_i64", &[Type::I64], Type::Unit),
         ("print_str", &[Type::Str], Type::Unit),
         ("print_bool", &[Type::Bool], Type::Unit),
@@ -173,6 +173,12 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         // `i64::clamp`'s `min > max` trap; emitted by sema for the failure arm.
         // Typed `i64` because it stands in one arm of the desugar's `if`.
         ("__rmc_clamp", &[], Type::I64),
+        // The bit-inspection methods (`count_ones`, `leading_zeros`,
+        // `trailing_zeros`), emitted by sema for the matching method. Each takes
+        // the receiver by value and returns the count as `i64`.
+        ("__rmc_count_ones", &[Type::I64], Type::I64),
+        ("__rmc_leading_zeros", &[Type::I64], Type::I64),
+        ("__rmc_trailing_zeros", &[Type::I64], Type::I64),
     ];
     for (name, params, ret) in builtins {
         sigs.insert(
@@ -879,6 +885,33 @@ impl Sema {
                         Block { stmts: Vec::new(), tail: Some(Box::new(y)) },
                         Some(Block { stmts: Vec::new(), tail: Some(Box::new(x)) }),
                     ),
+                    Type::I64,
+                )
+            }
+            // The bit-inspection methods. Each is a call to a small runtime
+            // helper: a loop over the 64 bits is exact (no operand is ever
+            // negated or decremented, so there is no overflow to trap on) and
+            // `--overflow-checks` cannot change the answer, whereas a desugared
+            // `x & (x - 1)` would overflow for `i64::MIN`. The receiver is bound
+            // first (when it is not a plain variable) so a call operand runs
+            // once; the helper takes it by value and returns the count.
+            "count_ones" | "leading_zeros" | "trailing_zeros" => {
+                if !args.is_empty() {
+                    return Err(format!("method `{name}` takes no arguments"));
+                }
+                let helper = match name {
+                    "count_ones" => "__rmc_count_ones",
+                    "leading_zeros" => "__rmc_leading_zeros",
+                    _ => "__rmc_trailing_zeros",
+                };
+                (
+                    Expr::Call {
+                        name: helper.into(),
+                        args: vec![x],
+                        arg_slots: vec![(-1, 0)],
+                        ret_slot: -1,
+                        ret_ty: Type::I64,
+                    },
                     Type::I64,
                 )
             }
@@ -2553,6 +2586,9 @@ impl Sema {
                             | "div_euclid"
                             | "rem_euclid"
                             | "clamp"
+                            | "count_ones"
+                            | "leading_zeros"
+                            | "trailing_zeros"
                     )
                 {
                     // `abs` synthesises `-x`, a compiler-generated negation, so
