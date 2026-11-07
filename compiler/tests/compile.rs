@@ -5290,6 +5290,105 @@ fn a_nested_fn_cannot_capture_a_local() {
 }
 
 #[test]
+fn a_type_alias_is_transparent_for_a_scalar() {
+    // The alias is gone by codegen: the `let` is an ordinary `i64`, so the
+    // function returns `6` and no name for the alias survives.
+    let out = asm("type N = i64; fn main() -> i64 { let x: N = 5; return x + 1; }");
+    assert!(out.contains("main:"));
+    assert!(!out.contains("N:"), "the alias is not emitted as a symbol");
+}
+
+#[test]
+fn a_type_alias_may_be_used_before_it_is_declared() {
+    // `N` is declared after `main`, which names it in a parameter and a return
+    // type. Both resolve, because the pre-scan registers every alias first.
+    // Inlining is off so the call's callee survives to be asserted on.
+    let out = asm_no_inline(
+        "fn f(x: N) -> N { return x; } fn main() -> i64 { return f(7); } type N = i64;",
+    );
+    assert!(out.contains("f:"));
+}
+
+#[test]
+fn a_type_alias_chain_resolves() {
+    // `A` names `B`, which names `i64`; either declaration order works.
+    let out = asm("type A = B; type B = i64; fn main() -> i64 { let x: A = 3; return x; }");
+    assert!(out.contains("main:"));
+}
+
+#[test]
+fn a_struct_type_alias_is_the_struct_itself() {
+    // `Pt` is `P`, so the literal, the fields and the layout are the struct's.
+    let out = asm(
+        "struct P { x: i64, y: i64 } type Pt = P; \
+         fn main() -> i64 { let p: Pt = P { x: 1, y: 2 }; return p.x + p.y; }",
+    );
+    assert!(out.contains("main:"));
+}
+
+#[test]
+fn a_type_alias_for_an_array_uses_a_const_length() {
+    // `[i64; K]` needs `K`, which is resolved before the alias target is parsed.
+    let out = asm("const K: i64 = 3; type A = [i64; K]; fn main() -> i64 { let a: A = [1, 2, 3]; return a[2]; }");
+    assert!(out.contains("main:"));
+}
+
+#[test]
+fn a_cyclic_type_alias_is_rejected_not_a_hang() {
+    // `A = B; B = A` expands forever without a bound; the depth limit stops it.
+    let out = compile_to_asm(
+        "type A = B; type B = A; fn main() -> i64 { return 0; }",
+        &CompileOptions::default(),
+    );
+    assert!(out.is_err(), "a cycle is an error, not a hang");
+}
+
+#[test]
+fn a_duplicate_type_alias_is_rejected() {
+    let err = compile_to_asm(
+        "type N = i64; type N = bool; fn main() -> i64 { return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("defined multiple times"), "E0428-like error:\n{err}");
+}
+
+#[test]
+fn a_type_alias_that_collides_with_a_struct_is_rejected() {
+    // A `type` shares the type namespace with a struct (rustc's E0428), in
+    // either declaration order.
+    for src in [
+        "struct S { x: i64 } type S = i64; fn main() -> i64 { return 0; }",
+        "type S = i64; struct S { x: i64 } fn main() -> i64 { return 0; }",
+    ] {
+        let err = compile_to_asm(src, &CompileOptions::default()).unwrap_err();
+        assert!(err.contains("defined multiple times"), "E0428-like error:\n{err}");
+    }
+}
+
+#[test]
+fn a_type_alias_does_not_collide_with_a_const_or_a_fn() {
+    // A `const` and a `fn` live in the value namespace, so a `type` of the same
+    // name is fine, as in rustc.
+    let c = asm("type N = i64; const N: i64 = 1; fn main() -> i64 { return N; }");
+    assert!(c.contains("main:"));
+    // Inlining is off so the function `N` survives to be asserted on.
+    let f = asm_no_inline("type N = i64; fn N() -> i64 { return 3; } fn main() -> i64 { return N(); }");
+    assert!(f.contains("N:"));
+}
+
+#[test]
+fn type_is_a_reserved_word() {
+    // `type` is a keyword, so it cannot be a binding name (as in rustc).
+    let err = compile_to_asm(
+        "fn main() -> i64 { let type: i64 = 3; return type; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("expected identifier"), "`type` is reserved:\n{err}");
+}
+
+#[test]
 fn a_builtin_integer_method_on_a_struct_is_not_shadowed() {
     // A struct may still define its own `min`; the built-in only fires on an
     // `i64` receiver.

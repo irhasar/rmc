@@ -16,6 +16,7 @@ time; there are no runtime type errors.
 | `&T` `&mut T`| a reference to a `T` (one word)               |
 | `Name`       | a struct declared with `struct Name { .. }`   |
 | `Name`       | an enum declared with `enum Name { .. }`      |
+| `Name`       | a `type` alias declared with `type Name = T;` |
 | `()`         | unit, the result of a statement or `main`     |
 
 Integer and boolean literals are inferred. The smallest `i64` value is written
@@ -285,7 +286,7 @@ fn name(a: i64, b: bool) -> i64 { ... }
 - A function body's last expression is its value, or use `return`.
 - A `fn` may be declared inside a block, including another `fn`'s body. It is an
   item, not a closure: it captures no locals, so it sees only the program's
-  items (a top-level `fn`, `struct`, `enum` or `const`), never an enclosing
+  items (a top-level `fn`, `struct`, `enum`, `const` or `type`), never an enclosing
   binding. Reading an enclosing local from it is rejected (rustc's `E0434`). A
   nested `fn` is visible in its whole block, so it may be called before its own
   declaration and a sibling may call a `fn` declared later. It shadows a
@@ -317,6 +318,37 @@ constants and an initializer that is not a constant expression. Only top-level
 A local binding may not reuse a constant's name (rustc's `E0530`), whether it is
 a `let`, a parameter or a `for` variable. A `const` and a function share a
 namespace, so giving both the same name is an error (rustc's `E0428`).
+
+## Type aliases
+
+```rust
+type Count = i64;
+type Point = (i64, i64);
+type Grid = [[i64; 4]; 4];
+struct Node { next: i64 }
+type List = Node;
+
+let n: Count = 5;             // a scalar alias
+let p: Point = (1, 2);        // an alias for a tuple
+let g: Grid = [[0; 4]; 4];    // an alias for a nested array
+let l: List = Node { next: 0 };
+```
+
+A `type NAME = T;` item gives a second name to a type. The alias is transparent:
+it is rewritten to its target when the type is parsed, so it never reaches layout
+or code generation, an alias and its target are the same type (a `Count` and an
+`i64` may be used interchangeably), and a struct alias is the struct itself, with
+the same fields and the same layout. Any type may be aliased, including a
+struct, an enum, a tuple, an array, a reference or a scalar.
+
+An alias may be named before it is declared, as in Rust, and one alias may name
+another (`type A = B; type B = i64;`) in either declaration order. A cycle
+(`type A = B; type B = A;`) is an error (rustc's `E0391`), not a hang. `type` is
+a keyword, so it cannot be used as a binding or function name. An alias shares
+the type namespace with a struct and an enum, so reusing one of their names (or
+declaring the same alias twice) is an error (rustc's `E0428`); a `const` or a
+`fn` of the same name is fine, since those live in the value namespace. Only
+top-level `type` items are supported.
 
 ## Statements
 

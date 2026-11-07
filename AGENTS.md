@@ -57,6 +57,7 @@ python3 tools/fuzz.py --mode atpat --n 500 --seed 1
 python3 tools/fuzz.py --mode tuple --n 500 --seed 1
 python3 tools/fuzz.py --mode intmeth --n 500 --seed 1
 python3 tools/fuzz.py --mode nestedfn --n 500 --seed 1
+python3 tools/fuzz.py --mode typealias --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 
 # robustness / soundness: rmc must error cleanly, never crash
@@ -278,6 +279,16 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   where rustc accepts them. This is a documented limitation, not a regression —
   an annotation (`let x: i64 = ..`) makes the type concrete and both compile.
   `let_destructuring_{accepts,rejects}_an_*_diverging_initialiser` pin it.
+- Type aliases (`type NAME = T;`) are resolved entirely in the parser and never
+  reach sema or codegen, so they cost nothing at run time and cannot affect
+  layout. `prescan` records each alias name and the token index where its target
+  begins (skipping to the `;`), then, after `resolve_consts`, parses each target
+  (a second pass expands a target that named a not-yet-parsed alias, so
+  `type A = B; type B = i64;` works in either order). `parse_type_inner`
+  rewrites a `Tok::Ident` through `aliases` via `expand_alias_ty`, so every use
+  site (a `let`, a parameter, a return, a struct field, a cast) is already
+  concrete. A struct name is not an alias and stays `Type::Named`. A cycle is
+  reported (`expand_alias_ty` bounds the walk), matching rustc's `E0391`.
 - `compiler/src/ast.rs` — AST and `Type` (`I64`, `Bool`, `Str`, `Unit`, `Array`,
   `Struct`, and the parser-only placeholder `Named`). `Str` is the type of a
   string literal: one slot holding a pointer to NUL-terminated static data. It
