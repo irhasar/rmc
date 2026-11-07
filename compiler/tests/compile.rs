@@ -5060,25 +5060,30 @@ fn mir_hex_formatter_lowers_to_the_base_formatter() {
         "the hex formatter is not selected:\n{asm}"
     );
     assert!(
-        asm.contains("__rmc_put_base_unsigned:"),
+        asm.contains("__rmc_emit_unsigned:"),
         "the base printer is not linked in"
     );
 }
 
 #[test]
-fn mir_format_width_is_a_clear_diagnostic() {
-    // The runtime walker renders a placeholder's value in full; a width or
-    // precision would be silently dropped, so the back end must reject it.
+fn mir_format_width_is_rendered() {
+    // A width or precision is published in `__rmc_fmt_mode` by the template
+    // walker and applied by the shared padder, so the placeholder lowers to a
+    // normal call plus the padding helper.
     let mir = runtime_format_mir(
         "std::fmt::Display",
         "b\"\\xc3 \\x00\\x00h\\x05\\x00\\x01\\n\\x00\"",
     );
     let prog = rmc::mir::parse(&mir).expect("parse");
-    let err = rmc::compile_mir_to_asm(&prog, &rmc::mir_codegen::Options::default())
-        .expect_err("a width must be rejected");
+    let asm = rmc::compile_mir_to_asm(&prog, &rmc::mir_codegen::Options::default())
+        .expect("a width must compile");
     assert!(
-        err.contains("not implemented on the MIR path"),
-        "unhelpful diagnostic: {err}"
+        asm.contains("__rmc_fmt_pad:"),
+        "the padder is not linked in:\n{asm}"
+    );
+    assert!(
+        asm.contains("__rmc_fmt_set:"),
+        "the mode setter is not linked in:\n{asm}"
     );
 }
 

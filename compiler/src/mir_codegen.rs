@@ -122,17 +122,6 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<String, String> {
     // word, because the runtime walks them and reads the length from the first
     // byte of each piece.
     let (templates, template_ids) = collect_templates(prog);
-    // The runtime walker renders a placeholder's value in full; it does not
-    // honour a width or precision (`{:>5}`, `{:.2}`). Reject those templates
-    // here so they are a diagnostic rather than silently mis-rendered.
-    for t in &templates {
-        if let Some(field) = template_unrendered_field(t) {
-            return Err(format!(
-                "mir: `format_args!` placeholder with `{field}` is not implemented on the MIR path; \
-                 format the value without flags, width or precision"
-            ));
-        }
-    }
 
     // Every static allocation becomes a `.rodata` blob: its bytes, plus a
     // `.quad` for each interior pointer relocation. `alloc1` (string data) and

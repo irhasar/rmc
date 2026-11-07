@@ -243,21 +243,39 @@ __rmc_write_template:
 .Ltmpl_placeholder:
     # 0b11xxxxxx: optional fields follow, each present when its bit is set --
     # bit 0 flags (u32), bit 1 width (u16), bit 2 precision (u16), bit 3
-    # arg_index (u16). We do not render flags, but must skip the present fields
-    # to reach the argument index; the runtime formatters always print the
-    # plain value.
+    # arg_index (u16), bit 4 width indirect, bit 5 precision indirect. The
+    # formatters must render flags, width and precision, but their signature is
+    # fixed (`fn(&T)`), so record the placeholder's options in the global
+    # `__rmc_fmt_mode` before the call: bits 0..31 are the flags word (fill in
+    # bits 0..20, sign/alternate/alignment above), width in bits 32..47 and
+    # precision in bits 48..63. A placeholder with no options leaves it 0,
+    # which lets every formatter take its fast path.
     mov %eax, %edx           # the flag byte
     inc %r12
+    xor %r10, %r10
     test $0x01, %dl          # flags present
     jz .Lph_no_flags
+    mov (%r12), %r10d
     add $4, %r12
 .Lph_no_flags:
     test $0x02, %dl          # width present
     jz .Lph_no_width
+    test $0x10, %dl          # width indirect (an argument, not a value)
+    jnz .Lph_skip_width
+    movzwl (%r12), %eax
+    shl $32, %rax
+    or %rax, %r10
+.Lph_skip_width:
     add $2, %r12
 .Lph_no_width:
     test $0x04, %dl          # precision present
     jz .Lph_no_prec
+    test $0x20, %dl          # precision indirect
+    jnz .Lph_skip_prec
+    movzwl (%r12), %eax
+    shl $48, %rax
+    or %rax, %r10
+.Lph_skip_prec:
     add $2, %r12
 .Lph_no_prec:
     test $0x08, %dl          # arg_index present
@@ -269,11 +287,15 @@ __rmc_write_template:
     mov %r15, %rax           # next argument, in order
     inc %r15
 .Lph_have_index:
-    # Argument i is 16 bytes: value pointer at +0, formatter at +8.
+    # Argument i is 16 bytes: value pointer at +0, formatter at +8. Resolve it
+    # before publishing the mode, which clobbers the caller-saved registers.
     shl $4, %rax
     add %r13, %rax
-    mov (%rax), %rdi         # value pointer
-    call *8(%rax)            # formatter(value)
+    mov %rax, %r11
+    mov %r10, %rdi
+    call __rmc_fmt_set
+    mov (%r11), %rdi         # value pointer
+    call *8(%r11)            # formatter(value)
     jmp .Ltmpl_loop
 .Ltmpl_done:
     pop %r15
@@ -349,67 +371,434 @@ __rmc_compare_bytes:
 # the `Argument` array carries its address; the template walker calls it with a
 # pointer to the value. Each writes to stdout with a raw syscall. They are kept
 # only when the program actually formats a runtime argument.
+#
+# The walker publishes each placeholder's flags, width and precision in
+# `__rmc_fmt_mode` before the call (0 for a plain placeholder, so the common
+# case skips all of this). `__rmc_fmt_pad` then writes the value's digits with
+# the fill, sign, prefix, alignment and zero padding those options ask for.
+.data
+.align 8
+__rmc_fmt_mode: .quad 0
+
 .text
+# void __rmc_fmt_set(long mode)  -- stash the current placeholder's options:
+# bits 0..20 the fill char, 21..31 the sign/alternate/zero-pad/align flags
+# (rustc's `FormattingOptions::flags`), 32..47 the width, 48..63 the precision.
+.globl __rmc_fmt_set
+.type __rmc_fmt_set, @function
+__rmc_fmt_set:
+    mov %rdi, __rmc_fmt_mode(%rip)
+    ret
+.size __rmc_fmt_set, .-__rmc_fmt_set
+
+# long __rmc_fmt_pad(const char *digits, long len, const char *buf_end)  --
+# write the pending value honouring `__rmc_fmt_mode`. `%rdi` points at the
+# digits (sign, `0x`/`0b`/`0o` prefix and body already in place), `%rsi` is
+# their length and `%rdx` is the end of the 96-byte scratch buffer they were
+# built in. With no options set this is a bare write; otherwise the value is
+# padded to the width.
+# void __rmc_put_fill(char c, long n)  -- write `n` copies of `c`. The fill can
+# be wider than the scratch buffer, so it goes out in 128-byte chunks.
+__rmc_put_fill:
+    push %rbx
+    push %r12
+    push %r13
+    mov %rsi, %r12
+    mov %rdi, %rbx
+    sub $128, %rsp
+    mov %rsp, %rdi
+    mov $128, %rcx
+    mov %bl, %al
+.Lpf_fill:
+    mov %al, (%rdi)
+    inc %rdi
+    dec %rcx
+    jnz .Lpf_fill
+.Lpf_loop:
+    test %r12, %r12
+    jz .Lpf_done
+    mov %r12, %rdx
+    cmp $128, %rdx
+    jbe .Lpf_chunk
+    mov $128, %rdx
+.Lpf_chunk:
+    sub %rdx, %r12
+    mov %rsp, %rsi
+    mov $1, %rdi
+    mov $1, %rax
+    syscall
+    jmp .Lpf_loop
+.Lpf_done:
+    add $128, %rsp
+    pop %r13
+    pop %r12
+    pop %rbx
+    ret
+.size __rmc_put_fill, .-__rmc_put_fill
+
+# void __rmc_fmt_pad(const char *value, long len)  -- write the pending value
+# honouring `__rmc_fmt_mode`. `%rdi`/`%rsi` are the value's digits (sign and any
+# `0x`/`0b`/`0o` prefix already in place). With no options set this is a bare
+# write; otherwise the value is padded to the width.
+__rmc_fmt_pad:
+    cmpq $0, __rmc_fmt_mode(%rip)
+    jne .Lpad_slow
+    mov %rsi, %rdx
+    mov %rdi, %rsi
+    mov $1, %rdi
+    mov $1, %rax
+    syscall
+    ret
+.Lpad_slow:
+    push %rbx
+    push %rbp
+    push %r12
+    push %r13
+    push %r14
+    push %r15
+    mov %rdi, %rbx           # value start
+    mov %rsi, %rbp           # len
+    mov __rmc_fmt_mode(%rip), %r14
+    mov %r14, %r15
+    shr $32, %r15
+    and $0xffff, %r15        # width
+    mov %r15, %r13
+    sub %rbp, %r13           # padding
+    jbe .Lpad_value
+    # Zero padding: the `0` flag (SIGN_AWARE_ZERO_PAD), no explicit `-`, and a
+    # width. Insert the zeros between the sign/prefix and the body.
+    test $0x1000000, %r14d
+    jz .Lpad_align
+    test $0x400000, %r14d
+    jnz .Lpad_align
+    mov %rbx, %r10           # prefix end: past the sign and any base prefix
+    test %rbp, %rbp
+    jz .Lzp_go
+    movzbl (%r10), %eax
+    cmp $45, %al             # '-'
+    je .Lzp_sign
+    cmp $43, %al             # '+'
+    je .Lzp_sign
+    cmp $32, %al             # ' '
+    je .Lzp_sign
+    jmp .Lzp_pre
+.Lzp_sign:
+    inc %r10
+.Lzp_pre:
+    mov %rbx, %rdx
+    add %rbp, %rdx
+    sub %r10, %rdx
+    cmp $2, %rdx
+    jb .Lzp_go
+    movzbl (%r10), %eax
+    cmp $48, %al             # '0'
+    jne .Lzp_go
+    movzbl 1(%r10), %eax
+    cmp $120, %al            # 'x'
+    je .Lzp_two
+    cmp $88, %al             # 'X'
+    je .Lzp_two
+    cmp $98, %al             # 'b'
+    je .Lzp_two
+    cmp $111, %al            # 'o'
+    je .Lzp_two
+    jmp .Lzp_go
+.Lzp_two:
+    add $2, %r10
+.Lzp_go:
+    mov %r10, %rdx
+    sub %rbx, %rdx           # prefix length
+    jz .Lzp_zeros
+    mov %rbx, %rsi
+    mov $1, %rdi
+    mov $1, %rax
+    syscall
+.Lzp_zeros:
+    mov $48, %edi
+    mov %r13, %rsi
+    call __rmc_put_fill
+    mov %rbx, %rdx
+    add %rbp, %rdx
+    sub %r10, %rdx           # body length
+    jz .Lpad_done
+    mov %r10, %rsi
+    mov $1, %rdi
+    mov $1, %rax
+    syscall
+    jmp .Lpad_done
+.Lpad_align:
+    mov %r14, %r8
+    and $0xff, %r8           # fill byte
+    test %r8d, %r8d
+    jnz .Lpad_have_fill
+    mov $32, %r8d
+.Lpad_have_fill:
+    mov %r14, %rax
+    shr $29, %rax
+    and $3, %eax             # 0 left, 1 right, 2 center, 3 default
+    cmp $2, %eax
+    je .Lpad_center
+    test %eax, %eax
+    jz .Lpad_left
+    # right, or the numeric default
+    mov %r8d, %edi
+    mov %r13, %rsi
+    call __rmc_put_fill
+    jmp .Lpad_value
+.Lpad_center:
+    mov %r13, %rax
+    shr $1, %rax
+    mov %rax, %r15           # left half
+    mov %r8d, %edi
+    mov %rax, %rsi
+    call __rmc_put_fill
+    mov %rbx, %rsi
+    mov %rbp, %rdx
+    mov $1, %rdi
+    mov $1, %rax
+    syscall
+    mov %r13, %rsi
+    sub %r15, %rsi           # right half
+    mov %r8d, %edi
+    call __rmc_put_fill
+    jmp .Lpad_done
+.Lpad_left:
+    mov %rbx, %rsi
+    mov %rbp, %rdx
+    mov $1, %rdi
+    mov $1, %rax
+    syscall
+    mov %r8d, %edi
+    mov %r13, %rsi
+    call __rmc_put_fill
+    jmp .Lpad_done
+.Lpad_value:
+    mov %rbx, %rsi
+    mov %rbp, %rdx
+    mov $1, %rdi
+    mov $1, %rax
+    syscall
+.Lpad_done:
+    pop %r15
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %rbp
+    pop %rbx
+    ret
+.size __rmc_fmt_pad, .-__rmc_fmt_pad
+
+# void __rmc_emit_signed(long v)  -- `%rax` is the value and `%rdi` the base of
+# a 96-byte buffer; write it in decimal, with the `+`/` ` sign flag when set.
+__rmc_emit_signed:
+    push %rbx
+    push %r12
+    mov %rdi, %rbx
+    lea 96(%rbx), %r12
+    xor %r8, %r8
+    test %rax, %rax
+    jns .Les_pos
+    neg %rax
+    mov $45, %r8             # '-'
+    jmp .Les_abs
+.Les_pos:
+    mov __rmc_fmt_mode(%rip), %rdx
+    test $0x200000, %edx     # SIGN_PLUS
+    jz .Les_space
+    mov $43, %r8             # '+'
+    jmp .Les_abs
+.Les_space:
+    test $0x100000, %edx     # the ` ` flag
+    jz .Les_abs
+    mov $32, %r8             # ' '
+.Les_abs:
+    mov $10, %r9
+.Les_loop:
+    xor %rdx, %rdx
+    div %r9
+    add $48, %dl
+    dec %r12
+    mov %dl, (%r12)
+    test %rax, %rax
+    jnz .Les_loop
+    test %r8, %r8
+    jz .Les_pad
+    dec %r12
+    mov %r8b, (%r12)
+.Les_pad:
+    mov %r12, %rdi
+    lea 96(%rbx), %rsi
+    sub %r12, %rsi
+    call __rmc_fmt_pad
+    pop %r12
+    pop %rbx
+    ret
+
+# void __rmc_emit_unsigned(long v)  -- `%rax` is the value, `%rdi` the buffer,
+# `%r9` the base (2, 8, 10 or 16) and `%r10` 1 for a lowercase alphabet or 2 for
+# uppercase. `{:#x}`/`{:#b}`/`{:#o}` add the base prefix.
+__rmc_emit_unsigned:
+    push %rbx
+    push %r12
+    push %r13
+    mov %rdi, %rbx
+    lea 96(%rbx), %r12
+    mov %r10, %r13
+    test %rax, %rax
+    jnz .Leu_loop
+    dec %r12
+    movb $48, (%r12)
+    jmp .Leu_prefix
+.Leu_loop:
+    xor %rdx, %rdx
+    div %r9
+    cmp $10, %dl
+    jb .Leu_lt10
+    add $87, %dl             # 10..15 -> 'a'..'f'
+    cmp $2, %r13
+    jne .Leu_digit
+    sub $32, %dl             # -> 'A'..'F'
+    jmp .Leu_digit
+.Leu_lt10:
+    add $48, %dl
+.Leu_digit:
+    dec %r12
+    mov %dl, (%r12)
+    test %rax, %rax
+    jnz .Leu_loop
+.Leu_prefix:
+    mov __rmc_fmt_mode(%rip), %rdx
+    test $0x800000, %edx     # ALTERNATE (the `#` flag)
+    jz .Leu_sign
+    cmp $16, %r9
+    jne .Leu_poct
+    dec %r12
+    movb $120, (%r12)        # 'x' (lowercase, even for `{:#X}`)
+    dec %r12
+    movb $48, (%r12)
+    jmp .Leu_sign
+.Leu_poct:
+    cmp $8, %r9
+    jne .Leu_pbin
+    dec %r12
+    movb $111, (%r12)        # 'o'
+    dec %r12
+    movb $48, (%r12)
+    jmp .Leu_sign
+.Leu_pbin:
+    dec %r12
+    movb $98, (%r12)         # 'b'
+    dec %r12
+    movb $48, (%r12)
+.Leu_sign:
+    mov __rmc_fmt_mode(%rip), %rdx
+    test $0x200000, %edx     # SIGN_PLUS: an unsigned value still gets a `+`
+    jz .Leu_pad
+    dec %r12
+    movb $43, (%r12)
+.Leu_pad:
+    mov %r12, %rdi
+    lea 96(%rbx), %rsi
+    sub %r12, %rsi
+    call __rmc_fmt_pad
+    pop %r13
+    pop %r12
+    pop %rbx
+    ret
+
+# The entry points the `Argument`s carry. Each loads the value at its own
+# width, reserves a scratch buffer and prints it with the pending options.
 .globl __rmc_fmt_i64
 .type __rmc_fmt_i64, @function
 __rmc_fmt_i64:
-    mov (%rdi), %rax         # the value
-    jmp __rmc_put_dec_signed
+    mov (%rdi), %rax
+    sub $96, %rsp
+    mov %rsp, %rdi
+    call __rmc_emit_signed
+    add $96, %rsp
+    ret
 .size __rmc_fmt_i64, .-__rmc_fmt_i64
 
 .globl __rmc_fmt_u64
 .type __rmc_fmt_u64, @function
 __rmc_fmt_u64:
     mov (%rdi), %rax
-    jmp __rmc_put_dec_unsigned
+    mov $10, %r9
+    mov $1, %r10
+    sub $96, %rsp
+    mov %rsp, %rdi
+    call __rmc_emit_unsigned
+    add $96, %rsp
+    ret
 .size __rmc_fmt_u64, .-__rmc_fmt_u64
 
 .globl __rmc_fmt_i32
 .type __rmc_fmt_i32, @function
 __rmc_fmt_i32:
     movslq (%rdi), %rax
-    jmp __rmc_put_dec_signed
+    sub $96, %rsp
+    mov %rsp, %rdi
+    call __rmc_emit_signed
+    add $96, %rsp
+    ret
 .size __rmc_fmt_i32, .-__rmc_fmt_i32
 
 .globl __rmc_fmt_u32
 .type __rmc_fmt_u32, @function
 __rmc_fmt_u32:
     mov (%rdi), %eax
-    jmp __rmc_put_dec_unsigned
+    mov $10, %r9
+    mov $1, %r10
+    sub $96, %rsp
+    mov %rsp, %rdi
+    call __rmc_emit_unsigned
+    add $96, %rsp
+    ret
 .size __rmc_fmt_u32, .-__rmc_fmt_u32
 
 .globl __rmc_fmt_bool
 .type __rmc_fmt_bool, @function
 __rmc_fmt_bool:
+    call __rmc_fmt_left
     movzbl (%rdi), %eax
+    sub $96, %rsp
+    lea __rmc_fmt_false(%rip), %r8
+    mov $5, %ecx
     test %eax, %eax
-    jnz .Lfmt_bool_true
-    lea __rmc_fmt_false(%rip), %rsi
-    mov $5, %rdx
-    jmp .Lfmt_lit
-.Lfmt_bool_true:
-    lea __rmc_fmt_true(%rip), %rsi
-    mov $4, %rdx
-.Lfmt_lit:
-    mov $1, %rdi
-    mov $1, %rax
-    syscall
+    jz .Lbool_copy
+    lea __rmc_fmt_true(%rip), %r8
+    mov $4, %ecx
+.Lbool_copy:
+    mov %rsp, %rdi
+    xor %edx, %edx
+.Lbool_cp_loop:
+    cmp %ecx, %edx
+    jae .Lbool_pad
+    movzbl (%r8,%rdx), %eax
+    mov %al, (%rdi,%rdx)
+    inc %edx
+    jmp .Lbool_cp_loop
+.Lbool_pad:
+    mov %ecx, %esi
+    lea 96(%rsp), %rdx
+    call __rmc_fmt_pad
+    add $96, %rsp
     ret
 .size __rmc_fmt_bool, .-__rmc_fmt_bool
 
 .globl __rmc_fmt_char
 .type __rmc_fmt_char, @function
 __rmc_fmt_char:
-    mov (%rdi), %edi         # a `char` is a 32-bit scalar; `__rmc_utf8_encode` reads the codepoint from `%edi`
-    sub $16, %rsp
-    mov %rsp, %rsi           # scratch buffer
-    call __rmc_utf8_encode   # codepoint in %edi -> bytes at (%rsi), count in %rax
-    mov %rax, %rdx
+    call __rmc_fmt_left
+    mov (%rdi), %edi
+    sub $96, %rsp
     mov %rsp, %rsi
-    mov $1, %rdi
-    mov $1, %rax
-    syscall
-    add $16, %rsp
+    call __rmc_utf8_encode
+    mov %rsp, %rdi
+    lea 96(%rsp), %rdx
+    mov %rax, %rsi
+    call __rmc_fmt_pad
+    add $96, %rsp
     ret
 .size __rmc_fmt_char, .-__rmc_fmt_char
 
@@ -417,27 +806,49 @@ __rmc_fmt_char:
 .type __rmc_fmt_str, @function
 __rmc_fmt_str:
     # `%rdi` points at the `&str` slot the formatter was handed; the slot holds
-    # the address of rmc's `{len: i64, bytes..}` record. Deref once to reach the
-    # record, then word 0 is the byte length and the bytes follow.
-    mov (%rdi), %rdi         # -> the string record
-    mov (%rdi), %rdx         # length
-    lea 8(%rdi), %rsi        # -> the bytes
-    mov $1, %rdi
-    mov $1, %rax
-    syscall
+    # the address of rmc's `{len: i64, bytes..}` record. Strings default to left
+    # alignment, so when the placeholder asked for no alignment turn off the
+    # numeric default before padding.
+    mov (%rdi), %rdi
+    call __rmc_fmt_left
+    mov (%rdi), %rsi
+    lea 8(%rdi), %rdi
+    mov %rdi, %rax
+    add %rsi, %rax
+    mov %rax, %rdx
+    call __rmc_fmt_pad
     ret
 .size __rmc_fmt_str, .-__rmc_fmt_str
+
+# Set the left-alignment default for a placeholder whose value reads as text
+# (`bool`, `char`, `&str`), unless one was asked for. `%rdi` is preserved.
+__rmc_fmt_left:
+    push %rdi
+    mov __rmc_fmt_mode(%rip), %rax
+    mov %rax, %rcx
+    shr $29, %rcx
+    and $3, %ecx
+    cmp $3, %ecx
+    jne .Lleft_done
+    movabs $0xFFFFFFFF9FFFFFFF, %rdx
+    and %rdx, %rax           # clear the align bits -> left
+    mov %rax, __rmc_fmt_mode(%rip)
+.Lleft_done:
+    pop %rdi
+    ret
 
 .globl __rmc_fmt_str_debug
 .type __rmc_fmt_str_debug, @function
 __rmc_fmt_str_debug:
     # Debug for a string quotes it and escapes `"` `\` and control characters.
     mov (%rdi), %rdi
-    mov (%rdi), %rdx
-    lea 8(%rdi), %rsi
-    mov $1, %rdi
-    mov $1, %rax
-    syscall
+    call __rmc_fmt_left
+    mov (%rdi), %rsi
+    lea 8(%rdi), %rdi
+    mov %rdi, %rax
+    add %rsi, %rax
+    mov %rax, %rdx
+    call __rmc_fmt_pad
     ret
 .size __rmc_fmt_str_debug, .-__rmc_fmt_str_debug
 
@@ -448,88 +859,29 @@ __rmc_fmt_false: .ascii "false"
         defines: &[
             "__rmc_fmt_i64", "__rmc_fmt_u64", "__rmc_fmt_i32", "__rmc_fmt_u32",
             "__rmc_fmt_bool", "__rmc_fmt_char", "__rmc_fmt_str", "__rmc_fmt_str_debug",
+            "__rmc_fmt_set", "__rmc_fmt_pad", "__rmc_put_fill", "__rmc_fmt_left",
+            "__rmc_emit_signed", "__rmc_emit_unsigned",
         ],
     },
     Piece {
         text: r#"
-# The `{:X}` (UpperHex) formatters: the same as the lowercase hex ones but the
-# digit alphabet is `0-9A-F`.
-.text
-.globl __rmc_fmt_HEX_8
-.type __rmc_fmt_HEX_8, @function
-__rmc_fmt_HEX_8:
-    movzbl (%rdi), %eax
-    mov $16, %r9
-    jmp __rmc_put_base_upper
-.size __rmc_fmt_HEX_8, .-__rmc_fmt_HEX_8
-
-.globl __rmc_fmt_HEX_16
-.type __rmc_fmt_HEX_16, @function
-__rmc_fmt_HEX_16:
-    movzwl (%rdi), %eax
-    mov $16, %r9
-    jmp __rmc_put_base_upper
-.size __rmc_fmt_HEX_16, .-__rmc_fmt_HEX_16
-
-.globl __rmc_fmt_HEX_32
-.type __rmc_fmt_HEX_32, @function
-__rmc_fmt_HEX_32:
-    mov (%rdi), %eax
-    mov $16, %r9
-    jmp __rmc_put_base_upper
-.size __rmc_fmt_HEX_32, .-__rmc_fmt_HEX_32
-
-.globl __rmc_fmt_HEX_64
-.type __rmc_fmt_HEX_64, @function
-__rmc_fmt_HEX_64:
-    mov (%rdi), %rax
-    mov $16, %r9
-    jmp __rmc_put_base_upper
-.size __rmc_fmt_HEX_64, .-__rmc_fmt_HEX_64
-
-__rmc_put_base_upper:
-    sub $72, %rsp
-    lea 71(%rsp), %rsi
-    mov %r9, %r10
-.Lpbu_up_loop:
-    xor %rdx, %rdx
-    div %r10
-    cmp $10, %dl
-    jb .Lpbu_up_digit
-    add $7, %dl              # 10..15 -> 'A'..'F'
-.Lpbu_up_digit:
-    add $48, %dl
-    dec %rsi
-    mov %dl, (%rsi)
-    test %rax, %rax
-    jnz .Lpbu_up_loop
-    lea 71(%rsp), %rdx
-    sub %rsi, %rdx
-    mov $1, %rdi
-    mov $1, %rax
-    syscall
-    add $72, %rsp
-    ret
-"#,
-        defines: &[
-            "__rmc_fmt_HEX_8", "__rmc_fmt_HEX_16", "__rmc_fmt_HEX_32", "__rmc_fmt_HEX_64",
-            "__rmc_put_base_upper",
-        ],
-    },
-    Piece {
-        text: r#"
-# The `{:x}`/`{:o}`/`{:b}` formatters. Rust prints the value as an unsigned
-# integer of its own width, so each entry point loads exactly that many bytes
-# (zero-extending), which drops the sign bits of a narrower type: `{:x}` of
-# `-2i16` is `fffe`, not the 16-digit 64-bit pattern. The base is a constant per
-# entry point.
+# The `{:x}`/`{:X}`/`{:o}`/`{:b}` formatters. Rust prints the value as an
+# unsigned integer of its own width, so each entry point loads exactly that many
+# bytes (zero-extending), which drops the sign bits of a narrower type: `{:x}`
+# of `-2i16` is `fffe`, not the 16-digit 64-bit pattern. `%r9` is the base and
+# `%r10` 1 for a lowercase alphabet, 2 for uppercase.
 .text
 .globl __rmc_fmt_hex_8
 .type __rmc_fmt_hex_8, @function
 __rmc_fmt_hex_8:
     movzbl (%rdi), %eax
     mov $16, %r9
-    jmp __rmc_put_base_unsigned
+    mov $1, %r10
+    sub $96, %rsp
+    mov %rsp, %rdi
+    call __rmc_emit_unsigned
+    add $96, %rsp
+    ret
 .size __rmc_fmt_hex_8, .-__rmc_fmt_hex_8
 
 .globl __rmc_fmt_hex_16
@@ -537,7 +889,12 @@ __rmc_fmt_hex_8:
 __rmc_fmt_hex_16:
     movzwl (%rdi), %eax
     mov $16, %r9
-    jmp __rmc_put_base_unsigned
+    mov $1, %r10
+    sub $96, %rsp
+    mov %rsp, %rdi
+    call __rmc_emit_unsigned
+    add $96, %rsp
+    ret
 .size __rmc_fmt_hex_16, .-__rmc_fmt_hex_16
 
 .globl __rmc_fmt_hex_32
@@ -545,7 +902,12 @@ __rmc_fmt_hex_16:
 __rmc_fmt_hex_32:
     mov (%rdi), %eax
     mov $16, %r9
-    jmp __rmc_put_base_unsigned
+    mov $1, %r10
+    sub $96, %rsp
+    mov %rsp, %rdi
+    call __rmc_emit_unsigned
+    add $96, %rsp
+    ret
 .size __rmc_fmt_hex_32, .-__rmc_fmt_hex_32
 
 .globl __rmc_fmt_hex_64
@@ -553,15 +915,77 @@ __rmc_fmt_hex_32:
 __rmc_fmt_hex_64:
     mov (%rdi), %rax
     mov $16, %r9
-    jmp __rmc_put_base_unsigned
+    mov $1, %r10
+    sub $96, %rsp
+    mov %rsp, %rdi
+    call __rmc_emit_unsigned
+    add $96, %rsp
+    ret
 .size __rmc_fmt_hex_64, .-__rmc_fmt_hex_64
+
+.globl __rmc_fmt_HEX_8
+.type __rmc_fmt_HEX_8, @function
+__rmc_fmt_HEX_8:
+    movzbl (%rdi), %eax
+    mov $16, %r9
+    mov $2, %r10
+    sub $96, %rsp
+    mov %rsp, %rdi
+    call __rmc_emit_unsigned
+    add $96, %rsp
+    ret
+.size __rmc_fmt_HEX_8, .-__rmc_fmt_HEX_8
+
+.globl __rmc_fmt_HEX_16
+.type __rmc_fmt_HEX_16, @function
+__rmc_fmt_HEX_16:
+    movzwl (%rdi), %eax
+    mov $16, %r9
+    mov $2, %r10
+    sub $96, %rsp
+    mov %rsp, %rdi
+    call __rmc_emit_unsigned
+    add $96, %rsp
+    ret
+.size __rmc_fmt_HEX_16, .-__rmc_fmt_HEX_16
+
+.globl __rmc_fmt_HEX_32
+.type __rmc_fmt_HEX_32, @function
+__rmc_fmt_HEX_32:
+    mov (%rdi), %eax
+    mov $16, %r9
+    mov $2, %r10
+    sub $96, %rsp
+    mov %rsp, %rdi
+    call __rmc_emit_unsigned
+    add $96, %rsp
+    ret
+.size __rmc_fmt_HEX_32, .-__rmc_fmt_HEX_32
+
+.globl __rmc_fmt_HEX_64
+.type __rmc_fmt_HEX_64, @function
+__rmc_fmt_HEX_64:
+    mov (%rdi), %rax
+    mov $16, %r9
+    mov $2, %r10
+    sub $96, %rsp
+    mov %rsp, %rdi
+    call __rmc_emit_unsigned
+    add $96, %rsp
+    ret
+.size __rmc_fmt_HEX_64, .-__rmc_fmt_HEX_64
 
 .globl __rmc_fmt_oct_8
 .type __rmc_fmt_oct_8, @function
 __rmc_fmt_oct_8:
     movzbl (%rdi), %eax
     mov $8, %r9
-    jmp __rmc_put_base_unsigned
+    mov $1, %r10
+    sub $96, %rsp
+    mov %rsp, %rdi
+    call __rmc_emit_unsigned
+    add $96, %rsp
+    ret
 .size __rmc_fmt_oct_8, .-__rmc_fmt_oct_8
 
 .globl __rmc_fmt_oct_16
@@ -569,7 +993,12 @@ __rmc_fmt_oct_8:
 __rmc_fmt_oct_16:
     movzwl (%rdi), %eax
     mov $8, %r9
-    jmp __rmc_put_base_unsigned
+    mov $1, %r10
+    sub $96, %rsp
+    mov %rsp, %rdi
+    call __rmc_emit_unsigned
+    add $96, %rsp
+    ret
 .size __rmc_fmt_oct_16, .-__rmc_fmt_oct_16
 
 .globl __rmc_fmt_oct_32
@@ -577,7 +1006,12 @@ __rmc_fmt_oct_16:
 __rmc_fmt_oct_32:
     mov (%rdi), %eax
     mov $8, %r9
-    jmp __rmc_put_base_unsigned
+    mov $1, %r10
+    sub $96, %rsp
+    mov %rsp, %rdi
+    call __rmc_emit_unsigned
+    add $96, %rsp
+    ret
 .size __rmc_fmt_oct_32, .-__rmc_fmt_oct_32
 
 .globl __rmc_fmt_oct_64
@@ -585,7 +1019,12 @@ __rmc_fmt_oct_32:
 __rmc_fmt_oct_64:
     mov (%rdi), %rax
     mov $8, %r9
-    jmp __rmc_put_base_unsigned
+    mov $1, %r10
+    sub $96, %rsp
+    mov %rsp, %rdi
+    call __rmc_emit_unsigned
+    add $96, %rsp
+    ret
 .size __rmc_fmt_oct_64, .-__rmc_fmt_oct_64
 
 .globl __rmc_fmt_bin_8
@@ -593,7 +1032,12 @@ __rmc_fmt_oct_64:
 __rmc_fmt_bin_8:
     movzbl (%rdi), %eax
     mov $2, %r9
-    jmp __rmc_put_base_unsigned
+    mov $1, %r10
+    sub $96, %rsp
+    mov %rsp, %rdi
+    call __rmc_emit_unsigned
+    add $96, %rsp
+    ret
 .size __rmc_fmt_bin_8, .-__rmc_fmt_bin_8
 
 .globl __rmc_fmt_bin_16
@@ -601,7 +1045,12 @@ __rmc_fmt_bin_8:
 __rmc_fmt_bin_16:
     movzwl (%rdi), %eax
     mov $2, %r9
-    jmp __rmc_put_base_unsigned
+    mov $1, %r10
+    sub $96, %rsp
+    mov %rsp, %rdi
+    call __rmc_emit_unsigned
+    add $96, %rsp
+    ret
 .size __rmc_fmt_bin_16, .-__rmc_fmt_bin_16
 
 .globl __rmc_fmt_bin_32
@@ -609,7 +1058,12 @@ __rmc_fmt_bin_16:
 __rmc_fmt_bin_32:
     mov (%rdi), %eax
     mov $2, %r9
-    jmp __rmc_put_base_unsigned
+    mov $1, %r10
+    sub $96, %rsp
+    mov %rsp, %rdi
+    call __rmc_emit_unsigned
+    add $96, %rsp
+    ret
 .size __rmc_fmt_bin_32, .-__rmc_fmt_bin_32
 
 .globl __rmc_fmt_bin_64
@@ -617,41 +1071,19 @@ __rmc_fmt_bin_32:
 __rmc_fmt_bin_64:
     mov (%rdi), %rax
     mov $2, %r9
-    jmp __rmc_put_base_unsigned
-.size __rmc_fmt_bin_64, .-__rmc_fmt_bin_64
-
-# void __rmc_put_base_unsigned(void)  -- `%rax` is the value, `%r9` the base
-# (2, 8 or 16). Writes it to stdout with no prefix. A 64-bit value needs 64
-# binary digits, hence the 72-byte scratch.
-__rmc_put_base_unsigned:
-    sub $72, %rsp
-    lea 71(%rsp), %rsi
-    mov %r9, %r10
-.Lpbu_loop:
-    xor %rdx, %rdx
-    div %r10
-    cmp $10, %dl
-    jb .Lpbu_digit
-    add $39, %dl             # 10..15 -> 'a'..'f'
-.Lpbu_digit:
-    add $48, %dl
-    dec %rsi
-    mov %dl, (%rsi)
-    test %rax, %rax
-    jnz .Lpbu_loop
-    lea 71(%rsp), %rdx
-    sub %rsi, %rdx
-    mov $1, %rdi
-    mov $1, %rax
-    syscall
-    add $72, %rsp
+    mov $1, %r10
+    sub $96, %rsp
+    mov %rsp, %rdi
+    call __rmc_emit_unsigned
+    add $96, %rsp
     ret
+.size __rmc_fmt_bin_64, .-__rmc_fmt_bin_64
 "#,
         defines: &[
             "__rmc_fmt_hex_8", "__rmc_fmt_hex_16", "__rmc_fmt_hex_32", "__rmc_fmt_hex_64",
+            "__rmc_fmt_HEX_8", "__rmc_fmt_HEX_16", "__rmc_fmt_HEX_32", "__rmc_fmt_HEX_64",
             "__rmc_fmt_oct_8", "__rmc_fmt_oct_16", "__rmc_fmt_oct_32", "__rmc_fmt_oct_64",
             "__rmc_fmt_bin_8", "__rmc_fmt_bin_16", "__rmc_fmt_bin_32", "__rmc_fmt_bin_64",
-            "__rmc_put_base_unsigned",
         ],
     },
     Piece {
