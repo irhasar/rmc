@@ -461,7 +461,11 @@ compile-time constant is decided at compile time, not by the trap.
   calling a method through a reference does not need an explicit `*`: `r.x`,
   `r[i]` and `r.m()` auto-deref. A reference is one word whether it points at a
   scalar or an aggregate, so a `&Point` parameter costs one register and no
-  copy. There is no borrow checking: rmc does not track how long a reference
+  copy. Because `r.m()` resolves through the reference, a built-in `i64` method
+  on a bare `&i64` receiver (`r.min(0)`) is accepted where rustc binds
+  `<&i64>::min` and demands a reference argument; write `(*r).min(0)` or
+  `r.min(&0)` to match rustc. rmc is a superset here, never a wrong answer.
+  There is no borrow checking: rmc does not track how long a reference
   lives, so it is the programmer's job not to outlive the referent, and `&mut` is
   not enforced to be exclusive.
 - Calls: `f(a, b)`.
