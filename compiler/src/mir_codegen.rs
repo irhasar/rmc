@@ -3037,6 +3037,71 @@ fn fold_addresses(body: &str) -> String {
     out
 }
 
+/// Fold `lea D(%rbp), %t; add $K, %t` into one `lea (D+K)(%rbp), %t`, and drop
+/// an `add $0, %t` that is pure noise.
+///
+/// Walking a struct field-by-field materialises the base address of the local
+/// and then adds each field offset to it, so a local with eight fields pays
+/// eight extra instructions. The offset belongs in the `lea` displacement. Both
+/// rewrites drop an `add`, which is the only instruction here that sets flags,
+/// so they are skipped when a conditional jump reads those flags.
+fn fold_local_offsets(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if let Some((disp, t)) = lea_local(lines[i]) {
+            if let Some((k, arith_dst)) = addsub_imm_at(lines.get(i + 1).copied()) {
+                if arith_dst == t && !flags_used_by(lines.get(i + 2).copied()) {
+                    if k == 0 {
+                        out.push_str(lines[i]);
+                        out.push('\n');
+                        i += 2;
+                        continue;
+                    }
+                    if let Some(sum) = disp.checked_add(k) {
+                        out.push_str(&format!("  lea {sum}(%rbp), {t}\n"));
+                        i += 2;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push_str(lines[i]);
+        out.push('\n');
+        i += 1;
+    }
+    out
+}
+
+/// `lea <disp>(%rbp), <reg>`, returning the displacement and the register.
+fn lea_local(line: &str) -> Option<(i64, &str)> {
+    let t = line.trim();
+    let rest = t.strip_prefix("lea ")?;
+    let (mem, dst) = rest.split_once(',')?;
+    let (mem, dst) = (mem.trim(), dst.trim());
+    let disp = mem.strip_suffix("(%rbp)")?;
+    let disp: i64 = disp.parse().ok()?;
+    is_reg(dst).then_some((disp, dst))
+}
+
+/// `add|sub $k, <reg>` on any line (not just the head of a pair).
+fn addsub_imm_at(line: Option<&str>) -> Option<(i64, &str)> {
+    let (op, k, dst) = addsub_imm(line?)?;
+    let k = if op == "sub" { -k } else { k };
+    Some((k, dst))
+}
+
+/// Whether an instruction reads the flags a preceding `add` would set.
+fn flags_used_by(line: Option<&str>) -> bool {
+    let Some(line) = line else { return false };
+    let t = line.trim();
+    let op = t.split_whitespace().next().unwrap_or("");
+    op.starts_with('j')
+        || op.starts_with("set")
+        || matches!(op, "adc" | "sbb" | "cmov" | "cmovb" | "cmove" | "cmovne")
+}
+
 /// Replace every whole-operand occurrence of `from` with `to`.
 fn replace_reg(line: &str, from: &str, to: &str) -> String {
     let mut out = String::with_capacity(line.len());
@@ -3733,6 +3798,7 @@ fn optimize(body: &str) -> String {
         body = coalesce_scratch(&body);
         body = forward_stores(&body);
         body = fold_addresses(&body);
+        body = fold_local_offsets(&body);
         body = dead_stores(&body);
         body = drop_unread_stores(&body);
     }
