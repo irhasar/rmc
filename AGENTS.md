@@ -387,15 +387,22 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   mis-splits and the constant fails to parse. `string_end` handles both `"..."` 
   and `b"..."`, and skips backslash escapes so an escaped quote does not end the
   literal early.
-- **A literal format argument (`println!("{:x}", 255)`) hits a promoted
-  constant the back end cannot fold.** rustc promotes the literal to
-  `const main::promoted[0]: &i32` (a `static` holding the value, returned as a
-  reference), and `mir.rs::classify_unsupported` rejects any `::promoted[` with
-  a named diagnostic rather than miscompiling. The value case is what works
-  (`let z = 0; println!("{:b}", z)`) and what the `tests/std` cases use; only a
-  literal directly in the argument position is affected. Folding it would mean
-  parsing the promoted body's `_1 = const N; _0 = &_1;` and materialising the
-  value in `.rodata`.
+- **A literal format argument (`println!("{:x}", 255)`) is a promoted
+  constant.** rustc promotes the literal to `const main::promoted[0]: &i32` (a
+  `static` holding the value, returned as a reference). `mir.rs::parse_promoted`
+  reads the promoted body's `_1 = const N; _0 = &_1;` (or `_1 = Add(const A,
+  const B);` from a `macro_rules!` expansion, or a zero-sized `_1 = Q;`) and
+  folds the referent into `Program::promoted`; `mir_codegen.rs` emits the bytes
+  into `.rodata` and `const_operand` returns the label. A promoted body whose
+  referent is not a foldable scalar (an aggregate, a reference) is still
+  rejected by `classify_unsupported` rather than miscompiled.
+- **`a.min(b)`/`a.max(b)` on an integer lower to `<T as Ord>::min`/`max`.**
+  `normalize_call_name` keeps only the final path segment (`min`), which is not
+  a runtime symbol, so the link failed. `mir.rs::std_intrinsic_name` rewrites
+  the call *before* normalisation to `__rmc_imin`/`__rmc_imax` (signed) or
+  `__rmc_umin`/`__rmc_umax` (unsigned), picked from the `T` in the qualifier; the
+  helpers branch rather than use `cmov`, which the in-process assembler cannot
+  encode.
 - **A 32-bit register selects a 32-bit memory access.** `mov (%rdi), %eax` is
   the 32-bit load (`8B /r`), `mov (%rdi), %rax` the 64-bit one (`48 8B /r`);
   likewise for stores. `elf.rs`'s `mov` must derive the operand width from the
