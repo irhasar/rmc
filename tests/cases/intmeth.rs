@@ -47,4 +47,20 @@ fn main() {
         i += 1;
     }
     println!("{}", s);
+    // `is_positive` / `is_negative` yield `bool`; `0` is neither, `i64::MIN`
+    // is negative and not positive.
+    println!("{}", a.is_negative() as i64);
+    println!("{}", a.is_positive() as i64);
+    println!("{}", b.is_positive() as i64);
+    println!("{}", z.is_positive() as i64);
+    println!("{}", z.is_negative() as i64);
+    println!("{}", m.is_negative() as i64);
+    println!("{}", m.is_positive() as i64);
+    println!("{}", MIN.is_negative() as i64);
+    println!("{}", r.is_positive() as i64);
+    if a.is_negative() {
+        println!("{}", 1);
+    } else {
+        println!("{}", 0);
+    }
 }

@@ -106,12 +106,14 @@ pub struct Sema {
     /// gets a distinct identifier. Names carry a leading NUL, which no source
     /// identifier can contain, so they cannot collide with a user binding.
     tmp: u32,
-    /// Set while re-checking the body of a built-in `abs`. Its `-x` is
-    /// compiler-generated, so the `arithmetic_overflow` lint that rejects a
-    /// written `-i64::MIN` must not fire: rustc accepts `i64::MIN.abs()` (it
-    /// yields `i64::MIN` in release and traps under overflow checks), because
-    /// the negation happens inside a generic stdlib body that never folds.
-    in_builtin_abs: bool,
+    /// Set while re-checking the body of a built-in `abs`, whose `-x` is
+    /// compiler-generated. The `arithmetic_overflow` lint that rejects a
+    /// written `-i64::MIN` must not fire on it: rustc accepts `i64::MIN.abs()`
+    /// (it yields `i64::MIN` in release and traps under overflow checks),
+    /// because the negation happens inside a generic stdlib body that never
+    /// folds. Named for the neg it suppresses, not just `abs`, so a future
+    /// desugar that also synthesises a negation reuses it.
+    in_builtin_neg: bool,
     /// How many times each binding name is assigned by an `=` statement in the
     /// current function (the `let` initializer is not counted). rustc folds a
     /// local only when it is assigned at most once in total, so a name with any
@@ -242,7 +244,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         match_total: false,
         match_chain: false,
         tmp: 0,
-        in_builtin_abs: false,
+        in_builtin_neg: false,
         const_locals: HashMap::new(),
         assign_count: HashMap::new(),
         mut_borrowed: std::collections::HashSet::new(),
@@ -660,19 +662,22 @@ impl Sema {
     /// Rewrite a built-in integer method call into an expression over `i64`
     /// operators. `recv` is already checked and, for a `&i64` receiver,
     /// auto-dereferenced to an `i64` place. `min`/`max` need a second operand;
-    /// `abs`/`signum` take none.
+    /// the rest take none. `abs`/`signum`/`min`/`max` yield `i64`;
+    /// `is_positive`/`is_negative` yield `bool`.
     ///
     /// Every desugaring reads its operands more than once (the receiver appears
     /// in both arms, an argument in the test and in a result), so each
     /// non-trivial operand is bound to a temporary first — `g().abs()` must call
     /// `g` once, as rustc does. A plain variable or literal has no side effect
     /// and is reused directly, so `x.abs()` stays a bare branch.
+    ///
+    /// The result type is `Type::I64` unless the method yields `bool`.
     fn desugar_i64_method(
         &mut self,
         name: &str,
         recv: Expr,
         args: &[Expr],
-    ) -> Result<Expr, String> {
+    ) -> Result<(Expr, Type), String> {
         use BinOp::*;
 
         /// Bind `e` to a fresh `\0im<n>` temporary unless it is a plain variable
@@ -696,7 +701,7 @@ impl Sema {
 
         let mut stmts = Vec::new();
         let x = bind(self, recv, &mut stmts);
-        let body = match name {
+        let (body, ty) = match name {
             "abs" => {
                 if !args.is_empty() {
                     return Err("method `abs` takes no arguments".into());
@@ -705,10 +710,13 @@ impl Sema {
                 // maps to itself rather than trapping — `rustc -O` semantics.
                 let cond = Expr::Bin(Lt, Box::new(x.clone()), Box::new(Expr::Int(0)));
                 let neg = Expr::Un(UnOp::Neg, Box::new(x.clone()));
-                Expr::If(
-                    Box::new(cond),
-                    Block { stmts: Vec::new(), tail: Some(Box::new(neg)) },
-                    Some(Block { stmts: Vec::new(), tail: Some(Box::new(x)) }),
+                (
+                    Expr::If(
+                        Box::new(cond),
+                        Block { stmts: Vec::new(), tail: Some(Box::new(neg)) },
+                        Some(Block { stmts: Vec::new(), tail: Some(Box::new(x)) }),
+                    ),
+                    Type::I64,
                 )
             }
             "signum" => {
@@ -725,7 +733,16 @@ impl Sema {
                     Box::new(Expr::Bin(Lt, Box::new(x), Box::new(Expr::Int(0)))),
                     Type::I64,
                 );
-                Expr::Bin(Sub, Box::new(pos), Box::new(neg))
+                (Expr::Bin(Sub, Box::new(pos), Box::new(neg)), Type::I64)
+            }
+            "is_positive" | "is_negative" => {
+                if !args.is_empty() {
+                    return Err(format!("method `{name}` takes no arguments"));
+                }
+                // A comparison already yields `bool`, so this is `x > 0` /
+                // `x < 0` with no cast; `0` is neither positive nor negative.
+                let cmp = if name == "is_positive" { Gt } else { Lt };
+                (Expr::Bin(cmp, Box::new(x), Box::new(Expr::Int(0))), Type::Bool)
             }
             "min" | "max" => {
                 if args.len() != 1 {
@@ -738,19 +755,23 @@ impl Sema {
                 // `if y > x { y } else { x }`; both return `x` on a tie.
                 let cmp = if name == "min" { Lt } else { Gt };
                 let cond = Expr::Bin(cmp, Box::new(y.clone()), Box::new(x.clone()));
-                Expr::If(
-                    Box::new(cond),
-                    Block { stmts: Vec::new(), tail: Some(Box::new(y)) },
-                    Some(Block { stmts: Vec::new(), tail: Some(Box::new(x)) }),
+                (
+                    Expr::If(
+                        Box::new(cond),
+                        Block { stmts: Vec::new(), tail: Some(Box::new(y)) },
+                        Some(Block { stmts: Vec::new(), tail: Some(Box::new(x)) }),
+                    ),
+                    Type::I64,
                 )
             }
             _ => unreachable!("checked by the caller"),
         };
-        if stmts.is_empty() {
-            Ok(body)
+        let body = if stmts.is_empty() {
+            body
         } else {
-            Ok(Expr::Block(Block { stmts, tail: Some(Box::new(body)) }))
-        }
+            Expr::Block(Block { stmts, tail: Some(Box::new(body)) })
+        };
+        Ok((body, ty))
     }
 
     fn lookup(scope: &Scope, name: &str) -> Option<(i32, Type, bool, bool)> {
@@ -1688,7 +1709,7 @@ impl Sema {
                         // not a negation, so only a written `-` reaches here.
                         // The negation inside a built-in `abs` is exempt: it is
                         // not a written `-`, and rustc accepts it.
-                        if !self.in_builtin_abs
+                        if !self.in_builtin_neg
                             && self.const_of(inner, &self.const_locals) == Some(i64::MIN)
                         {
                             return Err("this arithmetic operation overflows".into());
@@ -2303,11 +2324,15 @@ impl Sema {
                 // to expressions over the operators rmc already lowers, so
                 // codegen is untouched, and they mirror `rustc -O` exactly:
                 // `abs` of `i64::MIN` is `i64::MIN` (no trap), `signum` of zero
-                // is zero. A method of the same name on a struct or enum still
-                // reaches the user-method path below, because this only fires
-                // when the receiver's type is `i64`.
+                // is zero, `is_positive`/`is_negative` of zero are both false.
+                // A method of the same name on a struct or enum still reaches
+                // the user-method path below, because this only fires when the
+                // receiver's type is `i64`.
                 if matches!(base_ty, Type::I64)
-                    && matches!(name.as_str(), "abs" | "min" | "max" | "signum")
+                    && matches!(
+                        name.as_str(),
+                        "abs" | "min" | "max" | "signum" | "is_positive" | "is_negative"
+                    )
                 {
                     let is_abs = name == "abs";
                     let recv = std::mem::replace(recv.as_mut(), Expr::Int(0));
@@ -2317,15 +2342,17 @@ impl Sema {
                     } else {
                         recv
                     };
-                    let rewritten = self.desugar_i64_method(name, recv, args)?;
+                    let (rewritten, ret) = self.desugar_i64_method(name, recv, args)?;
                     *e = rewritten;
                     // `abs` synthesises a `-x`; mark the re-check so the
                     // neg-overflow lint does not fire on it (see the field).
-                    let saved = self.in_builtin_abs;
-                    self.in_builtin_abs = is_abs;
+                    let saved = self.in_builtin_neg;
+                    self.in_builtin_neg = is_abs;
                     let r = self.check_expr(e, scope);
-                    self.in_builtin_abs = saved;
-                    return r;
+                    self.in_builtin_neg = saved;
+                    // The desugared expression's own type is the method's
+                    // result type (`bool` for the `is_*` predicates).
+                    return r.map(|_| ret);
                 }
                 // A method lives on a struct or an enum; both give the mangled
                 // prefix `Type$method`.

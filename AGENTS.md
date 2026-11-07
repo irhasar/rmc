@@ -1297,22 +1297,27 @@ The checks, all in `sema.rs`:
   effects (dropped entirely when it is a named local). A user `len` on a struct or
   enum still falls through to the mangled-method path. rmc's `.len()` is `i64`
   where rustc's is `usize`, so a differential twin casts with `as i64`.
-- **Built-in `i64` methods (`abs`/`min`/`max`/`signum`).** Like `len()`, they are
-  special-cased in the `MethodCall` arm of sema before the struct/enum lookup,
+- **Built-in `i64` methods
+  (`abs`/`min`/`max`/`signum`/`is_positive`/`is_negative`).** Like `len()`, they
+  are special-cased in the `MethodCall` arm of sema before the struct/enum lookup,
   and only when the receiver's type is `i64`, so a user `min` on a struct is
   untouched. `desugar_i64_method` rewrites the call into an expression over the
   operators rmc already lowers, so codegen gains no case and no runtime helper:
   `abs` is `if x < 0 { -x } else { x }` (so `i64::MIN` maps to itself, matching
   `rustc -O`; under `--overflow-checks` the `neg` traps, matching a debug build),
   `signum` is `(x > 0) as i64 - (x < 0) as i64` (comparisons only, so `i64::MIN`
-  never overflows), and `min`/`max` compare `y` against `x`
-  (`if y < x { y } else { x }` for `min`), returning `x` on a tie. Each desugar
-  reads an operand more than once, so every non-trivial operand is first bound to
-  a fresh `\0im<n>` temporary (`Sema::tmp`), receiver before argument — `g().abs()`
-  calls `g` once, as rustc does; a plain variable or literal is reused directly.
+  never overflows), `min`/`max` compare `y` against `x`
+  (`if y < x { y } else { x }` for `min`), returning `x` on a tie, and
+  `is_positive`/`is_negative` are the bare comparisons `x > 0` / `x < 0` (so
+  `0` is neither, and both return `bool`, unlike the `i64`-valued four). Each
+  desugar reads an operand more than once, so every non-trivial operand is first
+  bound to a fresh `\0im<n>` temporary (`Sema::tmp`), receiver before argument —
+  `g().abs()` calls `g` once, as rustc does; a plain variable or literal is
+  reused directly. The desugar returns its result type (`i64`, or `bool` for the
+  predicates) so the caller reports the right type without re-deriving it.
   `abs`'s synthesized `-x` is exempt from the compile-time neg-overflow lint
-  (`Sema::in_builtin_abs`), because rustc accepts `i64::MIN.abs()`: a written
-  `-i64::MIN` is still rejected.
+  (`Sema::in_builtin_neg`, named for the neg it suppresses), because rustc
+  accepts `i64::MIN.abs()`: a written `-i64::MIN` is still rejected.
 - **Parameter names (`E0415`) and `main` (`E0580`).** A function's parameters
   must be uniquely named; `check_fn` rejects a duplicate (rmc used to bind both
   to one slot). The parser applies the same check earlier

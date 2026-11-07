@@ -104,19 +104,23 @@ variant of that enum and not an associated function is reported as such.
 
 ### Built-in integer methods
 
-An `i64` receiver has four methods built in, which desugar to the operators rmc
+An `i64` receiver has six methods built in, which desugar to the operators rmc
 already lowers (so they cost no call and add nothing to the runtime):
 
-| call            | meaning                                        |
-| --------------- | ---------------------------------------------- |
-| `x.abs()`       | `if x < 0 { -x } else { x }`                    |
-| `x.signum()`    | `-1`, `0` or `1`                                |
-| `x.min(y)`      | the smaller of `x` and `y` (returns `x` on a tie) |
-| `x.max(y)`      | the larger of `x` and `y` (returns `x` on a tie) |
+| call              | meaning                                        |
+| ----------------- | ---------------------------------------------- |
+| `x.abs()`         | `if x < 0 { -x } else { x }`                    |
+| `x.signum()`      | `-1`, `0` or `1`                                |
+| `x.min(y)`        | the smaller of `x` and `y` (returns `x` on a tie) |
+| `x.max(y)`        | the larger of `x` and `y` (returns `x` on a tie) |
+| `x.is_positive()` | `x > 0` (a `bool`)                              |
+| `x.is_negative()` | `x < 0` (a `bool`)                              |
 
 The semantics match `rustc -O`: `i64::MIN.abs()` is `i64::MIN` (it does not
 trap; with `--overflow-checks` it traps, as in a debug build), and `signum` is
 computed with comparisons only, so `i64::MIN.signum()` is `-1` without overflow.
+`is_positive`/`is_negative` return `bool` — unlike the four above, which return
+`i64` — and `0` is neither positive nor negative, so both are `false` there.
 Each method evaluates its receiver — and, for `min`/`max`, its argument — exactly
 once, so `g().abs()` calls `g` once. A method of the same name on a struct or
 enum is unaffected — the built-in only fires when the receiver's type is `i64`.

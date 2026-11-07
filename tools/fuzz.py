@@ -1870,27 +1870,43 @@ def gen_intmeth_program(rng):
 
     def call():
         k = rng.random()
-        if k < 0.3:
+        if k < 0.25:
             return f"({recv()}).abs()"
-        if k < 0.55:
+        if k < 0.45:
             return f"({recv()}).signum()"
-        if k < 0.8:
+        if k < 0.7:
             return f"({recv()}).min({gen_i64(rng, 1)})"
         return f"({recv()}).max({gen_i64(rng, 1)})"
 
-    exprs = [call() for _ in range(6)]
-    # A constant `i64::MIN` exercises `abs` (maps to itself) and `signum` (-1).
+    def pred():
+        """A `bool`-valued method, cast to `i64` so it prints like the rest."""
+        m = rng.choice(["is_positive", "is_negative"])
+        return f"(({recv()}).{m}() as i64)"
+
+    exprs = [call() for _ in range(6)] + [pred() for _ in range(4)]
+    # A constant `i64::MIN` exercises `abs` (maps to itself) and `signum` (-1);
+    # it is negative and not positive. `i64::MAX` is the mirror.
     exprs.append("(MIN).abs()")
     exprs.append("(MIN).signum()")
     exprs.append("(MIN).min(0)")
     exprs.append("(MIN).max(0)")
+    exprs.append("(MIN).is_negative() as i64")
+    exprs.append("(MIN).is_positive() as i64")
+    exprs.append("(MAX).is_positive() as i64")
+    exprs.append("(MAX).is_negative() as i64")
+    # Zero is neither positive nor negative.
+    exprs.append("(0).is_positive() as i64")
+    exprs.append("(0).is_negative() as i64")
     # A chain, so the outer method's receiver is another method call.
     exprs.append(f"({call()}).min({call()})")
+    exprs.append(f"({call()}).is_positive() as i64")
+    exprs.append(f"({call()}).is_negative() as i64")
     rms = [
         # `h` prints before returning, so a receiver or argument evaluated more
         # than once shows up as extra output and the diff catches it.
         "fn h(x: i64) -> i64 { print_i64(x); return x; }",
         "const MIN: i64 = -9223372036854775808;",
+        "const MAX: i64 = 9223372036854775807;",
         "fn main() -> i64 {",
         "    let a: i64 = arg_i64(1);",
         "    let b: i64 = arg_i64(2);",
@@ -1899,6 +1915,7 @@ def gen_intmeth_program(rng):
     rs = [
         "fn h(x: i64) -> i64 { println!(\"{}\", x); return x; }",
         "const MIN: i64 = -9223372036854775808;",
+        "const MAX: i64 = 9223372036854775807;",
         "fn main() {",
         "    let args: Vec<i64> = std::env::args().skip(1).map(|s| s.parse().unwrap()).collect();",
         "    let a: i64 = args[0];",

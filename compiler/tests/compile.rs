@@ -5076,6 +5076,37 @@ fn a_side_effecting_min_argument_is_evaluated_once() {
 }
 
 #[test]
+fn is_positive_and_is_negative_evaluate_the_receiver_once() {
+    // `is_negative` desugars to a comparison, which reads the receiver once,
+    // but it still goes through the temp-binding path so a call receiver is
+    // evaluated a single time.
+    let out = asm_no_inline(
+        "fn g() -> i64 { return 3; } \
+         fn main() -> i64 { let b: bool = g().is_negative(); if b { return 1; } return 0; }",
+    );
+    let body = &out[out.find("main:").expect("main")..];
+    assert_eq!(body.matches("call g").count(), 1, "receiver must be called once:\n{body}");
+    assert!(body.contains("cmp"), "expected a comparison:\n{body}");
+}
+
+#[test]
+fn is_positive_yields_a_bool_usable_as_one() {
+    // The result type is `bool`, not `i64`: it initialises a `bool` binding and
+    // drives an `if` with no cast. `0` is neither positive nor negative.
+    let out = asm(
+        "fn main() -> i64 { \
+         let x: i64 = -5; \
+         let p: bool = x.is_positive(); \
+         let n: bool = x.is_negative(); \
+         if n { return 1; } \
+         if p { return 2; } \
+         return 0; \
+         }",
+    );
+    assert!(out.contains("main:"));
+}
+
+#[test]
 fn a_builtin_integer_method_on_a_struct_is_not_shadowed() {
     // A struct may still define its own `min`; the built-in only fires on an
     // `i64` receiver.
