@@ -260,24 +260,48 @@ __rmc_write_template:
 .Lph_no_flags:
     test $0x02, %dl          # width present
     jz .Lph_no_width
-    test $0x10, %dl          # width indirect (an argument, not a value)
-    jnz .Lph_skip_width
     movzwl (%r12), %eax
+    test $0x10, %dl          # width indirect: the field is an argument index
+    jz .Lph_width_val
+    shl $4, %rax             # the Count value sits at +8 in the argument
+    add %r13, %rax
+    movzwl 8(%rax), %eax
+.Lph_width_val:
     shl $32, %rax
     or %rax, %r10
-.Lph_skip_width:
     add $2, %r12
 .Lph_no_width:
     test $0x04, %dl          # precision present
     jz .Lph_no_prec
-    test $0x20, %dl          # precision indirect
-    jnz .Lph_skip_prec
     movzwl (%r12), %eax
+    test $0x20, %dl          # precision indirect
+    jz .Lph_prec_val
+    shl $4, %rax
+    add %r13, %rax
+    movzwl 8(%rax), %eax
+.Lph_prec_val:
+    inc %eax                 # stored as prec + 1, so 0 still means "none"
     shl $48, %rax
     or %rax, %r10
-.Lph_skip_prec:
     add $2, %r12
 .Lph_no_prec:
+    # A precision of 0 has no precision field, only the flag, so re-create it.
+    mov %r10, %rax
+    shr $48, %rax
+    jnz .Lph_have_prec
+    test $0x10000000, %r10d  # PRECISION_FLAG
+    jz .Lph_have_prec
+    movabs $0x0001000000000000, %rax
+    or %rax, %r10
+.Lph_have_prec:
+    # A precision wider than the widest rendered value (96 bytes) is unbounded.
+    mov %r10, %rax
+    shr $48, %rax
+    cmp $96, %rax
+    jbe .Lph_prec_ok
+    movabs $0x0000FFFFFFFFFFFF, %rcx
+    and %rcx, %r10
+.Lph_prec_ok:
     test $0x08, %dl          # arg_index present
     jz .Lph_implicit
     movzwl (%r12), %eax
@@ -381,6 +405,39 @@ __rmc_compare_bytes:
 __rmc_fmt_mode: .quad 0
 
 .text
+# long __rmc_utf8_trunc(const char *s, long n, long max)  -- the byte length of
+# the first `max` UTF-8 characters of the `n`-byte string `s`.
+__rmc_utf8_trunc:
+    xor %rax, %rax
+    test %rsi, %rsi
+    jz .Lut_done
+.Lut_loop:
+    cmp %rsi, %rax
+    jae .Lut_done
+    test %rdx, %rdx
+    jz .Lut_done
+    movzbl (%rdi,%rax), %ecx
+    inc %rax
+    cmp $0x80, %ecx
+    jb .Lut_next
+    cmp $0xE0, %ecx
+    jae .Lut_3
+    inc %rax
+    jmp .Lut_next
+.Lut_3:
+    cmp $0xF0, %ecx
+    jae .Lut_4
+    add $2, %rax
+    jmp .Lut_next
+.Lut_4:
+    add $3, %rax
+.Lut_next:
+    dec %rdx
+    jmp .Lut_loop
+.Lut_done:
+    ret
+.size __rmc_utf8_trunc, .-__rmc_utf8_trunc
+
 # void __rmc_fmt_set(long mode)  -- stash the current placeholder's options:
 # bits 0..20 the fill char, 21..31 the sign/alternate/zero-pad/align flags
 # (rustc's `FormattingOptions::flags`), 32..47 the width, 48..63 the precision.
@@ -436,10 +493,11 @@ __rmc_put_fill:
     ret
 .size __rmc_put_fill, .-__rmc_put_fill
 
-# void __rmc_fmt_pad(const char *value, long len)  -- write the pending value
-# honouring `__rmc_fmt_mode`. `%rdi`/`%rsi` are the value's digits (sign and any
-# `0x`/`0b`/`0o` prefix already in place). With no options set this is a bare
-# write; otherwise the value is padded to the width.
+# void __rmc_fmt_pad(const char *value, long len, long text)  -- write the
+# pending value honouring `__rmc_fmt_mode`. `%rdi`/`%rsi` are the value's bytes
+# (sign and any `0x`/`0b`/`0o` prefix already in place) and `%rdx` is non-zero
+# when the value reads as text, the only case where a precision truncates. With
+# no options set this is a bare write; otherwise the value is padded to width.
 __rmc_fmt_pad:
     cmpq $0, __rmc_fmt_mode(%rip)
     jne .Lpad_slow
@@ -458,6 +516,20 @@ __rmc_fmt_pad:
     push %r15
     mov %rdi, %rbx           # value start
     mov %rsi, %rbp           # len
+    # A precision truncates a text value to that many characters; a numeric
+    # value ignores it, exactly as rustc does.
+    test %rdx, %rdx
+    jz .Lprec_done
+    mov __rmc_fmt_mode(%rip), %rdx
+    shr $48, %rdx
+    test %rdx, %rdx
+    jz .Lprec_done
+    dec %rdx
+    mov %rbx, %rdi
+    mov %rbp, %rsi
+    call __rmc_utf8_trunc
+    mov %rax, %rbp
+.Lprec_done:
     mov __rmc_fmt_mode(%rip), %r14
     mov %r14, %r15
     shr $32, %r15
@@ -629,6 +701,7 @@ __rmc_emit_signed:
     mov %r12, %rdi
     lea 96(%rbx), %rsi
     sub %r12, %rsi
+    xor %edx, %edx           # a numeric value: a precision does not apply
     call __rmc_fmt_pad
     pop %r12
     pop %rbx
@@ -700,6 +773,7 @@ __rmc_emit_unsigned:
     mov %r12, %rdi
     lea 96(%rbx), %rsi
     sub %r12, %rsi
+    xor %edx, %edx           # a numeric value: a precision does not apply
     call __rmc_fmt_pad
     pop %r13
     pop %r12
@@ -780,7 +854,7 @@ __rmc_fmt_bool:
     jmp .Lbool_cp_loop
 .Lbool_pad:
     mov %ecx, %esi
-    lea 96(%rsp), %rdx
+    mov $1, %edx
     call __rmc_fmt_pad
     add $96, %rsp
     ret
@@ -795,8 +869,8 @@ __rmc_fmt_char:
     mov %rsp, %rsi
     call __rmc_utf8_encode
     mov %rsp, %rdi
-    lea 96(%rsp), %rdx
     mov %rax, %rsi
+    mov $1, %edx
     call __rmc_fmt_pad
     add $96, %rsp
     ret
@@ -813,9 +887,7 @@ __rmc_fmt_str:
     call __rmc_fmt_left
     mov (%rdi), %rsi
     lea 8(%rdi), %rdi
-    mov %rdi, %rax
-    add %rsi, %rax
-    mov %rax, %rdx
+    mov $1, %edx
     call __rmc_fmt_pad
     ret
 .size __rmc_fmt_str, .-__rmc_fmt_str
@@ -839,27 +911,211 @@ __rmc_fmt_left:
 
 .globl __rmc_fmt_str_debug
 .type __rmc_fmt_str_debug, @function
-__rmc_fmt_str_debug:
-    # Debug for a string quotes it and escapes `"` `\` and control characters.
-    mov (%rdi), %rdi
-    call __rmc_fmt_left
-    mov (%rdi), %rsi
-    lea 8(%rdi), %rdi
-    mov %rdi, %rax
-    add %rsi, %rax
-    mov %rax, %rdx
-    call __rmc_fmt_pad
+# long __rmc_dbg_len(const char *s, long n)  -- the escaped length of the
+# `n`-byte string `s`, excluding the surrounding quotes. `Debug` for `str`
+# escapes `"`, `\\`, the three named control characters and every other C0
+# control plus DEL as `\\u{..}` with no leading zeros.
+__rmc_dbg_len:
+    xor %rax, %rax
+    xor %rdx, %rdx
+.Ldl_loop:
+    cmp %rsi, %rdx
+    jae .Ldl_done
+    movzbl (%rdi,%rdx), %ecx
+    inc %rdx
+    cmp $34, %cl
+    je .Ldl_two
+    cmp $92, %cl
+    je .Ldl_two
+    cmp $10, %cl
+    je .Ldl_two
+    cmp $13, %cl
+    je .Ldl_two
+    cmp $9, %cl
+    je .Ldl_two
+    cmp $32, %cl
+    jb .Ldl_uni
+    cmp $127, %cl
+    je .Ldl_uni
+    inc %rax
+    jmp .Ldl_loop
+.Ldl_two:
+    add $2, %rax
+    jmp .Ldl_loop
+.Ldl_uni:
+    add $5, %rax             # \u{d}
+    cmp $16, %ecx
+    jb .Ldl_loop
+    inc %rax                 # \u{dd}
+    jmp .Ldl_loop
+.Ldl_done:
     ret
+.size __rmc_dbg_len, .-__rmc_dbg_len
+
+# long __rmc_escape_one(char c)  -- the escape sequence for `%cl`, written to
+# the 16-byte scratch `%r14`; returns its length. A byte that needs no escaping
+# is never passed here.
+__rmc_escape_one:
+    cmp $34, %cl
+    je .Le1_two
+    cmp $92, %cl
+    je .Le1_two
+    cmp $10, %cl
+    je .Le1_n
+    cmp $13, %cl
+    je .Le1_r
+    cmp $9, %cl
+    je .Le1_t
+    movb $92, (%r14)
+    movb $117, 1(%r14)       # 'u'
+    movb $123, 2(%r14)       # '{'
+    lea __rmc_hexdigit(%rip), %rsi
+    movzbl %cl, %eax
+    cmp $16, %eax
+    jb .Le1_one
+    mov %eax, %edx
+    shr $4, %edx
+    movzbl (%rsi,%rdx), %edx
+    mov %dl, 3(%r14)
+    mov %eax, %edx
+    and $15, %edx
+    movzbl (%rsi,%rdx), %edx
+    mov %dl, 4(%r14)
+    movb $125, 5(%r14)       # '}'
+    mov $6, %eax
+    ret
+.Le1_one:
+    movzbl (%rsi,%rax), %edx
+    mov %dl, 3(%r14)
+    movb $125, 4(%r14)
+    mov $5, %eax
+    ret
+.Le1_two:
+    movb $92, (%r14)
+    mov %cl, 1(%r14)
+    mov $2, %eax
+    ret
+.Le1_n:
+    movb $92, (%r14)
+    movb $110, 1(%r14)
+    mov $2, %eax
+    ret
+.Le1_r:
+    movb $92, (%r14)
+    movb $114, 1(%r14)
+    mov $2, %eax
+    ret
+.Le1_t:
+    movb $92, (%r14)
+    movb $116, 1(%r14)
+    mov $2, %eax
+    ret
+.size __rmc_escape_one, .-__rmc_escape_one
+
+# void __rmc_dbg_body(const char *s, long n)  -- write `"`, the escaped bytes of
+# the `n`-byte string `s`, then `"`.
+__rmc_dbg_body:
+    push %rbx
+    push %rbp
+    push %r12
+    push %r13
+    push %r14
+    sub $32, %rsp
+    mov %rdi, %rbx
+    mov %rsi, %rbp
+    lea 16(%rsp), %r14       # the escape scratch
+    movb $34, (%rsp)
+    mov $1, %edx
+    mov %rsp, %rsi
+    mov $1, %rdi
+    mov $1, %rax
+    syscall
+    xor %r12, %r12           # cursor
+    xor %r13, %r13           # start of the pending plain run
+.Ldb_loop:
+    cmp %rbp, %r12
+    jae .Ldb_tail
+    movzbl (%rbx,%r12), %ecx
+    cmp $34, %cl
+    je .Ldb_esc
+    cmp $92, %cl
+    je .Ldb_esc
+    cmp $10, %cl
+    je .Ldb_esc
+    cmp $13, %cl
+    je .Ldb_esc
+    cmp $9, %cl
+    je .Ldb_esc
+    cmp $32, %cl
+    jb .Ldb_esc
+    cmp $127, %cl
+    je .Ldb_esc
+    inc %r12
+    jmp .Ldb_loop
+.Ldb_esc:
+    mov %r12, %rdx
+    sub %r13, %rdx
+    jz .Ldb_noflush
+    lea (%rbx,%r13), %rsi
+    mov $1, %rdi
+    mov $1, %rax
+    syscall
+.Ldb_noflush:
+    movzbl (%rbx,%r12), %ecx
+    call __rmc_escape_one
+    mov %rax, %rdx
+    mov %r14, %rsi
+    mov $1, %rdi
+    mov $1, %rax
+    syscall
+    inc %r12
+    mov %r12, %r13
+    jmp .Ldb_loop
+.Ldb_tail:
+    mov %r12, %rdx
+    sub %r13, %rdx
+    jz .Ldb_close
+    lea (%rbx,%r13), %rsi
+    mov $1, %rdi
+    mov $1, %rax
+    syscall
+.Ldb_close:
+    movb $34, (%rsp)
+    mov $1, %edx
+    mov %rsp, %rsi
+    mov $1, %rdi
+    mov $1, %rax
+    syscall
+    add $32, %rsp
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %rbp
+    pop %rbx
+    ret
+.size __rmc_dbg_body, .-__rmc_dbg_body
+
+# void __rmc_fmt_str_debug(const char **slot)  -- `{:?}` for a `&str`. The
+# value is quoted and escaped. rustc's `Debug for str` writes the value with
+# `write_char` and never calls the formatter's padding, so every option --
+# width, fill, alignment and precision -- is ignored.
+__rmc_fmt_str_debug:
+    mov (%rdi), %rdi
+    mov (%rdi), %rsi         # len
+    lea 8(%rdi), %rdi        # bytes
+    jmp __rmc_dbg_body
 .size __rmc_fmt_str_debug, .-__rmc_fmt_str_debug
 
 .section .rodata
 __rmc_fmt_true:  .ascii "true"
 __rmc_fmt_false: .ascii "false"
+__rmc_hexdigit:  .ascii "0123456789abcdef"
 "#,
         defines: &[
             "__rmc_fmt_i64", "__rmc_fmt_u64", "__rmc_fmt_i32", "__rmc_fmt_u32",
             "__rmc_fmt_bool", "__rmc_fmt_char", "__rmc_fmt_str", "__rmc_fmt_str_debug",
             "__rmc_fmt_set", "__rmc_fmt_pad", "__rmc_put_fill", "__rmc_fmt_left",
+            "__rmc_dbg_len", "__rmc_escape_one", "__rmc_dbg_body",
             "__rmc_emit_signed", "__rmc_emit_unsigned",
         ],
     },

@@ -2127,27 +2127,77 @@ fn parse_uint(num: &str) -> Option<u64> {
 
 fn unescape(s: &str) -> String {
     let mut out = String::new();
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some('n') => out.push('\n'),
-                Some('t') => out.push('\t'),
-                Some('r') => out.push('\r'),
-                Some('0') => out.push('\0'),
-                Some('\\') => out.push('\\'),
-                Some('"') => out.push('"'),
-                Some(other) => {
-                    out.push('\\');
-                    out.push(other);
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'\\' {
+            // Copy a whole UTF-8 sequence so a multi-byte literal stays intact.
+            let len = utf8_len(b[i]);
+            let end = (i + len).min(b.len());
+            out.push_str(&s[i..end]);
+            i = end;
+            continue;
+        }
+        i += 1;
+        let Some(&c) = b.get(i) else {
+            out.push('\\');
+            break;
+        };
+        i += 1;
+        match c {
+            b'n' => out.push('\n'),
+            b't' => out.push('\t'),
+            b'r' => out.push('\r'),
+            b'0' => out.push('\0'),
+            b'\\' => out.push('\\'),
+            b'"' => out.push('"'),
+            b'\'' => out.push('\''),
+            b'x' => {
+                // `\xNN` -- exactly two hex digits.
+                if let (Some(hi), Some(lo)) = (
+                    b.get(i).and_then(|c| (*c as char).to_digit(16)),
+                    b.get(i + 1).and_then(|c| (*c as char).to_digit(16)),
+                ) {
+                    out.push((hi * 16 + lo) as u8 as char);
+                    i += 2;
+                } else {
+                    out.push_str("\\x");
                 }
-                None => out.push('\\'),
             }
-        } else {
-            out.push(c);
+            b'u' => {
+                // `\u{...}` -- braced hex, e.g. `\u{1F600}`.
+                let rest = &s[i..];
+                if let Some(inner) = rest.strip_prefix('{').and_then(|r| r.split_once('}')) {
+                    if let Ok(cp) = u32::from_str_radix(inner.0, 16) {
+                        if let Some(ch) = char::from_u32(cp) {
+                            out.push(ch);
+                        }
+                        i += inner.0.len() + 2;
+                    }
+                } else {
+                    out.push_str("\\u");
+                }
+            }
+            other => {
+                out.push('\\');
+                out.push(other as char);
+            }
         }
     }
     out
+}
+
+/// The byte length of the UTF-8 sequence whose lead byte is `b`.
+fn utf8_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b < 0xE0 {
+        2
+    } else if b < 0xF0 {
+        3
+    } else {
+        4
+    }
 }
 
 /// `'A'`, `'\n'`, `'\u{1F600}'` — a `char` literal as MIR prints it, returned

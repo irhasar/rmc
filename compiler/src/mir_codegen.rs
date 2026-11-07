@@ -452,47 +452,6 @@ fn collect_strings(prog: &Program) -> (Vec<String>, HashMap<String, String>) {
     (order, map)
 }
 
-/// Walk a `format_args!` template and return a description of the first
-/// placeholder that carries flags, a width or a precision, or `None` if every
-/// placeholder is plain. The runtime walker skips those fields (it must, to
-/// reach the argument index) but renders the value in full, so such a template
-/// would be silently mis-rendered; the caller rejects it instead.
-///
-/// A placeholder byte is `0b11xxxxxx`; bits 0..3 mark a present `flags` (u32),
-/// `width` (u16), `precision` (u16) and `arg_index` (u16). Only the optional
-/// `arg_index` is harmless.
-fn template_unrendered_field(t: &[u8]) -> Option<&'static str> {
-    let mut i = 0;
-    while i < t.len() {
-        let b = t[i];
-        if b < 0x80 {
-            i += 1 + b as usize; // literal piece: length byte, then the bytes
-        } else if b < 0xC0 {
-            if i + 3 > t.len() {
-                return None;
-            }
-            let len = t[i + 1] as usize | ((t[i + 2] as usize) << 8);
-            i += 3 + len; // long literal: 0x80, u16 length, then the bytes
-        } else {
-            let bits = b & 0x0F;
-            if bits & 0x01 != 0 {
-                return Some("flags");
-            }
-            if bits & 0x02 != 0 {
-                return Some("width");
-            }
-            if bits & 0x04 != 0 {
-                return Some("precision");
-            }
-            i += 1;
-            if bits & 0x08 != 0 {
-                i += 2; // arg_index
-            }
-        }
-    }
-    None
-}
-
 /// Every distinct `format_args!` template byte string, in first-seen order, and
 /// a map from its bytes to a `.rodata` label.
 fn collect_templates(prog: &Program) -> (Vec<Vec<u8>>, HashMap<Vec<u8>, String>) {
