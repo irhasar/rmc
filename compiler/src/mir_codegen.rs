@@ -191,7 +191,7 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<String, String> {
         if strings.is_empty() && templates.is_empty() {
             rodata.push_str("\n.section .rodata\n");
         }
-        for id in alloc_ids {
+        for &id in &alloc_ids {
             let data = &prog.allocs[id];
             let label = &alloc_labels[id];
             let _ = writeln!(rodata, "{label}:");
@@ -215,6 +215,38 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<String, String> {
             if off < data.bytes.len() {
                 let bytes: Vec<String> = data.bytes[off..].iter().map(|b| b.to_string()).collect();
                 let _ = writeln!(rodata, "  .byte {}", bytes.join(", "));
+            }
+        }
+    }
+    // Promoted constants: the scalar a `const main::promoted[N]` points at, as a
+    // `.rodata` blob. A `&i32` referent is a word; a `&char` is four bytes, so
+    // the blob is the referent's size, padded to a word.
+    let mut promoted_names: Vec<&String> = prog.promoted.keys().collect();
+    promoted_names.sort();
+    if !promoted_names.is_empty() {
+        if strings.is_empty() && templates.is_empty() && alloc_ids.is_empty() {
+            rodata.push_str("\n.section .rodata\n");
+        }
+        for name in promoted_names {
+            let p = &prog.promoted[name];
+            let label = promoted_label(name);
+            let _ = writeln!(rodata, ".balign 8");
+            let _ = writeln!(rodata, "{label}:");
+            let words = ((p.size + 7) / 8).max(1);
+            let mut data = vec![0i64; words as usize];
+            for (off, v) in &p.bytes {
+                let w = (off / 8) as usize;
+                if w < data.len() {
+                    // A char is four bytes; the rest of its word stays zero.
+                    if p.size == 4 {
+                        data[w] = (*v as u32) as i64;
+                    } else {
+                        data[w] = *v;
+                    }
+                }
+            }
+            for v in &data {
+                let _ = writeln!(rodata, "  .quad {}", *v as u64);
             }
         }
     }
@@ -380,6 +412,20 @@ fn int_kind(name: &str) -> (bool, u32) {
         }
     }
     (true, 64)
+}
+
+/// The `.rodata` label for a promoted constant, derived from its MIR name
+/// (`main::promoted[0]`) so it is stable and cannot collide with a user symbol.
+fn promoted_label(name: &str) -> String {
+    let mut out = String::from("__rmc_promoted_");
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    out
 }
 
 /// Every distinct string literal in the program, in first-seen order, and a map
@@ -1827,6 +1873,12 @@ impl<'a> FnGen<'a> {
             .unwrap_or_else(|| s.to_string())
     }
 
+    /// The `.rodata` label for a promoted constant the parser folded, or `None`
+    /// when the name is not a folded promoted constant.
+    fn promoted_label(&self, name: &str) -> Option<String> {
+        self.prog.promoted.contains_key(name).then(|| promoted_label(name))
+    }
+
     /// The `.rodata` label for a `format_args!` template's bytes.
     fn template_label(&self, b: &[u8]) -> String {
         self.template_ids
@@ -1847,6 +1899,7 @@ impl<'a> FnGen<'a> {
         Ok(match c {
             Const::Int(n) => format!("${n}"),
             Const::Bool(b) => format!("${}", *b as i64),
+            Const::Char(c) => format!("${c}"),
             Const::Unit => "$0".to_string(),
             Const::Str(s) => {
                 // A string literal is the address of its `.rodata` record, so it
@@ -1857,7 +1910,15 @@ impl<'a> FnGen<'a> {
                 "%rax".to_string()
             }
             Const::Named(n) => {
-                return Err(format!("mir_codegen: unsupported constant `{n}`"));
+                // A folded promoted constant is the address of its `.rodata`
+                // blob. Anything else (`{..}` aggregate the parser could not
+                // model) stays a hard error rather than a wrong value.
+                if let Some(label) = self.promoted_label(n) {
+                    self.emit(&format!("  lea {label}(%rip), %rax"));
+                    "%rax".to_string()
+                } else {
+                    return Err(format!("mir_codegen: unsupported constant `{n}`"));
+                }
             }
             Const::Bytes(b) => {
                 // A `format_args!` template: the address of its raw `.rodata`

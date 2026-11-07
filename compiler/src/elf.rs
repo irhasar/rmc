@@ -185,8 +185,12 @@ impl Elf {
             }
             "globl" | "type" | "size" => {}
             "quad" => {
+                // A bare number (signed or unsigned, e.g. `u64::MAX` printed as
+                // 18446744073709551615) is data; anything else is a symbol.
                 if let Ok(v) = arg.parse::<i64>() {
                     self.sections[*cur].data.extend_from_slice(&(v as u64).to_le_bytes());
+                } else if let Ok(v) = arg.parse::<u64>() {
+                    self.sections[*cur].data.extend_from_slice(&v.to_le_bytes());
                 } else {
                     let off = self.sections[*cur].data.len();
                     self.abs64.push((*cur, off, arg.to_string()));

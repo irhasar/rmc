@@ -342,10 +342,10 @@ __rmc_fmt_bool:
 .globl __rmc_fmt_char
 .type __rmc_fmt_char, @function
 __rmc_fmt_char:
-    mov (%rdi), %eax         # a `char` is a 32-bit scalar
+    mov (%rdi), %edi         # a `char` is a 32-bit scalar; `__rmc_utf8_encode` reads the codepoint from `%edi`
     sub $16, %rsp
     mov %rsp, %rsi           # scratch buffer
-    call __rmc_utf8_encode   # codepoint in %eax -> bytes at (%rsi), count in %rax
+    call __rmc_utf8_encode   # codepoint in %edi -> bytes at (%rsi), count in %rax
     mov %rax, %rdx
     mov %rsp, %rsi
     mov $1, %rdi

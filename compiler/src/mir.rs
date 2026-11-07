@@ -71,6 +71,9 @@ pub enum Operand {
 pub enum Const {
     Int(i64),
     Bool(bool),
+    /// A `char` literal (`'A'`), held as its Unicode scalar value. Rust's
+    /// `char` is a 32-bit scalar, so the formatter reads four bytes.
+    Char(u32),
     Unit,
     Str(String),
     /// `{allocN: TY}` — the address of a static allocation (a promoted
@@ -252,6 +255,19 @@ pub struct Function {
     pub consts: HashMap<String, i64>,
 }
 
+/// A promoted constant: `const main::promoted[N]: &T = { _1 = const V; _0 =
+/// &_1; return; }`. rustc promotes a literal used behind a reference (a format
+/// argument, a `&[1, 2, 3]`, ...) into a hidden static, and MIR refers to it by
+/// name (`const main::promoted[0]`). The body is reduced to the value it
+/// returns the address of, so the back end can materialise it in `.rodata`.
+#[derive(Debug, Clone)]
+pub struct Promoted {
+    /// The referent's byte size; the `.rodata` blob is padded to a word.
+    pub size: i64,
+    /// `(byte offset, value)` for each scalar written into the blob.
+    pub bytes: Vec<(i64, i64)>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Program {
     pub funcs: Vec<Function>,
@@ -260,6 +276,9 @@ pub struct Program {
     pub allocs: HashMap<u32, AllocData>,
     /// `const NAME: TY = ...;` items at the crate scope.
     pub consts: HashMap<String, i64>,
+    /// `main::promoted[N]` -> the value it points at, for the ones the back end
+    /// can fold. A name that is absent is rejected rather than miscompiled.
+    pub promoted: HashMap<String, Promoted>,
 }
 
 /// A static allocation: its bytes, any pointer relocations into other
@@ -620,7 +639,12 @@ fn rewrite_term(t: &mut Terminator, subst: &HashMap<u32, Place>) {
 /// Parse the text `rustc --emit=mir` prints into a [`Program`].
 pub fn parse(text: &str) -> Result<Program, String> {
     let lines: Vec<String> = text.lines().map(strip_comment).collect();
-    let mut prog = Program { funcs: Vec::new(), allocs: HashMap::new(), consts: HashMap::new() };
+    let mut prog = Program {
+        funcs: Vec::new(),
+        allocs: HashMap::new(),
+        consts: HashMap::new(),
+        promoted: HashMap::new(),
+    };
     let mut i = 0;
     while i < lines.len() {
         let l = lines[i].trim();
@@ -631,6 +655,14 @@ pub fn parse(text: &str) -> Result<Program, String> {
         if l.starts_with("fn ") {
             let (f, next) = parse_fn(&lines, i)?;
             prog.funcs.push(f);
+            i = next;
+        } else if l.starts_with("const ") && l.contains("::promoted[") {
+            let (name, p, next) = parse_promoted(&lines, i)?;
+            // A promoted constant the parser cannot fold is left out of the map,
+            // so a use of it is a clear back-end error rather than a wrong value.
+            if let Some(p) = p {
+                prog.promoted.insert(name, p);
+            }
             i = next;
         } else if l.starts_with("const ") {
             if let Some((name, val)) = parse_const_item(l) {
@@ -734,6 +766,191 @@ fn parse_alloc(lines: &[String], start: usize) -> Result<(u32, AllocData, usize)
         i += 1;
     }
     Err("mir: unterminated alloc block".into())
+}
+
+/// `const main::promoted[N]: &T = { ... }` — a promoted constant, reduced to
+/// the bytes of the value it returns the address of. `None` means the shape is
+/// not one the back end can fold.
+fn parse_promoted(lines: &[String], start: usize) -> Result<(String, Option<Promoted>, usize), String> {
+    let header = lines[start].trim().trim_end_matches(';');
+    let name = header
+        .strip_prefix("const ")
+        // The name/type separator is `: ` (colon-space); the `::` inside the
+        // path has no space, so a plain `find(':')` would cut at the first `:`.
+        .and_then(|r| r.find(": ").map(|c| r[..c].trim().to_string()))
+        .ok_or_else(|| format!("mir: bad promoted header `{header}`"))?;
+    // The promoted body opens with `= {` on the header line and closes on the
+    // first column-0 `}`.
+    let mut end = start + 1;
+    while end < lines.len() {
+        let raw = &lines[end];
+        if !raw.is_empty() && raw.as_bytes()[0] != b' ' && raw.trim() == "}" {
+            break;
+        }
+        end += 1;
+    }
+    if end >= lines.len() {
+        return Err(format!("mir: unterminated promoted `{name}`"));
+    }
+    let body = &lines[start + 1..end];
+
+    // Local declarations, as raw type text: `let mut _1: i32;`.
+    let mut decls: HashMap<u32, String> = HashMap::new();
+    for line in body {
+        if let Some((n, ty_text)) = parse_let_raw(line.trim()) {
+            decls.insert(n, ty_text);
+        }
+    }
+
+    // The referent is the local the return takes the address of: `_0 = &_1;`.
+    let mut referent: Option<u32> = None;
+    for line in body {
+        let t = line.trim();
+        if let Some((lhs, rhs)) = split_assign(t) {
+            let Some(dest) = parse_local_id(lhs.trim()) else { continue };
+            if dest != 0 {
+                continue;
+            }
+            if let Some(r) = rhs.trim().strip_prefix('&') {
+                if let Some(x) = parse_local_id(r.trim()) {
+                    referent = Some(x);
+                }
+            }
+        }
+    }
+    let Some(ref_local) = referent else {
+        return Ok((name, None, end + 1));
+    };
+    let Some(ty_text) = decls.get(&ref_local) else {
+        return Ok((name, None, end + 1));
+    };
+    let size = referent_size(ty_text);
+
+    // The value: `_1 = const V;`, `_1 = Add(const A, const B);`, or a zero-sized
+    // construction `_1 = Q;`. Only a scalar referent is folded; anything else is
+    // left unmodelled.
+    let mut bytes: Vec<(i64, i64)> = Vec::new();
+    for line in body {
+        let t = line.trim();
+        if let Some((lhs, rhs)) = split_assign(t) {
+            if parse_local_id(lhs.trim()) == Some(ref_local) {
+                if let Some(v) = parse_promoted_value(rhs.trim(), ty_text) {
+                    bytes.push((0, v));
+                }
+            }
+        }
+    }
+    if bytes.is_empty() {
+        return Ok((name, None, end + 1));
+    }
+    Ok((name, Some(Promoted { size, bytes }), end + 1))
+}
+
+/// The scalar a promoted referent is set to: a literal, a binary op folded over
+/// two literals, or a zero-sized construction (the type name used as a value).
+fn parse_promoted_value(rhs: &str, ty_text: &str) -> Option<i64> {
+    let s = rhs.trim().trim_end_matches(';').trim();
+    if let Some(v) = parse_const_value(s) {
+        return Some(v);
+    }
+    // `_1 = Q;` where `_1: Q` — a unit struct or unit variant, so a zero-sized
+    // value with no bytes to store.
+    if s == ty_text.trim() {
+        return Some(0);
+    }
+    // `Add(const 3_i32, const 3_i32)` — a binary op over two literals, as the
+    // MIR of a `macro_rules!` expansion like `$e + $e`.
+    let open = s.find('(')?;
+    let close = s.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    let op = s[..open].trim();
+    let (a, b) = split_top_comma(&s[open + 1..close])?;
+    let x = parse_const_value(a.trim())?;
+    let y = parse_const_value(b.trim())?;
+    eval_binop(op, x, y, ty_text)
+}
+
+/// Split `a, b` at the top-level comma (one not nested in brackets).
+fn split_top_comma(s: &str) -> Option<(&str, &str)> {
+    let mut depth = 0i32;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => return Some((&s[..i], &s[i + 1..])),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Fold a MIR binary op over two literals, at the referent's integer width.
+fn eval_binop(op: &str, a: i64, b: i64, ty_text: &str) -> Option<i64> {
+    let w = match ty_text.trim() {
+        "i8" | "u8" => 8u32,
+        "i16" | "u16" => 16,
+        "i32" | "u32" => 32,
+        _ => 64,
+    };
+    let mask: u64 = if w == 64 { u64::MAX } else { (1u64 << w) - 1 };
+    let ua = (a as u64) & mask;
+    let ub = (b as u64) & mask;
+    let shift = ub & (w as u64 - 1);
+    let r = match op {
+        "Add" => ua.wrapping_add(ub),
+        "Sub" => ua.wrapping_sub(ub),
+        "Mul" => ua.wrapping_mul(ub),
+        "BitXor" => ua ^ ub,
+        "BitAnd" => ua & ub,
+        "BitOr" => ua | ub,
+        "Shl" => ua.wrapping_shl(shift as u32),
+        "Shr" => {
+            if ty_text.trim().starts_with('i') {
+                ((a >> shift) as u64) & mask
+            } else {
+                ua >> shift
+            }
+        }
+        _ => return None,
+    };
+    Some((r & mask) as i64)
+}
+
+/// `let mut _1: i32;` -> `(1, "i32")`, with the type kept as its source text so
+/// `char` (four bytes) is not flattened to a word.
+fn parse_let_raw(t: &str) -> Option<(u32, String)> {
+    let t = t.strip_prefix("let ")?;
+    let t = t.strip_prefix("mut ").unwrap_or(t);
+    let t = t.strip_prefix('_')?;
+    let colon = t.find(':')?;
+    let n: u32 = t[..colon].trim().parse().ok()?;
+    let ty = t[colon + 1..].trim().trim_end_matches(';').trim().to_string();
+    Some((n, ty))
+}
+
+/// The referent size of a promoted constant, from its type text. Only the
+/// scalar widths matter here; a `char` is four bytes and everything else the
+/// back end folds is a word.
+fn referent_size(ty_text: &str) -> i64 {
+    if ty_text == "char" {
+        4
+    } else {
+        8
+    }
+}
+
+/// A scalar constant's value, for a promoted referent: an integer, a `bool`, or
+/// a `char` (as its codepoint). Anything else is `None`.
+fn parse_const_value(s: &str) -> Option<i64> {
+    let s = s.strip_prefix("const ").unwrap_or(s).trim();
+    match parse_const(s)? {
+        Const::Int(n) => Some(n),
+        Const::Bool(b) => Some(b as i64),
+        Const::Char(c) => Some(c as i64),
+        _ => None,
+    }
 }
 
 fn parse_fn(lines: &[String], start: usize) -> Result<(Function, usize), String> {
@@ -1584,7 +1801,7 @@ pub fn classify_unsupported(fragment: &str) -> Option<&'static str> {
         return Some("128-bit integers are not implemented on the MIR path");
     }
     if has("::promoted[") {
-        return Some("a promoted constant the back end cannot fold is not implemented on the MIR path");
+        return Some("a promoted constant of a shape the back end cannot fold (an aggregate, or a reference to one) is not implemented on the MIR path");
     }
     None
 }
@@ -1605,6 +1822,11 @@ fn parse_const(s: &str) -> Option<Const> {
     if s == "false" {
         return Some(Const::Bool(false));
     }
+    // A `char` literal (`'A'`, `'\n'`, `'\u{1F600}'`). Rust's `char` is a
+    // 32-bit Unicode scalar, so the value is the codepoint.
+    if let Some(c) = parse_char_literal(s) {
+        return Some(Const::Char(c));
+    }
     // A zero-sized constant: `PhantomData::<..>` and the like. It takes no
     // storage, so the aggregate that lists it must not reserve a word.
     if s.starts_with("PhantomData") {
@@ -1619,6 +1841,12 @@ fn parse_const(s: &str) -> Option<Const> {
     }
     if let Some(n) = parse_named_const(s) {
         return Some(Const::Int(n));
+    }
+    // `main::promoted[N]` — a reference to a promoted constant. The parser folds
+    // the promoted body into `Program::promoted`; the back end materialises its
+    // `.rodata` blob. A name that was not folded is rejected at codegen.
+    if s.contains("::promoted[") {
+        return Some(Const::Named(s.to_string()));
     }
     // `{allocN: TY}` — a static allocation, possibly with an interior
     // offset printed as `{allocN: TY[place]}`.
@@ -1770,6 +1998,46 @@ fn unescape(s: &str) -> String {
         }
     }
     out
+}
+
+/// `'A'`, `'\n'`, `'\u{1F600}'` — a `char` literal as MIR prints it, returned
+/// as its Unicode scalar value. `char` is 32 bits, so the value is the
+/// codepoint, not a byte.
+fn parse_char_literal(s: &str) -> Option<u32> {
+    let body = s.strip_prefix('\'')?.strip_suffix('\'')?;
+    let b = body.as_bytes();
+    if b.is_empty() {
+        return None;
+    }
+    if b[0] != b'\\' {
+        // A single literal character (which may be multi-byte UTF-8).
+        let mut chars = body.chars();
+        let c = chars.next()?;
+        if chars.next().is_some() {
+            return None;
+        }
+        return Some(c as u32);
+    }
+    match *b.get(1)? {
+        b'n' => Some('\n' as u32),
+        b't' => Some('\t' as u32),
+        b'r' => Some('\r' as u32),
+        b'0' => Some(0),
+        b'\\' => Some('\\' as u32),
+        b'\'' => Some('\'' as u32),
+        b'"' => Some('"' as u32),
+        b'x' => {
+            let hi = (*b.get(2)? as char).to_digit(16)?;
+            let lo = (*b.get(3)? as char).to_digit(16)?;
+            Some(hi * 16 + lo)
+        }
+        b'u' => {
+            // `\u{1F600}` — the braces hold hex digits.
+            let inner = body.strip_prefix("\\u{")?.strip_suffix('}')?;
+            u32::from_str_radix(inner, 16).ok()
+        }
+        _ => None,
+    }
 }
 
 /// `b"..."` — a byte-string literal, as `rustc --emit=mir` prints it. The
