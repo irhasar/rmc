@@ -86,4 +86,19 @@ fn main() {
     } else {
         println!("{}", 0);
     }
+
+    // `clamp`: `x` bounded to `[lo, hi]`, a tie with either bound returning
+    // that bound. `min > max` is a run-time panic, so every call here has
+    // `lo <= hi`; `MIN` as a bound must not overflow the comparisons.
+    println!("{}", a.clamp(-10, 10));
+    println!("{}", a.clamp(-5, 10));
+    println!("{}", a.clamp(-10, -8));
+    println!("{}", a.clamp(a, b));
+    println!("{}", b.clamp(a, b));
+    println!("{}", z.clamp(a, b));
+    println!("{}", MIN.clamp(MIN, b));
+    println!("{}", b.clamp(MIN, MIN));
+    println!("{}", a.clamp(b, b));
+    println!("{}", pick(-5, 9).clamp(0, 100));
+    println!("{}", a.abs().clamp(0, 3));
 }

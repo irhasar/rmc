@@ -157,7 +157,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     // Runtime helpers provided by the freestanding assembly runtime. They are
     // linked in automatically, so they do not appear in the source program.
-    let builtins: [(&str, &[Type], Type); 9] = [
+    let builtins: [(&str, &[Type], Type); 10] = [
         ("print_i64", &[Type::I64], Type::Unit),
         ("print_str", &[Type::Str], Type::Unit),
         ("print_bool", &[Type::Bool], Type::Unit),
@@ -170,6 +170,9 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         ("__rmc_str_lt", &[Type::Str, Type::Str], Type::Bool),
         // `str::len`, the record's length word; emitted by sema for `s.len()`.
         ("__rmc_str_len", &[Type::Str], Type::I64),
+        // `i64::clamp`'s `min > max` trap; emitted by sema for the failure arm.
+        // Typed `i64` because it stands in one arm of the desugar's `if`.
+        ("__rmc_clamp", &[], Type::I64),
     ];
     for (name, params, ret) in builtins {
         sigs.insert(
@@ -812,6 +815,40 @@ impl Sema {
                         shifted,
                         r,
                     ),
+                    Type::I64,
+                )
+            }
+            "clamp" => {
+                if args.len() != 2 {
+                    return Err("method `clamp` takes exactly two arguments".into());
+                }
+                // `clamp` panics when `min > max` and otherwise returns the
+                // receiver, `min` or `max`. The panic is a call to a runtime
+                // helper, so no codegen case is added; it never returns but is
+                // typed `i64` so it can stand in one arm of the `if`. `min` and
+                // `max` are bound before the comparisons, in argument order, so
+                // a call operand runs once. Comparisons never overflow, so a
+                // constant operand may be reused directly (`bind`).
+                let lo = bind(self, args[0].clone(), &mut stmts);
+                let hi = bind(self, args[1].clone(), &mut stmts);
+                let fail = Expr::Call {
+                    name: "__rmc_clamp".into(),
+                    args: Vec::new(),
+                    arg_slots: Vec::new(),
+                    ret_slot: -1,
+                    ret_ty: Type::I64,
+                };
+                let below = if_then_else(
+                    Expr::Bin(Lt, Box::new(x.clone()), Box::new(lo.clone())),
+                    lo.clone(),
+                    if_then_else(
+                        Expr::Bin(Gt, Box::new(x.clone()), Box::new(hi.clone())),
+                        hi.clone(),
+                        x,
+                    ),
+                );
+                (
+                    if_then_else(Expr::Bin(Gt, Box::new(lo), Box::new(hi)), fail, below),
                     Type::I64,
                 )
             }
@@ -2446,6 +2483,7 @@ impl Sema {
                             | "is_negative"
                             | "div_euclid"
                             | "rem_euclid"
+                            | "clamp"
                     )
                 {
                     // `abs` synthesises `-x`, a compiler-generated negation, so

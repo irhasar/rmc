@@ -104,8 +104,9 @@ variant of that enum and not an associated function is reported as such.
 
 ### Built-in integer methods
 
-An `i64` receiver has eight methods built in, which desugar to the operators rmc
-already lowers (so they cost no call and add nothing to the runtime):
+An `i64` receiver has nine methods built in, which desugar to the operators rmc
+already lowers (so they cost no call, and only `clamp` reaches the runtime, for
+its panic):
 
 | call                | meaning                                        |
 | ------------------- | ---------------------------------------------- |
@@ -113,6 +114,7 @@ already lowers (so they cost no call and add nothing to the runtime):
 | `x.signum()`        | `-1`, `0` or `1`                                |
 | `x.min(y)`          | the smaller of `x` and `y` (returns `x` on a tie) |
 | `x.max(y)`          | the larger of `x` and `y` (returns `x` on a tie) |
+| `x.clamp(lo, hi)`   | `x` bounded to `[lo, hi]`                       |
 | `x.is_positive()`   | `x > 0` (a `bool`)                              |
 | `x.is_negative()`   | `x < 0` (a `bool`)                              |
 | `x.div_euclid(y)`   | `x / y` rounded toward the mathematical quotient |
@@ -121,14 +123,17 @@ already lowers (so they cost no call and add nothing to the runtime):
 The semantics match `rustc -O`: `i64::MIN.abs()` is `i64::MIN` (it does not
 trap; with `--overflow-checks` it traps, as in a debug build), and `signum` is
 computed with comparisons only, so `i64::MIN.signum()` is `-1` without overflow.
-`is_positive`/`is_negative` return `bool` — unlike the six above, which return
+`is_positive`/`is_negative` return `bool` — unlike the seven above, which return
 `i64` — and `0` is neither positive nor negative, so both are `false` there.
 `div_euclid`/`rem_euclid` compute `q = x / y` and `r = x % y` and round toward
 the mathematical quotient: when `r` is negative, `q` moves one step further from
 zero and `r` gains `abs(y)`. They reuse `/` and `%`, so a zero divisor and
 `i64::MIN.div_euclid(-1)` panic at run time exactly as the operators do.
+`clamp` returns `lo`, `x` or `hi`, and panics when `lo > hi` (a message and exit
+101, like rustc); it is the one built-in whose panic is a runtime call, so a
+program that never calls it does not carry the helper.
 Each method evaluates its receiver — and, for the two-argument methods, its
-argument — exactly once, so `g().abs()` calls `g` once. A method of the same
+arguments — exactly once, so `g().abs()` calls `g` once. A method of the same
 name on a struct or enum is unaffected — the built-in only fires when the
 receiver's type is `i64`.
 

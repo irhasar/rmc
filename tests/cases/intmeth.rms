@@ -86,5 +86,20 @@ fn main() -> i64 {
     } else {
         print_i64(0);
     }
+
+    // `clamp`: `x` bounded to `[lo, hi]`, a tie with either bound returning
+    // that bound. `min > max` is a run-time panic, so every call here has
+    // `lo <= hi`; `MIN` as a bound must not overflow the comparisons.
+    print_i64(a.clamp(-10, 10));
+    print_i64(a.clamp(-5, 10));
+    print_i64(a.clamp(-10, -8));
+    print_i64(a.clamp(a, b));
+    print_i64(b.clamp(a, b));
+    print_i64(z.clamp(a, b));
+    print_i64(MIN.clamp(MIN, b));
+    print_i64(b.clamp(MIN, MIN));
+    print_i64(a.clamp(b, b));
+    print_i64(pick(-5, 9).clamp(0, 100));
+    print_i64(a.abs().clamp(0, 3));
     return 0;
 }
