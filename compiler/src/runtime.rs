@@ -625,6 +625,94 @@ __rmc_clamp_msg: .ascii "rmc: clamp min > max\n"
 "#,
         defines: &["__rmc_clamp", "__rmc_clamp_msg", "__rmc_clamp_len"],
     },
+    Piece {
+        text: r#"
+# long __rmc_count_ones(long x)  -- the number of set bits in `x`. A plain loop
+# over the 64 bits: `x & 1` tests the low bit, then `x` is shifted logically so
+# the sign bit is not replicated. The count is exact for every input, including
+# `i64::MIN`, so the result does not depend on `--overflow-checks`.
+.globl __rmc_count_ones
+.type __rmc_count_ones, @function
+__rmc_count_ones:
+    xor %eax, %eax           # count = 0
+    mov $64, %ecx            # 64 bits to examine
+.Lco_loop:
+    mov %rdi, %rdx
+    and $1, %rdx
+    add %rdx, %rax
+    shr $1, %rdi             # logical shift: bring in a zero, not the sign
+    dec %ecx
+    jne .Lco_loop
+    ret
+.size __rmc_count_ones, .-__rmc_count_ones
+"#,
+        defines: &["__rmc_count_ones"],
+    },
+    Piece {
+        text: r#"
+# long __rmc_leading_zeros(long x)  -- the number of high-order zero bits before
+# the first set bit; 64 when `x` is zero. `rdx` holds the remaining bits and
+# `rcx` counts the shifts, which equals the zeros above the top bit: `shr $63`
+# peels the current top bit into `rax`, and each time it is clear the value is
+# shifted left to expose the next bit. Only supported instructions are used (no
+# `bt`). The count is exact for every input, including `i64::MIN`, so the result
+# does not depend on `--overflow-checks`.
+.globl __rmc_leading_zeros
+.type __rmc_leading_zeros, @function
+__rmc_leading_zeros:
+    mov %rdi, %rdx           # remaining value
+    xor %ecx, %ecx           # shifts = zeros above the top bit
+.Llz_loop:
+    test %rdx, %rdx
+    jz .Llz_done             # no bits left: x was zero
+    mov %rdx, %rax
+    shr $63, %rax            # top bit
+    test %rax, %rax
+    jnz .Llz_found
+    shl $1, %rdx             # bring the next bit up
+    inc %rcx
+    jmp .Llz_loop
+.Llz_found:
+    mov %rcx, %rax           # zeros above bit `rcx`
+    ret
+.Llz_done:
+    mov $64, %rax            # x was zero
+    ret
+.size __rmc_leading_zeros, .-__rmc_leading_zeros
+"#,
+        defines: &["__rmc_leading_zeros"],
+    },
+    Piece {
+        text: r#"
+# long __rmc_trailing_zeros(long x)  -- the number of low-order zero bits before
+# the first set bit; 64 when `x` is zero. `rdx` holds the remaining bits and
+# `rcx` counts the zeros dropped so far. `and $1` sets ZF when the low bit is
+# clear, so the loop shifts it out and continues; the index of the first set bit
+# is the count. Only supported instructions are used (no `bt`).
+.globl __rmc_trailing_zeros
+.type __rmc_trailing_zeros, @function
+__rmc_trailing_zeros:
+    mov %rdi, %rdx           # remaining value
+    xor %ecx, %ecx           # zeros dropped so far
+.Ltz_loop:
+    test %rdx, %rdx
+    jz .Ltz_done             # no bits left: all zero
+    mov %rdx, %rax
+    and $1, %rax
+    jz .Ltz_skip             # low bit clear: shift it out and continue
+    mov %rcx, %rax           # first set bit found
+    ret
+.Ltz_skip:
+    shr $1, %rdx
+    inc %rcx
+    jmp .Ltz_loop
+.Ltz_done:
+    mov $64, %rax            # x was zero
+    ret
+.size __rmc_trailing_zeros, .-__rmc_trailing_zeros
+"#,
+        defines: &["__rmc_trailing_zeros"],
+    },
 ];
 
 /// The identifiers in `src`, with `#`-to-end-of-line comments dropped. Matching

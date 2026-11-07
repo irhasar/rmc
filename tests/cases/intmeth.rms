@@ -101,5 +101,30 @@ fn main() -> i64 {
     print_i64(a.clamp(b, b));
     print_i64(pick(-5, 9).clamp(0, 100));
     print_i64(a.abs().clamp(0, 3));
+
+    // `count_ones` / `leading_zeros` / `trailing_zeros`: exact bit counts for
+    // every input, including the `i64` extremes, with no trap under
+    // `--overflow-checks` (the helpers never negate or decrement).
+    print_i64(z.count_ones());
+    print_i64(z.leading_zeros());
+    print_i64(z.trailing_zeros());
+    print_i64(a.count_ones());
+    print_i64(a.leading_zeros());
+    print_i64(a.trailing_zeros());
+    print_i64(MIN.count_ones());
+    print_i64(MIN.leading_zeros());
+    print_i64(MIN.trailing_zeros());
+    let mx: i64 = 9223372036854775807;
+    print_i64(mx.count_ones());
+    print_i64(mx.leading_zeros());
+    print_i64(mx.trailing_zeros());
+    let ones: i64 = -1;
+    print_i64(ones.count_ones());
+    print_i64(ones.leading_zeros());
+    print_i64(ones.trailing_zeros());
+    // Through a reference receiver, and chained onto another method.
+    print_i64(r.count_ones());
+    print_i64(a.abs().trailing_zeros());
+    print_i64(mx.count_ones().trailing_zeros());
     return 0;
 }

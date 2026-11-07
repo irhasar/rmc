@@ -5161,6 +5161,61 @@ fn clamp_pulls_in_the_trap_helper_only_when_used() {
 }
 
 #[test]
+fn the_bit_methods_evaluate_the_receiver_once() {
+    // Each bit method binds a non-trivial receiver to a temp first, so a call
+    // receiver runs a single time, then hands it to its runtime helper.
+    for m in ["count_ones", "leading_zeros", "trailing_zeros"] {
+        let out = asm_no_inline(&format!(
+            "fn g() -> i64 {{ return 3; }} \
+             fn main() -> i64 {{ return g().{m}(); }}"
+        ));
+        let body = &out[out.find("main:").expect("main")..];
+        assert_eq!(body.matches("call g").count(), 1, "{m}: receiver called once:\n{body}");
+        assert!(body.contains(&format!("call __rmc_{m}")), "{m}: helper called:\n{body}");
+    }
+}
+
+#[test]
+fn a_plain_variable_receiver_needs_no_temp() {
+    // A bare local has no side effect, so it is passed straight to the helper
+    // rather than copied into a temporary first: the only call is the helper.
+    let out = asm_no_inline(
+        "fn main() -> i64 { let x: i64 = 5; return x.count_ones(); }",
+    );
+    let body = &out[out.find("main:").expect("main")..];
+    let body = &body[..body.find(".size main").expect("end of main")];
+    assert_eq!(body.matches("call ").count(), 1, "only the helper is called:\n{body}");
+    assert!(body.contains("call __rmc_count_ones"), "helper called:\n{body}");
+}
+
+#[test]
+fn a_bit_method_argument_is_rejected() {
+    for m in ["count_ones", "leading_zeros", "trailing_zeros"] {
+        let bad = format!("fn main() -> i64 {{ return 1.{m}(2); }}");
+        assert!(
+            compile_to_asm(&bad, &CompileOptions::default()).is_err(),
+            "`{m}` takes no arguments"
+        );
+    }
+}
+
+#[test]
+fn the_bit_helpers_are_pulled_in_only_when_used() {
+    // The per-symbol runtime pruning keeps a helper only when the program (or
+    // another kept piece) names it, so a program that never inspects bits does
+    // not carry any of the three.
+    let out = asm("fn main() -> i64 { return 1; }");
+    for h in ["__rmc_count_ones", "__rmc_leading_zeros", "__rmc_trailing_zeros"] {
+        assert!(!out.contains(h), "{h} dropped when unused:\n{out}");
+    }
+    // And a program that uses one carries exactly that one.
+    let used = asm("fn main() -> i64 { return 5.trailing_zeros(); }");
+    assert!(used.contains("__rmc_trailing_zeros:"));
+    assert!(!used.contains("__rmc_count_ones:"));
+    assert!(!used.contains("__rmc_leading_zeros:"));
+}
+
+#[test]
 fn a_nested_fn_is_hoisted_and_callable() {
     // A `fn` inside a block is an item, not a closure: it captures nothing, so
     // it is hoisted to the top level and emitted like any other function.

@@ -101,4 +101,29 @@ fn main() {
     println!("{}", a.clamp(b, b));
     println!("{}", pick(-5, 9).clamp(0, 100));
     println!("{}", a.abs().clamp(0, 3));
+
+    // `count_ones` / `leading_zeros` / `trailing_zeros`: exact bit counts for
+    // every input, including the `i64` extremes, with no trap under
+    // `-C overflow-checks=on` (the helpers never negate or decrement).
+    println!("{}", z.count_ones());
+    println!("{}", z.leading_zeros());
+    println!("{}", z.trailing_zeros());
+    println!("{}", a.count_ones());
+    println!("{}", a.leading_zeros());
+    println!("{}", a.trailing_zeros());
+    println!("{}", MIN.count_ones());
+    println!("{}", MIN.leading_zeros());
+    println!("{}", MIN.trailing_zeros());
+    let mx: i64 = 9223372036854775807;
+    println!("{}", mx.count_ones());
+    println!("{}", mx.leading_zeros());
+    println!("{}", mx.trailing_zeros());
+    let ones: i64 = -1;
+    println!("{}", ones.count_ones());
+    println!("{}", ones.leading_zeros());
+    println!("{}", ones.trailing_zeros());
+    // Through a reference receiver, and chained onto another method.
+    println!("{}", r.count_ones());
+    println!("{}", a.abs().trailing_zeros());
+    println!("{}", mx.count_ones().trailing_zeros());
 }

@@ -1339,13 +1339,16 @@ The checks, all in `sema.rs`:
   where rustc's is `usize`, so a differential twin casts with `as i64`.
 - **Built-in `i64` methods
   (`abs`/`min`/`max`/`clamp`/`signum`/`is_positive`/`is_negative`/
-  `div_euclid`/`rem_euclid`).** Like `len()`, they
+  `div_euclid`/`rem_euclid`/`count_ones`/`leading_zeros`/`trailing_zeros`).**
+  Like `len()`, they
   are special-cased in the `MethodCall` arm of sema before the struct/enum lookup,
   and only when the receiver's type is `i64`, so a user `min` on a struct is
   untouched. `desugar_i64_method` rewrites the call into an expression over the
-  operators rmc already lowers, so codegen gains no case and no runtime helper
-  (`clamp`'s `min > max` panic is the one exception — a call to the
-  `__rmc_clamp` runtime piece, which is linked only when a `clamp` appears):
+  operators rmc already lowers, so codegen gains no case
+  (`clamp`'s `min > max` panic and the three bit counts are the exceptions — a
+  call to the `__rmc_clamp` / `__rmc_count_ones` / `__rmc_leading_zeros` /
+  `__rmc_trailing_zeros` runtime pieces, each linked only when its method
+  appears):
   `abs` is `if x < 0 { -x } else { x }` (so `i64::MIN` maps to itself, matching
   `rustc -O`; under `--overflow-checks` the `neg` traps, matching a debug build),
   `signum` is `(x > 0) as i64 - (x < 0) as i64` (comparisons only, so `i64::MIN`
@@ -1365,6 +1368,14 @@ The checks, all in `sema.rs`:
   does not overflow a dead arm: with `y == MIN` the remainder is never negative,
   so `r - y` never runs. They reuse `/` and `%`, so a zero divisor and
   `MIN.div_euclid(-1)` panic at run time as the operators do.
+  `count_ones`/`leading_zeros`/`trailing_zeros` take no argument and lower to a
+  `Call __rmc_<name>` on the receiver (no operators): the usual `x & (x - 1)`
+  bit trick overflows for `i64::MIN`, and rustc's answer for `MIN` is exact
+  (`count_ones` 1, `leading_zeros` 0, `trailing_zeros` 63), so each helper is a
+  plain loop over the 64 bits that neither negates nor decrements — the result
+  is the same with and without `--overflow-checks`. They reuse the same
+  bind-receiver-once path, so `g().count_ones()` calls `g` once, and the
+  `call`/`defines` pruning drops each helper unless its method appears.
   Each desugar reads an operand more than once, so every non-trivial operand is
   first bound to a fresh `\0im<n>` temporary (`Sema::tmp`), receiver before
   argument — `g().abs()` calls `g` once, as rustc does; a plain variable or
