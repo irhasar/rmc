@@ -5107,6 +5107,38 @@ fn is_positive_yields_a_bool_usable_as_one() {
 }
 
 #[test]
+fn div_euclid_and_rem_euclid_evaluate_each_operand_once() {
+    // Each desugar binds its receiver and its argument before the two `q`/`r`
+    // divisions, so a call operand runs a single time.
+    for m in ["div_euclid", "rem_euclid"] {
+        let out = asm_no_inline(&format!(
+            "fn g() -> i64 {{ return 3; }} \
+             fn main() -> i64 {{ return g().{m}(g()); }}"
+        ));
+        let body = &out[out.find("main:").expect("main")..];
+        assert_eq!(body.matches("call g").count(), 2, "{m}: each operand once:\n{body}");
+    }
+}
+
+#[test]
+fn a_min_divisor_in_the_euclidean_methods_does_not_trip_the_overflow_lint() {
+    // `x.rem_euclid(i64::MIN)` synthesises `r - MIN` on the negative-remainder
+    // path, but that arm never runs when the divisor is `MIN`, so rustc accepts
+    // it. The desugar must not const-fold the dead arm and reject the program.
+    // `MIN.div_euclid(1)` is the mirror: its `q - 1` arm is dead because the
+    // remainder is non-negative.
+    for src in [
+        "fn main() -> i64 { let m: i64 = -9223372036854775808; return m.rem_euclid(m); }",
+        "fn main() -> i64 { let m: i64 = -9223372036854775808; return 7.rem_euclid(m); }",
+        "fn main() -> i64 { let m: i64 = -9223372036854775808; return m.div_euclid(1); }",
+        "fn main() -> i64 { let x: i64 = -9223372036854775808; let y: i64 = -1; return x.div_euclid(y); }",
+    ] {
+        let out = asm(src);
+        assert!(out.contains("main:"), "should compile:\n{src}");
+    }
+}
+
+#[test]
 fn a_builtin_integer_method_on_a_struct_is_not_shadowed() {
     // A struct may still define its own `min`; the built-in only fires on an
     // `i64` receiver.

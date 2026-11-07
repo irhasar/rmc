@@ -699,6 +699,15 @@ impl Sema {
             var
         }
 
+        /// `if cond { a } else { b }`, the shape every two-way desugar uses.
+        fn if_then_else(cond: Expr, a: Expr, b: Expr) -> Expr {
+            Expr::If(
+                Box::new(cond),
+                Block { stmts: Vec::new(), tail: Some(Box::new(a)) },
+                Some(Block { stmts: Vec::new(), tail: Some(Box::new(b)) }),
+            )
+        }
+
         let mut stmts = Vec::new();
         let x = bind(self, recv, &mut stmts);
         let (body, ty) = match name {
@@ -743,6 +752,68 @@ impl Sema {
                 // `x < 0` with no cast; `0` is neither positive nor negative.
                 let cmp = if name == "is_positive" { Gt } else { Lt };
                 (Expr::Bin(cmp, Box::new(x), Box::new(Expr::Int(0))), Type::Bool)
+            }
+            "div_euclid" => {
+                if args.len() != 1 {
+                    return Err("method `div_euclid` takes exactly one argument".into());
+                }
+                // `div_euclid` is truncating division rounded toward the
+                // mathematical quotient: `q = x / y`, `r = x % y`, and when the
+                // remainder is negative the quotient is nudged one step further
+                // from zero (toward `-inf` for a positive divisor, toward `+inf`
+                // for a negative one). `q` and `r` are bound so each division
+                // runs once. The `/` and `%` reuse their existing traps, so a
+                // zero divisor and `i64::MIN / -1` behave exactly as they do for
+                // a written `/`: rustc's `div_euclid` panics on both, and the
+                // quotient is computed before the remainder, as here.
+                let x = self.force_temp(x, &mut stmts);
+                let y = bind(self, args[0].clone(), &mut stmts);
+                let q = bind(self, Expr::Bin(Div, Box::new(x.clone()), Box::new(y.clone())), &mut stmts);
+                let r = bind(self, Expr::Bin(Mod, Box::new(x), Box::new(y.clone())), &mut stmts);
+                let away = if_then_else(
+                    Expr::Bin(Gt, Box::new(y), Box::new(Expr::Int(0))),
+                    Expr::Bin(Sub, Box::new(q.clone()), Box::new(Expr::Int(1))),
+                    Expr::Bin(Add, Box::new(q.clone()), Box::new(Expr::Int(1))),
+                );
+                (
+                    if_then_else(
+                        Expr::Bin(Lt, Box::new(r), Box::new(Expr::Int(0))),
+                        away,
+                        q,
+                    ),
+                    Type::I64,
+                )
+            }
+            "rem_euclid" => {
+                if args.len() != 1 {
+                    return Err("method `rem_euclid` takes exactly one argument".into());
+                }
+                // `rem_euclid` is the remainder made non-negative: `r = x % y`,
+                // and when `r` is negative it is shifted up by `|y|` into
+                // `[0, |y|)`. Written without a negated operand — `r + y` when
+                // the divisor is positive, `r - y` when it is negative — so no
+                // compiler-synthesised `-y` needs the neg-overflow lint exempted,
+                // and a written `-i64::MIN` argument is still rejected. Neither
+                // arm can overflow: with `y == i64::MIN` the remainder is never
+                // negative (so the `r - y` arm is unreachable), and otherwise
+                // `|r| < |y|` keeps `r ± y` inside `i64`. `%` keeps its traps, so
+                // a zero divisor and `i64::MIN % -1` panic as rustc's does.
+                let x = self.force_temp(x, &mut stmts);
+                let y = bind(self, args[0].clone(), &mut stmts);
+                let r = bind(self, Expr::Bin(Mod, Box::new(x), Box::new(y.clone())), &mut stmts);
+                let shifted = if_then_else(
+                    Expr::Bin(Gt, Box::new(y.clone()), Box::new(Expr::Int(0))),
+                    Expr::Bin(Add, Box::new(r.clone()), Box::new(y.clone())),
+                    Expr::Bin(Sub, Box::new(r.clone()), Box::new(y)),
+                );
+                (
+                    if_then_else(
+                        Expr::Bin(Lt, Box::new(r.clone()), Box::new(Expr::Int(0))),
+                        shifted,
+                        r,
+                    ),
+                    Type::I64,
+                )
             }
             "min" | "max" => {
                 if args.len() != 1 {
@@ -1137,7 +1208,17 @@ impl Sema {
                 // propagated — folding the first `x` here would wrongly reject
                 // the program.
                 let assigned = self.assign_count.get(name).copied().unwrap_or(0);
-                if init.is_some() && assigned == 0 && !self.mut_borrowed.contains(name) {
+                // A `\0im` name is a temp the built-in integer-method desugar
+                // introduced (`Sema::bind` / `force_temp`). They are never
+                // tracked, so the arithmetic a desugar builds over them cannot
+                // fold: `x.div_euclid(1)` synthesises `q - 1` on the
+                // `x == i64::MIN` path, and folding it would reject a program
+                // rustc accepts, because rustc never folds the stdlib body.
+                if !name.starts_with("\u{0}im")
+                    && init.is_some()
+                    && assigned == 0
+                    && !self.mut_borrowed.contains(name)
+                {
                     if let Some(e) = init.as_ref() {
                         if let Some(k) = self.const_of(e, &self.const_locals) {
                             self.const_locals.insert(s, k);
@@ -1596,6 +1677,30 @@ impl Sema {
             }
             Expr::Deref { expr, .. } => Self::collect_mut_borrows(expr, a, mb),
         }
+    }
+
+    /// Bind `e` to a fresh `\0im<n>` temporary, forcing it even when it is a
+    /// literal or a plain variable. The euclidean desugars use this for their
+    /// receiver: a literal or a const-tracked variable would otherwise let a
+    /// synthesised op fold and trip the overflow lint — `x.div_euclid(y)` with
+    /// `x == i64::MIN` and `y == -1` folds `x / y`, and `7.rem_euclid(MIN)`
+    /// folds `7 - MIN` on the dead negative-remainder arm; rustc accepts both
+    /// because it never folds the stdlib body. A NUL-named temp is not
+    /// const-tracked, so the op stays unfolded. The divisor is deliberately not
+    /// forced: keeping it a literal preserves the strength reduction of `x % d`
+    /// (`gen_div_const`), which a temp divisor would lose.
+    fn force_temp(&mut self, e: Expr, stmts: &mut Vec<Stmt>) -> Expr {
+        let name = format!("\u{0}im{}", self.tmp);
+        self.tmp += 1;
+        let var = Expr::Var { name: name.clone(), slot: -1, ty: Type::I64 };
+        stmts.push(Stmt::Let {
+            name,
+            ty: Some(Type::I64),
+            init: Some(e),
+            slot: -1,
+            mutable: false,
+        });
+        var
     }
 
     /// The constant value of an expression: a literal (with `const_i64`'s
@@ -2324,17 +2429,29 @@ impl Sema {
                 // to expressions over the operators rmc already lowers, so
                 // codegen is untouched, and they mirror `rustc -O` exactly:
                 // `abs` of `i64::MIN` is `i64::MIN` (no trap), `signum` of zero
-                // is zero, `is_positive`/`is_negative` of zero are both false.
-                // A method of the same name on a struct or enum still reaches
-                // the user-method path below, because this only fires when the
-                // receiver's type is `i64`.
+                // is zero, `is_positive`/`is_negative` of zero are both false,
+                // and `div_euclid`/`rem_euclid` round toward the mathematical
+                // quotient (a zero divisor and `i64::MIN / -1` panic, because
+                // they reuse `/` and `%`). A method of the same name on a struct
+                // or enum still reaches the user-method path below, because this
+                // only fires when the receiver's type is `i64`.
                 if matches!(base_ty, Type::I64)
                     && matches!(
                         name.as_str(),
-                        "abs" | "min" | "max" | "signum" | "is_positive" | "is_negative"
+                        "abs"
+                            | "min"
+                            | "max"
+                            | "signum"
+                            | "is_positive"
+                            | "is_negative"
+                            | "div_euclid"
+                            | "rem_euclid"
                     )
                 {
-                    let is_abs = name == "abs";
+                    // `abs` synthesises `-x`, a compiler-generated negation, so
+                    // the neg-overflow lint must not fire on it during the
+                    // re-check below (see the field).
+                    let synthesises_neg = name == "abs";
                     let recv = std::mem::replace(recv.as_mut(), Expr::Int(0));
                     // A `&i64` receiver auto-derefs to its referent.
                     let recv = if via_ref {
@@ -2344,10 +2461,8 @@ impl Sema {
                     };
                     let (rewritten, ret) = self.desugar_i64_method(name, recv, args)?;
                     *e = rewritten;
-                    // `abs` synthesises a `-x`; mark the re-check so the
-                    // neg-overflow lint does not fire on it (see the field).
                     let saved = self.in_builtin_neg;
-                    self.in_builtin_neg = is_abs;
+                    self.in_builtin_neg = synthesises_neg;
                     let r = self.check_expr(e, scope);
                     self.in_builtin_neg = saved;
                     // The desugared expression's own type is the method's

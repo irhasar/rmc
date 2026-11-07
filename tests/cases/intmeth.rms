@@ -47,6 +47,29 @@ fn main() -> i64 {
         i += 1;
     }
     print_i64(s);
+
+    // `div_euclid` / `rem_euclid`: the quotient rounded toward the
+    // mathematical value and the remainder in `[0, |y|)`. `i64::MIN`
+    // as the divisor must not overflow the `r - MIN` arm, which never
+    // runs.
+    print_i64(a.div_euclid(b));
+    print_i64(a.rem_euclid(b));
+    print_i64(b.div_euclid(a));
+    print_i64(b.rem_euclid(a));
+    print_i64(a.div_euclid(-b));
+    print_i64(a.rem_euclid(-b));
+    print_i64(b.div_euclid(-a));
+    print_i64(b.rem_euclid(-a));
+    print_i64(m.div_euclid(b));
+    print_i64(m.rem_euclid(b));
+    print_i64(a.rem_euclid(m));
+    print_i64(a.div_euclid(m));
+    print_i64(b.rem_euclid(m));
+    print_i64(b.div_euclid(m));
+    print_i64(a.div_euclid(MIN));
+    print_i64(a.rem_euclid(MIN));
+    print_i64(r.div_euclid(b));
+    print_i64(r.rem_euclid(b));
     // `is_positive` / `is_negative` yield `bool`; `0` is neither, `i64::MIN`
     // is negative and not positive.
     print_i64(a.is_negative() as i64);

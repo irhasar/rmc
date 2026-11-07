@@ -1298,7 +1298,8 @@ The checks, all in `sema.rs`:
   enum still falls through to the mangled-method path. rmc's `.len()` is `i64`
   where rustc's is `usize`, so a differential twin casts with `as i64`.
 - **Built-in `i64` methods
-  (`abs`/`min`/`max`/`signum`/`is_positive`/`is_negative`).** Like `len()`, they
+  (`abs`/`min`/`max`/`signum`/`is_positive`/`is_negative`/`div_euclid`/
+  `rem_euclid`).** Like `len()`, they
   are special-cased in the `MethodCall` arm of sema before the struct/enum lookup,
   and only when the receiver's type is `i64`, so a user `min` on a struct is
   untouched. `desugar_i64_method` rewrites the call into an expression over the
@@ -1309,12 +1310,29 @@ The checks, all in `sema.rs`:
   never overflows), `min`/`max` compare `y` against `x`
   (`if y < x { y } else { x }` for `min`), returning `x` on a tie, and
   `is_positive`/`is_negative` are the bare comparisons `x > 0` / `x < 0` (so
-  `0` is neither, and both return `bool`, unlike the `i64`-valued four). Each
-  desugar reads an operand more than once, so every non-trivial operand is first
-  bound to a fresh `\0im<n>` temporary (`Sema::tmp`), receiver before argument —
-  `g().abs()` calls `g` once, as rustc does; a plain variable or literal is
-  reused directly. The desugar returns its result type (`i64`, or `bool` for the
-  predicates) so the caller reports the right type without re-deriving it.
+  `0` is neither, and both return `bool`, unlike the `i64`-valued six).
+  `div_euclid`/`rem_euclid` bind `q = x / y` and `r = x % y`, then round: when
+  `r < 0`, `div_euclid` is `q - 1` (positive `y`) or `q + 1` (negative `y`), and
+  `rem_euclid` is `r + y` (positive `y`) or `r - y` (negative `y`), the latter
+  arm written as a subtraction so no synthesized `-y` needs the neg lint exempted.
+  `rem_euclid` is phrased `r ± y` (not `r + abs(y)`) precisely so a `MIN` divisor
+  does not overflow a dead arm: with `y == MIN` the remainder is never negative,
+  so `r - y` never runs. They reuse `/` and `%`, so a zero divisor and
+  `MIN.div_euclid(-1)` panic at run time as the operators do.
+  Each desugar reads an operand more than once, so every non-trivial operand is
+  first bound to a fresh `\0im<n>` temporary (`Sema::tmp`), receiver before
+  argument — `g().abs()` calls `g` once, as rustc does; a plain variable or
+  literal is reused directly. The euclidean *receiver* instead goes through
+  `Sema::force_temp`, which binds it even when it is a plain variable or
+  literal: a literal or a const-tracked variable would let the synthesized
+  `x / y` (or the dead `r - y` arm) fold and trip the overflow lint on
+  `MIN.div_euclid(-1)` / `7.rem_euclid(MIN)` — programs rustc accepts, since it
+  never folds the stdlib body. The divisor is deliberately left as `bind` so a
+  literal divisor stays literal and `gen_div_const` can still strength-reduce
+  `x % d` to a magic multiply. A `\0`-named temp is never entered into
+  `const_locals` (the same reason). The desugar returns its result type (`i64`,
+  or `bool` for the predicates) so the caller reports the right type without
+  re-deriving it.
   `abs`'s synthesized `-x` is exempt from the compile-time neg-overflow lint
   (`Sema::in_builtin_neg`, named for the neg it suppresses), because rustc
   accepts `i64::MIN.abs()`: a written `-i64::MIN` is still rejected.

@@ -50,7 +50,8 @@ Modes:
           value that mutates the base so the evaluation order and the
           independence of the result are both observable
     intmeth
-          built-in `i64` methods (`abs`/`signum`/`min`/`max`) over `argv`-sourced
+          built-in `i64` methods (`abs`/`signum`/`min`/`max`/`div_euclid`/
+          `rem_euclid`/`is_positive`/`is_negative`) over `argv`-sourced
           operands, so `i64::MIN`, `-1`, `0` and `1` are all reachable and the
           receiver's single evaluation and the tie/overflow behaviour are
           compared against `rustc -O`
@@ -1868,15 +1869,31 @@ def gen_intmeth_program(rng):
     def recv():
         return gen_i64(rng, 1)
 
+    def divisor():
+        """A divisor for the euclidean methods. A zero divisor traps in both
+        compilers (both write the message and exit 101), so it is included but
+        rare; `MIN`/`MAX` reach the rounding arms."""
+        r = rng.random()
+        if r < 0.08:
+            return "0"
+        if r < 0.28:
+            return rng.choice(["1", "-1", "2", "-2", "3", "-3", "7", "-7"])
+        if r < 0.42:
+            return rng.choice(["MIN", "MAX"])
+        return gen_i64(rng, 1)
+
     def call():
         k = rng.random()
-        if k < 0.25:
+        if k < 0.2:
             return f"({recv()}).abs()"
-        if k < 0.45:
+        if k < 0.36:
             return f"({recv()}).signum()"
-        if k < 0.7:
+        if k < 0.55:
             return f"({recv()}).min({gen_i64(rng, 1)})"
-        return f"({recv()}).max({gen_i64(rng, 1)})"
+        if k < 0.72:
+            return f"({recv()}).max({gen_i64(rng, 1)})"
+        m = rng.choice(["div_euclid", "rem_euclid"])
+        return f"({recv()}).{m}({divisor()})"
 
     def pred():
         """A `bool`-valued method, cast to `i64` so it prints like the rest."""
@@ -1894,6 +1911,19 @@ def gen_intmeth_program(rng):
     exprs.append("(MIN).is_positive() as i64")
     exprs.append("(MAX).is_positive() as i64")
     exprs.append("(MAX).is_negative() as i64")
+    # The euclidean rounding arms, pinned: `MIN` as the dividend with a divisor
+    # that leaves a negative remainder (`q + 1`), and `MIN`/`MAX` as the divisor
+    # (where the `r - MIN` arm would overflow if it ran, but never does).
+    exprs.append("(MIN).div_euclid(3)")
+    exprs.append("(MIN).rem_euclid(3)")
+    exprs.append("(MIN).div_euclid(-3)")
+    exprs.append("(MIN).rem_euclid(-3)")
+    exprs.append("(MIN).div_euclid(MIN)")
+    exprs.append("(MIN).rem_euclid(MIN)")
+    exprs.append("(MAX).div_euclid(-2)")
+    exprs.append("(MAX).rem_euclid(-2)")
+    exprs.append("(7).div_euclid(MIN)")
+    exprs.append("(7).rem_euclid(MIN)")
     # Zero is neither positive nor negative.
     exprs.append("(0).is_positive() as i64")
     exprs.append("(0).is_negative() as i64")
