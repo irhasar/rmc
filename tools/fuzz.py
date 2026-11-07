@@ -1888,16 +1888,33 @@ def gen_intmeth_program(rng):
             return rng.choice(["MIN", "MAX"])
         return gen_i64(rng, 1)
 
+    def bounds():
+        """A `(min, max)` pair with `min <= max`, so `clamp` does not trap.
+        `MIN`/`MAX` appear often, exercising the comparison arms at the i64
+        edges; the two are ordered by their numeric value, since the names are
+        opaque to Python's sort."""
+        order = {"MIN": -2**63, "MAX": 2**63 - 1}
+
+        def key(v):
+            return order[v] if v in order else int(v)
+
+        vals = ["MIN", "-100", "-7", "-3", "-1", "0", "1", "3", "7", "100", "MAX"]
+        a, b = rng.sample(vals, 2)
+        return (a, b) if key(a) <= key(b) else (b, a)
+
     def call():
         k = rng.random()
-        if k < 0.2:
+        if k < 0.18:
             return f"({recv()}).abs()"
-        if k < 0.36:
+        if k < 0.32:
             return f"({recv()}).signum()"
-        if k < 0.55:
+        if k < 0.48:
             return f"({recv()}).min({gen_i64(rng, 1)})"
-        if k < 0.72:
+        if k < 0.64:
             return f"({recv()}).max({gen_i64(rng, 1)})"
+        if k < 0.78:
+            lo, hi = bounds()
+            return f"({recv()}).clamp({lo}, {hi})"
         m = rng.choice(["div_euclid", "rem_euclid"])
         return f"({recv()}).{m}({divisor()})"
 
@@ -1930,6 +1947,19 @@ def gen_intmeth_program(rng):
     exprs.append("(MAX).rem_euclid(-2)")
     exprs.append("(7).div_euclid(MIN)")
     exprs.append("(7).rem_euclid(MIN)")
+    # `clamp`'s three outcomes pinned: below the low bound, above the high
+    # bound, and inside; the low/high tie returns the bound; `MIN`/`MAX` as
+    # bounds exercise the comparisons at the i64 edges.
+    exprs.append("(MIN).clamp(MIN, MAX)")
+    exprs.append("(MAX).clamp(MIN, MAX)")
+    exprs.append("(0).clamp(MIN, MAX)")
+    exprs.append("(-5).clamp(0, 10)")
+    exprs.append("(15).clamp(0, 10)")
+    exprs.append("(5).clamp(0, 10)")
+    exprs.append("(7).clamp(7, 9)")
+    exprs.append("(3).clamp(0, 3)")
+    exprs.append("(MIN).clamp(MAX, MAX)")
+    exprs.append("(MAX).clamp(MIN, MIN)")
     # Zero is neither positive nor negative.
     exprs.append("(0).is_positive() as i64")
     exprs.append("(0).is_negative() as i64")

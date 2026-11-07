@@ -5212,6 +5212,28 @@ fn a_min_divisor_in_the_euclidean_methods_does_not_trip_the_overflow_lint() {
 }
 
 #[test]
+fn clamp_evaluates_each_operand_once_and_traps_on_an_inverted_range() {
+    // Each operand is bound once, so a call operand runs a single time.
+    let out = asm_no_inline(
+        "fn g() -> i64 { return 3; } \
+         fn main() -> i64 { return g().clamp(g(), g()); }",
+    );
+    let body = &out[out.find("main:").expect("main")..];
+    assert_eq!(body.matches("call g").count(), 3, "each operand once:\n{body}");
+    // An inverted range calls the trap helper; the range check precedes the
+    // bound comparisons, so a valid range never reaches it.
+    assert!(out.contains("call __rmc_clamp"), "inverted range traps:\n{body}");
+}
+
+#[test]
+fn clamp_pulls_in_the_trap_helper_only_when_used() {
+    // A program with no `clamp` must not carry the trap, matching the
+    // runtime's per-symbol dead-code elimination.
+    let out = asm("fn main() -> i64 { return 1; }");
+    assert!(!out.contains("__rmc_clamp"), "trap dropped when unused:\n{out}");
+}
+
+#[test]
 fn a_builtin_integer_method_on_a_struct_is_not_shadowed() {
     // A struct may still define its own `min`; the built-in only fires on an
     // `i64` receiver.

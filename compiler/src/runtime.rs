@@ -599,6 +599,32 @@ __rmc_bounds_msg: .ascii "rmc: index out of bounds\n"
 "#,
         defines: &["__rmc_bounds", "__rmc_bounds_msg", "__rmc_bounds_len"],
     },
+    Piece {
+        text: r#"
+.text
+# void __rmc_clamp(void)  -- `i64::clamp` was called with `min > max`; write a
+# fixed message and exit with status 101, mirroring a Rust panic. It never
+# returns, but sema types the call `i64` so it can sit in one arm of the
+# `if min > max { .. } else { .. }` the desugar builds.
+.globl __rmc_clamp
+.type __rmc_clamp, @function
+__rmc_clamp:
+    mov $1, %rax
+    mov $2, %rdi             # stderr, like a Rust panic
+    lea __rmc_clamp_msg(%rip), %rsi
+    mov $__rmc_clamp_len, %rdx
+    syscall
+    mov $101, %rdi
+    mov $60, %rax
+    syscall
+.size __rmc_clamp, .-__rmc_clamp
+
+.section .rodata
+__rmc_clamp_msg: .ascii "rmc: clamp min > max\n"
+.set __rmc_clamp_len, . - __rmc_clamp_msg
+"#,
+        defines: &["__rmc_clamp", "__rmc_clamp_msg", "__rmc_clamp_len"],
+    },
 ];
 
 /// The identifiers in `src`, with `#`-to-end-of-line comments dropped. Matching

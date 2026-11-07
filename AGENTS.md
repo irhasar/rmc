@@ -1340,19 +1340,25 @@ The checks, all in `sema.rs`:
   enum still falls through to the mangled-method path. rmc's `.len()` is `i64`
   where rustc's is `usize`, so a differential twin casts with `as i64`.
 - **Built-in `i64` methods
-  (`abs`/`min`/`max`/`signum`/`is_positive`/`is_negative`/`div_euclid`/
-  `rem_euclid`).** Like `len()`, they
+  (`abs`/`min`/`max`/`clamp`/`signum`/`is_positive`/`is_negative`/
+  `div_euclid`/`rem_euclid`).** Like `len()`, they
   are special-cased in the `MethodCall` arm of sema before the struct/enum lookup,
   and only when the receiver's type is `i64`, so a user `min` on a struct is
   untouched. `desugar_i64_method` rewrites the call into an expression over the
-  operators rmc already lowers, so codegen gains no case and no runtime helper:
+  operators rmc already lowers, so codegen gains no case and no runtime helper
+  (`clamp`'s `min > max` panic is the one exception — a call to the
+  `__rmc_clamp` runtime piece, which is linked only when a `clamp` appears):
   `abs` is `if x < 0 { -x } else { x }` (so `i64::MIN` maps to itself, matching
   `rustc -O`; under `--overflow-checks` the `neg` traps, matching a debug build),
   `signum` is `(x > 0) as i64 - (x < 0) as i64` (comparisons only, so `i64::MIN`
   never overflows), `min`/`max` compare `y` against `x`
-  (`if y < x { y } else { x }` for `min`), returning `x` on a tie, and
+  (`if y < x { y } else { x }` for `min`), returning `x` on a tie,
+  `clamp(lo, hi)` is `if lo > hi { __rmc_clamp() } else if x < lo { lo } else if
+  x > hi { hi } else { x }` (the `lo`/`hi` binds run in argument order, then the
+  range check, so `g().clamp(g(), g())` calls `g` three times as rustc does and
+  the inverted-range panic fires before either bound is used), and
   `is_positive`/`is_negative` are the bare comparisons `x > 0` / `x < 0` (so
-  `0` is neither, and both return `bool`, unlike the `i64`-valued six).
+  `0` is neither, and both return `bool`, unlike the `i64`-valued seven).
   `div_euclid`/`rem_euclid` bind `q = x / y` and `r = x % y`, then round: when
   `r < 0`, `div_euclid` is `q - 1` (positive `y`) or `q + 1` (negative `y`), and
   `rem_euclid` is `r + y` (positive `y`) or `r - y` (negative `y`), the latter

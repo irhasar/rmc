@@ -155,6 +155,57 @@ def check_bounds_traps(combos):
     return failures
 
 
+def check_clamp_trap(combos):
+    """`i64::clamp` with `min > max` must write its message and exit 101, not
+    fault, under a plain `ld` link (the trap is a runtime call, so its message
+    lives in `.rodata` and the handler must be reachable). The operands come
+    from parameters, so the range is not known at compile time; a `lo` bound
+    with a side effect must run before the panic, matching rustc's evaluation
+    of the receiver, then the arguments, then the range check."""
+    cases = {
+        "runtime": ("fn f(x: i64, lo: i64, hi: i64) -> i64 { return x.clamp(lo, hi); } fn main() -> i64 { return f(5, 7, 3); }", b""),
+        "side_effect": ("fn g(v: i64) -> i64 { print_i64(v); return v; } fn f(x: i64, lo: i64, hi: i64) -> i64 { return x.clamp(lo, hi); } fn main() -> i64 { return f(g(5), g(7), g(3)); }", b"5\n7\n3\n"),
+    }
+    failures = 0
+    for name, (src, want_stdout) in cases.items():
+        rms = os.path.join(OUT, f"clamp_{name}.rms")
+        with open(rms, "w") as f:
+            f.write(src)
+        for label, opt_flags in combos:
+            asm = subprocess.run([RMC] + list(opt_flags) + ["--emit-asm", rms],
+                                 capture_output=True)
+            if asm.returncode != 0:
+                print(f"FAIL clamp {name}{label}: rmc failed:\n{asm.stderr.decode(errors='replace')}")
+                failures += 1
+                continue
+            s_path = os.path.join(OUT, f"clamp_{name}.s")
+            o_path = os.path.join(OUT, f"clamp_{name}.o")
+            exe = os.path.join(OUT, f"clamp_{name}.exe")
+            with open(s_path, "wb") as f:
+                f.write(asm.stdout)
+            p = subprocess.run(["as", s_path, "-o", o_path], capture_output=True)
+            if p.returncode != 0:
+                print(f"FAIL clamp {name}{label}: as failed:\n{p.stderr.decode(errors='replace')}")
+                failures += 1
+                continue
+            p = subprocess.run(["ld", "-o", exe, o_path], capture_output=True)
+            if p.returncode != 0:
+                print(f"FAIL clamp {name}{label}: ld failed:\n{p.stderr.decode(errors='replace')}")
+                failures += 1
+                continue
+            p = subprocess.run([exe], capture_output=True)
+            if p.returncode != 101 or b"clamp min > max" not in p.stderr:
+                print(f"FAIL clamp {name}{label}: exit={p.returncode} stderr={p.stderr!r} (want 101 + message)")
+                failures += 1
+            elif not p.stdout.startswith(want_stdout):
+                print(f"FAIL clamp {name}{label}: stdout={p.stdout!r} (want prefix {want_stdout!r})")
+                failures += 1
+    if failures == 0:
+        print(f"clamp `min > max` traps exit 101 under a plain `ld` link, "
+              f"in {len(combos)} optimiser configurations")
+    return failures
+
+
 def check_stripped():
     """Size behaviour of both link paths.
 
@@ -479,6 +530,7 @@ def main():
                     print(f"ok   {name}{label} {argv}")
 
     failures += check_bounds_traps(combos)
+    failures += check_clamp_trap(combos)
     stripped = check_stripped()
     failures += stripped
     if stripped == 0:
