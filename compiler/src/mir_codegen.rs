@@ -327,6 +327,15 @@ fn resolve_fmt(ty_name: &str, trait_name: &str) -> &'static str {
     if is_str {
         return if debug { "__rmc_fmt_str_debug" } else { "__rmc_fmt_str" };
     }
+    // A float has its own decimal renderer per width. It must be checked before
+    // `int_kind`, which would otherwise read an `f64` as a signed word and print
+    // its bit pattern as a huge integer.
+    if base == "f64" {
+        return "__rmc_fmt_f64";
+    }
+    if base == "f32" {
+        return "__rmc_fmt_f32";
+    }
     // Integers keep their width and signedness. `char`/`bool` have their own
     // helpers; every other scalar (a `usize` width, a pointer) is formatted
     // as a 64-bit value.
@@ -1806,7 +1815,7 @@ impl<'a> FnGen<'a> {
             Operand::Fmt { ty_name, trait_name } => {
                 // A reified formatter is the address of rmc's own runtime
                 // formatter for this type/trait pair.
-                let label = self.fmt_label(ty_name, trait_name);
+                let label = self.fmt_label(ty_name, trait_name)?;
                 self.emit(&format!("  lea {label}(%rip), %rax"));
                 Ok(("%rax".to_string(), false))
             }
@@ -1827,7 +1836,7 @@ impl<'a> FnGen<'a> {
     fn eval_operand_keep_rax(&mut self, op: &Operand) -> Result<(String, bool), String> {
         match op {
             Operand::Fmt { ty_name, trait_name } => {
-                let label = self.fmt_label(ty_name, trait_name);
+                let label = self.fmt_label(ty_name, trait_name)?;
                 self.emit(&format!("  lea {label}(%rip), %rcx"));
                 Ok(("%rcx".to_string(), false))
             }
@@ -1908,14 +1917,36 @@ impl<'a> FnGen<'a> {
     /// The runtime defines one per scalar type and numeric base; the trait name
     /// only selects the base (`Display` = decimal, `Debug` = decimal with
     /// quoting for strings, `LowerHex` = hex, ...).
-    fn fmt_label(&self, ty_name: &str, trait_name: &str) -> String {
-        resolve_fmt(ty_name, trait_name).to_string()
+    fn fmt_label(&self, ty_name: &str, trait_name: &str) -> Result<String, String> {
+        // A float's `Display` is the shortest decimal that round-trips, which
+        // the runtime does not yet render. Reject it here, naming the feature,
+        // rather than emitting a call to a formatter that does not exist (an
+        // "undefined symbol" link error) or, worse, reading the bit pattern as
+        // an integer and printing a huge number.
+        let base = ty_name.trim().trim_start_matches('&').trim_start_matches("mut ").trim();
+        if base == "f64" || base == "f32" {
+            return Err(format!(
+                "mir_codegen: formatting a float (`{base}`) is not implemented on the MIR path"
+            ));
+        }
+        Ok(resolve_fmt(ty_name, trait_name).to_string())
     }
 
     fn const_operand(&mut self, c: &Const) -> Result<String, String> {
         Ok(match c {
             Const::Int(n) => format!("${n}"),
             Const::Bool(b) => format!("${}", *b as i64),
+            // A float's value as a general-purpose register is its bit pattern;
+            // the float arithmetic paths move that word into an SSE register.
+            // An f32 keeps its 32 bits in the low half.
+            Const::Float(v, is_f32) => {
+                let bits = if *is_f32 {
+                    (*v as f32).to_bits() as i64
+                } else {
+                    v.to_bits() as i64
+                };
+                format!("${bits}")
+            }
             Const::Char(c) => format!("${c}"),
             Const::Unit => "$0".to_string(),
             Const::Str(s) => {
@@ -2419,6 +2450,14 @@ impl<'a> FnGen<'a> {
                 self.store_scalar(dest, "%rax")?;
             }
             Rvalue::Cast { op, to, .. } => {
+                // A float is involved when either side is one. The source type
+                // is resolved at codegen time, not from the `from` field, which
+                // the parser cannot know for a local.
+                let src_ty = self.operand_ty(op);
+                if src_ty.is_float() || to.is_float() {
+                    self.gen_float_cast(dest, op, &src_ty, to)?;
+                    return Ok(());
+                }
                 // rmc has no real slice representation: a `&[T]`/`&str` value
                 // is a *thin* pointer to a `{len: i64, data..}` record. Only a
                 // string literal (and the `b".."` template bytes, which are the
@@ -2714,6 +2753,13 @@ impl<'a> FnGen<'a> {
         a: &Operand,
         b: &Operand,
     ) -> Result<(), String> {
+        // A float operand routes to SSE: the arithmetic mnemonics differ, the
+        // comparison is `ucomisd` rather than `cmp`, and both sides are moved
+        // through `%xmm` registers. A pointer offset is never float, so only
+        // the arithmetic and comparison operators need this.
+        if self.operand_ty(a).is_float() || self.operand_ty(b).is_float() {
+            return self.gen_float_binary(dest, op, a, b);
+        }
         // When the destination is a promoted register and the operator maps to
         // a single ALU instruction, update the register in place. This is the
         // accumulator pattern (`_acc = Add(_acc, k)`), which copy propagation
@@ -2785,6 +2831,184 @@ impl<'a> FnGen<'a> {
                 self.emit_arith(op, a, b)?;
                 self.store_scalar(dest, "%rax")?;
             }
+        }
+        Ok(())
+    }
+
+    /// Emit a floating-point `a op b` into `%rax`.
+    ///
+    /// A float operand is a one-word value whose bit pattern is moved into
+    /// `%xmm0`/`%xmm1` to be operated on and back to `%rax` afterwards, so the
+    /// rest of the back end (a frame slot, a promoted register, an argument
+    /// register) sees an ordinary scalar. The width picks the `sd`/`ss`
+    /// mnemonic: an `f32` operates on the low 32 bits of the `%xmm` register,
+    /// which is also how it is stored, so no packing is needed.
+    fn gen_float_binary(
+        &mut self,
+        dest: &Place,
+        op: BinOp,
+        a: &Operand,
+        b: &Operand,
+    ) -> Result<(), String> {
+        let f32 = matches!(self.operand_ty(a), Ty::F32)
+            || matches!(self.operand_ty(b), Ty::F32);
+        let suf = if f32 { "ss" } else { "sd" };
+        match op {
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                self.load_float(a, "%xmm0")?;
+                self.load_float_keep_xmm0(b, "%xmm1")?;
+                let m = match op {
+                    BinOp::Add => "add",
+                    BinOp::Sub => "sub",
+                    BinOp::Mul => "mul",
+                    _ => "div",
+                };
+                self.emit(&format!("  {m}{suf} %xmm1, %xmm0"));
+                self.emit("  movq %xmm0, %rax");
+                if f32 {
+                    // An `f32` value lives in the low 32 bits, so the upper half
+                    // of the word must be cleared for the bit pattern to be
+                    // exactly the float and for a `ucomiss`/store to agree.
+                    self.emit("  mov %eax, %eax");
+                }
+                self.store_scalar(dest, "%rax")?;
+            }
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                self.load_float(a, "%xmm0")?;
+                self.load_float_keep_xmm0(b, "%xmm1")?;
+                self.emit(&format!("  ucomi{suf} %xmm1, %xmm0"));
+                // `ucomiss`/`ucomisd` set CF/ZF/PF as an *unsigned* compare, so
+                // the mnemonic is the unsigned one (`setb`, not `setl`), and an
+                // unordered result (a NaN operand) sets ZF=PF=CF=1. Rust's
+                // comparisons are all false when a NaN is involved except `!=`,
+                // which is true, so `==`/`<`/`<=` must clear the parity-bit
+                // result and `!=` must set it. `>` and `>=` are already false
+                // when unordered (their CF=0 precondition fails), so they need
+                // no guard.
+                let (cc, guard) = match op {
+                    BinOp::Eq => ("sete", Guard::Ordered),
+                    BinOp::Ne => ("setne", Guard::Unordered),
+                    BinOp::Lt => ("setb", Guard::Ordered),
+                    BinOp::Le => ("setbe", Guard::Ordered),
+                    BinOp::Gt => ("seta", Guard::None),
+                    _ => ("setae", Guard::None),
+                };
+                self.emit(&format!("  {cc} %al"));
+                match guard {
+                    Guard::Ordered => {
+                        self.emit("  setnp %cl");
+                        self.emit("  and %cl, %al");
+                    }
+                    Guard::Unordered => {
+                        self.emit("  setp %cl");
+                        self.emit("  or %cl, %al");
+                    }
+                    Guard::None => {}
+                }
+                self.emit("  movzbl %al, %eax");
+                self.store_scalar(dest, "%rax")?;
+            }
+            _ => {
+                return Err(format!(
+                    "mir_codegen: float operator {op:?} is not implemented"
+                ))
+            }
+        }
+        Ok(())
+    }
+
+    /// Load a float operand's bit pattern into an `%xmm` register. The operand
+    /// is a scalar (an immediate bit pattern, a frame slot, or a promoted
+    /// register), so it goes through `%rax` first, except for a direct memory
+    /// operand which `movsd`/`movss` can read without the trip.
+    fn load_float(&mut self, op: &Operand, xmm: &str) -> Result<(), String> {
+        let f32 = matches!(self.operand_ty(op), Ty::F32);
+        let (v, mem) = self.eval_operand(op)?;
+        if mem && !f32 {
+            // `movsd` reads a double straight from memory.
+            self.emit(&format!("  movsd {v}, {xmm}"));
+            return Ok(());
+        }
+        if mem && f32 {
+            self.emit(&format!("  movss {v}, {xmm}"));
+            return Ok(());
+        }
+        if v != "%rax" {
+            self.emit(&format!("  mov {v}, %rax"));
+        }
+        if f32 {
+            self.emit(&format!("  movd %eax, {xmm}"));
+        } else {
+            self.emit(&format!("  movq %rax, {xmm}"));
+        }
+        Ok(())
+    }
+
+    /// Load the right-hand float operand without clobbering `%xmm0`, mirroring
+    /// `eval_operand_keep_rax` for the SSE side.
+    fn load_float_keep_xmm0(&mut self, op: &Operand, xmm: &str) -> Result<(), String> {
+        self.load_float(op, xmm)
+    }
+
+    /// A cast with a float on one side: `IntToFloat`, `FloatToInt`, and the
+    /// `f32`/`f64` widening and narrowing. The integer side is a signed 64-bit
+    /// value, which is what the back end stores for every integer width.
+    fn gen_float_cast(
+        &mut self,
+        dest: &Place,
+        op: &Operand,
+        src: &Ty,
+        to: &Ty,
+    ) -> Result<(), String> {
+        let to_f32 = matches!(to, Ty::F32);
+        match (src.is_float(), to.is_float()) {
+            // Integer -> float: `cvtsi2ss`/`cvtsi2sd` read a signed 64-bit
+            // general-purpose register and write the `%xmm` register.
+            (false, true) => {
+                let (v, _) = self.eval_operand(op)?;
+                if v != "%rax" {
+                    self.emit(&format!("  mov {v}, %rax"));
+                }
+                if to_f32 {
+                    self.emit("  cvtsi2ss %rax, %xmm0");
+                    self.emit("  movd %xmm0, %eax");
+                } else {
+                    self.emit("  cvtsi2sd %rax, %xmm0");
+                    self.emit("  movq %xmm0, %rax");
+                }
+                self.store_scalar(dest, "%rax")?;
+            }
+            // Float -> integer: `cvttsd2si` truncates toward zero, which is
+            // Rust's `as` semantics. A value out of range (or a NaN) leaves
+            // `0x8000000000000000`, matching rustc's saturating cast for the
+            // signed 64-bit case.
+            (true, false) => {
+                self.load_float(op, "%xmm0")?;
+                if matches!(src, Ty::F32) {
+                    self.emit("  cvttss2si %xmm0, %rax");
+                } else {
+                    self.emit("  cvttsd2si %xmm0, %rax");
+                }
+                self.store_scalar(dest, "%rax")?;
+            }
+            // Float -> float: `cvtss2sd` widens, `cvtsd2ss` narrows (rounding
+            // to nearest-even, which matches rustc).
+            (true, true) => {
+                self.load_float(op, "%xmm0")?;
+                if matches!(src, Ty::F32) && !to_f32 {
+                    self.emit("  cvtss2sd %xmm0, %xmm0");
+                    self.emit("  movq %xmm0, %rax");
+                } else if matches!(src, Ty::F64) && to_f32 {
+                    self.emit("  cvtsd2ss %xmm0, %xmm0");
+                    self.emit("  movd %xmm0, %eax");
+                } else if to_f32 {
+                    self.emit("  movd %xmm0, %eax");
+                } else {
+                    self.emit("  movq %xmm0, %rax");
+                }
+                self.store_scalar(dest, "%rax")?;
+            }
+            (false, false) => unreachable!("gen_float_cast called with no float side"),
         }
         Ok(())
     }
@@ -3067,6 +3291,15 @@ impl<'a> FnGen<'a> {
         match op {
             Operand::Copy(p) | Operand::Move(p) => self.place_ty(p),
             Operand::Const(Const::Bool(_)) => Ty::Bool,
+            // A float constant carries its width, so the arithmetic paths can
+            // pick the single- or double-precision SSE form.
+            Operand::Const(Const::Float(_, is_f32)) => {
+                if *is_f32 {
+                    Ty::F32
+                } else {
+                    Ty::F64
+                }
+            }
             // A string constant is a byte pointer, so `Offset` scales by 1.
             Operand::Const(Const::Str(_)) => Ty::Ptr(Box::new(Ty::U8)),
             Operand::Const(_) => Ty::I64,
@@ -4134,7 +4367,8 @@ fn is_wide_imm(op: &str) -> bool {
 fn ty_size(ty: &Ty) -> i64 {
     match ty {
         Ty::U8 => 1,
-        Ty::I64 | Ty::Bool | Ty::Int | Ty::Ptr(_) | Ty::Ref(_) | Ty::Other | Ty::Unit => 8,
+        Ty::F32 => 4,
+        Ty::I64 | Ty::Bool | Ty::Int | Ty::F64 | Ty::Ptr(_) | Ty::Ref(_) | Ty::Other | Ty::Unit => 8,
         Ty::Struct(_) => 8, // refined by the aggregate's own length
         Ty::Array(elem, n) => ty_size(elem) * (*n as i64).max(1),
         Ty::Tuple(tys) => tys.iter().map(|t| ty_size(t)).sum::<i64>().max(8),
@@ -4254,6 +4488,16 @@ fn operand_place(op: &Operand) -> Option<&Place> {
         Operand::Copy(p) | Operand::Move(p) => Some(p),
         _ => None,
     }
+}
+
+/// The NaN guard a float comparison needs after `ucomisd`/`ucomiss`.
+enum Guard {
+    /// The comparison is false when unordered: AND the result with `setnp`.
+    Ordered,
+    /// The comparison is true when unordered: OR the result with `setp`.
+    Unordered,
+    /// The flag test is already false when unordered.
+    None,
 }
 
 fn setcc(op: BinOp) -> &'static str {

@@ -42,6 +42,11 @@ pub enum Ty {
     Tuple(Vec<TyBox>),
     /// `()` and any type the backend treats as zero-sized.
     Unit,
+    /// `f64`: one 64-bit word holding an IEEE-754 double.
+    F64,
+    /// `f32`: one 32-bit word holding an IEEE-754 single, stored in the low
+    /// half of a 64-bit slot.
+    F32,
     /// A `&str` literal or an unmodelled type; treated as a scalar.
     Other,
 }
@@ -51,6 +56,14 @@ pub type TyBox = Box<Ty>;
 impl Ty {
     pub fn is_aggregate(&self) -> bool {
         matches!(self, Ty::Struct(_) | Ty::Array(..) | Ty::Tuple(_))
+    }
+
+    /// True for an IEEE-754 float. A float lives in a general-purpose register
+    /// like any other scalar (the back end moves it through `%rax` and SSE
+    /// registers), so most of the integer plumbing treats it as one word; only
+    /// arithmetic, comparison, casts and formatting branch on this.
+    pub fn is_float(&self) -> bool {
+        matches!(self, Ty::F32 | Ty::F64)
     }
 }
 
@@ -75,6 +88,10 @@ pub enum Operand {
 pub enum Const {
     Int(i64),
     Bool(bool),
+    /// An `f64`/`f32` literal (`const 5.5f64`, `const 2f64`), held as its bit
+    /// pattern so the back end can materialise it without a parser dependency
+    /// on Rust's decimal-to-binary rounding. The width says which one it is.
+    Float(f64, bool),
     /// A `char` literal (`'A'`), held as its Unicode scalar value. Rust's
     /// `char` is a 32-bit scalar, so the formatter reads four bytes.
     Char(u32),
@@ -1959,6 +1976,14 @@ fn parse_const(s: &str) -> Option<Const> {
     if let Some(n) = parse_named_const(s) {
         return Some(Const::Int(n));
     }
+    // An `f64`/`f32` literal: `5.5f64`, `2f64`, `-0f64`, `1.0E+100f64`, and
+    // the special forms `+Inf_f64` / `-Inf_f64` / `NaN_f64` the printer uses
+    // for the non-finite values. The suffix is the width; a value with no
+    // suffix (`const 5.5`) does not appear, so requiring one keeps this from
+    // swallowing an integer.
+    if let Some(f) = parse_float_literal(s) {
+        return Some(f);
+    }
     // `main::promoted[N]` — a reference to a promoted constant. The parser folds
     // the promoted body into `Program::promoted`; the back end materialises its
     // `.rodata` blob. A name that was not folded is rejected at codegen.
@@ -2104,6 +2129,41 @@ fn parse_named_const(s: &str) -> Option<i64> {
         "MAX" => Some((1i64 << bits) - 1),
         _ => None,
     }
+}
+
+/// An `f64`/`f32` literal, as the MIR printer writes it. The suffix carries the
+/// width: `5.5f64` for a finite value, and `+Inf_f64` / `-Inf_f64` / `NaN_f64`
+/// (an underscore before the width) for the non-finite ones. The decimal text
+/// is parsed by Rust's own `f64::from_str`, which is correctly rounded to
+/// nearest-even, so the value matches rustc's exactly.
+fn parse_float_literal(s: &str) -> Option<Const> {
+    let s = s.trim();
+    for (suffix, is_f32) in [("_f64", false), ("_f32", true)] {
+        if let Some(body) = s.strip_suffix(suffix) {
+            let v = match body {
+                "+Inf" => f64::INFINITY,
+                "-Inf" => f64::NEG_INFINITY,
+                "NaN" => f64::NAN,
+                _ => return None,
+            };
+            return Some(Const::Float(v, is_f32));
+        }
+    }
+    let (body, is_f32) = if let Some(b) = s.strip_suffix("f64") {
+        (b, false)
+    } else if let Some(b) = s.strip_suffix("f32") {
+        (b, true)
+    } else {
+        return None;
+    };
+    // A bare `f64`/`f32` (a type fragment) leaves an empty body, which fails to
+    // parse; an integer suffix such as `2_i64` never reaches here.
+    let v = if is_f32 {
+        body.parse::<f32>().ok()? as f64
+    } else {
+        body.parse::<f64>().ok()?
+    };
+    Some(Const::Float(v, is_f32))
 }
 
 /// `0_i64`, `100_usize`, `-1_i64`, `0x10_u8`, `0x8000000000000000_u64`.
@@ -2396,6 +2456,8 @@ pub fn parse_ty(s: &str) -> Result<Ty, String> {
         "i64" => Ok(Ty::I64),
         "bool" => Ok(Ty::Bool),
         "u8" | "i8" => Ok(Ty::U8),
+        "f64" => Ok(Ty::F64),
+        "f32" => Ok(Ty::F32),
         "usize" | "isize" | "u64" | "u32" | "i32" | "u16" | "i16"
         | "u128" | "i128" | "char" => Ok(Ty::Int),
         "()" => Ok(Ty::Unit),
