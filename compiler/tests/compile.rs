@@ -5620,3 +5620,178 @@ fn an_unknown_std_path_is_a_clear_error() {
         "unknown std path is diagnosed:\n{err}"
     );
 }
+
+// ------------------------------------------------------------------- char
+
+#[test]
+fn a_char_literal_reaches_codegen_as_its_scalar_value() {
+    let out = asm("fn main() -> i64 { return 'A' as i64; }");
+    assert!(out.contains("mov $65, %rax"), "the scalar value is emitted:\n{out}");
+}
+
+#[test]
+fn char_escapes_decode_to_the_right_scalar() {
+    // `\n` is 10, `\t` is 9, `\0` is 0, `\\` is 92, `\'` is 39 and `\x41` is
+    // 65; each must reach codegen as that immediate.
+    for (lit, val) in [("'\\n'", 10), ("'\\t'", 9), ("'\\0'", 0), ("'\\\\'", 92),
+                       ("'\\''", 39), ("'\\x41'", 65)] {
+        let out = asm(&format!("fn main() -> i64 {{ return {lit} as i64; }}"));
+        assert!(out.contains(&format!("mov ${val}, %rax")),
+                "{lit} should be {val}:\n{out}");
+    }
+}
+
+#[test]
+fn a_unicode_char_escape_reaches_codegen_as_its_scalar() {
+    // The astral `\u{1F600}` is 128512; a `\u{..}` above the BMP must not be
+    // truncated.
+    let out = asm("fn main() -> i64 { return '\\u{1F600}' as i64; }");
+    assert!(out.contains("mov $128512, %rax"), "the astral scalar survives:\n{out}");
+}
+
+#[test]
+fn a_non_ascii_char_literal_reaches_codegen_as_its_scalar() {
+    // `é` is U+00E9 = 233, read from the raw UTF-8 bytes of the source.
+    let out = asm("fn main() -> i64 { return 'é' as i64; }");
+    assert!(out.contains("mov $233, %rax"), "the UTF-8 scalar survives:\n{out}");
+}
+
+#[test]
+fn a_char_hex_escape_above_ascii_is_rejected() {
+    // rustc restricts a character's `\x` escape to `[\x00-\x7f]`.
+    let err = compile_to_asm("fn main() -> i64 { return '\\xff' as i64; }", &CompileOptions::default())
+        .unwrap_err();
+    assert!(err.contains("out of range hex escape"), "got: {err}");
+}
+
+#[test]
+fn a_char_u_escape_that_is_not_a_scalar_is_rejected() {
+    // A surrogate (`\u{d800}`) is not a Unicode scalar value.
+    let err = compile_to_asm("fn main() -> i64 { return '\\u{d800}' as i64; }", &CompileOptions::default())
+        .unwrap_err();
+    assert!(err.contains("not a Unicode scalar"), "got: {err}");
+}
+
+#[test]
+fn an_empty_char_literal_is_rejected() {
+    let err = compile_to_asm("fn main() -> i64 { return '' as i64; }", &CompileOptions::default())
+        .unwrap_err();
+    assert!(err.contains("character literal"), "got: {err}");
+}
+
+#[test]
+fn a_bare_unescaped_quote_is_rejected() {
+    // `'''` must be an error, not the quote character.
+    let err = compile_to_asm("fn main() -> i64 { return ''' as i64; }", &CompileOptions::default())
+        .unwrap_err();
+    assert!(err.contains("must be escaped"), "got: {err}");
+}
+
+#[test]
+fn a_loop_label_is_not_a_char_literal() {
+    // `'outer:` must lex as a label, not a char literal.
+    let out = asm("fn main() -> i64 { let mut i: i64 = 0; 'outer: while i < 3 { i = i + 1; if i == 2 { continue 'outer; } } return i; }");
+    assert!(out.contains("main:"), "the label lexes:\n{out}");
+}
+
+#[test]
+fn two_chars_compare_by_scalar() {
+    let eq = asm("fn main() -> i64 { return ('a' == 'a') as i64; }");
+    assert!(eq.contains("sete"), "equality is a scalar compare:\n{eq}");
+    let ord = asm("fn main() -> i64 { return ('a' < 'b') as i64; }");
+    assert!(ord.contains("main:"), "ordering compiles:\n{ord}");
+}
+
+#[test]
+fn a_char_match_lowers_to_a_scalar_test() {
+    let out = asm("fn main() -> i64 { let c = 'x'; return match c { 'x' => 1, _ => 0 }; }");
+    assert!(out.contains("main:"), "the char match compiles:\n{out}");
+}
+
+#[test]
+fn char_to_i64_is_allowed_but_i64_to_char_is_not() {
+    // rustc allows only `u8 as char`, so `i64 as char` is rejected.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let n: i64 = 65; let c = n as char; return c as i64; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("cannot cast"), "got: {err}");
+}
+
+#[test]
+fn a_char_prints_as_utf8_text() {
+    // `{}` on a `char` selects the UTF-8 writer, not the i64 one.
+    let out = asm("fn main() -> i64 { println!(\"{}\", 'A'); return 0; }");
+    assert!(out.contains("__rmc_write_char:"), "the char writer is linked:\n{out}");
+    assert!(!out.contains("__rmc_write_i64:"), "the i64 writer is not:\n{out}");
+}
+
+#[test]
+fn a_char_constant_folds_into_a_pattern() {
+    let out = asm("const C: char = 'z'; fn main() -> i64 { let c = 'z'; return match c { C => 1, _ => 0 }; }");
+    assert!(out.contains("main:"), "the const pattern compiles:\n{out}");
+}
+
+#[test]
+fn a_char_array_is_indexable() {
+    let out = asm("fn main() -> i64 { let cs: [char; 2] = ['a', 'b']; return cs[1] as i64; }");
+    assert!(out.contains("mov $98, %rax"), "the element is read:\n{out}");
+}
+
+#[test]
+fn print_char_writes_utf8_and_is_linked_only_when_used() {
+    let out = asm("fn main() -> i64 { print_char('A'); return 0; }");
+    assert!(out.contains("print_char:"), "the char printer is kept:\n{out}");
+    assert!(out.contains("__rmc_write_char:"), "its helper is kept too:\n{out}");
+    assert!(!out.contains("print_bool:"), "unrelated printers are dropped:\n{out}");
+}
+
+#[test]
+fn print_char_rejects_a_non_char_argument() {
+    let err = compile_to_asm("fn main() -> i64 { print_char(65); return 0; }", &CompileOptions::default())
+        .unwrap_err();
+    assert!(err.contains("print_char"), "the mismatch names the call:\n{err}");
+}
+
+#[test]
+fn a_char_range_pattern_lowers_to_two_comparisons() {
+    // `'a'..='z'` becomes `'a' <= c && c <= 'z'`, the same shape as an integer
+    // range, so sema and codegen need no new case. `'a'` is 97, `'z'` 122.
+    let out = asm(
+        "fn main() -> i64 { let c = 'q'; \
+         if let 'a'..='z' = c { return 1; } return 0; }",
+    );
+    assert!(out.contains("$97"), "lower bound is emitted:\n{out}");
+    assert!(out.contains("$122"), "upper bound is emitted:\n{out}");
+}
+
+#[test]
+fn a_char_range_pattern_matches_a_value() {
+    let out = asm(
+        "fn main() -> i64 { let c = 'q'; \
+         match c { 'a'..='z' => return 1, _ => return 0 } }",
+    );
+    assert!(out.contains("$97"), "the range lower bound is emitted:\n{out}");
+    assert!(out.contains("$122"), "the range upper bound is emitted:\n{out}");
+}
+
+#[test]
+fn an_empty_char_range_pattern_is_rejected() {
+    let err = compile_to_asm(
+        "fn main() -> i64 { let c = 'q'; match c { 'z'..'a' => return 1, _ => return 0 } }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("empty range"), "the message explains the empty range:\n{err}");
+}
+
+#[test]
+fn a_char_range_with_an_int_bound_is_rejected() {
+    let err = compile_to_asm(
+        "fn main() -> i64 { let c = 'q'; match c { 'a'..=5 => return 1, _ => return 0 } }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("char"), "the message names the char bound:\n{err}");
+}

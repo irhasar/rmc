@@ -144,7 +144,7 @@ fn stmt_ok(s: &Stmt) -> bool {
 /// that could itself grow.
 fn expr_ok(e: &Expr) -> bool {
     match e {
-        Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {
+        Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {
             true
         }
         Expr::Bin(_, a, b) => expr_ok(a) && expr_ok(b),
@@ -190,7 +190,7 @@ fn count_stmt(s: &Stmt) -> usize {
 fn count_expr(e: &Expr) -> usize {
     let n = |x: &Box<Expr>| count_expr(x);
     match e {
-        Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => 1,
+        Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => 1,
         Expr::PatScrutinee(_) => {
             unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
         }
@@ -363,7 +363,7 @@ impl Inliner {
             Expr::VariantTest { scrutinee, .. } => self.walk_expr(scrutinee, base, expanding),
             Expr::BoolTest { scrutinee, .. } => self.walk_expr(scrutinee, base, expanding),
             Expr::EnumPayload { recv, .. } => self.walk_expr(recv, base, expanding),
-            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
+            Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
         }
     }
 
@@ -487,7 +487,7 @@ impl Inliner {
 /// evaluation: a name, a literal, or a string. Everything else is evaluated once
 /// into a temporary instead.
 fn trivial(e: &Expr) -> bool {
-    matches!(e, Expr::Var { .. } | Expr::Int(_) | Expr::Bool(_) | Expr::Str(_))
+    matches!(e, Expr::Var { .. } | Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_))
 }
 
 /// True for an expression whose evaluation may write memory or call a function,
@@ -634,7 +634,7 @@ fn escaped_slots(stmts: &[Stmt], tail: Option<&Expr>) -> HashSet<i32> {
             Expr::VariantTest { scrutinee, .. } => collect_expr(scrutinee, out),
             Expr::BoolTest { scrutinee, .. } => collect_expr(scrutinee, out),
             Expr::EnumPayload { recv, .. } => collect_expr(recv, out),
-            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
+            Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
         }
     }
 
@@ -804,7 +804,7 @@ impl Sub<'_> {
             Expr::VariantTest { scrutinee, .. } => self.expr(scrutinee),
             Expr::BoolTest { scrutinee, .. } => self.expr(scrutinee),
             Expr::EnumPayload { recv, .. } => self.expr(recv),
-            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::EnumVariant { .. } => {}
+            Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::EnumVariant { .. } => {}
         }
     }
 }

@@ -324,24 +324,154 @@ def gen_expr_program(rng):
     return "\n".join(rms), "\n".join(rs)
 
 
+def gen_char_lit(rng):
+    """A random `char` literal. Covers the plain, escaped (`\\n`, `\\t`, `\\0`,
+    `\\'`, `\\\\`, `\\r`), `\\xNN` and `\\u{..}` forms, so the lexer's escape
+    decoding and the UTF-8 encoder in the runtime are both exercised. `\\'` and
+    `\\\\` are included because they are the two escapes whose *value* is a
+    quote or a backslash, which a naive scan would mis-read."""
+    r = rng.random()
+    if r < 0.35:
+        # A printable ASCII character; skip `'` and `\\`, which need escaping.
+        c = rng.choice("abXYZ019 ~")
+        return f"'{c}'"
+    if r < 0.55:
+        return "'" + rng.choice(["\\n", "\\t", "\\0", "\\r", "\\'", "\\\\"]) + "'"
+    if r < 0.75:
+        # `\xNN` is a raw byte; stay in 0x00..=0x7F so it is a valid scalar.
+        return f"'\\x{rng.randint(0, 0x7f):02x}'"
+    # A `\u{..}` escape: an ASCII scalar, or a multi-byte one from a small set
+    # of code points (including astral ones), so 1-, 2-, 3- and 4-byte UTF-8
+    # encodings all appear.
+    cp = rng.choice([0x41, 0x7a, 0xE9, 0x3B1, 0x20AC, 0x4E2D, 0x1F600, 0x1F4A9])
+    return f"'\\u{{{cp:x}}}'"
+
+
+def gen_char_range_lit(rng):
+    """A `char` range pattern `'lo'..'hi'` or `'lo'..='hi'` with a non-empty
+    range. The bounds are drawn from a fixed table of literal sources paired
+    with their scalar values, so the two can be ordered without re-decoding the
+    escapes; rustc rejects an empty range, and so does rmc."""
+    table = [
+        ("'a'", 0x61), ("'z'", 0x7a), ("'A'", 0x41), ("'Z'", 0x5a),
+        ("'0'", 0x30), ("'9'", 0x39), ("'~'", 0x7e), ("' '", 0x20),
+        ("'\\n'", 0x0a), ("'\\x41'", 0x41), ("'\\u{e9}'", 0xe9),
+        ("'\\u{3b1}'", 0x3b1), ("'\\u{20ac}'", 0x20ac),
+    ]
+    inclusive = rng.random() < 0.5
+    lo_src, lo = rng.choice(table)
+    hi_src, hi = rng.choice(table)
+    if lo == hi:
+        # An equal bound is a valid inclusive range but an empty exclusive one.
+        inclusive = True
+    elif lo > hi:
+        lo_src, hi_src = hi_src, lo_src
+    op = "..=" if inclusive else ".."
+    return f"{lo_src}{op}{hi_src}"
+
+
+def gen_char_program(rng):
+    """`char` literals, `as i64`, `char` ordering and equality, `match` on a
+    `char` (literal, or-pattern and range arms), a `char` array, a `const char`,
+    and a `char` parameter/return. The literals are drawn from `gen_char_lit`, so
+    the escape and UTF-8 paths are fuzzed; the scalar value is printed as an
+    `i64` and the character itself is also printed as text, so both the
+    `as i64` path and the runtime's UTF-8 encoder are exercised."""
+    def lit():
+        return gen_char_lit(rng)
+
+    # Every literal is drawn once and shared by both programs; drawing twice
+    # would give the two twins different characters and a bogus divergence.
+    c_const = lit()
+    arr = [lit() for _ in range(3)]
+    base_lit = lit()
+    exprs = []
+    for _ in range(rng.randint(2, 6)):
+        r = rng.random()
+        if r < 0.35:
+            e = f"({lit()} as i64)"
+        elif r < 0.55:
+            e = f"(({lit()} == {lit()}) as i64)"
+        elif r < 0.75:
+            op = rng.choice(["<", "<=", ">", ">="])
+            e = f"(({lit()} {op} {lit()}) as i64)"
+        else:
+            # `match` on a `char`: literal arms, a wildcard, an `|`, and a
+            # `char` range pattern (`'a'..='z'`, `'a'..'z'`).
+            r2 = rng.random()
+            if r2 < 0.5:
+                e = (f"(match {lit()} {{ {lit()} => 1, {lit()} | {lit()} => 2, "
+                     f"_ => 3 }})")
+            else:
+                e = (f"(match {lit()} {{ {gen_char_range_lit(rng)} => 1, "
+                     f"{gen_char_range_lit(rng)} => 2, _ => 3 }})")
+        exprs.append(e)
+    arr_src = "[" + ", ".join(arr) + "]"
+    rms = [
+        f"const C: char = {c_const};",
+        "fn id(c: char) -> char { return c; }",
+        "fn code(c: char) -> i64 { return c as i64; }",
+        "fn main() -> i64 {",
+        f"    let cs: [char; 3] = {arr_src};",
+        f"    let base: char = {base_lit};",
+        "    let mut acc: i64 = 0;",
+    ]
+    rs = [
+        f"const C: char = {c_const};",
+        "fn id(c: char) -> char { return c; }",
+        "fn code(c: char) -> i64 { return c as i64; }",
+        "fn main() {",
+        f"    let cs: [char; 3] = {arr_src};",
+        f"    let base: char = {base_lit};",
+        "    let mut acc: i64 = 0;",
+    ]
+    for e in exprs:
+        rms.append(f"    acc = acc + {e};")
+        rs.append(f"    acc += {e};")
+    # The array, a parameter/return, a `const`, and the binding, each
+    # contributing to the total so a wrong read shows up.
+    tail = [
+        "    acc = acc + (cs[0] as i64) + (cs[1] as i64) + (cs[2] as i64);",
+        "    acc = acc + code(id(base));",
+        "    acc = acc + (C as i64);",
+        "    acc = acc + (base as i64);",
+    ]
+    for t in tail:
+        rms.append(t)
+        rs.append(t.replace("acc = acc + ", "acc += "))
+    # Print some characters as text (not as their scalar value), so the UTF-8
+    # encoder in the runtime is exercised, not just `as i64`. rmc's `print_char`
+    # writes the character then a newline; the twin's `println!("{}", c)` does
+    # the same, so the bytes must match for every width of encoding.
+    printed = [base_lit] + arr
+    for lit_src in printed:
+        rms.append(f"    print_char({lit_src});")
+        rs.append(f'    println!("{{}}", {lit_src});')
+    rms += ['    println!("{}", acc);', "    return 0;", "}"]
+    rs += ['    println!("{}", acc);', "}"]
+    return "\n".join(rms), "\n".join(rs)
+
+
 def gen_printfmt_program(rng):
     """`print!`/`println!` with a literal format string, `{}` substitution,
     literal braces, escapes, and an empty format. The pieces are joined so a
-    single format can mix all three argument types, and the leading/trailing
-    text differs from run to run so a dropped or duplicated newline shows up.
-    A `println!` and a `print!` are both emitted, since the newline is the one
-    thing `println!` adds over `print!`."""
+    single format can mix all four argument types (`i64`, `bool`, `str`, `char`),
+    and the leading/trailing text differs from run to run so a dropped or
+    duplicated newline shows up. A `println!` and a `print!` are both emitted,
+    since the newline is the one thing `println!` adds over `print!`."""
     def word():
         return "".join(rng.choice("xyz") for _ in range(rng.randint(0, 3)))
 
     def piece():
         r = rng.random()
-        if r < 0.3:
+        if r < 0.25:
             return word(), f"{rng.randint(-99, 99)}"          # i64
-        if r < 0.5:
+        if r < 0.45:
             return word(), f"({rng.randint(0, 9)} < {rng.randint(0, 9)})"  # bool
-        if r < 0.65:
+        if r < 0.6:
             return word(), gen_str_lit(rng)                    # str
+        if r < 0.8:
+            return word(), gen_char_lit(rng)                   # char
         return "{{}}", None                                    # literal braces
 
     def one(macro, out_rms, out_rs, leading):
@@ -2830,6 +2960,45 @@ def reject_corpus():
         return rms, rs
 
     return {
+        # `char` literals rustc rejects: an out-of-range `\x` escape (a
+        # character's `\x` is restricted to ASCII), a non-scalar `\u{..}`, an
+        # empty literal, a bare unescaped quote, and an integer-to-`char` cast
+        # (`u8 as char` is the only integer cast rustc allows, and rmc has no
+        # `u8`).
+        "char_hex_out_of_range": (
+            "fn main() -> i64 { let c = '\\xff'; print_i64(c as i64); return 0; }\n",
+            "fn main() { let c = '\\xff'; println!(\"{}\", c as i64); }\n",
+        ),
+        "char_u_not_scalar": (
+            "fn main() -> i64 { let c = '\\u{d800}'; print_i64(c as i64); return 0; }\n",
+            "fn main() { let c = '\\u{d800}'; println!(\"{}\", c as i64); }\n",
+        ),
+        "char_empty": (
+            "fn main() -> i64 { let c = ''; print_i64(c as i64); return 0; }\n",
+            "fn main() { let c = ''; println!(\"{}\", c as i64); }\n",
+        ),
+        "char_bare_quote": (
+            "fn main() -> i64 { let c = '''; print_i64(c as i64); return 0; }\n",
+            "fn main() { let c = '''; println!(\"{}\", c as i64); }\n",
+        ),
+        "char_from_i64_cast": (
+            "fn main() -> i64 { let n: i64 = 65; let c = n as char; print_i64(c as i64); return 0; }\n",
+            "fn main() { let n: i64 = 65; let c = n as char; println!(\"{}\", c as i64); }\n",
+        ),
+        # A `char` range pattern with the bounds the wrong way round, and an
+        # empty inclusive range; rustc rejects both with E0579.
+        "char_range_reversed": (
+            "fn main() -> i64 { let c = 'q'; let r = match c { 'z'..'a' => 1, _ => 0 }; print_i64(r); return 0; }\n",
+            "fn main() { let c = 'q'; let r = match c { 'z'..'a' => 1, _ => 0 }; println!(\"{}\", r); }\n",
+        ),
+        "char_range_empty_incl": (
+            "fn main() -> i64 { let c = 'q'; let r = match c { 'b'..='a' => 1, _ => 0 }; print_i64(r); return 0; }\n",
+            "fn main() { let c = 'q'; let r = match c { 'b'..='a' => 1, _ => 0 }; println!(\"{}\", r); }\n",
+        ),
+        "char_range_int_bound": (
+            "fn main() -> i64 { let c = 'q'; let r = match c { 'a'..=5 => 1, _ => 0 }; print_i64(r); return 0; }\n",
+            "fn main() { let c = 'q'; let r = match c { 'a'..=5 => 1, _ => 0 }; println!(\"{}\", r); }\n",
+        ),
         # The outer match names A and wildcards the rest; the missing B test is
         # only inside the nested match, so the outer chain is not exhaustive.
         "nested_wildcard_other": both("match a { E::A => 1, _ => match b { E::B => 2 } }"),
@@ -3776,7 +3945,7 @@ def gen_typealias_program(rng):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "intmeth", "nestedfn", "typealias", "printfmt", "robust", "reject", "mutate"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "intmeth", "nestedfn", "typealias", "printfmt", "char", "robust", "reject", "mutate"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -3832,7 +4001,8 @@ def main():
            "intmeth": gen_intmeth_program,
            "nestedfn": gen_nestedfn_program,
            "typealias": gen_typealias_program,
-           "printfmt": gen_printfmt_program}[args.mode]
+           "printfmt": gen_printfmt_program,
+           "char": gen_char_program}[args.mode]
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus
     # suite; a fuzz program is otherwise only checked with every pass on, so a

@@ -189,7 +189,7 @@ impl Licm {
             Expr::VariantTest { scrutinee, .. } => self.expr_loops(scrutinee),
             Expr::BoolTest { scrutinee, .. } => self.expr_loops(scrutinee),
             Expr::EnumPayload { recv, .. } => self.expr_loops(recv),
-            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
+            Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
         }
     }
 
@@ -366,7 +366,7 @@ impl Effects {
             Expr::VariantTest { scrutinee, .. } => self.expr(scrutinee),
             Expr::BoolTest { scrutinee, .. } => self.expr(scrutinee),
             Expr::EnumPayload { recv, .. } => self.expr(recv),
-            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
+            Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
         }
     }
 }
@@ -539,7 +539,7 @@ impl Hoister {
             Expr::VariantTest { scrutinee, .. } => self.expr(scrutinee),
             Expr::BoolTest { scrutinee, .. } => self.expr(scrutinee),
             Expr::EnumPayload { recv, .. } => self.expr(recv),
-            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
+            Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
         }
     }
 
@@ -653,7 +653,7 @@ fn fmt_expr(e: &Expr) -> String {
 fn count_expr(e: &Expr) -> usize {
     let n = |x: &Box<Expr>| count_expr(x);
     match e {
-        Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => 1,
+        Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => 1,
         Expr::Bin(_, a, b) => 1 + n(a) + n(b),
         Expr::Un(_, a) | Expr::Cast(a, _) => 1 + n(a),
         Expr::Field { base, .. } => 1 + n(base),

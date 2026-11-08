@@ -561,7 +561,8 @@ instead of at the iteration that overflows. `--no-licm` turns the pass off.
 `runtime.rs` holds a freestanding assembly runtime. `_start` captures `argc` and
 `argv` from the initial stack, calls `main`, and exits via the `exit` syscall
 with `main`'s return value. I/O (`print_i64`, `print_str`, `print_bool`,
-`putchar`), memory (`alloc`/`free`), `arg_i64`, the byte-wise string comparison
+`print_char`, `putchar`), memory (`alloc`/`free`), `arg_i64`, the byte-wise
+string comparison
 `__rmc_str_lt` and the overflow trap are all implemented with raw syscalls.
 Because there is no libc, the resulting ELF is static and tiny.
 

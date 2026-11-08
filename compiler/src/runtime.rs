@@ -305,6 +305,107 @@ __rmc_write_str:
     },
     Piece {
         text: r#"
+# void __rmc_write_char(long c)  -- c is a Unicode scalar value, written as its
+# UTF-8 bytes with no trailing newline (like `{}` for a `char`).
+.globl __rmc_write_char
+.type __rmc_write_char, @function
+__rmc_write_char:
+    push %rbp
+    mov %rsp, %rbp
+    sub $16, %rsp
+    mov %edi, %eax
+    cmp $0x80, %eax
+    jae .Lwc_two
+    mov %al, -8(%rbp)
+    mov $1, %edx
+    jmp .Lwc_write
+.Lwc_two:
+    cmp $0x800, %eax
+    jae .Lwc_three
+    mov %eax, %ecx
+    shr $6, %ecx
+    or $0xC0, %ecx
+    mov %cl, -8(%rbp)
+    mov %eax, %ecx
+    and $0x3F, %ecx
+    or $0x80, %ecx
+    mov %cl, -7(%rbp)
+    mov $2, %edx
+    jmp .Lwc_write
+.Lwc_three:
+    cmp $0x10000, %eax
+    jae .Lwc_four
+    mov %eax, %ecx
+    shr $12, %ecx
+    or $0xE0, %ecx
+    mov %cl, -8(%rbp)
+    mov %eax, %ecx
+    shr $6, %ecx
+    and $0x3F, %ecx
+    or $0x80, %ecx
+    mov %cl, -7(%rbp)
+    mov %eax, %ecx
+    and $0x3F, %ecx
+    or $0x80, %ecx
+    mov %cl, -6(%rbp)
+    mov $3, %edx
+    jmp .Lwc_write
+.Lwc_four:
+    mov %eax, %ecx
+    shr $18, %ecx
+    or $0xF0, %ecx
+    mov %cl, -8(%rbp)
+    mov %eax, %ecx
+    shr $12, %ecx
+    and $0x3F, %ecx
+    or $0x80, %ecx
+    mov %cl, -7(%rbp)
+    mov %eax, %ecx
+    shr $6, %ecx
+    and $0x3F, %ecx
+    or $0x80, %ecx
+    mov %cl, -6(%rbp)
+    mov %eax, %ecx
+    and $0x3F, %ecx
+    or $0x80, %ecx
+    mov %cl, -5(%rbp)
+    mov $4, %edx
+.Lwc_write:
+    lea -8(%rbp), %rsi
+    mov $1, %rax
+    mov $1, %rdi
+    syscall
+    leave
+    ret
+.size __rmc_write_char, .-__rmc_write_char
+"#,
+        defines: &["__rmc_write_char"],
+    },
+    Piece {
+        text: r#"
+# void print_char(char c)  -- the character written as UTF-8 bytes followed by
+# a newline, the char analogue of print_i64/print_bool.
+.globl print_char
+.type print_char, @function
+print_char:
+    push %rbp
+    mov %rsp, %rbp
+    sub $16, %rsp
+    call __rmc_write_char
+    movb $10, -8(%rbp)
+    lea -8(%rbp), %rsi
+    mov $1, %rdx
+    mov $1, %rax
+    mov $1, %rdi
+    syscall
+    leave
+    ret
+.size print_char, .-print_char
+"#,
+        defines: &["print_char"],
+    },
+    Piece {
+        text: r#"
 # bool __rmc_str_lt(long a, long b)  -- a and b point at {len: i64, bytes...}
 # records. Returns 1 when the byte string a is lexicographically less than b,
 # 0 otherwise. A `str` value is the address of its record, so a string
@@ -921,6 +1022,34 @@ fn piece_idents() -> &'static [HashSet<&'static str>] {
     CACHE.get_or_init(|| PIECES.iter().map(|p| idents(p.text)).collect())
 }
 
+/// The global symbols `user_asm` defines, so a piece that redefines one is
+/// skipped. A symbol is defined by a label at column 0 (`name:`) or by a
+/// `.globl`/`.global` directive.
+fn defined_symbols(src: &str) -> HashSet<&str> {
+    let mut out = HashSet::new();
+    for line in src.lines() {
+        if let Some(rest) =
+            line.strip_prefix(".globl ").or_else(|| line.strip_prefix(".global "))
+        {
+            let name = rest.trim();
+            if !name.is_empty() {
+                out.insert(name);
+            }
+            continue;
+        }
+        if line.starts_with(|c: char| c == '_' || c.is_ascii_alphanumeric()) {
+            if let Some(name) = line.strip_suffix(':') {
+                if !name.is_empty()
+                    && name.bytes().all(|b| b == b'_' || b.is_ascii_alphanumeric())
+                {
+                    out.insert(name);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The subset of the runtime that `user_asm` reaches.
 ///
 /// `_start` is always kept — it is the process entry — and every piece it pulls
@@ -928,7 +1057,13 @@ fn piece_idents() -> &'static [HashSet<&'static str>] {
 /// keeping a piece can name more symbols, so the selection runs to a fixpoint.
 /// A program that never allocates does not carry the allocator, and one that
 /// never indexes an array does not carry the bounds trap.
+/// A program may shim a runtime helper with an ordinary function (`fn
+/// alloc(..)`) so the same source also builds under rustc; emitting the
+/// runtime's own `alloc` too would be a duplicate symbol.
 pub fn for_program(user_asm: &str) -> String {
+    // The global symbols the program defines itself. A piece that would define
+    // one of them is skipped, so a user shim of a built-in wins.
+    let user_defs = defined_symbols(user_asm);
     // Tokenise the program once and look each symbol up in the set, rather than
     // rescanning the whole text per symbol: the scan is O(text * symbols) and
     // was the single largest cost in a compile. The piece texts are static, so
@@ -961,6 +1096,11 @@ pub fn for_program(user_asm: &str) -> String {
         dirty = false;
         for (i, p) in PIECES.iter().enumerate() {
             if included[i] {
+                continue;
+            }
+            // A piece the program redefines is left out, so the user's own
+            // `alloc`/`free` shim is the only definition linked.
+            if p.defines.iter().any(|d| user_defs.contains(d)) {
                 continue;
             }
             let defines_wanted = p
@@ -1039,6 +1179,23 @@ mod tests {
         // function, which merely shares a name prefix.
         let r = for_program("main:\n\tcall alloc\n\tret\n");
         assert!(!r.contains("free:"), "free dropped despite __rmc_freelist:\n{r}");
+    }
+
+    #[test]
+    fn a_user_definition_suppresses_the_runtime_piece() {
+        // A program that shims `alloc`/`free` (so the same source also builds
+        // under rustc) must not get the runtime's own copies too: the two would
+        // be duplicate symbols at link time.
+        let r = for_program(
+            ".globl alloc\nalloc:\n\tmov $0, %rax\n\tret\n\
+             .globl free\nfree:\n\tret\n\
+             main:\n\tcall alloc\n\tcall free\n\tret\n",
+        );
+        assert!(!r.contains("\nalloc:"), "runtime alloc dropped:\n{r}");
+        assert!(!r.contains("\nfree:"), "runtime free dropped:\n{r}");
+        // The arena globals are only needed by the runtime allocator, which is
+        // gone, so they go too.
+        assert!(!r.contains("__rmc_arena:"), "arena globals dropped:\n{r}");
     }
 
     #[test]

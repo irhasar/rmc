@@ -166,7 +166,7 @@ fn calls_other(e: &Expr, name: &str) -> bool {
         Expr::Call { name: n, args, .. } => {
             n != name || args.iter().any(|a| calls_other(a, name))
         }
-        Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } => false,
+        Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } => false,
         Expr::PatScrutinee(_) => {
             unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
         }
@@ -225,7 +225,7 @@ fn stmt_calls_other(s: &Stmt, name: &str) -> bool {
 fn has_call(e: &Expr) -> bool {
     match e {
         Expr::Call { .. } => true,
-        Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } => false,
+        Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } => false,
         Expr::PatScrutinee(_) => {
             unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
         }
@@ -283,7 +283,7 @@ fn stmt_has_call(s: &Stmt) -> bool {
 /// the transformed loop rather than from the recursive frame that wrote it.
 fn has_return(e: &Expr) -> bool {
     match e {
-        Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } => false,
+        Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } => false,
         Expr::PatScrutinee(_) => {
             unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
         }

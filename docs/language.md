@@ -10,6 +10,7 @@ time; there are no runtime type errors.
 | ------------ | --------------------------------------------- |
 | `i64`        | signed 64-bit integer                         |
 | `bool`       | `true` or `false`                             |
+| `char`       | a Unicode scalar value (a 4-byte code point, held in an 8-byte slot) |
 | `str`        | a string (one word: a pointer to a `{len, bytes}` record) |
 | `[T; N]`     | fixed-size array of `N` `T` elements, where `T` is a scalar, a struct or another array |
 | `(A, B)`     | a tuple of the given element types (an aggregate) |
@@ -19,15 +20,20 @@ time; there are no runtime type errors.
 | `Name`       | a `type` alias declared with `type Name = T;` |
 | `()`         | unit, the result of a statement or `main`     |
 
-Integer and boolean literals are inferred. The smallest `i64` value is written
-`-9223372036854775808` (or `-0x8000000000000000`); the magnitude alone is out of
-range, as in Rust. Explicit types can be given on
+Integer, boolean and character literals are inferred. The smallest `i64` value
+is written `-9223372036854775808` (or `-0x8000000000000000`); the magnitude
+alone is out of range, as in Rust. A `char` literal is a single Unicode scalar
+in single quotes, with the usual escapes (`\n`, `\t`, `\r`, `\0`, `\'`, `\\`,
+`\xNN` restricted to `\x00`-`\x7f`, and `\u{..}`), and a non-ASCII character may
+also be written directly. Explicit types can be given on
 `let` bindings and function signatures. `as` converts among `i64`, `bool` and an
-enum tag, and casts a `&mut T` to a `&T`. A reference may only be cast to a
-reference of the same type, never to a scalar or to `&mut T`. Two casts go
+enum tag, casts a `char` to its `i64` scalar value, and casts a `&mut T` to a
+`&T`. A reference may only be cast to
+a reference of the same type, never to a scalar or to `&mut T`. Two casts go
 beyond Rust: `i64 as bool` (Rust spells this `x != 0`) and the raw pointer cast
 `i64 as &T` / `i64 as &mut T` (used to turn an `alloc` address into a node
-pointer).
+pointer). `i64 as char` is rejected, matching Rust, which allows only `u8 as
+char`.
 
 ## Structs
 
@@ -566,10 +572,12 @@ compile-time constant is decided at compile time, not by the trap.
   (`a[i] = b[j]`, `m[i]` as a `[i64; 3]` value).
 - Struct literals: `Point { x: 1, y: 2 }`, usable as a `let` initialiser.
 - Blocks and `if`/`else` are expressions.
-- `match` on integers, enums or strings: `match x { 0 => a, 1 => b, _ => c }`,
-  `match c { Color::Red => a, _ => b }` or `match s { "on" => a, _ => b }`. An
+- `match` on integers, characters, enums or strings: `match x { 0 => a, 1 => b,
+  _ => c }`, `match c { 'a'..='z' => a, _ => b }`, `match c { Color::Red => a, _
+  => b }` or `match s { "on" => a, _ => b }`. An
   arm pattern is an integer literal (optionally negated), an integer *range*
-  `lo..hi` / `lo..=hi`, a *string* literal, an `Enum::Variant`, a struct
+  `lo..hi` / `lo..=hi`, a *character* literal, a character *range*
+  `'a'..'z'` / `'a'..='z'`, a *string* literal, an `Enum::Variant`, a struct
   pattern `S { f, .. }` (see below), a *tuple* pattern `(a, b)` (see below),
   an *or-pattern* `a | b | c`, an *at-binding* `n @ PAT` (see below), or `_`. The
   first matching arm
@@ -751,6 +759,7 @@ Provided by the runtime; no declaration or import is required.
 | `print_i64(x)`  | `(i64) -> ()`  |
 | `print_str(s)`  | `(str) -> ()`  |
 | `print_bool(b)` | `(bool) -> ()` |
+| `print_char(c)` | `(char) -> ()` |
 | `putchar(c)`    | `(i64) -> ()`  |
 | `alloc(n)`      | `(i64) -> i64` |
 | `free(p)`       | `(i64) -> ()`  |
@@ -769,7 +778,8 @@ is the target of `std::process::exit`, a failed `assert!`, and `panic!`.
 `print!` and `println!` format a literal string and print it. The format string
 must be a literal; each `{}` is filled by the next argument in order, and is
 rendered by the argument's type (`i64` in decimal, `bool` as `true`/`false`,
-`str` as its text). `{{` and `}}` are literal braces, and the usual escapes
+`char` as the character itself, `str` as its text). `{{` and `}}` are literal
+braces, and the usual escapes
 (`\n`, `\t`, `\"`, ...) are resolved by the lexer. `println!` appends a newline;
 `print!` adds none.
 
@@ -797,7 +807,10 @@ Any other `std::` path is a compile error.
 
 Traits, generics, borrowing, lifetimes, modules, closures, `f32`/`f64`,
 `u*`/`i*` types other than `i64`, and the standard library beyond the two `std`
-paths above. References exist (`&T` / `&mut T`, `&e`, `*e`, `*e = v`),
+paths above. A `char` is a scalar, but its full `char` API
+(`char::from_u32`, `is_alphabetic`, `to_digit`, ...) is not provided, and
+`char` may not be cast from an integer (`i64 as char` is rejected, as in
+rustc). References exist (`&T` / `&mut T`, `&e`, `*e`, `*e = v`),
 but without borrow checking: rmc does not prove that a reference outlives its
 referent, and `&mut` carries no exclusivity guarantee. An aggregate is still
 passed by value unless a reference is used. A `str` and a `&str` are the same

@@ -1027,7 +1027,7 @@ impl Codegen {
             Expr::ArrayLit(v, _) => {
                 Self::count_expr(v, counts, mem, copied, true, let_tmps)
             }
-            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) => {}
+            Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) => {}
         }
     }
 
@@ -1928,6 +1928,10 @@ impl Codegen {
                 self.line(&format!("mov ${v}, %rax"));
                 Type::I64
             }
+            Expr::Char(c) => {
+                self.line(&format!("mov ${c}, %rax"));
+                Type::Char
+            }
             Expr::Bool(b) => {
                 self.line(&format!("mov ${}, %rax", if *b { 1 } else { 0 }));
                 Type::Bool
@@ -2182,6 +2186,7 @@ impl Codegen {
     fn simple_operand(&self, e: &Expr) -> Option<String> {
         match e {
             Expr::Int(v) if (-2_147_483_648..=2_147_483_647).contains(v) => Some(format!("${v}")),
+            Expr::Char(c) if *c <= 2_147_483_647 => Some(format!("${c}")),
             Expr::Bool(b) => Some(format!("${}", if *b { 1 } else { 0 })),
             Expr::Var { slot, ty, .. } => {
                 if ty.is_aggregate() {
@@ -2419,7 +2424,7 @@ impl Codegen {
             return true;
         }
         match e {
-            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::EnumVariant { .. } => false,
+            Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::EnumVariant { .. } => false,
             Expr::Var { .. } => false,
             Expr::Field { base, .. } => self.uses_reg(base, r),
             Expr::Bin(_, a, b) => self.uses_reg(a, r) || self.uses_reg(b, r),
