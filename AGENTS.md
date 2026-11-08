@@ -495,6 +495,31 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
 
 ## Things that are easy to get wrong
 
+- **An enum's tags are rustc's declaration order, not construction order.**
+  `collect_enums` learns a variant's tag from the `switchInt` on a
+  `discriminant` that a `match` emits. A *niche-optimised* enum
+  (`Option<&T>`, `Result<T,&E>`) carries no tag word, so rustc folds the
+  comparison to a literal and emits no `switchInt`: `is_some` is
+  `discriminant(_x) == 1`, `is_ok` is `discriminant(_x) == 0`. With no
+  evidence the backend fell back to *construction* order (`Some` = 0),
+  and every `is_some()`/`is_ok()` read false — silently, with a plausible
+  exit status. Seed the declaration order for `Option`/`Result`
+  (`None`=0/`Some`=1, `Ok`=0/`Err`=1) before filling from evidence; a
+  real `switchInt` tag still wins because only a *missing* tag is filled.
+  `tests/std/nicheenums.rs` guards this. The same trap awaits any enum
+  whose discriminant is only ever compared, never switched on.
+- **Formatting a reference must print the referent, not its address.**
+  rustc's `Display for &T` calls the base formatter with a pointer to the
+  referent, so a `&T` slot holds a *pointer to a pointer*. rmc's runtime
+  hands a formatter the slot holding the value, so for `T` scalar the
+  base formatter's single `mov (%rdi), %rax` is one deref short on a `&T`
+  (`println!("{}", &n)` printed a stack address; `for x in &v { println!(
+  "{}", x) }` printed addresses). `fmt_label` now wraps the base formatter
+  in a deref trampoline that does `mov (%rdi), %rdi` `depth` times, where
+  `depth` is the reference count — except a `str`/`[u8]` referent, whose
+  formatter *already* dereferences to reach its record, so it needs
+  `depth - 1`. `tests/std/reffmt.rs` guards `&i64`, `&bool`, `&str`,
+  `&&i64`, `{:?}`/`{:x}`, and `for x in &v`.
 - **`loop` is an expression, and codegen must report its own type, not `I64`.**
   `loop { .. }` parses to `Expr::Loop(body, slot, ty)`; a `loop` in statement
   position is a `Stmt::Expr` around it with `slot == -2`, so its value is
