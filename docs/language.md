@@ -105,7 +105,7 @@ variant of that enum and not an associated function is reported as such.
 
 ### Built-in integer methods
 
-An `i64` receiver has nineteen methods built in, which desugar to the operators
+An `i64` receiver has twenty methods built in, which desugar to the operators
 rmc already lowers (so they cost no call, except `clamp`, for its panic, and the
 ten bit methods below, for their per-bit work):
 
@@ -120,6 +120,7 @@ ten bit methods below, for their per-bit work):
 | `x.is_negative()`       | `x < 0` (a `bool`)                              |
 | `x.div_euclid(y)`       | `x / y` rounded toward the mathematical quotient |
 | `x.rem_euclid(y)`       | the remainder in `[0, abs(y))`                  |
+| `x.midpoint(y)`         | the mean of `x` and `y`, rounded toward zero    |
 | `x.count_ones()`        | the number of set bits                          |
 | `x.count_zeros()`       | the number of clear bits                        |
 | `x.leading_zeros()`     | the zeros above the top set bit (64 when `x` is 0) |
@@ -134,13 +135,19 @@ ten bit methods below, for their per-bit work):
 The semantics match `rustc -O`: `i64::MIN.abs()` is `i64::MIN` (it does not
 trap; with `--overflow-checks` it traps, as in a debug build), and `signum` is
 computed with comparisons only, so `i64::MIN.signum()` is `-1` without overflow.
-`is_positive`/`is_negative` return `bool` — unlike the seventeen arithmetic and
+`is_positive`/`is_negative` return `bool` — unlike the eighteen arithmetic and
 bit methods, which return `i64` — and `0` is neither positive nor negative, so
 both are `false` there.
 `div_euclid`/`rem_euclid` compute `q = x / y` and `r = x % y` and round toward
 the mathematical quotient: when `r` is negative, `q` moves one step further from
 zero and `r` gains `abs(y)`. They reuse `/` and `%`, so a zero divisor and
 `i64::MIN.div_euclid(-1)` panic at run time exactly as the operators do.
+`midpoint` is the mean rounded toward zero — `(x + y) / 2` with the sum taken in
+unbounded precision, so it does not overflow: `i64::MAX.midpoint(i64::MAX)` is
+`i64::MAX` and `i64::MIN.midpoint(i64::MAX)` is `0`. It lowers to
+`(x & y) + ((x ^ y) >> 1)` with a one-step correction for an odd negative sum,
+which is exactly `rustc`'s definition and never overflows, so the result is the
+same with and without `--overflow-checks`.
 `clamp` returns `lo`, `x` or `hi`, and panics when `lo > hi` (a message and exit
 101, like rustc); it is the one built-in whose panic is a runtime call, so a
 program that never calls it does not carry the helper.
@@ -748,16 +755,48 @@ Provided by the runtime; no declaration or import is required.
 | `alloc(n)`      | `(i64) -> i64` |
 | `free(p)`       | `(i64) -> ()`  |
 | `arg_i64(i)`    | `(i64) -> i64` |
+| `exit(code)`    | `(i64) -> ()`  |
 
 `alloc` returns a pointer to `n` bytes of writable memory, or 0 on failure; it
 is a first-fit allocator over an mmap'd arena, and `free` returns a block for
 reuse and coalesces neighbours. Memory is not zeroed.
 
+`exit(code)` terminates the process with `code` via the raw `exit` syscall. It
+is the target of `std::process::exit`, a failed `assert!`, and `panic!`.
+
+### Macros
+
+`print!` and `println!` format a literal string and print it. The format string
+must be a literal; each `{}` is filled by the next argument in order, and is
+rendered by the argument's type (`i64` in decimal, `bool` as `true`/`false`,
+`str` as its text). `{{` and `}}` are literal braces, and the usual escapes
+(`\n`, `\t`, `\"`, ...) are resolved by the lexer. `println!` appends a newline;
+`print!` adds none.
+
+`assert!(cond)`, `assert!(cond, msg)`, `assert_eq!(a, b)` and `assert_ne!(a, b)`
+evaluate their condition and, when it fails, exit with status 101 (rustc's panic
+code). The optional message is not printed. `panic!`, `unreachable!`, `todo!`
+and `unimplemented!` always exit 101; their arguments are ignored.
+
+### std paths
+
+Two `std` items are provided so ordinary Rust can be compiled unchanged:
+
+| path                        | meaning                      |
+| --------------------------- | ---------------------------- |
+| `std::process::exit(code)`  | the `exit(code)` builtin     |
+| `std::hint::black_box(x)`   | the identity (`x`)           |
+
+`use` statements are parsed and discarded: rmc resolves every name globally, so
+an import has nothing to do. Any other `std::` path is a compile error.
+
 ## Not supported
 
-Traits, generics, borrowing, lifetimes, modules, macros, `use`, closures,
-`f32`/`f64`, `u*`/`i*` types other than `i64`, and
-the standard library. References exist (`&T` / `&mut T`, `&e`, `*e`, `*e = v`),
+Traits, generics, borrowing, lifetimes, modules, closures, `f32`/`f64`,
+`u*`/`i*` types other than `i64`, and the standard library beyond the two `std`
+paths above. References exist (`&T` / `&mut T`, `&e`, `*e`, `*e = v`),
 but without borrow checking: rmc does not prove that a reference outlives its
 referent, and `&mut` carries no exclusivity guarantee. An aggregate is still
-passed by value unless a reference is used.
+passed by value unless a reference is used. A `str` and a `&str` are the same
+one-word value (the address of the `{len, bytes}` record), so the two coerce
+freely; a `&'static str` field or `&str` parameter may be written `str`.

@@ -157,10 +157,14 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     // Runtime helpers provided by the freestanding assembly runtime. They are
     // linked in automatically, so they do not appear in the source program.
-    let builtins: [(&str, &[Type], Type); 17] = [
+    let builtins: [(&str, &[Type], Type); 21] = [
         ("print_i64", &[Type::I64], Type::Unit),
         ("print_str", &[Type::Str], Type::Unit),
         ("print_bool", &[Type::Bool], Type::Unit),
+        // `std::process::exit(code)`, lowered to the runtime's raw `exit`
+        // syscall wrapper by the parser. It never returns, but it is typed as
+        // returning `()` so it may be used as a statement or tail expression.
+        ("exit", &[Type::I64], Type::Unit),
         ("putchar", &[Type::I64], Type::Unit),
         ("alloc", &[Type::I64], Type::I64),
         ("free", &[Type::I64], Type::Unit),
@@ -187,6 +191,13 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         // helpers with two parameters.
         ("__rmc_rotate_left", &[Type::I64, Type::I64], Type::I64),
         ("__rmc_rotate_right", &[Type::I64, Type::I64], Type::I64),
+        // `print!`/`println!`'s `{}` pieces, chosen by the value's type. Unlike
+        // `print_i64` and friends they print *no* trailing newline, so a
+        // `println!` line of several pieces stays on one line and the macro
+        // appends the newline itself. They are not written in source.
+        ("__rmc_write_i64", &[Type::I64], Type::Unit),
+        ("__rmc_write_bool", &[Type::Bool], Type::Unit),
+        ("__rmc_write_str", &[Type::Str], Type::Unit),
     ];
     for (name, params, ret) in builtins {
         sigs.insert(
@@ -968,6 +979,40 @@ impl Sema {
                     },
                     Type::I64,
                 )
+            }
+            // `midpoint(y)` is the arithmetic mean rounded toward zero —
+            // `(x + y) / 2` with the sum taken in unbounded precision, so it
+            // does not overflow. rustc computes it as `(x & y) + ((x ^ y) >> 1)`
+            // for the floor, then nudges up when the sum is odd and negative
+            // (truncation toward zero differs from the floor only there). The
+            // half-sum is bound to a temp so the sign test reads the same value
+            // the `+` does, and the correction is written `(x ^ y) & 1 & (h < 0)`
+            // so no arm is negated and none overflows. Comparisons never
+            // overflow, so the operands may be plain variables or literals.
+            "midpoint" => {
+                if args.len() != 1 {
+                    return Err("method `midpoint` takes exactly one argument".into());
+                }
+                let y = bind(self, args[0].clone(), &mut stmts);
+                let xored = Expr::Bin(BitXor, Box::new(x.clone()), Box::new(y.clone()));
+                let half = Expr::Bin(
+                    Add,
+                    Box::new(Expr::Bin(BitAnd, Box::new(x), Box::new(y))),
+                    Box::new(Expr::Bin(Shr, Box::new(xored.clone()), Box::new(Expr::Int(1)))),
+                );
+                let h = bind(self, half, &mut stmts);
+                // `(x ^ y) & 1` is 1 exactly when the two addends have opposite
+                // parity, i.e. the sum is odd; the half-sum is negative exactly
+                // when the sum is negative.
+                let carry = Expr::Bin(
+                    BitAnd,
+                    Box::new(Expr::Bin(BitAnd, Box::new(xored), Box::new(Expr::Int(1)))),
+                    Box::new(Expr::Cast(
+                        Box::new(Expr::Bin(Lt, Box::new(h.clone()), Box::new(Expr::Int(0)))),
+                        Type::I64,
+                    )),
+                );
+                (Expr::Bin(Add, Box::new(h), Box::new(carry)), Type::I64)
             }
             _ => unreachable!("checked by the caller"),
         };
@@ -2030,9 +2075,9 @@ impl Sema {
                 // helper, not by pointer. Rewrite the whole node and re-check
                 // it, so the emitted code is an ordinary `bool` expression.
                 if matches!(op, Eq | Ne | Lt | Le | Gt | Ge)
-                    && (ta == Type::Str || tb == Type::Str)
+                    && (is_string_ty(&ta) || is_string_ty(&tb))
                 {
-                    if ta != tb {
+                    if !(is_string_ty(&ta) && is_string_ty(&tb)) {
                         return Err(format!(
                             "comparison between different types: {ta:?} and {tb:?}"
                         ));
@@ -2100,6 +2145,34 @@ impl Sema {
                 }
             }
             Expr::Call { name, args, arg_slots, ret_slot, ret_ty } => {
+                // `__rmc_print` is the placeholder a `print!`/`println!` `{}`
+                // emits. The type of the value is known only here, so pick the
+                // runtime helper that matches it and rewrite the call.
+                if name == "__rmc_print" {
+                    if args.len() != 1 {
+                        return Err("internal: `__rmc_print` takes one argument".into());
+                    }
+                    let t = self.check_expr(&mut args[0], scope)?;
+                    let helper = if t == Type::I64 {
+                        "__rmc_write_i64"
+                    } else if t == Type::Bool {
+                        "__rmc_write_bool"
+                    } else if t == Type::Str
+                        || matches!(&t, Type::Ref(i, _) if **i == Type::Str)
+                    {
+                        "__rmc_write_str"
+                    } else {
+                        return Err(format!(
+                            "`{{}}` cannot print a value of type {t:?} (only `i64`, `bool` and `str`)"
+                        ));
+                    };
+                    *name = helper.to_string();
+                    arg_slots.clear();
+                    arg_slots.push((-1, 0));
+                    *ret_ty = Type::Unit;
+                    *ret_slot = -1;
+                    return Ok(Type::Unit);
+                }
                 let sig = self
                     .sigs
                     .get(name)
@@ -2454,7 +2527,7 @@ impl Sema {
                     seen[idx] = true;
                     let want = info.fields[idx].1.clone();
                     let got = self.check_expr(&mut fi.value, scope)?;
-                    if got != want {
+                    if got != want && !ref_coerces(&got, &want) {
                         return Err(format!(
                             "struct `{name}` field `{}`: expected {want:?}, found {got:?}",
                             fi.name
@@ -2650,6 +2723,7 @@ impl Sema {
                             | "count_zeros"
                             | "rotate_left"
                             | "rotate_right"
+                            | "midpoint"
                     )
                 {
                     // `abs` synthesises `-x`, a compiler-generated negation, so
@@ -2839,7 +2913,7 @@ impl Sema {
                 for (i, arg) in args.iter_mut().enumerate() {
                     let got = self.check_expr(arg, scope)?;
                     let (want, off) = fields[i].clone();
-                    if got != want {
+                    if got != want && !ref_coerces(&got, &want) {
                         return Err(format!(
                             "variant `{enum_name}::{variant}` field {i}: expected {want:?}, found {got:?}"
                         ));
@@ -3046,12 +3120,22 @@ impl Sema {
     }
 }
 
+/// True for `str` and for a reference to `str` (`&str`). rmc represents both as
+/// the address of the `{len, bytes}` record, so they are interchangeable.
+fn is_string_ty(t: &Type) -> bool {
+    *t == Type::Str || matches!(t, Type::Ref(i, _) if **i == Type::Str)
+}
+
 /// True when a value of type `found` may be used where `expected` is wanted.
-/// The only coercion rmc performs is `&mut T` to `&T`: both are one pointer, and
-/// Rust allows it, so a `&mut` receiver can be read by a `&self` method.
+/// The coercions rmc performs are `&mut T` to `&T` (both one pointer, and Rust
+/// allows it, so a `&mut` receiver can be read by a `&self` method) and between
+/// `str` and `&str`, which rmc represents identically as the address of the
+/// `{len, bytes}` record.
 fn ref_coerces(found: &Type, expected: &Type) -> bool {
     match (found, expected) {
         (Type::Ref(f, true), Type::Ref(e, false)) => f == e,
+        (Type::Str, Type::Ref(e, false)) => **e == Type::Str,
+        (Type::Ref(e, false), Type::Str) => **e == Type::Str,
         _ => false,
     }
 }

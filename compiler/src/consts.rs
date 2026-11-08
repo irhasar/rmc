@@ -68,6 +68,10 @@ pub fn eval_i64(e: &Expr, ints: &HashMap<String, i64>) -> Option<i64> {
         Expr::Var { name, .. } => ints.get(name).copied(),
         Expr::Int(k) => Some(*k),
         Expr::Un(UnOp::Neg, inner) => eval_i64(inner, ints)?.checked_neg(),
+        // A cast to `i64` (or any width, all of which rmc treats as `i64`) is
+        // the identity here, so an array length written `N as usize` still
+        // folds. A cast to `bool` is not an integer and does not.
+        Expr::Cast(inner, ty) if *ty == Type::I64 => eval_i64(inner, ints),
         Expr::Bin(op, a, b) => {
             let x = eval_i64(a, ints)?;
             let y = eval_i64(b, ints)?;

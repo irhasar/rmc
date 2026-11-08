@@ -184,4 +184,21 @@ fn main() {
     println!("{}", mx.rotate_right(1));
     println!("{}", a.rotate_left(1).count_ones());
     println!("{}", pick(1, 2).rotate_right(1));
+
+    // `midpoint`: the mean of `x` and `y` rounded toward zero, computed with an
+    // unbounded sum so it never overflows — `MIN.midpoint(MIN)` is `MIN`, and
+    // `MIN.midpoint(MAX)` is 0. The odd negative sum rounds toward zero, so
+    // `(-3).midpoint(0)` is -1.
+    println!("{}", a.midpoint(b));
+    println!("{}", b.midpoint(a));
+    println!("{}", z.midpoint(a));
+    println!("{}", MIN.midpoint(MIN));
+    println!("{}", MIN.midpoint(mx));
+    println!("{}", mx.midpoint(MIN));
+    println!("{}", mx.midpoint(mx));
+    println!("{}", mx.midpoint(1));
+    println!("{}", MIN.midpoint(-1));
+    println!("{}", (-3i64).midpoint(0));
+    println!("{}", (3i64).midpoint(-3));
+    println!("{}", pick(1, 2).midpoint(4));
 }
