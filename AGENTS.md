@@ -518,8 +518,11 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   in a deref trampoline that does `mov (%rdi), %rdi` `depth` times, where
   `depth` is the reference count — except a `str`/`[u8]` referent, whose
   formatter *already* dereferences to reach its record, so it needs
-  `depth - 1`. `tests/std/reffmt.rs` guards `&i64`, `&bool`, `&str`,
-  `&&i64`, `{:?}`/`{:x}`, and `for x in &v`.
+  `depth - 1`. Trampolines are module-scoped and emitted once after every
+  function body, so two functions that both format a `&i64` share one
+  rather than emitting a duplicate `.L` label.
+  `tests/std/reffmt.rs` guards `&i64`, `&bool`, `&str`,
+  `&&i64`, `{:?}`/`{:x}`, `for x in &v`, and the cross-function case.
 - **`loop` is an expression, and codegen must report its own type, not `I64`.**
   `loop { .. }` parses to `Expr::Loop(body, slot, ty)`; a `loop` in statement
   position is a `Stmt::Expr` around it with `slot == -2`, so its value is

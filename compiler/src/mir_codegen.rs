@@ -141,6 +141,11 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<String, String> {
     let structs = collect_structs(prog);
     let enums = collect_enums(prog);
 
+    // Deref trampolines for reference placeholders are module-scoped and emitted
+    // once, after every function body (see `FnGen::deref_fmt_label`).
+    let mut deref_names: HashSet<String> = HashSet::new();
+    let mut deref_tramps: Vec<(String, String)> = Vec::new();
+
     for f in &order {
         if is_unsupported_builtin(&f.name) {
             continue;
@@ -148,9 +153,20 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<String, String> {
         let mut g = FnGen::new(prog, f, opts, &string_ids, &template_ids, &alloc_labels, &structs, &enums);
         let body = g.gen_fn()?;
         asm.push_str(&body);
+        for (name, text) in g.deref_tramps {
+            // Module-scoped, so two functions that both format a `&i64` share
+            // one trampoline rather than emitting a duplicate label.
+            if deref_names.insert(name.clone()) {
+                deref_tramps.push((name, text));
+            }
+        }
         if !g.errors.is_empty() {
             return Err(g.errors.join("\n"));
         }
+    }
+
+    for (_, text) in &deref_tramps {
+        asm.push_str(text);
     }
 
     let mut rodata = String::new();
@@ -1492,13 +1508,7 @@ impl<'a> FnGen<'a> {
             let _ = writeln!(self.out, "  pop {r}");
         }
         self.out.push_str("  leave\n  ret\n");
-        let mut body = optimize(&std::mem::take(&mut self.out));
-        // Deref trampolines for reference placeholders, after the epilogue so
-        // control never falls into them.
-        for (_, text) in &self.deref_tramps {
-            body.push_str(text);
-        }
-        Ok(body)
+        Ok(optimize(&std::mem::take(&mut self.out)))
     }
 
     /// Argument setup plus every basic block. Run twice (dry, then real).

@@ -21,4 +21,17 @@ fn main() {
     for x in &arr {
         println!("{}", x);
     }
+    // Two functions formatting a `&i64` must share one deref trampoline, not
+    // emit a duplicate label.
+    println!("{}", twice(&n) + also(&n));
+}
+
+fn twice(x: &i64) -> i64 {
+    println!("{}", x);
+    *x
+}
+
+fn also(x: &i64) -> i64 {
+    println!("{}", x);
+    *x + 1
 }
