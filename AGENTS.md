@@ -378,6 +378,18 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   supported" path fired because the length word was `0x0a6968`, not the text).
   This is the same representation the `.rms` path uses (`Type::Str` is the
   record address).
+- **A string literal can be a *terminator* operand, not just a statement one.**
+  `"x".contains("ell")` passes `"ell"` straight as a call argument, so
+  `collect_strings` must also scan call args, `switchInt` discriminants and
+  `assert` conditions. When it only scanned statements, `str_label` fell back to
+  emitting the literal's text as a symbol name (`lea "ell"(%rip)`), which the
+  linker reported as `undefined symbol`.
+- **`str::starts_with`/`ends_with`/`contains` are runtime helpers, not libstd.**
+  The first two inline to `<[u8]>::starts_with`/`ends_with` and the last to
+  `<&str as Pattern>::is_contained_in`; `std_intrinsic_name` rewrites each to
+  `__rmc_slice_*`/`__rmc_str_contains`, which read rmc's `{len, bytes..}` record
+  the way `__rmc_compare_bytes` does. The substring test's operands are
+  pattern-first, haystack-second.
 - **Array-to-slice unsizing (`&[T; N] -> &[T]`) builds a record in the frame.**
   `mir_codegen.rs::gen_unsize` writes the length word and a copy of the elements
   into a fresh frame region and leaves its address in `%rax`; a slice local then

@@ -451,6 +451,26 @@ fn collect_strings(prog: &Program) -> (Vec<String>, HashMap<String, String>) {
                     collect_strings_rv(rv, &mut order, &mut map);
                 }
             }
+            // A string literal can also be a *terminator* operand: a call
+            // argument (`"x".contains("ell")` passes `"ell"` straight to the
+            // callee), a `switchInt` discriminant, or an `assert` condition.
+            // Those never appear in a statement, so without this scan
+            // `str_label` falls back to emitting the raw text as a symbol name.
+            let mut term_ops: Vec<&Operand> = Vec::new();
+            match &b.term {
+                Terminator::Call { args, .. } => term_ops.extend(args.iter()),
+                Terminator::SwitchInt { discr, .. } => term_ops.push(discr),
+                Terminator::Assert { cond, .. } => term_ops.push(cond),
+                _ => {}
+            }
+            for op in term_ops {
+                if let Operand::Const(Const::Str(s)) = op {
+                    if !map.contains_key(s) {
+                        map.insert(s.clone(), format!("__rmc_lit{}", map.len()));
+                        order.push(s.clone());
+                    }
+                }
+            }
         }
     }
     // A promoted `&&str` constant's literal appears only in the promoted body,
@@ -1963,6 +1983,15 @@ impl<'a> FnGen<'a> {
         if base == "f64" || base == "f32" {
             return Err(format!(
                 "mir_codegen: formatting a float (`{base}`) is not implemented on the MIR path"
+            ));
+        }
+        // An aggregate (`{:?}` on an array, tuple or struct) has no scalar
+        // formatter. Without this guard `resolve_fmt` falls through to its
+        // integer default and prints the first word as a number - a silent
+        // miscompile, worse than a diagnostic.
+        if base.starts_with('[') || base.starts_with('(') {
+            return Err(format!(
+                "mir_codegen: formatting an aggregate (`{base}`) is not implemented on the MIR path"
             ));
         }
         Ok(resolve_fmt(ty_name, trait_name).to_string())

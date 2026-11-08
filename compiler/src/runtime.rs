@@ -391,6 +391,113 @@ __rmc_compare_bytes:
     },
     Piece {
         text: r#"
+# bool __rmc_slice_starts_with(const u8 *a, const u8 *b)  -- `[u8]::starts_with`,
+# the byte-slice predicate `str::starts_with` inlines to. Both operands are the
+# addresses of `{len: i64, bytes..}` records (rmc's `&[u8]`), so word 0 of each
+# is its length. True when `b`'s bytes are a prefix of `a`'s.
+.globl __rmc_slice_starts_with
+.type __rmc_slice_starts_with, @function
+__rmc_slice_starts_with:
+    mov 0(%rdi), %rcx        # len(a)
+    mov 0(%rsi), %rdx        # len(b)
+    cmp %rdx, %rcx
+    jb .Lsw_false            # len(b) > len(a)
+    xor %r8, %r8
+.Lsw_loop:
+    cmp %rdx, %r8
+    jae .Lsw_true
+    movzbl 8(%rdi,%r8), %eax
+    movzbl 8(%rsi,%r8), %r9d
+    cmp %r9d, %eax
+    jne .Lsw_false
+    inc %r8
+    jmp .Lsw_loop
+.Lsw_true:
+    mov $1, %eax
+    ret
+.Lsw_false:
+    xor %eax, %eax
+    ret
+.size __rmc_slice_starts_with, .-__rmc_slice_starts_with
+
+# bool __rmc_slice_ends_with(const u8 *a, const u8 *b)  -- `[u8]::ends_with`.
+# True when `b`'s bytes are a suffix of `a`'s.
+.globl __rmc_slice_ends_with
+.type __rmc_slice_ends_with, @function
+__rmc_slice_ends_with:
+    mov 0(%rdi), %rcx        # len(a)
+    mov 0(%rsi), %rdx        # len(b)
+    cmp %rdx, %rcx
+    jb .Lew_false            # len(b) > len(a)
+    sub %rdx, %rcx           # start offset in `a`
+    xor %r8, %r8
+.Lew_loop:
+    cmp %rdx, %r8
+    jae .Lew_true
+    movzbl 8(%rdi,%rcx), %eax
+    movzbl 8(%rsi,%r8), %r9d
+    cmp %r9d, %eax
+    jne .Lew_false
+    inc %rcx
+    inc %r8
+    jmp .Lew_loop
+.Lew_true:
+    mov $1, %eax
+    ret
+.Lew_false:
+    xor %eax, %eax
+    ret
+.size __rmc_slice_ends_with, .-__rmc_slice_ends_with
+
+# bool __rmc_str_contains(const u8 *pat, const u8 *hay)  -- `str::contains`,
+# lowered from `<&str as Pattern>::is_contained_in(pat, hay)`. Both operands are
+# `{len: i64, bytes..}` records. An empty pattern matches; otherwise scan every
+# start offset where the pattern fits.
+.globl __rmc_str_contains
+.type __rmc_str_contains, @function
+__rmc_str_contains:
+    mov 0(%rdi), %rcx        # len(pat)
+    mov 0(%rsi), %rdx        # len(hay)
+    test %rcx, %rcx
+    jz .Lsc_true             # empty pattern always matches
+    cmp %rcx, %rdx
+    jb .Lsc_false            # hay shorter than pat
+    xor %r8, %r8             # i = start offset
+.Lsc_outer:
+    mov %rdx, %rax
+    sub %rcx, %rax           # len(hay) - len(pat)
+    cmp %rax, %r8
+    ja .Lsc_false
+    xor %r9, %r9             # j = pattern offset
+.Lsc_inner:
+    cmp %rcx, %r9
+    jae .Lsc_true            # whole pattern matched
+    lea (%r8,%r9), %r10
+    movzbl 8(%rsi,%r10), %eax
+    movzbl 8(%rdi,%r9), %r11d
+    cmp %r11d, %eax
+    jne .Lsc_next
+    inc %r9
+    jmp .Lsc_inner
+.Lsc_next:
+    inc %r8
+    jmp .Lsc_outer
+.Lsc_true:
+    mov $1, %eax
+    ret
+.Lsc_false:
+    xor %eax, %eax
+    ret
+.size __rmc_str_contains, .-__rmc_str_contains
+"#,
+        defines: &[
+            "__rmc_slice_starts_with",
+            "__rmc_slice_ends_with",
+            "__rmc_str_contains",
+        ],
+    },
+    Piece {
+        text: r#"
 # The `core::fmt` formatters. `format_args!` reifies one per placeholder and
 # the `Argument` array carries its address; the template walker calls it with a
 # pointer to the value. Each writes to stdout with a raw syscall. They are kept

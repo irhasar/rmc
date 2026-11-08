@@ -1275,8 +1275,27 @@ fn is_panic_fn(name: &str) -> bool {
 /// helper's symbol so it survives `normalize_call_name` (which keeps only the
 /// final path segment, `min`, which is not a symbol the runtime defines).
 fn std_intrinsic_name(name: &str) -> Option<String> {
+    let n = name.trim();
+    // `<[u8]>::starts_with`/`ends_with` — the byte-slice predicates `str`'s
+    // `starts_with`/`ends_with` inline to. rmc's `&[u8]` (and the `&[u8]` cast
+    // of a string literal) is the address of a `{len: i64, bytes..}` record, so
+    // the runtime helper reads that record, matching `__rmc_compare_bytes`.
+    if n.contains("<impl [u8]>::") {
+        if n.contains(">::starts_with") {
+            return Some("__rmc_slice_starts_with".to_string());
+        }
+        if n.contains(">::ends_with") {
+            return Some("__rmc_slice_ends_with".to_string());
+        }
+    }
+    // `<&str as Pattern>::is_contained_in(pat, hay)` — the substring test
+    // `str::contains` lowers to. The receiver (the pattern) is the first
+    // argument, the haystack the second.
+    if n.contains("as Pattern>::is_contained_in") {
+        return Some("__rmc_str_contains".to_string());
+    }
     // `<T as Ord>::min(a, b)` and `max`, for an integer `T`.
-    let rest = name.trim().strip_prefix('<')?;
+    let rest = n.strip_prefix('<')?;
     let (ty, tail) = rest.split_once(" as ")?;
     let (trait_name, method) = tail.split_once(">::")?;
     if trait_name == "Ord" && (method == "min" || method == "max") {
@@ -2117,7 +2136,26 @@ fn strip_generics(s: &str) -> String {
 /// `i64::MIN`, `u64::MAX`, `usize::MAX`, `i32::MIN`, ... — the associated
 /// integer constants MIR prints by name.
 fn parse_named_const(s: &str) -> Option<i64> {
+    // `i64::MIN`, and the qualified form rustc prints inside a promoted body:
+    // `core::num::<impl i64>::MIN`. The `impl` marker names the type between
+    // `<` and `>`; strip everything up to and including it so both shapes
+    // reduce to `TY::NAME`.
+    let s = match s.find("::<impl ") {
+        Some(at) => {
+            let rest = &s[at + "::<impl ".len()..];
+            let ty = rest.split('>').next()?.trim();
+            // Rebuild as `TY::NAME`, where NAME is the last path segment.
+            let name = s.rsplit("::").next()?.trim();
+            return parse_int_assoc(ty, name);
+        }
+        None => s,
+    };
     let (ty, name) = s.split_once("::")?;
+    parse_int_assoc(ty.trim(), name.trim())
+}
+
+/// `i64::MIN`, `u8::MAX`, ... — the associated integer constant of a named type.
+fn parse_int_assoc(ty: &str, name: &str) -> Option<i64> {
     let bits: u32 = match ty {
         "i8" | "u8" => 8,
         "i16" | "u16" => 16,
