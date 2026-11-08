@@ -106,6 +106,10 @@ struct FnGen<'a> {
     /// the base appears in the emitted text; without this the frame packer
     /// would drop the interior slots and the elements would land on dead frame.
     pinned: Vec<(i64, i64)>,
+    /// Deref trampolines for `println!("{}", ref)`-style placeholders, keyed by
+    /// `(depth, label)`; appended after the function body. See
+    /// [`FnGen::deref_fmt_label`].
+    deref_tramps: Vec<(String, String)>,
     out: String,
     label: u64,
     errors: Vec<String>,
@@ -315,6 +319,19 @@ fn unsupported_note(msg: &str, fragment: &str) -> String {
 /// The System V integer argument registers, in order.
 const ARG_REGS: [&str; 6] = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"];
 
+/// How many leading `&` (or `&mut `) a type text carries: `&i64` is 1,
+/// `&&str` is 2. Used to pick the deref trampoline a reference placeholder
+/// needs. `str` itself is a slice header, not a pointer, so `&str` is 0 here.
+fn ref_depth(ty_name: &str) -> usize {
+    let mut s = ty_name.trim();
+    let mut n = 0;
+    while let Some(r) = s.strip_prefix('&') {
+        s = r.trim_start_matches("mut ").trim_start();
+        n += 1;
+    }
+    n
+}
+
 /// A reified formatter, reduced to the runtime helper that implements it. The
 /// type text is matched loosely (a `&str` and a `&&str` share the string
 /// formatter; an integer keeps its width and signedness) and the trait selects
@@ -400,6 +417,25 @@ fn resolve_fmt(ty_name: &str, trait_name: &str) -> &'static str {
         false if bits == 32 => "__rmc_fmt_u32",
         false => "__rmc_fmt_u64",
     }
+}
+
+/// Whether a type name is a scalar the runtime has a formatter for: an integer
+/// of any width, a float, `bool`, `char` or `str`. A reference is not stripped
+/// here; the caller does that.
+fn is_scalar_ty(name: &str) -> bool {
+    let n = name.trim();
+    if matches!(n, "bool" | "char" | "str") {
+        return true;
+    }
+    // An integer or float: `i`/`u` + digits, or `f32`/`f64`.
+    let (sigil, rest) = n.split_at(1.min(n.len()));
+    if sigil == "f" {
+        return matches!(rest, "32" | "64");
+    }
+    if sigil == "i" || sigil == "u" {
+        return rest == "size" || rest.parse::<u32>().is_ok();
+    }
+    false
 }
 
 /// The signedness and bit width of an integer type name (`i32` -> signed 32,
@@ -713,6 +749,31 @@ fn collect_enums(prog: &Program) -> HashMap<String, EnumLayout> {
         }
     }
 
+    // `Option` and `Result` use rustc's *declaration-order* discriminants
+    // (`None`=0, `Some`=1; `Ok`=0, `Err`=1), and rustc folds a `discriminant`
+    // comparison on a niche-optimised enum (`Option<&T>`, `Result<T,&E>`) to a
+    // literal with those values - `is_some` is `discriminant(_x) == 1`. The tag
+    // evidence above only comes from a `switchInt` on the discriminant, which a
+    // folded comparison never emits, so a niche enum would otherwise take its
+    // tags from *construction* order (`Some` = 0) and `is_some` would read
+    // false. Seed the declaration order; real `switchInt` evidence still wins,
+    // because only a missing tag is filled.
+    for (e, vs) in [
+        ("Option", ["None", "Some"]),
+        ("Result", ["Ok", "Err"]),
+    ] {
+        let ord = order.entry(e.to_string()).or_default();
+        for v in vs {
+            if !ord.iter().any(|x| x == v) {
+                ord.push(v.to_string());
+            }
+        }
+        let tm = tags.entry(e.to_string()).or_default();
+        for (i, v) in vs.iter().enumerate() {
+            tm.entry(v.to_string()).or_insert(i as u64);
+        }
+    }
+
     let mut enums = HashMap::new();
     for (name, variants) in &fields {
         let fieldless = variants.values().all(|tys| tys.is_empty());
@@ -938,6 +999,7 @@ impl<'a> FnGen<'a> {
             slot_map: None,
             next_slot: 0,
             pinned: Vec::new(),
+            deref_tramps: Vec::new(),
             out: String::new(),
             label: 0,
             errors: Vec::new(),
@@ -1430,7 +1492,13 @@ impl<'a> FnGen<'a> {
             let _ = writeln!(self.out, "  pop {r}");
         }
         self.out.push_str("  leave\n  ret\n");
-        Ok(optimize(&std::mem::take(&mut self.out)))
+        let mut body = optimize(&std::mem::take(&mut self.out));
+        // Deref trampolines for reference placeholders, after the epilogue so
+        // control never falls into them.
+        for (_, text) in &self.deref_tramps {
+            body.push_str(text);
+        }
+        Ok(body)
     }
 
     /// Argument setup plus every basic block. Run twice (dry, then real).
@@ -1973,7 +2041,44 @@ impl<'a> FnGen<'a> {
     /// The runtime defines one per scalar type and numeric base; the trait name
     /// only selects the base (`Display` = decimal, `Debug` = decimal with
     /// quoting for strings, `LowerHex` = hex, ...).
-    fn fmt_label(&self, ty_name: &str, trait_name: &str) -> Result<String, String> {
+    ///
+    /// A reference type (`&T`) gets a *deref trampoline*: rustc formats a `&T`
+    /// by calling `<T as Display>::fmt` with a pointer to the reference's
+    /// referent, while rmc's runtime hands a formatter the slot holding the
+    /// value. For a scalar referent the runtime formatter dereferences once to
+    /// reach the scalar, so a `depth`-deep reference needs `depth` derefs. A
+    /// `str`/`[u8]` referent is itself a pointer, and the runtime formatter
+    /// dereferences once to reach its record, so the outermost `&` already
+    /// names the slot it wants and only `depth - 1` derefs are needed.
+    fn fmt_label(&mut self, ty_name: &str, trait_name: &str) -> Result<String, String> {
+        let base = ty_name.trim().trim_start_matches('&').trim_start_matches("mut ").trim();
+        let label = self.fmt_label_inner(ty_name, trait_name)?;
+        let is_str = base == "str" || base.starts_with("[u8]") || base.starts_with("[u8;");
+        let depth = ref_depth(ty_name).saturating_sub(is_str as usize);
+        if depth > 0 {
+            return Ok(self.deref_fmt_label(&label, depth));
+        }
+        Ok(label)
+    }
+
+    /// The label of a trampoline that dereferences its argument `depth` times
+    /// before tail-calling the base formatter `base`. Deduplicated, and emitted
+    /// after the function body so the trampoline cannot fall through into it.
+    fn deref_fmt_label(&mut self, base: &str, depth: usize) -> String {
+        let name = format!(".Lrmc_deref{depth}_{}", base.trim_start_matches("__rmc_fmt_"));
+        if !self.deref_tramps.iter().any(|(n, _)| n == &name) {
+            let mut text = String::new();
+            let _ = writeln!(text, "{name}:");
+            for _ in 0..depth {
+                let _ = writeln!(text, "  mov (%rdi), %rdi");
+            }
+            let _ = writeln!(text, "  jmp {base}");
+            self.deref_tramps.push((name.clone(), text));
+        }
+        name
+    }
+
+    fn fmt_label_inner(&self, ty_name: &str, trait_name: &str) -> Result<String, String> {
         // A float's `Display` is the shortest decimal that round-trips, which
         // the runtime does not yet render. Reject it here, naming the feature,
         // rather than emitting a call to a formatter that does not exist (an
@@ -1985,13 +2090,16 @@ impl<'a> FnGen<'a> {
                 "mir_codegen: formatting a float (`{base}`) is not implemented on the MIR path"
             ));
         }
-        // An aggregate (`{:?}` on an array, tuple or struct) has no scalar
-        // formatter. Without this guard `resolve_fmt` falls through to its
-        // integer default and prints the first word as a number - a silent
-        // miscompile, worse than a diagnostic.
-        if base.starts_with('[') || base.starts_with('(') {
+        // Only a scalar (or a byte slice, which formats as text) has a runtime
+        // formatter. `resolve_fmt` falls through to its integer default for
+        // anything else, so an aggregate - `{:?}` on an array, tuple, struct,
+        // `Option`, `Result`, `Vec` - silently printed the first word as a
+        // number. That is a miscompile, worse than a diagnostic: reject it.
+        let byte_slice = base.starts_with("[u8]") || base.starts_with("[u8;");
+        if !is_scalar_ty(base) && !byte_slice {
             return Err(format!(
-                "mir_codegen: formatting an aggregate (`{base}`) is not implemented on the MIR path"
+                "mir_codegen: formatting `{base}` is not implemented on the MIR path \
+                 (only scalars, `str` and `[u8]` have a runtime formatter)"
             ));
         }
         Ok(resolve_fmt(ty_name, trait_name).to_string())
