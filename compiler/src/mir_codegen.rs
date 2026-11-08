@@ -745,11 +745,6 @@ fn collect_enums(prog: &Program) -> HashMap<String, EnumLayout> {
     enums
 }
 
-/// A field type the backend can store in one word.
-fn scalar_word(t: &Ty) -> bool {
-    matches!(t, Ty::I64 | Ty::Bool | Ty::Int | Ty::Ptr(_) | Ty::Ref(_) | Ty::Unit | Ty::Other)
-}
-
 /// The `(_d = discriminant(_x))` in `b`, as `(enum name, _d)`.
 fn block_discriminant(f: &Function, b: &BasicBlock) -> Option<(String, u32)> {
     for s in &b.stmts {
