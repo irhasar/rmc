@@ -1106,6 +1106,16 @@ impl Parser {
                     continue;
                 }
             }
+            // `use` is allowed inside a block as well as at the top level;
+            // skip it either way. Guard on what follows so a variable named
+            // `use` (which rmc, unlike rustc, would otherwise allow) is not
+            // swallowed by mistake.
+            if self.peek() == Some(&Tok::Ident("use".into()))
+                && matches!(self.peek2(), Some(Tok::Ident(_)) | Some(Tok::ColonColon))
+            {
+                self.skip_use()?;
+                continue;
+            }
             // tail expression: an expression not followed by `;`
             if self.starts_expr() {
                 let e = self.parse_expr()?;

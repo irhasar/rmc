@@ -787,8 +787,9 @@ Two `std` items are provided so ordinary Rust can be compiled unchanged:
 | `std::process::exit(code)`  | the `exit(code)` builtin     |
 | `std::hint::black_box(x)`   | the identity (`x`)           |
 
-`use` statements are parsed and discarded: rmc resolves every name globally, so
-an import has nothing to do. Any other `std::` path is a compile error.
+`use` statements are parsed and discarded at the top level and inside a block:
+rmc resolves every name globally, so an import has nothing to do. Any other
+`std::` path is a compile error.
 
 ## Not supported
 

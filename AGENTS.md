@@ -1644,7 +1644,8 @@ The macro surface is lowered at parse time and is deliberately tiny.
 the newline itself. `assert!`/`assert_eq!`/`assert_ne!`/`panic!`/`unreachable!`/
 `todo!`/`unimplemented!` desugar to `if !(cond) { exit(101) }` (or a bare
 `exit(101)`), so a failure matches rustc's panic exit code; the message
-arguments are parsed and discarded. `use` items are skipped, and only
+arguments are parsed and discarded. `use` items are skipped at the top level
+and inside a block, and only
 `std::process::exit` and `std::hint::black_box` are understood among `std::`
 paths. `str` and `&str` are the same one-word value, so `ref_coerces` lets them
 be exchanged at a variable, parameter, struct-field, enum-variant-field or
