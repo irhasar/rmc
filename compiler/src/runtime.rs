@@ -830,6 +830,31 @@ __rmc_fmt_u32:
     ret
 .size __rmc_fmt_u32, .-__rmc_fmt_u32
 
+# A `u8`/`i8` is one byte in memory, so the value is loaded at byte width.
+.globl __rmc_fmt_u8
+.type __rmc_fmt_u8, @function
+__rmc_fmt_u8:
+    movzbl (%rdi), %eax
+    mov $10, %r9
+    mov $1, %r10
+    sub $96, %rsp
+    mov %rsp, %rdi
+    call __rmc_emit_unsigned
+    add $96, %rsp
+    ret
+.size __rmc_fmt_u8, .-__rmc_fmt_u8
+
+.globl __rmc_fmt_i8
+.type __rmc_fmt_i8, @function
+__rmc_fmt_i8:
+    movsbq (%rdi), %rax
+    sub $96, %rsp
+    mov %rsp, %rdi
+    call __rmc_emit_signed
+    add $96, %rsp
+    ret
+.size __rmc_fmt_i8, .-__rmc_fmt_i8
+
 .globl __rmc_fmt_bool
 .type __rmc_fmt_bool, @function
 __rmc_fmt_bool:
@@ -1113,6 +1138,7 @@ __rmc_hexdigit:  .ascii "0123456789abcdef"
 "#,
         defines: &[
             "__rmc_fmt_i64", "__rmc_fmt_u64", "__rmc_fmt_i32", "__rmc_fmt_u32",
+            "__rmc_fmt_u8", "__rmc_fmt_i8",
             "__rmc_fmt_bool", "__rmc_fmt_char", "__rmc_fmt_str", "__rmc_fmt_str_debug",
             "__rmc_fmt_set", "__rmc_fmt_pad", "__rmc_put_fill", "__rmc_fmt_left",
             "__rmc_dbg_len", "__rmc_escape_one", "__rmc_dbg_body",

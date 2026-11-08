@@ -18,4 +18,11 @@ fn main() {
 
     // A negative operand must compare signed: unsigned ordering would pick 7.
     println!("{}", (-7i64).max(7));
+
+    // `{}` of a narrow integer loads exactly one byte; an `i8` must sign-extend
+    // all the way to 64 bits, or the value prints as a huge unsigned number.
+    let e: u8 = 200;
+    let f: i8 = -5;
+    println!("{} {} {}", e, f, 7u8);
+    println!("{:x} {:b} {:o}", 200u8, -5i8, 200u8);
 }

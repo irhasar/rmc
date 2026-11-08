@@ -354,6 +354,25 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   supported" path fired because the length word was `0x0a6968`, not the text).
   This is the same representation the `.rms` path uses (`Type::Str` is the
   record address).
+- **Array-to-slice unsizing (`&[T; N] -> &[T]`) builds a record in the frame.**
+  `mir_codegen.rs::gen_unsize` writes the length word and a copy of the elements
+  into a fresh frame region and leaves its address in `%rax`; a slice local then
+  points at it for as long as the binding lives. The region is written through
+  `base + k`, so only its base appears in the emitted text: `gen_unsize` records
+  the span in `FnGen::pinned` and the frame packer pins every slot of it (the
+  same treatment a multi-slot local gets), or the packer would drop the interior
+  slots and the elements would land on dead frame.
+- **A callee's return place `_0` is a real local, so inlining must redirect it
+  everywhere.** `mir.rs::Remap::rv` routes every operand and place through the
+  `_ret` variants. A helper that accumulates into `_0` (`_0 = Add(copy _0, move
+  _5)`) was previously inlined with that read left as the caller's own `_0`,
+  which aliased the accumulator and collapsed the sum to its last term.
+  `tests/std/accfn.rs` pins it.
+- **A `u8`/`i8` is one byte in memory.** The codegen loads it with `movzbl`
+  (`load_place_to`) and the `{}` helpers load exactly one byte; an `i8` must
+  sign-extend all the way to 64 bits (`movsbq`, not `movsbl`), or a negative
+  value prints as a huge unsigned number. `tests/std/numeric.rs` pins the
+  `{}`, `{:x}`, `{:b}` and `{:o}` shapes.
 - **`println!("{}", x)` for a variable builds the full `core::fmt` argument
   machinery and now works.** An all-constant format string folds to
   `Arguments::from_str` (a string-record pointer plus a `len << 1 | 1` word);

@@ -29,6 +29,10 @@ pub enum Ty {
     /// in one 64-bit word here; the width only matters to the exact op, and
     /// every benchmark program is `i64`-shaped.
     Int,
+    /// A one-byte integer (`u8`/`i8`), kept apart from `Int` because pointer
+    /// arithmetic scales by the pointee's size: `Offset` over a `*const u8`
+    /// must advance one byte, not eight.
+    U8,
     Ptr(TyBox),
     /// A reference or raw pointer; the pointee type is only used to size a
     /// `&raw` / `*p` load.
@@ -2391,7 +2395,8 @@ pub fn parse_ty(s: &str) -> Result<Ty, String> {
     match s {
         "i64" => Ok(Ty::I64),
         "bool" => Ok(Ty::Bool),
-        "usize" | "isize" | "u64" | "u32" | "i32" | "u16" | "i16" | "u8" | "i8"
+        "u8" | "i8" => Ok(Ty::U8),
+        "usize" | "isize" | "u64" | "u32" | "i32" | "u16" | "i16"
         | "u128" | "i128" | "char" => Ok(Ty::Int),
         "()" => Ok(Ty::Unit),
         "!" => Ok(Ty::Unit),
@@ -2843,33 +2848,50 @@ impl Remap {
     }
 
     fn rv(&self, rv: &Rvalue, dest_local: u32) -> Rvalue {
+        // Every operand and place goes through the `_ret` variants: the callee's
+        // return place `_0` is a real local that the body both reads and writes
+        // (an accumulator such as `_0 = Add(copy _0, move _5)`), and it must
+        // become the caller's destination everywhere it appears, not just in
+        // the final `Use`. Reading it as a plain local would alias the caller's
+        // own `_0`.
         match rv {
             Rvalue::Use(o) => Rvalue::Use(self.op_ret(o, dest_local)),
-            Rvalue::Binary(op, a, b) => Rvalue::Binary(*op, self.op(a), self.op(b)),
-            Rvalue::Unary(op, a) => Rvalue::Unary(*op, self.op(a)),
+            Rvalue::Binary(op, a, b) => {
+                Rvalue::Binary(*op, self.op_ret(a, dest_local), self.op_ret(b, dest_local))
+            }
+            Rvalue::Unary(op, a) => Rvalue::Unary(*op, self.op_ret(a, dest_local)),
             Rvalue::Cast { from, to, op, kind } => Rvalue::Cast {
                 from: from.clone(),
                 to: to.clone(),
-                op: self.op(op),
+                op: self.op_ret(op, dest_local),
                 kind: *kind,
             },
             Rvalue::Ref { mutbl, place } => {
-                Rvalue::Ref { mutbl: *mutbl, place: self.place(place) }
+                Rvalue::Ref { mutbl: *mutbl, place: self.place_ret(place, dest_local) }
             }
             Rvalue::RawRef { mutbl, place } => {
-                Rvalue::RawRef { mutbl: *mutbl, place: self.place(place) }
+                Rvalue::RawRef { mutbl: *mutbl, place: self.place_ret(place, dest_local) }
             }
-            Rvalue::Repeat { op, count } => Rvalue::Repeat { op: self.op(op), count: *count },
-            Rvalue::Array(ops) => Rvalue::Array(ops.iter().map(|o| self.op(o)).collect()),
-            Rvalue::Aggregate(ops) => Rvalue::Aggregate(ops.iter().map(|o| self.op(o)).collect()),
-            Rvalue::Enum { name, ops } => {
-                Rvalue::Enum { name: name.clone(), ops: ops.iter().map(|o| self.op(o)).collect() }
+            Rvalue::Repeat { op, count } => {
+                Rvalue::Repeat { op: self.op_ret(op, dest_local), count: *count }
             }
-            Rvalue::Len(p) => Rvalue::Len(self.place(p)),
-            Rvalue::WithOverflow { op, a, b } => {
-                Rvalue::WithOverflow { op: *op, a: self.op(a), b: self.op(b) }
+            Rvalue::Array(ops) => {
+                Rvalue::Array(ops.iter().map(|o| self.op_ret(o, dest_local)).collect())
             }
-            Rvalue::Discriminant(p) => Rvalue::Discriminant(self.place(p)),
+            Rvalue::Aggregate(ops) => {
+                Rvalue::Aggregate(ops.iter().map(|o| self.op_ret(o, dest_local)).collect())
+            }
+            Rvalue::Enum { name, ops } => Rvalue::Enum {
+                name: name.clone(),
+                ops: ops.iter().map(|o| self.op_ret(o, dest_local)).collect(),
+            },
+            Rvalue::Len(p) => Rvalue::Len(self.place_ret(p, dest_local)),
+            Rvalue::WithOverflow { op, a, b } => Rvalue::WithOverflow {
+                op: *op,
+                a: self.op_ret(a, dest_local),
+                b: self.op_ret(b, dest_local),
+            },
+            Rvalue::Discriminant(p) => Rvalue::Discriminant(self.place_ret(p, dest_local)),
             Rvalue::Unsupported(s) => Rvalue::Unsupported(s.clone()),
         }
     }

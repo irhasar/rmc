@@ -101,6 +101,11 @@ struct FnGen<'a> {
     /// has revealed which slots the body actually touches.
     slot_map: Option<Vec<i64>>,
     next_slot: i64,
+    /// Slot spans that must stay contiguous in the packed frame. `gen_unsize`
+    /// writes a slice record through a base pointer plus byte offsets, so only
+    /// the base appears in the emitted text; without this the frame packer
+    /// would drop the interior slots and the elements would land on dead frame.
+    pinned: Vec<(i64, i64)>,
     out: String,
     label: u64,
     errors: Vec<String>,
@@ -379,8 +384,10 @@ fn resolve_fmt(ty_name: &str, trait_name: &str) -> &'static str {
         };
     }
     match signed {
+        true if bits == 8 => "__rmc_fmt_i8",
         true if bits == 32 => "__rmc_fmt_i32",
         true => "__rmc_fmt_i64",
+        false if bits == 8 => "__rmc_fmt_u8",
         false if bits == 32 => "__rmc_fmt_u32",
         false => "__rmc_fmt_u64",
     }
@@ -905,6 +912,7 @@ impl<'a> FnGen<'a> {
             saved_regs: 0,
             slot_map: None,
             next_slot: 0,
+            pinned: Vec::new(),
             out: String::new(),
             label: 0,
             errors: Vec::new(),
@@ -1330,6 +1338,15 @@ impl<'a> FnGen<'a> {
                 }
             }
         }
+        // A slice record built by `gen_unsize` is written through `base + k`,
+        // so pin every slot of its run the same way.
+        for &(first, base) in &self.pinned {
+            let lo = (first.max(0) as usize).min(used.len().saturating_sub(1));
+            let hi = (base.max(0) as usize).min(used.len().saturating_sub(1));
+            if lo <= hi {
+                used[lo..=hi].fill(true);
+            }
+        }
         let mut map = vec![-1i64; frame_slots as usize];
         let mut next = 0i64;
         for (slot, &is_used) in used.iter().enumerate() {
@@ -1393,6 +1410,7 @@ impl<'a> FnGen<'a> {
 
     /// Argument setup plus every basic block. Run twice (dry, then real).
     fn gen_body(&mut self) -> Result<(), String> {
+        self.pinned.clear();
         // MIR numbers arguments from `_1`, so the register is chosen by the
         // argument's ordinal, not by its local index.
         let mut args: Vec<u32> = (0..self.func.locals.len() as u32)
@@ -2025,12 +2043,13 @@ impl<'a> FnGen<'a> {
                     }
                 }
                 Proj::IndexConst(i) => {
-                    let stride = self.size_of_ty(&elem_ty(&ty)).max(8);
-                    self.emit(&format!("  add ${}, %rax", *i as i64 * stride));
+                    // An element is at least a byte; a `[u8; N]` strides 1.
+                    let stride = self.size_of_ty(&elem_ty(&ty)).max(1);
+                    self.emit(&format!("  add ${}, %rax", *i as i64 * stride + slice_header(&ty)));
                     ty = elem_ty(&ty);
                 }
                 Proj::IndexLocal(l) => {
-                    let stride = self.size_of_ty(&elem_ty(&ty)).max(8);
+                    let stride = self.size_of_ty(&elem_ty(&ty)).max(1);
                     let src = self.local_operand(*l);
                     self.emit(&format!("  mov {src}, %rcx"));
                     match stride {
@@ -2042,6 +2061,13 @@ impl<'a> FnGen<'a> {
                             self.emit(&format!("  imul ${s}, %rcx, %rcx"));
                             self.emit("  add %rcx, %rax");
                         }
+                    }
+                    // A slice is the address of a `{len: i64, data..}` record
+                    // (the shape a `&str`/`&[u8]` literal already has), so its
+                    // first element sits one word past the record base.
+                    let header = slice_header(&ty);
+                    if header != 0 {
+                        self.emit(&format!("  add ${header}, %rax"));
                     }
                     ty = elem_ty(&ty);
                 }
@@ -2096,6 +2122,7 @@ impl<'a> FnGen<'a> {
             // *whole* local of type `()` still gets a slot from `analyze`'s
             // `.max(1)`.
             Ty::Unit => 0,
+            Ty::U8 => 1,
             Ty::Struct(name) => {
                 if let Some(l) = self.enums.get(name) {
                     return l.size.max(8);
@@ -2165,6 +2192,16 @@ impl<'a> FnGen<'a> {
     /// Load the scalar value at `place` into `reg` (which may be `%rax`).
     fn load_place_to(&mut self, p: &Place, reg: &str) -> Result<(), String> {
         self.place_addr(p)?;
+        // A `u8`/`i8` is one byte, so a whole-word load would pull in the seven
+        // bytes after it. The byte is zero-extended, which is `u8`'s value
+        // semantics; the backend does not track signedness.
+        if matches!(self.place_ty(p), Ty::U8) {
+            self.emit("  movzbl (%rax), %eax");
+            if reg != "%rax" {
+                self.emit(&format!("  mov %rax, {reg}"));
+            }
+            return Ok(());
+        }
         if reg != "%rax" {
             self.emit(&format!("  mov (%rax), {reg}"));
         } else {
@@ -2264,6 +2301,45 @@ impl<'a> FnGen<'a> {
         Ok(())
     }
 
+    /// Materialise the `{len: i64, data..}` record a `&[T]` points at, for the
+    /// array-to-slice unsizing `&[T; N] -> &[T]`. `op` is a reference to a
+    /// fixed-size array; the record (length word, then a copy of the elements)
+    /// is built in the frame and its address left in `%rax`. rmc's slices are
+    /// thin pointers to such a record, so binding one in a local keeps the
+    /// record alive for as long as the slice is usable.
+    fn gen_unsize(&mut self, op: &Operand) -> Result<(), String> {
+        let (arr_ref, _) = self.eval_operand(op)?;
+        let (elem, n) = match self.operand_ty(op) {
+            Ty::Ref(t) | Ty::Ptr(t) => match *t {
+                Ty::Array(e, n) => (*e, n),
+                _ => return Err("mir_codegen: unsize source is not an array".into()),
+            },
+            _ => return Err("mir_codegen: unsize source is not a reference".into()),
+        };
+        let total = (n as i64) * self.size_of_ty(&elem).max(1);
+        // The record is the length word plus the element bytes; the slots run
+        // from `base` (lowest address, the length word) upward.
+        let data_slots = ((total + 7) / 8).max(1);
+        let slots = data_slots + 1;
+        let first = self.next_slot;
+        for _ in 0..slots {
+            self.alloc_slot();
+        }
+        let base = first + slots - 1;
+        // The record spans `slots` frame words but is only ever named by its
+        // base, so pin the whole run for the frame packer.
+        self.pinned.push((first, base));
+        self.emit(&format!("  mov ${n}, %rcx"));
+        self.emit(&format!("  mov %rcx, {}", self.off(base)));
+        if total > 0 {
+            self.emit(&format!("  mov {arr_ref}, %rsi"));
+            self.emit(&format!("  lea {}, %rdi", self.off(base - 1)));
+            self.copy_words(total);
+        }
+        self.emit(&format!("  lea {}, %rax", self.off(base)));
+        Ok(())
+    }
+
     /// Copy `size` bytes from the address in `%rsi` to the address in `%rdi`.
     fn copy_words(&mut self, size: i64) {
         if size <= 0 {
@@ -2275,6 +2351,12 @@ impl<'a> FnGen<'a> {
                 let d = i * 8;
                 self.emit(&format!("  mov {d}(%rsi), %rcx"));
                 self.emit(&format!("  mov %rcx, {d}(%rdi)"));
+            }
+            // A trailing partial word (a `[u8; N]` slice whose length is not a
+            // multiple of eight) is copied byte by byte.
+            for i in (n * 8)..size {
+                self.emit(&format!("  movb {i}(%rsi), %cl"));
+                self.emit(&format!("  movb %cl, {i}(%rdi)"));
             }
         } else {
             self.emit("  mov %rdi, %rdx");
@@ -2290,6 +2372,11 @@ impl<'a> FnGen<'a> {
             self.emit("  add $8, %rdi");
             self.emit("  dec %rcx");
             self.emit(&format!("  jnz {loop_l}"));
+            // `%rsi`/`%rdi` now point past the whole words; copy any tail bytes.
+            for i in 0..(size - (size / 8) * 8) {
+                self.emit(&format!("  movb {i}(%rsi), %cl"));
+                self.emit(&format!("  movb %cl, {i}(%rdi)"));
+            }
         }
     }
 
@@ -2331,7 +2418,33 @@ impl<'a> FnGen<'a> {
                 }
                 self.store_scalar(dest, "%rax")?;
             }
-            Rvalue::Cast { op, .. } => {
+            Rvalue::Cast { op, to, .. } => {
+                // rmc has no real slice representation: a `&[T]`/`&str` value
+                // is a *thin* pointer to a `{len: i64, data..}` record. Only a
+                // string literal (and the `b".."` template bytes, which are the
+                // same shape) actually has that record. An array unsized to a
+                // slice points straight at the elements, so indexing it or
+                // reading `PtrMetadata` would walk the length word as data and
+                // miscompile. Reject it rather than emit a wrong value.
+                if matches!(to.as_ref(), Ty::Ref(t) | Ty::Ptr(t) if matches!(**t, Ty::Array(_, 0))) {
+                    // An operand already of slice/`str` type (a literal, or a
+                    // local that holds one) carries the record. An operand that
+                    // is a reference to a fixed-size array is the genuine
+                    // unsizing: build the record it should point at.
+                    let unsizing = match op {
+                        Operand::Const(Const::Str(_)) | Operand::Const(Const::Bytes(_)) => false,
+                        _ => matches!(
+                            self.operand_ty(op),
+                            Ty::Ref(t) | Ty::Ptr(t)
+                                if matches!(*t, Ty::Array(_, n) if n > 0)
+                        ),
+                    };
+                    if unsizing {
+                        self.gen_unsize(op)?;
+                        self.store_scalar(dest, "%rax")?;
+                        return Ok(());
+                    }
+                }
                 let (src, _) = self.eval_operand(op)?;
                 self.store_scalar(dest, &src)?;
             }
@@ -2473,12 +2586,23 @@ impl<'a> FnGen<'a> {
             self.emit(&format!("  mov {src}, {dst}"));
             return Ok(());
         }
-        // A whole-local destination is one frame slot, so store into it
-        // directly instead of materialising its address with an `lea` first.
-        // `mov mem, mem` is not encodable, so a memory source still goes
-        // through `%rcx`.
+        // A `u8`/`i8` destination is one byte: a whole-word store would clobber
+        // the seven bytes after it. `%al` holds the low byte of the source.
+        let byte = matches!(self.place_ty(dest), Ty::U8);
         if dest.proj.is_empty() {
             let dst = self.off(self.local_base(dest.local));
+            if byte {
+                let src = if src.starts_with('$') {
+                    src.to_string()
+                } else if src.contains('(') {
+                    self.emit(&format!("  mov {src}, %rcx"));
+                    "%cl".to_string()
+                } else {
+                    byte_reg(src).to_string()
+                };
+                self.emit(&format!("  movb {src}, {dst}"));
+                return Ok(());
+            }
             // A wide immediate has no `mov $imm, mem` encoding, so it goes
             // through `%rcx` like a memory source.
             if src.contains('(') || is_wide_imm(src) {
@@ -2492,6 +2616,23 @@ impl<'a> FnGen<'a> {
             } else {
                 self.emit(&format!("  mov {src}, {dst}"));
             }
+            return Ok(());
+        }
+        if byte {
+            // A memory source cannot feed `mov mem, reg8` directly when it is a
+            // wide slot; load it into `%rcx` first. An immediate needs the `b`
+            // suffix, or the assembler would pick a 32-bit store.
+            let is_mem = src.contains('(');
+            let (mnem, src) = if src == "%rax" || is_mem || is_wide_imm(src) {
+                self.emit(&format!("  mov {src}, %rcx"));
+                ("mov", "%cl")
+            } else if src.starts_with('$') {
+                ("movb", src)
+            } else {
+                ("mov", byte_reg(src))
+            };
+            self.place_addr(dest)?;
+            self.emit(&format!("  {mnem} {src}, (%rax)"));
             return Ok(());
         }
         // A memory source cannot be the source of a memory destination, and
@@ -2609,7 +2750,17 @@ impl<'a> FnGen<'a> {
             }
             BinOp::Cmp => return Err("mir_codegen: three-way Cmp unsupported".into()),
             BinOp::Offset | BinOp::PtrOffset => {
-                // `a + b*8` — a pointer offset by b elements.
+                // `a + b*scale` — a pointer offset by `b` elements. The scale is
+                // the pointee's size, not a fixed 8: `*const u8` advances one
+                // byte and `*mut i32` four, so a hardcoded 8 would walk off the
+                // end of the allocation.
+                let scale = match self.operand_ty(a) {
+                    Ty::Ptr(t) | Ty::Ref(t) => self.size_of_ty(&t).max(1),
+                    // A `&[T]` slice constant's pointer is to `T`; `Array` is
+                    // how the parser spells the pointee.
+                    Ty::Array(t, _) => self.size_of_ty(&t).max(1),
+                    _ => 8,
+                };
                 let (av, _) = self.eval_operand(a)?;
                 if av != "%rax" {
                     self.emit(&format!("  mov {av}, %rax"));
@@ -2618,7 +2769,16 @@ impl<'a> FnGen<'a> {
                 if bv != "%rcx" {
                     self.emit(&format!("  mov {bv}, %rcx"));
                 }
-                self.emit("  lea (%rax,%rcx,8), %rax");
+                match scale {
+                    1 => self.emit("  add %rcx, %rax"),
+                    2 => self.emit("  lea (%rax,%rcx,2), %rax"),
+                    4 => self.emit("  lea (%rax,%rcx,4), %rax"),
+                    8 => self.emit("  lea (%rax,%rcx,8), %rax"),
+                    s => {
+                        self.emit(&format!("  imul ${s}, %rcx, %rcx"));
+                        self.emit("  add %rcx, %rax");
+                    }
+                }
                 self.store_scalar(dest, "%rax")?;
             }
             _ => {
@@ -2907,7 +3067,8 @@ impl<'a> FnGen<'a> {
         match op {
             Operand::Copy(p) | Operand::Move(p) => self.place_ty(p),
             Operand::Const(Const::Bool(_)) => Ty::Bool,
-            Operand::Const(Const::Str(_)) => Ty::Ptr(Box::new(Ty::Unit)),
+            // A string constant is a byte pointer, so `Offset` scales by 1.
+            Operand::Const(Const::Str(_)) => Ty::Ptr(Box::new(Ty::U8)),
             Operand::Const(_) => Ty::I64,
             Operand::Fmt { .. } => Ty::Ptr(Box::new(Ty::Unit)),
         }
@@ -3972,11 +4133,26 @@ fn is_wide_imm(op: &str) -> bool {
 
 fn ty_size(ty: &Ty) -> i64 {
     match ty {
+        Ty::U8 => 1,
         Ty::I64 | Ty::Bool | Ty::Int | Ty::Ptr(_) | Ty::Ref(_) | Ty::Other | Ty::Unit => 8,
         Ty::Struct(_) => 8, // refined by the aggregate's own length
         Ty::Array(elem, n) => ty_size(elem) * (*n as i64).max(1),
         Ty::Tuple(tys) => tys.iter().map(|t| ty_size(t)).sum::<i64>().max(8),
-        _ => 8,
+    }
+}
+
+/// The length word a slice's data sits behind. A `&[T]`/`*const [T]` (and the
+/// `[T]` its deref yields) is the address of a `{len: i64, data..}` record, so
+/// the first element is one word in. A fixed-size array (`[T; N]`, N > 0) has
+/// no such word.
+fn slice_header(ty: &Ty) -> i64 {
+    match ty {
+        Ty::Array(_, 0) => 8,
+        Ty::Ref(t) | Ty::Ptr(t) => match &**t {
+            Ty::Array(_, 0) => 8,
+            _ => 0,
+        },
+        _ => 0,
     }
 }
 
@@ -3987,6 +4163,27 @@ fn elem_ty(ty: &Ty) -> Ty {
         Ty::Array(elem, _) => (**elem).clone(),
         Ty::Ref(t) | Ty::Ptr(t) => (**t).clone(),
         _ => Ty::I64,
+    }
+}
+
+/// The 8-bit register holding the low byte of a 64-bit register name.
+fn byte_reg(reg: &str) -> &str {
+    match reg {
+        "%rax" => "%al",
+        "%rbx" => "%bl",
+        "%rcx" => "%cl",
+        "%rdx" => "%dl",
+        "%rsi" => "%sil",
+        "%rdi" => "%dil",
+        "%r8" => "%r8b",
+        "%r9" => "%r9b",
+        "%r10" => "%r10b",
+        "%r11" => "%r11b",
+        "%r12" => "%r12b",
+        "%r13" => "%r13b",
+        "%r14" => "%r14b",
+        "%r15" => "%r15b",
+        other => other,
     }
 }
 
