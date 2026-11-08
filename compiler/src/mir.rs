@@ -206,6 +206,9 @@ pub enum CastKind {
     PtrToInt,
     PtrToIntCast,
     IntToPtrCast,
+    /// A bit-preserving reinterpretation (`f64::to_bits`, `u64::from`), which
+    /// must copy the bits, not convert the value.
+    Transmute,
     Other,
 }
 
@@ -1732,12 +1735,15 @@ fn parse_rvalue(s: &str) -> Result<Rvalue, String> {
     // unit variant `Enum::Variant` is a bare name.
     // `Len(PLACE)`
     if let Some(r) = s.strip_prefix("Len(") {
-        let inner = r.trim_end_matches(')');
+        // Strip exactly the closing paren, not every trailing one: a place such
+        // as `(*_1)` ends in a paren of its own, and `trim_end_matches` would
+        // eat both, leaving the deref unbalanced.
+        let inner = r.strip_suffix(')').unwrap_or(r);
         return Ok(Rvalue::Len(parse_place(inner.trim())?));
     }
     // `discriminant(PLACE)`
     if let Some(r) = s.strip_prefix("discriminant(") {
-        let inner = r.trim_end_matches(')');
+        let inner = r.strip_suffix(')').unwrap_or(r);
         return Ok(Rvalue::Discriminant(parse_place(inner.trim())?));
     }
     // `AddWithOverflow(a, b)` / `SubWithOverflow` / `MulWithOverflow`.
@@ -1845,6 +1851,7 @@ fn cast_kind(k: &str) -> CastKind {
         "PtrToPtr" | "PointerWithExposedProvenance" | "PtrToPtrCast" => CastKind::PtrToPtr,
         "IntToPtr" => CastKind::IntToPtr,
         "PtrToInt" => CastKind::PtrToInt,
+        "Transmute" => CastKind::Transmute,
         _ => CastKind::Other,
     }
 }

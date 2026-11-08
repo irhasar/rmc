@@ -706,16 +706,17 @@ fn collect_enums(prog: &Program) -> HashMap<String, EnumLayout> {
                 t
             });
         }
-        // The backend models a payload enum only when every payload field is one
-        // word wide: the tag is then one word and the payload follows it.
-        let modelled = fieldless
-            || variants.values().all(|tys| tys.iter().all(|t| scalar_word(t)));
+        // The widest variant decides the enum's size: the tag plus one word per
+        // payload field. A `Rect { w, h }`-shaped variant needs two payload
+        // words, so a fixed `tag + 1` would undersize the enum and an array of
+        // it would overlap its neighbour. This holds for a float payload too,
+        // which is one word here: `size_of_ty` must still reserve the right
+        // frame bytes whether or not the payload is otherwise "modelled".
+        let max_fields = variants.values().map(|tys| tys.len()).max().unwrap_or(0) as i64;
         let (payload_off, size) = if fieldless {
             (0, 8)
-        } else if modelled {
-            (8, 16)
         } else {
-            (0, 0)
+            (8, 8 + max_fields * 8)
         };
         enums.insert(
             name.clone(),
@@ -2363,15 +2364,18 @@ impl<'a> FnGen<'a> {
         self.emit(&format!("  mov ${n}, %rcx"));
         self.emit(&format!("  mov %rcx, {}", self.off(base)));
         if total > 0 {
-            self.emit(&format!("  mov {arr_ref}, %rsi"));
-            self.emit(&format!("  lea {}, %rdi", self.off(base - 1)));
+            self.emit(&format!("  mov {arr_ref}, %r10"));
+            self.emit(&format!("  lea {}, %r11", self.off(base - 1)));
             self.copy_words(total);
         }
         self.emit(&format!("  lea {}, %rax", self.off(base)));
         Ok(())
     }
 
-    /// Copy `size` bytes from the address in `%rsi` to the address in `%rdi`.
+    /// Copy `size` bytes from the address in `%r10` to the address in `%r11`.
+    /// `%r10`/`%r11` are never promoted (they are scratch for `div`/`rem`), so
+    /// an aggregate copy cannot clobber a promoted local the way `%rsi`/`%rdi`
+    /// would when they hold a caller-saved promotion.
     fn copy_words(&mut self, size: i64) {
         if size <= 0 {
             return;
@@ -2380,33 +2384,29 @@ impl<'a> FnGen<'a> {
             let n = size / 8;
             for i in 0..n {
                 let d = i * 8;
-                self.emit(&format!("  mov {d}(%rsi), %rcx"));
-                self.emit(&format!("  mov %rcx, {d}(%rdi)"));
+                self.emit(&format!("  mov {d}(%r10), %rcx"));
+                self.emit(&format!("  mov %rcx, {d}(%r11)"));
             }
             // A trailing partial word (a `[u8; N]` slice whose length is not a
             // multiple of eight) is copied byte by byte.
             for i in (n * 8)..size {
-                self.emit(&format!("  movb {i}(%rsi), %cl"));
-                self.emit(&format!("  movb %cl, {i}(%rdi)"));
+                self.emit(&format!("  movb {i}(%r10), %cl"));
+                self.emit(&format!("  movb %cl, {i}(%r11)"));
             }
         } else {
-            self.emit("  mov %rdi, %rdx");
-            self.emit("  mov %rsi, %r8");
-            self.emit("  mov %rdx, %rdi");
-            self.emit("  mov %r8, %rsi");
             self.emit(&format!("  mov ${}, %rcx", size / 8));
             let loop_l = self.new_label();
             self.emit(&format!("{loop_l}:"));
-            self.emit("  mov (%rsi), %rax");
-            self.emit("  mov %rax, (%rdi)");
-            self.emit("  add $8, %rsi");
-            self.emit("  add $8, %rdi");
+            self.emit("  mov (%r10), %rax");
+            self.emit("  mov %rax, (%r11)");
+            self.emit("  add $8, %r10");
+            self.emit("  add $8, %r11");
             self.emit("  dec %rcx");
             self.emit(&format!("  jnz {loop_l}"));
-            // `%rsi`/`%rdi` now point past the whole words; copy any tail bytes.
+            // `%r10`/`%r11` now point past the whole words; copy any tail bytes.
             for i in 0..(size - (size / 8) * 8) {
-                self.emit(&format!("  movb {i}(%rsi), %cl"));
-                self.emit(&format!("  movb %cl, {i}(%rdi)"));
+                self.emit(&format!("  movb {i}(%r10), %cl"));
+                self.emit(&format!("  movb %cl, {i}(%r11)"));
             }
         }
     }
@@ -2421,9 +2421,9 @@ impl<'a> FnGen<'a> {
                     // Copy the aggregate words into the destination.
                     let size = self.place_size(dest);
                     self.eval_aggregate_addr(op)?;
-                    self.emit("  mov %rax, %rsi");
+                    self.emit("  mov %rax, %r10");
                     self.place_addr(dest)?;
-                    self.emit("  mov %rax, %rdi");
+                    self.emit("  mov %rax, %r11");
                     self.copy_words(size);
                 } else {
                     let (src, _) = self.eval_operand(op)?;
@@ -2449,10 +2449,19 @@ impl<'a> FnGen<'a> {
                 }
                 self.store_scalar(dest, "%rax")?;
             }
-            Rvalue::Cast { op, to, .. } => {
+            Rvalue::Cast { op, to, kind, .. } => {
+                // A bit-preserving reinterpretation (`f64::to_bits`,
+                // `f32::to_bits`) copies the bits; it is not a value conversion,
+                // so it must not reach the numeric float-cast path (which would
+                // round `1.5` to `1` instead of reinterpreting `0x3ff8..`).
+                if matches!(kind, CastKind::Transmute) {
+                    let (src, _) = self.eval_operand(op)?;
+                    self.store_scalar(dest, &src)?;
+                    return Ok(());
+                }
                 // A float is involved when either side is one. The source type
                 // is resolved at codegen time, not from the `from` field, which
-                // the parser cannot know for a local.
+                // the parser cannot know from a local.
                 let src_ty = self.operand_ty(op);
                 if src_ty.is_float() || to.is_float() {
                     self.gen_float_cast(dest, op, &src_ty, to)?;
@@ -2480,6 +2489,29 @@ impl<'a> FnGen<'a> {
                     };
                     if unsizing {
                         self.gen_unsize(op)?;
+                        self.store_scalar(dest, "%rax")?;
+                        return Ok(());
+                    }
+                }
+                // The mirror image: a slice pointer (`*const [T]`/`&[T]`, which
+                // rmc holds as the address of a `{len: i64, data..}` record)
+                // cast to an element pointer (`*const T`/`&T`) is the
+                // data-pointer extraction. The result must point at the
+                // elements, one word past the length, so the cast cannot be the
+                // no-op the generic path makes it: `Iter::new` does exactly this
+                // (`*mut [f64]` -> `*mut f64`), and without the skip the first
+                // element read is the length word, shifting every element by
+                // one. `[T]` is spelled `Array(T, 0)`.
+                let from_ty = self.operand_ty(op);
+                if let (Ty::Ptr(f) | Ty::Ref(f), Ty::Ptr(t) | Ty::Ref(t)) =
+                    (&from_ty, to.as_ref())
+                {
+                    if matches!(**f, Ty::Array(_, 0)) && !matches!(**t, Ty::Array(_, 0)) {
+                        let (src, _) = self.eval_operand(op)?;
+                        if src != "%rax" {
+                            self.emit(&format!("  mov {src}, %rax"));
+                        }
+                        self.emit("  add $8, %rax");
                         self.store_scalar(dest, "%rax")?;
                         return Ok(());
                     }
@@ -2530,9 +2562,9 @@ impl<'a> FnGen<'a> {
                     if ty.is_aggregate() {
                         let size = self.place_size(&target);
                         self.eval_aggregate_addr(op)?;
-                        self.emit("  mov %rax, %rsi");
+                        self.emit("  mov %rax, %r10");
                         self.place_addr(&target)?;
-                        self.emit("  mov %rax, %rdi");
+                        self.emit("  mov %rax, %r11");
                         self.copy_words(size);
                     } else {
                         let (src, _) = self.eval_operand(op)?;

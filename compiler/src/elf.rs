@@ -449,6 +449,17 @@ impl Elf {
         };
         let ops = split_ops(rest);
         match mnem {
+            "movq" | "movd" if ops.get(0).map_or(false, |o| parse_xmm(o).is_some()) => {
+                self.enc_mov_xmm_gpr(mnem, &ops, sec)
+            }
+            "movq" | "movd" if ops.get(1).map_or(false, |o| parse_xmm(o).is_some()) => {
+                self.enc_mov_gpr_xmm(mnem, &ops, sec)
+            }
+            "movsd" | "movss" => self.enc_mov_sse(mnem, &ops, sec),
+            "addss" | "addsd" | "subss" | "subsd" | "mulss" | "mulsd" | "divss" | "divsd"
+            | "ucomiss" | "ucomisd" | "cvtss2sd" | "cvtsd2ss" => self.enc_sse_arith(mnem, &ops, sec),
+            "cvtsi2ss" | "cvtsi2sd" | "cvttss2si" | "cvttsd2si" => self.enc_sse_cvt(mnem, &ops, sec),
+            "setp" | "setnp" => self.enc_setcc(mnem, &ops, sec),
             "mov" | "movq" | "movb" | "movabs" | "movzbq" | "movzbl" | "movzwq" | "movzwl"
             | "movsbq" | "movsbl" | "movswq" | "movswl" | "movslq" => {
                 self.enc_mov(mnem, &ops, sec)
@@ -547,6 +558,135 @@ impl Elf {
             "movb" => self.enc_mov_bytes(&src, &dst, sec),
             _ => self.enc_mov_generic(mnem, &src, &dst, sec),
         }
+    }
+
+    /// `movq %xmmN, %r64` (opcode `66 0F 7E`, REX.W) and `movd %xmmN, %r32`
+    /// (`66 0F 7E`, no REX.W) — the `%xmm` register is the source.
+    fn enc_mov_xmm_gpr(&mut self, mnem: &str, ops: &[String], sec: usize) -> Result<(), String> {
+        let (src, dst) = (ops[0].clone(), ops[1].clone());
+        let xmm = parse_xmm(&src).ok_or_else(|| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+        let (gpr, _) = parse_reg(&dst).map_err(|_| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+        let w = mnem == "movq";
+        let mut out = Vec::new();
+        out.push(0x66);
+        let r = rex(w, xmm, gpr);
+        if r != 0x40 {
+            out.push(r);
+        }
+        out.extend_from_slice(&[0x0F, 0x7E]);
+        modrm_reg_reg(&mut out, xmm, gpr);
+        self.sections[sec].data.extend_from_slice(&out);
+        Ok(())
+    }
+
+    /// `movq %r64, %xmmN` (opcode `66 0F 6E`, REX.W) and `movd %r32, %xmmN`
+    /// (`66 0F 6E`, no REX.W) — the general-purpose register is the source.
+    fn enc_mov_gpr_xmm(&mut self, mnem: &str, ops: &[String], sec: usize) -> Result<(), String> {
+        let (src, dst) = (ops[0].clone(), ops[1].clone());
+        let (gpr, _) = parse_reg(&src).map_err(|_| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+        let xmm = parse_xmm(&dst).ok_or_else(|| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+        let w = mnem == "movq";
+        let mut out = Vec::new();
+        out.push(0x66);
+        let r = rex(w, xmm, gpr);
+        if r != 0x40 {
+            out.push(r);
+        }
+        out.extend_from_slice(&[0x0F, 0x6E]);
+        modrm_reg_reg(&mut out, xmm, gpr);
+        self.sections[sec].data.extend_from_slice(&out);
+        Ok(())
+    }
+
+    /// `movsd`/`movss` between two `%xmm` registers or from memory to an
+    /// `%xmm` register. The load is `F2/F3 0F 10 /r`; the store form
+    /// (`... 11 /r`) is not emitted by the back end.
+    fn enc_mov_sse(&mut self, mnem: &str, ops: &[String], sec: usize) -> Result<(), String> {
+        let (src, dst) = (ops[0].clone(), ops[1].clone());
+        let prefix: &[u8] = if mnem == "movsd" { &[0xF2] } else { &[0xF3] };
+        let reg = parse_xmm(&dst).ok_or_else(|| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+        let mut out = Vec::new();
+        if let Some(rm) = parse_xmm(&src) {
+            emit_sse_rr(&mut out, prefix, false, 0x10, reg, rm);
+        } else {
+            let m = parse_mem(&src).ok_or_else(|| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+            emit_sse_mem(&mut out, prefix, false, 0x10, reg, &m);
+            if let Some(sym) = m.rip_label.clone() {
+                self.sections[sec].data.extend_from_slice(&out);
+                let len = self.sections[sec].data.len();
+                self.fixups.push(Fixup { sec, disp_off: len - 4, next_off: len, sym });
+                return Ok(());
+            }
+        }
+        self.sections[sec].data.extend_from_slice(&out);
+        Ok(())
+    }
+
+    /// An SSE arithmetic or compare op with the destination in the `%xmm` reg
+    /// field and the source either an `%xmm` register or memory.
+    fn enc_sse_arith(&mut self, mnem: &str, ops: &[String], sec: usize) -> Result<(), String> {
+        let (src, dst) = (ops[0].clone(), ops[1].clone());
+        let (prefix, opcode) =
+            sse_reg_rm(mnem).ok_or_else(|| format!("elf: unsupported sse op `{mnem}`"))?;
+        let reg = parse_xmm(&dst).ok_or_else(|| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+        let mut out = Vec::new();
+        if let Some(rm) = parse_xmm(&src) {
+            emit_sse_rr(&mut out, prefix, false, opcode, reg, rm);
+        } else {
+            let m = parse_mem(&src).ok_or_else(|| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+            emit_sse_mem(&mut out, prefix, false, opcode, reg, &m);
+            if let Some(sym) = m.rip_label.clone() {
+                self.sections[sec].data.extend_from_slice(&out);
+                let len = self.sections[sec].data.len();
+                self.fixups.push(Fixup { sec, disp_off: len - 4, next_off: len, sym });
+                return Ok(());
+            }
+        }
+        self.sections[sec].data.extend_from_slice(&out);
+        Ok(())
+    }
+
+    /// The `%xmm`/general-purpose conversions: `cvtsi2ss`/`cvtsi2sd` (`F3/F2 0F
+    /// 2A /r`) read a general-purpose register and write an `%xmm`; `cvttss2si`/
+    /// `cvttsd2si` (`F3/F2 0F 2C /r`) read an `%xmm` (or memory) and write a
+    /// general-purpose register, with REX.W for the 64-bit destination.
+    fn enc_sse_cvt(&mut self, mnem: &str, ops: &[String], sec: usize) -> Result<(), String> {
+        let (src, dst) = (ops[0].clone(), ops[1].clone());
+        let mut out = Vec::new();
+        match mnem {
+            "cvtsi2ss" | "cvtsi2sd" => {
+                let prefix: &[u8] = if mnem == "cvtsi2ss" { &[0xF3] } else { &[0xF2] };
+                let (gpr, _) =
+                    parse_reg(&src).map_err(|_| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+                let xmm = parse_xmm(&dst).ok_or_else(|| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+                // The source is a 64-bit register (`%rax`); REX.W selects the
+                // 64-bit form of the conversion.
+                let w = reg_is_64(&src);
+                emit_sse_rr(&mut out, prefix, w, 0x2A, xmm, gpr);
+            }
+            "cvttss2si" | "cvttsd2si" => {
+                let prefix: &[u8] = if mnem == "cvttss2si" { &[0xF3] } else { &[0xF2] };
+                let (gpr, _) =
+                    parse_reg(&dst).map_err(|_| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+                let w = reg_is_64(&dst);
+                if let Some(xmm) = parse_xmm(&src) {
+                    emit_sse_rr(&mut out, prefix, w, 0x2C, gpr, xmm);
+                } else {
+                    let m =
+                        parse_mem(&src).ok_or_else(|| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+                    emit_sse_mem(&mut out, prefix, w, 0x2C, gpr, &m);
+                    if let Some(sym) = m.rip_label.clone() {
+                        self.sections[sec].data.extend_from_slice(&out);
+                        let len = self.sections[sec].data.len();
+                        self.fixups.push(Fixup { sec, disp_off: len - 4, next_off: len, sym });
+                        return Ok(());
+                    }
+                }
+            }
+            _ => return Err(format!("elf: unsupported sse cvt `{mnem}`")),
+        }
+        self.sections[sec].data.extend_from_slice(&out);
+        Ok(())
     }
 
     /// A sign/zero-extending move: `movz{b,w}`/`movs{b,w,l}` into a 64-bit (or
@@ -1328,6 +1468,76 @@ fn rex(w: bool, reg: u8, rm: u8) -> u8 {
 /// ModRM for a register/register form: mod=11, reg field, rm field.
 fn modrm_reg_reg(out: &mut Vec<u8>, reg: u8, rm: u8) {
     out.push(0xC0 | ((reg & 7) << 3) | (rm & 7));
+}
+
+/// `%xmmN` register number, if `s` names one. The `%xmm` file is separate from
+/// the general-purpose registers, so these never appear in `parse_reg`.
+fn parse_xmm(s: &str) -> Option<u8> {
+    let n = s.trim().strip_prefix("%xmm")?;
+    n.parse::<u8>().ok().filter(|r| *r < 16)
+}
+
+/// The mandatory prefix and two-byte opcode of an SSE op that takes the
+/// destination `%xmm` in the ModRM `reg` field and the source — an `%xmm` or a
+/// memory operand — in the r/m field. The prefix selects the operand width
+/// (`F3` single, `F2` double, `66` for the integer compares).
+fn sse_reg_rm(mnem: &str) -> Option<(&'static [u8], u8)> {
+    Some(match mnem {
+        "addss" => (&[0xF3], 0x58),
+        "addsd" => (&[0xF2], 0x58),
+        "subss" => (&[0xF3], 0x5C),
+        "subsd" => (&[0xF2], 0x5C),
+        "mulss" => (&[0xF3], 0x59),
+        "mulsd" => (&[0xF2], 0x59),
+        "divss" => (&[0xF3], 0x5E),
+        "divsd" => (&[0xF2], 0x5E),
+        "ucomiss" => (&[], 0x2E),
+        "ucomisd" => (&[0x66], 0x2E),
+        "cvtss2sd" => (&[0xF3], 0x5A),
+        "cvtsd2ss" => (&[0xF2], 0x5A),
+        _ => return None,
+    })
+}
+
+/// Emit an SSE instruction in the `%xmm`-register-to-`%xmm`-register form:
+/// mandatory prefix, REX (only when needed), the `0F` escape, the opcode and a
+/// mod=11 ModRM byte.
+fn emit_sse_rr(out: &mut Vec<u8>, prefix: &[u8], rex_w: bool, opcode: u8, reg: u8, rm: u8) {
+    out.extend_from_slice(prefix);
+    let r = rex(rex_w, reg, rm);
+    if r != 0x40 {
+        out.push(r);
+    }
+    out.push(0x0F);
+    out.push(opcode);
+    modrm_reg_reg(out, reg, rm);
+}
+
+/// Emit an SSE instruction whose r/m operand is memory. The REX byte precedes
+/// the `0F` escape (unlike `emit_mem_op`, which takes a one-byte opcode).
+fn emit_sse_mem(out: &mut Vec<u8>, prefix: &[u8], rex_w: bool, opcode: u8, reg: u8, m: &Mem) {
+    out.extend_from_slice(prefix);
+    let mut r = 0x40;
+    if rex_w {
+        r |= 0x08;
+    }
+    if reg >= 8 {
+        r |= 0x04;
+    }
+    if m.rip_label.is_none() {
+        if m.base.map_or(false, |b| b >= 8) {
+            r |= 0x01;
+        }
+        if m.index.map_or(false, |i| i >= 8) {
+            r |= 0x02;
+        }
+    }
+    if r != 0x40 {
+        out.push(r);
+    }
+    out.push(0x0F);
+    out.push(opcode);
+    emit_mem_modrm(out, m, reg);
 }
 
 fn emit_mov_imm(out: &mut Vec<u8>, reg: u8, v: i64, w: bool, abs: bool) {
