@@ -126,5 +126,37 @@ fn main() -> i64 {
     print_i64(r.count_ones());
     print_i64(a.abs().trailing_zeros());
     print_i64(mx.count_ones().trailing_zeros());
+
+    // `leading_ones` / `trailing_ones`: the count of leading/trailing set bits.
+    // They reuse the zero counts on `!x`, so the `i64` extremes are exact too
+    // (`MIN.leading_ones()` is 1, `-1.leading_ones()` is 64).
+    print_i64(z.leading_ones());
+    print_i64(z.trailing_ones());
+    print_i64(a.leading_ones());
+    print_i64(a.trailing_ones());
+    print_i64(MIN.leading_ones());
+    print_i64(MIN.trailing_ones());
+    print_i64(mx.leading_ones());
+    print_i64(mx.trailing_ones());
+    print_i64(ones.leading_ones());
+    print_i64(ones.trailing_ones());
+    print_i64(r.leading_ones());
+
+    // `swap_bytes` / `reverse_bits`: the byte and bit order reversed. A single
+    // `bswap` and a per-bit loop, exact for every input.
+    print_i64(z.swap_bytes());
+    print_i64(z.reverse_bits());
+    print_i64(a.swap_bytes());
+    print_i64(a.reverse_bits());
+    print_i64(MIN.swap_bytes());
+    print_i64(MIN.reverse_bits());
+    print_i64(mx.swap_bytes());
+    print_i64(mx.reverse_bits());
+    print_i64(ones.swap_bytes());
+    print_i64(ones.reverse_bits());
+    print_i64(r.swap_bytes());
+    // Chained, and on a call result.
+    print_i64(a.swap_bytes().reverse_bits());
+    print_i64(pick(-5, 9).reverse_bits());
     return 0;
 }

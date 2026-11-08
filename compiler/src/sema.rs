@@ -157,7 +157,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     // Runtime helpers provided by the freestanding assembly runtime. They are
     // linked in automatically, so they do not appear in the source program.
-    let builtins: [(&str, &[Type], Type); 13] = [
+    let builtins: [(&str, &[Type], Type); 15] = [
         ("print_i64", &[Type::I64], Type::Unit),
         ("print_str", &[Type::Str], Type::Unit),
         ("print_bool", &[Type::Bool], Type::Unit),
@@ -179,6 +179,10 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         ("__rmc_count_ones", &[Type::I64], Type::I64),
         ("__rmc_leading_zeros", &[Type::I64], Type::I64),
         ("__rmc_trailing_zeros", &[Type::I64], Type::I64),
+        // `swap_bytes` and `reverse_bits` are also loops over the bits, so they
+        // take the receiver by value and return the transformed value as `i64`.
+        ("__rmc_swap_bytes", &[Type::I64], Type::I64),
+        ("__rmc_reverse_bits", &[Type::I64], Type::I64),
     ];
     for (name, params, ret) in builtins {
         sigs.insert(
@@ -878,26 +882,42 @@ impl Sema {
                     Type::I64,
                 )
             }
-            // The bit-inspection methods. Each is a call to a small runtime
-            // helper: a loop over the 64 bits is exact (no operand is ever
-            // negated or decremented, so there is no overflow to trap on) and
+            // The bit methods that lower to a runtime helper. The counts are
+            // exact for every input: a loop over the 64 bits neither negates nor
+            // decrements, so there is no overflow to trap on and
             // `--overflow-checks` cannot change the answer, whereas a desugared
-            // `x & (x - 1)` would overflow for `i64::MIN`. The receiver is bound
-            // first (when it is not a plain variable) so a call operand runs
-            // once; the helper takes it by value and returns the count.
-            "count_ones" | "leading_zeros" | "trailing_zeros" => {
+            // `x & (x - 1)` would overflow for `i64::MIN`. `swap_bytes` and
+            // `reverse_bits` are the same shape — a per-bit loop (a single
+            // `bswap` for the former) with no operand negated. The receiver is
+            // bound first (when it is not a plain variable) so a call operand
+            // runs once; the helper takes it by value and returns the result.
+            // `leading_ones`/`trailing_ones` reuse the zero counts on `!x`,
+            // which is `xor $-1` and cannot overflow.
+            "count_ones" | "leading_zeros" | "trailing_zeros" | "swap_bytes"
+            | "reverse_bits" | "leading_ones" | "trailing_ones" => {
                 if !args.is_empty() {
                     return Err(format!("method `{name}` takes no arguments"));
                 }
-                let helper = match name {
-                    "count_ones" => "__rmc_count_ones",
-                    "leading_zeros" => "__rmc_leading_zeros",
-                    _ => "__rmc_trailing_zeros",
+                let (helper, arg) = match name {
+                    "count_ones" => ("__rmc_count_ones", x),
+                    "leading_zeros" => ("__rmc_leading_zeros", x),
+                    "trailing_zeros" => ("__rmc_trailing_zeros", x),
+                    "swap_bytes" => ("__rmc_swap_bytes", x),
+                    "reverse_bits" => ("__rmc_reverse_bits", x),
+                    // `leading_ones(x)` is `leading_zeros(!x)` and likewise for
+                    // the trailing form: inverting the bits swaps which side is
+                    // being counted, so the negated value is handed to the zero
+                    // helper rather than to a dedicated piece. `!` is `not`,
+                    // which cannot overflow.
+                    "leading_ones" => {
+                        ("__rmc_leading_zeros", Expr::Un(UnOp::Not, Box::new(x)))
+                    }
+                    _ => ("__rmc_trailing_zeros", Expr::Un(UnOp::Not, Box::new(x))),
                 };
                 (
                     Expr::Call {
                         name: helper.into(),
-                        args: vec![x],
+                        args: vec![arg],
                         arg_slots: vec![(-1, 0)],
                         ret_slot: -1,
                         ret_ty: Type::I64,
@@ -2520,6 +2540,10 @@ impl Sema {
                             | "count_ones"
                             | "leading_zeros"
                             | "trailing_zeros"
+                            | "swap_bytes"
+                            | "reverse_bits"
+                            | "leading_ones"
+                            | "trailing_ones"
                     )
                 {
                     // `abs` synthesises `-x`, a compiler-generated negation, so

@@ -713,6 +713,46 @@ __rmc_trailing_zeros:
 "#,
         defines: &["__rmc_trailing_zeros"],
     },
+    Piece {
+        text: r#"
+# long __rmc_swap_bytes(long x)  -- the byte order reversed. A single `bswap`
+# on the 64-bit register is exactly rustc's `i64::swap_bytes`; the in-process
+# encoder emits the same 0F C8+rd bytes that `as` assembles here.
+.globl __rmc_swap_bytes
+.type __rmc_swap_bytes, @function
+__rmc_swap_bytes:
+    mov %rdi, %rax
+    bswap %rax
+    ret
+.size __rmc_swap_bytes, .-__rmc_swap_bytes
+"#,
+        defines: &["__rmc_swap_bytes"],
+    },
+    Piece {
+        text: r#"
+# long __rmc_reverse_bits(long x)  -- the bit order reversed. A plain loop over
+# the 64 bits: each step shifts the result left and ORs in the low bit of the
+# remaining value, which is then shifted right. Like the other bit helpers it
+# neither negates nor decrements, so the result is exact for every input,
+# including `i64::MIN`, and does not depend on `--overflow-checks`.
+.globl __rmc_reverse_bits
+.type __rmc_reverse_bits, @function
+__rmc_reverse_bits:
+    xor %eax, %eax           # result = 0
+    mov $64, %ecx            # 64 bits to move
+.Lrb_loop:
+    shl $1, %rax             # result <<= 1, opening the low bit
+    mov %rdi, %rdx
+    and $1, %rdx             # low bit of the remaining value
+    or %rdx, %rax            # drop it into the result
+    shr $1, %rdi             # logical shift: bring in a zero, not the sign
+    dec %ecx
+    jne .Lrb_loop
+    ret
+.size __rmc_reverse_bits, .-__rmc_reverse_bits
+"#,
+        defines: &["__rmc_reverse_bits"],
+    },
 ];
 
 /// The identifiers in `src`, with `#`-to-end-of-line comments dropped. Matching

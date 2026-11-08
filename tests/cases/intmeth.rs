@@ -126,4 +126,36 @@ fn main() {
     println!("{}", r.count_ones());
     println!("{}", a.abs().trailing_zeros());
     println!("{}", mx.count_ones().trailing_zeros());
+
+    // `leading_ones` / `trailing_ones`: the count of leading/trailing set bits.
+    // They reuse the zero counts on `!x`, so the `i64` extremes are exact too
+    // (`MIN.leading_ones()` is 1, `-1.leading_ones()` is 64).
+    println!("{}", z.leading_ones());
+    println!("{}", z.trailing_ones());
+    println!("{}", a.leading_ones());
+    println!("{}", a.trailing_ones());
+    println!("{}", MIN.leading_ones());
+    println!("{}", MIN.trailing_ones());
+    println!("{}", mx.leading_ones());
+    println!("{}", mx.trailing_ones());
+    println!("{}", ones.leading_ones());
+    println!("{}", ones.trailing_ones());
+    println!("{}", r.leading_ones());
+
+    // `swap_bytes` / `reverse_bits`: the byte and bit order reversed. A single
+    // `bswap` and a per-bit loop, exact for every input.
+    println!("{}", z.swap_bytes());
+    println!("{}", z.reverse_bits());
+    println!("{}", a.swap_bytes());
+    println!("{}", a.reverse_bits());
+    println!("{}", MIN.swap_bytes());
+    println!("{}", MIN.reverse_bits());
+    println!("{}", mx.swap_bytes());
+    println!("{}", mx.reverse_bits());
+    println!("{}", ones.swap_bytes());
+    println!("{}", ones.reverse_bits());
+    println!("{}", r.swap_bytes());
+    // Chained, and on a call result.
+    println!("{}", a.swap_bytes().reverse_bits());
+    println!("{}", pick(-5, 9).reverse_bits());
 }

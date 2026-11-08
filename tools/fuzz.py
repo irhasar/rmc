@@ -1910,11 +1910,15 @@ def gen_intmeth_program(rng):
             lo, hi = bounds()
             return f"({recv()}).clamp({lo}, {hi})"
         if k < 0.88:
-            # A bit-inspection method. Each lowers to a runtime helper rather
-            # than operators, so the receiver must be typed `i64` in rustc
+            # A bit method. Each lowers to a runtime helper rather than
+            # operators, so the receiver must be typed `i64` in rustc
             # (`count_ones` exists on every integer width, so an unsuffixed
-            # literal would be ambiguous); `recv` is a variable or call.
-            m = rng.choice(["count_ones", "leading_zeros", "trailing_zeros"])
+            # literal would be ambiguous); `recv` is a variable or call. The
+            # `*_ones` forms reuse the zero-count helpers on `!x`.
+            m = rng.choice([
+                "count_ones", "leading_zeros", "trailing_zeros",
+                "leading_ones", "trailing_ones", "swap_bytes", "reverse_bits",
+            ])
             return f"({recv()}).{m}()"
         m = rng.choice(["div_euclid", "rem_euclid"])
         return f"({recv()}).{m}({divisor()})"
@@ -1964,12 +1968,15 @@ def gen_intmeth_program(rng):
     # Zero is neither positive nor negative.
     exprs.append("(0).is_positive() as i64")
     exprs.append("(0).is_negative() as i64")
-    # The bit-inspection methods, pinned at the edges: `ZERO` is all zeros (64
-    # leading and trailing zeros, no set bits), `MIN` has one bit set at the
-    # top, `MAX` has 63 set bits and one leading zero, and `ONES` is all ones.
-    # Named consts, not literals: an unsuffixed literal receiver is ambiguous in
-    # rustc (`count_ones` exists at every integer width).
-    for m in ["count_ones", "leading_zeros", "trailing_zeros"]:
+    # The bit methods, pinned at the edges: `ZERO` is all zeros (64 leading and
+    # trailing zeros, no set bits), `MIN` has one bit set at the top, `MAX` has
+    # 63 set bits and one leading zero, and `ONES` is all ones. Named consts,
+    # not literals: an unsuffixed literal receiver is ambiguous in rustc
+    # (`count_ones` exists at every integer width).
+    for m in [
+        "count_ones", "leading_zeros", "trailing_zeros",
+        "leading_ones", "trailing_ones", "swap_bytes", "reverse_bits",
+    ]:
         exprs.append(f"(ZERO).{m}()")
         exprs.append(f"(MIN).{m}()")
         exprs.append(f"(MAX).{m}()")
@@ -1978,6 +1985,8 @@ def gen_intmeth_program(rng):
     # result flows into the helper as a computed value.
     exprs.append("(MAX).count_ones().trailing_zeros()")
     exprs.append("(MIN).leading_zeros().count_ones()")
+    exprs.append("(ONES).swap_bytes().reverse_bits()")
+    exprs.append("(MIN).reverse_bits().leading_ones()")
     # A chain, so the outer method's receiver is another method call.
     exprs.append(f"({call()}).min({call()})")
     exprs.append(f"({call()}).is_positive() as i64")
