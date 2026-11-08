@@ -120,7 +120,7 @@ impl Parser {
             fn_scopes: vec![Vec::new()],
             fn_at: std::collections::HashMap::new(),
             nf_counter: 0,
-            aliases: std::collections::HashMap::new(),
+            aliases: builtin_aliases(),
         }
     }
 
@@ -223,6 +223,13 @@ impl Parser {
                 Some(Tok::Type) => self.parse_type_alias()?,
                 Some(Tok::Fn) => fns.push(self.parse_fn()?),
                 Some(Tok::Impl) => self.parse_impl(&mut fns)?,
+                // `use` imports a path into scope. rmc has no module system and
+                // resolves names globally, so the import is skipped; the items
+                // it would bring in (`std::process::exit`, a same-file `fn`,
+                // ...) are already visible. A `use` that brings in an item rmc
+                // does not provide fails later at its use site, with a clearer
+                // message than a parse error here.
+                Some(Tok::Ident(id)) if id == "use" => self.skip_use()?,
                 other => {
                     return Err(format!(
                         "at byte {}: expected `fn`, `struct`, `enum`, `const`, `type` or `impl`, found {}",
@@ -473,6 +480,14 @@ impl Parser {
         }
         self.i = saved;
         Ok(())
+    }
+
+    /// Skip a whole `use ...;` item, whose path may span braces
+    /// (`use std::{env, process};`). It is discarded: rmc resolves every name
+    /// globally, so an import has nothing to do.
+    fn skip_use(&mut self) -> PResult<()> {
+        self.i += 1; // the `use` identifier
+        self.skip_to_semi()
     }
 
     /// Advance past the next `;` at bracket depth 0, used to skip an alias
@@ -894,6 +909,11 @@ impl Parser {
 
     fn parse_type_inner(&mut self) -> PResult<Type> {
         if self.eat(&Tok::Amp) {
+            // A reference may carry a lifetime (`&'static str`, `&'a mut T`).
+            // rmc does not model lifetimes, so it is skipped here.
+            if let Some(Tok::Label(_)) = self.peek() {
+                self.i += 1;
+            }
             let mutable = self.eat(&Tok::Mut);
             let inner = self.parse_type()?;
             return Ok(Type::Ref(Box::new(inner), mutable));
@@ -1873,6 +1893,240 @@ impl Parser {
         let r = self.parse_expr();
         self.no_struct_lit = saved;
         r
+    }
+
+    /// `assert!(cond)`, `assert!(cond, msg)`, `assert_eq!(a, b)` and
+    /// `assert_ne!(a, b)`. Each becomes `if !(cond) { panic }` where the panic
+    /// body exits with status 101, so a failing assertion matches rustc's exit
+    /// code. The optional message is ignored (rmc prints no panic message, only
+    /// the status). `assert_eq!`/`assert_ne!` compare with `==`/`!=`; when the
+    /// operands are `str` that is the content comparison sema already lowers.
+    fn parse_assert(&mut self, name: &str) -> PResult<Expr> {
+        self.i += 1; // the `!`
+        self.expect(Tok::LParen)?;
+        let a = self.parse_bracketed_expr()?;
+        let cond = match name {
+            "assert" => a,
+            "assert_eq" | "assert_ne" => {
+                self.expect(Tok::Comma)?;
+                let b = self.parse_bracketed_expr()?;
+                let op = if name == "assert_eq" { BinOp::Eq } else { BinOp::Ne };
+                Expr::Bin(op, Box::new(a), Box::new(b))
+            }
+            _ => unreachable!(),
+        };
+        // Any remaining arguments are a custom panic message; discard them.
+        while self.eat(&Tok::Comma) {
+            let _ = self.parse_bracketed_expr()?;
+        }
+        self.expect(Tok::RParen)?;
+        Ok(Expr::If(
+            Box::new(Expr::Un(UnOp::Not, Box::new(cond))),
+            Block { stmts: vec![Stmt::Expr(Self::panic_call())], tail: None },
+            None,
+        ))
+    }
+
+    /// `panic!()`, `unreachable!()`, `todo!()` and `unimplemented!()`: exit with
+    /// status 101, rustc's panic code. Any arguments (a message) are discarded.
+    fn parse_panic(&mut self, _name: &str) -> PResult<Expr> {
+        self.i += 1; // the `!`
+        self.expect(Tok::LParen)?;
+        while self.peek() != Some(&Tok::RParen) {
+            let _ = self.parse_bracketed_expr()?;
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(Tok::RParen)?;
+        Ok(Self::panic_call())
+    }
+
+    /// The `exit(101)` call a failed assertion or a `panic!` lowers to.
+    fn panic_call() -> Expr {
+        Expr::Call {
+            name: "exit".into(),
+            args: vec![Expr::Int(101)],
+            arg_slots: vec![(-1, 0)],
+            ret_slot: -1,
+            ret_ty: Type::Unit,
+        }
+    }
+
+
+    /// `std::<mod>::<item>(args)` for the few std items rmc provides without a
+    /// standard library. Only `process::exit` and `hint::black_box` are known;
+    /// both lower to something rmc already has, so the call type-checks and
+    /// runs the same as under rustc for the programs rmc accepts.
+    fn parse_std_path(&mut self) -> PResult<Expr> {
+        self.i += 1; // the first `::`
+        let seg1 = self.expect_ident()?;
+        self.expect(Tok::ColonColon)?;
+        let seg2 = self.expect_ident()?;
+        match (seg1.as_str(), seg2.as_str()) {
+            // `std::process::exit(code)`: terminate with `code`. `exit` is the
+            // runtime's raw `exit(2)` syscall wrapper; it diverges, so the
+            // parser types the call `()` like any other.
+            ("process", "exit") => {
+                self.expect(Tok::LParen)?;
+                let arg = self.parse_bracketed_expr()?;
+                self.expect(Tok::RParen)?;
+                Ok(Expr::Call {
+                    name: "exit".into(),
+                    args: vec![arg],
+                    arg_slots: Vec::new(),
+                    ret_slot: -1,
+                    ret_ty: Type::Unit,
+                })
+            }
+            // `std::hint::black_box(x)`: the identity. rmc has no optimizer that
+            // would otherwise fold the value away, so the barrier is a no-op.
+            ("hint", "black_box") => {
+                self.expect(Tok::LParen)?;
+                let arg = self.parse_bracketed_expr()?;
+                self.expect(Tok::RParen)?;
+                Ok(arg)
+            }
+            _ => Err(format!(
+                "at byte {}: unsupported path `std::{seg1}::{seg2}` \
+                 (only `std::process::exit` and `std::hint::black_box` are provided)",
+                self.pos()
+            )),
+        }
+    }
+
+    /// `println!("...")` / `print!("...")`: format the literal and its `{}`
+    /// arguments, then print. `println!` appends a newline. The format string
+    /// must be a literal (a variable one is not supported), and a `{}` is filled
+    /// by the next argument in order; `{{`/`}}` are literal braces, and `\n` and
+    /// the other escapes are already resolved by the lexer. Each printed piece
+    /// is a `__rmc_print` call, which sema rewrites to the runtime helper that
+    /// matches the value's type (`__rmc_write_i64`, `__rmc_write_bool` or
+    /// `__rmc_write_str`); none of those appends a newline, so `println!` adds
+    /// the one trailing newline itself and `print!` adds none.
+    fn parse_macro(&mut self, name: &str) -> PResult<Expr> {
+        self.i += 1; // the `!`
+        let newline = name == "println";
+        if !self.eat(&Tok::LParen) {
+            return Err(format!("at byte {}: `{name}!` expects `(`", self.pos()));
+        }
+        // The format string must be a literal. `println!()` with no format at
+        // all is allowed and prints just a newline, as in rustc.
+        let fmt = if self.peek() == Some(&Tok::RParen) {
+            String::new()
+        } else {
+            match self.peek().cloned() {
+                Some(Tok::Str(s)) => {
+                    self.i += 1;
+                    s
+                }
+                other => {
+                    return Err(format!(
+                        "at byte {}: `{name}!` expects a string literal, found {}",
+                        self.pos(),
+                        other.map(|t| t.describe()).unwrap_or_else(|| "end of input".into())
+                    ))
+                }
+            }
+        };
+        let mut args: Vec<Expr> = Vec::new();
+        // The format string is the first element of a comma-separated list, so
+        // arguments (if any) follow a leading comma: `println!("x{}", a)`.
+        if self.eat(&Tok::Comma) {
+            while self.peek() != Some(&Tok::RParen) {
+                args.push(self.parse_bracketed_expr()?);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(Tok::RParen)?;
+        self.desugar_macro(name, newline, &fmt, args)
+    }
+
+    /// Build the block for `println!`/`print!` from the parsed format and
+    /// arguments. See `parse_macro` for the contract.
+    fn desugar_macro(
+        &mut self,
+        name: &str,
+        newline: bool,
+        fmt: &str,
+        args: Vec<Expr>,
+    ) -> PResult<Expr> {
+        let bytes = fmt.as_bytes();
+        let mut stmts: Vec<Stmt> = Vec::new();
+        let mut arg_i = 0usize;
+        let mut lit: Vec<u8> = Vec::new();
+        let flush = |lit: &mut Vec<u8>, stmts: &mut Vec<Stmt>| {
+            if !lit.is_empty() {
+                let s = String::from_utf8(lit.clone()).unwrap_or_default();
+                lit.clear();
+                stmts.push(Stmt::Expr(Expr::Call {
+                    name: "__rmc_print".into(),
+                    args: vec![Expr::Str(s)],
+                    arg_slots: vec![(-1, 0)],
+                    ret_slot: -1,
+                    ret_ty: Type::Unit,
+                }));
+            }
+        };
+        let mut k = 0usize;
+        while k < bytes.len() {
+            match bytes[k] {
+                b'{' if bytes.get(k + 1) == Some(&b'{') => {
+                    lit.push(b'{');
+                    k += 2;
+                }
+                b'}' if bytes.get(k + 1) == Some(&b'}') => {
+                    lit.push(b'}');
+                    k += 2;
+                }
+                b'{' if bytes.get(k + 1) == Some(&b'}') => {
+                    flush(&mut lit, &mut stmts);
+                    let arg = args.get(arg_i).cloned().ok_or_else(|| {
+                        format!("at byte {}: `{name}!` has more `{{}}` than arguments", self.pos())
+                    })?;
+                    arg_i += 1;
+                    stmts.push(Stmt::Expr(Expr::Call {
+                        name: "__rmc_print".into(),
+                        args: vec![arg],
+                        arg_slots: vec![(-1, 0)],
+                        ret_slot: -1,
+                        ret_ty: Type::Unit,
+                    }));
+                    k += 2;
+                }
+                b'{' | b'}' => {
+                    return Err(format!(
+                        "at byte {}: `{name}!` supports only `{{}}` in the format string",
+                        self.pos()
+                    ));
+                }
+                other => {
+                    lit.push(other);
+                    k += 1;
+                }
+            }
+        }
+        flush(&mut lit, &mut stmts);
+        if arg_i != args.len() {
+            return Err(format!(
+                "at byte {}: `{name}!` has {} argument(s) but {} `{{}}`",
+                self.pos(),
+                args.len(),
+                arg_i
+            ));
+        }
+        if newline {
+            stmts.push(Stmt::Expr(Expr::Call {
+                name: "putchar".into(),
+                args: vec![Expr::Int(10)],
+                arg_slots: vec![(-1, 0)],
+                ret_slot: -1,
+                ret_ty: Type::Unit,
+            }));
+        }
+        Ok(Expr::Block(Block { stmts, tail: None }))
     }
 
     fn parse_or(&mut self) -> PResult<Expr> {
@@ -3588,6 +3842,22 @@ impl Parser {
                 self.i += 1;
                 Ok(Expr::Str(s))
             }
+            // `i64::MIN` / `i64::MAX` / `i64::BITS`. `i64` is a keyword token,
+            // so it never reaches the `Ident` arm below.
+            Some(Tok::TyI64) => {
+                self.i += 1;
+                if self.eat(&Tok::ColonColon) {
+                    let konst = self.expect_ident()?;
+                    if let Some(v) = int_assoc_const("i64", &konst) {
+                        return Ok(Expr::Int(v));
+                    }
+                    return Err(format!(
+                        "at byte {}: `i64` has no associated constant `{konst}`",
+                        self.pos()
+                    ));
+                }
+                Err(format!("at byte {}: expected an expression, found `i64`", self.pos()))
+            }
             Some(Tok::True) => {
                 self.i += 1;
                 Ok(Expr::Bool(true))
@@ -3612,9 +3882,48 @@ impl Parser {
                 } else {
                     name
                 };
+                // A macro invocation `name!(...)`. `print!`/`println!` are
+                // lowered to runtime writes; `assert!`, `assert_eq!`,
+                // `assert_ne!`, `panic!` and `unreachable!` become an exit with
+                // status 101 (rustc's panic code). Any other name is rejected.
+                if self.peek() == Some(&Tok::Bang) {
+                    match name.as_str() {
+                        "println" | "print" => return self.parse_macro(&name),
+                        "assert" | "assert_eq" | "assert_ne" => {
+                            return self.parse_assert(&name)
+                        }
+                        "panic" | "unreachable" | "todo" | "unimplemented" => {
+                            return self.parse_panic(&name)
+                        }
+                        _ => {
+                            return Err(format!(
+                                "at byte {}: unknown macro `{name}!`",
+                                self.pos()
+                            ))
+                        }
+                    }
+                }
+                // `std::...` paths for the handful of std items rmc provides.
+                // Flattening the path lets `std::process::exit(0)` and
+                // `std::hint::black_box(x)` compile; anything else gets a clear
+                // "unsupported" error instead of a confusing parse error at the
+                // `::`.
+                if name == "std" && self.peek() == Some(&Tok::ColonColon) {
+                    return self.parse_std_path();
+                }
                 // `Enum::Variant` or `Enum::Variant(args)` — resolved and
                 // range-checked by sema.
                 if self.eat(&Tok::ColonColon) {
+                    // `i64::MIN`, `usize::MAX`, `u32::BITS`: an integer-width
+                    // associated constant folds straight to its value.
+                    if is_int_width(&name) {
+                        if let Some(Tok::Ident(konst)) = self.peek().cloned() {
+                            if let Some(v) = int_assoc_const(&name, &konst) {
+                                self.i += 1;
+                                return Ok(Expr::Int(v));
+                            }
+                        }
+                    }
                     let variant = self.expect_ident()?;
                     if self.eat(&Tok::LParen) {
                         let mut args = Vec::new();
@@ -3944,6 +4253,49 @@ fn expr_has_call(e: &Expr) -> bool {
     }
 }
 
+/// True when `s` is one of the built-in integer-width type names.
+fn is_int_width(s: &str) -> bool {
+    matches!(
+        s,
+        "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
+            | "u8" | "u16" | "u32" | "u64" | "u128" | "usize"
+    )
+}
+
+/// The value of an integer-width associated constant (`i32::MAX`, `u8::BITS`),
+/// or `None` when `ty`/`name` is not one. rmc has one integer type, so a width's
+/// `MIN`/`MAX`/`BITS` is folded to the `i64` value of that width; an unsigned
+/// `MAX` above `i64::MAX` becomes its two's-complement bit pattern, exactly what
+/// `u64::MAX as i64` is, so `usize::MAX` reads as `-1`.
+fn int_assoc_const(ty: &str, name: &str) -> Option<i64> {
+    let (signed, bits): (bool, u32) = match ty {
+        "i8" => (true, 8),
+        "i16" => (true, 16),
+        "i32" => (true, 32),
+        "i64" => (true, 64),
+        "i128" => (true, 128),
+        "isize" => (true, 64),
+        "u8" => (false, 8),
+        "u16" => (false, 16),
+        "u32" => (false, 32),
+        "u64" => (false, 64),
+        "u128" => (false, 128),
+        "usize" => (false, 64),
+        _ => return None,
+    };
+    let v: i128 = match name {
+        "BITS" => bits as i128,
+        "MIN" if signed => -(1i128 << (bits - 1)),
+        "MIN" => 0,
+        "MAX" if signed => (1i128 << (bits - 1)) - 1,
+        // An unsigned `MAX` of a 128-bit width is `u128::MAX`, whose bit pattern
+        // is all ones; the narrower ones fit an `i128` before truncating.
+        "MAX" => ((1u128 << bits) - 1) as i128,
+        _ => return None,
+    };
+    Some(v as i64)
+}
+
 fn block_has_call_p(b: &Block) -> bool {
     b.stmts.iter().any(stmt_has_call_p) || b.tail.as_deref().map_or(false, expr_has_call)
 }
@@ -3961,4 +4313,21 @@ fn stmt_has_call_p(s: &Stmt) -> bool {
         Stmt::Break(v, _) => v.as_ref().map_or(false, expr_has_call),
         Stmt::Continue(_) => false,
     }
+}
+
+/// The built-in integer-width type names. rmc has one integer type, `i64`, but
+/// a Rust source spells widths (`usize`, `u32`, `i8`, ...). Each is pre-seeded
+/// as a transparent alias for `i64` so `let i: usize = 0;` and
+/// `x as usize` parse; the value is `i64` throughout, so the alias is exactly
+/// what a `type usize = i64;` would give. A program may shadow any of them with
+/// its own `type`, which is why this is the alias map and not a reserved word.
+fn builtin_aliases() -> std::collections::HashMap<String, Type> {
+    let mut m = std::collections::HashMap::new();
+    for name in [
+        "usize", "isize", "u8", "u16", "u32", "u64", "u128",
+        "i8", "i16", "i32", "i128",
+    ] {
+        m.insert(name.to_string(), Type::I64);
+    }
+    m
 }

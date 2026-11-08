@@ -5315,6 +5315,32 @@ fn the_bit_helpers_are_pulled_in_only_when_used() {
 }
 
 #[test]
+fn midpoint_lowers_to_operators_and_evaluates_each_operand_once() {
+    // `midpoint` desugars to `(x & y) + ((x ^ y) >> 1)` plus a sign/parity
+    // correction, so it adds no runtime helper and calls each operand once.
+    let out = asm_no_inline(
+        "fn g() -> i64 { return 3; } \
+         fn main() -> i64 { return g().midpoint(g()); }",
+    );
+    let body = &out[out.find("main:").expect("main")..];
+    assert_eq!(body.matches("call g").count(), 2, "each operand once:\n{body}");
+    assert!(!out.contains("__rmc_midpoint"), "no dedicated helper:\n{out}");
+}
+
+#[test]
+fn midpoint_takes_exactly_one_argument() {
+    for src in [
+        "fn main() -> i64 { return 1.midpoint(); }",
+        "fn main() -> i64 { return 1.midpoint(2, 3); }",
+    ] {
+        assert!(
+            compile_to_asm(src, &CompileOptions::default()).is_err(),
+            "`midpoint` arity: {src}"
+        );
+    }
+}
+
+#[test]
 fn a_nested_fn_is_hoisted_and_callable() {
     // A `fn` inside a block is an item, not a closure: it captures nothing, so
     // it is hoisted to the top level and emitted like any other function.

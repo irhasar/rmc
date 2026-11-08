@@ -135,7 +135,9 @@ The suite covers arithmetic and division semantics (including divisors that need
 the magic-multiply add fixup and powers of two), every comparison operator with
 the immediate on either side, string comparison by content (which a pointer
 compare would get wrong), boolean short-circuiting, control flow, arrays,
-calls and recursion, the output builtins, nested expressions, and arrays of `i64` and `bool` built
+calls and recursion, the output builtins (including `print!`/`println!`
+formatting and the `assert!` family), `use` and `std` paths, `str`/`&str`
+coercion, nested expressions, and arrays of `i64` and `bool` built
 from either literal form. It is
 deliberately adversarial: reverting the folded-comparison operand-order fix
 makes the `cmp` case fail, dropping the sign bias from division by a power of
@@ -289,6 +291,7 @@ or field, compared by content with `==`/`!=`/`<`/`<=`/`>`/`>=`, with `.len()` fo
 the byte length); array `.len()` (a compile-time constant); built-in `i64` methods
 (`x.abs()`, `x.signum()`, `x.min(y)`, `x.max(y)`, `x.clamp(lo, hi)`,
 `x.is_positive()`, `x.is_negative()`, `x.div_euclid(y)`, `x.rem_euclid(y)`,
+`x.midpoint(y)`,
 `x.count_ones()`, `x.count_zeros()`, `x.leading_zeros()`, `x.trailing_zeros()`,
 `x.leading_ones()`, `x.trailing_ones()`, `x.swap_bytes()`, `x.reverse_bits()`,
 `x.rotate_left(n)`, `x.rotate_right(n)`, desugared to
@@ -306,8 +309,14 @@ with auto-deref for `r.x`, `r[i]` and `r.m()`, and `&self` receivers); methods
 block-scoped, so it shadows a top-level `fn` of the same name and is visible
 throughout its block, exactly as rustc); `as` casts at Rust's
 precedence (looser than the unary operators, so `*r as i64` is `(*r) as i64`);
-attributes such as `#[derive(Copy, Clone)]` (parsed and ignored); and a small
-set of runtime builtins. Structs and arrays may be passed to and returned from
+attributes such as `#[derive(Copy, Clone)]` (parsed and ignored); `use`
+statements (parsed and discarded, since every name is resolved globally);
+`print!`/`println!` with `{}` substitution, and `assert!`/`assert_eq!`/
+`assert_ne!`/`panic!`/`unreachable!` (a failure exits with rustc's panic code
+101); the `std::process::exit` and `std::hint::black_box` paths; and a small
+set of runtime builtins. A `str` and a `&str` are the same one-word value, so
+they coerce freely and a `&'static str` field or `&str` parameter may be
+written `str`. Structs and arrays may be passed to and returned from
 functions by value, or by reference to avoid the copy. Overflow checks are
 opt-in with `--overflow-checks`, and array bounds checks with
 `--bounds-checks`. See `docs/language.md` for the full grammar.
@@ -323,6 +332,7 @@ Runtime builtins (provided by `src/runtime.rs`, no imports needed):
 | `alloc(n)`      | `(i64) -> i64`       | allocate `n` bytes (first-fit free list) |
 | `free(p)`       | `(i64) -> ()`        | return a block from `alloc` to the heap |
 | `arg_i64(i)`    | `(i64) -> i64`       | parse `argv[i]` as a signed integer    |
+| `exit(code)`    | `(i64) -> ()`        | terminate with `code` (raw syscall)    |
 
 ## Benchmarks
 

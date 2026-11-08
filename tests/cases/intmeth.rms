@@ -184,5 +184,22 @@ fn main() -> i64 {
     print_i64(mx.rotate_right(1));
     print_i64(a.rotate_left(1).count_ones());
     print_i64(pick(1, 2).rotate_right(1));
+
+    // `midpoint`: the mean of `x` and `y` rounded toward zero, computed with an
+    // unbounded sum so it never overflows — `MIN.midpoint(MIN)` is `MIN`, and
+    // `MIN.midpoint(MAX)` is 0. The odd negative sum rounds toward zero, so
+    // `(-3).midpoint(0)` is -1.
+    print_i64(a.midpoint(b));
+    print_i64(b.midpoint(a));
+    print_i64(z.midpoint(a));
+    print_i64(MIN.midpoint(MIN));
+    print_i64(MIN.midpoint(mx));
+    print_i64(mx.midpoint(MIN));
+    print_i64(mx.midpoint(mx));
+    print_i64(mx.midpoint(1));
+    print_i64(MIN.midpoint(-1));
+    print_i64((-3).midpoint(0));
+    print_i64((3).midpoint(-3));
+    print_i64(pick(1, 2).midpoint(4));
     return 0;
 }

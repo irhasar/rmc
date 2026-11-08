@@ -344,7 +344,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 i += 1;
             }
             let raw = src[start..i].replace('_', "");
-            let (digits, radix) = if let Some(h) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+            let (body, radix) = if let Some(h) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
                 (h, 16)
             } else if let Some(b) = raw.strip_prefix("0b").or_else(|| raw.strip_prefix("0B")) {
                 (b, 2)
@@ -353,6 +353,19 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             } else {
                 (raw.as_str(), 10)
             };
+            // A trailing integer suffix (`1i64`, `0u8`, `0xffu32`) is not part of
+            // the value: split off the leading run of radix digits and check the
+            // rest against the known suffixes. rmc is `i64`-only, so every
+            // suffix is accepted and lowered to the same value (a `u8`/`u32`
+            // suffix does not change the representation), which lets a Rust
+            // source that names an integer width compile unchanged.
+            let digits_len = body
+                .find(|c: char| c.to_digit(radix).is_none())
+                .unwrap_or(body.len());
+            let (digits, suffix) = body.split_at(digits_len);
+            if !suffix.is_empty() && !is_int_suffix(suffix) {
+                return Err(format!("invalid integer literal `{raw}` at byte {start}"));
+            }
             let v = i64::from_str_radix(digits, radix);
             match v {
                 Ok(v) => out.push(Token { tok: Tok::Int(v), pos }),
@@ -465,4 +478,16 @@ fn is_i64_min_magnitude(digits: &str, radix: u32) -> bool {
         8 => trimmed.len() == 22 && trimmed.starts_with('1') && trimmed[1..].bytes().all(|b| b == b'0'),
         _ => false,
     }
+}
+
+/// True when `s` is a Rust integer-literal suffix (`i8`..`i128`, `u8`..`u128`,
+/// `isize`/`usize`). rmc is `i64`-only, so a suffix is accepted but discarded:
+/// the literal's value is unchanged. This lets a Rust source that names a width
+/// (`0u8`, `1i64`, `100usize`) compile, which matters for a `.rs` file.
+fn is_int_suffix(s: &str) -> bool {
+    matches!(
+        s,
+        "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
+            | "u8" | "u16" | "u32" | "u64" | "u128" | "usize"
+    )
 }

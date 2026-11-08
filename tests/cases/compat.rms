@@ -1,0 +1,20 @@
+// The rmc twin of `compat.rs`. rmc ignores `use` and lowers `std::hint::black_box`
+// to the identity and `std::process::exit` to the `exit` syscall; `assert!` and
+// friends become `if !(cond) { exit(101) }`.
+fn twice(x: i64) -> i64 { std::hint::black_box(x) * 2 }
+
+fn main() -> i64 {
+    let n = twice(21);
+    assert!(n == 42);
+    assert_eq!(n, 42);
+    assert_ne!(n, 41);
+    if n == 0 {
+        panic!("unreachable");
+    }
+    print_i64(n);
+    if n == 42 {
+        std::process::exit(0);
+    }
+    print_i64(99);
+    return 0;
+}

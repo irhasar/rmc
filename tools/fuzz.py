@@ -1921,13 +1921,18 @@ def gen_intmeth_program(rng):
                 "count_zeros",
             ])
             return f"({recv()}).{m}()"
-        if k < 0.94:
+        if k < 0.92:
             # A rotate: the count is a small non-negative literal, so the same
             # source is valid in rmc (`i64` count) and rustc (`u32` count). The
             # `64`/`65` counts exercise the hardware `% 64` mask.
             m = rng.choice(["rotate_left", "rotate_right"])
             n = rng.choice(["0", "1", "7", "31", "63", "64", "65"])
             return f"({recv()}).{m}({n})"
+        if k < 0.97:
+            # `midpoint`: the argument is a full `i64`, and `MIN`/`MAX` are
+            # included because the mean is the one method that would overflow if
+            # it summed naively.
+            return f"({recv()}).midpoint({gen_i64(rng, 1)})"
         m = rng.choice(["div_euclid", "rem_euclid"])
         return f"({recv()}).{m}({divisor()})"
 
@@ -2005,6 +2010,18 @@ def gen_intmeth_program(rng):
     exprs.append("(MIN).reverse_bits().leading_ones()")
     exprs.append("(ONES).rotate_left(13).count_ones()")
     exprs.append("(MIN).rotate_right(1).count_zeros()")
+    # `midpoint` at the edges: a same-sign pair would overflow a naive sum, so
+    # `(MIN).midpoint(MIN)` and `(MAX).midpoint(MAX)` pin the unbounded-sum
+    # behaviour, and the mixed-sign pairs pin the rounding direction.
+    for a in ["ZERO", "MIN", "MAX", "ONES"]:
+        for b in ["ZERO", "MIN", "MAX", "ONES"]:
+            exprs.append(f"({a}).midpoint({b})")
+    exprs.append("(MIN).midpoint(MAX)")
+    exprs.append("(MAX).midpoint(MIN)")
+    exprs.append("(h(1)).midpoint(MIN)")
+    exprs.append("(MIN).midpoint(1)")
+    exprs.append("(MAX).midpoint(-1)")
+    exprs.append("(h(-1)).midpoint(MAX)")
     # A chain, so the outer method's receiver is another method call.
     exprs.append(f"({call()}).min({call()})")
     exprs.append(f"({call()}).is_positive() as i64")

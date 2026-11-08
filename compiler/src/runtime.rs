@@ -205,6 +205,106 @@ print_str:
     },
     Piece {
         text: r#"
+# void __rmc_write_i64(long n)  -- decimal value, no trailing newline
+.globl __rmc_write_i64
+.type __rmc_write_i64, @function
+__rmc_write_i64:
+    push %rbp
+    mov %rsp, %rbp
+    sub $64, %rsp
+    lea -1(%rbp), %rsi
+    mov $0, %rcx
+    mov %rdi, %rax
+    xor %r8, %r8
+    test %rax, %rax
+    jns .Lwi_pos
+    mov $1, %r8
+    neg %rax
+.Lwi_pos:
+    mov $10, %r9
+.Lwi_loop:
+    xor %rdx, %rdx
+    div %r9
+    add $48, %dl
+    dec %rsi
+    mov %dl, (%rsi)
+    inc %rcx
+    test %rax, %rax
+    jnz .Lwi_loop
+    test %r8, %r8
+    jz .Lwi_write
+    dec %rsi
+    movb $45, (%rsi)
+    inc %rcx
+.Lwi_write:
+    mov %rcx, %rdx
+    mov $1, %rax
+    mov $1, %rdi
+    syscall
+    leave
+    ret
+.size __rmc_write_i64, .-__rmc_write_i64
+"#,
+        defines: &["__rmc_write_i64"],
+    },
+    Piece {
+        text: r#"
+# void __rmc_write_bool(bool b)  -- `true` or `false`, no trailing newline
+.globl __rmc_write_bool
+.type __rmc_write_bool, @function
+__rmc_write_bool:
+    push %rbp
+    mov %rsp, %rbp
+    sub $16, %rsp
+    test %rdi, %rdi
+    jz .Lwb_false
+    movb $0x74, -8(%rbp)
+    movb $0x72, -7(%rbp)
+    movb $0x75, -6(%rbp)
+    movb $0x65, -5(%rbp)
+    lea -8(%rbp), %rsi
+    mov $4, %rdx
+    jmp .Lwb_write
+.Lwb_false:
+    movb $0x66, -8(%rbp)
+    movb $0x61, -7(%rbp)
+    movb $0x6c, -6(%rbp)
+    movb $0x73, -5(%rbp)
+    movb $0x65, -4(%rbp)
+    lea -8(%rbp), %rsi
+    mov $5, %rdx
+.Lwb_write:
+    mov $1, %rax
+    mov $1, %rdi
+    syscall
+    leave
+    ret
+.size __rmc_write_bool, .-__rmc_write_bool
+"#,
+        defines: &["__rmc_write_bool"],
+    },
+    Piece {
+        text: r#"
+# void __rmc_write_str(long ptr)  -- ptr points at a {len: i64, bytes...} record,
+# written with no trailing newline (unlike print_str)
+.globl __rmc_write_str
+.type __rmc_write_str, @function
+__rmc_write_str:
+    push %rbp
+    mov %rsp, %rbp
+    mov (%rdi), %rdx
+    lea 8(%rdi), %rsi
+    mov $1, %rax
+    mov $1, %rdi
+    syscall
+    leave
+    ret
+.size __rmc_write_str, .-__rmc_write_str
+"#,
+        defines: &["__rmc_write_str"],
+    },
+    Piece {
+        text: r#"
 # bool __rmc_str_lt(long a, long b)  -- a and b point at {len: i64, bytes...}
 # records. Returns 1 when the byte string a is lexicographically less than b,
 # 0 otherwise. A `str` value is the address of its record, so a string

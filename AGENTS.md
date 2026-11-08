@@ -1343,7 +1343,7 @@ The checks, all in `sema.rs`:
   where rustc's is `usize`, so a differential twin casts with `as i64`.
 - **Built-in `i64` methods
   (`abs`/`min`/`max`/`clamp`/`signum`/`is_positive`/`is_negative`/
-  `div_euclid`/`rem_euclid`/`count_ones`/`count_zeros`/`leading_zeros`/
+  `div_euclid`/`rem_euclid`/`midpoint`/`count_ones`/`count_zeros`/`leading_zeros`/
   `trailing_zeros`/`leading_ones`/`trailing_ones`/`swap_bytes`/`reverse_bits`/
   `rotate_left`/`rotate_right`).**
   Like `len()`, they
@@ -1375,6 +1375,17 @@ The checks, all in `sema.rs`:
   does not overflow a dead arm: with `y == MIN` the remainder is never negative,
   so `r - y` never runs. They reuse `/` and `%`, so a zero divisor and
   `MIN.div_euclid(-1)` panic at run time as the operators do.
+  `midpoint(y)` is the mean rounded toward zero, which is *not* the floor: it is
+  `(x & y) + ((x ^ y) >> 1)` (the floor, since `x + y = (x & y) + (x | y)` and
+  `(x | y) = (x & y) + (x ^ y)`) with a one-step correction for an odd negative
+  sum — `(x ^ y) & 1` is 1 exactly when the sum is odd, and the half-sum is
+  negative exactly when the sum is, so the correction is
+  `((x ^ y) & 1) & ((half < 0) as i64)`, added once. Nothing is negated and no
+  arm can overflow (the `&`, `^`, `>>` and `+` of the floor stay in range, and
+  the correction is 0 or 1), so `MAX.midpoint(MAX)` is `MAX` and
+  `MIN.midpoint(MAX)` is `0` with or without `--overflow-checks`. The half-sum is
+  bound to a temp so the sign test reads the same value the `+` does. This is
+  exactly `rustc`'s definition, so no helper is added.
   `count_ones`/`leading_zeros`/`trailing_zeros` take no argument and lower to a
   `Call __rmc_<name>` on the receiver (no operators): the usual `x & (x - 1)`
   bit trick overflows for `i64::MIN`, and rustc's answer for `MIN` is exact
@@ -1625,6 +1636,21 @@ range is a compile error; a *variable* index is unchecked by default (used
 as-is, like C), so an out-of-range one reads or writes adjacent stack memory.
 `--bounds-checks` turns on a per-index runtime check that traps (see the codegen
 notes and "Soundness checks").
+
+The macro surface is lowered at parse time and is deliberately tiny.
+`print!`/`println!` take a literal format string and rewrite each `{}` to a
+`__rmc_print` call whose argument's checked type picks the runtime writer
+(`__rmc_write_i64`, `__rmc_write_bool`, `__rmc_write_str`); `println!` appends
+the newline itself. `assert!`/`assert_eq!`/`assert_ne!`/`panic!`/`unreachable!`/
+`todo!`/`unimplemented!` desugar to `if !(cond) { exit(101) }` (or a bare
+`exit(101)`), so a failure matches rustc's panic exit code; the message
+arguments are parsed and discarded. `use` items are skipped, and only
+`std::process::exit` and `std::hint::black_box` are understood among `std::`
+paths. `str` and `&str` are the same one-word value, so `ref_coerces` lets them
+be exchanged at a variable, parameter, struct-field, enum-variant-field or
+comparison site; there is no lifetime checking, so a `&'static str` field or
+`&str` parameter may be written `str`.
+
 The README's roadmap lists the intended next steps.
 
 ## Codegen notes

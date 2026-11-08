@@ -100,7 +100,7 @@ fn print_help() {
     println!(
         "rmc - experimental Rust-subset compiler (no LLVM, no crates)\n\
          \n\
-         USAGE:\n    rmc [OPTIONS] <input.rms>\n\
+         USAGE:\n    rmc [OPTIONS] <input.rs>\n\
          \n\
          OPTIONS:\n\
          \x20   -o <path>      output binary path\n\
