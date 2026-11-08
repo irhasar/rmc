@@ -44,6 +44,11 @@ pub struct Parser {
     /// `tuple_defs` and appended to the program's structs once parsing is done.
     tuple_structs: std::collections::HashSet<String>,
     tuple_defs: Vec<StructDef>,
+    /// Module names brought into scope by a `use` of a `std` subtree, so that
+    /// `use std::process;` makes a later `process::exit(0)` resolve. Only the
+    /// `std` tree is tracked: any other import is skipped, because a same-file
+    /// item is already visible by its own name. `std` is present from the start.
+    std_mods: std::collections::HashSet<String>,
     /// Functions declared inside a block (`fn f() { .. }` as a statement),
     /// collected here and appended to the program's flat function list. A nested
     /// `fn` is an item, not a closure: it captures no locals, so it is hoisted
@@ -115,6 +120,11 @@ impl Parser {
             struct_fields: std::collections::HashMap::new(),
             tuple_structs: std::collections::HashSet::new(),
             tuple_defs: Vec::new(),
+            std_mods: {
+                let mut m = std::collections::HashSet::new();
+                m.insert("std".to_string());
+                m
+            },
             nested_fns: Vec::new(),
             pat_refutable_ok: false,
             fn_scopes: vec![Vec::new()],
@@ -483,11 +493,40 @@ impl Parser {
     }
 
     /// Skip a whole `use ...;` item, whose path may span braces
-    /// (`use std::{env, process};`). It is discarded: rmc resolves every name
-    /// globally, so an import has nothing to do.
+    /// (`use std::{env, process};`). The import is discarded — rmc resolves
+    /// every name globally — but a `std` subtree is recorded so that a later
+    /// `process::exit(0)` after `use std::process;` resolves to the `std` path.
     fn skip_use(&mut self) -> PResult<()> {
         self.i += 1; // the `use` identifier
+        self.collect_std_use();
         self.skip_to_semi()
+    }
+
+    /// Record the module names a `use` of the `std` tree brings into scope.
+    /// Walks the token run up to the `;`, so `use std::process;`,
+    /// `use std::process::exit;` and `use std::{process, hint};` all register
+    /// `process` (and `hint`). A `use` that does not start at `std` is ignored.
+    fn collect_std_use(&mut self) {
+        let mut j = self.i;
+        if !matches!(self.toks.get(j).map(|t| &t.tok), Some(Tok::Ident(n)) if n == "std") {
+            return;
+        }
+        let mut want = true; // the next ident is a module name
+        j += 1;
+        while j < self.toks.len() {
+            match &self.toks[j].tok {
+                Tok::Semi => break,
+                Tok::ColonColon => want = true,
+                Tok::LBrace => {} // the group of a `std::{..}`; names inside count
+                Tok::Comma | Tok::RBrace => want = true,
+                Tok::Ident(n) if want => {
+                    self.std_mods.insert(n.clone());
+                    want = false;
+                }
+                _ => {}
+            }
+            j += 1;
+        }
     }
 
     /// Advance past the next `;` at bracket depth 0, used to skip an alias
@@ -1976,45 +2015,76 @@ impl Parser {
     }
 
 
-    /// `std::<mod>::<item>(args)` for the few std items rmc provides without a
-    /// standard library. Only `process::exit` and `hint::black_box` are known;
-    /// both lower to something rmc already has, so the call type-checks and
-    /// runs the same as under rustc for the programs rmc accepts.
-    fn parse_std_path(&mut self) -> PResult<Expr> {
-        self.i += 1; // the first `::`
-        let seg1 = self.expect_ident()?;
-        self.expect(Tok::ColonColon)?;
-        let seg2 = self.expect_ident()?;
-        match (seg1.as_str(), seg2.as_str()) {
-            // `std::process::exit(code)`: terminate with `code`. `exit` is the
-            // runtime's raw `exit(2)` syscall wrapper; it diverges, so the
-            // parser types the call `()` like any other.
-            ("process", "exit") => {
-                self.expect(Tok::LParen)?;
-                let arg = self.parse_bracketed_expr()?;
-                self.expect(Tok::RParen)?;
-                Ok(Expr::Call {
-                    name: "exit".into(),
-                    args: vec![arg],
-                    arg_slots: Vec::new(),
-                    ret_slot: -1,
-                    ret_ty: Type::Unit,
-                })
+    /// `std::<mod>::<item>(args)` (or `<mod>::<item>(args)` after a
+    /// `use std::<mod>;`) for the few std items rmc provides without a standard
+    /// library. Only `process::exit` and `hint::black_box` are known; both lower
+    /// to something rmc already has, so the call type-checks and runs the same
+    /// as under rustc for the programs rmc accepts. Returns `Ok(None)` without
+    /// consuming anything when the path is not one rmc knows, so the caller can
+    /// fall back to the ordinary `::` (enum variant) handling.
+    fn try_parse_std_path(&mut self, name: &str) -> PResult<Option<Expr>> {
+        // `self.i` is at the first `::`. Work out `(module, item)` by looking
+        // ahead before consuming, so an unknown path can be declined.
+        let seg = |p: &Self, k: usize| match p.toks.get(k).map(|t| &t.tok) {
+            Some(Tok::Ident(n)) => Some(n.clone()),
+            _ => None,
+        };
+        let (module, item) = if name == "std" {
+            if self.toks.get(self.i + 2).map(|t| &t.tok) != Some(&Tok::ColonColon) {
+                return Ok(None);
             }
+            match (seg(self, self.i + 1), seg(self, self.i + 3)) {
+                (Some(m), Some(it)) => (m, it),
+                _ => return Ok(None),
+            }
+        } else {
+            match seg(self, self.i + 1) {
+                Some(it) => (name.to_string(), it),
+                None => return Ok(None),
+            }
+        };
+        let known = matches!(
+            (module.as_str(), item.as_str()),
+            ("process", "exit") | ("hint", "black_box")
+        );
+        if !known {
+            // A full `std::` path is unambiguously a std import, so it gets a
+            // clear message; an aliased module may just be a same-file item.
+            if name == "std" {
+                return Err(format!(
+                    "at byte {}: unsupported path `std::{module}::{item}` \
+                     (only `std::process::exit` and `std::hint::black_box` are provided)",
+                    self.pos()
+                ));
+            }
+            return Ok(None);
+        }
+        self.expect(Tok::ColonColon)?; // the first `::`
+        if name == "std" {
+            self.expect_ident()?; // the module
+            self.expect(Tok::ColonColon)?;
+        }
+        self.expect_ident()?; // the item
+        self.expect(Tok::LParen)?;
+        let arg = self.parse_bracketed_expr()?;
+        self.expect(Tok::RParen)?;
+        let e = match (module.as_str(), item.as_str()) {
+            // `std::process::exit(code)`: terminate with `code`. `exit` is the
+            // runtime's raw `exit` syscall wrapper; it diverges, so the parser
+            // types the call `()` like any other.
+            ("process", "exit") => Expr::Call {
+                name: "exit".into(),
+                args: vec![arg],
+                arg_slots: Vec::new(),
+                ret_slot: -1,
+                ret_ty: Type::Unit,
+            },
             // `std::hint::black_box(x)`: the identity. rmc has no optimizer that
             // would otherwise fold the value away, so the barrier is a no-op.
-            ("hint", "black_box") => {
-                self.expect(Tok::LParen)?;
-                let arg = self.parse_bracketed_expr()?;
-                self.expect(Tok::RParen)?;
-                Ok(arg)
-            }
-            _ => Err(format!(
-                "at byte {}: unsupported path `std::{seg1}::{seg2}` \
-                 (only `std::process::exit` and `std::hint::black_box` are provided)",
-                self.pos()
-            )),
-        }
+            ("hint", "black_box") => arg,
+            _ => unreachable!(),
+        };
+        Ok(Some(e))
     }
 
     /// `println!("...")` / `print!("...")`: format the literal and its `{}`
@@ -3925,13 +3995,15 @@ impl Parser {
                         }
                     }
                 }
-                // `std::...` paths for the handful of std items rmc provides.
-                // Flattening the path lets `std::process::exit(0)` and
-                // `std::hint::black_box(x)` compile; anything else gets a clear
-                // "unsupported" error instead of a confusing parse error at the
-                // `::`.
-                if name == "std" && self.peek() == Some(&Tok::ColonColon) {
-                    return self.parse_std_path();
+                // `std::...` paths, or a module brought in by `use std::m;`, for
+                // the handful of std items rmc provides. Flattening the path
+                // lets `std::process::exit(0)` and `std::hint::black_box(x)`
+                // compile; an unrecognised path is left to the normal `::`
+                // handling below (so a struct named like a module still works).
+                if self.peek() == Some(&Tok::ColonColon) && self.std_mods.contains(&name) {
+                    if let Some(e) = self.try_parse_std_path(&name)? {
+                        return Ok(e);
+                    }
                 }
                 // `Enum::Variant` or `Enum::Variant(args)` — resolved and
                 // range-checked by sema.

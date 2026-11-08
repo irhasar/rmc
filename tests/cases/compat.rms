@@ -1,6 +1,9 @@
-// The rmc twin of `compat.rs`. rmc ignores `use` and lowers `std::hint::black_box`
-// to the identity and `std::process::exit` to the `exit` syscall; `assert!` and
-// friends become `if !(cond) { exit(101) }`.
+// The rmc twin of `compat.rs`. rmc ignores `use` but records a `std` subtree,
+// so `use std::process;` makes a later `process::exit` resolve; it lowers
+// `std::hint::black_box` to the identity and `std::process::exit` to the `exit`
+// syscall; `assert!` and friends become `if !(cond) { exit(101) }`.
+use std::process;
+
 fn twice(x: i64) -> i64 { std::hint::black_box(x) * 2 }
 
 fn main() -> i64 {
@@ -13,7 +16,7 @@ fn main() -> i64 {
     }
     print_i64(n);
     if n == 42 {
-        std::process::exit(0);
+        process::exit(0);
     }
     print_i64(99);
     return 0;
