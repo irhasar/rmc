@@ -1686,7 +1686,7 @@ fn parse_rvalue(s: &str) -> Result<Rvalue, String> {
             // `...ArgumentType::<'_>::Placeholder { .. }`), so those are
             // normalised to a bare name instead of being mistaken for variants.
             let name = normalize_fmt_struct(name);
-            if name.contains("::") {
+            if name.contains("::") && is_enum_variant_name(name) {
                 return Ok(Rvalue::Enum { name: name.to_string(), ops });
             }
             return Ok(Rvalue::Aggregate(ops));
@@ -2311,6 +2311,22 @@ fn normalize_fmt_struct(name: &str) -> &str {
         return last;
     }
     name
+}
+
+/// Whether a struct-literal path names an enum variant rather than a struct.
+///
+/// rustc prints both struct and enum literals with a full path. A generic
+/// *struct* ends with its type's generics (`std::slice::Iter::<'_, i32>`),
+/// while an enum *variant* has a path segment after the type's generics
+/// (`core::option::Option::<i64>::Some`) or no generics at all
+/// (`core::option::Option::Some`). Treating a generic struct as a variant
+/// adds a phantom tag word and shifts every field by one, which silently
+/// corrupts the value.
+fn is_enum_variant_name(name: &str) -> bool {
+    match name.rfind("::<") {
+        None => true,
+        Some(i) => name[i + 3..].contains("::"),
+    }
 }
 
 /// Function arguments, as `(local index, type)` pairs. The index matters: MIR

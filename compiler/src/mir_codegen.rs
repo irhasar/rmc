@@ -967,13 +967,46 @@ impl<'a> FnGen<'a> {
     /// Compute each local's size and type, and find the operands of counted
     /// loop tests (`switchInt(Lt(counter, bound))`).
     fn analyze(&mut self) {
+        // A local whose declared type the backend does not model (`Ty::Other`)
+        // may still be built from a multi-field aggregate literal: a
+        // `std::slice::Iter` is `Ty::Other` but holds two words. Sizing such a
+        // local from its type alone would give it one word, so its second field
+        // would land in a neighbouring local's frame. The region is widened to
+        // the widest aggregate stored into it.
+        let mut agg_size = vec![0i64; self.func.locals.len()];
+        for b in &self.func.blocks {
+            for s in &b.stmts {
+                let Stmt::Assign(dest, rv) = s else { continue };
+                if !dest.proj.is_empty() {
+                    continue;
+                }
+                let extent = match rv {
+                    Rvalue::Aggregate(ops) | Rvalue::Array(ops) => ops
+                        .iter()
+                        .map(|op| self.size_of_ty(&rv_operand_ty(self.func, op)))
+                        .sum::<i64>(),
+                    Rvalue::Enum { name, ops } => {
+                        let en = split_ev(name).0;
+                        match self.enums.get(&en) {
+                            Some(l) => l.size.max(8),
+                            None => 8 + ops.len() as i64 * 8,
+                        }
+                    }
+                    _ => 0,
+                };
+                let idx = dest.local as usize;
+                if let Some(slot) = agg_size.get_mut(idx) {
+                    *slot = (*slot).max(extent);
+                }
+            }
+        }
         // Give every local its own region sized to its type: an aggregate such
         // as `[i64; 200000]` needs 1.6 MB of frame, not one 8-byte slot. A
         // scalar takes one slot. Regions are laid out first so `local_base` can
         // be indexed directly.
         let mut slot = 0i64;
-        for l in &self.func.locals {
-            let size = self.size_of_ty(&l.ty);
+        for (i, l) in self.func.locals.iter().enumerate() {
+            let size = self.size_of_ty(&l.ty).max(agg_size[i]);
             let slots = ((size + 7) / 8).max(1);
             self.ty.push((*l.ty).clone());
             self.size.push(size);
