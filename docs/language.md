@@ -788,8 +788,10 @@ Two `std` items are provided so ordinary Rust can be compiled unchanged:
 | `std::hint::black_box(x)`   | the identity (`x`)           |
 
 `use` statements are parsed and discarded at the top level and inside a block:
-rmc resolves every name globally, so an import has nothing to do. Any other
-`std::` path is a compile error.
+rmc resolves every name globally, so an import has nothing to do. A `use` of a
+`std` subtree is remembered, though, so after `use std::process;` a later
+`process::exit(0)` resolves to the same item as the full `std::process::exit`.
+Any other `std::` path is a compile error.
 
 ## Not supported
 

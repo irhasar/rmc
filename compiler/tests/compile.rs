@@ -5505,3 +5505,45 @@ fn a_builtin_integer_method_on_a_struct_is_not_shadowed() {
     );
     assert!(out.contains("main:"));
 }
+
+#[test]
+fn std_paths_lower_to_the_items_rmc_provides() {
+    // `std::process::exit` becomes the `exit` builtin, so its call survives to
+    // codegen; `std::hint::black_box` is the identity, so it adds no call.
+    let e = asm_no_inline("fn main() -> i64 { std::process::exit(7); return 0; }");
+    assert!(e.contains("call exit"), "std::process::exit lowers to `exit`:\n{e}");
+    let b = asm_no_inline("fn main() -> i64 { return std::hint::black_box(5); }");
+    assert!(!b.contains("black_box"), "black_box is the identity:\n{b}");
+    assert!(b.contains("mov $5, %rax"), "the value flows through unchanged:\n{b}");
+}
+
+#[test]
+fn a_use_of_a_std_module_aliases_its_path() {
+    // `use std::process;` records the module, so a later `process::exit(0)`
+    // resolves to the same item as the full path (and, with the brace form,
+    // `hint::black_box` too).
+    let out = asm_no_inline(
+        "use std::{process, hint}; \
+         fn main() -> i64 { let n = hint::black_box(4); process::exit(n); return 0; }",
+    );
+    assert!(out.contains("call exit"), "the aliased `exit` lowers:\n{out}");
+}
+
+#[test]
+fn a_use_inside_a_block_is_skipped() {
+    let out = asm_no_inline("fn main() -> i64 { use std::hint; return hint::black_box(3); }");
+    assert!(out.contains("main:"));
+}
+
+#[test]
+fn an_unknown_std_path_is_a_clear_error() {
+    let err = compile_to_asm(
+        "fn main() -> i64 { let x = std::collections::HashMap::new(); return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("unsupported path `std::collections::HashMap`"),
+        "unknown std path is diagnosed:\n{err}"
+    );
+}
