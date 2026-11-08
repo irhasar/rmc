@@ -59,6 +59,7 @@ python3 tools/fuzz.py --mode intmeth --n 500 --seed 1
 python3 tools/fuzz.py --mode nestedfn --n 500 --seed 1
 python3 tools/fuzz.py --mode typealias --n 500 --seed 1
 python3 tools/fuzz.py --mode printfmt --n 500 --seed 1
+python3 tools/fuzz.py --mode char --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 
 # robustness / soundness: rmc must error cleanly, never crash
@@ -678,6 +679,17 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   `if`-with-a-lone-`break`/`continue`
   fast path in `bare_exit` only fires for an *unlabelled* `break`/`continue`,
   since a labelled one may leave an outer loop.
+- **`'` starts a `char` literal or a loop label, and the lexer decides by lookahead.**
+  It is a `char` literal when the byte after `'` is a backslash escape, an
+  immediate `'` (`''`), or a full UTF-8 sequence followed by `'`; otherwise it
+  is a label. This mirrors rustc, where a label is never followed by a lone
+  quote. A `char` *range* pattern (`'a'..='z'`) is built in `maybe_char_range`:
+  after a `char` literal, a following `..`/`..=` consumes a second `char`
+  literal as the upper bound. The upper bound must be a `char` literal (a bare
+  `5` is rejected) and an empty range (`'a'..'a'`, `'z'..'a'`) is rejected, as
+  rustc rejects them (E0579/E0308). `Pat::CharRange` lowers to the same
+  `lo <= s && s <= hi` comparisons as `Pat::Range`, so sema and codegen need no
+  new case.
 - **A `for` bound is compared directly when it is a constant, and through a
   hidden slot otherwise.** `0..=1000` needs no `end_slot`: the guard is
   `cmp $1000, %rax`, so no frame word is written and no reload happens each
@@ -1641,8 +1653,14 @@ notes and "Soundness checks").
 The macro surface is lowered at parse time and is deliberately tiny.
 `print!`/`println!` take a literal format string and rewrite each `{}` to a
 `__rmc_print` call whose argument's checked type picks the runtime writer
-(`__rmc_write_i64`, `__rmc_write_bool`, `__rmc_write_str`); `println!` appends
-the newline itself. `assert!`/`assert_eq!`/`assert_ne!`/`panic!`/`unreachable!`/
+(`__rmc_write_i64`, `__rmc_write_bool`, `__rmc_write_str`, `__rmc_write_char`);
+`println!` appends the newline itself. The `char` type is a distinct scalar
+(a Unicode scalar value in an 8-byte slot, so `c + 1` is rejected); its
+literals take the usual escapes, `as i64` yields the code point, and `match`
+accepts `'a'..='z'` / `'a'..'z'` range arms (lowered to the same two
+comparisons as an integer range; an empty range or a non-`char` bound is
+rejected). The `print_char(c)` builtin writes the UTF-8 bytes then a newline.
+`assert!`/`assert_eq!`/`assert_ne!`/`panic!`/`unreachable!`/
 `todo!`/`unimplemented!` desugar to `if !(cond) { exit(101) }` (or a bare
 `exit(101)`), so a failure matches rustc's panic exit code; the message
 arguments are parsed and discarded. `use` items are skipped at the top level
