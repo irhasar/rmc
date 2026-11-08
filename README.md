@@ -465,9 +465,11 @@ Two benchmarks need a word of caution when reading their ratio:
 rmc is a small, self-contained compiler, not a drop-in replacement for rustc.
 
 - The language subset is small (see `docs/language.md`). Structs, arrays, `for`,
-  aggregates across calls, overflow checks, integer `match`, enums and
-  references exist; traits, generics, borrowing, closures, floating point and
-  the standard library do not. An aggregate is passed by value through a hidden
+  aggregates across calls, overflow checks, integer `match`, enums,
+  references, the `print!`/`println!` and `assert!` families, and `use`/`std`
+  paths exist; traits, generics, borrowing, closures, floating point and the
+  standard library beyond `std::process::exit` / `std::hint::black_box` do not.
+  An aggregate is passed by value through a hidden
   pointer unless a reference (`&T` / `&self`) is used, which passes the address
   and copies nothing. References are not checked: nothing proves a reference
   outlives its referent, and `&mut` carries no exclusivity guarantee.
