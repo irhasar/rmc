@@ -458,7 +458,9 @@ impl Elf {
                 self.sections[sec].data.extend_from_slice(&[0x48, 0x99]);
                 Ok(())
             }
-            "sal" | "shl" | "sar" | "shr" => self.enc_shift(mnem, &ops, sec),
+            "sal" | "shl" | "sar" | "shr" | "rol" | "ror" => {
+                self.enc_shift(mnem, &ops, sec)
+            }
             "jmp" => {
                 self.sections[sec].data.push(0xE9);
                 self.pc_rel(sec, &ops[0]);
@@ -882,6 +884,8 @@ impl Elf {
             "sal" | "shl" => 4u8,
             "shr" => 5,
             "sar" => 7,
+            "rol" => 0,
+            "ror" => 1,
             _ => unreachable!(),
         };
         let (reg, _) = parse_reg(&ops[1])?;
@@ -1547,5 +1551,21 @@ mod tests {
         let mut e = test_elf(0x5);
         e.instruction("bswap %r9", 0).unwrap();
         assert_eq!(e.sections[0].data[3..], [0x49, 0x0F, 0xC9]);
+    }
+
+    #[test]
+    fn rotate_uses_group2_slash0_and_slash1() {
+        // `rol`/`ror` share group-2 with `shl`/`shr`/`sar` but use /0 and /1.
+        // The count-by-`%cl` form is `D3`, the immediate form `C1`; `%r9` needs
+        // REX.B. All four match `as`.
+        let mut e = test_elf(0x5);
+        e.instruction("rol %cl, %rax", 0).unwrap();
+        assert_eq!(e.sections[0].data[3..], [0x48, 0xD3, 0xC0]);
+        let mut e = test_elf(0x5);
+        e.instruction("ror %cl, %rax", 0).unwrap();
+        assert_eq!(e.sections[0].data[3..], [0x48, 0xD3, 0xC8]);
+        let mut e = test_elf(0x5);
+        e.instruction("rol $3, %r9", 0).unwrap();
+        assert_eq!(e.sections[0].data[3..], [0x49, 0xC1, 0xC1, 0x03]);
     }
 }

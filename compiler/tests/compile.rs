@@ -5173,6 +5173,7 @@ fn the_bit_methods_evaluate_the_receiver_once() {
         ("reverse_bits", "__rmc_reverse_bits"),
         ("leading_ones", "__rmc_leading_zeros"),
         ("trailing_ones", "__rmc_trailing_zeros"),
+        ("count_zeros", "__rmc_count_ones"),
     ] {
         let out = asm_no_inline(&format!(
             "fn g() -> i64 {{ return 3; }} \
@@ -5186,8 +5187,9 @@ fn the_bit_methods_evaluate_the_receiver_once() {
 
 #[test]
 fn the_ones_methods_invert_before_the_zero_helper() {
-    // `leading_ones`/`trailing_ones` are the zero counts on `!x`, so the helper
-    // is preceded by a `not` of the receiver and no dedicated piece exists.
+    // `leading_ones`/`trailing_ones`/`count_zeros` are the zero counts on `!x`,
+    // so the helper is preceded by a `not` of the receiver and no dedicated
+    // piece exists.
     let lead = asm_no_inline("fn main() -> i64 { return 5.leading_ones(); }");
     let lbody = &lead[lead.find("main:").expect("main")..];
     assert!(lbody.contains("not %rax"), "`!x` before the count:\n{lbody}");
@@ -5196,6 +5198,31 @@ fn the_ones_methods_invert_before_the_zero_helper() {
     let tbody = &trail[trail.find("main:").expect("main")..];
     assert!(tbody.contains("not %rax"), "`!x` before the count:\n{tbody}");
     assert!(tbody.contains("call __rmc_trailing_zeros"), "zeros helper reused:\n{tbody}");
+    let cz = asm_no_inline("fn main() -> i64 { return 5.count_zeros(); }");
+    let cbody = &cz[cz.find("main:").expect("main")..];
+    assert!(cbody.contains("not %rax"), "`!x` before the count:\n{cbody}");
+    assert!(cbody.contains("call __rmc_count_ones"), "ones helper reused:\n{cbody}");
+}
+
+#[test]
+fn the_rotates_call_their_helper_with_value_and_count() {
+    // `rotate_left`/`rotate_right` bind the receiver, then the count, and pass
+    // both to a helper; each operand is evaluated once.
+    for (m, helper) in [
+        ("rotate_left", "__rmc_rotate_left"),
+        ("rotate_right", "__rmc_rotate_right"),
+    ] {
+        let out = asm_no_inline(&format!(
+            "fn g() -> i64 {{ return 3; }} \
+             fn main() -> i64 {{ return g().{m}(g()); }}"
+        ));
+        let body = &out[out.find("main:").expect("main")..];
+        assert_eq!(body.matches("call g").count(), 2, "{m}: each operand once:\n{body}");
+        assert!(body.contains(&format!("call {helper}")), "{m}: helper called:\n{body}");
+    }
+    // The helper rotates with `rol`/`ror`, no loop.
+    let out = asm("fn main() -> i64 { return 5.rotate_left(3); }");
+    assert!(out.contains("rol %cl, %rax"), "rol in the helper:\n{out}");
 }
 
 #[test]
@@ -5229,11 +5256,25 @@ fn a_bit_method_argument_is_rejected() {
         "reverse_bits",
         "leading_ones",
         "trailing_ones",
+        "count_zeros",
     ] {
         let bad = format!("fn main() -> i64 {{ return 1.{m}(2); }}");
         assert!(
             compile_to_asm(&bad, &CompileOptions::default()).is_err(),
             "`{m}` takes no arguments"
+        );
+    }
+    // The rotates take exactly one.
+    for m in ["rotate_left", "rotate_right"] {
+        let none = format!("fn main() -> i64 {{ return 1.{m}(); }}");
+        assert!(
+            compile_to_asm(&none, &CompileOptions::default()).is_err(),
+            "`{m}` needs an argument"
+        );
+        let two = format!("fn main() -> i64 {{ return 1.{m}(2, 3); }}");
+        assert!(
+            compile_to_asm(&two, &CompileOptions::default()).is_err(),
+            "`{m}` takes one argument"
         );
     }
 }
@@ -5250,6 +5291,8 @@ fn the_bit_helpers_are_pulled_in_only_when_used() {
         "__rmc_trailing_zeros",
         "__rmc_swap_bytes",
         "__rmc_reverse_bits",
+        "__rmc_rotate_left",
+        "__rmc_rotate_right",
     ] {
         assert!(!out.contains(h), "{h} dropped when unused:\n{out}");
     }
@@ -5264,6 +5307,11 @@ fn the_bit_helpers_are_pulled_in_only_when_used() {
     assert!(ones.contains("__rmc_leading_zeros:"));
     assert!(!ones.contains("__rmc_trailing_zeros:"));
     assert!(!ones.contains("__rmc_swap_bytes:"));
+    // A rotate pulls in only its own helper.
+    let rot = asm("fn main() -> i64 { return 5.rotate_left(3); }");
+    assert!(rot.contains("__rmc_rotate_left:"));
+    assert!(!rot.contains("__rmc_rotate_right:"));
+    assert!(!rot.contains("__rmc_count_ones:"));
 }
 
 #[test]

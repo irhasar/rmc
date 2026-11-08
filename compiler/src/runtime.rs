@@ -753,6 +753,38 @@ __rmc_reverse_bits:
 "#,
         defines: &["__rmc_reverse_bits"],
     },
+    Piece {
+        text: r#"
+# long __rmc_rotate_left(long x, long n)  -- the bits rotated left by `n`. The
+# count goes in `%cl`, and `rol %cl` masks it to 6 bits (0..63) in hardware,
+# exactly Rust's `n % 64`; `n` is never negated, so the result is exact for
+# every input and does not depend on `--overflow-checks`.
+.globl __rmc_rotate_left
+.type __rmc_rotate_left, @function
+__rmc_rotate_left:
+    mov %rdi, %rax           # value
+    mov %rsi, %rcx           # count (masked to 6 bits by the instruction)
+    rol %cl, %rax
+    ret
+.size __rmc_rotate_left, .-__rmc_rotate_left
+"#,
+        defines: &["__rmc_rotate_left"],
+    },
+    Piece {
+        text: r#"
+# long __rmc_rotate_right(long x, long n)  -- the bits rotated right by `n`. The
+# mirror of `__rmc_rotate_left`; `ror %cl` masks the count to 6 bits.
+.globl __rmc_rotate_right
+.type __rmc_rotate_right, @function
+__rmc_rotate_right:
+    mov %rdi, %rax           # value
+    mov %rsi, %rcx           # count (masked to 6 bits by the instruction)
+    ror %cl, %rax
+    ret
+.size __rmc_rotate_right, .-__rmc_rotate_right
+"#,
+        defines: &["__rmc_rotate_right"],
+    },
 ];
 
 /// The identifiers in `src`, with `#`-to-end-of-line comments dropped. Matching
