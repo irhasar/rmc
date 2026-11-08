@@ -158,4 +158,30 @@ fn main() {
     // Chained, and on a call result.
     println!("{}", a.swap_bytes().reverse_bits());
     println!("{}", pick(-5, 9).reverse_bits());
+
+    // `count_zeros`: the mirror of `count_ones`, `count_ones(!x)`.
+    println!("{}", z.count_zeros());
+    println!("{}", a.count_zeros());
+    println!("{}", MIN.count_zeros());
+    println!("{}", mx.count_zeros());
+    println!("{}", ones.count_zeros());
+
+    // `rotate_left` / `rotate_right`: the count is taken mod 64, so 64 is a full
+    // turn (the identity) and 65 wraps to 1. Exact for every count.
+    println!("{}", z.rotate_left(1));
+    println!("{}", a.rotate_left(3));
+    println!("{}", a.rotate_right(3));
+    println!("{}", MIN.rotate_left(1));
+    println!("{}", mx.rotate_left(1));
+    println!("{}", ones.rotate_left(5));
+    println!("{}", ones.rotate_right(5));
+    println!("{}", a.rotate_left(0));
+    println!("{}", a.rotate_left(64));
+    println!("{}", a.rotate_left(65));
+    println!("{}", a.rotate_right(64));
+    println!("{}", a.rotate_left(63));
+    println!("{}", MIN.rotate_left(64));
+    println!("{}", mx.rotate_right(1));
+    println!("{}", a.rotate_left(1).count_ones());
+    println!("{}", pick(1, 2).rotate_right(1));
 }

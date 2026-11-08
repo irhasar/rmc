@@ -1924,8 +1924,16 @@ def gen_intmeth_program(rng):
             m = rng.choice([
                 "count_ones", "leading_zeros", "trailing_zeros",
                 "leading_ones", "trailing_ones", "swap_bytes", "reverse_bits",
+                "count_zeros",
             ])
             return f"({recv()}).{m}()"
+        if k < 0.94:
+            # A rotate: the count is a small non-negative literal, so the same
+            # source is valid in rmc (`i64` count) and rustc (`u32` count). The
+            # `64`/`65` counts exercise the hardware `% 64` mask.
+            m = rng.choice(["rotate_left", "rotate_right"])
+            n = rng.choice(["0", "1", "7", "31", "63", "64", "65"])
+            return f"({recv()}).{m}({n})"
         m = rng.choice(["div_euclid", "rem_euclid"])
         return f"({recv()}).{m}({divisor()})"
 
@@ -1982,17 +1990,27 @@ def gen_intmeth_program(rng):
     for m in [
         "count_ones", "leading_zeros", "trailing_zeros",
         "leading_ones", "trailing_ones", "swap_bytes", "reverse_bits",
+        "count_zeros",
     ]:
         exprs.append(f"(ZERO).{m}()")
         exprs.append(f"(MIN).{m}()")
         exprs.append(f"(MAX).{m}()")
         exprs.append(f"(ONES).{m}()")
+    # The rotates, pinned at the edges and at the count-mask boundaries: `64`
+    # is a full turn (the identity), `65` wraps to `1`, `0` is the identity, and
+    # `63` is the largest real rotation.
+    for m in ["rotate_left", "rotate_right"]:
+        for n in ["0", "1", "63", "64", "65"]:
+            for v in ["ZERO", "MIN", "MAX", "ONES"]:
+                exprs.append(f"({v}).{m}({n})")
     # A chain: the outer method's receiver is another method call, so the inner
     # result flows into the helper as a computed value.
     exprs.append("(MAX).count_ones().trailing_zeros()")
     exprs.append("(MIN).leading_zeros().count_ones()")
     exprs.append("(ONES).swap_bytes().reverse_bits()")
     exprs.append("(MIN).reverse_bits().leading_ones()")
+    exprs.append("(ONES).rotate_left(13).count_ones()")
+    exprs.append("(MIN).rotate_right(1).count_zeros()")
     # A chain, so the outer method's receiver is another method call.
     exprs.append(f"({call()}).min({call()})")
     exprs.append(f"({call()}).is_positive() as i64")

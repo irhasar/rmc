@@ -105,9 +105,9 @@ variant of that enum and not an associated function is reported as such.
 
 ### Built-in integer methods
 
-An `i64` receiver has sixteen methods built in, which desugar to the operators
+An `i64` receiver has nineteen methods built in, which desugar to the operators
 rmc already lowers (so they cost no call, except `clamp`, for its panic, and the
-seven bit methods below, for their per-bit work):
+ten bit methods below, for their per-bit work):
 
 | call                    | meaning                                        |
 | ----------------------- | ---------------------------------------------- |
@@ -121,19 +121,22 @@ seven bit methods below, for their per-bit work):
 | `x.div_euclid(y)`       | `x / y` rounded toward the mathematical quotient |
 | `x.rem_euclid(y)`       | the remainder in `[0, abs(y))`                  |
 | `x.count_ones()`        | the number of set bits                          |
+| `x.count_zeros()`       | the number of clear bits                        |
 | `x.leading_zeros()`     | the zeros above the top set bit (64 when `x` is 0) |
 | `x.trailing_zeros()`    | the zeros below the low set bit (64 when `x` is 0) |
 | `x.leading_ones()`      | the ones above the low zero bit (0 when `x` is -1) |
 | `x.trailing_ones()`     | the ones below the high zero bit (0 when `x` is -1) |
 | `x.swap_bytes()`        | the byte order reversed                         |
 | `x.reverse_bits()`      | the bit order reversed                          |
+| `x.rotate_left(n)`      | the bits rotated left by `n % 64`               |
+| `x.rotate_right(n)`     | the bits rotated right by `n % 64`              |
 
 The semantics match `rustc -O`: `i64::MIN.abs()` is `i64::MIN` (it does not
 trap; with `--overflow-checks` it traps, as in a debug build), and `signum` is
 computed with comparisons only, so `i64::MIN.signum()` is `-1` without overflow.
-`is_positive`/`is_negative` return `bool` — unlike the twelve arithmetic and bit
-methods, which return `i64` — and `0` is neither positive nor negative, so both
-are `false` there.
+`is_positive`/`is_negative` return `bool` — unlike the seventeen arithmetic and
+bit methods, which return `i64` — and `0` is neither positive nor negative, so
+both are `false` there.
 `div_euclid`/`rem_euclid` compute `q = x / y` and `r = x % y` and round toward
 the mathematical quotient: when `r` is negative, `q` moves one step further from
 zero and `r` gains `abs(y)`. They reuse `/` and `%`, so a zero divisor and
@@ -145,8 +148,10 @@ The bit methods each lower to a small runtime helper rather than to operators:
 `x & (x - 1)` would overflow for `i64::MIN`, whereas a loop over the 64 bits is
 exact for every input, so the result is the same with and without
 `--overflow-checks`. `swap_bytes` is a single `bswap`; `reverse_bits` is a
-per-bit loop. `leading_ones`/`trailing_ones` reuse the zero counts on `!x`
-(`leading_ones(x)` is `leading_zeros(!x)`), so they need no helper of their own.
+per-bit loop; the rotates are a single `rol`/`ror`, whose hardware `% 64` count
+mask is exactly Rust's. `leading_ones`/`trailing_ones`/`count_zeros` reuse the
+counts on `!x` (`leading_ones(x)` is `leading_zeros(!x)`, `count_zeros(x)` is
+`count_ones(!x)`), so they need no helper of their own.
 Like `clamp`, each helper is linked only when its method is used.
 Each method evaluates its receiver — and, for the two-argument methods, its
 arguments — exactly once, so `g().abs()` calls `g` once. A method of the same

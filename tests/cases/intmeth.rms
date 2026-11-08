@@ -158,5 +158,31 @@ fn main() -> i64 {
     // Chained, and on a call result.
     print_i64(a.swap_bytes().reverse_bits());
     print_i64(pick(-5, 9).reverse_bits());
+
+    // `count_zeros`: the mirror of `count_ones`, `count_ones(!x)`.
+    print_i64(z.count_zeros());
+    print_i64(a.count_zeros());
+    print_i64(MIN.count_zeros());
+    print_i64(mx.count_zeros());
+    print_i64(ones.count_zeros());
+
+    // `rotate_left` / `rotate_right`: the count is taken mod 64, so 64 is a full
+    // turn (the identity) and 65 wraps to 1. Exact for every count.
+    print_i64(z.rotate_left(1));
+    print_i64(a.rotate_left(3));
+    print_i64(a.rotate_right(3));
+    print_i64(MIN.rotate_left(1));
+    print_i64(mx.rotate_left(1));
+    print_i64(ones.rotate_left(5));
+    print_i64(ones.rotate_right(5));
+    print_i64(a.rotate_left(0));
+    print_i64(a.rotate_left(64));
+    print_i64(a.rotate_left(65));
+    print_i64(a.rotate_right(64));
+    print_i64(a.rotate_left(63));
+    print_i64(MIN.rotate_left(64));
+    print_i64(mx.rotate_right(1));
+    print_i64(a.rotate_left(1).count_ones());
+    print_i64(pick(1, 2).rotate_right(1));
     return 0;
 }

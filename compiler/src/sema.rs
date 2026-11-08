@@ -157,7 +157,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     // Runtime helpers provided by the freestanding assembly runtime. They are
     // linked in automatically, so they do not appear in the source program.
-    let builtins: [(&str, &[Type], Type); 15] = [
+    let builtins: [(&str, &[Type], Type); 17] = [
         ("print_i64", &[Type::I64], Type::Unit),
         ("print_str", &[Type::Str], Type::Unit),
         ("print_bool", &[Type::Bool], Type::Unit),
@@ -183,6 +183,10 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         // take the receiver by value and return the transformed value as `i64`.
         ("__rmc_swap_bytes", &[Type::I64], Type::I64),
         ("__rmc_reverse_bits", &[Type::I64], Type::I64),
+        // The rotates take the value and the count, so they are the only bit
+        // helpers with two parameters.
+        ("__rmc_rotate_left", &[Type::I64, Type::I64], Type::I64),
+        ("__rmc_rotate_right", &[Type::I64, Type::I64], Type::I64),
     ];
     for (name, params, ret) in builtins {
         sigs.insert(
@@ -904,7 +908,7 @@ impl Sema {
             // `leading_ones`/`trailing_ones` reuse the zero counts on `!x`,
             // which is `xor $-1` and cannot overflow.
             "count_ones" | "leading_zeros" | "trailing_zeros" | "swap_bytes"
-            | "reverse_bits" | "leading_ones" | "trailing_ones" => {
+            | "reverse_bits" | "leading_ones" | "trailing_ones" | "count_zeros" => {
                 if !args.is_empty() {
                     return Err(format!("method `{name}` takes no arguments"));
                 }
@@ -918,17 +922,47 @@ impl Sema {
                     // the trailing form: inverting the bits swaps which side is
                     // being counted, so the negated value is handed to the zero
                     // helper rather than to a dedicated piece. `!` is `not`,
-                    // which cannot overflow.
+                    // which cannot overflow. `count_zeros(x)` is the mirror of
+                    // `count_ones(x)`: the count of set bits in `!x`.
                     "leading_ones" => {
                         ("__rmc_leading_zeros", Expr::Un(UnOp::Not, Box::new(x)))
                     }
-                    _ => ("__rmc_trailing_zeros", Expr::Un(UnOp::Not, Box::new(x))),
+                    "trailing_ones" => {
+                        ("__rmc_trailing_zeros", Expr::Un(UnOp::Not, Box::new(x)))
+                    }
+                    _ => ("__rmc_count_ones", Expr::Un(UnOp::Not, Box::new(x))),
                 };
                 (
                     Expr::Call {
                         name: helper.into(),
                         args: vec![arg],
                         arg_slots: vec![(-1, 0)],
+                        ret_slot: -1,
+                        ret_ty: Type::I64,
+                    },
+                    Type::I64,
+                )
+            }
+            // The rotates lower to a helper with the count as a second argument.
+            // `rol`/`ror` mask the count to 6 bits in hardware, which is exactly
+            // Rust's `n % 64`, so every count is accepted (no panic) and the
+            // result is the same with and without `--overflow-checks`. The
+            // receiver is bound first, then the count, so each operand runs once.
+            "rotate_left" | "rotate_right" => {
+                if args.len() != 1 {
+                    return Err(format!("method `{name}` takes exactly one argument"));
+                }
+                let n = bind(self, args[0].clone(), &mut stmts);
+                let helper = if name == "rotate_left" {
+                    "__rmc_rotate_left"
+                } else {
+                    "__rmc_rotate_right"
+                };
+                (
+                    Expr::Call {
+                        name: helper.into(),
+                        args: vec![x, n],
+                        arg_slots: vec![(-1, 0), (-1, 0)],
                         ret_slot: -1,
                         ret_ty: Type::I64,
                     },
@@ -2613,6 +2647,9 @@ impl Sema {
                             | "reverse_bits"
                             | "leading_ones"
                             | "trailing_ones"
+                            | "count_zeros"
+                            | "rotate_left"
+                            | "rotate_right"
                     )
                 {
                     // `abs` synthesises `-x`, a compiler-generated negation, so
