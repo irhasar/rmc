@@ -289,7 +289,8 @@ or field, compared by content with `==`/`!=`/`<`/`<=`/`>`/`>=`, with `.len()` fo
 the byte length); array `.len()` (a compile-time constant); built-in `i64` methods
 (`x.abs()`, `x.signum()`, `x.min(y)`, `x.max(y)`, `x.clamp(lo, hi)`,
 `x.is_positive()`, `x.is_negative()`, `x.div_euclid(y)`, `x.rem_euclid(y)`,
-`x.count_ones()`, `x.leading_zeros()`, `x.trailing_zeros()`, desugared to
+`x.count_ones()`, `x.leading_zeros()`, `x.trailing_zeros()`, `x.leading_ones()`,
+`x.trailing_ones()`, `x.swap_bytes()`, `x.reverse_bits()`, desugared to
 operators or a small runtime helper, so `i64::MIN.abs()` maps to itself as in
 `rustc -O`);
 `mut` enforcement and definite

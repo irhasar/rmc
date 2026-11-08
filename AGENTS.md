@@ -894,6 +894,10 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   real bug:
   - Group opcodes: `inc`/`dec` are group-5 (`FF /0,/1`) but `not`/`neg` are
     group-3 (`F7 /2,/3`). `FF /3` is `call far`, which faults at run time.
+  - `bswap %r64` (`0F C8+rd`) names its operand in the low three opcode bits,
+    *not* in ModRM: there is no ModRM byte, so the register index is REX.B
+    (`rex(true, 0, reg)`), and a `%r8`-`%r15` operand needs `0x49`, not `0x44`.
+    Using the REX.R helper here would silently swap the wrong register.
   - ModRM direction: for `mov src, dst` and `op src, dst` the *source* is the
     reg field (REX.R) and the *destination* is r/m (REX.B). Swapping them
     silently moves the wrong register.
@@ -1381,16 +1385,17 @@ The checks, all in `sema.rs`:
   where rustc's is `usize`, so a differential twin casts with `as i64`.
 - **Built-in `i64` methods
   (`abs`/`min`/`max`/`clamp`/`signum`/`is_positive`/`is_negative`/
-  `div_euclid`/`rem_euclid`/`count_ones`/`leading_zeros`/`trailing_zeros`).**
+  `div_euclid`/`rem_euclid`/`count_ones`/`leading_zeros`/`trailing_zeros`/
+  `leading_ones`/`trailing_ones`/`swap_bytes`/`reverse_bits`).**
   Like `len()`, they
   are special-cased in the `MethodCall` arm of sema before the struct/enum lookup,
   and only when the receiver's type is `i64`, so a user `min` on a struct is
   untouched. `desugar_i64_method` rewrites the call into an expression over the
   operators rmc already lowers, so codegen gains no case
-  (`clamp`'s `min > max` panic and the three bit counts are the exceptions — a
+  (`clamp`'s `min > max` panic and the seven bit methods are the exceptions — a
   call to the `__rmc_clamp` / `__rmc_count_ones` / `__rmc_leading_zeros` /
-  `__rmc_trailing_zeros` runtime pieces, each linked only when its method
-  appears):
+  `__rmc_trailing_zeros` / `__rmc_swap_bytes` / `__rmc_reverse_bits` runtime
+  pieces, each linked only when its method appears):
   `abs` is `if x < 0 { -x } else { x }` (so `i64::MIN` maps to itself, matching
   `rustc -O`; under `--overflow-checks` the `neg` traps, matching a debug build),
   `signum` is `(x > 0) as i64 - (x < 0) as i64` (comparisons only, so `i64::MIN`
@@ -1415,7 +1420,12 @@ The checks, all in `sema.rs`:
   bit trick overflows for `i64::MIN`, and rustc's answer for `MIN` is exact
   (`count_ones` 1, `leading_zeros` 0, `trailing_zeros` 63), so each helper is a
   plain loop over the 64 bits that neither negates nor decrements — the result
-  is the same with and without `--overflow-checks`. They reuse the same
+  is the same with and without `--overflow-checks`. `swap_bytes` is the same
+  shape with a single `bswap` (`enc_bswap` in the encoder: `0F C8+rd`), and
+  `reverse_bits` is a per-bit loop. `leading_ones`/`trailing_ones` need no piece
+  of their own: `leading_ones(x)` is `leading_zeros(!x)` and `trailing_ones(x)`
+  is `trailing_zeros(!x)`, so the desugar wraps the receiver in `!` (`not`, which
+  cannot overflow) and calls the zero helper. They reuse the same
   bind-receiver-once path, so `g().count_ones()` calls `g` once, and the
   `call`/`defines` pruning drops each helper unless its method appears.
   Each desugar reads an operand more than once, so every non-trivial operand is

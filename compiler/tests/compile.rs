@@ -5236,16 +5236,47 @@ fn clamp_pulls_in_the_trap_helper_only_when_used() {
 #[test]
 fn the_bit_methods_evaluate_the_receiver_once() {
     // Each bit method binds a non-trivial receiver to a temp first, so a call
-    // receiver runs a single time, then hands it to its runtime helper.
-    for m in ["count_ones", "leading_zeros", "trailing_zeros"] {
+    // receiver runs a single time, then hands it to its runtime helper. The
+    // `*_ones` forms reuse the zero-count helpers on `!x`.
+    for (m, helper) in [
+        ("count_ones", "__rmc_count_ones"),
+        ("leading_zeros", "__rmc_leading_zeros"),
+        ("trailing_zeros", "__rmc_trailing_zeros"),
+        ("swap_bytes", "__rmc_swap_bytes"),
+        ("reverse_bits", "__rmc_reverse_bits"),
+        ("leading_ones", "__rmc_leading_zeros"),
+        ("trailing_ones", "__rmc_trailing_zeros"),
+    ] {
         let out = asm_no_inline(&format!(
             "fn g() -> i64 {{ return 3; }} \
              fn main() -> i64 {{ return g().{m}(); }}"
         ));
         let body = &out[out.find("main:").expect("main")..];
         assert_eq!(body.matches("call g").count(), 1, "{m}: receiver called once:\n{body}");
-        assert!(body.contains(&format!("call __rmc_{m}")), "{m}: helper called:\n{body}");
+        assert!(body.contains(&format!("call {helper}")), "{m}: helper called:\n{body}");
     }
+}
+
+#[test]
+fn the_ones_methods_invert_before_the_zero_helper() {
+    // `leading_ones`/`trailing_ones` are the zero counts on `!x`, so the helper
+    // is preceded by a `not` of the receiver and no dedicated piece exists.
+    let lead = asm_no_inline("fn main() -> i64 { return 5.leading_ones(); }");
+    let lbody = &lead[lead.find("main:").expect("main")..];
+    assert!(lbody.contains("not %rax"), "`!x` before the count:\n{lbody}");
+    assert!(lbody.contains("call __rmc_leading_zeros"), "zeros helper reused:\n{lbody}");
+    let trail = asm_no_inline("fn main() -> i64 { return 5.trailing_ones(); }");
+    let tbody = &trail[trail.find("main:").expect("main")..];
+    assert!(tbody.contains("not %rax"), "`!x` before the count:\n{tbody}");
+    assert!(tbody.contains("call __rmc_trailing_zeros"), "zeros helper reused:\n{tbody}");
+}
+
+#[test]
+fn swap_bytes_lowers_to_a_single_bswap() {
+    // `swap_bytes` is one `bswap` on the receiver, matching rustc; no loop.
+    let out = asm_no_inline("fn main() -> i64 { return 5.swap_bytes(); }");
+    assert!(out.contains("bswap %rax"), "one bswap:\n{out}");
+    assert!(out.contains("call __rmc_swap_bytes"), "helper called:\n{out}");
 }
 
 #[test]
@@ -5263,7 +5294,15 @@ fn a_plain_variable_receiver_needs_no_temp() {
 
 #[test]
 fn a_bit_method_argument_is_rejected() {
-    for m in ["count_ones", "leading_zeros", "trailing_zeros"] {
+    for m in [
+        "count_ones",
+        "leading_zeros",
+        "trailing_zeros",
+        "swap_bytes",
+        "reverse_bits",
+        "leading_ones",
+        "trailing_ones",
+    ] {
         let bad = format!("fn main() -> i64 {{ return 1.{m}(2); }}");
         assert!(
             compile_to_asm(&bad, &CompileOptions::default()).is_err(),
@@ -5276,9 +5315,15 @@ fn a_bit_method_argument_is_rejected() {
 fn the_bit_helpers_are_pulled_in_only_when_used() {
     // The per-symbol runtime pruning keeps a helper only when the program (or
     // another kept piece) names it, so a program that never inspects bits does
-    // not carry any of the three.
+    // not carry any of them.
     let out = asm("fn main() -> i64 { return 1; }");
-    for h in ["__rmc_count_ones", "__rmc_leading_zeros", "__rmc_trailing_zeros"] {
+    for h in [
+        "__rmc_count_ones",
+        "__rmc_leading_zeros",
+        "__rmc_trailing_zeros",
+        "__rmc_swap_bytes",
+        "__rmc_reverse_bits",
+    ] {
         assert!(!out.contains(h), "{h} dropped when unused:\n{out}");
     }
     // And a program that uses one carries exactly that one.
@@ -5286,6 +5331,12 @@ fn the_bit_helpers_are_pulled_in_only_when_used() {
     assert!(used.contains("__rmc_trailing_zeros:"));
     assert!(!used.contains("__rmc_count_ones:"));
     assert!(!used.contains("__rmc_leading_zeros:"));
+    assert!(!used.contains("__rmc_swap_bytes:"));
+    // A `*_ones` call pulls in only the zero helper it reuses.
+    let ones = asm("fn main() -> i64 { return 5.leading_ones(); }");
+    assert!(ones.contains("__rmc_leading_zeros:"));
+    assert!(!ones.contains("__rmc_trailing_zeros:"));
+    assert!(!ones.contains("__rmc_swap_bytes:"));
 }
 
 #[test]

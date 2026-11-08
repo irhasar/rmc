@@ -495,6 +495,7 @@ impl Elf {
             }
             "sete" | "setne" | "setl" | "setle" | "setg" | "setge" | "setb" | "setbe" | "seta"
             | "setae" => self.enc_setcc(mnem, &ops, sec),
+            "bswap" => self.enc_bswap(&ops, sec),
             j if j.starts_with('j') => self.enc_jcc(j, &ops, sec),
             other => Err(format!("elf: unsupported instruction `{other}`")),
         }
@@ -903,6 +904,15 @@ impl Elf {
         self.sections[sec].data.push(rex(true, ext, reg));
         self.sections[sec].data.push(0xD3);
         modrm_reg_reg(&mut self.sections[sec].data, ext, reg);
+        Ok(())
+    }
+
+    /// `bswap %r64` (0F C8+rd). `movbe` needs SSE4.1 and a memory operand; a
+    /// single register `bswap` is the whole 64-bit reversal of byte order.
+    fn enc_bswap(&mut self, ops: &[String], sec: usize) -> Result<(), String> {
+        let (reg, _) = parse_reg(&ops[0])?;
+        self.sections[sec].data.push(rex(true, 0, reg));
+        self.sections[sec].data.extend_from_slice(&[0x0F, 0xC8 + (reg & 7)]);
         Ok(())
     }
 
@@ -1532,5 +1542,18 @@ mod tests {
         let mut out = Vec::new();
         emit_mem_op(&mut out, 0x8B, &mem("(%rbp)"), 0, true, false);
         assert_eq!(out, [0x48, 0x8B, 0x45, 0x00]);
+    }
+
+    #[test]
+    fn bswap_names_its_register_in_the_opcode() {
+        // `bswap %r64` is `0F C8+rd`: the register index lives in the low three
+        // opcode bits, so there is no ModRM byte and the index is REX.B (not
+        // REX.R). `%rax` is `48 0F C8` and `%r9` is `49 0F C9`, matching `as`.
+        let mut e = test_elf(0x5);
+        e.instruction("bswap %rax", 0).unwrap();
+        assert_eq!(e.sections[0].data[3..], [0x48, 0x0F, 0xC8]);
+        let mut e = test_elf(0x5);
+        e.instruction("bswap %r9", 0).unwrap();
+        assert_eq!(e.sections[0].data[3..], [0x49, 0x0F, 0xC9]);
     }
 }
