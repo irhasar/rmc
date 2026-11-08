@@ -58,6 +58,7 @@ python3 tools/fuzz.py --mode tuple --n 500 --seed 1
 python3 tools/fuzz.py --mode intmeth --n 500 --seed 1
 python3 tools/fuzz.py --mode nestedfn --n 500 --seed 1
 python3 tools/fuzz.py --mode typealias --n 500 --seed 1
+python3 tools/fuzz.py --mode printfmt --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 
 # robustness / soundness: rmc must error cleanly, never crash

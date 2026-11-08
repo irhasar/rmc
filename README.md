@@ -185,7 +185,10 @@ after it, a nested `fn` inside another body, a nested `fn` shadowing a top-level
 one of the same name, and the shadowed name called to confirm the inner one
 wins), `typealias` for `type` aliases (a scalar, tuple, array and struct alias,
 an alias as a parameter and return type, one alias naming another, an alias used
-before it is declared, an alias behind a reference and in a cast), and
+before it is declared, an alias behind a reference and in a cast), `printfmt`
+for `print!`/`println!` (a literal format with `{}` filled by an `i64`, a
+`bool` or a `str`, literal `{{`/`}}` braces, escapes, a leading `\n`, and a
+bare `println!()` with no format string), and
 `order` for assignment evaluation order (a
 side-effecting index and value on both `=` and every compound operator, the
 shapes `stmt` never assigns through). `shift` drives `<<`, `>>` and the compound
@@ -203,6 +206,7 @@ python3 tools/fuzz.py --mode arith --n 500 --seed 1
 python3 tools/fuzz.py --mode nest --n 500 --seed 1
 python3 tools/fuzz.py --mode nestedfn --n 500 --seed 1
 python3 tools/fuzz.py --mode typealias --n 500 --seed 1
+python3 tools/fuzz.py --mode printfmt --n 500 --seed 1
 python3 tools/fuzz.py --mode pat --n 500 --seed 1
 python3 tools/fuzz.py --mode order --n 500 --seed 1
 python3 tools/fuzz.py --mode shift --n 500 --seed 1
