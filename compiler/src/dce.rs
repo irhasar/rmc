@@ -98,7 +98,7 @@ fn collect_stmt(s: &Stmt, out: &mut HashSet<String>) {
 
 fn collect_expr(e: &Expr, out: &mut HashSet<String>) {
     match e {
-        Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
+        Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
         Expr::PatScrutinee(_) => {
             unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
         }

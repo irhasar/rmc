@@ -157,10 +157,11 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     // Runtime helpers provided by the freestanding assembly runtime. They are
     // linked in automatically, so they do not appear in the source program.
-    let builtins: [(&str, &[Type], Type); 21] = [
+    let builtins: [(&str, &[Type], Type); 23] = [
         ("print_i64", &[Type::I64], Type::Unit),
         ("print_str", &[Type::Str], Type::Unit),
         ("print_bool", &[Type::Bool], Type::Unit),
+        ("print_char", &[Type::Char], Type::Unit),
         // `std::process::exit(code)`, lowered to the runtime's raw `exit`
         // syscall wrapper by the parser. It never returns, but it is typed as
         // returning `()` so it may be used as a statement or tail expression.
@@ -198,6 +199,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         ("__rmc_write_i64", &[Type::I64], Type::Unit),
         ("__rmc_write_bool", &[Type::Bool], Type::Unit),
         ("__rmc_write_str", &[Type::Str], Type::Unit),
+        ("__rmc_write_char", &[Type::Char], Type::Unit),
     ];
     for (name, params, ret) in builtins {
         sigs.insert(
@@ -230,9 +232,11 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         }
     }
     for f in &prog.fns {
-        if sigs.contains_key(&f.name) {
-            return Err(format!("function `{}` is defined more than once", f.name));
-        }
+        // A user definition of a runtime helper wins over the built-in:
+        // `spills.rs` shims `alloc`/`free` as ordinary Rust functions so the
+        // same source also builds under rustc, and rmc must not reject the
+        // redefinition. Overwrite the built-in signature with the user's; the
+        // runtime drops its own piece for any symbol the program defines.
         let params: Result<Vec<Type>, String> =
             f.params.iter().map(|(_, t)| resolve_in(t, &structs, &enums)).collect();
         let params = params?;
@@ -521,10 +525,10 @@ fn check_consts(
         }
         let ty = resolve_in(&c.ty, structs, enums)?;
         match ty {
-            Type::I64 | Type::Bool => {}
+            Type::I64 | Type::Bool | Type::Char => {}
             other => {
                 return Err(format!(
-                    "constant `{}` has type {other:?}; rmc only folds `i64` and `bool` constants",
+                    "constant `{}` has type {other:?}; rmc only folds `i64`, `bool` and `char` constants",
                     c.name
                 ))
             }
@@ -535,6 +539,7 @@ fn check_consts(
         match (ty, resolved.get(&c.name)) {
             (Type::I64, Some(crate::consts::ConstVal::Int(_))) => {}
             (Type::Bool, Some(crate::consts::ConstVal::Bool(_))) => {}
+            (Type::Char, Some(crate::consts::ConstVal::Char(_))) => {}
             (Type::I64, _) => {
                 return Err(format!(
                     "constant `{}` is not a constant `i64` expression",
@@ -544,6 +549,12 @@ fn check_consts(
             (Type::Bool, _) => {
                 return Err(format!(
                     "constant `{}` is not a constant `bool` expression",
+                    c.name
+                ))
+            }
+            (Type::Char, _) => {
+                return Err(format!(
+                    "constant `{}` is not a constant `char` expression",
                     c.name
                 ))
             }
@@ -1690,6 +1701,18 @@ impl Sema {
             (Type::Str, _) | (_, Type::Str) => {
                 Err(format!("cannot cast `{from:?}` to `{to:?}`"))
             }
+            // rustc allows only `u8 as char`; rmc has no `u8` type (a suffixed
+            // literal is an `i64`), so it rejects every integer-to-`char` cast
+            // rather than accept one rustc would reject.
+            (Type::I64, Type::Char) => {
+                Err("cannot cast `i64` to `char` (rustc allows only `u8 as char`)".into())
+            }
+            // `char` converts to an integer as its scalar value.
+            (Type::Char, Type::I64) => Ok(()),
+            // Any other `char` cast is not one rustc performs.
+            (Type::Char, _) | (_, Type::Char) => {
+                Err(format!("cannot cast `{from:?}` to `{to:?}`"))
+            }
             // `i64`, `bool` and an enum tag convert among themselves.
             _ => Ok(()),
         }
@@ -1775,7 +1798,7 @@ impl Sema {
         mb: &mut std::collections::HashSet<String>,
     ) {
         match e {
-            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
+            Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
             // A scalar-pattern scrutinee is rewritten by `check_expr`, which runs
             // after this pre-pass, so recurse into it here to see any `&mut` it
             // borrows (`match &mut x { 5 => .. }`).
@@ -1953,6 +1976,7 @@ impl Sema {
         match e {
             Expr::Int(_) => Ok(Type::I64),
             Expr::Bool(_) => Ok(Type::Bool),
+            Expr::Char(_) => Ok(Type::Char),
             // A string literal has its own type, so it cannot be added to an
             // integer or passed where an `i64` is expected.
             Expr::Str(_) => Ok(Type::Str),
@@ -2041,6 +2065,12 @@ impl Sema {
                         Ok(Type::Bool)
                     }
                     Lt | Le | Gt | Ge => {
+                        // `char` orders by its scalar value, so two `char`s
+                        // compare; anything else must be `i64`, matching rustc,
+                        // which does not order a `char` against an integer.
+                        if ta == Type::Char && tb == Type::Char {
+                            return Ok(Type::Bool);
+                        }
                         if ta != Type::I64 || tb != Type::I64 {
                             return Err(format!("ordering comparison expects `i64`, found {ta:?} and {tb:?}"));
                         }
@@ -2088,13 +2118,15 @@ impl Sema {
                         "__rmc_write_i64"
                     } else if t == Type::Bool {
                         "__rmc_write_bool"
+                    } else if t == Type::Char {
+                        "__rmc_write_char"
                     } else if t == Type::Str
                         || matches!(&t, Type::Ref(i, _) if **i == Type::Str)
                     {
                         "__rmc_write_str"
                     } else {
                         return Err(format!(
-                            "`{{}}` cannot print a value of type {t:?} (only `i64`, `bool` and `str`)"
+                            "`{{}}` cannot print a value of type {t:?} (only `i64`, `bool`, `char` and `str`)"
                         ));
                     };
                     *name = helper.to_string();

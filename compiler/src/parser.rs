@@ -29,6 +29,9 @@ pub struct Parser {
     /// Constant `bool` items by name, so a `const F: bool` used as a `match`
     /// pattern becomes the `true`/`false` pattern.
     const_bools: std::collections::HashMap<String, bool>,
+    /// Constant `char` items by name, so a `const C: char` used as a `match`
+    /// pattern becomes the character pattern.
+    const_chars: std::collections::HashMap<String, u32>,
     /// Struct field names by struct name, collected before parsing so a struct
     /// pattern (`S { f, .. }`) can be checked at parse time. A struct pattern
     /// has no runtime test, so the parser rewrites it into field reads; that
@@ -117,6 +120,7 @@ impl Parser {
             current_impl: None,
             consts: std::collections::HashMap::new(),
             const_bools: std::collections::HashMap::new(),
+            const_chars: std::collections::HashMap::new(),
             struct_fields: std::collections::HashMap::new(),
             tuple_structs: std::collections::HashSet::new(),
             tuple_defs: Vec::new(),
@@ -637,6 +641,9 @@ impl Parser {
                 crate::consts::ConstVal::Bool(v) => {
                     self.const_bools.insert(name, v);
                 }
+                crate::consts::ConstVal::Char(v) => {
+                    self.const_chars.insert(name, v);
+                }
             }
         }
     }
@@ -978,6 +985,10 @@ impl Parser {
                 self.i += 1;
                 Ok(Type::Bool)
             }
+            Some(Tok::TyChar) => {
+                self.i += 1;
+                Ok(Type::Char)
+            }
             Some(Tok::LBracket) => {
                 self.i += 1;
                 let elem = self.parse_type()?;
@@ -1262,7 +1273,10 @@ impl Parser {
         // `parse_pattern` would otherwise read the name as that constant's
         // value, so the check happens here, before the pattern is parsed.
         if let Some(Tok::Ident(n)) = self.peek() {
-            if self.consts.contains_key(n) || self.const_bools.contains_key(n) {
+            if self.consts.contains_key(n)
+                || self.const_bools.contains_key(n)
+                || self.const_chars.contains_key(n)
+            {
                 return Err(format!(
                     "identifier `{n}` shadows a constant of the same name"
                 ));
@@ -2534,6 +2548,10 @@ impl Parser {
                 self.i += 1;
                 Ok(Pat::Str(s))
             }
+            Some(Tok::Char(c)) => {
+                self.i += 1;
+                self.maybe_char_range(c)
+            }
             // `name @ subpat`: bind the whole value and also match it against
             // the sub-pattern. `@` cannot begin any other pattern, so it is
             // unambiguous here; a `mut` may precede the name.
@@ -2582,6 +2600,8 @@ impl Parser {
                     Ok(Pat::Int(*v))
                 } else if let Some(b) = self.const_bools.get(&n) {
                     Ok(Pat::Bool(*b))
+                } else if let Some(c) = self.const_chars.get(&n) {
+                    Ok(Pat::Char(*c))
                 } else {
                     // A bare name binds the scrutinee; `_` already matched the
                     // wildcard case above.
@@ -2970,7 +2990,7 @@ impl Parser {
                 // generated separately by `tuple_pat_test`. An or-pattern element
                 // is allowed in an irrefutable context only when a `_`
                 // alternative makes it irrefutable, so it too binds nothing.
-                Pat::Int(_) | Pat::Bool(_) | Pat::Str(_) | Pat::Range(..) | Pat::Or(_) => {}
+                Pat::Int(_) | Pat::Char(_) | Pat::CharRange(..) | Pat::Bool(_) | Pat::Str(_) | Pat::Range(..) | Pat::Or(_) => {}
                 _ => unreachable!("a tuple element is validated when the tuple is parsed"),
             }
         }
@@ -3165,6 +3185,49 @@ impl Parser {
         Ok(Pat::Range(lo, hi, inclusive))
     }
 
+    /// If a `..`/`..=` follows a `char` literal just parsed, consume it and the
+    /// upper bound to build a `char` range pattern; otherwise the literal stands
+    /// alone. Both bounds are `char`, and the upper bound must be a `char`
+    /// literal, as in rustc (which also rejects an empty range).
+    fn maybe_char_range(&mut self, lo: u32) -> PResult<Pat> {
+        let inclusive = match self.peek() {
+            Some(Tok::DotDot) => false,
+            Some(Tok::DotDotEq) => true,
+            _ => return Ok(Pat::Char(lo)),
+        };
+        self.i += 1;
+        let hi = match self.peek() {
+            Some(Tok::Char(c)) => {
+                let c = *c;
+                self.i += 1;
+                c
+            }
+            _ => {
+                return Err(format!(
+                    "at byte {}: expected a `char` literal as the range pattern's upper bound",
+                    self.pos()
+                ))
+            }
+        };
+        if !inclusive && lo >= hi {
+            return Err(format!(
+                "at byte {}: empty range pattern `'{}'..'{}'`",
+                self.pos(),
+                char::from_u32(lo).unwrap_or('\u{FFFD}'),
+                char::from_u32(hi).unwrap_or('\u{FFFD}')
+            ));
+        }
+        if inclusive && lo > hi {
+            return Err(format!(
+                "at byte {}: empty range pattern `'{}'..='{}'`",
+                self.pos(),
+                char::from_u32(lo).unwrap_or('\u{FFFD}'),
+                char::from_u32(hi).unwrap_or('\u{FFFD}')
+            ));
+        }
+        Ok(Pat::CharRange(lo, hi, inclusive))
+    }
+
     /// The boolean test for one tuple *element* pattern, if it has one. A
     /// binding, `_`, a struct pattern and a nested irrefutable tuple are
     /// test-free (`None`); a scalar pattern reuses the same test the top-level
@@ -3195,6 +3258,11 @@ impl Parser {
                 Box::new(Self::scalar_scrutinee(subj)),
                 Box::new(Expr::Int(*k)),
             )),
+            Pat::Char(c) => Some(Expr::Bin(
+                BinOp::Eq,
+                Box::new(Self::scalar_scrutinee(subj)),
+                Box::new(Expr::Char(*c)),
+            )),
             Pat::Bool(b) => Some(Expr::BoolTest {
                 scrutinee: Box::new(Self::scalar_scrutinee(subj)),
                 value: *b,
@@ -3214,6 +3282,19 @@ impl Parser {
                     if *inclusive { BinOp::Le } else { BinOp::Lt },
                     Box::new(Self::scalar_scrutinee(subj)),
                     Box::new(Expr::Int(*hi)),
+                );
+                Some(Expr::Bin(BinOp::And, Box::new(lower), Box::new(upper)))
+            }
+            Pat::CharRange(lo, hi, inclusive) => {
+                let lower = Expr::Bin(
+                    BinOp::Le,
+                    Box::new(Expr::Char(*lo)),
+                    Box::new(Self::scalar_scrutinee(subj)),
+                );
+                let upper = Expr::Bin(
+                    if *inclusive { BinOp::Le } else { BinOp::Lt },
+                    Box::new(Self::scalar_scrutinee(subj)),
+                    Box::new(Expr::Char(*hi)),
                 );
                 Some(Expr::Bin(BinOp::And, Box::new(lower), Box::new(upper)))
             }
@@ -3255,11 +3336,11 @@ impl Parser {
             // `name @ subpat` is allowed when its sub-pattern is.
             Pat::At(_, _, sub) => Self::tuple_element_ok(sub),
             Pat::Array { .. } => Self::pat_irrefutable(p),
-            Pat::Int(_) | Pat::Bool(_) | Pat::Str(_) | Pat::Range(..) => true,
+            Pat::Int(_) | Pat::Char(_) | Pat::CharRange(..) | Pat::Bool(_) | Pat::Str(_) | Pat::Range(..) => true,
             // An or-pattern is allowed when every alternative is a scalar test
             // or a `_` (no alternative binds or is a variant).
             Pat::Or(alts) => alts.iter().all(|a| {
-                matches!(a, Pat::Wild | Pat::Int(_) | Pat::Bool(_) | Pat::Str(_) | Pat::Range(..))
+                matches!(a, Pat::Wild | Pat::Int(_) | Pat::Char(_) | Pat::CharRange(..) | Pat::Bool(_) | Pat::Str(_) | Pat::Range(..))
             }),
             Pat::Variant(..) => false,
         }
@@ -3418,6 +3499,11 @@ impl Parser {
                 Box::new(Self::scalar_scrutinee(subj)),
                 Box::new(Expr::Int(*k)),
             ),
+            Pat::Char(c) => Expr::Bin(
+                BinOp::Eq,
+                Box::new(Self::scalar_scrutinee(subj)),
+                Box::new(Expr::Char(*c)),
+            ),
             Pat::Bool(b) => {
                 Expr::BoolTest { scrutinee: Box::new(Self::scalar_scrutinee(subj)), value: *b }
             }
@@ -3442,6 +3528,19 @@ impl Parser {
                     if *inclusive { BinOp::Le } else { BinOp::Lt },
                     Box::new(Self::scalar_scrutinee(subj)),
                     Box::new(Expr::Int(*hi)),
+                );
+                Expr::Bin(BinOp::And, Box::new(lower), Box::new(upper))
+            }
+            Pat::CharRange(lo, hi, inclusive) => {
+                let lower = Expr::Bin(
+                    BinOp::Le,
+                    Box::new(Expr::Char(*lo)),
+                    Box::new(Self::scalar_scrutinee(subj)),
+                );
+                let upper = Expr::Bin(
+                    if *inclusive { BinOp::Le } else { BinOp::Lt },
+                    Box::new(Self::scalar_scrutinee(subj)),
+                    Box::new(Expr::Char(*hi)),
                 );
                 Expr::Bin(BinOp::And, Box::new(lower), Box::new(upper))
             }
@@ -3637,7 +3736,7 @@ impl Parser {
             // A scalar element binds nothing (its test is generated
             // separately); an or-pattern binds nothing (rmc rejects a binding
             // in an or-pattern when it is parsed).
-            Pat::Int(_) | Pat::Bool(_) | Pat::Str(_) | Pat::Range(..) | Pat::Or(_) => {}
+            Pat::Int(_) | Pat::Char(_) | Pat::CharRange(..) | Pat::Bool(_) | Pat::Str(_) | Pat::Range(..) | Pat::Or(_) => {}
             _ => unreachable!("unexpected sub-pattern"),
         }
     }
@@ -3733,6 +3832,14 @@ impl Parser {
                     Box::new(Expr::Int(k)),
                 )),
             ),
+            Pat::Char(c) => (
+                Vec::new(),
+                Some(Expr::Bin(
+                    BinOp::Eq,
+                    Box::new(Self::scalar_scrutinee(subj)),
+                    Box::new(Expr::Char(c)),
+                )),
+            ),
             // A string literal pattern: a content compare, which sema lowers to
             // the byte-wise helper (a pointer compare would never match). Not
             // auto-deref'd: see `or_cond`.
@@ -3753,6 +3860,21 @@ impl Parser {
                     if inclusive { BinOp::Le } else { BinOp::Lt },
                     Box::new(Self::scalar_scrutinee(subj)),
                     Box::new(Expr::Int(hi)),
+                );
+                (Vec::new(), Some(Expr::Bin(BinOp::And, Box::new(lower), Box::new(upper))))
+            }
+            // `'a'..'z'` / `'a'..='z'`: the char analogue of `Range`, the same
+            // pair of comparisons with `char` bounds.
+            Pat::CharRange(lo, hi, inclusive) => {
+                let lower = Expr::Bin(
+                    BinOp::Le,
+                    Box::new(Expr::Char(lo)),
+                    Box::new(Self::scalar_scrutinee(subj)),
+                );
+                let upper = Expr::Bin(
+                    if inclusive { BinOp::Le } else { BinOp::Lt },
+                    Box::new(Self::scalar_scrutinee(subj)),
+                    Box::new(Expr::Char(hi)),
                 );
                 (Vec::new(), Some(Expr::Bin(BinOp::And, Box::new(lower), Box::new(upper))))
             }
@@ -3910,6 +4032,10 @@ impl Parser {
             Some(Tok::Int(v)) => {
                 self.i += 1;
                 Ok(Expr::Int(v))
+            }
+            Some(Tok::Char(c)) => {
+                self.i += 1;
+                Ok(Expr::Char(c))
             }
             // The magnitude `2^63` is only valid directly under a `-`, which
             // `parse_unary` folds into `Expr::Int(i64::MIN)`. Reaching it here
@@ -4099,6 +4225,8 @@ impl Parser {
                     Ok(Expr::Int(*v))
                 } else if let Some(b) = self.const_bools.get(&name) {
                     Ok(Expr::Bool(*b))
+                } else if let Some(c) = self.const_chars.get(&name) {
+                    Ok(Expr::Char(*c))
                 } else {
                     Ok(Expr::Var { name, slot: -1, ty: Type::I64 })
                 }
@@ -4257,6 +4385,11 @@ impl Parser {
 enum Pat {
     Wild,
     Int(i64),
+    /// A character literal, matched by value.
+    Char(u32),
+    /// `'a'..'z'` / `'a'..='z'`, inclusive flag set for `..=`. The character
+    /// analogue of `Range`.
+    CharRange(u32, u32, bool),
     /// `lo..hi` / `lo..=hi`, inclusive flag set for `..=`.
     Range(i64, i64, bool),
     /// `a | b | c`, alternatives tried left to right.

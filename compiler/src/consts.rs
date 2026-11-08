@@ -7,11 +7,12 @@
 use crate::ast::{BinOp, Expr, Type, UnOp};
 use std::collections::HashMap;
 
-/// The value of a resolved constant: an `i64` or a `bool`.
+/// The value of a resolved constant: an `i64`, a `bool`, or a `char`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConstVal {
     Int(i64),
     Bool(bool),
+    Char(u32),
 }
 
 /// Resolve a list of `const` items, each `(name, declared type, initializer)`,
@@ -23,11 +24,12 @@ pub enum ConstVal {
 pub fn resolve(items: &[(String, Type, Expr)]) -> HashMap<String, ConstVal> {
     let mut ints: HashMap<String, i64> = HashMap::new();
     let mut bools: HashMap<String, bool> = HashMap::new();
+    let mut chars: HashMap<String, u32> = HashMap::new();
     // Iterate to a fixpoint so a constant may name one declared later.
     loop {
         let mut progress = false;
         for (name, ty, value) in items {
-            if ints.contains_key(name) || bools.contains_key(name) {
+            if ints.contains_key(name) || bools.contains_key(name) || chars.contains_key(name) {
                 continue;
             }
             match ty {
@@ -40,6 +42,12 @@ pub fn resolve(items: &[(String, Type, Expr)]) -> HashMap<String, ConstVal> {
                 Type::Bool => {
                     if let Some(v) = eval_bool(value, &ints, &bools) {
                         bools.insert(name.clone(), v);
+                        progress = true;
+                    }
+                }
+                Type::Char => {
+                    if let Some(v) = eval_char(value, &chars) {
+                        chars.insert(name.clone(), v);
                         progress = true;
                     }
                 }
@@ -57,7 +65,20 @@ pub fn resolve(items: &[(String, Type, Expr)]) -> HashMap<String, ConstVal> {
     for (k, v) in bools {
         out.insert(k, ConstVal::Bool(v));
     }
+    for (k, v) in chars {
+        out.insert(k, ConstVal::Char(v));
+    }
     out
+}
+
+/// A constant `char` expression: a character literal, or another `char`
+/// constant by name.
+pub fn eval_char(e: &Expr, chars: &HashMap<String, u32>) -> Option<u32> {
+    match e {
+        Expr::Char(c) => Some(*c),
+        Expr::Var { name, .. } => chars.get(name).copied(),
+        _ => None,
+    }
 }
 
 /// A constant `i64` expression, resolving a reference to another integer

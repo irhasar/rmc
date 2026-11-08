@@ -10,6 +10,11 @@
 pub enum Type {
     I64,
     Bool,
+    /// `char`: one Unicode scalar value, held in a 32-bit slot. A `char`
+    /// converts to an integer with `as` and compares as one, but is a distinct
+    /// type, so `c + 1` is rejected just as rustc rejects it. The slot is 8
+    /// bytes like every other scalar (see `size`).
+    Char,
     Unit,
     Array(Box<Type>, usize),
     /// A struct: its name and its size in bytes. Sizes are computed by sema so
@@ -46,7 +51,7 @@ pub enum Type {
 impl Type {
     pub fn size(&self) -> usize {
         match self {
-            Type::I64 | Type::Bool | Type::Str | Type::Enum(_) | Type::Ref(..) => 8,
+            Type::I64 | Type::Bool | Type::Char | Type::Str | Type::Enum(_) | Type::Ref(..) => 8,
             Type::EnumData(_, size) => *size,
             Type::Unit | Type::Never => 0,
             Type::Array(elem, n) => elem.size() * n,
@@ -56,19 +61,22 @@ impl Type {
     }
 
     /// True for the types that fit in a single 8-byte slot and travel in one
-    /// register: `i64`, `bool` and an enum. They may be parameters, fields and
-    /// return values.
+    /// register: `i64`, `bool`, `char` and an enum. They may be parameters,
+    /// fields and return values.
     pub fn is_scalar(&self) -> bool {
-        matches!(self, Type::I64 | Type::Bool | Type::Str | Type::Enum(_) | Type::Ref(..))
+        matches!(
+            self,
+            Type::I64 | Type::Bool | Type::Char | Type::Str | Type::Enum(_) | Type::Ref(..)
+        )
     }
 
     /// True for the types an array element may have: the 8-byte integer-like
-    /// scalars `i64`, `bool` and a unit enum. A unit enum occupies one slot and
-    /// codegen emits it exactly as it emits `i64`, so `[E; N]` lays out and
-    /// indexes correctly. A payload enum or a reference is excluded, matching
-    /// rustc, which rejects both as array elements.
+    /// scalars `i64`, `bool`, `char` and a unit enum. A unit enum occupies one
+    /// slot and codegen emits it exactly as it emits `i64`, so `[E; N]` lays out
+    /// and indexes correctly. A payload enum or a reference is excluded,
+    /// matching rustc, which rejects both as array elements.
     pub fn is_int_or_bool(&self) -> bool {
-        matches!(self, Type::I64 | Type::Bool | Type::Enum(_))
+        matches!(self, Type::I64 | Type::Bool | Type::Char | Type::Enum(_))
     }
 
     /// True for the types an array element may have now that nested aggregates
@@ -77,7 +85,10 @@ impl Type {
     /// `size() / 8` slots. A payload enum, a reference and `str` stay excluded
     /// (rustc rejects a payload enum and a reference as array elements too).
     pub fn is_array_elem(&self) -> bool {
-        matches!(self, Type::I64 | Type::Bool | Type::Enum(_) | Type::Array(..) | Type::Struct(..))
+        matches!(
+            self,
+            Type::I64 | Type::Bool | Type::Char | Type::Enum(_) | Type::Array(..) | Type::Struct(..)
+        )
     }
 
     /// True for the aggregate types that live in memory: arrays and structs.
@@ -103,6 +114,7 @@ impl Type {
         match self {
             Type::I64 => "i".to_string(),
             Type::Bool => "b".to_string(),
+            Type::Char => "c".to_string(),
             Type::Str => "s".to_string(),
             Type::Unit => "u".to_string(),
             Type::Never => "!".to_string(),
@@ -176,6 +188,10 @@ pub enum UnOp {
 pub enum Expr {
     Int(i64),
     Bool(bool),
+    /// A character literal `'A'`, holding its Unicode scalar value. It has type
+    /// `char` and codegen emits it as an `i64` immediate, exactly like an
+    /// integer.
+    Char(u32),
     /// String literal; evaluates to a pointer to a `{len, bytes}` record in
     /// `.rodata`. Given type `i64` so it can be passed to runtime helpers.
     Str(String),

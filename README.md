@@ -187,8 +187,12 @@ wins), `typealias` for `type` aliases (a scalar, tuple, array and struct alias,
 an alias as a parameter and return type, one alias naming another, an alias used
 before it is declared, an alias behind a reference and in a cast), `printfmt`
 for `print!`/`println!` (a literal format with `{}` filled by an `i64`, a
-`bool` or a `str`, literal `{{`/`}}` braces, escapes, a leading `\n`, and a
-bare `println!()` with no format string), and
+`bool`, a `char` or a `str`, literal `{{`/`}}` braces, escapes, a leading `\n`,
+and a
+bare `println!()` with no format string), `char` for `char` literals
+(plain, escaped, `\xNN`, `\u{..}`), `as i64`, `char` ordering and equality, a
+`char` `match` with literal, or-pattern and range arms, a `char` array, a
+`const char`, a `char` parameter/return, and the `print_char` builtin, and
 `order` for assignment evaluation order (a
 side-effecting index and value on both `=` and every compound operator, the
 shapes `stmt` never assigns through). `shift` drives `<<`, `>>` and the compound
@@ -258,8 +262,8 @@ fn main() -> i64 {
 }
 ```
 
-Supported: `i64`, `bool`, `str`, fixed-size arrays, tuples `(A, B, ..)`, and
-structs with named fields
+Supported: `i64`, `bool`, `char`, `str`, fixed-size arrays, tuples `(A, B, ..)`,
+and structs with named fields
 (including field init shorthand, `P { x, y }`, struct update syntax,
 `P { x: 9, ..base }`, struct patterns `P { x, y: z, .. }` in `match`/`if let`
 (including nested sub-patterns `P { a: I { x }, .. }`), `let` destructuring
@@ -278,8 +282,8 @@ plain parameters); `let` / `let mut` / `let _` (discard); assignment to variable
 array elements and struct fields (including compound `+=` and friends);
 `if`/`else`, `while`, `loop`, `for i in a..b` / `a..=b` and `for x in arr`
 (array iteration, by value); `match` on integers,
-`bool`s, enums and strings (literal, `true`/`false`, string, `Enum::Variant`,
-struct and
+`bool`s, `char`s, enums and strings (literal, `true`/`false`, char, string,
+`Enum::Variant`, struct and
 `_` patterns, plus payload bindings and binding names, and a per-arm guard
 `PAT if COND`) and `if let` with the
 same patterns
@@ -332,6 +336,7 @@ Runtime builtins (provided by `src/runtime.rs`, no imports needed):
 | `print_i64(x)`  | `(i64) -> ()`        | print an integer followed by `\n`      |
 | `print_str(s)`  | `(str) -> ()`        | print a string followed by `\n`       |
 | `print_bool(b)` | `(bool) -> ()`       | print `1` or `0`                       |
+| `print_char(c)` | `(char) -> ()`       | write a character as UTF-8, then `\n`  |
 | `putchar(c)`    | `(i64) -> ()`        | write a single byte                    |
 | `alloc(n)`      | `(i64) -> i64`       | allocate `n` bytes (first-fit free list) |
 | `free(p)`       | `(i64) -> ()`        | return a block from `alloc` to the heap |
