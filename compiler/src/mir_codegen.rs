@@ -1508,7 +1508,9 @@ impl<'a> FnGen<'a> {
         // comparisons into the terminator, so all three are dead.
         if matches!(term, Terminator::Assert { negate: true, .. }) {
             if let Some((ai, c1i, c2i)) = self.and_chain(bb, pl.local) {
-                return vec![ai, c1i, c2i];
+                if !self.local_used_elsewhere(bb, pl.local) {
+                    return vec![ai, c1i, c2i];
+                }
             }
         }
         let mut last = None;
@@ -1519,7 +1521,45 @@ impl<'a> FnGen<'a> {
                 }
             }
         }
-        last.into_iter().collect()
+        let Some(i) = last else { return Vec::new() };
+        // Folding the comparison into the terminator leaves no `bool` in
+        // memory, so a *later* block that reads the same local (rustc reuses
+        // one `_15` for both the first and a second bounds check) would read a
+        // stale slot. Keep the store when the local is live elsewhere.
+        if self.local_used_elsewhere(bb, pl.local) {
+            return Vec::new();
+        }
+        vec![i]
+    }
+
+    /// Whether `local` is read anywhere except the statements of `bb` before
+    /// (and including) the comparison the terminator folds. The terminator of
+    /// `bb` is the only read the fold itself serves, so a read in any other
+    /// block - or a read in `bb` that is not the folded comparison - means the
+    /// local must be materialised.
+    fn local_used_elsewhere(&self, bb: u32, local: u32) -> bool {
+        for (b, block) in self.func.blocks.iter().enumerate() {
+            for s in &block.stmts {
+                let mut used = false;
+                scan_operands(s, &mut |op| {
+                    if let Operand::Copy(p) | Operand::Move(p) = op {
+                        if p.local == local {
+                            used = true;
+                        }
+                    }
+                });
+                if used {
+                    return true;
+                }
+            }
+            if b as u32 == bb {
+                continue;
+            }
+            if terminator_reads(&block.term, local) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Recognise `_b = c1 & c2` in `bb`, where `c1`/`c2` are comparisons that
@@ -4516,6 +4556,61 @@ fn operand_place(op: &Operand) -> Option<&Place> {
         _ => None,
     }
 }
+
+/// Every operand a statement reads, in source order.
+fn scan_operands(s: &Stmt, f: &mut impl FnMut(&Operand)) {
+    let Stmt::Assign(_, rv) = s else { return };
+    match rv {
+        Rvalue::Use(op)
+        | Rvalue::Unary(_, op)
+        | Rvalue::Repeat { op, .. } => f(op),
+        Rvalue::Binary(_, a, b) | Rvalue::WithOverflow { a, b, .. } => {
+            f(a);
+            f(b);
+        }
+        Rvalue::Cast { op, .. } => f(op),
+        Rvalue::Array(ops) | Rvalue::Aggregate(ops) | Rvalue::Enum { ops, .. } => {
+            for op in ops {
+                f(op);
+            }
+        }
+        // `&place`, `Len(place)`, `discriminant(place)` read a place, not an
+        // operand; treat a non-deref read of a local as a use of that local.
+        Rvalue::Ref { place, .. }
+        | Rvalue::RawRef { place, .. }
+        | Rvalue::Len(place)
+        | Rvalue::Discriminant(place) => {
+            if !matches!(place.proj.first(), Some(Proj::Deref)) {
+                f(&Operand::Copy(place.clone()));
+            }
+        }
+        Rvalue::Unsupported(_) => {}
+    }
+}
+
+/// Whether a terminator reads `local`.
+fn terminator_reads(t: &Terminator, local: u32) -> bool {
+    let mut hit = false;
+    let mut check = |op: &Operand| {
+        if let Operand::Copy(p) | Operand::Move(p) = op {
+            if p.local == local {
+                hit = true;
+            }
+        }
+    };
+    match t {
+        Terminator::SwitchInt { discr, .. } => check(discr),
+        Terminator::Assert { cond, .. } => check(cond),
+        Terminator::Call { args, .. } => {
+            for a in args {
+                check(a);
+            }
+        }
+        _ => {}
+    }
+    hit
+}
+
 
 /// The NaN guard a float comparison needs after `ucomisd`/`ucomiss`.
 enum Guard {

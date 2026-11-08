@@ -329,6 +329,14 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
 - Local `_0` is the return value; `return` reads it without naming it, so
   `use_counts` does not see that read. Any "unread local" test must special-case
   `_0` or it will delete a function's result.
+- **A `bool` that folds into a terminator is only dead if nothing else reads it.**
+  `compare_branch_skip` drops the statement that computes the `switchInt`/`assert`
+  condition, because the terminator emits the `cmp`+`jcc` itself. But rustc reuses
+  one temporary across a loop body: a `while` that indexes the same array twice
+  has two `assert`s reading one `_15`, and the first folds it away, so the second
+  read a never-written slot and trapped (`exit 101`). The skip now consults
+  `local_used_elsewhere` first; keep that guard on any new fold. Pinned by
+  `tests/std/reusedcheck.rs`.
 - A trap block is emitted inline in the fall-through position, so the common path
   takes a taken branch over it. `mix`'s `%` loop pays that branch once per
   iteration; it is not free.
