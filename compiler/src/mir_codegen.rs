@@ -138,8 +138,11 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<String, String> {
     let alloc_labels: HashMap<u32, String> =
         prog.allocs.keys().map(|id| (*id, format!("__rmc_alloc{id}"))).collect();
 
-    let structs = collect_structs(prog);
+    // Enums first: `collect_structs` consults the variant tables to tell a
+    // path-qualified struct constant (`std::ops::Range::<usize> { .. }`) from an
+    // enum-variant constant (`Option::Some(..)`).
     let enums = collect_enums(prog);
+    let structs = collect_structs(prog, &enums);
 
     // Deref trampolines for reference placeholders are module-scoped and emitted
     // once, after every function body (see `FnGen::deref_fmt_label`).
@@ -588,7 +591,7 @@ fn collect_templates_rv(rv: &Rvalue, order: &mut Vec<Vec<u8>>, map: &mut HashMap
 }
 
 /// Struct name -> field types, learned from aggregate constructions.
-fn collect_structs(prog: &Program) -> HashMap<String, Vec<Ty>> {
+fn collect_structs(prog: &Program, enums: &HashMap<String, EnumLayout>) -> HashMap<String, Vec<Ty>> {
     let mut structs: HashMap<String, Vec<Ty>> = HashMap::new();
     for f in &prog.funcs {
         for l in &f.locals {
@@ -608,14 +611,20 @@ fn collect_structs(prog: &Program) -> HashMap<String, Vec<Ty>> {
                         }
                     }
                     // An aggregate *constant* (`const P { .. }`) carries its own
-                    // field list, so learn the struct's shape from it too.
+                    // field list, so learn the struct's shape from it too. A
+                    // path-qualified name (`std::ops::Range::<usize> { .. }`) is
+                    // registered under its last segment (`Range`) so it matches
+                    // the key `materialize_const_agg` looks up; a variant is not,
+                    // or it would shadow the enum's own layout.
                     let mut aggs = Vec::new();
                     rv_const_aggs(rv, &mut aggs);
                     for (name, ops) in aggs {
-                        if !name.is_empty() && !name.contains("::") {
-                            let tys = ops.iter().map(|op| rv_operand_ty(f, op)).collect();
-                            structs.insert(name, tys);
+                        if name.is_empty() || is_variant_const(&name, &enums) {
+                            continue;
                         }
+                        let key = struct_path_name(&name).unwrap_or_else(|| name.clone());
+                        let tys = ops.iter().map(|op| rv_operand_ty(f, op)).collect();
+                        structs.insert(key, tys);
                     }
                 }
             }
@@ -681,6 +690,48 @@ fn split_ev(name: &str) -> (String, String) {
     (head.trim().to_string(), variant)
 }
 
+/// The struct name a path-qualified aggregate constant names, if the path's
+/// last segment is a plausible Rust *type* name. `std::ops::Range::<usize>`
+/// yields `Range`, so `collect_structs` and `materialize_const_agg` can agree
+/// on a key for a struct constant that the printer spelled out with its full
+/// path (`Range::<usize> { start: .., end: .. }`).
+///
+/// A variant is a CamelCase identifier and so is a type, so this cannot
+/// separate `Option::Some` from `Range` on shape alone. The caller resolves the
+/// ambiguity with the variant table `collect_enums` already built.
+fn struct_path_name(name: &str) -> Option<String> {
+    let head = name.split("::<").next().unwrap_or(name);
+    let last = head.rsplit("::").next().unwrap_or(head).trim();
+    let ok = !last.is_empty()
+        && last.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && last.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    ok.then(|| last.to_string())
+}
+
+/// Whether a constant named `name` is an enum variant rather than a struct,
+/// given the variant tables `collect_enums` has already built. A bare `Some(1)`
+/// (the printer drops the enum when the type is inferred) has no `::`, so its
+/// head is the variant itself; a path-qualified name is a variant only if its
+/// head names a known enum that has that variant.
+fn is_variant_const(name: &str, enums: &HashMap<String, EnumLayout>) -> bool {
+    if name.contains("::") {
+        let (e, v) = split_ev(name);
+        enums.get(&e).is_some_and(|l| l.fields.contains_key(&v))
+    } else {
+        enums.values().any(|l| l.fields.contains_key(name.trim()))
+    }
+}
+
+/// Whether `s` is a Rust identifier, so a `split_ev` "variant" is a real
+/// variant name and not a generic argument. `std::ops::Range::<usize>` splits
+/// to variant `"<usize>"`, which is not an identifier, and so is a struct, not
+/// an enum.
+fn is_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Learn each enum's layout from how the program uses it: its constructions
 /// give the payload field types, and a `discriminant` switch gives the tag
 /// values. Only the shapes the backend models are described; an enum with a
@@ -710,6 +761,14 @@ fn collect_enums(prog: &Program) -> HashMap<String, EnumLayout> {
                             continue;
                         }
                         let (e, v) = split_ev(&name);
+                        // `std::ops::Range::<usize> { start, end }` splits to a
+                        // variant that is not an identifier: it is a struct the
+                        // printer spelled with its path, not an enum variant, and
+                        // registering it would give the struct a phantom tag
+                        // word. Skip it; `collect_structs` claims it instead.
+                        if !is_ident(&v) {
+                            continue;
+                        }
                         let tys: Vec<Ty> = ops.iter().map(|op| rv_operand_ty(f, op)).collect();
                         fields.entry(e.clone()).or_default().entry(v.clone()).or_insert(tys);
                         let ord = order.entry(e).or_default();
@@ -2443,8 +2502,14 @@ impl<'a> FnGen<'a> {
         let Const::Agg { name, ops } = c else {
             return Err("mir_codegen: aggregate constant unsupported".into());
         };
-        // The aggregate's kind and the byte offset of each field.
-        let (offs, size): (Vec<i64>, i64) = if name.contains("::") {
+        // The aggregate's kind and the byte offset of each field. A
+        // path-qualified name is an enum only when its head names one the
+        // variant tables know: `Option::Some(1)` is a variant, while
+        // `std::ops::Range::<usize> { start: 1, end: 3 }` is a struct the
+        // printer spelled out with its full path. Treating that struct as an
+        // enum reserved a tag word and shifted `start`/`end`, so `r.start`
+        // read the tag (`0`) instead of `1`.
+        let (offs, size): (Vec<i64>, i64) = if is_variant_const(name, &self.enums) {
             let (en, v) = split_ev(name);
             let Some(l) = self.enums.get(&en) else {
                 return Err(format!("mir_codegen: unknown enum `{en}`"));
@@ -2460,7 +2525,8 @@ impl<'a> FnGen<'a> {
         } else if name.is_empty() {
             ((0..ops.len()).map(|k| k as i64 * 8).collect(), (ops.len() as i64 * 8).max(8))
         } else {
-            let tys = self.structs.get(name).cloned().unwrap_or_default();
+            let key = struct_path_name(name).unwrap_or_else(|| name.clone());
+            let tys = self.structs.get(&key).cloned().unwrap_or_default();
             let mut offs = Vec::new();
             let mut acc = 0i64;
             for t in &tys {
@@ -2481,7 +2547,7 @@ impl<'a> FnGen<'a> {
         // `lea` for the region base cannot clobber an earlier value. An enum's
         // first word is its tag, an immediate.
         let mut vals: Vec<(i64, Option<i64>, Option<i64>)> = Vec::new();
-        let tag_first = name.contains("::");
+        let tag_first = is_variant_const(name, &self.enums);
         for (k, op) in ops.iter().enumerate() {
             // A zero-sized field stores nothing and takes no word, so it must
             // not consume a slot (nor shift the fields after it).
