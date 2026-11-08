@@ -343,6 +343,22 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   register.** The value being shifted is parked in a frame slot across the count
   evaluation, not in `%rdx` (the MIR back end has no spill of caller-saved
   registers around an arbitrary call).
+- **`copy_words` uses `%r10`/`%r11`, never `%rsi`/`%rdi`.** `%rsi`/`%rdi` can
+  hold a caller-saved *promoted* local (a value in a register rather than the
+  frame), so an aggregate copy that parked its source/destination in them
+  clobbered a live value - a float accumulator survived a `for` loop but not the
+  aggregate literal built after it. `%r10`/`%r11` are the `div`/`rem` scratch and
+  are never promoted. Any new emitter that uses `%rsi`/`%rdi`/`%r8`/`%r9` as
+  scratch must first confirm no promotion can be live there.
+- **An enum's size is `tag + (words in its widest variant)`, not a fixed two
+  words.** The backend models a payload enum as tag-then-payload, but a variant
+  with two fields (a `Rect { w, h }`) needs two payload words; sizing at one
+  word made an array of such an enum overlap its neighbour and corrupt the next
+  element. A float payload is one word here, so it still counts.
+- **A `Transmute` cast (`f64::to_bits`, `u64::from_bits`) copies bits, it does
+  not convert.** `CastKind::Transmute` must be handled as a plain move *before*
+  the float-cast path, or `1.5f64.to_bits()` rounds to `1` instead of yielding
+  `0x3ff8000000000000`.
 - `main.rs::run_mir_pipeline` honours `--no-inline`/`--no-licm`/`--no-tco`, the
   same gates the `.rms` path uses, so the fuzzer's per-pass matrix applies to
   both pipelines.

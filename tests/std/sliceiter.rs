@@ -40,4 +40,12 @@ fn main() {
         total += area(s);
     }
     println!("{:x}", total.to_bits());
+
+    // A second aggregate literal *after* `total` is live. Building it copies
+    // aggregate words, so the copy must not use a register `total` occupies.
+    let more = [Shape::Rect { w: 1.0, h: 1.0 }, Shape::Circle(1.0)];
+    for s in &more {
+        total += area(s);
+    }
+    println!("{:x}", total.to_bits());
 }
