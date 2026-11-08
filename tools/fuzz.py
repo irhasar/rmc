@@ -324,6 +324,54 @@ def gen_expr_program(rng):
     return "\n".join(rms), "\n".join(rs)
 
 
+def gen_printfmt_program(rng):
+    """`print!`/`println!` with a literal format string, `{}` substitution,
+    literal braces, escapes, and an empty format. The pieces are joined so a
+    single format can mix all three argument types, and the leading/trailing
+    text differs from run to run so a dropped or duplicated newline shows up.
+    A `println!` and a `print!` are both emitted, since the newline is the one
+    thing `println!` adds over `print!`."""
+    def word():
+        return "".join(rng.choice("xyz") for _ in range(rng.randint(0, 3)))
+
+    def piece():
+        r = rng.random()
+        if r < 0.3:
+            return word(), f"{rng.randint(-99, 99)}"          # i64
+        if r < 0.5:
+            return word(), f"({rng.randint(0, 9)} < {rng.randint(0, 9)})"  # bool
+        if r < 0.65:
+            return word(), gen_str_lit(rng)                    # str
+        return "{{}}", None                                    # literal braces
+
+    def one(macro, out_rms, out_rs, leading):
+        fmt, args = leading, []
+        for _ in range(rng.randint(0, 3)):
+            w, a = piece()
+            fmt += w + "{}" if a is not None else w
+            if a is not None:
+                args.append(a)
+        body = f'"{fmt}"' + ("".join(", " + a for a in args))
+        out_rms.append(f"    {macro}!({body});")
+        out_rs.append(f"    {macro}!({body});")
+
+    rms = ["fn main() -> i64 {"]
+    rs = ["fn main() {"]
+    for _ in range(rng.randint(1, 5)):
+        macro = rng.choice(["print", "println", "println"])
+        leading = word()
+        if rng.random() < 0.3:
+            leading = "\\n" + leading
+        one(macro, rms, rs, leading)
+    # A bare `println!()` / `print!()` with no format string at all.
+    if rng.random() < 0.5:
+        rms.append("    println!();")
+        rs.append("    println!();")
+    rms += ["    return 0;", "}"]
+    rs += ["}"]
+    return "\n".join(rms), "\n".join(rs)
+
+
 def gen_cast_program(rng):
     """Expressions that sit on the `as` / unary precedence boundary. `as` binds
     looser than `* - ! &`, so `*r as i64` is `(*r) as i64` and `-a as i64` is
@@ -3728,7 +3776,7 @@ def gen_typealias_program(rng):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "intmeth", "nestedfn", "typealias", "robust", "reject", "mutate"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "intmeth", "nestedfn", "typealias", "printfmt", "robust", "reject", "mutate"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -3783,7 +3831,8 @@ def main():
            "tuple": gen_tuple_program,
            "intmeth": gen_intmeth_program,
            "nestedfn": gen_nestedfn_program,
-           "typealias": gen_typealias_program}[args.mode]
+           "typealias": gen_typealias_program,
+           "printfmt": gen_printfmt_program}[args.mode]
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus
     # suite; a fuzz program is otherwise only checked with every pass on, so a
