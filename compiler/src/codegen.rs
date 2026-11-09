@@ -1370,6 +1370,22 @@ impl Codegen {
                 self.raw(&format!("{top}:"));
                 self.gen_block(body);
                 self.raw(&format!("{cont}:"));
+                // An inclusive loop must stop *before* incrementing past the
+                // endpoint: `MAX..=MAX` would otherwise wrap the counter to
+                // MIN and loop forever. Only a variable or `i64::MAX` endpoint
+                // can reach the wrap, so a smaller constant bound keeps the
+                // branch-free increment.
+                if *inclusive && !matches!(end_imm, Some(k) if k != i64::MAX) {
+                    self.gen_var_operand(*var_slot, "%rax");
+                    match end_imm {
+                        Some(k) => self.line(&format!("cmp ${k}, %rax")),
+                        None => {
+                            self.gen_var_operand(*end_slot, "%rcx");
+                            self.line("cmp %rcx, %rax");
+                        }
+                    }
+                    self.line(&format!("je {exit}"));
+                }
                 self.inc_slot(*var_slot);
                 self.raw(&format!("{guard}:"));
                 self.gen_var_operand(*var_slot, "%rax");

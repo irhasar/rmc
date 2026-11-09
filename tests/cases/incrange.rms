@@ -1,0 +1,21 @@
+// An inclusive `for` must not increment past the endpoint. `MAX..=MAX` runs
+// once and stops; a loop that incremented first and tested `<=` afterwards
+// would wrap the counter to `i64::MIN` and spin forever.
+fn main() -> i64 {
+    let mut c: i64 = 0;
+    for i in 9223372036854775805..=9223372036854775807 {
+        c = c + 1;
+    }
+    print_i64(c);
+    let mut d: i64 = 0;
+    for i in 0..=3 {
+        d = d + i;
+    }
+    print_i64(d);
+    let mut e: i64 = 0;
+    for i in 9223372036854775807..=9223372036854775807 {
+        e = e + 1;
+    }
+    print_i64(e);
+    return 0;
+}

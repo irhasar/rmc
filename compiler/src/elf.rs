@@ -104,7 +104,10 @@ impl Elf {
 
     fn parse(&mut self, asm: &str) -> Result<(), String> {
         let mut cur = self.text_idx;
-        let mut sets: Vec<(String, String, String)> = Vec::new();
+        // Each `.set` records the section current when it appeared, so a
+        // later `.` resolves against that section, not the last one the file
+        // happened to switch to.
+        let mut sets: Vec<(String, String, String, usize)> = Vec::new();
 
         for (lineno, raw) in asm.lines().enumerate() {
             let mut line = strip_comment(raw).trim();
@@ -133,8 +136,8 @@ impl Elf {
             self.instruction(line, cur).map_err(|e| format!("{e} (line {})", lineno + 1))?;
         }
 
-        for (name, a, b) in sets {
-            let (va, sa) = self.sym_value(&a, cur)?;
+        for (name, a, b, sec) in sets {
+            let (va, sa) = self.sym_value(&a, sec)?;
             let (vb, _) = self.sym_value(&b, cur)?;
             self.syms.insert(name, Sym { sec: sa, off: (va - vb) as u64, abs: true });
         }
@@ -145,7 +148,7 @@ impl Elf {
         &mut self,
         rest: &str,
         cur: &mut usize,
-        sets: &mut Vec<(String, String, String)>,
+        sets: &mut Vec<(String, String, String, usize)>,
     ) -> Result<(), String> {
         let mut it = rest.splitn(2, char::is_whitespace);
         let name = it.next().unwrap_or("");
@@ -207,7 +210,12 @@ impl Elf {
             "set" => {
                 let (n, expr) = arg.split_once(',').ok_or("elf: bad .set")?;
                 let (a, b) = expr.split_once('-').ok_or("elf: bad .set expression")?;
-                sets.push((n.trim().to_string(), a.trim().to_string(), b.trim().to_string()));
+                sets.push((
+                    n.trim().to_string(),
+                    a.trim().to_string(),
+                    b.trim().to_string(),
+                    *cur,
+                ));
             }
             other => return Err(format!("elf: unsupported directive `.{other}`")),
         }

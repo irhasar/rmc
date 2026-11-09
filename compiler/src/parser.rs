@@ -763,7 +763,7 @@ impl Parser {
             });
         }
         let body = self.parse_block()?;
-        Ok(self.desugar_for_array(pat, head, body, label))
+        self.desugar_for_array(pat, head, body, label)
     }
 
     /// `for PAT in ARRAY { body }` -> an index loop over the array (see
@@ -771,7 +771,7 @@ impl Parser {
     /// rejected rather than mis-bound, since rmc has no destructuring `let`.
     /// A label on the `for` is carried to the desugared loop, so `break 'a`
     /// still targets it.
-    fn desugar_for_array(&mut self, pat: Pat, arr: Expr, body: Block, label: Option<String>) -> Stmt {
+    fn desugar_for_array(&mut self, pat: Pat, arr: Expr, body: Block, label: Option<String>) -> PResult<Stmt> {
         let n = self.tmp;
         self.tmp += 1;
         let arr_name = format!("\u{0}fa{n}");
@@ -780,10 +780,10 @@ impl Parser {
             Pat::Bind(name) => name,
             Pat::Wild => format!("\u{0}fd{n}"),
             _ => {
-                return Stmt::Expr(Expr::Block(Block {
-                    stmts: vec![Stmt::Expr(Expr::Int(0))],
-                    tail: None,
-                }))
+                return Err(format!(
+                    "at byte {}: `for` over an array needs a binding or `_`",
+                    self.pos()
+                ))
             }
         };
         let arr_var =
@@ -825,7 +825,7 @@ impl Parser {
             slot: -1,
             mutable: false,
         };
-        Stmt::Expr(Expr::Block(Block { stmts: vec![arr_let, for_stmt], tail: None }))
+        Ok(Stmt::Expr(Expr::Block(Block { stmts: vec![arr_let, for_stmt], tail: None })))
     }
 
     /// Consume the `;` that ends a statement, but allow it to be omitted when

@@ -553,6 +553,12 @@ def gen_stmt_program(rng):
     rs.append(f"    let fb: i64 = {fb};")
     rms.append(f"    for fi in fa{op}fb {{ acc = acc + fi * 3; }}")
     rs.append(f"    for fi in fa{op}fb {{ acc += fi * 3; }}")
+    # An inclusive range ending at `i64::MAX`. A loop that increments before the
+    # `<=` test wraps the counter to `i64::MIN` and never terminates (the run
+    # times out); the body adds a bounded amount, so a wrong iteration count
+    # shows up as well if the loop does stop.
+    rms.append("    for mi in 9223372036854775805..=9223372036854775807 { acc = acc + 1; }")
+    rs.append("    for mi in 9223372036854775805i64..=9223372036854775807 { acc += 1; }")
     # `for x in ARRAY`: the array is iterated by value, and the head is a local
     # (not a literal) so a stale read shows up. A `continue` keeps the increment
     # path live, and a wildcard counts the elements.
@@ -1845,6 +1851,39 @@ def reject_corpus():
         "iflet_irrefutable_nonunit_without_else": (
             "fn main() -> i64 { let o: i64 = 3; if let y = o { 1 } return 0; }\n",
             "fn main() { let o = 3i64; if let y = o { 1 } }\n",
+        ),
+        # `for PAT in ARRAY` needs a plain binding or `_`. A compound pattern
+        # (`[a, b]`, `(a, b)`, a struct pattern) is rejected rather than
+        # mis-bound to a single element, since rmc has no destructuring `let`.
+        "for_array_compound_pattern": (
+            "fn main() -> i64 {\n"
+            "    let a: [i64; 3] = [10, 20, 30];\n"
+            "    let mut s: i64 = 0;\n"
+            "    for [x, y, z] in a { s = s + x + y + z; }\n"
+            "    print_i64(s);\n"
+            "    return 0;\n"
+            "}\n",
+            "fn main() {\n"
+            "    let a = [10i64, 20, 30];\n"
+            "    let mut s = 0i64;\n"
+            "    for [x, y, z] in a { s += x + y + z; }\n"
+            "    println!(\"{}\", s);\n"
+            "}\n",
+        ),
+        "for_array_tuple_pattern": (
+            "fn main() -> i64 {\n"
+            "    let a: [i64; 2] = [10, 20];\n"
+            "    let mut s: i64 = 0;\n"
+            "    for (x, y) in a { s = s + x + y; }\n"
+            "    print_i64(s);\n"
+            "    return 0;\n"
+            "}\n",
+            "fn main() {\n"
+            "    let a = [10i64, 20];\n"
+            "    let mut s = 0i64;\n"
+            "    for (x, y) in a { s += x + y; }\n"
+            "    println!(\"{}\", s);\n"
+            "}\n",
         ),
     }
 

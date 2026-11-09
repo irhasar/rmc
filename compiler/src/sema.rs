@@ -1484,7 +1484,53 @@ impl Sema {
     /// at different addresses. `lt(a, b)` is emitted once for `a < b` and
     /// `b < a`, and `Eq`/`Ne`/`Le`/`Ge` are built from them, so the comparison
     /// matches Rust's byte-wise `str` ordering.
-    fn str_cmp(op: BinOp, a: &Expr, b: &Expr) -> Expr {
+    /// True for a `str` operand whose evaluation reads no memory that a later
+    /// operand could write and runs no call, so it can be duplicated by
+    /// `str_cmp_body` without repeating a side effect or reordering one.
+    fn str_operand_is_pure(e: &Expr) -> bool {
+        match e {
+            Expr::Str(_) | Expr::Var { .. } => true,
+            Expr::Field { base, .. } => Self::str_operand_is_pure(base),
+            _ => false,
+        }
+    }
+
+    /// Rewrite a `str` comparison, binding both operands to fresh `str` locals
+    /// in source order first when either can have an effect. `str_cmp_body`
+    /// duplicates an operand (once per `lt` direction), and `Gt`/`Le` pass the
+    /// right operand first; both would repeat or reorder a side effect, so an
+    /// effectful operand is evaluated once, left to right, into a local.
+    fn str_cmp(&mut self, op: BinOp, a: &Expr, b: &Expr) -> Expr {
+        if Self::str_operand_is_pure(a) && Self::str_operand_is_pure(b) {
+            return Self::str_cmp_body(op, a, b);
+        }
+        let sa = self.alloc_slot();
+        let sb = self.alloc_slot();
+        let an = "\u{0}sca".to_string();
+        let bn = "\u{0}scb".to_string();
+        let va = Expr::Var { name: an.clone(), slot: sa, ty: Type::Str };
+        let vb = Expr::Var { name: bn.clone(), slot: sb, ty: Type::Str };
+        let body = Self::str_cmp_body(op, &va, &vb);
+        let stmts = vec![
+            Stmt::Let {
+                name: an,
+                ty: Some(Type::Str),
+                init: Some(a.clone()),
+                slot: sa,
+                mutable: false,
+            },
+            Stmt::Let {
+                name: bn,
+                ty: Some(Type::Str),
+                init: Some(b.clone()),
+                slot: sb,
+                mutable: false,
+            },
+        ];
+        Expr::Block(Block { stmts, tail: Some(Box::new(body)) })
+    }
+
+    fn str_cmp_body(op: BinOp, a: &Expr, b: &Expr) -> Expr {
         let lt = |x: &Expr, y: &Expr| Expr::Call {
             name: "__rmc_str_lt".into(),
             args: vec![x.clone(), y.clone()],
@@ -1565,7 +1611,7 @@ impl Sema {
                             "comparison between different types: {ta:?} and {tb:?}"
                         ));
                     }
-                    let rewritten = Self::str_cmp(*op, a, b);
+                    let rewritten = self.str_cmp(*op, a, b);
                     *e = rewritten;
                     return self.check_expr(e, scope);
                 }
