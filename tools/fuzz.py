@@ -485,8 +485,14 @@ def gen_printfmt_program(rng):
         out_rms.append(f"    {macro}!({body});")
         out_rs.append(f"    {macro}!({body});")
 
-    rms = ["fn main() -> i64 {"]
-    rs = ["fn main() {"]
+    rms = [
+        "fn sh(t: i64) -> i64 { print_i64(t); return t; }",
+        "fn main() -> i64 {",
+    ]
+    rs = [
+        'fn sh(t: i64) -> i64 { println!("{}", t); t }',
+        "fn main() {",
+    ]
     for _ in range(rng.randint(1, 5)):
         macro = rng.choice(["print", "println", "println"])
         leading = word()
@@ -497,6 +503,14 @@ def gen_printfmt_program(rng):
     if rng.random() < 0.5:
         rms.append("    println!();")
         rs.append("    println!();")
+    # A `{}` argument that calls: every argument must be evaluated before the
+    # first byte of output, in source order, so a call in argument position
+    # prints before the literal that precedes it in the format string.
+    if rng.random() < 0.5:
+        a, b = rng.randint(-99, 99), rng.randint(-99, 99)
+        pre, mid = word(), word()
+        rms.append(f'    println!("{pre}{{}}{mid}{{}}", sh({a}), sh({b}));')
+        rs.append(f'    println!("{pre}{{}}{mid}{{}}", sh({a}), sh({b}));')
     rms += ["    return 0;", "}"]
     rs += ["}"]
     return "\n".join(rms), "\n".join(rs)

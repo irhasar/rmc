@@ -2163,6 +2163,26 @@ impl Parser {
         let mut stmts: Vec<Stmt> = Vec::new();
         let mut arg_i = 0usize;
         let mut lit: Vec<u8> = Vec::new();
+        // Rust evaluates every format argument before the first byte of output.
+        // The body below interleaves literal chunks with `{}` writes, so the
+        // raw arguments are bound to fresh locals first and the writes read
+        // those; otherwise `println!("A{}B{}", f(), g())` would print `A`, then
+        // run `f`, then print `f`'s value. Each local is `_`-prefixed and
+        // untyped so sema infers the value's type and `__rmc_print` still picks
+        // the matching writer.
+        let mut bound: Vec<Expr> = Vec::new();
+        for (i, arg) in args.iter().enumerate() {
+            let name = format!("\u{0}fmt{i}");
+            stmts.push(Stmt::Let {
+                name: name.clone(),
+                ty: None,
+                init: Some(arg.clone()),
+                slot: -1,
+                mutable: false,
+            });
+            bound.push(Expr::Var { name, slot: -1, ty: Type::I64 });
+        }
+        let args = bound;
         let flush = |lit: &mut Vec<u8>, stmts: &mut Vec<Stmt>| {
             if !lit.is_empty() {
                 let s = String::from_utf8(lit.clone()).unwrap_or_default();

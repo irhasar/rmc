@@ -1,0 +1,18 @@
+// Every `{}` argument is evaluated before the first byte of output, in source
+// order, matching Rust. The `println!` lowering interleaves literal chunks with
+// `{}` writes, so `f`/`g` must run before "A" is printed, not between "A" and
+// `f`'s value.
+fn f() -> str {
+    print_str("1");
+    return "ten";
+}
+
+fn g() -> str {
+    print_str("2");
+    return "twenty";
+}
+
+fn main() -> i64 {
+    println!("A{}B{}", f(), g());
+    return 0;
+}
