@@ -3207,34 +3207,6 @@ fn split_top_as(s: &str) -> Option<(&str, &str)> {
 // Loop-invariant code motion
 // ---------------------------------------------------------------------------
 
-/// The functions a MIR function may call without observable side effects, so a
-/// call to one can be hoisted out of a loop. This is the MIR analogue of the
-/// AST backend's `licm` pass, which runs after inlining; rustc leaves the
-/// accessor calls in place, so they are hoisted here instead.
-///
-/// A call is only *hoisted* when every operand it reads is invariant and the
-/// callee does not write the caller's frame, which the purity list plus the
-/// no-memory-write rule below guarantee. This is a strict allowlist, not a
-/// denylist: a name that is not a known side-effect-free runtime leaf is treated
-/// as impure. A user function can print, mutate a global, or write through a
-/// pointer, and rmc does no interprocedural purity analysis, so hoisting its
-/// call out of a loop would drop the repeated side effects (`helper` printing on
-/// every iteration). Only helpers that read their arguments and return a value
-/// qualify.
-fn pure_call(name: &str) -> bool {
-    matches!(
-        name,
-        "__rmc_imin"
-            | "__rmc_imax"
-            | "__rmc_umin"
-            | "__rmc_umax"
-            | "__rmc_compare_bytes"
-            | "__rmc_str_len"
-            | "__rmc_str_lt"
-            | "__rmc_str_contains"
-    )
-}
-
 /// Halve the call tree of a single self-recursive function.
 ///
 /// `f(x) = t(x) op f(h(x))` recurses twice per level, so `fib(32)` makes
@@ -4667,10 +4639,16 @@ impl Function {
 /// a binding can make the loads that read through it invariant on the next
 /// round.
 pub fn licm(prog: &mut Program) {
+    // Interprocedural purity: a user function whose body only computes a value
+    // from its arguments (no store, no address-taking op, no call to a runtime
+    // helper or another impure function) is side-effect-free, so a call to it
+    // can be hoisted out of a loop. rustc leaves these accessor calls in place,
+    // and `refs` leans on hoisting `Wide::total`/`pair` out of the loop.
+    let pure_fns = pure_function_set(prog);
     for _ in 0..LICM_ROUNDS {
         let mut changed = false;
         for f in &mut prog.funcs {
-            if f.licm_once() {
+            if f.licm_once(&pure_fns) {
                 changed = true;
             }
         }
@@ -4678,6 +4656,63 @@ pub fn licm(prog: &mut Program) {
             break;
         }
     }
+}
+
+/// The names of the user functions whose bodies are side-effect-free, computed
+/// as a greatest fixpoint with a worklist: a function is impure if it stores to
+/// memory, takes an address, makes an indirect call, calls an unknown/extern
+/// function, or calls a function already known impure. Impurity propagates
+/// backwards along the call graph, so a recursive or mutually recursive group
+/// that only reads its arguments stays pure. Linear in the call graph, not a
+/// quadratic re-scan.
+fn pure_function_set(prog: &Program) -> HashSet<String> {
+    let index: HashMap<&str, usize> =
+        prog.funcs.iter().enumerate().map(|(i, f)| (f.name.as_str(), i)).collect();
+    let n = prog.funcs.len();
+    let mut impure = vec![false; n];
+    // Reverse call edges: `callers[callee]` lists the functions that call it.
+    let mut callers: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+    for (i, f) in prog.funcs.iter().enumerate() {
+        // A body-less declaration cannot be verified; treat it as impure.
+        if f.blocks.is_empty() {
+            impure[i] = true;
+            continue;
+        }
+        for b in &f.blocks {
+            if block_self_impure(b) {
+                impure[i] = true;
+            }
+            if let Terminator::Call { func: CallTarget::Direct(name), .. } = &b.term {
+                if pure_runtime_call(name) {
+                    continue;
+                }
+                match index.get(name.as_str()) {
+                    Some(&g) => callers[g].push(i),
+                    // An unknown name is a runtime helper rmc cannot vouch for.
+                    None => impure[i] = true,
+                }
+            }
+        }
+    }
+
+    // Propagate impurity backwards from the initially-impure functions.
+    let mut work: Vec<usize> = (0..n).filter(|&i| impure[i]).collect();
+    while let Some(g) = work.pop() {
+        for &caller in &callers[g] {
+            if !impure[caller] {
+                impure[caller] = true;
+                work.push(caller);
+            }
+        }
+    }
+
+    prog.funcs
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !impure[*i])
+        .map(|(_, f)| f.name.clone())
+        .collect()
 }
 
 impl Function {
@@ -4700,7 +4735,7 @@ impl Function {
     ///
     /// The preheader is the loop header's only predecessor. Hoisting to it is
     /// safe because it is entered on the way to the loop and executed once.
-    fn licm_once(&mut self) -> bool {
+    fn licm_once(&mut self, pure_fns: &HashSet<String>) -> bool {
         let nblocks = self.blocks.len();
         if nblocks == 0 {
             return false;
@@ -4710,7 +4745,11 @@ impl Function {
 
         // Which blocks write memory (a store, a call, or an address-taking op).
         let writes_mem: Vec<bool> = self.blocks.iter().map(|b| block_writes_mem(b)).collect();
-        let impure_call: Vec<bool> = self.blocks.iter().map(|b| block_has_impure_call(b)).collect();
+        let impure_call: Vec<bool> = self
+            .blocks
+            .iter()
+            .map(|b| block_has_impure_call(b, pure_fns))
+            .collect();
 
         // Predecessors, from the terminator successors.
         let mut preds: Vec<Vec<u32>> = vec![Vec::new(); nblocks];
@@ -4740,7 +4779,7 @@ impl Function {
 
         let mut any_changed = false;
         for header in headers {
-            if self.licm_loop(header, &latches, &preds, &defs, &use_counts, &writes_mem, &impure_call) {
+            if self.licm_loop(header, &latches, &preds, &defs, &use_counts, &writes_mem, &impure_call, pure_fns) {
                 any_changed = true;
             }
         }
@@ -4757,6 +4796,7 @@ impl Function {
         use_counts: &HashMap<u32, u32>,
         writes_mem: &[bool],
         impure_call: &[bool],
+        pure_fns: &HashSet<String>,
     ) -> bool {
         // The preheader is the header's only predecessor from *outside* the
         // loop: then the loop is entered from exactly one place, and hoisting to
@@ -4873,7 +4913,7 @@ impl Function {
                 continue;
             }
             let CallTarget::Direct(name) = func else { continue };
-            if !pure_call(name) {
+            if !call_is_pure(name, pure_fns) {
                 continue;
             }
             if !call_args_invariant(args, &is_invariant) {
@@ -5016,7 +5056,38 @@ fn call_args_invariant(args: &[Operand], is_invariant: &impl Fn(u32) -> bool) ->
 /// a projection (`*p = x`, `arr[i] = x`), an address-taking rvalue, or a call to
 /// a function that is not known pure. A pure call is not a store, so it does not
 /// block hoisting a load past it.
+/// The runtime helpers that are side-effect-free: they read their arguments and
+/// return a value, with no store and no syscall. A call to one is safe to hoist
+/// out of a loop.
+fn pure_runtime_call(name: &str) -> bool {
+    matches!(
+        name,
+        "__rmc_imin"
+            | "__rmc_imax"
+            | "__rmc_umin"
+            | "__rmc_umax"
+            | "__rmc_compare_bytes"
+            | "__rmc_str_len"
+            | "__rmc_str_lt"
+            | "__rmc_str_contains"
+    )
+}
+
+/// Whether a direct call is side-effect-free: a known pure runtime leaf, or a
+/// user function in the interprocedural purity set. Anything else (a runtime
+/// helper that prints or allocates, an unknown name) is treated as impure.
+fn call_is_pure(name: &str, pure_fns: &HashSet<String>) -> bool {
+    pure_runtime_call(name) || pure_fns.contains(name)
+}
+
 fn block_writes_mem(b: &BasicBlock) -> bool {
+    block_self_impure(b)
+}
+
+/// A statement or terminator that is a side effect *by itself*: a store, an
+/// address-taking op, or an indirect call. A direct call is judged separately
+/// (its callee may be pure).
+fn block_self_impure(b: &BasicBlock) -> bool {
     b.stmts.iter().any(|s| match s {
         Stmt::Assign(dest, rv) => {
             !dest.proj.is_empty()
@@ -5031,13 +5102,18 @@ fn block_writes_mem(b: &BasicBlock) -> bool {
                 )
         }
         Stmt::Nop => false,
-    }) || block_has_impure_call(b)
+    }) || matches!(
+        &b.term,
+        Terminator::Call { func: CallTarget::Indirect, .. }
+    )
 }
 
-/// True when a block contains a call that is not to a known-pure function.
-fn block_has_impure_call(b: &BasicBlock) -> bool {
+/// True when a block contains a call that is not known to be pure.
+fn block_has_impure_call(b: &BasicBlock, pure_fns: &HashSet<String>) -> bool {
     match &b.term {
-        Terminator::Call { func: CallTarget::Direct(name), .. } => !pure_call(name),
+        Terminator::Call { func: CallTarget::Direct(name), .. } => {
+            !call_is_pure(name, pure_fns)
+        }
         Terminator::Call { func: CallTarget::Indirect, .. } => true,
         _ => false,
     }
