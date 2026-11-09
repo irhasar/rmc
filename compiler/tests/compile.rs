@@ -1413,6 +1413,42 @@ fn a_guard_on_a_payload_binding_sees_the_binding() {
 }
 
 #[test]
+fn a_failed_guard_binding_does_not_shadow_the_fallback() {
+    // The arm binds `n`, but a later arm must resolve `n` to the outer binding,
+    // not to this arm's. `desugar_arm` used to wrap the whole `if` in the
+    // binding's block, so the `_` arm saw `n: i64` and the `if n` below was a
+    // type error. With the binding scoped to the guard and `then` only, the
+    // fallback reads the outer `bool`.
+    let src = "fn main() -> i64 { let n: bool = true; \
+               let r = match 0 { n if n == 5 => 1, _ => { if n { 7 } else { 8 } } }; \
+               return r; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_failed_payload_guard_does_not_shadow_the_fallback() {
+    // The payload-binding form of the same bug: `Opt::Some(x)` binds `x: i64`
+    // for its guard and body, but the `_` fallback must still see the outer
+    // `x: bool`.
+    let src = "enum Opt { None, Some(i64) } \
+               fn main() -> i64 { let x: bool = true; let o = Opt::Some(5); \
+               let r = match o { Opt::Some(x) if x > 0 => x, \
+               _ => { if x { 7 } else { 8 } } }; return r; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_failed_guard_binding_does_not_leak_an_unbound_name() {
+    // The `_` fallback names `g`, which only the failed arm bound. Because the
+    // binding must not reach the fallback, `g` is unbound and the program is
+    // rejected, exactly as rustc rejects it.
+    let src = "fn main() -> i64 { \
+               let r = match 0 { g if g == 5 => 1, _ => g }; return r; }";
+    let err = compile_to_asm(src, &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("unknown variable") || err.contains("`g`"), "got: {err}");
+}
+
+#[test]
 fn a_payload_enum_match_naming_every_variant_is_a_value() {
     // Pre-existing gap: the payload-binding block hid the chain from the
     // exhaustiveness walk, so this was wrongly rejected without a `_` arm.

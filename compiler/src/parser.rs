@@ -4018,16 +4018,29 @@ impl Parser {
         // and codegen need no new case for a guard: it is folded in with `&&`,
         // and an irrefutable arm's guard becomes the whole `if` condition.
         let (bindings, test) = Self::arm_pattern_parts(pat, &subj);
-        let arm = match test {
+        // The pattern's bindings belong to the guard and to the arm body, but
+        // NOT to the fallback `rest`: a later arm must not see this arm's names
+        // (`match x { n if false => n, _ => n }` must let the `_` arm read the
+        // outer `n`). So the bindings wrap the guard expression and the `then`
+        // block, never the whole `if`.
+        let with_bindings = |e: Expr| -> Expr {
+            if bindings.is_empty() {
+                e
+            } else {
+                Expr::Block(Block { stmts: bindings.clone(), tail: Some(Box::new(e)) })
+            }
+        };
+        let then = with_bindings(body);
+        Ok(match test {
             Some(cond) => {
                 // `pat if g => body` is `pat => body` only when `g` holds, so
                 // the guard joins the pattern test with `&&` and a failed guard
                 // falls through to `rest`.
                 let cond = match guard {
-                    Some(g) => Expr::Bin(BinOp::And, Box::new(cond), Box::new(g)),
+                    Some(g) => Expr::Bin(BinOp::And, Box::new(cond), Box::new(with_bindings(g))),
                     None => cond,
                 };
-                Self::match_arm(cond, body, rest)
+                Self::match_arm(cond, then, rest)
             }
             // An irrefutable arm: without a guard it always matches (and `rest`
             // is dead); with one it is `if g { body } else { rest }`. The guard
@@ -4035,19 +4048,14 @@ impl Parser {
             // exhaustiveness walk can tell a guarded binding arm (covers
             // nothing) from an unguarded one (covers everything).
             None => match guard {
-                None => Self::irrefutable_arm(body, rest, check_dead),
+                None => Self::irrefutable_arm(then, rest, check_dead),
                 Some(g) => Self::match_arm(
-                    Expr::Bin(BinOp::And, Box::new(Expr::Bool(true)), Box::new(g)),
-                    body,
+                    Expr::Bin(BinOp::And, Box::new(Expr::Bool(true)), Box::new(with_bindings(g))),
+                    then,
                     rest,
                 ),
             },
-        };
-        if bindings.is_empty() {
-            Ok(arm)
-        } else {
-            Ok(Expr::Block(Block { stmts: bindings, tail: Some(Box::new(arm)) }))
-        }
+        })
     }
 
     /// An irrefutable arm (`_` or a binding) always matches, so `rest` (the

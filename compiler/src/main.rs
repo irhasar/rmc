@@ -76,6 +76,13 @@ fn parse_args() -> Result<Options, String> {
     }
 
     let input = input.ok_or("no input file given (see --help)")?;
+    // `--no-strip` exists so `nm`/`gdb`/`objdump` can read the artifact, which
+    // needs a symbol table. The in-process encoder builds none, so the flag
+    // selects the binutils path instead of silently producing a symbol-less
+    // binary.
+    if !strip {
+        binutils = true;
+    }
     let output = output.unwrap_or_else(|| {
         let stem = input.file_stem().unwrap_or_default();
         Path::new(".").join(stem)
