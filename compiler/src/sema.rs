@@ -99,6 +99,13 @@ pub struct Sema {
     /// top again). A `loop` that runs at most once keeps the straight-line
     /// write rules.
     loop_repeats: Vec<bool>,
+    /// Per enclosing loop, the definite-initialization state captured at each
+    /// `break` that leaves it. A `loop` runs its body at least once, so a
+    /// binding the loop initializes stays initialized afterwards — but only if
+    /// *every* exit leaves it initialized. `while`/`for` may run zero times, so
+    /// their entry is recorded but the merge is not used. Indexed like
+    /// `loop_stack`, so a labelled `break` records against its target loop.
+    loop_exits: Vec<Vec<Vec<bool>>>,
     ret_ty: Type,
     /// While checking the `else` chain of a desugared `match`: whether the
     /// whole chain names every variant of one enum. Decided once at the chain's
@@ -305,6 +312,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         loop_stack: Vec::new(),
         loop_marks: Vec::new(),
         loop_repeats: Vec::new(),
+        loop_exits: Vec::new(),
         ret_ty: Type::Unit,
         match_total: false,
         match_chain: false,
@@ -1548,7 +1556,9 @@ impl Sema {
                 // existed before the loop cannot be written inside it.
                 self.loop_marks.push(scope.len());
                 self.loop_repeats.push(true);
+                self.loop_exits.push(Vec::new());
                 self.check_block(body, scope)?;
+                self.loop_exits.pop();
                 self.loop_repeats.pop();
                 self.loop_marks.pop();
                 self.loop_stack.pop();
@@ -1595,7 +1605,9 @@ impl Sema {
                 });
                 self.loop_marks.push(mark);
                 self.loop_repeats.push(true);
+                self.loop_exits.push(Vec::new());
                 self.check_block(body, scope)?;
+                self.loop_exits.pop();
                 self.loop_repeats.pop();
                 self.loop_marks.pop();
                 self.loop_stack.pop();
@@ -1644,6 +1656,11 @@ impl Sema {
                         ))
                     }
                 };
+                // Record the initialization state this exit leaves behind, so
+                // the target loop can require every exit to initialize a binding
+                // before treating it as initialized after the loop.
+                let snap = Self::init_snapshot(scope);
+                self.loop_exits[idx].push(snap);
                 match v {
                     Some(e) => {
                         let t = self.check_expr(e, scope)?;
@@ -2486,12 +2503,9 @@ impl Sema {
             }
             Expr::Loop(body, slot, lty, label) => {
                 // A `loop` in value position yields the type of its `break`s.
-                // A `loop` runs its body at least once, so unlike `while`/`for`
-                // (which may run zero times) it does not restore the entry state:
-                // a binding the body initializes stays initialized afterwards.
-                // Merge the entry state back in as well, so a binding that was
-                // already initialized before the loop is still initialized when
-                // the body's `break` leaves it.
+                // A `loop` runs its body at least once, so a binding it
+                // initializes is initialized afterwards only if it was before,
+                // or every `break` that leaves the loop initializes it.
                 let init_before = Self::init_snapshot(scope);
                 self.loop_depth += 1;
                 self.loop_stack.push(LoopCtx {
@@ -2500,13 +2514,20 @@ impl Sema {
                 });
                 self.loop_marks.push(scope.len());
                 self.loop_repeats.push(block_repeats(body));
+                self.loop_exits.push(Vec::new());
                 let body_ty = self.check_block(body, scope)?;
+                let exits = self.loop_exits.pop().unwrap();
                 self.loop_repeats.pop();
                 self.loop_marks.pop();
                 let ctx = self.loop_stack.pop().unwrap();
                 self.loop_depth -= 1;
-                for (i, b) in scope.iter_mut().enumerate() {
-                    b.init = b.init || init_before.get(i).copied().unwrap_or(false);
+                // When no `break` can leave the loop it diverges, so nothing
+                // after is reachable and the state does not matter.
+                if block_has_break(body) {
+                    for (i, b) in scope.iter_mut().enumerate() {
+                        b.init = init_before.get(i).copied().unwrap_or(false)
+                            || exits.iter().all(|e| e.get(i).copied().unwrap_or(false));
+                    }
                 }
                 // The body's value is discarded: only `break value` reaches the
                 // loop's result. A body that can complete must therefore be
