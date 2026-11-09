@@ -76,6 +76,13 @@ fn parse_args() -> Result<Options, String> {
     }
 
     let input = input.ok_or("no input file given (see --help)")?;
+    // `--no-strip` asks for a symbol table so `nm`/`gdb` can read the artifact;
+    // `--min-size` runs `strip --strip-all`, which removes exactly that table.
+    // The two request opposite artifacts, so reject the combination rather than
+    // silently letting `--min-size` win.
+    if !strip && min_size {
+        return Err("--no-strip and --min-size conflict: --min-size strips the symbol table --no-strip keeps".into());
+    }
     // `--no-strip` exists so `nm`/`gdb`/`objdump` can read the artifact, which
     // needs a symbol table. The in-process encoder builds none, so the flag
     // selects the binutils path instead of silently producing a symbol-less

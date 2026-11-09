@@ -92,7 +92,12 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   parentheses) and threads it through `desugar_arm` as an `Option<Expr>`. The
   guard folds into the arm's condition rather than becoming a node, so sema and
   codegen gain no case; see the exhaustiveness notes below for the three rules a
-  guard changes.
+  guard changes. `desugar_match_arms` snapshots the scrutinee into a temporary
+  before the arm chain whenever it is not a literal or an enum constant, so a
+  guard that assigns the matched value (`match x { n if { x = 2; true } => n }`)
+  cannot change what the arm body's binding reads: the guard and the body share
+  the snapshot. rustc's borrow checker rejects that program (E0506), so no
+  differential twin exists; the snapshot is pinned by an end-to-end test.
   `while let PAT = EXPR { body }` is parsed here and desugared by
   `desugar_while_let` to `loop { if let PAT = EXPR { body } else { break; } }`,
   reusing the `if let` path, so sema and codegen gain no case. The scrutinee sits
@@ -707,12 +712,14 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   which compiles every case through both paths and requires identical output.
   The `--binutils` path still uses `ld --build-id=none -z noseparate-code
   --strip-all`; `--no-strip` keeps the symbol table, `--min-size` also runs
-  `strip --strip-section-headers`. Do not change the `--binutils` link back to
-  `-n` (nmagic): it packs every section into one read+write+execute `LOAD`
-  segment, a W^X violation, and is *larger*. `tests/run.py`'s `check_stripped`
-  pins the size ordering of all four variants, `check_no_rwx` fails on any
-  writable+executable `LOAD` segment, and `check_link_paths_agree` requires the
-  two link paths to behave identically.
+  `strip --strip-section-headers`. `--no-strip` and `--min-size` request
+  opposite artifacts, so `parse_args` rejects the pair instead of letting
+  `--min-size` strip the symbols `--no-strip` asked to keep. Do not change the
+  `--binutils` link back to `-n` (nmagic): it packs every section into one
+  read+write+execute `LOAD` segment, a W^X violation, and is *larger*.
+  `tests/run.py`'s `check_stripped` pins the size ordering of all four variants,
+  `check_no_rwx` fails on any writable+executable `LOAD` segment, and
+  `check_link_paths_agree` requires the two link paths to behave identically.
 - **In-process assembler gotchas.** The encoder in `src/elf.rs` is deliberately
   narrow; these are the encodings that are easy to get wrong and were each a
   real bug:

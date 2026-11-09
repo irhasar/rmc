@@ -3908,6 +3908,38 @@ fn a_struct_update_base_of_the_wrong_type_is_rejected() {
 }
 
 #[test]
+fn a_guard_that_mutates_the_scrutinee_keeps_the_matched_value() {
+    // A pattern binding captures the scrutinee when the arm matches. A guard
+    // that assigns the scrutinee (`x = 2`) must not change what the arm body
+    // reads: `n` keeps the value 1 the arm matched. rustc's borrow checker
+    // rejects this program (E0506), so it cannot live in the differential
+    // corpus; the value is pinned here by running the built binary.
+    let dir = std::env::temp_dir().join(format!("rmc-guardmut-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("m.rms");
+    let bin = dir.join("m.bin");
+    std::fs::write(
+        &src,
+        "fn main() -> i64 { let mut x: i64 = 1; \
+         let r: i64 = match x { n if { x = 2; true } => n, _ => 0 }; \
+         print_i64(r); return 0; }\n",
+    )
+    .unwrap();
+
+    let rmc = env!("CARGO_BIN_EXE_rmc");
+    let out = std::process::Command::new(rmc)
+        .arg("-o")
+        .arg(&bin)
+        .arg(&src)
+        .output()
+        .expect("run rmc");
+    assert!(out.status.success(), "rmc failed: {}", String::from_utf8_lossy(&out.stderr));
+    let run = std::process::Command::new(&bin).output().expect("run the binary");
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "1\n", "the guard must not change the bound value");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn no_strip_keeps_a_symbol_table_in_the_output() {
     // `--no-strip` exists so `nm` can read the artifact. The in-process encoder
     // writes no symbol table, so the flag must route through `as`/`ld` instead
@@ -3939,6 +3971,30 @@ fn no_strip_keeps_a_symbol_table_in_the_output() {
         symbols.contains("main") || !symbols.trim().is_empty(),
         "expected a symbol table, nm printed nothing"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn no_strip_conflicts_with_min_size() {
+    // `--min-size` strips the symbol table `--no-strip` asks to keep, so the
+    // combination is rejected rather than silently producing a stripped binary.
+    let dir = std::env::temp_dir().join(format!("rmc-conflict-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("m.rms");
+    std::fs::write(&src, "fn main() -> i64 { return 0; }\n").unwrap();
+
+    let rmc = env!("CARGO_BIN_EXE_rmc");
+    let out = std::process::Command::new(rmc)
+        .arg("--no-strip")
+        .arg("--min-size")
+        .arg("-o")
+        .arg(dir.join("m.bin"))
+        .arg(&src)
+        .output()
+        .expect("run rmc");
+    assert!(!out.status.success(), "the conflicting flags must be rejected");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("conflict"), "got: {stderr}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

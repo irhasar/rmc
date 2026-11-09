@@ -1674,15 +1674,25 @@ impl Parser {
         // *guarded* irrefutable arm is not a catch-all: `_ if c` can fail, so
         // the arms after it are still reachable.
         let has_catch_all = arms.iter().any(|(p, g, _)| g.is_none() && Self::pat_irrefutable(p));
+        // Snapshot the scrutinee into a temporary before the arm chain whenever
+        // it names a value that can change. A guard may assign the matched
+        // variable (`match x { n if { x = 2; true } => n }`); the pattern
+        // bindings and the body must keep the value captured when the arm
+        // matched, so the guard and the body both read this snapshot rather than
+        // a binding re-created after the guard ran. Without a guard nothing runs
+        // between an arm's test and its body, so a plain variable stays inline. A
+        // non-variable scrutinee is always evaluated once, matching Rust.
+        let has_guard = arms.iter().any(|(_, g, _)| g.is_some());
         let (subj, prelude) = match scrutinee {
-            Expr::Var { .. } | Expr::Int(_) | Expr::EnumVariant { .. } => (scrutinee, None),
+            Expr::Int(_) | Expr::EnumVariant { .. } => (scrutinee, None),
+            Expr::Var { .. } if !has_guard => (scrutinee, None),
             other => {
                 let name = format!("\u{0}mt{}", self.tmp);
                 self.tmp += 1;
                 (
                     Expr::Var { name: name.clone(), slot: -1, ty: Type::I64 },
                     // No annotation: the temp takes the scrutinee's type, which
-                    // may be an enum rather than an integer.
+                    // may be an enum or a bool rather than an integer.
                     Some(Stmt::Let { name, ty: None, init: Some(other), slot: -1, mutable: false }),
                 )
             }
