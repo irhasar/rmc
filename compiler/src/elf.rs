@@ -863,7 +863,12 @@ impl Elf {
             _ => unreachable!(),
         };
         let (reg, _) = parse_reg(&ops[0])?;
-        self.sections[sec].data.push(rex(true, ext, reg));
+        // Operand size follows the named register, like `enc_div`: `dec %ecx`
+        // is 32-bit and must not set REX.W, or the in-process bytes differ from
+        // `as`. A 64-bit operand still sets it.
+        if let Some(r) = rex_if_needed(reg_is_64(&ops[0]), ext, reg) {
+            self.sections[sec].data.push(r);
+        }
         // `inc`/`dec` are group-5 (`FF /0,/1`); `not`/`neg` are group-3
         // (`F7 /2,/3`). Using `FF` for `not`/`neg` would encode `call far`.
         self.sections[sec].data.push(if mnem == "inc" || mnem == "dec" { 0xFF } else { 0xF7 });

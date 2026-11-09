@@ -828,6 +828,7 @@ __rmc_clamp_msg: .ascii "rmc: clamp min > max\n"
     },
     Piece {
         text: r#"
+.text
 # long __rmc_count_ones(long x)  -- the number of set bits in `x`. A plain loop
 # over the 64 bits: `x & 1` tests the low bit, then `x` is shifted logically so
 # the sign bit is not replicated. The count is exact for every input, including
@@ -851,6 +852,7 @@ __rmc_count_ones:
     },
     Piece {
         text: r#"
+.text
 # long __rmc_leading_zeros(long x)  -- the number of high-order zero bits before
 # the first set bit; 64 when `x` is zero. `rdx` holds the remaining bits and
 # `rcx` counts the shifts, which equals the zeros above the top bit: `shr $63`
@@ -885,6 +887,7 @@ __rmc_leading_zeros:
     },
     Piece {
         text: r#"
+.text
 # long __rmc_trailing_zeros(long x)  -- the number of low-order zero bits before
 # the first set bit; 64 when `x` is zero. `rdx` holds the remaining bits and
 # `rcx` counts the zeros dropped so far. `and $1` sets ZF when the low bit is
@@ -916,6 +919,7 @@ __rmc_trailing_zeros:
     },
     Piece {
         text: r#"
+.text
 # long __rmc_swap_bytes(long x)  -- the byte order reversed. A single `bswap`
 # on the 64-bit register is exactly rustc's `i64::swap_bytes`; the in-process
 # encoder emits the same 0F C8+rd bytes that `as` assembles here.
@@ -931,6 +935,7 @@ __rmc_swap_bytes:
     },
     Piece {
         text: r#"
+.text
 # long __rmc_reverse_bits(long x)  -- the bit order reversed. A plain loop over
 # the 64 bits: each step shifts the result left and ORs in the low bit of the
 # remaining value, which is then shifted right. Like the other bit helpers it
@@ -956,6 +961,7 @@ __rmc_reverse_bits:
     },
     Piece {
         text: r#"
+.text
 # long __rmc_rotate_left(long x, long n)  -- the bits rotated left by `n`. The
 # count goes in `%cl`, and `rol %cl` masks it to 6 bits (0..63) in hardware,
 # exactly Rust's `n % 64`; `n` is never negated, so the result is exact for
@@ -973,6 +979,7 @@ __rmc_rotate_left:
     },
     Piece {
         text: r#"
+.text
 # long __rmc_rotate_right(long x, long n)  -- the bits rotated right by `n`. The
 # mirror of `__rmc_rotate_left`; `ror %cl` masks the count to 6 bits.
 .globl __rmc_rotate_right
