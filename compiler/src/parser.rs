@@ -477,6 +477,25 @@ impl Parser {
                 self.aliases.insert(name.clone(), expanded);
             }
         }
+        // Parse every target once more, now that the whole alias map is known.
+        // The first pass may have lowered a tuple (or array) whose element named
+        // an alias not yet parsed, baking a `Named` placeholder into the tuple
+        // struct's fields; a later pass would then see a stale layout. Rebuilding
+        // the tuple structs here, with every alias expanded, fixes
+        // `type Pair = (T, i64); type T = i64;` to match the backward order.
+        self.tuple_structs.clear();
+        self.tuple_defs.clear();
+        for (name, start) in &alias_spans {
+            self.i = *start;
+            let ty = self.parse_type()?;
+            self.aliases.insert(name.clone(), ty);
+        }
+        for (name, _) in &alias_spans {
+            if let Some(t) = self.aliases.get(name).cloned() {
+                let expanded = self.expand_alias_ty(&t, 0)?;
+                self.aliases.insert(name.clone(), expanded);
+            }
+        }
         // A `type` shares the type namespace with a struct and an enum, so a
         // collision is an error (rustc's E0428). It does *not* collide with a
         // `const` or a `fn`, which live in the value namespace. rmc keeps a

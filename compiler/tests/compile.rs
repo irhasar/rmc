@@ -5534,6 +5534,19 @@ fn a_type_alias_chain_resolves() {
 }
 
 #[test]
+fn a_tuple_alias_may_name_an_alias_declared_later() {
+    // `Pair` names `T`, which is declared after it. The pre-scan's first pass
+    // lowers `Pair` to a tuple struct whose element is still the unresolved
+    // `T`; the rebuild pass must redo it now that `T` is known, or the tuple's
+    // layout would be the placeholder's.
+    let out = asm(
+        "type Pair = (T, i64); type T = i64; \
+         fn main() -> i64 { let p: Pair = (5, 6); return p.0 + p.1; }",
+    );
+    assert!(out.contains("main:"));
+}
+
+#[test]
 fn a_struct_type_alias_is_the_struct_itself() {
     // `Pt` is `P`, so the literal, the fields and the layout are the struct's.
     let out = asm(
