@@ -2940,19 +2940,7 @@ impl<'a> FnGen<'a> {
                 self.emit(&format!("  movb {src}, {dst}"));
                 return Ok(());
             }
-            // A wide immediate has no `mov $imm, mem` encoding, so it goes
-            // through `%rcx` like a memory source.
-            if src.contains('(') || is_wide_imm(src) {
-                self.emit(&format!("  mov {src}, %rcx"));
-                self.emit(&format!("  mov %rcx, {dst}"));
-            } else if src.starts_with('$') {
-                // An unsuffixed `mov $imm, mem` is a 32-bit store, which would
-                // leave the high half of this 8-byte slot stale for a negative
-                // value; `movq` forces the sign-extending 64-bit form.
-                self.emit(&format!("  movq {src}, {dst}"));
-            } else {
-                self.emit(&format!("  mov {src}, {dst}"));
-            }
+            self.store_word(src, &dst);
             return Ok(());
         }
         if byte {

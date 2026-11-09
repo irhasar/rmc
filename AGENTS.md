@@ -446,7 +446,11 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   `IndexConst` there would scale by 8 and type the element `i64`, dropping the
   formatter pointer. A negative immediate stored into a frame slot must use a
   64-bit store (`movq $imm, mem`); the unsuffixed form is a 32-bit store that
-  leaves the high half stale.
+  zero-extends the value (`$-3` becomes `0xFFFFFFFD`) and leaves the high half
+  wrong. Every full-word store - an aggregate-constant field, an array element,
+  a `[x; N]` repeat, a projected store - must go through `store_word`, not a
+  raw `mov`: `let a = [-3i64, 5]; a[0]` printed `4294967293` until it did.
+  `tests/std/negagg.rs` guards it.
 - **The MIR scanners must skip string literals.** `matching`, `split_top_args`,
   `split_top_semi` and `split_top_as` walk a line by bracket depth, but a
   `format_args!` template or a `b"..."` byte string can contain `)`/`,`/`;`/`as`
@@ -508,6 +512,17 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   real `switchInt` tag still wins because only a *missing* tag is filled.
   `tests/std/nicheenums.rs` guards this. The same trap awaits any enum
   whose discriminant is only ever compared, never switched on.
+- **A constant's path-qualified *struct* name is not an enum variant.**
+  rustc spells a `Range` constant `std::ops::Range::<usize> { start, end }`,
+  so a name containing `::` does not imply a variant. `split_ev` cuts at the
+  *last* `::`, which for that name yields the generic argument `"<usize>"` as
+  the "variant"; treating it as one reserved a phantom tag word and shifted
+  every field by a slot (`let r = 1..3; r.start` printed `0`). Classify a
+  path-qualified constant by whether its `split_ev` variant is an identifier:
+  `collect_enums` skips a constant whose variant is not (`Range`), and
+  `is_variant_const` consults the variant table rather than the `::`. A struct
+  constant is registered under its last path segment so `materialize_const_agg`
+  and `collect_structs` agree on the key. `tests/std/structconst.rs` guards it.
 - **Formatting a reference must print the referent, not its address.**
   rustc's `Display for &T` calls the base formatter with a pointer to the
   referent, so a `&T` slot holds a *pointer to a pointer*. rmc's runtime
