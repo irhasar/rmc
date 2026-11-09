@@ -1150,8 +1150,12 @@ The checks, all in `sema.rs`:
   write — a field or element write does not initialize the aggregate, matching
   rustc's "partially assigned" rule, so reading it afterwards errors. A read of
   an uninitialized one errors. An `if`/`else` keeps a binding initialized only if both arms (or the
-  entry state) initialized it; a branch with no `else` and a loop body do not
-  count, because they may not run. This is deliberately conservative — it rejects
+  entry state) initialized it; a branch with no `else` does not count, because it
+  may not run, and a `while`/`for` body does not because the loop may run zero
+  times. A `loop` body counts only when every `break` that leaves the loop
+  initializes the binding: the loop runs at least once, but an exit taken before
+  the assignment leaves the binding uninitialized (rustc E0381), so the state at
+  each `break` is captured and merged. This is deliberately conservative — it rejects
   the uninitialized-array-filled-in-a-loop pattern (`let mut a: [i64; N]; while
   ... { a[i] = ..; } a[0]`), which rustc also rejects. Write the array with `= [0;
   N]` instead; the corpus cases do.
