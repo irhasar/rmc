@@ -887,9 +887,10 @@ impl Codegen {
             Expr::ArrayList(_) => unreachable!("sema rewrites ArrayList into a block"),
             Expr::TupleLit(_) => unreachable!("sema rewrites TupleLit into a StructLit"),
             Expr::MethodCall { .. } => unreachable!("sema rewrites MethodCall into a Call"),
-            Expr::PatScrutinee(_) => {
+Expr::PatScrutinee(_) => {
                 unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
             }
+            Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
             Expr::EnumVariant { .. } => {} // a tag has no subexpressions
             Expr::EnumCtor { args, slot, size, .. } => {
                 for a in args {
@@ -1837,9 +1838,10 @@ impl Codegen {
             Expr::ArrayList(_) => unreachable!("sema rewrites ArrayList into a block"),
             Expr::TupleLit(_) => unreachable!("sema rewrites TupleLit into a StructLit"),
             Expr::MethodCall { .. } => unreachable!("sema rewrites MethodCall into a Call"),
-            Expr::PatScrutinee(_) => {
+Expr::PatScrutinee(_) => {
                 unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
             }
+            Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
             Expr::EnumVariant { tag, .. } => {
                 self.line(&format!("mov ${tag}, %rax"));
                 Type::I64
@@ -2448,9 +2450,10 @@ impl Codegen {
             Expr::ArrayList(_) | Expr::TupleLit(_) | Expr::MethodCall { .. } => {
                 unreachable!("sema rewrites ArrayList, TupleLit and MethodCall")
             }
-            Expr::PatScrutinee(_) => {
+Expr::PatScrutinee(_) => {
                 unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
             }
+            Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
         }
     }
 

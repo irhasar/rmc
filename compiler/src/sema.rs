@@ -1316,9 +1316,20 @@ impl Sema {
 
     fn check_block(&mut self, b: &mut Block, scope: &mut Scope) -> Result<Type, String> {
         let mark = scope.len();
-        for st in &mut b.stmts {
-            self.check_stmt(st, scope)?;
+        // A struct pattern's type check (`Expr::PatCheck`) is a marker statement
+        // the parser inserts before the pattern's bindings. `check_stmt` reduces
+        // it to `true`; drop it afterwards so it never reaches the passes or
+        // codegen. It must be checked in order, after the scrutinee's own
+        // `let`, so it cannot be filtered out before the loop.
+        let mut kept: Vec<Stmt> = Vec::with_capacity(b.stmts.len());
+        for mut st in std::mem::take(&mut b.stmts) {
+            let is_pat_check = matches!(st, Stmt::Expr(Expr::PatCheck { .. }));
+            self.check_stmt(&mut st, scope)?;
+            if !is_pat_check {
+                kept.push(st);
+            }
         }
+        b.stmts = kept;
         let ty = match &mut b.tail {
             Some(e) => self.check_expr(e, scope)?,
             None => Type::Unit,
@@ -1826,6 +1837,10 @@ impl Sema {
             // after this pre-pass, so recurse into it here to see any `&mut` it
             // borrows (`match &mut x { 5 => .. }`).
             Expr::PatScrutinee(x) => Self::collect_mut_borrows(x, a, mb),
+            // A struct pattern's type claim is rewritten by `check_expr`, which
+            // runs after this pre-pass, so recurse into its scrutinee here to see
+            // any `&mut` it borrows (`let S { .. } = &mut x;`).
+            Expr::PatCheck { base, .. } => Self::collect_mut_borrows(base, a, mb),
             Expr::Bin(_, x, y) => {
                 Self::collect_mut_borrows(x, a, mb);
                 Self::collect_mut_borrows(y, a, mb);
@@ -3124,6 +3139,29 @@ impl Sema {
                         Ok(other)
                     }
                 }
+            }
+            Expr::PatCheck { base, pat_struct } => {
+                // A struct pattern names the struct it destructures; the field
+                // reads are then ordinary field accesses, which would happily
+                // find a same-named field of a *different* struct. Check the
+                // claim here and reduce the node to `true` so the passes and
+                // codegen see only a plain boolean.
+                let t = deref_ty(self.check_expr(base, scope)?);
+                match t {
+                    Type::Struct(name, _) if name == *pat_struct => {}
+                    Type::Struct(name, _) => {
+                        return Err(format!(
+                            "mismatched types: pattern `{pat_struct} {{ .. }}` cannot match a value of type `{name}`"
+                        ))
+                    }
+                    other => {
+                        return Err(format!(
+                            "struct pattern `{pat_struct} {{ .. }}` on a value of type {other:?}"
+                        ))
+                    }
+                }
+                *e = Expr::Bool(true);
+                Ok(Type::Bool)
             }
             Expr::Cast(inner, to) => {
                 let it = self.check_expr(inner, scope)?;

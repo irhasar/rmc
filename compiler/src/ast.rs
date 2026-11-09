@@ -343,6 +343,13 @@ pub enum Expr {
     /// reference and to the bare expression otherwise. It is consumed by
     /// `sema::check_expr` and never survives to codegen.
     PatScrutinee(Box<Expr>),
+    /// A struct pattern's claim that its scrutinee has the named struct type:
+    /// `A` in `A { x }` or `A { .. }`. Sema checks it against the scrutinee's
+    /// actual type and rewrites it to `true`, so it never reaches codegen. It is
+    /// emitted even for a pattern that binds no fields, and for a nested
+    /// pattern, so a pattern for one struct cannot bind a same-named field of
+    /// another (`let A { x } = B { x: 7 }` is rejected, as rustc rejects it).
+    PatCheck { base: Box<Expr>, pat_struct: String },
 }
 
 /// A field inside a struct literal, once sema has resolved its layout.

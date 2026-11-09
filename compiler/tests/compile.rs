@@ -458,6 +458,43 @@ fn a_struct_pattern_field_bound_twice_is_rejected() {
 }
 
 #[test]
+fn a_struct_pattern_for_a_different_struct_is_rejected() {
+    // The field read `b.x` would find `B`'s field even though the pattern says
+    // `A`, so the pattern's struct name must be checked against the scrutinee's
+    // type, exactly as rustc rejects this (E0308).
+    let err = compile_to_asm(
+        "struct A { x: i64 } struct B { x: i64 } \
+         fn main() -> i64 { let b = B { x: 7 }; let A { x } = b; return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("cannot match a value of type `B`"), "got: {err}");
+}
+
+#[test]
+fn a_struct_pattern_that_binds_nothing_still_checks_the_struct() {
+    // `A { .. }` emits no field read for sema to catch, so the check must be
+    // emitted independently of the fields.
+    let err = compile_to_asm(
+        "struct A { x: i64 } struct B { x: i64 } \
+         fn main() -> i64 { let b = B { x: 7 }; let A { .. } = b; return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("cannot match a value of type `B`"), "got: {err}");
+}
+
+#[test]
+fn a_struct_pattern_for_the_matching_struct_is_accepted() {
+    assert!(compile_to_asm(
+        "struct A { x: i64 } struct B { x: i64 } \
+         fn main() -> i64 { let a = A { x: 7 }; let A { x } = a; return x; }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
 fn an_unknown_struct_in_a_pattern_is_rejected() {
     let err = compile_to_asm(
         "struct P { x: i64 } \
@@ -478,7 +515,7 @@ fn a_struct_pattern_on_a_non_struct_scrutinee_is_rejected() {
         &CompileOptions::default(),
     )
     .unwrap_err();
-    assert!(err.contains("field access"), "got: {err}");
+    assert!(err.contains("struct pattern `P { .. }` on a value of type"), "got: {err}");
 }
 
 #[test]
@@ -755,7 +792,7 @@ fn a_let_destructuring_pattern_on_a_non_struct_is_rejected() {
         &CompileOptions::default(),
     )
     .unwrap_err();
-    assert!(err.contains("field access"), "got: {err}");
+    assert!(err.contains("struct pattern `P { .. }` on a value of type"), "got: {err}");
 }
 
 #[test]

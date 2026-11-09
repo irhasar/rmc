@@ -875,7 +875,7 @@ impl Parser {
     /// variant, an or-pattern) is rejected, as rustc rejects it for a parameter.
     fn param_pat_binds(&mut self, p: Pat, subj: &Expr) -> PResult<Vec<Stmt>> {
         match p {
-            Pat::Struct(_, fields) => Ok(Self::struct_pat_binds(&fields, subj)),
+            Pat::Struct(name, fields) => Ok(Self::struct_pat_binds(&fields, subj, &name)),
             Pat::Tuple(elems) => Ok(Self::tuple_pat_binds(&elems, subj)),
             Pat::Array { elems, rest, front } => {
                 Ok(Self::array_pat_binds(&elems, rest, front, subj))
@@ -1397,7 +1397,7 @@ impl Parser {
                 slot: -1,
                 mutable: false,
             }],
-            Pat::Struct(_, fields) => self.let_destructure_stmts(fields, None, elem),
+            Pat::Struct(name, fields) => self.let_destructure_stmts(name, fields, None, elem),
             Pat::Tuple(elems) => self.let_destructure_tuple_stmts(elems, None, elem),
             Pat::Array { elems, rest, front } => {
                 self.let_destructure_array_stmts(elems, rest, front, None, elem)
@@ -1609,8 +1609,8 @@ impl Parser {
                     let init = self.parse_expr()?;
                     self.expect(Tok::Semi)?;
                     match pat {
-                        Pat::Struct(_, fields) => {
-                            out.extend(self.let_destructure_stmts(fields, ty, init))
+                        Pat::Struct(name, fields) => {
+                            out.extend(self.let_destructure_stmts(name, fields, ty, init))
                         }
                         Pat::Tuple(elems) => {
                             out.extend(self.let_destructure_tuple_stmts(elems, ty, init))
@@ -3013,7 +3013,7 @@ impl Parser {
                     });
                     Self::pat_binds(sub, false, &field, &mut out);
                 }
-                Pat::Struct(_, inner) => out.extend(Self::struct_pat_binds(inner, &field)),
+                Pat::Struct(name, inner) => out.extend(Self::struct_pat_binds(inner, &field, &name)),
                 Pat::Tuple(inner) => out.extend(Self::tuple_pat_binds(inner, &field)),
                 Pat::Array { elems, rest, front } => {
                     out.extend(Self::array_pat_binds(elems, *rest, *front, &field))
@@ -3090,7 +3090,7 @@ impl Parser {
                     out.extend(Self::array_pat_binds(elems, *rest, *front, &index))
                 }
                 // A struct or tuple sub-pattern inside an array element.
-                Pat::Struct(_, fields) => out.extend(Self::struct_pat_binds(fields, &index)),
+                Pat::Struct(name, fields) => out.extend(Self::struct_pat_binds(fields, &index, &name)),
                 Pat::Tuple(elems) => out.extend(Self::tuple_pat_binds(elems, &index)),
                 _ => unreachable!("unexpected array sub-pattern"),
             }
@@ -3611,12 +3611,13 @@ impl Parser {
     /// it is still checked.
     fn let_destructure_stmts(
         &mut self,
+        name: String,
         fields: Vec<FieldPat>,
         ty: Option<Type>,
         init: Expr,
     ) -> Vec<Stmt> {
         let (mut out, subj) = self.let_destructure_prelude(ty, init);
-        out.extend(Self::struct_pat_binds(&fields, &subj));
+        out.extend(Self::struct_pat_binds(&fields, &subj, &name));
         out
     }
 
@@ -3684,8 +3685,14 @@ impl Parser {
     /// may auto-deref a `&S` scrutinee. `f: _` contributes no binding. A nested
     /// sub-pattern (`f: I { a }`) recurses with the field read as its
     /// sub-scrutinee, so the nested names become ordinary chained reads.
-    fn struct_pat_binds(fields: &[FieldPat], subj: &Expr) -> Vec<Stmt> {
-        let mut out = Vec::new();
+    fn struct_pat_binds(fields: &[FieldPat], subj: &Expr, pat_struct: &str) -> Vec<Stmt> {
+        // A check that `subj` is really a `pat_struct`, emitted even when the
+        // pattern binds no fields (`A { .. }`), so a pattern naming the wrong
+        // struct is rejected rather than silently matching.
+        let mut out = vec![Stmt::Expr(Expr::PatCheck {
+            base: Box::new(subj.clone()),
+            pat_struct: pat_struct.to_string(),
+        })];
         for (fname, bind) in fields {
             let (m, pat) = match bind {
                 Some(x) => x,
@@ -3717,7 +3724,9 @@ impl Parser {
                     });
                     Self::pat_binds(sub, false, &field, &mut out);
                 }
-                Pat::Struct(_, inner) => out.extend(Self::struct_pat_binds(inner, &field)),
+                Pat::Struct(inner_name, inner) => {
+                    out.extend(Self::struct_pat_binds(inner, &field, inner_name))
+                }
                 Pat::Tuple(inner) => out.extend(Self::tuple_pat_binds(inner, &field)),
                 // An array-typed field may be destructured by an array pattern.
                 Pat::Array { elems, rest, front } => {
@@ -3760,7 +3769,7 @@ impl Parser {
                 });
                 Self::pat_binds(sub, false, subj, out);
             }
-            Pat::Struct(_, fields) => out.extend(Self::struct_pat_binds(fields, subj)),
+            Pat::Struct(name, fields) => out.extend(Self::struct_pat_binds(fields, subj, &name)),
             Pat::Tuple(elems) => out.extend(Self::tuple_pat_binds(elems, subj)),
             Pat::Array { elems, rest, front } => {
                 out.extend(Self::array_pat_binds(elems, *rest, *front, subj))
@@ -3831,7 +3840,7 @@ impl Parser {
             // scrutinee by auto-deref. The struct name and each field name were
             // already checked against the prescan, so `f: _` (which emits no
             // read) is validated too.
-            Pat::Struct(_name, fields) => (Self::struct_pat_binds(&fields, &subj), None),
+            Pat::Struct(name, fields) => (Self::struct_pat_binds(&fields, &subj, &name), None),
             // `(a, b) => body` binds each named element via a field read. When
             // every element is irrefutable there is no test (a catch-all); a
             // scalar element (`(0, x)`) adds its test, folded into the arm's
