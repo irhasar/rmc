@@ -2543,9 +2543,16 @@ impl<'a> FnGen<'a> {
             let tag = self.variant_tag(&en, &v) as i64;
             Ok((offs, tys, l.size.max(8), Some(tag)))
         } else if name.is_empty() {
-            let offs = (0..ops.len()).map(|k| k as i64 * 8).collect();
-            let tys = ops.iter().map(|op| rv_operand_ty(&self.func, op)).collect();
-            Ok((offs, tys, (ops.len() as i64 * 8).max(8), None))
+            // A tuple or array constant is printed without a name; lay its
+            // fields out by their real sizes, as the struct branch does.
+            let tys: Vec<Ty> = ops.iter().map(|op| rv_operand_ty(&self.func, op)).collect();
+            let mut offs = Vec::new();
+            let mut acc = 0i64;
+            for t in &tys {
+                offs.push(acc);
+                acc += self.size_of_ty(t);
+            }
+            Ok((offs, tys, acc.max(8), None))
         } else {
             let key = struct_path_name(name).unwrap_or_else(|| name.clone());
             let tys = self.structs.get(&key).cloned().unwrap_or_default();
