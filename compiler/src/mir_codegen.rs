@@ -2218,8 +2218,8 @@ impl<'a> FnGen<'a> {
                 "%rax".to_string()
             }
             Const::Zst => "$0".to_string(),
-            Const::Agg { .. } => {
-                return Err("mir_codegen: aggregate constant not yet materialised".into());
+            Const::Agg { name, .. } => {
+                return Err(format!("mir_codegen: aggregate constant not yet materialised: `{name}`").into());
             }
             Const::Alloc { id, place } => {
                 let label = self
@@ -2496,6 +2496,22 @@ impl<'a> FnGen<'a> {
         }
     }
 
+    /// Store a full 64-bit word into a frame slot. An unsuffixed
+    /// `mov $imm, mem` assembles to a 32-bit store, which zero-extends a
+    /// negative immediate (`$-3` becomes `0xFFFFFFFD`); `movq` forces the
+    /// sign-extending 64-bit form, and a wide immediate has no memory form at
+    /// all and must go through `%rcx`.
+    fn store_word(&mut self, src: &str, dst: &str) {
+        if is_wide_imm(src) || src.contains('(') {
+            self.emit(&format!("  mov {src}, %rcx"));
+            self.emit(&format!("  mov %rcx, {dst}"));
+        } else if src.starts_with('$') {
+            self.emit(&format!("  movq {src}, {dst}"));
+        } else {
+            self.emit(&format!("  mov {src}, {dst}"));
+        }
+    }
+
     /// Write an aggregate constant into a fresh frame region and leave its
     /// address in `%rax`.
     fn materialize_const_agg(&mut self, c: &Const) -> Result<(), String> {
@@ -2556,7 +2572,8 @@ impl<'a> FnGen<'a> {
             }
             let (src, _) = self.eval_operand(op)?;
             let tmp = self.alloc_slot();
-            self.emit(&format!("  mov {src}, {}", self.off(tmp)));
+            let off = self.off(tmp);
+            self.store_word(&src, &off);
             let off = offs.get(k + tag_first as usize).copied().unwrap_or(k as i64 * 8);
             vals.push((off, None, Some(tmp)));
         }
@@ -2778,7 +2795,8 @@ impl<'a> FnGen<'a> {
                 // base address is kept in `%rcx` and the count in `%rdx`.
                 let (src, _) = self.eval_operand(op)?;
                 let tmp = self.alloc_slot();
-                self.emit(&format!("  mov {src}, {}", self.off(tmp)));
+                let off = self.off(tmp);
+                self.store_word(&src, &off);
                 self.place_addr(dest)?;
                 self.emit("  mov %rax, %rcx");
                 let val = self.off(tmp);
@@ -2965,7 +2983,10 @@ impl<'a> FnGen<'a> {
             src
         };
         self.place_addr(dest)?;
-        self.emit(&format!("  mov {src}, (%rax)"));
+        // An unsuffixed `mov $imm, (mem)` is a 32-bit store and zero-extends a
+        // negative immediate; `movq` is the sign-extending 64-bit form.
+        let mnem = if src.starts_with('$') { "movq" } else { "mov" };
+        self.emit(&format!("  {mnem} {src}, (%rax)"));
         Ok(())
     }
 
