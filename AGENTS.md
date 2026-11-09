@@ -472,12 +472,18 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   The Rust twin must use the same 24-byte stride or its smaller working set
   flatters the walk; it still does not run a free list, so the ratio is about the
   generated pointer code, not the allocators.
-- **`refs` is not an instruction-level tie.** Keeping the Rust loop real needs
-  an in-loop `black_box`, which costs a store/reload per iteration; rmc has no
-  such barrier. rmc's `licm` reassociates the loop-invariant part of the
-  accumulation into one hoisted value, so its loop does a single add per
-  iteration, and it wins the ratio by more than 2x. Read the number as "two real
-  loops doing the same arithmetic", not as an instruction-for-instruction tie.
+- **`refs` is the reference-read loss, and it is deliberate.** The loop reads a
+  fixed struct through `&self` accessors. `licm` will not hoist a read through a
+  reference: rmc lets a reference outlive its referent (`0 as &i64` is accepted),
+  so a speculative deref can fault on a loop that never runs, where the in-body
+  read would not. The accessor sum is therefore recomputed every iteration and
+  rmc loses to rustc by roughly 8x. A frame-based loop of the same shape is
+  hoisted and wins. Keeping the Rust loop real needs an in-loop `black_box`
+  (a store/reload per iteration), so read the ratio as "two real loops doing the
+  same arithmetic", not an instruction-for-instruction tie - but do not claim a
+  win here; there is not one. This was the state before the faulting-hoist fix
+  (the LICM reference-read restriction); the docstrings and this note were not
+  updated when the fix landed, and a stale 2.23x win sat in `RESULTS.md`.
 - **`callrec` is the call-heavy case, and it used to lose.** Non-tail recursion
   (`tree(n) = 1 + tree(n-1) + tree(n-2)`) cannot be inlined by either compiler,
   so it measures raw call overhead plus argument setup, where the stack-based
