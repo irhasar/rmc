@@ -394,10 +394,23 @@ impl Inliner {
         // substituting a trivial argument for it would make the assignment write
         // through to the caller's variable. Such a parameter is always copied
         // into a fresh slot, and the body's assignment targets that slot.
+        // Everything up to and including the last argument that can write
+        // memory is copied, so no later argument can change what an earlier
+        // one named.
+        let last_effect = args.iter().rposition(has_effect);
         let mut binds: Vec<Stmt> = Vec::new();
         let mut subst: Vec<Expr> = Vec::with_capacity(args.len());
         for (i, arg) in args.into_iter().enumerate() {
-            if trivial(&arg) && !assigned.contains(&param_slots[i]) {
+            // A trivial argument (a name, a literal) is normally substituted in
+            // place, so the body reads the caller's expression directly. That is
+            // unsound when the caller's expression can change before the body
+            // reads it: a later argument's side effect (a call, an assignment, a
+            // place with a call) can write a variable the earlier argument
+            // named. Everything up to and including the last argument that can
+            // write memory is therefore copied into a fresh slot first, so each
+            // parameter sees its argument's value at call time, in order.
+            let later_effect = last_effect.map_or(false, |j| j > i);
+            if trivial(&arg) && !assigned.contains(&param_slots[i]) && !later_effect {
                 subst.push(arg);
             } else {
                 let slot = *base;
@@ -452,6 +465,26 @@ impl Inliner {
 /// into a temporary instead.
 fn trivial(e: &Expr) -> bool {
     matches!(e, Expr::Var { .. } | Expr::Int(_) | Expr::Bool(_) | Expr::Str(_))
+}
+
+/// True for an expression whose evaluation may write memory or call a function,
+/// so a later argument can change what an earlier argument's name reads. A
+/// block, an assignment, a call and a loop are all effects; a plain operand
+/// (name, literal, arithmetic on operands) is not. Conservative: an
+/// unrecognised variant counts as an effect, which only costs an extra copy.
+fn has_effect(e: &Expr) -> bool {
+    match e {
+        Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } => false,
+        Expr::Bin(_, a, b) => has_effect(a) || has_effect(b),
+        Expr::Un(_, a) | Expr::Cast(a, _) => has_effect(a),
+        Expr::Field { base, .. } => has_effect(base),
+        Expr::Index(a, b) => has_effect(a) || has_effect(b),
+        Expr::EnumPayload { recv, .. } | Expr::Deref { expr: recv, .. } => has_effect(recv),
+        Expr::AddrOf { expr, .. } => has_effect(expr),
+        Expr::ArrayLit(base, _) => has_effect(base),
+        Expr::ArrayList(v) => v.iter().any(has_effect),
+        _ => true,
+    }
 }
 
 /// The slots a candidate body assigns directly (not through a pointer or an

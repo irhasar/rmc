@@ -112,6 +112,7 @@ def check_bounds_traps(combos):
         "computed": ("fn f(i: i64) -> i64 { let a: [i64; 3] = [1, 2, 3]; return a[i + 1]; } fn main() -> i64 { return f(3); }", b""),
         "field": ("struct S { n: i64, a: [i64; 3] } fn f(i: i64) -> i64 { let s: S = S { n: 0, a: [4, 5, 6] }; return s.a[i]; } fn main() -> i64 { return f(5); }", b""),
         "store": ("fn f(i: i64) -> i64 { let mut a: [i64; 3] = [1, 2, 3]; a[i] = 9; return a[0]; } fn main() -> i64 { return f(4); }", b""),
+        "array_ref": ("fn f(i: i64) -> i64 { let a: [i64; 3] = [1, 2, 3]; let r: &[i64; 3] = &a; return r[i]; } fn main() -> i64 { return f(9); }", b""),
     }
     failures = 0
     for name, (src, want_stdout) in cases.items():

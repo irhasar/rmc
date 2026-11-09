@@ -142,6 +142,9 @@ impl Codegen {
     fn array_len_ty(ty: &Type) -> Option<usize> {
         match ty {
             Type::Array(_, n) => Some(*n),
+            // Indexing an array reference checks against the referent's
+            // length, so `&[T; N]` must report `N` or the check is skipped.
+            Type::Ref(inner, _) => Self::array_len_ty(inner),
             _ => None,
         }
     }
@@ -1088,7 +1091,7 @@ impl Codegen {
                                 // place (see `store_through_addr`), and here the
                                 // place's index is what may call, so the value
                                 // must be stashed before the address is formed.
-                                if Self::contains_call(target) {
+                                if Self::place_has_effect(target) {
                                     self.gen_expr(value);
                                     self.push_rax();
                                     self.gen_addr(target);
@@ -1392,7 +1395,7 @@ impl Codegen {
         // expression whose operands are ordered right-to-left). When computing
         // the place can run a call, evaluate the value first and stash it,
         // otherwise the place's call would be sequenced ahead of the value's.
-        if Self::contains_call(target) {
+        if Self::place_has_effect(target) {
             // The value goes first, but the place's address is what `gen_addr`
             // leaves in `%rax`; move it aside, reload the value into `%rax`, and
             // store the value through the address.
@@ -1425,7 +1428,7 @@ impl Codegen {
     /// can call, the value is stashed across it. Otherwise the place is formed
     /// first and the value stashed across the copy's scratch use of `%rdi`.
     fn assign_aggregate(&mut self, target: &Expr, value: &Expr, n: usize) {
-        if Self::contains_call(target) {
+        if Self::place_has_effect(target) {
             self.gen_expr(value);
             self.push_rax();
             self.gen_addr(target);
@@ -2835,6 +2838,49 @@ impl Codegen {
             Expr::Block(b) => Self::block_has_call(b),
             Expr::MatchBoundary(b, _) => Self::block_has_call(b),
             _ => false,
+        }
+    }
+
+    /// True when forming the address of `e` can change observable state: a
+    /// call, or a block/if that assigns a local. The value-before-place reorder
+    /// must key on this, not `contains_call`: `a[{ x = 2; 0 }] = x` computes the
+    /// place (a store) with no call, and reading the place first would store the
+    /// new `x` instead of the value `x` held before the place ran.
+    fn place_has_effect(e: &Expr) -> bool {
+        match e {
+            Expr::Block(b) | Expr::MatchBoundary(b, _) => Self::block_has_effect(b),
+            Expr::If(c, t, els) => {
+                Self::contains_call(c)
+                    || Self::block_has_effect(t)
+                    || els.as_ref().map_or(false, |b| Self::block_has_effect(b))
+            }
+            Expr::Index(a, b) => Self::place_has_effect(a) || Self::place_has_effect(b),
+            Expr::Field { base, .. } => Self::place_has_effect(base),
+            Expr::Deref { expr, .. } | Expr::AddrOf { expr, .. } => Self::place_has_effect(expr),
+            Expr::EnumPayload { recv, .. } => Self::place_has_effect(recv),
+            _ => Self::contains_call(e),
+        }
+    }
+
+    fn block_has_effect(b: &Block) -> bool {
+        b.stmts.iter().any(Self::stmt_has_effect)
+            || b.tail.as_deref().map_or(false, Self::place_has_effect)
+    }
+
+    fn stmt_has_effect(s: &Stmt) -> bool {
+        match s {
+            Stmt::Let { init, .. } => init.as_ref().map_or(false, Self::place_has_effect),
+            // An assignment writes a local, which a later read can observe.
+            Stmt::Assign { .. } => true,
+            Stmt::Expr(e) => Self::place_has_effect(e),
+            Stmt::Return(v) => v.as_ref().map_or(false, Self::place_has_effect),
+            Stmt::For { start, end, body, .. } => {
+                Self::place_has_effect(start)
+                    || Self::place_has_effect(end)
+                    || Self::block_has_effect(body)
+            }
+            Stmt::While(..) | Stmt::Loop(..) => true,
+            Stmt::Break | Stmt::Continue => false,
         }
     }
 

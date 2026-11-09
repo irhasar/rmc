@@ -15,7 +15,7 @@ fn main() -> i64 {
     print_i64(a);
 
     let mut b: S = S { x: 1, y: 2 };
-    let pb: &mut S = &mut b;
+    let mut pb: &mut S = &mut b;
     let qb: &mut &mut S = &mut pb;
     (*qb).x = 9;
     (*qb).y = 8;

@@ -947,9 +947,12 @@ impl Sema {
     ) -> Result<(), String> {
         match e {
             Expr::Var { name, .. } => {
-                let (_, ty, mutable, init) = Self::lookup(scope, name)
+                let (_, _, mutable, init) = Self::lookup(scope, name)
                     .ok_or_else(|| format!("unknown variable `{name}`"))?;
-                if mutable || matches!(ty, Type::Ref(_, true)) || (allow_uninit && !init) {
+                // Reassigning the binding itself needs `mut`; writing *through*
+                // a reference is decided by the field/index/deref arm, so a
+                // `&mut T` binding need not itself be `mut` for `r.x = ..`.
+                if mutable || (allow_uninit && !init) {
                     Ok(())
                 } else {
                     Err(format!(
@@ -957,8 +960,18 @@ impl Sema {
                     ))
                 }
             }
-            Expr::Field { base, .. } => self.place_writable(base, scope, allow_uninit),
-            Expr::Index(base, _) => self.place_writable(base, scope, allow_uninit),
+            Expr::Field { base, .. } | Expr::Index(base, _) => {
+                // A write into a component goes through the base's address when
+                // the base is a reference, so the referent's mutability decides;
+                // a shared `&T` cannot be written through at all.
+                match self.check_expr(base, scope)? {
+                    Type::Ref(_, true) => Ok(()),
+                    Type::Ref(_, false) => {
+                        Err("cannot assign through a shared reference; use `&mut`".to_string())
+                    }
+                    _ => self.place_writable(base, scope, allow_uninit),
+                }
+            }
             Expr::Deref { expr, .. } => match self.check_expr(expr, scope)? {
                 Type::Ref(_, true) => Ok(()),
                 Type::Ref(_, false) => {

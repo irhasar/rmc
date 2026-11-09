@@ -503,6 +503,16 @@ impl Hoister {
         }
     }
 
+    /// True when a field read's base names a local aggregate, so the read is a
+    /// frame access rather than a load through a pointer that could fault.
+    fn frame_field_base(e: &Expr) -> bool {
+        match e {
+            Expr::Var { ty, .. } => !matches!(ty, crate::ast::Type::Ref(..)),
+            Expr::Field { base, .. } => Self::frame_field_base(base),
+            _ => false,
+        }
+    }
+
     /// True when `e` reads only loop-invariant data and cannot trap or write.
     fn invariant(&self, e: &Expr) -> bool {
         match e {
@@ -510,8 +520,16 @@ impl Hoister {
             Expr::Var { slot, .. } => !self.eff.all && !self.eff.slots.contains(slot),
             // A field read is memory, so it is only invariant when the loop
             // writes no memory at all.
+            // A field read through a local aggregate is a frame access and
+            // cannot fault, so it is safe to speculate. A read through a
+            // reference dereferences a pointer that may be null or dangling, so
+            // it must stay in the loop: hoisting it would fault on a loop whose
+            // body never runs.
             Expr::Field { base, ty, .. } => {
-                !self.eff.mem && ty.is_scalar() && self.invariant(base)
+                !self.eff.mem
+                    && ty.is_scalar()
+                    && self.invariant(base)
+                    && Self::frame_field_base(base)
             }
             Expr::Bin(op, a, b) => {
                 !matches!(op, BinOp::Div | BinOp::Mod) && self.invariant(a) && self.invariant(b)

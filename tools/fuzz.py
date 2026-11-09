@@ -801,6 +801,12 @@ def gen_order_program(rng):
     # A side-effecting value with a side-effecting index in one expression.
     rms.append("    a[li(i + 1)] = li(a[li(0)]);")
     rs.append("    a[li(i + 1) as usize] = li(a[li(0) as usize]);")
+    # A place that writes a local without calling: `contains_call` misses it, so
+    # the value must still be captured before the place runs.
+    for _ in range(rng.randint(1, 2)):
+        idx, a1, a2 = rng.randint(0, 7), rng.randint(0, 9), rng.randint(0, 9)
+        rms.append(f"    a[{{ x = li({a1}); {idx} }}] = x + {a2};")
+        rs.append(f"    a[{{ x = li({a1}); {idx} }} as usize] = x + {a2};")
     rms.append("    let mut acc: i64 = 0;")
     rs.append("    let mut acc: i64 = 0;")
     for k in range(8):

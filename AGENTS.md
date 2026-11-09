@@ -196,6 +196,9 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   parameter the body assigns must also be bound to a fresh slot even when the
   argument is a plain variable, because a parameter is a local copy: replacing
   it by the caller's variable would make `x = x + 1` write through to the caller.
+  A trivial argument (a name or literal) is substituted in place only when no
+  *later* argument can write memory (`has_effect`); otherwise it is copied to a
+  fresh slot, so `sum(x, set(&mut x))` reads the `x` from before `set` ran.
   A candidate body must be call-free and straight-line; because it is, inlining it
   cannot expose new calls, but the pass still runs to a *fixpoint* because a
   function only becomes call-free after its own callees are inlined (the `refs`
@@ -208,6 +211,11 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   `MAX_NODES` (48) must stay above a two-level helper — `sum_via_ref` is 35
   nodes once its accessors land — and `count_expr` must count a block's tail,
   or a candidate's size is understated and it is wrongly admitted.
+- **LICM never hoists a read through a reference.** A scalar field read is
+  hoisted only when its base is a local aggregate (`frame_field_base`); a field
+  read through `&T` dereferences a pointer that may be null (`0 as &S`) or
+  dangling, so hoisting it would fault on a loop whose body never runs. Local
+  aggregate fields are frame accesses and stay hoistable.
 - **LICM hoists a loop body's invariant arithmetic, and `for` slots are
   loop-carried.** The pass rewrites only a loop *body*; a `while` condition and
   a `for`'s bounds run once per iteration by design. A `for`'s variable and
@@ -354,11 +362,18 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 - **Struct-literal fields stay in source order.** Their layout offsets are
   attached per field, so reordering them into declaration order would change the
   order initializer side effects run in.
+- **A bounds check sees through a reference to an array.** `array_len_of` /
+  `array_len_ty` unwrap an `Expr::Ref` base, so `let r: &[i64; 3] = &a; r[i]`
+  traps on an out-of-range `i` under `--bounds-checks` instead of reading
+  adjacent memory. A field store through a shared `&T` is rejected by
+  `place_writable` ("cannot assign through a shared reference; use `&mut`"), and
+  a `&mut` binding itself is not reassignable unless declared `mut`.
 - **Assignment evaluates its value before its place.** rustc orders assignment
   operands right-to-left (the one expression that does), so `a[li(1)] = li(5)`
   must run `li(5)` before `li(1)`. Codegen's general index/deref store path and
   `store_through_addr` evaluate the value first and stash it across the address
-  computation whenever that computation can call (`contains_call`), and the
+  computation whenever that computation can have an effect (`place_has_effect`,
+  which is `contains_call` plus a block/if that assigns a local), and the
   aggregate copy is factored into `assign_aggregate` for the same reason. The
   `contains_call` walk must reach every place form (`Deref`, `AddrOf`,
   `EnumPayload`, ...), or a target like `*f()` is mis-ordered. `assignorder.rms`
