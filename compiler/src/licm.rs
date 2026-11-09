@@ -2,10 +2,9 @@
 //! generation.
 //!
 //! Inlining leaves accessor arithmetic inside the loop that reads only
-//! loop-invariant data. The `refs` hot loop reads a fixed struct through three
-//! accessors every iteration; after inlining, the whole sum of the struct's
-//! fields is invariant, yet it is recomputed each pass. This pass computes each
-//! such subexpression once, before the loop, and reads the result inside.
+//! loop-invariant data. A `for`/`while` loop that sums a fixed struct's fields
+//! recomputes the whole sum each pass; after inlining the sum is invariant, so
+//! this pass computes it once, before the loop, and reads the result inside.
 //!
 //! The pass is deliberately conservative, because hoisting across an iteration
 //! boundary is easy to get wrong:
@@ -14,6 +13,15 @@
 //!   (which can trap), no array index and no dereference (both can read memory
 //!   an alias could change), and no block or `if`. Struct-field reads are
 //!   allowed, but only when the loop writes no memory at all.
+//! * A field read through a *reference* (`p.x` where `p: &T`, or `(*q).x`) is
+//!   not hoisted. rmc lets a reference outlive its referent (`0 as &i64` is
+//!   accepted, and a `&` to a local can be returned), so dereferencing one is a
+//!   memory read that can fault. Hoisting it would fault on a loop that never
+//!   runs, where the read inside the body would not. Such a read stays in the
+//!   loop even when it is otherwise invariant and the loop writes no memory.
+//!   The `refs` benchmark is exactly this shape (a `&self` accessor sum), so it
+//!   is not hoisted and runs slower than an equivalent frame-based loop; see
+//!   `bench/RESULTS.md`.
 //! * Every local the expression reads must be untouched by the loop. If the loop
 //!   contains any call, the pass gives up on that loop entirely, since a call
 //!   can write anything.
