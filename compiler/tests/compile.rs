@@ -5972,6 +5972,69 @@ fn a_char_range_with_an_int_bound_is_rejected() {
     assert!(err.contains("char"), "the message names the char bound:\n{err}");
 }
 #[test]
+fn a_guard_that_mutates_the_scrutinee_keeps_the_matched_value() {
+    // A pattern binding captures the scrutinee when the arm matches. A guard
+    // that assigns the scrutinee (`x = 2`) must not change what the arm body
+    // reads: `n` keeps the value 1 the arm matched. rustc's borrow checker
+    // rejects this program (E0506), so it cannot live in the differential
+    // corpus; the value is pinned here by running the built binary.
+    let dir = std::env::temp_dir().join(format!("rmc-guardmut-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("m.rms");
+    let bin = dir.join("m.bin");
+    std::fs::write(
+        &src,
+        "fn main() -> i64 { let mut x: i64 = 1; \
+         let r: i64 = match x { n if { x = 2; true } => n, _ => 0 }; \
+         print_i64(r); return 0; }\n",
+    )
+    .unwrap();
+
+    let rmc = env!("CARGO_BIN_EXE_rmc");
+    let out = std::process::Command::new(rmc)
+        .arg("-o")
+        .arg(&bin)
+        .arg(&src)
+        .output()
+        .expect("run rmc");
+    assert!(out.status.success(), "rmc failed: {}", String::from_utf8_lossy(&out.stderr));
+    let run = std::process::Command::new(&bin).output().expect("run the binary");
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "1\n", "the guard must not change the bound value");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_guard_that_mutates_a_matched_field_keeps_the_bound_value() {
+    // The struct-field form of the same bug: `P { x }` binds `p.x`, and a guard
+    // that writes `p.x` must not change what the arm body reads. rustc rejects
+    // it (E0506), so run the built binary to pin the value.
+    let dir = std::env::temp_dir().join(format!("rmc-guardfield-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("m.rms");
+    let bin = dir.join("m.bin");
+    std::fs::write(
+        &src,
+        "struct P { x: i64 } \
+         fn main() -> i64 { let mut p: P = P { x: 1 }; \
+         let r: i64 = match p { P { x } if { p.x = 9; true } => x, _ => 0 }; \
+         print_i64(r); return 0; }\n",
+    )
+    .unwrap();
+
+    let rmc = env!("CARGO_BIN_EXE_rmc");
+    let out = std::process::Command::new(rmc)
+        .arg("-o")
+        .arg(&bin)
+        .arg(&src)
+        .output()
+        .expect("run rmc");
+    assert!(out.status.success(), "rmc failed: {}", String::from_utf8_lossy(&out.stderr));
+    let run = std::process::Command::new(&bin).output().expect("run the binary");
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "1\n", "the guard must not change the bound field");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn no_strip_keeps_a_symbol_table_in_the_output() {
     // `--no-strip` exists so `nm` can read the artifact. The in-process encoder
     // writes no symbol table, so the flag must route through `as`/`ld` instead

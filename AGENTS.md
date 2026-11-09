@@ -238,7 +238,15 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   parentheses) and threads it through `desugar_arm` as an `Option<Expr>`. The
   guard folds into the arm's condition rather than becoming a node, so sema and
   codegen gain no case; see the exhaustiveness notes below for the three rules a
-  guard changes.
+  guard changes. When any arm has a guard, `desugar_match_arms` snapshots a
+  variable scrutinee into a temporary before the arm chain, so a guard that
+  assigns the matched value (`match x { n if { x = 2; true } => n }`) or one of
+  its fields (`match p { P { x } if { p.x = 9; true } => x }`) cannot change what
+  the arm body's binding reads: the guard and the body share the snapshot.
+  Without a guard nothing runs between an arm's test and its body, so a plain
+  variable stays inline and the lowering matches the equivalent field reads.
+  rustc's borrow checker rejects both mutating programs (E0506), so no
+  differential twin exists; the values are pinned by end-to-end tests.
   `while let PAT = EXPR { body }` is parsed here and desugared by
   `desugar_while_let` to `loop { if let PAT = EXPR { body } else { break; } }`,
   reusing the `if let` path, so sema and codegen gain no case. The scrutinee sits
