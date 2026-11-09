@@ -299,6 +299,12 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   site (a `let`, a parameter, a return, a struct field, a cast) is already
   concrete. A struct name is not an alias and stays `Type::Named`. A cycle is
   reported (`expand_alias_ty` bounds the walk), matching rustc's `E0391`.
+  A *tuple* or array alias whose element names a later alias needs one more
+  step: the first pass bakes the tuple struct's element as the still-unresolved
+  `Named`, so after the map is complete every target is re-parsed with the
+  tuple-struct table cleared (`type Pair = (Later, i64); type Later = i64;`
+  otherwise keeps the placeholder's layout). `a_tuple_alias_may_name_an_alias_
+  declared_later` and the `PairF` case in `tests/cases/typealias.*` pin it.
 - `compiler/src/ast.rs` — AST and `Type` (`I64`, `Bool`, `Str`, `Unit`, `Array`,
   `Struct`, and the parser-only placeholder `Named`). `Str` is the type of a
   string literal: one slot holding a pointer to NUL-terminated static data. It
@@ -1735,12 +1741,18 @@ The macro surface is lowered at parse time and is deliberately tiny.
 `print!`/`println!` take a literal format string and rewrite each `{}` to a
 `__rmc_print` call whose argument's checked type picks the runtime writer
 (`__rmc_write_i64`, `__rmc_write_bool`, `__rmc_write_str`, `__rmc_write_char`);
-`println!` appends the newline itself. The `char` type is a distinct scalar
-(a Unicode scalar value in an 8-byte slot, so `c + 1` is rejected); its
-literals take the usual escapes, `as i64` yields the code point, and `match`
-accepts `'a'..='z'` / `'a'..'z'` range arms (lowered to the same two
-comparisons as an integer range; an empty range or a non-`char` bound is
-rejected). The `print_char(c)` builtin writes the UTF-8 bytes then a newline.
+`println!` appends the newline itself. Every `{}` argument is evaluated before
+the first byte of output, in source order (matching Rust), so the lowering
+binds each argument to a fresh local first and the `{}` writes read those —
+otherwise `println!("A{}B{}", f(), g())` would print `A` before `f` ran.
+`format_arguments_run_before_the_first_write` and `tests/cases/fmtorder.*`
+pin it; the fmtorder twin uses `println!` on both sides so the comparison
+rests on the ordering rule, not on `print_str`'s trailing newline. The `char`
+type is a distinct scalar (a Unicode scalar value in an 8-byte slot, so `c + 1`
+is rejected); its literals take the usual escapes, `as i64` yields the code
+point, and `match` accepts `'a'..='z'` / `'a'..'z'` range arms (lowered to the
+same two comparisons as an integer range; an empty range or a non-`char` bound
+is rejected). The `print_char(c)` builtin writes the UTF-8 bytes then a newline.
 `assert!`/`assert_eq!`/`assert_ne!`/`panic!`/`unreachable!`/
 `todo!`/`unimplemented!` desugar to `if !(cond) { exit(101) }` (or a bare
 `exit(101)`), so a failure matches rustc's panic exit code; the message
