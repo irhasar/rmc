@@ -57,6 +57,12 @@ pub struct Sema {
     enums: HashMap<String, EnumInfo>,
     next_slot: i32,
     loop_depth: u32,
+    /// One entry per enclosing loop, holding the scope length at the loop's
+    /// entry. A `while`/`for` body may run again, so a binding that already
+    /// existed outside the loop must not be written by a non-`mut` binding
+    /// inside it (rustc's `cannot assign twice`); a binding declared *inside*
+    /// the body is fresh each iteration and is exempt.
+    loop_marks: Vec<usize>,
     ret_ty: Type,
 }
 
@@ -68,9 +74,14 @@ struct Binding {
     slot: i32,
     ty: Type,
     mutable: bool,
-    /// False for a binding declared without an initialiser, so its first
-    /// assignment is allowed even when it is not `mut`.
-    initialized: bool,
+    /// True for a function/method parameter, which rustc reports as an
+    /// "immutable argument" rather than a twice-assigned variable.
+    param: bool,
+    /// True once the binding has been assigned on some path (or was initialized
+    /// at its declaration). A plain `let` without an initialiser may be written
+    /// exactly once, so a second write to a non-`mut` binding is rejected the
+    /// way rustc rejects `cannot assign twice to immutable variable`.
+    assigned: bool,
 }
 
 type Scope = Vec<Binding>;
@@ -102,10 +113,14 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
     }
     // A method's receiver is its first parameter, with the impl's struct type.
     // Give it to every method up front so its signature (and later its frame)
-    // includes `self` from the start.
+    // includes `self` from the start. `param_mut` tracks the explicitly declared
+    // parameters, so it must gain a matching entry for the synthesized receiver
+    // (`self` is immutable); otherwise the flag for the first declared parameter
+    // lands on `self` and the last declared parameter is treated as immutable.
     for f in &mut prog.fns {
         if let Some(ty) = f.self_ty.clone() {
             f.params.insert(0, ("self".to_string(), Type::Named(ty)));
+            f.param_mut.insert(0, false);
         }
     }
     for f in &prog.fns {
@@ -137,6 +152,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         enums,
         next_slot: 0,
         loop_depth: 0,
+        loop_marks: Vec::new(),
         ret_ty: Type::Unit,
     };
     for f in &mut prog.fns {
@@ -362,7 +378,8 @@ impl Sema {
                 slot,
                 ty: rt,
                 mutable: param_mut.get(i).copied().unwrap_or(false),
-                initialized: true,
+                param: true,
+                assigned: true,
             });
         }
 
@@ -477,7 +494,8 @@ impl Sema {
                     slot: s,
                     ty: final_ty,
                     mutable: *mutable,
-                    initialized: init.is_some(),
+                    param: false,
+                    assigned: init.is_some(),
                 });
                 Ok(())
             }
@@ -488,6 +506,7 @@ impl Sema {
                 if vty != tty {
                     return Err(format!("assignment type mismatch: target is {tty:?}, value is {vty:?}"));
                 }
+                self.mark_assigned(target, scope);
                 Ok(())
             }
             Stmt::Expr(e) => {
@@ -500,11 +519,17 @@ impl Sema {
                     return Err(format!("`while` condition must be `bool`, found {ct:?}"));
                 }
                 self.loop_depth += 1;
+                // The body may run again, so a non-`mut` binding that already
+                // existed outside the loop cannot be written inside it.
+                self.loop_marks.push(scope.len());
                 self.check_block(body, scope)?;
+                self.loop_marks.pop();
                 self.loop_depth -= 1;
                 Ok(())
             }
             Stmt::Loop(body) => {
+                // A `loop` runs at least once, so writes to outer bindings
+                // inside it behave like straight-line writes and are allowed.
                 self.loop_depth += 1;
                 self.check_block(body, scope)?;
                 self.loop_depth -= 1;
@@ -528,10 +553,13 @@ impl Sema {
                     slot: s,
                     ty: Type::I64,
                     mutable: false,
-                    initialized: true,
+                    param: false,
+                    assigned: true,
                 });
                 self.loop_depth += 1;
+                self.loop_marks.push(mark);
                 self.check_block(body, scope)?;
+                self.loop_marks.pop();
                 self.loop_depth -= 1;
                 scope.truncate(mark);
                 Ok(())
@@ -573,20 +601,82 @@ impl Sema {
         }
     }
 
-    /// Reject an assignment whose root binding is immutable, matching rustc's
-    /// `cannot assign to immutable variable` error. A field or index target is
-    /// writable exactly when the variable it is rooted at is.
+    /// Reject an assignment whose root binding may not be written here,
+    /// matching rustc's errors. A `mut` binding is always writable. A plain
+    /// `let` is writable exactly once: the write to its uninitialised value,
+    /// or the declaration's initialiser. A later write is `cannot assign twice
+    /// to immutable variable`. A `while`/`for` body may run again, so writing a
+    /// binding that was already in scope before the loop is a second write even
+    /// on the first iteration, which rustc also rejects.
     fn check_writable(&self, e: &Expr, scope: &Scope) -> Result<(), String> {
         match e {
-            Expr::Var { name, .. } => match scope.iter().rev().find(|b| &b.name == name) {
-                Some(b) if b.mutable || !b.initialized => Ok(()),
-                Some(_) => Err(format!(
-                    "cannot assign to immutable variable `{name}` (add `mut`)"
-                )),
-                None => Ok(()),
-            },
+            Expr::Var { name, .. } => {
+                let deny = |b: &Binding| {
+                    if b.param {
+                        Err(format!(
+                            "cannot assign to immutable argument `{name}` (add `mut`)"
+                        ))
+                    } else {
+                        Err(format!(
+                            "cannot assign twice to immutable variable `{name}` (add `mut`)"
+                        ))
+                    }
+                };
+                match scope.iter().enumerate().rev().find(|(_, b)| &b.name == name) {
+                    Some((_, b)) if b.mutable => Ok(()),
+                    Some((_, b)) if b.assigned => deny(b),
+                    // A write inside a `while`/`for` to a binding declared before
+                    // that loop would run once per iteration, so it is a second
+                    // write even on the first pass.
+                    Some((idx, b)) if self.loop_marks.last().is_some_and(|&m| idx < m) => deny(b),
+                    Some(_) => Ok(()),
+                    None => Ok(()),
+                }
+            }
             Expr::Field { base, .. } | Expr::Index(base, _) => self.check_writable(base, scope),
             _ => Ok(()),
+        }
+    }
+
+    /// The root variable name of an assignment target (`a` for `a.f[i]`).
+    fn root_name(e: &Expr) -> Option<&str> {
+        match e {
+            Expr::Var { name, .. } => Some(name.as_str()),
+            Expr::Field { base, .. } | Expr::Index(base, _) => Self::root_name(base),
+            _ => None,
+        }
+    }
+
+    /// Record that an assignment wrote its root binding, so a later write to a
+    /// non-`mut` binding is the `cannot assign twice` error.
+    fn mark_assigned(&self, target: &Expr, scope: &mut Scope) {
+        if let Some(name) = Self::root_name(target) {
+            if let Some(b) = scope.iter_mut().rev().find(|b| b.name == name) {
+                b.assigned = true;
+            }
+        }
+    }
+
+    fn snapshot_assigned(scope: &Scope) -> Vec<bool> {
+        scope.iter().map(|b| b.assigned).collect()
+    }
+
+    fn restore_assigned(scope: &mut Scope, state: &[bool]) {
+        if scope.len() == state.len() {
+            for (b, s) in scope.iter_mut().zip(state) {
+                b.assigned = *s;
+            }
+        }
+    }
+
+    /// Mark a binding assigned when *either* merged path assigns it. The
+    /// second-write check asks whether the binding may already have been
+    /// written, so a write on one path is enough to make a later write illegal.
+    fn merge_assigned(scope: &mut Scope, a: &[bool], b: &[bool]) {
+        if scope.len() == a.len() && scope.len() == b.len() {
+            for (i, binding) in scope.iter_mut().enumerate() {
+                binding.assigned = a[i] || b[i];
+            }
         }
     }
 
@@ -724,14 +814,23 @@ impl Sema {
                 if ct != Type::Bool {
                     return Err(format!("`if` condition must be `bool`, found {ct:?}"));
                 }
+                // An `if` writes a binding only when both arms definitely do;
+                // an `if` without an `else` leaves the state unchanged (the
+                // else path is a no-op). Snapshot the flags, check each arm
+                // from the incoming state, then keep a flag set only when every
+                // path sets it.
+                let before = Self::snapshot_assigned(scope);
                 let tt = self.check_block(then, scope)?;
-                match els {
+                let then_state = Self::snapshot_assigned(scope);
+                Self::restore_assigned(scope, &before);
+                let (et, else_state) = match els {
                     Some(e) => {
                         let et = self.check_block(e, scope)?;
+                        let st = Self::snapshot_assigned(scope);
                         if tt != et {
                             return Err(format!("`if` branches have different types: {tt:?} and {et:?}"));
                         }
-                        Ok(tt)
+                        (tt, st)
                     }
                     None => {
                         if tt != Type::Unit {
@@ -739,9 +838,12 @@ impl Sema {
                                 "`if` without `else` must evaluate to `()`, but the branch is {tt:?}"
                             ));
                         }
-                        Ok(Type::Unit)
+                        // No else: the fall-through keeps the incoming state.
+                        (tt, before.clone())
                     }
-                }
+                };
+                Self::merge_assigned(scope, &then_state, &else_state);
+                Ok(et)
             }
             Expr::Block(b) => self.check_block(b, scope),
             Expr::Index(base, idx) => {
@@ -873,7 +975,7 @@ impl Sema {
                     ty: Some(arr_ty.clone()),
                     init: None,
                     slot: arr_slot,
-                    mutable: false,
+                    mutable: true,
                 }];
                 for (i, e) in elems.drain(..).enumerate() {
                     stmts.push(Stmt::Assign {

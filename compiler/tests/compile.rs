@@ -733,7 +733,7 @@ fn an_immutable_local_cannot_be_assigned() {
         &CompileOptions::default(),
     )
     .unwrap_err();
-    assert!(err.contains("cannot assign to immutable"), "got: {err}");
+    assert!(err.contains("cannot assign twice to immutable"), "got: {err}");
     // A `mut` binding, and a first assignment to an uninitialised binding, are
     // both allowed.
     assert!(compile_to_asm(
@@ -749,18 +749,84 @@ fn an_immutable_local_cannot_be_assigned() {
 }
 
 #[test]
+fn an_uninitialised_local_may_be_assigned_only_once() {
+    // A plain `let` is written once: its initialiser, or its first assignment.
+    // A second write is `cannot assign twice`, exactly as rustc reports.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let x: i64; x = 1; x = 2; return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("cannot assign twice to immutable"), "got: {err}");
+    // An `if`/`else` that assigns on both paths still counts as one write, so a
+    // later write is the error; a write on one path of an `if` without an
+    // `else` is likewise enough to make a later write a second write.
+    assert!(compile_to_asm(
+        "fn f(c: bool) -> i64 { let x: i64; if c { x = 1; } else { x = 2; } return x; } \
+         fn main() -> i64 { return f(true); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+    let err = compile_to_asm(
+        "fn f(c: bool) -> i64 { let x: i64; if c { x = 1; } x = 2; return x; } \
+         fn main() -> i64 { return f(true); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("cannot assign twice to immutable"), "got: {err}");
+    // A `while` body may run again, so writing a binding declared before the
+    // loop is a second write on its first iteration, which rustc rejects.
+    let err = compile_to_asm(
+        "fn f(c: bool) -> i64 { let x: i64; while c { x = 1; } return x; } \
+         fn main() -> i64 { return f(false); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("cannot assign twice to immutable"), "got: {err}");
+    // A `loop` runs at least once, so a single write inside is fine.
+    assert!(compile_to_asm(
+        "fn f() -> i64 { let x: i64; loop { x = 1; break; } return x; } \
+         fn main() -> i64 { return f(); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
 fn an_immutable_parameter_cannot_be_assigned() {
     let err = compile_to_asm(
         "fn f(x: i64) -> i64 { x = 2; return x; } fn main() -> i64 { return f(1); }",
         &CompileOptions::default(),
     )
     .unwrap_err();
-    assert!(err.contains("cannot assign to immutable"), "got: {err}");
+    assert!(err.contains("cannot assign to immutable argument"), "got: {err}");
     assert!(compile_to_asm(
         "fn f(mut x: i64) -> i64 { x = 2; return x; } fn main() -> i64 { return f(1); }",
         &CompileOptions::default(),
     )
     .is_ok());
+}
+
+#[test]
+fn a_method_receiver_is_immutable_and_a_mut_parameter_is_writable() {
+    // `self` is the synthesized first parameter and is never `mut`; the
+    // explicitly declared `mut n` must stay writable even though it follows the
+    // receiver in the parameter list.
+    assert!(compile_to_asm(
+        "struct P { v: i64 } \
+         impl P { fn bump(self, mut n: i64) -> i64 { n += 1; n } } \
+         fn main() -> i64 { let p: P = P { v: 0 }; return p.bump(5); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+    let err = compile_to_asm(
+        "struct P { v: i64 } \
+         impl P { fn bad(self) -> i64 { self.v = 9; return self.v; } } \
+         fn main() -> i64 { let p: P = P { v: 0 }; return p.bad(); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("cannot assign to immutable argument `self`"), "got: {err}");
 }
 
 #[test]
