@@ -1,0 +1,1 @@
+fn f()->i64{ let x:i64; loop { x=1; break; } return x;} fn main()->i64{ print_i64(f()); return 0;}

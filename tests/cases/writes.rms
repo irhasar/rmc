@@ -1,0 +1,52 @@
+// Immutable-binding write rules: a single write on each path is accepted even
+// when the write sits in a method receiver or a branch that returns, and a
+// `loop` that runs at most once keeps the straight-line rules.
+struct P {
+    v: i64,
+}
+
+impl P {
+    fn get(self) -> i64 {
+        return self.v;
+    }
+}
+
+// The receiver block writes `x` once; the method-call lowering must not count
+// the receiver's type check twice.
+fn via_receiver() -> i64 {
+    let x: i64;
+    let p: P = P { v: 40 };
+    print_i64(({ x = 1; p }).get() + x);
+    return 0;
+}
+
+// One write on either route: the `if` arm that returns must not carry its write
+// into the fall-through path.
+fn after_return(c: bool) -> i64 {
+    let x: i64;
+    if c {
+        x = 10;
+        return x;
+    }
+    x = 20;
+    return x;
+}
+
+// A `loop` whose body always reaches `break` runs at most once, so the write to
+// `x` is a straight-line write and is accepted.
+fn one_iter() -> i64 {
+    let x: i64;
+    loop {
+        x = 7;
+        break;
+    }
+    return x;
+}
+
+fn main() -> i64 {
+    via_receiver();
+    print_i64(after_return(true));
+    print_i64(after_return(false));
+    print_i64(one_iter());
+    return 0;
+}
