@@ -1947,13 +1947,20 @@ The README's roadmap lists the intended next steps.
 
 ## Pushing
 
-Pushing needs a token with `contents: write`. The `GITHUB_TOKEN` provided in
-this environment is **read-only**: it authenticates as the repo owner and the
-REST API even reports `admin` on the repo, yet `git push` and the Git Data API
-both return `403 Resource not accessible by integration` (`receive-pack` is
-refused while `git fetch` works). That combination — API says `push: true`, push
-says "not accessible by integration" — is the signature of a read-only token,
-not a missing scope. Do not re-derive it: ask the user for a token with
-`contents: write` and push with it once, inline in the URL
-(`git push https://<token>@github.com/irhasar/rmc.git <branch>`), so it is not
-written to `.git/config`. Never persist the token in a remote URL or a file.
+`git push origin <branch>` works with the `GITHUB_TOKEN` in this environment.
+An earlier note here claimed the token was read-only (`403 Resource not
+accessible by integration` on `receive-pack`); that is no longer true — pushes
+to `rmc-1-core` through `rmc-4-patterns` succeed. If a push is ever refused,
+check `git ls-remote` first before concluding the token lacks `contents: write`,
+and never persist a token in `.git/config` or a file.
+
+## PR branch stack
+
+The four PRs stack linearly: `rmc-1-core` -> `rmc-2-optimiser` ->
+`rmc-3-artifact-size` -> `rmc-4-patterns`, each targeting the one below it.
+Review fixes land on the branch the finding names, then propagate *upward*:
+merge the fixed lower branch into the branch above it. A fix that both a lower
+and an upper branch already carry independently (because it was carried upward
+before it landed below) will conflict on the duplicate hunks; resolve by keeping
+either side — the content is identical — and commit the merge so the upper
+branch descends from the corrected base and the PR reports `mergeable`.
