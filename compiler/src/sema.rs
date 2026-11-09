@@ -77,6 +77,12 @@ pub struct Sema {
     /// top again). A `loop` that runs at most once keeps the straight-line
     /// write rules.
     loop_repeats: Vec<bool>,
+    /// Per enclosing loop, the definite-initialization state captured at each
+    /// `break` that leaves it. A `loop` runs its body at least once, so a
+    /// binding the loop initializes stays initialized afterwards — but only if
+    /// *every* exit leaves it initialized. `while`/`for` may run zero times, so
+    /// their entry is recorded but the merge is not used.
+    loop_exits: Vec<Vec<Vec<bool>>>,
     ret_ty: Type,
     /// While checking the `else` chain of a desugared `match`: whether the
     /// whole chain names every variant of one enum. Decided once at the chain's
@@ -229,6 +235,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         loop_depth: 0,
         loop_marks: Vec::new(),
         loop_repeats: Vec::new(),
+        loop_exits: Vec::new(),
         ret_ty: Type::Unit,
         match_total: false,
         match_chain: false,
@@ -907,7 +914,9 @@ impl Sema {
                 // existed before the loop cannot be written inside it.
                 self.loop_marks.push(scope.len());
                 self.loop_repeats.push(true);
+                self.loop_exits.push(Vec::new());
                 self.check_block(body, scope)?;
+                self.loop_exits.pop();
                 self.loop_repeats.pop();
                 self.loop_marks.pop();
                 self.loop_depth -= 1;
@@ -920,16 +929,27 @@ impl Sema {
                 // A `loop` runs at least once, so writes to outer bindings inside
                 // it behave like straight-line writes unless the body can reach
                 // the top again; then it is a second write on the next pass and
-                // rustc rejects it, exactly like a `while` body. It also leaves a
-                // binding it initialized initialized, so the state is not
-                // restored (unlike `while`/`for`, which may run zero times).
+                // rustc rejects it, exactly like a `while` body. A binding is
+                // definitely initialized after the loop only if it was before, or
+                // every `break` that leaves the loop initializes it.
+                let init_before = Self::init_snapshot(scope);
                 self.loop_depth += 1;
                 self.loop_marks.push(scope.len());
                 self.loop_repeats.push(block_repeats(body));
+                self.loop_exits.push(Vec::new());
                 self.check_block(body, scope)?;
+                let exits = self.loop_exits.pop().unwrap();
                 self.loop_repeats.pop();
                 self.loop_marks.pop();
                 self.loop_depth -= 1;
+                // The loop diverges when no `break` can leave it: nothing after
+                // is reachable, so the state does not matter.
+                if block_has_break(body) {
+                    for (i, b) in scope.iter_mut().enumerate() {
+                        b.init = init_before.get(i).copied().unwrap_or(false)
+                            || exits.iter().all(|e| e.get(i).copied().unwrap_or(false));
+                    }
+                }
                 Ok(())
             }
             Stmt::For { var, var_slot, start, end, end_slot, body } => {
@@ -965,7 +985,9 @@ impl Sema {
                 self.loop_depth += 1;
                 self.loop_marks.push(mark);
                 self.loop_repeats.push(true);
+                self.loop_exits.push(Vec::new());
                 self.check_block(body, scope)?;
+                self.loop_exits.pop();
                 self.loop_repeats.pop();
                 self.loop_marks.pop();
                 self.loop_depth -= 1;
@@ -999,6 +1021,11 @@ impl Sema {
                 if self.loop_depth == 0 {
                     return Err("`break` outside of a loop".into());
                 }
+                // Record the initialization state this exit leaves behind, so
+                // the loop can require every exit to initialize a binding before
+                // treating it as initialized after the loop.
+                let snap = Self::init_snapshot(scope);
+                self.loop_exits.last_mut().unwrap().push(snap);
                 Ok(())
             }
             Stmt::Continue => {
@@ -2181,6 +2208,35 @@ fn expr_has_continue(e: &Expr) -> bool {
         Expr::EnumCtor { args, .. } => args.iter().any(expr_has_continue),
         Expr::VariantTest { scrutinee, .. } => expr_has_continue(scrutinee),
         Expr::EnumPayload { recv, .. } => expr_has_continue(recv),
+        _ => false,
+    }
+}
+
+/// True when a `break` in `b` targets the loop `b` is the body of. A nested
+/// loop captures its own `break`s, so the walk stops at one; an `if`/block does
+/// not, so it descends.
+fn block_has_break(b: &Block) -> bool {
+    b.stmts.iter().any(stmt_has_break) || b.tail.as_deref().map_or(false, expr_has_break)
+}
+
+fn stmt_has_break(s: &Stmt) -> bool {
+    match s {
+        Stmt::Break => true,
+        Stmt::While(..) | Stmt::Loop(..) | Stmt::For { .. } => false,
+        Stmt::Expr(e) => expr_has_break(e),
+        Stmt::Let { init: Some(e), .. } => expr_has_break(e),
+        Stmt::Assign { value, .. } => expr_has_break(value),
+        _ => false,
+    }
+}
+
+fn expr_has_break(e: &Expr) -> bool {
+    match e {
+        Expr::Block(b) => block_has_break(b),
+        Expr::MatchBoundary(b, _) => block_has_break(b),
+        Expr::If(_, t, els) => {
+            block_has_break(t) || els.as_ref().map_or(false, |b| block_has_break(b))
+        }
         _ => false,
     }
 }

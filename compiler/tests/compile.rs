@@ -1707,6 +1707,33 @@ fn an_uninitialised_local_may_be_assigned_only_once() {
 }
 
 #[test]
+fn a_loop_leaves_a_binding_initialized_only_on_every_exit() {
+    // A `break` that leaves the loop before the assignment means the binding is
+    // not initialized on that exit, so reading it after the loop is E0381.
+    let err = compile_to_asm(
+        "fn f(d: bool) -> i64 { let x: i64; loop { if d { break; } x = 1; break; } return x; } \
+         fn main() -> i64 { return f(true); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("use of possibly-uninitialized variable `x`"), "got: {err}");
+    // Both exits after the assignment leave it initialized, so it is readable.
+    assert!(compile_to_asm(
+        "fn f(c: bool) -> i64 { let x: i64; loop { x = 1; if c { break; } else { break; } } return x; } \
+         fn main() -> i64 { return f(true); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+    // An `if`/`else` that assigns on both paths before the `break` is fine too.
+    assert!(compile_to_asm(
+        "fn f(c: bool) -> i64 { let x: i64; loop { if c { x = 1; } else { x = 2; } break; } return x; } \
+         fn main() -> i64 { return f(true); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
 fn an_immutable_parameter_cannot_be_assigned() {
     let err = compile_to_asm(
         "fn f(x: i64) -> i64 { x = 2; return x; } fn main() -> i64 { return f(1); }",
