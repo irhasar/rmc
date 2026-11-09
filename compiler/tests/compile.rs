@@ -4376,7 +4376,21 @@ fn a_call_in_an_assignment_target_blocks_hoisting() {
 }
 
 #[test]
-fn a_register_only_leaf_has_no_frame_pointer() {
+fn a_field_read_through_a_reference_blocks_hoisting() {
+    // `h.p` is a reference field, so `h.p.n` loads through the pointer it holds.
+    // That pointer may be null or dangling, so the read must stay in the loop:
+    // hoisting it would fault on a loop whose body never runs. The `imul` over
+    // the two loads staying in the body shows the read was not speculated.
+    let src = "struct S { n: i64 } struct Holder { p: &S } \
+               fn main() -> i64 { let s: S = S { n: 5 }; let h: Holder = Holder { p: &s }; \
+               let mut acc: i64 = 0; let mut i: i64 = 0; \
+               while i < 3 { acc = acc + h.p.n * h.p.n; i = i + 1; } return acc; }";
+    let with = loop_body(&asm(src));
+    assert!(with.contains("imul"), "a read through a reference field stays in the loop:\n{with}");
+}
+
+#[test]
+fn a_register_only_leaf_allocates_no_frame() {
     // Every local is promoted into a callee-saved register and nothing is
     // materialised, so the body addresses no frame slot. Nothing is addressed
     // through `%rbp`, so the prologue omits the frame pointer entirely — no
@@ -6034,6 +6048,7 @@ fn a_guard_that_mutates_a_matched_field_keeps_the_bound_value() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+
 #[test]
 fn no_strip_keeps_a_symbol_table_in_the_output() {
     // `--no-strip` exists so `nm` can read the artifact. The in-process encoder
@@ -6066,6 +6081,30 @@ fn no_strip_keeps_a_symbol_table_in_the_output() {
         symbols.contains("main") || !symbols.trim().is_empty(),
         "expected a symbol table, nm printed nothing"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn no_strip_conflicts_with_min_size() {
+    // `--min-size` strips the symbol table `--no-strip` asks to keep, so the
+    // combination is rejected rather than silently producing a stripped binary.
+    let dir = std::env::temp_dir().join(format!("rmc-conflict-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("m.rms");
+    std::fs::write(&src, "fn main() -> i64 { return 0; }\n").unwrap();
+
+    let rmc = env!("CARGO_BIN_EXE_rmc");
+    let out = std::process::Command::new(rmc)
+        .arg("--no-strip")
+        .arg("--min-size")
+        .arg("-o")
+        .arg(dir.join("m.bin"))
+        .arg(&src)
+        .output()
+        .expect("run rmc");
+    assert!(!out.status.success(), "the conflicting flags must be rejected");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("conflict"), "got: {stderr}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

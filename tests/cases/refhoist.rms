@@ -1,0 +1,15 @@
+// LICM must not hoist a field read through a reference field out of a loop.
+// `h.p` holds a null pointer; the loop body never runs, so the program is well
+// defined only if the read stays inside the loop. Hoisting it would fault.
+struct S { n: i64 }
+struct Holder { p: &S }
+
+fn main() -> i64 {
+    let h: Holder = Holder { p: 0 as &S };
+    let mut out: i64 = 7;
+    while false {
+        out = h.p.n;
+    }
+    print_i64(out);
+    return 0;
+}

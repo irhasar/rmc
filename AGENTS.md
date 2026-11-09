@@ -526,8 +526,10 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
 - **LICM never hoists a read through a reference.** A scalar field read is
   hoisted only when its base is a local aggregate (`frame_field_base`); a field
   read through `&T` dereferences a pointer that may be null (`0 as &S`) or
-  dangling, so hoisting it would fault on a loop whose body never runs. Local
-  aggregate fields are frame accesses and stay hoistable.
+  dangling, so hoisting it would fault on a loop whose body never runs. Any
+  field in the chain whose own type is a reference holds such a pointer, so
+  `h.p.n` (where `p: &S`) is not a frame access either. Local aggregate fields
+  are frame accesses and stay hoistable.
 - **LICM hoists a loop body's invariant arithmetic, and `for` slots are
   loop-carried.** The pass rewrites only a loop *body*; a `while` condition and
   a `for`'s bounds run once per iteration by design. A `for`'s variable and
@@ -846,9 +848,11 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   computation whenever that computation can have an effect (`place_has_effect`,
   which is `contains_call` plus a block/if that assigns a local), and the
   aggregate copy is factored into `assign_aggregate` for the same reason. The
-  `contains_call` walk must reach every place form (`Deref`, `AddrOf`,
-  `EnumPayload`, ...), or a target like `*f()` is mis-ordered. `assignorder.rms`
-  and `tools/fuzz.py --mode order` pin this.
+  walk must reach every place form (`Deref`, `AddrOf`, `EnumPayload`, ...) and
+  must descend through `Bin`/`Un`/`Cast` and an `if` condition, or a target like
+  `r[{ y = 2; 0 } + 0]` is mis-ordered: `contains_call` alone misses a block
+  that assigns without calling. `assignorder.rms`, `refidxorder.rms` and
+  `tools/fuzz.py --mode order` pin this.
 - **A compound assignment binds its modifying operand first.** `desugar_compound`
   evaluates the right-hand operand into a temporary ahead of the subscript
   temporary, so `a[next()] += val()` runs `val()` before `next()`, matching the
@@ -904,12 +908,14 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   which compiles every case through both paths and requires identical output.
   The `--binutils` path still uses `ld --build-id=none -z noseparate-code
   --strip-all`; `--no-strip` keeps the symbol table, `--min-size` also runs
-  `strip --strip-section-headers`. Do not change the `--binutils` link back to
-  `-n` (nmagic): it packs every section into one read+write+execute `LOAD`
-  segment, a W^X violation, and is *larger*. `tests/run.py`'s `check_stripped`
-  pins the size ordering of all four variants, `check_no_rwx` fails on any
-  writable+executable `LOAD` segment, and `check_link_paths_agree` requires the
-  two link paths to behave identically.
+  `strip --strip-section-headers`. `--no-strip` and `--min-size` request
+  opposite artifacts, so `parse_args` rejects the pair instead of letting
+  `--min-size` strip the symbols `--no-strip` asked to keep. Do not change the
+  `--binutils` link back to `-n` (nmagic): it packs every section into one
+  read+write+execute `LOAD` segment, a W^X violation, and is *larger*.
+  `tests/run.py`'s `check_stripped` pins the size ordering of all four variants,
+  `check_no_rwx` fails on any writable+executable `LOAD` segment, and
+  `check_link_paths_agree` requires the two link paths to behave identically.
 - **In-process assembler gotchas.** The encoder in `src/elf.rs` is deliberately
   narrow; these are the encodings that are easy to get wrong and were each a
   real bug:
