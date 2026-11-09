@@ -63,6 +63,11 @@ pub struct Sema {
     /// inside it (rustc's `cannot assign twice`); a binding declared *inside*
     /// the body is fresh each iteration and is exempt.
     loop_marks: Vec<usize>,
+    /// Per enclosing loop, whether it may run a body iteration more than once
+    /// (a `while`/`for` always may; a `loop` only when its body can reach the
+    /// top again, i.e. it falls through the end or contains a `continue`). A
+    /// `loop` that runs at most once keeps the straight-line write rules.
+    loop_repeats: Vec<bool>,
     ret_ty: Type,
 }
 
@@ -153,6 +158,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         next_slot: 0,
         loop_depth: 0,
         loop_marks: Vec::new(),
+        loop_repeats: Vec::new(),
         ret_ty: Type::Unit,
     };
     for f in &mut prog.fns {
@@ -522,16 +528,24 @@ impl Sema {
                 // The body may run again, so a non-`mut` binding that already
                 // existed outside the loop cannot be written inside it.
                 self.loop_marks.push(scope.len());
+                self.loop_repeats.push(true);
                 self.check_block(body, scope)?;
+                self.loop_repeats.pop();
                 self.loop_marks.pop();
                 self.loop_depth -= 1;
                 Ok(())
             }
             Stmt::Loop(body) => {
-                // A `loop` runs at least once, so writes to outer bindings
-                // inside it behave like straight-line writes and are allowed.
                 self.loop_depth += 1;
+                // A `loop` runs at least once, so a write to an outer binding is
+                // a straight-line write unless the body can reach the top again.
+                // Then it is a second write on the next pass and rustc rejects
+                // it, exactly like a `while` body.
+                self.loop_marks.push(scope.len());
+                self.loop_repeats.push(block_repeats(body));
                 self.check_block(body, scope)?;
+                self.loop_repeats.pop();
+                self.loop_marks.pop();
                 self.loop_depth -= 1;
                 Ok(())
             }
@@ -558,7 +572,9 @@ impl Sema {
                 });
                 self.loop_depth += 1;
                 self.loop_marks.push(mark);
+                self.loop_repeats.push(true);
                 self.check_block(body, scope)?;
+                self.loop_repeats.pop();
                 self.loop_marks.pop();
                 self.loop_depth -= 1;
                 scope.truncate(mark);
@@ -625,10 +641,19 @@ impl Sema {
                 match scope.iter().enumerate().rev().find(|(_, b)| &b.name == name) {
                     Some((_, b)) if b.mutable => Ok(()),
                     Some((_, b)) if b.assigned => deny(b),
-                    // A write inside a `while`/`for` to a binding declared before
-                    // that loop would run once per iteration, so it is a second
-                    // write even on the first pass.
-                    Some((idx, b)) if self.loop_marks.last().is_some_and(|&m| idx < m) => deny(b),
+                    // A write inside a repeating loop to a binding declared
+                    // before that loop would run once per iteration, so it is a
+                    // second write even on the first pass. A `loop` that runs at
+                    // most once is exempt (its flag is `false`).
+                    Some((idx, b))
+                        if self
+                            .loop_marks
+                            .iter()
+                            .zip(self.loop_repeats.iter())
+                            .any(|(&m, &rep)| rep && idx < m) =>
+                    {
+                        deny(b)
+                    }
                     Some(_) => Ok(()),
                     None => Ok(()),
                 }
@@ -814,23 +839,25 @@ impl Sema {
                 if ct != Type::Bool {
                     return Err(format!("`if` condition must be `bool`, found {ct:?}"));
                 }
-                // An `if` writes a binding only when both arms definitely do;
-                // an `if` without an `else` leaves the state unchanged (the
-                // else path is a no-op). Snapshot the flags, check each arm
-                // from the incoming state, then keep a flag set only when every
-                // path sets it.
+                // Each arm is checked from the incoming state, then the results
+                // are merged. A path that returns/breaks/continues cannot reach
+                // the statement after the `if`, so it must not contribute: only
+                // arms that can fall through decide the merged state. An `if`
+                // without an `else` has an implicit fall-through arm keeping the
+                // incoming state.
                 let before = Self::snapshot_assigned(scope);
                 let tt = self.check_block(then, scope)?;
                 let then_state = Self::snapshot_assigned(scope);
+                let then_div = block_diverges(then);
                 Self::restore_assigned(scope, &before);
-                let (et, else_state) = match els {
+                let (et, else_state, else_div) = match els {
                     Some(e) => {
                         let et = self.check_block(e, scope)?;
                         let st = Self::snapshot_assigned(scope);
                         if tt != et {
                             return Err(format!("`if` branches have different types: {tt:?} and {et:?}"));
                         }
-                        (tt, st)
+                        (tt, st, block_diverges(e))
                     }
                     None => {
                         if tt != Type::Unit {
@@ -839,10 +866,18 @@ impl Sema {
                             ));
                         }
                         // No else: the fall-through keeps the incoming state.
-                        (tt, before.clone())
+                        (tt, before.clone(), false)
                     }
                 };
-                Self::merge_assigned(scope, &then_state, &else_state);
+                // A may-analysis: a binding is "assigned" when any reaching path
+                // assigned it. Only arms that fall through contribute.
+                match (then_div, else_div) {
+                    (false, false) => Self::merge_assigned(scope, &then_state, &else_state),
+                    (true, false) => Self::restore_assigned(scope, &else_state),
+                    (false, true) => Self::restore_assigned(scope, &then_state),
+                    // Both arms diverge: nothing after the `if` is reachable.
+                    (true, true) => {}
+                }
                 Ok(et)
             }
             Expr::Block(b) => self.check_block(b, scope),
@@ -1007,6 +1042,11 @@ impl Sema {
             Expr::MethodCall { recv, name, args } => {
                 // Resolve the receiver's type, then look the method up as the
                 // mangled free function `Type$method` the parser produced.
+                // The receiver is checked twice — once here for its type, once
+                // again as the first argument of the rewritten call. Snapshot the
+                // assignment flags so the second check sees the receiver's writes
+                // exactly once, not twice.
+                let assigned_before = Self::snapshot_assigned(scope);
                 let rt = self.check_expr(recv, scope)?;
                 // A method lives on a struct or an enum; both give the mangled
                 // prefix `Type$method`.
@@ -1022,11 +1062,8 @@ impl Sema {
                 if !self.sigs.contains_key(&mangled) {
                     return Err(format!("no method `{name}` on `{tyname}`"));
                 }
+                Self::restore_assigned(scope, &assigned_before);
                 // Rewrite into a call with the receiver as the first argument.
-                // The receiver was checked above; the call is checked once more
-                // as a whole, which re-checks the receiver — harmless, since a
-                // value expression has no side effects on the frame other than
-                // bumping `next_slot` for a temporary aggregate.
                 let recv = std::mem::replace(recv.as_mut(), Expr::Int(0));
                 let mut call_args = Vec::with_capacity(args.len() + 1);
                 call_args.push(recv);
@@ -1265,6 +1302,76 @@ fn expr_diverges(e: &Expr) -> bool {
         Expr::If(_, t, els) => {
             block_diverges(t) && els.as_ref().map_or(false, |b| block_diverges(b))
         }
+        _ => false,
+    }
+}
+
+/// True when a `loop` body can reach its own top again, so a write to a binding
+/// declared before the loop repeats and rustc rejects it. That happens when the
+/// body can fall through to its end (control loops back) or contains a
+/// `continue` for this loop. A body that always reaches a `break`/`return` runs
+/// at most once.
+fn block_repeats(b: &Block) -> bool {
+    for s in &b.stmts {
+        if stmt_has_continue(s) {
+            return true;
+        }
+        if stmt_diverges(s) {
+            return false;
+        }
+    }
+    if let Some(t) = &b.tail {
+        if expr_has_continue(t) {
+            return true;
+        }
+        if expr_diverges(t) {
+            return false;
+        }
+    }
+    true
+}
+
+/// True when a statement contains a `continue` for the enclosing `loop`. A
+/// `continue` inside a nested loop targets that loop, so those statements are
+/// transparent.
+fn stmt_has_continue(s: &Stmt) -> bool {
+    match s {
+        Stmt::Continue => true,
+        Stmt::While(_, _) | Stmt::For { .. } | Stmt::Loop(_) => false,
+        Stmt::Expr(e) => expr_has_continue(e),
+        Stmt::Let { init: Some(e), .. } => expr_has_continue(e),
+        Stmt::Assign { value, .. } => expr_has_continue(value),
+        _ => false,
+    }
+}
+
+fn block_has_continue(b: &Block) -> bool {
+    b.stmts.iter().any(stmt_has_continue) || b.tail.as_deref().map_or(false, expr_has_continue)
+}
+
+fn expr_has_continue(e: &Expr) -> bool {
+    match e {
+        Expr::Block(b) => block_has_continue(b),
+        Expr::If(c, t, els) => {
+            expr_has_continue(c)
+                || block_has_continue(t)
+                || els.as_ref().map_or(false, |b| block_has_continue(b))
+        }
+        Expr::Bin(_, a, b) => expr_has_continue(a) || expr_has_continue(b),
+        Expr::Un(_, a) => expr_has_continue(a),
+        Expr::Index(a, b) => expr_has_continue(a) || expr_has_continue(b),
+        Expr::Field { base, .. } => expr_has_continue(base),
+        Expr::Cast(a, _) => expr_has_continue(a),
+        Expr::Call { args, .. } => args.iter().any(expr_has_continue),
+        Expr::StructLit { fields, .. } => fields.iter().any(|f| expr_has_continue(&f.value)),
+        Expr::ArrayLit(v, _) => expr_has_continue(v),
+        Expr::ArrayList(xs) => xs.iter().any(expr_has_continue),
+        Expr::MethodCall { recv, args, .. } => {
+            expr_has_continue(recv) || args.iter().any(expr_has_continue)
+        }
+        Expr::EnumCtor { args, .. } => args.iter().any(expr_has_continue),
+        Expr::VariantTest { scrutinee, .. } => expr_has_continue(scrutinee),
+        Expr::EnumPayload { recv, .. } => expr_has_continue(recv),
         _ => false,
     }
 }
