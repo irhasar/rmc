@@ -1904,10 +1904,22 @@ impl Sema {
                     other => Err(format!("cannot index a value of type {other:?}")),
                 }
             }
-            Expr::Field { base, name, offset, ty } => {
+            Expr::Field { base, name, offset, ty, pat_struct } => {
                 let bt = deref_ty(self.check_expr(base, scope)?);
                 match bt {
                     Type::Struct(sname, _) => {
+                        // A field read produced by a destructuring pattern names
+                        // the struct it was written against. The scrutinee must
+                        // be that struct, or rustc's "mismatched types" (E0308)
+                        // is missed: `let P { x } = q` where `q: Q` reads `Q`'s
+                        // `x` at `P`'s offset and silently binds the wrong field.
+                        if let Some(want) = pat_struct {
+                            if *want != sname {
+                                return Err(format!(
+                                    "mismatched types: expected `{want}`, found `{sname}` in a struct pattern"
+                                ));
+                            }
+                        }
                         let info = self.structs.get(&sname).cloned().unwrap();
                         match info.fields.iter().find(|(f, _, _)| f == name) {
                             Some((_, fty, off)) => {

@@ -612,7 +612,7 @@ impl Parser {
     /// variant, an or-pattern) is rejected, as rustc rejects it for a parameter.
     fn param_pat_binds(&mut self, p: Pat, subj: &Expr) -> PResult<Vec<Stmt>> {
         match p {
-            Pat::Struct(_, fields) => Ok(Self::struct_pat_binds(&fields, subj)),
+            Pat::Struct(name, fields) => Ok(Self::struct_pat_binds(&name, &fields, subj)),
             Pat::Array { elems, rest, front } => {
                 Ok(Self::array_pat_binds(&elems, rest, front, subj))
             }
@@ -974,7 +974,7 @@ impl Parser {
                 slot: -1,
                 mutable: false,
             }],
-            Pat::Struct(_, fields) => self.let_destructure_stmts(fields, None, elem),
+            Pat::Struct(name, fields) => self.let_destructure_stmts(name, fields, None, elem),
             Pat::Array { elems, rest, front } => {
                 self.let_destructure_array_stmts(elems, rest, front, None, elem)
             }
@@ -1139,8 +1139,8 @@ impl Parser {
                     let init = self.parse_expr()?;
                     self.expect(Tok::Semi)?;
                     match pat {
-                        Pat::Struct(_, fields) => {
-                            out.extend(self.let_destructure_stmts(fields, ty, init))
+                        Pat::Struct(name, fields) => {
+                            out.extend(self.let_destructure_stmts(name, fields, ty, init))
                         }
                         Pat::Array { elems, rest, front } => {
                             out.extend(self.let_destructure_array_stmts(elems, rest, front, ty, init))
@@ -1303,7 +1303,13 @@ impl Parser {
         });
 
         for (vname, ty, fname) in writes {
-            let target = Expr::Field { base: Box::new(tvar()), name: fname, offset: 0, ty: Type::I64 };
+            let target = Expr::Field {
+                base: Box::new(tvar()),
+                name: fname,
+                offset: 0,
+                ty: Type::I64,
+                pat_struct: None,
+            };
             let value = Expr::Var { name: vname, slot: -1, ty };
             stmts.push(Stmt::Assign { target, value });
         }
@@ -1649,7 +1655,13 @@ impl Parser {
                     self.expect(Tok::RParen)?;
                     e = Expr::MethodCall { recv: Box::new(e), name, args };
                 } else {
-                    e = Expr::Field { base: Box::new(e), name, offset: 0, ty: Type::I64 };
+                    e = Expr::Field {
+                        base: Box::new(e),
+                        name,
+                        offset: 0,
+                        ty: Type::I64,
+                        pat_struct: None,
+                    };
                 }
             } else {
                 break;
@@ -2078,7 +2090,9 @@ impl Parser {
                     out.extend(Self::array_pat_binds(elems, *rest, *front, &index))
                 }
                 // A struct sub-pattern inside an array element.
-                Pat::Struct(_, fields) => out.extend(Self::struct_pat_binds(fields, &index)),
+                Pat::Struct(name, fields) => {
+                    out.extend(Self::struct_pat_binds(name, fields, &index))
+                }
                 _ => unreachable!("unexpected array sub-pattern"),
             }
         }
@@ -2388,12 +2402,13 @@ impl Parser {
     /// it is still checked.
     fn let_destructure_stmts(
         &mut self,
+        sname: String,
         fields: Vec<FieldPat>,
         ty: Option<Type>,
         init: Expr,
     ) -> Vec<Stmt> {
         let (mut out, subj) = self.let_destructure_prelude(ty, init);
-        out.extend(Self::struct_pat_binds(&fields, &subj));
+        out.extend(Self::struct_pat_binds(&sname, &fields, &subj));
         out
     }
 
@@ -2446,7 +2461,7 @@ impl Parser {
     /// may auto-deref a `&S` scrutinee. `f: _` contributes no binding. A nested
     /// sub-pattern (`f: I { a }`) recurses with the field read as its
     /// sub-scrutinee, so the nested names become ordinary chained reads.
-    fn struct_pat_binds(fields: &[FieldPat], subj: &Expr) -> Vec<Stmt> {
+    fn struct_pat_binds(sname: &str, fields: &[FieldPat], subj: &Expr) -> Vec<Stmt> {
         let mut out = Vec::new();
         for (fname, bind) in fields {
             let (m, pat) = match bind {
@@ -2458,6 +2473,7 @@ impl Parser {
                 name: fname.clone(),
                 offset: -1,
                 ty: Type::Unit,
+                pat_struct: Some(sname.to_string()),
             };
             match pat {
                 Pat::Bind(b) => out.push(Stmt::Let {
@@ -2467,7 +2483,9 @@ impl Parser {
                     init: Some(field),
                     slot: -1,
                 }),
-                Pat::Struct(_, inner) => out.extend(Self::struct_pat_binds(inner, &field)),
+                Pat::Struct(name, inner) => {
+                    out.extend(Self::struct_pat_binds(name, inner, &field))
+                }
                 // An array-typed field may be destructured by an array pattern.
                 Pat::Array { elems, rest, front } => {
                     out.extend(Self::array_pat_binds(elems, *rest, *front, &field))
@@ -2496,7 +2514,7 @@ impl Parser {
                 slot: -1,
             }),
             Pat::Wild => {}
-            Pat::Struct(_, fields) => out.extend(Self::struct_pat_binds(&fields, subj)),
+            Pat::Struct(name, fields) => out.extend(Self::struct_pat_binds(&name, &fields, subj)),
             Pat::Array { elems, rest, front } => {
                 out.extend(Self::array_pat_binds(&elems, rest, front, subj))
             }
@@ -2551,7 +2569,7 @@ impl Parser {
             // scrutinee by auto-deref. The struct name and each field name were
             // already checked against the prescan, so `f: _` (which emits no
             // read) is validated too.
-            Pat::Struct(_name, fields) => (Self::struct_pat_binds(&fields, &subj), None),
+            Pat::Struct(name, fields) => (Self::struct_pat_binds(&name, &fields, &subj), None),
             // `[a, b] => body` is irrefutable in the same way: it binds each
             // named element via an index read, with no test. A `..` rest shifts
             // the trailing bindings to the back of the array.

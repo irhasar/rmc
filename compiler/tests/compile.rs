@@ -927,6 +927,44 @@ fn an_array_pattern_with_an_out_of_range_element_is_rejected() {
 }
 
 #[test]
+fn a_struct_pattern_on_a_different_struct_is_rejected() {
+    // rustc rejects `let P { x } = q` when `q: Q` with "mismatched types"
+    // (E0308). rmc used to accept it and read `Q`'s `x` at `P`'s offset, so a
+    // field with the same name but a different layout bound silently.
+    let err = compile_to_asm(
+        "struct P { x: i64, y: i64 } struct Q { x: i64 } \
+         fn main() -> i64 { let q: Q = Q { x: 5 }; let P { x, y } = q; return x + y; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("mismatched types"), "got: {err}");
+    assert!(err.contains("expected `P`") && err.contains("found `Q`"), "got: {err}");
+}
+
+#[test]
+fn a_struct_pattern_on_a_non_struct_is_rejected() {
+    // The scrutinee is not a struct at all: rustc's E0308. The pattern names
+    // the struct it was written against, so the error can name it.
+    let err = compile_to_asm(
+        "struct P { x: i64 } \
+         fn main() -> i64 { let n: i64 = 1; let P { x } = n; return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("field access on a value of type"), "got: {err}");
+}
+
+#[test]
+fn a_struct_pattern_on_the_right_struct_is_accepted() {
+    // The check must not reject a legitimate destructuring, including a nested
+    // sub-pattern whose field type is the inner struct.
+    let src = "struct Inner { a: i64, b: i64 } struct Outer { i: Inner, c: i64 } \
+               fn main() -> i64 { let o: Outer = Outer { i: Inner { a: 3, b: 4 }, c: 5 }; \
+               let Outer { i: Inner { a, b }, c } = o; return a * 100 + b * 10 + c; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
 fn a_struct_field_may_be_destructured_by_an_array_pattern() {
     let src = "struct S { a: [i64; 2], b: i64 } \
                fn main() -> i64 { let s: S = S { a: [3, 4], b: 5 }; \

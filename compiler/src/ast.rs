@@ -170,7 +170,19 @@ pub enum Expr {
     Index(Box<Expr>, Box<Expr>),
     /// struct field access `base.name`. `offset` is the byte offset from the base
     /// address and `ty` the field's type; both are filled in by sema.
-    Field { base: Box<Expr>, name: String, offset: i32, ty: Type },
+    ///
+    /// `pat_struct` names the struct a destructuring pattern bound this field
+    /// through (`S { f }`), when the field was produced by that pattern rather
+    /// than by an ordinary `base.name`. Sema checks the base is that struct, so
+    /// `let P { x } = q` where `q: Q` is rejected as rustc rejects it; for an
+    /// ordinary field access it is `None` and the field is resolved by name.
+    Field {
+        base: Box<Expr>,
+        name: String,
+        offset: i32,
+        ty: Type,
+        pat_struct: Option<String>,
+    },
     /// `Name { field: value, ... }`. Sema reorders `fields` into declaration
     /// order, fills in each field's offset and type, and allocates `slot`, a
     /// frame buffer the literal is materialised into so it can be used wherever
