@@ -31,25 +31,47 @@ fn main() {
 
     let text = std::fs::read_to_string(&input).expect("cannot read input");
     let opts = Options { overflow_checks, promote: !no_promote, align_loops: true };
+    let timing = std::env::var_os("RMC_TIME").is_some();
+    let mut t0 = std::time::Instant::now();
+    let mut mark = |label: &str, t0: &mut std::time::Instant| {
+        if timing {
+            eprintln!("{:>22} {:8.1} ms", label, t0.elapsed().as_secs_f64() * 1000.0);
+            *t0 = std::time::Instant::now();
+        }
+    };
     let mut prog = rmc::mir::parse(&text).expect("mir parse");
+    mark("parse", &mut t0);
     rmc::mir::tco(&mut prog, overflow_checks);
+    mark("tco", &mut t0);
     rmc::mir::inline_calls(&mut prog);
+    mark("inline", &mut t0);
     rmc::mir::coalesce_call_results(&mut prog);
+    mark("coalesce", &mut t0);
     rmc::mir::merge_blocks(&mut prog);
+    mark("merge_blocks", &mut t0);
     prog.copy_propagate();
+    mark("copy_propagate", &mut t0);
     rmc::mir::drop_redundant_asserts(&mut prog);
+    mark("drop_asserts", &mut t0);
     rmc::mir::licm(&mut prog);
+    mark("licm", &mut t0);
     rmc::mir::fold_accumulators(&mut prog);
+    mark("fold_accumulators", &mut t0);
     rmc::mir::jump_thread(&mut prog);
+    mark("jump_thread", &mut t0);
     rmc::mir::rotate_loops(&mut prog);
+    mark("rotate_loops", &mut t0);
     rmc::mir::layout_blocks(&mut prog);
+    mark("layout_blocks", &mut t0);
     match rmc::compile_mir_to_asm(&prog, &opts) {
         Ok(asm) => {
+            mark("codegen", &mut t0);
             if emit_asm {
                 print!("{asm}");
                 return;
             }
             let bytes = rmc::elf::assemble(&asm).expect("assemble");
+            mark("assemble", &mut t0);
             std::fs::write(&output, &bytes).expect("write output");
             #[cfg(unix)]
             {

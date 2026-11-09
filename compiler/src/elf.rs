@@ -65,7 +65,12 @@ pub fn assemble(asm: &str) -> Result<Vec<u8>, String> {
         sections: vec![Section {
             name: ".text",
             flags: 0x5,
-            align: 16,
+            // 64, not 16: the in-section `.p2align 5` that aligns a loop header
+            // is relative to the section, so a 16-aligned section base turns
+            // every "32-aligned" loop into a 16-mod-32 one -- the slow half of
+            // the run-time lottery. A cache-line base makes the directive mean
+            // what it says.
+            align: 64,
             data: Vec::new(),
             vaddr: 0,
             file_off: 0,
@@ -221,11 +226,38 @@ impl Elf {
     fn pad_to_align(&mut self, sec: usize, n: u64) {
         let len = self.sections[sec].data.len() as u64;
         let pad = (n - (len % n)) % n;
-        // A zero byte is `add %al,(%rax)` in an executable section, which would
-        // fault if control ever reached it; pad with `nop` there. Other sections
-        // (`.rodata`, `.data`) want real zeros.
-        let fill = if self.sections[sec].flags & 0x1 != 0 { 0x90 } else { 0 };
-        self.sections[sec].data.resize(len as usize + pad as usize, fill);
+        if pad == 0 {
+            return;
+        }
+        if self.sections[sec].flags & 0x1 != 0 {
+            // Executable: pad the way GAS does. A run of one-byte `nop`s is
+            // legal but decodes as many instructions, and on some cores the
+            // long run of 1-byte nops -- plus the branch that jumps over it --
+            // costs real run-time in a hot loop. Multi-byte `nop`s keep the
+            // padding to one or two instructions, which is what `as` emits.
+            let mut left = pad as usize;
+            while left > 0 {
+                let k = left.min(9);
+                let nop: &[u8] = match k {
+                    1 => &[0x90],
+                    2 => &[0x66, 0x90],
+                    3 => &[0x0F, 0x1F, 0x00],
+                    4 => &[0x0F, 0x1F, 0x40, 0x00],
+                    5 => &[0x0F, 0x1F, 0x44, 0x00, 0x00],
+                    6 => &[0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00],
+                    7 => &[0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00],
+                    8 => &[0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+                    _ => &[0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+                };
+                self.sections[sec].data.extend_from_slice(nop);
+                left -= k;
+            }
+        } else {
+            // A zero byte is `add %al,(%rax)` in an executable section, which
+            // would fault if control ever reached it; other sections want real
+            // zeros.
+            self.sections[sec].data.resize(len as usize + pad as usize, 0);
+        }
     }
 
     fn sym_value(&self, name: &str, cur: usize) -> Result<(i64, usize), String> {
@@ -1245,11 +1277,35 @@ impl Elf {
             "jnp" => 0x8B,
             other => return Err(format!("elf: unsupported branch `{other}`")),
         };
-        // Always the 6-byte rel32 form, so branch length never depends on the
-        // distance to the target.
+        // A backward branch to an already-defined label is almost always a loop
+        // back-edge, and its length decides where the code after the loop
+        // lands: the 6-byte rel32 form shifts the loop exit 4 bytes later than
+        // the 2-byte rel8 form `as` emits, which measured a 20% run-time
+        // regression on `fib`. Emit rel8 when the target is in range; otherwise
+        // fall back to rel32.
+        if self.try_short_jcc(cc, sec, &ops[0]) {
+            return Ok(());
+        }
         self.sections[sec].data.extend_from_slice(&[0x0F, cc]);
         self.pc_rel(sec, &ops[0]);
         Ok(())
+    }
+
+    /// Emit a 2-byte `jcc rel8` when the target is a label already defined in
+    /// this section and the displacement fits. Returns whether it did.
+    fn try_short_jcc(&mut self, cc: u8, sec: usize, sym: &str) -> bool {
+        if let Some(s) = self.syms.get(sym) {
+            if s.sec == sec && !s.abs {
+                let at = self.sections[sec].data.len() as i64;
+                let disp = s.off as i64 - (at + 2);
+                if (-128..=127).contains(&disp) {
+                    self.sections[sec].data.push(cc - 0x10);
+                    self.sections[sec].data.push(disp as u8);
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 

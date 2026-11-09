@@ -1533,41 +1533,75 @@ impl<'a> FnGen<'a> {
         // The saved registers sit below `%rbp`, so every frame slot is shifted
         // past them; `off` reads this.
         self.saved_regs = saved.len() as i64;
-        let _ = writeln!(self.out, ".globl {}", self.func.name);
-        let _ = writeln!(self.out, "{}:", self.func.name);
-        self.out.push_str("  push %rbp\n  mov %rsp, %rbp\n");
-        for r in &saved {
-            let _ = writeln!(self.out, "  push {r}");
-        }
-        // Keep `%rsp` 16-byte aligned at every call: the saved registers plus
-        // the frame must together be a multiple of 16.
-        let saved_bytes = self.saved_regs * 8;
-        let frame_bytes = align_up(packed_slots * 8 + saved_bytes, 16) - saved_bytes;
-        if frame_bytes > 0 {
-            let _ = writeln!(self.out, "  sub ${frame_bytes}, %rsp");
-        }
 
         self.gen_body()?;
+        let body = optimize(&std::mem::take(&mut self.out));
+
+        // A function whose final body never names `%rbp` needs no frame pointer:
+        // the `push %rbp; mov %rsp, %rbp; ...; leave` sequence is then pure
+        // overhead on every call, which a recursive function pays per level.
+        // Decide from the *optimised* body: the folding passes rewrite the store
+        // and reload of a call result into a register move, so a slot the raw
+        // body named can be gone by the time the frame is laid out.
+        let omit_frame = rbp_slots(&body).is_empty();
+        let saved_bytes = self.saved_regs * 8;
+        // A function with no `%rbp` operand touches no frame slot, so the only
+        // stack it needs is the padding that keeps `%rsp` 16-byte aligned at a
+        // call. rmc emits no aligned SSE and makes no external ABI call (its
+        // runtime manages its own stack), so that padding is pure per-call
+        // overhead -- and a recursive function pays it on every level. Only a
+        // body that actually addresses the frame gets the padding.
+        let mut frame_bytes = if omit_frame { 0 } else { packed_slots * 8 };
+        while !omit_frame && (8 + saved_bytes + 8 + frame_bytes) % 16 != 0 {
+            frame_bytes += 8;
+        }
+
+        let mut out = String::new();
+        // Align the entry to a 16-byte boundary: a call-heavy program (every
+        // recursive call, every `main` -> helper jump) fetches the first bytes
+        // of the callee, and an unaligned entry splits that fetch across two
+        // cache lines. LLVM aligns every function this way.
+        out.push_str("  .p2align 4\n");
+        let _ = writeln!(out, ".globl {}", self.func.name);
+        let _ = writeln!(out, "{}:", self.func.name);
+        if !omit_frame {
+            out.push_str("  push %rbp\n  mov %rsp, %rbp\n");
+        }
+        for r in &saved {
+            let _ = writeln!(out, "  push {r}");
+        }
+        if frame_bytes > 0 {
+            let _ = writeln!(out, "  sub ${frame_bytes}, %rsp");
+        }
+        out.push_str(&body);
 
         // Epilogue: restore the saved registers and return `%rax`. The saved
         // registers live directly below `%rbp`, but `%rsp` is still at the
         // bottom of the frame, so it has to be moved back up first.
-        let _ = writeln!(self.out, ".Lret_{}:", self.func.name);
+        let _ = writeln!(out, ".Lret_{}:", self.func.name);
         // `_start` passes `main`'s `%rax` straight to `exit(2)`, so a `main`
         // that returns `()` must define it. The ABI leaves `%rax` unspecified
         // for a unit return, so without this the process exits with whatever
         // the last statement happened to leave in the register.
         if self.func.name == "main" && self.local_ty(0) == Ty::Unit {
-            self.out.push_str("  xor %eax, %eax\n");
+            out.push_str("  xor %eax, %eax\n");
         }
-        if saved_bytes > 0 {
-            let _ = writeln!(self.out, "  lea -{saved_bytes}(%rbp), %rsp");
+        if omit_frame {
+            if frame_bytes > 0 {
+                let _ = writeln!(out, "  add ${frame_bytes}, %rsp");
+            }
+        } else if saved_bytes > 0 {
+            let _ = writeln!(out, "  lea -{saved_bytes}(%rbp), %rsp");
         }
         for r in saved.iter().rev() {
-            let _ = writeln!(self.out, "  pop {r}");
+            let _ = writeln!(out, "  pop {r}");
         }
-        self.out.push_str("  leave\n  ret\n");
-        Ok(optimize(&std::mem::take(&mut self.out)))
+        if omit_frame {
+            out.push_str("  ret\n");
+        } else {
+            out.push_str("  leave\n  ret\n");
+        }
+        Ok(optimize(&out))
     }
 
     /// Argument setup plus every basic block. Run twice (dry, then real).
@@ -1588,11 +1622,14 @@ impl<'a> FnGen<'a> {
         }
         for i in 0..self.func.blocks.len() as u32 {
             // Align a loop header: the target of a back edge (an edge from a
-            // later block). Aligning it to a cache line keeps the hot loop's
-            // instructions from straddling a boundary, which matters most for a
-            // tight inner loop.
+            // later block). 32 bytes, not 16: the front-end's decode window and
+            // loop stream buffer work on 32-byte chunks, so a 16-byte-aligned
+            // header still lands mid-window half the time -- and the resulting
+            // run-time swing (measured at 20% on `fib`) depends on where the
+            // linker happened to place `.text`, which the compiler cannot
+            // control. Aligning to 32 removes the lottery.
             if self.opts.align_loops && self.is_loop_header(i) {
-                let _ = writeln!(self.out, "  .p2align 4");
+                let _ = writeln!(self.out, "  .p2align 5");
             }
             let _ = writeln!(self.out, ".Lbb{}:", self.bb_label(i));
             self.gen_block(i)?;

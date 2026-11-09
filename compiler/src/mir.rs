@@ -4645,15 +4645,15 @@ pub fn licm(prog: &mut Program) {
     // can be hoisted out of a loop. rustc leaves these accessor calls in place,
     // and `refs` leans on hoisting `Wide::total`/`pair` out of the loop.
     let pure_fns = pure_function_set(prog);
-    for _ in 0..LICM_ROUNDS {
-        let mut changed = false;
-        for f in &mut prog.funcs {
-            if f.licm_once(&pure_fns) {
-                changed = true;
+    // LICM is intraprocedural: hoisting inside one function never changes
+    // another's blocks. So drive each function to its own fixpoint instead of
+    // restarting the whole program whenever any function changes, which made
+    // the pass O(rounds x functions) and dominated compile time on large input.
+    for f in &mut prog.funcs {
+        for _ in 0..LICM_ROUNDS {
+            if !f.licm_once(&pure_fns) {
+                break;
             }
-        }
-        if !changed {
-            break;
         }
     }
 }
@@ -4751,12 +4751,28 @@ impl Function {
             .map(|b| block_has_impure_call(b, pure_fns))
             .collect();
 
-        // Predecessors, from the terminator successors.
+        // Predecessors and successors, computed once. The back-edge test below
+        // needs "can `s` reach `b`", which a per-function reachability matrix
+        // answers in O(1) instead of a fresh reverse walk per edge.
+        let succ: Vec<Vec<u32>> = self.blocks.iter().map(|b| successors(&b.term)).collect();
         let mut preds: Vec<Vec<u32>> = vec![Vec::new(); nblocks];
-        for (b, blk) in self.blocks.iter().enumerate() {
-            for s in successors(&blk.term) {
+        for (b, ss) in succ.iter().enumerate() {
+            for &s in ss {
                 if let Some(p) = preds.get_mut(s as usize) {
                     p.push(b as u32);
+                }
+            }
+        }
+        let mut reach: Vec<Vec<bool>> = vec![vec![false; nblocks]; nblocks];
+        for s in 0..nblocks {
+            reach[s][s] = true;
+            let mut stack = vec![s];
+            while let Some(x) = stack.pop() {
+                for &t in &succ[x] {
+                    if !reach[s][t as usize] {
+                        reach[s][t as usize] = true;
+                        stack.push(t as usize);
+                    }
                 }
             }
         }
@@ -4766,9 +4782,9 @@ impl Function {
         // lay a loop out so its preheader has a *lower* block number than the
         // header, which would misread that edge as a back edge.
         let mut latches: HashMap<u32, Vec<u32>> = HashMap::new();
-        for (b, blk) in self.blocks.iter().enumerate() {
-            for s in successors(&blk.term) {
-                if s == b as u32 || reaches(&preds, s, b as u32) {
+        for (b, ss) in succ.iter().enumerate() {
+            for &s in ss {
+                if s == b as u32 || reach[s as usize][b] {
                     latches.entry(s).or_default().push(b as u32);
                 }
             }
@@ -4801,7 +4817,7 @@ impl Function {
         // The preheader is the header's only predecessor from *outside* the
         // loop: then the loop is entered from exactly one place, and hoisting to
         // it runs once. (The latches are predecessors too, but they are inside.)
-        let loop_blocks = self.loop_blocks(header, latches);
+        let loop_blocks = self.loop_blocks(header, latches, preds);
         let mut outside: Vec<u32> = preds[header as usize]
             .iter()
             .copied()
@@ -4986,7 +5002,7 @@ impl Function {
     /// The set of blocks that make up the loop with the given header: every
     /// block that can reach a latch without passing through the header, plus
     /// the header itself.
-    fn loop_blocks(&self, header: u32, latches: &HashMap<u32, Vec<u32>>) -> HashSet<u32> {
+    fn loop_blocks(&self, header: u32, latches: &HashMap<u32, Vec<u32>>, preds: &[Vec<u32>]) -> HashSet<u32> {
         let mut in_loop: HashSet<u32> = HashSet::new();
         in_loop.insert(header);
         let mut worklist: Vec<u32> = latches.get(&header).cloned().unwrap_or_default();
@@ -4996,10 +5012,9 @@ impl Function {
             }
             // Walk predecessors, stopping at the header (its other predecessors
             // are outside the loop).
-            for (p, blk) in self.blocks.iter().enumerate() {
-                let _ = blk;
-                if successors(&self.blocks[p].term).contains(&b) && p as u32 != header {
-                    worklist.push(p as u32);
+            for &p in &preds[b as usize] {
+                if p != header {
+                    worklist.push(p);
                 }
             }
         }
