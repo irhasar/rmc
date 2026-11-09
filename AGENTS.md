@@ -291,13 +291,39 @@ python3 tools/fuzz.py --mode mirmut --n 500 --seed 1     # mutated .mir text
 ## The rustc-MIR front end
 
 A `.rs` input takes the second pipeline: `main.rs::run_mir_pipeline` runs
-`rustc --emit=mir -O -C panic=abort --crate-type=bin --edition 2021`,
+`rustc --emit=mir -O -Zno-codegen -C panic=abort --crate-type=bin --edition 2021`,
 `mir.rs::parse` reads the MIR text, the MIR-level passes run, and
 `mir_codegen.rs` emits x86-64 that goes through the same `elf.rs`
 assembler/linker and `runtime.rs` as the `.rms` path. LLVM never runs. A `.mir`
 input skips the front end and enters `main.rs::run_mir_text` directly, which is
 the same back-end sequence; `rmcmir` (`examples/rmcmir.rs`) is the older
 standalone CLI for the same thing, and the benchmark times the two stages apart.
+
+- **`-Zno-codegen` is what keeps the front end cheap, and it is the single
+  biggest compile-time lever.** rmc *is* the code generator, so rustc should
+  stop right after the MIR optimisations instead of running the monomorphisation
+  and codegen preparation that `--emit=mir` throws away. Adding it drops the
+  front end from ~32 ms to ~27.5 ms and peak RSS by ~8.7 MB, and the MIR it
+  prints is byte-for-byte identical (verified for all ten benchmarks). It is a
+  nightly flag, so `run_rustc_front_end` sets `RUSTC_BOOTSTRAP=1` on the *child*
+  rustc only and falls back to a plain invocation when the flag is rejected;
+  keep that fallback or a stock stable toolchain breaks. The first (flagged)
+  attempt stays quiet on failure so a source error is not printed twice. Both
+  `bench/run_mir.py` and `bench/run_fair.py` set `RUSTC_BOOTSTRAP=1` at the top
+  so their `mir` column measures the pipeline rmc actually runs.
+- `-O` must stay on the front end: dropping it triples the emitted code's run
+  time (`fib` 5.4 ms -> 20.4 ms). The MIR-level optimisations it runs are the
+  ones rmc's own passes build on.
+- **`cmov` if-conversion for `min`/`max` is a trap, not a win.** LLVM compiles
+  `if v > max { max = v }` to `cmp`+`cmov`, and the natural instinct is to match
+  it. Measured on `stats` it is *slower* (3.96 ms vs 3.20 ms): the `min`/`max`
+  values saturate, so the branches predict almost perfectly and the
+  branchless form just lengthens the dependency chain. Do not add cmov
+  if-conversion without measuring the specific loop.
+- **The remaining `stats` gap is LLVM's 2x unrolling**, not the branches: LLVM
+  unrolls the `%` loop twice (two `imul`/magic-division chains per iteration).
+  Matching that needs an unroller, which is a larger and riskier pass than the
+  current peepholes; it is left undone deliberately.
 
 - The MIR text format is rustc's *internal* dump, not a stable interface. It
   changes between rustc releases; `mir.rs::parse` is written against the shape
