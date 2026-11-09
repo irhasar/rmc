@@ -2571,6 +2571,24 @@ fn a_string_reference_can_be_printed_through_a_function_parameter() {
 }
 
 #[test]
+fn format_arguments_run_before_the_first_write() {
+    // Rust evaluates every `{}` argument left to right before the first byte of
+    // output, so `println!("A{}B{}", f(), g())` must call `f` then `g` before
+    // the literal `A` is written. The lowering used to interleave the literal
+    // chunks with the argument writes, running `f` after `A`.
+    let out = asm_no_inline(
+        "fn f() -> i64 { print_str(\"1\"); return 10; } \
+         fn g() -> i64 { print_str(\"2\"); return 20; } \
+         fn main() -> i64 { println!(\"A{}B{}\", f(), g()); return 0; }",
+    );
+    let f_at = out.find("call f").expect("call f");
+    let g_at = out.find("call g").expect("call g");
+    let write_at = out.find("call __rmc_write").expect("a writer");
+    assert!(f_at < g_at, "arguments keep source order:\n{out}");
+    assert!(g_at < write_at, "every argument runs before the first write:\n{out}");
+}
+
+#[test]
 fn a_char_constant_with_an_aliased_type_folds_into_a_use() {
     // The constant's declared type names an alias (`Letter` -> `char`). The
     // prescan resolves aliases after the first `const` pass, so the value must
@@ -5774,12 +5792,15 @@ fn a_tuple_alias_may_name_an_alias_declared_later() {
     // `Pair` names `T`, which is declared after it. The pre-scan's first pass
     // lowers `Pair` to a tuple struct whose element is still the unresolved
     // `T`; the rebuild pass must redo it now that `T` is known, or the tuple's
-    // layout would be the placeholder's.
+    // layout would be the placeholder's. Passing the value to a function keeps
+    // both fields live, so a wrong element layout misplaces `p.1`.
     let out = asm(
         "type Pair = (T, i64); type T = i64; \
-         fn main() -> i64 { let p: Pair = (5, 6); return p.0 + p.1; }",
+         fn sum(p: Pair) -> i64 { return p.0 + p.1; } \
+         fn main() -> i64 { let p: Pair = (5, 6); return sum(p); }",
     );
-    assert!(out.contains("main:"));
+    assert!(out.contains("sum:"), "the parameter's tuple layout resolves:\n{out}");
+    assert!(out.contains("main:"), "accepted:\n{out}");
 }
 
 #[test]

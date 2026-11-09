@@ -21,6 +21,10 @@ fn main() {
     // An alias for a tuple and for an array, the latter with a `const` length.
     let t: Pair = (3, 6);
     println!("{}", t.0 * t.1);
+    // A forward alias *inside* a tuple: `PairF` names `Later`, declared below,
+    // so the tuple's element layout must be rebuilt once the alias resolves.
+    let pf: PairF = (8, 9);
+    println!("{}", pf.0 + pf.1);
     let arr: Arr = [1, 2, 3, 4];
     println!("{}", arr[0] + arr[3]);
     // An alias behind a reference and in a cast.
@@ -59,6 +63,7 @@ enum Ev {
 
 type Pt = P;
 type Pair = (i64, i64);
+type PairF = (Later, i64);
 type Arr = [i64; 4];
 type E = Ev;
 type Grid = [[i64; 2]; 2];
