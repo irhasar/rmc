@@ -337,6 +337,25 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   read a never-written slot and trapped (`exit 101`). The skip now consults
   `local_used_elsewhere` first; keep that guard on any new fold. Pinned by
   `tests/std/reusedcheck.rs`.
+- **The same `bool` reuse is what makes the fold *safe* in a loop header.** The
+  guard above was too coarse: it treated a read of the local in *any* other block
+  as live, even when that block defines the local before reading it. rustc reuses
+  one `bool` for repeated tests, so `fib` computes `_2 = Lt(n, 2)` in the entry
+  block *and* the loop header; the header's read is served by its own store, so
+  folding the entry store is safe. With the coarse guard both folds bailed and
+  the backend paid `setl`/`movzbl`/store plus a second `cmp` every iteration,
+  which is what put `fib` and `callrec` behind LLVM (0.92x / 0.89x). The guard
+  now tracks define-before-use per block: a same-block read is always live, a
+  read in another block is live only before that block's first definition. Pinned
+  by `mir_codegen::tests::reused_bool_local_still_folds` (fails on the old guard,
+  which re-emits `setl`) and kept honest by `reusedcheck`.
+- **A destructuring pattern must check the scrutinee's struct.** `let P { x } = q`
+  where `q: Q` reads `Q`'s `x` at `P`'s offset: a field with the same name but a
+  different type or position bound silently. rustc rejects it with E0308. The
+  `Expr::Field` read a struct pattern expands to carries the struct the pattern
+  named (`pat_struct`), and sema requires the scrutinee to be it; an ordinary
+  `base.name` leaves it `None` and resolves by field name. Threaded through
+  `struct_pat_binds`.
 - A trap block is emitted inline in the fall-through position, so the common path
   takes a taken branch over it. `mix`'s `%` loop pays that branch once per
   iteration; it is not free.
