@@ -2986,12 +2986,16 @@ impl<'a> FnGen<'a> {
         }
         if byte {
             // A memory source cannot feed `mov mem, reg8` directly when it is a
-            // wide slot; load it into `%rcx` first. An immediate needs the `b`
+            // wide slot; load it into `%rdx` first. An immediate needs the `b`
             // suffix, or the assembler would pick a 32-bit store.
+            //
+            // `%rdx`, not `%rcx`: `place_addr` below computes a dynamic index
+            // through `%rcx`, so a value parked there is overwritten by the
+            // index and the element receives the index (`arr[i] = src[i]`).
             let is_mem = src.contains('(');
             let (mnem, src) = if src == "%rax" || is_mem || is_wide_imm(src) {
-                self.emit(&format!("  mov {src}, %rcx"));
-                ("mov", "%cl")
+                self.emit(&format!("  mov {src}, %rdx"));
+                ("mov", "%dl")
             } else if src.starts_with('$') {
                 ("movb", src)
             } else {
@@ -3002,12 +3006,14 @@ impl<'a> FnGen<'a> {
             return Ok(());
         }
         // A memory source cannot be the source of a memory destination, and
-        // `%rax` is clobbered by `place_addr`, so both go through `%rcx`. A
-        // wide immediate has no `mov $imm, mem` encoding either.
+        // `%rax` is clobbered by `place_addr`, so both go through `%rdx`. A
+        // wide immediate has no `mov $imm, mem` encoding either. `place_addr`
+        // uses `%rcx` for a dynamic index, so `%rdx` is the one scratch it
+        // leaves alone.
         let is_mem = src.contains('(');
-        let src = if src == "%rax" || is_mem || is_wide_imm(src) {
-            self.emit(&format!("  mov {src}, %rcx"));
-            "%rcx"
+        let src = if src == "%rax" || src == "%rcx" || is_mem || is_wide_imm(src) {
+            self.emit(&format!("  mov {src}, %rdx"));
+            "%rdx"
         } else {
             src
         };

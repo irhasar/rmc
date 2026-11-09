@@ -352,8 +352,38 @@ impl Function {
     /// temporary's slot, which is still written.
     fn copy_propagate(&mut self) {
         let defs = self.def_counts();
+        // A local read as a dynamic index (`_1[_7]`) must keep its definition:
+        // folding it away leaves the index slot with no writer, so the store
+        // addresses element 0 (`arr[i] = x` wrote the wrong element).
+        let index_locals: HashSet<u32> = self
+            .blocks
+            .iter()
+            .flat_map(|b| {
+                let stmts = b.stmts.iter().flat_map(|s| match s {
+                    Stmt::Assign(d, rv) => {
+                        let mut v: Vec<u32> = place_indices(d);
+                        scan_rv_operands(rv, &mut |op| {
+                            if let Operand::Copy(p) | Operand::Move(p) = op {
+                                v.extend(place_indices(p));
+                            }
+                        });
+                        v
+                    }
+                    _ => Vec::new(),
+                });
+                let term = std::iter::once(&b.term).flat_map(|t| match t {
+                    Terminator::SwitchInt { discr, .. } => operand_indices(discr),
+                    Terminator::Assert { cond, .. } => operand_indices(cond),
+                    Terminator::Call { args, .. } => {
+                        args.iter().flat_map(operand_indices).collect::<Vec<_>>()
+                    }
+                    _ => Vec::new(),
+                });
+                stmts.chain(term)
+            })
+            .collect();
         let subst_local: HashSet<u32> = (0..self.locals.len() as u32)
-            .filter(|l| self.safe_subst(*l, &defs))
+            .filter(|l| self.safe_subst(*l, &defs) && !index_locals.contains(l))
             .collect();
         // Locals written through a projection anywhere (`_s.0 = x`, `(*_s).1 = y`).
         // A value read out of such a local can change without a whole-local
@@ -552,6 +582,25 @@ fn for_each_operand_mut(rv: &mut Rvalue, f: &mut impl FnMut(&mut Operand)) {
     }
 }
 
+/// The locals a place reads as a dynamic index (`_1[_7]` reads `_7`).
+fn place_indices(p: &Place) -> Vec<u32> {
+    p.proj
+        .iter()
+        .filter_map(|proj| match proj {
+            Proj::IndexLocal(i) => Some(*i),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The locals an operand reads as a dynamic index.
+fn operand_indices(op: &Operand) -> Vec<u32> {
+    match op {
+        Operand::Copy(p) | Operand::Move(p) => place_indices(p),
+        _ => Vec::new(),
+    }
+}
+
 fn is_self_assign(s: &Stmt) -> bool {
     let Stmt::Assign(d, Rvalue::Use(Operand::Copy(src) | Operand::Move(src))) = s else {
         return false;
@@ -593,15 +642,7 @@ fn rewrite_op(op: &mut Operand, subst: &HashMap<u32, Place>) {
 /// target is rewritten too, but only when the alias is a plain local: aliasing a
 /// projection would change which address is taken.
 fn rewrite_place(p: &mut Place, subst: &HashMap<u32, Place>) {
-    for proj in &mut p.proj {
-        if let Proj::IndexLocal(i) = proj {
-            if let Some(src) = subst.get(i) {
-                if src.proj.is_empty() {
-                    *i = src.local;
-                }
-            }
-        }
-    }
+    rewrite_place_indices(p, subst);
     if let Some(src) = subst.get(&p.local) {
         if p.proj.is_empty() || src.proj.is_empty() {
             let proj = std::mem::take(&mut p.proj);
@@ -611,11 +652,36 @@ fn rewrite_place(p: &mut Place, subst: &HashMap<u32, Place>) {
     }
 }
 
+/// Rewrite only the dynamic index locals of a place (`_1[_7]`), leaving its
+/// base local alone.
+///
+/// This is what an assignment's destination needs. The base names the storage
+/// that is written, and `_d = copy _x` gives `_d` its own storage, so
+/// `_d.0 = 5` must not be redirected to `_x.0`. The index, by contrast, is an
+/// address computation: if `_7`'s definition was folded into `_9`, the index
+/// must follow the alias or the store addresses the wrong element.
+fn rewrite_place_indices(p: &mut Place, subst: &HashMap<u32, Place>) {
+    for proj in &mut p.proj {
+        if let Proj::IndexLocal(i) = proj {
+            if let Some(src) = subst.get(i) {
+                if src.proj.is_empty() {
+                    *i = src.local;
+                }
+            }
+        }
+    }
+}
+
 fn rewrite_stmt(s: &mut Stmt, subst: &HashMap<u32, Place>) {
     if subst.is_empty() {
         return;
     }
-    let Stmt::Assign(_, rv) = s else { return };
+    let Stmt::Assign(dest, rv) = s else { return };
+    // The destination is a place too: `_2[_9] = v` indexes through `_9`, and if
+    // `_9`'s definition was folded away the store would address the wrong
+    // element. Rewriting only the rvalue left the index dangling. The base
+    // local is left alone: the destination names the storage that is written.
+    rewrite_place_indices(dest, subst);
     match rv {
         Rvalue::Use(op) => rewrite_op(op, subst),
         Rvalue::Binary(_, a, b) => {
@@ -710,10 +776,28 @@ pub fn parse(text: &str) -> Result<Program, String> {
 }
 
 fn strip_comment(line: &str) -> String {
-    match line.find("//") {
-        Some(i) => line[..i].to_string(),
-        None => line.to_string(),
+    // A `//` inside a string literal is data, not a comment: a `const
+    // "https://x"` or a template containing `//` must survive intact. Track
+    // double-quoted runs (honouring backslash escapes) and cut only at a `//`
+    // seen outside one.
+    let b = line.as_bytes();
+    let mut i = 0;
+    let mut in_str = false;
+    while i < b.len() {
+        match b[i] {
+            b'\\' if in_str => {
+                i += 2;
+                continue;
+            }
+            b'"' => in_str = !in_str,
+            b'/' if !in_str && b.get(i + 1) == Some(&b'/') => {
+                return line[..i].to_string();
+            }
+            _ => {}
+        }
+        i += 1;
     }
+    line.to_string()
 }
 
 /// `const NAME: TY = VALUE;` — returns the integer value when it has one.
