@@ -1689,13 +1689,42 @@ impl<'a> FnGen<'a> {
         vec![i]
     }
 
-    /// Whether `local` is read anywhere except the statements of `bb` before
-    /// (and including) the comparison the terminator folds. The terminator of
-    /// `bb` is the only read the fold itself serves, so a read in any other
-    /// block - or a read in `bb` that is not the folded comparison - means the
-    /// local must be materialised.
+    /// Whether `local` is read somewhere the fold cannot serve: a read in `bb`
+    /// other than the folded comparison, or a read in another block that is not
+    /// preceded by its own definition of `local`.
+    ///
+    /// The "own definition" test matters because rustc reuses one local for
+    /// repeated tests. `fib` computes `_2 = Lt(n, 2)` in both the entry block
+    /// and the loop header; a read of `_2` in the second block is served by the
+    /// second block's own `_2 = ..`, not by the first block's store, so folding
+    /// the first store away is safe. Treating every read anywhere as live made
+    /// both folds bail, and the `bool` materialisation (`setl`/`movzbl`/store)
+    /// was paid on every loop iteration.
     fn local_used_elsewhere(&self, bb: u32, local: u32) -> bool {
         for (b, block) in self.func.blocks.iter().enumerate() {
+            // In `bb` itself the fold removes one statement, so any read of the
+            // local there - before the comparison (the old value) or after it
+            // (the folded value) - is a read the fold cannot serve.
+            if b as u32 == bb {
+                for s in &block.stmts {
+                    let mut used = false;
+                    scan_operands(s, &mut |op| {
+                        if let Operand::Copy(p) | Operand::Move(p) = op {
+                            if p.local == local {
+                                used = true;
+                            }
+                        }
+                    });
+                    if used {
+                        return true;
+                    }
+                }
+                continue;
+            }
+            // Another block: a read is served by that block's own definition of
+            // the local when one precedes it, so only a read before the first
+            // definition makes the local live across the fold.
+            let mut defined = false;
             for s in &block.stmts {
                 let mut used = false;
                 scan_operands(s, &mut |op| {
@@ -1705,14 +1734,16 @@ impl<'a> FnGen<'a> {
                         }
                     }
                 });
-                if used {
+                if used && !defined {
                     return true;
                 }
+                if let Stmt::Assign(d, _) = s {
+                    if d.local == local && d.proj.is_empty() {
+                        defined = true;
+                    }
+                }
             }
-            if b as u32 == bb {
-                continue;
-            }
-            if terminator_reads(&block.term, local) {
+            if terminator_reads(&block.term, local) && !defined {
                 return true;
             }
         }
@@ -4988,3 +5019,125 @@ fn bump(p: &Place, counts: &mut HashMap<u32, u32>, projected: &mut HashSet<u32>)
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The assembly text of the first function named `name` in `asm`.
+    fn func_asm(asm: &str, name: &str) -> String {
+        let start = format!("\n{name}:\n");
+        let Some(i) = asm.find(&start) else { return String::new() };
+        let rest = &asm[i + start.len() - 1..];
+        let mut out = String::new();
+        for (k, line) in rest.lines().enumerate() {
+            if k > 0 {
+                // A new top-level label (a letter, not the leading `.` of a
+                // local label) ends the function.
+                if line.starts_with(|c: char| c.is_ascii_alphabetic()) && line.ends_with(':') {
+                    break;
+                }
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// A `bool` local reused by two loop tests must still fold in both blocks.
+    ///
+    /// rustc computes `_1 = Lt(_2, 2)` in the loop header *and* reuses the same
+    /// `_1` for a second test. Folding each test into a `cmp`/`jcc` is only
+    /// sound if the store of `_1` in the *other* block is not treated as making
+    /// the local live: the other block recomputes `_1` before reading it. When
+    /// the liveness test was too coarse the fold bailed, and the backend paid
+    /// `setl`/`movzbl`/store plus a second `cmp` on every iteration, which is
+    /// what put `fib` and `callrec` behind LLVM. This checks the `setl` is gone.
+    #[test]
+    fn reused_bool_local_still_folds() {
+        let src = "\
+fn main() -> i64 {
+    let mut _0: i64;
+    let mut _1: bool;
+    let mut _2: i64;
+
+    bb0: {
+        _2 = const 0_i64;
+        goto -> bb1;
+    }
+
+    bb1: {
+        _1 = Lt(copy _2, const 2_i64);
+        switchInt(move _1) -> [0: bb2, otherwise: bb4];
+    }
+
+    bb2: {
+        _2 = Add(copy _2, const 1_i64);
+        goto -> bb3;
+    }
+
+    bb3: {
+        _1 = Lt(copy _2, const 2_i64);
+        switchInt(move _1) -> [0: bb2, otherwise: bb4];
+    }
+
+    bb4: {
+        _0 = copy _2;
+        return;
+    }
+}
+";
+        let mut prog = crate::mir::parse(src).expect("parse");
+        crate::mir::layout_blocks(&mut prog);
+        let asm = compile(&prog, &Options::default()).expect("compile");
+        let main = func_asm(&asm, "main");
+        assert!(!main.is_empty(), "main not emitted:\n{asm}");
+        assert!(
+            !main.contains("setl"),
+            "the reused bool was materialised instead of folded:\n{main}"
+        );
+        assert!(main.matches("cmp").count() >= 2, "both tests should branch:\n{main}");
+    }
+
+    /// The fold must not drop a `bool` store that a *later* block reads without
+    /// recomputing it: that is the `reusedcheck` miscompile shape, caught here
+    /// at the unit level too.
+    #[test]
+    fn external_bool_read_blocks_fold() {
+        let src = "\
+fn main() -> i64 {
+    let mut _0: i64;
+    let mut _1: bool;
+    let mut _2: i64;
+
+    bb0: {
+        _1 = Lt(const 1_i64, const 2_i64);
+        switchInt(move _1) -> [0: bb1, otherwise: bb2];
+    }
+
+    bb1: {
+        _2 = const 0_i64;
+        goto -> bb3;
+    }
+
+    bb2: {
+        _2 = const 1_i64;
+        goto -> bb3;
+    }
+
+    bb3: {
+        _0 = _2;
+        return;
+    }
+}
+";
+        let mut prog = crate::mir::parse(src).expect("parse");
+        crate::mir::layout_blocks(&mut prog);
+        let asm = compile(&prog, &Options::default()).expect("compile");
+        let main = func_asm(&asm, "main");
+        assert!(!main.is_empty(), "main not emitted:\n{asm}");
+        // `_1` is read nowhere else, so this fold is the served one; the branch
+        // still becomes a `cmp`/`jcc`.
+        assert!(main.contains("cmp"), "comparison should fold into a branch:\n{main}");
+    }
+}

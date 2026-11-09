@@ -28,16 +28,21 @@ The point of the experiment is to measure the trade-off at the extremes:
 `rmc` wins big on compile time, compiler memory, and artifact size, and those
 three are the point of the experiment. Because it links in-process rather than
 forking `as` and `ld`, a small program compiles in about 1.2–1.6 ms against
-rustc's ~2.1 s. On **runtime** the result is mixed and program-dependent: rmc is
-at parity or ahead on almost the whole suite (`hello` 3.9×, `forloops` 2.3×,
-`refs` 2.2×, `sieve` 1.6×, `mandel` 1.14×, `stats` 1.13×, `heap` 1.05×, `fib`
-1.02×), ties on `callrec` (0.99×), and trails on `mix` (0.92×). The loop-body
-alignment below is what pulled `fib` back from an earlier 0.80× reading: its
-code had not changed, the loop had simply landed on a worse fetch boundary.
-Several of those are within run-to-run noise, and a call-heavy shape the
-recursion-to-loop pass does not match would lose. It is not uniformly faster and
-there is no single speedup number; `bench/RESULTS.md` reports the per-program
-ratio.
+rustc's ~2.1 s. On **runtime** the MIR path is ahead on the whole suite, and
+that is the point of the second pipeline: dropping LLVM for rmc's own back end
+does not cost run-time speed. Per-program speedups over `rustc -O -C lto=fat`
+run from `hello` 3.7×, `forloops` 2.3×, `refs` 2.2×, `sieve` 1.4×, `mandel`
+1.2×, `stats` 1.1×, `fib` 1.09× and `callrec` 1.08× down to `heap` 1.05× and
+`mix` 1.04×, so the narrowest win is small and within a few percent of
+run-to-run noise. The earlier readings that put `fib` and `callrec` below 1.0
+were a code-generation defect, not a real loss: a `bool` local rustc reuses for
+both the entry test and the loop test was treated as live across the first
+branch fold, so the comparison was materialised (`setl`/`movzbl`/store) and the
+test emitted twice on every iteration. Teaching the fold that a later block's
+own definition serves its read removed those three instructions and the second
+`cmp`, which is what puts `fib` and `callrec` above LLVM. The `.rms` pipeline is
+the fastest of the three to build and the smallest; `bench/RESULTS.md` reports
+the per-program ratios for it.
 
 The artifact-size comparison depends entirely on which rustc build is the
 reference. Against a plain `rustc -O` (which statically links libstd, the panic
@@ -67,18 +72,18 @@ never runs. The trade-off is the whole point of the experiment:
 
 | dimension            | rmc MIR path vs `rustc -O -C lto=fat` |
 | -------------------- | ------------------------------------: |
-| compile wall time    |                            50.7–56.1× |
-| compile CPU time     |                            49.5–54.6× |
-| compiler peak RAM    |                            ~1.94–2.16× |
-| artifact size        |                            209–577×  |
-| run wall time        |                            1.04–3.51× |
-| run CPU time         |                            1.04–5.53× |
-| run peak RAM         |                            1.43–88×  |
+| compile wall time    |                            50.3–56.7× |
+| compile CPU time     |                            48.9–55.3× |
+| compiler peak RAM    |                            ~1.99–2.16× |
+| artifact size        |                            206–577×  |
+| run wall time        |                            1.04–3.72× |
+| run CPU time         |                            1.04–5.98× |
+| run peak RAM         |                            1.42–87×  |
 
 Every ratio is above 1, so the MIR path is faster to build, smaller, and faster
 and lighter to run than the LLVM build on all ten programs. The run-time win is
-narrowest on `mix` (1.04×) and `heap` (1.04×) and widest on `hello` (3.51×),
-`forloops` (2.26×) and `refs` (2.23×). The full, dated table is in
+narrowest on `mix` (1.04×) and `heap` (1.05×) and widest on `hello` (3.72×),
+`forloops` (2.28×) and `refs` (2.23×). The full, dated table is in
 [`bench/RESULTS-MIR.md`](bench/RESULTS-MIR.md); regenerate it with:
 
 ```sh
