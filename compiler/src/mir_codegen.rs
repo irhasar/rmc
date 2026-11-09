@@ -2512,34 +2512,40 @@ impl<'a> FnGen<'a> {
         }
     }
 
-    /// Write an aggregate constant into a fresh frame region and leave its
-    /// address in `%rax`.
-    fn materialize_const_agg(&mut self, c: &Const) -> Result<(), String> {
+    /// The field offsets, field types, total size, and (for an enum variant
+    /// constant) the tag, of an aggregate constant. A path-qualified name is an
+    /// enum only when its head names one the variant tables know:
+    /// `Option::Some(1)` is a variant, while `std::ops::Range::<usize> { start,
+    /// end }` is a struct the printer spelled out with its full path. Treating
+    /// that struct as an enum reserved a tag word and shifted `start`/`end`, so
+    /// `r.start` read the tag (`0`) instead of `1`.
+    fn const_agg_layout(
+        &self,
+        c: &Const,
+    ) -> Result<(Vec<i64>, Vec<Ty>, i64, Option<i64>), String> {
         let Const::Agg { name, ops } = c else {
             return Err("mir_codegen: aggregate constant unsupported".into());
         };
-        // The aggregate's kind and the byte offset of each field. A
-        // path-qualified name is an enum only when its head names one the
-        // variant tables know: `Option::Some(1)` is a variant, while
-        // `std::ops::Range::<usize> { start: 1, end: 3 }` is a struct the
-        // printer spelled out with its full path. Treating that struct as an
-        // enum reserved a tag word and shifted `start`/`end`, so `r.start`
-        // read the tag (`0`) instead of `1`.
-        let (offs, size): (Vec<i64>, i64) = if is_variant_const(name, &self.enums) {
+        if is_variant_const(name, &self.enums) {
             let (en, v) = split_ev(name);
             let Some(l) = self.enums.get(&en) else {
                 return Err(format!("mir_codegen: unknown enum `{en}`"));
             };
             // Word 0 is the tag; a payload variant's fields follow it.
-            let mut offs = vec![0i64];
+            let mut offs = Vec::new();
+            let mut tys = Vec::new();
             if !l.fieldless {
                 for k in 0..ops.len() {
                     offs.push(self.enum_field_offset(&en, &v, k as u64));
+                    tys.push(self.enum_field_ty(&en, &v, k as u64));
                 }
             }
-            (offs, l.size.max(8))
+            let tag = self.variant_tag(&en, &v) as i64;
+            Ok((offs, tys, l.size.max(8), Some(tag)))
         } else if name.is_empty() {
-            ((0..ops.len()).map(|k| k as i64 * 8).collect(), (ops.len() as i64 * 8).max(8))
+            let offs = (0..ops.len()).map(|k| k as i64 * 8).collect();
+            let tys = ops.iter().map(|op| rv_operand_ty(&self.func, op)).collect();
+            Ok((offs, tys, (ops.len() as i64 * 8).max(8), None))
         } else {
             let key = struct_path_name(name).unwrap_or_else(|| name.clone());
             let tys = self.structs.get(&key).cloned().unwrap_or_default();
@@ -2549,53 +2555,81 @@ impl<'a> FnGen<'a> {
                 offs.push(acc);
                 acc += self.size_of_ty(t);
             }
-            (offs, acc.max(8))
-        };
+            Ok((offs, tys, acc.max(8), None))
+        }
+    }
 
+    /// Write an aggregate constant into a fresh frame region and leave its
+    /// address in `%rax`.
+    fn materialize_const_agg(&mut self, c: &Const) -> Result<(), String> {
+        let (_offs, _tys, size, _tag) = self.const_agg_layout(c)?;
         let slots = ((size + 7) / 8).max(1);
         let first = self.next_slot;
         for _ in 0..slots {
             self.alloc_slot();
         }
+        // `off` grows the address as the slot number falls, so the region's
+        // lowest address (byte offset 0) is its highest slot, `base`.
         let base = first + slots - 1;
+        // Fields are written through `base + k`; pin the whole run so the frame
+        // packer keeps it contiguous.
+        self.pinned.push((first, base));
+        self.write_const_agg(c, base)?;
+        self.emit(&format!("  lea {}, %rax", self.off(base)));
+        Ok(())
+    }
 
-        // Evaluate each field value into its own scratch word first, so a later
-        // `lea` for the region base cannot clobber an earlier value. An enum's
-        // first word is its tag, an immediate.
-        let mut vals: Vec<(i64, Option<i64>, Option<i64>)> = Vec::new();
-        let tag_first = is_variant_const(name, &self.enums);
+    /// Write `c`'s bytes into the already-allocated region based at `base`,
+    /// recursing into nested aggregate constants so a field that is itself a
+    /// struct (or tuple, or array) is laid out rather than stored as a pointer.
+    fn write_const_agg(&mut self, c: &Const, base: i64) -> Result<(), String> {
+        let Const::Agg { ops, .. } = c else {
+            return Err("mir_codegen: aggregate constant unsupported".into());
+        };
+        let (offs, tys, _size, tag) = self.const_agg_layout(c)?;
+        if let Some(tag) = tag {
+            self.emit_region_addr(base, 0, "%rax");
+            self.store_word(&format!("${tag}"), "(%rax)");
+        }
         for (k, op) in ops.iter().enumerate() {
-            // A zero-sized field stores nothing and takes no word, so it must
-            // not consume a slot (nor shift the fields after it).
+            // A zero-sized field stores nothing and takes no word.
             if matches!(rv_operand_ty(&self.func, op), Ty::Unit) {
                 continue;
             }
-            let (src, _) = self.eval_operand(op)?;
-            let tmp = self.alloc_slot();
-            let off = self.off(tmp);
-            self.store_word(&src, &off);
-            let off = offs.get(k + tag_first as usize).copied().unwrap_or(k as i64 * 8);
-            vals.push((off, None, Some(tmp)));
-        }
-        if tag_first {
-            let (en, v) = split_ev(name);
-            let tag = self.variant_tag(&en, &v) as i64;
-            vals.insert(0, (0, Some(tag), None));
-        }
-        for (off, imm, tmp) in vals {
-            self.emit(&format!("  lea {}, %rax", self.off(base)));
-            if off != 0 {
-                self.emit(&format!("  add ${off}, %rax"));
+            let off = offs.get(k).copied().unwrap_or(k as i64 * 8);
+            let fty = tys.get(k).cloned().unwrap_or(Ty::I64);
+            if let Operand::Const(nested @ Const::Agg { .. }) = op {
+                // A byte offset of 8*k is slot `base - k`; a nested aggregate is
+                // always word-aligned, so this is exact.
+                self.write_const_agg(nested, base - off / 8)?;
+            } else if fty.is_aggregate() {
+                // An enum payload holding a struct is copied in, not stored as
+                // a pointer.
+                self.eval_aggregate_addr(op)?;
+                self.emit("  mov %rax, %r10");
+                self.emit_region_addr(base, off, "%r11");
+                self.copy_words(self.size_of_ty(&fty));
+            } else {
+                let (src, _) = self.eval_operand(op)?;
+                self.emit_region_addr(base, off, "%rax");
+                self.store_word(&src, "(%rax)");
             }
-            if let Some(v) = imm {
-                self.emit(&format!("  mov ${v}, %rcx"));
-            } else if let Some(t) = tmp {
-                self.emit(&format!("  mov {}, %rcx", self.off(t)));
-            }
-            self.emit("  mov %rcx, (%rax)");
         }
-        self.emit(&format!("  lea {}, %rax", self.off(base)));
         Ok(())
+    }
+
+    /// Emit the address of `base + off` bytes of a contiguous, pinned frame
+    /// region into `reg`.
+    ///
+    /// The write goes through a computed address rather than a direct slot
+    /// store: the frame optimiser's dead-store passes only track direct
+    /// `(%rbp)` stores, so an interior field written as `movq $v, slot(%rbp)`
+    /// looks unread and is deleted, silently zeroing the field.
+    fn emit_region_addr(&mut self, base: i64, off: i64, reg: &str) {
+        self.emit(&format!("  lea {}, {reg}", self.off(base)));
+        if off != 0 {
+            self.emit(&format!("  add ${off}, {reg}"));
+        }
     }
 
     /// Materialise the `{len: i64, data..}` record a `&[T]` points at, for the
