@@ -451,6 +451,20 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   a `[x; N]` repeat, a projected store - must go through `store_word`, not a
   raw `mov`: `let a = [-3i64, 5]; a[0]` printed `4294967293` until it did.
   `tests/std/negagg.rs` guards it.
+- **An aggregate constant's nested aggregate is laid out, not pointed at.**
+  `Outer { head: Inner { x: 5 }, tail: 7 }` is one constant whose `head` field
+  is itself an aggregate constant. Storing the *address* of a separately
+  materialised `Inner` (the natural first cut) makes the enclosing copy read
+  the pointer's own words, so `head.x` printed the low half of a stack address.
+  `write_const_agg` recurses so a nested field's fields land at their real
+  offsets, and an enum payload that holds a struct is `copy_words`d in.
+- **Write a frame region's interior through its base, not through a direct
+  slot.** The frame optimiser's dead-store passes (`dead_stores`,
+  `drop_unread_stores`) only see a store whose destination is a literal
+  `(%rbp)` slot; a region field written as `movq $v, slot(%rbp)` looks unread
+  and is *deleted*, silently zeroing the field. `emit_region_addr` emits
+  `lea base(%rbp), %rax` (+ offset) and stores through `(%rax)`, which the
+  passes leave alone. `tests/std/nestedagg.rs` guards the whole path.
 - **The MIR scanners must skip string literals.** `matching`, `split_top_args`,
   `split_top_semi` and `split_top_as` walk a line by bracket depth, but a
   `format_args!` template or a `b"..."` byte string can contain `)`/`,`/`;`/`as`
