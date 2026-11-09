@@ -496,6 +496,21 @@ impl Parser {
                 self.aliases.insert(name.clone(), expanded);
             }
         }
+        // A `const`'s declared type may name an alias (`const C: Letter = 'a';
+        // type Letter = char;`). The first `resolve_consts` ran before the
+        // aliases were parsed, so it saw the placeholder `Named("Letter")` and
+        // skipped the item. Expand each type through the now-complete alias map
+        // and resolve again, so the constant lands in the table a later use
+        // reads (`print_char(C)`).
+        let expanded_items: Vec<ConstDef> = items
+            .iter()
+            .map(|d| ConstDef {
+                name: d.name.clone(),
+                ty: self.expand_alias_ty(&d.ty, 0).unwrap_or_else(|_| d.ty.clone()),
+                value: d.value.clone(),
+            })
+            .collect();
+        self.resolve_consts(&expanded_items);
         // A `type` shares the type namespace with a struct and an enum, so a
         // collision is an error (rustc's E0428). It does *not* collide with a
         // `const` or a `fn`, which live in the value namespace. rmc keeps a

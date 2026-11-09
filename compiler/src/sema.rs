@@ -3091,29 +3091,57 @@ impl Sema {
                 // aggregate. An lvalue is addressed directly; anything else has
                 // no address of its own, so it is checked as a value and given a
                 // hidden frame slot to be materialised into.
-                let t = if is_lvalue(expr) {
+                //
+                // The operand is lifted out first so the whole node can be
+                // rewritten in place below: rmc represents `str` and `&str`
+                // identically, as the address of the `{len, bytes}` record, so
+                // `&s` on a string is the string itself and must fold to `s`.
+                // Leaving an `&` in place would emit a pointer *to* the record
+                // pointer, which the string writer reads as a length and uses to
+                // expose adjacent memory.
+                let mut operand = std::mem::replace(expr.as_mut(), Expr::Int(0));
+                let t = if is_lvalue(&operand) {
                     // `&mut place` needs a mutable place; rustc rejects
                     // `&mut x` on an immutable binding (E0596). A non-lvalue
                     // operand is materialised into a temporary, which is a
                     // fresh mutable slot, so it is always borrowable.
                     if *mutable {
-                        self.place_writable(expr, scope, false)?;
+                        self.place_writable(&mut operand, scope, false)?;
                     }
-                    self.check_lvalue(expr, scope)?
+                    self.check_lvalue(&mut operand, scope)?
                 } else {
-                    let t = self.check_expr(expr, scope)?;
+                    let t = self.check_expr(&mut operand, scope)?;
                     *slot = self.alloc_slots((t.size() / 8).max(1) as i32);
                     t
                 };
+                let mutability = *mutable;
+                if t == Type::Str {
+                    *e = operand;
+                    return Ok(Type::Ref(Box::new(Type::Str), mutability));
+                }
                 *ty = t.clone();
-                Ok(Type::Ref(Box::new(t), *mutable))
+                *e = Expr::AddrOf { expr: Box::new(operand), ty: t.clone(), mutable: mutability, slot: *slot };
+                Ok(Type::Ref(Box::new(t), mutability))
             }
             Expr::Deref { expr, ty } => {
-                let it = self.check_expr(expr, scope)?;
+                // `&str` and `str` share one representation (the record
+                // address), so `*r` on a `&str` is the string itself; a load
+                // would read the record's length word as if it were a pointer.
+                // The operand is lifted out so the node can be rewritten in
+                // place. A `str` operand is not a reference, so `*s` on one is
+                // still rejected below, exactly as rustc rejects E0614.
+                let mut operand = std::mem::replace(expr.as_mut(), Expr::Int(0));
+                let it = self.check_expr(&mut operand, scope)?;
+                if matches!(&it, Type::Ref(i, _) if **i == Type::Str) {
+                    *e = operand;
+                    return Ok(Type::Str);
+                }
                 match it {
                     Type::Ref(inner, _) => {
                         *ty = (*inner).clone();
-                        Ok(*inner)
+                        let inner = *inner;
+                        *e = Expr::Deref { expr: Box::new(operand), ty: inner.clone() };
+                        Ok(inner)
                     }
                     other => Err(format!("cannot dereference a value of type {other:?}")),
                 }

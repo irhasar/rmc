@@ -2492,6 +2492,96 @@ fn str_len_lowers_to_the_runtime_helper() {
 }
 
 #[test]
+fn a_borrowed_string_passes_the_record_not_a_pointer_to_it() {
+    // rmc represents `str` and `&str` identically, as the address of the
+    // `{len, bytes}` record. `&s` on a string must therefore pass the string's
+    // own address; an `&` left in place would emit a pointer *to* the record
+    // pointer, which the writer reads as a length and uses to print adjacent
+    // memory (CWE-125). The folded form passes the literal's address directly,
+    // so no slot ever holds a pointer to the record pointer.
+    let out = asm("fn main() -> i64 { let s = \"hi\"; print!(\"{}\", &s); return 0; }");
+    let body = main_body(&out);
+    assert!(
+        body.contains("call __rmc_write_str"),
+        "the string writer is called:\n{out}"
+    );
+    // The argument handed to the writer is the literal's address (`lea`), never
+    // a load of a stack slot (`mov ...(%rbp), ...`) that would be a pointer to
+    // the record pointer.
+    let arg_setup = &body[..body.find("call __rmc_write_str").unwrap()];
+    let last = arg_setup.lines().rev().find(|l| l.contains("%rdi") || l.contains("%rax"));
+    assert!(
+        last.map_or(false, |l| !l.contains("(%rbp)")),
+        "the record address reaches the writer without an extra indirection:\n{out}"
+    );
+}
+
+#[test]
+fn dereferencing_a_string_reference_is_the_string_itself() {
+    // `*r` on a `&str` shares the one representation, so it must not load the
+    // record's length word as if it were the pointer.
+    let out = asm("fn main() -> i64 { let s = \"hi\"; let r = &s; print!(\"{}\", *r); return 0; }");
+    assert!(out.contains("call __rmc_write_str"), "the writer is called:\n{out}");
+    // The same program with the deref spelled out must produce the same writer
+    // call shape, i.e. the string address, not a loaded word.
+    let direct = asm("fn main() -> i64 { let s = \"hi\"; print!(\"{}\", s); return 0; }");
+    let strip = |o: &str| {
+        main_body(o)
+            .lines()
+            .filter(|l| l.contains("__rmc_write_str") || l.trim_start().starts_with("lea .Lstr"))
+            .count()
+    };
+    assert_eq!(strip(&out), strip(&direct), "the deref adds no load:\n{out}\n--\n{direct}");
+}
+
+#[test]
+fn dereferencing_a_plain_string_is_rejected() {
+    // A `str` is not a reference, so `*s` is E0614 in rustc and must be an
+    // error here too rather than silently reading memory.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let s = \"hi\"; print!(\"{}\", *s); return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("dereference"), "got: {err}");
+}
+
+#[test]
+fn a_string_reference_keeps_its_length_and_reference_type() {
+    // `&s` still has reference type, so `r.len()` and `*r` keep working, and
+    // the reference must not change the length.
+    let out = asm(
+        "fn main() -> i64 { let s = \"hello\"; let r = &s; return r.len() + (*r).len(); }",
+    );
+    assert!(out.contains("call __rmc_str_len"), "len still resolves:\n{out}");
+}
+
+#[test]
+fn a_string_reference_can_be_printed_through_a_function_parameter() {
+    // A `&str` parameter is the same one-word record address, so passing `&s`
+    // to a `&str` parameter and printing it must show the string, not memory.
+    let out = asm(
+        "fn f(s: &str) -> i64 { print!(\"{}\", s); return 0; } \
+         fn main() -> i64 { let s = \"hi\"; return f(&s); }",
+    );
+    assert!(out.contains("call __rmc_write_str"), "the writer is called:\n{out}");
+}
+
+#[test]
+fn a_char_constant_with_an_aliased_type_folds_into_a_use() {
+    // The constant's declared type names an alias (`Letter` -> `char`). The
+    // prescan resolves aliases after the first `const` pass, so the value must
+    // be re-resolved once the alias map is complete, or `C` is missing from the
+    // parser's constant table and a later `print_char(C)` fails.
+    let out = asm(
+        "const C: Letter = 'a'; type Letter = char; \
+         fn main() -> i64 { print_char(C); return 0; }",
+    );
+    assert!(out.contains("mov $97, %rdi"), "the char value is emitted:\n{out}");
+    assert!(out.contains("print_char:"), "the printer is linked:\n{out}");
+}
+
+#[test]
 fn array_len_folds_to_the_constant() {
     // An array's length is known at compile time, so `a.len()` is a constant
     // with no runtime work at all.
