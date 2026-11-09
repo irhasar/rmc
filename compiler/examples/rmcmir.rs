@@ -30,7 +30,7 @@ fn main() {
     let output = output.unwrap_or_else(|| input.with_extension(""));
 
     let text = std::fs::read_to_string(&input).expect("cannot read input");
-    let opts = Options { overflow_checks, promote: !no_promote, align_loops: true };
+    let opts = Options { overflow_checks, promote: !no_promote };
     let timing = std::env::var_os("RMC_TIME").is_some();
     let mut t0 = std::time::Instant::now();
     let mut mark = |label: &str, t0: &mut std::time::Instant| {

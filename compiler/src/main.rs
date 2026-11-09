@@ -221,7 +221,6 @@ fn run_mir_text(opts: &Options, mir: &str) -> Result<(), String> {
     let mir_opts = rmc::mir_codegen::Options {
         overflow_checks: opts.overflow_checks,
         promote: true,
-        align_loops: true,
     };
     let asm = rmc::compile_mir_to_asm(&prog, &mir_opts)?;
 

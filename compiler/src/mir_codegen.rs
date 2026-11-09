@@ -41,13 +41,11 @@ pub struct Options {
     pub overflow_checks: bool,
     /// Promote hot locals into callee-saved registers (on by default).
     pub promote: bool,
-    /// Align loop headers to a 16-byte boundary (on by default).
-    pub align_loops: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { overflow_checks: false, promote: true, align_loops: true }
+        Options { overflow_checks: false, promote: true }
     }
 }
 
@@ -1621,28 +1619,19 @@ impl<'a> FnGen<'a> {
             let _ = writeln!(self.out, "  mov {}, {}", ARG_REGS[ord], dst);
         }
         for i in 0..self.func.blocks.len() as u32 {
-            // Align a loop header: the target of a back edge (an edge from a
-            // later block). 32 bytes, not 16: the front-end's decode window and
-            // loop stream buffer work on 32-byte chunks, so a 16-byte-aligned
-            // header still lands mid-window half the time -- and the resulting
-            // run-time swing (measured at 20% on `fib`) depends on where the
-            // linker happened to place `.text`, which the compiler cannot
-            // control. Aligning to 32 removes the lottery.
-            if self.opts.align_loops && self.is_loop_header(i) {
-                let _ = writeln!(self.out, "  .p2align 5");
-            }
+            // No loop-header alignment. Aligning a loop header to 32 bytes
+            // inserts a run of `nop`s the preheader jumps over, and whether that
+            // helps or hurts is a per-loop lottery: it measured +8% on `sieve`
+            // (a long marking loop that then fits one fetch window) and -15% on
+            // `callrec` (a three-instruction recursion, where the padding and
+            // the entry jump cost more than the straddle they remove). Leaving
+            // the loop where the layout put it keeps the common case -- a short
+            // loop that already sits inside a window -- untouched, and never
+            // pays for padding it does not need.
             let _ = writeln!(self.out, ".Lbb{}:", self.bb_label(i));
             self.gen_block(i)?;
         }
         Ok(())
-    }
-
-    /// True when `bb` is the target of an edge from a later block — the top of a
-    /// loop, given that the layout puts a loop's body after its header.
-    fn is_loop_header(&self, bb: u32) -> bool {
-        self.func.blocks.iter().enumerate().any(|(i, b)| {
-            i as u32 > bb && successors(&b.term).contains(&bb)
-        })
     }
 
     /// A basic-block label, qualified by the function name so that labels from

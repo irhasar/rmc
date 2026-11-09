@@ -65,11 +65,12 @@ pub fn assemble(asm: &str) -> Result<Vec<u8>, String> {
         sections: vec![Section {
             name: ".text",
             flags: 0x5,
-            // 64, not 16: the in-section `.p2align 5` that aligns a loop header
-            // is relative to the section, so a 16-aligned section base turns
-            // every "32-aligned" loop into a 16-mod-32 one -- the slow half of
-            // the run-time lottery. A cache-line base makes the directive mean
-            // what it says.
+            // A cache-line base for `.text`. The generator emits `.p2align 4`
+            // at every function entry, which is relative to the section, so a
+            // 16-aligned section base would still let a function start 16 mod 64
+            // -- mid-cache-line for every 64-byte fetch. A 64-byte base makes
+            // the directive mean what it says and keeps the first function's
+            // entry in the same line as its prologue.
             align: 64,
             data: Vec::new(),
             vaddr: 0,
