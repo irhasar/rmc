@@ -823,8 +823,14 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   `zip(ARG_REGS)` silently drop the seventh.
 - **`mut` is enforced.** `Stmt::Let` carries a `mutable` flag and `FnDef` a
   `param_mut` vector; `sema` records both in its scope and rejects an assignment
-  to a non-`mut` binding (the first assignment to an uninitialised binding is
-  still allowed). Keep generated `let`s `mutable: true` so they never trip this.
+  to a non-`mut` binding. A plain `let` is written exactly once — its initialiser
+  or its first assignment — so a later write is `cannot assign twice to
+  immutable variable`, and an immutable parameter reports `cannot assign to
+  immutable argument`, both matching rustc. The check is a may-analysis: an
+  `if`/`else` merges a flag with OR, and a write to a binding declared before a
+  `while`/`for` is rejected because the body may run again (a `loop` runs at
+  least once, so it is exempt). Keep generated `let`s `mutable: true` so they
+  never trip this.
 - **A compound assignment evaluates its place once.** `desugar_compound` binds
   any component of the target that contains a call — the base or the subscript —
   to a temporary and reuses it for both the read and the write, so `make().x += 1`

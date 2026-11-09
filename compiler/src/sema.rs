@@ -86,6 +86,13 @@ pub struct Sema {
     /// The loops currently being checked, innermost last, so a `break` can see
     /// the type of the loop it targets.
     loop_stack: Vec<LoopCtx>,
+    /// One entry per enclosing `while`/`for` loop, holding the scope length at
+    /// the loop's entry. Such a body may run again, so a write inside it to a
+    /// non-`mut` binding that already existed before the loop is a second write
+    /// on the first iteration (rustc's `cannot assign twice`); a binding
+    /// declared *inside* the body is fresh each iteration and is exempt. A
+    /// `loop` runs at least once, so it pushes nothing.
+    loop_marks: Vec<usize>,
     ret_ty: Type,
     /// While checking the `else` chain of a desugared `match`: whether the
     /// whole chain names every variant of one enum. Decided once at the chain's
@@ -141,6 +148,14 @@ struct Binding {
     ty: Type,
     mutable: bool,
     init: bool,
+    /// True for a function/method parameter, which rustc reports as an
+    /// "immutable argument" rather than a twice-assigned variable.
+    param: bool,
+    /// True once the binding has been written on some path: its declaration
+    /// initialiser, or an assignment. A plain `let` without an initialiser may
+    /// be written exactly once, so a second write is rejected the way rustc
+    /// rejects `cannot assign twice to immutable variable`.
+    assigned: bool,
 }
 
 /// A lexical scope: a stack of bindings, innermost last.
@@ -282,6 +297,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         next_slot: 0,
         loop_depth: 0,
         loop_stack: Vec::new(),
+        loop_marks: Vec::new(),
         ret_ty: Type::Unit,
         match_total: false,
         match_chain: false,
@@ -650,7 +666,7 @@ impl Sema {
             // A parameter is a `let` binding; it is immutable unless declared
             // `mut`, and it is always initialized by the caller.
             let mutable = f.param_mut.get(i).copied().unwrap_or(false);
-            scope.push(Binding { name: name.clone(), slot, ty: rt, mutable, init: true });
+            scope.push(Binding { name: name.clone(), slot, ty: rt, mutable, init: true, param: true, assigned: true });
         }
 
         // A pattern parameter binds its names at the top of the body, before
@@ -1062,6 +1078,30 @@ impl Sema {
         }
     }
 
+    /// Snapshot the "already written" state of each binding, so a branch can be
+    /// checked from the same state its sibling saw.
+    fn assigned_snapshot(scope: &Scope) -> Vec<bool> {
+        scope.iter().map(|b| b.assigned).collect()
+    }
+
+    fn assigned_restore(scope: &mut Scope, snap: &[bool]) {
+        if scope.len() == snap.len() {
+            for (b, &s) in scope.iter_mut().zip(snap) {
+                b.assigned = s;
+            }
+        }
+    }
+
+    /// Merge two paths: a binding counts as written when *either* path wrote it,
+    /// since a later write only needs to know it *may* already have happened.
+    fn assigned_merge(scope: &mut Scope, a: &[bool], b: &[bool]) {
+        if scope.len() == a.len() && scope.len() == b.len() {
+            for (i, binding) in scope.iter_mut().enumerate() {
+                binding.assigned = a[i] || b[i];
+            }
+        }
+    }
+
     /// Type-check a `let` initialiser. A `[v; n]` written directly here is kept
     /// as an `ArrayLit` so codegen splats one value across the array, rather
     /// than materialising it element by element. Any other initialiser (and any
@@ -1399,6 +1439,8 @@ impl Sema {
                     ty: final_ty,
                     mutable: *mutable,
                     init: initialized,
+                    param: false,
+                    assigned: init.is_some(),
                 });
                 // Track an `i64` local whose initializer is constant and that
                 // is never written or mutably borrowed anywhere in the function
@@ -1469,6 +1511,15 @@ impl Sema {
                 if vty != tty && !ref_coerces(&vty, &tty) {
                     return Err(format!("assignment type mismatch: target is {tty:?}, value is {vty:?}"));
                 }
+                // Record the write so a later assignment to a non-`mut` binding
+                // is the `cannot assign twice` error. The root name is used for
+                // a field/index target (`a.f`, `a[i]`).
+                let root = Self::place_root_name(target);
+                if let Some(name) = root {
+                    if let Some(i) = Self::binding_index(scope, &name) {
+                        scope[i].assigned = true;
+                    }
+                }
                 Ok(())
             }
             Stmt::Expr(e) => {
@@ -1486,7 +1537,11 @@ impl Sema {
                     label: label.clone(),
                     kind: LoopKind::NoValue,
                 });
+                // The body may run again, so a non-`mut` binding that already
+                // existed before the loop cannot be written inside it.
+                self.loop_marks.push(scope.len());
                 self.check_block(body, scope)?;
+                self.loop_marks.pop();
                 self.loop_stack.pop();
                 self.loop_depth -= 1;
                 // The loop may run zero times, so nothing it initializes is
@@ -1521,13 +1576,17 @@ impl Sema {
                     ty: Type::I64,
                     mutable: false,
                     init: true,
+                    param: false,
+                    assigned: true,
                 });
                 self.loop_depth += 1;
                 self.loop_stack.push(LoopCtx {
                     label: label.clone(),
                     kind: LoopKind::NoValue,
                 });
+                self.loop_marks.push(mark);
                 self.check_block(body, scope)?;
+                self.loop_marks.pop();
                 self.loop_stack.pop();
                 self.loop_depth -= 1;
                 scope.truncate(mark);
@@ -1662,18 +1721,34 @@ impl Sema {
     ) -> Result<(), String> {
         match e {
             Expr::Var { name, .. } => {
-                let (_, _, mutable, init) = Self::lookup(scope, name)
+                let idx = Self::binding_index(scope, name)
                     .ok_or_else(|| format!("unknown variable `{name}`"))?;
+                let b = &scope[idx];
                 // Reassigning the binding itself needs `mut`; writing *through*
                 // a reference is decided by the field/index/deref arm, so a
                 // `&mut T` binding need not itself be `mut` for `r.x = ..`.
-                if mutable || (allow_uninit && !init) {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "cannot assign to immutable variable `{name}` (add `mut`)"
-                    ))
+                if b.mutable {
+                    return Ok(());
                 }
+                // A mutable borrow (`&mut place`, `allow_uninit == false`) needs
+                // the binding itself to be `mut`.
+                if !allow_uninit {
+                    return Err(format!(
+                        "cannot assign to immutable variable `{name}` (add `mut`)"
+                    ));
+                }
+                // A plain `let` may be written exactly once: its initialiser, or
+                // its first assignment. A write inside a `while`/`for` to a
+                // binding that already existed before the loop runs once per
+                // iteration, so it is a second write even on the first pass.
+                if b.assigned || self.loop_marks.last().is_some_and(|&m| idx < m) {
+                    return Err(if b.param {
+                        format!("cannot assign to immutable argument `{name}` (add `mut`)")
+                    } else {
+                        format!("cannot assign twice to immutable variable `{name}` (add `mut`)")
+                    });
+                }
+                Ok(())
             }
             Expr::Field { base, .. } | Expr::Index(base, _) => {
                 // A write into a component goes through the base's address when
@@ -2279,8 +2354,10 @@ impl Sema {
                 // is initialized afterwards only if it was before, or on both
                 // paths. `init_before` is the state on entry to the branch.
                 let init_before = Self::init_snapshot(scope);
+                let assigned_before = Self::assigned_snapshot(scope);
                 let tt = self.check_block(then, scope)?;
                 let then_init = Self::init_snapshot(scope);
+                let then_assigned = Self::assigned_snapshot(scope);
                 match els {
                     Some(e) => {
                         // Only a total chain's `else` continues the chain: an
@@ -2293,6 +2370,7 @@ impl Sema {
                         // Restore the entry state before the else, so the else
                         // sees the same scope the then saw.
                         Self::init_restore(scope, &init_before);
+                        Self::assigned_restore(scope, &assigned_before);
                         let et = self.check_block(e, scope)?;
                         self.match_chain = false;
                         self.match_total = false;
@@ -2336,6 +2414,9 @@ impl Sema {
                                 (true, true) => false,
                             };
                         }
+                        // A binding counts as written if either branch wrote it.
+                        let else_assigned = Self::assigned_snapshot(scope);
+                        Self::assigned_merge(scope, &then_assigned, &else_assigned);
                         Ok(ty)
                     }
                     None => {
@@ -2356,6 +2437,7 @@ impl Sema {
                         // what lets an all-`return` exhaustive match stand as a
                         // `!` tail.
                         Self::init_restore(scope, &init_before);
+                        Self::assigned_merge(scope, &then_assigned, &assigned_before);
                         Ok(if tt == Type::Never {
                             if total {
                                 Type::Never
@@ -2370,12 +2452,10 @@ impl Sema {
             }
             Expr::Loop(body, slot, lty, label) => {
                 // A `loop` in value position yields the type of its `break`s.
-                // Track definite initialization only from a `break`: the body
-                // runs at least once, but the value flows out through the
-                // `break`, so nothing the body initializes is guaranteed after
-                // the loop unless a `break` guarantees it too. Keep it simple and
-                // restore the entry state, exactly as for `while`/`for`.
-                let init_before = Self::init_snapshot(scope);
+                // A `loop` runs its body at least once, so a binding it
+                // initializes stays initialized afterwards (unlike `while`/`for`,
+                // which may run zero times), and a write to an outer binding
+                // inside it is a straight-line write, not a second one.
                 self.loop_depth += 1;
                 self.loop_stack.push(LoopCtx {
                     label: label.clone(),
@@ -2384,7 +2464,6 @@ impl Sema {
                 let body_ty = self.check_block(body, scope)?;
                 let ctx = self.loop_stack.pop().unwrap();
                 self.loop_depth -= 1;
-                Self::init_restore(scope, &init_before);
                 // The body's value is discarded: only `break value` reaches the
                 // loop's result. A body that can complete must therefore be
                 // `()`, unless it is unreachable (a `!`-typed body, e.g. a
