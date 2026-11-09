@@ -3311,8 +3311,9 @@ impl Codegen {
                     || Self::place_has_effect(end)
                     || Self::block_has_effect(body)
             }
-            Stmt::While(..) | Stmt::Loop(..) => true,
-            Stmt::Break | Stmt::Continue => false,
+            Stmt::While(..) => true,
+            Stmt::Break(v, _) => v.as_ref().map_or(false, Self::place_has_effect),
+            Stmt::Continue(_) => false,
         }
     }
 
