@@ -104,10 +104,11 @@ impl Elf {
 
     fn parse(&mut self, asm: &str) -> Result<(), String> {
         let mut cur = self.text_idx;
-        // Each `.set` records the section current when it appeared, so a
-        // later `.` resolves against that section, not the last one the file
-        // happened to switch to.
-        let mut sets: Vec<(String, String, String, usize)> = Vec::new();
+        // Each `.set` records the section current when it appeared, plus the
+        // section's length at that point, so a `.` (the current location) in the
+        // expression resolves to the position of the `.set` itself rather than
+        // the end of the section once the whole file has been parsed.
+        let mut sets: Vec<(String, String, String, usize, u64)> = Vec::new();
 
         for (lineno, raw) in asm.lines().enumerate() {
             let mut line = strip_comment(raw).trim();
@@ -136,9 +137,12 @@ impl Elf {
             self.instruction(line, cur).map_err(|e| format!("{e} (line {})", lineno + 1))?;
         }
 
-        for (name, a, b, sec) in sets {
-            let (va, sa) = self.sym_value(&a, sec)?;
-            let (vb, _) = self.sym_value(&b, cur)?;
+        for (name, a, b, sec, dot) in sets {
+            // Resolve both operands against the section the `.set` appeared in,
+            // with `.` meaning the position of the `.set` itself (`dot`), not
+            // the end of whatever section the file finished in.
+            let (va, sa) = self.sym_value_at(&a, sec, dot)?;
+            let (vb, _) = self.sym_value_at(&b, sec, dot)?;
             self.syms.insert(name, Sym { sec: sa, off: (va - vb) as u64, abs: true });
         }
         Ok(())
@@ -148,7 +152,7 @@ impl Elf {
         &mut self,
         rest: &str,
         cur: &mut usize,
-        sets: &mut Vec<(String, String, String, usize)>,
+        sets: &mut Vec<(String, String, String, usize, u64)>,
     ) -> Result<(), String> {
         let mut it = rest.splitn(2, char::is_whitespace);
         let name = it.next().unwrap_or("");
@@ -210,11 +214,13 @@ impl Elf {
             "set" => {
                 let (n, expr) = arg.split_once(',').ok_or("elf: bad .set")?;
                 let (a, b) = expr.split_once('-').ok_or("elf: bad .set expression")?;
+                let dot = self.sections[*cur].data.len() as u64;
                 sets.push((
                     n.trim().to_string(),
                     a.trim().to_string(),
                     b.trim().to_string(),
                     *cur,
+                    dot,
                 ));
             }
             other => return Err(format!("elf: unsupported directive `.{other}`")),
@@ -238,6 +244,16 @@ impl Elf {
         }
         let s = self.syms.get(name).ok_or_else(|| format!("elf: unknown symbol `{name}`"))?;
         Ok((s.off as i64, s.sec))
+    }
+
+    /// `sym_value`, but `.` means the fixed position `dot` in section `sec`
+    /// rather than the section's current end. Used to resolve a `.set` after the
+    /// whole file is parsed, when the section lengths have moved on.
+    fn sym_value_at(&self, name: &str, sec: usize, dot: u64) -> Result<(i64, usize), String> {
+        if name == "." {
+            return Ok((dot as i64, sec));
+        }
+        self.sym_value(name, sec)
     }
 
     /// Assign every section a file offset and a virtual address, then resolve
@@ -1411,6 +1427,27 @@ mod tests {
         // The RX segment's file size must cover the whole image, not 8 bytes.
         let filesz = u64::from_le_bytes(elf[96..104].try_into().unwrap());
         assert!(filesz > 64, "RX segment covers the code, got {filesz}");
+    }
+
+    #[test]
+    fn a_set_length_is_measured_at_its_own_position_not_the_section_end() {
+        // Two messages in `.rodata`, each followed by a `.set` length, and a
+        // `.data` section after both. At the end of parsing `.rodata` is 5
+        // bytes, so resolving `.` as the section's current end makes the first
+        // length 5 (its own offset is 0) — the later message's bytes leak into
+        // the first trap's output. Each length must be the distance from its
+        // message to its own `.set` (3 and 2).
+        let mut e = test_elf(0x5);
+        e.parse(
+            ".text\nmain:\n.quad 0\n\
+             .section .rodata\n\
+             msg1: .ascii \"abc\"\n.set msg1_len, . - msg1\n\
+             msg2: .ascii \"de\"\n.set msg2_len, . - msg2\n\
+             .data\n.quad 0\n",
+        )
+        .unwrap();
+        assert_eq!(e.syms["msg1_len"].off, 3);
+        assert_eq!(e.syms["msg2_len"].off, 2);
     }
 
     #[test]
