@@ -29,6 +29,13 @@ import sys
 import time
 import shutil
 
+# `rmc` drives rustc with `-Zno-codegen` so the front end stops after the MIR
+# optimisations instead of preparing codegen it will never use. The flag is
+# nightly-only, so rmc sets `RUSTC_BOOTSTRAP=1` on the child rustc (see
+# `front_end_mir` in compiler/src/main.rs); the harness mirrors that so the
+# `mir` column measures the pipeline rmc actually runs.
+os.environ.setdefault("RUSTC_BOOTSTRAP", "1")
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
 PROJ = os.path.dirname(ROOT)
 RMC = os.path.join(PROJ, "compiler", "target", "release", "rmc")
@@ -50,7 +57,7 @@ ARGS = {
     "forloops": ["2000000"],
 }
 
-RUSTC_MIR = ["rustc", "--emit=mir", "-O", "-C", "panic=abort",
+RUSTC_MIR = ["rustc", "--emit=mir", "-O", "-Zno-codegen", "-C", "panic=abort",
              "--crate-type=bin", "--edition", "2021"]
 RUSTC_OBJ = ["rustc", "--emit=obj", "-O", "-C", "opt-level=3", "-C", "lto=fat",
              "-C", "codegen-units=1", "-C", "panic=abort", "--edition", "2021"]

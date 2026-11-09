@@ -161,9 +161,29 @@ fn main() {
 /// This is the second pipeline — rustc's parser, type checker and MIR
 /// optimiser feed rmc's own x86-64 back end, so the compile is dominated by
 /// rmc's in-process assembler rather than by LLVM.
+///
+/// `-Zno-codegen` is what makes this cheap: it tells rustc to stop after the
+/// MIR optimisations and skip the monomorphisation and codegen preparation
+/// that `--emit=mir` throws away anyway. rmc *is* the code generator here, so
+/// none of that work is needed, and the MIR it prints is byte-for-byte
+/// identical. The flag is nightly-only, so `RUSTC_BOOTSTRAP=1` is set on the
+/// child (never on rmc itself) and the run falls back to plain rustc if the
+/// flag is rejected, which keeps a stock stable toolchain working. `-O` stays:
+/// dropping it triples the run time of the emitted code (`fib` 5.4 ms ->
+/// 20.4 ms), because the MIR-level optimisations it runs are the ones rmc's
+/// own passes build on.
 fn front_end_mir(input: &Path) -> Result<String, String> {
-    let out = Command::new("rustc")
-        .arg("--emit=mir")
+    match run_rustc_front_end(input, true) {
+        Ok(mir) => Ok(mir),
+        Err(_) => run_rustc_front_end(input, false),
+    }
+}
+
+/// One rustc front-end invocation. `no_codegen` selects `-Zno-codegen` (with
+/// `RUSTC_BOOTSTRAP=1`); the fallback call passes `false`.
+fn run_rustc_front_end(input: &Path, no_codegen: bool) -> Result<String, String> {
+    let mut cmd = Command::new("rustc");
+    cmd.arg("--emit=mir")
         .arg("-o")
         .arg("-")
         .arg("-O")
@@ -171,12 +191,21 @@ fn front_end_mir(input: &Path) -> Result<String, String> {
         .arg("panic=abort")
         .arg("--crate-type=bin")
         .arg("--edition")
-        .arg("2021")
+        .arg("2021");
+    if no_codegen {
+        cmd.arg("-Zno-codegen").env("RUSTC_BOOTSTRAP", "1");
+    }
+    let out = cmd
         .arg(input)
         .output()
         .map_err(|e| format!("failed to run `rustc`: {e}"))?;
     if !out.status.success() {
-        let _ = std::io::stderr().write_all(&out.stderr);
+        // The first (flagged) attempt stays quiet: if it failed because the
+        // toolchain rejected `-Zno-codegen`, the fallback prints the real
+        // diagnostic; if it failed on the source, the fallback prints it once.
+        if !no_codegen {
+            let _ = std::io::stderr().write_all(&out.stderr);
+        }
         return Err("rustc front end failed".into());
     }
     let mir = out.stdout;
