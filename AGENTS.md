@@ -352,8 +352,10 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 - **LICM never hoists a read through a reference.** A scalar field read is
   hoisted only when its base is a local aggregate (`frame_field_base`); a field
   read through `&T` dereferences a pointer that may be null (`0 as &S`) or
-  dangling, so hoisting it would fault on a loop whose body never runs. Local
-  aggregate fields are frame accesses and stay hoistable.
+  dangling, so hoisting it would fault on a loop whose body never runs. Any
+  field in the chain whose own type is a reference holds such a pointer, so
+  `h.p.n` (where `p: &S`) is not a frame access either. Local aggregate fields
+  are frame accesses and stay hoistable.
 - **LICM hoists a loop body's invariant arithmetic, and `for` slots are
   loop-carried.** The pass rewrites only a loop *body*; a `while` condition and
   a `for`'s bounds run once per iteration by design. A `for`'s variable and
@@ -654,9 +656,11 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   computation whenever that computation can have an effect (`place_has_effect`,
   which is `contains_call` plus a block/if that assigns a local), and the
   aggregate copy is factored into `assign_aggregate` for the same reason. The
-  `contains_call` walk must reach every place form (`Deref`, `AddrOf`,
-  `EnumPayload`, ...), or a target like `*f()` is mis-ordered. `assignorder.rms`
-  and `tools/fuzz.py --mode order` pin this.
+  walk must reach every place form (`Deref`, `AddrOf`, `EnumPayload`, ...) and
+  must descend through `Bin`/`Un`/`Cast` and an `if` condition, or a target like
+  `r[{ y = 2; 0 } + 0]` is mis-ordered: `contains_call` alone misses a block
+  that assigns without calling. `assignorder.rms`, `refidxorder.rms` and
+  `tools/fuzz.py --mode order` pin this.
 - **A compound assignment binds its modifying operand first.** `desugar_compound`
   evaluates the right-hand operand into a temporary ahead of the subscript
   temporary, so `a[next()] += val()` runs `val()` before `next()`, matching the

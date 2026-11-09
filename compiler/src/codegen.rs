@@ -3298,7 +3298,7 @@ impl Codegen {
         match e {
             Expr::Block(b) | Expr::MatchBoundary(b, _) => Self::block_has_effect(b),
             Expr::If(c, t, els) => {
-                Self::contains_call(c)
+                Self::place_has_effect(c)
                     || Self::block_has_effect(t)
                     || els.as_ref().map_or(false, |b| Self::block_has_effect(b))
             }
@@ -3306,6 +3306,20 @@ impl Codegen {
             Expr::Field { base, .. } => Self::place_has_effect(base),
             Expr::Deref { expr, .. } | Expr::AddrOf { expr, .. } => Self::place_has_effect(expr),
             Expr::EnumPayload { recv, .. } => Self::place_has_effect(recv),
+            // An arithmetic, unary or cast sub-expression can hide a block that
+            // assigns a local (`r[{ y = 2; 0 } + 0] = y`), so the operands are
+            // traversed rather than reduced to a call check.
+            Expr::Bin(_, a, b) => Self::place_has_effect(a) || Self::place_has_effect(b),
+            Expr::Un(_, a) | Expr::Cast(a, _) => Self::place_has_effect(a),
+            Expr::ArrayLit(v, _) => Self::place_has_effect(v),
+            Expr::ArrayList(v) => v.iter().any(Self::place_has_effect),
+            // A call is an effect by itself; its arguments cannot make it worse.
+            Expr::Call { .. } | Expr::MethodCall { .. } => true,
+            Expr::StructLit { fields, .. } => fields.iter().any(|f| Self::place_has_effect(&f.value)),
+            Expr::EnumCtor { args, .. } => args.iter().any(Self::place_has_effect),
+            Expr::VariantTest { scrutinee, .. } | Expr::BoolTest { scrutinee, .. } => {
+                Self::place_has_effect(scrutinee)
+            }
             _ => Self::contains_call(e),
         }
     }

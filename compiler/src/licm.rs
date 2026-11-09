@@ -520,11 +520,16 @@ impl Hoister {
     }
 
     /// True when a field read's base names a local aggregate, so the read is a
-    /// frame access rather than a load through a pointer that could fault.
+    /// frame access rather than a load through a pointer that could fault. Any
+    /// field in the chain whose own type is a reference holds an address, so a
+    /// read past it dereferences a pointer that may be null or dangling and is
+    /// not a frame access.
     fn frame_field_base(e: &Expr) -> bool {
         match e {
             Expr::Var { ty, .. } => !matches!(ty, crate::ast::Type::Ref(..)),
-            Expr::Field { base, .. } => Self::frame_field_base(base),
+            Expr::Field { base, ty, .. } => {
+                !matches!(ty, crate::ast::Type::Ref(..)) && Self::frame_field_base(base)
+            }
             _ => false,
         }
     }

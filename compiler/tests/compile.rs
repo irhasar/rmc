@@ -3292,7 +3292,21 @@ fn a_call_in_an_assignment_target_blocks_hoisting() {
 }
 
 #[test]
-fn a_register_only_leaf_has_no_frame_pointer() {
+fn a_field_read_through_a_reference_blocks_hoisting() {
+    // `h.p` is a reference field, so `h.p.n` loads through the pointer it holds.
+    // That pointer may be null or dangling, so the read must stay in the loop:
+    // hoisting it would fault on a loop whose body never runs. The `imul` over
+    // the two loads staying in the body shows the read was not speculated.
+    let src = "struct S { n: i64 } struct Holder { p: &S } \
+               fn main() -> i64 { let s: S = S { n: 5 }; let h: Holder = Holder { p: &s }; \
+               let mut acc: i64 = 0; let mut i: i64 = 0; \
+               while i < 3 { acc = acc + h.p.n * h.p.n; i = i + 1; } return acc; }";
+    let with = loop_body(&asm(src));
+    assert!(with.contains("imul"), "a read through a reference field stays in the loop:\n{with}");
+}
+
+#[test]
+fn a_register_only_leaf_allocates_no_frame() {
     // Every local is promoted into a callee-saved register and nothing is
     // materialised, so the body addresses no frame slot. Nothing is addressed
     // through `%rbp`, so the prologue omits the frame pointer entirely — no
