@@ -2452,10 +2452,13 @@ impl Sema {
             }
             Expr::Loop(body, slot, lty, label) => {
                 // A `loop` in value position yields the type of its `break`s.
-                // A `loop` runs its body at least once, so a binding it
-                // initializes stays initialized afterwards (unlike `while`/`for`,
-                // which may run zero times), and a write to an outer binding
-                // inside it is a straight-line write, not a second one.
+                // A `loop` runs its body at least once, so unlike `while`/`for`
+                // (which may run zero times) it does not restore the entry state:
+                // a binding the body initializes stays initialized afterwards.
+                // Merge the entry state back in as well, so a binding that was
+                // already initialized before the loop is still initialized when
+                // the body's `break` leaves it.
+                let init_before = Self::init_snapshot(scope);
                 self.loop_depth += 1;
                 self.loop_stack.push(LoopCtx {
                     label: label.clone(),
@@ -2464,6 +2467,9 @@ impl Sema {
                 let body_ty = self.check_block(body, scope)?;
                 let ctx = self.loop_stack.pop().unwrap();
                 self.loop_depth -= 1;
+                for (i, b) in scope.iter_mut().enumerate() {
+                    b.init = b.init || init_before.get(i).copied().unwrap_or(false);
+                }
                 // The body's value is discarded: only `break value` reaches the
                 // loop's result. A body that can complete must therefore be
                 // `()`, unless it is unreachable (a `!`-typed body, e.g. a
