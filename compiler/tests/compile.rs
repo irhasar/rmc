@@ -3907,3 +3907,38 @@ fn a_struct_update_base_of_the_wrong_type_is_rejected() {
     assert!(err.contains("does not match"), "got: {err}");
 }
 
+#[test]
+fn no_strip_keeps_a_symbol_table_in_the_output() {
+    // `--no-strip` exists so `nm` can read the artifact. The in-process encoder
+    // writes no symbol table, so the flag must route through `as`/`ld` instead
+    // of silently producing a symbol-less binary. Skips when the toolchain is
+    // absent (the rest of the suite never shells out).
+    if std::process::Command::new("as").arg("--version").output().is_err() {
+        eprintln!("skipping: `as` not on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("rmc-nostrip-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("m.rms");
+    let bin = dir.join("m.bin");
+    std::fs::write(&src, "fn main() -> i64 { return 0; }\n").unwrap();
+
+    let rmc = env!("CARGO_BIN_EXE_rmc");
+    let out = std::process::Command::new(rmc)
+        .arg("--no-strip")
+        .arg("-o")
+        .arg(&bin)
+        .arg(&src)
+        .output()
+        .expect("run rmc");
+    assert!(out.status.success(), "rmc failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    let nm = std::process::Command::new("nm").arg(&bin).output().expect("run nm");
+    let symbols = String::from_utf8_lossy(&nm.stdout);
+    assert!(
+        symbols.contains("main") || !symbols.trim().is_empty(),
+        "expected a symbol table, nm printed nothing"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
