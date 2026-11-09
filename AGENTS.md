@@ -1010,6 +1010,21 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   hoist or inline that drops the `cmp`/`jae` would let the program read or write
   out of range), and across the index shapes: a block or call base, a local
   array, a negative and a computed index, a struct-field array, and a store.
+- **Every runtime piece after the first must re-open `.text`.** The bit-method
+  helpers (`__rmc_count_ones`, `__rmc_leading_zeros`, `__rmc_trailing_zeros`,
+  `__rmc_swap_bytes`, `__rmc_reverse_bits`, `__rmc_rotate_left`,
+  `__rmc_rotate_right`) follow `__rmc_clamp`, whose last message ends in
+  `.section .rodata`. Without a `.text` line they were emitted into `.rodata`
+  and faulted under a link that honours section permissions (`--binutils`, or
+  the library path). The fuzzers did not see it because a bit method that traps
+  was never combined with the CLI's `-n` merge. When adding a piece, copy the
+  leading `.text` from a neighbour; `tests/run.py` links bit-method programs with
+  a plain `ld` to catch a regression.
+- **A `.set` resolves against the section current when it appeared.** The
+  in-process encoder recorded `.` for a `.set` against the *last* section the
+  file switched to, so a `.set` after a `.section .rodata` block (the trap
+  message lengths) resolved against the wrong section and mis-sized the
+  immediate. Each `.set` now carries the section it was seen in.
 - **`array_len_of` must cover every array-typed base.** It reads the length from
   a `Var`/`Field`/`Call` type and from a block's or `if`'s tail. A base it does
   not recognise silently skips the bounds check; extend it alongside any new
