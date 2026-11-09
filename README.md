@@ -11,8 +11,11 @@ the assembly text is what you want.
 
 It also has a second front end: given a `.rs` file it runs `rustc --emit=mir -O`
 and lowers the MIR it prints to the same x86-64, so LLVM is replaced by rmc's own
-back end (see [Two pipelines](#two-pipelines)). That path builds a real Rust
-program tens of times faster than LLVM and still beats it at run time.
+back end (see [Two pipelines](#two-pipelines)). Because rmc *is* the code
+generator, the front end is told to stop at MIR (`-Zno-codegen`) rather than
+prepare codegen it would discard, which prints the same MIR for ~4.5 ms less.
+That path builds a real Rust program tens of times faster than LLVM and still
+beats it at run time.
 
 The point of the experiment is to measure the trade-off at the extremes:
 
@@ -66,33 +69,37 @@ selects which:
 
 The `.rs` path exists to test the thesis that LLVM is the expensive part of a
 Rust build. `rustc` still does the parsing and type checking, but it stops at
-MIR (`--emit=mir`, ~35 ms); a new back end in `mir.rs` lowers that MIR to the
-same x86-64 the `.rms` path emits, through the same assembler and linker. LLVM
-never runs. The trade-off is the whole point of the experiment:
+MIR (`--emit=mir -Zno-codegen`, ~28 ms); a new back end in `mir.rs` lowers that
+MIR to the same x86-64 the `.rms` path emits, through the same assembler and
+linker. LLVM never runs. Because rmc *is* the code generator, the front end is
+told to stop right after the MIR optimisations (`-Zno-codegen`) instead of
+preparing codegen it would throw away; that prints byte-for-byte the same MIR
+and saves about 4.5 ms per build. The trade-off is the whole point of the
+experiment:
 
 | dimension            | rmc MIR path vs `rustc -O -C lto=fat` |
 | -------------------- | ------------------------------------: |
-| compile wall time    |                            50.3–56.7× |
-| compile CPU time     |                            48.9–55.3× |
-| compiler peak RAM    |                            ~1.99–2.16× |
-| artifact size        |                            206–577×  |
-| run wall time        |                            1.04–3.72× |
-| run CPU time         |                            1.04–5.98× |
-| run peak RAM         |                            1.42–87×  |
+| compile wall time    |                            65.9–74.6× |
+| compile CPU time     |                            67.3–76.3× |
+| compiler peak RAM    |                            ~2.16–2.25× |
+| artifact size        |                            207–567×  |
+| run wall time        |                            1.03–3.29× |
+| run CPU time         |                            1.03–5.06× |
+| run peak RAM         |                            1.42–63.6× |
 
 Every ratio is above 1, so the MIR path is faster to build, smaller, and faster
 and lighter to run than the LLVM build on all ten programs. The run-time win is
-narrowest on `mix` (1.04×) and `heap` (1.05×) and widest on `hello` (3.72×),
-`forloops` (2.28×) and `refs` (2.23×). The full, dated table is in
-[`bench/RESULTS-MIR.md`](bench/RESULTS-MIR.md); regenerate it with:
+narrowest on `heap` (1.03×), `mix` (1.05×) and `stats` (1.11×) and widest on
+`hello` (3.29×), `forloops` (2.25×) and `refs` (2.22×). The full, dated table is
+in [`bench/RESULTS-MIR.md`](bench/RESULTS-MIR.md); regenerate it with:
 
 ```sh
 python3 bench/run_mir.py --markdown bench/RESULTS-MIR.md
 ```
 
 The back end is where the compile-time win comes from: `rustc --emit=mir` is
-~35 ms and ~85 MB, and `rmcmir` is under 5 ms and ~4 MB. Against the `.rms`
-pipeline the `.rs` path still pays the rustc front end, so it is ~35× slower to
+~28 ms and ~85 MB, and `rmcmir` is under 5 ms and ~4 MB. Against the `.rms`
+pipeline the `.rs` path still pays the rustc front end, so it is ~70× slower to
 compile - the `.rms` path remains the fastest. The point of the `.rs` path is
 that dropping LLVM makes a real Rust build competitive, not that it beats rmc's
 own front end.
