@@ -133,6 +133,27 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
 - **`%r10` carries the return buffer.** It is caller-saved and not an argument
   register, so it survives argument setup. Do not use `%r10` as scratch anywhere
   argument setup can run after the return pointer is set.
+- **The direct-argument shortcut must decline every clobbering argument.**
+  `gen_call` writes scalar arguments straight into the ABI registers when each
+  argument is a simple operand, or when there are at most two and none calls or
+  copies an aggregate. `contains_call` must therefore recurse into *every*
+  expression that can evaluate a child — including `EnumCtor`, `VariantTest`
+  and `EnumPayload` — and `clobbers_arg_regs`/`stmt_clobbers` must flag every
+  statement path that runs `copy_words_rdi_rsi` (whole-aggregate `let`, and
+  aggregate `Var`/`Field`/`Index` stores). A missed case leaves an earlier
+  argument in `%rdi`/`%rsi` that a later argument overwrites.
+- **At most six parameters.** The System V integer argument registers are the
+  only ones this compiler uses, so `sema` rejects a function (or a method after
+  its receiver is inserted) with more than six parameters rather than letting
+  `zip(ARG_REGS)` silently drop the seventh.
+- **`mut` is enforced.** `Stmt::Let` carries a `mutable` flag and `FnDef` a
+  `param_mut` vector; `sema` records both in its scope and rejects an assignment
+  to a non-`mut` binding (the first assignment to an uninitialised binding is
+  still allowed). Keep generated `let`s `mutable: true` so they never trip this.
+- **A compound assignment evaluates its place once.** `desugar_compound` binds
+  any component of the target that contains a call — the base or the subscript —
+  to a temporary and reuses it for both the read and the write, so `make().x += 1`
+  calls `make` once. A call-free `Var`/`Field`/`Index` is cloned directly.
 - **`sema` persists the inferred type on every `let`.** Codegen selects the
   aggregate path from `Stmt::Let`'s `ty`, so leaving it `None` for `let a = [7; 2]`
   silently initialises only one word.

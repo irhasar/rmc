@@ -2018,6 +2018,13 @@ impl Codegen {
             Expr::Un(_, a) | Expr::Cast(a, _) => Self::contains_call(a),
             Expr::Index(a, b) => Self::contains_call(a) || Self::contains_call(b),
             Expr::Field { base, .. } => Self::contains_call(base),
+            // An enum constructor, a variant test and a payload read all
+            // evaluate their children, which can call. Missing these let the
+            // direct-argument shortcut select an argument whose nested call
+            // clobbers an earlier argument register.
+            Expr::EnumCtor { args, .. } => args.iter().any(Self::contains_call),
+            Expr::VariantTest { scrutinee, .. } => Self::contains_call(scrutinee),
+            Expr::EnumPayload { recv, .. } => Self::contains_call(recv),
             Expr::If(c, t, els) => {
                 Self::contains_call(c)
                     || Self::block_has_call(t)
@@ -2058,9 +2065,18 @@ impl Codegen {
     fn stmt_clobbers(s: &Stmt) -> bool {
         match s {
             Stmt::Let { init: Some(e), .. } => Self::value_copies_aggregate(e),
-            Stmt::Assign { target, .. } => {
-                matches!(target, Expr::Var { ty, .. } if ty.is_aggregate())
-            }
+            // An aggregate store copies word by word through `%rdi`/`%rsi`
+            // (`copy_words_rdi_rsi`), whether the destination is a whole local,
+            // a struct field or an array element, so all three clobber the
+            // argument registers.
+            Stmt::Assign { target, .. } => match target {
+                Expr::Var { ty, .. } | Expr::Field { ty, .. } => ty.is_aggregate(),
+                Expr::Index(base, _) => matches!(
+                    base.as_ref(),
+                    Expr::Var { ty: Type::Array(e, _), .. } if e.is_aggregate()
+                ),
+                _ => false,
+            },
             _ => false,
         }
     }

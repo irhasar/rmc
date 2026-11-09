@@ -211,6 +211,6 @@ reuse and coalesces neighbours. Memory is not zeroed.
 ## Not supported
 
 Traits, generics, references, borrowing, lifetimes, modules, macros, `use`,
-closures, `f32`/`f64`, `u*`/`i*` types other than `i64`, tuples, enum variants
-with a payload, arrays of aggregates, and the standard library. Aggregates cross
-a call only by value; there are no `&T`/`&mut T` parameters.
+closures, `f32`/`f64`, `u*`/`i*` types other than `i64`, tuples, arrays of
+aggregates, and the standard library. Aggregates cross a call only by value;
+there are no `&T`/`&mut T` parameters.

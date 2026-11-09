@@ -725,3 +725,75 @@ fn a_struct_may_have_a_payload_enum_field() {
                return match w.o { O::S(v) => v + w.n, _ => 0 }; }";
     assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
 }
+
+#[test]
+fn an_immutable_local_cannot_be_assigned() {
+    let err = compile_to_asm(
+        "fn main() -> i64 { let x: i64 = 1; x = 2; return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("cannot assign to immutable"), "got: {err}");
+    // A `mut` binding, and a first assignment to an uninitialised binding, are
+    // both allowed.
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let mut x: i64 = 1; x = 2; return x; }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let x: i64; x = 2; return x; }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn an_immutable_parameter_cannot_be_assigned() {
+    let err = compile_to_asm(
+        "fn f(x: i64) -> i64 { x = 2; return x; } fn main() -> i64 { return f(1); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("cannot assign to immutable"), "got: {err}");
+    assert!(compile_to_asm(
+        "fn f(mut x: i64) -> i64 { x = 2; return x; } fn main() -> i64 { return f(1); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_seventh_parameter_is_rejected() {
+    let err = compile_to_asm(
+        "fn f(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64) -> i64 { return g; } \
+         fn main() -> i64 { return f(1, 2, 3, 4, 5, 6, 7); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("at most 6"), "got: {err}");
+}
+
+#[test]
+fn a_call_in_an_enum_constructor_does_not_clobber_an_argument() {
+    // `7` is placed in `%rdi` before the second argument runs `g`; the direct
+    // path must be declined so the call cannot destroy `%rdi`.
+    let out = asm(
+        "enum O { N, S(i64) } \
+         fn g() -> i64 { return 1; } \
+         fn f(a: i64, b: i64) -> i64 { return a + b; } \
+         fn main() -> i64 { return f(7, { let e: O = O::S(g()); 9 }); }",
+    );
+    assert!(
+        out.contains("push %rdi") || out.contains("mov %rax, -"),
+        "the argument is captured to a frame slot, not left in %rdi across the call"
+    );
+}
+
+#[test]
+fn a_method_on_a_payload_enum_is_callable() {
+    let src = "enum O { N, S(i64) } \
+               impl O { fn v(self) -> i64 { return match self { O::S(x) => x, _ => 0 }; } } \
+               fn main() -> i64 { return O::S(42).v(); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}

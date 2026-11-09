@@ -60,7 +60,20 @@ pub struct Sema {
     ret_ty: Type,
 }
 
-type Scope = Vec<(String, i32, Type)>;
+/// One in-scope binding: its name, frame slot, type, and whether it may be
+/// assigned. Parameters and `let mut` bindings are mutable; a plain `let` is
+/// not, so an assignment to it is rejected the way rustc rejects it.
+struct Binding {
+    name: String,
+    slot: i32,
+    ty: Type,
+    mutable: bool,
+    /// False for a binding declared without an initialiser, so its first
+    /// assignment is allowed even when it is not `mut`.
+    initialized: bool,
+}
+
+type Scope = Vec<Binding>;
 
 pub fn analyze(prog: &mut Program) -> Result<(), String> {
     let (structs, enums) = resolve_layouts(&prog.structs, &prog.enums)?;
@@ -103,6 +116,16 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
             f.params.iter().map(|(_, t)| resolve_in(t, &structs, &enums)).collect();
         let params = params?;
         let ret = resolve_in(&f.ret, &structs, &enums)?;
+        // The System V calling convention passes the first six integer
+        // arguments in registers; this compiler does not implement stack
+        // arguments, so a seventh parameter could never receive a value.
+        if params.len() > 6 {
+            return Err(format!(
+                "function `{}` has {} parameters, but at most 6 are supported",
+                f.name,
+                params.len()
+            ));
+        }
         // Aggregate parameters and returns are passed by pointer, so any type
         // is allowed here; the calling convention handles the rest.
         sigs.insert(f.name.clone(), Sig { params, ret, takes_self: f.takes_self });
@@ -326,14 +349,21 @@ impl Sema {
 
         let mut scope: Scope = Vec::with_capacity(f.params.len() + 8);
         f.param_slots.clear();
-        for (name, ty) in &mut f.params {
+        let param_mut = f.param_mut.clone();
+        for (i, (name, ty)) in f.params.iter_mut().enumerate() {
             let rt = self.resolve_ty(ty)?;
             *ty = rt.clone();
             // An aggregate parameter owns a frame buffer big enough for a copy;
             // a scalar owns a single slot.
             let slot = self.alloc_slots((rt.size() / 8) as i32);
             f.param_slots.push(slot);
-            scope.push((name.clone(), slot, rt));
+            scope.push(Binding {
+                name: name.clone(),
+                slot,
+                ty: rt,
+                mutable: param_mut.get(i).copied().unwrap_or(false),
+                initialized: true,
+            });
         }
 
         let body_ty = self.check_block(&mut f.body, &mut scope)?;
@@ -372,12 +402,12 @@ impl Sema {
         s
     }
 
-    fn lookup(scope: &Scope, name: &str) -> Option<(i32, Type)> {
+    fn lookup(scope: &Scope, name: &str) -> Option<(i32, Type, bool)> {
         scope
             .iter()
             .rev()
-            .find(|(n, _, _)| n == name)
-            .map(|(_, s, t)| (*s, t.clone()))
+            .find(|b| b.name == name)
+            .map(|b| (b.slot, b.ty.clone(), b.mutable))
     }
 
     /// Type-check a `let` initialiser. A `[v; n]` written directly here is kept
@@ -411,7 +441,7 @@ impl Sema {
 
     fn check_stmt(&mut self, st: &mut Stmt, scope: &mut Scope) -> Result<(), String> {
         match st {
-            Stmt::Let { name, ty, init, slot } => {
+            Stmt::Let { name, ty, init, slot, mutable } => {
                 let declared = match ty {
                     Some(t) => Some(self.resolve_ty(t)?),
                     None => None,
@@ -442,12 +472,19 @@ impl Sema {
                 *ty = Some(final_ty.clone());
                 let s = self.alloc_slots((final_ty.size() / 8) as i32);
                 *slot = s;
-                scope.push((name.clone(), s, final_ty));
+                scope.push(Binding {
+                    name: name.clone(),
+                    slot: s,
+                    ty: final_ty,
+                    mutable: *mutable,
+                    initialized: init.is_some(),
+                });
                 Ok(())
             }
             Stmt::Assign { target, value } => {
                 let vty = self.check_expr(value, scope)?;
                 let tty = self.check_lvalue(target, scope)?;
+                self.check_writable(target, scope)?;
                 if vty != tty {
                     return Err(format!("assignment type mismatch: target is {tty:?}, value is {vty:?}"));
                 }
@@ -486,7 +523,13 @@ impl Sema {
                 let s = self.alloc_slot();
                 *var_slot = s;
                 let mark = scope.len();
-                scope.push((var.clone(), s, Type::I64));
+                scope.push(Binding {
+                    name: var.clone(),
+                    slot: s,
+                    ty: Type::I64,
+                    mutable: false,
+                    initialized: true,
+                });
                 self.loop_depth += 1;
                 self.check_block(body, scope)?;
                 self.loop_depth -= 1;
@@ -530,6 +573,23 @@ impl Sema {
         }
     }
 
+    /// Reject an assignment whose root binding is immutable, matching rustc's
+    /// `cannot assign to immutable variable` error. A field or index target is
+    /// writable exactly when the variable it is rooted at is.
+    fn check_writable(&self, e: &Expr, scope: &Scope) -> Result<(), String> {
+        match e {
+            Expr::Var { name, .. } => match scope.iter().rev().find(|b| &b.name == name) {
+                Some(b) if b.mutable || !b.initialized => Ok(()),
+                Some(_) => Err(format!(
+                    "cannot assign to immutable variable `{name}` (add `mut`)"
+                )),
+                None => Ok(()),
+            },
+            Expr::Field { base, .. } | Expr::Index(base, _) => self.check_writable(base, scope),
+            _ => Ok(()),
+        }
+    }
+
     /// Type-check an assignment target (variable, array element or field).
     fn check_lvalue(&mut self, e: &mut Expr, scope: &mut Scope) -> Result<Type, String> {
         match e {
@@ -555,7 +615,7 @@ impl Sema {
             Expr::Bool(_) => Ok(Type::Bool),
             Expr::Str(_) => Ok(Type::I64),
             Expr::Var { name, slot, ty } => match Self::lookup(scope, name) {
-                Some((s, t)) => {
+                Some((s, t, _)) => {
                     *slot = s;
                     *ty = t.clone();
                     Ok(t)
@@ -775,6 +835,7 @@ impl Sema {
                     ty: Some(ty.clone()),
                     init: Some(Expr::ArrayLit(val.clone(), *n)),
                     slot: arr_slot,
+                    mutable: false,
                 }];
                 *e = Expr::Block(Block { stmts, tail: Some(Box::new(var)) });
                 // Re-check the rewritten block so its statements are typed and
@@ -812,6 +873,7 @@ impl Sema {
                     ty: Some(arr_ty.clone()),
                     init: None,
                     slot: arr_slot,
+                    mutable: false,
                 }];
                 for (i, e) in elems.drain(..).enumerate() {
                     stmts.push(Stmt::Assign {
@@ -847,7 +909,7 @@ impl Sema {
                 // A method lives on a struct or an enum; both give the mangled
                 // prefix `Type$method`.
                 let tyname = match &rt {
-                    Type::Struct(n, _) | Type::Enum(n) => n.clone(),
+                    Type::Struct(n, _) | Type::Enum(n) | Type::EnumData(n, _) => n.clone(),
                     other => {
                         return Err(format!(
                             "method `{name}` called on a value of type {other:?}, which is not a struct or enum"

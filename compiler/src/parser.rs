@@ -188,12 +188,14 @@ impl Parser {
         let name = self.expect_ident()?;
         self.expect(Tok::LParen)?;
         let mut params = Vec::new();
+        let mut param_mut = Vec::new();
         while self.peek() != Some(&Tok::RParen) {
-            self.eat(&Tok::Mut); // `mut` on a parameter is accepted and ignored
+            let m = self.eat(&Tok::Mut);
             let pname = self.expect_ident()?;
             self.expect(Tok::Colon)?;
             let ty = self.parse_type()?;
             params.push((pname, ty));
+            param_mut.push(m);
             if !self.eat(&Tok::Comma) {
                 break;
             }
@@ -205,7 +207,7 @@ impl Parser {
             Type::Unit
         };
         let body = self.parse_block()?;
-        Ok(FnDef { name, self_ty: None, takes_self: false, params, ret, body, param_slots: Vec::new(), ret_slot: -1, nslots: 0 })
+        Ok(FnDef { name, self_ty: None, takes_self: false, params, param_mut, ret, body, param_slots: Vec::new(), ret_slot: -1, nslots: 0 })
     }
 
     /// `impl Type { fn method(self, ..) -> .. { .. } }`. The methods are pushed
@@ -251,13 +253,15 @@ impl Parser {
             ));
         }
         let mut params = Vec::new();
+        let mut param_mut = Vec::new();
         if self.eat(&Tok::Comma) {
             while self.peek() != Some(&Tok::RParen) {
-                self.eat(&Tok::Mut);
+                let m = self.eat(&Tok::Mut);
                 let pname = self.expect_ident()?;
                 self.expect(Tok::Colon)?;
                 let pty = self.parse_type()?;
                 params.push((pname, pty));
+                param_mut.push(m);
                 if !self.eat(&Tok::Comma) {
                     break;
                 }
@@ -271,6 +275,7 @@ impl Parser {
             self_ty: Some(ty.to_string()),
             takes_self: true,
             params,
+            param_mut,
             ret,
             body,
             param_slots: Vec::new(),
@@ -419,7 +424,7 @@ impl Parser {
         match self.peek() {
             Some(Tok::Let) => {
                 self.i += 1;
-                self.eat(&Tok::Mut);
+                let mutable = self.eat(&Tok::Mut);
                 let name = self.expect_ident()?;
                 let ty = if self.eat(&Tok::Colon) {
                     Some(self.parse_type()?)
@@ -432,7 +437,7 @@ impl Parser {
                     None
                 };
                 self.expect(Tok::Semi)?;
-                Ok(Stmt::Let { name, ty, init, slot: -1 })
+                Ok(Stmt::Let { name, ty, init, slot: -1, mutable })
             }
             Some(Tok::While) => {
                 self.i += 1;
@@ -506,11 +511,7 @@ impl Parser {
         // has no observable effect, so the cheap form (target repeated in the
         // right-hand side) is used. Only a call inside a subscript is bound to a
         // temporary, since evaluating it twice would run the call twice.
-        let needs_temp = match target {
-            Expr::Index(_, idx) => expr_has_call(idx),
-            _ => false,
-        };
-        if !needs_temp {
+        if !expr_has_call(target) {
             return Stmt::Assign {
                 target: target.clone(),
                 value: Expr::Bin(op, Box::new(target.clone()), Box::new(value)),
@@ -520,26 +521,43 @@ impl Parser {
         let tv = |name: &str| Expr::Var { name: name.to_string(), slot: -1, ty: Type::I64 };
         let mut stmts = Vec::new();
 
-        // Bind the read target and the write target to the *same* location.
-        // For an index the subscript is evaluated once into a temporary and
-        // reused, so `a[next()] += 1` advances the counter once, not twice.
-        // A `Var` or `Field` target has no side effect on re-evaluation.
+        // Bind the read target and the write target to the *same* location. A
+        // side-effecting component (a call in the base or the subscript) is
+        // evaluated once into a temporary and reused, so `make().x += 1` calls
+        // `make` once and `a[next()] += 1` advances the counter once. A plain
+        // `Var` or call-free `Field`/`Index` has no side effect on
+        // re-evaluation and is cloned directly.
+        let mut bind = |e: &Expr| -> Expr {
+            // NUL is not a valid identifier byte, so a generated name can
+            // never collide with one the source spells.
+            let n = format!("\u{0}tmp{}", self.tmp);
+            self.tmp += 1;
+            stmts.push(Stmt::Let {
+                name: n.clone(),
+                ty: None,
+                init: Some(e.clone()),
+                slot: -1,
+                mutable: true,
+            });
+            tv(&n)
+        };
         let (read, write) = match target {
             Expr::Index(base, idx) => {
-                // NUL is not a valid identifier byte, so a generated name can
-                // never collide with one the source spells.
-                let it = format!("\u{0}ix{}", self.tmp);
-                self.tmp += 1;
-                stmts.push(Stmt::Let {
-                    name: it.clone(),
-                    ty: Some(Type::I64),
-                    init: Some((**idx).clone()),
-                    slot: -1,
-                });
-                let idxv = Box::new(tv(&it));
+                // Bind only the components that call: binding an array base
+                // would copy the whole array and redirect the write to the
+                // copy, so a call-free base is cloned as before.
+                let b = if expr_has_call(base) { bind(base) } else { (**base).clone() };
+                let i = if expr_has_call(idx) { bind(idx) } else { (**idx).clone() };
                 (
-                    Expr::Index(base.clone(), idxv.clone()),
-                    Expr::Index(base.clone(), idxv),
+                    Expr::Index(Box::new(b.clone()), Box::new(i.clone())),
+                    Expr::Index(Box::new(b), Box::new(i)),
+                )
+            }
+            Expr::Field { base, name, offset, ty } => {
+                let b = if expr_has_call(base) { bind(base) } else { (**base).clone() };
+                (
+                    Expr::Field { base: Box::new(b.clone()), name: name.clone(), offset: *offset, ty: ty.clone() },
+                    Expr::Field { base: Box::new(b), name: name.clone(), offset: *offset, ty: ty.clone() },
                 )
             }
             other => (other.clone(), other.clone()),
@@ -552,6 +570,7 @@ impl Parser {
             ty: Some(Type::I64),
             init: Some(read),
             slot: -1,
+            mutable: true,
         });
         stmts.push(Stmt::Assign {
             target: write,
@@ -874,7 +893,7 @@ impl Parser {
                     Expr::Var { name: name.clone(), slot: -1, ty: Type::I64 },
                     // No annotation: the temp takes the scrutinee's type, which
                     // may be an enum rather than an integer.
-                    Some(Stmt::Let { name, ty: None, init: Some(other), slot: -1 }),
+                    Some(Stmt::Let { name, ty: None, init: Some(other), slot: -1, mutable: true }),
                 )
             }
         };
@@ -889,6 +908,7 @@ impl Parser {
                         ty: None,
                         init: Some(subj.clone()),
                         slot: -1,
+                        mutable: true,
                     }],
                     tail: Some(Box::new(body)),
                 }),
@@ -926,6 +946,7 @@ impl Parser {
                                         ty: Type::Unit,
                                     }),
                                     slot: -1,
+                                    mutable: true,
                                 })
                                 .collect();
                             Expr::Block(Block { stmts, tail: Some(Box::new(body)) })

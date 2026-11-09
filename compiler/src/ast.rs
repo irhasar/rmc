@@ -205,6 +205,9 @@ pub enum Stmt {
         ty: Option<Type>,
         init: Option<Expr>,
         slot: i32,
+        /// True when the binding was declared `mut`. An assignment to a
+        /// non-`mut` binding is rejected, matching rustc.
+        mutable: bool,
     },
     Assign {
         target: Expr,
@@ -250,6 +253,9 @@ pub struct FnDef {
     /// through a method call, so a free function cannot be called as one.
     pub takes_self: bool,
     pub params: Vec<(String, Type)>,
+    /// True for each parameter declared `mut`, parallel to `params`. A `mut`
+    /// parameter may be assigned; an immutable one is rejected like a `let`.
+    pub param_mut: Vec<bool>,
     pub ret: Type,
     pub body: Block,
     /// Frame slot of each parameter, in order, filled in by `sema`. An aggregate
