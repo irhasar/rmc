@@ -25,13 +25,22 @@ use std::collections::{HashMap, HashSet};
 pub enum Ty {
     I64,
     Bool,
-    /// `usize`/`isize`/`u*`/`i*` narrower than 64 bits and `u64`/`i64` all live
-    /// in one 64-bit word here; the width only matters to the exact op, and
-    /// every benchmark program is `i64`-shaped.
-    Int,
+    /// An integer narrower than 64 bits, or a 64-bit integer whose
+    /// signedness differs from `i64`. The width and signedness matter to the
+    /// exact op: `u64 >> n` fills with zeros, `u32` division is unsigned, and
+    /// `as` must truncate to the right width and extend with the right sign.
+    /// `i64` keeps its own variant (the common case, so the hot paths match on
+    /// one tag) and `Int` covers everything else.
+    Int {
+        /// 1, 2, 4 or 8 bytes.
+        width: u8,
+        /// `false` for `u*`/`usize`, `true` for `i*`/`isize`.
+        signed: bool,
+    },
     /// A one-byte integer (`u8`/`i8`), kept apart from `Int` because pointer
     /// arithmetic scales by the pointee's size: `Offset` over a `*const u8`
-    /// must advance one byte, not eight.
+    /// must advance one byte, not eight. `i8` is sign-extended on load, `u8`
+    /// zero-extended.
     U8,
     Ptr(TyBox),
     /// A reference or raw pointer; the pointee type is only used to size a
@@ -49,6 +58,47 @@ pub enum Ty {
     F32,
     /// A `&str` literal or an unmodelled type; treated as a scalar.
     Other,
+}
+
+impl Ty {
+    /// A signed integer of the given byte width (1, 2, 4 or 8).
+    pub fn signed_int(width: u8) -> Ty {
+        if width == 8 {
+            Ty::I64
+        } else {
+            Ty::Int { width, signed: true }
+        }
+    }
+
+    /// An unsigned integer of the given byte width (1, 2, 4 or 8).
+    pub fn unsigned_int(width: u8) -> Ty {
+        if width == 1 {
+            // A `u8` has its own variant so a byte load/store is chosen.
+            Ty::U8
+        } else {
+            Ty::Int { width, signed: false }
+        }
+    }
+
+    /// Whether this is an integer type (any width, either signedness).
+    pub fn is_int(&self) -> bool {
+        matches!(self, Ty::I64 | Ty::Int { .. } | Ty::U8)
+    }
+
+    /// `(width_in_bytes, signed)` for an integer, or `None` for anything else.
+    pub fn int_width_sign(&self) -> Option<(u8, bool)> {
+        match self {
+            Ty::I64 => Some((8, true)),
+            Ty::U8 => Some((1, false)),
+            Ty::Int { width, signed } => Some((*width, *signed)),
+            _ => None,
+        }
+    }
+
+    /// Whether an integer type is unsigned. `false` for non-integers.
+    pub fn is_unsigned(&self) -> bool {
+        self.int_width_sign().map_or(false, |(_, s)| !s)
+    }
 }
 
 pub type TyBox = Box<Ty>;
@@ -2584,11 +2634,20 @@ pub fn parse_ty(s: &str) -> Result<Ty, String> {
     match s {
         "i64" => Ok(Ty::I64),
         "bool" => Ok(Ty::Bool),
-        "u8" | "i8" => Ok(Ty::U8),
+        "u8" => Ok(Ty::U8),
+        "i8" => Ok(Ty::signed_int(1)),
         "f64" => Ok(Ty::F64),
         "f32" => Ok(Ty::F32),
-        "usize" | "isize" | "u64" | "u32" | "i32" | "u16" | "i16"
-        | "u128" | "i128" | "char" => Ok(Ty::Int),
+        // `usize`/`isize` are 64-bit here (the target is x86-64). Each width
+        // keeps its signedness so the exact op and the casts can honour it.
+        "u64" | "usize" => Ok(Ty::unsigned_int(8)),
+        "isize" => Ok(Ty::I64),
+        "u32" => Ok(Ty::unsigned_int(4)),
+        "i32" => Ok(Ty::signed_int(4)),
+        "u16" => Ok(Ty::unsigned_int(2)),
+        "i16" => Ok(Ty::signed_int(2)),
+        "u128" | "i128" => Ok(Ty::Int { width: 16, signed: !s.starts_with('u') }),
+        "char" => Ok(Ty::unsigned_int(4)),
         "()" => Ok(Ty::Unit),
         "!" => Ok(Ty::Unit),
         _ => {
@@ -3155,10 +3214,25 @@ fn split_top_as(s: &str) -> Option<(&str, &str)> {
 ///
 /// A call is only *hoisted* when every operand it reads is invariant and the
 /// callee does not write the caller's frame, which the purity list plus the
-/// no-memory-write rule below guarantee. Calls that allocate (`alloc`) or write
-/// (`print_i64`, `putchar`) are never pure.
+/// no-memory-write rule below guarantee. This is a strict allowlist, not a
+/// denylist: a name that is not a known side-effect-free runtime leaf is treated
+/// as impure. A user function can print, mutate a global, or write through a
+/// pointer, and rmc does no interprocedural purity analysis, so hoisting its
+/// call out of a loop would drop the repeated side effects (`helper` printing on
+/// every iteration). Only helpers that read their arguments and return a value
+/// qualify.
 fn pure_call(name: &str) -> bool {
-    !matches!(name, "alloc" | "print_i64" | "print_str" | "putchar" | "free")
+    matches!(
+        name,
+        "__rmc_imin"
+            | "__rmc_imax"
+            | "__rmc_umin"
+            | "__rmc_umax"
+            | "__rmc_compare_bytes"
+            | "__rmc_str_len"
+            | "__rmc_str_lt"
+            | "__rmc_str_contains"
+    )
 }
 
 /// Halve the call tree of a single self-recursive function.

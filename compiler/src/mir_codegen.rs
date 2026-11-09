@@ -2427,6 +2427,9 @@ impl<'a> FnGen<'a> {
             // `.max(1)`.
             Ty::Unit => 0,
             Ty::U8 => 1,
+            // A one-byte signed integer occupies one byte like `u8`; the
+            // extension on load differs.
+            Ty::Int { width: 1, .. } => 1,
             Ty::Struct(name) => {
                 if let Some(l) = self.enums.get(name) {
                     return l.size.max(8);
@@ -2497,19 +2500,58 @@ impl<'a> FnGen<'a> {
     fn load_place_to(&mut self, p: &Place, reg: &str) -> Result<(), String> {
         self.place_addr(p)?;
         // A `u8`/`i8` is one byte, so a whole-word load would pull in the seven
-        // bytes after it. The byte is zero-extended, which is `u8`'s value
-        // semantics; the backend does not track signedness.
-        if matches!(self.place_ty(p), Ty::U8) {
-            self.emit("  movzbl (%rax), %eax");
-            if reg != "%rax" {
-                self.emit(&format!("  mov %rax, {reg}"));
+        // bytes after it. The byte is zero-extended for `u8` and sign-extended
+        // for `i8`, so the value in the slot matches the type's semantics.
+        match self.place_ty(p).int_width_sign() {
+            Some((1, true)) => {
+                self.emit("  movsbq (%rax), %rax");
+                if reg != "%rax" {
+                    self.emit(&format!("  mov %rax, {reg}"));
+                }
+                return Ok(());
             }
-            return Ok(());
+            Some((1, false)) => {
+                self.emit("  movzbl (%rax), %eax");
+                if reg != "%rax" {
+                    self.emit(&format!("  mov %rax, {reg}"));
+                }
+                return Ok(());
+            }
+            _ => {}
         }
         if reg != "%rax" {
             self.emit(&format!("  mov (%rax), {reg}"));
         } else {
             self.emit("  mov (%rax), %rax");
+        }
+        Ok(())
+    }
+
+    /// Canonicalise `%rax` to the value of an integer type: truncate to its
+    /// width, then sign- or zero-extend back to 64 bits, so every later use
+    /// reads the number rustc's `as` would produce. An `i64`/`u64` needs no
+    /// work. Used after an `as` cast and by a narrow load.
+    fn canonicalize_int(&mut self, ty: &Ty) -> Result<(), String> {
+        let Some((width, signed)) = ty.int_width_sign() else {
+            return Ok(());
+        };
+        match (width, signed) {
+            (1, true) => self.emit("  movsbq %al, %rax"),
+            (1, false) => self.emit("  movzbl %al, %eax"),
+            // The encoder has no 16-bit register operand, so extend by shifting
+            // the low half into the top and back.
+            (2, true) => {
+                self.emit("  shl $48, %rax");
+                self.emit("  sar $48, %rax");
+            }
+            (2, false) => {
+                self.emit("  shl $48, %rax");
+                self.emit("  shr $48, %rax");
+            }
+            (4, true) => self.emit("  movslq %eax, %rax"),
+            (4, false) => self.emit("  mov %eax, %eax"),
+            // A 64-bit (or wider, unmodelled) value already fills the slot.
+            _ => {}
         }
         Ok(())
     }
@@ -2774,7 +2816,18 @@ impl<'a> FnGen<'a> {
                     self.emit(&format!("  mov {src}, %rax"));
                 }
                 match op {
-                    UnOp::Not => self.emit("  xor $1, %rax"),
+                    // MIR spells both boolean negation and integer bitwise
+                    // complement `Not`. `xor $1` is the boolean inversion (a
+                    // normalized `0`/`1`); an integer needs every bit flipped,
+                    // or `!2_i64` yields `3` instead of `-3`. The operand type
+                    // picks the form.
+                    UnOp::Not => {
+                        if matches!(self.operand_ty(a), Ty::Bool) {
+                            self.emit("  xor $1, %rax");
+                        } else {
+                            self.emit("  not %rax");
+                        }
+                    }
                     UnOp::Neg => self.emit("  neg %rax"),
                     UnOp::PtrMetadata => {
                         // `str::len` / slice length. rmc represents a `&str`
@@ -2854,7 +2907,17 @@ impl<'a> FnGen<'a> {
                     }
                 }
                 let (src, _) = self.eval_operand(op)?;
-                self.store_scalar(dest, &src)?;
+                if src != "%rax" {
+                    self.emit(&format!("  mov {src}, %rax"));
+                }
+                // A cast reads its source at the source's width and signedness
+                // first: `i8 as i64` sign-extends, `u8 as i64` zero-extends.
+                // Then `as` to a narrower or unsigned type truncates to the
+                // target. Without both steps `-1_i64 as u32` stays `-1` and
+                // `x as i8 as i64` keeps the stale high bytes.
+                self.canonicalize_int(&from_ty)?;
+                self.canonicalize_int(to)?;
+                self.store_scalar(dest, "%rax")?;
             }
             Rvalue::Ref { place, .. } | Rvalue::RawRef { place, .. } => {
                 self.place_addr(place)?;
@@ -2997,7 +3060,7 @@ impl<'a> FnGen<'a> {
         }
         // A `u8`/`i8` destination is one byte: a whole-word store would clobber
         // the seven bytes after it. `%al` holds the low byte of the source.
-        let byte = matches!(self.place_ty(dest), Ty::U8);
+        let byte = matches!(self.place_ty(dest).int_width_sign(), Some((1, _)));
         if dest.proj.is_empty() {
             let dst = self.off(self.local_base(dest.local));
             if byte {
@@ -3157,7 +3220,21 @@ impl<'a> FnGen<'a> {
         match op {
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 self.emit_cmp(op, a, b)?;
-                self.emit(&format!("  {} %al", setcc(op)));
+                // A `<`/`<=`/`>`/`>=` on an unsigned integer must compare with
+                // the carry flag (`setb`/`setbe`/`seta`/`setae`), not the sign
+                // flag, or a value with the top bit set reads as negative.
+                let cc = if self.operand_ty(a).is_unsigned() {
+                    match op {
+                        BinOp::Lt => "setb",
+                        BinOp::Le => "setbe",
+                        BinOp::Gt => "seta",
+                        BinOp::Ge => "setae",
+                        other => setcc(other),
+                    }
+                } else {
+                    setcc(op)
+                };
+                self.emit(&format!("  {cc} %al"));
                 self.emit("  movzbl %al, %eax");
                 self.store_scalar(dest, "%rax")?;
             }
@@ -3317,6 +3394,124 @@ impl<'a> FnGen<'a> {
         self.load_float(op, xmm)
     }
 
+    /// Load a compile-time float constant into an `%xmm` register.
+    fn load_float_imm(&mut self, v: f64, f32: bool, xmm: &str) {
+        let bits = if f32 {
+            (v as f32).to_bits() as i64
+        } else {
+            v.to_bits() as i64
+        };
+        self.emit(&format!("  movabs ${bits}, %rax"));
+        if f32 {
+            self.emit(&format!("  movd %eax, {xmm}"));
+        } else {
+            self.emit(&format!("  movq %rax, {xmm}"));
+        }
+    }
+
+    /// Convert the float in `%xmm0` to the integer type `to`, saturating and
+    /// mapping NaN to zero the way Rust's `as` does. `cvttsd2si` only saturates
+    /// at the *signed* 64-bit limits (and returns `i64::MIN` for a positive
+    /// overflow), so a narrower, unsigned, or `u64` target needs an explicit
+    /// clamp against the target's bounds. Result lands in `%rax`.
+    fn gen_float_to_int(&mut self, src_f32: bool, to: &Ty) -> Result<(), String> {
+        let Some((width, signed)) = to.int_width_sign() else {
+            // A float-to-float or float-to-pointer cast does not reach here.
+            return Ok(());
+        };
+        let suf = if src_f32 { "ss" } else { "sd" };
+        let hi_lbl = self.new_label();
+        let lo_lbl = self.new_label();
+        let nan_lbl = self.new_label();
+        let done_lbl = self.new_label();
+        // NaN is the only value not equal to itself; catch it before the range
+        // compares, which would otherwise fall through to the conversion.
+        self.emit(&format!("  ucomi{suf} %xmm0, %xmm0"));
+        self.emit(&format!("  jp {nan_lbl}"));
+
+        if signed {
+            let bits = width * 8;
+            let hi: i64 = if bits >= 64 { i64::MAX } else { (1i64 << (bits - 1)) - 1 };
+            let lo: i64 = if bits >= 64 { i64::MIN } else { -(1i64 << (bits - 1)) };
+            // `2^(bits-1)` is exactly representable as a float; `>=` it clamps
+            // to the maximum.
+            let hi_f = 2f64.powi((bits - 1) as i32);
+            let lo_f = lo as f64;
+            self.load_float_imm(hi_f, src_f32, "%xmm1");
+            self.emit(&format!("  ucomi{suf} %xmm1, %xmm0"));
+            self.emit(&format!("  jae {hi_lbl}"));
+            self.load_float_imm(lo_f, src_f32, "%xmm1");
+            self.emit(&format!("  ucomi{suf} %xmm1, %xmm0"));
+            self.emit(&format!("  jb {lo_lbl}"));
+            self.emit_float_trunc(src_f32)?;
+            self.emit(&format!("  jmp {done_lbl}"));
+            self.emit(&format!("{hi_lbl}:"));
+            self.emit(&format!("  movabs ${hi}, %rax"));
+            self.emit(&format!("  jmp {done_lbl}"));
+            self.emit(&format!("{lo_lbl}:"));
+            self.emit(&format!("  movabs ${lo}, %rax"));
+        } else if width < 8 {
+            let bits = width * 8;
+            let hi: i64 = (1i64 << bits) - 1;
+            let hi_f = 2f64.powi(bits as i32);
+            self.load_float_imm(hi_f, src_f32, "%xmm1");
+            self.emit(&format!("  ucomi{suf} %xmm1, %xmm0"));
+            self.emit(&format!("  jae {hi_lbl}"));
+            self.load_float_imm(0.0, src_f32, "%xmm1");
+            self.emit(&format!("  ucomi{suf} %xmm1, %xmm0"));
+            self.emit(&format!("  jb {lo_lbl}"));
+            self.emit_float_trunc(src_f32)?;
+            self.emit(&format!("  jmp {done_lbl}"));
+            self.emit(&format!("{hi_lbl}:"));
+            self.emit(&format!("  movabs ${hi}, %rax"));
+            self.emit(&format!("  jmp {done_lbl}"));
+            self.emit(&format!("{lo_lbl}:"));
+            self.emit("  xor %eax, %eax");
+        } else {
+            // `u64`: [0, 2^63) converts as a signed value; [2^63, 2^64) is
+            // converted after subtracting 2^63 and re-biasing; >= 2^64 clamps.
+            let big_lbl = self.new_label();
+            self.load_float_imm(0.0, src_f32, "%xmm1");
+            self.emit(&format!("  ucomi{suf} %xmm1, %xmm0"));
+            self.emit(&format!("  jb {lo_lbl}"));
+            self.load_float_imm(2f64.powi(64), src_f32, "%xmm1");
+            self.emit(&format!("  ucomi{suf} %xmm1, %xmm0"));
+            self.emit(&format!("  jae {hi_lbl}"));
+            self.load_float_imm(2f64.powi(63), src_f32, "%xmm1");
+            self.emit(&format!("  ucomi{suf} %xmm1, %xmm0"));
+            self.emit(&format!("  jae {big_lbl}"));
+            self.emit_float_trunc(src_f32)?;
+            self.emit(&format!("  jmp {done_lbl}"));
+            self.emit(&format!("{big_lbl}:"));
+            self.load_float_imm(2f64.powi(63), src_f32, "%xmm1");
+            self.emit(&format!("  sub{suf} %xmm1, %xmm0"));
+            self.emit_float_trunc(src_f32)?;
+            self.emit("  movabs $-9223372036854775808, %rcx");
+            self.emit("  add %rcx, %rax");
+            self.emit(&format!("  jmp {done_lbl}"));
+            self.emit(&format!("{hi_lbl}:"));
+            self.emit("  movabs $-1, %rax");
+            self.emit(&format!("  jmp {done_lbl}"));
+            self.emit(&format!("{lo_lbl}:"));
+            self.emit("  xor %eax, %eax");
+        }
+        self.emit(&format!("  jmp {done_lbl}"));
+        self.emit(&format!("{nan_lbl}:"));
+        self.emit("  xor %eax, %eax");
+        self.emit(&format!("{done_lbl}:"));
+        Ok(())
+    }
+
+    /// `cvttsd2si`/`cvttss2si` from `%xmm0` into `%rax`.
+    fn emit_float_trunc(&mut self, src_f32: bool) -> Result<(), String> {
+        if src_f32 {
+            self.emit("  cvttss2si %xmm0, %rax");
+        } else {
+            self.emit("  cvttsd2si %xmm0, %rax");
+        }
+        Ok(())
+    }
+
     /// A cast with a float on one side: `IntToFloat`, `FloatToInt`, and the
     /// `f32`/`f64` widening and narrowing. The integer side is a signed 64-bit
     /// value, which is what the back end stores for every integer width.
@@ -3351,11 +3546,7 @@ impl<'a> FnGen<'a> {
             // signed 64-bit case.
             (true, false) => {
                 self.load_float(op, "%xmm0")?;
-                if matches!(src, Ty::F32) {
-                    self.emit("  cvttss2si %xmm0, %rax");
-                } else {
-                    self.emit("  cvttsd2si %xmm0, %rax");
-                }
+                self.gen_float_to_int(matches!(src, Ty::F32), to)?;
                 self.store_scalar(dest, "%rax")?;
             }
             // Float -> float: `cvtss2sd` widens, `cvtsd2ss` narrows (rounding
@@ -3420,11 +3611,26 @@ impl<'a> FnGen<'a> {
                     self.emit(&format!("  mov {bv}, %rcx"));
                 }
                 self.emit(&format!("  mov {}, %rax", self.off(tmp)));
-                let m = if op == BinOp::Shl { "sal" } else { "sar" };
+                let m = match op {
+                    BinOp::Shl => "sal",
+                    // An unsigned shift fills with zeros, a signed one with the
+                    // sign bit. MIR's `Shr` covers both; the operand's type
+                    // decides, or `0x8000000000000000u64 >> 60` fills with ones
+                    // and reads as a huge negative instead of 8.
+                    BinOp::Shr => {
+                        if self.operand_ty(a).is_unsigned() {
+                            "shr"
+                        } else {
+                            "sar"
+                        }
+                    }
+                    _ => unreachable!(),
+                };
                 self.emit(&format!("  {m} %cl, %rax"));
             }
             BinOp::Div | BinOp::Rem => {
-                if self.gen_div_const(op, b)? {
+                let unsigned = self.div_is_unsigned(a, b);
+                if !unsigned && self.gen_div_const(op, b)? {
                     return Ok(());
                 }
                 // `%rax` holds the dividend; the divisor must be materialised
@@ -3454,8 +3660,15 @@ impl<'a> FnGen<'a> {
                 }
                 self.emit(&format!("  jmp {done}"));
                 self.emit(&format!("{slow}:"));
-                self.emit("  cqto");
-                self.emit("  idiv %rcx");
+                if unsigned {
+                    // Zero-extend the dividend into `%rdx:%rax`; `div` divides
+                    // the 128-bit pair by `%rcx` as unsigned.
+                    self.emit("  xor %edx, %edx");
+                    self.emit("  div %rcx");
+                } else {
+                    self.emit("  cqto");
+                    self.emit("  idiv %rcx");
+                }
                 if op == BinOp::Rem {
                     self.emit("  mov %rdx, %rax");
                 }
@@ -3464,6 +3677,17 @@ impl<'a> FnGen<'a> {
             _ => unreachable!(),
         }
         Ok(())
+    }
+
+    /// Whether a `/`/`%` should use the unsigned `div` instruction. The
+    /// dividend's type decides; when it is an untyped constant the divisor's
+    /// type is the fallback.
+    fn div_is_unsigned(&self, a: &Operand, b: &Operand) -> bool {
+        let ta = self.operand_ty(a);
+        if ta.is_int() {
+            return ta.is_unsigned();
+        }
+        self.operand_ty(b).is_unsigned()
     }
 
     /// Division/modulo by a constant becomes a multiply and an arithmetic shift
@@ -4735,7 +4959,11 @@ fn ty_size(ty: &Ty) -> i64 {
     match ty {
         Ty::U8 => 1,
         Ty::F32 => 4,
-        Ty::I64 | Ty::Bool | Ty::Int | Ty::F64 | Ty::Ptr(_) | Ty::Ref(_) | Ty::Other | Ty::Unit => 8,
+        Ty::I64 | Ty::Bool | Ty::F64 | Ty::Ptr(_) | Ty::Ref(_) | Ty::Other | Ty::Unit => 8,
+        // A narrow integer is one 64-bit slot in the frame, except `i8`, which
+        // packs into a byte like `u8`.
+        Ty::Int { width: 1, .. } => 1,
+        Ty::Int { .. } => 8,
         Ty::Struct(_) => 8, // refined by the aggregate's own length
         Ty::Array(elem, n) => ty_size(elem) * (*n as i64).max(1),
         Ty::Tuple(tys) => tys.iter().map(|t| ty_size(t)).sum::<i64>().max(8),
