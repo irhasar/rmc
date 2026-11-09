@@ -1688,8 +1688,9 @@ fn a_seventh_parameter_is_rejected() {
 #[test]
 fn a_call_in_an_enum_constructor_does_not_clobber_an_argument() {
     // `7` is placed in `%rdi` before the second argument runs `g`; the direct
-    // path must be declined so the call cannot destroy `%rdi`.
-    let out = asm(
+    // path must be declined so the call cannot destroy `%rdi`. `f` is kept out
+    // of the inliner so the call survives as a real `call`.
+    let out = asm_no_inline(
         "enum O { N, S(i64) } \
          fn g() -> i64 { return 1; } \
          fn f(a: i64, b: i64) -> i64 { return a + b; } \
