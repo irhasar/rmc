@@ -605,7 +605,13 @@ impl Sema {
             }
             Stmt::While(cond, body) => {
                 let ct = self.check_expr(cond, scope)?;
-                if ct != Type::Bool {
+                if cond_has_unlabelled_exit(cond) {
+                    return Err(
+                        "`break` or `continue` with no label in the condition of a `while` loop"
+                            .into(),
+                    );
+                }
+                if ct != Type::Bool && !expr_diverges(cond) {
                     return Err(format!("`while` condition must be `bool`, found {ct:?}"));
                 }
                 self.loop_depth += 1;
@@ -972,7 +978,7 @@ impl Sema {
             }
             Expr::If(cond, then, els) => {
                 let ct = self.check_expr(cond, scope)?;
-                if ct != Type::Bool {
+                if ct != Type::Bool && !expr_diverges(cond) {
                     return Err(format!("`if` condition must be `bool`, found {ct:?}"));
                 }
                 // Each arm is checked from the incoming state, then the results
@@ -1579,9 +1585,78 @@ fn stmt_has_break(s: &Stmt) -> bool {
 fn expr_has_break(e: &Expr) -> bool {
     match e {
         Expr::Block(b) => block_has_break(b),
-        Expr::If(_, t, els) => {
-            block_has_break(t) || els.as_ref().map_or(false, |b| block_has_break(b))
+        // The condition is evaluated, so a `break` there can leave the loop the
+        // expression belongs to; the walk must inspect it too, along with every
+        // other evaluated child.
+        Expr::If(c, t, els) => {
+            expr_has_break(c)
+                || block_has_break(t)
+                || els.as_ref().map_or(false, |b| block_has_break(b))
         }
+        Expr::Bin(_, a, b) => expr_has_break(a) || expr_has_break(b),
+        Expr::Un(_, a) => expr_has_break(a),
+        Expr::Index(a, b) => expr_has_break(a) || expr_has_break(b),
+        Expr::Field { base, .. } => expr_has_break(base),
+        Expr::Cast(a, _) => expr_has_break(a),
+        Expr::Call { args, .. } => args.iter().any(expr_has_break),
+        Expr::StructLit { fields, .. } => fields.iter().any(|f| expr_has_break(&f.value)),
+        Expr::ArrayLit(v, _) => expr_has_break(v),
+        Expr::ArrayList(xs) => xs.iter().any(expr_has_break),
+        Expr::MethodCall { recv, args, .. } => {
+            expr_has_break(recv) || args.iter().any(expr_has_break)
+        }
+        Expr::EnumCtor { args, .. } => args.iter().any(expr_has_break),
+        Expr::VariantTest { scrutinee, .. } => expr_has_break(scrutinee),
+        Expr::EnumPayload { recv, .. } => expr_has_break(recv),
+        _ => false,
+    }
+}
+
+/// True when `e` contains an unlabelled `break`/`continue` that would target a
+/// loop enclosing the `while` whose condition is `e`. rustc forbids these
+/// (E0590): the condition runs before the body, so such a branch can never be
+/// reached from the loop. A nested loop captures its own unlabelled exits.
+fn cond_has_unlabelled_exit(e: &Expr) -> bool {
+    match e {
+        Expr::Block(b) => block_has_unlabelled_exit(b),
+        Expr::If(c, t, els) => {
+            cond_has_unlabelled_exit(c)
+                || block_has_unlabelled_exit(t)
+                || els.as_ref().map_or(false, |b| block_has_unlabelled_exit(b))
+        }
+        Expr::Bin(_, a, b) => cond_has_unlabelled_exit(a) || cond_has_unlabelled_exit(b),
+        Expr::Un(_, a) => cond_has_unlabelled_exit(a),
+        Expr::Index(a, b) => cond_has_unlabelled_exit(a) || cond_has_unlabelled_exit(b),
+        Expr::Field { base, .. } => cond_has_unlabelled_exit(base),
+        Expr::Cast(a, _) => cond_has_unlabelled_exit(a),
+        Expr::Call { args, .. } => args.iter().any(cond_has_unlabelled_exit),
+        Expr::StructLit { fields, .. } => fields.iter().any(|f| cond_has_unlabelled_exit(&f.value)),
+        Expr::ArrayLit(v, _) => cond_has_unlabelled_exit(v),
+        Expr::ArrayList(xs) => xs.iter().any(cond_has_unlabelled_exit),
+        Expr::MethodCall { recv, args, .. } => {
+            cond_has_unlabelled_exit(recv) || args.iter().any(cond_has_unlabelled_exit)
+        }
+        Expr::EnumCtor { args, .. } => args.iter().any(cond_has_unlabelled_exit),
+        Expr::VariantTest { scrutinee, .. } => cond_has_unlabelled_exit(scrutinee),
+        Expr::EnumPayload { recv, .. } => cond_has_unlabelled_exit(recv),
+        _ => false,
+    }
+}
+
+fn block_has_unlabelled_exit(b: &Block) -> bool {
+    b.stmts.iter().any(stmt_has_unlabelled_exit)
+        || b.tail.as_deref().map_or(false, cond_has_unlabelled_exit)
+}
+
+fn stmt_has_unlabelled_exit(s: &Stmt) -> bool {
+    match s {
+        Stmt::Break | Stmt::Continue => true,
+        // A nested loop captures its own unlabelled exits.
+        Stmt::While(..) | Stmt::For { .. } | Stmt::Loop(_) => false,
+        Stmt::Expr(e) => cond_has_unlabelled_exit(e),
+        Stmt::Return(Some(e)) => cond_has_unlabelled_exit(e),
+        Stmt::Let { init: Some(e), .. } => cond_has_unlabelled_exit(e),
+        Stmt::Assign { value, .. } => cond_has_unlabelled_exit(value),
         _ => false,
     }
 }
