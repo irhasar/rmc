@@ -1,4 +1,4 @@
-// Twin of regs.rms: many live locals with a call inside a loop, so the compiler
+// Many live locals with a call inside a loop, so the compiler
 // must keep them alive across calls.
 fn helper(a: i64, b: i64) -> i64 {
     return a * 3 + b;

@@ -2,7 +2,7 @@
 """Differential test suite for the MIR path with `std` available.
 
 `tests/mir/` is freestanding (`#![no_std]`, one runtime) and `tests/run.py` is
-the `.rms` path. Neither exercises `println!`: the first has no `std`, and the
+the AST path. Neither exercises `println!`: the first has no `std`, and the
 second's front end has no macro. This suite closes that gap.
 
 Each case in `tests/std/` is a plain `std` program. It is compiled two ways and
@@ -66,7 +66,7 @@ def main():
             failures += 1
             continue
 
-        p = subprocess.run([RMC, src, "-o", got], capture_output=True)
+        p = subprocess.run([RMC, "--rustc-frontend", src, "-o", got], capture_output=True)
         if p.returncode != 0:
             print(f"FAIL {name}: rmc failed:\n{p.stderr.decode(errors='replace')}")
             failures += 1

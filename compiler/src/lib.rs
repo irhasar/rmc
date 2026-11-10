@@ -50,7 +50,7 @@ pub struct CompileOptions {
     pub no_tco: bool,
 }
 
-/// Compile `src` (a `.rms` program) to x86-64 assembly in GNU `as` syntax.
+/// Compile `src` (a `.rs` program) to x86-64 assembly in GNU `as` syntax.
 ///
 /// The returned string is a complete translation unit: the compiled program
 /// followed by the freestanding runtime. Feed it to `as` and `ld` to obtain an
@@ -87,11 +87,11 @@ pub fn compile_to_asm(src: &str, opts: &CompileOptions) -> Result<String, String
     Ok(asm)
 }
 
-/// Compile a parsed MIR [`mir::Program`] to x86-64 assembly, using rustc as the
-/// front end and the in-process [`mir_codegen`] back end.
+/// Compile a parsed MIR program to x86-64 assembly (program plus runtime).
 ///
-/// The result is a complete translation unit (program plus the freestanding
-/// runtime) ready for [`elf::assemble`].
+/// The MIR path shares the freestanding runtime and the in-process assembler
+/// with [`compile_to_asm`]; only the front end (rustc's MIR) and the lowering
+/// (`mir_codegen`) differ.
 pub fn compile_mir_to_asm(
     prog: &mir::Program,
     opts: &mir_codegen::Options,
@@ -102,15 +102,4 @@ pub fn compile_mir_to_asm(
     asm.push_str(&user_asm);
     asm.push_str(&runtime);
     Ok(asm)
-}
-
-/// Compile MIR text (as printed by `rustc --emit=mir`) to an ELF executable.
-pub fn compile_mir_text_to_elf(
-    mir_text: &str,
-    opts: &mir_codegen::Options,
-) -> Result<Vec<u8>, String> {
-    let mut prog = mir::parse(mir_text)?;
-    prog.copy_propagate();
-    let asm = compile_mir_to_asm(&prog, opts)?;
-    elf::assemble(&asm)
 }

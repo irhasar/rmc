@@ -1,4 +1,3 @@
-// Rust twin of structarrpat.rms.
 #[derive(Copy, Clone)]
 struct I { u: i64, v: i64 }
 #[derive(Copy, Clone)]

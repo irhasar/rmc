@@ -140,7 +140,7 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<String, String> {
     // Emit only functions the program can reach from `main` (dead-function
     // elimination keeps the artifact small and the compile fast). `drop` glue
     // needs the struct layouts, so this runs after `collect_structs`.
-    let live = reachable(prog, &structs);
+    let live = reachable(prog, &structs, &enums);
     let order: Vec<&Function> = prog.funcs.iter().filter(|f| live.contains(&f.name)).collect();
 
     // Deref trampolines for reference placeholders are module-scoped and emitted
@@ -179,7 +179,7 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<String, String> {
         for s in &strings {
             let label = &string_ids[s];
             // A `&str`/`&[u8]` literal is a `{len: i64, bytes..}` record, the
-            // same shape the `.rms` path uses and the one `print_str` and
+            // same shape the AST path uses and the one `print_str` and
             // `PtrMetadata` (`str::len`) read. The record's address is the
             // value, so word 0 must be the byte length, not the first byte.
             let _ = writeln!(rodata, ".balign 8");
@@ -277,7 +277,11 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<String, String> {
 }
 
 /// Functions reachable from `main` by direct calls.
-fn reachable(prog: &Program, structs: &HashMap<String, Vec<Ty>>) -> HashSet<String> {
+fn reachable(
+    prog: &Program,
+    structs: &HashMap<String, Vec<Ty>>,
+    enums: &HashMap<String, EnumLayout>,
+) -> HashSet<String> {
     let mut live = HashSet::new();
     let Some(main) = prog.func("main") else { return live };
     let mut stack = vec![main.name.clone()];
@@ -293,16 +297,18 @@ fn reachable(prog: &Program, structs: &HashMap<String, Vec<Ty>>) -> HashSet<Stri
                             stack.push(callee.clone());
                         }
                     }
-                    // A `drop(_N)` terminator runs `_N`'s destructor, which may
-                    // be a nested field's impl; none of them are named by a
-                    // `Call`, so collect them all here.
+                    // A `drop(_N)` terminator runs the destructor of `_N`'s
+                    // type, which may be a nested field's impl; none of them are
+                    // named by a `Call`, so collect them all here. The base
+                    // local's type covers a projected place too (`drop((_2.1: G))`
+                    // needs `_2`'s field impls), and copy propagation often turns
+                    // a plain drop into a projected one, so the projection must
+                    // not be required to be empty.
                     Terminator::Drop { place, .. } => {
-                        if place.proj.is_empty() {
-                            if let Some(ty) = f.locals.get(place.local as usize).map(|l| &*l.ty) {
-                                let mut syms = Vec::new();
-                                collect_drop_symbols(prog, structs, ty, &mut syms);
-                                stack.extend(syms);
-                            }
+                        if let Some(ty) = f.locals.get(place.local as usize).map(|l| &*l.ty) {
+                            let mut syms = Vec::new();
+                            collect_drop_symbols(prog, structs, enums, ty, &mut syms);
+                            stack.extend(syms);
                         }
                     }
                     _ => {}
@@ -318,6 +324,7 @@ fn reachable(prog: &Program, structs: &HashMap<String, Vec<Ty>>) -> HashSet<Stri
 fn collect_drop_symbols(
     prog: &Program,
     structs: &HashMap<String, Vec<Ty>>,
+    enums: &HashMap<String, EnumLayout>,
     ty: &Ty,
     out: &mut Vec<String>,
 ) {
@@ -328,16 +335,24 @@ fn collect_drop_symbols(
             if let Some(sym) = prog.drop_impls.get(name) {
                 out.push(sym.clone());
             }
-            if let Some(fields) = structs.get(name) {
+            if let Some(layout) = enums.get(name) {
+                // An enum's payload fields are variant-dependent; collect every
+                // variant's droppable fields' symbols.
+                for tys in layout.fields.values() {
+                    for f in tys {
+                        collect_drop_symbols(prog, structs, enums, f, out);
+                    }
+                }
+            } else if let Some(fields) = structs.get(name) {
                 for f in fields {
-                    collect_drop_symbols(prog, structs, f, out);
+                    collect_drop_symbols(prog, structs, enums, f, out);
                 }
             }
         }
-        Ty::Array(elem, _) => collect_drop_symbols(prog, structs, elem, out),
+        Ty::Array(elem, _) => collect_drop_symbols(prog, structs, enums, elem, out),
         Ty::Tuple(tys) => {
             for t in tys {
-                collect_drop_symbols(prog, structs, t, out);
+                collect_drop_symbols(prog, structs, enums, t, out);
             }
         }
         _ => {}
@@ -366,8 +381,12 @@ fn func_calls(prog: &Program, name: &str, callee: &str) -> bool {
     false
 }
 
+/// A rustc-internal shim rmc cannot compile. A user function qualified by its
+/// module (`a::helper`) or an impl method keyed by receiver (`a::A__value`) also
+/// contains `::`, so it must *not* be skipped here: it is emitted normally and
+/// reached by the same symbol its call sites use.
 fn is_unsupported_builtin(name: &str) -> bool {
-    name.contains("::") || name.starts_with('<') || name == "rust_begin_unwind"
+    name.starts_with('<') || name == "rust_begin_unwind"
 }
 
 /// Append the user-visible feature name to a back-end error, when the rejected
@@ -775,22 +794,44 @@ struct EnumLayout {
     fieldless: bool,
 }
 
+/// An assembler-safe spelling of an IR symbol. A user type keeps its module
+/// path (`a::A__value`) so two same-named types stay distinct, but `::` is the
+/// section separator in assembler syntax and would split the label. `$` is a
+/// valid symbol character in GNU `as`, the in-process assembler and the ELF
+/// symbol table, and cannot appear in a Rust identifier, so it is a safe
+/// stand-in. A name with no `::` is returned unchanged, so every symbol rmc
+/// emits today is byte-for-byte identical.
+fn asm_sym(name: &str) -> String {
+    if name.contains("::") {
+        name.replace("::", "$")
+    } else {
+        name.to_string()
+    }
+}
+
 /// Split `Enum::Variant` or `Option::<i64>::Some` into the enum and variant
 /// names, dropping any generic arguments.
 fn split_ev(name: &str) -> (String, String) {
-    let idx = name.rfind("::").unwrap_or(0);
+    // A bare variant (`Some(1)`, the enum dropped because the type is
+    // inferred) has no `::`; the whole name is the variant and the enum is
+    // unknown here. `is_variant_const` resolves it against the variant tables.
+    let Some(idx) = name.rfind("::") else {
+        return (String::new(), name.trim().to_string());
+    };
     let variant = name[idx + 2..].trim().to_string();
     let head = &name[..idx];
     let head = head.split("::<").next().unwrap_or(head);
-    let head = head.rsplit("::").next().unwrap_or(head);
+    // Keep the enum's whole path, matching the identity `parse_ty` gave the
+    // enum type; `canonicalize_types` has reconciled the two spellings.
     (head.trim().to_string(), variant)
 }
 
 /// The struct name a path-qualified aggregate constant names, if the path's
-/// last segment is a plausible Rust *type* name. `std::ops::Range::<usize>`
-/// yields `Range`, so `collect_structs` and `materialize_const_agg` can agree
-/// on a key for a struct constant that the printer spelled out with its full
-/// path (`Range::<usize> { start: .., end: .. }`).
+/// last segment is a plausible Rust *type* name. The whole pre-generic path is
+/// kept (`std::ops::Range`, `a::A`) so the key matches the identity `parse_ty`
+/// gave the same type; `canonicalize_types` has already shortened a path whose
+/// last segment is unambiguous, so a type the printer spelled bare in its own
+/// module resolves to the one qualified spelling.
 ///
 /// A variant is a CamelCase identifier and so is a type, so this cannot
 /// separate `Option::Some` from `Range` on shape alone. The caller resolves the
@@ -801,7 +842,7 @@ fn struct_path_name(name: &str) -> Option<String> {
     let ok = !last.is_empty()
         && last.chars().next().is_some_and(|c| c.is_ascii_uppercase())
         && last.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-    ok.then(|| last.to_string())
+    ok.then(|| crate::mir::struct_const_identity(name))
 }
 
 /// Whether a constant named `name` is an enum variant rather than a struct,
@@ -812,7 +853,13 @@ fn struct_path_name(name: &str) -> Option<String> {
 fn is_variant_const(name: &str, enums: &HashMap<String, EnumLayout>) -> bool {
     if name.contains("::") {
         let (e, v) = split_ev(name);
-        enums.get(&e).is_some_and(|l| l.fields.contains_key(&v))
+        // A path-qualified constant is a variant only if the segment before it
+        // is a type name. `b::E::B` has `E`; a struct constant qualified by its
+        // module (`a::A { .. }`) has the lowercase module there, so it stays a
+        // struct rather than gaining a phantom tag word.
+        let last = e.rsplit("::").next().unwrap_or(&e).trim();
+        last.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+            && enums.get(&e).is_some_and(|l| l.fields.contains_key(&v))
     } else {
         enums.values().any(|l| l.fields.contains_key(name.trim()))
     }
@@ -858,11 +905,17 @@ fn collect_enums(prog: &Program) -> HashMap<String, EnumLayout> {
                         }
                         let (e, v) = split_ev(&name);
                         // `std::ops::Range::<usize> { start, end }` splits to a
-                        // variant that is not an identifier: it is a struct the
-                        // printer spelled with its path, not an enum variant, and
-                        // registering it would give the struct a phantom tag
-                        // word. Skip it; `collect_structs` claims it instead.
+                        // variant that is not an identifier, and `a::A { v: .. }`
+                        // to one whose "enum" is the lowercase module `a`: both
+                        // are structs the printer spelled with a path, not enum
+                        // variants, and registering them would give the struct a
+                        // phantom tag word. Skip them; `collect_structs` claims
+                        // them instead.
                         if !is_ident(&v) {
+                            continue;
+                        }
+                        let enum_seg = e.rsplit("::").next().unwrap_or(&e).trim();
+                        if !enum_seg.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
                             continue;
                         }
                         let tys: Vec<Ty> = ops.iter().map(|op| rv_operand_ty(f, op)).collect();
@@ -1650,8 +1703,9 @@ impl<'a> FnGen<'a> {
         // of the callee, and an unaligned entry splits that fetch across two
         // cache lines. LLVM aligns every function this way.
         out.push_str("  .p2align 4\n");
-        let _ = writeln!(out, ".globl {}", self.func.name);
-        let _ = writeln!(out, "{}:", self.func.name);
+        let fname = asm_sym(&self.func.name);
+        let _ = writeln!(out, ".globl {fname}");
+        let _ = writeln!(out, "{fname}:");
         if !omit_frame {
             out.push_str("  push %rbp\n  mov %rsp, %rbp\n");
         }
@@ -1666,7 +1720,7 @@ impl<'a> FnGen<'a> {
         // Epilogue: restore the saved registers and return `%rax`. The saved
         // registers live directly below `%rbp`, but `%rsp` is still at the
         // bottom of the frame, so it has to be moved back up first.
-        let _ = writeln!(out, ".Lret_{}:", self.func.name);
+        let _ = writeln!(out, ".Lret_{}:", asm_sym(&self.func.name));
         // `_start` passes `main`'s `%rax` straight to `exit(2)`, so a `main`
         // that returns `()` must define it. The ABI leaves `%rax` unspecified
         // for a unit return, so without this the process exits with whatever
@@ -1976,10 +2030,10 @@ impl<'a> FnGen<'a> {
                         self.emit(&format!("  mov {src}, %rax"));
                     }
                 }
-                self.emit(&format!("  jmp .Lret_{}", self.func.name));
+                self.emit(&format!("  jmp .Lret_{}", asm_sym(&self.func.name)));
             }
             Terminator::Unreachable => {
-                self.emit(&format!("  jmp .Lret_{}", self.func.name));
+                self.emit(&format!("  jmp .Lret_{}", asm_sym(&self.func.name)));
             }
             Terminator::Abort => {
                 // A trap: exit 101, matching rustc's panic status.
@@ -2060,7 +2114,7 @@ impl<'a> FnGen<'a> {
                     u32::MAX
                 });
                 if t == u32::MAX {
-                    self.emit(&format!("  jmp .Lret_{}", self.func.name));
+                    self.emit(&format!("  jmp .Lret_{}", asm_sym(&self.func.name)));
                 } else if t != bb + 1 || t as usize >= self.func.blocks.len() {
                     self.emit(&format!("  jmp .Lbb{}", self.bb_label(t)));
                 }
@@ -3913,6 +3967,33 @@ impl<'a> FnGen<'a> {
 
     // --- calls -------------------------------------------------------------
 
+    /// Spill every promoted caller-saved local to its frame slot, returning the
+    /// `(local, register)` list `restore_caller_saved` reloads. `%rdi`, `%rsi`,
+    /// `%r8` and `%r9` are all clobbered by a call, so a local that lives in one
+    /// must be saved around it. `gen_call` and the drop glue both call this.
+    fn spill_caller_saved(&mut self) -> Vec<(u32, &'static str)> {
+        let mut caller_promos: Vec<(u32, &'static str)> = self
+            .promo
+            .iter()
+            .filter(|(_, p)| p.caller_saved)
+            .map(|(l, p)| (*l, p.reg))
+            .collect();
+        caller_promos.sort_unstable();
+        for (l, reg) in &caller_promos {
+            let slot = self.off(self.caller_spill[l]);
+            self.emit(&format!("  mov {reg}, {slot}"));
+        }
+        caller_promos
+    }
+
+    /// Reload the promoted caller-saved locals `spill_caller_saved` saved.
+    fn restore_caller_saved(&mut self, saved: &[(u32, &'static str)]) {
+        for (l, reg) in saved {
+            let slot = self.off(self.caller_spill[l]);
+            self.emit(&format!("  mov {slot}, {reg}"));
+        }
+    }
+
     /// Emit `place`'s destructor: call its type's `Drop::drop` impl with the
     /// value's address, or, when the type has no impl of its own but has fields
     /// that do, run each field's destructor in place.
@@ -3928,10 +4009,35 @@ impl<'a> FnGen<'a> {
     /// then, as rustc's `drop_in_place` does, the destructor of every droppable
     /// field. A type without an impl has only the fields to drop.
     fn gen_drop_glue(&mut self, place: &Place, ty: &Ty) -> Result<(), String> {
+        // An enum's payload is variant-dependent, so it cannot be walked by
+        // field index. Hand it to the address-based helper, which runs the
+        // enum's own `Drop` impl (if any) and then dispatches on the tag. This
+        // must happen *before* the own-impl call below, or the impl would run
+        // twice (once here, once inside the helper).
+        if let Ty::Struct(name) = ty {
+            if self.enums.contains_key(name) {
+                // The enum's own `Drop` impl runs first, then the active
+                // variant's fields. Both make calls, and the address helper
+                // clobbers `%rdi`, so preserve the promoted caller-saved locals
+                // across the whole sequence: the spill must precede `mov %rax,
+                // %rdi`, which would otherwise destroy a promoted `%rdi`.
+                self.place_addr(place)?;
+                let saved = self.spill_caller_saved();
+                self.emit("  mov %rax, %rdi");
+                self.gen_drop_glue_at_reg(ty)?;
+                self.restore_caller_saved(&saved);
+                return Ok(());
+            }
+        }
         if let Some(sym) = self.drop_symbol_for_ty(ty) {
             self.place_addr(place)?;
+            // Spill *before* the `%rdi` move: it clobbers a promoted `%rdi`, so
+            // saving afterwards would store the clobbered value. `%rax` (the
+            // address) is not a promoted register, so the spill leaves it live.
+            let saved = self.spill_caller_saved();
             self.emit("  mov %rax, %rdi");
-            self.emit(&format!("  call {sym}"));
+            self.emit(&format!("  call {}", asm_sym(&sym)));
+            self.restore_caller_saved(&saved);
         }
         match ty {
             Ty::Struct(name) => {
@@ -3957,25 +4063,28 @@ impl<'a> FnGen<'a> {
                 if *n == 0 || !self.ty_needs_drop(elem) {
                     return Ok(());
                 }
-                let size = self.size_of_ty(elem);
-                // `_i` runs 0..n, dropping each element front to back (the order
-                // rustc's own array glue uses).
+                let size = self.size_of_ty(elem).max(1);
+                let ptr = self.alloc_slot();
                 let i = self.alloc_slot();
                 let loop_lbl = self.new_label();
                 let done = self.new_label();
+                // Evaluate the base address once: the element destructor is a
+                // call that clobbers the registers `place_addr` would otherwise
+                // recompute it from, and a projected base may live in one.
+                self.place_addr(place)?;
+                self.emit(&format!("  mov %rax, {}", self.off(ptr)));
                 self.emit(&format!("  movq $0, {}", self.off(i)));
                 self.emit(&format!("{loop_lbl}:"));
                 self.emit(&format!("  cmp ${n}, {}", self.off(i)));
                 self.emit(&format!("  jge {done}"));
-                self.place_addr(place)?;
+                self.emit(&format!("  mov {}, %rdi", self.off(ptr)));
                 self.emit(&format!("  mov {}, %rdx", self.off(i)));
                 if size != 1 {
                     self.emit(&format!("  imul ${size}, %rdx"));
                 }
-                self.emit("  add %rdx, %rax");
+                self.emit("  add %rdx, %rdi");
                 // The element's destructor may itself be glue, so recurse
                 // through the element address rather than inlining the math.
-                self.emit("  mov %rax, %rdi");
                 self.gen_drop_glue_at_reg(elem)?;
                 self.emit(&format!("  addq $1, {}", self.off(i)));
                 self.emit(&format!("  jmp {loop_lbl}"));
@@ -3991,20 +4100,37 @@ impl<'a> FnGen<'a> {
     /// its fields' destructors at their offsets, recursing for nested
     /// aggregates.
     fn gen_drop_glue_at_reg(&mut self, ty: &Ty) -> Result<(), String> {
+        // Save the aggregate's address before the own-impl call, which clobbers
+        // `%rdi`; the field loops below need it to reach each field.
+        let fields: Vec<Ty> = match ty {
+            Ty::Struct(name) => self.structs.get(name).cloned().unwrap_or_default(),
+            Ty::Tuple(tys) => tys.iter().map(|t| (**t).clone()).collect(),
+            _ => Vec::new(),
+        };
+        let needs_fields = match ty {
+            Ty::Array(elem, n) => *n != 0 && self.ty_needs_drop(elem),
+            Ty::Struct(name) if self.enums.contains_key(name) => self.enum_needs_drop(name),
+            _ => fields.iter().any(|f| self.ty_needs_drop(f)),
+        };
+        let ptr = if needs_fields { Some(self.alloc_slot()) } else { None };
+        if let Some(p) = ptr {
+            self.emit(&format!("  mov %rdi, {}", self.off(p)));
+        }
         if let Some(sym) = self.drop_symbol_for_ty(ty) {
-            self.emit(&format!("  call {sym}"));
+            let saved = self.spill_caller_saved();
+            self.emit(&format!("  call {}", asm_sym(&sym)));
+            self.restore_caller_saved(&saved);
         }
         match ty {
             Ty::Array(elem, n) => {
                 if *n == 0 || !self.ty_needs_drop(elem) {
                     return Ok(());
                 }
-                let size = self.size_of_ty(elem);
-                let ptr = self.alloc_slot();
+                let size = self.size_of_ty(elem).max(1);
+                let ptr = ptr.expect("array glue allocated its pointer slot");
                 let i = self.alloc_slot();
                 let loop_lbl = self.new_label();
                 let done = self.new_label();
-                self.emit(&format!("  mov %rdi, {}", self.off(ptr)));
                 self.emit(&format!("  movq $0, {}", self.off(i)));
                 self.emit(&format!("{loop_lbl}:"));
                 self.emit(&format!("  cmp ${n}, {}", self.off(i)));
@@ -4020,14 +4146,48 @@ impl<'a> FnGen<'a> {
                 self.emit(&format!("  jmp {loop_lbl}"));
                 self.emit(&format!("{done}:"));
             }
+            Ty::Struct(name) if self.enums.contains_key(name) => {
+                let Some(ptr) = ptr else { return Ok(()) };
+                let layout = self.enums.get(name).cloned().unwrap_or_default();
+                // For each variant, compare the tag and, on a match, drop each
+                // droppable payload field. `switchInt` on the discriminant is
+                // exactly what the value's own `drop_in_place` lowers to.
+                let variants: Vec<(String, Vec<Ty>)> = layout
+                    .tags
+                    .iter()
+                    .map(|(v, _)| (v.clone(), layout.fields.get(v).cloned().unwrap_or_default()))
+                    .collect();
+                let done = self.new_label();
+                for (v, tys) in variants {
+                    if !tys.iter().any(|t| self.ty_needs_drop(t)) {
+                        continue;
+                    }
+                    let next = self.new_label();
+                    let tag = self.variant_tag(name, &v);
+                    self.emit(&format!("  mov {}, %rax", self.off(ptr)));
+                    self.emit(&format!("  mov {}, %rdx", self.off(ptr)));
+                    self.emit("  mov (%rdx), %rdx");
+                    self.emit(&format!("  cmp ${tag}, %rdx"));
+                    self.emit(&format!("  jne {next}"));
+                    for (k, fty) in tys.iter().enumerate() {
+                        if !self.ty_needs_drop(fty) {
+                            continue;
+                        }
+                        let off = layout.payload_off + k as i64 * 8;
+                        self.emit(&format!("  mov {}, %rdi", self.off(ptr)));
+                        if off != 0 {
+                            self.emit(&format!("  add ${off}, %rdi"));
+                        }
+                        self.gen_drop_glue_at_reg(fty)?;
+                    }
+                    self.emit(&format!("  jmp {done}"));
+                    self.emit(&format!("{next}:"));
+                }
+                self.emit(&format!("{done}:"));
+            }
             Ty::Struct(_) | Ty::Tuple(_) => {
-                let fields: Vec<Ty> = match ty {
-                    Ty::Struct(name) => self.structs.get(name).cloned().unwrap_or_default(),
-                    Ty::Tuple(tys) => tys.iter().map(|t| (**t).clone()).collect(),
-                    _ => unreachable!(),
-                };
-                let ptr = self.alloc_slot();
-                self.emit(&format!("  mov %rdi, {}", self.off(ptr)));
+                // No droppable field: the own impl (already emitted) is all.
+                let Some(ptr) = ptr else { return Ok(()) };
                 let mut off = 0i64;
                 for fty in fields.iter() {
                     if self.ty_needs_drop(fty) {
@@ -4059,6 +4219,9 @@ impl<'a> FnGen<'a> {
                 if self.prog.drop_impls.contains_key(name) {
                     return true;
                 }
+                if self.enums.contains_key(name) {
+                    return self.enum_needs_drop(name);
+                }
                 self.structs
                     .get(name)
                     .map(|f| f.iter().any(|t| self.ty_needs_drop(t)))
@@ -4068,6 +4231,20 @@ impl<'a> FnGen<'a> {
             Ty::Tuple(tys) => tys.iter().any(|t| self.ty_needs_drop(t)),
             _ => false,
         }
+    }
+
+    /// Whether any variant of enum `name` carries a payload field that needs a
+    /// destructor.
+    fn enum_needs_drop(&self, name: &str) -> bool {
+        self.enums
+            .get(name)
+            .map(|l| {
+                l.fields
+                    .values()
+                    .flatten()
+                    .any(|t| self.ty_needs_drop(t))
+            })
+            .unwrap_or(false)
     }
 
     fn gen_call(&mut self, dest: &Place, func: &CallTarget, args: &[Operand]) -> Result<(), String> {
@@ -4124,27 +4301,14 @@ impl<'a> FnGen<'a> {
         // Spill the promoted caller-saved registers before the argument moves,
         // which overwrite them, and restore afterwards. `%rax` carries the
         // result, so the spills use memory operands directly.
-        let mut caller_promos: Vec<(u32, &'static str)> = self
-            .promo
-            .iter()
-            .filter(|(_, p)| p.caller_saved)
-            .map(|(l, p)| (*l, p.reg))
-            .collect();
-        caller_promos.sort_unstable();
-        for (l, reg) in &caller_promos {
-            let slot = self.off(self.caller_spill[l]);
-            self.emit(&format!("  mov {reg}, {slot}"));
-        }
+        let caller_promos = self.spill_caller_saved();
         for (i, v) in &reg_ops {
             if ARG_REGS[*i] != *v {
                 self.emit(&format!("  mov {v}, {}", ARG_REGS[*i]));
             }
         }
-        self.emit(&format!("  call {name}"));
-        for (l, reg) in &caller_promos {
-            let slot = self.off(self.caller_spill[l]);
-            self.emit(&format!("  mov {slot}, {reg}"));
-        }
+        self.emit(&format!("  call {}", asm_sym(&name)));
+        self.restore_caller_saved(&caller_promos);
         if self.place_ty(dest).is_aggregate() {
             // Aggregates return by hidden pointer in %rdi; rmc's builtins do
             // not, so this only appears for functions this backend owns.
@@ -5089,6 +5253,7 @@ fn store_slot(line: &str) -> Option<&str> {
 fn optimize(body: &str) -> String {
     let mut body = peephole(body);
     body = drop_dead_jumps(&body);
+    body = drop_noop_arith(&body);
     for _ in 0..2 {
         body = fuse_imm(&body);
         body = fuse_lea(&body);
@@ -5098,8 +5263,34 @@ fn optimize(body: &str) -> String {
         body = fold_local_offsets(&body);
         body = dead_stores(&body);
         body = drop_unread_stores(&body);
+        body = drop_noop_arith(&body);
     }
     body
+}
+
+/// Drop an arithmetic instruction that cannot change its destination: `add $0`
+/// and `sub $0` leave a register untouched. A field access at offset 0 emits
+/// exactly `add $0, %rax`, and the dead instruction then blocks the
+/// store-forwarding peephole that would otherwise fold the pointer's round-trip
+/// through its frame slot. Kept only when the next instruction does not read
+/// the flags the instruction would have set.
+fn drop_noop_arith(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out = String::with_capacity(body.len());
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        let noop = t
+            .strip_prefix("add $0, ")
+            .or_else(|| t.strip_prefix("sub $0, "))
+            .map(is_reg)
+            .unwrap_or(false);
+        if noop && !flags_used_by(lines.get(i + 1).copied()) {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// Drop a `jmp` whose target is the very next label. The return path always
@@ -5666,5 +5857,17 @@ fn main() -> () {
         crate::mir::layout_blocks(&mut prog);
         let asm = compile(&prog, &Options::default()).expect("compile");
         assert!(asm.contains("main:"), "main not emitted:\n{asm}");
+    }
+
+    /// `add $0, %reg` cannot change its destination and is dropped; the same
+    /// instruction must survive when the next one reads the flags it sets.
+    #[test]
+    fn noop_arithmetic_is_dropped_but_flags_are_kept() {
+        let body = "  mov %rax, %rcx\n  add $0, %rcx\n  mov %rcx, %rdx\n";
+        let out = drop_noop_arith(body);
+        assert!(!out.contains("add $0"), "no-op add not dropped:\n{out}");
+        let flags = "  add $0, %rcx\n  jle .Lx\n";
+        let out = drop_noop_arith(flags);
+        assert!(out.contains("add $0"), "flagged add wrongly dropped:\n{out}");
     }
 }

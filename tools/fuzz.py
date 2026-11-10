@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Differential fuzzer for rmc.
 
-Generates random programs in the rmc subset, compiles each with both rmc and
-rustc -O, runs both, and compares stdout plus exit status. A mismatch prints the
+Generates random programs in the Rust subset rmc supports, compiles each with
+both rmc and rustc -O from the same `.rs` source, runs both, and compares
+stdout plus exit status. A mismatch prints the
 program and exits non-zero. Seeds are reproducible, so a reported failure can be
 re-run with `--seed`.
 
@@ -49,6 +50,12 @@ Modes:
           copying every field, chaining, a struct-typed field, and a field
           value that mutates the base so the evaluation order and the
           independence of the result are both observable
+    intmeth
+          built-in `i64` methods (`abs`/`signum`/`min`/`max`/`div_euclid`/
+          `rem_euclid`/`is_positive`/`is_negative`) over `argv`-sourced
+          operands, so `i64::MIN`, `-1`, `0` and `1` are all reachable and the
+          receiver's single evaluation and the tie/overflow behaviour are
+          compared against `rustc -O`
     robust
           a fixed set of adversarial inputs (random bytes, deep nesting, long
           chains), each of which must error cleanly rather than crash
@@ -130,7 +137,7 @@ def _disasm(raw, scratch):
     return ins
 
 
-def encoding_divergence(rms, flags, tmp):
+def encoding_divergence(src, flags, tmp):
     """Compile both ways and compare the decoded `.text`.
 
     Returns `None` when either build fails (nothing to compare), `True` when the
@@ -138,9 +145,9 @@ def encoding_divergence(rms, flags, tmp):
     divergence."""
     direct = f"{tmp}/enc.direct"
     binut = f"{tmp}/enc.binutils"
-    if run([RMC] + flags + [rms, "-o", direct]).returncode != 0:
+    if run([RMC] + flags + [src, "-o", direct]).returncode != 0:
         return None
-    if run([RMC, "--binutils"] + flags + [rms, "-o", binut]).returncode != 0:
+    if run([RMC, "--binutils"] + flags + [src, "-o", binut]).returncode != 0:
         return None
     raw = _inproc_text(direct)
     bu = _binutils_text(binut, f"{tmp}/enc.text")
@@ -272,14 +279,6 @@ def gen_expr_program(rng):
     ]
     if rng.random() < 0.4:
         exprs.append(rng.choice(min_exprs))
-    rms = [
-        "fn h(x: i64) -> i64 { return (x * 3 + 1) % 97 - 48; }",
-        "fn main() -> i64 {",
-        f"    let a: i64 = {a};",
-        f"    let b: i64 = {b};",
-        f"    let c: i64 = {c};",
-        "    let m: i64 = -9223372036854775808;",
-    ]
     rs = [
         "fn h(x: i64) -> i64 { (x * 3 + 1) % 97 - 48 }",
         "fn main() {",
@@ -289,33 +288,196 @@ def gen_expr_program(rng):
         "    let m: i64 = -9223372036854775808;",
     ]
     for e in exprs:
-        rms.append(f"    print_i64({e});")
         rs.append(f'    println!("{{}}", {e});')
     # String comparisons: printed as `bool`, which both compilers render as
     # `0`/`1` through the `pb` twin. A pointer compare would diverge here.
     for _ in range(rng.randint(1, 4)):
         s = gen_strcmp(rng)
-        rms.append(f"    print_bool({s});")
         rs.append(f'    println!("{{}}", ({s}) as i64);')
     # Lengths. `"lit".len()` reads the string record's length word, so it must be
     # an indirect load through the pointer, not a struct field; an array's length
     # is a compile-time constant. rustc's `len()` is `usize`, so the twin casts.
     for lit in (gen_str_lit(rng) for _ in range(rng.randint(1, 3))):
-        rms.append(f"    print_i64({lit}.len());")
         rs.append(f'    println!("{{}}", {lit}.len() as i64);')
     sv = gen_str_lit(rng)
     n = rng.randint(1, 6)
-    rms.append(f"    let sv = {sv};")
-    rms.append("    print_i64(sv.len());")
     rs.append(f"    let sv = {sv};")
     rs.append('    println!("{}", sv.len() as i64);')
-    rms.append(f"    let arr: [i64; {n}] = [0; {n}];")
-    rms.append("    print_i64(arr.len());")
     rs.append(f"    let arr: [i64; {n}] = [0; {n}];")
     rs.append('    println!("{}", arr.len() as i64);')
-    rms += ["    return 0;", "}"]
     rs += ["}"]
-    return "\n".join(rms), "\n".join(rs)
+    return "\n".join(rs)
+
+
+def gen_char_lit(rng):
+    """A random `char` literal. Covers the plain, escaped (`\\n`, `\\t`, `\\0`,
+    `\\'`, `\\\\`, `\\r`), `\\xNN` and `\\u{..}` forms, so the lexer's escape
+    decoding and the UTF-8 encoder in the runtime are both exercised. `\\'` and
+    `\\\\` are included because they are the two escapes whose *value* is a
+    quote or a backslash, which a naive scan would mis-read."""
+    r = rng.random()
+    if r < 0.35:
+        # A printable ASCII character; skip `'` and `\\`, which need escaping.
+        c = rng.choice("abXYZ019 ~")
+        return f"'{c}'"
+    if r < 0.55:
+        return "'" + rng.choice(["\\n", "\\t", "\\0", "\\r", "\\'", "\\\\"]) + "'"
+    if r < 0.75:
+        # `\xNN` is a raw byte; stay in 0x00..=0x7F so it is a valid scalar.
+        return f"'\\x{rng.randint(0, 0x7f):02x}'"
+    # A `\u{..}` escape: an ASCII scalar, or a multi-byte one from a small set
+    # of code points (including astral ones), so 1-, 2-, 3- and 4-byte UTF-8
+    # encodings all appear.
+    cp = rng.choice([0x41, 0x7a, 0xE9, 0x3B1, 0x20AC, 0x4E2D, 0x1F600, 0x1F4A9])
+    return f"'\\u{{{cp:x}}}'"
+
+
+def gen_char_range_lit(rng):
+    """A `char` range pattern `'lo'..'hi'` or `'lo'..='hi'` with a non-empty
+    range. The bounds are drawn from a fixed table of literal sources paired
+    with their scalar values, so the two can be ordered without re-decoding the
+    escapes; rustc rejects an empty range, and so does rmc."""
+    table = [
+        ("'a'", 0x61), ("'z'", 0x7a), ("'A'", 0x41), ("'Z'", 0x5a),
+        ("'0'", 0x30), ("'9'", 0x39), ("'~'", 0x7e), ("' '", 0x20),
+        ("'\\n'", 0x0a), ("'\\x41'", 0x41), ("'\\u{e9}'", 0xe9),
+        ("'\\u{3b1}'", 0x3b1), ("'\\u{20ac}'", 0x20ac),
+    ]
+    inclusive = rng.random() < 0.5
+    lo_src, lo = rng.choice(table)
+    hi_src, hi = rng.choice(table)
+    if lo == hi:
+        # An equal bound is a valid inclusive range but an empty exclusive one.
+        inclusive = True
+    elif lo > hi:
+        lo_src, hi_src = hi_src, lo_src
+    op = "..=" if inclusive else ".."
+    return f"{lo_src}{op}{hi_src}"
+
+
+def gen_char_program(rng):
+    """`char` literals, `as i64`, `char` ordering and equality, `match` on a
+    `char` (literal, or-pattern and range arms), a `char` array, a `const char`,
+    and a `char` parameter/return. The literals are drawn from `gen_char_lit`, so
+    the escape and UTF-8 paths are fuzzed; the scalar value is printed as an
+    `i64` and the character itself is also printed as text, so both the
+    `as i64` path and the runtime's UTF-8 encoder are exercised."""
+    def lit():
+        return gen_char_lit(rng)
+
+    # Every literal is drawn once and shared by both programs; drawing twice
+    # would give the two twins different characters and a bogus divergence.
+    c_const = lit()
+    arr = [lit() for _ in range(3)]
+    base_lit = lit()
+    exprs = []
+    for _ in range(rng.randint(2, 6)):
+        r = rng.random()
+        if r < 0.35:
+            e = f"({lit()} as i64)"
+        elif r < 0.55:
+            e = f"(({lit()} == {lit()}) as i64)"
+        elif r < 0.75:
+            op = rng.choice(["<", "<=", ">", ">="])
+            e = f"(({lit()} {op} {lit()}) as i64)"
+        else:
+            # `match` on a `char`: literal arms, a wildcard, an `|`, and a
+            # `char` range pattern (`'a'..='z'`, `'a'..'z'`).
+            r2 = rng.random()
+            if r2 < 0.5:
+                e = (f"(match {lit()} {{ {lit()} => 1, {lit()} | {lit()} => 2, "
+                     f"_ => 3 }})")
+            else:
+                e = (f"(match {lit()} {{ {gen_char_range_lit(rng)} => 1, "
+                     f"{gen_char_range_lit(rng)} => 2, _ => 3 }})")
+        exprs.append(e)
+    arr_src = "[" + ", ".join(arr) + "]"
+    rs = [
+        f"const C: char = {c_const};",
+        "fn id(c: char) -> char { return c; }",
+        "fn code(c: char) -> i64 { return c as i64; }",
+        "fn main() {",
+        f"    let cs: [char; 3] = {arr_src};",
+        f"    let base: char = {base_lit};",
+        "    let mut acc: i64 = 0;",
+    ]
+    for e in exprs:
+        rs.append(f"    acc += {e};")
+    # The array, a parameter/return, a `const`, and the binding, each
+    # contributing to the total so a wrong read shows up.
+    tail = [
+        "    acc = acc + (cs[0] as i64) + (cs[1] as i64) + (cs[2] as i64);",
+        "    acc = acc + code(id(base));",
+        "    acc = acc + (C as i64);",
+        "    acc = acc + (base as i64);",
+    ]
+    for t in tail:
+        rs.append(t.replace("acc = acc + ", "acc += "))
+    # Print some characters as text (not as their scalar value), so the UTF-8
+    # encoder in the runtime is exercised, not just `as i64`. rmc's `print_char`
+    # writes the character then a newline; the twin's `println!("{}", c)` does
+    # the same, so the bytes must match for every width of encoding.
+    printed = [base_lit] + arr
+    for lit_src in printed:
+        rs.append(f'    println!("{{}}", {lit_src});')
+    rs += ['    println!("{}", acc);', "}"]
+    return "\n".join(rs)
+
+
+def gen_printfmt_program(rng):
+    """`print!`/`println!` with a literal format string, `{}` substitution,
+    literal braces, escapes, and an empty format. The pieces are joined so a
+    single format can mix all four argument types (`i64`, `bool`, `str`, `char`),
+    and the leading/trailing text differs from run to run so a dropped or
+    duplicated newline shows up. A `println!` and a `print!` are both emitted,
+    since the newline is the one thing `println!` adds over `print!`."""
+    def word():
+        return "".join(rng.choice("xyz") for _ in range(rng.randint(0, 3)))
+
+    def piece():
+        r = rng.random()
+        if r < 0.25:
+            return word(), f"{rng.randint(-99, 99)}"          # i64
+        if r < 0.45:
+            return word(), f"({rng.randint(0, 9)} < {rng.randint(0, 9)})"  # bool
+        if r < 0.6:
+            return word(), gen_str_lit(rng)                    # str
+        if r < 0.8:
+            return word(), gen_char_lit(rng)                   # char
+        return "{{}}", None                                    # literal braces
+
+    def one(macro, out_rs, leading):
+        fmt, args = leading, []
+        for _ in range(rng.randint(0, 3)):
+            w, a = piece()
+            fmt += w + "{}" if a is not None else w
+            if a is not None:
+                args.append(a)
+        body = f'"{fmt}"' + ("".join(", " + a for a in args))
+        out_rs.append(f"    {macro}!({body});")
+
+    rs = [
+        'fn sh(t: i64) -> i64 { println!("{}", t); t }',
+        "fn main() {",
+    ]
+    for _ in range(rng.randint(1, 5)):
+        macro = rng.choice(["print", "println", "println"])
+        leading = word()
+        if rng.random() < 0.3:
+            leading = "\\n" + leading
+        one(macro, rs, leading)
+    # A bare `println!()` / `print!()` with no format string at all.
+    if rng.random() < 0.5:
+        rs.append("    println!();")
+    # A `{}` argument that calls: every argument must be evaluated before the
+    # first byte of output, in source order, so a call in argument position
+    # prints before the literal that precedes it in the format string.
+    if rng.random() < 0.5:
+        a, b = rng.randint(-99, 99), rng.randint(-99, 99)
+        pre, mid = word(), word()
+        rs.append(f'    println!("{pre}{{}}{mid}{{}}", sh({a}), sh({b}));')
+    rs += ["}"]
+    return "\n".join(rs)
 
 
 def gen_cast_program(rng):
@@ -358,15 +520,6 @@ def gen_cast_program(rng):
         lambda: f"({B()} as i64 as i64 - {X()})",
     ]
     exprs = [rng.choice(tmpl)() for _ in range(rng.randint(4, 12))]
-    rms = [
-        "fn h(x: i64) -> i64 { return (x * 3 + 1) % 97 - 48; }",
-        "fn main() -> i64 {",
-        f"    let a: i64 = {a};",
-        f"    let b: i64 = {b};",
-        f"    let c: i64 = {c};",
-        f"    let bl: bool = {bl};",
-        "    let r: &i64 = &a;",
-    ]
     rs = [
         "fn h(x: i64) -> i64 { (x * 3 + 1) % 97 - 48 }",
         "fn main() {",
@@ -377,11 +530,9 @@ def gen_cast_program(rng):
         "    let r: &i64 = &a;",
     ]
     for e in exprs:
-        rms.append(f"    print_i64({e});")
         rs.append(f'    println!("{{}}", {e});')
-    rms += ["    return 0;", "}"]
     rs += ["}"]
-    return "\n".join(rms), "\n".join(rs)
+    return "\n".join(rs)
 
 
 def gen_assoc_program(rng):
@@ -394,30 +545,6 @@ def gen_assoc_program(rng):
     for _ in range(rng.randint(3, 8)):
         x, y, m = (rng.randint(-50, 50) for _ in range(3))
         calls.append((x, y, m))
-    rms = [
-        "struct S { a: i64, b: i64 }",
-        "impl S {",
-        "    fn new(a: i64, b: i64) -> S { return S { a, b }; }",
-        "    fn zero() -> S { return S { a: 0, b: 0 }; }",
-        "    fn scale_of(v: i64) -> i64 { return v * 3; }",
-        "    fn sum(self) -> i64 { return self.a + self.b; }",
-        "    fn bump(self, d: i64) -> S { return S::new(self.a + d, self.b + d); }",
-        "}",
-        "enum E { Off, On }",
-        "impl E {",
-        "    fn from(n: i64) -> E { if n % 2 == 0 { return E::Off; } return E::On; }",
-        "    fn tag(self) -> i64 { return self as i64; }",
-        "}",
-        "fn main() -> i64 {",
-        f"    let s: S = S::new({a}, {b});",
-        "    print_i64(s.sum());",
-        "    print_i64(S::zero().sum());",
-        f"    print_i64(S::scale_of({k}));",
-        f"    print_i64(s.bump({k}).sum());",
-        f"    print_i64(S::new({k}, {k}).bump({a}).sum());",
-        "    print_i64(E::from(0).tag());",
-        "    print_i64(E::from(1).tag());",
-    ]
     rs = [
         "struct S { a: i64, b: i64 }",
         "impl S {",
@@ -443,11 +570,9 @@ def gen_assoc_program(rng):
         '    println!("{}", E::from(1).tag());',
     ]
     for (x, y, m) in calls:
-        rms.append(f"    print_i64(S::new({x}, {y}).bump({m}).sum() + E::from({m}).tag());")
         rs.append(f'    println!("{{}}", S::new({x}, {y}).bump({m}).sum() + E::from({m}).tag());')
-    rms += ["    return 0;", "}"]
     rs += ["}"]
-    return "\n".join(rms), "\n".join(rs)
+    return "\n".join(rs)
 
 
 # ---------------------------------------------------------------- stmt mode
@@ -457,31 +582,22 @@ def gen_stmt_program(rng):
     fields = [f"f{i}" for i in range(nf)]
     fdecl = ", ".join(f"{n}: i64" for n in fields)
     lit = ", ".join(f"{n}: {rng.randint(-9, 9)}" for n in fields)
-    rms = [f"struct S {{ {fdecl} }}"]
     rs = ["#[derive(Copy, Clone)]", f"struct S {{ {fdecl} }}"]
     # A unit enum, matched and cast, to exercise tag resolution and enum
     # patterns alongside the struct paths.
-    rms.append("enum E { P, Q, R }")
     rs.append("#[derive(Copy, Clone)]")
     rs.append("enum E { P, Q, R }")
-    rms.append("fn tag(e: E) -> i64 { match e { E::P => 0, E::Q => 1, _ => 2 } }")
     rs.append("fn tag(e: E) -> i64 { match e { E::P => 0, E::Q => 1, _ => 2 } }")
     # A payload enum: a tagged union built, passed, and destructured.
-    rms.append("enum Opt { None, Some(i64) }")
     rs.append("#[derive(Copy, Clone)]")
     rs.append("enum Opt { None, Some(i64) }")
-    rms.append("fn unwrap(o: Opt, d: i64) -> i64 { match o { Opt::Some(v) => v, _ => d } }")
     rs.append("fn unwrap(o: Opt, d: i64) -> i64 { match o { Opt::Some(v) => v, _ => d } }")
     # An exhaustive enum `match` with no `_` arm, used as a value: the desugared
     # `if` chain has no final `else` and must still type-check.
-    rms.append("fn exval(e: E) -> i64 { return match e { E::P => 1, E::Q => 2, E::R => 3 }; }")
     rs.append("fn exval(e: E) -> i64 { match e { E::P => 1, E::Q => 2, E::R => 3 } }")
     # Methods on a payload enum, by value and by reference.
-    rms.append("impl Opt { fn or_else(self, d: i64) -> i64 { return match self { Opt::Some(v) => v, Opt::None => d }; } fn is_some(&self) -> bool { return match *self { Opt::Some(v) => true, Opt::None => false }; } }")
     rs.append("impl Opt { fn or_else(self, d: i64) -> i64 { match self { Opt::Some(v) => v, Opt::None => d } } fn is_some(&self) -> bool { match *self { Opt::Some(v) => true, Opt::None => false } } }")
-    rms.append(f"fn mk(t: i64) -> S {{ print_i64(t); return S {{ {lit} }}; }}")
     rs.append(f'fn mk(t: i64) -> S {{ println!("{{}}", t); S {{ {lit} }} }}')
-    rms.append("fn sc(t: i64) -> i64 { print_i64(t); return t * 2; }")
     rs.append('fn sc(t: i64) -> i64 { println!("{}", t); t * 2 }')
     # a two-argument function mixing kinds, to exercise evaluation order
     kinds = [rng.choice(["scalar", "agg"]) for _ in range(2)]
@@ -496,167 +612,112 @@ def gen_stmt_program(rng):
     body = " + ".join(
         (f"a{i}" if kinds[i] == "scalar" else f"s{i}.{fields[0]}") for i in range(2)
     )
-    rms.append(f"fn mix({', '.join(params)}) -> i64 {{ return {body}; }}")
     rs.append(f"fn mix({', '.join(params)}) -> i64 {{ {body} }}")
     # References: a `&self` method, a `&S` parameter and a `&i64` parameter, all
     # reached through `&`/`*` and auto-deref.
-    rms.append(f"impl S {{ fn first(&self) -> i64 {{ return self.{fields[0]}; }} }}")
     rs.append(f"impl S {{ fn first(&self) -> i64 {{ self.{fields[0]} }} }}")
-    rms.append(f"fn sref(s: &S) -> i64 {{ return s.{fields[0]}; }}")
     rs.append(f"fn sref(s: &S) -> i64 {{ s.{fields[0]} }}")
-    rms.append("fn vref(p: &i64) -> i64 { return *p + 1; }")
     rs.append("fn vref(p: &i64) -> i64 { *p + 1 }")
     # A `&mut` parameter and a `&mut self` method: both write through the
     # reference, so a wrong address shows up as a wrong final value.
-    rms.append("fn bumpv(p: &mut i64) -> i64 { *p = *p + 1; return *p; }")
     rs.append("fn bumpv(p: &mut i64) -> i64 { *p += 1; *p }")
-    rms.append("impl S { fn bump(&mut self) -> i64 { self." + fields[0] + " = self." + fields[0] + " + 2; return self." + fields[0] + "; } }")
     rs.append("impl S { fn bump(&mut self) -> i64 { self." + fields[0] + " += 2; self." + fields[0] + " } }")
 
     bound = rng.randint(1, 8)
-    rms += ["fn main() -> i64 {", "    let mut acc: i64 = 0;",
-            "    let mut arr: [i64; 4] = [1, 2, 3, 4];", "    let mut i: i64 = 0;"]
     rs += ["fn main() {", "    let mut acc: i64 = 0;",
            "    let mut arr: [i64; 4] = [1, 2, 3, 4];", "    let mut i: i64 = 0;"]
-    rms.append(f"    while i < {bound} {{")
     rs.append(f"    while i < {bound} {{")
     inner = rng.choice([
         "acc = acc + h(i) + arr[i % 4];",
         "acc = acc + (i << 2) + (i & 3);",
         "acc = acc + (i ^ (i >> 1));",
     ])
-    rms.append("        " + inner)
     rs.append("        " + inner.replace("acc = acc +", "acc +=", 1)
                .replace("arr[i % 4]", "arr[(i % 4) as usize]"))
-    rms.append("        acc = acc + match i % 3 { 0 => 5, 1 => 7, _ => 11 };")
     rs.append("        acc += match i % 3 { 0 => 5, 1 => 7, _ => 11 };")
-    rms.append("        arr[i % 4] = arr[i % 4] + i;")
     rs.append("        arr[(i % 4) as usize] += i;")
-    rms.append("        i = i + 1;")
     rs.append("        i += 1;")
-    rms += ["    }"]
     rs += ["    }"]
     # `while let` over a payload enum: the scrutinee is a variable here (a
     # call scrutinee is covered in `pat` mode), and the loop stops when the
     # value becomes `None`. A `continue` before the `break` check keeps the
     # re-test path live.
-    rms.append("    let mut wl: i64 = 0;")
     rs.append("    let mut wl: i64 = 0;")
-    rms.append("    let mut wo: Opt = Opt::Some(2);")
     rs.append("    let mut wo: Opt = Opt::Some(2);")
-    rms.append("    while let Opt::Some(v) = wo { wl = wl + v; if wl > 100 { wo = Opt::None; continue; } if wl > 6 { wo = Opt::None; } }")
     rs.append("    while let Opt::Some(v) = wo { wl += v; if wl > 100 { wo = Opt::None; continue; } if wl > 6 { wo = Opt::None; } }")
-    rms.append("    acc = acc + wl * 7 + nodiv(i);")
     rs.append("    acc += wl * 7 + nodiv(i);")
     # A bare `loop` whose `break` is the last thing in the block, so the `;` is
     # omitted (rustc allows it because `break` diverges).
-    rms.append("    let mut lc: i64 = 0;")
     rs.append("    let mut lc: i64 = 0;")
-    rms.append("    loop { lc = lc + 1; if lc >= 3 { break } }")
     rs.append("    loop { lc += 1; if lc >= 3 { break } }")
-    rms.append("    acc = acc + lc * 11;")
     rs.append("    acc += lc * 11;")
     # A `for` range over i64 variables, exclusive or inclusive. The bounds are
     # named `i64` locals so Rust does not default the literals to `i32`; that
     # also exercises a non-literal bound and `..=`'s strict exit test.
     fa, fb = rng.randint(-3, 3), rng.randint(-3, 3)
     op = rng.choice(["..", "..="])
-    rms.append(f"    let fa: i64 = {fa};")
     rs.append(f"    let fa: i64 = {fa};")
-    rms.append(f"    let fb: i64 = {fb};")
     rs.append(f"    let fb: i64 = {fb};")
-    rms.append(f"    for fi in fa{op}fb {{ acc = acc + fi * 3; }}")
     rs.append(f"    for fi in fa{op}fb {{ acc += fi * 3; }}")
+    # An inclusive range ending at `i64::MAX`. A loop that increments before the
+    # `<=` test wraps the counter to `i64::MIN` and never terminates (the run
+    # times out); the body adds a bounded amount, so a wrong iteration count
+    # shows up as well if the loop does stop.
+    rs.append("    for mi in 9223372036854775805i64..=9223372036854775807 { acc += 1; }")
     # `for x in ARRAY`: the array is iterated by value, and the head is a local
     # (not a literal) so a stale read shows up. A `continue` keeps the increment
     # path live, and a wildcard counts the elements.
-    rms.append("    let farr: [i64; 3] = [1, 2, 3];")
     rs.append("    let farr: [i64; 3] = [1, 2, 3];")
-    rms.append("    for fv in farr { acc = acc + fv * 5; }")
     rs.append("    for fv in farr { acc += fv * 5; }")
-    rms.append("    let mut fc: i64 = 0;")
     rs.append("    let mut fc: i64 = 0;")
-    rms.append("    for fv in farr { if fv == 2 { continue; } fc = fc + fv; }")
     rs.append("    for fv in farr { if fv == 2 { continue; } fc += fv; }")
-    rms.append("    for _ in farr { fc = fc + 1; }")
     rs.append("    for _ in farr { fc += 1; }")
-    rms.append("    acc = acc + fc * 17;")
     rs.append("    acc += fc * 17;")
     # A bool array built from a list literal, then counted. Guards the
     # list-literal element-type inference and bool indexing.
-    rms.append("    let flags: [bool; 4] = [true, false, i < 1, true];")
     rs.append("    let flags: [bool; 4] = [true, false, i < 1, true];")
-    rms.append("    let mut f: i64 = 0;")
     rs.append("    let mut f: i64 = 0;")
-    rms.append("    let mut k: i64 = 0;")
     rs.append("    let mut k: i64 = 0;")
-    rms.append("    while k < 4 { if flags[k] { f = f + 1; } k = k + 1; }")
     rs.append("    while k < 4 { if flags[k as usize] { f += 1; } k += 1; }")
-    rms.append("    acc = acc + f * 1000;")
     rs.append("    acc += f * 1000;")
     # An enum value chosen by the loop counter, matched and cast.
-    rms.append("    let e: E = match i % 3 { 0 => E::P, 1 => E::Q, _ => E::R };")
     rs.append("    let e = match i % 3 { 0 => E::P, 1 => E::Q, _ => E::R };")
-    rms.append("    acc = acc + tag(e) * 100 + (e as i64);")
     rs.append("    acc += tag(e) * 100 + (e as i64);")
     # `let _ = e;` discards `e`: a side-effecting call must still run once and a
     # discarded aggregate must not corrupt the frame. Annotated and unannotated
     # forms both appear.
-    rms.append("    let _ = sc(5);")
     rs.append("    let _ = sc(5);")
-    rms.append("    let _: i64 = sc(6);")
     rs.append("    let _: i64 = sc(6);")
-    rms.append("    let _ = mk(7);")
     rs.append("    let _ = mk(7);")
-    rms.append("    let _ = [1, 2, 3];")
     rs.append("    let _ = [1, 2, 3];")
     # An exhaustive enum `match` with no `_` arm, used as a value.
-    rms.append("    acc = acc + exval(e);")
     rs.append("    acc += exval(e);")
     # An array of unit enums, indexed and matched.
-    rms.append("    let es: [E; 3] = [E::P, E::Q, E::R];")
     rs.append("    let es: [E; 3] = [E::P, E::Q, E::R];")
-    rms.append("    acc = acc + (es[k % 3] as i64) + exval(es[(k + 1) % 3]);")
     rs.append("    acc += (es[(k % 3) as usize] as i64) + exval(es[((k + 1) % 3) as usize]);")
     # Build a payload variant, pass it to a function, and destructure it.
-    rms.append("    let opt: Opt = match i % 2 { 0 => Opt::Some(i + 1), _ => Opt::None };")
     rs.append("    let opt = match i % 2 { 0 => Opt::Some(i + 1), _ => Opt::None };")
     # Methods on the payload enum, by value and by reference.
-    rms.append("    acc = acc + opt.or_else(77);")
     rs.append("    acc += opt.or_else(77);")
-    rms.append("    if opt.is_some() { acc = acc + 5; }")
     rs.append("    if opt.is_some() { acc += 5; }")
-    rms.append("    acc = acc + unwrap(opt, 1000);")
     rs.append("    acc += unwrap(opt, 1000);")
-    rms.append(f"    acc = acc + mix({', '.join(callargs)});")
     rs.append(f"    acc += mix({', '.join(callargs)});")
     # Build a struct, take references to it and to a scalar, and read back
     # through `&self`, `&S` and `&i64`.
-    rms.append(f"    let s0: S = S {{ {lit} }};")
     rs.append(f"    let s0 = S {{ {lit} }};")
-    rms.append("    let sr: &S = &s0;")
     rs.append("    let sr: &S = &s0;")
-    rms.append("    let vr: &i64 = &acc;")
     rs.append("    let vr: &i64 = &acc;")
-    rms.append("    acc = acc + sr.first() + sref(sr) + sref(&s0) + vref(vr) + vref(&acc);")
     rs.append("    acc += sr.first() + sref(sr) + sref(&s0) + vref(vr) + vref(&acc);")
-    rms.append("    let mut s1: S = S { " + lit + " };")
     rs.append("    let mut s1: S = S { " + lit + " };")
-    rms.append("    let mut a1: i64 = 3;")
     rs.append("    let mut a1: i64 = 3;")
-    rms.append("    acc = acc + s1.bump() + bumpv(&mut a1) + bumpv(&mut a1) + a1 + s1.first();")
     rs.append("    acc += s1.bump() + bumpv(&mut a1) + bumpv(&mut a1) + a1 + s1.first();")
-    rms.append("    print_i64(acc);")
     rs.append('    println!("{}", acc);')
-    rms += ["    return 0;", "}"]
     rs += ["}"]
-    rms.insert(0, "fn nodiv(c: i64) -> i64 { if c > 0 { 1 } else { return 2 } }")
-    rms.insert(0, "fn h(x: i64) -> i64 { return (x * 3 + 1) % 97; }")
     # `rs[0]` is the struct's `#[derive]`, so the helper has to go *before* it:
     # inserting at 1 puts the attribute on `fn h`, which rustc rejects.
     rs.insert(0, "fn nodiv(c: i64) -> i64 { if c > 0 { 1 } else { return 2 } }")
     rs.insert(0, "fn h(x: i64) -> i64 { (x * 3 + 1) % 97 }")
-    return "\n".join(rms), "\n".join(rs)
+    return "\n".join(rs)
 
 
 # ---------------------------------------------------------------- opt mode
@@ -691,20 +752,6 @@ def gen_arith_program(rng):
     # chain into a run of `add`s on `a`'s register, which has no `jo`.
     step = rng.choice(["a + 1 + 1", "a + i + 1", "a + i * 2 + 3", "a + a", "a + i + i"])
     n0 = rng.randint(1, 4)
-    rms = [
-        f"fn f(x: i64) -> i64 {{ return {shape}; }}",
-        "fn acc(n: i64) -> i64 {",
-        "    let mut a: i64 = 9223372036854775807;",
-        "    let mut i: i64 = 0;",
-        f"    while i < n {{ a = {step}; i = i + 1; }}",
-        "    return a;",
-        "}",
-        "fn main() -> i64 {",
-        f"    print_i64(f({big}));",
-        f"    print_i64(acc({n0}));",
-        "    return 0;",
-        "}",
-    ]
     rs = [
         f"fn f(x: i64) -> i64 {{ {shape} }}",
         "fn acc(n: i64) -> i64 {",
@@ -718,7 +765,7 @@ def gen_arith_program(rng):
         f'    println!("{{}}", acc({n0}));',
         "}",
     ]
-    return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
+    return "\n".join(rs) + "\n"
 
 
 def gen_shift_program(rng):
@@ -740,20 +787,6 @@ def gen_shift_program(rng):
     ])
     cshape = rng.choice(["y <<= n", "y >>= n", "y <<= n + 1", "y >>= n - 1"])
     ashape = cshape.replace("y", "a[0]", 1)
-    rms = [
-        "fn main() -> i64 {",
-        "    let n: i64 = arg_i64(1);",
-        "    let mut y: i64 = arg_i64(2);",
-        f"    print_i64({shape});",
-        "    let mut a: [i64; 3] = [1, 2, 3];",
-        "    a[0] = y;",
-        f"    {ashape};",
-        "    print_i64(a[0]);",
-        f"    {cshape};",
-        "    print_i64(y);",
-        "    return 0;",
-        "}",
-    ]
     rs = [
         "fn main() {",
         "    let args: Vec<i64> = std::env::args().skip(1).map(|s| s.parse().unwrap()).collect();",
@@ -768,7 +801,7 @@ def gen_shift_program(rng):
         '    println!("{}", y);',
         "}",
     ]
-    return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
+    return "\n".join(rs) + "\n"
 
 
 def gen_nest_program(rng):
@@ -816,57 +849,6 @@ def gen_nest_program(rng):
         for r in range(ns)
     )
 
-    rms = [
-        "fn seed(x: i64) -> i64 { return x * 7 + 1; }",
-        f"struct Inner {{ {idecl} }}",
-        f"struct Outer {{ s: i64, mid: Inner, arr: [i64; {na}] }}",
-        "enum W { Z, V(Inner) }",
-        "struct Wrap { w: W, t: i64 }",
-        f"fn mk(n: i64) -> Outer {{ return Outer {{ s: n, mid: Inner {{ {inner_mk} }}, arr: [{arr_mk}] }}; }}",
-        f"fn sum(o: Outer) -> i64 {{ return {' + '.join(sum_terms)}; }}",
-        f"fn wval(w: W) -> i64 {{ return match w {{ W::Z => 0, W::V(v) => {wval} }}; }}",
-        f"fn wwrap(p: Wrap) -> i64 {{ return match p.w {{ W::Z => p.t, W::V(v) => p.t + v.{f0} }}; }}",
-        f"fn bump(o: &mut Outer) {{ o.mid.{f0} = o.mid.{f0} + 5; o.s = o.s + 1; }}",
-        "fn main() -> i64 {",
-        f"    let base: i64 = seed({base_k});",
-        "    let mut acc: i64 = 0;",
-        "    let o0: Outer = mk(base);",
-        f"    acc = acc + sum(o0) + o0.mid.{inner[1]} + o0.arr[{na - 1}];",
-        "    let mut o1: Outer = o0;",
-        f"    o1.mid.{f0} = o1.mid.{f0} + {m1};",
-        f"    o1.arr[0] = o1.arr[0] + {m2};",
-        f"    acc = acc + o1.mid.{f0} + o0.mid.{f0} + o1.arr[0] + o0.arr[0];",
-        "    let mut k: i64 = 0;",
-        f"    while k < {na} {{ acc = acc + o0.arr[k]; k = k + 1; }}",
-        f"    let w0: W = W::V(Inner {{ {inner_lit} }});",
-        "    let w1: W = W::Z;",
-        "    acc = acc + wval(w0) + wval(w1);",
-        "    let wr: Wrap = Wrap { w: w0, t: 3 };",
-        "    let wz: Wrap = Wrap { w: w1, t: 4 };",
-        "    acc = acc + wwrap(wr) + wwrap(wz);",
-        "    let mut o2: Outer = mk(base + 1);",
-        "    bump(&mut o2);",
-        f"    acc = acc + o2.mid.{f0} + o2.s;",
-        # Nested arrays and arrays of structs: literal, splat, variable-index
-        # reads, element write, whole-element copy.
-        f"    let g: [[i64; {c2}]; {r2}] = [{grid_lit}];",
-        "    let mut gi: i64 = 0;",
-        f"    while gi < {r2} {{ let mut gj: i64 = 0; while gj < {c2} {{ acc = acc + g[gi][gj]; gj = gj + 1; }} gi = gi + 1; }}",
-        f"    acc = acc + g[0][0] + g[{r2 - 1}][{c2 - 1}];",
-        f"    let mut gm: [[i64; {c2}]; {r2}] = [[3; {c2}]; {r2}];",
-        f"    gm[{r2 - 1}][0] = acc;",
-        f"    acc = acc + gm[0][0] + gm[{r2 - 1}][0] + gm[{r2 - 1}][{c2 - 1}];",
-        f"    let mut sa: [Inner; {ns}] = [{st_lit}];",
-        f"    sa[{ns - 1}].{f0} = sa[{ns - 1}].{f0} + 3;",
-        f"    let sc: [Inner; 2] = [Inner {{ {inner_lit2} }}; 2];",
-        f"    sa[0] = sc[1];",
-        "    let mut si: i64 = 0;",
-        f"    while si < {ns} {{ acc = acc + sa[si].{f0} + sa[si].{inner[1]}; si = si + 1; }}",
-        f"    acc = acc + sc[0].{f0} + sc[1].{inner[1]};",
-        "    print_i64(acc);",
-        "    return 0;",
-        "}",
-    ]
     rs = [
         "fn seed(x: i64) -> i64 { x * 7 + 1 }",
         "#[derive(Copy, Clone)]",
@@ -919,7 +901,7 @@ def gen_nest_program(rng):
         '    println!("{}", acc);',
         "}",
     ]
-    return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
+    return "\n".join(rs) + "\n"
 
 def gen_update_program(rng):
     """Struct update syntax `S { field: value, ..base }`. No other mode emits
@@ -935,45 +917,6 @@ def gen_update_program(rng):
     """
     b = rng.randint(1, 9)
     d = rng.randint(1, 9)
-    rms = [
-        "struct P { x: i64, y: i64 }",
-        "struct Q { p: P, t: i64 }",
-        f"fn seed(n: i64) -> i64 {{ return n * 3 + {b}; }}",
-        "fn mk(n: i64) -> P { return P { x: n, y: n + 1 }; }",
-        # Bumps the base's `y` and returns the value to store, so the order in
-        # which the update evaluates it against the base is observable.
-        "fn mutate(p: &mut P, v: i64) -> i64 { p.y = p.y + 100; return v; }",
-        "fn sumq(q: Q) -> i64 { return q.p.x + q.p.y + q.t; }",
-        "fn main() -> i64 {",
-        f"    let n: i64 = seed({d});",
-        "    let mut acc: i64 = 0;",
-        "    let mut base: P = mk(n);",
-        # Written field value mutates the base before the base is read.
-        "    let a: P = P { x: mutate(&mut base, n), ..base };",
-        "    acc = acc + a.x + a.y + base.y;",
-        # Overriding one field, copying the rest.
-        "    let b2: P = P { y: n + 7, ..base };",
-        "    acc = acc + b2.x + b2.y;",
-        # The result is independent of the base.
-        "    let mut c: P = P { x: n + 1, ..base };",
-        "    c.y = c.y + 50;",
-        "    acc = acc + c.y + base.y;",
-        # Copy every field.
-        "    let e: P = P { ..base };",
-        "    acc = acc + e.x + e.y;",
-        # Chained, and through a struct-typed field.
-        "    let f: P = P { x: n + 2, ..e };",
-        "    let g: P = P { y: n + 3, ..f };",
-        "    let q: Q = Q { p: g, t: n };",
-        "    let r: Q = Q { t: n + 4, ..q };",
-        "    acc = acc + r.p.x + r.p.y + r.t + sumq(r);",
-        # In a loop and as an argument.
-        "    let mut i: i64 = 0;",
-        "    while i < 3 { let p: P = P { x: i, ..base }; acc = acc + p.x + p.y; i = i + 1; }",
-        "    print_i64(acc);",
-        "    return 0;",
-        "}",
-    ]
     rs = [
         "#[derive(Copy, Clone)]",
         "struct P { x: i64, y: i64 }",
@@ -1006,7 +949,7 @@ def gen_update_program(rng):
         '    println!("{}", acc);',
         "}",
     ]
-    return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
+    return "\n".join(rs) + "\n"
 
 def _let_pat(rng, fields, prefix):
     """A random `let` struct pattern over `fields`. Returns the pattern text and
@@ -1060,14 +1003,6 @@ def gen_letdestr_program(rng):
     # effect), or a reference (temporary, auto-deref on the field reads).
     src = rng.choice(["local", "call", "ref"])
 
-    rms = [
-        "struct P { x: i64, y: i64, z: i64 }",
-        "struct Q { p: P, t: i64 }",
-        f"fn mk(n: i64) -> P {{ print_i64(n); return P {{ x: n, y: n + 1, z: n + 2 }}; }}",
-        "fn main() -> i64 {",
-        "    let mut acc: i64 = 0;",
-        f"    let s: P = mk({d});",
-    ]
     rs = [
         "#[derive(Copy, Clone)]",
         "struct P { x: i64, y: i64, z: i64 }",
@@ -1079,49 +1014,38 @@ def gen_letdestr_program(rng):
         f"    let s: P = mk({d});",
     ]
     if src == "local":
-        scrut, scrut_rs = "s", "s"
+        scrut = "s"
     elif src == "call":
-        scrut, scrut_rs = f"mk({d + 1})", f"mk({d + 1})"
+        scrut = f"mk({d + 1})"
     else:
-        scrut, scrut_rs = "&s", "&s"
-    rms.append(f"    let P {{ {pat} }} = {scrut};")
-    rs.append(f"    let P {{ {pat} }} = {scrut_rs};")
+        scrut = "&s"
+    rs.append(f"    let P {{ {pat} }} = {scrut};")
     # Mutate every `mut` binding, so an ignored `mut` (a compile error if the
     # flag is dropped) and a mis-bound one are both observable.
     for (name, mutable, _f) in binds:
         if mutable:
-            rms.append(f"    {name} = {name} + {b};")
             rs.append(f"    {name} += {b};")
     if binds:
         terms = " + ".join(f"{n} * {i + 2}" for i, (n, _m, _f) in enumerate(binds))
-        rms.append(f"    acc = acc + {terms};")
         rs.append(f"    acc += {terms};")
     else:
         # `P { .. }` binds nothing; the scrutinee still runs once.
-        rms.append("    acc = acc + 1;")
         rs.append("    acc += 1;")
     # Destructure a struct-typed field in a second statement.
     pat2, binds2 = _let_pat(rng, fields, "c")
-    rms.append(f"    let q: Q = Q {{ p: mk({d + 2}), t: {b} }};")
     rs.append(f"    let q: Q = Q {{ p: mk({d + 2}), t: {b} }};")
-    rms.append(f"    let Q {{ p, t }} = q;")
     rs.append(f"    let Q {{ p, t }} = q;")
-    rms.append(f"    let P {{ {pat2} }} = p;")
     rs.append(f"    let P {{ {pat2} }} = p;")
     for (name, mutable, _f) in binds2:
         if mutable:
-            rms.append(f"    {name} = {name} + {b};")
             rs.append(f"    {name} += {b};")
     if binds2:
         terms2 = " + ".join(f"{n} * {i + 3}" for i, (n, _m, _f) in enumerate(binds2))
-        rms.append(f"    acc = acc + {terms2} + t;")
         rs.append(f"    acc += {terms2} + t;")
     else:
-        rms.append("    acc = acc + t;")
         rs.append("    acc += t;")
-    rms += ["    print_i64(acc);", "    return 0;", "}"]
     rs += ['    println!("{}", acc);', "}"]
-    return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
+    return "\n".join(rs) + "\n"
 
 
 def gen_fordestr_program(rng):
@@ -1140,13 +1064,6 @@ def gen_fordestr_program(rng):
     # expression with a side effect, so it must run exactly once).
     src = rng.choice(["local", "inline"])
 
-    rms = [
-        "struct P { x: i64, y: i64, z: i64 }",
-        f"fn mk(n: i64) -> P {{ print_i64(n); return P {{ x: n, y: n + 1, z: n + 2 }}; }}",
-        "fn main() -> i64 {",
-        "    let mut acc: i64 = 0;",
-        f"    let arr: [P; 3] = [mk({b}), mk({b + 10}), mk({b + 20})];",
-    ]
     rs = [
         "#[derive(Copy, Clone)]",
         "struct P { x: i64, y: i64, z: i64 }",
@@ -1157,46 +1074,34 @@ def gen_fordestr_program(rng):
     ]
     head, head_rs = ("arr", "arr") if src == "local" else \
         (f"[mk({b + 30}), mk({b + 40})]", f"[mk({b + 30}), mk({b + 40})]")
-    rms.append(f"    for P {{ {pat} }} in {head} {{")
     rs.append(f"    for P {{ {pat} }} in {head_rs} {{")
     for (name, mutable, _f) in binds:
         if mutable:
-            rms.append(f"        {name} = {name} + {b};")
             rs.append(f"        {name} += {b};")
     if binds:
         terms = " + ".join(f"{n} * {i + 2}" for i, (n, _m, _f) in enumerate(binds))
-        rms.append(f"        acc = acc + {terms};")
         rs.append(f"        acc += {terms};")
     else:
         # `P { .. }` binds nothing; the loop still runs.
-        rms.append("        acc = acc + 1;")
         rs.append("        acc += 1;")
-    rms.append("    }")
     rs.append("    }")
     # A second loop with `continue` and a `break`, so the per-iteration
     # rebinding is exercised across a non-fallthrough exit.
     pat2, binds2 = _let_pat(rng, fields, "c")
-    rms.append(f"    for P {{ {pat2} }} in arr {{")
     rs.append(f"    for P {{ {pat2} }} in arr {{")
     if binds2:
         n0 = binds2[0][0]
-        rms.append(f"        if {n0} > {b + 15} {{ break; }}")
         rs.append(f"        if {n0} > {b + 15} {{ break; }}")
         for (name, mutable, _f) in binds2:
             if mutable:
-                rms.append(f"        {name} = {name} + {b};")
                 rs.append(f"        {name} += {b};")
         terms2 = " + ".join(f"{n} * {i + 3}" for i, (n, _m, _f) in enumerate(binds2))
-        rms.append(f"        acc = acc + {terms2};")
         rs.append(f"        acc += {terms2};")
     else:
-        rms.append("        acc = acc + 1;")
         rs.append("        acc += 1;")
-    rms.append("    }")
     rs.append("    }")
-    rms += ["    print_i64(acc);", "    return 0;", "}"]
     rs += ['    println!("{}", acc);', "}"]
-    return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
+    return "\n".join(rs) + "\n"
 
 
 # A chain of struct types for the nested-pattern fuzzer: each entry is
@@ -1278,11 +1183,8 @@ def gen_nestpat_program(rng):
         "struct A { m: B, n: i64, o: i64 }",
         "struct S { a: A, b: i64, c: i64 }",
     ]
-    mk = ("fn mk(n: i64) -> S { print_i64(n); return S { a: A { m: B { h: C { u: n, v: n + 1 }, "
-          "j: n + 2 }, n: n + 3, o: n + 4 }, b: n + 5, c: n + 6 }; }")
     mk_rs = ("fn mk(n: i64) -> S { println!(\"{}\", n); S { a: A { m: B { h: C { u: n, v: n + 1 }, "
              "j: n + 2 }, n: n + 3, o: n + 4 }, b: n + 5, c: n + 6 } }")
-    rms = decls + [mk, "fn main() -> i64 {", "    let mut acc: i64 = 0;", f"    let s: S = mk({b});"]
     rs = []
     for d in decls:
         rs.append("#[derive(Copy, Clone)]")
@@ -1292,44 +1194,31 @@ def gen_nestpat_program(rng):
     def emit(indent):
         for (name, mutable, _p) in binds:
             if mutable:
-                rms.append(f"{indent}{name} = {name} + {b};")
                 rs.append(f"{indent}{name} += {b};")
         if binds:
-            rms.append(f"{indent}acc = acc + {terms()};")
             rs.append(f"{indent}acc += {terms()};")
         else:
-            rms.append(f"{indent}acc = acc + 1;")
             rs.append(f"{indent}acc += 1;")
 
     # `let` destructuring.
-    rms.append(f"    let {spat} = s;")
     rs.append(f"    let {spat} = s;")
     emit("    ")
     # `match` through a reference (auto-deref).
-    rms.append("    let r: &S = &s;")
     rs.append("    let r = &s;")
-    rms.append(f"    match r {{ {spat} => {{")
     rs.append(f"    match r {{ {spat} => {{")
     emit("        ")
-    rms.append("    } }")
     rs.append("    } }")
     # `for` over an array of `S`, with the nested pattern in the head.
-    rms.append(f"    let arr: [S; 2] = [s, mk({b + 10})];")
     rs.append(f"    let arr: [S; 2] = [s, mk({b + 10})];")
-    rms.append(f"    for {spat} in arr {{")
     rs.append(f"    for {spat} in arr {{")
     emit("        ")
-    rms.append("    }")
     rs.append("    }")
     # `if let` with a nested pattern.
-    rms.append(f"    if let {spat} = s {{")
     rs.append(f"    if let {spat} = s {{")
     emit("        ")
-    rms.append("    }")
     rs.append("    }")
-    rms += ["    print_i64(acc);", "    return 0;", "}"]
     rs += ['    println!("{}", acc);', "}"]
-    return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
+    return "\n".join(rs) + "\n"
 
 
 def _array_pat(rng, n, prefix):
@@ -1411,15 +1300,6 @@ def gen_arrpat_program(rng):
     lit = ", ".join(f"s + {i}" for i in range(n))
     slit = ", ".join(f"s + {100 + i}" for i in range(n_s))
 
-    rms = [
-        "fn mk(n: i64) -> i64 { print_i64(n); return n; }",
-        f"struct SA {{ a: [i64; {n_s}], b: i64 }}",
-        "fn main() -> i64 {",
-        "    let mut acc: i64 = 0;",
-        f"    let s: i64 = mk({b});",
-        f"    let arr: [i64; {n}] = [{lit}];",
-        f"    let sv: SA = SA {{ a: [{slit}], b: s + {50} }};",
-    ]
     rs = [
         'fn mk(n: i64) -> i64 { println!("{}", n); n }',
         "#[derive(Copy, Clone)]",
@@ -1434,84 +1314,67 @@ def gen_arrpat_program(rng):
     def emit(indent, binds, w0):
         for (name, mutable, _idx) in binds:
             if mutable:
-                rms.append(f"{indent}{name} = {name} + {b};")
                 rs.append(f"{indent}{name} += {b};")
         if binds:
             terms = " + ".join(f"{nm} * {w0 + i}" for i, (nm, _m, _x) in enumerate(binds))
-            rms.append(f"{indent}acc = acc + {terms};")
             rs.append(f"{indent}acc += {terms};")
         else:
-            rms.append(f"{indent}acc = acc + 1;")
             rs.append(f"{indent}acc += 1;")
 
     pat, binds = _array_pat(rng, n, "L")
-    rms.append(f"    let {pat} = arr;")
     rs.append(f"    let {pat} = arr;")
     emit("    ", binds, 2)
 
     pat, binds = _array_pat(rng, n, "M")
-    rms.append(f"    match arr {{ {pat} => {{")
     rs.append(f"    match arr {{ {pat} => {{")
     emit("        ", binds, 2)
-    rms.append("    } }")
     rs.append("    } }")
 
     pat, binds = _array_pat(rng, n, "I")
-    rms.append(f"    if let {pat} = arr {{")
     rs.append(f"    if let {pat} = arr {{")
     emit("        ", binds, 2)
-    rms.append("    }")
     rs.append("    }")
 
     # `for` over an array of 2-element arrays, destructuring each element.
     rows = ", ".join(f"[s + {10 * r}, s + {10 * r + 1}]" for r in range(3))
-    rms.append(f"    let rows: [[i64; 2]; 3] = [{rows}];")
     rs.append(f"    let rows: [[i64; 2]; 3] = [{rows}];")
     pat, binds = _array_pat(rng, 2, "F")
-    rms.append(f"    for {pat} in rows {{")
     rs.append(f"    for {pat} in rows {{")
     emit("        ", binds, 3)
-    rms.append("    }")
     rs.append("    }")
 
     # An array-typed struct field destructured in place, in `let` and `match`.
     spat, abinds, fbind = _struct_arr_field_pat(rng, n_s, "P")
     allbinds = abinds + [(nm, mu, 0) for (nm, mu, _f) in fbind]
-    rms.append(f"    let {spat} = sv;")
     rs.append(f"    let {spat} = sv;")
     emit("    ", allbinds, 2)
 
     spat, abinds, fbind = _struct_arr_field_pat(rng, n_s, "Q")
     allbinds = abinds + [(nm, mu, 0) for (nm, mu, _f) in fbind]
-    rms.append(f"    match sv {{ {spat} => {{")
     rs.append(f"    match sv {{ {spat} => {{")
     emit("        ", allbinds, 2)
-    rms.append("    } }")
     rs.append("    } }")
 
-    rms += ["    print_i64(acc);", "    return 0;", "}"]
     rs += ['    println!("{}", acc);', "}"]
-    return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
+    return "\n".join(rs) + "\n"
 
 
 def _pat_fn_body(binds, b, tail):
     """Body lines for a function whose parameter pattern binds `binds`: mutate
     each `mut` binding, then return the weighted sum of the bindings plus
-    `tail` (a text fragment, e.g. `self.z`, or `""`). Returns `(rms, rs)`.
+    `tail` (a text fragment, e.g. `self.z`, or `""`). Returns the body lines.
     """
-    rms, rs = [], []
+    rs = []
     for (nm, mutable, _f) in binds:
         if mutable:
-            rms.append(f"    {nm} = {nm} + {b};")
             rs.append(f"    {nm} += {b};")
     terms = " + ".join(f"{nm} * {i + 2}" for i, (nm, _m, _f) in enumerate(binds))
     if tail:
         terms = f"{terms} + {tail}" if terms else tail
     if not terms:
         terms = "0"
-    rms.append(f"    return {terms};")
     rs.append(f"    {terms}")
-    return rms, rs
+    return rs
 
 
 def gen_parampat_program(rng):
@@ -1527,11 +1390,6 @@ def gen_parampat_program(rng):
     """
     b = rng.randint(1, 9)
     fields = ["x", "y", "z"]
-    rms = [
-        "fn mk(n: i64) -> i64 { print_i64(n); return n; }",
-        "struct P { x: i64, y: i64, z: i64 }",
-        "struct S { a: [i64; 2], b: i64 }",
-    ]
     rs = [
         'fn mk(n: i64) -> i64 { println!("{}", n); n }',
         "#[derive(Copy, Clone)]",
@@ -1542,73 +1400,41 @@ def gen_parampat_program(rng):
 
     # A struct parameter pattern.
     pat, binds = _let_pat(rng, fields, "A")
-    rms.append(f"fn f_struct(P {{ {pat} }}: P) -> i64 {{")
     rs.append(f"fn f_struct(P {{ {pat} }}: P) -> i64 {{")
-    body, body_rs = _pat_fn_body(binds, b, "")
-    rms += body
+    body_rs = _pat_fn_body(binds, b, "")
     rs += body_rs
-    rms.append("}")
     rs.append("}")
 
     # An array parameter pattern.
     apat, abinds = _array_pat(rng, 2, "B")
-    rms.append(f"fn f_array({apat}: [i64; 2]) -> i64 {{")
     rs.append(f"fn f_array({apat}: [i64; 2]) -> i64 {{")
-    body, body_rs = _pat_fn_body(abinds, b, "")
-    rms += body
+    body_rs = _pat_fn_body(abinds, b, "")
     rs += body_rs
-    rms.append("}")
     rs.append("}")
 
     # A nested parameter pattern: an array-typed field destructured in place
     # plus a scalar field.
     spat, nabinds, fbind = _struct_arr_field_pat(rng, 2, "N")
     nbinds = nabinds + [(nm, mu, 0) for (nm, mu, _f) in fbind]
-    rms.append(f"fn f_nested({spat}: S) -> i64 {{")
     rs.append(f"fn f_nested({spat}: S) -> i64 {{")
-    body, body_rs = _pat_fn_body(nbinds, b, "")
-    rms += body
+    body_rs = _pat_fn_body(nbinds, b, "")
     rs += body_rs
-    rms.append("}")
     rs.append("}")
 
     # A pattern parameter mixed with plain ones.
     mpat, mbinds = _let_pat(rng, fields, "M")
-    rms.append(f"fn f_mixed(k: i64, P {{ {mpat} }}: P, m: i64) -> i64 {{")
     rs.append(f"fn f_mixed(k: i64, P {{ {mpat} }}: P, m: i64) -> i64 {{")
-    body, body_rs = _pat_fn_body(mbinds, b, "k + m")
-    rms += body
+    body_rs = _pat_fn_body(mbinds, b, "k + m")
     rs += body_rs
-    rms.append("}")
     rs.append("}")
 
     # A method receiver plus a pattern parameter.
     rpat, rbinds = _let_pat(rng, fields, "R")
-    rms.append(f"impl P {{ fn add(self, P {{ {rpat} }}: P) -> i64 {{")
     rs.append(f"impl P {{ fn add(self, P {{ {rpat} }}: P) -> i64 {{")
-    body, body_rs = _pat_fn_body(rbinds, b, "self.z")
-    rms += body
+    body_rs = _pat_fn_body(rbinds, b, "self.z")
     rs += body_rs
-    rms.append("    } }")
     rs.append("    } }")
 
-    rms += [
-        "fn main() -> i64 {",
-        "    let mut acc: i64 = 0;",
-        f"    let s: i64 = mk({b});",
-        f"    acc = acc + f_struct(P {{ x: s, y: s + 1, z: s + 2 }});",
-        f"    acc = acc + f_struct(P {{ x: s + 3, y: s + 4, z: s + 5 }});",
-        f"    acc = acc + f_array([s + 6, s + 7]);",
-        f"    acc = acc + f_array([s + 8, s + 9]);",
-        f"    acc = acc + f_nested(S {{ a: [s + 10, s + 11], b: s + 12 }});",
-        f"    acc = acc + f_nested(S {{ a: [s + 13, s + 14], b: s + 15 }});",
-        f"    acc = acc + f_mixed(s + 16, P {{ x: s + 17, y: s + 18, z: s + 19 }}, s + 20);",
-        f"    acc = acc + f_mixed(s + 21, P {{ x: s + 22, y: s + 23, z: s + 24 }}, s + 25);",
-        f"    acc = acc + P {{ x: s + 26, y: s + 27, z: s + 28 }}.add(P {{ x: s + 29, y: s + 30, z: s + 31 }});",
-        "    print_i64(acc);",
-        "    return 0;",
-        "}",
-    ]
     rs += [
         "fn main() {",
         "    let mut acc: i64 = 0;",
@@ -1625,7 +1451,7 @@ def gen_parampat_program(rng):
         '    println!("{}", acc);',
         "}",
     ]
-    return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
+    return "\n".join(rs) + "\n"
 
 
 def gen_enumpat_program(rng):
@@ -1646,23 +1472,6 @@ def gen_enumpat_program(rng):
     wild_first = rng.random() < 0.5
     wild_pat = "E::Pair(_, y) => y" if wild_first else "E::Pair(x, _) => x"
 
-    rms = [
-        "struct I { u: i64 }",
-        "struct S { a: [i64; 2], b: I }",
-        "enum E { Pair(i64, i64), Trip(i64, i64, i64), Hold(S), Arr([i64; 2]), Mix(i64, S, [i64; 2]), None }",
-        "fn mk(n: i64) -> i64 { print_i64(n); return n; }",
-        f"fn wild(e: E) -> i64 {{ return match e {{ {wild_pat}, _ => 0 }}; }}",
-        f"fn mutate(e: E) -> i64 {{ return match e {{ E::Pair(mut x, y) => {{ x = x + {b}; x * 10 + y }}, _ => 0 }}; }}",
-        "fn restp(e: E) -> i64 { return match e { E::Trip(x, ..) => x, _ => 0 }; }",
-        "fn restonly(e: E) -> i64 { return match e { E::Trip(..) => 1, E::None => 0, _ => 0 - 1 }; }",
-        "fn nstruct(e: E) -> i64 { return match e { E::Hold(S { a: [p, q], b: I { u } }) => p * 100 + q * 10 + u, _ => 0 }; }",
-        "fn narr(e: E) -> i64 { return match e { E::Arr([a, c]) => a * 10 + c, _ => 0 }; }",
-        "fn mix(e: E) -> i64 { return match e { E::Mix(n, S { a: [p, q], b: I { u } }, [r, s]) => n + p + q + u + r + s, _ => 0 }; }",
-        "impl E { fn first(self) -> i64 { return match self { E::Pair(x, ..) => x, E::Trip(x, ..) => x, _ => 0 }; } }",
-        "fn wref(e: &E) -> i64 { return match e { E::Pair(x, _) => x * 2, E::Trip(x, ..) => x * 3, _ => 0 }; }",
-        "fn nref(e: &E) -> i64 { return match e { E::Hold(S { a: [p, q], b: I { u } }) => p * 100 + q * 10 + u, _ => 0 }; }",
-        "fn uref(e: &E) -> i64 { return match e { E::None => 100, E::Pair(_, _) => 200, E::Trip(_, _, _) => 300, E::Hold(_) => 400, E::Arr(_) => 500, E::Mix(_, _, _) => 600 }; }",
-    ]
     rs = [
         "#[derive(Copy, Clone)]",
         "struct I { u: i64 }",
@@ -1684,11 +1493,7 @@ def gen_enumpat_program(rng):
         "fn uref(e: &E) -> i64 { match e { E::None => 100, E::Pair(_, _) => 200, E::Trip(_, _, _) => 300, E::Hold(_) => 400, E::Arr(_) => 500, E::Mix(_, _, _) => 600 } }",
     ]
 
-    def acc_add(expr):
-        return f"    acc = acc + {expr};"
 
-    def acc_add_rs(expr):
-        return f"    acc += {expr};"
 
     calls = [
         f"wild(E::Pair(s + {o[0]}, s + {o[1]}))",
@@ -1710,20 +1515,9 @@ def gen_enumpat_program(rng):
         "uref(&E::None)",
         f"uref(&E::Arr([s + {o[18]}, s + {o[19]}]))",
     ]
-    body_rms = ["fn main() -> i64 {", "    let mut acc: i64 = 0;", f"    let s: i64 = mk({b});"]
     body_rs = ["fn main() {", "    let mut acc: i64 = 0;", f"    let s: i64 = mk({b});"]
     for c in calls:
-        body_rms.append(acc_add(c))
-        body_rs.append(acc_add_rs(c))
-    body_rms += [
-        "    let e: E = E::Hold(S { a: [s + 9, s + 10], b: I { u: s + 11 } });",
-        "    if let E::Hold(S { a: [p, q], b: I { u } }) = e {",
-        "        print_i64(p + q + u);",
-        "    }",
-        "    print_i64(acc);",
-        "    return 0;",
-        "}",
-    ]
+        body_rs.append(f"    acc += {c};")
     body_rs += [
         "    let e: E = E::Hold(S { a: [s + 9, s + 10], b: I { u: s + 11 } });",
         "    if let E::Hold(S { a: [p, q], b: I { u } }) = e {",
@@ -1732,9 +1526,271 @@ def gen_enumpat_program(rng):
         '    println!("{}", acc);',
         "}",
     ]
-    rms += body_rms
     rs += body_rs
-    return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
+    return "\n".join(rs) + "\n"
+
+
+def gen_tuple_program(rng):
+    """Tuples: construction, field access (`.0`), destructuring in a `let`, a
+    `match` arm and a parameter, nesting, and use as parameter/return types. A
+    tuple is lowered to an anonymous struct (element `k` is field `"k"`), so a
+    mis-chosen struct, a wrong element offset, or a shared slot changes the
+    total. Element values are re-derived through the random offsets, and every
+    accessor is called with several tuples, so a leaked or aliased slot is
+    observable.
+    """
+    b = rng.randint(1, 9)
+    o = [rng.randint(0, 40) for _ in range(16)]
+
+    rs = [
+        "#[derive(Copy, Clone)]",
+        "struct P { x: i64, y: i64 }",
+        "fn add2(t: (i64, i64)) -> i64 { t.0 + t.1 }",
+        "fn swap(t: (i64, i64)) -> (i64, i64) { (t.1, t.0) }",
+        "fn add3(t: (i64, i64, i64)) -> i64 { t.0 + t.1 + t.2 }",
+        'fn mk(n: i64) -> i64 { println!("{}", n); n }',
+        "fn decon(t: (i64, i64)) -> i64 { let (a, b) = t; a * 10 + b }",
+        "fn decon3(t: (i64, i64, i64)) -> i64 { let (a, _, c) = t; a * 100 + c }",
+        "fn nest(t: ((i64, i64), i64)) -> i64 { let ((a, b), c) = t; a * 100 + b * 10 + c }",
+        "fn firstx(t: (P, i64)) -> i64 { t.0.x + t.1 }",
+        "fn mtu(t: (i64, i64)) -> i64 { match t { (a, b) => a * 7 + b } }",
+        "fn ptup(t: (i64, i64)) -> i64 { let (mut a, b) = t; a = a + b; a }",
+        "fn ppat((a, b): (i64, i64)) -> i64 { a * 3 + b }",
+        "fn ford(a: [(i64, i64); 2]) -> i64 { let mut s = 0; for (x, y) in a { s = s + x * 2 + y; } s }",
+        "fn refut(t: (i64, i64)) -> i64 { match t { (0, x) => x, (a, b) => a * 10 + b } }",
+        "fn refut_or(t: (i64, i64)) -> i64 { match t { (0 | 1, x) => x, _ => 0 - 1 } }",
+        "fn refut_rng(t: (i64, i64)) -> i64 { match t { (a, 5..=9) => a, _ => 0 - 2 } }",
+        "fn iflet(t: (i64, i64)) -> i64 { if let (3, x) = t { x } else { 0 - 3 } }",
+    ]
+
+    calls = [
+        f"add2((s + {o[0]}, s + {o[1]}))",
+        f"add2((s + {o[2]}, s + {o[3]}))",
+        f"decon((s + {o[4]}, s + {o[5]}))",
+        f"decon3((s + {o[6]}, s + {o[7]}, s + {o[8]}))",
+        f"add3((s + {o[9]}, s + {o[10]}, s + {o[11]}))",
+        f"nest(((s + {o[12]}, s + {o[13]}), s + {o[14]}))",
+        f"firstx((P {{ x: s + {o[15]}, y: 0 }}, s + {b}))",
+        f"mtu((s + {b}, s + {o[0]}))",
+        f"ptup((s + {o[1]}, s + {o[2]}))",
+        f"ppat((s + {o[3]}, s + {o[4]}))",
+        f"ford([(s + {o[5]}, s + {o[6]}), (s + {o[7]}, s + {o[8]})])",
+        f"refut((0, s + {o[0]}))",
+        f"refut((s + {o[1]}, s + {o[2]}))",
+        f"refut_or((1, s + {o[3]}))",
+        f"refut_or((s + {o[4]}, s + {o[5]}))",
+        f"refut_rng((s + {o[6]}, 7))",
+        f"refut_rng((s + {o[7]}, s + {o[8]}))",
+        f"iflet((3, s + {o[9]}))",
+        f"iflet((s + {o[10]}, s + {o[11]}))",
+        f"swap((s + {o[3]}, s + {o[4]})).0",
+        f"swap((s + {o[5]}, s + {o[6]})).1",
+    ]
+    body_rs = ["fn main() {", "    let mut acc: i64 = 0;", f"    let s: i64 = mk({b});"]
+    for c in calls:
+        body_rs.append(f"    acc += {c};")
+    body_rs += [
+        f"    let t: (i64, i64) = (s + {o[7]}, s + {o[8]});",
+        "    acc += t.0 + t.1;",
+        f"    let mut u = (s + {o[9]}, s + {o[10]});",
+        f"    u.0 = u.0 + {b};",
+        "    acc += u.0 + u.1;",
+        "    let arr: [(i64, i64); 2] = [(s, s + 1), (s + 2, s + 3)];",
+        "    acc += arr[0].0 + arr[1].1;",
+        "    let r = &t;",
+        "    acc += r.0 + r.1;",
+        "    let (p, q) = t;",
+        '    println!("{}", p * 100 + q);',
+        '    println!("{}", acc);',
+        "}",
+    ]
+    rs += body_rs
+    return "\n".join(rs) + "\n"
+
+
+def gen_intmeth_program(rng):
+    """A program built from the built-in `i64` methods. Each method desugars to
+    operators, so the shapes that matter are the receiver being a non-trivial
+    expression (evaluated once), the `i64::MIN` edge for `abs`/`signum`, and a
+    method chained onto another. Operands go through `gen_i64` so they are typed
+    `i64` in both compilers (an unsuffixed literal receiver is ambiguous in
+    rustc)."""
+    def recv():
+        return gen_i64(rng, 1)
+
+    def divisor():
+        """A divisor for the euclidean methods. A zero divisor traps in both
+        compilers (both write the message and exit 101), so it is included but
+        rare; `MIN`/`MAX` reach the rounding arms."""
+        r = rng.random()
+        if r < 0.08:
+            return "0"
+        if r < 0.28:
+            return rng.choice(["1", "-1", "2", "-2", "3", "-3", "7", "-7"])
+        if r < 0.42:
+            return rng.choice(["MIN", "MAX"])
+        return gen_i64(rng, 1)
+
+    def bounds():
+        """A `(min, max)` pair with `min <= max`, so `clamp` does not trap.
+        `MIN`/`MAX` appear often, exercising the comparison arms at the i64
+        edges; the two are ordered by their numeric value, since the names are
+        opaque to Python's sort."""
+        order = {"MIN": -2**63, "MAX": 2**63 - 1}
+
+        def key(v):
+            return order[v] if v in order else int(v)
+
+        vals = ["MIN", "-100", "-7", "-3", "-1", "0", "1", "3", "7", "100", "MAX"]
+        a, b = rng.sample(vals, 2)
+        return (a, b) if key(a) <= key(b) else (b, a)
+
+    def call():
+        k = rng.random()
+        if k < 0.18:
+            return f"({recv()}).abs()"
+        if k < 0.32:
+            return f"({recv()}).signum()"
+        if k < 0.48:
+            return f"({recv()}).min({gen_i64(rng, 1)})"
+        if k < 0.64:
+            return f"({recv()}).max({gen_i64(rng, 1)})"
+        if k < 0.78:
+            lo, hi = bounds()
+            return f"({recv()}).clamp({lo}, {hi})"
+        if k < 0.88:
+            # A bit method. Each lowers to a runtime helper rather than
+            # operators, so the receiver must be typed `i64` in rustc
+            # (`count_ones` exists on every integer width, so an unsuffixed
+            # literal would be ambiguous); `recv` is a variable or call. The
+            # `*_ones` forms reuse the zero-count helpers on `!x`.
+            m = rng.choice([
+                "count_ones", "leading_zeros", "trailing_zeros",
+                "leading_ones", "trailing_ones", "swap_bytes", "reverse_bits",
+                "count_zeros",
+            ])
+            return f"({recv()}).{m}()"
+        if k < 0.92:
+            # A rotate: the count is a small non-negative literal, so the same
+            # source is valid in rmc (`i64` count) and rustc (`u32` count). The
+            # `64`/`65` counts exercise the hardware `% 64` mask.
+            m = rng.choice(["rotate_left", "rotate_right"])
+            n = rng.choice(["0", "1", "7", "31", "63", "64", "65"])
+            return f"({recv()}).{m}({n})"
+        if k < 0.97:
+            # `midpoint`: the argument is a full `i64`, and `MIN`/`MAX` are
+            # included because the mean is the one method that would overflow if
+            # it summed naively.
+            return f"({recv()}).midpoint({gen_i64(rng, 1)})"
+        m = rng.choice(["div_euclid", "rem_euclid"])
+        return f"({recv()}).{m}({divisor()})"
+
+    def pred():
+        """A `bool`-valued method, cast to `i64` so it prints like the rest."""
+        m = rng.choice(["is_positive", "is_negative"])
+        return f"(({recv()}).{m}() as i64)"
+
+    exprs = [call() for _ in range(6)] + [pred() for _ in range(4)]
+    # A constant `i64::MIN` exercises `abs` (maps to itself) and `signum` (-1);
+    # it is negative and not positive. `i64::MAX` is the mirror.
+    exprs.append("(MIN).abs()")
+    exprs.append("(MIN).signum()")
+    exprs.append("(MIN).min(0)")
+    exprs.append("(MIN).max(0)")
+    exprs.append("(MIN).is_negative() as i64")
+    exprs.append("(MIN).is_positive() as i64")
+    exprs.append("(MAX).is_positive() as i64")
+    exprs.append("(MAX).is_negative() as i64")
+    # The euclidean rounding arms, pinned: `MIN` as the dividend with a divisor
+    # that leaves a negative remainder (`q + 1`), and `MIN`/`MAX` as the divisor
+    # (where the `r - MIN` arm would overflow if it ran, but never does).
+    exprs.append("(MIN).div_euclid(3)")
+    exprs.append("(MIN).rem_euclid(3)")
+    exprs.append("(MIN).div_euclid(-3)")
+    exprs.append("(MIN).rem_euclid(-3)")
+    exprs.append("(MIN).div_euclid(MIN)")
+    exprs.append("(MIN).rem_euclid(MIN)")
+    exprs.append("(MAX).div_euclid(-2)")
+    exprs.append("(MAX).rem_euclid(-2)")
+    exprs.append("(7).div_euclid(MIN)")
+    exprs.append("(7).rem_euclid(MIN)")
+    # `clamp`'s three outcomes pinned: below the low bound, above the high
+    # bound, and inside; the low/high tie returns the bound; `MIN`/`MAX` as
+    # bounds exercise the comparisons at the i64 edges.
+    exprs.append("(MIN).clamp(MIN, MAX)")
+    exprs.append("(MAX).clamp(MIN, MAX)")
+    exprs.append("(0).clamp(MIN, MAX)")
+    exprs.append("(-5).clamp(0, 10)")
+    exprs.append("(15).clamp(0, 10)")
+    exprs.append("(5).clamp(0, 10)")
+    exprs.append("(7).clamp(7, 9)")
+    exprs.append("(3).clamp(0, 3)")
+    exprs.append("(MIN).clamp(MAX, MAX)")
+    exprs.append("(MAX).clamp(MIN, MIN)")
+    # Zero is neither positive nor negative.
+    exprs.append("(0).is_positive() as i64")
+    exprs.append("(0).is_negative() as i64")
+    # The bit methods, pinned at the edges: `ZERO` is all zeros (64 leading and
+    # trailing zeros, no set bits), `MIN` has one bit set at the top, `MAX` has
+    # 63 set bits and one leading zero, and `ONES` is all ones. Named consts,
+    # not literals: an unsuffixed literal receiver is ambiguous in rustc
+    # (`count_ones` exists at every integer width).
+    for m in [
+        "count_ones", "leading_zeros", "trailing_zeros",
+        "leading_ones", "trailing_ones", "swap_bytes", "reverse_bits",
+        "count_zeros",
+    ]:
+        exprs.append(f"(ZERO).{m}()")
+        exprs.append(f"(MIN).{m}()")
+        exprs.append(f"(MAX).{m}()")
+        exprs.append(f"(ONES).{m}()")
+    # The rotates, pinned at the edges and at the count-mask boundaries: `64`
+    # is a full turn (the identity), `65` wraps to `1`, `0` is the identity, and
+    # `63` is the largest real rotation.
+    for m in ["rotate_left", "rotate_right"]:
+        for n in ["0", "1", "63", "64", "65"]:
+            for v in ["ZERO", "MIN", "MAX", "ONES"]:
+                exprs.append(f"({v}).{m}({n})")
+    # A chain: the outer method's receiver is another method call, so the inner
+    # result flows into the helper as a computed value.
+    exprs.append("(MAX).count_ones().trailing_zeros()")
+    exprs.append("(MIN).leading_zeros().count_ones()")
+    exprs.append("(ONES).swap_bytes().reverse_bits()")
+    exprs.append("(MIN).reverse_bits().leading_ones()")
+    exprs.append("(ONES).rotate_left(13).count_ones()")
+    exprs.append("(MIN).rotate_right(1).count_zeros()")
+    # `midpoint` at the edges: a same-sign pair would overflow a naive sum, so
+    # `(MIN).midpoint(MIN)` and `(MAX).midpoint(MAX)` pin the unbounded-sum
+    # behaviour, and the mixed-sign pairs pin the rounding direction.
+    for a in ["ZERO", "MIN", "MAX", "ONES"]:
+        for b in ["ZERO", "MIN", "MAX", "ONES"]:
+            exprs.append(f"({a}).midpoint({b})")
+    exprs.append("(MIN).midpoint(MAX)")
+    exprs.append("(MAX).midpoint(MIN)")
+    exprs.append("(h(1)).midpoint(MIN)")
+    exprs.append("(MIN).midpoint(1)")
+    exprs.append("(MAX).midpoint(-1)")
+    exprs.append("(h(-1)).midpoint(MAX)")
+    # A chain, so the outer method's receiver is another method call.
+    exprs.append(f"({call()}).min({call()})")
+    exprs.append(f"({call()}).is_positive() as i64")
+    exprs.append(f"({call()}).is_negative() as i64")
+    rs = [
+        "fn h(x: i64) -> i64 { println!(\"{}\", x); return x; }",
+        "const MIN: i64 = -9223372036854775808;",
+        "const MAX: i64 = 9223372036854775807;",
+        "const ZERO: i64 = 0;",
+        "const ONES: i64 = -1;",
+        "fn main() {",
+        "    let args: Vec<i64> = std::env::args().skip(1).map(|s| s.parse().unwrap()).collect();",
+        "    let a: i64 = args[0];",
+        "    let b: i64 = args[1];",
+        "    let c: i64 = args[2];",
+    ]
+    for e in exprs:
+        rs.append(f'    println!("{{}}", {e});')
+    rs.append("}")
+    return "\n".join(rs) + "\n"
 
 
 def gen_ref_program(rng):
@@ -1765,57 +1821,6 @@ def gen_ref_program(rng):
     f0 = inner[0]
     k = rng.randint(1, 9)
 
-    rms = [
-        "fn seed(x: i64) -> i64 { return x * 7 + 1; }",
-        f"struct Inner {{ {idecl} }}",
-        f"struct Outer {{ s: i64, mid: Inner, arr: [i64; {na}] }}",
-        "fn inc(r: &mut i64) { *r = *r + 1; }",
-        "fn addto(r: &mut i64, v: i64) { *r = *r + v; }",
-        "fn twice(r: &mut i64) { inc(r); inc(r); }",
-        "fn get(r: &i64) -> i64 { return *r; }",
-        f"fn sumfields(r: &Outer) -> i64 {{ return {sumf}; }}",
-        f"fn setfield(r: &mut Outer, v: i64) {{ r.s = r.s + v; r.mid.{f0} = r.mid.{f0} + v; }}",
-        f"fn sumarr(a: &[i64; {na}]) -> i64 {{ let mut s: i64 = 0; let mut i: i64 = 0; "
-        f"while i < {na} {{ s = s + a[i]; i = i + 1; }} return s; }}",
-        "fn main() -> i64 {",
-        f"    let base: i64 = seed({k});",
-        "    let mut acc: i64 = 0;",
-        # A reference to a scalar local, written through directly and by callee.
-        "    let mut x: i64 = base;",
-        "    let r: &mut i64 = &mut x;",
-        "    *r = *r + 3;",
-        "    inc(&mut x);",
-        "    twice(&mut x);",
-        "    acc = acc + x + get(&x);",
-        # A reference to a struct field, including a nested one.
-        f"    let mut o: Outer = Outer {{ s: base, mid: Inner {{ {inner_lit} }}, arr: [{arr_lit}] }};",
-        "    addto(&mut o.s, 5);",
-        f"    inc(&mut o.mid.{f0});",
-        f"    acc = acc + o.s + o.mid.{f0};",
-        # A reference to an array element.
-        f"    let mut a: [i64; {na}] = [{arr_lit}];",
-        "    inc(&mut a[0]);",
-        f"    addto(&mut a[{na - 1}], 9);",
-        f"    acc = acc + a[0] + a[{na - 1}];",
-        # Read and write a whole aggregate through a reference.
-        "    acc = acc + sumfields(&o);",
-        "    setfield(&mut o, 7);",
-        f"    acc = acc + o.s + o.mid.{f0};",
-        "    acc = acc + sumarr(&a);",
-        # A reference to a nested array element.
-        f"    let mut m: [[i64; {c2}]; {r2}] = [{grid_lit}];",
-        f"    inc(&mut m[{r2 - 1}][{c2 - 1}]);",
-        f"    acc = acc + m[0][0] + m[{r2 - 1}][{c2 - 1}];",
-        # A reference local that is the destination of an accumulator update.
-        "    let rl: &mut i64 = &mut acc;",
-        "    *rl = *rl + 1;",
-        "    let mut y: i64 = base;",
-        "    twice(&mut y);",
-        "    acc = acc + y;",
-        "    print_i64(acc);",
-        "    return 0;",
-        "}",
-    ]
     rs = [
         "fn seed(x: i64) -> i64 { x * 7 + 1 }",
         f"struct Inner {{ {idecl} }}",
@@ -1824,6 +1829,8 @@ def gen_ref_program(rng):
         "fn addto(r: &mut i64, v: i64) { *r += v; }",
         "fn twice(r: &mut i64) { inc(r); inc(r); }",
         "fn get(r: &i64) -> i64 { *r }",
+        "fn byrefval(x: i64) -> i64 { let r = &x; *r * 2 + 1 }",
+        "fn byrefmut(mut x: i64) -> i64 { let r = &mut x; *r += 3; x }",
         f"fn sumfields(r: &Outer) -> i64 {{ {sumf} }}",
         f"fn setfield(r: &mut Outer, v: i64) {{ r.s += v; r.mid.{f0} += v; }}",
         f"fn sumarr(a: &[i64; {na}]) -> i64 {{ let mut s = 0i64; let mut i = 0usize; "
@@ -1857,10 +1864,12 @@ def gen_ref_program(rng):
         "    let mut y: i64 = base;",
         "    twice(&mut y);",
         "    acc += y;",
+        "    acc += byrefval(4) + byrefval(base);",
+        "    acc += byrefmut(4) + byrefmut(base) + y;",
         '    println!("{}", acc);',
         "}",
     ]
-    return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
+    return "\n".join(rs) + "\n"
 
 
 def gen_pat_program(rng):
@@ -1904,95 +1913,6 @@ def gen_pat_program(rng):
     # then disagree on which arm fires.
     s0, s1 = gen_str_lit(rng), gen_str_lit(rng)
 
-    rms = [
-        "fn side(k: i64) -> i64 { print_i64(k); return k * 3 + 1; }",
-        f"fn classify(x: i64) -> i64 {{ return match x {{ {neg} => 10, 0 => 20, 1 => 30, _ => 40 }}; }}",
-        "fn bindit(x: i64) -> i64 { return match x { y => y * 2 + 1 }; }",
-        f"fn bscr(x: i64) -> i64 {{ return match x + {k} {{ {v} => 100, _ => 0 }}; }}",
-        f"fn cscr(k: i64) -> i64 {{ return match side(k) {{ {v} => 5, _ => 7 }}; }}",
-        f"fn mscr(k: i64) -> i64 {{ return match side(k) {{ {v} => 11, {v + 1} => 22, {v + 2} => 33, _ => 44 }}; }}",
-        f"fn iscr(a: [i64; 4], i: i64) -> i64 {{ return match a[i] {{ {v} => 70, _ => 0 }}; }}",
-        "fn nested(x: i64) -> i64 { return match x { 0 => match x + 5 { 5 => 100, _ => 101 }, _ => match x { 2 => 200, _ => 201 } }; }",
-        "fn bmatch(b: bool) -> i64 { return match b { true => 7, false => 9 }; }",
-        f"enum Color {{ {color_def} }}",
-        f"fn color_code(c: Color) -> i64 {{ return match c {{ {color_arms} }}; }}",
-        "enum Shape { Dot, Line(i64), Rect(i64, i64) }",
-        "fn area(s: Shape) -> i64 { return match s { Shape::Dot => 0, Shape::Line(w) => w, Shape::Rect(w, h) => w * h }; }",
-        # Explicit discriminants: the tag is the written value, not the
-        # variant's index, so a `match` arm or an `as i64` that still used the
-        # index would read a different number.
-        "enum Disc { D0 = 4, D1, D2 = 10 }",
-        "fn disc_code(d: Disc) -> i64 { return match d { Disc::D0 => 1, Disc::D1 => 2, Disc::D2 => 3 }; }",
-        "fn disc_cast(d: Disc) -> i64 { return d as i64; }",
-        "struct S { a: i64, b: i64 }",
-        f"fn fscr(s: S) -> i64 {{ return match s.b {{ {v} => 20, _ => 0 }}; }}",
-        # Struct patterns: irrefutable, so the arm needs no `_`, and the two
-        # bindings read the two fields. A renamed field and a `..` rest are
-        # generated too, so the shorthand, the rename and the dropped field all
-        # reach codegen.
-        "fn spbind(s: S) -> i64 { return match s { S { a, b } => a * 10 + b }; }",
-        "fn sprename(s: S) -> i64 { return match s { S { a: x, b: _ } => x + 1 }; }",
-        "fn sprest(s: S) -> i64 { return match s { S { b, .. } => b * 3 }; }",
-        f"fn spguard(s: S) -> i64 {{ return match s {{ S {{ a, b }} if a > b => 1, _ => 0 }}; }}",
-        f"fn spiflet(s: S) -> i64 {{ if let S {{ a, b }} = s {{ a - b }} else {{ 0 }} }}",
-        f"fn iflet_int(x: i64) -> i64 {{ if let {v} = x {{ 50 }} else {{ 60 }} }}",
-        "fn iflet_bind(x: i64) -> i64 { if let y = x { y + 1 } else { 0 } }",
-        f"fn iflet_side(k: i64) -> i64 {{ if let {v} = side(k) {{ 5 }} else {{ 7 }} }}",
-        f"fn iflet_color(c: Color) -> i64 {{ if let Color::{colors[0]} = c {{ 1 }} else {{ 2 }} }}",
-        "fn iflet_rect(s: Shape) -> i64 { if let Shape::Rect(w, h) = s { w * h } else { 0 } }",
-        f"fn iflet_chain(x: i64) -> i64 {{ if let {v} = x {{ 10 }} else if let {v + 1} = x {{ 20 }} else {{ 30 }} }}",
-        f"fn orpat(x: i64) -> i64 {{ return match x {{ {v} | {v + 1} | {v + 2} => 77, _ => 0 }}; }}",
-        f"fn orpat_color(c: Color) -> i64 {{ return match c {{ {or_arms} }}; }}",
-        f"fn rangepat(x: i64) -> i64 {{ return match x {{ {rlo}..={rhi} => 88, _ => 0 }}; }}",
-        f"fn range_excl(x: i64) -> i64 {{ return match x {{ {rlo}..{rhi} => 99, _ => 0 }}; }}",
-        f"fn orrange(x: i64) -> i64 {{ return match x {{ {rlo}..={rhi} => 1, {v} | {v + 5} => 2, _ => 0 }}; }}",
-        f"fn oriflet(x: i64) -> i64 {{ if let {v} | {v + 1} = x {{ 5 }} else {{ 6 }} }}",
-        f"fn rangeiflet(x: i64) -> i64 {{ if let {rlo}..={rhi} = x {{ 7 }} else {{ 8 }} }}",
-        f"fn strmatch(sel: i64) -> i64 {{ let s = if sel == 0 {{ {s0} }} else {{ {s1} }}; return match s {{ {s0} => 1, {s1} => 2, _ => 3 }}; }}",
-        f"fn stror(sel: i64) -> i64 {{ let s = if sel == 0 {{ {s0} }} else {{ {s1} }}; return match s {{ {s0} | {s1} => 1, _ => 2 }}; }}",
-        f"fn striflet(sel: i64) -> i64 {{ let s = if sel == 0 {{ {s0} }} else {{ {s1} }}; if let {s0} = s {{ 5 }} else {{ 6 }} }}",
-        f"fn strbind(sel: i64) -> i64 {{ let s = if sel == 0 {{ {s0} }} else {{ {s1} }}; return match s {{ {s0} => 1, other => if other == {s1} {{ 2 }} else {{ 3 }} }}; }}",
-        f"fn armassign(x: i64) -> i64 {{ let mut a: i64 = 100; match x % 3 {{ 0 => a = a + 1, 1 => a += 10, _ => a = a - 5 }} return a; }}",
-        f"fn gguard(x: i64) -> i64 {{ return match x {{ n if n > {v} => 100, n if n > {v} - 3 => 200, _ => 0 }}; }}",
-        f"fn gbind(x: i64) -> i64 {{ return match x {{ n if n % 2 == 1 => n * 3, _ => 0 }}; }}",
-        f"fn gcolor(c: Color) -> i64 {{ return match c {{ Color::{colors[0]} if c as i64 == 0 => 1, _ => 2 }}; }}",
-        "fn gshape(s: Shape) -> i64 { return match s { Shape::Line(w) if w > 3 => w, Shape::Line(w) => 0 - w, _ => 0 }; }",
-        f"fn gorpat(x: i64) -> i64 {{ return match x {{ {v} | {v + 1} if x > {v} => 1, _ => 0 }}; }}",
-        f"fn grange(x: i64) -> i64 {{ return match x {{ n if n > 0 && n < {v + 5} => 1, _ => 0 }}; }}",
-        "fn gbool(b: bool) -> i64 { return match b { true if b => 1, _ => 0 }; }",
-        f"fn gwild(x: i64) -> i64 {{ return match x {{ _ if x == {v} => 9, _ => 8 }}; }}",
-        "fn main() -> i64 {",
-        "    let mut acc: i64 = 0;",
-        f"    let arr: [i64; 4] = [{a0}, {a1}, {v}, {k}];",
-        "    let mut i: i64 = 0;",
-        f"    while i < {bound} {{",
-        f"        let c: Color = match i % {ncolors} {{ {color_pick}, _ => Color::{colors[0]} }};",
-        "        acc = acc + color_code(c) * 1000;",
-        "        let s: Shape = match i % 3 { 0 => Shape::Dot, 1 => Shape::Line(i + 2), _ => Shape::Rect(i + 1, i + 2) };",
-        "        acc = acc + area(s);",
-        "        acc = acc + classify(i) + bindit(i);",
-        "        acc = acc + bscr(i) + cscr(i) + mscr(i) + iscr(arr, i % 4) + fscr(S { a: i, b: i % 5 });",
-        "        let sv: S = S { a: i, b: i % 5 };",
-        "        acc = acc + spbind(sv) + sprename(sv) + sprest(sv) + spguard(sv) + spiflet(sv);",
-        "        acc = acc + nested(i % 3);",
-        "        acc = acc + bmatch(i % 2 == 0);",
-        f"        acc = acc + bmatch(side(i) > {v});",
-        "        acc = acc + iflet_int(i) + iflet_bind(i) + iflet_side(i) + iflet_chain(i);",
-        "        acc = acc + orpat(i) + orpat_color(c) + rangepat(i) + range_excl(i);",
-        "        acc = acc + orrange(i) + oriflet(i) + rangeiflet(i);",
-        "        acc = acc + iflet_color(c) + iflet_rect(s);",
-        "        acc = acc + strmatch(i % 2) + stror(i % 2) + striflet(i % 2) + strbind(i % 2);",
-        "        acc = acc + armassign(i);",
-        "        acc = acc + gguard(i) + gbind(i) + gorpat(i) + grange(i);",
-        "        acc = acc + gcolor(c) + gshape(s) + gbool(i % 2 == 0) + gwild(i);",
-        "        let d: Disc = match i % 3 { 0 => Disc::D0, 1 => Disc::D1, _ => Disc::D2 };",
-        "        acc = acc + disc_code(d) * 100 + disc_cast(d);",
-        "        i = i + 1;",
-        "    }",
-        "    print_i64(acc);",
-        "    return 0;",
-        "}",
-    ]
     rs = [
         'fn side(k: i64) -> i64 { println!("{}", k); k * 3 + 1 }',
         f"fn classify(x: i64) -> i64 {{ match x {{ {neg} => 10, 0 => 20, 1 => 30, _ => 40 }} }}",
@@ -2078,7 +1998,7 @@ def gen_pat_program(rng):
         '    println!("{}", acc);',
         "}",
     ]
-    return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
+    return "\n".join(rs) + "\n"
 
 
 def gen_opt_program(rng):
@@ -2126,33 +2046,6 @@ def gen_opt_program(rng):
         "print_i64(licmfn(a0, b0) + dbl(rec(5)));",
     ])
 
-    rms = [
-        f"fn rec(n: i64) -> i64 {{ if {cond} {{ return {guard}; }} return rec({g}) {op} rec({h}); }}",
-        "fn id(x: i64) -> i64 { return x; }",
-        "fn bump(mut x: i64) -> i64 { x = x + 1; return x + x; }",
-        "fn dbl(x: i64) -> i64 { return x + x; }",
-        "fn licmfn(a: i64, b: i64) -> i64 {",
-        "    let mut i: i64 = 0;",
-        "    let mut t: i64 = 0;",
-        "    let mut w: i64 = a;",
-        "    while i < %d {" % bound,
-        "        t = t + %s;" % inv,
-        "        t = t + (i * 3);",
-        "        t = t + w;",
-        "        w = w + 1;",
-        "        i = i + 1;",
-        "    }",
-        "    return t;",
-        "}",
-        "fn main() -> i64 {",
-        "    let a0: i64 = %d;" % a0,
-        "    let b0: i64 = %d;" % b0,
-        "    print_i64(rec(%d));" % n0,
-        "    print_i64(licmfn(a0, b0));",
-        "    " + extra,
-        "    return 0;",
-        "}",
-    ]
     rs = [
         f"fn rec(n: i64) -> i64 {{ if {cond} {{ return {guard}; }} rec({g}) {op} rec({h}) }}",
         "fn id(x: i64) -> i64 { x }",
@@ -2179,7 +2072,7 @@ def gen_opt_program(rng):
         '    println!("{}", ' + extra[len("print_i64("):-2] + ");",
         "}",
     ]
-    return "\n".join(rms), "\n".join(rs)
+    return "\n".join(rs)
 
 
 # ------------------------------------------------------------- order mode
@@ -2194,10 +2087,8 @@ def gen_order_program(rng):
     their own `li` calls. The array is printed at the end so a wrong order or a
     lost store shows up.
     """
-    rms = ["fn li(t: i64) -> i64 { print_i64(t); return t; }"]
     rs = ['fn li(t: i64) -> i64 { println!("{}", t); t }']
     init = ", ".join(str(rng.randint(0, 9)) for _ in range(8))
-    rms += ["fn main() -> i64 {", f"    let mut a: [i64; 8] = [{init}];"]
     rs += ["fn main() {", f"    let mut a: [i64; 8] = [{init}];"]
     # `=` and every compound operator: a compound assignment desugars to a read,
     # a combine and a write, so its operand order is its own path.
@@ -2208,44 +2099,34 @@ def gen_order_program(rng):
         shape = rng.choice(["v", "v+v", "v*v"])
         a, b = rng.randint(0, 9), rng.randint(0, 9)
         val = {"v": f"li({a})", "v+v": f"li({a}) + li({b})", "v*v": f"li({a}) * li({b})"}[shape]
-        rms.append(f"    a[li({idx})] {op} {val};")
         rs.append(f"    a[li({idx}) as usize] {op} {val};")
     # A plain assignment whose target index is a variable but whose value calls:
     # the place has no effect, so only the value's order against nothing matters.
-    rms.append("    let mut i: i64 = 3;")
     rs.append("    let mut i: i64 = 3;")
-    rms.append("    a[i] = li(41);")
     rs.append("    a[i as usize] = li(41);")
     # Assignments through a `&mut` array and a `&mut` scalar: these take the
     # generic store-through-address path rather than the array-local one.
-    rms.append("    let r: &mut [i64; 8] = &mut a;")
     rs.append("    let r = &mut a;")
     for _ in range(rng.randint(1, 2)):
         idx, val = rng.randint(0, 7), rng.randint(0, 9)
-        rms.append(f"    r[li({idx})] = li({val});")
         rs.append(f"    r[li({idx}) as usize] = li({val});")
-    rms.append("    let mut x: i64 = 0;")
     rs.append("    let mut x: i64 = 0;")
-    rms.append("    let p: &mut i64 = &mut x;")
     rs.append("    let p = &mut x;")
-    rms.append("    *p = li(13);")
     rs.append("    *p = li(13);")
-    rms.append("    a[i] = a[i] + x;")
     rs.append("    a[i as usize] += x;")
     # A side-effecting value with a side-effecting index in one expression.
-    rms.append("    a[li(i + 1)] = li(a[li(0)]);")
     rs.append("    a[li(i + 1) as usize] = li(a[li(0) as usize]);")
-    rms.append("    let mut acc: i64 = 0;")
+    # A place that writes a local without calling: `contains_call` misses it, so
+    # the value must still be captured before the place runs.
+    for _ in range(rng.randint(1, 2)):
+        idx, a1, a2 = rng.randint(0, 7), rng.randint(0, 9), rng.randint(0, 9)
+        rs.append(f"    a[{{ x = li({a1}); {idx} }} as usize] = x + {a2};")
     rs.append("    let mut acc: i64 = 0;")
     for k in range(8):
-        rms.append(f"    acc = acc + a[{k}] * {k + 1};")
         rs.append(f"    acc += a[{k}] * {k + 1};")
-    rms.append("    print_i64(acc);")
     rs.append('    println!("{}", acc);')
-    rms.append("    return 0;")
     rs.append("}")
-    rms.append("}")
-    return "\n".join(rms), "\n".join(rs)
+    return "\n".join(rs)
 
 
 # -------------------------------------------------------------- robust mode
@@ -2358,12 +2239,12 @@ def robust_corpus():
 
 def run_robust():
     # Per-process temp dir: two fuzz runs sharing one would overwrite each
-    # other's p.s/p.rms and report a bogus assembler failure.
+    # other's p.s/p.rs and report a bogus assembler failure.
     tmp = f"/tmp/rmc-fuzz-{os.getpid()}"
     os.makedirs(tmp, exist_ok=True)
     failures = 0
     for name, data in robust_corpus().items():
-        path = f"{tmp}/{name}.rms"
+        path = f"{tmp}/{name}.rs"
         open(path, "wb").write(data)
         p = run([RMC, path, "-o", f"{tmp}/o.bin"])
         # A signal (negative return code) or a panic message is a crash.
@@ -2379,204 +2260,6 @@ def run_robust():
     return 1 if failures else 0
 
 
-# ---------------------------------------------------- MIR-path robust mode
-
-def mir_robust_corpus():
-    """`.rs` programs the rustc-MIR back end may not support. Each must produce
-    a clean error (exit 1) with no panic and no signal. The back end parses
-    rustc's MIR text, so the failure mode a user hits first is not a syntax
-    error in their own source but a MIR shape the parser does not model; this
-    corpus is weighted toward the Rust constructs that produce those shapes
-    (formatting, the standard-library containers, closures, floating point,
-    traits) plus malformed programs that must fail at the rustc front end."""
-    return {
-        # --- ordinary programs whose MIR the back end does not model ---
-        "fmt_display": 'fn main() { let n = 42; println!("n = {}", n); }\n',
-        "fmt_debug": 'fn main() { let t = (1, 2); println!("{:?}", t); }\n',
-        "fmt_hex": 'fn main() { println!("{:#x}", 255); }\n',
-        "fmt_width": 'fn main() { println!("{:>5}", 1); }\n',
-        "fmt_named": 'fn main() { println!("{n}", n = 3); }\n',
-        "print_macro": 'fn main() { print!("no newline"); }\n',
-        "eprintln_macro": 'fn main() { eprintln!("to stderr"); }\n',
-        "format_macro": 'fn main() { let s = format!("{}-{}", 1, 2); println!("{}", s); }\n',
-        "vec_push": "fn main() { let mut v = Vec::new(); v.push(1); }\n",
-        "vec_macro": "fn main() { let v = vec![1, 2, 3]; let _ = v[0]; }\n",
-        "string_new": "fn main() { let s = String::new(); }\n",
-        "box_new": "fn main() { let b = Box::new(5); }\n",
-        "hashmap": "use std::collections::HashMap;\nfn main() { let mut m = HashMap::new(); m.insert(1, 2); }\n",
-        "closure": "fn main() { let f = |x: i64| x + 1; let _ = f(2); }\n",
-        "closure_capture": "fn main() { let n = 3; let f = |x: i64| x + n; let _ = f(2); }\n",
-        "float": "fn main() { let x = 1.5; let _ = x * 2.0; }\n",
-        "float_fmt": 'fn main() { println!("{:.2}", 3.14159); }\n',
-        "i128": "fn main() { let a: i128 = 1; let _ = a; }\n",
-        "trait_method": "trait S { fn a(&self) -> i64; }\nstruct Q;\nimpl S for Q { fn a(&self) -> i64 { 3 } }\nfn main() { let _ = Q.a(); }\n",
-        "generic_fn": "fn id<T>(x: T) -> T { x }\nfn main() { let _ = id(5); }\n",
-        "dyn_trait": "trait S { fn a(&self) -> i64; }\nfn f(s: &dyn S) -> i64 { s.a() }\nstruct Q;\nimpl S for Q { fn a(&self) -> i64 { 1 } }\nfn main() { let _ = f(&Q); }\n",
-        "iterator_chain": "fn main() { let s: i64 = (1..10).filter(|x| x % 2 == 0).sum(); let _ = s; }\n",
-        "slice_len": 'fn main() { let s = "abc"; let _ = s.len(); }\n',
-        "option_debug": "fn main() { let o: Option<i64> = Some(5); println!(\"{:?}\", o); }\n",
-        "panic_macro": 'fn main() { panic!("boom"); }\n',
-        "assert_macro": "fn main() { assert!(1 == 2); }\n",
-        "derive_debug": '#[derive(Debug)]\nstruct P { x: i64 }\nfn main() { println!("{:?}", P { x: 1 }); }\n',
-        "string_index": 'fn main() { let s = "hello"; let _ = &s[1..3]; }\n',
-        "char_type": "fn main() { let c = 'x'; println!(\"{}\", c); }\n",
-        # --- programs rustc itself rejects: must fail, cleanly ---
-        "rustc_reject_type": "fn main() { let x: i64 = \"str\"; }\n",
-        "rustc_reject_move": "fn main() { let s = String::from(\"a\"); let t = s; let u = s; }\n",
-        "rustc_reject_undef": "fn main() { undefined_function(); }\n",
-        "rustc_reject_main_sig": "fn main() -> i64 { 0 }\n",
-        "rustc_reject_no_main": "fn f() -> i64 { 0 }\n",
-        "rustc_reject_syntax": "fn main( { }\n",
-        "rustc_reject_empty": "",
-        "rustc_reject_lone": "fn",
-        # --- malformed that must not crash the MIR parser either ---
-        "truncated_fn": "fn main() {\n",
-        "stray_brace": "}\n",
-        "binary_garbage": "\x00\x01\x02\x03",
-        "deep_nest": "fn main() { let x = " + "(" * 2000 + "1" + ")" * 2000 + "; }\n",
-        "huge_literal": "fn main() { let x: i64 = " + "9" * 3000 + "; }\n",
-    }
-
-
-def run_mir_robust():
-    """Compile each `.rs` corpus entry through the MIR path and require a clean
-    failure: exit 1, no signal, no panic, no stack overflow. A program that
-    compiles is fine too (exit 0), as long as it does not crash. Unlike
-    `robust`, which is about rmc's own parser, this exercises the MIR parser and
-    back end, where a rejected construct must still be a diagnostic."""
-    tmp = f"/tmp/rmc-fuzz-mirrobust-{os.getpid()}"
-    os.makedirs(tmp, exist_ok=True)
-    failures = 0
-    compiled = 0
-    for name, src in mir_robust_corpus().items():
-        path = f"{tmp}/{name}.rs"
-        with open(path, "w") as f:
-            f.write(src)
-        p = run([RMC, path, "-o", f"{tmp}/{name}.bin"])
-        crashed = (p.returncode < 0 or b"panicked" in p.stderr
-                   or b"overflowed its stack" in p.stderr)
-        if crashed:
-            print(f"[mirrobust] {name}: CRASH (exit {p.returncode}) "
-                  f"{p.stderr.decode(errors='replace')[:200]}")
-            failures += 1
-        elif p.returncode not in (0, 1):
-            print(f"[mirrobust] {name}: unexpected exit {p.returncode}")
-            failures += 1
-        elif p.returncode == 0:
-            compiled += 1
-    if failures == 0:
-        n = len(mir_robust_corpus())
-        print(f"mirrobust: all {n} inputs handled cleanly ({compiled} compiled, "
-              f"{n - compiled} rejected with a diagnostic)")
-    return 1 if failures else 0
-
-
-# ------------------------------------------------------ MIR text mutate mode
-
-def mirmut_seeds():
-    """Real `rustc --emit=mir` text for programs the back end *does* compile.
-    These are the seeds the mutator perturbs: valid MIR is the only input that
-    reaches the back end's internal invariants, which is exactly where an
-    `unreachable!` would turn a malformed input into a panic."""
-    seeds = {
-        "add": "fn main() -> i64 {\n    let mut _0: i64;\n\n    bb0: {\n        _0 = const 7_i64;\n        return;\n    }\n}\n",
-        "arith": "fn main() -> i64 {\n    let mut _0: i64;\n    let mut _1: i64;\n    let mut _2: i64;\n\n    bb0: {\n        _1 = const 3_i64;\n        _2 = const 4_i64;\n        _0 = Add(move _1, move _2);\n        return;\n    }\n}\n",
-        "cmp": "fn main() -> i64 {\n    let mut _0: i64;\n    let mut _1: bool;\n\n    bb0: {\n        _1 = const 1_i64 < const 2_i64;\n        _0 = const 0_i64;\n        return;\n    }\n}\n",
-        "call": "fn add(a: i64, b: i64) -> i64 {\n    let mut _0: i64;\n\n    bb0: {\n        _0 = Add(move a, move b);\n        return;\n    }\n}\n\nfn main() -> i64 {\n    let mut _0: i64;\n    let mut _1: i64;\n\n    bb0: {\n        _1 = const 2_i64;\n        _0 = add(const 1_i64, move _1) -> [return: bb1, unwind unreachable];\n    }\n\n    bb1: {\n        return;\n    }\n}\n",
-        "if": "fn main() -> i64 {\n    let mut _0: i64;\n    let mut _1: bool;\n\n    bb0: {\n        _1 = const 1_i64 < const 2_i64;\n        switchInt(move _1) -> [0: bb2, otherwise: bb1];\n    }\n\n    bb1: {\n        _0 = const 10_i64;\n        goto -> bb3;\n    }\n\n    bb2: {\n        _0 = const 20_i64;\n        goto -> bb3;\n    }\n\n    bb3: {\n        return;\n    }\n}\n",
-        "loop": "fn main() -> i64 {\n    let mut _0: i64;\n    let mut _1: i64;\n    let mut _2: bool;\n\n    bb0: {\n        _1 = const 0_i64;\n        goto -> bb1;\n    }\n\n    bb1: {\n        _2 = Lt(copy _1, const 10_i64);\n        switchInt(move _2) -> [0: bb3, otherwise: bb2];\n    }\n\n    bb2: {\n        _1 = Add(move _1, const 1_i64);\n        goto -> bb1;\n    }\n\n    bb3: {\n        _0 = move _1;\n        return;\n    }\n}\n",
-        "div": "fn main() -> i64 {\n    let mut _0: i64;\n    let mut _1: i64;\n    let mut _2: i64;\n\n    bb0: {\n        _1 = const 20_i64;\n        _2 = const 3_i64;\n        _0 = Div(move _1, move _2);\n        return;\n    }\n}\n",
-        "ref": "fn main() -> i64 {\n    let mut _0: i64;\n    let mut _1: i64;\n    let mut _2: &i64;\n\n    bb0: {\n        _1 = const 5_i64;\n        _2 = &_1;\n        _0 = (*_2);\n        return;\n    }\n}\n",
-        "struct": "struct P {\n    x: i64,\n    y: i64,\n}\n\nfn main() -> i64 {\n    let mut _0: i64;\n    let mut _1: P;\n\n    bb0: {\n        _1 = P { x: const 1_i64, y: const 2_i64 };\n        _0 = (_1.0);\n        return;\n    }\n}\n",
-        "shift": "fn main() -> i64 {\n    let mut _0: i64;\n    let mut _1: i64;\n\n    bb0: {\n        _1 = const 1_i64;\n        _0 = Shl(move _1, const 4_i32);\n        return;\n    }\n}\n",
-        "unit": "fn main() {\n    let mut _0: ();\n\n    bb0: {\n        _0 = const ();\n        return;\n    }\n}\n",
-    }
-    return seeds
-
-
-# Fragments the mutator splices in. Each is a plausible-looking MIR token that
-# is either semantically impossible (a bad jump target, a type mismatch) or
-# simply absent from the seeds (an operator or cast the parser must handle).
-MIR_TOKENS = [
-    "goto -> bb99;", "goto -> bb0;", "switchInt(move _1) -> [0: bb9, otherwise: bb8];",
-    "_0 = Div(move _1, const 0_i64);", "_0 = Rem(move _1, const 0_i64);",
-    "_0 = Add(move _0, move _0);", "_0 = Neg(move _1);", "_0 = Not(move _1);",
-    "_0 = Shl(move _1, const 200_i32);", "_0 = Shr(move _1, const 200_i32);",
-    "_0 = (_1.99);", "_0 = (*_2);", "_0 = Len((*_3));", "_0 = Discriminant(_1);",
-    "_0 = copy _1 as u8;", "_0 = move _1 as i128;", "_0 = &raw const _1;",
-    "drop(_1) -> [return: bb1, unwind unreachable];",
-    "assert(!move _1, \"overflow\") -> [success: bb1, unwind unreachable];",
-    "_0 = const 99999999999999999999999999_i64;", "_0 = const 1.5_f64;",
-    "_0 = const \"unterminated;", "unreachable;", "return;", "StorageLive(_0);",
-    "StorageDead(_0);", "_0 = Rvalue::Unsupported;", "_0 = PtrMetadata(move _1);",
-    "bb4: {", "}", "    ", "_0 = Add(move _1, const 1_i64) -> [return: bb9, unwind unreachable];",
-]
-
-
-def mutate_mir(rng, text):
-    """One random structural edit of a MIR program. Returns the mutated text."""
-    lines = text.split("\n")
-    kind = rng.randrange(5)
-    if kind == 0 and lines:  # delete a line
-        del lines[rng.randrange(len(lines))]
-    elif kind == 1:  # splice a token as a new statement line
-        at = rng.randrange(len(lines) + 1)
-        lines.insert(at, MIR_TOKENS[rng.randrange(len(MIR_TOKENS))])
-    elif kind == 2 and lines:  # duplicate a line
-        i = rng.randrange(len(lines))
-        lines.insert(i, lines[i])
-    elif kind == 3 and lines:  # truncate the program
-        lines = lines[: rng.randrange(1, len(lines) + 1)]
-    else:  # append a token to a random line
-        if lines:
-            i = rng.randrange(len(lines))
-            tok = MIR_TOKENS[rng.randrange(len(MIR_TOKENS))]
-            lines[i] = lines[i] + " " + tok
-    return "\n".join(lines)
-
-
-def run_mirmut(args):
-    """Mutate real `rustc --emit=mir` text and feed it to the `.mir` input path.
-    Every result must be a clean exit 0 (compiled) or exit 1 (diagnostic): a
-    panic, a signal, or any other status is a bug. This is the mode that
-    reaches the back end's internal invariants, which the `.rs` modes cannot
-    because rustc rejects malformed source before it ever emits MIR."""
-    tmp = f"/tmp/rmc-fuzz-mirmut-{os.getpid()}"
-    os.makedirs(tmp, exist_ok=True)
-    rng = random.Random(args.seed)
-    seeds = list(mirmut_seeds().items())
-    failures = 0
-    compiled = 0
-    for i in range(args.n):
-        name, base = seeds[rng.randrange(len(seeds))]
-        text = base
-        for _ in range(rng.randint(1, 3)):
-            text = mutate_mir(rng, text)
-        path = f"{tmp}/m{i}.mir"
-        with open(path, "w") as f:
-            f.write(text)
-        p = run([RMC, path, "-o", f"{tmp}/m{i}.bin"])
-        crashed = (p.returncode < 0 or b"panicked" in p.stderr
-                   or b"overflowed its stack" in p.stderr)
-        if crashed:
-            keep = f"{args.keep or tmp}/crash-{i}-{name}.mir"
-            os.makedirs(os.path.dirname(keep) or ".", exist_ok=True)
-            with open(keep, "w") as f:
-                f.write(text)
-            print(f"[mirmut] seed={name} #{i}: CRASH (exit {p.returncode}) "
-                  f"kept {keep}\n{p.stderr.decode(errors='replace')[:300]}")
-            failures += 1
-        elif p.returncode not in (0, 1):
-            print(f"[mirmut] seed={name} #{i}: unexpected exit {p.returncode}")
-            failures += 1
-        elif p.returncode == 0:
-            compiled += 1
-    if failures == 0:
-        print(f"mirmut: all {args.n} mutated MIR inputs handled cleanly "
-              f"({compiled} compiled, {args.n - compiled} rejected)")
-    return 1 if failures else 0
-
-
 # -------------------------------------------------------------- reject mode
 
 def reject_corpus():
@@ -2588,16 +2271,6 @@ def reject_corpus():
     `match`-boundary handling: a wildcard arm whose body is itself a `match`
     must not borrow the outer match's exhaustiveness."""
     def both(body):
-        rms = (
-            "enum E { A, B }\n"
-            "fn main() -> i64 {\n"
-            "    let a: E = E::B;\n"
-            "    let b: E = E::A;\n"
-            f"    let t: i64 = {body};\n"
-            "    print_i64(t);\n"
-            "    return 0;\n"
-            "}\n"
-        )
         rs = (
             "enum E { A, B }\n"
             "fn main() {\n"
@@ -2607,19 +2280,11 @@ def reject_corpus():
             '    println!("{}", t);\n'
             "}\n"
         )
-        return rms, rs
+        return rs
 
     def stmt(body, enum="enum E { A, B }\n", decl="let e: E = E::A;", rs_decl="let e = E::A;", rs_enum="enum E { A, B }\n"):
         """A `match` used as a statement: rmc must reject a non-exhaustive one
         just as rustc does, even though the fall-through to `()` is harmless."""
-        rms = (
-            f"{enum}"
-            "fn main() -> i64 {\n"
-            f"    {decl}\n"
-            f"    {body}\n"
-            "    return 0;\n"
-            "}\n"
-        )
         rs = (
             f"{rs_enum}"
             "fn main() {\n"
@@ -2627,9 +2292,24 @@ def reject_corpus():
             f"    {body}\n"
             "}\n"
         )
-        return rms, rs
+        return rs
 
     return {
+        # `char` literals rustc rejects: an out-of-range `\x` escape (a
+        # character's `\x` is restricted to ASCII), a non-scalar `\u{..}`, an
+        # empty literal, a bare unescaped quote, and an integer-to-`char` cast
+        # (`u8 as char` is the only integer cast rustc allows, and rmc has no
+        # `u8`).
+        "char_hex_out_of_range": "fn main() { let c = '\\xff'; println!(\"{}\", c as i64); }\n",
+        "char_u_not_scalar": "fn main() { let c = '\\u{d800}'; println!(\"{}\", c as i64); }\n",
+        "char_empty": "fn main() { let c = ''; println!(\"{}\", c as i64); }\n",
+        "char_bare_quote": "fn main() { let c = '''; println!(\"{}\", c as i64); }\n",
+        "char_from_i64_cast": "fn main() { let n: i64 = 65; let c = n as char; println!(\"{}\", c as i64); }\n",
+        # A `char` range pattern with the bounds the wrong way round, and an
+        # empty inclusive range; rustc rejects both with E0579.
+        "char_range_reversed": "fn main() { let c = 'q'; let r = match c { 'z'..'a' => 1, _ => 0 }; println!(\"{}\", r); }\n",
+        "char_range_empty_incl": "fn main() { let c = 'q'; let r = match c { 'b'..='a' => 1, _ => 0 }; println!(\"{}\", r); }\n",
+        "char_range_int_bound": "fn main() { let c = 'q'; let r = match c { 'a'..=5 => 1, _ => 0 }; println!(\"{}\", r); }\n",
         # The outer match names A and wildcards the rest; the missing B test is
         # only inside the nested match, so the outer chain is not exhaustive.
         "nested_wildcard_other": both("match a { E::A => 1, _ => match b { E::B => 2 } }"),
@@ -2670,449 +2350,269 @@ def reject_corpus():
         "stmt_guard_gap": stmt("match e { E::A if 1 == 1 => { print_i64(1); } }"),
         # Assignment to an immutable binding. rmc used to accept these and let
         # codegen write the slot; rustc rejects each with E0384.
-        "assign_immutable_let": (
-            "fn main() -> i64 { let x: i64 = 1; x = 2; return x; }\n",
-            "fn main() { let x: i64 = 1; x = 2; println!(\"{}\", x); }\n",
-        ),
-        "assign_immutable_param": (
-            "fn f(x: i64) -> i64 { x = x + 1; return x; }\n"
-            "fn main() -> i64 { return f(1); }\n",
-            "fn f(x: i64) -> i64 { x = x + 1; x }\n"
+        "assign_immutable_let": "fn main() { let x: i64 = 1; x = 2; println!(\"{}\", x); }\n",
+        "assign_immutable_param": "fn f(x: i64) -> i64 { x = x + 1; x }\n"
             "fn main() { println!(\"{}\", f(1)); }\n",
-        ),
-        "assign_immutable_compound": (
-            "fn main() -> i64 { let x: i64 = 1; x += 1; return x; }\n",
-            "fn main() { let x: i64 = 1; x += 1; println!(\"{}\", x); }\n",
-        ),
+        "assign_immutable_compound": "fn main() { let x: i64 = 1; x += 1; println!(\"{}\", x); }\n",
+        # A write to an outer immutable binding inside a nested block of a
+        # repeating loop repeats, so rustc rejects it (E0384). The nested
+        # block's continuation to the loop's back edge must be threaded in.
+        "assign_immutable_nested_if_loop": "fn flag() -> bool { true }\n"
+            "fn main() { let x: i64; while flag() { if flag() { x = 1; } } let _ = x; }\n",
+        "assign_immutable_nested_block_loop": "fn flag() -> bool { true }\n"
+            "fn main() { let x: i64; while flag() { { x = 1; } } let _ = x; }\n",
+        "assign_immutable_for_nested": "fn main() { let x: i64; for i in 0..3 { if i < 3 { x = 1; } } let _ = x; }\n",
+        # A `break` path that declares a local still carries its write to the
+        # outer binding, so a later write is a second write (E0384).
+        "assign_immutable_break_with_local": "fn cond() -> bool { true }\n"
+            "fn main() { let x: i64; while cond() { if cond() { x = 1; let y = 0; break; } } x = 2; let _ = x; }\n",
         # A read of a binding that was declared but never initialized (E0381).
-        "use_uninit_scalar": (
-            "fn main() -> i64 { let x: i64; return x; }\n",
-            "fn main() { let x: i64; println!(\"{}\", x); }\n",
-        ),
+        "use_uninit_scalar": "fn main() { let x: i64; println!(\"{}\", x); }\n",
         # An uninitialized array whose elements are written in a loop and then
         # read: rustc rejects it (it cannot see that the loop covers every
         # element), so rmc must too.
-        "use_uninit_array": (
-            "fn main() -> i64 {\n"
-            "    let mut a: [i64; 6];\n"
-            "    let mut i: i64 = 0;\n"
-            "    while i < 6 { a[i] = i + 1; i = i + 1; }\n"
-            "    return a[0];\n"
-            "}\n",
-            "fn main() {\n"
+        "use_uninit_array": "fn main() {\n"
             "    let mut a: [i64; 6];\n"
             "    let mut i: usize = 0;\n"
             "    while i < 6 { a[i] = i as i64 + 1; i += 1; }\n"
             '    println!("{}", a[0]);\n'
             "}\n",
-        ),
         # A constant index outside the array (E0080/E0608). rmc used to emit a
         # trap only under --bounds-checks and otherwise read adjacent memory.
-        "const_index_positive_oob": (
-            "fn main() -> i64 { let a: [i64; 2] = [1, 2]; return a[5]; }\n",
-            "fn main() { let a: [i64; 2] = [1, 2]; println!(\"{}\", a[5]); }\n",
-        ),
-        "const_index_negative_oob": (
-            "fn main() -> i64 { let a: [i64; 2] = [1, 2]; return a[-1]; }\n",
-            "fn main() { let a: [i64; 2] = [1, 2]; println!(\"{}\", a[-1]); }\n",
-        ),
+        "const_index_positive_oob": "fn main() { let a: [i64; 2] = [1, 2]; println!(\"{}\", a[5]); }\n",
+        "const_index_negative_oob": "fn main() { let a: [i64; 2] = [1, 2]; println!(\"{}\", a[-1]); }\n",
         # The magnitude `2^63` is only valid as the operand of a `-` that makes
         # it `i64::MIN`. Standing alone (E0080) or as the operand of a second
         # negation (E0080/E0608 overflow) rustc rejects it, and so must rmc.
-        "i64_min_magnitude_alone": (
-            "fn main() -> i64 { return 9223372036854775808; }\n",
-            "fn main() { let x: i64 = 9223372036854775808; println!(\"{}\", x); }\n",
-        ),
-        "negate_i64_min": (
-            "fn main() -> i64 { return - -9223372036854775808; }\n",
-            "fn main() { let x: i64 = - -9223372036854775808; println!(\"{}\", x); }\n",
-        ),
+        "i64_min_magnitude_alone": "fn main() { let x: i64 = 9223372036854775808; println!(\"{}\", x); }\n",
+        "negate_i64_min": "fn main() { let x: i64 = - -9223372036854775808; println!(\"{}\", x); }\n",
         # A string literal is a `&str`, not an integer. Adding it to an integer
         # (E0369) and passing it where an `i64` is expected must be rejected;
         # rmc used to treat the string's address as an `i64`.
-        "add_int_to_str": (
-            "fn main() -> i64 { let s: i64 = \"hi\"; let x: i64 = s + 1; return x; }\n",
-            "fn main() { let s = \"hi\"; let x = s + 1; println!(\"{}\", x); }\n",
-        ),
-        "print_str_int": (
-            "fn main() -> i64 { let x: i64 = 42; print_str(x); return 0; }\n",
-            "fn main() { let s: &str = 42; println!(\"{}\", s); }\n",
-        ),
+        "add_int_to_str": "fn main() { let s = \"hi\"; let x = s + 1; println!(\"{}\", x); }\n",
+        "print_str_int": "fn main() { let s: &str = 42; println!(\"{}\", s); }\n",
         # Comparing a `str` with an integer. rmc used to compare the string's
         # address against the integer, which compiled to nonsense; rustc rejects
         # it (E0308). The two are different types, so both must refuse.
-        "str_vs_int": (
-            "fn main() -> i64 { if \"a\" == 1 { return 1; } return 0; }\n",
-            "fn main() { if \"a\" == 1 { } }\n",
-        ),
+        "str_vs_int": "fn main() { if \"a\" == 1 { } }\n",
         # Writing through a place whose root binding is not `mut`. The first
         # mutability check only looked at a bare `Var` target, so these all
         # compiled. rustc rejects each (E0594/E0596).
-        "field_assign_immutable": (
-            "struct P { x: i64, y: i64 }\n"
-            "fn main() -> i64 { let p: P = P { x: 1, y: 2 }; p.x = 2; return p.x; }\n",
-            "struct P { x: i64, y: i64 }\n"
+        "field_assign_immutable": "struct P { x: i64, y: i64 }\n"
             "fn main() -> i64 { let p = P { x: 1, y: 2 }; p.x = 2; p.x }\n",
-        ),
-        "elem_assign_immutable": (
-            "fn main() -> i64 { let a: [i64; 2] = [1, 2]; a[0] = 5; return a[0]; }\n",
-            "fn main() -> i64 { let a = [1i64, 2]; a[0] = 5; a[0] }\n",
-        ),
-        "compound_field_immutable": (
-            "struct P { x: i64, y: i64 }\n"
-            "fn main() -> i64 { let p: P = P { x: 1, y: 2 }; p.x += 1; return p.x; }\n",
-            "struct P { x: i64, y: i64 }\n"
+        "elem_assign_immutable": "fn main() -> i64 { let a = [1i64, 2]; a[0] = 5; a[0] }\n",
+        "compound_field_immutable": "struct P { x: i64, y: i64 }\n"
             "fn main() -> i64 { let p = P { x: 1, y: 2 }; p.x += 1; p.x }\n",
-        ),
-        "borrow_immutable_as_mut": (
-            "fn main() -> i64 { let x: i64 = 1; let r: &mut i64 = &mut x; return 0; }\n",
-            "fn main() { let x = 1i64; let r = &mut x; let _ = r; }\n",
-        ),
-        "write_through_shared_ref": (
-            "fn main() -> i64 { let x: i64 = 1; let r: &i64 = &x; *r = 5; return 0; }\n",
-            "fn main() { let x = 1i64; let r = &x; *r = 5; }\n",
-        ),
-        "shared_ref_field_write": (
-            "struct P { x: i64, y: i64 }\n"
-            "fn main() -> i64 { let p: P = P { x: 1, y: 2 }; let r: &P = &p; r.x = 5; return 0; }\n",
-            "struct P { x: i64, y: i64 }\n"
+        "borrow_immutable_as_mut": "fn main() { let x = 1i64; let r = &mut x; let _ = r; }\n",
+        "write_through_shared_ref": "fn main() { let x = 1i64; let r = &x; *r = 5; }\n",
+        "shared_ref_field_write": "struct P { x: i64, y: i64 }\n"
             "fn main() -> i64 { let p = P { x: 1, y: 2 }; let r = &p; r.x = 5; }\n",
-        ),
-        "partial_init_then_read": (
-            "fn main() -> i64 { let a: [i64; 2]; a[0] = 1; return a[0]; }\n",
-            "fn main() -> i64 { let a: [i64; 2]; a[0] = 1; a[0] }\n",
-        ),
+        "partial_init_then_read": "fn main() -> i64 { let a: [i64; 2]; a[0] = 1; a[0] }\n",
         # Duplicate parameter names (E0415) and a `main` that takes arguments
         # (E0580); rmc used to bind the duplicates to one slot and accept any
         # `main`.
-        "duplicate_parameter": (
-            "fn f(x: i64, x: i64) -> i64 { return x; }\n"
-            "fn main() -> i64 { return f(1, 2); }\n",
-            "fn f(x: i64, x: i64) -> i64 { x }\nfn main() { let _ = f(1, 2); }\n",
-        ),
-        "main_with_parameter": (
-            "fn main(x: i64) -> i64 { return x; }\n",
-            "fn main(x: i64) { let _ = x; }\n",
-        ),
+        "duplicate_parameter": "fn f(x: i64, x: i64) -> i64 { x }\nfn main() { let _ = f(1, 2); }\n",
+        "main_with_parameter": "fn main(x: i64) { let _ = x; }\n",
         # Constant arithmetic that rustc denies: division by zero, overflow and
         # an out-of-range shift all trap, so rmc rejects the constant case.
-        "const_div_by_zero": (
-            "fn main() -> i64 { let x: i64 = 1 / 0; return x; }\n",
-            "fn main() { let x = 1i64 / 0; let _ = x; }\n",
-        ),
-        "const_overflow_add": (
-            "fn main() -> i64 { let x: i64 = 9223372036854775807 + 1; return x; }\n",
-            "fn main() { let x = 9223372036854775807i64 + 1; let _ = x; }\n",
-        ),
-        "const_shift_out_of_range": (
-            "fn main() -> i64 { return 1 << 64; }\n",
-            "fn main() { let x = 1i64 << 64; let _ = x; }\n",
-        ),
+        "const_div_by_zero": "fn main() { let x = 1i64 / 0; let _ = x; }\n",
+        "const_overflow_add": "fn main() { let x = 9223372036854775807i64 + 1; let _ = x; }\n",
+        "const_shift_out_of_range": "fn main() { let x = 1i64 << 64; let _ = x; }\n",
         # A constant index written as an expression must fold like a literal, or
         # an out-of-range one reads past the array (E0080 in rustc).
-        "const_index_expr_oob": (
-            "fn main() -> i64 { let a: [i64; 2] = [1, 2]; return a[1 + 4]; }\n",
-            "fn main() -> i64 { let a = [1i64, 2]; a[1 + 4] }\n",
-        ),
+        "const_index_expr_oob": "fn main() -> i64 { let a = [1i64, 2]; a[1 + 4] }\n",
         # A constant *local* used as an index must fold too. rustc's constant
         # propagation knows `i`'s value, so it denies the out-of-range index;
         # rmc used to read past the array (the memory-safety gap).
-        "const_local_index_oob": (
-            "fn main() -> i64 { let a: [i64; 2] = [1, 2]; let i: i64 = -1; return a[i]; }\n",
-            "fn main() { let a = [1i64, 2]; let i: i64 = -1; println!(\"{}\", a[i as usize]); }\n",
-        ),
-        "const_local_index_expr_oob": (
-            "fn main() -> i64 { let a: [i64; 2] = [1, 2]; let i: i64 = 1 - 3; return a[i]; }\n",
-            "fn main() { let a = [1i64, 2]; let i: i64 = 1 - 3; println!(\"{}\", a[i as usize]); }\n",
-        ),
+        "const_local_index_oob": "fn main() { let a = [1i64, 2]; let i: i64 = -1; println!(\"{}\", a[i as usize]); }\n",
+        "const_local_index_expr_oob": "fn main() { let a = [1i64, 2]; let i: i64 = 1 - 3; println!(\"{}\", a[i as usize]); }\n",
         # A constant local that overflows or divides by zero is folded like a
         # literal (E0080 in rustc).
-        "const_local_overflow": (
-            "fn main() -> i64 { let x: i64 = 9223372036854775807; let y: i64 = x + 1; return y; }\n",
-            "fn main() { let x = 9223372036854775807i64; let y = x + 1; let _ = y; }\n",
-        ),
-        "const_local_div_zero": (
-            "fn main() -> i64 { let d: i64 = 0; let y: i64 = 1 / d; return y; }\n",
-            "fn main() { let d = 0i64; let y = 1i64 / d; let _ = y; }\n",
-        ),
+        "const_local_overflow": "fn main() { let x = 9223372036854775807i64; let y = x + 1; let _ = y; }\n",
+        "const_local_div_zero": "fn main() { let d = 0i64; let y = 1i64 / d; let _ = y; }\n",
         # A reference may only be cast to a reference of the same type, may not
         # gain mutability, and may not become a scalar (E0605/E0606). rmc's
         # `i64 as &T` raw pointer cast is a documented extension and stays.
-        "cast_ref_to_scalar": (
-            "fn main() -> i64 { let x: i64 = 1; let r: &i64 = &x; return r as i64; }\n",
-            "fn main() { let x = 1i64; let r = &x; let _ = r as i64; }\n",
-        ),
-        "cast_shared_ref_to_mut": (
-            "fn main() -> i64 { let x: i64 = 1; let r: &i64 = &x; "
-            "let s: &mut i64 = r as &mut i64; return 0; }\n",
-            "fn main() { let x = 1i64; let r = &x; let s = r as &mut i64; let _ = s; }\n",
-        ),
-        "cast_ref_to_other_ref": (
-            "fn main() -> i64 { let x: i64 = 1; let r: &i64 = &x; "
-            "let s: &bool = r as &bool; return 0; }\n",
-            "fn main() { let x = 1i64; let r = &x; let s = r as &bool; let _ = s; }\n",
-        ),
-        "cast_bool_to_ref": (
-            "fn main() -> i64 { let b: bool = true; let r: &i64 = b as &i64; return 0; }\n",
-            "fn main() { let b = true; let r = b as &i64; let _ = r; }\n",
-        ),
+        "cast_ref_to_scalar": "fn main() { let x = 1i64; let r = &x; let _ = r as i64; }\n",
+        "cast_shared_ref_to_mut": "fn main() { let x = 1i64; let r = &x; let s = r as &mut i64; let _ = s; }\n",
+        "cast_ref_to_other_ref": "fn main() { let x = 1i64; let r = &x; let s = r as &bool; let _ = s; }\n",
+        "cast_bool_to_ref": "fn main() { let b = true; let r = b as &i64; let _ = r; }\n",
         # `if let` is sugar for `match`, but unlike `match` it need not be
         # exhaustive. What it may *not* do is have a non-unit `then` with no
         # `else` (E0308): the fall-through `_` arm is `()`, so the branch types
         # differ. rmc must reject it too.
-        "iflet_nonunit_without_else": (
-            "fn main() -> i64 { let o: i64 = 3; if let 3 = o { 1 } return 0; }\n",
-            "fn main() { let o = 3i64; if let 3 = o { 1 } }\n",
-        ),
+        "iflet_nonunit_without_else": "fn main() { let o = 3i64; if let 3 = o { 1 } }\n",
         # An *irrefutable* pattern makes the fall-through `_` arm dead, but rustc
         # still type-checks it: a non-unit `then` with a `()` fallback is
         # rejected. The `if true` wrapper in `irrefutable_arm` is what carries
         # this check; dropping the dead arm (as for `match`) would accept it.
-        "iflet_irrefutable_nonunit_without_else": (
-            "fn main() -> i64 { let o: i64 = 3; if let y = o { 1 } return 0; }\n",
-            "fn main() { let o = 3i64; if let y = o { 1 } }\n",
-        ),
+        "iflet_irrefutable_nonunit_without_else": "fn main() { let o = 3i64; if let y = o { 1 } }\n",
+        # `for PAT in ARRAY` needs a plain binding or `_`. A compound pattern
+        # (`[a, b]`, `(a, b)`, a struct pattern) is rejected rather than
+        # mis-bound to a single element, since rmc has no destructuring `let`.
+        "for_array_compound_pattern": "fn main() {\n"
+            "    let a = [10i64, 20, 30];\n"
+            "    let mut s = 0i64;\n"
+            "    for [x, y, z] in a { s += x + y + z; }\n"
+            "    println!(\"{}\", s);\n"
+            "}\n",
+        "for_array_tuple_pattern": "fn main() {\n"
+            "    let a = [10i64, 20];\n"
+            "    let mut s = 0i64;\n"
+            "    for (x, y) in a { s += x + y; }\n"
+            "    println!(\"{}\", s);\n"
+            "}\n",
         # `let` destructuring. `mut` goes on each binding, not on the pattern
         # (E0658); a field the struct lacks (E0026), a field bound twice (E0416)
         # and an unknown struct (E0422) are all rejected; a non-struct
         # scrutinee is a field-access error. A partial pattern (one that does
         # not mention every field and has no `..`) is *accepted*, as in the
         # `match` path — a documented subset relaxation, so it is not here.
-        "let_destructure_mut_before_pattern": (
-            "struct S { x: i64, y: i64 }\n"
-            "fn main() -> i64 { let s: S = S { x: 1, y: 2 }; let mut S { x, y } = s; return x; }\n",
-            "struct S { x: i64, y: i64 }\n"
+        "let_destructure_mut_before_pattern": "struct S { x: i64, y: i64 }\n"
             "fn main() { let s = S { x: 1, y: 2 }; let mut S { x, y } = s; let _ = (x, y); }\n",
-        ),
-        "let_destructure_unknown_field": (
-            "struct S { x: i64 }\n"
-            "fn main() -> i64 { let s: S = S { x: 1 }; let S { z } = s; return 0; }\n",
-            "struct S { x: i64 }\n"
+        "let_destructure_unknown_field": "struct S { x: i64 }\n"
             "fn main() { let s = S { x: 1 }; let S { z } = s; let _ = z; }\n",
-        ),
-        "let_destructure_field_bound_twice": (
-            "struct S { x: i64 }\n"
-            "fn main() -> i64 { let s: S = S { x: 1 }; let S { x, x: a } = s; return a; }\n",
-            "struct S { x: i64 }\n"
+        "let_destructure_field_bound_twice": "struct S { x: i64 }\n"
             "fn main() { let s = S { x: 1 }; let S { x, x: a } = s; let _ = (x, a); }\n",
-        ),
-        "let_destructure_unknown_struct": (
-            "struct S { x: i64 }\n"
-            "fn main() -> i64 { let s: S = S { x: 1 }; let Q { x } = s; return x; }\n",
-            "struct S { x: i64 }\n"
+        "let_destructure_unknown_struct": "struct S { x: i64 }\n"
             "fn main() { let s = S { x: 1 }; let Q { x } = s; let _ = x; }\n",
-        ),
-        "let_destructure_non_struct": (
-            "struct S { x: i64 }\n"
-            "fn main() -> i64 { let S { x } = 5; return x; }\n",
-            "struct S { x: i64 }\n"
+        "let_destructure_non_struct": "struct S { x: i64 }\n"
             "fn main() { let S { x } = 5; let _ = x; }\n",
-        ),
         # A destructuring `for` shares the same checks: an unknown field
         # (E0026), an unknown struct (E0422), a non-struct element (E0308) and
         # a `mut` on the pattern (E0596-style) are each rejected by rustc, so
         # rmc must reject them too.
-        "for_destructure_unknown_field": (
-            "struct S { x: i64 }\n"
-            "fn main() -> i64 { let a: [S; 1] = [S { x: 1 }]; for S { z } in a {} return 0; }\n",
-            "struct S { x: i64 }\n"
+        "for_destructure_unknown_field": "struct S { x: i64 }\n"
             "fn main() { let a = [S { x: 1 }]; for S { z } in a { let _ = z; } }\n",
-        ),
-        "for_destructure_unknown_struct": (
-            "struct S { x: i64 }\n"
-            "fn main() -> i64 { let a: [S; 1] = [S { x: 1 }]; for Q { x } in a {} return 0; }\n",
-            "struct S { x: i64 }\n"
+        "for_destructure_unknown_struct": "struct S { x: i64 }\n"
             "fn main() { let a = [S { x: 1 }]; for Q { x } in a { let _ = x; } }\n",
-        ),
-        "for_destructure_non_struct": (
-            "struct S { x: i64 }\n"
-            "fn main() -> i64 { let a: [i64; 1] = [5]; for S { x } in a {} return 0; }\n",
-            "struct S { x: i64 }\n"
+        "for_destructure_non_struct": "struct S { x: i64 }\n"
             "fn main() { let a = [5i64]; for S { x } in a { let _ = x; } }\n",
-        ),
-        "for_destructure_mut_on_pattern": (
-            "struct S { x: i64 }\n"
-            "fn main() -> i64 { let a: [S; 1] = [S { x: 1 }]; for mut S { x } in a {} return 0; }\n",
-            "struct S { x: i64 }\n"
+        "for_destructure_mut_on_pattern": "struct S { x: i64 }\n"
             "fn main() { let a = [S { x: 1 }]; for mut S { x } in a { let _ = x; } }\n",
-        ),
         # A nested struct sub-pattern runs the same field checks one level
         # deeper: an unknown inner struct (E0422), an unknown inner field
         # (E0026) and a `mut` on a nested pattern (E0596-style) are all
         # rejected by rustc, so rmc must reject them too.
-        "nested_pat_unknown_struct": (
-            "struct I { x: i64 } struct S { a: I }\n"
-            "fn main() -> i64 { let s: S = S { a: I { x: 1 } }; let S { a: Q { x } } = s; return x; }\n",
-            "struct I { x: i64 } struct S { a: I }\n"
+        "nested_pat_unknown_struct": "struct I { x: i64 } struct S { a: I }\n"
             "fn main() { let s = S { a: I { x: 1 } }; let S { a: Q { x } } = s; let _ = x; }\n",
-        ),
-        "nested_pat_unknown_field": (
-            "struct I { x: i64 } struct S { a: I }\n"
-            "fn main() -> i64 { let s: S = S { a: I { x: 1 } }; let S { a: I { z } } = s; return z; }\n",
-            "struct I { x: i64 } struct S { a: I }\n"
+        "nested_pat_unknown_field": "struct I { x: i64 } struct S { a: I }\n"
             "fn main() { let s = S { a: I { x: 1 } }; let S { a: I { z } } = s; let _ = z; }\n",
-        ),
-        "nested_pat_mut_on_nested": (
-            "struct I { x: i64 } struct S { a: I }\n"
-            "fn main() -> i64 { let s: S = S { a: I { x: 1 } }; let S { a: mut I { x } } = s; return x; }\n",
-            "struct I { x: i64 } struct S { a: I }\n"
+        "nested_pat_mut_on_nested": "struct I { x: i64 } struct S { a: I }\n"
             "fn main() { let s = S { a: I { x: 1 } }; let S { a: mut I { x } } = s; let _ = x; }\n",
-        ),
-        "struct_arr_field_mut_on_nested": (
-            "struct S { a: [i64; 2] }\n"
-            "fn main() -> i64 { let s: S = S { a: [1, 2] }; let S { a: mut [x, y] } = s; return x; }\n",
-            "struct S { a: [i64; 2] }\n"
+        "struct_arr_field_mut_on_nested": "struct S { a: [i64; 2] }\n"
             "fn main() { let s = S { a: [1, 2] }; let S { a: mut [x, y] } = s; let _ = x; }\n",
-        ),
-        "struct_arr_field_refutable_element": (
-            "struct S { a: [i64; 2] }\n"
-            "fn main() -> i64 { let s: S = S { a: [1, 2] }; let S { a: [1, y] } = s; return y; }\n",
-            "struct S { a: [i64; 2] }\n"
+        "struct_arr_field_refutable_element": "struct S { a: [i64; 2] }\n"
             "fn main() { let s = S { a: [1, 2] }; let S { a: [1, y] } = s; let _ = y; }\n",
-        ),
-        "struct_arr_field_out_of_range": (
-            "struct S { a: [i64; 2] }\n"
-            "fn main() -> i64 { let s: S = S { a: [1, 2] }; let S { a: [x, y, z] } = s; return x; }\n",
-            "struct S { a: [i64; 2] }\n"
+        "struct_arr_field_out_of_range": "struct S { a: [i64; 2] }\n"
             "fn main() { let s = S { a: [1, 2] }; let S { a: [x, y, z] } = s; let _ = x; }\n",
-        ),
-        "struct_arr_field_unknown_field": (
-            "struct S { a: [i64; 2] }\n"
-            "fn main() -> i64 { let s: S = S { a: [1, 2] }; let S { z: [x, y] } = s; return x; }\n",
-            "struct S { a: [i64; 2] }\n"
+        "struct_arr_field_unknown_field": "struct S { a: [i64; 2] }\n"
             "fn main() { let s = S { a: [1, 2] }; let S { z: [x, y] } = s; let _ = x; }\n",
-        ),
         # A parameter pattern runs the same checks in a parameter position: a
         # `mut` on the whole pattern, a name bound twice (E0415), and an unknown
         # field or struct are all rejected by rustc.
-        "param_pat_mut_on_pattern": (
-            "struct S { x: i64 }\n"
-            "fn f(mut S { x }: S) -> i64 { return x; }\n"
-            "fn main() -> i64 { return 0; }\n",
-            "struct S { x: i64 }\n"
+        "param_pat_mut_on_pattern": "struct S { x: i64 }\n"
             "fn f(mut S { x }: S) -> i64 { x }\n"
             "fn main() { let _ = f(S { x: 1 }); }\n",
-        ),
-        "param_pat_dup_name": (
-            "struct S { x: i64 }\n"
-            "fn f(S { x }: S, x: i64) -> i64 { return x; }\n"
-            "fn main() -> i64 { return 0; }\n",
-            "struct S { x: i64 }\n"
+        "param_pat_dup_name": "struct S { x: i64 }\n"
             "fn f(S { x }: S, x: i64) -> i64 { x }\n"
             "fn main() { let _ = f(S { x: 1 }, 2); }\n",
-        ),
-        "param_pat_dup_name_reversed": (
-            "struct S { x: i64 }\n"
-            "fn f(x: i64, S { x }: S) -> i64 { return x; }\n"
-            "fn main() -> i64 { return 0; }\n",
-            "struct S { x: i64 }\n"
+        "param_pat_dup_name_reversed": "struct S { x: i64 }\n"
             "fn f(x: i64, S { x }: S) -> i64 { x }\n"
             "fn main() { let _ = f(1, S { x: 2 }); }\n",
-        ),
-        "param_pat_unknown_field": (
-            "struct S { x: i64 }\n"
-            "fn f(S { z }: S) -> i64 { return z; }\n"
-            "fn main() -> i64 { return 0; }\n",
-            "struct S { x: i64 }\n"
+        "param_pat_unknown_field": "struct S { x: i64 }\n"
             "fn f(S { z }: S) -> i64 { z }\n"
             "fn main() { let _ = f(S { x: 1 }); }\n",
-        ),
-        "param_pat_unknown_struct": (
-            "struct S { x: i64 }\n"
-            "fn f(Q { x }: Q) -> i64 { return x; }\n"
-            "fn main() -> i64 { return 0; }\n",
-            "struct S { x: i64 }\n"
+        "param_pat_unknown_struct": "struct S { x: i64 }\n"
             "fn f(Q { x }: Q) -> i64 { x }\n"
             "fn main() { let _ = f(S { x: 1 }); }\n",
-        ),
-        "param_pat_refutable_literal": (
-            "fn f(1: i64) -> i64 { return 1; }\n"
-            "fn main() -> i64 { return 0; }\n",
-            "fn f(1: i64) -> i64 { 1 }\n"
+        "param_pat_refutable_literal": "fn f(1: i64) -> i64 { 1 }\n"
             "fn main() { let _ = f(1); }\n",
-        ),
-        "param_pat_dup_element": (
-            "fn f([a, a]: [i64; 2]) -> i64 { return a; }\n"
-            "fn main() -> i64 { return 0; }\n",
-            "fn f([a, a]: [i64; 2]) -> i64 { a }\n"
+        "param_pat_dup_element": "fn f([a, a]: [i64; 2]) -> i64 { a }\n"
             "fn main() { let _ = f([1, 2]); }\n",
-        ),
         # A payload variant pattern runs the same checks in its argument list:
         # naming more fields than the variant has, naming fewer without a `..`,
         # a refutable argument (a literal), a `mut` on a nested pattern, and a
         # field the nested struct lacks are each rejected by rustc.
-        "enum_pat_too_many_fields": (
-            "enum E { A(i64), B }\n"
-            "fn main() -> i64 { let e: E = E::A(1); return match e { E::A(x, y) => x, E::B => 0 }; }\n",
-            "enum E { A(i64), B }\n"
+        "enum_pat_too_many_fields": "enum E { A(i64), B }\n"
             "fn main() { let e = E::A(1); let _ = match e { E::A(x, y) => x, E::B => 0 }; }\n",
-        ),
-        "enum_pat_too_few_fields": (
-            "enum E { A(i64, i64), B }\n"
-            "fn main() -> i64 { let e: E = E::A(1, 2); return match e { E::A(x) => x, E::B => 0 }; }\n",
-            "enum E { A(i64, i64), B }\n"
+        "enum_pat_too_few_fields": "enum E { A(i64, i64), B }\n"
             "fn main() { let e = E::A(1, 2); let _ = match e { E::A(x) => x, E::B => 0 }; }\n",
-        ),
-        "enum_pat_mut_on_nested": (
-            "struct S { x: i64 } enum E { A(S), B }\n"
-            "fn main() -> i64 { let e: E = E::A(S { x: 1 }); return match e { E::A(mut S { x }) => x, E::B => 0 }; }\n",
-            "struct S { x: i64 } enum E { A(S), B }\n"
+        "enum_pat_mut_on_nested": "struct S { x: i64 } enum E { A(S), B }\n"
             "fn main() { let e = E::A(S { x: 1 }); let _ = match e { E::A(mut S { x }) => x, E::B => 0 }; }\n",
-        ),
-        "enum_pat_nested_unknown_field": (
-            "struct S { x: i64 } enum E { A(S), B }\n"
-            "fn main() -> i64 { let e: E = E::A(S { x: 1 }); return match e { E::A(S { z }) => z, E::B => 0 }; }\n",
-            "struct S { x: i64 } enum E { A(S), B }\n"
+        "enum_pat_nested_unknown_field": "struct S { x: i64 } enum E { A(S), B }\n"
             "fn main() { let e = E::A(S { x: 1 }); let _ = match e { E::A(S { z }) => z, E::B => 0 }; }\n",
-        ),
-        "enum_pat_nested_unknown_struct": (
-            "struct S { x: i64 } enum E { A(S), B }\n"
-            "fn main() -> i64 { let e: E = E::A(S { x: 1 }); return match e { E::A(Q { x }) => x, E::B => 0 }; }\n",
-            "struct S { x: i64 } enum E { A(S), B }\n"
+        "enum_pat_nested_unknown_struct": "struct S { x: i64 } enum E { A(S), B }\n"
             "fn main() { let e = E::A(S { x: 1 }); let _ = match e { E::A(Q { x }) => x, E::B => 0 }; }\n",
-        ),
-        "enum_pat_nested_arr_out_of_range": (
-            "enum E { A([i64; 2]), B }\n"
-            "fn main() -> i64 { let e: E = E::A([1, 2]); return match e { E::A([x, y, z]) => x, E::B => 0 }; }\n",
-            "enum E { A([i64; 2]), B }\n"
+        "enum_pat_nested_arr_out_of_range": "enum E { A([i64; 2]), B }\n"
             "fn main() { let e = E::A([1, 2]); let _ = match e { E::A([x, y, z]) => x, E::B => 0 }; }\n",
-        ),
         # A pattern reads through a `&E` scrutinee (match ergonomics), but the
         # referent is what it is checked against: a variant of a *different*
         # enum, or of no enum at all, must still be rejected.
-        "enum_pat_ref_wrong_enum": (
-            "enum E { A, B } enum F { C, D }\n"
-            "fn main() -> i64 { let e: E = E::A; return match &e { F::C => 1, _ => 0 }; }\n",
-            "enum E { A, B } enum F { C, D }\n"
+        "enum_pat_ref_wrong_enum": "enum E { A, B } enum F { C, D }\n"
             "fn main() { let e = E::A; let _ = match &e { F::C => 1, _ => 0 }; }\n",
-        ),
-        "enum_pat_ref_scalar": (
-            "enum E { A, B }\n"
-            "fn main() -> i64 { let x: i64 = 0; return match &x { E::A => 1, _ => 0 }; }\n",
-            "enum E { A, B }\n"
+        "enum_pat_ref_scalar": "enum E { A, B }\n"
             "fn main() { let x = 0i64; let _ = match &x { E::A => 1, _ => 0 }; }\n",
-        ),
         # A label on `while let` now names the desugared `loop`, so an
         # undeclared label there is still rustc's E0426.
-        "labelled_while_let_undeclared": (
-            "enum E { A(i64), B }\n"
-            "fn main() -> i64 { let mut e: E = E::A(1); while let E::A(x) = e { break 'nope; } return 0; }\n",
-            "enum E { A(i64), B }\n"
+        "labelled_while_let_undeclared": "enum E { A(i64), B }\n"
             "fn main() { let mut e = E::A(1); while let E::A(x) = e { break 'nope; } }\n",
-        ),
+        # An at-binding in an irrefutable position requires an irrefutable
+        # sub-pattern (E0005), and a binding alternative in an or-pattern is
+        # still rejected (E0408) even when the binding is an at-binding.
+        "at_pat_refutable_in_let": "fn main() { let x = 3; let n @ 1..=5 = x; let _ = n; }\n",
+        "at_pat_refutable_in_for": "fn main() { let mut s = 0; for n @ 1..=5 in 0..3 { s += n; } }\n",
+        "at_pat_refutable_in_param": "fn f(n @ 1..=5: i64) -> i64 { n }\nfn main() { let _ = f(1); }\n",
+        "at_pat_binding_alt_in_or": "fn main() { let x = 3; let _ = match x { n @ 1 | 2 => 1, _ => 0 }; }\n",
+        # A cyclic `type` alias is E0391, not a hang; a duplicate `type` and a
+        # `type` that collides with a struct are E0428. rmc resolves aliases in
+        # the parser, so each must be caught there rather than reaching sema.
+        "type_alias_cycle": "type A = B; type B = A;\nfn main() {}\n",
+        "type_alias_duplicate": "type N = i64; type N = bool;\nfn main() {}\n",
+        "type_alias_struct_collision": "struct S { x: i64 } type S = i64;\nfn main() {}\n",
+        "type_alias_enum_collision": "enum E { A } type E = i64;\nfn main() {}\n",
+        # A `break` inside an inner loop's `if` condition still leaves that
+        # loop, so the outer loop repeats and a write to an immutable binding
+        # before the inner loop is a second write (E0384). The break walk must
+        # inspect condition expressions.
+        "assign_immutable_cond_break_inner": "fn main() { let x: i64; loop { loop { if { break; true } {} } x = 1; } }\n",
+        "assign_immutable_cond_break_while": "fn flag() -> bool { true }\n"
+            "fn main() { let x: i64; while flag() { x = 1; loop { if { break; true } {} } } }\n",
+        # A labelled `continue` inside a nested loop targets the outer loop, so
+        # a write before the inner loop repeats (E0384). The reach walk must
+        # follow a labelled continue out of the nested loop.
+        "assign_immutable_labelled_continue": "fn main() { let x: i64; 'outer: loop { x = 1; loop { continue 'outer; } } }\n",
+        # An unlabelled `break`/`continue` in a `while` condition would target a
+        # loop enclosing the `while`, which rustc forbids (E0590).
+        "while_break_in_condition": "fn main() { loop { while { break; } {} } }\n",
+        # A non-`bool` condition is still checked when its block has an
+        # unreachable tail (`{ return; 42 }`). rustc types such a block by its
+        # tail, so the condition is an integer, not `!` (E0308); a block is only
+        # `!` when it has no tail at all, or a `!`-typed tail.
+        "nonbool_cond_return": "fn main() { if { return; 42 } {} }\n",
+        "nonbool_cond_break": "fn main() { loop { if { break; 42 } {} } }\n",
+        "nonbool_cond_while": "fn main() { while { return; 42 } {} }\n",
+        # A `break` in the index of an assignment target, or in a `for` range
+        # bound, is evaluated before the enclosing `while` starts, so it targets
+        # a loop outside the `while` (E0590).
+        "while_break_in_assign_target": "fn main() { let mut a = [0i64; 1]; loop { while { a[{ break; 0 }] = 1; true } {} } }\n",
+        "while_break_in_for_bound": "fn main() { loop { while { for i in { break; 0 }..1 {} true } {} } }\n",
+        # A labelled `continue` in a nested `while` condition (or a `for` bound)
+        # targets the outer loop, so a write before the nested loop repeats
+        # (E0384). The reach walk must follow it out of the nested loop.
+        "assign_immutable_cond_continue_nested": "fn main() { let x: i64; 'o: loop { x = 1; while { continue 'o; true } {} break 'o; } }\n",
     }
 
 
 def run_reject():
     # Per-process temp dir: two fuzz runs sharing one would overwrite each
-    # other's p.s/p.rms and report a bogus assembler failure.
+    # other's p.s/p.rs and report a bogus assembler failure.
     tmp = f"/tmp/rmc-fuzz-{os.getpid()}"
     os.makedirs(tmp, exist_ok=True)
     failures = 0
     corpus = reject_corpus()
-    for name, (rms, rs) in corpus.items():
-        open(f"{tmp}/{name}.rms", "w").write(rms)
-        open(f"{tmp}/{name}.rs", "w").write(rs)
+    for name, src in corpus.items():
+        open(f"{tmp}/{name}.rs", "w").write(src)
         # The reference must reject it, or the corpus entry proves nothing.
         ref = run([RUSTC, "-A", "warnings", "--edition", "2021", f"{tmp}/{name}.rs",
                    "-o", f"{tmp}/{name}.ref"])
@@ -3120,12 +2620,12 @@ def run_reject():
             print(f"[reject] {name}: rustc ACCEPTED the program; corpus is wrong")
             failures += 1
             continue
-        p = run([RMC, f"{tmp}/{name}.rms", "-o", f"{tmp}/{name}.bin"])
+        p = run([RMC, f"{tmp}/{name}.rs", "-o", f"{tmp}/{name}.bin"])
         if p.returncode < 0 or b"panicked" in p.stderr or b"overflowed its stack" in p.stderr:
             print(f"[reject] {name}: CRASH (exit {p.returncode})")
             failures += 1
         elif p.returncode == 0:
-            print(f"[reject] {name}: rmc ACCEPTED a program rustc rejects\n{rms}")
+            print(f"[reject] {name}: rmc ACCEPTED a program rustc rejects\n{src}")
             failures += 1
         elif p.returncode != 1:
             print(f"[reject] {name}: unexpected exit {p.returncode}")
@@ -3135,222 +2635,77 @@ def run_reject():
     return 1 if failures else 0
 
 
-# ---------------------------------------------------------------- MIR mode
-
-# The prelude each generated freestanding program includes. It mirrors
-# `tests/mir/prelude.rs`: the same source builds both against rustc and through
-# rmc's MIR path, linked against the same runtime.
-MIR_PRELUDE = """#![no_std]
-#![no_main]
-extern "C" {
-    fn print_i64(x: i64);
-    fn print_bool(b: i64);
-    fn arg_i64(i: i64) -> i64;
-    fn alloc(n: i64) -> i64;
-    fn free(p: i64);
-}
-#[inline(always)]
-fn out(x: i64) { unsafe { print_i64(x) } }
-#[inline(always)]
-fn outb(b: bool) { unsafe { print_bool(b as i64) } }
-#[inline(always)]
-fn arg(i: i64) -> i64 { unsafe { arg_i64(i) } }
-#[inline(always)]
-fn alc(n: i64) -> i64 { unsafe { alloc(n) } }
-#[inline(always)]
-fn rel(p: i64) { unsafe { free(p) } }
-#[panic_handler]
-fn panic(_i: &core::panic::PanicInfo) -> ! { unsafe { extern "C" { fn exit(c: i64) -> !; } exit(101) } }
-"""
-
-
-def gen_mir_program(rng):
-    """A freestanding program for the MIR path.
-
-    It reuses the `.rms` expression grammar but prints through the runtime's
-    `print_i64`/`print_bool` and returns from `main`, so rustc's reference (an
-    object linked against the same runtime) and rmc produce identical output.
+# -------------------------------------------------------------- atpat mode
+def gen_atpat_program(rng):
+    """`name @ subpat` bindings, the whole value bound alongside a sub-pattern:
+    `n @ _`, `n @ m` (an alias), `t @ (a, b)`, `f: n @ _` on a struct field,
+    `for n @ _ in ..`, a refutable `n @ 1..=5` in a `match` arm and an `if let`,
+    and a `n @ _` / `mut n @ _` parameter. The binding must name the whole value
+    (a wrong read, a duplicated binding or a dropped alias changes the total),
+    the sub-pattern's own bindings must still be made, and a `mut` alias must
+    write a local copy. Every function is called twice with different
+    arguments, so a shared slot or a leaked `mut` write is observable. No other
+    mode emits an `@` binding.
     """
-    a, b, c = (rng.randint(-1000, 1000) for _ in range(3))
-    exprs = []
-    for _ in range(rng.randint(2, 6)):
-        r = rng.random()
-        if r < 0.45:
-            exprs.append(gen_expr(rng, 0))
-        elif r < 0.7:
-            exprs.append(gen_guarded_div(rng, 0))
-        else:
-            exprs.append(gen_cmp(rng, 0))
-    lines = [
-        f"fn h(x: i64) -> i64 {{ (x * 3 + 1) % 97 - 48 }}",
-        "#[no_mangle]",
-        'pub extern "C" fn main() -> i64 {',
-        f"    let a: i64 = {a};",
-        f"    let b: i64 = {b};",
-        f"    let c: i64 = {c};",
+    b = rng.randint(1, 9)
+    rs = [
+        "#[derive(Copy, Clone)]",
+        "struct P { x: i64, y: i64, z: i64 }",
+        f"fn mk(n: i64) -> i64 {{ println!(\"{{}}\", n); n }}",
+        "fn f(n @ _: i64, mut m @ _: i64) -> i64 { m += n; m }",
+        "fn g(t @ (a, b): (i64, i64)) -> i64 { t.0 + a + b }",
+        "fn main() {",
         "    let mut acc: i64 = 0;",
+        f"    let x: i64 = mk({b});",
     ]
-    for e in exprs:
-        lines.append(f"    out({e});")
-        lines.append(f"    acc = acc.wrapping_add({e});")
-    lines += [
-        "    let mut i: i64 = 0;",
-        "    while i < 8 {",
-        "        acc = acc.wrapping_add(i * 3 - 7);",
-        "        i += 1;",
-        "    }",
-        "    out(acc);",
-        "    outb(acc > 0);",
-        "    0",
-        "}",
-    ]
-    return MIR_PRELUDE + "\n".join(lines) + "\n"
+
+    def add(expr):
+        rs.append(f"    acc += {expr};")
+
+    # `let` with an alias and a chain of aliases.
+    rs.append("    let n @ _ = x;")
+    rs.append("    let p @ q @ _ = x;")
+    add("n + p + q")
+    # A tuple sub-pattern: the whole tuple and each element bound.
+    rs.append("    let t @ (a, c) = (x, x + 1);")
+    add("t.0 + t.1 + a + c")
+    # A struct field sub-pattern, with a `mut` alias that is then written.
+    rs.append(f"    let s: P = P {{ x: x, y: x + 1, z: x + 2 }};")
+    rs.append("    let P { x: r @ _, y: mut w @ _, .. } = s;")
+    rs.append("    w += 1;")
+    add("r + w")
+    # `for` over a range and over an array.
+    rs.append("    for i @ _ in 0..3 {")
+    rs.append("        acc += i;")
+    rs.append("    }")
+    rs.append("    for i @ j in 0..3 {")
+    rs.append("        acc += i + j;")
+    rs.append("    }")
+    rs.append("    let arr: [i64; 3] = [x, x + 1, x + 2];")
+    rs.append("    for e @ _ in arr {")
+    rs.append("        acc += e;")
+    rs.append("    }")
+    # A `mut` alias inside an array and a tuple element.
+    rs.append("    let [mut d @ _, h] = arr;")
+    rs.append("    d += 1;")
+    add("d + h")
+    rs.append("    let (mut u @ _, v) = (x, x + 1);")
+    rs.append("    u += 1;")
+    add("u + v")
+    # A refutable `@` in a `match` arm and an `if let`.
+    rs.append("    match x { k @ 1..=1000000 => {")
+    rs.append("        acc += k;")
+    rs.append("    } _ => {} }")
+    rs.append("    if let k @ 1..=1000000 = x {")
+    rs.append("        acc += k;")
+    rs.append("    }")
+    # Parameters, including a `mut` alias and a tuple sub-pattern.
+    add(f"f(x, x + 1) + f(x + 2, x + 3)")
+    add(f"g((x, x + 4)) + g((x + 5, x + 6))")
+    rs += ['    println!("{}", acc);', "}"]
+    return "\n".join(rs) + "\n"
 
 
-# Integer types narrower than 64 bits all live in one 64-bit word in the back
-# end; the width only matters to the operation. That is the assumption most
-# likely to hide a miscompile, so the generator below exercises every width
-# with a value that distinguishes a correct sign/zero extension from a wrong
-# one, and with a `wrapping_*` result that a plain 64-bit op would get wrong.
-_MIR_INT_TYPES = ["u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "usize", "isize"]
-
-
-def _mir_width_value(rng, ty):
-    """A value that is distinctive at `ty`'s width, as a Rust literal."""
-    bits = {"u8": 8, "i8": 8, "u16": 16, "i16": 16, "u32": 32, "i32": 32,
-            "u64": 64, "i64": 64, "usize": 64, "isize": 64}[ty]
-    if ty.startswith("u"):
-        return str(rng.randrange(1 << bits)) if bits < 64 else str(rng.randrange(1 << 63, 1 << 64))
-    lo, hi = -(1 << (bits - 1)), (1 << (bits - 1)) - 1
-    return str(rng.randint(lo, hi))
-
-
-def gen_mir_width_program(rng):
-    """A freestanding program that mixes integer widths.
-
-    Every value is printed after a `as i64` cast, so a wrong extension (a
-    sign-extension of an unsigned value, or a truncation of a wider one) shows
-    up as a printed mismatch against the rustc reference. It also computes
-    `wrapping_add`/`wrapping_sub`/`wrapping_mul` at the narrow width, where the
-    result is `(a op b) mod 2^width` interpreted at that width — a 64-bit
-    operation would not wrap and would diverge."""
-    lines = [
-        "fn h(x: i64) -> i64 { (x * 7 + 3) % 101 - 50 }",
-        "#[no_mangle]",
-        'pub extern "C" fn main() -> i64 {',
-    ]
-    for _ in range(rng.randint(3, 6)):
-        ty = rng.choice(_MIR_INT_TYPES)
-        a = _mir_width_value(rng, ty)
-        b = _mir_width_value(rng, ty)
-        lines.append(f"    let a: {ty} = {a};")
-        lines.append(f"    let b: {ty} = {b};")
-        lines.append(f"    out(a as i64);")
-        lines.append(f"    out(b as i64);")
-        lines.append(f"    out(a.wrapping_add(b) as i64);")
-        lines.append(f"    out(a.wrapping_sub(b) as i64);")
-        lines.append(f"    out(a.wrapping_mul(b) as i64);")
-        # A comparison and a cast back down, to exercise both directions.
-        lines.append(f"    out((a > b) as i64);")
-        lines.append(f"    let c: {ty} = {_mir_width_value(rng, ty)};")
-        lines.append(f"    out((c as i64).wrapping_add(a as i64) as {ty} as i64);")
-    lines += ["    0", "}"]
-    return MIR_PRELUDE + "\n".join(lines) + "\n"
-
-
-def mir_runtime(tmp):
-    """The freestanding runtime as assembly, written once per temp dir. The
-    rustc reference is linked against the *same* runtime rmc uses, so the only
-    variable between the two binaries is the code generator."""
-    rt = f"{tmp}/runtime.s"
-    if not os.path.exists(rt):
-        p = run([RMC, "--emit-runtime-asm"])
-        if p.returncode != 0:
-            return None, f"rmc --emit-runtime-asm failed:\n{p.stderr.decode(errors='replace')}"
-        open(rt, "wb").write(p.stdout)
-    return rt, None
-
-
-def mir_build_reference(rs, obj, ref, rt):
-    """`rustc --emit=obj` -> static link against the shared runtime."""
-    c = run([RUSTC, "-O", "-C", "opt-level=3", "-C", "panic=abort",
-             "--crate-type=bin", "--edition", "2021",
-             "-C", "relocation-model=static", "--emit=obj", rs, "-o", obj])
-    if c.returncode != 0:
-        return f"rustc reference failed:\n{c.stderr.decode(errors='replace')}"
-    c = run(["cc", "-static", "-nostdlib", "-no-pie", obj, rt, "-o", ref])
-    if c.returncode != 0:
-        return f"cc link failed:\n{c.stderr.decode(errors='replace')}"
-    return None
-
-
-def run_mir(args):
-    """Fuzz the rustc-MIR front end + rmc back end against a rustc reference
-    linked against the same freestanding runtime. The `.rms` modes above never
-    reach this path; this one does."""
-    tmp = f"/tmp/rmc-fuzz-mir-{os.getpid()}"
-    os.makedirs(tmp, exist_ok=True)
-    rt, err = mir_runtime(tmp)
-    if err:
-        print(err, file=sys.stderr)
-        return 2
-    gen_name = args.gen or "mir"
-    gen = {"mir": gen_mir_program,
-           "expr": gen_expr_program, "stmt": gen_stmt_program,
-           "opt": gen_opt_program, "arith": gen_arith_program,
-           "nest": gen_nest_program, "pat": gen_pat_program,
-           "order": gen_order_program, "shift": gen_shift_program,
-           "cast": gen_cast_program, "assoc": gen_assoc_program,
-           "ref": gen_ref_program, "update": gen_update_program,
-           "letdestr": gen_letdestr_program, "fordestr": gen_fordestr_program,
-           "nestpat": gen_nestpat_program, "arrpat": gen_arrpat_program,
-           "parampat": gen_parampat_program,
-           "width": gen_mir_width_program}[gen_name]
-    rng = random.Random(args.seed)
-    flags = ["--no-inline", "--no-licm", "--no-tco"]
-    failures = 0
-    built = 0
-    for t in range(args.n):
-        if gen_name in ("mir", "width"):
-            rs = gen(rng)
-        else:
-            # The `.rms` generators produce a std program; only its `.rs` half
-            # is freestanding enough to link against the runtime.
-            _, rs = gen(rng)
-        open(f"{tmp}/p.rs", "w").write(rs)
-        argv = []
-        if args.mode == "shift":
-            argv = [str(rng.choice([rng.randint(-4, 4), rng.randint(60, 68),
-                                    rng.randint(0, 63), -1, 64, 63, 0])),
-                    str(rng.randint(-1000, 1000))]
-        ref = f"{tmp}/p.ref"
-        err = mir_build_reference(f"{tmp}/p.rs", f"{tmp}/p.ref.o", ref, rt)
-        if err:
-            # The generator can emit a program the freestanding reference
-            # cannot build (it targets `std`); skip it rather than fail.
-            continue
-        expected = run([ref] + argv)
-        built += 1
-        bad = None
-        for label, extra in [("", [])] + [(f, [f]) for f in flags]:
-            c = run([RMC] + extra + [f"{tmp}/p.rs", "-o", f"{tmp}/p.bin"])
-            if c.returncode != 0:
-                bad = f"rmc{extra} failed to compile:\n{c.stderr.decode(errors='replace')}"
-                break
-            got = run([f"{tmp}/p.bin"] + argv)
-            if (got.returncode, got.stdout) != (expected.returncode, expected.stdout):
-                bad = (f"rmc{extra} argv={argv} exit={got.returncode} stdout={got.stdout!r}\n"
-                       f"  rustc    exit={expected.returncode} stdout={expected.stdout!r}")
-                break
-        if bad:
-            print(f"[mir {args.mode} seed={args.seed} iter={t}] DIVERGENCE\n{rs}\n  {bad}")
-            if args.keep:
-                os.makedirs(args.keep, exist_ok=True)
-                open(f"{args.keep}/fuzz-mir-{args.mode}-{args.seed}-{t}.rs", "w").write(rs)
-            failures += 1
-            break
-    if failures == 0:
-        print(f"{built} {args.mode} programs (of {args.n}) through the MIR path, seed {args.seed}: all match rustc")
 # -------------------------------------------------------------- mutate mode
 
 # Tokens a mutation may splice in. A mix of valid fragments, delimiters that
@@ -3400,9 +2755,10 @@ def run_mutate(n, seed, keep=None):
     rng = random.Random(seed)
     gens = [gen_expr_program, gen_stmt_program, gen_opt_program, gen_pat_program,
             gen_ref_program, gen_update_program, gen_nestpat_program,
-            gen_arrpat_program, gen_parampat_program, gen_enumpat_program]
+            gen_arrpat_program, gen_parampat_program, gen_enumpat_program,
+            gen_atpat_program]
     # Seeds to mutate: the generated programs plus the corpora's byte inputs.
-    bases = [gens[rng.randrange(len(gens))](rng)[0] for _ in range(max(1, n // 4))]
+    bases = [gens[rng.randrange(len(gens))](rng) for _ in range(max(1, n // 4))]
     bases += [d.decode("latin-1") for d in robust_corpus().values() if isinstance(d, bytes)]
     failures = 0
     for it in range(n):
@@ -3410,7 +2766,7 @@ def run_mutate(n, seed, keep=None):
         text = base
         for _ in range(rng.randint(1, 4)):
             text = _mutate_once(rng, text)
-        path = f"{tmp}/m{it}.rms"
+        path = f"{tmp}/m{it}.rs"
         open(path, "w").write(text)
         p = run([RMC, path, "-o", f"{tmp}/m{it}.bin"])
         crashed = (p.returncode < 0 or b"panicked" in p.stderr
@@ -3422,7 +2778,7 @@ def run_mutate(n, seed, keep=None):
             print(p.stderr.decode(errors="replace")[:300])
             if keep:
                 os.makedirs(keep, exist_ok=True)
-                open(f"{keep}/m{it}.rms", "w").write(text)
+                open(f"{keep}/m{it}.rs", "w").write(text)
             if failures >= 5:
                 break
     if failures == 0:
@@ -3430,14 +2786,141 @@ def run_mutate(n, seed, keep=None):
     return 1 if failures else 0
 
 
+def gen_nestedfn_program(rng):
+    """Programs with nested `fn` items. A nested `fn` is hoisted to the top
+    level, so a call must resolve to the innermost declaration of that name
+    (rustc's block scoping), a sibling declared later must be callable, and a
+    same-named top-level `fn` must be shadowed inside the block. Each program
+    prints a fixed sequence of results, so a wrong resolution shows up as a
+    value difference rather than only a compile error."""
+    # A nested `fn` of each shape, and its rustc spelling (identical body, so a
+    # value difference is a resolution bug, not a codegen one).
+    shapes = [
+        ("add1", "x + 1"),
+        ("dbl", "x * 2"),
+        ("sub3", "x - 3"),
+        ("mix", "(x * 5 + 2) % 13"),
+    ]
+    # A top-level `fn` whose name some nested `fn` may shadow.
+    shadow_name = rng.choice(["add1", "dbl", "sub3", "mix"])
+    # rustc spelling of the top-level function, distinct from every nested body.
+    top_body = "x - 100"
+
+    lines_rs = [
+        f"fn {shadow_name}(x: i64) -> i64 {{ {top_body} }}",
+        "fn main() {",
+    ]
+
+    # 1..3 nested fns declared directly in `main`, each with a distinct name.
+    chosen = rng.sample(shapes, rng.randint(1, 3))
+    for (name, body) in chosen:
+        lines_rs.append(f"    fn {name}(x: i64) -> i64 {{ {body} }}")
+
+    # A nested fn that calls a sibling declared after it (hoisting), and one
+    # nested inside another fn's body.
+    lines_rs.append("    fn call_later(x: i64) -> i64 { later(x) + 1 }")
+    lines_rs.append("    fn outer(x: i64) -> i64 {")
+    lines_rs.append("        fn inner(y: i64) -> i64 { y * 7 }")
+    lines_rs.append("        inner(x) - 2")
+    lines_rs.append("    }")
+    lines_rs.append("    fn later(x: i64) -> i64 { x + 50 }")
+
+    # Call every name, so a mis-resolved call shows up as a wrong value.
+    calls = [name for (name, _) in chosen] + ["call_later", "outer"]
+    for _ in range(rng.randint(3, 8)):
+        name = rng.choice(calls)
+        v = rng.randint(-500, 500)
+        lines_rs.append(f'    println!("{{}}", {name}({v}));')
+    # Also call the (possibly shadowed) top-level name to confirm the nested one
+    # wins when it exists.
+    if shadow_name in calls:
+        lines_rs.append(f'    println!("{{}}", {shadow_name}(7));')
+
+    lines_rs += ["}"]
+    return "\n".join(lines_rs)
+
+
+def gen_typealias_program(rng):
+    """Programs that name types through `type` aliases. An alias is transparent,
+    so a scalar alias is the scalar, a struct alias is the struct (same layout
+    and fields), an alias may be used before it is declared, and one alias may
+    name another. Every alias target here is something rmc and rustc agree on;
+    the values printed are fixed by the generator, so a wrong expansion shows up
+    as a value difference, not only a compile error."""
+    # A struct and its alias, plus a tuple and an array alias. The array length
+    # is a literal because rustc's array length must be `usize`.
+    arr_len = rng.randint(1, 5)
+    struct_name = "S"
+    lines_rs = [
+        "type N = i64;",
+        "type Flag = bool;",
+        f"struct {struct_name} {{ x: i64, y: i64 }}",
+        f"type SA = {struct_name};",
+        "type Tup = (i64, i64);",
+        "type Chain = N;",
+        f"type Arr = [i64; {arr_len}];",
+        "enum Ev { A, B, C }",
+        "type EA = Ev;",
+        "type Grid = [[i64; 2]; 2];",
+        "fn sum(a: N, b: Chain) -> N { return a + b; }",
+        "fn main() {",
+    ]
+
+    a = rng.randint(-1000, 1000)
+    b = rng.randint(-1000, 1000)
+    lines_rs.append(f"    let a: N = {a};")
+    lines_rs.append(f"    let b: Chain = {b};")
+    lines_rs.append('    println!("{}", sum(a, b));')
+
+    flag = rng.choice(["true", "false"])
+    lines_rs.append(f"    let f: Flag = {flag};")
+    lines_rs.append('    if f { println!("{}", 1); } else { println!("{}", 0); }')
+
+    sx, sy = rng.randint(-50, 50), rng.randint(-50, 50)
+    lines_rs.append(f"    let s: SA = {struct_name} {{ x: {sx}, y: {sy} }};")
+    lines_rs.append('    println!("{}", s.x * 100 + s.y);')
+
+    t0, t1 = rng.randint(-20, 20), rng.randint(-20, 20)
+    lines_rs.append(f"    let t: Tup = ({t0}, {t1});")
+    lines_rs.append('    println!("{}", t.0 * 10 + t.1);')
+
+    elems = [rng.randint(-100, 100) for _ in range(arr_len)]
+    init = ", ".join(str(e) for e in elems)
+    lines_rs.append(f"    let arr: Arr = [{init}];")
+    lines_rs.append(f'    println!("{{}}", arr[0] + arr[{arr_len - 1}]);')
+
+    # A reference to an alias-typed local, and an alias in a cast.
+    lines_rs.append("    let r: &N = &a;")
+    lines_rs.append('    println!("{}", *r + 7);')
+    lines_rs.append('    println!("{}", (a as N) - 1);')
+
+    # An enum alias: the alias is the enum, matched by its variants.
+    variant, _ = rng.choice([("Ev::A", 1), ("Ev::B", 2), ("Ev::C", 3)])
+    lines_rs.append(f"    let e: EA = {variant};")
+    lines_rs.append(
+        '    match e { Ev::A => println!("{}", 1), Ev::B => println!("{}", 2), Ev::C => println!("{}", 3) }'
+    )
+
+    # A nested-array alias, indexed twice.
+    g = [[rng.randint(-9, 9) for _ in range(2)] for _ in range(2)]
+    lines_rs.append(f"    let grid: Grid = [[{g[0][0]}, {g[0][1]}], [{g[1][0]}, {g[1][1]}]];")
+    lines_rs.append('    println!("{}", grid[1][0] + grid[0][1]);')
+
+    # A use of an alias declared after `main` (the pre-scan registers it first).
+    later = rng.randint(-1000, 1000)
+    lines_rs.append(f"    let z: Later = {later};")
+    lines_rs.append('    println!("{}", z);')
+
+    lines_rs += ["}", "type Later = i64;"]
+    return "\n".join(lines_rs)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "robust", "mirrobust", "mirmut", "reject", "mutate", "mir"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "intmeth", "nestedfn", "typealias", "printfmt", "char", "robust", "reject", "mutate"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
-    ap.add_argument("--gen", default=None,
-                    help="with --mode mir, which generator to run (default: expr)")
     ap.add_argument("--bounds", action="store_true",
                     help="also compile with --bounds-checks, to exercise the trap codegen")
     ap.add_argument("--encoding", action="store_true",
@@ -3454,18 +2937,6 @@ def main():
         return 2
     if args.mode == "robust":
         return run_robust()
-    if args.mode == "mirrobust":
-        if not rustc_available():
-            print("rustc not found; set RUSTC or install a toolchain", file=sys.stderr)
-            return 2
-        return run_mir_robust()
-    if args.mode == "mirmut":
-        return run_mirmut(args)
-    if args.mode == "mir":
-        if not rustc_available():
-            print("rustc not found; set RUSTC or install a toolchain", file=sys.stderr)
-            return 2
-        return run_mir(args)
     if args.mode == "reject":
         if not rustc_available():
             print("rustc not found; set RUSTC or install a toolchain", file=sys.stderr)
@@ -3482,7 +2953,7 @@ def main():
         args.overflow = True
 
     # Per-process temp dir: two fuzz runs sharing one would overwrite each
-    # other's p.s/p.rms and report a bogus assembler failure.
+    # other's p.s/p.rs and report a bogus assembler failure.
     tmp = f"/tmp/rmc-fuzz-{os.getpid()}"
     os.makedirs(tmp, exist_ok=True)
     gen = {"expr": gen_expr_program, "stmt": gen_stmt_program,
@@ -3496,7 +2967,14 @@ def main():
            "nestpat": gen_nestpat_program,
            "arrpat": gen_arrpat_program,
            "parampat": gen_parampat_program,
-           "enumpat": gen_enumpat_program}[args.mode]
+           "enumpat": gen_enumpat_program,
+           "atpat": gen_atpat_program,
+           "tuple": gen_tuple_program,
+           "intmeth": gen_intmeth_program,
+           "nestedfn": gen_nestedfn_program,
+           "typealias": gen_typealias_program,
+           "printfmt": gen_printfmt_program,
+           "char": gen_char_program}[args.mode]
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus
     # suite; a fuzz program is otherwise only checked with every pass on, so a
@@ -3533,8 +3011,7 @@ def main():
         ]
     failures = 0
     for t in range(args.n):
-        rms, rs = gen(rng)
-        open(f"{tmp}/p.rms", "w").write(rms)
+        rs = gen(rng)
         open(f"{tmp}/p.rs", "w").write(rs)
         # Shift mode reads its counts from argv; every other mode ignores
         # arguments. `count` is deliberately drawn from the full i64 range so
@@ -3544,6 +3021,12 @@ def main():
             argv = [str(rng.choice([rng.randint(-4, 4), rng.randint(60, 68),
                                     rng.randint(0, 63), -1, 64, 63, 0])),
                     str(rng.randint(-1000, 1000))]
+        if args.mode == "intmeth":
+            # Mix small values, the extremes, and a couple of larger draws so
+            # `abs`/`signum`/`min`/`max` see `i64::MIN`, `-1`, `0` and `1`.
+            pick = [rng.randint(-20, 20), -1, 0, 1,
+                    -9223372036854775808, 9223372036854775807, 4, -4]
+            argv = [str(rng.choice(pick)) for _ in range(3)]
         # One rustc reference per distinct flag set, built once and cached.
         refs = {}
         skip = False
@@ -3559,7 +3042,7 @@ def main():
             continue
         bad = None
         for label, flags, rf in configs:
-            c = run([RMC] + flags + [f"{tmp}/p.rms", "-o", f"{tmp}/p.bin"])
+            c = run([RMC] + flags + [f"{tmp}/p.rs", "-o", f"{tmp}/p.bin"])
             if c.returncode != 0:
                 # rmc rejects the program. If rustc rejects it too the generator
                 # produced an ill-formed program (a constant shift or overflow
@@ -3578,17 +3061,17 @@ def main():
                        f"  rustc    exit={o2.returncode} stdout={o2.stdout!r}")
                 break
             if args.encoding:
-                enc = encoding_divergence(f"{tmp}/p.rms", flags, tmp)
+                enc = encoding_divergence(f"{tmp}/p.rs", flags, tmp)
                 if enc is not None and enc is not True:
                     k, ip, asm = enc
                     bad = (f"rmc[{label}] in-process vs as differ at instruction {k}\n"
                            f"  in-process = {ip}\n  as+ld      = {asm}")
                     break
         if bad:
-            print(f"[{args.mode} seed={args.seed} iter={t}] DIVERGENCE\n{rms}\n  {bad}")
+            print(f"[{args.mode} seed={args.seed} iter={t}] DIVERGENCE\n{rs}\n  {bad}")
             if args.keep:
                 os.makedirs(args.keep, exist_ok=True)
-                open(f"{args.keep}/fuzz-{args.mode}-{args.seed}-{t}.rms", "w").write(rms)
+                open(f"{args.keep}/fuzz-{args.mode}-{args.seed}-{t}.rs", "w").write(rs)
             failures += 1
             break
     if failures == 0:

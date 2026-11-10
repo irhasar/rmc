@@ -29,6 +29,9 @@ pub struct Parser {
     /// Constant `bool` items by name, so a `const F: bool` used as a `match`
     /// pattern becomes the `true`/`false` pattern.
     const_bools: std::collections::HashMap<String, bool>,
+    /// Constant `char` items by name, so a `const C: char` used as a `match`
+    /// pattern becomes the character pattern.
+    const_chars: std::collections::HashMap<String, u32>,
     /// Struct field names by struct name, collected before parsing so a struct
     /// pattern (`S { f, .. }`) can be checked at parse time. A struct pattern
     /// has no runtime test, so the parser rewrites it into field reads; that
@@ -36,6 +39,85 @@ pub struct Parser {
     /// struct declared later in the file is covered because the whole list is
     /// scanned first.
     struct_fields: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// Anonymous structs introduced by tuple *types*, keyed by the canonical
+    /// name `ast::tuple_struct_name` produces. A tuple is lowered to a struct
+    /// (element `k` is field `"k"`), so it reuses the whole struct path through
+    /// sema and codegen; this set only deduplicates the definitions so the same
+    /// tuple type is not declared twice. The definitions are collected in
+    /// `tuple_defs` and appended to the program's structs once parsing is done.
+    tuple_structs: std::collections::HashSet<String>,
+    tuple_defs: Vec<StructDef>,
+    /// Module names brought into scope by a `use` of a `std` subtree, so that
+    /// `use std::process;` makes a later `process::exit(0)` resolve. Only the
+    /// `std` tree is tracked: any other import is skipped, because a same-file
+    /// item is already visible by its own name. `std` is present from the start.
+    std_mods: std::collections::HashSet<String>,
+    /// Functions declared inside a block (`fn f() { .. }` as a statement),
+    /// collected here and appended to the program's flat function list. A nested
+    /// `fn` is an item, not a closure: it captures no locals, so it is hoisted
+    /// to the top level and the flat list carries it like any other. It sees
+    /// only the program's items (a top-level `fn`, `struct`, `enum` or `const`),
+    /// never an enclosing local, so nothing needs to be closed over.
+    nested_fns: Vec<FnDef>,
+    /// True while parsing a pattern that may be refutable (a `match` arm, an
+    /// `if let` / `while let` scrutinee). A tuple pattern is irrefutable only
+    /// when every element is, but in a refutable position its elements may be
+    /// literal or range tests, exactly as an array pattern's may not (rmc has
+    /// no array-element test, but it does have the scalar tests a tuple element
+    /// reuses). A `let`, a `for` head and a parameter are irrefutable, so there
+    /// the flag is false and a literal element is rejected.
+    pat_refutable_ok: bool,
+    /// One frame per block being parsed, innermost last, mapping the original
+    /// name of each nested `fn` declared directly in that block to the unique
+    /// name it is hoisted under. A nested `fn` shadows a top-level one of the
+    /// same name inside its block, as rustc's scoping does, so a call is
+    /// rewritten through the innermost frame that names it; a block with no
+    /// nested `fn` pushes an empty frame. A frame is filled by `scan_block_fns`
+    /// before the block's statements are parsed, so a `fn` is in scope for the
+    /// whole block and siblings may call each other in either order, exactly as
+    /// Rust hoists items.
+    fn_scopes: Vec<Vec<(String, String)>>,
+    /// Unique name of each nested `fn`, keyed by the token index of its `fn`
+    /// keyword. Filled in by `scan_block_fns` and read when the `fn` is parsed,
+    /// so a name discovered by the pre-scan is the one the definition is given.
+    fn_at: std::collections::HashMap<usize, String>,
+    /// Monotonic counter for the unique names of hoisted nested functions, so
+    /// two `fn`s of the same name in different blocks get distinct symbols.
+    nf_counter: u32,
+    /// `type` aliases, name -> target, collected by `prescan` so an alias may be
+    /// used before it is declared. A use is rewritten to its target at parse
+    /// time, so no later pass sees the alias and layout is unaffected.
+    aliases: std::collections::HashMap<String, Type>,
+    /// The `skip(n)` index recorded by the most recent
+    /// `std::env::args().skip(n).map(..).collect()` in a `let` initializer.
+    /// `parse_let` reads it to record the binding, and the `for v in &args`
+    /// desugar reads the binding's skip to start its range.
+    args_skip: i64,
+    /// Names bound to a `std::env::args()...collect()` vector, mapped to their
+    /// `skip` index. rmc has no `Vec`; a `for v in &args` over such a binding
+    /// desugars to `for i in skip..__rmc_nargs() { let v = __rmc_arg_or(i, 0); .. }`,
+    /// so no array is ever materialised.
+    args_vecs: std::collections::HashMap<String, i64>,
+    /// The loop variable of a `for v in &args` desugar, while its body is being
+    /// parsed. `v` is an `i64`, but Rust types it `&i64`, so `*v` in the body is
+    /// a copy of `v`; the parser drops the `*` for a name in this set. Scoped to
+    /// the loop body, so a shadowing `let` outside it is unaffected.
+    args_elems: std::collections::HashSet<String>,
+    /// Names bound to a `Vec` by a supported shape (`Vec::with_capacity(k)` or
+    /// `vec![e; n]`). rmc has no `Vec`; the binding holds the backing allocation
+    /// as an `i64` address, and the few methods the corpus uses are folded here
+    /// (`.as_mut_ptr()`, `.capacity()`, `.len()`).
+    vec_names: std::collections::HashSet<String>,
+    /// The constant capacity of a `Vec::with_capacity(k)` binding, for
+    /// `v.capacity()`.
+    vec_cap: std::collections::HashMap<String, i64>,
+    /// The constant length of a `vec![e; n]` binding with a constant `n`, for
+    /// `v.len()`.
+    vec_len: std::collections::HashMap<String, i64>,
+    /// Names holding a raw pointer (an `i64` address) taken by `.as_mut_ptr()`
+    /// or `.as_ptr()`. A `.add(off)` on one is the address arithmetic
+    /// `ptr + off`, matching the raw-pointer method.
+    ptr_vars: std::collections::HashSet<String>,
 }
 
 /// The deepest expression, block or type nesting the parser accepts. Deeply
@@ -68,7 +150,28 @@ impl Parser {
             current_impl: None,
             consts: std::collections::HashMap::new(),
             const_bools: std::collections::HashMap::new(),
+            const_chars: std::collections::HashMap::new(),
             struct_fields: std::collections::HashMap::new(),
+            tuple_structs: std::collections::HashSet::new(),
+            tuple_defs: Vec::new(),
+            std_mods: {
+                let mut m = std::collections::HashSet::new();
+                m.insert("std".to_string());
+                m
+            },
+            nested_fns: Vec::new(),
+            pat_refutable_ok: false,
+            fn_scopes: vec![Vec::new()],
+            fn_at: std::collections::HashMap::new(),
+            nf_counter: 0,
+            aliases: builtin_aliases(),
+            args_skip: 1,
+            args_vecs: std::collections::HashMap::new(),
+            args_elems: std::collections::HashSet::new(),
+            vec_names: std::collections::HashSet::new(),
+            vec_cap: std::collections::HashMap::new(),
+            vec_len: std::collections::HashMap::new(),
+            ptr_vars: std::collections::HashSet::new(),
         }
     }
 
@@ -168,17 +271,45 @@ impl Parser {
                 Some(Tok::Struct) => structs.push(self.parse_struct()?),
                 Some(Tok::Enum) => enums.push(self.parse_enum()?),
                 Some(Tok::Const) => consts.push(self.parse_const()?),
+                Some(Tok::Type) => self.parse_type_alias()?,
                 Some(Tok::Fn) => fns.push(self.parse_fn()?),
                 Some(Tok::Impl) => self.parse_impl(&mut fns)?,
+                // `unsafe fn` is a plain `fn`: rmc performs no safety checking,
+                // so the qualifier carries no meaning and is dropped here.
+                Some(Tok::Ident(id)) if id == "unsafe" => {
+                    self.i += 1;
+                    if self.peek() != Some(&Tok::Fn) {
+                        return Err(format!(
+                            "at byte {}: expected `fn` after `unsafe`",
+                            self.pos()
+                        ));
+                    }
+                    fns.push(self.parse_fn()?);
+                }
+                // `use` imports a path into scope. rmc has no module system and
+                // resolves names globally, so the import is skipped; the items
+                // it would bring in (`std::process::exit`, a same-file `fn`,
+                // ...) are already visible. A `use` that brings in an item rmc
+                // does not provide fails later at its use site, with a clearer
+                // message than a parse error here.
+                Some(Tok::Ident(id)) if id == "use" => self.skip_use()?,
                 other => {
                     return Err(format!(
-                        "at byte {}: expected `fn`, `struct`, `enum`, `const` or `impl`, found {}",
+                        "at byte {}: expected `fn`, `struct`, `enum`, `const`, `type` or `impl`, found {}",
                         self.pos(),
                         other.map(|x| x.describe()).unwrap_or_else(|| "end of input".into())
                     ))
                 }
             }
         }
+        // Append the anonymous structs that tuple types introduced, so
+        // `resolve_layouts` sees them alongside the user's structs. They are
+        // added after the scan so a tuple element naming a user struct declared
+        // later still resolves.
+        structs.append(&mut self.tuple_defs);
+        // Nested functions are hoisted to the top level, so the flat list sema
+        // and codegen walk holds them like any other function.
+        fns.append(&mut self.nested_fns);
         Ok(Program { structs, enums, consts, fns })
     }
 
@@ -262,11 +393,32 @@ impl Parser {
     fn prescan(&mut self) -> PResult<()> {
         let saved = self.i;
         let mut items: Vec<ConstDef> = Vec::new();
+        // `type` aliases are deferred: (name, token index of the target). Their
+        // targets are parsed after `resolve_consts`, so a `[T; N]` target sees
+        // the constants, and after the first pass so `type A = B;` may name a
+        // later `type B`.
+        let mut alias_spans: Vec<(String, usize)> = Vec::new();
+        // Struct and enum names, for the type-namespace collision check below.
+        let mut struct_names: Vec<String> = Vec::new();
+        let mut enum_names: Vec<String> = Vec::new();
         self.i = 0;
         loop {
             match self.peek() {
                 None => break,
                 Some(Tok::Const) => items.push(self.parse_const()?),
+                Some(Tok::Type) => {
+                    // `type NAME = TYPE;`. The target is not parsed yet: a
+                    // `[T; N]` target needs the constant values, which are still
+                    // being collected. Record the name and where its target
+                    // starts, skip to the `;`, and parse the target after
+                    // `resolve_consts` (below) so it sees them.
+                    self.i += 1;
+                    let name = self.expect_ident()?;
+                    self.expect(Tok::Eq)?;
+                    let start = self.i;
+                    self.skip_to_semi()?;
+                    alias_spans.push((name, start));
+                }
                 Some(Tok::Struct) => {
                     // Record the field names, then skip the body. Only a braced
                     // struct has named fields to collect; a later `struct S { .. }`
@@ -279,6 +431,9 @@ impl Parser {
                     } else {
                         None
                     };
+                    if let Some(n) = &name {
+                        struct_names.push(n.clone());
+                    }
                     if self.peek() == Some(&Tok::LBrace) {
                         self.i += 1;
                         let mut fields = std::collections::HashSet::new();
@@ -315,9 +470,10 @@ impl Parser {
                     }
                 }
                 Some(Tok::Enum) => {
-                    // Skip `Name` then a balanced `{ .. }` body.
+                    // Record the name, then skip a balanced `{ .. }` body.
                     self.i += 1;
-                    if matches!(self.peek(), Some(Tok::Ident(_))) {
+                    if let Some(Tok::Ident(n)) = self.peek() {
+                        enum_names.push(n.clone());
                         self.i += 1;
                     }
                     self.skip_balanced(Tok::LBrace, Tok::RBrace)?;
@@ -355,7 +511,128 @@ impl Parser {
         }
         self.i = saved;
         self.resolve_consts(&items);
+        // Parse each alias target now that the constants are known. Two passes
+        // let `type A = B; type B = i64;` resolve: the first lays down every
+        // direct target, the second fills any left as a bare `Named` (a target
+        // that named a not-yet-parsed alias).
+        for (name, start) in &alias_spans {
+            self.i = *start;
+            let ty = self.parse_type()?;
+            self.aliases.insert(name.clone(), ty);
+        }
+        for (name, _) in &alias_spans {
+            if let Some(t) = self.aliases.get(name).cloned() {
+                let expanded = self.expand_alias_ty(&t, 0)?;
+                self.aliases.insert(name.clone(), expanded);
+            }
+        }
+        // Parse every target once more, now that the whole alias map is known.
+        // The first pass may have lowered a tuple (or array) whose element named
+        // an alias not yet parsed, baking a `Named` placeholder into the tuple
+        // struct's fields; a later pass would then see a stale layout. Rebuilding
+        // the tuple structs here, with every alias expanded, fixes
+        // `type Pair = (T, i64); type T = i64;` to match the backward order.
+        self.tuple_structs.clear();
+        self.tuple_defs.clear();
+        for (name, start) in &alias_spans {
+            self.i = *start;
+            let ty = self.parse_type()?;
+            self.aliases.insert(name.clone(), ty);
+        }
+        for (name, _) in &alias_spans {
+            if let Some(t) = self.aliases.get(name).cloned() {
+                let expanded = self.expand_alias_ty(&t, 0)?;
+                self.aliases.insert(name.clone(), expanded);
+            }
+        }
+        // A `const`'s declared type may name an alias (`const C: Letter = 'a';
+        // type Letter = char;`). The first `resolve_consts` ran before the
+        // aliases were parsed, so it saw the placeholder `Named("Letter")` and
+        // skipped the item. Expand each type through the now-complete alias map
+        // and resolve again, so the constant lands in the table a later use
+        // reads (`print_char(C)`).
+        let expanded_items: Vec<ConstDef> = items
+            .iter()
+            .map(|d| ConstDef {
+                name: d.name.clone(),
+                ty: self.expand_alias_ty(&d.ty, 0).unwrap_or_else(|_| d.ty.clone()),
+                value: d.value.clone(),
+            })
+            .collect();
+        self.resolve_consts(&expanded_items);
+        // A `type` shares the type namespace with a struct and an enum, so a
+        // collision is an error (rustc's E0428). It does *not* collide with a
+        // `const` or a `fn`, which live in the value namespace. rmc keeps a
+        // single map for the target, so a duplicate `type` is detected by the
+        // count rather than by the map's length.
+        let mut alias_names: Vec<&str> = alias_spans.iter().map(|(n, _)| n.as_str()).collect();
+        alias_names.sort_unstable();
+        if let Some(dup) = alias_names.windows(2).find(|w| w[0] == w[1]) {
+            return Err(format!("the name `{}` is defined multiple times", dup[0]));
+        }
+        for n in &alias_names {
+            if struct_names.iter().any(|s| s == n) || enum_names.iter().any(|e| e == n) {
+                return Err(format!("the name `{}` is defined multiple times", n));
+            }
+        }
+        self.i = saved;
         Ok(())
+    }
+
+    /// Skip a whole `use ...;` item, whose path may span braces
+    /// (`use std::{env, process};`). The import is discarded — rmc resolves
+    /// every name globally — but a `std` subtree is recorded so that a later
+    /// `process::exit(0)` after `use std::process;` resolves to the `std` path.
+    fn skip_use(&mut self) -> PResult<()> {
+        self.i += 1; // the `use` identifier
+        self.collect_std_use();
+        self.skip_to_semi()
+    }
+
+    /// Record the module names a `use` of the `std` tree brings into scope.
+    /// Walks the token run up to the `;`, so `use std::process;`,
+    /// `use std::process::exit;` and `use std::{process, hint};` all register
+    /// `process` (and `hint`). A `use` that does not start at `std` is ignored.
+    fn collect_std_use(&mut self) {
+        let mut j = self.i;
+        if !matches!(self.toks.get(j).map(|t| &t.tok), Some(Tok::Ident(n)) if n == "std") {
+            return;
+        }
+        let mut want = true; // the next ident is a module name
+        j += 1;
+        while j < self.toks.len() {
+            match &self.toks[j].tok {
+                Tok::Semi => break,
+                Tok::ColonColon => want = true,
+                Tok::LBrace => {} // the group of a `std::{..}`; names inside count
+                Tok::Comma | Tok::RBrace => want = true,
+                Tok::Ident(n) if want => {
+                    self.std_mods.insert(n.clone());
+                    want = false;
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+    }
+
+    /// Advance past the next `;` at bracket depth 0, used to skip an alias
+    /// target in the pre-scan before it is parsed.
+    fn skip_to_semi(&mut self) -> PResult<()> {
+        let mut depth = 0i32;
+        while let Some(t) = self.peek() {
+            match t {
+                Tok::LParen | Tok::LBracket => depth += 1,
+                Tok::RParen | Tok::RBracket => depth -= 1,
+                Tok::Semi if depth <= 0 => {
+                    self.i += 1;
+                    return Ok(());
+                }
+                _ => {}
+            }
+            self.i += 1;
+        }
+        Err(format!("at byte {}: unexpected end of input", self.pos()))
     }
 
     /// Advance past a balanced `open .. close` group, starting at `open`.
@@ -395,6 +672,41 @@ impl Parser {
         Ok(ConstDef { name, ty, value })
     }
 
+    /// Rewrite every alias name in `t` to its target, so no later pass sees an
+    /// alias. `depth` bounds a cycle (`type A = B; type B = A;`), which would
+    /// otherwise expand forever; a cycle is reported as an error, matching
+    /// rustc's E0391 rather than hanging or emitting a wrong layout. The limit
+    /// is generous because each step is one named type.
+    fn expand_alias_ty(&self, t: &Type, depth: u32) -> PResult<Type> {
+        if depth > 64 {
+            return Err("type alias cycle detected".into());
+        }
+        match t {
+            Type::Named(n) => match self.aliases.get(n) {
+                Some(target) => self.expand_alias_ty(target, depth + 1),
+                None => Ok(t.clone()),
+            },
+            Type::Ref(inner, m) => Ok(Type::Ref(Box::new(self.expand_alias_ty(inner, depth + 1)?), *m)),
+            Type::Array(elem, n) => Ok(Type::Array(Box::new(self.expand_alias_ty(elem, depth + 1)?), *n)),
+            _ => Ok(t.clone()),
+        }
+    }
+
+    /// `type NAME = TYPE;`. The target is parsed here (aliases in it expanded by
+    /// `parse_type_inner`) and stored; a use is rewritten to it by
+    /// `expand_alias_ty`, so the alias never reaches sema. The name was
+    /// registered by `prescan`, so it may be used before this point, which means
+    /// `type A = B;` and `type B = i64;` resolve in either order.
+    fn parse_type_alias(&mut self) -> PResult<()> {
+        self.expect(Tok::Type)?;
+        let name = self.expect_ident()?;
+        self.expect(Tok::Eq)?;
+        let ty = self.parse_type()?;
+        self.expect(Tok::Semi)?;
+        self.aliases.insert(name, ty);
+        Ok(())
+    }
+
     /// Evaluate every `const` item into `self.consts`/`self.const_bools`, to a
     /// fixpoint so a constant may name one declared later. Runs after the whole
     /// program is parsed, so a forward reference resolves here even though it
@@ -411,6 +723,9 @@ impl Parser {
                 }
                 crate::consts::ConstVal::Bool(v) => {
                     self.const_bools.insert(name, v);
+                }
+                crate::consts::ConstVal::Char(v) => {
+                    self.const_chars.insert(name, v);
                 }
             }
         }
@@ -432,6 +747,26 @@ impl Parser {
         }
         self.expect(Tok::RBrace)?;
         Ok(StructDef { name, fields })
+    }
+
+    /// Lower a parsed tuple *type* `(A, B)` into its anonymous struct. The
+    /// element types may themselves be tuples, which are lowered first. The
+    /// struct definition is recorded in `tuple_defs` (once per distinct tuple
+    /// type) and appended to the program once parsing is done, so
+    /// `resolve_layouts` lays it out exactly like a user struct; the returned
+    /// `Type::Named` is what `resolve_in` then resolves to `Type::Struct`.
+    fn lower_tuple_type(&mut self, elems: Vec<Type>) -> Type {
+        let mut fields = Vec::with_capacity(elems.len());
+        let mut keys = Vec::with_capacity(elems.len());
+        for (k, e) in elems.into_iter().enumerate() {
+            keys.push(e.key());
+            fields.push((k.to_string(), e));
+        }
+        let name = crate::ast::tuple_struct_name(&keys);
+        if self.tuple_structs.insert(name.clone()) {
+            self.tuple_defs.push(StructDef { name: name.clone(), fields });
+        }
+        Type::Named(name)
     }
 
     fn parse_fn(&mut self) -> PResult<FnDef> {
@@ -567,21 +902,32 @@ impl Parser {
         param_pats: &mut Vec<Option<Vec<Stmt>>>,
     ) -> PResult<()> {
         let pm = self.eat(&Tok::Mut);
-        // `S {` or `[` at the start of a parameter is a destructuring pattern,
-        // not a name: neither can begin a plain `p: T`. A leading `mut` on a
-        // pattern is rejected, as rustc rejects `mut S { x }: S` (the `mut`
-        // belongs on each binding).
+        // `S {`, `[` or `(` at the start of a parameter is a destructuring
+        // pattern, not a name: none can begin a plain `p: T`. A leading `mut`
+        // on a pattern is rejected, as rustc rejects `mut S { x }: S` (the
+        // `mut` belongs on each binding). `n @ subpat` is likewise a pattern,
+        // but there `mut` is legal and attaches to `n`.
+        let at_pat = matches!(self.peek(), Some(Tok::Ident(_)))
+            && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::At);
         let pat = if matches!(self.peek(), Some(Tok::LBracket))
+            || matches!(self.peek(), Some(Tok::LParen))
+            || at_pat
             || matches!(self.peek(), Some(Tok::Ident(_))
                 if self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::LBrace))
         {
-            if pm {
+            if pm && !at_pat {
                 return Err(format!(
                     "at byte {}: `mut` must be attached to each individual binding",
                     self.pos()
                 ));
             }
-            Some(self.parse_pattern()?)
+            let mut p = self.parse_pattern()?;
+            if at_pat {
+                if let Pat::At(_, ref mut m, _) = p {
+                    *m = pm;
+                }
+            }
+            Some(p)
         } else {
             None
         };
@@ -612,7 +958,8 @@ impl Parser {
     /// variant, an or-pattern) is rejected, as rustc rejects it for a parameter.
     fn param_pat_binds(&mut self, p: Pat, subj: &Expr) -> PResult<Vec<Stmt>> {
         match p {
-            Pat::Struct(name, fields) => Ok(Self::struct_pat_binds(&name, &fields, subj)),
+            Pat::Struct(name, fields) => Ok(Self::struct_pat_binds(&fields, subj, &name)),
+            Pat::Tuple(elems) => Ok(Self::tuple_pat_binds(&elems, subj)),
             Pat::Array { elems, rest, front } => {
                 Ok(Self::array_pat_binds(&elems, rest, front, subj))
             }
@@ -623,8 +970,28 @@ impl Parser {
                 init: Some(subj.clone()),
                 slot: -1,
             }]),
+            // `n @ subpat: T` binds the whole argument to `n` and also
+            // destructures it. `subpat` must be irrefutable, as for any
+            // parameter pattern.
+            Pat::At(name, am, sub) => {
+                if !Self::pat_irrefutable(&sub) {
+                    return Err(format!(
+                        "at byte {}: a parameter pattern must be irrefutable (a struct, tuple or array pattern)",
+                        self.pos()
+                    ));
+                }
+                let mut binds = vec![Stmt::Let {
+                    name,
+                    ty: None,
+                    mutable: am,
+                    init: Some(subj.clone()),
+                    slot: -1,
+                }];
+                Self::pat_binds(&sub, false, subj, &mut binds);
+                Ok(binds)
+            }
             _ => Err(format!(
-                "at byte {}: a parameter pattern must be irrefutable (a struct or array pattern)",
+                "at byte {}: a parameter pattern must be irrefutable (a struct, tuple or array pattern)",
                 self.pos()
             )),
         }
@@ -670,7 +1037,35 @@ impl Parser {
     }
 
     fn parse_type_inner(&mut self) -> PResult<Type> {
+        // `*const T` / `*mut T`: a raw pointer. rmc has no borrow checking and a
+        // raw pointer is one address, exactly like a reference, so it maps to
+        // the same `Ref` type (the `mut` flag is kept for symmetry).
+        if self.eat(&Tok::Star) {
+            let mutable = match self.peek() {
+                Some(Tok::Const) => {
+                    self.i += 1;
+                    false
+                }
+                Some(Tok::Mut) => {
+                    self.i += 1;
+                    true
+                }
+                _ => {
+                    return Err(format!(
+                        "at byte {}: expected `const` or `mut` after `*`",
+                        self.pos()
+                    ))
+                }
+            };
+            let inner = self.parse_type()?;
+            return Ok(Type::Ref(Box::new(inner), mutable));
+        }
         if self.eat(&Tok::Amp) {
+            // A reference may carry a lifetime (`&'static str`, `&'a mut T`).
+            // rmc does not model lifetimes, so it is skipped here.
+            if let Some(Tok::Label(_)) = self.peek() {
+                self.i += 1;
+            }
             let mutable = self.eat(&Tok::Mut);
             let inner = self.parse_type()?;
             return Ok(Type::Ref(Box::new(inner), mutable));
@@ -696,6 +1091,10 @@ impl Parser {
                 self.i += 1;
                 Ok(Type::Bool)
             }
+            Some(Tok::TyChar) => {
+                self.i += 1;
+                Ok(Type::Char)
+            }
             Some(Tok::LBracket) => {
                 self.i += 1;
                 let elem = self.parse_type()?;
@@ -717,21 +1116,68 @@ impl Parser {
                 Ok(Type::Array(Box::new(elem), n))
             }
             Some(Tok::LParen) => {
-                // allow `()` and `(T)` for unit / grouping
                 self.i += 1;
+                // `()` is unit; `(T)` is grouping; `(A, B)` and `(A,)` are
+                // tuples, lowered to an anonymous struct so the whole struct
+                // path (layout, by-pointer passing, field reads) is reused.
                 if self.eat(&Tok::RParen) {
                     return Ok(Type::Unit);
                 }
-                let inner = self.parse_type()?;
+                let first = self.parse_type()?;
+                if !self.eat(&Tok::Comma) {
+                    self.expect(Tok::RParen)?;
+                    return Ok(first);
+                }
+                let mut elems = vec![first];
+                while self.peek() != Some(&Tok::RParen) {
+                    elems.push(self.parse_type()?);
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
                 self.expect(Tok::RParen)?;
-                Ok(inner)
+                Ok(self.lower_tuple_type(elems))
             }
             Some(Tok::Ident(_)) => {
                 let name = match self.bump() {
                     Tok::Ident(s) => s,
                     _ => unreachable!(),
                 };
-                Ok(Type::Named(name))
+                // `Vec<T>` has no real type in rmc; the `let` that declares an
+                // `args()`-vector consumes the `<..>` and its initializer is
+                // desugared. Here only the `<..>` is skipped and a placeholder
+                // `Vec` name returned, so the annotation parses. A `Vec` used
+                // anywhere but that one `let` fails when it reaches sema (the
+                // name resolves to no struct).
+                if self.peek() == Some(&Tok::Lt) {
+                    if name != "Vec" {
+                        return Err(format!(
+                            "at byte {}: unsupported generic type `{name}` (only `Vec<T>` is accepted)",
+                            self.pos()
+                        ));
+                    }
+                    self.i += 1; // `<`
+                    let mut depth = 1i32;
+                    while depth > 0 {
+                        match self.peek() {
+                            None => {
+                                return Err(format!(
+                                    "at byte {}: unexpected end of input in `Vec<..>`",
+                                    self.pos()
+                                ))
+                            }
+                            Some(Tok::Lt) => depth += 1,
+                            Some(Tok::Gt) => depth -= 1,
+                            _ => {}
+                        }
+                        self.i += 1;
+                    }
+                    return Ok(Type::Named("Vec".into()));
+                }
+                // An alias is transparent: a use is rewritten to its target here,
+                // at parse time, so no later pass sees it. A struct name is not an
+                // alias and stays `Type::Named` for sema to lay out.
+                self.expand_alias_ty(&Type::Named(name), 0)
             }
             other => Err(format!(
                 "at byte {}: expected a type, found {}",
@@ -750,6 +1196,87 @@ impl Parser {
 
     fn parse_block_inner(&mut self) -> PResult<Block> {
         self.expect(Tok::LBrace)?;
+        // A block is a `fn` scope: a nested `fn` declared directly in it is
+        // visible throughout, shadows a same-named one outside, and is gone when
+        // the block ends. The frame is filled before the statements are parsed,
+        // so a `fn` is in scope for the whole block and siblings may call each
+        // other in either order, as Rust hoists items. It is popped on every
+        // exit, so an error part way through does not leave a stale binding.
+        let frame = self.scan_block_fns()?;
+        self.fn_scopes.push(frame);
+        let r = self.parse_block_body();
+        self.fn_scopes.pop();
+        r
+    }
+
+    /// Collect the nested `fn`s declared directly in the block whose `{` has
+    /// just been consumed, without parsing the block. Each gets a unique hoisted
+    /// name, recorded both in the frame returned (name -> unique) and in `fn_at`
+    /// keyed by its `fn` keyword, so the definition is later parsed under the
+    /// same name. A `fn` nested in an inner block or a nested item's body is
+    /// skipped, since it belongs to that block's frame, not this one.
+    fn scan_block_fns(&mut self) -> PResult<Vec<(String, String)>> {
+        let mut frame: Vec<(String, String)> = Vec::new();
+        let mut depth = 0u32;
+        let mut i = self.i;
+        while i < self.toks.len() {
+            match &self.toks[i].tok {
+                Tok::LBrace | Tok::LParen | Tok::LBracket => depth += 1,
+                Tok::RBrace => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                Tok::RParen | Tok::RBracket => {
+                    depth = depth.saturating_sub(1);
+                }
+                Tok::Fn if depth == 0 => {
+                    // `fn name ( .. ) -> .. { body }`. The body brace is skipped
+                    // as a unit by the `depth` counter, so a `fn` inside it is
+                    // not seen here.
+                    if let Some(Token { tok: Tok::Ident(name), .. }) = self.toks.get(i + 1) {
+                        let name = name.clone();
+                        // Two `fn`s with the same name in one block is rustc's
+                        // E0428. A later one shadowing an outer one is fine and
+                        // keeps its own unique symbol.
+                        if frame.iter().any(|(n, _)| *n == name) {
+                            return Err(format!(
+                                "at byte {}: the name `{name}` is defined multiple times in this block",
+                                self.toks[i].pos
+                            ));
+                        }
+                        // The name carries two `$`, which no source identifier
+                        // can contain (a method's mangled name has one), so it
+                        // cannot collide with a user function. A NUL would break
+                        // the `--binutils` path, whose label goes through GNU
+                        // `as`; `$` is a valid symbol character there.
+                        let unique = format!("rmc$nf{}${}", self.nf_counter, name);
+                        self.nf_counter += 1;
+                        self.fn_at.insert(i, unique.clone());
+                        frame.push((name, unique));
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        Ok(frame)
+    }
+
+    /// The hoisted name of the nested `fn` called `name` in the innermost block
+    /// that declares one, or `name` itself when no enclosing block does (so a
+    /// top-level `fn` and a builtin are left alone).
+    fn resolve_fn_name(&self, name: String) -> String {
+        for frame in self.fn_scopes.iter().rev() {
+            if let Some((_, unique)) = frame.iter().rev().find(|(n, _)| *n == name) {
+                return unique.clone();
+            }
+        }
+        name
+    }
+
+    fn parse_block_body(&mut self) -> PResult<Block> {
         let mut stmts = Vec::new();
         let mut tail: Option<Box<Expr>> = None;
         while self.peek() != Some(&Tok::RBrace) {
@@ -765,6 +1292,16 @@ impl Parser {
                     self.parse_stmt_into(&mut stmts)?;
                     continue;
                 }
+            }
+            // `use` is allowed inside a block as well as at the top level;
+            // skip it either way. Guard on what follows so a variable named
+            // `use` (which rmc, unlike rustc, would otherwise allow) is not
+            // swallowed by mistake.
+            if self.peek() == Some(&Tok::Ident("use".into()))
+                && matches!(self.peek2(), Some(Tok::Ident(_)) | Some(Tok::ColonColon))
+            {
+                self.skip_use()?;
+                continue;
             }
             // tail expression: an expression not followed by `;`
             if self.starts_expr() {
@@ -829,7 +1366,7 @@ impl Parser {
                 // in the body target it just as they would a labelled `while`.
                 if self.peek() == Some(&Tok::Let) {
                     self.i += 1;
-                    let pat = self.parse_pattern()?;
+                    let pat = self.parse_refutable_pattern()?;
                     self.expect(Tok::Eq)?;
                     let scrutinee = self.parse_cond()?;
                     let body = self.parse_block()?;
@@ -873,7 +1410,10 @@ impl Parser {
         // `parse_pattern` would otherwise read the name as that constant's
         // value, so the check happens here, before the pattern is parsed.
         if let Some(Tok::Ident(n)) = self.peek() {
-            if self.consts.contains_key(n) || self.const_bools.contains_key(n) {
+            if self.consts.contains_key(n)
+                || self.const_bools.contains_key(n)
+                || self.const_chars.contains_key(n)
+            {
                 return Err(format!(
                     "identifier `{n}` shadows a constant of the same name"
                 ));
@@ -882,6 +1422,35 @@ impl Parser {
         let pat = self.parse_pattern()?;
         self.expect(Tok::In)?;
         let head = self.parse_cond()?;
+        // `for v in &args` (and `for v in args`) over an `args()`-vector binding
+        // desugars to a range over the argument count; the element is read from
+        // the argument array, so the vector is never materialised. `head` is
+        // `&args` (an `AddrOf`) or the binding itself.
+        let args_name = match &head {
+            Expr::AddrOf { expr, .. } => match expr.as_ref() {
+                Expr::Var { name, .. } if self.args_vecs.contains_key(name) => Some(name.clone()),
+                _ => None,
+            },
+            Expr::Var { name, .. } if self.args_vecs.contains_key(name) => Some(name.clone()),
+            _ => None,
+        };
+        if let Some(name) = args_name {
+            let skip = self.args_vecs[&name];
+            let elem = match &pat {
+                Pat::Bind(n) => Some(n.clone()),
+                _ => None,
+            };
+            // Mark the loop variable before the body is parsed, so a `*v` in it
+            // (Rust's `&i64` element) lowers to the plain value.
+            if let Some(ref n) = elem {
+                self.args_elems.insert(n.clone());
+            }
+            let body = self.parse_block();
+            if let Some(ref n) = elem {
+                self.args_elems.remove(n);
+            }
+            return self.desugar_for_argsvec(pat, skip, body?, label);
+        }
         // `for x in &arr` iterates by *reference* in Rust: `x` is `&i64`, not
         // `i64`. rmc iterates by value, so accepting the `&` form would silently
         // give `x` the wrong type (and diverge from rustc's typing). Reject it
@@ -899,13 +1468,28 @@ impl Parser {
                 self.expect(Tok::DotDot)?;
             }
             let end = self.parse_cond()?;
-            let body = self.parse_block()?;
-            let var = match pat {
-                Pat::Bind(n) => n,
+            let mut body = self.parse_block()?;
+            // A range's loop variable is bound directly, so only an irrefutable
+            // pattern is allowed: `for n @ _ in 0..5` binds `n`, and
+            // `for n @ m in 0..5` also binds `m` (an alias) in the body.
+            let (var, extra) = match pat {
+                Pat::Bind(n) => (n, Vec::new()),
                 Pat::Wild => {
                     let n = format!("\u{0}fi{}", self.tmp);
                     self.tmp += 1;
-                    n
+                    (n, Vec::new())
+                }
+                Pat::At(n, _, sub) => {
+                    if !Self::pat_irrefutable(&sub) {
+                        return Err(format!(
+                            "at byte {}: refutable pattern in `for` binding",
+                            self.pos()
+                        ));
+                    }
+                    let subj = Expr::Var { name: n.clone(), slot: -1, ty: Type::I64 };
+                    let mut binds = Vec::new();
+                    Self::pat_binds(&sub, false, &subj, &mut binds);
+                    (n, binds)
                 }
                 _ => {
                     return Err(format!(
@@ -914,6 +1498,11 @@ impl Parser {
                     ))
                 }
             };
+            if !extra.is_empty() {
+                let mut stmts = extra;
+                stmts.extend(body.stmts);
+                body = Block { stmts, tail: body.tail };
+            }
             return Ok(Stmt::For {
                 var,
                 var_slot: -1,
@@ -975,12 +1564,33 @@ impl Parser {
                 mutable: false,
             }],
             Pat::Struct(name, fields) => self.let_destructure_stmts(name, fields, None, elem),
+            Pat::Tuple(elems) => self.let_destructure_tuple_stmts(elems, None, elem),
             Pat::Array { elems, rest, front } => {
                 self.let_destructure_array_stmts(elems, rest, front, None, elem)
             }
+            // `for n @ subpat in arr` binds the element to `n` and also matches
+            // it against `subpat`. The sub-pattern must be irrefutable (a `for`
+            // pattern is), which rustc enforces too.
+            Pat::At(name, am, sub) => {
+                if !Self::pat_irrefutable(&sub) {
+                    return Err(format!(
+                        "at byte {}: refutable pattern in `for` binding",
+                        self.pos()
+                    ));
+                }
+                let mut stmts = vec![Stmt::Let {
+                    name,
+                    ty: None,
+                    init: Some(elem.clone()),
+                    slot: -1,
+                    mutable: am,
+                }];
+                Self::pat_binds(&sub, false, &elem, &mut stmts);
+                stmts
+            }
             _ => {
                 return Err(format!(
-                    "at byte {}: `for` over an array needs a binding, `_`, a struct or an array pattern",
+                    "at byte {}: `for` over an array needs a binding, `_`, a struct, tuple or array pattern",
                     self.pos()
                 ))
             }
@@ -1006,6 +1616,81 @@ impl Parser {
             mutable: false,
         };
         Ok(Stmt::Expr(Expr::Block(Block { stmts: vec![arr_let, for_stmt], tail: None })))
+    }
+
+    /// `for PAT in &args { body }` over an `args()`-vector binding, desugared to
+    /// `for i in skip..__rmc_nargs() { let PAT = __rmc_arg_or(i, 0); body }`. The
+    /// element read is the runtime's argv parse, so no `Vec` is materialised.
+    /// `elem` names the loop variable when `PAT` is a binding, so the body's
+    /// `*v` (Rust's `&i64` element) can be lowered to `v`.
+    fn desugar_for_argsvec(
+        &mut self,
+        pat: Pat,
+        skip: i64,
+        mut body: Block,
+        label: Option<String>,
+    ) -> PResult<Stmt> {
+        let n = self.tmp;
+        self.tmp += 1;
+        let idx_name = format!("\u{0}ai{n}");
+        let idx_var = Expr::Var { name: idx_name.clone(), slot: -1, ty: Type::I64 };
+        let elem_expr = self.args_or_at(&idx_var, 0);
+        let stmts = match pat {
+            Pat::Bind(name) => vec![Stmt::Let {
+                name,
+                ty: None,
+                init: Some(elem_expr),
+                slot: -1,
+                mutable: false,
+            }],
+            Pat::Wild => vec![Stmt::Let {
+                name: format!("\u{0}ad{n}"),
+                ty: None,
+                init: Some(elem_expr),
+                slot: -1,
+                mutable: false,
+            }],
+            other => {
+                let _ = other;
+                return Err(format!(
+                    "at byte {}: `for` over an `args()` vector needs a binding or `_`",
+                    self.pos()
+                ));
+            }
+        };
+        let mut stmts = stmts;
+        stmts.extend(body.stmts.drain(..));
+        let for_stmt = Stmt::For {
+            var: idx_name,
+            var_slot: -1,
+            start: Expr::Int(skip),
+            end: Expr::Call {
+                name: "__rmc_nargs".into(),
+                args: Vec::new(),
+                arg_slots: Vec::new(),
+                ret_slot: -1,
+                ret_ty: Type::I64,
+            },
+            end_slot: -1,
+            inclusive: false,
+            body: Block { stmts, tail: body.tail },
+            label,
+        };
+        Ok(for_stmt)
+    }
+
+    /// `__rmc_arg_or(i, default)` for a runtime index `i` (the constant form is
+    /// `args_or`).
+    fn args_or_at(&self, idx: &Expr, default: i64) -> Expr {
+        Expr::Call {
+            name: "__rmc_arg_or".into(),
+            // `false`: `for v in &args` over an args-vector uses `__rmc_arg_or`'s
+            // fallback path (there is no `unwrap` here).
+            args: vec![idx.clone(), Expr::Int(default), Expr::Int(0)],
+            arg_slots: Vec::new(),
+            ret_slot: -1,
+            ret_ty: Type::I64,
+        }
     }
 
     /// Consume the `;` that ends a statement, but allow it to be omitted when
@@ -1064,6 +1749,24 @@ impl Parser {
             return Ok(());
         }
         match self.peek() {
+            // A nested `fn` is an item, not an expression: it binds a name for
+            // the whole enclosing block (and, since it captures nothing, is
+            // hoisted to the top level by `parse_program`). It is parsed here so
+            // it may appear among statements; the trailing `;` is not required.
+            // `scan_block_fns` already gave it a unique name and put it in the
+            // block's frame, so a call in this block resolves to it.
+            Some(Tok::Fn) => {
+                let at = self.i;
+                let mut f = self.parse_fn()?;
+                // The pre-scan already named this `fn` and put it in the block's
+                // frame; the definition takes that same name. A `fn` the scan
+                // did not see (it never should) falls back to its own name.
+                if let Some(unique) = self.fn_at.get(&at).cloned() {
+                    f.name = unique;
+                }
+                self.nested_fns.push(f);
+                return Ok(());
+            }
             Some(Tok::Let) => {
                 self.i += 1;
                 // `mut` before the name marks that binding mutable. A struct
@@ -1122,8 +1825,16 @@ impl Parser {
                 // from it. `..` and `f: _` are the only way to drop fields.
                 let struct_pat = matches!(self.peek(), Some(Tok::Ident(_)))
                     && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::LBrace);
-                if struct_pat || self.peek() == Some(&Tok::LBracket) {
-                    if mutable {
+                // `let n @ subpat = e;` binds the whole value to `n` and also
+                // destructures it. Detected by the `@` after the name.
+                let at_pat = matches!(self.peek(), Some(Tok::Ident(_)))
+                    && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::At);
+                if struct_pat
+                    || at_pat
+                    || self.peek() == Some(&Tok::LBracket)
+                    || self.peek() == Some(&Tok::LParen)
+                {
+                    if mutable && !at_pat {
                         return Err(format!(
                             "at byte {}: `mut` must be attached to each individual binding, as `S {{ mut f }}`",
                             self.pos()
@@ -1142,10 +1853,63 @@ impl Parser {
                         Pat::Struct(name, fields) => {
                             out.extend(self.let_destructure_stmts(name, fields, ty, init))
                         }
+                        Pat::Tuple(elems) => {
+                            out.extend(self.let_destructure_tuple_stmts(elems, ty, init))
+                        }
                         Pat::Array { elems, rest, front } => {
+                            // An array pattern must match the array's length
+                            // exactly (rustc E0527); a `..` rest only makes the
+                            // count a lower bound. rmc desugars to one index
+                            // read per element, so a mismatch would read past
+                            // the array instead of being rejected. Check it here
+                            // when the length is known from the annotation or a
+                            // literal initializer.
+                            if let Some(len) = Self::array_len_of(&ty, &init) {
+                                Self::check_array_pat_len(&elems, rest, len, self.pos())?;
+                            }
                             out.extend(self.let_destructure_array_stmts(elems, rest, front, ty, init))
                         }
-                        _ => unreachable!("`{{` or `[` starts a destructuring pattern"),
+                        // A parenthesised pattern that is not a tuple: `(x)` is
+                        // an ordinary binding and `(_)` ignores the value, as
+                        // rustc reads them.
+                        Pat::Bind(name) => out.push(Stmt::Let {
+                            name,
+                            ty,
+                            init: Some(init),
+                            slot: -1,
+                            mutable: false,
+                        }),
+                        // `let n @ subpat = e;` binds the whole value to `n`
+                        // and also matches it against `subpat`. It is a local
+                        // binding, so `subpat` must be irrefutable: `let n @
+                        // 1..=5 = e;` is a refutable local binding, which rustc
+                        // rejects (E0005).
+                        Pat::At(name, am, sub) => {
+                            if !Self::pat_irrefutable(&sub) {
+                                return Err(format!(
+                                    "at byte {}: refutable pattern in local binding",
+                                    self.pos()
+                                ));
+                            }
+                            let (mut stmts, subj) = self.let_destructure_prelude(ty, init);
+                            stmts.push(Stmt::Let {
+                                name,
+                                ty: None,
+                                init: Some(subj.clone()),
+                                slot: -1,
+                                mutable: mutable || am,
+                            });
+                            Self::pat_binds(&sub, false, &subj, &mut stmts);
+                            out.extend(stmts)
+                        }
+                        Pat::Wild => out.push(Stmt::Let {
+                            name: "\u{0}wild".to_string(),
+                            ty,
+                            init: Some(init),
+                            slot: -1,
+                            mutable: false,
+                        }),
+                        _ => unreachable!("a `(` starts a tuple, binding or wildcard pattern"),
                     }
                     return Ok(());
                 }
@@ -1161,6 +1925,121 @@ impl Parser {
                     None
                 };
                 self.expect(Tok::Semi)?;
+                // A `Vec` binding is lowered to an `i64` address of its backing
+                // allocation. Three initializers are supported, each replaced by
+                // the allocation (plus, for `vec![..]`, a fill). The binding and
+                // its shape are recorded so the methods the corpus uses
+                // (`.capacity()`, `.len()`, `.as_mut_ptr()`) fold at parse time.
+                if let Some(Expr::Call { name: m, args, .. }) = init.clone() {
+                    if m == "\u{0}argsvec" {
+                        if !matches!(ty, Some(Type::Named(ref n)) if n == "Vec") {
+                            return Err(format!(
+                                "at byte {}: `std::env::args()...collect()` needs a `Vec<i64>` binding",
+                                self.pos()
+                            ));
+                        }
+                        self.args_vecs.insert(name.clone(), self.args_skip);
+                        return Ok(());
+                    }
+                    if m == "\u{0}vecnew" || m == "\u{0}vecrepeat" {
+                        let n_expr = if m == "\u{0}vecnew" {
+                            args[0].clone()
+                        } else {
+                            args[1].clone()
+                        };
+                        // The count may be a constant or a runtime value; only a
+                        // constant is recorded for a later `.len()`/`.capacity()`
+                        // fold. Either way the size is `count * 8` bytes at run
+                        // time and `__rmc_fill` takes the count as a value.
+                        let count = eval_i64(&n_expr, &self.consts);
+                        self.vec_names.insert(name.clone());
+                        if let Some(c) = count {
+                            self.vec_len.insert(name.clone(), c);
+                            if m == "\u{0}vecnew" {
+                                self.vec_cap.insert(name.clone(), c);
+                            }
+                        }
+                        // `alloc(count * 8)`; each element is one machine word.
+                        // The count expression is evaluated once: bind it to a
+                        // temporary and reuse it for both the allocation size and
+                        // the fill, or a side-effecting count (e.g. a call) would
+                        // run twice and the two uses could disagree.
+                        let count_tmp = format!("\u{0}vc{}", self.tmp);
+                        self.tmp += 1;
+                        let count_use = Expr::Var {
+                            name: count_tmp.clone(),
+                            slot: -1,
+                            ty: Type::I64,
+                        };
+                        let bytes = Expr::Bin(
+                            BinOp::Mul,
+                            Box::new(count_use.clone()),
+                            Box::new(Expr::Int(8)),
+                        );
+                        let addr = Expr::Call {
+                            name: "alloc".into(),
+                            args: vec![bytes],
+                            arg_slots: Vec::new(),
+                            ret_slot: -1,
+                            ret_ty: Type::I64,
+                        };
+                        let init_expr = if m == "\u{0}vecnew" {
+                            addr
+                        } else {
+                            // `__rmc_fill(addr, count, elem)` writes the repeated
+                            // element; it returns the address.
+                            Expr::Call {
+                                name: "__rmc_fill".into(),
+                                args: vec![addr, count_use, args[0].clone()],
+                                arg_slots: Vec::new(),
+                                ret_slot: -1,
+                                ret_ty: Type::I64,
+                            }
+                        };
+                        out.push(Stmt::Let {
+                            name: count_tmp,
+                            ty: Some(Type::I64),
+                            init: Some(n_expr),
+                            slot: -1,
+                            mutable: false,
+                        });
+                        out.push(Stmt::Let {
+                            name,
+                            ty: Some(Type::I64),
+                            init: Some(init_expr),
+                            slot: -1,
+                            mutable,
+                        });
+                        return Ok(());
+                    }
+                    if m == "\u{0}veclist" {
+                        return Err(format!(
+                            "at byte {}: `vec![a, b, c]` is not supported (use `vec![e; n]`)",
+                            self.pos()
+                        ));
+                    }
+                    // `let p = base.as_mut_ptr();`: `base` is a `Vec` address, so
+                    // `p` holds that same address. Record it a raw pointer so a
+                    // later `p.add(off)` folds to address arithmetic.
+                    if m == "\u{0}ptr" {
+                        self.ptr_vars.insert(name.clone());
+                        out.push(Stmt::Let {
+                            name,
+                            ty: Some(Type::I64),
+                            init: Some(args[0].clone()),
+                            slot: -1,
+                            mutable,
+                        });
+                        return Ok(());
+                    }
+                }
+                if matches!(ty, Some(Type::Named(ref n)) if n == "Vec") {
+                    return Err(format!(
+                        "at byte {}: a `Vec` binding must be initialized by \
+                         `Vec::with_capacity(k)`, `vec![e; n]` or an `args()` collect",
+                        self.pos()
+                    ));
+                }
                 out.push(Stmt::Let { name, ty, init, slot: -1, mutable });
                 Ok(())
             }
@@ -1170,7 +2049,7 @@ impl Parser {
                 // and stops at the first value `PAT` does not match.
                 if self.peek() == Some(&Tok::Let) {
                     self.i += 1;
-                    let pat = self.parse_pattern()?;
+                    let pat = self.parse_refutable_pattern()?;
                     self.expect(Tok::Eq)?;
                     let scrutinee = self.parse_cond()?;
                     let body = self.parse_block()?;
@@ -1303,13 +2182,7 @@ impl Parser {
         });
 
         for (vname, ty, fname) in writes {
-            let target = Expr::Field {
-                base: Box::new(tvar()),
-                name: fname,
-                offset: 0,
-                ty: Type::I64,
-                pat_struct: None,
-            };
+            let target = Expr::Field { base: Box::new(tvar()), name: fname, offset: 0, ty: Type::I64 };
             let value = Expr::Var { name: vname, slot: -1, ty };
             stmts.push(Stmt::Assign { target, value });
         }
@@ -1327,11 +2200,7 @@ impl Parser {
         // has no observable effect, so the cheap form (target repeated in the
         // right-hand side) is used. Only a call inside a subscript is bound to a
         // temporary, since evaluating it twice would run the call twice.
-        let needs_temp = match target {
-            Expr::Index(_, idx) => expr_has_call(idx),
-            _ => false,
-        };
-        if !needs_temp {
+        if !expr_has_call(target) {
             return Stmt::Assign {
                 target: target.clone(),
                 value: Expr::Bin(op, Box::new(target.clone()), Box::new(value)),
@@ -1343,7 +2212,7 @@ impl Parser {
 
         // The modifying operand is evaluated before the assignee place (the one
         // right-to-left expression), so its side effects run first: bind it now,
-        // ahead of the index temporary, or a call in the index would overtake it.
+        // ahead of any place temporary, or a call in the place would overtake it.
         let rv = format!("\u{0}rv{}", self.tmp);
         self.tmp += 1;
         stmts.push(Stmt::Let {
@@ -1354,27 +2223,43 @@ impl Parser {
             mutable: true,
         });
 
-        // Bind the read target and the write target to the *same* location.
-        // For an index the subscript is evaluated once into a temporary and
-        // reused, so `a[next()] += 1` advances the counter once, not twice.
-        // A `Var` or `Field` target has no side effect on re-evaluation.
+        // Bind the read target and the write target to the *same* location. A
+        // side-effecting component (a call in the base or the subscript) is
+        // evaluated once into a temporary and reused, so `make().x += 1` calls
+        // `make` once and `a[next()] += 1` advances the counter once. A plain
+        // `Var` or call-free `Field`/`Index` has no side effect on
+        // re-evaluation and is cloned directly.
+        let mut bind = |e: &Expr| -> Expr {
+            // NUL is not a valid identifier byte, so a generated name can
+            // never collide with one the source spells.
+            let n = format!("\u{0}tmp{}", self.tmp);
+            self.tmp += 1;
+            stmts.push(Stmt::Let {
+                name: n.clone(),
+                ty: None,
+                init: Some(e.clone()),
+                slot: -1,
+                mutable: true,
+            });
+            tv(&n)
+        };
         let (read, write) = match target {
             Expr::Index(base, idx) => {
-                // NUL is not a valid identifier byte, so a generated name can
-                // never collide with one the source spells.
-                let it = format!("\u{0}ix{}", self.tmp);
-                self.tmp += 1;
-                stmts.push(Stmt::Let {
-                    name: it.clone(),
-                    ty: Some(Type::I64),
-                    init: Some((**idx).clone()),
-                    slot: -1,
-                    mutable: true,
-                });
-                let idxv = Box::new(tv(&it));
+                // Bind only the components that call: binding an array base
+                // would copy the whole array and redirect the write to the
+                // copy, so a call-free base is cloned as before.
+                let b = if expr_has_call(base) { bind(base) } else { (**base).clone() };
+                let i = if expr_has_call(idx) { bind(idx) } else { (**idx).clone() };
                 (
-                    Expr::Index(base.clone(), idxv.clone()),
-                    Expr::Index(base.clone(), idxv),
+                    Expr::Index(Box::new(b.clone()), Box::new(i.clone())),
+                    Expr::Index(Box::new(b), Box::new(i)),
+                )
+            }
+            Expr::Field { base, name, offset, ty } => {
+                let b = if expr_has_call(base) { bind(base) } else { (**base).clone() };
+                (
+                    Expr::Field { base: Box::new(b.clone()), name: name.clone(), offset: *offset, ty: ty.clone() },
+                    Expr::Field { base: Box::new(b), name: name.clone(), offset: *offset, ty: ty.clone() },
                 )
             }
             other => (other.clone(), other.clone()),
@@ -1449,6 +2334,580 @@ impl Parser {
         let r = self.parse_expr();
         self.no_struct_lit = saved;
         r
+    }
+
+    /// `assert!(cond)`, `assert!(cond, msg)`, `assert_eq!(a, b)` and
+    /// `assert_ne!(a, b)`. Each becomes `if !(cond) { panic }` where the panic
+    /// body exits with status 101, so a failing assertion matches rustc's exit
+    /// code. The optional message is ignored (rmc prints no panic message, only
+    /// the status). `assert_eq!`/`assert_ne!` compare with `==`/`!=`; when the
+    /// operands are `str` that is the content comparison sema already lowers.
+    fn parse_assert(&mut self, name: &str) -> PResult<Expr> {
+        self.i += 1; // the `!`
+        self.expect(Tok::LParen)?;
+        let a = self.parse_bracketed_expr()?;
+        let cond = match name {
+            "assert" => a,
+            "assert_eq" | "assert_ne" => {
+                self.expect(Tok::Comma)?;
+                let b = self.parse_bracketed_expr()?;
+                let op = if name == "assert_eq" { BinOp::Eq } else { BinOp::Ne };
+                Expr::Bin(op, Box::new(a), Box::new(b))
+            }
+            _ => unreachable!(),
+        };
+        // Any remaining arguments are a custom panic message; discard them.
+        while self.eat(&Tok::Comma) {
+            let _ = self.parse_bracketed_expr()?;
+        }
+        self.expect(Tok::RParen)?;
+        Ok(Expr::If(
+            Box::new(Expr::Un(UnOp::Not, Box::new(cond))),
+            Block { stmts: vec![Stmt::Expr(Self::panic_call())], tail: None },
+            None,
+        ))
+    }
+
+    /// `panic!()`, `unreachable!()`, `todo!()` and `unimplemented!()`: exit with
+    /// status 101, rustc's panic code. Any arguments (a message) are discarded.
+    fn parse_panic(&mut self, _name: &str) -> PResult<Expr> {
+        self.i += 1; // the `!`
+        self.expect(Tok::LParen)?;
+        while self.peek() != Some(&Tok::RParen) {
+            let _ = self.parse_bracketed_expr()?;
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(Tok::RParen)?;
+        Ok(Self::panic_call())
+    }
+
+    /// The `exit(101)` call a failed assertion or a `panic!` lowers to.
+    fn panic_call() -> Expr {
+        Expr::Call {
+            name: "exit".into(),
+            args: vec![Expr::Int(101)],
+            arg_slots: vec![(-1, 0)],
+            ret_slot: -1,
+            ret_ty: Type::Unit,
+        }
+    }
+
+
+    /// `std::<mod>::<item>(args)` (or `<mod>::<item>(args)` after a
+    /// `use std::<mod>;`) for the few std items rmc provides without a standard
+    /// library. Only `process::exit` and `hint::black_box` are known; both lower
+    /// to something rmc already has, so the call type-checks and runs the same
+    /// as under rustc for the programs rmc accepts. Returns `Ok(None)` without
+    /// consuming anything when the path is not one rmc knows, so the caller can
+    /// fall back to the ordinary `::` (enum variant) handling.
+    fn try_parse_std_path(&mut self, name: &str) -> PResult<Option<Expr>> {
+        // `self.i` is at the first `::`. Work out `(module, item)` by looking
+        // ahead before consuming, so an unknown path can be declined.
+        let seg = |p: &Self, k: usize| match p.toks.get(k).map(|t| &t.tok) {
+            Some(Tok::Ident(n)) => Some(n.clone()),
+            _ => None,
+        };
+        let (module, item) = if name == "std" {
+            if self.toks.get(self.i + 2).map(|t| &t.tok) != Some(&Tok::ColonColon) {
+                return Ok(None);
+            }
+            match (seg(self, self.i + 1), seg(self, self.i + 3)) {
+                (Some(m), Some(it)) => (m, it),
+                _ => return Ok(None),
+            }
+        } else {
+            match seg(self, self.i + 1) {
+                Some(it) => (name.to_string(), it),
+                None => return Ok(None),
+            }
+        };
+        let known = matches!(
+            (module.as_str(), item.as_str()),
+            ("process", "exit") | ("hint", "black_box") | ("ptr", "null")
+        );
+        // `std::env::args()` (and `env::args()` after `use std::env;`) has no
+        // argument list; it lowers to a hidden marker the postfix parser folds
+        // together with the iterator-method chain that follows it.
+        if (module.as_str(), item.as_str()) == ("env", "args") {
+            self.expect(Tok::ColonColon)?; // the first `::`
+            if name == "std" {
+                self.expect_ident()?; // the module
+                self.expect(Tok::ColonColon)?;
+            }
+            self.expect_ident()?; // `args`
+            self.expect(Tok::LParen)?;
+            self.expect(Tok::RParen)?;
+            return Ok(Some(Expr::Call {
+                name: "\u{0}args".into(),
+                args: Vec::new(),
+                arg_slots: Vec::new(),
+                ret_slot: -1,
+                ret_ty: Type::I64,
+            }));
+        }
+        if !known {
+            // A full `std::` path is unambiguously a std import, so it gets a
+            // clear message; an aliased module may just be a same-file item.
+            if name == "std" {
+                return Err(format!(
+                    "at byte {}: unsupported path `std::{module}::{item}` \
+                     (only `std::process::exit` and `std::hint::black_box` are provided)",
+                    self.pos()
+                ));
+            }
+            return Ok(None);
+        }
+        self.expect(Tok::ColonColon)?; // the first `::`
+        if name == "std" {
+            self.expect_ident()?; // the module
+            self.expect(Tok::ColonColon)?;
+        }
+        self.expect_ident()?; // the item
+        self.expect(Tok::LParen)?;
+        // `std::ptr::null()` / `std::ptr::null_mut()` take no argument; every
+        // other known path takes exactly one.
+        if (module.as_str(), item.as_str()) == ("ptr", "null") {
+            self.expect(Tok::RParen)?;
+            return Ok(Some(Expr::Int(0)));
+        }
+        let arg = self.parse_bracketed_expr()?;
+        self.expect(Tok::RParen)?;
+        let e = match (module.as_str(), item.as_str()) {
+            // `std::process::exit(code)`: terminate with `code`. `exit` is the
+            // runtime's raw `exit` syscall wrapper; it diverges, so the parser
+            // types the call `()` like any other.
+            ("process", "exit") => Expr::Call {
+                name: "exit".into(),
+                args: vec![arg],
+                arg_slots: Vec::new(),
+                ret_slot: -1,
+                ret_ty: Type::Unit,
+            },
+            // `std::hint::black_box(x)`: the identity. rmc has no optimizer that
+            // would otherwise fold the value away, so the barrier is a no-op.
+            ("hint", "black_box") => arg,
+            _ => unreachable!(),
+        };
+        Ok(Some(e))
+    }
+
+    /// Lower the iterator-method chain that follows `std::env::args()`. rmc has
+    /// no `Iterator`/`Option`/`Result` types, so it recognises the shapes the
+    /// suite and benchmarks use and folds each to an `i64`:
+    ///
+    /// * `.nth(i).unwrap()` / `.nth(i).unwrap().parse().unwrap()`
+    ///   / `.nth(i).unwrap_or(d)` / `.nth(i).and_then(|s| s.parse().ok()).unwrap_or(d)`
+    ///     -> `__rmc_arg_or(i, d)` (`d` is `0` without an `unwrap_or`).
+    /// * `.skip(k).map(|s| s.parse::<i64>().unwrap()).collect()` -> an array of
+    ///   the arguments from index `k` on, used by the `for v in &args` form.
+    ///
+    /// A `|s| ...` closure body is not parsed for its own sake: only the
+    /// `s.parse::<i64>().unwrap()` / `.parse().ok()` shape is accepted, and its
+    /// binding name is ignored. Any other shape is rejected with a clear
+    /// message rather than mis-compiled.
+    fn finish_args_chain(&mut self, chain: Expr) -> PResult<Expr> {
+        // `chain` is the `\0args` marker. It must be followed by `.`.
+        debug_assert!(matches!(&chain, Expr::Call { name, .. } if name == "\u{0}args"));
+        let mut skip = 0i64;
+        // `skip(n)`: advance the starting index (only the last one counts, as
+        // for any iterator).
+        loop {
+            if !self.eat(&Tok::Dot) {
+                return Err(format!(
+                    "at byte {}: `std::env::args()` must be followed by an iterator method",
+                    self.pos()
+                ));
+            }
+            let m = self.expect_ident()?;
+            match m.as_str() {
+                "skip" => {
+                    self.expect(Tok::LParen)?;
+                    let n = self.parse_bracketed_expr()?;
+                    self.expect(Tok::RParen)?;
+                    skip = eval_i64(&n, &self.consts).ok_or_else(|| {
+                        format!("at byte {}: `skip` needs a constant count", self.pos())
+                    })?;
+                }
+                "nth" => {
+                    self.expect(Tok::LParen)?;
+                    let n = self.parse_bracketed_expr()?;
+                    self.expect(Tok::RParen)?;
+                    let idx = eval_i64(&n, &self.consts).ok_or_else(|| {
+                        format!("at byte {}: `nth` needs a constant index", self.pos())
+                    })?;
+                    return self.finish_args_nth(idx + skip);
+                }
+                "map" => {
+                    self.expect(Tok::LParen)?;
+                    self.skip_closure()?;
+                    self.expect(Tok::RParen)?;
+                    // Only the `.collect()` array form follows a `map` in the
+                    // supported shapes.
+                    self.expect(Tok::Dot)?;
+                    let c = self.expect_ident()?;
+                    if c != "collect" {
+                        return Err(format!(
+                            "at byte {}: `std::env::args().map(..)` must be followed by `collect()`",
+                            self.pos()
+                        ));
+                    }
+                    self.expect(Tok::LParen)?;
+                    self.expect(Tok::RParen)?;
+                    return self.finish_args_collect(skip);
+                }
+                other => {
+                    return Err(format!(
+                        "at byte {}: unsupported `std::env::args()` method `{other}`",
+                        self.pos()
+                    ))
+                }
+            }
+        }
+    }
+
+    /// `.nth(idx)` already consumed: accept `unwrap()` / `parse().unwrap()` /
+    /// `unwrap_or(d)` / `and_then(|s| s.parse().ok()).unwrap_or(d)` and fold to
+    /// `__rmc_arg_or(idx, default)`.
+    fn finish_args_nth(&mut self, idx: i64) -> PResult<Expr> {
+        let mut default: Option<Expr> = None;
+        let mut required = false;
+        let mut done = false;
+        while self.peek() == Some(&Tok::Dot) {
+            self.i += 1;
+            let m = self.expect_ident()?;
+            match m.as_str() {
+                "parse" => {
+                    // `parse::<i64>()` carries a turbofish; skip it.
+                    if self.eat(&Tok::ColonColon) {
+                        self.expect(Tok::Lt)?;
+                        self.expect_ident()?; // the type name
+                        self.expect(Tok::Gt)?;
+                    }
+                    self.expect(Tok::LParen)?;
+                    self.expect(Tok::RParen)?;
+                }
+                "unwrap" => {
+                    self.expect(Tok::LParen)?;
+                    self.expect(Tok::RParen)?;
+                    // `.unwrap()` is required: a missing or non-numeric argument
+                    // panics. `.unwrap().parse().unwrap()` is also required.
+                    required = true;
+                    done = true;
+                }
+                "unwrap_or" => {
+                    self.expect(Tok::LParen)?;
+                    let d = self.parse_bracketed_expr()?;
+                    self.expect(Tok::RParen)?;
+                    default = Some(d);
+                    done = true;
+                }
+                "and_then" => {
+                    self.expect(Tok::LParen)?;
+                    self.skip_closure()?;
+                    self.expect(Tok::RParen)?;
+                }
+                other => {
+                    return Err(format!(
+                        "at byte {}: unsupported `std::env::args().nth(..)` method `{other}`",
+                        self.pos()
+                    ))
+                }
+            }
+        }
+        if !done {
+            return Err(format!(
+                "at byte {}: `std::env::args().nth(..)` must end with `unwrap()` or `unwrap_or(..)`",
+                self.pos()
+            ));
+        }
+        Ok(self.args_or(idx, default.unwrap_or(Expr::Int(0)), required))
+    }
+
+    /// `.skip(k).map(|s| s.parse::<i64>().unwrap()).collect()`: the arguments
+    /// from index `k` on, as an array. Only the `for v in &args` loop reads it,
+    /// so the array's length is `argc - k` clamped to the `[i64; N]` the source
+    /// declares. Since `N` is a compile-time constant and `argc` is not, rmc
+    /// emits a fixed-size array of `N` elements, each `__rmc_arg_or(k + j, 0)`.
+    /// The caller supplies `N` by re-reading it from the `let` type; here the
+    /// chain has no length, so this returns a marker the `let`/`for` fold
+    /// completes. For the suite's shapes the length is the literal in the
+    /// declared type, handled in `parse_let`.
+    fn finish_args_collect(&mut self, skip: i64) -> PResult<Expr> {
+        // The `let` that this initializes owns the array; record the skip so it
+        // can size the desugared loop. `parse_let` rejects the marker anywhere
+        // other than an `args`-vector binding.
+        self.args_skip = skip;
+        Ok(Expr::Call {
+            name: "\u{0}argsvec".into(),
+            args: Vec::new(),
+            arg_slots: Vec::new(),
+            ret_slot: -1,
+            ret_ty: Type::I64,
+        })
+    }
+
+    /// Skip a closure argument `|a, b| EXPR`, consuming its tokens without
+    /// type-checking the body (rmc only accepts the `s.parse()...` shape).
+    fn skip_closure(&mut self) -> PResult<()> {
+        if self.peek() != Some(&Tok::Pipe) {
+            return Err(format!("at byte {}: expected a closure `|..| ..`", self.pos()));
+        }
+        self.i += 1; // the opening `|`
+        // Parameters up to the closing `|`.
+        while self.peek() != Some(&Tok::Pipe) {
+            match self.peek() {
+                Some(Tok::Ident(_)) | Some(Tok::Comma) | Some(Tok::Underscore) => self.i += 1,
+                _ => {
+                    return Err(format!(
+                        "at byte {}: unsupported closure parameter in `std::env::args()` chain",
+                        self.pos()
+                    ))
+                }
+            }
+        }
+        self.i += 1; // the closing `|`
+        // The body: `s.parse::<i64>().unwrap()` or `s.parse().ok()`. Walk to the
+        // end of the closure's expression (the enclosing `)` or `,`).
+        let mut depth = 0i32;
+        loop {
+            match self.peek() {
+                None => break,
+                Some(Tok::LParen) => {
+                    depth += 1;
+                    self.i += 1;
+                }
+                Some(Tok::RParen) => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                    self.i += 1;
+                }
+                Some(Tok::Comma) if depth == 0 => break,
+                _ => self.i += 1,
+            }
+        }
+        Ok(())
+    }
+
+    /// `__rmc_arg_or(idx, default)`.
+    fn args_or(&self, idx: i64, default: Expr, required: bool) -> Expr {
+        Expr::Call {
+            name: "__rmc_arg_or".into(),
+            // `required` mirrors `unwrap()`: the runtime exits (101) when the
+            // argument is absent or not a whole integer, instead of yielding
+            // the fallback. `unwrap_or(d)` passes `false` and gets `d`.
+            args: vec![Expr::Int(idx), default, Expr::Int(required as i64)],
+            arg_slots: Vec::new(),
+            ret_slot: -1,
+            ret_ty: Type::I64,
+        }
+    }
+
+    /// `println!("...")` / `print!("...")`: format the literal and its `{}`
+    /// arguments, then print. `println!` appends a newline. The format string
+    /// must be a literal (a variable one is not supported), and a `{}` is filled
+    /// by the next argument in order; `{{`/`}}` are literal braces, and `\n` and
+    /// the other escapes are already resolved by the lexer. Each printed piece
+    /// is a `__rmc_print` call, which sema rewrites to the runtime helper that
+    /// matches the value's type (`__rmc_write_i64`, `__rmc_write_bool` or
+    /// `__rmc_write_str`); none of those appends a newline, so `println!` adds
+    /// the one trailing newline itself and `print!` adds none.
+    fn parse_macro(&mut self, name: &str) -> PResult<Expr> {
+        self.i += 1; // the `!`
+        let newline = name == "println";
+        if !self.eat(&Tok::LParen) {
+            return Err(format!("at byte {}: `{name}!` expects `(`", self.pos()));
+        }
+        // The format string must be a literal. `println!()` with no format at
+        // all is allowed and prints just a newline, as in rustc.
+        let fmt = if self.peek() == Some(&Tok::RParen) {
+            String::new()
+        } else {
+            match self.peek().cloned() {
+                Some(Tok::Str(s)) => {
+                    self.i += 1;
+                    s
+                }
+                other => {
+                    return Err(format!(
+                        "at byte {}: `{name}!` expects a string literal, found {}",
+                        self.pos(),
+                        other.map(|t| t.describe()).unwrap_or_else(|| "end of input".into())
+                    ))
+                }
+            }
+        };
+        let mut args: Vec<Expr> = Vec::new();
+        // The format string is the first element of a comma-separated list, so
+        // arguments (if any) follow a leading comma: `println!("x{}", a)`.
+        if self.eat(&Tok::Comma) {
+            while self.peek() != Some(&Tok::RParen) {
+                args.push(self.parse_bracketed_expr()?);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(Tok::RParen)?;
+        self.desugar_macro(name, newline, &fmt, args)
+    }
+
+    /// `vec![e; n]` (repeat form) and `vec![a, b, c]` (list form). rmc has no
+    /// `Vec`; each lowers to a fresh heap allocation holding the elements, with
+    /// the value being the block address (an `i64`). The repeat form's `n` and
+    /// the list form's length are recorded so a later `.len()` folds. The
+    /// element count must be a constant for the size to be known at compile
+    /// time; a non-constant `n` is rejected.
+    fn parse_vec_macro(&mut self) -> PResult<Expr> {
+        self.i += 1; // the `!`
+        self.expect(Tok::LBracket)?;
+        // Empty `vec![]` is a zero-length allocation.
+        if self.eat(&Tok::RBracket) {
+            return Ok(Expr::Call {
+                name: "\u{0}vecrepeat".into(),
+                args: vec![Expr::Int(0), Expr::Int(0)],
+                arg_slots: Vec::new(),
+                ret_slot: -1,
+                ret_ty: Type::I64,
+            });
+        }
+        let first = self.parse_bracketed_expr()?;
+        // `vec![e; n]`: the `;` separates the element from the count.
+        if self.eat(&Tok::Semi) {
+            let n = self.parse_bracketed_expr()?;
+            self.expect(Tok::RBracket)?;
+            return Ok(Expr::Call {
+                name: "\u{0}vecrepeat".into(),
+                args: vec![first, n],
+                arg_slots: Vec::new(),
+                ret_slot: -1,
+                ret_ty: Type::I64,
+            });
+        }
+        // `vec![a, b, c]`: the elements are stored in order.
+        let mut elems = vec![first];
+        while self.eat(&Tok::Comma) {
+            if self.peek() == Some(&Tok::RBracket) {
+                break;
+            }
+            elems.push(self.parse_bracketed_expr()?);
+        }
+        self.expect(Tok::RBracket)?;
+        Ok(Expr::Call {
+            name: "\u{0}veclist".into(),
+            args: elems,
+            arg_slots: Vec::new(),
+            ret_slot: -1,
+            ret_ty: Type::I64,
+        })
+    }
+
+    /// Build the block for `println!`/`print!` from the parsed format and
+    /// arguments. See `parse_macro` for the contract.
+    fn desugar_macro(
+        &mut self,
+        name: &str,
+        newline: bool,
+        fmt: &str,
+        args: Vec<Expr>,
+    ) -> PResult<Expr> {
+        let bytes = fmt.as_bytes();
+        let mut stmts: Vec<Stmt> = Vec::new();
+        let mut arg_i = 0usize;
+        let mut lit: Vec<u8> = Vec::new();
+        // Rust evaluates every format argument before the first byte of output.
+        // The body below interleaves literal chunks with `{}` writes, so the
+        // raw arguments are bound to fresh locals first and the writes read
+        // those; otherwise `println!("A{}B{}", f(), g())` would print `A`, then
+        // run `f`, then print `f`'s value. Each local is `_`-prefixed and
+        // untyped so sema infers the value's type and `__rmc_print` still picks
+        // the matching writer.
+        let mut bound: Vec<Expr> = Vec::new();
+        for (i, arg) in args.iter().enumerate() {
+            let name = format!("\u{0}fmt{i}");
+            stmts.push(Stmt::Let {
+                name: name.clone(),
+                ty: None,
+                init: Some(arg.clone()),
+                slot: -1,
+                mutable: false,
+            });
+            bound.push(Expr::Var { name, slot: -1, ty: Type::I64 });
+        }
+        let args = bound;
+        let flush = |lit: &mut Vec<u8>, stmts: &mut Vec<Stmt>| {
+            if !lit.is_empty() {
+                let s = String::from_utf8(lit.clone()).unwrap_or_default();
+                lit.clear();
+                stmts.push(Stmt::Expr(Expr::Call {
+                    name: "__rmc_print".into(),
+                    args: vec![Expr::Str(s)],
+                    arg_slots: vec![(-1, 0)],
+                    ret_slot: -1,
+                    ret_ty: Type::Unit,
+                }));
+            }
+        };
+        let mut k = 0usize;
+        while k < bytes.len() {
+            match bytes[k] {
+                b'{' if bytes.get(k + 1) == Some(&b'{') => {
+                    lit.push(b'{');
+                    k += 2;
+                }
+                b'}' if bytes.get(k + 1) == Some(&b'}') => {
+                    lit.push(b'}');
+                    k += 2;
+                }
+                b'{' if bytes.get(k + 1) == Some(&b'}') => {
+                    flush(&mut lit, &mut stmts);
+                    let arg = args.get(arg_i).cloned().ok_or_else(|| {
+                        format!("at byte {}: `{name}!` has more `{{}}` than arguments", self.pos())
+                    })?;
+                    arg_i += 1;
+                    stmts.push(Stmt::Expr(Expr::Call {
+                        name: "__rmc_print".into(),
+                        args: vec![arg],
+                        arg_slots: vec![(-1, 0)],
+                        ret_slot: -1,
+                        ret_ty: Type::Unit,
+                    }));
+                    k += 2;
+                }
+                b'{' | b'}' => {
+                    return Err(format!(
+                        "at byte {}: `{name}!` supports only `{{}}` in the format string",
+                        self.pos()
+                    ));
+                }
+                other => {
+                    lit.push(other);
+                    k += 1;
+                }
+            }
+        }
+        flush(&mut lit, &mut stmts);
+        if arg_i != args.len() {
+            return Err(format!(
+                "at byte {}: `{name}!` has {} argument(s) but {} `{{}}`",
+                self.pos(),
+                args.len(),
+                arg_i
+            ));
+        }
+        if newline {
+            stmts.push(Stmt::Expr(Expr::Call {
+                name: "putchar".into(),
+                args: vec![Expr::Int(10)],
+                arg_slots: vec![(-1, 0)],
+                ret_slot: -1,
+                ret_ty: Type::Unit,
+            }));
+        }
+        Ok(Expr::Block(Block { stmts, tail: None }))
     }
 
     fn parse_or(&mut self) -> PResult<Expr> {
@@ -1628,6 +3087,14 @@ impl Parser {
                 self.i += 1;
                 self.bump_depth()?;
                 let e = self.parse_unary()?;
+                // `*v` where `v` is a `for v in &args` loop variable: Rust types
+                // `v` as `&i64`, but rmc's desugar binds it as the `i64` value,
+                // so the deref is a copy of `v` and is dropped.
+                if let Expr::Var { name, .. } = &e {
+                    if self.args_elems.contains(name) {
+                        return Ok(e);
+                    }
+                }
                 Ok(Expr::Deref { expr: Box::new(e), ty: Type::Named(String::new()) })
             }
             _ => self.parse_postfix(),
@@ -1638,12 +3105,53 @@ impl Parser {
         let mut e = self.parse_primary()?;
         loop {
             self.bump_depth()?;
+            // `args[i]` on an `args()`-vector binding lowers to
+            // `__rmc_arg_or(i + skip, 0)`: no vector is materialised, and the
+            // index must be a constant, exactly as the direct `args().nth(i)`
+            // form requires.
+            if let Expr::Var { name, .. } = &e {
+                if let Some(&skip) = self.args_vecs.get(name) {
+                    if self.peek() == Some(&Tok::LBracket) {
+                        self.i += 1;
+                        let idx = self.parse_bracketed_expr()?;
+                        self.expect(Tok::RBracket)?;
+                        let k = eval_i64(&idx, &self.consts).ok_or_else(|| {
+                            format!(
+                                "at byte {}: indexing an `args()` vector needs a constant index",
+                                self.pos()
+                            )
+                        })?;
+                        e = self.args_or(k + skip, Expr::Int(0), false);
+                        continue;
+                    }
+                }
+            }
+            // `std::env::args()` lowers to a hidden marker; the iterator-method
+            // chain that follows folds to an `i64` (`__rmc_arg_or`). A chain rmc
+            // cannot lower is rejected there rather than mis-compiled.
+            if let Expr::Call { name, .. } = &e {
+                if name == "\u{0}args" {
+                    let chain = std::mem::replace(&mut e, Expr::Int(0));
+                    e = self.finish_args_chain(chain)?;
+                    continue;
+                }
+            }
             if self.eat(&Tok::LBracket) {
                 let idx = self.parse_bracketed_expr()?;
                 self.expect(Tok::RBracket)?;
                 e = Expr::Index(Box::new(e), Box::new(idx));
             } else if self.eat(&Tok::Dot) {
-                let name = self.expect_ident()?;
+                // A tuple field is written `.0`, `.1`, ...: the "name" is a
+                // decimal literal, which becomes the field name `"k"` of the
+                // anonymous struct a tuple lowers to. A named field keeps its
+                // identifier.
+                let name = match self.peek().cloned() {
+                    Some(Tok::Int(n)) if n >= 0 => {
+                        self.i += 1;
+                        n.to_string()
+                    }
+                    _ => self.expect_ident()?,
+                };
                 if self.eat(&Tok::LParen) {
                     let mut args = Vec::new();
                     while self.peek() != Some(&Tok::RParen) {
@@ -1653,21 +3161,62 @@ impl Parser {
                         }
                     }
                     self.expect(Tok::RParen)?;
+                    // Methods on a `Vec`/raw-pointer binding that rmc lowers to
+                    // plain arithmetic. The receiver is an `i64` (a `Vec` is its
+                    // backing address), so `capacity`/`len` fold to the constant
+                    // recorded at the binding, `as_mut_ptr`/`as_ptr` keep the
+                    // address (marked so a later `.add` folds), and `.add(off)`
+                    // is `ptr + off`.
+                    if let Expr::Var { name: recv, .. } = &e {
+                        if args.is_empty() && name == "capacity" && self.vec_cap.contains_key(recv)
+                        {
+                            e = Expr::Int(self.vec_cap[recv]);
+                            continue;
+                        }
+                        if args.is_empty() && name == "len" && self.vec_len.contains_key(recv) {
+                            e = Expr::Int(self.vec_len[recv]);
+                            continue;
+                        }
+                        if args.is_empty()
+                            && (name == "as_mut_ptr" || name == "as_ptr")
+                            && self.vec_names.contains(recv)
+                        {
+                            let recv_expr = e.clone();
+                            e = Expr::Call {
+                                name: "\u{0}ptr".into(),
+                                args: vec![recv_expr],
+                                arg_slots: Vec::new(),
+                                ret_slot: -1,
+                                ret_ty: Type::I64,
+                            };
+                            continue;
+                        }
+                        if name == "add" && args.len() == 1 && self.ptr_vars.contains(recv) {
+                            let recv_expr = e.clone();
+                            e = Expr::Bin(BinOp::Add, Box::new(recv_expr), Box::new(args.pop().unwrap()));
+                            continue;
+                        }
+                    }
                     e = Expr::MethodCall { recv: Box::new(e), name, args };
                 } else {
-                    e = Expr::Field {
-                        base: Box::new(e),
-                        name,
-                        offset: 0,
-                        ty: Type::I64,
-                        pat_struct: None,
-                    };
+                    e = Expr::Field { base: Box::new(e), name, offset: 0, ty: Type::I64 };
                 }
             } else {
                 break;
             }
         }
         Ok(e)
+    }
+
+    /// One pattern in a *refutable* position (a `match` arm or an `if let` /
+    /// `while let` scrutinee): the same as `parse_pattern`, but a tuple element
+    /// may be a scalar test.
+    fn parse_refutable_pattern(&mut self) -> PResult<Pat> {
+        let saved = self.pat_refutable_ok;
+        self.pat_refutable_ok = true;
+        let r = self.parse_pattern();
+        self.pat_refutable_ok = saved;
+        r
     }
 
     /// One pattern: an integer, `true`/`false`, `Enum::Variant`, `Enum::Variant(a, b)`,
@@ -1719,6 +3268,24 @@ impl Parser {
 
     fn parse_pattern_primary(&mut self) -> PResult<Pat> {
         match self.peek().cloned() {
+            // `mut name @ subpat` / `mut name`: a mutable binding. Only a
+            // refutable position (a `match` arm or an `if let` / `while let`
+            // scrutinee) writes `mut` here; a `let` or `for` writes it before
+            // the whole pattern. Represented as `name @ subpat` with the
+            // binding flag set, `_` standing in for the absent sub-pattern.
+            Some(Tok::Mut) if self.pat_refutable_ok => {
+                self.i += 1;
+                let n = self.expect_ident()?;
+                let sub = if self.eat(&Tok::At) {
+                    self.parse_pattern_primary()?
+                } else {
+                    Pat::Wild
+                };
+                Ok(Pat::At(n, true, Box::new(sub)))
+            }
+            // `(a, b)`: a tuple pattern. `(` cannot start a binding, a constant
+            // or a literal pattern, so it is unambiguous here.
+            Some(Tok::LParen) => self.parse_tuple_pat(),
             // `[a, b, .., c]`: an array pattern. `[` cannot start a binding or a
             // constant, so it is unambiguous here.
             Some(Tok::LBracket) => self.parse_array_pat(),
@@ -1743,7 +3310,21 @@ impl Parser {
                 self.i += 1;
                 Ok(Pat::Str(s))
             }
-            // `Enum::Variant`, `Enum::Variant(a, b)`, a constant, or a binding.
+            Some(Tok::Char(c)) => {
+                self.i += 1;
+                self.maybe_char_range(c)
+            }
+            // `name @ subpat`: bind the whole value and also match it against
+            // the sub-pattern. `@` cannot begin any other pattern, so it is
+            // unambiguous here; a `mut` may precede the name.
+            Some(Tok::Ident(n)) if self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::At) => {
+                self.i += 2;
+                let sub = self.parse_pattern_primary()?;
+                Ok(Pat::At(n, false, Box::new(sub)))
+            }
+            // A bare name that is a constant is that constant's value, a name
+            // that is a struct starts a struct pattern, and anything else binds
+            // the scrutinee; `_` already matched the wildcard case above.
             Some(Tok::Ident(n)) => {
                 self.i += 1;
                 if self.eat(&Tok::ColonColon) {
@@ -1781,6 +3362,8 @@ impl Parser {
                     Ok(Pat::Int(*v))
                 } else if let Some(b) = self.const_bools.get(&n) {
                     Ok(Pat::Bool(*b))
+                } else if let Some(c) = self.const_chars.get(&n) {
+                    Ok(Pat::Char(*c))
                 } else {
                     // A bare name binds the scrutinee; `_` already matched the
                     // wildcard case above.
@@ -1828,7 +3411,7 @@ impl Parser {
             } else {
                 self.parse_pattern_primary()?
             };
-            if m && !matches!(p, Pat::Bind(_)) {
+            if m && !matches!(p, Pat::Bind(_) | Pat::At(..)) {
                 return Err(format!(
                     "at byte {}: `mut` is not allowed here; it attaches to a binding",
                     self.pos()
@@ -1935,6 +3518,22 @@ impl Parser {
                         ));
                     }
                     Some((false, self.parse_array_pat()?))
+                } else if matches!(self.peek(), Some(Tok::Ident(_)))
+                    && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::At)
+                {
+                    // `f: n @ subpat` binds the field to `n` and also
+                    // destructures it. The sub-pattern must be irrefutable,
+                    // since rmc generates no per-field test.
+                    let name = self.expect_ident()?;
+                    self.i += 1; // the `@`
+                    let sub = self.parse_pattern_primary()?;
+                    if !Self::pat_irrefutable(&sub) {
+                        return Err(format!(
+                            "at byte {}: a struct field sub-pattern must be irrefutable",
+                            self.pos()
+                        ));
+                    }
+                    Some((m, Pat::At(name, m, Box::new(sub))))
                 } else {
                     Some((m, Pat::Bind(self.expect_ident()?)))
                 }
@@ -2014,7 +3613,7 @@ impl Parser {
             // `mut` may precede an element binding (`[mut a, b]`), as in rustc.
             let m = self.eat(&Tok::Mut);
             let p = self.parse_pattern_primary()?;
-            if m && !matches!(p, Pat::Bind(_)) {
+            if m && !matches!(p, Pat::Bind(_) | Pat::At(..)) {
                 return Err(format!(
                     "at byte {}: `mut` is not allowed here; it attaches to a binding",
                     self.pos()
@@ -2039,6 +3638,125 @@ impl Parser {
         // `..` from those after it, and `array_pat_binds` reads the tail
         // relative to the array's length.
         Ok(Pat::Array { elems, rest, front })
+    }
+
+    /// `(a, b)`: a tuple pattern, with the opening `(` already peeked. `()` is
+    /// the unit pattern (binds nothing); `(a)` is a parenthesised sub-pattern,
+    /// not a one-tuple, matching rustc's rule that a one-tuple needs a trailing
+    /// comma `(a,)`. Every element must be irrefutable, since a tuple pattern has
+    /// no test.
+    fn parse_tuple_pat(&mut self) -> PResult<Pat> {
+        self.i += 1; // the `(`
+        if self.eat(&Tok::RParen) {
+            return Ok(Pat::Tuple(Vec::new()));
+        }
+        let m = self.eat(&Tok::Mut);
+        // An element may be an or-pattern (`(0 | 1, x)`), which `parse_pattern`
+        // collects; a lone primary is returned unchanged.
+        let first = self.parse_pattern()?;
+        if m && !matches!(first, Pat::Bind(_) | Pat::At(..)) {
+            return Err(format!(
+                "at byte {}: `mut` is not allowed here; it attaches to a binding",
+                self.pos()
+            ));
+        }
+        // `(a)`: a parenthesised pattern, not a tuple.
+        if !self.eat(&Tok::Comma) {
+            self.expect(Tok::RParen)?;
+            return Ok(first);
+        }
+        let mut elems = vec![(m, first)];
+        while self.peek() != Some(&Tok::RParen) {
+            if self.peek().is_none() {
+                return Err(format!(
+                    "at byte {}: unexpected end of input in tuple pattern",
+                    self.pos()
+                ));
+            }
+            let m = self.eat(&Tok::Mut);
+            let p = self.parse_pattern()?;
+            if m && !matches!(p, Pat::Bind(_) | Pat::At(..)) {
+                return Err(format!(
+                    "at byte {}: `mut` is not allowed here; it attaches to a binding",
+                    self.pos()
+                ));
+            }
+            elems.push((m, p));
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(Tok::RParen)?;
+        // A tuple element must be irrefutable in a `let`, `for` head or
+        // parameter, where the pattern has no test; in a `match` arm or an
+        // `if let` / `while let` scrutinee it may instead be a scalar test
+        // (an integer, bool, string or range), which rmc generates. Anything
+        // else (a variant pattern, which would bind its payload through the
+        // test) is rejected in both.
+        for (_, p) in &elems {
+            if !Self::pat_irrefutable(p) && !self.pat_refutable_ok {
+                return Err(format!(
+                    "at byte {}: tuple pattern elements must be bindings, `_`, or nested patterns",
+                    self.pos()
+                ));
+            }
+            if !Self::tuple_element_ok(p) {
+                return Err(format!(
+                    "at byte {}: a tuple pattern element must be irrefutable or a scalar test (an integer, `true`/`false`, a string or a range)",
+                    self.pos()
+                ));
+            }
+        }
+        Ok(Pat::Tuple(elems))
+    }
+
+    /// The `let` statements a tuple pattern introduces: one per bound element,
+    /// each a read of the element's field (`"k"` on the anonymous struct a tuple
+    /// lowers to). Shared by the `let`, `for`, `match` and parameter paths.
+    fn tuple_pat_binds(elems: &[(bool, Pat)], subj: &Expr) -> Vec<Stmt> {
+        let mut out = Vec::new();
+        for (k, (m, pat)) in elems.iter().enumerate() {
+            let field = Expr::Field {
+                base: Box::new(subj.clone()),
+                name: k.to_string(),
+                offset: -1,
+                ty: Type::Unit,
+            };
+            match pat {
+                Pat::Bind(b) => out.push(Stmt::Let {
+                    name: b.clone(),
+                    ty: None,
+                    mutable: *m,
+                    init: Some(field),
+                    slot: -1,
+                }),
+                Pat::Wild => {}
+                // `name @ subpat`: bind the element to `name`, then bind the
+                // sub-pattern's names from the same element read.
+                Pat::At(name, am, sub) => {
+                    out.push(Stmt::Let {
+                        name: name.clone(),
+                        ty: None,
+                        mutable: *m || *am,
+                        init: Some(field.clone()),
+                        slot: -1,
+                    });
+                    Self::pat_binds(sub, false, &field, &mut out);
+                }
+                Pat::Struct(name, inner) => out.extend(Self::struct_pat_binds(inner, &field, &name)),
+                Pat::Tuple(inner) => out.extend(Self::tuple_pat_binds(inner, &field)),
+                Pat::Array { elems, rest, front } => {
+                    out.extend(Self::array_pat_binds(elems, *rest, *front, &field))
+                }
+                // A scalar element (`(1, x)`) binds nothing here: its test is
+                // generated separately by `tuple_pat_test`. An or-pattern element
+                // is allowed in an irrefutable context only when a `_`
+                // alternative makes it irrefutable, so it too binds nothing.
+                Pat::Int(_) | Pat::Char(_) | Pat::CharRange(..) | Pat::Bool(_) | Pat::Str(_) | Pat::Range(..) | Pat::Or(_) => {}
+                _ => unreachable!("a tuple element is validated when the tuple is parsed"),
+            }
+        }
+        out
     }
 
     /// The `let` statements an array pattern introduces: one per bound element,
@@ -2086,13 +3804,24 @@ impl Parser {
                     init: Some(index),
                     slot: -1,
                 }),
+                // `name @ subpat`: bind the element to `name`, then bind the
+                // sub-pattern's names from the same index read.
+                Pat::At(name, am, sub) => {
+                    out.push(Stmt::Let {
+                        name: name.clone(),
+                        ty: None,
+                        mutable: *m || *am,
+                        init: Some(index.clone()),
+                        slot: -1,
+                    });
+                    Self::pat_binds(sub, false, &index, &mut out);
+                }
                 Pat::Array { elems, rest, front } => {
                     out.extend(Self::array_pat_binds(elems, *rest, *front, &index))
                 }
-                // A struct sub-pattern inside an array element.
-                Pat::Struct(name, fields) => {
-                    out.extend(Self::struct_pat_binds(name, fields, &index))
-                }
+                // A struct or tuple sub-pattern inside an array element.
+                Pat::Struct(name, fields) => out.extend(Self::struct_pat_binds(fields, &index, &name)),
+                Pat::Tuple(elems) => out.extend(Self::tuple_pat_binds(elems, &index)),
                 _ => unreachable!("unexpected array sub-pattern"),
             }
         }
@@ -2114,7 +3843,7 @@ impl Parser {
             if self.peek().is_none() {
                 return Err(format!("at byte {}: unexpected end of input in `match`", self.pos()));
             }
-            let pat = self.parse_pattern()?;
+            let pat = self.parse_refutable_pattern()?;
             // An optional guard: `pat if cond => body`. The condition is parsed
             // like an `if` condition, so a struct literal needs parentheses.
             let guard = if self.eat(&Tok::If) {
@@ -2218,13 +3947,178 @@ impl Parser {
         Ok(Pat::Range(lo, hi, inclusive))
     }
 
+    /// If a `..`/`..=` follows a `char` literal just parsed, consume it and the
+    /// upper bound to build a `char` range pattern; otherwise the literal stands
+    /// alone. Both bounds are `char`, and the upper bound must be a `char`
+    /// literal, as in rustc (which also rejects an empty range).
+    fn maybe_char_range(&mut self, lo: u32) -> PResult<Pat> {
+        let inclusive = match self.peek() {
+            Some(Tok::DotDot) => false,
+            Some(Tok::DotDotEq) => true,
+            _ => return Ok(Pat::Char(lo)),
+        };
+        self.i += 1;
+        let hi = match self.peek() {
+            Some(Tok::Char(c)) => {
+                let c = *c;
+                self.i += 1;
+                c
+            }
+            _ => {
+                return Err(format!(
+                    "at byte {}: expected a `char` literal as the range pattern's upper bound",
+                    self.pos()
+                ))
+            }
+        };
+        if !inclusive && lo >= hi {
+            return Err(format!(
+                "at byte {}: empty range pattern `'{}'..'{}'`",
+                self.pos(),
+                char::from_u32(lo).unwrap_or('\u{FFFD}'),
+                char::from_u32(hi).unwrap_or('\u{FFFD}')
+            ));
+        }
+        if inclusive && lo > hi {
+            return Err(format!(
+                "at byte {}: empty range pattern `'{}'..='{}'`",
+                self.pos(),
+                char::from_u32(lo).unwrap_or('\u{FFFD}'),
+                char::from_u32(hi).unwrap_or('\u{FFFD}')
+            ));
+        }
+        Ok(Pat::CharRange(lo, hi, inclusive))
+    }
+
+    /// The boolean test for one tuple *element* pattern, if it has one. A
+    /// binding, `_`, a struct pattern and a nested irrefutable tuple are
+    /// test-free (`None`); a scalar pattern reuses the same test the top-level
+    /// `match` builds. A variant pattern is rejected when the tuple is parsed,
+    /// so it is not reached here.
+    fn pat_test(p: &Pat, subj: &Expr) -> Option<Expr> {
+        match p {
+            Pat::Wild | Pat::Bind(_) | Pat::Struct(..) => None,
+            // `name @ subpat`: the binding itself adds no test; the sub-pattern's
+            // test is the whole test.
+            Pat::At(_, _, sub) => Self::pat_test(sub, subj),
+            Pat::Tuple(elems) => Self::tuple_pat_test(elems, subj),
+            // `a | b | c` as an element: any alternative matching passes. A `_`
+            // alternative makes the whole element always true, so there is no
+            // test; otherwise fold the alternatives' tests with `||`.
+            Pat::Or(alts) => {
+                if alts.iter().any(|a| matches!(a, Pat::Wild)) {
+                    return None;
+                }
+                let mut cond = Self::or_cond(&alts[0], subj);
+                for alt in &alts[1..] {
+                    cond = Expr::Bin(BinOp::Or, Box::new(cond), Box::new(Self::or_cond(alt, subj)));
+                }
+                Some(cond)
+            }
+            Pat::Int(k) => Some(Expr::Bin(
+                BinOp::Eq,
+                Box::new(Self::scalar_scrutinee(subj)),
+                Box::new(Expr::Int(*k)),
+            )),
+            Pat::Char(c) => Some(Expr::Bin(
+                BinOp::Eq,
+                Box::new(Self::scalar_scrutinee(subj)),
+                Box::new(Expr::Char(*c)),
+            )),
+            Pat::Bool(b) => Some(Expr::BoolTest {
+                scrutinee: Box::new(Self::scalar_scrutinee(subj)),
+                value: *b,
+            }),
+            Pat::Str(s) => Some(Expr::Bin(
+                BinOp::Eq,
+                Box::new(subj.clone()),
+                Box::new(Expr::Str(s.clone())),
+            )),
+            Pat::Range(lo, hi, inclusive) => {
+                let lower = Expr::Bin(
+                    BinOp::Le,
+                    Box::new(Expr::Int(*lo)),
+                    Box::new(Self::scalar_scrutinee(subj)),
+                );
+                let upper = Expr::Bin(
+                    if *inclusive { BinOp::Le } else { BinOp::Lt },
+                    Box::new(Self::scalar_scrutinee(subj)),
+                    Box::new(Expr::Int(*hi)),
+                );
+                Some(Expr::Bin(BinOp::And, Box::new(lower), Box::new(upper)))
+            }
+            Pat::CharRange(lo, hi, inclusive) => {
+                let lower = Expr::Bin(
+                    BinOp::Le,
+                    Box::new(Expr::Char(*lo)),
+                    Box::new(Self::scalar_scrutinee(subj)),
+                );
+                let upper = Expr::Bin(
+                    if *inclusive { BinOp::Le } else { BinOp::Lt },
+                    Box::new(Self::scalar_scrutinee(subj)),
+                    Box::new(Expr::Char(*hi)),
+                );
+                Some(Expr::Bin(BinOp::And, Box::new(lower), Box::new(upper)))
+            }
+            _ => unreachable!("a tuple element is validated when the tuple is parsed"),
+        }
+    }
+
+    /// The boolean test for a tuple pattern: the `&&` of its elements' tests,
+    /// each read through the element's field (`"k"` on the anonymous struct a
+    /// tuple lowers to). `None` when every element is irrefutable, so the arm is
+    /// a catch-all.
+    fn tuple_pat_test(elems: &[(bool, Pat)], subj: &Expr) -> Option<Expr> {
+        let mut cond: Option<Expr> = None;
+        for (k, (_, p)) in elems.iter().enumerate() {
+            let field = Expr::Field {
+                base: Box::new(subj.clone()),
+                name: k.to_string(),
+                offset: -1,
+                ty: Type::Unit,
+            };
+            if let Some(t) = Self::pat_test(p, &field) {
+                cond = Some(match cond {
+                    None => t,
+                    Some(c) => Expr::Bin(BinOp::And, Box::new(c), Box::new(t)),
+                });
+            }
+        }
+        cond
+    }
+
+    /// True for a pattern a tuple element may hold: an irrefutable one, or a
+    /// scalar test rmc can generate (an integer, `true`/`false`, a string or a
+    /// range). A nested tuple is validated when it is parsed. A variant or an
+    /// or-pattern is rejected: rmc would have to bind a payload or merge the
+    /// alternatives through the element test.
+    fn tuple_element_ok(p: &Pat) -> bool {
+        match p {
+            Pat::Wild | Pat::Bind(_) | Pat::Struct(..) | Pat::Tuple(_) => true,
+            // `name @ subpat` is allowed when its sub-pattern is.
+            Pat::At(_, _, sub) => Self::tuple_element_ok(sub),
+            Pat::Array { .. } => Self::pat_irrefutable(p),
+            Pat::Int(_) | Pat::Char(_) | Pat::CharRange(..) | Pat::Bool(_) | Pat::Str(_) | Pat::Range(..) => true,
+            // An or-pattern is allowed when every alternative is a scalar test
+            // or a `_` (no alternative binds or is a variant).
+            Pat::Or(alts) => alts.iter().all(|a| {
+                matches!(a, Pat::Wild | Pat::Int(_) | Pat::Char(_) | Pat::CharRange(..) | Pat::Bool(_) | Pat::Str(_) | Pat::Range(..))
+            }),
+            Pat::Variant(..) => false,
+        }
+    }
+
     /// Whether a pattern matches every value: `_`, a binding, or an
     /// or-pattern with such an alternative.
     fn pat_irrefutable(p: &Pat) -> bool {
         match p {
             // A struct pattern always matches: it binds the named fields and
             // ignores the rest, with no test, so an arm using one is a catch-all.
+            // A tuple pattern matches when every element pattern does.
             Pat::Wild | Pat::Bind(_) | Pat::Struct(..) => true,
+            // `name @ subpat` is irrefutable exactly when its sub-pattern is.
+            Pat::At(_, _, sub) => Self::pat_irrefutable(sub),
+            Pat::Tuple(elems) => elems.iter().all(|(_, p)| Self::pat_irrefutable(p)),
             // An array pattern matches when every element pattern does.
             Pat::Array { elems, .. } => elems
                 .iter()
@@ -2261,15 +4155,27 @@ impl Parser {
         // *guarded* irrefutable arm is not a catch-all: `_ if c` can fail, so
         // the arms after it are still reachable.
         let has_catch_all = arms.iter().any(|(p, g, _)| g.is_none() && Self::pat_irrefutable(p));
+        // Snapshot the scrutinee into a temporary before the arm chain whenever
+        // it names a value that can change. A guard may assign the matched
+        // variable (`match x { n if { x = 2; true } => n }`) or one of its
+        // fields (`match p { P { x } if { p.x = 9; true } => x }`); the pattern
+        // bindings and the body must keep the value captured when the arm
+        // matched, so the guard and the body both read this snapshot rather than
+        // a binding re-created after the guard ran. Without a guard nothing runs
+        // between an arm's test and its body, so a plain variable stays inline
+        // (that keeps the pattern lowering identical to the equivalent reads).
+        // A non-variable scrutinee is always evaluated once, matching Rust.
+        let has_guard = arms.iter().any(|(_, g, _)| g.is_some());
         let (subj, prelude) = match scrutinee {
-            Expr::Var { .. } | Expr::Int(_) | Expr::EnumVariant { .. } => (scrutinee, None),
+            Expr::Int(_) | Expr::EnumVariant { .. } => (scrutinee, None),
+            Expr::Var { .. } if !has_guard => (scrutinee, None),
             other => {
                 let name = format!("\u{0}mt{}", self.tmp);
                 self.tmp += 1;
                 (
                     Expr::Var { name: name.clone(), slot: -1, ty: Type::I64 },
                     // No annotation: the temp takes the scrutinee's type, which
-                    // may be an enum rather than an integer.
+                    // may be an enum, a struct or a bool rather than an integer.
                     Some(Stmt::Let { name, ty: None, init: Some(other), slot: -1, mutable: false }),
                 )
             }
@@ -2345,8 +4251,16 @@ impl Parser {
         Ok(Stmt::Expr(Expr::Loop(loop_body, -1, Type::Unit, label)))
     }
 
-    /// One arm of a desugared `match` or `if let`: the pattern test, the
-    /// bindings it introduces, and the fallback `rest` for a non-match.
+    /// The scrutinee of a *scalar* pattern test, wrapped so sema can apply
+    /// match ergonomics. rustc derefs a `&T` scrutinee for a literal, range or
+    /// bool pattern (`match &x { 5 => .. }`), and the desugared test is a plain
+    /// comparison that sema would otherwise reject on a `&i64`. The parser does
+    /// not know the scrutinee's type, so it marks the node and `sema` rewrites
+    /// it — to a `Deref` for a reference, to the bare expression otherwise.
+    fn scalar_scrutinee(subj: &Expr) -> Expr {
+        Expr::PatScrutinee(Box::new(subj.clone()))
+    }
+
     /// The boolean test for one alternative of an or-pattern. Only a test, not
     /// an arm: the shared body and fallback stay outside, so an or-pattern does
     /// not duplicate the body. A binding or `_` alternative is always true, but
@@ -2354,22 +4268,53 @@ impl Parser {
     /// irrefutable alternative here.
     fn or_cond(pat: &Pat, subj: &Expr) -> Expr {
         match pat {
-            Pat::Int(k) => Expr::Bin(BinOp::Eq, Box::new(subj.clone()), Box::new(Expr::Int(*k))),
-            Pat::Bool(b) => Expr::BoolTest { scrutinee: Box::new(subj.clone()), value: *b },
+            Pat::Int(k) => Expr::Bin(
+                BinOp::Eq,
+                Box::new(Self::scalar_scrutinee(subj)),
+                Box::new(Expr::Int(*k)),
+            ),
+            Pat::Char(c) => Expr::Bin(
+                BinOp::Eq,
+                Box::new(Self::scalar_scrutinee(subj)),
+                Box::new(Expr::Char(*c)),
+            ),
+            Pat::Bool(b) => {
+                Expr::BoolTest { scrutinee: Box::new(Self::scalar_scrutinee(subj)), value: *b }
+            }
             // A string pattern tests by content: `Bin(Eq, ..)` over a `str`,
             // which sema lowers to the byte-wise helper. A pointer compare
-            // would never match two distinct-but-equal literals.
+            // would never match two distinct-but-equal literals. A `str`
+            // scrutinee is the string type itself (rmc has no unsized `str`), so
+            // it is not auto-deref'd: `match &s { "hi" => .. }` on a `&str`
+            // is rejected, as rustc rejects it for `&&str`.
             Pat::Str(s) => Expr::Bin(
                 BinOp::Eq,
                 Box::new(subj.clone()),
                 Box::new(Expr::Str(s.clone())),
             ),
             Pat::Range(lo, hi, inclusive) => {
-                let lower = Expr::Bin(BinOp::Le, Box::new(Expr::Int(*lo)), Box::new(subj.clone()));
+                let lower = Expr::Bin(
+                    BinOp::Le,
+                    Box::new(Expr::Int(*lo)),
+                    Box::new(Self::scalar_scrutinee(subj)),
+                );
                 let upper = Expr::Bin(
                     if *inclusive { BinOp::Le } else { BinOp::Lt },
-                    Box::new(subj.clone()),
+                    Box::new(Self::scalar_scrutinee(subj)),
                     Box::new(Expr::Int(*hi)),
+                );
+                Expr::Bin(BinOp::And, Box::new(lower), Box::new(upper))
+            }
+            Pat::CharRange(lo, hi, inclusive) => {
+                let lower = Expr::Bin(
+                    BinOp::Le,
+                    Box::new(Expr::Char(*lo)),
+                    Box::new(Self::scalar_scrutinee(subj)),
+                );
+                let upper = Expr::Bin(
+                    if *inclusive { BinOp::Le } else { BinOp::Lt },
+                    Box::new(Self::scalar_scrutinee(subj)),
+                    Box::new(Expr::Char(*hi)),
                 );
                 Expr::Bin(BinOp::And, Box::new(lower), Box::new(upper))
             }
@@ -2383,8 +4328,14 @@ impl Parser {
             },
             // `_` in an or-pattern: always true, so the whole condition is true.
             // A struct pattern is likewise always true; a binding one is
-            // rejected before this point.
+            // rejected before this point. A tuple alternative folds its
+            // elements' tests with `&&`, or is `true` when it has none.
             Pat::Wild | Pat::Struct(..) => Expr::Bool(true),
+            // `n @ subpat` as an alternative: its test is the sub-pattern's
+            // (the binding is emitted separately, and an or-alternative binds
+            // nothing, so `n` is rejected here like any other binding).
+            Pat::At(_, _, sub) => Self::or_cond(sub, subj),
+            Pat::Tuple(elems) => Self::tuple_pat_test(elems, subj).unwrap_or(Expr::Bool(true)),
             // A binding inside an or-pattern is rejected before this point; an
             // array pattern is not supported as an or-alternative.
             Pat::Bind(_) | Pat::Or(_) | Pat::Array { .. } => {
@@ -2402,14 +4353,53 @@ impl Parser {
     /// it is still checked.
     fn let_destructure_stmts(
         &mut self,
-        sname: String,
+        name: String,
         fields: Vec<FieldPat>,
         ty: Option<Type>,
         init: Expr,
     ) -> Vec<Stmt> {
         let (mut out, subj) = self.let_destructure_prelude(ty, init);
-        out.extend(Self::struct_pat_binds(&sname, &fields, &subj));
+        out.extend(Self::struct_pat_binds(&fields, &subj, &name));
         out
+    }
+
+    /// The element count an array pattern's subject is known to have, from its
+    /// written type (`[i64; 2]`) or an array literal initializer. `None` when
+    /// neither is present, so the length check is skipped rather than guessed.
+    fn array_len_of(ty: &Option<Type>, init: &Expr) -> Option<usize> {
+        if let Some(Type::Array(_, n)) = ty {
+            return Some(*n);
+        }
+        match init {
+            Expr::ArrayLit(_, n) => Some(*n),
+            Expr::ArrayList(vs) => Some(vs.len()),
+            _ => None,
+        }
+    }
+
+    /// Reject an array pattern whose element count cannot match `len`, as rustc
+    /// does (E0527): exactly `len` elements without a `..`, and at most `len`
+    /// with one.
+    fn check_array_pat_len(
+        elems: &[Option<(bool, Pat)>],
+        rest: bool,
+        len: usize,
+        pos: u32,
+    ) -> PResult<()> {
+        if rest {
+            if elems.len() > len {
+                return Err(format!(
+                    "at byte {pos}: pattern requires at most {len} elements but array has {len}"
+                ));
+            }
+        } else if elems.len() != len {
+            return Err(format!(
+                "at byte {pos}: pattern requires {} element{} but array has {len}",
+                elems.len(),
+                if elems.len() == 1 { "" } else { "s" }
+            ));
+        }
+        Ok(())
     }
 
     /// The same expansion for an array pattern: bind the scrutinee to a hidden
@@ -2426,6 +4416,21 @@ impl Parser {
     ) -> Vec<Stmt> {
         let (mut out, subj) = self.let_destructure_prelude(ty, init);
         out.extend(Self::array_pat_binds(&elems, rest, front, &subj));
+        out
+    }
+
+    /// The same expansion for a tuple pattern: bind the scrutinee to a hidden
+    /// temporary (unless it is already a plain place) and read each named
+    /// element out of it. The temporary carries the annotation, so `let (a, b):
+    /// (i64, i64) = e;` is still checked.
+    fn let_destructure_tuple_stmts(
+        &mut self,
+        elems: Vec<(bool, Pat)>,
+        ty: Option<Type>,
+        init: Expr,
+    ) -> Vec<Stmt> {
+        let (mut out, subj) = self.let_destructure_prelude(ty, init);
+        out.extend(Self::tuple_pat_binds(&elems, &subj));
         out
     }
 
@@ -2461,8 +4466,14 @@ impl Parser {
     /// may auto-deref a `&S` scrutinee. `f: _` contributes no binding. A nested
     /// sub-pattern (`f: I { a }`) recurses with the field read as its
     /// sub-scrutinee, so the nested names become ordinary chained reads.
-    fn struct_pat_binds(sname: &str, fields: &[FieldPat], subj: &Expr) -> Vec<Stmt> {
-        let mut out = Vec::new();
+    fn struct_pat_binds(fields: &[FieldPat], subj: &Expr, pat_struct: &str) -> Vec<Stmt> {
+        // A check that `subj` is really a `pat_struct`, emitted even when the
+        // pattern binds no fields (`A { .. }`), so a pattern naming the wrong
+        // struct is rejected rather than silently matching.
+        let mut out = vec![Stmt::Expr(Expr::PatCheck {
+            base: Box::new(subj.clone()),
+            pat_struct: pat_struct.to_string(),
+        })];
         for (fname, bind) in fields {
             let (m, pat) = match bind {
                 Some(x) => x,
@@ -2473,7 +4484,6 @@ impl Parser {
                 name: fname.clone(),
                 offset: -1,
                 ty: Type::Unit,
-                pat_struct: Some(sname.to_string()),
             };
             match pat {
                 Pat::Bind(b) => out.push(Stmt::Let {
@@ -2483,15 +4493,28 @@ impl Parser {
                     init: Some(field),
                     slot: -1,
                 }),
-                Pat::Struct(name, inner) => {
-                    out.extend(Self::struct_pat_binds(name, inner, &field))
+                // `f: name @ subpat`: bind the field to `name`, then bind the
+                // sub-pattern's names from the same field read.
+                Pat::At(name, am, sub) => {
+                    out.push(Stmt::Let {
+                        name: name.clone(),
+                        ty: None,
+                        mutable: *m || *am,
+                        init: Some(field.clone()),
+                        slot: -1,
+                    });
+                    Self::pat_binds(sub, false, &field, &mut out);
                 }
+                Pat::Struct(inner_name, inner) => {
+                    out.extend(Self::struct_pat_binds(inner, &field, inner_name))
+                }
+                Pat::Tuple(inner) => out.extend(Self::tuple_pat_binds(inner, &field)),
                 // An array-typed field may be destructured by an array pattern.
                 Pat::Array { elems, rest, front } => {
                     out.extend(Self::array_pat_binds(elems, *rest, *front, &field))
                 }
-                // Only a binding, a nested struct pattern or a nested array
-                // pattern is parsed here.
+                // Only a binding, a nested struct/tuple pattern or a nested
+                // array pattern is parsed here.
                 _ => unreachable!("unexpected struct sub-pattern"),
             }
         }
@@ -2500,26 +4523,43 @@ impl Parser {
 
     /// The `let` statements one sub-pattern introduces, reading from `subj`.
     /// `m` is a `mut` written before the pattern; only a binding may carry it.
-    /// A binding becomes one `let`; a wildcard binds nothing; a struct or array
-    /// pattern recurses, reading through `subj` (its own fields/elements). Used
-    /// by a payload variant's arguments, so `E::A(S { x })` and `E::A([a, b])`
-    /// expand to the same reads the equivalent `let` would.
-    fn pat_binds_into(pat: Pat, m: bool, subj: &Expr, out: &mut Vec<Stmt>) {
+    /// A binding becomes one `let`; a wildcard binds nothing; a struct, tuple
+    /// or array pattern recurses, reading through `subj` (its own fields or
+    /// elements). Shared by the `let`/`for`/`match` paths and a payload
+    /// variant's arguments, so `E::A(S { x })` expands to the same read the
+    /// equivalent `let` would.
+    fn pat_binds(pat: &Pat, m: bool, subj: &Expr, out: &mut Vec<Stmt>) {
         match pat {
             Pat::Bind(name) => out.push(Stmt::Let {
-                name,
+                name: name.clone(),
                 ty: None,
                 mutable: m,
                 init: Some(subj.clone()),
                 slot: -1,
             }),
             Pat::Wild => {}
-            Pat::Struct(name, fields) => out.extend(Self::struct_pat_binds(&name, &fields, subj)),
-            Pat::Array { elems, rest, front } => {
-                out.extend(Self::array_pat_binds(&elems, rest, front, subj))
+            // `name @ subpat`: bind the whole value to `name`, then bind the
+            // sub-pattern's names from the same value.
+            Pat::At(name, am, sub) => {
+                out.push(Stmt::Let {
+                    name: name.clone(),
+                    ty: None,
+                    mutable: m || *am,
+                    init: Some(subj.clone()),
+                    slot: -1,
+                });
+                Self::pat_binds(sub, false, subj, out);
             }
-            // `parse_variant_pat_args` rejects anything else.
-            _ => unreachable!("unexpected variant argument pattern"),
+            Pat::Struct(name, fields) => out.extend(Self::struct_pat_binds(fields, subj, &name)),
+            Pat::Tuple(elems) => out.extend(Self::tuple_pat_binds(elems, subj)),
+            Pat::Array { elems, rest, front } => {
+                out.extend(Self::array_pat_binds(elems, *rest, *front, subj))
+            }
+            // A scalar element binds nothing (its test is generated
+            // separately); an or-pattern binds nothing (rmc rejects a binding
+            // in an or-pattern when it is parsed).
+            Pat::Int(_) | Pat::Char(_) | Pat::CharRange(..) | Pat::Bool(_) | Pat::Str(_) | Pat::Range(..) | Pat::Or(_) => {}
+            _ => unreachable!("unexpected sub-pattern"),
         }
     }
 
@@ -2530,6 +4570,9 @@ impl Parser {
     fn first_bound_name(p: &Pat) -> Option<String> {
         match p {
             Pat::Bind(n) => Some(n.clone()),
+            // `name @ subpat` binds `name` first, then whatever the sub-pattern
+            // binds.
+            Pat::At(n, _, _) => Some(n.clone()),
             // A payload variant pattern binds the names of its argument
             // sub-patterns; a nested variant pattern would too, but it is
             // rejected before this point.
@@ -2539,6 +4582,7 @@ impl Parser {
             Pat::Struct(_, fields) => fields.iter().find_map(|(_, b)| {
                 b.as_ref().and_then(|(_, sub)| Self::first_bound_name(sub))
             }),
+            Pat::Tuple(elems) => elems.iter().find_map(|(_, sub)| Self::first_bound_name(sub)),
             Pat::Array { elems, .. } => elems
                 .iter()
                 .find_map(|e| e.as_ref().and_then(|(_, p)| Self::first_bound_name(p))),
@@ -2547,21 +4591,29 @@ impl Parser {
         }
     }
 
-    fn desugar_arm(
-        &mut self,
-        pat: Pat,
-        guard: Option<Expr>,
-        subj: &Expr,
-        body: Expr,
-        rest: Option<Expr>,
-        check_dead: bool,
-    ) -> PResult<Expr> {
-        // Each pattern yields its test (`None` when it is irrefutable) and any
-        // bindings it introduces. The test is an ordinary expression, so sema
-        // and codegen need no new case for a guard: it is folded in with `&&`,
-        // and an irrefutable arm's guard becomes the whole `if` condition.
-        let (bindings, test): (Vec<Stmt>, Option<Expr>) = match pat {
+    /// The bindings and the optional test a pattern contributes to an arm.
+    /// A test is `None` when the pattern is irrefutable, so the arm is a
+    /// catch-all. `Pat::At` binds the whole value and recurses into its
+    /// sub-pattern, so `n @ 1..=5` binds `n` and adds the range test.
+    fn arm_pattern_parts(pat: Pat, subj: &Expr) -> (Vec<Stmt>, Option<Expr>) {
+        match pat {
             Pat::Wild => (Vec::new(), None),
+            // `name @ subpat` binds the whole value to `name`, then matches the
+            // same value against `subpat`, which contributes its own bindings
+            // and test: `n @ 1..=5` binds `n` and adds the range test, and
+            // `n @ (a, b)` binds all three.
+            Pat::At(name, m, sub) => {
+                let mut binds = vec![Stmt::Let {
+                    name,
+                    ty: None,
+                    mutable: m,
+                    init: Some(subj.clone()),
+                    slot: -1,
+                }];
+                let (sub_binds, test) = Self::arm_pattern_parts(*sub, subj);
+                binds.extend(sub_binds);
+                (binds, test)
+            }
             // `S { f, g: h } => body` is irrefutable, so it has no test: it binds
             // each named field to a fresh local via a field read. The reads are
             // left for sema to type and locate, so a non-struct scrutinee is a
@@ -2569,7 +4621,14 @@ impl Parser {
             // scrutinee by auto-deref. The struct name and each field name were
             // already checked against the prescan, so `f: _` (which emits no
             // read) is validated too.
-            Pat::Struct(name, fields) => (Self::struct_pat_binds(&name, &fields, &subj), None),
+            Pat::Struct(name, fields) => (Self::struct_pat_binds(&fields, &subj, &name), None),
+            // `(a, b) => body` binds each named element via a field read. When
+            // every element is irrefutable there is no test (a catch-all); a
+            // scalar element (`(0, x)`) adds its test, folded into the arm's
+            // condition like any other.
+            Pat::Tuple(elems) => {
+                (Self::tuple_pat_binds(&elems, &subj), Self::tuple_pat_test(&elems, &subj))
+            }
             // `[a, b] => body` is irrefutable in the same way: it binds each
             // named element via an index read, with no test. A `..` rest shifts
             // the trailing bindings to the back of the array.
@@ -2589,10 +4648,23 @@ impl Parser {
             ),
             Pat::Int(k) => (
                 Vec::new(),
-                Some(Expr::Bin(BinOp::Eq, Box::new(subj.clone()), Box::new(Expr::Int(k)))),
+                Some(Expr::Bin(
+                    BinOp::Eq,
+                    Box::new(Self::scalar_scrutinee(subj)),
+                    Box::new(Expr::Int(k)),
+                )),
+            ),
+            Pat::Char(c) => (
+                Vec::new(),
+                Some(Expr::Bin(
+                    BinOp::Eq,
+                    Box::new(Self::scalar_scrutinee(subj)),
+                    Box::new(Expr::Char(c)),
+                )),
             ),
             // A string literal pattern: a content compare, which sema lowers to
-            // the byte-wise helper (a pointer compare would never match).
+            // the byte-wise helper (a pointer compare would never match). Not
+            // auto-deref'd: see `or_cond`.
             Pat::Str(s) => (
                 Vec::new(),
                 Some(Expr::Bin(BinOp::Eq, Box::new(subj.clone()), Box::new(Expr::Str(s)))),
@@ -2601,12 +4673,30 @@ impl Parser {
             // sides. A plain `Bin(And, ..)` of comparisons, so sema and codegen
             // need no new case.
             Pat::Range(lo, hi, inclusive) => {
-                let lower =
-                    Expr::Bin(BinOp::Le, Box::new(Expr::Int(lo)), Box::new(subj.clone()));
+                let lower = Expr::Bin(
+                    BinOp::Le,
+                    Box::new(Expr::Int(lo)),
+                    Box::new(Self::scalar_scrutinee(subj)),
+                );
                 let upper = Expr::Bin(
                     if inclusive { BinOp::Le } else { BinOp::Lt },
-                    Box::new(subj.clone()),
+                    Box::new(Self::scalar_scrutinee(subj)),
                     Box::new(Expr::Int(hi)),
+                );
+                (Vec::new(), Some(Expr::Bin(BinOp::And, Box::new(lower), Box::new(upper))))
+            }
+            // `'a'..'z'` / `'a'..='z'`: the char analogue of `Range`, the same
+            // pair of comparisons with `char` bounds.
+            Pat::CharRange(lo, hi, inclusive) => {
+                let lower = Expr::Bin(
+                    BinOp::Le,
+                    Box::new(Expr::Char(lo)),
+                    Box::new(Self::scalar_scrutinee(subj)),
+                );
+                let upper = Expr::Bin(
+                    if inclusive { BinOp::Le } else { BinOp::Lt },
+                    Box::new(Self::scalar_scrutinee(subj)),
+                    Box::new(Expr::Char(hi)),
                 );
                 (Vec::new(), Some(Expr::Bin(BinOp::And, Box::new(lower), Box::new(upper))))
             }
@@ -2630,7 +4720,10 @@ impl Parser {
             // chain of them can be recognised as an exhaustive bool match.
             Pat::Bool(b) => (
                 Vec::new(),
-                Some(Expr::BoolTest { scrutinee: Box::new(subj.clone()), value: b }),
+                Some(Expr::BoolTest {
+                    scrutinee: Box::new(Self::scalar_scrutinee(subj)),
+                    value: b,
+                }),
             ),
             Pat::Variant(enum_name, variant, args) => {
                 let n_binds = args.as_ref().map_or(-1, |(a, _)| a.len() as i32);
@@ -2660,7 +4753,7 @@ impl Parser {
                                 offset: 0,
                                 ty: Type::Unit,
                             };
-                            Self::pat_binds_into(pat, m, &payload, &mut out);
+                            Self::pat_binds(&pat, m, &payload, &mut out);
                         }
                         out
                     }
@@ -2668,17 +4761,48 @@ impl Parser {
                 };
                 (binds, Some(cond))
             }
+        }
+    }
+
+    /// One arm of a desugared `match` or `if let`: the pattern test, the
+    /// bindings it introduces, and the fallback `rest` for a non-match.
+    fn desugar_arm(
+        &mut self,
+        pat: Pat,
+        guard: Option<Expr>,
+        subj: &Expr,
+        body: Expr,
+        rest: Option<Expr>,
+        check_dead: bool,
+    ) -> PResult<Expr> {
+        // Each pattern yields its test (`None` when it is irrefutable) and any
+        // bindings it introduces. The test is an ordinary expression, so sema
+        // and codegen need no new case for a guard: it is folded in with `&&`,
+        // and an irrefutable arm's guard becomes the whole `if` condition.
+        let (bindings, test) = Self::arm_pattern_parts(pat, &subj);
+        // The pattern's bindings belong to the guard and to the arm body, but
+        // NOT to the fallback `rest`: a later arm must not see this arm's names
+        // (`match x { n if false => n, _ => n }` must let the `_` arm read the
+        // outer `n`). So the bindings wrap the guard expression and the `then`
+        // block, never the whole `if`.
+        let with_bindings = |e: Expr| -> Expr {
+            if bindings.is_empty() {
+                e
+            } else {
+                Expr::Block(Block { stmts: bindings.clone(), tail: Some(Box::new(e)) })
+            }
         };
-        let arm = match test {
+        let then = with_bindings(body);
+        Ok(match test {
             Some(cond) => {
                 // `pat if g => body` is `pat => body` only when `g` holds, so
                 // the guard joins the pattern test with `&&` and a failed guard
                 // falls through to `rest`.
                 let cond = match guard {
-                    Some(g) => Expr::Bin(BinOp::And, Box::new(cond), Box::new(g)),
+                    Some(g) => Expr::Bin(BinOp::And, Box::new(cond), Box::new(with_bindings(g))),
                     None => cond,
                 };
-                Self::match_arm(cond, body, rest)
+                Self::match_arm(cond, then, rest)
             }
             // An irrefutable arm: without a guard it always matches (and `rest`
             // is dead); with one it is `if g { body } else { rest }`. The guard
@@ -2686,19 +4810,14 @@ impl Parser {
             // exhaustiveness walk can tell a guarded binding arm (covers
             // nothing) from an unguarded one (covers everything).
             None => match guard {
-                None => Self::irrefutable_arm(body, rest, check_dead),
+                None => Self::irrefutable_arm(then, rest, check_dead),
                 Some(g) => Self::match_arm(
-                    Expr::Bin(BinOp::And, Box::new(Expr::Bool(true)), Box::new(g)),
-                    body,
+                    Expr::Bin(BinOp::And, Box::new(Expr::Bool(true)), Box::new(with_bindings(g))),
+                    then,
                     rest,
                 ),
             },
-        };
-        if bindings.is_empty() {
-            Ok(arm)
-        } else {
-            Ok(Expr::Block(Block { stmts: bindings, tail: Some(Box::new(arm)) }))
-        }
+        })
     }
 
     /// An irrefutable arm (`_` or a binding) always matches, so `rest` (the
@@ -2744,6 +4863,10 @@ impl Parser {
                 self.i += 1;
                 Ok(Expr::Int(v))
             }
+            Some(Tok::Char(c)) => {
+                self.i += 1;
+                Ok(Expr::Char(c))
+            }
             // The magnitude `2^63` is only valid directly under a `-`, which
             // `parse_unary` folds into `Expr::Int(i64::MIN)`. Reaching it here
             // means it stood alone, so it is out of range, as in rustc.
@@ -2755,6 +4878,22 @@ impl Parser {
                 self.i += 1;
                 Ok(Expr::Str(s))
             }
+            // `i64::MIN` / `i64::MAX` / `i64::BITS`. `i64` is a keyword token,
+            // so it never reaches the `Ident` arm below.
+            Some(Tok::TyI64) => {
+                self.i += 1;
+                if self.eat(&Tok::ColonColon) {
+                    let konst = self.expect_ident()?;
+                    if let Some(v) = int_assoc_const("i64", &konst) {
+                        return Ok(Expr::Int(v));
+                    }
+                    return Err(format!(
+                        "at byte {}: `i64` has no associated constant `{konst}`",
+                        self.pos()
+                    ));
+                }
+                Err(format!("at byte {}: expected an expression, found `i64`", self.pos()))
+            }
             Some(Tok::True) => {
                 self.i += 1;
                 Ok(Expr::Bool(true))
@@ -2765,6 +4904,11 @@ impl Parser {
             }
             Some(Tok::Ident(name)) => {
                 self.i += 1;
+                // `unsafe { .. }`: rmc does no borrow or safety checking, so the
+                // block is transparent. `unsafe fn` is likewise a plain `fn`.
+                if name == "unsafe" && self.peek() == Some(&Tok::LBrace) {
+                    return self.parse_block().map(Expr::Block);
+                }
                 // `Self { .. }` names the struct of the enclosing `impl`.
                 let name = if name == "Self" {
                     match self.current_impl.clone() {
@@ -2779,9 +4923,79 @@ impl Parser {
                 } else {
                     name
                 };
+                // A macro invocation `name!(...)`. `print!`/`println!` are
+                // lowered to runtime writes; `assert!`, `assert_eq!`,
+                // `assert_ne!`, `panic!` and `unreachable!` become an exit with
+                // status 101 (rustc's panic code). Any other name is rejected.
+                if self.peek() == Some(&Tok::Bang) {
+                    match name.as_str() {
+                        "println" | "print" => return self.parse_macro(&name),
+                        "vec" => return self.parse_vec_macro(),
+                        "assert" | "assert_eq" | "assert_ne" => {
+                            return self.parse_assert(&name)
+                        }
+                        "panic" | "unreachable" | "todo" | "unimplemented" => {
+                            return self.parse_panic(&name)
+                        }
+                        _ => {
+                            return Err(format!(
+                                "at byte {}: unknown macro `{name}!`",
+                                self.pos()
+                            ))
+                        }
+                    }
+                }
+                // `std::...` paths, or a module brought in by `use std::m;`, for
+                // the handful of std items rmc provides. Flattening the path
+                // lets `std::process::exit(0)` and `std::hint::black_box(x)`
+                // compile; an unrecognised path is left to the normal `::`
+                // handling below (so a struct named like a module still works).
+                if self.peek() == Some(&Tok::ColonColon) && self.std_mods.contains(&name) {
+                    if let Some(e) = self.try_parse_std_path(&name)? {
+                        return Ok(e);
+                    }
+                }
                 // `Enum::Variant` or `Enum::Variant(args)` — resolved and
                 // range-checked by sema.
                 if self.eat(&Tok::ColonColon) {
+                    // `Vec::with_capacity(k)` and `Vec::new()` allocate the
+                    // backing store; the returned `Vec` value is the block
+                    // address (an `i64`). Only these two constructors are
+                    // supported, and only as a `let` initializer.
+                    if name == "Vec" {
+                        let assoc = self.expect_ident()?;
+                        if assoc != "with_capacity" && assoc != "new" {
+                            return Err(format!(
+                                "at byte {}: unsupported `Vec::{assoc}` (only `Vec::with_capacity` and `Vec::new`)",
+                                self.pos()
+                            ));
+                        }
+                        self.expect(Tok::LParen)?;
+                        let cap = if assoc == "new" {
+                            Expr::Int(0)
+                        } else {
+                            let e = self.parse_bracketed_expr()?;
+                            self.expect(Tok::RParen)?;
+                            e
+                        };
+                        return Ok(Expr::Call {
+                            name: "\u{0}vecnew".into(),
+                            args: vec![cap],
+                            arg_slots: Vec::new(),
+                            ret_slot: -1,
+                            ret_ty: Type::I64,
+                        });
+                    }
+                    // `i64::MIN`, `usize::MAX`, `u32::BITS`: an integer-width
+                    // associated constant folds straight to its value.
+                    if is_int_width(&name) {
+                        if let Some(Tok::Ident(konst)) = self.peek().cloned() {
+                            if let Some(v) = int_assoc_const(&name, &konst) {
+                                self.i += 1;
+                                return Ok(Expr::Int(v));
+                            }
+                        }
+                    }
                     let variant = self.expect_ident()?;
                     if self.eat(&Tok::LParen) {
                         let mut args = Vec::new();
@@ -2864,6 +5078,10 @@ impl Parser {
                         }
                     }
                     self.expect(Tok::RParen)?;
+                    // A call names a nested `fn` if one is in scope, so a nested
+                    // `fn` shadows a top-level one of the same name. The rewrite
+                    // is to the hoisted function's unique name.
+                    let name = self.resolve_fn_name(name);
                     Ok(Expr::Call { name, args, arg_slots: Vec::new(), ret_slot: -1, ret_ty: Type::I64 })
                 } else if let Some(v) = self.consts.get(&name) {
                     // A reference to a constant is its value, substituted here
@@ -2871,6 +5089,8 @@ impl Parser {
                     Ok(Expr::Int(*v))
                 } else if let Some(b) = self.const_bools.get(&name) {
                     Ok(Expr::Bool(*b))
+                } else if let Some(c) = self.const_chars.get(&name) {
+                    Ok(Expr::Char(*c))
                 } else {
                     Ok(Expr::Var { name, slot: -1, ty: Type::I64 })
                 }
@@ -2879,11 +5099,37 @@ impl Parser {
                 self.i += 1;
                 let saved = self.no_struct_lit;
                 self.no_struct_lit = false;
-                let e = self.parse_expr();
+                // `()` is unit; `(e)` is grouping; `(a, b)` and `(a,)` are
+                // tuple literals. Sema resolves the literal's element types and
+                // rewrites it to the anonymous struct that lays them out.
+                if self.eat(&Tok::RParen) {
+                    self.no_struct_lit = saved;
+                    return Ok(Expr::Block(Block { stmts: Vec::new(), tail: None }));
+                }
+                let first = self.parse_expr();
+                let first = match first {
+                    Ok(e) => e,
+                    Err(e) => {
+                        self.no_struct_lit = saved;
+                        return Err(e);
+                    }
+                };
+                let r = if self.eat(&Tok::Comma) {
+                    let mut elems = vec![first];
+                    while self.peek() != Some(&Tok::RParen) {
+                        elems.push(self.parse_expr()?);
+                        if !self.eat(&Tok::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(Tok::RParen)?;
+                    Ok(Expr::TupleLit(elems))
+                } else {
+                    self.expect(Tok::RParen)?;
+                    Ok(first)
+                };
                 self.no_struct_lit = saved;
-                let e = e?;
-                self.expect(Tok::RParen)?;
-                Ok(e)
+                r
             }
             Some(Tok::If) => {
                 self.i += 1;
@@ -2892,7 +5138,7 @@ impl Parser {
                 // codegen need no new case.
                 if self.peek() == Some(&Tok::Let) {
                     self.i += 1;
-                    let pat = self.parse_pattern()?;
+                    let pat = self.parse_refutable_pattern()?;
                     self.expect(Tok::Eq)?;
                     let scrutinee = self.parse_cond()?;
                     let then = self.parse_block()?;
@@ -3003,6 +5249,11 @@ impl Parser {
 enum Pat {
     Wild,
     Int(i64),
+    /// A character literal, matched by value.
+    Char(u32),
+    /// `'a'..'z'` / `'a'..='z'`, inclusive flag set for `..=`. The character
+    /// analogue of `Range`.
+    CharRange(u32, u32, bool),
     /// `lo..hi` / `lo..=hi`, inclusive flag set for `..=`.
     Range(i64, i64, bool),
     /// `a | b | c`, alternatives tried left to right.
@@ -3040,6 +5291,19 @@ enum Pat {
     /// arm using one has no test. Desugars to the indexed reads its bindings
     /// name.
     Array { elems: Vec<Option<(bool, Pat)>>, rest: bool, front: usize },
+    /// `(a, b, c)`: a tuple pattern. Each element is a sub-pattern with its own
+    /// `mut` flag (`(mut a, b)`). It is irrefutable when every element is, so a
+    /// `let`/`for`/parameter may use one; a `match` arm using one has no test.
+    /// Desugars to the field reads its bindings name (a tuple is an anonymous
+    /// struct, so element `k` is the field `"k"`). The element count must match
+    /// the scrutinee's arity, which sema enforces through those reads.
+    Tuple(Vec<(bool, Pat)>),
+    /// `name @ subpat`: bind the whole value to `name` and also match it
+    /// against `subpat`, so `n @ 1..=5` binds `n` and tests the range. The
+    /// flag is a `mut` written before the name (`mut n @ pat`). The binding
+    /// is emitted like any other, and the sub-pattern contributes its own test
+    /// and bindings, so `n @ (a, b)` binds all three.
+    At(String, bool, Box<Pat>),
 }
 
 /// One field of a struct pattern: its name and what it binds. `None` is
@@ -3068,6 +5332,49 @@ fn expr_has_call(e: &Expr) -> bool {
     }
 }
 
+/// True when `s` is one of the built-in integer-width type names.
+fn is_int_width(s: &str) -> bool {
+    matches!(
+        s,
+        "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
+            | "u8" | "u16" | "u32" | "u64" | "u128" | "usize"
+    )
+}
+
+/// The value of an integer-width associated constant (`i32::MAX`, `u8::BITS`),
+/// or `None` when `ty`/`name` is not one. rmc has one integer type, so a width's
+/// `MIN`/`MAX`/`BITS` is folded to the `i64` value of that width; an unsigned
+/// `MAX` above `i64::MAX` becomes its two's-complement bit pattern, exactly what
+/// `u64::MAX as i64` is, so `usize::MAX` reads as `-1`.
+fn int_assoc_const(ty: &str, name: &str) -> Option<i64> {
+    let (signed, bits): (bool, u32) = match ty {
+        "i8" => (true, 8),
+        "i16" => (true, 16),
+        "i32" => (true, 32),
+        "i64" => (true, 64),
+        "i128" => (true, 128),
+        "isize" => (true, 64),
+        "u8" => (false, 8),
+        "u16" => (false, 16),
+        "u32" => (false, 32),
+        "u64" => (false, 64),
+        "u128" => (false, 128),
+        "usize" => (false, 64),
+        _ => return None,
+    };
+    let v: i128 = match name {
+        "BITS" => bits as i128,
+        "MIN" if signed => -(1i128 << (bits - 1)),
+        "MIN" => 0,
+        "MAX" if signed => (1i128 << (bits - 1)) - 1,
+        // An unsigned `MAX` of a 128-bit width is `u128::MAX`, whose bit pattern
+        // is all ones; the narrower ones fit an `i128` before truncating.
+        "MAX" => ((1u128 << bits) - 1) as i128,
+        _ => return None,
+    };
+    Some(v as i64)
+}
+
 fn block_has_call_p(b: &Block) -> bool {
     b.stmts.iter().any(stmt_has_call_p) || b.tail.as_deref().map_or(false, expr_has_call)
 }
@@ -3085,4 +5392,21 @@ fn stmt_has_call_p(s: &Stmt) -> bool {
         Stmt::Break(v, _) => v.as_ref().map_or(false, expr_has_call),
         Stmt::Continue(_) => false,
     }
+}
+
+/// The built-in integer-width type names. rmc has one integer type, `i64`, but
+/// a Rust source spells widths (`usize`, `u32`, `i8`, ...). Each is pre-seeded
+/// as a transparent alias for `i64` so `let i: usize = 0;` and
+/// `x as usize` parse; the value is `i64` throughout, so the alias is exactly
+/// what a `type usize = i64;` would give. A program may shadow any of them with
+/// its own `type`, which is why this is the alias map and not a reserved word.
+fn builtin_aliases() -> std::collections::HashMap<String, Type> {
+    let mut m = std::collections::HashMap::new();
+    for name in [
+        "usize", "isize", "u8", "u16", "u32", "u64", "u128",
+        "i8", "i16", "i32", "i128",
+    ] {
+        m.insert(name.to_string(), Type::I64);
+    }
+    m
 }

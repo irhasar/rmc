@@ -19,39 +19,20 @@ export PATH=/workspace/.cargo/bin:$PATH        # rustc/cargo are installed here
 cargo build --release --manifest-path compiler/Cargo.toml
 
 # compile a program
-./compiler/target/release/rmc bench/programs/fib.rms -o /tmp/fib
+./compiler/target/release/rmc bench/rust/fib.rs -o /tmp/fib
 /tmp/fib 30
 
 # inspect generated assembly
-./compiler/target/release/rmc bench/programs/fib.rms --emit-asm
-
-# compile a real Rust file through the rustc-MIR front end + rmc back end
-./compiler/target/release/rmc bench/mir/fib.rs -o /tmp/fib-mir
-/tmp/fib-mir 32
-
-# the back end on its own: MIR text -> ELF (no rustc, no LLVM)
-./compiler/target/release/rmc bench/mir/fib.rs --keep-mir -o /tmp/fib-mir
-./compiler/target/release/examples/rmcmir bench/mir/fib.mir -o /tmp/fib-mir2
+./compiler/target/release/rmc bench/rust/fib.rs --emit-asm
 
 # full benchmark suite (writes binaries to /tmp/rmcbench)
 python3 bench/run.py
 
-# three-pipeline suite: mir vs ast vs llvm (writes binaries to /tmp/rmcmirbench)
-python3 bench/run_mir.py
-
 # benchmark suite, also recording the dated result to the repo
 python3 bench/run.py --markdown bench/RESULTS.md
-python3 bench/run_mir.py --markdown bench/RESULTS-MIR.md
-
-# fail if the MIR pipeline does not beat LLVM on every axis
-python3 bench/run_mir.py --check
 
 # differential test suite: rmc vs rustc on twin programs
 python3 tests/run.py -v
-
-# differential suite for the MIR path with `std`: each case is compiled by
-# rustc (reference) and by rmc, and the stdout/exit status must match
-python3 tests/std/run.py -v
 
 # differential fuzzer: random programs vs rustc (reproducible seeds)
 python3 tools/fuzz.py --mode expr --n 500 --seed 1
@@ -72,18 +53,19 @@ python3 tools/fuzz.py --mode nestpat --n 500 --seed 1
 python3 tools/fuzz.py --mode arrpat --n 500 --seed 1
 python3 tools/fuzz.py --mode parampat --n 500 --seed 1
 python3 tools/fuzz.py --mode enumpat --n 500 --seed 1
+python3 tools/fuzz.py --mode atpat --n 500 --seed 1
+python3 tools/fuzz.py --mode tuple --n 500 --seed 1
+python3 tools/fuzz.py --mode intmeth --n 500 --seed 1
+python3 tools/fuzz.py --mode nestedfn --n 500 --seed 1
+python3 tools/fuzz.py --mode typealias --n 500 --seed 1
+python3 tools/fuzz.py --mode printfmt --n 500 --seed 1
+python3 tools/fuzz.py --mode char --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 
-# differential fuzzer over the rustc-MIR path (rustc --emit=mir -> rmc back end)
-python3 tools/fuzz.py --mode mir --n 500 --seed 1
-python3 tools/fuzz.py --mode mir --gen width --n 500 --seed 1
-
-# robustness / soundness: rmc must error cleanly, never crash (no rustc)
-python3 tools/fuzz.py --mode robust        # rmc's own .rms parser
-python3 tools/fuzz.py --mode reject        # programs rustc rejects
-python3 tools/fuzz.py --mode mutate --n 500 --seed 1     # random edits
-python3 tools/fuzz.py --mode mirrobust     # .rs programs the MIR path rejects
-python3 tools/fuzz.py --mode mirmut --n 500 --seed 1     # mutated .mir text
+# robustness / soundness: rmc must error cleanly, never crash
+python3 tools/fuzz.py --mode robust
+python3 tools/fuzz.py --mode reject
+python3 tools/fuzz.py --mode mutate --n 500 --seed 1
 ```
 
 ## Source map
@@ -121,8 +103,23 @@ python3 tools/fuzz.py --mode mirmut --n 500 --seed 1     # mutated .mir text
   the body is not duplicated), so neither needs a sema or codegen case. A
   *string* pattern desugars to `Bin(Eq, scrutinee, Str(s))`, which sema already
   lowers to the byte-wise `__rmc_str_lt` helper: the scrutinee is a pointer, so
-  a machine compare would never match two distinct-but-equal literals. An
-  or-pattern with a
+  a machine compare would never match two distinct-but-equal literals. A
+  *scalar* pattern (a literal, a range or a bool) desugars to a plain compare
+  too, but match ergonomics must deref a `&T` scrutinee (`match &x { 5 => .. }`
+  reads the `i64` under the `&i64`), and the parser does not know the
+  scrutinee's type. So `scalar_scrutinee` wraps it in `Expr::PatScrutinee`, a
+  marker sema rewrites: `check_expr` replaces it with a `Deref` for a `Ref`
+  scrutinee, or with the bare expression otherwise (a scalar scrutinee stays
+  untouched). Only a pattern auto-derefs; a bare `r < 6` still needs `*r`, as in
+  rustc. The rewrite moves the inner expression out with `std::mem::replace`
+  rather than re-checking it, so a side-effecting scrutinee is type-checked and
+  its slots allocated exactly once. The marker never survives to codegen; the
+  later passes (`inline`, `tco`, `licm`, `dce`, `codegen`) treat it as
+  unreachable, like `ArrayList` and `MethodCall`. `TupleLit` is the same kind of
+  marker: sema's `check_expr` rewrites it to a `StructLit` of the anonymous
+  struct that lays the tuple out (so it is visible only to the sema pre-pass,
+  `collect_mut_borrows`, which recurses into its elements).
+  An or-pattern with a
   `_` alternative, and one whose alternatives cover every variant, are handled
   by `pat_irrefutable` and `or_leaves` (in sema) respectively. A *binding*
   alternative is rejected, as rustc's E0408 rejects it.
@@ -182,14 +179,74 @@ python3 tools/fuzz.py --mode mirmut --n 500 --seed 1     # mutated .mir text
   `pat_irrefutable`, `first_bound_name` (recursing so a binding element in an
   or-pattern is still rejected) and the `let`/`for`/`match`/`if let` paths through
   `let_destructure_array_stmts` (the `let_destructure_prelude` helper shares the
-  hidden-scrutinee logic with the struct path). `or_cond` does not treat it as
+  hidden-scrutinee logic with the struct path).   `or_cond` does not treat it as
   true: an array pattern is not a supported or-alternative.
+  *Tuple patterns* `(a, b)` are the fourth irrefutable aggregate pattern:
+  `Pat::Tuple(Vec<(bool, Pat)>)` is parsed by `parse_tuple_pat` (`(` is routed
+  from `parse_pattern_primary`; `()` is the unit pattern and `(a)` is a
+  parenthesised sub-pattern, so a one-tuple needs a trailing comma `(a,)`, as in
+  Rust) and desugared by `tuple_pat_binds` into one `let` per bound element whose
+  initialiser is a *field read* `Expr::Field { name: "k" }`. A tuple is an
+  aggregate lowered to an anonymous struct (element `k` is field `"k"`), so a
+  tuple pattern reuses the whole struct path: `tuple_pat_binds` mirrors
+  `struct_pat_binds` (a nested struct/tuple/array element recurses with the field
+  read as the sub-scrutinee). No sema or codegen case. It is irrefutable when
+  every element is, so it joins `pat_irrefutable`, `first_bound_name`, `or_cond`
+  and the
+  `let`/`for`/`match`/parameter paths through `let_destructure_tuple_stmts` (the
+  `let_destructure_prelude` helper shares the hidden-scrutinee logic).
+  In a *refutable* position (a `match` arm or an `if let` / `while let`
+  scrutinee) a tuple element may be a scalar test. The parser tracks this with
+  `pat_refutable_ok`, set by `parse_refutable_pattern` at the four refutable
+  call sites; `parse_tuple_pat` rejects a non-irrefutable element when it is
+  clear. `tuple_pat_test` builds the arm's test as the `&&` of each element's
+  test (`pat_test`), each read through the element's field; `None` when every
+  element is irrefutable, so the arm stays a catch-all. A refutable element may
+  not bind or be a variant (`tuple_element_ok` rejects `E::V(x)`), since the
+  test carries no payload. `pat_test` also handles an or-pattern element
+  (`(0 | 1, x)`) by folding `or_cond` with `||`, and `or_cond` handles a tuple
+  alternative the same way; `parse_tuple_pat` therefore parses each element with
+  `parse_pattern` (not `parse_pattern_primary`) so an or-pattern is collected.
+  A tuple *type* `(A, B)` is lowered by `lower_tuple_type` (in `parse_type`) to
+  the same anonymous struct, named by the canonical element-type keys
+  (`ast::tuple_struct_name`), and a tuple *literal* `(a, b)` stays `Expr::TupleLit`
+  until sema resolves its element types and rewrites it to a `StructLit` of that
+  struct (`tuple_struct_for` introduces the layout if the parser did not). An
+  element is written `.0`, `.1`, ...: `parse_postfix` accepts a decimal literal
+  after `.` as the field name.
+  *At-bindings* `name @ subpat` bind the whole value to `name` and also match it
+  against `subpat`. `Pat::At(String, bool, Box<Pat>)` is parsed by
+  `parse_pattern_primary` (an identifier followed by `@`), so it is reachable in
+  every pattern position; `mut` before the name (`mut n @ sub`) sets the flag.
+  The name is an ordinary binding (the whole scrutinee) and `subpat`'s own names
+  are bound from the same value, which is exactly what `pat_binds(pat, m, subj,
+  out)` does: the uniform binding helper every position calls, which emits a
+  `Stmt::Let` for the name then recurses on `subpat`. `pat_irrefutable` treats an
+  at-binding as irrefutable only when its sub-pattern is, and `first_bound_name`
+  returns the name. In a refutable position (`pat_test`, `arm_pattern_parts`,
+  `or_cond`) the sub-pattern contributes its own test and the name binds when it
+  passes. The irrefutable positions (`let`, `for`, parameters, a struct field's
+  sub-pattern) each reject a refutable sub-pattern rather than mis-bind it, so
+  `let n @ 1..=5 = e;` is a refutable local binding (E0005), as in rustc. A
+  binding alternative inside an or-pattern stays rejected: `n @ 1 | 2` is E0408.
+  The element-level `mut` of an array or tuple element (`[mut n @ _, m]`,
+  `(mut n @ _, m)`) is OR-ed into the binding's flag, since `mut` before the
+  element attaches to the element binding. An at-binding whose sub-pattern is a
+  `..` rest (`first @ ..`) is rejected cleanly: rmc has no slice type.
   An arm may carry a *guard*, `PAT if COND => body`. `parse_match` reads the
   optional `if COND` after the pattern (`parse_cond`, so a struct literal needs
   parentheses) and threads it through `desugar_arm` as an `Option<Expr>`. The
   guard folds into the arm's condition rather than becoming a node, so sema and
   codegen gain no case; see the exhaustiveness notes below for the three rules a
-  guard changes.
+  guard changes. When any arm has a guard, `desugar_match_arms` snapshots a
+  variable scrutinee into a temporary before the arm chain, so a guard that
+  assigns the matched value (`match x { n if { x = 2; true } => n }`) or one of
+  its fields (`match p { P { x } if { p.x = 9; true } => x }`) cannot change what
+  the arm body's binding reads: the guard and the body share the snapshot.
+  Without a guard nothing runs between an arm's test and its body, so a plain
+  variable stays inline and the lowering matches the equivalent field reads.
+  rustc's borrow checker rejects both mutating programs (E0506), so no
+  differential twin exists; the values are pinned by end-to-end tests.
   `while let PAT = EXPR { body }` is parsed here and desugared by
   `desugar_while_let` to `loop { if let PAT = EXPR { body } else { break; } }`,
   reusing the `if let` path, so sema and codegen gain no case. The scrutinee sits
@@ -232,6 +289,22 @@ python3 tools/fuzz.py --mode mirmut --n 500 --seed 1     # mutated .mir text
   where rustc accepts them. This is a documented limitation, not a regression —
   an annotation (`let x: i64 = ..`) makes the type concrete and both compile.
   `let_destructuring_{accepts,rejects}_an_*_diverging_initialiser` pin it.
+- Type aliases (`type NAME = T;`) are resolved entirely in the parser and never
+  reach sema or codegen, so they cost nothing at run time and cannot affect
+  layout. `prescan` records each alias name and the token index where its target
+  begins (skipping to the `;`), then, after `resolve_consts`, parses each target
+  (a second pass expands a target that named a not-yet-parsed alias, so
+  `type A = B; type B = i64;` works in either order). `parse_type_inner`
+  rewrites a `Tok::Ident` through `aliases` via `expand_alias_ty`, so every use
+  site (a `let`, a parameter, a return, a struct field, a cast) is already
+  concrete. A struct name is not an alias and stays `Type::Named`. A cycle is
+  reported (`expand_alias_ty` bounds the walk), matching rustc's `E0391`.
+  A *tuple* or array alias whose element names a later alias needs one more
+  step: the first pass bakes the tuple struct's element as the still-unresolved
+  `Named`, so after the map is complete every target is re-parsed with the
+  tuple-struct table cleared (`type Pair = (Later, i64); type Later = i64;`
+  otherwise keeps the placeholder's layout). `a_tuple_alias_may_name_an_alias_
+  declared_later` and the `PairF` case in `tests/cases/typealias.*` pin it.
 - `compiler/src/ast.rs` — AST and `Type` (`I64`, `Bool`, `Str`, `Unit`, `Array`,
   `Struct`, and the parser-only placeholder `Named`). `Str` is the type of a
   string literal: one slot holding a pointer to NUL-terminated static data. It
@@ -270,366 +343,12 @@ python3 tools/fuzz.py --mode mirmut --n 500 --seed 1     # mutated .mir text
 - `compiler/src/main.rs` — CLI: reads source, calls the library, writes the ELF.
   Flags: `--emit-asm`, `--keep-asm`, `--binutils`, `--no-strip`, `--min-size`,
   `--overflow-checks`, `--bounds-checks`, `--no-inline`, `--no-licm`,
-  `--no-tco`, `--keep-mir`.
-- `compiler/src/mir.rs` — parses the MIR text `rustc --emit=mir` prints into an
-  in-memory MIR, and holds the MIR-level optimiser passes. See "The rustc-MIR
-  front end" below. `mir.rs::parse` is the untrusted-input boundary: it rejects a
-  function with no basic block and a terminator whose target block the function
-  never declares, because the passes index `blocks[0]` and `blocks[target]`
-  directly (`mirmut` found both as panics; see the fuzzing section).
-- `compiler/src/mir_codegen.rs` — lowers that MIR to x86-64, sharing `elf.rs`
-  with the `.rms` path. It has its own peephole/register planner; see "MIR
-  codegen" below.
-- `compiler/examples/rmcmir.rs` — `rmcmir` CLI: a `.mir` text file to ELF, i.e.
-  the MIR back end with no rustc in the loop. The benchmark harness times it
-  separately from the front end. `rmc file.mir` is the same path through the
-  main binary (via `main.rs::run_mir_text`), which is what the `mirmut` fuzzer
-  drives.
+  `--no-tco`.
 - `compiler/tests/compile.rs` — unit tests for the front end and codegen; these
   run without `as`/`ld`.
 
-## The rustc-MIR front end
-
-A `.rs` input takes the second pipeline: `main.rs::run_mir_pipeline` runs
-`rustc --emit=mir -O -Zno-codegen -C panic=abort --crate-type=bin --edition 2021`,
-`mir.rs::parse` reads the MIR text, the MIR-level passes run, and
-`mir_codegen.rs` emits x86-64 that goes through the same `elf.rs`
-assembler/linker and `runtime.rs` as the `.rms` path. LLVM never runs. A `.mir`
-input skips the front end and enters `main.rs::run_mir_text` directly, which is
-the same back-end sequence; `rmcmir` (`examples/rmcmir.rs`) is the older
-standalone CLI for the same thing, and the benchmark times the two stages apart.
-
-- **`-Zno-codegen` is what keeps the front end cheap, and it is the single
-  biggest compile-time lever.** rmc *is* the code generator, so rustc should
-  stop right after the MIR optimisations instead of running the monomorphisation
-  and codegen preparation that `--emit=mir` throws away. Adding it drops the
-  front end from ~32 ms to ~27.5 ms and peak RSS by ~8.7 MB, and the MIR it
-  prints is byte-for-byte identical (verified for all ten benchmarks). It is a
-  nightly flag, so `run_rustc_front_end` sets `RUSTC_BOOTSTRAP=1` on the *child*
-  rustc only and falls back to a plain invocation when the flag is rejected;
-  keep that fallback or a stock stable toolchain breaks. The first (flagged)
-  attempt stays quiet on failure so a source error is not printed twice. Both
-  `bench/run_mir.py` and `bench/run_fair.py` set `RUSTC_BOOTSTRAP=1` at the top
-  so their `mir` column measures the pipeline rmc actually runs.
-- `-O` must stay on the front end: dropping it triples the emitted code's run
-  time (`fib` 5.4 ms -> 20.4 ms). The MIR-level optimisations it runs are the
-  ones rmc's own passes build on.
-- **`cmov` if-conversion for `min`/`max` is a trap, not a win.** LLVM compiles
-  `if v > max { max = v }` to `cmp`+`cmov`, and the natural instinct is to match
-  it. Measured on `stats` it is *slower* (3.96 ms vs 3.20 ms): the `min`/`max`
-  values saturate, so the branches predict almost perfectly and the
-  branchless form just lengthens the dependency chain. Do not add cmov
-  if-conversion without measuring the specific loop.
-- **The remaining `stats` gap is LLVM's 2x unrolling**, not the branches: LLVM
-  unrolls the `%` loop twice (two `imul`/magic-division chains per iteration).
-  Matching that needs an unroller, which is a larger and riskier pass than the
-  current peepholes; it is left undone deliberately.
-- **`collect_structs` drops a struct layout that can reach itself through field
-  edges.** A `Ty::Struct` keeps only the last path segment of a type's name, so
-  two distinct types share one layout key (`std::...::HashMap` and
-  `hashbrown::...::HashMap` both key `HashMap`). Their field lists then point at
-  each other, which reads as a self-referential value -- impossible for a Rust
-  struct without indirection -- and every walk over the layouts (`size_of_ty`,
-  `struct_layout`, the drop glue) recursed forever and overflowed the stack on
-  the fuzzer's `hashmap` case. The cyclic layouts are now pruned; a walker that
-  misses one falls back to a scalar, as it already did for a never-seen type.
-
-- The MIR text format is rustc's *internal* dump, not a stable interface. It
-  changes between rustc releases; `mir.rs::parse` is written against the shape
-  `rustc 1.99.1` prints and will need revisiting on an upgrade. Keep the parse
-  errors specific so a format change fails loudly rather than miscompiling.
-- `rustc -O` leaves the safety checks in the MIR even when they are provably
-  dead: `_6 = Eq(_5, 0)` then `assert(!move _6)` for a div-by-zero, and an
-  `assert(!(_7 & _8))` for the `i64::MIN / -1` overflow. They cost a compare and
-  a branch on every iteration of a `%` loop, which is where the `mix` gap came
-  from. `mir.rs::drop_redundant_asserts` removes them.
-- That pass is a **must**-analysis, and it must stay one. At a join it takes the
-  *intersection* of what each predecessor proves, never the union - a union
-  would claim a local is non-zero when one path could reach the assert with it
-  zero, and the trap would be dropped from a program that needs it. Each field
-  only ever loses entries at a join, which is what makes the fixed point
-  terminate.
-- The div-by-zero check's condition is a `bool` local defined by a statement *in
-  the assert's own block*, so the fact has to be computed from the state after
-  the block's statements, not the block's entry state. Checking the entry state
-  finds nothing.
-- `copy` aliasing is needed to see the guard's fact at the divisor: the loop test
-  proves `_2 != 0`, but the divisor is a later `copy` of `_2`. The pass follows
-  those copies (`AssertFacts::alias`) within a block only.
-- Dropping the assert leaves the `Eq` that fed it dead. `drop_dead_pure_assignments`
-  removes it, but only for the comparison rvalues and only when nothing reads the
-  destination - a wider "drop any unread assignment" pass removed an assignment
-  whose operand the backend still needed and broke `heap`. Do not widen it
-  without a differential run.
-- Local `_0` is the return value; `return` reads it without naming it, so
-  `use_counts` does not see that read. Any "unread local" test must special-case
-  `_0` or it will delete a function's result.
-- **A `bool` that folds into a terminator is only dead if nothing else reads it.**
-  `compare_branch_skip` drops the statement that computes the `switchInt`/`assert`
-  condition, because the terminator emits the `cmp`+`jcc` itself. But rustc reuses
-  one temporary across a loop body: a `while` that indexes the same array twice
-  has two `assert`s reading one `_15`, and the first folds it away, so the second
-  read a never-written slot and trapped (`exit 101`). The skip now consults
-  `local_used_elsewhere` first; keep that guard on any new fold. 
-  `tests/std/reusedcheck.rs`.
-- **The same `bool` reuse is what makes the fold *safe* in a loop header.** The
-  guard above was too coarse: it treated a read of the local in *any* other block
-  as live, even when that block defines the local before reading it. rustc reuses
-  one `bool` for repeated tests, so `fib` computes `_2 = Lt(n, 2)` in the entry
-  block *and* the loop header; the header's read is served by its own store, so
-  folding the entry store is safe. With the coarse guard both folds bailed and
-  the backend paid `setl`/`movzbl`/store plus a second `cmp` every iteration,
-  which is what put `fib` and `callrec` behind LLVM (0.92x / 0.89x). The guard
-  now tracks define-before-use per block: a same-block read is always live, a
-  read in another block is live only before that block's first definition. Pinned
-  by `mir_codegen::tests::reused_bool_local_still_folds` (fails on the old guard,
-  which re-emits `setl`) and kept honest by `reusedcheck`.
-- **A destructuring pattern must check the scrutinee's struct.** `let P { x } = q`
-  where `q: Q` reads `Q`'s `x` at `P`'s offset: a field with the same name but a
-  different type or position bound silently. rustc rejects it with E0308. The
-  `Expr::Field` read a struct pattern expands to carries the struct the pattern
-  named (`pat_struct`), and sema requires the scrutinee to be it; an ordinary
-  `base.name` leaves it `None` and resolves by field name. Threaded through
-  `struct_pat_binds`.
-- A trap block is emitted inline in the fall-through position, so the common path
-  takes a taken branch over it. `mix`'s `%` loop pays that branch once per
-  iteration; it is not free.
-- **An x86 ALU immediate is only i32 wide.** `add $imm, %rax` sign-extends its
-  i32 field, so a 64-bit MIR constant used as an operand, a `switchInt`
-  discriminant, or a frame store must be materialised in a register first.
-  `mir_codegen.rs::wide_imm` does that at every ALU site and `store_scalar` routes
-  a wide immediate through `%rcx`; the assembler (`elf.rs`) now *rejects* an
-  out-of-range immediate rather than silently truncating it, so a missed site
-  fails loudly instead of miscompiling. `tests/mir/wideimm.rs` pins the paths.
-- **Evaluating a shift count can call, and a call clobbers every scratch
-  register.** The value being shifted is parked in a frame slot across the count
-  evaluation, not in `%rdx` (the MIR back end has no spill of caller-saved
-  registers around an arbitrary call).
-- **`copy_words` uses `%r10`/`%r11`, never `%rsi`/`%rdi`.** `%rsi`/`%rdi` can
-  hold a caller-saved *promoted* local (a value in a register rather than the
-  frame), so an aggregate copy that parked its source/destination in them
-  clobbered a live value - a float accumulator survived a `for` loop but not the
-  aggregate literal built after it. `%r10`/`%r11` are the `div`/`rem` scratch and
-  are never promoted. Any new emitter that uses `%rsi`/`%rdi`/`%r8`/`%r9` as
-  scratch must first confirm no promotion can be live there.
-- **An enum's size is `tag + (words in its widest variant)`, not a fixed two
-  words.** The backend models a payload enum as tag-then-payload, but a variant
-  with two fields (a `Rect { w, h }`) needs two payload words; sizing at one
-  word made an array of such an enum overlap its neighbour and corrupt the next
-  element. A float payload is one word here, so it still counts.
-- **A `Transmute` cast (`f64::to_bits`, `u64::from_bits`) copies bits, it does
-  not convert.** `CastKind::Transmute` must be handled as a plain move *before*
-  the float-cast path, or `1.5f64.to_bits()` rounds to `1` instead of yielding
-  `0x3ff8000000000000`.
-- `main.rs::run_mir_pipeline` honours `--no-inline`/`--no-licm`/`--no-tco`, the
-  same gates the `.rms` path uses, so the fuzzer's per-pass matrix applies to
-  both pipelines.
-- **A `drop(_N)` terminator runs `_N`'s destructor, and a type's own `Drop` impl
-  runs *before* its fields are dropped.** The parser records each impl's
-  receiver type -> `__rmc_drop_<T>` symbol in `Program::drop_impls`; the back
-  end's `gen_drop_glue` calls that impl, then recurses into the fields (and
-  array elements), matching rustc's `drop_in_place` order. Skipping the field
-  recursion after an impl silently drops a nested droppable field; calling only
-  the impl (an early revision) silently skipped *every* nested destructor. A
-  `drop` terminator is a *read* of its place, so `terminator_reads` counts it,
-  and every block-remap pass (`layout_blocks`, `compact_blocks`) must remap its
-  target or the edge is dropped - both were one-line omissions that took a
-  while to find. `reachable` runs after `collect_structs` (it needs the
-  layouts) and collects drop-glue symbols from `Drop` terminators, since no
-  `Call` names them. Pinned by `tests/mir/drop.rs` (direct) and
-  `tests/mir/dropnest.rs` (nested fields, array elements, impl-plus-field).
-- **An impl method needs a receiver-qualified symbol.** rustc prints every
-  inherent/trait method as `<impl at ...>::name` (or `Type::<impl at ...>::name`),
-  so keying by the bare name collides two impls of the same method
-  (`A::value`/`B::value` both became `value`, and one body won). `mir.rs`
-  keys a definition by `<Receiver>__<name>` and marks a call target it cannot
-  yet key with `IMPL_MARK`; `resolve_impl_calls` runs after the whole program is
-  parsed and fills the receiver in from the call's first argument (a `&T`/`T`
-  local), so a forward reference to a later impl still resolves. An associated
-  function (`A::make()`) has no receiver and keeps its bare name. Pinned by
-  `tests/mir/implname.rs`.
-- **A `&str`/`&[u8]` literal on the MIR path is a `{len: i64, bytes..}` record,
-  not a NUL-terminated C string.** `mir_codegen.rs` emits `.quad <len>` before
-  the bytes. `str::len` lowers to `PtrMetadata`, which reads word 0, and the
-  `print!` sink reads word 0 as the length; a C string here makes both read the
-  first byte as a huge length (the old "runtime format arguments are not
-  supported" path fired because the length word was `0x0a6968`, not the text).
-  This is the same representation the `.rms` path uses (`Type::Str` is the
-  record address).
-- **A string literal can be a *terminator* operand, not just a statement one.**
-  `"x".contains("ell")` passes `"ell"` straight as a call argument, so
-  `collect_strings` must also scan call args, `switchInt` discriminants and
-  `assert` conditions. When it only scanned statements, `str_label` fell back to
-  emitting the literal's text as a symbol name (`lea "ell"(%rip)`), which the
-  linker reported as `undefined symbol`.
-- **`str::starts_with`/`ends_with`/`contains` are runtime helpers, not libstd.**
-  The first two inline to `<[u8]>::starts_with`/`ends_with` and the last to
-  `<&str as Pattern>::is_contained_in`; `std_intrinsic_name` rewrites each to
-  `__rmc_slice_*`/`__rmc_str_contains`, which read rmc's `{len, bytes..}` record
-  the way `__rmc_compare_bytes` does. The substring test's operands are
-  pattern-first, haystack-second.
-- **Array-to-slice unsizing (`&[T; N] -> &[T]`) builds a record in the frame.**
-  `mir_codegen.rs::gen_unsize` writes the length word and a copy of the elements
-  into a fresh frame region and leaves its address in `%rax`; a slice local then
-  points at it for as long as the binding lives. The region is written through
-  `base + k`, so only its base appears in the emitted text: `gen_unsize` records
-  the span in `FnGen::pinned` and the frame packer pins every slot of it (the
-  same treatment a multi-slot local gets), or the packer would drop the interior
-  slots and the elements would land on dead frame.
-- **A callee's return place `_0` is a real local, so inlining must redirect it
-  everywhere.** `mir.rs::Remap::rv` routes every operand and place through the
-  `_ret` variants. A helper that accumulates into `_0` (`_0 = Add(copy _0, move
-  _5)`) was previously inlined with that read left as the caller's own `_0`,
-  which aliased the accumulator and collapsed the sum to its last term.
-  `tests/std/accfn.rs` pins it.
-- **A `u8`/`i8` is one byte in memory.** The codegen loads it with `movzbl`
-  (`load_place_to`) and the `{}` helpers load exactly one byte; an `i8` must
-  sign-extend all the way to 64 bits (`movsbq`, not `movsbl`), or a negative
-  value prints as a huge unsigned number. `tests/std/numeric.rs` pins the
-  `{}`, `{:x}`, `{:b}` and `{:o}` shapes.
-- **`println!("{}", x)` for a variable builds the full `core::fmt` argument
-  machinery and now works.** An all-constant format string folds to
-  `Arguments::from_str` (a string-record pointer plus a `len << 1 | 1` word);
-  a placeholder with a runtime argument instead reifies `<T as Display>::fmt`
-  as a fn pointer inside a `core::fmt::rt::ArgumentType::Placeholder`, and the
-  back end models the `Argument`/`ArgumentType`/`NonNull`/`PhantomData` structs
-  by their last path segment. `mir.rs` rewrites the `std::io::_print`/`_eprint`
-  sink (the trailing path segment starts with `_`) to the runtime helpers
-  `__rmc_print`/`__rmc_eprint`, and `__rmc_write_args` branches on the low bit
-  of the args word. The runtime template walker calls each argument's formatter
-  (`__rmc_fmt_i64`, `__rmc_fmt_bool`, ...). The formatter is picked from the
-  reified type/trait pair: `Display`/`Debug` give the decimal (or string)
-  printer, `LowerHex`/`UpperHex`/`Octal`/`Binary` the base printers, one entry
-  point per width so a narrow type prints its own width (`{:x}` of `-2i16` is
-  `fffe`, not the 16-digit 64-bit pattern; `{:X}` has its own symbol because the
-  digit alphabet differs). The walker decodes the whole template: the optional
-  fields are gated by a bitmask (`bit0` flags u32, `bit1` width u16, `bit2`
-  precision u16, `bit3` arg index u16, `bit4` width-indirect, `bit5`
-  precision-indirect), and it renders fill/alignment/width/precision and the
-  sign, alternate, `+`/` ` and `0` flags itself. Precision is stored as
-  `prec + 1`, so `{:.0}` has a precision field of 0 but still sets the
-  precision flag: the walker re-creates a 0 from the flag, because the packed
-  `__rmc_fmt_mode` word reads 0 both for "no precision" and for `{:.0}`.
-  Precision truncates a text value at a UTF-8 character boundary
-  (`__rmc_utf8_trunc`) and is ignored by numbers, which matches rustc. An
-  indirect width/precision (`{:w$}`, `{:.*}`) reads the value from a `Count`
-  argument: the field is an argument index, and the `usize` sits at `+8` in
-  that 16-byte `Argument`. `{:?}` of a `&str` goes through
-  `__rmc_fmt_str_debug`, which quotes and escapes it exactly as rustc does
-  (control characters as `\u{N}`), and — like rustc — ignores width and
-  precision. Two layout invariants are load
-  bearing: `Argument` and `ArgumentType` are 16 bytes each (the `PhantomData`
-  lifetime field is zero-sized and must not reserve a word), and a struct field
-  is a `Field` projection so the element keeps its real type — using
-  `IndexConst` there would scale by 8 and type the element `i64`, dropping the
-  formatter pointer. A negative immediate stored into a frame slot must use a
-  64-bit store (`movq $imm, mem`); the unsuffixed form is a 32-bit store that
-  zero-extends the value (`$-3` becomes `0xFFFFFFFD`) and leaves the high half
-  wrong. Every full-word store - an aggregate-constant field, an array element,
-  a `[x; N]` repeat, a projected store - must go through `store_word`, not a
-  raw `mov`: `let a = [-3i64, 5]; a[0]` printed `4294967293` until it did.
-  `tests/std/negagg.rs` guards it.
-- **An aggregate constant's nested aggregate is laid out, not pointed at.**
-  `Outer { head: Inner { x: 5 }, tail: 7 }` is one constant whose `head` field
-  is itself an aggregate constant. Storing the *address* of a separately
-  materialised `Inner` (the natural first cut) makes the enclosing copy read
-  the pointer's own words, so `head.x` printed the low half of a stack address.
-  `write_const_agg` recurses so a nested field's fields land at their real
-  offsets, and an enum payload that holds a struct is `copy_words`d in.
-- **Write a frame region's interior through its base, not through a direct
-  slot.** The frame optimiser's dead-store passes (`dead_stores`,
-  `drop_unread_stores`) only see a store whose destination is a literal
-  `(%rbp)` slot; a region field written as `movq $v, slot(%rbp)` looks unread
-  and is *deleted*, silently zeroing the field. `emit_region_addr` emits
-  `lea base(%rbp), %rax` (+ offset) and stores through `(%rax)`, which the
-  passes leave alone. `tests/std/nestedagg.rs` guards the whole path.
-- **The MIR scanners must skip string literals.** `matching`, `split_top_args`,
-  `split_top_semi` and `split_top_as` walk a line by bracket depth, but a
-  `format_args!` template or a `b"..."` byte string can contain `)`/`,`/`;`/`as`
-  in its bytes. Without the `string_end` skip, a template like `b"\x03a)b..."`
-  mis-splits and the constant fails to parse. `string_end` handles both `"..."` 
-  and `b"..."`, and skips backslash escapes so an escaped quote does not end the
-  literal early.
-- **A literal format argument (`println!("{:x}", 255)`) is a promoted
-  constant.** rustc promotes the literal to `const main::promoted[0]: &i32` (a
-  `static` holding the value, returned as a reference). `mir.rs::parse_promoted`
-  reads the promoted body's `_1 = const N; _0 = &_1;` (or `_1 = Add(const A,
-  const B);` from a `macro_rules!` expansion, or a zero-sized `_1 = Q;`) and
-  folds the referent into `Program::promoted`; `mir_codegen.rs` emits the bytes
-  into `.rodata` and `const_operand` returns the label. A promoted body whose
-  referent is not a foldable scalar (an aggregate, a reference) is still
-  rejected by `classify_unsupported` rather than miscompiled.
-- **`a.min(b)`/`a.max(b)` on an integer lower to `<T as Ord>::min`/`max`.**
-  `normalize_call_name` keeps only the final path segment (`min`), which is not
-  a runtime symbol, so the link failed. `mir.rs::std_intrinsic_name` rewrites
-  the call *before* normalisation to `__rmc_imin`/`__rmc_imax` (signed) or
-  `__rmc_umin`/`__rmc_umax` (unsigned), picked from the `T` in the qualifier; the
-  helpers branch rather than use `cmov`, which the in-process assembler cannot
-  encode.
-- **A 32-bit register selects a 32-bit memory access.** `mov (%rdi), %eax` is
-  the 32-bit load (`8B /r`), `mov (%rdi), %rax` the 64-bit one (`48 8B /r`);
-  likewise for stores. `elf.rs`'s `mov` must derive the operand width from the
-  register name (or a `movl`/`movq` suffix), not default to 64-bit, or a narrow
-  type read through a pointer picks up the neighbouring bytes.
-
-- **The MIR peephole pipeline is where the back end's quality lives.**
-  `mir_codegen.rs::optimize` runs, twice, `fuse_imm`, `fuse_lea`,
-  `coalesce_scratch`, `forward_stores`, `fold_addresses`, `fold_local_offsets`,
-  `dead_stores` and `drop_unread_stores`, each pass exposing work for the next.
-  `fold_addresses` turns the generator's "copy the base pointer, add the byte
-  offset, load through it" into one `disp(%base)` addressing mode;
-  `fold_local_offsets` does the same for a local (`lea D(%rbp), %t; add $K, %t`
-  -> `lea (D+K)(%rbp), %t`, and drops a bare `add $0, %t`). Both drop an `add`,
-  which is the only flag-setting instruction in the pair, so they check
-  `flags_used_by` before folding — a following `j*`/`set*`/`adc`/`sbb`/`cmov`
-  reads those flags. Every pass is textual and must leave a rewrite that is
-  legal for the in-process assembler (no memory-to-memory `mov`).
-- **A zero-sized alloc prints on one line.** A promoted empty `&str` is
-  `allocN (size: 0, align: 1) {}`; `mir.rs::parse_alloc` has to accept that
-  shape, or it reads past the header looking for the closing `}` and reports
-  "unterminated alloc block".
-
 ## Things that are easy to get wrong
 
-- **An enum's tags are rustc's declaration order, not construction order.**
-  `collect_enums` learns a variant's tag from the `switchInt` on a
-  `discriminant` that a `match` emits. A *niche-optimised* enum
-  (`Option<&T>`, `Result<T,&E>`) carries no tag word, so rustc folds the
-  comparison to a literal and emits no `switchInt`: `is_some` is
-  `discriminant(_x) == 1`, `is_ok` is `discriminant(_x) == 0`. With no
-  evidence the backend fell back to *construction* order (`Some` = 0),
-  and every `is_some()`/`is_ok()` read false — silently, with a plausible
-  exit status. Seed the declaration order for `Option`/`Result`
-  (`None`=0/`Some`=1, `Ok`=0/`Err`=1) before filling from evidence; a
-  real `switchInt` tag still wins because only a *missing* tag is filled.
-  `tests/std/nicheenums.rs` guards this. The same trap awaits any enum
-  whose discriminant is only ever compared, never switched on.
-- **A constant's path-qualified *struct* name is not an enum variant.**
-  rustc spells a `Range` constant `std::ops::Range::<usize> { start, end }`,
-  so a name containing `::` does not imply a variant. `split_ev` cuts at the
-  *last* `::`, which for that name yields the generic argument `"<usize>"` as
-  the "variant"; treating it as one reserved a phantom tag word and shifted
-  every field by a slot (`let r = 1..3; r.start` printed `0`). Classify a
-  path-qualified constant by whether its `split_ev` variant is an identifier:
-  `collect_enums` skips a constant whose variant is not (`Range`), and
-  `is_variant_const` consults the variant table rather than the `::`. A struct
-  constant is registered under its last path segment so `materialize_const_agg`
-  and `collect_structs` agree on the key. `tests/std/structconst.rs` guards it.
-- **Formatting a reference must print the referent, not its address.**
-  rustc's `Display for &T` calls the base formatter with a pointer to the
-  referent, so a `&T` slot holds a *pointer to a pointer*. rmc's runtime
-  hands a formatter the slot holding the value, so for `T` scalar the
-  base formatter's single `mov (%rdi), %rax` is one deref short on a `&T`
-  (`println!("{}", &n)` printed a stack address; `for x in &v { println!(
-  "{}", x) }` printed addresses). `fmt_label` now wraps the base formatter
-  in a deref trampoline that does `mov (%rdi), %rdi` `depth` times, where
-  `depth` is the reference count — except a `str`/`[u8]` referent, whose
-  formatter *already* dereferences to reach its record, so it needs
-  `depth - 1`. Trampolines are module-scoped and emitted once after every
-  function body, so two functions that both format a `&i64` share one
-  rather than emitting a duplicate `.L` label.
-  `tests/std/reffmt.rs` guards `&i64`, `&bool`, `&str`,
-  `&&i64`, `{:?}`/`{:x}`, `for x in &v`, and the cross-function case.
 - **`loop` is an expression, and codegen must report its own type, not `I64`.**
   `loop { .. }` parses to `Expr::Loop(body, slot, ty)`; a `loop` in statement
   position is a `Stmt::Expr` around it with `slot == -2`, so its value is
@@ -699,7 +418,7 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   a reference *local*, never a `Deref`. `addr_reg` (local or one `Deref` of a
   local) is the form `gen_addr` folds for a `lea`. Extending either to a deeper
   chain would read the inner pointer from a register it is not in — the bug that
-  `(**ppr).x` in `tests/cases/references.rms` guards against.
+  `(**ppr).x` in `tests/cases/references.rs` guards against.
 - **A scalar `*p` read is a memory operand.** `simple_operand` returns `(%reg)`
   for a non-aggregate `Deref` whose pointer is a reference local, so `*p < 5`
   is one `cmpq $5, (%reg)` and `*p` in a comparison needs no load. An aggregate
@@ -730,7 +449,7 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   (`mov %r, X; mov X, %rY` -> `mov %r, %rY`) was measured perf-neutral on the
   whole suite and not kept. A fuller textual version that tracked the live
   register per frame slot (`forward_stores`) removed one instruction across the
-  whole corpus and cost 3-30% of compile time (`div.rms` 1.30x) for no runtime
+  whole corpus and cost 3-30% of compile time (`div.rs` 1.30x) for no runtime
   change, so it was reverted too: the generator already keeps the value in a
   register or reloads where a load is genuinely needed, and a whole-body rewrite
   pass is the wrong price for the project's headline metric. `gen_expr_to_slot(e, slot)` is the one entry point
@@ -779,6 +498,18 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   parameter the body assigns must also be bound to a fresh slot even when the
   argument is a plain variable, because a parameter is a local copy: replacing
   it by the caller's variable would make `x = x + 1` write through to the caller.
+  A trivial argument (a name or literal) is substituted in place only when no
+  *later* argument can write memory (`has_effect`); otherwise it is copied to a
+  fresh slot, so `sum(x, set(&mut x))` reads the `x` from before `set` ran.
+  The same holds for a parameter whose *address* the body takes (`let r = &x;`,
+  `&mut x`): it must be bound to a fresh slot too, or a substituted variable
+  argument would let `*r = ..` write through to the caller (`f(y)` with
+  `f(mut x) { let r = &mut x; *r = 5; }` left `y` at 5 instead of 3), and a
+  substituted non-lvalue argument (a literal, a call) would produce `&3`, an
+  address with no place to name, which `gen_addr` rejects. `escaped_slots`
+  collects both kinds — a slot assigned directly and a slot whose address is
+  taken — and its `Expr::AddrOf` arm records the operand slot when it is a bare
+  `Var`, so the copy is forced.
   A candidate body must be call-free with no early exit; because it is call-free,
   inlining it cannot expose new calls, but the pass still runs to a *fixpoint*
   because a function only becomes call-free after its own callees are inlined
@@ -788,7 +519,7 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   `break`/`continue` is *not* allowed: once spliced into the caller it would bind
   to the caller's enclosing loop. A non-final `return` is not allowed either, for
   the same reason. `Sub` already rewrites `while`/`loop`/`for` bodies and their
-  counter slots, and `assigned_slots` already descends into them, so a
+  counter slots, and `escaped_slots` already descends into them, so a
   loop-bearing body needs no extra splice work. A statement-free block is unwrapped to
   its tail after expansion: the spliced body of an accessor would otherwise stay
   wrapped in an `Expr::Block`, and later passes (`simple_operand`, the
@@ -798,6 +529,13 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   `MAX_NODES` (48) must stay above a two-level helper — `sum_via_ref` is 35
   nodes once its accessors land — and `count_expr` must count a block's tail,
   or a candidate's size is understated and it is wrongly admitted.
+- **LICM never hoists a read through a reference.** A scalar field read is
+  hoisted only when its base is a local aggregate (`frame_field_base`); a field
+  read through `&T` dereferences a pointer that may be null (`0 as &S`) or
+  dangling, so hoisting it would fault on a loop whose body never runs. Any
+  field in the chain whose own type is a reference holds such a pointer, so
+  `h.p.n` (where `p: &S`) is not a frame access either. Local aggregate fields
+  are frame accesses and stay hoistable.
 - **LICM hoists a loop body's invariant arithmetic, and `for` slots are
   loop-carried.** The pass rewrites only a loop *body*; a `while` condition and
   a `for`'s bounds run once per iteration by design. A `for`'s variable and
@@ -869,7 +607,7 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   high-water mark and the deepest slot, and the dead/round-trip instructions
   `trim_dead` removes change neither, so `Codegen::dry` turns the pass off for
   it. That is a pure compile-time saving on a function whose body is one long
-  straight line: `div.rms` (a 531-line `main`) drops 6% of its compile time, and
+  straight line: `div.rs` (a 531-line `main`) drops 6% of its compile time, and
   the emitted assembly is byte-for-byte identical to running the pass twice.
 - **A callee-saved *temporary* is not worth it; a callee-saved *spill* is.** An
   early attempt kept every short-lived value in `%r12`-`%r15` and measured
@@ -891,7 +629,7 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
 - **Saved registers sit between `%rbp` and the frame.** The epilogue must point
   `%rsp` at the lowest saved register (or add the frame size back) before
   popping, otherwise `pop` reads the frame and the return address is lost.
-  `regs.rms` and `calls.rms` fail if this regresses.
+  `regs.rs` and `calls.rs` fail if this regresses.
 - **Only whole-value structs keep all their fields in memory.** A scalar field
   of a struct is promoted like any other local, *unless* the struct is ever
   copied, returned or passed by value, in which case the whole-value copy reads
@@ -899,7 +637,7 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   during its walk (`copied` and the `let` targets) and zeroes those slots. A
   promoted field that stays in memory on the copy path but is read from its
   register on the field path is a silent wrong-answer bug, which is what
-  `fieldpromo.rms` guards.
+  `fieldpromo.rs` guards.
 - **A struct's base slot is its last field, and it stays promotable unless the
   struct is used as a whole.** Field `k` lives at `slot + fields - 1 - k`, so
   field `fields - 1` *is* `slot`. A whole-value use (copy, return, pass by
@@ -965,6 +703,17 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   `if`-with-a-lone-`break`/`continue`
   fast path in `bare_exit` only fires for an *unlabelled* `break`/`continue`,
   since a labelled one may leave an outer loop.
+- **`'` starts a `char` literal or a loop label, and the lexer decides by lookahead.**
+  It is a `char` literal when the byte after `'` is a backslash escape, an
+  immediate `'` (`''`), or a full UTF-8 sequence followed by `'`; otherwise it
+  is a label. This mirrors rustc, where a label is never followed by a lone
+  quote. A `char` *range* pattern (`'a'..='z'`) is built in `maybe_char_range`:
+  after a `char` literal, a following `..`/`..=` consumes a second `char`
+  literal as the upper bound. The upper bound must be a `char` literal (a bare
+  `5` is rejected) and an empty range (`'a'..'a'`, `'z'..'a'`) is rejected, as
+  rustc rejects them (E0579/E0308). `Pat::CharRange` lowers to the same
+  `lo <= s && s <= hi` comparisons as `Pat::Range`, so sema and codegen need no
+  new case.
 - **A `for` bound is compared directly when it is a constant, and through a
   hidden slot otherwise.** `0..=1000` needs no `end_slot`: the guard is
   `cmp $1000, %rax`, so no frame word is written and no reload happens each
@@ -993,11 +742,11 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   name against the constant table *before* `parse_pattern`, because a bare
   constant name there resolves to its value (not a binding), which would turn
   `for N in 0..3` into an iteration over a literal and lose the E0530 error.
-  `tests/cases/forarr.{rms,rs}` and the `stmt` fuzzer cover it.
+  `tests/cases/forarr.rs` and the `stmt` fuzzer cover it.
 - **`..=` exits on `jle` back-edge, not `jl`.** The guard is the loop-back
   condition, so the inclusive form loops while `var <= end` (`jle`) and the
   exclusive one while `var < end` (`jl`); a `jg`/`jge` *exit* test is the
-  un-rotated mirror of the same thing. `forloop.rms` and
+  un-rotated mirror of the same thing. `forloop.rs` and
   `an_inclusive_range_uses_a_strict_exit_test` pin both bounds, and `..=` is a
   three-character token, so it must be lexed in the three-char table (before
   `..`), or it lexes as `..` then `=`.
@@ -1061,25 +810,85 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   registers right-to-left, so an earlier argument's source is already copied
   before a later argument runs. Evaluating all aggregates before the scalars
   would run side effects out of order: `f(g(), mk())` must print `2` then `1`,
-  not the reverse. `aggfn.rms`/`aggbig.rms` and `argorder.rms` cover this.
+  not the reverse. `aggfn.rs`/`aggbig.rs` and `argorder.rs` cover this.
 - **`%r10` carries the return buffer.** It is caller-saved and not an argument
   register, so it survives argument setup. Do not use `%r10` as scratch anywhere
   argument setup can run after the return pointer is set.
+- **The direct-argument shortcut must decline every clobbering argument.**
+  `gen_call` writes scalar arguments straight into the ABI registers when each
+  argument is a simple operand, or when there are at most two and none calls or
+  copies an aggregate. `contains_call` must therefore recurse into *every*
+  expression that can evaluate a child — including `EnumCtor`, `VariantTest`
+  and `EnumPayload` — and `clobbers_arg_regs`/`stmt_clobbers` must flag every
+  statement path that runs `copy_words_rdi_rsi` (whole-aggregate `let`, and
+  aggregate `Var`/`Field`/`Index` stores). A missed case leaves an earlier
+  argument in `%rdi`/`%rsi` that a later argument overwrites.
+- **At most six parameters.** The System V integer argument registers are the
+  only ones this compiler uses, so `sema` rejects a function (or a method after
+  its receiver is inserted) with more than six parameters rather than letting
+  `zip(ARG_REGS)` silently drop the seventh.
+- **`mut` is enforced.** `Stmt::Let` carries a `mutable` flag and `FnDef` a
+  `param_mut` vector; `sema` records both in its scope and rejects an assignment
+  to a non-`mut` binding. A plain `let` is written exactly once — its initialiser
+  or its first assignment — so a later write is `cannot assign twice to
+  immutable variable`, and an immutable parameter reports `cannot assign to
+  immutable argument`, both matching rustc. The check is a may-analysis: an
+  `if`/`else` merges a flag with OR. Whether a write repeats is decided per
+  path: `Sema` threads the enclosing statement's continuation (`loop_cont`)
+  into every nested block, so a write is a second write only when *some* path
+  from it reaches the loop's top again — a `continue`, a loop body's
+  fall-through end, or the code after its statement. `x = 1; break;` is a
+  single write even when a sibling path `continue`s, and a `loop` whose every
+  path `break`s/`return`s runs at most once. A `break` merges the writes on its
+  path into the post-loop state. Keep generated `let`s `mutable: true` so they
+  never trip this. Three edges the analysis must get right: every loop entry
+  pushes a `loop_cont` entry (not just `loop_reach`), or a nested block's
+  `saved_cont` defaults to `false` and a write in the nested block of a
+  repeating loop is missed; a `break` merges only the *prefix* of its snapshot
+  that lines up with the bindings present at loop entry, so a break path that
+  declared extra locals still contributes its outer-binding writes; and a
+  `loop` with no reachable `break` does not fall through, so an infinite inner
+  loop must not make the outer loop look repeating. Two more: an `if`/`while`
+  condition is evaluated like any other operand, so the break/reach walks
+  descend into condition expressions and every other evaluated child
+  (`expr_has_break`/`expr_contains_continue`), or `loop { loop { if { break;
+  true } {} } x = 1; }` wrongly accepts the second write; and a labelled
+  `continue` inside a nested loop still targets the outer loop, so the reach
+  walk descends into a nested loop body, threading a `nested` flag so an
+  unlabelled `continue` there no longer counts. A diverging condition
+  (`{ break; }`, `{ return; }`, `{ continue; }`) has type `!`, which rustc
+  accepts where `bool` is expected; the `if`/`while` condition type check must
+  not reject it. An *unlabelled* `break`/`continue` in a `while` condition has
+  no valid target (E0590), so the condition check rejects it via
+  `cond_has_unlabelled_exit`; a labelled one is fine.
+- **A compound assignment evaluates its place once.** `desugar_compound` binds
+  any component of the target that contains a call — the base or the subscript —
+  to a temporary and reuses it for both the read and the write, so `make().x += 1`
+  calls `make` once. A call-free `Var`/`Field`/`Index` is cloned directly.
 - **`sema` persists the inferred type on every `let`.** Codegen selects the
   aggregate path from `Stmt::Let`'s `ty`, so leaving it `None` for `let a = [7; 2]`
   silently initialises only one word.
 - **Struct-literal fields stay in source order.** Their layout offsets are
   attached per field, so reordering them into declaration order would change the
   order initializer side effects run in.
+- **A bounds check sees through a reference to an array.** `array_len_of` /
+  `array_len_ty` unwrap an `Expr::Ref` base, so `let r: &[i64; 3] = &a; r[i]`
+  traps on an out-of-range `i` under `--bounds-checks` instead of reading
+  adjacent memory. A field store through a shared `&T` is rejected by
+  `place_writable` ("cannot assign through a shared reference; use `&mut`"), and
+  a `&mut` binding itself is not reassignable unless declared `mut`.
 - **Assignment evaluates its value before its place.** rustc orders assignment
   operands right-to-left (the one expression that does), so `a[li(1)] = li(5)`
   must run `li(5)` before `li(1)`. Codegen's general index/deref store path and
   `store_through_addr` evaluate the value first and stash it across the address
-  computation whenever that computation can call (`contains_call`), and the
+  computation whenever that computation can have an effect (`place_has_effect`,
+  which is `contains_call` plus a block/if that assigns a local), and the
   aggregate copy is factored into `assign_aggregate` for the same reason. The
-  `contains_call` walk must reach every place form (`Deref`, `AddrOf`,
-  `EnumPayload`, ...), or a target like `*f()` is mis-ordered. `assignorder.rms`
-  and `tools/fuzz.py --mode order` pin this.
+  walk must reach every place form (`Deref`, `AddrOf`, `EnumPayload`, ...) and
+  must descend through `Bin`/`Un`/`Cast` and an `if` condition, or a target like
+  `r[{ y = 2; 0 } + 0]` is mis-ordered: `contains_call` alone misses a block
+  that assigns without calling. `assignorder.rs`, `refidxorder.rs` and
+  `tools/fuzz.py --mode order` pin this.
 - **A compound assignment binds its modifying operand first.** `desugar_compound`
   evaluates the right-hand operand into a temporary ahead of the subscript
   temporary, so `a[next()] += val()` runs `val()` before `next()`, matching the
@@ -1135,17 +944,23 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   which compiles every case through both paths and requires identical output.
   The `--binutils` path still uses `ld --build-id=none -z noseparate-code
   --strip-all`; `--no-strip` keeps the symbol table, `--min-size` also runs
-  `strip --strip-section-headers`. Do not change the `--binutils` link back to
-  `-n` (nmagic): it packs every section into one read+write+execute `LOAD`
-  segment, a W^X violation, and is *larger*. `tests/run.py`'s `check_stripped`
-  pins the size ordering of all four variants, `check_no_rwx` fails on any
-  writable+executable `LOAD` segment, and `check_link_paths_agree` requires the
-  two link paths to behave identically.
+  `strip --strip-section-headers`. `--no-strip` and `--min-size` request
+  opposite artifacts, so `parse_args` rejects the pair instead of letting
+  `--min-size` strip the symbols `--no-strip` asked to keep. Do not change the
+  `--binutils` link back to `-n` (nmagic): it packs every section into one
+  read+write+execute `LOAD` segment, a W^X violation, and is *larger*.
+  `tests/run.py`'s `check_stripped` pins the size ordering of all four variants,
+  `check_no_rwx` fails on any writable+executable `LOAD` segment, and
+  `check_link_paths_agree` requires the two link paths to behave identically.
 - **In-process assembler gotchas.** The encoder in `src/elf.rs` is deliberately
   narrow; these are the encodings that are easy to get wrong and were each a
   real bug:
   - Group opcodes: `inc`/`dec` are group-5 (`FF /0,/1`) but `not`/`neg` are
     group-3 (`F7 /2,/3`). `FF /3` is `call far`, which faults at run time.
+  - `bswap %r64` (`0F C8+rd`) names its operand in the low three opcode bits,
+    *not* in ModRM: there is no ModRM byte, so the register index is REX.B
+    (`rex(true, 0, reg)`), and a `%r8`-`%r15` operand needs `0x49`, not `0x44`.
+    Using the REX.R helper here would silently swap the wrong register.
   - ModRM direction: for `mov src, dst` and `op src, dst` the *source* is the
     reg field (REX.R) and the *destination* is r/m (REX.B). Swapping them
     silently moves the wrong register.
@@ -1245,6 +1060,21 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   hoist or inline that drops the `cmp`/`jae` would let the program read or write
   out of range), and across the index shapes: a block or call base, a local
   array, a negative and a computed index, a struct-field array, and a store.
+- **Every runtime piece after the first must re-open `.text`.** The bit-method
+  helpers (`__rmc_count_ones`, `__rmc_leading_zeros`, `__rmc_trailing_zeros`,
+  `__rmc_swap_bytes`, `__rmc_reverse_bits`, `__rmc_rotate_left`,
+  `__rmc_rotate_right`) follow `__rmc_clamp`, whose last message ends in
+  `.section .rodata`. Without a `.text` line they were emitted into `.rodata`
+  and faulted under a link that honours section permissions (`--binutils`, or
+  the library path). The fuzzers did not see it because a bit method that traps
+  was never combined with the CLI's `-n` merge. When adding a piece, copy the
+  leading `.text` from a neighbour; `tests/run.py` links bit-method programs with
+  a plain `ld` to catch a regression.
+- **A `.set` resolves against the section current when it appeared.** The
+  in-process encoder recorded `.` for a `.set` against the *last* section the
+  file switched to, so a `.set` after a `.section .rodata` block (the trap
+  message lengths) resolved against the wrong section and mis-sized the
+  immediate. Each `.set` now carries the section it was seen in.
 - **`array_len_of` must cover every array-typed base.** It reads the length from
   a `Var`/`Field`/`Call` type and from a block's or `if`'s tail. A base it does
   not recognise silently skips the bounds check; extend it alongside any new
@@ -1307,21 +1137,18 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   The Rust twin must use the same 24-byte stride or its smaller working set
   flatters the walk; it still does not run a free list, so the ratio is about the
   generated pointer code, not the allocators.
-- **`refs` is not an instruction-level tie.** Keeping the Rust loop real needs
-  an in-loop `black_box`, which costs a store/reload per iteration; rmc has no
-  such barrier. rmc's `licm` reassociates the loop-invariant part of the
-  accumulation into one hoisted value, so its loop does a single add per
-  iteration, and it wins the ratio by more than 2x. Read the number as "two real
-  loops doing the same arithmetic", not as an instruction-for-instruction tie.
-- **`bench/run_fair.py` gives the same freestanding source to both back ends, so
-  it drops the `black_box` and `refs` flips to a loss.** With nothing opaque in
-  the loop LLVM proves the body constant and closes the whole loop to `n * c`
-  (0.17 ms vs rmc's 1.7 ms); rmc's accumulator fold cannot sum a non-constant
-  addend chain, and a closed form for the `acc += const` shape is not implemented.
-  Every other program is within a few percent and `mandel`/`forloops` are rmc
-  wins, so read `refs` in this harness as "LLVM's loop closing", not as a codegen
-  gap. The twin harness (`run.py`) keeps the loop real and is the fair runtime
-  comparison for that program.
+- **`refs` is the reference-read loss, and it is deliberate.** The loop reads a
+  fixed struct through `&self` accessors. `licm` will not hoist a read through a
+  reference: rmc lets a reference outlive its referent (`0 as &i64` is accepted),
+  so a speculative deref can fault on a loop that never runs, where the in-body
+  read would not. The accessor sum is therefore recomputed every iteration and
+  rmc loses to rustc by roughly 8x. A frame-based loop of the same shape is
+  hoisted and wins. Keeping the Rust loop real needs an in-loop `black_box`
+  (a store/reload per iteration), so read the ratio as "two real loops doing the
+  same arithmetic", not an instruction-for-instruction tie - but do not claim a
+  win here; there is not one. This was the state before the faulting-hoist fix
+  (the LICM reference-read restriction); the docstrings and this note were not
+  updated when the fix landed, and a stale 2.23x win sat in `RESULTS.md`.
 - **`callrec` is the call-heavy case, and it used to lose.** Non-tail recursion
   (`tree(n) = 1 + tree(n-1) + tree(n-2)`) cannot be inlined by either compiler,
   so it measures raw call overhead plus argument setup, where the stack-based
@@ -1360,27 +1187,7 @@ random splices, deletions and duplications to the generators' programs and the
 signal, no panic). It needs no rustc, so it runs anywhere, and it reaches error
 paths the hand-written corpora miss.
 
-`tests/mir/run.py` is the differential suite for the rustc-MIR path. Each
-`tests/mir/NAME.rs` is a freestanding `#![no_std]` program that includes
-`prelude.rs` and calls the runtime's `print_i64`/`print_bool`. The case is built
-twice: a reference from `rustc --emit=obj` linked against the *same* runtime
-(`rmc --emit-runtime-asm`) with `cc -static -nostdlib`, and rmc's own
-`rustc --emit=mir` + back-end build. Both binaries share one runtime and one
-entry point, so the only variable is the code generator; they must print
-identical stdout and exit with the same status. `ARGS` maps a case to its argv
-vectors. This is the suite that actually exercises `mir_codegen.rs`; `tests/run.py`
-covers the `.rms` path and never reaches it.
-
-`tests/std/run.py` is the same idea but with `std` available, so it can exercise
-`println!`/`print!`/`eprintln!`. Each `tests/std/NAME.rs` is a plain `std`
-program compiled by `rustc -O` (reference, the full LLVM pipeline) and by `rmc`
-(`rustc --emit=mir -O` then the back end); both must print identical stdout and
-exit with the same status. The `mir` suite cannot cover formatting (it is
-`#![no_std]`), so this is where the formatter machinery - literal and runtime
-arguments, `{:x}`/`{:X}`/`{:o}`/`{:b}` - is diffed against rustc. `ARGS` maps a
-case to its argv vectors.
-
-`tests/run.py` compiles each `tests/cases/NAME.{rms,rs}` pair with both compilers
+`tests/run.py` compiles each `tests/cases/NAME.rs` with both compilers
 and diffs stdout and the exit status. Every case is then recompiled with the
 optimiser passes disabled in turn (`--no-inline`, `--no-licm`, `--no-tco`, and
 all three at once), because a bug in one pass can hide behind another or only
@@ -1398,8 +1205,10 @@ side-effecting scrutinee, and value position) and `consts` (top-level `const`
 items in expression position, as array lengths and repeat counts, as a `for`
 bound, in conditions, and as `match` patterns, including a negative constant and
 one defined in terms of another) guard the
-front-end/codegen fixes below. When adding a case, add both twins, write
-them to behave identically, and remember that `rustc` infers `i32` for unsuffixed
+front-end/codegen fixes below. There is no separate rmc dialect: each case is a
+single `.rs` file that rmc compiles directly, and rustc compiles the same file
+as the reference, so rmc can stand in for rustc on the supported subset. When
+adding a case, remember that `rustc` infers `i32` for unsuffixed
 literals, so large literals need an `i64` suffix on the Rust side. `args.json`
 maps a case name to a list of argv vectors. Verify a new case actually detects
 the bug it guards: revert the fix and confirm the case fails.
@@ -1490,7 +1299,7 @@ Two exhaustiveness-walk bugs this exposed are fixed. A payload-binding arm
 block used to hide the chain: `match o { O::Some(v) => v, O::None => 0 }` (no
 `_`) was wrongly rejected. `chain_tail` now unwraps block wrappers while
 descending the chain, and the walk no longer requires an arm's `else` block to
-have empty `stmts`. `tests/cases/guard.{rms,rs}` and the `pat` fuzzer cover
+have empty `stmts`. `tests/cases/guard.rs` and the `pat` fuzzer cover
 guards; the `reject` fuzzer's `guard_*` cases pin the exhaustiveness rules.
 
 The `match` desugaring wraps its first step in `Expr::MatchBoundary`, a
@@ -1508,7 +1317,7 @@ it exactly like `Expr::Block`, and `is_block_like` lists it so a `match`
 statement still needs no trailing `;`. A subtle-scrutinee comparison would *not*
 work: the two programs above share the same scrutinee, so the boundary is the
 only thing that keeps them apart.
-`tests/cases/exhmat.{rms,rs}` covers value position, reordering, nesting,
+`tests/cases/exhmat.rs` covers value position, reordering, nesting,
 references and a loop; a non-exhaustive or duplicate-variant match still errors,
 and `tools/fuzz.py --mode reject` pins the nested-wildcard and statement-position
 cases.
@@ -1534,6 +1343,34 @@ no call and no matching variant is reported as an associated function that must
 be called (rmc has no function values), not as an unknown enum. Calling an
 associated function with `.` (`p.new(1)`) passes the receiver as an extra
 argument, so it fails on arity — which matches rustc's E0599 closely enough.
+
+A **nested `fn`** (`fn f() { .. }` as a statement) is an item, not a closure:
+Rust forbids it from capturing an enclosing local (`E0434`), so it sees only the
+program's items. That is what makes it cheap to support: the parser hoists it to
+the top level and appends it to `Program::fns`, so sema, codegen and every later
+pass treat it as an ordinary free function with no new case. Two things make it
+behave like rustc's block scoping, both in the parser:
+
+- *Name resolution and shadowing.* `parse_block_inner` pushes a scope frame
+  filled by `scan_block_fns`, a token-index pre-scan of the block's direct
+  statements (it skips any `{ .. }`/`( .. )`/`[ .. ]` region, so a `fn` inside an
+  inner block or a body is not seen here). The pre-scan gives each nested `fn` a
+  unique symbol (`rmc$nf<n>$<name>`, keyed in `fn_at` by the `fn` keyword's token
+  index) and records `name -> unique` in the frame. Because the frame is filled
+  before the statements are parsed, a nested `fn` is in scope for its whole block
+  (a call before its declaration, or a sibling declared later, both resolve), and
+  a nested `fn` shadows a top-level one of the same name inside the block.
+  `resolve_fn_name` rewrites a call through the innermost frame that names it.
+  Two `fn`s of one name in a block is rustc's `E0428`, reported by the pre-scan.
+- *The symbol.* `$` is used, not a NUL: the in-process encoder takes any bytes,
+  but the `--binutils` path writes the label into GNU `as`, which rejects a NUL.
+  A user identifier is `[A-Za-z0-9_]`, and a method mangles to `Type$method`
+  (one `$`), so `rmc$nf<n>$name` (two `$`) cannot collide with either.
+
+The definition is parsed under its pre-scanned name (`fn_at`), so the hoisted
+function and its call sites agree. A nested `fn` captures nothing, so this is
+exactly rustc's semantics for the subset — including that a nested `fn` in a
+`loop` body is the same function every iteration (it is not re-created).
 
 An array's element type is a scalar: `i64`, `bool` or a unit enum. Nested
 arrays, arrays of structs and arrays of payload enums are rejected. A unit enum
@@ -1588,8 +1425,12 @@ The checks, all in `sema.rs`:
   write — a field or element write does not initialize the aggregate, matching
   rustc's "partially assigned" rule, so reading it afterwards errors. A read of
   an uninitialized one errors. An `if`/`else` keeps a binding initialized only if both arms (or the
-  entry state) initialized it; a branch with no `else` and a loop body do not
-  count, because they may not run. This is deliberately conservative — it rejects
+  entry state) initialized it; a branch with no `else` does not count, because it
+  may not run, and a `while`/`for` body does not because the loop may run zero
+  times. A `loop` body counts only when every `break` that leaves the loop
+  initializes the binding: the loop runs at least once, but an exit taken before
+  the assignment leaves the binding uninitialized (rustc E0381), so the state at
+  each `break` is captured and merged. This is deliberately conservative — it rejects
   the uninitialized-array-filled-in-a-loop pattern (`let mut a: [i64; N]; while
   ... { a[i] = ..; } a[0]`), which rustc also rejects. Write the array with `= [0;
   N]` instead; the corpus cases do.
@@ -1602,7 +1443,10 @@ The checks, all in `sema.rs`:
   `a[1 + 4]` read adjacent stack memory. `Sema::const_of` extends this to a
   constant *local*: `let i = -1; a[i]` is folded the way rustc's constant
   propagation folds it, which an earlier version did not, letting `a[i]` read
-  past the array. A *variable* index is still unchecked by default (see Scope).
+  past the array. Both folders see through the identity cast `i as usize` (the
+  usual spelling of an index in real Rust), so `a[i as usize]` is caught
+  exactly like `a[i]`. A *variable* index is still unchecked by default (see
+  Scope).
 - **String typing.** A string literal is `Type::Str`, not `i64`. It cannot be an
   arithmetic operand (`1 + "hi"` was accepted as integer addition on the
   string's address, `E0369`) and cannot be passed where an `i64` is expected
@@ -1626,6 +1470,88 @@ The checks, all in `sema.rs`:
   effects (dropped entirely when it is a named local). A user `len` on a struct or
   enum still falls through to the mangled-method path. rmc's `.len()` is `i64`
   where rustc's is `usize`, so a differential twin casts with `as i64`.
+- **Built-in `i64` methods
+  (`abs`/`min`/`max`/`clamp`/`signum`/`is_positive`/`is_negative`/
+  `div_euclid`/`rem_euclid`/`midpoint`/`count_ones`/`count_zeros`/`leading_zeros`/
+  `trailing_zeros`/`leading_ones`/`trailing_ones`/`swap_bytes`/`reverse_bits`/
+  `rotate_left`/`rotate_right`).**
+  Like `len()`, they
+  are special-cased in the `MethodCall` arm of sema before the struct/enum lookup,
+  and only when the receiver's type is `i64`, so a user `min` on a struct is
+  untouched. `desugar_i64_method` rewrites the call into an expression over the
+  operators rmc already lowers, so codegen gains no case
+  (`clamp`'s `min > max` panic and the ten bit methods are the exceptions — a
+  call to the `__rmc_clamp` / `__rmc_count_ones` / `__rmc_leading_zeros` /
+  `__rmc_trailing_zeros` / `__rmc_swap_bytes` / `__rmc_reverse_bits` /
+  `__rmc_rotate_left` / `__rmc_rotate_right` runtime
+  pieces, each linked only when its method appears):
+  `abs` is `if x < 0 { -x } else { x }` (so `i64::MIN` maps to itself, matching
+  `rustc -O`; under `--overflow-checks` the `neg` traps, matching a debug build),
+  `signum` is `(x > 0) as i64 - (x < 0) as i64` (comparisons only, so `i64::MIN`
+  never overflows), `min`/`max` compare `y` against `x`
+  (`if y < x { y } else { x }` for `min`), returning `x` on a tie,
+  `clamp(lo, hi)` is `if lo > hi { __rmc_clamp() } else if x < lo { lo } else if
+  x > hi { hi } else { x }` (the `lo`/`hi` binds run in argument order, then the
+  range check, so `g().clamp(g(), g())` calls `g` three times as rustc does and
+  the inverted-range panic fires before either bound is used), and
+  `is_positive`/`is_negative` are the bare comparisons `x > 0` / `x < 0` (so
+  `0` is neither, and both return `bool`, unlike the `i64`-valued seven).
+  `div_euclid`/`rem_euclid` bind `q = x / y` and `r = x % y`, then round: when
+  `r < 0`, `div_euclid` is `q - 1` (positive `y`) or `q + 1` (negative `y`), and
+  `rem_euclid` is `r + y` (positive `y`) or `r - y` (negative `y`), the latter
+  arm written as a subtraction so no synthesized `-y` needs the neg lint exempted.
+  `rem_euclid` is phrased `r ± y` (not `r + abs(y)`) precisely so a `MIN` divisor
+  does not overflow a dead arm: with `y == MIN` the remainder is never negative,
+  so `r - y` never runs. They reuse `/` and `%`, so a zero divisor and
+  `MIN.div_euclid(-1)` panic at run time as the operators do.
+  `midpoint(y)` is the mean rounded toward zero, which is *not* the floor: it is
+  `(x & y) + ((x ^ y) >> 1)` (the floor, since `x + y = (x & y) + (x | y)` and
+  `(x | y) = (x & y) + (x ^ y)`) with a one-step correction for an odd negative
+  sum — `(x ^ y) & 1` is 1 exactly when the sum is odd, and the half-sum is
+  negative exactly when the sum is, so the correction is
+  `((x ^ y) & 1) & ((half < 0) as i64)`, added once. Nothing is negated and no
+  arm can overflow (the `&`, `^`, `>>` and `+` of the floor stay in range, and
+  the correction is 0 or 1), so `MAX.midpoint(MAX)` is `MAX` and
+  `MIN.midpoint(MAX)` is `0` with or without `--overflow-checks`. The half-sum is
+  bound to a temp so the sign test reads the same value the `+` does. This is
+  exactly `rustc`'s definition, so no helper is added.
+  `count_ones`/`leading_zeros`/`trailing_zeros` take no argument and lower to a
+  `Call __rmc_<name>` on the receiver (no operators): the usual `x & (x - 1)`
+  bit trick overflows for `i64::MIN`, and rustc's answer for `MIN` is exact
+  (`count_ones` 1, `leading_zeros` 0, `trailing_zeros` 63), so each helper is a
+  plain loop over the 64 bits that neither negates nor decrements — the result
+  is the same with and without `--overflow-checks`. `swap_bytes` is the same
+  shape with a single `bswap` (`enc_bswap` in the encoder: `0F C8+rd`), and
+  `reverse_bits` is a per-bit loop. `leading_ones`/`trailing_ones`/`count_zeros`
+  need no piece of their own: `leading_ones(x)` is `leading_zeros(!x)`,
+  `trailing_ones(x)` is `trailing_zeros(!x)` and `count_zeros(x)` is
+  `count_ones(!x)`, so the desugar wraps the receiver in `!` (`not`, which
+  cannot overflow) and calls the matching helper. `rotate_left`/`rotate_right`
+  are the one bit family that takes an argument: the desugar binds the receiver
+  then the count and calls `__rmc_rotate_left` / `__rmc_rotate_right`, which are
+  a single `rol`/`ror` (`enc_shift` gained the `/0` and `/1` group-2 encodings).
+  The hardware masks the count to 6 bits, which is exactly Rust's `n % 64`, so
+  every count is accepted (no panic) and no count is negated — the result is the
+  same with and without `--overflow-checks`. They reuse the same
+  bind-receiver-once path, so `g().count_ones()` calls `g` once, and the
+  `call`/`defines` pruning drops each helper unless its method appears.
+  Each desugar reads an operand more than once, so every non-trivial operand is
+  first bound to a fresh `\0im<n>` temporary (`Sema::tmp`), receiver before
+  argument — `g().abs()` calls `g` once, as rustc does; a plain variable or
+  literal is reused directly. The euclidean *receiver* instead goes through
+  `Sema::force_temp`, which binds it even when it is a plain variable or
+  literal: a literal or a const-tracked variable would let the synthesized
+  `x / y` (or the dead `r - y` arm) fold and trip the overflow lint on
+  `MIN.div_euclid(-1)` / `7.rem_euclid(MIN)` — programs rustc accepts, since it
+  never folds the stdlib body. The divisor is deliberately left as `bind` so a
+  literal divisor stays literal and `gen_div_const` can still strength-reduce
+  `x % d` to a magic multiply. A `\0`-named temp is never entered into
+  `const_locals` (the same reason). The desugar returns its result type (`i64`,
+  or `bool` for the predicates) so the caller reports the right type without
+  re-deriving it.
+  `abs`'s synthesized `-x` is exempt from the compile-time neg-overflow lint
+  (`Sema::in_builtin_neg`, named for the neg it suppresses), because rustc
+  accepts `i64::MIN.abs()`: a written `-i64::MIN` is still rejected.
 - **Parameter names (`E0415`) and `main` (`E0580`).** A function's parameters
   must be uniquely named; `check_fn` rejects a duplicate (rmc used to bind both
   to one slot). The parser applies the same check earlier
@@ -1803,47 +1729,6 @@ them fails the fuzz job at `iter=0`. `expr` mode emits `str::len` and array
 `.len()`. When adding a language feature, extend the
 generator to exercise it — a clean fuzz run only covers the shapes it emits.
 
-`mir` mode (`tools/fuzz.py --mode mir`) fuzzes the *other* pipeline: it builds a
-freestanding `#![no_std]` program (the `MIR_PRELUDE` plus the `expr` grammar's
-expressions), compiles it with `rustc --emit=obj` and links the object against
-the *same* freestanding runtime rmc uses (`rmc --emit-runtime-asm`), then
-compiles the same source through `rmc <src.rs>` (the rustc-MIR front end) and
-compares stdout and exit status. Because both binaries share one runtime and one
-entry point, the only variable is the code generator. It recompiles the rmc side
-with each MIR-level pass off in turn (`--no-inline`, `--no-licm`, `--no-tco`),
-which now also gates the MIR pipeline in `main.rs::run_mir_pipeline` — without
-that wiring the flags were silently ignored for a `.rs` input. The `.rms` modes
-never reach `mir_codegen.rs`; this is the only randomised coverage of the MIR
-back end. `--gen <mode>` reuses one of the `.rms` generators instead (only its
-`.rs` half is freestanding enough to link). It immediately found two real MIR
-codegen bugs: a shift whose count is computed by a call clobbered the value
-parked in `%rdx` (now parked in a frame slot), and a 64-bit constant used as an
-ALU immediate or a frame store was silently truncated to i32 (now materialised
-in a register; the assembler rejects an out-of-range immediate loudly instead of
-truncating). Both are pinned by `tests/mir/wideimm.rs`.
-
-`--gen width` (with `--mode mir`) is a differential generator that mixes every
-integer width (`u8`..`i64`, `usize`/`isize`) with `wrapping_add`/`sub`/`mul` and
-a cast back down. Every width shares one 64-bit word in the back end, so a wrong
-sign/zero extension or a missing wrap is the miscompile it hunts; none found.
-
-`mirrobust` mode (`tools/fuzz.py --mode mirrobust`) is `robust` for the MIR path:
-a fixed corpus of `.rs` programs (formatting, the containers, closures, floats,
-traits, generics, plus rustc-rejected and malformed input) that must each end in
-a diagnostic, never a panic or a signal. This is the failure a user hits first on
-this path — an unsupported MIR shape — so the corpus keeps it a message.
-
-`mirmut` mode (`tools/fuzz.py --mode mirmut`) mutates real `rustc --emit=mir`
-text and lowers it through the `.mir` input path (`rmc file.mir`). This is the
-only mode that reaches the back end's internal invariants with structurally
-broken input: the `.rs` modes cannot, because rustc rejects malformed source
-before it emits MIR. Every result must be a clean exit 0 or 1. It found two real
-panics on the first run — a function declaring no basic block (`facts_in[0]`
-indexed an empty vector) and a terminator targeting a block the function never
-declares (`merge_blocks` indexes `blocks[target]`) — both now rejected in
-`mir.rs::parse` and pinned by tests. It needs no rustc. When you add a MIR shape
-the passes assume, add a seed or a `MIR_TOKENS` fragment that violates it.
-
 `--mode mutate` is the counterpart to the differential modes: it needs no rustc
 reference at all. It seeds from the generators' programs and the `robust` corpus,
 applies one to four random edits (splice a token, delete a run, duplicate a run),
@@ -1880,6 +1765,51 @@ range is a compile error; a *variable* index is unchecked by default (used
 as-is, like C), so an out-of-range one reads or writes adjacent stack memory.
 `--bounds-checks` turns on a per-index runtime check that traps (see the codegen
 notes and "Soundness checks").
+
+The macro surface is lowered at parse time and is deliberately tiny.
+`print!`/`println!` take a literal format string and rewrite each `{}` to a
+`__rmc_print` call whose argument's checked type picks the runtime writer
+(`__rmc_write_i64`, `__rmc_write_bool`, `__rmc_write_str`, `__rmc_write_char`);
+`println!` appends the newline itself. Every `{}` argument is evaluated before
+the first byte of output, in source order (matching Rust), so the lowering
+binds each argument to a fresh local first and the `{}` writes read those —
+otherwise `println!("A{}B{}", f(), g())` would print `A` before `f` ran.
+`format_arguments_run_before_the_first_write` and `tests/cases/fmtorder.*`
+pin it; the fmtorder twin uses `println!` on both sides so the comparison
+rests on the ordering rule, not on `print_str`'s trailing newline. The `char`
+type is a distinct scalar (a Unicode scalar value in an 8-byte slot, so `c + 1`
+is rejected); its literals take the usual escapes, `as i64` yields the code
+point, and `match` accepts `'a'..='z'` / `'a'..'z'` range arms (lowered to the
+same two comparisons as an integer range; an empty range or a non-`char` bound
+is rejected). The `print_char(c)` builtin writes the UTF-8 bytes then a newline.
+`assert!`/`assert_eq!`/`assert_ne!`/`panic!`/`unreachable!`/
+`todo!`/`unimplemented!` desugar to `if !(cond) { exit(101) }` (or a bare
+`exit(101)`), so a failure matches rustc's panic exit code; the message
+arguments are parsed and discarded. `use` items are skipped at the top level
+and inside a block; a `use` of a `std` subtree is recorded so a later
+`process::exit(0)` after `use std::process;` resolves, and only
+`std::process::exit` and `std::hint::black_box` are understood among `std::`
+paths. `str` and `&str` are the same one-word value, so `ref_coerces` lets them
+be exchanged at a variable, parameter, struct-field, enum-variant-field or
+comparison site; there is no lifetime checking, so a `&'static str` field or
+`&str` parameter may be written `str`.
+
+There is no `Vec`, but the parser folds the few shapes the corpus uses to an
+`i64` address: `Vec::with_capacity(k)`/`Vec::new()` become `alloc(k * 8)`,
+`vec![e; n]` becomes `alloc(n * 8)` plus a `__rmc_fill`, `v.capacity()`/`v.len()`
+fold to the constant count, and `v.as_mut_ptr()` keeps the address so a later
+`.add(off)` is plain pointer arithmetic. Each shape is recognised only directly
+in a `let` initializer; anywhere else the `\0`-prefixed parser marker reaches
+sema, which reports the source construct (see the `\0vecnew` arm). An
+args-vector is never built: `std::env::args()...collect()` records the binding,
+`for v in &args` desugars to `for i in skip..__rmc_nargs()`, and `args[i]`
+becomes `__rmc_arg_or(i + skip, 0)`. The `__rmc_arg_or`, `__rmc_nargs` and
+`__rmc_fill` helpers live in `runtime.rs`. Two relaxations make the pointer
+shapes type: `*mut T as i64` is allowed (rmc maps `*mut T` and `&mut T` alike,
+and rustc allows the raw form) and an integer/pointer coerce both ways, matching
+the existing `i64 as &T` extension; a shared reference still may not become a
+`&mut` one.
+
 The README's roadmap lists the intended next steps.
 
 ## Codegen notes
@@ -2028,7 +1958,7 @@ The README's roadmap lists the intended next steps.
   - **The sign bias is required** for power-of-two divisors; without it a
     negative dividend rounds toward negative infinity instead of toward zero.
   - `small_imm` accepts a negated literal, so `x / -1000` takes the fast path.
-  - `tests/cases/div.{rms,rs}` covers both variants, powers of two, negatives,
+  - `tests/cases/div.rs` covers both variants, powers of two, negatives,
     and boundary dividends, and is the regression guard for all of the above.
 - Division or modulo by a *variable* divisor uses `idiv`, but only after a
   32-bit fast path. `emit_div` tests whether both operands fit in 32 bits by
@@ -2062,7 +1992,7 @@ The README's roadmap lists the intended next steps.
   when it is a compile-time constant (`const_of`); a run-time count always gets
   the check. With overflow checks off, the shift is unchecked, matching Rust's
   default `<<` (which does not panic on an out-of-range count in release).
-- **`tests/cases/divtrap.rms` and `shovf.rms` pin the trap codegen.** `divtrap`
+- **`tests/cases/divtrap.rs` and `shovf.rs` pin the trap codegen.** `divtrap`
   exercises `MIN / -1` (SIGFPE on x86 `idiv`) and division by zero, both of which
   trap *without* `--overflow-checks` (Rust panics on them by default); it covers
   the constant `-1` divisor (strength-reduced) and a runtime divisor (`idiv`).
@@ -2090,21 +2020,76 @@ The README's roadmap lists the intended next steps.
   duplicate a side effect or leave without adding the accumulator. It
   is also skipped entirely under `--overflow-checks`, since reassociating checked
   arithmetic traps on a different intermediate than the recursion. A shape that
-  does not match is left completely alone. `tests/cases/tco.{rms,rs}` diffs `fib`
-  and `fact` against rustc and `tests/cases/callrec.{rms,rs}` covers the
+  does not match is left completely alone. `tests/cases/tco.rs` diffs `fib`
+  and `fact` against rustc and `tests/cases/callrec.rs` covers the
   `1 + f(n-1) + f(n-2)` shape; unit tests pin the non-associative
   `f(x-1) - f(x-2)` case, a `return` in an argument, a foreign call in the left
   operand, and overflow checks.
 
+## MIR back-end benchmark tuning (fair harness)
+
+`bench/run_fair.py` compares the same `bench/mir/*.rs` source through both
+back ends: `mir` = `rustc --emit=mir -O -Zno-codegen` + `rmcmir`, `llvm` =
+`rustc --emit=obj -O -C lto=fat -C codegen-units=1` + `ld`, both linked against
+rmc's own freestanding runtime. Read the harness before trusting a number.
+
+- **Count the whole pipeline's peak RSS on both sides.** The `mir` column's RSS
+  is `max(rustc --emit=mir, rmcmir)`; counting only `rustc` on the LLVM side
+  (leaving out `ld`) credits LLVM with a free link step and turns a tie into a
+  fake win. `measure_llvm` takes `max(c, ld)`.
+- **`-Zno-codegen` is the whole point of the front end.** With it, `rustc
+  --emit=mir` stops before LLVM codegen: `hello`/`stats` front-end CPU drops
+  from ~267/538 ms to ~54/408 ms. rmc sets `RUSTC_BOOTSTRAP=1` on the child
+  rustc; the harness mirrors that. Without the flag the MIR front end is as
+  expensive as the LLVM one.
+- **`rustc --emit=mir` uses ~3-5 MB *more* RSS than `--emit=obj`** (85892 vs
+  85220 KB on `stats`), reproducibly, with `-Zthreads=1`, `debuginfo=0`,
+  `mir-opt-level=2` and `incremental=false` all failing to close it. The
+  compile-RSS axis is therefore an inherent front-end tie (~0.99), not
+  something the back end can fix; the front end is rustc in *both* pipelines.
+- **The compile CPU win is real and large** (~1.2x): skipping LLVM codegen.
+  Wall time is a near-tie because both fronts pay rustc's ~25-30 ms startup.
+
+### Branchless min/max (`cmov`) was tried and rejected
+
+A min/max diamond (`if v > acc { acc = v }`) lowered to a branch; LLVM emits
+`cmov`. Adding `enc_cmov` to `elf.rs` and a `plan_cmovs` fold to
+`mir_codegen.rs` made `stats` **1.16x slower** (3.27 -> 5.08 ms on the same
+binary, `taskset -c 2`, best of 13) and was neutral (0.99-1.02) on the rest.
+The reduction branches in these benchmarks are predictable — the accumulators
+start at `i64::MIN`/`MAX` and the update usually takes the same side — so the
+branch predicts ~perfectly while the `cmov` only adds a data dependency to a
+latency-bound loop. LLVM wins `stats` because it *unrolls by two* and strength-
+reduces the `i * 2654435761` multiply into two induction variables, not because
+of `cmov`. Do not re-add the fold without measuring a program whose min/max
+input is genuinely unpredictable.
+
+### No-op arithmetic (`add $0, %reg`) must be dropped
+
+A struct field at offset 0 lowers to `add $0, %rax`. The instruction cannot
+change its destination, but it *does* block the store-forwarding peephole that
+would otherwise fold the pointer's round-trip through its frame slot, so every
+field write keeps a reload. `drop_noop_arith` removes `add $0`/`sub $0` unless
+the next instruction reads the flags it sets (`flags_used_by`). Measured on the
+`heap` linked-list fill: one load per node removed, run 1.08x vs LLVM; `refs`
+1.04x, `mix` 1.01x.
+
 ## Pushing
 
-Pushing needs a token with `contents: write`. The `GITHUB_TOKEN` provided in
-this environment is **read-only**: it authenticates as the repo owner and the
-REST API even reports `admin` on the repo, yet `git push` and the Git Data API
-both return `403 Resource not accessible by integration` (`receive-pack` is
-refused while `git fetch` works). That combination — API says `push: true`, push
-says "not accessible by integration" — is the signature of a read-only token,
-not a missing scope. Do not re-derive it: ask the user for a token with
-`contents: write` and push with it once, inline in the URL
-(`git push https://<token>@github.com/irhasar/rmc.git <branch>`), so it is not
-written to `.git/config`. Never persist the token in a remote URL or a file.
+`git push origin <branch>` works with the `GITHUB_TOKEN` in this environment.
+An earlier note here claimed the token was read-only (`403 Resource not
+accessible by integration` on `receive-pack`); that is no longer true — pushes
+to `rmc-1-core` through `rmc-4-patterns` succeed. If a push is ever refused,
+check `git ls-remote` first before concluding the token lacks `contents: write`,
+and never persist a token in `.git/config` or a file.
+
+## PR branch stack
+
+The four PRs stack linearly: `rmc-1-core` -> `rmc-2-optimiser` ->
+`rmc-3-artifact-size` -> `rmc-4-patterns`, each targeting the one below it.
+Review fixes land on the branch the finding names, then propagate *upward*:
+merge the fixed lower branch into the branch above it. A fix that both a lower
+and an upper branch already carry independently (because it was carried upward
+before it landed below) will conflict on the duplicate hunks; resolve by keeping
+either side — the content is identical — and commit the merge so the upper
+branch descends from the corrected base and the PR reports `mergeable`.

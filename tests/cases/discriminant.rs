@@ -1,4 +1,4 @@
-// The Rust twin of `discriminant.rms`. A plain Rust subset.
+// A plain Rust subset.
 #[derive(Copy, Clone)]
 enum Code { Ok = 0, Warn = 4, Err }
 #[derive(Copy, Clone)]

@@ -14,7 +14,7 @@
 //! error naming the line, so an unhandled MIR shape fails loudly instead of
 //! silently miscompiling.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// A resolved type, in the narrow sense the backend needs.
 ///
@@ -853,7 +853,263 @@ pub fn parse(text: &str) -> Result<Program, String> {
         }
     }
     resolve_impl_calls(&mut prog);
+    canonicalize_types(&mut prog);
     Ok(prog)
+}
+
+/// Reconcile the several names rustc's MIR printer uses for one type. A type is
+/// spelled with a path *relative* to the item that mentions it: `main` prints
+/// `a::A`, but the impl inside module `a` prints the same type as `A`, and a
+/// type two modules deep prints with only the tail of its path. Two distinct
+/// types can also share a last segment (`a::A` and `b::A`). `parse_ty` keeps
+/// every qualified path whole; this pass then lets a bare (or short) name adopt
+/// the one qualified name it is a `::`-suffix of, so an impl definition, its
+/// call sites and the value's own layout all key on one string. A name with no
+/// unique longer match is left alone.
+fn canonicalize_types(prog: &mut Program) {
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for f in &prog.funcs {
+        for l in &f.locals {
+            collect_struct_names(&l.ty, &mut names);
+        }
+        for b in &f.blocks {
+            for s in &b.stmts {
+                collect_stmt_tys(s, &mut names);
+            }
+        }
+    }
+    for k in prog.drop_impls.keys() {
+        names.insert(k.clone());
+    }
+
+    let mut canon: BTreeMap<String, String> = BTreeMap::new();
+    for n in &names {
+        canon.insert(n.clone(), n.clone());
+    }
+    // Each name adopts the unique *longest* name it is a `::`-suffix of. When
+    // two candidates tie for longest (`A` seen as both `a::A` and `b::A`) the
+    // name is genuinely ambiguous and is left alone.
+    for n in &names {
+        let suffix = format!("::{n}");
+        let mut best: Option<&String> = None;
+        let mut tied = false;
+        for q in &names {
+            if q != n && q.ends_with(&suffix) {
+                match best {
+                    Some(b) if q.len() == b.len() => tied = true,
+                    Some(b) if q.len() < b.len() => {}
+                    _ => {
+                        best = Some(q);
+                        tied = false;
+                    }
+                }
+            }
+        }
+        if let Some(b) = best.filter(|_| !tied) {
+            canon.insert(n.clone(), b.clone());
+        }
+    }
+
+    for f in &mut prog.funcs {
+        for l in &mut f.locals {
+            rename_struct_names(&mut l.ty, &canon);
+        }
+        for b in &mut f.blocks {
+            for s in &mut b.stmts {
+                rename_stmt_tys(s, &canon);
+            }
+            if let Terminator::Call { func: CallTarget::Direct(name), .. } = &mut b.term {
+                if let Some((recv, rest)) = name
+                    .split_once("__")
+                    .filter(|(k, _)| canon.contains_key(*k))
+                    .map(|(k, r)| (k.to_string(), r.to_string()))
+                {
+                    *name = format!("{}__{rest}", canon[&recv]);
+                }
+            }
+        }
+    }
+    // An impl method's symbol is `<receiver>__<method>`; the receiver is the
+    // long-name form the definition happened to print, so rename the prefix.
+    let mut keys: Vec<&String> = canon.iter().filter(|(k, v)| k != v).map(|(k, _)| k).collect();
+    keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
+    for f in &mut prog.funcs {
+        if let Some((recv, rest)) = keys
+            .iter()
+            .find_map(|k| f.name.strip_prefix(k.as_str()).and_then(|r| r.strip_prefix("__")).map(|r| (*k, r)))
+        {
+            f.name = format!("{}__{rest}", canon[recv]);
+        }
+    }
+    let mut new_drops: HashMap<String, String> = HashMap::new();
+    for (recv, sym) in &prog.drop_impls {
+        let c = canon.get(recv).cloned().unwrap_or_else(|| recv.clone());
+        let sym = sym
+            .strip_prefix("__rmc_drop_")
+            .map(|r| format!("__rmc_drop_{}", canon.get(r).cloned().unwrap_or_else(|| r.to_string())))
+            .unwrap_or_else(|| sym.clone());
+        new_drops.insert(c, sym);
+    }
+    prog.drop_impls = new_drops;
+}
+
+/// Insert every `Ty::Struct` name reachable from `ty`.
+fn collect_struct_names(ty: &Ty, out: &mut BTreeSet<String>) {
+    match ty {
+        Ty::Struct(n) => {
+            out.insert(n.clone());
+        }
+        Ty::Ref(t) | Ty::Ptr(t) | Ty::Array(t, _) => collect_struct_names(t, out),
+        Ty::Tuple(ts) => ts.iter().for_each(|t| collect_struct_names(t, out)),
+        _ => {}
+    }
+}
+
+/// Rewrite every `Ty::Struct` name reachable from `ty` through `canon`.
+fn rename_struct_names(ty: &mut Ty, canon: &BTreeMap<String, String>) {
+    match ty {
+        Ty::Struct(n) => {
+            if let Some(c) = canon.get(n) {
+                *n = c.clone();
+            }
+        }
+        Ty::Ref(t) | Ty::Ptr(t) | Ty::Array(t, _) => rename_struct_names(t, canon),
+        Ty::Tuple(ts) => ts.iter_mut().for_each(|t| rename_struct_names(t, canon)),
+        _ => {}
+    }
+}
+
+fn collect_stmt_tys(s: &Stmt, out: &mut BTreeSet<String>) {
+    if let Stmt::Assign(_, rv) = s {
+        collect_rv_tys(rv, out);
+    }
+}
+
+fn rename_stmt_tys(s: &mut Stmt, canon: &BTreeMap<String, String>) {
+    if let Stmt::Assign(_, rv) = s {
+        rename_rv_tys(rv, canon);
+    }
+}
+
+fn collect_rv_tys(rv: &Rvalue, out: &mut BTreeSet<String>) {
+    if let Rvalue::Cast { from, to, .. } = rv {
+        collect_struct_names(from, out);
+        collect_struct_names(to, out);
+    }
+    // An enum variant names its enum in the path prefix (`a::E::A` -> `a::E`);
+    // that prefix must canonicalize with the enum's own type spelling.
+    if let Rvalue::Enum { name, ops } = rv {
+        if let Some(prefix) = name.rsplit_once("::").map(|(p, _)| p) {
+            out.insert(prefix.to_string());
+        }
+        for op in ops {
+            collect_op_tys(op, out);
+        }
+    }
+    for op in rv_all_operands(rv) {
+        collect_op_tys(op, out);
+    }
+}
+
+/// The back-end identity of the type a struct aggregate-constant name refers
+/// to. A std shape the back end models by its last segment (`std::ops::Range`
+/// -> `Range`, matching `parse_ty`) keeps just that; a user aggregate keeps its
+/// whole path (`a::A`), matching the identity `parse_ty` gave it and
+/// `canonicalize_types` reconciled. Generic arguments are dropped either way.
+pub(crate) fn struct_const_identity(name: &str) -> String {
+    let base = strip_generics(name);
+    let last = base.rsplit("::").next().unwrap_or(&base).trim();
+    let std_shape = matches!(
+        last,
+        "Option" | "Range" | "Argument" | "ArgumentType" | "NonNull" | "PhantomData" | "Arguments"
+    );
+    if std_shape {
+        last.to_string()
+    } else {
+        base
+    }
+}
+
+/// The type a `Const::Agg` names: the whole path for a struct (`a::A`), the
+/// enum prefix for a variant (`a::E::A` -> `a::E`). Returns the type name and
+/// the `::variant` suffix to re-append, if the constant is a variant.
+fn agg_type_and_variant(name: &str) -> (String, String) {
+    let base = strip_generics(name);
+    if let Some((prefix, variant)) = base.rsplit_once("::") {
+        let last = prefix.rsplit("::").next().unwrap_or(prefix).trim();
+        if last.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+            return (struct_const_identity(prefix), format!("::{variant}"));
+        }
+    }
+    (struct_const_identity(&base), String::new())
+}
+
+fn collect_op_tys(op: &Operand, out: &mut BTreeSet<String>) {
+    if let Operand::Const(Const::Agg { name, ops }) = op {
+        out.insert(agg_type_and_variant(name).0);
+        for o in ops {
+            collect_op_tys(o, out);
+        }
+    }
+}
+
+fn rename_rv_tys(rv: &mut Rvalue, canon: &BTreeMap<String, String>) {
+    if let Rvalue::Cast { from, to, .. } = rv {
+        rename_struct_names(from, canon);
+        rename_struct_names(to, canon);
+    }
+    if let Rvalue::Enum { name, ops } = rv {
+        if let Some((prefix, variant)) = name.rsplit_once("::") {
+            if let Some(c) = canon.get(prefix) {
+                *name = format!("{c}::{variant}");
+            }
+        }
+        for op in ops {
+            rename_op_tys(op, canon);
+        }
+    }
+    for op in rv_all_operands_mut(rv) {
+        rename_op_tys(op, canon);
+    }
+}
+
+fn rename_op_tys(op: &mut Operand, canon: &BTreeMap<String, String>) {
+    if let Operand::Const(Const::Agg { name, ops }) = op {
+        let (ty, suffix) = agg_type_and_variant(name);
+        if let Some(c) = canon.get(&ty) {
+            *name = format!("{c}{suffix}");
+        }
+        for o in ops {
+            rename_op_tys(o, canon);
+        }
+    }
+}
+
+/// Every operand a statement's rvalue reads, for the type-canonicalization walk.
+fn rv_all_operands(rv: &Rvalue) -> Vec<&Operand> {
+    match rv {
+        Rvalue::Use(op) => vec![op],
+        Rvalue::Binary(_, a, b) => vec![a, b],
+        Rvalue::Unary(_, a) => vec![a],
+        Rvalue::Cast { op, .. } => vec![op],
+        Rvalue::Repeat { op, .. } => vec![op],
+        Rvalue::Array(ops) | Rvalue::Aggregate(ops) | Rvalue::Enum { ops, .. } => ops.iter().collect(),
+        Rvalue::WithOverflow { a, b, .. } => vec![a, b],
+        _ => Vec::new(),
+    }
+}
+
+fn rv_all_operands_mut(rv: &mut Rvalue) -> Vec<&mut Operand> {
+    match rv {
+        Rvalue::Use(op) => vec![op],
+        Rvalue::Binary(_, a, b) => vec![a, b],
+        Rvalue::Unary(_, a) => vec![a],
+        Rvalue::Cast { op, .. } => vec![op],
+        Rvalue::Repeat { op, .. } => vec![op],
+        Rvalue::Array(ops) | Rvalue::Aggregate(ops) | Rvalue::Enum { ops, .. } => ops.iter_mut().collect(),
+        Rvalue::WithOverflow { a, b, .. } => vec![a, b],
+        _ => Vec::new(),
+    }
 }
 
 /// Replace each marked impl-method call target (`<IMPL_MARK>method`) with the
@@ -1272,6 +1528,12 @@ fn parse_fn(lines: &[String], start: usize) -> Result<(Function, usize), String>
     let recv = method_receiver_ty(&arg_tys);
     let mut name = match (&method, &recv) {
         (Some(m), Some(r)) if !m.is_empty() && !m.contains('<') => format!("{r}__{m}"),
+        // An associated function has an impl-method name but no receiver
+        // argument (`method_receiver_ty` yields `None`). Its *call* prints as
+        // `Type::name` and `resolve_impl_calls` resolves it to the bare method
+        // name, so the definition must be keyed that way too, or the call
+        // targets a `\u{1}`-marked symbol that no definition carries.
+        (Some(m), None) if !m.is_empty() && !m.contains('<') => m.clone(),
         _ => normalize_call_name(&raw_name).unwrap_or_else(|| raw_name.clone()),
     };
     // A `Drop` impl is renamed to `__rmc_drop_<T>`; `parse` records the mapping
@@ -1574,14 +1836,32 @@ fn normalize_call_name(name: &str) -> Option<String> {
     // module-qualified free function (`m::helper`) has a lowercase first
     // segment and is left alone.
     let head = name.split('<').next().unwrap_or(name);
-    let first = head.split("::").next().unwrap_or(head).trim();
-    let tail = head.rsplit("::").next().unwrap_or(head).trim();
+    let segs: Vec<&str> = head.split("::").map(str::trim).collect();
+    let first = segs.first().copied().unwrap_or(head);
+    let tail = segs.last().copied().unwrap_or(head);
+    let is_ident = !tail.is_empty() && tail.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let is_method = tail.chars().next().is_some_and(|c| c.is_ascii_lowercase());
+    // `Type::method` (a capitalised first segment, a lowercase last).
     if first != tail
         && first.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-        && tail.chars().next().is_some_and(|c| c.is_ascii_lowercase())
-        && tail.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && is_method
+        && is_ident
     {
         return Some(format!("{IMPL_MARK}{tail}"));
+    }
+    // `module::Type::method` — the printer qualifies the receiver with the
+    // modules it is named from (`a::A::value`), so a capitalised
+    // second-to-last segment is the receiver and the call is a method too.
+    // A `module::function` path has a lowercase second-to-last segment and is
+    // left as a free function.
+    if segs.len() >= 2 {
+        let penult = segs[segs.len() - 2];
+        if penult.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+            && is_method
+            && is_ident
+        {
+            return Some(format!("{IMPL_MARK}{tail}"));
+        }
     }
     // Drop a leading `<...>` qualifier, then take the final path segment.
     let mut rest = name;
@@ -2062,6 +2342,23 @@ fn parse_rvalue(s: &str) -> Result<Rvalue, String> {
             let close = matching(s, open, '(', ')').ok_or_else(|| format!("mir: unbalanced unop `{s}`"))?;
             let arg = s[open + 1..close].trim();
             return Ok(Rvalue::Unary(op, parse_operand(arg)?));
+        }
+    }
+    // A fieldless enum variant used as a value (`b::E::B`). rustc prints a
+    // variant *with* a payload as a constructor call, but a unit variant is a
+    // bare path, and the back end needs the enum and variant to write the tag.
+    // Both the last segment and the one before it must be type-cased, so an
+    // associated constant (`i64::MAX`, `std::u64::MAX`) is not mistaken for a
+    // variant.
+    if s.contains("::") && !s.contains(char::is_whitespace) {
+        let segs: Vec<&str> = s.split("::").collect();
+        let camel = |x: &str| {
+            x.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                && x.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        };
+        let n = segs.len();
+        if n >= 2 && camel(segs[n - 1]) && camel(segs[n - 2]) {
+            return Ok(Rvalue::Enum { name: s.to_string(), ops: Vec::new() });
         }
     }
     // Fall back to an operand (a `copy`/`move`/`const`).
@@ -2833,14 +3130,15 @@ pub fn parse_ty(s: &str) -> Result<Ty, String> {
             }
             if s.contains("::") {
                 // A qualified user-defined aggregate (`m::Pair`, `crate::E`)
-                // reaches here after the std shapes above. Keep its identity so
-                // the back end sizes and copies the whole value; folding it to
-                // `Ty::Other` would silently copy only the first word.
-                if let Some(last) = qualified_aggregate_name(s) {
-                    return Ok(Ty::Struct(last));
-                }
-                if let Some(last) = lowercase_module_aggregate(s) {
-                    return Ok(Ty::Struct(last));
+                // reaches here after the std shapes above. Keep its *whole*
+                // path as its identity, not just the last segment: two distinct
+                // types can share a last segment (`a::A` and `b::A`), and
+                // folding both to `A` makes their layouts and method symbols
+                // collide. `canonicalize_types` later shortens a path back to
+                // its last segment when that segment is unambiguous, so a type
+                // printed bare in its own module still matches.
+                if let Some(path) = user_aggregate_path(s) {
+                    return Ok(Ty::Struct(path));
                 }
                 Ok(Ty::Other)
             } else {
@@ -2852,15 +3150,17 @@ pub fn parse_ty(s: &str) -> Result<Ty, String> {
 
 // --- small string utilities ------------------------------------------------
 
-/// The last path segment of a qualified *user aggregate* type name, if `s`
-/// names one (`m::Pair` -> `Pair`, `crate::E` -> `E`). `None` for a
-/// function-pointer or trait-object type, whose last segment is not a type, so
-/// `parse_ty` keeps treating those as scalars.
+/// The path-qualified *user aggregate* type name, if `s` names one
+/// (`m::Pair` -> `m::Pair`, `crate::E` -> `crate::E`). The whole path is kept so
+/// two same-named types in different modules stay distinct; `canonicalize_types`
+/// shortens it later where the last segment is unambiguous.
 ///
-/// Only types the earlier std-shape arms did not already claim reach here, so
+/// `None` for a function-pointer or trait-object type, whose last segment is
+/// not a type, so `parse_ty` keeps treating those as scalars. Only types the
+/// earlier std-shape arms did not already claim reach here, so
 /// `std::fmt::Arguments` and the `format_args!` helpers are handled before this
 /// is consulted.
-fn qualified_aggregate_name(s: &str) -> Option<String> {
+fn user_aggregate_path(s: &str) -> Option<String> {
     // Drop a leading `<...>` qualifier (`<T as Trait>::Assoc`).
     let mut rest = s.trim();
     if rest.starts_with('<') {
@@ -2873,25 +3173,7 @@ fn qualified_aggregate_name(s: &str) -> Option<String> {
     let ok = !last.is_empty()
         && last.chars().next().is_some_and(|c| c.is_ascii_uppercase())
         && last.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-    ok.then(|| last.to_string())
-}
-
-/// The final CamelCase segment of a path-qualified aggregate whose last
-/// segment is capitalised but whose *first* is not (`a::A` -> `A`). Such a name
-/// is a module-qualified user type, which `qualified_aggregate_name` rejects
-/// (it keys on a capitalised last segment) and `parse_ty` would otherwise fold
-/// to `Ty::Other`, losing the value's size. This mirrors the printer's
-/// qualification of a type used across a module boundary.
-fn lowercase_module_aggregate(s: &str) -> Option<String> {
-    let head = s.split('<').next().unwrap_or(s);
-    let mut segs = head.split("::").filter(|x| !x.trim().is_empty());
-    let first = segs.next()?.trim();
-    let last = head.rsplit("::").next()?.trim();
-    let is_ty = !last.is_empty()
-        && last.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-        && last.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-    let first_is_mod = first.chars().next().is_some_and(|c| c.is_ascii_lowercase());
-    (is_ty && first_is_mod).then(|| last.to_string())
+    ok.then(|| head.trim().to_string())
 }
 
 /// Index of the matching close bracket for the opener at `open`.
@@ -3774,6 +4056,451 @@ pub fn fold_accumulators(prog: &mut Program) {
     for f in &mut prog.funcs {
         f.fold_accumulators();
     }
+}
+
+/// Fold a counted loop into its closed form.
+///
+/// `for _ in 0..n { acc += K }`, with `K` loop-invariant, is `acc += K * n`.
+/// rustc's MIR keeps the loop (LLVM folds it later through scalar evolution),
+/// so the rmc back end would run the body N times; the `refs` benchmark turns a
+/// constant sum into N additions this way. The fold is exact only under wrapping
+/// arithmetic, so it is skipped when overflow checks are on: a checked `+` would
+/// trap at a different iteration than the folded `*`.
+pub fn close_counted_loops(prog: &mut Program, overflow_checks: bool) {
+    if overflow_checks {
+        return;
+    }
+    for f in &mut prog.funcs {
+        for _ in 0..8 {
+            if !f.close_one_counted_loop() {
+                break;
+            }
+        }
+    }
+}
+
+/// The pieces of a loop that `close_counted_loops` matched: an induction
+/// variable stepping by one from zero, an accumulator adding a loop-invariant
+/// value each iteration, and the bound the induction variable is compared with.
+struct CountedLoop {
+    exit: u32,
+    body: u32,
+    acc: u32,
+    bound: Operand,
+    k: Operand,
+}
+
+impl Function {
+    /// Match one `for i in 0..bound { acc += K }` loop and replace its body with
+    /// `acc += K * bound`, guarded by the loop's own `0 < bound` test.
+    fn close_one_counted_loop(&mut self) -> bool {
+        let n = self.blocks.len();
+        if n == 0 {
+            return false;
+        }
+        let succs: Vec<Vec<u32>> = self.blocks.iter().map(|b| successors(&b.term)).collect();
+        let mut preds: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for (b, ss) in succs.iter().enumerate() {
+            for &s in ss {
+                if !preds[s as usize].contains(&(b as u32)) {
+                    preds[s as usize].push(b as u32);
+                }
+            }
+        }
+        let mut dom: Vec<HashSet<usize>> = vec![HashSet::new(); n];
+        for b in 0..n {
+            if b == 0 {
+                dom[b].insert(0);
+            } else {
+                dom[b].extend(0..n);
+            }
+        }
+        loop {
+            let mut changed = false;
+            for b in 1..n {
+                let mut new: HashSet<usize> = HashSet::new();
+                if let Some((first, rest)) = preds[b].split_first() {
+                    new = dom[*first as usize].clone();
+                    for p in rest {
+                        new.retain(|x| dom[*p as usize].contains(x));
+                    }
+                }
+                new.insert(b);
+                if new != dom[b] {
+                    dom[b] = new;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let Some(cl) = self.match_counted_loop(&succs, &preds, &dom, n) else {
+            return false;
+        };
+        self.apply_counted_loop(cl);
+        true
+    }
+
+    fn match_counted_loop(
+        &self,
+        succs: &[Vec<u32>],
+        preds: &[Vec<u32>],
+        dom: &[HashSet<usize>],
+        n: usize,
+    ) -> Option<CountedLoop> {
+        for h in 0..n {
+            let Terminator::SwitchInt { discr, .. } = &self.blocks[h].term else { continue };
+            // The back edge is a predecessor the header dominates; its tail is
+            // the latch. Exactly one such edge keeps the shape a simple loop.
+            let latch: Vec<u32> = preds[h]
+                .iter()
+                .copied()
+                .filter(|&u| u != h as u32 && dom[u as usize].contains(&h))
+                .collect();
+            if latch.len() != 1 {
+                continue;
+            }
+            // The loop is the latch plus every block that can reach it without
+            // passing through the header. Following predecessors with the header
+            // removed is what keeps the exit block out: the exit can only reach
+            // the latch by going back through the header.
+            let mut in_loop = vec![false; n];
+            in_loop[h] = true;
+            let mut stack = vec![latch[0]];
+            while let Some(x) = stack.pop() {
+                if in_loop[x as usize] {
+                    continue;
+                }
+                in_loop[x as usize] = true;
+                for &p in &preds[x as usize] {
+                    if p != h as u32 {
+                        stack.push(p);
+                    }
+                }
+            }
+            // A single entry from outside is the preheader.
+            let outside: Vec<u32> =
+                preds[h].iter().copied().filter(|&p| !in_loop[p as usize]).collect();
+            if outside.len() != 1 {
+                continue;
+            }
+            // One successor inside the loop is the body; one outside is the exit.
+            let inner: Vec<u32> =
+                succs[h].iter().copied().filter(|&s| in_loop[s as usize]).collect();
+            let outer: Vec<u32> =
+                succs[h].iter().copied().filter(|&s| !in_loop[s as usize]).collect();
+            if inner.len() != 1 || outer.len() != 1 {
+                continue;
+            }
+            let (body, exit) = (inner[0], outer[0]);
+            // A single-block body that jumps straight back to the header.
+            let body_blocks: Vec<u32> =
+                (0..n as u32).filter(|&b| b != h as u32 && in_loop[b as usize]).collect();
+            if body_blocks != vec![body]
+                || !matches!(self.blocks[body as usize].term, Terminator::Goto(t) if t == h as u32)
+            {
+                continue;
+            }
+            // The test must be `iv < bound`, with `iv` an induction variable.
+            let Some((op, a, b)) = self.bool_def(discr) else { continue };
+            if op != BinOp::Lt {
+                continue;
+            }
+            let (Operand::Copy(ivp) | Operand::Move(ivp)) = &a else { continue };
+            if !ivp.proj.is_empty() {
+                continue;
+            }
+            let iv = ivp.local;
+            let bound = as_copy(&b);
+            // `iv` must start at zero, outside the loop.
+            if self.loop_iv_init(iv, &in_loop, n) != Some(0) {
+                continue;
+            }
+            // Locals the loop writes: an invariant operand must not be one.
+            let mut defined_in_loop: HashSet<u32> = HashSet::new();
+            for b in 0..n {
+                if !in_loop[b] {
+                    continue;
+                }
+                for s in &self.blocks[b].stmts {
+                    if let Stmt::Assign(d, _) = s {
+                        defined_in_loop.insert(d.local);
+                    }
+                }
+                if let Terminator::Call { dest, .. } = &self.blocks[b].term {
+                    defined_in_loop.insert(dest.local);
+                }
+            }
+            let invariant = |op: &Operand| {
+                other_place(op).is_some_and(|l| !defined_in_loop.contains(&l))
+            };
+            // The header runs exactly once after the rewrite, so it must be no
+            // more than the test: a local it writes and that is read again
+            // outside the header would lose its per-iteration value, and a store
+            // through a pointer is a side effect that must not be dropped either.
+            // (The discriminant local and short-lived comparison temporaries are
+            // read only inside the header, so they are fine.)
+            let discr_local = other_place(discr);
+            let mut header_ok = true;
+            for s in &self.blocks[h].stmts {
+                match s {
+                    Stmt::Nop => {}
+                    Stmt::Assign(d, _) if d.proj.is_empty() => {
+                        if Some(d.local) != discr_local
+                            && self.local_read_elsewhere(d.local, h as u32, n)
+                        {
+                            header_ok = false;
+                            break;
+                        }
+                    }
+                    _ => {
+                        header_ok = false;
+                        break;
+                    }
+                }
+            }
+            if !header_ok {
+                continue;
+            }
+            // The body is exactly `acc += K` and `iv += 1`.
+            let mut acc = None;
+            let mut iv_updates = 0u32;
+            let mut only_updates = true;
+            for s in &self.blocks[body as usize].stmts {
+                match s {
+                    Stmt::Nop => {}
+                    Stmt::Assign(d, Rvalue::Binary(BinOp::Add, x, y)) if d.proj.is_empty() => {
+                        if let Some(c) = const_operand(y) {
+                            // `iv += 1`.
+                            if d.local == iv && matches!(other_place(x), Some(p) if p == iv) && c == 1 {
+                                iv_updates += 1;
+                                continue;
+                            }
+                        }
+                        // `acc += K` (either operand order), K invariant.
+                        for (self_side, other) in [(x, y), (y, x)] {
+                            if matches!(other_place(self_side), Some(p) if p == d.local)
+                                && invariant(other)
+                            {
+                                if acc.is_some() {
+                                    only_updates = false;
+                                }
+                                acc = Some((d.local, as_copy(other)));
+                                break;
+                            }
+                        }
+                    }
+                    _ => only_updates = false,
+                }
+            }
+            // The induction variable must advance by exactly one each iteration:
+            // `acc += K * bound` counts `bound` iterations, which matches a step
+            // of one and nothing else.
+            if !only_updates || iv_updates != 1 {
+                continue;
+            }
+            let Some((acc, k)) = acc else { continue };
+            if acc == iv
+                || other_place(&k) == Some(acc)
+                || other_place(&bound) == Some(acc)
+                || !invariant(&bound)
+            {
+                continue;
+            }
+            // `iv` must be dead after the loop, or the closed form's missing
+            // final value would be observable.
+            if self.local_read_outside(iv, &in_loop, outside[0], n) {
+                continue;
+            }
+            return Some(CountedLoop { exit, body, acc, bound, k });
+        }
+        None
+    }
+
+    fn apply_counted_loop(&mut self, cl: CountedLoop) {
+        let t = self.fresh_local();
+        let mul = Stmt::Assign(
+            Place { local: t, proj: Vec::new() },
+            Rvalue::Binary(BinOp::Mul, cl.k, cl.bound),
+        );
+        let add = Stmt::Assign(
+            Place { local: cl.acc, proj: Vec::new() },
+            Rvalue::Binary(
+                BinOp::Add,
+                Operand::Copy(Place { local: cl.acc, proj: Vec::new() }),
+                Operand::Copy(Place { local: t, proj: Vec::new() }),
+            ),
+        );
+        // The header keeps its `0 < bound` test; running the body once now does
+        // the whole accumulation, and the body exits instead of looping.
+        self.blocks[cl.body as usize].stmts = vec![mul, add];
+        self.blocks[cl.body as usize].term = Terminator::Goto(cl.exit);
+    }
+
+    /// The constant `local` is initialised to outside the loop at `header`, if
+    /// there is exactly one such definition and it is a literal.
+    fn loop_iv_init(&self, local: u32, in_loop: &[bool], n: usize) -> Option<i64> {
+        let mut init = None;
+        for b in 0..n {
+            if in_loop[b] {
+                continue;
+            }
+            for s in &self.blocks[b].stmts {
+                if let Stmt::Assign(d, Rvalue::Use(c)) = s {
+                    if d.local == local && d.proj.is_empty() {
+                        if init.is_some() {
+                            return None;
+                        }
+                        init = const_operand(c);
+                    }
+                }
+            }
+        }
+        init
+    }
+
+    /// Whether `local` is read anywhere except in block `h` itself (its own
+    /// definitions do not count). Decides whether a header statement the
+    /// loop-closing rewrite deletes was observable elsewhere.
+    fn local_read_elsewhere(&self, local: u32, h: u32, n: usize) -> bool {
+        for b in 0..n {
+            if b as u32 == h {
+                continue;
+            }
+            for s in &self.blocks[b].stmts {
+                let mut found = false;
+                if let Stmt::Assign(_, rv) = s {
+                    scan_rv_operands(rv, &mut |op| {
+                        if other_place(op) == Some(local) {
+                            found = true;
+                        }
+                    });
+                }
+                if found {
+                    return true;
+                }
+            }
+            match &self.blocks[b].term {
+                Terminator::SwitchInt { discr, .. } => {
+                    if other_place(discr) == Some(local) {
+                        return true;
+                    }
+                }
+                Terminator::Assert { cond, .. } => {
+                    if other_place(cond) == Some(local) {
+                        return true;
+                    }
+                }
+                Terminator::Call { args, .. } => {
+                    if args.iter().any(|a| other_place(a) == Some(local)) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Whether `local` is read anywhere outside the loop (its own definitions
+    /// do not count). A read outside means the loop's final induction value is
+    /// live, so the loop cannot be closed.
+    fn local_read_outside(&self, local: u32, in_loop: &[bool], preheader: u32, n: usize) -> bool {
+        for b in 0..n {
+            // A rotated loop repeats the header test in the preheader, which
+            // reads the induction variable at its initial value. That read is
+            // still correct once the loop is closed, so it does not count.
+            if in_loop[b] || b as u32 == preheader {
+                continue;
+            }
+            for s in &self.blocks[b].stmts {
+                let mut found = false;
+                if let Stmt::Assign(_, rv) = s {
+                    scan_rv_operands(rv, &mut |op| {
+                        if other_place(op) == Some(local) {
+                            found = true;
+                        }
+                    });
+                }
+                if found {
+                    return true;
+                }
+            }
+            match &self.blocks[b].term {
+                Terminator::SwitchInt { discr, .. } => {
+                    if other_place(discr) == Some(local) {
+                        return true;
+                    }
+                }
+                Terminator::Assert { cond, .. } => {
+                    if other_place(cond) == Some(local) {
+                        return true;
+                    }
+                }
+                Terminator::Call { args, .. } => {
+                    if args.iter().any(|a| other_place(a) == Some(local)) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// The comparison a boolean local holds: the `Binary(cmp, a, b)` that defines
+    /// it. A rotated loop emits the same test twice (once in the preheader, once
+    /// in the header), so identical definitions are accepted; disagreeing ones
+    /// are not.
+    fn bool_def(&self, op: &Operand) -> Option<(BinOp, Operand, Operand)> {
+        let (Operand::Copy(p) | Operand::Move(p)) = op else { return None };
+        if !p.proj.is_empty() {
+            return None;
+        }
+        let mut found = None;
+        for b in &self.blocks {
+            for s in &b.stmts {
+                if let Stmt::Assign(d, Rvalue::Binary(o, a, c)) = s {
+                    if d.local == p.local && d.proj.is_empty() && is_cmp_op(*o) {
+                        if found.is_some() && found != Some((*o, a.clone(), c.clone())) {
+                            return None;
+                        }
+                        found = Some((*o, a.clone(), c.clone()));
+                    }
+                }
+            }
+        }
+        found
+    }
+}
+
+/// The whole-local a place operand names, if any.
+fn other_place(op: &Operand) -> Option<u32> {
+    match op {
+        Operand::Copy(p) | Operand::Move(p) if p.proj.is_empty() => Some(p.local),
+        _ => None,
+    }
+}
+
+/// Force an operand to a copy: a `Move` becomes a `Copy`, so the operand can be
+/// read again without being consumed.
+fn as_copy(op: &Operand) -> Operand {
+    match op {
+        Operand::Move(p) => Operand::Copy(p.clone()),
+        other => other.clone(),
+    }
+}
+
+fn const_operand(op: &Operand) -> Option<i64> {
+    match op {
+        Operand::Const(Const::Int(n)) => Some(*n),
+        _ => None,
+    }
+}
+
+fn is_cmp_op(op: BinOp) -> bool {
+    matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
 }
 
 /// A rewrite the accumulator fold will apply, found while borrowing the blocks

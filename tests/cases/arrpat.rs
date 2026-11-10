@@ -1,4 +1,3 @@
-// Rust twin of arrpat.rms.
 fn sum2(p: [i64; 2]) -> i64 {
     let [x, y] = p;
     x + y

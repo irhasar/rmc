@@ -1,4 +1,4 @@
-// Rust twin of consts.rms. Top-level `const` items, folded by the compiler and
+// Top-level `const` items, folded by the compiler and
 // substituted at every use. The rmc and Rust programs must print identical
 // output and exit with the same status.
 const N: i64 = 5;
@@ -7,6 +7,12 @@ const LIMIT: i64 = M + 1;
 const BIG: bool = LIMIT > 10;
 const YES: bool = true;
 const NEG: i64 = 0 - 3;
+// `wrapping_mul` is `*` without the overflow trap, so rustc folds it in a
+// `const` item (a plain `*` that overflows is rejected there). The parser sees
+// the method-call form, which must fold here as well.
+const WRAP: i64 = 9223372036854775807i64.wrapping_mul(2);
+const WRAP_SMALL: i64 = 6i64.wrapping_mul(7);
+const WRAP_NAMED: i64 = N.wrapping_mul(M);
 
 fn main() {
     // A constant in expression position.
@@ -42,4 +48,9 @@ fn main() {
     // A constant in a value-position `if`.
     let v: i64 = if BIG { M } else { 0 };
     println!("{}", v);
+
+    // Constants whose initializer uses `wrapping_mul`.
+    println!("{}", WRAP);
+    println!("{}", WRAP_SMALL);
+    println!("{}", WRAP_NAMED);
 }

@@ -9,14 +9,6 @@ a freestanding runtime that talks to the Linux kernel through raw syscalls.
 `--binutils` keeps the old path through GNU `as` and `ld` for the cases where
 the assembly text is what you want.
 
-It also has a second front end: given a `.rs` file it runs `rustc --emit=mir -O`
-and lowers the MIR it prints to the same x86-64, so LLVM is replaced by rmc's own
-back end (see [Two pipelines](#two-pipelines)). Because rmc *is* the code
-generator, the front end is told to stop at MIR (`-Zno-codegen`) rather than
-prepare codegen it would discard, which prints the same MIR for ~4.5 ms less.
-That path builds a real Rust program tens of times faster than LLVM and still
-beats it at run time.
-
 The point of the experiment is to measure the trade-off at the extremes:
 
 | property                         | rmc                                   | rustc (LLVM)                     |
@@ -31,21 +23,16 @@ The point of the experiment is to measure the trade-off at the extremes:
 `rmc` wins big on compile time, compiler memory, and artifact size, and those
 three are the point of the experiment. Because it links in-process rather than
 forking `as` and `ld`, a small program compiles in about 1.2–1.6 ms against
-rustc's ~2.1 s. On **runtime** the MIR path is ahead on the whole suite, and
-that is the point of the second pipeline: dropping LLVM for rmc's own back end
-does not cost run-time speed. Per-program speedups over `rustc -O -C lto=fat`
-run from `hello` 3.7×, `forloops` 2.3×, `refs` 2.2×, `sieve` 1.4×, `mandel`
-1.2×, `stats` 1.1×, `fib` 1.09× and `callrec` 1.08× down to `heap` 1.05× and
-`mix` 1.04×, so the narrowest win is small and within a few percent of
-run-to-run noise. The earlier readings that put `fib` and `callrec` below 1.0
-were a code-generation defect, not a real loss: a `bool` local rustc reuses for
-both the entry test and the loop test was treated as live across the first
-branch fold, so the comparison was materialised (`setl`/`movzbl`/store) and the
-test emitted twice on every iteration. Teaching the fold that a later block's
-own definition serves its read removed those three instructions and the second
-`cmp`, which is what puts `fib` and `callrec` above LLVM. The `.rms` pipeline is
-the fastest of the three to build and the smallest; `bench/RESULTS.md` reports
-the per-program ratios for it.
+rustc's ~2.1 s. On **runtime** the result is mixed and program-dependent: rmc is
+at parity or ahead on almost the whole suite (`hello` 3.9×, `forloops` 2.3×,
+`refs` 2.2×, `sieve` 1.6×, `mandel` 1.14×, `stats` 1.13×, `heap` 1.05×, `fib`
+1.02×), ties on `callrec` (0.99×), and trails on `mix` (0.92×). The loop-body
+alignment below is what pulled `fib` back from an earlier 0.80× reading: its
+code had not changed, the loop had simply landed on a worse fetch boundary.
+Several of those are within run-to-run noise, and a call-heavy shape the
+recursion-to-loop pass does not match would lose. It is not uniformly faster and
+there is no single speedup number; `bench/RESULTS.md` reports the per-program
+ratio.
 
 The artifact-size comparison depends entirely on which rustc build is the
 reference. Against a plain `rustc -O` (which statically links libstd, the panic
@@ -55,54 +42,6 @@ first is the closest like-for-like, the last is the one that flatters rustc
 least. The gap is this wide because the linker keeps only the runtime pieces a
 program reaches: a program that never allocates carries no allocator, and one
 that never indexes an array carries no bounds trap.
-
-## Two pipelines
-
-`rmc` ships two front ends over one x86-64 back end. The extension of the input
-selects which:
-
-| input    | front end                    | back end                              |
-| -------- | ---------------------------- | ------------------------------------- |
-| `*.rms`  | rmc's own lexer/parser/sema  | `codegen.rs` -> `elf.rs` (in-process) |
-| `*.rs`   | `rustc --emit=mir -O`        | `mir.rs` -> `mir_codegen.rs` -> `elf.rs` |
-| `*.mir`  | none (already MIR text)      | `mir.rs` -> `mir_codegen.rs` -> `elf.rs` |
-
-The `.rs` path exists to test the thesis that LLVM is the expensive part of a
-Rust build. `rustc` still does the parsing and type checking, but it stops at
-MIR (`--emit=mir -Zno-codegen`, ~28 ms); a new back end in `mir.rs` lowers that
-MIR to the same x86-64 the `.rms` path emits, through the same assembler and
-linker. LLVM never runs. Because rmc *is* the code generator, the front end is
-told to stop right after the MIR optimisations (`-Zno-codegen`) instead of
-preparing codegen it would throw away; that prints byte-for-byte the same MIR
-and saves about 4.5 ms per build. The trade-off is the whole point of the
-experiment:
-
-| dimension            | rmc MIR path vs `rustc -O -C lto=fat` |
-| -------------------- | ------------------------------------: |
-| compile wall time    |                            65.9–74.6× |
-| compile CPU time     |                            67.3–76.3× |
-| compiler peak RAM    |                            ~2.16–2.25× |
-| artifact size        |                            207–567×  |
-| run wall time        |                            1.03–3.29× |
-| run CPU time         |                            1.03–5.06× |
-| run peak RAM         |                            1.42–63.6× |
-
-Every ratio is above 1, so the MIR path is faster to build, smaller, and faster
-and lighter to run than the LLVM build on all ten programs. The run-time win is
-narrowest on `heap` (1.03×), `mix` (1.05×) and `stats` (1.11×) and widest on
-`hello` (3.29×), `forloops` (2.25×) and `refs` (2.22×). The full, dated table is
-in [`bench/RESULTS-MIR.md`](bench/RESULTS-MIR.md); regenerate it with:
-
-```sh
-python3 bench/run_mir.py --markdown bench/RESULTS-MIR.md
-```
-
-The back end is where the compile-time win comes from: `rustc --emit=mir` is
-~28 ms and ~85 MB, and `rmcmir` is under 5 ms and ~4 MB. Against the `.rms`
-pipeline the `.rs` path still pays the rustc front end, so it is ~70× slower to
-compile - the `.rms` path remains the fastest. The point of the `.rs` path is
-that dropping LLVM makes a real Rust build competitive, not that it beats rmc's
-own front end.
 
 ## Layout
 
@@ -114,28 +53,20 @@ compiler/            the rmc compiler (Rust, std only, no dependencies)
   src/ast.rs         AST + type definitions
   src/sema.rs        type checking, struct layout, slot allocation, builtins
   src/codegen.rs     AST -> x86-64 assembly (System V, AT&T syntax)
-  src/mir.rs         rustc MIR text -> in-memory MIR + MIR-level optimiser
-  src/mir_codegen.rs MIR -> x86-64 assembly, sharing the register/frame planner
   src/elf.rs         in-process assembler + ELF64 linker (no `as`, no `ld`)
   src/dce.rs         dead-function elimination (drop what main cannot reach)
   src/runtime.rs     freestanding runtime written in assembly
   src/main.rs        CLI driver: source -> asm -> ELF executable
-  examples/rmcmir.rs `rmcmir` CLI: a `.mir` file -> ELF (the MIR back end alone)
   tests/compile.rs   unit tests for the front end and code generator
 bench/
-  programs/*.rms     benchmark programs in the rmc subset
-  rust/*.rs          the same programs written in real Rust
-  mir/*.rs           the same programs for the rustc-MIR front end
+  rust/*.rs          benchmark programs (plain Rust, compiled by rmc)
   run.py             benchmark harness (compile time, CPU, RAM, size, runtime)
-  run_mir.py         three-pipeline harness: mir vs ast vs llvm
 tools/
   fuzz.py            differential fuzzer and robustness checker
 tests/
   run.py             differential test suite: rmc vs rustc on twin programs
-  cases/*.rms, *.rs  paired programs that must behave identically
+  cases/*.rs         programs compiled by both rmc and rustc
   args.json          per-case argv vectors (for runtime inputs)
-  mir/run.py         differential suite for the rustc-MIR path (mir_codegen)
-  mir/*.rs           freestanding cases, each linked against rmc's runtime
 docs/
   language.md        the supported language subset
   design.md          compiler architecture and code generation notes
@@ -154,19 +85,16 @@ to build a program: the default path needs no assembler and no linker. `as` and
 ## Usage
 
 ```sh
-rmc input.rms -o output            # compile and link in-process (default)
-rmc input.rms --emit-asm           # print the generated assembly to stdout
-rmc input.rs -o output             # rustc --emit=mir front end, rmc back end
-rmc input.mir -o output            # lower `rustc --emit=mir` text directly
-rmc --emit-runtime-asm             # print the freestanding runtime as assembly
-rmc input.rms --binutils -o out    # assemble and link with `as`/`ld` instead
-rmc input.rms --binutils --no-strip -o out   # keep the symbol table
-rmc input.rms --binutils --min-size -o out   # drop the section headers too
-rmc input.rms --overflow-checks    # trap on i64 +,-,* overflow (exit 101)
-rmc input.rms --bounds-checks      # trap on an out-of-range array index (exit 101)
-rmc input.rms --no-inline          # disable inlining (on by default)
-rmc input.rms --no-licm            # disable loop-invariant code motion (on by default)
-rmc input.rms --no-tco             # disable self-recursion-to-loop (on by default)
+rmc input.rs -o output             # compile and link in-process (default)
+rmc input.rs --emit-asm            # print the generated assembly to stdout
+rmc input.rs --binutils -o out     # assemble and link with `as`/`ld` instead
+rmc input.rs --binutils --no-strip -o out    # keep the symbol table
+rmc input.rs --binutils --min-size -o out    # drop the section headers too
+rmc input.rs --overflow-checks     # trap on i64 +,-,* overflow (exit 101)
+rmc input.rs --bounds-checks       # trap on an out-of-range array index (exit 101)
+rmc input.rs --no-inline           # disable inlining (on by default)
+rmc input.rs --no-licm             # disable loop-invariant code motion (on by default)
+rmc input.rs --no-tco              # disable self-recursion-to-loop (on by default)
 ```
 
 Run the produced binary directly; it is a static ELF executable with no
@@ -188,10 +116,9 @@ std::fs::write("out.s", asm)?;
 
 ## Testing
 
-`tests/run.py` is a differential test suite. Every case is a pair of programs,
-`tests/cases/NAME.rms` and `tests/cases/NAME.rs`, written to behave identically;
-the runner compiles both, runs them, and fails if stdout or the exit status
-differs. `tests/args.json` optionally maps a case to argv vectors so the same
+`tests/run.py` is a differential test suite. Every case is a single program,
+`tests/cases/NAME.rs`, compiled by both rmc and rustc; the runner runs both and
+fails if stdout or the exit status differs. `tests/args.json` optionally maps a case to argv vectors so the same
 program is exercised with several runtime inputs. Each case is then recompiled
 with the optimiser passes turned off in turn (`--no-inline`, `--no-licm`,
 `--no-tco`, and all three at once), since a bug in one pass can hide behind
@@ -206,26 +133,14 @@ The suite covers arithmetic and division semantics (including divisors that need
 the magic-multiply add fixup and powers of two), every comparison operator with
 the immediate on either side, string comparison by content (which a pointer
 compare would get wrong), boolean short-circuiting, control flow, arrays,
-calls and recursion, the output builtins, nested expressions, and arrays of `i64` and `bool` built
+calls and recursion, the output builtins (including `print!`/`println!`
+formatting and the `assert!` family), `use` and `std` paths, `str`/`&str`
+coercion, nested expressions, and arrays of `i64` and `bool` built
 from either literal form. It is
 deliberately adversarial: reverting the folded-comparison operand-order fix
 makes the `cmp` case fail, dropping the sign bias from division by a power of
 two makes the `div` case fail, and comparing string pointers instead of their
 bytes makes the `strcmp` case fail.
-
-`tests/mir/run.py` is the differential suite for the other pipeline. Each
-`tests/mir/NAME.rs` is a freestanding `#![no_std]` program that includes
-`prelude.rs` and calls the runtime's `print_i64`/`print_bool`. The case is built
-twice - once from `rustc --emit=obj` linked against rmc's own freestanding
-runtime (`rmc --emit-runtime-asm`), and once through rmc's `rustc --emit=mir`
-front end and MIR back end - and the two must print identical output and exit
-with the same status. Both binaries share one runtime and one entry point, so
-the only variable is the code generator. This is the suite that actually
-exercises `mir_codegen.rs`; `tests/run.py` never reaches it.
-
-```sh
-python3 tests/mir/run.py -v
-```
 
 `tools/fuzz.py` generates random programs and checks them against `rustc -O`
 the same way, for the cases a hand-written suite does not think of. It has
@@ -256,7 +171,26 @@ in every position, and an array-typed struct field destructured in place),
 nested one, one mixed with plain parameters, and one on a method receiver),
 `enumpat` for payload variant patterns with sub-patterns (`_`, `mut x`, a
 trailing `..`, and a nested struct or array pattern inside `E::V(..)`, in
-`match`, `if let` and a method, and read through a `&E` scrutinee), and
+`match`, `if let` and a method, and read through a `&E` scrutinee), `atpat` for
+`@` bindings (`n @ _`, `n @ m`, `t @ (a, b)`, a struct field `f: n @ _`, a `for`
+head, a refutable `n @ 1..=5` in a `match` arm and an `if let`, and `n @ _` /
+`mut n @ _` parameters), `tuple` for
+tuples (construction, `.0` element access, destructuring in a `let`, a `match`
+arm and a parameter, nesting, a tuple-typed struct field, an array of tuples,
+and a tuple behind a reference, used as parameter and return types), `nestedfn`
+for nested `fn` items (hoisting, a call before the declaration, a sibling called
+after it, a nested `fn` inside another body, a nested `fn` shadowing a top-level
+one of the same name, and the shadowed name called to confirm the inner one
+wins), `typealias` for `type` aliases (a scalar, tuple, array and struct alias,
+an alias as a parameter and return type, one alias naming another, an alias used
+before it is declared, an alias behind a reference and in a cast), `printfmt`
+for `print!`/`println!` (a literal format with `{}` filled by an `i64`, a
+`bool`, a `char` or a `str`, literal `{{`/`}}` braces, escapes, a leading `\n`,
+and a
+bare `println!()` with no format string), `char` for `char` literals
+(plain, escaped, `\xNN`, `\u{..}`), `as i64`, `char` ordering and equality, a
+`char` `match` with literal, or-pattern and range arms, a `char` array, a
+`const char`, a `char` parameter/return, and the `print_char` builtin, and
 `order` for assignment evaluation order (a
 side-effecting index and value on both `=` and every compound operator, the
 shapes `stmt` never assigns through). `shift` drives `<<`, `>>` and the compound
@@ -266,38 +200,23 @@ masks its counts with `& 63` to keep them valid, which left the shift-overflow
 trap unreachable by fuzzing. Every program is recompiled with each optimiser pass off in turn.
 Seeds are reproducible, so a failure can be re-run and shrunk.
 
-`mir` mode fuzzes the *other* pipeline. It builds a freestanding `#![no_std]`
-program (the `expr` grammar plus a prelude with `out`/`outb` externs), compiles
-it with `rustc --emit=obj` and links the object against the *same* freestanding
-runtime rmc uses (`rmc --emit-runtime-asm`), then compiles the same source
-through `rmc <src.rs>` (the rustc-MIR front end) and compares stdout and exit
-status. Because both binaries share one runtime and one entry point, the only
-variable is the code generator. It is the only randomised coverage of the MIR
-back end - the `.rms` modes never reach `mir_codegen.rs`. `--gen <mode>` reuses
-one of the `.rms` generators instead. It found two real MIR codegen bugs on its
-first run: a shift whose count is computed by a call clobbered the value parked
-in `%rdx` (now parked in a frame slot), and a 64-bit constant used as an ALU
-immediate or a frame store was silently truncated to i32 (now materialised in a
-register). Both are pinned by `tests/mir/wideimm.rs`.
-
 ```sh
 python3 tools/fuzz.py --mode expr --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1
 python3 tools/fuzz.py --mode opt --n 500 --seed 1
 python3 tools/fuzz.py --mode arith --n 500 --seed 1
 python3 tools/fuzz.py --mode nest --n 500 --seed 1
+python3 tools/fuzz.py --mode nestedfn --n 500 --seed 1
+python3 tools/fuzz.py --mode typealias --n 500 --seed 1
+python3 tools/fuzz.py --mode printfmt --n 500 --seed 1
 python3 tools/fuzz.py --mode pat --n 500 --seed 1
 python3 tools/fuzz.py --mode order --n 500 --seed 1
 python3 tools/fuzz.py --mode shift --n 500 --seed 1
-python3 tools/fuzz.py --mode mir --n 500 --seed 1
-python3 tools/fuzz.py --mode mir --gen width --n 500 --seed 1
 # also exercise the trap codegen: --bounds-checks and --overflow-checks runs
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 python3 tools/fuzz.py --mode robust
 python3 tools/fuzz.py --mode reject
 python3 tools/fuzz.py --mode mutate --n 500 --seed 1
-python3 tools/fuzz.py --mode mirrobust
-python3 tools/fuzz.py --mode mirmut --n 500 --seed 1
 ```
 
 `robust` mode needs no rustc: it feeds a fixed corpus of malformed and
@@ -311,30 +230,6 @@ random edits (splices, deletions, duplications) to the generators' programs and
 the `robust` corpus, and requires every mutant to fail cleanly; it needs no
 rustc and reaches error paths the fixed corpora miss. CI runs `robust` together
 with a small fixed-seed differential fuzz.
-
-`mirrobust` mode is `robust` for the MIR path. It feeds a fixed corpus of `.rs`
-programs — the standard-library formatting and containers, closures, floating
-point, traits, generics, plus programs rustc itself rejects and a few malformed
-ones — through `rmc <src.rs>` and requires each to end in a diagnostic (exit 1),
-never a panic or a signal. The failure a user hits first on this path is not a
-syntax error in their own source but a MIR shape the back end does not model, so
-this is the corpus that keeps a rejected construct a message rather than a
-crash.
-
-`--gen width` is a differential generator that mixes every integer width
-(`u8`..`i64`, `usize`/`isize`) with `wrapping_add`/`sub`/`mul` and a cast back
-down. Every integer narrower than 64 bits shares one word in the back end, so a
-wrong sign/zero extension or a missing wrap at a narrow width is the miscompile
-this generator exists to find; it has not found one.
-
-`mirmut` mode needs no rustc and mutates real `rustc --emit=mir` text, then
-lowers it through the `.mir` input path (`rmc file.mir`). This is the only mode
-that reaches the back end's internal invariants with structurally broken input:
-the `.rs` modes cannot, because rustc rejects malformed source before it emits
-MIR. It found two real panics on its first run — a function that declares no
-basic block, and a terminator that jumps to a block the function never declares
-— both now rejected at the parser boundary. Every mutated input must end in a
-clean exit 0 (compiled) or exit 1 (diagnostic), never a panic or a signal.
 
 A caveat for `expr`: an integer literal in a shift amount is unconstrained, so
 rustc infers `i32` and masks the count to 5 bits, while rmc is `i64`-only and
@@ -365,7 +260,8 @@ fn main() -> i64 {
 }
 ```
 
-Supported: `i64`, `bool`, `str`, fixed-size arrays, and structs with named fields
+Supported: `i64`, `bool`, `char`, `str`, fixed-size arrays, tuples `(A, B, ..)`,
+and structs with named fields
 (including field init shorthand, `P { x, y }`, struct update syntax,
 `P { x: 9, ..base }`, struct patterns `P { x, y: z, .. }` in `match`/`if let`
 (including nested sub-patterns `P { a: I { x }, .. }`), `let` destructuring
@@ -373,15 +269,19 @@ Supported: `i64`, `bool`, `str`, fixed-size arrays, and structs with named field
 `for P { x, y: z, .. } in arr { .. }`, and array patterns
 `[a, b, .., c]` (in `let`/`for`/`match`/`if let`, with `_`, `mut`, nested
 patterns and `..` rests, also usable on an array-typed struct field,
-`let P { a: [x, y], .. } = p;`));
+`let P { a: [x, y], .. } = p;`), and tuple patterns
+`(a, b)` / `(x, _, mut z)` (the same positions, and `.0`/`.1` element access),
+and `@` bindings `n @ PAT` (`n @ _`, `n @ m`, `t @ (a, b)`, a struct field
+`f: n @ _`, a `for` head, and `n @ _` / `mut n @ _` parameters, with the
+sub-pattern required to be irrefutable in an irrefutable position));
 functions with up to six parameters, which may be written as an aggregate
 pattern (`fn f(P { x, y }: P)`, `fn f([a, b]: [i64; 2])`, nested and mixed with
 plain parameters); `let` / `let mut` / `let _` (discard); assignment to variables,
 array elements and struct fields (including compound `+=` and friends);
 `if`/`else`, `while`, `loop`, `for i in a..b` / `a..=b` and `for x in arr`
 (array iteration, by value); `match` on integers,
-`bool`s, enums and strings (literal, `true`/`false`, string, `Enum::Variant`,
-struct and
+`bool`s, `char`s, enums and strings (literal, `true`/`false`, char, string,
+`Enum::Variant`, struct and
 `_` patterns, plus payload bindings and binding names, and a per-arm guard
 `PAT if COND`) and `if let` with the
 same patterns
@@ -394,15 +294,35 @@ works as an expression), `continue`,
 loop); arithmetic, comparison, bitwise (`!`/`&`/`|`/`^`) and shift (`<<`/`>>`)
 operators; `&&`/`||`; strings (a `str` literal or `str`-typed parameter, return
 or field, compared by content with `==`/`!=`/`<`/`<=`/`>`/`>=`, with `.len()` for
-the byte length); array `.len()` (a compile-time constant); `mut` enforcement and definite
+the byte length); array `.len()` (a compile-time constant); built-in `i64` methods
+(`x.abs()`, `x.signum()`, `x.min(y)`, `x.max(y)`, `x.clamp(lo, hi)`,
+`x.is_positive()`, `x.is_negative()`, `x.div_euclid(y)`, `x.rem_euclid(y)`,
+`x.midpoint(y)`,
+`x.count_ones()`, `x.count_zeros()`, `x.leading_zeros()`, `x.trailing_zeros()`,
+`x.leading_ones()`, `x.trailing_ones()`, `x.swap_bytes()`, `x.reverse_bits()`,
+`x.rotate_left(n)`, `x.rotate_right(n)`, desugared to
+operators or a small runtime helper, so `i64::MIN.abs()` maps to itself as in
+`rustc -O`);
+`mut` enforcement and definite
 initialisation; `const` items (folded to a value and substituted at every use,
-including array lengths and `match` patterns); references (`&T` / `&mut T`, `&e`, `*e`,
+including array lengths and `match` patterns); `type` aliases (a transparent
+second name for any type, resolved at parse time, usable before declaration);
+references (`&T` / `&mut T`, `&e`, `*e`,
 with auto-deref for `r.x`, `r[i]` and `r.m()`, and `&self` receivers); methods
 (`self` / `&self` / `&mut self`) and associated functions (`fn name(..)` with no
-`self`, called as `Type::name(..)`, the constructor idiom); `as` casts at Rust's
+`self`, called as `Type::name(..)`, the constructor idiom); nested `fn` items (a
+`fn` declared in a block, hoisted to the top level since it captures nothing —
+block-scoped, so it shadows a top-level `fn` of the same name and is visible
+throughout its block, exactly as rustc); `as` casts at Rust's
 precedence (looser than the unary operators, so `*r as i64` is `(*r) as i64`);
-attributes such as `#[derive(Copy, Clone)]` (parsed and ignored); and a small
-set of runtime builtins. Structs and arrays may be passed to and returned from
+attributes such as `#[derive(Copy, Clone)]` (parsed and ignored); `use`
+statements (parsed and discarded, since every name is resolved globally);
+`print!`/`println!` with `{}` substitution, and `assert!`/`assert_eq!`/
+`assert_ne!`/`panic!`/`unreachable!` (a failure exits with rustc's panic code
+101); the `std::process::exit` and `std::hint::black_box` paths; and a small
+set of runtime builtins. A `str` and a `&str` are the same one-word value, so
+they coerce freely and a `&'static str` field or `&str` parameter may be
+written `str`. Structs and arrays may be passed to and returned from
 functions by value, or by reference to avoid the copy. Overflow checks are
 opt-in with `--overflow-checks`, and array bounds checks with
 `--bounds-checks`. See `docs/language.md` for the full grammar.
@@ -414,10 +334,12 @@ Runtime builtins (provided by `src/runtime.rs`, no imports needed):
 | `print_i64(x)`  | `(i64) -> ()`        | print an integer followed by `\n`      |
 | `print_str(s)`  | `(str) -> ()`        | print a string followed by `\n`       |
 | `print_bool(b)` | `(bool) -> ()`       | print `1` or `0`                       |
+| `print_char(c)` | `(char) -> ()`       | write a character as UTF-8, then `\n`  |
 | `putchar(c)`    | `(i64) -> ()`        | write a single byte                    |
 | `alloc(n)`      | `(i64) -> i64`       | allocate `n` bytes (first-fit free list) |
 | `free(p)`       | `(i64) -> ()`        | return a block from `alloc` to the heap |
 | `arg_i64(i)`    | `(i64) -> i64`       | parse `argv[i]` as a signed integer    |
+| `exit(code)`    | `(i64) -> ()`        | terminate with `code` (raw syscall)    |
 
 ## Benchmarks
 
@@ -549,27 +471,12 @@ Two benchmarks need a word of caution when reading their ratio:
 
 rmc is a small, self-contained compiler, not a drop-in replacement for rustc.
 
-- **The `.rs` (MIR) path lowers a *subset* of rustc's MIR.** It compiles
-  freestanding `#![no_std]` programs and `println!`/`print!`/`eprintln!`
-  (literal *and* runtime arguments, including `{:x}`/`{:X}`/`{:o}`/`{:b}` and
-  their width-specific narrowing for `u8`/`i16`/...), but it does not model the
-  heap containers (`Vec`, `String`, `Box`, `HashMap`), closures and the `Fn`
-  traits, floating point, `i128`, `dyn Trait`, or generic instantiation. A
-  program that uses one of those is rejected with a diagnostic that names the
-  feature (for example, "`{}`/`{:?}` formatting (rustc's `core::fmt`) is not
-  implemented on the MIR path"), never miscompiled. A format placeholder with a
-  width or precision (`{:>5}`, `{:.2}`) is likewise rejected rather than
-  mis-rendered. For formatting, rustc folds a constant format string to
-  `Arguments::from_str` and builds the `core::fmt::rt::Argument` array for
-  runtime arguments; the runtime template walker calls each argument's
-  formatter. `rustc` still does the lexing, parsing, name resolution and type
-  checking; rmc only replaces LLVM. The `.rms` path (rmc's
-  own front end) has the subset in `docs/language.md`; the two paths do not
-  accept the same programs.
 - The language subset is small (see `docs/language.md`). Structs, arrays, `for`,
-  aggregates across calls, overflow checks, integer `match`, enums and
-  references exist; traits, generics, borrowing, closures, floating point and
-  the standard library do not. An aggregate is passed by value through a hidden
+  aggregates across calls, overflow checks, integer `match`, enums,
+  references, the `print!`/`println!` and `assert!` families, and `use`/`std`
+  paths exist; traits, generics, borrowing, closures, floating point and the
+  standard library beyond `std::process::exit` / `std::hint::black_box` do not.
+  An aggregate is passed by value through a hidden
   pointer unless a reference (`&T` / `&self`) is used, which passes the address
   and copies nothing. References are not checked: nothing proves a reference
   outlives its referent, and `&mut` carries no exclusivity guarantee.

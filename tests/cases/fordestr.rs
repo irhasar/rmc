@@ -1,4 +1,4 @@
-// The Rust twin of `fordestr.rms`. A plain Rust subset.
+// A plain Rust subset.
 #[derive(Copy, Clone)]
 struct P { x: i64, y: i64 }
 #[derive(Copy, Clone)]

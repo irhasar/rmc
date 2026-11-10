@@ -1,4 +1,4 @@
-// The Rust twin of `refplaces.rms`. A plain Rust subset, so it compiles with
+// A plain Rust subset, so it compiles with
 // rustc unchanged.
 #[derive(Copy, Clone)]
 struct Inner { a: i64, b: i64 }

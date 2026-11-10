@@ -18,6 +18,7 @@ struct Options {
     output: PathBuf,
     emit_asm: bool,
     emit_runtime_asm: bool,
+    rustc_frontend: bool,
     keep_mir: bool,
     keep_asm: bool,
     strip: bool,
@@ -36,6 +37,7 @@ fn parse_args() -> Result<Options, String> {
     let mut output: Option<PathBuf> = None;
     let mut emit_asm = false;
     let mut emit_runtime_asm = false;
+    let mut rustc_frontend = false;
     let mut keep_mir = false;
     let mut keep_asm = false;
     let mut strip = true;
@@ -55,6 +57,7 @@ fn parse_args() -> Result<Options, String> {
             }
             "--emit-asm" => emit_asm = true,
             "--emit-runtime-asm" => emit_runtime_asm = true,
+            "--rustc-frontend" => rustc_frontend = true,
             "--keep-mir" => keep_mir = true,
             "--keep-asm" => keep_asm = true,
             "--no-strip" => strip = false,
@@ -87,6 +90,20 @@ fn parse_args() -> Result<Options, String> {
         None if emit_runtime_asm => PathBuf::new(),
         None => return Err("no input file given (see --help)".into()),
     };
+    // `--no-strip` asks for a symbol table so `nm`/`gdb` can read the artifact;
+    // `--min-size` runs `strip --strip-all`, which removes exactly that table.
+    // The two request opposite artifacts, so reject the combination rather than
+    // silently letting `--min-size` win.
+    if !strip && min_size {
+        return Err("--no-strip and --min-size conflict: --min-size strips the symbol table --no-strip keeps".into());
+    }
+    // `--no-strip` exists so `nm`/`gdb`/`objdump` can read the artifact, which
+    // needs a symbol table. The in-process encoder builds none, so the flag
+    // selects the binutils path instead of silently producing a symbol-less
+    // binary.
+    if !strip {
+        binutils = true;
+    }
     let output = output.unwrap_or_else(|| {
         let stem = input.file_stem().unwrap_or_default();
         Path::new(".").join(stem)
@@ -96,6 +113,7 @@ fn parse_args() -> Result<Options, String> {
         output,
         emit_asm,
         emit_runtime_asm,
+        rustc_frontend,
         keep_mir,
         keep_asm,
         strip,
@@ -113,14 +131,15 @@ fn print_help() {
     println!(
         "rmc - experimental Rust-subset compiler (no LLVM, no crates)\n\
          \n\
-         USAGE:\n    rmc [OPTIONS] <input.rms>\n\
-         \x20   rmc [OPTIONS] <input.rs>    use rustc --emit=mir as the front end\n\
+         USAGE:\n    rmc [OPTIONS] <input.rs>    compile with rmc's own front end\n\
+         \x20   rmc --rustc-frontend <input.rs>  use rustc's parser and MIR optimiser\n\
          \x20   rmc [OPTIONS] <input.mir>   lower `rustc --emit=mir` text directly\n\
          \n\
          OPTIONS:\n\
          \x20   -o <path>      output binary path\n\
          \x20   --emit-asm     print generated assembly to stdout and stop\n\
          \x20   --emit-runtime-asm  print the freestanding runtime as assembly and stop\n\
+         \x20   --rustc-frontend   use rustc's parser and MIR optimiser as the front end\n\
          \x20   --keep-mir     keep the MIR text next to the output (a .rs input)\n\
          \x20   --keep-asm     keep the intermediate .s file next to the output\n\
          \x20   --no-strip     keep the symbol table in the output binary\n\
@@ -244,6 +263,7 @@ fn run_mir_text(opts: &Options, mir: &str) -> Result<(), String> {
         rmc::mir::licm(&mut prog);
     }
     rmc::mir::fold_accumulators(&mut prog);
+    rmc::mir::close_counted_loops(&mut prog, opts.overflow_checks);
     rmc::mir::jump_thread(&mut prog);
     rmc::mir::rotate_loops(&mut prog);
     rmc::mir::layout_blocks(&mut prog);
@@ -252,24 +272,54 @@ fn run_mir_text(opts: &Options, mir: &str) -> Result<(), String> {
         promote: true,
     };
     let asm = rmc::compile_mir_to_asm(&prog, &mir_opts)?;
+    emit_binary(opts, &asm)
+}
 
+/// Assemble and link `asm` into `opts.output`, honouring `--emit-asm`,
+/// `--binutils`, `--no-strip`, `--min-size` and `--keep-asm`. Shared by the
+/// AST path and the MIR path, so every input kind accepts the same
+/// output options instead of the MIR path silently ignoring them.
+fn emit_binary(opts: &Options, asm: &str) -> Result<(), String> {
     if opts.emit_asm {
         print!("{asm}");
         return Ok(());
     }
-    let bytes = rmc::elf::assemble(&asm)?;
-    std::fs::write(&opts.output, &bytes)
-        .map_err(|e| format!("cannot write {}: {e}", opts.output.display()))?;
-    if opts.keep_asm {
-        std::fs::write(opts.output.with_extension("s"), &asm)
-            .map_err(|e| format!("cannot write assembly: {e}"))?;
+    if !opts.binutils {
+        // Assemble and link in-process. This is the default: it removes the two
+        // binutils processes that dominate compile time and produces a smaller
+        // executable (no symbol or section-header tables to begin with).
+        let bytes = rmc::elf::assemble(asm)?;
+        std::fs::write(&opts.output, &bytes)
+            .map_err(|e| format!("cannot write {}: {e}", opts.output.display()))?;
+        if opts.keep_asm {
+            std::fs::write(opts.output.with_extension("s"), asm)
+                .map_err(|e| format!("cannot write assembly: {e}"))?;
+        }
+        // `ld` marks its output executable; the in-process path must too.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::Permissions::from_mode(0o755);
+            std::fs::set_permissions(&opts.output, mode)
+                .map_err(|e| format!("cannot chmod {}: {e}", opts.output.display()))?;
+        }
+        return Ok(());
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&opts.output, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("cannot chmod {}: {e}", opts.output.display()))?;
+
+    let asm_path = opts.output.with_extension("s");
+    std::fs::write(&asm_path, asm).map_err(|e| format!("cannot write {}: {e}", asm_path.display()))?;
+
+    let obj_path = opts.output.with_extension("o");
+    assemble(&asm_path, &obj_path)?;
+    link(&obj_path, &opts.output, opts.strip)?;
+    if opts.min_size {
+        strip_section_headers(&opts.output)?;
     }
+
+    if !opts.keep_asm {
+        let _ = std::fs::remove_file(&asm_path);
+    }
+    let _ = std::fs::remove_file(&obj_path);
     Ok(())
 }
 
@@ -281,9 +331,11 @@ fn run(opts: Options) -> Result<(), String> {
         print!("{}", rmc::runtime::support_asm());
         return Ok(());
     }
-    // A `.rs` input selects the rustc-front-end pipeline; anything else is
-    // rmc's own source language, compiled end to end.
-    if opts.input.extension().and_then(|e| e.to_str()) == Some("rs") {
+    // `--rustc-frontend` routes a `.rs` input through rustc's parser and MIR
+    // optimiser instead of rmc's own front end. Without it a `.rs` file is
+    // rmc's own source language, compiled end to end (the default pipeline), so
+    // the flag is what distinguishes the two meanings of a `.rs` input.
+    if opts.rustc_frontend && opts.input.extension().and_then(|e| e.to_str()) == Some("rs") {
         return run_mir_pipeline(&opts);
     }
     // A `.mir` input is already MIR text (as `rustc --emit=mir` prints it), so
@@ -307,50 +359,7 @@ fn run(opts: Options) -> Result<(), String> {
             no_tco: opts.no_tco,
         },
     )?;
-
-    if opts.emit_asm {
-        print!("{asm}");
-        return Ok(());
-    }
-
-    if !opts.binutils {
-        // Assemble and link in-process. This is the default: it removes the two
-        // binutils processes that dominate compile time and produces a smaller
-        // executable (no symbol or section-header tables to begin with).
-        let bytes = rmc::elf::assemble(&asm)?;
-        std::fs::write(&opts.output, &bytes)
-            .map_err(|e| format!("cannot write {}: {e}", opts.output.display()))?;
-        if opts.keep_asm {
-            let asm_path = opts.output.with_extension("s");
-            std::fs::write(&asm_path, &asm)
-                .map_err(|e| format!("cannot write {}: {e}", asm_path.display()))?;
-        }
-        // `ld` marks its output executable; the in-process path must too.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::Permissions::from_mode(0o755);
-            std::fs::set_permissions(&opts.output, mode)
-                .map_err(|e| format!("cannot chmod {}: {e}", opts.output.display()))?;
-        }
-        return Ok(());
-    }
-
-    let asm_path = opts.output.with_extension("s");
-    std::fs::write(&asm_path, &asm).map_err(|e| format!("cannot write {}: {e}", asm_path.display()))?;
-
-    let obj_path = opts.output.with_extension("o");
-    assemble(&asm_path, &obj_path)?;
-    link(&obj_path, &opts.output, opts.strip)?;
-    if opts.min_size {
-        strip_section_headers(&opts.output)?;
-    }
-
-    if !opts.keep_asm {
-        let _ = std::fs::remove_file(&asm_path);
-    }
-    let _ = std::fs::remove_file(&obj_path);
-    Ok(())
+    emit_binary(&opts, &asm)
 }
 
 fn assemble(asm: &Path, obj: &Path) -> Result<(), String> {

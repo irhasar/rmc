@@ -12,7 +12,7 @@ Each case in `tests/mir/` is a freestanding `#![no_std]` program (it includes
 The two binaries share one runtime, one entry point and one syscall layer, so
 the only variable is the code generator. They must print identical stdout and
 exit with the same status. This is the suite that actually exercises the MIR
-path; `tests/run.py` covers the `.rms` path.
+path; `tests/run.py` covers the AST path.
 
 Usage: python3 tests/mir/run.py [-v]
 """
@@ -87,7 +87,7 @@ def build_reference(name, rt):
 def build_rmc(name):
     src = os.path.join(ROOT, f"{name}.rs")
     mir = os.path.join(OUT, f"{name}.mir.bin")
-    rc, _, err = run([RMC, src, "-o", mir])
+    rc, _, err = run([RMC, "--rustc-frontend", src, "-o", mir])
     if rc != 0:
         return None, f"rmc failed:\n{err.decode(errors='replace')}"
     return mir, None

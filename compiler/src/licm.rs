@@ -2,10 +2,9 @@
 //! generation.
 //!
 //! Inlining leaves accessor arithmetic inside the loop that reads only
-//! loop-invariant data. The `refs` hot loop reads a fixed struct through three
-//! accessors every iteration; after inlining, the whole sum of the struct's
-//! fields is invariant, yet it is recomputed each pass. This pass computes each
-//! such subexpression once, before the loop, and reads the result inside.
+//! loop-invariant data. A `for`/`while` loop that sums a fixed struct's fields
+//! recomputes the whole sum each pass; after inlining the sum is invariant, so
+//! this pass computes it once, before the loop, and reads the result inside.
 //!
 //! The pass is deliberately conservative, because hoisting across an iteration
 //! boundary is easy to get wrong:
@@ -14,6 +13,15 @@
 //!   (which can trap), no array index and no dereference (both can read memory
 //!   an alias could change), and no block or `if`. Struct-field reads are
 //!   allowed, but only when the loop writes no memory at all.
+//! * A field read through a *reference* (`p.x` where `p: &T`, or `(*q).x`) is
+//!   not hoisted. rmc lets a reference outlive its referent (`0 as &i64` is
+//!   accepted, and a `&` to a local can be returned), so dereferencing one is a
+//!   memory read that can fault. Hoisting it would fault on a loop that never
+//!   runs, where the read inside the body would not. Such a read stays in the
+//!   loop even when it is otherwise invariant and the loop writes no memory.
+//!   The `refs` benchmark is exactly this shape (a `&self` accessor sum), so it
+//!   is not hoisted and runs slower than an equivalent frame-based loop; see
+//!   `bench/RESULTS.md`.
 //! * Every local the expression reads must be untouched by the loop. If the loop
 //!   contains any call, the pass gives up on that loop entirely, since a call
 //!   can write anything.
@@ -123,6 +131,10 @@ impl Licm {
     /// process them. A loop is a statement, so it only appears inside a block.
     fn expr_loops(&mut self, e: &mut Expr) {
         match e {
+Expr::PatScrutinee(_) => {
+                unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+            }
+            Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
             Expr::Block(b) | Expr::Loop(b, _, _, _) => self.block(b),
             Expr::MatchBoundary(b, _) => self.block(b),
             Expr::If(c, t, els) => {
@@ -170,10 +182,15 @@ impl Licm {
                     self.expr_loops(x);
                 }
             }
+            Expr::TupleLit(v) => {
+                for x in v {
+                    self.expr_loops(x);
+                }
+            }
             Expr::VariantTest { scrutinee, .. } => self.expr_loops(scrutinee),
             Expr::BoolTest { scrutinee, .. } => self.expr_loops(scrutinee),
             Expr::EnumPayload { recv, .. } => self.expr_loops(recv),
-            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
+            Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
         }
     }
 
@@ -276,6 +293,10 @@ impl Effects {
 
     fn expr(&mut self, e: &Expr) {
         match e {
+Expr::PatScrutinee(_) => {
+                unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+            }
+            Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
             Expr::Call { args, .. } => {
                 // A call may write anything, so no local is known invariant.
                 self.all = true;
@@ -339,10 +360,15 @@ impl Effects {
                     self.expr(x);
                 }
             }
+            Expr::TupleLit(v) => {
+                for x in v {
+                    self.expr(x);
+                }
+            }
             Expr::VariantTest { scrutinee, .. } => self.expr(scrutinee),
             Expr::BoolTest { scrutinee, .. } => self.expr(scrutinee),
             Expr::EnumPayload { recv, .. } => self.expr(recv),
-            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
+            Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
         }
     }
 }
@@ -457,6 +483,10 @@ impl Hoister {
             return;
         }
         match e {
+Expr::PatScrutinee(_) => {
+                unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+            }
+            Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
             Expr::Bin(_, a, b) => {
                 self.expr(a);
                 self.expr(b);
@@ -504,10 +534,30 @@ impl Hoister {
                     self.expr(x);
                 }
             }
+            Expr::TupleLit(v) => {
+                for x in v {
+                    self.expr(x);
+                }
+            }
             Expr::VariantTest { scrutinee, .. } => self.expr(scrutinee),
             Expr::BoolTest { scrutinee, .. } => self.expr(scrutinee),
             Expr::EnumPayload { recv, .. } => self.expr(recv),
-            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
+            Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
+        }
+    }
+
+    /// True when a field read's base names a local aggregate, so the read is a
+    /// frame access rather than a load through a pointer that could fault. Any
+    /// field in the chain whose own type is a reference holds an address, so a
+    /// read past it dereferences a pointer that may be null or dangling and is
+    /// not a frame access.
+    fn frame_field_base(e: &Expr) -> bool {
+        match e {
+            Expr::Var { ty, .. } => !matches!(ty, crate::ast::Type::Ref(..)),
+            Expr::Field { base, ty, .. } => {
+                !matches!(ty, crate::ast::Type::Ref(..)) && Self::frame_field_base(base)
+            }
+            _ => false,
         }
     }
 
@@ -518,8 +568,16 @@ impl Hoister {
             Expr::Var { slot, .. } => !self.eff.all && !self.eff.slots.contains(slot),
             // A field read is memory, so it is only invariant when the loop
             // writes no memory at all.
+            // A field read through a local aggregate is a frame access and
+            // cannot fault, so it is safe to speculate. A read through a
+            // reference dereferences a pointer that may be null or dangling, so
+            // it must stay in the loop: hoisting it would fault on a loop whose
+            // body never runs.
             Expr::Field { base, ty, .. } => {
-                !self.eff.mem && ty.is_scalar() && self.invariant(base)
+                !self.eff.mem
+                    && ty.is_scalar()
+                    && self.invariant(base)
+                    && Self::frame_field_base(base)
             }
             Expr::Bin(op, a, b) => {
                 !matches!(op, BinOp::Div | BinOp::Mod) && self.invariant(a) && self.invariant(b)
@@ -603,7 +661,7 @@ fn fmt_expr(e: &Expr) -> String {
 fn count_expr(e: &Expr) -> usize {
     let n = |x: &Box<Expr>| count_expr(x);
     match e {
-        Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => 1,
+        Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => 1,
         Expr::Bin(_, a, b) => 1 + n(a) + n(b),
         Expr::Un(_, a) | Expr::Cast(a, _) => 1 + n(a),
         Expr::Field { base, .. } => 1 + n(base),

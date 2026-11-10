@@ -144,7 +144,7 @@ fn stmt_ok(s: &Stmt) -> bool {
 /// that could itself grow.
 fn expr_ok(e: &Expr) -> bool {
     match e {
-        Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {
+        Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {
             true
         }
         Expr::Bin(_, a, b) => expr_ok(a) && expr_ok(b),
@@ -190,7 +190,11 @@ fn count_stmt(s: &Stmt) -> usize {
 fn count_expr(e: &Expr) -> usize {
     let n = |x: &Box<Expr>| count_expr(x);
     match e {
-        Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => 1,
+        Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => 1,
+Expr::PatScrutinee(_) => {
+            unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+        }
+        Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
         Expr::Bin(_, a, b) => 1 + n(a) + n(b),
         Expr::Un(_, a) | Expr::Cast(a, _) => 1 + n(a),
         Expr::Field { base, .. } => 1 + n(base),
@@ -219,6 +223,7 @@ fn count_expr(e: &Expr) -> usize {
         Expr::EnumCtor { args, .. } => 1 + args.iter().map(count_expr).sum::<usize>(),
         Expr::ArrayLit(v, _) => 1 + n(v),
         Expr::ArrayList(v) => 1 + v.iter().map(count_expr).sum::<usize>(),
+        Expr::TupleLit(v) => 1 + v.iter().map(count_expr).sum::<usize>(),
         Expr::VariantTest { scrutinee, .. } => 1 + n(scrutinee),
         Expr::BoolTest { scrutinee, .. } => 1 + n(scrutinee),
         Expr::EnumPayload { recv, .. } => 1 + n(recv),
@@ -299,6 +304,10 @@ impl Inliner {
             return;
         }
         match e {
+Expr::PatScrutinee(_) => {
+                unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+            }
+            Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
             Expr::Bin(_, a, b) => {
                 self.walk_expr(a, base, expanding);
                 self.walk_expr(b, base, expanding);
@@ -348,10 +357,15 @@ impl Inliner {
                     self.walk_expr(x, base, expanding);
                 }
             }
+            Expr::TupleLit(v) => {
+                for x in v {
+                    self.walk_expr(x, base, expanding);
+                }
+            }
             Expr::VariantTest { scrutinee, .. } => self.walk_expr(scrutinee, base, expanding),
             Expr::BoolTest { scrutinee, .. } => self.walk_expr(scrutinee, base, expanding),
             Expr::EnumPayload { recv, .. } => self.walk_expr(recv, base, expanding),
-            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
+            Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
         }
     }
 
@@ -393,7 +407,7 @@ impl Inliner {
         *base += region;
         let param_slots = self.cands[cand].param_slots.clone();
         let param_tys = self.cands[cand].params.clone();
-        let assigned = assigned_slots(&self.cands[cand].stmts, self.cands[cand].tail.as_ref());
+        let assigned = escaped_slots(&self.cands[cand].stmts, self.cands[cand].tail.as_ref());
 
         // Bind each argument to what the body should read for its parameter. A
         // trivial argument (a name, a literal, a string) is substituted in
@@ -405,10 +419,23 @@ impl Inliner {
         // substituting a trivial argument for it would make the assignment write
         // through to the caller's variable. Such a parameter is always copied
         // into a fresh slot, and the body's assignment targets that slot.
+        // Everything up to and including the last argument that can write
+        // memory is copied, so no later argument can change what an earlier
+        // one named.
+        let last_effect = args.iter().rposition(has_effect);
         let mut binds: Vec<Stmt> = Vec::new();
         let mut subst: Vec<Expr> = Vec::with_capacity(args.len());
         for (i, arg) in args.into_iter().enumerate() {
-            if trivial(&arg) && !assigned.contains(&param_slots[i]) {
+            // A trivial argument (a name, a literal) is normally substituted in
+            // place, so the body reads the caller's expression directly. That is
+            // unsound when the caller's expression can change before the body
+            // reads it: a later argument's side effect (a call, an assignment, a
+            // place with a call) can write a variable the earlier argument
+            // named. Everything up to and including the last argument that can
+            // write memory is therefore copied into a fresh slot first, so each
+            // parameter sees its argument's value at call time, in order.
+            let later_effect = last_effect.map_or(false, |j| j > i);
+            if trivial(&arg) && !assigned.contains(&param_slots[i]) && !later_effect {
                 subst.push(arg);
             } else {
                 let slot = *base;
@@ -462,13 +489,36 @@ impl Inliner {
 /// evaluation: a name, a literal, or a string. Everything else is evaluated once
 /// into a temporary instead.
 fn trivial(e: &Expr) -> bool {
-    matches!(e, Expr::Var { .. } | Expr::Int(_) | Expr::Bool(_) | Expr::Str(_))
+    matches!(e, Expr::Var { .. } | Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_))
+}
+
+/// True for an expression whose evaluation may write memory or call a function,
+/// so a later argument can change what an earlier argument's name reads. A
+/// block, an assignment, a call and a loop are all effects; a plain operand
+/// (name, literal, arithmetic on operands) is not. Conservative: an
+/// unrecognised variant counts as an effect, which only costs an extra copy.
+fn has_effect(e: &Expr) -> bool {
+    match e {
+        Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } => false,
+        Expr::Bin(_, a, b) => has_effect(a) || has_effect(b),
+        Expr::Un(_, a) | Expr::Cast(a, _) => has_effect(a),
+        Expr::Field { base, .. } => has_effect(base),
+        Expr::Index(a, b) => has_effect(a) || has_effect(b),
+        Expr::EnumPayload { recv, .. } | Expr::Deref { expr: recv, .. } => has_effect(recv),
+        Expr::AddrOf { expr, .. } => has_effect(expr),
+        Expr::ArrayLit(base, _) => has_effect(base),
+        Expr::ArrayList(v) => v.iter().any(has_effect),
+        _ => true,
+    }
 }
 
 /// The slots a candidate body assigns directly (not through a pointer or an
-/// element). A parameter among them is a local the body mutates, so it must be
-/// copied rather than substituted, or the mutation would reach the caller.
-fn assigned_slots(stmts: &[Stmt], tail: Option<&Expr>) -> HashSet<i32> {
+/// element) or takes the address of. A parameter among them is a local the body
+/// mutates or points at, so it must be copied rather than substituted: a
+/// substituted argument would let a mutation reach the caller, and taking the
+/// address of a non-lvalue argument (a literal, a call) would have no place to
+/// name.
+fn escaped_slots(stmts: &[Stmt], tail: Option<&Expr>) -> HashSet<i32> {
     fn collect_block(b: &Block, out: &mut HashSet<i32>) {
         for s in &b.stmts {
             collect_stmt(s, out);
@@ -518,6 +568,10 @@ fn assigned_slots(stmts: &[Stmt], tail: Option<&Expr>) -> HashSet<i32> {
     }
     fn collect_expr(e: &Expr, out: &mut HashSet<i32>) {
         match e {
+Expr::PatScrutinee(_) => {
+                unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+            }
+            Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
             Expr::Bin(_, a, b) => {
                 collect_expr(a, out);
                 collect_expr(b, out);
@@ -528,7 +582,17 @@ fn assigned_slots(stmts: &[Stmt], tail: Option<&Expr>) -> HashSet<i32> {
                 collect_expr(a, out);
                 collect_expr(b, out);
             }
-            Expr::Deref { expr, .. } | Expr::AddrOf { expr, .. } => collect_expr(expr, out),
+            Expr::Deref { expr, .. } => collect_expr(expr, out),
+            // `&x` names the place `x`, so a parameter read by address must stay
+            // a copy; record the slot. `&*p` and `&s.f` recurse into the operand
+            // instead, which reaches `p`/`s` only when that operand is itself a
+            // bare parameter read.
+            Expr::AddrOf { expr, .. } => {
+                if let Expr::Var { slot, .. } = expr.as_ref() {
+                    out.insert(*slot);
+                }
+                collect_expr(expr, out);
+            }
             Expr::Block(b) => collect_block(b, out),
             Expr::MatchBoundary(b, _) | Expr::Loop(b, _, _, _) => collect_block(b, out),
             Expr::If(c, t, els) => {
@@ -565,10 +629,15 @@ fn assigned_slots(stmts: &[Stmt], tail: Option<&Expr>) -> HashSet<i32> {
                     collect_expr(x, out);
                 }
             }
+            Expr::TupleLit(v) => {
+                for x in v {
+                    collect_expr(x, out);
+                }
+            }
             Expr::VariantTest { scrutinee, .. } => collect_expr(scrutinee, out),
             Expr::BoolTest { scrutinee, .. } => collect_expr(scrutinee, out),
             Expr::EnumPayload { recv, .. } => collect_expr(recv, out),
-            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
+            Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
         }
     }
 
@@ -657,6 +726,10 @@ impl Sub<'_> {
             }
         }
         match e {
+Expr::PatScrutinee(_) => {
+                unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+            }
+            Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
             Expr::Var { slot, .. } => *slot = self.slot(*slot),
             Expr::Bin(_, a, b) => {
                 self.expr(a);
@@ -727,10 +800,15 @@ impl Sub<'_> {
                     self.expr(x);
                 }
             }
+            Expr::TupleLit(v) => {
+                for x in v {
+                    self.expr(x);
+                }
+            }
             Expr::VariantTest { scrutinee, .. } => self.expr(scrutinee),
             Expr::BoolTest { scrutinee, .. } => self.expr(scrutinee),
             Expr::EnumPayload { recv, .. } => self.expr(recv),
-            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::EnumVariant { .. } => {}
+            Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::EnumVariant { .. } => {}
         }
     }
 }

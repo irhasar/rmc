@@ -1,4 +1,4 @@
-// The Rust twin of `refs.rms`: the same `&self` methods over a wide struct,
+// The Rust twin of `bench/mir/refs.rs`: the same `&self` methods over a wide struct,
 // called in a hot loop.
 #[derive(Copy, Clone)]
 struct Wide { a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64 }

@@ -163,6 +163,9 @@ impl Codegen {
     fn array_len_ty(ty: &Type) -> Option<usize> {
         match ty {
             Type::Array(_, n) => Some(*n),
+            // Indexing an array reference checks against the referent's
+            // length, so `&[T; N]` must report `N` or the check is skipped.
+            Type::Ref(inner, _) => Self::array_len_ty(inner),
             _ => None,
         }
     }
@@ -882,7 +885,12 @@ impl Codegen {
     ) {
         match e {
             Expr::ArrayList(_) => unreachable!("sema rewrites ArrayList into a block"),
+            Expr::TupleLit(_) => unreachable!("sema rewrites TupleLit into a StructLit"),
             Expr::MethodCall { .. } => unreachable!("sema rewrites MethodCall into a Call"),
+Expr::PatScrutinee(_) => {
+                unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+            }
+            Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
             Expr::EnumVariant { .. } => {} // a tag has no subexpressions
             Expr::EnumCtor { args, slot, size, .. } => {
                 for a in args {
@@ -1020,7 +1028,7 @@ impl Codegen {
             Expr::ArrayLit(v, _) => {
                 Self::count_expr(v, counts, mem, copied, true, let_tmps)
             }
-            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) => {}
+            Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) => {}
         }
     }
 
@@ -1285,7 +1293,7 @@ impl Codegen {
                                 // place (see `store_through_addr`), and here the
                                 // place's index is what may call, so the value
                                 // must be stashed before the address is formed.
-                                if Self::contains_call(target) {
+                                if Self::place_has_effect(target) {
                                     self.gen_expr(value);
                                     self.push_rax();
                                     self.gen_addr(target);
@@ -1367,6 +1375,22 @@ impl Codegen {
                 self.raw(&format!("{top}:"));
                 self.gen_block(body);
                 self.raw(&format!("{cont}:"));
+                // An inclusive loop must stop *before* incrementing past the
+                // endpoint: `MAX..=MAX` would otherwise wrap the counter to
+                // MIN and loop forever. Only a variable or `i64::MAX` endpoint
+                // can reach the wrap, so a smaller constant bound keeps the
+                // branch-free increment.
+                if *inclusive && !matches!(end_imm, Some(k) if k != i64::MAX) {
+                    self.gen_var_operand(*var_slot, "%rax");
+                    match end_imm {
+                        Some(k) => self.line(&format!("cmp ${k}, %rax")),
+                        None => {
+                            self.gen_var_operand(*end_slot, "%rcx");
+                            self.line("cmp %rcx, %rax");
+                        }
+                    }
+                    self.line(&format!("je {exit}"));
+                }
                 self.inc_slot(*var_slot);
                 self.raw(&format!("{guard}:"));
                 self.gen_var_operand(*var_slot, "%rax");
@@ -1650,7 +1674,7 @@ impl Codegen {
         // expression whose operands are ordered right-to-left). When computing
         // the place can run a call, evaluate the value first and stash it,
         // otherwise the place's call would be sequenced ahead of the value's.
-        if Self::contains_call(target) {
+        if Self::place_has_effect(target) {
             // The value goes first, but the place's address is what `gen_addr`
             // leaves in `%rax`; move it aside, reload the value into `%rax`, and
             // store the value through the address.
@@ -1683,7 +1707,7 @@ impl Codegen {
     /// can call, the value is stashed across it. Otherwise the place is formed
     /// first and the value stashed across the copy's scratch use of `%rdi`.
     fn assign_aggregate(&mut self, target: &Expr, value: &Expr, n: usize) {
-        if Self::contains_call(target) {
+        if Self::place_has_effect(target) {
             self.gen_expr(value);
             self.push_rax();
             self.gen_addr(target);
@@ -1812,7 +1836,12 @@ impl Codegen {
     fn gen_expr(&mut self, e: &Expr) -> Type {
         match e {
             Expr::ArrayList(_) => unreachable!("sema rewrites ArrayList into a block"),
+            Expr::TupleLit(_) => unreachable!("sema rewrites TupleLit into a StructLit"),
             Expr::MethodCall { .. } => unreachable!("sema rewrites MethodCall into a Call"),
+Expr::PatScrutinee(_) => {
+                unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+            }
+            Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
             Expr::EnumVariant { tag, .. } => {
                 self.line(&format!("mov ${tag}, %rax"));
                 Type::I64
@@ -1900,6 +1929,10 @@ impl Codegen {
             Expr::Int(v) => {
                 self.line(&format!("mov ${v}, %rax"));
                 Type::I64
+            }
+            Expr::Char(c) => {
+                self.line(&format!("mov ${c}, %rax"));
+                Type::Char
             }
             Expr::Bool(b) => {
                 self.line(&format!("mov ${}, %rax", if *b { 1 } else { 0 }));
@@ -2155,6 +2188,7 @@ impl Codegen {
     fn simple_operand(&self, e: &Expr) -> Option<String> {
         match e {
             Expr::Int(v) if (-2_147_483_648..=2_147_483_647).contains(v) => Some(format!("${v}")),
+            Expr::Char(c) if *c <= 2_147_483_647 => Some(format!("${c}")),
             Expr::Bool(b) => Some(format!("${}", if *b { 1 } else { 0 })),
             Expr::Var { slot, ty, .. } => {
                 if ty.is_aggregate() {
@@ -2392,7 +2426,7 @@ impl Codegen {
             return true;
         }
         match e {
-            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::EnumVariant { .. } => false,
+            Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::EnumVariant { .. } => false,
             Expr::Var { .. } => false,
             Expr::Field { base, .. } => self.uses_reg(base, r),
             Expr::Bin(_, a, b) => self.uses_reg(a, r) || self.uses_reg(b, r),
@@ -2413,9 +2447,13 @@ impl Codegen {
             }
             Expr::Block(b) | Expr::Loop(b, _, _, _) => self.block_uses_reg(b, r),
             Expr::MatchBoundary(b, _) => self.block_uses_reg(b, r),
-            Expr::ArrayList(_) | Expr::MethodCall { .. } => {
-                unreachable!("sema rewrites ArrayList and MethodCall")
+            Expr::ArrayList(_) | Expr::TupleLit(_) | Expr::MethodCall { .. } => {
+                unreachable!("sema rewrites ArrayList, TupleLit and MethodCall")
             }
+Expr::PatScrutinee(_) => {
+                unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+            }
+            Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
         }
     }
 
@@ -2523,6 +2561,17 @@ impl Codegen {
 
     fn gen_bin(&mut self, op: BinOp, a: &Expr, b: &Expr) -> Type {
         use BinOp::*;
+        // `wrapping_mul` is `*` with no overflow guard. Run the whole `Mul`
+        // path with the guard suppressed and the trap-restoring `jo` turned
+        // off, so the constant folds, the `lea` scaling and the operand
+        // selection are all shared and only the `jo` differs.
+        if op == WrappingMul {
+            let saved = self.overflow;
+            self.overflow = false;
+            let t = self.gen_bin(Mul, a, b);
+            self.overflow = saved;
+            return t;
+        }
         match op {
             And | Or => {
                 let short = self.new_label();
@@ -2982,6 +3031,23 @@ impl Codegen {
         }
     }
 
+    /// The frame displacement of element `idx` of the local array at `slot` with
+    /// `n` slots and a `stride`-slot element, for a *constant* index. `None`
+    /// when `base` is not a local array. Used where an element is named directly
+    /// rather than through `array_elem_operand` (which handles only stride 1).
+    fn const_elem_off(&self, base: &Expr, idx: &Expr) -> Option<i32> {
+        let (slot, n) = match base {
+            Expr::Var { slot, ty: Type::Array(_, n), .. } => (*slot, *n),
+            _ => return None,
+        };
+        match idx {
+            Expr::Int(v) if (-2_147_483_648..=2_147_483_647).contains(v) => {
+                Some(self.array_off(slot, n) + *v as i32 * 8 * Self::elem_stride(base) as i32)
+            }
+            _ => None,
+        }
+    }
+
     /// Emit a `cmp` that leaves the flags for `a - b`, i.e. the flags for
     /// `a op b`. Returns false when neither operand can be named without a
     /// register, so the caller can fall back to the general path. x86 rejects
@@ -3230,14 +3296,17 @@ impl Codegen {
             Expr::Un(_, a) | Expr::Cast(a, _) => Self::contains_call(a),
             Expr::Index(a, b) => Self::contains_call(a) || Self::contains_call(b),
             Expr::Field { base, .. } => Self::contains_call(base),
-            // A deref or an address-of evaluates its operand, which can call:
-            // `*f()` and `&g()` are targets/values whose place computation runs
-            // the call, so the assignment reorder must see it.
-            Expr::Deref { expr, .. } | Expr::AddrOf { expr, .. } => Self::contains_call(expr),
-            Expr::EnumPayload { recv, .. } => Self::contains_call(recv),
+            // Every expression that evaluates a child can call, so each must be
+            // covered: a missed variant lets the direct-argument shortcut pick
+            // an argument whose nested call clobbers an earlier argument
+            // register, and the assignment reorder must also see a call inside
+            // a place.
+            Expr::EnumCtor { args, .. } => args.iter().any(Self::contains_call),
             Expr::VariantTest { scrutinee, .. } | Expr::BoolTest { scrutinee, .. } => {
                 Self::contains_call(scrutinee)
             }
+            Expr::EnumPayload { recv, .. } => Self::contains_call(recv),
+            Expr::Deref { expr, .. } | Expr::AddrOf { expr, .. } => Self::contains_call(expr),
             Expr::ArrayList(v) => v.iter().any(Self::contains_call),
             Expr::If(c, t, els) => {
                 Self::contains_call(c)
@@ -3247,6 +3316,64 @@ impl Codegen {
             Expr::Block(b) | Expr::Loop(b, _, _, _) => Self::block_has_call(b),
             Expr::MatchBoundary(b, _) => Self::block_has_call(b),
             _ => false,
+        }
+    }
+
+    /// True when forming the address of `e` can change observable state: a
+    /// call, or a block/if that assigns a local. The value-before-place reorder
+    /// must key on this, not `contains_call`: `a[{ x = 2; 0 }] = x` computes the
+    /// place (a store) with no call, and reading the place first would store the
+    /// new `x` instead of the value `x` held before the place ran.
+    fn place_has_effect(e: &Expr) -> bool {
+        match e {
+            Expr::Block(b) | Expr::MatchBoundary(b, _) => Self::block_has_effect(b),
+            Expr::If(c, t, els) => {
+                Self::place_has_effect(c)
+                    || Self::block_has_effect(t)
+                    || els.as_ref().map_or(false, |b| Self::block_has_effect(b))
+            }
+            Expr::Index(a, b) => Self::place_has_effect(a) || Self::place_has_effect(b),
+            Expr::Field { base, .. } => Self::place_has_effect(base),
+            Expr::Deref { expr, .. } | Expr::AddrOf { expr, .. } => Self::place_has_effect(expr),
+            Expr::EnumPayload { recv, .. } => Self::place_has_effect(recv),
+            // An arithmetic, unary or cast sub-expression can hide a block that
+            // assigns a local (`r[{ y = 2; 0 } + 0] = y`), so the operands are
+            // traversed rather than reduced to a call check.
+            Expr::Bin(_, a, b) => Self::place_has_effect(a) || Self::place_has_effect(b),
+            Expr::Un(_, a) | Expr::Cast(a, _) => Self::place_has_effect(a),
+            Expr::ArrayLit(v, _) => Self::place_has_effect(v),
+            Expr::ArrayList(v) => v.iter().any(Self::place_has_effect),
+            // A call is an effect by itself; its arguments cannot make it worse.
+            Expr::Call { .. } | Expr::MethodCall { .. } => true,
+            Expr::StructLit { fields, .. } => fields.iter().any(|f| Self::place_has_effect(&f.value)),
+            Expr::EnumCtor { args, .. } => args.iter().any(Self::place_has_effect),
+            Expr::VariantTest { scrutinee, .. } | Expr::BoolTest { scrutinee, .. } => {
+                Self::place_has_effect(scrutinee)
+            }
+            _ => Self::contains_call(e),
+        }
+    }
+
+    fn block_has_effect(b: &Block) -> bool {
+        b.stmts.iter().any(Self::stmt_has_effect)
+            || b.tail.as_deref().map_or(false, Self::place_has_effect)
+    }
+
+    fn stmt_has_effect(s: &Stmt) -> bool {
+        match s {
+            Stmt::Let { init, .. } => init.as_ref().map_or(false, Self::place_has_effect),
+            // An assignment writes a local, which a later read can observe.
+            Stmt::Assign { .. } => true,
+            Stmt::Expr(e) => Self::place_has_effect(e),
+            Stmt::Return(v) => v.as_ref().map_or(false, Self::place_has_effect),
+            Stmt::For { start, end, body, .. } => {
+                Self::place_has_effect(start)
+                    || Self::place_has_effect(end)
+                    || Self::block_has_effect(body)
+            }
+            Stmt::While(..) => true,
+            Stmt::Break(v, _) => v.as_ref().map_or(false, Self::place_has_effect),
+            Stmt::Continue(_) => false,
         }
     }
 
@@ -3281,9 +3408,18 @@ impl Codegen {
     fn stmt_clobbers(s: &Stmt) -> bool {
         match s {
             Stmt::Let { init: Some(e), .. } => Self::value_copies_aggregate(e),
-            Stmt::Assign { target, .. } => {
-                matches!(target, Expr::Var { ty, .. } if ty.is_aggregate())
-            }
+            // An aggregate store copies word by word through `%rdi`/`%rsi`
+            // (`copy_words_rdi_rsi`), whether the destination is a whole local,
+            // a struct field or an array element, so all three clobber the
+            // argument registers.
+            Stmt::Assign { target, .. } => match target {
+                Expr::Var { ty, .. } | Expr::Field { ty, .. } => ty.is_aggregate(),
+                Expr::Index(base, _) => matches!(
+                    base.as_ref(),
+                    Expr::Var { ty: Type::Array(e, _), .. } if e.is_aggregate()
+                ),
+                _ => false,
+            },
             _ => false,
         }
     }

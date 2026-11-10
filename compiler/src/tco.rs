@@ -166,7 +166,11 @@ fn calls_other(e: &Expr, name: &str) -> bool {
         Expr::Call { name: n, args, .. } => {
             n != name || args.iter().any(|a| calls_other(a, name))
         }
-        Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } => false,
+        Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } => false,
+Expr::PatScrutinee(_) => {
+            unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+        }
+        Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
         Expr::Bin(_, a, b) => calls_other(a, name) || calls_other(b, name),
         Expr::Un(_, a) | Expr::Cast(a, _) | Expr::AddrOf { expr: a, .. } | Expr::Deref { expr: a, .. } => {
             calls_other(a, name)
@@ -189,6 +193,7 @@ fn calls_other(e: &Expr, name: &str) -> bool {
         Expr::StructLit { fields, .. } => fields.iter().any(|fi| calls_other(&fi.value, name)),
         Expr::ArrayLit(v, _) => calls_other(v, name),
         Expr::ArrayList(v) => v.iter().any(|x| calls_other(x, name)),
+        Expr::TupleLit(v) => v.iter().any(|x| calls_other(x, name)),
         Expr::MethodCall { recv, args, .. } => {
             calls_other(recv, name) || args.iter().any(|a| calls_other(a, name))
         }
@@ -221,7 +226,11 @@ fn stmt_calls_other(s: &Stmt, name: &str) -> bool {
 fn has_call(e: &Expr) -> bool {
     match e {
         Expr::Call { .. } => true,
-        Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } => false,
+        Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } => false,
+Expr::PatScrutinee(_) => {
+            unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+        }
+        Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
         Expr::Bin(_, a, b) => has_call(a) || has_call(b),
         Expr::Un(_, a) => has_call(a),
         Expr::If(c, t, e) => {
@@ -243,6 +252,7 @@ fn has_call(e: &Expr) -> bool {
         Expr::StructLit { fields, .. } => fields.iter().any(|fi| has_call(&fi.value)),
         Expr::ArrayLit(v, _) => has_call(v),
         Expr::ArrayList(v) => v.iter().any(has_call),
+        Expr::TupleLit(v) => v.iter().any(has_call),
         Expr::MethodCall { recv, args, .. } => {
             has_call(recv) || args.iter().any(has_call)
         }
@@ -275,7 +285,11 @@ fn stmt_has_call(s: &Stmt) -> bool {
 /// the transformed loop rather than from the recursive frame that wrote it.
 fn has_return(e: &Expr) -> bool {
     match e {
-        Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } => false,
+        Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } => false,
+Expr::PatScrutinee(_) => {
+            unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+        }
+        Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
         // A `return` can hide in a call argument, e.g. `f({ if c { return 0; } x })`.
         Expr::Call { args, .. } => args.iter().any(has_return),
         Expr::Bin(_, a, b) => has_return(a) || has_return(b),
@@ -294,6 +308,7 @@ fn has_return(e: &Expr) -> bool {
         Expr::StructLit { fields, .. } => fields.iter().any(|fi| has_return(&fi.value)),
         Expr::ArrayLit(v, _) => has_return(v),
         Expr::ArrayList(v) => v.iter().any(has_return),
+        Expr::TupleLit(v) => v.iter().any(has_return),
         Expr::MethodCall { recv, args, .. } => has_return(recv) || args.iter().any(has_return),
         Expr::EnumVariant { .. } => false,
         Expr::EnumCtor { args, .. } => args.iter().any(has_return),

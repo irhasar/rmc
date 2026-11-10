@@ -1,4 +1,3 @@
-// The Rust twin of `mut_refs.rms`.
 #[derive(Copy, Clone)]
 struct C { n: i64 }
 

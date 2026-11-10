@@ -56,6 +56,7 @@ fn main() {
     rmc::mir::licm(&mut prog);
     mark("licm", &mut t0);
     rmc::mir::fold_accumulators(&mut prog);
+    rmc::mir::close_counted_loops(&mut prog, opts.overflow_checks);
     mark("fold_accumulators", &mut t0);
     rmc::mir::jump_thread(&mut prog);
     mark("jump_thread", &mut t0);

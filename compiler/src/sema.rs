@@ -86,6 +86,40 @@ pub struct Sema {
     /// The loops currently being checked, innermost last, so a `break` can see
     /// the type of the loop it targets.
     loop_stack: Vec<LoopCtx>,
+    /// One entry per enclosing `while`/`for` loop, holding the scope length at
+    /// the loop's entry. Such a body may run again, so a write inside it to a
+    /// non-`mut` binding that already existed before the loop is a second write
+    /// on the first iteration (rustc's `cannot assign twice`); a binding
+    /// declared *inside* the body is fresh each iteration and is exempt. A
+    /// `loop` runs at least once, so it pushes nothing. The paired
+    /// `loop_repeats` flag marks a `loop` whose body can reach the top again.
+    loop_marks: Vec<usize>,
+    /// Per enclosing loop, whether it may run a body iteration more than once
+    /// (a `while`/`for` always may; a `loop` only when its body can reach the
+    /// top again). A `loop` that runs at most once keeps the straight-line
+    /// write rules.
+    loop_repeats: Vec<bool>,
+    /// Per enclosing loop, the definite-initialization state captured at each
+    /// `break` that leaves it. A `loop` runs its body at least once, so a
+    /// binding the loop initializes stays initialized afterwards — but only if
+    /// *every* exit leaves it initialized. `while`/`for` may run zero times, so
+    /// their entry is recorded but the merge is not used. Indexed like
+    /// `loop_stack`, so a labelled `break` records against its target loop.
+    loop_exits: Vec<Vec<Vec<bool>>>,
+    /// Parallel to `loop_repeats`: at the current point, whether control can
+    /// still reach the top of that loop. Inside a `loop` body this is the
+    /// per-statement repeat flag. A `continue` in a branch restores it to `true`
+    /// while that branch is checked.
+    loop_reach: Vec<bool>,
+    /// Parallel to `loop_reach`: the reach of the code *after* the statement
+    /// currently being checked. A nested block (an `if` arm, a `{}` expression)
+    /// falls through to this point, so its own reach analysis is seeded with it
+    /// rather than with the statement's own reach.
+    loop_cont: Vec<bool>,
+    /// Per enclosing loop, the may-assigned state accumulated over every `break`
+    /// that targets it, so a write on a break path counts as the first write for
+    /// a later statement.
+    break_assigned: Vec<Vec<bool>>,
     ret_ty: Type,
     /// While checking the `else` chain of a desugared `match`: whether the
     /// whole chain names every variant of one enum. Decided once at the chain's
@@ -102,6 +136,18 @@ pub struct Sema {
     /// or arithmetic operand that is a constant *local* (`let i = -1; a[i]`),
     /// which rustc folds and rmc otherwise missed.
     const_locals: HashMap<i32, i64>,
+    /// A monotonic counter for synthesised temporary names, so each desugar
+    /// gets a distinct identifier. Names carry a leading NUL, which no source
+    /// identifier can contain, so they cannot collide with a user binding.
+    tmp: u32,
+    /// Set while re-checking the body of a built-in `abs`, whose `-x` is
+    /// compiler-generated. The `arithmetic_overflow` lint that rejects a
+    /// written `-i64::MIN` must not fire on it: rustc accepts `i64::MIN.abs()`
+    /// (it yields `i64::MIN` in release and traps under overflow checks),
+    /// because the negation happens inside a generic stdlib body that never
+    /// folds. Named for the neg it suppresses, not just `abs`, so a future
+    /// desugar that also synthesises a negation reuses it.
+    in_builtin_neg: bool,
     /// How many times each binding name is assigned by an `=` statement in the
     /// current function (the `let` initializer is not counted). rustc folds a
     /// local only when it is assigned at most once in total, so a name with any
@@ -129,6 +175,14 @@ struct Binding {
     ty: Type,
     mutable: bool,
     init: bool,
+    /// True for a function/method parameter, which rustc reports as an
+    /// "immutable argument" rather than a twice-assigned variable.
+    param: bool,
+    /// True once the binding has been written on some path: its declaration
+    /// initialiser, or an assignment. A plain `let` without an initialiser may
+    /// be written exactly once, so a second write is rejected the way rustc
+    /// rejects `cannot assign twice to immutable variable`.
+    assigned: bool,
 }
 
 /// A lexical scope: a stack of bindings, innermost last.
@@ -145,19 +199,60 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     // Runtime helpers provided by the freestanding assembly runtime. They are
     // linked in automatically, so they do not appear in the source program.
-    let builtins: [(&str, &[Type], Type); 9] = [
+    let builtins: [(&str, &[Type], Type); 26] = [
         ("print_i64", &[Type::I64], Type::Unit),
         ("print_str", &[Type::Str], Type::Unit),
         ("print_bool", &[Type::Bool], Type::Unit),
+        ("print_char", &[Type::Char], Type::Unit),
+        // `std::process::exit(code)`, lowered to the runtime's raw `exit`
+        // syscall wrapper by the parser. It never returns, but it is typed as
+        // returning `()` so it may be used as a statement or tail expression.
+        ("exit", &[Type::I64], Type::Unit),
         ("putchar", &[Type::I64], Type::Unit),
         ("alloc", &[Type::I64], Type::I64),
         ("free", &[Type::I64], Type::Unit),
         ("arg_i64", &[Type::I64], Type::I64),
+        // `std::env::args().nth(i)...unwrap_or(d)`: the i-th argument parsed as
+        // an integer, or `d` when the index is out of range or the text is not a
+        // whole integer. The third parameter selects the `.unwrap()` behaviour
+        // (trap instead of falling back). Emitted by the parser for the `args()`
+        // chain, never written in source.
+        ("__rmc_arg_or", &[Type::I64, Type::I64, Type::I64], Type::I64),
+        // The argument count, for the `for v in &args` desugar's loop bound.
+        ("__rmc_nargs", &[], Type::I64),
+        // `__rmc_fill(addr, count, elem)`: store `elem` at each of `count` words
+        // from `addr`, for the `vec![e; n]` desugar; returns `addr`.
+        ("__rmc_fill", &[Type::I64, Type::I64, Type::I64], Type::I64),
         // Byte-wise lexicographic `str` compare; emitted by sema for a string
         // comparison and never written in source.
         ("__rmc_str_lt", &[Type::Str, Type::Str], Type::Bool),
         // `str::len`, the record's length word; emitted by sema for `s.len()`.
         ("__rmc_str_len", &[Type::Str], Type::I64),
+        // `i64::clamp`'s `min > max` trap; emitted by sema for the failure arm.
+        // Typed `i64` because it stands in one arm of the desugar's `if`.
+        ("__rmc_clamp", &[], Type::I64),
+        // The bit-inspection methods (`count_ones`, `leading_zeros`,
+        // `trailing_zeros`), emitted by sema for the matching method. Each takes
+        // the receiver by value and returns the count as `i64`.
+        ("__rmc_count_ones", &[Type::I64], Type::I64),
+        ("__rmc_leading_zeros", &[Type::I64], Type::I64),
+        ("__rmc_trailing_zeros", &[Type::I64], Type::I64),
+        // `swap_bytes` and `reverse_bits` are also loops over the bits, so they
+        // take the receiver by value and return the transformed value as `i64`.
+        ("__rmc_swap_bytes", &[Type::I64], Type::I64),
+        ("__rmc_reverse_bits", &[Type::I64], Type::I64),
+        // The rotates take the value and the count, so they are the only bit
+        // helpers with two parameters.
+        ("__rmc_rotate_left", &[Type::I64, Type::I64], Type::I64),
+        ("__rmc_rotate_right", &[Type::I64, Type::I64], Type::I64),
+        // `print!`/`println!`'s `{}` pieces, chosen by the value's type. Unlike
+        // `print_i64` and friends they print *no* trailing newline, so a
+        // `println!` line of several pieces stays on one line and the macro
+        // appends the newline itself. They are not written in source.
+        ("__rmc_write_i64", &[Type::I64], Type::Unit),
+        ("__rmc_write_bool", &[Type::Bool], Type::Unit),
+        ("__rmc_write_str", &[Type::Str], Type::Unit),
+        ("__rmc_write_char", &[Type::Char], Type::Unit),
     ];
     for (name, params, ret) in builtins {
         sigs.insert(
@@ -190,13 +285,25 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         }
     }
     for f in &prog.fns {
-        if sigs.contains_key(&f.name) {
-            return Err(format!("function `{}` is defined more than once", f.name));
-        }
+        // A user definition of a runtime helper wins over the built-in:
+        // `spills.rs` shims `alloc`/`free` as ordinary Rust functions so the
+        // same source also builds under rustc, and rmc must not reject the
+        // redefinition. Overwrite the built-in signature with the user's; the
+        // runtime drops its own piece for any symbol the program defines.
         let params: Result<Vec<Type>, String> =
             f.params.iter().map(|(_, t)| resolve_in(t, &structs, &enums)).collect();
         let params = params?;
         let ret = resolve_in(&f.ret, &structs, &enums)?;
+        // The System V calling convention passes the first six integer
+        // arguments in registers; this compiler does not implement stack
+        // arguments, so a seventh parameter could never receive a value.
+        if params.len() > 6 {
+            return Err(format!(
+                "function `{}` has {} parameters, but at most 6 are supported",
+                f.name,
+                params.len()
+            ));
+        }
         // Aggregate parameters and returns are passed by pointer, so any type
         // is allowed here; the calling convention handles the rest.
         sigs.insert(
@@ -228,9 +335,17 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         next_slot: 0,
         loop_depth: 0,
         loop_stack: Vec::new(),
+        loop_marks: Vec::new(),
+        loop_repeats: Vec::new(),
+        loop_exits: Vec::new(),
+        loop_reach: Vec::new(),
+        loop_cont: Vec::new(),
+        break_assigned: Vec::new(),
         ret_ty: Type::Unit,
         match_total: false,
         match_chain: false,
+        tmp: 0,
+        in_builtin_neg: false,
         const_locals: HashMap::new(),
         assign_count: HashMap::new(),
         mut_borrowed: std::collections::HashSet::new(),
@@ -409,6 +524,9 @@ fn resolve_ty_rec(
         }
         Type::Ref(inner, m) => {
             let t = resolve_ty_rec(inner, raw_s, raw_e, so, eo, visiting)?;
+            if t == Type::Str {
+                return Ok(Type::Str);
+            }
             Ok(Type::Ref(Box::new(t), *m))
         }
         other => Ok(other.clone()),
@@ -444,7 +562,17 @@ fn resolve_in(
             }
             Ok(Type::Array(Box::new(e), *n))
         }
-        Type::Ref(inner, m) => Ok(Type::Ref(Box::new(resolve_in(inner, structs, enums)?), *m)),
+        // A reference to `str` (`&str`, `&'static str`, `&mut str`) is rmc's
+        // `Str`: a pointer to a byte string. rmc has no separate fat-pointer
+        // type, so `&str` and `str` denote the same one-slot value. This lets a
+        // Rust `fn f() -> &'static str` return a string literal unchanged.
+        Type::Ref(inner, m) => {
+            let it = resolve_in(inner, structs, enums)?;
+            if it == Type::Str {
+                return Ok(Type::Str);
+            }
+            Ok(Type::Ref(Box::new(it), *m))
+        }
         other => Ok(other.clone()),
     }
 }
@@ -479,10 +607,10 @@ fn check_consts(
         }
         let ty = resolve_in(&c.ty, structs, enums)?;
         match ty {
-            Type::I64 | Type::Bool => {}
+            Type::I64 | Type::Bool | Type::Char => {}
             other => {
                 return Err(format!(
-                    "constant `{}` has type {other:?}; rmc only folds `i64` and `bool` constants",
+                    "constant `{}` has type {other:?}; rmc only folds `i64`, `bool` and `char` constants",
                     c.name
                 ))
             }
@@ -493,6 +621,7 @@ fn check_consts(
         match (ty, resolved.get(&c.name)) {
             (Type::I64, Some(crate::consts::ConstVal::Int(_))) => {}
             (Type::Bool, Some(crate::consts::ConstVal::Bool(_))) => {}
+            (Type::Char, Some(crate::consts::ConstVal::Char(_))) => {}
             (Type::I64, _) => {
                 return Err(format!(
                     "constant `{}` is not a constant `i64` expression",
@@ -502,6 +631,12 @@ fn check_consts(
             (Type::Bool, _) => {
                 return Err(format!(
                     "constant `{}` is not a constant `bool` expression",
+                    c.name
+                ))
+            }
+            (Type::Char, _) => {
+                return Err(format!(
+                    "constant `{}` is not a constant `char` expression",
                     c.name
                 ))
             }
@@ -516,6 +651,29 @@ impl Sema {
     /// type may appear.
     fn resolve_ty(&self, t: &Type) -> Result<Type, String> {
         resolve_in(t, &self.structs, &self.enums)
+    }
+
+    /// The anonymous struct that lays out a tuple with these element types: its
+    /// name and layout. A tuple *type* the user wrote was already lowered by the
+    /// parser and laid out by `resolve_layouts`, so its name is found in the
+    /// table; a tuple *literal* the parser could not type introduces the struct
+    /// here, laid out exactly like a struct with fields `"0"`, `"1"`, ... at
+    /// consecutive offsets, and it is recorded so a later use finds it.
+    fn tuple_struct_for(&mut self, tys: &[Type]) -> (String, StructInfo) {
+        let keys: Vec<String> = tys.iter().map(|t| t.key()).collect();
+        let name = crate::ast::tuple_struct_name(&keys);
+        if let Some(info) = self.structs.get(&name) {
+            return (name, info.clone());
+        }
+        let mut fields = Vec::with_capacity(tys.len());
+        let mut size = 0usize;
+        for (k, ty) in tys.iter().enumerate() {
+            fields.push((k.to_string(), ty.clone(), size));
+            size += ty.size();
+        }
+        let info = StructInfo { fields, size };
+        self.structs.insert(name.clone(), info.clone());
+        (name, info)
     }
 
     fn check_fn(&mut self, f: &mut FnDef) -> Result<(), String> {
@@ -564,7 +722,7 @@ impl Sema {
             // A parameter is a `let` binding; it is immutable unless declared
             // `mut`, and it is always initialized by the caller.
             let mutable = f.param_mut.get(i).copied().unwrap_or(false);
-            scope.push(Binding { name: name.clone(), slot, ty: rt, mutable, init: true });
+            scope.push(Binding { name: name.clone(), slot, ty: rt, mutable, init: true, param: true, assigned: true });
         }
 
         // A pattern parameter binds its names at the top of the body, before
@@ -622,6 +780,345 @@ impl Sema {
         s
     }
 
+    /// Rewrite a built-in integer method call into an expression over `i64`
+    /// operators. `recv` is already checked and, for a `&i64` receiver,
+    /// auto-dereferenced to an `i64` place. `min`/`max` need a second operand;
+    /// the rest take none. `abs`/`signum`/`min`/`max` yield `i64`;
+    /// `is_positive`/`is_negative` yield `bool`.
+    ///
+    /// Every desugaring reads its operands more than once (the receiver appears
+    /// in both arms, an argument in the test and in a result), so each
+    /// non-trivial operand is bound to a temporary first — `g().abs()` must call
+    /// `g` once, as rustc does. A plain variable or literal has no side effect
+    /// and is reused directly, so `x.abs()` stays a bare branch.
+    ///
+    /// The result type is `Type::I64` unless the method yields `bool`.
+    fn desugar_i64_method(
+        &mut self,
+        name: &str,
+        recv: Expr,
+        args: &[Expr],
+    ) -> Result<(Expr, Type), String> {
+        use BinOp::*;
+
+        /// Bind `e` to a fresh `\0im<n>` temporary unless it is a plain variable
+        /// or literal, appending the `let` to `stmts` in evaluation order.
+        fn bind(sema: &mut Sema, e: Expr, stmts: &mut Vec<Stmt>) -> Expr {
+            if matches!(e, Expr::Var { .. } | Expr::Int(_)) {
+                return e;
+            }
+            let name = format!("\u{0}im{}", sema.tmp);
+            sema.tmp += 1;
+            let var = Expr::Var { name: name.clone(), slot: -1, ty: Type::I64 };
+            stmts.push(Stmt::Let {
+                name,
+                ty: Some(Type::I64),
+                init: Some(e),
+                slot: -1,
+                mutable: false,
+            });
+            var
+        }
+
+        /// `if cond { a } else { b }`, the shape every two-way desugar uses.
+        fn if_then_else(cond: Expr, a: Expr, b: Expr) -> Expr {
+            Expr::If(
+                Box::new(cond),
+                Block { stmts: Vec::new(), tail: Some(Box::new(a)) },
+                Some(Block { stmts: Vec::new(), tail: Some(Box::new(b)) }),
+            )
+        }
+
+        let mut stmts = Vec::new();
+        let x = bind(self, recv, &mut stmts);
+        let (body, ty) = match name {
+            "abs" => {
+                if !args.is_empty() {
+                    return Err("method `abs` takes no arguments".into());
+                }
+                // `x.abs()` is `if x < 0 { -x } else { x }`, so `i64::MIN`
+                // maps to itself rather than trapping — `rustc -O` semantics.
+                let cond = Expr::Bin(Lt, Box::new(x.clone()), Box::new(Expr::Int(0)));
+                let neg = Expr::Un(UnOp::Neg, Box::new(x.clone()));
+                (
+                    Expr::If(
+                        Box::new(cond),
+                        Block { stmts: Vec::new(), tail: Some(Box::new(neg)) },
+                        Some(Block { stmts: Vec::new(), tail: Some(Box::new(x)) }),
+                    ),
+                    Type::I64,
+                )
+            }
+            "signum" => {
+                if !args.is_empty() {
+                    return Err("method `signum` takes no arguments".into());
+                }
+                // `(x > 0) as i64 - (x < 0) as i64` gives -1, 0 or 1 without
+                // ever negating `i64::MIN`.
+                let pos = Expr::Cast(
+                    Box::new(Expr::Bin(Gt, Box::new(x.clone()), Box::new(Expr::Int(0)))),
+                    Type::I64,
+                );
+                let neg = Expr::Cast(
+                    Box::new(Expr::Bin(Lt, Box::new(x), Box::new(Expr::Int(0)))),
+                    Type::I64,
+                );
+                (Expr::Bin(Sub, Box::new(pos), Box::new(neg)), Type::I64)
+            }
+            "is_positive" | "is_negative" => {
+                if !args.is_empty() {
+                    return Err(format!("method `{name}` takes no arguments"));
+                }
+                // A comparison already yields `bool`, so this is `x > 0` /
+                // `x < 0` with no cast; `0` is neither positive nor negative.
+                let cmp = if name == "is_positive" { Gt } else { Lt };
+                (Expr::Bin(cmp, Box::new(x), Box::new(Expr::Int(0))), Type::Bool)
+            }
+            "div_euclid" => {
+                if args.len() != 1 {
+                    return Err("method `div_euclid` takes exactly one argument".into());
+                }
+                // `div_euclid` is truncating division rounded toward the
+                // mathematical quotient: `q = x / y`, `r = x % y`, and when the
+                // remainder is negative the quotient is nudged one step further
+                // from zero (toward `-inf` for a positive divisor, toward `+inf`
+                // for a negative one). `q` and `r` are bound so each division
+                // runs once. The `/` and `%` reuse their existing traps, so a
+                // zero divisor and `i64::MIN / -1` behave exactly as they do for
+                // a written `/`: rustc's `div_euclid` panics on both, and the
+                // quotient is computed before the remainder, as here.
+                let x = self.force_temp(x, &mut stmts);
+                let y = bind(self, args[0].clone(), &mut stmts);
+                let q = bind(self, Expr::Bin(Div, Box::new(x.clone()), Box::new(y.clone())), &mut stmts);
+                let r = bind(self, Expr::Bin(Mod, Box::new(x), Box::new(y.clone())), &mut stmts);
+                let away = if_then_else(
+                    Expr::Bin(Gt, Box::new(y), Box::new(Expr::Int(0))),
+                    Expr::Bin(Sub, Box::new(q.clone()), Box::new(Expr::Int(1))),
+                    Expr::Bin(Add, Box::new(q.clone()), Box::new(Expr::Int(1))),
+                );
+                (
+                    if_then_else(
+                        Expr::Bin(Lt, Box::new(r), Box::new(Expr::Int(0))),
+                        away,
+                        q,
+                    ),
+                    Type::I64,
+                )
+            }
+            "rem_euclid" => {
+                if args.len() != 1 {
+                    return Err("method `rem_euclid` takes exactly one argument".into());
+                }
+                // `rem_euclid` is the remainder made non-negative: `r = x % y`,
+                // and when `r` is negative it is shifted up by `|y|` into
+                // `[0, |y|)`. Written without a negated operand — `r + y` when
+                // the divisor is positive, `r - y` when it is negative — so no
+                // compiler-synthesised `-y` needs the neg-overflow lint exempted,
+                // and a written `-i64::MIN` argument is still rejected. Neither
+                // arm can overflow: with `y == i64::MIN` the remainder is never
+                // negative (so the `r - y` arm is unreachable), and otherwise
+                // `|r| < |y|` keeps `r ± y` inside `i64`. `%` keeps its traps, so
+                // a zero divisor and `i64::MIN % -1` panic as rustc's does.
+                let x = self.force_temp(x, &mut stmts);
+                let y = bind(self, args[0].clone(), &mut stmts);
+                let r = bind(self, Expr::Bin(Mod, Box::new(x), Box::new(y.clone())), &mut stmts);
+                let shifted = if_then_else(
+                    Expr::Bin(Gt, Box::new(y.clone()), Box::new(Expr::Int(0))),
+                    Expr::Bin(Add, Box::new(r.clone()), Box::new(y.clone())),
+                    Expr::Bin(Sub, Box::new(r.clone()), Box::new(y)),
+                );
+                (
+                    if_then_else(
+                        Expr::Bin(Lt, Box::new(r.clone()), Box::new(Expr::Int(0))),
+                        shifted,
+                        r,
+                    ),
+                    Type::I64,
+                )
+            }
+            "clamp" => {
+                if args.len() != 2 {
+                    return Err("method `clamp` takes exactly two arguments".into());
+                }
+                // `clamp` panics when `min > max` and otherwise returns the
+                // receiver, `min` or `max`. The panic is a call to a runtime
+                // helper, so no codegen case is added; it never returns but is
+                // typed `i64` so it can stand in one arm of the `if`. `min` and
+                // `max` are bound before the comparisons, in argument order, so
+                // a call operand runs once. Comparisons never overflow, so a
+                // constant operand may be reused directly (`bind`).
+                let lo = bind(self, args[0].clone(), &mut stmts);
+                let hi = bind(self, args[1].clone(), &mut stmts);
+                let fail = Expr::Call {
+                    name: "__rmc_clamp".into(),
+                    args: Vec::new(),
+                    arg_slots: Vec::new(),
+                    ret_slot: -1,
+                    ret_ty: Type::I64,
+                };
+                let below = if_then_else(
+                    Expr::Bin(Lt, Box::new(x.clone()), Box::new(lo.clone())),
+                    lo.clone(),
+                    if_then_else(
+                        Expr::Bin(Gt, Box::new(x.clone()), Box::new(hi.clone())),
+                        hi.clone(),
+                        x,
+                    ),
+                );
+                (
+                    if_then_else(Expr::Bin(Gt, Box::new(lo), Box::new(hi)), fail, below),
+                    Type::I64,
+                )
+            }
+            "min" | "max" => {
+                if args.len() != 1 {
+                    return Err(format!("method `{name}` takes exactly one argument"));
+                }
+                // The receiver is bound first, then the argument, matching
+                // rustc's left-to-right evaluation of `x.min(y)`.
+                let y = bind(self, args[0].clone(), &mut stmts);
+                // `x.min(y)` is `if y < x { y } else { x }` and `x.max(y)` is
+                // `if y > x { y } else { x }`; both return `x` on a tie.
+                let cmp = if name == "min" { Lt } else { Gt };
+                let cond = Expr::Bin(cmp, Box::new(y.clone()), Box::new(x.clone()));
+                (
+                    Expr::If(
+                        Box::new(cond),
+                        Block { stmts: Vec::new(), tail: Some(Box::new(y)) },
+                        Some(Block { stmts: Vec::new(), tail: Some(Box::new(x)) }),
+                    ),
+                    Type::I64,
+                )
+            }
+            // The bit methods that lower to a runtime helper. The counts are
+            // exact for every input: a loop over the 64 bits neither negates nor
+            // decrements, so there is no overflow to trap on and
+            // `--overflow-checks` cannot change the answer, whereas a desugared
+            // `x & (x - 1)` would overflow for `i64::MIN`. `swap_bytes` and
+            // `reverse_bits` are the same shape — a per-bit loop (a single
+            // `bswap` for the former) with no operand negated. The receiver is
+            // bound first (when it is not a plain variable) so a call operand
+            // runs once; the helper takes it by value and returns the result.
+            // `leading_ones`/`trailing_ones` reuse the zero counts on `!x`,
+            // which is `xor $-1` and cannot overflow.
+            "count_ones" | "leading_zeros" | "trailing_zeros" | "swap_bytes"
+            | "reverse_bits" | "leading_ones" | "trailing_ones" | "count_zeros" => {
+                if !args.is_empty() {
+                    return Err(format!("method `{name}` takes no arguments"));
+                }
+                let (helper, arg) = match name {
+                    "count_ones" => ("__rmc_count_ones", x),
+                    "leading_zeros" => ("__rmc_leading_zeros", x),
+                    "trailing_zeros" => ("__rmc_trailing_zeros", x),
+                    "swap_bytes" => ("__rmc_swap_bytes", x),
+                    "reverse_bits" => ("__rmc_reverse_bits", x),
+                    // `leading_ones(x)` is `leading_zeros(!x)` and likewise for
+                    // the trailing form: inverting the bits swaps which side is
+                    // being counted, so the negated value is handed to the zero
+                    // helper rather than to a dedicated piece. `!` is `not`,
+                    // which cannot overflow. `count_zeros(x)` is the mirror of
+                    // `count_ones(x)`: the count of set bits in `!x`.
+                    "leading_ones" => {
+                        ("__rmc_leading_zeros", Expr::Un(UnOp::Not, Box::new(x)))
+                    }
+                    "trailing_ones" => {
+                        ("__rmc_trailing_zeros", Expr::Un(UnOp::Not, Box::new(x)))
+                    }
+                    _ => ("__rmc_count_ones", Expr::Un(UnOp::Not, Box::new(x))),
+                };
+                (
+                    Expr::Call {
+                        name: helper.into(),
+                        args: vec![arg],
+                        arg_slots: vec![(-1, 0)],
+                        ret_slot: -1,
+                        ret_ty: Type::I64,
+                    },
+                    Type::I64,
+                )
+            }
+            // The rotates lower to a helper with the count as a second argument.
+            // `rol`/`ror` mask the count to 6 bits in hardware, which is exactly
+            // Rust's `n % 64`, so every count is accepted (no panic) and the
+            // result is the same with and without `--overflow-checks`. The
+            // receiver is bound first, then the count, so each operand runs once.
+            "rotate_left" | "rotate_right" => {
+                if args.len() != 1 {
+                    return Err(format!("method `{name}` takes exactly one argument"));
+                }
+                let n = bind(self, args[0].clone(), &mut stmts);
+                let helper = if name == "rotate_left" {
+                    "__rmc_rotate_left"
+                } else {
+                    "__rmc_rotate_right"
+                };
+                (
+                    Expr::Call {
+                        name: helper.into(),
+                        args: vec![x, n],
+                        arg_slots: vec![(-1, 0), (-1, 0)],
+                        ret_slot: -1,
+                        ret_ty: Type::I64,
+                    },
+                    Type::I64,
+                )
+            }
+            // `midpoint(y)` is the arithmetic mean rounded toward zero —
+            // `(x + y) / 2` with the sum taken in unbounded precision, so it
+            // does not overflow. rustc computes it as `(x & y) + ((x ^ y) >> 1)`
+            // for the floor, then nudges up when the sum is odd and negative
+            // (truncation toward zero differs from the floor only there). The
+            // half-sum is bound to a temp so the sign test reads the same value
+            // the `+` does, and the correction is written `(x ^ y) & 1 & (h < 0)`
+            // so no arm is negated and none overflows. Comparisons never
+            // overflow, so the operands may be plain variables or literals.
+            "midpoint" => {
+                if args.len() != 1 {
+                    return Err("method `midpoint` takes exactly one argument".into());
+                }
+                let y = bind(self, args[0].clone(), &mut stmts);
+                let xored = Expr::Bin(BitXor, Box::new(x.clone()), Box::new(y.clone()));
+                let half = Expr::Bin(
+                    Add,
+                    Box::new(Expr::Bin(BitAnd, Box::new(x), Box::new(y))),
+                    Box::new(Expr::Bin(Shr, Box::new(xored.clone()), Box::new(Expr::Int(1)))),
+                );
+                let h = bind(self, half, &mut stmts);
+                // `(x ^ y) & 1` is 1 exactly when the two addends have opposite
+                // parity, i.e. the sum is odd; the half-sum is negative exactly
+                // when the sum is negative.
+                let carry = Expr::Bin(
+                    BitAnd,
+                    Box::new(Expr::Bin(BitAnd, Box::new(xored), Box::new(Expr::Int(1)))),
+                    Box::new(Expr::Cast(
+                        Box::new(Expr::Bin(Lt, Box::new(h.clone()), Box::new(Expr::Int(0)))),
+                        Type::I64,
+                    )),
+                );
+                (Expr::Bin(Add, Box::new(h), Box::new(carry)), Type::I64)
+            }
+            // `wrapping_mul` is `*` with the overflow trap suppressed. It lowers
+            // to the `WrappingMul` operator, whose codegen never emits the `jo`
+            // guard even under `--overflow-checks`, so the two compilers agree on
+            // the wrapped product for every operand. The receiver is bound first
+            // and the argument second, so each runs once and in argument order.
+            "wrapping_mul" => {
+                if args.len() != 1 {
+                    return Err("method `wrapping_mul` takes exactly one argument".into());
+                }
+                let y = bind(self, args[0].clone(), &mut stmts);
+                (Expr::Bin(WrappingMul, Box::new(x), Box::new(y)), Type::I64)
+            }
+            _ => unreachable!("checked by the caller"),
+        };
+        let body = if stmts.is_empty() {
+            body
+        } else {
+            Expr::Block(Block { stmts, tail: Some(Box::new(body)) })
+        };
+        Ok((body, ty))
+    }
+
     fn lookup(scope: &Scope, name: &str) -> Option<(i32, Type, bool, bool)> {
         scope
             .iter()
@@ -646,6 +1143,30 @@ impl Sema {
     fn init_restore(scope: &mut Scope, snap: &[bool]) {
         for (b, &before) in scope.iter_mut().zip(snap) {
             b.init = before;
+        }
+    }
+
+    /// Snapshot the "already written" state of each binding, so a branch can be
+    /// checked from the same state its sibling saw.
+    fn assigned_snapshot(scope: &Scope) -> Vec<bool> {
+        scope.iter().map(|b| b.assigned).collect()
+    }
+
+    fn assigned_restore(scope: &mut Scope, snap: &[bool]) {
+        if scope.len() == snap.len() {
+            for (b, &s) in scope.iter_mut().zip(snap) {
+                b.assigned = s;
+            }
+        }
+    }
+
+    /// Merge two paths: a binding counts as written when *either* path wrote it,
+    /// since a later write only needs to know it *may* already have happened.
+    fn assigned_merge(scope: &mut Scope, a: &[bool], b: &[bool]) {
+        if scope.len() == a.len() && scope.len() == b.len() {
+            for (i, binding) in scope.iter_mut().enumerate() {
+                binding.assigned = a[i] || b[i];
+            }
         }
     }
 
@@ -837,12 +1358,26 @@ impl Sema {
                         }
                         Expr::BoolTest { scrutinee, value } => {
                             // `desugar_match` only tests a `Var` (the temporary
-                            // it bound the scrutinee to, or a bool variable);
-                            // anything else cannot be proven the same across
-                            // arms.
-                            let name = match scrutinee.as_ref() {
-                                Expr::Var { name, .. } => name.as_str(),
-                                _ => return false,
+                            // it bound the scrutinee to, or a bool variable), so
+                            // two arms can be proven to test the same value.
+                            // Anything else cannot, so the chain is not total.
+                            // A scalar pattern through a reference
+                            // (`match &b { true => .., false => .. }`) reads the
+                            // referent, so the same `Var` appears under one
+                            // `Deref` in every arm; accept that too, and look
+                            // through a `PatScrutinee` marker should one still be
+                            // present.
+                            fn bool_scrutinee_var(e: &Expr) -> Option<&str> {
+                                match e {
+                                    Expr::Var { name, .. } => Some(name.as_str()),
+                                    Expr::Deref { expr, .. } => bool_scrutinee_var(expr),
+                                    Expr::PatScrutinee(inner) => bool_scrutinee_var(inner),
+                                    _ => None,
+                                }
+                            }
+                            let name = match bool_scrutinee_var(scrutinee.as_ref()) {
+                                Some(n) => n,
+                                None => return false,
                             };
                             match kind {
                                 Some(Kind::Bool(s)) if s == name => {}
@@ -888,14 +1423,86 @@ impl Sema {
     }
 
     fn check_block(&mut self, b: &mut Block, scope: &mut Scope) -> Result<Type, String> {
+        let label = self.loop_stack.last().and_then(|c| c.label.clone());
+        self.check_block_inner(b, scope, false, label.as_deref())
+    }
+
+    /// Check a block. When `loop_body` is set the block is a loop body, whose
+    /// normal completion loops back to the top (seed `true`) and whose
+    /// `continue`s target `label`; any other block falls through to the code
+    /// after its statement (`loop_cont`). Each statement's reach and
+    /// continuation come from the block's suffix walk, so a nested `if`/block
+    /// sees the continuation that really follows it. `loop_reach`/`loop_cont`
+    /// are restored on exit.
+    fn check_block_inner(
+        &mut self,
+        b: &mut Block,
+        scope: &mut Scope,
+        loop_body: bool,
+        label: Option<&str>,
+    ) -> Result<Type, String> {
         let mark = scope.len();
-        for st in &mut b.stmts {
-            self.check_stmt(st, scope)?;
+        let saved_reach = self.loop_reach.last().copied().unwrap_or(false);
+        let saved_cont = self.loop_cont.last().copied().unwrap_or(false);
+        let in_loop = !self.loop_reach.is_empty();
+        let seed = if loop_body { true } else { saved_cont };
+        let active = in_loop && (!loop_body || self.loop_repeats.last().copied().unwrap_or(false));
+        let suffixes = if active {
+            Some(block_repeat_suffixes(b, label, seed))
+        } else {
+            None
+        };
+        let n_stmts = b.stmts.len();
+        // A struct pattern's type check (`Expr::PatCheck`) is a marker statement
+        // the parser inserts before the pattern's bindings. `check_stmt` reduces
+        // it to `true`; drop it afterwards so it never reaches the passes or
+        // codegen. It must be checked in order, after the scrutinee's own
+        // `let`, so it cannot be filtered out before the loop.
+        let mut kept: Vec<Stmt> = Vec::with_capacity(b.stmts.len());
+        for (i, mut st) in std::mem::take(&mut b.stmts).into_iter().enumerate() {
+            let reach = match &suffixes {
+                Some(sfx) => sfx[i],
+                None => false,
+            };
+            let cont = match &suffixes {
+                Some(sfx) => sfx[i + 1],
+                None => saved_cont,
+            };
+            if let Some(l) = self.loop_reach.last_mut() {
+                *l = reach;
+            }
+            if let Some(l) = self.loop_cont.last_mut() {
+                *l = cont;
+            }
+            let is_pat_check = matches!(st, Stmt::Expr(Expr::PatCheck { .. }));
+            self.check_stmt(&mut st, scope)?;
+            if !is_pat_check {
+                kept.push(st);
+            }
         }
+        b.stmts = kept;
         let ty = match &mut b.tail {
-            Some(e) => self.check_expr(e, scope)?,
+            Some(e) => {
+                let reach = match &suffixes {
+                    Some(sfx) => sfx[n_stmts],
+                    None => false,
+                };
+                if let Some(l) = self.loop_reach.last_mut() {
+                    *l = reach;
+                }
+                if let Some(l) = self.loop_cont.last_mut() {
+                    *l = seed;
+                }
+                self.check_expr(e, scope)?
+            }
             None => Type::Unit,
         };
+        if let Some(l) = self.loop_reach.last_mut() {
+            *l = saved_reach;
+        }
+        if let Some(l) = self.loop_cont.last_mut() {
+            *l = saved_cont;
+        }
         scope.truncate(mark);
         // A block that cannot complete normally (a `return`/`break`/`continue`
         // statement, or a diverging tail) is `!`. That unifies with any expected
@@ -903,7 +1510,11 @@ impl Sema {
         // `let x: i64 = { return 7; };` are accepted, as in rustc. The tail is
         // still checked above, so its slots are assigned even though it is
         // unreachable.
-        if block_diverges(b) {
+        // Only a genuinely `!`-typed block bypasses a type check. A block whose
+        // tail is unreachable but has a concrete type (`{ return; 42 }`) is not
+        // `!`: rustc still reports that concrete type, so `if { return; 42 } {}`
+        // is a `bool` mismatch, not a valid `!` condition.
+        if ty == Type::Never || (b.tail.is_none() && block_diverges(b)) {
             Ok(Type::Never)
         } else {
             Ok(ty)
@@ -961,6 +1572,8 @@ impl Sema {
                     ty: final_ty,
                     mutable: *mutable,
                     init: initialized,
+                    param: false,
+                    assigned: init.is_some(),
                 });
                 // Track an `i64` local whose initializer is constant and that
                 // is never written or mutably borrowed anywhere in the function
@@ -971,7 +1584,17 @@ impl Sema {
                 // propagated — folding the first `x` here would wrongly reject
                 // the program.
                 let assigned = self.assign_count.get(name).copied().unwrap_or(0);
-                if init.is_some() && assigned == 0 && !self.mut_borrowed.contains(name) {
+                // A `\0im` name is a temp the built-in integer-method desugar
+                // introduced (`Sema::bind` / `force_temp`). They are never
+                // tracked, so the arithmetic a desugar builds over them cannot
+                // fold: `x.div_euclid(1)` synthesises `q - 1` on the
+                // `x == i64::MIN` path, and folding it would reject a program
+                // rustc accepts, because rustc never folds the stdlib body.
+                if !name.starts_with("\u{0}im")
+                    && init.is_some()
+                    && assigned == 0
+                    && !self.mut_borrowed.contains(name)
+                {
                     if let Some(e) = init.as_ref() {
                         if let Some(k) = self.const_of(e, &self.const_locals) {
                             self.const_locals.insert(s, k);
@@ -1021,6 +1644,15 @@ impl Sema {
                 if vty != tty && !ref_coerces(&vty, &tty) {
                     return Err(format!("assignment type mismatch: target is {tty:?}, value is {vty:?}"));
                 }
+                // Record the write so a later assignment to a non-`mut` binding
+                // is the `cannot assign twice` error. The root name is used for
+                // a field/index target (`a.f`, `a[i]`).
+                let root = Self::place_root_name(target);
+                if let Some(name) = root {
+                    if let Some(i) = Self::binding_index(scope, &name) {
+                        scope[i].assigned = true;
+                    }
+                }
                 Ok(())
             }
             Stmt::Expr(e) => {
@@ -1029,7 +1661,13 @@ impl Sema {
             }
             Stmt::While(cond, body, label) => {
                 let ct = self.check_expr(cond, scope)?;
-                if ct != Type::Bool {
+                if cond_has_unlabelled_exit(cond) {
+                    return Err(
+                        "`break` or `continue` with no label in the condition of a `while` loop"
+                            .into(),
+                    );
+                }
+                if ct != Type::Bool && ct != Type::Never {
                     return Err(format!("`while` condition must be `bool`, found {ct:?}"));
                 }
                 let init_before = Self::init_snapshot(scope);
@@ -1038,9 +1676,33 @@ impl Sema {
                     label: label.clone(),
                     kind: LoopKind::NoValue,
                 });
-                self.check_block(body, scope)?;
+                // The body may run again, so a non-`mut` binding that already
+                // existed before the loop cannot be written inside it.
+                self.loop_marks.push(scope.len());
+                self.loop_repeats.push(true);
+                self.loop_exits.push(Vec::new());
+                self.loop_reach.push(false);
+                self.loop_cont.push(false);
+                self.break_assigned.push(Self::assigned_snapshot(scope));
+                self.check_block_inner(body, scope, true, label.as_deref())?;
+                let breaks = self.break_assigned.pop().unwrap();
+                self.loop_exits.pop();
+                self.loop_cont.pop();
+                self.loop_reach.pop();
+                self.loop_repeats.pop();
+                self.loop_marks.pop();
                 self.loop_stack.pop();
+                for (i, b) in scope.iter_mut().enumerate() {
+                    if breaks.get(i).copied().unwrap_or(false) {
+                        b.assigned = true;
+                    }
+                }
                 self.loop_depth -= 1;
+                for (i, b) in scope.iter_mut().enumerate() {
+                    if breaks.get(i).copied().unwrap_or(false) {
+                        b.assigned = true;
+                    }
+                }
                 // The loop may run zero times, so nothing it initializes is
                 // guaranteed afterwards.
                 Self::init_restore(scope, &init_before);
@@ -1073,15 +1735,39 @@ impl Sema {
                     ty: Type::I64,
                     mutable: false,
                     init: true,
+                    param: false,
+                    assigned: true,
                 });
                 self.loop_depth += 1;
                 self.loop_stack.push(LoopCtx {
                     label: label.clone(),
                     kind: LoopKind::NoValue,
                 });
-                self.check_block(body, scope)?;
+                self.loop_marks.push(mark);
+                self.loop_repeats.push(true);
+                self.loop_exits.push(Vec::new());
+                self.loop_reach.push(false);
+                self.loop_cont.push(false);
+                self.break_assigned.push(Self::assigned_snapshot(scope));
+                self.check_block_inner(body, scope, true, label.as_deref())?;
+                let breaks = self.break_assigned.pop().unwrap();
+                self.loop_exits.pop();
+                self.loop_cont.pop();
+                self.loop_reach.pop();
+                self.loop_repeats.pop();
+                self.loop_marks.pop();
                 self.loop_stack.pop();
+                for (i, b) in scope.iter_mut().enumerate() {
+                    if breaks.get(i).copied().unwrap_or(false) {
+                        b.assigned = true;
+                    }
+                }
                 self.loop_depth -= 1;
+                for (i, b) in scope.iter_mut().enumerate() {
+                    if breaks.get(i).copied().unwrap_or(false) {
+                        b.assigned = true;
+                    }
+                }
                 scope.truncate(mark);
                 Self::init_restore(scope, &init_before);
                 Ok(())
@@ -1169,6 +1855,25 @@ impl Sema {
                         }
                     }
                 }
+                // Record the initialization state this exit leaves behind, so
+                // the target loop can require every exit to initialize a binding
+                // before treating it as initialized after the loop.
+                let snap = Self::init_snapshot(scope);
+                self.loop_exits[idx].push(snap);
+                // The branch's writes are seen by the code after the loop, so
+                // merge this state into the target loop's break-exit state
+                // before the branch's local state is discarded.
+                let cur = Self::assigned_snapshot(scope);
+                if let Some(acc) = self.break_assigned.get_mut(idx) {
+                    // Only the bindings present at loop entry matter after the
+                    // loop; a break path may have declared extra locals, and
+                    // those must not stop its writes to the entry bindings
+                    // from counting.
+                    let n = acc.len().min(cur.len());
+                    for (a, b) in acc.iter_mut().zip(cur.iter()).take(n) {
+                        *a |= *b;
+                    }
+                }
                 Ok(())
             }
             Stmt::Continue(label) => {
@@ -1180,6 +1885,12 @@ impl Sema {
                         "use of undeclared label `'{}`",
                         label.as_deref().unwrap_or("")
                     ));
+                }
+                // The back edge is taken: from here control reaches the loop's
+                // top again, so a binding declared before the loop is written
+                // once per iteration even if the rest of the body would exit.
+                if let Some(last) = self.loop_reach.last_mut() {
+                    *last = true;
                 }
                 Ok(())
             }
@@ -1214,18 +1925,54 @@ impl Sema {
     ) -> Result<(), String> {
         match e {
             Expr::Var { name, .. } => {
-                let (_, ty, mutable, init) = Self::lookup(scope, name)
+                let idx = Self::binding_index(scope, name)
                     .ok_or_else(|| format!("unknown variable `{name}`"))?;
-                if mutable || matches!(ty, Type::Ref(_, true)) || (allow_uninit && !init) {
-                    Ok(())
-                } else {
-                    Err(format!(
+                let b = &scope[idx];
+                // Reassigning the binding itself needs `mut`; writing *through*
+                // a reference is decided by the field/index/deref arm, so a
+                // `&mut T` binding need not itself be `mut` for `r.x = ..`.
+                if b.mutable {
+                    return Ok(());
+                }
+                // A mutable borrow (`&mut place`, `allow_uninit == false`) needs
+                // the binding itself to be `mut`.
+                if !allow_uninit {
+                    return Err(format!(
                         "cannot assign to immutable variable `{name}` (add `mut`)"
-                    ))
+                    ));
+                }
+                // A plain `let` may be written exactly once: its initialiser, or
+                // its first assignment. A write inside a repeating loop to a
+                // binding declared before that loop runs once per iteration, so
+                // it is a second write even on the first pass. A `loop` that
+                // runs at most once is exempt (its flag is `false`).
+                if b.assigned
+                    || self
+                        .loop_marks
+                        .iter()
+                        .zip(self.loop_reach.iter())
+                        .any(|(&m, &reach)| reach && idx < m)
+                {
+                    return Err(if b.param {
+                        format!("cannot assign to immutable argument `{name}` (add `mut`)")
+                    } else {
+                        format!("cannot assign twice to immutable variable `{name}` (add `mut`)")
+                    });
+                }
+                Ok(())
+            }
+            Expr::Field { base, .. } | Expr::Index(base, _) => {
+                // A write into a component goes through the base's address when
+                // the base is a reference, so the referent's mutability decides;
+                // a shared `&T` cannot be written through at all.
+                match self.check_expr(base, scope)? {
+                    Type::Ref(_, true) => Ok(()),
+                    Type::Ref(_, false) => {
+                        Err("cannot assign through a shared reference; use `&mut`".to_string())
+                    }
+                    _ => self.place_writable(base, scope, allow_uninit),
                 }
             }
-            Expr::Field { base, .. } => self.place_writable(base, scope, allow_uninit),
-            Expr::Index(base, _) => self.place_writable(base, scope, allow_uninit),
             Expr::Deref { expr, .. } => match self.check_expr(expr, scope)? {
                 Type::Ref(_, true) => Ok(()),
                 Type::Ref(_, false) => {
@@ -1242,7 +1989,7 @@ impl Sema {
     /// rmc's two intentional extensions. Both extensions are documented: the
     /// raw pointer cast `i64 as &T` (rustc would require `as *const T` first;
     /// the heap benchmark builds a linked list with it) and `i64 as bool`
-    /// (rustc requires `!= 0`; `boolops.rms` uses it). Everything else rmc
+    /// (rustc requires `!= 0`; `boolops.rs` uses it). Everything else rmc
     /// accepts here is valid Rust, so no accidental reinterpretation slips
     /// through — in particular a reference may only become a reference to the
     /// same referent, and may never gain mutability or become a scalar.
@@ -1260,7 +2007,11 @@ impl Sema {
                 Ok(())
             }
             // A reference cannot become a scalar: `&T as i64` would expose the
-            // address as an integer, which rustc forbids (E0606).
+            // address as an integer, which rustc forbids (E0606). rmc maps both
+            // `*mut T` and `&mut T` to `Ref(_, true)`, and rustc *does* allow
+            // `*mut T as i64`, so the mutable form is accepted (the raw-pointer
+            // extension). A shared reference stays rejected, matching E0606.
+            (Type::Ref(_, true), Type::I64) => Ok(()),
             (Type::Ref(..), _) => {
                 Err(format!("cannot cast a reference `{from:?}` to `{to:?}`"))
             }
@@ -1272,6 +2023,18 @@ impl Sema {
             }
             // A string literal is not castable in rmc.
             (Type::Str, _) | (_, Type::Str) => {
+                Err(format!("cannot cast `{from:?}` to `{to:?}`"))
+            }
+            // rustc allows only `u8 as char`; rmc has no `u8` type (a suffixed
+            // literal is an `i64`), so it rejects every integer-to-`char` cast
+            // rather than accept one rustc would reject.
+            (Type::I64, Type::Char) => {
+                Err("cannot cast `i64` to `char` (rustc allows only `u8 as char`)".into())
+            }
+            // `char` converts to an integer as its scalar value.
+            (Type::Char, Type::I64) => Ok(()),
+            // Any other `char` cast is not one rustc performs.
+            (Type::Char, _) | (_, Type::Char) => {
                 Err(format!("cannot cast `{from:?}` to `{to:?}`"))
             }
             // `i64`, `bool` and an enum tag convert among themselves.
@@ -1359,12 +2122,25 @@ impl Sema {
         mb: &mut std::collections::HashSet<String>,
     ) {
         match e {
-            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
+            Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
+            // A scalar-pattern scrutinee is rewritten by `check_expr`, which runs
+            // after this pre-pass, so recurse into it here to see any `&mut` it
+            // borrows (`match &mut x { 5 => .. }`).
+            Expr::PatScrutinee(x) => Self::collect_mut_borrows(x, a, mb),
+            // A struct pattern's type claim is rewritten by `check_expr`, which
+            // runs after this pre-pass, so recurse into its scrutinee here to see
+            // any `&mut` it borrows (`let S { .. } = &mut x;`).
+            Expr::PatCheck { base, .. } => Self::collect_mut_borrows(base, a, mb),
             Expr::Bin(_, x, y) => {
                 Self::collect_mut_borrows(x, a, mb);
                 Self::collect_mut_borrows(y, a, mb);
             }
             Expr::Un(_, x) => Self::collect_mut_borrows(x, a, mb),
+            Expr::TupleLit(xs) => {
+                for x in xs {
+                    Self::collect_mut_borrows(x, a, mb);
+                }
+            }
             Expr::Call { args, .. } => {
                 for x in args {
                     Self::collect_mut_borrows(x, a, mb);
@@ -1423,6 +2199,30 @@ impl Sema {
         }
     }
 
+    /// Bind `e` to a fresh `\0im<n>` temporary, forcing it even when it is a
+    /// literal or a plain variable. The euclidean desugars use this for their
+    /// receiver: a literal or a const-tracked variable would otherwise let a
+    /// synthesised op fold and trip the overflow lint — `x.div_euclid(y)` with
+    /// `x == i64::MIN` and `y == -1` folds `x / y`, and `7.rem_euclid(MIN)`
+    /// folds `7 - MIN` on the dead negative-remainder arm; rustc accepts both
+    /// because it never folds the stdlib body. A NUL-named temp is not
+    /// const-tracked, so the op stays unfolded. The divisor is deliberately not
+    /// forced: keeping it a literal preserves the strength reduction of `x % d`
+    /// (`gen_div_const`), which a temp divisor would lose.
+    fn force_temp(&mut self, e: Expr, stmts: &mut Vec<Stmt>) -> Expr {
+        let name = format!("\u{0}im{}", self.tmp);
+        self.tmp += 1;
+        let var = Expr::Var { name: name.clone(), slot: -1, ty: Type::I64 };
+        stmts.push(Stmt::Let {
+            name,
+            ty: Some(Type::I64),
+            init: Some(e),
+            slot: -1,
+            mutable: false,
+        });
+        var
+    }
+
     /// The constant value of an expression: a literal (with `const_i64`'s
     /// arithmetic folding), a constant local read, or an operator applied to
     /// two constants. `snap` is the current `const_locals`, passed so this can
@@ -1431,6 +2231,9 @@ impl Sema {
     fn const_of(&self, e: &Expr, snap: &HashMap<i32, i64>) -> Option<i64> {
         const_i64(e).or_else(|| match e {
             Expr::Var { slot, ty, .. } if *ty == Type::I64 && *slot >= 0 => snap.get(slot).copied(),
+            // An identity cast (`i as usize`) is transparent, so a constant
+            // local used as an index is still recognised.
+            Expr::Cast(inner, ty) if *ty == Type::I64 => self.const_of(inner, snap),
             Expr::Bin(op, a, b) => {
                 let x = self.const_of(a, snap)?;
                 let y = self.const_of(b, snap)?;
@@ -1479,7 +2282,53 @@ impl Sema {
     /// at different addresses. `lt(a, b)` is emitted once for `a < b` and
     /// `b < a`, and `Eq`/`Ne`/`Le`/`Ge` are built from them, so the comparison
     /// matches Rust's byte-wise `str` ordering.
-    fn str_cmp(op: BinOp, a: &Expr, b: &Expr) -> Expr {
+    /// True for a `str` operand whose evaluation reads no memory that a later
+    /// operand could write and runs no call, so it can be duplicated by
+    /// `str_cmp_body` without repeating a side effect or reordering one.
+    fn str_operand_is_pure(e: &Expr) -> bool {
+        match e {
+            Expr::Str(_) | Expr::Var { .. } => true,
+            Expr::Field { base, .. } => Self::str_operand_is_pure(base),
+            _ => false,
+        }
+    }
+
+    /// Rewrite a `str` comparison, binding both operands to fresh `str` locals
+    /// in source order first when either can have an effect. `str_cmp_body`
+    /// duplicates an operand (once per `lt` direction), and `Gt`/`Le` pass the
+    /// right operand first; both would repeat or reorder a side effect, so an
+    /// effectful operand is evaluated once, left to right, into a local.
+    fn str_cmp(&mut self, op: BinOp, a: &Expr, b: &Expr) -> Expr {
+        if Self::str_operand_is_pure(a) && Self::str_operand_is_pure(b) {
+            return Self::str_cmp_body(op, a, b);
+        }
+        let sa = self.alloc_slot();
+        let sb = self.alloc_slot();
+        let an = "\u{0}sca".to_string();
+        let bn = "\u{0}scb".to_string();
+        let va = Expr::Var { name: an.clone(), slot: sa, ty: Type::Str };
+        let vb = Expr::Var { name: bn.clone(), slot: sb, ty: Type::Str };
+        let body = Self::str_cmp_body(op, &va, &vb);
+        let stmts = vec![
+            Stmt::Let {
+                name: an,
+                ty: Some(Type::Str),
+                init: Some(a.clone()),
+                slot: sa,
+                mutable: false,
+            },
+            Stmt::Let {
+                name: bn,
+                ty: Some(Type::Str),
+                init: Some(b.clone()),
+                slot: sb,
+                mutable: false,
+            },
+        ];
+        Expr::Block(Block { stmts, tail: Some(Box::new(body)) })
+    }
+
+    fn str_cmp_body(op: BinOp, a: &Expr, b: &Expr) -> Expr {
         let lt = |x: &Expr, y: &Expr| Expr::Call {
             name: "__rmc_str_lt".into(),
             args: vec![x.clone(), y.clone()],
@@ -1504,6 +2353,7 @@ impl Sema {
         match e {
             Expr::Int(_) => Ok(Type::I64),
             Expr::Bool(_) => Ok(Type::Bool),
+            Expr::Char(_) => Ok(Type::Char),
             // A string literal has its own type, so it cannot be added to an
             // integer or passed where an `i64` is expected.
             Expr::Str(_) => Ok(Type::Str),
@@ -1532,7 +2382,11 @@ impl Sema {
                         // operand folds to a constant, so rmc does too; the
                         // `i64::MIN` literal itself is parsed as `Int(i64::MIN)`,
                         // not a negation, so only a written `-` reaches here.
-                        if self.const_of(inner, &self.const_locals) == Some(i64::MIN) {
+                        // The negation inside a built-in `abs` is exempt: it is
+                        // not a written `-`, and rustc accepts it.
+                        if !self.in_builtin_neg
+                            && self.const_of(inner, &self.const_locals) == Some(i64::MIN)
+                        {
                             return Err("this arithmetic operation overflows".into());
                         }
                         Ok(Type::I64)
@@ -1553,24 +2407,28 @@ impl Sema {
                 // helper, not by pointer. Rewrite the whole node and re-check
                 // it, so the emitted code is an ordinary `bool` expression.
                 if matches!(op, Eq | Ne | Lt | Le | Gt | Ge)
-                    && (ta == Type::Str || tb == Type::Str)
+                    && (is_string_ty(&ta) || is_string_ty(&tb))
                 {
-                    if ta != tb {
+                    if !(is_string_ty(&ta) && is_string_ty(&tb)) {
                         return Err(format!(
                             "comparison between different types: {ta:?} and {tb:?}"
                         ));
                     }
-                    let rewritten = Self::str_cmp(*op, a, b);
+                    let rewritten = self.str_cmp(*op, a, b);
                     *e = rewritten;
                     return self.check_expr(e, scope);
                 }
                 match op {
-                    Add | Sub | Mul | Div | Mod => {
+                    Add | Sub | Mul | Div | Mod | WrappingMul => {
                         if ta != Type::I64 || tb != Type::I64 {
                             return Err(format!("arithmetic expects `i64` operands, found {ta:?} and {tb:?}"));
                         }
-                        if let (Some(x), Some(y)) = (self.const_of(a, &self.const_locals), self.const_of(b, &self.const_locals)) {
-                            const_binop(*op, x, y)?;
+                        // `wrapping_mul` never traps, so a constant product that
+                        // overflows is folded as a wrap rather than rejected.
+                        if *op != WrappingMul {
+                            if let (Some(x), Some(y)) = (self.const_of(a, &self.const_locals), self.const_of(b, &self.const_locals)) {
+                                const_binop(*op, x, y)?;
+                            }
                         }
                         Ok(Type::I64)
                     }
@@ -1588,6 +2446,12 @@ impl Sema {
                         Ok(Type::Bool)
                     }
                     Lt | Le | Gt | Ge => {
+                        // `char` orders by its scalar value, so two `char`s
+                        // compare; anything else must be `i64`, matching rustc,
+                        // which does not order a `char` against an integer.
+                        if ta == Type::Char && tb == Type::Char {
+                            return Ok(Type::Bool);
+                        }
                         if ta != Type::I64 || tb != Type::I64 {
                             return Err(format!("ordering comparison expects `i64`, found {ta:?} and {tb:?}"));
                         }
@@ -1623,11 +2487,53 @@ impl Sema {
                 }
             }
             Expr::Call { name, args, arg_slots, ret_slot, ret_ty } => {
-                let sig = self
-                    .sigs
-                    .get(name)
-                    .cloned()
-                    .ok_or_else(|| format!("call to unknown function `{name}`"))?;
+                // `__rmc_print` is the placeholder a `print!`/`println!` `{}`
+                // emits. The type of the value is known only here, so pick the
+                // runtime helper that matches it and rewrite the call.
+                if name == "__rmc_print" {
+                    if args.len() != 1 {
+                        return Err("internal: `__rmc_print` takes one argument".into());
+                    }
+                    let t = self.check_expr(&mut args[0], scope)?;
+                    let helper = if t == Type::I64 {
+                        "__rmc_write_i64"
+                    } else if t == Type::Bool {
+                        "__rmc_write_bool"
+                    } else if t == Type::Char {
+                        "__rmc_write_char"
+                    } else if t == Type::Str
+                        || matches!(&t, Type::Ref(i, _) if **i == Type::Str)
+                    {
+                        "__rmc_write_str"
+                    } else {
+                        return Err(format!(
+                            "`{{}}` cannot print a value of type {t:?} (only `i64`, `bool`, `char` and `str`)"
+                        ));
+                    };
+                    *name = helper.to_string();
+                    arg_slots.clear();
+                    arg_slots.push((-1, 0));
+                    *ret_ty = Type::Unit;
+                    *ret_slot = -1;
+                    return Ok(Type::Unit);
+                }
+                let sig = self.sigs.get(name).cloned().ok_or_else(|| {
+                    // A `\0`-prefixed name is a parser marker that only lowers
+                    // inside the `let` shape it belongs to; reaching here means
+                    // it was used elsewhere (e.g. `Vec::with_capacity` outside a
+                    // `let`). Report the source construct, not the marker.
+                    if let Some(rest) = name.strip_prefix('\u{0}') {
+                        let what = match rest {
+                            "vecnew" => "`Vec::with_capacity` / `Vec::new`",
+                            "vecrepeat" | "veclist" => "`vec![..]`",
+                            "argsvec" => "`std::env::args()...collect()`",
+                            "ptr" => "`as_mut_ptr` / `as_ptr`",
+                            _ => "this construct",
+                        };
+                        return format!("{what} is only supported directly in a `let` initializer");
+                    }
+                    format!("call to unknown function `{name}`")
+                })?;
                 if args.len() != sig.params.len() {
                     return Err(format!(
                         "function `{name}` expects {} argument(s), got {}",
@@ -1638,7 +2544,10 @@ impl Sema {
                 arg_slots.clear();
                 for (a, p) in args.iter_mut().zip(sig.params.iter()) {
                     let t = self.check_expr(a, scope)?;
-                    if &t != p && !ref_coerces(&t, p) {
+                    // `!` unifies with any parameter type: an argument that never
+                    // materialises (a block ending in `break`/`return`/`continue`)
+                    // coerces, exactly as rustc allows.
+                    if &t != p && t != Type::Never && !ref_coerces(&t, p) {
                         return Err(format!("function `{name}`: argument type mismatch, expected {p:?}, found {t:?}"));
                     }
                     // An aggregate argument is passed by pointer, so give it a
@@ -1670,7 +2579,7 @@ impl Sema {
                 self.match_chain = false;
                 self.match_total = false;
                 let ct = self.check_expr(cond, scope)?;
-                if ct != Type::Bool {
+                if ct != Type::Bool && ct != Type::Never {
                     return Err(format!("`if` condition must be `bool`, found {ct:?}"));
                 }
                 let total = if is_root {
@@ -1682,8 +2591,10 @@ impl Sema {
                 // is initialized afterwards only if it was before, or on both
                 // paths. `init_before` is the state on entry to the branch.
                 let init_before = Self::init_snapshot(scope);
+                let assigned_before = Self::assigned_snapshot(scope);
                 let tt = self.check_block(then, scope)?;
                 let then_init = Self::init_snapshot(scope);
+                let then_assigned = Self::assigned_snapshot(scope);
                 match els {
                     Some(e) => {
                         // Only a total chain's `else` continues the chain: an
@@ -1696,6 +2607,7 @@ impl Sema {
                         // Restore the entry state before the else, so the else
                         // sees the same scope the then saw.
                         Self::init_restore(scope, &init_before);
+                        Self::assigned_restore(scope, &assigned_before);
                         let et = self.check_block(e, scope)?;
                         self.match_chain = false;
                         self.match_total = false;
@@ -1739,6 +2651,19 @@ impl Sema {
                                 (true, true) => false,
                             };
                         }
+                        // A binding counts as written if a branch that can
+                        // reach the next statement wrote it. A diverging branch
+                        // never falls through, so its write must not count.
+                        let else_assigned = Self::assigned_snapshot(scope);
+                        match (then_div, else_div) {
+                            (false, false) => {
+                                Self::assigned_merge(scope, &then_assigned, &else_assigned)
+                            }
+                            (true, false) => Self::assigned_restore(scope, &else_assigned),
+                            (false, true) => Self::assigned_restore(scope, &then_assigned),
+                            // Both branches diverge: nothing after is reachable.
+                            (true, true) => {}
+                        }
                         Ok(ty)
                     }
                     None => {
@@ -1759,6 +2684,13 @@ impl Sema {
                         // what lets an all-`return` exhaustive match stand as a
                         // `!` tail.
                         Self::init_restore(scope, &init_before);
+                        // An arm that cannot fall through must not contribute:
+                        // its write is unreachable from the next statement.
+                        if block_diverges(then) && !total {
+                            Self::assigned_restore(scope, &assigned_before);
+                        } else {
+                            Self::assigned_merge(scope, &then_assigned, &assigned_before);
+                        }
                         Ok(if tt == Type::Never {
                             if total {
                                 Type::Never
@@ -1773,21 +2705,43 @@ impl Sema {
             }
             Expr::Loop(body, slot, lty, label) => {
                 // A `loop` in value position yields the type of its `break`s.
-                // Track definite initialization only from a `break`: the body
-                // runs at least once, but the value flows out through the
-                // `break`, so nothing the body initializes is guaranteed after
-                // the loop unless a `break` guarantees it too. Keep it simple and
-                // restore the entry state, exactly as for `while`/`for`.
+                // A `loop` runs its body at least once, so a binding it
+                // initializes is initialized afterwards only if it was before,
+                // or every `break` that leaves the loop initializes it.
                 let init_before = Self::init_snapshot(scope);
                 self.loop_depth += 1;
                 self.loop_stack.push(LoopCtx {
                     label: label.clone(),
                     kind: LoopKind::Valued { ty: Type::Unit, seen: false },
                 });
-                let body_ty = self.check_block(body, scope)?;
+                self.loop_marks.push(scope.len());
+                self.loop_repeats.push(block_reaches_top(body, label.as_deref()));
+                self.loop_exits.push(Vec::new());
+                self.loop_reach.push(false);
+                self.loop_cont.push(false);
+                self.break_assigned.push(Self::assigned_snapshot(scope));
+                let body_ty = self.check_block_inner(body, scope, true, label.as_deref())?;
+                let breaks = self.break_assigned.pop().unwrap();
+                let exits = self.loop_exits.pop().unwrap();
+                self.loop_cont.pop();
+                self.loop_reach.pop();
+                self.loop_repeats.pop();
+                self.loop_marks.pop();
                 let ctx = self.loop_stack.pop().unwrap();
                 self.loop_depth -= 1;
-                Self::init_restore(scope, &init_before);
+                // When no `break` can leave the loop it diverges, so nothing
+                // after is reachable and the state does not matter.
+                if block_has_break(body) {
+                    for (i, b) in scope.iter_mut().enumerate() {
+                        b.init = init_before.get(i).copied().unwrap_or(false)
+                            || exits.iter().all(|e| e.get(i).copied().unwrap_or(false));
+                    }
+                }
+                for (i, b) in scope.iter_mut().enumerate() {
+                    if breaks.get(i).copied().unwrap_or(false) {
+                        b.assigned = true;
+                    }
+                }
                 // The body's value is discarded: only `break value` reaches the
                 // loop's result. A body that can complete must therefore be
                 // `()`, unless it is unreachable (a `!`-typed body, e.g. a
@@ -1904,22 +2858,10 @@ impl Sema {
                     other => Err(format!("cannot index a value of type {other:?}")),
                 }
             }
-            Expr::Field { base, name, offset, ty, pat_struct } => {
+            Expr::Field { base, name, offset, ty } => {
                 let bt = deref_ty(self.check_expr(base, scope)?);
                 match bt {
                     Type::Struct(sname, _) => {
-                        // A field read produced by a destructuring pattern names
-                        // the struct it was written against. The scrutinee must
-                        // be that struct, or rustc's "mismatched types" (E0308)
-                        // is missed: `let P { x } = q` where `q: Q` reads `Q`'s
-                        // `x` at `P`'s offset and silently binds the wrong field.
-                        if let Some(want) = pat_struct {
-                            if *want != sname {
-                                return Err(format!(
-                                    "mismatched types: expected `{want}`, found `{sname}` in a struct pattern"
-                                ));
-                            }
-                        }
                         let info = self.structs.get(&sname).cloned().unwrap();
                         match info.fields.iter().find(|(f, _, _)| f == name) {
                             Some((_, fty, off)) => {
@@ -1932,6 +2874,33 @@ impl Sema {
                     }
                     other => Err(format!("field access on a value of type {other:?}")),
                 }
+            }
+            Expr::TupleLit(elems) => {
+                // Type each element in order, then lower the tuple to the
+                // anonymous struct that lays them out (element `k` is field
+                // `"k"`). The struct is chosen by the element-type keys, exactly
+                // as the parser chose it for a tuple *type*, so a literal and an
+                // annotated type with the same elements are the same struct.
+                let mut tys = Vec::with_capacity(elems.len());
+                for e in elems.iter_mut() {
+                    tys.push(self.check_expr(e, scope)?);
+                }
+                let (name, info) = self.tuple_struct_for(&tys);
+                // A frame buffer so the literal has an address in any context,
+                // exactly like a struct literal.
+                let fields: Vec<FieldInit> = elems
+                    .drain(..)
+                    .enumerate()
+                    .map(|(k, v)| FieldInit {
+                        name: k.to_string(),
+                        offset: info.fields[k].2 as i32,
+                        ty: info.fields[k].1.clone(),
+                        value: v,
+                    })
+                    .collect();
+                let slot = self.alloc_slots((info.size / 8) as i32);
+                *e = Expr::StructLit { name: name.clone(), fields, slot };
+                Ok(Type::Struct(name, info.size))
             }
             Expr::StructLit { name, fields, slot } => {
                 let info = self
@@ -1962,7 +2931,7 @@ impl Sema {
                     seen[idx] = true;
                     let want = info.fields[idx].1.clone();
                     let got = self.check_expr(&mut fi.value, scope)?;
-                    if got != want {
+                    if got != want && !ref_coerces(&got, &want) {
                         return Err(format!(
                             "struct `{name}` field `{}`: expected {want:?}, found {got:?}",
                             fi.name
@@ -2070,6 +3039,11 @@ impl Sema {
             Expr::MethodCall { recv, name, args } => {
                 // Resolve the receiver's type, then look the method up as the
                 // mangled free function `Type$method` the parser produced.
+                // The receiver is checked again when the rewritten call is
+                // re-checked, so snapshot its assignment flags and restore them
+                // before that second check: the receiver's writes then count
+                // exactly once, not twice.
+                let assigned_before = Self::assigned_snapshot(scope);
                 let rt = self.check_expr(recv, scope)?;
                 // Reading a method off a reference auto-derefs, so `r.m()`
                 // resolves against the referent's type.
@@ -2126,6 +3100,63 @@ impl Sema {
                         _ => {}
                     }
                 }
+                // Built-in integer methods on an `i64` receiver. They desugar
+                // to expressions over the operators rmc already lowers, so
+                // codegen is untouched, and they mirror `rustc -O` exactly:
+                // `abs` of `i64::MIN` is `i64::MIN` (no trap), `signum` of zero
+                // is zero, `is_positive`/`is_negative` of zero are both false,
+                // and `div_euclid`/`rem_euclid` round toward the mathematical
+                // quotient (a zero divisor and `i64::MIN / -1` panic, because
+                // they reuse `/` and `%`). A method of the same name on a struct
+                // or enum still reaches the user-method path below, because this
+                // only fires when the receiver's type is `i64`.
+                if matches!(base_ty, Type::I64)
+                    && matches!(
+                        name.as_str(),
+                        "abs"
+                            | "min"
+                            | "max"
+                            | "signum"
+                            | "is_positive"
+                            | "is_negative"
+                            | "div_euclid"
+                            | "rem_euclid"
+                            | "clamp"
+                            | "count_ones"
+                            | "leading_zeros"
+                            | "trailing_zeros"
+                            | "swap_bytes"
+                            | "reverse_bits"
+                            | "leading_ones"
+                            | "trailing_ones"
+                            | "count_zeros"
+                            | "rotate_left"
+                            | "rotate_right"
+                            | "midpoint"
+                            | "wrapping_mul"
+                    )
+                {
+                    // `abs` synthesises `-x`, a compiler-generated negation, so
+                    // the neg-overflow lint must not fire on it during the
+                    // re-check below (see the field).
+                    let synthesises_neg = name == "abs";
+                    let recv = std::mem::replace(recv.as_mut(), Expr::Int(0));
+                    // A `&i64` receiver auto-derefs to its referent.
+                    let recv = if via_ref {
+                        Expr::Deref { expr: Box::new(recv), ty: Type::I64 }
+                    } else {
+                        recv
+                    };
+                    let (rewritten, ret) = self.desugar_i64_method(name, recv, args)?;
+                    *e = rewritten;
+                    let saved = self.in_builtin_neg;
+                    self.in_builtin_neg = synthesises_neg;
+                    let r = self.check_expr(e, scope);
+                    self.in_builtin_neg = saved;
+                    // The desugared expression's own type is the method's
+                    // result type (`bool` for the `is_*` predicates).
+                    return r.map(|_| ret);
+                }
                 // A method lives on a struct or an enum; both give the mangled
                 // prefix `Type$method`.
                 let tyname = match &base_ty {
@@ -2142,10 +3173,7 @@ impl Sema {
                     None => return Err(format!("no method `{name}` on `{tyname}`")),
                 };
                 // Rewrite into a call with the receiver as the first argument.
-                // The receiver was checked above; the call is checked once more
-                // as a whole, which re-checks the receiver — harmless, since a
-                // value expression has no side effects on the frame other than
-                // bumping `next_slot` for a temporary aggregate.
+                Self::assigned_restore(scope, &assigned_before);
                 let recv = std::mem::replace(recv.as_mut(), Expr::Int(0));
                 // Match the receiver's form to the method's. A `&self` method
                 // takes an address, so a large receiver is not copied; `self`
@@ -2292,7 +3320,7 @@ impl Sema {
                 for (i, arg) in args.iter_mut().enumerate() {
                     let got = self.check_expr(arg, scope)?;
                     let (want, off) = fields[i].clone();
-                    if got != want {
+                    if got != want && !ref_coerces(&got, &want) {
                         return Err(format!(
                             "variant `{enum_name}::{variant}` field {i}: expected {want:?}, found {got:?}"
                         ));
@@ -2423,32 +3451,105 @@ impl Sema {
                 // aggregate. An lvalue is addressed directly; anything else has
                 // no address of its own, so it is checked as a value and given a
                 // hidden frame slot to be materialised into.
-                let t = if is_lvalue(expr) {
+                //
+                // The operand is lifted out first so the whole node can be
+                // rewritten in place below: rmc represents `str` and `&str`
+                // identically, as the address of the `{len, bytes}` record, so
+                // `&s` on a string is the string itself and must fold to `s`.
+                // Leaving an `&` in place would emit a pointer *to* the record
+                // pointer, which the string writer reads as a length and uses to
+                // expose adjacent memory.
+                let mut operand = std::mem::replace(expr.as_mut(), Expr::Int(0));
+                let t = if is_lvalue(&operand) {
                     // `&mut place` needs a mutable place; rustc rejects
                     // `&mut x` on an immutable binding (E0596). A non-lvalue
                     // operand is materialised into a temporary, which is a
                     // fresh mutable slot, so it is always borrowable.
                     if *mutable {
-                        self.place_writable(expr, scope, false)?;
+                        self.place_writable(&mut operand, scope, false)?;
                     }
-                    self.check_lvalue(expr, scope)?
+                    self.check_lvalue(&mut operand, scope)?
                 } else {
-                    let t = self.check_expr(expr, scope)?;
+                    let t = self.check_expr(&mut operand, scope)?;
                     *slot = self.alloc_slots((t.size() / 8).max(1) as i32);
                     t
                 };
+                let mutability = *mutable;
+                if t == Type::Str {
+                    *e = operand;
+                    return Ok(Type::Ref(Box::new(Type::Str), mutability));
+                }
                 *ty = t.clone();
-                Ok(Type::Ref(Box::new(t), *mutable))
+                *e = Expr::AddrOf { expr: Box::new(operand), ty: t.clone(), mutable: mutability, slot: *slot };
+                Ok(Type::Ref(Box::new(t), mutability))
             }
             Expr::Deref { expr, ty } => {
-                let it = self.check_expr(expr, scope)?;
+                // `&str` and `str` share one representation (the record
+                // address), so `*r` on a `&str` is the string itself; a load
+                // would read the record's length word as if it were a pointer.
+                // The operand is lifted out so the node can be rewritten in
+                // place. A `str` operand is not a reference, so `*s` on one is
+                // still rejected below, exactly as rustc rejects E0614.
+                let mut operand = std::mem::replace(expr.as_mut(), Expr::Int(0));
+                let it = self.check_expr(&mut operand, scope)?;
+                if matches!(&it, Type::Ref(i, _) if **i == Type::Str) {
+                    *e = operand;
+                    return Ok(Type::Str);
+                }
                 match it {
                     Type::Ref(inner, _) => {
                         *ty = (*inner).clone();
-                        Ok(*inner)
+                        let inner = *inner;
+                        *e = Expr::Deref { expr: Box::new(operand), ty: inner.clone() };
+                        Ok(inner)
                     }
                     other => Err(format!("cannot dereference a value of type {other:?}")),
                 }
+            }
+            // The scrutinee of a scalar pattern. Match ergonomics deref a
+            // reference scrutinee (`match &x { 5 => .. }` reads the `i64` under
+            // the `&i64`), while a scalar scrutinee is left alone. The parser
+            // marks the node; here the type is known, so rewrite it in place.
+            // `std::mem::replace` moves the inner expression out rather than
+            // re-checking it, so a side-effecting scrutinee is type-checked (and
+            // its slots allocated) exactly once.
+            Expr::PatScrutinee(inner) => {
+                let t = self.check_expr(inner, scope)?;
+                let r = std::mem::replace(inner.as_mut(), Expr::Int(0));
+                match t {
+                    Type::Ref(referent, _) => {
+                        let referent = *referent;
+                        *e = Expr::Deref { expr: Box::new(r), ty: referent.clone() };
+                        Ok(referent)
+                    }
+                    other => {
+                        *e = r;
+                        Ok(other)
+                    }
+                }
+            }
+            Expr::PatCheck { base, pat_struct } => {
+                // A struct pattern names the struct it destructures; the field
+                // reads are then ordinary field accesses, which would happily
+                // find a same-named field of a *different* struct. Check the
+                // claim here and reduce the node to `true` so the passes and
+                // codegen see only a plain boolean.
+                let t = deref_ty(self.check_expr(base, scope)?);
+                match t {
+                    Type::Struct(name, _) if name == *pat_struct => {}
+                    Type::Struct(name, _) => {
+                        return Err(format!(
+                            "mismatched types: pattern `{pat_struct} {{ .. }}` cannot match a value of type `{name}`"
+                        ))
+                    }
+                    other => {
+                        return Err(format!(
+                            "struct pattern `{pat_struct} {{ .. }}` on a value of type {other:?}"
+                        ))
+                    }
+                }
+                *e = Expr::Bool(true);
+                Ok(Type::Bool)
             }
             Expr::Cast(inner, to) => {
                 let it = self.check_expr(inner, scope)?;
@@ -2477,12 +3578,28 @@ impl Sema {
     }
 }
 
+/// True for `str` and for a reference to `str` (`&str`). rmc represents both as
+/// the address of the `{len, bytes}` record, so they are interchangeable.
+fn is_string_ty(t: &Type) -> bool {
+    *t == Type::Str || matches!(t, Type::Ref(i, _) if **i == Type::Str)
+}
+
 /// True when a value of type `found` may be used where `expected` is wanted.
-/// The only coercion rmc performs is `&mut T` to `&T`: both are one pointer, and
-/// Rust allows it, so a `&mut` receiver can be read by a `&self` method.
+/// The coercions rmc performs are `&mut T` to `&T` (both one pointer, and Rust
+/// allows it, so a `&mut` receiver can be read by a `&self` method) and between
+/// `str` and `&str`, which rmc represents identically as the address of the
+/// `{len, bytes}` record.
 fn ref_coerces(found: &Type, expected: &Type) -> bool {
     match (found, expected) {
         (Type::Ref(f, true), Type::Ref(e, false)) => f == e,
+        (Type::Str, Type::Ref(e, false)) => **e == Type::Str,
+        (Type::Ref(e, false), Type::Str) => **e == Type::Str,
+        // An integer and a reference (raw pointer) coerce both ways. rmc has no
+        // borrow checking and treats a pointer as one address, so `0`/`i64 as
+        // *const T` (a null pointer) and a pointer's address as an integer are
+        // both accepted, matching the `i64 as &T` cast extension. A shared
+        // reference never coerces to a `&mut`/`*mut` one, matching E0596.
+        (Type::I64, Type::Ref(..)) | (Type::Ref(..), Type::I64) => true,
         _ => false,
     }
 }
@@ -2572,9 +3689,35 @@ fn expr_has_break(e: &Expr) -> bool {
         // A nested `loop`/`while`/`for` captures its own `break`s, so the walk
         // does not descend into it.
         Expr::Loop(..) => false,
-        Expr::If(_, t, els) => {
-            block_has_break(t) || els.as_ref().map_or(false, |b| block_has_break(b))
+        // The condition is evaluated, so a `break` there can leave the loop the
+        // expression belongs to; the walk must inspect it too, along with every
+        // other evaluated child.
+        Expr::If(c, t, els) => {
+            expr_has_break(c)
+                || block_has_break(t)
+                || els.as_ref().map_or(false, |b| block_has_break(b))
         }
+        Expr::Bin(_, a, b) => expr_has_break(a) || expr_has_break(b),
+        Expr::Un(_, a) => expr_has_break(a),
+        Expr::Index(a, b) => expr_has_break(a) || expr_has_break(b),
+        Expr::Field { base, .. } => expr_has_break(base),
+        Expr::Cast(a, _) => expr_has_break(a),
+        Expr::AddrOf { expr, .. } => expr_has_break(expr),
+        Expr::Deref { expr, .. } => expr_has_break(expr),
+        Expr::BoolTest { scrutinee, .. } => expr_has_break(scrutinee),
+        Expr::Call { args, .. } => args.iter().any(expr_has_break),
+        Expr::StructLit { fields, .. } => fields.iter().any(|f| expr_has_break(&f.value)),
+        Expr::ArrayLit(v, _) => expr_has_break(v),
+        Expr::ArrayList(xs) => xs.iter().any(expr_has_break),
+        Expr::TupleLit(xs) => xs.iter().any(expr_has_break),
+        Expr::MethodCall { recv, args, .. } => {
+            expr_has_break(recv) || args.iter().any(expr_has_break)
+        }
+        Expr::EnumCtor { args, .. } => args.iter().any(expr_has_break),
+        Expr::VariantTest { scrutinee, .. } => expr_has_break(scrutinee),
+        Expr::EnumPayload { recv, .. } => expr_has_break(recv),
+        Expr::PatScrutinee(inner) => expr_has_break(inner),
+        Expr::PatCheck { base, .. } => expr_has_break(base),
         _ => false,
     }
 }
@@ -2593,6 +3736,317 @@ fn expr_diverges(e: &Expr) -> bool {
         // Both arms must diverge for the `if` to diverge.
         Expr::If(_, t, els) => {
             block_diverges(t) && els.as_ref().map_or(false, |b| block_diverges(b))
+        }
+        _ => false,
+    }
+}
+/// True when a `loop` body can reach its own top again, so a write to a binding
+/// declared before the loop repeats and rustc rejects it. That happens when some
+/// path completes the body normally (which loops back) or hits a `continue` for
+/// this loop. A body whose every path `break`s or `return`s runs at most once.
+fn block_reaches_top(b: &Block, label: Option<&str>) -> bool {
+    block_reaches_top_from(b, label, true)
+}
+
+/// `reach[i]` is true when some path from statement `i` onward (then the tail,
+/// then the continuation `after`) can reach the loop's top.
+fn block_repeat_suffixes(b: &Block, label: Option<&str>, after: bool) -> Vec<bool> {
+    let n = b.stmts.len();
+    let mut out = vec![false; n + 1];
+    let mut reach = match &b.tail {
+        Some(t) => expr_reaches_top(t, label, after),
+        None => after,
+    };
+    out[n] = reach;
+    for i in (0..n).rev() {
+        reach = stmt_reaches_top(&b.stmts[i], label)
+            || (stmt_can_fall(&b.stmts[i]) && reach);
+        out[i] = reach;
+    }
+    out
+}
+
+/// True when some path from the start of `b` reaches the loop's top, given the
+/// reach state `after` that holds once the block completes.
+fn block_reaches_top_from(b: &Block, label: Option<&str>, after: bool) -> bool {
+    let mut reach = match &b.tail {
+        Some(t) => expr_reaches_top(t, label, after),
+        None => after,
+    };
+    for i in (0..b.stmts.len()).rev() {
+        reach = stmt_reaches_top(&b.stmts[i], label)
+            || (stmt_can_fall(&b.stmts[i]) && reach);
+    }
+    reach
+}
+
+/// True when evaluating `e` can reach the loop's top: it contains a `continue`
+/// for this loop, or it can complete normally and `after` reaches the top.
+fn expr_reaches_top(e: &Expr, label: Option<&str>, after: bool) -> bool {
+    expr_contains_continue(e, label, false) || (expr_can_fall(e) && after)
+}
+
+/// True when `e` can complete normally (produce a value) on some path.
+fn expr_can_fall(e: &Expr) -> bool {
+    match e {
+        Expr::Block(b) => block_can_fall(b),
+        Expr::MatchBoundary(b, _) => block_can_fall(b),
+        // A `loop` completes only through a `break`; one with no reachable
+        // break never falls through, so code after it is unreachable.
+        Expr::Loop(body, _, _, _) => block_has_break(body),
+        Expr::If(cond, t, els) => {
+            expr_can_fall(cond)
+                && (block_can_fall(t) || els.as_ref().map_or(true, |e| block_can_fall(e)))
+        }
+        Expr::Bin(op, a, b) => {
+            use BinOp::*;
+            match op {
+                And | Or => expr_can_fall(a),
+                _ => expr_can_fall(a) && expr_can_fall(b),
+            }
+        }
+        Expr::Un(_, a) => expr_can_fall(a),
+        Expr::Index(a, b) => expr_can_fall(a) && expr_can_fall(b),
+        Expr::Field { base, .. } => expr_can_fall(base),
+        Expr::Cast(a, _) => expr_can_fall(a),
+        Expr::Call { args, .. } => args.iter().all(expr_can_fall),
+        Expr::StructLit { fields, .. } => fields.iter().all(|f| expr_can_fall(&f.value)),
+        Expr::ArrayLit(v, _) => expr_can_fall(v),
+        Expr::ArrayList(xs) => xs.iter().all(expr_can_fall),
+        Expr::TupleLit(xs) => xs.iter().all(expr_can_fall),
+        Expr::MethodCall { recv, args, .. } => expr_can_fall(recv) && args.iter().all(expr_can_fall),
+        Expr::EnumCtor { args, .. } => args.iter().all(expr_can_fall),
+        Expr::VariantTest { scrutinee, .. } => expr_can_fall(scrutinee),
+        Expr::EnumPayload { recv, .. } => expr_can_fall(recv),
+        Expr::PatScrutinee(inner) => expr_can_fall(inner),
+        Expr::PatCheck { base, .. } => expr_can_fall(base),
+        _ => true,
+    }
+}
+
+/// True when every path through `b` reaches the end of the block.
+fn block_can_fall(b: &Block) -> bool {
+    for s in &b.stmts {
+        if !stmt_can_fall(s) {
+            return false;
+        }
+    }
+    b.tail.as_deref().map_or(true, expr_can_fall)
+}
+
+/// True when control from `s` can reach the statement after it.
+fn stmt_can_fall(s: &Stmt) -> bool {
+    match s {
+        Stmt::Return(_) => false,
+        Stmt::Break(..) | Stmt::Continue(_) => false,
+        Stmt::Expr(e) => expr_can_fall(e),
+        Stmt::Let { init: Some(e), .. } => expr_can_fall(e),
+        Stmt::Assign { value, .. } => expr_can_fall(value),
+        // A `while` completes normally only when its condition does (a false
+        // condition, or a `break`). A condition that cannot complete never
+        // yields a value, so the loop never exits and cannot fall through. The
+        // same holds for a `for` whose range bounds cannot complete.
+        Stmt::While(cond, _, _) => expr_can_fall(cond),
+        Stmt::For { start, end, .. } => expr_can_fall(start) && expr_can_fall(end),
+        _ => true,
+    }
+}
+
+/// True when `e` contains an unlabelled `break`/`continue` that would target a
+/// loop enclosing the `while` whose condition is `e`. rustc forbids these
+/// (E0590): the condition runs before the body, so such a branch can never be
+/// reached from the loop. A nested loop captures its own unlabelled exits.
+fn cond_has_unlabelled_exit(e: &Expr) -> bool {
+    match e {
+        Expr::Block(b) => block_has_unlabelled_exit(b),
+        Expr::If(c, t, els) => {
+            cond_has_unlabelled_exit(c)
+                || block_has_unlabelled_exit(t)
+                || els.as_ref().map_or(false, |b| block_has_unlabelled_exit(b))
+        }
+        Expr::Bin(_, a, b) => cond_has_unlabelled_exit(a) || cond_has_unlabelled_exit(b),
+        Expr::Un(_, a) => cond_has_unlabelled_exit(a),
+        Expr::Index(a, b) => cond_has_unlabelled_exit(a) || cond_has_unlabelled_exit(b),
+        Expr::Field { base, .. } => cond_has_unlabelled_exit(base),
+        Expr::Cast(a, _) => cond_has_unlabelled_exit(a),
+        Expr::Call { args, .. } => args.iter().any(cond_has_unlabelled_exit),
+        Expr::StructLit { fields, .. } => fields.iter().any(|f| cond_has_unlabelled_exit(&f.value)),
+        Expr::ArrayLit(v, _) => cond_has_unlabelled_exit(v),
+        Expr::ArrayList(xs) => xs.iter().any(cond_has_unlabelled_exit),
+        Expr::MethodCall { recv, args, .. } => {
+            cond_has_unlabelled_exit(recv) || args.iter().any(cond_has_unlabelled_exit)
+        }
+        Expr::EnumCtor { args, .. } => args.iter().any(cond_has_unlabelled_exit),
+        Expr::VariantTest { scrutinee, .. } => cond_has_unlabelled_exit(scrutinee),
+        Expr::EnumPayload { recv, .. } => cond_has_unlabelled_exit(recv),
+        Expr::MatchBoundary(b, _) => block_has_unlabelled_exit(b),
+        Expr::AddrOf { expr, .. } => cond_has_unlabelled_exit(expr),
+        Expr::Deref { expr, .. } => cond_has_unlabelled_exit(expr),
+        Expr::BoolTest { scrutinee, .. } => cond_has_unlabelled_exit(scrutinee),
+        Expr::TupleLit(xs) => xs.iter().any(cond_has_unlabelled_exit),
+        Expr::PatScrutinee(inner) => cond_has_unlabelled_exit(inner),
+        Expr::PatCheck { base, .. } => cond_has_unlabelled_exit(base),
+        // A nested `loop` captures its own unlabelled exits.
+        Expr::Loop(..) => false,
+        _ => false,
+    }
+}
+
+fn block_has_unlabelled_exit(b: &Block) -> bool {
+    b.stmts.iter().any(stmt_has_unlabelled_exit)
+        || b.tail.as_deref().map_or(false, cond_has_unlabelled_exit)
+}
+
+fn stmt_has_unlabelled_exit(s: &Stmt) -> bool {
+    match s {
+        Stmt::Break(_, None) | Stmt::Continue(None) => true,
+        // A `while`/`for` body captures its own unlabelled exits, but a `for`'s
+        // range bounds are evaluated before the loop starts, so an unlabelled
+        // exit there targets the enclosing loop.
+        Stmt::While(..) => false,
+        Stmt::For { start, end, .. } => {
+            cond_has_unlabelled_exit(start) || cond_has_unlabelled_exit(end)
+        }
+        Stmt::Expr(e) => cond_has_unlabelled_exit(e),
+        Stmt::Return(Some(e)) => cond_has_unlabelled_exit(e),
+        Stmt::Let { init: Some(e), .. } => cond_has_unlabelled_exit(e),
+        // The target's index/deref is evaluated, so a `break` there is an exit
+        // from the enclosing `while`.
+        Stmt::Assign { target, value } => {
+            cond_has_unlabelled_exit(value) || cond_has_unlabelled_exit(target)
+        }
+        _ => false,
+    }
+}
+
+/// True when `s` can reach the loop's top directly: it contains a `continue` for
+/// this loop, or a `return` whose value continues back to the top.
+fn stmt_reaches_top(s: &Stmt, label: Option<&str>) -> bool {
+    match s {
+        Stmt::Continue(cl) => cl.is_none() || cl.as_deref() == label,
+        Stmt::Return(Some(e)) => expr_contains_continue(e, label, false),
+        Stmt::Expr(e) => expr_contains_continue(e, label, false),
+        Stmt::Let { init: Some(e), .. } => expr_contains_continue(e, label, false),
+        Stmt::Assign { target, value } => {
+            expr_contains_continue(value, label, false)
+                || expr_contains_continue(target, label, false)
+        }
+        // A nested loop runs its condition (and a `for` its bounds) before its
+        // body, and its body can hold a labelled `continue` for our loop, so all
+        // three can reach our top. `stmt_contains_continue` applies the nesting
+        // rule that keeps unlabelled continues with the nested loop.
+        Stmt::While(..) | Stmt::For { .. } => stmt_contains_continue(s, label, false),
+        _ => false,
+    }
+}
+
+/// True when `b` contains a `continue` that targets the loop labelled `label`
+/// (or the innermost loop when `label` is `None`). A block that merely falls
+/// through its end does not count here: only the loop body's own end loops back.
+/// `break`/`return` end the path first, so a statement after them cannot
+/// contribute.
+fn block_contains_continue(b: &Block, label: Option<&str>, nested: bool) -> bool {
+    for s in &b.stmts {
+        if stmt_contains_continue(s, label, nested) {
+            return true;
+        }
+        if stmt_diverges(s) {
+            return false;
+        }
+    }
+    b.tail
+        .as_deref()
+        .map_or(false, |t| expr_contains_continue(t, label, nested))
+}
+
+fn stmt_contains_continue(s: &Stmt, label: Option<&str>, nested: bool) -> bool {
+    match s {
+        // An unlabelled `continue` targets the innermost loop. At the target
+        // loop's own body level (`nested` false) that is this loop; inside a
+        // deeper loop it is not, so it does not count.
+        Stmt::Continue(cl) => match cl {
+            Some(l) => Some(l.as_str()) == label,
+            None => !nested,
+        },
+        // A nested `while`/`for` captures its own unlabelled `continue`s, but a
+        // labelled one inside it can still target an enclosing loop. Descend
+        // unless the nested loop is itself the target (its `continue`s then
+        // target a loop between us and it, never our top). A nested `while`'s
+        // *condition* and a `for`'s *range bounds* run before the loop's body,
+        // so a labelled `continue` there still targets our loop; check them even
+        // though the nested body is excluded.
+        Stmt::While(cond, body, lbl) => {
+            let outward = lbl.as_deref() != label;
+            // The condition runs before the body, so a condition that cannot
+            // complete makes the body unreachable: a `continue` in the body can
+            // never run and must not count. A `continue` in the condition itself
+            // still counts — it runs before the body does.
+            (outward && expr_contains_continue(cond, label, nested))
+                || (outward
+                    && expr_can_fall(cond)
+                    && block_contains_continue(body, label, true))
+        }
+        Stmt::For { start, end, body, label: lbl, .. } => {
+            let outward = lbl.as_deref() != label;
+            // The range bounds run before the loop, so a bound that cannot
+            // complete makes the body unreachable.
+            (outward
+                && (expr_contains_continue(start, label, nested)
+                    || expr_contains_continue(end, label, nested)))
+                || (outward
+                    && expr_can_fall(start)
+                    && expr_can_fall(end)
+                    && block_contains_continue(body, label, true))
+        }
+        Stmt::Break(..) => false,
+        Stmt::Expr(e) => expr_contains_continue(e, label, nested),
+        // A `return` evaluates its value before leaving the function, and that
+        // value can `continue` back to the loop instead.
+        Stmt::Return(Some(e)) => expr_contains_continue(e, label, nested),
+        Stmt::Let { init: Some(e), .. } => expr_contains_continue(e, label, nested),
+        Stmt::Assign { value, .. } => expr_contains_continue(value, label, nested),
+        _ => false,
+    }
+}
+
+fn expr_contains_continue(e: &Expr, label: Option<&str>, nested: bool) -> bool {
+    match e {
+        Expr::Block(b) => block_contains_continue(b, label, nested),
+        Expr::MatchBoundary(b, _) => block_contains_continue(b, label, nested),
+        Expr::If(c, t, els) => {
+            expr_contains_continue(c, label, nested)
+                || block_contains_continue(t, label, nested)
+                || els.as_ref().map_or(false, |b| block_contains_continue(b, label, nested))
+        }
+        Expr::Bin(_, a, b) => {
+            expr_contains_continue(a, label, nested) || expr_contains_continue(b, label, nested)
+        }
+        Expr::Un(_, a) => expr_contains_continue(a, label, nested),
+        Expr::Index(a, b) => {
+            expr_contains_continue(a, label, nested) || expr_contains_continue(b, label, nested)
+        }
+        Expr::Field { base, .. } => expr_contains_continue(base, label, nested),
+        Expr::Cast(a, _) => expr_contains_continue(a, label, nested),
+        Expr::Call { args, .. } => args.iter().any(|a| expr_contains_continue(a, label, nested)),
+        Expr::StructLit { fields, .. } => {
+            fields.iter().any(|f| expr_contains_continue(&f.value, label, nested))
+        }
+        Expr::ArrayLit(v, _) => expr_contains_continue(v, label, nested),
+        Expr::ArrayList(xs) => xs.iter().any(|a| expr_contains_continue(a, label, nested)),
+        Expr::TupleLit(xs) => xs.iter().any(|a| expr_contains_continue(a, label, nested)),
+        Expr::MethodCall { recv, args, .. } => {
+            expr_contains_continue(recv, label, nested)
+                || args.iter().any(|a| expr_contains_continue(a, label, nested))
+        }
+        Expr::EnumCtor { args, .. } => args.iter().any(|a| expr_contains_continue(a, label, nested)),
+        Expr::VariantTest { scrutinee, .. } => expr_contains_continue(scrutinee, label, nested),
+        Expr::EnumPayload { recv, .. } => expr_contains_continue(recv, label, nested),
+        Expr::PatScrutinee(inner) => expr_contains_continue(inner, label, nested),
+        Expr::PatCheck { base, .. } => expr_contains_continue(base, label, nested),
+        // A nested `loop` captures its own unlabelled `continue`s, but a
+        // labelled one can still target an enclosing loop.
+        Expr::Loop(body, _, _, lbl) => {
+            lbl.as_deref() != label && block_contains_continue(body, label, true)
         }
         _ => false,
     }

@@ -116,7 +116,7 @@ def median(xs):
 def measure_compile(name, kind, reps=5):
     if kind == "rmc":
         out = os.path.join(OUT, f"{name}.rmc.bin")
-        argv = [RMC, os.path.join(ROOT, "programs", f"{name}.rms"), "-o", out]
+        argv = [RMC, os.path.join(ROOT, "rust", f"{name}.rs"), "-o", out]
     else:
         out = os.path.join(OUT, f"{name}.rustc.bin")
         argv = ["rustc", "-O", "-C", "opt-level=3", "-C", "lto=fat",
@@ -274,8 +274,12 @@ def write_markdown(path, rows, note):
     lines.append("Run time is not uniformly in rmc's favour, and a ratio below 1 is")
     lines.append("possible. On loop-heavy integer code rmc is competitive: it wins on")
     lines.append("`forloops` because the rotated `for` compares the counter against the")
-    lines.append("bound directly, and on `refs` because LICM reassociates the")
-    lines.append("loop-invariant part of the accumulation into one hoisted value. On call-heavy code")
+    lines.append("bound directly. `refs` is the counterexample: its loop reads a fixed")
+    lines.append("struct through `&self` accessors, and LICM will not hoist a read through")
+    lines.append("a reference (it can fault on a loop that never runs), so the whole")
+    lines.append("accessor sum is recomputed every iteration and rmc loses to rustc by")
+    lines.append("roughly 8x. A frame-based loop of the same shape is hoisted and wins.")
+    lines.append("On call-heavy code")
     lines.append("(`callrec`) rmc now keeps up because the self-recursion pass folds the")
     lines.append("right spine into a loop, leaving one call per level - the same")
     lines.append("transform rustc applies. A register-only function also drops the frame")
