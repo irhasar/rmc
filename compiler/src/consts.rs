@@ -98,6 +98,16 @@ pub fn eval_i64(e: &Expr, ints: &HashMap<String, i64>) -> Option<i64> {
             let y = eval_i64(b, ints)?;
             const_binop_checked(*op, x, y)
         }
+        // `wrapping_mul` is `*` without the overflow trap, so rustc folds it in
+        // a `const` item (unlike `*`, which is rejected there). The parser sees
+        // the method-call form — the `WrappingMul` operator only appears after
+        // sema lowers the method — so the fold is needed here too, or a
+        // `const K: i64 = a.wrapping_mul(b)` is rejected as non-constant.
+        Expr::MethodCall { recv, name, args } if name == "wrapping_mul" && args.len() == 1 => {
+            let x = eval_i64(recv, ints)?;
+            let y = eval_i64(&args[0], ints)?;
+            Some(x.wrapping_mul(y))
+        }
         _ => None,
     }
 }
