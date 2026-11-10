@@ -4009,26 +4009,38 @@ impl<'a> FnGen<'a> {
     /// then, as rustc's `drop_in_place` does, the destructor of every droppable
     /// field. A type without an impl has only the fields to drop.
     fn gen_drop_glue(&mut self, place: &Place, ty: &Ty) -> Result<(), String> {
+        // An enum's payload is variant-dependent, so it cannot be walked by
+        // field index. Hand it to the address-based helper, which runs the
+        // enum's own `Drop` impl (if any) and then dispatches on the tag. This
+        // must happen *before* the own-impl call below, or the impl would run
+        // twice (once here, once inside the helper).
+        if let Ty::Struct(name) = ty {
+            if self.enums.contains_key(name) {
+                // The enum's own `Drop` impl runs first, then the active
+                // variant's fields. Both make calls, and the address helper
+                // clobbers `%rdi`, so preserve the promoted caller-saved locals
+                // across the whole sequence: the spill must precede `mov %rax,
+                // %rdi`, which would otherwise destroy a promoted `%rdi`.
+                self.place_addr(place)?;
+                let saved = self.spill_caller_saved();
+                self.emit("  mov %rax, %rdi");
+                self.gen_drop_glue_at_reg(ty)?;
+                self.restore_caller_saved(&saved);
+                return Ok(());
+            }
+        }
         if let Some(sym) = self.drop_symbol_for_ty(ty) {
             self.place_addr(place)?;
-            self.emit("  mov %rax, %rdi");
-            // The impl is an ordinary function call: it clobbers the
-            // caller-saved registers, so a promoted local living in one must be
-            // spilled and reloaded around it, exactly as `gen_call` does.
+            // Spill *before* the `%rdi` move: it clobbers a promoted `%rdi`, so
+            // saving afterwards would store the clobbered value. `%rax` (the
+            // address) is not a promoted register, so the spill leaves it live.
             let saved = self.spill_caller_saved();
+            self.emit("  mov %rax, %rdi");
             self.emit(&format!("  call {}", asm_sym(&sym)));
             self.restore_caller_saved(&saved);
         }
         match ty {
             Ty::Struct(name) => {
-                if self.enums.contains_key(name) {
-                    // An enum's payload is variant-dependent, so it cannot be
-                    // walked by field index: dispatch on the runtime tag.
-                    self.place_addr(place)?;
-                    self.emit("  mov %rax, %rdi");
-                    self.gen_drop_glue_at_reg(ty)?;
-                    return Ok(());
-                }
                 let fields = self.structs.get(name).cloned().unwrap_or_default();
                 for (i, fty) in fields.iter().enumerate() {
                     if !self.ty_needs_drop(fty) {
