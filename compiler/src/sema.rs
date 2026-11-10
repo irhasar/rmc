@@ -2867,9 +2867,12 @@ fn block_has_break(b: &Block) -> bool {
 fn stmt_has_break(s: &Stmt) -> bool {
     match s {
         Stmt::Break(..) => true,
-        // A `while`/`for` body's `break`s belong to that loop, not the
-        // enclosing one, so the walk does not descend into it.
-        Stmt::While(..) | Stmt::For { .. } => false,
+        // A nested loop's `break`s belong to that loop, not the enclosing one,
+        // so the walk skips its body. Its condition (and a `for`'s range bounds)
+        // run in the enclosing context, though, so a labelled `break` there
+        // still leaves the enclosing loop and must be seen.
+        Stmt::While(cond, _body, _lbl) => expr_has_break(cond),
+        Stmt::For { start, end, .. } => expr_has_break(start) || expr_has_break(end),
         Stmt::Expr(e) => expr_has_break(e),
         Stmt::Let { init: Some(e), .. } => expr_has_break(e),
         Stmt::Assign { value, .. } => expr_has_break(value),
@@ -2920,8 +2923,14 @@ fn expr_diverges(e: &Expr) -> bool {
         // A desugared `match` diverges when every arm body diverges, so the
         // whole chain is `!` even though its last step is an `if` with no
         // `else` (which `Expr::If` alone would call non-diverging).
-        Expr::MatchBoundary(b, _) => {
-            Sema::match_chain_diverges(b) || block_diverges(b)
+        //
+        // `match_chain_diverges` reads a bare `if` as the next chain step, which
+        // is only sound for a chain with no catch-all: a `_`/binding arm ends
+        // the chain, so its body is not a step, and the body's inner expression
+        // may itself be a bare `if`. With a catch-all the structural walk
+        // (`block_diverges`) is already exact.
+        Expr::MatchBoundary(b, has_catch_all) => {
+            (!*has_catch_all && Sema::match_chain_diverges(b)) || block_diverges(b)
         }
         // A `loop` diverges when no `break` can leave it.
         Expr::Loop(body, _, _, _) => !block_has_break(body),

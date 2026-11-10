@@ -304,6 +304,32 @@ fn a_diverging_match_is_never_and_fits_any_return_type() {
 }
 
 #[test]
+fn a_catch_all_match_whose_body_can_fall_through_does_not_diverge() {
+    // The wildcard arm's body is an `if` without an `else`, so it can fall
+    // through to `()`. The match therefore does not diverge, and a binding the
+    // other branch initialises is not definitely initialised afterwards. The
+    // structural walk must not read the body's bare `if` as another chain step
+    // and mistake the match for `!` (rustc's E0381).
+    let err = compile_to_asm(
+        "fn f(c: bool) -> i64 { let x: i64; \
+         if c { match c { _ => if c { return 1; } } } else { x = 1; } return x; } \
+         fn main() {}",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("use of possibly-uninitialized variable `x`"), "got: {err}");
+    // The same shape with a diverging body is fine: the branch returns, so `x`
+    // is initialised by the `else` alone.
+    assert!(compile_to_asm(
+        "fn f(c: bool) -> i64 { let x: i64; \
+         if c { match c { _ => { return 1; } } } else { x = 1; } return x; } \
+         fn main() {}",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
 fn a_diverging_if_else_initializes_a_typed_let() {
     let src = "fn f(c: bool) -> i64 { let x: i64 = if c { return 1; } else { return 2; }; return x; } \
                fn main() -> i64 { return f(true); }";
@@ -2560,6 +2586,27 @@ fn a_loop_leaves_a_binding_initialized_only_on_every_exit() {
     assert!(compile_to_asm(
         "fn f(c: bool) -> i64 { let x: i64; loop { if c { x = 1; } else { x = 2; } break; } return x; } \
          fn main() -> i64 { return f(true); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_labelled_break_in_a_nested_condition_repeats_the_outer_loop() {
+    // A labelled `break` in a nested `while` condition runs in the enclosing
+    // loop's context, so it can leave the outer `loop` and the body then
+    // repeats. A write to a binding declared before the outer loop is therefore
+    // a second write on the next iteration, as rustc's E0384.
+    let err = compile_to_asm(
+        "fn main() { let x: i64; 'o: loop { x = 1; \
+         while 'inner: loop { while { break 'inner true; true } {} } { continue 'o; } } }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("cannot assign twice to immutable"), "got: {err}");
+    // Without a repeated write the same shape is fine.
+    assert!(compile_to_asm(
+        "fn main() { 'o: loop { while { break 'o; true } {} } }",
         &CompileOptions::default(),
     )
     .is_ok());
