@@ -3668,6 +3668,35 @@ fn a_loop_leaves_a_binding_initialized_only_on_every_exit() {
 }
 
 #[test]
+fn a_labelled_break_in_a_nested_condition_repeats_the_outer_loop() {
+    // A labelled `break` in a nested `while` condition (or a `for` range bound)
+    // runs in the enclosing loop's context, so it can leave the outer `loop`
+    // and the body then repeats. A write to a binding declared before the outer
+    // loop is therefore a second write on the next iteration, as rustc's E0384.
+    let err = compile_to_asm(
+        "fn main() { let x: i64; 'o: loop { x = 1; \
+         while 'inner: loop { while { break 'inner true; true } {} } { continue 'o; } } }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("cannot assign twice to immutable"), "got: {err}");
+    // A `break` in a `for` range bound leaves the loop before the body runs, so
+    // the write happens once and rustc accepts it.
+    assert!(compile_to_asm(
+        "fn main() { let x: i64; 'o: loop { x = 1; \
+         while { for i in { break 'o; 0 }..1 {} true } {} } }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+    // Without a repeated write the same shape is fine.
+    assert!(compile_to_asm(
+        "fn main() { 'o: loop { while { break 'o; true } {} } }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
 fn an_immutable_parameter_cannot_be_assigned() {
     let err = compile_to_asm(
         "fn f(x: i64) -> i64 { x = 2; return x; } fn main() -> i64 { return f(1); }",
