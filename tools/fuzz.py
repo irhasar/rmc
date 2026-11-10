@@ -1664,6 +1664,33 @@ def reject_corpus():
             "fn main() -> i64 { let x: i64 = 1; x += 1; return x; }\n",
             "fn main() { let x: i64 = 1; x += 1; println!(\"{}\", x); }\n",
         ),
+        # A write to an outer immutable binding inside a nested block of a
+        # repeating loop repeats, so rustc rejects it (E0384). The nested
+        # block's continuation to the loop's back edge must be threaded in.
+        "assign_immutable_nested_if_loop": (
+            "fn flag() -> bool { return true; }\n"
+            "fn main() -> i64 { let x: i64; while flag() { if flag() { x = 1; } } return 0; }\n",
+            "fn flag() -> bool { true }\n"
+            "fn main() { let x: i64; while flag() { if flag() { x = 1; } } let _ = x; }\n",
+        ),
+        "assign_immutable_nested_block_loop": (
+            "fn flag() -> bool { return true; }\n"
+            "fn main() -> i64 { let x: i64; while flag() { { x = 1; } } return 0; }\n",
+            "fn flag() -> bool { true }\n"
+            "fn main() { let x: i64; while flag() { { x = 1; } } let _ = x; }\n",
+        ),
+        "assign_immutable_for_nested": (
+            "fn main() -> i64 { let x: i64; for i in 0..3 { if i < 3 { x = 1; } } return 0; }\n",
+            "fn main() { let x: i64; for i in 0..3 { if i < 3 { x = 1; } } let _ = x; }\n",
+        ),
+        # A `break` path that declares a local still carries its write to the
+        # outer binding, so a later write is a second write (E0384).
+        "assign_immutable_break_with_local": (
+            "fn cond() -> bool { return true; }\n"
+            "fn main() -> i64 { let x: i64; while cond() { if cond() { x = 1; let y: i64 = 0; break; } } x = 2; return 0; }\n",
+            "fn cond() -> bool { true }\n"
+            "fn main() { let x: i64; while cond() { if cond() { x = 1; let y = 0; break; } } x = 2; let _ = x; }\n",
+        ),
         # A read of a binding that was declared but never initialized (E0381).
         "use_uninit_scalar": (
             "fn main() -> i64 { let x: i64; return x; }\n",

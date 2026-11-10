@@ -1180,10 +1180,12 @@ impl Sema {
                 self.loop_repeats.push(true);
                 self.loop_exits.push(Vec::new());
                 self.loop_reach.push(false);
+                self.loop_cont.push(false);
                 self.break_assigned.push(Self::assigned_snapshot(scope));
                 self.check_block_inner(body, scope, true, label.as_deref())?;
                 let breaks = self.break_assigned.pop().unwrap();
                 self.loop_exits.pop();
+                self.loop_cont.pop();
                 self.loop_reach.pop();
                 self.loop_repeats.pop();
                 self.loop_marks.pop();
@@ -1238,10 +1240,12 @@ impl Sema {
                 self.loop_repeats.push(true);
                 self.loop_exits.push(Vec::new());
                 self.loop_reach.push(false);
+                self.loop_cont.push(false);
                 self.break_assigned.push(Self::assigned_snapshot(scope));
                 self.check_block_inner(body, scope, true, label.as_deref())?;
                 let breaks = self.break_assigned.pop().unwrap();
                 self.loop_exits.pop();
+                self.loop_cont.pop();
                 self.loop_reach.pop();
                 self.loop_repeats.pop();
                 self.loop_marks.pop();
@@ -1349,10 +1353,13 @@ impl Sema {
                 // before the branch's local state is discarded.
                 let cur = Self::assigned_snapshot(scope);
                 if let Some(acc) = self.break_assigned.get_mut(idx) {
-                    if acc.len() == cur.len() {
-                        for (a, b) in acc.iter_mut().zip(cur.iter()) {
-                            *a |= *b;
-                        }
+                    // Only the bindings present at loop entry matter after the
+                    // loop; a break path may have declared extra locals, and
+                    // those must not stop its writes to the entry bindings
+                    // from counting.
+                    let n = acc.len().min(cur.len());
+                    for (a, b) in acc.iter_mut().zip(cur.iter()).take(n) {
+                        *a |= *b;
                     }
                 }
                 Ok(())
@@ -2090,10 +2097,12 @@ impl Sema {
                 self.loop_repeats.push(block_reaches_top(body, label.as_deref()));
                 self.loop_exits.push(Vec::new());
                 self.loop_reach.push(false);
+                self.loop_cont.push(false);
                 self.break_assigned.push(Self::assigned_snapshot(scope));
                 let body_ty = self.check_block_inner(body, scope, true, label.as_deref())?;
                 let breaks = self.break_assigned.pop().unwrap();
                 let exits = self.loop_exits.pop().unwrap();
+                self.loop_cont.pop();
                 self.loop_reach.pop();
                 self.loop_repeats.pop();
                 self.loop_marks.pop();
@@ -2935,6 +2944,9 @@ fn expr_can_fall(e: &Expr) -> bool {
     match e {
         Expr::Block(b) => block_can_fall(b),
         Expr::MatchBoundary(b, _) => block_can_fall(b),
+        // A `loop` completes only through a `break`; one with no reachable
+        // break never falls through, so code after it is unreachable.
+        Expr::Loop(body, _, _, _) => block_has_break(body),
         Expr::If(cond, t, els) => {
             expr_can_fall(cond)
                 && (block_can_fall(t) || els.as_ref().map_or(true, |e| block_can_fall(e)))
