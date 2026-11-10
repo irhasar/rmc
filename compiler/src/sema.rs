@@ -84,6 +84,20 @@ pub struct Sema {
     /// *every* exit leaves it initialized. `while`/`for` may run zero times, so
     /// their entry is recorded but the merge is not used.
     loop_exits: Vec<Vec<Vec<bool>>>,
+    /// Parallel to `loop_repeats`: at the current point, whether control can
+    /// still reach the top of that loop. Inside a `loop` body this is the
+    /// per-statement repeat flag. A `continue` in a branch restores it to `true`
+    /// while that branch is checked.
+    loop_reach: Vec<bool>,
+    /// Parallel to `loop_reach`: the reach of the code *after* the statement
+    /// currently being checked. A nested block (an `if` arm, a `{}` expression)
+    /// falls through to this point, so its own reach analysis is seeded with it
+    /// rather than with the statement's own reach.
+    loop_cont: Vec<bool>,
+    /// Per enclosing loop, the may-assigned state accumulated over every `break`
+    /// that leaves it, so a write on a break path counts as the first write for
+    /// a later statement.
+    break_assigned: Vec<Vec<bool>>,
     ret_ty: Type,
     /// While checking the `else` chain of a desugared `match`: whether the
     /// whole chain names every variant of one enum. Decided once at the chain's
@@ -237,6 +251,9 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         loop_marks: Vec::new(),
         loop_repeats: Vec::new(),
         loop_exits: Vec::new(),
+        loop_reach: Vec::new(),
+        loop_cont: Vec::new(),
+        break_assigned: Vec::new(),
         ret_ty: Type::Unit,
         match_total: false,
         match_chain: false,
@@ -768,31 +785,72 @@ impl Sema {
     }
 
     fn check_block(&mut self, b: &mut Block, scope: &mut Scope) -> Result<Type, String> {
+        self.check_block_inner(b, scope, false)
+    }
+
+    /// Check a block. When `loop_body` is set the block is a loop body, whose
+    /// normal completion loops back to the top (seed `true`); any other block
+    /// falls through to the code after its statement (`loop_cont`). Each
+    /// statement's reach and continuation come from the block's suffix walk, so
+    /// a nested `if`/block sees the continuation that really follows it.
+    /// `loop_reach`/`loop_cont` are restored on exit.
+    fn check_block_inner(
+        &mut self,
+        b: &mut Block,
+        scope: &mut Scope,
+        loop_body: bool,
+    ) -> Result<Type, String> {
         let mark = scope.len();
-        // If this block is a loop body, `loop_repeats` holds whether the whole
-        // body can reach the top. Refine it per statement so a write is judged
-        // from its own position: `x = 1; break;` is a single write even when
-        // another path in the body can `continue`.
-        let suffixes = if self.loop_repeats.last().copied().unwrap_or(false) {
-            Some(block_repeat_suffixes(b))
+        let saved_reach = self.loop_reach.last().copied().unwrap_or(false);
+        let saved_cont = self.loop_cont.last().copied().unwrap_or(false);
+        let in_loop = !self.loop_reach.is_empty();
+        let seed = if loop_body { true } else { saved_cont };
+        let active = in_loop && (!loop_body || self.loop_repeats.last().copied().unwrap_or(false));
+        let suffixes = if active {
+            Some(block_repeat_suffixes(b, seed))
         } else {
             None
         };
+        let n = b.stmts.len();
         for (i, st) in b.stmts.iter_mut().enumerate() {
-            if let Some(sfx) = &suffixes {
-                *self.loop_repeats.last_mut().unwrap() = sfx[i];
+            let reach = match &suffixes {
+                Some(sfx) => sfx[i],
+                None => false,
+            };
+            let cont = match &suffixes {
+                Some(sfx) => sfx[i + 1],
+                None => saved_cont,
+            };
+            if let Some(l) = self.loop_reach.last_mut() {
+                *l = reach;
+            }
+            if let Some(l) = self.loop_cont.last_mut() {
+                *l = cont;
             }
             self.check_stmt(st, scope)?;
         }
         let ty = match &mut b.tail {
             Some(e) => {
-                if let Some(sfx) = &suffixes {
-                    *self.loop_repeats.last_mut().unwrap() = sfx[b.stmts.len()];
+                let reach = match &suffixes {
+                    Some(sfx) => sfx[n],
+                    None => false,
+                };
+                if let Some(l) = self.loop_reach.last_mut() {
+                    *l = reach;
+                }
+                if let Some(l) = self.loop_cont.last_mut() {
+                    *l = seed;
                 }
                 self.check_expr(e, scope)?
             }
             None => Type::Unit,
         };
+        if let Some(l) = self.loop_reach.last_mut() {
+            *l = saved_reach;
+        }
+        if let Some(l) = self.loop_cont.last_mut() {
+            *l = saved_cont;
+        }
         scope.truncate(mark);
         Ok(ty)
     }
@@ -933,10 +991,19 @@ impl Sema {
                 self.loop_marks.push(scope.len());
                 self.loop_repeats.push(true);
                 self.loop_exits.push(Vec::new());
-                self.check_block(body, scope)?;
+                self.loop_reach.push(false);
+                self.break_assigned.push(Self::assigned_snapshot(scope));
+                self.check_block_inner(body, scope, true)?;
+                let breaks = self.break_assigned.pop().unwrap();
                 self.loop_exits.pop();
+                self.loop_reach.pop();
                 self.loop_repeats.pop();
                 self.loop_marks.pop();
+                for (i, b) in scope.iter_mut().enumerate() {
+                    if breaks.get(i).copied().unwrap_or(false) {
+                        b.assigned = true;
+                    }
+                }
                 self.loop_depth -= 1;
                 // The loop may run zero times, so nothing it initializes is
                 // guaranteed afterwards.
@@ -955,10 +1022,19 @@ impl Sema {
                 self.loop_marks.push(scope.len());
                 self.loop_repeats.push(block_reaches_top(body));
                 self.loop_exits.push(Vec::new());
-                self.check_block(body, scope)?;
+                self.loop_reach.push(false);
+                self.break_assigned.push(Self::assigned_snapshot(scope));
+                self.check_block_inner(body, scope, true)?;
+                let breaks = self.break_assigned.pop().unwrap();
                 let exits = self.loop_exits.pop().unwrap();
+                self.loop_reach.pop();
                 self.loop_repeats.pop();
                 self.loop_marks.pop();
+                for (i, b) in scope.iter_mut().enumerate() {
+                    if breaks.get(i).copied().unwrap_or(false) {
+                        b.assigned = true;
+                    }
+                }
                 self.loop_depth -= 1;
                 // The loop diverges when no `break` can leave it: nothing after
                 // is reachable, so the state does not matter.
@@ -1004,10 +1080,19 @@ impl Sema {
                 self.loop_marks.push(mark);
                 self.loop_repeats.push(true);
                 self.loop_exits.push(Vec::new());
-                self.check_block(body, scope)?;
+                self.loop_reach.push(false);
+                self.break_assigned.push(Self::assigned_snapshot(scope));
+                self.check_block_inner(body, scope, true)?;
+                let breaks = self.break_assigned.pop().unwrap();
                 self.loop_exits.pop();
+                self.loop_reach.pop();
                 self.loop_repeats.pop();
                 self.loop_marks.pop();
+                for (i, b) in scope.iter_mut().enumerate() {
+                    if breaks.get(i).copied().unwrap_or(false) {
+                        b.assigned = true;
+                    }
+                }
                 self.loop_depth -= 1;
                 scope.truncate(mark);
                 Self::init_restore(scope, &init_before);
@@ -1044,11 +1129,28 @@ impl Sema {
                 // treating it as initialized after the loop.
                 let snap = Self::init_snapshot(scope);
                 self.loop_exits.last_mut().unwrap().push(snap);
+                // The branch's writes are seen by the code after the loop, so
+                // merge this state into the loop's break-exit state before the
+                // branch's local state is discarded.
+                if let Some(acc) = self.break_assigned.last_mut() {
+                    let cur = Self::assigned_snapshot(scope);
+                    if acc.len() == cur.len() {
+                        for (a, b) in acc.iter_mut().zip(cur.iter()) {
+                            *a |= *b;
+                        }
+                    }
+                }
                 Ok(())
             }
             Stmt::Continue => {
                 if self.loop_depth == 0 {
                     return Err("`continue` outside of a loop".into());
+                }
+                // The back edge is taken: from here control reaches the loop's
+                // top again, so a binding declared before the loop is written
+                // once per iteration even if the rest of the body would exit.
+                if let Some(last) = self.loop_reach.last_mut() {
+                    *last = true;
                 }
                 Ok(())
             }
@@ -1095,8 +1197,8 @@ impl Sema {
                     || self
                         .loop_marks
                         .iter()
-                        .zip(self.loop_repeats.iter())
-                        .any(|(&m, &rep)| rep && idx < m)
+                        .zip(self.loop_reach.iter())
+                        .any(|(&m, &reach)| reach && idx < m)
                 {
                     return Err(if b.param {
                         format!("cannot assign to immutable argument `{name}` (add `mut`)")
@@ -1548,18 +1650,31 @@ impl Sema {
                         if tt != et {
                             return Err(format!("`if` branches have different types: {tt:?} and {et:?}"));
                         }
-                        // Keep only what both branches initialized.
+                        // Keep only what every path that reaches the code
+                        // after the `if` initialized. An arm that
+                        // returns/breaks/continues cannot reach it, so its
+                        // state must not be ANDed in: only fall-through arms
+                        // decide the merged state.
                         let else_init = Self::init_snapshot(scope);
+                        let then_div = block_diverges(then);
+                        let else_div = block_diverges(e);
                         for (i, b) in scope.iter_mut().enumerate() {
-                            b.init = then_init.get(i).copied().unwrap_or(false)
-                                && else_init.get(i).copied().unwrap_or(false);
+                            let t = then_init.get(i).copied().unwrap_or(false);
+                            let el = else_init.get(i).copied().unwrap_or(false);
+                            b.init = match (then_div, else_div) {
+                                (false, false) => t && el,
+                                (false, true) => t,
+                                (true, false) => el,
+                                // Both arms diverge: nothing after is reachable.
+                                (true, true) => false,
+                            };
                         }
                         // A binding counts as written if a branch that can reach
                         // the next statement wrote it. An arm that
                         // returns/breaks/continues cannot, so its write must not
                         // count: only fall-through arms decide the merged state.
                         let else_assigned = Self::assigned_snapshot(scope);
-                        match (block_diverges(then), block_diverges(e)) {
+                        match (then_div, else_div) {
                             (false, false) => {
                                 Self::assigned_merge(scope, &then_assigned, &else_assigned)
                             }
@@ -2160,44 +2275,120 @@ fn expr_diverges(e: &Expr) -> bool {
 }
 
 /// True when a `loop` body can reach its own top again, so a write to a binding
-/// declared before the loop repeats and rustc rejects it. That happens when the
-/// body contains a `continue` for this loop, or can fall through to its end
-/// (control loops back). A body that always reaches a `break`/`return` runs at
-/// most once.
+/// declared before the loop repeats and rustc rejects it. That happens when some
+/// path completes the body normally (which loops back) or hits a `continue` for
+/// this loop. A body whose every path `break`s or `return`s runs at most once.
 fn block_reaches_top(b: &Block) -> bool {
-    block_contains_continue(b, None, 0) || !block_diverges(b)
+    block_reaches_top_from(b, true)
 }
 
-/// Per-statement flags for a loop body: `out[i]` is true when the part of the
-/// body from statement `i` onward (including the tail) can reach the loop's top
-/// again. `out[stmts.len()]` describes the tail. A write is a second write only
-/// when its own suffix can loop back, so `x = 1; break;` is a single write even
-/// when another path in the body can `continue`. The walk is right-to-left,
-/// tracking for each position whether the path can still reach the back edge.
-fn block_repeat_suffixes(b: &Block) -> Vec<bool> {
+/// `reach[i]` is true when some path from statement `i` onward (then the tail,
+/// then the continuation `after`) can reach the loop's top.
+fn block_repeat_suffixes(b: &Block, after: bool) -> Vec<bool> {
     let n = b.stmts.len();
     let mut out = vec![false; n + 1];
+    // The block's own tail is the last thing evaluated before the continuation,
+    // so the reach after the statements is the tail's reach, not `after`.
     let mut reach = match &b.tail {
-        // A tail that always exits the loop (a `break`/`return` on every path)
-        // cannot reach the top.
-        Some(t) if expr_exits_loop(t) => false,
-        Some(t) => expr_contains_continue(t, None, 0) || !expr_diverges(t),
-        None => true,
+        Some(t) => expr_reaches_top(t, after),
+        None => after,
     };
     out[n] = reach;
     for i in (0..n).rev() {
-        reach = if stmt_exits_loop(&b.stmts[i]) {
-            false
-        } else if stmt_contains_continue(&b.stmts[i], None, 0) {
-            true
-        } else if stmt_diverges(&b.stmts[i]) {
-            false
-        } else {
-            reach
-        };
+        reach = stmt_reaches_top(&b.stmts[i]) || (stmt_can_fall(&b.stmts[i]) && reach);
         out[i] = reach;
     }
     out
+}
+
+/// True when some path from the start of `b` reaches the loop's top, given the
+/// reach state `after` that holds once the block completes.
+fn block_reaches_top_from(b: &Block, after: bool) -> bool {
+    let mut reach = match &b.tail {
+        Some(t) => expr_reaches_top(t, after),
+        None => after,
+    };
+    for i in (0..b.stmts.len()).rev() {
+        reach = stmt_reaches_top(&b.stmts[i]) || (stmt_can_fall(&b.stmts[i]) && reach);
+    }
+    reach
+}
+
+/// True when evaluating `e` can reach the loop's top: it contains a `continue`,
+/// or it can complete normally and `after` reaches the top.
+fn expr_reaches_top(e: &Expr, after: bool) -> bool {
+    expr_contains_continue(e, None, 0) || (expr_can_fall(e) && after)
+}
+
+/// True when `e` can complete normally (produce a value) on some path, i.e. it
+/// does not always `break`/`return`/`continue` first.
+fn expr_can_fall(e: &Expr) -> bool {
+    match e {
+        Expr::Block(b) => block_can_fall(b),
+        Expr::MatchBoundary(b, _) => block_can_fall(b),
+        Expr::If(cond, t, els) => {
+            expr_can_fall(cond)
+                && (block_can_fall(t) || els.as_ref().map_or(true, |e| block_can_fall(e)))
+        }
+        Expr::Bin(op, a, b) => {
+            use BinOp::*;
+            match op {
+                And | Or => expr_can_fall(a),
+                _ => expr_can_fall(a) && expr_can_fall(b),
+            }
+        }
+        Expr::Un(_, a) => expr_can_fall(a),
+        Expr::Index(a, b) => expr_can_fall(a) && expr_can_fall(b),
+        Expr::Field { base, .. } => expr_can_fall(base),
+        Expr::Cast(a, _) => expr_can_fall(a),
+        Expr::AddrOf { expr, .. } => expr_can_fall(expr),
+        Expr::Deref { expr, .. } => expr_can_fall(expr),
+        Expr::BoolTest { scrutinee, .. } => expr_can_fall(scrutinee),
+        Expr::Call { args, .. } => args.iter().all(expr_can_fall),
+        Expr::StructLit { fields, .. } => fields.iter().all(|f| expr_can_fall(&f.value)),
+        Expr::ArrayLit(v, _) => expr_can_fall(v),
+        Expr::ArrayList(xs) => xs.iter().all(expr_can_fall),
+        Expr::MethodCall { recv, args, .. } => expr_can_fall(recv) && args.iter().all(expr_can_fall),
+        Expr::EnumCtor { args, .. } => args.iter().all(expr_can_fall),
+        Expr::VariantTest { scrutinee, .. } => expr_can_fall(scrutinee),
+        Expr::EnumPayload { recv, .. } => expr_can_fall(recv),
+        _ => true,
+    }
+}
+
+/// True when every path through `b` reaches the end of the block.
+fn block_can_fall(b: &Block) -> bool {
+    for s in &b.stmts {
+        if !stmt_can_fall(s) {
+            return false;
+        }
+    }
+    b.tail.as_deref().map_or(true, expr_can_fall)
+}
+
+/// True when control from `s` can reach the statement after it.
+fn stmt_can_fall(s: &Stmt) -> bool {
+    match s {
+        Stmt::Return(_) => false,
+        Stmt::Break | Stmt::Continue => false,
+        Stmt::Expr(e) => expr_can_fall(e),
+        Stmt::Let { init: Some(e), .. } => expr_can_fall(e),
+        Stmt::Assign { value, .. } => expr_can_fall(value),
+        _ => true,
+    }
+}
+
+/// True when `s` can reach the loop's top directly: it contains a `continue` for
+/// this loop, or a `return` whose value continues back to the top.
+fn stmt_reaches_top(s: &Stmt) -> bool {
+    match s {
+        Stmt::Continue => true,
+        Stmt::Return(Some(e)) => expr_contains_continue(e, None, 0),
+        Stmt::Expr(e) => expr_contains_continue(e, None, 0),
+        Stmt::Let { init: Some(e), .. } => expr_contains_continue(e, None, 0),
+        Stmt::Assign { value, .. } => expr_contains_continue(value, None, 0),
+        _ => false,
+    }
 }
 
 /// True when `b` contains a `continue` that reaches the top of the loop `depth`
@@ -2258,6 +2449,9 @@ fn expr_contains_continue(e: &Expr, label: Option<&str>, depth: usize) -> bool {
         }
         Expr::Field { base, .. } => expr_contains_continue(base, label, depth),
         Expr::Cast(a, _) => expr_contains_continue(a, label, depth),
+        Expr::AddrOf { expr, .. } => expr_contains_continue(expr, label, depth),
+        Expr::Deref { expr, .. } => expr_contains_continue(expr, label, depth),
+        Expr::BoolTest { scrutinee, .. } => expr_contains_continue(scrutinee, label, depth),
         Expr::Call { args, .. } => args.iter().any(|a| expr_contains_continue(a, label, depth)),
         Expr::StructLit { fields, .. } => fields
             .iter()
@@ -2271,61 +2465,6 @@ fn expr_contains_continue(e: &Expr, label: Option<&str>, depth: usize) -> bool {
         Expr::EnumCtor { args, .. } => args.iter().any(|a| expr_contains_continue(a, label, depth)),
         Expr::VariantTest { scrutinee, .. } => expr_contains_continue(scrutinee, label, depth),
         Expr::EnumPayload { recv, .. } => expr_contains_continue(recv, label, depth),
-        _ => false,
-    }
-}
-
-/// True when evaluating `e` cannot reach the top of the innermost enclosing
-/// loop: every path either `break`s out of it or `return`s from the function.
-/// This is how rustc decides that a `loop` ends without another iteration, so a
-/// write guarded by such an expression is a single write (`R2150`).
-fn expr_exits_loop(e: &Expr) -> bool {
-    match e {
-        Expr::Block(b) => block_exits_loop(b),
-        Expr::MatchBoundary(b, _) => block_exits_loop(b),
-        Expr::If(_, t, els) => {
-            block_exits_loop(t) && els.as_ref().map_or(false, |b| block_exits_loop(b))
-        }
-        Expr::Bin(_, a, b) => expr_exits_loop(a) || expr_exits_loop(b),
-        Expr::Un(_, a) => expr_exits_loop(a),
-        Expr::Index(a, b) => expr_exits_loop(a) || expr_exits_loop(b),
-        Expr::Field { base, .. } => expr_exits_loop(base),
-        Expr::Cast(a, _) => expr_exits_loop(a),
-        Expr::Call { args, .. } => args.iter().any(expr_exits_loop),
-        Expr::StructLit { fields, .. } => fields.iter().any(|f| expr_exits_loop(&f.value)),
-        Expr::ArrayLit(v, _) => expr_exits_loop(v),
-        Expr::ArrayList(xs) => xs.iter().any(expr_exits_loop),
-        Expr::MethodCall { recv, args, .. } => {
-            expr_exits_loop(recv) || args.iter().any(expr_exits_loop)
-        }
-        Expr::EnumCtor { args, .. } => args.iter().any(expr_exits_loop),
-        Expr::VariantTest { scrutinee, .. } => expr_exits_loop(scrutinee),
-        Expr::EnumPayload { recv, .. } => expr_exits_loop(recv),
-        _ => false,
-    }
-}
-
-fn block_exits_loop(b: &Block) -> bool {
-    if let Some(t) = &b.tail {
-        if expr_exits_loop(t) {
-            return true;
-        }
-    }
-    b.stmts.iter().any(stmt_exits_loop)
-}
-
-fn stmt_exits_loop(s: &Stmt) -> bool {
-    match s {
-        // A `return` exits the function only if its value does not `continue`
-        // back to the loop first.
-        Stmt::Return(Some(e)) => !expr_contains_continue(e, None, 0),
-        Stmt::Return(None) => true,
-        Stmt::Break => true,
-        // A nested loop only leaves *itself*, not the enclosing loop.
-        Stmt::While(..) | Stmt::For { .. } | Stmt::Loop(_) => false,
-        Stmt::Expr(e) => expr_exits_loop(e),
-        Stmt::Let { init: Some(e), .. } => expr_exits_loop(e),
-        Stmt::Assign { value, .. } => expr_exits_loop(value),
         _ => false,
     }
 }
