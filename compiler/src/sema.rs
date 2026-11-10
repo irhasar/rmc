@@ -1621,7 +1621,13 @@ impl Sema {
             }
             Stmt::While(cond, body, label) => {
                 let ct = self.check_expr(cond, scope)?;
-                if ct != Type::Bool {
+                if cond_has_unlabelled_exit(cond) {
+                    return Err(
+                        "`break` or `continue` with no label in the condition of a `while` loop"
+                            .into(),
+                    );
+                }
+                if ct != Type::Bool && !expr_diverges(cond) {
                     return Err(format!("`while` condition must be `bool`, found {ct:?}"));
                 }
                 let init_before = Self::init_snapshot(scope);
@@ -2500,7 +2506,7 @@ impl Sema {
                 self.match_chain = false;
                 self.match_total = false;
                 let ct = self.check_expr(cond, scope)?;
-                if ct != Type::Bool {
+                if ct != Type::Bool && !expr_diverges(cond) {
                     return Err(format!("`if` condition must be `bool`, found {ct:?}"));
                 }
                 let total = if is_root {
@@ -3603,9 +3609,35 @@ fn expr_has_break(e: &Expr) -> bool {
         // A nested `loop`/`while`/`for` captures its own `break`s, so the walk
         // does not descend into it.
         Expr::Loop(..) => false,
-        Expr::If(_, t, els) => {
-            block_has_break(t) || els.as_ref().map_or(false, |b| block_has_break(b))
+        // The condition is evaluated, so a `break` there can leave the loop the
+        // expression belongs to; the walk must inspect it too, along with every
+        // other evaluated child.
+        Expr::If(c, t, els) => {
+            expr_has_break(c)
+                || block_has_break(t)
+                || els.as_ref().map_or(false, |b| block_has_break(b))
         }
+        Expr::Bin(_, a, b) => expr_has_break(a) || expr_has_break(b),
+        Expr::Un(_, a) => expr_has_break(a),
+        Expr::Index(a, b) => expr_has_break(a) || expr_has_break(b),
+        Expr::Field { base, .. } => expr_has_break(base),
+        Expr::Cast(a, _) => expr_has_break(a),
+        Expr::AddrOf { expr, .. } => expr_has_break(expr),
+        Expr::Deref { expr, .. } => expr_has_break(expr),
+        Expr::BoolTest { scrutinee, .. } => expr_has_break(scrutinee),
+        Expr::Call { args, .. } => args.iter().any(expr_has_break),
+        Expr::StructLit { fields, .. } => fields.iter().any(|f| expr_has_break(&f.value)),
+        Expr::ArrayLit(v, _) => expr_has_break(v),
+        Expr::ArrayList(xs) => xs.iter().any(expr_has_break),
+        Expr::TupleLit(xs) => xs.iter().any(expr_has_break),
+        Expr::MethodCall { recv, args, .. } => {
+            expr_has_break(recv) || args.iter().any(expr_has_break)
+        }
+        Expr::EnumCtor { args, .. } => args.iter().any(expr_has_break),
+        Expr::VariantTest { scrutinee, .. } => expr_has_break(scrutinee),
+        Expr::EnumPayload { recv, .. } => expr_has_break(recv),
+        Expr::PatScrutinee(inner) => expr_has_break(inner),
+        Expr::PatCheck { base, .. } => expr_has_break(base),
         _ => false,
     }
 }
@@ -3671,7 +3703,7 @@ fn block_reaches_top_from(b: &Block, label: Option<&str>, after: bool) -> bool {
 /// True when evaluating `e` can reach the loop's top: it contains a `continue`
 /// for this loop, or it can complete normally and `after` reaches the top.
 fn expr_reaches_top(e: &Expr, label: Option<&str>, after: bool) -> bool {
-    expr_contains_continue(e, label) || (expr_can_fall(e) && after)
+    expr_contains_continue(e, label, false) || (expr_can_fall(e) && after)
 }
 
 /// True when `e` can complete normally (produce a value) on some path.
@@ -3734,15 +3766,73 @@ fn stmt_can_fall(s: &Stmt) -> bool {
     }
 }
 
+/// True when `e` contains an unlabelled `break`/`continue` that would target a
+/// loop enclosing the `while` whose condition is `e`. rustc forbids these
+/// (E0590): the condition runs before the body, so such a branch can never be
+/// reached from the loop. A nested loop captures its own unlabelled exits.
+fn cond_has_unlabelled_exit(e: &Expr) -> bool {
+    match e {
+        Expr::Block(b) => block_has_unlabelled_exit(b),
+        Expr::If(c, t, els) => {
+            cond_has_unlabelled_exit(c)
+                || block_has_unlabelled_exit(t)
+                || els.as_ref().map_or(false, |b| block_has_unlabelled_exit(b))
+        }
+        Expr::Bin(_, a, b) => cond_has_unlabelled_exit(a) || cond_has_unlabelled_exit(b),
+        Expr::Un(_, a) => cond_has_unlabelled_exit(a),
+        Expr::Index(a, b) => cond_has_unlabelled_exit(a) || cond_has_unlabelled_exit(b),
+        Expr::Field { base, .. } => cond_has_unlabelled_exit(base),
+        Expr::Cast(a, _) => cond_has_unlabelled_exit(a),
+        Expr::Call { args, .. } => args.iter().any(cond_has_unlabelled_exit),
+        Expr::StructLit { fields, .. } => fields.iter().any(|f| cond_has_unlabelled_exit(&f.value)),
+        Expr::ArrayLit(v, _) => cond_has_unlabelled_exit(v),
+        Expr::ArrayList(xs) => xs.iter().any(cond_has_unlabelled_exit),
+        Expr::MethodCall { recv, args, .. } => {
+            cond_has_unlabelled_exit(recv) || args.iter().any(cond_has_unlabelled_exit)
+        }
+        Expr::EnumCtor { args, .. } => args.iter().any(cond_has_unlabelled_exit),
+        Expr::VariantTest { scrutinee, .. } => cond_has_unlabelled_exit(scrutinee),
+        Expr::EnumPayload { recv, .. } => cond_has_unlabelled_exit(recv),
+        Expr::MatchBoundary(b, _) => block_has_unlabelled_exit(b),
+        Expr::AddrOf { expr, .. } => cond_has_unlabelled_exit(expr),
+        Expr::Deref { expr, .. } => cond_has_unlabelled_exit(expr),
+        Expr::BoolTest { scrutinee, .. } => cond_has_unlabelled_exit(scrutinee),
+        Expr::TupleLit(xs) => xs.iter().any(cond_has_unlabelled_exit),
+        Expr::PatScrutinee(inner) => cond_has_unlabelled_exit(inner),
+        Expr::PatCheck { base, .. } => cond_has_unlabelled_exit(base),
+        // A nested `loop` captures its own unlabelled exits.
+        Expr::Loop(..) => false,
+        _ => false,
+    }
+}
+
+fn block_has_unlabelled_exit(b: &Block) -> bool {
+    b.stmts.iter().any(stmt_has_unlabelled_exit)
+        || b.tail.as_deref().map_or(false, cond_has_unlabelled_exit)
+}
+
+fn stmt_has_unlabelled_exit(s: &Stmt) -> bool {
+    match s {
+        Stmt::Break(_, None) | Stmt::Continue(None) => true,
+        // A nested loop captures its own unlabelled exits.
+        Stmt::While(..) | Stmt::For { .. } => false,
+        Stmt::Expr(e) => cond_has_unlabelled_exit(e),
+        Stmt::Return(Some(e)) => cond_has_unlabelled_exit(e),
+        Stmt::Let { init: Some(e), .. } => cond_has_unlabelled_exit(e),
+        Stmt::Assign { value, .. } => cond_has_unlabelled_exit(value),
+        _ => false,
+    }
+}
+
 /// True when `s` can reach the loop's top directly: it contains a `continue` for
 /// this loop, or a `return` whose value continues back to the top.
 fn stmt_reaches_top(s: &Stmt, label: Option<&str>) -> bool {
     match s {
         Stmt::Continue(cl) => cl.is_none() || cl.as_deref() == label,
-        Stmt::Return(Some(e)) => expr_contains_continue(e, label),
-        Stmt::Expr(e) => expr_contains_continue(e, label),
-        Stmt::Let { init: Some(e), .. } => expr_contains_continue(e, label),
-        Stmt::Assign { value, .. } => expr_contains_continue(value, label),
+        Stmt::Return(Some(e)) => expr_contains_continue(e, label, false),
+        Stmt::Expr(e) => expr_contains_continue(e, label, false),
+        Stmt::Let { init: Some(e), .. } => expr_contains_continue(e, label, false),
+        Stmt::Assign { value, .. } => expr_contains_continue(value, label, false),
         _ => false,
     }
 }
@@ -3752,9 +3842,9 @@ fn stmt_reaches_top(s: &Stmt, label: Option<&str>) -> bool {
 /// through its end does not count here: only the loop body's own end loops back.
 /// `break`/`return` end the path first, so a statement after them cannot
 /// contribute.
-fn block_contains_continue(b: &Block, label: Option<&str>) -> bool {
+fn block_contains_continue(b: &Block, label: Option<&str>, nested: bool) -> bool {
     for s in &b.stmts {
-        if stmt_contains_continue(s, label) {
+        if stmt_contains_continue(s, label, nested) {
             return true;
         }
         if stmt_diverges(s) {
@@ -3763,64 +3853,75 @@ fn block_contains_continue(b: &Block, label: Option<&str>) -> bool {
     }
     b.tail
         .as_deref()
-        .map_or(false, |t| expr_contains_continue(t, label))
+        .map_or(false, |t| expr_contains_continue(t, label, nested))
 }
 
-fn stmt_contains_continue(s: &Stmt, label: Option<&str>) -> bool {
+fn stmt_contains_continue(s: &Stmt, label: Option<&str>, nested: bool) -> bool {
     match s {
-        // An unlabelled `continue` targets the innermost loop; a labelled one
-        // targets the loop whose label it names.
-        Stmt::Continue(cl) => cl.is_none() || cl.as_deref() == label,
-        // A nested loop captures its own unlabelled `continue`s, so the walk
-        // does not descend into it.
-        Stmt::While(..) | Stmt::For { .. } => false,
+        // An unlabelled `continue` targets the innermost loop. At the target
+        // loop's own body level (`nested` false) that is this loop; inside a
+        // deeper loop it is not, so it does not count.
+        Stmt::Continue(cl) => match cl {
+            Some(l) => Some(l.as_str()) == label,
+            None => !nested,
+        },
+        // A nested `while`/`for` captures its own unlabelled `continue`s, but a
+        // labelled one inside it can still target an enclosing loop. Descend
+        // unless the nested loop is itself the target (its `continue`s then
+        // target a loop between us and it, never our top).
+        Stmt::While(_, body, lbl) | Stmt::For { body, label: lbl, .. } => {
+            lbl.as_deref() != label && block_contains_continue(body, label, true)
+        }
         Stmt::Break(..) => false,
-        Stmt::Expr(e) => expr_contains_continue(e, label),
+        Stmt::Expr(e) => expr_contains_continue(e, label, nested),
         // A `return` evaluates its value before leaving the function, and that
         // value can `continue` back to the loop instead.
-        Stmt::Return(Some(e)) => expr_contains_continue(e, label),
-        Stmt::Let { init: Some(e), .. } => expr_contains_continue(e, label),
-        Stmt::Assign { value, .. } => expr_contains_continue(value, label),
+        Stmt::Return(Some(e)) => expr_contains_continue(e, label, nested),
+        Stmt::Let { init: Some(e), .. } => expr_contains_continue(e, label, nested),
+        Stmt::Assign { value, .. } => expr_contains_continue(value, label, nested),
         _ => false,
     }
 }
 
-fn expr_contains_continue(e: &Expr, label: Option<&str>) -> bool {
+fn expr_contains_continue(e: &Expr, label: Option<&str>, nested: bool) -> bool {
     match e {
-        Expr::Block(b) => block_contains_continue(b, label),
-        Expr::MatchBoundary(b, _) => block_contains_continue(b, label),
+        Expr::Block(b) => block_contains_continue(b, label, nested),
+        Expr::MatchBoundary(b, _) => block_contains_continue(b, label, nested),
         Expr::If(c, t, els) => {
-            expr_contains_continue(c, label)
-                || block_contains_continue(t, label)
-                || els.as_ref().map_or(false, |b| block_contains_continue(b, label))
+            expr_contains_continue(c, label, nested)
+                || block_contains_continue(t, label, nested)
+                || els.as_ref().map_or(false, |b| block_contains_continue(b, label, nested))
         }
         Expr::Bin(_, a, b) => {
-            expr_contains_continue(a, label) || expr_contains_continue(b, label)
+            expr_contains_continue(a, label, nested) || expr_contains_continue(b, label, nested)
         }
-        Expr::Un(_, a) => expr_contains_continue(a, label),
+        Expr::Un(_, a) => expr_contains_continue(a, label, nested),
         Expr::Index(a, b) => {
-            expr_contains_continue(a, label) || expr_contains_continue(b, label)
+            expr_contains_continue(a, label, nested) || expr_contains_continue(b, label, nested)
         }
-        Expr::Field { base, .. } => expr_contains_continue(base, label),
-        Expr::Cast(a, _) => expr_contains_continue(a, label),
-        Expr::Call { args, .. } => args.iter().any(|a| expr_contains_continue(a, label)),
+        Expr::Field { base, .. } => expr_contains_continue(base, label, nested),
+        Expr::Cast(a, _) => expr_contains_continue(a, label, nested),
+        Expr::Call { args, .. } => args.iter().any(|a| expr_contains_continue(a, label, nested)),
         Expr::StructLit { fields, .. } => {
-            fields.iter().any(|f| expr_contains_continue(&f.value, label))
+            fields.iter().any(|f| expr_contains_continue(&f.value, label, nested))
         }
-        Expr::ArrayLit(v, _) => expr_contains_continue(v, label),
-        Expr::ArrayList(xs) => xs.iter().any(|a| expr_contains_continue(a, label)),
-        Expr::TupleLit(xs) => xs.iter().any(|a| expr_contains_continue(a, label)),
+        Expr::ArrayLit(v, _) => expr_contains_continue(v, label, nested),
+        Expr::ArrayList(xs) => xs.iter().any(|a| expr_contains_continue(a, label, nested)),
+        Expr::TupleLit(xs) => xs.iter().any(|a| expr_contains_continue(a, label, nested)),
         Expr::MethodCall { recv, args, .. } => {
-            expr_contains_continue(recv, label)
-                || args.iter().any(|a| expr_contains_continue(a, label))
+            expr_contains_continue(recv, label, nested)
+                || args.iter().any(|a| expr_contains_continue(a, label, nested))
         }
-        Expr::EnumCtor { args, .. } => args.iter().any(|a| expr_contains_continue(a, label)),
-        Expr::VariantTest { scrutinee, .. } => expr_contains_continue(scrutinee, label),
-        Expr::EnumPayload { recv, .. } => expr_contains_continue(recv, label),
-        Expr::PatScrutinee(inner) => expr_contains_continue(inner, label),
-        Expr::PatCheck { base, .. } => expr_contains_continue(base, label),
-        // A nested `loop` captures its own unlabelled `continue`s.
-        Expr::Loop(..) => false,
+        Expr::EnumCtor { args, .. } => args.iter().any(|a| expr_contains_continue(a, label, nested)),
+        Expr::VariantTest { scrutinee, .. } => expr_contains_continue(scrutinee, label, nested),
+        Expr::EnumPayload { recv, .. } => expr_contains_continue(recv, label, nested),
+        Expr::PatScrutinee(inner) => expr_contains_continue(inner, label, nested),
+        Expr::PatCheck { base, .. } => expr_contains_continue(base, label, nested),
+        // A nested `loop` captures its own unlabelled `continue`s, but a
+        // labelled one can still target an enclosing loop.
+        Expr::Loop(body, _, _, lbl) => {
+            lbl.as_deref() != label && block_contains_continue(body, label, true)
+        }
         _ => false,
     }
 }
