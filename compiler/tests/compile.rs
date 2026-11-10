@@ -2923,6 +2923,53 @@ fn a_constant_index_out_of_range_is_a_compile_error() {
 }
 
 #[test]
+fn bounds_checks_guard_a_loop_expression_base() {
+    // `loop { break a; }[i]`: the base's length comes from the loop's `break`
+    // value type, not its block tail (which is `()`), so the check must still be
+    // emitted for a variable index. Reading past the array is CWE-125.
+    let out = compile_to_asm(
+        "fn f(i: i64) -> i64 { let a: [i64; 3] = [1, 2, 3]; return loop { break a; }[i]; } \
+         fn main() -> i64 { return f(9); }",
+        &CompileOptions { bounds_checks: true, ..Default::default() },
+    )
+    .unwrap();
+    assert!(out.contains("cmp $3, %rax"), "compares to the loop's array length:\n{out}");
+    assert!(out.contains("jae __rmc_bounds"), "traps on out of range");
+}
+
+#[test]
+fn a_loop_expression_base_copies_its_break_value() {
+    // The fix must not only add the check: the loop still yields the array, so
+    // indexing it in range reads the element.
+    let out = asm(
+        "fn main() -> i64 { let a: [i64; 3] = [10, 20, 30]; let i: i64 = 1; \
+         return loop { break a; }[i]; }",
+    );
+    assert!(out.contains("main:"), "compiles:\n{out}");
+}
+
+#[test]
+fn a_unit_break_in_a_statement_loop_does_not_clobber_the_frame() {
+    // A statement `loop` is typed `()` and has no result slot (`-1`); storing a
+    // `break` value into `off(-1)` wrote the saved frame pointer and segfaulted
+    // on `leave`. The body must still run for its side effects.
+    let out = asm("fn main() -> i64 { let mut n: i64 = 7; loop { break; } return n; }");
+    assert!(out.contains("main:"), "compiles:\n{out}");
+    assert!(!out.contains("mov %rax, -1(%rbp)"), "no store to slot -1:\n{out}");
+}
+
+#[test]
+fn a_unit_break_still_evaluates_its_value_expression() {
+    // `break g()` in a statement `loop`: the value is `()`, but the call must
+    // still run (rustc evaluates it for its side effects).
+    let out = asm(
+        "fn g() { print_i64(1); } \
+         fn main() -> i64 { loop { break g(); } return 0; }",
+    );
+    assert!(out.contains("call g"), "the break value expression is evaluated:\n{out}");
+}
+
+#[test]
 fn bounds_checks_leave_an_in_range_constant_alone() {
     let out = compile_to_asm(
         "fn main() -> i64 { let a: [i64; 2] = [1, 2]; return a[1]; }",
@@ -3764,6 +3811,47 @@ fn a_break_to_an_outer_loop_in_an_intervening_loop_is_not_a_repeat() {
     )
     .unwrap_err();
     assert!(err.contains("cannot assign twice to immutable"), "got: {err}");
+}
+
+#[test]
+fn a_while_label_is_in_scope_in_its_own_condition() {
+    // rustc shadows an outer label of the same name with the `while`'s own, and
+    // the condition runs with that label already in scope, so `break 'i` there
+    // leaves this loop. Checking the condition before pushing the loop resolved
+    // `'i` to the outer loop (or failed to resolve it at all), diverging from
+    // rustc.
+    let out = asm(
+        "fn main() -> i64 { let mut n: i64 = 0; 'i: while { break 'i; true } {} return n; }",
+    );
+    assert!(out.contains("main:"), "compiles:\n{out}");
+}
+
+#[test]
+fn a_shadowing_while_label_binds_the_inner_loop() {
+    // `'o: while { break 'o; true }` inside `'o: loop`: the `while`'s own `'o`
+    // shadows the outer one, so the `break` leaves the *while*, not the `loop`.
+    // The outer loop therefore keeps running until its own `break`, which is
+    // what makes `c` reach 4.
+    let out = asm(
+        "fn main() -> i64 { let mut c: i64 = 0; 'o: loop { 'o: while { break 'o; true } {} \
+         c = c + 1; if c > 3 { break; } } return c; }",
+    );
+    assert!(out.contains("main:"), "compiles:\n{out}");
+}
+
+#[test]
+fn a_nested_loop_condition_break_does_not_make_the_outer_loop_breakable() {
+    // `'o: while { break 'o; true }` inside `'o: loop`: the `while`'s own `'o`
+    // shadows the outer one, so the `break` leaves the inner `while`. The outer
+    // `loop` then has no `break` of its own, so it is `!`, its `if` branch is
+    // `!`, and the `if`/`else` unifies with `i64`, exactly as rustc does. Before
+    // the label-aware walk, the inner `break` was credited to the outer `loop`,
+    // making it `()` so the branch types disagreed (E0308).
+    let out = asm(
+        "fn main() { let n: i64 = if true { 'o: loop { 'o: while { break 'o; true } {} } } \
+         else { 1 }; }",
+    );
+    assert!(out.contains("main:"), "compiles:\n{out}");
 }
 
 #[test]

@@ -1658,6 +1658,23 @@ impl Sema {
                 Ok(())
             }
             Stmt::While(cond, body, label) => {
+                let init_before = Self::init_snapshot(scope);
+                self.loop_depth += 1;
+                self.loop_stack.push(LoopCtx {
+                    label: label.clone(),
+                    kind: LoopKind::NoValue,
+                });
+                // The condition runs with the loop's own label in scope: rustc
+                // shadows an outer label of the same name, so
+                // `'i: while { break 'i; true } {}` is accepted and the
+                // condition is a break target. Pushing before the condition is
+                // what makes `break 'i` resolve.
+                self.loop_marks.push(scope.len());
+                self.loop_repeats.push(true);
+                self.loop_exits.push(Vec::new());
+                self.loop_reach.push(false);
+                self.loop_cont.push(false);
+                self.break_assigned.push(Self::assigned_snapshot(scope));
                 let ct = self.check_expr(cond, scope)?;
                 if cond_has_unlabelled_exit(cond) {
                     return Err(
@@ -1668,20 +1685,6 @@ impl Sema {
                 if ct != Type::Bool && ct != Type::Never {
                     return Err(format!("`while` condition must be `bool`, found {ct:?}"));
                 }
-                let init_before = Self::init_snapshot(scope);
-                self.loop_depth += 1;
-                self.loop_stack.push(LoopCtx {
-                    label: label.clone(),
-                    kind: LoopKind::NoValue,
-                });
-                // The body may run again, so a non-`mut` binding that already
-                // existed before the loop cannot be written inside it.
-                self.loop_marks.push(scope.len());
-                self.loop_repeats.push(true);
-                self.loop_exits.push(Vec::new());
-                self.loop_reach.push(false);
-                self.loop_cont.push(false);
-                self.break_assigned.push(Self::assigned_snapshot(scope));
                 self.check_block_inner(body, scope, true, label.as_deref())?;
                 let breaks = self.break_assigned.pop().unwrap();
                 self.loop_exits.pop();

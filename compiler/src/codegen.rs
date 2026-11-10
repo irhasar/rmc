@@ -154,6 +154,11 @@ impl Codegen {
             Expr::Index(b, _) => Self::array_elem_ty(b).and_then(|t| Self::array_len_ty(&t)),
             Expr::Block(b) => b.tail.as_deref().and_then(Self::array_len_of),
             Expr::MatchBoundary(b, _) => b.tail.as_deref().and_then(Self::array_len_of),
+            // A loop expression's value is its `break` value, carried in the
+            // loop's checked result type, not its block tail (which is `()` for
+            // `loop { break a; }`). Missing this let `loop { break a; }[i]` skip
+            // the bounds check on a variable index.
+            Expr::Loop(_, _, lty, _) => Self::array_len_ty(lty),
             Expr::If(_, then, Some(els)) => Self::array_len_of_tail(then)
                 .or_else(|| Self::array_len_of_tail(els)),
             _ => None,
@@ -193,6 +198,10 @@ impl Codegen {
             Expr::MatchBoundary(b, _) => {
                 return b.tail.as_deref().and_then(Self::array_elem_ty)
             }
+            // Mirrors `array_len_of`: a loop expression's value type is its
+            // checked result type, so an element's stride is known wherever its
+            // length is.
+            Expr::Loop(_, _, lty, _) => return Self::array_elem_of_ty(lty),
             Expr::If(_, then, Some(els)) => {
                 return Self::array_elem_ty_tail(then)
                     .or_else(|| Self::array_elem_ty_tail(els))
@@ -1423,9 +1432,17 @@ Expr::PatScrutinee(_) => {
                 let i = self.loop_target(label);
                 let (_, end, slot, _) = self.loops[i].clone();
                 if let Some(e) = v {
-                    // Store the break value into the loop's result slot, then
-                    // leave; the loop expression loads it after `end`.
-                    self.gen_expr_to_slot(e, slot);
+                    // A unit- or `!`-valued loop has no result slot (`-1`), so
+                    // there is nothing to store; writing `off(-1)` would hit the
+                    // saved frame pointer. Still evaluate the expression for its
+                    // side effects, as rustc does.
+                    if slot < 0 {
+                        self.gen_expr(e);
+                    } else {
+                        // Store the break value into the loop's result slot, then
+                        // leave; the loop expression loads it after `end`.
+                        self.gen_expr_to_slot(e, slot);
+                    }
                 }
                 self.line(&format!("jmp {end}"));
             }
