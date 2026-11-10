@@ -805,6 +805,34 @@ fn a_wildcard_arm_matching_the_same_value_is_not_exhaustive() {
 }
 
 #[test]
+fn a_match_whose_wildcard_body_can_fall_through_is_not_a_condition() {
+    // The wildcard arm's body is an `if` without an `else`, so it can fall
+    // through to `()`: the match is `()`, not `!`. Using it as an `if`/`while`
+    // condition is then a type error, as rustc's E0317. A wildcard body that
+    // always returns is `!` and is accepted.
+    let err = compile_to_asm(
+        "fn f(c: bool) -> i64 { if match c { _ => if c { return 1; } } { return 2; } return 3; } \
+         fn main() {}",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("condition must be `bool`"), "got: {err}");
+    let err = compile_to_asm(
+        "fn f(c: bool) -> i64 { while match c { _ => if c { return 1; } } {} return 3; } \
+         fn main() {}",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("condition must be `bool`"), "got: {err}");
+    assert!(compile_to_asm(
+        "fn f(c: bool) -> i64 { if match c { _ => { return 1; } } { return 2; } return 3; } \
+         fn main() {}",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
 fn a_nested_match_with_all_variants_is_still_a_value() {
     // The nested match names every variant, so the wildcard arm's body is a
     // value and the outer chain is total: this must compile.
