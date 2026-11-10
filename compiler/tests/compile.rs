@@ -2940,3 +2940,19 @@ fn indexing_a_reference_to_an_array_uses_the_element_type() {
     assert!(out.contains("sete %al"), "`!` on a bool element must be logical not");
     assert!(!out.contains("not %rax"), "`!` on a bool element must not be a bitwise not");
 }
+
+#[test]
+fn a_constant_array_length_may_use_a_bitwise_operator() {
+    // `[i64; 1 | 2]` is a constant expression, so the length is 3. The bitwise
+    // operators were missing from the constant folder, so the length was
+    // rejected as non-constant. `asm` panics on a compile error, so reaching
+    // the assertions proves the fold succeeded.
+    let out = asm("fn main() -> i64 { let a: [i64; 1 | 2] = [10, 20, 30]; return a[2]; }");
+    assert!(out.contains("main:"), "the array must compile");
+}
+
+#[test]
+fn a_constant_array_length_may_name_a_constant() {
+    let out = asm("const N: i64 = 4; fn main() -> i64 { let a: [i64; N] = [1, 2, 3, 4]; return a[3]; }");
+    assert!(out.contains("main:"), "a named constant length must fold");
+}
