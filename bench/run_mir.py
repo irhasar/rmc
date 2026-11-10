@@ -64,32 +64,58 @@ def peak_rss_kb(pid):
     return 0
 
 
+def sample_spawned(argv):
+    """Spawn argv once; return (wall_s, cpu_s, peak_rss_kb)."""
+    exe = shutil.which(argv[0]) or argv[0]
+    for _attempt in range(5):
+        t0 = time.perf_counter()
+        pid = os.posix_spawn(exe, [exe] + list(argv[1:]), os.environ, file_actions=[])
+        peak = 0
+        while True:
+            hwm = peak_rss_kb(pid)
+            if hwm > peak:
+                peak = hwm
+            done, status, ru = os.wait4(pid, os.WNOHANG)
+            if done:
+                break
+            os.sched_yield()
+        wall = time.perf_counter() - t0
+        if status != 0:
+            raise RuntimeError(f"run failed for {exe}: status={status}")
+        if peak > 0:
+            break
+    return wall, ru.ru_utime + ru.ru_stime, peak
+
+
 def measure_spawned(argv, reps, cwd=None):
     """Run argv `reps` times; return minimum wall/CPU and peak RSS."""
-    exe = shutil.which(argv[0]) or argv[0]
     walls, cpus, rsss = [], [], []
     for _ in range(reps):
-        for _attempt in range(5):
-            t0 = time.perf_counter()
-            pid = os.posix_spawn(exe, [exe] + list(argv[1:]), os.environ, file_actions=[])
-            peak = 0
-            while True:
-                hwm = peak_rss_kb(pid)
-                if hwm > peak:
-                    peak = hwm
-                done, status, ru = os.wait4(pid, os.WNOHANG)
-                if done:
-                    break
-                os.sched_yield()
-            wall = time.perf_counter() - t0
-            if status != 0:
-                raise RuntimeError(f"run failed for {exe}: status={status}")
-            if peak > 0:
-                break
+        wall, cpu, peak = sample_spawned(argv)
         walls.append(wall)
-        cpus.append(ru.ru_utime + ru.ru_stime)
+        cpus.append(cpu)
         rsss.append(peak)
     return dict(wall=min(walls), cpu=min(cpus), rss=max(rsss))
+
+
+def measure_runs(bins, args, reps):
+    """Run several binaries of the same workload interleaved.
+
+    A sequential sweep measures the first pipeline on a cool core and the last
+    on a warmed-up (or throttled) one, which can flip a near-parity case by
+    several percent. Round-robin sampling spreads any frequency/thermal drift
+    evenly across the pipelines. `bins` maps a name to its path; returns
+    `{name: dict(wall, cpu, rss)}`.
+    """
+    samples = {name: ([], [], []) for name in bins}
+    for _ in range(reps):
+        for name, path in bins.items():
+            wall, cpu, peak = sample_spawned([path] + list(args))
+            samples[name][0].append(wall)
+            samples[name][1].append(cpu)
+            samples[name][2].append(peak)
+    return {name: dict(wall=min(w), cpu=min(c), rss=max(r))
+            for name, (w, c, r) in samples.items()}
 
 
 def measure_mir_compile(name, reps=5):
@@ -134,9 +160,11 @@ def collect():
         res["mir"] = measure_mir_compile(p)
         res["ast"] = measure_ast_compile(p)
         res["llvm"] = measure_llvm_compile(p)
+        bins = {kind: os.path.join(OUT, f"{p}.{kind}.bin")
+                for kind in ("mir", "ast", "llvm")}
+        runs = measure_runs(bins, ARGS[p], 9)
         for kind in ("mir", "ast", "llvm"):
-            binpath = os.path.join(OUT, f"{p}.{kind}.bin")
-            res[kind]["run"] = measure_spawned([binpath] + ARGS[p], 9)
+            res[kind]["run"] = runs[kind]
         rows.append((p, res))
     return rows
 
