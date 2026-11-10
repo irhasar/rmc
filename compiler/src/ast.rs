@@ -23,6 +23,18 @@ pub enum Type {
     /// carried here, so codegen needs no lookup. It is an aggregate: named by
     /// its address, passed and returned by pointer, like a struct.
     EnumData(String, usize),
+    /// A reference: `&T` or `&mut T`. It occupies one 8-byte slot holding the
+    /// address of a `T`, so it is a scalar (passed and returned in one register)
+    /// even when `T` is an aggregate. There is no lifetime or borrow checking:
+    /// rmc trusts the programmer not to outlive the referent.
+    Ref(Box<Type>, bool),
+    /// A string literal: a pointer to a NUL-terminated byte string in static
+    /// data. It occupies one slot and travels in one register like `i64`, but it
+    /// is a distinct type so it cannot be added to an integer or passed where an
+    /// `i64` is expected (the ways rmc used to let a bad string through). There
+    /// is no way to name this type in source, so only a string literal produces
+    /// it.
+    Str,
     /// Unresolved name produced by the parser; never survives sema.
     Named(String),
 }
@@ -30,7 +42,7 @@ pub enum Type {
 impl Type {
     pub fn size(&self) -> usize {
         match self {
-            Type::I64 | Type::Bool | Type::Enum(_) => 8,
+            Type::I64 | Type::Bool | Type::Str | Type::Enum(_) | Type::Ref(..) => 8,
             Type::EnumData(_, size) => *size,
             Type::Unit => 0,
             Type::Array(elem, n) => elem.size() * n,
@@ -43,14 +55,16 @@ impl Type {
     /// register: `i64`, `bool` and an enum. They may be parameters, fields and
     /// return values.
     pub fn is_scalar(&self) -> bool {
-        matches!(self, Type::I64 | Type::Bool | Type::Enum(_))
+        matches!(self, Type::I64 | Type::Bool | Type::Str | Type::Enum(_) | Type::Ref(..))
     }
 
-    /// True for the primitive types an array element may have. An enum is
-    /// deliberately excluded: codegen only lays out 8-byte integer-like
-    /// elements, and `[E; N]` would silently mis-size.
+    /// True for the types an array element may have: the 8-byte integer-like
+    /// scalars `i64`, `bool` and a unit enum. A unit enum occupies one slot and
+    /// codegen emits it exactly as it emits `i64`, so `[E; N]` lays out and
+    /// indexes correctly. A payload enum or a reference is excluded, matching
+    /// rustc, which rejects both as array elements.
     pub fn is_int_or_bool(&self) -> bool {
-        matches!(self, Type::I64 | Type::Bool)
+        matches!(self, Type::I64 | Type::Bool | Type::Enum(_))
     }
 
     /// True for the aggregate types that live in memory: arrays and structs.
@@ -115,6 +129,18 @@ pub enum Expr {
         ret_ty: Type,
     },
     If(Box<Expr>, Block, Option<Block>),
+    /// Marks a desugared `match`, wrapping the *whole* `if` chain exactly once
+    /// (not each arm). A `match` desugars to an `if` chain, and the chain must
+    /// be recognised as a unit when deciding whether it is exhaustive. Without
+    /// this marker a wildcard arm whose body is itself a `match` on the same
+    /// enum value would fuse with the outer chain: `match a { A => 1, _ =>
+    /// match a { B => 2 } }` and `match a { A => 1, B => 2 }` desugar to the
+    /// same `if` chain, but only the second is exhaustive. The marker, inserted
+    /// by `desugar_match` after the whole chain is folded, keeps them apart; it
+    /// is transparent to codegen. The `bool` records whether some arm is a
+    /// catch-all (`_` or a binding), which makes the match exhaustive
+    /// regardless of the variants it names.
+    MatchBoundary(Block, bool),
     Block(Block),
     /// array[index]
     Index(Box<Expr>, Box<Expr>),
@@ -168,6 +194,15 @@ pub enum Expr {
         /// parentheses, which is an error for a variant that has a payload.
         n_binds: i32,
     },
+    /// `value == true`/`false`, as a `bool`. The arm test a `bool` literal
+    /// pattern desugars to. It is a distinct node rather than a plain
+    /// `Bin(Eq, ..)` so `if_chain_is_exhaustive` can tell a `match` over a
+    /// `bool` (whose `true` and `false` arms together are exhaustive) from a
+    /// hand-written `if b == true { .. } else if b == false { .. }`, which rustc
+    /// does *not* treat as exhaustive in value position. `desugar_match` only
+    /// ever produces it over a `Var` — the scrutinee it bound to a temporary or
+    /// a bool variable — so no side effect is evaluated here.
+    BoolTest { scrutinee: Box<Expr>, value: bool },
     /// The payload of a payload enum, read after a tag check: field `idx` of
     /// `variant`, at `offset` bytes into the value. Yields the field value, or
     /// its address when the field is itself an aggregate.
@@ -181,6 +216,15 @@ pub enum Expr {
     },
     /// expr as Type
     Cast(Box<Expr>, Type),
+    /// `&e` or `&mut e`: the address of an lvalue, or of a temporary
+    /// materialised into `slot` when `e` has no address of its own (a call
+    /// result, a literal, an aggregate-valued expression). `slot` is -1 when the
+    /// operand is an addressable lvalue. `ty` is the referent type.
+    AddrOf { expr: Box<Expr>, ty: Type, mutable: bool, slot: i32 },
+    /// `*e`: read the referent. `ty` is the referent type, filled in by sema.
+    /// Reading an aggregate yields its address, exactly as naming a struct local
+    /// does.
+    Deref { expr: Box<Expr>, ty: Type },
 }
 
 /// A field inside a struct literal, once sema has resolved its layout.
@@ -205,8 +249,8 @@ pub enum Stmt {
         ty: Option<Type>,
         init: Option<Expr>,
         slot: i32,
-        /// True when the binding was declared `mut`. An assignment to a
-        /// non-`mut` binding is rejected, matching rustc.
+        /// Whether the binding was declared `mut`. Stored so a later assignment
+        /// to it can be rejected when it was not.
         mutable: bool,
     },
     Assign {
@@ -252,9 +296,18 @@ pub struct FnDef {
     /// already present in `params`; this only records that a call to it must go
     /// through a method call, so a free function cannot be called as one.
     pub takes_self: bool,
+    /// True when the receiver was written `&self` / `&mut self`. The receiver is
+    /// then a reference: a method call passes the value's address instead of a
+    /// copy, so a large receiver is not copied into the callee.
+    pub ref_self: bool,
+    /// True when the receiver was written `&mut self`. It only affects type
+    /// checking (`&mut T` and `&T` are distinct types); there is no exclusivity
+    /// check.
+    pub ref_self_mut: bool,
     pub params: Vec<(String, Type)>,
-    /// True for each parameter declared `mut`, parallel to `params`. A `mut`
-    /// parameter may be assigned; an immutable one is rejected like a `let`.
+    /// Whether each parameter was declared `mut`, parallel to `params`. A
+    /// non-`mut` parameter is an immutable binding, so assigning it is rejected
+    /// like rustc; `mut x: T` allows the body to rebind it (a local copy).
     pub param_mut: Vec<bool>,
     pub ret: Type,
     pub body: Block,
@@ -285,9 +338,21 @@ pub struct EnumDef {
     pub variants: Vec<EnumVariantDef>,
 }
 
+/// A `const NAME: TYPE = EXPR;` item. rmc resolves it at compile time to a
+/// single value and substitutes that value at every use, so a constant has no
+/// storage and no codegen. Only `i64` and `bool` constants are accepted, which
+/// is what an array length or a scalar expression can use.
+#[derive(Debug, Clone)]
+pub struct ConstDef {
+    pub name: String,
+    pub ty: Type,
+    pub value: Expr,
+}
+
 #[derive(Debug, Clone)]
 pub struct Program {
     pub structs: Vec<StructDef>,
     pub enums: Vec<EnumDef>,
+    pub consts: Vec<ConstDef>,
     pub fns: Vec<FnDef>,
 }

@@ -1,0 +1,13 @@
+// Inlining must copy a parameter whose address the callee takes, or the
+// callee's write through that pointer would reach the caller's variable.
+fn take_mut(mut x: i64) -> i64 { let p = &mut x; *p = 9; x }
+fn read_ref(x: i64) -> i64 { let p = &x; *p }
+
+fn main() {
+    let y: i64 = 1;
+    let r = take_mut(y);
+    print_i64(y);
+    print_i64(r);
+    let z: i64 = 5;
+    print_i64(read_ref(z));
+}

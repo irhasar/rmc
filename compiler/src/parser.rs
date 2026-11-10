@@ -1,6 +1,7 @@
 //! Recursive-descent parser for the rmc Rust subset.
 
 use crate::ast::*;
+use crate::consts::eval_i64;
 use crate::lexer::{Tok, Token};
 
 pub struct Parser {
@@ -18,6 +19,16 @@ pub struct Parser {
     /// Name of the struct whose `impl` block is being parsed, if any. It lets
     /// `Self` in a method signature resolve to the right struct.
     current_impl: Option<String>,
+    /// Constant `i64` items by name, collected as they are parsed. The parser
+    /// needs their values to size an array type (`[i64; N]`) and to turn a
+    /// constant used as a `match` pattern into a literal, both of which happen
+    /// before sema. Only `i64` constants that fold to a literal are entered; a
+    /// constant that is not yet known at a use site simply stays unresolved and
+    /// is diagnosed there, matching rustc's forward-reference rules.
+    consts: std::collections::HashMap<String, i64>,
+    /// Constant `bool` items by name, so a `const F: bool` used as a `match`
+    /// pattern becomes the `true`/`false` pattern.
+    const_bools: std::collections::HashMap<String, bool>,
 }
 
 /// The deepest expression, block or type nesting the parser accepts. Deeply
@@ -34,14 +45,23 @@ const MAX_DEPTH: u32 = 100;
 
 /// Expressions that are allowed as statements without a trailing `;`.
 fn is_block_like(e: &Expr) -> bool {
-    matches!(e, Expr::If(..) | Expr::Block(..))
+    matches!(e, Expr::If(..) | Expr::Block(..) | Expr::MatchBoundary(..))
 }
 
 type PResult<T> = Result<T, String>;
 
 impl Parser {
     pub fn new(toks: Vec<Token>) -> Self {
-        Parser { toks, i: 0, no_struct_lit: false, tmp: 0, depth: 0, current_impl: None }
+        Parser {
+            toks,
+            i: 0,
+            no_struct_lit: false,
+            tmp: 0,
+            depth: 0,
+            current_impl: None,
+            consts: std::collections::HashMap::new(),
+            const_bools: std::collections::HashMap::new(),
+        }
     }
 
     /// Count one level of nesting and fail past `MAX_DEPTH`.
@@ -111,25 +131,31 @@ impl Parser {
     }
 
     pub fn parse_program(&mut self) -> PResult<Program> {
+        // A `const` may be named before it is declared (an array length
+        // `[i64; N]`, a pattern `N =>`), so collect and evaluate every `const`
+        // item first, then parse the program with the values known.
+        self.prescan_consts()?;
         let mut structs = Vec::new();
         let mut enums = Vec::new();
+        let mut consts = Vec::new();
         let mut fns = Vec::new();
         while self.peek().is_some() {
             match self.peek() {
                 Some(Tok::Struct) => structs.push(self.parse_struct()?),
                 Some(Tok::Enum) => enums.push(self.parse_enum()?),
+                Some(Tok::Const) => consts.push(self.parse_const()?),
                 Some(Tok::Fn) => fns.push(self.parse_fn()?),
                 Some(Tok::Impl) => self.parse_impl(&mut fns)?,
                 other => {
                     return Err(format!(
-                        "at byte {}: expected `fn`, `struct`, `enum` or `impl`, found {}",
+                        "at byte {}: expected `fn`, `struct`, `enum`, `const` or `impl`, found {}",
                         self.pos(),
                         other.map(|x| x.describe()).unwrap_or_else(|| "end of input".into())
                     ))
                 }
             }
         }
-        Ok(Program { structs, enums, fns })
+        Ok(Program { structs, enums, consts, fns })
     }
 
     fn parse_enum(&mut self) -> PResult<EnumDef> {
@@ -165,6 +191,122 @@ impl Parser {
         Ok(EnumDef { name, variants })
     }
 
+    /// Scan the token stream for top-level `const` items and evaluate them, so
+    /// a use that precedes the declaration (an array length, a pattern) sees
+    /// the value. Only the item's own tokens are consumed: a `{ .. }` or
+    /// `( .. )` in its initializer is skipped by bracket matching, and every
+    /// other item's body is skipped the same way, so no nested `const` inside a
+    /// function body is collected here.
+    fn prescan_consts(&mut self) -> PResult<()> {
+        let saved = self.i;
+        let mut items: Vec<ConstDef> = Vec::new();
+        self.i = 0;
+        loop {
+            match self.peek() {
+                None => break,
+                Some(Tok::Const) => items.push(self.parse_const()?),
+                Some(Tok::Struct) | Some(Tok::Enum) => {
+                    // Skip `Name` then a balanced `{ .. }` body.
+                    self.i += 1;
+                    if matches!(self.peek(), Some(Tok::Ident(_))) {
+                        self.i += 1;
+                    }
+                    self.skip_balanced(Tok::LBrace, Tok::RBrace)?;
+                }
+                Some(Tok::Impl) => {
+                    self.i += 1;
+                    if matches!(self.peek(), Some(Tok::Ident(_))) {
+                        self.i += 1;
+                    }
+                    self.skip_balanced(Tok::LBrace, Tok::RBrace)?;
+                }
+                Some(Tok::Fn) => {
+                    // Skip the name, the parameter list, the return type and the
+                    // body, so a `const` inside a function body is not seen.
+                    self.i += 1;
+                    if matches!(self.peek(), Some(Tok::Ident(_))) {
+                        self.i += 1;
+                    }
+                    self.skip_balanced(Tok::LParen, Tok::RParen)?;
+                    // Skip the return type to the body. It is not parsed here,
+                    // because a `[T; N]` return type would need the constant
+                    // values that are still being collected.
+                    if self.eat(&Tok::Arrow) {
+                        while let Some(t) = self.peek() {
+                            if *t == Tok::LBrace {
+                                break;
+                            }
+                            self.i += 1;
+                        }
+                    }
+                    self.skip_balanced(Tok::LBrace, Tok::RBrace)?;
+                }
+                Some(_) => self.i += 1,
+            }
+        }
+        self.i = saved;
+        self.resolve_consts(&items);
+        Ok(())
+    }
+
+    /// Advance past a balanced `open .. close` group, starting at `open`.
+    fn skip_balanced(&mut self, open: Tok, close: Tok) -> PResult<()> {
+        if self.peek() != Some(&open) {
+            return Ok(());
+        }
+        let mut depth = 0i32;
+        while let Some(t) = self.peek() {
+            if *t == open {
+                depth += 1;
+            } else if *t == close {
+                depth -= 1;
+                if depth == 0 {
+                    self.i += 1;
+                    return Ok(());
+                }
+            }
+            self.i += 1;
+        }
+        Err(format!("at byte {}: unexpected end of input", self.pos()))
+    }
+
+    /// `const NAME: TYPE = EXPR;`. The declared type is resolved by sema; the
+    /// value is evaluated here, as soon as it is parsed, so a later array type
+    /// or pattern can use it. A value that does not fold yet (it names a
+    /// constant declared later) is left for `resolve_consts`, which reruns once
+    /// every item has been seen.
+    fn parse_const(&mut self) -> PResult<ConstDef> {
+        self.expect(Tok::Const)?;
+        let name = self.expect_ident()?;
+        self.expect(Tok::Colon)?;
+        let ty = self.parse_type()?;
+        self.expect(Tok::Eq)?;
+        let value = self.parse_expr()?;
+        self.expect(Tok::Semi)?;
+        Ok(ConstDef { name, ty, value })
+    }
+
+    /// Evaluate every `const` item into `self.consts`/`self.const_bools`, to a
+    /// fixpoint so a constant may name one declared later. Runs after the whole
+    /// program is parsed, so a forward reference resolves here even though it
+    /// did not while the use site was parsed.
+    fn resolve_consts(&mut self, defs: &[ConstDef]) {
+        let items: Vec<(String, Type, Expr)> = defs
+            .iter()
+            .map(|d| (d.name.clone(), d.ty.clone(), d.value.clone()))
+            .collect();
+        for (name, val) in crate::consts::resolve(&items) {
+            match val {
+                crate::consts::ConstVal::Int(v) => {
+                    self.consts.insert(name, v);
+                }
+                crate::consts::ConstVal::Bool(v) => {
+                    self.const_bools.insert(name, v);
+                }
+            }
+        }
+    }
+
     fn parse_struct(&mut self) -> PResult<StructDef> {
         self.expect(Tok::Struct)?;
         let name = self.expect_ident()?;
@@ -190,12 +332,12 @@ impl Parser {
         let mut params = Vec::new();
         let mut param_mut = Vec::new();
         while self.peek() != Some(&Tok::RParen) {
-            let m = self.eat(&Tok::Mut);
+            let pm = self.eat(&Tok::Mut);
             let pname = self.expect_ident()?;
             self.expect(Tok::Colon)?;
             let ty = self.parse_type()?;
             params.push((pname, ty));
-            param_mut.push(m);
+            param_mut.push(pm);
             if !self.eat(&Tok::Comma) {
                 break;
             }
@@ -207,7 +349,7 @@ impl Parser {
             Type::Unit
         };
         let body = self.parse_block()?;
-        Ok(FnDef { name, self_ty: None, takes_self: false, params, param_mut, ret, body, param_slots: Vec::new(), ret_slot: -1, nslots: 0 })
+        Ok(FnDef { name, self_ty: None, takes_self: false, ref_self: false, ref_self_mut: false, params, param_mut, ret, body, param_slots: Vec::new(), ret_slot: -1, nslots: 0 })
     }
 
     /// `impl Type { fn method(self, ..) -> .. { .. } }`. The methods are pushed
@@ -242,9 +384,11 @@ impl Parser {
         self.expect(Tok::Fn)?;
         let name = self.expect_ident()?;
         self.expect(Tok::LParen)?;
-        // First parameter must be `self` (an immutable receiver). We accept the
-        // `&self` spelling too and ignore the `&`, since rmc has no references.
-        self.eat(&Tok::Amp);
+        // First parameter must be `self`. `&self` / `&mut self` make the receiver
+        // a reference, so the call passes the value's address rather than a copy;
+        // `self` takes the receiver by value.
+        let by_ref = self.eat(&Tok::Amp);
+        let by_mut = by_ref && self.eat(&Tok::Mut);
         let first = self.expect_ident()?;
         if first != "self" {
             return Err(format!(
@@ -256,12 +400,12 @@ impl Parser {
         let mut param_mut = Vec::new();
         if self.eat(&Tok::Comma) {
             while self.peek() != Some(&Tok::RParen) {
-                let m = self.eat(&Tok::Mut);
+                let pm = self.eat(&Tok::Mut);
                 let pname = self.expect_ident()?;
                 self.expect(Tok::Colon)?;
                 let pty = self.parse_type()?;
                 params.push((pname, pty));
-                param_mut.push(m);
+                param_mut.push(pm);
                 if !self.eat(&Tok::Comma) {
                     break;
                 }
@@ -274,6 +418,8 @@ impl Parser {
             name: format!("{ty}${name}"),
             self_ty: Some(ty.to_string()),
             takes_self: true,
+            ref_self: by_ref,
+            ref_self_mut: by_mut,
             params,
             param_mut,
             ret,
@@ -292,6 +438,16 @@ impl Parser {
     }
 
     fn parse_type_inner(&mut self) -> PResult<Type> {
+        if self.eat(&Tok::Amp) {
+            let mutable = self.eat(&Tok::Mut);
+            let inner = self.parse_type()?;
+            return Ok(Type::Ref(Box::new(inner), mutable));
+        }
+        // `&&T` lexes as one token; treat it as two references.
+        if self.eat(&Tok::AmpAmp) {
+            let inner = self.parse_type()?;
+            return Ok(Type::Ref(Box::new(Type::Ref(Box::new(inner), false)), false));
+        }
         match self.peek() {
             Some(Tok::Ident(n)) if n == "Self" => {
                 self.i += 1;
@@ -312,9 +468,18 @@ impl Parser {
                 self.i += 1;
                 let elem = self.parse_type()?;
                 self.expect(Tok::Semi)?;
-                let n = match self.bump() {
-                    Tok::Int(v) if v >= 0 => v as usize,
-                    other => return Err(format!("array length must be a non-negative integer, found {}", other.describe())),
+                // A constant length: a literal, or an expression over constants
+                // (`[i64; N]`, `[i64; N + 1]`). It is evaluated here because the
+                // array's size is fixed at parse time.
+                let len = self.parse_expr()?;
+                let n = match eval_i64(&len, &self.consts) {
+                    Some(v) if v >= 0 => v as usize,
+                    _ => {
+                        return Err(format!(
+                            "at byte {}: array length must be a non-negative constant integer",
+                            self.pos()
+                        ))
+                    }
                 };
                 self.expect(Tok::RBracket)?;
                 Ok(Type::Array(Box::new(elem), n))
@@ -413,6 +578,8 @@ impl Parser {
                 | Some(Tok::If)
                 | Some(Tok::Match)
                 | Some(Tok::LBracket)
+                | Some(Tok::Amp)
+                | Some(Tok::Star)
                 // A bare `{ ... }` is a block expression, valid as a statement
                 // without a `;`. Without this it fell through to `parse_stmt`,
                 // which has no arm for `{`, so a nested block failed to parse.
@@ -521,6 +688,19 @@ impl Parser {
         let tv = |name: &str| Expr::Var { name: name.to_string(), slot: -1, ty: Type::I64 };
         let mut stmts = Vec::new();
 
+        // The modifying operand is evaluated before the assignee place (the one
+        // right-to-left expression), so its side effects run first: bind it now,
+        // ahead of any place temporary, or a call in the place would overtake it.
+        let rv = format!("\u{0}rv{}", self.tmp);
+        self.tmp += 1;
+        stmts.push(Stmt::Let {
+            name: rv.clone(),
+            ty: Some(Type::I64),
+            init: Some(value),
+            slot: -1,
+            mutable: true,
+        });
+
         // Bind the read target and the write target to the *same* location. A
         // side-effecting component (a call in the base or the subscript) is
         // evaluated once into a temporary and reused, so `make().x += 1` calls
@@ -574,7 +754,7 @@ impl Parser {
         });
         stmts.push(Stmt::Assign {
             target: write,
-            value: Expr::Bin(op, Box::new(tv(&tmp)), Box::new(value)),
+            value: Expr::Bin(op, Box::new(tv(&tmp)), Box::new(tv(&rv))),
         });
         Stmt::Expr(Expr::Block(Block {
             stmts,
@@ -748,6 +928,13 @@ impl Parser {
             Some(Tok::Minus) => {
                 self.i += 1;
                 self.bump_depth()?;
+                // `-9223372036854775808` is the one literal whose magnitude
+                // exceeds `i64::MAX`; the lexer hands it over as a distinct
+                // token so only this `-` position can make it valid.
+                if self.peek() == Some(&Tok::IntMinMagnitude) {
+                    self.i += 1;
+                    return Ok(Expr::Int(i64::MIN));
+                }
                 let e = self.parse_unary()?;
                 Ok(Expr::Un(UnOp::Neg, Box::new(e)))
             }
@@ -756,6 +943,27 @@ impl Parser {
                 self.bump_depth()?;
                 let e = self.parse_unary()?;
                 Ok(Expr::Un(UnOp::Not, Box::new(e)))
+            }
+            Some(Tok::Amp) => {
+                self.i += 1;
+                let mutable = self.eat(&Tok::Mut);
+                self.bump_depth()?;
+                let e = self.parse_unary()?;
+                Ok(Expr::AddrOf { expr: Box::new(e), ty: Type::Named(String::new()), mutable, slot: -1 })
+            }
+            // `&&e` lexes as one token; treat it as two address-ofs.
+            Some(Tok::AmpAmp) => {
+                self.i += 1;
+                self.bump_depth()?;
+                let e = self.parse_unary()?;
+                let inner = Expr::AddrOf { expr: Box::new(e), ty: Type::Named(String::new()), mutable: false, slot: -1 };
+                Ok(Expr::AddrOf { expr: Box::new(inner), ty: Type::Named(String::new()), mutable: false, slot: -1 })
+            }
+            Some(Tok::Star) => {
+                self.i += 1;
+                self.bump_depth()?;
+                let e = self.parse_unary()?;
+                Ok(Expr::Deref { expr: Box::new(e), ty: Type::Named(String::new()) })
             }
             _ => self.parse_postfix(),
         }
@@ -794,6 +1002,77 @@ impl Parser {
         Ok(e)
     }
 
+    /// One pattern: an integer, `true`/`false`, `Enum::Variant`, `Enum::Variant(a, b)`,
+    /// a bare binding name, or `_`. Shared by `match` arms and `if let`.
+    fn parse_pattern(&mut self) -> PResult<Pat> {
+        match self.peek().cloned() {
+            Some(Tok::Underscore) => {
+                self.i += 1;
+                Ok(Pat::Wild)
+            }
+            Some(Tok::Minus) => {
+                self.i += 1;
+                match self.bump() {
+                    Tok::Int(v) => Ok(Pat::Int(v.checked_neg().ok_or_else(|| {
+                        format!("at byte {}: pattern literal out of range", self.pos())
+                    })?)),
+                    Tok::IntMinMagnitude => Ok(Pat::Int(i64::MIN)),
+                    other => Err(format!(
+                        "at byte {}: expected an integer after `-` in a pattern, found {}",
+                        self.pos(), other.describe()
+                    )),
+                }
+            }
+            Some(Tok::Int(v)) => {
+                self.i += 1;
+                Ok(Pat::Int(v))
+            }
+            Some(Tok::True) => {
+                self.i += 1;
+                Ok(Pat::Bool(true))
+            }
+            Some(Tok::False) => {
+                self.i += 1;
+                Ok(Pat::Bool(false))
+            }
+            // `Enum::Variant`, `Enum::Variant(a, b)`, a constant, or a binding.
+            Some(Tok::Ident(n)) => {
+                self.i += 1;
+                if self.eat(&Tok::ColonColon) {
+                    let variant = self.expect_ident()?;
+                    let mut bindings = None;
+                    if self.eat(&Tok::LParen) {
+                        let mut names = Vec::new();
+                        while self.peek() != Some(&Tok::RParen) {
+                            names.push(self.expect_ident()?);
+                            if !self.eat(&Tok::Comma) {
+                                break;
+                            }
+                        }
+                        self.expect(Tok::RParen)?;
+                        bindings = Some(names);
+                    }
+                    Ok(Pat::Variant(n, variant, bindings))
+                } else if let Some(v) = self.consts.get(&n) {
+                    // A bare name that names a constant is that constant's
+                    // value, not a fresh binding, exactly as rustc reads it.
+                    Ok(Pat::Int(*v))
+                } else if let Some(b) = self.const_bools.get(&n) {
+                    Ok(Pat::Bool(*b))
+                } else {
+                    // A bare name binds the scrutinee; `_` already matched the
+                    // wildcard case above.
+                    Ok(Pat::Bind(n))
+                }
+            }
+            other => Err(format!(
+                "at byte {}: expected an integer, `true`/`false`, `Enum::Variant` or `_` pattern, found {}",
+                self.pos(),
+                other.map(|t| t.describe()).unwrap_or_else(|| "end of input".into())
+            )),
+        }
+    }
+
     /// `match scrutinee { pat => expr, ... }` on integers. It desugars to a
     /// chain of `if` comparisons, so sema and codegen need no new cases. A
     /// pattern is an integer literal (optionally negated) or `_`; the first arm
@@ -809,57 +1088,7 @@ impl Parser {
             if self.peek().is_none() {
                 return Err(format!("at byte {}: unexpected end of input in `match`", self.pos()));
             }
-            let pat = match self.peek().cloned() {
-                Some(Tok::Underscore) => {
-                    self.i += 1;
-                    Pat::Wild
-                }
-                Some(Tok::Minus) => {
-                    self.i += 1;
-                    match self.bump() {
-                        Tok::Int(v) => Pat::Int(v.checked_neg().ok_or_else(|| {
-                            format!("at byte {}: pattern literal out of range", self.pos())
-                        })?),
-                        other => return Err(format!(
-                            "at byte {}: expected an integer after `-` in a pattern, found {}",
-                            self.pos(), other.describe()
-                        )),
-                    }
-                }
-                Some(Tok::Int(v)) => {
-                    self.i += 1;
-                    Pat::Int(v)
-                }
-                // `Enum::Variant`, `Enum::Variant(a, b)`, or a binding name.
-                Some(Tok::Ident(n)) => {
-                    self.i += 1;
-                    if self.eat(&Tok::ColonColon) {
-                        let variant = self.expect_ident()?;
-                        let mut bindings = None;
-                        if self.eat(&Tok::LParen) {
-                            let mut names = Vec::new();
-                            while self.peek() != Some(&Tok::RParen) {
-                                names.push(self.expect_ident()?);
-                                if !self.eat(&Tok::Comma) {
-                                    break;
-                                }
-                            }
-                            self.expect(Tok::RParen)?;
-                            bindings = Some(names);
-                        }
-                        Pat::Variant(n, variant, bindings)
-                    } else {
-                        // A bare name binds the scrutinee; `_` already matched
-                        // the wildcard case above.
-                        Pat::Bind(n)
-                    }
-                }
-                other => return Err(format!(
-                    "at byte {}: expected an integer, `Enum::Variant` or `_` pattern, found {}",
-                    self.pos(),
-                    other.map(|t| t.describe()).unwrap_or_else(|| "end of input".into())
-                )),
-            };
+            let pat = self.parse_pattern()?;
             self.expect(Tok::FatArrow)?;
             let body = self.parse_expr()?;
             arms.push((pat, body));
@@ -884,6 +1113,21 @@ impl Parser {
     /// Rust). With no `_`, the chain has no final `else`, so a non-matching
     /// value yields `()`.
     fn desugar_match(&mut self, scrutinee: Expr, arms: Vec<(Pat, Expr)>) -> Expr {
+        self.desugar_match_arms(scrutinee, arms, false)
+    }
+
+    /// `desugar_match`, with `check_dead_arms` deciding how an irrefutable arm
+    /// (`_` or a binding) treats the arms after it. `match` leaves them out of
+    /// the tree, as before; `if let` keeps them behind an `if true` so their
+    /// type is still checked (see `irrefutable_arm`).
+    fn desugar_match_arms(
+        &mut self,
+        scrutinee: Expr,
+        arms: Vec<(Pat, Expr)>,
+        check_dead_arms: bool,
+    ) -> Expr {
+        // A `_` or binding arm makes the match exhaustive in every position.
+        let has_catch_all = arms.iter().any(|(p, _)| matches!(p, Pat::Wild | Pat::Bind(_)));
         let (subj, prelude) = match scrutinee {
             Expr::Var { .. } | Expr::Int(_) | Expr::EnumVariant { .. } => (scrutinee, None),
             other => {
@@ -893,74 +1137,133 @@ impl Parser {
                     Expr::Var { name: name.clone(), slot: -1, ty: Type::I64 },
                     // No annotation: the temp takes the scrutinee's type, which
                     // may be an enum rather than an integer.
-                    Some(Stmt::Let { name, ty: None, init: Some(other), slot: -1, mutable: true }),
+                    Some(Stmt::Let { name, ty: None, init: Some(other), slot: -1, mutable: false }),
                 )
             }
         };
         let mut acc: Option<Expr> = None;
         for (pat, body) in arms.into_iter().rev() {
-            acc = Some(match pat {
-                Pat::Wild => body,
-                // `name => body` binds the whole scrutinee.
-                Pat::Bind(name) => Expr::Block(Block {
-                    stmts: vec![Stmt::Let {
-                        name,
-                        ty: None,
-                        init: Some(subj.clone()),
-                        slot: -1,
-                        mutable: true,
-                    }],
-                    tail: Some(Box::new(body)),
-                }),
-                Pat::Int(k) => {
-                    let cond = Expr::Bin(BinOp::Eq, Box::new(subj.clone()), Box::new(Expr::Int(k)));
-                    Self::match_arm(cond, body, acc)
-                }
-                Pat::Variant(enum_name, variant, bindings) => {
-                    let n_binds = match &bindings {
-                        Some(names) => names.len() as i32,
-                        None => -1,
-                    };
-                    let cond = Expr::VariantTest {
-                        scrutinee: Box::new(subj.clone()),
-                        enum_name: enum_name.clone(),
-                        variant: variant.clone(),
-                        tag: -1,
-                        n_binds,
-                    };
-                    // `Enum::V(w, x)` binds each payload field in the arm body.
-                    let body = match bindings {
-                        Some(names) if !names.is_empty() => {
-                            let stmts = names
-                                .into_iter()
-                                .enumerate()
-                                .map(|(idx, name)| Stmt::Let {
-                                    name,
-                                    ty: None,
-                                    init: Some(Expr::EnumPayload {
-                                        recv: Box::new(subj.clone()),
-                                        enum_name: enum_name.clone(),
-                                        variant: variant.clone(),
-                                        idx,
-                                        offset: 0,
-                                        ty: Type::Unit,
-                                    }),
-                                    slot: -1,
-                                    mutable: true,
-                                })
-                                .collect();
-                            Expr::Block(Block { stmts, tail: Some(Box::new(body)) })
-                        }
-                        _ => body,
-                    };
-                    Self::match_arm(cond, body, acc)
-                }
-            });
+            acc = Some(Self::desugar_arm(pat, &subj, body, acc, check_dead_arms));
         }
         let acc = acc.expect("a `match` has at least one arm");
+        let acc = Expr::MatchBoundary(
+            Block { stmts: Vec::new(), tail: Some(Box::new(acc)) },
+            has_catch_all,
+        );
         match prelude {
             None => acc,
             Some(stmt) => Expr::Block(Block { stmts: vec![stmt], tail: Some(Box::new(acc)) }),
+        }
+    }
+
+    /// `if let PAT = EXPR { then } else { els }` is Rust's sugar for
+    /// `match EXPR { PAT => then, _ => els_or_unit }`, so it desugars to a
+    /// two-arm `match` and reuses that path. Unlike `match`, an `if let` need
+    /// not be exhaustive: a non-matching value falls through to the `_` arm,
+    /// which is the `else` block or `()` — so a non-unit `then` with no `else`
+    /// is a branch-type error, as in rustc.
+    fn desugar_if_let(&mut self, pat: Pat, scrutinee: Expr, then: Block, els: Option<Block>) -> Expr {
+        let fallback = match els {
+            Some(b) => Expr::Block(b),
+            None => Expr::Block(Block { stmts: Vec::new(), tail: None }),
+        };
+        let arms = vec![(pat, Expr::Block(then)), (Pat::Wild, fallback)];
+        self.desugar_match_arms(scrutinee, arms, true)
+    }
+
+    /// One arm of a desugared `match` or `if let`: the pattern test, the
+    /// bindings it introduces, and the fallback `rest` for a non-match.
+    fn desugar_arm(pat: Pat, subj: &Expr, body: Expr, rest: Option<Expr>, check_dead: bool) -> Expr {
+        match pat {
+            // A wildcard ends the chain, so its body is wrapped in a block
+            // (like a binding arm's) to mark it as a body rather than another
+            // chain step. Without the block, `match_never_typed` would read a
+            // body that is itself an `if` as the next arm's test and misjudge
+            // whether the match is `!`.
+            Pat::Wild => Expr::Block(Block {
+                stmts: Vec::new(),
+                tail: Some(Box::new(Self::irrefutable_arm(body, rest, check_dead))),
+            }),
+            // `name => body` binds the whole scrutinee.
+            Pat::Bind(name) => Expr::Block(Block {
+                stmts: vec![Stmt::Let {
+                    name,
+                    ty: None,
+                    init: Some(subj.clone()),
+                    slot: -1,
+                    mutable: false,
+                }],
+                tail: Some(Box::new(Self::irrefutable_arm(body, rest, check_dead))),
+            }),
+            Pat::Int(k) => {
+                let cond = Expr::Bin(BinOp::Eq, Box::new(subj.clone()), Box::new(Expr::Int(k)));
+                Self::match_arm(cond, body, rest)
+            }
+            // `true`/`false` become a `BoolTest`, not a `Bin(Eq, ..)`, so a
+            // chain of them can be recognised as an exhaustive bool match.
+            Pat::Bool(b) => {
+                let cond = Expr::BoolTest { scrutinee: Box::new(subj.clone()), value: b };
+                Self::match_arm(cond, body, rest)
+            }
+            Pat::Variant(enum_name, variant, bindings) => {
+                let n_binds = match &bindings {
+                    Some(names) => names.len() as i32,
+                    None => -1,
+                };
+                let cond = Expr::VariantTest {
+                    scrutinee: Box::new(subj.clone()),
+                    enum_name: enum_name.clone(),
+                    variant: variant.clone(),
+                    tag: -1,
+                    n_binds,
+                };
+                // `Enum::V(w, x)` binds each payload field in the arm body.
+                let body = match bindings {
+                    Some(names) if !names.is_empty() => {
+                        let stmts = names
+                            .into_iter()
+                            .enumerate()
+                            .map(|(idx, name)| Stmt::Let {
+                                name,
+                                ty: None,
+                                mutable: false,
+                                init: Some(Expr::EnumPayload {
+                                    recv: Box::new(subj.clone()),
+                                    enum_name: enum_name.clone(),
+                                    variant: variant.clone(),
+                                    idx,
+                                    offset: 0,
+                                    ty: Type::Unit,
+                                }),
+                                slot: -1,
+                            })
+                            .collect();
+                        Expr::Block(Block { stmts, tail: Some(Box::new(body)) })
+                    }
+                    _ => body,
+                };
+                Self::match_arm(cond, body, rest)
+            }
+        }
+    }
+
+    /// An irrefutable arm (`_` or a binding) always matches, so `rest` (the
+    /// arms after it, or an `if let`'s `else`) is unreachable and dropped by
+    /// Rust. For `if let`, `check_dead` is set and `rest` is kept behind an
+    /// `if true` so its type is still checked: rustc rejects a mismatch (E0308)
+    /// between a non-unit `then` and the `else` even when the pattern is
+    /// irrefutable, and rmc must too. Desugaring to `if true { body } else {
+    /// rest }` reuses the ordinary branch-type check for exactly that — the
+    /// `else` is never run, but its type must equal `body`'s. For `match` the
+    /// dead arms are dropped, as before. With no `rest` the arm is just `body`.
+    fn irrefutable_arm(body: Expr, rest: Option<Expr>, check_dead: bool) -> Expr {
+        match (check_dead, rest) {
+            (true, Some(r)) => Expr::If(
+                Box::new(Expr::Bool(true)),
+                Block { stmts: Vec::new(), tail: Some(Box::new(body)) },
+                Some(Block { stmts: Vec::new(), tail: Some(Box::new(r)) }),
+            ),
+            _ => body,
         }
     }
 
@@ -987,6 +1290,13 @@ impl Parser {
                 self.i += 1;
                 Ok(Expr::Int(v))
             }
+            // The magnitude `2^63` is only valid directly under a `-`, which
+            // `parse_unary` folds into `Expr::Int(i64::MIN)`. Reaching it here
+            // means it stood alone, so it is out of range, as in rustc.
+            Some(Tok::IntMinMagnitude) => Err(format!(
+                "at byte {}: integer literal `9223372036854775808` is out of range for `i64`",
+                self.pos()
+            )),
             Some(Tok::Str(s)) => {
                 self.i += 1;
                 Ok(Expr::Str(s))
@@ -1066,6 +1376,12 @@ impl Parser {
                     }
                     self.expect(Tok::RParen)?;
                     Ok(Expr::Call { name, args, arg_slots: Vec::new(), ret_slot: -1, ret_ty: Type::I64 })
+                } else if let Some(v) = self.consts.get(&name) {
+                    // A reference to a constant is its value, substituted here
+                    // so sema and codegen never see a constant as a variable.
+                    Ok(Expr::Int(*v))
+                } else if let Some(b) = self.const_bools.get(&name) {
+                    Ok(Expr::Bool(*b))
                 } else {
                     Ok(Expr::Var { name, slot: -1, ty: Type::I64 })
                 }
@@ -1082,6 +1398,27 @@ impl Parser {
             }
             Some(Tok::If) => {
                 self.i += 1;
+                // `if let PAT = EXPR { .. } else { .. }` is sugar for a one-arm
+                // `match`, so it desugars through the same path and sema and
+                // codegen need no new case.
+                if self.peek() == Some(&Tok::Let) {
+                    self.i += 1;
+                    let pat = self.parse_pattern()?;
+                    self.expect(Tok::Eq)?;
+                    let scrutinee = self.parse_cond()?;
+                    let then = self.parse_block()?;
+                    let els = if self.eat(&Tok::Else) {
+                        if self.peek() == Some(&Tok::If) {
+                            let nested = self.parse_primary()?;
+                            Some(Block { stmts: Vec::new(), tail: Some(Box::new(nested)) })
+                        } else {
+                            Some(self.parse_block()?)
+                        }
+                    } else {
+                        None
+                    };
+                    return Ok(self.desugar_if_let(pat, scrutinee, then, els));
+                }
                 let cond = self.parse_cond()?;
                 let then = self.parse_block()?;
                 let els = if self.eat(&Tok::Else) {
@@ -1106,9 +1443,16 @@ impl Parser {
                 self.i += 1;
                 let first = self.parse_expr()?;
                 if self.eat(&Tok::Semi) {
-                    let n = match self.bump() {
-                        Tok::Int(v) if v >= 0 => v as usize,
-                        other => return Err(format!("array length must be a non-negative integer, found {}", other.describe())),
+                    // `[v; N]`: the repeat count is a constant expression.
+                    let len = self.parse_expr()?;
+                    let n = match eval_i64(&len, &self.consts) {
+                        Some(v) if v >= 0 => v as usize,
+                        _ => {
+                            return Err(format!(
+                                "at byte {}: array length must be a non-negative constant integer",
+                                self.pos()
+                            ))
+                        }
                     };
                     self.expect(Tok::RBracket)?;
                     Ok(Expr::ArrayLit(Box::new(first), n))
@@ -1137,11 +1481,14 @@ impl Parser {
     }
 }
 
-/// A `match` pattern: a wildcard, an integer literal, or an `Enum::Variant`.
-/// The variant is resolved to its tag by sema, once the enum is known.
+/// A `match` pattern: a wildcard, an integer or `bool` literal, or an
+/// `Enum::Variant`. The variant is resolved to its tag by sema, once the enum
+/// is known.
 enum Pat {
     Wild,
     Int(i64),
+    /// `true` or `false`.
+    Bool(bool),
     /// `Enum::Variant` or `Enum::Variant(..)`. The constructor is resolved by
     /// sema; the optional bindings name the payload fields, in field order.
     Variant(String, String, Option<Vec<String>>),
@@ -1163,6 +1510,7 @@ fn expr_has_call(e: &Expr) -> bool {
             expr_has_call(c) || block_has_call_p(t) || els.as_ref().map_or(false, block_has_call_p)
         }
         Expr::Block(b) => block_has_call_p(b),
+        Expr::MatchBoundary(b, _) => block_has_call_p(b),
         Expr::StructLit { fields, .. } => fields.iter().any(|f| expr_has_call(&f.value)),
         Expr::ArrayLit(v, _) => expr_has_call(v),
         _ => false,

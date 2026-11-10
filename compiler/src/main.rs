@@ -17,6 +17,9 @@ struct Options {
     keep_asm: bool,
     overflow_checks: bool,
     bounds_checks: bool,
+    no_inline: bool,
+    no_licm: bool,
+    no_tco: bool,
 }
 
 fn parse_args() -> Result<Options, String> {
@@ -27,6 +30,9 @@ fn parse_args() -> Result<Options, String> {
     let mut keep_asm = false;
     let mut overflow_checks = false;
     let mut bounds_checks = false;
+    let mut no_inline = false;
+    let mut no_licm = false;
+    let mut no_tco = false;
 
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -38,6 +44,9 @@ fn parse_args() -> Result<Options, String> {
             "--keep-asm" => keep_asm = true,
             "--overflow-checks" => overflow_checks = true,
             "--bounds-checks" => bounds_checks = true,
+            "--no-inline" => no_inline = true,
+            "--no-licm" => no_licm = true,
+            "--no-tco" => no_tco = true,
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -66,6 +75,9 @@ fn parse_args() -> Result<Options, String> {
         keep_asm,
         overflow_checks,
         bounds_checks,
+        no_inline,
+        no_licm,
+        no_tco,
     })
 }
 
@@ -81,6 +93,9 @@ fn print_help() {
          \x20   --keep-asm     keep the intermediate .s file next to the output\n\
          \x20   --overflow-checks  trap on i64 +,-,* overflow (off by default)\n\
          \x20   --bounds-checks    trap on an out-of-range array index (off by default)\n\
+         \x20   --no-inline        disable the inlining pass (on by default)\n\
+         \x20   --no-licm          disable loop-invariant code motion (on by default)\n\
+         \x20   --no-tco           disable self-recursion-to-loop (on by default)\n\
          \x20   -h, --help     show this help\n\
          \n\
          The accepted language is a strict subset of Rust. Entry point is `fn main`."
@@ -116,6 +131,9 @@ fn run(opts: Options) -> Result<(), String> {
         &CompileOptions {
             overflow_checks: opts.overflow_checks,
             bounds_checks: opts.bounds_checks,
+            no_inline: opts.no_inline,
+            no_licm: opts.no_licm,
+            no_tco: opts.no_tco,
         },
     )?;
 
@@ -155,13 +173,19 @@ fn assemble(asm: &Path, obj: &Path) -> Result<(), String> {
 
 fn link(obj: &Path, exe: &Path) -> Result<(), String> {
     // The assembly carries a `.note.GNU-stack` section, so the stack is marked
-    // non-executable without an explicit `-z noexecstack`. `-n` drops the
-    // page alignment between sections, which roughly halves the artifact size.
+    // non-executable without an explicit `-z noexecstack`.
+    //
+    // `-z noseparate-code` packs the read-only and executable sections into a
+    // single read+execute LOAD segment and keeps the writable data in its own
+    // read+write one. That is both smaller than `-n` (which packs *everything*
+    // into one read+write+execute segment, an avoidable W^X hazard) and the
+    // smallest layout `ld` offers here: 3304 bytes vs 7344 for the hello case.
     let out = Command::new("ld")
         .arg("-o")
         .arg(exe)
         .arg("--build-id=none")
-        .arg("-n")
+        .arg("-z")
+        .arg("noseparate-code")
         .arg(obj)
         .output()
         .map_err(|e| format!("failed to run `ld`: {e}"))?;

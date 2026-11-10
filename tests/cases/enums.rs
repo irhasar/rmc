@@ -48,4 +48,24 @@ fn main() {
     }
     println!("{}", n);
     println!("{}", s as i64);
+    let dirs: [Dir; 4] = [Dir::North, Dir::East, Dir::South, Dir::West];
+    let mut i: i64 = 0;
+    let mut sum: i64 = 0;
+    while i < 4 {
+        sum += dirs[i as usize] as i64;
+        i += 1;
+    }
+    println!("{}", sum);
+    let t: i64 = match dirs[3] {
+        Dir::West => 99,
+        Dir::North => 11,
+        Dir::East => 22,
+        Dir::South => 33,
+    };
+    println!("{}", t);
+    let mut rep: [Color; 3] = [Color::Blue; 3];
+    rep[1] = Color::Red;
+    println!("{}", rep[0] as i64);
+    println!("{}", rep[1] as i64);
+    println!("{}", rep[2] as i64);
 }

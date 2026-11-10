@@ -1,0 +1,24 @@
+// Regression tests for review findings on the optimiser branch.
+struct S { n: i64 }
+
+fn sum(a: i64, b: i64) -> i64 { a + b }
+fn set(p: &mut i64) -> i64 { *p = 10; 0 }
+
+fn main() -> i64 {
+    // The inliner must snapshot `x` before `set` writes it.
+    let mut x: i64 = 1;
+    print_i64(sum(x, set(&mut x)));
+
+    // Assignment evaluates its value before an effectful place.
+    let mut y: i64 = 1;
+    let mut a: [i64; 1] = [0; 1];
+    a[{ y = 2; 0 }] = y;
+    print_i64(a[0]);
+
+    // Bounds checks must see through a reference to an array.
+    let arr: [i64; 3] = [7, 8, 9];
+    let r: &[i64; 3] = &arr;
+    let i: i64 = 2;
+    print_i64(r[i]);
+    return 0;
+}

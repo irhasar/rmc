@@ -26,12 +26,21 @@ cargo build --release --manifest-path compiler/Cargo.toml
 # full benchmark suite (writes binaries to /tmp/rmcbench)
 python3 bench/run.py
 
+# benchmark suite, also recording the dated result to the repo
+python3 bench/run.py --markdown bench/RESULTS.md
+
 # differential test suite: rmc vs rustc on twin programs
 python3 tests/run.py -v
 
 # differential fuzzer: random programs vs rustc (reproducible seeds)
 python3 tools/fuzz.py --mode expr --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1
+python3 tools/fuzz.py --mode opt --n 500 --seed 1
+python3 tools/fuzz.py --mode arith --n 500 --seed 1
+python3 tools/fuzz.py --mode nest --n 500 --seed 1
+python3 tools/fuzz.py --mode pat --n 500 --seed 1
+python3 tools/fuzz.py --mode order --n 500 --seed 1
+python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 ```
 
 ## Source map
@@ -50,37 +59,223 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
   so sema and codegen have no `match` case. A non-`Var`/`Int` scrutinee is bound
   to a hidden `let` first, so a call in the scrutinee runs once. An arm after
   `_` is unreachable and dropped (the `_` body becomes the `else`).
-- `compiler/src/ast.rs` — AST and `Type` (`I64`, `Bool`, `Unit`, `Array`,
-  `Struct`, and the parser-only placeholder `Named`).
+  `if let PAT = EXPR { .. } else { .. }` is parsed here too and desugared by
+  `desugar_if_let` into a two-arm `match` (`PAT => then, _ => else_or_unit`),
+  reusing `desugar_match_arms` and the `parse_pattern` shared with `match` arms,
+  so sema and codegen gain no new case. The `_` fallback arm is what makes an
+  `if let` need not be exhaustive; a non-unit `then` with no `else` then trips
+  the ordinary branch-type check, as in rustc. But note the two desugarings
+  differ in how an *irrefutable* arm (`_` or a binding) treats what follows it.
+  `match` drops the dead arms, as before. `if let` must not: rustc type-checks
+  the dead `else` and rejects `if let y = o { 1 } else { }` (E0308), so
+  `desugar_match_arms` takes a `check_dead_arms` flag and `irrefutable_arm`
+  wraps the dead arm in `if true { body } else { rest }` to carry that check
+  through the ordinary branch-type rule. Dropping the dead `else` for `if let`
+  accepts a program rustc rejects; wrapping the dead arms for `match` instead
+  rejects a program rustc accepts (`match o { _ => 5, 3 => 9 }` in value
+  position), which is why the flag exists.
+- `compiler/src/ast.rs` — AST and `Type` (`I64`, `Bool`, `Str`, `Unit`, `Array`,
+  `Struct`, and the parser-only placeholder `Named`). `Str` is the type of a
+  string literal: one slot holding a pointer to NUL-terminated static data. It
+  is a scalar (travels in a register) but is deliberately *not* `i64`, so a
+  string cannot be added to an integer or passed where an `i64` is expected.
+  There is no way to spell the type in source, so only a literal produces it.
 - `compiler/src/sema.rs` — type checking, struct layout, stack-slot allocation,
-  builtin sigs. Resolves `Type::Named`, fills `Field`/`FieldInit` offsets, and
-  allocates the hidden slots for aggregate arguments and returns.
+  builtin sigs, and the soundness checks (mutability, definite initialization,
+  constant array bounds, string typing — see "Soundness checks" below). Resolves
+  `Type::Named`, fills `Field`/`FieldInit` offsets, and allocates the hidden
+  slots for aggregate arguments and returns.
+- `compiler/src/consts.rs` — shared constant folding: `const_i64`/`const_binop`
+  (used by sema to fold a constant index or operand) and `resolve`/`eval_i64`
+  (used by the parser to evaluate `const` items). A `const` item has no storage
+  and no codegen; its value is substituted at every use.
+- `compiler/src/inline.rs` — AST inlining of small, straight-line, scalar
+  functions, run after sema and before codegen. See the inlining gotcha below.
+- `compiler/src/licm.rs` — loop-invariant code motion, run after inlining and
+  before codegen. See the LICM gotcha below.
 - `compiler/src/codegen.rs` — AST to AT&T x86-64 assembly.
 - `compiler/src/runtime.rs` — freestanding assembly runtime (`_start`, I/O,
   `alloc`/`free`, `arg_i64`, the overflow trap).
 - `compiler/src/main.rs` — CLI: reads source, calls the library, runs `as`/`ld`.
+  Flags: `--emit-asm`, `--keep-asm`, `--overflow-checks`, `--bounds-checks`,
+  `--no-inline`, `--no-licm`.
 - `compiler/tests/compile.rs` — unit tests for the front end and codegen; these
   run without `as`/`ld`.
 
 ## Things that are easy to get wrong
 
+- **A local whose address is taken must be forced into memory before promotion.**
+  The promotion pass picks the hottest scalar locals and keeps them only in
+  registers, so their frame slot goes stale. `&x` needs `x` to be in memory, so
+  `count_expr` calls `mark_addressed` on an `AddrOf` operand to set `mem[]` for
+  that slot *before* promotion runs. Miss this and `lea slot(%rbp)` reads a
+  garbage word. `mark_addressed` walks `Field`/`Index` bases and marks the whole
+  aggregate, and it must run in the dry pass too (it does: `count_expr` is shared
+  by both passes).
+- **A reference is a scalar, but an aggregate referent is named by its address.**
+  `Type::Ref` is a scalar (one slot, one register) even when the referent is a
+  struct or array. So `gen_expr` on a `Ref` local is a plain `mov`, while `Deref`
+  of an aggregate is a no-op after evaluating the pointer — the pointer *is* the
+  value. `gen_addr` on a `Deref` yields the pointer, and on a `Field` whose base
+  is `Ref`-typed it adds the offset to the pointer (`ref_base`), never to the
+  slot holding the pointer.
+- **`&e` on a non-lvalue materialises a temporary.** `sema` gives `AddrOf` a
+  hidden slot (`slot >= 0`) for a literal, call result, or aggregate-valued
+  operand, and codegen stores the value there and yields that address. An
+  aggregate operand is copied with `copy_words_rdi_rsi`, a scalar with one `mov`.
+  `slot == -1` means the operand is an lvalue and `gen_addr` is used directly.
+- **`&mut T` coerces to `&T`; the reverse does not.** `ref_coerces` is the only
+  coercion and is checked in `let`, assignment and call arguments. Both are one
+  pointer, so the coercion emits no code. `&mut` and `&` are otherwise distinct
+  types, which is why `Sig` carries `ref_self_mut`.
+- **A field read through a reference folds to one `disp(%reg)` load.**
+  `field_operand` recognises a reference local kept in a register (`p.x` where
+  `p: &T` and `p` is promoted) and a dereference of one (`(*q).x`), emitting
+  `mov off(%reg), %rax` instead of `mov %reg,%rax; add $off,%rax; mov (%rax),%rax`.
+  Before this, an `&self` accessor over an 8-field struct emitted ~3 instructions
+  per field and the `refs` benchmark ran at 69 ms; the fold brought rmc's own
+  runtime down ~1.4x to ~50 ms. Inlining the accessors then removed the calls
+  entirely, taking `refs` to ~20 ms, and LICM hoisted the now-inlined struct
+  reads out of the loop, taking it to ~6 ms. Flattening the accumulator fold over
+  the nested sum LICM leaves (`acc + t + (t + p) + p`), and unwrapping the
+  inliner's spliced block so the fold can see it, took `refs` to ~4.7 ms. Against
+  an honest rustc twin (which `black_box`es a term, or LLVM closes the whole loop
+  into `128 * n`) that is ~0.8x, not the ~0.14x an earlier run reported from the
+  folded loop; rustc is only ~1.2x ahead now, keeping the struct in registers
+  across the loop, which rmc does not. The fold is deliberately *one* level deep:
+  a `*p` used as a reference has its pointer in memory, so `ptr_reg` only matches
+  a reference *local*, never a `Deref`. `addr_reg` (local or one `Deref` of a
+  local) is the form `gen_addr` folds for a `lea`. Extending either to a deeper
+  chain would read the inner pointer from a register it is not in — the bug that
+  `(**ppr).x` in `tests/cases/references.rms` guards against.
+- **A scalar `*p` read is a memory operand.** `simple_operand` returns `(%reg)`
+  for a non-aggregate `Deref` whose pointer is a reference local, so `*p < 5`
+  is one `cmpq $5, (%reg)` and `*p` in a comparison needs no load. An aggregate
+  `Deref` is *not* a simple operand: its value is an address, not data.
+- **A store through a computed address folds a register/immediate value.**
+  `(*np).next = head` with both operands in registers emits one `mov %r, (%rax)`
+  rather than spilling `head` to a frame slot, storing the address, and reloading
+  (`mov %rbx, -80(%rbp); mov %rax, -72(%rbp); mov -72(%rbp), %rcx; ...`). The
+  fold guards on the value operand starting with `%` or `$` so a *memory* value
+  never becomes an illegal memory-to-memory `mov`; a frame-slot operand falls
+  back to the `%rax` round trip. The same fold applies to a field in a promoted
+  register (`mov %r, %r`) and to `field_operand`'s `disp(%reg)` form. Measured
+  +5% on `heap`. The two store-shape tests (`a_write_through_a_dereference...`,
+  `field_write_targets_the_right_slot`) assert the folded form.
+- **`trim_dead` drops unreachable instructions, self-moves, inverse-move pairs,
+  and a jump to the next label.** After each function body is generated it
+  removes instructions following an unconditional `jmp`/`ret` up to the next
+  label, `mov %r, %r`, a `mov` that exactly undoes the previous `mov` (`mov %rax,
+  X` then `mov X, %rax`, the store/reload pair a spill-and-restore emits), and a
+  `jmp L` whose target label `L:` is the very next line (the fallthrough already
+  reaches it — a function whose last expression is a value jumps to the
+  epilogue label that directly follows). A `return` inside an expression emits
+  `jmp epilogue` then the rest of the expression; the pass is a one-sweep
+  fixpoint because removing a line creates neither a label nor a new terminator.
+  The inverse-move check compares the full source and destination strings, so it
+  only fires on `mov` (there are no `movq $imm` register forms to confuse it)
+  and never across a label or any other instruction. It runs on the real body
+  only (the dry spill pass's output is truncated anyway), so it costs nothing at
+  compile time.
+- **A statement-position `if` without `else` emits no unit value.** `gen_stmt_expr`
+  sets a `discard` flag while generating an expression whose value is thrown
+  away, and `Expr::If` reads it: with no `else` the `xor %eax, %eax` that
+  materialises unit (and the `jmp` over the empty else) is dead, so it is
+  omitted. In `fib` that removes a dead instruction from the hot path. Only a
+  bare `if` is special-cased; a block or `match` in statement position is left
+  alone because an `if` in *its* tail is a value. The flag is saved and restored,
+  so a discarded outer expression does not silence an inner value `if`.
+  Runtime-neutral (the loops are latency-bound) but trims ~40 bytes per artifact.
+- **Inlining is a post-sema AST pass, and slots are frame indices.** Each
+  inlined call gets a fresh region of the caller's frame (`base = f.nslots`,
+  grown as it goes), the callee's slots are shifted by that base, and a read of
+  a parameter's slot is replaced by the argument. Two expansions must not share
+  a region or an inlined local would clobber another's. An argument with a side
+  effect must be bound to one slot, never substituted into a body that reads the
+  parameter twice — `f(sc(5))` with `f(x) = x + x` must call `sc` once. A
+  parameter the body assigns must also be bound to a fresh slot even when the
+  argument is a plain variable, because a parameter is a local copy: replacing
+  it by the caller's variable would make `x = x + 1` write through to the caller.
+  A trivial argument (a name or literal) is substituted in place only when no
+  *later* argument can write memory (`has_effect`); otherwise it is copied to a
+  fresh slot, so `sum(x, set(&mut x))` reads the `x` from before `set` ran.
+  A candidate body must be call-free and straight-line; because it is, inlining it
+  cannot expose new calls, but the pass still runs to a *fixpoint* because a
+  function only becomes call-free after its own callees are inlined (the `refs`
+  wrapper `sum_via_ref` needs round two). A statement-free block is unwrapped to
+  its tail after expansion: the spliced body of an accessor would otherwise stay
+  wrapped in an `Expr::Block`, and later passes (`simple_operand`, the
+  accumulator fold) cannot see through a block, so the hot loop would bounce its
+  sum through `%rax` and the spill slots. `--no-inline` disables it; the tests
+  that assert on the calling convention (`call f`, argument setup) use it.
+  `MAX_NODES` (48) must stay above a two-level helper — `sum_via_ref` is 35
+  nodes once its accessors land — and `count_expr` must count a block's tail,
+  or a candidate's size is understated and it is wrongly admitted.
+- **LICM never hoists a read through a reference.** A scalar field read is
+  hoisted only when its base is a local aggregate (`frame_field_base`); a field
+  read through `&T` dereferences a pointer that may be null (`0 as &S`) or
+  dangling, so hoisting it would fault on a loop whose body never runs. Any
+  field in the chain whose own type is a reference holds such a pointer, so
+  `h.p.n` (where `p: &S`) is not a frame access either. Local aggregate fields
+  are frame accesses and stay hoistable.
+- **LICM hoists a loop body's invariant arithmetic, and `for` slots are
+  loop-carried.** The pass rewrites only a loop *body*; a `while` condition and
+  a `for`'s bounds run once per iteration by design. A `for`'s variable and
+  bound are assigned by the loop itself, not in the body, so they are handed to
+  the effect scan as explicit `carried` slots — miss this and `if i == 3` in a
+  `for` body gets hoisted and the loop runs wrong. It hoists only a pure,
+  non-trapping scalar: no call, division/modulo, index, dereference, block or
+  `if`, and a field read only when the loop writes no memory at all. Any call in
+  the loop disables the whole loop, since a call can write anything. The effect
+  scan must also see writes that do not name a slot directly: a `while`
+  condition and a `for`'s start/end run as part of the loop, taking a local's
+  address (`&mut x`) marks that slot as written (an inlined callee's deref store
+  reaches it), an assignment target is scanned as an expression
+  (`a[next(&mut x)] = 0`), and assigning a whole aggregate marks the loop as
+  writing memory. The pass is off under `--overflow-checks` (a hoisted checked
+  `+`/`-`/`*` would trap at the wrong time); `--no-licm` disables it outright.
 - **Stack slots grow downward.** A local in slot `s` lives at
   `-(s+1+nregs)*8(%rbp)`, where `nregs` is the number of registers holding
   promoted locals. Address them positively and you overwrite the saved
   `%rbp`/return address and segfault. See `Codegen::off`.
 - **Spills live in frame slots, not on the stack.** `push_rax`/`pop_to` write a
-  slot at `spill_base + sp_off` instead of `push`/`pop`, so `%rsp` never moves
-  and no alignment pad is needed around a call. `spill_slots` is sized by a dry
-  run of the body; if the real pass spilled deeper than the reservation, spills
-  would overwrite locals. Keeping the two passes identical is what makes the
-  reservation exact.
+  slot instead of `push`/`pop`, so `%rsp` never moves and no alignment pad is
+  needed around a call. The first few spills are held in callee-saved registers
+  (`spill_regs`); only spills past those reach the frame, and they are packed at
+  `spill_base + (sp_off - spill_regs.len())` so a register-held spill leaves no
+  hole. `spill_slots` is sized by a dry run of the body; if the real pass spilled
+  deeper than the reservation, spills would overwrite locals. Keeping the two
+  passes identical is what makes the reservation exact.
+- **The frame is sized to the slots actually used, not to `nslots`.** The parser
+  sizes `nslots` for every local a function *could* declare; `off`/`array_off`
+  record the deepest local slot the emitted body actually names (excluding spill
+  slots, which are counted separately) and the prologue allocates only that much
+  plus `spill_slots`. A promoted-local-only leaf like `fib` then needs no frame
+  at all: dropping its 16-byte `sub`/`lea` pair took `fib` from 13.5 ms to
+  10.6 ms. The measurement is a `Cell` because `off`/`array_off` take `&self`;
+  the dry pass measures and the final pass is seeded with the result, so the
+  prologue (emitted before the body) allocates the exact size.
 - **Two-pass codegen must reset every counter.** `gen_fn` runs the body twice and
-  truncates the output between passes; the label counter, string table and spill
-  high-water mark are part of that reset. Miss one and the two passes diverge.
-- **A callee-saved temporary is not worth it here.** Holding a value across a
-  call in `%r12`-`%r15` was implemented and measured *slower* (the save/restore
-  in the prologue/epilogue costs more than the spill it removes). Keep the frame
-  slot unless you re-measure.
+  truncates the output between passes; the label counter, string table, spill
+  high-water mark and frame-size measurement are part of that reset. Miss one and
+  the two passes diverge.
+- **A callee-saved *temporary* is not worth it; a callee-saved *spill* is.** An
+  early attempt kept every short-lived value in `%r12`-`%r15` and measured
+  *slower* — the unconditional save/restore in the prologue/epilogue cost more
+  than the spills it removed. The shipped `spill_regs` is narrower: it holds
+  only the temporaries that must survive a call (the dry run reports how many),
+  so a function with no spill reserves no register and pays no push/pop. On the
+  recursive `fib` (which has exactly one such value per call) that is +23%
+  (`--no-tco`: 13.1 ms to 10.1 ms); it is invisible in the default benchmark
+  table because `tco` has already rewritten `fib`'s recursion into a loop with
+  no memory operation to remove. Do not widen it back to all temporaries, and
+  re-measure with `--no-tco` before touching it, or the win hides.
+- **Don't gate promotion on a use count.** A single-use local like `gcd`'s `b`
+  is copied into `%rbx` once, read once in the loop, and costs a push/pop per
+  call, so promoting only slots used more than once looked like a win on `mix`.
+  It measured neutral (0.998–1.009× across the suite, `mix` unchanged): the
+  extra frame store/load replaces the register push/pop one-for-one. Keep the
+  `> 0` filter.
 - **Saved registers sit between `%rbp` and the frame.** The epilogue must point
   `%rsp` at the lowest saved register (or add the frame size back) before
   popping, otherwise `pop` reads the frame and the return address is lost.
@@ -111,7 +306,16 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
   used `off(slot)`, the wrong end of the range).
 - **`for` is not a `while`.** `continue` must run the increment, so `for` keeps
   its own node with a dedicated continue label. Desugaring it to `while` would
-  make `continue` skip the increment and loop forever.
+  make `continue` skip the increment and loop forever. For the same reason `for`
+  is *not* rotated while `while` is: its increment sits between the body and the
+  guard, so a rotated form would run the increment before the first body
+  iteration (skipping it) or need the guard duplicated.
+- **`while` is rotated.** The test is emitted at the bottom as the back edge
+  (`gen_branch_true`, a `jl`/`jne`) with an entry `jmp` reusing the same test, so
+  an iteration is one branch fewer than the top-tested form. `continue` targets
+  the bottom test and `break` the label it falls into. If you change the loop
+  shape, keep both: a rotation that forgets the entry test loops forever on a
+  false condition, and one that targets the body for `continue` skips the test.
 - **Promotion counting must stay linear.** `counts` is built in slot order and
   `count_expr` indexes it directly by slot; do not reintroduce a linear `find`
   per reference or per excluded slot, which is O(n^2) and made a 200k-element
@@ -190,10 +394,30 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
 - **Struct-literal fields stay in source order.** Their layout offsets are
   attached per field, so reordering them into declaration order would change the
   order initializer side effects run in.
-- **A compound assignment with a call in its subscript is bound to a temporary.**
-  `a[next()] += 1` must evaluate `next()` once; the parser's `desugar_compound`
-  binds the subscript when (and only when) it contains a call, so the common
-  `i += 1` keeps the cheap two-instruction form.
+- **A bounds check sees through a reference to an array.** `array_len_of` /
+  `array_len_ty` unwrap an `Expr::Ref` base, so `let r: &[i64; 3] = &a; r[i]`
+  traps on an out-of-range `i` under `--bounds-checks` instead of reading
+  adjacent memory. A field store through a shared `&T` is rejected by
+  `place_writable` ("cannot assign through a shared reference; use `&mut`"), and
+  a `&mut` binding itself is not reassignable unless declared `mut`.
+- **Assignment evaluates its value before its place.** rustc orders assignment
+  operands right-to-left (the one expression that does), so `a[li(1)] = li(5)`
+  must run `li(5)` before `li(1)`. Codegen's general index/deref store path and
+  `store_through_addr` evaluate the value first and stash it across the address
+  computation whenever that computation can have an effect (`place_has_effect`,
+  which is `contains_call` plus a block/if that assigns a local), and the
+  aggregate copy is factored into `assign_aggregate` for the same reason. The
+  walk must reach every place form (`Deref`, `AddrOf`, `EnumPayload`, ...) and
+  must descend through `Bin`/`Un`/`Cast` and an `if` condition, or a target like
+  `r[{ y = 2; 0 } + 0]` is mis-ordered: `contains_call` alone misses a block
+  that assigns without calling. `assignorder.rms`, `refidxorder.rms` and
+  `tools/fuzz.py --mode order` pin this.
+- **A compound assignment binds its modifying operand first.** `desugar_compound`
+  evaluates the right-hand operand into a temporary ahead of the subscript
+  temporary, so `a[next()] += val()` runs `val()` before `next()`, matching the
+  right-to-left rule above. The subscript is still bound once, so `a[next()] += 1`
+  advances the counter once, not twice, and the cheap two-instruction form is
+  kept when the subscript has no call.
 - **Statements vs. tail expressions.** Assignments inside a block must be
   detected before the trailing-`;` check in `parse_block`, otherwise `x = ...;`
   is parsed as an expression and rejected.
@@ -201,17 +425,33 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
   rather than `push`/`pop`, so `%rsp` is static and a call needs no alignment
   pad. This measured faster on every real program (`fib` +3.3%) because the pad
   costs two instructions per call.
-- **Link flags.** The driver uses `ld -o <out> --build-id=none -n <obj>`; the
-  assembly already carries `.note.GNU-stack` so no `-z noexecstack` is needed.
-  `-n` (nmagic) drops the page alignment between sections and roughly halves the
-  artifact size, which is one of the benchmark's measured dimensions.
-- **A runtime function must be emitted in `.text`.** `-n` merges sections so a
-  misplaced handler still runs under the CLI link, but a library client that
-  links with a plain `ld` (no `-n`) maps `.rodata` without execute permission,
-  so a handler left there faults. `__rmc_bounds` follows a `.rodata` message, so
-  it re-opens `.text` first; check this whenever a trap is added after a
-  `.section .rodata` block. `tests/run.py` links a few traps with a plain `ld`
-  to catch it.
+- **`alloc`'s fast paths are a leaf.** The free-list scan, the arena carve and
+  the failure return touch only caller-saved registers, so `alloc` keeps no
+  frame pointer and saves no callee-saved registers; the prologue/epilogue that
+  a `push %rbp` + four `push`es cost was pure overhead on every allocation.
+  Measured +7% on `heap` (3.61 → 3.37 ms). Only the mmap slow path needs state
+  across the syscall: the total block size rides the stack (the syscall clobbers
+  `%rcx`/`%r11`) and the chunk length stays in `%rsi`. Keep new code off the
+  callee-saved set, or the whole-function frame comes back.
+- **Link flags.** The driver uses `ld -o <out> --build-id=none -z noseparate-code
+  <obj>`; the assembly already carries `.note.GNU-stack` so no `-z noexecstack` is
+  needed. It used to use `-n` (nmagic), which packed every section into one
+  read+write+execute `LOAD` segment: a W^X violation. `-z noseparate-code` keeps
+  the read-only and executable sections in one read+execute segment and the
+  writable data in a separate read+write one, and is *smaller* than `-n` (3304
+  bytes vs 7344 for `hello`). Do not "optimise" it back to `-n`. `tests/run.py`
+  runs `readelf -lW` on a compiled binary and fails if any `LOAD` segment is both
+  writable and executable.
+- **A runtime function must be emitted in `.text`.** `-n` merged sections so a
+  misplaced handler still ran under the CLI link, but with any sane link (the
+  library path, or the CLI's `-z noseparate-code`) a handler left in `.rodata`
+  is mapped without execute permission and faults. `__rmc_bounds` follows a
+  `.rodata` message, so it re-opens `.text` first; check this whenever a trap is
+  added after a `.section .rodata` block. `tests/run.py` links out-of-range
+  programs with a plain `ld` to catch it, across every optimiser configuration (a
+  hoist or inline that drops the `cmp`/`jae` would let the program read or write
+  out of range), and across the index shapes: a block or call base, a local
+  array, a negative and a computed index, a struct-field array, and a store.
 - **`array_len_of` must cover every array-typed base.** It reads the length from
   a `Var`/`Field`/`Call` type and from a block's or `if`'s tail. A base it does
   not recognise silently skips the bounds check; extend it alongside any new
@@ -245,17 +485,91 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
 
 - Runtime is process-spawn dominated for small programs; use large enough
   workloads (see `ARGS` in `bench/run.py`) for a meaningful runtime comparison.
-- `bench/run.py` measures compile time and peak RSS with `wait4()`, so `as`/`ld`
-  and LLVM are included. It raises if a produced binary exits non-zero, which
-  catches the classic "measured a nonexistent path" bug.
+- `bench/run.py` measures both compilers and both binaries the same way: wall
+  and CPU time from `wait4()`, and peak RAM from the child's own `VmHWM`. Do not
+  read peak RAM from `wait4()`'s `ru_maxrss`: a freshly spawned child shares
+  Python's address space before `exec`, so it floors at Python's RSS (~15 MB) and
+  hides the real number. `VmHWM` is sampled until the child exits and taken as
+  the max over reps, because a sub-millisecond run can exit between samples and
+  read back as zero. It raises if a produced binary exits non-zero, which
+  catches the classic "measured a nonexistent path" bug. `--markdown PATH` writes
+  the dated result to a file; the current one lives at `bench/RESULTS.md`.
+- **The sampler yields, it does not spin.** The `VmHWM` poll calls
+  `os.sched_yield()` between reads. A tight `wait4(WNOHANG)` spin keeps the
+  harness runnable for the whole child lifetime and competes with the benchmark
+  on a single-core host, inflating the wall time it is trying to measure. A
+  `sleep` would fix that but drops the sample rate enough to miss the peak of a
+  sub-millisecond process (`hello` read ~0.8 MB instead of the true ~2 MB), so
+  the loop yields and keeps polling.
+- **`heap` compares equal strides, not equal allocators.** rmc's `alloc` returns
+  a payload 8 bytes past a size header, so its 16-byte nodes are 24 bytes apart.
+  The Rust twin must use the same 24-byte stride or its smaller working set
+  flatters the walk; it still does not run a free list, so the ratio is about the
+  generated pointer code, not the allocators.
+- **`refs` is the reference-read loss, and it is deliberate.** The loop reads a
+  fixed struct through `&self` accessors. `licm` will not hoist a read through a
+  reference: rmc lets a reference outlive its referent (`0 as &i64` is accepted),
+  so a speculative deref can fault on a loop that never runs, where the in-body
+  read would not. The accessor sum is therefore recomputed every iteration and
+  rmc loses to rustc by roughly 8x. A frame-based loop of the same shape is
+  hoisted and wins. Keeping the Rust loop real needs an in-loop `black_box`
+  (a store/reload per iteration), so read the ratio as "two real loops doing the
+  same arithmetic", not an instruction-for-instruction tie - but do not claim a
+  win here; there is not one. This was the state before the faulting-hoist fix
+  (the LICM reference-read restriction); the docstrings and this note were not
+  updated when the fix landed, and a stale 2.23x win sat in `RESULTS.md`.
+- **`callrec` is the call-heavy case, and it used to lose.** Non-tail recursion
+  (`tree(n) = 1 + tree(n-1) + tree(n-2)`) cannot be inlined by either compiler,
+  so it measures raw call overhead plus argument setup, where the stack-based
+  generator with no register allocator is weakest. It was ~0.60x rustc until the
+  self-recursion pass learned to fold the right spine of `1 + f(n-1) + f(n-2)`
+  (not just the `f(g) + f(h)` shape), which leaves one call per level like rustc;
+  it now sits at parity. The shape the pass still does not match is the losing
+  case, so keep this benchmark: it is what stops the runtime story from being a
+  uniform "rmc wins" claim.
+- **Artifact size depends entirely on the rustc reference build.** The headline
+  table compares against `-O` + fat LTO + `codegen-units=1` + `panic=abort` +
+  stripped, which is the *smallest* rustc output (~290 kB) and therefore the
+  least flattering to rmc (~85x). A plain `rustc -O` is ~4.5 MB (~1335x) and a
+  stripped static build is ~1.2 MB (~350x). `bench/run.py` records all three
+  (`measure_rustc_plain`, `measure_rustc_static`) so no single choice overstates
+  the gap; report the reference whenever quoting a size ratio.
+- **Run-time ratios are noisy and machine-dependent.** A program near parity
+  (`fib`, `mandel`) flips between a small rmc win and a small rmc loss from run
+  to run and host to host. Do not quote a single ratio for such a program as a
+  stable property, and re-measure on the target machine before drawing a
+  workload-specific conclusion.
+- **A compiled rmc binary's few-kB RSS is mostly "no libc".** Its ~24 kB peak is
+  real but is a property of linking no C library, not of the generated code
+  being leaner: a dynamically linked rustc binary floors at ~2 MB because of
+  `ld.so` + `libc`. Say so when the RAM gap comes up, or it reads as a
+  code-quality claim it is not.
 
 ## Tests
 
+`tools/fuzz.py --mode reject` compiles a list of programs `rustc` rejects and
+requires `rmc` to reject each one cleanly; it pins the soundness checks below,
+which the differential fuzzers cannot see (they only compare programs both
+compilers accept).
+
 `tests/run.py` compiles each `tests/cases/NAME.{rms,rs}` pair with both compilers
-and diffs stdout and the exit status. `aggsem` (by-value aggregate assignment,
+and diffs stdout and the exit status. Every case is then recompiled with the
+optimiser passes disabled in turn (`--no-inline`, `--no-licm`, `--no-tco`, and
+all three at once), because a bug in one pass can hide behind another or only
+show on the unoptimised path; the Rust twin is built once and reused. `aggsem`
+(by-value aggregate assignment,
 inferred aggregates, nested fields, indexing a returned array), `cmpsem`
 (single evaluation of a side-effecting subscript in a compound assignment,
-struct-literal field order) and `utf8` (non-ASCII string literals) guard the
+struct-literal field order), `utf8` (non-ASCII string literals), `inlmulti`
+(a callee that assigns its parameter, a non-trivial argument evaluated once, and
+nested inlining with a call argument), `assignorder` (value-before-place
+assignment order, plain and compound), `licmref` (a field read that must not
+be hoisted past a `&mut` store in the loop), `iflet` (the `if let`
+desugaring: integer, binding, payload-binding, `else if let` chain,
+side-effecting scrutinee, and value position) and `consts` (top-level `const`
+items in expression position, as array lengths and repeat counts, as a `for`
+bound, in conditions, and as `match` patterns, including a negative constant and
+one defined in terms of another) guard the
 front-end/codegen fixes below. When adding a case, add both twins, write
 them to behave identically, and remember that `rustc` infers `i32` for unsuffixed
 literals, so large literals need an `i64` suffix on the Rust side. `args.json`
@@ -264,10 +578,13 @@ the bug it guards: revert the fix and confirm the case fails.
 
 The parser bounds nesting depth (`MAX_DEPTH` in `parser.rs`, currently 100). A
 recursive-descent parser with no bound overflows the native stack and aborts on
-deeply nested or very long input, which is a crash on untrusted input. The limit
-must stay low enough for a 2 MiB thread stack (each expression level threads
-through every precedence function, so it costs several KiB); `fuzz.py --mode
-robust` and the depth tests in `tests/compile.rs` guard it. If you add a new
+deeply nested or very long input, which is a crash on untrusted input. Each
+expression level threads through every precedence function, so a debug build
+costs on the order of 10 KiB per level and the full 100 levels is close to the
+2 MiB a default test thread gets; the two depth tests in `tests/compile.rs`
+therefore run on a dedicated 32 MiB thread via `with_big_stack`, so they test
+the limit rather than the harness's thread size. The CLI runs on the 8 MiB main
+thread. `fuzz.py --mode robust` guards the limit end to end. If you add a new
 recursive construct, count a level with `bump_depth` on entry.
 
 An enum is a set of unit variants represented by its `i64` tag (the declaration
@@ -277,47 +594,274 @@ resolve to `Type::Enum` through `resolve_ty`, which every type site uses, and
 enum patterns are a `Pat::Variant` the parser desugars into an `EnumVariant`
 comparison. `as` may not target an enum, matching rustc.
 
+A pattern is a wildcard, an integer or `bool` literal, an `Enum::Variant`, or a
+bare binding name. A `bool` pattern (`true`/`false`) desugars to a `BoolTest`,
+a node like `VariantTest` that compares the scrutinee word; a chain of two of
+them covering both values is exhaustive, so `match b { true => .., false => .. }`
+is a value. The node exists precisely so a hand-written `if b == true { .. }
+else if b == false { .. }` (a plain `Bin(Eq, ..)`) is *not* mistaken for an
+exhaustive chain — rustc rejects that in value position, and rmc must too. A
+`bool` pattern on a non-`bool` value is rejected. rmc's `match` desugaring also
+evaluates a non-trivial scrutinee once through a `\0mt<n>` temporary, so a side
+effect in the scrutinee runs exactly once regardless of the arm count.
+
+A `match` is desugared into a chain of `if`s, so a `match` with no `_` arm has
+no final `else` and, used as a value, would trip the "`if` without `else`" check
+in sema. When the arms name *every* variant of one enum it is total, and rustc
+accepts it as a value, so sema recognises exactly that case:
+`Sema::if_chain_is_exhaustive` walks the chain, requires every condition to be a
+`VariantTest` over one enum (or a `BoolTest` over one variable), and compares the
+number of distinct variants (or bool values) tested against the enum's variant
+count (or two). Because the desugared chain is checked
+outside-in, the innermost `if` is seen first; `Sema::match_chain`/`match_total`
+carry the verdict down the chain so the last `if` (no `else`) may stand for a
+value. The two flags are set only on the `else` path of a *total* chain, so a
+wildcard arm body that is itself an `if` is still checked as an ordinary root.
+
+Every `match` must be exhaustive, in *any* position, exactly as rustc requires
+(E0004). The value-position case is caught by the `if`-without-`else` check; the
+statement-position case is not, because the arms are unit-typed and the
+fall-through to `()` is harmless, so `Sema`'s `MatchBoundary` arm also decides
+exhaustiveness (`match_chain_is_exhaustive`, plus the catch-all flag the parser
+records) and errors when it fails. Do not relax this to statement position only:
+rustc rejects a non-exhaustive `match` there too, and rmc must match rustc.
+
+The `match` desugaring wraps its first step in `Expr::MatchBoundary`, a
+transparent node that marks where the chain begins. Its `bool` field records
+whether some arm is a catch-all (`_` or a binding), which makes the match
+exhaustive regardless of the variants named. The marker exists because a wildcard
+arm body can itself be a `match`: `match a { A => 1, _ => match a { B => 2 } }`
+and `match a { A => 1, B => 2 }` desugar to the *same* `if` chain, yet only the
+second is exhaustive. Without the marker, `if_chain_is_exhaustive` walks through
+the wildcard body into the nested match and counts both matches' variants
+together, wrongly accepting a program rustc rejects. The boundary stops that
+walk and resets `match_chain`/`match_total`, so each `match` is judged on its
+own. It is transparent everywhere else: codegen, the inliner, LICM and TCO treat
+it exactly like `Expr::Block`, and `is_block_like` lists it so a `match`
+statement still needs no trailing `;`. A subtle-scrutinee comparison would *not*
+work: the two programs above share the same scrutinee, so the boundary is the
+only thing that keeps them apart.
+`tests/cases/exhmat.{rms,rs}` covers value position, reordering, nesting,
+references and a loop; a non-exhaustive or duplicate-variant match still errors,
+and `tools/fuzz.py --mode reject` pins the nested-wildcard and statement-position
+cases.
+
 A method is an ordinary free function whose name is mangled to `Type$method` and
 whose first parameter is `self` of the impl's struct type; the parser produces
 it, sema inserts the `self` parameter before building signatures, and a method
 call is rewritten by sema into a `Call` with the receiver prepended. Codegen
-therefore has no method case — keep it that way. `Self` resolves through the
-parser's `current_impl`.
+therefore has no method case — keep it that way. Method resolution accepts a
+receiver whose type is `Struct`, `Enum` (unit) or `EnumData` (payload); all
+three give the same mangled prefix, and a `self` method on an aggregate receiver
+passes it by pointer. `Self` resolves through the parser's `current_impl`.
 
-An array's element type is always scalar (`i64` or `bool`); nested arrays and
-arrays of structs are rejected. A list literal `[a, b, c]` is parsed as
+An array's element type is a scalar: `i64`, `bool` or a unit enum. Nested
+arrays, arrays of structs and arrays of payload enums are rejected. A unit enum
+is one 8-byte slot emitted like `i64`, so `[E; N]` lays out and indexes
+correctly; rustc likewise accepts a unit enum and rejects a payload enum and a
+reference as array elements. A list literal `[a, b, c]` is parsed as
 `Expr::ArrayList` and rewritten by sema, which infers the element type from the
 values — the parser must not guess it, because it does not type-check, and
 guessing `i64` is what made `[true, false]` fail.
 
+## Soundness checks
+
+The differential fuzzers only compare programs that *both* compilers accept, so
+they are blind to the dangerous direction: a program `rmc` accepts but `rustc`
+rejects. Such a program is never run against the reference (the reference does
+not build), so a wrong-answer or memory-safety bug it triggers is invisible to
+the suite. `tools/fuzz.py --mode reject` pins this class instead: a deterministic
+list of programs `rustc` rejects, each of which `rmc` must also reject (cleanly,
+exit 1). When you find a new `rmc`-accepts/`rustc`-rejects divergence, add it
+there. The hand-audit harness that found the original set lived outside the repo
+(`/tmp/audit5/`); the durable record is the reject corpus.
+
+The checks, all in `sema.rs`:
+
+- **Mutability (`E0384`/`E0594`/`E0596`).** A write must target a mutable
+  *place*. The check is `Sema::place_writable`, which walks a target to its root
+  binding: a `mut` binding, or a reference whose referent is mutable
+  (`&mut T`), is writable; a shared reference (`&T`) is not; an uninitialized
+  binding is writable when the caller passes `allow_uninit` (an assignment
+  initializes it — whole, by field, or by element, matching rustc's partial
+  initializer), but not for a `&mut place` borrow (borrowing an uninitialized
+  place is itself E0381). A bare-`Var` write of a non-`mut` binding that is
+  already initialized is E0384; a field/element write through a non-`mut` root
+  is E0594; `&mut x` on a non-`mut` binding is E0596. Checking the *place* rather
+  than just the target node is what closes field/element assignment and
+  `&mut`-borrow divergences that a bare-`Var` check missed. `mut` on a parameter
+  is recorded in `FnDef::param_mut` (the parser used to accept and discard it)
+  and a parameter is otherwise immutable: `fn f(x: i64) { x = 1; }` is rejected,
+  `fn f(mut x: i64) { x = 1; }` is not. The scope entry is a `Binding` struct
+  carrying `mutable` and `init`. Because a `&mut self` receiver has type `&mut
+  Self`, `self.n = ..` stays legal without `mut self`.
+- **Definite initialization (`E0381`).** `Binding::init` records whether a
+  binding is initialized at the current point, and is set only by a whole-binding
+  write — a field or element write does not initialize the aggregate, matching
+  rustc's "partially assigned" rule, so reading it afterwards errors. A read of
+  an uninitialized one errors. An `if`/`else` keeps a binding initialized only if both arms (or the
+  entry state) initialized it; a branch with no `else` does not count, because it
+  may not run, and a `while`/`for` body does not because the loop may run zero
+  times. A `loop` body counts only when every `break` that leaves the loop
+  initializes the binding: the loop runs at least once, but an exit taken before
+  the assignment leaves the binding uninitialized (rustc E0381), so the state at
+  each `break` is captured and merged. This is deliberately conservative — it rejects
+  the uninitialized-array-filled-in-a-loop pattern (`let mut a: [i64; N]; while
+  ... { a[i] = ..; } a[0]`), which rustc also rejects. Write the array with `= [0;
+  N]` instead; the corpus cases do.
+- **Constant array bounds.** A constant index outside the array (`a[5]` on a
+  `[i64; 2]`, the negated `a[-1]`, or an expression like `a[1 + 4]`) is a compile
+  error, with or without `--bounds-checks`, matching rustc (`E0080`/`E0608`).
+  The index is folded with `const_i64`, which evaluates the integer operators
+  (`+ - * / % & | ^ << >>`) as well as unary `-`, so an index written as an
+  expression is caught too — an earlier version folded only literals and let
+  `a[1 + 4]` read adjacent stack memory. `Sema::const_of` extends this to a
+  constant *local*: `let i = -1; a[i]` is folded the way rustc's constant
+  propagation folds it, which an earlier version did not, letting `a[i]` read
+  past the array. A *variable* index is still unchecked by default (see Scope).
+- **String typing.** A string literal is `Type::Str`, not `i64`. It cannot be an
+  arithmetic operand (`1 + "hi"` was accepted as integer addition on the
+  string's address, `E0369`) and cannot be passed where an `i64` is expected
+  (`print_str(42)` used to compile and then segfault, dereferencing the integer
+  as a pointer). `print_str` takes `Type::Str`.
+- **Parameter names (`E0415`) and `main` (`E0580`).** A function's parameters
+  must be uniquely named; `check_fn` rejects a duplicate (rmc used to bind both
+  to one slot). `main` takes no parameters, checked in `analyze`.
+- **Casts (`E0054`/`E0605`/`E0606`).** `check_cast` restricts `as` to the
+  conversions rustc allows plus rmc's two documented extensions. A reference may
+  only become a reference to the same type (`&mut T` may lose mutability to
+  `&T`, never gain it), and never a scalar; any other scalar may not become a
+  reference. The extensions are `i64 as bool` (rustc spells it `x != 0`) and the
+  raw pointer cast `i64 as &T` / `i64 as &mut T` (rustc needs `as *const T`
+  first), both used by the corpus (`boolops`, `listptr`) and the heap benchmark.
+  Before this, `r as i64`, `r as &mut T`, `&T as &U` and `bool as &T` all
+  compiled, reinterpreting a pointer as a value or forging mutability.
+- **Constant arithmetic (`E0080`-like).** `const_binop` folds an operator whose
+  operands are both constant (through `Sema::const_of`) and rejects the cases
+  rustc denies: division/remainder by zero, `MIN / -1`, `+`/`-`/`*` overflow,
+  and a shift amount outside `0..64`. Under the overflow checks rmc emits each
+  of these traps, so an accepted one would fault at run time (rmc used to emit an
+  `idiv` that raised SIGFPE). A constant local counts as constant, so `let d =
+  0; 1 / d` and `let x = i64::MAX; x + 1` are diagnosed like the literals, as
+  rustc does.
+- **Constant-local propagation, matching rustc.** `Sema::const_locals` maps a
+  slot to a known constant, and `const_of` reads it. A local is entered only
+  when rustc would know it: its initializer is constant and it is assigned at
+  most once in the whole function and never taken by `&mut`. `collect_assigns`
+  pre-scans the body (before slots exist, so it keys on names) for `=`
+  assignments and `&mut` borrows. The whole-function, order-independent test is
+  what keeps the fold in step with rustc: `let mut x = i64::MAX; x = x + 1;` is
+  *accepted* because `x` is assigned twice, so rustc does not propagate its
+  constant and neither must rmc (folding it would wrongly reject the program).
+  A deferred single init (`let i; i = -1;`) is the one assignment that is
+  folded, via the `Assign` arm, which is also where the target's slot is
+  resolved. This is the safe direction: rmc folds a strict subset of what rustc
+  folds, so it never accepts a program rustc rejects.
+
+`!` on an integer is bitwise not, as in Rust: sema accepts `bool` and `i64`
+operands (it yields the operand's type) and codegen emits `not %rax` for the
+integer form and a `sete` for the `bool` form, selecting on the operand's
+generated type. `licm::expr_ty` follows the operand for a `!` so a hoisted
+bitwise not is bound to an `i64` slot, not a `bool` one.
+
+The `i64::MIN` literal `-9223372036854775808` is accepted: the lexer parses the
+magnitude `9223372036854775808`, which exceeds `i64::MAX`, as a distinct
+`IntMinMagnitude` token rather than an error, and the parser folds a `-` that
+directly precedes it into `Int(i64::MIN)`. Anywhere else the magnitude is out of
+range and rejected, as in rustc — `9223372036854775808` alone, `0x10000000000000000`,
+and `- -9223372036854775808` all error. Negating a constant `i64::MIN` (from the
+literal or a constant local) is rejected by the same `arithmetic_overflow` check
+rmc applies to constant arithmetic, matching rustc's deny lint. The magnitude
+test is structural (`is_i64_min_magnitude`), covering decimal, hex, binary and
+octal; a spaced `- 9223372036854775808` still folds, as in rustc.
+
 `tools/fuzz.py` is the differential fuzzer. `expr` mode builds random integer
-expressions with calls and guarded division; `stmt` mode builds loops,
+expressions with calls, guarded division and comparisons (`(x < y) as i64`,
+which is the only generator that feeds `emit_cmp`'s operand-class dispatch:
+immediate/immediate, immediate/memory, memory/immediate, memory/memory);
+`stmt` mode builds loops,
 conditionals, `match`, arrays and aggregate calls, and deliberately places
 side-effecting scalar and aggregate arguments in every position (this is what
-found the argument-evaluation-order bug). It compares stdout and exit status
-against `rustc -O`. A generated shift amount must stay `i64`-typed: rustc infers
+found the argument-evaluation-order bug); `opt` mode builds a self-recursive
+right-spine function (TCO), a loop with an invariant subexpression (LICM) and
+calls to small helpers with trivial and non-trivial arguments (inlining) — the
+shapes the other two modes never emit, so the optimiser passes are exercised
+with randomised inputs rather than only the fixed corpus cases. `arith` mode
+builds overflowing arithmetic near `i64::MAX` — a `lea`/`imul` shape and a
+loop-carried accumulator, the two strength reductions `gen_expr_into_reg` makes
+— so the `--overflow-checks` trap actually fires: the other modes use small
+values, so no generated program ever traps and the trap was reached only by the
+`ovf` corpus case. `nest` mode builds nested aggregates — a struct holding
+another struct and an array, and an enum whose payload is a struct — with a
+deep copy (`let mut o1 = o0`) and a nested-path write (`o1.mid.f = ...`,
+`o1.arr[0] = ...`) that the copy must not alias: `stmt` mode only ever gives a
+struct plain `i64` fields, so the field-offset arithmetic for a nested path and
+the aggregate copy were never generated. `pat` mode builds `match`
+expressions: a multi-variant unit enum, a variant with two payload fields, a
+binding pattern, a negative literal, a nested `match`, an `if let` (integer,
+binding, payload-binding, `else if let` chain and a side-effecting scrutinee),
+and a non-trivial
+side-effecting scrutinee (a call) tested against several arms — the last is
+what exercises `desugar_match`'s temporary, which must evaluate the scrutinee
+exactly once (re-evaluating it per arm repeats a side effect). It compares
+stdout and exit status against `rustc -O`, and it recompiles each program with
+every optimiser pass off in turn (`--no-inline`, `--no-licm`, `--no-tco`, all
+three), the same matrix the corpus suite uses — a pass-specific bug is otherwise
+invisible, because the fuzzer used to run only the default configuration.
+`--bounds` adds `--bounds-checks` runs (every generated index is in bounds, so a
+spurious trap or a check-codegen miscompile shows up) and `--overflow` adds
+`--overflow-checks` runs, each compared against a `rustc` built with
+`-C overflow-checks=on` (the default `rustc -O` wraps, so it would disagree by
+design). The temp directory is per-PID: two concurrent fuzz runs sharing one
+would overwrite each other's `p.s` and report a bogus assembler failure.
+A generated shift amount must stay `i64`-typed: rustc infers
 `i32` for an unconstrained literal and masks the count to 5 bits, while rmc is
 `i64`-only and masks to 6, so an untyped count reports a divergence that is not a
 bug.
+
+The fuzzer's grammar is narrower than the language, so it does not reach every
+construct; three divergences found by hand-probing were an enum `match` with no
+`_` arm used as a *value* (not a statement), a method on a *payload* enum, and an
+array of a unit enum. `stmt` mode now emits all three, so a regression in any of
+them fails the fuzz job at `iter=0`. When adding a language feature, extend the
+generator to exercise it — a clean fuzz run only covers the shapes it emits.
 
 ## Scope
 
 This is a small, self-contained compiler, not a general Rust compiler. Do not
 claim otherwise. It supports only the subset in `docs/language.md` (scalars,
-arrays, structs, `for`, aggregates across calls), has no register allocator and
-only a small peephole optimiser (operand/comparison/array-address folding,
-constant folding, division by a constant), and no borrow checker. Aggregates
-cross a call only by value; there are no references. Array indexing is unchecked
-by default (the index is used as-is, like C), so an out-of-range index reads or
-writes adjacent stack memory; `--bounds-checks` turns on a per-index check that
-traps (see the codegen notes). The README's roadmap lists the intended next
-steps.
+arrays, structs, enums, `for`, aggregates across calls, references `&T`/`&mut T`
+with no borrow checking). It has no *general* register allocator: whole-function
+locals are promoted to callee-saved registers by mention count (`promote`), and
+temporaries crossing a call use `SPILL_REGS`, but a dying temporary's register is
+not reused for a later local (roadmap item 1). The optimiser is an AST inlining
+pass (small, straight-line, scalar functions), a self-recursion-to-loop pass
+(`f(x) = t(x) op f(h(x))` with `op` associative and `t` any pure expression that
+may contain a self-call becomes a loop with one call per level, halving the call
+tree of both `fib` and `tree`), a loop-invariant code motion pass, plus a
+small peephole pass (operand/comparison/array-address folding, constant folding,
+division by a constant, a 32-bit `div` fast path for a variable divisor). A *constant* index out of
+range is a compile error; a *variable* index is unchecked by default (used
+as-is, like C), so an out-of-range one reads or writes adjacent stack memory.
+`--bounds-checks` turns on a per-index runtime check that traps (see the codegen
+notes and "Soundness checks").
+The README's roadmap lists the intended next steps.
 
 ## Codegen notes
 
 - Every expression leaves its result in `%rax`; `%rcx`/`%rdx` are the only
   scratch registers used. No other register is written by expression code, which
   is what makes the direct-argument call shortcut safe (see `gen_call`).
+- **A benchmark twin must `black_box` its workload.** rmc's `arg_i64` is opaque
+  to rmc, but the Rust twin's `std::env::args().nth(1).parse()` is not opaque to
+  LLVM: it sees the whole program and can fold a loop into a closed form. The
+  `refs` twin did exactly that — LLVM reduced the loop to `acc = 128 * n`, so the
+  recorded "rustc 0.83 ms" was its own constant folding and the ratio read 0.18x
+  instead of the honest ~1.0x. Every twin with a loop now threads its trip count
+  or a term through `std::hint::black_box`. When a rustc twin's time matches its
+  `hello` time, suspect folding before celebrating. The `heap` twin uses a bump
+  arena rather than `Box`/`malloc`, so the comparison is the generated pointer
+  code, not rmc's free list versus glibc.
 - **A destination address must survive the value it is assigned.** Assigning a
   whole aggregate to a field or element computes the destination first, and
   `gen_expr(value)` may clobber `%rdi` (a call, or another aggregate copy), so
@@ -359,6 +903,14 @@ steps.
   safe way to materialise an expression straight into a destination register
   during argument setup, and a scalar `let`/assignment writes straight into a
   promoted local's register rather than bouncing through `%rax`.
+  - **Retargeting a trailing `mov SRC, %rax` to `dst` was measured and
+    rejected.** When `gen_expr` ends with a move into `%rax` (the modulo-by-
+    constant tail's `mov %r8, %rax`), emitting `mov SRC, dst` instead of
+    `mov SRC, %rax; mov %rax, dst` saves an instruction, but it measured neutral
+    at run time (the loops are latency-bound, and register renaming hides the
+    extra move) and shrank the artifact by only 8 bytes on two of eight programs.
+    The transform also has to be careful: truncating to the pre-expression
+    offset wipes the whole expression, not just the final move.
 - **`emit_cmp` folds a register operand.** `cmp %r, %r` and `cmp %r, mem` are
   legal, so a comparison between two promoted locals is one instruction; only a
   `mem, mem` compare must materialise one side into `%rax`.
@@ -371,10 +923,49 @@ steps.
   scalar locals, constant-index array elements, and struct fields of a local.
   `array_elem_operand` returns the `disp(%rbp,%rax,8)` form whose index must
   first be loaded into `%rax`.
-- Folding arithmetic memory operands into `add`/`imul` and the in-place
-  `x = x + e` form were both tried and measured *slower* on the Zen cores this
-  was tuned on, so they were removed. Keep the plain two-register form unless
-  you re-measure on the target CPU.
+- Folding arithmetic memory operands into `add`/`imul` and the plain two-operand
+  in-place `x = x + e` form were both tried and measured *slower* on the Zen
+  cores this was tuned on, so they were removed. Keep the plain two-register
+  form unless you re-measure on the target CPU.
+  - Folding a *register* operand (never a memory one) into `+`, `-`, `*`, `&`,
+    `|`, `^` is the one exception and was measured faster: it drops the
+    `mov y, %rcx` bounce, taking `mandel` from 1.03× to 1.10×. The distinction is
+    the load: a memory operand lands in the instruction's dependency chain (and
+    regressed `mandel` by ~19% when tried), a register operand does not. Only
+    `simple_operand` results that start with `%` fold.
+  - **Commutative spill fold.** When neither operand is simple, the
+    order-preserving path evaluates the right operand, moves it to `%rcx`, then
+    restores the left from the spill. For a commutative op (`+`, `*`, `&`, `|`,
+    `^`) the left can be popped straight into `%rcx` instead, one move fewer;
+    `eval_operands` takes a `commutative` flag and `sub`/`div`/`mod`/comparisons
+    pass `false`. Measured ~10% on `stats`.
+  - **`idiv` reads a promoted-local divisor directly.** `a / y` no longer bounces
+    `y` into `%rcx`; the divisor is already in a callee-saved register and
+    `gen_expr(a)` plus `cqto` only touch `%rax`/`%rcx`/`%rdx`, so it stays live.
+  - The multi-term **accumulation fold** (`gen_accumulate`) is a narrower form
+    that was measured neutral: it applies only when `x` is promoted, no term
+    reads `x`'s register, and every term is already a single operand. It cuts
+    instruction count (a running sum over locals drops to one `add`/`sub` per
+    term; the `refs` loop goes 22 → 12) with no wall-clock regression, because
+    these loops are latency-bound on the serial add chain and register renaming
+    hides the extra moves.
+  - **A term that needs evaluating folds too, when overflow checks are off.**
+    `sum = sum + f(i)` emits `call f; add %rax, dst` — one `add` on the
+    accumulator — instead of `call f; mov %rax, %rcx; mov dst, %rax; add %rcx,
+    %rax; mov %rax, dst`. That is three instructions fewer per iteration in
+    `mix` (the call-heavy benchmark), byte-identical output for `refs`/`stats`
+    (their loops are fully inlined and have no such term), and neutral-to-better
+    at run time. Terms are still emitted in source order, so a call that writes
+    a local an earlier term read is unaffected (`mut_aliasing` tests cover it).
+    An earlier rejection of this idea (a ~12% `refs` regression) predates the
+    inliner: that `refs` loop still held three calls, and folding them reordered
+    reads around them. With the loop inlined there is nothing to reorder.
+  - **CSE into frame slots was measured and rejected.** De-duplicating repeated
+    inlined subexpressions *within* a statement by binding each to a fresh slot
+    (`refs`: 18 → 28 ms) loses to recomputing: the extra slot loses the
+    five-register promotion contest and the loop round-trips through memory.
+    Hoisting the same value out of the loop entirely (LICM) is what wins, because
+    the slot is written once, not per iteration.
 - Division or modulo by a literal divisor does not use `idiv`. `gen_div_const`
   emits the Hacker's Delight magic multiply (the same algorithm LLVM uses),
   with a sign fixup and, for roughly a quarter of divisors, an extra add of the
@@ -387,3 +978,62 @@ steps.
   - `small_imm` accepts a negated literal, so `x / -1000` takes the fast path.
   - `tests/cases/div.{rms,rs}` covers both variants, powers of two, negatives,
     and boundary dividends, and is the regression guard for all of the above.
+- Division or modulo by a *variable* divisor uses `idiv`, but only after a
+  32-bit fast path. `emit_div` first tests both operands unsigned against 2^32
+  (`mov $4294967296, %rdx` + two `cmp`/`jae`); when both fit, `xor %edx,%edx`
+  + `div <reg>d` computes the same result in ~20 cycles instead of ~30–40, and
+  when either does not, the 64-bit `cqto` + `idiv <reg>` runs. This is what
+  closes the `mix` gap: its `gcd` operands are always small, so it takes the
+  narrow path every iteration, and `mix` went from 0.92× to 1.06× versus rustc.
+  - **The comparison must be unsigned** (`jae`, not `jge`): a negative operand
+    has the sign bit set and compares as a huge unsigned value, so it correctly
+    falls through to the 64-bit path. A signed test would send a negative
+    dividend down the 32-bit path and truncate it.
+  - **The 32-bit divide zeroes its own `%rdx`**, so no `cqto` is needed on the
+    fast path, and `%rdx` is free for the 2^32 constant because `cqto` has not
+    run yet. `mov $4294967296, %rdx` is used rather than a `shr $32` test because
+    the shift would destroy the dividend in `%rax`.
+  - The divisor is read from its own register (`idiv %rbx`) when it is a
+    promoted local, and from `%rcx` otherwise; `r32` maps each to its 32-bit
+    half. A one-off sweep of 1042 `q(a,b)` pairs across the full `i64` range —
+    negatives, the 2^32 boundary, and near-`i64::MAX` — matched rustc exactly.
+- **Under `--overflow-checks`, a shift count is range-checked before the shift.**
+  `check_shift_count` emits `cmp $63, <count>; ja __rmc_shift_overflow`, because
+  the hardware masks a 64-bit shift count to 6 bits: without the check `x << 64`
+  silently shifts by 0, while Rust panics. The count is only known to be in range
+  when it is a compile-time constant (`const_of`); a run-time count always gets
+  the check. With overflow checks off, the shift is unchecked, matching Rust's
+  default `<<` (which does not panic on an out-of-range count in release).
+- **`tests/cases/divtrap.rms` and `shovf.rms` pin the trap codegen.** `divtrap`
+  exercises `MIN / -1` (SIGFPE on x86 `idiv`) and division by zero, both of which
+  trap *without* `--overflow-checks` (Rust panics on them by default); it covers
+  the constant `-1` divisor (strength-reduced) and a runtime divisor (`idiv`).
+  `shovf` (with a `.overflow` marker) exercises an out-of-range shift count under
+  `--overflow-checks`. Both are differential (stdout and exit status must match
+  the rustc twin) and are what catch a trap that fires when it should not, or
+  fails to fire when it should.
+- **The `MIN / -1` guard sits in the 64-bit slow path, not before the split.**
+  `emit_div` splits on whether both operands fit in 32 bits; a dividend that does
+  is never `MIN` (its high bit is clear), so the `movabs $0x8000...; cmp; jne`
+  guard only runs on the `idiv` path. Putting it before the split cost every
+  division a `movabs`+`cmp`+branch for nothing. The zero-divisor check *must*
+  stay before the split: zero fits in 32 bits and would otherwise reach `div`.
+- **The self-recursion pass must synthesise the AST the parser would build.** It
+  runs after sema, so it has no `Sema` to allocate slots or resolve names. It
+  reuses the parameter's own `(name, slot, ty)` for the loop variable, and takes
+  one fresh slot (`f.nslots`, then `f.nslots += 1`) for the accumulator; the
+  synthesized `Call` carries `arg_slots: vec![(-1, 0)]` and `ret_slot: -1`
+  directly, because a scalar `i64` argument needs no hidden buffer and a scalar
+  return needs no hidden pointer. Every synthesized `Expr::Var` must carry the
+  right `slot`/`ty`, or codegen emits a load from the wrong frame word.
+- **The pass is guarded to be exact, not approximate.** Only `+`/`*` (associative)
+  qualify; `cond`, `guard` and `h` must be call-free and return-free, and `t` must
+  be return-free and call only the function being transformed, or the loop would
+  duplicate a side effect or leave without adding the accumulator. It
+  is also skipped entirely under `--overflow-checks`, since reassociating checked
+  arithmetic traps on a different intermediate than the recursion. A shape that
+  does not match is left completely alone. `tests/cases/tco.{rms,rs}` diffs `fib`
+  and `fact` against rustc and `tests/cases/callrec.{rms,rs}` covers the
+  `1 + f(n-1) + f(n-2)` shape; unit tests pin the non-associative
+  `f(x-1) - f(x-2)` case, a `return` in an argument, a foreign call in the left
+  operand, and overflow checks.

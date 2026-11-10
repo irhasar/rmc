@@ -1,11 +1,11 @@
 //! rmc: an ahead-of-time compiler for a small, statically-typed subset of Rust.
 //!
-//! The pipeline is lex -> parse -> semantic analysis -> x86-64 assembly. This
-//! library exposes it as a single call, [`compile_to_asm`], so rmc can be
-//! embedded in another program instead of only run as a command-line tool. The
-//! `rmc` binary in `src/main.rs` drives this library and then invokes `as` and
-//! `ld`; those two are the only external dependencies, and neither is needed if
-//! you only want the assembly text.
+//! The pipeline is lex -> parse -> semantic analysis -> inline -> self-recursion
+//! to loop -> loop-invariant code motion -> x86-64 assembly. This library exposes it as a single call,
+//! [`compile_to_asm`], so rmc can be embedded in another program instead of only
+//! run as a command-line tool. The `rmc` binary in `src/main.rs` drives this
+//! library and then invokes `as` and `ld`; those two are the only external
+//! dependencies, and neither is needed if you only want the assembly text.
 //!
 //! ```
 //! let asm = rmc::compile_to_asm("fn main() -> i64 { return 0; }", &Default::default())
@@ -15,10 +15,14 @@
 
 pub mod ast;
 pub mod codegen;
+pub mod consts;
+pub mod inline;
+pub mod licm;
 pub mod lexer;
 pub mod parser;
 pub mod runtime;
 pub mod sema;
+pub mod tco;
 
 /// Options that change what the compiler emits.
 #[derive(Debug, Clone, Default)]
@@ -31,6 +35,15 @@ pub struct CompileOptions {
     /// index exits with status 101 instead of reading or writing adjacent stack
     /// memory. Off by default because it costs a compare and branch per index.
     pub bounds_checks: bool,
+    /// Skip the inlining pass. Inlining is on by default: it is what makes a
+    /// call to a small accessor as cheap as the arithmetic it wraps.
+    pub no_inline: bool,
+    /// Skip loop-invariant code motion. It is on by default and hoists
+    /// invariant arithmetic out of a loop body.
+    pub no_licm: bool,
+    /// Skip the self-recursion-to-loop pass. It is on by default and halves the
+    /// call tree of a `f(x) = f(g(x)) op f(h(x))` function such as `fib`.
+    pub no_tco: bool,
 }
 
 /// Compile `src` (a `.rms` program) to x86-64 assembly in GNU `as` syntax.
@@ -43,6 +56,15 @@ pub fn compile_to_asm(src: &str, opts: &CompileOptions) -> Result<String, String
     let toks = lexer::lex(src)?;
     let mut prog = parser::Parser::new(toks).parse_program()?;
     sema::analyze(&mut prog)?;
+    if !opts.no_inline {
+        inline::run(&mut prog);
+    }
+    if !opts.no_tco {
+        tco::run(&mut prog, opts.overflow_checks);
+    }
+    if !opts.no_licm {
+        licm::run(&mut prog, opts.overflow_checks);
+    }
 
     let mut cg = codegen::Codegen::new();
     if opts.overflow_checks {

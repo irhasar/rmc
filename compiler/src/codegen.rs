@@ -1,13 +1,18 @@
 //! Direct x86-64 (System V, AT&T syntax) code generator.
 //!
-//! Expression results live in `%rax` and temporaries are pushed on the machine
-//! stack, so the generator needs no register allocator. Locals are different:
-//! the hottest few scalars in each function are promoted into callee-saved
-//! registers for the whole function (see `promote`), and the rest occupy an
-//! 8-byte slot at `-(slot + 1 + nregs)*8(%rbp)`, below the saved registers and
-//! growing downward from `%rbp`.
+//! Expression results live in `%rax`; the temporaries a binary operator needs
+//! are spilled, not to the machine stack but to the reserved spill area: the
+//! first few go to callee-saved registers (`spill_regs`), the rest to frame
+//! slots just past the locals. `%rsp` therefore never moves mid-function and a
+//! call needs no alignment pad. There is no general register allocator: locals
+//! stay in memory, except that the hottest few scalars in each function are
+//! promoted into callee-saved registers for the whole function (see `promote`).
+//! A promoted local occupies a register instead of its stack slot; the rest
+//! occupy an 8-byte slot at `-(slot + 1 + nregs)*8(%rbp)`, below the saved
+//! registers and growing downward from `%rbp`.
 
 use crate::ast::*;
+use std::cell::Cell;
 use std::fmt::Write as _;
 
 pub struct Codegen {
@@ -28,17 +33,38 @@ pub struct Codegen {
     /// Slot -> callee-saved register for locals promoted out of memory in the
     /// function currently being generated. Empty means every local is in memory.
     regs: Vec<(i32, &'static str)>,
+    /// Callee-saved registers reserved for expression temporaries that must
+    /// survive a call — the values `push_rax`/`pop_to` used to write to the
+    /// frame. Holding the first few in a register turns each of those pairs into
+    /// a register move, which is the whole win on call-heavy code such as `fib`.
+    /// Trimmed to the number the function actually needs before it is emitted.
+    spill_regs: Vec<&'static str>,
     /// When set, every array index is checked against the array's length and an
     /// out-of-range index traps instead of reading or writing adjacent memory.
     bounds: bool,
     /// When set, every `+`, `-` and `*` is followed by a jump-if-overflow to the
     /// runtime trap. Off by default because it costs a branch per operation.
     overflow: bool,
+    /// True while generating an expression whose value is discarded (a
+    /// statement-position expression). `if` without `else` then skips the
+    /// `xor %eax, %eax` that materialises its unit value, which in `fib` is a
+    /// dead instruction in the hot path.
+    discard: bool,
     /// Frame slot holding the hidden return-buffer pointer for the function
     /// being generated (`-1` when the return type is scalar or unit).
     ret_slot: i32,
     /// Return type of the function being generated, needed to route `return`.
     ret_ty: Type,
+    /// Number of frame slots (locals plus reserved spill slots) to allocate in
+    /// the prologue. The parser sizes `nslots` for every local a function could
+    /// declare; the code generator touches only the ones the emitted body
+    /// actually names, so this is set to the deepest slot the body addresses.
+    /// An all-register leaf like `fib` then needs no frame at all.
+    ///
+    /// Only meaningful during the final (emitting) pass; the dry pass leaves it
+    /// at zero and the frame it emits is discarded. Recorded by `off` and
+    /// `array_off`, so it is a `Cell`.
+    frame_slots: Cell<i32>,
 }
 
 /// Callee-saved registers eligible for promoting a local out of memory. They
@@ -46,6 +72,12 @@ pub struct Codegen {
 /// one. `%rbp` and `%rsp` are excluded; `%rbx` is listed first because a short
 /// register name keeps the generated assembly readable.
 const ALLOC_REGS: [&str; 5] = ["%rbx", "%r12", "%r13", "%r14", "%r15"];
+
+/// Callee-saved registers reserved for spill temporaries, after the locals have
+/// taken what they need. The deepest is two at once (a binary op whose left
+/// operand crosses a call in the right), so a handful covers every expression
+/// the parser can build; past that the spill falls back to a frame slot.
+const SPILL_REGS: [&str; 3] = ["%r12", "%r13", "%r14"];
 
 /// A `let`-declared aggregate, recorded so promotion knows whether its
 /// initialiser writes it field by field (`by_field`) or copies the whole value.
@@ -69,10 +101,13 @@ impl Codegen {
             loops: Vec::new(),
             epilogue: String::new(),
             regs: Vec::new(),
+            spill_regs: Vec::new(),
             bounds: false,
             overflow: false,
+            discard: false,
             ret_slot: -1,
             ret_ty: Type::Unit,
+            frame_slots: Cell::new(0),
         }
     }
 
@@ -97,6 +132,7 @@ impl Codegen {
             Expr::Var { ty, .. } | Expr::Field { ty, .. } => Self::array_len_ty(ty),
             Expr::Call { ret_ty, .. } => Self::array_len_ty(ret_ty),
             Expr::Block(b) => b.tail.as_deref().and_then(Self::array_len_of),
+            Expr::MatchBoundary(b, _) => b.tail.as_deref().and_then(Self::array_len_of),
             Expr::If(_, then, Some(els)) => Self::array_len_of_tail(then)
                 .or_else(|| Self::array_len_of_tail(els)),
             _ => None,
@@ -106,6 +142,9 @@ impl Codegen {
     fn array_len_ty(ty: &Type) -> Option<usize> {
         match ty {
             Type::Array(_, n) => Some(*n),
+            // Indexing an array reference checks against the referent's
+            // length, so `&[T; N]` must report `N` or the check is skipped.
+            Type::Ref(inner, _) => Self::array_len_ty(inner),
             _ => None,
         }
     }
@@ -162,19 +201,34 @@ impl Codegen {
         self.regs.len() as i32
     }
 
+    /// Number of callee-saved registers saved below `%rbp`, holding promoted
+    /// locals and spill temporaries. Both sit above the frame slots, so a slot
+    /// offset is shifted past the sum.
+    fn saved_regs(&self) -> i32 {
+        self.nregs() + self.spill_regs.len() as i32
+    }
+
     /// Byte offset of stack `slot` relative to `%rbp`. Slots grow downward, and
-    /// the saved promoted registers sit in the lowest bytes of the frame, so
-    /// every slot is shifted past them and never overlaps `%rbp` or a saved
-    /// register.
+    /// the saved registers sit in the lowest bytes of the frame, so every slot
+    /// is shifted past them and never overlaps `%rbp` or a saved register.
     fn off(&self, slot: i32) -> i32 {
-        -(slot + 1 + self.nregs()) * 8
+        // Only a local slot sizes the frame; a spill slot lives in the reserved
+        // region past the locals (`spill_slots`), so it must not be counted or it
+        // would be added twice.
+        if slot < self.spill_base {
+            self.frame_slots.set(self.frame_slots.get().max(slot + 1));
+        }
+        -(slot + 1 + self.saved_regs()) * 8
     }
 
     /// Address of element 0 of an `n`-element array occupying `slot..slot+n`.
     /// Slots are laid out downward, so the lowest address is that of the last
     /// slot; elements are then addressed upward from there as `base + i*8`.
     fn array_off(&self, slot: i32, n: usize) -> i32 {
-        -(slot + n as i32 + self.nregs()) * 8
+        if slot < self.spill_base {
+            self.frame_slots.set(self.frame_slots.get().max(slot + n as i32));
+        }
+        -(slot + n as i32 + self.saved_regs()) * 8
     }
 
     fn new_label(&mut self) -> String {
@@ -187,16 +241,32 @@ impl Codegen {
     /// `%rsp` never moves mid-function: a moving stack forces a 16-byte
     /// alignment pad around every call, which costs more than the spill saves.
     fn push_rax(&mut self) {
-        let o = self.off(self.spill_base + self.sp_off);
-        self.line(&format!("mov %rax, {o}(%rbp)"));
+        // The first few spills live in callee-saved registers, which survive
+        // the calls the spill exists to cross; only the rest reach the frame.
+        if let Some(r) = self.spill_regs.get(self.sp_off as usize) {
+            let r = *r;
+            self.line(&format!("mov %rax, {r}"));
+        } else {
+            // Frame spills are packed just past the locals, so a deeper
+            // register-held spill does not leave a hole in the frame.
+            let idx = self.spill_base + (self.sp_off - self.spill_regs.len() as i32);
+            let o = self.off(idx);
+            self.line(&format!("mov %rax, {o}(%rbp)"));
+        }
         self.sp_off += 1;
         self.max_spill = self.max_spill.max(self.sp_off);
     }
 
     fn pop_to(&mut self, reg: &str) {
         self.sp_off -= 1;
-        let o = self.off(self.spill_base + self.sp_off);
-        self.line(&format!("mov {o}(%rbp), {reg}"));
+        if let Some(r) = self.spill_regs.get(self.sp_off as usize) {
+            let r = *r;
+            self.line(&format!("mov {r}, {reg}"));
+        } else {
+            let idx = self.spill_base + (self.sp_off - self.spill_regs.len() as i32);
+            let o = self.off(idx);
+            self.line(&format!("mov {o}(%rbp), {reg}"));
+        }
     }
 
     pub fn compile(mut self, prog: &Program) -> String {
@@ -237,27 +307,59 @@ impl Codegen {
         // slots; the dry run's output is discarded.
         self.spill_base = f.nslots;
         self.spill_slots = 0;
+        self.spill_regs = Vec::new();
+        // Reset the frame size; `off`/`array_off` re-measure it as the dry pass
+        // emits, and the final pass is seeded with the dry pass's result.
+        self.frame_slots.set(0);
         let mark = (self.out.len(), self.label, self.str_id, self.strings.len());
+        // Dry run with every spill in the frame: it reports the deepest spill,
+        // which is exactly how many spill registers are worth reserving, and the
+        // deepest local slot the body addresses, which sizes the frame.
         self.gen_fn_body(f);
         let need = self.max_spill;
+        let frame = self.frame_slots.get();
         self.out.truncate(mark.0);
         self.label = mark.1;
         self.str_id = mark.2;
         self.strings.truncate(mark.3);
-        self.spill_slots = need;
+        // Hold the first `nres` spills in callee-saved registers; the dry run
+        // already proved nothing spills deeper than that. The pool is the same
+        // registers the promoted locals draw on, so a spill register must be one
+        // no local is already using — a promoted `%r12` and a spill `%r12` would
+        // clobber each other.
+        let used: Vec<&'static str> = self.regs.iter().map(|(_, r)| *r).collect();
+        let free: Vec<&'static str> =
+            ALLOC_REGS.iter().copied().filter(|r| !used.contains(r)).collect();
+        let nres = (need as usize).min(SPILL_REGS.len()).min(free.len());
+        self.spill_regs = free[..nres].to_vec();
+        // Only spills past the reserved registers land in the frame; the rest
+        // are held in `spill_regs`, so the frame needs just the remainder.
+        self.spill_slots = (need as usize - nres) as i32;
+        // Seed the frame size measured by the dry run so the prologue, which is
+        // emitted before the body, allocates exactly that much, and start the
+        // spill slots right after the deepest local actually used rather than
+        // after every declared local; `gen_fn_body` then re-measures and must
+        // agree (the extra spill slots do not change which locals are addressed).
+        self.frame_slots.set(frame);
+        self.spill_base = frame;
         self.gen_fn_body(f);
         self.regs.clear();
+        self.spill_regs.clear();
     }
 
     fn gen_fn_body(&mut self, f: &FnDef) {
+        let fn_start = self.out.len();
         self.sp_off = 0;
         self.max_spill = 0;
         self.epilogue = self.new_label();
         self.ret_slot = f.ret_slot;
         self.ret_ty = f.ret.clone();
-        let saved: Vec<&'static str> = self.regs.iter().map(|(_, r)| *r).collect();
+        let mut saved: Vec<&'static str> = self.regs.iter().map(|(_, r)| *r).collect();
+        // Spill registers are saved after the promoted locals, in pool order,
+        // which is the order `off` accounts for them in.
+        saved.extend(self.spill_regs.iter().copied());
 
-        let nregs = self.nregs();
+        let nregs = saved.len() as i32;
         self.raw(&format!(".globl {}", f.name));
         self.raw(&format!(".type {}, @function", f.name));
         self.raw(&format!("{}:", f.name));
@@ -270,7 +372,7 @@ impl Codegen {
             self.line(&format!("push {r}"));
         }
         let saved_bytes = nregs as i32 * 8;
-        let slots_bytes = (f.nslots + self.spill_slots) * 8;
+        let slots_bytes = (self.frame_slots.get() + self.spill_slots) * 8;
         // The total depth below %rbp (saved registers plus frame) must be a
         // multiple of 16 so %rsp is 16-byte aligned at every call.
         let frame = ((slots_bytes + saved_bytes + 15) / 16) * 16 - saved_bytes;
@@ -340,6 +442,83 @@ impl Codegen {
         self.line("leave");
         self.line("ret");
         self.raw(&format!(".size {}, .-{}", f.name, f.name));
+        self.trim_dead(fn_start);
+    }
+
+    /// Drop instructions that cannot be reached because the instruction before
+    /// them unconditionally transfers control (`jmp`, `ret`), drop a
+    /// register-to-self `mov`, and drop a `jmp` whose target is the very next
+    /// label (the fallthrough already goes there). The generator emits all
+    /// three: a `return` inside an expression leaves a `jmp` to the epilogue
+    /// followed by the rest of the expression, a value already in a destination
+    /// register is still "stored", and a function whose last expression is a
+    /// value jumps to an epilogue label that immediately follows. None changes
+    /// behaviour but each costs I-cache and decode slots.
+    ///
+    /// A label ends the unreachable run: a later `jmp` may target it, so the
+    /// instruction after a label is live even when the text before it is not.
+    /// Output from `start` onward is rewritten in place; the pass is a fixpoint
+    /// in one sweep because removing an instruction never creates a new label
+    /// or a new terminator.
+    fn trim_dead(&mut self, start: usize) {
+        let mut head = self.out[..start].to_string();
+        let body = self.out[start..].to_string();
+        let mut dead = false;
+        // The last live instruction, as (src, dst) for a `mov` and `None` for
+        // anything else. Used to fold a store immediately undone by its reload
+        // (or the reverse) into nothing.
+        let mut prev: Option<(String, String)> = None;
+        for raw_line in body.split_inclusive('\n') {
+            let line = raw_line.trim_end_matches('\n');
+            let is_label = !line.starts_with('\t') && !line.starts_with(' ') && line.ends_with(':');
+            let text = line.trim_start();
+            if is_label || line.starts_with('.') {
+                dead = false;
+                prev = None;
+                if is_label {
+                    // `jmp L` immediately followed by `L:` is a jump to the next
+                    // instruction; drop it. The label is written with no leading
+                    // tab, the jump with one, so the exact suffix identifies it.
+                    let jmp_line = format!("\tjmp {}\n", line.trim_end_matches(':'));
+                    if head.ends_with(&jmp_line) {
+                        head.truncate(head.len() - jmp_line.len());
+                    }
+                }
+            }
+            if dead {
+                continue;
+            }
+            if let Some(rest) = text.strip_prefix("mov ") {
+                if let Some((src, dst)) = rest.split_once(',') {
+                    let (src, dst) = (src.trim(), dst.trim());
+                    // `mov %r, %r` with the same operand twice is a no-op.
+                    if src == dst && src.starts_with('%') {
+                        continue;
+                    }
+                    // A `mov` whose source and destination are the reverse of
+                    // the previous `mov`'s is a round trip that changes nothing
+                    // (both are adjacent, so nothing clobbers the register in
+                    // between): `mov %rax, X` then `mov X, %rax`. Drop the
+                    // second and keep the first, so a store survives and a
+                    // pointless reload disappears.
+                    if let Some((psrc, pdst)) = &prev {
+                        if src == pdst && dst == psrc {
+                            continue;
+                        }
+                    }
+                    prev = Some((src.to_string(), dst.to_string()));
+                } else {
+                    prev = None;
+                }
+            } else {
+                prev = None;
+            }
+            if text == "jmp" || text.starts_with("jmp ") || text == "ret" {
+                dead = true;
+            }
+            head.push_str(raw_line);
+        }
+        self.out = head;
     }
 
     /// Copy `n` 8-byte words from the address in `%rsi` to the address in `%rdi`.
@@ -541,6 +720,26 @@ impl Codegen {
         }
     }
 
+    /// Marks every local that a `&` reaches as needing memory, so its frame
+    /// slot stays current and `lea` yields a valid address.
+    fn mark_addressed(e: &Expr, mem: &mut Vec<bool>) {
+        match e {
+            Expr::Var { slot, ty, .. } => {
+                let n = if ty.is_aggregate() { (ty.size() / 8).max(1) } else { 1 };
+                for k in 0..n as i32 {
+                    if let Some(m) = mem.get_mut((*slot + k) as usize) {
+                        *m = true;
+                    }
+                }
+            }
+            Expr::Field { base, .. } => Self::mark_addressed(base, mem),
+            Expr::Index(base, _) => Self::mark_addressed(base, mem),
+            // A dereference's target already lives in memory.
+            Expr::Deref { .. } => {}
+            _ => {}
+        }
+    }
+
     /// `whole` is true when the value of `e` is used as a complete aggregate,
     /// which is what makes a struct unfit for per-field promotion. A `Field` or
     /// `Index` base is not a whole use, so it is passed `false`.
@@ -570,6 +769,9 @@ impl Codegen {
             // A tag test reads the value's first word, and a payload read
             // offsets into it: both need the value's address, never a copy.
             Expr::VariantTest { scrutinee, .. } => {
+                Self::count_expr(scrutinee, counts, mem, copied, false, let_tmps)
+            }
+            Expr::BoolTest { scrutinee, .. } => {
                 Self::count_expr(scrutinee, counts, mem, copied, false, let_tmps)
             }
             Expr::EnumPayload { recv, ty, .. } => {
@@ -641,6 +843,26 @@ impl Codegen {
             Expr::Un(_, a) | Expr::Cast(a, _) => {
                 Self::count_expr(a, counts, mem, copied, true, let_tmps)
             }
+            // `&e` on a place is that place's address, so `e` is read as a
+            // place, never as a whole value to copy. A temporary `&e` (slot >=
+            // 0) keeps the temporary's words in memory for the copy.
+            Expr::AddrOf { expr, ty, slot, .. } => {
+                // Taking a place's address needs the place to be in memory: a
+                // register-promoted local has no address, and `lea slot(%rbp)`
+                // would read a stale frame word.
+                Self::mark_addressed(expr, mem);
+                Self::count_expr(expr, counts, mem, copied, false, let_tmps);
+                if *slot >= 0 {
+                    for k in 0..(ty.size() / 8).max(1) as i32 {
+                        if let Some(m) = mem.get_mut((*slot + k) as usize) {
+                            *m = true;
+                        }
+                    }
+                }
+            }
+            Expr::Deref { expr, .. } => {
+                Self::count_expr(expr, counts, mem, copied, false, let_tmps)
+            }
             Expr::Call { args, .. } => {
                 for a in args {
                     Self::count_expr(a, counts, mem, copied, true, let_tmps);
@@ -654,11 +876,23 @@ impl Codegen {
                 }
             }
             Expr::Block(b) => Self::count_block(b, counts, mem, copied, true, let_tmps),
+            Expr::MatchBoundary(b, _) => Self::count_block(b, counts, mem, copied, true, let_tmps),
             Expr::ArrayLit(v, _) => {
                 Self::count_expr(v, counts, mem, copied, true, let_tmps)
             }
             Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) => {}
         }
+    }
+
+    /// Generate an expression whose value is discarded, so `if` without `else`
+    /// need not materialise its unit result. Only a bare `if` is special-cased:
+    /// a block or `match` in statement position is left alone, because their
+    /// `if` arms can appear in value position within the block's own tail.
+    fn gen_stmt_expr(&mut self, e: &Expr) {
+        let saved = self.discard;
+        self.discard = true;
+        self.gen_expr(e);
+        self.discard = saved;
     }
 
     fn gen_block(&mut self, b: &Block) -> Type {
@@ -781,33 +1015,31 @@ impl Codegen {
                         }
                     }
                     Expr::Field { ty, .. } if ty.is_aggregate() => {
-                        let n = ty.size() / 8;
-                        // The destination address lives in `%rdi`, which
-                        // `gen_expr(value)` may clobber (a call, or another
-                        // aggregate copy), so stash it until the copy.
-                        self.gen_addr(target);
-                        self.push_rax();
-                        self.gen_expr(value);
-                        self.line("mov %rax, %rsi");
-                        self.pop_to("%rdi");
-                        self.copy_words_rdi_rsi(n);
+                        self.assign_aggregate(target, value, ty.size() / 8);
                     }
                     Expr::Field { base, offset, .. } => {
                         if let Some(r) = self.field_reg(base, *offset) {
-                            self.gen_expr_into_reg(value, r);
+                            // The field lives in a promoted register. A register
+                            // or immediate value folds into the move; anything
+                            // else materialises the value, then moves it.
+                            match self.simple_operand(value) {
+                                Some(op) if op.starts_with('%') || op.starts_with('$') => {
+                                    self.line(&format!("mov {op}, {r}"));
+                                }
+                                _ => self.gen_expr_into_reg(value, r),
+                            }
                         } else {
                             match self.field_operand(base, *offset) {
-                                Some(op) => {
-                                    self.gen_expr(value);
-                                    self.line(&format!("mov %rax, {op}"));
-                                }
-                                None => {
-                                    self.gen_addr(target);
-                                    self.push_rax();
-                                    self.gen_expr(value);
-                                    self.pop_to("%rcx");
-                                    self.line("mov %rax, (%rcx)");
-                                }
+                                Some(op) => match self.simple_operand(value) {
+                                    Some(v) if v.starts_with('%') || v.starts_with('$') => {
+                                        self.store_operand(&v, &op);
+                                    }
+                                    _ => {
+                                        self.gen_expr(value);
+                                        self.line(&format!("mov %rax, {op}"));
+                                    }
+                                },
+                                None => self.store_through_addr(target, value, Some(0)),
                             }
                         }
                     }
@@ -819,13 +1051,7 @@ impl Codegen {
                             Expr::Var { ty: Type::Array(e, _), .. } => (**e).clone(),
                             _ => unreachable!(),
                         };
-                        let n = elem.size() / 8;
-                        self.gen_addr(target);
-                        self.push_rax();
-                        self.gen_expr(value);
-                        self.line("mov %rax, %rsi");
-                        self.pop_to("%rdi");
-                        self.copy_words_rdi_rsi(n);
+                        self.assign_aggregate(target, value, elem.size() / 8);
                     }
                     Expr::Index(base, idx) => {
                         match self.array_elem_operand(base, idx) {
@@ -861,28 +1087,57 @@ impl Codegen {
                                 }
                             }
                             None => {
-                                self.gen_addr(target);
-                                self.push_rax();
-                                self.gen_expr(value);
-                                self.pop_to("%rcx");
-                                self.line("mov %rax, (%rcx)");
+                                // The value is evaluated before the assignee
+                                // place (see `store_through_addr`), and here the
+                                // place's index is what may call, so the value
+                                // must be stashed before the address is formed.
+                                if Self::place_has_effect(target) {
+                                    self.gen_expr(value);
+                                    self.push_rax();
+                                    self.gen_addr(target);
+                                    self.line("mov %rax, %rcx");
+                                    self.pop_to("%rax");
+                                    self.line("mov %rax, (%rcx)");
+                                } else {
+                                    self.gen_addr(target);
+                                    self.push_rax();
+                                    self.gen_expr(value);
+                                    self.pop_to("%rcx");
+                                    self.line("mov %rax, (%rcx)");
+                                }
                             }
                         }
+                    }
+                    // `*r = v`: the target's address is the pointer `r` holds.
+                    Expr::Deref { ty, .. } if ty.is_aggregate() => {
+                        self.assign_aggregate(target, value, ty.size() / 8);
+                    }
+                    Expr::Deref { .. } => {
+                        self.store_through_addr(target, value, Some(0));
                     }
                     _ => unreachable!("sema guarantees a valid assignment target"),
                 }
             }
             Stmt::Expr(e) => {
-                self.gen_expr(e);
+                self.gen_stmt_expr(e);
             }
             Stmt::While(cond, body) => {
-                let top = self.new_label();
+                // Rotated: the test moves to the bottom and the body falls
+                // through to it, so the back edge is the conditional branch and
+                // the loop no longer pays an unconditional `jmp` every
+                // iteration. The entry `jmp` runs once and reuses the same test,
+                // so a false first condition still skips the body. `continue`
+                // targets the test (re-check), `break` targets `end`, which the
+                // test falls into.
+                let body_l = self.new_label();
+                let test_l = self.new_label();
                 let end = self.new_label();
-                self.loops.push((top.clone(), end.clone()));
-                self.raw(&format!("{top}:"));
-                self.gen_branch_false(cond, &end);
+                self.loops.push((test_l.clone(), end.clone()));
+                self.line(&format!("jmp {test_l}"));
+                self.raw(&format!("{body_l}:"));
                 self.gen_block(body);
-                self.line(&format!("jmp {top}"));
+                self.raw(&format!("{test_l}:"));
+                self.gen_branch_true(cond, &body_l);
                 self.raw(&format!("{end}:"));
                 self.loops.pop();
             }
@@ -902,6 +1157,11 @@ impl Codegen {
                 self.store_slot(*var_slot);
                 self.gen_expr(end);
                 self.store_slot(*end_slot);
+                // Not rotated: the increment sits between the body and the
+                // guard, so the first guard must see the *un*-incremented start.
+                // A rotated form would either skip the first iteration or need
+                // the guard duplicated, which is not worth it for a construct
+                // the hot benchmarks do not use.
                 let top = self.new_label();
                 let cont = self.new_label();
                 let end_l = self.new_label();
@@ -1025,9 +1285,28 @@ impl Codegen {
         }
     }
 
-    /// A `disp(%rbp)` operand for `base.field` when `base` is a struct local in
-    /// memory, or `None` when the base is not a plain local (the caller then
-    /// computes the address).
+    /// True when `e`'s type is a reference, so `e`'s value is a pointer and
+    /// reaching a field or element through it uses that pointer directly.
+    fn ref_base(e: &Expr) -> bool {
+        match e {
+            Expr::Var { ty, .. } | Expr::Field { ty, .. } | Expr::Deref { ty, .. } => {
+                matches!(ty, Type::Ref(..))
+            }
+            _ => false,
+        }
+    }
+
+    /// A `disp(base)` operand for `base.field`, or `None` when the base is not
+    /// a form that can be addressed directly (the caller then computes the
+    /// address). Two forms fold:
+    ///
+    /// * a struct local in memory: `disp(%rbp)`;
+    /// * a pointer held in a register — a reference local, or a dereference of
+    ///   one — which gives `disp(%reg)`, the whole `&self` field read as one
+    ///   instruction instead of `mov`/`add`/`mov`.
+    ///
+    /// A reference held in memory (never promoted, or spilled) would need its
+    /// pointer in a register first, so it does not fold here.
     fn field_operand(&self, base: &Expr, offset: i32) -> Option<String> {
         match base {
             Expr::Var { slot, ty: Type::Struct(_, size), .. } => {
@@ -1038,6 +1317,51 @@ impl Codegen {
                     return None;
                 }
                 Some(format!("{}(%rbp)", self.array_off(*slot, size / 8) + offset))
+            }
+            Expr::Var { slot, ty: Type::Ref(inner, _), .. } => {
+                // A reference local's register holds its pointer, which is the
+                // struct's address only when the referent *is* a struct. For a
+                // `&&Struct` the referent is another pointer, so `r.field` must
+                // load that inner pointer first (see the read path).
+                match self.reg_of(*slot) {
+                    Some(r) if inner.is_aggregate() => Some(format!("{}({r})", offset)),
+                    _ => None,
+                }
+            }
+            // `base` is `*expr`, whose value is the place `expr` points at. That
+            // place is the struct address only when the deref's own type is the
+            // aggregate; for `(*q).field` with `q: &&Struct` the deref yields a
+            // pointer, whose address is the reference cell, not the struct.
+            Expr::Deref { expr, ty } => match self.ptr_reg(expr) {
+                Some(r) if ty.is_aggregate() => Some(format!("{}({r})", offset)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The register holding the pointer value of reference expression `e`, when
+    /// `e` is a reference *local* kept in a register. This is the only form whose
+    /// pointer needs no load: a `*p` used as a reference has its pointer in
+    /// memory, so it is not a register operand.
+    fn ptr_reg(&self, e: &Expr) -> Option<&'static str> {
+        match e {
+            Expr::Var { slot, ty: Type::Ref(..), .. } => self.reg_of(*slot),
+            _ => None,
+        }
+    }
+
+    /// The register holding the address of aggregate place `e`, when that
+    /// address is already in a register: a reference local (`r.x` where `r: &T`)
+    /// or a dereference of one (`(*q).x` where `q: &T`). A deeper chain
+    /// (`(**q).x`) has its inner pointer in memory and does not fold.
+    fn addr_reg(&self, e: &Expr) -> Option<&'static str> {
+        match e {
+            Expr::Var { slot, ty: Type::Ref(inner, _), .. } => {
+                self.reg_of(*slot).filter(|_| inner.is_aggregate())
+            }
+            Expr::Deref { expr, ty } => {
+                self.ptr_reg(expr).filter(|_| ty.is_aggregate())
             }
             _ => None,
         }
@@ -1057,6 +1381,78 @@ impl Codegen {
 
     fn struct_field_reg(&self, slot: i32, fields: i32, offset: i32) -> Option<&'static str> {
         self.reg_of(slot + fields - 1 - offset / 8)
+    }
+
+    /// Stores `value` into a place whose address `gen_addr` computes. When the
+    /// value is a register or immediate operand that no `gen_addr` clobbers,
+    /// the store folds to one instruction (`mov $k, off(%reg)` or
+    /// `mov %r, off(%reg)`) with no temporary slot. Otherwise it falls back to
+    /// materialising the address, then the value, then storing through `%rcx`.
+    /// `off` is a constant displacement added to the computed address (a
+    /// variable index passes `None` and stays on the fallback path).
+    fn store_through_addr(&mut self, target: &Expr, value: &Expr, off: Option<i32>) {
+        // rustc evaluates the assigned value before the assignee place (the one
+        // expression whose operands are ordered right-to-left). When computing
+        // the place can run a call, evaluate the value first and stash it,
+        // otherwise the place's call would be sequenced ahead of the value's.
+        if Self::place_has_effect(target) {
+            // The value goes first, but the place's address is what `gen_addr`
+            // leaves in `%rax`; move it aside, reload the value into `%rax`, and
+            // store the value through the address.
+            self.gen_expr(value);
+            self.push_rax();
+            self.gen_addr(target);
+            self.line("mov %rax, %rcx");
+            self.pop_to("%rax");
+            self.line("mov %rax, (%rcx)");
+            return;
+        }
+        if let (Some(op), Some(k)) = (self.simple_operand(value), off) {
+            if op.starts_with('%') || op.starts_with('$') {
+                self.gen_addr(target);
+                let disp = if k == 0 { String::new() } else { format!("{k}") };
+                self.store_operand(&op, &format!("{disp}(%rax)"));
+                return;
+            }
+        }
+        self.gen_addr(target);
+        self.push_rax();
+        self.gen_expr(value);
+        self.pop_to("%rcx");
+        self.line("mov %rax, (%rcx)");
+    }
+
+    /// Assign aggregate `value` (an address in `%rax`) into aggregate place
+    /// `target` by copying `n` words. The value is evaluated before the place,
+    /// as rustc orders assignment operands; when the place's address computation
+    /// can call, the value is stashed across it. Otherwise the place is formed
+    /// first and the value stashed across the copy's scratch use of `%rdi`.
+    fn assign_aggregate(&mut self, target: &Expr, value: &Expr, n: usize) {
+        if Self::place_has_effect(target) {
+            self.gen_expr(value);
+            self.push_rax();
+            self.gen_addr(target);
+            self.line("mov %rax, %rdi");
+            self.pop_to("%rsi");
+        } else {
+            self.gen_addr(target);
+            self.push_rax();
+            self.gen_expr(value);
+            self.line("mov %rax, %rsi");
+            self.pop_to("%rdi");
+        }
+        self.copy_words_rdi_rsi(n);
+    }
+
+    /// Store register-or-immediate operand `op` into memory operand `dst`.
+    ///
+    /// An immediate store must be sized `movq`. `as` has no operand to infer a
+    /// width from in `mov $imm, mem`, so it defaults to a 32-bit store and
+    /// leaves the destination's upper four bytes untouched — a stale high half.
+    /// A register operand names its own width, so a plain `mov` is already 64-bit.
+    fn store_operand(&mut self, op: &str, dst: &str) {
+        let mnemonic = if op.starts_with('$') { "movq" } else { "mov" };
+        self.line(&format!("{mnemonic} {op}, {dst}"));
     }
 
     /// Leaves the address of an lvalue in `%rax`.
@@ -1083,10 +1479,26 @@ impl Codegen {
                 self.line("lea (%rcx,%rax,8), %rax");
             }
             Expr::Field { base, offset, .. } => {
-                self.gen_addr(base);
-                if *offset != 0 {
-                    self.line(&format!("add ${}, %rax", *offset));
+                // A `Ref` base is a pointer: the address of its field is the
+                // pointer value plus the offset, not the address of the slot
+                // holding the pointer. When the pointer is already in a register
+                // this is a single `lea`.
+                if let Some(r) = self.addr_reg(base) {
+                    self.line(&format!("lea {}({r}), %rax", *offset));
+                } else {
+                    if Self::ref_base(base) {
+                        self.gen_expr(base);
+                    } else {
+                        self.gen_addr(base);
+                    }
+                    if *offset != 0 {
+                        self.line(&format!("add ${}, %rax", *offset));
+                    }
                 }
+            }
+            // `*r` is a place whose address is the pointer `r` holds.
+            Expr::Deref { expr, .. } => {
+                self.gen_expr(expr);
             }
             // A field or index base that is not a named local is a temporary
             // whose value *is* its address: a call's hidden return buffer, a
@@ -1094,6 +1506,7 @@ impl Codegen {
             // it leaves that address in `%rax`.
             Expr::Call { .. }
             | Expr::Block(_)
+            | Expr::MatchBoundary(_, _)
             | Expr::If(..)
             | Expr::StructLit { .. }
             | Expr::EnumCtor { .. } => {
@@ -1157,6 +1570,14 @@ impl Codegen {
                 self.line(&format!("lea {base}(%rbp), %rax"));
                 Type::EnumData(enum_name.clone(), *size)
             }
+            Expr::BoolTest { scrutinee, value } => {
+                // The scrutinee is a bool word (0 or 1); compare it directly.
+                self.gen_expr(scrutinee);
+                self.line(&format!("cmp ${}, %rax", *value as i64));
+                self.line("sete %al");
+                self.line("movzbq %al, %rax");
+                Type::Bool
+            }
             Expr::VariantTest { scrutinee, tag, .. } => {
                 // Compare the value's tag word. `gen_expr` yields the address
                 // for an aggregate enum and the tag itself for a unit enum, so
@@ -1201,12 +1622,18 @@ impl Codegen {
                 Type::I64
             }
             Expr::Var { slot, ty, .. } => {
-                match self.aggregate_base(*slot, ty) {
-                    Some(base) => self.line(&format!("lea {base}(%rbp), %rax")),
-                    None => match self.reg_of(*slot) {
+                // A reference is a scalar: its value is the address it holds. An
+                // aggregate is named by its own address.
+                if ty.is_aggregate() {
+                    match self.aggregate_base(*slot, ty) {
+                        Some(base) => self.line(&format!("lea {base}(%rbp), %rax")),
+                        None => self.line(&format!("mov {}(%rbp), %rax", self.off(*slot))),
+                    }
+                } else {
+                    match self.reg_of(*slot) {
                         Some(r) => self.line(&format!("mov {r}, %rax")),
                         None => self.line(&format!("mov {}(%rbp), %rax", self.off(*slot))),
-                    },
+                    }
                 }
                 ty.clone()
             }
@@ -1251,10 +1678,7 @@ impl Codegen {
                 Type::Struct(name.clone(), (n as usize) * 8)
             }
             Expr::Index(base, _idx) => {
-                let elem = match base.as_ref() {
-                    Expr::Var { ty: Type::Array(e, _), .. } => (**e).clone(),
-                    _ => Type::I64,
-                };
+                let elem = Self::array_elem_ty(base).unwrap_or(Type::I64);
                 match self.array_elem_operand(base, _idx) {
                     // `disp(%rbp,%reg,8)` addresses the element in one operand.
                     Some(op) if op.contains("%rax") => {
@@ -1294,22 +1718,57 @@ impl Codegen {
                 }
                 elem
             }
+            Expr::AddrOf { expr, ty, slot, mutable } => {
+                if *slot >= 0 {
+                    // The operand has no address of its own (a literal, a call,
+                    // an aggregate value): evaluate it into a temporary and take
+                    // that address. An aggregate value *is* its address.
+                    let n = (ty.size() / 8).max(1);
+                    self.gen_expr(expr);
+                    if ty.is_aggregate() {
+                        self.line("mov %rax, %rsi");
+                        self.line(&format!("lea {}(%rbp), %rdi", self.array_off(*slot, n)));
+                        self.copy_words_rdi_rsi(n);
+                    } else {
+                        self.line(&format!("mov %rax, {}(%rbp)", self.off(*slot)));
+                    }
+                    self.line(&format!("lea {}(%rbp), %rax", self.array_off(*slot, n)));
+                } else {
+                    self.gen_addr(expr);
+                }
+                Type::Ref(Box::new(ty.clone()), *mutable)
+            }
+            Expr::Deref { expr, ty } => {
+                // A dereference is a place: read it. An aggregate referent is
+                // named by its address, so reading it yields the pointer itself.
+                self.gen_expr(expr);
+                if !ty.is_aggregate() {
+                    self.line("mov (%rax), %rax");
+                }
+                ty.clone()
+            }
             Expr::Un(op, inner) => {
-                self.gen_expr(inner);
+                let inner_ty = self.gen_expr(inner);
                 match op {
                     UnOp::Neg => {
                         self.line("neg %rax");
                         self.check_overflow();
                     }
-                    UnOp::Not => {
+                    // `!` is logical not on `bool` (1 when the operand is zero)
+                    // and bitwise not on an integer, matching Rust. Sema has
+                    // already checked the operand is `bool` or `i64`.
+                    UnOp::Not if inner_ty == Type::Bool => {
                         self.line("test %rax, %rax");
                         self.line("sete %al");
                         self.line("movzbq %al, %rax");
                     }
+                    UnOp::Not => {
+                        self.line("not %rax");
+                    }
                 }
                 match op {
                     UnOp::Neg => Type::I64,
-                    UnOp::Not => Type::Bool,
+                    UnOp::Not => inner_ty,
                 }
             }
             Expr::Bin(op, a, b) => self.gen_bin(*op, a, b),
@@ -1319,14 +1778,23 @@ impl Codegen {
             Expr::If(cond, then, els) => {
                 let else_l = self.new_label();
                 let end_l = self.new_label();
+                // An `if` without `else` in statement position produces no
+                // value, so it needs neither the `xor` that materialises unit
+                // nor a `jmp` over an empty else. The `then` block falls
+                // straight through to the branch target.
+                let bare = self.discard && els.is_none();
                 self.gen_branch_false(cond, &else_l);
                 let tt = self.gen_block(then);
-                self.line(&format!("jmp {end_l}"));
+                if !bare {
+                    self.line(&format!("jmp {end_l}"));
+                }
                 self.raw(&format!("{else_l}:"));
                 let et = match els {
                     Some(e) => self.gen_block(e),
                     None => {
-                        self.line("xor %eax, %eax");
+                        if !bare {
+                            self.line("xor %eax, %eax");
+                        }
                         Type::Unit
                     }
                 };
@@ -1334,6 +1802,7 @@ impl Codegen {
                 if tt == Type::Unit { et } else { tt }
             }
             Expr::Block(b) => self.gen_block(b),
+            Expr::MatchBoundary(b, _) => self.gen_block(b),
             Expr::ArrayLit(v, n) => {
                 // Only meaningful as a `let` initializer; produce the value.
                 let _ = n;
@@ -1381,6 +1850,12 @@ impl Codegen {
                     self.field_operand(base, *offset)
                 }
             }
+            // `*p` reading a scalar through a reference in a register is a bare
+            // memory operand, so `x + *p` folds into one `add`. An aggregate
+            // referent's value is its address, which is not a simple operand.
+            Expr::Deref { expr, ty } if !ty.is_aggregate() => {
+                self.ptr_reg(expr).map(|r| format!("({r})"))
+            }
             Expr::Index(base, idx) => {
                 // With bounds checks on, an element is never used as a bare
                 // operand: it is materialised through `gen_expr`, which emits
@@ -1404,6 +1879,17 @@ impl Codegen {
     fn check_overflow(&mut self) {
         if self.overflow {
             self.line("jo __rmc_overflow");
+        }
+    }
+
+    /// Trap if `reg` is not a valid shift count (0..=63). The hardware masks a
+    /// shift count to 6 bits, so without this a count of 81 silently shifts by
+    /// 17; Rust's `<<`/`>>` panics instead. Only called when overflow checks are
+    /// enabled.
+    fn check_shift_count(&mut self, reg: &str) {
+        if self.overflow {
+            self.line(&format!("cmp $63, {reg}"));
+            self.line("ja __rmc_shift_overflow");
         }
     }
 
@@ -1447,6 +1933,9 @@ impl Codegen {
                     return;
                 }
             }
+            if self.gen_accumulate(e, dst) {
+                return;
+            }
         }
         if let Some(op) = self.simple_operand(e) {
             if op != dst {
@@ -1457,6 +1946,150 @@ impl Codegen {
         self.gen_expr(e);
         if dst != "%rax" {
             self.line(&format!("mov %rax, {dst}"));
+        }
+    }
+
+    /// Fold `dst = dst + a + b - c + ...` into one `add`/`sub` per term, when
+    /// `dst` already holds the chain's leftmost operand (its own previous
+    /// value). A term that is already a single operand (an immediate, a
+    /// register, or a memory reference) folds straight into the instruction; a
+    /// term that needs evaluating (a call, a product) is computed into `%rax`
+    /// and added with one `add %rax, dst`. Either way this replaces the generic
+    /// expression tree, which bounces every partial result through `%rax` and
+    /// the spill slots, with a flat run of `add`s and `sub`s on the
+    /// accumulator's own register — the shape of a running sum.
+    ///
+    /// The chain is flattened first, so a nested sum counts: `acc + a + (b + c)`
+    /// becomes three adds rather than evaluating `b + c` in `%rax` and adding it
+    /// once. That case is common after LICM, which hoists each invariant term
+    /// into its own local and can leave the surviving expression as a sum of
+    /// sums.
+    ///
+    /// Returns false when `e` is not such a chain or when a term reads the
+    /// accumulator register itself: `dst` is updated in place, so a term that
+    /// read the *original* value would see the running result instead. The
+    /// evaluated-term form is skipped under `--overflow-checks`, where that
+    /// `add` would need its own `jo`. Each case falls back to the tree, which
+    /// keeps `dst` untouched until the end.
+    fn gen_accumulate(&mut self, e: &Expr, dst: &str) -> bool {
+        let mut terms: Vec<(bool, &Expr)> = Vec::new(); // (is_sub, operand)
+        Self::flatten_chain(e, false, &mut terms);
+        // The first term is the chain's base and must be `dst` itself.
+        let (base_sub, base) = terms[0];
+        if terms.len() < 2 || base_sub || self.reg_operand(base).as_deref() != Some(dst) {
+            return false;
+        }
+        if terms[1..].iter().any(|(_, x)| self.uses_reg(x, dst)) {
+            return false;
+        }
+        // Resolve every term before emitting anything, so a term that cannot be
+        // folded bails out without a half-written chain. A simple operand folds
+        // straight into the `add`/`sub`; a term that must be evaluated (a call,
+        // a product) is computed into `%rax` and added with a single `add
+        // %rax, dst`, saving the `%rax`->`%rcx`->`%rax` bounce. The evaluated
+        // form is only sound with overflow checks off — it has no `jo` — and
+        // `%rax` is free between terms because no term may read `dst` and the
+        // scratch registers never include a promoted local.
+        enum Term<'a> {
+            Simple(String),
+            Eval(&'a Expr),
+        }
+        let mut plan: Vec<(bool, Term)> = Vec::new();
+        for (is_sub, other) in &terms[1..] {
+            if let Some(op) = self.simple_operand(other) {
+                plan.push((*is_sub, Term::Simple(op)));
+            } else if !self.overflow {
+                plan.push((*is_sub, Term::Eval(other)));
+            } else {
+                return false;
+            }
+        }
+        for (is_sub, term) in plan {
+            let mnemonic = if is_sub { "sub" } else { "add" };
+            match term {
+                Term::Simple(op) => self.line(&format!("{mnemonic} {op}, {dst}")),
+                Term::Eval(x) => {
+                    self.gen_expr(x);
+                    self.line(&format!("{mnemonic} %rax, {dst}"));
+                }
+            }
+        }
+        true
+    }
+
+    /// Flatten a `+`/`-` tree into signed terms, left to right. Subtraction
+    /// flips the sign of its right subtree, so `x - (a - b)` yields `x`, `-a`,
+    /// `+b`. Anything that is not an add or a subtract is a single term.
+    fn flatten_chain<'a>(e: &'a Expr, sub: bool, out: &mut Vec<(bool, &'a Expr)>) {
+        match e {
+            Expr::Bin(BinOp::Add, a, b) => {
+                Self::flatten_chain(a, sub, out);
+                Self::flatten_chain(b, sub, out);
+            }
+            Expr::Bin(BinOp::Sub, a, b) => {
+                Self::flatten_chain(a, sub, out);
+                Self::flatten_chain(b, !sub, out);
+            }
+            _ => out.push((sub, e)),
+        }
+    }
+
+    /// True when evaluating `e` reads register `r`, the storage of a promoted
+    /// local. Only a `Var` or `Field` whose slot is promoted to `r` reads it
+    /// directly; every other node is checked by recursing into its operands.
+    fn uses_reg(&self, e: &Expr, r: &str) -> bool {
+        if self.reg_operand(e).as_deref() == Some(r) {
+            return true;
+        }
+        match e {
+            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::EnumVariant { .. } => false,
+            Expr::Var { .. } => false,
+            Expr::Field { base, .. } => self.uses_reg(base, r),
+            Expr::Bin(_, a, b) => self.uses_reg(a, r) || self.uses_reg(b, r),
+            Expr::Un(_, a) | Expr::Cast(a, _) => self.uses_reg(a, r),
+            Expr::Index(a, b) => self.uses_reg(a, r) || self.uses_reg(b, r),
+            Expr::Call { args, .. } => args.iter().any(|a| self.uses_reg(a, r)),
+            Expr::AddrOf { expr, .. } | Expr::Deref { expr, .. } => self.uses_reg(expr, r),
+            Expr::StructLit { fields, .. } => fields.iter().any(|f| self.uses_reg(&f.value, r)),
+            Expr::ArrayLit(v, _) => self.uses_reg(v, r),
+            Expr::EnumCtor { args, .. } => args.iter().any(|a| self.uses_reg(a, r)),
+            Expr::VariantTest { scrutinee, .. } => self.uses_reg(scrutinee, r),
+            Expr::BoolTest { scrutinee, .. } => self.uses_reg(scrutinee, r),
+            Expr::EnumPayload { recv, .. } => self.uses_reg(recv, r),
+            Expr::If(c, t, els) => {
+                self.uses_reg(c, r)
+                    || self.block_uses_reg(t, r)
+                    || els.as_ref().map_or(false, |b| self.block_uses_reg(b, r))
+            }
+            Expr::Block(b) => self.block_uses_reg(b, r),
+            Expr::MatchBoundary(b, _) => self.block_uses_reg(b, r),
+            Expr::ArrayList(_) | Expr::MethodCall { .. } => {
+                unreachable!("sema rewrites ArrayList and MethodCall")
+            }
+        }
+    }
+
+    fn block_uses_reg(&self, b: &Block, r: &str) -> bool {
+        b.stmts.iter().any(|s| self.stmt_uses_reg(s, r))
+            || b.tail.as_deref().map_or(false, |e| self.uses_reg(e, r))
+    }
+
+    fn stmt_uses_reg(&self, s: &Stmt, r: &str) -> bool {
+        match s {
+            Stmt::Let { init, .. } => init.as_ref().map_or(false, |e| self.uses_reg(e, r)),
+            Stmt::Assign { target, value } => {
+                self.uses_reg(target, r) || self.uses_reg(value, r)
+            }
+            Stmt::Expr(e) => self.uses_reg(e, r),
+            Stmt::While(c, b) => self.uses_reg(c, r) || self.block_uses_reg(b, r),
+            Stmt::Loop(b) => self.block_uses_reg(b, r),
+            Stmt::For { start, end, body, .. } => {
+                self.uses_reg(start, r)
+                    || self.uses_reg(end, r)
+                    || self.block_uses_reg(body, r)
+            }
+            Stmt::Return(v) => v.as_ref().map_or(false, |e| self.uses_reg(e, r)),
+            Stmt::Break | Stmt::Continue => false,
         }
     }
 
@@ -1572,7 +2205,7 @@ impl Codegen {
         // register-free operand the comparison needs no stack traffic at all.
         if matches!(op, Eq | Ne | Lt | Le | Gt | Ge) {
             if !self.emit_cmp(a, b) {
-                self.eval_operands(a, b);
+                self.eval_operands(a, b, false);
                 self.line("cmp %rcx, %rax");
             }
             self.line(&format!("{} %al", setcc(op)));
@@ -1588,12 +2221,20 @@ impl Codegen {
             if self.gen_div_const(op, a, b) {
                 return Type::I64;
             }
-            self.eval_operands(a, b);
-            self.line("cqto");
-            self.line("idiv %rcx");
-            if matches!(op, Mod) {
-                self.line("mov %rdx, %rax");
+            // A promoted-local divisor is a callee-saved register, so `idiv`
+            // can read it directly instead of bouncing it into `%rcx`. The
+            // dividend still has to reach `%rax`, but `gen_expr(a)` uses only
+            // `%rax`/`%rcx`/`%rdx` as scratch and `cqto` only writes `%rdx`, so
+            // the divisor register stays live across both.
+            if let Some(rb) = self.simple_operand(b) {
+                if rb.starts_with('%') {
+                    self.gen_expr(a);
+                    self.emit_div(op, &rb, r32(&rb));
+                    return Type::I64;
+                }
             }
+            self.eval_operands(a, b, false);
+            self.emit_div(op, "%rcx", "%ecx");
             return Type::I64;
         }
 
@@ -1633,6 +2274,8 @@ impl Codegen {
                 BitXor => self.line(&format!("xor ${k}, %rax")),
                 // The shift count is masked to 6 bits by hardware, exactly as
                 // Rust's `<<`/`>>` on `i64`; `sal`/`sar` take the count directly.
+                // A count outside 0..=63 is a compile-time error when the shift
+                // is constant (rejected in sema), so this arm only sees 0..=63.
                 Shl => self.line(&format!("sal ${}, %rax", k & 63)),
                 Shr => self.line(&format!("sar ${}, %rax", k & 63)),
                 _ => unreachable!(),
@@ -1640,7 +2283,41 @@ impl Codegen {
             return Type::I64;
         }
 
-        self.eval_operands(a, b);
+        // For these six ops the right operand can fold straight into the
+        // instruction, so `x + y` skips the `mov y, %rcx` bounce. Only a
+        // *register* operand folds: a memory operand measured slower on the
+        // cores this was tuned on (the load lands in the instruction's critical
+        // path), which is why the immediate-only rule above exists too.
+        // `gen_expr(a)` leaves `%rax`/`%rcx`/`%rdx` alone, so a register operand
+        // read from the promoted set is still live across it. The shifts are
+        // excluded because the count must be in `%cl`.
+        if matches!(op, Add | Sub | Mul | BitAnd | BitOr | BitXor) {
+            if let Some(rb) = self.simple_operand(b) {
+                if rb.starts_with('%') {
+                    self.gen_expr(a);
+                    match op {
+                        Add => {
+                            self.line(&format!("add {rb}, %rax"));
+                            self.check_overflow();
+                        }
+                        Sub => {
+                            self.line(&format!("sub {rb}, %rax"));
+                            self.check_overflow();
+                        }
+                        Mul => {
+                            self.line(&format!("imul {rb}, %rax"));
+                            self.check_overflow();
+                        }
+                        BitAnd => self.line(&format!("and {rb}, %rax")),
+                        BitOr => self.line(&format!("or {rb}, %rax")),
+                        _ => self.line(&format!("xor {rb}, %rax")),
+                    }
+                    return Type::I64;
+                }
+            }
+        }
+
+        self.eval_operands(a, b, matches!(op, Add | Mul | BitAnd | BitOr | BitXor));
         match op {
             Add => {
                 self.line("add %rcx, %rax");
@@ -1659,8 +2336,14 @@ impl Codegen {
             BitXor => self.line("xor %rcx, %rax"),
             // The variable shift count must be in `%cl`; `eval_operands`
             // already leaves the right operand in `%rcx`.
-            Shl => self.line("sal %cl, %rax"),
-            Shr => self.line("sar %cl, %rax"),
+            Shl => {
+                self.check_shift_count("%rcx");
+                self.line("sal %cl, %rax");
+            }
+            Shr => {
+                self.check_shift_count("%rcx");
+                self.line("sar %cl, %rax");
+            }
             _ => unreachable!(),
         }
         Type::I64
@@ -1688,7 +2371,61 @@ impl Codegen {
         }
     }
 
-    /// Emit `a / d` or `a % d` for a literal divisor `d` using a multiply and a
+    /// Emit a variable `Div`/`Mod` with the dividend in `%rax` and the divisor
+    /// in `rd` (whose 32-bit half is `rd32`), leaving the result in `%rax`.
+    ///
+    /// A 64-bit `idiv` is ~30–40 cycles; the 32-bit `div`/`idiv` is ~20 and
+    /// compiles to the same microcode as the 64-bit form on the cores this was
+    /// tuned on, so when both operands fit in a 32-bit value the narrower
+    /// instruction is simply cheaper. The operands are compared unsigned
+    /// against 2^32 (`cmp`/`jae`, not a signed `jl`) so the test is exact: a
+    /// negative dividend or divisor falls through to the 64-bit path, and no
+    /// signed comparison trick is needed. `%rdx` is free — `cqto` has not run
+    /// yet and a 32-bit `div` zeroes its own `%rdx` — and the dividend and
+    /// divisor are still in `%rax`/`rd` when the fast path is taken.
+    fn emit_div(&mut self, op: BinOp, rd: &str, rd32: &str) {
+        let slow = self.new_label();
+        let done = self.new_label();
+        let ok = self.new_label();
+        // Rust traps on a zero divisor even without `overflow-checks`. A zero
+        // divisor is < 2^32, so without this it would take the 32-bit path below
+        // and fault in `div`; check it before the fast/slow split.
+        self.line(&format!("test {rd}, {rd}"));
+        self.line("jz __rmc_divide_by_zero");
+        self.line("mov $4294967296, %rdx"); // 2^32
+        self.line("cmp %rdx, %rax");
+        self.line(&format!("jae {slow}"));
+        self.line(&format!("cmp %rdx, {rd}"));
+        self.line(&format!("jae {slow}"));
+        // Both fit in 32 bits: the 32-bit divide is exact (the dividend's high
+        // half is zero, so its `%rdx` contribution is zero) and cannot overflow.
+        self.line("xor %edx, %edx");
+        self.line(&format!("div {rd32}"));
+        if matches!(op, BinOp::Mod) {
+            self.line("mov %rdx, %rax");
+        }
+        self.line(&format!("jmp {done}"));
+        self.raw(&format!("{slow}:"));
+        // `i64::MIN / -1` (and `% -1`) has no representable quotient and the
+        // 64-bit `idiv` would fault; trap like Rust. Only a 64-bit-path dividend
+        // can be `MIN` (a 32-bit one has the high bit clear), so the check sits
+        // in the slow path and the fast path pays nothing for it. `%rdx` is
+        // scratch here: `cqto` below overwrites it before it is read.
+        self.line("movabs $0x8000000000000000, %rdx");
+        self.line("cmp %rdx, %rax");
+        self.line(&format!("jne {ok}"));
+        self.line(&format!("cmp $-1, {rd}"));
+        self.line("je __rmc_divide_overflow");
+        self.raw(&format!("{ok}:"));
+        self.line("cqto");
+        self.line(&format!("idiv {rd}"));
+        if matches!(op, BinOp::Mod) {
+            self.line("mov %rdx, %rax");
+        }
+        self.raw(&format!("{done}:"));
+    }
+
+    /// Division/modulo by a constant becomes a multiply, an arithmetic
     /// shift instead of `idiv`. Returns `false` for a variable divisor, a zero
     /// divisor, or a non-`i64` literal, so the caller falls back to `idiv`.
     ///
@@ -1704,7 +2441,12 @@ impl Codegen {
         if d == 1 {
             // The dividend is already in %rax.
         } else if d == -1 {
+            // `i64::MIN / -1` and `i64::MIN % -1` overflow; `neg` sets OF for
+            // exactly that operand, so the check is free. Rust traps here even
+            // without `overflow-checks`, because `idiv` cannot produce the
+            // wrapping result.
             self.line("neg %rax");
+            self.line("jo __rmc_divide_overflow");
         } else {
             let mag = d.unsigned_abs();
             if mag.is_power_of_two() {
@@ -1737,6 +2479,16 @@ impl Codegen {
                 self.line("add %rcx, %rdx");
                 if d < 0 {
                     self.line("neg %rdx");
+                }
+                // For `%` the quotient is already in `%rdx`; leave it there and
+                // take the remainder now, skipping the `%rdx`->`%rax`->`%rdx`
+                // round-trip the shared tail below would emit.
+                if matches!(op, BinOp::Mod) {
+                    self.line(&format!("movabs ${d}, %rcx"));
+                    self.line("imul %rcx, %rdx");
+                    self.line("sub %rdx, %r8");
+                    self.line("mov %r8, %rax");
+                    return true;
                 }
                 self.line("mov %rdx, %rax");
             }
@@ -1791,6 +2543,36 @@ impl Codegen {
         let m = q2 + 1;
         let add = m > i64::MAX as u128;
         (m as i64, p - N, add)
+    }
+    /// The element type of an array-valued expression `base`, when it can be
+    /// determined. A reference to an array is unwrapped, so `&[bool; N]`
+    /// reports `bool`; a block or `if` base gets the type of its tail. `None`
+    /// means the element type is unknown, and the caller falls back to `i64`.
+    fn array_elem_ty(base: &Expr) -> Option<Type> {
+        let t = match base {
+            Expr::Var { ty, .. } | Expr::Field { ty, .. } => ty,
+            Expr::Call { ret_ty, .. } => ret_ty,
+            Expr::Deref { ty, .. } => ty,
+            Expr::Block(b) => return b.tail.as_deref().and_then(Self::array_elem_ty),
+            Expr::MatchBoundary(b, _) => return b.tail.as_deref().and_then(Self::array_elem_ty),
+            Expr::If(_, then, Some(els)) => {
+                return Self::array_elem_ty_tail(then)
+                    .or_else(|| Self::array_elem_ty_tail(els))
+            }
+            _ => return None,
+        };
+        match t {
+            Type::Array(e, _) => Some((**e).clone()),
+            Type::Ref(inner, _) => match inner.as_ref() {
+                Type::Array(e, _) => Some((**e).clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn array_elem_ty_tail(b: &Block) -> Option<Type> {
+        b.tail.as_deref().and_then(Self::array_elem_ty)
     }
 
     /// An operand `disp(%rbp,%rax,8)` for `base[idx]` where `base` is a local
@@ -1876,10 +2658,13 @@ impl Codegen {
         }
     }
 
-    /// Evaluate two operands into the shared convention: left in `%rax`, right
-    /// in `%rcx`. Constants and locals are folded in as immediate or memory
-    /// operands; anything else goes through the stack.
-    fn eval_operands(&mut self, a: &Expr, b: &Expr) {
+    /// Evaluate `a` into `%rax` and `b` into `%rcx`, the operand registers the
+    /// arithmetic and comparison paths read. `commutative` lets the two-operand
+    /// cases skip a register bounce: when the operation does not care about
+    /// order, the spilled operand is placed in `%rcx` directly instead of being
+    /// routed through `%rax`, collapsing two moves into one. Callers must pass
+    /// `false` for anything order-sensitive — comparisons and `sub`/`div`/`mod`.
+    fn eval_operands(&mut self, a: &Expr, b: &Expr, commutative: bool) {
         let ra = self.simple_operand(a);
         let rb = self.simple_operand(b);
         match (ra, rb) {
@@ -1893,15 +2678,25 @@ impl Codegen {
             }
             (Some(la), None) => {
                 self.gen_expr(b);
-                self.line("mov %rax, %rcx");
-                self.line(&format!("mov {la}, %rax"));
+                if commutative {
+                    // `%rax` already holds `b`; the operation reads both
+                    // registers, so `la` only needs to reach `%rcx`.
+                    self.line(&format!("mov {la}, %rcx"));
+                } else {
+                    self.line("mov %rax, %rcx");
+                    self.line(&format!("mov {la}, %rax"));
+                }
             }
             (None, None) => {
                 self.gen_expr(a);
                 self.push_rax();
                 self.gen_expr(b);
-                self.line("mov %rax, %rcx");
-                self.pop_to("%rax");
+                if commutative {
+                    self.pop_to("%rcx");
+                } else {
+                    self.line("mov %rax, %rcx");
+                    self.pop_to("%rax");
+                }
             }
         }
     }
@@ -1912,7 +2707,7 @@ impl Codegen {
         if let Expr::Bin(op, a, b) = cond {
             if let Some(cc) = invert_cc(*op) {
                 if !self.emit_cmp(a, b) {
-                    self.eval_operands(a, b);
+                    self.eval_operands(a, b, false);
                     self.line("cmp %rcx, %rax");
                 }
                 self.line(&format!("{cc} {target}"));
@@ -1924,7 +2719,7 @@ impl Codegen {
             if let Expr::Bin(op, a, b) = inner.as_ref() {
                 if let Some(cc) = setcc_cc(*op) {
                     if !self.emit_cmp(a, b) {
-                        self.eval_operands(a, b);
+                        self.eval_operands(a, b, false);
                         self.line("cmp %rcx, %rax");
                     }
                     self.line(&format!("{cc} {target}"));
@@ -1935,6 +2730,38 @@ impl Codegen {
         self.gen_expr(cond);
         self.line("test %rax, %rax");
         self.line(&format!("jz {target}"));
+    }
+
+    /// The dual of `gen_branch_false`: jump to `target` when `cond` holds,
+    /// otherwise fall through. Used to close a rotated loop, where the test sits
+    /// at the bottom and the back edge is the conditional jump.
+    fn gen_branch_true(&mut self, cond: &Expr, target: &str) {
+        if let Expr::Bin(op, a, b) = cond {
+            if let Some(cc) = setcc_cc(*op) {
+                if !self.emit_cmp(a, b) {
+                    self.eval_operands(a, b, false);
+                    self.line("cmp %rcx, %rax");
+                }
+                self.line(&format!("{cc} {target}"));
+                return;
+            }
+        }
+        // `!(a < b)` jumps back when the comparison is false.
+        if let Expr::Un(UnOp::Not, inner) = cond {
+            if let Expr::Bin(op, a, b) = inner.as_ref() {
+                if let Some(cc) = invert_cc(*op) {
+                    if !self.emit_cmp(a, b) {
+                        self.eval_operands(a, b, false);
+                        self.line("cmp %rcx, %rax");
+                    }
+                    self.line(&format!("{cc} {target}"));
+                    return;
+                }
+            }
+        }
+        self.gen_expr(cond);
+        self.line("test %rax, %rax");
+        self.line(&format!("jnz {target}"));
     }
 
     fn gen_call(
@@ -2018,20 +2845,83 @@ impl Codegen {
             Expr::Un(_, a) | Expr::Cast(a, _) => Self::contains_call(a),
             Expr::Index(a, b) => Self::contains_call(a) || Self::contains_call(b),
             Expr::Field { base, .. } => Self::contains_call(base),
-            // An enum constructor, a variant test and a payload read all
-            // evaluate their children, which can call. Missing these let the
-            // direct-argument shortcut select an argument whose nested call
-            // clobbers an earlier argument register.
+            // Every expression that evaluates a child can call, so each must be
+            // covered: a missed variant lets the direct-argument shortcut pick
+            // an argument whose nested call clobbers an earlier argument
+            // register, and the assignment reorder must also see a call inside
+            // a place.
             Expr::EnumCtor { args, .. } => args.iter().any(Self::contains_call),
-            Expr::VariantTest { scrutinee, .. } => Self::contains_call(scrutinee),
+            Expr::VariantTest { scrutinee, .. } | Expr::BoolTest { scrutinee, .. } => {
+                Self::contains_call(scrutinee)
+            }
             Expr::EnumPayload { recv, .. } => Self::contains_call(recv),
+            Expr::Deref { expr, .. } | Expr::AddrOf { expr, .. } => Self::contains_call(expr),
+            Expr::ArrayList(v) => v.iter().any(Self::contains_call),
             Expr::If(c, t, els) => {
                 Self::contains_call(c)
                     || Self::block_has_call(t)
                     || els.as_ref().map_or(false, Self::block_has_call)
             }
             Expr::Block(b) => Self::block_has_call(b),
+            Expr::MatchBoundary(b, _) => Self::block_has_call(b),
             _ => false,
+        }
+    }
+
+    /// True when forming the address of `e` can change observable state: a
+    /// call, or a block/if that assigns a local. The value-before-place reorder
+    /// must key on this, not `contains_call`: `a[{ x = 2; 0 }] = x` computes the
+    /// place (a store) with no call, and reading the place first would store the
+    /// new `x` instead of the value `x` held before the place ran.
+    fn place_has_effect(e: &Expr) -> bool {
+        match e {
+            Expr::Block(b) | Expr::MatchBoundary(b, _) => Self::block_has_effect(b),
+            Expr::If(c, t, els) => {
+                Self::place_has_effect(c)
+                    || Self::block_has_effect(t)
+                    || els.as_ref().map_or(false, |b| Self::block_has_effect(b))
+            }
+            Expr::Index(a, b) => Self::place_has_effect(a) || Self::place_has_effect(b),
+            Expr::Field { base, .. } => Self::place_has_effect(base),
+            Expr::Deref { expr, .. } | Expr::AddrOf { expr, .. } => Self::place_has_effect(expr),
+            Expr::EnumPayload { recv, .. } => Self::place_has_effect(recv),
+            // An arithmetic, unary or cast sub-expression can hide a block that
+            // assigns a local (`r[{ y = 2; 0 } + 0] = y`), so the operands are
+            // traversed rather than reduced to a call check.
+            Expr::Bin(_, a, b) => Self::place_has_effect(a) || Self::place_has_effect(b),
+            Expr::Un(_, a) | Expr::Cast(a, _) => Self::place_has_effect(a),
+            Expr::ArrayLit(v, _) => Self::place_has_effect(v),
+            Expr::ArrayList(v) => v.iter().any(Self::place_has_effect),
+            // A call is an effect by itself; its arguments cannot make it worse.
+            Expr::Call { .. } | Expr::MethodCall { .. } => true,
+            Expr::StructLit { fields, .. } => fields.iter().any(|f| Self::place_has_effect(&f.value)),
+            Expr::EnumCtor { args, .. } => args.iter().any(Self::place_has_effect),
+            Expr::VariantTest { scrutinee, .. } | Expr::BoolTest { scrutinee, .. } => {
+                Self::place_has_effect(scrutinee)
+            }
+            _ => Self::contains_call(e),
+        }
+    }
+
+    fn block_has_effect(b: &Block) -> bool {
+        b.stmts.iter().any(Self::stmt_has_effect)
+            || b.tail.as_deref().map_or(false, Self::place_has_effect)
+    }
+
+    fn stmt_has_effect(s: &Stmt) -> bool {
+        match s {
+            Stmt::Let { init, .. } => init.as_ref().map_or(false, Self::place_has_effect),
+            // An assignment writes a local, which a later read can observe.
+            Stmt::Assign { .. } => true,
+            Stmt::Expr(e) => Self::place_has_effect(e),
+            Stmt::Return(v) => v.as_ref().map_or(false, Self::place_has_effect),
+            Stmt::For { start, end, body, .. } => {
+                Self::place_has_effect(start)
+                    || Self::place_has_effect(end)
+                    || Self::block_has_effect(body)
+            }
+            Stmt::While(..) | Stmt::Loop(..) => true,
+            Stmt::Break | Stmt::Continue => false,
         }
     }
 
@@ -2041,18 +2931,46 @@ impl Codegen {
     }
 
     /// True when evaluating `e` can clobber `%rdi`/`%rsi` without
-    /// `contains_call` noticing. The only such case is copying a whole
-    /// aggregate into a local: the copy runs through `%rdi`/`%rsi`
-    /// (`copy_words_rdi_rsi`), and a block's `let` initialiser can trigger one
-    /// without containing a call, so the direct-argument shortcut must not
-    /// select it.
+    /// `contains_call` noticing. Two cases qualify: copying a whole aggregate
+    /// into a local, and materialising an aggregate `&`-temporary. Both run
+    /// through `%rdi`/`%rsi` (`copy_words_rdi_rsi`) with no call in sight, so
+    /// the direct-argument shortcut must not select such an argument. The walk
+    /// recurses through every expression form, since a clobber can hide inside
+    /// a block, a binary operand, an index, or a nested `&`.
     fn clobbers_arg_regs(e: &Expr) -> bool {
         match e {
             Expr::Block(b) => Self::block_clobbers(b),
+            Expr::MatchBoundary(b, _) => Self::block_clobbers(b),
             Expr::If(_, t, els) => {
                 Self::block_clobbers(t)
                     || els.as_ref().map_or(false, |b| Self::block_clobbers(b))
             }
+            // `&<aggregate>` with a materialised temporary slot copies the
+            // aggregate into that slot through `%rdi`/`%rsi`, so `&{ s }` or
+            // `&some_struct_value` clobbers an earlier argument's register even
+            // though no call runs.
+            Expr::AddrOf { expr, ty, slot, .. } => {
+                (*slot >= 0 && ty.is_aggregate()) || Self::clobbers_arg_regs(expr)
+            }
+            Expr::Bin(_, a, b) => Self::clobbers_arg_regs(a) || Self::clobbers_arg_regs(b),
+            Expr::Un(_, a) | Expr::Cast(a, _) => Self::clobbers_arg_regs(a),
+            Expr::Index(a, b) => Self::clobbers_arg_regs(a) || Self::clobbers_arg_regs(b),
+            Expr::Field { base, .. } => Self::clobbers_arg_regs(base),
+            Expr::Deref { expr, .. } => Self::clobbers_arg_regs(expr),
+            Expr::Call { args, .. } => args.iter().any(Self::clobbers_arg_regs),
+            Expr::MethodCall { recv, args, .. } => {
+                Self::clobbers_arg_regs(recv) || args.iter().any(Self::clobbers_arg_regs)
+            }
+            Expr::EnumCtor { args, .. } => args.iter().any(Self::clobbers_arg_regs),
+            Expr::StructLit { fields, .. } => {
+                fields.iter().any(|f| Self::clobbers_arg_regs(&f.value))
+            }
+            Expr::ArrayLit(v, _) => Self::clobbers_arg_regs(v),
+            Expr::ArrayList(v) => v.iter().any(Self::clobbers_arg_regs),
+            Expr::VariantTest { scrutinee, .. } | Expr::BoolTest { scrutinee, .. } => {
+                Self::clobbers_arg_regs(scrutinee)
+            }
+            Expr::EnumPayload { recv, .. } => Self::clobbers_arg_regs(recv),
             _ => false,
         }
     }
@@ -2087,7 +3005,7 @@ impl Codegen {
     fn value_copies_aggregate(e: &Expr) -> bool {
         match e {
             Expr::Var { ty, .. } | Expr::Field { ty, .. } => ty.is_aggregate(),
-            Expr::Block(_) | Expr::If(..) => Self::clobbers_arg_regs(e),
+            Expr::Block(_) | Expr::MatchBoundary(_, _) | Expr::If(..) => Self::clobbers_arg_regs(e),
             _ => false,
         }
     }
@@ -2121,6 +3039,28 @@ fn setcc(op: BinOp) -> &'static str {
         BinOp::Gt => "setg",
         BinOp::Ge => "setge",
         _ => unreachable!(),
+    }
+}
+
+/// The 32-bit half of a 64-bit register mnemonic, for the `div`/`idiv` fast
+/// path in [`Codegen::emit_div`].
+fn r32(r: &str) -> &'static str {
+    match r {
+        "%rax" => "%eax",
+        "%rbx" => "%ebx",
+        "%rcx" => "%ecx",
+        "%rdx" => "%edx",
+        "%rsi" => "%esi",
+        "%rdi" => "%edi",
+        "%r8" => "%r8d",
+        "%r9" => "%r9d",
+        "%r10" => "%r10d",
+        "%r11" => "%r11d",
+        "%r12" => "%r12d",
+        "%r13" => "%r13d",
+        "%r14" => "%r14d",
+        "%r15" => "%r15d",
+        _ => unreachable!("no 32-bit form of {r}"),
     }
 }
 

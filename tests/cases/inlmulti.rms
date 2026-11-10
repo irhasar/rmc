@@ -1,0 +1,35 @@
+// Inlining hazards beyond the plain "parameter is a local copy" case.
+//
+// When a callee assigns a parameter, inlining must copy the argument into a
+// fresh slot rather than substitute it (else the write reaches the caller), and
+// the copy makes a non-trivial argument evaluate exactly once even though the
+// parameter is read twice. Nested inlining with a call argument must preserve
+// the left-to-right evaluation order.
+fn bump(mut x: i64) -> i64 {
+    x = x + 1;
+    return x + x;
+}
+fn id(x: i64) -> i64 {
+    return x;
+}
+fn add(a: i64, b: i64) -> i64 {
+    return a + b;
+}
+fn dbl(x: i64) -> i64 {
+    return x + x;
+}
+fn quad(x: i64) -> i64 {
+    return dbl(x) + dbl(x);
+}
+fn main() -> i64 {
+    // The caller's `y` must be unchanged: the write is to the copy.
+    let y: i64 = 5;
+    print_i64(bump(y));
+    print_i64(y);
+    // A non-trivial argument is evaluated once, before the body's first read.
+    print_i64(bump(3 * 2));
+    // A call argument to an inlined call, and nested inlining with a call arg.
+    print_i64(add(id(1), id(2)));
+    print_i64(quad(3));
+    return 0;
+}

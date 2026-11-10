@@ -10,6 +10,7 @@
 //! always a multiple of 8 and every field is naturally aligned.
 
 use crate::ast::*;
+use crate::consts::{const_binop, const_binop_checked, const_i64};
 use std::collections::HashMap;
 
 #[derive(Clone)]
@@ -18,6 +19,12 @@ pub struct Sig {
     pub ret: Type,
     /// A method receiver: such a function may only be called as `recv.name(..)`.
     pub takes_self: bool,
+    /// A `&self` / `&mut self` receiver: `params[0]` is a reference to the impl
+    /// type, and a method call passes the receiver's address, not a copy.
+    pub ref_self: bool,
+    /// True when the receiver was `&mut self`, so the synthesized parameter is
+    /// `&mut T` and matches the address the call site builds.
+    pub ref_self_mut: bool,
 }
 
 /// A laid-out struct: each field's name, resolved type and byte offset, plus the
@@ -57,68 +64,110 @@ pub struct Sema {
     enums: HashMap<String, EnumInfo>,
     next_slot: i32,
     loop_depth: u32,
-    /// One entry per enclosing loop, holding the scope length at the loop's
-    /// entry. A `while`/`for` body may run again, so a binding that already
-    /// existed outside the loop must not be written by a non-`mut` binding
-    /// inside it (rustc's `cannot assign twice`); a binding declared *inside*
-    /// the body is fresh each iteration and is exempt.
+    /// One entry per enclosing `while`/`for` loop, holding the scope length at
+    /// the loop's entry. Such a body may run again, so a write inside it to a
+    /// non-`mut` binding that already existed before the loop is a second write
+    /// on the first iteration (rustc's `cannot assign twice`); a binding
+    /// declared *inside* the body is fresh each iteration and is exempt. A
+    /// `loop` runs at least once, so it pushes nothing. The paired
+    /// `loop_repeats` flag marks a `loop` whose body can reach the top again.
     loop_marks: Vec<usize>,
-    /// One entry per enclosing loop, parallel to `loop_marks`: a binding may be
-    /// written inside the loop without counting as a second write only if the
-    /// write cannot be reached again after the loop's back edge. At a write the
-    /// top entry says whether the *current statement and everything after it*
-    /// can loop back to the top; `check_block` rewrites it per statement as the
-    /// block is walked. See `block_repeat_suffixes`.
+    /// Per enclosing loop, whether a write to a binding that existed before the
+    /// loop can repeat. A `while`/`for` always may; a `loop` only when its body
+    /// can reach the top again. `check_block` rewrites the top entry per
+    /// statement to "the rest of the body from here can reach the top", so a
+    /// write is a second write only when its own suffix can loop back.
     loop_repeats: Vec<bool>,
+    /// Per enclosing loop, the definite-initialization state captured at each
+    /// `break` that leaves it. A `loop` runs its body at least once, so a
+    /// binding the loop initializes stays initialized afterwards — but only if
+    /// *every* exit leaves it initialized. `while`/`for` may run zero times, so
+    /// their entry is recorded but the merge is not used.
+    loop_exits: Vec<Vec<Vec<bool>>>,
     /// Parallel to `loop_repeats`: at the current point, whether control can
     /// still reach the top of that loop. Inside a `loop` body this is the
-    /// per-statement repeat flag. Inside a `break`-valued expression it becomes
-    /// `false`, because a `break` jumps past the loop top. A `continue` in a
-    /// branch restores it to `true` while that branch is checked.
+    /// per-statement repeat flag. A `continue` in a branch restores it to `true`
+    /// while that branch is checked.
     loop_reach: Vec<bool>,
     /// Parallel to `loop_reach`: the reach of the code *after* the statement
     /// currently being checked. A nested block (an `if` arm, a `{}` expression)
     /// falls through to this point, so its own reach analysis is seeded with it
     /// rather than with the statement's own reach.
     loop_cont: Vec<bool>,
-    /// One entry per enclosing loop: the may-assigned state of the bindings in
-    /// scope at the loop's entry, accumulated over every `break` that leaves the
-    /// loop. A `break` ends the loop, so its branch's writes are not seen by the
-    /// code after the loop unless they are merged here; without it a write on a
-    /// `break` path would let a later statement write a non-`mut` binding twice.
+    /// Per enclosing loop, the may-assigned state accumulated over every `break`
+    /// that leaves it, so a write on a break path counts as the first write for
+    /// a later statement.
     break_assigned: Vec<Vec<bool>>,
     ret_ty: Type,
+    /// While checking the `else` chain of a desugared `match`: whether the
+    /// whole chain names every variant of one enum. Decided once at the chain's
+    /// first `if` and carried down, so the final `if` (which has no `else`) may
+    /// stand for a value. Cleared while checking a condition or an arm body.
+    match_total: bool,
+    /// Whether the `if` being checked is a non-root step of such a chain, so it
+    /// inherits `match_total` instead of recomputing it.
+    match_chain: bool,
+    /// The constant value of each local, by slot, if it is known. A local is
+    /// entered only when rustc's constant propagation would know it: its
+    /// initializer is constant and it is never written or mutably borrowed
+    /// anywhere in the function (see `collect_written`). Used to fold an index
+    /// or arithmetic operand that is a constant *local* (`let i = -1; a[i]`),
+    /// which rustc folds and rmc otherwise missed.
+    const_locals: HashMap<i32, i64>,
+    /// How many times each binding name is assigned by an `=` statement in the
+    /// current function (the `let` initializer is not counted). rustc folds a
+    /// local only when it is assigned at most once in total, so a name with any
+    /// `=` assignment is folded only if it was declared without an initializer
+    /// and this is that one assignment. Keyed by name because the scan runs
+    /// before sema assigns slots.
+    assign_count: HashMap<String, u32>,
+    /// Binding names taken by `&mut` anywhere in the function; such a local is
+    /// never folded, since the callee may write it.
+    mut_borrowed: std::collections::HashSet<String>,
+    /// Names of the program's `const` items. A local binding may not reuse one
+    /// (rustc E0530), so a `let`, a parameter or a `for` variable is checked
+    /// against this set.
+    const_names: std::collections::HashSet<String>,
 }
 
-/// One in-scope binding: its name, frame slot, type, and whether it may be
-/// assigned. Parameters and `let mut` bindings are mutable; a plain `let` is
-/// not, so an assignment to it is rejected the way rustc rejects it.
+/// A lexical scope entry. `mutable` records whether the binding was declared
+/// `mut`, so an assignment to a non-`mut` binding can be rejected the way rustc
+/// rejects it. `init` records whether the binding is definitely initialized at
+/// the current program point, so a read of a `let x: T;` that was never written
+/// is rejected like rustc's "used binding isn't initialized".
 struct Binding {
     name: String,
     slot: i32,
     ty: Type,
     mutable: bool,
+    init: bool,
     /// True for a function/method parameter, which rustc reports as an
     /// "immutable argument" rather than a twice-assigned variable.
     param: bool,
-    /// True once the binding has been assigned on some path (or was initialized
-    /// at its declaration). A plain `let` without an initialiser may be written
-    /// exactly once, so a second write to a non-`mut` binding is rejected the
-    /// way rustc rejects `cannot assign twice to immutable variable`.
+    /// True once the binding has been written on some path: its declaration
+    /// initialiser, or an assignment. A plain `let` without an initialiser may
+    /// be written exactly once, so a second write is rejected the way rustc
+    /// rejects `cannot assign twice to immutable variable`.
     assigned: bool,
 }
 
+/// A lexical scope: a stack of bindings, innermost last.
 type Scope = Vec<Binding>;
 
 pub fn analyze(prog: &mut Program) -> Result<(), String> {
     let (structs, enums) = resolve_layouts(&prog.structs, &prog.enums)?;
+
+    // Validate the `const` items. Their values were folded by the parser (which
+    // needs them for array lengths and patterns); here each is checked for a
+    // duplicate name, a usable type, and an initializer that actually folds.
+    let const_names = check_consts(prog, &structs, &enums)?;
 
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     // Runtime helpers provided by the freestanding assembly runtime. They are
     // linked in automatically, so they do not appear in the source program.
     let builtins: [(&str, &[Type], Type); 7] = [
         ("print_i64", &[Type::I64], Type::Unit),
-        ("print_str", &[Type::I64], Type::Unit),
+        ("print_str", &[Type::Str], Type::Unit),
         ("print_bool", &[Type::Bool], Type::Unit),
         ("putchar", &[Type::I64], Type::Unit),
         ("alloc", &[Type::I64], Type::I64),
@@ -132,18 +181,22 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
                 params: params.to_vec(),
                 ret,
                 takes_self: false,
+                ref_self: false,
+                ref_self_mut: false,
             },
         );
     }
     // A method's receiver is its first parameter, with the impl's struct type.
     // Give it to every method up front so its signature (and later its frame)
-    // includes `self` from the start. `param_mut` tracks the explicitly declared
-    // parameters, so it must gain a matching entry for the synthesized receiver
-    // (`self` is immutable); otherwise the flag for the first declared parameter
-    // lands on `self` and the last declared parameter is treated as immutable.
+    // includes `self` from the start.
     for f in &mut prog.fns {
         if let Some(ty) = f.self_ty.clone() {
-            f.params.insert(0, ("self".to_string(), Type::Named(ty)));
+            let rt = if f.ref_self {
+                Type::Ref(Box::new(Type::Named(ty)), f.ref_self_mut)
+            } else {
+                Type::Named(ty)
+            };
+            f.params.insert(0, ("self".to_string(), rt));
             f.param_mut.insert(0, false);
         }
     }
@@ -167,7 +220,26 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         }
         // Aggregate parameters and returns are passed by pointer, so any type
         // is allowed here; the calling convention handles the rest.
-        sigs.insert(f.name.clone(), Sig { params, ret, takes_self: f.takes_self });
+        sigs.insert(
+            f.name.clone(),
+            Sig {
+                params,
+                ret,
+                takes_self: f.takes_self,
+                ref_self: f.ref_self,
+                ref_self_mut: f.ref_self_mut,
+            },
+        );
+    }
+    // `main` is the entry point: it takes no parameters (rustc E0580). rmc
+    // additionally lets it return `i64`, which becomes the exit status.
+    if let Some(main) = prog.fns.iter().find(|f| f.name == "main") {
+        if !main.params.is_empty() {
+            return Err(format!(
+                "`main` takes no parameters, but {} were declared",
+                main.params.len()
+            ));
+        }
     }
 
     let mut sema = Sema {
@@ -178,10 +250,17 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         loop_depth: 0,
         loop_marks: Vec::new(),
         loop_repeats: Vec::new(),
+        loop_exits: Vec::new(),
         loop_reach: Vec::new(),
         loop_cont: Vec::new(),
         break_assigned: Vec::new(),
         ret_ty: Type::Unit,
+        match_total: false,
+        match_chain: false,
+        const_locals: HashMap::new(),
+        assign_count: HashMap::new(),
+        mut_borrowed: std::collections::HashSet::new(),
+        const_names,
     };
     for f in &mut prog.fns {
         sema.check_fn(f)?;
@@ -331,9 +410,13 @@ fn resolve_ty_rec(
         Type::Array(elem, n) => {
             let e = resolve_ty_rec(elem, raw_s, raw_e, so, eo, visiting)?;
             if !e.is_int_or_bool() {
-                return Err(format!("array elements must be `i64` or `bool`, not {e:?}"));
+                return Err(format!("array elements must be `i64`, `bool` or a unit enum, not {e:?}"));
             }
             Ok(Type::Array(Box::new(e), *n))
+        }
+        Type::Ref(inner, m) => {
+            let t = resolve_ty_rec(inner, raw_s, raw_e, so, eo, visiting)?;
+            Ok(Type::Ref(Box::new(t), *m))
         }
         other => Ok(other.clone()),
     }
@@ -363,12 +446,75 @@ fn resolve_in(
         Type::Array(elem, n) => {
             let e = resolve_in(elem, structs, enums)?;
             if !e.is_int_or_bool() {
-                return Err(format!("array elements must be `i64` or `bool`, not {e:?}"));
+                return Err(format!("array elements must be `i64`, `bool` or a unit enum, not {e:?}"));
             }
             Ok(Type::Array(Box::new(e), *n))
         }
+        Type::Ref(inner, m) => Ok(Type::Ref(Box::new(resolve_in(inner, structs, enums)?), *m)),
         other => Ok(other.clone()),
     }
+}
+
+/// Validate every `const` item: unique name, a type rmc can fold (`i64` or
+/// `bool`), and an initializer that evaluates to that type. Returns the set of
+/// constant names so local bindings can be checked against it. The parser
+/// already folded the values; this only checks them, so a constant whose
+/// initializer does not fold (a call, a cycle, an out-of-range arithmetic) is
+/// reported here rather than silently dropped.
+fn check_consts(
+    prog: &Program,
+    structs: &HashMap<String, StructInfo>,
+    enums: &HashMap<String, EnumInfo>,
+) -> Result<std::collections::HashSet<String>, String> {
+    let mut names = std::collections::HashSet::new();
+    // A `const` and a function share a namespace in rustc (E0428).
+    let fn_names: std::collections::HashSet<&str> =
+        prog.fns.iter().map(|f| f.name.as_str()).collect();
+    let items: Vec<(String, Type, Expr)> = prog
+        .consts
+        .iter()
+        .map(|c| (c.name.clone(), c.ty.clone(), c.value.clone()))
+        .collect();
+    let resolved = crate::consts::resolve(&items);
+    for c in &prog.consts {
+        if !names.insert(c.name.clone()) {
+            return Err(format!("the name `{}` is defined multiple times", c.name));
+        }
+        if fn_names.contains(c.name.as_str()) {
+            return Err(format!("the name `{}` is defined multiple times", c.name));
+        }
+        let ty = resolve_in(&c.ty, structs, enums)?;
+        match ty {
+            Type::I64 | Type::Bool => {}
+            other => {
+                return Err(format!(
+                    "constant `{}` has type {other:?}; rmc only folds `i64` and `bool` constants",
+                    c.name
+                ))
+            }
+        }
+        // `resolved` holds only items whose initializer folded, so a missing
+        // name means the initializer is not a constant expression (or is part
+        // of a cycle).
+        match (ty, resolved.get(&c.name)) {
+            (Type::I64, Some(crate::consts::ConstVal::Int(_))) => {}
+            (Type::Bool, Some(crate::consts::ConstVal::Bool(_))) => {}
+            (Type::I64, _) => {
+                return Err(format!(
+                    "constant `{}` is not a constant `i64` expression",
+                    c.name
+                ))
+            }
+            (Type::Bool, _) => {
+                return Err(format!(
+                    "constant `{}` is not a constant `bool` expression",
+                    c.name
+                ))
+            }
+            _ => unreachable!(),
+        }
+    }
+    Ok(names)
 }
 
 impl Sema {
@@ -379,8 +525,28 @@ impl Sema {
     }
 
     fn check_fn(&mut self, f: &mut FnDef) -> Result<(), String> {
+        // A parameter name must be unique within its function (rustc E0415).
+        // `self` is inserted first, so this also rejects a second `self`.
+        for (i, (name, _)) in f.params.iter().enumerate() {
+            if f.params[..i].iter().any(|(n, _)| n == name) {
+                return Err(format!(
+                    "identifier `{name}` is bound more than once in this parameter list"
+                ));
+            }
+            // A parameter may not shadow a constant (rustc E0530). `self` is
+            // never a constant, so it needs no special case.
+            if self.const_names.contains(name) {
+                return Err(format!(
+                    "identifier `{name}` shadows a constant of the same name"
+                ));
+            }
+        }
         self.next_slot = 0;
         self.loop_depth = 0;
+        self.const_locals.clear();
+        self.assign_count.clear();
+        self.mut_borrowed.clear();
+        Self::collect_assigns(&f.body, &mut self.assign_count, &mut self.mut_borrowed);
         self.ret_ty = self.resolve_ty(&f.ret)?;
         f.ret = self.ret_ty.clone();
         // An aggregate return is written through a hidden pointer, so reserve a
@@ -393,22 +559,17 @@ impl Sema {
 
         let mut scope: Scope = Vec::with_capacity(f.params.len() + 8);
         f.param_slots.clear();
-        let param_mut = f.param_mut.clone();
         for (i, (name, ty)) in f.params.iter_mut().enumerate() {
             let rt = self.resolve_ty(ty)?;
             *ty = rt.clone();
             // An aggregate parameter owns a frame buffer big enough for a copy;
-            // a scalar owns a single slot.
+            // a scalar (including a reference) owns a single slot.
             let slot = self.alloc_slots((rt.size() / 8) as i32);
             f.param_slots.push(slot);
-            scope.push(Binding {
-                name: name.clone(),
-                slot,
-                ty: rt,
-                mutable: param_mut.get(i).copied().unwrap_or(false),
-                param: true,
-                assigned: true,
-            });
+            // A parameter is a `let` binding; it is immutable unless declared
+            // `mut`, and it is always initialized by the caller.
+            let mutable = f.param_mut.get(i).copied().unwrap_or(false);
+            scope.push(Binding { name: name.clone(), slot, ty: rt, mutable, init: true, param: true, assigned: true });
         }
 
         let body_ty = self.check_block(&mut f.body, &mut scope)?;
@@ -447,12 +608,55 @@ impl Sema {
         s
     }
 
-    fn lookup(scope: &Scope, name: &str) -> Option<(i32, Type, bool)> {
+    fn lookup(scope: &Scope, name: &str) -> Option<(i32, Type, bool, bool)> {
         scope
             .iter()
             .rev()
             .find(|b| b.name == name)
-            .map(|b| (b.slot, b.ty.clone(), b.mutable))
+            .map(|b| (b.slot, b.ty.clone(), b.mutable, b.init))
+    }
+
+    /// Index of the innermost binding of `name`, for mutating its state.
+    fn binding_index(scope: &Scope, name: &str) -> Option<usize> {
+        scope.iter().rposition(|b| b.name == name)
+    }
+
+    /// Snapshot the initialization state of each binding, to compare against
+    /// after checking a branch or loop body.
+    fn init_snapshot(scope: &Scope) -> Vec<bool> {
+        scope.iter().map(|b| b.init).collect()
+    }
+
+    /// After a loop body, a variable written inside is not definitely
+    /// initialized: the loop may run zero times.
+    fn init_restore(scope: &mut Scope, snap: &[bool]) {
+        for (b, &before) in scope.iter_mut().zip(snap) {
+            b.init = before;
+        }
+    }
+
+    /// Snapshot the "already written" state of each binding, so a branch can be
+    /// checked from the same state its sibling saw.
+    fn assigned_snapshot(scope: &Scope) -> Vec<bool> {
+        scope.iter().map(|b| b.assigned).collect()
+    }
+
+    fn assigned_restore(scope: &mut Scope, snap: &[bool]) {
+        if scope.len() == snap.len() {
+            for (b, &s) in scope.iter_mut().zip(snap) {
+                b.assigned = s;
+            }
+        }
+    }
+
+    /// Merge two paths: a binding counts as written when *either* path wrote it,
+    /// since a later write only needs to know it *may* already have happened.
+    fn assigned_merge(scope: &mut Scope, a: &[bool], b: &[bool]) {
+        if scope.len() == a.len() && scope.len() == b.len() {
+            for (i, binding) in scope.iter_mut().enumerate() {
+                binding.assigned = a[i] || b[i];
+            }
+        }
     }
 
     /// Type-check a `let` initialiser. A `[v; n]` written directly here is kept
@@ -464,11 +668,120 @@ impl Sema {
         if let Expr::ArrayLit(val, n) = e {
             let t = self.check_expr(val, scope)?;
             if !t.is_int_or_bool() {
-                return Err(format!("array elements must be `i64` or `bool`, found {t:?}"));
+                return Err(format!("array elements must be `i64`, `bool` or a unit enum, found {t:?}"));
             }
             return Ok(Type::Array(Box::new(t), *n));
         }
         self.check_expr(e, scope)
+    }
+
+    /// Whether a desugared `match` `if`-chain is provably total: it tests every
+    /// variant of one enum exactly once, or both values of one `bool`, and no
+    /// other condition.
+    ///
+    /// A `match` with no `_` arm folds to `if c1 { a1 } else { if c2 { a2 } ... }`
+    /// with no final `else`, so a value that matches no arm falls through to
+    /// unit. That is exactly right when the match is non-exhaustive, but when
+    /// the arms name *every* variant the fall-through is unreachable and the
+    /// chain may be used as a value. rustc accepts that; rmc rejected it with a
+    /// spurious "`if` without `else`" error.
+    ///
+    /// `VariantTest` and `BoolTest` nodes are produced only by `match`
+    /// desugaring, so a chain whose conditions are all of one kind, test the
+    /// same enum (or the same bool variable), and whose tested variants (or
+    /// bool values) are pairwise distinct and complete is exhaustive. Anything
+    /// else (an integer arm, a duplicate, a missing case, a hand-written `if`
+    /// chain) is not, and keeps the old error.
+    ///
+    /// The comparison is by variant *name*, not tag: the nested `VariantTest`s
+    /// have not been visited by `check_expr` yet, so their tags are still -1.
+    fn if_chain_is_exhaustive(&self, cond: &Expr, els: &Option<Block>) -> bool {
+        // Every condition must test the same thing: all the variants of one
+        // enum, or both values of one `bool`. A chain that mixes the two, or
+        // tests two different enums, is never exhaustive. The `BoolTest` case
+        // is why the node exists: `match b { true => .., false => .. }` is
+        // exhaustive, but the equivalent hand-written `if b == true { .. }
+        // else if b == false { .. }` (a plain `Bin(Eq, ..)`, not a `BoolTest`)
+        // is not, and rustc rejects it in value position.
+        enum Kind<'a> {
+            Enum(&'a str),
+            Bool(&'a str),
+        }
+        let mut kind: Option<Kind> = None;
+        let mut seen_variants: Vec<&str> = Vec::new();
+        let mut seen_bools: Vec<bool> = Vec::new();
+        let mut cur_cond = cond;
+        let mut cur_els = els;
+        loop {
+            match cur_cond {
+                Expr::VariantTest { enum_name, variant, .. } => {
+                    match kind {
+                        Some(Kind::Enum(e)) if e == enum_name.as_str() => {}
+                        None => kind = Some(Kind::Enum(enum_name.as_str())),
+                        _ => return false,
+                    }
+                    if seen_variants.contains(&variant.as_str()) {
+                        return false;
+                    }
+                    seen_variants.push(variant.as_str());
+                }
+                Expr::BoolTest { scrutinee, value } => {
+                    // `desugar_match` only tests a `Var` (the temporary it bound
+                    // the scrutinee to, or a bool variable); anything else cannot
+                    // be proven the same across arms.
+                    let name = match scrutinee.as_ref() {
+                        Expr::Var { name, .. } => name.as_str(),
+                        _ => return false,
+                    };
+                    match kind {
+                        Some(Kind::Bool(s)) if s == name => {}
+                        None => kind = Some(Kind::Bool(name)),
+                        _ => return false,
+                    }
+                    if seen_bools.contains(value) {
+                        return false;
+                    }
+                    seen_bools.push(*value);
+                }
+                _ => return false,
+            }
+            match cur_els {
+                None => break,
+                Some(block) => {
+                    // An arm body is `{ body }`; only the nested `else` chains.
+                    if !block.stmts.is_empty() {
+                        return false;
+                    }
+                    match block.tail.as_deref() {
+                        Some(Expr::If(cond, _, els)) => {
+                            cur_cond = cond;
+                            cur_els = els;
+                        }
+                        _ => return false,
+                    }
+                }
+            }
+        }
+        match kind {
+            Some(Kind::Enum(name)) => {
+                self.enums.get(name).map_or(false, |i| i.variants.len() == seen_variants.len())
+            }
+            // Both `true` and `false` tested, pairwise distinct.
+            Some(Kind::Bool(_)) => seen_bools.len() == 2,
+            None => false,
+        }
+    }
+
+    /// Whether a desugared `match` (the `MatchBoundary` block `b`) names every
+    /// variant of one enum. Unlike `if_chain_is_exhaustive`, this takes the
+    /// boundary block so it can look through the binding-arm wrapper, and it is
+    /// called before the chain is checked, so a nested `match`'s own
+    /// `MatchBoundary` (not a bare `If`) still delimits the walk.
+    fn match_chain_is_exhaustive(&self, b: &Block) -> bool {
+        match b.tail.as_deref() {
+            Some(Expr::If(cond, _, els)) => self.if_chain_is_exhaustive(cond, els),
+            _ => false,
+        }
     }
 
     fn check_block(&mut self, b: &mut Block, scope: &mut Scope) -> Result<Type, String> {
@@ -479,9 +792,8 @@ impl Sema {
     /// normal completion loops back to the top (seed `true`); any other block
     /// falls through to the code after its statement (`loop_cont`). Each
     /// statement's reach and continuation come from the block's suffix walk, so
-    /// a nested `if`/block sees the continuation that really follows it rather
-    /// than the enclosing statement's own reach. `loop_reach`/`loop_cont` are
-    /// restored on exit.
+    /// a nested `if`/block sees the continuation that really follows it.
+    /// `loop_reach`/`loop_cont` are restored on exit.
     fn check_block_inner(
         &mut self,
         b: &mut Block,
@@ -492,9 +804,6 @@ impl Sema {
         let saved_reach = self.loop_reach.last().copied().unwrap_or(false);
         let saved_cont = self.loop_cont.last().copied().unwrap_or(false);
         let in_loop = !self.loop_reach.is_empty();
-        // A loop body's completion goes back to the loop top. A loop that runs
-        // at most once (`loop_repeats` false) has no back edge, so every reach
-        // is `false` and a single write to an outer binding stays legal.
         let seed = if loop_body { true } else { saved_cont };
         let active = in_loop && (!loop_body || self.loop_repeats.last().copied().unwrap_or(false));
         let suffixes = if active {
@@ -549,6 +858,13 @@ impl Sema {
     fn check_stmt(&mut self, st: &mut Stmt, scope: &mut Scope) -> Result<(), String> {
         match st {
             Stmt::Let { name, ty, init, slot, mutable } => {
+                // A `let` may not shadow a constant (rustc E0530). Checked
+                // before the initializer so the error names the binding.
+                if self.const_names.contains(name) {
+                    return Err(format!(
+                        "identifier `{name}` shadows a constant of the same name"
+                    ));
+                }
                 let declared = match ty {
                     Some(t) => Some(self.resolve_ty(t)?),
                     None => None,
@@ -559,7 +875,7 @@ impl Sema {
                 };
                 let final_ty = match (declared, init_ty) {
                     (Some(d), Some(i)) => {
-                        if d != i {
+                        if d != i && !ref_coerces(&i, &d) {
                             return Err(format!(
                                 "variable `{name}`: declared type {d:?} does not match initializer type {i:?}"
                             ));
@@ -579,24 +895,84 @@ impl Sema {
                 *ty = Some(final_ty.clone());
                 let s = self.alloc_slots((final_ty.size() / 8) as i32);
                 *slot = s;
+                let initialized = init.is_some();
                 scope.push(Binding {
                     name: name.clone(),
                     slot: s,
                     ty: final_ty,
                     mutable: *mutable,
+                    init: initialized,
                     param: false,
                     assigned: init.is_some(),
                 });
+                // Track an `i64` local whose initializer is constant and that
+                // is never written or mutably borrowed anywhere in the function
+                // (`written`), so a later `a[i]` or `x + i` folds it the way
+                // rustc's constant propagation does. The whole-function test
+                // matters: `let mut x = i64::MAX; x = x + 1;` is accepted by
+                // rustc because `x` is assigned twice, so its constant is not
+                // propagated — folding the first `x` here would wrongly reject
+                // the program.
+                let assigned = self.assign_count.get(name).copied().unwrap_or(0);
+                if init.is_some() && assigned == 0 && !self.mut_borrowed.contains(name) {
+                    if let Some(e) = init.as_ref() {
+                        if let Some(k) = self.const_of(e, &self.const_locals) {
+                            self.const_locals.insert(s, k);
+                        }
+                    }
+                }
                 Ok(())
             }
             Stmt::Assign { target, value } => {
+                // The destination must be a mutable place. Checked before the
+                // value so the error names the binding rather than a type.
+                self.place_writable(target, scope, true)?;
+                // The value is checked first, so a self-referential initializer
+                // (`let x: i64; x = x + 1;`) still reads `x` as uninitialized.
                 let vty = self.check_expr(value, scope)?;
+                // The write initializes a whole binding; mark it before
+                // checking the target as a place, so `let x: i64; x = 7;` does
+                // not read `x` back as uninitialized.
+                let mut deferred_init = None;
+                if let Expr::Var { name, .. } = target {
+                    if let Some(i) = Self::binding_index(scope, name) {
+                        let was_uninit = !scope[i].init;
+                        scope[i].init = true;
+                        if was_uninit {
+                            deferred_init = Some(name.clone());
+                        }
+                    }
+                }
                 let tty = self.check_lvalue(target, scope)?;
-                self.check_writable(target, scope)?;
-                if vty != tty {
+                // A deferred single init (`let i; i = -1;`) is the one
+                // assignment rustc folds; a second assignment would make the
+                // count 2 and the gate fail. This runs after `check_lvalue`,
+                // which is what resolves the target's slot.
+                if let Some(name) = deferred_init {
+                    if let Expr::Var { slot, .. } = target {
+                        let assigned = self.assign_count.get(&name).copied().unwrap_or(0);
+                        if assigned == 1
+                            && !self.mut_borrowed.contains(&name)
+                            && *slot >= 0
+                        {
+                            if let Some(k) = self.const_of(value, &self.const_locals) {
+                                self.const_locals.insert(*slot, k);
+                            }
+                        }
+                    }
+                }
+                if vty != tty && !ref_coerces(&vty, &tty) {
                     return Err(format!("assignment type mismatch: target is {tty:?}, value is {vty:?}"));
                 }
-                self.mark_assigned(target, scope);
+                // Record the write so a later assignment to a non-`mut` binding
+                // is the `cannot assign twice` error. The root name is used for
+                // a field/index target (`a.f`, `a[i]`).
+                let root = Self::place_root_name(target);
+                if let Some(name) = root {
+                    if let Some(i) = Self::binding_index(scope, &name) {
+                        scope[i].assigned = true;
+                    }
+                }
                 Ok(())
             }
             Stmt::Expr(e) => {
@@ -614,54 +990,79 @@ impl Sema {
                 if ct != Type::Bool && !expr_never_typed(cond) {
                     return Err(format!("`while` condition must be `bool`, found {ct:?}"));
                 }
+                let init_before = Self::init_snapshot(scope);
                 self.loop_depth += 1;
                 // The body may run again, so a non-`mut` binding that already
-                // existed outside the loop cannot be written inside it.
+                // existed before the loop cannot be written inside it.
                 self.loop_marks.push(scope.len());
                 self.loop_repeats.push(true);
+                self.loop_exits.push(Vec::new());
                 self.loop_reach.push(false);
                 self.loop_cont.push(false);
-                self.break_assigned.push(Self::snapshot_assigned(scope));
+                self.break_assigned.push(Self::assigned_snapshot(scope));
                 self.check_block_inner(body, scope, true)?;
                 let breaks = self.break_assigned.pop().unwrap();
+                self.loop_exits.pop();
                 self.loop_cont.pop();
                 self.loop_reach.pop();
                 self.loop_repeats.pop();
                 self.loop_marks.pop();
-                if breaks.len() == scope.len() {
-                    for (b, a) in scope.iter_mut().zip(breaks.iter()) {
-                        b.assigned |= *a;
+                for (i, b) in scope.iter_mut().enumerate() {
+                    if breaks.get(i).copied().unwrap_or(false) {
+                        b.assigned = true;
                     }
                 }
                 self.loop_depth -= 1;
+                // The loop may run zero times, so nothing it initializes is
+                // guaranteed afterwards.
+                Self::init_restore(scope, &init_before);
                 Ok(())
             }
             Stmt::Loop(body) => {
+                // A `loop` runs at least once, so writes to outer bindings inside
+                // it behave like straight-line writes unless the body can reach
+                // the top again; then it is a second write on the next pass and
+                // rustc rejects it, exactly like a `while` body. A binding is
+                // definitely initialized after the loop only if it was before, or
+                // every `break` that leaves the loop initializes it.
+                let init_before = Self::init_snapshot(scope);
                 self.loop_depth += 1;
-                // A `loop` runs at least once, so a write to an outer binding is
-                // a straight-line write unless the body can reach the top again.
-                // Then it is a second write on the next pass and rustc rejects
-                // it, exactly like a `while` body.
                 self.loop_marks.push(scope.len());
                 self.loop_repeats.push(block_reaches_top(body));
+                self.loop_exits.push(Vec::new());
                 self.loop_reach.push(false);
                 self.loop_cont.push(false);
-                self.break_assigned.push(Self::snapshot_assigned(scope));
+                self.break_assigned.push(Self::assigned_snapshot(scope));
                 self.check_block_inner(body, scope, true)?;
                 let breaks = self.break_assigned.pop().unwrap();
+                let exits = self.loop_exits.pop().unwrap();
                 self.loop_cont.pop();
                 self.loop_reach.pop();
                 self.loop_repeats.pop();
                 self.loop_marks.pop();
-                if breaks.len() == scope.len() {
-                    for (b, a) in scope.iter_mut().zip(breaks.iter()) {
-                        b.assigned |= *a;
+                for (i, b) in scope.iter_mut().enumerate() {
+                    if breaks.get(i).copied().unwrap_or(false) {
+                        b.assigned = true;
                     }
                 }
                 self.loop_depth -= 1;
+                // The loop diverges when no `break` can leave it: nothing after
+                // is reachable, so the state does not matter.
+                if block_has_break(body) {
+                    for (i, b) in scope.iter_mut().enumerate() {
+                        b.init = init_before.get(i).copied().unwrap_or(false)
+                            || exits.iter().all(|e| e.get(i).copied().unwrap_or(false));
+                    }
+                }
                 Ok(())
             }
             Stmt::For { var, var_slot, start, end, end_slot, body } => {
+                // The loop variable may not shadow a constant (rustc E0530).
+                if self.const_names.contains(var) {
+                    return Err(format!(
+                        "identifier `{var}` shadows a constant of the same name"
+                    ));
+                }
                 let ts = self.check_expr(start, scope)?;
                 let te = self.check_expr(end, scope)?;
                 if ts != Type::I64 || te != Type::I64 {
@@ -674,33 +1075,39 @@ impl Sema {
                 let s = self.alloc_slot();
                 *var_slot = s;
                 let mark = scope.len();
+                let init_before = Self::init_snapshot(scope);
+                // The loop variable is a fresh immutable binding each iteration.
                 scope.push(Binding {
                     name: var.clone(),
                     slot: s,
                     ty: Type::I64,
                     mutable: false,
+                    init: true,
                     param: false,
                     assigned: true,
                 });
                 self.loop_depth += 1;
                 self.loop_marks.push(mark);
                 self.loop_repeats.push(true);
+                self.loop_exits.push(Vec::new());
                 self.loop_reach.push(false);
                 self.loop_cont.push(false);
-                self.break_assigned.push(Self::snapshot_assigned(scope));
+                self.break_assigned.push(Self::assigned_snapshot(scope));
                 self.check_block_inner(body, scope, true)?;
                 let breaks = self.break_assigned.pop().unwrap();
+                self.loop_exits.pop();
                 self.loop_cont.pop();
                 self.loop_reach.pop();
                 self.loop_repeats.pop();
                 self.loop_marks.pop();
-                if breaks.len() == scope.len() {
-                    for (b, a) in scope.iter_mut().zip(breaks.iter()) {
-                        b.assigned |= *a;
+                for (i, b) in scope.iter_mut().enumerate() {
+                    if breaks.get(i).copied().unwrap_or(false) {
+                        b.assigned = true;
                     }
                 }
                 self.loop_depth -= 1;
                 scope.truncate(mark);
+                Self::init_restore(scope, &init_before);
                 Ok(())
             }
             Stmt::Return(v) => {
@@ -729,17 +1136,23 @@ impl Sema {
                 if self.loop_depth == 0 {
                     return Err("`break` outside of a loop".into());
                 }
+                // Record the initialization state this exit leaves behind, so
+                // the loop can require every exit to initialize a binding before
+                // treating it as initialized after the loop.
+                let snap = Self::init_snapshot(scope);
+                self.loop_exits.last_mut().unwrap().push(snap);
                 // The branch's writes are seen by the code after the loop, so
                 // merge this state into the loop's break-exit state before the
                 // branch's local state is discarded.
                 if let Some(acc) = self.break_assigned.last_mut() {
+                    let cur = Self::assigned_snapshot(scope);
                     // Only the bindings present at loop entry matter after the
                     // loop; a break path may have declared extra locals, and
                     // those must not stop its writes to the entry bindings
                     // from counting.
-                    let n = acc.len().min(scope.len());
-                    for (a, b) in acc.iter_mut().zip(scope.iter()).take(n) {
-                        *a |= b.assigned;
+                    let n = acc.len().min(cur.len());
+                    for (a, b) in acc.iter_mut().zip(cur.iter()).take(n) {
+                        *a |= *b;
                     }
                 }
                 Ok(())
@@ -759,106 +1172,302 @@ impl Sema {
         }
     }
 
-    /// Reject an assignment whose root binding may not be written here,
-    /// matching rustc's errors. A `mut` binding is always writable. A plain
-    /// `let` is writable exactly once: the write to its uninitialised value,
-    /// or the declaration's initialiser. A later write is `cannot assign twice
-    /// to immutable variable`. A `while`/`for` body may run again, so writing a
-    /// binding that was already in scope before the loop is a second write even
-    /// on the first iteration, which rustc also rejects.
-    fn check_writable(&self, e: &Expr, scope: &Scope) -> Result<(), String> {
+    /// The root binding of a place must be writable: a `mut` binding, or a
+    /// reference whose referent is mutable. A shared reference (`&T`) cannot be
+    /// written through. With `allow_uninit`, a not-yet-initialized binding is
+    /// writable too — an assignment may initialize it, whole or by field/element
+    /// (rustc allows a partial initializer and only rejects reading it). A
+    /// `&mut place` borrow passes `false`: borrowing an uninitialized place is
+    /// itself E0381. Mirrors rustc's E0594/E0596 for the cases rmc can express.
+    fn place_writable(
+        &mut self,
+        e: &mut Expr,
+        scope: &mut Scope,
+        allow_uninit: bool,
+    ) -> Result<(), String> {
         match e {
             Expr::Var { name, .. } => {
-                let deny = |b: &Binding| {
-                    if b.param {
-                        Err(format!(
-                            "cannot assign to immutable argument `{name}` (add `mut`)"
-                        ))
+                let idx = Self::binding_index(scope, name)
+                    .ok_or_else(|| format!("unknown variable `{name}`"))?;
+                let b = &scope[idx];
+                // Reassigning the binding itself needs `mut`; writing *through*
+                // a reference is decided by the field/index/deref arm, so a
+                // `&mut T` binding need not itself be `mut` for `r.x = ..`.
+                if b.mutable {
+                    return Ok(());
+                }
+                // A mutable borrow (`&mut place`, `allow_uninit == false`) needs
+                // the binding itself to be `mut`.
+                if !allow_uninit {
+                    return Err(format!(
+                        "cannot assign to immutable variable `{name}` (add `mut`)"
+                    ));
+                }
+                // A plain `let` may be written exactly once: its initialiser, or
+                // its first assignment. A write inside a repeating loop to a
+                // binding declared before that loop runs once per iteration, so
+                // it is a second write even on the first pass. A `loop` that
+                // runs at most once is exempt (its flag is `false`).
+                if b.assigned
+                    || self
+                        .loop_marks
+                        .iter()
+                        .zip(self.loop_reach.iter())
+                        .any(|(&m, &reach)| reach && idx < m)
+                {
+                    return Err(if b.param {
+                        format!("cannot assign to immutable argument `{name}` (add `mut`)")
                     } else {
-                        Err(format!(
-                            "cannot assign twice to immutable variable `{name}` (add `mut`)"
-                        ))
+                        format!("cannot assign twice to immutable variable `{name}` (add `mut`)")
+                    });
+                }
+                Ok(())
+            }
+            Expr::Field { base, .. } | Expr::Index(base, _) => {
+                // A write into a component goes through the base's address when
+                // the base is a reference, so the referent's mutability decides;
+                // a shared `&T` cannot be written through at all.
+                match self.check_expr(base, scope)? {
+                    Type::Ref(_, true) => Ok(()),
+                    Type::Ref(_, false) => {
+                        Err("cannot assign through a shared reference; use `&mut`".to_string())
                     }
-                };
-                match scope.iter().enumerate().rev().find(|(_, b)| &b.name == name) {
-                    Some((_, b)) if b.mutable => Ok(()),
-                    Some((_, b)) if b.assigned => deny(b),
-                    // A write inside a repeating loop to a binding declared
-                    // before that loop would run once per iteration, so it is a
-                    // second write even on the first pass. A `loop` that runs at
-                    // most once is exempt (its flag is `false`).
-                    Some((idx, b))
-                        if self
-                            .loop_marks
-                            .iter()
-                            .zip(self.loop_reach.iter())
-                            .any(|(&m, &reach)| reach && idx < m) =>
-                    {
-                        deny(b)
-                    }
-                    Some(_) => Ok(()),
-                    None => Ok(()),
+                    _ => self.place_writable(base, scope, allow_uninit),
                 }
             }
-            Expr::Field { base, .. } | Expr::Index(base, _) => self.check_writable(base, scope),
-            _ => Ok(()),
-        }
-    }
-
-    /// The root variable name of an assignment target (`a` for `a.f[i]`).
-    fn root_name(e: &Expr) -> Option<&str> {
-        match e {
-            Expr::Var { name, .. } => Some(name.as_str()),
-            Expr::Field { base, .. } | Expr::Index(base, _) => Self::root_name(base),
-            _ => None,
-        }
-    }
-
-    /// Record that an assignment wrote its root binding, so a later write to a
-    /// non-`mut` binding is the `cannot assign twice` error.
-    fn mark_assigned(&self, target: &Expr, scope: &mut Scope) {
-        if let Some(name) = Self::root_name(target) {
-            if let Some(b) = scope.iter_mut().rev().find(|b| b.name == name) {
-                b.assigned = true;
-            }
-        }
-    }
-
-    fn snapshot_assigned(scope: &Scope) -> Vec<bool> {
-        scope.iter().map(|b| b.assigned).collect()
-    }
-
-    fn restore_assigned(scope: &mut Scope, state: &[bool]) {
-        if scope.len() == state.len() {
-            for (b, s) in scope.iter_mut().zip(state) {
-                b.assigned = *s;
-            }
-        }
-    }
-
-    /// Mark a binding assigned when *either* merged path assigns it. The
-    /// second-write check asks whether the binding may already have been
-    /// written, so a write on one path is enough to make a later write illegal.
-    fn merge_assigned(scope: &mut Scope, a: &[bool], b: &[bool]) {
-        if scope.len() == a.len() && scope.len() == b.len() {
-            for (i, binding) in scope.iter_mut().enumerate() {
-                binding.assigned = a[i] || b[i];
-            }
+            Expr::Deref { expr, .. } => match self.check_expr(expr, scope)? {
+                Type::Ref(_, true) => Ok(()),
+                Type::Ref(_, false) => {
+                    Err("cannot assign through a shared reference; use `&mut`".to_string())
+                }
+                other => Err(format!("cannot dereference a value of type {other:?}")),
+            },
+            _ => Err("invalid assignment target".into()),
         }
     }
 
     /// Type-check an assignment target (variable, array element or field).
+    /// Check a cast `from as to`, mirroring rustc's allowed conversions plus
+    /// rmc's two intentional extensions. Both extensions are documented: the
+    /// raw pointer cast `i64 as &T` (rustc would require `as *const T` first;
+    /// the heap benchmark builds a linked list with it) and `i64 as bool`
+    /// (rustc requires `!= 0`; `boolops.rms` uses it). Everything else rmc
+    /// accepts here is valid Rust, so no accidental reinterpretation slips
+    /// through — in particular a reference may only become a reference to the
+    /// same referent, and may never gain mutability or become a scalar.
+    fn check_cast(&self, from: &Type, to: &Type) -> Result<(), String> {
+        match (from, to) {
+            (Type::Ref(a, a_mut), Type::Ref(b, b_mut)) => {
+                if a != b {
+                    return Err(format!(
+                        "cannot cast a `{a:?}` reference to a `{b:?}` reference"
+                    ));
+                }
+                if *b_mut && !*a_mut {
+                    return Err("cannot cast a shared reference `&T` to `&mut T`".into());
+                }
+                Ok(())
+            }
+            // A reference cannot become a scalar: `&T as i64` would expose the
+            // address as an integer, which rustc forbids (E0606).
+            (Type::Ref(..), _) => {
+                Err(format!("cannot cast a reference `{from:?}` to `{to:?}`"))
+            }
+            // The raw pointer cast extension: an integer becomes a reference.
+            (Type::I64, Type::Ref(..)) => Ok(()),
+            // Any other scalar may not become a reference (rustc E0605).
+            (_, Type::Ref(..)) => {
+                Err(format!("cannot cast `{from:?}` to a reference `{to:?}`"))
+            }
+            // A string literal is not castable in rmc.
+            (Type::Str, _) | (_, Type::Str) => {
+                Err(format!("cannot cast `{from:?}` to `{to:?}`"))
+            }
+            // `i64`, `bool` and an enum tag convert among themselves.
+            _ => Ok(()),
+        }
+    }
+
+    /// Count the `=` assignments to each binding name in a function and record
+    /// the names taken by `&mut`. rustc's constant propagation folds a local
+    /// only when it is assigned at most once in total, so a name with a second
+    /// assignment must not be folded even when a fold would be correct on the
+    /// path actually taken. The scan is whole-function and order-independent:
+    /// `let mut x = i64::MAX; x = x + 1;` is accepted by rustc because `x` is
+    /// assigned twice, so its constant is not propagated. Keyed by name because
+    /// it runs before sema assigns slots.
+    fn collect_assigns(
+        block: &Block,
+        a: &mut HashMap<String, u32>,
+        mb: &mut std::collections::HashSet<String>,
+    ) {
+        for st in &block.stmts {
+            Self::collect_assigns_stmt(st, a, mb);
+        }
+        if let Some(t) = &block.tail {
+            Self::collect_mut_borrows(t, a, mb);
+        }
+    }
+
+    fn collect_assigns_stmt(
+        st: &Stmt,
+        a: &mut HashMap<String, u32>,
+        mb: &mut std::collections::HashSet<String>,
+    ) {
+        match st {
+            Stmt::Let { init, .. } => {
+                if let Some(e) = init {
+                    Self::collect_mut_borrows(e, a, mb);
+                }
+            }
+            Stmt::Assign { target, value } => {
+                if let Some(n) = Self::place_root_name(target) {
+                    *a.entry(n).or_insert(0) += 1;
+                }
+                Self::collect_mut_borrows(value, a, mb);
+            }
+            Stmt::Expr(e) => Self::collect_mut_borrows(e, a, mb),
+            Stmt::While(c, b) => {
+                Self::collect_mut_borrows(c, a, mb);
+                Self::collect_assigns(b, a, mb);
+            }
+            Stmt::Loop(b) => Self::collect_assigns(b, a, mb),
+            Stmt::For { start, end, body, .. } => {
+                Self::collect_mut_borrows(start, a, mb);
+                Self::collect_mut_borrows(end, a, mb);
+                Self::collect_assigns(body, a, mb);
+            }
+            Stmt::Return(v) => {
+                if let Some(e) = v {
+                    Self::collect_mut_borrows(e, a, mb);
+                }
+            }
+            Stmt::Break | Stmt::Continue => {}
+        }
+    }
+
+    /// The root name of a place expression, if it names a local.
+    fn place_root_name(e: &Expr) -> Option<String> {
+        match e {
+            Expr::Var { name, .. } => Some(name.clone()),
+            Expr::Deref { expr, .. } | Expr::Field { base: expr, .. } => Self::place_root_name(expr),
+            Expr::Index(base, _) => Self::place_root_name(base),
+            _ => None,
+        }
+    }
+
+    /// Record every `&mut place` name, and recurse into nested blocks so their
+    /// assignments are counted too.
+    fn collect_mut_borrows(
+        e: &Expr,
+        a: &mut HashMap<String, u32>,
+        mb: &mut std::collections::HashSet<String>,
+    ) {
+        match e {
+            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
+            Expr::Bin(_, x, y) => {
+                Self::collect_mut_borrows(x, a, mb);
+                Self::collect_mut_borrows(y, a, mb);
+            }
+            Expr::Un(_, x) => Self::collect_mut_borrows(x, a, mb),
+            Expr::Call { args, .. } => {
+                for x in args {
+                    Self::collect_mut_borrows(x, a, mb);
+                }
+            }
+            Expr::If(c, t, el) => {
+                Self::collect_mut_borrows(c, a, mb);
+                Self::collect_assigns(t, a, mb);
+                if let Some(b) = el {
+                    Self::collect_assigns(b, a, mb);
+                }
+            }
+            Expr::MatchBoundary(b, _) | Expr::Block(b) => Self::collect_assigns(b, a, mb),
+            Expr::Index(base, idx) => {
+                Self::collect_mut_borrows(base, a, mb);
+                Self::collect_mut_borrows(idx, a, mb);
+            }
+            Expr::Field { base, .. } => Self::collect_mut_borrows(base, a, mb),
+            Expr::StructLit { fields, .. } => {
+                for f in fields {
+                    Self::collect_mut_borrows(&f.value, a, mb);
+                }
+            }
+            Expr::ArrayLit(v, _) => Self::collect_mut_borrows(v, a, mb),
+            Expr::ArrayList(vs) => {
+                for v in vs {
+                    Self::collect_mut_borrows(v, a, mb);
+                }
+            }
+            Expr::MethodCall { recv, args, .. } => {
+                Self::collect_mut_borrows(recv, a, mb);
+                for x in args {
+                    Self::collect_mut_borrows(x, a, mb);
+                }
+            }
+            Expr::EnumCtor { args, .. } => {
+                for x in args {
+                    Self::collect_mut_borrows(x, a, mb);
+                }
+            }
+            Expr::VariantTest { scrutinee, .. } => Self::collect_mut_borrows(scrutinee, a, mb),
+            Expr::BoolTest { scrutinee, .. } => Self::collect_mut_borrows(scrutinee, a, mb),
+            Expr::EnumPayload { recv, .. } => Self::collect_mut_borrows(recv, a, mb),
+            Expr::Cast(inner, _) => Self::collect_mut_borrows(inner, a, mb),
+            Expr::AddrOf { expr, mutable, .. } => {
+                if *mutable {
+                    if let Some(n) = Self::place_root_name(expr) {
+                        mb.insert(n);
+                    }
+                }
+                Self::collect_mut_borrows(expr, a, mb);
+            }
+            Expr::Deref { expr, .. } => Self::collect_mut_borrows(expr, a, mb),
+        }
+    }
+
+    /// The constant value of an expression: a literal (with `const_i64`'s
+    /// arithmetic folding), a constant local read, or an operator applied to
+    /// two constants. `snap` is the current `const_locals`, passed so this can
+    /// be a pure function over an immutable snapshot (it is called while the
+    /// AST is mutably borrowed).
+    fn const_of(&self, e: &Expr, snap: &HashMap<i32, i64>) -> Option<i64> {
+        const_i64(e).or_else(|| match e {
+            Expr::Var { slot, ty, .. } if *ty == Type::I64 && *slot >= 0 => snap.get(slot).copied(),
+            Expr::Bin(op, a, b) => {
+                let x = self.const_of(a, snap)?;
+                let y = self.const_of(b, snap)?;
+                const_binop_checked(*op, x, y)
+            }
+            _ => None,
+        })
+    }
+
     fn check_lvalue(&mut self, e: &mut Expr, scope: &mut Scope) -> Result<Type, String> {
         match e {
             Expr::Var { .. } | Expr::Field { .. } => self.check_expr(e, scope),
+            Expr::Deref { .. } => self.check_expr(e, scope),
             Expr::Index(base, idx) => {
-                let bt = self.check_expr(base, scope)?;
+                let bt = deref_ty(self.check_expr(base, scope)?);
                 let it = self.check_expr(idx, scope)?;
                 if it != Type::I64 {
                     return Err(format!("array index must be `i64`, found {it:?}"));
                 }
                 match bt {
-                    Type::Array(elem, _) => Ok(*elem),
+                    Type::Array(elem, n) => {
+                        // A constant index outside the array is a compile error,
+                        // exactly as rustc rejects it. A non-constant index is
+                        // checked at runtime (when bounds checks are on), so it
+                        // stays a runtime concern here.
+                        if let Some(k) = self.const_of(idx, &self.const_locals) {
+                            if k < 0 || k as usize >= n {
+                                return Err(format!(
+                                    "index {k} is out of bounds for an array of length {n}"
+                                ));
+                            }
+                        }
+                        Ok(*elem)
+                    }
                     other => Err(format!("cannot index a value of type {other:?}")),
                 }
             }
@@ -870,9 +1479,16 @@ impl Sema {
         match e {
             Expr::Int(_) => Ok(Type::I64),
             Expr::Bool(_) => Ok(Type::Bool),
-            Expr::Str(_) => Ok(Type::I64),
+            // A string literal has its own type, so it cannot be added to an
+            // integer or passed where an `i64` is expected.
+            Expr::Str(_) => Ok(Type::Str),
             Expr::Var { name, slot, ty } => match Self::lookup(scope, name) {
-                Some((s, t, _)) => {
+                Some((s, t, _mut, init)) => {
+                    if !init {
+                        return Err(format!(
+                            "use of possibly-uninitialized variable `{name}`"
+                        ));
+                    }
                     *slot = s;
                     *ty = t.clone();
                     Ok(t)
@@ -886,14 +1502,22 @@ impl Sema {
                         if t != Type::I64 {
                             return Err(format!("unary `-` expects `i64`, found {t:?}"));
                         }
+                        // Negating `i64::MIN` overflows. rustc's
+                        // `arithmetic_overflow` deny lint catches it when the
+                        // operand folds to a constant, so rmc does too; the
+                        // `i64::MIN` literal itself is parsed as `Int(i64::MIN)`,
+                        // not a negation, so only a written `-` reaches here.
+                        if self.const_of(inner, &self.const_locals) == Some(i64::MIN) {
+                            return Err("this arithmetic operation overflows".into());
+                        }
                         Ok(Type::I64)
                     }
-                    UnOp::Not => {
-                        if t != Type::Bool {
-                            return Err(format!("unary `!` expects `bool`, found {t:?}"));
-                        }
-                        Ok(Type::Bool)
-                    }
+                    UnOp::Not => match t {
+                        // `!` is logical not on `bool` and bitwise not on an
+                        // integer, matching Rust. It yields its operand's type.
+                        Type::Bool | Type::I64 => Ok(t),
+                        _ => Err(format!("unary `!` expects `bool` or `i64`, found {t:?}")),
+                    },
                 }
             }
             Expr::Bin(op, a, b) => {
@@ -904,6 +1528,9 @@ impl Sema {
                     Add | Sub | Mul | Div | Mod => {
                         if ta != Type::I64 || tb != Type::I64 {
                             return Err(format!("arithmetic expects `i64` operands, found {ta:?} and {tb:?}"));
+                        }
+                        if let (Some(x), Some(y)) = (self.const_of(a, &self.const_locals), self.const_of(b, &self.const_locals)) {
+                            const_binop(*op, x, y)?;
                         }
                         Ok(Type::I64)
                     }
@@ -936,6 +1563,21 @@ impl Sema {
                         if ta != Type::I64 || tb != Type::I64 {
                             return Err(format!("bitwise operator expects `i64` operands, found {ta:?} and {tb:?}"));
                         }
+                        // rustc rejects a shift whose count is a known constant
+                        // outside 0..=63 even when the shifted value is a
+                        // runtime value (`x << 81` is a compile error, not a
+                        // wrapped result), so the count is checked on its own
+                        // rather than only when both sides are constant.
+                        if matches!(op, Shl | Shr) {
+                            if let Some(y) = self.const_of(b, &self.const_locals) {
+                                if !(0..64).contains(&y) {
+                                    return Err("shift amount is out of range for `i64`".into());
+                                }
+                            }
+                        }
+                        if let (Some(x), Some(y)) = (self.const_of(a, &self.const_locals), self.const_of(b, &self.const_locals)) {
+                            const_binop(*op, x, y)?;
+                        }
                         Ok(Type::I64)
                     }
                 }
@@ -956,7 +1598,7 @@ impl Sema {
                 arg_slots.clear();
                 for (a, p) in args.iter_mut().zip(sig.params.iter()) {
                     let t = self.check_expr(a, scope)?;
-                    if &t != p {
+                    if &t != p && !ref_coerces(&t, p) {
                         return Err(format!("function `{name}`: argument type mismatch, expected {p:?}, found {t:?}"));
                     }
                     // An aggregate argument is passed by pointer, so give it a
@@ -977,65 +1619,168 @@ impl Sema {
                 Ok(sig.ret)
             }
             Expr::If(cond, then, els) => {
+                // A desugared `match` is a chain of `if`s. The first step is an
+                // ordinary `if`; the steps in its `else` chain are flagged with
+                // `match_chain`, and inherit `match_total`, which records
+                // whether the whole chain names every variant of one enum. A
+                // total chain may stand for a value even though its last step
+                // has no `else`.
+                let is_root = !self.match_chain;
+                let total = self.match_total;
+                self.match_chain = false;
+                self.match_total = false;
                 let ct = self.check_expr(cond, scope)?;
                 if ct != Type::Bool && !expr_never_typed(cond) {
                     return Err(format!("`if` condition must be `bool`, found {ct:?}"));
                 }
-                // Each arm is checked from the incoming state, then the results
-                // are merged. A path that returns/breaks/continues cannot reach
-                // the statement after the `if`, so it must not contribute: only
-                // arms that can fall through decide the merged state. An `if`
-                // without an `else` has an implicit fall-through arm keeping the
-                // incoming state.
-                let before = Self::snapshot_assigned(scope);
+                let total = if is_root {
+                    self.if_chain_is_exhaustive(cond, els)
+                } else {
+                    total
+                };
+                // Track definite initialization across the branches: a binding
+                // is initialized afterwards only if it was before, or on both
+                // paths. `init_before` is the state on entry to the branch.
+                let init_before = Self::init_snapshot(scope);
+                let assigned_before = Self::assigned_snapshot(scope);
                 let tt = self.check_block(then, scope)?;
-                let then_state = Self::snapshot_assigned(scope);
-                let then_div = block_diverges(then);
-                Self::restore_assigned(scope, &before);
-                let (et, else_state, else_div) = match els {
+                let then_init = Self::init_snapshot(scope);
+                let then_assigned = Self::assigned_snapshot(scope);
+                match els {
                     Some(e) => {
+                        // Only a total chain's `else` continues the chain: an
+                        // all-variant `match` has no wildcard body, so the else
+                        // block is always the next arm's test. A non-total chain
+                        // may end in a wildcard body that is itself an `if`, and
+                        // that nested `if` must be checked as an ordinary root.
+                        self.match_chain = total;
+                        self.match_total = total;
+                        // Restore the entry state before the else, so the else
+                        // sees the same scope the then saw.
+                        Self::init_restore(scope, &init_before);
+                        Self::assigned_restore(scope, &assigned_before);
                         let et = self.check_block(e, scope)?;
-                        let st = Self::snapshot_assigned(scope);
+                        self.match_chain = false;
+                        self.match_total = false;
                         if tt != et {
                             return Err(format!("`if` branches have different types: {tt:?} and {et:?}"));
                         }
-                        (tt, st, block_diverges(e))
+                        // Keep only what every path that reaches the code
+                        // after the `if` initialized. An arm that
+                        // returns/breaks/continues cannot reach it, so its
+                        // state must not be ANDed in: only fall-through arms
+                        // decide the merged state.
+                        let else_init = Self::init_snapshot(scope);
+                        let then_div = block_diverges(then);
+                        let else_div = block_diverges(e);
+                        for (i, b) in scope.iter_mut().enumerate() {
+                            let t = then_init.get(i).copied().unwrap_or(false);
+                            let el = else_init.get(i).copied().unwrap_or(false);
+                            b.init = match (then_div, else_div) {
+                                (false, false) => t && el,
+                                (false, true) => t,
+                                (true, false) => el,
+                                // Both arms diverge: nothing after is reachable.
+                                (true, true) => false,
+                            };
+                        }
+                        // A binding counts as written if a branch that can reach
+                        // the next statement wrote it. An arm that
+                        // returns/breaks/continues cannot, so its write must not
+                        // count: only fall-through arms decide the merged state.
+                        let else_assigned = Self::assigned_snapshot(scope);
+                        match (then_div, else_div) {
+                            (false, false) => {
+                                Self::assigned_merge(scope, &then_assigned, &else_assigned)
+                            }
+                            (true, false) => Self::assigned_restore(scope, &else_assigned),
+                            (false, true) => Self::assigned_restore(scope, &then_assigned),
+                            // Both arms diverge: nothing after the `if` is reachable.
+                            (true, true) => {}
+                        }
+                        Ok(tt)
                     }
                     None => {
-                        if tt != Type::Unit {
+                        if tt != Type::Unit && !total {
                             return Err(format!(
                                 "`if` without `else` must evaluate to `()`, but the branch is {tt:?}"
                             ));
                         }
-                        // No else: the fall-through keeps the incoming state.
-                        (tt, before.clone(), false)
+                        // No else: the then branch may not run. If it can fall
+                        // through, its writes count (a may-analysis); if it
+                        // diverges, the fall-through keeps the incoming state.
+                        Self::init_restore(scope, &init_before);
+                        if block_diverges(then) {
+                            Self::assigned_restore(scope, &assigned_before);
+                        } else {
+                            Self::assigned_merge(scope, &then_assigned, &assigned_before);
+                        }
+                        Ok(tt)
                     }
-                };
-                // A may-analysis: a binding is "assigned" when any reaching path
-                // assigned it. Only arms that fall through contribute.
-                match (then_div, else_div) {
-                    (false, false) => Self::merge_assigned(scope, &then_state, &else_state),
-                    (true, false) => Self::restore_assigned(scope, &else_state),
-                    (false, true) => Self::restore_assigned(scope, &then_state),
-                    // Both arms diverge: nothing after the `if` is reachable.
-                    (true, true) => {}
                 }
-                Ok(et)
+            }
+            // The start of a desugared `match`. It is transparent: check the
+            // chain inside as an ordinary expression, but clear any inherited
+            // chain context first so the inner chain is judged on its own. This
+            // is what stops a wildcard arm's nested `match` from borrowing the
+            // outer match's exhaustiveness.
+            Expr::MatchBoundary(b, has_catch_all) => {
+                let outer_chain = self.match_chain;
+                let outer_total = self.match_total;
+                self.match_chain = false;
+                self.match_total = false;
+                // Every `match` must be exhaustive, in any position: rustc
+                // rejects a non-exhaustive one with E0004, even in statement
+                // position where the fall-through to `()` is harmless. A `_` or
+                // binding arm is a catch-all; otherwise the arms must name every
+                // variant of one enum. Decide it before checking the body, while
+                // the `VariantTest` tags are still unset, so the walk compares
+                // variant *names*.
+                let exhaustive = *has_catch_all || self.match_chain_is_exhaustive(b);
+                let t = self.check_block(b, scope);
+                self.match_chain = outer_chain;
+                self.match_total = outer_total;
+                // A non-exhaustive match in *value* position already failed with
+                // the "`if` without `else`" error inside `check_block`; that
+                // message is more specific, so let it win. This only adds the
+                // statement-position case, where the arms are unit-typed and the
+                // chain checked clean.
+                let t = t?;
+                if !exhaustive {
+                    return Err(
+                        "non-exhaustive `match`: add the missing variant arm or a `_` arm"
+                            .to_string(),
+                    );
+                }
+                Ok(t)
             }
             Expr::Block(b) => self.check_block(b, scope),
             Expr::Index(base, idx) => {
-                let bt = self.check_expr(base, scope)?;
+                let bt = deref_ty(self.check_expr(base, scope)?);
                 let it = self.check_expr(idx, scope)?;
                 if it != Type::I64 {
                     return Err(format!("array index must be `i64`, found {it:?}"));
                 }
                 match bt {
-                    Type::Array(elem, _) => Ok(*elem),
+                    Type::Array(elem, n) => {
+                        // A constant index outside the array is a compile error,
+                        // exactly as rustc rejects it. A non-constant index is
+                        // checked at runtime (when bounds checks are on), so it
+                        // stays a runtime concern here.
+                        if let Some(k) = self.const_of(idx, &self.const_locals) {
+                            if k < 0 || k as usize >= n {
+                                return Err(format!(
+                                    "index {k} is out of bounds for an array of length {n}"
+                                ));
+                            }
+                        }
+                        Ok(*elem)
+                    }
                     other => Err(format!("cannot index a value of type {other:?}")),
                 }
             }
             Expr::Field { base, name, offset, ty } => {
-                let bt = self.check_expr(base, scope)?;
+                let bt = deref_ty(self.check_expr(base, scope)?);
                 match bt {
                     Type::Struct(sname, _) => {
                         let info = self.structs.get(&sname).cloned().unwrap();
@@ -1096,7 +1841,7 @@ impl Sema {
             Expr::ArrayLit(val, n) => {
                 let t = self.check_expr(val, scope)?;
                 if !t.is_int_or_bool() {
-                    return Err(format!("array elements must be `i64` or `bool`, found {t:?}"));
+                    return Err(format!("array elements must be `i64`, `bool` or a unit enum, found {t:?}"));
                 }
                 let ty = Type::Array(Box::new(t), *n);
                 // Value position: `[v; n]` has no address of its own, so rewrite
@@ -1127,7 +1872,7 @@ impl Sema {
                 let elem_ty = self.check_expr(&mut elems[0], scope)?;
                 if !elem_ty.is_int_or_bool() {
                     return Err(format!(
-                        "array elements must be `i64` or `bool`, found {elem_ty:?}"
+                        "array elements must be `i64`, `bool` or a unit enum, found {elem_ty:?}"
                     ));
                 }
                 for e in elems.iter_mut().skip(1) {
@@ -1188,11 +1933,15 @@ impl Sema {
                 // again as the first argument of the rewritten call. Snapshot the
                 // assignment flags so the second check sees the receiver's writes
                 // exactly once, not twice.
-                let assigned_before = Self::snapshot_assigned(scope);
+                let assigned_before = Self::assigned_snapshot(scope);
                 let rt = self.check_expr(recv, scope)?;
+                // Reading a method off a reference auto-derefs, so `r.m()`
+                // resolves against the referent's type.
+                let via_ref = matches!(rt, Type::Ref(..));
+                let base_ty = deref_ty(rt.clone());
                 // A method lives on a struct or an enum; both give the mangled
                 // prefix `Type$method`.
-                let tyname = match &rt {
+                let tyname = match &base_ty {
                     Type::Struct(n, _) | Type::Enum(n) | Type::EnumData(n, _) => n.clone(),
                     other => {
                         return Err(format!(
@@ -1201,12 +1950,28 @@ impl Sema {
                     }
                 };
                 let mangled = format!("{tyname}${name}");
-                if !self.sigs.contains_key(&mangled) {
-                    return Err(format!("no method `{name}` on `{tyname}`"));
-                }
-                Self::restore_assigned(scope, &assigned_before);
+                let sig = match self.sigs.get(&mangled).cloned() {
+                    Some(s) => s,
+                    None => return Err(format!("no method `{name}` on `{tyname}`")),
+                };
                 // Rewrite into a call with the receiver as the first argument.
+                Self::assigned_restore(scope, &assigned_before);
                 let recv = std::mem::replace(recv.as_mut(), Expr::Int(0));
+                // Match the receiver's form to the method's. A `&self` method
+                // takes an address, so a large receiver is not copied; `self`
+                // takes the value. A receiver that is already a reference is
+                // passed through for `&self`, and dereferenced (copied) for
+                // `self`.
+                let recv = match (sig.ref_self, via_ref) {
+                    (true, false) => Expr::AddrOf {
+                        expr: Box::new(recv),
+                        ty: Type::Named(String::new()),
+                        mutable: sig.ref_self_mut,
+                        slot: -1,
+                    },
+                    (false, true) => Expr::Deref { expr: Box::new(recv), ty: Type::Named(String::new()) },
+                    _ => recv,
+                };
                 let mut call_args = Vec::with_capacity(args.len() + 1);
                 call_args.push(recv);
                 call_args.append(args);
@@ -1306,6 +2071,15 @@ impl Sema {
                 *slot = self.alloc_slots((info.size / 8) as i32);
                 Ok(Type::EnumData(enum_name, info.size))
             }
+            Expr::BoolTest { scrutinee, value } => {
+                let st = self.check_expr(scrutinee, scope)?;
+                if st != Type::Bool {
+                    return Err(format!(
+                        "`{value}` pattern cannot match a value of type {st:?}"
+                    ));
+                }
+                Ok(Type::Bool)
+            }
             Expr::VariantTest { scrutinee, enum_name, variant, tag, n_binds } => {
                 let n_binds = *n_binds;
                 let st = self.check_expr(scrutinee, scope)?;
@@ -1379,6 +2153,38 @@ impl Sema {
                 *ty = fty.clone();
                 Ok(fty)
             }
+            Expr::AddrOf { expr, ty, mutable, slot } => {
+                // A reference is one word, whether it points at a scalar or an
+                // aggregate. An lvalue is addressed directly; anything else has
+                // no address of its own, so it is checked as a value and given a
+                // hidden frame slot to be materialised into.
+                let t = if is_lvalue(expr) {
+                    // `&mut place` needs a mutable place; rustc rejects
+                    // `&mut x` on an immutable binding (E0596). A non-lvalue
+                    // operand is materialised into a temporary, which is a
+                    // fresh mutable slot, so it is always borrowable.
+                    if *mutable {
+                        self.place_writable(expr, scope, false)?;
+                    }
+                    self.check_lvalue(expr, scope)?
+                } else {
+                    let t = self.check_expr(expr, scope)?;
+                    *slot = self.alloc_slots((t.size() / 8).max(1) as i32);
+                    t
+                };
+                *ty = t.clone();
+                Ok(Type::Ref(Box::new(t), *mutable))
+            }
+            Expr::Deref { expr, ty } => {
+                let it = self.check_expr(expr, scope)?;
+                match it {
+                    Type::Ref(inner, _) => {
+                        *ty = (*inner).clone();
+                        Ok(*inner)
+                    }
+                    other => Err(format!("cannot dereference a value of type {other:?}")),
+                }
+            }
             Expr::Cast(inner, to) => {
                 let it = self.check_expr(inner, scope)?;
                 // An enum may be cast to `i64` (its tag), but not the reverse:
@@ -1398,10 +2204,44 @@ impl Sema {
                 if !it.is_scalar() || !rt.is_scalar() {
                     return Err(format!("cannot cast {it:?} to {rt:?}"));
                 }
+                self.check_cast(&it, &rt)?;
                 *to = rt.clone();
                 Ok(rt)
             }
         }
+    }
+}
+
+/// True when a value of type `found` may be used where `expected` is wanted.
+/// The only coercion rmc performs is `&mut T` to `&T`: both are one pointer, and
+/// Rust allows it, so a `&mut` receiver can be read by a `&self` method.
+fn ref_coerces(found: &Type, expected: &Type) -> bool {
+    match (found, expected) {
+        (Type::Ref(f, true), Type::Ref(e, false)) => f == e,
+        _ => false,
+    }
+}
+
+/// The type a reference points at, or the type itself when it is not a
+/// reference. Reading through a reference (`r.x`, `r[i]`) does not need an
+/// explicit `*r`, so every base that reaches a place goes through here.
+fn deref_ty(t: Type) -> Type {
+    match t {
+        Type::Ref(inner, _) => *inner,
+        other => other,
+    }
+}
+
+/// True when `e` denotes a place with an address: a variable, a field of a
+/// place, an element of a place, or a dereference. `&e` on such an expression is
+/// its address; anything else (a literal, a call, arithmetic) has no address and
+/// must be materialised into a temporary first.
+fn is_lvalue(e: &Expr) -> bool {
+    match e {
+        Expr::Var { .. } | Expr::Deref { .. } => true,
+        Expr::Field { base, .. } => is_lvalue(base),
+        Expr::Index(base, _) => is_lvalue(base),
+        _ => false,
     }
 }
 
@@ -1423,10 +2263,6 @@ fn block_diverges(b: &Block) -> bool {
 
 fn stmt_diverges(s: &Stmt) -> bool {
     match s {
-        // A `return` leaves the function, so control never reaches the following
-        // statement. Its value is evaluated first (and may itself `continue`,
-        // which is handled by `stmt_continues_to`), but either way the next
-        // statement is unreachable.
         Stmt::Return(_) => true,
         // Only reachable inside a loop, so it never ends a function body, but
         // treating it as diverging keeps the walk total.
@@ -1449,10 +2285,44 @@ fn stmt_diverges(s: &Stmt) -> bool {
 fn expr_never_typed(e: &Expr) -> bool {
     match e {
         Expr::Block(b) => block_never_typed(b),
+        // A `match` desugars to a `MatchBoundary` wrapping an `if` chain. Its
+        // implicit fall-through is unreachable when the chain is exhaustive and
+        // every arm diverges (a `_` arm ends the chain with a plain diverging
+        // body; an exhaustive bool/enum chain ends with an `if` that has no
+        // `else`), so it is `!` just as the equivalent `if`/`else` chain is.
+        // `check_expr` already rejected a non-exhaustive match, so no
+        // exhaustiveness test is needed here.
+        Expr::MatchBoundary(b, _) => match_never_typed(b),
         Expr::If(_, t, els) => {
             block_never_typed(t) && els.as_ref().map_or(false, |b| block_never_typed(b))
         }
         _ => false,
+    }
+}
+
+/// True when a desugared `match` (its `MatchBoundary` block `b`) is `!`: every
+/// arm diverges and the chain cannot fall out of its end.
+fn match_never_typed(b: &Block) -> bool {
+    let mut cur = match b.tail.as_deref() {
+        Some(e) => e,
+        None => return block_diverges(b),
+    };
+    loop {
+        match cur {
+            Expr::If(_, then, els) => {
+                if !block_never_typed(then) {
+                    return false;
+                }
+                match els.as_ref().and_then(|blk| blk.tail.as_deref()) {
+                    Some(next) => cur = next,
+                    // The last arm has no `else`: the chain is exhaustive, so
+                    // nothing falls through.
+                    None => return true,
+                }
+            }
+            // A `_` arm closes the chain with a plain body.
+            other => return expr_never_typed(other),
+        }
     }
 }
 
@@ -1466,6 +2336,7 @@ fn block_never_typed(b: &Block) -> bool {
 fn expr_diverges(e: &Expr) -> bool {
     match e {
         Expr::Block(b) => block_diverges(b),
+        Expr::MatchBoundary(b, _) => block_diverges(b),
         // Both arms must diverge for the `if` to diverge.
         Expr::If(_, t, els) => {
             block_diverges(t) && els.as_ref().map_or(false, |b| block_diverges(b))
@@ -1479,14 +2350,11 @@ fn expr_diverges(e: &Expr) -> bool {
 /// path completes the body normally (which loops back) or hits a `continue` for
 /// this loop. A body whose every path `break`s or `return`s runs at most once.
 fn block_reaches_top(b: &Block) -> bool {
-    // Normal completion of a loop body loops back to the top.
     block_reaches_top_from(b, true)
 }
 
 /// `reach[i]` is true when some path from statement `i` onward (then the tail,
-/// then the continuation `after`) can reach the loop's top. The walk is
-/// right-to-left; a statement that cannot complete normally and does not itself
-/// reach the top makes every earlier position's `reach` false.
+/// then the continuation `after`) can reach the loop's top.
 fn block_repeat_suffixes(b: &Block, after: bool) -> Vec<bool> {
     let n = b.stmts.len();
     let mut out = vec![false; n + 1];
@@ -1507,12 +2375,11 @@ fn block_repeat_suffixes(b: &Block, after: bool) -> Vec<bool> {
 /// True when some path from the start of `b` reaches the loop's top, given the
 /// reach state `after` that holds once the block completes.
 fn block_reaches_top_from(b: &Block, after: bool) -> bool {
-    let n = b.stmts.len();
     let mut reach = match &b.tail {
         Some(t) => expr_reaches_top(t, after),
         None => after,
     };
-    for i in (0..n).rev() {
+    for i in (0..b.stmts.len()).rev() {
         reach = stmt_reaches_top(&b.stmts[i]) || (stmt_can_fall(&b.stmts[i]) && reach);
     }
     reach
@@ -1525,12 +2392,11 @@ fn expr_reaches_top(e: &Expr, after: bool) -> bool {
 }
 
 /// True when `e` can complete normally (produce a value) on some path, i.e. it
-/// does not always `break`/`return`/`continue` first. Short-circuit operators
-/// evaluate the right operand only when the left does not decide, so the whole
-/// expression can complete whenever the left can.
+/// does not always `break`/`return`/`continue` first.
 fn expr_can_fall(e: &Expr) -> bool {
     match e {
         Expr::Block(b) => block_can_fall(b),
+        Expr::MatchBoundary(b, _) => block_can_fall(b),
         Expr::If(cond, t, els) => {
             expr_can_fall(cond)
                 && (block_can_fall(t) || els.as_ref().map_or(true, |e| block_can_fall(e)))
@@ -1546,6 +2412,9 @@ fn expr_can_fall(e: &Expr) -> bool {
         Expr::Index(a, b) => expr_can_fall(a) && expr_can_fall(b),
         Expr::Field { base, .. } => expr_can_fall(base),
         Expr::Cast(a, _) => expr_can_fall(a),
+        Expr::AddrOf { expr, .. } => expr_can_fall(expr),
+        Expr::Deref { expr, .. } => expr_can_fall(expr),
+        Expr::BoolTest { scrutinee, .. } => expr_can_fall(scrutinee),
         Expr::Call { args, .. } => args.iter().all(expr_can_fall),
         Expr::StructLit { fields, .. } => fields.iter().all(|f| expr_can_fall(&f.value)),
         Expr::ArrayLit(v, _) => expr_can_fall(v),
@@ -1558,8 +2427,7 @@ fn expr_can_fall(e: &Expr) -> bool {
     }
 }
 
-/// True when every path through `b` reaches the end of the block: no statement
-/// diverges and the tail (if any) can complete normally.
+/// True when every path through `b` reaches the end of the block.
 fn block_can_fall(b: &Block) -> bool {
     for s in &b.stmts {
         if !stmt_can_fall(s) {
@@ -1581,56 +2449,6 @@ fn stmt_can_fall(s: &Stmt) -> bool {
         // break never falls through, so code after it is unreachable.
         Stmt::Loop(body) => block_has_break(body),
         _ => true,
-    }
-}
-
-/// True when a `break` in `b` targets the loop `b` is the body of. A nested
-/// loop captures its own `break`s, so the walk stops at one; an `if`/block does
-/// not, so it descends.
-fn block_has_break(b: &Block) -> bool {
-    b.stmts.iter().any(stmt_has_break) || b.tail.as_deref().map_or(false, expr_has_break)
-}
-
-fn stmt_has_break(s: &Stmt) -> bool {
-    match s {
-        Stmt::Break => true,
-        // A `while`/`for`/`loop` body's `break`s belong to that loop, not the
-        // enclosing one, so the walk does not descend into it.
-        Stmt::While(..) | Stmt::For { .. } | Stmt::Loop(_) => false,
-        Stmt::Expr(e) => expr_has_break(e),
-        Stmt::Let { init: Some(e), .. } => expr_has_break(e),
-        Stmt::Assign { value, .. } => expr_has_break(value),
-        _ => false,
-    }
-}
-
-fn expr_has_break(e: &Expr) -> bool {
-    match e {
-        Expr::Block(b) => block_has_break(b),
-        // The condition is evaluated, so a `break` there can leave the loop the
-        // expression belongs to; the walk must inspect it too, along with every
-        // other evaluated child.
-        Expr::If(c, t, els) => {
-            expr_has_break(c)
-                || block_has_break(t)
-                || els.as_ref().map_or(false, |b| block_has_break(b))
-        }
-        Expr::Bin(_, a, b) => expr_has_break(a) || expr_has_break(b),
-        Expr::Un(_, a) => expr_has_break(a),
-        Expr::Index(a, b) => expr_has_break(a) || expr_has_break(b),
-        Expr::Field { base, .. } => expr_has_break(base),
-        Expr::Cast(a, _) => expr_has_break(a),
-        Expr::Call { args, .. } => args.iter().any(expr_has_break),
-        Expr::StructLit { fields, .. } => fields.iter().any(|f| expr_has_break(&f.value)),
-        Expr::ArrayLit(v, _) => expr_has_break(v),
-        Expr::ArrayList(xs) => xs.iter().any(expr_has_break),
-        Expr::MethodCall { recv, args, .. } => {
-            expr_has_break(recv) || args.iter().any(expr_has_break)
-        }
-        Expr::EnumCtor { args, .. } => args.iter().any(expr_has_break),
-        Expr::VariantTest { scrutinee, .. } => expr_has_break(scrutinee),
-        Expr::EnumPayload { recv, .. } => expr_has_break(recv),
-        _ => false,
     }
 }
 
@@ -1661,6 +2479,10 @@ fn cond_has_unlabelled_exit(e: &Expr) -> bool {
         Expr::EnumCtor { args, .. } => args.iter().any(cond_has_unlabelled_exit),
         Expr::VariantTest { scrutinee, .. } => cond_has_unlabelled_exit(scrutinee),
         Expr::EnumPayload { recv, .. } => cond_has_unlabelled_exit(recv),
+        Expr::MatchBoundary(b, _) => block_has_unlabelled_exit(b),
+        Expr::AddrOf { expr, .. } => cond_has_unlabelled_exit(expr),
+        Expr::Deref { expr, .. } => cond_has_unlabelled_exit(expr),
+        Expr::BoolTest { scrutinee, .. } => cond_has_unlabelled_exit(scrutinee),
         _ => false,
     }
 }
@@ -1746,6 +2568,7 @@ fn stmt_contains_continue(s: &Stmt, label: Option<&str>, depth: usize) -> bool {
 fn expr_contains_continue(e: &Expr, label: Option<&str>, depth: usize) -> bool {
     match e {
         Expr::Block(b) => block_contains_continue(b, label, depth),
+        Expr::MatchBoundary(b, _) => block_contains_continue(b, label, depth),
         Expr::If(c, t, els) => {
             expr_contains_continue(c, label, depth)
                 || block_contains_continue(t, label, depth)
@@ -1762,6 +2585,9 @@ fn expr_contains_continue(e: &Expr, label: Option<&str>, depth: usize) -> bool {
         }
         Expr::Field { base, .. } => expr_contains_continue(base, label, depth),
         Expr::Cast(a, _) => expr_contains_continue(a, label, depth),
+        Expr::AddrOf { expr, .. } => expr_contains_continue(expr, label, depth),
+        Expr::Deref { expr, .. } => expr_contains_continue(expr, label, depth),
+        Expr::BoolTest { scrutinee, .. } => expr_contains_continue(scrutinee, label, depth),
         Expr::Call { args, .. } => args.iter().any(|a| expr_contains_continue(a, label, depth)),
         Expr::StructLit { fields, .. } => fields
             .iter()
@@ -1775,6 +2601,56 @@ fn expr_contains_continue(e: &Expr, label: Option<&str>, depth: usize) -> bool {
         Expr::EnumCtor { args, .. } => args.iter().any(|a| expr_contains_continue(a, label, depth)),
         Expr::VariantTest { scrutinee, .. } => expr_contains_continue(scrutinee, label, depth),
         Expr::EnumPayload { recv, .. } => expr_contains_continue(recv, label, depth),
+        _ => false,
+    }
+}
+/// True when a `break` in `b` targets the loop `b` is the body of. A nested
+/// loop captures its own `break`s, so the walk stops at one; an `if`/block does
+/// not, so it descends.
+fn block_has_break(b: &Block) -> bool {
+    b.stmts.iter().any(stmt_has_break) || b.tail.as_deref().map_or(false, expr_has_break)
+}
+
+fn stmt_has_break(s: &Stmt) -> bool {
+    match s {
+        Stmt::Break => true,
+        Stmt::While(..) | Stmt::Loop(..) | Stmt::For { .. } => false,
+        Stmt::Expr(e) => expr_has_break(e),
+        Stmt::Let { init: Some(e), .. } => expr_has_break(e),
+        Stmt::Assign { value, .. } => expr_has_break(value),
+        _ => false,
+    }
+}
+
+fn expr_has_break(e: &Expr) -> bool {
+    match e {
+        Expr::Block(b) => block_has_break(b),
+        Expr::MatchBoundary(b, _) => block_has_break(b),
+        // The condition is evaluated, so a `break` there can leave the loop the
+        // expression belongs to; the walk must inspect it too.
+        Expr::If(c, t, els) => {
+            expr_has_break(c)
+                || block_has_break(t)
+                || els.as_ref().map_or(false, |b| block_has_break(b))
+        }
+        Expr::Bin(_, a, b) => expr_has_break(a) || expr_has_break(b),
+        Expr::Un(_, a) => expr_has_break(a),
+        Expr::Index(a, b) => expr_has_break(a) || expr_has_break(b),
+        Expr::Field { base, .. } => expr_has_break(base),
+        Expr::Cast(a, _) => expr_has_break(a),
+        Expr::AddrOf { expr, .. } => expr_has_break(expr),
+        Expr::Deref { expr, .. } => expr_has_break(expr),
+        Expr::BoolTest { scrutinee, .. } => expr_has_break(scrutinee),
+        Expr::Call { args, .. } => args.iter().any(expr_has_break),
+        Expr::StructLit { fields, .. } => fields.iter().any(|f| expr_has_break(&f.value)),
+        Expr::ArrayLit(v, _) => expr_has_break(v),
+        Expr::ArrayList(xs) => xs.iter().any(expr_has_break),
+        Expr::MethodCall { recv, args, .. } => {
+            expr_has_break(recv) || args.iter().any(expr_has_break)
+        }
+        Expr::EnumCtor { args, .. } => args.iter().any(expr_has_break),
+        Expr::VariantTest { scrutinee, .. } => expr_has_break(scrutinee),
+        Expr::EnumPayload { recv, .. } => expr_has_break(recv),
         _ => false,
     }
 }
