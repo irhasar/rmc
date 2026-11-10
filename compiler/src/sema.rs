@@ -1658,7 +1658,6 @@ impl Sema {
                 Ok(())
             }
             Stmt::While(cond, body, label) => {
-                let init_before = Self::init_snapshot(scope);
                 self.loop_depth += 1;
                 self.loop_stack.push(LoopCtx {
                     label: label.clone(),
@@ -1673,21 +1672,35 @@ impl Sema {
                 self.loop_repeats.push(true);
                 self.loop_exits.push(Vec::new());
                 self.loop_reach.push(false);
-                self.loop_cont.push(false);
+                // The condition is re-evaluated whenever the body runs to its
+                // end (or `continue`s), so a write to an immutable binding in
+                // the condition repeats and rustc rejects it (E0384). Seeding
+                // the condition's continuation with the body's reachability is
+                // what lets the condition's own block walk see that back edge;
+                // `while { x = 1; false } {}` writes `x` on every evaluation.
+                self.loop_cont.push(block_reaches_top(body, label.as_deref()));
                 self.break_assigned.push(Self::assigned_snapshot(scope));
-                let ct = self.check_expr(cond, scope)?;
+                // rustc rejects an unlabelled `break`/`continue` in the
+                // condition before it looks at anything else, so this check
+                // precedes `check_expr` and its message wins over a write error.
                 if cond_has_unlabelled_exit(cond) {
                     return Err(
                         "`break` or `continue` with no label in the condition of a `while` loop"
                             .into(),
                     );
                 }
+                let ct = self.check_expr(cond, scope)?;
                 if ct != Type::Bool && ct != Type::Never {
                     return Err(format!("`while` condition must be `bool`, found {ct:?}"));
                 }
+                // The condition is evaluated at least once, even when the body
+                // never runs, so a binding it initializes is initialized on the
+                // fall-through exit. Snapshot that state: the body may still run
+                // zero times, so its writes do not count on their own.
+                let cond_init = Self::init_snapshot(scope);
                 self.check_block_inner(body, scope, true, label.as_deref())?;
                 let breaks = self.break_assigned.pop().unwrap();
-                self.loop_exits.pop();
+                let exits = self.loop_exits.pop().unwrap();
                 self.loop_cont.pop();
                 self.loop_reach.pop();
                 self.loop_repeats.pop();
@@ -1699,14 +1712,13 @@ impl Sema {
                     }
                 }
                 self.loop_depth -= 1;
+                // A binding is definitely initialized after the loop only if
+                // every exit initializes it: the fall-through exit (the
+                // condition's state) and each `break` that leaves the loop.
                 for (i, b) in scope.iter_mut().enumerate() {
-                    if breaks.get(i).copied().unwrap_or(false) {
-                        b.assigned = true;
-                    }
+                    b.init = cond_init.get(i).copied().unwrap_or(false)
+                        && exits.iter().all(|e| e.get(i).copied().unwrap_or(false));
                 }
-                // The loop may run zero times, so nothing it initializes is
-                // guaranteed afterwards.
-                Self::init_restore(scope, &init_before);
                 Ok(())
             }
             Stmt::For { var, var_slot, start, end, end_slot, body, label, .. } => {
@@ -2649,7 +2661,12 @@ impl Sema {
                                 (false, false) => ti && ei,
                                 (false, true) => ti,
                                 (true, false) => ei,
-                                (true, true) => false,
+                                // Both branches diverge, so neither write is
+                                // observed: control cannot reach here from
+                                // either, so the state is unchanged. Reporting
+                                // `false` would wrongly clobber a binding that
+                                // was already initialized before the `if`.
+                                (true, true) => init_before.get(i).copied().unwrap_or(false),
                             };
                         }
                         // A binding counts as written if a branch that can
@@ -3673,6 +3690,10 @@ fn block_has_break(b: &Block, label: Option<&str>) -> bool {
 }
 
 fn block_has_break_at(b: &Block, label: Option<&str>, nested: bool) -> bool {
+    // `any` over every statement, including ones after a `break`/`return`. rustc
+    // still type-checks such an unreachable `break` as an exit of the loop it
+    // names: `'a: loop { loop { break; break 'a; } }` requires the outer loop to
+    // yield the `break`'s value, so the dead break must count here.
     b.stmts.iter().any(|s| stmt_has_break(s, label, nested))
         || b.tail
             .as_deref()
@@ -3705,9 +3726,12 @@ fn stmt_has_break(s: &Stmt, label: Option<&str>, nested: bool) -> bool {
         }
         Stmt::For { start, end, body, label: lbl, .. } => {
             let outward = lbl.as_deref() != label;
-            (outward
-                && (expr_has_break(start, label, nested)
-                    || expr_has_break(end, label, nested)))
+            // A `for`'s range bounds run *before* its own label enters scope, so
+            // a `break` naming `label` there targets the enclosing loop even
+            // when the `for` reuses that label. The body is the only part the
+            // shadowing test applies to.
+            expr_has_break(start, label, nested)
+                || expr_has_break(end, label, nested)
                 || (outward
                     && expr_can_fall(start)
                     && expr_can_fall(end)
