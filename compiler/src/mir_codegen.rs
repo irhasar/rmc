@@ -675,7 +675,58 @@ fn collect_structs(prog: &Program, enums: &HashMap<String, EnumLayout>) -> HashM
             }
         }
     }
+    // A `Ty::Struct` keeps only the last path segment of a type's name, so two
+    // distinct types can share one key (`std::...::HashMap` and
+    // `hashbrown::...::HashMap` both key `HashMap`). When their field lists then
+    // point at each other, the layout reads as a self-referential value, which
+    // no Rust struct can be without indirection. Every walk over the layouts
+    // (`size_of_ty`, `struct_layout`, drop glue) would then recurse forever, so
+    // drop the cyclic layouts; a walker that misses one falls back to a scalar.
+    let cyclic: Vec<String> = structs
+        .keys()
+        .filter(|n| struct_on_cycle(n, &structs))
+        .cloned()
+        .collect();
+    for n in cyclic {
+        structs.remove(&n);
+    }
     structs
+}
+
+/// The struct names a type mentions, at any depth through `Tuple`/`Array`.
+fn ty_struct_names(ty: &Ty) -> Vec<String> {
+    fn walk(ty: &Ty, out: &mut Vec<String>) {
+        match ty {
+            Ty::Struct(n) => out.push(n.clone()),
+            Ty::Array(e, _) => walk(e, out),
+            Ty::Tuple(ts) => ts.iter().for_each(|t| walk(t, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(ty, &mut out);
+    out
+}
+
+/// Whether `name` can reach itself through one or more field edges.
+fn struct_on_cycle(name: &str, structs: &HashMap<String, Vec<Ty>>) -> bool {
+    let Some(fields) = structs.get(name) else {
+        return false;
+    };
+    let mut stack: Vec<String> = fields.iter().flat_map(ty_struct_names).collect();
+    let mut seen = HashSet::new();
+    while let Some(n) = stack.pop() {
+        if n == name {
+            return true;
+        }
+        if !seen.insert(n.clone()) {
+            continue;
+        }
+        if let Some(fs) = structs.get(&n) {
+            stack.extend(fs.iter().flat_map(ty_struct_names));
+        }
+    }
+    false
 }
 
 /// Every `Const::Agg` operand in `rv`, as `(name, ops)`, including nested ones.
@@ -5584,5 +5635,36 @@ fn main() -> i64 {
         // `_1` is read nowhere else, so this fold is the served one; the branch
         // still becomes a `cmp`/`jcc`.
         assert!(main.contains("cmp"), "comparison should fold into a branch:\n{main}");
+    }
+
+    /// A struct layout whose field list names its own struct must not send the
+    /// layout walkers into unbounded recursion.
+    ///
+    /// `Ty::Struct` keeps only a type name's last path segment, so two distinct
+    /// types (`A` and `x::A`) share one layout key. When that shared key's field
+    /// list then names itself — as in the `HashMap`/`hashbrown::HashMap`
+    /// collision the MIR fuzzer found — `size_of_ty`, `struct_layout` and the
+    /// drop glue each walk the layout forever and overflow the stack.
+    /// `collect_structs` now drops cyclic layouts; this checks the compile
+    /// terminates instead of crashing.
+    #[test]
+    fn self_referential_layout_terminates() {
+        let src = "\
+fn main() -> () {
+    let mut _0: ();
+    let mut _1: A;
+    let mut _2: A;
+    bb0: {
+        _2 = A { f: const 0_i64 };
+        _1 = A { f: move _2 };
+        drop(_1) -> [return: bb1, unwind unreachable];
+    }
+    bb1: { return; }
+}
+";
+        let mut prog = crate::mir::parse(src).expect("parse");
+        crate::mir::layout_blocks(&mut prog);
+        let asm = compile(&prog, &Options::default()).expect("compile");
+        assert!(asm.contains("main:"), "main not emitted:\n{asm}");
     }
 }
