@@ -121,6 +121,67 @@ arg_i64:
     },
     Piece {
         text: r#"
+# long __rmc_arg_or(long idx, long default)  -- arg_i64(idx) when idx is a
+# valid index, else `default`. Lowers the `std::env::args().nth(i)...unwrap_or(d)`
+# idiom (and its `.and_then(..).ok()` spelling) without an Option type.
+.globl __rmc_arg_or
+.type __rmc_arg_or, @function
+__rmc_arg_or:
+    push %rbp
+    mov %rsp, %rbp
+    test %rdi, %rdi
+    js .Lao_def
+    mov __rmc_argc(%rip), %rcx
+    cmp %rcx, %rdi
+    jge .Lao_def
+    call arg_i64
+    leave
+    ret
+.Lao_def:
+    mov %rsi, %rax
+    leave
+    ret
+.size __rmc_arg_or, .-__rmc_arg_or
+"#,
+        defines: &["__rmc_arg_or"],
+    },
+    Piece {
+        text: r#"
+# long __rmc_nargs(void)  -- the argument count. The `for v in &args` desugar
+# bounds its loop by this, so an args-vector is never materialised.
+.globl __rmc_nargs
+.type __rmc_nargs, @function
+__rmc_nargs:
+    mov __rmc_argc(%rip), %rax
+    ret
+.size __rmc_nargs, .-__rmc_nargs
+"#,
+        defines: &["__rmc_nargs"],
+    },
+    Piece {
+        text: r#"
+# long __rmc_fill(long addr, long count, long elem)  -- store `elem` at each of
+# `count` words from `addr`; returns `addr`. Backs the `vec![e; n]` desugar.
+.globl __rmc_fill
+.type __rmc_fill, @function
+__rmc_fill:
+    mov %rdi, %rax
+    test %rsi, %rsi
+    jle .Lfill_done
+    xor %rcx, %rcx
+.Lfill_loop:
+    mov %rdx, (%rax,%rcx,8)
+    inc %rcx
+    cmp %rsi, %rcx
+    jl .Lfill_loop
+.Lfill_done:
+    ret
+.size __rmc_fill, .-__rmc_fill
+"#,
+        defines: &["__rmc_fill"],
+    },
+    Piece {
+        text: r#"
 # void exit(long code)
 .globl exit
 .type exit, @function

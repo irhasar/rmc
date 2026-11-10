@@ -88,6 +88,36 @@ pub struct Parser {
     /// used before it is declared. A use is rewritten to its target at parse
     /// time, so no later pass sees the alias and layout is unaffected.
     aliases: std::collections::HashMap<String, Type>,
+    /// The `skip(n)` index recorded by the most recent
+    /// `std::env::args().skip(n).map(..).collect()` in a `let` initializer.
+    /// `parse_let` reads it to record the binding, and the `for v in &args`
+    /// desugar reads the binding's skip to start its range.
+    args_skip: i64,
+    /// Names bound to a `std::env::args()...collect()` vector, mapped to their
+    /// `skip` index. rmc has no `Vec`; a `for v in &args` over such a binding
+    /// desugars to `for i in skip..__rmc_nargs() { let v = __rmc_arg_or(i, 0); .. }`,
+    /// so no array is ever materialised.
+    args_vecs: std::collections::HashMap<String, i64>,
+    /// The loop variable of a `for v in &args` desugar, while its body is being
+    /// parsed. `v` is an `i64`, but Rust types it `&i64`, so `*v` in the body is
+    /// a copy of `v`; the parser drops the `*` for a name in this set. Scoped to
+    /// the loop body, so a shadowing `let` outside it is unaffected.
+    args_elems: std::collections::HashSet<String>,
+    /// Names bound to a `Vec` by a supported shape (`Vec::with_capacity(k)` or
+    /// `vec![e; n]`). rmc has no `Vec`; the binding holds the backing allocation
+    /// as an `i64` address, and the few methods the corpus uses are folded here
+    /// (`.as_mut_ptr()`, `.capacity()`, `.len()`).
+    vec_names: std::collections::HashSet<String>,
+    /// The constant capacity of a `Vec::with_capacity(k)` binding, for
+    /// `v.capacity()`.
+    vec_cap: std::collections::HashMap<String, i64>,
+    /// The constant length of a `vec![e; n]` binding with a constant `n`, for
+    /// `v.len()`.
+    vec_len: std::collections::HashMap<String, i64>,
+    /// Names holding a raw pointer (an `i64` address) taken by `.as_mut_ptr()`
+    /// or `.as_ptr()`. A `.add(off)` on one is the address arithmetic
+    /// `ptr + off`, matching the raw-pointer method.
+    ptr_vars: std::collections::HashSet<String>,
 }
 
 /// The deepest expression, block or type nesting the parser accepts. Deeply
@@ -135,6 +165,13 @@ impl Parser {
             fn_at: std::collections::HashMap::new(),
             nf_counter: 0,
             aliases: builtin_aliases(),
+            args_skip: 1,
+            args_vecs: std::collections::HashMap::new(),
+            args_elems: std::collections::HashSet::new(),
+            vec_names: std::collections::HashSet::new(),
+            vec_cap: std::collections::HashMap::new(),
+            vec_len: std::collections::HashMap::new(),
+            ptr_vars: std::collections::HashSet::new(),
         }
     }
 
@@ -237,6 +274,18 @@ impl Parser {
                 Some(Tok::Type) => self.parse_type_alias()?,
                 Some(Tok::Fn) => fns.push(self.parse_fn()?),
                 Some(Tok::Impl) => self.parse_impl(&mut fns)?,
+                // `unsafe fn` is a plain `fn`: rmc performs no safety checking,
+                // so the qualifier carries no meaning and is dropped here.
+                Some(Tok::Ident(id)) if id == "unsafe" => {
+                    self.i += 1;
+                    if self.peek() != Some(&Tok::Fn) {
+                        return Err(format!(
+                            "at byte {}: expected `fn` after `unsafe`",
+                            self.pos()
+                        ));
+                    }
+                    fns.push(self.parse_fn()?);
+                }
                 // `use` imports a path into scope. rmc has no module system and
                 // resolves names globally, so the import is skipped; the items
                 // it would bring in (`std::process::exit`, a same-file `fn`,
@@ -988,6 +1037,29 @@ impl Parser {
     }
 
     fn parse_type_inner(&mut self) -> PResult<Type> {
+        // `*const T` / `*mut T`: a raw pointer. rmc has no borrow checking and a
+        // raw pointer is one address, exactly like a reference, so it maps to
+        // the same `Ref` type (the `mut` flag is kept for symmetry).
+        if self.eat(&Tok::Star) {
+            let mutable = match self.peek() {
+                Some(Tok::Const) => {
+                    self.i += 1;
+                    false
+                }
+                Some(Tok::Mut) => {
+                    self.i += 1;
+                    true
+                }
+                _ => {
+                    return Err(format!(
+                        "at byte {}: expected `const` or `mut` after `*`",
+                        self.pos()
+                    ))
+                }
+            };
+            let inner = self.parse_type()?;
+            return Ok(Type::Ref(Box::new(inner), mutable));
+        }
         if self.eat(&Tok::Amp) {
             // A reference may carry a lifetime (`&'static str`, `&'a mut T`).
             // rmc does not model lifetimes, so it is skipped here.
@@ -1071,6 +1143,37 @@ impl Parser {
                     Tok::Ident(s) => s,
                     _ => unreachable!(),
                 };
+                // `Vec<T>` has no real type in rmc; the `let` that declares an
+                // `args()`-vector consumes the `<..>` and its initializer is
+                // desugared. Here only the `<..>` is skipped and a placeholder
+                // `Vec` name returned, so the annotation parses. A `Vec` used
+                // anywhere but that one `let` fails when it reaches sema (the
+                // name resolves to no struct).
+                if self.peek() == Some(&Tok::Lt) {
+                    if name != "Vec" {
+                        return Err(format!(
+                            "at byte {}: unsupported generic type `{name}` (only `Vec<T>` is accepted)",
+                            self.pos()
+                        ));
+                    }
+                    self.i += 1; // `<`
+                    let mut depth = 1i32;
+                    while depth > 0 {
+                        match self.peek() {
+                            None => {
+                                return Err(format!(
+                                    "at byte {}: unexpected end of input in `Vec<..>`",
+                                    self.pos()
+                                ))
+                            }
+                            Some(Tok::Lt) => depth += 1,
+                            Some(Tok::Gt) => depth -= 1,
+                            _ => {}
+                        }
+                        self.i += 1;
+                    }
+                    return Ok(Type::Named("Vec".into()));
+                }
                 // An alias is transparent: a use is rewritten to its target here,
                 // at parse time, so no later pass sees it. A struct name is not an
                 // alias and stays `Type::Named` for sema to lay out.
@@ -1319,6 +1422,35 @@ impl Parser {
         let pat = self.parse_pattern()?;
         self.expect(Tok::In)?;
         let head = self.parse_cond()?;
+        // `for v in &args` (and `for v in args`) over an `args()`-vector binding
+        // desugars to a range over the argument count; the element is read from
+        // the argument array, so the vector is never materialised. `head` is
+        // `&args` (an `AddrOf`) or the binding itself.
+        let args_name = match &head {
+            Expr::AddrOf { expr, .. } => match expr.as_ref() {
+                Expr::Var { name, .. } if self.args_vecs.contains_key(name) => Some(name.clone()),
+                _ => None,
+            },
+            Expr::Var { name, .. } if self.args_vecs.contains_key(name) => Some(name.clone()),
+            _ => None,
+        };
+        if let Some(name) = args_name {
+            let skip = self.args_vecs[&name];
+            let elem = match &pat {
+                Pat::Bind(n) => Some(n.clone()),
+                _ => None,
+            };
+            // Mark the loop variable before the body is parsed, so a `*v` in it
+            // (Rust's `&i64` element) lowers to the plain value.
+            if let Some(ref n) = elem {
+                self.args_elems.insert(n.clone());
+            }
+            let body = self.parse_block();
+            if let Some(ref n) = elem {
+                self.args_elems.remove(n);
+            }
+            return self.desugar_for_argsvec(pat, skip, body?, label);
+        }
         // `for x in &arr` iterates by *reference* in Rust: `x` is `&i64`, not
         // `i64`. rmc iterates by value, so accepting the `&` form would silently
         // give `x` the wrong type (and diverge from rustc's typing). Reject it
@@ -1484,6 +1616,79 @@ impl Parser {
             mutable: false,
         };
         Ok(Stmt::Expr(Expr::Block(Block { stmts: vec![arr_let, for_stmt], tail: None })))
+    }
+
+    /// `for PAT in &args { body }` over an `args()`-vector binding, desugared to
+    /// `for i in skip..__rmc_nargs() { let PAT = __rmc_arg_or(i, 0); body }`. The
+    /// element read is the runtime's argv parse, so no `Vec` is materialised.
+    /// `elem` names the loop variable when `PAT` is a binding, so the body's
+    /// `*v` (Rust's `&i64` element) can be lowered to `v`.
+    fn desugar_for_argsvec(
+        &mut self,
+        pat: Pat,
+        skip: i64,
+        mut body: Block,
+        label: Option<String>,
+    ) -> PResult<Stmt> {
+        let n = self.tmp;
+        self.tmp += 1;
+        let idx_name = format!("\u{0}ai{n}");
+        let idx_var = Expr::Var { name: idx_name.clone(), slot: -1, ty: Type::I64 };
+        let elem_expr = self.args_or_at(&idx_var, 0);
+        let stmts = match pat {
+            Pat::Bind(name) => vec![Stmt::Let {
+                name,
+                ty: None,
+                init: Some(elem_expr),
+                slot: -1,
+                mutable: false,
+            }],
+            Pat::Wild => vec![Stmt::Let {
+                name: format!("\u{0}ad{n}"),
+                ty: None,
+                init: Some(elem_expr),
+                slot: -1,
+                mutable: false,
+            }],
+            other => {
+                let _ = other;
+                return Err(format!(
+                    "at byte {}: `for` over an `args()` vector needs a binding or `_`",
+                    self.pos()
+                ));
+            }
+        };
+        let mut stmts = stmts;
+        stmts.extend(body.stmts.drain(..));
+        let for_stmt = Stmt::For {
+            var: idx_name,
+            var_slot: -1,
+            start: Expr::Int(skip),
+            end: Expr::Call {
+                name: "__rmc_nargs".into(),
+                args: Vec::new(),
+                arg_slots: Vec::new(),
+                ret_slot: -1,
+                ret_ty: Type::I64,
+            },
+            end_slot: -1,
+            inclusive: false,
+            body: Block { stmts, tail: body.tail },
+            label,
+        };
+        Ok(for_stmt)
+    }
+
+    /// `__rmc_arg_or(i, default)` for a runtime index `i` (the constant form is
+    /// `args_or`).
+    fn args_or_at(&self, idx: &Expr, default: i64) -> Expr {
+        Expr::Call {
+            name: "__rmc_arg_or".into(),
+            args: vec![idx.clone(), Expr::Int(default)],
+            arg_slots: Vec::new(),
+            ret_slot: -1,
+            ret_ty: Type::I64,
+        }
     }
 
     /// Consume the `;` that ends a statement, but allow it to be omitted when
@@ -1708,6 +1913,103 @@ impl Parser {
                     None
                 };
                 self.expect(Tok::Semi)?;
+                // A `Vec` binding is lowered to an `i64` address of its backing
+                // allocation. Three initializers are supported, each replaced by
+                // the allocation (plus, for `vec![..]`, a fill). The binding and
+                // its shape are recorded so the methods the corpus uses
+                // (`.capacity()`, `.len()`, `.as_mut_ptr()`) fold at parse time.
+                if let Some(Expr::Call { name: m, args, .. }) = init.clone() {
+                    if m == "\u{0}argsvec" {
+                        if !matches!(ty, Some(Type::Named(ref n)) if n == "Vec") {
+                            return Err(format!(
+                                "at byte {}: `std::env::args()...collect()` needs a `Vec<i64>` binding",
+                                self.pos()
+                            ));
+                        }
+                        self.args_vecs.insert(name.clone(), self.args_skip);
+                        return Ok(());
+                    }
+                    if m == "\u{0}vecnew" || m == "\u{0}vecrepeat" {
+                        let n_expr = if m == "\u{0}vecnew" {
+                            args[0].clone()
+                        } else {
+                            args[1].clone()
+                        };
+                        // The count may be a constant or a runtime value; only a
+                        // constant is recorded for a later `.len()`/`.capacity()`
+                        // fold. Either way the size is `count * 8` bytes at run
+                        // time and `__rmc_fill` takes the count as a value.
+                        let count = eval_i64(&n_expr, &self.consts);
+                        self.vec_names.insert(name.clone());
+                        if let Some(c) = count {
+                            self.vec_len.insert(name.clone(), c);
+                            if m == "\u{0}vecnew" {
+                                self.vec_cap.insert(name.clone(), c);
+                            }
+                        }
+                        // `alloc(count * 8)`; each element is one machine word.
+                        let bytes = Expr::Bin(
+                            BinOp::Mul,
+                            Box::new(n_expr.clone()),
+                            Box::new(Expr::Int(8)),
+                        );
+                        let addr = Expr::Call {
+                            name: "alloc".into(),
+                            args: vec![bytes],
+                            arg_slots: Vec::new(),
+                            ret_slot: -1,
+                            ret_ty: Type::I64,
+                        };
+                        let init_expr = if m == "\u{0}vecnew" {
+                            addr
+                        } else {
+                            // `__rmc_fill(addr, count, elem)` writes the repeated
+                            // element; it returns the address.
+                            Expr::Call {
+                                name: "__rmc_fill".into(),
+                                args: vec![addr, n_expr, args[0].clone()],
+                                arg_slots: Vec::new(),
+                                ret_slot: -1,
+                                ret_ty: Type::I64,
+                            }
+                        };
+                        out.push(Stmt::Let {
+                            name,
+                            ty: Some(Type::I64),
+                            init: Some(init_expr),
+                            slot: -1,
+                            mutable,
+                        });
+                        return Ok(());
+                    }
+                    if m == "\u{0}veclist" {
+                        return Err(format!(
+                            "at byte {}: `vec![a, b, c]` is not supported (use `vec![e; n]`)",
+                            self.pos()
+                        ));
+                    }
+                    // `let p = base.as_mut_ptr();`: `base` is a `Vec` address, so
+                    // `p` holds that same address. Record it a raw pointer so a
+                    // later `p.add(off)` folds to address arithmetic.
+                    if m == "\u{0}ptr" {
+                        self.ptr_vars.insert(name.clone());
+                        out.push(Stmt::Let {
+                            name,
+                            ty: Some(Type::I64),
+                            init: Some(args[0].clone()),
+                            slot: -1,
+                            mutable,
+                        });
+                        return Ok(());
+                    }
+                }
+                if matches!(ty, Some(Type::Named(ref n)) if n == "Vec") {
+                    return Err(format!(
+                        "at byte {}: a `Vec` binding must be initialized by \
+                         `Vec::with_capacity(k)`, `vec![e; n]` or an `args()` collect",
+                        self.pos()
+                    ));
+                }
                 out.push(Stmt::Let { name, ty, init, slot: -1, mutable });
                 Ok(())
             }
@@ -2093,8 +2395,28 @@ impl Parser {
         };
         let known = matches!(
             (module.as_str(), item.as_str()),
-            ("process", "exit") | ("hint", "black_box")
+            ("process", "exit") | ("hint", "black_box") | ("ptr", "null")
         );
+        // `std::env::args()` (and `env::args()` after `use std::env;`) has no
+        // argument list; it lowers to a hidden marker the postfix parser folds
+        // together with the iterator-method chain that follows it.
+        if (module.as_str(), item.as_str()) == ("env", "args") {
+            self.expect(Tok::ColonColon)?; // the first `::`
+            if name == "std" {
+                self.expect_ident()?; // the module
+                self.expect(Tok::ColonColon)?;
+            }
+            self.expect_ident()?; // `args`
+            self.expect(Tok::LParen)?;
+            self.expect(Tok::RParen)?;
+            return Ok(Some(Expr::Call {
+                name: "\u{0}args".into(),
+                args: Vec::new(),
+                arg_slots: Vec::new(),
+                ret_slot: -1,
+                ret_ty: Type::I64,
+            }));
+        }
         if !known {
             // A full `std::` path is unambiguously a std import, so it gets a
             // clear message; an aliased module may just be a same-file item.
@@ -2114,6 +2436,12 @@ impl Parser {
         }
         self.expect_ident()?; // the item
         self.expect(Tok::LParen)?;
+        // `std::ptr::null()` / `std::ptr::null_mut()` take no argument; every
+        // other known path takes exactly one.
+        if (module.as_str(), item.as_str()) == ("ptr", "null") {
+            self.expect(Tok::RParen)?;
+            return Ok(Some(Expr::Int(0)));
+        }
         let arg = self.parse_bracketed_expr()?;
         self.expect(Tok::RParen)?;
         let e = match (module.as_str(), item.as_str()) {
@@ -2135,6 +2463,211 @@ impl Parser {
         Ok(Some(e))
     }
 
+    /// Lower the iterator-method chain that follows `std::env::args()`. rmc has
+    /// no `Iterator`/`Option`/`Result` types, so it recognises the shapes the
+    /// suite and benchmarks use and folds each to an `i64`:
+    ///
+    /// * `.nth(i).unwrap()` / `.nth(i).unwrap().parse().unwrap()`
+    ///   / `.nth(i).unwrap_or(d)` / `.nth(i).and_then(|s| s.parse().ok()).unwrap_or(d)`
+    ///     -> `__rmc_arg_or(i, d)` (`d` is `0` without an `unwrap_or`).
+    /// * `.skip(k).map(|s| s.parse::<i64>().unwrap()).collect()` -> an array of
+    ///   the arguments from index `k` on, used by the `for v in &args` form.
+    ///
+    /// A `|s| ...` closure body is not parsed for its own sake: only the
+    /// `s.parse::<i64>().unwrap()` / `.parse().ok()` shape is accepted, and its
+    /// binding name is ignored. Any other shape is rejected with a clear
+    /// message rather than mis-compiled.
+    fn finish_args_chain(&mut self, chain: Expr) -> PResult<Expr> {
+        // `chain` is the `\0args` marker. It must be followed by `.`.
+        debug_assert!(matches!(&chain, Expr::Call { name, .. } if name == "\u{0}args"));
+        let mut skip = 0i64;
+        // `skip(n)`: advance the starting index (only the last one counts, as
+        // for any iterator).
+        loop {
+            if !self.eat(&Tok::Dot) {
+                return Err(format!(
+                    "at byte {}: `std::env::args()` must be followed by an iterator method",
+                    self.pos()
+                ));
+            }
+            let m = self.expect_ident()?;
+            match m.as_str() {
+                "skip" => {
+                    self.expect(Tok::LParen)?;
+                    let n = self.parse_bracketed_expr()?;
+                    self.expect(Tok::RParen)?;
+                    skip = eval_i64(&n, &self.consts).ok_or_else(|| {
+                        format!("at byte {}: `skip` needs a constant count", self.pos())
+                    })?;
+                }
+                "nth" => {
+                    self.expect(Tok::LParen)?;
+                    let n = self.parse_bracketed_expr()?;
+                    self.expect(Tok::RParen)?;
+                    let idx = eval_i64(&n, &self.consts).ok_or_else(|| {
+                        format!("at byte {}: `nth` needs a constant index", self.pos())
+                    })?;
+                    return self.finish_args_nth(idx + skip);
+                }
+                "map" => {
+                    self.expect(Tok::LParen)?;
+                    self.skip_closure()?;
+                    self.expect(Tok::RParen)?;
+                    // Only the `.collect()` array form follows a `map` in the
+                    // supported shapes.
+                    self.expect(Tok::Dot)?;
+                    let c = self.expect_ident()?;
+                    if c != "collect" {
+                        return Err(format!(
+                            "at byte {}: `std::env::args().map(..)` must be followed by `collect()`",
+                            self.pos()
+                        ));
+                    }
+                    self.expect(Tok::LParen)?;
+                    self.expect(Tok::RParen)?;
+                    return self.finish_args_collect(skip);
+                }
+                other => {
+                    return Err(format!(
+                        "at byte {}: unsupported `std::env::args()` method `{other}`",
+                        self.pos()
+                    ))
+                }
+            }
+        }
+    }
+
+    /// `.nth(idx)` already consumed: accept `unwrap()` / `parse().unwrap()` /
+    /// `unwrap_or(d)` / `and_then(|s| s.parse().ok()).unwrap_or(d)` and fold to
+    /// `__rmc_arg_or(idx, default)`.
+    fn finish_args_nth(&mut self, idx: i64) -> PResult<Expr> {
+        let mut default: Option<Expr> = None;
+        let mut done = false;
+        while self.peek() == Some(&Tok::Dot) {
+            self.i += 1;
+            let m = self.expect_ident()?;
+            match m.as_str() {
+                "parse" => {
+                    // `parse::<i64>()` carries a turbofish; skip it.
+                    if self.eat(&Tok::ColonColon) {
+                        self.expect(Tok::Lt)?;
+                        self.expect_ident()?; // the type name
+                        self.expect(Tok::Gt)?;
+                    }
+                    self.expect(Tok::LParen)?;
+                    self.expect(Tok::RParen)?;
+                }
+                "unwrap" => {
+                    self.expect(Tok::LParen)?;
+                    self.expect(Tok::RParen)?;
+                    done = true;
+                }
+                "unwrap_or" => {
+                    self.expect(Tok::LParen)?;
+                    let d = self.parse_bracketed_expr()?;
+                    self.expect(Tok::RParen)?;
+                    default = Some(d);
+                    done = true;
+                }
+                "and_then" => {
+                    self.expect(Tok::LParen)?;
+                    self.skip_closure()?;
+                    self.expect(Tok::RParen)?;
+                }
+                other => {
+                    return Err(format!(
+                        "at byte {}: unsupported `std::env::args().nth(..)` method `{other}`",
+                        self.pos()
+                    ))
+                }
+            }
+        }
+        if !done {
+            return Err(format!(
+                "at byte {}: `std::env::args().nth(..)` must end with `unwrap()` or `unwrap_or(..)`",
+                self.pos()
+            ));
+        }
+        Ok(self.args_or(idx, default.unwrap_or(Expr::Int(0))))
+    }
+
+    /// `.skip(k).map(|s| s.parse::<i64>().unwrap()).collect()`: the arguments
+    /// from index `k` on, as an array. Only the `for v in &args` loop reads it,
+    /// so the array's length is `argc - k` clamped to the `[i64; N]` the source
+    /// declares. Since `N` is a compile-time constant and `argc` is not, rmc
+    /// emits a fixed-size array of `N` elements, each `__rmc_arg_or(k + j, 0)`.
+    /// The caller supplies `N` by re-reading it from the `let` type; here the
+    /// chain has no length, so this returns a marker the `let`/`for` fold
+    /// completes. For the suite's shapes the length is the literal in the
+    /// declared type, handled in `parse_let`.
+    fn finish_args_collect(&mut self, skip: i64) -> PResult<Expr> {
+        // The `let` that this initializes owns the array; record the skip so it
+        // can size the desugared loop. `parse_let` rejects the marker anywhere
+        // other than an `args`-vector binding.
+        self.args_skip = skip;
+        Ok(Expr::Call {
+            name: "\u{0}argsvec".into(),
+            args: Vec::new(),
+            arg_slots: Vec::new(),
+            ret_slot: -1,
+            ret_ty: Type::I64,
+        })
+    }
+
+    /// Skip a closure argument `|a, b| EXPR`, consuming its tokens without
+    /// type-checking the body (rmc only accepts the `s.parse()...` shape).
+    fn skip_closure(&mut self) -> PResult<()> {
+        if self.peek() != Some(&Tok::Pipe) {
+            return Err(format!("at byte {}: expected a closure `|..| ..`", self.pos()));
+        }
+        self.i += 1; // the opening `|`
+        // Parameters up to the closing `|`.
+        while self.peek() != Some(&Tok::Pipe) {
+            match self.peek() {
+                Some(Tok::Ident(_)) | Some(Tok::Comma) | Some(Tok::Underscore) => self.i += 1,
+                _ => {
+                    return Err(format!(
+                        "at byte {}: unsupported closure parameter in `std::env::args()` chain",
+                        self.pos()
+                    ))
+                }
+            }
+        }
+        self.i += 1; // the closing `|`
+        // The body: `s.parse::<i64>().unwrap()` or `s.parse().ok()`. Walk to the
+        // end of the closure's expression (the enclosing `)` or `,`).
+        let mut depth = 0i32;
+        loop {
+            match self.peek() {
+                None => break,
+                Some(Tok::LParen) => {
+                    depth += 1;
+                    self.i += 1;
+                }
+                Some(Tok::RParen) => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                    self.i += 1;
+                }
+                Some(Tok::Comma) if depth == 0 => break,
+                _ => self.i += 1,
+            }
+        }
+        Ok(())
+    }
+
+    /// `__rmc_arg_or(idx, default)`.
+    fn args_or(&self, idx: i64, default: Expr) -> Expr {
+        Expr::Call {
+            name: "__rmc_arg_or".into(),
+            args: vec![Expr::Int(idx), default],
+            arg_slots: Vec::new(),
+            ret_slot: -1,
+            ret_ty: Type::I64,
+        }
+    }
     /// `println!("...")` / `print!("...")`: format the literal and its `{}`
     /// arguments, then print. `println!` appends a newline. The format string
     /// must be a literal (a variable one is not supported), and a `{}` is filled
@@ -2182,6 +2715,56 @@ impl Parser {
         }
         self.expect(Tok::RParen)?;
         self.desugar_macro(name, newline, &fmt, args)
+    }
+
+    /// `vec![e; n]` (repeat form) and `vec![a, b, c]` (list form). rmc has no
+    /// `Vec`; each lowers to a fresh heap allocation holding the elements, with
+    /// the value being the block address (an `i64`). The repeat form's `n` and
+    /// the list form's length are recorded so a later `.len()` folds. The
+    /// element count must be a constant for the size to be known at compile
+    /// time; a non-constant `n` is rejected.
+    fn parse_vec_macro(&mut self) -> PResult<Expr> {
+        self.i += 1; // the `!`
+        self.expect(Tok::LBracket)?;
+        // Empty `vec![]` is a zero-length allocation.
+        if self.eat(&Tok::RBracket) {
+            return Ok(Expr::Call {
+                name: "\u{0}vecrepeat".into(),
+                args: vec![Expr::Int(0), Expr::Int(0)],
+                arg_slots: Vec::new(),
+                ret_slot: -1,
+                ret_ty: Type::I64,
+            });
+        }
+        let first = self.parse_bracketed_expr()?;
+        // `vec![e; n]`: the `;` separates the element from the count.
+        if self.eat(&Tok::Semi) {
+            let n = self.parse_bracketed_expr()?;
+            self.expect(Tok::RBracket)?;
+            return Ok(Expr::Call {
+                name: "\u{0}vecrepeat".into(),
+                args: vec![first, n],
+                arg_slots: Vec::new(),
+                ret_slot: -1,
+                ret_ty: Type::I64,
+            });
+        }
+        // `vec![a, b, c]`: the elements are stored in order.
+        let mut elems = vec![first];
+        while self.eat(&Tok::Comma) {
+            if self.peek() == Some(&Tok::RBracket) {
+                break;
+            }
+            elems.push(self.parse_bracketed_expr()?);
+        }
+        self.expect(Tok::RBracket)?;
+        Ok(Expr::Call {
+            name: "\u{0}veclist".into(),
+            args: elems,
+            arg_slots: Vec::new(),
+            ret_slot: -1,
+            ret_ty: Type::I64,
+        })
     }
 
     /// Build the block for `println!`/`print!` from the parsed format and
@@ -2466,6 +3049,14 @@ impl Parser {
                 self.i += 1;
                 self.bump_depth()?;
                 let e = self.parse_unary()?;
+                // `*v` where `v` is a `for v in &args` loop variable: Rust types
+                // `v` as `&i64`, but rmc's desugar binds it as the `i64` value,
+                // so the deref is a copy of `v` and is dropped.
+                if let Expr::Var { name, .. } = &e {
+                    if self.args_elems.contains(name) {
+                        return Ok(e);
+                    }
+                }
                 Ok(Expr::Deref { expr: Box::new(e), ty: Type::Named(String::new()) })
             }
             _ => self.parse_postfix(),
@@ -2476,6 +3067,37 @@ impl Parser {
         let mut e = self.parse_primary()?;
         loop {
             self.bump_depth()?;
+            // `args[i]` on an `args()`-vector binding lowers to
+            // `__rmc_arg_or(i + skip, 0)`: no vector is materialised, and the
+            // index must be a constant, exactly as the direct `args().nth(i)`
+            // form requires.
+            if let Expr::Var { name, .. } = &e {
+                if let Some(&skip) = self.args_vecs.get(name) {
+                    if self.peek() == Some(&Tok::LBracket) {
+                        self.i += 1;
+                        let idx = self.parse_bracketed_expr()?;
+                        self.expect(Tok::RBracket)?;
+                        let k = eval_i64(&idx, &self.consts).ok_or_else(|| {
+                            format!(
+                                "at byte {}: indexing an `args()` vector needs a constant index",
+                                self.pos()
+                            )
+                        })?;
+                        e = self.args_or(k + skip, Expr::Int(0));
+                        continue;
+                    }
+                }
+            }
+            // `std::env::args()` lowers to a hidden marker; the iterator-method
+            // chain that follows folds to an `i64` (`__rmc_arg_or`). A chain rmc
+            // cannot lower is rejected there rather than mis-compiled.
+            if let Expr::Call { name, .. } = &e {
+                if name == "\u{0}args" {
+                    let chain = std::mem::replace(&mut e, Expr::Int(0));
+                    e = self.finish_args_chain(chain)?;
+                    continue;
+                }
+            }
             if self.eat(&Tok::LBracket) {
                 let idx = self.parse_bracketed_expr()?;
                 self.expect(Tok::RBracket)?;
@@ -2501,6 +3123,42 @@ impl Parser {
                         }
                     }
                     self.expect(Tok::RParen)?;
+                    // Methods on a `Vec`/raw-pointer binding that rmc lowers to
+                    // plain arithmetic. The receiver is an `i64` (a `Vec` is its
+                    // backing address), so `capacity`/`len` fold to the constant
+                    // recorded at the binding, `as_mut_ptr`/`as_ptr` keep the
+                    // address (marked so a later `.add` folds), and `.add(off)`
+                    // is `ptr + off`.
+                    if let Expr::Var { name: recv, .. } = &e {
+                        if args.is_empty() && name == "capacity" && self.vec_cap.contains_key(recv)
+                        {
+                            e = Expr::Int(self.vec_cap[recv]);
+                            continue;
+                        }
+                        if args.is_empty() && name == "len" && self.vec_len.contains_key(recv) {
+                            e = Expr::Int(self.vec_len[recv]);
+                            continue;
+                        }
+                        if args.is_empty()
+                            && (name == "as_mut_ptr" || name == "as_ptr")
+                            && self.vec_names.contains(recv)
+                        {
+                            let recv_expr = e.clone();
+                            e = Expr::Call {
+                                name: "\u{0}ptr".into(),
+                                args: vec![recv_expr],
+                                arg_slots: Vec::new(),
+                                ret_slot: -1,
+                                ret_ty: Type::I64,
+                            };
+                            continue;
+                        }
+                        if name == "add" && args.len() == 1 && self.ptr_vars.contains(recv) {
+                            let recv_expr = e.clone();
+                            e = Expr::Bin(BinOp::Add, Box::new(recv_expr), Box::new(args.pop().unwrap()));
+                            continue;
+                        }
+                    }
                     e = Expr::MethodCall { recv: Box::new(e), name, args };
                 } else {
                     e = Expr::Field { base: Box::new(e), name, offset: 0, ty: Type::I64 };
@@ -4169,6 +4827,11 @@ impl Parser {
             }
             Some(Tok::Ident(name)) => {
                 self.i += 1;
+                // `unsafe { .. }`: rmc does no borrow or safety checking, so the
+                // block is transparent. `unsafe fn` is likewise a plain `fn`.
+                if name == "unsafe" && self.peek() == Some(&Tok::LBrace) {
+                    return self.parse_block().map(Expr::Block);
+                }
                 // `Self { .. }` names the struct of the enclosing `impl`.
                 let name = if name == "Self" {
                     match self.current_impl.clone() {
@@ -4190,6 +4853,7 @@ impl Parser {
                 if self.peek() == Some(&Tok::Bang) {
                     match name.as_str() {
                         "println" | "print" => return self.parse_macro(&name),
+                        "vec" => return self.parse_vec_macro(),
                         "assert" | "assert_eq" | "assert_ne" => {
                             return self.parse_assert(&name)
                         }
@@ -4217,6 +4881,34 @@ impl Parser {
                 // `Enum::Variant` or `Enum::Variant(args)` — resolved and
                 // range-checked by sema.
                 if self.eat(&Tok::ColonColon) {
+                    // `Vec::with_capacity(k)` and `Vec::new()` allocate the
+                    // backing store; the returned `Vec` value is the block
+                    // address (an `i64`). Only these two constructors are
+                    // supported, and only as a `let` initializer.
+                    if name == "Vec" {
+                        let assoc = self.expect_ident()?;
+                        if assoc != "with_capacity" && assoc != "new" {
+                            return Err(format!(
+                                "at byte {}: unsupported `Vec::{assoc}` (only `Vec::with_capacity` and `Vec::new`)",
+                                self.pos()
+                            ));
+                        }
+                        self.expect(Tok::LParen)?;
+                        let cap = if assoc == "new" {
+                            Expr::Int(0)
+                        } else {
+                            let e = self.parse_bracketed_expr()?;
+                            self.expect(Tok::RParen)?;
+                            e
+                        };
+                        return Ok(Expr::Call {
+                            name: "\u{0}vecnew".into(),
+                            args: vec![cap],
+                            arg_slots: Vec::new(),
+                            ret_slot: -1,
+                            ret_ty: Type::I64,
+                        });
+                    }
                     // `i64::MIN`, `usize::MAX`, `u32::BITS`: an integer-width
                     // associated constant folds straight to its value.
                     if is_int_width(&name) {

@@ -199,7 +199,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     // Runtime helpers provided by the freestanding assembly runtime. They are
     // linked in automatically, so they do not appear in the source program.
-    let builtins: [(&str, &[Type], Type); 23] = [
+    let builtins: [(&str, &[Type], Type); 26] = [
         ("print_i64", &[Type::I64], Type::Unit),
         ("print_str", &[Type::Str], Type::Unit),
         ("print_bool", &[Type::Bool], Type::Unit),
@@ -212,6 +212,15 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         ("alloc", &[Type::I64], Type::I64),
         ("free", &[Type::I64], Type::Unit),
         ("arg_i64", &[Type::I64], Type::I64),
+        // `std::env::args().nth(i)...unwrap_or(d)`: the i-th argument parsed as
+        // an integer, or `d` when the index is out of range. Emitted by the
+        // parser for the `args()` chain, never written in source.
+        ("__rmc_arg_or", &[Type::I64, Type::I64], Type::I64),
+        // The argument count, for the `for v in &args` desugar's loop bound.
+        ("__rmc_nargs", &[], Type::I64),
+        // `__rmc_fill(addr, count, elem)`: store `elem` at each of `count` words
+        // from `addr`, for the `vec![e; n]` desugar; returns `addr`.
+        ("__rmc_fill", &[Type::I64, Type::I64, Type::I64], Type::I64),
         // Byte-wise lexicographic `str` compare; emitted by sema for a string
         // comparison and never written in source.
         ("__rmc_str_lt", &[Type::Str, Type::Str], Type::Bool),
@@ -513,6 +522,9 @@ fn resolve_ty_rec(
         }
         Type::Ref(inner, m) => {
             let t = resolve_ty_rec(inner, raw_s, raw_e, so, eo, visiting)?;
+            if t == Type::Str {
+                return Ok(Type::Str);
+            }
             Ok(Type::Ref(Box::new(t), *m))
         }
         other => Ok(other.clone()),
@@ -548,7 +560,17 @@ fn resolve_in(
             }
             Ok(Type::Array(Box::new(e), *n))
         }
-        Type::Ref(inner, m) => Ok(Type::Ref(Box::new(resolve_in(inner, structs, enums)?), *m)),
+        // A reference to `str` (`&str`, `&'static str`, `&mut str`) is rmc's
+        // `Str`: a pointer to a byte string. rmc has no separate fat-pointer
+        // type, so `&str` and `str` denote the same one-slot value. This lets a
+        // Rust `fn f() -> &'static str` return a string literal unchanged.
+        Type::Ref(inner, m) => {
+            let it = resolve_in(inner, structs, enums)?;
+            if it == Type::Str {
+                return Ok(Type::Str);
+            }
+            Ok(Type::Ref(Box::new(it), *m))
+        }
         other => Ok(other.clone()),
     }
 }
@@ -1961,7 +1983,11 @@ impl Sema {
                 Ok(())
             }
             // A reference cannot become a scalar: `&T as i64` would expose the
-            // address as an integer, which rustc forbids (E0606).
+            // address as an integer, which rustc forbids (E0606). rmc maps both
+            // `*mut T` and `&mut T` to `Ref(_, true)`, and rustc *does* allow
+            // `*mut T as i64`, so the mutable form is accepted (the raw-pointer
+            // extension). A shared reference stays rejected, matching E0606.
+            (Type::Ref(_, true), Type::I64) => Ok(()),
             (Type::Ref(..), _) => {
                 Err(format!("cannot cast a reference `{from:?}` to `{to:?}`"))
             }
@@ -2460,11 +2486,23 @@ impl Sema {
                     *ret_slot = -1;
                     return Ok(Type::Unit);
                 }
-                let sig = self
-                    .sigs
-                    .get(name)
-                    .cloned()
-                    .ok_or_else(|| format!("call to unknown function `{name}`"))?;
+                let sig = self.sigs.get(name).cloned().ok_or_else(|| {
+                    // A `\0`-prefixed name is a parser marker that only lowers
+                    // inside the `let` shape it belongs to; reaching here means
+                    // it was used elsewhere (e.g. `Vec::with_capacity` outside a
+                    // `let`). Report the source construct, not the marker.
+                    if let Some(rest) = name.strip_prefix('\u{0}') {
+                        let what = match rest {
+                            "vecnew" => "`Vec::with_capacity` / `Vec::new`",
+                            "vecrepeat" | "veclist" => "`vec![..]`",
+                            "argsvec" => "`std::env::args()...collect()`",
+                            "ptr" => "`as_mut_ptr` / `as_ptr`",
+                            _ => "this construct",
+                        };
+                        return format!("{what} is only supported directly in a `let` initializer");
+                    }
+                    format!("call to unknown function `{name}`")
+                })?;
                 if args.len() != sig.params.len() {
                     return Err(format!(
                         "function `{name}` expects {} argument(s), got {}",
@@ -3524,6 +3562,12 @@ fn ref_coerces(found: &Type, expected: &Type) -> bool {
         (Type::Ref(f, true), Type::Ref(e, false)) => f == e,
         (Type::Str, Type::Ref(e, false)) => **e == Type::Str,
         (Type::Ref(e, false), Type::Str) => **e == Type::Str,
+        // An integer and a reference (raw pointer) coerce both ways. rmc has no
+        // borrow checking and treats a pointer as one address, so `0`/`i64 as
+        // *const T` (a null pointer) and a pointer's address as an integer are
+        // both accepted, matching the `i64 as &T` cast extension. A shared
+        // reference never coerces to a `&mut`/`*mut` one, matching E0596.
+        (Type::I64, Type::Ref(..)) | (Type::Ref(..), Type::I64) => true,
         _ => false,
     }
 }
