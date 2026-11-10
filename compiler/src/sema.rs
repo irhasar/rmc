@@ -3025,6 +3025,12 @@ fn stmt_can_fall(s: &Stmt) -> bool {
         Stmt::Expr(e) => expr_can_fall(e),
         Stmt::Let { init: Some(e), .. } => expr_can_fall(e),
         Stmt::Assign { value, .. } => expr_can_fall(value),
+        // A `while` completes normally only when its condition does (a false
+        // condition, or a `break`). A condition that cannot complete never
+        // yields a value, so the loop never exits and cannot fall through. The
+        // same holds for a `for` whose range bounds cannot complete.
+        Stmt::While(cond, _, _) => expr_can_fall(cond),
+        Stmt::For { start, end, .. } => expr_can_fall(start) && expr_can_fall(end),
         _ => true,
     }
 }
@@ -3150,14 +3156,27 @@ fn stmt_contains_continue(s: &Stmt, label: Option<&str>, nested: bool) -> bool {
         // so a labelled `continue` there still targets our loop; check them even
         // though the nested body is excluded.
         Stmt::While(cond, body, lbl) => {
-            (lbl.as_deref() != label && expr_contains_continue(cond, label, nested))
-                || (lbl.as_deref() != label && block_contains_continue(body, label, true))
+            let outward = lbl.as_deref() != label;
+            // The condition runs before the body, so a condition that cannot
+            // complete makes the body unreachable: a `continue` in the body can
+            // never run and must not count. A `continue` in the condition itself
+            // still counts — it runs before the body does.
+            (outward && expr_contains_continue(cond, label, nested))
+                || (outward
+                    && expr_can_fall(cond)
+                    && block_contains_continue(body, label, true))
         }
         Stmt::For { start, end, body, label: lbl, .. } => {
-            let outward = lbl.as_deref() != label
+            let outward = lbl.as_deref() != label;
+            // The range bounds run before the loop, so a bound that cannot
+            // complete makes the body unreachable.
+            (outward
                 && (expr_contains_continue(start, label, nested)
-                    || expr_contains_continue(end, label, nested));
-            outward || (lbl.as_deref() != label && block_contains_continue(body, label, true))
+                    || expr_contains_continue(end, label, nested)))
+                || (outward
+                    && expr_can_fall(start)
+                    && expr_can_fall(end)
+                    && block_contains_continue(body, label, true))
         }
         Stmt::Break(..) => false,
         Stmt::Expr(e) => expr_contains_continue(e, label, nested),
