@@ -5,7 +5,7 @@ Three pipelines are measured on every axis:
 
   * ``mir``   -- ``rustc --emit=mir -O`` (fast front end) then ``rmcmir``
                  (rmc's in-process assembler/linker, no LLVM, no libc);
-  * ``ast``   -- ``rmc`` compiling its own ``.rms`` source (the original
+  * ``ast``   -- ``rmc`` compiling the same ``.rs`` source with its own AST back end (the original
                  all-in-one pipeline);
   * ``llvm``  -- ``rustc -O`` with fat LTO, one codegen unit, ``panic=abort``
                  and stripped symbols, i.e. the slowest LLVM build and the
@@ -114,7 +114,7 @@ def measure_mir_compile(name, reps=5):
 
 def measure_ast_compile(name, reps=5):
     out = os.path.join(OUT, f"{name}.ast.bin")
-    r = measure_spawned([RMC, os.path.join(ROOT, "programs", f"{name}.rms"), "-o", out], reps)
+    r = measure_spawned([RMC, os.path.join(ROOT, "rust", f"{name}.rs"), "-o", out], reps)
     r["size"] = os.path.getsize(out)
     return r
 
@@ -162,7 +162,7 @@ def axis_values(res):
 
 def check_mir_wins(rows):
     """Verify the MIR pipeline beats LLVM on every axis, and report which axes
-    the `.rms`/AST pipeline wins (for honesty). The LLVM win is the headline
+    the AST pipeline wins (for honesty). The LLVM win is the headline
     claim and must hold on every axis of every program. The AST path shares
     rmc's back end but skips rustc's front end entirely, so it is cheaper to
     *compile*; the MIR path still has to win where it can (artifact size,
@@ -256,7 +256,7 @@ def write_markdown(path, rows, note):
     lines.append("* `mir` - `rustc --emit=mir -O -Zno-codegen` then `rmcmir` (rmc's")
     lines.append("  in-process assembler/linker; no LLVM, no libc, no crates). The")
     lines.append("  front-end and back-end costs are split out below.")
-    lines.append("* `ast` - `rmc` compiling the `.rms` twin (the original all-in-one")
+    lines.append("* `ast` - `rmc` compiling `bench/rust/{name}.rs` with its own AST back end")
     lines.append("  pipeline).")
     lines.append("* `llvm` - `rustc -O` with fat LTO, one codegen unit, `panic=abort`")
     lines.append("  and stripped symbols.")
@@ -293,7 +293,7 @@ def write_markdown(path, rows, note):
     lines.append("means the MIR pipeline is better on that dimension. Every")
     lines.append("`llvm/mir` row above is above 1: the MIR pipeline beats LLVM on")
     lines.append("every axis. The `ast/mir` rows are reported for honesty - the")
-    lines.append("`.rms` path skips rustc's front end, so it is cheaper to compile,")
+    lines.append("AST path skips rustc's front end, so it is cheaper to compile,")
     lines.append("but the MIR path is the one that replaces LLVM.")
     lines.append("")
     lines.append("## Front-end and back-end cost")
