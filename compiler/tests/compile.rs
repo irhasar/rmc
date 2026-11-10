@@ -21,6 +21,13 @@ fn asm_no_tco(src: &str) -> String {
         .expect("should compile")
 }
 
+fn store_offset_after(out: &str, marker: &str) -> i32 {
+    let tail = &out[out.find(marker).expect("marker present")..];
+    let rest = &tail[tail.find("mov %rax, ").expect("a store") + "mov %rax, ".len()..];
+    let end = rest.find("(%rbp)").expect("frame store");
+    rest[..end].trim().parse().expect("offset")
+}
+
 /// The frame offset stored by the first `mov %rax, <off>(%rbp)` after `marker`.
 /// Lets a test check relative layout without hard-coding absolute offsets.
 /// The frame offset of the first `movq $imm, off(%rbp)` store. Panics when the
@@ -6317,3 +6324,63 @@ fn no_strip_conflicts_with_min_size() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+
+#[test]
+fn inlining_copies_a_parameter_whose_address_the_callee_takes() {
+    // The callee takes `&mut x` and writes through it. Inlining must give the
+    // parameter its own slot, so the `*p = 9` store must not land in the
+    // caller's slot for `y` (whose address `&y` pins to memory).
+    let out = asm("fn take_mut(mut x: i64) -> i64 { let p = &mut x; *p = 9; x } fn main() -> i64 { let y: i64 = 1; let q = &y; return take_mut(y) + *q; }");
+    let y_slot: i32 = {
+        let tail = &out[out.find("movq $1, ").expect("store of 1")..];
+        let rest = &tail["movq $1, ".len()..];
+        rest[..rest.find("(%rbp)").expect("frame store")].trim().parse().expect("offset")
+    };
+    let before_write = out.split("movq $9, (%rax)").next().expect("a write of 9");
+    let lea = before_write.rfind("lea ").expect("a lea before the write");
+    let tail = &before_write[lea + "lea ".len()..];
+    let param_slot: i32 = tail[..tail.find("(%rbp)").expect("frame address")]
+        .trim()
+        .parse()
+        .expect("an offset");
+    assert_ne!(param_slot, y_slot, "the write must target the parameter's own slot");
+}
+#[test]
+fn an_aggregate_reference_argument_does_not_use_the_direct_call_path() {
+    // `&{ s }` materialises the aggregate through %rdi/%rsi. If the call kept
+    // the earlier argument live in %rdi, the copy would clobber it, so the call
+    // must spill every argument instead of loading each straight into its
+    // argument register. The direct path would emit `mov $7, %rdi`.
+    let out = asm_no_inline("struct S { a: i64, b: i64 } fn first(n: i64, p: &S) -> i64 { n } fn main() -> i64 { let s: S = S { a: 1, b: 2 }; return first(7, &{ s }); }");
+    let call = out.find("call first").expect("a call to first");
+    let setup = &out[..call];
+    assert!(!setup.contains("mov $7, %rdi"), "the argument must not go straight into %rdi");
+    assert!(setup.contains("mov %rbx, %rdi") || setup.contains("mov %r12, %rdi"),
+        "the argument must be held in a callee-saved spill across the copy");
+}
+
+#[test]
+fn indexing_a_reference_to_an_array_uses_the_element_type() {
+    // `&[bool; 2]` must report `bool` as the element type, so `!` on the
+    // element is logical not. With the old i64 fallback the element was treated
+    // as an integer and `!` emitted a bitwise `not`.
+    let out = asm("fn main() -> i64 { let a = [true, false]; let r: &[bool; 2] = &a; let b: bool = !r[0]; return b as i64; }");
+    assert!(out.contains("sete %al"), "`!` on a bool element must be logical not");
+    assert!(!out.contains("not %rax"), "`!` on a bool element must not be a bitwise not");
+}
+
+#[test]
+fn a_constant_array_length_may_use_a_bitwise_operator() {
+    // `[i64; 1 | 2]` is a constant expression, so the length is 3. The bitwise
+    // operators were missing from the constant folder, so the length was
+    // rejected as non-constant. `asm` panics on a compile error, so reaching
+    // the assertions proves the fold succeeded.
+    let out = asm("fn main() -> i64 { let a: [i64; 1 | 2] = [10, 20, 30]; return a[2]; }");
+    assert!(out.contains("main:"), "the array must compile");
+}
+
+#[test]
+fn a_constant_array_length_may_name_a_constant() {
+    let out = asm("const N: i64 = 4; fn main() -> i64 { let a: [i64; N] = [1, 2, 3, 4]; return a[3]; }");
+    assert!(out.contains("main:"), "a named constant length must fold");
+}

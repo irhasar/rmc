@@ -225,6 +225,9 @@ pub fn const_binop(op: BinOp, a: i64, b: i64) -> Result<i64, String> {
             }
             (if op == Shl { a << b } else { a >> b }, false)
         }
+        BitAnd => (a & b, false),
+        BitOr => (a | b, false),
+        BitXor => (a ^ b, false),
         _ => return Ok(0),
     };
     if overflow {
@@ -257,6 +260,9 @@ pub fn const_binop_checked(op: BinOp, a: i64, b: i64) -> Option<i64> {
             }
             (if op == Shl { a << b } else { a >> b }, false)
         }
+        BitAnd => (a & b, false),
+        BitOr => (a | b, false),
+        BitXor => (a ^ b, false),
         _ => return None,
     };
     if overflow {
