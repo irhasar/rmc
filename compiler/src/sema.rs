@@ -614,9 +614,11 @@ impl Sema {
                 self.loop_marks.push(scope.len());
                 self.loop_repeats.push(true);
                 self.loop_reach.push(false);
+                self.loop_cont.push(false);
                 self.break_assigned.push(Self::snapshot_assigned(scope));
                 self.check_block_inner(body, scope, true)?;
                 let breaks = self.break_assigned.pop().unwrap();
+                self.loop_cont.pop();
                 self.loop_reach.pop();
                 self.loop_repeats.pop();
                 self.loop_marks.pop();
@@ -637,9 +639,11 @@ impl Sema {
                 self.loop_marks.push(scope.len());
                 self.loop_repeats.push(block_reaches_top(body));
                 self.loop_reach.push(false);
+                self.loop_cont.push(false);
                 self.break_assigned.push(Self::snapshot_assigned(scope));
                 self.check_block_inner(body, scope, true)?;
                 let breaks = self.break_assigned.pop().unwrap();
+                self.loop_cont.pop();
                 self.loop_reach.pop();
                 self.loop_repeats.pop();
                 self.loop_marks.pop();
@@ -676,9 +680,11 @@ impl Sema {
                 self.loop_marks.push(mark);
                 self.loop_repeats.push(true);
                 self.loop_reach.push(false);
+                self.loop_cont.push(false);
                 self.break_assigned.push(Self::snapshot_assigned(scope));
                 self.check_block_inner(body, scope, true)?;
                 let breaks = self.break_assigned.pop().unwrap();
+                self.loop_cont.pop();
                 self.loop_reach.pop();
                 self.loop_repeats.pop();
                 self.loop_marks.pop();
@@ -721,10 +727,13 @@ impl Sema {
                 // merge this state into the loop's break-exit state before the
                 // branch's local state is discarded.
                 if let Some(acc) = self.break_assigned.last_mut() {
-                    if acc.len() == scope.len() {
-                        for (a, b) in acc.iter_mut().zip(scope.iter()) {
-                            *a |= b.assigned;
-                        }
+                    // Only the bindings present at loop entry matter after the
+                    // loop; a break path may have declared extra locals, and
+                    // those must not stop its writes to the entry bindings
+                    // from counting.
+                    let n = acc.len().min(scope.len());
+                    for (a, b) in acc.iter_mut().zip(scope.iter()).take(n) {
+                        *a |= b.assigned;
                     }
                 }
                 Ok(())
@@ -1540,7 +1549,40 @@ fn stmt_can_fall(s: &Stmt) -> bool {
         Stmt::Expr(e) => expr_can_fall(e),
         Stmt::Let { init: Some(e), .. } => expr_can_fall(e),
         Stmt::Assign { value, .. } => expr_can_fall(value),
+        // A `loop` completes only through a `break`; one with no reachable
+        // break never falls through, so code after it is unreachable.
+        Stmt::Loop(body) => block_has_break(body),
         _ => true,
+    }
+}
+
+/// True when a `break` in `b` targets the loop `b` is the body of. A nested
+/// loop captures its own `break`s, so the walk stops at one; an `if`/block does
+/// not, so it descends.
+fn block_has_break(b: &Block) -> bool {
+    b.stmts.iter().any(stmt_has_break) || b.tail.as_deref().map_or(false, expr_has_break)
+}
+
+fn stmt_has_break(s: &Stmt) -> bool {
+    match s {
+        Stmt::Break => true,
+        // A `while`/`for`/`loop` body's `break`s belong to that loop, not the
+        // enclosing one, so the walk does not descend into it.
+        Stmt::While(..) | Stmt::For { .. } | Stmt::Loop(_) => false,
+        Stmt::Expr(e) => expr_has_break(e),
+        Stmt::Let { init: Some(e), .. } => expr_has_break(e),
+        Stmt::Assign { value, .. } => expr_has_break(value),
+        _ => false,
+    }
+}
+
+fn expr_has_break(e: &Expr) -> bool {
+    match e {
+        Expr::Block(b) => block_has_break(b),
+        Expr::If(_, t, els) => {
+            block_has_break(t) || els.as_ref().map_or(false, |b| block_has_break(b))
+        }
+        _ => false,
     }
 }
 
