@@ -1072,6 +1072,20 @@ fn a_loop_with_no_break_satisfies_any_return_type() {
 }
 
 #[test]
+fn a_break_to_an_outer_loop_does_not_make_an_inner_loop_finite() {
+    // The inner `loop` has no `break` targeting itself, so it never completes:
+    // it is `!` and satisfies any expected type, even though a `while` in its
+    // body breaks the *outer* loop from that condition. rustc accepts the `i64`
+    // initializer; the walk must not count `break 'outer` as exiting `'inner`.
+    assert!(compile_to_asm(
+        "fn main() { 'outer: loop { let x: i64 = 'inner: loop { \
+         while { break 'outer; true } {} }; } }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
 fn a_mixed_value_and_diverging_arm_keeps_the_value_type() {
     // One arm yields `i64`, the other diverges: the match is `i64`.
     let src = "enum E { A, B } \
@@ -3720,6 +3734,29 @@ fn a_labelled_break_in_a_nested_condition_repeats_the_outer_loop() {
         &CompileOptions::default(),
     )
     .is_ok());
+}
+
+#[test]
+fn a_break_to_an_outer_loop_in_an_intervening_loop_is_not_a_repeat() {
+    // The intervening inner loop never finishes: its condition breaks the
+    // *outer* `'o`, which is not a `break` of the inner loop. So `x = 1` runs
+    // once and is not a repeated write, as rustc accepts. A `break` that really
+    // targets the inner loop does repeat `'o` and stays rejected.
+    for src in [
+        "fn main() { let x: i64; 'o: loop { x = 1; loop { while { break 'o; true } {} } } }",
+        "fn main() { let x: i64; 'o: loop { x = 1; \
+         while { while { break 'o; true } {} true } {} } }",
+        "fn main() { let x: i64; 'o: loop { x = 1; \
+         for i in { while { break 'o; true } {} 0 }..1 {} } }",
+    ] {
+        assert!(compile_to_asm(src, &CompileOptions::default()).is_ok(), "got: {src}");
+    }
+    let err = compile_to_asm(
+        "fn main() { let x: i64; 'o: loop { x = 1; 'i: loop { break 'i; } } }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("cannot assign twice to immutable"), "got: {err}");
 }
 
 #[test]

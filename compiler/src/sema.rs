@@ -2729,7 +2729,7 @@ impl Sema {
                 self.loop_depth -= 1;
                 // When no `break` can leave the loop it diverges, so nothing
                 // after is reachable and the state does not matter.
-                if block_has_break(body) {
+                if block_has_break(body, label.as_deref()) {
                     for (i, b) in scope.iter_mut().enumerate() {
                         b.init = init_before.get(i).copied().unwrap_or(false)
                             || exits.iter().all(|e| e.get(i).copied().unwrap_or(false));
@@ -2757,7 +2757,7 @@ impl Sema {
                     // No `break value`: the loop is `!` when no `break` can
                     // leave it (it never finishes), otherwise `()`.
                     _ => {
-                        if block_has_break(body) {
+                        if block_has_break(body, label.as_deref()) {
                             Type::Unit
                         } else {
                             Type::Never
@@ -3660,65 +3660,113 @@ fn stmt_diverges(s: &Stmt) -> bool {
     }
 }
 
-/// True when a `break` in `b` targets the loop `b` is the body of. A nested
-/// loop captures its own `break`s, so the walk stops at one; an `if`/block does
-/// not, so it descends.
-fn block_has_break(b: &Block) -> bool {
-    b.stmts.iter().any(stmt_has_break) || b.tail.as_deref().map_or(false, expr_has_break)
+/// True when a `break` in `b` targets the loop labelled `label` (the innermost
+/// loop when `label` is `None`). A nested loop captures its own unlabelled
+/// `break`s, and a labelled `break` counts only for the loop it names, so the
+/// walk descends only where a `break` could still reach the loop being scanned.
+/// Mirrors `block_contains_continue`.
+fn block_has_break(b: &Block, label: Option<&str>) -> bool {
+    block_has_break_at(b, label, false)
 }
 
-fn stmt_has_break(s: &Stmt) -> bool {
+fn block_has_break_at(b: &Block, label: Option<&str>, nested: bool) -> bool {
+    b.stmts.iter().any(|s| stmt_has_break(s, label, nested))
+        || b.tail
+            .as_deref()
+            .map_or(false, |e| expr_has_break(e, label, nested))
+}
+
+fn stmt_has_break(s: &Stmt, label: Option<&str>, nested: bool) -> bool {
     match s {
-        Stmt::Break(..) => true,
-        // A nested loop's `break`s belong to that loop, not the enclosing one,
-        // so the walk skips its body. Its condition (and a `for`'s range bounds)
-        // run in the enclosing context, though, so a labelled `break` there
-        // still leaves the enclosing loop and must be seen.
-        Stmt::While(cond, _body, _lbl) => expr_has_break(cond),
-        Stmt::For { start, end, .. } => expr_has_break(start) || expr_has_break(end),
-        Stmt::Expr(e) => expr_has_break(e),
-        Stmt::Let { init: Some(e), .. } => expr_has_break(e),
-        Stmt::Assign { value, .. } => expr_has_break(value),
+        // An unlabelled `break` targets the innermost loop, so it leaves ours
+        // only at our own body level (`nested` false); a labelled one must name
+        // us. This keeps a `break` inside a deeper loop from counting.
+        Stmt::Break(_, bl) => match bl {
+            Some(l) => Some(l.as_str()) == label,
+            None => !nested,
+        },
+        // A nested `while`/`for` captures its own unlabelled `break`s, but a
+        // labelled one inside it can still leave our loop. Descend unless the
+        // nested loop is itself our target (its `break`s then target a loop
+        // between us and it, never us). Its condition and a `for`'s range bounds
+        // run in our context, so a labelled `break` there leaves our loop even
+        // though the nested body is excluded; gate the body on the condition
+        // completing, since a condition that cannot complete makes it
+        // unreachable.
+        Stmt::While(cond, body, lbl) => {
+            let outward = lbl.as_deref() != label;
+            (outward && expr_has_break(cond, label, nested))
+                || (outward
+                    && expr_can_fall(cond)
+                    && block_has_break_at(body, label, true))
+        }
+        Stmt::For { start, end, body, label: lbl, .. } => {
+            let outward = lbl.as_deref() != label;
+            (outward
+                && (expr_has_break(start, label, nested)
+                    || expr_has_break(end, label, nested)))
+                || (outward
+                    && expr_can_fall(start)
+                    && expr_can_fall(end)
+                    && block_has_break_at(body, label, true))
+        }
+        Stmt::Expr(e) => expr_has_break(e, label, nested),
+        Stmt::Let { init: Some(e), .. } => expr_has_break(e, label, nested),
+        Stmt::Assign { target, value } => {
+            expr_has_break(value, label, nested) || expr_has_break(target, label, nested)
+        }
         _ => false,
     }
 }
 
-fn expr_has_break(e: &Expr) -> bool {
+fn expr_has_break(e: &Expr, label: Option<&str>, nested: bool) -> bool {
     match e {
-        Expr::Block(b) => block_has_break(b),
-        Expr::MatchBoundary(b, _) => block_has_break(b),
-        // A nested `loop`/`while`/`for` captures its own `break`s, so the walk
-        // does not descend into it.
-        Expr::Loop(..) => false,
+        Expr::Block(b) => block_has_break_at(b, label, nested),
+        Expr::MatchBoundary(b, _) => block_has_break_at(b, label, nested),
+        // A nested `loop` captures its own unlabelled `break`s, but a labelled
+        // one in its body can still leave our loop; descend unless the nested
+        // loop is itself our target.
+        Expr::Loop(body, _, _, lbl) => {
+            lbl.as_deref() != label && block_has_break_at(body, label, true)
+        }
         // The condition is evaluated, so a `break` there can leave the loop the
         // expression belongs to; the walk must inspect it too, along with every
         // other evaluated child.
         Expr::If(c, t, els) => {
-            expr_has_break(c)
-                || block_has_break(t)
-                || els.as_ref().map_or(false, |b| block_has_break(b))
+            expr_has_break(c, label, nested)
+                || block_has_break_at(t, label, nested)
+                || els
+                    .as_ref()
+                    .map_or(false, |b| block_has_break_at(b, label, nested))
         }
-        Expr::Bin(_, a, b) => expr_has_break(a) || expr_has_break(b),
-        Expr::Un(_, a) => expr_has_break(a),
-        Expr::Index(a, b) => expr_has_break(a) || expr_has_break(b),
-        Expr::Field { base, .. } => expr_has_break(base),
-        Expr::Cast(a, _) => expr_has_break(a),
-        Expr::AddrOf { expr, .. } => expr_has_break(expr),
-        Expr::Deref { expr, .. } => expr_has_break(expr),
-        Expr::BoolTest { scrutinee, .. } => expr_has_break(scrutinee),
-        Expr::Call { args, .. } => args.iter().any(expr_has_break),
-        Expr::StructLit { fields, .. } => fields.iter().any(|f| expr_has_break(&f.value)),
-        Expr::ArrayLit(v, _) => expr_has_break(v),
-        Expr::ArrayList(xs) => xs.iter().any(expr_has_break),
-        Expr::TupleLit(xs) => xs.iter().any(expr_has_break),
+        Expr::Bin(_, a, b) => {
+            expr_has_break(a, label, nested) || expr_has_break(b, label, nested)
+        }
+        Expr::Un(_, a) => expr_has_break(a, label, nested),
+        Expr::Index(a, b) => {
+            expr_has_break(a, label, nested) || expr_has_break(b, label, nested)
+        }
+        Expr::Field { base, .. } => expr_has_break(base, label, nested),
+        Expr::Cast(a, _) => expr_has_break(a, label, nested),
+        Expr::AddrOf { expr, .. } => expr_has_break(expr, label, nested),
+        Expr::Deref { expr, .. } => expr_has_break(expr, label, nested),
+        Expr::BoolTest { scrutinee, .. } => expr_has_break(scrutinee, label, nested),
+        Expr::Call { args, .. } => args.iter().any(|a| expr_has_break(a, label, nested)),
+        Expr::StructLit { fields, .. } => fields
+            .iter()
+            .any(|f| expr_has_break(&f.value, label, nested)),
+        Expr::ArrayLit(v, _) => expr_has_break(v, label, nested),
+        Expr::ArrayList(xs) => xs.iter().any(|a| expr_has_break(a, label, nested)),
+        Expr::TupleLit(xs) => xs.iter().any(|a| expr_has_break(a, label, nested)),
         Expr::MethodCall { recv, args, .. } => {
-            expr_has_break(recv) || args.iter().any(expr_has_break)
+            expr_has_break(recv, label, nested)
+                || args.iter().any(|a| expr_has_break(a, label, nested))
         }
-        Expr::EnumCtor { args, .. } => args.iter().any(expr_has_break),
-        Expr::VariantTest { scrutinee, .. } => expr_has_break(scrutinee),
-        Expr::EnumPayload { recv, .. } => expr_has_break(recv),
-        Expr::PatScrutinee(inner) => expr_has_break(inner),
-        Expr::PatCheck { base, .. } => expr_has_break(base),
+        Expr::EnumCtor { args, .. } => args.iter().any(|a| expr_has_break(a, label, nested)),
+        Expr::VariantTest { scrutinee, .. } => expr_has_break(scrutinee, label, nested),
+        Expr::EnumPayload { recv, .. } => expr_has_break(recv, label, nested),
+        Expr::PatScrutinee(inner) => expr_has_break(inner, label, nested),
+        Expr::PatCheck { base, .. } => expr_has_break(base, label, nested),
         _ => false,
     }
 }
@@ -3740,7 +3788,7 @@ fn expr_diverges(e: &Expr) -> bool {
             (!*has_catch_all && Sema::match_chain_diverges(b)) || block_diverges(b)
         }
         // A `loop` diverges when no `break` can leave it.
-        Expr::Loop(body, _, _, _) => !block_has_break(body),
+        Expr::Loop(body, _, _, lbl) => !block_has_break(body, lbl.as_deref()),
         // Both arms must diverge for the `if` to diverge.
         Expr::If(_, t, els) => {
             block_diverges(t) && els.as_ref().map_or(false, |b| block_diverges(b))
@@ -3801,7 +3849,7 @@ fn expr_can_fall(e: &Expr) -> bool {
         Expr::MatchBoundary(b, _) => block_can_fall(b),
         // A `loop` completes only through a `break`; one with no reachable
         // break never falls through, so code after it is unreachable.
-        Expr::Loop(body, _, _, _) => block_has_break(body),
+        Expr::Loop(body, _, _, lbl) => block_has_break(body, lbl.as_deref()),
         Expr::If(cond, t, els) => {
             expr_can_fall(cond)
                 && (block_can_fall(t) || els.as_ref().map_or(true, |e| block_can_fall(e)))
