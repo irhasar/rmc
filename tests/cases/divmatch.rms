@@ -1,0 +1,30 @@
+// A `match` whose every arm diverges has type `!`, so it is accepted as an
+// `if`/`while` condition exactly as the equivalent `if`/`else` chain is: the
+// condition never yields a value, and the branch it guards is unreachable.
+// A non-exhaustive or partially-diverging chain is still rejected.
+enum E { A, B }
+
+fn pick(b: bool) -> i64 {
+    if match b { true => { return 1; }, false => { return 2; } } {}
+    return 0;
+}
+
+fn loop_pick(b: bool) -> i64 {
+    while match b { true => { return 3; }, false => { return 4; } } {}
+    return 0;
+}
+
+fn enum_pick(e: E) -> i64 {
+    if match e { E::A => { return 5; }, E::B => { return 6; } } {}
+    return 0;
+}
+
+fn main() -> i64 {
+    print_i64(pick(0 < 1));
+    print_i64(pick(1 < 0));
+    print_i64(loop_pick(0 < 1));
+    print_i64(loop_pick(1 < 0));
+    print_i64(enum_pick(E::A));
+    print_i64(enum_pick(E::B));
+    return 0;
+}

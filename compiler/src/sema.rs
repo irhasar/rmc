@@ -2285,10 +2285,44 @@ fn stmt_diverges(s: &Stmt) -> bool {
 fn expr_never_typed(e: &Expr) -> bool {
     match e {
         Expr::Block(b) => block_never_typed(b),
+        // A `match` desugars to a `MatchBoundary` wrapping an `if` chain. Its
+        // implicit fall-through is unreachable when the chain is exhaustive and
+        // every arm diverges (a `_` arm ends the chain with a plain diverging
+        // body; an exhaustive bool/enum chain ends with an `if` that has no
+        // `else`), so it is `!` just as the equivalent `if`/`else` chain is.
+        // `check_expr` already rejected a non-exhaustive match, so no
+        // exhaustiveness test is needed here.
+        Expr::MatchBoundary(b, _) => match_never_typed(b),
         Expr::If(_, t, els) => {
             block_never_typed(t) && els.as_ref().map_or(false, |b| block_never_typed(b))
         }
         _ => false,
+    }
+}
+
+/// True when a desugared `match` (its `MatchBoundary` block `b`) is `!`: every
+/// arm diverges and the chain cannot fall out of its end.
+fn match_never_typed(b: &Block) -> bool {
+    let mut cur = match b.tail.as_deref() {
+        Some(e) => e,
+        None => return block_diverges(b),
+    };
+    loop {
+        match cur {
+            Expr::If(_, then, els) => {
+                if !block_never_typed(then) {
+                    return false;
+                }
+                match els.as_ref().and_then(|blk| blk.tail.as_deref()) {
+                    Some(next) => cur = next,
+                    // The last arm has no `else`: the chain is exhaustive, so
+                    // nothing falls through.
+                    None => return true,
+                }
+            }
+            // A `_` arm closes the chain with a plain body.
+            other => return expr_never_typed(other),
+        }
     }
 }
 
