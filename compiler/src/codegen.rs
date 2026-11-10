@@ -3353,11 +3353,13 @@ impl Codegen {
     }
 
     /// True when evaluating `e` can clobber `%rdi`/`%rsi` without
-    /// `contains_call` noticing. The only such case is copying a whole
-    /// aggregate into a local: the copy runs through `%rdi`/`%rsi`
-    /// (`copy_words_rdi_rsi`), and a block's `let` initialiser can trigger one
-    /// without containing a call, so the direct-argument shortcut must not
-    /// select it.
+    /// `contains_call` noticing. Two cases: copying a whole aggregate into a
+    /// local, which runs through `%rdi`/`%rsi` (`copy_words_rdi_rsi`), and
+    /// `&<aggregate>` with a materialised temporary slot, which copies the
+    /// aggregate into that slot the same way. The walk recurses through every
+    /// expression form, because either can hide inside an operand (`&{ s }`,
+    /// `g(x, &{ s })`) with no call in sight, and the direct-argument shortcut
+    /// must not select such an argument.
     fn clobbers_arg_regs(e: &Expr) -> bool {
         match e {
             Expr::Block(b) | Expr::Loop(b, _, _, _) => Self::block_clobbers(b),
@@ -3366,6 +3368,28 @@ impl Codegen {
                 Self::block_clobbers(t)
                     || els.as_ref().map_or(false, |b| Self::block_clobbers(b))
             }
+            Expr::AddrOf { expr, ty, slot, .. } => {
+                (*slot >= 0 && ty.is_aggregate()) || Self::clobbers_arg_regs(expr)
+            }
+            Expr::Bin(_, a, b) => Self::clobbers_arg_regs(a) || Self::clobbers_arg_regs(b),
+            Expr::Un(_, a) | Expr::Cast(a, _) => Self::clobbers_arg_regs(a),
+            Expr::Index(a, b) => Self::clobbers_arg_regs(a) || Self::clobbers_arg_regs(b),
+            Expr::Field { base, .. } => Self::clobbers_arg_regs(base),
+            Expr::Deref { expr, .. } => Self::clobbers_arg_regs(expr),
+            Expr::Call { args, .. } => args.iter().any(Self::clobbers_arg_regs),
+            Expr::MethodCall { recv, args, .. } => {
+                Self::clobbers_arg_regs(recv) || args.iter().any(Self::clobbers_arg_regs)
+            }
+            Expr::EnumCtor { args, .. } => args.iter().any(Self::clobbers_arg_regs),
+            Expr::StructLit { fields, .. } => {
+                fields.iter().any(|f| Self::clobbers_arg_regs(&f.value))
+            }
+            Expr::ArrayLit(v, _) => Self::clobbers_arg_regs(v),
+            Expr::ArrayList(v) => v.iter().any(Self::clobbers_arg_regs),
+            Expr::VariantTest { scrutinee, .. } | Expr::BoolTest { scrutinee, .. } => {
+                Self::clobbers_arg_regs(scrutinee)
+            }
+            Expr::EnumPayload { recv, .. } => Self::clobbers_arg_regs(recv),
             _ => false,
         }
     }
