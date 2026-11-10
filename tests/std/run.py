@@ -2,7 +2,7 @@
 """Differential test suite for the MIR path with `std` available.
 
 `tests/mir/` is freestanding (`#![no_std]`, one runtime) and `tests/run.py` is
-the `.rms` path. Neither exercises `println!`: the first has no `std`, and the
+the AST path. Neither exercises `println!`: the first has no `std`, and the
 second's front end has no macro. This suite closes that gap.
 
 Each case in `tests/std/` is a plain `std` program. It is compiled two ways and

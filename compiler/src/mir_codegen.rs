@@ -179,7 +179,7 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<String, String> {
         for s in &strings {
             let label = &string_ids[s];
             // A `&str`/`&[u8]` literal is a `{len: i64, bytes..}` record, the
-            // same shape the `.rms` path uses and the one `print_str` and
+            // same shape the AST path uses and the one `print_str` and
             // `PtrMetadata` (`str::len`) read. The record's address is the
             // value, so word 0 must be the byte length, not the first byte.
             let _ = writeln!(rodata, ".balign 8");

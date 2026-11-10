@@ -12,7 +12,7 @@ Each case in `tests/mir/` is a freestanding `#![no_std]` program (it includes
 The two binaries share one runtime, one entry point and one syscall layer, so
 the only variable is the code generator. They must print identical stdout and
 exit with the same status. This is the suite that actually exercises the MIR
-path; `tests/run.py` covers the `.rms` path.
+path; `tests/run.py` covers the AST path.
 
 Usage: python3 tests/mir/run.py [-v]
 """

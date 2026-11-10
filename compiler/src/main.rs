@@ -277,7 +277,7 @@ fn run_mir_text(opts: &Options, mir: &str) -> Result<(), String> {
 
 /// Assemble and link `asm` into `opts.output`, honouring `--emit-asm`,
 /// `--binutils`, `--no-strip`, `--min-size` and `--keep-asm`. Shared by the
-/// `.rms`/AST path and the MIR path, so every input kind accepts the same
+/// AST path and the MIR path, so every input kind accepts the same
 /// output options instead of the MIR path silently ignoring them.
 fn emit_binary(opts: &Options, asm: &str) -> Result<(), String> {
     if opts.emit_asm {
