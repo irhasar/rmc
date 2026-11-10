@@ -213,9 +213,11 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         ("free", &[Type::I64], Type::Unit),
         ("arg_i64", &[Type::I64], Type::I64),
         // `std::env::args().nth(i)...unwrap_or(d)`: the i-th argument parsed as
-        // an integer, or `d` when the index is out of range. Emitted by the
-        // parser for the `args()` chain, never written in source.
-        ("__rmc_arg_or", &[Type::I64, Type::I64], Type::I64),
+        // an integer, or `d` when the index is out of range or the text is not a
+        // whole integer. The third parameter selects the `.unwrap()` behaviour
+        // (trap instead of falling back). Emitted by the parser for the `args()`
+        // chain, never written in source.
+        ("__rmc_arg_or", &[Type::I64, Type::I64, Type::I64], Type::I64),
         // The argument count, for the `for v in &args` desugar's loop bound.
         ("__rmc_nargs", &[], Type::I64),
         // `__rmc_fill(addr, count, elem)`: store `elem` at each of `count` words

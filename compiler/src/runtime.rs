@@ -69,9 +69,86 @@ _start:
     },
     Piece {
         text: r#"
+# long __rmc_arg_parse(const char *s)  -- parse a whole C string as a signed
+# decimal integer, as `str::parse::<i64>()` does. On success returns the value
+# and leaves `%rdx` zero; on failure (empty, no digits, a non-digit byte, or a
+# value outside the 64-bit range) returns zero and sets `%rdx` to one. A leading
+# `+`/`-` is allowed; the magnitude is accumulated unsigned so that the one
+# out-of-range-but-valid value, -2^63, is accepted like `str::parse`.
+.globl __rmc_arg_parse
+.type __rmc_arg_parse, @function
+__rmc_arg_parse:
+    push %rbp
+    mov %rsp, %rbp
+    xor %eax, %eax          # unsigned magnitude
+    xor %r8, %r8            # sign flag
+    xor %r9, %r9            # digits seen
+    movzbl (%rdi), %ecx
+    cmp $45, %cl            # '-'
+    jne .Lap_plus
+    mov $1, %r8
+    inc %rdi
+    jmp .Lap_body
+.Lap_plus:
+    cmp $43, %cl            # '+' is also accepted by `str::parse`
+    jne .Lap_body
+    inc %rdi
+.Lap_body:
+    movzbl (%rdi), %ecx
+    cmp $48, %cl
+    jb .Lap_end
+    cmp $57, %cl
+    ja .Lap_end
+    # Reject before the multiply when `mag * 10` would wrap, so the check does
+    # not need the unsigned high half (the assembler has no `mul`).
+    movabs $0x1999999999999999, %r11   # floor((2^64 - 1) / 10)
+    cmp %r11, %rax
+    ja .Lap_bad
+    imul $10, %rax, %rax
+    movzbl (%rdi), %ecx
+    sub $48, %rcx
+    add %rcx, %rax
+    jc .Lap_bad
+    inc %r9
+    inc %rdi
+    jmp .Lap_body
+.Lap_end:
+    # A valid integer has at least one digit and consumes the whole string; an
+    # empty string, a bare sign, or a trailing byte is a parse error.
+    cmp $0, %cl
+    jne .Lap_bad
+    test %r9, %r9
+    jz .Lap_bad
+    test %r8, %r8
+    jz .Lap_pos
+    movabs $0x8000000000000000, %r11   # -2^63 is valid
+    cmp %r11, %rax
+    ja .Lap_bad
+    neg %rax
+    jmp .Lap_ok
+.Lap_pos:
+    movabs $0x7fffffffffffffff, %r11
+    cmp %r11, %rax
+    ja .Lap_bad
+.Lap_ok:
+    xor %edx, %edx
+    leave
+    ret
+.Lap_bad:
+    xor %eax, %eax
+    mov $1, %rdx
+    leave
+    ret
+.size __rmc_arg_parse, .-__rmc_arg_parse
+"#,
+        defines: &["__rmc_arg_parse"],
+    },
+    Piece {
+        text: r#"
 # long arg_i64(long idx)  -- parse argv[idx] as a signed decimal integer.
-# Returns 0 when the index is out of range. Used by benchmarks so the input is
-# opaque to the compiler and cannot be constant-folded away.
+# Returns 0 when the index is out of range or the text is not an integer. Used
+# by benchmarks so the input is opaque to the compiler and cannot be
+# constant-folded away.
 .globl arg_i64
 .type arg_i64, @function
 arg_i64:
@@ -85,30 +162,8 @@ arg_i64:
     cmp %rcx, %rdi
     jge .Larg_zero
     mov __rmc_argv(%rip), %rdx
-    mov (%rdx,%rdi,8), %rsi
-    xor %rax, %rax
-    xor %r8, %r8
-    movzbl (%rsi), %ecx
-    cmp $45, %cl
-    jne .Larg_loop
-    mov $1, %r8
-    inc %rsi
-.Larg_loop:
-    movzbl (%rsi), %ecx
-    cmp $48, %cl
-    jl .Larg_done
-    cmp $57, %cl
-    jg .Larg_done
-    imul $10, %rax, %rax
-    sub $48, %rcx
-    add %rcx, %rax
-    inc %rsi
-    jmp .Larg_loop
-.Larg_done:
-    test %r8, %r8
-    jz .Larg_ret
-    neg %rax
-.Larg_ret:
+    mov (%rdx,%rdi,8), %rdi
+    call __rmc_arg_parse
     leave
     ret
 .Larg_zero:
@@ -121,26 +176,44 @@ arg_i64:
     },
     Piece {
         text: r#"
-# long __rmc_arg_or(long idx, long default)  -- arg_i64(idx) when idx is a
-# valid index, else `default`. Lowers the `std::env::args().nth(i)...unwrap_or(d)`
-# idiom (and its `.and_then(..).ok()` spelling) without an Option type.
+# long __rmc_arg_or(long idx, long default, long required)
+#   -- the value of argv[idx] when `idx` names a present, whole integer; else
+#      `default` when `required` is 0, or exit(101) when `required` is 1.
+# Lowers `std::env::args().nth(i)...unwrap_or(d)` (required = 0) and its
+# `.unwrap()` spelling (required = 1), and the `.and_then(|s| s.parse().ok())`
+# form, without an Option type. A present-but-non-numeric argument is a parse
+# failure, so it takes the fallback (or traps) rather than reading as zero.
 .globl __rmc_arg_or
 .type __rmc_arg_or, @function
 __rmc_arg_or:
     push %rbp
     mov %rsp, %rbp
+    # `required` lives in %r10: `__rmc_arg_parse` clobbers
+    # %rax/%rcx/%rdx/%rdi/%r8/%r9 but not %r10, and %rsi (the default) survives
+    # the call too.
+    mov %rdx, %r10
     test %rdi, %rdi
-    js .Lao_def
+    js .Lao_fail
     mov __rmc_argc(%rip), %rcx
     cmp %rcx, %rdi
-    jge .Lao_def
-    call arg_i64
+    jge .Lao_fail
+    mov __rmc_argv(%rip), %rdx
+    mov (%rdx,%rdi,8), %rdi
+    call __rmc_arg_parse
+    test %rdx, %rdx
+    jnz .Lao_fail
     leave
     ret
-.Lao_def:
+.Lao_fail:
+    test %r10, %r10
+    jnz .Lao_trap
     mov %rsi, %rax
     leave
     ret
+.Lao_trap:
+    mov $101, %rdi
+    mov $60, %rax
+    syscall
 .size __rmc_arg_or, .-__rmc_arg_or
 "#,
         defines: &["__rmc_arg_or"],

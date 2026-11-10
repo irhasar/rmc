@@ -1684,7 +1684,9 @@ impl Parser {
     fn args_or_at(&self, idx: &Expr, default: i64) -> Expr {
         Expr::Call {
             name: "__rmc_arg_or".into(),
-            args: vec![idx.clone(), Expr::Int(default)],
+            // `false`: `for v in &args` over an args-vector uses `__rmc_arg_or`'s
+            // fallback path (there is no `unwrap` here).
+            args: vec![idx.clone(), Expr::Int(default), Expr::Int(0)],
             arg_slots: Vec::new(),
             ret_slot: -1,
             ret_ty: Type::I64,
@@ -1958,9 +1960,20 @@ impl Parser {
                             }
                         }
                         // `alloc(count * 8)`; each element is one machine word.
+                        // The count expression is evaluated once: bind it to a
+                        // temporary and reuse it for both the allocation size and
+                        // the fill, or a side-effecting count (e.g. a call) would
+                        // run twice and the two uses could disagree.
+                        let count_tmp = format!("\u{0}vc{}", self.tmp);
+                        self.tmp += 1;
+                        let count_use = Expr::Var {
+                            name: count_tmp.clone(),
+                            slot: -1,
+                            ty: Type::I64,
+                        };
                         let bytes = Expr::Bin(
                             BinOp::Mul,
-                            Box::new(n_expr.clone()),
+                            Box::new(count_use.clone()),
                             Box::new(Expr::Int(8)),
                         );
                         let addr = Expr::Call {
@@ -1977,12 +1990,19 @@ impl Parser {
                             // element; it returns the address.
                             Expr::Call {
                                 name: "__rmc_fill".into(),
-                                args: vec![addr, n_expr, args[0].clone()],
+                                args: vec![addr, count_use, args[0].clone()],
                                 arg_slots: Vec::new(),
                                 ret_slot: -1,
                                 ret_ty: Type::I64,
                             }
                         };
+                        out.push(Stmt::Let {
+                            name: count_tmp,
+                            ty: Some(Type::I64),
+                            init: Some(n_expr),
+                            slot: -1,
+                            mutable: false,
+                        });
                         out.push(Stmt::Let {
                             name,
                             ty: Some(Type::I64),
@@ -2552,6 +2572,7 @@ impl Parser {
     /// `__rmc_arg_or(idx, default)`.
     fn finish_args_nth(&mut self, idx: i64) -> PResult<Expr> {
         let mut default: Option<Expr> = None;
+        let mut required = false;
         let mut done = false;
         while self.peek() == Some(&Tok::Dot) {
             self.i += 1;
@@ -2570,6 +2591,9 @@ impl Parser {
                 "unwrap" => {
                     self.expect(Tok::LParen)?;
                     self.expect(Tok::RParen)?;
+                    // `.unwrap()` is required: a missing or non-numeric argument
+                    // panics. `.unwrap().parse().unwrap()` is also required.
+                    required = true;
                     done = true;
                 }
                 "unwrap_or" => {
@@ -2598,7 +2622,7 @@ impl Parser {
                 self.pos()
             ));
         }
-        Ok(self.args_or(idx, default.unwrap_or(Expr::Int(0))))
+        Ok(self.args_or(idx, default.unwrap_or(Expr::Int(0)), required))
     }
 
     /// `.skip(k).map(|s| s.parse::<i64>().unwrap()).collect()`: the arguments
@@ -2669,15 +2693,19 @@ impl Parser {
     }
 
     /// `__rmc_arg_or(idx, default)`.
-    fn args_or(&self, idx: i64, default: Expr) -> Expr {
+    fn args_or(&self, idx: i64, default: Expr, required: bool) -> Expr {
         Expr::Call {
             name: "__rmc_arg_or".into(),
-            args: vec![Expr::Int(idx), default],
+            // `required` mirrors `unwrap()`: the runtime exits (101) when the
+            // argument is absent or not a whole integer, instead of yielding
+            // the fallback. `unwrap_or(d)` passes `false` and gets `d`.
+            args: vec![Expr::Int(idx), default, Expr::Int(required as i64)],
             arg_slots: Vec::new(),
             ret_slot: -1,
             ret_ty: Type::I64,
         }
     }
+
     /// `println!("...")` / `print!("...")`: format the literal and its `{}`
     /// arguments, then print. `println!` appends a newline. The format string
     /// must be a literal (a variable one is not supported), and a `{}` is filled
@@ -3093,7 +3121,7 @@ impl Parser {
                                 self.pos()
                             )
                         })?;
-                        e = self.args_or(k + skip, Expr::Int(0));
+                        e = self.args_or(k + skip, Expr::Int(0), false);
                         continue;
                     }
                 }
