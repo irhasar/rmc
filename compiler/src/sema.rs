@@ -1296,22 +1296,6 @@ impl Sema {
                         ))
                     }
                 };
-                // Record the initialization state this exit leaves behind, so
-                // the target loop can require every exit to initialize a binding
-                // before treating it as initialized after the loop.
-                let snap = Self::init_snapshot(scope);
-                self.loop_exits[idx].push(snap);
-                // The branch's writes are seen by the code after the loop, so
-                // merge this state into the target loop's break-exit state
-                // before the branch's local state is discarded.
-                let cur = Self::assigned_snapshot(scope);
-                if let Some(acc) = self.break_assigned.get_mut(idx) {
-                    if acc.len() == cur.len() {
-                        for (a, b) in acc.iter_mut().zip(cur.iter()) {
-                            *a |= *b;
-                        }
-                    }
-                }
                 match v {
                     Some(e) => {
                         let t = self.check_expr(e, scope)?;
@@ -1352,6 +1336,22 @@ impl Sema {
                                     "`break` with no value in a loop that yields {ty:?}"
                                 ));
                             }
+                        }
+                    }
+                }
+                // Record the initialization state this exit leaves behind, so
+                // the target loop can require every exit to initialize a binding
+                // before treating it as initialized after the loop.
+                let snap = Self::init_snapshot(scope);
+                self.loop_exits[idx].push(snap);
+                // The branch's writes are seen by the code after the loop, so
+                // merge this state into the target loop's break-exit state
+                // before the branch's local state is discarded.
+                let cur = Self::assigned_snapshot(scope);
+                if let Some(acc) = self.break_assigned.get_mut(idx) {
+                    if acc.len() == cur.len() {
+                        for (a, b) in acc.iter_mut().zip(cur.iter()) {
+                            *a |= *b;
                         }
                     }
                 }
