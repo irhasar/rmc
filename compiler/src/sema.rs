@@ -72,10 +72,11 @@ pub struct Sema {
     /// `loop` runs at least once, so it pushes nothing. The paired
     /// `loop_repeats` flag marks a `loop` whose body can reach the top again.
     loop_marks: Vec<usize>,
-    /// Per enclosing loop, whether it may run a body iteration more than once
-    /// (a `while`/`for` always may; a `loop` only when its body can reach the
-    /// top again). A `loop` that runs at most once keeps the straight-line
-    /// write rules.
+    /// Per enclosing loop, whether a write to a binding that existed before the
+    /// loop can repeat. A `while`/`for` always may; a `loop` only when its body
+    /// can reach the top again. `check_block` rewrites the top entry per
+    /// statement to "the rest of the body from here can reach the top", so a
+    /// write is a second write only when its own suffix can loop back.
     loop_repeats: Vec<bool>,
     /// Per enclosing loop, the definite-initialization state captured at each
     /// `break` that leaves it. A `loop` runs its body at least once, so a
@@ -768,11 +769,28 @@ impl Sema {
 
     fn check_block(&mut self, b: &mut Block, scope: &mut Scope) -> Result<Type, String> {
         let mark = scope.len();
-        for st in &mut b.stmts {
+        // If this block is a loop body, `loop_repeats` holds whether the whole
+        // body can reach the top. Refine it per statement so a write is judged
+        // from its own position: `x = 1; break;` is a single write even when
+        // another path in the body can `continue`.
+        let suffixes = if self.loop_repeats.last().copied().unwrap_or(false) {
+            Some(block_repeat_suffixes(b))
+        } else {
+            None
+        };
+        for (i, st) in b.stmts.iter_mut().enumerate() {
+            if let Some(sfx) = &suffixes {
+                *self.loop_repeats.last_mut().unwrap() = sfx[i];
+            }
             self.check_stmt(st, scope)?;
         }
         let ty = match &mut b.tail {
-            Some(e) => self.check_expr(e, scope)?,
+            Some(e) => {
+                if let Some(sfx) = &suffixes {
+                    *self.loop_repeats.last_mut().unwrap() = sfx[b.stmts.len()];
+                }
+                self.check_expr(e, scope)?
+            }
             None => Type::Unit,
         };
         scope.truncate(mark);
@@ -935,7 +953,7 @@ impl Sema {
                 let init_before = Self::init_snapshot(scope);
                 self.loop_depth += 1;
                 self.loop_marks.push(scope.len());
-                self.loop_repeats.push(block_repeats(body));
+                self.loop_repeats.push(block_reaches_top(body));
                 self.loop_exits.push(Vec::new());
                 self.check_block(body, scope)?;
                 let exits = self.loop_exits.pop().unwrap();
@@ -2143,75 +2161,174 @@ fn expr_diverges(e: &Expr) -> bool {
 
 /// True when a `loop` body can reach its own top again, so a write to a binding
 /// declared before the loop repeats and rustc rejects it. That happens when the
-/// body can fall through to its end (control loops back) or contains a
-/// `continue` for this loop. A body that always reaches a `break`/`return` runs
-/// at most once.
-fn block_repeats(b: &Block) -> bool {
+/// body contains a `continue` for this loop, or can fall through to its end
+/// (control loops back). A body that always reaches a `break`/`return` runs at
+/// most once.
+fn block_reaches_top(b: &Block) -> bool {
+    block_contains_continue(b, None, 0) || !block_diverges(b)
+}
+
+/// Per-statement flags for a loop body: `out[i]` is true when the part of the
+/// body from statement `i` onward (including the tail) can reach the loop's top
+/// again. `out[stmts.len()]` describes the tail. A write is a second write only
+/// when its own suffix can loop back, so `x = 1; break;` is a single write even
+/// when another path in the body can `continue`. The walk is right-to-left,
+/// tracking for each position whether the path can still reach the back edge.
+fn block_repeat_suffixes(b: &Block) -> Vec<bool> {
+    let n = b.stmts.len();
+    let mut out = vec![false; n + 1];
+    let mut reach = match &b.tail {
+        // A tail that always exits the loop (a `break`/`return` on every path)
+        // cannot reach the top.
+        Some(t) if expr_exits_loop(t) => false,
+        Some(t) => expr_contains_continue(t, None, 0) || !expr_diverges(t),
+        None => true,
+    };
+    out[n] = reach;
+    for i in (0..n).rev() {
+        reach = if stmt_exits_loop(&b.stmts[i]) {
+            false
+        } else if stmt_contains_continue(&b.stmts[i], None, 0) {
+            true
+        } else if stmt_diverges(&b.stmts[i]) {
+            false
+        } else {
+            reach
+        };
+        out[i] = reach;
+    }
+    out
+}
+
+/// True when `b` contains a `continue` that reaches the top of the loop `depth`
+/// levels out (0 = the innermost loop) with the given label. A block that merely
+/// falls through its end does not count here: only the loop body's own end loops
+/// back. `break`/`return` end the path first, so a statement after them cannot
+/// contribute.
+fn block_contains_continue(b: &Block, label: Option<&str>, depth: usize) -> bool {
     for s in &b.stmts {
-        if stmt_has_continue(s) {
+        if stmt_contains_continue(s, label, depth) {
             return true;
         }
         if stmt_diverges(s) {
             return false;
         }
     }
+    b.tail
+        .as_deref()
+        .map_or(false, |t| expr_contains_continue(t, label, depth))
+}
+
+fn stmt_contains_continue(s: &Stmt, label: Option<&str>, depth: usize) -> bool {
+    match s {
+        // A `continue` reaches the top of the loop `depth` levels out when it is
+        // unlabelled (`depth == 0`) or its label names that loop.
+        Stmt::Continue => depth == 0 && label.is_none(),
+        // A nested loop hides its own unlabelled `continue`s from the enclosing
+        // loop; a labelled `continue` inside it can still target the outer one.
+        Stmt::While(..) | Stmt::For { .. } | Stmt::Loop(_) => depth == 0 && label.is_some(),
+        Stmt::Break => false,
+        Stmt::Expr(e) => expr_contains_continue(e, label, depth),
+        // A `return` evaluates its value before leaving the function, and that
+        // value can `continue` back to the loop instead.
+        Stmt::Return(Some(e)) => expr_contains_continue(e, label, depth),
+        Stmt::Let { init: Some(e), .. } => expr_contains_continue(e, label, depth),
+        Stmt::Assign { value, .. } => expr_contains_continue(value, label, depth),
+        _ => false,
+    }
+}
+
+fn expr_contains_continue(e: &Expr, label: Option<&str>, depth: usize) -> bool {
+    match e {
+        Expr::Block(b) => block_contains_continue(b, label, depth),
+        Expr::MatchBoundary(b, _) => block_contains_continue(b, label, depth),
+        Expr::If(c, t, els) => {
+            expr_contains_continue(c, label, depth)
+                || block_contains_continue(t, label, depth)
+                || els
+                    .as_ref()
+                    .map_or(false, |b| block_contains_continue(b, label, depth))
+        }
+        Expr::Bin(_, a, b) => {
+            expr_contains_continue(a, label, depth) || expr_contains_continue(b, label, depth)
+        }
+        Expr::Un(_, a) => expr_contains_continue(a, label, depth),
+        Expr::Index(a, b) => {
+            expr_contains_continue(a, label, depth) || expr_contains_continue(b, label, depth)
+        }
+        Expr::Field { base, .. } => expr_contains_continue(base, label, depth),
+        Expr::Cast(a, _) => expr_contains_continue(a, label, depth),
+        Expr::Call { args, .. } => args.iter().any(|a| expr_contains_continue(a, label, depth)),
+        Expr::StructLit { fields, .. } => fields
+            .iter()
+            .any(|f| expr_contains_continue(&f.value, label, depth)),
+        Expr::ArrayLit(v, _) => expr_contains_continue(v, label, depth),
+        Expr::ArrayList(xs) => xs.iter().any(|a| expr_contains_continue(a, label, depth)),
+        Expr::MethodCall { recv, args, .. } => {
+            expr_contains_continue(recv, label, depth)
+                || args.iter().any(|a| expr_contains_continue(a, label, depth))
+        }
+        Expr::EnumCtor { args, .. } => args.iter().any(|a| expr_contains_continue(a, label, depth)),
+        Expr::VariantTest { scrutinee, .. } => expr_contains_continue(scrutinee, label, depth),
+        Expr::EnumPayload { recv, .. } => expr_contains_continue(recv, label, depth),
+        _ => false,
+    }
+}
+
+/// True when evaluating `e` cannot reach the top of the innermost enclosing
+/// loop: every path either `break`s out of it or `return`s from the function.
+/// This is how rustc decides that a `loop` ends without another iteration, so a
+/// write guarded by such an expression is a single write (`R2150`).
+fn expr_exits_loop(e: &Expr) -> bool {
+    match e {
+        Expr::Block(b) => block_exits_loop(b),
+        Expr::MatchBoundary(b, _) => block_exits_loop(b),
+        Expr::If(_, t, els) => {
+            block_exits_loop(t) && els.as_ref().map_or(false, |b| block_exits_loop(b))
+        }
+        Expr::Bin(_, a, b) => expr_exits_loop(a) || expr_exits_loop(b),
+        Expr::Un(_, a) => expr_exits_loop(a),
+        Expr::Index(a, b) => expr_exits_loop(a) || expr_exits_loop(b),
+        Expr::Field { base, .. } => expr_exits_loop(base),
+        Expr::Cast(a, _) => expr_exits_loop(a),
+        Expr::Call { args, .. } => args.iter().any(expr_exits_loop),
+        Expr::StructLit { fields, .. } => fields.iter().any(|f| expr_exits_loop(&f.value)),
+        Expr::ArrayLit(v, _) => expr_exits_loop(v),
+        Expr::ArrayList(xs) => xs.iter().any(expr_exits_loop),
+        Expr::MethodCall { recv, args, .. } => {
+            expr_exits_loop(recv) || args.iter().any(expr_exits_loop)
+        }
+        Expr::EnumCtor { args, .. } => args.iter().any(expr_exits_loop),
+        Expr::VariantTest { scrutinee, .. } => expr_exits_loop(scrutinee),
+        Expr::EnumPayload { recv, .. } => expr_exits_loop(recv),
+        _ => false,
+    }
+}
+
+fn block_exits_loop(b: &Block) -> bool {
     if let Some(t) = &b.tail {
-        if expr_has_continue(t) {
+        if expr_exits_loop(t) {
             return true;
         }
-        if expr_diverges(t) {
-            return false;
-        }
     }
-    true
+    b.stmts.iter().any(stmt_exits_loop)
 }
 
-/// True when a statement contains a `continue` for the enclosing `loop`. A
-/// `continue` inside a nested loop targets that loop, so those statements are
-/// transparent.
-fn stmt_has_continue(s: &Stmt) -> bool {
+fn stmt_exits_loop(s: &Stmt) -> bool {
     match s {
-        Stmt::Continue => true,
-        Stmt::While(_, _) | Stmt::For { .. } | Stmt::Loop(_) => false,
-        Stmt::Expr(e) => expr_has_continue(e),
-        Stmt::Let { init: Some(e), .. } => expr_has_continue(e),
-        Stmt::Assign { value, .. } => expr_has_continue(value),
+        // A `return` exits the function only if its value does not `continue`
+        // back to the loop first.
+        Stmt::Return(Some(e)) => !expr_contains_continue(e, None, 0),
+        Stmt::Return(None) => true,
+        Stmt::Break => true,
+        // A nested loop only leaves *itself*, not the enclosing loop.
+        Stmt::While(..) | Stmt::For { .. } | Stmt::Loop(_) => false,
+        Stmt::Expr(e) => expr_exits_loop(e),
+        Stmt::Let { init: Some(e), .. } => expr_exits_loop(e),
+        Stmt::Assign { value, .. } => expr_exits_loop(value),
         _ => false,
     }
 }
-
-fn block_has_continue(b: &Block) -> bool {
-    b.stmts.iter().any(stmt_has_continue) || b.tail.as_deref().map_or(false, expr_has_continue)
-}
-
-fn expr_has_continue(e: &Expr) -> bool {
-    match e {
-        Expr::Block(b) => block_has_continue(b),
-        Expr::MatchBoundary(b, _) => block_has_continue(b),
-        Expr::If(c, t, els) => {
-            expr_has_continue(c)
-                || block_has_continue(t)
-                || els.as_ref().map_or(false, |b| block_has_continue(b))
-        }
-        Expr::Bin(_, a, b) => expr_has_continue(a) || expr_has_continue(b),
-        Expr::Un(_, a) => expr_has_continue(a),
-        Expr::Index(a, b) => expr_has_continue(a) || expr_has_continue(b),
-        Expr::Field { base, .. } => expr_has_continue(base),
-        Expr::Cast(a, _) => expr_has_continue(a),
-        Expr::Call { args, .. } => args.iter().any(expr_has_continue),
-        Expr::StructLit { fields, .. } => fields.iter().any(|f| expr_has_continue(&f.value)),
-        Expr::ArrayLit(v, _) => expr_has_continue(v),
-        Expr::ArrayList(xs) => xs.iter().any(expr_has_continue),
-        Expr::MethodCall { recv, args, .. } => {
-            expr_has_continue(recv) || args.iter().any(expr_has_continue)
-        }
-        Expr::EnumCtor { args, .. } => args.iter().any(expr_has_continue),
-        Expr::VariantTest { scrutinee, .. } => expr_has_continue(scrutinee),
-        Expr::EnumPayload { recv, .. } => expr_has_continue(recv),
-        _ => false,
-    }
-}
-
 /// True when a `break` in `b` targets the loop `b` is the body of. A nested
 /// loop captures its own `break`s, so the walk stops at one; an `if`/block does
 /// not, so it descends.
