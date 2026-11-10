@@ -2736,6 +2736,92 @@ fn a_nested_loop_condition_break_does_not_make_the_outer_loop_breakable() {
 }
 
 #[test]
+fn a_while_condition_initialization_survives_the_loop() {
+    // The condition runs at least once even when the body never does, so a
+    // binding it initializes is initialized after the loop. Snapshotting the
+    // state only before the condition dropped that write and rejected a valid
+    // read (rmc said `use of possibly-uninitialized variable`, rustc accepts).
+    assert!(compile_to_asm(
+        "fn f() -> i64 { let mut x: i64; while { x = 7; false } {} return x; } \
+         fn main() { let _ = f(); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+    assert_eq!(
+        run_exit_code(
+            "fn f() -> i64 { let mut x: i64; while { x = 7; false } {} return x; } \
+             fn main() -> i64 { return f(); }"
+        ),
+        7,
+        "the condition's write reaches the read after the loop"
+    );
+}
+
+#[test]
+fn a_for_range_bound_break_targets_the_enclosing_loop() {
+    // A `for`'s range bounds are evaluated before its own label enters scope, so
+    // `break 'a` in a bound names the enclosing `'a` loop even when the `for`
+    // reuses the label `'a`. Treating the bound as shadowed made the break
+    // resolve to the `for` itself, so `x`'s write was not a guaranteed exit of
+    // the outer `loop` and a valid read was rejected.
+    assert!(compile_to_asm(
+        "fn f() -> i64 { let mut x: i64; 'a: loop { for i in { if true { x = 7; break 'a; } 0 }..0 {} } \
+         return x; } fn main() { let _ = f(); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+    assert_eq!(
+        run_exit_code(
+            "fn f() -> i64 { let mut x: i64 = 0; 'a: loop { for i in { x = 7; break 'a; 0 }..0 {} } \
+             return x; } fn main() -> i64 { return f(); }"
+        ),
+        7,
+        "the bound's break leaves the outer loop and its write survives"
+    );
+}
+
+#[test]
+fn a_while_condition_write_to_an_immutable_binding_is_a_second_write() {
+    // The condition is re-evaluated whenever the body completes, so a write to a
+    // plain `let` there is a second write and rustc rejects it (E0384). The body
+    // being empty still lets the loop return to the condition.
+    for src in [
+        "fn f() { let x: i64; while { x = 1; false } {} } fn main() { f(); }",
+        "fn f() { let x: i64; while { x = 1; true } {} } fn main() { f(); }",
+        "fn f() { let x: i64; while { x = 1; true } { continue; } } fn main() { f(); }",
+    ] {
+        let err = compile_to_asm(src, &CompileOptions::default()).unwrap_err();
+        assert!(err.contains("cannot assign twice to immutable variable"), "got: {err}");
+    }
+    // A loop that can never return to the condition runs it once, so the single
+    // write is allowed, as is a `mut` binding.
+    assert!(compile_to_asm(
+        "fn f() { let x: i64; while { x = 1; true } { break; } } fn main() { f(); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+    assert!(compile_to_asm(
+        "fn f() { let mut x: i64; while { x = 1; false } {} } fn main() { f(); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_both_diverge_if_does_not_uninitialize_a_live_binding() {
+    // Neither branch of `if true { return 1 } else { return 2 }` reaches the
+    // code after it, so a binding initialized before the `if` stays initialized
+    // (the read is unreachable, but rustc still accepts it). Merging the two
+    // diverging branches as `false` wrongly clobbered it and rejected the read.
+    assert!(compile_to_asm(
+        "fn f() -> i64 { let mut x: i64 = 0; if true { return 1; } else { return 2; } return x; } \
+         fn main() { let _ = f(); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
 fn an_immutable_parameter_cannot_be_assigned() {
     let err = compile_to_asm(
         "fn f(x: i64) -> i64 { x = 2; return x; } fn main() -> i64 { return f(1); }",
@@ -3345,6 +3431,28 @@ fn an_inlined_parameter_assignment_does_not_reach_the_caller() {
 fn asm_no_licm(src: &str) -> String {
     compile_to_asm(src, &CompileOptions { no_licm: true, ..Default::default() })
         .expect("should compile")
+}
+
+/// Compile `src` with the built `rmc` and run it, returning the exit status
+/// code (the value a `main() -> i64` returns). Shells out, so it only runs
+/// where the toolchain can link.
+fn run_exit_code(src: &str) -> i32 {
+    let dir = std::env::temp_dir().join(format!("rmc-run-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let srcp = dir.join("m.rs");
+    let bin = dir.join("m.bin");
+    std::fs::write(&srcp, src).unwrap();
+    let rmc = env!("CARGO_BIN_EXE_rmc");
+    let out = std::process::Command::new(rmc)
+        .arg("-o")
+        .arg(&bin)
+        .arg(&srcp)
+        .output()
+        .expect("run rmc");
+    assert!(out.status.success(), "rmc failed: {}", String::from_utf8_lossy(&out.stderr));
+    let run = std::process::Command::new(&bin).output().expect("run the binary");
+    let _ = std::fs::remove_dir_all(&dir);
+    run.status.code().unwrap_or(-1)
 }
 
 /// The instructions inside `main` only, so a hoisted value appearing before the
