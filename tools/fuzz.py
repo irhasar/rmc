@@ -3608,6 +3608,40 @@ def reject_corpus():
             "fn main() { loop { while { break; } {} } }\n",
             "fn main() { loop { while { break; } {} } }\n",
         ),
+        # A non-`bool` condition is still checked when its block has an
+        # unreachable tail (`{ return; 42 }`). rustc types such a block by its
+        # tail, so the condition is an integer, not `!` (E0308); a block is only
+        # `!` when it has no tail at all, or a `!`-typed tail.
+        "nonbool_cond_return": (
+            "fn main() -> i64 { if { return 0; 42 } {} return 0; }\n",
+            "fn main() { if { return; 42 } {} }\n",
+        ),
+        "nonbool_cond_break": (
+            "fn main() -> i64 { loop { if { break; 42 } {} } return 0; }\n",
+            "fn main() { loop { if { break; 42 } {} } }\n",
+        ),
+        "nonbool_cond_while": (
+            "fn main() -> i64 { while { return 0; 42 } {} return 0; }\n",
+            "fn main() { while { return; 42 } {} }\n",
+        ),
+        # A `break` in the index of an assignment target, or in a `for` range
+        # bound, is evaluated before the enclosing `while` starts, so it targets
+        # a loop outside the `while` (E0590).
+        "while_break_in_assign_target": (
+            "fn main() -> i64 { let mut a: [i64; 1] = [0]; loop { while { a[{ break; 0 }] = 1; true } {} } return 0; }\n",
+            "fn main() { let mut a = [0i64; 1]; loop { while { a[{ break; 0 }] = 1; true } {} } }\n",
+        ),
+        "while_break_in_for_bound": (
+            "fn main() -> i64 { loop { while { for i in { break; 0 }..1 {} true } {} } return 0; }\n",
+            "fn main() { loop { while { for i in { break; 0 }..1 {} true } {} } }\n",
+        ),
+        # A labelled `continue` in a nested `while` condition (or a `for` bound)
+        # targets the outer loop, so a write before the nested loop repeats
+        # (E0384). The reach walk must follow it out of the nested loop.
+        "assign_immutable_cond_continue_nested": (
+            "fn main() { let x: i64; 'o: loop { x = 1; while { continue 'o; true } {} break 'o; } }\n",
+            "fn main() { let x: i64; 'o: loop { x = 1; while { continue 'o; true } {} break 'o; } }\n",
+        ),
     }
 
 
