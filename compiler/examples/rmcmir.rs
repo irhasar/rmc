@@ -33,7 +33,7 @@ fn main() {
     let opts = Options { overflow_checks, promote: !no_promote };
     let timing = std::env::var_os("RMC_TIME").is_some();
     let mut t0 = std::time::Instant::now();
-    let mut mark = |label: &str, t0: &mut std::time::Instant| {
+    let mark = |label: &str, t0: &mut std::time::Instant| {
         if timing {
             eprintln!("{:>22} {:8.1} ms", label, t0.elapsed().as_secs_f64() * 1000.0);
             *t0 = std::time::Instant::now();

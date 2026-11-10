@@ -1787,10 +1787,17 @@ mod tests {
     #[test]
     fn balign_pads_an_executable_section_with_nop() {
         // A zero byte decodes as `add %al,(%rax)`; a jump into the pad would
-        // fault, so an executable section pads with the one-byte `nop`.
+        // fault, so an executable section pads with `nop`s, never zero. The
+        // pad here is one multi-byte `nop` (the form `as` uses to keep padding
+        // to one instruction); its trailing zero bytes are part of that
+        // encoding, not separate instructions.
         let mut e = test_elf(0x5);
         e.pad_to_align(0, 8);
-        assert_eq!(e.sections[0].data, [1, 2, 3, 0x90, 0x90, 0x90, 0x90, 0x90]);
+        let data = &e.sections[0].data;
+        assert_eq!(data.len(), 8, "padded to the requested alignment");
+        assert_eq!(data[..3], [1, 2, 3], "existing bytes untouched");
+        assert_eq!(&data[3..], [0x0f, 0x1f, 0x44, 0x00, 0x00], "nop pad");
+        assert_ne!(data[3], 0, "the pad does not begin with a zero byte");
     }
 
     #[test]

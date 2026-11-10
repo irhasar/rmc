@@ -41,5 +41,8 @@ fn short_term(t: &rmc::mir::Terminator) -> String {
         }
         rmc::mir::Terminator::Call { func, .. } => format!("call {func:?}"),
         rmc::mir::Terminator::Assert { negate, .. } => format!("assert negate={negate}"),
+        rmc::mir::Terminator::Drop { place, target } => {
+            format!("drop _{} -> {target}", place.local)
+        }
     }
 }

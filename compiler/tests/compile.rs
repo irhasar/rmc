@@ -112,6 +112,7 @@ fn a_constant_for_bound_folds_into_its_home() {
     assert!(!out.contains("mov $0, %rax\n\tmov %rax, %r"), "no counter bounce:\n{out}");
 }
 
+#[test]
 fn struct_fields_are_laid_out_in_order() {
     // Declaration order, no padding: `y` sits exactly one word above `x`. A
     // `&p` keeps the struct in memory so both fields are stored to the frame;
