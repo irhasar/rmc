@@ -3729,8 +3729,15 @@ fn expr_diverges(e: &Expr) -> bool {
         // A desugared `match` diverges when every arm body diverges, so the
         // whole chain is `!` even though its last step is an `if` with no
         // `else` (which `Expr::If` alone would call non-diverging).
-        Expr::MatchBoundary(b, _) => {
-            Sema::match_chain_diverges(b) || block_diverges(b)
+        //
+        // `match_chain_diverges` reads a bare `if` as the next chain step, which
+        // is only sound for a chain with no catch-all: a `_`/binding arm ends
+        // the chain, so its body — wrapped in a `Block`, but the *inner* body
+        // may itself be a bare `if` — is a body, not a step. With a catch-all
+        // the structural walk (`block_diverges`) is already exact, because the
+        // chain's implicit fall-through is the catch-all arm's own fall-through.
+        Expr::MatchBoundary(b, has_catch_all) => {
+            (!*has_catch_all && Sema::match_chain_diverges(b)) || block_diverges(b)
         }
         // A `loop` diverges when no `break` can leave it.
         Expr::Loop(body, _, _, _) => !block_has_break(body),
