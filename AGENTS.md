@@ -324,6 +324,15 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   unrolls the `%` loop twice (two `imul`/magic-division chains per iteration).
   Matching that needs an unroller, which is a larger and riskier pass than the
   current peepholes; it is left undone deliberately.
+- **`collect_structs` drops a struct layout that can reach itself through field
+  edges.** A `Ty::Struct` keeps only the last path segment of a type's name, so
+  two distinct types share one layout key (`std::...::HashMap` and
+  `hashbrown::...::HashMap` both key `HashMap`). Their field lists then point at
+  each other, which reads as a self-referential value -- impossible for a Rust
+  struct without indirection -- and every walk over the layouts (`size_of_ty`,
+  `struct_layout`, the drop glue) recursed forever and overflowed the stack on
+  the fuzzer's `hashmap` case. The cyclic layouts are now pruned; a walker that
+  misses one falls back to a scalar, as it already did for a never-seen type.
 
 - The MIR text format is rustc's *internal* dump, not a stable interface. It
   changes between rustc releases; `mir.rs::parse` is written against the shape
@@ -1304,6 +1313,15 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   accumulation into one hoisted value, so its loop does a single add per
   iteration, and it wins the ratio by more than 2x. Read the number as "two real
   loops doing the same arithmetic", not as an instruction-for-instruction tie.
+- **`bench/run_fair.py` gives the same freestanding source to both back ends, so
+  it drops the `black_box` and `refs` flips to a loss.** With nothing opaque in
+  the loop LLVM proves the body constant and closes the whole loop to `n * c`
+  (0.17 ms vs rmc's 1.7 ms); rmc's accumulator fold cannot sum a non-constant
+  addend chain, and a closed form for the `acc += const` shape is not implemented.
+  Every other program is within a few percent and `mandel`/`forloops` are rmc
+  wins, so read `refs` in this harness as "LLVM's loop closing", not as a codegen
+  gap. The twin harness (`run.py`) keeps the loop real and is the fair runtime
+  comparison for that program.
 - **`callrec` is the call-heavy case, and it used to lose.** Non-tail recursion
   (`tree(n) = 1 + tree(n-1) + tree(n-2)`) cannot be inlined by either compiler,
   so it measures raw call overhead plus argument setup, where the stack-based
