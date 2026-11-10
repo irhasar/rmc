@@ -172,7 +172,11 @@ def measure_llvm(name, runtime_obj, stub_obj, reps=5):
                  reps)
     return {
         "wall": c["wall"] + ld["wall"], "cpu": c["cpu"] + ld["cpu"],
-        "rss": c["rss"], "front_wall": c["wall"], "back_wall": ld["wall"],
+        # The peak of the *whole* pipeline, `ld` included, so the axis matches
+        # the `mir` column (which counts `rmcmir`). Counting only the compiler
+        # would credit LLVM with a link step that still allocates its own RSS.
+        "rss": max(c["rss"], ld["rss"]),
+        "front_wall": c["wall"], "back_wall": ld["wall"],
         "size": os.path.getsize(out),
     }
 

@@ -5241,6 +5241,7 @@ fn store_slot(line: &str) -> Option<&str> {
 fn optimize(body: &str) -> String {
     let mut body = peephole(body);
     body = drop_dead_jumps(&body);
+    body = drop_noop_arith(&body);
     for _ in 0..2 {
         body = fuse_imm(&body);
         body = fuse_lea(&body);
@@ -5250,8 +5251,34 @@ fn optimize(body: &str) -> String {
         body = fold_local_offsets(&body);
         body = dead_stores(&body);
         body = drop_unread_stores(&body);
+        body = drop_noop_arith(&body);
     }
     body
+}
+
+/// Drop an arithmetic instruction that cannot change its destination: `add $0`
+/// and `sub $0` leave a register untouched. A field access at offset 0 emits
+/// exactly `add $0, %rax`, and the dead instruction then blocks the
+/// store-forwarding peephole that would otherwise fold the pointer's round-trip
+/// through its frame slot. Kept only when the next instruction does not read
+/// the flags the instruction would have set.
+fn drop_noop_arith(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out = String::with_capacity(body.len());
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        let noop = t
+            .strip_prefix("add $0, ")
+            .or_else(|| t.strip_prefix("sub $0, "))
+            .map(is_reg)
+            .unwrap_or(false);
+        if noop && !flags_used_by(lines.get(i + 1).copied()) {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// Drop a `jmp` whose target is the very next label. The return path always
@@ -5818,5 +5845,17 @@ fn main() -> () {
         crate::mir::layout_blocks(&mut prog);
         let asm = compile(&prog, &Options::default()).expect("compile");
         assert!(asm.contains("main:"), "main not emitted:\n{asm}");
+    }
+
+    /// `add $0, %reg` cannot change its destination and is dropped; the same
+    /// instruction must survive when the next one reads the flags it sets.
+    #[test]
+    fn noop_arithmetic_is_dropped_but_flags_are_kept() {
+        let body = "  mov %rax, %rcx\n  add $0, %rcx\n  mov %rcx, %rdx\n";
+        let out = drop_noop_arith(body);
+        assert!(!out.contains("add $0"), "no-op add not dropped:\n{out}");
+        let flags = "  add $0, %rcx\n  jle .Lx\n";
+        let out = drop_noop_arith(flags);
+        assert!(out.contains("add $0"), "flagged add wrongly dropped:\n{out}");
     }
 }
