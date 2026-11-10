@@ -1,0 +1,2151 @@
+//! Direct x86-64 (System V, AT&T syntax) code generator.
+//!
+//! Expression results live in `%rax` and temporaries are pushed on the machine
+//! stack, so the generator needs no register allocator. Locals are different:
+//! the hottest few scalars in each function are promoted into callee-saved
+//! registers for the whole function (see `promote`), and the rest occupy an
+//! 8-byte slot at `-(slot + 1 + nregs)*8(%rbp)`, below the saved registers and
+//! growing downward from `%rbp`.
+
+use crate::ast::*;
+use std::fmt::Write as _;
+
+pub struct Codegen {
+    out: String,
+    label: u32,
+    /// Current spill depth: number of values held in spill slots.
+    sp_off: i32,
+    /// First frame slot available for spills (just past the locals).
+    spill_base: i32,
+    /// Spill slots reserved for the function being generated, sized by a dry run.
+    spill_slots: i32,
+    /// High-water mark of `sp_off` during the current pass.
+    max_spill: i32,
+    str_id: u32,
+    strings: Vec<(String, String)>, // (label, bytes)
+    loops: Vec<(String, String)>,   // (continue_label, break_label)
+    epilogue: String,
+    /// Slot -> callee-saved register for locals promoted out of memory in the
+    /// function currently being generated. Empty means every local is in memory.
+    regs: Vec<(i32, &'static str)>,
+    /// When set, every array index is checked against the array's length and an
+    /// out-of-range index traps instead of reading or writing adjacent memory.
+    bounds: bool,
+    /// When set, every `+`, `-` and `*` is followed by a jump-if-overflow to the
+    /// runtime trap. Off by default because it costs a branch per operation.
+    overflow: bool,
+    /// Frame slot holding the hidden return-buffer pointer for the function
+    /// being generated (`-1` when the return type is scalar or unit).
+    ret_slot: i32,
+    /// Return type of the function being generated, needed to route `return`.
+    ret_ty: Type,
+}
+
+/// Callee-saved registers eligible for promoting a local out of memory. They
+/// survive calls, so a promoted variable does not need to be spilled around
+/// one. `%rbp` and `%rsp` are excluded; `%rbx` is listed first because a short
+/// register name keeps the generated assembly readable.
+const ALLOC_REGS: [&str; 5] = ["%rbx", "%r12", "%r13", "%r14", "%r15"];
+
+/// A `let`-declared aggregate, recorded so promotion knows whether its
+/// initialiser writes it field by field (`by_field`) or copies the whole value.
+struct LetTarget {
+    slot: i32,
+    fields: i32,
+    by_field: bool,
+}
+
+impl Codegen {
+    pub fn new() -> Self {
+        Codegen {
+            out: String::with_capacity(1 << 16),
+            label: 0,
+            sp_off: 0,
+            spill_base: 0,
+            spill_slots: 0,
+            max_spill: 0,
+            str_id: 0,
+            strings: Vec::new(),
+            loops: Vec::new(),
+            epilogue: String::new(),
+            regs: Vec::new(),
+            bounds: false,
+            overflow: false,
+            ret_slot: -1,
+            ret_ty: Type::Unit,
+        }
+    }
+
+    /// Turn on overflow checks for `+`, `-` and `*`.
+    pub fn overflow_checks(mut self) -> Self {
+        self.overflow = true;
+        self
+    }
+
+    /// Turn on array bounds checks.
+    pub fn bounds_checks(mut self) -> Self {
+        self.bounds = true;
+        self
+    }
+
+    /// The length of the array `base`, when it can be determined. A block or
+    /// `if` base gets its length from its tail, since that expression's type is
+    /// the value's type. This must cover every base `array_elem_operand` and the
+    /// index paths handle, or the check is silently skipped.
+    fn array_len_of(base: &Expr) -> Option<usize> {
+        match base {
+            Expr::Var { ty, .. } | Expr::Field { ty, .. } => Self::array_len_ty(ty),
+            Expr::Call { ret_ty, .. } => Self::array_len_ty(ret_ty),
+            Expr::Block(b) => b.tail.as_deref().and_then(Self::array_len_of),
+            Expr::If(_, then, Some(els)) => Self::array_len_of_tail(then)
+                .or_else(|| Self::array_len_of_tail(els)),
+            _ => None,
+        }
+    }
+
+    fn array_len_ty(ty: &Type) -> Option<usize> {
+        match ty {
+            Type::Array(_, n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    fn array_len_of_tail(b: &Block) -> Option<usize> {
+        b.tail.as_deref().and_then(Self::array_len_of)
+    }
+
+    /// Emit a bounds check for `base[idx]`. For a variable index the value is
+    /// in `%rax`, and `jae` after `cmp` catches both `idx >= len` and a negative
+    /// index, which is an enormous unsigned value. A constant index is decided
+    /// here instead: in range emits nothing, out of range is an unconditional
+    /// trap.
+    fn check_bounds(&mut self, base: &Expr, idx: &Expr) {
+        if !self.bounds {
+            return;
+        }
+        let n = match Self::array_len_of(base) {
+            Some(n) => n,
+            None => return,
+        };
+        if let Expr::Int(v) = idx {
+            // A constant index is decided here: in range emits nothing, out of
+            // range is a trap. (`v as i128` avoids wrapping on a huge literal.)
+            if (*v as i128) < 0 || (*v as i128) >= n as i128 {
+                self.line("jmp __rmc_bounds");
+            }
+            return;
+        }
+        if n <= i32::MAX as usize {
+            self.line(&format!("cmp ${n}, %rax"));
+            self.line("jae __rmc_bounds");
+        }
+    }
+
+    /// The register holding local `slot`, if it was promoted out of memory.
+    fn reg_of(&self, slot: i32) -> Option<&'static str> {
+        self.regs.iter().find(|(s, _)| *s == slot).map(|(_, r)| *r)
+    }
+
+    fn line(&mut self, s: &str) {
+        self.out.push_str("\t");
+        self.out.push_str(s);
+        self.out.push('\n');
+    }
+
+    fn raw(&mut self, s: &str) {
+        self.out.push_str(s);
+        self.out.push('\n');
+    }
+
+    /// Number of callee-saved registers currently holding promoted locals.
+    fn nregs(&self) -> i32 {
+        self.regs.len() as i32
+    }
+
+    /// Byte offset of stack `slot` relative to `%rbp`. Slots grow downward, and
+    /// the saved promoted registers sit in the lowest bytes of the frame, so
+    /// every slot is shifted past them and never overlaps `%rbp` or a saved
+    /// register.
+    fn off(&self, slot: i32) -> i32 {
+        -(slot + 1 + self.nregs()) * 8
+    }
+
+    /// Address of element 0 of an `n`-element array occupying `slot..slot+n`.
+    /// Slots are laid out downward, so the lowest address is that of the last
+    /// slot; elements are then addressed upward from there as `base + i*8`.
+    fn array_off(&self, slot: i32, n: usize) -> i32 {
+        -(slot + n as i32 + self.nregs()) * 8
+    }
+
+    fn new_label(&mut self) -> String {
+        let l = format!(".L{}", self.label);
+        self.label += 1;
+        l
+    }
+
+    /// Spill `%rax` into a frame slot. A slot is used instead of `push` so that
+    /// `%rsp` never moves mid-function: a moving stack forces a 16-byte
+    /// alignment pad around every call, which costs more than the spill saves.
+    fn push_rax(&mut self) {
+        let o = self.off(self.spill_base + self.sp_off);
+        self.line(&format!("mov %rax, {o}(%rbp)"));
+        self.sp_off += 1;
+        self.max_spill = self.max_spill.max(self.sp_off);
+    }
+
+    fn pop_to(&mut self, reg: &str) {
+        self.sp_off -= 1;
+        let o = self.off(self.spill_base + self.sp_off);
+        self.line(&format!("mov {o}(%rbp), {reg}"));
+    }
+
+    pub fn compile(mut self, prog: &Program) -> String {
+        self.raw(".text");
+        for f in &prog.fns {
+            self.gen_fn(f);
+        }
+        // rodata: string literal records are `{len: i64, bytes...}`.
+        if !self.strings.is_empty() {
+            self.raw(".section .rodata");
+            let strings = std::mem::take(&mut self.strings);
+            for (label, bytes) in &strings {
+                self.raw("\t.balign 8");
+                self.raw(&format!("{label}:"));
+                let b = bytes.as_bytes();
+                self.raw(&format!("\t.quad {}", b.len()));
+                if !b.is_empty() {
+                    let mut hex = String::from("\t.byte ");
+                    for (i, ch) in b.iter().enumerate() {
+                        if i > 0 {
+                            hex.push(',');
+                        }
+                        let _ = write!(hex, "{}", ch);
+                    }
+                    self.raw(&hex);
+                }
+            }
+        }
+        self.raw(".section .note.GNU-stack,\"\",@progbits");
+        self.out
+    }
+
+    fn gen_fn(&mut self, f: &FnDef) {
+        // Promote the most-used scalar locals into callee-saved registers.
+        self.regs = Self::promote(f);
+        // Spill slots live just past the locals in the frame. Generate the body
+        // once to find the deepest spill, then regenerate with exactly that many
+        // slots; the dry run's output is discarded.
+        self.spill_base = f.nslots;
+        self.spill_slots = 0;
+        let mark = (self.out.len(), self.label, self.str_id, self.strings.len());
+        self.gen_fn_body(f);
+        let need = self.max_spill;
+        self.out.truncate(mark.0);
+        self.label = mark.1;
+        self.str_id = mark.2;
+        self.strings.truncate(mark.3);
+        self.spill_slots = need;
+        self.gen_fn_body(f);
+        self.regs.clear();
+    }
+
+    fn gen_fn_body(&mut self, f: &FnDef) {
+        self.sp_off = 0;
+        self.max_spill = 0;
+        self.epilogue = self.new_label();
+        self.ret_slot = f.ret_slot;
+        self.ret_ty = f.ret.clone();
+        let saved: Vec<&'static str> = self.regs.iter().map(|(_, r)| *r).collect();
+
+        let nregs = self.nregs();
+        self.raw(&format!(".globl {}", f.name));
+        self.raw(&format!(".type {}, @function", f.name));
+        self.raw(&format!("{}:", f.name));
+        self.line("push %rbp");
+        self.line("mov %rsp, %rbp");
+        // Save the registers used for promoted locals. The frame is padded to a
+        // multiple of 16 so that, counting these pushes, %rsp stays 16-byte
+        // aligned at every call.
+        for r in &saved {
+            self.line(&format!("push {r}"));
+        }
+        let saved_bytes = nregs as i32 * 8;
+        let slots_bytes = (f.nslots + self.spill_slots) * 8;
+        // The total depth below %rbp (saved registers plus frame) must be a
+        // multiple of 16 so %rsp is 16-byte aligned at every call.
+        let frame = ((slots_bytes + saved_bytes + 15) / 16) * 16 - saved_bytes;
+        if frame > 0 {
+            self.line(&format!("sub ${frame}, %rsp"));
+        }
+        // An aggregate return is written through a pointer the caller leaves in
+        // `%r10`; stash it in its slot before anything can clobber it.
+        if f.ret.is_aggregate() {
+            self.line(&format!("mov %r10, {}(%rbp)", self.off(f.ret_slot)));
+        }
+        // Spill incoming arguments. A scalar goes into its slot or promoted
+        // register. An aggregate arrives as a pointer and is copied into the
+        // parameter's frame buffer so the callee owns a private copy.
+        //
+        // The copy clobbers `%rsi`/`%rdi`, which are also where later arguments
+        // live, so the aggregate pointers are saved on the stack first and the
+        // copies run afterwards. Scalars are spilled up front too; that touches
+        // neither of those registers.
+        const ARG_REGS: [&str; 6] = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"];
+        for (i, (_, pty)) in f.params.iter().enumerate() {
+            if i >= 6 {
+                break;
+            }
+            let slot = f.param_slots[i];
+            if pty.is_aggregate() {
+                self.line(&format!("push {}", ARG_REGS[i]));
+            } else {
+                match self.reg_of(slot) {
+                    Some(r) => self.line(&format!("mov {}, {r}", ARG_REGS[i])),
+                    None => self.line(&format!("mov {}, {}(%rbp)", ARG_REGS[i], self.off(slot))),
+                }
+            }
+        }
+        // Pop the saved pointers in reverse and copy each argument into place.
+        for (i, (_, pty)) in f.params.iter().enumerate().rev() {
+            if i >= 6 {
+                continue;
+            }
+            if pty.is_aggregate() {
+                let n = pty.size() / 8;
+                let slot = f.param_slots[i];
+                self.line("pop %rsi");
+                self.line(&format!("lea {}(%rbp), %rdi", self.array_off(slot, n)));
+                self.copy_words_rdi_rsi(n);
+            }
+        }
+        let ty = self.gen_block(&f.body);
+        if f.ret.is_aggregate() {
+            // Implicit return of an aggregate tail expression.
+            if ty.is_aggregate() {
+                let n = f.ret.size() / 8;
+                self.gen_return_aggregate_from_rax(n);
+            }
+        } else if ty == Type::Unit {
+            self.line("xor %eax, %eax");
+        }
+        self.raw(&format!("{}:", self.epilogue));
+        // The saved registers sit just below %rbp; point %rsp at the lowest one
+        // and pop them back, which also discards the frame.
+        if nregs > 0 {
+            self.line(&format!("lea -{}(%rbp), %rsp", nregs * 8));
+            for r in saved.iter().rev() {
+                self.line(&format!("pop {r}"));
+            }
+        }
+        self.line("leave");
+        self.line("ret");
+        self.raw(&format!(".size {}, .-{}", f.name, f.name));
+    }
+
+    /// Copy `n` 8-byte words from the address in `%rsi` to the address in `%rdi`.
+    /// `%rax` and, for larger counts, `%rcx` are clobbered.
+    fn copy_words_rdi_rsi(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        // Scratch is %r8/%r9, never %rax: a caller may hold a live value in
+        // %rax across the copy (a pending operand, or an argument already
+        // loaded into a register).
+        if n <= 8 {
+            for i in 0..n {
+                self.line(&format!("mov {}(%rsi), %r8", i as i32 * 8));
+                self.line(&format!("mov %r8, {}(%rdi)", i as i32 * 8));
+            }
+        } else {
+            let l = self.new_label();
+            self.line(&format!("mov ${n}, %rcx"));
+            self.raw(&format!("{l}:"));
+            self.line("mov (%rsi), %r8");
+            self.line("mov %r8, (%rdi)");
+            self.line("add $8, %rsi");
+            self.line("add $8, %rdi");
+            self.line("dec %rcx");
+            self.line(&format!("jnz {l}"));
+        }
+    }
+
+    /// Copy the aggregate whose address is in `%rax` into the hidden return
+    /// buffer, then leave the buffer address in `%rax`.
+    fn gen_return_aggregate_from_rax(&mut self, n: usize) {
+        self.line("mov %rax, %rsi");
+        self.line(&format!("mov {}(%rbp), %rdi", self.off(self.ret_slot)));
+        self.copy_words_rdi_rsi(n);
+        self.line(&format!("mov {}(%rbp), %rax", self.off(self.ret_slot)));
+    }
+
+    /// Choose up to `ALLOC_REGS.len()` slots to keep in registers for the whole
+    /// function, ordered by how often they are mentioned.
+    ///
+    /// Scalars are counted directly. A struct's scalar fields are counted too,
+    /// so a hot `acc.sum` stays in a register, but only when the struct is
+    /// never read or written as a whole: a whole-struct copy runs through
+    /// memory, so every field of such a struct must stay in memory. A field is
+    /// named by its register only where the layout is known, so the struct's
+    /// base slot (its last field, whose address is the struct's own base) and
+    /// any aggregate field always stay in memory.
+    fn promote(f: &FnDef) -> Vec<(i32, &'static str)> {
+        let n = f.nslots as usize;
+        let mut counts = vec![0u32; n];
+        let mut mem = vec![false; n];
+        // Structs used as a whole value, recorded as (base slot, field count).
+        let mut copied: Vec<(i32, i32)> = Vec::new();
+        // `let`-declared aggregates, which are copied as a whole unless their
+        // initialiser writes them field by field.
+        let mut let_tmps: Vec<LetTarget> = Vec::new();
+        Self::count_block(&f.body, &mut counts, &mut mem, &mut copied, true, &mut let_tmps);
+
+        // An aggregate parameter is copied into its slots in the prologue, so
+        // every one of its fields must stay in memory for that copy to count.
+        for (i, (_, pty)) in f.params.iter().enumerate() {
+            if pty.is_aggregate() {
+                let base = f.param_slots[i];
+                for k in 0..(pty.size() / 8) as i32 {
+                    if let Some(m) = mem.get_mut((base + k) as usize) {
+                        *m = true;
+                    }
+                }
+            }
+        }
+
+        // A struct that is ever copied, returned or passed by value is read and
+        // written through memory, so none of its fields may be promoted.
+        for (base, fields) in &copied {
+            for k in 0..*fields {
+                if let Some(m) = mem.get_mut((base + k) as usize) {
+                    *m = true;
+                }
+            }
+        }
+
+        // A `let` whose initialiser is not field-by-field copies the whole
+        // value, so its fields must stay in memory too.
+        for t in &let_tmps {
+            if !t.by_field {
+                for k in 0..t.fields {
+                    if let Some(m) = mem.get_mut((t.slot + k) as usize) {
+                        *m = true;
+                    }
+                }
+            }
+        }
+
+        let mut ranked: Vec<(i32, u32)> = (0..f.nslots)
+            .map(|s| (s, if mem[s as usize] { 0 } else { counts[s as usize] }))
+            .collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        ranked
+            .into_iter()
+            .filter(|(_, c)| *c > 0)
+            .take(ALLOC_REGS.len())
+            .zip(ALLOC_REGS.iter())
+            .map(|((slot, _), reg)| (slot, *reg))
+            .collect()
+    }
+
+    fn count_block(
+        b: &Block,
+        counts: &mut Vec<u32>,
+        mem: &mut Vec<bool>,
+        copied: &mut Vec<(i32, i32)>,
+        whole: bool,
+        let_tmps: &mut Vec<LetTarget>,
+    ) {
+        for s in &b.stmts {
+            Self::count_stmt(s, counts, mem, copied, whole, let_tmps);
+        }
+        if let Some(t) = &b.tail {
+            Self::count_expr(t, counts, mem, copied, whole, let_tmps);
+        }
+    }
+
+    fn count_stmt(
+        s: &Stmt,
+        counts: &mut Vec<u32>,
+        mem: &mut Vec<bool>,
+        copied: &mut Vec<(i32, i32)>,
+        _whole: bool,
+        let_tmps: &mut Vec<LetTarget>,
+    ) {
+        match s {
+            Stmt::Let { ty, init, slot, .. } => {
+                if let Some(e) = init {
+                    Self::count_expr(e, counts, mem, copied, true, let_tmps);
+                }
+                // A `let` of an aggregate writes the whole value, except when
+                // the initialiser is field-by-field: a struct literal, a splat
+                // (`[v; n]`), or a zero-fill. Only then may its fields live in
+                // registers.
+                match ty {
+                    Some(Type::Struct(_, size)) => {
+                        let by_field = matches!(
+                            init,
+                            None | Some(Expr::StructLit { .. }) | Some(Expr::ArrayLit(..))
+                        );
+                        let_tmps.push(LetTarget {
+                            slot: *slot,
+                            fields: (*size / 8) as i32,
+                            by_field,
+                        });
+                    }
+                    Some(Type::Array(elem, n)) => {
+                        // A splat or zero-fill writes each element; a copy does
+                        // not, and an aggregate element is never splatted.
+                        let by_field = matches!(init, None | Some(Expr::ArrayLit(..)))
+                            && !elem.is_aggregate();
+                        let_tmps.push(LetTarget {
+                            slot: *slot,
+                            fields: *n as i32,
+                            by_field,
+                        });
+                    }
+                    // A payload enum is a tagged union copied word by word, so
+                    // its words stay in memory like a whole struct.
+                    Some(Type::EnumData(_, size)) => {
+                        let_tmps.push(LetTarget {
+                            slot: *slot,
+                            fields: (*size / 8) as i32,
+                            by_field: false,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            Stmt::Assign { target, value } => {
+                // A whole-struct target is written as a copy, so its fields
+                // must stay in memory just like a whole-struct source.
+                Self::count_expr(target, counts, mem, copied, true, let_tmps);
+                Self::count_expr(value, counts, mem, copied, true, let_tmps);
+            }
+            Stmt::Expr(e) => Self::count_expr(e, counts, mem, copied, true, let_tmps),
+            Stmt::While(c, b) => {
+                Self::count_expr(c, counts, mem, copied, true, let_tmps);
+                Self::count_block(b, counts, mem, copied, true, let_tmps);
+            }
+            Stmt::Loop(b) => Self::count_block(b, counts, mem, copied, true, let_tmps),
+            Stmt::For { start, end, body, .. } => {
+                Self::count_expr(start, counts, mem, copied, true, let_tmps);
+                Self::count_expr(end, counts, mem, copied, true, let_tmps);
+                Self::count_block(body, counts, mem, copied, true, let_tmps);
+            }
+            Stmt::Return(v) => {
+                if let Some(e) = v {
+                    Self::count_expr(e, counts, mem, copied, true, let_tmps);
+                }
+            }
+            Stmt::Break | Stmt::Continue => {}
+        }
+    }
+
+    /// `whole` is true when the value of `e` is used as a complete aggregate,
+    /// which is what makes a struct unfit for per-field promotion. A `Field` or
+    /// `Index` base is not a whole use, so it is passed `false`.
+    fn count_expr(
+        e: &Expr,
+        counts: &mut Vec<u32>,
+        mem: &mut Vec<bool>,
+        copied: &mut Vec<(i32, i32)>,
+        whole: bool,
+        let_tmps: &mut Vec<LetTarget>,
+    ) {
+        match e {
+            Expr::ArrayList(_) => unreachable!("sema rewrites ArrayList into a block"),
+            Expr::MethodCall { .. } => unreachable!("sema rewrites MethodCall into a Call"),
+            Expr::EnumVariant { .. } => {} // a tag has no subexpressions
+            Expr::EnumCtor { args, slot, size, .. } => {
+                for a in args {
+                    Self::count_expr(a, counts, mem, copied, true, let_tmps);
+                }
+                // The ctor yields its own address, so its words stay in memory.
+                for k in 0..(*size / 8) as i32 {
+                    if let Some(m) = mem.get_mut((*slot + k) as usize) {
+                        *m = true;
+                    }
+                }
+            }
+            // A tag test reads the value's first word, and a payload read
+            // offsets into it: both need the value's address, never a copy.
+            Expr::VariantTest { scrutinee, .. } => {
+                Self::count_expr(scrutinee, counts, mem, copied, false, let_tmps)
+            }
+            Expr::EnumPayload { recv, ty, .. } => {
+                Self::count_expr(recv, counts, mem, copied, false, let_tmps);
+                // A payload field of aggregate type is named by its address.
+                let _ = ty;
+            }
+            Expr::Var { slot, ty, .. } => {
+                counts[*slot as usize] += 1;
+                if ty.is_aggregate() {
+                    match ty {
+                        Type::Array(..) => {
+                            for k in 0..(ty.size() / 8) as i32 {
+                                mem[(*slot + k) as usize] = true;
+                            }
+                        }
+                        Type::Struct(_, size) | Type::EnumData(_, size) => {
+                            // The base slot is the value's last word, whose
+                            // address is the value's own base, so it must stay
+                            // addressable.
+                            mem[*slot as usize] = true;
+                            if whole {
+                                copied.push((*slot, (*size / 8) as i32));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Expr::Index(base, idx) => {
+                Self::count_expr(base, counts, mem, copied, false, let_tmps);
+                Self::count_expr(idx, counts, mem, copied, false, let_tmps);
+            }
+            Expr::Field { base, offset, ty, .. } => {
+                Self::count_expr(base, counts, mem, copied, false, let_tmps);
+                if let Expr::Var { slot, ty: Type::Struct(_, size), .. } = base.as_ref() {
+                    let fields = (*size / 8) as i32;
+                    let fslot = *slot + fields - 1 - *offset / 8;
+                    if fslot >= 0 {
+                        if ty.is_aggregate() {
+                            for k in 0..(ty.size() / 8) as i32 {
+                                mem[(fslot - k) as usize] = true;
+                            }
+                        } else {
+                            counts[fslot as usize] += 1;
+                        }
+                    }
+                }
+            }
+            Expr::StructLit { fields, slot, .. } => {
+                for fi in fields {
+                    Self::count_expr(&fi.value, counts, mem, copied, true, let_tmps);
+                }
+                // The literal yields its own address, so it is a whole use of
+                // itself: its fields stay in memory for that copy. Sema gives a
+                // literal an inferred type only as a `let` initialiser, which is
+                // already marked whole by that `let`.
+                let n = fields.len() as i32;
+                for k in 0..n {
+                    if let Some(m) = mem.get_mut((*slot + k) as usize) {
+                        *m = true;
+                    }
+                }
+            }
+            Expr::Bin(_, a, b) => {
+                Self::count_expr(a, counts, mem, copied, true, let_tmps);
+                Self::count_expr(b, counts, mem, copied, true, let_tmps);
+            }
+            Expr::Un(_, a) | Expr::Cast(a, _) => {
+                Self::count_expr(a, counts, mem, copied, true, let_tmps)
+            }
+            Expr::Call { args, .. } => {
+                for a in args {
+                    Self::count_expr(a, counts, mem, copied, true, let_tmps);
+                }
+            }
+            Expr::If(c, t, els) => {
+                Self::count_expr(c, counts, mem, copied, true, let_tmps);
+                Self::count_block(t, counts, mem, copied, true, let_tmps);
+                if let Some(e) = els {
+                    Self::count_block(e, counts, mem, copied, true, let_tmps);
+                }
+            }
+            Expr::Block(b) => Self::count_block(b, counts, mem, copied, true, let_tmps),
+            Expr::ArrayLit(v, _) => {
+                Self::count_expr(v, counts, mem, copied, true, let_tmps)
+            }
+            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) => {}
+        }
+    }
+
+    fn gen_block(&mut self, b: &Block) -> Type {
+        for st in &b.stmts {
+            self.gen_stmt(st);
+        }
+        match &b.tail {
+            Some(e) => self.gen_expr(e),
+            None => Type::Unit,
+        }
+    }
+
+    fn gen_stmt(&mut self, st: &Stmt) {
+        match st {
+            Stmt::Let { ty, init, slot, .. } => {
+                let vty = ty.clone().unwrap_or(Type::I64);
+                if let Type::Array(elem, n) = &vty {
+                    match init {
+                        // `[v; n]` splats one value across every element.
+                        Some(Expr::ArrayLit(v, _)) => {
+                            self.gen_expr(v);
+                            self.fill_aggregate(*slot, elem.size(), *n);
+                        }
+                        // Anything else yields the array's address (a list
+                        // literal desugars to a block ending in a local array),
+                        // so copy the elements into the destination.
+                        Some(e) => {
+                            self.gen_expr(e);
+                            self.copy_aggregate(*slot, *n, elem.size());
+                        }
+                        None => {
+                            self.line("xor %eax, %eax");
+                            self.fill_aggregate(*slot, elem.size(), *n);
+                        }
+                    }
+                } else if let Type::EnumData(_, size) = &vty {
+                    match init {
+                        // A ctor, a call, another enum local: all yield the
+                        // value's address, so copy its words in.
+                        Some(e) => {
+                            self.gen_expr(e);
+                            self.copy_aggregate(*slot, *size / 8, 8);
+                        }
+                        None => {
+                            self.line("xor %eax, %eax");
+                            self.fill_aggregate(*slot, 8, *size / 8);
+                        }
+                    }
+                } else if let Type::Struct(_, size) = &vty {
+                    match init {
+                        Some(Expr::StructLit { fields, .. }) => {
+                            // The field-to-slot map uses the struct's slot
+                            // count, not its field count: an array field spans
+                            // several slots, so `fields.len() != size / 8`.
+                            let base = self.array_off(*slot, size / 8);
+                            let n = (size / 8) as i32;
+                            for fi in fields {
+                                let reg = self.struct_field_reg(*slot, n, fi.offset);
+                                self.store_field_value(base + fi.offset, reg, fi);
+                            }
+                        }
+                        // No initializer: the struct is zero-filled, into the
+                        // register of each promoted field and memory otherwise.
+                        None => {
+                            let base = self.array_off(*slot, size / 8);
+                            let n = (size / 8) as i32;
+                            self.line("xor %eax, %eax");
+                            for i in 0..n {
+                                match self.reg_of(*slot + n - 1 - i) {
+                                    Some(r) => self.line(&format!("xor {r}, {r}")),
+                                    None => {
+                                        self.line(&format!("mov %rax, {}(%rbp)", base + i * 8))
+                                    }
+                                }
+                            }
+                        }
+                        // Any other initialiser yields the struct's address (a
+                        // call's hidden return buffer, or another struct local),
+                        // so copy it into the destination.
+                        Some(e) => {
+                            self.gen_expr(e);
+                            self.copy_aggregate(*slot, size / 8, 8);
+                        }
+                    }
+                } else if let Some(e) = init {
+                    // Write straight into the target: the promoted register when
+                    // there is one, else `%rax` for the frame store.
+                    match self.reg_of(*slot) {
+                        Some(r) => self.gen_expr_into_reg(e, r),
+                        None => {
+                            self.gen_expr_into_reg(e, "%rax");
+                            self.store_slot(*slot);
+                        }
+                    }
+                } else {
+                    match self.reg_of(*slot) {
+                        Some(r) => self.line(&format!("xor {r}, {r}")),
+                        None => self.line(&format!("movq $0, {}(%rbp)", self.off(*slot))),
+                    }
+                }
+            }
+            Stmt::Assign { target, value } => {
+                match target {
+                    Expr::Var { slot, ty, .. } if ty.is_aggregate() => {
+                        // Whole-aggregate assignment copies the contents, not the
+                        // source address, preserving by-value semantics.
+                        let n = ty.size() / 8;
+                        self.gen_expr(value);
+                        self.line("mov %rax, %rsi");
+                        self.line(&format!("lea {}(%rbp), %rdi", self.array_off(*slot, n)));
+                        self.copy_words_rdi_rsi(n);
+                    }
+                    Expr::Var { slot, .. } => {
+                        match self.reg_of(*slot) {
+                            Some(r) => self.gen_expr_into_reg(value, r),
+                            None => {
+                                self.gen_expr_into_reg(value, "%rax");
+                                self.store_slot(*slot);
+                            }
+                        }
+                    }
+                    Expr::Field { ty, .. } if ty.is_aggregate() => {
+                        let n = ty.size() / 8;
+                        // The destination address lives in `%rdi`, which
+                        // `gen_expr(value)` may clobber (a call, or another
+                        // aggregate copy), so stash it until the copy.
+                        self.gen_addr(target);
+                        self.push_rax();
+                        self.gen_expr(value);
+                        self.line("mov %rax, %rsi");
+                        self.pop_to("%rdi");
+                        self.copy_words_rdi_rsi(n);
+                    }
+                    Expr::Field { base, offset, .. } => {
+                        if let Some(r) = self.field_reg(base, *offset) {
+                            self.gen_expr_into_reg(value, r);
+                        } else {
+                            match self.field_operand(base, *offset) {
+                                Some(op) => {
+                                    self.gen_expr(value);
+                                    self.line(&format!("mov %rax, {op}"));
+                                }
+                                None => {
+                                    self.gen_addr(target);
+                                    self.push_rax();
+                                    self.gen_expr(value);
+                                    self.pop_to("%rcx");
+                                    self.line("mov %rax, (%rcx)");
+                                }
+                            }
+                        }
+                    }
+                    Expr::Index(base, idx)
+                        if matches!(base.as_ref(),
+                            Expr::Var { ty: Type::Array(e, _), .. } if e.is_aggregate()) =>
+                    {
+                        let elem = match base.as_ref() {
+                            Expr::Var { ty: Type::Array(e, _), .. } => (**e).clone(),
+                            _ => unreachable!(),
+                        };
+                        let n = elem.size() / 8;
+                        self.gen_addr(target);
+                        self.push_rax();
+                        self.gen_expr(value);
+                        self.line("mov %rax, %rsi");
+                        self.pop_to("%rdi");
+                        self.copy_words_rdi_rsi(n);
+                    }
+                    Expr::Index(base, idx) => {
+                        match self.array_elem_operand(base, idx) {
+                            // Constant index: one store.
+                            Some(op) if !op.contains("%rax") => {
+                                self.check_bounds(base, idx);
+                                self.gen_expr(value);
+                                self.line(&format!("mov %rax, {op}"));
+                            }
+                            // Variable index: load the index into %rax, then
+                            // store through `disp(%rbp,%rax,8)`.
+                            Some(op) => {
+                                match self.simple_operand(value) {
+                                    Some(vs) if vs.starts_with('$') => {
+                                        self.gen_expr(idx);
+                                        self.check_bounds(base, idx);
+                                        self.line(&format!("movq {vs}, {op}"));
+                                    }
+                                    Some(vs) => {
+                                        self.gen_expr(idx);
+                                        self.check_bounds(base, idx);
+                                        self.line(&format!("mov {vs}, %rcx"));
+                                        self.line(&format!("mov %rcx, {op}"));
+                                    }
+                                    None => {
+                                        self.gen_expr(value);
+                                        self.push_rax();
+                                        self.gen_expr(idx);
+                                        self.check_bounds(base, idx);
+                                        self.pop_to("%rcx");
+                                        self.line(&format!("mov %rcx, {op}"));
+                                    }
+                                }
+                            }
+                            None => {
+                                self.gen_addr(target);
+                                self.push_rax();
+                                self.gen_expr(value);
+                                self.pop_to("%rcx");
+                                self.line("mov %rax, (%rcx)");
+                            }
+                        }
+                    }
+                    _ => unreachable!("sema guarantees a valid assignment target"),
+                }
+            }
+            Stmt::Expr(e) => {
+                self.gen_expr(e);
+            }
+            Stmt::While(cond, body) => {
+                let top = self.new_label();
+                let end = self.new_label();
+                self.loops.push((top.clone(), end.clone()));
+                self.raw(&format!("{top}:"));
+                self.gen_branch_false(cond, &end);
+                self.gen_block(body);
+                self.line(&format!("jmp {top}"));
+                self.raw(&format!("{end}:"));
+                self.loops.pop();
+            }
+            Stmt::Loop(body) => {
+                let top = self.new_label();
+                let end = self.new_label();
+                self.loops.push((top.clone(), end.clone()));
+                self.raw(&format!("{top}:"));
+                self.gen_block(body);
+                self.line(&format!("jmp {top}"));
+                self.raw(&format!("{end}:"));
+                self.loops.pop();
+            }
+            Stmt::For { var_slot, start, end, end_slot, body, .. } => {
+                // Evaluate both bounds once: `var = start`, `end_slot = end`.
+                self.gen_expr(start);
+                self.store_slot(*var_slot);
+                self.gen_expr(end);
+                self.store_slot(*end_slot);
+                let top = self.new_label();
+                let cont = self.new_label();
+                let end_l = self.new_label();
+                // `continue` must still run the increment, so it targets `cont`.
+                self.loops.push((cont.clone(), end_l.clone()));
+                self.raw(&format!("{top}:"));
+                self.gen_var_operand(*var_slot, "%rax");
+                self.gen_var_operand(*end_slot, "%rcx");
+                self.line("cmp %rcx, %rax");
+                self.line(&format!("jge {end_l}"));
+                self.gen_block(body);
+                self.raw(&format!("{cont}:"));
+                self.gen_var_operand(*var_slot, "%rax");
+                self.line("add $1, %rax");
+                self.store_slot(*var_slot);
+                self.line(&format!("jmp {top}"));
+                self.raw(&format!("{end_l}:"));
+                self.loops.pop();
+            }
+            Stmt::Return(v) => {
+                match v {
+                    Some(e) => {
+                        self.gen_expr(e);
+                        if self.ret_ty.is_aggregate() {
+                            let n = self.ret_ty.size() / 8;
+                            self.gen_return_aggregate_from_rax(n);
+                        }
+                    }
+                    None => self.line("xor %eax, %eax"),
+                }
+                self.line(&format!("jmp {}", self.epilogue));
+            }
+            Stmt::Break => {
+                let end = self.loops.last().unwrap().1.clone();
+                self.line(&format!("jmp {end}"));
+            }
+            Stmt::Continue => {
+                let top = self.loops.last().unwrap().0.clone();
+                self.line(&format!("jmp {top}"));
+            }
+        }
+    }
+
+    /// Load local `slot` (memory or a promoted register) into `reg`.
+    fn gen_var_operand(&mut self, slot: i32, reg: &str) {
+        match self.reg_of(slot) {
+            Some(r) => self.line(&format!("mov {r}, {reg}")),
+            None => self.line(&format!("mov {}(%rbp), {reg}", self.off(slot))),
+        }
+    }
+
+    /// Copy `n` elements of `elem_size` bytes from the address in `%rax` into
+    /// the aggregate starting at `slot`. Used to initialise an array from a list
+    /// literal, which produces its address rather than its elements.
+    fn copy_aggregate(&mut self, slot: i32, n: usize, elem_size: usize) {
+        if n == 0 || elem_size != 8 {
+            return;
+        }
+        let base = self.array_off(slot, n);
+        if n <= 8 {
+            for i in 0..n {
+                self.line(&format!("mov {}(%rax), %rdx", i as i32 * 8));
+                self.line(&format!("mov %rdx, {}(%rbp)", base + i as i32 * 8));
+            }
+        } else {
+            let l = self.new_label();
+            self.line("mov %rax, %rsi");
+            self.line(&format!("lea {base}(%rbp), %rdi"));
+            self.line(&format!("mov ${n}, %rcx"));
+            self.raw(&format!("{l}:"));
+            self.line("mov (%rsi), %rdx");
+            self.line("mov %rdx, (%rdi)");
+            self.line("add $8, %rsi");
+            self.line("add $8, %rdi");
+            self.line("dec %rcx");
+            self.line(&format!("jnz {l}"));
+        }
+    }
+
+    /// Store `%rax` into `n` consecutive slots starting at `slot`. Used to
+    /// zero-fill or splat an array or struct that lives in the frame.
+    fn fill_aggregate(&mut self, slot: i32, elem_size: usize, n: usize) {
+        if elem_size != 8 {
+            // Only 8-byte elements are supported by sema.
+            return;
+        }
+        let base = self.array_off(slot, n);
+        if n == 0 {
+            return;
+        }
+        if n <= 8 {
+            for i in 0..n {
+                let s = slot + n as i32 - 1 - i as i32;
+                match self.reg_of(s) {
+                    Some(r) => self.line(&format!("mov %rax, {r}")),
+                    None => self.line(&format!("mov %rax, {}(%rbp)", base + i as i32 * 8)),
+                }
+            }
+        } else {
+            let l = self.new_label();
+            self.line("mov %rax, %r8");
+            self.line(&format!("mov ${n}, %rcx"));
+            self.line(&format!("lea {base}(%rbp), %rdx"));
+            self.raw(&format!("{l}:"));
+            self.line("mov %r8, (%rdx)");
+            self.line("add $8, %rdx");
+            self.line("dec %rcx");
+            self.line(&format!("jnz {l}"));
+        }
+    }
+
+    /// The frame offset of element 0 / field 0 of an aggregate local, or `None`
+    /// for a scalar. Aggregates occupy the low end of their slot range, so this
+    /// is the *lowest* address of the range and fields index upward from it.
+    fn aggregate_base(&self, slot: i32, ty: &Type) -> Option<i32> {
+        match ty {
+            Type::Array(_, n) => Some(self.array_off(slot, *n)),
+            Type::Struct(_, size) => Some(self.array_off(slot, size / 8)),
+            Type::EnumData(_, size) => Some(self.array_off(slot, size / 8)),
+            _ => None,
+        }
+    }
+
+    /// A `disp(%rbp)` operand for `base.field` when `base` is a struct local in
+    /// memory, or `None` when the base is not a plain local (the caller then
+    /// computes the address).
+    fn field_operand(&self, base: &Expr, offset: i32) -> Option<String> {
+        match base {
+            Expr::Var { slot, ty: Type::Struct(_, size), .. } => {
+                // The struct base slot is never promoted, so `%rbp` addressing
+                // is always valid; the guard only makes a promote regression
+                // fall back to memory instead of silently reading stale data.
+                if self.reg_of(*slot).is_some() {
+                    return None;
+                }
+                Some(format!("{}(%rbp)", self.array_off(*slot, size / 8) + offset))
+            }
+            _ => None,
+        }
+    }
+
+    /// The register holding scalar field `offset` of struct local `base`, or
+    /// `None` when the field stays in memory. Field 0 is the highest slot, so
+    /// field `offset / 8` lives at `base + fields - 1 - offset / 8`.
+    fn field_reg(&self, base: &Expr, offset: i32) -> Option<&'static str> {
+        match base {
+            Expr::Var { slot, ty: Type::Struct(_, size), .. } => {
+                self.struct_field_reg(*slot, (*size / 8) as i32, offset)
+            }
+            _ => None,
+        }
+    }
+
+    fn struct_field_reg(&self, slot: i32, fields: i32, offset: i32) -> Option<&'static str> {
+        self.reg_of(slot + fields - 1 - offset / 8)
+    }
+
+    /// Leaves the address of an lvalue in `%rax`.
+    fn gen_addr(&mut self, e: &Expr) {
+        match e {
+            Expr::Var { slot, ty, .. } => {
+                let off = self.aggregate_base(*slot, ty).unwrap_or_else(|| self.off(*slot));
+                self.line(&format!("lea {off}(%rbp), %rax"));
+            }
+            Expr::Index(base, idx) => {
+                match base.as_ref() {
+                    Expr::Var { slot, ty: Type::Array(_, n), .. } => {
+                        self.line(&format!("lea {}(%rbp), %rax", self.array_off(*slot, *n)));
+                    }
+                    // A non-local base yields its address as a value.
+                    _ => {
+                        self.gen_expr(base);
+                    }
+                }
+                self.push_rax();
+                self.gen_expr(idx);
+                self.check_bounds(base, idx);
+                self.pop_to("%rcx");
+                self.line("lea (%rcx,%rax,8), %rax");
+            }
+            Expr::Field { base, offset, .. } => {
+                self.gen_addr(base);
+                if *offset != 0 {
+                    self.line(&format!("add ${}, %rax", *offset));
+                }
+            }
+            // A field or index base that is not a named local is a temporary
+            // whose value *is* its address: a call's hidden return buffer, a
+            // block or `if` yielding a struct, or a struct literal. Evaluating
+            // it leaves that address in `%rax`.
+            Expr::Call { .. }
+            | Expr::Block(_)
+            | Expr::If(..)
+            | Expr::StructLit { .. }
+            | Expr::EnumCtor { .. } => {
+                self.gen_expr(e);
+            }
+            // A payload field of aggregate type is named by its address, which
+            // evaluating it yields.
+            Expr::EnumPayload { ty, .. } if ty.is_aggregate() => {
+                self.gen_expr(e);
+            }
+            _ => unreachable!("sema guarantees a valid address expression"),
+        }
+    }
+
+    fn gen_expr(&mut self, e: &Expr) -> Type {
+        match e {
+            Expr::ArrayList(_) => unreachable!("sema rewrites ArrayList into a block"),
+            Expr::MethodCall { .. } => unreachable!("sema rewrites MethodCall into a Call"),
+            Expr::EnumVariant { tag, .. } => {
+                self.line(&format!("mov ${tag}, %rax"));
+                Type::I64
+            }
+            Expr::EnumCtor { tag, args, arg_offsets, slot, size, enum_name, .. } => {
+                // Materialise the value into its frame buffer and yield that
+                // address, exactly like a struct literal: the tag word first,
+                // then each argument at its field offset after the tag.
+                let n = *size / 8;
+                let base = self.array_off(*slot, n);
+                self.line(&format!("movq ${tag}, {base}(%rbp)"));
+                // Zero the payload first so a partially-initialised variant
+                // never exposes stale frame bytes.
+                for k in 1..n {
+                    self.line(&format!("movq $0, {}(%rbp)", base + (k as i32) * 8));
+                }
+                for (i, a) in args.iter().enumerate() {
+                    let off = 8 + arg_offsets[i];
+                    // A payload field is always 8 bytes, so the store width is
+                    // fixed. An immediate or a register can be stored directly;
+                    // a memory operand (an unpromoted local, or a field) cannot,
+                    // because `mov mem, mem` is not an x86 instruction — it must
+                    // go through `%rax`.
+                    match self.simple_operand(a) {
+                        Some(op) if !op.contains('(') => {
+                            self.line(&format!("mov {op}, {}(%rbp)", base + off));
+                        }
+                        _ => {
+                        let at = self.gen_expr(a);
+                        if at.is_aggregate() {
+                            // An aggregate argument is a value named by its
+                            // address; copy its words in.
+                            let words = at.size() / 8;
+                            self.line("mov %rax, %rsi");
+                            self.line(&format!("lea {}(%rbp), %rdi", base + off));
+                            self.copy_words_rdi_rsi(words);
+                            } else {
+                                self.line(&format!("mov %rax, {}(%rbp)", base + off));
+                            }
+                        }
+                    }
+                }
+                self.line(&format!("lea {base}(%rbp), %rax"));
+                Type::EnumData(enum_name.clone(), *size)
+            }
+            Expr::VariantTest { scrutinee, tag, .. } => {
+                // Compare the value's tag word. `gen_expr` yields the address
+                // for an aggregate enum and the tag itself for a unit enum, so
+                // branch on the returned type rather than on syntax.
+                let st = self.gen_expr(scrutinee);
+                if st.is_aggregate() {
+                    self.line("mov (%rax), %rax");
+                }
+                self.line(&format!("cmp ${tag}, %rax"));
+                self.line("sete %al");
+                self.line("movzbq %al, %rax");
+                Type::Bool
+            }
+            Expr::EnumPayload { recv, offset, ty, .. } => {
+                // The receiver is a payload enum, so `gen_expr` yields its
+                // address. A payload field is at `offset` (tag word included).
+                self.gen_expr(recv);
+                if ty.is_aggregate() {
+                    if *offset != 0 {
+                        self.line(&format!("add ${}, %rax", *offset));
+                    }
+                } else if let Some(r) = self.field_reg(recv, *offset) {
+                    self.line(&format!("mov {r}, %rax"));
+                } else {
+                    self.line(&format!("mov {}(%rax), %rax", *offset));
+                }
+                ty.clone()
+            }
+            Expr::Int(v) => {
+                self.line(&format!("mov ${v}, %rax"));
+                Type::I64
+            }
+            Expr::Bool(b) => {
+                self.line(&format!("mov ${}, %rax", if *b { 1 } else { 0 }));
+                Type::Bool
+            }
+            Expr::Str(s) => {
+                let label = format!(".Lstr{}", self.str_id);
+                self.str_id += 1;
+                self.strings.push((label.clone(), s.clone()));
+                self.line(&format!("lea {label}(%rip), %rax"));
+                Type::I64
+            }
+            Expr::Var { slot, ty, .. } => {
+                match self.aggregate_base(*slot, ty) {
+                    Some(base) => self.line(&format!("lea {base}(%rbp), %rax")),
+                    None => match self.reg_of(*slot) {
+                        Some(r) => self.line(&format!("mov {r}, %rax")),
+                        None => self.line(&format!("mov {}(%rbp), %rax", self.off(*slot))),
+                    },
+                }
+                ty.clone()
+            }
+            Expr::Field { base, offset, ty, .. } => {
+                if ty.is_aggregate() {
+                    // A nested struct field is named by its address.
+                    match self.field_operand(base, *offset) {
+                        Some(op) => self.line(&format!("lea {op}, %rax")),
+                        None => self.gen_addr(e),
+                    }
+                } else if let Some(r) = self.field_reg(base, *offset) {
+                    self.line(&format!("mov {r}, %rax"));
+                } else {
+                    match self.field_operand(base, *offset) {
+                        Some(op) => self.line(&format!("mov {op}, %rax")),
+                        None => {
+                            self.gen_addr(e);
+                            self.line("mov (%rax), %rax");
+                        }
+                    }
+                }
+                ty.clone()
+            }
+            Expr::StructLit { name, fields, slot } => {
+                // Materialise the literal into its frame buffer and yield that
+                // address, which is how every aggregate value is represented.
+                // Fields are stored in source order, so initializer side effects
+                // run in the order they were written.
+                // Slot count, which exceeds the field count when a field is
+                // itself an aggregate (an array field spans several slots).
+                let n = fields
+                    .iter()
+                    .map(|fi| fi.offset / 8 + (fi.ty.size() / 8) as i32)
+                    .max()
+                    .unwrap_or(0);
+                let base = self.array_off(*slot, n as usize);
+                for fi in fields {
+                    let reg = self.struct_field_reg(*slot, n, fi.offset);
+                    self.store_field_value(base + fi.offset, reg, fi);
+                }
+                self.line(&format!("lea {base}(%rbp), %rax"));
+                Type::Struct(name.clone(), (n as usize) * 8)
+            }
+            Expr::Index(base, _idx) => {
+                let elem = match base.as_ref() {
+                    Expr::Var { ty: Type::Array(e, _), .. } => (**e).clone(),
+                    _ => Type::I64,
+                };
+                match self.array_elem_operand(base, _idx) {
+                    // `disp(%rbp,%reg,8)` addresses the element in one operand.
+                    Some(op) if op.contains("%rax") => {
+                        self.gen_expr(_idx);
+                        self.check_bounds(base, _idx);
+                        self.line(&format!("mov {op}, %rax"));
+                    }
+                    Some(op) => {
+                        self.check_bounds(base, _idx);
+                        self.line(&format!("mov {op}, %rax"));
+                    }
+                    None => {
+                        // The base is not a local array: it is a temporary whose
+                        // value *is* its address (a call's hidden return buffer,
+                        // a block, a struct field), so index off that address.
+                        match _idx.as_ref() {
+                            Expr::Int(v) if (-2_147_483_648..=2_147_483_647).contains(v) => {
+                                // Evaluate the base before checking, so a call or
+                                // block base runs its side effects (Rust evaluates
+                                // the base and index before the bounds check). The
+                                // check uses no register, so the base address
+                                // survives in `%rax` for the load.
+                                self.gen_expr(base);
+                                self.check_bounds(base, _idx);
+                                self.line(&format!("mov {}(%rax), %rax", *v as i32 * 8));
+                            }
+                            _ => {
+                                self.gen_expr(base);
+                                self.push_rax();
+                                self.gen_expr(_idx);
+                                self.check_bounds(base, _idx);
+                                self.pop_to("%rcx");
+                                self.line("mov (%rcx,%rax,8), %rax");
+                            }
+                        }
+                    }
+                }
+                elem
+            }
+            Expr::Un(op, inner) => {
+                self.gen_expr(inner);
+                match op {
+                    UnOp::Neg => {
+                        self.line("neg %rax");
+                        self.check_overflow();
+                    }
+                    UnOp::Not => {
+                        self.line("test %rax, %rax");
+                        self.line("sete %al");
+                        self.line("movzbq %al, %rax");
+                    }
+                }
+                match op {
+                    UnOp::Neg => Type::I64,
+                    UnOp::Not => Type::Bool,
+                }
+            }
+            Expr::Bin(op, a, b) => self.gen_bin(*op, a, b),
+            Expr::Call { name, args, arg_slots, ret_slot, ret_ty } => {
+                self.gen_call(name, args, arg_slots, *ret_slot, ret_ty)
+            }
+            Expr::If(cond, then, els) => {
+                let else_l = self.new_label();
+                let end_l = self.new_label();
+                self.gen_branch_false(cond, &else_l);
+                let tt = self.gen_block(then);
+                self.line(&format!("jmp {end_l}"));
+                self.raw(&format!("{else_l}:"));
+                let et = match els {
+                    Some(e) => self.gen_block(e),
+                    None => {
+                        self.line("xor %eax, %eax");
+                        Type::Unit
+                    }
+                };
+                self.raw(&format!("{end_l}:"));
+                if tt == Type::Unit { et } else { tt }
+            }
+            Expr::Block(b) => self.gen_block(b),
+            Expr::ArrayLit(v, n) => {
+                // Only meaningful as a `let` initializer; produce the value.
+                let _ = n;
+                self.gen_expr(v);
+                Type::I64
+            }
+            Expr::Cast(inner, to) => {
+                self.gen_expr(inner);
+                // Normalise a cast to `bool` to 0/1, so a non-canonical value
+                // such as `2 as bool` compares equal to `true` everywhere.
+                if *to == Type::Bool {
+                    self.line("test %rax, %rax");
+                    self.line("setne %al");
+                    self.line("movzbq %al, %rax");
+                }
+                to.clone()
+            }
+        }
+    }
+
+    /// An operand usable directly in an instruction without touching any
+    /// register: an immediate, a scalar local, or an array element with a
+    /// constant index. Anything needing a register (a variable index) returns
+    /// `None` so the caller falls back to materialising the value in `%rax`.
+    /// A local promoted to a register is returned as that register name.
+    fn simple_operand(&self, e: &Expr) -> Option<String> {
+        match e {
+            Expr::Int(v) if (-2_147_483_648..=2_147_483_647).contains(v) => Some(format!("${v}")),
+            Expr::Bool(b) => Some(format!("${}", if *b { 1 } else { 0 })),
+            Expr::Var { slot, ty, .. } => {
+                if ty.is_aggregate() {
+                    return None;
+                }
+                match self.reg_of(*slot) {
+                    Some(r) => Some(r.to_string()),
+                    None => Some(format!("{}(%rbp)", self.off(*slot))),
+                }
+            }
+            Expr::Field { base, offset, ty, .. } => {
+                if ty.is_aggregate() {
+                    None
+                } else if let Some(r) = self.field_reg(base, *offset) {
+                    Some(r.to_string())
+                } else {
+                    self.field_operand(base, *offset)
+                }
+            }
+            Expr::Index(base, idx) => {
+                // With bounds checks on, an element is never used as a bare
+                // operand: it is materialised through `gen_expr`, which emits
+                // the check.
+                if self.bounds {
+                    return None;
+                }
+                match self.array_elem_operand(base, idx) {
+                    // Only register-free operands are usable here.
+                    Some(op) if !op.contains("%rax") => Some(op),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Store `%rax` into local `slot`, honouring a register promotion.
+    /// Emit a jump to the runtime trap if the flags show signed overflow. Only
+    /// called when overflow checks are enabled.
+    fn check_overflow(&mut self) {
+        if self.overflow {
+            self.line("jo __rmc_overflow");
+        }
+    }
+
+    /// Store one struct-literal field value at `dest_off(%rbp)`. A scalar field
+    /// is a single word store; an aggregate field is copied word by word, since
+    /// the value expression yields the field's *address*, not its contents.
+    fn store_field_value(&mut self, dest_off: i32, reg: Option<&'static str>, fi: &FieldInit) {
+        self.gen_expr(&fi.value);
+        if fi.ty.is_aggregate() {
+            let n = fi.ty.size() / 8;
+            self.line("mov %rax, %rsi");
+            self.line(&format!("lea {dest_off}(%rbp), %rdi"));
+            self.copy_words_rdi_rsi(n);
+        } else if let Some(r) = reg {
+            self.line(&format!("mov %rax, {r}"));
+        } else {
+            self.line(&format!("mov %rax, {dest_off}(%rbp)"));
+        }
+    }
+
+    fn store_slot(&mut self, slot: i32) {
+        match self.reg_of(slot) {
+            Some(r) => self.line(&format!("mov %rax, {r}")),
+            None => self.line(&format!("mov %rax, {}(%rbp)", self.off(slot))),
+        }
+    }
+
+    /// Materialise `e` directly into `dst` (a register), avoiding a round trip
+    /// through `%rax` where the destination is already known. `x + k` / `x - k`
+    /// for a register `x` and a small constant becomes a single `lea`, which is
+    /// the common case in argument setup and in `let t = i - 1;`.
+    fn gen_expr_into_reg(&mut self, e: &Expr, dst: &str) {
+        // A folded `lea` cannot trap, so the strength reductions below are only
+        // sound when overflow checks are off; with them on, fall through to
+        // `gen_expr`, which emits the `jo` after each arithmetic op.
+        if !self.overflow {
+            if let Some((reg, k, c)) = self.lea_shape(e) {
+                // `reg` alone is a plain move; anything else is one `lea`.
+                if k != 1 || c != 0 {
+                    self.line(&format!("lea {}, {dst}", Self::lea_operand(&reg, k, c)));
+                    return;
+                }
+            }
+        }
+        if let Some(op) = self.simple_operand(e) {
+            if op != dst {
+                self.line(&format!("mov {op}, {dst}"));
+            }
+            return;
+        }
+        self.gen_expr(e);
+        if dst != "%rax" {
+            self.line(&format!("mov %rax, {dst}"));
+        }
+    }
+
+    /// The register holding `e` when it is a scalar local or field promoted to
+    /// a register. `lea` needs a register base/index, so memory operands and
+    /// immediates do not qualify.
+    fn reg_operand(&self, e: &Expr) -> Option<String> {
+        self.simple_operand(e).filter(|s| s.starts_with('%'))
+    }
+
+    /// Recognise `k * x + c` where `x` is register-resident and `k` is one of
+    /// the scales an `lea` can express, returning `(x, k, c)`. This folds
+    /// `2*i`, `3*i + 1`, `8*i` and friends into a single `lea`.
+    fn lea_shape(&self, e: &Expr) -> Option<(String, i64, i64)> {
+        if let Expr::Bin(op, a, b) = e {
+            match op {
+                BinOp::Add => {
+                    if let Some(c) = Self::small_imm(b) {
+                        if let Some((r, k, c0)) = self.lea_shape(a) {
+                            if Self::disp_ok(c0 + c) {
+                                return Some((r, k, c0 + c));
+                            }
+                        }
+                    }
+                    if let Some(c) = Self::small_imm(a) {
+                        if let Some((r, k, c0)) = self.lea_shape(b) {
+                            if Self::disp_ok(c0 + c) {
+                                return Some((r, k, c0 + c));
+                            }
+                        }
+                    }
+                }
+                BinOp::Sub => {
+                    if let Some(c) = Self::small_imm(b) {
+                        if let Some((r, k, c0)) = self.lea_shape(a) {
+                            if Self::disp_ok(c0 - c) {
+                                return Some((r, k, c0 - c));
+                            }
+                        }
+                    }
+                }
+                BinOp::Mul => {
+                    let (k, x) = match (Self::small_imm(a), Self::small_imm(b)) {
+                        (Some(k), None) => (k, b),
+                        (None, Some(k)) => (k, a),
+                        _ => return None,
+                    };
+                    if matches!(k, 1 | 2 | 3 | 4 | 5 | 8 | 9) {
+                        if let Some(r) = self.reg_operand(x) {
+                            return Some((r, k, 0));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.reg_operand(e).map(|r| (r, 1, 0))
+    }
+
+    /// The `lea` source operand computing `k * reg + c`, for the scales `lea`
+    /// can express: 1, 2, 3, 4, 5, 8 and 9 (as base + index*scale).
+    fn lea_operand(reg: &str, k: i64, c: i64) -> String {
+        match k {
+            1 => format!("{c}({reg})"),
+            2 => format!("{c}({reg},{reg})"),
+            3 => format!("{c}({reg},{reg},2)"),
+            4 => format!("{c}(,{reg},4)"),
+            5 => format!("{c}({reg},{reg},4)"),
+            8 => format!("{c}(,{reg},8)"),
+            9 => format!("{c}({reg},{reg},8)"),
+            _ => unreachable!("lea_shape only yields expressible scales"),
+        }
+    }
+
+    fn gen_bin(&mut self, op: BinOp, a: &Expr, b: &Expr) -> Type {
+        use BinOp::*;
+        match op {
+            And | Or => {
+                let short = self.new_label();
+                let end = self.new_label();
+                self.gen_expr(a);
+                self.line("test %rax, %rax");
+                match op {
+                    And => {
+                        self.line(&format!("jz {short}"));
+                        self.gen_expr(b);
+                        self.line("test %rax, %rax");
+                        self.line("setne %al");
+                        self.line("movzbq %al, %rax");
+                        self.line(&format!("jmp {end}"));
+                        self.raw(&format!("{short}:"));
+                        self.line("xor %eax, %eax");
+                    }
+                    Or => {
+                        self.line(&format!("jnz {short}"));
+                        self.gen_expr(b);
+                        self.line("test %rax, %rax");
+                        self.line("setne %al");
+                        self.line("movzbq %al, %rax");
+                        self.line(&format!("jmp {end}"));
+                        self.raw(&format!("{short}:"));
+                        self.line("mov $1, %rax");
+                    }
+                    _ => unreachable!(),
+                }
+                self.raw(&format!("{end}:"));
+                return Type::Bool;
+            }
+            _ => {}
+        }
+
+        // Comparisons: a direct `cmp`/`setcc` pair. When one side is a
+        // register-free operand the comparison needs no stack traffic at all.
+        if matches!(op, Eq | Ne | Lt | Le | Gt | Ge) {
+            if !self.emit_cmp(a, b) {
+                self.eval_operands(a, b);
+                self.line("cmp %rcx, %rax");
+            }
+            self.line(&format!("{} %al", setcc(op)));
+            self.line("movzbq %al, %rax");
+            return Type::Bool;
+        }
+
+        // Division/modulo by a constant becomes a multiply, an arithmetic
+        // shift and a sign fixup instead of a ~30-cycle `idiv`; by a variable
+        // there is no shortcut, since the dividend must be in `%rax` and the
+        // divisor in a register.
+        if matches!(op, Div | Mod) {
+            if self.gen_div_const(op, a, b) {
+                return Type::I64;
+            }
+            self.eval_operands(a, b);
+            self.line("cqto");
+            self.line("idiv %rcx");
+            if matches!(op, Mod) {
+                self.line("mov %rdx, %rax");
+            }
+            return Type::I64;
+        }
+
+        // Add/Sub/Mul: keep the left operand in `%rax` and the right in `%rcx`.
+        // A small constant operand folds straight into the instruction, which
+        // saves the constant load. Folding a *memory* operand into `imul`/`add`
+        // measured slower on the cores this was tuned on, so only immediates
+        // are folded.
+        let (imm, other) = match Self::small_imm(b) {
+            Some(k) => (Some(k), a),
+            // Commutative ops accept the constant on either side; subtraction
+            // and the shifts do not, because `c - x` is not `x - c` and
+            // `c << x` is not `x << c`.
+            None if matches!(op, Add | Mul | BitAnd | BitOr | BitXor) => match Self::small_imm(a) {
+                Some(k) => (Some(k), b),
+                None => (None, a),
+            },
+            None => (None, a),
+        };
+        if let Some(k) = imm {
+            self.gen_expr(other);
+            match op {
+                Add => {
+                    self.line(&format!("add ${k}, %rax"));
+                    self.check_overflow();
+                }
+                Sub => {
+                    self.line(&format!("sub ${k}, %rax"));
+                    self.check_overflow();
+                }
+                Mul => {
+                    self.line(&format!("imul ${k}, %rax, %rax"));
+                    self.check_overflow();
+                }
+                BitAnd => self.line(&format!("and ${k}, %rax")),
+                BitOr => self.line(&format!("or ${k}, %rax")),
+                BitXor => self.line(&format!("xor ${k}, %rax")),
+                // The shift count is masked to 6 bits by hardware, exactly as
+                // Rust's `<<`/`>>` on `i64`; `sal`/`sar` take the count directly.
+                Shl => self.line(&format!("sal ${}, %rax", k & 63)),
+                Shr => self.line(&format!("sar ${}, %rax", k & 63)),
+                _ => unreachable!(),
+            }
+            return Type::I64;
+        }
+
+        self.eval_operands(a, b);
+        match op {
+            Add => {
+                self.line("add %rcx, %rax");
+                self.check_overflow();
+            }
+            Sub => {
+                self.line("sub %rcx, %rax");
+                self.check_overflow();
+            }
+            Mul => {
+                self.line("imul %rcx, %rax");
+                self.check_overflow();
+            }
+            BitAnd => self.line("and %rcx, %rax"),
+            BitOr => self.line("or %rcx, %rax"),
+            BitXor => self.line("xor %rcx, %rax"),
+            // The variable shift count must be in `%cl`; `eval_operands`
+            // already leaves the right operand in `%rcx`.
+            Shl => self.line("sal %cl, %rax"),
+            Shr => self.line("sar %cl, %rax"),
+            _ => unreachable!(),
+        }
+        Type::I64
+    }
+
+    /// True when `d` fits an x86-64 `lea` displacement (a signed 32-bit value).
+    /// Each constant in a folded chain is representable on its own, but their
+    /// sum need not be, and GNU `as` rejects the out-of-range instruction.
+    fn disp_ok(d: i64) -> bool {
+        (-2_147_483_648..=2_147_483_647).contains(&d)
+    }
+
+    /// The value of `e` when it is an integer literal, negated or not, that fits
+    /// in an `imm32`.
+    fn small_imm(e: &Expr) -> Option<i64> {
+        match e {
+            Expr::Int(v) if (-2_147_483_648..=2_147_483_647).contains(v) => Some(*v),
+            Expr::Un(UnOp::Neg, inner) => match inner.as_ref() {
+                Expr::Int(v) => v
+                    .checked_neg()
+                    .filter(|n| (-2_147_483_648..=2_147_483_647).contains(n)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Emit `a / d` or `a % d` for a literal divisor `d` using a multiply and a
+    /// shift instead of `idiv`. Returns `false` for a variable divisor, a zero
+    /// divisor, or a non-`i64` literal, so the caller falls back to `idiv`.
+    ///
+    /// `D` stays in `%rax` until the quotient or remainder is known; `%rdx` and
+    /// `%r8` are scratch.
+    fn gen_div_const(&mut self, op: BinOp, a: &Expr, b: &Expr) -> bool {
+        let d = match Self::small_imm(b) {
+            Some(v) if v != 0 => v,
+            _ => return false,
+        };
+        self.gen_expr(a);
+        self.line("mov %rax, %r8");
+        if d == 1 {
+            // The dividend is already in %rax.
+        } else if d == -1 {
+            self.line("neg %rax");
+        } else {
+            let mag = d.unsigned_abs();
+            if mag.is_power_of_two() {
+                // `d` is ±2^k. Arithmetic shift rounds toward -inf, so a
+                // negative dividend needs a bias of 2^k-1 to round toward zero:
+                // `%rdx` is 0 or -1 from the sign, then masked to 0 or 2^k-1.
+                let k = mag.trailing_zeros();
+                self.line("mov %rax, %rdx");
+                self.line("sar $63, %rdx");
+                self.line(&format!("shr ${}, %rdx", 64 - k));
+                self.line("add %rdx, %rax");
+                self.line(&format!("sar ${k}, %rax"));
+                if d < 0 {
+                    self.line("neg %rax");
+                }
+            } else {
+                let (m, s, add) = Self::sdiv_magic(mag);
+                self.line(&format!("movabs ${m}, %rcx"));
+                self.line("imul %rcx");
+                if add {
+                    // `imul` clobbers %rax with the low product, so the
+                    // dividend comes from the %r8 copy, not from %rax.
+                    self.line("add %r8, %rdx");
+                }
+                if s > 0 {
+                    self.line(&format!("sar ${s}, %rdx"));
+                }
+                self.line("mov %r8, %rcx");
+                self.line("shr $63, %rcx");
+                self.line("add %rcx, %rdx");
+                if d < 0 {
+                    self.line("neg %rdx");
+                }
+                self.line("mov %rdx, %rax");
+            }
+        }
+        if matches!(op, BinOp::Mod) {
+            self.line("mov %rax, %rdx");
+            self.line(&format!("movabs ${d}, %rcx"));
+            self.line("imul %rcx, %rdx");
+            self.line("sub %rdx, %r8");
+            self.line("mov %r8, %rax");
+        }
+        true
+    }
+
+    /// Magic multiplier and shift for signed division by `d > 1`, from Hacker's
+    /// Delight via LLVM's `SignedDivisionByConstantInfo`. For a dividend `x`:
+    ///
+    /// ```text
+    /// t = high64(signed(m) * x);  if add { t += x }  t >>= s
+    /// q = t + (x >> 63)
+    /// ```
+    ///
+    /// `add` is needed for roughly a quarter of divisors.
+    fn sdiv_magic(d: u64) -> (i64, u32, bool) {
+        const N: u32 = 64;
+        let smin: u128 = 1u128 << (N - 1);
+        let ad = d as u128;
+        // NC is the largest dividend whose remainder modulo `d` is `d - 1`.
+        let anc = smin - 1 - (smin % ad);
+        let (mut q1, mut r1) = (smin / anc, smin % anc);
+        let (mut q2, mut r2) = (smin / ad, smin % ad);
+        let mut p = N - 1;
+        loop {
+            p += 1;
+            q1 <<= 1;
+            r1 <<= 1;
+            if r1 >= anc {
+                q1 += 1;
+                r1 -= anc;
+            }
+            q2 <<= 1;
+            r2 <<= 1;
+            if r2 >= ad {
+                q2 += 1;
+                r2 -= ad;
+            }
+            let delta = ad - r2;
+            if !(q1 < delta || (q1 == delta && r1 == 0)) {
+                break;
+            }
+        }
+        let m = q2 + 1;
+        let add = m > i64::MAX as u128;
+        (m as i64, p - N, add)
+    }
+
+    /// An operand `disp(%rbp,%rax,8)` for `base[idx]` where `base` is a local
+    /// array. The caller must have the index value in `%rax`. Returns `None`
+    /// for anything else, so the caller falls back to computing the address.
+    fn array_elem_operand(&self, base: &Expr, idx: &Expr) -> Option<String> {
+        let (slot, n) = match base {
+            Expr::Var { slot, ty: Type::Array(_, n), .. } => (*slot, *n),
+            _ => return None,
+        };
+        match idx {
+            Expr::Int(v) if (-2_147_483_648..=2_147_483_647).contains(v) => {
+                // Constant index: no register needed at all.
+                Some(format!("{}(%rbp)", self.array_off(slot, n) + *v as i32 * 8))
+            }
+            Expr::Var { slot: _, ty: Type::I64, .. } => {
+                // The index lives in a slot; the caller must load it into %rax
+                // and bake the array base offset into the displacement.
+                Some(format!("{}(%rbp,%rax,8)", self.array_off(slot, n)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Emit a `cmp` that leaves the flags for `a - b`, i.e. the flags for
+    /// `a op b`. Returns false when neither operand can be named without a
+    /// register, so the caller can fall back to the general path. x86 rejects
+    /// memory-vs-memory and immediate-vs-immediate, and needs an explicit `q`
+    /// suffix when an immediate is compared against memory.
+    fn emit_cmp(&mut self, a: &Expr, b: &Expr) -> bool {
+        let av = self.simple_operand(a);
+        let bv = self.simple_operand(b);
+        match (av, bv) {
+            (Some(x), Some(y)) => {
+                match (x.starts_with('$'), y.starts_with('$')) {
+                    // Two immediates: materialise one so they can be compared.
+                    (true, true) => {
+                        self.line(&format!("mov {x}, %rax"));
+                        self.line(&format!("cmp {y}, %rax"));
+                    }
+                    // `a` is an immediate and `b` in memory. x86 cannot compare
+                    // an immediate against memory with the immediate first, so
+                    // load `a` into `%rcx` and compare `b` against it, leaving
+                    // the flags of `a - b`.
+                    (true, false) => {
+                        self.line(&format!("mov {x}, %rcx"));
+                        self.line(&format!("cmp {y}, %rcx"));
+                    }
+                    // `a` in memory, `b` immediate: `cmpq $b, a` is `a - b`.
+                    (false, true) => self.line(&format!("cmpq {y}, {x}")),
+                    // Two register-free operands. `cmp y, x` is legal unless
+                    // both are memory (x86 has no mem,mem compare); only then
+                    // must `b` be materialised into a register.
+                    (false, false) => {
+                        let x_mem = !x.starts_with('%') && !x.starts_with('$');
+                        let y_mem = !y.starts_with('%') && !y.starts_with('$');
+                        if x_mem && y_mem {
+                            self.gen_expr(b);
+                            self.line(&format!("cmp %rax, {x}"));
+                        } else {
+                            self.line(&format!("cmp {y}, {x}"));
+                        }
+                    }
+                }
+                true
+            }
+            (Some(x), None) => {
+                self.gen_expr(b);
+                if x.starts_with('$') {
+                    self.line(&format!("mov {x}, %rcx"));
+                    self.line("cmp %rax, %rcx");
+                } else {
+                    self.line(&format!("cmp %rax, {x}"));
+                }
+                true
+            }
+            (None, Some(y)) => {
+                self.gen_expr(a);
+                self.line(&format!("cmp {y}, %rax"));
+                true
+            }
+            (None, None) => false,
+        }
+    }
+
+    /// Evaluate two operands into the shared convention: left in `%rax`, right
+    /// in `%rcx`. Constants and locals are folded in as immediate or memory
+    /// operands; anything else goes through the stack.
+    fn eval_operands(&mut self, a: &Expr, b: &Expr) {
+        let ra = self.simple_operand(a);
+        let rb = self.simple_operand(b);
+        match (ra, rb) {
+            (Some(la), Some(rb)) => {
+                self.line(&format!("mov {la}, %rax"));
+                self.line(&format!("mov {rb}, %rcx"));
+            }
+            (None, Some(rb)) => {
+                self.gen_expr(a);
+                self.line(&format!("mov {rb}, %rcx"));
+            }
+            (Some(la), None) => {
+                self.gen_expr(b);
+                self.line("mov %rax, %rcx");
+                self.line(&format!("mov {la}, %rax"));
+            }
+            (None, None) => {
+                self.gen_expr(a);
+                self.push_rax();
+                self.gen_expr(b);
+                self.line("mov %rax, %rcx");
+                self.pop_to("%rax");
+            }
+        }
+    }
+
+    /// Branch to `target` when `cond` is false. Comparisons are emitted as a
+    /// direct `cmp`/`jcc` pair, which keeps loop and `if` conditions tight.
+    fn gen_branch_false(&mut self, cond: &Expr, target: &str) {
+        if let Expr::Bin(op, a, b) = cond {
+            if let Some(cc) = invert_cc(*op) {
+                if !self.emit_cmp(a, b) {
+                    self.eval_operands(a, b);
+                    self.line("cmp %rcx, %rax");
+                }
+                self.line(&format!("{cc} {target}"));
+                return;
+            }
+        }
+        // `!(a < b)` jumps when the comparison holds.
+        if let Expr::Un(UnOp::Not, inner) = cond {
+            if let Expr::Bin(op, a, b) = inner.as_ref() {
+                if let Some(cc) = setcc_cc(*op) {
+                    if !self.emit_cmp(a, b) {
+                        self.eval_operands(a, b);
+                        self.line("cmp %rcx, %rax");
+                    }
+                    self.line(&format!("{cc} {target}"));
+                    return;
+                }
+            }
+        }
+        self.gen_expr(cond);
+        self.line("test %rax, %rax");
+        self.line(&format!("jz {target}"));
+    }
+
+    fn gen_call(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        arg_slots: &[(i32, usize)],
+        ret_slot: i32,
+        ret_ty: &Type,
+    ) -> Type {
+        const ARG_REGS: [&str; 6] = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"];
+
+        // Arguments are evaluated in source order. An aggregate is passed by
+        // value: it is copied into its hidden frame slot, and that slot's
+        // address is what travels in the argument register. Each argument is
+        // pushed as it is evaluated (aggregate: its slot address; scalar: its
+        // value), so the pushes are left-to-right and the register loads below
+        // are a single reverse walk. Copying every aggregate only after all
+        // scalars would run the arguments out of order.
+        let is_agg: Vec<bool> = arg_slots.iter().map(|(s, _)| *s >= 0).collect();
+
+        let direct = is_agg.iter().all(|a| !*a)
+            && (args.iter().all(|a| self.arg_is_simple(a))
+                || (args.len() <= 2
+                    && !args.iter().any(Self::contains_call)
+                    && !args.iter().any(Self::clobbers_arg_regs)));
+        if direct {
+            for (a, r) in args.iter().zip(ARG_REGS.iter()) {
+                self.gen_expr_into_reg(a, r);
+            }
+        } else {
+            for ((a, agg), (slot, n)) in args.iter().zip(is_agg.iter()).zip(arg_slots.iter()) {
+                if *agg {
+                    let base = self.array_off(*slot, *n);
+                    self.gen_expr(a); // the aggregate's address is in %rax
+                    self.line("mov %rax, %rsi");
+                    self.line(&format!("lea {base}(%rbp), %rdi"));
+                    self.copy_words_rdi_rsi(*n);
+                    self.line(&format!("lea {base}(%rbp), %rax"));
+                } else {
+                    self.gen_expr(a);
+                }
+                self.push_rax();
+            }
+            // Pushes were left-to-right, so pop right-to-left into the ABI
+            // registers, one per argument.
+            for i in (0..args.len()).rev() {
+                self.pop_to(ARG_REGS[i]);
+            }
+        }
+
+        // The return buffer pointer goes in %r10, which is caller-saved and not
+        // one of the argument registers, so it survives argument setup.
+        if ret_slot >= 0 {
+            let n = ret_ty.size() / 8;
+            self.line(&format!("lea {}(%rbp), %r10", self.array_off(ret_slot, n)));
+        }
+        // Spills live in frame slots, so `%rsp` is already 16-byte aligned at
+        // every call and needs no pad here.
+        self.line(&format!("call {name}"));
+        // An aggregate result's address (the hidden buffer) is in %rax; a
+        // scalar result is already in %rax.
+        ret_ty.clone()
+    }
+
+    /// An argument that loads into a register without using the `%rcx`/`%rdx`
+    /// scratch registers that later arguments would clobber.
+    fn arg_is_simple(&self, e: &Expr) -> bool {
+        self.simple_operand(e).is_some() || matches!(e, Expr::Str(_))
+    }
+
+    /// True when evaluating `e` may perform a call.
+    fn contains_call(e: &Expr) -> bool {
+        match e {
+            Expr::Call { .. } => true,
+            // A struct or array literal is materialised through a copy that
+            // uses scratch registers, so the direct-argument shortcut (which
+            // requires register preservation) must not select it.
+            Expr::StructLit { .. } | Expr::ArrayLit(..) => true,
+            Expr::Bin(_, a, b) => Self::contains_call(a) || Self::contains_call(b),
+            Expr::Un(_, a) | Expr::Cast(a, _) => Self::contains_call(a),
+            Expr::Index(a, b) => Self::contains_call(a) || Self::contains_call(b),
+            Expr::Field { base, .. } => Self::contains_call(base),
+            // An enum constructor, a variant test and a payload read all
+            // evaluate their children, which can call. Missing these let the
+            // direct-argument shortcut select an argument whose nested call
+            // clobbers an earlier argument register.
+            Expr::EnumCtor { args, .. } => args.iter().any(Self::contains_call),
+            Expr::VariantTest { scrutinee, .. } => Self::contains_call(scrutinee),
+            Expr::EnumPayload { recv, .. } => Self::contains_call(recv),
+            Expr::If(c, t, els) => {
+                Self::contains_call(c)
+                    || Self::block_has_call(t)
+                    || els.as_ref().map_or(false, Self::block_has_call)
+            }
+            Expr::Block(b) => Self::block_has_call(b),
+            _ => false,
+        }
+    }
+
+    fn block_has_call(b: &Block) -> bool {
+        b.stmts.iter().any(Self::stmt_has_call)
+            || b.tail.as_deref().map_or(false, Self::contains_call)
+    }
+
+    /// True when evaluating `e` can clobber `%rdi`/`%rsi` without
+    /// `contains_call` noticing. The only such case is copying a whole
+    /// aggregate into a local: the copy runs through `%rdi`/`%rsi`
+    /// (`copy_words_rdi_rsi`), and a block's `let` initialiser can trigger one
+    /// without containing a call, so the direct-argument shortcut must not
+    /// select it.
+    fn clobbers_arg_regs(e: &Expr) -> bool {
+        match e {
+            Expr::Block(b) => Self::block_clobbers(b),
+            Expr::If(_, t, els) => {
+                Self::block_clobbers(t)
+                    || els.as_ref().map_or(false, |b| Self::block_clobbers(b))
+            }
+            _ => false,
+        }
+    }
+
+    fn block_clobbers(b: &Block) -> bool {
+        b.stmts.iter().any(Self::stmt_clobbers)
+            || b.tail.as_deref().map_or(false, Self::clobbers_arg_regs)
+    }
+
+    fn stmt_clobbers(s: &Stmt) -> bool {
+        match s {
+            Stmt::Let { init: Some(e), .. } => Self::value_copies_aggregate(e),
+            // An aggregate store copies word by word through `%rdi`/`%rsi`
+            // (`copy_words_rdi_rsi`), whether the destination is a whole local,
+            // a struct field or an array element, so all three clobber the
+            // argument registers.
+            Stmt::Assign { target, .. } => match target {
+                Expr::Var { ty, .. } | Expr::Field { ty, .. } => ty.is_aggregate(),
+                Expr::Index(base, _) => matches!(
+                    base.as_ref(),
+                    Expr::Var { ty: Type::Array(e, _), .. } if e.is_aggregate()
+                ),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// True when `e` produces an aggregate by copying, which goes through
+    /// `%rdi`/`%rsi`. A literal is excluded because `contains_call` already
+    /// rejects it; a call result is excluded because it is a call.
+    fn value_copies_aggregate(e: &Expr) -> bool {
+        match e {
+            Expr::Var { ty, .. } | Expr::Field { ty, .. } => ty.is_aggregate(),
+            Expr::Block(_) | Expr::If(..) => Self::clobbers_arg_regs(e),
+            _ => false,
+        }
+    }
+
+    fn stmt_has_call(s: &Stmt) -> bool {
+        match s {
+            Stmt::Let { init, .. } => init.as_ref().map_or(false, Self::contains_call),
+            Stmt::Assign { target, value } => {
+                Self::contains_call(target) || Self::contains_call(value)
+            }
+            Stmt::Expr(e) => Self::contains_call(e),
+            Stmt::Return(v) => v.as_ref().map_or(false, Self::contains_call),
+            Stmt::For { start, end, body, .. } => {
+                Self::contains_call(start) || Self::contains_call(end) || Self::block_has_call(body)
+            }
+            // A loop body might call on some iteration; be conservative.
+            Stmt::While(..) | Stmt::Loop(..) => true,
+            Stmt::Break | Stmt::Continue => false,
+        }
+    }
+
+}
+
+/// The `setcc` mnemonic for a comparison operator.
+fn setcc(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Eq => "sete",
+        BinOp::Ne => "setne",
+        BinOp::Lt => "setl",
+        BinOp::Le => "setle",
+        BinOp::Gt => "setg",
+        BinOp::Ge => "setge",
+        _ => unreachable!(),
+    }
+}
+
+/// The `jcc` mnemonic that jumps when a comparison is *false*, for `a op b`.
+fn invert_cc(op: BinOp) -> Option<&'static str> {
+    Some(match op {
+        BinOp::Eq => "jne",
+        BinOp::Ne => "je",
+        BinOp::Lt => "jge",
+        BinOp::Le => "jg",
+        BinOp::Gt => "jle",
+        BinOp::Ge => "jl",
+        _ => return None,
+    })
+}
+
+/// The `jcc` mnemonic that jumps when a comparison holds.
+fn setcc_cc(op: BinOp) -> Option<&'static str> {
+    Some(match op {
+        BinOp::Eq => "je",
+        BinOp::Ne => "jne",
+        BinOp::Lt => "jl",
+        BinOp::Le => "jle",
+        BinOp::Gt => "jg",
+        BinOp::Ge => "jge",
+        _ => return None,
+    })
+}

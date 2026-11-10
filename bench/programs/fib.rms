@@ -1,0 +1,15 @@
+fn fib(n: i64) -> i64 {
+    if n < 2 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn main() -> i64 {
+    let mut n: i64 = arg_i64(1);
+    if n == 0 {
+        n = 30;
+    }
+    print_i64(fib(n));
+    return 0;
+}

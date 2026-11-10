@@ -1,0 +1,89 @@
+// An enum whose variants carry data: a tagged union.
+#[derive(Copy, Clone)]
+enum Opt { None, Some(i64) }
+
+#[derive(Copy, Clone)]
+enum Shape { Dot, Line(i64, i64), Rect(i64, i64, i64) }
+
+#[derive(Copy, Clone)]
+struct Point { x: i64, y: i64 }
+
+#[derive(Copy, Clone)]
+enum Node { Leaf(i64), Pair(Point) }
+
+fn get(o: Opt) -> i64 {
+    match o {
+        Opt::Some(v) => v,
+        Opt::None => 0 - 1,
+        _ => 0,
+    }
+}
+
+fn area(s: Shape) -> i64 {
+    match s {
+        Shape::Dot => 0,
+        Shape::Line(w, h) => w * h,
+        Shape::Rect(w, h, d) => 2 * (w * h + h * d + w * d),
+        _ => 0,
+    }
+}
+
+#[derive(Copy, Clone)]
+struct Box2 { v: i64 }
+
+impl Box2 {
+    fn wrap(self) -> Opt {
+        // A payload taken from a field: the argument is a memory operand, which
+        // a constructor must route through a register.
+        return Opt::Some(self.v);
+    }
+    fn empty(self) -> Opt { return Opt::None; }
+}
+
+fn sum_node(n: Node) -> i64 {
+    match n {
+        Node::Leaf(v) => v,
+        Node::Pair(p) => p.x + p.y,
+        _ => 0,
+    }
+}
+
+fn main() -> i64 {
+    // Build and read back a payload.
+    print_i64(get(Opt::Some(42)));
+    print_i64(get(Opt::None));
+    // Several payload variants of different widths.
+    print_i64(area(Shape::Dot));
+    print_i64(area(Shape::Line(3, 4)));
+    print_i64(area(Shape::Rect(1, 2, 3)));
+    // A payload that is a struct.
+    print_i64(sum_node(Node::Leaf(9)));
+    print_i64(sum_node(Node::Pair(Point { x: 5, y: 6 })));
+    // A payload variant built in a loop, destructured each time.
+    let mut acc: i64 = 0;
+    let mut i: i64 = 0;
+    while i < 5 {
+        let o: Opt = Opt::Some(i * 10);
+        match o {
+            Opt::Some(v) => { acc = acc + v; }
+            Opt::None => {}
+        }
+        i = i + 1;
+    }
+    print_i64(acc);
+    // Copy semantics: `b` is an independent copy of `a`.
+    let a: Opt = Opt::Some(7);
+    let b: Opt = a;
+    print_i64(get(a) + get(b));
+    // A method returning a payload enum, with the payload read from a field.
+    let bx: Box2 = Box2 { v: 55 };
+    print_i64(get(bx.wrap()));
+    print_i64(get(bx.empty()));
+    // A binding pattern as the catch-all.
+    let c: Opt = Opt::None;
+    match c {
+        Opt::Some(v) => { print_i64(v); }
+        other => { print_i64(get(other) - 100); }
+    }
+    return 0;
+}

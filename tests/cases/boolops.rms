@@ -1,0 +1,30 @@
+// Boolean operators, short-circuiting, and bool<->i64 casts.
+fn side(n: i64) -> bool {
+    print_i64(n);
+    return true;
+}
+fn main() -> i64 {
+    print_bool(true && true);
+    print_bool(true && false);
+    print_bool(false && true);
+    print_bool(false || false);
+    print_bool(true || false);
+    print_bool(!true);
+    print_bool(!false);
+    print_bool(!(3 > 5));
+    print_bool((1 < 2) && (3 < 4));
+    print_bool((1 < 2) || (3 > 4));
+    // Short-circuit: side(1) must not run, side(2) must.
+    print_bool(false && side(1));
+    print_bool(true || side(2));
+    print_bool(true && side(3));
+    let mut b: bool = 5 < 6;
+    print_i64(b as i64);
+    b = false;
+    print_i64(b as i64);
+    let n: i64 = 1;
+    print_bool(n as bool);
+    let z: i64 = 0;
+    print_bool(z as bool);
+    return 0;
+}

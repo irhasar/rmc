@@ -1,0 +1,2 @@
+// Non-ASCII string literals must round-trip as UTF-8.
+fn main() -> i64 { print_str("héllo → é"); return 0; }

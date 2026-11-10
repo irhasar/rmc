@@ -1,0 +1,43 @@
+// Regression tests for review findings on the core branch.
+#[derive(Copy, Clone)]
+enum Opt { None, Some(i64) }
+
+#[derive(Copy, Clone)]
+struct P { x: i64 }
+
+fn h(x: i64) -> i64 { x + 1 }
+fn g() -> i64 { h(41) }
+fn f(a: i64, b: i64) -> i64 { a * 100 + b }
+
+fn make() -> P { print_i64(100); P { x: 5 } }
+
+fn nxt() -> i64 { print_i64(9); 0 }
+
+fn add_two(mut n: i64) -> i64 { n += 2; n }
+
+impl Opt {
+    fn tag_value(self) -> i64 {
+        match self {
+            Opt::Some(v) => v,
+            Opt::None => 0,
+            _ => 0,
+        }
+    }
+}
+
+fn main() -> i64 {
+    // A call nested in an enum constructor must not clobber an earlier
+    // argument register: `7` stays in `%rdi` while `g()` runs.
+    print_i64(f(7, { let e = Opt::Some(g()); 9 }));
+    // A compound assignment evaluates a side-effecting base exactly once.
+    make().x += 1;
+    // A compound assignment with a side-effecting subscript.
+    let mut a: [i64; 2] = [1, 2];
+    a[nxt()] += 5;
+    print_i64(a[0]);
+    // A method on a payload enum.
+    print_i64(Opt::Some(42).tag_value());
+    // A `mut` parameter may be assigned.
+    print_i64(add_two(3));
+    return 0;
+}
