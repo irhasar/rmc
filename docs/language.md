@@ -788,6 +788,28 @@ evaluate their condition and, when it fails, exit with status 101 (rustc's panic
 code). The optional message is not printed. `panic!`, `unreachable!`, `todo!`
 and `unimplemented!` always exit 101; their arguments are ignored.
 
+### Vec shims
+
+rmc has no `Vec`. A few `Vec` shapes appear in real Rust, so the parser folds
+each to an `i64` address into the same heap `alloc` uses, plus a runtime helper.
+The value of a supported `Vec` binding is that address; it is not a container
+with a length or capacity field, so only the methods below are understood.
+
+| source                              | lowered to                                    |
+| ----------------------------------- | --------------------------------------------- |
+| `let v: Vec<i64> = Vec::with_capacity(k);` | `alloc(k * 8)`; `v.capacity()` is `k`  |
+| `let v: Vec<u8> = vec![e; n];`      | `alloc(n * 8)` filled by `__rmc_fill`         |
+| `v.len()` (constant `n`)            | `n`                                           |
+| `v.as_mut_ptr()` / `v.as_ptr()`     | the address; a following `.add(off)` is `p + off` |
+| `let a: Vec<i64> = std::env::args().skip(k).map(..).collect();` | no allocation at all (see below) |
+
+`vec![e; n]` takes a runtime `n`; `alloc` and `__rmc_fill` both take it as a
+value. A `vec![a, b, c]` list form is rejected. An args-vector is never
+materialised: `for v in &args` desugars to `for i in k..__rmc_nargs()` and
+`args[i]` to `__rmc_arg_or(i + k, 0)`, so `*v` in the loop body is the `i64`
+argument itself. Each of these constructs is only recognised directly in a
+`let` initializer; used elsewhere it is a compile error naming the construct.
+
 ### std paths
 
 Two `std` items are provided so ordinary Rust can be compiled unchanged:
@@ -807,7 +829,9 @@ Any other `std::` path is a compile error.
 
 Traits, generics, borrowing, lifetimes, modules, closures, `f32`/`f64`,
 `u*`/`i*` types other than `i64`, and the standard library beyond the two `std`
-paths above. A `char` is a scalar, but its full `char` API
+paths above and the `Vec` shims. A `Vec` is not a real container: only the
+handful of shapes in "Vec shims" are recognised, and any other `Vec` method or
+use is a compile error. A `char` is a scalar, but its full `char` API
 (`char::from_u32`, `is_alphabetic`, `to_digit`, ...) is not provided, and
 `char` may not be cast from an integer (`i64 as char` is rejected, as in
 rustc). References exist (`&T` / `&mut T`, `&e`, `*e`, `*e = v`),

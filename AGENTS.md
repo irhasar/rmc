@@ -1789,6 +1789,22 @@ be exchanged at a variable, parameter, struct-field, enum-variant-field or
 comparison site; there is no lifetime checking, so a `&'static str` field or
 `&str` parameter may be written `str`.
 
+There is no `Vec`, but the parser folds the few shapes the corpus uses to an
+`i64` address: `Vec::with_capacity(k)`/`Vec::new()` become `alloc(k * 8)`,
+`vec![e; n]` becomes `alloc(n * 8)` plus a `__rmc_fill`, `v.capacity()`/`v.len()`
+fold to the constant count, and `v.as_mut_ptr()` keeps the address so a later
+`.add(off)` is plain pointer arithmetic. Each shape is recognised only directly
+in a `let` initializer; anywhere else the `\0`-prefixed parser marker reaches
+sema, which reports the source construct (see the `\0vecnew` arm). An
+args-vector is never built: `std::env::args()...collect()` records the binding,
+`for v in &args` desugars to `for i in skip..__rmc_nargs()`, and `args[i]`
+becomes `__rmc_arg_or(i + skip, 0)`. The `__rmc_arg_or`, `__rmc_nargs` and
+`__rmc_fill` helpers live in `runtime.rs`. Two relaxations make the pointer
+shapes type: `*mut T as i64` is allowed (rmc maps `*mut T` and `&mut T` alike,
+and rustc allows the raw form) and an integer/pointer coerce both ways, matching
+the existing `i64 as &T` extension; a shared reference still may not become a
+`&mut` one.
+
 The README's roadmap lists the intended next steps.
 
 ## Codegen notes
