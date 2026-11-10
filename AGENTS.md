@@ -2045,3 +2045,10 @@ and an upper branch already carry independently (because it was carried upward
 before it landed below) will conflict on the duplicate hunks; resolve by keeping
 either side — the content is identical — and commit the merge so the upper
 branch descends from the corrected base and the PR reports `mergeable`.
+
+Do not reach for `-X ours` (or `-X theirs`) to skip that resolution. When the
+upper branch added a *method* the lower branch does not have, `-X ours` drops
+the lower branch's copy of a *different* method silently, and the next build
+fails with "duplicate definitions with name ..." once both are in the tree. A
+plain merge surfaces the overlapping hunks; resolve them by hand. After any
+such merge, rebuild and run `cargo test` plus `tests/run.py` before committing.
