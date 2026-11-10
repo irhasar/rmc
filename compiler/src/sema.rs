@@ -987,7 +987,7 @@ impl Sema {
                             .into(),
                     );
                 }
-                if ct != Type::Bool && !expr_diverges(cond) {
+                if ct != Type::Bool && !expr_never_typed(cond) {
                     return Err(format!("`while` condition must be `bool`, found {ct:?}"));
                 }
                 let init_before = Self::init_snapshot(scope);
@@ -1630,7 +1630,7 @@ impl Sema {
                 self.match_chain = false;
                 self.match_total = false;
                 let ct = self.check_expr(cond, scope)?;
-                if ct != Type::Bool && !expr_diverges(cond) {
+                if ct != Type::Bool && !expr_never_typed(cond) {
                     return Err(format!("`if` condition must be `bool`, found {ct:?}"));
                 }
                 let total = if is_root {
@@ -2277,6 +2277,28 @@ fn stmt_diverges(s: &Stmt) -> bool {
     }
 }
 
+/// True when `e` has the never type `!`: a block with no tail that diverges, or
+/// whose tail is itself `!`, or an `if` both of whose arms are `!`. A block with
+/// an unreachable-but-typed tail (`{ return; 42 }`) is *not* `!`, so it must not
+/// bypass a `bool` check. This mirrors rustc, which still types such a block by
+/// its tail.
+fn expr_never_typed(e: &Expr) -> bool {
+    match e {
+        Expr::Block(b) => block_never_typed(b),
+        Expr::If(_, t, els) => {
+            block_never_typed(t) && els.as_ref().map_or(false, |b| block_never_typed(b))
+        }
+        _ => false,
+    }
+}
+
+fn block_never_typed(b: &Block) -> bool {
+    match &b.tail {
+        Some(t) => expr_never_typed(t),
+        None => block_diverges(b),
+    }
+}
+
 fn expr_diverges(e: &Expr) -> bool {
     match e {
         Expr::Block(b) => block_diverges(b),
@@ -2439,12 +2461,21 @@ fn block_has_unlabelled_exit(b: &Block) -> bool {
 fn stmt_has_unlabelled_exit(s: &Stmt) -> bool {
     match s {
         Stmt::Break | Stmt::Continue => true,
-        // A nested loop captures its own unlabelled exits.
-        Stmt::While(..) | Stmt::For { .. } | Stmt::Loop(_) => false,
+        // A `while`/`for`/`loop` body captures its own unlabelled exits, but a
+        // `for`'s range bounds are evaluated before the loop starts, so an
+        // unlabelled exit there targets the enclosing loop.
+        Stmt::While(..) | Stmt::Loop(_) => false,
+        Stmt::For { start, end, .. } => {
+            cond_has_unlabelled_exit(start) || cond_has_unlabelled_exit(end)
+        }
         Stmt::Expr(e) => cond_has_unlabelled_exit(e),
         Stmt::Return(Some(e)) => cond_has_unlabelled_exit(e),
         Stmt::Let { init: Some(e), .. } => cond_has_unlabelled_exit(e),
-        Stmt::Assign { value, .. } => cond_has_unlabelled_exit(value),
+        // The target's index/deref is evaluated, so a `break` there is an exit
+        // from the enclosing `while`.
+        Stmt::Assign { target, value } => {
+            cond_has_unlabelled_exit(value) || cond_has_unlabelled_exit(target)
+        }
         _ => false,
     }
 }
