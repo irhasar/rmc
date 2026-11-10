@@ -1185,6 +1185,33 @@ def reject_corpus():
             "fn main() -> i64 { let o: i64 = 3; if let y = o { 1 } return 0; }\n",
             "fn main() { let o = 3i64; if let y = o { 1 } }\n",
         ),
+        # A `break` inside an inner loop's `if` condition still leaves that
+        # loop, so the outer loop repeats and a write to an immutable binding
+        # before the inner loop is a second write (E0384). The break walk must
+        # inspect condition expressions.
+        "assign_immutable_cond_break_inner": (
+            "fn main() { let x: i64; loop { loop { if { break; true } {} } x = 1; } }\n",
+            "fn main() { let x: i64; loop { loop { if { break; true } {} } x = 1; } }\n",
+        ),
+        "assign_immutable_cond_break_while": (
+            "fn flag() -> bool { return true; }\n"
+            "fn main() { let x: i64; while flag() { x = 1; loop { if { break; true } {} } } }\n",
+            "fn flag() -> bool { true }\n"
+            "fn main() { let x: i64; while flag() { x = 1; loop { if { break; true } {} } } }\n",
+        ),
+        # A labelled `continue` inside a nested loop targets the outer loop, so
+        # a write before the inner loop repeats (E0384). The reach walk must
+        # follow a labelled continue out of the nested loop.
+        "assign_immutable_labelled_continue": (
+            "fn main() { let x: i64; 'outer: loop { x = 1; loop { continue 'outer; } } }\n",
+            "fn main() { let x: i64; 'outer: loop { x = 1; loop { continue 'outer; } } }\n",
+        ),
+        # An unlabelled `break`/`continue` in a `while` condition would target a
+        # loop enclosing the `while`, which rustc forbids (E0590).
+        "while_break_in_condition": (
+            "fn main() { loop { while { break; } {} } }\n",
+            "fn main() { loop { while { break; } {} } }\n",
+        ),
     }
 
 

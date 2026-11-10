@@ -371,7 +371,19 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   that lines up with the bindings present at loop entry, so a break path that
   declared extra locals still contributes its outer-binding writes; and a
   `loop` with no reachable `break` does not fall through, so an infinite inner
-  loop must not make the outer loop look repeating.
+  loop must not make the outer loop look repeating. Two more: an `if`/`while`
+  condition is evaluated like any other operand, so the break/reach walks
+  descend into condition expressions and every other evaluated child
+  (`expr_has_break`/`expr_contains_continue`), or `loop { loop { if { break;
+  true } {} } x = 1; }` wrongly accepts the second write; and a labelled
+  `continue` inside a nested loop still targets the outer loop, so the reach
+  walk descends into a nested loop body, threading a `nested` flag so an
+  unlabelled `continue` there no longer counts. A diverging condition
+  (`{ break; }`, `{ return; }`, `{ continue; }`) has type `!`, which rustc
+  accepts where `bool` is expected; the `if`/`while` condition type check must
+  not reject it. An *unlabelled* `break`/`continue` in a `while` condition has
+  no valid target (E0590), so the condition check rejects it via
+  `cond_has_unlabelled_exit`; a labelled one is fine.
 - **A compound assignment evaluates its place once.** `desugar_compound` binds
   any component of the target that contains a call — the base or the subscript —
   to a temporary and reuses it for both the read and the write, so `make().x += 1`
