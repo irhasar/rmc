@@ -1855,6 +1855,16 @@ impl Parser {
                             out.extend(self.let_destructure_tuple_stmts(elems, ty, init))
                         }
                         Pat::Array { elems, rest, front } => {
+                            // An array pattern must match the array's length
+                            // exactly (rustc E0527); a `..` rest only makes the
+                            // count a lower bound. rmc desugars to one index
+                            // read per element, so a mismatch would read past
+                            // the array instead of being rejected. Check it here
+                            // when the length is known from the annotation or a
+                            // literal initializer.
+                            if let Some(len) = Self::array_len_of(&ty, &init) {
+                                Self::check_array_pat_len(&elems, rest, len, self.pos())?;
+                            }
                             out.extend(self.let_destructure_array_stmts(elems, rest, front, ty, init))
                         }
                         // A parenthesised pattern that is not a tuple: `(x)` is
@@ -4323,6 +4333,45 @@ impl Parser {
         let (mut out, subj) = self.let_destructure_prelude(ty, init);
         out.extend(Self::struct_pat_binds(&fields, &subj, &name));
         out
+    }
+
+    /// The element count an array pattern's subject is known to have, from its
+    /// written type (`[i64; 2]`) or an array literal initializer. `None` when
+    /// neither is present, so the length check is skipped rather than guessed.
+    fn array_len_of(ty: &Option<Type>, init: &Expr) -> Option<usize> {
+        if let Some(Type::Array(_, n)) = ty {
+            return Some(*n);
+        }
+        match init {
+            Expr::ArrayLit(_, n) => Some(*n),
+            Expr::ArrayList(vs) => Some(vs.len()),
+            _ => None,
+        }
+    }
+
+    /// Reject an array pattern whose element count cannot match `len`, as rustc
+    /// does (E0527): exactly `len` elements without a `..`, and at most `len`
+    /// with one.
+    fn check_array_pat_len(
+        elems: &[Option<(bool, Pat)>],
+        rest: bool,
+        len: usize,
+        pos: u32,
+    ) -> PResult<()> {
+        if rest {
+            if elems.len() > len {
+                return Err(format!(
+                    "at byte {pos}: pattern requires at most {len} elements but array has {len}"
+                ));
+            }
+        } else if elems.len() != len {
+            return Err(format!(
+                "at byte {pos}: pattern requires {} element{} but array has {len}",
+                elems.len(),
+                if elems.len() == 1 { "" } else { "s" }
+            ));
+        }
+        Ok(())
     }
 
     /// The same expansion for an array pattern: bind the scrutinee to a hidden
