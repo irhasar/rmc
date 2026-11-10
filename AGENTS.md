@@ -2026,6 +2026,54 @@ The README's roadmap lists the intended next steps.
   `f(x-1) - f(x-2)` case, a `return` in an argument, a foreign call in the left
   operand, and overflow checks.
 
+## MIR back-end benchmark tuning (fair harness)
+
+`bench/run_fair.py` compares the same `bench/mir/*.rs` source through both
+back ends: `mir` = `rustc --emit=mir -O -Zno-codegen` + `rmcmir`, `llvm` =
+`rustc --emit=obj -O -C lto=fat -C codegen-units=1` + `ld`, both linked against
+rmc's own freestanding runtime. Read the harness before trusting a number.
+
+- **Count the whole pipeline's peak RSS on both sides.** The `mir` column's RSS
+  is `max(rustc --emit=mir, rmcmir)`; counting only `rustc` on the LLVM side
+  (leaving out `ld`) credits LLVM with a free link step and turns a tie into a
+  fake win. `measure_llvm` takes `max(c, ld)`.
+- **`-Zno-codegen` is the whole point of the front end.** With it, `rustc
+  --emit=mir` stops before LLVM codegen: `hello`/`stats` front-end CPU drops
+  from ~267/538 ms to ~54/408 ms. rmc sets `RUSTC_BOOTSTRAP=1` on the child
+  rustc; the harness mirrors that. Without the flag the MIR front end is as
+  expensive as the LLVM one.
+- **`rustc --emit=mir` uses ~3-5 MB *more* RSS than `--emit=obj`** (85892 vs
+  85220 KB on `stats`), reproducibly, with `-Zthreads=1`, `debuginfo=0`,
+  `mir-opt-level=2` and `incremental=false` all failing to close it. The
+  compile-RSS axis is therefore an inherent front-end tie (~0.99), not
+  something the back end can fix; the front end is rustc in *both* pipelines.
+- **The compile CPU win is real and large** (~1.2x): skipping LLVM codegen.
+  Wall time is a near-tie because both fronts pay rustc's ~25-30 ms startup.
+
+### Branchless min/max (`cmov`) was tried and rejected
+
+A min/max diamond (`if v > acc { acc = v }`) lowered to a branch; LLVM emits
+`cmov`. Adding `enc_cmov` to `elf.rs` and a `plan_cmovs` fold to
+`mir_codegen.rs` made `stats` **1.16x slower** (3.27 -> 5.08 ms on the same
+binary, `taskset -c 2`, best of 13) and was neutral (0.99-1.02) on the rest.
+The reduction branches in these benchmarks are predictable — the accumulators
+start at `i64::MIN`/`MAX` and the update usually takes the same side — so the
+branch predicts ~perfectly while the `cmov` only adds a data dependency to a
+latency-bound loop. LLVM wins `stats` because it *unrolls by two* and strength-
+reduces the `i * 2654435761` multiply into two induction variables, not because
+of `cmov`. Do not re-add the fold without measuring a program whose min/max
+input is genuinely unpredictable.
+
+### No-op arithmetic (`add $0, %reg`) must be dropped
+
+A struct field at offset 0 lowers to `add $0, %rax`. The instruction cannot
+change its destination, but it *does* block the store-forwarding peephole that
+would otherwise fold the pointer's round-trip through its frame slot, so every
+field write keeps a reload. `drop_noop_arith` removes `add $0`/`sub $0` unless
+the next instruction reads the flags it sets (`flags_used_by`). Measured on the
+`heap` linked-list fill: one load per node removed, run 1.08x vs LLVM; `refs`
+1.04x, `mix` 1.01x.
+
 ## Pushing
 
 `git push origin <branch>` works with the `GITHUB_TOKEN` in this environment.
