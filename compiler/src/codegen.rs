@@ -2561,6 +2561,17 @@ Expr::PatScrutinee(_) => {
 
     fn gen_bin(&mut self, op: BinOp, a: &Expr, b: &Expr) -> Type {
         use BinOp::*;
+        // `wrapping_mul` is `*` with no overflow guard. Run the whole `Mul`
+        // path with the guard suppressed and the trap-restoring `jo` turned
+        // off, so the constant folds, the `lea` scaling and the operand
+        // selection are all shared and only the `jo` differs.
+        if op == WrappingMul {
+            let saved = self.overflow;
+            self.overflow = false;
+            let t = self.gen_bin(Mul, a, b);
+            self.overflow = saved;
+            return t;
+        }
         match op {
             And | Or => {
                 let short = self.new_label();

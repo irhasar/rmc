@@ -1,6 +1,6 @@
-// Differential twin of `strref.rms`: `&str`/`&'static str` fields and
+// `&str`/`&'static str` fields and
 // parameters, `str` equality, and an array length written `N as usize`. rmc
-// models `str` and `&str` identically, so the `.rms` twin spells them `str`.
+// models `str` and `&str` identically.
 const N: i64 = 4;
 
 #[derive(Copy, Clone)]

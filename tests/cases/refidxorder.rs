@@ -1,4 +1,4 @@
-// The Rust twin of `refidxorder.rms`: the index block writes `y`, but the
+// The index block writes `y`, but the
 // assigned value is read first, so `r[0]` is 1 and `y` ends at 2.
 fn main() {
     let mut y: i64 = 1;

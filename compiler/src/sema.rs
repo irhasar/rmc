@@ -1095,6 +1095,18 @@ impl Sema {
                 );
                 (Expr::Bin(Add, Box::new(h), Box::new(carry)), Type::I64)
             }
+            // `wrapping_mul` is `*` with the overflow trap suppressed. It lowers
+            // to the `WrappingMul` operator, whose codegen never emits the `jo`
+            // guard even under `--overflow-checks`, so the two compilers agree on
+            // the wrapped product for every operand. The receiver is bound first
+            // and the argument second, so each runs once and in argument order.
+            "wrapping_mul" => {
+                if args.len() != 1 {
+                    return Err("method `wrapping_mul` takes exactly one argument".into());
+                }
+                let y = bind(self, args[0].clone(), &mut stmts);
+                (Expr::Bin(WrappingMul, Box::new(x), Box::new(y)), Type::I64)
+            }
             _ => unreachable!("checked by the caller"),
         };
         let body = if stmts.is_empty() {
@@ -1965,7 +1977,7 @@ impl Sema {
     /// rmc's two intentional extensions. Both extensions are documented: the
     /// raw pointer cast `i64 as &T` (rustc would require `as *const T` first;
     /// the heap benchmark builds a linked list with it) and `i64 as bool`
-    /// (rustc requires `!= 0`; `boolops.rms` uses it). Everything else rmc
+    /// (rustc requires `!= 0`; `boolops.rs` uses it). Everything else rmc
     /// accepts here is valid Rust, so no accidental reinterpretation slips
     /// through — in particular a reference may only become a reference to the
     /// same referent, and may never gain mutability or become a scalar.
@@ -2207,6 +2219,9 @@ impl Sema {
     fn const_of(&self, e: &Expr, snap: &HashMap<i32, i64>) -> Option<i64> {
         const_i64(e).or_else(|| match e {
             Expr::Var { slot, ty, .. } if *ty == Type::I64 && *slot >= 0 => snap.get(slot).copied(),
+            // An identity cast (`i as usize`) is transparent, so a constant
+            // local used as an index is still recognised.
+            Expr::Cast(inner, ty) if *ty == Type::I64 => self.const_of(inner, snap),
             Expr::Bin(op, a, b) => {
                 let x = self.const_of(a, snap)?;
                 let y = self.const_of(b, snap)?;
@@ -2392,12 +2407,16 @@ impl Sema {
                     return self.check_expr(e, scope);
                 }
                 match op {
-                    Add | Sub | Mul | Div | Mod => {
+                    Add | Sub | Mul | Div | Mod | WrappingMul => {
                         if ta != Type::I64 || tb != Type::I64 {
                             return Err(format!("arithmetic expects `i64` operands, found {ta:?} and {tb:?}"));
                         }
-                        if let (Some(x), Some(y)) = (self.const_of(a, &self.const_locals), self.const_of(b, &self.const_locals)) {
-                            const_binop(*op, x, y)?;
+                        // `wrapping_mul` never traps, so a constant product that
+                        // overflows is folded as a wrap rather than rejected.
+                        if *op != WrappingMul {
+                            if let (Some(x), Some(y)) = (self.const_of(a, &self.const_locals), self.const_of(b, &self.const_locals)) {
+                                const_binop(*op, x, y)?;
+                            }
                         }
                         Ok(Type::I64)
                     }
@@ -3102,6 +3121,7 @@ impl Sema {
                             | "rotate_left"
                             | "rotate_right"
                             | "midpoint"
+                            | "wrapping_mul"
                     )
                 {
                     // `abs` synthesises `-x`, a compiler-generated negation, so

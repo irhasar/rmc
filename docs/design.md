@@ -197,7 +197,7 @@ base — so a field value that mutates the base is read back consistently.
 ### Division by a constant
 
 `idiv` is one of the slowest x86 instructions, roughly 20–40 cycles and not
-fully pipelined, and `mandel.rms` divides three times per inner iteration. When
+fully pipelined, and `mandel.rs` divides three times per inner iteration. When
 the divisor is a literal, `gen_div_const` replaces it with the Hacker's Delight
 "magic number" method, the same algorithm LLVM uses:
 
@@ -508,8 +508,8 @@ in an argument would otherwise be duplicated by the loop, and a `return` nested
 in an argument would leave the transformed loop instead of the recursive frame,
 dropping the accumulator.
 
-The transform is validated by `tests/cases/tco.{rms,rs}`, which diffs `fib` and
-`fact` against rustc for `n` in `0..20`, and `tests/cases/callrec.{rms,rs}`,
+The transform is validated by `tests/cases/tco.rs`, which diffs `fib` and
+`fact` against rustc for `n` in `0..20`, and `tests/cases/callrec.rs`,
 which covers the `1 + f(n-1) + f(n-2)` shape, plus unit tests that check a
 non-associative recursion keeps both calls and a foreign call in the left operand
 is not folded.
@@ -631,7 +631,7 @@ dead-instruction trim described above. No global register allocation, no
 common-subexpression elimination, no other loop transforms, no instruction
 scheduling. The compiler is optimised for compile speed and simplicity, not for
 the speed of the code it produces. The non-trivial
-passes are division by a constant (1.4x on `mandel.rms`), the top-five local
+passes are division by a constant (1.4x on `mandel.rs`), the top-five local
 promotion (a few percent on `mix` and `sieve`), the reference-operand folds plus
 `trim_dead` (1.4x on the `refs` benchmark), inlining (2.6x on `refs`, by removing
 the three accessor calls from its hot loop), and loop-invariant code motion (a

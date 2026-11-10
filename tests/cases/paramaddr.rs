@@ -1,4 +1,3 @@
-// The Rust twin of `paramaddr.rms`.
 fn readref(x: i64) -> i64 { let r = &x; *r }
 
 fn writeback(mut x: i64) -> i64 { let r = &mut x; *r = 5; x }

@@ -1,4 +1,3 @@
-// Rust twin of enumpatargs.rms.
 #[derive(Copy, Clone)]
 struct I { u: i64 }
 #[derive(Copy, Clone)]

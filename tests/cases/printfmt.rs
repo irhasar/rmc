@@ -1,4 +1,4 @@
-// Differential twin of `printfmt.rms`: exercises `print!`/`println!`, `{}`
+// Exercises `print!`/`println!`, `{}`
 // substitution, `{{`/`}}` escapes, the type-directed formatting of `i64`,
 // `bool` and `str`, and `println!()` with no arguments.
 fn main() {

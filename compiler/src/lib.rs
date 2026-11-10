@@ -48,7 +48,7 @@ pub struct CompileOptions {
     pub no_tco: bool,
 }
 
-/// Compile `src` (a `.rms` program) to x86-64 assembly in GNU `as` syntax.
+/// Compile `src` (a `.rs` program) to x86-64 assembly in GNU `as` syntax.
 ///
 /// The returned string is a complete translation unit: the compiled program
 /// followed by the freestanding runtime. Feed it to `as` and `ld` to obtain an

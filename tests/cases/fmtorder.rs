@@ -1,4 +1,4 @@
-// Differential twin of `fmtorder.rms`: side-effecting `{}` arguments must run
+// Side-effecting `{}` arguments must run
 // before any output, left to right.
 fn f() -> &'static str {
     println!("1");

@@ -161,6 +161,10 @@ pub enum BinOp {
     Add,
     Sub,
     Mul,
+    /// `i64::wrapping_mul`, i.e. `Mul` without the overflow trap. Only the
+    /// inherent method `x.wrapping_mul(y)` produces it; a written `x * y`
+    /// always maps to `Mul`.
+    WrappingMul,
     Div,
     Mod,
     Eq,

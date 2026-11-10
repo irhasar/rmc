@@ -1,4 +1,3 @@
-// Rust twin of tuple.rms.
 fn swap(p: (i64, i64)) -> (i64, i64) {
     (p.1, p.0)
 }

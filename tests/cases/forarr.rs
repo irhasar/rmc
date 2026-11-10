@@ -1,4 +1,3 @@
-// Rust twin of forarr.rms.
 fn mk() -> [i64; 3] {
     println!("{}", -1);
     [5, 6, 7]

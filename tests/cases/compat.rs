@@ -1,4 +1,4 @@
-// Differential twin of `compat.rms`: `use` imports (skipped by rmc),
+// `use` imports (skipped by rmc),
 // `std::process::exit` and `std::hint::black_box`, `assert!`/`assert_eq!`/
 // `assert_ne!` (passing), and `panic!` on a path that is not taken.
 use std::process;

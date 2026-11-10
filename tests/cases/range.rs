@@ -1,4 +1,3 @@
-// Rust twin of range.rms.
 fn bucket(x: i64) -> i64 {
     match x {
         0 => 0,

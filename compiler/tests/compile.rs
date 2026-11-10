@@ -6111,7 +6111,7 @@ fn a_guard_that_mutates_the_scrutinee_keeps_the_matched_value() {
     // corpus; the value is pinned here by running the built binary.
     let dir = std::env::temp_dir().join(format!("rmc-guardmut-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let src = dir.join("m.rms");
+    let src = dir.join("m.rs");
     let bin = dir.join("m.bin");
     std::fs::write(
         &src,
@@ -6141,7 +6141,7 @@ fn a_guard_that_mutates_a_matched_field_keeps_the_bound_value() {
     // it (E0506), so run the built binary to pin the value.
     let dir = std::env::temp_dir().join(format!("rmc-guardfield-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let src = dir.join("m.rms");
+    let src = dir.join("m.rs");
     let bin = dir.join("m.bin");
     std::fs::write(
         &src,
@@ -6178,7 +6178,7 @@ fn no_strip_keeps_a_symbol_table_in_the_output() {
     }
     let dir = std::env::temp_dir().join(format!("rmc-nostrip-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let src = dir.join("m.rms");
+    let src = dir.join("m.rs");
     let bin = dir.join("m.bin");
     std::fs::write(&src, "fn main() -> i64 { return 0; }\n").unwrap();
 
@@ -6207,7 +6207,7 @@ fn no_strip_conflicts_with_min_size() {
     // combination is rejected rather than silently producing a stripped binary.
     let dir = std::env::temp_dir().join(format!("rmc-conflict-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let src = dir.join("m.rms");
+    let src = dir.join("m.rs");
     std::fs::write(&src, "fn main() -> i64 { return 0; }\n").unwrap();
 
     let rmc = env!("CARGO_BIN_EXE_rmc");

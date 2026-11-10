@@ -1,4 +1,4 @@
-// The Rust twin of `strparam.rms`. rmc's `str` is a bare one-word pointer, so
+// Rmc's `str` is a bare one-word pointer, so
 // its functions take `str` by value; Rust's is a fat pointer, so the twin takes
 // `&str` (and the struct holds a `&'static str`). `len()` returns `usize`, cast
 // to `i64` to line up with rmc's `i64`.

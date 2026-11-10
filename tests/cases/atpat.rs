@@ -1,4 +1,3 @@
-// Rust twin of atpat.rms.
 struct P {
     x: i64,
     y: i64,

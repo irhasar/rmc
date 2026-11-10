@@ -1,8 +1,9 @@
 # The rmc language subset
 
 `rmc` accepts a small, statically typed subset of Rust. Programs are ordinary
-UTF-8 text files with the `.rms` extension. Everything is checked at compile
-time; there are no runtime type errors.
+UTF-8 `.rs` source files, the same ones `rustc` compiles; rmc can stand in for
+`rustc` on the subset it supports. Everything is checked at compile time; there
+are no runtime type errors.
 
 ## Types
 

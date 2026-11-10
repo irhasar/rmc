@@ -59,14 +59,13 @@ compiler/            the rmc compiler (Rust, std only, no dependencies)
   src/main.rs        CLI driver: source -> asm -> ELF executable
   tests/compile.rs   unit tests for the front end and code generator
 bench/
-  programs/*.rms     benchmark programs in the rmc subset
-  rust/*.rs          the same programs written in real Rust
+  rust/*.rs          benchmark programs (plain Rust, compiled by rmc)
   run.py             benchmark harness (compile time, CPU, RAM, size, runtime)
 tools/
   fuzz.py            differential fuzzer and robustness checker
 tests/
   run.py             differential test suite: rmc vs rustc on twin programs
-  cases/*.rms, *.rs  paired programs that must behave identically
+  cases/*.rs         programs compiled by both rmc and rustc
   args.json          per-case argv vectors (for runtime inputs)
 docs/
   language.md        the supported language subset
@@ -86,16 +85,16 @@ to build a program: the default path needs no assembler and no linker. `as` and
 ## Usage
 
 ```sh
-rmc input.rms -o output            # compile and link in-process (default)
-rmc input.rms --emit-asm           # print the generated assembly to stdout
-rmc input.rms --binutils -o out    # assemble and link with `as`/`ld` instead
-rmc input.rms --binutils --no-strip -o out   # keep the symbol table
-rmc input.rms --binutils --min-size -o out   # drop the section headers too
-rmc input.rms --overflow-checks    # trap on i64 +,-,* overflow (exit 101)
-rmc input.rms --bounds-checks      # trap on an out-of-range array index (exit 101)
-rmc input.rms --no-inline          # disable inlining (on by default)
-rmc input.rms --no-licm            # disable loop-invariant code motion (on by default)
-rmc input.rms --no-tco             # disable self-recursion-to-loop (on by default)
+rmc input.rs -o output             # compile and link in-process (default)
+rmc input.rs --emit-asm            # print the generated assembly to stdout
+rmc input.rs --binutils -o out     # assemble and link with `as`/`ld` instead
+rmc input.rs --binutils --no-strip -o out    # keep the symbol table
+rmc input.rs --binutils --min-size -o out    # drop the section headers too
+rmc input.rs --overflow-checks     # trap on i64 +,-,* overflow (exit 101)
+rmc input.rs --bounds-checks       # trap on an out-of-range array index (exit 101)
+rmc input.rs --no-inline           # disable inlining (on by default)
+rmc input.rs --no-licm             # disable loop-invariant code motion (on by default)
+rmc input.rs --no-tco              # disable self-recursion-to-loop (on by default)
 ```
 
 Run the produced binary directly; it is a static ELF executable with no
@@ -117,10 +116,9 @@ std::fs::write("out.s", asm)?;
 
 ## Testing
 
-`tests/run.py` is a differential test suite. Every case is a pair of programs,
-`tests/cases/NAME.rms` and `tests/cases/NAME.rs`, written to behave identically;
-the runner compiles both, runs them, and fails if stdout or the exit status
-differs. `tests/args.json` optionally maps a case to argv vectors so the same
+`tests/run.py` is a differential test suite. Every case is a single program,
+`tests/cases/NAME.rs`, compiled by both rmc and rustc; the runner runs both and
+fails if stdout or the exit status differs. `tests/args.json` optionally maps a case to argv vectors so the same
 program is exercised with several runtime inputs. Each case is then recompiled
 with the optimiser passes turned off in turn (`--no-inline`, `--no-licm`,
 `--no-tco`, and all three at once), since a bug in one pass can hide behind

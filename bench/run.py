@@ -116,7 +116,7 @@ def median(xs):
 def measure_compile(name, kind, reps=5):
     if kind == "rmc":
         out = os.path.join(OUT, f"{name}.rmc.bin")
-        argv = [RMC, os.path.join(ROOT, "programs", f"{name}.rms"), "-o", out]
+        argv = [RMC, os.path.join(ROOT, "rust", f"{name}.rs"), "-o", out]
     else:
         out = os.path.join(OUT, f"{name}.rustc.bin")
         argv = ["rustc", "-O", "-C", "opt-level=3", "-C", "lto=fat",

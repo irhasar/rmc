@@ -1,4 +1,4 @@
-// Rust twin of consts.rms. Top-level `const` items, folded by the compiler and
+// Top-level `const` items, folded by the compiler and
 // substituted at every use. The rmc and Rust programs must print identical
 // output and exit with the same status.
 const N: i64 = 5;

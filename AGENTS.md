@@ -19,11 +19,11 @@ export PATH=/workspace/.cargo/bin:$PATH        # rustc/cargo are installed here
 cargo build --release --manifest-path compiler/Cargo.toml
 
 # compile a program
-./compiler/target/release/rmc bench/programs/fib.rms -o /tmp/fib
+./compiler/target/release/rmc bench/rust/fib.rs -o /tmp/fib
 /tmp/fib 30
 
 # inspect generated assembly
-./compiler/target/release/rmc bench/programs/fib.rms --emit-asm
+./compiler/target/release/rmc bench/rust/fib.rs --emit-asm
 
 # full benchmark suite (writes binaries to /tmp/rmcbench)
 python3 bench/run.py
@@ -418,7 +418,7 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   a reference *local*, never a `Deref`. `addr_reg` (local or one `Deref` of a
   local) is the form `gen_addr` folds for a `lea`. Extending either to a deeper
   chain would read the inner pointer from a register it is not in — the bug that
-  `(**ppr).x` in `tests/cases/references.rms` guards against.
+  `(**ppr).x` in `tests/cases/references.rs` guards against.
 - **A scalar `*p` read is a memory operand.** `simple_operand` returns `(%reg)`
   for a non-aggregate `Deref` whose pointer is a reference local, so `*p < 5`
   is one `cmpq $5, (%reg)` and `*p` in a comparison needs no load. An aggregate
@@ -449,7 +449,7 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   (`mov %r, X; mov X, %rY` -> `mov %r, %rY`) was measured perf-neutral on the
   whole suite and not kept. A fuller textual version that tracked the live
   register per frame slot (`forward_stores`) removed one instruction across the
-  whole corpus and cost 3-30% of compile time (`div.rms` 1.30x) for no runtime
+  whole corpus and cost 3-30% of compile time (`div.rs` 1.30x) for no runtime
   change, so it was reverted too: the generator already keeps the value in a
   register or reloads where a load is genuinely needed, and a whole-body rewrite
   pass is the wrong price for the project's headline metric. `gen_expr_to_slot(e, slot)` is the one entry point
@@ -607,7 +607,7 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   high-water mark and the deepest slot, and the dead/round-trip instructions
   `trim_dead` removes change neither, so `Codegen::dry` turns the pass off for
   it. That is a pure compile-time saving on a function whose body is one long
-  straight line: `div.rms` (a 531-line `main`) drops 6% of its compile time, and
+  straight line: `div.rs` (a 531-line `main`) drops 6% of its compile time, and
   the emitted assembly is byte-for-byte identical to running the pass twice.
 - **A callee-saved *temporary* is not worth it; a callee-saved *spill* is.** An
   early attempt kept every short-lived value in `%r12`-`%r15` and measured
@@ -629,7 +629,7 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
 - **Saved registers sit between `%rbp` and the frame.** The epilogue must point
   `%rsp` at the lowest saved register (or add the frame size back) before
   popping, otherwise `pop` reads the frame and the return address is lost.
-  `regs.rms` and `calls.rms` fail if this regresses.
+  `regs.rs` and `calls.rs` fail if this regresses.
 - **Only whole-value structs keep all their fields in memory.** A scalar field
   of a struct is promoted like any other local, *unless* the struct is ever
   copied, returned or passed by value, in which case the whole-value copy reads
@@ -637,7 +637,7 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   during its walk (`copied` and the `let` targets) and zeroes those slots. A
   promoted field that stays in memory on the copy path but is read from its
   register on the field path is a silent wrong-answer bug, which is what
-  `fieldpromo.rms` guards.
+  `fieldpromo.rs` guards.
 - **A struct's base slot is its last field, and it stays promotable unless the
   struct is used as a whole.** Field `k` lives at `slot + fields - 1 - k`, so
   field `fields - 1` *is* `slot`. A whole-value use (copy, return, pass by
@@ -742,11 +742,11 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   name against the constant table *before* `parse_pattern`, because a bare
   constant name there resolves to its value (not a binding), which would turn
   `for N in 0..3` into an iteration over a literal and lose the E0530 error.
-  `tests/cases/forarr.{rms,rs}` and the `stmt` fuzzer cover it.
+  `tests/cases/forarr.rs` and the `stmt` fuzzer cover it.
 - **`..=` exits on `jle` back-edge, not `jl`.** The guard is the loop-back
   condition, so the inclusive form loops while `var <= end` (`jle`) and the
   exclusive one while `var < end` (`jl`); a `jg`/`jge` *exit* test is the
-  un-rotated mirror of the same thing. `forloop.rms` and
+  un-rotated mirror of the same thing. `forloop.rs` and
   `an_inclusive_range_uses_a_strict_exit_test` pin both bounds, and `..=` is a
   three-character token, so it must be lexed in the three-char table (before
   `..`), or it lexes as `..` then `=`.
@@ -810,7 +810,7 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   registers right-to-left, so an earlier argument's source is already copied
   before a later argument runs. Evaluating all aggregates before the scalars
   would run side effects out of order: `f(g(), mk())` must print `2` then `1`,
-  not the reverse. `aggfn.rms`/`aggbig.rms` and `argorder.rms` cover this.
+  not the reverse. `aggfn.rs`/`aggbig.rs` and `argorder.rs` cover this.
 - **`%r10` carries the return buffer.** It is caller-saved and not an argument
   register, so it survives argument setup. Do not use `%r10` as scratch anywhere
   argument setup can run after the return pointer is set.
@@ -887,7 +887,7 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   walk must reach every place form (`Deref`, `AddrOf`, `EnumPayload`, ...) and
   must descend through `Bin`/`Un`/`Cast` and an `if` condition, or a target like
   `r[{ y = 2; 0 } + 0]` is mis-ordered: `contains_call` alone misses a block
-  that assigns without calling. `assignorder.rms`, `refidxorder.rms` and
+  that assigns without calling. `assignorder.rs`, `refidxorder.rs` and
   `tools/fuzz.py --mode order` pin this.
 - **A compound assignment binds its modifying operand first.** `desugar_compound`
   evaluates the right-hand operand into a temporary ahead of the subscript
@@ -1187,7 +1187,7 @@ random splices, deletions and duplications to the generators' programs and the
 signal, no panic). It needs no rustc, so it runs anywhere, and it reaches error
 paths the hand-written corpora miss.
 
-`tests/run.py` compiles each `tests/cases/NAME.{rms,rs}` pair with both compilers
+`tests/run.py` compiles each `tests/cases/NAME.rs` with both compilers
 and diffs stdout and the exit status. Every case is then recompiled with the
 optimiser passes disabled in turn (`--no-inline`, `--no-licm`, `--no-tco`, and
 all three at once), because a bug in one pass can hide behind another or only
@@ -1205,8 +1205,10 @@ side-effecting scrutinee, and value position) and `consts` (top-level `const`
 items in expression position, as array lengths and repeat counts, as a `for`
 bound, in conditions, and as `match` patterns, including a negative constant and
 one defined in terms of another) guard the
-front-end/codegen fixes below. When adding a case, add both twins, write
-them to behave identically, and remember that `rustc` infers `i32` for unsuffixed
+front-end/codegen fixes below. There is no separate rmc dialect: each case is a
+single `.rs` file that rmc compiles directly, and rustc compiles the same file
+as the reference, so rmc can stand in for rustc on the supported subset. When
+adding a case, remember that `rustc` infers `i32` for unsuffixed
 literals, so large literals need an `i64` suffix on the Rust side. `args.json`
 maps a case name to a list of argv vectors. Verify a new case actually detects
 the bug it guards: revert the fix and confirm the case fails.
@@ -1297,7 +1299,7 @@ Two exhaustiveness-walk bugs this exposed are fixed. A payload-binding arm
 block used to hide the chain: `match o { O::Some(v) => v, O::None => 0 }` (no
 `_`) was wrongly rejected. `chain_tail` now unwraps block wrappers while
 descending the chain, and the walk no longer requires an arm's `else` block to
-have empty `stmts`. `tests/cases/guard.{rms,rs}` and the `pat` fuzzer cover
+have empty `stmts`. `tests/cases/guard.rs` and the `pat` fuzzer cover
 guards; the `reject` fuzzer's `guard_*` cases pin the exhaustiveness rules.
 
 The `match` desugaring wraps its first step in `Expr::MatchBoundary`, a
@@ -1315,7 +1317,7 @@ it exactly like `Expr::Block`, and `is_block_like` lists it so a `match`
 statement still needs no trailing `;`. A subtle-scrutinee comparison would *not*
 work: the two programs above share the same scrutinee, so the boundary is the
 only thing that keeps them apart.
-`tests/cases/exhmat.{rms,rs}` covers value position, reordering, nesting,
+`tests/cases/exhmat.rs` covers value position, reordering, nesting,
 references and a loop; a non-exhaustive or duplicate-variant match still errors,
 and `tools/fuzz.py --mode reject` pins the nested-wildcard and statement-position
 cases.
@@ -1441,7 +1443,10 @@ The checks, all in `sema.rs`:
   `a[1 + 4]` read adjacent stack memory. `Sema::const_of` extends this to a
   constant *local*: `let i = -1; a[i]` is folded the way rustc's constant
   propagation folds it, which an earlier version did not, letting `a[i]` read
-  past the array. A *variable* index is still unchecked by default (see Scope).
+  past the array. Both folders see through the identity cast `i as usize` (the
+  usual spelling of an index in real Rust), so `a[i as usize]` is caught
+  exactly like `a[i]`. A *variable* index is still unchecked by default (see
+  Scope).
 - **String typing.** A string literal is `Type::Str`, not `i64`. It cannot be an
   arithmetic operand (`1 + "hi"` was accepted as integer addition on the
   string's address, `E0369`) and cannot be passed where an `i64` is expected
@@ -1953,7 +1958,7 @@ The README's roadmap lists the intended next steps.
   - **The sign bias is required** for power-of-two divisors; without it a
     negative dividend rounds toward negative infinity instead of toward zero.
   - `small_imm` accepts a negated literal, so `x / -1000` takes the fast path.
-  - `tests/cases/div.{rms,rs}` covers both variants, powers of two, negatives,
+  - `tests/cases/div.rs` covers both variants, powers of two, negatives,
     and boundary dividends, and is the regression guard for all of the above.
 - Division or modulo by a *variable* divisor uses `idiv`, but only after a
   32-bit fast path. `emit_div` tests whether both operands fit in 32 bits by
@@ -1987,7 +1992,7 @@ The README's roadmap lists the intended next steps.
   when it is a compile-time constant (`const_of`); a run-time count always gets
   the check. With overflow checks off, the shift is unchecked, matching Rust's
   default `<<` (which does not panic on an out-of-range count in release).
-- **`tests/cases/divtrap.rms` and `shovf.rms` pin the trap codegen.** `divtrap`
+- **`tests/cases/divtrap.rs` and `shovf.rs` pin the trap codegen.** `divtrap`
   exercises `MIN / -1` (SIGFPE on x86 `idiv`) and division by zero, both of which
   trap *without* `--overflow-checks` (Rust panics on them by default); it covers
   the constant `-1` divisor (strength-reduced) and a runtime divisor (`idiv`).
@@ -2015,8 +2020,8 @@ The README's roadmap lists the intended next steps.
   duplicate a side effect or leave without adding the accumulator. It
   is also skipped entirely under `--overflow-checks`, since reassociating checked
   arithmetic traps on a different intermediate than the recursion. A shape that
-  does not match is left completely alone. `tests/cases/tco.{rms,rs}` diffs `fib`
-  and `fact` against rustc and `tests/cases/callrec.{rms,rs}` covers the
+  does not match is left completely alone. `tests/cases/tco.rs` diffs `fib`
+  and `fact` against rustc and `tests/cases/callrec.rs` covers the
   `1 + f(n-1) + f(n-2)` shape; unit tests pin the non-associative
   `f(x-1) - f(x-2)` case, a `return` in an argument, a foreign call in the left
   operand, and overflow checks.

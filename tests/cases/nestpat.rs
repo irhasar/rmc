@@ -1,4 +1,3 @@
-// Rust twin of nestpat.rms.
 #[derive(Copy, Clone)]
 struct I { x: i64, y: i64 }
 #[derive(Copy, Clone)]

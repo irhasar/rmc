@@ -150,6 +150,11 @@ pub fn const_i64(e: &Expr) -> Option<i64> {
     match e {
         Expr::Int(k) => Some(*k),
         Expr::Un(UnOp::Neg, inner) => const_i64(inner)?.checked_neg(),
+        // `usize` and the other integer widths are transparent aliases for
+        // `i64`, so `i as usize` (the usual spelling of an index) is an
+        // identity cast that must not hide a constant index from the bound
+        // check.
+        Expr::Cast(inner, ty) if *ty == Type::I64 => const_i64(inner),
         // Fold the integer operators too, so a constant index written as an
         // expression (`a[1 + 4]`) is bounds-checked exactly like a literal.
         Expr::Bin(op, a, b) => {
@@ -160,6 +165,9 @@ pub fn const_i64(e: &Expr) -> Option<i64> {
                 Add => x.checked_add(y),
                 Sub => x.checked_sub(y),
                 Mul => x.checked_mul(y),
+                // `wrapping_mul` never overflows, so it folds to the wrapped
+                // product rather than to `None`.
+                WrappingMul => Some(x.wrapping_mul(y)),
                 Div => x.checked_div(y),
                 Mod => x.checked_rem(y),
                 BitAnd => Some(x & y),
@@ -189,6 +197,9 @@ pub fn const_binop(op: BinOp, a: i64, b: i64) -> Result<i64, String> {
         Add => a.overflowing_add(b),
         Sub => a.overflowing_sub(b),
         Mul => a.overflowing_mul(b),
+        // `wrapping_mul` is the one arithmetic op that cannot trap, so its
+        // constant fold is always defined.
+        WrappingMul => (a.wrapping_mul(b), false),
         Div | Mod => {
             if b == 0 {
                 return Err("division by zero panics at run time".into());
@@ -223,6 +234,7 @@ pub fn const_binop_checked(op: BinOp, a: i64, b: i64) -> Option<i64> {
         Add => a.overflowing_add(b),
         Sub => a.overflowing_sub(b),
         Mul => a.overflowing_mul(b),
+        WrappingMul => (a.wrapping_mul(b), false),
         Div | Mod => {
             if b == 0 || (a == i64::MIN && b == -1) {
                 return None;
