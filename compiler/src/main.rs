@@ -131,8 +131,8 @@ fn print_help() {
     println!(
         "rmc - experimental Rust-subset compiler (no LLVM, no crates)\n\
          \n\
-         USAGE:\n    rmc [OPTIONS] <input.rms>\n\
-         \x20   rmc [OPTIONS] <input.rs>    use rustc --emit=mir as the front end\n\
+         USAGE:\n    rmc [OPTIONS] <input.rs>    compile with rmc's own front end\n\
+         \x20   rmc --rustc-frontend <input.rs>  use rustc's parser and MIR optimiser\n\
          \x20   rmc [OPTIONS] <input.mir>   lower `rustc --emit=mir` text directly\n\
          \n\
          OPTIONS:\n\
