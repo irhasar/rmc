@@ -1372,6 +1372,12 @@ impl Sema {
                         *a |= *b;
                     }
                 }
+                // The back edge is taken: from here control reaches the loop's
+                // top again, so a binding declared before the loop is written
+                // once per iteration even if the rest of the body would exit.
+                if let Some(last) = self.loop_reach.last_mut() {
+                    *last = true;
+                }
                 Ok(())
             }
             Stmt::Continue(label) => {
