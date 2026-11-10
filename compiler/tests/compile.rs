@@ -2940,12 +2940,16 @@ fn bounds_checks_guard_a_loop_expression_base() {
 #[test]
 fn a_loop_expression_base_copies_its_break_value() {
     // The fix must not only add the check: the loop still yields the array, so
-    // indexing it in range reads the element.
-    let out = asm(
-        "fn main() -> i64 { let a: [i64; 3] = [10, 20, 30]; let i: i64 = 1; \
-         return loop { break a; }[i]; }",
+    // indexing it in range reads the element. Execute it and read element 1,
+    // which only a real copy of the `break` value can produce.
+    assert_eq!(
+        run_exit_code(
+            "fn main() -> i64 { let a: [i64; 3] = [10, 20, 30]; let i: i64 = 1; \
+             return loop { break a; }[i]; }"
+        ),
+        20,
+        "indexing the loop's returned array yields the element"
     );
-    assert!(out.contains("main:"), "compiles:\n{out}");
 }
 
 #[test]
@@ -2956,6 +2960,19 @@ fn a_unit_break_in_a_statement_loop_does_not_clobber_the_frame() {
     let out = asm("fn main() -> i64 { let mut n: i64 = 7; loop { break; } return n; }");
     assert!(out.contains("main:"), "compiles:\n{out}");
     assert!(!out.contains("mov %rax, -1(%rbp)"), "no store to slot -1:\n{out}");
+    assert_eq!(
+        run_exit_code("fn main() -> i64 { let mut n: i64 = 7; loop { break; } return n; }"),
+        7,
+        "the loop exits cleanly and the local survives"
+    );
+    // The value-store path the reviewer pointed at: a `break` whose value is
+    // `()` but which carries a side effect. It must print and still exit 0,
+    // not corrupt the frame.
+    assert_eq!(
+        run_output("fn main() -> i64 { loop { break print_i64(7); } return 0; }"),
+        (0, "7\n".to_string()),
+        "a unit `break` value runs its side effect and leaves the frame intact"
+    );
 }
 
 #[test]
@@ -3831,12 +3848,17 @@ fn a_shadowing_while_label_binds_the_inner_loop() {
     // `'o: while { break 'o; true }` inside `'o: loop`: the `while`'s own `'o`
     // shadows the outer one, so the `break` leaves the *while*, not the `loop`.
     // The outer loop therefore keeps running until its own `break`, which is
-    // what makes `c` reach 4.
-    let out = asm(
-        "fn main() -> i64 { let mut c: i64 = 0; 'o: loop { 'o: while { break 'o; true } {} \
-         c = c + 1; if c > 3 { break; } } return c; }",
+    // what makes `c` reach 4. Resolving `break 'o` to the outer loop would make
+    // the whole thing exit immediately and return 0, so executing it is what
+    // distinguishes the two resolutions.
+    assert_eq!(
+        run_exit_code(
+            "fn main() -> i64 { let mut c: i64 = 0; 'o: loop { 'o: while { break 'o; true } {} \
+             c = c + 1; if c > 3 { break; } } return c; }"
+        ),
+        4,
+        "the break leaves the inner while, so the outer loop runs four times"
     );
-    assert!(out.contains("main:"), "compiles:\n{out}");
 }
 
 #[test]
@@ -4553,10 +4575,16 @@ fn asm_no_licm(src: &str) -> String {
 }
 
 /// Compile `src` with the built `rmc` and run it, returning the exit status
-/// code (the value a `main() -> i64` returns). Shells out, so it only runs
-/// where the toolchain can link.
-fn run_exit_code(src: &str) -> i32 {
-    let dir = std::env::temp_dir().join(format!("rmc-run-{}", std::process::id()));
+/// code (the value a `main() -> i64` returns) together with stdout. Shells
+/// out, so it only runs where the toolchain can link.
+fn run_output(src: &str) -> (i32, String) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "rmc-run-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let srcp = dir.join("m.rs");
     let bin = dir.join("m.bin");
@@ -4571,7 +4599,15 @@ fn run_exit_code(src: &str) -> i32 {
     assert!(out.status.success(), "rmc failed: {}", String::from_utf8_lossy(&out.stderr));
     let run = std::process::Command::new(&bin).output().expect("run the binary");
     let _ = std::fs::remove_dir_all(&dir);
-    run.status.code().unwrap_or(-1)
+    (
+        run.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&run.stdout).into_owned(),
+    )
+}
+
+/// The exit status code of a compiled-and-run `main() -> i64`.
+fn run_exit_code(src: &str) -> i32 {
+    run_output(src).0
 }
 
 /// The instructions inside `main` only, so a hoisted value appearing before the
