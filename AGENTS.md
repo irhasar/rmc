@@ -160,7 +160,14 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1
   single write even when a sibling path `continue`s, and a `loop` whose every
   path `break`s/`return`s runs at most once. A `break` merges the writes on its
   path into the post-loop state. Keep generated `let`s `mutable: true` so they
-  never trip this.
+  never trip this. Three edges the analysis must get right: every loop entry
+  pushes a `loop_cont` entry (not just `loop_reach`), or a nested block's
+  `saved_cont` defaults to `false` and a write in the nested block of a
+  repeating loop is missed; a `break` merges only the *prefix* of its snapshot
+  that lines up with the bindings present at loop entry, so a break path that
+  declared extra locals still contributes its outer-binding writes; and a
+  `loop` with no reachable `break` does not fall through, so an infinite inner
+  loop must not make the outer loop look repeating.
 - **A compound assignment evaluates its place once.** `desugar_compound` binds
   any component of the target that contains a call — the base or the subscript —
   to a temporary and reuses it for both the read and the write, so `make().x += 1`
