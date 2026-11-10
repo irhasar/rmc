@@ -2052,3 +2052,39 @@ the lower branch's copy of a *different* method silently, and the next build
 fails with "duplicate definitions with name ..." once both are in the tree. A
 plain merge surfaces the overlapping hunks; resolve them by hand. After any
 such merge, rebuild and run `cargo test` plus `tests/run.py` before committing.
+
+## Definite-initialization analysis (`sema.rs`)
+
+The loop/branch init merge is where most rustc divergences have come from.
+Rules that took real work to pin down, each verified against rustc and now
+covered by a test in `compiler/tests/compile.rs`:
+
+- **A `while` condition runs at least once.** A binding it initializes is
+  initialized on the fall-through exit even if the body never runs, so
+  snapshot the state *after* checking the condition and require it on every
+  exit (the fall-through and each `break` that leaves the loop). Do not
+  restore the pre-condition snapshot.
+- **A `while` condition is re-evaluated whenever the body completes.** So a
+  write to a plain `let` in the condition is a second write (E0384). Seed the
+  condition's continuation (`loop_cont`) with the body's reachability before
+  checking the condition, or the back edge is invisible to the condition's
+  own block walk.
+- **A `for` range bound is evaluated before the loop's own label enters
+  scope.** A `break 'a` in a bound names the enclosing `'a` loop even when the
+  `for` reuses that label, so the bound scanners must *not* apply the
+  shadowing (`outward`) test; only the body is shadowed.
+- **An `if` whose two branches both diverge does not fall through.** Merging
+  such branches as "uninitialized" clobbers a binding that was live before the
+  `if`; keep the pre-`if` state instead.
+- **rustc counts unreachable breaks.** `'a: loop { loop { break; break 'a; } }`
+  is rejected (E0308) because the dead `break 'a` still makes the outer loop
+  `()`, not `!`. `block_has_break_at` must therefore scan *every* statement,
+  including ones after a `break`/`return` — a "stop at non-falling stmt" walk
+  is wrong here.
+- **Check ordering matters for the message.** rustc reports an unlabelled
+  `break`/`continue` in a `while` condition before it evaluates the condition,
+  so that check must precede `check_expr`.
+
+Tests that claim to guard a runtime bug must *execute* the program and assert
+the result (`run_exit_code` / `run_output`); an `asm(...).contains("main:")`
+assertion passes even when the emitted code is wrong.
