@@ -361,7 +361,7 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
   one temporary across a loop body: a `while` that indexes the same array twice
   has two `assert`s reading one `_15`, and the first folds it away, so the second
   read a never-written slot and trapped (`exit 101`). The skip now consults
-  `local_used_elsewhere` first; keep that guard on any new fold. Pinned by
+  `local_used_elsewhere` first; keep that guard on any new fold. 
   `tests/std/reusedcheck.rs`.
 - **The same `bool` reuse is what makes the fold *safe* in a loop header.** The
   guard above was too coarse: it treated a read of the local in *any* other block
@@ -415,6 +415,30 @@ standalone CLI for the same thing, and the benchmark times the two stages apart.
 - `main.rs::run_mir_pipeline` honours `--no-inline`/`--no-licm`/`--no-tco`, the
   same gates the `.rms` path uses, so the fuzzer's per-pass matrix applies to
   both pipelines.
+- **A `drop(_N)` terminator runs `_N`'s destructor, and a type's own `Drop` impl
+  runs *before* its fields are dropped.** The parser records each impl's
+  receiver type -> `__rmc_drop_<T>` symbol in `Program::drop_impls`; the back
+  end's `gen_drop_glue` calls that impl, then recurses into the fields (and
+  array elements), matching rustc's `drop_in_place` order. Skipping the field
+  recursion after an impl silently drops a nested droppable field; calling only
+  the impl (an early revision) silently skipped *every* nested destructor. A
+  `drop` terminator is a *read* of its place, so `terminator_reads` counts it,
+  and every block-remap pass (`layout_blocks`, `compact_blocks`) must remap its
+  target or the edge is dropped - both were one-line omissions that took a
+  while to find. `reachable` runs after `collect_structs` (it needs the
+  layouts) and collects drop-glue symbols from `Drop` terminators, since no
+  `Call` names them. Pinned by `tests/mir/drop.rs` (direct) and
+  `tests/mir/dropnest.rs` (nested fields, array elements, impl-plus-field).
+- **An impl method needs a receiver-qualified symbol.** rustc prints every
+  inherent/trait method as `<impl at ...>::name` (or `Type::<impl at ...>::name`),
+  so keying by the bare name collides two impls of the same method
+  (`A::value`/`B::value` both became `value`, and one body won). `mir.rs`
+  keys a definition by `<Receiver>__<name>` and marks a call target it cannot
+  yet key with `IMPL_MARK`; `resolve_impl_calls` runs after the whole program is
+  parsed and fills the receiver in from the call's first argument (a `&T`/`T`
+  local), so a forward reference to a later impl still resolves. An associated
+  function (`A::make()`) has no receiver and keeps its bare name. Pinned by
+  `tests/mir/implname.rs`.
 - **A `&str`/`&[u8]` literal on the MIR path is a `{len: i64, bytes..}` record,
   not a NUL-terminated C string.** `mir_codegen.rs` emits `.quad <len>` before
   the bytes. `str::len` lowers to `PtrMetadata`, which reads word 0, and the

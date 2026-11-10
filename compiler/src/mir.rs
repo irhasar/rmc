@@ -296,6 +296,11 @@ pub enum Terminator {
     /// A trap (e.g. `assert` failure with `unwind terminate`); the backend
     /// emits an `exit(101)`.
     Abort,
+    /// `drop(_N) -> [return: bbX, ...]`: run `_N`'s destructor, then continue.
+    /// The back end calls the type's `Drop::drop` impl with the value's
+    /// address. Folding this to a plain `goto` (as an earlier revision did)
+    /// silently skipped every destructor.
+    Drop { place: Place, target: u32 },
 }
 
 #[derive(Debug, Clone)]
@@ -358,6 +363,12 @@ pub struct Program {
     /// `main::promoted[N]` -> the value it points at, for the ones the back end
     /// can fold. A name that is absent is rejected rather than miscompiled.
     pub promoted: HashMap<String, Promoted>,
+    /// Receiver type name -> the emitted symbol of its `Drop::drop` impl. The
+    /// MIR prints each impl's body as `fn <impl at ...>::drop(_1: &mut T)`, so
+    /// every impl normalises to the same `drop` name; renaming each to
+    /// `__rmc_drop_<T>` keeps them distinct, and the map lets the back end
+    /// resolve a `drop(_N)` terminator from `_N`'s type.
+    pub drop_impls: HashMap<String, String>,
 }
 
 /// A static allocation: its bytes, any pointer relocations into other
@@ -424,6 +435,7 @@ impl Function {
                 let term = std::iter::once(&b.term).flat_map(|t| match t {
                     Terminator::SwitchInt { discr, .. } => operand_indices(discr),
                     Terminator::Assert { cond, .. } => operand_indices(cond),
+                    Terminator::Drop { place, .. } => place_indices(place),
                     Terminator::Call { args, .. } => {
                         args.iter().flat_map(operand_indices).collect::<Vec<_>>()
                     }
@@ -505,7 +517,7 @@ impl Function {
     /// The number of reads of each local, over the (already rewritten) body.
     fn use_counts(&self) -> HashMap<u32, u32> {
         let mut uses: HashMap<u32, u32> = HashMap::new();
-        let mut read_op = |op: &Operand, uses: &mut HashMap<u32, u32>| {
+        let read_op = |op: &Operand, uses: &mut HashMap<u32, u32>| {
             if let Operand::Copy(p) | Operand::Move(p) = op {
                 *uses.entry(p.local).or_insert(0) += 1;
             }
@@ -519,6 +531,9 @@ impl Function {
             match &b.term {
                 Terminator::SwitchInt { discr, .. } => read_op(discr, &mut uses),
                 Terminator::Assert { cond, .. } => read_op(cond, &mut uses),
+                Terminator::Drop { place, .. } => {
+                    *uses.entry(place.local).or_insert(0) += 1;
+                }
                 Terminator::Call { args, .. } => {
                     for a in args {
                         read_op(a, &mut uses);
@@ -768,6 +783,7 @@ fn rewrite_term(t: &mut Terminator, subst: &HashMap<u32, Place>) {
     match t {
         Terminator::SwitchInt { discr, .. } => rewrite_op(discr, subst),
         Terminator::Assert { cond, .. } => rewrite_op(cond, subst),
+        Terminator::Drop { place, .. } => rewrite_place(place, subst),
         Terminator::Call { args, .. } => {
             for a in args {
                 rewrite_op(a, subst);
@@ -789,6 +805,7 @@ pub fn parse(text: &str) -> Result<Program, String> {
         allocs: HashMap::new(),
         consts: HashMap::new(),
         promoted: HashMap::new(),
+        drop_impls: HashMap::new(),
     };
     let mut i = 0;
     while i < lines.len() {
@@ -799,6 +816,19 @@ pub fn parse(text: &str) -> Result<Program, String> {
         }
         if l.starts_with("fn ") {
             let (f, next) = parse_fn(&lines, i)?;
+            // Record a `Drop` impl's receiver type -> its renamed symbol, so the
+            // back end can resolve a `drop(_N)` terminator to the impl.
+            if l.contains("<impl") {
+                if let Some((open, close)) = l.find('(').zip(l.find(')')) {
+                    let head = l[..open].trim();
+                    let arg_tys = parse_arg_tys(&l[open + 1..close]).unwrap_or_default();
+                    if head.rsplit(">::").next().map(str::trim) == Some("drop") {
+                        if let Some(recv) = method_receiver_ty(&arg_tys) {
+                            prog.drop_impls.insert(recv.clone(), format!("__rmc_drop_{recv}"));
+                        }
+                    }
+                }
+            }
             prog.funcs.push(f);
             i = next;
         } else if l.starts_with("const ") && l.contains("::promoted[") {
@@ -822,7 +852,57 @@ pub fn parse(text: &str) -> Result<Program, String> {
             i += 1;
         }
     }
+    resolve_impl_calls(&mut prog);
     Ok(prog)
+}
+
+/// Replace each marked impl-method call target (`<IMPL_MARK>method`) with the
+/// receiver-keyed symbol (`A__method`). The receiver type is read from the
+/// call's first argument: its local's declared type, or, for an argument whose
+/// own type is not yet resolved (a nested call result), the destination's type
+/// where that is known. This runs after parsing so every `LocalDecl` is final.
+fn resolve_impl_calls(prog: &mut Program) {
+    for f in &mut prog.funcs {
+        let locals: Vec<Ty> = f.locals.iter().map(|l| (*l.ty).clone()).collect();
+        for b in &mut f.blocks {
+            let (method, first_arg) = match &b.term {
+                Terminator::Call { func: CallTarget::Direct(name), args, .. } => {
+                    match name.strip_prefix(IMPL_MARK) {
+                        Some(m) => (m.to_string(), args.first().cloned()),
+                        None => continue,
+                    }
+                }
+                _ => continue,
+            };
+            // An associated function (`A::make()`) has no receiver argument;
+            // its definition is keyed by its bare name too, so fall back.
+            let resolved = match first_arg.as_ref().and_then(|a| operand_receiver_ty(&locals, a)) {
+                Some(recv) => impl_method_name(&recv, &method),
+                None => method,
+            };
+            if let Terminator::Call { func, .. } = &mut b.term {
+                *func = CallTarget::Direct(resolved);
+            }
+        }
+    }
+}
+
+/// The receiver type of a method call's first argument: a reference/pointer
+/// argument yields its pointee, an aggregate argument yields itself.
+fn operand_receiver_ty(locals: &[Ty], op: &Operand) -> Option<String> {
+    let place = match op {
+        Operand::Copy(p) | Operand::Move(p) => p,
+        _ => return None,
+    };
+    let ty = locals.get(place.local as usize)?;
+    let inner = match ty {
+        Ty::Ref(t) | Ty::Ptr(t) => &**t,
+        other => other,
+    };
+    match inner {
+        Ty::Struct(n) => Some(n.clone()),
+        _ => None,
+    }
 }
 
 fn strip_comment(line: &str) -> String {
@@ -1177,13 +1257,30 @@ fn parse_fn(lines: &[String], start: usize) -> Result<(Function, usize), String>
     let header = lines[start].trim();
     let rest = header.strip_prefix("fn ").unwrap();
     let open = rest.find('(').ok_or_else(|| format!("mir: bad fn header `{header}`"))?;
-    let name = rest[..open].trim().to_string();
-    // The emitted symbol is the bare definition name, but a call prints the
-    // qualified path. Map `...::name` (and `<T as Tr>::name`) back to `name` so
-    // direct calls resolve to the definition.
-    let name = normalize_call_name(&name).unwrap_or(name);
     let close = matching(rest, open, '(', ')').ok_or_else(|| format!("mir: unbalanced fn args `{header}`"))?;
+    let raw_name = rest[..open].trim().to_string();
     let arg_tys = parse_arg_tys(&rest[open + 1..close])?;
+    // A method definition prints as `<impl at ...>::name` (or
+    // `Type::<impl at ...>::name`), and rustc emits a distinct body per impl.
+    // Key it by receiver type (`A__value`) so two impls of the same method name
+    // cannot collide into one symbol; a call is resolved to the same key by
+    // `resolve_impl_calls`. A free function keeps its bare name.
+    let method = raw_name
+        .contains("<impl")
+        .then(|| raw_name.rsplit(">::").next().map(|m| m.trim().to_string()))
+        .flatten();
+    let recv = method_receiver_ty(&arg_tys);
+    let mut name = match (&method, &recv) {
+        (Some(m), Some(r)) if !m.is_empty() && !m.contains('<') => format!("{r}__{m}"),
+        _ => normalize_call_name(&raw_name).unwrap_or_else(|| raw_name.clone()),
+    };
+    // A `Drop` impl is renamed to `__rmc_drop_<T>`; `parse` records the mapping
+    // so a `drop(_N)` terminator can find the right impl from `_N`'s type.
+    if method.as_deref() == Some("drop") {
+        if let Some(r) = &recv {
+            name = format!("__rmc_drop_{r}");
+        }
+    }
     let after = rest[close + 1..].trim();
     let _ret = match after.strip_prefix("->") {
         Some(r) => parse_ty(r.trim().trim_end_matches('{').trim())?,
@@ -1205,7 +1302,7 @@ fn parse_fn(lines: &[String], start: usize) -> Result<(Function, usize), String>
     let body = &lines[start + 1..end];
 
     let mut locals: Vec<LocalDecl> = Vec::new();
-    let mut ensure = |n: u32, locals: &mut Vec<LocalDecl>| {
+    let ensure = |n: u32, locals: &mut Vec<LocalDecl>| {
         while locals.len() <= n as usize {
             locals.push(LocalDecl { ty: Box::new(Ty::Unit), is_arg: false, name: None });
         }
@@ -1447,6 +1544,12 @@ fn std_intrinsic_name(name: &str) -> Option<String> {
 /// `<core::ops::Range<i64> as Iterator>::next`). rmc's frontend drops the
 /// qualifier, so the last path segment is the definition name; a leading
 /// `::`-less segment after stripping an `<...>` qualifier is that name.
+/// A sentinel prefixed to a call target that still needs its receiver type
+/// resolved (`<impl at ...>::value`). The parser cannot key it without the
+/// argument types, so `parse` leaves the marker and `resolve_impl_calls` fills
+/// it in once the whole program (and thus every struct layout) is known.
+const IMPL_MARK: char = '\u{1}';
+
 fn normalize_call_name(name: &str) -> Option<String> {
     let name = name.trim();
     if name.is_empty() || name.starts_with('_') {
@@ -1454,6 +1557,31 @@ fn normalize_call_name(name: &str) -> Option<String> {
     }
     if !name.contains("::") && !name.contains('<') {
         return Some(name.to_string());
+    }
+    // An impl method (`<impl at ...>::value`, `Type::<impl at ...>::value`) is
+    // returned with a marker and its method name; `resolve_impl_calls` later
+    // replaces the marker with the receiver type derived from the arguments.
+    if name.contains("<impl") {
+        let last = name.rsplit(">::").next()?.trim();
+        if last.is_empty() || last.starts_with('_') || last.contains('<') {
+            return None;
+        }
+        return Some(format!("{IMPL_MARK}{last}"));
+    }
+    // An inherent method call prints as `Type::method` (a capitalised first
+    // segment, a lowercase last). It carries the same marker as an impl-method
+    // definition so the two resolve to one receiver-keyed symbol. A
+    // module-qualified free function (`m::helper`) has a lowercase first
+    // segment and is left alone.
+    let head = name.split('<').next().unwrap_or(name);
+    let first = head.split("::").next().unwrap_or(head).trim();
+    let tail = head.rsplit("::").next().unwrap_or(head).trim();
+    if first != tail
+        && first.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && tail.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+        && tail.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Some(format!("{IMPL_MARK}{tail}"));
     }
     // Drop a leading `<...>` qualifier, then take the final path segment.
     let mut rest = name;
@@ -1586,15 +1714,18 @@ fn parse_terminator(t: &str) -> Option<Terminator> {
         return Some(Terminator::Abort);
     }
     if let Some(rest) = t.strip_prefix("drop(") {
-        // `drop(_N) -> [return: bbX, ...]`
-        if let Some((_, targets)) = split_arrow(t) {
-            if let Some(bb) = parse_success_target(targets) {
-                return Some(Terminator::Goto(bb));
-            }
-            let _ = rest;
-            return Some(Terminator::Unreachable);
-        }
-        return Some(Terminator::Unreachable);
+        // `drop(_N) -> [return: bbX, ...]`. The place names the value whose
+        // destructor runs; the back end resolves `_N`'s type to its `Drop::drop`
+        // impl. A `drop` with no target is `unreachable` (the value is dropped
+        // and control does not continue), which the caller cannot represent, so
+        // reject it rather than miscompile.
+        let open = t.find('(')?;
+        let close = matching(t, open, '(', ')')?;
+        let place = parse_place(t[open + 1..close].trim()).ok()?;
+        let (_, targets) = split_arrow(t)?;
+        let target = parse_success_target(targets)?;
+        let _ = rest;
+        return Some(Terminator::Drop { place, target });
     }
     if t.starts_with("StorageLive") || t.starts_with("StorageDead") || t == "Nop;" {
         return None;
@@ -2572,6 +2703,27 @@ fn is_enum_variant_name(name: &str) -> bool {
     }
 }
 
+/// The receiver type of a method's `_1` argument (`_1: &mut Guard` ->
+/// `Guard`), which keys the method's qualified symbol. A non-aggregate receiver
+/// (`&i64`) has no impl type to qualify by.
+fn method_receiver_ty(arg_tys: &[(u32, Ty)]) -> Option<String> {
+    let (_, ty) = arg_tys.iter().find(|(i, _)| *i == 1)?;
+    let inner = match ty {
+        Ty::Ref(t) | Ty::Ptr(t) => &**t,
+        other => other,
+    };
+    match inner {
+        Ty::Struct(n) => Some(n.clone()),
+        _ => None,
+    }
+}
+
+/// The emitted symbol for an impl method: `<Receiver>__<method>`, so two impls
+/// of the same method name on different types stay distinct.
+fn impl_method_name(recv: &str, method: &str) -> String {
+    format!("{recv}__{method}")
+}
+
 /// Function arguments, as `(local index, type)` pairs. The index matters: MIR
 /// numbers arguments from `_1` (`_0` is the return place), and the locals are
 /// not necessarily declared in index order.
@@ -2680,6 +2832,16 @@ pub fn parse_ty(s: &str) -> Result<Ty, String> {
                 return Ok(Ty::Struct(last.to_string()));
             }
             if s.contains("::") {
+                // A qualified user-defined aggregate (`m::Pair`, `crate::E`)
+                // reaches here after the std shapes above. Keep its identity so
+                // the back end sizes and copies the whole value; folding it to
+                // `Ty::Other` would silently copy only the first word.
+                if let Some(last) = qualified_aggregate_name(s) {
+                    return Ok(Ty::Struct(last));
+                }
+                if let Some(last) = lowercase_module_aggregate(s) {
+                    return Ok(Ty::Struct(last));
+                }
                 Ok(Ty::Other)
             } else {
                 Ok(Ty::Struct(s.to_string()))
@@ -2689,6 +2851,48 @@ pub fn parse_ty(s: &str) -> Result<Ty, String> {
 }
 
 // --- small string utilities ------------------------------------------------
+
+/// The last path segment of a qualified *user aggregate* type name, if `s`
+/// names one (`m::Pair` -> `Pair`, `crate::E` -> `E`). `None` for a
+/// function-pointer or trait-object type, whose last segment is not a type, so
+/// `parse_ty` keeps treating those as scalars.
+///
+/// Only types the earlier std-shape arms did not already claim reach here, so
+/// `std::fmt::Arguments` and the `format_args!` helpers are handled before this
+/// is consulted.
+fn qualified_aggregate_name(s: &str) -> Option<String> {
+    // Drop a leading `<...>` qualifier (`<T as Trait>::Assoc`).
+    let mut rest = s.trim();
+    if rest.starts_with('<') {
+        let close = matching(rest, 0, '<', '>')?;
+        rest = rest[close + 1..].trim_start_matches("::").trim();
+    }
+    // A type argument list may follow the last segment; cut at the first `<`.
+    let head = rest.split('<').next().unwrap_or(rest);
+    let last = head.rsplit("::").next().unwrap_or(head).trim();
+    let ok = !last.is_empty()
+        && last.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && last.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    ok.then(|| last.to_string())
+}
+
+/// The final CamelCase segment of a path-qualified aggregate whose last
+/// segment is capitalised but whose *first* is not (`a::A` -> `A`). Such a name
+/// is a module-qualified user type, which `qualified_aggregate_name` rejects
+/// (it keys on a capitalised last segment) and `parse_ty` would otherwise fold
+/// to `Ty::Other`, losing the value's size. This mirrors the printer's
+/// qualification of a type used across a module boundary.
+fn lowercase_module_aggregate(s: &str) -> Option<String> {
+    let head = s.split('<').next().unwrap_or(s);
+    let mut segs = head.split("::").filter(|x| !x.trim().is_empty());
+    let first = segs.next()?.trim();
+    let last = head.rsplit("::").next()?.trim();
+    let is_ty = !last.is_empty()
+        && last.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && last.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let first_is_mod = first.chars().next().is_some_and(|c| c.is_ascii_lowercase());
+    (is_ty && first_is_mod).then(|| last.to_string())
+}
 
 /// Index of the matching close bracket for the opener at `open`.
 fn matching(s: &str, open: usize, oc: char, cc: char) -> Option<usize> {
@@ -3166,6 +3370,10 @@ impl Remap {
             Terminator::Assert { cond, negate, target } => Terminator::Assert {
                 cond: self.op(cond),
                 negate: *negate,
+                target: self.block(*target),
+            },
+            Terminator::Drop { place, target } => Terminator::Drop {
+                place: self.place_ret(place, dest_local),
                 target: self.block(*target),
             },
         }
@@ -4135,6 +4343,7 @@ impl Function {
                 }
                 Terminator::Call { target: Some(t), .. } => *t = remap(*t),
                 Terminator::Assert { target, .. } => *target = remap(*target),
+                Terminator::Drop { target, .. } => *target = remap(*target),
                 _ => {}
             }
         }
@@ -4170,6 +4379,11 @@ fn redirect_target(t: &mut Terminator, from: u32, to: u32) {
                 *target = to;
             }
         }
+        Terminator::Drop { target, .. } => {
+            if *target == from {
+                *target = to;
+            }
+        }
         _ => {}
     }
 }
@@ -4192,6 +4406,7 @@ fn explicit_target(t: &Terminator) -> Option<u32> {
         }
         Terminator::Call { target, .. } => *target,
         Terminator::Assert { target, .. } => Some(*target),
+        Terminator::Drop { target, .. } => Some(*target),
         _ => None,
     }
 }
@@ -4269,6 +4484,7 @@ impl Function {
                 }
                 Terminator::Call { target: Some(t), .. } => *t = remap(*t),
                 Terminator::Assert { target, .. } => *target = remap(*target),
+                Terminator::Drop { target, .. } => *target = remap(*target),
                 _ => {}
             }
         }
@@ -4571,6 +4787,7 @@ fn edges_with_facts(t: &Terminator) -> Vec<(u32, EdgeFact)> {
         Terminator::Goto(b) => vec![(*b, EdgeFact::None)],
         Terminator::Call { target, .. } => target.iter().map(|b| (*b, EdgeFact::None)).collect(),
         Terminator::Assert { target, .. } => vec![(*target, EdgeFact::None)],
+        Terminator::Drop { target, .. } => vec![(*target, EdgeFact::None)],
         Terminator::Return | Terminator::Unreachable | Terminator::Abort => Vec::new(),
     }
 }
@@ -5022,26 +5239,6 @@ impl Function {
     }
 }
 
-/// Whether `from` can reach `to` by following predecessor edges, i.e. `from`
-/// dominates-or-equals `to` in the block order. Used to tell a back edge from a
-/// forward one without relying on block numbering.
-fn reaches(preds: &[Vec<u32>], from: u32, to: u32) -> bool {
-    let mut seen = HashSet::new();
-    let mut stack = vec![to];
-    while let Some(b) = stack.pop() {
-        if b == from {
-            return true;
-        }
-        if !seen.insert(b) {
-            continue;
-        }
-        for &p in &preds[b as usize] {
-            stack.push(p);
-        }
-    }
-    false
-}
-
 /// The successor blocks of a terminator.
 pub(crate) fn successors(t: &Terminator) -> Vec<u32> {
     match t {
@@ -5053,6 +5250,7 @@ pub(crate) fn successors(t: &Terminator) -> Vec<u32> {
         }
         Terminator::Call { target, .. } => target.iter().copied().collect(),
         Terminator::Assert { target, .. } => vec![*target],
+        Terminator::Drop { target, .. } => vec![*target],
         Terminator::Return | Terminator::Unreachable | Terminator::Abort => Vec::new(),
     }
 }

@@ -118,11 +118,6 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<String, String> {
     let mut asm = String::new();
     asm.push_str(".text\n");
 
-    // Emit only functions the program can reach from `main` (dead-function
-    // elimination keeps the artifact small and the compile fast).
-    let live = reachable(prog);
-    let order: Vec<&Function> = prog.funcs.iter().filter(|f| live.contains(&f.name)).collect();
-
     // String literals become `.rodata` labels, emitted once.
     let (strings, string_ids) = collect_strings(prog);
     // `format_args!` templates are byte-string literals: raw bytes, no length
@@ -141,6 +136,12 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<String, String> {
     // enum-variant constant (`Option::Some(..)`).
     let enums = collect_enums(prog);
     let structs = collect_structs(prog, &enums);
+
+    // Emit only functions the program can reach from `main` (dead-function
+    // elimination keeps the artifact small and the compile fast). `drop` glue
+    // needs the struct layouts, so this runs after `collect_structs`.
+    let live = reachable(prog, &structs);
+    let order: Vec<&Function> = prog.funcs.iter().filter(|f| live.contains(&f.name)).collect();
 
     // Deref trampolines for reference placeholders are module-scoped and emitted
     // once, after every function body (see `FnGen::deref_fmt_label`).
@@ -276,7 +277,7 @@ pub fn compile(prog: &Program, opts: &Options) -> Result<String, String> {
 }
 
 /// Functions reachable from `main` by direct calls.
-fn reachable(prog: &Program) -> HashSet<String> {
+fn reachable(prog: &Program, structs: &HashMap<String, Vec<Ty>>) -> HashSet<String> {
     let mut live = HashSet::new();
     let Some(main) = prog.func("main") else { return live };
     let mut stack = vec![main.name.clone()];
@@ -286,15 +287,61 @@ fn reachable(prog: &Program) -> HashSet<String> {
         }
         if let Some(f) = prog.func(&name) {
             for b in &f.blocks {
-                if let Terminator::Call { func: CallTarget::Direct(callee), .. } = &b.term {
-                    if prog.func(callee).is_some() {
-                        stack.push(callee.clone());
+                match &b.term {
+                    Terminator::Call { func: CallTarget::Direct(callee), .. } => {
+                        if prog.func(callee).is_some() {
+                            stack.push(callee.clone());
+                        }
                     }
+                    // A `drop(_N)` terminator runs `_N`'s destructor, which may
+                    // be a nested field's impl; none of them are named by a
+                    // `Call`, so collect them all here.
+                    Terminator::Drop { place, .. } => {
+                        if place.proj.is_empty() {
+                            if let Some(ty) = f.locals.get(place.local as usize).map(|l| &*l.ty) {
+                                let mut syms = Vec::new();
+                                collect_drop_symbols(prog, structs, ty, &mut syms);
+                                stack.extend(syms);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
     }
     live
+}
+
+/// Every `__rmc_drop_<T>` symbol a destructor of `ty` needs: its own impl, or
+/// (for an aggregate without one) the impls of its droppable fields.
+fn collect_drop_symbols(
+    prog: &Program,
+    structs: &HashMap<String, Vec<Ty>>,
+    ty: &Ty,
+    out: &mut Vec<String>,
+) {
+    match ty {
+        Ty::Struct(name) => {
+            // A type with its own impl still drops its fields afterwards, so
+            // record the impl *and* recurse, exactly as `gen_drop_glue` emits.
+            if let Some(sym) = prog.drop_impls.get(name) {
+                out.push(sym.clone());
+            }
+            if let Some(fields) = structs.get(name) {
+                for f in fields {
+                    collect_drop_symbols(prog, structs, f, out);
+                }
+            }
+        }
+        Ty::Array(elem, _) => collect_drop_symbols(prog, structs, elem, out),
+        Ty::Tuple(tys) => {
+            for t in tys {
+                collect_drop_symbols(prog, structs, t, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Whether `name` can reach a call to `callee` through direct calls.
@@ -1108,10 +1155,6 @@ impl<'a> FnGen<'a> {
         self.local_base.get(local as usize).copied().unwrap_or(local as i64)
     }
 
-    fn local_size(&self, local: u32) -> i64 {
-        self.size.get(local as usize).copied().unwrap_or(8)
-    }
-
     fn local_ty(&self, local: u32) -> Ty {
         self.ty.get(local as usize).cloned().unwrap_or(Ty::I64)
     }
@@ -1126,10 +1169,6 @@ impl<'a> FnGen<'a> {
 
     /// True when a scalar local is held in a register (so `p.proj` is empty and
     /// reading it needs no memory access).
-    fn place_is_promoted(&self, p: &Place) -> bool {
-        p.proj.is_empty() && self.promo.contains_key(&p.local)
-    }
-
     // --- analysis ----------------------------------------------------------
 
     /// Compute each local's size and type, and find the operands of counted
@@ -1952,6 +1991,12 @@ impl<'a> FnGen<'a> {
             Terminator::SwitchInt { discr, targets, otherwise } => {
                 self.gen_switch(bb, discr, targets, *otherwise)?;
             }
+            Terminator::Drop { place, target } => {
+                self.gen_drop(place)?;
+                if *target != bb + 1 || *target as usize >= self.func.blocks.len() {
+                    self.emit(&format!("  jmp .Lbb{}", self.bb_label(*target)));
+                }
+            }
             Terminator::Call { dest, func, args, target } => {
                 // `cold_path` is an optimisation hint with no effect here; it
                 // has no body to call, so skip it and continue.
@@ -2318,7 +2363,17 @@ impl<'a> FnGen<'a> {
     /// Leave the address of `place` in `%rax`.
     fn place_addr(&mut self, p: &Place) -> Result<(), String> {
         let starts_deref = matches!(p.proj.first(), Some(Proj::Deref));
+        // An aggregate argument is passed by address: its frame slot holds a
+        // pointer to the value, not the value itself (see `gen_call`, which
+        // evaluates every aggregate argument to an address). Every read of such
+        // a local, and every projection off it, is relative to that pointer.
+        let agg_arg = !starts_deref
+            && self.local_ty(p.local).is_aggregate()
+            && self.func.locals.get(p.local as usize).map(|l| l.is_arg).unwrap_or(false);
         if starts_deref {
+            let src = self.local_operand(p.local);
+            self.emit(&format!("  mov {src}, %rax"));
+        } else if agg_arg {
             let src = self.local_operand(p.local);
             self.emit(&format!("  mov {src}, %rax"));
         } else if p.proj.is_empty() {
@@ -2472,11 +2527,6 @@ impl<'a> FnGen<'a> {
         }
     }
 
-    /// The layout of an enum, if the backend models it.
-    fn enum_layout(&self, name: &str) -> Option<&EnumLayout> {
-        self.enums.get(name)
-    }
-
     /// The byte offset of variant `v`'s field `k` within an enum, or the offset
     /// of the tag when `k` is `None`.
     fn enum_field_offset(&self, name: &str, _v: &str, k: u64) -> i64 {
@@ -2515,11 +2565,6 @@ impl<'a> FnGen<'a> {
             acc += self.size_of_ty(t);
         }
         Some((offs, tys.clone()))
-    }
-
-    /// Leave the scalar value at `place` in `%rax`.
-    fn load_place_value(&mut self, p: &Place) -> Result<(), String> {
-        self.load_place_to(p, "%rax")
     }
 
     /// Load the scalar value at `place` into `reg` (which may be `%rax`).
@@ -3817,6 +3862,163 @@ impl<'a> FnGen<'a> {
 
     // --- calls -------------------------------------------------------------
 
+    /// Emit `place`'s destructor: call its type's `Drop::drop` impl with the
+    /// value's address, or, when the type has no impl of its own but has fields
+    /// that do, run each field's destructor in place.
+    fn gen_drop(&mut self, place: &Place) -> Result<(), String> {
+        let ty = self.place_ty(place);
+        if self.ty_needs_drop(&ty) {
+            self.gen_drop_glue(place, &ty)?;
+        }
+        Ok(())
+    }
+
+    /// Run the destructor of the value at `place`: its type's own `Drop` impl,
+    /// then, as rustc's `drop_in_place` does, the destructor of every droppable
+    /// field. A type without an impl has only the fields to drop.
+    fn gen_drop_glue(&mut self, place: &Place, ty: &Ty) -> Result<(), String> {
+        if let Some(sym) = self.drop_symbol_for_ty(ty) {
+            self.place_addr(place)?;
+            self.emit("  mov %rax, %rdi");
+            self.emit(&format!("  call {sym}"));
+        }
+        match ty {
+            Ty::Struct(name) => {
+                let fields = self.structs.get(name).cloned().unwrap_or_default();
+                for (i, fty) in fields.iter().enumerate() {
+                    if !self.ty_needs_drop(fty) {
+                        continue;
+                    }
+                    let sub = self.subplace(place, i as u64);
+                    self.gen_drop_glue(&sub, fty)?;
+                }
+            }
+            Ty::Tuple(tys) => {
+                for (i, fty) in tys.iter().enumerate() {
+                    if !self.ty_needs_drop(fty) {
+                        continue;
+                    }
+                    let sub = self.subplace(place, i as u64);
+                    self.gen_drop_glue(&sub, fty)?;
+                }
+            }
+            Ty::Array(elem, n) => {
+                if *n == 0 || !self.ty_needs_drop(elem) {
+                    return Ok(());
+                }
+                let size = self.size_of_ty(elem);
+                // `_i` runs 0..n, dropping each element front to back (the order
+                // rustc's own array glue uses).
+                let i = self.alloc_slot();
+                let loop_lbl = self.new_label();
+                let done = self.new_label();
+                self.emit(&format!("  movq $0, {}", self.off(i)));
+                self.emit(&format!("{loop_lbl}:"));
+                self.emit(&format!("  cmp ${n}, {}", self.off(i)));
+                self.emit(&format!("  jge {done}"));
+                self.place_addr(place)?;
+                self.emit(&format!("  mov {}, %rdx", self.off(i)));
+                if size != 1 {
+                    self.emit(&format!("  imul ${size}, %rdx"));
+                }
+                self.emit("  add %rdx, %rax");
+                // The element's destructor may itself be glue, so recurse
+                // through the element address rather than inlining the math.
+                self.emit("  mov %rax, %rdi");
+                self.gen_drop_glue_at_reg(elem)?;
+                self.emit(&format!("  addq $1, {}", self.off(i)));
+                self.emit(&format!("  jmp {loop_lbl}"));
+                self.emit(&format!("{done}:"));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Glue for an aggregate whose address is already in `%rdi` (an array
+    /// element, or a field reached by pointer). Emits the type's own impl, then
+    /// its fields' destructors at their offsets, recursing for nested
+    /// aggregates.
+    fn gen_drop_glue_at_reg(&mut self, ty: &Ty) -> Result<(), String> {
+        if let Some(sym) = self.drop_symbol_for_ty(ty) {
+            self.emit(&format!("  call {sym}"));
+        }
+        match ty {
+            Ty::Array(elem, n) => {
+                if *n == 0 || !self.ty_needs_drop(elem) {
+                    return Ok(());
+                }
+                let size = self.size_of_ty(elem);
+                let ptr = self.alloc_slot();
+                let i = self.alloc_slot();
+                let loop_lbl = self.new_label();
+                let done = self.new_label();
+                self.emit(&format!("  mov %rdi, {}", self.off(ptr)));
+                self.emit(&format!("  movq $0, {}", self.off(i)));
+                self.emit(&format!("{loop_lbl}:"));
+                self.emit(&format!("  cmp ${n}, {}", self.off(i)));
+                self.emit(&format!("  jge {done}"));
+                self.emit(&format!("  mov {}, %rdi", self.off(ptr)));
+                self.emit(&format!("  mov {}, %rdx", self.off(i)));
+                if size != 1 {
+                    self.emit(&format!("  imul ${size}, %rdx"));
+                }
+                self.emit("  add %rdx, %rdi");
+                self.gen_drop_glue_at_reg(elem)?;
+                self.emit(&format!("  addq $1, {}", self.off(i)));
+                self.emit(&format!("  jmp {loop_lbl}"));
+                self.emit(&format!("{done}:"));
+            }
+            Ty::Struct(_) | Ty::Tuple(_) => {
+                let fields: Vec<Ty> = match ty {
+                    Ty::Struct(name) => self.structs.get(name).cloned().unwrap_or_default(),
+                    Ty::Tuple(tys) => tys.iter().map(|t| (**t).clone()).collect(),
+                    _ => unreachable!(),
+                };
+                let ptr = self.alloc_slot();
+                self.emit(&format!("  mov %rdi, {}", self.off(ptr)));
+                let mut off = 0i64;
+                for fty in fields.iter() {
+                    if self.ty_needs_drop(fty) {
+                        self.emit(&format!("  mov {}, %rdi", self.off(ptr)));
+                        if off != 0 {
+                            self.emit(&format!("  add ${off}, %rdi"));
+                        }
+                        self.gen_drop_glue_at_reg(fty)?;
+                    }
+                    off += self.size_of_ty(fty);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// The `__rmc_drop_<T>` symbol for a type that has a `Drop` impl of its own.
+    fn drop_symbol_for_ty(&self, ty: &Ty) -> Option<String> {
+        let Ty::Struct(name) = ty else { return None };
+        self.prog.drop_impls.get(name).cloned()
+    }
+
+    /// Whether a value of `ty` has a destructor: a `Drop` impl of its own, or a
+    /// field that does.
+    fn ty_needs_drop(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Struct(name) => {
+                if self.prog.drop_impls.contains_key(name) {
+                    return true;
+                }
+                self.structs
+                    .get(name)
+                    .map(|f| f.iter().any(|t| self.ty_needs_drop(t)))
+                    .unwrap_or(false)
+            }
+            Ty::Array(elem, _) => self.ty_needs_drop(elem),
+            Ty::Tuple(tys) => tys.iter().any(|t| self.ty_needs_drop(t)),
+            _ => false,
+        }
+    }
+
     fn gen_call(&mut self, dest: &Place, func: &CallTarget, args: &[Operand]) -> Result<(), String> {
         let name = match func {
             CallTarget::Direct(n) => n.clone(),
@@ -4920,10 +5122,6 @@ fn load_pair(line: &str) -> Option<(&str, &str)> {
     Some((src, dst))
 }
 
-fn align_up(v: i64, a: i64) -> i64 {
-    (v + a - 1) / a * a
-}
-
 /// `mov $v, reg`, using `movabs` only when `v` does not fit a sign-extended
 /// 32-bit immediate (the shorter encoding for the common small divisor).
 fn mov_imm_str(v: i64, reg: &str) -> String {
@@ -4979,21 +5177,6 @@ fn imm_value(op: &str) -> Option<i64> {
 /// it cannot be encoded as an ALU or memory-store operand.
 fn is_wide_imm(op: &str) -> bool {
     imm_value(op).map_or(false, |v| !(i32::MIN as i64..=i32::MAX as i64).contains(&v))
-}
-
-fn ty_size(ty: &Ty) -> i64 {
-    match ty {
-        Ty::U8 => 1,
-        Ty::F32 => 4,
-        Ty::I64 | Ty::Bool | Ty::F64 | Ty::Ptr(_) | Ty::Ref(_) | Ty::Other | Ty::Unit => 8,
-        // A narrow integer is one 64-bit slot in the frame, except `i8`, which
-        // packs into a byte like `u8`.
-        Ty::Int { width: 1, .. } => 1,
-        Ty::Int { .. } => 8,
-        Ty::Struct(_) => 8, // refined by the aggregate's own length
-        Ty::Array(elem, n) => ty_size(elem) * (*n as i64).max(1),
-        Ty::Tuple(tys) => tys.iter().map(|t| ty_size(t)).sum::<i64>().max(8),
-    }
 }
 
 /// The length word a slice's data sits behind. A `&[T]`/`*const [T]` (and the
@@ -5160,6 +5343,11 @@ fn terminator_reads(t: &Terminator, local: u32) -> bool {
                 check(a);
             }
         }
+        Terminator::Drop { place, .. } => {
+            if place.local == local {
+                hit = true;
+            }
+        }
         _ => {}
     }
     hit
@@ -5257,6 +5445,9 @@ fn scan_term(
                 scan_operand(a, counts, projected);
             }
         }
+        // A `drop(_N)` takes `_N`'s address, so the local must not be promoted
+        // into a register it has no address for.
+        Terminator::Drop { place, .. } => bump(place, counts, projected),
         _ => {}
     }
 }

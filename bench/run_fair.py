@@ -93,21 +93,28 @@ def measure(argv, reps, cwd=None):
     exe = shutil.which(argv[0]) or argv[0]
     walls, cpus, rsss = [], [], []
     for _ in range(reps):
-        t0 = time.perf_counter()
-        pid = os.posix_spawn(exe, [exe] + list(argv[1:]), os.environ,
-                             file_actions=[])
-        peak = 0
-        while True:
-            hwm = peak_rss_kb(pid)
-            if hwm > peak:
-                peak = hwm
-            done, status, ru = os.wait4(pid, os.WNOHANG)
-            if done:
+        # A short-lived process can exit before the first `VmHWM` sample, which
+        # would record RSS 0 and turn a real win into a spurious loss in the
+        # ratio check. Retry the spawn until a nonzero peak is observed, the
+        # same way `run_mir.py`'s sampler does.
+        for _attempt in range(5):
+            t0 = time.perf_counter()
+            pid = os.posix_spawn(exe, [exe] + list(argv[1:]), os.environ,
+                                 file_actions=[])
+            peak = 0
+            while True:
+                hwm = peak_rss_kb(pid)
+                if hwm > peak:
+                    peak = hwm
+                done, status, ru = os.wait4(pid, os.WNOHANG)
+                if done:
+                    break
+                os.sched_yield()
+            wall = time.perf_counter() - t0
+            if status != 0:
+                raise RuntimeError(f"run failed for {exe}: status={status}")
+            if peak > 0:
                 break
-            os.sched_yield()
-        wall = time.perf_counter() - t0
-        if status != 0:
-            raise RuntimeError(f"run failed for {exe}: status={status}")
         walls.append(wall)
         cpus.append(ru.ru_utime + ru.ru_stime)
         rsss.append(peak)
