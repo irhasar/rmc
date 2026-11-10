@@ -992,10 +992,12 @@ impl Sema {
                 self.loop_repeats.push(true);
                 self.loop_exits.push(Vec::new());
                 self.loop_reach.push(false);
+                self.loop_cont.push(false);
                 self.break_assigned.push(Self::assigned_snapshot(scope));
                 self.check_block_inner(body, scope, true)?;
                 let breaks = self.break_assigned.pop().unwrap();
                 self.loop_exits.pop();
+                self.loop_cont.pop();
                 self.loop_reach.pop();
                 self.loop_repeats.pop();
                 self.loop_marks.pop();
@@ -1023,10 +1025,12 @@ impl Sema {
                 self.loop_repeats.push(block_reaches_top(body));
                 self.loop_exits.push(Vec::new());
                 self.loop_reach.push(false);
+                self.loop_cont.push(false);
                 self.break_assigned.push(Self::assigned_snapshot(scope));
                 self.check_block_inner(body, scope, true)?;
                 let breaks = self.break_assigned.pop().unwrap();
                 let exits = self.loop_exits.pop().unwrap();
+                self.loop_cont.pop();
                 self.loop_reach.pop();
                 self.loop_repeats.pop();
                 self.loop_marks.pop();
@@ -1081,10 +1085,12 @@ impl Sema {
                 self.loop_repeats.push(true);
                 self.loop_exits.push(Vec::new());
                 self.loop_reach.push(false);
+                self.loop_cont.push(false);
                 self.break_assigned.push(Self::assigned_snapshot(scope));
                 self.check_block_inner(body, scope, true)?;
                 let breaks = self.break_assigned.pop().unwrap();
                 self.loop_exits.pop();
+                self.loop_cont.pop();
                 self.loop_reach.pop();
                 self.loop_repeats.pop();
                 self.loop_marks.pop();
@@ -1134,10 +1140,13 @@ impl Sema {
                 // branch's local state is discarded.
                 if let Some(acc) = self.break_assigned.last_mut() {
                     let cur = Self::assigned_snapshot(scope);
-                    if acc.len() == cur.len() {
-                        for (a, b) in acc.iter_mut().zip(cur.iter()) {
-                            *a |= *b;
-                        }
+                    // Only the bindings present at loop entry matter after the
+                    // loop; a break path may have declared extra locals, and
+                    // those must not stop its writes to the entry bindings
+                    // from counting.
+                    let n = acc.len().min(cur.len());
+                    for (a, b) in acc.iter_mut().zip(cur.iter()).take(n) {
+                        *a |= *b;
                     }
                 }
                 Ok(())
@@ -2374,6 +2383,9 @@ fn stmt_can_fall(s: &Stmt) -> bool {
         Stmt::Expr(e) => expr_can_fall(e),
         Stmt::Let { init: Some(e), .. } => expr_can_fall(e),
         Stmt::Assign { value, .. } => expr_can_fall(value),
+        // A `loop` completes only through a `break`; one with no reachable
+        // break never falls through, so code after it is unreachable.
+        Stmt::Loop(body) => block_has_break(body),
         _ => true,
     }
 }
