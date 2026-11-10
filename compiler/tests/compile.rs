@@ -2695,6 +2695,47 @@ fn a_labelled_break_in_a_nested_condition_repeats_the_outer_loop() {
 }
 
 #[test]
+fn a_while_label_is_in_scope_in_its_own_condition() {
+    // rustc shadows an outer label of the same name with the `while`'s own, and
+    // the condition runs with that label already in scope, so `break 'i` there
+    // leaves this loop. Checking the condition before pushing the loop resolved
+    // `'i` to the outer loop (or failed to resolve it at all), diverging from
+    // rustc.
+    let out = asm(
+        "fn main() -> i64 { let mut n: i64 = 0; 'i: while { break 'i; true } {} return n; }",
+    );
+    assert!(out.contains("main:"), "compiles:\n{out}");
+}
+
+#[test]
+fn a_shadowing_while_label_binds_the_inner_loop() {
+    // `'o: while { break 'o; true }` inside `'o: loop`: the `while`'s own `'o`
+    // shadows the outer one, so the `break` leaves the *while*, not the `loop`.
+    // The outer loop therefore keeps running until its own `break`, which is
+    // what makes `c` reach 4.
+    let out = asm(
+        "fn main() -> i64 { let mut c: i64 = 0; 'o: loop { 'o: while { break 'o; true } {} \
+         c = c + 1; if c > 3 { break; } } return c; }",
+    );
+    assert!(out.contains("main:"), "compiles:\n{out}");
+}
+
+#[test]
+fn a_nested_loop_condition_break_does_not_make_the_outer_loop_breakable() {
+    // `'o: while { break 'o; true }` inside `'o: loop`: the `while`'s own `'o`
+    // shadows the outer one, so the `break` leaves the inner `while`. The outer
+    // `loop` then has no `break` of its own, so it is `!`, its `if` branch is
+    // `!`, and the `if`/`else` unifies with `i64`, exactly as rustc does. Before
+    // the label-aware walk, the inner `break` was credited to the outer `loop`,
+    // making it `()` so the branch types disagreed (E0308).
+    let out = asm(
+        "fn main() { let n: i64 = if true { 'o: loop { 'o: while { break 'o; true } {} } } \
+         else { 1 }; }",
+    );
+    assert!(out.contains("main:"), "compiles:\n{out}");
+}
+
+#[test]
 fn an_immutable_parameter_cannot_be_assigned() {
     let err = compile_to_asm(
         "fn f(x: i64) -> i64 { x = 2; return x; } fn main() -> i64 { return f(1); }",
