@@ -1028,7 +1028,11 @@ impl Sema {
         // `let x: i64 = { return 7; };` are accepted, as in rustc. The tail is
         // still checked above, so its slots are assigned even though it is
         // unreachable.
-        if block_diverges(b) {
+        // Only a genuinely `!`-typed block bypasses a type check. A block whose
+        // tail is unreachable but has a concrete type (`{ return; 42 }`) is not
+        // `!`: rustc still reports that concrete type, so `if { return; 42 } {}`
+        // is a `bool` mismatch, not a valid `!` condition.
+        if ty == Type::Never || (b.tail.is_none() && block_diverges(b)) {
             Ok(Type::Never)
         } else {
             Ok(ty)
@@ -1171,7 +1175,7 @@ impl Sema {
                             .into(),
                     );
                 }
-                if ct != Type::Bool && !expr_diverges(cond) {
+                if ct != Type::Bool && ct != Type::Never {
                     return Err(format!("`while` condition must be `bool`, found {ct:?}"));
                 }
                 let init_before = Self::init_snapshot(scope);
@@ -1960,7 +1964,7 @@ impl Sema {
                 self.match_chain = false;
                 self.match_total = false;
                 let ct = self.check_expr(cond, scope)?;
-                if ct != Type::Bool && !expr_diverges(cond) {
+                if ct != Type::Bool && ct != Type::Never {
                     return Err(format!("`if` condition must be `bool`, found {ct:?}"));
                 }
                 let total = if is_root {
@@ -3070,12 +3074,21 @@ fn block_has_unlabelled_exit(b: &Block) -> bool {
 fn stmt_has_unlabelled_exit(s: &Stmt) -> bool {
     match s {
         Stmt::Break(_, None) | Stmt::Continue(None) => true,
-        // A nested loop captures its own unlabelled exits.
-        Stmt::While(..) | Stmt::For { .. } => false,
+        // A `while`/`for` body captures its own unlabelled exits, but a `for`'s
+        // range bounds are evaluated before the loop starts, so an unlabelled
+        // exit there targets the enclosing loop.
+        Stmt::While(..) => false,
+        Stmt::For { start, end, .. } => {
+            cond_has_unlabelled_exit(start) || cond_has_unlabelled_exit(end)
+        }
         Stmt::Expr(e) => cond_has_unlabelled_exit(e),
         Stmt::Return(Some(e)) => cond_has_unlabelled_exit(e),
         Stmt::Let { init: Some(e), .. } => cond_has_unlabelled_exit(e),
-        Stmt::Assign { value, .. } => cond_has_unlabelled_exit(value),
+        // The target's index/deref is evaluated, so a `break` there is an exit
+        // from the enclosing `while`.
+        Stmt::Assign { target, value } => {
+            cond_has_unlabelled_exit(value) || cond_has_unlabelled_exit(target)
+        }
         _ => false,
     }
 }
@@ -3088,7 +3101,15 @@ fn stmt_reaches_top(s: &Stmt, label: Option<&str>) -> bool {
         Stmt::Return(Some(e)) => expr_contains_continue(e, label, false),
         Stmt::Expr(e) => expr_contains_continue(e, label, false),
         Stmt::Let { init: Some(e), .. } => expr_contains_continue(e, label, false),
-        Stmt::Assign { value, .. } => expr_contains_continue(value, label, false),
+        Stmt::Assign { target, value } => {
+            expr_contains_continue(value, label, false)
+                || expr_contains_continue(target, label, false)
+        }
+        // A nested loop runs its condition (and a `for` its bounds) before its
+        // body, and its body can hold a labelled `continue` for our loop, so all
+        // three can reach our top. `stmt_contains_continue` applies the nesting
+        // rule that keeps unlabelled continues with the nested loop.
+        Stmt::While(..) | Stmt::For { .. } => stmt_contains_continue(s, label, false),
         _ => false,
     }
 }
@@ -3124,9 +3145,19 @@ fn stmt_contains_continue(s: &Stmt, label: Option<&str>, nested: bool) -> bool {
         // A nested `while`/`for` captures its own unlabelled `continue`s, but a
         // labelled one inside it can still target an enclosing loop. Descend
         // unless the nested loop is itself the target (its `continue`s then
-        // target a loop between us and it, never our top).
-        Stmt::While(_, body, lbl) | Stmt::For { body, label: lbl, .. } => {
-            lbl.as_deref() != label && block_contains_continue(body, label, true)
+        // target a loop between us and it, never our top). A nested `while`'s
+        // *condition* and a `for`'s *range bounds* run before the loop's body,
+        // so a labelled `continue` there still targets our loop; check them even
+        // though the nested body is excluded.
+        Stmt::While(cond, body, lbl) => {
+            (lbl.as_deref() != label && expr_contains_continue(cond, label, nested))
+                || (lbl.as_deref() != label && block_contains_continue(body, label, true))
+        }
+        Stmt::For { start, end, body, label: lbl, .. } => {
+            let outward = lbl.as_deref() != label
+                && (expr_contains_continue(start, label, nested)
+                    || expr_contains_continue(end, label, nested));
+            outward || (lbl.as_deref() != label && block_contains_continue(body, label, true))
         }
         Stmt::Break(..) => false,
         Stmt::Expr(e) => expr_contains_continue(e, label, nested),
