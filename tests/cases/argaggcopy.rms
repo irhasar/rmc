@@ -1,0 +1,14 @@
+// The direct-argument call shortcut keeps arguments in %rdi/%rsi without
+// spilling. A later argument that materialises an aggregate `&`-temporary
+// (`&{ s }`, `&make_s(..)`) copies through %rdi/%rsi and would clobber an
+// earlier argument, so such a call must take the spilling path.
+struct S { a: i64, b: i64 }
+fn make_s(a: i64) -> S { S { a: a, b: a + 1 } }
+fn first(n: i64, p: &S) -> i64 { n }
+
+fn main() {
+    let s: S = S { a: 1, b: 2 };
+    print_i64(first(3, &s));
+    print_i64(first(7, &{ s }));
+    print_i64(first(9, &make_s(5)));
+}

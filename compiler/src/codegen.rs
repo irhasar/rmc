@@ -1678,10 +1678,7 @@ impl Codegen {
                 Type::Struct(name.clone(), (n as usize) * 8)
             }
             Expr::Index(base, _idx) => {
-                let elem = match base.as_ref() {
-                    Expr::Var { ty: Type::Array(e, _), .. } => (**e).clone(),
-                    _ => Type::I64,
-                };
+                let elem = Self::array_elem_ty(base).unwrap_or(Type::I64);
                 match self.array_elem_operand(base, _idx) {
                     // `disp(%rbp,%reg,8)` addresses the element in one operand.
                     Some(op) if op.contains("%rax") => {
@@ -2547,6 +2544,36 @@ impl Codegen {
         let add = m > i64::MAX as u128;
         (m as i64, p - N, add)
     }
+    /// The element type of an array-valued expression `base`, when it can be
+    /// determined. A reference to an array is unwrapped, so `&[bool; N]`
+    /// reports `bool`; a block or `if` base gets the type of its tail. `None`
+    /// means the element type is unknown, and the caller falls back to `i64`.
+    fn array_elem_ty(base: &Expr) -> Option<Type> {
+        let t = match base {
+            Expr::Var { ty, .. } | Expr::Field { ty, .. } => ty,
+            Expr::Call { ret_ty, .. } => ret_ty,
+            Expr::Deref { ty, .. } => ty,
+            Expr::Block(b) => return b.tail.as_deref().and_then(Self::array_elem_ty),
+            Expr::MatchBoundary(b, _) => return b.tail.as_deref().and_then(Self::array_elem_ty),
+            Expr::If(_, then, Some(els)) => {
+                return Self::array_elem_ty_tail(then)
+                    .or_else(|| Self::array_elem_ty_tail(els))
+            }
+            _ => return None,
+        };
+        match t {
+            Type::Array(e, _) => Some((**e).clone()),
+            Type::Ref(inner, _) => match inner.as_ref() {
+                Type::Array(e, _) => Some((**e).clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn array_elem_ty_tail(b: &Block) -> Option<Type> {
+        b.tail.as_deref().and_then(Self::array_elem_ty)
+    }
 
     /// An operand `disp(%rbp,%rax,8)` for `base[idx]` where `base` is a local
     /// array. The caller must have the index value in `%rax`. Returns `None`
@@ -2904,11 +2931,12 @@ impl Codegen {
     }
 
     /// True when evaluating `e` can clobber `%rdi`/`%rsi` without
-    /// `contains_call` noticing. The only such case is copying a whole
-    /// aggregate into a local: the copy runs through `%rdi`/`%rsi`
-    /// (`copy_words_rdi_rsi`), and a block's `let` initialiser can trigger one
-    /// without containing a call, so the direct-argument shortcut must not
-    /// select it.
+    /// `contains_call` noticing. Two cases qualify: copying a whole aggregate
+    /// into a local, and materialising an aggregate `&`-temporary. Both run
+    /// through `%rdi`/`%rsi` (`copy_words_rdi_rsi`) with no call in sight, so
+    /// the direct-argument shortcut must not select such an argument. The walk
+    /// recurses through every expression form, since a clobber can hide inside
+    /// a block, a binary operand, an index, or a nested `&`.
     fn clobbers_arg_regs(e: &Expr) -> bool {
         match e {
             Expr::Block(b) => Self::block_clobbers(b),
@@ -2917,6 +2945,32 @@ impl Codegen {
                 Self::block_clobbers(t)
                     || els.as_ref().map_or(false, |b| Self::block_clobbers(b))
             }
+            // `&<aggregate>` with a materialised temporary slot copies the
+            // aggregate into that slot through `%rdi`/`%rsi`, so `&{ s }` or
+            // `&some_struct_value` clobbers an earlier argument's register even
+            // though no call runs.
+            Expr::AddrOf { expr, ty, slot, .. } => {
+                (*slot >= 0 && ty.is_aggregate()) || Self::clobbers_arg_regs(expr)
+            }
+            Expr::Bin(_, a, b) => Self::clobbers_arg_regs(a) || Self::clobbers_arg_regs(b),
+            Expr::Un(_, a) | Expr::Cast(a, _) => Self::clobbers_arg_regs(a),
+            Expr::Index(a, b) => Self::clobbers_arg_regs(a) || Self::clobbers_arg_regs(b),
+            Expr::Field { base, .. } => Self::clobbers_arg_regs(base),
+            Expr::Deref { expr, .. } => Self::clobbers_arg_regs(expr),
+            Expr::Call { args, .. } => args.iter().any(Self::clobbers_arg_regs),
+            Expr::MethodCall { recv, args, .. } => {
+                Self::clobbers_arg_regs(recv) || args.iter().any(Self::clobbers_arg_regs)
+            }
+            Expr::EnumCtor { args, .. } => args.iter().any(Self::clobbers_arg_regs),
+            Expr::StructLit { fields, .. } => {
+                fields.iter().any(|f| Self::clobbers_arg_regs(&f.value))
+            }
+            Expr::ArrayLit(v, _) => Self::clobbers_arg_regs(v),
+            Expr::ArrayList(v) => v.iter().any(Self::clobbers_arg_regs),
+            Expr::VariantTest { scrutinee, .. } | Expr::BoolTest { scrutinee, .. } => {
+                Self::clobbers_arg_regs(scrutinee)
+            }
+            Expr::EnumPayload { recv, .. } => Self::clobbers_arg_regs(recv),
             _ => false,
         }
     }

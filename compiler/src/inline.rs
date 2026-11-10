@@ -382,7 +382,7 @@ impl Inliner {
         *base += region;
         let param_slots = self.cands[cand].param_slots.clone();
         let param_tys = self.cands[cand].params.clone();
-        let assigned = assigned_slots(&self.cands[cand].stmts, self.cands[cand].tail.as_ref());
+        let escaped = escaped_slots(&self.cands[cand].stmts, self.cands[cand].tail.as_ref());
 
         // Bind each argument to what the body should read for its parameter. A
         // trivial argument (a name, a literal, a string) is substituted in
@@ -410,7 +410,7 @@ impl Inliner {
             // write memory is therefore copied into a fresh slot first, so each
             // parameter sees its argument's value at call time, in order.
             let later_effect = last_effect.map_or(false, |j| j > i);
-            if trivial(&arg) && !assigned.contains(&param_slots[i]) && !later_effect {
+            if trivial(&arg) && !escaped.contains(&param_slots[i]) && !later_effect {
                 subst.push(arg);
             } else {
                 let slot = *base;
@@ -488,9 +488,12 @@ fn has_effect(e: &Expr) -> bool {
 }
 
 /// The slots a candidate body assigns directly (not through a pointer or an
-/// element). A parameter among them is a local the body mutates, so it must be
-/// copied rather than substituted, or the mutation would reach the caller.
-fn assigned_slots(stmts: &[Stmt], tail: Option<&Expr>) -> HashSet<i32> {
+/// element) or takes the address of. A parameter among them is a local the body
+/// mutates or points at, so it must be copied rather than substituted: a
+/// substituted argument would let a mutation reach the caller, and taking the
+/// address of a non-lvalue argument (a literal, a call) would have no place to
+/// name.
+fn escaped_slots(stmts: &[Stmt], tail: Option<&Expr>) -> HashSet<i32> {
     fn collect_block(b: &Block, out: &mut HashSet<i32>) {
         for s in &b.stmts {
             collect_stmt(s, out);
@@ -546,7 +549,17 @@ fn assigned_slots(stmts: &[Stmt], tail: Option<&Expr>) -> HashSet<i32> {
                 collect_expr(a, out);
                 collect_expr(b, out);
             }
-            Expr::Deref { expr, .. } | Expr::AddrOf { expr, .. } => collect_expr(expr, out),
+            Expr::Deref { expr, .. } => collect_expr(expr, out),
+            // `&x` names the place `x`, so a parameter read by address must stay
+            // a copy; record the slot. `&*p` and `&s.f` recurse into the operand
+            // instead, which reaches `p`/`s` only when that operand is itself a
+            // bare parameter read.
+            Expr::AddrOf { expr, .. } => {
+                if let Expr::Var { slot, .. } = expr.as_ref() {
+                    out.insert(*slot);
+                }
+                collect_expr(expr, out);
+            }
             Expr::Block(b) => collect_block(b, out),
             Expr::MatchBoundary(b, _) => collect_block(b, out),
             Expr::If(c, t, els) => {

@@ -2898,3 +2898,45 @@ fn a_duplicate_const_is_rejected() {
     .unwrap_err();
     assert!(err.contains("defined multiple times"), "got: {err}");
 }
+
+#[test]
+fn inlining_copies_a_parameter_whose_address_the_callee_takes() {
+    // The callee takes `&mut x` and writes through it. Inlining must give the
+    // parameter its own slot, so the `*p = 9` store must not land in the
+    // caller's slot for `y` (whose address `&y` pins to memory).
+    let out = asm("fn take_mut(mut x: i64) -> i64 { let p = &mut x; *p = 9; x } fn main() -> i64 { let y: i64 = 1; let q = &y; return take_mut(y) + *q; }");
+    let y_slot = store_offset_after(&out, "mov $1, %rax");
+    // The parameter's temporary is the `lea` whose address the write uses.
+    let before_write = out.split("movq $9, (%rax)").next().expect("a write of 9");
+    let lea = before_write.rfind("lea ").expect("a lea before the write");
+    let tail = &before_write[lea + "lea ".len()..];
+    let param_slot: i32 = tail[..tail.find("(%rbp)").expect("a frame address")]
+        .trim()
+        .parse()
+        .expect("an offset");
+    assert_ne!(param_slot, y_slot, "the write must target the parameter's own slot");
+}
+
+#[test]
+fn an_aggregate_reference_argument_does_not_use_the_direct_call_path() {
+    // `&{ s }` materialises the aggregate through %rdi/%rsi. If the call kept
+    // the earlier argument live in %rdi, the copy would clobber it, so the call
+    // must spill every argument instead of loading each straight into its
+    // argument register. The direct path would emit `mov $7, %rdi`.
+    let out = asm_no_inline("struct S { a: i64, b: i64 } fn first(n: i64, p: &S) -> i64 { n } fn main() -> i64 { let s: S = S { a: 1, b: 2 }; return first(7, &{ s }); }");
+    let call = out.find("call first").expect("a call to first");
+    let setup = &out[..call];
+    assert!(!setup.contains("mov $7, %rdi"), "the argument must not go straight into %rdi");
+    assert!(setup.contains("mov %rbx, %rdi") || setup.contains("mov %r12, %rdi"),
+        "the argument must be held in a callee-saved spill across the copy");
+}
+
+#[test]
+fn indexing_a_reference_to_an_array_uses_the_element_type() {
+    // `&[bool; 2]` must report `bool` as the element type, so `!` on the
+    // element is logical not. With the old i64 fallback the element was treated
+    // as an integer and `!` emitted a bitwise `not`.
+    let out = asm("fn main() -> i64 { let a = [true, false]; let r: &[bool; 2] = &a; let b: bool = !r[0]; return b as i64; }");
+    assert!(out.contains("sete %al"), "`!` on a bool element must be logical not");
+    assert!(!out.contains("not %rax"), "`!` on a bool element must not be a bitwise not");
+}
