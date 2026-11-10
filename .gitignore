@@ -1,3 +1,7 @@
 /compiler/target/
 __pycache__/
 *.pyc
+
+# Stray build artifacts
+compiler/c.bin
+compiler/c.err
