@@ -635,9 +635,14 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   or its first assignment — so a later write is `cannot assign twice to
   immutable variable`, and an immutable parameter reports `cannot assign to
   immutable argument`, both matching rustc. The check is a may-analysis: an
-  `if`/`else` merges a flag with OR, and a write to a binding declared before a
-  `while`/`for` is rejected because the body may run again (a `loop` runs at
-  least once, so it is exempt). Keep generated `let`s `mutable: true` so they
+  `if`/`else` merges a flag with OR. Whether a write repeats is decided per
+  path: `Sema` threads the enclosing statement's continuation (`loop_cont`)
+  into every nested block, so a write is a second write only when *some* path
+  from it reaches the loop's top again — a `continue`, a loop body's
+  fall-through end, or the code after its statement. `x = 1; break;` is a
+  single write even when a sibling path `continue`s, and a `loop` whose every
+  path `break`s/`return`s runs at most once. A `break` merges the writes on its
+  path into the post-loop state. Keep generated `let`s `mutable: true` so they
   never trip this.
 - **A compound assignment evaluates its place once.** `desugar_compound` binds
   any component of the target that contains a call — the base or the subscript —
