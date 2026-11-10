@@ -4235,9 +4235,37 @@ impl Function {
             let invariant = |op: &Operand| {
                 other_place(op).is_some_and(|l| !defined_in_loop.contains(&l))
             };
+            // The header runs exactly once after the rewrite, so it must be no
+            // more than the test: a local it writes and that is read again
+            // outside the header would lose its per-iteration value, and a store
+            // through a pointer is a side effect that must not be dropped either.
+            // (The discriminant local and short-lived comparison temporaries are
+            // read only inside the header, so they are fine.)
+            let discr_local = other_place(discr);
+            let mut header_ok = true;
+            for s in &self.blocks[h].stmts {
+                match s {
+                    Stmt::Nop => {}
+                    Stmt::Assign(d, _) if d.proj.is_empty() => {
+                        if Some(d.local) != discr_local
+                            && self.local_read_elsewhere(d.local, h as u32, n)
+                        {
+                            header_ok = false;
+                            break;
+                        }
+                    }
+                    _ => {
+                        header_ok = false;
+                        break;
+                    }
+                }
+            }
+            if !header_ok {
+                continue;
+            }
             // The body is exactly `acc += K` and `iv += 1`.
             let mut acc = None;
-            let mut stepped = false;
+            let mut iv_updates = 0u32;
             let mut only_updates = true;
             for s in &self.blocks[body as usize].stmts {
                 match s {
@@ -4246,7 +4274,7 @@ impl Function {
                         if let Some(c) = const_operand(y) {
                             // `iv += 1`.
                             if d.local == iv && matches!(other_place(x), Some(p) if p == iv) && c == 1 {
-                                stepped = true;
+                                iv_updates += 1;
                                 continue;
                             }
                         }
@@ -4266,7 +4294,10 @@ impl Function {
                     _ => only_updates = false,
                 }
             }
-            if !only_updates || !stepped {
+            // The induction variable must advance by exactly one each iteration:
+            // `acc += K * bound` counts `bound` iterations, which matches a step
+            // of one and nothing else.
+            if !only_updates || iv_updates != 1 {
                 continue;
             }
             let Some((acc, k)) = acc else { continue };
@@ -4327,6 +4358,49 @@ impl Function {
             }
         }
         init
+    }
+
+    /// Whether `local` is read anywhere except in block `h` itself (its own
+    /// definitions do not count). Decides whether a header statement the
+    /// loop-closing rewrite deletes was observable elsewhere.
+    fn local_read_elsewhere(&self, local: u32, h: u32, n: usize) -> bool {
+        for b in 0..n {
+            if b as u32 == h {
+                continue;
+            }
+            for s in &self.blocks[b].stmts {
+                let mut found = false;
+                if let Stmt::Assign(_, rv) = s {
+                    scan_rv_operands(rv, &mut |op| {
+                        if other_place(op) == Some(local) {
+                            found = true;
+                        }
+                    });
+                }
+                if found {
+                    return true;
+                }
+            }
+            match &self.blocks[b].term {
+                Terminator::SwitchInt { discr, .. } => {
+                    if other_place(discr) == Some(local) {
+                        return true;
+                    }
+                }
+                Terminator::Assert { cond, .. } => {
+                    if other_place(cond) == Some(local) {
+                        return true;
+                    }
+                }
+                Terminator::Call { args, .. } => {
+                    if args.iter().any(|a| other_place(a) == Some(local)) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     /// Whether `local` is read anywhere outside the loop (its own definitions
