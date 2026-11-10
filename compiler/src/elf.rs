@@ -65,7 +65,13 @@ pub fn assemble(asm: &str) -> Result<Vec<u8>, String> {
         sections: vec![Section {
             name: ".text",
             flags: 0x5,
-            align: 16,
+            // A cache-line base for `.text`. The generator emits `.p2align 4`
+            // at every function entry, which is relative to the section, so a
+            // 16-aligned section base would still let a function start 16 mod 64
+            // -- mid-cache-line for every 64-byte fetch. A 64-byte base makes
+            // the directive mean what it says and keeps the first function's
+            // entry in the same line as its prologue.
+            align: 64,
             data: Vec::new(),
             vaddr: 0,
             file_off: 0,
@@ -104,10 +110,6 @@ impl Elf {
 
     fn parse(&mut self, asm: &str) -> Result<(), String> {
         let mut cur = self.text_idx;
-        // Each `.set` records the section current when it appeared, plus the
-        // section's length at that point, so a `.` (the current location) in the
-        // expression resolves to the position of the `.set` itself rather than
-        // the end of the section once the whole file has been parsed.
         let mut sets: Vec<(String, String, String, usize, u64)> = Vec::new();
 
         for (lineno, raw) in asm.lines().enumerate() {
@@ -192,8 +194,12 @@ impl Elf {
             }
             "globl" | "type" | "size" => {}
             "quad" => {
+                // A bare number (signed or unsigned, e.g. `u64::MAX` printed as
+                // 18446744073709551615) is data; anything else is a symbol.
                 if let Ok(v) = arg.parse::<i64>() {
                     self.sections[*cur].data.extend_from_slice(&(v as u64).to_le_bytes());
+                } else if let Ok(v) = arg.parse::<u64>() {
+                    self.sections[*cur].data.extend_from_slice(&v.to_le_bytes());
                 } else {
                     let off = self.sections[*cur].data.len();
                     self.abs64.push((*cur, off, arg.to_string()));
@@ -214,6 +220,8 @@ impl Elf {
             "set" => {
                 let (n, expr) = arg.split_once(',').ok_or("elf: bad .set")?;
                 let (a, b) = expr.split_once('-').ok_or("elf: bad .set expression")?;
+                // Capture `.` here: it is the position of the `.set` itself, not
+                // the end of whichever section the file finishes in.
                 let dot = self.sections[*cur].data.len() as u64;
                 sets.push((
                     n.trim().to_string(),
@@ -231,11 +239,38 @@ impl Elf {
     fn pad_to_align(&mut self, sec: usize, n: u64) {
         let len = self.sections[sec].data.len() as u64;
         let pad = (n - (len % n)) % n;
-        // A zero byte is `add %al,(%rax)` in an executable section, which would
-        // fault if control ever reached it; pad with `nop` there. Other sections
-        // (`.rodata`, `.data`) want real zeros.
-        let fill = if self.sections[sec].flags & 0x1 != 0 { 0x90 } else { 0 };
-        self.sections[sec].data.resize(len as usize + pad as usize, fill);
+        if pad == 0 {
+            return;
+        }
+        if self.sections[sec].flags & 0x1 != 0 {
+            // Executable: pad the way GAS does. A run of one-byte `nop`s is
+            // legal but decodes as many instructions, and on some cores the
+            // long run of 1-byte nops -- plus the branch that jumps over it --
+            // costs real run-time in a hot loop. Multi-byte `nop`s keep the
+            // padding to one or two instructions, which is what `as` emits.
+            let mut left = pad as usize;
+            while left > 0 {
+                let k = left.min(9);
+                let nop: &[u8] = match k {
+                    1 => &[0x90],
+                    2 => &[0x66, 0x90],
+                    3 => &[0x0F, 0x1F, 0x00],
+                    4 => &[0x0F, 0x1F, 0x40, 0x00],
+                    5 => &[0x0F, 0x1F, 0x44, 0x00, 0x00],
+                    6 => &[0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00],
+                    7 => &[0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00],
+                    8 => &[0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+                    _ => &[0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+                };
+                self.sections[sec].data.extend_from_slice(nop);
+                left -= k;
+            }
+        } else {
+            // A zero byte is `add %al,(%rax)` in an executable section, which
+            // would fault if control ever reached it; other sections want real
+            // zeros.
+            self.sections[sec].data.resize(len as usize + pad as usize, 0);
+        }
     }
 
     fn sym_value(&self, name: &str, cur: usize) -> Result<(i64, usize), String> {
@@ -246,9 +281,9 @@ impl Elf {
         Ok((s.off as i64, s.sec))
     }
 
-    /// `sym_value`, but `.` means the fixed position `dot` in section `sec`
-    /// rather than the section's current end. Used to resolve a `.set` after the
-    /// whole file is parsed, when the section lengths have moved on.
+    /// Like `sym_value`, but `.` resolves to `dot` rather than the section's
+    /// current end. `.set` uses this so a length is measured at the position of
+    /// the `.set`, not wherever the section ends up.
     fn sym_value_at(&self, name: &str, sec: usize, dot: u64) -> Result<(i64, usize), String> {
         if name == "." {
             return Ok((dot as i64, sec));
@@ -469,7 +504,21 @@ impl Elf {
         };
         let ops = split_ops(rest);
         match mnem {
-            "mov" | "movq" | "movb" | "movabs" | "movzbq" | "movzbl" => self.enc_mov(mnem, &ops, sec),
+            "movq" | "movd" if ops.get(0).map_or(false, |o| parse_xmm(o).is_some()) => {
+                self.enc_mov_xmm_gpr(mnem, &ops, sec)
+            }
+            "movq" | "movd" if ops.get(1).map_or(false, |o| parse_xmm(o).is_some()) => {
+                self.enc_mov_gpr_xmm(mnem, &ops, sec)
+            }
+            "movsd" | "movss" => self.enc_mov_sse(mnem, &ops, sec),
+            "addss" | "addsd" | "subss" | "subsd" | "mulss" | "mulsd" | "divss" | "divsd"
+            | "ucomiss" | "ucomisd" | "cvtss2sd" | "cvtsd2ss" => self.enc_sse_arith(mnem, &ops, sec),
+            "cvtsi2ss" | "cvtsi2sd" | "cvttss2si" | "cvttsd2si" => self.enc_sse_cvt(mnem, &ops, sec),
+            "setp" | "setnp" => self.enc_setcc(mnem, &ops, sec),
+            "mov" | "movq" | "movb" | "movabs" | "movzbq" | "movzbl" | "movzwq" | "movzwl"
+            | "movsbq" | "movsbl" | "movswq" | "movswl" | "movslq" => {
+                self.enc_mov(mnem, &ops, sec)
+            }
             "lea" => self.enc_lea(&ops, sec),
             "push" | "pop" => self.enc_push_pop(mnem, &ops, sec),
             "add" | "addq" | "sub" | "and" | "or" | "xor" | "cmp" | "cmpq" | "test" => {
@@ -491,6 +540,23 @@ impl Elf {
                 Ok(())
             }
             "call" => {
+                // `call *%reg` is the indirect register form (FF /2, mod=11),
+                // `call *mem` indirects through memory (FF /2 with an r/m
+                // operand), and the bare form is a PC-relative `E8 rel32`.
+                if let Some(reg) = ops[0].strip_prefix('*') {
+                    if let Ok((r, _)) = parse_reg(reg) {
+                        if r >= 8 {
+                            self.sections[sec].data.push(0x41);
+                        }
+                        self.sections[sec].data.push(0xFF);
+                        modrm_reg_reg(&mut self.sections[sec].data, 2, r);
+                        return Ok(());
+                    }
+                    let m = parse_mem(reg)
+                        .ok_or_else(|| format!("elf: bad indirect call operand `{}`", ops[0]))?;
+                    self.mem_op(sec, 0xFF, &m, 2, false, false);
+                    return Ok(());
+                }
                 self.sections[sec].data.push(0xE8);
                 self.pc_rel(sec, &ops[0]);
                 Ok(())
@@ -512,7 +578,7 @@ impl Elf {
                 Ok(())
             }
             "sete" | "setne" | "setl" | "setle" | "setg" | "setge" | "setb" | "setbe" | "seta"
-            | "setae" => self.enc_setcc(mnem, &ops, sec),
+            | "setae" | "seto" | "setno" | "sets" | "setns" => self.enc_setcc(mnem, &ops, sec),
             "bswap" => self.enc_bswap(&ops, sec),
             j if j.starts_with('j') => self.enc_jcc(j, &ops, sec),
             other => Err(format!("elf: unsupported instruction `{other}`")),
@@ -528,58 +594,225 @@ impl Elf {
 
     fn enc_mov(&mut self, mnem: &str, ops: &[String], sec: usize) -> Result<(), String> {
         let (src, dst) = (ops[0].clone(), ops[1].clone());
+        // `movz`/`movs` loads: a 2-byte opcode (`0F B6`/`0F B7`/`0F BE`/`0F BF`/
+        // `63`), an optional REX.W, and a byte-width source that forces a REX
+        // prefix for %sil/%dil. `movslq` is the sign-extending `63 /r`.
+        let ext = match mnem {
+            "movzbq" => Some((false, 1u8, true)),
+            "movzbl" => Some((false, 1u8, false)),
+            "movzwq" => Some((false, 2u8, true)),
+            "movzwl" => Some((false, 2u8, false)),
+            "movsbq" => Some((true, 1u8, true)),
+            "movsbl" => Some((true, 1u8, false)),
+            "movswq" => Some((true, 2u8, true)),
+            "movswl" => Some((true, 2u8, false)),
+            "movslq" => Some((true, 4u8, true)),
+            _ => None,
+        };
+        if let Some((sign, srcw, w)) = ext {
+            return self.enc_movx(&src, &dst, sec, sign, srcw, w);
+        }
         match mnem {
-            "movzbq" | "movzbl" => {
-                let (dreg, _) = parse_reg(&dst)?;
-                let w = mnem == "movzbq";
-                if let Ok((sreg, s8)) = parse_reg(&src) {
-                    let mut rex = 0x40;
-                    if w {
-                        rex |= 0x08;
-                    }
-                    if dreg >= 8 {
-                        rex |= 0x04;
-                    }
-                    if sreg >= 8 {
-                        rex |= 0x01;
-                    }
-                    // A byte source of %sil/%dil needs the prefix even with no
-                    // extended register in play.
-                    if rex != 0x40 || (s8 && sreg >= 4) {
-                        self.sections[sec].data.push(rex);
-                    }
-                    self.sections[sec].data.extend_from_slice(&[0x0F, 0xB6]);
-                    modrm_reg_reg(&mut self.sections[sec].data, dreg, sreg);
-                    return Ok(());
-                }
-                let m = parse_mem(&src).ok_or_else(|| format!("elf: bad movz src `{src}`"))?;
-                let mut rex = 0x40;
-                if w {
-                    rex |= 0x08;
-                }
-                if dreg >= 8 {
-                    rex |= 0x04;
-                }
-                if m.base.map_or(false, |b| b >= 8) {
-                    rex |= 0x01;
-                }
-                if m.index.map_or(false, |i| i >= 8) {
-                    rex |= 0x02;
-                }
-                if rex != 0x40 {
-                    self.sections[sec].data.push(rex);
-                }
-                self.sections[sec].data.extend_from_slice(&[0x0F, 0xB6]);
-                emit_mem_modrm(&mut self.sections[sec].data, &m, dreg);
-                if let Some(sym) = m.rip_label.clone() {
-                    let len = self.sections[sec].data.len();
-                    self.fixups.push(Fixup { sec, disp_off: len - 4, next_off: len, sym });
-                }
-                Ok(())
-            }
             "movb" => self.enc_mov_bytes(&src, &dst, sec),
             _ => self.enc_mov_generic(mnem, &src, &dst, sec),
         }
+    }
+
+    /// `movq %xmmN, %r64` (opcode `66 0F 7E`, REX.W) and `movd %xmmN, %r32`
+    /// (`66 0F 7E`, no REX.W) — the `%xmm` register is the source.
+    fn enc_mov_xmm_gpr(&mut self, mnem: &str, ops: &[String], sec: usize) -> Result<(), String> {
+        let (src, dst) = (ops[0].clone(), ops[1].clone());
+        let xmm = parse_xmm(&src).ok_or_else(|| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+        let (gpr, _) = parse_reg(&dst).map_err(|_| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+        let w = mnem == "movq";
+        let mut out = Vec::new();
+        out.push(0x66);
+        let r = rex(w, xmm, gpr);
+        if r != 0x40 {
+            out.push(r);
+        }
+        out.extend_from_slice(&[0x0F, 0x7E]);
+        modrm_reg_reg(&mut out, xmm, gpr);
+        self.sections[sec].data.extend_from_slice(&out);
+        Ok(())
+    }
+
+    /// `movq %r64, %xmmN` (opcode `66 0F 6E`, REX.W) and `movd %r32, %xmmN`
+    /// (`66 0F 6E`, no REX.W) — the general-purpose register is the source.
+    fn enc_mov_gpr_xmm(&mut self, mnem: &str, ops: &[String], sec: usize) -> Result<(), String> {
+        let (src, dst) = (ops[0].clone(), ops[1].clone());
+        let (gpr, _) = parse_reg(&src).map_err(|_| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+        let xmm = parse_xmm(&dst).ok_or_else(|| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+        let w = mnem == "movq";
+        let mut out = Vec::new();
+        out.push(0x66);
+        let r = rex(w, xmm, gpr);
+        if r != 0x40 {
+            out.push(r);
+        }
+        out.extend_from_slice(&[0x0F, 0x6E]);
+        modrm_reg_reg(&mut out, xmm, gpr);
+        self.sections[sec].data.extend_from_slice(&out);
+        Ok(())
+    }
+
+    /// `movsd`/`movss` between two `%xmm` registers or from memory to an
+    /// `%xmm` register. The load is `F2/F3 0F 10 /r`; the store form
+    /// (`... 11 /r`) is not emitted by the back end.
+    fn enc_mov_sse(&mut self, mnem: &str, ops: &[String], sec: usize) -> Result<(), String> {
+        let (src, dst) = (ops[0].clone(), ops[1].clone());
+        let prefix: &[u8] = if mnem == "movsd" { &[0xF2] } else { &[0xF3] };
+        let reg = parse_xmm(&dst).ok_or_else(|| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+        let mut out = Vec::new();
+        if let Some(rm) = parse_xmm(&src) {
+            emit_sse_rr(&mut out, prefix, false, 0x10, reg, rm);
+        } else {
+            let m = parse_mem(&src).ok_or_else(|| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+            emit_sse_mem(&mut out, prefix, false, 0x10, reg, &m);
+            if let Some(sym) = m.rip_label.clone() {
+                self.sections[sec].data.extend_from_slice(&out);
+                let len = self.sections[sec].data.len();
+                self.fixups.push(Fixup { sec, disp_off: len - 4, next_off: len, sym });
+                return Ok(());
+            }
+        }
+        self.sections[sec].data.extend_from_slice(&out);
+        Ok(())
+    }
+
+    /// An SSE arithmetic or compare op with the destination in the `%xmm` reg
+    /// field and the source either an `%xmm` register or memory.
+    fn enc_sse_arith(&mut self, mnem: &str, ops: &[String], sec: usize) -> Result<(), String> {
+        let (src, dst) = (ops[0].clone(), ops[1].clone());
+        let (prefix, opcode) =
+            sse_reg_rm(mnem).ok_or_else(|| format!("elf: unsupported sse op `{mnem}`"))?;
+        let reg = parse_xmm(&dst).ok_or_else(|| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+        let mut out = Vec::new();
+        if let Some(rm) = parse_xmm(&src) {
+            emit_sse_rr(&mut out, prefix, false, opcode, reg, rm);
+        } else {
+            let m = parse_mem(&src).ok_or_else(|| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+            emit_sse_mem(&mut out, prefix, false, opcode, reg, &m);
+            if let Some(sym) = m.rip_label.clone() {
+                self.sections[sec].data.extend_from_slice(&out);
+                let len = self.sections[sec].data.len();
+                self.fixups.push(Fixup { sec, disp_off: len - 4, next_off: len, sym });
+                return Ok(());
+            }
+        }
+        self.sections[sec].data.extend_from_slice(&out);
+        Ok(())
+    }
+
+    /// The `%xmm`/general-purpose conversions: `cvtsi2ss`/`cvtsi2sd` (`F3/F2 0F
+    /// 2A /r`) read a general-purpose register and write an `%xmm`; `cvttss2si`/
+    /// `cvttsd2si` (`F3/F2 0F 2C /r`) read an `%xmm` (or memory) and write a
+    /// general-purpose register, with REX.W for the 64-bit destination.
+    fn enc_sse_cvt(&mut self, mnem: &str, ops: &[String], sec: usize) -> Result<(), String> {
+        let (src, dst) = (ops[0].clone(), ops[1].clone());
+        let mut out = Vec::new();
+        match mnem {
+            "cvtsi2ss" | "cvtsi2sd" => {
+                let prefix: &[u8] = if mnem == "cvtsi2ss" { &[0xF3] } else { &[0xF2] };
+                let (gpr, _) =
+                    parse_reg(&src).map_err(|_| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+                let xmm = parse_xmm(&dst).ok_or_else(|| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+                // The source is a 64-bit register (`%rax`); REX.W selects the
+                // 64-bit form of the conversion.
+                let w = reg_is_64(&src);
+                emit_sse_rr(&mut out, prefix, w, 0x2A, xmm, gpr);
+            }
+            "cvttss2si" | "cvttsd2si" => {
+                let prefix: &[u8] = if mnem == "cvttss2si" { &[0xF3] } else { &[0xF2] };
+                let (gpr, _) =
+                    parse_reg(&dst).map_err(|_| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+                let w = reg_is_64(&dst);
+                if let Some(xmm) = parse_xmm(&src) {
+                    emit_sse_rr(&mut out, prefix, w, 0x2C, gpr, xmm);
+                } else {
+                    let m =
+                        parse_mem(&src).ok_or_else(|| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+                    emit_sse_mem(&mut out, prefix, w, 0x2C, gpr, &m);
+                    if let Some(sym) = m.rip_label.clone() {
+                        self.sections[sec].data.extend_from_slice(&out);
+                        let len = self.sections[sec].data.len();
+                        self.fixups.push(Fixup { sec, disp_off: len - 4, next_off: len, sym });
+                        return Ok(());
+                    }
+                }
+            }
+            _ => return Err(format!("elf: unsupported sse cvt `{mnem}`")),
+        }
+        self.sections[sec].data.extend_from_slice(&out);
+        Ok(())
+    }
+
+    /// A sign/zero-extending move: `movz{b,w}`/`movs{b,w,l}` into a 64-bit (or
+    /// 32-bit) destination register. `sign` selects movs over movz, `srcw` is
+    /// the source width in bytes, and `w` sets REX.W for a 64-bit destination.
+    fn enc_movx(
+        &mut self,
+        src: &str,
+        dst: &str,
+        sec: usize,
+        sign: bool,
+        srcw: u8,
+        w: bool,
+    ) -> Result<(), String> {
+        let (dreg, _) = parse_reg(dst)?;
+        let opcode = if sign {
+            if srcw == 4 {
+                vec![0x63]
+            } else {
+                vec![0x0F, if srcw == 1 { 0xBE } else { 0xBF }]
+            }
+        } else {
+            vec![0x0F, if srcw == 1 { 0xB6 } else { 0xB7 }]
+        };
+        if let Ok((sreg, s8)) = parse_reg(src) {
+            let mut rex = 0x40;
+            if w {
+                rex |= 0x08;
+            }
+            if dreg >= 8 {
+                rex |= 0x04;
+            }
+            if sreg >= 8 {
+                rex |= 0x01;
+            }
+            // A byte source of %sil/%dil needs the prefix even with no extended
+            // register in play.
+            if rex != 0x40 || (srcw == 1 && s8 && sreg >= 4) {
+                self.sections[sec].data.push(rex);
+            }
+            self.sections[sec].data.extend_from_slice(&opcode);
+            modrm_reg_reg(&mut self.sections[sec].data, dreg, sreg);
+            return Ok(());
+        }
+        let m = parse_mem(src).ok_or_else(|| format!("elf: bad movx src `{src}`"))?;
+        let mut rex = 0x40;
+        if w {
+            rex |= 0x08;
+        }
+        if dreg >= 8 {
+            rex |= 0x04;
+        }
+        if m.base.map_or(false, |b| b >= 8) {
+            rex |= 0x01;
+        }
+        if m.index.map_or(false, |i| i >= 8) {
+            rex |= 0x02;
+        }
+        if rex != 0x40 {
+            self.sections[sec].data.push(rex);
+        }
+        self.sections[sec].data.extend_from_slice(&opcode);
+        emit_mem_modrm(&mut self.sections[sec].data, &m, dreg);
+        if let Some(sym) = m.rip_label.clone() {
+            let len = self.sections[sec].data.len();
+            self.fixups.push(Fixup { sec, disp_off: len - 4, next_off: len, sym });
+        }
+        Ok(())
     }
 
     fn enc_mov_bytes(&mut self, src: &str, dst: &str, sec: usize) -> Result<(), String> {
@@ -673,7 +906,12 @@ impl Elf {
             // because there is no operand to infer a width from; only an explicit
             // `movq` stores 64 bits. Matching that keeps the encoder a faithful
             // stand-in and stops an unsuffixed store silently leaving the high
-            // half of the destination stale.
+            // half of the destination stale. Either form sign-extends a 32-bit
+            // immediate, so a wider one has no encoding at all and must be
+            // materialised in a register by the caller.
+            if !fits_i32(v) {
+                return Err(format!("elf: `{mnem}` immediate {v} does not fit i32; use a register"));
+            }
             self.mem_op(sec, 0xC7, &m, 0, mnem != "mov", false);
             self.sections[sec].data.extend_from_slice(&(v as i32).to_le_bytes());
             return Ok(());
@@ -699,15 +937,34 @@ impl Elf {
             }
             if let Some(m) = parse_mem(dst) {
                 // `mov %dl, (%rsi)` is a one-byte store even though the
-                // mnemonic carries no `b` suffix.
-                self.mem_op(sec, if s8 { 0x88 } else { 0x89 }, &m, sreg, !s8, s8 && sreg >= 4);
+                // mnemonic carries no `b` suffix. A `movl`/`movq` suffix pins
+                // the width; otherwise the source register's name does, so
+                // `mov %eax, (%rdi)` is a 32-bit store, not a 64-bit one.
+                let wide = if mnem == "movl" {
+                    false
+                } else if mnem == "movq" || mnem == "movabs" {
+                    true
+                } else {
+                    reg_is_64(src)
+                };
+                self.mem_op(sec, if s8 { 0x88 } else { 0x89 }, &m, sreg, wide, s8 && sreg >= 4);
                 return Ok(());
             }
             return Err(format!("elf: bad mov dst `{dst}`"));
         }
         if let Some(m) = parse_mem(src) {
             let (dreg, d8) = parse_reg(dst)?;
-            self.mem_op(sec, if d8 { 0x8A } else { 0x8B }, &m, dreg, !d8, d8 && dreg >= 4);
+            // The destination register's width selects the load: `mov (%rdi),
+            // %eax` is a 32-bit load (`8B /r`), `mov (%rdi), %rax` a 64-bit one
+            // (`48 8B /r`). A `movl`/`movq` suffix pins it too.
+            let wide = if mnem == "movl" {
+                false
+            } else if mnem == "movq" || mnem == "movabs" {
+                true
+            } else {
+                reg_is_64(dst)
+            };
+            self.mem_op(sec, if d8 { 0x8A } else { 0x8B }, &m, dreg, wide, d8 && dreg >= 4);
             return Ok(());
         }
         Err(format!("elf: unsupported mov `{src}, {dst}`"))
@@ -762,10 +1019,45 @@ impl Elf {
         if let Some(rest) = src.strip_prefix('$') {
             let v = parse_imm(rest)?;
             if base == "test" {
-                return Err("elf: test with an immediate operand is not emitted".into());
+                // `test` has no sign-extended byte form: always `F7 /0 id`.
+                // The width follows the r/m operand, so only a 64-bit operand
+                // takes REX.W.
+                if !fits_i32(v) {
+                    return Err(format!("elf: `{mnem}` immediate {v} does not fit i32"));
+                }
+                if let Some(m) = parse_mem(&dst) {
+                    self.mem_op(sec, 0xF7, &m, 0, true, false);
+                    self.sections[sec].data.extend_from_slice(&(v as i32).to_le_bytes());
+                    return Ok(());
+                }
+                let (dreg, d8) = parse_reg(&dst)?;
+                if d8 {
+                    // `test $imm8, %r8b`: F6 /0 ib.
+                    let mut rex = 0x40;
+                    if dreg >= 8 {
+                        rex |= 0x01;
+                    }
+                    if rex != 0x40 || dreg >= 4 {
+                        self.sections[sec].data.push(rex);
+                    }
+                    self.sections[sec].data.push(0xF6);
+                    modrm_reg_reg(&mut self.sections[sec].data, 0, dreg);
+                    self.sections[sec].data.push(v as u8);
+                    return Ok(());
+                }
+                if let Some(r) = rex_if_needed(!reg_is_32(&dst), 0, dreg) {
+                    self.sections[sec].data.push(r);
+                }
+                self.sections[sec].data.push(0xF7);
+                modrm_reg_reg(&mut self.sections[sec].data, 0, dreg);
+                self.sections[sec].data.extend_from_slice(&(v as i32).to_le_bytes());
+                return Ok(());
             }
             if let Some(m) = parse_mem(&dst) {
                 // `cmp $imm, mem`: 81 /7 id, or the sign-extended 83 /7 ib.
+                if !fits_i32(v) {
+                    return Err(format!("elf: `{mnem}` immediate {v} does not fit i32"));
+                }
                 if fits_i8(v) {
                     self.mem_op(sec, 0x83, &m, ext, true, false);
                     self.sections[sec].data.push(v as u8);
@@ -793,6 +1085,9 @@ impl Elf {
             }
             // Width follows the destination: `add $1, %eax` must stay 32-bit
             // (`83 /0 ib`, no REX.W), like every other register form.
+            if !fits_i32(v) {
+                return Err(format!("elf: `{mnem}` immediate {v} does not fit i32"));
+            }
             if let Some(r) = rex_if_needed(!reg_is_32(&dst), ext, dreg) {
                 self.sections[sec].data.push(r);
             }
@@ -853,6 +1148,23 @@ impl Elf {
             self.sections[sec].data.extend_from_slice(&(v as i32).to_le_bytes());
             return Ok(());
         }
+        if ops.len() == 2 && ops[0].starts_with('$') {
+            // `imul $imm, %reg`: the two-operand immediate form, which is the
+            // three-operand form with source and destination the same register.
+            // The immediate is sign-extended from 32 bits, so a value that does
+            // not fit i32 would silently multiply by a different number; refuse
+            // it so the caller materialises the constant in a register instead.
+            let v = parse_imm(&ops[0][1..])?;
+            if !fits_i32(v) {
+                return Err(format!("elf: imul immediate {v} does not fit in 32 bits"));
+            }
+            let (reg, _) = parse_reg(&ops[1])?;
+            self.sections[sec].data.push(rex(true, reg, reg));
+            self.sections[sec].data.push(0x69);
+            modrm_reg_reg(&mut self.sections[sec].data, reg, reg);
+            self.sections[sec].data.extend_from_slice(&(v as i32).to_le_bytes());
+            return Ok(());
+        }
         if ops.len() == 1 {
             // One-operand `imul %reg`: signed multiply of %rax by the operand,
             // result in %rdx:%rax. Used by the division magic multiply.
@@ -860,6 +1172,25 @@ impl Elf {
             self.sections[sec].data.push(rex(true, 5, reg));
             self.sections[sec].data.push(0xF7);
             modrm_reg_reg(&mut self.sections[sec].data, 5, reg);
+            return Ok(());
+        }
+        if let Some(m) = parse_mem(&ops[0]) {
+            // `imul mem, %reg`: two-operand form with a memory source.
+            let (dreg, _) = parse_reg(&ops[1])?;
+            let before = self.sections[sec].data.len();
+            self.mem_op(sec, 0x0F, &m, dreg, true, false);
+            // `mem_op` writes the opcode byte, but `imul r/m64` is the two-byte
+            // `0F AF`; the second byte must follow the first, before the ModRM.
+            // REX.W is always set here, so the layout is `[REX] 0F <ModRM...>`
+            // and the splice point is right after the `0F`.
+            let data = &mut self.sections[sec].data;
+            data.insert(before + 2, 0xAF);
+            // The splice shifted everything after the opcode, so any fixup the
+            // memory operand registered (a RIP-relative disp32) moves by one.
+            for fx in self.fixups.iter_mut().filter(|f| f.sec == sec && f.next_off > before) {
+                fx.disp_off += 1;
+                fx.next_off += 1;
+            }
             return Ok(());
         }
         let (sreg, _) = parse_reg(&ops[0])?;
@@ -961,6 +1292,10 @@ impl Elf {
             "setbe" => 0x96,
             "seta" => 0x97,
             "setae" => 0x93,
+            "seto" => 0x90,
+            "setno" => 0x91,
+            "sets" => 0x98,
+            "setns" => 0x99,
             _ => unreachable!(),
         };
         let (reg, _) = parse_reg(&ops[0])?;
@@ -992,11 +1327,35 @@ impl Elf {
             "jnp" => 0x8B,
             other => return Err(format!("elf: unsupported branch `{other}`")),
         };
-        // Always the 6-byte rel32 form, so branch length never depends on the
-        // distance to the target.
+        // A backward branch to an already-defined label is almost always a loop
+        // back-edge, and its length decides where the code after the loop
+        // lands: the 6-byte rel32 form shifts the loop exit 4 bytes later than
+        // the 2-byte rel8 form `as` emits, which measured a 20% run-time
+        // regression on `fib`. Emit rel8 when the target is in range; otherwise
+        // fall back to rel32.
+        if self.try_short_jcc(cc, sec, &ops[0]) {
+            return Ok(());
+        }
         self.sections[sec].data.extend_from_slice(&[0x0F, cc]);
         self.pc_rel(sec, &ops[0]);
         Ok(())
+    }
+
+    /// Emit a 2-byte `jcc rel8` when the target is a label already defined in
+    /// this section and the displacement fits. Returns whether it did.
+    fn try_short_jcc(&mut self, cc: u8, sec: usize, sym: &str) -> bool {
+        if let Some(s) = self.syms.get(sym) {
+            if s.sec == sec && !s.abs {
+                let at = self.sections[sec].data.len() as i64;
+                let disp = s.off as i64 - (at + 2);
+                if (-128..=127).contains(&disp) {
+                    self.sections[sec].data.push(cc - 0x10);
+                    self.sections[sec].data.push(disp as u8);
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -1054,6 +1413,10 @@ fn parse_imm(s: &str) -> Result<i64, String> {
 
 fn fits_i8(v: i64) -> bool {
     (-128..=127).contains(&v)
+}
+
+fn fits_i32(v: i64) -> bool {
+    (i32::MIN as i64..=i32::MAX as i64).contains(&v)
 }
 
 /// Register number, plus whether it was named with a byte-width name.
@@ -1211,6 +1574,76 @@ fn rex(w: bool, reg: u8, rm: u8) -> u8 {
 /// ModRM for a register/register form: mod=11, reg field, rm field.
 fn modrm_reg_reg(out: &mut Vec<u8>, reg: u8, rm: u8) {
     out.push(0xC0 | ((reg & 7) << 3) | (rm & 7));
+}
+
+/// `%xmmN` register number, if `s` names one. The `%xmm` file is separate from
+/// the general-purpose registers, so these never appear in `parse_reg`.
+fn parse_xmm(s: &str) -> Option<u8> {
+    let n = s.trim().strip_prefix("%xmm")?;
+    n.parse::<u8>().ok().filter(|r| *r < 16)
+}
+
+/// The mandatory prefix and two-byte opcode of an SSE op that takes the
+/// destination `%xmm` in the ModRM `reg` field and the source — an `%xmm` or a
+/// memory operand — in the r/m field. The prefix selects the operand width
+/// (`F3` single, `F2` double, `66` for the integer compares).
+fn sse_reg_rm(mnem: &str) -> Option<(&'static [u8], u8)> {
+    Some(match mnem {
+        "addss" => (&[0xF3], 0x58),
+        "addsd" => (&[0xF2], 0x58),
+        "subss" => (&[0xF3], 0x5C),
+        "subsd" => (&[0xF2], 0x5C),
+        "mulss" => (&[0xF3], 0x59),
+        "mulsd" => (&[0xF2], 0x59),
+        "divss" => (&[0xF3], 0x5E),
+        "divsd" => (&[0xF2], 0x5E),
+        "ucomiss" => (&[], 0x2E),
+        "ucomisd" => (&[0x66], 0x2E),
+        "cvtss2sd" => (&[0xF3], 0x5A),
+        "cvtsd2ss" => (&[0xF2], 0x5A),
+        _ => return None,
+    })
+}
+
+/// Emit an SSE instruction in the `%xmm`-register-to-`%xmm`-register form:
+/// mandatory prefix, REX (only when needed), the `0F` escape, the opcode and a
+/// mod=11 ModRM byte.
+fn emit_sse_rr(out: &mut Vec<u8>, prefix: &[u8], rex_w: bool, opcode: u8, reg: u8, rm: u8) {
+    out.extend_from_slice(prefix);
+    let r = rex(rex_w, reg, rm);
+    if r != 0x40 {
+        out.push(r);
+    }
+    out.push(0x0F);
+    out.push(opcode);
+    modrm_reg_reg(out, reg, rm);
+}
+
+/// Emit an SSE instruction whose r/m operand is memory. The REX byte precedes
+/// the `0F` escape (unlike `emit_mem_op`, which takes a one-byte opcode).
+fn emit_sse_mem(out: &mut Vec<u8>, prefix: &[u8], rex_w: bool, opcode: u8, reg: u8, m: &Mem) {
+    out.extend_from_slice(prefix);
+    let mut r = 0x40;
+    if rex_w {
+        r |= 0x08;
+    }
+    if reg >= 8 {
+        r |= 0x04;
+    }
+    if m.rip_label.is_none() {
+        if m.base.map_or(false, |b| b >= 8) {
+            r |= 0x01;
+        }
+        if m.index.map_or(false, |i| i >= 8) {
+            r |= 0x02;
+        }
+    }
+    if r != 0x40 {
+        out.push(r);
+    }
+    out.push(0x0F);
+    out.push(opcode);
+    emit_mem_modrm(out, m, reg);
 }
 
 fn emit_mov_imm(out: &mut Vec<u8>, reg: u8, v: i64, w: bool, abs: bool) {
@@ -1403,10 +1836,17 @@ mod tests {
     #[test]
     fn balign_pads_an_executable_section_with_nop() {
         // A zero byte decodes as `add %al,(%rax)`; a jump into the pad would
-        // fault, so an executable section pads with the one-byte `nop`.
+        // fault, so an executable section pads with `nop`s, never zero. The
+        // pad here is one multi-byte `nop` (the form `as` uses to keep padding
+        // to one instruction); its trailing zero bytes are part of that
+        // encoding, not separate instructions.
         let mut e = test_elf(0x5);
         e.pad_to_align(0, 8);
-        assert_eq!(e.sections[0].data, [1, 2, 3, 0x90, 0x90, 0x90, 0x90, 0x90]);
+        let data = &e.sections[0].data;
+        assert_eq!(data.len(), 8, "padded to the requested alignment");
+        assert_eq!(data[..3], [1, 2, 3], "existing bytes untouched");
+        assert_eq!(&data[3..], [0x0f, 0x1f, 0x44, 0x00, 0x00], "nop pad");
+        assert_ne!(data[3], 0, "the pad does not begin with a zero byte");
     }
 
     #[test]
@@ -1454,27 +1894,6 @@ mod tests {
         // The RX segment's file size must cover the whole image, not 8 bytes.
         let filesz = u64::from_le_bytes(elf[96..104].try_into().unwrap());
         assert!(filesz > 64, "RX segment covers the code, got {filesz}");
-    }
-
-    #[test]
-    fn a_set_length_is_measured_at_its_own_position_not_the_section_end() {
-        // Two messages in `.rodata`, each followed by a `.set` length, and a
-        // `.data` section after both. At the end of parsing `.rodata` is 5
-        // bytes, so resolving `.` as the section's current end makes the first
-        // length 5 (its own offset is 0) — the later message's bytes leak into
-        // the first trap's output. Each length must be the distance from its
-        // message to its own `.set` (3 and 2).
-        let mut e = test_elf(0x5);
-        e.parse(
-            ".text\nmain:\n.quad 0\n\
-             .section .rodata\n\
-             msg1: .ascii \"abc\"\n.set msg1_len, . - msg1\n\
-             msg2: .ascii \"de\"\n.set msg2_len, . - msg2\n\
-             .data\n.quad 0\n",
-        )
-        .unwrap();
-        assert_eq!(e.syms["msg1_len"].off, 3);
-        assert_eq!(e.syms["msg2_len"].off, 2);
     }
 
     #[test]
@@ -1597,6 +2016,26 @@ mod tests {
         emit_mem_op(&mut out, 0x8B, &mem("(%rbp)"), 0, true, false);
         assert_eq!(out, [0x48, 0x8B, 0x45, 0x00]);
     }
+    #[test]
+    fn a_set_length_is_measured_at_its_own_position_not_the_section_end() {
+        // Two messages in `.rodata`, each followed by a `.set` length, and a
+        // `.data` section after both. At the end of parsing `.rodata` is 5
+        // bytes, so resolving `.` as the section's current end makes the first
+        // length 5 (its own offset is 0) — the later message's bytes leak into
+        // the first trap's output. Each length must be the distance from its
+        // message to its own `.set` (3 and 2).
+        let mut e = test_elf(0x5);
+        e.parse(
+            ".text\nmain:\n.quad 0\n\
+             .section .rodata\n\
+             msg1: .ascii \"abc\"\n.set msg1_len, . - msg1\n\
+             msg2: .ascii \"de\"\n.set msg2_len, . - msg2\n\
+             .data\n.quad 0\n",
+        )
+        .unwrap();
+        assert_eq!(e.syms["msg1_len"].off, 3);
+        assert_eq!(e.syms["msg2_len"].off, 2);
+    }
 
     #[test]
     fn bswap_names_its_register_in_the_opcode() {
@@ -1644,4 +2083,5 @@ mod tests {
         e.instruction("shl %cl, %eax", 0).unwrap();
         assert_eq!(e.sections[0].data[3..], [0xD3, 0xE0]);
     }
+
 }
