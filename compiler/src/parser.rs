@@ -1175,7 +1175,15 @@ impl Parser {
     /// bindings it introduces, and the fallback `rest` for a non-match.
     fn desugar_arm(pat: Pat, subj: &Expr, body: Expr, rest: Option<Expr>, check_dead: bool) -> Expr {
         match pat {
-            Pat::Wild => Self::irrefutable_arm(body, rest, check_dead),
+            // A wildcard ends the chain, so its body is wrapped in a block
+            // (like a binding arm's) to mark it as a body rather than another
+            // chain step. Without the block, `match_never_typed` would read a
+            // body that is itself an `if` as the next arm's test and misjudge
+            // whether the match is `!`.
+            Pat::Wild => Expr::Block(Block {
+                stmts: Vec::new(),
+                tail: Some(Box::new(Self::irrefutable_arm(body, rest, check_dead))),
+            }),
             // `name => body` binds the whole scrutinee.
             Pat::Bind(name) => Expr::Block(Block {
                 stmts: vec![Stmt::Let {
