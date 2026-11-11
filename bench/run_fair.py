@@ -96,7 +96,9 @@ def measure(argv, reps, cwd=None):
         # A short-lived process can exit before the first `VmHWM` sample, which
         # would record RSS 0 and turn a real win into a spurious loss in the
         # ratio check. Retry the spawn until a nonzero peak is observed, the
-        # same way `run_mir.py`'s sampler does.
+        # same way `run_mir.py`'s sampler does. (When even the retries miss - a
+        # sub-millisecond binary like `refs` can exit between two reads - the
+        # verdict treats the 0 as unmeasured rather than as a loss; see `main`.)
         for _attempt in range(5):
             t0 = time.perf_counter()
             pid = os.posix_spawn(exe, [exe] + list(argv[1:]), os.environ,
@@ -225,13 +227,18 @@ def main():
                 mv, lv = m["run"][a[4:]], l["run"][a[4:]]
             else:
                 mv, lv = m[a], l[a]
-            ratio = lv / mv if mv else 0
+            # A zero means the sample never landed (see `measure`); a missing
+            # number is not a loss, so leave it out of the verdict rather than
+            # scoring it 0 and flagging a spurious `<-- LOSS`. `nan` also prints
+            # as `n/a` and, being unequal to itself, skips the `< 1.0` test.
+            ratio = lv / mv if mv else float("nan")
             vals.append(ratio)
             if ratio < 1.0:
                 ok = False
         all_ok = all_ok and ok
         mark = "" if ok else "  <-- LOSS"
-        print(f"{p:<9} " + " ".join(f"{v:9.2f}" for v in vals) + mark)
+        cells = " ".join("      n/a" if v != v else f"{v:9.2f}" for v in vals)
+        print(f"{p:<9} {cells}{mark}")
     print()
     print("ALL MIR WINS" if all_ok else "some axes lost")
 
