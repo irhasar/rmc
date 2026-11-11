@@ -2986,6 +2986,10 @@ def reject_corpus():
         # `b'\\x{41}'` is not a byte escape either; rustc wants exactly two hex
         # digits, and so does rmc.
         "byte_literal_bad_hex_escape": "fn main() { println!(\"{}\", b'\\x{41}'); }\n",
+        # A block-scoped `const` must be type-checked like a top-level one: a
+        # `str` constant is unsized in rustc (E0277), and rmc folds only `i64`,
+        # `bool` and `char`, so it must reject the item rather than skip it.
+        "block_const_str_type": "fn main() { const S: str = \"hi\"; println!(\"{}\", 1); }\n",
     }
 
 

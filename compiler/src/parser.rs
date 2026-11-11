@@ -857,16 +857,34 @@ impl Parser {
         };
         let end = self.i;
         self.i = saved;
+        // Resolve the declared type the way a top-level `const` is resolved
+        // (`str`, and an alias to a scalar), then require a type rmc can fold.
+        // Without this a block-scoped `const S: str = "hi";` would be accepted
+        // while the same item at the top level is rejected.
+        let ty = self.expand_alias_ty(&def.ty, 0)?;
+        let ty = match ty {
+            Type::Named(n) if n == "str" => Type::Str,
+            other => other,
+        };
+        match ty {
+            Type::I64 | Type::Bool | Type::Char => {}
+            other => {
+                return Err(format!(
+                    "at byte {}: constant `{}` has type {other:?}; rmc only folds `i64`, `bool` and `char` constants",
+                    self.toks[start].pos, def.name
+                ))
+            }
+        }
         // A constant may name one declared earlier (in this block or outside
         // it), so fold against the live tables, which already hold every value
         // in scope.
-        let items = [(def.name.clone(), def.ty.clone(), def.value.clone())];
+        let items = [(def.name.clone(), ty.clone(), def.value.clone())];
         let mut val = crate::consts::resolve(&items).get(&def.name).copied();
         // A `char` constant folds through `eval_char`, which the item `resolve`
         // path covers; an alias-typed one is rare enough to leave unresolved.
         if val.is_none() {
             if let Some(v) = crate::consts::eval_i64(&def.value, &self.consts) {
-                if def.ty == Type::I64 {
+                if ty == Type::I64 {
                     val = Some(crate::consts::ConstVal::Int(v));
                 }
             }

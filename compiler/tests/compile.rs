@@ -5425,6 +5425,18 @@ fn a_block_const_is_out_of_scope_after_its_block() {
 }
 
 #[test]
+fn a_block_const_of_an_unsupported_type_is_rejected() {
+    // The item is type-checked like a top-level one, so a `str` constant is
+    // refused rather than silently skipped.
+    let err = compile_to_asm(
+        "fn main() { const S: str = \"hi\"; println!(\"{}\", 1); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("rmc only folds"), "got: {err}");
+}
+
+#[test]
 fn a_value_loop_binds_its_break_value() {
     // `loop` is an expression: the `break` value is stored into the loop's
     // result slot, which the code after the loop reads.
