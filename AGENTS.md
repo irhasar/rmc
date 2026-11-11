@@ -2086,6 +2086,33 @@ the next instruction reads the flags it sets (`flags_used_by`). Measured on the
 `heap` linked-list fill: one load per node removed, run 1.08x vs LLVM; `refs`
 1.04x, `mix` 1.01x.
 
+### A drop-glue read of a promoted caller-saved local must come from its spill slot
+
+`gen_drop` spills the promoted caller-saved locals once, before the destructor
+tree, and restores them after the whole tree. That is correct for the tree's
+*calls*, but not for a read that happens *inside* the tree after one of them: the
+destructor call clobbers the register, so a later `place_addr` that reads the
+local gets garbage. Dropping `arr[i]` is the reachable case — the index local
+feeds `Proj::IndexLocal`, and a struct whose first field drops before a second
+field is addressed (`struct S { a: [Inner; 2], b: Inner }`) reads the index again
+after the array's destructors have run, dropping `b` at `arr[<garbage>]`. While
+`in_drop` is set, `local_operand` returns the local's caller-spill slot (written
+by the tree's own spill) instead of the register. The index must be *promoted*
+for this to bite: it needs a use count of at least 2 (`indexdrop.rs` raises it
+with nested loops), otherwise it stays in its frame slot and the bug is latent.
+Regression: `tests/mir/indexdrop.rs`.
+
+### An aggregate literal is a variant only if a real `::variant` segment follows the type
+
+Both aggregate-classification paths (`reclassify_enum_aggregate`, which uses the
+destination local's type, and `is_enum_variant_name`, which decides by
+capitalisation) must strip generics *before* looking for the variant segment. A
+generic struct literal prints as `G::<T> { .. }`; splitting the raw name takes
+the turbofish as the variant and adds a phantom tag word, shifting every field by
+one (`G::<T>` with a module-qualified argument gave 12 instead of 119). Reducing
+first makes `Option::<i64>::Some` -> `Option::Some` (a variant) and `G::<T>` ->
+`G` (a struct). Regression: `tests/mir/genstruct.rs`.
+
 ## Pushing
 
 `git push origin <branch>` needs a token with `contents: write`. The

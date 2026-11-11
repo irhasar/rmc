@@ -25,6 +25,14 @@ jobs:
       - name: Differential tests
         run: python3 tests/run.py
 
+      # The MIR pipeline (rustc front end + rmc back end): same differential
+      # contract, but the reference and the subject share one freestanding
+      # runtime, so the only variable is the code generator. `rmc` drives
+      # `rustc --emit=mir` itself (with `RUSTC_BOOTSTRAP=1` for `-Zno-codegen`),
+      # so the stable toolchain installed above is enough.
+      - name: MIR differential tests
+        run: python3 tests/mir/run.py
+
   fuzz:
     runs-on: ubuntu-latest
     steps:
