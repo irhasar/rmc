@@ -4023,6 +4023,53 @@ fn a_short_circuited_condition_does_not_initialize_its_right_operand() {
 }
 
 #[test]
+fn a_chained_guard_checks_its_right_operand_under_the_left_true_state() {
+    // `(a && { x = 7; true }) && x == 7`: the outer `&&`'s right operand runs
+    // only where the inner `&&` was true, which is exactly where `x` was
+    // assigned. The inner short circuit leaves the merged "either path" state
+    // on the scope, so checking the comparison against that state wrongly
+    // rejected the read. rustc accepts this and returns `7`.
+    assert_eq!(
+        run_exit_code(
+            "fn f(a: bool) -> i64 { let mut x: i64; \
+             if (a && { x = 7; true }) && x == 7 { return x; } return 0; } \
+             fn main() -> i64 { return f(true); }",
+        ),
+        7
+    );
+    // The mirror for `||`: `(a || { x = 7; false }) || x == 7` reaches the
+    // comparison only when the left was false, which is where `x` was assigned.
+    assert_eq!(
+        run_exit_code(
+            "fn f(a: bool) -> i64 { let mut x: i64 = 0; \
+             if (a || { x = 7; false }) || x == 7 { return 0; } return x; } \
+             fn main() -> i64 { return f(false); }",
+        ),
+        0
+    );
+    // The guard's write is still not visible *after* the whole condition: on the
+    // path where the outer right operand never runs, `x` is uninitialized, so a
+    // read in the else must be rejected. rustc rejects it (E0381).
+    let err = compile_to_asm(
+        "fn f(a: bool) -> i64 { let mut x: i64; if (a && { x = 7; true }) && x == 7 { return 1; } \
+         else { return x; } } fn main() { let _ = f(true); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("possibly-uninitialized variable `x`"), "got: {err}");
+    // A value use still sees the merged state: `let b = a && { x = 7; true }`
+    // may skip the right operand, so the later read is rejected. rustc rejects
+    // it (E0381).
+    let err = compile_to_asm(
+        "fn f(a: bool) -> i64 { let mut x: i64; let b = a && { x = 7; true }; \
+         if b { return x; } return 0; } fn main() { let _ = f(true); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("possibly-uninitialized variable `x`"), "got: {err}");
+}
+
+#[test]
 fn a_both_diverge_if_does_not_uninitialize_a_live_binding() {
     // Neither branch of `if true { return 1 } else { return 2 }` reaches the
     // code after it, so a binding initialized before the `if` stays initialized
