@@ -14,14 +14,16 @@
 //!   an alias could change), and no block or `if`. Struct-field reads are
 //!   allowed, but only when the loop writes no memory at all.
 //! * A field read through a *reference* (`p.x` where `p: &T`, or `(*q).x`) is
-//!   not hoisted. rmc lets a reference outlive its referent (`0 as &i64` is
-//!   accepted, and a `&` to a local can be returned), so dereferencing one is a
-//!   memory read that can fault. Hoisting it would fault on a loop that never
-//!   runs, where the read inside the body would not. Such a read stays in the
-//!   loop even when it is otherwise invariant and the loop writes no memory.
-//!   The `refs` benchmark is exactly this shape (a `&self` accessor sum), so it
-//!   is not hoisted and runs slower than an equivalent frame-based loop; see
-//!   `bench/RESULTS.md`.
+//!   hoisted only when the reference is *proven* to point at a live local of
+//!   this function (`let p = &local;`, or a copy of such a reference). Such a
+//!   pointer cannot be null or dangle, so speculating the read cannot fault,
+//!   and the loop writes no memory, so the value is unchanged. Any other
+//!   reference — a parameter, a field, a dereference of one, or one whose
+//!   operand is not a frame place — is unproven and its reads stay in the loop,
+//!   because rmc lets a reference outlive its referent (`0 as &i64` is accepted,
+//!   and a `&` to a local can be returned) and dereferencing one is a memory
+//!   read that can fault. Hoisting it would fault on a loop that never runs,
+//!   where the read inside the body would not.
 //! * Every local the expression reads must be untouched by the loop. If the loop
 //!   contains any call, the pass gives up on that loop entirely, since a call
 //!   can write anything.
@@ -49,7 +51,8 @@ pub fn run(prog: &mut Program, overflow_checks: bool) {
         return;
     }
     for f in &mut prog.fns {
-        let mut l = Licm { nslots: f.nslots };
+        let proven = proven_refs(&f.body);
+        let mut l = Licm { nslots: f.nslots, proven };
         l.block(&mut f.body);
         f.nslots = l.nslots;
     }
@@ -57,6 +60,9 @@ pub fn run(prog: &mut Program, overflow_checks: bool) {
 
 struct Licm {
     nslots: i32,
+    /// Slots holding a reference proven to point at a live local of this
+    /// function, so a read through one cannot fault (see `proven_refs`).
+    proven: HashSet<i32>,
 }
 
 impl Licm {
@@ -206,10 +212,156 @@ Expr::PatScrutinee(_) => {
         for s in carried {
             eff.slots.insert(*s);
         }
-        let mut h = Hoister { nslots: self.nslots, eff, binds: Vec::new(), seen: HashMap::new() };
+        let mut h = Hoister {
+            nslots: self.nslots,
+            eff,
+            binds: Vec::new(),
+            seen: HashMap::new(),
+            proven: self.proven.clone(),
+        };
         h.block(body);
         self.nslots = h.nslots;
         h.binds
+    }
+}
+
+/// The slots of `body` that hold a reference *proven* to point at a live local
+/// of this function, so a read through one cannot fault.
+///
+/// A slot is proven when an immutable `let` binds it to `&place` for a frame
+/// place (`&local` or `&local.field`), or to another proven slot. The operand
+/// must be a local the function owns, so the pointer is to live frame storage
+/// and can neither be null nor dangle while the reference is live. An immutable
+/// binding cannot be reassigned (sema rejects assigning a non-`mut` local), so
+/// the proof holds for the binding's whole life; a `mut` reference is not
+/// proven. Every other reference — a parameter, a struct field, a dereference of
+/// one, `&*p`, or a cast from an integer — is unproven: rmc lets it be null or
+/// dangling (`0 as &i64`, or a returned `&local`), so a speculative read through
+/// it could fault.
+///
+/// The set is a fixed point over the whole body, not just the loop: `let p =
+/// &x;` after a loop must be seen for a `let q = p;` copy read inside it to be
+/// proven, and the source may be walked after the copy. It is *may*-proven (a
+/// slot added by any binding is kept), which is sound because a proven slot is
+/// an immutable binding: nothing can later make it hold a different pointer.
+fn proven_refs(body: &Block) -> HashSet<i32> {
+    let mut proven = HashSet::new();
+    loop {
+        let before = proven.len();
+        scan_proven(body, &mut proven);
+        if proven.len() == before {
+            return proven;
+        }
+    }
+}
+
+/// True when `e` builds a reference to a frame place: `&local` or
+/// `&local.field`. The operand must be a place this function owns, so the
+/// pointer cannot be null or dangle.
+fn is_frame_ref(e: &Expr) -> bool {
+    matches!(e, Expr::AddrOf { expr, .. } if is_frame_place(expr))
+}
+
+/// True when `e` names a frame place: a local, or a non-reference field of one.
+/// A reference-typed field is a pointer, so a place past it is not a frame
+/// place.
+fn is_frame_place(e: &Expr) -> bool {
+    match e {
+        Expr::Var { .. } => true,
+        Expr::Field { base, ty, .. } => !matches!(ty, Type::Ref(..)) && is_frame_place(base),
+        _ => false,
+    }
+}
+
+/// Record the destination of an immutable `let` that is bound to a proven
+/// reference, and recurse through every statement and block.
+fn scan_proven(b: &Block, proven: &mut HashSet<i32>) {
+    for s in &b.stmts {
+        match s {
+            Stmt::Let { init: Some(e), slot, mutable: false, .. } => {
+                if is_frame_ref(e) || matches!(e, Expr::Var { slot, .. } if proven.contains(slot)) {
+                    proven.insert(*slot);
+                }
+                scan_expr_proven(e, proven);
+            }
+            Stmt::Let { init: Some(e), .. } => scan_expr_proven(e, proven),
+            Stmt::Let { init: None, .. } => {}
+            Stmt::Assign { value, .. } => scan_expr_proven(value, proven),
+            Stmt::Expr(e) => scan_expr_proven(e, proven),
+            Stmt::While(c, body, _) => {
+                scan_expr_proven(c, proven);
+                scan_proven(body, proven);
+            }
+            Stmt::For { start, end, body, .. } => {
+                scan_expr_proven(start, proven);
+                scan_expr_proven(end, proven);
+                scan_proven(body, proven);
+            }
+            Stmt::Return(Some(e)) | Stmt::Break(Some(e), _) => scan_expr_proven(e, proven),
+            Stmt::Return(None) | Stmt::Break(None, _) | Stmt::Continue(_) => {}
+        }
+    }
+    if let Some(t) = &b.tail {
+        scan_expr_proven(t, proven);
+    }
+}
+
+/// Recurse into the sub-expressions of `e` so a `let` inside a nested block or
+/// `if` arm is seen.
+fn scan_expr_proven(e: &Expr, proven: &mut HashSet<i32>) {
+    match e {
+        Expr::Block(b) | Expr::Loop(b, _, _, _) | Expr::MatchBoundary(b, _) => scan_proven(b, proven),
+        Expr::If(c, t, els) => {
+            scan_expr_proven(c, proven);
+            scan_proven(t, proven);
+            if let Some(b) = els {
+                scan_proven(b, proven);
+            }
+        }
+        Expr::Bin(_, a, b) => {
+            scan_expr_proven(a, proven);
+            scan_expr_proven(b, proven);
+        }
+        Expr::Un(_, a) | Expr::Cast(a, _) => scan_expr_proven(a, proven),
+        Expr::Field { base, .. } => scan_expr_proven(base, proven),
+        Expr::Index(a, b) => {
+            scan_expr_proven(a, proven);
+            scan_expr_proven(b, proven);
+        }
+        Expr::Deref { expr, .. } | Expr::AddrOf { expr, .. } => scan_expr_proven(expr, proven),
+        Expr::Call { args, .. } => {
+            for a in args {
+                scan_expr_proven(a, proven);
+            }
+        }
+        Expr::MethodCall { recv, args, .. } => {
+            scan_expr_proven(recv, proven);
+            for a in args {
+                scan_expr_proven(a, proven);
+            }
+        }
+        Expr::StructLit { fields, .. } => {
+            for f in fields {
+                scan_expr_proven(&f.value, proven);
+            }
+        }
+        Expr::EnumCtor { args, .. } => {
+            for a in args {
+                scan_expr_proven(a, proven);
+            }
+        }
+        Expr::ArrayLit(v, _) => scan_expr_proven(v, proven),
+        Expr::ArrayList(v) | Expr::TupleLit(v) => {
+            for x in v {
+                scan_expr_proven(x, proven);
+            }
+        }
+        Expr::VariantTest { scrutinee, .. } | Expr::BoolTest { scrutinee, .. } => {
+            scan_expr_proven(scrutinee, proven);
+        }
+        Expr::EnumPayload { recv, .. } => scan_expr_proven(recv, proven),
+        Expr::PatScrutinee(_) | Expr::PatCheck { .. } | Expr::PatArity { .. } => {}
+        Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
     }
 }
 
@@ -380,6 +532,9 @@ struct Hoister {
     eff: Effects,
     binds: Vec<Stmt>,
     seen: HashMap<String, (i32, Type)>,
+    /// The function's proven-reference slots, copied from `Licm` so the same
+    /// `frame_field_base` rule decides what a hoist may speculate.
+    proven: HashSet<i32>,
 }
 
 impl Hoister {
@@ -549,16 +704,19 @@ Expr::PatScrutinee(_) => {
         }
     }
 
-    /// True when a field read's base names a local aggregate, so the read is a
-    /// frame access rather than a load through a pointer that could fault. Any
-    /// field in the chain whose own type is a reference holds an address, so a
-    /// read past it dereferences a pointer that may be null or dangling and is
-    /// not a frame access.
-    fn frame_field_base(e: &Expr) -> bool {
+    /// True when a field read's base is a frame access rather than a load
+    /// through a pointer that could fault. A local aggregate is a frame access.
+    /// A local reference is a frame access only when it is *proven* to point at
+    /// a live local (`self.proven`); an unproven reference, a reference-typed
+    /// field, or any deeper chain holds an address that may be null or dangle.
+    fn frame_field_base(&self, e: &Expr) -> bool {
         match e {
-            Expr::Var { ty, .. } => !matches!(ty, crate::ast::Type::Ref(..)),
+            Expr::Var { slot, ty, .. } => match ty {
+                Type::Ref(..) => self.proven.contains(slot),
+                _ => true,
+            },
             Expr::Field { base, ty, .. } => {
-                !matches!(ty, crate::ast::Type::Ref(..)) && Self::frame_field_base(base)
+                !matches!(ty, Type::Ref(..)) && self.frame_field_base(base)
             }
             _ => false,
         }
@@ -573,14 +731,15 @@ Expr::PatScrutinee(_) => {
             // writes no memory at all.
             // A field read through a local aggregate is a frame access and
             // cannot fault, so it is safe to speculate. A read through a
-            // reference dereferences a pointer that may be null or dangling, so
-            // it must stay in the loop: hoisting it would fault on a loop whose
-            // body never runs.
+            // reference may dereference a pointer that is null or dangling, so
+            // it is hoisted only when the reference is proven to point at a live
+            // local (`frame_field_base`): hoisting an unproven one would fault
+            // on a loop whose body never runs.
             Expr::Field { base, ty, .. } => {
                 !self.eff.mem
                     && ty.is_scalar()
                     && self.invariant(base)
-                    && Self::frame_field_base(base)
+                    && self.frame_field_base(base)
             }
             Expr::Bin(op, a, b) => {
                 !matches!(op, BinOp::Div | BinOp::Mod) && self.invariant(a) && self.invariant(b)
@@ -681,3 +840,4 @@ fn count_expr(e: &Expr) -> usize {
         _ => 1_000_000,
     }
 }
+

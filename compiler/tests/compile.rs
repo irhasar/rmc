@@ -5008,6 +5008,74 @@ fn a_field_read_through_a_reference_blocks_hoisting() {
 }
 
 #[test]
+fn a_read_through_a_local_reference_is_hoisted() {
+    // `wr` is `&w`, an immutable binding to a live local, so the pointer cannot
+    // be null or dangle and a read through it cannot fault. The accessor sum is
+    // invariant and the loop writes no memory, so it is hoisted and the loop
+    // keeps one add per iteration (the same code a frame-based loop gets).
+    let src = "struct S { n: i64, m: i64 } \
+               fn main() -> i64 { let s: S = S { n: 5, m: 3 }; let r: &S = &s; \
+               let mut acc: i64 = 0; let mut i: i64 = 0; \
+               while i < 4 { acc = acc + r.n * r.m; i = i + 1; } return acc; }";
+    let with = loop_body(&asm(src));
+    assert!(!with.contains("imul"), "a read through a proven reference is hoisted:\n{with}");
+    let without = loop_body(&asm_no_licm(src));
+    assert!(without.contains("imul"), "without LICM the product stays in the loop:\n{without}");
+}
+
+#[test]
+fn a_proven_reference_copy_is_hoisted() {
+    // `q` is bound to `p`, which is proven, so `q` is proven too even though it
+    // is declared after the loop and the scan sees it only on the second pass.
+    let src = "struct S { n: i64, m: i64 } \
+               fn main() -> i64 { let s: S = S { n: 5, m: 3 }; let p: &S = &s; \
+               let mut acc: i64 = 0; let mut i: i64 = 0; \
+               while i < 4 { acc = acc + p.n * p.m; i = i + 1; } \
+               let q: &S = p; return acc + q.n; }";
+    let with = loop_body(&asm(src));
+    assert!(!with.contains("imul"), "a copy of a proven reference is hoisted:\n{with}");
+}
+
+#[test]
+fn a_read_through_a_reference_parameter_is_not_hoisted() {
+    // A parameter is not proven: the caller may pass a null or dangling
+    // pointer, so a speculative read could fault on a loop that never runs. The
+    // loop is in `f`, so its body is inspected directly.
+    let src = "struct S { n: i64, m: i64 } \
+               fn f(r: &S) -> i64 { let mut acc: i64 = 0; let mut i: i64 = 0; \
+               while i < 4 { acc = acc + r.n * r.m; i = i + 1; } return acc; } \
+               fn main() -> i64 { let s: S = S { n: 5, m: 3 }; return f(&s); }";
+    let out = asm_no_inline(src);
+    let (_, fbody) = fn_bodies(&out).into_iter().find(|(n, _)| n == "f").unwrap();
+    assert!(fbody.contains("imul"), "a read through a reference parameter stays in the loop:\n{fbody}");
+}
+
+#[test]
+fn a_read_through_a_mutable_reference_is_not_hoisted() {
+    // A `mut` binding can be reassigned to a dangling pointer, so it is not
+    // proven even when its initializer is `&local`.
+    let src = "struct S { n: i64, m: i64 } \
+               fn main() -> i64 { let s: S = S { n: 5, m: 3 }; let mut r: &S = &s; \
+               let mut acc: i64 = 0; let mut i: i64 = 0; \
+               while i < 4 { acc = acc + r.n * r.m; i = i + 1; } return acc; }";
+    let with = loop_body(&asm(src));
+    assert!(with.contains("imul"), "a read through a mutable reference stays in the loop:\n{with}");
+}
+
+#[test]
+fn a_read_through_a_cast_reference_is_not_hoisted() {
+    // `0 as &S` is an integer cast to a reference; rmc accepts it and it is
+    // null, so a speculative read would fault.
+    let src = "struct S { n: i64, m: i64 } \
+               fn main() -> i64 { let r: &S = 0 as &S; \
+               let mut acc: i64 = 0; let mut i: i64 = 0; \
+               while i < 0 { acc = acc + r.n * r.m; i = i + 1; } return acc; }";
+    let with = loop_body(&asm(src));
+    assert!(with.contains("imul"), "a read through a cast reference stays in the loop:\n{with}");
+}
+
+
+#[test]
 fn a_register_only_leaf_allocates_no_frame() {
     // Every local is promoted into a callee-saved register and nothing is
     // materialised, so the body addresses no frame slot. Nothing is addressed
