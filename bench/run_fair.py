@@ -91,36 +91,45 @@ def peak_rss_kb(pid):
 
 def measure(argv, reps, cwd=None):
     exe = shutil.which(argv[0]) or argv[0]
-    walls, cpus, rsss = [], [], []
+    walls, cpus = [], []
+    # Time the child with no other work in the loop. Sampling `VmHWM` in a
+    # busy-wait while the child runs adds syscall and scheduling overhead to the
+    # very interval being measured and lets ambient load leak in: a run that
+    # should take 3 ms could report 6. The CPU time comes from `wait4`'s rusage
+    # and is exact; wall time is a clean `perf_counter` bracket. RSS is sampled
+    # in its own pass below.
     for _ in range(reps):
-        # A short-lived process can exit before the first `VmHWM` sample, which
-        # would record RSS 0 and turn a real win into a spurious loss in the
-        # ratio check. Retry the spawn until a nonzero peak is observed, the
-        # same way `run_mir.py`'s sampler does. (When even the retries miss - a
-        # sub-millisecond binary like `refs` can exit between two reads - the
-        # verdict treats the 0 as unmeasured rather than as a loss; see `main`.)
-        for _attempt in range(5):
-            t0 = time.perf_counter()
-            pid = os.posix_spawn(exe, [exe] + list(argv[1:]), os.environ,
-                                 file_actions=[])
-            peak = 0
-            while True:
-                hwm = peak_rss_kb(pid)
-                if hwm > peak:
-                    peak = hwm
-                done, status, ru = os.wait4(pid, os.WNOHANG)
-                if done:
-                    break
-                os.sched_yield()
-            wall = time.perf_counter() - t0
-            if status != 0:
-                raise RuntimeError(f"run failed for {exe}: status={status}")
-            if peak > 0:
-                break
-        walls.append(wall)
+        t0 = time.perf_counter()
+        pid = os.posix_spawn(exe, [exe] + list(argv[1:]), os.environ,
+                             file_actions=[])
+        done, status, ru = os.wait4(pid, 0)
+        walls.append(time.perf_counter() - t0)
         cpus.append(ru.ru_utime + ru.ru_stime)
-        rsss.append(peak)
-    return dict(wall=min(walls), cpu=min(cpus), rss=max(rsss))
+        if status != 0:
+            raise RuntimeError(f"run failed for {exe}: status={status}")
+    # Peak RSS in its own pass. A short-lived process can exit before the first
+    # `VmHWM` sample; retry until a nonzero peak is seen, the same way
+    # `run_mir.py`'s sampler does. (When even the retries miss - a
+    # sub-millisecond binary like `refs` can exit between two reads - the
+    # verdict treats the 0 as unmeasured rather than as a loss; see `main`.)
+    rss = 0
+    for _ in range(max(3, reps)):
+        pid = os.posix_spawn(exe, [exe] + list(argv[1:]), os.environ,
+                             file_actions=[])
+        peak = 0
+        while True:
+            hwm = peak_rss_kb(pid)
+            if hwm > peak:
+                peak = hwm
+            done, status, ru = os.wait4(pid, os.WNOHANG)
+            if done:
+                break
+            os.sched_yield()
+        if status != 0:
+            raise RuntimeError(f"run failed for {exe}: status={status}")
+        if peak > rss:
+            rss = peak
+    return dict(wall=min(walls), cpu=min(cpus), rss=rss)
 
 
 def build_runtime():
@@ -183,7 +192,10 @@ def measure_llvm(name, runtime_obj, stub_obj, reps=5):
     }
 
 
-def run_binary(path, args, reps=9):
+def run_binary(path, args, reps=25):
+    # The binary's wall/CPU is the headline runtime number, so give it more
+    # samples than a compile step; `measure` returns the minimum of each, and
+    # more samples means a smaller, more stable minimum.
     return measure([path] + args, reps)
 
 
