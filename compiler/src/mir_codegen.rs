@@ -4000,7 +4000,17 @@ impl<'a> FnGen<'a> {
     fn gen_drop(&mut self, place: &Place) -> Result<(), String> {
         let ty = self.place_ty(place);
         if self.ty_needs_drop(&ty) {
+            // The destructor tree makes calls that clobber the caller-saved
+            // argument registers, and a promoted caller-saved local may live in
+            // one. Spill them once here, before any address is materialised
+            // into `%rdi` (which would overwrite a promoted `%rdi`), and restore
+            // after the whole tree. The spill cannot live inside the nested
+            // glue: every level shares one slot per local, so an inner spill
+            // would overwrite the outer's saved value with an argument register
+            // that already holds an address.
+            let saved = self.spill_caller_saved();
             self.gen_drop_glue(place, &ty)?;
+            self.restore_caller_saved(&saved);
         }
         Ok(())
     }
@@ -4017,27 +4027,19 @@ impl<'a> FnGen<'a> {
         if let Ty::Struct(name) = ty {
             if self.enums.contains_key(name) {
                 // The enum's own `Drop` impl runs first, then the active
-                // variant's fields. Both make calls, and the address helper
-                // clobbers `%rdi`, so preserve the promoted caller-saved locals
-                // across the whole sequence: the spill must precede `mov %rax,
-                // %rdi`, which would otherwise destroy a promoted `%rdi`.
+                // variant's fields. Hand the whole thing to the address helper,
+                // which runs the impl and dispatches on the tag; `gen_drop`
+                // already spilled the promoted caller-saved locals across it.
                 self.place_addr(place)?;
-                let saved = self.spill_caller_saved();
                 self.emit("  mov %rax, %rdi");
                 self.gen_drop_glue_at_reg(ty)?;
-                self.restore_caller_saved(&saved);
                 return Ok(());
             }
         }
         if let Some(sym) = self.drop_symbol_for_ty(ty) {
             self.place_addr(place)?;
-            // Spill *before* the `%rdi` move: it clobbers a promoted `%rdi`, so
-            // saving afterwards would store the clobbered value. `%rax` (the
-            // address) is not a promoted register, so the spill leaves it live.
-            let saved = self.spill_caller_saved();
             self.emit("  mov %rax, %rdi");
             self.emit(&format!("  call {}", asm_sym(&sym)));
-            self.restore_caller_saved(&saved);
         }
         match ty {
             Ty::Struct(name) => {
@@ -4117,9 +4119,7 @@ impl<'a> FnGen<'a> {
             self.emit(&format!("  mov %rdi, {}", self.off(p)));
         }
         if let Some(sym) = self.drop_symbol_for_ty(ty) {
-            let saved = self.spill_caller_saved();
             self.emit(&format!("  call {}", asm_sym(&sym)));
-            self.restore_caller_saved(&saved);
         }
         match ty {
             Ty::Array(elem, n) => {
