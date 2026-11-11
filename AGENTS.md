@@ -2084,16 +2084,31 @@ covered by a test in `compiler/tests/compile.rs`:
 - **Check ordering matters for the message.** rustc reports an unlabelled
   `break`/`continue` in a `while` condition before it evaluates the condition,
   so that check must precede `check_expr`.
-- **`&&`/`||` short-circuit.** A binding initialized only in the right operand
-  is not definitely initialized after the expression: merge the skipped path
-  (the left operand's state) with the evaluated path (both operands) for
-  `And`/`Or` in `check_expr`, before the caller snapshots the condition. A
-  binding already initialized before the expression stays initialized.
+- **`&&`/`||` short-circuit, so track the two branch states, not one merge.**
+  The right operand runs on only one of the two paths, so a binding it
+  initializes is not initialized after the expression unless it was already.
+  A *global* merge (both operands required) is wrong: rustc is path-sensitive,
+  and it over-rejects valid `if a && b { .. }` (true path ran `b`) and
+  `if a || b { .. }` (true path may have skipped `b`). `check_expr` instead
+  records `cond_then_init`/`cond_else_init` — the state on entry to the true
+  and false branch — and `check_stmt`'s `if`/`while` restore them before
+  checking each branch. `a && b` is true only when `b` ran (then = evaluated,
+  else = either); `a || b` is the mirror (then = either, else = evaluated).
+  Leave the scope with the "either path" state for a value use
+  (`let x = a && b`). Only a *top-level* short circuit splits the branches;
+  consume the slots on every condition so a nested one cannot leak.
 - **A `for` bound `continue` targets the enclosing loop even when the label is
   reused.** The bounds are evaluated before the `for`'s own label enters scope,
   so `stmt_contains_continue` must inspect `start`/`end` regardless of the
   shadowing test and guard only the body. Missing this hid the back edge to a
   `while` condition, letting a repeated immutable write pass (E0384).
+- **rustc's `arithmetic_overflow` lint is best-effort, and rmc is stricter.**
+  rmc folds a constant expression and rejects an overflow it can see. rustc's
+  lint can silently give up once a function body grows (a second statement in
+  `main` suppresses the diagnostic for an overflowing `*`), so a large generated
+  program where rustc accepts but rmc rejects is a known false-rejection, not a
+  bug in the fold. The differential fuzzers keep generated values small so this
+  never triggers under CI.
 
 Tests that claim to guard a runtime bug must *execute* the program and assert
 the result (`run_exit_code` / `run_output`); an `asm(...).contains("main:")`
