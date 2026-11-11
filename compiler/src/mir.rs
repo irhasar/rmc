@@ -890,6 +890,15 @@ fn canonicalize_types(prog: &mut Program) {
     // two candidates tie for longest (`A` seen as both `a::A` and `b::A`) the
     // name is genuinely ambiguous and is left alone.
     for n in &names {
+        // Only a bare name adopts a qualified one: the printer spells a type
+        // relative to the item that mentions it, so a lone `A` may stand for
+        // `a::A`. A name that already carries a path is a complete spelling and
+        // must not absorb a longer path it merely ends with — `a::A` is a
+        // `::`-suffix of `outer::a::A`, a different type, and merging them makes
+        // one impl's body win both calls.
+        if n.contains("::") {
+            continue;
+        }
         let suffix = format!("::{n}");
         let mut best: Option<&String> = None;
         let mut tied = false;
@@ -2995,7 +3004,24 @@ fn normalize_fmt_struct(name: &str) -> &str {
 /// corrupts the value.
 fn is_enum_variant_name(name: &str) -> bool {
     match name.rfind("::<") {
-        None => true,
+        None => {
+            // No generics. `Enum::Variant` has a type-cased segment before the
+            // last (`core::option::Option::Some`, `b::E::B`), while a struct the
+            // printer qualified by its module has a lowercase one there
+            // (`a::A`, `outer::inner::C`). Treating the latter as a variant adds
+            // a phantom tag word and shifts every field by one.
+            let mut segs = name.rsplit("::");
+            let _last = segs.next();
+            match segs.next() {
+                Some(penult) => penult
+                    .trim()
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_uppercase()),
+                // The caller only reaches here when the name contains `::`.
+                None => true,
+            }
+        }
         Some(i) => name[i + 3..].contains("::"),
     }
 }
