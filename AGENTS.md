@@ -2113,6 +2113,22 @@ one (`G::<T>` with a module-qualified argument gave 12 instead of 119). Reducing
 first makes `Option::<i64>::Some` -> `Option::Some` (a variant) and `G::<T>` ->
 `G` (a struct). Regression: `tests/mir/genstruct.rs`.
 
+### A type spelling is relative to the item that mentions it, and it can be qualified
+
+rustc prints a type relative to the body that mentions it, and that relative
+spelling is not always bare: inside `outer::get`, the nested type `outer::a::A`
+prints as `a::A`, while the crate root spells it `outer::a::A`. A qualified
+spelling looks like a complete path, so `canonicalize_types`' global bare-name
+pass skips it (it must: `a::A` in two modules can name two distinct types). The
+callee then keys a *different* type than the caller built, its layout is empty,
+and field reads fall back to `k*8`, reading the wrong word past a multi-word
+field. `Function::module` keeps the body's own module prefix from the raw header
+(before the printer's relative spellings are resolved) and a per-body pass in
+`canonicalize_types` resolves each qualified body spelling against it, longest
+prefix first. Regression: `tests/mir/modrelpath.rs` (reads `1 5` instead of
+`1 13` without the per-body pass). The inliner masks this: the callee needs a
+large body (or `#[inline(never)]`) to be emitted at all.
+
 ## Pushing
 
 `git push origin <branch>` needs a token with `contents: write`. The
