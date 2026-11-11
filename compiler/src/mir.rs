@@ -328,6 +328,10 @@ pub struct LocalDecl {
 #[derive(Debug, Clone)]
 pub struct Function {
     pub name: String,
+    /// The path prefix the body is nested in (`outer::get` -> `outer`), taken
+    /// from the raw header before the printer's relative type spellings are
+    /// resolved. Empty for a crate-root item.
+    pub module: String,
     pub locals: Vec<LocalDecl>,
     pub blocks: Vec<BasicBlock>,
     /// `const NAME: TY = VALUE;` items declared at this function's scope.
@@ -857,6 +861,32 @@ pub fn parse(text: &str) -> Result<Program, String> {
     Ok(prog)
 }
 
+/// The module paths a function's body may name types relative to, longest
+/// first. `outer::get` -> `["outer"]`; a nested `outer::inner::f` ->
+/// `["outer::inner", "outer"]`. A path relative to an outer module still
+/// resolves because the shorter prefix is tried too. `main` at the crate root
+/// yields the empty set, and the crate root is the empty prefix, which the
+/// bare-name pass has already reconciled.
+///
+/// A segment counts as a module only when some canonical type name extends it
+/// with `::`; the function's own final segment never does.
+fn function_modules(module: &str, canon: &BTreeMap<String, String>) -> Vec<String> {
+    let mut mods = Vec::new();
+    let mut cur = String::new();
+    for seg in module.split("::").filter(|s| !s.is_empty()) {
+        if !cur.is_empty() {
+            cur.push_str("::");
+        }
+        cur.push_str(seg);
+        let prefix = format!("{cur}::");
+        if canon.keys().any(|n| n.starts_with(&prefix)) {
+            mods.push(cur.clone());
+        }
+    }
+    mods.reverse();
+    mods
+}
+
 /// Reconcile the several names rustc's MIR printer uses for one type. A type is
 /// spelled with a path *relative* to the item that mentions it: `main` prints
 /// `a::A`, but the impl inside module `a` prints the same type as `A`. Two
@@ -869,6 +899,12 @@ pub fn parse(text: &str) -> Result<Program, String> {
 /// `::`-suffix is not proof of identity, and merging `a::A` into `outer::a::A`
 /// would give two distinct types one layout and one symbol. A bare name with no
 /// unique longer match is left alone.
+///
+/// A qualified spelling can be relative too: inside `outer::get`, the type
+/// `outer::a::A` prints as `a::A`. The global pass cannot resolve those (it does
+/// not know which module each body is relative to, and `a::A` in two modules can
+/// name two types), so it leaves them alone and the per-function loop below
+/// resolves them against the body's own module.
 fn canonicalize_types(prog: &mut Program) {
     let mut names: BTreeSet<String> = BTreeSet::new();
     for f in &prog.funcs {
@@ -923,20 +959,50 @@ fn canonicalize_types(prog: &mut Program) {
     }
 
     for f in &mut prog.funcs {
+        // The printer spells a type *relative to the item that mentions it*, so
+        // a qualified spelling can be relative too: inside `outer::get`, the
+        // nested type `outer::a::A` prints as `a::A`. The global pass above
+        // skips every qualified name (it cannot know which module the spelling
+        // is relative to), so resolve those here, per body, against the module
+        // the body lives in. This must stay per-function: `a::A` in `outer::get`
+        // and `a::A` in another module can name two different types.
+        let mut body_names: BTreeSet<String> = BTreeSet::new();
+        for l in &f.locals {
+            collect_struct_names(&l.ty, &mut body_names);
+        }
+        for b in &f.blocks {
+            for s in &b.stmts {
+                collect_stmt_tys(s, &mut body_names);
+            }
+        }
+        let mods = function_modules(&f.module, &canon);
+        let mut fcanon = canon.clone();
+        for n in &body_names {
+            if !n.contains("::") || mods.is_empty() {
+                continue;
+            }
+            for m in &mods {
+                let cand = format!("{m}::{n}");
+                if names.contains(&cand) {
+                    fcanon.insert(n.clone(), cand);
+                    break;
+                }
+            }
+        }
         for l in &mut f.locals {
-            rename_struct_names(&mut l.ty, &canon);
+            rename_struct_names(&mut l.ty, &fcanon);
         }
         for b in &mut f.blocks {
             for s in &mut b.stmts {
-                rename_stmt_tys(s, &canon);
+                rename_stmt_tys(s, &fcanon);
             }
             if let Terminator::Call { func: CallTarget::Direct(name), .. } = &mut b.term {
                 if let Some((recv, rest)) = name
                     .split_once("__")
-                    .filter(|(k, _)| canon.contains_key(*k))
+                    .filter(|(k, _)| fcanon.contains_key(*k))
                     .map(|(k, r)| (k.to_string(), r.to_string()))
                 {
-                    *name = format!("{}__{rest}", canon[&recv]);
+                    *name = format!("{}__{rest}", fcanon[&recv]);
                 }
             }
         }
@@ -1527,6 +1593,17 @@ fn parse_fn(lines: &[String], start: usize) -> Result<(Function, usize), String>
     let open = rest.find('(').ok_or_else(|| format!("mir: bad fn header `{header}`"))?;
     let close = matching(rest, open, '(', ')').ok_or_else(|| format!("mir: unbalanced fn args `{header}`"))?;
     let raw_name = rest[..open].trim().to_string();
+    // The module the body is nested in, kept from the raw header. rustc prints
+    // a body's own name with the printer's relative spelling, so a free
+    // function in `outer` shows as `outer::get`; the types it mentions are
+    // relative to that same `outer`, which `canonicalize_types` needs.
+    let module = raw_name
+        .split('<')
+        .next()
+        .unwrap_or(&raw_name)
+        .rsplit_once("::")
+        .map(|(m, _)| m.trim().to_string())
+        .unwrap_or_default();
     let arg_tys = parse_arg_tys(&rest[open + 1..close])?;
     // A method definition prints as `<impl at ...>::name` (or
     // `Type::<impl at ...>::name`), and rustc emits a distinct body per impl.
@@ -1673,7 +1750,7 @@ fn parse_fn(lines: &[String], start: usize) -> Result<(Function, usize), String>
         }
     }
 
-    let f = Function { name, locals, blocks, consts: HashMap::new() };
+    let f = Function { name, module, locals, blocks, consts: HashMap::new() };
     Ok((f, end + 1))
 }
 
@@ -1733,30 +1810,45 @@ fn parse_line_stmt(t: &str, locals: &[LocalDecl]) -> Result<Option<Stmt>, String
 
 /// rustc prints a named-field enum variant (`e::Some { x }`) as a brace
 /// aggregate, so by shape alone it is indistinguishable from a struct literal.
-/// The destination's declared type disambiguates: when it is the enum itself,
-/// the aggregate is the variant, and the back end must write the discriminant.
-/// A struct spelled with a module path (`a::A { .. }`) has a path *prefix* (`a`)
-/// that differs from its own type (`a::A`), so it stays an aggregate.
+/// The destination's declared type disambiguates, in *both* directions: a struct
+/// in a capitalised module (`M::G::<i64> { .. }`) looks like `Enum::Variant` and
+/// a lowercase enum's variant (`e::A { .. }`) does not, so neither the
+/// capitalisation guess in [`parse_rvalue`] nor its absence is trustworthy.
+///
+/// A literal is a variant only when the path prefix left after stripping its
+/// generics *is* the destination type: `Option::<i64>::Some` -> `Option` (the
+/// destination `Option`), `e::A` -> `e`; but `M::G::<i64>` -> `M::G` with prefix
+/// `M` (a module), not the destination `M::G`. Without type evidence (the
+/// destination is a projection or a non-aggregate) the parse-time guess stands,
+/// because there is nothing to correct it with.
 fn reclassify_enum_aggregate(rv: Rvalue, rhs: &str, dest: &Place, locals: &[LocalDecl]) -> Rvalue {
-    let Rvalue::Aggregate(ops) = rv else { return rv };
-    let Some(brace) = rhs.find('{') else { return Rvalue::Aggregate(ops) };
-    let name = normalize_fmt_struct(rhs[..brace].trim());
-    // A literal names an enum variant only when a `::variant` segment follows
-    // the type path once its generics are stripped: `Option::<i64>::Some`
-    // reduces to `Option::Some` (a variant), while `G::<T>` reduces to `G` (a
-    // plain generic struct). Splitting the raw name would take `G::<T>`'s
-    // turbofish as the variant and add a phantom tag to a struct.
-    let base = strip_generics(name);
-    let Some((prefix, variant)) = base.rsplit_once("::") else {
-        return Rvalue::Aggregate(ops);
+    let parsed_as_enum = matches!(rv, Rvalue::Enum { .. });
+    let (lit_name, ops) = match rv {
+        Rvalue::Aggregate(ops) => {
+            let Some(brace) = rhs.find('{') else { return Rvalue::Aggregate(ops) };
+            (normalize_fmt_struct(rhs[..brace].trim()).to_string(), ops)
+        }
+        Rvalue::Enum { name, ops } => (name, ops),
+        other => return other,
     };
-    if prefix.is_empty() || variant.is_empty() {
-        return Rvalue::Aggregate(ops);
+    // Strip the generics before splitting, so a turbofish is not read as the
+    // variant segment: `Option::<i64>::Some` reduces to `Option::Some` (a
+    // variant), `M::G::<i64>` to `M::G` (a struct in module `M`).
+    let base = strip_generics(&lit_name);
+    let split = base
+        .rsplit_once("::")
+        .map(|(p, v)| (p.to_string(), v.to_string()))
+        .filter(|(p, v)| !p.is_empty() && !v.is_empty());
+    let is_variant = match (split, dest_enum_name(locals, dest)) {
+        (Some((prefix, _)), Some(ty)) => prefix == ty,
+        (Some(_), None) => parsed_as_enum,
+        (None, _) => false,
+    };
+    if is_variant {
+        Rvalue::Enum { name: lit_name, ops }
+    } else {
+        Rvalue::Aggregate(ops)
     }
-    if dest_enum_name(locals, dest).as_deref() != Some(prefix) {
-        return Rvalue::Aggregate(ops);
-    }
-    Rvalue::Enum { name: name.to_string(), ops }
 }
 
 /// The enum name a place's type names, following at most a chain of derefs.
