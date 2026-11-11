@@ -5471,6 +5471,75 @@ fn a_struct_field_binding_shadowing_a_block_const_is_rejected() {
 }
 
 #[test]
+fn an_incomplete_byte_literal_is_a_lexer_error_not_a_panic() {
+    // `b'` at end of input used to index past the byte slice and panic.
+    let err = compile_to_asm("fn main() { b'", &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("unterminated byte literal"), "got: {err}");
+}
+
+#[test]
+fn a_self_referential_block_const_is_a_cycle() {
+    // The inner `K` shadows the outer one, so its initializer resolves to
+    // itself (a cycle), not to the outer value.
+    let err = compile_to_asm(
+        "const K: i64 = 1; fn main() { const K: i64 = K + 1; println!(\"{}\", K); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("K"), "got: {err}");
+}
+
+#[test]
+fn an_unused_block_const_is_still_validated() {
+    // The item is never read, but a non-foldable initializer or a type
+    // mismatch must still be an error, as at the top level.
+    let mismatch = compile_to_asm(
+        "fn main() { const N: i64 = true; }",
+        &CompileOptions::default(),
+    );
+    assert!(mismatch.is_err(), "`const N: i64 = true` must be rejected");
+
+    let non_const = compile_to_asm(
+        "fn main() { const N: i64 = f(); } fn f() -> i64 { 5 }",
+        &CompileOptions::default(),
+    );
+    assert!(non_const.is_err(), "`const N: i64 = f()` must be rejected");
+}
+
+#[test]
+fn a_forward_referenced_block_const_resolves() {
+    // The whole block is resolved to a fixpoint, so `A` may name the later `B`.
+    let out = asm("fn main() { const A: i64 = B + 1; const B: i64 = 2; println!(\"{}\", A); }");
+    assert!(out.contains("mov $3, "), "A folds to 3:\n{out}");
+}
+
+#[test]
+fn a_block_const_may_name_an_enclosing_const() {
+    let out = asm("const X: i64 = 5; fn main() { const Y: i64 = X + 1; println!(\"{}\", Y); }");
+    assert!(out.contains("mov $6, "), "Y folds to 6:\n{out}");
+}
+
+#[test]
+fn a_block_const_colliding_with_a_fn_is_rejected() {
+    let err = compile_to_asm(
+        "fn main() { const N: i64 = 1; fn N() -> i64 { 2 } }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("defined multiple times"), "got: {err}");
+}
+
+#[test]
+fn a_nested_pub_fn_shadows_an_outer_fn() {
+    // The `pub` must not hide the nested `fn` from the block scan, or the two
+    // definitions would collide under one name.
+    let out = asm_no_inline(
+        "fn g() -> i64 { 1 } fn main() { pub fn g() -> i64 { 2 } println!(\"{}\", g()); }",
+    );
+    assert!(out.contains("rmc$nf"), "the nested `fn` gets a unique name:\n{out}");
+}
+
+#[test]
 fn a_value_loop_binds_its_break_value() {
     // `loop` is an expression: the `break` value is stored into the loop's
     // result slot, which the code after the loop reads.

@@ -78,7 +78,9 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   The compiler is a library plus a thin CLI, so it can be embedded.
 - `compiler/src/lexer.rs` — byte scanner, tokens carry byte positions. A byte
   literal `b'A'` lexes to a `Tok::Int` (rmc has no `u8`); `b".."` is not a
-  literal it recognises, so it is rejected downstream.
+  literal it recognises, so it is rejected downstream. `lex_byte_lit` reads the
+  first content byte with `get`, so an input ending in `b'` is an
+  unterminated-literal error rather than an out-of-bounds panic.
 - `compiler/src/parser.rs` — recursive descent; `is_block_like` allows
   `if`/blocks as statements without a trailing `;`. `parse_cond` sets
   `no_struct_lit` so a `{` after a condition starts the body, not a struct.
@@ -349,14 +351,20 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   and no codegen; its value is substituted at every use. An immutable `static`
   is parsed by `parse_static` and lowered to the same `ConstDef`, so it shares
   this path; `static mut` is rejected, since rmc has no mutable global.
-  A `const`/immutable-`static` declared inside a block is folded by
-  `scan_block_consts` when the block begins (rustc hoists block items), so it is
-  in scope for the whole block and shadows an outer one until the block ends.
-  Because such a constant never reaches sema, the parser must enforce the checks
-  sema applies to a top-level one: `fold_const_item` resolves the declared type
-  and requires a foldable kind (a block-scoped `const S: str` is rejected like a
-  top-level one), and `reject_const_shadow` rejects a `let`/`@`/struct-field
-  binding that reuses the name (rustc's `E0530`).
+  A `const`/immutable-`static` declared inside a block is collected and resolved
+  by `scan_block_consts` when the block begins (rustc hoists block items), so it
+  is in scope for the whole block and shadows an outer one until the block ends.
+  The whole block's items are collected before any is folded, then resolved
+  together (`consts::resolve_with`) seeded with the enclosing scope: a forward
+  reference resolves, and a self-reference is a cycle rather than a read of the
+  outer value (the items are parsed with the live constant tables cleared, so a
+  name in an initializer stays symbolic). Because such a constant never reaches
+  sema, the parser must enforce the checks sema applies to a top-level one:
+  `resolve_const_ty` requires a foldable kind (a block-scoped `const S: str` is
+  rejected like a top-level one), every item must fold even when unused (a call,
+  a cycle or a type mismatch is an error), a `const`/`fn` name collision is
+  `E0428`, and `reject_const_shadow` rejects a `let`/`@`/struct-field binding that
+  reuses the name (rustc's `E0530`).
 - `compiler/src/inline.rs` — AST inlining of small, call-free, scalar functions
   (a loop is allowed, an early exit is not), run after sema and before codegen.
   See the inlining gotcha below.
@@ -1851,8 +1859,10 @@ and inside a block; a `use` of a `std` subtree is recorded so a later
 paths. A `pub` qualifier (on an item, a struct field, an `impl` method or a
 nested `fn`, with any `(crate)`/`(super)`/`(in ..)` restriction) is dropped by
 `skip_pub`, since every name resolves in one flat namespace; the prescan and the
-block-body loop skip it too, and `scan_block_fns` looks through a `pub` before a
-nested `fn`. An inline `mod NAME { .. }` is skipped by `skip_mod` (its items are
+block-body loop skip it too. `scan_block_fns` reads the name directly after the
+`fn` keyword (the `pub`, if any, is a separate earlier token and is never landed
+on, since the scan advances one token at a time), and `fn_at` is keyed to that
+same `fn` token. An inline `mod NAME { .. }` is skipped by `skip_mod` (its items are
 not visible); a `mod NAME;` that would load another file is a compile error. `str`
 and `&str` are the same one-word value, so `ref_coerces` lets them
 be exchanged at a variable, parameter, struct-field, enum-variant-field or

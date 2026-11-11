@@ -310,8 +310,9 @@ operators or a small runtime helper, so `i64::MIN.abs()` maps to itself as in
 `mut` enforcement and definite
 initialisation; `const` items (folded to a value and substituted at every use,
 including array lengths and `match` patterns; also inside a function body, where
-it is in scope for the rest of the block) and an immutable `static` (lowered
-to a `const`; `static mut` is rejected); `type` aliases (a transparent
+it is in scope for the whole block and may be used before its declaration) and an
+immutable `static` (lowered to a `const`; `static mut` is rejected); `type`
+ aliases (a transparent
 second name for any type, resolved at parse time, usable before declaration);
 references (`&T` / `&mut T`, `&e`, `*e`,
 with auto-deref for `r.x`, `r[i]` and `r.m()`, and `&self` receivers); methods

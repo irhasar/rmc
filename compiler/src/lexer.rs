@@ -645,7 +645,10 @@ fn hex_val(b: u8) -> Option<u32> {
 /// rustc. `start` is the index of the leading `b`.
 fn lex_byte_lit(bytes: &[u8], start: usize) -> Result<(i64, usize), String> {
     let mut i = start + 2; // past `b'`
-    let v: u32 = if bytes[i] == b'\\' {
+    let first = *bytes
+        .get(i)
+        .ok_or_else(|| format!("unterminated byte literal at byte {start}"))?;
+    let v: u32 = if first == b'\\' {
         let e = *bytes
             .get(i + 1)
             .ok_or_else(|| format!("unterminated byte literal at byte {start}"))?;

@@ -360,8 +360,13 @@ constants and an initializer that is not a constant expression.
 A `const` may also be declared inside a block, where it is folded and in scope
 for the rest of that block. Like a top-level `const` it may be named before it is
 declared (rustc hoists block items), and it shadows an outer constant of the same
-name until the block ends, when the outer value returns. Two `const`s of the same
-name in one block is an error (rustc's `E0428`).
+name until the block ends, when the outer value returns. The whole block's
+constants are resolved together, so a forward reference (`const A = B + 1; const
+B = 2;`) works and a self-reference (`const K = K + 1;`, where an outer `K`
+exists) is a cycle, not a read of the outer value. Every block constant is
+validated even when unused, so `const N: i64 = true;` is rejected as it would be
+at the top level. Two `const`s of the same name in one block is an error, and so
+is a `const` and a `fn` of the same name (rustc's `E0428`).
 
 ```rust
 fn main() {
@@ -369,6 +374,8 @@ fn main() {
     const N: i64 = 5;
     let b = { const N: i64 = 9; N };   // an inner shadow, 9
     // here `N` is 5 again
+    const A: i64 = B + 1;  // a forward reference
+    const B: i64 = 2;      // A folds to 3
 }
 ```
 

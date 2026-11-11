@@ -38,7 +38,6 @@ enum NameScope {
 struct LocalConst {
     start: usize,
     end: usize,
-    name: String,
 }
 
 pub struct Parser {
@@ -837,14 +836,12 @@ impl Parser {
         self.parse_const_tail()
     }
 
-    /// Parse a `const`/immutable-`static` item found at token `start`, fold its
-    /// value, and return the value plus the token index just past its `;`. The
-    /// declared type is honoured (an `i64`/`bool`/`char` item folds to that
-    /// kind); any other type folds to nothing, so a later use is diagnosed the
-    /// way an unresolved constant is. `static mut` is refused, as at the top
-    /// level. `self.i` is left at `start` so a caller that wants to parse the
-    /// item normally (the top-level loop) can.
-    fn fold_const_item(&mut self, start: usize) -> PResult<(Option<crate::consts::ConstVal>, usize)> {
+    /// Parse the `const`/immutable-`static` item whose keyword is at token
+    /// `start` (past any `pub`), returning the definition and the token index
+    /// just past its `;`. `self.i` is left at `start` so a caller that wants to
+    /// parse the item normally (the top-level loop) can. `static mut` is
+    /// refused, as at the top level.
+    fn parse_const_item_at(&mut self, start: usize) -> PResult<(ConstDef, usize)> {
         let saved = self.i;
         self.i = start;
         self.skip_pub()?;
@@ -857,39 +854,25 @@ impl Parser {
         };
         let end = self.i;
         self.i = saved;
-        // Resolve the declared type the way a top-level `const` is resolved
-        // (`str`, and an alias to a scalar), then require a type rmc can fold.
-        // Without this a block-scoped `const S: str = "hi";` would be accepted
-        // while the same item at the top level is rejected.
-        let ty = self.expand_alias_ty(&def.ty, 0)?;
+        Ok((def, end))
+    }
+
+    /// The declared type of a `const`/`static`, resolved the way a top-level
+    /// `const` is (`str`, and an alias to a scalar), then required to be a kind
+    /// rmc can fold. Without this a block-scoped `const S: str = "hi";` would be
+    /// accepted while the same item at the top level is rejected.
+    fn resolve_const_ty(&self, ty: &Type, name: &str, pos: u32) -> PResult<Type> {
+        let ty = self.expand_alias_ty(ty, 0)?;
         let ty = match ty {
             Type::Named(n) if n == "str" => Type::Str,
             other => other,
         };
         match ty {
-            Type::I64 | Type::Bool | Type::Char => {}
-            other => {
-                return Err(format!(
-                    "at byte {}: constant `{}` has type {other:?}; rmc only folds `i64`, `bool` and `char` constants",
-                    self.toks[start].pos, def.name
-                ))
-            }
+            Type::I64 | Type::Bool | Type::Char => Ok(ty),
+            other => Err(format!(
+                "at byte {pos}: constant `{name}` has type {other:?}; rmc only folds `i64`, `bool` and `char` constants"
+            )),
         }
-        // A constant may name one declared earlier (in this block or outside
-        // it), so fold against the live tables, which already hold every value
-        // in scope.
-        let items = [(def.name.clone(), ty.clone(), def.value.clone())];
-        let mut val = crate::consts::resolve(&items).get(&def.name).copied();
-        // A `char` constant folds through `eval_char`, which the item `resolve`
-        // path covers; an alias-typed one is rare enough to leave unresolved.
-        if val.is_none() {
-            if let Some(v) = crate::consts::eval_i64(&def.value, &self.consts) {
-                if ty == Type::I64 {
-                    val = Some(crate::consts::ConstVal::Int(v));
-                }
-            }
-        }
-        Ok((val, end))
     }
 
     /// Rewrite every alias name in `t` to its target, so no later pass sees an
@@ -1474,21 +1457,36 @@ impl Parser {
     }
 
     /// Scan the block starting at the current `{` for the `const`/immutable
-    /// `static` items declared directly in it, fold each, and enter its value in
-    /// the live constant tables so a later statement in the block (and a nested
-    /// block) resolves the name. Returns the frame of their token spans, which
-    /// the main parse skips. A `const` nested deeper is left to the scan of that
-    /// block. The frame is popped with the block by `pop_name_scope`, so the name
-    /// is gone after the block ends. Names in the frame are also noted as
-    /// `NameScope` entries, so `pop_name_scope` restores an outer value the block
-    /// shadowed.
+    /// `static` items declared directly in it, resolve their values together,
+    /// and enter them in the live constant tables so a later statement in the
+    /// block (and a nested block) resolves the name. Returns the frame of their
+    /// token spans, which the main parse skips. A `const` nested deeper is left
+    /// to the scan of that block.
+    ///
+    /// The whole block's items are collected before any is folded, then resolved
+    /// to a fixpoint seeded with the enclosing scope, so a forward reference
+    /// (`const A = B + 1; const B = 2;`) resolves and a self-reference
+    /// (`const K = K + 1;`, where an outer `K` exists) is a cycle rather than a
+    /// read of the outer value. Every item is validated, including an unused
+    /// one: a non-foldable initializer (`const N: i64 = true;`) or an
+    /// unsupported type is an error, as at the top level. A `const` colliding
+    /// with another `const` or with a `fn` in the same block is E0428.
     fn scan_block_consts(&mut self) -> PResult<Vec<LocalConst>> {
-        let mut frame: Vec<LocalConst> = Vec::new();
+        let mut raw: Vec<(usize, usize, usize, ConstDef)> = Vec::new();
         let mut depth = 0u32;
         let mut i = self.i;
+        // Parse the items with the live constant tables cleared, so a name in an
+        // initializer stays symbolic: otherwise `const K: i64 = K + 1;` would
+        // have the enclosing `K` substituted in while parsing, hiding the cycle,
+        // and a forward reference to a later item that shadows an outer constant
+        // would bake in the outer value. The tables are restored for the resolve
+        // below, which needs them as the enclosing scope.
+        let saved_consts = std::mem::take(&mut self.consts);
+        let saved_bools = std::mem::take(&mut self.const_bools);
+        let saved_chars = std::mem::take(&mut self.const_chars);
         while i < self.toks.len() {
-            // Decide by a short-lived borrow, so the mutable calls below (which
-            // fold the item and enter its value) do not conflict with it.
+            // Decide by a short-lived borrow, so the parsing below does not
+            // conflict with it.
             let mut is_item = false;
             match &self.toks[i].tok {
                 Tok::LBrace | Tok::LParen | Tok::LBracket => depth += 1,
@@ -1518,10 +1516,13 @@ impl Parser {
             if is_item {
                 let raw_start = i;
                 // `static mut` has no meaning in rmc; reject it here, where the
-                // block scan sees it, rather than let `fold_const_item` fail with
-                // a less specific message.
+                // block scan sees it, rather than let the parse fail with a less
+                // specific message.
                 if let Some(Tok::Ident(id)) = self.toks.get(i + 1).map(|t| &t.tok) {
                     if id == "mut" {
+                        self.consts = saved_consts;
+                        self.const_bools = saved_bools;
+                        self.const_chars = saved_chars;
                         return Err(format!(
                             "at byte {}: `static mut` is not supported; rmc has no mutable global",
                             self.toks[i].pos
@@ -1529,29 +1530,104 @@ impl Parser {
                     }
                 }
                 let start = self.skip_pub_at(i);
-                let (val, end) = self.fold_const_item(start)?;
-                if let Some(Tok::Ident(n)) = self.toks.get(start + 1).map(|t| t.tok.clone()) {
-                    // Two `const`s of the same name in one block is E0428, as for
-                    // two `fn`s (`scan_block_fns`). A `let` of the same name is a
-                    // binding, not an item, and shadows rather than collides.
-                    if frame.iter().any(|c| c.name == n) {
-                        return Err(format!(
-                            "at byte {}: the name `{n}` is defined multiple times in this block",
-                            self.toks[raw_start].pos
-                        ));
-                    }
-                    self.enter_local_const(&n, val);
-                    // `start` is the `const`/`static` keyword (past any `pub`),
-                    // so the main parse, which drops a `pub` before it, matches
-                    // on the same index.
-                    frame.push(LocalConst { start, end, name: n });
-                    i = end;
-                    continue;
-                }
+                let (def, end) = self.parse_const_item_at(start)?;
+                raw.push((raw_start, start, end, def));
+                i = end;
+                continue;
             }
             i += 1;
         }
+        self.consts = saved_consts;
+        self.const_bools = saved_bools;
+        self.const_chars = saved_chars;
+        // E0428: two items of the same name, a `const` and a `fn`, or two
+        // `fn`s (`scan_block_fns`). The block's nested `fn` names are already in
+        // the frame `parse_block_inner` pushed, so include them here, along with
+        // any `fn` declared later in the block.
+        let mut fn_names: Vec<String> = self
+            .fn_scopes
+            .last()
+            .map(|f| f.iter().map(|(n, _)| n.clone()).collect())
+            .unwrap_or_default();
+        fn_names.extend(self.scan_block_fn_names());
+        for (k, (_, _, _, def)) in raw.iter().enumerate() {
+            if raw[..k].iter().any(|(_, _, _, d)| d.name == def.name)
+                || fn_names.contains(&def.name)
+            {
+                return Err(format!(
+                    "at byte {}: the name `{}` is defined multiple times in this block",
+                    self.toks[raw[k].0].pos, def.name
+                ));
+            }
+        }
+        // Resolve the whole block at once against the enclosing scope.
+        let items: Vec<(String, Type, Expr)> = raw
+            .iter()
+            .map(|(raw_start, _, _, d)| {
+                let ty = self.resolve_const_ty(&d.ty, &d.name, self.toks[*raw_start].pos)?;
+                Ok((d.name.clone(), ty, d.value.clone()))
+            })
+            .collect::<PResult<Vec<_>>>()?;
+        let resolved =
+            crate::consts::resolve_with(&items, &self.consts, &self.const_bools, &self.const_chars);
+        // Every item must fold, including an unused one. `resolve_with` leaves
+        // out an item whose initializer is not a constant expression (a call, a
+        // cycle, a reference to an unresolved name), which at the top level
+        // `check_consts` rejects; do the same here.
+        for ((raw_start, _, _, def), (_, ty, _)) in raw.iter().zip(items.iter()) {
+            if !resolved.contains_key(&def.name) {
+                let kind = match ty {
+                    Type::Bool => "bool",
+                    Type::Char => "char",
+                    _ => "i64",
+                };
+                return Err(format!(
+                    "at byte {}: constant `{}` is not a constant `{kind}` expression",
+                    self.toks[*raw_start].pos, def.name
+                ));
+            }
+        }
+        let mut frame: Vec<LocalConst> = Vec::new();
+        for (_, start, end, def) in &raw {
+            self.enter_local_const(&def.name, resolved.get(&def.name).copied());
+            // `start` is the `const`/`static` keyword (past any `pub`), so the
+            // main parse, which drops a `pub` before it, matches on the same
+            // index.
+            frame.push(LocalConst { start: *start, end: *end });
+        }
         Ok(frame)
+    }
+
+    /// The names of the `fn`s declared directly in the block at the cursor,
+    /// without registering them (used only for the `const`/`fn` collision check;
+    /// `scan_block_fns` does the real hoisting).
+    fn scan_block_fn_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut depth = 0u32;
+        let mut i = self.i;
+        while i < self.toks.len() {
+            match &self.toks[i].tok {
+                Tok::LBrace | Tok::LParen | Tok::LBracket => depth += 1,
+                Tok::RBrace => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                Tok::RParen | Tok::RBracket => {
+                    depth = depth.saturating_sub(1);
+                }
+                Tok::Fn if depth == 0 => {
+                    // The name always follows the `fn` keyword.
+                    if let Some(Token { tok: Tok::Ident(name), .. }) = self.toks.get(i + 1) {
+                        names.push(name.clone());
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        names
     }
 
     /// True when the token at the cursor begins a `const`/immutable-`static`
@@ -1784,17 +1860,12 @@ impl Parser {
                 Tok::Fn if depth == 0 => {
                     // `fn name ( .. ) -> .. { body }`. The body brace is skipped
                     // as a unit by the `depth` counter, so a `fn` inside it is
-                    // not seen here. A `pub` before the `fn` is skipped too, so a
-                    // nested `pub fn` (which rustc accepts) is scanned.
-                    let fn_tok = if matches!(
-                        self.toks.get(i.wrapping_sub(1)).map(|t| &t.tok),
-                        Some(Tok::Ident(p)) if p == "pub"
-                    ) {
-                        i + 1
-                    } else {
-                        i
-                    };
-                    if let Some(Token { tok: Tok::Ident(name), .. }) = self.toks.get(fn_tok + 1) {
+                    // not seen here. The name always follows the `fn` keyword;
+                    // a preceding `pub` is irrelevant, since `i` still points at
+                    // the `fn` itself (the loop only advances one token at a
+                    // time, so it never lands on the `pub`). `fn_at` is keyed to
+                    // that same `i`, which is what `parse_stmt_into` looks up.
+                    if let Some(Token { tok: Tok::Ident(name), .. }) = self.toks.get(i + 1) {
                         let name = name.clone();
                         // E0428. A later one shadowing an outer one is fine and
                         // keeps its own unique symbol.
