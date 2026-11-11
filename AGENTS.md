@@ -159,7 +159,10 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   directly, as in `desugar_match_arms`) followed by the per-field bindings into
   the enclosing block. `let mut S { .. }` is rejected (rustc's "`mut` must be
   attached to each individual binding"); a type annotation goes on the temporary.
-  No sema or codegen case.
+  The temporary is forced when a binding shadows the name the initializer reads
+  (`let (x, y) = x;`), so every element read still sees the original value; the
+  prelude's `force` flag and the `pat_bound_names`/`init_shadowed_by` helpers
+  decide that. No sema or codegen case.
   *Array patterns* `[a, b, .., c]` are the third irrefutable aggregate pattern,
   alongside struct patterns: `Pat::Array { elems, rest, front }` is parsed by
   `parse_array_pat` (`[` is routed from `parse_pattern_primary`) and desugared by
@@ -196,7 +199,9 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   count flexible), which sema checks so a pattern naming the wrong number of
   elements is rejected as rustc does (E0308/E0527) rather than silently reading
   the first `k` and ignoring the rest; `()` (the unit type) counts as the empty
-  tuple. No sema or codegen case beyond that marker. It is irrefutable when
+  tuple. A tuple pattern never matches an array even at equal length (E0308), so
+  the array arm of the check is guarded by `!is_tuple`. No sema or codegen case
+  beyond that marker. It is irrefutable when
   every element is, so it joins `pat_irrefutable`, `first_bound_name`, `or_cond`
   and the
   `let`/`for`/`match`/parameter paths through `let_destructure_tuple_stmts` (the

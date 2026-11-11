@@ -50,6 +50,14 @@ Modes:
           copying every field, chaining, a struct-typed field, and a field
           value that mutates the base so the evaluation order and the
           independence of the result are both observable
+    tuple
+          tuples: construction, field access, destructuring in `let`/`match`/
+          parameter positions, nesting
+    patshadow
+          a destructuring pattern whose element shadows the scrutinee's own
+          name (tuple, array, struct, `@`, nested wildcard), so the expansion
+          must copy the scrutinee before it binds and every read sees the
+          original value
     intmeth
           built-in `i64` methods (`abs`/`signum`/`min`/`max`/`div_euclid`/
           `rem_euclid`/`is_positive`/`is_negative`) over `argv`-sourced
@@ -1612,6 +1620,49 @@ def gen_tuple_program(rng):
     return "\n".join(rs) + "\n"
 
 
+def gen_patshadow_program(rng):
+    """A destructuring pattern whose element shadows the scrutinee's own name.
+    Every element read must see the original value: the expansion copies the
+    scrutinee to a hidden temporary before it binds (`let (x, y) = x;`). A naive
+    expansion reads the new binding and fails to type; a correct one copies, so
+    the printed values match rustc. Covers a tuple, an array, a struct and an
+    `@` binding, plus a nested tuple whose inner pattern is wildcard-only.
+    """
+    b = rng.randint(1, 9)
+    o = [rng.randint(0, 40) for _ in range(12)]
+
+    rs = [
+        "struct S { a: i64, b: i64 }",
+        "fn main() {",
+        "    let mut acc: i64 = 0;",
+        # Tuple: the first element rebinds the scrutinee.
+        f"    let t: (i64, i64) = ({o[0]}, {o[1]});",
+        "    let (t, u) = t;",
+        "    acc += t * 10 + u;",
+        # Array.
+        f"    let a: [i64; 3] = [{o[2]}, {o[3]}, {o[4]}];",
+        "    let [a, b, c] = a;",
+        "    acc += a * 100 + b * 10 + c;",
+        # Struct: a field rebinds the struct's name.
+        f"    let s = S {{ a: {o[5]}, b: {o[6]} }};",
+        "    let S { a: s, b } = s;",
+        "    acc += s * 10 + b;",
+        # Nested tuple with a wildcard-only inner pattern: the outer element
+        # rebinds `n`, and the inner `(_, _)` marker must still read the old `n`.
+        f"    let n: (i64, (i64, i64)) = ({o[7]}, ({o[8]}, {o[9]}));",
+        "    let (n, (_, _)) = n;",
+        "    acc += n;",
+        # `@` binding shadowing its own scrutinee.
+        f"    let p: (i64, i64) = ({o[10]}, {o[11]});",
+        "    let p @ (_, _) = p;",
+        "    acc += p.0 + p.1;",
+        f"    acc += {b};",
+        '    println!("{}", acc);',
+        "}",
+    ]
+    return "\n".join(rs) + "\n"
+
+
 def gen_intmeth_program(rng):
     """A program built from the built-in `i64` methods. Each method desugars to
     operators, so the shapes that matter are the receiver being a non-trivial
@@ -2689,6 +2740,13 @@ def reject_corpus():
         # targets the outer loop, so a write before the nested loop repeats
         # (E0384). The reach walk must follow it out of the nested loop.
         "assign_immutable_cond_continue_nested": "fn main() { let x: i64; 'o: loop { x = 1; while { continue 'o; true } {} break 'o; } }\n",
+        # A tuple pattern never matches an array, even one of the same length
+        # (E0308). With all-wildcard elements no field read catches the
+        # mismatch, so the arity check must reject it; and a tuple pattern whose
+        # count equals the array's length must not pass the array arity check.
+        "let_tuple_pat_on_array": "fn main() { let a: [i64; 2] = [1, 2]; let (x, y) = a; let _ = x; }\n",
+        "let_tuple_pat_wildcards_on_array": "fn main() { let a: [i64; 2] = [1, 2]; let (_, _) = a; }\n",
+        "match_tuple_pat_on_array": "fn main() { let a: [i64; 2] = [1, 2]; let _ = match a { (x, y) => x }; }\n",
     }
 
 
@@ -3005,7 +3063,7 @@ def gen_typealias_program(rng):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "intmeth", "nestedfn", "typealias", "printfmt", "ptr", "char", "robust", "reject", "mutate"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "patshadow", "intmeth", "nestedfn", "typealias", "printfmt", "ptr", "char", "robust", "reject", "mutate"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -3058,6 +3116,7 @@ def main():
            "enumpat": gen_enumpat_program,
            "atpat": gen_atpat_program,
            "tuple": gen_tuple_program,
+           "patshadow": gen_patshadow_program,
            "intmeth": gen_intmeth_program,
            "nestedfn": gen_nestedfn_program,
            "typealias": gen_typealias_program,

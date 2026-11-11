@@ -2055,7 +2055,13 @@ impl Parser {
                                     self.pos()
                                 ));
                             }
-                            let (mut stmts, subj) = self.let_destructure_prelude(ty, init);
+                            // `n` itself and the sub-pattern's names both bind;
+                            // if the initializer reads `n` (or a name the
+                            // sub-pattern binds), copy it first.
+                            let mut names = vec![name.clone()];
+                            Self::pat_bound_names(&sub, &mut names);
+                            let force = Self::init_shadowed_by(&init, &names);
+                            let (mut stmts, subj) = self.let_destructure_prelude(ty, init, force);
                             stmts.push(Stmt::Let {
                                 name,
                                 ty: None,
@@ -4551,7 +4557,14 @@ impl Parser {
         ty: Option<Type>,
         init: Expr,
     ) -> Vec<Stmt> {
-        let (mut out, subj) = self.let_destructure_prelude(ty, init);
+        let mut names = Vec::new();
+        for (_, b) in &fields {
+            if let Some((_, sub)) = b {
+                Self::pat_bound_names(sub, &mut names);
+            }
+        }
+        let force = Self::init_shadowed_by(&init, &names);
+        let (mut out, subj) = self.let_destructure_prelude(ty, init, force);
         out.extend(Self::struct_pat_binds(&fields, &subj, &name));
         out
     }
@@ -4568,7 +4581,14 @@ impl Parser {
         ty: Option<Type>,
         init: Expr,
     ) -> Vec<Stmt> {
-        let (mut out, subj) = self.let_destructure_prelude(ty, init);
+        let mut names = Vec::new();
+        for e in &elems {
+            if let Some((_, sub)) = e {
+                Self::pat_bound_names(sub, &mut names);
+            }
+        }
+        let force = Self::init_shadowed_by(&init, &names);
+        let (mut out, subj) = self.let_destructure_prelude(ty, init, force);
         out.extend(Self::array_pat_binds(&elems, rest, front, &subj));
         out
     }
@@ -4583,7 +4603,12 @@ impl Parser {
         ty: Option<Type>,
         init: Expr,
     ) -> Vec<Stmt> {
-        let (mut out, subj) = self.let_destructure_prelude(ty, init);
+        let mut names = Vec::new();
+        for (_, sub) in &elems {
+            Self::pat_bound_names(sub, &mut names);
+        }
+        let force = Self::init_shadowed_by(&init, &names);
+        let (mut out, subj) = self.let_destructure_prelude(ty, init, force);
         out.extend(Self::tuple_pat_binds(&elems, &subj));
         out
     }
@@ -4592,9 +4617,18 @@ impl Parser {
     /// itself when it is a plain place with no annotation to carry, otherwise a
     /// fresh temporary that holds it (so the initializer's side effects run
     /// once and the annotation is checked against the value). Shared by the
-    /// struct and array destructuring paths.
-    fn let_destructure_prelude(&mut self, ty: Option<Type>, init: Expr) -> (Vec<Stmt>, Expr) {
-        if ty.is_none()
+    /// struct, array and tuple destructuring paths. `force` makes the temporary
+    /// unconditional: a caller sets it when a pattern binds the very name the
+    /// initializer reads, so every element read sees the original value rather
+    /// than a binding that shadowed it (`let (x, y) = x;`).
+    fn let_destructure_prelude(
+        &mut self,
+        ty: Option<Type>,
+        init: Expr,
+        force: bool,
+    ) -> (Vec<Stmt>, Expr) {
+        if !force
+            && ty.is_none()
             && matches!(init, Expr::Var { .. } | Expr::Int(_) | Expr::EnumVariant { .. })
         {
             (Vec::new(), init)
@@ -4714,6 +4748,59 @@ impl Parser {
             // in an or-pattern when it is parsed).
             Pat::Int(_) | Pat::Char(_) | Pat::CharRange(..) | Pat::Bool(_) | Pat::Str(_) | Pat::Range(..) | Pat::Or(_) => {}
             _ => unreachable!("unexpected sub-pattern"),
+        }
+    }
+
+    /// Every name a pattern binds, in binding order: a struct pattern's fields,
+    /// a tuple/array's elements, an `@` binding's name followed by its
+    /// sub-pattern's. Used to decide whether a `let` destructuring must copy its
+    /// scrutinee before it binds, so an element that shadows the scrutinee name
+    /// does not make a later read resolve against the new binding.
+    fn pat_bound_names(p: &Pat, out: &mut Vec<String>) {
+        match p {
+            Pat::Bind(n) => out.push(n.clone()),
+            Pat::At(n, _, sub) => {
+                out.push(n.clone());
+                Self::pat_bound_names(sub, out);
+            }
+            Pat::Struct(_, fields) => {
+                for (_, b) in fields {
+                    if let Some((_, sub)) = b {
+                        Self::pat_bound_names(sub, out);
+                    }
+                }
+            }
+            Pat::Tuple(elems) => {
+                for (_, sub) in elems {
+                    Self::pat_bound_names(sub, out);
+                }
+            }
+            Pat::Array { elems, .. } => {
+                for e in elems {
+                    if let Some((_, sub)) = e {
+                        Self::pat_bound_names(sub, out);
+                    }
+                }
+            }
+            Pat::Variant(_, _, Some((args, _))) => {
+                for (_, sub) in args {
+                    Self::pat_bound_names(sub, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// True when `init` reads a plain variable the pattern also binds. A `let`
+    /// destructuring expands to one binding per element, each reading the
+    /// scrutinee; if an element shadows the scrutinee's own name, a later read
+    /// would resolve to the new binding (`let (x, y) = x;` read field `1` of the
+    /// integer `x` just bound). Such a destructuring must first copy the
+    /// scrutinee to a hidden temporary, so every read sees the original value.
+    fn init_shadowed_by(init: &Expr, names: &[String]) -> bool {
+        match init {
+            Expr::Var { name, .. } => names.iter().any(|n| n == name),
+            _ => false,
         }
     }
 

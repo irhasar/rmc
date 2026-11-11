@@ -6044,6 +6044,103 @@ fn a_unit_tuple_pattern_is_accepted() {
 }
 
 #[test]
+fn a_tuple_pattern_on_an_array_is_rejected() {
+    // A tuple pattern never matches an array, even one of the same length
+    // (E0308). With all-wildcard elements no field read catches the mismatch,
+    // so the arity check must reject it rather than accept the equal count.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let a: [i64; 2] = [1, 2]; let (_, _) = a; return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("a tuple pattern cannot match"), "got: {err}");
+}
+
+#[test]
+fn a_binding_tuple_pattern_on_an_array_is_rejected() {
+    // The same with named elements, so the marker is what rejects it rather
+    // than the field read that would follow.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let a: [i64; 2] = [1, 2]; let (x, y) = a; return x + y; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("a tuple pattern cannot match"), "got: {err}");
+}
+
+#[test]
+fn a_tuple_pattern_on_an_array_in_a_match_arm_is_rejected() {
+    let err = compile_to_asm(
+        "fn main() -> i64 { let a: [i64; 2] = [1, 2]; let _ = match a { (x, y) => x }; return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("a tuple pattern cannot match"), "got: {err}");
+}
+
+#[test]
+fn a_destructuring_let_may_shadow_its_own_scrutinee() {
+    // `let (x, y) = x;` binds from the *old* `x`: the expansion must copy the
+    // scrutinee to a hidden temporary before it binds, or the second read
+    // resolves against the new binding and fails to type.
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let x: (i64, i64) = (1, 2); let (x, y) = x; return x + y; }",
+        &CompileOptions::default()
+    )
+    .is_ok());
+}
+
+#[test]
+fn an_array_destructuring_let_may_shadow_its_own_scrutinee() {
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let a: [i64; 3] = [1, 2, 3]; let [a, b, c] = a; return a + b + c; }",
+        &CompileOptions::default()
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_struct_destructuring_let_may_shadow_its_own_scrutinee() {
+    assert!(compile_to_asm(
+        "struct S { a: i64, b: i64 } \
+         fn main() -> i64 { let s = S { a: 1, b: 2 }; let S { a: s, b } = s; return s + b; }",
+        &CompileOptions::default()
+    )
+    .is_ok());
+}
+
+#[test]
+fn an_at_binding_may_shadow_its_own_scrutinee() {
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let p: (i64, i64) = (1, 2); let p @ (_, _) = p; return p.0 + p.1; }",
+        &CompileOptions::default()
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_nested_tuple_destructure_may_shadow_its_scrutinee() {
+    // The outer element rebinds `n`; the inner wildcard-only `(_, _)` marker
+    // must still read the original `n`.
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let n: (i64, (i64, i64)) = (1, (2, 3)); let (n, (_, _)) = n; return n; }",
+        &CompileOptions::default()
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_non_shadowing_destructuring_let_reuses_the_local() {
+    // The copy is only forced when the pattern shadows the scrutinee; a plain
+    // `let (a, b) = p;` still reads `p` directly, with no `\0lp` temporary.
+    let out = asm_no_inline(
+        "fn main() -> i64 { let p: (i64, i64) = (5, 6); let (a, b) = p; return a + b; }",
+    );
+    let body = &out[out.find("main:").expect("main")..];
+    assert!(!body.contains("lp"), "a non-shadowing destructure must not copy:\n{body}");
+}
+
+#[test]
 fn is_positive_and_is_negative_evaluate_the_receiver_once() {
     // `is_negative` desugars to a comparison, which reads the receiver once,
     // but it still goes through the temp-binding path so a call receiver is

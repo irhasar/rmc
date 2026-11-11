@@ -275,8 +275,14 @@ Element access `.0`, `.1`, ... requires the base to be a tuple (or a reference
 to one, which auto-derefs); an index past the end is rejected. A tuple may be
 destructured in a `let`, a `for` head, a function parameter or a `match` arm,
 with `_` to ignore an element and `mut` on a binding. A tuple pattern's element
-count must match the tuple's arity for a field read to resolve; a mismatch is
-reported as a missing field.
+count must match the tuple's arity exactly, and a tuple pattern never matches an
+array even when the counts agree: `let (x,) = (1, 2);` and `let (_, _) = [1, 2];`
+are both rejected, as `rustc` rejects them (E0308).
+
+A destructuring pattern may shadow the very variable it reads, and every element
+read still sees the original value, as in `rustc`: the expansion copies the
+scrutinee before it binds, so `let (x, y) = x;` binds `x` and `y` from the old
+`x`.
 
 In a `match` arm or an `if let` / `while let` scrutinee a tuple pattern may be
 *refutable*: an element may be a scalar test (an integer, `true`/`false`, a
@@ -450,7 +456,9 @@ the array's length, so `let [x, .., z] = a;` binds `a[0]` and `a[a.len() - 1]`
 struct patterns to any depth. An element pattern must be irrefutable, so a
 literal element (`let [1, y] = a;`) is rejected rather than mis-bound; a
 two-`..` pattern, an out-of-range fixed index, and `mut` on a non-binding are
-rejected too. Array patterns are also accepted in `match`, `if let` and `while
+rejected too. An array pattern must name exactly the array's length (a `..`
+rest may absorb the remainder), as rustc requires. Array patterns are also
+accepted in `match`, `if let` and `while
 let` arms, and as a `for` head (`for [x, y] in pairs`), with the same grammar.
 A `let` or parameter without `mut` is
 immutable: assigning it (rustc's `E0384`), assigning a field or element of it

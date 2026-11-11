@@ -3711,7 +3711,11 @@ impl Sema {
                 // has would silently match and ignore the rest.
                 let t = deref_ty(self.check_expr(base, scope)?);
                 let (got, what) = match t {
-                    Type::Array(_, n) => (n, "array"),
+                    // A tuple pattern never matches an array, even one of the
+                    // same length: rustc rejects `let (_, _) = [1, 2];`
+                    // (E0308). Guard on `is_tuple` so a tuple pattern falls
+                    // through to the mismatched-type arm below.
+                    Type::Array(_, n) if !is_tuple => (n, "array"),
                     // `()` is the unit type, which rustc treats as the empty
                     // tuple: `let () = ();` is legal and matches nothing.
                     Type::Unit if is_tuple && *want == 0 => (0, "tuple"),
