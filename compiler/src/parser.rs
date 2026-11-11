@@ -3184,23 +3184,33 @@ impl Parser {
     }
 
     fn parse_cmp(&mut self) -> PResult<Expr> {
-        let mut lhs = self.parse_bitor()?;
-        loop {
-            let op = match self.peek() {
-                Some(Tok::EqEq) => BinOp::Eq,
-                Some(Tok::Ne) => BinOp::Ne,
-                Some(Tok::Lt) => BinOp::Lt,
-                Some(Tok::Le) => BinOp::Le,
-                Some(Tok::Gt) => BinOp::Gt,
-                Some(Tok::Ge) => BinOp::Ge,
-                _ => break,
-            };
-            self.i += 1;
-            let rhs = self.parse_bitor()?;
-            self.bump_depth()?;
-            lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs));
+        let lhs = self.parse_bitor()?;
+        let op = match self.peek() {
+            Some(Tok::EqEq) => BinOp::Eq,
+            Some(Tok::Ne) => BinOp::Ne,
+            Some(Tok::Lt) => BinOp::Lt,
+            Some(Tok::Le) => BinOp::Le,
+            Some(Tok::Gt) => BinOp::Gt,
+            Some(Tok::Ge) => BinOp::Ge,
+            _ => return Ok(lhs),
+        };
+        self.i += 1;
+        let rhs = self.parse_bitor()?;
+        self.bump_depth()?;
+        // Comparison is non-associative in Rust: `a < b < c` is a hard error
+        // ("comparison operators cannot be chained"), not `(a < b) < c`. Reject
+        // a second comparison operator here so rmc does not accept what rustc
+        // rejects.
+        if matches!(
+            self.peek(),
+            Some(Tok::EqEq | Tok::Ne | Tok::Lt | Tok::Le | Tok::Gt | Tok::Ge)
+        ) {
+            return Err(format!(
+                "at byte {}: comparison operators cannot be chained",
+                self.pos()
+            ));
         }
-        Ok(lhs)
+        Ok(Expr::Bin(op, Box::new(lhs), Box::new(rhs)))
     }
 
     /// `|`, then `^`, then `&`, matching Rust's precedence. Each is left

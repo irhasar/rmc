@@ -86,6 +86,10 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   `<< >>`, `+ -`, `* / %`. Note shifts bind *looser* than `+`/`-`, matching
   Rust: `parse_shift` consumes `parse_add`, and `parse_bitand` consumes
   `parse_shift`. Swapping these silently mis-parses `1 + 2 << 3`.
+  Comparison is *non-associative*: `parse_cmp` parses one comparison and then
+  rejects a second comparison operator at the same level, because rustc treats
+  `a < b < c` as a hard error rather than `(a < b) < c`. A parenthesised inner
+  comparison (`(a < b) == c`) still parses, since the `)` ends the first.
   `match` is parsed here and *desugared to a chain of `if`s* (`desugar_match`),
   so sema and codegen have no `match` case. A non-`Var`/`Int` scrutinee is bound
   to a hidden `let` first, so a call in the scrutinee runs once. An arm after

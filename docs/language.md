@@ -544,7 +544,9 @@ compile-time constant is decided at compile time, not by the trap.
 ## Expressions
 
 - Arithmetic: `+ - * / %` on `i64`.
-- Comparison: `== != < <= > >=`, producing `bool`.
+- Comparison: `== != < <= > >=`, producing `bool`. Comparison is
+  non-associative, as in Rust: `a < b < c` is a hard error, not `(a < b) < c`;
+  parenthesise the inner test (`(a < b) == c`) to chain it.
 - Boolean: `&& || !`, short-circuiting. `!` is logical not on a `bool` and
   bitwise not on an `i64`, as in Rust; it yields its operand's type.
 - Bitwise: `& | ^` on `i64`, and on `bool` where they are the non-short-circuiting
@@ -860,7 +862,8 @@ error, since rmc compiles a single file and cannot resolve it.
 
 ## Not supported
 
-Traits, generics, borrowing, lifetimes, modules, closures, `f32`/`f64`,
+Traits, generics, borrowing, lifetimes, modules, closures, tuple structs
+(`struct S(i64, i64)`), raw string literals (`r".."`), `f32`/`f64`,
 `u*`/`i*` types other than `i64`, and the standard library beyond the two `std`
 paths above and the `Vec` shims. A `Vec` is not a real container: only the
 handful of shapes in "Vec shims" are recognised, and any other `Vec` method or

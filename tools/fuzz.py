@@ -2906,6 +2906,14 @@ def reject_corpus():
         "let_tuple_pat_on_array": "fn main() { let a: [i64; 2] = [1, 2]; let (x, y) = a; let _ = x; }\n",
         "let_tuple_pat_wildcards_on_array": "fn main() { let a: [i64; 2] = [1, 2]; let (_, _) = a; }\n",
         "match_tuple_pat_on_array": "fn main() { let a: [i64; 2] = [1, 2]; let _ = match a { (x, y) => x }; }\n",
+        # Comparison operators are non-associative: `a < b < c` is a hard error
+        # in rustc ("comparison operators cannot be chained"), not `(a < b) < c`.
+        # rmc must reject a second comparison operator at the same level.
+        "chained_comparison_int": "fn main() { println!(\"{}\", 1 < 2 < 3); }\n",
+        "chained_comparison_eq": "fn main() { println!(\"{}\", 1 == 1 == true); }\n",
+        "chained_comparison_ne": "fn main() { println!(\"{}\", 1 != 2 != false); }\n",
+        "chained_comparison_mixed": "fn main() { println!(\"{}\", 1 <= 2 >= 1); }\n",
+        "chained_comparison_bool": "fn main() { println!(\"{}\", true == true == true); }\n",
     }
 
 

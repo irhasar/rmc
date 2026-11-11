@@ -7124,3 +7124,22 @@ fn a_file_module_declaration_is_rejected() {
     let err = compile_to_asm("mod m; fn main() -> i64 { 0 }", &CompileOptions::default());
     assert!(err.is_err(), "`mod NAME;` must be rejected");
 }
+
+#[test]
+fn a_chained_comparison_is_rejected() {
+    // Comparison is non-associative in Rust: `a < b < c` is a hard error, not
+    // `(a < b) < c`. rmc must not accept what rustc rejects.
+    for src in [
+        "fn main() { println!(\"{}\", 1 < 2 < 3); }",
+        "fn main() { println!(\"{}\", 1 == 1 == true); }",
+        "fn main() { println!(\"{}\", 1 != 2 != false); }",
+        "fn main() { println!(\"{}\", 1 <= 2 >= 1); }",
+    ] {
+        let err = compile_to_asm(src, &CompileOptions::default());
+        assert!(err.is_err(), "a chained comparison must be rejected: {src}");
+    }
+    // A single comparison, and a comparison of a parenthesised comparison,
+    // still compile.
+    assert!(compile_to_asm("fn main() { let x = 1 < 2; }", &CompileOptions::default()).is_ok());
+    assert!(compile_to_asm("fn main() { let x = (1 < 2) == true; }", &CompileOptions::default()).is_ok());
+}
