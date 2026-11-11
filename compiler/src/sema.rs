@@ -722,6 +722,23 @@ impl Sema {
         }
     }
 
+    /// The true- and false-outcome initialization states of an operand just
+    /// checked by `check_expr`. A logical operand (`&&`/`||`) has recorded its
+    /// two outcomes in the `cond_*` slots; any other operand has a single exit
+    /// state, which is both outcomes. The slots are always consumed, so a
+    /// nested short circuit cannot leak past the operand that produced it.
+    fn outcome_states(sema: &mut Sema, e: &Expr, scope: &Scope) -> (Vec<bool>, Vec<bool>) {
+        let then = sema.cond_then_init.take();
+        let els = sema.cond_else_init.take();
+        if matches!(e, Expr::Bin(BinOp::And | BinOp::Or, ..)) {
+            if let (Some(t), Some(f)) = (then, els) {
+                return (t, f);
+            }
+        }
+        let s = Self::init_snapshot(scope);
+        (s.clone(), s)
+    }
+
     /// Type-check a `let` initialiser. A `[v; n]` written directly here is kept
     /// as an `ArrayLit` so codegen splats one value across the array, rather
     /// than materialising it element by element. Any other initialiser (and any
@@ -1896,29 +1913,45 @@ impl Sema {
                 // conservative "either path" state so a value use
                 // (`let b = a && x`) cannot assume the right operand ran.
                 if matches!(op, BinOp::And | BinOp::Or) {
+                    // Each operand has a *true* and a *false* outcome state.
+                    // For a non-logical operand both are its single exit state;
+                    // for a logical one they differ, and `check_expr` leaves
+                    // them in the `cond_*` slots. Tracking both is what lets a
+                    // chain such as `(a && { x = 7; true }) && x == 7` check
+                    // the later operand against the state its guard guarantees,
+                    // rather than the merged state of the earlier short circuit.
                     let ta = self.check_expr(a, scope)?;
-                    let skip = Self::init_snapshot(scope);
+                    let (a_then, a_else) = Self::outcome_states(self, a, scope);
+                    // The right operand runs only where the left does not decide
+                    // the result: on the left-true path for `&&`, the left-false
+                    // path for `||`. Enter it in that state.
+                    Self::init_restore(scope, if matches!(op, BinOp::And) { &a_then } else { &a_else });
                     let tb = self.check_expr(b, scope)?;
-                    let eval = Self::init_snapshot(scope);
+                    let (b_then, b_else) = Self::outcome_states(self, b, scope);
                     if ta != Type::Bool || tb != Type::Bool {
                         return Err(format!(
                             "logical operator expects `bool`, found {ta:?} and {tb:?}"
                         ));
                     }
-                    // A binding is initialized after the expression only if it
-                    // is initialized whether or not the right operand ran.
-                    let either: Vec<bool> = (0..scope.len())
-                        .map(|i| {
-                            skip.get(i).copied().unwrap_or(false)
-                                && eval.get(i).copied().unwrap_or(false)
-                        })
-                        .collect();
-                    // `a && b` is true only when `b` ran; false when either `a`
-                    // was false (`b` skipped) or `b` ran. `a || b` is the mirror.
-                    let (then_state, else_state) = match op {
-                        BinOp::And => (eval, either.clone()),
-                        _ => (either.clone(), eval),
+                    let n = scope.len();
+                    let all = |x: &[bool], y: &[bool]| -> Vec<bool> {
+                        (0..n)
+                            .map(|i| {
+                                x.get(i).copied().unwrap_or(false)
+                                    && y.get(i).copied().unwrap_or(false)
+                            })
+                            .collect()
                     };
+                    // `a && b` is true only when `b` ran (its true outcome);
+                    // false when `a` was false (skipping `b`) or `b` ran and was
+                    // false. `a || b` is the mirror.
+                    let (then_state, else_state) = match op {
+                        BinOp::And => (b_then, all(&a_else, &b_else)),
+                        _ => (all(&a_then, &b_then), b_else),
+                    };
+                    // A value use of the whole expression sees the merge of its
+                    // two outcomes, so it cannot assume the right operand ran.
+                    let either = all(&then_state, &else_state);
                     self.cond_then_init = Some(then_state);
                     self.cond_else_init = Some(else_state);
                     for (bl, &m) in scope.iter_mut().zip(&either) {
