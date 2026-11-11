@@ -1803,8 +1803,20 @@ in a `let` initializer; anywhere else the `\0`-prefixed parser marker reaches
 sema, which reports the source construct (see the `\0vecnew` arm). An
 args-vector is never built: `std::env::args()...collect()` records the binding,
 `for v in &args` desugars to `for i in skip..__rmc_nargs()`, and `args[i]`
-becomes `__rmc_arg_or(i + skip, 0)`. The `__rmc_arg_or`, `__rmc_nargs` and
-`__rmc_fill` helpers live in `runtime.rs`. Two relaxations make the pointer
+becomes `__rmc_arg_or(i + skip, 0, 0, 0)`. The `__rmc_arg_or`, `__rmc_nargs` and
+`__rmc_fill` helpers live in `runtime.rs`.
+
+The `args().nth(i)` chain has two independent failure points, and
+`finish_args_nth` tracks them in `__rmc_arg_or`'s last two arguments: `missing`
+(the `Option` unwrap) and `parse` (the `Result` unwrap). `.unwrap_or(d)` leaves
+both 0 and yields `d` for either failure; `.unwrap()` sets `missing`, so an
+absent argument exits 101 while a present non-integer takes the fallback when
+only `parse` is 0. The `and_then(|s| s.parse().ok())` chain recovers both, so it
+sets neither. A present non-integer argument must not be read as zero, and the
+turbofish `parse::<i64>()` type name lexes as a keyword token, not an
+identifier.
+
+Two relaxations make the pointer
 shapes type: `*mut T as i64` is allowed (rmc maps `*mut T` and `&mut T` alike,
 and rustc allows the raw form) and an integer/pointer coerce both ways, matching
 the existing `i64 as &T` extension; a shared reference still may not become a
