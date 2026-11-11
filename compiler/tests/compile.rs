@@ -2920,13 +2920,15 @@ fn a_chained_guard_checks_its_right_operand_under_the_left_true_state() {
     );
     // The mirror for `||`: `(a || { x = 7; false }) || x == 7` reaches the
     // comparison only when the left was false, which is where `x` was assigned.
+    // `x` is left uninitialized so the read only type-checks if that left-false
+    // state is restored; with `x = 0` the case passed even without the restore.
     assert_eq!(
         run_exit_code(
-            "fn f(a: bool) -> i64 { let mut x: i64 = 0; \
-             if (a || { x = 7; false }) || x == 7 { return 0; } return x; } \
+            "fn f(a: bool) -> i64 { let mut x: i64; \
+             if (a || { x = 7; false }) || x == 7 { return 1; } return 0; } \
              fn main() -> i64 { return f(false); }",
         ),
-        0
+        1
     );
     // The guard's write is still not visible *after* the whole condition: on the
     // path where the outer right operand never runs, `x` is uninitialized, so a
