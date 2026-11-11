@@ -129,6 +129,13 @@ pub struct Sema {
     /// Whether the `if` being checked is a non-root step of such a chain, so it
     /// inherits `match_total` instead of recomputing it.
     match_chain: bool,
+    /// Set by `check_expr` for a top-level `&&`/`||` condition: the
+    /// definite-initialization state on entry to the true (`cond_then_init`)
+    /// and false (`cond_else_init`) branch. A short circuit means the right
+    /// operand runs on only one of the two paths, so the branches see
+    /// different states. Consumed and cleared by `check_stmt`'s `if`/`while`.
+    cond_then_init: Option<Vec<bool>>,
+    cond_else_init: Option<Vec<bool>>,
     /// The constant value of each local, by slot, if it is known. A local is
     /// entered only when rustc's constant propagation would know it: its
     /// initializer is constant and it is never written or mutably borrowed
@@ -346,6 +353,8 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         match_chain: false,
         tmp: 0,
         in_builtin_neg: false,
+        cond_then_init: None,
+        cond_else_init: None,
         const_locals: HashMap::new(),
         assign_count: HashMap::new(),
         mut_borrowed: std::collections::HashSet::new(),
@@ -1660,33 +1669,66 @@ impl Sema {
                 Ok(())
             }
             Stmt::While(cond, body, label) => {
-                let ct = self.check_expr(cond, scope)?;
+                self.loop_depth += 1;
+                self.loop_stack.push(LoopCtx {
+                    label: label.clone(),
+                    kind: LoopKind::NoValue,
+                });
+                // The condition runs with the loop's own label in scope: rustc
+                // shadows an outer label of the same name, so
+                // `'i: while { break 'i; true } {}` is accepted and the
+                // condition is a break target. Pushing before the condition is
+                // what makes `break 'i` resolve.
+                self.loop_marks.push(scope.len());
+                self.loop_repeats.push(true);
+                self.loop_exits.push(Vec::new());
+                self.loop_reach.push(false);
+                // The condition is re-evaluated whenever the body runs to its
+                // end (or `continue`s), so a write to an immutable binding in
+                // the condition repeats and rustc rejects it (E0384). Seeding
+                // the condition's continuation with the body's reachability is
+                // what lets the condition's own block walk see that back edge;
+                // `while { x = 1; false } {}` writes `x` on every evaluation.
+                self.loop_cont.push(block_reaches_top(body, label.as_deref()));
+                self.break_assigned.push(Self::assigned_snapshot(scope));
+                // rustc rejects an unlabelled `break`/`continue` in the
+                // condition before it looks at anything else, so this check
+                // precedes `check_expr` and its message wins over a write error.
                 if cond_has_unlabelled_exit(cond) {
                     return Err(
                         "`break` or `continue` with no label in the condition of a `while` loop"
                             .into(),
                     );
                 }
+                let ct = self.check_expr(cond, scope)?;
+                // A top-level `&&`/`||` condition runs its right operand on only
+                // one of the two paths: the body enters on the condition-true
+                // state, the post-loop fall-through on the condition-false one.
+                // Only a top-level short circuit splits the branches; a nested
+                // one inside a larger condition does not. Always consume the
+                // slots so a nested one cannot leak to a later condition.
+                let (mut cond_then, mut cond_else) =
+                    (self.cond_then_init.take(), self.cond_else_init.take());
+                if !matches!(cond, Expr::Bin(BinOp::And | BinOp::Or, ..)) {
+                    cond_then = None;
+                    cond_else = None;
+                }
                 if ct != Type::Bool && ct != Type::Never {
                     return Err(format!("`while` condition must be `bool`, found {ct:?}"));
                 }
-                let init_before = Self::init_snapshot(scope);
-                self.loop_depth += 1;
-                self.loop_stack.push(LoopCtx {
-                    label: label.clone(),
-                    kind: LoopKind::NoValue,
-                });
-                // The body may run again, so a non-`mut` binding that already
-                // existed before the loop cannot be written inside it.
-                self.loop_marks.push(scope.len());
-                self.loop_repeats.push(true);
-                self.loop_exits.push(Vec::new());
-                self.loop_reach.push(false);
-                self.loop_cont.push(false);
-                self.break_assigned.push(Self::assigned_snapshot(scope));
+                // The condition is evaluated at least once, even when the body
+                // never runs, so a binding it initializes is initialized on the
+                // fall-through exit. Snapshot that state: the body may still run
+                // zero times, so its writes do not count on their own. A short
+                // circuit takes the condition-false path's state instead.
+                let cond_init = cond_else.unwrap_or_else(|| Self::init_snapshot(scope));
+                // The body runs only when the condition is true.
+                if let Some(st) = &cond_then {
+                    Self::init_restore(scope, st);
+                }
                 self.check_block_inner(body, scope, true, label.as_deref())?;
                 let breaks = self.break_assigned.pop().unwrap();
-                self.loop_exits.pop();
+                let exits = self.loop_exits.pop().unwrap();
                 self.loop_cont.pop();
                 self.loop_reach.pop();
                 self.loop_repeats.pop();
@@ -1698,14 +1740,13 @@ impl Sema {
                     }
                 }
                 self.loop_depth -= 1;
+                // A binding is definitely initialized after the loop only if
+                // every exit initializes it: the fall-through exit (the
+                // condition's state) and each `break` that leaves the loop.
                 for (i, b) in scope.iter_mut().enumerate() {
-                    if breaks.get(i).copied().unwrap_or(false) {
-                        b.assigned = true;
-                    }
+                    b.init = cond_init.get(i).copied().unwrap_or(false)
+                        && exits.iter().all(|e| e.get(i).copied().unwrap_or(false));
                 }
-                // The loop may run zero times, so nothing it initializes is
-                // guaranteed afterwards.
-                Self::init_restore(scope, &init_before);
                 Ok(())
             }
             Stmt::For { var, var_slot, start, end, end_slot, body, label, .. } => {
@@ -2400,6 +2441,43 @@ impl Sema {
                 }
             }
             Expr::Bin(op, a, b) => {
+                // `&&`/`||` short-circuit: the right operand runs only when the
+                // left does not decide the result. Record the two branch-entry
+                // states for a caller that branches on this expression (an
+                // `if`/`while` condition), and leave the scope with the
+                // conservative "either path" state so a value use
+                // (`let b = a && x`) cannot assume the right operand ran.
+                if matches!(op, BinOp::And | BinOp::Or) {
+                    let ta = self.check_expr(a, scope)?;
+                    let skip = Self::init_snapshot(scope);
+                    let tb = self.check_expr(b, scope)?;
+                    let eval = Self::init_snapshot(scope);
+                    if ta != Type::Bool || tb != Type::Bool {
+                        return Err(format!(
+                            "logical operator expects `bool`, found {ta:?} and {tb:?}"
+                        ));
+                    }
+                    // A binding is initialized after the expression only if it
+                    // is initialized whether or not the right operand ran.
+                    let either: Vec<bool> = (0..scope.len())
+                        .map(|i| {
+                            skip.get(i).copied().unwrap_or(false)
+                                && eval.get(i).copied().unwrap_or(false)
+                        })
+                        .collect();
+                    // `a && b` is true only when `b` ran; false when either `a`
+                    // was false (`b` skipped) or `b` ran. `a || b` is the mirror.
+                    let (then_state, else_state) = match op {
+                        BinOp::And => (eval, either.clone()),
+                        _ => (either.clone(), eval),
+                    };
+                    self.cond_then_init = Some(then_state);
+                    self.cond_else_init = Some(else_state);
+                    for (bl, &m) in scope.iter_mut().zip(&either) {
+                        bl.init = m;
+                    }
+                    return Ok(Type::Bool);
+                }
                 let ta = self.check_expr(a, scope)?;
                 let tb = self.check_expr(b, scope)?;
                 use BinOp::*;
@@ -2579,6 +2657,16 @@ impl Sema {
                 self.match_chain = false;
                 self.match_total = false;
                 let ct = self.check_expr(cond, scope)?;
+                // A top-level `&&`/`||` condition runs its right operand on only
+                // one of the two branches, so the branches enter with different
+                // initialization states. Only a top-level short circuit splits
+                // them; always consume the slots so a nested one cannot leak.
+                let (mut cond_then, mut cond_else) =
+                    (self.cond_then_init.take(), self.cond_else_init.take());
+                if !matches!(&**cond, Expr::Bin(BinOp::And | BinOp::Or, ..)) {
+                    cond_then = None;
+                    cond_else = None;
+                }
                 if ct != Type::Bool && ct != Type::Never {
                     return Err(format!("`if` condition must be `bool`, found {ct:?}"));
                 }
@@ -2592,6 +2680,10 @@ impl Sema {
                 // paths. `init_before` is the state on entry to the branch.
                 let init_before = Self::init_snapshot(scope);
                 let assigned_before = Self::assigned_snapshot(scope);
+                // Enter the then-branch in the state its guard guarantees.
+                if let Some(st) = &cond_then {
+                    Self::init_restore(scope, st);
+                }
                 let tt = self.check_block(then, scope)?;
                 let then_init = Self::init_snapshot(scope);
                 let then_assigned = Self::assigned_snapshot(scope);
@@ -2606,7 +2698,10 @@ impl Sema {
                         self.match_total = total;
                         // Restore the entry state before the else, so the else
                         // sees the same scope the then saw.
-                        Self::init_restore(scope, &init_before);
+                        Self::init_restore(
+                            scope,
+                            cond_else.as_deref().unwrap_or(&init_before),
+                        );
                         Self::assigned_restore(scope, &assigned_before);
                         let et = self.check_block(e, scope)?;
                         self.match_chain = false;
@@ -2648,7 +2743,12 @@ impl Sema {
                                 (false, false) => ti && ei,
                                 (false, true) => ti,
                                 (true, false) => ei,
-                                (true, true) => false,
+                                // Both branches diverge, so neither write is
+                                // observed: control cannot reach here from
+                                // either, so the state is unchanged. Reporting
+                                // `false` would wrongly clobber a binding that
+                                // was already initialized before the `if`.
+                                (true, true) => init_before.get(i).copied().unwrap_or(false),
                             };
                         }
                         // A binding counts as written if a branch that can
@@ -2682,8 +2782,12 @@ impl Sema {
                         // (every variant is named), so a diverging then-branch
                         // makes the whole step `!` rather than `()` — which is
                         // what lets an all-`return` exhaustive match stand as a
-                        // `!` tail.
-                        Self::init_restore(scope, &init_before);
+                        // `!` tail. The implicit else is the condition-false
+                        // path, whose state a short circuit may differ on.
+                        Self::init_restore(
+                            scope,
+                            cond_else.as_deref().unwrap_or(&init_before),
+                        );
                         // An arm that cannot fall through must not contribute:
                         // its write is unreachable from the next statement.
                         if block_diverges(then) && !total {
@@ -2731,7 +2835,7 @@ impl Sema {
                 self.loop_depth -= 1;
                 // When no `break` can leave the loop it diverges, so nothing
                 // after is reachable and the state does not matter.
-                if block_has_break(body) {
+                if block_has_break(body, label.as_deref()) {
                     for (i, b) in scope.iter_mut().enumerate() {
                         b.init = init_before.get(i).copied().unwrap_or(false)
                             || exits.iter().all(|e| e.get(i).copied().unwrap_or(false));
@@ -2759,7 +2863,7 @@ impl Sema {
                     // No `break value`: the loop is `!` when no `break` can
                     // leave it (it never finishes), otherwise `()`.
                     _ => {
-                        if block_has_break(body) {
+                        if block_has_break(body, label.as_deref()) {
                             Type::Unit
                         } else {
                             Type::Never
@@ -3662,62 +3766,120 @@ fn stmt_diverges(s: &Stmt) -> bool {
     }
 }
 
-/// True when a `break` in `b` targets the loop `b` is the body of. A nested
-/// loop captures its own `break`s, so the walk stops at one; an `if`/block does
-/// not, so it descends.
-fn block_has_break(b: &Block) -> bool {
-    b.stmts.iter().any(stmt_has_break) || b.tail.as_deref().map_or(false, expr_has_break)
+/// True when a `break` in `b` targets the loop labelled `label` (the innermost
+/// loop when `label` is `None`). A nested loop captures its own unlabelled
+/// `break`s, and a labelled `break` counts only for the loop it names, so the
+/// walk descends only where a `break` could still reach the loop being scanned.
+/// Mirrors `block_contains_continue`.
+fn block_has_break(b: &Block, label: Option<&str>) -> bool {
+    block_has_break_at(b, label, false)
 }
 
-fn stmt_has_break(s: &Stmt) -> bool {
+fn block_has_break_at(b: &Block, label: Option<&str>, nested: bool) -> bool {
+    // `any` over every statement, including ones after a `break`/`return`. rustc
+    // still type-checks such an unreachable `break` as an exit of the loop it
+    // names: `'a: loop { loop { break; break 'a; } }` requires the outer loop to
+    // yield the `break`'s value, so the dead break must count here.
+    b.stmts.iter().any(|s| stmt_has_break(s, label, nested))
+        || b.tail
+            .as_deref()
+            .map_or(false, |e| expr_has_break(e, label, nested))
+}
+
+fn stmt_has_break(s: &Stmt, label: Option<&str>, nested: bool) -> bool {
     match s {
-        Stmt::Break(..) => true,
-        // A `while`/`for` body's `break`s belong to that loop, not the
-        // enclosing one, so the walk does not descend into it.
-        Stmt::While(..) | Stmt::For { .. } => false,
-        Stmt::Expr(e) => expr_has_break(e),
-        Stmt::Let { init: Some(e), .. } => expr_has_break(e),
-        Stmt::Assign { value, .. } => expr_has_break(value),
+        // An unlabelled `break` targets the innermost loop, so it leaves ours
+        // only at our own body level (`nested` false); a labelled one must name
+        // us. This keeps a `break` inside a deeper loop from counting.
+        Stmt::Break(_, bl) => match bl {
+            Some(l) => Some(l.as_str()) == label,
+            None => !nested,
+        },
+        // A nested `while`/`for` captures its own unlabelled `break`s, but a
+        // labelled one inside it can still leave our loop. Descend unless the
+        // nested loop is itself our target (its `break`s then target a loop
+        // between us and it, never us). Its condition and a `for`'s range bounds
+        // run in our context, so a labelled `break` there leaves our loop even
+        // though the nested body is excluded; gate the body on the condition
+        // completing, since a condition that cannot complete makes it
+        // unreachable.
+        Stmt::While(cond, body, lbl) => {
+            let outward = lbl.as_deref() != label;
+            (outward && expr_has_break(cond, label, nested))
+                || (outward
+                    && expr_can_fall(cond)
+                    && block_has_break_at(body, label, true))
+        }
+        Stmt::For { start, end, body, label: lbl, .. } => {
+            let outward = lbl.as_deref() != label;
+            // A `for`'s range bounds run *before* its own label enters scope, so
+            // a `break` naming `label` there targets the enclosing loop even
+            // when the `for` reuses that label. The body is the only part the
+            // shadowing test applies to.
+            expr_has_break(start, label, nested)
+                || expr_has_break(end, label, nested)
+                || (outward
+                    && expr_can_fall(start)
+                    && expr_can_fall(end)
+                    && block_has_break_at(body, label, true))
+        }
+        Stmt::Expr(e) => expr_has_break(e, label, nested),
+        Stmt::Let { init: Some(e), .. } => expr_has_break(e, label, nested),
+        Stmt::Assign { target, value } => {
+            expr_has_break(value, label, nested) || expr_has_break(target, label, nested)
+        }
         _ => false,
     }
 }
 
-fn expr_has_break(e: &Expr) -> bool {
+fn expr_has_break(e: &Expr, label: Option<&str>, nested: bool) -> bool {
     match e {
-        Expr::Block(b) => block_has_break(b),
-        Expr::MatchBoundary(b, _) => block_has_break(b),
-        // A nested `loop`/`while`/`for` captures its own `break`s, so the walk
-        // does not descend into it.
-        Expr::Loop(..) => false,
+        Expr::Block(b) => block_has_break_at(b, label, nested),
+        Expr::MatchBoundary(b, _) => block_has_break_at(b, label, nested),
+        // A nested `loop` captures its own unlabelled `break`s, but a labelled
+        // one in its body can still leave our loop; descend unless the nested
+        // loop is itself our target.
+        Expr::Loop(body, _, _, lbl) => {
+            lbl.as_deref() != label && block_has_break_at(body, label, true)
+        }
         // The condition is evaluated, so a `break` there can leave the loop the
         // expression belongs to; the walk must inspect it too, along with every
         // other evaluated child.
         Expr::If(c, t, els) => {
-            expr_has_break(c)
-                || block_has_break(t)
-                || els.as_ref().map_or(false, |b| block_has_break(b))
+            expr_has_break(c, label, nested)
+                || block_has_break_at(t, label, nested)
+                || els
+                    .as_ref()
+                    .map_or(false, |b| block_has_break_at(b, label, nested))
         }
-        Expr::Bin(_, a, b) => expr_has_break(a) || expr_has_break(b),
-        Expr::Un(_, a) => expr_has_break(a),
-        Expr::Index(a, b) => expr_has_break(a) || expr_has_break(b),
-        Expr::Field { base, .. } => expr_has_break(base),
-        Expr::Cast(a, _) => expr_has_break(a),
-        Expr::AddrOf { expr, .. } => expr_has_break(expr),
-        Expr::Deref { expr, .. } => expr_has_break(expr),
-        Expr::BoolTest { scrutinee, .. } => expr_has_break(scrutinee),
-        Expr::Call { args, .. } => args.iter().any(expr_has_break),
-        Expr::StructLit { fields, .. } => fields.iter().any(|f| expr_has_break(&f.value)),
-        Expr::ArrayLit(v, _) => expr_has_break(v),
-        Expr::ArrayList(xs) => xs.iter().any(expr_has_break),
-        Expr::TupleLit(xs) => xs.iter().any(expr_has_break),
+        Expr::Bin(_, a, b) => {
+            expr_has_break(a, label, nested) || expr_has_break(b, label, nested)
+        }
+        Expr::Un(_, a) => expr_has_break(a, label, nested),
+        Expr::Index(a, b) => {
+            expr_has_break(a, label, nested) || expr_has_break(b, label, nested)
+        }
+        Expr::Field { base, .. } => expr_has_break(base, label, nested),
+        Expr::Cast(a, _) => expr_has_break(a, label, nested),
+        Expr::AddrOf { expr, .. } => expr_has_break(expr, label, nested),
+        Expr::Deref { expr, .. } => expr_has_break(expr, label, nested),
+        Expr::BoolTest { scrutinee, .. } => expr_has_break(scrutinee, label, nested),
+        Expr::Call { args, .. } => args.iter().any(|a| expr_has_break(a, label, nested)),
+        Expr::StructLit { fields, .. } => fields
+            .iter()
+            .any(|f| expr_has_break(&f.value, label, nested)),
+        Expr::ArrayLit(v, _) => expr_has_break(v, label, nested),
+        Expr::ArrayList(xs) => xs.iter().any(|a| expr_has_break(a, label, nested)),
+        Expr::TupleLit(xs) => xs.iter().any(|a| expr_has_break(a, label, nested)),
         Expr::MethodCall { recv, args, .. } => {
-            expr_has_break(recv) || args.iter().any(expr_has_break)
+            expr_has_break(recv, label, nested)
+                || args.iter().any(|a| expr_has_break(a, label, nested))
         }
-        Expr::EnumCtor { args, .. } => args.iter().any(expr_has_break),
-        Expr::VariantTest { scrutinee, .. } => expr_has_break(scrutinee),
-        Expr::EnumPayload { recv, .. } => expr_has_break(recv),
-        Expr::PatScrutinee(inner) => expr_has_break(inner),
-        Expr::PatCheck { base, .. } => expr_has_break(base),
+        Expr::EnumCtor { args, .. } => args.iter().any(|a| expr_has_break(a, label, nested)),
+        Expr::VariantTest { scrutinee, .. } => expr_has_break(scrutinee, label, nested),
+        Expr::EnumPayload { recv, .. } => expr_has_break(recv, label, nested),
+        Expr::PatScrutinee(inner) => expr_has_break(inner, label, nested),
+        Expr::PatCheck { base, .. } => expr_has_break(base, label, nested),
         _ => false,
     }
 }
@@ -3728,11 +3890,18 @@ fn expr_diverges(e: &Expr) -> bool {
         // A desugared `match` diverges when every arm body diverges, so the
         // whole chain is `!` even though its last step is an `if` with no
         // `else` (which `Expr::If` alone would call non-diverging).
-        Expr::MatchBoundary(b, _) => {
-            Sema::match_chain_diverges(b) || block_diverges(b)
+        //
+        // `match_chain_diverges` reads a bare `if` as the next chain step, which
+        // is only sound for a chain with no catch-all: a `_`/binding arm ends
+        // the chain, so its body — wrapped in a `Block`, but the *inner* body
+        // may itself be a bare `if` — is a body, not a step. With a catch-all
+        // the structural walk (`block_diverges`) is already exact, because the
+        // chain's implicit fall-through is the catch-all arm's own fall-through.
+        Expr::MatchBoundary(b, has_catch_all) => {
+            (!*has_catch_all && Sema::match_chain_diverges(b)) || block_diverges(b)
         }
         // A `loop` diverges when no `break` can leave it.
-        Expr::Loop(body, _, _, _) => !block_has_break(body),
+        Expr::Loop(body, _, _, lbl) => !block_has_break(body, lbl.as_deref()),
         // Both arms must diverge for the `if` to diverge.
         Expr::If(_, t, els) => {
             block_diverges(t) && els.as_ref().map_or(false, |b| block_diverges(b))
@@ -3793,7 +3962,7 @@ fn expr_can_fall(e: &Expr) -> bool {
         Expr::MatchBoundary(b, _) => block_can_fall(b),
         // A `loop` completes only through a `break`; one with no reachable
         // break never falls through, so code after it is unreachable.
-        Expr::Loop(body, _, _, _) => block_has_break(body),
+        Expr::Loop(body, _, _, lbl) => block_has_break(body, lbl.as_deref()),
         Expr::If(cond, t, els) => {
             expr_can_fall(cond)
                 && (block_can_fall(t) || els.as_ref().map_or(true, |e| block_can_fall(e)))
@@ -3988,11 +4157,12 @@ fn stmt_contains_continue(s: &Stmt, label: Option<&str>, nested: bool) -> bool {
         }
         Stmt::For { start, end, body, label: lbl, .. } => {
             let outward = lbl.as_deref() != label;
-            // The range bounds run before the loop, so a bound that cannot
-            // complete makes the body unreachable.
-            (outward
-                && (expr_contains_continue(start, label, nested)
-                    || expr_contains_continue(end, label, nested)))
+            // The range bounds run *before* the loop's own label enters scope,
+            // so a `continue` naming `label` there targets the enclosing loop
+            // even when the `for` reuses that label. Only the body is shadowed.
+            // A bound that cannot complete makes the body unreachable.
+            expr_contains_continue(start, label, nested)
+                || expr_contains_continue(end, label, nested)
                 || (outward
                     && expr_can_fall(start)
                     && expr_can_fall(end)

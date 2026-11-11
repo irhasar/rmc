@@ -21,6 +21,13 @@ fn asm_no_tco(src: &str) -> String {
         .expect("should compile")
 }
 
+fn store_offset_after(out: &str, marker: &str) -> i32 {
+    let tail = &out[out.find(marker).expect("marker present")..];
+    let rest = &tail[tail.find("mov %rax, ").expect("a store") + "mov %rax, ".len()..];
+    let end = rest.find("(%rbp)").expect("frame store");
+    rest[..end].trim().parse().expect("offset")
+}
+
 /// The frame offset stored by the first `mov %rax, <off>(%rbp)` after `marker`.
 /// Lets a test check relative layout without hard-coding absolute offsets.
 /// The frame offset of the first `movq $imm, off(%rbp)` store. Panics when the
@@ -1033,6 +1040,32 @@ fn a_diverging_match_is_never_and_fits_any_return_type() {
 }
 
 #[test]
+fn a_catch_all_match_whose_body_can_fall_through_does_not_diverge() {
+    // The wildcard arm's body is an `if` without an `else`, so it can fall
+    // through to `()`. The match therefore does not diverge, and a binding the
+    // other branch initialises is not definitely initialised afterwards. The
+    // structural walk must not read the body's bare `if` as another chain step
+    // and mistake the match for `!` (rustc's E0381).
+    let err = compile_to_asm(
+        "fn f(c: bool) -> i64 { let x: i64; \
+         if c { match c { _ => if c { return 1; } } } else { x = 1; } return x; } \
+         fn main() {}",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("use of possibly-uninitialized variable `x`"), "got: {err}");
+    // The same shape with a diverging body is fine: the branch returns, so `x`
+    // is initialised by the `else` alone.
+    assert!(compile_to_asm(
+        "fn f(c: bool) -> i64 { let x: i64; \
+         if c { match c { _ => { return 1; } } } else { x = 1; } return x; } \
+         fn main() {}",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
 fn a_diverging_if_else_initializes_a_typed_let() {
     let src = "fn f(c: bool) -> i64 { let x: i64 = if c { return 1; } else { return 2; }; return x; } \
                fn main() -> i64 { return f(true); }";
@@ -1043,6 +1076,20 @@ fn a_diverging_if_else_initializes_a_typed_let() {
 fn a_loop_with_no_break_satisfies_any_return_type() {
     let src = "fn f() -> i64 { loop {} } fn main() -> i64 { return f(); }";
     assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_break_to_an_outer_loop_does_not_make_an_inner_loop_finite() {
+    // The inner `loop` has no `break` targeting itself, so it never completes:
+    // it is `!` and satisfies any expected type, even though a `while` in its
+    // body breaks the *outer* loop from that condition. rustc accepts the `i64`
+    // initializer; the walk must not count `break 'outer` as exiting `'inner`.
+    assert!(compile_to_asm(
+        "fn main() { 'outer: loop { let x: i64 = 'inner: loop { \
+         while { break 'outer; true } {} }; } }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
 }
 
 #[test]
@@ -2876,6 +2923,70 @@ fn a_constant_index_out_of_range_is_a_compile_error() {
 }
 
 #[test]
+fn bounds_checks_guard_a_loop_expression_base() {
+    // `loop { break a; }[i]`: the base's length comes from the loop's `break`
+    // value type, not its block tail (which is `()`), so the check must still be
+    // emitted for a variable index. Reading past the array is CWE-125.
+    let out = compile_to_asm(
+        "fn f(i: i64) -> i64 { let a: [i64; 3] = [1, 2, 3]; return loop { break a; }[i]; } \
+         fn main() -> i64 { return f(9); }",
+        &CompileOptions { bounds_checks: true, ..Default::default() },
+    )
+    .unwrap();
+    assert!(out.contains("cmp $3, %rax"), "compares to the loop's array length:\n{out}");
+    assert!(out.contains("jae __rmc_bounds"), "traps on out of range");
+}
+
+#[test]
+fn a_loop_expression_base_copies_its_break_value() {
+    // The fix must not only add the check: the loop still yields the array, so
+    // indexing it in range reads the element. Execute it and read element 1,
+    // which only a real copy of the `break` value can produce.
+    assert_eq!(
+        run_exit_code(
+            "fn main() -> i64 { let a: [i64; 3] = [10, 20, 30]; let i: i64 = 1; \
+             return loop { break a; }[i]; }"
+        ),
+        20,
+        "indexing the loop's returned array yields the element"
+    );
+}
+
+#[test]
+fn a_unit_break_in_a_statement_loop_does_not_clobber_the_frame() {
+    // A statement `loop` is typed `()` and has no result slot (`-1`); storing a
+    // `break` value into `off(-1)` wrote the saved frame pointer and segfaulted
+    // on `leave`. The body must still run for its side effects.
+    let out = asm("fn main() -> i64 { let mut n: i64 = 7; loop { break; } return n; }");
+    assert!(out.contains("main:"), "compiles:\n{out}");
+    assert!(!out.contains("mov %rax, -1(%rbp)"), "no store to slot -1:\n{out}");
+    assert_eq!(
+        run_exit_code("fn main() -> i64 { let mut n: i64 = 7; loop { break; } return n; }"),
+        7,
+        "the loop exits cleanly and the local survives"
+    );
+    // The value-store path the reviewer pointed at: a `break` whose value is
+    // `()` but which carries a side effect. It must print and still exit 0,
+    // not corrupt the frame.
+    assert_eq!(
+        run_output("fn main() -> i64 { loop { break print_i64(7); } return 0; }"),
+        (0, "7\n".to_string()),
+        "a unit `break` value runs its side effect and leaves the frame intact"
+    );
+}
+
+#[test]
+fn a_unit_break_still_evaluates_its_value_expression() {
+    // `break g()` in a statement `loop`: the value is `()`, but the call must
+    // still run (rustc evaluates it for its side effects).
+    let out = asm(
+        "fn g() { print_i64(1); } \
+         fn main() -> i64 { loop { break g(); } return 0; }",
+    );
+    assert!(out.contains("call g"), "the break value expression is evaluated:\n{out}");
+}
+
+#[test]
 fn bounds_checks_leave_an_in_range_constant_alone() {
     let out = compile_to_asm(
         "fn main() -> i64 { let a: [i64; 2] = [1, 2]; return a[1]; }",
@@ -3668,6 +3779,264 @@ fn a_loop_leaves_a_binding_initialized_only_on_every_exit() {
 }
 
 #[test]
+fn a_labelled_break_in_a_nested_condition_repeats_the_outer_loop() {
+    // A labelled `break` in a nested `while` condition (or a `for` range bound)
+    // runs in the enclosing loop's context, so it can leave the outer `loop`
+    // and the body then repeats. A write to a binding declared before the outer
+    // loop is therefore a second write on the next iteration, as rustc's E0384.
+    let err = compile_to_asm(
+        "fn main() { let x: i64; 'o: loop { x = 1; \
+         while 'inner: loop { while { break 'inner true; true } {} } { continue 'o; } } }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("cannot assign twice to immutable"), "got: {err}");
+    // A `break` in a `for` range bound leaves the loop before the body runs, so
+    // the write happens once and rustc accepts it.
+    assert!(compile_to_asm(
+        "fn main() { let x: i64; 'o: loop { x = 1; \
+         while { for i in { break 'o; 0 }..1 {} true } {} } }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+    // Without a repeated write the same shape is fine.
+    assert!(compile_to_asm(
+        "fn main() { 'o: loop { while { break 'o; true } {} } }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_break_to_an_outer_loop_in_an_intervening_loop_is_not_a_repeat() {
+    // The intervening inner loop never finishes: its condition breaks the
+    // *outer* `'o`, which is not a `break` of the inner loop. So `x = 1` runs
+    // once and is not a repeated write, as rustc accepts. A `break` that really
+    // targets the inner loop does repeat `'o` and stays rejected.
+    for src in [
+        "fn main() { let x: i64; 'o: loop { x = 1; loop { while { break 'o; true } {} } } }",
+        "fn main() { let x: i64; 'o: loop { x = 1; \
+         while { while { break 'o; true } {} true } {} } }",
+        "fn main() { let x: i64; 'o: loop { x = 1; \
+         for i in { while { break 'o; true } {} 0 }..1 {} } }",
+    ] {
+        assert!(compile_to_asm(src, &CompileOptions::default()).is_ok(), "got: {src}");
+    }
+    let err = compile_to_asm(
+        "fn main() { let x: i64; 'o: loop { x = 1; 'i: loop { break 'i; } } }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("cannot assign twice to immutable"), "got: {err}");
+}
+
+#[test]
+fn a_while_label_is_in_scope_in_its_own_condition() {
+    // rustc shadows an outer label of the same name with the `while`'s own, and
+    // the condition runs with that label already in scope, so `break 'i` there
+    // leaves this loop. Checking the condition before pushing the loop resolved
+    // `'i` to the outer loop (or failed to resolve it at all), diverging from
+    // rustc.
+    let out = asm(
+        "fn main() -> i64 { let mut n: i64 = 0; 'i: while { break 'i; true } {} return n; }",
+    );
+    assert!(out.contains("main:"), "compiles:\n{out}");
+}
+
+#[test]
+fn a_shadowing_while_label_binds_the_inner_loop() {
+    // `'o: while { break 'o; true }` inside `'o: loop`: the `while`'s own `'o`
+    // shadows the outer one, so the `break` leaves the *while*, not the `loop`.
+    // The outer loop therefore keeps running until its own `break`, which is
+    // what makes `c` reach 4. Resolving `break 'o` to the outer loop would make
+    // the whole thing exit immediately and return 0, so executing it is what
+    // distinguishes the two resolutions.
+    assert_eq!(
+        run_exit_code(
+            "fn main() -> i64 { let mut c: i64 = 0; 'o: loop { 'o: while { break 'o; true } {} \
+             c = c + 1; if c > 3 { break; } } return c; }"
+        ),
+        4,
+        "the break leaves the inner while, so the outer loop runs four times"
+    );
+}
+
+#[test]
+fn a_nested_loop_condition_break_does_not_make_the_outer_loop_breakable() {
+    // `'o: while { break 'o; true }` inside `'o: loop`: the `while`'s own `'o`
+    // shadows the outer one, so the `break` leaves the inner `while`. The outer
+    // `loop` then has no `break` of its own, so it is `!`, its `if` branch is
+    // `!`, and the `if`/`else` unifies with `i64`, exactly as rustc does. Before
+    // the label-aware walk, the inner `break` was credited to the outer `loop`,
+    // making it `()` so the branch types disagreed (E0308).
+    let out = asm(
+        "fn main() { let n: i64 = if true { 'o: loop { 'o: while { break 'o; true } {} } } \
+         else { 1 }; }",
+    );
+    assert!(out.contains("main:"), "compiles:\n{out}");
+}
+
+#[test]
+fn a_while_condition_initialization_survives_the_loop() {
+    // The condition runs at least once even when the body never does, so a
+    // binding it initializes is initialized after the loop. Snapshotting the
+    // state only before the condition dropped that write and rejected a valid
+    // read (rmc said `use of possibly-uninitialized variable`, rustc accepts).
+    assert!(compile_to_asm(
+        "fn f() -> i64 { let mut x: i64; while { x = 7; false } {} return x; } \
+         fn main() { let _ = f(); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+    assert_eq!(
+        run_exit_code(
+            "fn f() -> i64 { let mut x: i64; while { x = 7; false } {} return x; } \
+             fn main() -> i64 { return f(); }"
+        ),
+        7,
+        "the condition's write reaches the read after the loop"
+    );
+}
+
+#[test]
+fn a_for_range_bound_break_targets_the_enclosing_loop() {
+    // A `for`'s range bounds are evaluated before its own label enters scope, so
+    // `break 'a` in a bound names the enclosing `'a` loop even when the `for`
+    // reuses the label `'a`. Treating the bound as shadowed made the break
+    // resolve to the `for` itself, so `x`'s write was not a guaranteed exit of
+    // the outer `loop` and a valid read was rejected.
+    assert!(compile_to_asm(
+        "fn f() -> i64 { let mut x: i64; 'a: loop { for i in { if true { x = 7; break 'a; } 0 }..0 {} } \
+         return x; } fn main() { let _ = f(); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+    assert_eq!(
+        run_exit_code(
+            "fn f() -> i64 { let mut x: i64 = 0; 'a: loop { for i in { x = 7; break 'a; 0 }..0 {} } \
+             return x; } fn main() -> i64 { return f(); }"
+        ),
+        7,
+        "the bound's break leaves the outer loop and its write survives"
+    );
+}
+
+#[test]
+fn a_while_condition_write_to_an_immutable_binding_is_a_second_write() {
+    // The condition is re-evaluated whenever the body completes, so a write to a
+    // plain `let` there is a second write and rustc rejects it (E0384). The body
+    // being empty still lets the loop return to the condition.
+    for src in [
+        "fn f() { let x: i64; while { x = 1; false } {} } fn main() { f(); }",
+        "fn f() { let x: i64; while { x = 1; true } {} } fn main() { f(); }",
+        "fn f() { let x: i64; while { x = 1; true } { continue; } } fn main() { f(); }",
+    ] {
+        let err = compile_to_asm(src, &CompileOptions::default()).unwrap_err();
+        assert!(err.contains("cannot assign twice to immutable variable"), "got: {err}");
+    }
+    // A loop that can never return to the condition runs it once, so the single
+    // write is allowed, as is a `mut` binding.
+    assert!(compile_to_asm(
+        "fn f() { let x: i64; while { x = 1; true } { break; } } fn main() { f(); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+    assert!(compile_to_asm(
+        "fn f() { let mut x: i64; while { x = 1; false } {} } fn main() { f(); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_for_bound_continue_reaches_the_enclosing_while_condition() {
+    // A `for`'s range bounds run before its own label enters scope, so a
+    // `continue 'a` in a bound names the enclosing `'a` `while` even when the
+    // `for` reuses the label. Treating the bound as shadowed made the condition
+    // look unreachable-from-the-body, so the loop's back edge was invisible and
+    // the second write to the immutable `x` passed. rustc rejects it (E0384).
+    let err = compile_to_asm(
+        "fn f() { let x: i64; 'a: while { x = 1; true } { \
+         'a: for i in { continue 'a; 0 }..1 {} break; } } fn main() { f(); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("cannot assign twice to immutable variable"), "got: {err}");
+    // A `break` in the bound leaves the `while` and never returns to the
+    // condition, so the single write stays legal.
+    assert!(compile_to_asm(
+        "fn f() { let x: i64; 'a: while { x = 1; true } { \
+         'a: for i in { break 'a; 0 }..1 {} } } fn main() { f(); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_short_circuited_condition_does_not_initialize_its_right_operand() {
+    // `flag && { x = 7; true }`: when `flag` is false the right operand never
+    // runs, so `x` is not definitely initialized after the condition and the
+    // read after the loop must be rejected, as rustc rejects it (E0381).
+    let err = compile_to_asm(
+        "fn f(flag: bool) -> i64 { let mut x: i64; while flag && { x = 7; true } {} return x; } \
+         fn main() { let _ = f(true); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("possibly-uninitialized variable `x`"), "got: {err}");
+    // The mirror: `flag || { x = 7; true }` skips the right operand when `flag`
+    // is true, and the body runs on that true path, so a read in the body may
+    // see `x` uninitialized. rustc rejects it (E0381).
+    let err = compile_to_asm(
+        "fn f(flag: bool) -> i64 { let mut x: i64; while flag || { x = 7; true } \
+         { let y: i64 = x; break; } return 0; } fn main() { let _ = f(false); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("possibly-uninitialized variable `x`"), "got: {err}");
+    // A binding initialized before the condition is still initialized after it,
+    // so the skipped path does not clobber it.
+    assert!(compile_to_asm(
+        "fn f(flag: bool) -> i64 { let mut x: i64 = 0; while flag && { x = 7; true } {} return x; } \
+         fn main() { let _ = f(true); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+    // A short circuit splits the two branches of an `if` as well. `a && b` is
+    // true only when `b` ran, so the then-branch sees `x` initialized; the
+    // implicit else does not.
+    assert!(compile_to_asm(
+        "fn f(a: bool) -> i64 { let mut x: i64; if a && { x = 7; true } { return x; } return 0; } \
+         fn main() { let _ = f(true); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+    // `a || b` is true when either side did, so the then-branch may have skipped
+    // `b`; a read there is rejected.
+    let err = compile_to_asm(
+        "fn f(a: bool) -> i64 { let mut x: i64; if a || { x = 7; true } { return x; } return 0; } \
+         fn main() { let _ = f(true); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("possibly-uninitialized variable `x`"), "got: {err}");
+}
+
+#[test]
+fn a_both_diverge_if_does_not_uninitialize_a_live_binding() {
+    // Neither branch of `if true { return 1 } else { return 2 }` reaches the
+    // code after it, so a binding initialized before the `if` stays initialized
+    // (the read is unreachable, but rustc still accepts it). Merging the two
+    // diverging branches as `false` wrongly clobbered it and rejected the read.
+    assert!(compile_to_asm(
+        "fn f() -> i64 { let mut x: i64 = 0; if true { return 1; } else { return 2; } return x; } \
+         fn main() { let _ = f(); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
 fn an_immutable_parameter_cannot_be_assigned() {
     let err = compile_to_asm(
         "fn f(x: i64) -> i64 { x = 2; return x; } fn main() -> i64 { return f(1); }",
@@ -4277,6 +4646,42 @@ fn an_inlined_parameter_assignment_does_not_reach_the_caller() {
 fn asm_no_licm(src: &str) -> String {
     compile_to_asm(src, &CompileOptions { no_licm: true, ..Default::default() })
         .expect("should compile")
+}
+
+/// Compile `src` with the built `rmc` and run it, returning the exit status
+/// code (the value a `main() -> i64` returns) together with stdout. Shells
+/// out, so it only runs where the toolchain can link.
+fn run_output(src: &str) -> (i32, String) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "rmc-run-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let srcp = dir.join("m.rs");
+    let bin = dir.join("m.bin");
+    std::fs::write(&srcp, src).unwrap();
+    let rmc = env!("CARGO_BIN_EXE_rmc");
+    let out = std::process::Command::new(rmc)
+        .arg("-o")
+        .arg(&bin)
+        .arg(&srcp)
+        .output()
+        .expect("run rmc");
+    assert!(out.status.success(), "rmc failed: {}", String::from_utf8_lossy(&out.stderr));
+    let run = std::process::Command::new(&bin).output().expect("run the binary");
+    let _ = std::fs::remove_dir_all(&dir);
+    (
+        run.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&run.stdout).into_owned(),
+    )
+}
+
+/// The exit status code of a compiled-and-run `main() -> i64`.
+fn run_exit_code(src: &str) -> i32 {
+    run_output(src).0
 }
 
 /// The instructions inside `main` only, so a hoisted value appearing before the
@@ -6316,4 +6721,64 @@ fn keeps_a_counted_loop_with_reversed_switch_arms() {
     let mut prog = counted_loop_mir(false, true);
     rmc::mir::close_counted_loops(&mut prog, false);
     assert!(!counted_loop_closed(&prog), "a reversed switch must block the rewrite");
+}
+
+#[test]
+fn inlining_copies_a_parameter_whose_address_the_callee_takes() {
+    // The callee takes `&mut x` and writes through it. Inlining must give the
+    // parameter its own slot, so the `*p = 9` store must not land in the
+    // caller's slot for `y` (whose address `&y` pins to memory).
+    let out = asm("fn take_mut(mut x: i64) -> i64 { let p = &mut x; *p = 9; x } fn main() -> i64 { let y: i64 = 1; let q = &y; return take_mut(y) + *q; }");
+    let y_slot: i32 = {
+        let tail = &out[out.find("movq $1, ").expect("store of 1")..];
+        let rest = &tail["movq $1, ".len()..];
+        rest[..rest.find("(%rbp)").expect("frame store")].trim().parse().expect("offset")
+    };
+    let before_write = out.split("movq $9, (%rax)").next().expect("a write of 9");
+    let lea = before_write.rfind("lea ").expect("a lea before the write");
+    let tail = &before_write[lea + "lea ".len()..];
+    let param_slot: i32 = tail[..tail.find("(%rbp)").expect("frame address")]
+        .trim()
+        .parse()
+        .expect("an offset");
+    assert_ne!(param_slot, y_slot, "the write must target the parameter's own slot");
+}
+#[test]
+fn an_aggregate_reference_argument_does_not_use_the_direct_call_path() {
+    // `&{ s }` materialises the aggregate through %rdi/%rsi. If the call kept
+    // the earlier argument live in %rdi, the copy would clobber it, so the call
+    // must spill every argument instead of loading each straight into its
+    // argument register. The direct path would emit `mov $7, %rdi`.
+    let out = asm_no_inline("struct S { a: i64, b: i64 } fn first(n: i64, p: &S) -> i64 { n } fn main() -> i64 { let s: S = S { a: 1, b: 2 }; return first(7, &{ s }); }");
+    let call = out.find("call first").expect("a call to first");
+    let setup = &out[..call];
+    assert!(!setup.contains("mov $7, %rdi"), "the argument must not go straight into %rdi");
+    assert!(setup.contains("mov %rbx, %rdi") || setup.contains("mov %r12, %rdi"),
+        "the argument must be held in a callee-saved spill across the copy");
+}
+
+#[test]
+fn indexing_a_reference_to_an_array_uses_the_element_type() {
+    // `&[bool; 2]` must report `bool` as the element type, so `!` on the
+    // element is logical not. With the old i64 fallback the element was treated
+    // as an integer and `!` emitted a bitwise `not`.
+    let out = asm("fn main() -> i64 { let a = [true, false]; let r: &[bool; 2] = &a; let b: bool = !r[0]; return b as i64; }");
+    assert!(out.contains("sete %al"), "`!` on a bool element must be logical not");
+    assert!(!out.contains("not %rax"), "`!` on a bool element must not be a bitwise not");
+}
+
+#[test]
+fn a_constant_array_length_may_use_a_bitwise_operator() {
+    // `[i64; 1 | 2]` is a constant expression, so the length is 3. The bitwise
+    // operators were missing from the constant folder, so the length was
+    // rejected as non-constant. `asm` panics on a compile error, so reaching
+    // the assertions proves the fold succeeded.
+    let out = asm("fn main() -> i64 { let a: [i64; 1 | 2] = [10, 20, 30]; return a[2]; }");
+    assert!(out.contains("main:"), "the array must compile");
+}
+
+#[test]
+fn a_constant_array_length_may_name_a_constant() {
+    let out = asm("const N: i64 = 4; fn main() -> i64 { let a: [i64; N] = [1, 2, 3, 4]; return a[3]; }");
+    assert!(out.contains("main:"), "a named constant length must fold");
 }

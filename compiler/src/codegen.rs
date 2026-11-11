@@ -154,6 +154,11 @@ impl Codegen {
             Expr::Index(b, _) => Self::array_elem_ty(b).and_then(|t| Self::array_len_ty(&t)),
             Expr::Block(b) => b.tail.as_deref().and_then(Self::array_len_of),
             Expr::MatchBoundary(b, _) => b.tail.as_deref().and_then(Self::array_len_of),
+            // A loop expression's value is its `break` value, carried in the
+            // loop's checked result type, not its block tail (which is `()` for
+            // `loop { break a; }`). Missing this let `loop { break a; }[i]` skip
+            // the bounds check on a variable index.
+            Expr::Loop(_, _, lty, _) => Self::array_len_ty(lty),
             Expr::If(_, then, Some(els)) => Self::array_len_of_tail(then)
                 .or_else(|| Self::array_len_of_tail(els)),
             _ => None,
@@ -193,6 +198,10 @@ impl Codegen {
             Expr::MatchBoundary(b, _) => {
                 return b.tail.as_deref().and_then(Self::array_elem_ty)
             }
+            // Mirrors `array_len_of`: a loop expression's value type is its
+            // checked result type, so an element's stride is known wherever its
+            // length is.
+            Expr::Loop(_, _, lty, _) => return Self::array_elem_of_ty(lty),
             Expr::If(_, then, Some(els)) => {
                 return Self::array_elem_ty_tail(then)
                     .or_else(|| Self::array_elem_ty_tail(els))
@@ -1423,9 +1432,17 @@ Expr::PatScrutinee(_) => {
                 let i = self.loop_target(label);
                 let (_, end, slot, _) = self.loops[i].clone();
                 if let Some(e) = v {
-                    // Store the break value into the loop's result slot, then
-                    // leave; the loop expression loads it after `end`.
-                    self.gen_expr_to_slot(e, slot);
+                    // A unit- or `!`-valued loop has no result slot (`-1`), so
+                    // there is nothing to store; writing `off(-1)` would hit the
+                    // saved frame pointer. Still evaluate the expression for its
+                    // side effects, as rustc does.
+                    if slot < 0 {
+                        self.gen_expr(e);
+                    } else {
+                        // Store the break value into the loop's result slot, then
+                        // leave; the loop expression loads it after `end`.
+                        self.gen_expr_to_slot(e, slot);
+                    }
                 }
                 self.line(&format!("jmp {end}"));
             }
@@ -3383,11 +3400,13 @@ Expr::PatScrutinee(_) => {
     }
 
     /// True when evaluating `e` can clobber `%rdi`/`%rsi` without
-    /// `contains_call` noticing. The only such case is copying a whole
-    /// aggregate into a local: the copy runs through `%rdi`/`%rsi`
-    /// (`copy_words_rdi_rsi`), and a block's `let` initialiser can trigger one
-    /// without containing a call, so the direct-argument shortcut must not
-    /// select it.
+    /// `contains_call` noticing. Two cases: copying a whole aggregate into a
+    /// local, which runs through `%rdi`/`%rsi` (`copy_words_rdi_rsi`), and
+    /// `&<aggregate>` with a materialised temporary slot, which copies the
+    /// aggregate into that slot the same way. The walk recurses through every
+    /// expression form, because either can hide inside an operand (`&{ s }`,
+    /// `g(x, &{ s })`) with no call in sight, and the direct-argument shortcut
+    /// must not select such an argument.
     fn clobbers_arg_regs(e: &Expr) -> bool {
         match e {
             Expr::Block(b) | Expr::Loop(b, _, _, _) => Self::block_clobbers(b),
@@ -3396,6 +3415,28 @@ Expr::PatScrutinee(_) => {
                 Self::block_clobbers(t)
                     || els.as_ref().map_or(false, |b| Self::block_clobbers(b))
             }
+            Expr::AddrOf { expr, ty, slot, .. } => {
+                (*slot >= 0 && ty.is_aggregate()) || Self::clobbers_arg_regs(expr)
+            }
+            Expr::Bin(_, a, b) => Self::clobbers_arg_regs(a) || Self::clobbers_arg_regs(b),
+            Expr::Un(_, a) | Expr::Cast(a, _) => Self::clobbers_arg_regs(a),
+            Expr::Index(a, b) => Self::clobbers_arg_regs(a) || Self::clobbers_arg_regs(b),
+            Expr::Field { base, .. } => Self::clobbers_arg_regs(base),
+            Expr::Deref { expr, .. } => Self::clobbers_arg_regs(expr),
+            Expr::Call { args, .. } => args.iter().any(Self::clobbers_arg_regs),
+            Expr::MethodCall { recv, args, .. } => {
+                Self::clobbers_arg_regs(recv) || args.iter().any(Self::clobbers_arg_regs)
+            }
+            Expr::EnumCtor { args, .. } => args.iter().any(Self::clobbers_arg_regs),
+            Expr::StructLit { fields, .. } => {
+                fields.iter().any(|f| Self::clobbers_arg_regs(&f.value))
+            }
+            Expr::ArrayLit(v, _) => Self::clobbers_arg_regs(v),
+            Expr::ArrayList(v) => v.iter().any(Self::clobbers_arg_regs),
+            Expr::VariantTest { scrutinee, .. } | Expr::BoolTest { scrutinee, .. } => {
+                Self::clobbers_arg_regs(scrutinee)
+            }
+            Expr::EnumPayload { recv, .. } => Self::clobbers_arg_regs(recv),
             _ => false,
         }
     }
