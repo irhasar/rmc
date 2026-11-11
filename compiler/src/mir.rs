@@ -3058,27 +3058,19 @@ fn normalize_fmt_struct(name: &str) -> &str {
 /// adds a phantom tag word and shifts every field by one, which silently
 /// corrupts the value.
 fn is_enum_variant_name(name: &str) -> bool {
-    match name.rfind("::<") {
-        None => {
-            // No generics. `Enum::Variant` has a type-cased segment before the
-            // last (`core::option::Option::Some`, `b::E::B`), while a struct the
-            // printer qualified by its module has a lowercase one there
-            // (`a::A`, `outer::inner::C`). Treating the latter as a variant adds
-            // a phantom tag word and shifts every field by one.
-            let mut segs = name.rsplit("::");
-            let _last = segs.next();
-            match segs.next() {
-                Some(penult) => penult
-                    .trim()
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_uppercase()),
-                // The caller only reaches here when the name contains `::`.
-                None => true,
-            }
-        }
-        Some(i) => name[i + 3..].contains("::"),
-    }
+    // Strip the generics first, so a generic struct (`G::<T>`, or a type
+    // argument that itself contains `::`) reduces to its path and cannot be
+    // mistaken for a variant on the strength of a `::` inside its arguments. An
+    // enum variant keeps a real segment after the type, so
+    // `Option::<i64>::Some` reduces to `Option::Some` and stays a variant.
+    let base = strip_generics(name);
+    let Some(i) = base.rfind("::") else { return false };
+    // `Enum::Variant`: the segment before the last is type-cased
+    // (`core::option::Option::Some`, `b::E::B`), while a struct the printer
+    // qualified by its module has a lowercase one (`a::A`, `outer::inner::C`).
+    let prefix = &base[..i];
+    let penult = prefix.rsplit("::").next().unwrap_or(prefix).trim();
+    penult.chars().next().is_some_and(|c| c.is_ascii_uppercase())
 }
 
 /// The receiver type of a method's `_1` argument (`_1: &mut Guard` ->
