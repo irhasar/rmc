@@ -1564,9 +1564,7 @@ impl<'a> FnGen<'a> {
     /// promotion would keep a stale copy across the call.
     fn reg_pool(&self) -> Vec<&'static str> {
         let mut pool: Vec<&'static str> = PROMOTE_REGS.to_vec();
-        if !self.allocates {
-            pool.extend_from_slice(&CALLER_REGS);
-        }
+        pool.extend_from_slice(&CALLER_REGS);
         pool
     }
 
