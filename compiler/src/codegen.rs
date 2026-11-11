@@ -817,6 +817,7 @@ impl Codegen {
             .collect()
     }
 
+
     /// Fold a loop's own counts into the running total at `LOOP_W`, saturating so
     /// a deeply nested loop cannot overflow the counter and wrap a hot local to
     /// the bottom of the ranking.
@@ -1327,15 +1328,22 @@ Expr::PatScrutinee(_) => {
                             }
                         } else {
                             match self.field_operand(base, *offset) {
-                                Some(op) => match self.simple_operand(value) {
-                                    Some(v) if v.starts_with('%') || v.starts_with('$') => {
-                                        self.store_operand(&v, &op);
+                                Some(op) => {
+                                    // `field += x` folds into one read-modify-write
+                                    // `add`/`sub`, the shape of a running total.
+                                    if self.gen_mem_accumulate(&op, value) {
+                                        return;
                                     }
-                                    _ => {
-                                        self.gen_expr(value);
-                                        self.line(&format!("mov %rax, {op}"));
+                                    match self.simple_operand(value) {
+                                        Some(v) if v.starts_with('%') || v.starts_with('$') => {
+                                            self.store_operand(&v, &op);
+                                        }
+                                        _ => {
+                                            self.gen_expr(value);
+                                            self.line(&format!("mov %rax, {op}"));
+                                        }
                                     }
-                                },
+                                }
                                 None => self.store_through_addr(target, value, Some(0)),
                             }
                         }
@@ -2443,6 +2451,51 @@ Expr::PatScrutinee(_) => {
         if dst != "%rax" {
             self.line(&format!("mov %rax, {dst}"));
         }
+    }
+
+    /// Fold `field += a - b + ...` into a run of read-modify-write `add`/`sub`
+    /// against the field's memory operand, when the chain's base term is the
+    /// field itself. The generic path loads the field, evaluates the whole sum
+    /// in registers and stores it back; this keeps the running total in memory
+    /// and touches each term once, which is the shape of an accumulator or a
+    /// counter field in a hot loop. Only a register or immediate term folds
+    /// into the instruction: a memory term would need `add mem, mem`, which is
+    /// not an instruction, and could alias the field being written, so such a
+    /// value falls back to the generic path. Overflow checks are also left to
+    /// the generic path, where each `add` gets its own `jo`.
+    fn gen_mem_accumulate(&mut self, op: &str, value: &Expr) -> bool {
+        if self.overflow {
+            return false;
+        }
+        let mut terms: Vec<(bool, &Expr)> = Vec::new();
+        Self::flatten_chain(value, false, &mut terms);
+        let (base_sub, first) = terms[0];
+        let first_is_target = matches!(
+            first,
+            Expr::Field { base, offset, .. }
+                if self.field_operand(base, *offset).as_deref() == Some(op)
+        );
+        if base_sub || !first_is_target {
+            return false;
+        }
+        // Resolve every term before emitting anything, so a term that cannot
+        // fold bails out without a half-written chain.
+        let mut plan: Vec<(bool, String)> = Vec::new();
+        for (is_sub, term) in &terms[1..] {
+            match self.simple_operand(term) {
+                Some(src) if !src.contains('(') => plan.push((*is_sub, src)),
+                _ => return false,
+            }
+        }
+        for (is_sub, src) in plan {
+            let m = if is_sub { "sub" } else { "add" };
+            // An immediate operand needs an explicit 64-bit width: `as` reads a
+            // suffixless `add $imm, mem` as a 32-bit add, which would truncate.
+            // A register operand names its own width, so it needs no suffix.
+            let m = if src.starts_with('$') { format!("{m}q") } else { m.to_string() };
+            self.line(&format!("{m} {src}, {op}"));
+        }
+        true
     }
 
     /// Fold `dst = dst + a + b - c + ...` into one `add`/`sub` per term, when
@@ -3654,3 +3707,4 @@ fn setcc_cc(op: BinOp) -> Option<&'static str> {
         _ => return None,
     })
 }
+

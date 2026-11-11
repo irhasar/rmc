@@ -6203,6 +6203,46 @@ fn a_wrapping_mul_receiver_is_copied_before_a_mutating_argument() {
 }
 
 #[test]
+fn a_pure_wrapping_mul_argument_keeps_the_receiver_in_its_slot() {
+    // A pure argument cannot write the receiver's slot, so the receiver needs
+    // no snapshot: `i.wrapping_mul(2654435761)` reads `i` directly instead of
+    // copying it into a temporary every iteration.
+    let out = asm_no_inline(
+        "fn main() -> i64 { let mut i: i64 = 7; let r = i.wrapping_mul(2654435761); return r; }",
+    );
+    let body = &out[out.find("main:").expect("main")..];
+    assert!(!body.contains("\u{0}im"), "no receiver temp is introduced:\n{body}");
+    assert!(body.contains("imul"), "the product is still computed:\n{body}");
+}
+
+#[test]
+fn a_field_accumulation_is_a_read_modify_write() {
+    // `a.sum += v` through a `&mut` receiver folds into one `add %v, off(%rbx)`
+    // rather than a load, an add and a store, keeping the running total in the
+    // field (which cannot be promoted, since the pointer escapes).
+    let out = asm_no_inline(
+        "struct A { sum: i64, k: i64 } \
+         fn bump(a: &mut A, v: i64) { a.sum += v; a.k += 1; } \
+         fn main() -> i64 { let mut a = A { sum: 0, k: 0 }; bump(&mut a, 5); return a.sum; }",
+    );
+    let (_, body) = fn_bodies(&out).into_iter().find(|(n, _)| n == "bump").unwrap();
+    assert!(body.contains("add %r"), "expected a read-modify-write add:\n{body}");
+}
+
+#[test]
+fn an_immediate_field_accumulation_is_64_bit() {
+    // An immediate operand needs the `q` suffix; without it `as` assembles a
+    // 32-bit add and truncates the field's high half.
+    let out = asm_no_inline(
+        "struct A { sum: i64, k: i64 } \
+         fn bump(a: &mut A) { a.k += 1; } \
+         fn main() -> i64 { let mut a = A { sum: 0, k: 0 }; bump(&mut a); return a.k; }",
+    );
+    let (_, body) = fn_bodies(&out).into_iter().find(|(n, _)| n == "bump").unwrap();
+    assert!(body.contains("addq $1,"), "expected a 64-bit immediate add:\n{body}");
+}
+
+#[test]
 fn a_vec_i64_pointer_add_steps_whole_elements() {
     // `add(off)` advances by `off` elements, so a `Vec<i64>` pointer steps eight
     // bytes per unit: `base.add(3)` is `base + 3 * 8`. The scaling `lea` is
