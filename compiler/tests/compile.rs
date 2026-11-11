@@ -5437,6 +5437,19 @@ fn a_block_const_of_an_unsupported_type_is_rejected() {
 }
 
 #[test]
+fn a_let_shadowing_a_block_const_is_rejected() {
+    // rustc E0530: a local binding may not shadow a constant. sema checks this
+    // for a top-level constant; a block-scoped one is folded in the parser, so
+    // the parser must reject it.
+    let err = compile_to_asm(
+        "fn main() { const N: i64 = 5; let N = 3; println!(\"{}\", N); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("shadows a constant"), "got: {err}");
+}
+
+#[test]
 fn a_value_loop_binds_its_break_value() {
     // `loop` is an expression: the `break` value is stored into the loop's
     // result slot, which the code after the loop reads.

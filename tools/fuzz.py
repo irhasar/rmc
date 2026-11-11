@@ -2990,6 +2990,11 @@ def reject_corpus():
         # `str` constant is unsized in rustc (E0277), and rmc folds only `i64`,
         # `bool` and `char`, so it must reject the item rather than skip it.
         "block_const_str_type": "fn main() { const S: str = \"hi\"; println!(\"{}\", 1); }\n",
+        # A `let` may not shadow a constant (rustc E0530). sema checks this for a
+        # top-level constant; a block-scoped one is folded in the parser, so the
+        # check must happen there too.
+        "let_shadows_block_const": "fn main() { const N: i64 = 5; let N = 3; println!(\"{}\", N); }\n",
+        "let_mut_shadows_block_const": "fn main() { const N: i64 = 5; let mut N = 3; println!(\"{}\", N); }\n",
     }
 
 

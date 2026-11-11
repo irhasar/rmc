@@ -2491,6 +2491,18 @@ impl Parser {
                     return Ok(());
                 }
                 let name = self.expect_ident()?;
+                // A `let` may not shadow a constant (rustc E0530). sema enforces
+                // this for a top-level constant, but a block-scoped one is folded
+                // at parse time and never reaches sema, so enforce it here too.
+                if self.consts.contains_key(&name)
+                    || self.const_bools.contains_key(&name)
+                    || self.const_chars.contains_key(&name)
+                {
+                    return Err(format!(
+                        "at byte {}: identifier `{name}` shadows a constant of the same name",
+                        self.pos()
+                    ));
+                }
                 // A `Vec<T>` annotation leaves its element width in
                 // `vec_elem_pending`; consume it here so it is bound to this
                 // name, and clear it for every other annotation.
