@@ -837,7 +837,18 @@ impl Sema {
         }
 
         let mut stmts = Vec::new();
-        let x = bind(self, recv, &mut stmts);
+        // A method evaluates and copies its scalar receiver before its
+        // arguments, so an argument that writes the receiver's slot must not
+        // change the value the desugaring reads. `bind` leaves a plain variable
+        // as a direct read of its slot, so force a snapshot temporary when the
+        // method takes an argument that could mutate it (`div_euclid`/
+        // `rem_euclid` force the receiver unconditionally further down, for the
+        // overflow lint). A literal receiver cannot be mutated, and any other
+        // shape already gets a temporary from `bind`.
+        let x = match recv {
+            Expr::Var { .. } if !args.is_empty() => self.force_temp(recv, &mut stmts),
+            other => bind(self, other, &mut stmts),
+        };
         let (body, ty) = match name {
             "abs" => {
                 if !args.is_empty() {

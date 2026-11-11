@@ -59,6 +59,7 @@ python3 tools/fuzz.py --mode intmeth --n 500 --seed 1
 python3 tools/fuzz.py --mode nestedfn --n 500 --seed 1
 python3 tools/fuzz.py --mode typealias --n 500 --seed 1
 python3 tools/fuzz.py --mode printfmt --n 500 --seed 1
+python3 tools/fuzz.py --mode ptr --n 500 --seed 1
 python3 tools/fuzz.py --mode char --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 
@@ -1549,8 +1550,13 @@ The checks, all in `sema.rs`:
   Each desugar reads an operand more than once, so every non-trivial operand is
   first bound to a fresh `\0im<n>` temporary (`Sema::tmp`), receiver before
   argument — `g().abs()` calls `g` once, as rustc does; a plain variable or
-  literal is reused directly. The euclidean *receiver* instead goes through
-  `Sema::force_temp`, which binds it even when it is a plain variable or
+  literal is reused directly. A method with an argument snapshots a *variable*
+  receiver into a temp too, even though `bind` would leave it as a direct read:
+  rustc evaluates and copies the scalar receiver before its arguments, so
+  `x.min({ x = 9; 7 })` must compare against the original `x` (5), not the value
+  the argument's block wrote. A literal receiver cannot be mutated, and any
+  other receiver shape already gets a temp. The euclidean *receiver* instead goes
+  through `Sema::force_temp`, which binds it even when it is a plain variable or
   literal: a literal or a const-tracked variable would let the synthesized
   `x / y` (or the dead `r - y` arm) fold and trip the overflow lint on
   `MIN.div_euclid(-1)` / `7.rem_euclid(MIN)` — programs rustc accepts, since it
@@ -1809,7 +1815,8 @@ There is no `Vec`, but the parser folds the few shapes the corpus uses to an
 `i64` address: `Vec::with_capacity(k)`/`Vec::new()` become `alloc(k * 8)`,
 `vec![e; n]` becomes `alloc(n * 8)` plus a `__rmc_fill`, `v.capacity()`/`v.len()`
 fold to the constant count, and `v.as_mut_ptr()` keeps the address so a later
-`.add(off)` is plain pointer arithmetic. Each shape is recognised only directly
+`.add(off)` is `p + off * elem`, scaling by the element width from the `Vec<T>`
+annotation (`Vec<u8>` stays byte-addressed). Each shape is recognised only directly
 in a `let` initializer; anywhere else the `\0`-prefixed parser marker reaches
 sema, which reports the source construct (see the `\0vecnew` arm). An
 args-vector is never built: `std::env::args()...collect()` records the binding,

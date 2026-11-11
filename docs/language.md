@@ -801,11 +801,13 @@ with a length or capacity field, so only the methods below are understood.
 | `let v: Vec<i64> = Vec::with_capacity(k);` | `alloc(k * 8)`; `v.capacity()` is `k`  |
 | `let v: Vec<u8> = vec![e; n];`      | `alloc(n * 8)` filled by `__rmc_fill`         |
 | `v.len()` (constant `n`)            | `n`                                           |
-| `v.as_mut_ptr()` / `v.as_ptr()`     | the address; a following `.add(off)` is `p + off` |
+| `v.as_mut_ptr()` / `v.as_ptr()`     | the address; a following `.add(off)` is `p + off * elem` |
 | `let a: Vec<i64> = std::env::args().skip(k).map(..).collect();` | no allocation at all (see below) |
 
 `vec![e; n]` takes a runtime `n`; `alloc` and `__rmc_fill` both take it as a
-value. A `vec![a, b, c]` list form is rejected. An args-vector is never
+value. A `vec![a, b, c]` list form is rejected. `add(off)` scales `off` by the
+element width taken from the `Vec<T>` annotation, so a `Vec<i64>` pointer steps
+a whole word while a `Vec<u8>` stays byte-addressed. An args-vector is never
 materialised: `for v in &args` desugars to `for i in k..__rmc_nargs()` and
 `args[i]` to `__rmc_arg_or(i + k, 0)`, so `*v` in the loop body is the `i64`
 argument itself. Each of these constructs is only recognised directly in a

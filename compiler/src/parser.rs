@@ -115,9 +115,20 @@ pub struct Parser {
     /// `v.len()`.
     vec_len: std::collections::HashMap<String, i64>,
     /// Names holding a raw pointer (an `i64` address) taken by `.as_mut_ptr()`
-    /// or `.as_ptr()`. A `.add(off)` on one is the address arithmetic
-    /// `ptr + off`, matching the raw-pointer method.
-    ptr_vars: std::collections::HashSet<String>,
+    /// or `.as_ptr()`, mapped to the byte stride of one element. A `.add(off)`
+    /// on one is `ptr + off * stride`, matching the raw-pointer method: `add`
+    /// advances by whole elements, so a `Vec<i64>` pointer steps eight bytes
+    /// while a `Vec<u8>` one steps one.
+    ptr_vars: std::collections::HashMap<String, i64>,
+    /// The element byte width of each `Vec` binding, taken from its `Vec<T>`
+    /// annotation. A pointer derived from the binding inherits it as its
+    /// stride. rmc stores every element in a word, so an absent or unrecognised
+    /// element type defaults to eight.
+    vec_elem: std::collections::HashMap<String, i64>,
+    /// The element width of the most recently parsed `Vec<T>` type, so the
+    /// `let` that consumes the type can record it against the binding name.
+    /// Only `Vec` bindings read it, and they always follow their annotation.
+    vec_elem_pending: Option<i64>,
 }
 
 /// The deepest expression, block or type nesting the parser accepts. Deeply
@@ -171,7 +182,9 @@ impl Parser {
             vec_names: std::collections::HashSet::new(),
             vec_cap: std::collections::HashMap::new(),
             vec_len: std::collections::HashMap::new(),
-            ptr_vars: std::collections::HashSet::new(),
+            ptr_vars: std::collections::HashMap::new(),
+            vec_elem: std::collections::HashMap::new(),
+            vec_elem_pending: None,
         }
     }
 
@@ -1157,6 +1170,14 @@ impl Parser {
                         ));
                     }
                     self.i += 1; // `<`
+                    // The element type fixes the pointer stride for a later
+                    // `.add(off)`, so read its name before the alias map
+                    // collapses `u8` to `i64`; `size_of::<T>()` is what rustc
+                    // scales `add` by.
+                    let width = match self.peek() {
+                        Some(Tok::Ident(t)) => elem_byte_width(t),
+                        _ => 8,
+                    };
                     let mut depth = 1i32;
                     while depth > 0 {
                         match self.peek() {
@@ -1172,6 +1193,7 @@ impl Parser {
                         }
                         self.i += 1;
                     }
+                    self.vec_elem_pending = Some(width);
                     return Ok(Type::Named("Vec".into()));
                 }
                 // An alias is transparent: a use is rewritten to its target here,
@@ -1902,10 +1924,19 @@ impl Parser {
                     return Ok(());
                 }
                 let name = self.expect_ident()?;
+                // A `Vec<T>` annotation leaves its element width in
+                // `vec_elem_pending`; consume it here so it is bound to this
+                // name, and clear it for every other annotation.
                 let ty = if self.eat(&Tok::Colon) {
                     Some(self.parse_type()?)
                 } else {
                     None
+                };
+                let elem_width = if matches!(ty, Some(Type::Named(ref n)) if n == "Vec") {
+                    self.vec_elem_pending.take().unwrap_or(8)
+                } else {
+                    self.vec_elem_pending = None;
+                    8
                 };
                 let init = if self.eat(&Tok::Eq) {
                     Some(self.parse_expr()?)
@@ -1941,6 +1972,7 @@ impl Parser {
                         // time and `__rmc_fill` takes the count as a value.
                         let count = eval_i64(&n_expr, &self.consts);
                         self.vec_names.insert(name.clone());
+                        self.vec_elem.insert(name.clone(), elem_width);
                         if let Some(c) = count {
                             self.vec_len.insert(name.clone(), c);
                             if m == "\u{0}vecnew" {
@@ -1989,10 +2021,18 @@ impl Parser {
                         ));
                     }
                     // `let p = base.as_mut_ptr();`: `base` is a `Vec` address, so
-                    // `p` holds that same address. Record it a raw pointer so a
-                    // later `p.add(off)` folds to address arithmetic.
+                    // `p` holds that same address. Record it a raw pointer, with
+                    // the element stride of `base`, so a later `p.add(off)`
+                    // scales `off` by the element width (`add` steps whole
+                    // elements, not bytes).
                     if m == "\u{0}ptr" {
-                        self.ptr_vars.insert(name.clone());
+                        let stride = match &args[0] {
+                            Expr::Var { name: base, .. } => {
+                                self.vec_elem.get(base).copied().unwrap_or(8)
+                            }
+                            _ => 8,
+                        };
+                        self.ptr_vars.insert(name.clone(), stride);
                         out.push(Stmt::Let {
                             name,
                             ty: Some(Type::I64),
@@ -3153,9 +3193,21 @@ impl Parser {
                             };
                             continue;
                         }
-                        if name == "add" && args.len() == 1 && self.ptr_vars.contains(recv) {
+                        if name == "add" && args.len() == 1 && self.ptr_vars.contains_key(recv) {
+                            let stride = self.ptr_vars[recv];
                             let recv_expr = e.clone();
-                            e = Expr::Bin(BinOp::Add, Box::new(recv_expr), Box::new(args.pop().unwrap()));
+                            let mut off = args.pop().unwrap();
+                            // `add(off)` advances by `off` whole elements, so
+                            // scale by the element width. A byte-strided
+                            // pointer (`Vec<u8>`) keeps the offset untouched.
+                            if stride != 1 {
+                                off = Expr::Bin(
+                                    BinOp::Mul,
+                                    Box::new(off),
+                                    Box::new(Expr::Int(stride)),
+                                );
+                            }
+                            e = Expr::Bin(BinOp::Add, Box::new(recv_expr), Box::new(off));
                             continue;
                         }
                     }
@@ -5262,6 +5314,18 @@ fn is_int_width(s: &str) -> bool {
         "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
             | "u8" | "u16" | "u32" | "u64" | "u128" | "usize"
     )
+}
+
+/// The byte width of one `Vec<T>` element named `t`, the stride a `.add(off)`
+/// scales by. rmc stores every element in one 8-byte slot (see `alloc`/
+/// `__rmc_fill`), so an element steps a whole word — except the byte types
+/// `u8`/`i8`, which the corpus uses as a raw byte arena and which therefore
+/// stay byte-addressed.
+fn elem_byte_width(t: &str) -> i64 {
+    match t {
+        "u8" | "i8" => 1,
+        _ => 8,
+    }
 }
 
 /// The value of an integer-width associated constant (`i32::MAX`, `u8::BITS`),

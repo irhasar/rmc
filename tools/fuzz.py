@@ -55,7 +55,11 @@ Modes:
           `rem_euclid`/`is_positive`/`is_negative`) over `argv`-sourced
           operands, so `i64::MIN`, `-1`, `0` and `1` are all reachable and the
           receiver's single evaluation and the tie/overflow behaviour are
-          compared against `rustc -O`
+          compared against `rustc -O`, including a mutating argument that must
+          not change the receiver's copied value
+    ptr   `Vec` raw-pointer arithmetic: `add(off)` on a `Vec<i64>` pointer steps
+          whole elements while a `Vec<u8>` arena stays byte-addressed, so a
+          wrong stride collapses the writes and the printed sums diverge
     robust
           a fixed set of adversarial inputs (random bytes, deep nesting, long
           chains), each of which must error cleanly rather than crash
@@ -1712,8 +1716,8 @@ def gen_intmeth_program(rng):
     exprs.append("(MIN).rem_euclid(MIN)")
     exprs.append("(MAX).div_euclid(-2)")
     exprs.append("(MAX).rem_euclid(-2)")
-    exprs.append("(7).div_euclid(MIN)")
-    exprs.append("(7).rem_euclid(MIN)")
+    exprs.append("(7i64).div_euclid(MIN)")
+    exprs.append("(7i64).rem_euclid(MIN)")
     # `clamp`'s three outcomes pinned: below the low bound, above the high
     # bound, and inside; the low/high tie returns the bound; `MIN`/`MAX` as
     # bounds exercise the comparisons at the i64 edges.
@@ -1728,8 +1732,8 @@ def gen_intmeth_program(rng):
     exprs.append("(MIN).clamp(MAX, MAX)")
     exprs.append("(MAX).clamp(MIN, MIN)")
     # Zero is neither positive nor negative.
-    exprs.append("(0).is_positive() as i64")
-    exprs.append("(0).is_negative() as i64")
+    exprs.append("(0i64).is_positive() as i64")
+    exprs.append("(0i64).is_negative() as i64")
     # The bit methods, pinned at the edges: `ZERO` is all zeros (64 leading and
     # trailing zeros, no set bits), `MIN` has one bit set at the top, `MAX` has
     # 63 set bits and one leading zero, and `ONES` is all ones. Named consts,
@@ -1789,6 +1793,90 @@ def gen_intmeth_program(rng):
     ]
     for e in exprs:
         rs.append(f'    println!("{{}}", {e});')
+    # A method evaluates and copies its scalar receiver before its arguments, so
+    # an argument that writes the receiver's slot must not change the value the
+    # method sees. Each call gets its own `x = 5` (a fresh block scope), and the
+    # argument writes 9 while yielding a value that makes the two orders differ
+    # (`min(5, 7)` is 5, `min(9, 7)` is 7); the receiver is printed after the
+    # call so a lost write shows up too.
+    cases = [
+        "x.min({ x = 9; 7 })",
+        "x.max({ x = 9; 7 })",
+        "x.clamp({ x = 9; 0 }, { x = 9; 9 })",
+        "x.midpoint({ x = 9; 1 })",
+        "x.rotate_left({ x = 9; 1 })",
+        "x.rotate_right({ x = 9; 1 })",
+        "x.wrapping_mul({ x = 9; 2 })",
+        "x.div_euclid({ x = 9; 2 })",
+        "x.rem_euclid({ x = 9; 2 })",
+    ]
+    for e in cases:
+        rs.append("{")
+        rs.append("    let mut x: i64 = 5;")
+        rs.append(f'    println!("{{}} {{}}", {e}, x);')
+        rs.append("}")
+    # A randomized call whose argument writes the receiver, likewise scoped so
+    # the receiver starts at 5 whatever the previous case left behind.
+    m = rng.choice(["min", "max", "midpoint", "wrapping_mul", "rotate_left"])
+    v = rng.randint(0, 9)
+    rs.append("{")
+    rs.append("    let mut x: i64 = 5;")
+    rs.append(f'    println!("{{}} {{}}", x.{m}({{ x = {v}; 3 }}), x);')
+    rs.append("}")
+    rs.append("}")
+    return "\n".join(rs) + "\n"
+
+
+def gen_ptr_program(rng):
+    """`Vec` raw-pointer arithmetic. `add(off)` steps whole elements, so a
+    `Vec<i64>` pointer advances eight bytes per unit; a byte stride makes
+    element `k` alias element `8k`, so the writes collapse and the sum is wrong.
+    A `Vec<u8>` arena is byte-addressed, so the same loop with a 16-byte node
+    stride must still round-trip.
+    """
+    n = rng.randint(1, 24)
+    k = rng.randint(1, 9)
+    rs = ["fn main() {"]
+    # `Vec<i64>`: element `i` holds `i * k`; the sum is the arithmetic series.
+    rs += [
+        f"    let n: i64 = {n};",
+        "    let mut v: Vec<i64> = vec![0i64; n as usize];",
+        "    let base = v.as_mut_ptr();",
+        "    let mut i: i64 = 0;",
+        "    while i < n {",
+        f"        let p = unsafe {{ base.add(i as usize) }} as *mut i64;",
+        f"        unsafe {{ *p = i * {k}; }}",
+        "        i += 1;",
+        "    }",
+        "    let mut sum: i64 = 0;",
+        "    let mut i: i64 = 0;",
+        "    while i < n {",
+        "        let p = unsafe { base.add(i as usize) } as *mut i64;",
+        "        sum += unsafe { *p };",
+        "        i += 1;",
+        "    }",
+        '    println!("{}", sum);',
+    ]
+    # `Vec<u8>` used as a raw byte arena: the pointer stays byte-addressed, so a
+    # `16`-byte node stride keeps every node disjoint and the sum matches.
+    rs += [
+        "    let mut arena: Vec<u8> = vec![0u8; n as usize * 16];",
+        "    let abase = arena.as_mut_ptr();",
+        "    let mut j: i64 = 0;",
+        "    while j < n {",
+        f"        let q = unsafe {{ abase.add(j as usize * 16) }} as *mut i64;",
+        f"        unsafe {{ *q = j * {k}; }}",
+        "        j += 1;",
+        "    }",
+        "    let mut asum: i64 = 0;",
+        "    let mut j: i64 = 0;",
+        "    while j < n {",
+        "        let q = unsafe { abase.add(j as usize * 16) } as *mut i64;",
+        "        asum += unsafe { *q };",
+        "        j += 1;",
+        "    }",
+        '    println!("{}", asum);',
+    ]
     rs.append("}")
     return "\n".join(rs) + "\n"
 
@@ -2917,7 +3005,7 @@ def gen_typealias_program(rng):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "intmeth", "nestedfn", "typealias", "printfmt", "char", "robust", "reject", "mutate"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "intmeth", "nestedfn", "typealias", "printfmt", "ptr", "char", "robust", "reject", "mutate"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -2974,6 +3062,7 @@ def main():
            "nestedfn": gen_nestedfn_program,
            "typealias": gen_typealias_program,
            "printfmt": gen_printfmt_program,
+           "ptr": gen_ptr_program,
            "char": gen_char_program}[args.mode]
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus

@@ -5894,6 +5894,83 @@ fn a_side_effecting_min_argument_is_evaluated_once() {
 }
 
 #[test]
+fn a_min_receiver_is_copied_before_a_mutating_argument() {
+    // Rust evaluates and copies the scalar receiver before the arguments, so
+    // `x.min({ x = 9; 7 })` compares the argument against the *original* `x`
+    // (5), not the value the argument's block wrote. The receiver must be
+    // snapshotted into a temporary first; leaving it as a read of its slot
+    // would let the write leak in. The snapshot is a `mov` of `x` before the
+    // `mov $9` that writes it.
+    let out = asm_no_inline(
+        "fn main() -> i64 { let mut x: i64 = 5; let r = x.min({ x = 9; 7 }); return r; }",
+    );
+    let body = &out[out.find("main:").expect("main")..];
+    let snap = body.find("mov %rbx, %r12").expect("receiver snapshot:\n");
+    let write = body.find("mov $9, %rbx").expect("the argument write:\n");
+    assert!(snap < write, "the receiver must be copied before the argument runs:\n{body}");
+}
+
+#[test]
+fn a_wrapping_mul_receiver_is_copied_before_a_mutating_argument() {
+    // `wrapping_mul` is `*` with the trap suppressed; it reads the receiver as
+    // a multiplicand, so it must snapshot it too. `x.wrapping_mul({ x = 9; 2 })`
+    // is `5 * 2`, not `9 * 2`.
+    let out = asm_no_inline(
+        "fn main() -> i64 { let mut x: i64 = 5; let r = x.wrapping_mul({ x = 9; 2 }); return r; }",
+    );
+    let body = &out[out.find("main:").expect("main")..];
+    let snap = body.find("mov %rbx, %r12").expect("receiver snapshot:\n");
+    let write = body.find("mov $9, %rbx").expect("the argument write:\n");
+    assert!(snap < write, "the receiver must be copied before the argument runs:\n{body}");
+}
+
+#[test]
+fn a_vec_i64_pointer_add_steps_whole_elements() {
+    // `add(off)` advances by `off` elements, so a `Vec<i64>` pointer steps eight
+    // bytes per unit: `base.add(3)` is `base + 3 * 8`. The scaling `lea` is
+    // emitted once for the allocation size (`n * 8`) and once more for the
+    // offset, so two of them appear; the offset add then takes a register
+    // operand rather than the immediate `3`.
+    let out = asm_no_inline(
+        "fn main() -> i64 { \
+             let v: Vec<i64> = vec![0i64; 8]; \
+             let base = v.as_mut_ptr(); \
+             let p = unsafe { base.add(3) } as *mut i64; \
+             return unsafe { *p }; \
+         }",
+    );
+    let body = &out[out.find("main:").expect("main")..];
+    assert_eq!(
+        body.matches("lea 0(,%rax,8), %rax").count(),
+        2,
+        "expected the offset to be scaled by eight:\n{body}"
+    );
+    assert!(body.contains("add %rcx, %rax"), "expected the scaled add:\n{body}");
+}
+
+#[test]
+fn a_vec_u8_pointer_add_steps_single_bytes() {
+    // A `Vec<u8>` is a raw byte arena in rmc, so its pointer keeps a one-byte
+    // stride: `base.add(3)` is `base + 3`. Only the allocation size contributes
+    // a scaling `lea`, and the offset add keeps its immediate `3`.
+    let out = asm_no_inline(
+        "fn main() -> i64 { \
+             let v: Vec<u8> = vec![0u8; 8]; \
+             let base = v.as_mut_ptr(); \
+             let p = unsafe { base.add(3) } as *mut i64; \
+             return unsafe { *p }; \
+         }",
+    );
+    let body = &out[out.find("main:").expect("main")..];
+    assert_eq!(
+        body.matches("lea 0(,%rax,8), %rax").count(),
+        1,
+        "a byte pointer must not scale the offset:\n{body}"
+    );
+    assert!(body.contains("add $3, %rax"), "expected a one-byte stride:\n{body}");
+}
+
+#[test]
 fn is_positive_and_is_negative_evaluate_the_receiver_once() {
     // `is_negative` desugars to a comparison, which reads the receiver once,
     // but it still goes through the temp-binding path so a call receiver is
