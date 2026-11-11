@@ -6684,7 +6684,13 @@ fn counted_loop_mir(exit_reads_cmp: bool, reversed: bool) -> rmc::mir::Program {
         BasicBlock { stmts: vec![assign(0, exit_val)], term: Terminator::Return },
     ];
     Program {
-        funcs: vec![Function { name: "main".into(), locals: decl(6), blocks, consts: Default::default() }],
+        funcs: vec![Function {
+            name: "main".into(),
+            module: String::new(),
+            locals: decl(6),
+            blocks,
+            consts: Default::default(),
+        }],
         allocs: Default::default(),
         consts: Default::default(),
         promoted: Default::default(),
