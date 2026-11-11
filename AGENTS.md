@@ -349,6 +349,14 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   and no codegen; its value is substituted at every use. An immutable `static`
   is parsed by `parse_static` and lowered to the same `ConstDef`, so it shares
   this path; `static mut` is rejected, since rmc has no mutable global.
+  A `const`/immutable-`static` declared inside a block is folded by
+  `scan_block_consts` when the block begins (rustc hoists block items), so it is
+  in scope for the whole block and shadows an outer one until the block ends.
+  Because such a constant never reaches sema, the parser must enforce the checks
+  sema applies to a top-level one: `fold_const_item` resolves the declared type
+  and requires a foldable kind (a block-scoped `const S: str` is rejected like a
+  top-level one), and `reject_const_shadow` rejects a `let`/`@`/struct-field
+  binding that reuses the name (rustc's `E0530`).
 - `compiler/src/inline.rs` — AST inlining of small, call-free, scalar functions
   (a loop is allowed, an early exit is not), run after sema and before codegen.
   See the inlining gotcha below.

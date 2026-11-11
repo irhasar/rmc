@@ -373,8 +373,10 @@ fn main() {
 ```
 
 A local binding may not reuse a constant's name (rustc's `E0530`), whether it is
-a `let`, a parameter or a `for` variable. A `const` and a function share a
-namespace, so giving both the same name is an error (rustc's `E0428`).
+a `let`, a parameter, a `for` variable, an `@` binding or a struct-pattern
+field. The check covers a block-scoped constant too, not only a top-level one. A
+`const` and a function share a namespace, so giving both the same name is an
+error (rustc's `E0428`).
 
 An immutable `static NAME: TYPE = EXPR;` (optionally `pub`) is lowered to a
 `const`: rmc has no mutable global storage, so a `static` has the same fold-and-
