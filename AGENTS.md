@@ -2088,12 +2088,16 @@ the next instruction reads the flags it sets (`flags_used_by`). Measured on the
 
 ## Pushing
 
-`git push origin <branch>` works with the `GITHUB_TOKEN` in this environment.
-An earlier note here claimed the token was read-only (`403 Resource not
-accessible by integration` on `receive-pack`); that is no longer true — pushes
-to `rmc-1-core` through `rmc-4-patterns` succeed. If a push is ever refused,
-check `git ls-remote` first before concluding the token lacks `contents: write`,
-and never persist a token in `.git/config` or a file.
+`git push origin <branch>` needs a token with `contents: write`. The
+`GITHUB_TOKEN` in this environment is sometimes such a token — pushes to
+`rmc-1-core` through `rmc-4-patterns` have succeeded — and sometimes a
+read-only GitHub App installation token (`ghu_` prefix, empty
+`x-oauth-scopes`), which fetches fine but answers every write with `403
+Resource not accessible by integration` on `receive-pack` and on the git-refs
+API alike. The repo permission list can still read `push: true` for the app's
+own account, so that is not a reliable signal. Check `git ls-remote` first,
+then try the push; if it 403s, leave the commits local and report the block
+rather than retrying. Never persist a token in `.git/config` or a file.
 
 ## PR branch stack
 
