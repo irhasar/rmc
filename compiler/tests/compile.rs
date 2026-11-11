@@ -94,12 +94,17 @@ fn a_constant_assignment_stores_straight_to_the_frame() {
 
 #[test]
 fn a_register_initialiser_stores_straight_to_the_frame() {
-    // `q.x` is promoted to `%rbx`; copying it into `a`, whose address is taken,
-    // is one `mov %rbx, off(%rbp)`, not `mov %rbx, %rax; mov %rax, off(%rbp)`.
+    // `q.x` is promoted to a callee-saved register; copying it into `a`, whose
+    // address is taken, is one `mov %rXX, off(%rbp)`, not `mov %rXX, %rax; mov
+    // %rax, off(%rbp)`. Which register holds `q.x` depends on the promotion
+    // ranking, so accept any callee-saved one.
     let out = asm(
         "struct P { x: i64, y: i64 } fn main() -> i64 { let mut q: P = P { x: 1, y: 2 }; let mut i: i64 = 0; while i < 10 { q.x = q.x + q.y; i = i + 1; } let mut a: i64 = 0; let ra: &i64 = &a; a = q.x; return a + *ra; }",
     );
-    assert!(out.contains("mov %rbx, -"), "register stored direct:\n{out}");
+    let direct = ["%rbx", "%r12", "%r13", "%r14", "%r15"]
+        .iter()
+        .any(|r| out.contains(&format!("mov {r}, -")));
+    assert!(direct, "register stored direct:\n{out}");
 }
 
 #[test]
