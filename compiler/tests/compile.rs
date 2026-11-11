@@ -7161,3 +7161,20 @@ fn a_static_mut_is_rejected() {
     let err = compile_to_asm("static mut X: i64 = 5; fn main() -> i64 { X }", &CompileOptions::default());
     assert!(err.is_err(), "`static mut` must be rejected");
 }
+
+#[test]
+fn a_byte_literal_is_an_integer() {
+    // `b'A'` is the byte value, an `i64` in rmc. `\xFF` is a valid byte escape.
+    let out = asm("fn main() -> i64 { b'A' }");
+    assert!(out.contains("main:"), "a byte literal must compile");
+    let big = asm("fn main() -> i64 { b'\\xFF' }");
+    assert!(big.contains("$255"), "`\\xFF` is 255");
+    let nl = asm("fn main() -> i64 { b'\\n' }");
+    assert!(nl.contains("$10"), "`\\n` is 10");
+}
+
+#[test]
+fn a_byte_string_is_not_supported() {
+    // `b".."` needs an array of bytes, which rmc does not have.
+    assert!(compile_to_asm("fn main() { let s = b\"hi\"; }", &CompileOptions::default()).is_err());
+}

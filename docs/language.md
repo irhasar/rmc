@@ -26,7 +26,10 @@ is written `-9223372036854775808` (or `-0x8000000000000000`); the magnitude
 alone is out of range, as in Rust. A `char` literal is a single Unicode scalar
 in single quotes, with the usual escapes (`\n`, `\t`, `\r`, `\0`, `\'`, `\\`,
 `\xNN` restricted to `\x00`-`\x7f`, and `\u{..}`), and a non-ASCII character may
-also be written directly. Explicit types can be given on
+also be written directly. A byte literal `b'A'` is an integer (its byte value,
+`0`-`255`); rmc has no `u8`, so it is an `i64`, and its `\x` escape may use the
+full `\x00`-`\xff` range. A byte *string* `b".."` is not supported. Explicit
+types can be given on
 `let` bindings and function signatures. `as` converts among `i64`, `bool` and an
 enum tag, casts a `char` to its `i64` scalar value, and casts a `&mut T` to a
 `&T`. A reference may only be cast to

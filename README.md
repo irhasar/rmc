@@ -188,7 +188,8 @@ for `print!`/`println!` (a literal format with `{}` filled by an `i64`, a
 `bool`, a `char` or a `str`, literal `{{`/`}}` braces, escapes, a leading `\n`,
 and a
 bare `println!()` with no format string), `char` for `char` literals
-(plain, escaped, `\xNN`, `\u{..}`), `as i64`, `char` ordering and equality, a
+(plain, escaped, `\xNN`, `\u{..}`) and byte literals (`b'A'`, `b'\xFF'`),
+`as i64`, `char` ordering and equality, a
 `char` `match` with literal, or-pattern and range arms, a `char` array, a
 `const char`, a `char` parameter/return, and the `print_char` builtin, and
 `order` for assignment evaluation order (a

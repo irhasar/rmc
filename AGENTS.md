@@ -75,7 +75,9 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
 
 - `compiler/src/lib.rs` — library entry point: `compile_to_asm(src, options)`.
   The compiler is a library plus a thin CLI, so it can be embedded.
-- `compiler/src/lexer.rs` — byte scanner, tokens carry byte positions.
+- `compiler/src/lexer.rs` — byte scanner, tokens carry byte positions. A byte
+  literal `b'A'` lexes to a `Tok::Int` (rmc has no `u8`); `b".."` is not a
+  literal it recognises, so it is rejected downstream.
 - `compiler/src/parser.rs` — recursive descent; `is_block_like` allows
   `if`/blocks as statements without a trailing `;`. `parse_cond` sets
   `no_struct_lit` so a `{` after a condition starts the body, not a struct.

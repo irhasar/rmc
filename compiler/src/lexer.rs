@@ -252,6 +252,16 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             continue;
         }
         let pos = i as u32;
+        // A byte literal `b'A'`: its value is the byte, an integer. rmc has no
+        // separate `u8` type (`u8` is an alias for `i64`), so it lexes to an
+        // `i64` holding the byte value. `b".."` (a byte string) is not handled;
+        // it would need an array of bytes, which rmc does not have.
+        if c == b'b' && bytes.get(i + 1) == Some(&b'\'') {
+            let (val, next) = lex_byte_lit(bytes, i)?;
+            out.push(Token { tok: Tok::Int(val), pos });
+            i = next;
+            continue;
+        }
         // identifiers / keywords
         if c == b'_' || c.is_ascii_alphabetic() {
             let start = i;
@@ -625,4 +635,62 @@ fn lex_char(src: &str, bytes: &[u8], start: usize) -> Result<(u32, usize), Strin
 
 fn hex_val(b: u8) -> Option<u32> {
     (b as char).to_digit(16)
+}
+
+/// A byte literal `b'A'` / `b'\n'` / `b'\xFF'`. Its value is the byte (0..=255),
+/// returned as an `i64` (rmc has no `u8`). Only a single ASCII character or a
+/// byte escape is allowed: rustc rejects a non-ASCII character (`b'é'`), since a
+/// byte literal holds one byte. `\xFF` is accepted here (unlike in a `char`
+/// literal, where `\x` is restricted to ASCII), and `\u{..}` is rejected, as in
+/// rustc. `start` is the index of the leading `b`.
+fn lex_byte_lit(bytes: &[u8], start: usize) -> Result<(i64, usize), String> {
+    let mut i = start + 2; // past `b'`
+    let v: u32 = if bytes[i] == b'\\' {
+        let e = *bytes
+            .get(i + 1)
+            .ok_or_else(|| format!("unterminated byte literal at byte {start}"))?;
+        i += 2;
+        match e {
+            b'n' => b'\n' as u32,
+            b't' => b'\t' as u32,
+            b'r' => b'\r' as u32,
+            b'0' => 0,
+            b'\\' => b'\\' as u32,
+            b'\'' => b'\'' as u32,
+            b'"' => b'"' as u32,
+            b'x' => {
+                // Exactly two hex digits, up to `\xFF`.
+                let hi = hex_val(*bytes.get(i).unwrap_or(&0))
+                    .ok_or_else(|| format!("invalid `\\x` escape at byte {start}"))?;
+                let lo = hex_val(*bytes.get(i + 1).unwrap_or(&0))
+                    .ok_or_else(|| format!("invalid `\\x` escape at byte {start}"))?;
+                i += 2;
+                hi * 16 + lo
+            }
+            b'u' => {
+                return Err(format!(
+                    "`\\u` is not allowed in a byte literal at byte {start}"
+                ))
+            }
+            other => {
+                return Err(format!("unknown escape `\\{}` at byte {}", other as char, start))
+            }
+        }
+    } else {
+        // A single character, which must be ASCII (one byte).
+        let b = *bytes
+            .get(i)
+            .ok_or_else(|| format!("unterminated byte literal at byte {start}"))?;
+        if b >= 0x80 {
+            return Err(format!(
+                "non-ASCII character in a byte literal at byte {start}"
+            ));
+        }
+        i += 1;
+        b as u32
+    };
+    if bytes.get(i) != Some(&b'\'') {
+        return Err(format!("unterminated byte literal at byte {start}"));
+    }
+    Ok((v as i64, i + 1))
 }

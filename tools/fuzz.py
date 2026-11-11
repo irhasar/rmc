@@ -367,6 +367,20 @@ def gen_char_range_lit(rng):
     return f"{lo_src}{op}{hi_src}"
 
 
+def gen_byte_lit(rng):
+    """A random byte literal `b'A'` / `b'\\n'` / `b'\\xNN'` / `b'\\0'`. rmc has
+    no `u8`, so a byte literal is an `i64`; its value must match rustc's `u8`
+    byte. `\\xFF` is included because a byte literal, unlike a `char`, allows the
+    full `\\x00..=\\xFF` range."""
+    r = rng.random()
+    if r < 0.5:
+        c = rng.choice("abXYZ019 ~")
+        return f"b'{c}'"
+    if r < 0.75:
+        return "b'" + rng.choice(["\\n", "\\t", "\\0", "\\r", "\\'", "\\\\"]) + "'"
+    return f"b'\\x{rng.randint(0, 0xff):02x}'"
+
+
 def gen_char_program(rng):
     """`char` literals, `as i64`, `char` ordering and equality, `match` on a
     `char` (literal, or-pattern and range arms), a `char` array, a `const char`,
@@ -382,6 +396,8 @@ def gen_char_program(rng):
     c_const = lit()
     arr = [lit() for _ in range(3)]
     base_lit = lit()
+    b_arr = [gen_byte_lit(rng) for _ in range(3)]
+    b_const = gen_byte_lit(rng)
     exprs = []
     for _ in range(rng.randint(2, 6)):
         r = rng.random()
@@ -406,10 +422,12 @@ def gen_char_program(rng):
     arr_src = "[" + ", ".join(arr) + "]"
     rs = [
         f"const C: char = {c_const};",
+        f"const BC: u8 = {b_const};",
         "fn id(c: char) -> char { return c; }",
         "fn code(c: char) -> i64 { return c as i64; }",
         "fn main() {",
         f"    let cs: [char; 3] = {arr_src};",
+        f"    let bs: [u8; 3] = [{' , '.join(b_arr)}];",
         f"    let base: char = {base_lit};",
         "    let mut acc: i64 = 0;",
     ]
@@ -422,6 +440,10 @@ def gen_char_program(rng):
         "    acc = acc + code(id(base));",
         "    acc = acc + (C as i64);",
         "    acc = acc + (base as i64);",
+        # Byte literals: each is an `i64` in rmc and a `u8` in rustc, so both
+        # sides are widened with `as i64` to keep the sum an `i64`.
+        "    acc = acc + (bs[0] as i64) + (bs[1] as i64) + (bs[2] as i64);",
+        "    acc = acc + (BC as i64);",
     ]
     for t in tail:
         rs.append(t.replace("acc = acc + ", "acc += "))
@@ -2920,6 +2942,12 @@ def reject_corpus():
         # `mod NAME;` loads another file, which rmc cannot resolve; rejecting it
         # matches rustc when the file is absent.
         "file_module_declaration": "mod m; fn main() { println!(\"{}\", 1); }\n",
+        # `b'\\u{41}'`: rustc forbids a `\u` escape in a byte literal, and rmc
+        # refuses it too.
+        "byte_literal_unicode_escape": "fn main() { println!(\"{}\", b'\\u{41}'); }\n",
+        # `b'\\x{41}'` is not a byte escape either; rustc wants exactly two hex
+        # digits, and so does rmc.
+        "byte_literal_bad_hex_escape": "fn main() { println!(\"{}\", b'\\x{41}'); }\n",
     }
 
 
