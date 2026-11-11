@@ -1663,6 +1663,130 @@ def gen_patshadow_program(rng):
     return "\n".join(rs) + "\n"
 
 
+def gen_semi_program(rng):
+    """Statements whose trailing `;` is omitted, and empty `;` statements.
+
+    An assignment (or compound assignment) is a `()`-valued expression, so its
+    trailing `;` may be dropped when it is the last thing in a block, exactly as
+    after `return`/`break`/`continue`. A bare `;` is an empty statement and may
+    appear anywhere. Every block here ends in an assignment with no `;`, so a
+    parser that demands the `;` rejects the program (a compile divergence), and
+    the value written is printed so a mis-parse would also show up as a value
+    difference. Empty statements are scattered between real ones to pin that a
+    run of `;` is skipped rather than treated as a statement.
+    """
+    ops = rng.sample(["+", "-", "*", "|", "^"], 5)
+    seeds = [rng.randint(1, 9) for _ in range(10)]
+    rs = ["fn main() {"]
+    rs += ["    let mut acc: i64 = 0;"]
+    # A plain assignment as the last statement of a nested block.
+    rs += [
+        "    {",
+        f"        acc = {seeds[0]}",
+        "    }",
+        "    ;",
+        '    println!("{}", acc);',
+    ]
+    # Each compound operator in tail position of an `if` arm.
+    for i, op in enumerate(ops):
+        rs += [
+            f"    if acc >= 0 {{",
+            f"        acc {op}= {seeds[i + 1]}",
+            "    } else {",
+            f"        acc {op}= {seeds[i + 1]}",
+            "    }",
+            ";",
+        ]
+    rs.append('    println!("{}", acc);')
+    # A `while` body whose only statement is an assignment with no `;`.
+    rs += [
+        f"    let mut n: i64 = {seeds[6] % 5 + 1};",
+        "    while n > 0 {",
+        "        acc += n;",
+        "        n -= 1",
+        "    }",
+        '    println!("{}", acc);',
+    ]
+    # A `loop` that breaks out of an assignment-terminated body.
+    rs += [
+        "    let mut k: i64 = 0;",
+        "    loop {",
+        "        k += 1;",
+        f"        if k == {seeds[7] % 5 + 1} {{",
+        "            break",
+        "        }",
+        "    }",
+        "    acc += k;",
+        # A `match` arm body that is a bare assignment (comma after), and a
+        # block-bodied arm ending in an assignment with no `;`.
+        "    match k {",
+        f"        1 => acc = {seeds[8]},",
+        f"        _ => {{ acc = {seeds[9]} }}",
+        "    }",
+        "    ;;",
+        '    println!("{}", acc);',
+        "}",
+    ]
+    return "\n".join(rs) + "\n"
+
+
+def gen_boolbit_program(rng):
+    """`&`, `|` and `^` on `bool`. rustc defines these as the logical operators
+    through the `BitAnd`/`BitOr`/`BitXor` impls, so they must type-check and give
+    the same 0/1 result as `&&`/`||`/`!=`. Each result is printed `as i64`, so a
+    wrong instruction (or a wrong precedence) shows up as a value difference, and
+    the operators are also used in a `const`, a compound assignment, a call, an
+    `if` condition and an array element."""
+    def bvar():
+        # A comparison is a bool-valued expression, so it can be an operand
+        # without needing a `bool` local.
+        return f"({rng.randint(-9, 9)} < {rng.randint(-9, 9)})"
+
+    def bexpr(depth):
+        r = rng.random()
+        if depth <= 0 or r < 0.35:
+            return bvar()
+        if r < 0.45:
+            return f"(!{bexpr(depth - 1)})"
+        op = rng.choice(["&", "|", "^"])
+        return f"({bexpr(depth - 1)} {op} {bexpr(depth - 1)})"
+
+    rs = ["fn main() {"]
+    for _ in range(rng.randint(4, 10)):
+        rs.append(f'    println!("{{}}", ({bexpr(3)}) as i64);')
+    # Compound assignment on a `bool` local.
+    init = rng.choice(["true", "false"])
+    rs.append(f"    let mut b: bool = {init};")
+    for _ in range(rng.randint(2, 6)):
+        op = rng.choice(["&=", "|=", "^="])
+        rs.append(f"    b {op} {rng.choice(['true', 'false'])};")
+    rs.append('    println!("{}", b as i64);')
+    # As an `if` condition (an `i64` operand would be a type error there).
+    rs.append(f"    if {bexpr(2)} {{ println!(\"{{}}\", 1); }} else {{ println!(\"{{}}\", 0); }}")
+    rs.append("}")
+    # A `const bool` folded from the operators, and an array of bool operands.
+    cname = "C"
+    cbody = bexpr(2)
+    head = [f"const {cname}: bool = {cbody};"]
+    rs.insert(1, f'    println!("{{}}", {cname} as i64);')
+    rs.insert(2, f'    let arr: [bool; 2] = [{bexpr(1)}, {bexpr(1)}];')
+    rs.insert(3, '    println!("{} {}", arr[0] as i64, arr[1] as i64);')
+    # An indexed bool operand: `!` must stay logical here too, and the bitwise
+    # ops must still type-check on an element.
+    rs.insert(4, '    println!("{}", (!arr[0]) as i64);')
+    rs.insert(5, '    println!("{}", (arr[0] | arr[1]) as i64);')
+    rs.insert(6, '    println!("{}", (!(arr[0] & arr[1])) as i64);')
+    # A loop-invariant bool bitwise expression under `!`: LICM may hoist the
+    # bitwise op, so the hoisted value's type must stay `bool` or `!` becomes a
+    # bitwise not.
+    inv = f"({bexpr(1)} | {bexpr(1)})"
+    rs.append("    let mut i: i64 = 0;")
+    rs.append("    let mut acc: i64 = 0;")
+    rs.append(f"    while i < 3 {{ if !{inv} {{ acc += 1; }} i += 1; }}")
+    rs.append('    println!("{}", acc);')
+    return "\n".join(head + rs) + "\n"
+
+
 def gen_intmeth_program(rng):
     """A program built from the built-in `i64` methods. Each method desugars to
     operators, so the shapes that matter are the receiver being a non-trivial
@@ -3063,7 +3187,7 @@ def gen_typealias_program(rng):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "patshadow", "intmeth", "nestedfn", "typealias", "printfmt", "ptr", "char", "robust", "reject", "mutate"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "patshadow", "intmeth", "nestedfn", "typealias", "printfmt", "ptr", "char", "semi", "boolbit", "robust", "reject", "mutate"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -3122,7 +3246,9 @@ def main():
            "typealias": gen_typealias_program,
            "printfmt": gen_printfmt_program,
            "ptr": gen_ptr_program,
-           "char": gen_char_program}[args.mode]
+           "char": gen_char_program,
+           "semi": gen_semi_program,
+           "boolbit": gen_boolbit_program}[args.mode]
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus
     # suite; a fuzz program is otherwise only checked with every pass on, so a

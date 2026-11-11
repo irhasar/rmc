@@ -212,6 +212,8 @@ python3 tools/fuzz.py --mode printfmt --n 500 --seed 1
 python3 tools/fuzz.py --mode pat --n 500 --seed 1
 python3 tools/fuzz.py --mode order --n 500 --seed 1
 python3 tools/fuzz.py --mode shift --n 500 --seed 1
+python3 tools/fuzz.py --mode semi --n 500 --seed 1
+python3 tools/fuzz.py --mode boolbit --n 500 --seed 1
 # also exercise the trap codegen: --bounds-checks and --overflow-checks runs
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 python3 tools/fuzz.py --mode robust

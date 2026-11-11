@@ -2589,6 +2589,18 @@ impl Sema {
                         Ok(Type::Bool)
                     }
                     BitAnd | BitOr | BitXor | Shl | Shr => {
+                        // `&`, `|` and `^` are defined on `bool` as well as
+                        // `i64` (rustc's `BitAnd`/`BitOr`/`BitXor` impls). A
+                        // `bool` is a 0/1 word, so the bitwise instruction is
+                        // already the logical result and codegen is unchanged;
+                        // only the operand check differs. The shifts stay
+                        // `i64`-only.
+                        if matches!(op, BitAnd | BitOr | BitXor)
+                            && ta == Type::Bool
+                            && tb == Type::Bool
+                        {
+                            return Ok(Type::Bool);
+                        }
                         if ta != Type::I64 || tb != Type::I64 {
                             return Err(format!("bitwise operator expects `i64` operands, found {ta:?} and {tb:?}"));
                         }

@@ -1479,19 +1479,27 @@ impl Parser {
                 self.skip_use()?;
                 continue;
             }
+            // A stray `;` is an empty statement; Rust accepts any number of
+            // them between statements and at the end of a block.
+            if self.eat(&Tok::Semi) {
+                continue;
+            }
             // tail expression: an expression not followed by `;`
             if self.starts_expr() {
                 let e = self.parse_expr()?;
                 if self.eat(&Tok::Eq) {
                     let value = self.parse_expr()?;
-                    self.expect(Tok::Semi)?;
+                    // An assignment is a `()`-valued expression, so its trailing
+                    // `;` may be omitted when it is the last thing in a block,
+                    // just as after `return`/`break`/`continue`.
+                    self.eat_semi_at_block_end()?;
                     stmts.push(Stmt::Assign { target: e, value });
                     continue;
                 }
                 if let Some(op) = self.peek_compound_op() {
                     self.i += 1;
                     let value = self.parse_expr()?;
-                    self.expect(Tok::Semi)?;
+                    self.eat_semi_at_block_end()?;
                     stmts.push(self.desugar_compound(&e, op, value));
                     continue;
                 }
@@ -2285,14 +2293,14 @@ impl Parser {
                 let e = self.parse_expr()?;
                 if self.eat(&Tok::Eq) {
                     let value = self.parse_expr()?;
-                    self.expect(Tok::Semi)?;
+                    self.eat_semi_at_block_end()?;
                     out.push(Stmt::Assign { target: e, value });
                     return Ok(());
                 }
                 if let Some(op) = self.peek_compound_op() {
                     self.i += 1;
                     let value = self.parse_expr()?;
-                    self.expect(Tok::Semi)?;
+                    self.eat_semi_at_block_end()?;
                     let s = self.desugar_compound(&e, op, value);
                     out.push(s);
                     return Ok(());

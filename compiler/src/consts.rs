@@ -127,6 +127,12 @@ pub fn eval_bool(
         Expr::Bin(op, a, b) => match op {
             And => Some(eval_bool(a, ints, bools)? && eval_bool(b, ints, bools)?),
             Or => Some(eval_bool(a, ints, bools)? || eval_bool(b, ints, bools)?),
+            // `&`, `|` and `^` on `bool` are the logical operators (rustc's
+            // `BitAnd`/`BitOr`/`BitXor` impls for `bool`), so a `const bool`
+            // may be written with them.
+            BitAnd => Some(eval_bool(a, ints, bools)? & eval_bool(b, ints, bools)?),
+            BitOr => Some(eval_bool(a, ints, bools)? | eval_bool(b, ints, bools)?),
+            BitXor => Some(eval_bool(a, ints, bools)? ^ eval_bool(b, ints, bools)?),
             Eq | Ne | Lt | Le | Gt | Ge => {
                 if let (Some(x), Some(y)) = (eval_i64(a, ints), eval_i64(b, ints)) {
                     Some(match op {

@@ -6986,3 +6986,81 @@ fn a_constant_array_length_may_name_a_constant() {
     let out = asm("const N: i64 = 4; fn main() -> i64 { let a: [i64; N] = [1, 2, 3, 4]; return a[3]; }");
     assert!(out.contains("main:"), "a named constant length must fold");
 }
+
+#[test]
+fn an_assignment_may_end_a_block_without_a_semicolon() {
+    // An assignment is a `()`-valued expression, so its trailing `;` may be
+    // omitted when it is the last thing in a block, as after `return`. The
+    // value written must still reach the store.
+    let out = asm("fn main() -> i64 { let mut x: i64 = 0; if x == 0 { x = 7 } return x; }");
+    assert!(out.contains("main:"), "a trailing assignment with no `;` must compile");
+    let compound = asm("fn main() -> i64 { let mut x: i64 = 3; { x *= 4 } return x; }");
+    assert!(compound.contains("main:"), "a trailing compound assignment with no `;` must compile");
+}
+
+#[test]
+fn a_stray_semicolon_is_an_empty_statement() {
+    // Rust accepts any number of bare `;` between statements and at the end of
+    // a block; they are empty statements, not a parse error.
+    let out = asm("fn main() -> i64 { let mut x: i64 = 0; ; x += 1; ;; return x; ; }");
+    assert!(out.contains("main:"), "empty statements must be skipped");
+}
+
+#[test]
+fn an_assignment_in_a_match_arm_may_end_a_block_without_a_semicolon() {
+    let out = asm(
+        "fn main() -> i64 { let mut x: i64 = 0; match 2 { 2 => { x = 100 } _ => { x = 200 } } return x; }",
+    );
+    assert!(out.contains("main:"), "an assignment ending a match-arm block must compile");
+}
+
+#[test]
+fn a_loop_body_may_end_in_an_assignment_without_a_semicolon() {
+    let out = asm(
+        "fn main() -> i64 { let mut n: i64 = 3; let mut s: i64 = 0; while n > 0 { s += n; n -= 1 } return s; }",
+    );
+    assert!(out.contains("main:"), "a loop body ending in an assignment must compile");
+}
+
+#[test]
+fn bitwise_operators_are_defined_on_bool() {
+    // rustc's `BitAnd`/`BitOr`/`BitXor` impls cover `bool`, so these must
+    // type-check and yield a `bool`, not a type error. `asm` panics on a
+    // compile error, so reaching the assertion proves the check passed.
+    let out = asm("fn main() -> i64 { let a: bool = true; let b: bool = false; let c: bool = a & b | a ^ b; return c as i64; }");
+    assert!(out.contains("main:"), "`&`/`|`/`^` on bool must compile");
+}
+
+#[test]
+fn a_const_bool_may_use_a_bitwise_operator() {
+    // The constant folder must fold `&`/`|`/`^` on `bool` too, or a `const`
+    // written with them is rejected as non-constant.
+    let out = asm("const A: bool = true & false; const B: bool = true | false; const C: bool = true ^ true; fn main() -> i64 { return (A as i64) + (B as i64) + (C as i64); }");
+    assert!(out.contains("main:"), "a const bool using &/|/^ must fold");
+}
+
+#[test]
+fn a_logical_not_of_a_bool_bitwise_expression_stays_logical() {
+    // `!(a | b)` is logical not on a `bool`. Codegen reports `i64` for a
+    // `&`/`|`/`^` (the instruction is the same for a 0/1 bool), so `!` must
+    // recover the operand's type from the expression, not the codegen result,
+    // or it emits a bitwise `not` and yields `-1`/`-2` instead of `0`/`1`.
+    let out = asm("fn main() -> i64 { let a: bool = true; let b: bool = false; let c: bool = !(a | b); return c as i64; }");
+    assert!(out.contains("sete %al"), "`!` on a bool `|` must be logical not");
+    assert!(!out.contains("not %rax"), "`!` on a bool `|` must not be a bitwise not");
+}
+
+#[test]
+fn a_logical_not_of_an_indexed_bool_bitwise_expression_stays_logical() {
+    let out = asm("fn main() -> i64 { let a = [true, false]; let c: bool = !(a[0] | a[1]); return c as i64; }");
+    assert!(out.contains("sete %al"), "`!` on an indexed bool `|` must be logical not");
+    assert!(!out.contains("not %rax"), "`!` on an indexed bool `|` must not be a bitwise not");
+}
+
+#[test]
+fn a_bitwise_not_of_an_integer_stays_bitwise() {
+    // The `bool` special case must not leak onto the integers: `!x` on an
+    // `i64` is a bitwise not.
+    let out = asm("fn main() -> i64 { let x: i64 = 5; return !x; }");
+    assert!(out.contains("not %rax"), "`!` on i64 must be a bitwise not");
+}

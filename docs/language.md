@@ -406,6 +406,7 @@ let _: T;                // annotated discard, no initialiser (a no-op)
 y = y + 1;               // assignment (target may be a variable, array element or field)
 y += 1;                  // compound assignment: += -= *= /= %=
 x;                       // expression statement
+;                        // empty statement (any number, anywhere)
 if cond { ... } else { ... }
 while cond { ... }
 while let PAT = expr { ... }  // re-tests expr each iteration; stops on no match
@@ -486,7 +487,12 @@ A branch whose type diverges (`return`, or a `loop` with no reachable `break`)
 unifies with any other branch's type, as Rust's `!` does, so
 `if c { 1 } else { return 2 }` is accepted. The trailing `;` after
 `return`/`break`/`continue` may be omitted when it is the last thing in a block,
-since those diverge and no expression can follow them. A whole block that
+since those diverge and no expression can follow them. An assignment and a
+compound assignment are `()`-valued expressions, so their trailing `;` may be
+omitted the same way: `{ x = 1 }` and `{ x += 1 }` are accepted when the
+assignment is the last thing in a block. A bare `;` is an empty statement and
+may appear between statements or after the last one, as in Rust.
+A whole block that
 cannot complete is `!` too, so it fits any expected type: `fn f(e: E) -> i64 {
 match e { E::A => { return 1; } E::B => { return 2; } } }` (every arm returns),
 `let x: i64 = if c { return 1; } else { return 2; };`, and `fn g() -> i64 {
@@ -541,7 +547,10 @@ compile-time constant is decided at compile time, not by the trap.
 - Comparison: `== != < <= > >=`, producing `bool`.
 - Boolean: `&& || !`, short-circuiting. `!` is logical not on a `bool` and
   bitwise not on an `i64`, as in Rust; it yields its operand's type.
-- Bitwise: `& | ^` on `i64`, plus `<<` and `>>`. `>>` is arithmetic (a negative
+- Bitwise: `& | ^` on `i64`, and on `bool` where they are the non-short-circuiting
+  logical operators (`a & b` is `a && b` without the short circuit), as in Rust;
+  `a & b` and `a | b` yield `bool` when both operands are `bool`. Also `<<` and
+  `>>`. `>>` is arithmetic (a negative
   value stays negative) and a shift count is taken modulo 64, matching Rust.
   Precedence, tightest first: `* / %`, `+ -`, `<< >>`, `&`, `^`, `|`, then the
   comparisons and `&& ||`. So `1 + 2 << 3` is `(1 + 2) << 3`, and

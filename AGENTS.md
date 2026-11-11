@@ -61,6 +61,8 @@ python3 tools/fuzz.py --mode typealias --n 500 --seed 1
 python3 tools/fuzz.py --mode printfmt --n 500 --seed 1
 python3 tools/fuzz.py --mode ptr --n 500 --seed 1
 python3 tools/fuzz.py --mode char --n 500 --seed 1
+python3 tools/fuzz.py --mode semi --n 500 --seed 1
+python3 tools/fuzz.py --mode boolbit --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 
 # robustness / soundness: rmc must error cleanly, never crash
@@ -263,7 +265,11 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   reusing the `if let` path, so sema and codegen gain no case. The scrutinee sits
   inside the loop, so it is re-evaluated each iteration and `continue` re-tests
   it. The `;` after `return`/`break`/`continue` may be omitted at the end of a
-  block (`eat_semi_at_block_end`), as in Rust.
+  block (`eat_semi_at_block_end`), as in Rust. An assignment and a compound
+  assignment are `()`-valued expressions, so `parse_block_body` and the
+  statement arm of `parse_stmt_into` end them with `eat_semi_at_block_end`
+  too: `{ x = 1 }` and `{ x += 1 }` are accepted as a block's last statement,
+  and a bare `;` (an empty statement) is skipped before every statement.
   `if let PAT = EXPR { .. } else { .. }` is parsed here too and desugared by
   `desugar_if_let` into a two-arm `match` (`PAT => then, _ => else_or_unit`),
   reusing `desugar_match_arms` and the `parse_pattern` shared with `match` arms,
@@ -920,7 +926,9 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   struct-literal-in-condition restriction.
 - **Statements vs. tail expressions.** Assignments inside a block must be
   detected before the trailing-`;` check in `parse_block`, otherwise `x = ...;`
-  is parsed as an expression and rejected.
+  is parsed as an expression and rejected. An assignment's own `;` may be
+  omitted when it ends a block (`eat_semi_at_block_end`), so the check is not a
+  bare `expect`; a leading `;` is skipped first as an empty statement.
 - **Spill slots are frame slots.** `push_rax`/`pop_to` spill to a frame slot
   rather than `push`/`pop`, so `%rsp` is static and a call needs no alignment
   pad. This measured faster on every real program (`fib` +3.3%) because the pad
@@ -1649,9 +1657,15 @@ The checks, all in `sema.rs`:
 
 `!` on an integer is bitwise not, as in Rust: sema accepts `bool` and `i64`
 operands (it yields the operand's type) and codegen emits `not %rax` for the
-integer form and a `sete` for the `bool` form, selecting on the operand's
-generated type. `licm::expr_ty` follows the operand for a `!` so a hoisted
-bitwise not is bound to an `i64` slot, not a `bool` one.
+integer form and a `sete` for the `bool` form. The operand's type is taken from
+`Codegen::static_ty` (falling back to `gen_expr`'s return value for a node it
+does not model), *not* from `gen_expr` alone: `gen_bin` reports `i64` for a
+`&`/`|`/`^` because the emitted instruction is the same for a 0/1 `bool` and an
+integer, so `!(a | b)` on `bool` would otherwise be a bitwise `not`. The same
+reasoning is why `licm::expr_ty` types a `bool` `&`/`|`/`^` as `Bool` (a hoisted
+one bound to an `i64` slot turns a later `!` into a bitwise not) and follows the
+operand for a `!` so a hoisted bitwise not is bound to an `i64` slot, not a
+`bool` one.
 
 The `i64::MIN` literal `-9223372036854775808` is accepted: the lexer parses the
 magnitude `9223372036854775808`, which exceeds `i64::MAX`, as a distinct

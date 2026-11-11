@@ -628,8 +628,11 @@ fn scalar(e: &Expr) -> bool {
     }
 }
 
-/// The type of a hoistable expression: `Bool` for a comparison or a `bool` `!`,
-/// the operand's type for a bitwise `!`, and `I64` otherwise.
+/// The type of a hoistable expression: `Bool` for a comparison or a `bool`
+/// `!`, the operand's type for a bitwise `!`, and `I64` otherwise. A `&`/`|`/`^`
+/// on `bool` is `bool` (rustc's `BitAnd`/`BitOr`/`BitXor` impls), so a hoisted
+/// one is bound to a `bool` slot; typing it `I64` would make a later `!` on the
+/// hoisted `Var` a bitwise not.
 fn expr_ty(e: &Expr) -> Type {
     match e {
         Expr::Bool(_) => Type::Bool,
@@ -639,6 +642,13 @@ fn expr_ty(e: &Expr) -> Type {
             if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) =>
         {
             Type::Bool
+        }
+        Expr::Bin(op, a, b) if matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor) => {
+            if expr_ty(a) == Type::Bool || expr_ty(b) == Type::Bool {
+                Type::Bool
+            } else {
+                Type::I64
+            }
         }
         Expr::Bin(_, a, _) if matches!(a.as_ref(), Expr::Bool(_)) => Type::Bool,
         _ => Type::I64,
