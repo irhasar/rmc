@@ -1679,14 +1679,13 @@ impl Parser {
         Ok(for_stmt)
     }
 
-    /// `__rmc_arg_or(i, default)` for a runtime index `i` (the constant form is
-    /// `args_or`).
+    /// `__rmc_arg_or(i, default, 0, 0)` for a runtime index `i` (the constant
+    /// form is `args_or`). The `for v in &args` desugar has no `unwrap`, so both
+    /// failure flags are 0 and a malformed argument takes the fallback.
     fn args_or_at(&self, idx: &Expr, default: i64) -> Expr {
         Expr::Call {
             name: "__rmc_arg_or".into(),
-            // `false`: `for v in &args` over an args-vector uses `__rmc_arg_or`'s
-            // fallback path (there is no `unwrap` here).
-            args: vec![idx.clone(), Expr::Int(default), Expr::Int(0)],
+            args: vec![idx.clone(), Expr::Int(default), Expr::Int(0), Expr::Int(0)],
             arg_slots: Vec::new(),
             ret_slot: -1,
             ret_ty: Type::I64,
@@ -2572,28 +2571,41 @@ impl Parser {
     /// `__rmc_arg_or(idx, default)`.
     fn finish_args_nth(&mut self, idx: i64) -> PResult<Expr> {
         let mut default: Option<Expr> = None;
-        let mut required = false;
+        let mut missing_required = false;
+        let mut parse_required = false;
+        // After `.parse()` the chain is a `Result`; an `unwrap()` there is a
+        // parse failure, not a missing argument, and `unwrap_or(d)` only
+        // recovers the parse failure. The two must be tracked separately:
+        // `.nth(i).unwrap().parse().unwrap_or(d)` still exits when the argument
+        // is absent but yields `d` when it is present and non-numeric.
+        let mut in_result = false;
         let mut done = false;
         while self.peek() == Some(&Tok::Dot) {
             self.i += 1;
             let m = self.expect_ident()?;
             match m.as_str() {
                 "parse" => {
-                    // `parse::<i64>()` carries a turbofish; skip it.
+                    // `parse::<i64>()` carries a turbofish; the type name is a
+                    // keyword token (`i64`/`bool`/`char`), so accept either.
                     if self.eat(&Tok::ColonColon) {
                         self.expect(Tok::Lt)?;
-                        self.expect_ident()?; // the type name
+                        self.bump();
                         self.expect(Tok::Gt)?;
                     }
                     self.expect(Tok::LParen)?;
                     self.expect(Tok::RParen)?;
+                    in_result = true;
                 }
                 "unwrap" => {
                     self.expect(Tok::LParen)?;
                     self.expect(Tok::RParen)?;
-                    // `.unwrap()` is required: a missing or non-numeric argument
-                    // panics. `.unwrap().parse().unwrap()` is also required.
-                    required = true;
+                    if in_result {
+                        parse_required = true;
+                    } else {
+                        // `.unwrap()` on the `Option`: a missing argument
+                        // panics. `.unwrap().parse().unwrap()` is required too.
+                        missing_required = true;
+                    }
                     done = true;
                 }
                 "unwrap_or" => {
@@ -2607,6 +2619,9 @@ impl Parser {
                     self.expect(Tok::LParen)?;
                     self.skip_closure()?;
                     self.expect(Tok::RParen)?;
+                    // The closure's `.ok()` yields an `Option`, and the
+                    // following `unwrap_or(d)` recovers both failures.
+                    in_result = true;
                 }
                 other => {
                     return Err(format!(
@@ -2622,7 +2637,7 @@ impl Parser {
                 self.pos()
             ));
         }
-        Ok(self.args_or(idx, default.unwrap_or(Expr::Int(0)), required))
+        Ok(self.args_or(idx, default.unwrap_or(Expr::Int(0)), missing_required, parse_required))
     }
 
     /// `.skip(k).map(|s| s.parse::<i64>().unwrap()).collect()`: the arguments
@@ -2692,14 +2707,21 @@ impl Parser {
         Ok(())
     }
 
-    /// `__rmc_arg_or(idx, default)`.
-    fn args_or(&self, idx: i64, default: Expr, required: bool) -> Expr {
+    /// `__rmc_arg_or(idx, default, missing_required, parse_required)`.
+    fn args_or(&self, idx: i64, default: Expr, missing_required: bool, parse_required: bool) -> Expr {
         Expr::Call {
             name: "__rmc_arg_or".into(),
-            // `required` mirrors `unwrap()`: the runtime exits (101) when the
-            // argument is absent or not a whole integer, instead of yielding
-            // the fallback. `unwrap_or(d)` passes `false` and gets `d`.
-            args: vec![Expr::Int(idx), default, Expr::Int(required as i64)],
+            // `missing_required` mirrors `unwrap()` on the `Option`: the runtime
+            // exits (101) when the argument is absent. `parse_required` mirrors
+            // `unwrap()` on the `Result`: it exits when the argument is present
+            // but not a whole integer. `unwrap_or(d)` passes both `false` and
+            // gets `d`; `.unwrap().parse().unwrap_or(d)` passes only the first.
+            args: vec![
+                Expr::Int(idx),
+                default,
+                Expr::Int(missing_required as i64),
+                Expr::Int(parse_required as i64),
+            ],
             arg_slots: Vec::new(),
             ret_slot: -1,
             ret_ty: Type::I64,
@@ -3121,7 +3143,7 @@ impl Parser {
                                 self.pos()
                             )
                         })?;
-                        e = self.args_or(k + skip, Expr::Int(0), false);
+                        e = self.args_or(k + skip, Expr::Int(0), false, false);
                         continue;
                     }
                 }

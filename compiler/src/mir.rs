@@ -859,12 +859,15 @@ pub fn parse(text: &str) -> Result<Program, String> {
 
 /// Reconcile the several names rustc's MIR printer uses for one type. A type is
 /// spelled with a path *relative* to the item that mentions it: `main` prints
-/// `a::A`, but the impl inside module `a` prints the same type as `A`, and a
-/// type two modules deep prints with only the tail of its path. Two distinct
-/// types can also share a last segment (`a::A` and `b::A`). `parse_ty` keeps
-/// every qualified path whole; this pass then lets a bare (or short) name adopt
-/// the one qualified name it is a `::`-suffix of, so an impl definition, its
-/// call sites and the value's own layout all key on one string. A name with no
+/// `a::A`, but the impl inside module `a` prints the same type as `A`. Two
+/// distinct types can also share a last segment (`a::A` and `b::A`) or a whole
+/// tail (`a::A` and `outer::a::A`). `parse_ty` keeps every qualified path whole;
+/// this pass then lets a *bare* name adopt the one qualified name it is a
+/// `::`-suffix of, so an impl definition, its call sites and the value's own
+/// layout all key on one string. A name that already carries a path is a
+/// complete spelling and never adopts a longer path it merely ends with — a
+/// `::`-suffix is not proof of identity, and merging `a::A` into `outer::a::A`
+/// would give two distinct types one layout and one symbol. A bare name with no
 /// unique longer match is left alone.
 fn canonicalize_types(prog: &mut Program) {
     let mut names: BTreeSet<String> = BTreeSet::new();

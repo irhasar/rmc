@@ -176,36 +176,47 @@ arg_i64:
     },
     Piece {
         text: r#"
-# long __rmc_arg_or(long idx, long default, long required)
-#   -- the value of argv[idx] when `idx` names a present, whole integer; else
-#      `default` when `required` is 0, or exit(101) when `required` is 1.
-# Lowers `std::env::args().nth(i)...unwrap_or(d)` (required = 0) and its
-# `.unwrap()` spelling (required = 1), and the `.and_then(|s| s.parse().ok())`
-# form, without an Option type. A present-but-non-numeric argument is a parse
-# failure, so it takes the fallback (or traps) rather than reading as zero.
+# long __rmc_arg_or(long idx, long default, long missing, long parse)
+#   -- the value of argv[idx] when `idx` names a present, whole integer;
+#      otherwise `default`, unless the corresponding failure is required.
+# `missing` is the `.unwrap()` on the `Option` (`args().nth(i).unwrap()`): a
+# missing argument exits 101. `parse` is the `.unwrap()` on the `Result`
+# (`.parse::<i64>().unwrap()`): a present-but-non-numeric argument exits 101.
+# `.unwrap_or(d)` leaves both 0 and yields `d` for either failure; a chain that
+# unwraps the `Option` but falls back on the parse (`..unwrap().parse()
+# .unwrap_or(d)`) sets only `missing`, so an absent argument still exits while a
+# malformed one takes `d`. Lowers the `args().nth(i)` chain and the
+# `.and_then(|s| s.parse().ok())` form without an Option type.
 .globl __rmc_arg_or
 .type __rmc_arg_or, @function
 __rmc_arg_or:
     push %rbp
     mov %rsp, %rbp
-    # `required` lives in %r10: `__rmc_arg_parse` clobbers
-    # %rax/%rcx/%rdx/%rdi/%r8/%r9 but not %r10, and %rsi (the default) survives
+    # `missing` lives in %r10 and `parse` in %r11: `__rmc_arg_parse` clobbers
+    # %rax/%rcx/%rdx/%rdi/%r8/%r9 but neither, and %rsi (the default) survives
     # the call too.
     mov %rdx, %r10
+    mov %rcx, %r11
     test %rdi, %rdi
-    js .Lao_fail
+    js .Lao_miss
     mov __rmc_argc(%rip), %rcx
     cmp %rcx, %rdi
-    jge .Lao_fail
+    jge .Lao_miss
     mov __rmc_argv(%rip), %rdx
     mov (%rdx,%rdi,8), %rdi
     call __rmc_arg_parse
     test %rdx, %rdx
-    jnz .Lao_fail
+    jnz .Lao_parse
     leave
     ret
-.Lao_fail:
+.Lao_miss:
     test %r10, %r10
+    jnz .Lao_trap
+    mov %rsi, %rax
+    leave
+    ret
+.Lao_parse:
+    test %r11, %r11
     jnz .Lao_trap
     mov %rsi, %rax
     leave
