@@ -4150,7 +4150,10 @@ impl Function {
         n: usize,
     ) -> Option<CountedLoop> {
         for h in 0..n {
-            let Terminator::SwitchInt { discr, .. } = &self.blocks[h].term else { continue };
+            let Terminator::SwitchInt { discr, targets, otherwise } = &self.blocks[h].term else {
+                continue;
+            };
+            let (targets, otherwise) = (targets.clone(), *otherwise);
             // The back edge is a predecessor the header dominates; its tail is
             // the latch. Exactly one such edge keeps the shape a simple loop.
             let latch: Vec<u32> = preds[h]
@@ -4194,6 +4197,21 @@ impl Function {
                 continue;
             }
             let (body, exit) = (inner[0], outer[0]);
+            // The condition must select the body on *true* and the exit on
+            // *false*, i.e. `[0: exit, otherwise: body]`. The rewrite runs the
+            // body once and jumps to the exit, which is only the loop's meaning
+            // when a true comparison enters the body; a reversed
+            // `[1: exit, otherwise: body]` (or any nonzero arm) would otherwise
+            // terminate a loop that should continue.
+            if targets.iter().any(|(v, t)| *v != 0 && *t != body) {
+                continue;
+            }
+            if targets.iter().any(|(v, t)| *v == 0 && *t != exit) {
+                continue;
+            }
+            if otherwise != body {
+                continue;
+            }
             // A single-block body that jumps straight back to the header.
             let body_blocks: Vec<u32> =
                 (0..n as u32).filter(|&b| b != h as u32 && in_loop[b as usize]).collect();
@@ -4239,17 +4257,16 @@ impl Function {
             // more than the test: a local it writes and that is read again
             // outside the header would lose its per-iteration value, and a store
             // through a pointer is a side effect that must not be dropped either.
-            // (The discriminant local and short-lived comparison temporaries are
-            // read only inside the header, so they are fine.)
-            let discr_local = other_place(discr);
+            // This includes the discriminant local: when the exit reads the
+            // condition, the closed form's missing final failing test would
+            // leave the last *true* value behind, so a condition observed
+            // outside the header blocks the rewrite.
             let mut header_ok = true;
             for s in &self.blocks[h].stmts {
                 match s {
                     Stmt::Nop => {}
                     Stmt::Assign(d, _) if d.proj.is_empty() => {
-                        if Some(d.local) != discr_local
-                            && self.local_read_elsewhere(d.local, h as u32, n)
-                        {
+                        if self.local_read_elsewhere(d.local, h as u32, n) {
                             header_ok = false;
                             break;
                         }

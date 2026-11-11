@@ -6225,3 +6225,95 @@ fn no_strip_conflicts_with_min_size() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+
+/// Build a `for i in 0..bound { acc += k }` MIR function by hand, so the
+/// counted-loop matcher can be tested without a rustc front end. `exit_reads_cmp`
+/// makes the exit observe the loop condition; `reversed` flips the switch arms so
+/// `false` enters the body.
+fn counted_loop_mir(exit_reads_cmp: bool, reversed: bool) -> rmc::mir::Program {
+    use rmc::mir::{BasicBlock, Function, Operand, Place, Program, Rvalue, Stmt, Terminator};
+    let pl = |l: u32| Place { local: l, proj: Vec::new() };
+    let cpl = |l: u32| Operand::Copy(pl(l));
+    let assign = |l: u32, rv: Rvalue| Stmt::Assign(pl(l), rv);
+    // 0: dest, 1: iv, 2: acc, 3: cmp, 4: bound, 5: k
+    let decl = |n: usize| {
+        (0..n)
+            .map(|_| rmc::mir::LocalDecl {
+                ty: Box::new(rmc::mir::Ty::I64),
+                is_arg: false,
+                name: None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let switch = if reversed {
+        Terminator::SwitchInt { discr: cpl(3), targets: vec![(1, 3)], otherwise: 2 }
+    } else {
+        Terminator::SwitchInt { discr: cpl(3), targets: vec![(0, 3)], otherwise: 2 }
+    };
+    let exit_val = if exit_reads_cmp {
+        Rvalue::Binary(rmc::mir::BinOp::Add, cpl(2), cpl(3))
+    } else {
+        Rvalue::Use(cpl(2))
+    };
+    let blocks = vec![
+        BasicBlock {
+            stmts: vec![
+                assign(1, Rvalue::Use(Operand::Const(rmc::mir::Const::Int(0)))),
+                assign(2, Rvalue::Use(Operand::Const(rmc::mir::Const::Int(0)))),
+                assign(4, Rvalue::Use(Operand::Const(rmc::mir::Const::Int(5)))),
+                assign(5, Rvalue::Use(Operand::Const(rmc::mir::Const::Int(10)))),
+            ],
+            term: Terminator::Goto(1),
+        },
+        BasicBlock {
+            stmts: vec![assign(3, Rvalue::Binary(rmc::mir::BinOp::Lt, cpl(1), cpl(4)))],
+            term: switch,
+        },
+        BasicBlock {
+            stmts: vec![
+                assign(2, Rvalue::Binary(rmc::mir::BinOp::Add, cpl(2), cpl(5))),
+                assign(1, Rvalue::Binary(rmc::mir::BinOp::Add, cpl(1), Operand::Const(rmc::mir::Const::Int(1)))),
+            ],
+            term: Terminator::Goto(1),
+        },
+        BasicBlock { stmts: vec![assign(0, exit_val)], term: Terminator::Return },
+    ];
+    Program {
+        funcs: vec![Function { name: "main".into(), locals: decl(6), blocks, consts: Default::default() }],
+        allocs: Default::default(),
+        consts: Default::default(),
+        promoted: Default::default(),
+        drop_impls: Default::default(),
+    }
+}
+
+/// Whether `close_counted_loops` replaced the body's back edge with a jump to the
+/// exit (a `Goto` to block 3 instead of the loop header).
+fn counted_loop_closed(prog: &rmc::mir::Program) -> bool {
+    matches!(prog.funcs[0].blocks[2].term, rmc::mir::Terminator::Goto(3))
+}
+
+#[test]
+fn closes_a_counted_loop_whose_condition_is_unobserved() {
+    let mut prog = counted_loop_mir(false, false);
+    rmc::mir::close_counted_loops(&mut prog, false);
+    assert!(counted_loop_closed(&prog), "the plain counted loop should close");
+}
+
+#[test]
+fn keeps_a_counted_loop_whose_condition_the_exit_reads() {
+    // The closed form never runs the final failing test, so the condition local
+    // would be left *true*; the exit reads it, so the rewrite must be rejected.
+    let mut prog = counted_loop_mir(true, false);
+    rmc::mir::close_counted_loops(&mut prog, false);
+    assert!(!counted_loop_closed(&prog), "an observed condition must block the rewrite");
+}
+
+#[test]
+fn keeps_a_counted_loop_with_reversed_switch_arms() {
+    // `[1: exit, otherwise: body]` means a false comparison enters the body; the
+    // rewrite assumes true enters the body, so this shape must be rejected.
+    let mut prog = counted_loop_mir(false, true);
+    rmc::mir::close_counted_loops(&mut prog, false);
+    assert!(!counted_loop_closed(&prog), "a reversed switch must block the rewrite");
+}
