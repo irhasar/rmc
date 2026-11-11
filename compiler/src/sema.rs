@@ -206,7 +206,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     // Runtime helpers provided by the freestanding assembly runtime. They are
     // linked in automatically, so they do not appear in the source program.
-    let builtins: [(&str, &[Type], Type); 26] = [
+    let builtins: [(&str, &[Type], Type); 27] = [
         ("print_i64", &[Type::I64], Type::Unit),
         ("print_str", &[Type::Str], Type::Unit),
         ("print_bool", &[Type::Bool], Type::Unit),
@@ -228,6 +228,10 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         // `__rmc_fill(addr, count, elem)`: store `elem` at each of `count` words
         // from `addr`, for the `vec![e; n]` desugar; returns `addr`.
         ("__rmc_fill", &[Type::I64, Type::I64, Type::I64], Type::I64),
+        // `__rmc_fill_bytes(addr, count, elem)`: the same, but for a one-byte
+        // element, storing the low byte of `elem` `count` times. Emitted for a
+        // `vec![e; n]` whose element is `u8`/`i8`.
+        ("__rmc_fill_bytes", &[Type::I64, Type::I64, Type::I64], Type::I64),
         // Byte-wise lexicographic `str` compare; emitted by sema for a string
         // comparison and never written in source.
         ("__rmc_str_lt", &[Type::Str, Type::Str], Type::Bool),

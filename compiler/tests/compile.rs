@@ -6160,9 +6160,9 @@ fn a_vec_i64_pointer_add_steps_whole_elements() {
 
 #[test]
 fn a_vec_u8_pointer_add_steps_single_bytes() {
-    // A `Vec<u8>` is a raw byte arena in rmc, so its pointer keeps a one-byte
-    // stride: `base.add(3)` is `base + 3`. Only the allocation size contributes
-    // a scaling `lea`, and the offset add keeps its immediate `3`.
+    // A `Vec<u8>` is a raw byte arena in rmc, so neither the allocation nor the
+    // pointer's `add` scales the count by eight: `vec![0u8; 8]` requests 8 bytes
+    // (not 64) and `base.add(3)` is `base + 3`.
     let out = asm_no_inline(
         "fn main() -> i64 { \
              let v: Vec<u8> = vec![0u8; 8]; \
@@ -6174,10 +6174,11 @@ fn a_vec_u8_pointer_add_steps_single_bytes() {
     let body = &out[out.find("main:").expect("main")..];
     assert_eq!(
         body.matches("lea 0(,%rax,8), %rax").count(),
-        1,
-        "a byte pointer must not scale the offset:\n{body}"
+        0,
+        "a byte arena must not scale by eight:\n{body}"
     );
     assert!(body.contains("add $3, %rax"), "expected a one-byte stride:\n{body}");
+    assert!(body.contains("call __rmc_fill_bytes"), "expected the byte fill:\n{body}");
 }
 
 #[test]

@@ -182,6 +182,29 @@ __rmc_fill:
     },
     Piece {
         text: r#"
+# long __rmc_fill_bytes(long addr, long count, long elem)  -- store the low byte
+# of `elem` at each of `count` bytes from `addr`; returns `addr`. Backs the
+# `vec![0u8; n]` desugar, whose elements are one byte wide.
+.globl __rmc_fill_bytes
+.type __rmc_fill_bytes, @function
+__rmc_fill_bytes:
+    mov %rdi, %rax
+    test %rsi, %rsi
+    jle .Lfillb_done
+    xor %rcx, %rcx
+.Lfillb_loop:
+    mov %dl, (%rax,%rcx,1)
+    inc %rcx
+    cmp %rsi, %rcx
+    jl .Lfillb_loop
+.Lfillb_done:
+    ret
+.size __rmc_fill_bytes, .-__rmc_fill_bytes
+"#,
+        defines: &["__rmc_fill_bytes"],
+    },
+    Piece {
+        text: r#"
 # void exit(long code)
 .globl exit
 .type exit, @function

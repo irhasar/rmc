@@ -2653,11 +2653,15 @@ impl Parser {
                                 self.vec_cap.insert(name.clone(), c);
                             }
                         }
-                        // `alloc(count * 8)`; each element is one machine word.
+                        // `alloc(count * elem_width)`; an `i64`/pointer element
+                        // is one machine word, a `u8`/`i8` element is one byte.
+                        // Sizing by the element width (not always 8) is what
+                        // keeps `vec![0u8; n]` from allocating eight times the
+                        // memory the source asks for.
                         let bytes = Expr::Bin(
                             BinOp::Mul,
                             Box::new(n_expr.clone()),
-                            Box::new(Expr::Int(8)),
+                            Box::new(Expr::Int(elem_width)),
                         );
                         let addr = Expr::Call {
                             name: "alloc".into(),
@@ -2669,10 +2673,17 @@ impl Parser {
                         let init_expr = if m == "\u{0}vecnew" {
                             addr
                         } else {
-                            // `__rmc_fill(addr, count, elem)` writes the repeated
-                            // element; it returns the address.
+                            // Write the repeated element. A one-byte element uses
+                            // the byte fill (writing `count` words would overrun a
+                            // `count`-byte block); every wider element uses the
+                            // word fill, `count` words being `count * 8` bytes.
+                            let fill = if elem_width == 1 {
+                                "__rmc_fill_bytes"
+                            } else {
+                                "__rmc_fill"
+                            };
                             Expr::Call {
-                                name: "__rmc_fill".into(),
+                                name: fill.into(),
                                 args: vec![addr, n_expr, args[0].clone()],
                                 arg_slots: Vec::new(),
                                 ret_slot: -1,
