@@ -7143,3 +7143,21 @@ fn a_chained_comparison_is_rejected() {
     assert!(compile_to_asm("fn main() { let x = 1 < 2; }", &CompileOptions::default()).is_ok());
     assert!(compile_to_asm("fn main() { let x = (1 < 2) == true; }", &CompileOptions::default()).is_ok());
 }
+
+#[test]
+fn a_static_is_accepted_like_a_const() {
+    // An immutable `static` lowers to a `const`: the initialiser must fold and
+    // every read yields the value. `pub` is accepted.
+    let out = asm("static X: i64 = 5; static Y: i64 = X + 1; fn main() -> i64 { X + Y }");
+    assert!(out.contains("main:"), "an immutable `static` must compile");
+    let pub_static = asm("pub static X: i64 = 7; fn main() -> i64 { X }");
+    assert!(pub_static.contains("main:"), "a `pub static` must compile");
+}
+
+#[test]
+fn a_static_mut_is_rejected() {
+    // rmc has no mutable global, so `static mut` is refused rather than
+    // silently dropping a mutation.
+    let err = compile_to_asm("static mut X: i64 = 5; fn main() -> i64 { X }", &CompileOptions::default());
+    assert!(err.is_err(), "`static mut` must be rejected");
+}

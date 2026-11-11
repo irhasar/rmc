@@ -14,6 +14,11 @@ const WRAP: i64 = 9223372036854775807i64.wrapping_mul(2);
 const WRAP_SMALL: i64 = 6i64.wrapping_mul(7);
 const WRAP_NAMED: i64 = N.wrapping_mul(M);
 
+// An immutable `static` is lowered to a `const`: its initialiser must be a
+// constant expression, and every read yields that value. `pub` is accepted.
+static S: i64 = N + 1;
+pub static S2: i64 = S * 2;
+
 fn main() {
     // A constant in expression position.
     println!("{}", N);
@@ -53,4 +58,8 @@ fn main() {
     println!("{}", WRAP);
     println!("{}", WRAP_SMALL);
     println!("{}", WRAP_NAMED);
+
+    // A `static` behaves exactly like the `const` it lowers to.
+    println!("{}", S);
+    println!("{}", S2);
 }

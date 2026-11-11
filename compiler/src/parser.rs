@@ -318,6 +318,9 @@ impl Parser {
                 Some(Tok::Struct) => structs.push(self.parse_struct()?),
                 Some(Tok::Enum) => enums.push(self.parse_enum()?),
                 Some(Tok::Const) => consts.push(self.parse_const()?),
+                // `static [mut] NAME: T = EXPR;`. An immutable `static` is a
+                // `const`; `static mut` is rejected (rmc has no mutable global).
+                Some(Tok::Ident(id)) if id == "static" => consts.push(self.parse_static()?),
                 Some(Tok::Type) => self.parse_type_alias()?,
                 Some(Tok::Fn) => fns.push(self.parse_fn()?),
                 Some(Tok::Impl) => self.parse_impl(&mut fns)?,
@@ -462,6 +465,10 @@ impl Parser {
             match self.peek() {
                 None => break,
                 Some(Tok::Const) => items.push(self.parse_const()?),
+                // `static [mut] NAME: T = EXPR;` is collected like a `const`:
+                // an immutable `static` is lowered to one, and `static mut` is
+                // rejected here too.
+                Some(Tok::Ident(id)) if id == "static" => items.push(self.parse_static()?),
                 Some(Tok::Type) => {
                     // `type NAME = TYPE;`. The target is not parsed yet: a
                     // `[T; N]` target needs the constant values, which are still
@@ -768,6 +775,15 @@ impl Parser {
     fn parse_const(&mut self) -> PResult<ConstDef> {
         self.skip_pub()?;
         self.expect(Tok::Const)?;
+        self.parse_const_tail()
+    }
+
+    /// The `NAME : TYPE = EXPR ;` tail shared by `const` and an immutable
+    /// `static`. rmc has no mutable global storage, so a `static` is treated
+    /// exactly like a `const`: its initialiser must be a constant expression
+    /// (as rustc requires too), and every read yields that value. `static mut`
+    /// is rejected before this point, since mutation has no meaning here.
+    fn parse_const_tail(&mut self) -> PResult<ConstDef> {
         let name = self.expect_ident()?;
         self.expect(Tok::Colon)?;
         let ty = self.parse_type()?;
@@ -775,6 +791,24 @@ impl Parser {
         let value = self.parse_expr()?;
         self.expect(Tok::Semi)?;
         Ok(ConstDef { name, ty, value })
+    }
+
+    /// `static [mut] NAME: TYPE = EXPR;`. An immutable `static` is lowered to a
+    /// `const`. `static mut` is rejected: rmc has no mutable global, and a
+    /// program that mutates one would diverge, so refusing is safer than
+    /// silently dropping the mutation.
+    fn parse_static(&mut self) -> PResult<ConstDef> {
+        self.skip_pub()?;
+        self.i += 1; // `static`
+        if let Some(Tok::Ident(id)) = self.peek() {
+            if id == "mut" {
+                return Err(format!(
+                    "at byte {}: `static mut` is not supported; rmc has no mutable global",
+                    self.pos()
+                ));
+            }
+        }
+        self.parse_const_tail()
     }
 
     /// Rewrite every alias name in `t` to its target, so no later pass sees an

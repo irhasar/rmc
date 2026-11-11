@@ -307,7 +307,8 @@ operators or a small runtime helper, so `i64::MIN.abs()` maps to itself as in
 `rustc -O`);
 `mut` enforcement and definite
 initialisation; `const` items (folded to a value and substituted at every use,
-including array lengths and `match` patterns); `type` aliases (a transparent
+including array lengths and `match` patterns) and an immutable `static` (lowered
+to a `const`; `static mut` is rejected); `type` aliases (a transparent
 second name for any type, resolved at parse time, usable before declaration);
 references (`&T` / `&mut T`, `&e`, `*e`,
 with auto-deref for `r.x`, `r[i]` and `r.m()`, and `&self` receivers); methods

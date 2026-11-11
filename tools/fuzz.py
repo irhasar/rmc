@@ -2914,6 +2914,12 @@ def reject_corpus():
         "chained_comparison_ne": "fn main() { println!(\"{}\", 1 != 2 != false); }\n",
         "chained_comparison_mixed": "fn main() { println!(\"{}\", 1 <= 2 >= 1); }\n",
         "chained_comparison_bool": "fn main() { println!(\"{}\", true == true == true); }\n",
+        # `static mut` needs `unsafe` to read, and rmc has no mutable global at
+        # all, so it is refused (E0133 in rustc for the un-`unsafe` read).
+        "static_mut_read": "static mut X: i64 = 5; fn main() { println!(\"{}\", X); }\n",
+        # `mod NAME;` loads another file, which rmc cannot resolve; rejecting it
+        # matches rustc when the file is absent.
+        "file_module_declaration": "mod m; fn main() { println!(\"{}\", 1); }\n",
     }
 
 

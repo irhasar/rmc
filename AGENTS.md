@@ -343,7 +343,9 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
 - `compiler/src/consts.rs` — shared constant folding: `const_i64`/`const_binop`
   (used by sema to fold a constant index or operand) and `resolve`/`eval_i64`
   (used by the parser to evaluate `const` items). A `const` item has no storage
-  and no codegen; its value is substituted at every use.
+  and no codegen; its value is substituted at every use. An immutable `static`
+  is parsed by `parse_static` and lowered to the same `ConstDef`, so it shares
+  this path; `static mut` is rejected, since rmc has no mutable global.
 - `compiler/src/inline.rs` — AST inlining of small, call-free, scalar functions
   (a loop is allowed, an early exit is not), run after sema and before codegen.
   See the inlining gotcha below.
