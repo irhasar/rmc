@@ -1,4 +1,3 @@
-// Rust twin of guard.rms.
 #[derive(Copy, Clone)]
 enum Opt { None, Some(i64) }
 

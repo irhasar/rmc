@@ -2,8 +2,9 @@
 """Differential test suite: every case is compiled by rmc and by rustc and the
 two programs must print identical output and exit with the same status.
 
-Each case lives in `tests/cases/` as a pair `NAME.rms` (rmc) and `NAME.rs`
-(Rust). The two files are written to behave identically, so any divergence in
+Each case lives in `tests/cases/` as a single `NAME.rs` source. rmc compiles it
+directly (there is no separate rmc dialect), and rustc compiles the same file
+as the reference. The two programs must behave identically, so any divergence in
 stdout or exit code is a compiler bug. `tests/args.json` optionally maps a case
 name to a list of argv vectors; each vector is one run, and the case passes
 only if every run matches. This is what catches bugs like a folded comparison
@@ -64,10 +65,10 @@ def compile_rust(name):
 
 
 def compile_rmc(name, optimizer_flags):
-    rms = os.path.join(CASES, f"{name}.rms")
+    rs = os.path.join(CASES, f"{name}.rs")
     rmc_bin = os.path.join(OUT, f"{name}.rmc")
     rmc_flags, _ = extra_flags(name)
-    p = subprocess.run([RMC] + rmc_flags + list(optimizer_flags) + [rms, "-o", rmc_bin],
+    p = subprocess.run([RMC] + rmc_flags + list(optimizer_flags) + [rs, "-o", rmc_bin],
                        capture_output=True)
     if p.returncode != 0:
         return None, f"rmc failed:\n{p.stderr.decode(errors='replace')}"
@@ -104,24 +105,24 @@ def check_bounds_traps(combos):
     # `let i = 9` (matching rustc, which rejects it), leaving the runtime path
     # unreachable. A parameter value is only known at run time.
     cases = {
-        "block": ("fn f(i: i64) -> i64 { let v: i64 = { let t: [i64; 3] = [10, 20, 30]; t }[i]; return v; } fn main() -> i64 { return f(9); }", b""),
-        "call": ("fn make() -> [i64; 3] { let a: [i64; 3] = [10, 20, 30]; return a; } fn f(i: i64) -> i64 { return make()[i]; } fn main() -> i64 { return f(10); }", b""),
-        "base_effect": ("fn make() -> [i64; 1] { print_i64(7); return [4]; } fn f(i: i64) -> i64 { return make()[i]; } fn main() -> i64 { return f(2); }", b"7\n"),
-        "local": ("fn f(i: i64) -> i64 { let a: [i64; 3] = [1, 2, 3]; return a[i]; } fn main() -> i64 { return f(3); }", b""),
-        "negative": ("fn f(i: i64) -> i64 { let a: [i64; 3] = [1, 2, 3]; return a[i]; } fn main() -> i64 { return f(-1); }", b""),
-        "computed": ("fn f(i: i64) -> i64 { let a: [i64; 3] = [1, 2, 3]; return a[i + 1]; } fn main() -> i64 { return f(3); }", b""),
-        "field": ("struct S { n: i64, a: [i64; 3] } fn f(i: i64) -> i64 { let s: S = S { n: 0, a: [4, 5, 6] }; return s.a[i]; } fn main() -> i64 { return f(5); }", b""),
-        "store": ("fn f(i: i64) -> i64 { let mut a: [i64; 3] = [1, 2, 3]; a[i] = 9; return a[0]; } fn main() -> i64 { return f(4); }", b""),
-        "array_ref": ("fn f(i: i64) -> i64 { let a: [i64; 3] = [1, 2, 3]; let r: &[i64; 3] = &a; return r[i]; } fn main() -> i64 { return f(9); }", b""),
+        "block": ("fn f(i: i64) -> i64 { let v: i64 = { let t: [i64; 3] = [10, 20, 30]; t }[i]; v } fn main() { let _ = f(9); }", b""),
+        "call": ("fn make() -> [i64; 3] { let a: [i64; 3] = [10, 20, 30]; a } fn f(i: i64) -> i64 { make()[i] } fn main() { let _ = f(10); }", b""),
+        "base_effect": ("fn make() -> [i64; 1] { println!(\"{}\", 7); [4] } fn f(i: i64) -> i64 { make()[i] } fn main() { let _ = f(2); }", b"7\n"),
+        "local": ("fn f(i: i64) -> i64 { let a: [i64; 3] = [1, 2, 3]; a[i] } fn main() { let _ = f(3); }", b""),
+        "negative": ("fn f(i: i64) -> i64 { let a: [i64; 3] = [1, 2, 3]; a[i] } fn main() { let _ = f(-1); }", b""),
+        "computed": ("fn f(i: i64) -> i64 { let a: [i64; 3] = [1, 2, 3]; a[i + 1] } fn main() { let _ = f(3); }", b""),
+        "field": ("struct S { n: i64, a: [i64; 3] } fn f(i: i64) -> i64 { let s: S = S { n: 0, a: [4, 5, 6] }; s.a[i] } fn main() { let _ = f(5); }", b""),
+        "store": ("fn f(i: i64) -> i64 { let mut a: [i64; 3] = [1, 2, 3]; a[i] = 9; a[0] } fn main() { let _ = f(4); }", b""),
+        "array_ref": ("fn f(i: i64) -> i64 { let a: [i64; 3] = [1, 2, 3]; let r: &[i64; 3] = &a; r[i] } fn main() { let _ = f(9); }", b""),
     }
     failures = 0
     for name, (src, want_stdout) in cases.items():
-        rms = os.path.join(OUT, f"trap_{name}.rms")
-        with open(rms, "w") as f:
+        src_path = os.path.join(OUT, f"trap_{name}.rs")
+        with open(src_path, "w") as f:
             f.write(src)
         for label, opt_flags in combos:
             asm = subprocess.run([RMC, "--bounds-checks"] + list(opt_flags)
-                                 + ["--emit-asm", rms], capture_output=True)
+                                 + ["--emit-asm", src_path], capture_output=True)
             if asm.returncode != 0:
                 print(f"FAIL trap {name}{label}: rmc failed:\n{asm.stderr.decode(errors='replace')}")
                 failures += 1
@@ -155,6 +156,57 @@ def check_bounds_traps(combos):
     return failures
 
 
+def check_clamp_trap(combos):
+    """`i64::clamp` with `min > max` must write its message and exit 101, not
+    fault, under a plain `ld` link (the trap is a runtime call, so its message
+    lives in `.rodata` and the handler must be reachable). The operands come
+    from parameters, so the range is not known at compile time; a `lo` bound
+    with a side effect must run before the panic, matching rustc's evaluation
+    of the receiver, then the arguments, then the range check."""
+    cases = {
+        "runtime": ("fn f(x: i64, lo: i64, hi: i64) -> i64 { x.clamp(lo, hi) } fn main() { let _ = f(5, 7, 3); }", b""),
+        "side_effect": ("fn g(v: i64) -> i64 { println!(\"{}\", v); v } fn f(x: i64, lo: i64, hi: i64) -> i64 { x.clamp(lo, hi) } fn main() { let _ = f(g(5), g(7), g(3)); }", b"5\n7\n3\n"),
+    }
+    failures = 0
+    for name, (src, want_stdout) in cases.items():
+        src_path = os.path.join(OUT, f"clamp_{name}.rs")
+        with open(src_path, "w") as f:
+            f.write(src)
+        for label, opt_flags in combos:
+            asm = subprocess.run([RMC] + list(opt_flags) + ["--emit-asm", src_path],
+                                 capture_output=True)
+            if asm.returncode != 0:
+                print(f"FAIL clamp {name}{label}: rmc failed:\n{asm.stderr.decode(errors='replace')}")
+                failures += 1
+                continue
+            s_path = os.path.join(OUT, f"clamp_{name}.s")
+            o_path = os.path.join(OUT, f"clamp_{name}.o")
+            exe = os.path.join(OUT, f"clamp_{name}.exe")
+            with open(s_path, "wb") as f:
+                f.write(asm.stdout)
+            p = subprocess.run(["as", s_path, "-o", o_path], capture_output=True)
+            if p.returncode != 0:
+                print(f"FAIL clamp {name}{label}: as failed:\n{p.stderr.decode(errors='replace')}")
+                failures += 1
+                continue
+            p = subprocess.run(["ld", "-o", exe, o_path], capture_output=True)
+            if p.returncode != 0:
+                print(f"FAIL clamp {name}{label}: ld failed:\n{p.stderr.decode(errors='replace')}")
+                failures += 1
+                continue
+            p = subprocess.run([exe], capture_output=True)
+            if p.returncode != 101 or b"clamp min > max" not in p.stderr:
+                print(f"FAIL clamp {name}{label}: exit={p.returncode} stderr={p.stderr!r} (want 101 + message)")
+                failures += 1
+            elif not p.stdout.startswith(want_stdout):
+                print(f"FAIL clamp {name}{label}: stdout={p.stdout!r} (want prefix {want_stdout!r})")
+                failures += 1
+    if failures == 0:
+        print(f"clamp `min > max` traps exit 101 under a plain `ld` link, "
+              f"in {len(combos)} optimiser configurations")
+    return failures
+
+
 def check_stripped():
     """Size behaviour of both link paths.
 
@@ -164,9 +216,9 @@ def check_stripped():
     default; there `--no-strip` keeps it and `--min-size` drops the section
     headers as well. Pin the ordering and that every artifact runs.
     """
-    rms = os.path.join(OUT, "strip_hello.rms")
-    with open(rms, "w") as f:
-        f.write("fn main() -> i64 { print_i64(1); return 0; }\n")
+    src = os.path.join(OUT, "strip_hello.rs")
+    with open(src, "w") as f:
+        f.write("fn main() { println!(\"{}\", 1); }\n")
 
     default = os.path.join(OUT, "strip_default.bin")
     binstrip = os.path.join(OUT, "strip_binutils.bin")
@@ -174,10 +226,10 @@ def check_stripped():
     binmin = os.path.join(OUT, "strip_binutils_min.bin")
 
     builds = [
-        (default, [RMC, rms, "-o", default]),
-        (binstrip, [RMC, "--binutils", rms, "-o", binstrip]),
-        (binkeep, [RMC, "--binutils", "--no-strip", rms, "-o", binkeep]),
-        (binmin, [RMC, "--binutils", "--min-size", rms, "-o", binmin]),
+        (default, [RMC, src, "-o", default]),
+        (binstrip, [RMC, "--binutils", src, "-o", binstrip]),
+        (binkeep, [RMC, "--binutils", "--no-strip", src, "-o", binkeep]),
+        (binmin, [RMC, "--binutils", "--min-size", src, "-o", binmin]),
     ]
     for path, cmd in builds:
         p = subprocess.run(cmd, capture_output=True)
@@ -236,13 +288,13 @@ def check_link_paths_agree():
     cases = ["arith", "div", "io", "utf8", "structs", "match", "bounds", "heap"]
     failures = 0
     for name in cases:
-        rms = os.path.join(CASES, f"{name}.rms")
-        if not os.path.exists(rms):
+        src = os.path.join(CASES, f"{name}.rs")
+        if not os.path.exists(src):
             continue
         direct = os.path.join(OUT, f"paths_{name}.direct")
         binut = os.path.join(OUT, f"paths_{name}.binutils")
-        p = subprocess.run([RMC, rms, "-o", direct], capture_output=True)
-        q = subprocess.run([RMC, "--binutils", rms, "-o", binut], capture_output=True)
+        p = subprocess.run([RMC, src, "-o", direct], capture_output=True)
+        q = subprocess.run([RMC, "--binutils", src, "-o", binut], capture_output=True)
         if p.returncode != 0 or q.returncode != 0:
             print(f"FAIL paths {name}: compile failed "
                   f"(direct={p.returncode} binutils={q.returncode})")
@@ -333,19 +385,19 @@ def check_encoding_matches_as():
     time on a divide-bound loop. This compares the decoded instruction streams,
     so an operand-size or alignment regression fails the suite.
     """
-    names = sorted(f[:-4] for f in os.listdir(CASES) if f.endswith(".rms"))
+    names = sorted(f[:-3] for f in os.listdir(CASES) if f.endswith(".rs"))
     # Encoding is chosen by the codegen, so the optimiser passes can change which
     # instruction forms appear. Check the default and the plainest path.
     combos = [("", []), (" [no-inline]", ["--no-inline"])]
     failures = 0
     for name in names:
-        rms = os.path.join(CASES, f"{name}.rms")
+        src = os.path.join(CASES, f"{name}.rs")
         for label, flags in combos:
             tag = name + label.replace(" ", "_").replace("[", "").replace("]", "")
             direct = os.path.join(OUT, f"enc_{tag}.direct")
             binut = os.path.join(OUT, f"enc_{tag}.binutils")
-            p = subprocess.run([RMC, rms, "-o", direct] + flags, capture_output=True)
-            q = subprocess.run([RMC, "--binutils", rms, "-o", binut] + flags,
+            p = subprocess.run([RMC, src, "-o", direct] + flags, capture_output=True)
+            q = subprocess.run([RMC, "--binutils", src, "-o", binut] + flags,
                                capture_output=True)
             if p.returncode != 0 or q.returncode != 0:
                 print(f"FAIL encoding {name}{label}: compile failed")
@@ -392,11 +444,11 @@ def check_no_rwx():
     `readelf -l` on a compiled `hello` catches a regression to `-n` (or any
     other linker flag that reintroduces a RWX segment).
     """
-    rms = os.path.join(OUT, "rwx_hello.rms")
-    with open(rms, "w") as f:
-        f.write("fn main() -> i64 { print_i64(1); return 0; }\n")
+    src = os.path.join(OUT, "rwx_hello.rs")
+    with open(src, "w") as f:
+        f.write("fn main() { println!(\"{}\", 1); }\n")
     exe = os.path.join(OUT, "rwx_hello.bin")
-    p = subprocess.run([RMC, rms, "-o", exe], capture_output=True)
+    p = subprocess.run([RMC, src, "-o", exe], capture_output=True)
     if p.returncode != 0:
         print(f"FAIL rwx: rmc failed:\n{p.stderr.decode(errors='replace')}")
         return 1
@@ -420,7 +472,7 @@ def main():
     os.makedirs(OUT, exist_ok=True)
     args = load_args()
 
-    names = sorted(f[:-4] for f in os.listdir(CASES) if f.endswith(".rms"))
+    names = sorted(f[:-3] for f in os.listdir(CASES) if f.endswith(".rs"))
     if not names:
         print("no test cases found", file=sys.stderr)
         return 1
@@ -479,6 +531,7 @@ def main():
                     print(f"ok   {name}{label} {argv}")
 
     failures += check_bounds_traps(combos)
+    failures += check_clamp_trap(combos)
     stripped = check_stripped()
     failures += stripped
     if stripped == 0:

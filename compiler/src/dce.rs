@@ -98,7 +98,12 @@ fn collect_stmt(s: &Stmt, out: &mut HashSet<String>) {
 
 fn collect_expr(e: &Expr, out: &mut HashSet<String>) {
     match e {
-        Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
+        Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
+Expr::PatScrutinee(_) => {
+            unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+        }
+        Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
+        Expr::PatArity { .. } => unreachable!("sema rewrites PatArity into `true`"),
         Expr::Call { name, args, .. } => {
             out.insert(name.clone());
             for a in args {
@@ -130,6 +135,11 @@ fn collect_expr(e: &Expr, out: &mut HashSet<String>) {
         }
         Expr::ArrayLit(v, _) => collect_expr(v, out),
         Expr::ArrayList(vs) => {
+            for v in vs {
+                collect_expr(v, out);
+            }
+        }
+        Expr::TupleLit(vs) => {
             for v in vs {
                 collect_expr(v, out);
             }

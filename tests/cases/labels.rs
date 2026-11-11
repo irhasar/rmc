@@ -1,3 +1,5 @@
+enum Opt { None, Some(i64) }
+
 fn main() {
     // `break 'outer` from a `while` nested in a labelled `loop`.
     let mut i: i64 = 0;
@@ -55,4 +57,28 @@ fn main() {
         }
     }
     println!("{}", w);
+
+    // A label on `while let` attaches to the `loop` it desugars to, so
+    // `break 'a` / `continue 'a` in the body target it.
+    let mut e: Opt = Opt::Some(1);
+    let mut n: i64 = 0;
+    'a: while let Opt::Some(x) = e {
+        n += x;
+        if n >= 3 {
+            break 'a;
+        }
+        e = Opt::Some(n);
+    }
+    println!("{}", n);
+
+    // A `break 'b` from an inner `while` leaves the labelled `while let`.
+    let mut m: i64 = 0;
+    let mut f: Opt = Opt::Some(1);
+    'b: while let Opt::Some(x) = f {
+        while true {
+            m += x;
+            break 'b;
+        }
+    }
+    println!("{}", m);
 }

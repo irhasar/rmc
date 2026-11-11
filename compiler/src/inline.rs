@@ -144,7 +144,7 @@ fn stmt_ok(s: &Stmt) -> bool {
 /// that could itself grow.
 fn expr_ok(e: &Expr) -> bool {
     match e {
-        Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {
+        Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {
             true
         }
         Expr::Bin(_, a, b) => expr_ok(a) && expr_ok(b),
@@ -190,7 +190,12 @@ fn count_stmt(s: &Stmt) -> usize {
 fn count_expr(e: &Expr) -> usize {
     let n = |x: &Box<Expr>| count_expr(x);
     match e {
-        Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => 1,
+        Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => 1,
+Expr::PatScrutinee(_) => {
+            unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+        }
+        Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
+        Expr::PatArity { .. } => unreachable!("sema rewrites PatArity into `true`"),
         Expr::Bin(_, a, b) => 1 + n(a) + n(b),
         Expr::Un(_, a) | Expr::Cast(a, _) => 1 + n(a),
         Expr::Field { base, .. } => 1 + n(base),
@@ -219,6 +224,7 @@ fn count_expr(e: &Expr) -> usize {
         Expr::EnumCtor { args, .. } => 1 + args.iter().map(count_expr).sum::<usize>(),
         Expr::ArrayLit(v, _) => 1 + n(v),
         Expr::ArrayList(v) => 1 + v.iter().map(count_expr).sum::<usize>(),
+        Expr::TupleLit(v) => 1 + v.iter().map(count_expr).sum::<usize>(),
         Expr::VariantTest { scrutinee, .. } => 1 + n(scrutinee),
         Expr::BoolTest { scrutinee, .. } => 1 + n(scrutinee),
         Expr::EnumPayload { recv, .. } => 1 + n(recv),
@@ -299,6 +305,11 @@ impl Inliner {
             return;
         }
         match e {
+Expr::PatScrutinee(_) => {
+                unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+            }
+            Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
+            Expr::PatArity { .. } => unreachable!("sema rewrites PatArity into `true`"),
             Expr::Bin(_, a, b) => {
                 self.walk_expr(a, base, expanding);
                 self.walk_expr(b, base, expanding);
@@ -348,10 +359,15 @@ impl Inliner {
                     self.walk_expr(x, base, expanding);
                 }
             }
+            Expr::TupleLit(v) => {
+                for x in v {
+                    self.walk_expr(x, base, expanding);
+                }
+            }
             Expr::VariantTest { scrutinee, .. } => self.walk_expr(scrutinee, base, expanding),
             Expr::BoolTest { scrutinee, .. } => self.walk_expr(scrutinee, base, expanding),
             Expr::EnumPayload { recv, .. } => self.walk_expr(recv, base, expanding),
-            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
+            Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
         }
     }
 
@@ -475,7 +491,7 @@ impl Inliner {
 /// evaluation: a name, a literal, or a string. Everything else is evaluated once
 /// into a temporary instead.
 fn trivial(e: &Expr) -> bool {
-    matches!(e, Expr::Var { .. } | Expr::Int(_) | Expr::Bool(_) | Expr::Str(_))
+    matches!(e, Expr::Var { .. } | Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_))
 }
 
 /// True for an expression whose evaluation may write memory or call a function,
@@ -553,6 +569,11 @@ fn escaped_slots(stmts: &[Stmt], tail: Option<&Expr>) -> HashSet<i32> {
     }
     fn collect_expr(e: &Expr, out: &mut HashSet<i32>) {
         match e {
+Expr::PatScrutinee(_) => {
+                unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+            }
+            Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
+            Expr::PatArity { .. } => unreachable!("sema rewrites PatArity into `true`"),
             Expr::Bin(_, a, b) => {
                 collect_expr(a, out);
                 collect_expr(b, out);
@@ -610,10 +631,15 @@ fn escaped_slots(stmts: &[Stmt], tail: Option<&Expr>) -> HashSet<i32> {
                     collect_expr(x, out);
                 }
             }
+            Expr::TupleLit(v) => {
+                for x in v {
+                    collect_expr(x, out);
+                }
+            }
             Expr::VariantTest { scrutinee, .. } => collect_expr(scrutinee, out),
             Expr::BoolTest { scrutinee, .. } => collect_expr(scrutinee, out),
             Expr::EnumPayload { recv, .. } => collect_expr(recv, out),
-            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
+            Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
         }
     }
 
@@ -702,6 +728,11 @@ impl Sub<'_> {
             }
         }
         match e {
+Expr::PatScrutinee(_) => {
+                unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+            }
+            Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
+            Expr::PatArity { .. } => unreachable!("sema rewrites PatArity into `true`"),
             Expr::Var { slot, .. } => *slot = self.slot(*slot),
             Expr::Bin(_, a, b) => {
                 self.expr(a);
@@ -772,10 +803,15 @@ impl Sub<'_> {
                     self.expr(x);
                 }
             }
+            Expr::TupleLit(v) => {
+                for x in v {
+                    self.expr(x);
+                }
+            }
             Expr::VariantTest { scrutinee, .. } => self.expr(scrutinee),
             Expr::BoolTest { scrutinee, .. } => self.expr(scrutinee),
             Expr::EnumPayload { recv, .. } => self.expr(recv),
-            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::EnumVariant { .. } => {}
+            Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::EnumVariant { .. } => {}
         }
     }
 }

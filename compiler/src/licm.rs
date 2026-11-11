@@ -131,6 +131,11 @@ impl Licm {
     /// process them. A loop is a statement, so it only appears inside a block.
     fn expr_loops(&mut self, e: &mut Expr) {
         match e {
+Expr::PatScrutinee(_) => {
+                unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+            }
+            Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
+            Expr::PatArity { .. } => unreachable!("sema rewrites PatArity into `true`"),
             Expr::Block(b) | Expr::Loop(b, _, _, _) => self.block(b),
             Expr::MatchBoundary(b, _) => self.block(b),
             Expr::If(c, t, els) => {
@@ -178,10 +183,15 @@ impl Licm {
                     self.expr_loops(x);
                 }
             }
+            Expr::TupleLit(v) => {
+                for x in v {
+                    self.expr_loops(x);
+                }
+            }
             Expr::VariantTest { scrutinee, .. } => self.expr_loops(scrutinee),
             Expr::BoolTest { scrutinee, .. } => self.expr_loops(scrutinee),
             Expr::EnumPayload { recv, .. } => self.expr_loops(recv),
-            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
+            Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
         }
     }
 
@@ -284,6 +294,11 @@ impl Effects {
 
     fn expr(&mut self, e: &Expr) {
         match e {
+Expr::PatScrutinee(_) => {
+                unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+            }
+            Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
+            Expr::PatArity { .. } => unreachable!("sema rewrites PatArity into `true`"),
             Expr::Call { args, .. } => {
                 // A call may write anything, so no local is known invariant.
                 self.all = true;
@@ -347,10 +362,15 @@ impl Effects {
                     self.expr(x);
                 }
             }
+            Expr::TupleLit(v) => {
+                for x in v {
+                    self.expr(x);
+                }
+            }
             Expr::VariantTest { scrutinee, .. } => self.expr(scrutinee),
             Expr::BoolTest { scrutinee, .. } => self.expr(scrutinee),
             Expr::EnumPayload { recv, .. } => self.expr(recv),
-            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
+            Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
         }
     }
 }
@@ -465,6 +485,11 @@ impl Hoister {
             return;
         }
         match e {
+Expr::PatScrutinee(_) => {
+                unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+            }
+            Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
+            Expr::PatArity { .. } => unreachable!("sema rewrites PatArity into `true`"),
             Expr::Bin(_, a, b) => {
                 self.expr(a);
                 self.expr(b);
@@ -512,10 +537,15 @@ impl Hoister {
                     self.expr(x);
                 }
             }
+            Expr::TupleLit(v) => {
+                for x in v {
+                    self.expr(x);
+                }
+            }
             Expr::VariantTest { scrutinee, .. } => self.expr(scrutinee),
             Expr::BoolTest { scrutinee, .. } => self.expr(scrutinee),
             Expr::EnumPayload { recv, .. } => self.expr(recv),
-            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
+            Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => {}
         }
     }
 
@@ -634,7 +664,7 @@ fn fmt_expr(e: &Expr) -> String {
 fn count_expr(e: &Expr) -> usize {
     let n = |x: &Box<Expr>| count_expr(x);
     match e {
-        Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => 1,
+        Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Var { .. } | Expr::EnumVariant { .. } => 1,
         Expr::Bin(_, a, b) => 1 + n(a) + n(b),
         Expr::Un(_, a) | Expr::Cast(a, _) => 1 + n(a),
         Expr::Field { base, .. } => 1 + n(base),

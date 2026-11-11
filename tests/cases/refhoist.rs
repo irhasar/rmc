@@ -1,4 +1,4 @@
-// The Rust twin of `refhoist.rms`: the reference field is null and the loop
+// The reference field is null and the loop
 // never runs, so the read is never performed and the program prints 7.
 struct S { n: i64 }
 struct Holder { p: *const S }

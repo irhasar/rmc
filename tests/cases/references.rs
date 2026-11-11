@@ -1,4 +1,4 @@
-// The Rust twin of `references.rms`. The code is a plain Rust subset, so this
+// The code is a plain Rust subset, so this
 // compiles with rustc unchanged.
 #[derive(Copy, Clone)]
 struct Point { x: i64, y: i64 }

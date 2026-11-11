@@ -11,6 +11,9 @@ pub enum Tok {
     /// it is out of range, matching rustc.
     IntMinMagnitude,
     Str(String),
+    /// A character literal, `'A'`, holding its Unicode scalar value (a `char`
+    /// is 4 bytes in Rust, but every value rmc accepts fits a `u32`).
+    Char(u32),
     /// A loop label, `'name` (the quote is part of the token). Rust labels are
     /// written `'outer: loop { .. }` and targeted by `break 'outer` /
     /// `continue 'outer`.
@@ -32,6 +35,7 @@ pub enum Tok {
     Impl,
     Enum,
     Const,
+    Type,
     For,
     In,
     True,
@@ -39,6 +43,7 @@ pub enum Tok {
     // types
     TyI64,
     TyBool,
+    TyChar,
     // punctuation
     LParen,
     RParen,
@@ -86,6 +91,8 @@ pub enum Tok {
     ShlEq,
     ShrEq,
     Underscore,
+    /// `@`, the binding operator in a pattern: `name @ subpat`.
+    At,
 }
 
 impl Tok {
@@ -96,6 +103,7 @@ impl Tok {
             Tok::Int(v) => format!("integer `{v}`"),
             Tok::IntMinMagnitude => "integer `9223372036854775808`".into(),
             Tok::Str(_) => "string literal".into(),
+            Tok::Char(c) => format!("character `{}`", char::from_u32(*c).unwrap_or('\u{fffd}')),
             Tok::Label(n) => format!("label `'{n}`"),
             Tok::Fn => "`fn`".into(),
             Tok::Let => "`let`".into(),
@@ -111,12 +119,14 @@ impl Tok {
             Tok::As => "`as`".into(),
             Tok::Struct => "`struct`".into(),
             Tok::Const => "`const`".into(),
+            Tok::Type => "`type`".into(),
             Tok::For => "`for`".into(),
             Tok::In => "`in`".into(),
             Tok::True => "`true`".into(),
             Tok::False => "`false`".into(),
             Tok::TyI64 => "`i64`".into(),
             Tok::TyBool => "`bool`".into(),
+            Tok::TyChar => "`char`".into(),
             other => format!("`{}`", other.punct_str()),
         }
     }
@@ -169,6 +179,7 @@ impl Tok {
             Tok::ShlEq => "<<=",
             Tok::ShrEq => ">>=",
             Tok::Underscore => "_",
+            Tok::At => "@",
             _ => "?",
         }
     }
@@ -265,22 +276,47 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 "impl" => Tok::Impl,
                 "enum" => Tok::Enum,
                 "const" => Tok::Const,
+                "type" => Tok::Type,
                 "for" => Tok::For,
                 "in" => Tok::In,
                 "true" => Tok::True,
                 "false" => Tok::False,
                 "i64" => Tok::TyI64,
                 "bool" => Tok::TyBool,
+                "char" => Tok::TyChar,
                 "_" => Tok::Underscore,
                 _ => Tok::Ident(s.to_string()),
             };
             out.push(Token { tok, pos });
             continue;
         }
-        // A loop label: `'name`. A `'` starts a label only when followed by an
-        // identifier; Rust has no character literals, so there is no ambiguity.
+        // A character literal `'A'`, or a loop label `'name`. A `'` starts a
+        // character literal when the next character is a backslash escape or the
+        // character after it is a closing `'`; otherwise it is a label. This is
+        // exactly how rustc disambiguates the two (a label is never followed by
+        // a lone quote).
         if c == b'\'' {
             let start = i;
+            let is_char = if bytes.get(i + 1) == Some(&b'\\') {
+                true
+            } else if bytes.get(i + 1) == Some(&b'\'') {
+                // `''`: an empty character literal, not a label (a label is
+                // never just a quote).
+                true
+            } else if let Some(&b) = bytes.get(i + 1) {
+                // A multi-byte character's bytes are all >= 0x80; step over the
+                // UTF-8 sequence to find the closing quote.
+                let len = utf8_len(b);
+                bytes.get(i + 1 + len) == Some(&b'\'')
+            } else {
+                false
+            };
+            if is_char {
+                let (val, next) = lex_char(src, bytes, start)?;
+                out.push(Token { tok: Tok::Char(val), pos: start as u32 });
+                i = next;
+                continue;
+            }
             i += 1;
             if i >= bytes.len() || !(bytes[i] == b'_' || bytes[i].is_ascii_alphabetic()) {
                 return Err(format!("expected a label name after `'` at byte {start}"));
@@ -338,7 +374,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 i += 1;
             }
             let raw = src[start..i].replace('_', "");
-            let (digits, radix) = if let Some(h) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+            let (body, radix) = if let Some(h) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
                 (h, 16)
             } else if let Some(b) = raw.strip_prefix("0b").or_else(|| raw.strip_prefix("0B")) {
                 (b, 2)
@@ -347,6 +383,19 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             } else {
                 (raw.as_str(), 10)
             };
+            // A trailing integer suffix (`1i64`, `0u8`, `0xffu32`) is not part of
+            // the value: split off the leading run of radix digits and check the
+            // rest against the known suffixes. rmc is `i64`-only, so every
+            // suffix is accepted and lowered to the same value (a `u8`/`u32`
+            // suffix does not change the representation), which lets a Rust
+            // source that names an integer width compile unchanged.
+            let digits_len = body
+                .find(|c: char| c.to_digit(radix).is_none())
+                .unwrap_or(body.len());
+            let (digits, suffix) = body.split_at(digits_len);
+            if !suffix.is_empty() && !is_int_suffix(suffix) {
+                return Err(format!("invalid integer literal `{raw}` at byte {start}"));
+            }
             let v = i64::from_str_radix(digits, radix);
             match v {
                 Ok(v) => out.push(Token { tok: Tok::Int(v), pos }),
@@ -437,6 +486,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             b'^' => Tok::Caret,
             b'!' => Tok::Bang,
             b'.' => Tok::Dot,
+            b'@' => Tok::At,
             _ => return Err(format!("unexpected character `{}` at byte {}", c as char, i)),
         };
         out.push(Token { tok: one, pos });
@@ -458,4 +508,121 @@ fn is_i64_min_magnitude(digits: &str, radix: u32) -> bool {
         8 => trimmed.len() == 22 && trimmed.starts_with('1') && trimmed[1..].bytes().all(|b| b == b'0'),
         _ => false,
     }
+}
+
+/// True when `s` is a Rust integer-literal suffix (`i8`..`i128`, `u8`..`u128`,
+/// `isize`/`usize`). rmc is `i64`-only, so a suffix is accepted but discarded:
+/// the literal's value is unchanged. This lets a Rust source that names a width
+/// (`0u8`, `1i64`, `100usize`) compile, which matters for a `.rs` file.
+fn is_int_suffix(s: &str) -> bool {
+    matches!(
+        s,
+        "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
+            | "u8" | "u16" | "u32" | "u64" | "u128" | "usize"
+    )
+}
+
+/// The length in bytes of the UTF-8 sequence that starts with `b`.
+fn utf8_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b >> 5 == 0b110 {
+        2
+    } else if b >> 4 == 0b1110 {
+        3
+    } else if b >> 3 == 0b11110 {
+        4
+    } else {
+        // A continuation or invalid byte; treat it as one byte so the scan
+        // terminates and the caller reports the malformed literal.
+        1
+    }
+}
+
+/// Lex the character literal that starts at the `'` at `start`. Returns the
+/// scalar value and the index just past the closing `'`.
+fn lex_char(src: &str, bytes: &[u8], start: usize) -> Result<(u32, usize), String> {
+    let mut i = start + 1;
+    let ch = if bytes[i] == b'\\' {
+        let e = *bytes
+            .get(i + 1)
+            .ok_or_else(|| format!("unterminated character literal at byte {start}"))?;
+        i += 2;
+        match e {
+            b'n' => '\n',
+            b't' => '\t',
+            b'r' => '\r',
+            b'0' => '\0',
+            b'\\' => '\\',
+            b'\'' => '\'',
+            b'"' => '"',
+            b'x' => {
+                // `'\xNN'`, exactly two hex digits, and rustc restricts a
+                // character's `\x` escape to the ASCII range (`\xFF` is a valid
+                // byte escape but not a `char`).
+                let hi = hex_val(*bytes.get(i).unwrap_or(&0))
+                    .ok_or_else(|| format!("invalid `\\x` escape at byte {start}"))?;
+                let lo = hex_val(*bytes.get(i + 1).unwrap_or(&0))
+                    .ok_or_else(|| format!("invalid `\\x` escape at byte {start}"))?;
+                i += 2;
+                let v = hi * 16 + lo;
+                if v > 0x7F {
+                    return Err(format!(
+                        "out of range hex escape `\\x{v:02x}` at byte {start} (must be in [\\x00-\\x7f])"
+                    ));
+                }
+                v as u8 as char
+            }
+            b'u' => {
+                // `'\u{NNNN}'`: `{`, hex digits, `}`.
+                if bytes.get(i) != Some(&b'{') {
+                    return Err(format!("expected `{{` after `\\u` at byte {start}"));
+                }
+                i += 1;
+                let ds = i;
+                while i < bytes.len() && bytes[i] != b'}' {
+                    i += 1;
+                }
+                let hex = &src[ds..i];
+                i += 1; // `}`
+                let v = u32::from_str_radix(hex, 16)
+                    .map_err(|_| format!("invalid `\\u{{..}}` escape at byte {start}"))?;
+                char::from_u32(v)
+                    .ok_or_else(|| format!("`\\u{{{hex}}}` is not a Unicode scalar at byte {start}"))?
+            }
+            other => {
+                return Err(format!("unknown escape `\\{}` at byte {}", other as char, start))
+            }
+        }
+    } else {
+        // An empty literal `''` and a bare unescaped quote `'''` both land
+        // here with the quote as the candidate character. rustc tells them
+        // apart by what follows: a second quote means the quote itself was
+        // written unescaped, otherwise the literal is empty.
+        if bytes[i] == b'\'' {
+            if bytes.get(i + 1) == Some(&b'\'') {
+                return Err(format!("character constant must be escaped at byte {start}"));
+            }
+            return Err(format!("empty character literal at byte {start}"));
+        }
+        // A whole character: take its UTF-8 length, then decode.
+        let len = utf8_len(bytes[i]);
+        let s = src
+            .get(i..i + len)
+            .ok_or_else(|| format!("unterminated character literal at byte {start}"))?;
+        let mut cs = s.chars();
+        let ch = cs
+            .next()
+            .ok_or_else(|| format!("empty character literal at byte {start}"))?;
+        i += len;
+        ch
+    };
+    if bytes.get(i) != Some(&b'\'') {
+        return Err(format!("unterminated character literal at byte {start}"));
+    }
+    Ok((ch as u32, i + 1))
+}
+
+fn hex_val(b: u8) -> Option<u32> {
+    (b as char).to_digit(16)
 }

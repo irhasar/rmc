@@ -1,4 +1,4 @@
-// The Rust twin of `listptr.rms`: bump through one arena, write each node's
+// Bump through one arena, write each node's
 // fields through a raw pointer, then chase the links. Same pointer arithmetic
 // as the rmc program, so the printed sum must match.
 struct Node {

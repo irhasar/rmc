@@ -1,4 +1,3 @@
-// Rust twin of whilelet.rms.
 #[derive(Copy, Clone)]
 enum Opt { None, Some(i64) }
 

@@ -1,4 +1,4 @@
-// Differential twin of `incrange.rms`: an inclusive range ending at `i64::MAX`
+// An inclusive range ending at `i64::MAX`
 // must terminate, and `MAX..=MAX` runs exactly once.
 fn main() {
     let mut c = 0i64;

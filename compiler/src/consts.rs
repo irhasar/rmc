@@ -7,11 +7,12 @@
 use crate::ast::{BinOp, Expr, Type, UnOp};
 use std::collections::HashMap;
 
-/// The value of a resolved constant: an `i64` or a `bool`.
+/// The value of a resolved constant: an `i64`, a `bool`, or a `char`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConstVal {
     Int(i64),
     Bool(bool),
+    Char(u32),
 }
 
 /// Resolve a list of `const` items, each `(name, declared type, initializer)`,
@@ -23,11 +24,12 @@ pub enum ConstVal {
 pub fn resolve(items: &[(String, Type, Expr)]) -> HashMap<String, ConstVal> {
     let mut ints: HashMap<String, i64> = HashMap::new();
     let mut bools: HashMap<String, bool> = HashMap::new();
+    let mut chars: HashMap<String, u32> = HashMap::new();
     // Iterate to a fixpoint so a constant may name one declared later.
     loop {
         let mut progress = false;
         for (name, ty, value) in items {
-            if ints.contains_key(name) || bools.contains_key(name) {
+            if ints.contains_key(name) || bools.contains_key(name) || chars.contains_key(name) {
                 continue;
             }
             match ty {
@@ -40,6 +42,12 @@ pub fn resolve(items: &[(String, Type, Expr)]) -> HashMap<String, ConstVal> {
                 Type::Bool => {
                     if let Some(v) = eval_bool(value, &ints, &bools) {
                         bools.insert(name.clone(), v);
+                        progress = true;
+                    }
+                }
+                Type::Char => {
+                    if let Some(v) = eval_char(value, &chars) {
+                        chars.insert(name.clone(), v);
                         progress = true;
                     }
                 }
@@ -57,7 +65,20 @@ pub fn resolve(items: &[(String, Type, Expr)]) -> HashMap<String, ConstVal> {
     for (k, v) in bools {
         out.insert(k, ConstVal::Bool(v));
     }
+    for (k, v) in chars {
+        out.insert(k, ConstVal::Char(v));
+    }
     out
+}
+
+/// A constant `char` expression: a character literal, or another `char`
+/// constant by name.
+pub fn eval_char(e: &Expr, chars: &HashMap<String, u32>) -> Option<u32> {
+    match e {
+        Expr::Char(c) => Some(*c),
+        Expr::Var { name, .. } => chars.get(name).copied(),
+        _ => None,
+    }
 }
 
 /// A constant `i64` expression, resolving a reference to another integer
@@ -68,10 +89,24 @@ pub fn eval_i64(e: &Expr, ints: &HashMap<String, i64>) -> Option<i64> {
         Expr::Var { name, .. } => ints.get(name).copied(),
         Expr::Int(k) => Some(*k),
         Expr::Un(UnOp::Neg, inner) => eval_i64(inner, ints)?.checked_neg(),
+        // A cast to `i64` (or any width, all of which rmc treats as `i64`) is
+        // the identity here, so an array length written `N as usize` still
+        // folds. A cast to `bool` is not an integer and does not.
+        Expr::Cast(inner, ty) if *ty == Type::I64 => eval_i64(inner, ints),
         Expr::Bin(op, a, b) => {
             let x = eval_i64(a, ints)?;
             let y = eval_i64(b, ints)?;
             const_binop_checked(*op, x, y)
+        }
+        // `wrapping_mul` is `*` without the overflow trap, so rustc folds it in
+        // a `const` item (unlike `*`, which is rejected there). The parser sees
+        // the method-call form — the `WrappingMul` operator only appears after
+        // sema lowers the method — so the fold is needed here too, or a
+        // `const K: i64 = a.wrapping_mul(b)` is rejected as non-constant.
+        Expr::MethodCall { recv, name, args } if name == "wrapping_mul" && args.len() == 1 => {
+            let x = eval_i64(recv, ints)?;
+            let y = eval_i64(&args[0], ints)?;
+            Some(x.wrapping_mul(y))
         }
         _ => None,
     }
@@ -125,6 +160,11 @@ pub fn const_i64(e: &Expr) -> Option<i64> {
     match e {
         Expr::Int(k) => Some(*k),
         Expr::Un(UnOp::Neg, inner) => const_i64(inner)?.checked_neg(),
+        // `usize` and the other integer widths are transparent aliases for
+        // `i64`, so `i as usize` (the usual spelling of an index) is an
+        // identity cast that must not hide a constant index from the bound
+        // check.
+        Expr::Cast(inner, ty) if *ty == Type::I64 => const_i64(inner),
         // Fold the integer operators too, so a constant index written as an
         // expression (`a[1 + 4]`) is bounds-checked exactly like a literal.
         Expr::Bin(op, a, b) => {
@@ -135,6 +175,9 @@ pub fn const_i64(e: &Expr) -> Option<i64> {
                 Add => x.checked_add(y),
                 Sub => x.checked_sub(y),
                 Mul => x.checked_mul(y),
+                // `wrapping_mul` never overflows, so it folds to the wrapped
+                // product rather than to `None`.
+                WrappingMul => Some(x.wrapping_mul(y)),
                 Div => x.checked_div(y),
                 Mod => x.checked_rem(y),
                 BitAnd => Some(x & y),
@@ -164,6 +207,9 @@ pub fn const_binop(op: BinOp, a: i64, b: i64) -> Result<i64, String> {
         Add => a.overflowing_add(b),
         Sub => a.overflowing_sub(b),
         Mul => a.overflowing_mul(b),
+        // `wrapping_mul` is the one arithmetic op that cannot trap, so its
+        // constant fold is always defined.
+        WrappingMul => (a.wrapping_mul(b), false),
         Div | Mod => {
             if b == 0 {
                 return Err("division by zero panics at run time".into());
@@ -201,6 +247,7 @@ pub fn const_binop_checked(op: BinOp, a: i64, b: i64) -> Option<i64> {
         Add => a.overflowing_add(b),
         Sub => a.overflowing_sub(b),
         Mul => a.overflowing_mul(b),
+        WrappingMul => (a.wrapping_mul(b), false),
         Div | Mod => {
             if b == 0 || (a == i64::MIN && b == -1) {
                 return None;

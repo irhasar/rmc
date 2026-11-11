@@ -10,6 +10,11 @@
 pub enum Type {
     I64,
     Bool,
+    /// `char`: one Unicode scalar value, held in a 32-bit slot. A `char`
+    /// converts to an integer with `as` and compares as one, but is a distinct
+    /// type, so `c + 1` is rejected just as rustc rejects it. The slot is 8
+    /// bytes like every other scalar (see `size`).
+    Char,
     Unit,
     Array(Box<Type>, usize),
     /// A struct: its name and its size in bytes. Sizes are computed by sema so
@@ -46,7 +51,7 @@ pub enum Type {
 impl Type {
     pub fn size(&self) -> usize {
         match self {
-            Type::I64 | Type::Bool | Type::Str | Type::Enum(_) | Type::Ref(..) => 8,
+            Type::I64 | Type::Bool | Type::Char | Type::Str | Type::Enum(_) | Type::Ref(..) => 8,
             Type::EnumData(_, size) => *size,
             Type::Unit | Type::Never => 0,
             Type::Array(elem, n) => elem.size() * n,
@@ -56,19 +61,22 @@ impl Type {
     }
 
     /// True for the types that fit in a single 8-byte slot and travel in one
-    /// register: `i64`, `bool` and an enum. They may be parameters, fields and
-    /// return values.
+    /// register: `i64`, `bool`, `char` and an enum. They may be parameters,
+    /// fields and return values.
     pub fn is_scalar(&self) -> bool {
-        matches!(self, Type::I64 | Type::Bool | Type::Str | Type::Enum(_) | Type::Ref(..))
+        matches!(
+            self,
+            Type::I64 | Type::Bool | Type::Char | Type::Str | Type::Enum(_) | Type::Ref(..)
+        )
     }
 
     /// True for the types an array element may have: the 8-byte integer-like
-    /// scalars `i64`, `bool` and a unit enum. A unit enum occupies one slot and
-    /// codegen emits it exactly as it emits `i64`, so `[E; N]` lays out and
-    /// indexes correctly. A payload enum or a reference is excluded, matching
-    /// rustc, which rejects both as array elements.
+    /// scalars `i64`, `bool`, `char` and a unit enum. A unit enum occupies one
+    /// slot and codegen emits it exactly as it emits `i64`, so `[E; N]` lays out
+    /// and indexes correctly. A payload enum or a reference is excluded,
+    /// matching rustc, which rejects both as array elements.
     pub fn is_int_or_bool(&self) -> bool {
-        matches!(self, Type::I64 | Type::Bool | Type::Enum(_))
+        matches!(self, Type::I64 | Type::Bool | Type::Char | Type::Enum(_))
     }
 
     /// True for the types an array element may have now that nested aggregates
@@ -77,15 +85,75 @@ impl Type {
     /// `size() / 8` slots. A payload enum, a reference and `str` stay excluded
     /// (rustc rejects a payload enum and a reference as array elements too).
     pub fn is_array_elem(&self) -> bool {
-        matches!(self, Type::I64 | Type::Bool | Type::Enum(_) | Type::Array(..) | Type::Struct(..))
+        matches!(
+            self,
+            Type::I64 | Type::Bool | Type::Char | Type::Enum(_) | Type::Array(..) | Type::Struct(..)
+        )
     }
 
     /// True for the aggregate types that live in memory: arrays and structs.
     /// They are named by their address, so they are passed to and returned from
-    /// a function by pointer rather than by value.
+    /// a function by pointer rather than by value. A tuple is lowered to an
+    /// anonymous struct by the parser, so it is a `Struct` here too.
     pub fn is_aggregate(&self) -> bool {
         matches!(self, Type::Array(..) | Type::Struct(..) | Type::EnumData(..))
     }
+
+    /// A canonical, injective key for a type, used to name the anonymous struct
+    /// that holds a tuple. Two tuples share one struct exactly when their
+    /// element-type keys match, so a tuple *type* `(i64, i64)` the user wrote and
+    /// a tuple *literal* `(1, 2)` sema inferred resolve to the same struct.
+    ///
+    /// The parser computes a tuple type's key before it knows whether a named
+    /// type is a struct or an enum, so every user type keys by its *name* alone
+    /// (`T{name}`); sema then keys the resolved `Struct`/`Enum` the same way, and
+    /// the two agree. Atoms carry no `(`/`,`/`)`, a nested tuple keys as its own
+    /// already-balanced `\0tuple(..)` name, and every other type keys as a prefix
+    /// code over those characters, so the encoding stays unambiguous.
+    pub fn key(&self) -> String {
+        match self {
+            Type::I64 => "i".to_string(),
+            Type::Bool => "b".to_string(),
+            Type::Char => "c".to_string(),
+            Type::Str => "s".to_string(),
+            Type::Unit => "u".to_string(),
+            Type::Never => "!".to_string(),
+            Type::Ref(t, m) => format!("r{}{}", if *m { "m" } else { "" }, t.key()),
+            Type::Array(t, n) => format!("a{n}:{}", t.key()),
+            // A lowered tuple is a struct whose name is the canonical
+            // `\0tuple(..)`; key it as itself so nesting is unambiguous.
+            Type::Struct(n, _) | Type::Enum(n) | Type::EnumData(n, _) => {
+                if is_tuple_name(n) {
+                    n.clone()
+                } else {
+                    format!("T{n}")
+                }
+            }
+            // `str` is spelled `Named("str")` until sema resolves it.
+            Type::Named(n) if n == "str" => "s".to_string(),
+            Type::Named(n) => {
+                if is_tuple_name(n) {
+                    n.clone()
+                } else {
+                    format!("T{n}")
+                }
+            }
+        }
+    }
+}
+
+/// The name of the anonymous struct laying out a tuple with these element-type
+/// keys, in order. Injective: the keys are a balanced-parenthesis term encoding,
+/// so two different element lists never share a name.
+pub fn tuple_struct_name(elem_keys: &[String]) -> String {
+    format!("\u{0}tuple({})", elem_keys.join(","))
+}
+
+/// True for the anonymous structs `tuple_struct_name` produces. The name starts
+/// with a NUL, which no source identifier can contain, so it can never collide
+/// with a user struct or be written in source.
+pub fn is_tuple_name(name: &str) -> bool {
+    name.starts_with("\u{0}tuple(")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +161,10 @@ pub enum BinOp {
     Add,
     Sub,
     Mul,
+    /// `i64::wrapping_mul`, i.e. `Mul` without the overflow trap. Only the
+    /// inherent method `x.wrapping_mul(y)` produces it; a written `x * y`
+    /// always maps to `Mul`.
+    WrappingMul,
     Div,
     Mod,
     Eq,
@@ -120,6 +192,10 @@ pub enum UnOp {
 pub enum Expr {
     Int(i64),
     Bool(bool),
+    /// A character literal `'A'`, holding its Unicode scalar value. It has type
+    /// `char` and codegen emits it as an `i64` immediate, exactly like an
+    /// integer.
+    Char(u32),
     /// String literal; evaluates to a pointer to a `{len, bytes}` record in
     /// `.rodata`. Given type `i64` so it can be passed to runtime helpers.
     Str(String),
@@ -141,6 +217,11 @@ pub enum Expr {
         ret_slot: i32,
         ret_ty: Type,
     },
+    /// `(a, b, ...)`: a tuple literal. `sema` resolves its element types and
+    /// rewrites it into a `StructLit` of the anonymous struct that lays the
+    /// elements out, so codegen never sees this node. It is produced by the
+    /// parser, which does not type-check.
+    TupleLit(Vec<Expr>),
     If(Box<Expr>, Block, Option<Block>),
     /// `loop { .. }`. It is always an expression: a `loop` in statement
     /// position is a `Stmt::Expr` around this node with `slot == -2`, so its
@@ -214,9 +295,15 @@ pub enum Expr {
         enum_name: String,
         variant: String,
         tag: i64,
-        /// How many payload names the pattern bound; -1 when it had no
-        /// parentheses, which is an error for a variant that has a payload.
+        /// How many payload fields the pattern bound with an explicit argument
+        /// pattern (`E::V(a, b)`, a `_`, a nested pattern or a trailing `..`);
+        /// -1 when the pattern had no parentheses, which is an error for a
+        /// variant that has a payload.
         n_binds: i32,
+        /// The pattern ended in `..` (`E::V(a, ..)`), so the remaining payload
+        /// fields are ignored rather than named. Only meaningful when the
+        /// pattern has an argument list (`n_binds >= 0`).
+        has_rest: bool,
     },
     /// `value == true`/`false`, as a `bool`. The arm test a `bool` literal
     /// pattern desugars to. It is a distinct node rather than a plain
@@ -249,6 +336,32 @@ pub enum Expr {
     /// Reading an aggregate yields its address, exactly as naming a struct local
     /// does.
     Deref { expr: Box<Expr>, ty: Type },
+    /// The scrutinee of a *scalar* pattern (`match x { 5 => .. }`), which match
+    /// ergonomics may need to dereference. A variant or struct pattern already
+    /// derefs its scrutinee in `sema`, but a literal, range or bool pattern
+    /// desugars to a plain comparison (`s == 5`), which `sema` rejects for a
+    /// `&i64` scrutinee. The parser cannot insert the deref itself: it does not
+    /// know the scrutinee's type, and rustc derefs only a *reference* (a scalar
+    /// scrutinee must stay untouched). This marker wraps such a scrutinee so
+    /// `sema`, which knows the type, can rewrite it to `Deref` when it is a
+    /// reference and to the bare expression otherwise. It is consumed by
+    /// `sema::check_expr` and never survives to codegen.
+    PatScrutinee(Box<Expr>),
+    /// A struct pattern's claim that its scrutinee has the named struct type:
+    /// `A` in `A { x }` or `A { .. }`. Sema checks it against the scrutinee's
+    /// actual type and rewrites it to `true`, so it never reaches codegen. It is
+    /// emitted even for a pattern that binds no fields, and for a nested
+    /// pattern, so a pattern for one struct cannot bind a same-named field of
+    /// another (`let A { x } = B { x: 7 }` is rejected, as rustc rejects it).
+    PatCheck { base: Box<Expr>, pat_struct: String },
+    /// An array or tuple pattern's claim about its scrutinee's arity: the
+    /// number of elements an array pattern names (`[a, b]` -> 2) or the field
+    /// count of a tuple pattern. Sema checks it against the scrutinee's actual
+    /// length and rewrites it to `true`, so it never reaches codegen. rustc
+    /// requires the counts to match exactly, so `let [x] = [1, 2];` and
+    /// `let (x,) = (1, 2);` are errors; without this marker the extra element
+    /// would simply never be read and the pattern would silently match.
+    PatArity { base: Box<Expr>, want: usize, is_tuple: bool },
 }
 
 /// A field inside a struct literal, once sema has resolved its layout.
@@ -342,6 +455,14 @@ pub struct FnDef {
     /// non-`mut` parameter is an immutable binding, so assigning it is rejected
     /// like rustc; `mut x: T` allows the body to rebind it (a local copy).
     pub param_mut: Vec<bool>,
+    /// Per-parameter destructuring patterns, parallel to `params`. A `None`
+    /// entry is a plain `p: T` parameter. A `Some(pattern)` entry is an
+    /// aggregate parameter written as a pattern (`S { x, y }: S`, `[a, b]:
+    /// [i64; 2]`): the parameter itself is an ordinary named parameter, and
+    /// these statements (spliced at the top of the body by `sema`) bind the
+    /// pattern's names from it. The pattern has no separate type, so its names
+    /// read through the parameter.
+    pub param_pats: Vec<Option<Vec<Stmt>>>,
     pub ret: Type,
     pub body: Block,
     /// Frame slot of each parameter, in order, filled in by `sema`. An aggregate

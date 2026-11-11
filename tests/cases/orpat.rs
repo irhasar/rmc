@@ -1,4 +1,3 @@
-// Rust twin of orpat.rms.
 #[derive(Copy, Clone)]
 enum Color { Red, Green, Blue }
 

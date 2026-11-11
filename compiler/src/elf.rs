@@ -482,7 +482,9 @@ impl Elf {
                 self.sections[sec].data.extend_from_slice(&[0x48, 0x99]);
                 Ok(())
             }
-            "sal" | "shl" | "sar" | "shr" => self.enc_shift(mnem, &ops, sec),
+            "sal" | "shl" | "sar" | "shr" | "rol" | "ror" => {
+                self.enc_shift(mnem, &ops, sec)
+            }
             "jmp" => {
                 self.sections[sec].data.push(0xE9);
                 self.pc_rel(sec, &ops[0]);
@@ -511,6 +513,7 @@ impl Elf {
             }
             "sete" | "setne" | "setl" | "setle" | "setg" | "setge" | "setb" | "setbe" | "seta"
             | "setae" => self.enc_setcc(mnem, &ops, sec),
+            "bswap" => self.enc_bswap(&ops, sec),
             j if j.starts_with('j') => self.enc_jcc(j, &ops, sec),
             other => Err(format!("elf: unsupported instruction `{other}`")),
         }
@@ -876,7 +879,12 @@ impl Elf {
             _ => unreachable!(),
         };
         let (reg, _) = parse_reg(&ops[0])?;
-        self.sections[sec].data.push(rex(true, ext, reg));
+        // Operand size follows the named register, like `enc_div`: `dec %ecx`
+        // is 32-bit and must not set REX.W, or the in-process bytes differ from
+        // `as`. A 64-bit operand still sets it.
+        if let Some(r) = rex_if_needed(reg_is_64(&ops[0]), ext, reg) {
+            self.sections[sec].data.push(r);
+        }
         // `inc`/`dec` are group-5 (`FF /0,/1`); `not`/`neg` are group-3
         // (`F7 /2,/3`). Using `FF` for `not`/`neg` would encode `call far`.
         self.sections[sec].data.push(if mnem == "inc" || mnem == "dec" { 0xFF } else { 0xF7 });
@@ -905,20 +913,39 @@ impl Elf {
             "sal" | "shl" => 4u8,
             "shr" => 5,
             "sar" => 7,
+            "rol" => 0,
+            "ror" => 1,
             _ => unreachable!(),
         };
         let (reg, _) = parse_reg(&ops[1])?;
+        // Width follows the shifted operand: `shr $6, %ecx` must stay 32-bit
+        // (no REX.W) so the in-process encoding matches `as`. A 64-bit operand
+        // still sets REX.W.
+        let w = !reg_is_32(&ops[1]);
         if let Some(rest) = ops[0].strip_prefix('$') {
             let n = parse_imm(rest)?;
-            self.sections[sec].data.push(rex(true, ext, reg));
+            if let Some(r) = rex_if_needed(w, ext, reg) {
+                self.sections[sec].data.push(r);
+            }
             self.sections[sec].data.push(0xC1);
             modrm_reg_reg(&mut self.sections[sec].data, ext, reg);
             self.sections[sec].data.push((n as u8) & 0x3F);
             return Ok(());
         }
-        self.sections[sec].data.push(rex(true, ext, reg));
+        if let Some(r) = rex_if_needed(w, ext, reg) {
+            self.sections[sec].data.push(r);
+        }
         self.sections[sec].data.push(0xD3);
         modrm_reg_reg(&mut self.sections[sec].data, ext, reg);
+        Ok(())
+    }
+
+    /// `bswap %r64` (0F C8+rd). `movbe` needs SSE4.1 and a memory operand; a
+    /// single register `bswap` is the whole 64-bit reversal of byte order.
+    fn enc_bswap(&mut self, ops: &[String], sec: usize) -> Result<(), String> {
+        let (reg, _) = parse_reg(&ops[0])?;
+        self.sections[sec].data.push(rex(true, 0, reg));
+        self.sections[sec].data.extend_from_slice(&[0x0F, 0xC8 + (reg & 7)]);
         Ok(())
     }
 
@@ -1569,5 +1596,52 @@ mod tests {
         let mut out = Vec::new();
         emit_mem_op(&mut out, 0x8B, &mem("(%rbp)"), 0, true, false);
         assert_eq!(out, [0x48, 0x8B, 0x45, 0x00]);
+    }
+
+    #[test]
+    fn bswap_names_its_register_in_the_opcode() {
+        // `bswap %r64` is `0F C8+rd`: the register index lives in the low three
+        // opcode bits, so there is no ModRM byte and the index is REX.B (not
+        // REX.R). `%rax` is `48 0F C8` and `%r9` is `49 0F C9`, matching `as`.
+        let mut e = test_elf(0x5);
+        e.instruction("bswap %rax", 0).unwrap();
+        assert_eq!(e.sections[0].data[3..], [0x48, 0x0F, 0xC8]);
+        let mut e = test_elf(0x5);
+        e.instruction("bswap %r9", 0).unwrap();
+        assert_eq!(e.sections[0].data[3..], [0x49, 0x0F, 0xC9]);
+    }
+
+    #[test]
+    fn rotate_uses_group2_slash0_and_slash1() {
+        // `rol`/`ror` share group-2 with `shl`/`shr`/`sar` but use /0 and /1.
+        // The count-by-`%cl` form is `D3`, the immediate form `C1`; `%r9` needs
+        // REX.B. All four match `as`.
+        let mut e = test_elf(0x5);
+        e.instruction("rol %cl, %rax", 0).unwrap();
+        assert_eq!(e.sections[0].data[3..], [0x48, 0xD3, 0xC0]);
+        let mut e = test_elf(0x5);
+        e.instruction("ror %cl, %rax", 0).unwrap();
+        assert_eq!(e.sections[0].data[3..], [0x48, 0xD3, 0xC8]);
+        let mut e = test_elf(0x5);
+        e.instruction("rol $3, %r9", 0).unwrap();
+        assert_eq!(e.sections[0].data[3..], [0x49, 0xC1, 0xC1, 0x03]);
+    }
+
+    #[test]
+    fn a_shift_follows_the_operand_width() {
+        // A 32-bit shift must not set REX.W: `shr $6, %ecx` is `C1 E9 06`,
+        // while `shr $6, %rcx` is `48 C1 E9 06`. Hardcoding REX.W made the
+        // in-process encoding of a 32-bit shift differ from `as` (and made the
+        // CPU shift the wrong width).
+        let mut e = test_elf(0x5);
+        e.instruction("shr $6, %ecx", 0).unwrap();
+        assert_eq!(e.sections[0].data[3..], [0xC1, 0xE9, 0x06]);
+        let mut e = test_elf(0x5);
+        e.instruction("shr $6, %rcx", 0).unwrap();
+        assert_eq!(e.sections[0].data[3..], [0x48, 0xC1, 0xE9, 0x06]);
+        // The count-by-`%cl` form follows the width too.
+        let mut e = test_elf(0x5);
+        e.instruction("shl %cl, %eax", 0).unwrap();
+        assert_eq!(e.sections[0].data[3..], [0xD3, 0xE0]);
     }
 }

@@ -894,7 +894,13 @@ impl Codegen {
     ) {
         match e {
             Expr::ArrayList(_) => unreachable!("sema rewrites ArrayList into a block"),
+            Expr::TupleLit(_) => unreachable!("sema rewrites TupleLit into a StructLit"),
             Expr::MethodCall { .. } => unreachable!("sema rewrites MethodCall into a Call"),
+Expr::PatScrutinee(_) => {
+                unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+            }
+            Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
+            Expr::PatArity { .. } => unreachable!("sema rewrites PatArity into `true`"),
             Expr::EnumVariant { .. } => {} // a tag has no subexpressions
             Expr::EnumCtor { args, slot, size, .. } => {
                 for a in args {
@@ -1032,7 +1038,7 @@ impl Codegen {
             Expr::ArrayLit(v, _) => {
                 Self::count_expr(v, counts, mem, copied, true, let_tmps)
             }
-            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) => {}
+            Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) => {}
         }
     }
 
@@ -1848,7 +1854,13 @@ impl Codegen {
     fn gen_expr(&mut self, e: &Expr) -> Type {
         match e {
             Expr::ArrayList(_) => unreachable!("sema rewrites ArrayList into a block"),
+            Expr::TupleLit(_) => unreachable!("sema rewrites TupleLit into a StructLit"),
             Expr::MethodCall { .. } => unreachable!("sema rewrites MethodCall into a Call"),
+Expr::PatScrutinee(_) => {
+                unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+            }
+            Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
+            Expr::PatArity { .. } => unreachable!("sema rewrites PatArity into `true`"),
             Expr::EnumVariant { tag, .. } => {
                 self.line(&format!("mov ${tag}, %rax"));
                 Type::I64
@@ -1936,6 +1948,10 @@ impl Codegen {
             Expr::Int(v) => {
                 self.line(&format!("mov ${v}, %rax"));
                 Type::I64
+            }
+            Expr::Char(c) => {
+                self.line(&format!("mov ${c}, %rax"));
+                Type::Char
             }
             Expr::Bool(b) => {
                 self.line(&format!("mov ${}, %rax", if *b { 1 } else { 0 }));
@@ -2191,6 +2207,7 @@ impl Codegen {
     fn simple_operand(&self, e: &Expr) -> Option<String> {
         match e {
             Expr::Int(v) if (-2_147_483_648..=2_147_483_647).contains(v) => Some(format!("${v}")),
+            Expr::Char(c) if *c <= 2_147_483_647 => Some(format!("${c}")),
             Expr::Bool(b) => Some(format!("${}", if *b { 1 } else { 0 })),
             Expr::Var { slot, ty, .. } => {
                 if ty.is_aggregate() {
@@ -2428,7 +2445,7 @@ impl Codegen {
             return true;
         }
         match e {
-            Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::EnumVariant { .. } => false,
+            Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::EnumVariant { .. } => false,
             Expr::Var { .. } => false,
             Expr::Field { base, .. } => self.uses_reg(base, r),
             Expr::Bin(_, a, b) => self.uses_reg(a, r) || self.uses_reg(b, r),
@@ -2449,9 +2466,14 @@ impl Codegen {
             }
             Expr::Block(b) | Expr::Loop(b, _, _, _) => self.block_uses_reg(b, r),
             Expr::MatchBoundary(b, _) => self.block_uses_reg(b, r),
-            Expr::ArrayList(_) | Expr::MethodCall { .. } => {
-                unreachable!("sema rewrites ArrayList and MethodCall")
+            Expr::ArrayList(_) | Expr::TupleLit(_) | Expr::MethodCall { .. } => {
+                unreachable!("sema rewrites ArrayList, TupleLit and MethodCall")
             }
+Expr::PatScrutinee(_) => {
+                unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
+            }
+            Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
+            Expr::PatArity { .. } => unreachable!("sema rewrites PatArity into `true`"),
         }
     }
 
@@ -2559,6 +2581,17 @@ impl Codegen {
 
     fn gen_bin(&mut self, op: BinOp, a: &Expr, b: &Expr) -> Type {
         use BinOp::*;
+        // `wrapping_mul` is `*` with no overflow guard. Run the whole `Mul`
+        // path with the guard suppressed and the trap-restoring `jo` turned
+        // off, so the constant folds, the `lea` scaling and the operand
+        // selection are all shared and only the `jo` differs.
+        if op == WrappingMul {
+            let saved = self.overflow;
+            self.overflow = false;
+            let t = self.gen_bin(Mul, a, b);
+            self.overflow = saved;
+            return t;
+        }
         match op {
             And | Or => {
                 let short = self.new_label();
