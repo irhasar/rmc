@@ -448,14 +448,17 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   Before this, an `&self` accessor over an 8-field struct emitted ~3 instructions
   per field and the `refs` benchmark ran at 69 ms; the fold brought rmc's own
   runtime down ~1.4x to ~50 ms. Inlining the accessors then removed the calls
-  entirely, taking `refs` to ~20 ms, and LICM hoisted the now-inlined struct
-  reads out of the loop, taking it to ~6 ms. Flattening the accumulator fold over
-  the nested sum LICM leaves (`acc + t + (t + p) + p`), and unwrapping the
-  inliner's spliced block so the fold can see it, took `refs` to ~4.7 ms. Against
-  an honest rustc twin (which `black_box`es a term, or LLVM closes the whole loop
-  into `128 * n`) that is ~0.8x, not the ~0.14x an earlier run reported from the
-  folded loop; rustc is only ~1.2x ahead now, keeping the struct in registers
-  across the loop, which rmc does not. The fold is deliberately *one* level deep:
+  entirely, taking `refs` to ~20 ms. The current `refs` benchmark reaches its
+  fields through a `&Wide`, and LICM deliberately does *not* hoist a read through
+  a reference: rmc's `&T` carries no guarantee that it is dereferenceable, so a
+  speculative load out of a loop that might never run could fault where the
+  source would not. The loop therefore reloads all eight fields (and both
+  products) every iteration, and `refs` sits at ~0.12x an honest rustc twin
+  (which `black_box`es a term, or LLVM closes the whole loop into `128 * n`).
+  A frame-based loop of the same shape *is* hoisted - LICM speculates a field
+  read through a local aggregate because that access cannot fault - and wins; the
+  gap is the reference, not the arithmetic. The fold is deliberately *one* level
+  deep:
   a `*p` used as a reference has its pointer in memory, so `ptr_reg` only matches
   a reference *local*, never a `Deref`. `addr_reg` (local or one `Deref` of a
   local) is the form `gen_addr` folds for a `lea`. Extending either to a deeper
@@ -1871,7 +1874,9 @@ comparison site; there is no lifetime checking, so a `&'static str` field or
 
 There is no `Vec`, but the parser folds the few shapes the corpus uses to an
 `i64` address: `Vec::with_capacity(k)`/`Vec::new()` become `alloc(k * 8)`,
-`vec![e; n]` becomes `alloc(n * 8)` plus a `__rmc_fill`, `v.capacity()`/`v.len()`
+`vec![e; n]` becomes `alloc(n * elem_width)` plus a `__rmc_fill` (or
+`__rmc_fill_bytes` for a one-byte element, which fills `n` bytes with `rep stosb`
+rather than `n` words), `v.capacity()`/`v.len()`
 fold to the constant count, and `v.as_mut_ptr()` keeps the address so a later
 `.add(off)` is `p + off * elem`, scaling by the element width from the `Vec<T>`
 annotation (`Vec<u8>` stays byte-addressed, and a `type Byte = u8` alias is
@@ -1880,8 +1885,9 @@ in a `let` initializer; anywhere else the `\0`-prefixed parser marker reaches
 sema, which reports the source construct (see the `\0vecnew` arm). An
 args-vector is never built: `std::env::args()...collect()` records the binding,
 `for v in &args` desugars to `for i in skip..__rmc_nargs()`, and `args[i]`
-becomes `__rmc_arg_or(i + skip, 0)`. The `__rmc_arg_or`, `__rmc_nargs` and
-`__rmc_fill` helpers live in `runtime.rs`. Two relaxations make the pointer
+becomes `__rmc_arg_or(i + skip, 0)`. The `__rmc_arg_or`, `__rmc_nargs`,
+`__rmc_fill` and `__rmc_fill_bytes` helpers live in `runtime.rs`. Two relaxations
+make the pointer
 shapes type: `*mut T as i64` is allowed (rmc maps `*mut T` and `&mut T` alike,
 and rustc allows the raw form) and an integer/pointer coerce both ways, matching
 the existing `i64 as &T` extension; a shared reference still may not become a

@@ -854,13 +854,15 @@ with a length or capacity field, so only the methods below are understood.
 | source                              | lowered to                                    |
 | ----------------------------------- | --------------------------------------------- |
 | `let v: Vec<i64> = Vec::with_capacity(k);` | `alloc(k * 8)`; `v.capacity()` is `k`  |
-| `let v: Vec<u8> = vec![e; n];`      | `alloc(n * 8)` filled by `__rmc_fill`         |
+| `let v: Vec<u8> = vec![e; n];`      | `alloc(n)` filled by `__rmc_fill_bytes` (one byte per element) |
 | `v.len()` (constant `n`)            | `n`                                           |
 | `v.as_mut_ptr()` / `v.as_ptr()`     | the address; a following `.add(off)` is `p + off * elem` |
 | `let a: Vec<i64> = std::env::args().skip(k).map(..).collect();` | no allocation at all (see below) |
 
-`vec![e; n]` takes a runtime `n`; `alloc` and `__rmc_fill` both take it as a
-value. A `vec![a, b, c]` list form is rejected. `add(off)` scales `off` by the
+`vec![e; n]` takes a runtime `n`; `alloc` and the fill helper both take it as a
+value, and the allocation is `n * elem_width` bytes (`elem_width` is 1 for a
+`u8`/`i8` element and 8 otherwise, so a `Vec<u8>` allocates `n` bytes and a
+`Vec<i64>` `n` words). A `vec![a, b, c]` list form is rejected. `add(off)` scales `off` by the
 element width taken from the `Vec<T>` annotation, so a `Vec<i64>` pointer steps
 a whole word while a `Vec<u8>` stays byte-addressed. An args-vector is never
 materialised: `for v in &args` desugars to `for i in k..__rmc_nargs()` and

@@ -29,11 +29,12 @@ fn main() {
         // loop disappears. `black_box` on a term is what stops that: it forces
         // a store/reload per iteration, which is why the Rust loop is not
         // instruction-identical to the rmc one. The rmc side has no `black_box`
-        // (it is a compiler, not a benchmark language) and instead relies on
-        // licm to hoist the invariant method results; both end up adding a
-        // constant per iteration, but only the Rust side pays the barrier.
-        // Treat the `refs` ratio as "two real loops doing the same arithmetic",
-        // not as an instruction-for-instruction tie.
+        // (it is a compiler, not a benchmark language) and its licm deliberately
+        // will not hoist a read through a reference (rmc's `&T` is not known to
+        // be dereferenceable, so a speculative load could fault), so the rmc
+        // loop reloads all eight fields every iteration. Read the `refs` ratio
+        // as "two real loops doing the same arithmetic", not as an
+        // instruction-for-instruction tie.
         acc = acc + std::hint::black_box(wr.total()) + sum_via_ref(wr) + wr.pair();
         i += 1;
     }

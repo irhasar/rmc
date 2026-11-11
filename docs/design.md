@@ -634,14 +634,15 @@ the speed of the code it produces. The non-trivial
 passes are division by a constant (1.4x on `mandel.rs`), the top-five local
 promotion (a few percent on `mix` and `sieve`), the reference-operand folds plus
 `trim_dead` (1.4x on the `refs` benchmark), inlining (2.6x on `refs`, by removing
-the three accessor calls from its hot loop), and loop-invariant code motion (a
-further 2.9x on `refs`, by hoisting the now-inlined struct reads out of the
-loop), the self-recursion rewrite (2.0x on `fib`, by halving its call tree);
-everything else is local and cheap to compute. Flattening the accumulator
-fold over a nested sum, plus unwrapping the inliner's spliced block so the fold
-can see the accessor arithmetic, is what turns LICM's three hoisted values into
-a six-instruction loop (`refs` 6.4 → 4.7 ms of rmc's own runtime, within ~20% of
-an honest rustc twin).
+the three accessor calls from its hot loop), and the self-recursion rewrite (2.0x
+on `fib`, by halving its call tree); everything else is local and cheap to
+compute. LICM hoists a field read through a *local aggregate* (it cannot fault)
+but deliberately not one through a reference (rmc's `&T` is not known to be
+dereferenceable, so a speculative load could fault on a loop that never runs).
+The current `refs` benchmark reaches its fields through a `&Wide`, so its loop
+reloads all eight fields each iteration and `refs` sits at ~0.12x an honest
+rustc twin; a frame-based loop of the same shape is hoisted to one add per
+iteration and wins.
 
 On the language side the notable absences are: `u*`/`i*` widths other than
 `i64`, floating point, traits and generics, closures, `for` over arbitrary
