@@ -514,6 +514,20 @@ impl Elf {
             "sete" | "setne" | "setl" | "setle" | "setg" | "setge" | "setb" | "setbe" | "seta"
             | "setae" => self.enc_setcc(mnem, &ops, sec),
             "bswap" => self.enc_bswap(&ops, sec),
+            // The only `rep`-prefixed forms the runtime emits are the two
+            // `stos` fills, so a whole `rep` form is accepted rather than a
+            // general prefix. `rep stosq` is `F3 48 AB`, `rep stosb` `F3 AA`.
+            "rep" => match rest {
+                "stosq" => {
+                    self.sections[sec].data.extend_from_slice(&[0xf3, 0x48, 0xab]);
+                    Ok(())
+                }
+                "stosb" => {
+                    self.sections[sec].data.extend_from_slice(&[0xf3, 0xaa]);
+                    Ok(())
+                }
+                other => Err(format!("elf: unsupported rep form `{other}`")),
+            },
             j if j.starts_with('j') => self.enc_jcc(j, &ops, sec),
             other => Err(format!("elf: unsupported instruction `{other}`")),
         }
