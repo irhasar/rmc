@@ -3750,15 +3750,6 @@ impl Remap {
         q
     }
 
-    fn op(&self, o: &Operand) -> Operand {
-        match o {
-            Operand::Copy(p) => Operand::Copy(self.place(p)),
-            Operand::Move(p) => Operand::Move(self.place(p)),
-            Operand::Const(c) => Operand::Const(self.const_(c)),
-            Operand::Fmt { .. } => o.clone(),
-        }
-    }
-
     fn op_ret(&self, o: &Operand, dest_local: u32) -> Operand {
         match o {
             Operand::Copy(p) => Operand::Copy(self.place_ret(p, dest_local)),
@@ -3839,8 +3830,13 @@ impl Remap {
     fn term(&self, t: &Terminator, dest_local: u32) -> Terminator {
         match t {
             Terminator::Goto(b) => Terminator::Goto(self.block(*b)),
+            // `discr`, the call arguments and the assert condition all read
+            // operands, so each must go through `op_ret`: the callee may read
+            // its own `_0` (a `switchInt` on the return place, an accumulator
+            // passed to a call), and that read has to see the caller's
+            // destination, not the caller's own `_0`.
             Terminator::SwitchInt { discr, targets, otherwise } => Terminator::SwitchInt {
-                discr: self.op(discr),
+                discr: self.op_ret(discr, dest_local),
                 targets: targets.iter().map(|(v, b)| (*v, self.block(*b))).collect(),
                 otherwise: self.block(*otherwise),
             },
@@ -3848,13 +3844,13 @@ impl Remap {
             Terminator::Call { dest, func, args, target } => Terminator::Call {
                 dest: self.place_ret(dest, dest_local),
                 func: func.clone(),
-                args: args.iter().map(|a| self.op(a)).collect(),
+                args: args.iter().map(|a| self.op_ret(a, dest_local)).collect(),
                 target: target.map(|b| self.block(b)),
             },
             Terminator::Unreachable => Terminator::Unreachable,
             Terminator::Abort => Terminator::Abort,
             Terminator::Assert { cond, negate, target } => Terminator::Assert {
-                cond: self.op(cond),
+                cond: self.op_ret(cond, dest_local),
                 negate: *negate,
                 target: self.block(*target),
             },
