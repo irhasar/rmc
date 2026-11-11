@@ -1562,6 +1562,26 @@ impl Parser {
         self.local_consts.iter().any(|f| f.iter().any(|c| c.start == self.i))
     }
 
+    /// Reject a local binding that shadows a constant (rustc E0530). sema
+    /// enforces this for a top-level constant, but a block-scoped one is folded
+    /// at parse time and never reaches sema, so the parser checks every binding
+    /// it lowers against the live constant tables. `names` are the names a `let`
+    /// pattern binds, in source order.
+    fn reject_const_shadow(&self, names: &[String]) -> PResult<()> {
+        for name in names {
+            if self.consts.contains_key(name)
+                || self.const_bools.contains_key(name)
+                || self.const_chars.contains_key(name)
+            {
+                return Err(format!(
+                    "at byte {}: identifier `{name}` shadows a constant of the same name",
+                    self.pos()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The token index of the item at `i`, skipping a `pub` / `pub(..)` before
     /// it. Used by `scan_block_consts`, which needs the keyword's own index.
     fn skip_pub_at(&self, mut i: usize) -> usize {
@@ -2422,6 +2442,13 @@ impl Parser {
                         ));
                     }
                     let pat = self.parse_pattern_primary()?;
+                    // Every name the pattern binds is a local binding, so none
+                    // may shadow a constant (rustc E0530). sema covers a
+                    // top-level constant; a block-scoped one is folded here in
+                    // the parser, so check it here.
+                    let mut bound = Vec::new();
+                    Self::pat_bound_names(&pat, &mut bound);
+                    self.reject_const_shadow(&bound)?;
                     let ty = if self.eat(&Tok::Colon) {
                         Some(self.parse_type()?)
                     } else {
@@ -2494,15 +2521,7 @@ impl Parser {
                 // A `let` may not shadow a constant (rustc E0530). sema enforces
                 // this for a top-level constant, but a block-scoped one is folded
                 // at parse time and never reaches sema, so enforce it here too.
-                if self.consts.contains_key(&name)
-                    || self.const_bools.contains_key(&name)
-                    || self.const_chars.contains_key(&name)
-                {
-                    return Err(format!(
-                        "at byte {}: identifier `{name}` shadows a constant of the same name",
-                        self.pos()
-                    ));
-                }
+                self.reject_const_shadow(&[name.clone()])?;
                 // A `Vec<T>` annotation leaves its element width in
                 // `vec_elem_pending`; consume it here so it is bound to this
                 // name, and clear it for every other annotation.
@@ -3927,6 +3946,10 @@ impl Parser {
             // the sub-pattern. `@` cannot begin any other pattern, so it is
             // unambiguous here; a `mut` may precede the name.
             Some(Tok::Ident(n)) if self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::At) => {
+                // `n @ subpat` is a binding, so it may not shadow a constant
+                // (rustc E0530); sema covers a top-level one, the parser a
+                // block-scoped one.
+                self.reject_const_shadow(std::slice::from_ref(&n))?;
                 self.i += 2;
                 let sub = self.parse_pattern_primary()?;
                 Ok(Pat::At(n, false, Box::new(sub)))
@@ -4134,6 +4157,7 @@ impl Parser {
                     // destructures it. The sub-pattern must be irrefutable,
                     // since rmc generates no per-field test.
                     let name = self.expect_ident()?;
+                    self.reject_const_shadow(std::slice::from_ref(&name))?;
                     self.i += 1; // the `@`
                     let sub = self.parse_pattern_primary()?;
                     if !Self::pat_irrefutable(&sub) {
@@ -4144,11 +4168,14 @@ impl Parser {
                     }
                     Some((m, Pat::At(name, m, Box::new(sub))))
                 } else {
-                    Some((m, Pat::Bind(self.expect_ident()?)))
+                    let name = self.expect_ident()?;
+                    self.reject_const_shadow(std::slice::from_ref(&name))?;
+                    Some((m, Pat::Bind(name)))
                 }
             } else {
                 // Shorthand: `S { f }` binds `f`, or `S { mut f }` binds a
-                // mutable `f`.
+                // mutable `f`. The binding may not shadow a constant (E0530).
+                self.reject_const_shadow(std::slice::from_ref(&fname))?;
                 Some((leading_mut, Pat::Bind(fname.clone())))
             };
             fields.push((fname, bind));

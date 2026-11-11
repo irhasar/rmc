@@ -5450,6 +5450,27 @@ fn a_let_shadowing_a_block_const_is_rejected() {
 }
 
 #[test]
+fn an_at_binding_shadowing_a_block_const_is_rejected() {
+    // rustc E0530 also covers an `@` binding and a struct-pattern field.
+    let err = compile_to_asm(
+        "fn main() { const N: i64 = 5; if let N @ 1 = 1 { println!(\"{}\", N); } }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("shadows a constant"), "got: {err}");
+}
+
+#[test]
+fn a_struct_field_binding_shadowing_a_block_const_is_rejected() {
+    let err = compile_to_asm(
+        "struct S { N: i64 } fn main() { const N: i64 = 5; let S { N } = S { N: 1 }; println!(\"{}\", N); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("shadows a constant"), "got: {err}");
+}
+
+#[test]
 fn a_value_loop_binds_its_break_value() {
     // `loop` is an expression: the `break` value is stored into the loop's
     // result slot, which the code after the loop reads.

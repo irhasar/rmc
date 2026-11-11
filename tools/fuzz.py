@@ -2995,6 +2995,10 @@ def reject_corpus():
         # check must happen there too.
         "let_shadows_block_const": "fn main() { const N: i64 = 5; let N = 3; println!(\"{}\", N); }\n",
         "let_mut_shadows_block_const": "fn main() { const N: i64 = 5; let mut N = 3; println!(\"{}\", N); }\n",
+        # An `@` binding and a struct-pattern field are bindings too, so they may
+        # not shadow a block-scoped constant either (rustc E0530).
+        "at_binding_shadows_block_const": "fn main() { const N: i64 = 5; if let N @ 1 = 1 { println!(\"{}\", N); } }\n",
+        "struct_pat_field_shadows_block_const": "struct S { N: i64 } fn main() { const N: i64 = 5; let S { N } = S { N: 1 }; println!(\"{}\", N); }\n",
     }
 
 
