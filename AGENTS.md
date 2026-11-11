@@ -2084,6 +2084,16 @@ covered by a test in `compiler/tests/compile.rs`:
 - **Check ordering matters for the message.** rustc reports an unlabelled
   `break`/`continue` in a `while` condition before it evaluates the condition,
   so that check must precede `check_expr`.
+- **`&&`/`||` short-circuit.** A binding initialized only in the right operand
+  is not definitely initialized after the expression: merge the skipped path
+  (the left operand's state) with the evaluated path (both operands) for
+  `And`/`Or` in `check_expr`, before the caller snapshots the condition. A
+  binding already initialized before the expression stays initialized.
+- **A `for` bound `continue` targets the enclosing loop even when the label is
+  reused.** The bounds are evaluated before the `for`'s own label enters scope,
+  so `stmt_contains_continue` must inspect `start`/`end` regardless of the
+  shadowing test and guard only the body. Missing this hid the back edge to a
+  `while` condition, letting a repeated immutable write pass (E0384).
 
 Tests that claim to guard a runtime bug must *execute* the program and assert
 the result (`run_exit_code` / `run_output`); an `asm(...).contains("main:")`
