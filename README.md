@@ -188,7 +188,8 @@ for `print!`/`println!` (a literal format with `{}` filled by an `i64`, a
 `bool`, a `char` or a `str`, literal `{{`/`}}` braces, escapes, a leading `\n`,
 and a
 bare `println!()` with no format string), `char` for `char` literals
-(plain, escaped, `\xNN`, `\u{..}`), `as i64`, `char` ordering and equality, a
+(plain, escaped, `\xNN`, `\u{..}`) and byte literals (`b'A'`, `b'\xFF'`),
+`as i64`, `char` ordering and equality, a
 `char` `match` with literal, or-pattern and range arms, a `char` array, a
 `const char`, a `char` parameter/return, and the `print_char` builtin, and
 `order` for assignment evaluation order (a
@@ -212,6 +213,9 @@ python3 tools/fuzz.py --mode printfmt --n 500 --seed 1
 python3 tools/fuzz.py --mode pat --n 500 --seed 1
 python3 tools/fuzz.py --mode order --n 500 --seed 1
 python3 tools/fuzz.py --mode shift --n 500 --seed 1
+python3 tools/fuzz.py --mode semi --n 500 --seed 1
+python3 tools/fuzz.py --mode boolbit --n 500 --seed 1
+python3 tools/fuzz.py --mode localconst --n 500 --seed 1
 # also exercise the trap codegen: --bounds-checks and --overflow-checks runs
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 python3 tools/fuzz.py --mode robust
@@ -305,7 +309,9 @@ operators or a small runtime helper, so `i64::MIN.abs()` maps to itself as in
 `rustc -O`);
 `mut` enforcement and definite
 initialisation; `const` items (folded to a value and substituted at every use,
-including array lengths and `match` patterns); `type` aliases (a transparent
+including array lengths and `match` patterns; also inside a function body, where
+it is in scope for the rest of the block) and an immutable `static` (lowered
+to a `const`; `static mut` is rejected); `type` aliases (a transparent
 second name for any type, resolved at parse time, usable before declaration);
 references (`&T` / `&mut T`, `&e`, `*e`,
 with auto-deref for `r.x`, `r[i]` and `r.m()`, and `&self` receivers); methods
@@ -316,7 +322,11 @@ block-scoped, so it shadows a top-level `fn` of the same name and is visible
 throughout its block, exactly as rustc); `as` casts at Rust's
 precedence (looser than the unary operators, so `*r as i64` is `(*r) as i64`);
 attributes such as `#[derive(Copy, Clone)]` (parsed and ignored); `use`
-statements (parsed and discarded, since every name is resolved globally);
+statements (parsed and discarded, since every name is resolved globally); `pub`
+visibility on an item, a struct field, an `impl` method or a nested `fn` (with
+any `(crate)`/`(super)`/`(in ..)` restriction — dropped, since visibility has no
+meaning in a single flat namespace); an inline `mod NAME { .. }` (skipped, since
+rmc has no module system; a `mod NAME;` that loads another file is an error);
 `print!`/`println!` with `{}` substitution, and `assert!`/`assert_eq!`/
 `assert_ne!`/`panic!`/`unreachable!` (a failure exits with rustc's panic code
 101); the `std::process::exit` and `std::hint::black_box` paths; and a small

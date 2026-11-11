@@ -26,7 +26,10 @@ is written `-9223372036854775808` (or `-0x8000000000000000`); the magnitude
 alone is out of range, as in Rust. A `char` literal is a single Unicode scalar
 in single quotes, with the usual escapes (`\n`, `\t`, `\r`, `\0`, `\'`, `\\`,
 `\xNN` restricted to `\x00`-`\x7f`, and `\u{..}`), and a non-ASCII character may
-also be written directly. Explicit types can be given on
+also be written directly. A byte literal `b'A'` is an integer (its byte value,
+`0`-`255`); rmc has no `u8`, so it is an `i64`, and its `\x` escape may use the
+full `\x00`-`\xff` range. A byte *string* `b".."` is not supported. Explicit
+types can be given on
 `let` bindings and function signatures. `as` converts among `i64`, `bool` and an
 enum tag, casts a `char` to its `i64` scalar value, and casts a `&mut T` to a
 `&T`. A reference may only be cast to
@@ -275,8 +278,14 @@ Element access `.0`, `.1`, ... requires the base to be a tuple (or a reference
 to one, which auto-derefs); an index past the end is rejected. A tuple may be
 destructured in a `let`, a `for` head, a function parameter or a `match` arm,
 with `_` to ignore an element and `mut` on a binding. A tuple pattern's element
-count must match the tuple's arity for a field read to resolve; a mismatch is
-reported as a missing field.
+count must match the tuple's arity exactly, and a tuple pattern never matches an
+array even when the counts agree: `let (x,) = (1, 2);` and `let (_, _) = [1, 2];`
+are both rejected, as `rustc` rejects them (E0308).
+
+A destructuring pattern may shadow the very variable it reads, and every element
+read still sees the original value, as in `rustc`: the expansion copies the
+scrutinee before it binds, so `let (x, y) = x;` binds `x` and `y` from the old
+`x`.
 
 In a `match` arm or an `if let` / `while let` scrutinee a tuple pattern may be
 *refutable*: an element may be a scalar test (an integer, `true`/`false`, a
@@ -346,12 +355,34 @@ pattern, where a bare constant name is that value rather than a fresh binding.
 A constant may be named before it is declared, as in Rust. Arithmetic in an
 initializer that would trap at run time — division or remainder by zero, `i64`
 overflow, or a shift by 64 or more — is rejected, as is a cycle between
-constants and an initializer that is not a constant expression. Only top-level
-`const` items are supported; a `const` inside a function body is rejected.
+constants and an initializer that is not a constant expression.
+
+A `const` may also be declared inside a block, where it is folded and in scope
+for the rest of that block. Like a top-level `const` it may be named before it is
+declared (rustc hoists block items), and it shadows an outer constant of the same
+name until the block ends, when the outer value returns. Two `const`s of the same
+name in one block is an error (rustc's `E0428`).
+
+```rust
+fn main() {
+    let a = N;             // usable before its declaration
+    const N: i64 = 5;
+    let b = { const N: i64 = 9; N };   // an inner shadow, 9
+    // here `N` is 5 again
+}
+```
 
 A local binding may not reuse a constant's name (rustc's `E0530`), whether it is
-a `let`, a parameter or a `for` variable. A `const` and a function share a
-namespace, so giving both the same name is an error (rustc's `E0428`).
+a `let`, a parameter, a `for` variable, an `@` binding or a struct-pattern
+field. The check covers a block-scoped constant too, not only a top-level one. A
+`const` and a function share a namespace, so giving both the same name is an
+error (rustc's `E0428`).
+
+An immutable `static NAME: TYPE = EXPR;` (optionally `pub`) is lowered to a
+`const`: rmc has no mutable global storage, so a `static` has the same fold-and-
+substitute semantics and the same restrictions. A block-scoped `static` is folded
+the same way. `static mut` is rejected, since rmc cannot represent a mutable
+global and a program that mutated one would diverge.
 
 ## Type aliases
 
@@ -400,6 +431,7 @@ let _: T;                // annotated discard, no initialiser (a no-op)
 y = y + 1;               // assignment (target may be a variable, array element or field)
 y += 1;                  // compound assignment: += -= *= /= %=
 x;                       // expression statement
+;                        // empty statement (any number, anywhere)
 if cond { ... } else { ... }
 while cond { ... }
 while let PAT = expr { ... }  // re-tests expr each iteration; stops on no match
@@ -450,7 +482,9 @@ the array's length, so `let [x, .., z] = a;` binds `a[0]` and `a[a.len() - 1]`
 struct patterns to any depth. An element pattern must be irrefutable, so a
 literal element (`let [1, y] = a;`) is rejected rather than mis-bound; a
 two-`..` pattern, an out-of-range fixed index, and `mut` on a non-binding are
-rejected too. Array patterns are also accepted in `match`, `if let` and `while
+rejected too. An array pattern must name exactly the array's length (a `..`
+rest may absorb the remainder), as rustc requires. Array patterns are also
+accepted in `match`, `if let` and `while
 let` arms, and as a `for` head (`for [x, y] in pairs`), with the same grammar.
 A `let` or parameter without `mut` is
 immutable: assigning it (rustc's `E0384`), assigning a field or element of it
@@ -478,7 +512,12 @@ A branch whose type diverges (`return`, or a `loop` with no reachable `break`)
 unifies with any other branch's type, as Rust's `!` does, so
 `if c { 1 } else { return 2 }` is accepted. The trailing `;` after
 `return`/`break`/`continue` may be omitted when it is the last thing in a block,
-since those diverge and no expression can follow them. A whole block that
+since those diverge and no expression can follow them. An assignment and a
+compound assignment are `()`-valued expressions, so their trailing `;` may be
+omitted the same way: `{ x = 1 }` and `{ x += 1 }` are accepted when the
+assignment is the last thing in a block. A bare `;` is an empty statement and
+may appear between statements or after the last one, as in Rust.
+A whole block that
 cannot complete is `!` too, so it fits any expected type: `fn f(e: E) -> i64 {
 match e { E::A => { return 1; } E::B => { return 2; } } }` (every arm returns),
 `let x: i64 = if c { return 1; } else { return 2; };`, and `fn g() -> i64 {
@@ -530,10 +569,15 @@ compile-time constant is decided at compile time, not by the trap.
 ## Expressions
 
 - Arithmetic: `+ - * / %` on `i64`.
-- Comparison: `== != < <= > >=`, producing `bool`.
+- Comparison: `== != < <= > >=`, producing `bool`. Comparison is
+  non-associative, as in Rust: `a < b < c` is a hard error, not `(a < b) < c`;
+  parenthesise the inner test (`(a < b) == c`) to chain it.
 - Boolean: `&& || !`, short-circuiting. `!` is logical not on a `bool` and
   bitwise not on an `i64`, as in Rust; it yields its operand's type.
-- Bitwise: `& | ^` on `i64`, plus `<<` and `>>`. `>>` is arithmetic (a negative
+- Bitwise: `& | ^` on `i64`, and on `bool` where they are the non-short-circuiting
+  logical operators (`a & b` is `a && b` without the short circuit), as in Rust;
+  `a & b` and `a | b` yield `bool` when both operands are `bool`. Also `<<` and
+  `>>`. `>>` is arithmetic (a negative
   value stays negative) and a shift count is taken modulo 64, matching Rust.
   Precedence, tightest first: `* / %`, `+ -`, `<< >>`, `&`, `^`, `|`, then the
   comparisons and `&& ||`. So `1 + 2 << 3` is `(1 + 2) << 3`, and
@@ -696,6 +740,9 @@ compile-time constant is decided at compile time, not by the trap.
   be irrefutable: a literal element (`[1, y]`) is rejected rather than
   mis-bound. An array pattern that binds
   nothing (`[_, _]`, `[..]`) is accepted and still evaluates the scrutinee once.
+  Without a `..` rest, the pattern must name exactly the array's length, as
+  rustc requires: `let [x] = [1, 2];` is rejected (E0527), not silently bound to
+  the first element.
 - Tuple patterns: `(a, b)` matches a tuple and binds its elements, in a `let`,
   `for` head, parameter, `match` arm, `if let` or `while let`. An element is a
   binding, `_`, or a nested struct/array/tuple pattern, exactly as an array
@@ -708,7 +755,8 @@ compile-time constant is decided at compile time, not by the trap.
   element may not itself bind or be a variant (`(E::V(x), y)`), since rmc
   generates no test that carries a payload. In a `let`, `for` head or parameter
   the pattern is irrefutable, so a literal element is rejected, as rustc
-  rejects it.
+  rejects it. The pattern must name exactly the tuple's arity (E0308):
+  `let (x,) = (1, 2);` is rejected, not bound to the first field.
 - `for` destructuring: `for S { f, g: h, i: _, .. } in arr { .. }` or
   `for [x, y] in arr { .. }` iterates the array as above but destructures each
   element with the same struct- or array-pattern grammar, binding the named
@@ -801,11 +849,13 @@ with a length or capacity field, so only the methods below are understood.
 | `let v: Vec<i64> = Vec::with_capacity(k);` | `alloc(k * 8)`; `v.capacity()` is `k`  |
 | `let v: Vec<u8> = vec![e; n];`      | `alloc(n * 8)` filled by `__rmc_fill`         |
 | `v.len()` (constant `n`)            | `n`                                           |
-| `v.as_mut_ptr()` / `v.as_ptr()`     | the address; a following `.add(off)` is `p + off` |
+| `v.as_mut_ptr()` / `v.as_ptr()`     | the address; a following `.add(off)` is `p + off * elem` |
 | `let a: Vec<i64> = std::env::args().skip(k).map(..).collect();` | no allocation at all (see below) |
 
 `vec![e; n]` takes a runtime `n`; `alloc` and `__rmc_fill` both take it as a
-value. A `vec![a, b, c]` list form is rejected. An args-vector is never
+value. A `vec![a, b, c]` list form is rejected. `add(off)` scales `off` by the
+element width taken from the `Vec<T>` annotation, so a `Vec<i64>` pointer steps
+a whole word while a `Vec<u8>` stays byte-addressed. An args-vector is never
 materialised: `for v in &args` desugars to `for i in k..__rmc_nargs()` and
 `args[i]` to `__rmc_arg_or(i + k, 0)`, so `*v` in the loop body is the `i64`
 argument itself. Each of these constructs is only recognised directly in a
@@ -826,9 +876,19 @@ rmc resolves every name globally, so an import has nothing to do. A `use` of a
 `process::exit(0)` resolves to the same item as the full `std::process::exit`.
 Any other `std::` path is a compile error.
 
+A `pub` visibility qualifier — on an item, a struct field, an `impl` method or a
+nested `fn` — is parsed and dropped, along with any restriction
+(`pub(crate)`, `pub(super)`, `pub(in ..)`). rmc resolves every name in one flat
+namespace, so visibility carries no meaning; accepting it lets an ordinary Rust
+source file parse unchanged. An inline `mod NAME { .. }` is likewise dropped:
+its body is not visible, but a program that declares one and uses only the flat
+items still compiles. A `mod NAME;` that would load another file is a compile
+error, since rmc compiles a single file and cannot resolve it.
+
 ## Not supported
 
-Traits, generics, borrowing, lifetimes, modules, closures, `f32`/`f64`,
+Traits, generics, borrowing, lifetimes, modules, closures, tuple structs
+(`struct S(i64, i64)`), raw string literals (`r".."`), `f32`/`f64`,
 `u*`/`i*` types other than `i64`, and the standard library beyond the two `std`
 paths above and the `Vec` shims. A `Vec` is not a real container: only the
 handful of shapes in "Vec shims" are recognised, and any other `Vec` method or

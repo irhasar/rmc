@@ -50,12 +50,24 @@ Modes:
           copying every field, chaining, a struct-typed field, and a field
           value that mutates the base so the evaluation order and the
           independence of the result are both observable
+    tuple
+          tuples: construction, field access, destructuring in `let`/`match`/
+          parameter positions, nesting
+    patshadow
+          a destructuring pattern whose element shadows the scrutinee's own
+          name (tuple, array, struct, `@`, nested wildcard), so the expansion
+          must copy the scrutinee before it binds and every read sees the
+          original value
     intmeth
           built-in `i64` methods (`abs`/`signum`/`min`/`max`/`div_euclid`/
           `rem_euclid`/`is_positive`/`is_negative`) over `argv`-sourced
           operands, so `i64::MIN`, `-1`, `0` and `1` are all reachable and the
           receiver's single evaluation and the tie/overflow behaviour are
-          compared against `rustc -O`
+          compared against `rustc -O`, including a mutating argument that must
+          not change the receiver's copied value
+    ptr   `Vec` raw-pointer arithmetic: `add(off)` on a `Vec<i64>` pointer steps
+          whole elements while a `Vec<u8>` arena stays byte-addressed, so a
+          wrong stride collapses the writes and the printed sums diverge
     robust
           a fixed set of adversarial inputs (random bytes, deep nesting, long
           chains), each of which must error cleanly rather than crash
@@ -355,6 +367,20 @@ def gen_char_range_lit(rng):
     return f"{lo_src}{op}{hi_src}"
 
 
+def gen_byte_lit(rng):
+    """A random byte literal `b'A'` / `b'\\n'` / `b'\\xNN'` / `b'\\0'`. rmc has
+    no `u8`, so a byte literal is an `i64`; its value must match rustc's `u8`
+    byte. `\\xFF` is included because a byte literal, unlike a `char`, allows the
+    full `\\x00..=\\xFF` range."""
+    r = rng.random()
+    if r < 0.5:
+        c = rng.choice("abXYZ019 ~")
+        return f"b'{c}'"
+    if r < 0.75:
+        return "b'" + rng.choice(["\\n", "\\t", "\\0", "\\r", "\\'", "\\\\"]) + "'"
+    return f"b'\\x{rng.randint(0, 0xff):02x}'"
+
+
 def gen_char_program(rng):
     """`char` literals, `as i64`, `char` ordering and equality, `match` on a
     `char` (literal, or-pattern and range arms), a `char` array, a `const char`,
@@ -370,6 +396,8 @@ def gen_char_program(rng):
     c_const = lit()
     arr = [lit() for _ in range(3)]
     base_lit = lit()
+    b_arr = [gen_byte_lit(rng) for _ in range(3)]
+    b_const = gen_byte_lit(rng)
     exprs = []
     for _ in range(rng.randint(2, 6)):
         r = rng.random()
@@ -394,10 +422,12 @@ def gen_char_program(rng):
     arr_src = "[" + ", ".join(arr) + "]"
     rs = [
         f"const C: char = {c_const};",
+        f"const BC: u8 = {b_const};",
         "fn id(c: char) -> char { return c; }",
         "fn code(c: char) -> i64 { return c as i64; }",
         "fn main() {",
         f"    let cs: [char; 3] = {arr_src};",
+        f"    let bs: [u8; 3] = [{' , '.join(b_arr)}];",
         f"    let base: char = {base_lit};",
         "    let mut acc: i64 = 0;",
     ]
@@ -410,6 +440,10 @@ def gen_char_program(rng):
         "    acc = acc + code(id(base));",
         "    acc = acc + (C as i64);",
         "    acc = acc + (base as i64);",
+        # Byte literals: each is an `i64` in rmc and a `u8` in rustc, so both
+        # sides are widened with `as i64` to keep the sum an `i64`.
+        "    acc = acc + (bs[0] as i64) + (bs[1] as i64) + (bs[2] as i64);",
+        "    acc = acc + (BC as i64);",
     ]
     for t in tail:
         rs.append(t.replace("acc = acc + ", "acc += "))
@@ -1608,6 +1642,246 @@ def gen_tuple_program(rng):
     return "\n".join(rs) + "\n"
 
 
+def gen_patshadow_program(rng):
+    """A destructuring pattern whose element shadows the scrutinee's own name.
+    Every element read must see the original value: the expansion copies the
+    scrutinee to a hidden temporary before it binds (`let (x, y) = x;`). A naive
+    expansion reads the new binding and fails to type; a correct one copies, so
+    the printed values match rustc. Covers a tuple, an array, a struct and an
+    `@` binding, plus a nested tuple whose inner pattern is wildcard-only.
+    """
+    b = rng.randint(1, 9)
+    o = [rng.randint(0, 40) for _ in range(12)]
+
+    rs = [
+        "struct S { a: i64, b: i64 }",
+        "fn main() {",
+        "    let mut acc: i64 = 0;",
+        # Tuple: the first element rebinds the scrutinee.
+        f"    let t: (i64, i64) = ({o[0]}, {o[1]});",
+        "    let (t, u) = t;",
+        "    acc += t * 10 + u;",
+        # Array.
+        f"    let a: [i64; 3] = [{o[2]}, {o[3]}, {o[4]}];",
+        "    let [a, b, c] = a;",
+        "    acc += a * 100 + b * 10 + c;",
+        # Struct: a field rebinds the struct's name.
+        f"    let s = S {{ a: {o[5]}, b: {o[6]} }};",
+        "    let S { a: s, b } = s;",
+        "    acc += s * 10 + b;",
+        # Nested tuple with a wildcard-only inner pattern: the outer element
+        # rebinds `n`, and the inner `(_, _)` marker must still read the old `n`.
+        f"    let n: (i64, (i64, i64)) = ({o[7]}, ({o[8]}, {o[9]}));",
+        "    let (n, (_, _)) = n;",
+        "    acc += n;",
+        # `@` binding shadowing its own scrutinee.
+        f"    let p: (i64, i64) = ({o[10]}, {o[11]});",
+        "    let p @ (_, _) = p;",
+        "    acc += p.0 + p.1;",
+        f"    acc += {b};",
+        '    println!("{}", acc);',
+        "}",
+    ]
+    return "\n".join(rs) + "\n"
+
+
+def gen_semi_program(rng):
+    """Statements whose trailing `;` is omitted, and empty `;` statements.
+
+    An assignment (or compound assignment) is a `()`-valued expression, so its
+    trailing `;` may be dropped when it is the last thing in a block, exactly as
+    after `return`/`break`/`continue`. A bare `;` is an empty statement and may
+    appear anywhere. Every block here ends in an assignment with no `;`, so a
+    parser that demands the `;` rejects the program (a compile divergence), and
+    the value written is printed so a mis-parse would also show up as a value
+    difference. Empty statements are scattered between real ones to pin that a
+    run of `;` is skipped rather than treated as a statement.
+    """
+    ops = rng.sample(["+", "-", "*", "|", "^"], 5)
+    seeds = [rng.randint(1, 9) for _ in range(10)]
+    rs = ["fn main() {"]
+    rs += ["    let mut acc: i64 = 0;"]
+    # A plain assignment as the last statement of a nested block.
+    rs += [
+        "    {",
+        f"        acc = {seeds[0]}",
+        "    }",
+        "    ;",
+        '    println!("{}", acc);',
+    ]
+    # Each compound operator in tail position of an `if` arm.
+    for i, op in enumerate(ops):
+        rs += [
+            f"    if acc >= 0 {{",
+            f"        acc {op}= {seeds[i + 1]}",
+            "    } else {",
+            f"        acc {op}= {seeds[i + 1]}",
+            "    }",
+            ";",
+        ]
+    rs.append('    println!("{}", acc);')
+    # A `while` body whose only statement is an assignment with no `;`.
+    rs += [
+        f"    let mut n: i64 = {seeds[6] % 5 + 1};",
+        "    while n > 0 {",
+        "        acc += n;",
+        "        n -= 1",
+        "    }",
+        '    println!("{}", acc);',
+    ]
+    # A `loop` that breaks out of an assignment-terminated body.
+    rs += [
+        "    let mut k: i64 = 0;",
+        "    loop {",
+        "        k += 1;",
+        f"        if k == {seeds[7] % 5 + 1} {{",
+        "            break",
+        "        }",
+        "    }",
+        "    acc += k;",
+        # A `match` arm body that is a bare assignment (comma after), and a
+        # block-bodied arm ending in an assignment with no `;`.
+        "    match k {",
+        f"        1 => acc = {seeds[8]},",
+        f"        _ => {{ acc = {seeds[9]} }}",
+        "    }",
+        "    ;;",
+        '    println!("{}", acc);',
+        "}",
+    ]
+    return "\n".join(rs) + "\n"
+
+
+def gen_boolbit_program(rng):
+    """`&`, `|` and `^` on `bool`. rustc defines these as the logical operators
+    through the `BitAnd`/`BitOr`/`BitXor` impls, so they must type-check and give
+    the same 0/1 result as `&&`/`||`/`!=`. Each result is printed `as i64`, so a
+    wrong instruction (or a wrong precedence) shows up as a value difference, and
+    the operators are also used in a `const`, a compound assignment, a call, an
+    `if` condition and an array element."""
+    def bvar():
+        # A comparison is a bool-valued expression, so it can be an operand
+        # without needing a `bool` local.
+        return f"({rng.randint(-9, 9)} < {rng.randint(-9, 9)})"
+
+    def bexpr(depth):
+        r = rng.random()
+        if depth <= 0 or r < 0.35:
+            return bvar()
+        if r < 0.45:
+            return f"(!{bexpr(depth - 1)})"
+        op = rng.choice(["&", "|", "^"])
+        return f"({bexpr(depth - 1)} {op} {bexpr(depth - 1)})"
+
+    rs = ["fn main() {"]
+    for _ in range(rng.randint(4, 10)):
+        rs.append(f'    println!("{{}}", ({bexpr(3)}) as i64);')
+    # Compound assignment on a `bool` local.
+    init = rng.choice(["true", "false"])
+    rs.append(f"    let mut b: bool = {init};")
+    for _ in range(rng.randint(2, 6)):
+        op = rng.choice(["&=", "|=", "^="])
+        rs.append(f"    b {op} {rng.choice(['true', 'false'])};")
+    rs.append('    println!("{}", b as i64);')
+    # As an `if` condition (an `i64` operand would be a type error there).
+    rs.append(f"    if {bexpr(2)} {{ println!(\"{{}}\", 1); }} else {{ println!(\"{{}}\", 0); }}")
+    rs.append("}")
+    # A `const bool` folded from the operators, and an array of bool operands.
+    cname = "C"
+    cbody = bexpr(2)
+    head = [f"const {cname}: bool = {cbody};"]
+    rs.insert(1, f'    println!("{{}}", {cname} as i64);')
+    rs.insert(2, f'    let arr: [bool; 2] = [{bexpr(1)}, {bexpr(1)}];')
+    rs.insert(3, '    println!("{} {}", arr[0] as i64, arr[1] as i64);')
+    # An indexed bool operand: `!` must stay logical here too, and the bitwise
+    # ops must still type-check on an element.
+    rs.insert(4, '    println!("{}", (!arr[0]) as i64);')
+    rs.insert(5, '    println!("{}", (arr[0] | arr[1]) as i64);')
+    rs.insert(6, '    println!("{}", (!(arr[0] & arr[1])) as i64);')
+    # A loop-invariant bool bitwise expression under `!`: LICM may hoist the
+    # bitwise op, so the hoisted value's type must stay `bool` or `!` becomes a
+    # bitwise not.
+    inv = f"({bexpr(1)} | {bexpr(1)})"
+    rs.append("    let mut i: i64 = 0;")
+    rs.append("    let mut acc: i64 = 0;")
+    rs.append(f"    while i < 3 {{ if !{inv} {{ acc += 1; }} i += 1; }}")
+    rs.append('    println!("{}", acc);')
+    return "\n".join(head + rs) + "\n"
+
+
+def gen_vis_program(rng):
+    """`pub` on items, fields, methods and nested `fn`s, and an inline `mod`.
+
+    rmc drops visibility (one flat namespace), so a `pub` must not change the
+    program's behaviour: the twin is generated with `pub` sprinkled on and must
+    print the same bytes as rustc. An inline `mod NAME { .. }` is skipped, so a
+    program that declares one and uses only the flat items still runs.
+    """
+    items = []
+    items.append("pub const K: i64 = %d;" % rng.randint(1, 20))
+    items.append("pub type Alias = i64;")
+    items.append("pub struct P { pub a: i64, pub b: i64 }")
+    items.append(
+        "impl P { pub fn total(&self) -> i64 { self.a + self.b } }"
+    )
+    items.append("pub mod unused { pub fn never() -> i64 { 0 } }")
+    # A function that uses the items, sometimes `pub`.
+    qual = "pub " if rng.random() < 0.5 else ""
+    items.append(
+        f"{qual}fn helper(x: Alias) -> i64 {{ let p = P {{ a: x, b: K }}; p.total() }}"
+    )
+    main = [
+        "fn main() {",
+        "    let p = P { a: %d, b: %d };" % (rng.randint(-5, 5), rng.randint(-5, 5)),
+        '    println!("{}", p.total());',
+        '    println!("{}", helper(%d));' % rng.randint(-9, 9),
+        '    println!("{}", K);',
+    ]
+    if rng.random() < 0.5:
+        main.append("    pub fn inner() -> i64 { %d }" % rng.randint(0, 9))
+        main.append('    println!("{}", inner());')
+    main.append("}")
+    return "\n".join(items + main) + "\n"
+
+
+def gen_localconst_program(rng):
+    """A `const` (or immutable `static`) declared inside a block, and a
+    block-scoped shadow of a top-level one.
+
+    rustc hoists block items, so a local constant is usable anywhere in its
+    block, including before its own declaration; it shadows an outer constant of
+    the same name until the block ends, then the outer value returns. rmc folds
+    the item and substitutes the value, so the printed bytes must match. The
+    name is sometimes reused across sibling blocks to exercise the scope
+    restore.
+    """
+    top = rng.randint(1, 50)
+    items = ["const K: i64 = %d;" % top]
+    # A helper that uses the top-level constant, so a local shadow in `main`
+    # must not leak into it.
+    items.append("fn helper() -> i64 { K * 2 }")
+    local = rng.randint(51, 99)
+    inner = rng.randint(100, 199)
+    kind = rng.choice(["const", "static"])
+    body = [
+        "fn main() {",
+        # Forward reference: the value is folded when the block is scanned.
+        '    println!("{}", L);',
+        "    %s L: i64 = %d;" % (kind, local),
+        '    println!("{}", L);',
+        '    println!("{}", helper());',
+        "    {",
+        "        const L: i64 = %d;" % inner,
+        '        println!("{}", L);',
+        "    }",
+        # The inner block's shadow is gone, so the outer local is back.
+        '    println!("{}", L);',
+        '    println!("{}", K);',
+        "}",
+    ]
+    return "\n".join(items + body) + "\n"
+
+
 def gen_intmeth_program(rng):
     """A program built from the built-in `i64` methods. Each method desugars to
     operators, so the shapes that matter are the receiver being a non-trivial
@@ -1712,8 +1986,8 @@ def gen_intmeth_program(rng):
     exprs.append("(MIN).rem_euclid(MIN)")
     exprs.append("(MAX).div_euclid(-2)")
     exprs.append("(MAX).rem_euclid(-2)")
-    exprs.append("(7).div_euclid(MIN)")
-    exprs.append("(7).rem_euclid(MIN)")
+    exprs.append("(7i64).div_euclid(MIN)")
+    exprs.append("(7i64).rem_euclid(MIN)")
     # `clamp`'s three outcomes pinned: below the low bound, above the high
     # bound, and inside; the low/high tie returns the bound; `MIN`/`MAX` as
     # bounds exercise the comparisons at the i64 edges.
@@ -1728,8 +2002,8 @@ def gen_intmeth_program(rng):
     exprs.append("(MIN).clamp(MAX, MAX)")
     exprs.append("(MAX).clamp(MIN, MIN)")
     # Zero is neither positive nor negative.
-    exprs.append("(0).is_positive() as i64")
-    exprs.append("(0).is_negative() as i64")
+    exprs.append("(0i64).is_positive() as i64")
+    exprs.append("(0i64).is_negative() as i64")
     # The bit methods, pinned at the edges: `ZERO` is all zeros (64 leading and
     # trailing zeros, no set bits), `MIN` has one bit set at the top, `MAX` has
     # 63 set bits and one leading zero, and `ONES` is all ones. Named consts,
@@ -1789,6 +2063,90 @@ def gen_intmeth_program(rng):
     ]
     for e in exprs:
         rs.append(f'    println!("{{}}", {e});')
+    # A method evaluates and copies its scalar receiver before its arguments, so
+    # an argument that writes the receiver's slot must not change the value the
+    # method sees. Each call gets its own `x = 5` (a fresh block scope), and the
+    # argument writes 9 while yielding a value that makes the two orders differ
+    # (`min(5, 7)` is 5, `min(9, 7)` is 7); the receiver is printed after the
+    # call so a lost write shows up too.
+    cases = [
+        "x.min({ x = 9; 7 })",
+        "x.max({ x = 9; 7 })",
+        "x.clamp({ x = 9; 0 }, { x = 9; 9 })",
+        "x.midpoint({ x = 9; 1 })",
+        "x.rotate_left({ x = 9; 1 })",
+        "x.rotate_right({ x = 9; 1 })",
+        "x.wrapping_mul({ x = 9; 2 })",
+        "x.div_euclid({ x = 9; 2 })",
+        "x.rem_euclid({ x = 9; 2 })",
+    ]
+    for e in cases:
+        rs.append("{")
+        rs.append("    let mut x: i64 = 5;")
+        rs.append(f'    println!("{{}} {{}}", {e}, x);')
+        rs.append("}")
+    # A randomized call whose argument writes the receiver, likewise scoped so
+    # the receiver starts at 5 whatever the previous case left behind.
+    m = rng.choice(["min", "max", "midpoint", "wrapping_mul", "rotate_left"])
+    v = rng.randint(0, 9)
+    rs.append("{")
+    rs.append("    let mut x: i64 = 5;")
+    rs.append(f'    println!("{{}} {{}}", x.{m}({{ x = {v}; 3 }}), x);')
+    rs.append("}")
+    rs.append("}")
+    return "\n".join(rs) + "\n"
+
+
+def gen_ptr_program(rng):
+    """`Vec` raw-pointer arithmetic. `add(off)` steps whole elements, so a
+    `Vec<i64>` pointer advances eight bytes per unit; a byte stride makes
+    element `k` alias element `8k`, so the writes collapse and the sum is wrong.
+    A `Vec<u8>` arena is byte-addressed, so the same loop with a 16-byte node
+    stride must still round-trip.
+    """
+    n = rng.randint(1, 24)
+    k = rng.randint(1, 9)
+    rs = ["fn main() {"]
+    # `Vec<i64>`: element `i` holds `i * k`; the sum is the arithmetic series.
+    rs += [
+        f"    let n: i64 = {n};",
+        "    let mut v: Vec<i64> = vec![0i64; n as usize];",
+        "    let base = v.as_mut_ptr();",
+        "    let mut i: i64 = 0;",
+        "    while i < n {",
+        f"        let p = unsafe {{ base.add(i as usize) }} as *mut i64;",
+        f"        unsafe {{ *p = i * {k}; }}",
+        "        i += 1;",
+        "    }",
+        "    let mut sum: i64 = 0;",
+        "    let mut i: i64 = 0;",
+        "    while i < n {",
+        "        let p = unsafe { base.add(i as usize) } as *mut i64;",
+        "        sum += unsafe { *p };",
+        "        i += 1;",
+        "    }",
+        '    println!("{}", sum);',
+    ]
+    # `Vec<u8>` used as a raw byte arena: the pointer stays byte-addressed, so a
+    # `16`-byte node stride keeps every node disjoint and the sum matches.
+    rs += [
+        "    let mut arena: Vec<u8> = vec![0u8; n as usize * 16];",
+        "    let abase = arena.as_mut_ptr();",
+        "    let mut j: i64 = 0;",
+        "    while j < n {",
+        f"        let q = unsafe {{ abase.add(j as usize * 16) }} as *mut i64;",
+        f"        unsafe {{ *q = j * {k}; }}",
+        "        j += 1;",
+        "    }",
+        "    let mut asum: i64 = 0;",
+        "    let mut j: i64 = 0;",
+        "    while j < n {",
+        "        let q = unsafe { abase.add(j as usize * 16) } as *mut i64;",
+        "        asum += unsafe { *q };",
+        "        j += 1;",
+        "    }",
+        '    println!("{}", asum);',
+    ]
     rs.append("}")
     return "\n".join(rs) + "\n"
 
@@ -2601,6 +2959,46 @@ def reject_corpus():
         # targets the outer loop, so a write before the nested loop repeats
         # (E0384). The reach walk must follow it out of the nested loop.
         "assign_immutable_cond_continue_nested": "fn main() { let x: i64; 'o: loop { x = 1; while { continue 'o; true } {} break 'o; } }\n",
+        # A tuple pattern never matches an array, even one of the same length
+        # (E0308). With all-wildcard elements no field read catches the
+        # mismatch, so the arity check must reject it; and a tuple pattern whose
+        # count equals the array's length must not pass the array arity check.
+        "let_tuple_pat_on_array": "fn main() { let a: [i64; 2] = [1, 2]; let (x, y) = a; let _ = x; }\n",
+        "let_tuple_pat_wildcards_on_array": "fn main() { let a: [i64; 2] = [1, 2]; let (_, _) = a; }\n",
+        "match_tuple_pat_on_array": "fn main() { let a: [i64; 2] = [1, 2]; let _ = match a { (x, y) => x }; }\n",
+        # Comparison operators are non-associative: `a < b < c` is a hard error
+        # in rustc ("comparison operators cannot be chained"), not `(a < b) < c`.
+        # rmc must reject a second comparison operator at the same level.
+        "chained_comparison_int": "fn main() { println!(\"{}\", 1 < 2 < 3); }\n",
+        "chained_comparison_eq": "fn main() { println!(\"{}\", 1 == 1 == true); }\n",
+        "chained_comparison_ne": "fn main() { println!(\"{}\", 1 != 2 != false); }\n",
+        "chained_comparison_mixed": "fn main() { println!(\"{}\", 1 <= 2 >= 1); }\n",
+        "chained_comparison_bool": "fn main() { println!(\"{}\", true == true == true); }\n",
+        # `static mut` needs `unsafe` to read, and rmc has no mutable global at
+        # all, so it is refused (E0133 in rustc for the un-`unsafe` read).
+        "static_mut_read": "static mut X: i64 = 5; fn main() { println!(\"{}\", X); }\n",
+        # `mod NAME;` loads another file, which rmc cannot resolve; rejecting it
+        # matches rustc when the file is absent.
+        "file_module_declaration": "mod m; fn main() { println!(\"{}\", 1); }\n",
+        # `b'\\u{41}'`: rustc forbids a `\u` escape in a byte literal, and rmc
+        # refuses it too.
+        "byte_literal_unicode_escape": "fn main() { println!(\"{}\", b'\\u{41}'); }\n",
+        # `b'\\x{41}'` is not a byte escape either; rustc wants exactly two hex
+        # digits, and so does rmc.
+        "byte_literal_bad_hex_escape": "fn main() { println!(\"{}\", b'\\x{41}'); }\n",
+        # A block-scoped `const` must be type-checked like a top-level one: a
+        # `str` constant is unsized in rustc (E0277), and rmc folds only `i64`,
+        # `bool` and `char`, so it must reject the item rather than skip it.
+        "block_const_str_type": "fn main() { const S: str = \"hi\"; println!(\"{}\", 1); }\n",
+        # A `let` may not shadow a constant (rustc E0530). sema checks this for a
+        # top-level constant; a block-scoped one is folded in the parser, so the
+        # check must happen there too.
+        "let_shadows_block_const": "fn main() { const N: i64 = 5; let N = 3; println!(\"{}\", N); }\n",
+        "let_mut_shadows_block_const": "fn main() { const N: i64 = 5; let mut N = 3; println!(\"{}\", N); }\n",
+        # An `@` binding and a struct-pattern field are bindings too, so they may
+        # not shadow a block-scoped constant either (rustc E0530).
+        "at_binding_shadows_block_const": "fn main() { const N: i64 = 5; if let N @ 1 = 1 { println!(\"{}\", N); } }\n",
+        "struct_pat_field_shadows_block_const": "struct S { N: i64 } fn main() { const N: i64 = 5; let S { N } = S { N: 1 }; println!(\"{}\", N); }\n",
     }
 
 
@@ -2917,7 +3315,7 @@ def gen_typealias_program(rng):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "intmeth", "nestedfn", "typealias", "printfmt", "char", "robust", "reject", "mutate"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "patshadow", "intmeth", "nestedfn", "typealias", "printfmt", "ptr", "char", "semi", "boolbit", "vis", "localconst", "robust", "reject", "mutate"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -2970,11 +3368,17 @@ def main():
            "enumpat": gen_enumpat_program,
            "atpat": gen_atpat_program,
            "tuple": gen_tuple_program,
+           "patshadow": gen_patshadow_program,
            "intmeth": gen_intmeth_program,
            "nestedfn": gen_nestedfn_program,
            "typealias": gen_typealias_program,
            "printfmt": gen_printfmt_program,
-           "char": gen_char_program}[args.mode]
+           "ptr": gen_ptr_program,
+           "char": gen_char_program,
+           "semi": gen_semi_program,
+           "boolbit": gen_boolbit_program,
+           "vis": gen_vis_program,
+           "localconst": gen_localconst_program}[args.mode]
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus
     # suite; a fuzz program is otherwise only checked with every pass on, so a

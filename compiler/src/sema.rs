@@ -839,7 +839,18 @@ impl Sema {
         }
 
         let mut stmts = Vec::new();
-        let x = bind(self, recv, &mut stmts);
+        // A method evaluates and copies its scalar receiver before its
+        // arguments, so an argument that writes the receiver's slot must not
+        // change the value the desugaring reads. `bind` leaves a plain variable
+        // as a direct read of its slot, so force a snapshot temporary when the
+        // method takes an argument that could mutate it (`div_euclid`/
+        // `rem_euclid` force the receiver unconditionally further down, for the
+        // overflow lint). A literal receiver cannot be mutated, and any other
+        // shape already gets a temporary from `bind`.
+        let x = match recv {
+            Expr::Var { .. } if !args.is_empty() => self.force_temp(recv, &mut stmts),
+            other => bind(self, other, &mut stmts),
+        };
         let (body, ty) = match name {
             "abs" => {
                 if !args.is_empty() {
@@ -1179,6 +1190,23 @@ impl Sema {
         }
     }
 
+    /// The true- and false-outcome initialization states of an operand just
+    /// checked by `check_expr`. A logical operand (`&&`/`||`) has recorded its
+    /// two outcomes in the `cond_*` slots; any other operand has a single exit
+    /// state, which is both outcomes. The slots are always consumed, so a
+    /// nested short circuit cannot leak past the operand that produced it.
+    fn outcome_states(sema: &mut Sema, e: &Expr, scope: &Scope) -> (Vec<bool>, Vec<bool>) {
+        let then = sema.cond_then_init.take();
+        let els = sema.cond_else_init.take();
+        if matches!(e, Expr::Bin(BinOp::And | BinOp::Or, ..)) {
+            if let (Some(t), Some(f)) = (then, els) {
+                return (t, f);
+            }
+        }
+        let s = Self::init_snapshot(scope);
+        (s.clone(), s)
+    }
+
     /// Type-check a `let` initialiser. A `[v; n]` written directly here is kept
     /// as an `ArrayLit` so codegen splats one value across the array, rather
     /// than materialising it element by element. Any other initialiser (and any
@@ -1483,7 +1511,10 @@ impl Sema {
             if let Some(l) = self.loop_cont.last_mut() {
                 *l = cont;
             }
-            let is_pat_check = matches!(st, Stmt::Expr(Expr::PatCheck { .. }));
+            let is_pat_check = matches!(
+                st,
+                Stmt::Expr(Expr::PatCheck { .. }) | Stmt::Expr(Expr::PatArity { .. })
+            );
             self.check_stmt(&mut st, scope)?;
             if !is_pat_check {
                 kept.push(st);
@@ -2171,7 +2202,9 @@ impl Sema {
             // A struct pattern's type claim is rewritten by `check_expr`, which
             // runs after this pre-pass, so recurse into its scrutinee here to see
             // any `&mut` it borrows (`let S { .. } = &mut x;`).
-            Expr::PatCheck { base, .. } => Self::collect_mut_borrows(base, a, mb),
+            Expr::PatCheck { base, .. } | Expr::PatArity { base, .. } => {
+                Self::collect_mut_borrows(base, a, mb)
+            }
             Expr::Bin(_, x, y) => {
                 Self::collect_mut_borrows(x, a, mb);
                 Self::collect_mut_borrows(y, a, mb);
@@ -2448,29 +2481,45 @@ impl Sema {
                 // conservative "either path" state so a value use
                 // (`let b = a && x`) cannot assume the right operand ran.
                 if matches!(op, BinOp::And | BinOp::Or) {
+                    // Each operand has a *true* and a *false* outcome state.
+                    // For a non-logical operand both are its single exit state;
+                    // for a logical one they differ, and `check_expr` leaves
+                    // them in the `cond_*` slots. Tracking both is what lets a
+                    // chain such as `(a && { x = 7; true }) && x == 7` check
+                    // the later operand against the state its guard guarantees,
+                    // rather than the merged state of the earlier short circuit.
                     let ta = self.check_expr(a, scope)?;
-                    let skip = Self::init_snapshot(scope);
+                    let (a_then, a_else) = Self::outcome_states(self, a, scope);
+                    // The right operand runs only where the left does not decide
+                    // the result: on the left-true path for `&&`, the left-false
+                    // path for `||`. Enter it in that state.
+                    Self::init_restore(scope, if matches!(op, BinOp::And) { &a_then } else { &a_else });
                     let tb = self.check_expr(b, scope)?;
-                    let eval = Self::init_snapshot(scope);
+                    let (b_then, b_else) = Self::outcome_states(self, b, scope);
                     if ta != Type::Bool || tb != Type::Bool {
                         return Err(format!(
                             "logical operator expects `bool`, found {ta:?} and {tb:?}"
                         ));
                     }
-                    // A binding is initialized after the expression only if it
-                    // is initialized whether or not the right operand ran.
-                    let either: Vec<bool> = (0..scope.len())
-                        .map(|i| {
-                            skip.get(i).copied().unwrap_or(false)
-                                && eval.get(i).copied().unwrap_or(false)
-                        })
-                        .collect();
-                    // `a && b` is true only when `b` ran; false when either `a`
-                    // was false (`b` skipped) or `b` ran. `a || b` is the mirror.
-                    let (then_state, else_state) = match op {
-                        BinOp::And => (eval, either.clone()),
-                        _ => (either.clone(), eval),
+                    let n = scope.len();
+                    let all = |x: &[bool], y: &[bool]| -> Vec<bool> {
+                        (0..n)
+                            .map(|i| {
+                                x.get(i).copied().unwrap_or(false)
+                                    && y.get(i).copied().unwrap_or(false)
+                            })
+                            .collect()
                     };
+                    // `a && b` is true only when `b` ran (its true outcome);
+                    // false when `a` was false (skipping `b`) or `b` ran and was
+                    // false. `a || b` is the mirror.
+                    let (then_state, else_state) = match op {
+                        BinOp::And => (b_then, all(&a_else, &b_else)),
+                        _ => (all(&a_then, &b_then), b_else),
+                    };
+                    // A value use of the whole expression sees the merge of its
+                    // two outcomes, so it cannot assume the right operand ran.
+                    let either = all(&then_state, &else_state);
                     self.cond_then_init = Some(then_state);
                     self.cond_else_init = Some(else_state);
                     for (bl, &m) in scope.iter_mut().zip(&either) {
@@ -2542,6 +2591,18 @@ impl Sema {
                         Ok(Type::Bool)
                     }
                     BitAnd | BitOr | BitXor | Shl | Shr => {
+                        // `&`, `|` and `^` are defined on `bool` as well as
+                        // `i64` (rustc's `BitAnd`/`BitOr`/`BitXor` impls). A
+                        // `bool` is a 0/1 word, so the bitwise instruction is
+                        // already the logical result and codegen is unchanged;
+                        // only the operand check differs. The shifts stay
+                        // `i64`-only.
+                        if matches!(op, BitAnd | BitOr | BitXor)
+                            && ta == Type::Bool
+                            && tb == Type::Bool
+                        {
+                            return Ok(Type::Bool);
+                        }
                         if ta != Type::I64 || tb != Type::I64 {
                             return Err(format!("bitwise operator expects `i64` operands, found {ta:?} and {tb:?}"));
                         }
@@ -3655,6 +3716,47 @@ impl Sema {
                 *e = Expr::Bool(true);
                 Ok(Type::Bool)
             }
+            Expr::PatArity { base, want, is_tuple } => {
+                let is_tuple = *is_tuple;
+                // An array or tuple pattern must name exactly as many elements
+                // as the scrutinee has, matching rustc's E0527/E0308. The
+                // element reads are ordinary index/field accesses, so without
+                // this check a pattern naming fewer elements than the scrutinee
+                // has would silently match and ignore the rest.
+                let t = deref_ty(self.check_expr(base, scope)?);
+                let (got, what) = match t {
+                    // A tuple pattern never matches an array, even one of the
+                    // same length: rustc rejects `let (_, _) = [1, 2];`
+                    // (E0308). Guard on `is_tuple` so a tuple pattern falls
+                    // through to the mismatched-type arm below.
+                    Type::Array(_, n) if !is_tuple => (n, "array"),
+                    // `()` is the unit type, which rustc treats as the empty
+                    // tuple: `let () = ();` is legal and matches nothing.
+                    Type::Unit if is_tuple && *want == 0 => (0, "tuple"),
+                    Type::Struct(name, _) if is_tuple && is_tuple_name(&name) => {
+                        (self.structs[&name].fields.len(), "tuple")
+                    }
+                    Type::Struct(name, _) if is_tuple => {
+                        return Err(format!(
+                            "mismatched types: a tuple pattern cannot match `{name}`"
+                        ))
+                    }
+                    other => {
+                        let what = if is_tuple { "tuple" } else { "array" };
+                        return Err(format!(
+                            "mismatched types: a {what} pattern cannot match a value of type {other:?}"
+                        ));
+                    }
+                };
+                if got != *want {
+                    return Err(format!(
+                        "pattern requires {want} element{} but {what} has {got}",
+                        if *want == 1 { "" } else { "s" }
+                    ));
+                }
+                *e = Expr::Bool(true);
+                Ok(Type::Bool)
+            }
             Expr::Cast(inner, to) => {
                 let it = self.check_expr(inner, scope)?;
                 // An enum may be cast to `i64` (its tag), but not the reverse:
@@ -3879,7 +3981,9 @@ fn expr_has_break(e: &Expr, label: Option<&str>, nested: bool) -> bool {
         Expr::VariantTest { scrutinee, .. } => expr_has_break(scrutinee, label, nested),
         Expr::EnumPayload { recv, .. } => expr_has_break(recv, label, nested),
         Expr::PatScrutinee(inner) => expr_has_break(inner, label, nested),
-        Expr::PatCheck { base, .. } => expr_has_break(base, label, nested),
+        Expr::PatCheck { base, .. } | Expr::PatArity { base, .. } => {
+            expr_has_break(base, label, nested)
+        }
         _ => false,
     }
 }
@@ -3988,7 +4092,7 @@ fn expr_can_fall(e: &Expr) -> bool {
         Expr::VariantTest { scrutinee, .. } => expr_can_fall(scrutinee),
         Expr::EnumPayload { recv, .. } => expr_can_fall(recv),
         Expr::PatScrutinee(inner) => expr_can_fall(inner),
-        Expr::PatCheck { base, .. } => expr_can_fall(base),
+        Expr::PatCheck { base, .. } | Expr::PatArity { base, .. } => expr_can_fall(base),
         _ => true,
     }
 }
@@ -4054,7 +4158,9 @@ fn cond_has_unlabelled_exit(e: &Expr) -> bool {
         Expr::BoolTest { scrutinee, .. } => cond_has_unlabelled_exit(scrutinee),
         Expr::TupleLit(xs) => xs.iter().any(cond_has_unlabelled_exit),
         Expr::PatScrutinee(inner) => cond_has_unlabelled_exit(inner),
-        Expr::PatCheck { base, .. } => cond_has_unlabelled_exit(base),
+        Expr::PatCheck { base, .. } | Expr::PatArity { base, .. } => {
+            cond_has_unlabelled_exit(base)
+        }
         // A nested `loop` captures its own unlabelled exits.
         Expr::Loop(..) => false,
         _ => false,
@@ -4212,7 +4318,9 @@ fn expr_contains_continue(e: &Expr, label: Option<&str>, nested: bool) -> bool {
         Expr::VariantTest { scrutinee, .. } => expr_contains_continue(scrutinee, label, nested),
         Expr::EnumPayload { recv, .. } => expr_contains_continue(recv, label, nested),
         Expr::PatScrutinee(inner) => expr_contains_continue(inner, label, nested),
-        Expr::PatCheck { base, .. } => expr_contains_continue(base, label, nested),
+        Expr::PatCheck { base, .. } | Expr::PatArity { base, .. } => {
+            expr_contains_continue(base, label, nested)
+        }
         // A nested `loop` captures its own unlabelled `continue`s, but a
         // labelled one can still target an enclosing loop.
         Expr::Loop(body, _, _, lbl) => {

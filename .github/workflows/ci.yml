@@ -74,3 +74,11 @@ jobs:
           python3 tools/fuzz.py --mode stmt --n 400 --seed 1
           python3 tools/fuzz.py --mode stmt --n 400 --seed 2
           python3 tools/fuzz.py --mode shift --n 400 --seed 1
+          python3 tools/fuzz.py --mode patshadow --n 400 --seed 1
+          python3 tools/fuzz.py --mode patshadow --n 400 --seed 2
+          python3 tools/fuzz.py --mode semi --n 400 --seed 1
+          python3 tools/fuzz.py --mode semi --n 400 --seed 2
+          python3 tools/fuzz.py --mode boolbit --n 400 --seed 1
+          python3 tools/fuzz.py --mode boolbit --n 400 --seed 2
+          python3 tools/fuzz.py --mode vis --n 400 --seed 1
+          python3 tools/fuzz.py --mode vis --n 400 --seed 2

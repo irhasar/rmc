@@ -103,6 +103,7 @@ Expr::PatScrutinee(_) => {
             unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
         }
         Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
+        Expr::PatArity { .. } => unreachable!("sema rewrites PatArity into `true`"),
         Expr::Call { name, args, .. } => {
             out.insert(name.clone());
             for a in args {

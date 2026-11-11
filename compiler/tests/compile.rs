@@ -961,13 +961,14 @@ fn a_mut_before_a_let_array_pattern_is_rejected() {
 
 #[test]
 fn an_array_pattern_with_an_out_of_range_element_is_rejected() {
-    // `[x, y, z]` on a length-2 array reads index 2, which sema rejects.
+    // `[x, y, z]` on a length-2 array is rejected: rustc reports the arity
+    // mismatch (E0527) before any index is read, so rmc does too.
     let err = compile_to_asm(
         "fn main() -> i64 { let a: [i64; 2] = [1, 2]; let [x, y, z] = a; return x; }",
         &CompileOptions::default(),
     )
     .unwrap_err();
-    assert!(err.contains("out of bounds"), "got: {err}");
+    assert!(err.contains("pattern requires 3 elements but array has 2"), "got: {err}");
 }
 
 #[test]
@@ -4023,6 +4024,55 @@ fn a_short_circuited_condition_does_not_initialize_its_right_operand() {
 }
 
 #[test]
+fn a_chained_guard_checks_its_right_operand_under_the_left_true_state() {
+    // `(a && { x = 7; true }) && x == 7`: the outer `&&`'s right operand runs
+    // only where the inner `&&` was true, which is exactly where `x` was
+    // assigned. The inner short circuit leaves the merged "either path" state
+    // on the scope, so checking the comparison against that state wrongly
+    // rejected the read. rustc accepts this and returns `7`.
+    assert_eq!(
+        run_exit_code(
+            "fn f(a: bool) -> i64 { let mut x: i64; \
+             if (a && { x = 7; true }) && x == 7 { return x; } return 0; } \
+             fn main() -> i64 { return f(true); }",
+        ),
+        7
+    );
+    // The mirror for `||`: `(a || { x = 7; false }) || x == 7` reaches the
+    // comparison only when the left was false, which is where `x` was assigned.
+    // `x` is left uninitialized so the read only type-checks if that left-false
+    // state is restored; with `x = 0` the case passed even without the restore.
+    assert_eq!(
+        run_exit_code(
+            "fn f(a: bool) -> i64 { let mut x: i64; \
+             if (a || { x = 7; false }) || x == 7 { return 1; } return 0; } \
+             fn main() -> i64 { return f(false); }",
+        ),
+        1
+    );
+    // The guard's write is still not visible *after* the whole condition: on the
+    // path where the outer right operand never runs, `x` is uninitialized, so a
+    // read in the else must be rejected. rustc rejects it (E0381).
+    let err = compile_to_asm(
+        "fn f(a: bool) -> i64 { let mut x: i64; if (a && { x = 7; true }) && x == 7 { return 1; } \
+         else { return x; } } fn main() { let _ = f(true); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("possibly-uninitialized variable `x`"), "got: {err}");
+    // A value use still sees the merged state: `let b = a && { x = 7; true }`
+    // may skip the right operand, so the later read is rejected. rustc rejects
+    // it (E0381).
+    let err = compile_to_asm(
+        "fn f(a: bool) -> i64 { let mut x: i64; let b = a && { x = 7; true }; \
+         if b { return x; } return 0; } fn main() { let _ = f(true); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("possibly-uninitialized variable `x`"), "got: {err}");
+}
+
+#[test]
 fn a_both_diverge_if_does_not_uninitialize_a_live_binding() {
     // Neither branch of `if true { return 1 } else { return 2 }` reaches the
     // code after it, so a binding initialized before the `if` stays initialized
@@ -5330,6 +5380,97 @@ fn a_duplicate_const_is_rejected() {
 }
 
 #[test]
+fn a_block_const_is_folded_like_a_top_level_one() {
+    // A `const` inside a function body is an item rustc hoists for the block, so
+    // it is usable before its declaration and has no storage of its own.
+    let out = asm("fn main() -> i64 { const N: i64 = 7; return N; }");
+    let body = main_body(&out);
+    assert!(body.contains("$7"), "the value is folded in:\n{body}");
+
+    let fwd = asm("fn main() -> i64 { let x = N; const N: i64 = 9; return x; }");
+    assert!(main_body(&fwd).contains("$9"), "forward reference folded:\n{fwd}");
+
+    let stat = asm("fn main() -> i64 { static N: i64 = 4; return N; }");
+    assert!(main_body(&stat).contains("$4"), "an immutable `static` folds too:\n{stat}");
+}
+
+#[test]
+fn a_block_const_shadows_a_top_level_one() {
+    // A block-scoped constant shadows an outer one until the block ends, then
+    // the outer value returns: the inner `N` folds to 2, the outer to 1.
+    let out = asm("const N: i64 = 1; fn main() -> i64 { let a: i64 = { const N: i64 = 2; N }; return a + N; }");
+    let body = main_body(&out);
+    assert!(body.contains("$2"), "the inner shadow is folded:\n{body}");
+    assert!(body.contains("$1"), "the outer value returns after the block:\n{body}");
+}
+
+#[test]
+fn a_duplicate_block_const_is_rejected() {
+    let err = compile_to_asm(
+        "fn main() -> i64 { const N: i64 = 2; const N: i64 = 3; return N; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("defined multiple times"), "got: {err}");
+}
+
+#[test]
+fn a_block_const_is_out_of_scope_after_its_block() {
+    let err = compile_to_asm(
+        "fn main() -> i64 { { const N: i64 = 2; } return N; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("N"), "got: {err}");
+}
+
+#[test]
+fn a_block_const_of_an_unsupported_type_is_rejected() {
+    // The item is type-checked like a top-level one, so a `str` constant is
+    // refused rather than silently skipped.
+    let err = compile_to_asm(
+        "fn main() { const S: str = \"hi\"; println!(\"{}\", 1); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("rmc only folds"), "got: {err}");
+}
+
+#[test]
+fn a_let_shadowing_a_block_const_is_rejected() {
+    // rustc E0530: a local binding may not shadow a constant. sema checks this
+    // for a top-level constant; a block-scoped one is folded in the parser, so
+    // the parser must reject it.
+    let err = compile_to_asm(
+        "fn main() { const N: i64 = 5; let N = 3; println!(\"{}\", N); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("shadows a constant"), "got: {err}");
+}
+
+#[test]
+fn an_at_binding_shadowing_a_block_const_is_rejected() {
+    // rustc E0530 also covers an `@` binding and a struct-pattern field.
+    let err = compile_to_asm(
+        "fn main() { const N: i64 = 5; if let N @ 1 = 1 { println!(\"{}\", N); } }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("shadows a constant"), "got: {err}");
+}
+
+#[test]
+fn a_struct_field_binding_shadowing_a_block_const_is_rejected() {
+    let err = compile_to_asm(
+        "struct S { N: i64 } fn main() { const N: i64 = 5; let S { N } = S { N: 1 }; println!(\"{}\", N); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("shadows a constant"), "got: {err}");
+}
+
+#[test]
 fn a_value_loop_binds_its_break_value() {
     // `loop` is an expression: the `break` value is stored into the loop's
     // result slot, which the code after the loop reads.
@@ -5842,6 +5983,252 @@ fn a_side_effecting_min_argument_is_evaluated_once() {
     );
     let body = &out[out.find("main:").expect("main")..];
     assert_eq!(body.matches("call g").count(), 2, "each operand called once:\n{body}");
+}
+
+#[test]
+fn a_min_receiver_is_copied_before_a_mutating_argument() {
+    // Rust evaluates and copies the scalar receiver before the arguments, so
+    // `x.min({ x = 9; 7 })` compares the argument against the *original* `x`
+    // (5), not the value the argument's block wrote. The receiver must be
+    // snapshotted into a temporary first; leaving it as a read of its slot
+    // would let the write leak in. The snapshot is a `mov` of `x` before the
+    // `mov $9` that writes it.
+    let out = asm_no_inline(
+        "fn main() -> i64 { let mut x: i64 = 5; let r = x.min({ x = 9; 7 }); return r; }",
+    );
+    let body = &out[out.find("main:").expect("main")..];
+    let snap = body.find("mov %rbx, %r12").expect("receiver snapshot:\n");
+    let write = body.find("mov $9, %rbx").expect("the argument write:\n");
+    assert!(snap < write, "the receiver must be copied before the argument runs:\n{body}");
+}
+
+#[test]
+fn a_wrapping_mul_receiver_is_copied_before_a_mutating_argument() {
+    // `wrapping_mul` is `*` with the trap suppressed; it reads the receiver as
+    // a multiplicand, so it must snapshot it too. `x.wrapping_mul({ x = 9; 2 })`
+    // is `5 * 2`, not `9 * 2`.
+    let out = asm_no_inline(
+        "fn main() -> i64 { let mut x: i64 = 5; let r = x.wrapping_mul({ x = 9; 2 }); return r; }",
+    );
+    let body = &out[out.find("main:").expect("main")..];
+    let snap = body.find("mov %rbx, %r12").expect("receiver snapshot:\n");
+    let write = body.find("mov $9, %rbx").expect("the argument write:\n");
+    assert!(snap < write, "the receiver must be copied before the argument runs:\n{body}");
+}
+
+#[test]
+fn a_vec_i64_pointer_add_steps_whole_elements() {
+    // `add(off)` advances by `off` elements, so a `Vec<i64>` pointer steps eight
+    // bytes per unit: `base.add(3)` is `base + 3 * 8`. The scaling `lea` is
+    // emitted once for the allocation size (`n * 8`) and once more for the
+    // offset, so two of them appear; the offset add then takes a register
+    // operand rather than the immediate `3`.
+    let out = asm_no_inline(
+        "fn main() -> i64 { \
+             let v: Vec<i64> = vec![0i64; 8]; \
+             let base = v.as_mut_ptr(); \
+             let p = unsafe { base.add(3) } as *mut i64; \
+             return unsafe { *p }; \
+         }",
+    );
+    let body = &out[out.find("main:").expect("main")..];
+    assert_eq!(
+        body.matches("lea 0(,%rax,8), %rax").count(),
+        2,
+        "expected the offset to be scaled by eight:\n{body}"
+    );
+    assert!(body.contains("add %rcx, %rax"), "expected the scaled add:\n{body}");
+}
+
+#[test]
+fn a_vec_u8_pointer_add_steps_single_bytes() {
+    // A `Vec<u8>` is a raw byte arena in rmc, so its pointer keeps a one-byte
+    // stride: `base.add(3)` is `base + 3`. Only the allocation size contributes
+    // a scaling `lea`, and the offset add keeps its immediate `3`.
+    let out = asm_no_inline(
+        "fn main() -> i64 { \
+             let v: Vec<u8> = vec![0u8; 8]; \
+             let base = v.as_mut_ptr(); \
+             let p = unsafe { base.add(3) } as *mut i64; \
+             return unsafe { *p }; \
+         }",
+    );
+    let body = &out[out.find("main:").expect("main")..];
+    assert_eq!(
+        body.matches("lea 0(,%rax,8), %rax").count(),
+        1,
+        "a byte pointer must not scale the offset:\n{body}"
+    );
+    assert!(body.contains("add $3, %rax"), "expected a one-byte stride:\n{body}");
+}
+
+#[test]
+fn a_shadowed_vec_binding_restores_the_outer_stride() {
+    // The element width a `Vec` binding carries is lexically scoped: an inner
+    // `v: Vec<i64>` in a nested block must not leave the outer `v: Vec<u8>`
+    // with an eight-byte stride once the block ends. The outer pointer's
+    // `add(1)` must therefore stay a one-byte step (`add $1, %rax`), not a
+    // scaled one.
+    let out = asm_no_inline(
+        "fn main() -> i64 { \
+             let mut v: Vec<u8> = vec![0u8; 16]; \
+             { let v: Vec<i64> = vec![0i64; 2]; let _ = v.len(); } \
+             let p = v.as_mut_ptr(); \
+             let q = unsafe { p.add(1) }; \
+             return q as i64 - p as i64; \
+         }",
+    );
+    let body = &out[out.find("main:").expect("main")..];
+    assert!(body.contains("add $1, %rax"), "outer byte stride lost after shadow:\n{body}");
+}
+
+#[test]
+fn a_vec_element_type_alias_resolves_to_the_target_width() {
+    // `type Byte = u8` is transparent, so `Vec<Byte>` has a one-byte stride:
+    // `p.add(8)` is `p + 8`, an immediate add, not a scaled one.
+    let out = asm_no_inline(
+        "type Byte = u8; \
+         fn main() -> i64 { \
+             let mut v: Vec<Byte> = vec![0u8; 16]; \
+             let p = v.as_mut_ptr(); \
+             let q = unsafe { p.add(8) }; \
+             return q as i64 - p as i64; \
+         }",
+    );
+    let body = &out[out.find("main:").expect("main")..];
+    assert!(body.contains("add $8, %rax"), "alias element must keep a byte stride:\n{body}");
+}
+
+#[test]
+fn an_array_pattern_of_the_wrong_length_is_rejected() {
+    // rustc requires an array pattern to name exactly the array's length
+    // (E0527), so `let [x] = [1, 2];` is an error rather than silently reading
+    // the first element and ignoring the rest.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let a: [i64; 2] = [1, 2]; let [x] = a; return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("pattern requires 1 element but array has 2"), "got: {err}");
+}
+
+#[test]
+fn a_tuple_pattern_of_the_wrong_length_is_rejected() {
+    // Likewise a tuple pattern must name every field (E0308), so `let (x,) =
+    // (1, 2);` is an error.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let t: (i64, i64) = (1, 2); let (x,) = t; return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("pattern requires 1 element but tuple has 2"), "got: {err}");
+}
+
+#[test]
+fn a_unit_tuple_pattern_is_accepted() {
+    // `()` is the empty tuple, so `let () = ();` is a legal irrefutable pattern.
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let () = (); return 0; }",
+        &CompileOptions::default()
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_tuple_pattern_on_an_array_is_rejected() {
+    // A tuple pattern never matches an array, even one of the same length
+    // (E0308). With all-wildcard elements no field read catches the mismatch,
+    // so the arity check must reject it rather than accept the equal count.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let a: [i64; 2] = [1, 2]; let (_, _) = a; return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("a tuple pattern cannot match"), "got: {err}");
+}
+
+#[test]
+fn a_binding_tuple_pattern_on_an_array_is_rejected() {
+    // The same with named elements, so the marker is what rejects it rather
+    // than the field read that would follow.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let a: [i64; 2] = [1, 2]; let (x, y) = a; return x + y; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("a tuple pattern cannot match"), "got: {err}");
+}
+
+#[test]
+fn a_tuple_pattern_on_an_array_in_a_match_arm_is_rejected() {
+    let err = compile_to_asm(
+        "fn main() -> i64 { let a: [i64; 2] = [1, 2]; let _ = match a { (x, y) => x }; return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("a tuple pattern cannot match"), "got: {err}");
+}
+
+#[test]
+fn a_destructuring_let_may_shadow_its_own_scrutinee() {
+    // `let (x, y) = x;` binds from the *old* `x`: the expansion must copy the
+    // scrutinee to a hidden temporary before it binds, or the second read
+    // resolves against the new binding and fails to type.
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let x: (i64, i64) = (1, 2); let (x, y) = x; return x + y; }",
+        &CompileOptions::default()
+    )
+    .is_ok());
+}
+
+#[test]
+fn an_array_destructuring_let_may_shadow_its_own_scrutinee() {
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let a: [i64; 3] = [1, 2, 3]; let [a, b, c] = a; return a + b + c; }",
+        &CompileOptions::default()
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_struct_destructuring_let_may_shadow_its_own_scrutinee() {
+    assert!(compile_to_asm(
+        "struct S { a: i64, b: i64 } \
+         fn main() -> i64 { let s = S { a: 1, b: 2 }; let S { a: s, b } = s; return s + b; }",
+        &CompileOptions::default()
+    )
+    .is_ok());
+}
+
+#[test]
+fn an_at_binding_may_shadow_its_own_scrutinee() {
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let p: (i64, i64) = (1, 2); let p @ (_, _) = p; return p.0 + p.1; }",
+        &CompileOptions::default()
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_nested_tuple_destructure_may_shadow_its_scrutinee() {
+    // The outer element rebinds `n`; the inner wildcard-only `(_, _)` marker
+    // must still read the original `n`.
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let n: (i64, (i64, i64)) = (1, (2, 3)); let (n, (_, _)) = n; return n; }",
+        &CompileOptions::default()
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_non_shadowing_destructuring_let_reuses_the_local() {
+    // The copy is only forced when the pattern shadows the scrutinee; a plain
+    // `let (a, b) = p;` still reads `p` directly, with no `\0lp` temporary.
+    let out = asm_no_inline(
+        "fn main() -> i64 { let p: (i64, i64) = (5, 6); let (a, b) = p; return a + b; }",
+    );
+    let body = &out[out.find("main:").expect("main")..];
+    assert!(!body.contains("lp"), "a non-shadowing destructure must not copy:\n{body}");
 }
 
 #[test]
@@ -6787,4 +7174,196 @@ fn a_constant_array_length_may_use_a_bitwise_operator() {
 fn a_constant_array_length_may_name_a_constant() {
     let out = asm("const N: i64 = 4; fn main() -> i64 { let a: [i64; N] = [1, 2, 3, 4]; return a[3]; }");
     assert!(out.contains("main:"), "a named constant length must fold");
+}
+
+#[test]
+fn an_assignment_may_end_a_block_without_a_semicolon() {
+    // An assignment is a `()`-valued expression, so its trailing `;` may be
+    // omitted when it is the last thing in a block, as after `return`. The
+    // value written must still reach the store.
+    let out = asm("fn main() -> i64 { let mut x: i64 = 0; if x == 0 { x = 7 } return x; }");
+    assert!(out.contains("main:"), "a trailing assignment with no `;` must compile");
+    let compound = asm("fn main() -> i64 { let mut x: i64 = 3; { x *= 4 } return x; }");
+    assert!(compound.contains("main:"), "a trailing compound assignment with no `;` must compile");
+}
+
+#[test]
+fn a_stray_semicolon_is_an_empty_statement() {
+    // Rust accepts any number of bare `;` between statements and at the end of
+    // a block; they are empty statements, not a parse error.
+    let out = asm("fn main() -> i64 { let mut x: i64 = 0; ; x += 1; ;; return x; ; }");
+    assert!(out.contains("main:"), "empty statements must be skipped");
+}
+
+#[test]
+fn an_assignment_in_a_match_arm_may_end_a_block_without_a_semicolon() {
+    let out = asm(
+        "fn main() -> i64 { let mut x: i64 = 0; match 2 { 2 => { x = 100 } _ => { x = 200 } } return x; }",
+    );
+    assert!(out.contains("main:"), "an assignment ending a match-arm block must compile");
+}
+
+#[test]
+fn a_loop_body_may_end_in_an_assignment_without_a_semicolon() {
+    let out = asm(
+        "fn main() -> i64 { let mut n: i64 = 3; let mut s: i64 = 0; while n > 0 { s += n; n -= 1 } return s; }",
+    );
+    assert!(out.contains("main:"), "a loop body ending in an assignment must compile");
+}
+
+#[test]
+fn bitwise_operators_are_defined_on_bool() {
+    // rustc's `BitAnd`/`BitOr`/`BitXor` impls cover `bool`, so these must
+    // type-check and yield a `bool`, not a type error. `asm` panics on a
+    // compile error, so reaching the assertion proves the check passed.
+    let out = asm("fn main() -> i64 { let a: bool = true; let b: bool = false; let c: bool = a & b | a ^ b; return c as i64; }");
+    assert!(out.contains("main:"), "`&`/`|`/`^` on bool must compile");
+}
+
+#[test]
+fn a_const_bool_may_use_a_bitwise_operator() {
+    // The constant folder must fold `&`/`|`/`^` on `bool` too, or a `const`
+    // written with them is rejected as non-constant.
+    let out = asm("const A: bool = true & false; const B: bool = true | false; const C: bool = true ^ true; fn main() -> i64 { return (A as i64) + (B as i64) + (C as i64); }");
+    assert!(out.contains("main:"), "a const bool using &/|/^ must fold");
+}
+
+#[test]
+fn a_logical_not_of_a_bool_bitwise_expression_stays_logical() {
+    // `!(a | b)` is logical not on a `bool`. Codegen reports `i64` for a
+    // `&`/`|`/`^` (the instruction is the same for a 0/1 bool), so `!` must
+    // recover the operand's type from the expression, not the codegen result,
+    // or it emits a bitwise `not` and yields `-1`/`-2` instead of `0`/`1`.
+    let out = asm("fn main() -> i64 { let a: bool = true; let b: bool = false; let c: bool = !(a | b); return c as i64; }");
+    assert!(out.contains("sete %al"), "`!` on a bool `|` must be logical not");
+    assert!(!out.contains("not %rax"), "`!` on a bool `|` must not be a bitwise not");
+}
+
+#[test]
+fn a_logical_not_of_an_indexed_bool_bitwise_expression_stays_logical() {
+    let out = asm("fn main() -> i64 { let a = [true, false]; let c: bool = !(a[0] | a[1]); return c as i64; }");
+    assert!(out.contains("sete %al"), "`!` on an indexed bool `|` must be logical not");
+    assert!(!out.contains("not %rax"), "`!` on an indexed bool `|` must not be a bitwise not");
+}
+
+#[test]
+fn a_bitwise_not_of_an_integer_stays_bitwise() {
+    // The `bool` special case must not leak onto the integers: `!x` on an
+    // `i64` is a bitwise not.
+    let out = asm("fn main() -> i64 { let x: i64 = 5; return !x; }");
+    assert!(out.contains("not %rax"), "`!` on i64 must be a bitwise not");
+}
+
+#[test]
+fn a_pub_item_is_accepted() {
+    // `pub` may prefix a top-level item. rmc resolves every name in one flat
+    // namespace, so the visibility is dropped; accepting it lets an ordinary
+    // Rust source file parse unchanged.
+    let out = asm(
+        "pub const N: i64 = 1; pub type T = i64; pub struct S { x: i64 } \
+         pub enum E { A } pub fn f(v: T) -> i64 { v } fn main() -> i64 { f(N) }",
+    );
+    assert!(out.contains("main:"), "a `pub` item must compile");
+}
+
+#[test]
+fn a_pub_struct_field_is_accepted() {
+    let out = asm("pub struct S { pub x: i64 } fn main() -> i64 { let s = S { x: 3 }; s.x }");
+    assert!(out.contains("main:"), "a `pub` field must compile");
+}
+
+#[test]
+fn a_pub_impl_method_is_accepted() {
+    let out = asm(
+        "struct S { x: i64 } impl S { pub fn get(&self) -> i64 { self.x } } \
+         fn main() -> i64 { let s = S { x: 5 }; s.get() }",
+    );
+    assert!(out.contains("main:"), "a `pub` method must compile");
+}
+
+#[test]
+fn a_pub_nested_fn_is_accepted() {
+    // A nested `pub fn` is accepted by rustc, so it must parse here too.
+    let out = asm("fn main() -> i64 { pub fn g() -> i64 { 4 } g() }");
+    assert!(out.contains("main:"), "a nested `pub fn` must compile");
+}
+
+#[test]
+fn a_pub_with_a_restriction_is_accepted() {
+    // `pub(crate)`, `pub(super)` and `pub(in ..)` carry a parenthesised
+    // restriction; the whole qualifier is dropped.
+    let out = asm("pub(crate) fn f() -> i64 { 2 } fn main() -> i64 { f() }");
+    assert!(out.contains("main:"), "`pub(crate)` must compile");
+    let sup = asm("pub(super) fn f() -> i64 { 3 } fn main() -> i64 { f() }");
+    assert!(sup.contains("main:"), "`pub(super)` must compile");
+}
+
+#[test]
+fn an_inline_module_is_skipped() {
+    // rmc has no module system, so an inline `mod NAME { .. }` body is dropped.
+    // A program that declares one and uses only the flat items still compiles.
+    let out = asm("mod m { pub fn never() -> i64 { 0 } } fn main() -> i64 { 7 }");
+    assert!(out.contains("main:"), "an inline module must be skipped");
+}
+
+#[test]
+fn a_file_module_declaration_is_rejected() {
+    // `mod NAME;` loads another file, which rmc cannot resolve. Rejecting it
+    // matches rustc when the file is absent and avoids a silent divergence.
+    let err = compile_to_asm("mod m; fn main() -> i64 { 0 }", &CompileOptions::default());
+    assert!(err.is_err(), "`mod NAME;` must be rejected");
+}
+
+#[test]
+fn a_chained_comparison_is_rejected() {
+    // Comparison is non-associative in Rust: `a < b < c` is a hard error, not
+    // `(a < b) < c`. rmc must not accept what rustc rejects.
+    for src in [
+        "fn main() { println!(\"{}\", 1 < 2 < 3); }",
+        "fn main() { println!(\"{}\", 1 == 1 == true); }",
+        "fn main() { println!(\"{}\", 1 != 2 != false); }",
+        "fn main() { println!(\"{}\", 1 <= 2 >= 1); }",
+    ] {
+        let err = compile_to_asm(src, &CompileOptions::default());
+        assert!(err.is_err(), "a chained comparison must be rejected: {src}");
+    }
+    // A single comparison, and a comparison of a parenthesised comparison,
+    // still compile.
+    assert!(compile_to_asm("fn main() { let x = 1 < 2; }", &CompileOptions::default()).is_ok());
+    assert!(compile_to_asm("fn main() { let x = (1 < 2) == true; }", &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_static_is_accepted_like_a_const() {
+    // An immutable `static` lowers to a `const`: the initialiser must fold and
+    // every read yields the value. `pub` is accepted.
+    let out = asm("static X: i64 = 5; static Y: i64 = X + 1; fn main() -> i64 { X + Y }");
+    assert!(out.contains("main:"), "an immutable `static` must compile");
+    let pub_static = asm("pub static X: i64 = 7; fn main() -> i64 { X }");
+    assert!(pub_static.contains("main:"), "a `pub static` must compile");
+}
+
+#[test]
+fn a_static_mut_is_rejected() {
+    // rmc has no mutable global, so `static mut` is refused rather than
+    // silently dropping a mutation.
+    let err = compile_to_asm("static mut X: i64 = 5; fn main() -> i64 { X }", &CompileOptions::default());
+    assert!(err.is_err(), "`static mut` must be rejected");
+}
+
+#[test]
+fn a_byte_literal_is_an_integer() {
+    // `b'A'` is the byte value, an `i64` in rmc. `\xFF` is a valid byte escape.
+    let out = asm("fn main() -> i64 { b'A' }");
+    assert!(out.contains("main:"), "a byte literal must compile");
+    let big = asm("fn main() -> i64 { b'\\xFF' }");
+    assert!(big.contains("$255"), "`\\xFF` is 255");
+    let nl = asm("fn main() -> i64 { b'\\n' }");
+    assert!(nl.contains("$10"), "`\\n` is 10");
+}
+
+#[test]
+fn a_byte_string_is_not_supported() {
+    // `b".."` needs an array of bytes, which rmc does not have.
+    assert!(compile_to_asm("fn main() { let s = b\"hi\"; }", &CompileOptions::default()).is_err());
 }

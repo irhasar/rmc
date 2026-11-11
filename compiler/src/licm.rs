@@ -135,6 +135,7 @@ Expr::PatScrutinee(_) => {
                 unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
             }
             Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
+            Expr::PatArity { .. } => unreachable!("sema rewrites PatArity into `true`"),
             Expr::Block(b) | Expr::Loop(b, _, _, _) => self.block(b),
             Expr::MatchBoundary(b, _) => self.block(b),
             Expr::If(c, t, els) => {
@@ -297,6 +298,7 @@ Expr::PatScrutinee(_) => {
                 unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
             }
             Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
+            Expr::PatArity { .. } => unreachable!("sema rewrites PatArity into `true`"),
             Expr::Call { args, .. } => {
                 // A call may write anything, so no local is known invariant.
                 self.all = true;
@@ -487,6 +489,7 @@ Expr::PatScrutinee(_) => {
                 unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
             }
             Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
+            Expr::PatArity { .. } => unreachable!("sema rewrites PatArity into `true`"),
             Expr::Bin(_, a, b) => {
                 self.expr(a);
                 self.expr(b);
@@ -625,8 +628,11 @@ fn scalar(e: &Expr) -> bool {
     }
 }
 
-/// The type of a hoistable expression: `Bool` for a comparison or a `bool` `!`,
-/// the operand's type for a bitwise `!`, and `I64` otherwise.
+/// The type of a hoistable expression: `Bool` for a comparison or a `bool`
+/// `!`, the operand's type for a bitwise `!`, and `I64` otherwise. A `&`/`|`/`^`
+/// on `bool` is `bool` (rustc's `BitAnd`/`BitOr`/`BitXor` impls), so a hoisted
+/// one is bound to a `bool` slot; typing it `I64` would make a later `!` on the
+/// hoisted `Var` a bitwise not.
 fn expr_ty(e: &Expr) -> Type {
     match e {
         Expr::Bool(_) => Type::Bool,
@@ -636,6 +642,13 @@ fn expr_ty(e: &Expr) -> Type {
             if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) =>
         {
             Type::Bool
+        }
+        Expr::Bin(op, a, b) if matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor) => {
+            if expr_ty(a) == Type::Bool || expr_ty(b) == Type::Bool {
+                Type::Bool
+            } else {
+                Type::I64
+            }
         }
         Expr::Bin(_, a, _) if matches!(a.as_ref(), Expr::Bool(_)) => Type::Bool,
         _ => Type::I64,

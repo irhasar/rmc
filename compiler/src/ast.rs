@@ -354,6 +354,14 @@ pub enum Expr {
     /// pattern, so a pattern for one struct cannot bind a same-named field of
     /// another (`let A { x } = B { x: 7 }` is rejected, as rustc rejects it).
     PatCheck { base: Box<Expr>, pat_struct: String },
+    /// An array or tuple pattern's claim about its scrutinee's arity: the
+    /// number of elements an array pattern names (`[a, b]` -> 2) or the field
+    /// count of a tuple pattern. Sema checks it against the scrutinee's actual
+    /// length and rewrites it to `true`, so it never reaches codegen. rustc
+    /// requires the counts to match exactly, so `let [x] = [1, 2];` and
+    /// `let (x,) = (1, 2);` are errors; without this marker the extra element
+    /// would simply never be read and the pattern would silently match.
+    PatArity { base: Box<Expr>, want: usize, is_tuple: bool },
 }
 
 /// A field inside a struct literal, once sema has resolved its layout.

@@ -4,6 +4,43 @@ use crate::ast::*;
 use crate::consts::eval_i64;
 use crate::lexer::{Tok, Token};
 
+/// One saved entry of a parser name table, so a block's bindings are forgotten
+/// when the block ends. Each `let`/`for` that records a `Vec` or raw-pointer
+/// binding first pushes the name's previous state; leaving the block undoes the
+/// entries in reverse, which both removes the inner binding and restores an
+/// outer binding the block shadowed. Without this, a nested `let v: Vec<i64>`
+/// would leave the outer `v: Vec<u8>` with an eight-byte stride once its block
+/// ended.
+enum NameScope {
+    /// `vec_names`: whether the name was already present.
+    VecName(String, bool),
+    VecCap(String, Option<i64>),
+    VecLen(String, Option<i64>),
+    VecElem(String, Option<i64>),
+    Ptr(String, Option<i64>),
+    /// `args_vecs`: a `std::env::args()...collect()` binding.
+    ArgsVec(String, Option<i64>),
+    /// A `const` declared inside the block, so the name is removed (or its
+    /// outer value restored) when the block ends. The `Option` is the value the
+    /// name had before, if any.
+    ConstInt(String, Option<i64>),
+    ConstBool(String, Option<bool>),
+    ConstChar(String, Option<u32>),
+}
+
+/// A `const` (or immutable `static`) declared inside a block. It is folded by
+/// the block scan and in scope for the rest of the block, exactly like a
+/// top-level `const` is in scope for the rest of the file; it is never added to
+/// the program's item list, so codegen never sees it. `start`/`end` are token
+/// indices: the `const`/`static` keyword and the token just past the `;`, so the
+/// main parse can skip the item the scan already folded.
+#[derive(Debug, Clone)]
+struct LocalConst {
+    start: usize,
+    end: usize,
+    name: String,
+}
+
 pub struct Parser {
     toks: Vec<Token>,
     i: usize,
@@ -59,6 +96,12 @@ pub struct Parser {
     /// only the program's items (a top-level `fn`, `struct`, `enum` or `const`),
     /// never an enclosing local, so nothing needs to be closed over.
     nested_fns: Vec<FnDef>,
+    /// One frame per block being parsed, innermost last, of the `const`s (and
+    /// immutable `static`s) declared directly in that block. A block-scoped
+    /// `const` is folded when it is parsed and shadows an outer one until the
+    /// block ends, matching rustc's scoping; the name table `consts`/`const_bools`/
+    /// `const_chars` is updated in place and restored by `pop_name_scope`.
+    local_consts: Vec<Vec<LocalConst>>,
     /// True while parsing a pattern that may be refutable (a `match` arm, an
     /// `if let` / `while let` scrutinee). A tuple pattern is irrefutable only
     /// when every element is, but in a refutable position its elements may be
@@ -115,9 +158,30 @@ pub struct Parser {
     /// `v.len()`.
     vec_len: std::collections::HashMap<String, i64>,
     /// Names holding a raw pointer (an `i64` address) taken by `.as_mut_ptr()`
-    /// or `.as_ptr()`. A `.add(off)` on one is the address arithmetic
-    /// `ptr + off`, matching the raw-pointer method.
-    ptr_vars: std::collections::HashSet<String>,
+    /// or `.as_ptr()`, mapped to the byte stride of one element. A `.add(off)`
+    /// on one is `ptr + off * stride`, matching the raw-pointer method: `add`
+    /// advances by whole elements, so a `Vec<i64>` pointer steps eight bytes
+    /// while a `Vec<u8>` one steps one.
+    ptr_vars: std::collections::HashMap<String, i64>,
+    /// The element byte width of each `Vec` binding, taken from its `Vec<T>`
+    /// annotation. A pointer derived from the binding inherits it as its
+    /// stride. rmc stores every element in a word, so an absent or unrecognised
+    /// element type defaults to eight.
+    vec_elem: std::collections::HashMap<String, i64>,
+    /// The element width of the most recently parsed `Vec<T>` type, so the
+    /// `let` that consumes the type can record it against the binding name.
+    /// Only `Vec` bindings read it, and they always follow their annotation.
+    vec_elem_pending: Option<i64>,
+    /// The bare-identifier target of each `type` alias (`type Byte = u8` ->
+    /// `Byte` -> `u8`), so a `Vec<Byte>` can resolve the element to its
+    /// underlying byte width. Only a target that is a single identifier is
+    /// recorded; anything else keeps the default width.
+    alias_target: std::collections::HashMap<String, String>,
+    /// Undo log for the `Vec`/pointer name tables above, one frame per block
+    /// being parsed (innermost last). A binding a block introduces is undone
+    /// when the block ends, and an outer binding it shadowed is restored, so a
+    /// name's recorded stride and shape are lexically scoped.
+    name_scopes: Vec<Vec<NameScope>>,
 }
 
 /// The deepest expression, block or type nesting the parser accepts. Deeply
@@ -160,6 +224,7 @@ impl Parser {
                 m
             },
             nested_fns: Vec::new(),
+            local_consts: Vec::new(),
             pat_refutable_ok: false,
             fn_scopes: vec![Vec::new()],
             fn_at: std::collections::HashMap::new(),
@@ -171,7 +236,11 @@ impl Parser {
             vec_names: std::collections::HashSet::new(),
             vec_cap: std::collections::HashMap::new(),
             vec_len: std::collections::HashMap::new(),
-            ptr_vars: std::collections::HashSet::new(),
+            ptr_vars: std::collections::HashMap::new(),
+            vec_elem: std::collections::HashMap::new(),
+            vec_elem_pending: None,
+            alias_target: std::collections::HashMap::new(),
+            name_scopes: Vec::new(),
         }
     }
 
@@ -267,10 +336,17 @@ impl Parser {
         let mut consts = Vec::new();
         let mut fns = Vec::new();
         while self.peek().is_some() {
+            // `pub` (and `pub(crate)` / `pub(super)` / `pub(in ..)`) may prefix
+            // any item. rmc has one flat namespace, so the visibility is
+            // dropped; skipping it here lets an ordinary `.rs` file parse.
+            self.skip_pub()?;
             match self.peek() {
                 Some(Tok::Struct) => structs.push(self.parse_struct()?),
                 Some(Tok::Enum) => enums.push(self.parse_enum()?),
                 Some(Tok::Const) => consts.push(self.parse_const()?),
+                // `static [mut] NAME: T = EXPR;`. An immutable `static` is a
+                // `const`; `static mut` is rejected (rmc has no mutable global).
+                Some(Tok::Ident(id)) if id == "static" => consts.push(self.parse_static()?),
                 Some(Tok::Type) => self.parse_type_alias()?,
                 Some(Tok::Fn) => fns.push(self.parse_fn()?),
                 Some(Tok::Impl) => self.parse_impl(&mut fns)?,
@@ -293,6 +369,10 @@ impl Parser {
                 // does not provide fails later at its use site, with a clearer
                 // message than a parse error here.
                 Some(Tok::Ident(id)) if id == "use" => self.skip_use()?,
+                // `mod NAME;` / `mod NAME { .. }`: rmc has no module system, so
+                // the module is skipped. The items it would contain are not
+                // visible; a use of one fails later at its use site.
+                Some(Tok::Ident(id)) if id == "mod" => self.skip_mod()?,
                 other => {
                     return Err(format!(
                         "at byte {}: expected `fn`, `struct`, `enum`, `const`, `type` or `impl`, found {}",
@@ -314,6 +394,7 @@ impl Parser {
     }
 
     fn parse_enum(&mut self) -> PResult<EnumDef> {
+        self.skip_pub()?;
         self.expect(Tok::Enum)?;
         let name = self.expect_ident()?;
         self.expect(Tok::LBrace)?;
@@ -403,9 +484,17 @@ impl Parser {
         let mut enum_names: Vec<String> = Vec::new();
         self.i = 0;
         loop {
+            // A `pub` on an item is dropped (rmc has one flat namespace), so
+            // skip it before matching the item keyword, exactly as the real
+            // parse loop does.
+            self.skip_pub()?;
             match self.peek() {
                 None => break,
                 Some(Tok::Const) => items.push(self.parse_const()?),
+                // `static [mut] NAME: T = EXPR;` is collected like a `const`:
+                // an immutable `static` is lowered to one, and `static mut` is
+                // rejected here too.
+                Some(Tok::Ident(id)) if id == "static" => items.push(self.parse_static()?),
                 Some(Tok::Type) => {
                     // `type NAME = TYPE;`. The target is not parsed yet: a
                     // `[T; N]` target needs the constant values, which are still
@@ -416,6 +505,15 @@ impl Parser {
                     let name = self.expect_ident()?;
                     self.expect(Tok::Eq)?;
                     let start = self.i;
+                    // If the target is a single identifier, remember it so a
+                    // `Vec<NAME>` can chase the alias to its underlying byte
+                    // width. A compound target (`[u8; 4]`, `(u8, u8)`) is left
+                    // out; its width is the default.
+                    if let Some(Tok::Ident(target)) = self.toks.get(self.i).map(|t| t.tok.clone()) {
+                        if matches!(self.toks.get(self.i + 1).map(|t| &t.tok), Some(Tok::Semi)) {
+                            self.alias_target.insert(name.clone(), target);
+                        }
+                    }
                     self.skip_to_semi()?;
                     alias_spans.push((name, start));
                 }
@@ -438,6 +536,9 @@ impl Parser {
                         self.i += 1;
                         let mut fields = std::collections::HashSet::new();
                         while self.peek() != Some(&Tok::RBrace) && self.peek().is_some() {
+                            // A field may carry its own `pub`; skip it so the
+                            // field name is recorded, not `pub`.
+                            self.skip_pub()?;
                             if let Some(Tok::Ident(f)) = self.peek() {
                                 fields.insert(f.clone());
                                 self.i += 1;
@@ -485,6 +586,10 @@ impl Parser {
                     }
                     self.skip_balanced(Tok::LBrace, Tok::RBrace)?;
                 }
+                // A `mod NAME;` / `mod NAME { .. }` is skipped, so a `const`
+                // inside a module body is not collected (its items are not
+                // visible to the flat namespace anyway).
+                Some(Tok::Ident(id)) if id == "mod" => self.skip_mod()?,
                 Some(Tok::Fn) => {
                     // Skip the name, the parameter list, the return type and the
                     // body, so a `const` inside a function body is not seen.
@@ -589,6 +694,38 @@ impl Parser {
         self.skip_to_semi()
     }
 
+    /// Skip a `pub` visibility qualifier, with its optional restriction
+    /// (`pub(crate)`, `pub(super)`, `pub(in path)`). rmc resolves every name in
+    /// one flat namespace, so visibility carries no meaning and is dropped here.
+    /// Accepting it lets an ordinary Rust source file parse unchanged.
+    fn skip_pub(&mut self) -> PResult<()> {
+        if self.peek() == Some(&Tok::Ident("pub".into())) {
+            self.i += 1;
+            if self.peek() == Some(&Tok::LParen) {
+                self.skip_balanced(Tok::LParen, Tok::RParen)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Skip an inline `mod NAME { .. }`. rmc has no module system — every name
+    /// is resolved in one flat namespace — so the module body is dropped, which
+    /// lets an ordinary `.rs` file that declares inline modules parse. A
+    /// `mod NAME;` that would load another file is rejected: rmc compiles one
+    /// file and cannot resolve it, and accepting it would diverge from rustc
+    /// when the file is absent.
+    fn skip_mod(&mut self) -> PResult<()> {
+        let pos = self.pos();
+        self.i += 1; // the `mod` keyword
+        let name = self.expect_ident()?;
+        if self.peek() == Some(&Tok::Semi) {
+            return Err(format!(
+                "at byte {pos}: `mod {name};` loads another file, which rmc does not support"
+            ));
+        }
+        self.skip_balanced(Tok::LBrace, Tok::RBrace)
+    }
+
     /// Record the module names a `use` of the `std` tree brings into scope.
     /// Walks the token run up to the `;`, so `use std::process;`,
     /// `use std::process::exit;` and `use std::{process, hint};` all register
@@ -662,7 +799,17 @@ impl Parser {
     /// constant declared later) is left for `resolve_consts`, which reruns once
     /// every item has been seen.
     fn parse_const(&mut self) -> PResult<ConstDef> {
+        self.skip_pub()?;
         self.expect(Tok::Const)?;
+        self.parse_const_tail()
+    }
+
+    /// The `NAME : TYPE = EXPR ;` tail shared by `const` and an immutable
+    /// `static`. rmc has no mutable global storage, so a `static` is treated
+    /// exactly like a `const`: its initialiser must be a constant expression
+    /// (as rustc requires too), and every read yields that value. `static mut`
+    /// is rejected before this point, since mutation has no meaning here.
+    fn parse_const_tail(&mut self) -> PResult<ConstDef> {
         let name = self.expect_ident()?;
         self.expect(Tok::Colon)?;
         let ty = self.parse_type()?;
@@ -670,6 +817,79 @@ impl Parser {
         let value = self.parse_expr()?;
         self.expect(Tok::Semi)?;
         Ok(ConstDef { name, ty, value })
+    }
+
+    /// `static [mut] NAME: TYPE = EXPR;`. An immutable `static` is lowered to a
+    /// `const`. `static mut` is rejected: rmc has no mutable global, and a
+    /// program that mutates one would diverge, so refusing is safer than
+    /// silently dropping the mutation.
+    fn parse_static(&mut self) -> PResult<ConstDef> {
+        self.skip_pub()?;
+        self.i += 1; // `static`
+        if let Some(Tok::Ident(id)) = self.peek() {
+            if id == "mut" {
+                return Err(format!(
+                    "at byte {}: `static mut` is not supported; rmc has no mutable global",
+                    self.pos()
+                ));
+            }
+        }
+        self.parse_const_tail()
+    }
+
+    /// Parse a `const`/immutable-`static` item found at token `start`, fold its
+    /// value, and return the value plus the token index just past its `;`. The
+    /// declared type is honoured (an `i64`/`bool`/`char` item folds to that
+    /// kind); any other type folds to nothing, so a later use is diagnosed the
+    /// way an unresolved constant is. `static mut` is refused, as at the top
+    /// level. `self.i` is left at `start` so a caller that wants to parse the
+    /// item normally (the top-level loop) can.
+    fn fold_const_item(&mut self, start: usize) -> PResult<(Option<crate::consts::ConstVal>, usize)> {
+        let saved = self.i;
+        self.i = start;
+        self.skip_pub()?;
+        let def = if self.peek() == Some(&Tok::Const) {
+            self.i += 1;
+            self.parse_const_tail()?
+        } else {
+            // `static [mut] ..`; `parse_static` consumes the keyword itself.
+            self.parse_static()?
+        };
+        let end = self.i;
+        self.i = saved;
+        // Resolve the declared type the way a top-level `const` is resolved
+        // (`str`, and an alias to a scalar), then require a type rmc can fold.
+        // Without this a block-scoped `const S: str = "hi";` would be accepted
+        // while the same item at the top level is rejected.
+        let ty = self.expand_alias_ty(&def.ty, 0)?;
+        let ty = match ty {
+            Type::Named(n) if n == "str" => Type::Str,
+            other => other,
+        };
+        match ty {
+            Type::I64 | Type::Bool | Type::Char => {}
+            other => {
+                return Err(format!(
+                    "at byte {}: constant `{}` has type {other:?}; rmc only folds `i64`, `bool` and `char` constants",
+                    self.toks[start].pos, def.name
+                ))
+            }
+        }
+        // A constant may name one declared earlier (in this block or outside
+        // it), so fold against the live tables, which already hold every value
+        // in scope.
+        let items = [(def.name.clone(), ty.clone(), def.value.clone())];
+        let mut val = crate::consts::resolve(&items).get(&def.name).copied();
+        // A `char` constant folds through `eval_char`, which the item `resolve`
+        // path covers; an alias-typed one is rare enough to leave unresolved.
+        if val.is_none() {
+            if let Some(v) = crate::consts::eval_i64(&def.value, &self.consts) {
+                if ty == Type::I64 {
+                    val = Some(crate::consts::ConstVal::Int(v));
+                }
+            }
+        }
+        Ok((val, end))
     }
 
     /// Rewrite every alias name in `t` to its target, so no later pass sees an
@@ -692,12 +912,28 @@ impl Parser {
         }
     }
 
+    /// The byte width of a `Vec<T>` element named by the identifier `t`,
+    /// following `type` aliases to their target so `type Byte = u8` and
+    /// `Vec<Byte>` still get a one-byte stride. The chain is bounded so a
+    /// cyclic alias (which `expand_alias_ty` rejects elsewhere) cannot loop.
+    fn elem_width_of(&self, t: &str) -> i64 {
+        let mut cur = t.to_string();
+        for _ in 0..64 {
+            match self.alias_target.get(&cur) {
+                Some(next) if *next != cur => cur = next.clone(),
+                _ => break,
+            }
+        }
+        elem_byte_width(&cur)
+    }
+
     /// `type NAME = TYPE;`. The target is parsed here (aliases in it expanded by
     /// `parse_type_inner`) and stored; a use is rewritten to it by
     /// `expand_alias_ty`, so the alias never reaches sema. The name was
     /// registered by `prescan`, so it may be used before this point, which means
     /// `type A = B;` and `type B = i64;` resolve in either order.
     fn parse_type_alias(&mut self) -> PResult<()> {
+        self.skip_pub()?;
         self.expect(Tok::Type)?;
         let name = self.expect_ident()?;
         self.expect(Tok::Eq)?;
@@ -732,11 +968,13 @@ impl Parser {
     }
 
     fn parse_struct(&mut self) -> PResult<StructDef> {
+        self.skip_pub()?;
         self.expect(Tok::Struct)?;
         let name = self.expect_ident()?;
         self.expect(Tok::LBrace)?;
         let mut fields = Vec::new();
         while self.peek() != Some(&Tok::RBrace) {
+            self.skip_pub()?;
             let fname = self.expect_ident()?;
             self.expect(Tok::Colon)?;
             let fty = self.parse_type()?;
@@ -770,6 +1008,7 @@ impl Parser {
     }
 
     fn parse_fn(&mut self) -> PResult<FnDef> {
+        self.skip_pub()?;
         self.expect(Tok::Fn)?;
         let name = self.expect_ident()?;
         self.expect(Tok::LParen)?;
@@ -822,6 +1061,7 @@ impl Parser {
     }
 
     fn parse_method(&mut self, ty: &str) -> PResult<FnDef> {
+        self.skip_pub()?;
         self.expect(Tok::Fn)?;
         let name = self.expect_ident()?;
         self.expect(Tok::LParen)?;
@@ -1157,6 +1397,15 @@ impl Parser {
                         ));
                     }
                     self.i += 1; // `<`
+                    // The element type fixes the pointer stride for a later
+                    // `.add(off)`, so read its name before the alias map
+                    // collapses `u8` to `i64`; `size_of::<T>()` is what rustc
+                    // scales `add` by. A `type Byte = u8` alias is chased to its
+                    // target so `Vec<Byte>` still gets a one-byte stride.
+                    let width = match self.peek() {
+                        Some(Tok::Ident(t)) => self.elem_width_of(t),
+                        _ => 8,
+                    };
                     let mut depth = 1i32;
                     while depth > 0 {
                         match self.peek() {
@@ -1172,6 +1421,7 @@ impl Parser {
                         }
                         self.i += 1;
                     }
+                    self.vec_elem_pending = Some(width);
                     return Ok(Type::Named("Vec".into()));
                 }
                 // An alias is transparent: a use is rewritten to its target here,
@@ -1204,9 +1454,309 @@ impl Parser {
         // exit, so an error part way through does not leave a stale binding.
         let frame = self.scan_block_fns()?;
         self.fn_scopes.push(frame);
+        // The `Vec`/pointer name tables are scoped the same way: a binding this
+        // block introduces (or shadows) is undone when the block ends, so an
+        // outer `v: Vec<u8>` regains its byte stride after a nested `v`. Pushed
+        // before the const scan so the restore notes it records land in this
+        // block's frame.
+        self.name_scopes.push(Vec::new());
+        // A block-scoped `const` is an item too: rustc hoists it for the whole
+        // block, so `println!("{}", N); const N: i64 = 5;` resolves. Fold every
+        // one now, in declaration order (a later one may name an earlier one),
+        // and note the names so the main parse skips the items it already folded.
+        let cframe = self.scan_block_consts()?;
+        self.local_consts.push(cframe);
         let r = self.parse_block_body();
+        self.pop_name_scope();
+        self.local_consts.pop();
         self.fn_scopes.pop();
         r
+    }
+
+    /// Scan the block starting at the current `{` for the `const`/immutable
+    /// `static` items declared directly in it, fold each, and enter its value in
+    /// the live constant tables so a later statement in the block (and a nested
+    /// block) resolves the name. Returns the frame of their token spans, which
+    /// the main parse skips. A `const` nested deeper is left to the scan of that
+    /// block. The frame is popped with the block by `pop_name_scope`, so the name
+    /// is gone after the block ends. Names in the frame are also noted as
+    /// `NameScope` entries, so `pop_name_scope` restores an outer value the block
+    /// shadowed.
+    fn scan_block_consts(&mut self) -> PResult<Vec<LocalConst>> {
+        let mut frame: Vec<LocalConst> = Vec::new();
+        let mut depth = 0u32;
+        let mut i = self.i;
+        while i < self.toks.len() {
+            // Decide by a short-lived borrow, so the mutable calls below (which
+            // fold the item and enter its value) do not conflict with it.
+            let mut is_item = false;
+            match &self.toks[i].tok {
+                Tok::LBrace | Tok::LParen | Tok::LBracket => depth += 1,
+                Tok::RBrace => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                Tok::RParen | Tok::RBracket => {
+                    depth = depth.saturating_sub(1);
+                }
+                // A `const`/`static` item at the top level of this block. A
+                // `pub` before it is skipped, as in a top-level item. A `const`
+                // inside a `fn` body or a nested `{ .. }` has `depth > 0`, so it
+                // is left to that block's own scan.
+                Tok::Const if depth == 0 => {
+                    // A raw pointer type `*const T` also lexes the `const`
+                    // keyword; an item's `const` is never preceded by `*`.
+                    if self.toks.get(i.wrapping_sub(1)).map(|t| &t.tok) != Some(&Tok::Star) {
+                        is_item = true;
+                    }
+                }
+                Tok::Ident(id) if id == "static" && depth == 0 => is_item = true,
+                _ => {}
+            }
+            if is_item {
+                let raw_start = i;
+                // `static mut` has no meaning in rmc; reject it here, where the
+                // block scan sees it, rather than let `fold_const_item` fail with
+                // a less specific message.
+                if let Some(Tok::Ident(id)) = self.toks.get(i + 1).map(|t| &t.tok) {
+                    if id == "mut" {
+                        return Err(format!(
+                            "at byte {}: `static mut` is not supported; rmc has no mutable global",
+                            self.toks[i].pos
+                        ));
+                    }
+                }
+                let start = self.skip_pub_at(i);
+                let (val, end) = self.fold_const_item(start)?;
+                if let Some(Tok::Ident(n)) = self.toks.get(start + 1).map(|t| t.tok.clone()) {
+                    // Two `const`s of the same name in one block is E0428, as for
+                    // two `fn`s (`scan_block_fns`). A `let` of the same name is a
+                    // binding, not an item, and shadows rather than collides.
+                    if frame.iter().any(|c| c.name == n) {
+                        return Err(format!(
+                            "at byte {}: the name `{n}` is defined multiple times in this block",
+                            self.toks[raw_start].pos
+                        ));
+                    }
+                    self.enter_local_const(&n, val);
+                    // `start` is the `const`/`static` keyword (past any `pub`),
+                    // so the main parse, which drops a `pub` before it, matches
+                    // on the same index.
+                    frame.push(LocalConst { start, end, name: n });
+                    i = end;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        Ok(frame)
+    }
+
+    /// True when the token at the cursor begins a `const`/immutable-`static`
+    /// item that `scan_block_consts` already folded for this block, so the main
+    /// parse should skip it. A `const` a block does not own (a nested block's,
+    /// seen from outside) is not in any active frame and returns false.
+    fn at_local_const(&self) -> bool {
+        self.local_consts.iter().any(|f| f.iter().any(|c| c.start == self.i))
+    }
+
+    /// Reject a local binding that shadows a constant (rustc E0530). sema
+    /// enforces this for a top-level constant, but a block-scoped one is folded
+    /// at parse time and never reaches sema, so the parser checks every binding
+    /// it lowers against the live constant tables. `names` are the names a `let`
+    /// pattern binds, in source order.
+    fn reject_const_shadow(&self, names: &[String]) -> PResult<()> {
+        for name in names {
+            if self.consts.contains_key(name)
+                || self.const_bools.contains_key(name)
+                || self.const_chars.contains_key(name)
+            {
+                return Err(format!(
+                    "at byte {}: identifier `{name}` shadows a constant of the same name",
+                    self.pos()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The token index of the item at `i`, skipping a `pub` / `pub(..)` before
+    /// it. Used by `scan_block_consts`, which needs the keyword's own index.
+    fn skip_pub_at(&self, mut i: usize) -> usize {
+        if matches!(self.toks.get(i).map(|t| &t.tok), Some(Tok::Ident(p)) if p == "pub") {
+            i += 1;
+            if self.toks.get(i).map(|t| &t.tok) == Some(&Tok::LParen) {
+                let mut d = 0u32;
+                while i < self.toks.len() {
+                    match &self.toks[i].tok {
+                        Tok::LParen => d += 1,
+                        Tok::RParen => {
+                            d -= 1;
+                            if d == 0 {
+                                i += 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+        }
+        i
+    }
+
+    /// Enter a folded block-scoped constant in the live tables, noting the
+    /// previous value so `pop_name_scope` can restore it when the block ends.
+    fn enter_local_const(&mut self, name: &str, val: Option<crate::consts::ConstVal>) {
+        use crate::consts::ConstVal;
+        // The name is in the value namespace, but `consts`/`const_bools`/
+        // `const_chars` are three tables; a name could in principle be in two
+        // (never in one well-typed program). Note all three so the restore is
+        // exact.
+        if let Some(frame) = self.name_scopes.last_mut() {
+            frame.push(NameScope::ConstInt(name.to_string(), self.consts.get(name).copied()));
+            frame.push(NameScope::ConstBool(name.to_string(), self.const_bools.get(name).copied()));
+            frame.push(NameScope::ConstChar(name.to_string(), self.const_chars.get(name).copied()));
+        }
+        // A `const` that does not fold (a call, a cycle) is left out, so a use
+        // is diagnosed the way an unresolved constant is; drop any outer value
+        // of the same name so the shadowing is honest.
+        self.consts.remove(name);
+        self.const_bools.remove(name);
+        self.const_chars.remove(name);
+        match val {
+            Some(ConstVal::Int(v)) => {
+                self.consts.insert(name.to_string(), v);
+            }
+            Some(ConstVal::Bool(v)) => {
+                self.const_bools.insert(name.to_string(), v);
+            }
+            Some(ConstVal::Char(v)) => {
+                self.const_chars.insert(name.to_string(), v);
+            }
+            None => {}
+        }
+    }
+
+    /// Record the current state of one `Vec`/pointer name table entry before a
+    /// binding overwrites it, so `pop_name_scope` can restore it. Called for
+    /// every binding a block introduces, including one that shadows an outer
+    /// binding of the same name.
+    fn note_vec_name(&mut self, name: &str) {
+        if let Some(frame) = self.name_scopes.last_mut() {
+            frame.push(NameScope::VecName(name.to_string(), self.vec_names.contains(name)));
+        }
+    }
+    fn note_vec_cap(&mut self, name: &str) {
+        if let Some(frame) = self.name_scopes.last_mut() {
+            frame.push(NameScope::VecCap(name.to_string(), self.vec_cap.get(name).copied()));
+        }
+    }
+    fn note_vec_len(&mut self, name: &str) {
+        if let Some(frame) = self.name_scopes.last_mut() {
+            frame.push(NameScope::VecLen(name.to_string(), self.vec_len.get(name).copied()));
+        }
+    }
+    fn note_vec_elem(&mut self, name: &str) {
+        if let Some(frame) = self.name_scopes.last_mut() {
+            frame.push(NameScope::VecElem(name.to_string(), self.vec_elem.get(name).copied()));
+        }
+    }
+    fn note_ptr(&mut self, name: &str) {
+        if let Some(frame) = self.name_scopes.last_mut() {
+            frame.push(NameScope::Ptr(name.to_string(), self.ptr_vars.get(name).copied()));
+        }
+    }
+    fn note_args_vec(&mut self, name: &str) {
+        if let Some(frame) = self.name_scopes.last_mut() {
+            frame.push(NameScope::ArgsVec(name.to_string(), self.args_vecs.get(name).copied()));
+        }
+    }
+
+    /// Undo the bindings the innermost block introduced, in reverse, so each
+    /// name returns to the state it had before the block (present-and-old, or
+    /// absent). Called on every exit from a block, including the error path.
+    fn pop_name_scope(&mut self) {
+        if let Some(frame) = self.name_scopes.pop() {
+            for entry in frame.into_iter().rev() {
+                match entry {
+                    NameScope::VecName(n, had) => {
+                        if had {
+                            self.vec_names.insert(n);
+                        } else {
+                            self.vec_names.remove(&n);
+                        }
+                    }
+                    NameScope::VecCap(n, prev) => match prev {
+                        Some(v) => {
+                            self.vec_cap.insert(n, v);
+                        }
+                        None => {
+                            self.vec_cap.remove(&n);
+                        }
+                    },
+                    NameScope::VecLen(n, prev) => match prev {
+                        Some(v) => {
+                            self.vec_len.insert(n, v);
+                        }
+                        None => {
+                            self.vec_len.remove(&n);
+                        }
+                    },
+                    NameScope::VecElem(n, prev) => match prev {
+                        Some(v) => {
+                            self.vec_elem.insert(n, v);
+                        }
+                        None => {
+                            self.vec_elem.remove(&n);
+                        }
+                    },
+                    NameScope::Ptr(n, prev) => match prev {
+                        Some(v) => {
+                            self.ptr_vars.insert(n, v);
+                        }
+                        None => {
+                            self.ptr_vars.remove(&n);
+                        }
+                    },
+                    NameScope::ArgsVec(n, prev) => match prev {
+                        Some(v) => {
+                            self.args_vecs.insert(n, v);
+                        }
+                        None => {
+                            self.args_vecs.remove(&n);
+                        }
+                    },
+                    NameScope::ConstInt(n, prev) => match prev {
+                        Some(v) => {
+                            self.consts.insert(n, v);
+                        }
+                        None => {
+                            self.consts.remove(&n);
+                        }
+                    },
+                    NameScope::ConstBool(n, prev) => match prev {
+                        Some(v) => {
+                            self.const_bools.insert(n, v);
+                        }
+                        None => {
+                            self.const_bools.remove(&n);
+                        }
+                    },
+                    NameScope::ConstChar(n, prev) => match prev {
+                        Some(v) => {
+                            self.const_chars.insert(n, v);
+                        }
+                        None => {
+                            self.const_chars.remove(&n);
+                        }
+                    },
+                }
+            }
+        }
     }
 
     /// Collect the nested `fn`s declared directly in the block whose `{` has
@@ -1234,10 +1784,18 @@ impl Parser {
                 Tok::Fn if depth == 0 => {
                     // `fn name ( .. ) -> .. { body }`. The body brace is skipped
                     // as a unit by the `depth` counter, so a `fn` inside it is
-                    // not seen here.
-                    if let Some(Token { tok: Tok::Ident(name), .. }) = self.toks.get(i + 1) {
+                    // not seen here. A `pub` before the `fn` is skipped too, so a
+                    // nested `pub fn` (which rustc accepts) is scanned.
+                    let fn_tok = if matches!(
+                        self.toks.get(i.wrapping_sub(1)).map(|t| &t.tok),
+                        Some(Tok::Ident(p)) if p == "pub"
+                    ) {
+                        i + 1
+                    } else {
+                        i
+                    };
+                    if let Some(Token { tok: Tok::Ident(name), .. }) = self.toks.get(fn_tok + 1) {
                         let name = name.clone();
-                        // Two `fn`s with the same name in one block is rustc's
                         // E0428. A later one shadowing an outer one is fine and
                         // keeps its own unique symbol.
                         if frame.iter().any(|(n, _)| *n == name) {
@@ -1303,19 +1861,64 @@ impl Parser {
                 self.skip_use()?;
                 continue;
             }
+            // `pub fn` (or `pub` before any item) in a block: drop the
+            // visibility and parse the item. Guarded on what follows so a
+            // variable named `pub` (which rmc, unlike rustc, would otherwise
+            // allow) is not swallowed.
+            if self.peek() == Some(&Tok::Ident("pub".into())) {
+                let p2 = self.peek2().cloned();
+                if p2 == Some(Tok::Fn) {
+                    self.skip_pub()?;
+                    self.parse_stmt_into(&mut stmts)?;
+                    continue;
+                }
+                // `pub const` / `pub static`: drop the `pub` and let the local
+                // constant skip below consume the item (already folded).
+                if p2 == Some(Tok::Const)
+                    || matches!(p2, Some(Tok::Ident(ref id)) if id == "static")
+                {
+                    self.skip_pub()?;
+                    continue;
+                }
+            }
+            // A `const`/immutable-`static` item directly in the block. Its value
+            // was folded by `scan_block_consts` when the block began (rustc
+            // hoists block items), so skip the item here; the constant is
+            // substituted at every use, so it has no statement.
+            if self.at_local_const() {
+                let end = self
+                    .local_consts
+                    .iter()
+                    .rev()
+                    .flat_map(|f| f.iter().rev())
+                    .find(|c| c.start == self.i)
+                    .map(|c| c.end);
+                if let Some(end) = end {
+                    self.i = end;
+                    continue;
+                }
+            }
+            // A stray `;` is an empty statement; Rust accepts any number of
+            // them between statements and at the end of a block.
+            if self.eat(&Tok::Semi) {
+                continue;
+            }
             // tail expression: an expression not followed by `;`
             if self.starts_expr() {
                 let e = self.parse_expr()?;
                 if self.eat(&Tok::Eq) {
                     let value = self.parse_expr()?;
-                    self.expect(Tok::Semi)?;
+                    // An assignment is a `()`-valued expression, so its trailing
+                    // `;` may be omitted when it is the last thing in a block,
+                    // just as after `return`/`break`/`continue`.
+                    self.eat_semi_at_block_end()?;
                     stmts.push(Stmt::Assign { target: e, value });
                     continue;
                 }
                 if let Some(op) = self.peek_compound_op() {
                     self.i += 1;
                     let value = self.parse_expr()?;
-                    self.expect(Tok::Semi)?;
+                    self.eat_semi_at_block_end()?;
                     stmts.push(self.desugar_compound(&e, op, value));
                     continue;
                 }
@@ -1840,6 +2443,13 @@ impl Parser {
                         ));
                     }
                     let pat = self.parse_pattern_primary()?;
+                    // Every name the pattern binds is a local binding, so none
+                    // may shadow a constant (rustc E0530). sema covers a
+                    // top-level constant; a block-scoped one is folded here in
+                    // the parser, so check it here.
+                    let mut bound = Vec::new();
+                    Self::pat_bound_names(&pat, &mut bound);
+                    self.reject_const_shadow(&bound)?;
                     let ty = if self.eat(&Tok::Colon) {
                         Some(self.parse_type()?)
                     } else {
@@ -1890,7 +2500,13 @@ impl Parser {
                                     self.pos()
                                 ));
                             }
-                            let (mut stmts, subj) = self.let_destructure_prelude(ty, init);
+                            // `n` itself and the sub-pattern's names both bind;
+                            // if the initializer reads `n` (or a name the
+                            // sub-pattern binds), copy it first.
+                            let mut names = vec![name.clone()];
+                            Self::pat_bound_names(&sub, &mut names);
+                            let force = Self::init_shadowed_by(&init, &names);
+                            let (mut stmts, subj) = self.let_destructure_prelude(ty, init, force);
                             stmts.push(Stmt::Let {
                                 name,
                                 ty: None,
@@ -1913,10 +2529,23 @@ impl Parser {
                     return Ok(());
                 }
                 let name = self.expect_ident()?;
+                // A `let` may not shadow a constant (rustc E0530). sema enforces
+                // this for a top-level constant, but a block-scoped one is folded
+                // at parse time and never reaches sema, so enforce it here too.
+                self.reject_const_shadow(&[name.clone()])?;
+                // A `Vec<T>` annotation leaves its element width in
+                // `vec_elem_pending`; consume it here so it is bound to this
+                // name, and clear it for every other annotation.
                 let ty = if self.eat(&Tok::Colon) {
                     Some(self.parse_type()?)
                 } else {
                     None
+                };
+                let elem_width = if matches!(ty, Some(Type::Named(ref n)) if n == "Vec") {
+                    self.vec_elem_pending.take().unwrap_or(8)
+                } else {
+                    self.vec_elem_pending = None;
+                    8
                 };
                 let init = if self.eat(&Tok::Eq) {
                     Some(self.parse_expr()?)
@@ -1937,6 +2566,7 @@ impl Parser {
                                 self.pos()
                             ));
                         }
+                        self.note_args_vec(&name);
                         self.args_vecs.insert(name.clone(), self.args_skip);
                         return Ok(());
                     }
@@ -1951,7 +2581,12 @@ impl Parser {
                         // fold. Either way the size is `count * 8` bytes at run
                         // time and `__rmc_fill` takes the count as a value.
                         let count = eval_i64(&n_expr, &self.consts);
+                        self.note_vec_name(&name);
+                        self.note_vec_elem(&name);
+                        self.note_vec_len(&name);
+                        self.note_vec_cap(&name);
                         self.vec_names.insert(name.clone());
+                        self.vec_elem.insert(name.clone(), elem_width);
                         if let Some(c) = count {
                             self.vec_len.insert(name.clone(), c);
                             if m == "\u{0}vecnew" {
@@ -2018,10 +2653,19 @@ impl Parser {
                         ));
                     }
                     // `let p = base.as_mut_ptr();`: `base` is a `Vec` address, so
-                    // `p` holds that same address. Record it a raw pointer so a
-                    // later `p.add(off)` folds to address arithmetic.
+                    // `p` holds that same address. Record it a raw pointer, with
+                    // the element stride of `base`, so a later `p.add(off)`
+                    // scales `off` by the element width (`add` steps whole
+                    // elements, not bytes).
                     if m == "\u{0}ptr" {
-                        self.ptr_vars.insert(name.clone());
+                        let stride = match &args[0] {
+                            Expr::Var { name: base, .. } => {
+                                self.vec_elem.get(base).copied().unwrap_or(8)
+                            }
+                            _ => 8,
+                        };
+                        self.note_ptr(&name);
+                        self.ptr_vars.insert(name.clone(), stride);
                         out.push(Stmt::Let {
                             name,
                             ty: Some(Type::I64),
@@ -2108,14 +2752,14 @@ impl Parser {
                 let e = self.parse_expr()?;
                 if self.eat(&Tok::Eq) {
                     let value = self.parse_expr()?;
-                    self.expect(Tok::Semi)?;
+                    self.eat_semi_at_block_end()?;
                     out.push(Stmt::Assign { target: e, value });
                     return Ok(());
                 }
                 if let Some(op) = self.peek_compound_op() {
                     self.i += 1;
                     let value = self.parse_expr()?;
-                    self.expect(Tok::Semi)?;
+                    self.eat_semi_at_block_end()?;
                     let s = self.desugar_compound(&e, op, value);
                     out.push(s);
                     return Ok(());
@@ -2978,23 +3622,33 @@ impl Parser {
     }
 
     fn parse_cmp(&mut self) -> PResult<Expr> {
-        let mut lhs = self.parse_bitor()?;
-        loop {
-            let op = match self.peek() {
-                Some(Tok::EqEq) => BinOp::Eq,
-                Some(Tok::Ne) => BinOp::Ne,
-                Some(Tok::Lt) => BinOp::Lt,
-                Some(Tok::Le) => BinOp::Le,
-                Some(Tok::Gt) => BinOp::Gt,
-                Some(Tok::Ge) => BinOp::Ge,
-                _ => break,
-            };
-            self.i += 1;
-            let rhs = self.parse_bitor()?;
-            self.bump_depth()?;
-            lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs));
+        let lhs = self.parse_bitor()?;
+        let op = match self.peek() {
+            Some(Tok::EqEq) => BinOp::Eq,
+            Some(Tok::Ne) => BinOp::Ne,
+            Some(Tok::Lt) => BinOp::Lt,
+            Some(Tok::Le) => BinOp::Le,
+            Some(Tok::Gt) => BinOp::Gt,
+            Some(Tok::Ge) => BinOp::Ge,
+            _ => return Ok(lhs),
+        };
+        self.i += 1;
+        let rhs = self.parse_bitor()?;
+        self.bump_depth()?;
+        // Comparison is non-associative in Rust: `a < b < c` is a hard error
+        // ("comparison operators cannot be chained"), not `(a < b) < c`. Reject
+        // a second comparison operator here so rmc does not accept what rustc
+        // rejects.
+        if matches!(
+            self.peek(),
+            Some(Tok::EqEq | Tok::Ne | Tok::Lt | Tok::Le | Tok::Gt | Tok::Ge)
+        ) {
+            return Err(format!(
+                "at byte {}: comparison operators cannot be chained",
+                self.pos()
+            ));
         }
-        Ok(lhs)
+        Ok(Expr::Bin(op, Box::new(lhs), Box::new(rhs)))
     }
 
     /// `|`, then `^`, then `&`, matching Rust's precedence. Each is left
@@ -3238,9 +3892,21 @@ impl Parser {
                             };
                             continue;
                         }
-                        if name == "add" && args.len() == 1 && self.ptr_vars.contains(recv) {
+                        if name == "add" && args.len() == 1 && self.ptr_vars.contains_key(recv) {
+                            let stride = self.ptr_vars[recv];
                             let recv_expr = e.clone();
-                            e = Expr::Bin(BinOp::Add, Box::new(recv_expr), Box::new(args.pop().unwrap()));
+                            let mut off = args.pop().unwrap();
+                            // `add(off)` advances by `off` whole elements, so
+                            // scale by the element width. A byte-strided
+                            // pointer (`Vec<u8>`) keeps the offset untouched.
+                            if stride != 1 {
+                                off = Expr::Bin(
+                                    BinOp::Mul,
+                                    Box::new(off),
+                                    Box::new(Expr::Int(stride)),
+                                );
+                            }
+                            e = Expr::Bin(BinOp::Add, Box::new(recv_expr), Box::new(off));
                             continue;
                         }
                     }
@@ -3365,6 +4031,10 @@ impl Parser {
             // the sub-pattern. `@` cannot begin any other pattern, so it is
             // unambiguous here; a `mut` may precede the name.
             Some(Tok::Ident(n)) if self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::At) => {
+                // `n @ subpat` is a binding, so it may not shadow a constant
+                // (rustc E0530); sema covers a top-level one, the parser a
+                // block-scoped one.
+                self.reject_const_shadow(std::slice::from_ref(&n))?;
                 self.i += 2;
                 let sub = self.parse_pattern_primary()?;
                 Ok(Pat::At(n, false, Box::new(sub)))
@@ -3572,6 +4242,7 @@ impl Parser {
                     // destructures it. The sub-pattern must be irrefutable,
                     // since rmc generates no per-field test.
                     let name = self.expect_ident()?;
+                    self.reject_const_shadow(std::slice::from_ref(&name))?;
                     self.i += 1; // the `@`
                     let sub = self.parse_pattern_primary()?;
                     if !Self::pat_irrefutable(&sub) {
@@ -3582,11 +4253,14 @@ impl Parser {
                     }
                     Some((m, Pat::At(name, m, Box::new(sub))))
                 } else {
-                    Some((m, Pat::Bind(self.expect_ident()?)))
+                    let name = self.expect_ident()?;
+                    self.reject_const_shadow(std::slice::from_ref(&name))?;
+                    Some((m, Pat::Bind(name)))
                 }
             } else {
                 // Shorthand: `S { f }` binds `f`, or `S { mut f }` binds a
-                // mutable `f`.
+                // mutable `f`. The binding may not shadow a constant (E0530).
+                self.reject_const_shadow(std::slice::from_ref(&fname))?;
                 Some((leading_mut, Pat::Bind(fname.clone())))
             };
             fields.push((fname, bind));
@@ -3761,7 +4435,14 @@ impl Parser {
     /// each a read of the element's field (`"k"` on the anonymous struct a tuple
     /// lowers to). Shared by the `let`, `for`, `match` and parameter paths.
     fn tuple_pat_binds(elems: &[(bool, Pat)], subj: &Expr) -> Vec<Stmt> {
-        let mut out = Vec::new();
+        // A tuple pattern must name exactly the scrutinee's fields, so emit a
+        // marker for sema to check before the element reads. The field reads
+        // below would otherwise let `let (x,) = (1, 2);` silently ignore `1`.
+        let mut out = vec![Stmt::Expr(Expr::PatArity {
+            base: Box::new(subj.clone()),
+            want: elems.len(),
+            is_tuple: true,
+        })];
         for (k, (m, pat)) in elems.iter().enumerate() {
             let field = Expr::Field {
                 base: Box::new(subj.clone()),
@@ -3818,7 +4499,19 @@ impl Parser {
         front: usize,
         subj: &Expr,
     ) -> Vec<Stmt> {
-        let mut out = Vec::new();
+        // An array pattern must name exactly the array's length (with no `..`
+        // rest), so emit a marker for sema to check before the index reads.
+        // Without it `let [x] = [1, 2];` would read `[0]` and ignore the rest.
+        // A `..` rest matches any count, so it has nothing to check.
+        let mut out = if rest {
+            Vec::new()
+        } else {
+            vec![Stmt::Expr(Expr::PatArity {
+                base: Box::new(subj.clone()),
+                want: elems.len(),
+                is_tuple: false,
+            })]
+        };
         for (j, elem) in elems.iter().enumerate() {
             let (m, pat) = match elem {
                 Some(x) => x,
@@ -4405,7 +5098,14 @@ impl Parser {
         ty: Option<Type>,
         init: Expr,
     ) -> Vec<Stmt> {
-        let (mut out, subj) = self.let_destructure_prelude(ty, init);
+        let mut names = Vec::new();
+        for (_, b) in &fields {
+            if let Some((_, sub)) = b {
+                Self::pat_bound_names(sub, &mut names);
+            }
+        }
+        let force = Self::init_shadowed_by(&init, &names);
+        let (mut out, subj) = self.let_destructure_prelude(ty, init, force);
         out.extend(Self::struct_pat_binds(&fields, &subj, &name));
         out
     }
@@ -4461,7 +5161,14 @@ impl Parser {
         ty: Option<Type>,
         init: Expr,
     ) -> Vec<Stmt> {
-        let (mut out, subj) = self.let_destructure_prelude(ty, init);
+        let mut names = Vec::new();
+        for e in &elems {
+            if let Some((_, sub)) = e {
+                Self::pat_bound_names(sub, &mut names);
+            }
+        }
+        let force = Self::init_shadowed_by(&init, &names);
+        let (mut out, subj) = self.let_destructure_prelude(ty, init, force);
         out.extend(Self::array_pat_binds(&elems, rest, front, &subj));
         out
     }
@@ -4476,7 +5183,12 @@ impl Parser {
         ty: Option<Type>,
         init: Expr,
     ) -> Vec<Stmt> {
-        let (mut out, subj) = self.let_destructure_prelude(ty, init);
+        let mut names = Vec::new();
+        for (_, sub) in &elems {
+            Self::pat_bound_names(sub, &mut names);
+        }
+        let force = Self::init_shadowed_by(&init, &names);
+        let (mut out, subj) = self.let_destructure_prelude(ty, init, force);
         out.extend(Self::tuple_pat_binds(&elems, &subj));
         out
     }
@@ -4485,9 +5197,18 @@ impl Parser {
     /// itself when it is a plain place with no annotation to carry, otherwise a
     /// fresh temporary that holds it (so the initializer's side effects run
     /// once and the annotation is checked against the value). Shared by the
-    /// struct and array destructuring paths.
-    fn let_destructure_prelude(&mut self, ty: Option<Type>, init: Expr) -> (Vec<Stmt>, Expr) {
-        if ty.is_none()
+    /// struct, array and tuple destructuring paths. `force` makes the temporary
+    /// unconditional: a caller sets it when a pattern binds the very name the
+    /// initializer reads, so every element read sees the original value rather
+    /// than a binding that shadowed it (`let (x, y) = x;`).
+    fn let_destructure_prelude(
+        &mut self,
+        ty: Option<Type>,
+        init: Expr,
+        force: bool,
+    ) -> (Vec<Stmt>, Expr) {
+        if !force
+            && ty.is_none()
             && matches!(init, Expr::Var { .. } | Expr::Int(_) | Expr::EnumVariant { .. })
         {
             (Vec::new(), init)
@@ -4607,6 +5328,59 @@ impl Parser {
             // in an or-pattern when it is parsed).
             Pat::Int(_) | Pat::Char(_) | Pat::CharRange(..) | Pat::Bool(_) | Pat::Str(_) | Pat::Range(..) | Pat::Or(_) => {}
             _ => unreachable!("unexpected sub-pattern"),
+        }
+    }
+
+    /// Every name a pattern binds, in binding order: a struct pattern's fields,
+    /// a tuple/array's elements, an `@` binding's name followed by its
+    /// sub-pattern's. Used to decide whether a `let` destructuring must copy its
+    /// scrutinee before it binds, so an element that shadows the scrutinee name
+    /// does not make a later read resolve against the new binding.
+    fn pat_bound_names(p: &Pat, out: &mut Vec<String>) {
+        match p {
+            Pat::Bind(n) => out.push(n.clone()),
+            Pat::At(n, _, sub) => {
+                out.push(n.clone());
+                Self::pat_bound_names(sub, out);
+            }
+            Pat::Struct(_, fields) => {
+                for (_, b) in fields {
+                    if let Some((_, sub)) = b {
+                        Self::pat_bound_names(sub, out);
+                    }
+                }
+            }
+            Pat::Tuple(elems) => {
+                for (_, sub) in elems {
+                    Self::pat_bound_names(sub, out);
+                }
+            }
+            Pat::Array { elems, .. } => {
+                for e in elems {
+                    if let Some((_, sub)) = e {
+                        Self::pat_bound_names(sub, out);
+                    }
+                }
+            }
+            Pat::Variant(_, _, Some((args, _))) => {
+                for (_, sub) in args {
+                    Self::pat_bound_names(sub, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// True when `init` reads a plain variable the pattern also binds. A `let`
+    /// destructuring expands to one binding per element, each reading the
+    /// scrutinee; if an element shadows the scrutinee's own name, a later read
+    /// would resolve to the new binding (`let (x, y) = x;` read field `1` of the
+    /// integer `x` just bound). Such a destructuring must first copy the
+    /// scrutinee to a hidden temporary, so every read sees the original value.
+    fn init_shadowed_by(init: &Expr, names: &[String]) -> bool {
+        match init {
+            Expr::Var { name, .. } => names.iter().any(|n| n == name),
+            _ => false,
         }
     }
 
@@ -5386,6 +6160,18 @@ fn is_int_width(s: &str) -> bool {
         "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
             | "u8" | "u16" | "u32" | "u64" | "u128" | "usize"
     )
+}
+
+/// The byte width of one `Vec<T>` element named `t`, the stride a `.add(off)`
+/// scales by. rmc stores every element in one 8-byte slot (see `alloc`/
+/// `__rmc_fill`), so an element steps a whole word — except the byte types
+/// `u8`/`i8`, which the corpus uses as a raw byte arena and which therefore
+/// stay byte-addressed.
+fn elem_byte_width(t: &str) -> i64 {
+    match t {
+        "u8" | "i8" => 1,
+        _ => 8,
+    }
 }
 
 /// The value of an integer-width associated constant (`i32::MAX`, `u8::BITS`),

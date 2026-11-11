@@ -228,6 +228,58 @@ impl Codegen {
         b.tail.as_deref().and_then(Self::array_elem_ty)
     }
 
+    /// The type of `e` when codegen can tell it statically. `gen_expr` already
+    /// returns a type for every node, but a `&`/`|`/`^` on `bool` reports `i64`
+    /// (the emitted instruction is the same for a 0/1 `bool` and an integer),
+    /// so a consumer that must tell a bool from an integer — `!`, which is a
+    /// logical not on `bool` and a bitwise not on `i64` — needs this. `None`
+    /// means "not statically known".
+    fn static_ty(e: &Expr) -> Option<Type> {
+        match e {
+            Expr::Bool(_) => Some(Type::Bool),
+            Expr::Int(_) | Expr::Str(_) => Some(Type::I64),
+            Expr::Char(_) => Some(Type::Char),
+            Expr::Var { ty, .. } | Expr::Field { ty, .. } | Expr::Deref { ty, .. } => {
+                Some(ty.clone())
+            }
+            Expr::Call { ret_ty, .. } => Some(ret_ty.clone()),
+            Expr::Cast(_, to) => Some(to.clone()),
+            Expr::Loop(_, _, lty, _) => Some(lty.clone()),
+            Expr::Un(op, inner) => match op {
+                UnOp::Neg => Some(Type::I64),
+                UnOp::Not => Self::static_ty(inner),
+            },
+            Expr::Bin(op, a, b) => match op {
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                | BinOp::And | BinOp::Or => Some(Type::Bool),
+                // The result of a bitwise op has the operand's type, so a
+                // `bool` operand makes a `bool` result. Either side may carry
+                // the type (`a[0] | a[1]`); a `bool` on either side wins because
+                // sema rejects a mix of `bool` and `i64`.
+                BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                    match (Self::static_ty(a), Self::static_ty(b)) {
+                        (Some(Type::Bool), _) | (_, Some(Type::Bool)) => Some(Type::Bool),
+                        (Some(Type::I64), _) | (_, Some(Type::I64)) => Some(Type::I64),
+                        _ => None,
+                    }
+                }
+                _ => Some(Type::I64),
+            },
+            // An element of an array has the array's element type, which
+            // `array_elem_ty` resolves (it looks through a reference too).
+            Expr::Index(base, _) => Self::array_elem_ty(base),
+            Expr::If(_, then, Some(els)) => {
+                Self::static_ty_tail(then).or_else(|| Self::static_ty_tail(els))
+            }
+            Expr::Block(b) | Expr::MatchBoundary(b, _) => Self::static_ty_tail(b),
+            _ => None,
+        }
+    }
+
+    fn static_ty_tail(b: &Block) -> Option<Type> {
+        b.tail.as_deref().and_then(Self::static_ty)
+    }
+
     /// The stride of `base`'s elements in 8-byte slots. One for a scalar array,
     /// more for an array of nested arrays or structs.
     fn elem_stride(base: &Expr) -> usize {
@@ -900,6 +952,7 @@ Expr::PatScrutinee(_) => {
                 unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
             }
             Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
+            Expr::PatArity { .. } => unreachable!("sema rewrites PatArity into `true`"),
             Expr::EnumVariant { .. } => {} // a tag has no subexpressions
             Expr::EnumCtor { args, slot, size, .. } => {
                 for a in args {
@@ -1859,6 +1912,7 @@ Expr::PatScrutinee(_) => {
                 unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
             }
             Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
+            Expr::PatArity { .. } => unreachable!("sema rewrites PatArity into `true`"),
             Expr::EnumVariant { tag, .. } => {
                 self.line(&format!("mov ${tag}, %rax"));
                 Type::I64
@@ -2107,15 +2161,24 @@ Expr::PatScrutinee(_) => {
             }
             Expr::Un(op, inner) => {
                 let inner_ty = self.gen_expr(inner);
+                // `!` is logical not on `bool` (1 when the operand is zero)
+                // and bitwise not on an integer, matching Rust. Sema has
+                // already checked the operand is `bool` or `i64`. The operand's
+                // type is taken from `static_ty` where it is known, because a
+                // `&`/`|`/`^` on `bool` makes `gen_expr` report `i64` (the
+                // emitted instruction is the same) and `!(a | b)` would
+                // otherwise be a bitwise `not`. For a node `static_ty` does not
+                // model (an index, say) `gen_expr`'s type is exact.
+                let inner_is_bool = match Self::static_ty(inner) {
+                    Some(t) => t == Type::Bool,
+                    None => inner_ty == Type::Bool,
+                };
                 match op {
                     UnOp::Neg => {
                         self.line("neg %rax");
                         self.check_overflow();
                     }
-                    // `!` is logical not on `bool` (1 when the operand is zero)
-                    // and bitwise not on an integer, matching Rust. Sema has
-                    // already checked the operand is `bool` or `i64`.
-                    UnOp::Not if inner_ty == Type::Bool => {
+                    UnOp::Not if inner_is_bool => {
                         self.line("test %rax, %rax");
                         self.line("sete %al");
                         self.line("movzbq %al, %rax");
@@ -2471,6 +2534,7 @@ Expr::PatScrutinee(_) => {
                 unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
             }
             Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
+            Expr::PatArity { .. } => unreachable!("sema rewrites PatArity into `true`"),
         }
     }
 
