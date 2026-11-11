@@ -24,17 +24,19 @@ The point of the experiment is to measure the trade-off at the extremes:
 three are the point of the experiment. Because it links in-process rather than
 forking `as` and `ld`, a small program compiles in about 1.5–1.9 ms against
 rustc's ~2.1 s. On **runtime** the result is mixed and program-dependent: rmc is
-at parity or ahead on most of the suite (`hello` 3.7×, `forloops` 2.3×,
-`sieve` 1.4×, `mandel` 1.1×, `heap` 1.1×, `mix` 1.0×, `fib` 0.99×, `callrec`
-0.99×), roughly ties on `stats` (0.95×), and trails on `refs` (0.12×). `refs`
-is the one structural loss: its loop reads a fixed struct through `&self`
-accessors, and LICM will not hoist a read through a reference (it can fault on
-a loop that never runs), so the accessor sum is recomputed every iteration; a
-frame-based loop of the same shape is hoisted and wins. The rest are within
-run-to-run noise, and a call-heavy shape the recursion-to-loop pass does not
-match would lose. It is not uniformly faster and
-there is no single speedup number; `bench/RESULTS.md` reports the per-program
-ratio.
+ahead on every program in the suite (`refs` 2.2×, `forloops` 2.3×, `hello`
+3.2×, `sieve` 1.4×, `stats` 1.2×, `mandel` 1.1×, `heap` 1.0×, `mix` 1.0×), with
+`fib` and `callrec` at parity (1.00× and 0.98×, inside run-to-run noise on a
+recursive shape where both compilers emit the same loop). `refs` used to be the
+one structural loss — LICM would not hoist a read through a reference, because
+rmc's `&T` carries no guarantee that it is dereferenceable and speculating the
+load out of a loop that might never run could fault. A provenance pre-pass now
+marks a reference that is bound directly to a live local (`&x`, `&x.field`) as
+provably frame-pointing, so a read through it *can* be hoisted; that took `refs`
+from 0.12× to 2.2×. The rest are within run-to-run noise, and a call-heavy shape
+the recursion-to-loop pass does not match would lose. It is not uniformly faster
+and there is no single speedup number; `bench/RESULTS.md` reports the
+per-program ratio.
 
 The artifact-size comparison depends entirely on which rustc build is the
 reference. Against a plain `rustc -O` (which statically links libstd, the panic
@@ -381,26 +383,26 @@ host):
 
 | program | compiler | compile wall | compile CPU | compile RAM | artifact | run wall | run CPU | run RAM |
 | ------- | -------- | -----------: | ----------: | ----------: | -------: | -------: | ------: | ------: |
-| hello | rmc | 1.75 ms | 1.59 ms | 3.1 MB | 495 B | 0.22 ms | 0.12 ms | 24 kB |
-| hello | rustc | 2023.29 ms | 2026.37 ms | 186.4 MB | 289416 B | 0.81 ms | 0.70 ms | 2024 kB |
-| fib | rmc | 1.89 ms | 1.74 ms | 3.1 MB | 692 B | 7.12 ms | 7.00 ms | 24 kB |
-| fib | rustc | 2087.81 ms | 2091.17 ms | 186.5 MB | 291696 B | 7.07 ms | 6.93 ms | 2100 kB |
-| mandel | rmc | 1.57 ms | 1.43 ms | 3.1 MB | 1041 B | 95.70 ms | 95.48 ms | 24 kB |
-| mandel | rustc | 2081.03 ms | 2085.15 ms | 192.4 MB | 291776 B | 105.14 ms | 104.94 ms | 2100 kB |
-| sieve | rmc | 1.52 ms | 1.39 ms | 3.1 MB | 852 B | 1.77 ms | 1.64 ms | 1584 kB |
-| sieve | rustc | 2130.61 ms | 2133.97 ms | 188.5 MB | 292032 B | 2.39 ms | 2.27 ms | 3648 kB |
-| mix | rmc | 1.53 ms | 1.41 ms | 3.1 MB | 941 B | 14.83 ms | 14.69 ms | 20 kB |
-| mix | rustc | 2098.38 ms | 2102.12 ms | 188.3 MB | 291880 B | 15.53 ms | 15.35 ms | 2024 kB |
-| stats | rmc | 1.54 ms | 1.43 ms | 3.2 MB | 942 B | 3.93 ms | 3.81 ms | 24 kB |
-| stats | rustc | 2154.39 ms | 2156.99 ms | 188.1 MB | 292048 B | 3.73 ms | 3.61 ms | 2096 kB |
-| refs | rmc | 1.81 ms | 1.59 ms | 3.1 MB | 892 B | 30.84 ms | 30.69 ms | 24 kB |
-| refs | rustc | 2096.40 ms | 2100.23 ms | 193.7 MB | 292256 B | 3.84 ms | 3.71 ms | 2020 kB |
-| heap | rmc | 1.60 ms | 1.47 ms | 3.1 MB | 1165 B | 3.18 ms | 3.04 ms | 4712 kB |
-| heap | rustc | 2136.26 ms | 2140.36 ms | 187.8 MB | 292400 B | 3.37 ms | 3.27 ms | 6684 kB |
-| callrec | rmc | 1.46 ms | 1.34 ms | 3.0 MB | 695 B | 2.87 ms | 2.76 ms | 24 kB |
-| callrec | rustc | 2109.60 ms | 2113.63 ms | 187.6 MB | 291680 B | 2.83 ms | 2.72 ms | 2052 kB |
-| forloops | rmc | 1.60 ms | 1.43 ms | 3.1 MB | 851 B | 1.44 ms | 1.33 ms | 24 kB |
-| forloops | rustc | 2106.54 ms | 2110.00 ms | 188.5 MB | 292480 B | 3.30 ms | 3.18 ms | 1984 kB |
+| hello | rmc | 1.34 ms | 1.22 ms | 3.0 MB | 495 B | 0.26 ms | 0.14 ms | 20 kB |
+| hello | rustc | 2076.10 ms | 2072.60 ms | 183.4 MB | 289416 B | 0.82 ms | 0.72 ms | 2068 kB |
+| fib | rmc | 1.46 ms | 1.33 ms | 3.0 MB | 692 B | 7.10 ms | 6.99 ms | 24 kB |
+| fib | rustc | 2043.10 ms | 2047.51 ms | 182.6 MB | 291696 B | 7.09 ms | 6.96 ms | 2056 kB |
+| mandel | rmc | 1.57 ms | 1.45 ms | 3.1 MB | 1041 B | 95.89 ms | 95.67 ms | 24 kB |
+| mandel | rustc | 2083.71 ms | 2087.25 ms | 185.9 MB | 291776 B | 105.14 ms | 104.91 ms | 2036 kB |
+| sieve | rmc | 1.49 ms | 1.37 ms | 3.1 MB | 852 B | 1.75 ms | 1.62 ms | 1584 kB |
+| sieve | rustc | 2078.26 ms | 2082.36 ms | 182.8 MB | 292032 B | 2.42 ms | 2.30 ms | 3588 kB |
+| mix | rmc | 1.52 ms | 1.40 ms | 3.0 MB | 941 B | 14.82 ms | 14.69 ms | 24 kB |
+| mix | rustc | 2067.95 ms | 2071.18 ms | 187.8 MB | 291880 B | 15.45 ms | 15.29 ms | 2044 kB |
+| stats | rmc | 1.54 ms | 1.43 ms | 3.1 MB | 924 B | 3.23 ms | 3.12 ms | 24 kB |
+| stats | rustc | 2074.10 ms | 2077.53 ms | 183.6 MB | 292048 B | 3.71 ms | 3.60 ms | 2080 kB |
+| refs | rmc | 1.66 ms | 1.54 ms | 3.0 MB | 1014 B | 1.79 ms | 1.66 ms | 24 kB |
+| refs | rustc | 2064.70 ms | 2068.67 ms | 184.2 MB | 292256 B | 3.84 ms | 3.70 ms | 1988 kB |
+| heap | rmc | 1.62 ms | 1.49 ms | 3.1 MB | 1165 B | 3.34 ms | 3.17 ms | 4712 kB |
+| heap | rustc | 2068.92 ms | 2073.25 ms | 183.7 MB | 292400 B | 3.48 ms | 3.31 ms | 6700 kB |
+| callrec | rmc | 1.45 ms | 1.31 ms | 3.0 MB | 695 B | 2.90 ms | 2.77 ms | 24 kB |
+| callrec | rustc | 2070.15 ms | 2073.55 ms | 184.2 MB | 291680 B | 2.84 ms | 2.70 ms | 2020 kB |
+| forloops | rmc | 1.61 ms | 1.49 ms | 3.1 MB | 851 B | 1.46 ms | 1.35 ms | 24 kB |
+| forloops | rustc | 2072.64 ms | 2076.65 ms | 182.6 MB | 292480 B | 3.32 ms | 3.19 ms | 2096 kB |
 
 Summary of the ratios (rustc ÷ rmc, so >1 means rmc is better):
 
@@ -410,7 +412,7 @@ Summary of the ratios (rustc ÷ rmc, so >1 means rmc is better):
 | compile CPU       | ~1202–1580× |
 | compiler peak RAM | ~60–62×    |
 | artifact size     | ~251–585× vs fat-LTO stripped; ~1016–2385× vs static stripped; ~3899–9166× vs plain `-O` |
-| run wall time     | 0.12–3.73× (rmc ahead on `hello`, `forloops`, `sieve`, `mandel`, `mix`, `heap`, `fib`; at parity on `callrec`; behind on `stats` and `refs`) |
+| run wall time     | 0.98–3.17× (rmc ahead on every program; `callrec` and `fib` within noise of parity) |
 | run peak RAM      | ~1.42× on `heap`, ~2.30× on `sieve`, ~84–101× elsewhere |
 
 The compile-time win is the point of the project: `rmc` builds in about 1.5–1.9 ms
@@ -420,10 +422,10 @@ stripped) or ~4.5 MB (plain `-O`). The binary is small because it links only the
 runtime pieces the program reaches: a program that never allocates carries no
 allocator, and one that never indexes an array carries no bounds trap. The
 run-time picture is mixed and remains the honest weak spot: rmc wins on `hello`
-(3.7×, mostly process startup), `forloops` (2.3×), `sieve` (1.35×), `mandel`
-(1.10×), `heap` (1.06×) and `mix` (1.05×), sits at parity on `fib` (0.99×) and
-`callrec` (0.99×), roughly ties on `stats` (0.95×), and trails on `refs` (0.12×).
-`refs` is the one structural loss — see below — not a tuning gap. Both compilers inline
+(3.17×, mostly process startup), `forloops` (2.27×), `refs` (2.15×), `sieve`
+(1.38×), `stats` (1.15×), `mandel` (1.10×), `heap` (1.04×) and `mix` (1.04×),
+and sits at parity on `fib` (1.00×) and `callrec` (0.98×, inside noise). `refs`
+is no longer the structural loss it was — see below. Both compilers inline
 `gcd` into `main` (the inliner now accepts a small loop-bearing helper) and both
 emit a 32-bit `div` fast path with a 64-bit `idiv` fallback, so the `mix` gap is the
 code around the divide rather than the divide's checks: rmc reloads the bound and
@@ -440,8 +442,7 @@ machine, and a program near parity (`fib`, `mix`, `callrec`) flips sign between
 runs, so treat a single run's ratio as indicative and re-measure with many
 samples before trusting a sub-5% difference. (An early `refs` run reported
 0.14×; that was LLVM folding the *whole* loop into `128 * n` in the Rust twin,
-not a measurement of the loop. The twin now `black_box`es a term, and the 0.12×
-above is the real two-loop gap.) The binary's
+not a measurement of the loop. The twin now `black_box`es a term.) The binary's
 tiny footprint also shows at run time: an `rmc` program peaks at ~20–24 kB of
 RAM, a rustc one at ~2 MB
 — except on `heap` and `sieve`, where the arena each program allocates dominates
@@ -473,15 +474,14 @@ Two benchmarks need a word of caution when reading their ratio:
   allocator runs, glibc's does not — so the ratio is about the generated walk,
   not a claim that the allocators cost the same.
 * **`refs`** needs the in-loop `black_box` to keep the Rust loop real (without
-  it LLVM folds the whole thing to `128 * n`). rmc has no such barrier, and its
-  `licm` deliberately does *not* hoist a read through a reference — rmc's `&T`
-  carries no guarantee that it is dereferenceable, so hoisting the load out of a
-  loop that might never run could fault where the source would not. The rmc loop
-  therefore reloads all eight fields (and redoes both products) every iteration,
-  which is the whole of the 0.12× ratio: rustc's loop keeps the invariant sum in
-  a register and only pays the `black_box` store/reload. A frame-based loop of
-  the same shape *is* hoisted and wins, so the gap is the reference, not the
-  arithmetic.
+  it LLVM folds the whole thing to `128 * n`). rmc's `licm` hoists a read through
+  a reference only when a provenance pre-pass proves the reference points at a
+  live local (`&x`, `&x.field`): rmc's `&T` carries no guarantee that it is
+  dereferenceable, so a reference of unknown origin — a parameter, a cast, a
+  mutable ref — must not have its load speculated out of a loop that might never
+  run. `refs` binds its reference to a local, so the read is hoisted and rmc now
+  wins (2.15×); a loop that reads through a reference of unproven origin would
+  still reload every iteration and lose, and that is the honest limit.
 
 ## Honest limitations
 

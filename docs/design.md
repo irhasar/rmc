@@ -304,7 +304,9 @@ slots. A struct used only field by field keeps every field promotable, the last
 one included: a field access names a register through `field_reg` or an address
 `base + offset` off `array_off`, and neither needs the last field's own slot to
 be addressable. This is worth a real benchmark — promoting `stats`'s last field
-(`sum`, the hot one) takes it from 0.88x to 1.14x of its rustc twin. A payload
+(`sum`, the hot one), together with keeping an i64-method receiver in its slot
+and folding field accumulators, takes `stats` from ~0.9x to ~1.15x of its rustc
+twin. A payload
 enum is the exception: it is read as a whole through its base word, so that word
 stays in memory.
 
@@ -637,12 +639,13 @@ promotion (a few percent on `mix` and `sieve`), the reference-operand folds plus
 the three accessor calls from its hot loop), and the self-recursion rewrite (2.0x
 on `fib`, by halving its call tree); everything else is local and cheap to
 compute. LICM hoists a field read through a *local aggregate* (it cannot fault)
-but deliberately not one through a reference (rmc's `&T` is not known to be
-dereferenceable, so a speculative load could fault on a loop that never runs).
-The current `refs` benchmark reaches its fields through a `&Wide`, so its loop
-reloads all eight fields each iteration and `refs` sits at ~0.12x an honest
-rustc twin; a frame-based loop of the same shape is hoisted to one add per
-iteration and wins.
+and through a reference only when a provenance pre-pass proves the reference is
+bound to a live local (rmc's `&T` is not known to be dereferenceable, so a
+speculative load through a reference of unknown origin could fault on a loop that
+never runs). The `refs` benchmark binds its `&Wide` to a local, so its loop is
+hoisted to one add per iteration and `refs` wins (~2.2x an honest rustc twin); a
+loop reading through an unproven reference still reloads every iteration and
+loses.
 
 On the language side the notable absences are: `u*`/`i*` widths other than
 `i64`, floating point, traits and generics, closures, `for` over arbitrary

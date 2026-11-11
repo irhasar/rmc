@@ -449,15 +449,16 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   per field and the `refs` benchmark ran at 69 ms; the fold brought rmc's own
   runtime down ~1.4x to ~50 ms. Inlining the accessors then removed the calls
   entirely, taking `refs` to ~20 ms. The current `refs` benchmark reaches its
-  fields through a `&Wide`, and LICM deliberately does *not* hoist a read through
-  a reference: rmc's `&T` carries no guarantee that it is dereferenceable, so a
+  fields through a `&Wide`, and LICM hoists a read through a reference only when
+  a provenance pre-pass proves the reference points at a live local (`&x`,
+  `&x.field`): rmc's `&T` carries no guarantee that it is dereferenceable, so a
   speculative load out of a loop that might never run could fault where the
-  source would not. The loop therefore reloads all eight fields (and both
-  products) every iteration, and `refs` sits at ~0.12x an honest rustc twin
-  (which `black_box`es a term, or LLVM closes the whole loop into `128 * n`).
-  A frame-based loop of the same shape *is* hoisted - LICM speculates a field
-  read through a local aggregate because that access cannot fault - and wins; the
-  gap is the reference, not the arithmetic. The fold is deliberately *one* level
+  source would not. `refs` binds its reference to a local, so the read is hoisted
+  and `refs` now wins (~2.2x an honest rustc twin, which `black_box`es a term, or
+  LLVM closes the whole loop into `128 * n`). A loop that reads through a
+  reference of unproven origin (a parameter, a cast, a mutable ref) still reloads
+  every iteration and loses; that is the honest limit, and the gap is the
+  reference, not the arithmetic. The fold is deliberately *one* level
   deep:
   a `*p` used as a reference has its pointer in memory, so `ptr_reg` only matches
   a reference *local*, never a `Deref`. `addr_reg` (local or one `Deref` of a
@@ -693,8 +694,9 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   (`slot + n - 1 - offset/8`), not the struct's base slot, before trusting a
   `%rbp` operand — otherwise a promoted last field reads a stale frame word.
   A payload enum is the exception: it is read as a whole through its base word,
-  so that word always stays in memory. Promoting `stats`'s last field is worth
-  0.88x -> 1.14x of its rustc twin.
+  so that word always stays in memory. Promoting `stats`'s last field, together
+  with keeping an i64-method receiver in its slot and folding field
+  accumulators, is worth ~0.9x -> ~1.15x of its rustc twin.
 - **A base-less SIB operand must use mod=00 with a disp32.** `lea 0(,%rax,8)` is
   SIB base field 101, which means "no base" only at mod=00; at mod=01/10 it
   selects `%rbp` instead. Emitting a disp8 there reads the wrong address (a
@@ -1184,18 +1186,19 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   The Rust twin must use the same 24-byte stride or its smaller working set
   flatters the walk; it still does not run a free list, so the ratio is about the
   generated pointer code, not the allocators.
-- **`refs` is the reference-read loss, and it is deliberate.** The loop reads a
-  fixed struct through `&self` accessors. `licm` will not hoist a read through a
-  reference: rmc lets a reference outlive its referent (`0 as &i64` is accepted),
-  so a speculative deref can fault on a loop that never runs, where the in-body
-  read would not. The accessor sum is therefore recomputed every iteration and
-  rmc loses to rustc by roughly 8x. A frame-based loop of the same shape is
-  hoisted and wins. Keeping the Rust loop real needs an in-loop `black_box`
-  (a store/reload per iteration), so read the ratio as "two real loops doing the
-  same arithmetic", not an instruction-for-instruction tie - but do not claim a
-  win here; there is not one. This was the state before the faulting-hoist fix
-  (the LICM reference-read restriction); the docstrings and this note were not
-  updated when the fix landed, and a stale 2.23x win sat in `RESULTS.md`.
+- **`refs` is the reference-read case, and the hoist is provenance-gated.** The
+  loop reads a fixed struct through `&self` accessors. `licm` hoists a read
+  through a reference only when a provenance pre-pass proves the reference is
+  bound to a live local (`&x`, `&x.field`): rmc lets a reference outlive its
+  referent (`0 as &i64` is accepted), so a speculative deref of a reference of
+  unknown origin can fault on a loop that never runs, where the in-body read
+  would not. `refs` binds its reference to a local, so the accessor sum is
+  hoisted and rmc wins (~2.2x). A loop that reads through an unproven reference
+  (a parameter, a cast, a mutable ref) is still recomputed every iteration and
+  loses; a frame-based loop of the same shape is hoisted and wins. Keeping the
+  Rust loop real needs an in-loop `black_box` (a store/reload per iteration), so
+  read the ratio as "two real loops doing the same arithmetic", not an
+  instruction-for-instruction tie.
 - **`callrec` is the call-heavy case, and it used to lose.** Non-tail recursion
   (`tree(n) = 1 + tree(n-1) + tree(n-2)`) cannot be inlined by either compiler,
   so it measures raw call overhead plus argument setup, where the stack-based
