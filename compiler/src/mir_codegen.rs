@@ -5789,6 +5789,11 @@ fn main() -> i64 {
     /// The fold must not drop a `bool` store that a *later* block reads without
     /// recomputing it: that is the `reusedcheck` miscompile shape, caught here
     /// at the unit level too.
+    ///
+    /// `bb3` reads `_1` and never defines it, so the fold in `bb0` cannot serve
+    /// that read and must leave the store behind. The materialisation shows up
+    /// as a `setl` (the original test read `_1` nowhere else, so its `cmp`
+    /// assertion held whether the store survived or not).
     #[test]
     fn external_bool_read_blocks_fold() {
         let src = "\
@@ -5813,7 +5818,16 @@ fn main() -> i64 {
     }
 
     bb3: {
-        _0 = _2;
+        switchInt(copy _1) -> [0: bb4, otherwise: bb5];
+    }
+
+    bb4: {
+        _0 = copy _2;
+        return;
+    }
+
+    bb5: {
+        _0 = copy _2;
         return;
     }
 }
@@ -5823,9 +5837,13 @@ fn main() -> i64 {
         let asm = compile(&prog, &Options::default()).expect("compile");
         let main = func_asm(&asm, "main");
         assert!(!main.is_empty(), "main not emitted:\n{asm}");
-        // `_1` is read nowhere else, so this fold is the served one; the branch
-        // still becomes a `cmp`/`jcc`.
-        assert!(main.contains("cmp"), "comparison should fold into a branch:\n{main}");
+        // `_1` is read in `bb3` with no definition there, so the `bb0` fold is
+        // blocked and the `bool` is materialised (`setl`); folding it away would
+        // leave `bb3` reading a stale or undefined value.
+        assert!(
+            main.contains("setl"),
+            "a cross-block read must keep the bool store:\n{main}"
+        );
     }
 
     /// A struct layout whose field list names its own struct must not send the
