@@ -2092,11 +2092,27 @@ covered by a test in `compiler/tests/compile.rs`:
   `if a || b { .. }` (true path may have skipped `b`). `check_expr` instead
   records `cond_then_init`/`cond_else_init` — the state on entry to the true
   and false branch — and `check_stmt`'s `if`/`while` restore them before
-  checking each branch. `a && b` is true only when `b` ran (then = evaluated,
-  else = either); `a || b` is the mirror (then = either, else = evaluated).
-  Leave the scope with the "either path" state for a value use
-  (`let x = a && b`). Only a *top-level* short circuit splits the branches;
-  consume the slots on every condition so a nested one cannot leak.
+  checking each branch. For a single `a && b`, the true state is the
+  right operand's outcome and the false state merges both ways it can be false;
+  `a || b` is the mirror. The two states are composed per operand, not read off
+  the scope — see the chained-guard rule below. Leave the scope with the
+  "either path" state for a value use (`let x = a && b`). Only a *top-level*
+  short circuit splits the branches; consume the slots on every condition so a
+  nested one cannot leak.
+- **A chained guard checks its right operand under the left-true state, so
+  compose outcomes rather than reading the scope.** `(a && { x = 7; true }) &&
+  x == 7` reaches the comparison only where the inner `&&` was true — exactly
+  where `x` was assigned — but the inner short circuit has already written the
+  merged "either path" state onto the scope, so checking the comparison there
+  wrongly rejects `x` (E0381). Each operand therefore has a *true* and a
+  *false* outcome state: `check_expr` leaves a logical operand's pair in the
+  `cond_*` slots, and any other operand's single exit state is both. The right
+  operand is checked under the left-true state for `&&` (left-false for `||`),
+  and the two outcomes are merged for the resulting true, false and
+  post-expression states. `outcome_states` consumes the slots for every
+  operand, so a nested short circuit cannot leak. The post-expression state is
+  still the conservative merge, so a value use cannot assume the right operand
+  ran.
 - **A `for` bound `continue` targets the enclosing loop even when the label is
   reused.** The bounds are evaluated before the `for`'s own label enters scope,
   so `stmt_contains_continue` must inspect `start`/`end` regardless of the
