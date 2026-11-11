@@ -900,6 +900,7 @@ Expr::PatScrutinee(_) => {
                 unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
             }
             Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
+            Expr::PatArity { .. } => unreachable!("sema rewrites PatArity into `true`"),
             Expr::EnumVariant { .. } => {} // a tag has no subexpressions
             Expr::EnumCtor { args, slot, size, .. } => {
                 for a in args {
@@ -1859,6 +1860,7 @@ Expr::PatScrutinee(_) => {
                 unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
             }
             Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
+            Expr::PatArity { .. } => unreachable!("sema rewrites PatArity into `true`"),
             Expr::EnumVariant { tag, .. } => {
                 self.line(&format!("mov ${tag}, %rax"));
                 Type::I64
@@ -2471,6 +2473,7 @@ Expr::PatScrutinee(_) => {
                 unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
             }
             Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
+            Expr::PatArity { .. } => unreachable!("sema rewrites PatArity into `true`"),
         }
     }
 

@@ -191,7 +191,12 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   aggregate lowered to an anonymous struct (element `k` is field `"k"`), so a
   tuple pattern reuses the whole struct path: `tuple_pat_binds` mirrors
   `struct_pat_binds` (a nested struct/tuple/array element recurses with the field
-  read as the sub-scrutinee). No sema or codegen case. It is irrefutable when
+  read as the sub-scrutinee). `tuple_pat_binds` emits an `Expr::PatArity`
+  marker first (and `array_pat_binds` does too, unless a `..` rest makes the
+  count flexible), which sema checks so a pattern naming the wrong number of
+  elements is rejected as rustc does (E0308/E0527) rather than silently reading
+  the first `k` and ignoring the rest; `()` (the unit type) counts as the empty
+  tuple. No sema or codegen case beyond that marker. It is irrefutable when
   every element is, so it joins `pat_irrefutable`, `first_bound_name`, `or_cond`
   and the
   `let`/`for`/`match`/parameter paths through `let_destructure_tuple_stmts` (the
@@ -1816,7 +1821,8 @@ There is no `Vec`, but the parser folds the few shapes the corpus uses to an
 `vec![e; n]` becomes `alloc(n * 8)` plus a `__rmc_fill`, `v.capacity()`/`v.len()`
 fold to the constant count, and `v.as_mut_ptr()` keeps the address so a later
 `.add(off)` is `p + off * elem`, scaling by the element width from the `Vec<T>`
-annotation (`Vec<u8>` stays byte-addressed). Each shape is recognised only directly
+annotation (`Vec<u8>` stays byte-addressed, and a `type Byte = u8` alias is
+chased to its target). Each shape is recognised only directly
 in a `let` initializer; anywhere else the `\0`-prefixed parser marker reaches
 sema, which reports the source construct (see the `\0vecnew` arm). An
 args-vector is never built: `std::env::args()...collect()` records the binding,
@@ -1827,6 +1833,14 @@ shapes type: `*mut T as i64` is allowed (rmc maps `*mut T` and `&mut T` alike,
 and rustc allows the raw form) and an integer/pointer coerce both ways, matching
 the existing `i64 as &T` extension; a shared reference still may not become a
 `&mut` one.
+
+The `Vec`/pointer name tables (`vec_names`, `vec_elem`, `vec_len`, `vec_cap`,
+`ptr_vars`, `args_vecs`) are lexically scoped like the nested-`fn` frames above:
+`parse_block_inner` pushes a frame onto `name_scopes` and every binding pushes an
+undo entry first (the `note_*` helpers), so `pop_name_scope` at block exit
+removes a binding the block introduced and restores one it shadowed. Without
+this, a nested `let v: Vec<i64>` would leave an outer `v: Vec<u8>` with an
+eight-byte stride once the block ended.
 
 The README's roadmap lists the intended next steps.
 

@@ -4,6 +4,24 @@ use crate::ast::*;
 use crate::consts::eval_i64;
 use crate::lexer::{Tok, Token};
 
+/// One saved entry of a parser name table, so a block's bindings are forgotten
+/// when the block ends. Each `let`/`for` that records a `Vec` or raw-pointer
+/// binding first pushes the name's previous state; leaving the block undoes the
+/// entries in reverse, which both removes the inner binding and restores an
+/// outer binding the block shadowed. Without this, a nested `let v: Vec<i64>`
+/// would leave the outer `v: Vec<u8>` with an eight-byte stride once its block
+/// ended.
+enum NameScope {
+    /// `vec_names`: whether the name was already present.
+    VecName(String, bool),
+    VecCap(String, Option<i64>),
+    VecLen(String, Option<i64>),
+    VecElem(String, Option<i64>),
+    Ptr(String, Option<i64>),
+    /// `args_vecs`: a `std::env::args()...collect()` binding.
+    ArgsVec(String, Option<i64>),
+}
+
 pub struct Parser {
     toks: Vec<Token>,
     i: usize,
@@ -129,6 +147,16 @@ pub struct Parser {
     /// `let` that consumes the type can record it against the binding name.
     /// Only `Vec` bindings read it, and they always follow their annotation.
     vec_elem_pending: Option<i64>,
+    /// The bare-identifier target of each `type` alias (`type Byte = u8` ->
+    /// `Byte` -> `u8`), so a `Vec<Byte>` can resolve the element to its
+    /// underlying byte width. Only a target that is a single identifier is
+    /// recorded; anything else keeps the default width.
+    alias_target: std::collections::HashMap<String, String>,
+    /// Undo log for the `Vec`/pointer name tables above, one frame per block
+    /// being parsed (innermost last). A binding a block introduces is undone
+    /// when the block ends, and an outer binding it shadowed is restored, so a
+    /// name's recorded stride and shape are lexically scoped.
+    name_scopes: Vec<Vec<NameScope>>,
 }
 
 /// The deepest expression, block or type nesting the parser accepts. Deeply
@@ -185,6 +213,8 @@ impl Parser {
             ptr_vars: std::collections::HashMap::new(),
             vec_elem: std::collections::HashMap::new(),
             vec_elem_pending: None,
+            alias_target: std::collections::HashMap::new(),
+            name_scopes: Vec::new(),
         }
     }
 
@@ -429,6 +459,15 @@ impl Parser {
                     let name = self.expect_ident()?;
                     self.expect(Tok::Eq)?;
                     let start = self.i;
+                    // If the target is a single identifier, remember it so a
+                    // `Vec<NAME>` can chase the alias to its underlying byte
+                    // width. A compound target (`[u8; 4]`, `(u8, u8)`) is left
+                    // out; its width is the default.
+                    if let Some(Tok::Ident(target)) = self.toks.get(self.i).map(|t| t.tok.clone()) {
+                        if matches!(self.toks.get(self.i + 1).map(|t| &t.tok), Some(Tok::Semi)) {
+                            self.alias_target.insert(name.clone(), target);
+                        }
+                    }
                     self.skip_to_semi()?;
                     alias_spans.push((name, start));
                 }
@@ -703,6 +742,21 @@ impl Parser {
             Type::Array(elem, n) => Ok(Type::Array(Box::new(self.expand_alias_ty(elem, depth + 1)?), *n)),
             _ => Ok(t.clone()),
         }
+    }
+
+    /// The byte width of a `Vec<T>` element named by the identifier `t`,
+    /// following `type` aliases to their target so `type Byte = u8` and
+    /// `Vec<Byte>` still get a one-byte stride. The chain is bounded so a
+    /// cyclic alias (which `expand_alias_ty` rejects elsewhere) cannot loop.
+    fn elem_width_of(&self, t: &str) -> i64 {
+        let mut cur = t.to_string();
+        for _ in 0..64 {
+            match self.alias_target.get(&cur) {
+                Some(next) if *next != cur => cur = next.clone(),
+                _ => break,
+            }
+        }
+        elem_byte_width(&cur)
     }
 
     /// `type NAME = TYPE;`. The target is parsed here (aliases in it expanded by
@@ -1173,9 +1227,10 @@ impl Parser {
                     // The element type fixes the pointer stride for a later
                     // `.add(off)`, so read its name before the alias map
                     // collapses `u8` to `i64`; `size_of::<T>()` is what rustc
-                    // scales `add` by.
+                    // scales `add` by. A `type Byte = u8` alias is chased to its
+                    // target so `Vec<Byte>` still gets a one-byte stride.
                     let width = match self.peek() {
-                        Some(Tok::Ident(t)) => elem_byte_width(t),
+                        Some(Tok::Ident(t)) => self.elem_width_of(t),
                         _ => 8,
                     };
                     let mut depth = 1i32;
@@ -1226,9 +1281,108 @@ impl Parser {
         // exit, so an error part way through does not leave a stale binding.
         let frame = self.scan_block_fns()?;
         self.fn_scopes.push(frame);
+        // The `Vec`/pointer name tables are scoped the same way: a binding this
+        // block introduces (or shadows) is undone when the block ends, so an
+        // outer `v: Vec<u8>` regains its byte stride after a nested `v`.
+        self.name_scopes.push(Vec::new());
         let r = self.parse_block_body();
+        self.pop_name_scope();
         self.fn_scopes.pop();
         r
+    }
+
+    /// Record the current state of one `Vec`/pointer name table entry before a
+    /// binding overwrites it, so `pop_name_scope` can restore it. Called for
+    /// every binding a block introduces, including one that shadows an outer
+    /// binding of the same name.
+    fn note_vec_name(&mut self, name: &str) {
+        if let Some(frame) = self.name_scopes.last_mut() {
+            frame.push(NameScope::VecName(name.to_string(), self.vec_names.contains(name)));
+        }
+    }
+    fn note_vec_cap(&mut self, name: &str) {
+        if let Some(frame) = self.name_scopes.last_mut() {
+            frame.push(NameScope::VecCap(name.to_string(), self.vec_cap.get(name).copied()));
+        }
+    }
+    fn note_vec_len(&mut self, name: &str) {
+        if let Some(frame) = self.name_scopes.last_mut() {
+            frame.push(NameScope::VecLen(name.to_string(), self.vec_len.get(name).copied()));
+        }
+    }
+    fn note_vec_elem(&mut self, name: &str) {
+        if let Some(frame) = self.name_scopes.last_mut() {
+            frame.push(NameScope::VecElem(name.to_string(), self.vec_elem.get(name).copied()));
+        }
+    }
+    fn note_ptr(&mut self, name: &str) {
+        if let Some(frame) = self.name_scopes.last_mut() {
+            frame.push(NameScope::Ptr(name.to_string(), self.ptr_vars.get(name).copied()));
+        }
+    }
+    fn note_args_vec(&mut self, name: &str) {
+        if let Some(frame) = self.name_scopes.last_mut() {
+            frame.push(NameScope::ArgsVec(name.to_string(), self.args_vecs.get(name).copied()));
+        }
+    }
+
+    /// Undo the bindings the innermost block introduced, in reverse, so each
+    /// name returns to the state it had before the block (present-and-old, or
+    /// absent). Called on every exit from a block, including the error path.
+    fn pop_name_scope(&mut self) {
+        if let Some(frame) = self.name_scopes.pop() {
+            for entry in frame.into_iter().rev() {
+                match entry {
+                    NameScope::VecName(n, had) => {
+                        if had {
+                            self.vec_names.insert(n);
+                        } else {
+                            self.vec_names.remove(&n);
+                        }
+                    }
+                    NameScope::VecCap(n, prev) => match prev {
+                        Some(v) => {
+                            self.vec_cap.insert(n, v);
+                        }
+                        None => {
+                            self.vec_cap.remove(&n);
+                        }
+                    },
+                    NameScope::VecLen(n, prev) => match prev {
+                        Some(v) => {
+                            self.vec_len.insert(n, v);
+                        }
+                        None => {
+                            self.vec_len.remove(&n);
+                        }
+                    },
+                    NameScope::VecElem(n, prev) => match prev {
+                        Some(v) => {
+                            self.vec_elem.insert(n, v);
+                        }
+                        None => {
+                            self.vec_elem.remove(&n);
+                        }
+                    },
+                    NameScope::Ptr(n, prev) => match prev {
+                        Some(v) => {
+                            self.ptr_vars.insert(n, v);
+                        }
+                        None => {
+                            self.ptr_vars.remove(&n);
+                        }
+                    },
+                    NameScope::ArgsVec(n, prev) => match prev {
+                        Some(v) => {
+                            self.args_vecs.insert(n, v);
+                        }
+                        None => {
+                            self.args_vecs.remove(&n);
+                        }
+                    },
+                }
+            }
+        }
     }
 
     /// Collect the nested `fn`s declared directly in the block whose `{` has
@@ -1957,6 +2111,7 @@ impl Parser {
                                 self.pos()
                             ));
                         }
+                        self.note_args_vec(&name);
                         self.args_vecs.insert(name.clone(), self.args_skip);
                         return Ok(());
                     }
@@ -1971,6 +2126,10 @@ impl Parser {
                         // fold. Either way the size is `count * 8` bytes at run
                         // time and `__rmc_fill` takes the count as a value.
                         let count = eval_i64(&n_expr, &self.consts);
+                        self.note_vec_name(&name);
+                        self.note_vec_elem(&name);
+                        self.note_vec_len(&name);
+                        self.note_vec_cap(&name);
                         self.vec_names.insert(name.clone());
                         self.vec_elem.insert(name.clone(), elem_width);
                         if let Some(c) = count {
@@ -2032,6 +2191,7 @@ impl Parser {
                             }
                             _ => 8,
                         };
+                        self.note_ptr(&name);
                         self.ptr_vars.insert(name.clone(), stride);
                         out.push(Stmt::Let {
                             name,
@@ -3728,7 +3888,14 @@ impl Parser {
     /// each a read of the element's field (`"k"` on the anonymous struct a tuple
     /// lowers to). Shared by the `let`, `for`, `match` and parameter paths.
     fn tuple_pat_binds(elems: &[(bool, Pat)], subj: &Expr) -> Vec<Stmt> {
-        let mut out = Vec::new();
+        // A tuple pattern must name exactly the scrutinee's fields, so emit a
+        // marker for sema to check before the element reads. The field reads
+        // below would otherwise let `let (x,) = (1, 2);` silently ignore `1`.
+        let mut out = vec![Stmt::Expr(Expr::PatArity {
+            base: Box::new(subj.clone()),
+            want: elems.len(),
+            is_tuple: true,
+        })];
         for (k, (m, pat)) in elems.iter().enumerate() {
             let field = Expr::Field {
                 base: Box::new(subj.clone()),
@@ -3785,7 +3952,19 @@ impl Parser {
         front: usize,
         subj: &Expr,
     ) -> Vec<Stmt> {
-        let mut out = Vec::new();
+        // An array pattern must name exactly the array's length (with no `..`
+        // rest), so emit a marker for sema to check before the index reads.
+        // Without it `let [x] = [1, 2];` would read `[0]` and ignore the rest.
+        // A `..` rest matches any count, so it has nothing to check.
+        let mut out = if rest {
+            Vec::new()
+        } else {
+            vec![Stmt::Expr(Expr::PatArity {
+                base: Box::new(subj.clone()),
+                want: elems.len(),
+                is_tuple: false,
+            })]
+        };
         for (j, elem) in elems.iter().enumerate() {
             let (m, pat) = match elem {
                 Some(x) => x,

@@ -195,6 +195,7 @@ Expr::PatScrutinee(_) => {
             unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
         }
         Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
+        Expr::PatArity { .. } => unreachable!("sema rewrites PatArity into `true`"),
         Expr::Bin(_, a, b) => 1 + n(a) + n(b),
         Expr::Un(_, a) | Expr::Cast(a, _) => 1 + n(a),
         Expr::Field { base, .. } => 1 + n(base),
@@ -308,6 +309,7 @@ Expr::PatScrutinee(_) => {
                 unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
             }
             Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
+            Expr::PatArity { .. } => unreachable!("sema rewrites PatArity into `true`"),
             Expr::Bin(_, a, b) => {
                 self.walk_expr(a, base, expanding);
                 self.walk_expr(b, base, expanding);
@@ -571,6 +573,7 @@ Expr::PatScrutinee(_) => {
                 unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
             }
             Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
+            Expr::PatArity { .. } => unreachable!("sema rewrites PatArity into `true`"),
             Expr::Bin(_, a, b) => {
                 collect_expr(a, out);
                 collect_expr(b, out);
@@ -729,6 +732,7 @@ Expr::PatScrutinee(_) => {
                 unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
             }
             Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
+            Expr::PatArity { .. } => unreachable!("sema rewrites PatArity into `true`"),
             Expr::Var { slot, .. } => *slot = self.slot(*slot),
             Expr::Bin(_, a, b) => {
                 self.expr(a);

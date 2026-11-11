@@ -696,6 +696,9 @@ compile-time constant is decided at compile time, not by the trap.
   be irrefutable: a literal element (`[1, y]`) is rejected rather than
   mis-bound. An array pattern that binds
   nothing (`[_, _]`, `[..]`) is accepted and still evaluates the scrutinee once.
+  Without a `..` rest, the pattern must name exactly the array's length, as
+  rustc requires: `let [x] = [1, 2];` is rejected (E0527), not silently bound to
+  the first element.
 - Tuple patterns: `(a, b)` matches a tuple and binds its elements, in a `let`,
   `for` head, parameter, `match` arm, `if let` or `while let`. An element is a
   binding, `_`, or a nested struct/array/tuple pattern, exactly as an array
@@ -708,7 +711,8 @@ compile-time constant is decided at compile time, not by the trap.
   element may not itself bind or be a variant (`(E::V(x), y)`), since rmc
   generates no test that carries a payload. In a `let`, `for` head or parameter
   the pattern is irrefutable, so a literal element is rejected, as rustc
-  rejects it.
+  rejects it. The pattern must name exactly the tuple's arity (E0308):
+  `let (x,) = (1, 2);` is rejected, not bound to the first field.
 - `for` destructuring: `for S { f, g: h, i: _, .. } in arr { .. }` or
   `for [x, y] in arr { .. }` iterates the array as above but destructures each
   element with the same struct- or array-pattern grammar, binding the named

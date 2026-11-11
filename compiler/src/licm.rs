@@ -135,6 +135,7 @@ Expr::PatScrutinee(_) => {
                 unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
             }
             Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
+            Expr::PatArity { .. } => unreachable!("sema rewrites PatArity into `true`"),
             Expr::Block(b) | Expr::Loop(b, _, _, _) => self.block(b),
             Expr::MatchBoundary(b, _) => self.block(b),
             Expr::If(c, t, els) => {
@@ -297,6 +298,7 @@ Expr::PatScrutinee(_) => {
                 unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
             }
             Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
+            Expr::PatArity { .. } => unreachable!("sema rewrites PatArity into `true`"),
             Expr::Call { args, .. } => {
                 // A call may write anything, so no local is known invariant.
                 self.all = true;
@@ -487,6 +489,7 @@ Expr::PatScrutinee(_) => {
                 unreachable!("sema rewrites PatScrutinee into a Deref or the bare scrutinee")
             }
             Expr::PatCheck { .. } => unreachable!("sema rewrites PatCheck into `true`"),
+            Expr::PatArity { .. } => unreachable!("sema rewrites PatArity into `true`"),
             Expr::Bin(_, a, b) => {
                 self.expr(a);
                 self.expr(b);

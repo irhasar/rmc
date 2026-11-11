@@ -961,13 +961,14 @@ fn a_mut_before_a_let_array_pattern_is_rejected() {
 
 #[test]
 fn an_array_pattern_with_an_out_of_range_element_is_rejected() {
-    // `[x, y, z]` on a length-2 array reads index 2, which sema rejects.
+    // `[x, y, z]` on a length-2 array is rejected: rustc reports the arity
+    // mismatch (E0527) before any index is read, so rmc does too.
     let err = compile_to_asm(
         "fn main() -> i64 { let a: [i64; 2] = [1, 2]; let [x, y, z] = a; return x; }",
         &CompileOptions::default(),
     )
     .unwrap_err();
-    assert!(err.contains("out of bounds"), "got: {err}");
+    assert!(err.contains("pattern requires 3 elements but array has 2"), "got: {err}");
 }
 
 #[test]
@@ -5968,6 +5969,78 @@ fn a_vec_u8_pointer_add_steps_single_bytes() {
         "a byte pointer must not scale the offset:\n{body}"
     );
     assert!(body.contains("add $3, %rax"), "expected a one-byte stride:\n{body}");
+}
+
+#[test]
+fn a_shadowed_vec_binding_restores_the_outer_stride() {
+    // The element width a `Vec` binding carries is lexically scoped: an inner
+    // `v: Vec<i64>` in a nested block must not leave the outer `v: Vec<u8>`
+    // with an eight-byte stride once the block ends. The outer pointer's
+    // `add(1)` must therefore stay a one-byte step (`add $1, %rax`), not a
+    // scaled one.
+    let out = asm_no_inline(
+        "fn main() -> i64 { \
+             let mut v: Vec<u8> = vec![0u8; 16]; \
+             { let v: Vec<i64> = vec![0i64; 2]; let _ = v.len(); } \
+             let p = v.as_mut_ptr(); \
+             let q = unsafe { p.add(1) }; \
+             return q as i64 - p as i64; \
+         }",
+    );
+    let body = &out[out.find("main:").expect("main")..];
+    assert!(body.contains("add $1, %rax"), "outer byte stride lost after shadow:\n{body}");
+}
+
+#[test]
+fn a_vec_element_type_alias_resolves_to_the_target_width() {
+    // `type Byte = u8` is transparent, so `Vec<Byte>` has a one-byte stride:
+    // `p.add(8)` is `p + 8`, an immediate add, not a scaled one.
+    let out = asm_no_inline(
+        "type Byte = u8; \
+         fn main() -> i64 { \
+             let mut v: Vec<Byte> = vec![0u8; 16]; \
+             let p = v.as_mut_ptr(); \
+             let q = unsafe { p.add(8) }; \
+             return q as i64 - p as i64; \
+         }",
+    );
+    let body = &out[out.find("main:").expect("main")..];
+    assert!(body.contains("add $8, %rax"), "alias element must keep a byte stride:\n{body}");
+}
+
+#[test]
+fn an_array_pattern_of_the_wrong_length_is_rejected() {
+    // rustc requires an array pattern to name exactly the array's length
+    // (E0527), so `let [x] = [1, 2];` is an error rather than silently reading
+    // the first element and ignoring the rest.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let a: [i64; 2] = [1, 2]; let [x] = a; return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("pattern requires 1 element but array has 2"), "got: {err}");
+}
+
+#[test]
+fn a_tuple_pattern_of_the_wrong_length_is_rejected() {
+    // Likewise a tuple pattern must name every field (E0308), so `let (x,) =
+    // (1, 2);` is an error.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let t: (i64, i64) = (1, 2); let (x,) = t; return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("pattern requires 1 element but tuple has 2"), "got: {err}");
+}
+
+#[test]
+fn a_unit_tuple_pattern_is_accepted() {
+    // `()` is the empty tuple, so `let () = ();` is a legal irrefutable pattern.
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let () = (); return 0; }",
+        &CompileOptions::default()
+    )
+    .is_ok());
 }
 
 #[test]

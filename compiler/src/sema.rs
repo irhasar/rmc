@@ -1509,7 +1509,10 @@ impl Sema {
             if let Some(l) = self.loop_cont.last_mut() {
                 *l = cont;
             }
-            let is_pat_check = matches!(st, Stmt::Expr(Expr::PatCheck { .. }));
+            let is_pat_check = matches!(
+                st,
+                Stmt::Expr(Expr::PatCheck { .. }) | Stmt::Expr(Expr::PatArity { .. })
+            );
             self.check_stmt(&mut st, scope)?;
             if !is_pat_check {
                 kept.push(st);
@@ -2197,7 +2200,9 @@ impl Sema {
             // A struct pattern's type claim is rewritten by `check_expr`, which
             // runs after this pre-pass, so recurse into its scrutinee here to see
             // any `&mut` it borrows (`let S { .. } = &mut x;`).
-            Expr::PatCheck { base, .. } => Self::collect_mut_borrows(base, a, mb),
+            Expr::PatCheck { base, .. } | Expr::PatArity { base, .. } => {
+                Self::collect_mut_borrows(base, a, mb)
+            }
             Expr::Bin(_, x, y) => {
                 Self::collect_mut_borrows(x, a, mb);
                 Self::collect_mut_borrows(y, a, mb);
@@ -3697,6 +3702,43 @@ impl Sema {
                 *e = Expr::Bool(true);
                 Ok(Type::Bool)
             }
+            Expr::PatArity { base, want, is_tuple } => {
+                let is_tuple = *is_tuple;
+                // An array or tuple pattern must name exactly as many elements
+                // as the scrutinee has, matching rustc's E0527/E0308. The
+                // element reads are ordinary index/field accesses, so without
+                // this check a pattern naming fewer elements than the scrutinee
+                // has would silently match and ignore the rest.
+                let t = deref_ty(self.check_expr(base, scope)?);
+                let (got, what) = match t {
+                    Type::Array(_, n) => (n, "array"),
+                    // `()` is the unit type, which rustc treats as the empty
+                    // tuple: `let () = ();` is legal and matches nothing.
+                    Type::Unit if is_tuple && *want == 0 => (0, "tuple"),
+                    Type::Struct(name, _) if is_tuple && is_tuple_name(&name) => {
+                        (self.structs[&name].fields.len(), "tuple")
+                    }
+                    Type::Struct(name, _) if is_tuple => {
+                        return Err(format!(
+                            "mismatched types: a tuple pattern cannot match `{name}`"
+                        ))
+                    }
+                    other => {
+                        let what = if is_tuple { "tuple" } else { "array" };
+                        return Err(format!(
+                            "mismatched types: a {what} pattern cannot match a value of type {other:?}"
+                        ));
+                    }
+                };
+                if got != *want {
+                    return Err(format!(
+                        "pattern requires {want} element{} but {what} has {got}",
+                        if *want == 1 { "" } else { "s" }
+                    ));
+                }
+                *e = Expr::Bool(true);
+                Ok(Type::Bool)
+            }
             Expr::Cast(inner, to) => {
                 let it = self.check_expr(inner, scope)?;
                 // An enum may be cast to `i64` (its tag), but not the reverse:
@@ -3921,7 +3963,9 @@ fn expr_has_break(e: &Expr, label: Option<&str>, nested: bool) -> bool {
         Expr::VariantTest { scrutinee, .. } => expr_has_break(scrutinee, label, nested),
         Expr::EnumPayload { recv, .. } => expr_has_break(recv, label, nested),
         Expr::PatScrutinee(inner) => expr_has_break(inner, label, nested),
-        Expr::PatCheck { base, .. } => expr_has_break(base, label, nested),
+        Expr::PatCheck { base, .. } | Expr::PatArity { base, .. } => {
+            expr_has_break(base, label, nested)
+        }
         _ => false,
     }
 }
@@ -4030,7 +4074,7 @@ fn expr_can_fall(e: &Expr) -> bool {
         Expr::VariantTest { scrutinee, .. } => expr_can_fall(scrutinee),
         Expr::EnumPayload { recv, .. } => expr_can_fall(recv),
         Expr::PatScrutinee(inner) => expr_can_fall(inner),
-        Expr::PatCheck { base, .. } => expr_can_fall(base),
+        Expr::PatCheck { base, .. } | Expr::PatArity { base, .. } => expr_can_fall(base),
         _ => true,
     }
 }
@@ -4096,7 +4140,9 @@ fn cond_has_unlabelled_exit(e: &Expr) -> bool {
         Expr::BoolTest { scrutinee, .. } => cond_has_unlabelled_exit(scrutinee),
         Expr::TupleLit(xs) => xs.iter().any(cond_has_unlabelled_exit),
         Expr::PatScrutinee(inner) => cond_has_unlabelled_exit(inner),
-        Expr::PatCheck { base, .. } => cond_has_unlabelled_exit(base),
+        Expr::PatCheck { base, .. } | Expr::PatArity { base, .. } => {
+            cond_has_unlabelled_exit(base)
+        }
         // A nested `loop` captures its own unlabelled exits.
         Expr::Loop(..) => false,
         _ => false,
@@ -4254,7 +4300,9 @@ fn expr_contains_continue(e: &Expr, label: Option<&str>, nested: bool) -> bool {
         Expr::VariantTest { scrutinee, .. } => expr_contains_continue(scrutinee, label, nested),
         Expr::EnumPayload { recv, .. } => expr_contains_continue(recv, label, nested),
         Expr::PatScrutinee(inner) => expr_contains_continue(inner, label, nested),
-        Expr::PatCheck { base, .. } => expr_contains_continue(base, label, nested),
+        Expr::PatCheck { base, .. } | Expr::PatArity { base, .. } => {
+            expr_contains_continue(base, label, nested)
+        }
         // A nested `loop` captures its own unlabelled `continue`s, but a
         // labelled one can still target an enclosing loop.
         Expr::Loop(body, _, _, lbl) => {
