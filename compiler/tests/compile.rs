@@ -4187,6 +4187,50 @@ fn self_recursion_becomes_a_loop_with_one_call_per_level() {
 }
 
 #[test]
+fn a_tail_expression_recursion_becomes_a_loop() {
+    // The idiomatic tail form (`fib(n-1) + fib(n-2)` as the block's value) must
+    // fold the right spine exactly like the explicit-`return` form. Requiring
+    // the `return` keyword skipped every function written this way, which is how
+    // the benchmark twins are written.
+    let out = asm(
+        "fn fib(n: i64) -> i64 { if n < 2 { return n; } fib(n - 1) + fib(n - 2) } \
+         fn main() -> i64 { return fib(arg_i64(1)); }",
+    );
+    let fib = &out[out.find("fib:").unwrap()..];
+    let fib = &fib[..fib.find(".size fib").unwrap()];
+    assert_eq!(fib.matches("call fib").count(), 1, "one call per level:\n{fib}");
+    assert!(fib.contains("lea -2(%rbx), %rbx"), "the loop advances n by -2:\n{fib}");
+}
+
+#[test]
+fn a_tail_expression_recursion_still_keeps_a_foreign_call() {
+    // The tail form must keep the same guard as the `return` form: a call to
+    // another function in the left operand stays, only the self-call folds.
+    let out = asm(
+        "fn g(n: i64) -> i64 { if n < 2 { return n; } g(n - 1) + g(n - 2) } \
+         fn f(n: i64) -> i64 { if n < 2 { return n; } g(n) + f(n - 1) } \
+         fn main() -> i64 { return f(5); }",
+    );
+    let f = &out[out.find("f:").unwrap()..];
+    let f = &f[..f.find(".size f").unwrap()];
+    assert_eq!(f.matches("call f").count(), 1, "the self-call is folded:\n{f}");
+    assert!(f.contains("call g"), "the foreign call is kept:\n{f}");
+}
+
+#[test]
+fn a_tail_expression_recursion_is_not_folded_under_overflow_checks() {
+    let out = compile_to_asm(
+        "fn fib(n: i64) -> i64 { if n < 2 { return n; } fib(n - 1) + fib(n - 2) } \
+         fn main() -> i64 { return fib(5); }",
+        &CompileOptions { overflow_checks: true, ..Default::default() },
+    )
+    .unwrap();
+    let fib = &out[out.find("fib:").unwrap()..];
+    let fib = &fib[..fib.find(".size fib").unwrap()];
+    assert_eq!(fib.matches("call fib").count(), 2, "both calls kept:\n{fib}");
+}
+
+#[test]
 fn a_left_operand_that_is_not_a_self_call_still_folds_the_right_spine() {
     // `tree(n) = 1 + tree(n-1) + tree(n-2)` parses as `(1 + tree(n-1)) + tree(n-2)`,
     // so the left operand of the top `+` is *not* a self-call. The right operand
