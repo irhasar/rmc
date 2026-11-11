@@ -37,6 +37,10 @@ pub enum Type {
     Str,
     /// Unresolved name produced by the parser; never survives sema.
     Named(String),
+    /// The type of an expression that never produces a value (`!`). Only ever
+    /// produced by sema (e.g. a `loop` with no reachable `break`), never named
+    /// in source. It unifies with every other type.
+    Never,
 }
 
 impl Type {
@@ -44,7 +48,7 @@ impl Type {
         match self {
             Type::I64 | Type::Bool | Type::Str | Type::Enum(_) | Type::Ref(..) => 8,
             Type::EnumData(_, size) => *size,
-            Type::Unit => 0,
+            Type::Unit | Type::Never => 0,
             Type::Array(elem, n) => elem.size() * n,
             Type::Struct(_, s) => *s,
             Type::Named(_) => 0,
@@ -65,6 +69,15 @@ impl Type {
     /// rustc, which rejects both as array elements.
     pub fn is_int_or_bool(&self) -> bool {
         matches!(self, Type::I64 | Type::Bool | Type::Enum(_))
+    }
+
+    /// True for the types an array element may have now that nested aggregates
+    /// are supported: the integer-like scalars plus a nested array or a struct.
+    /// Every such type is a multiple of 8 bytes, so an element's stride is
+    /// `size() / 8` slots. A payload enum, a reference and `str` stay excluded
+    /// (rustc rejects a payload enum and a reference as array elements too).
+    pub fn is_array_elem(&self) -> bool {
+        matches!(self, Type::I64 | Type::Bool | Type::Enum(_) | Type::Array(..) | Type::Struct(..))
     }
 
     /// True for the aggregate types that live in memory: arrays and structs.
@@ -129,6 +142,17 @@ pub enum Expr {
         ret_ty: Type,
     },
     If(Box<Expr>, Block, Option<Block>),
+    /// `loop { .. }`. It is always an expression: a `loop` in statement
+    /// position is a `Stmt::Expr` around this node with `slot == -2`, so its
+    /// value is discarded and it is typed `()`. Otherwise sema types it as the
+    /// type of its `break`s, or `!` when no `break` can be reached, and records
+    /// that type here. `slot` is the hidden frame slot holding the loop's value
+    /// (`-1` when it yields none, `-2` while untyped, meaning "used as a
+    /// statement"). `ty` is `Unit` until sema fills it in; codegen needs it to
+    /// report the loop's type to its consumer. The last field is the loop's
+    /// label (`'a: loop { .. }` -> `Some("a")`), which a `break 'a` /
+    /// `continue 'a` targets; `None` for an unlabelled loop.
+    Loop(Block, i32, Type, Option<String>),
     /// Marks a desugared `match`, wrapping the *whole* `if` chain exactly once
     /// (not each arm). A `match` desugars to an `if` chain, and the chain must
     /// be recognised as a unit when deciding whether it is exhaustive. Without
@@ -259,8 +283,9 @@ pub enum Stmt {
     },
     /// An expression evaluated for its side effects.
     Expr(Expr),
-    While(Expr, Block),
-    Loop(Block),
+    /// `while cond { body }`. The last field is the loop label
+    /// (`'a: while c { .. }` -> `Some("a")`), or `None` when unlabelled.
+    While(Expr, Block, Option<String>),
     /// `for var in start..end { body }`. A `for` cannot be desugared to a
     /// `while` because `continue` must still run the increment, so it keeps its
     /// own node and the code generator gives the increment its own label.
@@ -271,11 +296,19 @@ pub enum Stmt {
         end: Expr,
         /// Hidden slot holding the end bound, evaluated once before the loop.
         end_slot: i32,
+        /// `start..=end` includes `end`; `start..end` does not.
+        inclusive: bool,
         body: Block,
+        /// The loop label (`'a: for .. { .. }` -> `Some("a")`), else `None`.
+        label: Option<String>,
     },
     Return(Option<Expr>),
-    Break,
-    Continue,
+    /// `break`, `break value`, or `break 'label [value]`. A value is only legal
+    /// in a `loop`; sema rejects it in a `while`/`for` (rustc E0571). The second
+    /// field names the target loop when the `break` is labelled.
+    Break(Option<Expr>, Option<String>),
+    /// `continue` or `continue 'label`.
+    Continue(Option<String>),
 }
 
 /// A user-defined struct. Field offsets are assigned by sema in declaration
@@ -321,12 +354,15 @@ pub struct FnDef {
     pub nslots: i32,
 }
 
-/// One variant of an enum: a name and its payload field types. An empty
-/// `fields` is a unit variant.
+/// One variant of an enum: a name, its payload field types, and an optional
+/// explicit discriminant. An empty `fields` is a unit variant.
 #[derive(Debug, Clone)]
 pub struct EnumVariantDef {
     pub name: String,
     pub fields: Vec<Type>,
+    /// An explicit `= N` discriminant, if written. `None` means the variant
+    /// takes the previous variant's value plus one (starting at 0).
+    pub discr: Option<i64>,
 }
 
 /// A user-defined enum. When every variant is a unit variant the enum is

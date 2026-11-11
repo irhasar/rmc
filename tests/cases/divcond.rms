@@ -1,0 +1,38 @@
+// A nested loop whose condition cannot complete (`break 'o` before the `true`)
+// makes its body unreachable, so a `continue 'o` there does not write the outer
+// binding once per iteration: the outer `loop` still runs the write exactly
+// once and the program is accepted. A condition that can complete leaves the
+// body reachable, so the same `continue` would repeat the write (rejected).
+fn break_in_cond() -> i64 {
+    let x: i64;
+    'o: loop {
+        x = 1;
+        while { break 'o; true } { continue 'o; }
+    }
+    return x;
+}
+
+fn empty_body() -> i64 {
+    let x: i64;
+    'o: loop {
+        x = 2;
+        while { break 'o; true } { }
+    }
+    return x;
+}
+
+fn plain_continue() -> i64 {
+    let x: i64;
+    'o: loop {
+        x = 3;
+        while { break 'o; true } { continue; }
+    }
+    return x;
+}
+
+fn main() -> i64 {
+    print_i64(break_in_cond());
+    print_i64(empty_body());
+    print_i64(plain_continue());
+    return 0;
+}

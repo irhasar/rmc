@@ -45,7 +45,7 @@ const MAX_DEPTH: u32 = 100;
 
 /// Expressions that are allowed as statements without a trailing `;`.
 fn is_block_like(e: &Expr) -> bool {
-    matches!(e, Expr::If(..) | Expr::Block(..) | Expr::MatchBoundary(..))
+    matches!(e, Expr::If(..) | Expr::Block(..) | Expr::MatchBoundary(..) | Expr::Loop(..))
 }
 
 type PResult<T> = Result<T, String>;
@@ -81,6 +81,11 @@ impl Parser {
         self.toks.get(self.i).map(|t| &t.tok)
     }
 
+    /// The token after the next one, for a two-token lookahead (`'a: loop`).
+    fn peek2(&self) -> Option<&Tok> {
+        self.toks.get(self.i + 1).map(|t| &t.tok)
+    }
+
     fn pos(&self) -> u32 {
         self.toks.get(self.i).map(|t| t.pos).unwrap_or(u32::MAX)
     }
@@ -110,6 +115,16 @@ impl Parser {
                 .map(|x| x.describe())
                 .unwrap_or_else(|| "end of input".into());
             Err(format!("at byte {}: expected {}, found {}", self.pos(), t.describe(), got))
+        }
+    }
+
+    /// Consume a `'label` token if one is next, returning its name.
+    fn eat_label(&mut self) -> PResult<Option<String>> {
+        if let Some(Tok::Label(n)) = self.peek().cloned() {
+            self.i += 1;
+            Ok(Some(n))
+        } else {
+            Ok(None)
         }
     }
 
@@ -179,7 +194,44 @@ impl Parser {
                 }
                 self.expect(Tok::RParen)?;
             }
-            variants.push(EnumVariantDef { name: vname, fields });
+            // `Variant = N`: an explicit discriminant. Only a unit variant may
+            // have one, as in rustc (a payload variant's tag is an
+            // implementation detail there).
+            let mut discr = None;
+            if self.eat(&Tok::Eq) {
+                if !fields.is_empty() {
+                    return Err(format!(
+                        "at byte {}: a variant with a payload cannot have an explicit discriminant",
+                        self.pos()
+                    ));
+                }
+                let neg = self.eat(&Tok::Minus);
+                match self.peek().cloned() {
+                    Some(Tok::Int(n)) => {
+                        self.bump();
+                        discr = Some(if neg {
+                            n.checked_neg().ok_or_else(|| {
+                                format!("at byte {}: discriminant out of range", self.pos())
+                            })?
+                        } else {
+                            n
+                        });
+                    }
+                    // `-9223372036854775808` is `i64::MIN`; the magnitude alone
+                    // does not fit, so it is only valid under a `-`.
+                    Some(Tok::IntMinMagnitude) if neg => {
+                        self.bump();
+                        discr = Some(i64::MIN);
+                    }
+                    _ => {
+                        return Err(format!(
+                            "at byte {}: expected an integer after `=` in a variant discriminant",
+                            self.pos()
+                        ))
+                    }
+                }
+            }
+            variants.push(EnumVariantDef { name: vname, fields, discr });
             if !self.eat(&Tok::Comma) {
                 break;
             }
@@ -384,40 +436,40 @@ impl Parser {
         self.expect(Tok::Fn)?;
         let name = self.expect_ident()?;
         self.expect(Tok::LParen)?;
-        // First parameter must be `self`. `&self` / `&mut self` make the receiver
-        // a reference, so the call passes the value's address rather than a copy;
-        // `self` takes the receiver by value.
-        let by_ref = self.eat(&Tok::Amp);
-        let by_mut = by_ref && self.eat(&Tok::Mut);
-        let first = self.expect_ident()?;
-        if first != "self" {
-            return Err(format!(
-                "at byte {}: method `{name}` must take `self` as its first parameter",
-                self.pos()
-            ));
-        }
+        // A method takes `self` as its first parameter; an associated function
+        // (`P::new(..)`) does not. `&self` / `&mut self` make the receiver a
+        // reference, so the call passes the value's address rather than a copy;
+        // `self` takes the receiver by value. An associated function is parsed
+        // exactly like a free function, minus the `self` receiver.
+        let takes_self = match self.peek() {
+            Some(Tok::Amp) => true,
+            Some(Tok::Ident(n)) => n == "self",
+            _ => false,
+        };
         let mut params = Vec::new();
         let mut param_mut = Vec::new();
-        if self.eat(&Tok::Comma) {
-            while self.peek() != Some(&Tok::RParen) {
-                let pm = self.eat(&Tok::Mut);
-                let pname = self.expect_ident()?;
-                self.expect(Tok::Colon)?;
-                let pty = self.parse_type()?;
-                params.push((pname, pty));
-                param_mut.push(pm);
-                if !self.eat(&Tok::Comma) {
-                    break;
-                }
+        let (by_ref, by_mut) = if takes_self {
+            let by_ref = self.eat(&Tok::Amp);
+            let by_mut = by_ref && self.eat(&Tok::Mut);
+            let first = self.expect_ident()?;
+            debug_assert_eq!(first, "self");
+            if self.eat(&Tok::Comma) {
+                self.parse_param_list(&mut params, &mut param_mut)?;
             }
-        }
+            (by_ref, by_mut)
+        } else {
+            if self.peek() != Some(&Tok::RParen) {
+                self.parse_param_list(&mut params, &mut param_mut)?;
+            }
+            (false, false)
+        };
         self.expect(Tok::RParen)?;
         let ret = if self.eat(&Tok::Arrow) { self.parse_type()? } else { Type::Unit };
         let body = self.parse_block()?;
         Ok(FnDef {
             name: format!("{ty}${name}"),
             self_ty: Some(ty.to_string()),
-            takes_self: true,
+            takes_self,
             ref_self: by_ref,
             ref_self_mut: by_mut,
             params,
@@ -428,6 +480,27 @@ impl Parser {
             ret_slot: -1,
             nslots: 0,
         })
+    }
+
+    /// Parse `p: T, q: T, ..` up to (not including) the closing `)`. The caller
+    /// has already consumed the comma that follows the previous parameter.
+    fn parse_param_list(
+        &mut self,
+        params: &mut Vec<(String, Type)>,
+        param_mut: &mut Vec<bool>,
+    ) -> PResult<()> {
+        while self.peek() != Some(&Tok::RParen) {
+            let pm = self.eat(&Tok::Mut);
+            let pname = self.expect_ident()?;
+            self.expect(Tok::Colon)?;
+            let pty = self.parse_type()?;
+            params.push((pname, pty));
+            param_mut.push(pm);
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        Ok(())
     }
 
     fn parse_type(&mut self) -> PResult<Type> {
@@ -524,6 +597,16 @@ impl Parser {
             if self.peek().is_none() {
                 return Err(format!("at byte {}: unexpected end of input, expected `}}`", self.pos()));
             }
+            // `'a: while ..` / `'a: for ..` are statements; `'a: loop ..` is an
+            // expression and flows through the tail-expression path below.
+            if let Some(Tok::Label(_)) = self.peek() {
+                if self.peek2() == Some(&Tok::Colon)
+                    && self.toks.get(self.i + 2).map(|t| &t.tok) != Some(&Tok::Loop)
+                {
+                    stmts.push(self.parse_stmt()?);
+                    continue;
+                }
+            }
             // tail expression: an expression not followed by `;`
             if self.starts_expr() {
                 let e = self.parse_expr()?;
@@ -549,7 +632,14 @@ impl Parser {
                     break;
                 }
                 if is_block_like(&e) {
-                    // `if`/block expressions are valid statements without a `;`
+                    // `if`/block/`loop` expressions are valid statements without
+                    // a `;`. A `loop` here is a statement, so a value it yields
+                    // (via `break value`) is discarded: wrap it so it is typed
+                    // as `()`, not as its break type.
+                    let e = match e {
+                        Expr::Loop(b, _, ty, label) => Expr::Loop(b, -2, ty, label),
+                        other => other,
+                    };
                     stmts.push(Stmt::Expr(e));
                     continue;
                 }
@@ -562,6 +652,192 @@ impl Parser {
         }
         self.expect(Tok::RBrace)?;
         Ok(Block { stmts, tail })
+    }
+
+    fn parse_for(&mut self) -> PResult<Stmt> {
+        self.parse_for_labeled(None)
+    }
+
+    /// A labelled loop statement, `'name: while ..` or `'name: for ..`. A
+    /// labelled `loop` is an expression, so it does not reach here.
+    fn parse_labeled_loop_stmt(&mut self, label: String) -> PResult<Stmt> {
+        match self.peek() {
+            Some(Tok::While) => {
+                self.i += 1;
+                // `'a: while let PAT = EXPR { body }`: the label would be lost
+                // in the desugar to `loop { if let .. }`, so reject it rather
+                // than silently drop the label.
+                if self.peek() == Some(&Tok::Let) {
+                    return Err(format!(
+                        "at byte {}: a label on `while let` is not supported",
+                        self.pos()
+                    ));
+                }
+                let cond = self.parse_cond()?;
+                let body = self.parse_block()?;
+                Ok(Stmt::While(cond, body, Some(label)))
+            }
+            Some(Tok::For) => {
+                self.i += 1;
+                self.parse_for_labeled(Some(label))
+            }
+            other => Err(format!(
+                "at byte {}: a label must prefix `loop`, `while` or `for`, found {}",
+                self.pos(),
+                other.map(|t| t.describe()).unwrap_or_else(|| "end of input".into())
+            )),
+        }
+    }
+
+    /// `for PAT in ITER { body }`. Two iterables are supported: an integer
+    /// range (`a..b` / `a..=b`) and an array.
+    ///
+    /// The range form keeps its own node, because `continue` must still run the
+    /// increment, so it cannot be desugared to a `while`.
+    ///
+    /// The array form desugars to that same range loop, indexing the array:
+    ///
+    /// ```text
+    /// { let arr = EXPR; for i in 0..arr.len() { let PAT = arr[i]; body } }
+    /// ```
+    ///
+    /// `EXPR` is bound to a hidden temporary so an array expression with a side
+    /// effect (a call, a literal) runs exactly once, and `arr.len()` folds to
+    /// the array's compile-time length, so the loop bound is a literal and the
+    /// loop carries no hidden slot.
+    fn parse_for_labeled(&mut self, label: Option<String>) -> PResult<Stmt> {
+        // A loop variable that names a constant shadows it (rustc E0530).
+        // `parse_pattern` would otherwise read the name as that constant's
+        // value, so the check happens here, before the pattern is parsed.
+        if let Some(Tok::Ident(n)) = self.peek() {
+            if self.consts.contains_key(n) || self.const_bools.contains_key(n) {
+                return Err(format!(
+                    "identifier `{n}` shadows a constant of the same name"
+                ));
+            }
+        }
+        let pat = self.parse_pattern()?;
+        self.expect(Tok::In)?;
+        let head = self.parse_cond()?;
+        // `for x in &arr` iterates by *reference* in Rust: `x` is `&i64`, not
+        // `i64`. rmc iterates by value, so accepting the `&` form would silently
+        // give `x` the wrong type (and diverge from rustc's typing). Reject it
+        // rather than mis-compile; the by-value form is `for x in arr`.
+        if matches!(head, Expr::AddrOf { .. }) {
+            return Err(format!(
+                "at byte {}: `for` over a reference is not supported; \
+                 iterate by value with `for x in arr`",
+                self.pos()
+            ));
+        }
+        if self.peek() == Some(&Tok::DotDot) || self.peek() == Some(&Tok::DotDotEq) {
+            let inclusive = self.eat(&Tok::DotDotEq);
+            if !inclusive {
+                self.expect(Tok::DotDot)?;
+            }
+            let end = self.parse_cond()?;
+            let body = self.parse_block()?;
+            let var = match pat {
+                Pat::Bind(n) => n,
+                Pat::Wild => {
+                    let n = format!("\u{0}fi{}", self.tmp);
+                    self.tmp += 1;
+                    n
+                }
+                _ => {
+                    return Err(format!(
+                        "at byte {}: `for` over a range needs a binding or `_`",
+                        self.pos()
+                    ))
+                }
+            };
+            return Ok(Stmt::For {
+                var,
+                var_slot: -1,
+                start: head,
+                end,
+                end_slot: -1,
+                inclusive,
+                body,
+                label,
+            });
+        }
+        let body = self.parse_block()?;
+        self.desugar_for_array(pat, head, body, label)
+    }
+
+    /// `for PAT in ARRAY { body }` -> an index loop over the array (see
+    /// `parse_for`). `PAT` must be a binding or `_`; a compound pattern is
+    /// rejected rather than mis-bound, since rmc has no destructuring `let`.
+    /// A label on the `for` is carried to the desugared loop, so `break 'a`
+    /// still targets it.
+    fn desugar_for_array(&mut self, pat: Pat, arr: Expr, body: Block, label: Option<String>) -> PResult<Stmt> {
+        let n = self.tmp;
+        self.tmp += 1;
+        let arr_name = format!("\u{0}fa{n}");
+        let idx_name = format!("\u{0}fi{n}");
+        let bind_name = match pat {
+            Pat::Bind(name) => name,
+            Pat::Wild => format!("\u{0}fd{n}"),
+            _ => {
+                return Err(format!(
+                    "at byte {}: `for` over an array needs a binding or `_`",
+                    self.pos()
+                ))
+            }
+        };
+        let arr_var =
+            Expr::Var { name: arr_name.clone(), slot: -1, ty: Type::I64 };
+        let idx_var =
+            Expr::Var { name: idx_name.clone(), slot: -1, ty: Type::I64 };
+        // `arr.len()` — a `MethodCall` sema folds to the array's constant length.
+        let len = Expr::MethodCall {
+            recv: Box::new(arr_var.clone()),
+            name: "len".to_string(),
+            args: Vec::new(),
+        };
+        let elem = Expr::Index(Box::new(arr_var), Box::new(idx_var));
+        // `let PAT = arr[i];` runs before the user body each iteration.
+        let mut stmts = vec![Stmt::Let {
+            name: bind_name,
+            ty: None,
+            init: Some(elem),
+            slot: -1,
+            mutable: false,
+        }];
+        stmts.extend(body.stmts);
+        let loop_body = Block { stmts, tail: body.tail };
+        let for_stmt = Stmt::For {
+            var: idx_name,
+            var_slot: -1,
+            start: Expr::Int(0),
+            end: len,
+            end_slot: -1,
+            inclusive: false,
+            body: loop_body,
+            label,
+        };
+        // Bind the array once, outside the loop.
+        let arr_let = Stmt::Let {
+            name: arr_name,
+            ty: None,
+            init: Some(arr),
+            slot: -1,
+            mutable: false,
+        };
+        Ok(Stmt::Expr(Expr::Block(Block { stmts: vec![arr_let, for_stmt], tail: None })))
+    }
+
+    /// Consume the `;` that ends a statement, but allow it to be omitted when
+    /// the statement is the last thing in a block (`{ return 2 }`, `{ break }`).
+    /// Rust treats `return`/`break`/`continue` as diverging, so a trailing
+    /// expression is impossible after them and the `;` is optional.
+    fn eat_semi_at_block_end(&mut self) -> PResult<()> {
+        if self.eat(&Tok::Semi) || self.peek() == Some(&Tok::RBrace) {
+            Ok(())
+        } else {
+            Err(format!("at byte {}: expected `;`", self.pos()))
+        }
     }
 
     fn starts_expr(&self) -> bool {
@@ -577,6 +853,9 @@ impl Parser {
                 | Some(Tok::Bang)
                 | Some(Tok::If)
                 | Some(Tok::Match)
+                | Some(Tok::Loop)
+                // `'a: loop { .. }` is a labelled loop expression.
+                | Some(Tok::Label(_))
                 | Some(Tok::LBracket)
                 | Some(Tok::Amp)
                 | Some(Tok::Star)
@@ -588,10 +867,61 @@ impl Parser {
     }
 
     fn parse_stmt(&mut self) -> PResult<Stmt> {
+        // A loop label may prefix `while` or `for`; a labelled `loop` is an
+        // expression and is handled by `parse_primary` (routed here or there by
+        // `parse_block_inner` depending on whether it is a tail expression).
+        if let Some(Tok::Label(n)) = self.peek().cloned() {
+            self.i += 1;
+            self.expect(Tok::Colon)?;
+            return self.parse_labeled_loop_stmt(n);
+        }
         match self.peek() {
             Some(Tok::Let) => {
                 self.i += 1;
                 let mutable = self.eat(&Tok::Mut);
+                // `let _ = e;` (and `let _: T = e;`, and bare `let _;`) binds
+                // nothing. Desugar to a block holding a hidden binding so the
+                // initializer is still evaluated once and any annotation is
+                // still type-checked, then dropped; with no initializer there is
+                // nothing to check.
+                if self.peek() == Some(&Tok::Underscore) {
+                    self.i += 1;
+                    let ty = if self.eat(&Tok::Colon) {
+                        Some(self.parse_type()?)
+                    } else {
+                        None
+                    };
+                    let init = if self.eat(&Tok::Eq) {
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
+                    self.expect(Tok::Semi)?;
+                    let stmts = match init {
+                        Some(e) => {
+                            // Bind to `_` so a type-mismatch diagnostic names the
+                            // discard, not an internal temporary. `_` cannot be
+                            // written as an ordinary binding, so it never clashes.
+                            vec![Stmt::Let {
+                                name: "_".to_string(),
+                                ty,
+                                init: Some(e),
+                                slot: -1,
+                                mutable: false,
+                            }]
+                        }
+                        // `let _;` with no annotation has no type to infer, which
+                        // rustc rejects (E0282); `let _: T;` is a no-op.
+                        None if ty.is_none() => {
+                            return Err(format!(
+                                "at byte {}: `let _;` needs a type annotation",
+                                self.pos()
+                            ))
+                        }
+                        None => Vec::new(),
+                    };
+                    return Ok(Stmt::Expr(Expr::Block(Block { stmts, tail: None })));
+                }
                 let name = self.expect_ident()?;
                 let ty = if self.eat(&Tok::Colon) {
                     Some(self.parse_type()?)
@@ -608,45 +938,54 @@ impl Parser {
             }
             Some(Tok::While) => {
                 self.i += 1;
+                // `while let PAT = EXPR { body }` re-tests `EXPR` each iteration
+                // and stops at the first value `PAT` does not match.
+                if self.peek() == Some(&Tok::Let) {
+                    self.i += 1;
+                    let pat = self.parse_pattern()?;
+                    self.expect(Tok::Eq)?;
+                    let scrutinee = self.parse_cond()?;
+                    let body = self.parse_block()?;
+                    return Ok(self.desugar_while_let(pat, scrutinee, body));
+                }
                 let cond = self.parse_cond()?;
                 let body = self.parse_block()?;
-                Ok(Stmt::While(cond, body))
-            }
-            Some(Tok::Loop) => {
-                self.i += 1;
-                let body = self.parse_block()?;
-                Ok(Stmt::Loop(body))
+                Ok(Stmt::While(cond, body, None))
             }
             Some(Tok::For) => {
                 self.i += 1;
-                let var = self.expect_ident()?;
-                self.expect(Tok::In)?;
-                let start = self.parse_cond()?;
-                self.expect(Tok::DotDot)?;
-                let end = self.parse_cond()?;
-                let body = self.parse_block()?;
-                Ok(Stmt::For { var, var_slot: -1, start, end, end_slot: -1, body })
+                self.parse_for()
             }
             Some(Tok::Return) => {
                 self.i += 1;
-                let v = if self.eat(&Tok::Semi) {
-                    None
-                } else {
-                    let e = self.parse_expr()?;
-                    self.expect(Tok::Semi)?;
-                    Some(e)
-                };
-                Ok(Stmt::Return(v))
+                // `return`, `return expr` and `return;` are all valid, and the
+                // `;` may be omitted when the `return` is the last thing in the
+                // block (`{ return 2 }`), as in Rust.
+                if self.eat(&Tok::Semi) || self.peek() == Some(&Tok::RBrace) {
+                    return Ok(Stmt::Return(None));
+                }
+                let e = self.parse_expr()?;
+                self.eat_semi_at_block_end()?;
+                Ok(Stmt::Return(Some(e)))
             }
             Some(Tok::Break) => {
                 self.i += 1;
-                self.expect(Tok::Semi)?;
-                Ok(Stmt::Break)
+                // `break`, `break 'label`, `break expr` or `break 'label expr`;
+                // the `;` may be omitted at the end of a block. A value is only
+                // legal in a `loop`, checked by sema.
+                let label = self.eat_label()?;
+                if self.eat(&Tok::Semi) || self.peek() == Some(&Tok::RBrace) {
+                    return Ok(Stmt::Break(None, label));
+                }
+                let e = self.parse_expr()?;
+                self.eat_semi_at_block_end()?;
+                Ok(Stmt::Break(Some(e), label))
             }
             Some(Tok::Continue) => {
                 self.i += 1;
-                self.expect(Tok::Semi)?;
-                Ok(Stmt::Continue)
+                let label = self.eat_label()?;
+                self.eat_semi_at_block_end()?;
+                Ok(Stmt::Continue(label))
             }
             _ => {
                 // expression statement, possibly an assignment
@@ -666,6 +1005,68 @@ impl Parser {
                 Ok(Stmt::Expr(e))
             }
         }
+    }
+
+    /// `Name { f: v, ..base }`: fill the fields not written from `base`. The
+    /// desugaring matches rustc's evaluation order — the written field values
+    /// first, left to right, then the base — and produces a fresh value that
+    /// does not alias `base`:
+    ///
+    /// ```text
+    /// { let v = <field value>; ...; let mut t = base; t.f = v; ...; t }
+    /// ```
+    ///
+    /// Every field value is bound to a temporary *before* the base runs, so its
+    /// side effects happen first. `t` and the temporaries get fresh NUL-prefixed
+    /// names, so they can never collide with a source identifier. An `i64` field
+    /// is written straight into `t` (which stays in a register when it is hot);
+    /// an aggregate field is copied into `t`'s storage from its temporary,
+    /// because `t.f = v` would otherwise store the temporary's address rather
+    /// than its words.
+    fn desugar_struct_update(
+        &mut self,
+        name: String,
+        fields: Vec<FieldInit>,
+        base: Box<Expr>,
+    ) -> Expr {
+        let tname = format!("\u{0}su{}", self.tmp);
+        self.tmp += 1;
+        let tvar = || Expr::Var { name: tname.clone(), slot: -1, ty: Type::I64 };
+
+        let mut stmts = Vec::new();
+        // Evaluate the written fields first, in source order, each into its own
+        // temporary. The type is left unresolved so sema checks the value
+        // against the field (an `i64` literal is not forced to be the struct).
+        let mut writes: Vec<(String, Type, String)> = Vec::new();
+        for fi in fields {
+            let vname = format!("\u{0}sv{}", self.tmp);
+            self.tmp += 1;
+            stmts.push(Stmt::Let {
+                name: vname.clone(),
+                ty: None,
+                init: Some(fi.value),
+                slot: -1,
+                mutable: false,
+            });
+            writes.push((vname, fi.ty, fi.name));
+        }
+
+        // Then the base, into the value the block yields.
+        stmts.push(Stmt::Let {
+            name: tname.clone(),
+            ty: Some(Type::Named(name)),
+            init: Some(*base),
+            slot: -1,
+            mutable: true,
+        });
+
+        for (vname, ty, fname) in writes {
+            let target = Expr::Field { base: Box::new(tvar()), name: fname, offset: 0, ty: Type::I64 };
+            let value = Expr::Var { name: vname, slot: -1, ty };
+            stmts.push(Stmt::Assign { target, value });
+        }
+
+        Expr::Block(Block { stmts, tail: Some(Box::new(tvar())) })
     }
 
     /// Desugar `target op= value` into a block that reads the target once,
@@ -907,7 +1308,7 @@ impl Parser {
     }
 
     fn parse_mul(&mut self) -> PResult<Expr> {
-        let mut lhs = self.parse_unary()?;
+        let mut lhs = self.parse_cast()?;
         loop {
             let op = match self.peek() {
                 Some(Tok::Star) => BinOp::Mul,
@@ -916,11 +1317,26 @@ impl Parser {
                 _ => break,
             };
             self.i += 1;
-            let rhs = self.parse_unary()?;
+            let rhs = self.parse_cast()?;
             self.bump_depth()?;
             lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs));
         }
         Ok(lhs)
+    }
+
+    /// `e as T`. `as` binds looser than every unary operator, so `*r as i64`
+    /// is `(*r) as i64` and `-x as i64` is `(-x) as i64`, as in Rust; it binds
+    /// tighter than `* / %`. Rust places `as` in the binary precedence chain
+    /// just above `*`, which is where this level sits. The right-hand side is a
+    /// type, not an expression, so there is no operand recursion.
+    fn parse_cast(&mut self) -> PResult<Expr> {
+        let mut e = self.parse_unary()?;
+        while self.eat(&Tok::As) {
+            self.bump_depth()?;
+            let ty = self.parse_type()?;
+            e = Expr::Cast(Box::new(e), ty);
+        }
+        Ok(e)
     }
 
     fn parse_unary(&mut self) -> PResult<Expr> {
@@ -992,9 +1408,6 @@ impl Parser {
                 } else {
                     e = Expr::Field { base: Box::new(e), name, offset: 0, ty: Type::I64 };
                 }
-            } else if self.eat(&Tok::As) {
-                let ty = self.parse_type()?;
-                e = Expr::Cast(Box::new(e), ty);
             } else {
                 break;
             }
@@ -1005,27 +1418,58 @@ impl Parser {
     /// One pattern: an integer, `true`/`false`, `Enum::Variant`, `Enum::Variant(a, b)`,
     /// a bare binding name, or `_`. Shared by `match` arms and `if let`.
     fn parse_pattern(&mut self) -> PResult<Pat> {
+        let first = self.parse_pattern_primary()?;
+        if self.peek() != Some(&Tok::Pipe) {
+            return Ok(first);
+        }
+        let mut alts = vec![first];
+        while self.eat(&Tok::Pipe) {
+            alts.push(self.parse_pattern_primary()?);
+        }
+        // A binding must bind the same names in every alternative (rustc's
+        // E0408); rmc has no name-consistency check, so it rejects a binding in
+        // an or-pattern outright rather than mis-bind it.
+        if let Some(Pat::Bind(n)) = alts.iter().find(|a| matches!(a, Pat::Bind(_))) {
+            return Err(format!(
+                "at byte {}: variable `{n}` is not bound in all patterns of the or-pattern",
+                self.pos()
+            ));
+        }
+        Ok(Pat::Or(alts))
+    }
+
+    /// An integer pattern literal: `123` or `-123`. The magnitude `2^63` is in
+    /// range only directly under a `-`, where it is `i64::MIN`; standing alone
+    /// it is out of range, as in rustc. Shared by a plain integer pattern and
+    /// both bounds of a range pattern.
+    fn parse_signed_pat_int(&mut self) -> PResult<i64> {
+        let neg = self.eat(&Tok::Minus);
+        match self.bump() {
+            Tok::Int(v) if neg => Ok(v.checked_neg().ok_or_else(|| {
+                format!("at byte {}: pattern literal out of range", self.pos())
+            })?),
+            Tok::Int(v) => Ok(v),
+            Tok::IntMinMagnitude if neg => Ok(i64::MIN),
+            Tok::IntMinMagnitude => Err(format!(
+                "at byte {}: integer literal `9223372036854775808` is out of range for `i64`",
+                self.pos()
+            )),
+            other => Err(format!(
+                "at byte {}: expected an integer in a pattern, found {}",
+                self.pos(), other.describe()
+            )),
+        }
+    }
+
+    fn parse_pattern_primary(&mut self) -> PResult<Pat> {
         match self.peek().cloned() {
             Some(Tok::Underscore) => {
                 self.i += 1;
                 Ok(Pat::Wild)
             }
-            Some(Tok::Minus) => {
-                self.i += 1;
-                match self.bump() {
-                    Tok::Int(v) => Ok(Pat::Int(v.checked_neg().ok_or_else(|| {
-                        format!("at byte {}: pattern literal out of range", self.pos())
-                    })?)),
-                    Tok::IntMinMagnitude => Ok(Pat::Int(i64::MIN)),
-                    other => Err(format!(
-                        "at byte {}: expected an integer after `-` in a pattern, found {}",
-                        self.pos(), other.describe()
-                    )),
-                }
-            }
-            Some(Tok::Int(v)) => {
-                self.i += 1;
-                Ok(Pat::Int(v))
+            Some(Tok::Minus) | Some(Tok::Int(_)) => {
+                let lo = self.parse_signed_pat_int()?;
+                self.maybe_range(lo)
             }
             Some(Tok::True) => {
                 self.i += 1;
@@ -1034,6 +1478,11 @@ impl Parser {
             Some(Tok::False) => {
                 self.i += 1;
                 Ok(Pat::Bool(false))
+            }
+            // A string literal pattern, matched by content.
+            Some(Tok::Str(s)) => {
+                self.i += 1;
+                Ok(Pat::Str(s))
             }
             // `Enum::Variant`, `Enum::Variant(a, b)`, a constant, or a binding.
             Some(Tok::Ident(n)) => {
@@ -1066,7 +1515,7 @@ impl Parser {
                 }
             }
             other => Err(format!(
-                "at byte {}: expected an integer, `true`/`false`, `Enum::Variant` or `_` pattern, found {}",
+                "at byte {}: expected an integer, `true`/`false`, a string literal, `Enum::Variant` or `_` pattern, found {}",
                 self.pos(),
                 other.map(|t| t.describe()).unwrap_or_else(|| "end of input".into())
             )),
@@ -1083,15 +1532,22 @@ impl Parser {
         self.expect(Tok::Match)?;
         let scrutinee = self.parse_cond()?;
         self.expect(Tok::LBrace)?;
-        let mut arms: Vec<(Pat, Expr)> = Vec::new();
+        let mut arms: Vec<(Pat, Option<Expr>, Expr)> = Vec::new();
         while self.peek() != Some(&Tok::RBrace) {
             if self.peek().is_none() {
                 return Err(format!("at byte {}: unexpected end of input in `match`", self.pos()));
             }
             let pat = self.parse_pattern()?;
+            // An optional guard: `pat if cond => body`. The condition is parsed
+            // like an `if` condition, so a struct literal needs parentheses.
+            let guard = if self.eat(&Tok::If) {
+                Some(self.parse_cond()?)
+            } else {
+                None
+            };
             self.expect(Tok::FatArrow)?;
-            let body = self.parse_expr()?;
-            arms.push((pat, body));
+            let body = self.parse_arm_body()?;
+            arms.push((pat, guard, body));
             // A comma separates arms, but a block-bodied arm may omit it, so
             // only `}` ends the list early.
             if self.eat(&Tok::Comma) {
@@ -1108,11 +1564,98 @@ impl Parser {
         Ok(self.desugar_match(scrutinee, arms))
     }
 
+    /// Parse a `match` arm body. As in Rust, an arm body is an expression, but a
+    /// statement is also accepted: a bare assignment (`1 => x = 1`), or a
+    /// `return`/`break`/`continue`. rmc parses those only as statements, so
+    /// `parse_expr` would stop at the `=` or reject the keyword outright.
+    /// Accepting them here keeps an arm body from having to be wrapped in a
+    /// block. `if let`/`while let` bodies are blocks, so they do not reach this.
+    fn parse_arm_body(&mut self) -> PResult<Expr> {
+        // A terminator is a statement, not an expression: build the block and
+        // leave the arm's `,`/`}` for the caller. The value, if any, is an
+        // expression that stops before that terminator.
+        let stmt = match self.peek() {
+            Some(Tok::Return) => {
+                self.i += 1;
+                Stmt::Return(self.arm_terminator_value()?)
+            }
+            Some(Tok::Break) => {
+                self.i += 1;
+                let label = self.eat_label()?;
+                Stmt::Break(self.arm_terminator_value()?, label)
+            }
+            Some(Tok::Continue) => {
+                self.i += 1;
+                let label = self.eat_label()?;
+                Stmt::Continue(label)
+            }
+            _ => {
+                let target = self.parse_expr()?;
+                if self.eat(&Tok::Eq) {
+                    Stmt::Assign { target, value: self.parse_expr()? }
+                } else if let Some(op) = self.peek_compound_op() {
+                    self.i += 1;
+                    let value = self.parse_expr()?;
+                    self.desugar_compound(&target, op, value)
+                } else {
+                    return Ok(target);
+                }
+            }
+        };
+        Ok(Expr::Block(Block { stmts: vec![stmt], tail: None }))
+    }
+
+    /// The optional value of a `return`/`break` arm body: absent when the arm
+    /// ends right there (`,` or `}`), otherwise the following expression.
+    fn arm_terminator_value(&mut self) -> PResult<Option<Expr>> {
+        if self.peek() == Some(&Tok::Comma) || self.peek() == Some(&Tok::RBrace) {
+            Ok(None)
+        } else {
+            Ok(Some(self.parse_expr()?))
+        }
+    }
+
+    /// If a `..`/`..=` follows the integer just parsed, consume it and the
+    /// upper bound to build a range pattern; otherwise the integer stands
+    /// alone. Both bounds are `i64`, so `1..=5` and `-3..0` both work.
+    fn maybe_range(&mut self, lo: i64) -> PResult<Pat> {
+        let inclusive = match self.peek() {
+            Some(Tok::DotDot) => false,
+            Some(Tok::DotDotEq) => true,
+            _ => return Ok(Pat::Int(lo)),
+        };
+        self.i += 1;
+        let hi = self.parse_signed_pat_int()?;
+        if !inclusive && lo >= hi {
+            return Err(format!(
+                "at byte {}: empty range pattern `{}..{}`",
+                self.pos(), lo, hi
+            ));
+        }
+        if inclusive && lo > hi {
+            return Err(format!(
+                "at byte {}: empty range pattern `{}..={}`",
+                self.pos(), lo, hi
+            ));
+        }
+        Ok(Pat::Range(lo, hi, inclusive))
+    }
+
+    /// Whether a pattern matches every value: `_`, a binding, or an
+    /// or-pattern with such an alternative.
+    fn pat_irrefutable(p: &Pat) -> bool {
+        match p {
+            Pat::Wild | Pat::Bind(_) => true,
+            Pat::Or(alts) => alts.iter().any(Self::pat_irrefutable),
+            _ => false,
+        }
+    }
+
     /// Fold the arms into nested `if`s. The scrutinee is named once; an arm
     /// with `_` becomes the `else` (so any arm after it is unreachable, as in
     /// Rust). With no `_`, the chain has no final `else`, so a non-matching
     /// value yields `()`.
-    fn desugar_match(&mut self, scrutinee: Expr, arms: Vec<(Pat, Expr)>) -> Expr {
+    fn desugar_match(&mut self, scrutinee: Expr, arms: Vec<(Pat, Option<Expr>, Expr)>) -> Expr {
         self.desugar_match_arms(scrutinee, arms, false)
     }
 
@@ -1123,27 +1666,40 @@ impl Parser {
     fn desugar_match_arms(
         &mut self,
         scrutinee: Expr,
-        arms: Vec<(Pat, Expr)>,
+        arms: Vec<(Pat, Option<Expr>, Expr)>,
         check_dead_arms: bool,
     ) -> Expr {
-        // A `_` or binding arm makes the match exhaustive in every position.
-        let has_catch_all = arms.iter().any(|(p, _)| matches!(p, Pat::Wild | Pat::Bind(_)));
+        // A `_` or binding arm makes the match exhaustive in every position;
+        // an or-pattern is irrefutable when any alternative is (`1 | _`). A
+        // *guarded* irrefutable arm is not a catch-all: `_ if c` can fail, so
+        // the arms after it are still reachable.
+        let has_catch_all = arms.iter().any(|(p, g, _)| g.is_none() && Self::pat_irrefutable(p));
+        // Snapshot the scrutinee into a temporary before the arm chain whenever
+        // it names a value that can change. A guard may assign the matched
+        // variable (`match x { n if { x = 2; true } => n }`); the pattern
+        // bindings and the body must keep the value captured when the arm
+        // matched, so the guard and the body both read this snapshot rather than
+        // a binding re-created after the guard ran. Without a guard nothing runs
+        // between an arm's test and its body, so a plain variable stays inline. A
+        // non-variable scrutinee is always evaluated once, matching Rust.
+        let has_guard = arms.iter().any(|(_, g, _)| g.is_some());
         let (subj, prelude) = match scrutinee {
-            Expr::Var { .. } | Expr::Int(_) | Expr::EnumVariant { .. } => (scrutinee, None),
+            Expr::Int(_) | Expr::EnumVariant { .. } => (scrutinee, None),
+            Expr::Var { .. } if !has_guard => (scrutinee, None),
             other => {
                 let name = format!("\u{0}mt{}", self.tmp);
                 self.tmp += 1;
                 (
                     Expr::Var { name: name.clone(), slot: -1, ty: Type::I64 },
                     // No annotation: the temp takes the scrutinee's type, which
-                    // may be an enum rather than an integer.
+                    // may be an enum or a bool rather than an integer.
                     Some(Stmt::Let { name, ty: None, init: Some(other), slot: -1, mutable: false }),
                 )
             }
         };
         let mut acc: Option<Expr> = None;
-        for (pat, body) in arms.into_iter().rev() {
-            acc = Some(Self::desugar_arm(pat, &subj, body, acc, check_dead_arms));
+        for (pat, guard, body) in arms.into_iter().rev() {
+            acc = Some(Self::desugar_arm(pat, guard, &subj, body, acc, check_dead_arms));
         }
         let acc = acc.expect("a `match` has at least one arm");
         let acc = Expr::MatchBoundary(
@@ -1167,46 +1723,151 @@ impl Parser {
             Some(b) => Expr::Block(b),
             None => Expr::Block(Block { stmts: Vec::new(), tail: None }),
         };
-        let arms = vec![(pat, Expr::Block(then)), (Pat::Wild, fallback)];
+        let arms = vec![(pat, None, Expr::Block(then)), (Pat::Wild, None, fallback)];
         self.desugar_match_arms(scrutinee, arms, true)
+    }
+
+    /// `while let PAT = EXPR { body }` re-tests `EXPR` each iteration and stops
+    /// at the first value `PAT` does not match. It is exactly an `if let` whose
+    /// `else` breaks out of an enclosing `loop`:
+    ///
+    /// ```text
+    /// loop { if let PAT = EXPR { body } else { break; } }
+    /// ```
+    ///
+    /// so it desugars to those two existing statements and sema and codegen
+    /// need no new case. `EXPR` sits inside the loop, so it is re-evaluated
+    /// every iteration (as in Rust); the `if let` binds its non-`Var` scrutinee
+    /// to a fresh temporary each time.
+    fn desugar_while_let(&mut self, pat: Pat, scrutinee: Expr, body: Block) -> Stmt {
+        let break_else = Block {
+            stmts: vec![Stmt::Break(None, None)],
+            tail: None,
+        };
+        // The `if let` is a *statement* in the loop body, so its value is
+        // discarded and the loop body is unit even when `body` yields a value.
+        let test = self.desugar_if_let(pat, scrutinee, body, Some(break_else));
+        let loop_body = Block { stmts: vec![Stmt::Expr(test)], tail: None };
+        // The loop is unit-valued: the `else` arm always contains a plain
+        // `break;`, so a `break value` in the body is rejected as a type
+        // mismatch (rustc E0571 rejects it too).
+        Stmt::Expr(Expr::Loop(loop_body, -1, Type::Unit, None))
     }
 
     /// One arm of a desugared `match` or `if let`: the pattern test, the
     /// bindings it introduces, and the fallback `rest` for a non-match.
-    fn desugar_arm(pat: Pat, subj: &Expr, body: Expr, rest: Option<Expr>, check_dead: bool) -> Expr {
+    /// The boolean test for one alternative of an or-pattern. Only a test, not
+    /// an arm: the shared body and fallback stay outside, so an or-pattern does
+    /// not duplicate the body. A binding or `_` alternative is always true, but
+    /// rmc does not support bindings in an or-pattern, so `_` is the only
+    /// irrefutable alternative here.
+    fn or_cond(pat: &Pat, subj: &Expr) -> Expr {
         match pat {
-            // A wildcard ends the chain, so its body is wrapped in a block
-            // (like a binding arm's) to mark it as a body rather than another
-            // chain step. Without the block, `match_never_typed` would read a
-            // body that is itself an `if` as the next arm's test and misjudge
-            // whether the match is `!`.
-            Pat::Wild => Expr::Block(Block {
-                stmts: Vec::new(),
-                tail: Some(Box::new(Self::irrefutable_arm(body, rest, check_dead))),
-            }),
+            Pat::Int(k) => Expr::Bin(BinOp::Eq, Box::new(subj.clone()), Box::new(Expr::Int(*k))),
+            Pat::Bool(b) => Expr::BoolTest { scrutinee: Box::new(subj.clone()), value: *b },
+            // A string pattern tests by content: `Bin(Eq, ..)` over a `str`,
+            // which sema lowers to the byte-wise helper. A pointer compare
+            // would never match two distinct-but-equal literals.
+            Pat::Str(s) => Expr::Bin(
+                BinOp::Eq,
+                Box::new(subj.clone()),
+                Box::new(Expr::Str(s.clone())),
+            ),
+            Pat::Range(lo, hi, inclusive) => {
+                let lower = Expr::Bin(BinOp::Le, Box::new(Expr::Int(*lo)), Box::new(subj.clone()));
+                let upper = Expr::Bin(
+                    if *inclusive { BinOp::Le } else { BinOp::Lt },
+                    Box::new(subj.clone()),
+                    Box::new(Expr::Int(*hi)),
+                );
+                Expr::Bin(BinOp::And, Box::new(lower), Box::new(upper))
+            }
+            Pat::Variant(enum_name, variant, _) => Expr::VariantTest {
+                scrutinee: Box::new(subj.clone()),
+                enum_name: enum_name.clone(),
+                variant: variant.clone(),
+                tag: -1,
+                n_binds: -1,
+            },
+            // `_` in an or-pattern: always true, so the whole condition is true.
+            Pat::Wild => Expr::Bool(true),
+            // A binding inside an or-pattern is rejected before this point.
+            Pat::Bind(_) | Pat::Or(_) => unreachable!("or-pattern alternative"),
+        }
+    }
+
+    fn desugar_arm(
+        pat: Pat,
+        guard: Option<Expr>,
+        subj: &Expr,
+        body: Expr,
+        rest: Option<Expr>,
+        check_dead: bool,
+    ) -> Expr {
+        // Each pattern yields its test (`None` when it is irrefutable) and any
+        // bindings it introduces. The test is an ordinary expression, so sema
+        // and codegen need no new case for a guard: it is folded in with `&&`,
+        // and an irrefutable arm's guard becomes the whole `if` condition.
+        let (bindings, test): (Vec<Stmt>, Option<Expr>) = match pat {
+            Pat::Wild => (Vec::new(), None),
             // `name => body` binds the whole scrutinee.
-            Pat::Bind(name) => Expr::Block(Block {
-                stmts: vec![Stmt::Let {
+            Pat::Bind(name) => (
+                vec![Stmt::Let {
                     name,
                     ty: None,
                     init: Some(subj.clone()),
                     slot: -1,
                     mutable: false,
                 }],
-                tail: Some(Box::new(Self::irrefutable_arm(body, rest, check_dead))),
-            }),
-            Pat::Int(k) => {
-                let cond = Expr::Bin(BinOp::Eq, Box::new(subj.clone()), Box::new(Expr::Int(k)));
-                Self::match_arm(cond, body, rest)
+                None,
+            ),
+            Pat::Int(k) => (
+                Vec::new(),
+                Some(Expr::Bin(BinOp::Eq, Box::new(subj.clone()), Box::new(Expr::Int(k)))),
+            ),
+            // A string literal pattern: a content compare, which sema lowers to
+            // the byte-wise helper (a pointer compare would never match).
+            Pat::Str(s) => (
+                Vec::new(),
+                Some(Expr::Bin(BinOp::Eq, Box::new(subj.clone()), Box::new(Expr::Str(s)))),
+            ),
+            // `lo..hi` is `lo <= s && s < hi`; `lo..=hi` uses `<=` on both
+            // sides. A plain `Bin(And, ..)` of comparisons, so sema and codegen
+            // need no new case.
+            Pat::Range(lo, hi, inclusive) => {
+                let lower =
+                    Expr::Bin(BinOp::Le, Box::new(Expr::Int(lo)), Box::new(subj.clone()));
+                let upper = Expr::Bin(
+                    if inclusive { BinOp::Le } else { BinOp::Lt },
+                    Box::new(subj.clone()),
+                    Box::new(Expr::Int(hi)),
+                );
+                (Vec::new(), Some(Expr::Bin(BinOp::And, Box::new(lower), Box::new(upper))))
+            }
+            // `a | b | c => body` runs `body` when any alternative matches, so
+            // fold the alternatives into `cond_a || cond_b || cond_c`. `or_cond`
+            // builds just the test; the body is not duplicated.
+            Pat::Or(alts) => {
+                // An or-pattern with a `_` alternative matches every value, so
+                // the arm is irrefutable.
+                if alts.iter().any(|a| matches!(a, Pat::Wild)) {
+                    (Vec::new(), None)
+                } else {
+                    let mut cond = Self::or_cond(&alts[0], subj);
+                    for alt in &alts[1..] {
+                        cond = Expr::Bin(BinOp::Or, Box::new(cond), Box::new(Self::or_cond(alt, subj)));
+                    }
+                    (Vec::new(), Some(cond))
+                }
             }
             // `true`/`false` become a `BoolTest`, not a `Bin(Eq, ..)`, so a
             // chain of them can be recognised as an exhaustive bool match.
-            Pat::Bool(b) => {
-                let cond = Expr::BoolTest { scrutinee: Box::new(subj.clone()), value: b };
-                Self::match_arm(cond, body, rest)
-            }
-            Pat::Variant(enum_name, variant, bindings) => {
-                let n_binds = match &bindings {
+            Pat::Bool(b) => (
+                Vec::new(),
+                Some(Expr::BoolTest { scrutinee: Box::new(subj.clone()), value: b }),
+            ),
+            Pat::Variant(enum_name, variant, payload) => {
+                let n_binds = match &payload {
                     Some(names) => names.len() as i32,
                     None => -1,
                 };
@@ -1218,32 +1879,67 @@ impl Parser {
                     n_binds,
                 };
                 // `Enum::V(w, x)` binds each payload field in the arm body.
-                let body = match bindings {
-                    Some(names) if !names.is_empty() => {
-                        let stmts = names
-                            .into_iter()
-                            .enumerate()
-                            .map(|(idx, name)| Stmt::Let {
-                                name,
-                                ty: None,
-                                mutable: false,
-                                init: Some(Expr::EnumPayload {
-                                    recv: Box::new(subj.clone()),
-                                    enum_name: enum_name.clone(),
-                                    variant: variant.clone(),
-                                    idx,
-                                    offset: 0,
-                                    ty: Type::Unit,
-                                }),
-                                slot: -1,
-                            })
-                            .collect();
-                        Expr::Block(Block { stmts, tail: Some(Box::new(body)) })
-                    }
-                    _ => body,
+                let binds = match payload {
+                    Some(names) => names
+                        .into_iter()
+                        .enumerate()
+                        .map(|(idx, name)| Stmt::Let {
+                            name,
+                            ty: None,
+                            mutable: false,
+                            init: Some(Expr::EnumPayload {
+                                recv: Box::new(subj.clone()),
+                                enum_name: enum_name.clone(),
+                                variant: variant.clone(),
+                                idx,
+                                offset: 0,
+                                ty: Type::Unit,
+                            }),
+                            slot: -1,
+                        })
+                        .collect(),
+                    None => Vec::new(),
                 };
-                Self::match_arm(cond, body, rest)
+                (binds, Some(cond))
             }
+        };
+        // The pattern's bindings belong to the guard and to the arm body, but
+        // NOT to the fallback `rest`: a later arm must not see this arm's names
+        // (`match x { n if false => n, _ => n }` must let the `_` arm read the
+        // outer `n`). So the bindings wrap the guard expression and the `then`
+        // block, never the whole `if`.
+        let with_bindings = |e: Expr| -> Expr {
+            if bindings.is_empty() {
+                e
+            } else {
+                Expr::Block(Block { stmts: bindings.clone(), tail: Some(Box::new(e)) })
+            }
+        };
+        let then = with_bindings(body);
+        match test {
+            Some(cond) => {
+                // `pat if g => body` is `pat => body` only when `g` holds, so
+                // the guard joins the pattern test with `&&` and a failed guard
+                // falls through to `rest`.
+                let cond = match guard {
+                    Some(g) => Expr::Bin(BinOp::And, Box::new(cond), Box::new(with_bindings(g))),
+                    None => cond,
+                };
+                Self::match_arm(cond, then, rest)
+            }
+            // An irrefutable arm: without a guard it always matches (and `rest`
+            // is dead); with one it is `if g { body } else { rest }`. The guard
+            // is paired with a literal `true` pattern test so the
+            // exhaustiveness walk can tell a guarded binding arm (covers
+            // nothing) from an unguarded one (covers everything).
+            None => match guard {
+                None => Self::irrefutable_arm(then, rest, check_dead),
+                Some(g) => Self::match_arm(
+                    Expr::Bin(BinOp::And, Box::new(Expr::Bool(true)), Box::new(with_bindings(g))),
+                    then,
+                    rest,
+                ),
+            },
         }
     }
 
@@ -1351,19 +2047,54 @@ impl Parser {
                     return Ok(Expr::EnumVariant { enum_name: name, variant, tag: -1 });
                 }
                 if self.peek() == Some(&Tok::LBrace) && !self.no_struct_lit {
-                    // struct literal `Name { field: value, ... }`
+                    // struct literal `Name { field: value, ... }`, optionally
+                    // ending in a struct update base `..expr`.
                     self.i += 1;
                     let mut fields = Vec::new();
+                    let mut base: Option<Box<Expr>> = None;
                     while self.peek() != Some(&Tok::RBrace) {
+                        if self.eat(&Tok::DotDot) {
+                            // `..expr` fills the fields not written above. It is
+                            // the last thing before `}`, so the base parses
+                            // greedily; rustc allows any expression here,
+                            // including another struct literal.
+                            let b = self.parse_expr()?;
+                            base = Some(Box::new(b));
+                            // No comma may follow the base: it must be the last
+                            // thing before `}` (rustc E0747-style error).
+                            break;
+                        }
                         let fname = self.expect_ident()?;
-                        self.expect(Tok::Colon)?;
-                        let fval = self.parse_expr()?;
+                        // Field init shorthand: `P { x, y }` means `P { x: x, y: y }`,
+                        // so a bare name (no `:`) reuses the local of that name.
+                        let fval = if self.peek() == Some(&Tok::Colon) {
+                            self.i += 1;
+                            self.parse_expr()?
+                        } else {
+                            Expr::Var { name: fname.clone(), slot: -1, ty: Type::I64 }
+                        };
                         fields.push(FieldInit { name: fname, offset: 0, ty: Type::I64, value: fval });
                         if !self.eat(&Tok::Comma) {
                             break;
                         }
                     }
                     self.expect(Tok::RBrace)?;
+                    if let Some(base) = base {
+                        // A field written twice is an error (rustc: "field `x`
+                        // specified more than once"). The plain literal path
+                        // catches this in sema; the update path desugars to
+                        // assignments, so it must check here.
+                        for (i, f) in fields.iter().enumerate() {
+                            if fields[..i].iter().any(|g| g.name == f.name) {
+                                return Err(format!(
+                                    "at byte {}: field `{}` specified more than once",
+                                    self.pos(),
+                                    f.name
+                                ));
+                            }
+                        }
+                        return Ok(self.desugar_struct_update(name, fields, base));
+                    }
                     return Ok(Expr::StructLit { name, fields, slot: -1 });
                 }
                 if self.eat(&Tok::LParen) {
@@ -1438,6 +2169,33 @@ impl Parser {
                 Ok(Expr::If(Box::new(cond), then, els))
             }
             Some(Tok::Match) => self.parse_match(),
+            Some(Tok::Loop) => {
+                self.i += 1;
+                // `loop` is always parsed as `Expr::Loop`; a `loop` in statement
+                // position is wrapped in `Stmt::Expr` by `parse_block`, which
+                // rewrites its result slot to `-2` so a `break value` is
+                // discarded and the statement is typed as `()`.
+                let body = self.parse_block()?;
+                Ok(Expr::Loop(body, -1, Type::Unit, None))
+            }
+            // `'a: loop { .. }`. A label only labels a loop; `'a: while`/`'a: for`
+            // are statements and never reach here.
+            Some(Tok::Label(name)) => {
+                self.i += 1;
+                self.expect(Tok::Colon)?;
+                match self.peek() {
+                    Some(Tok::Loop) => {
+                        self.i += 1;
+                        let body = self.parse_block()?;
+                        Ok(Expr::Loop(body, -1, Type::Unit, Some(name)))
+                    }
+                    other => Err(format!(
+                        "at byte {}: expected `loop` after the label `'{name}`, found {}",
+                        self.pos(),
+                        other.map(|t| t.describe()).unwrap_or_else(|| "end of input".into())
+                    )),
+                }
+            }
             Some(Tok::LBrace) => Ok(Expr::Block(self.parse_block()?)),
             Some(Tok::LBracket) => {
                 self.i += 1;
@@ -1487,8 +2245,16 @@ impl Parser {
 enum Pat {
     Wild,
     Int(i64),
+    /// `lo..hi` / `lo..=hi`, inclusive flag set for `..=`.
+    Range(i64, i64, bool),
+    /// `a | b | c`, alternatives tried left to right.
+    Or(Vec<Pat>),
     /// `true` or `false`.
     Bool(bool),
+    /// A string literal, matched by content. A `str` is a pointer to its
+    /// record, so the test is a content comparison (sema lowers it to the
+    /// byte-wise helper), never a pointer compare.
+    Str(String),
     /// `Enum::Variant` or `Enum::Variant(..)`. The constructor is resolved by
     /// sema; the optional bindings name the payload fields, in field order.
     Variant(String, String, Option<Vec<String>>),
@@ -1527,11 +2293,11 @@ fn stmt_has_call_p(s: &Stmt) -> bool {
         Stmt::Assign { target, value } => expr_has_call(target) || expr_has_call(value),
         Stmt::Expr(e) => expr_has_call(e),
         Stmt::Return(v) => v.as_ref().map_or(false, expr_has_call),
-        Stmt::While(c, b) => expr_has_call(c) || block_has_call_p(b),
-        Stmt::Loop(b) => block_has_call_p(b),
+        Stmt::While(c, b, _) => expr_has_call(c) || block_has_call_p(b),
         Stmt::For { start, end, body, .. } => {
             expr_has_call(start) || expr_has_call(end) || block_has_call_p(body)
         }
-        Stmt::Break | Stmt::Continue => false,
+        Stmt::Break(v, _) => v.as_ref().map_or(false, expr_has_call),
+        Stmt::Continue(_) => false,
     }
 }

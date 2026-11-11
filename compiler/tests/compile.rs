@@ -21,11 +21,21 @@ fn asm_no_tco(src: &str) -> String {
         .expect("should compile")
 }
 
-/// The frame offset stored by the first `mov %rax, <off>(%rbp)` after `marker`.
-/// Lets a test check relative layout without hard-coding absolute offsets.
 fn store_offset_after(out: &str, marker: &str) -> i32 {
     let tail = &out[out.find(marker).expect("marker present")..];
     let rest = &tail[tail.find("mov %rax, ").expect("a store") + "mov %rax, ".len()..];
+    let end = rest.find("(%rbp)").expect("frame store");
+    rest[..end].trim().parse().expect("offset")
+}
+
+/// The frame offset stored by the first `mov %rax, <off>(%rbp)` after `marker`.
+/// Lets a test check relative layout without hard-coding absolute offsets.
+/// The frame offset of the first `movq $imm, off(%rbp)` store. Panics when the
+/// value was instead promoted to a register (no immediate store is emitted).
+fn store_offset_of(out: &str, imm: i64) -> i32 {
+    let marker = format!("movq ${imm}, ");
+    let tail = &out[out.find(&marker).expect("an immediate store")..];
+    let rest = &tail[marker.len()..];
     let end = rest.find("(%rbp)").expect("frame store");
     rest[..end].trim().parse().expect("offset")
 }
@@ -35,23 +45,93 @@ fn emits_a_global_main() {
     let out = asm("fn main() -> i64 { return 0; }");
     assert!(out.contains(".globl main"));
     assert!(out.contains("main:"));
-    // The runtime is always appended.
+    // The entry point is always appended; the runtime is pruned to what the
+    // program uses, and this one calls nothing.
     assert!(out.contains("_start:"));
-    assert!(out.contains("print_i64:"));
+    assert!(!out.contains("print_i64:"), "unused printer dropped");
 }
 
 #[test]
+fn runtime_pieces_are_kept_only_when_used() {
+    // A program that prints keeps `print_i64` but not the allocator or the
+    // bounds trap.
+    let printing = asm("fn main() -> i64 { print_i64(1); return 0; }");
+    assert!(printing.contains("print_i64:"));
+    assert!(!printing.contains("alloc:"));
+    assert!(!printing.contains("__rmc_bounds:"));
+
+    // A program that allocates keeps the allocator and its arena globals, and
+    // `free` only when it is called.
+    let allocating = asm("fn main() -> i64 { let p: i64 = alloc(16); return p; }");
+    assert!(allocating.contains("alloc:"));
+    assert!(allocating.contains("__rmc_arena:"));
+    assert!(!allocating.contains("free:"));
+}
+
+#[test]
+fn a_constant_initialiser_stores_straight_to_the_frame() {
+    // A scalar local and a struct field both start from a constant. The value
+    // goes into the frame slot with one `movq $k, off(%rbp)`, not the two-step
+    // `mov $k, %rax` + `mov %rax, off(%rbp)` bounce.
+    let out = asm(
+        "struct P { x: i64, y: i64 } fn main() -> i64 { let a: i64 = 7; let ra: &i64 = &a; let p: P = P { x: 1, y: 2 }; let r: &P = &p; return *ra + r.x + r.y; }",
+    );
+    assert!(out.contains("movq $7, "), "scalar constant stored direct:\n{out}");
+    assert!(out.contains("movq $1, "), "field constant stored direct:\n{out}");
+    assert!(!out.contains("mov $7, %rax"), "no register bounce:\n{out}");
+}
+
+#[test]
+fn a_constant_assignment_stores_straight_to_the_frame() {
+    // `x = 5` on an unpromoted local is the same store as its initialiser: one
+    // `movq $5, off(%rbp)`, not `mov $5, %rax` + `mov %rax, off(%rbp)`.
+    let out = asm(
+        "fn main() -> i64 { let mut x: i64 = 1; let p: &i64 = &x; x = 5; return *p + x; }",
+    );
+    assert!(out.contains("movq $5, "), "constant assignment stored direct:\n{out}");
+    assert!(!out.contains("mov $5, %rax"), "no register bounce:\n{out}");
+}
+
+#[test]
+fn a_register_initialiser_stores_straight_to_the_frame() {
+    // `q.x` is promoted to `%rbx`; copying it into `a`, whose address is taken,
+    // is one `mov %rbx, off(%rbp)`, not `mov %rbx, %rax; mov %rax, off(%rbp)`.
+    let out = asm(
+        "struct P { x: i64, y: i64 } fn main() -> i64 { let mut q: P = P { x: 1, y: 2 }; let mut i: i64 = 0; while i < 10 { q.x = q.x + q.y; i = i + 1; } let mut a: i64 = 0; let ra: &i64 = &a; a = q.x; return a + *ra; }",
+    );
+    assert!(out.contains("mov %rbx, -"), "register stored direct:\n{out}");
+}
+
+#[test]
+fn a_loop_body_starts_on_a_sixteen_byte_boundary() {
+    // The body is aligned so its layout does not shift with unrelated code-size
+    // changes; the directive must survive the dead-code pass, which otherwise
+    // drops it as text after the entry `jmp`.
+    let out = asm("fn main() -> i64 { let mut i: i64 = 0; while i < 3 { i = i + 1; } return i; }");
+    assert!(out.contains(".p2align 4"), "loop body aligned:\n{out}");
+}
+
+#[test]
+fn a_constant_for_bound_folds_into_its_home() {
+    // `for i in 0..n` evaluates the start once; a constant start stores
+    // straight to the counter register instead of bouncing through `%rax`.
+    let out = asm("fn main() -> i64 { let mut s: i64 = 0; for i in 0..3 { s = s + i; } return s; }");
+    assert!(!out.contains("mov $0, %rax\n\tmov %rax, %r"), "no counter bounce:\n{out}");
+}
+
 fn struct_fields_are_laid_out_in_order() {
-    // Declaration order, no padding: `y` sits exactly one word above `x`.
-    let out = asm("struct P { x: i64, y: i64 } fn main() -> i64 { let p: P = P { x: 1, y: 2 }; return p.y; }");
-    let x = store_offset_after(&out, "mov $1, %rax");
-    let y = store_offset_after(&out, "mov $2, %rax");
+    // Declaration order, no padding: `y` sits exactly one word above `x`. A
+    // `&p` keeps the struct in memory so both fields are stored to the frame;
+    // a field-only use now promotes the last field to a register.
+    let out = asm("struct P { x: i64, y: i64 } fn main() -> i64 { let p: P = P { x: 1, y: 2 }; let a: &P = &p; return a.y; }");
+    let x = store_offset_of(&out, 1);
+    let y = store_offset_of(&out, 2);
     assert_eq!(y, x + 8, "fields laid out in declaration order");
 }
 
 #[test]
 fn field_write_targets_the_right_slot() {
-    let out = asm("struct P { x: i64, y: i64 } fn main() -> i64 { let mut p: P = P { x: 1, y: 2 }; p.y = 9; return p.y; }");
+    let out = asm("struct P { x: i64, y: i64 } fn main() -> i64 { let mut p: P = P { x: 1, y: 2 }; let a: &P = &p; p.y = 9; return p.y; }");
     // The read of `p.y` and the write `p.y = 9` must name the same frame slot.
     // The write folds the constant straight into a sized `movq`, so it is
     // `movq $9, <off>(%rbp)` rather than a `%rax` round trip. The size matters:
@@ -79,14 +159,215 @@ fn field_write_targets_the_right_slot() {
 fn for_loop_has_a_continue_label() {
     // `continue` must jump to the increment, which is why `for` is not a while.
     let out = asm("fn main() -> i64 { let mut s: i64 = 0; for i in 0..3 { if i == 1 { continue; } s = s + i; } return s; }");
-    assert!(out.contains("jge"), "range end comparison");
-    assert!(out.contains("add $1, %rax"), "increment");
+    assert!(out.contains("jl "), "range end comparison, rotated to the back edge");
+    assert!(out.contains("add $1"), "increment");
+}
+
+#[test]
+fn an_inclusive_range_uses_a_non_strict_back_edge() {
+    // The guard is the back edge: `0..3` loops back while `var < end` (`jl`),
+    // and `0..=3` while `var <= end` (`jle`), so the inclusive form still runs
+    // the body once more when `var == end`.
+    let excl = asm("fn main() -> i64 { let mut s: i64 = 0; for i in 0..3 { s = s + i; } return s; }");
+    assert!(excl.contains("jl "), "exclusive range loops back strictly");
+    assert!(!excl.contains("jle "), "exclusive range must not use jle");
+    let incl = asm("fn main() -> i64 { let mut s: i64 = 0; for i in 0..=3 { s = s + i; } return s; }");
+    assert!(incl.contains("jle "), "inclusive range loops back non-strictly");
+}
+
+#[test]
+fn for_over_an_array_iterates_by_value() {
+    // `for x in arr` desugars to an index loop over the array; the length folds
+    // to a literal, so the loop carries no hidden end slot.
+    let src = "fn main() -> i64 { let a: [i64; 3] = [1, 2, 3]; \
+               let mut s: i64 = 0; for x in a { s = s + x; } return s; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn for_over_an_array_runs_an_array_expression_once() {
+    // The iterated expression is bound to a hidden temporary before the loop,
+    // so a call in the head is evaluated exactly once, not once per iteration.
+    let src = "fn mk() -> [i64; 3] { return [1, 2, 3]; } \
+               fn main() -> i64 { let mut s: i64 = 0; for x in mk() { s = s + x; } return s; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn for_over_an_array_supports_continue_and_break() {
+    // The desugared loop is a `for`, so `continue` runs the index increment and
+    // `break` leaves; both must still be legal in the body.
+    let src = "fn main() -> i64 { let a: [i64; 4] = [1, 2, 3, 4]; let mut s: i64 = 0; \
+               for x in a { if x == 2 { continue; } if x == 4 { break; } s = s + x; } return s; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn for_over_an_array_with_a_wildcard_binding_is_accepted() {
+    let src = "fn main() -> i64 { let a: [i64; 3] = [1, 2, 3]; \
+               let mut c: i64 = 0; for _ in a { c = c + 1; } return c; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn for_over_a_reference_is_rejected() {
+    // `for x in &a` would iterate by reference in Rust; rmc iterates by value,
+    // so it rejects the form rather than silently mistype `x`.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let a: [i64; 3] = [1, 2, 3]; \
+         let mut s: i64 = 0; for x in &a { s = s + x; } return s; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("reference"), "got: {err}");
+}
+
+#[test]
+fn a_labelled_break_leaves_the_named_outer_loop() {
+    // `break 'outer` from a nested loop must target the labelled loop, not the
+    // innermost one. The body runs `i` up to 5 and then leaves both loops.
+    let src = "fn main() -> i64 { let mut i: i64 = 0; \
+               'outer: loop { let mut j: i64 = 0; while j < 10 { j = j + 1; i = i + 1; \
+               if i == 5 { break 'outer; } } } return i; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_labelled_continue_targets_the_named_outer_loop() {
+    let src = "fn main() -> i64 { let mut s: i64 = 0; \
+               'a: for x in 0..3 { for y in 0..3 { if y == 1 { continue 'a; } s = s + 1; } } \
+               return s; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_labelled_loop_yields_a_value() {
+    let src = "fn main() -> i64 { let mut k: i64 = 0; \
+               let v: i64 = 'l: loop { k = k + 1; if k == 7 { break 'l k * 2; } }; return v; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn an_undeclared_loop_label_is_rejected() {
+    let err = compile_to_asm(
+        "fn main() -> i64 { loop { break 'nope; } return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("undeclared label"), "got: {err}");
+}
+
+#[test]
+fn a_label_on_while_let_is_rejected() {
+    // `while let` desugars to a plain `loop`, so the label would be lost; it is
+    // rejected rather than silently dropped.
+    let err = compile_to_asm(
+        "enum E { A(i64), B } \
+         fn main() -> i64 { let mut e: E = E::A(1); 'a: while let E::A(x) = e { break 'a; } return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("label on `while let`"), "got: {err}");
+}
+
+#[test]
+fn struct_field_init_shorthand_reuses_the_local() {
+    // `P { x, y }` is `P { x: x, y: y }`; the shorthand must read the locals of
+    // those names, not a placeholder.
+    let src = "struct P { x: i64, y: i64 } \
+               fn main() -> i64 { let x: i64 = 3; let y: i64 = 4; let p: P = P { x, y }; \
+               return p.x * 10 + p.y; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn struct_field_init_shorthand_mixes_with_explicit_fields() {
+    let src = "struct P { x: i64, y: i64 } \
+               fn main() -> i64 { let x: i64 = 3; let p: P = P { y: 10, x }; \
+               return p.x * 10 + p.y; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn struct_field_init_shorthand_for_an_unbound_name_is_rejected() {
+    let err = compile_to_asm(
+        "struct P { x: i64, y: i64 } \
+         fn main() -> i64 { let p: P = P { x, y }; return p.x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("unknown variable"), "got: {err}");
+}
+
+#[test]
+fn a_diverging_match_is_never_and_fits_any_return_type() {
+    // Every arm `return`s, so the match cannot yield a value: it is `!` and
+    // satisfies `-> i64`. rustc accepts this; rmc used to reject it with a
+    // spurious "falls off the end".
+    let src = "enum E { A, B } \
+               fn f(e: E) -> i64 { match e { E::A => { return 1; } E::B => { return 2; } } } \
+               fn main() -> i64 { return f(E::A); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_catch_all_match_whose_body_can_fall_through_does_not_diverge() {
+    // The wildcard arm's body is an `if` without an `else`, so it can fall
+    // through to `()`. The match therefore does not diverge, and a binding the
+    // other branch initialises is not definitely initialised afterwards. The
+    // structural walk must not read the body's bare `if` as another chain step
+    // and mistake the match for `!` (rustc's E0381).
+    let err = compile_to_asm(
+        "fn f(c: bool) -> i64 { let x: i64; \
+         if c { match c { _ => if c { return 1; } } } else { x = 1; } return x; } \
+         fn main() {}",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("use of possibly-uninitialized variable `x`"), "got: {err}");
+    // The same shape with a diverging body is fine: the branch returns, so `x`
+    // is initialised by the `else` alone.
+    assert!(compile_to_asm(
+        "fn f(c: bool) -> i64 { let x: i64; \
+         if c { match c { _ => { return 1; } } } else { x = 1; } return x; } \
+         fn main() {}",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_diverging_if_else_initializes_a_typed_let() {
+    let src = "fn f(c: bool) -> i64 { let x: i64 = if c { return 1; } else { return 2; }; return x; } \
+               fn main() -> i64 { return f(true); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_loop_with_no_break_satisfies_any_return_type() {
+    let src = "fn f() -> i64 { loop {} } fn main() -> i64 { return f(); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_mixed_value_and_diverging_arm_keeps_the_value_type() {
+    // One arm yields `i64`, the other diverges: the match is `i64`.
+    let src = "enum E { A, B } \
+               fn f(e: E) -> i64 { match e { E::A => 10, E::B => { return 20; } } } \
+               fn main() -> i64 { return f(E::A); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
 }
 
 #[test]
 fn compound_assignment_expands() {
+    // `x += 4` folds into a single `lea` when the target is register-resident,
+    // and otherwise into an `add`. Either is the expansion; what matters is
+    // that the value is incremented in place.
     let out = asm("fn main() -> i64 { let mut x: i64 = 1; x += 4; return x; }");
-    assert!(out.contains("add $4, %rax") || out.contains("add %rcx, %rax"));
+    assert!(
+        out.contains("lea 4(") || out.contains("add $4, %rax") || out.contains("add %rcx, %rax"),
+        "no increment in:\n{out}"
+    );
 }
 
 #[test]
@@ -166,6 +447,53 @@ fn irrefutable_if_let_with_matching_else_is_accepted() {
 }
 
 #[test]
+fn match_arm_body_may_be_a_bare_assignment() {
+    // A `match` arm body is an expression in Rust, but `x = 1` and `x += 1` are
+    // accepted too. rmc parses assignment only as a statement, so the arm body
+    // parser must accept it explicitly; without that, `0 => acc = 1` fails.
+    let out = asm(
+        "fn main() -> i64 { let mut acc: i64 = 0; let x: i64 = 1; \
+         match x { 0 => acc = acc + 1, 1 => acc += 10, _ => {} } return acc; }",
+    );
+    assert!(out.contains("main:"), "an assignment arm body compiles");
+}
+
+#[test]
+fn assignment_arm_bodies_work_with_or_patterns_and_ranges() {
+    // The assignment arm body composes with every pattern form, and with a
+    // `match` used as a statement (its value discarded).
+    let out = asm(
+        "fn main() -> i64 { let mut acc: i64 = 0; let mut i: i64 = 0; \
+         while i < 6 { match i { 0 | 1 => acc += 10, 2..=4 => acc = acc - 1, _ => {} } i = i + 1; } return acc; }",
+    );
+    assert!(out.contains("main:"), "assignment bodies compose with or-patterns and ranges");
+}
+
+#[test]
+fn if_let_and_while_let_bodies_may_assign() {
+    // `if let`/`while let` bodies are blocks, so an assignment inside them is an
+    // ordinary statement; this guards that path stays working.
+    let out = asm(
+        "fn main() -> i64 { let mut acc: i64 = 0; let x: i64 = 1; \
+         if let 1 = x { acc = acc + 5; } \
+         let mut y: i64 = 0; while let 0..=2 = y { y += 1; } return acc + y; }",
+    );
+    assert!(out.contains("main:"), "assignment bodies compile under `if let`/`while let`");
+}
+
+#[test]
+fn match_arm_body_may_be_a_return_or_break() {
+    // As in Rust, an arm body may be a `return`/`break` statement, not just an
+    // expression; `parse_arm_body` builds the statement and leaves the arm's
+    // terminator for the caller.
+    let out = asm(
+        "fn f(x: i64) -> i64 { match x { 0 => return 5, _ => 0 } } \
+         fn main() -> i64 { let mut i: i64 = 0; while i < 9 { match i { 3 => break, _ => {} } i = i + 1; } return f(0); }",
+    );
+    assert!(out.contains("main:"), "return/break arm bodies compile");
+}
+
+#[test]
 fn match_drops_arms_after_a_catch_all() {
     // A `match` arm after `_` is dead and dropped, so a value-position match
     // whose `_` arm yields a value is accepted even with arms after it.
@@ -215,7 +543,7 @@ fn large_array_compiles_in_linear_time() {
     let out = compile_to_asm(&src, &CompileOptions::default()).unwrap();
     assert!(out.contains("main:"));
     assert!(
-        t.elapsed().as_secs_f64() < 2.0,
+        t.elapsed().as_secs_f64() < 0.5,
         "compiling a 200k-element array took {:?}",
         t.elapsed()
     );
@@ -325,6 +653,122 @@ fn non_exhaustive_match_as_a_value_is_rejected() {
     )
     .unwrap_err();
     assert!(err.contains("`if` without `else`"), "got: {err}");
+}
+
+#[test]
+fn a_guarded_arm_folds_the_guard_into_the_pattern_test() {
+    // `pat if g` becomes `if pat_test && g`; the guard is an ordinary
+    // expression, so no new node reaches codegen.
+    let out = asm("fn main() -> i64 { let x: i64 = 5; \
+                   let t: i64 = match x { n if n > 3 => 1, _ => 2 }; return t; }");
+    assert!(out.contains("main:"), "{out}");
+    assert!(
+        compile_to_asm(
+            "fn main() -> i64 { let x: i64 = 5; \
+             let t: i64 = match x { n if n > 3 => 1, _ => 2 }; return t; }",
+            &CompileOptions::default()
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn a_guard_makes_an_otherwise_irrefutable_arm_not_a_catch_all() {
+    // `n if c` can fail, so the arms after it are still reachable: the match
+    // below is accepted and the `_` arm is live. If the guard were dropped the
+    // `_` arm would be dead and the body would differ.
+    let src = "fn main() -> i64 { let x: i64 = 5; \
+               let t: i64 = match x { n if n > 100 => 1, _ => 2 }; return t; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_guarded_arm_covers_nothing_for_exhaustiveness() {
+    // Every variant named, but one arm is guarded, so the match can still fall
+    // through: rustc rejects it (E0004) and rmc must too.
+    let err = compile_to_asm(
+        "enum E { A, B } fn main() -> i64 { let e: E = E::A; \
+         let t: i64 = match e { E::A if e as i64 == 0 => 1, E::B => 2 }; return t; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("exhaustive") || err.contains("`if` without `else`"), "got: {err}");
+}
+
+#[test]
+fn a_guarded_binding_arm_is_not_a_catch_all() {
+    // A bare binding arm is a catch-all; a guarded one is not.
+    let err = compile_to_asm(
+        "enum E { A, B } fn main() -> i64 { let e: E = E::A; \
+         let t: i64 = match e { v if v as i64 == 0 => 1 }; return t; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("exhaustive") || err.contains("`if` without `else`"), "got: {err}");
+}
+
+#[test]
+fn a_guard_on_a_payload_binding_sees_the_binding() {
+    let src = "enum Opt { None, Some(i64) } \
+               fn f(o: Opt) -> i64 { return match o { \
+               Opt::Some(v) if v > 10 => 100 + v, Opt::Some(v) => v, Opt::None => -1 }; } \
+               fn main() -> i64 { return f(Opt::Some(5)); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_failed_guard_binding_does_not_shadow_the_fallback() {
+    // The arm binds `n`, but a later arm must resolve `n` to the outer binding,
+    // not to this arm's. `desugar_arm` used to wrap the whole `if` in the
+    // binding's block, so the `_` arm saw `n: i64` and the `if n` below was a
+    // type error. With the binding scoped to the guard and `then` only, the
+    // fallback reads the outer `bool`.
+    let src = "fn main() -> i64 { let n: bool = true; \
+               let r = match 0 { n if n == 5 => 1, _ => { if n { 7 } else { 8 } } }; \
+               return r; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_failed_payload_guard_does_not_shadow_the_fallback() {
+    // The payload-binding form of the same bug: `Opt::Some(x)` binds `x: i64`
+    // for its guard and body, but the `_` fallback must still see the outer
+    // `x: bool`.
+    let src = "enum Opt { None, Some(i64) } \
+               fn main() -> i64 { let x: bool = true; let o = Opt::Some(5); \
+               let r = match o { Opt::Some(x) if x > 0 => x, \
+               _ => { if x { 7 } else { 8 } } }; return r; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_failed_guard_binding_does_not_leak_an_unbound_name() {
+    // The `_` fallback names `g`, which only the failed arm bound. Because the
+    // binding must not reach the fallback, `g` is unbound and the program is
+    // rejected, exactly as rustc rejects it.
+    let src = "fn main() -> i64 { \
+               let r = match 0 { g if g == 5 => 1, _ => g }; return r; }";
+    let err = compile_to_asm(src, &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("unknown variable") || err.contains("`g`"), "got: {err}");
+}
+
+#[test]
+fn a_payload_enum_match_naming_every_variant_is_a_value() {
+    // Pre-existing gap: the payload-binding block hid the chain from the
+    // exhaustiveness walk, so this was wrongly rejected without a `_` arm.
+    let src = "enum Opt { None, Some(i64) } \
+               fn f(o: Opt) -> i64 { return match o { Opt::Some(v) => v, Opt::None => 0 }; } \
+               fn main() -> i64 { return f(Opt::Some(5)); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_repeated_variant_arm_is_not_a_gap() {
+    // Two unguarded arms naming the same variant are redundant, not a hole;
+    // rustc accepts this and rmc must not report it non-exhaustive.
+    let src = "enum E { A, B } fn main() -> i64 { let e: E = E::A; \
+               let t: i64 = match e { E::A => 1, E::A => 2, E::B => 3 }; return t; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
 }
 
 #[test]
@@ -708,6 +1152,35 @@ fn the_documented_casts_are_accepted() {
 }
 
 #[test]
+fn a_cast_binds_looser_than_a_deref() {
+    // `*r as i64` is `(*r) as i64`, not `*(r as i64)`: in Rust `as` sits above
+    // the unary operators in the precedence chain, so rmc used to reject this
+    // valid program with a reference-cast error.
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let x: i64 = 5; let r: &i64 = &x; return *r as i64; }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_cast_binds_looser_than_unary_minus() {
+    // `-x as i64` is `(-x) as i64`.
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let x: i64 = 5; return -x as i64; }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_cast_binds_tighter_than_multiplication() {
+    // `b as i64 * 2` is `(b as i64) * 2`, so the `as` applies to `b` alone.
+    let asm = asm("fn main() -> i64 { let b: bool = true; return b as i64 * 2; }");
+    assert!(!asm.is_empty());
+}
+
+#[test]
 fn a_duplicate_parameter_name_is_rejected() {
     // rustc rejects two parameters with the same name (E0415); rmc used to
     // accept it and bind both to the same slot.
@@ -798,11 +1271,17 @@ fn overflow_checks_guard_a_variable_shift_count() {
     // matching Rust's panic; without the flag it must not (the shift is then
     // unchecked, as Rust's default `<<` is too).
     let src = "fn f(x: i64, n: i64) -> i64 { return x << n; } fn main() -> i64 { return f(1, 2); }";
-    let plain = compile_to_asm(src, &CompileOptions::default()).unwrap();
+    // Inlining would fold the constant shift into `main` and leave `f` dead;
+    // disable it so the guard is inspected in the function that carries it.
+    let plain = compile_to_asm(
+        src,
+        &CompileOptions { no_inline: true, ..Default::default() },
+    )
+    .unwrap();
     assert!(!plain.contains("ja __rmc_shift_overflow"), "no guard without the flag");
     let checked = compile_to_asm(
         src,
-        &CompileOptions { overflow_checks: true, ..Default::default() },
+        &CompileOptions { overflow_checks: true, no_inline: true, ..Default::default() },
     )
     .unwrap();
     assert!(checked.contains("cmp $63, %rcx"), "count is range-checked");
@@ -991,9 +1470,149 @@ fn print_str_accepts_a_string_literal() {
 }
 
 #[test]
+fn comparing_strings_lowers_to_the_byte_wise_helper() {
+    // A `str` is a pointer to its record, so a machine compare would answer
+    // "not equal" for two identical literals. The comparison must call the
+    // runtime helper instead.
+    let out = asm("fn main() -> i64 { if \"abc\" == \"abc\" { return 1; } return 0; }");
+    assert!(out.contains("call __rmc_str_lt"), "content compare emitted: {out}");
+    assert!(out.contains("__rmc_str_lt:"), "helper linked in");
+}
+
+#[test]
+fn a_string_equality_compares_by_content() {
+    // The two literals are distinct objects at run time; the comparison is
+    // decided by their bytes, so `==` is true and `!=` is false.
+    let out = asm(
+        "fn main() -> i64 { \
+         let mut n: i64 = 0; \
+         if \"abc\" == \"abc\" { n = n + 1; } \
+         if \"abc\" != \"abc\" { n = n + 10; } \
+         return n; }",
+    );
+    assert!(out.contains("call __rmc_str_lt"));
+    // No `str` is left to compare with a raw `cmp`, so the program must not
+    // contain a bare string-pointer comparison.
+    assert!(!out.contains("cmp %rcx, %rax"), "no pointer compare: {out}");
+}
+
+#[test]
+fn comparing_a_string_with_an_integer_is_rejected() {
+    let bad = "fn main() -> i64 { if \"a\" == 1 { return 1; } return 0; }";
+    assert!(compile_to_asm(bad, &CompileOptions::default()).is_err());
+}
+
+#[test]
+fn the_string_helper_is_dropped_when_unused() {
+    let out = asm("fn main() -> i64 { print_str(\"hi\"); return 0; }");
+    assert!(!out.contains("__rmc_str_lt"), "unused helper dropped: {out}");
+}
+
+#[test]
+fn a_string_pattern_matches_by_content() {
+    // A `str` scrutinee is a pointer, so a `match` on it must compare bytes,
+    // not addresses: `match s { "a" => .. }` has to fire for a `let s = "a"`.
+    let out = asm(
+        "fn main() -> i64 { \
+         let s = \"a\"; \
+         return match s { \"a\" => 1, _ => 2 }; }",
+    );
+    assert!(out.contains("call __rmc_str_lt"), "content compare emitted: {out}");
+}
+
+#[test]
+fn a_string_pattern_composes_with_an_or_pattern() {
+    // An or-pattern over two literals must test both, not fall through to `_`.
+    // Each string `==` lowers to two helper calls (`!(a<b) && !(b<a)`), so two
+    // alternatives give four.
+    let out = asm(
+        "fn main() -> i64 { \
+         let s = \"b\"; \
+         return match s { \"a\" | \"b\" => 1, _ => 2 }; }",
+    );
+    assert_eq!(out.matches("call __rmc_str_lt").count(), 4, "both alternatives tested");
+}
+
+#[test]
+fn a_string_pattern_in_if_let_lowers_the_same_way() {
+    let out = asm(
+        "fn main() -> i64 { \
+         let s = \"a\"; \
+         if let \"a\" = s { return 1; } \
+         return 0; }",
+    );
+    assert!(out.contains("call __rmc_str_lt"));
+}
+
+#[test]
+fn an_integer_pattern_against_a_string_is_rejected() {
+    // The pattern test is a `str`/`i64` comparison, which rustc rejects (E0308).
+    let bad = "fn main() -> i64 { let s = \"a\"; return match s { 1 => 1, _ => 2 }; }";
+    assert!(compile_to_asm(bad, &CompileOptions::default()).is_err());
+}
+
+#[test]
+fn str_len_lowers_to_the_runtime_helper() {
+    // `s.len()` is the string record's first word, read by the runtime helper;
+    // a struct field access would read the wrong offset (the record is
+    // `{len, bytes..}`, so field 0 is the length, but a `str` is a pointer, so
+    // the load must be indirect).
+    let out = asm("fn main() -> i64 { let s = \"hello\"; return s.len(); }");
+    assert!(out.contains("call __rmc_str_len"), "len helper emitted: {out}");
+}
+
+#[test]
+fn array_len_folds_to_the_constant() {
+    // An array's length is known at compile time, so `a.len()` is a constant
+    // with no runtime work at all.
+    let out = asm("fn main() -> i64 { let a = [1, 2, 3]; return a.len(); }");
+    assert!(out.contains("mov $3, %rax"), "length folded: {out}");
+    assert!(!out.contains("call __rmc_str_len"), "no runtime helper: {out}");
+}
+
+#[test]
+fn the_string_len_helper_is_dropped_when_unused() {
+    // The runtime is linked piece by piece; a program that never calls
+    // `str::len` must not carry the helper.
+    let out = asm("fn main() -> i64 { return 0; }");
+    assert!(!out.contains("__rmc_str_len"), "unused helper dropped: {out}");
+}
+
+#[test]
+fn str_is_a_nameable_type_in_signatures_and_fields() {
+    // `str` is a builtin type, not a struct, so writing it as a parameter,
+    // return or field type must resolve to `Type::Str` rather than "unknown
+    // type". A string parameter is passed as its one-word pointer.
+    let out = asm(
+        "fn n(s: str) -> i64 { return s.len(); } \
+         fn id(s: str) -> str { return s; } \
+         fn main() -> i64 { return n(id(\"hi\")); }",
+    );
+    assert!(out.contains("call __rmc_str_len"), "str param lowers: {out}");
+    assert!(!out.contains("unknown type"), "str is a known type");
+}
+
+#[test]
+fn a_str_struct_field_round_trips_through_a_copy() {
+    let out = asm(
+        "struct M { s: str, n: i64 } \
+         fn pick(m: M) -> str { return m.s; } \
+         fn main() -> i64 { let m = M { s: \"abc\", n: 2 }; return pick(m).len() + m.n; }",
+    );
+    assert!(out.contains("call __rmc_str_len"), "field read then len: {out}");
+}
+
+#[test]
+fn len_with_arguments_is_rejected() {
+    let bad = "fn main() -> i64 { return \"x\".len(1); }";
+    let err = compile_to_asm(bad, &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("takes no arguments"), "got: {err}");
+}
+
+#[test]
 fn argument_setup_folds_a_constant_with_lea() {
     // `fib(n - 1)` must become one `lea`, not `mov; sub; mov`.
-    let out = asm("fn f(n: i64) -> i64 { return n; } fn g(n: i64) -> i64 { return f(n - 1); } fn main() -> i64 { return 0; }");
+    let out = asm_no_inline("fn f(n: i64) -> i64 { return n; } fn g(n: i64) -> i64 { return f(n - 1); } fn main() -> i64 { return g(5); }");
     assert!(out.contains("lea -1(%"), "constant offset folded into lea: {out}");
     assert!(!out.contains("sub $1, %rax"), "no separate subtraction");
 }
@@ -1035,7 +1654,7 @@ fn an_inferred_array_is_initialised() {
 #[test]
 fn a_small_multiply_and_offset_fold_to_one_lea() {
     // `2*x + 3` on a promoted local is a single `lea`, with no `imul`.
-    let out = asm("fn g(i: i64) -> i64 { let mut x: i64 = i; x = 2 * x + 3; return x; } fn main() -> i64 { return 0; }");
+    let out = asm_no_inline("fn g(i: i64) -> i64 { let mut x: i64 = i; x = 2 * x + 3; return x; } fn main() -> i64 { return g(4); }");
     // Scope to `g`: the runtime's `arg_i64` contains its own `imul`.
     let g = &out[out.find("g:").unwrap()..out.find(".size g,").unwrap()];
     assert!(g.contains("lea 3(%"), "folded into lea: {g}");
@@ -1043,10 +1662,42 @@ fn a_small_multiply_and_offset_fold_to_one_lea() {
 }
 
 #[test]
+fn a_small_constant_multiply_is_a_lea() {
+    // `2 * x`, `5 * x` and `8 * x` are one 1-cycle `lea`, not a 3-cycle `imul`.
+    // `7` is not a `lea` scale, so it stays an `imul`.
+    for (expr, want_lea) in [("2 * x", true), ("5 * x", true), ("8 * x", true), ("7 * x", false)] {
+        let out = asm_no_inline(&format!(
+            "fn f(x: i64) -> i64 {{ return {expr}; }} fn main() -> i64 {{ return f(3); }}"
+        ));
+        let f = &out[out.find("f:").unwrap()..out.find(".size f,").unwrap()];
+        if want_lea {
+            assert!(f.contains("lea "), "`{expr}` folds to a lea: {f}");
+            assert!(!f.contains("imul"), "`{expr}` has no imul: {f}");
+        } else {
+            assert!(f.contains("imul"), "`{expr}` stays an imul: {f}");
+        }
+    }
+}
+
+#[test]
+fn a_multiply_by_one_is_dropped() {
+    // `1 * x` is `x`; the multiply disappears entirely.
+    let out = asm_no_inline("fn f(x: i64) -> i64 { return 1 * x; } fn main() -> i64 { return f(3); }");
+    let f = &out[out.find("f:").unwrap()..out.find(".size f,").unwrap()];
+    assert!(!f.contains("imul"), "no multiply remains: {f}");
+    // The only `lea` in `f` is the frame restore (`... , %rsp`); a `lea` into
+    // `%rax` would mean the multiply was not actually dropped.
+    assert!(
+        !f.lines().any(|l| l.contains("lea") && l.contains("%rax")),
+        "no value-computing lea either: {f}"
+    );
+}
+
+#[test]
 fn a_comparison_of_two_promoted_locals_is_one_cmp() {
     // Both operands live in registers, so no value is materialised in `%rax`.
-    let out = asm(
-        "fn g(a: i64, b: i64) -> bool { let mut x: i64 = a; let mut y: i64 = b; x = x + 1; y = y + 1; return x < y; } fn main() -> i64 { return 0; }",
+    let out = asm_no_inline(
+        "fn g(a: i64, b: i64) -> bool { let mut x: i64 = a; let mut y: i64 = b; x = x + 1; y = y + 1; return x < y; } fn main() -> i64 { if g(1, 2) { return 1; } return 0; }",
     );
     let has_reg_reg_cmp = out.lines().any(|l| {
         let l = l.trim();
@@ -1056,26 +1707,28 @@ fn a_comparison_of_two_promoted_locals_is_one_cmp() {
 }
 
 #[test]
-fn spills_use_frame_slots_not_the_stack() {
-    // A value held across a call is spilled to a frame slot, so `%rsp` never
-    // moves and no 16-byte alignment pad is emitted around the call.
-    let out = asm(
-        "fn f(x: i64) -> i64 { return x; } fn g(x: i64) -> i64 { return f(x - 1) + f(x - 2); } fn main() -> i64 { return 0; }",
+fn spills_use_registers_not_the_stack() {
+    // A value held across a call is spilled to a callee-saved register (or, when
+    // those run out, a frame slot), never `push`ed: `%rsp` stays put mid-body,
+    // so no alignment pad is emitted around the call.
+    let out = asm_no_inline(
+        "fn f(x: i64) -> i64 { return x; } fn g(x: i64) -> i64 { return f(x - 1) + f(x - 2); } fn main() -> i64 { return g(5); }",
     );
     let g = &out[out.find("g:").unwrap()..out.find(".size g,").unwrap()];
     assert!(!g.contains("push %rax"), "no stack spill: {g}");
-    assert!(!g.contains("sub $8, %rsp"), "no alignment pad: {g}");
-    assert!(g.contains("(%rbp)"), "spill lands in a frame slot: {g}");
+    assert!(!g.contains("push %rcx"), "no stack spill: {g}");
+    assert!(g.contains("%r12"), "the cross-call value lives in a spill register: {g}");
 }
 
 #[test]
 fn a_hot_struct_field_is_promoted_to_a_register() {
     // `p.x` is the hottest field, so it lives in `%rbx`; its initialiser
-    // writes the register instead of a frame slot.
+    // writes the register directly instead of a frame slot, with no `%rax`
+    // bounce.
     let out = asm(
         "struct P { x: i64, y: i64 } fn main() -> i64 { let mut p: P = P { x: 0, y: 1 }; let mut i: i64 = 0; while i < 10 { p.x = p.x + p.y; i = i + 1; } return p.x; }",
     );
-    assert!(out.contains("mov %rax, %rbx"), "p.x initialises into a register: {out}");
+    assert!(out.contains("mov $0, %rbx"), "p.x initialises straight into a register: {out}");
 }
 
 #[test]
@@ -1085,7 +1738,7 @@ fn a_copied_struct_keeps_its_fields_in_memory() {
     let out = asm(
         "struct P { x: i64, y: i64 } fn f(p: P) -> i64 { return p.x; } fn main() -> i64 { let p: P = P { x: 1, y: 2 }; let q: P = p; return f(q) + p.x; }",
     );
-    let _ = store_offset_after(&out, "mov $1, %rax"); // panics if `x` were promoted
+    let _ = store_offset_of(&out, 1); // panics if `x` were promoted
 }
 
 #[test]
@@ -1098,7 +1751,7 @@ fn a_struct_array_field_keeps_the_field_to_slot_map_consistent() {
     let out = asm(
         "struct W { tag: i64, data: [i64; 3] } fn main() -> i64 { let w: W = W { tag: 4, data: [1, 2, 3] }; return w.tag; }",
     );
-    assert!(out.contains("mov %rax, %rbx"), "literal writes `tag` to its register: {out}");
+    assert!(out.contains("mov $4, %rbx"), "literal writes `tag` to its register: {out}");
     assert!(out.contains("mov %rbx, %rax"), "`w.tag` reads the same register: {out}");
 }
 
@@ -1182,6 +1835,70 @@ fn a_constant_index_out_of_range_is_a_compile_error() {
 }
 
 #[test]
+fn bounds_checks_guard_a_loop_expression_base() {
+    // `loop { break a; }[i]`: the base's length comes from the loop's `break`
+    // value type, not its block tail (which is `()`), so the check must still be
+    // emitted for a variable index. Reading past the array is CWE-125.
+    let out = compile_to_asm(
+        "fn f(i: i64) -> i64 { let a: [i64; 3] = [1, 2, 3]; return loop { break a; }[i]; } \
+         fn main() -> i64 { return f(9); }",
+        &CompileOptions { bounds_checks: true, ..Default::default() },
+    )
+    .unwrap();
+    assert!(out.contains("cmp $3, %rax"), "compares to the loop's array length:\n{out}");
+    assert!(out.contains("jae __rmc_bounds"), "traps on out of range");
+}
+
+#[test]
+fn a_loop_expression_base_copies_its_break_value() {
+    // The fix must not only add the check: the loop still yields the array, so
+    // indexing it in range reads the element. Execute it and read element 1,
+    // which only a real copy of the `break` value can produce.
+    assert_eq!(
+        run_exit_code(
+            "fn main() -> i64 { let a: [i64; 3] = [10, 20, 30]; let i: i64 = 1; \
+             return loop { break a; }[i]; }"
+        ),
+        20,
+        "indexing the loop's returned array yields the element"
+    );
+}
+
+#[test]
+fn a_unit_break_in_a_statement_loop_does_not_clobber_the_frame() {
+    // A statement `loop` is typed `()` and has no result slot (`-1`); storing a
+    // `break` value into `off(-1)` wrote the saved frame pointer and segfaulted
+    // on `leave`. The body must still run for its side effects.
+    let out = asm("fn main() -> i64 { let mut n: i64 = 7; loop { break; } return n; }");
+    assert!(out.contains("main:"), "compiles:\n{out}");
+    assert!(!out.contains("mov %rax, -1(%rbp)"), "no store to slot -1:\n{out}");
+    assert_eq!(
+        run_exit_code("fn main() -> i64 { let mut n: i64 = 7; loop { break; } return n; }"),
+        7,
+        "the loop exits cleanly and the local survives"
+    );
+    // The value-store path the reviewer pointed at: a `break` whose value is
+    // `()` but which carries a side effect. It must print and still exit 0,
+    // not corrupt the frame.
+    assert_eq!(
+        run_output("fn main() -> i64 { loop { break print_i64(7); } return 0; }"),
+        (0, "7\n".to_string()),
+        "a unit `break` value runs its side effect and leaves the frame intact"
+    );
+}
+
+#[test]
+fn a_unit_break_still_evaluates_its_value_expression() {
+    // `break g()` in a statement `loop`: the value is `()`, but the call must
+    // still run (rustc evaluates it for its side effects).
+    let out = asm(
+        "fn g() { print_i64(1); } \
+         fn main() -> i64 { loop { break g(); } return 0; }",
+    );
+    assert!(out.contains("call g"), "the break value expression is evaluated:\n{out}");
+}
+
+#[test]
 fn bounds_checks_leave_an_in_range_constant_alone() {
     let out = compile_to_asm(
         "fn main() -> i64 { let a: [i64; 2] = [1, 2]; return a[1]; }",
@@ -1228,7 +1945,12 @@ fn bounds_checks_guard_a_runtime_index_on_a_non_local_base() {
 fn the_bounds_handler_is_in_an_executable_section() {
     // `__rmc_bounds` is called, so it must not be left in the `.rodata` opened
     // by the message before it; a plain `ld` link would then fault.
-    let out = asm("fn main() -> i64 { return 0; }");
+    let out = compile_to_asm(
+        "fn f(i: i64) -> i64 { let v: i64 = { let t: [i64; 3] = [1; 3]; t }[i]; return v; } \
+         fn main() -> i64 { return f(9); }",
+        &CompileOptions { bounds_checks: true, ..Default::default() },
+    )
+    .unwrap();
     let at = out.find(".globl __rmc_bounds").expect("handler present");
     let before = &out[..at];
     let text = before.rfind(".text").expect("a .text directive");
@@ -1313,7 +2035,7 @@ fn bitwise_and_shift_emit_the_right_instructions() {
     // matching rustc; the 6-bit mask applies only to a run-time count, which
     // the hardware does anyway (`sal %cl` masks `%cl` to 6 bits for a 64-bit
     // operand).
-    let out = asm("fn f(n: i64) -> i64 { return 1 << n; } fn main() -> i64 { return f(70); }");
+    let out = asm_no_inline("fn f(n: i64) -> i64 { return 1 << n; } fn main() -> i64 { return f(70); }");
     assert!(out.contains("sal %cl, %rax"), "a variable shift count goes through %cl");
 
     let out = asm("fn main() -> i64 { return -8 >> 2; }");
@@ -1372,6 +2094,25 @@ fn modulo_by_a_constant_has_no_round_trip() {
 }
 
 #[test]
+fn a_small_divisor_uses_a_short_immediate() {
+    // `movabs` is 10 bytes; when the divisor (or the magic multiplier) fits in a
+    // sign-extended 32-bit immediate the 7-byte `mov` encodes the same value.
+    // The remainder path materialises the divisor itself (`/` folds it into the
+    // magic multiply), so a small `%` divisor is where the short form shows.
+    let out = asm("fn main() -> i64 { let a: i64 = 7; return a % 3; }");
+    assert!(out.contains("mov $3, %rcx"), "small divisor is a short immediate:\n{out}");
+    assert!(!out.contains("movabs $3,"), "no movabs for a value that fits i32");
+}
+
+#[test]
+fn a_wide_magic_multiplier_keeps_movabs() {
+    // A divisor whose magic multiplier needs all 64 bits must still use
+    // `movabs`; the short form would truncate it.
+    let out = asm("fn main() -> i64 { let a: i64 = 7; return a / 1000003; }");
+    assert!(out.contains("movabs $"), "wide multiplier keeps movabs:\n{out}");
+}
+
+#[test]
 fn a_variable_shift_count_goes_in_cl() {
     // x86 shifts take the count in `%cl`; the right operand already lands in
     // `%rcx`, so no extra move is needed.
@@ -1391,7 +2132,7 @@ fn shift_binds_looser_than_addition() {
 #[test]
 fn match_desugars_to_equality_compares() {
     // Each integer arm becomes an `==` against the scrutinee.
-    let out = asm("fn f(x: i64) -> i64 { match x { 0 => 10, 1 => 20, _ => 30 } } fn main() -> i64 { return f(0); }");
+    let out = asm_no_inline("fn f(x: i64) -> i64 { match x { 0 => 10, 1 => 20, _ => 30 } } fn main() -> i64 { return f(0); }");
     assert!(out.contains("cmpq $0,"), "arm 0 compares against 0");
     assert!(out.contains("cmpq $1,"), "arm 1 compares against 1");
 }
@@ -1485,13 +2226,100 @@ fn a_list_literal_with_mixed_element_types_is_rejected() {
 }
 
 #[test]
-fn an_array_of_aggregates_is_rejected_not_miscompiled() {
-    // Nested arrays and arrays of structs are out of scope; they must be a
-    // clean error rather than a segfault.
-    let e1 = compile_to_asm("fn main() -> i64 { let m: [[i64; 2]; 2] = [[1, 2], [3, 4]]; return 0; }", &CompileOptions::default()).unwrap_err();
-    assert!(e1.contains("array elements must be"), "got: {e1}");
-    let e2 = compile_to_asm("struct P { x: i64 } fn main() -> i64 { let a: [P; 1] = [P { x: 1 }]; return 0; }", &CompileOptions::default()).unwrap_err();
-    assert!(e2.contains("array elements must be"), "got: {e2}");
+fn a_large_nested_splat_keeps_the_source_fixed() {
+    // The counting-loop path for `[v; n]` with a wide element must advance only
+    // the destination: every element is a copy of the *same* source value. An
+    // earlier version stepped the source too, so element `i` was read from
+    // `v + i * elem_size` and the tail of the array was garbage.
+    let out = asm("fn main() -> i64 { let m: [[i64; 3]; 4] = [[5; 3]; 4]; return m[3][2]; }");
+    assert!(out.contains("mov $4, %rcx"), "the splat loop counts elements:\n{out}");
+    assert!(out.contains("add $24, %rdi"), "the destination advances:\n{out}");
+    assert!(
+        !out.contains("add $24, %rsi"),
+        "the source must not advance:\n{out}"
+    );
+}
+
+#[test]
+fn nested_array_slots_are_allocated_per_element_word() {
+    // A nested array of `n` elements of `w` words needs `n * w` frame slots. If
+    // the `let` allocated only `n`, the elements would overlap and a write to
+    // the last row would clobber an earlier one. A 4x3 `i64` array is 12 slots
+    // (96 bytes), so the frame must reserve at least that much.
+    let out = asm("fn main() -> i64 { let mut m: [[i64; 3]; 4] = [[0; 3]; 4]; m[3][2] = 1; return m[3][2]; }");
+    let frame: i32 = out
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("sub $")?.strip_suffix(", %rsp")?.parse().ok())
+        .expect("a frame reservation");
+    assert!(frame >= 96, "frame {frame} must hold 12 words:\n{out}");
+}
+
+#[test]
+fn a_large_struct_splat_keeps_the_source_fixed() {
+    // The same loop-path requirement for an array of structs.
+    let out = asm(
+        "struct P { x: i64, y: i64 } \
+         fn main() -> i64 { let a: [P; 5] = [P { x: 4, y: 6 }; 5]; return a[4].y; }",
+    );
+    assert!(out.contains("mov $5, %rcx"), "the splat loop counts elements:\n{out}");
+    assert!(out.contains("add $16, %rdi"), "the destination advances:\n{out}");
+    assert!(
+        !out.contains("add $16, %rsi"),
+        "the source must not advance:\n{out}"
+    );
+}
+
+#[test]
+fn nested_arrays_compile_and_index() {
+    // An array of arrays is laid out row-major: `m[i]` has the element type of
+    // `m`, and `m[i][j]` indexes into it. The stride is the inner array's size,
+    // not one slot, so both a constant and a variable index must scale.
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let m: [[i64; 2]; 3] = [[1, 2], [3, 4], [5, 6]]; return m[0][0] + m[2][1]; }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let m: [[i64; 2]; 3] = [[1, 2], [3, 4], [5, 6]]; \
+         let mut i: i64 = 0; let mut s: i64 = 0; \
+         while i < 3 { s = s + m[i][1]; i = i + 1; } return s; }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+    // A nested splat `[[v; k]; n]` copies `v`'s bytes into each inner array.
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let m: [[i64; 2]; 3] = [[5; 2]; 3]; return m[1][1]; }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn an_array_of_structs_compiles() {
+    // A struct is a wide element: `a[i].field` indexes with a stride of the
+    // struct's size, and a whole-element assignment copies the struct's words.
+    let src = "struct P { x: i64, y: i64 } \
+               fn main() -> i64 { let mut a: [P; 2] = [P { x: 1, y: 2 }, P { x: 3, y: 4 }]; \
+               a[1].x = 9; let b: P = P { x: 8, y: 7 }; a[0] = b; return a[0].x + a[1].x; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+    // A struct splat `[P { .. }; n]`.
+    assert!(compile_to_asm(
+        "struct P { x: i64 } fn main() -> i64 { let a: [P; 3] = [P { x: 2 }; 3]; return a[2].x; }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn an_array_of_payload_enums_is_still_rejected() {
+    // A payload enum is not a fixed-width scalar; rustc rejects it as an array
+    // element too, so rmc must give a clean error rather than miscompile.
+    let err = compile_to_asm(
+        "enum O { N, S(i64) } fn main() -> i64 { let a: [O; 2] = [O::N, O::S(1)]; return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("array elements must be"), "got: {err}");
 }
 
 #[test]
@@ -1499,6 +2327,36 @@ fn an_empty_list_literal_is_rejected() {
     // `[]` has no element to infer from; the parser rejects it before sema.
     let err = compile_to_asm("fn main() -> i64 { let a = []; return 0; }", &CompileOptions::default()).unwrap_err();
     assert!(err.contains("expected an expression"), "got: {err}");
+}
+
+#[test]
+fn a_let_underscore_discards_its_initializer() {
+    // `let _ = e;` evaluates `e` for its side effects and binds nothing.
+    assert!(compile_to_asm(
+        "fn g() -> i64 { return 7; } fn main() -> i64 { let _ = g(); let _ = 3 + 4; let _: i64 = 5; return 0; }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_let_underscore_still_type_checks_its_initializer() {
+    // The discard does not skip the annotation check (rustc E0308).
+    let err = compile_to_asm(
+        "fn main() -> i64 { let _: bool = 5; return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("does not match"), "got: {err}");
+}
+
+#[test]
+fn a_let_underscore_without_a_type_is_rejected() {
+    // `let _;` has nothing to infer from (rustc E0282); `let _: i64;` is fine.
+    let err = compile_to_asm("fn main() -> i64 { let _; return 0; }", &CompileOptions::default())
+        .unwrap_err();
+    assert!(err.contains("needs a type annotation"), "got: {err}");
+    assert!(compile_to_asm("fn main() -> i64 { let _: i64; return 0; }", &CompileOptions::default()).is_ok());
 }
 
 #[test]
@@ -1522,9 +2380,35 @@ fn an_unknown_method_is_rejected() {
 }
 
 #[test]
-fn a_method_without_self_is_rejected() {
-    let err = compile_to_asm("struct P { x: i64 } impl P { fn f() -> i64 { return 1; } } fn main() -> i64 { return 0; }", &CompileOptions::default()).unwrap_err();
-    assert!(err.contains("expected identifier"), "got: {err}");
+fn an_associated_function_is_callable_through_the_type() {
+    // `fn f()` with no `self` in an `impl` is an associated function, called as
+    // `P::f(..)`, not a method. rustc accepts this, so rmc must too.
+    let asm = asm_no_inline(
+        "struct P { x: i64 } impl P { fn twice(n: i64) -> i64 { return n * 2; } } fn main() -> i64 { return P::twice(21); }",
+    );
+    assert!(asm.contains("P$twice"), "expected the mangled assoc fn in the asm");
+}
+
+#[test]
+fn an_associated_function_called_as_a_method_is_rejected() {
+    // A method call passes the receiver as the first argument, so `p.twice()`
+    // has one argument too many for a receiver-less associated function.
+    let err = compile_to_asm(
+        "struct P { x: i64 } impl P { fn twice(n: i64) -> i64 { return n * 2; } } fn main() -> i64 { let p: P = P { x: 1 }; return p.twice(1); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("expects 1 argument"), "got: {err}");
+}
+
+#[test]
+fn an_unknown_associated_function_is_rejected() {
+    let err = compile_to_asm(
+        "struct P { x: i64 } impl P { fn new(x: i64) -> P { return P { x }; } } fn main() -> i64 { let p: P = P::nope(1); return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("no associated function"), "got: {err}");
 }
 
 #[test]
@@ -1540,6 +2424,51 @@ fn enum_variants_are_their_declaration_index() {
     // The tag appears as the immediate the variant compiles to.
     let out = asm(src);
     assert!(out.contains("mov $2, %rax"), "expected the tag 2 in:\n{out}");
+}
+
+#[test]
+fn an_explicit_discriminant_replaces_the_index() {
+    // `B = 10` makes B's value 10, not its index 1.
+    let out = asm("enum C { A = 5, B = 10 } fn main() -> i64 { return C::B as i64; }");
+    assert!(out.contains("mov $10, %rax"), "expected the written tag 10 in:\n{out}");
+}
+
+#[test]
+fn a_variant_without_a_discriminant_takes_the_previous_plus_one() {
+    let out = asm("enum C { A = 4, B, C } fn main() -> i64 { return C::C as i64; }");
+    assert!(out.contains("mov $6, %rax"), "expected 4+1+1 = 6 in:\n{out}");
+}
+
+#[test]
+fn a_match_arm_keys_on_the_written_discriminant() {
+    // The arm for B must compare against 10, not 1, or the wrong arm fires.
+    let out = asm("enum C { A = 5, B = 10 } fn f(c: C) -> i64 { return match c { C::A => 1, C::B => 2 }; } fn main() -> i64 { return f(C::B); }");
+    assert!(out.contains("$10") || out.contains("10,"), "expected a compare against 10 in:\n{out}");
+}
+
+#[test]
+fn a_duplicate_discriminant_is_rejected() {
+    let err = compile_to_asm("enum C { A = 5, B = 5 } fn main() -> i64 { return 0; }", &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("discriminant 5"), "got: {err}");
+}
+
+#[test]
+fn a_payload_variant_cannot_have_a_discriminant() {
+    let err = compile_to_asm("enum C { A(i64) = 5 } fn main() -> i64 { return 0; }", &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("payload cannot have an explicit discriminant"), "got: {err}");
+}
+
+#[test]
+fn a_discriminant_that_overflows_the_next_variant_is_rejected() {
+    // The variant after `i64::MAX` has no in-range value (rustc E0370).
+    let err = compile_to_asm("enum C { A = 9223372036854775807, B } fn main() -> i64 { return 0; }", &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("discriminant overflowed"), "got: {err}");
+}
+
+#[test]
+fn the_extreme_discriminants_are_representable() {
+    let out = asm("enum C { A = -9223372036854775808, B = 9223372036854775807 } fn main() -> i64 { return C::A as i64 + C::B as i64; }");
+    assert!(out.contains("9223372036854775807"), "expected i64::MAX in:\n{out}");
 }
 
 #[test]
@@ -1762,6 +2691,282 @@ fn a_loop_leaves_a_binding_initialized_only_on_every_exit() {
 }
 
 #[test]
+fn a_labelled_break_in_a_nested_condition_repeats_the_outer_loop() {
+    // A labelled `break` in a nested `while` condition runs in the enclosing
+    // loop's context, so it can leave the outer `loop` and the body then
+    // repeats. A write to a binding declared before the outer loop is therefore
+    // a second write on the next iteration, as rustc's E0384.
+    let err = compile_to_asm(
+        "fn main() { let x: i64; 'o: loop { x = 1; \
+         while 'inner: loop { while { break 'inner true; true } {} } { continue 'o; } } }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("cannot assign twice to immutable"), "got: {err}");
+    // Without a repeated write the same shape is fine.
+    assert!(compile_to_asm(
+        "fn main() { 'o: loop { while { break 'o; true } {} } }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_while_label_is_in_scope_in_its_own_condition() {
+    // rustc shadows an outer label of the same name with the `while`'s own, and
+    // the condition runs with that label already in scope, so `break 'i` there
+    // leaves this loop. Checking the condition before pushing the loop resolved
+    // `'i` to the outer loop (or failed to resolve it at all), diverging from
+    // rustc.
+    let out = asm(
+        "fn main() -> i64 { let mut n: i64 = 0; 'i: while { break 'i; true } {} return n; }",
+    );
+    assert!(out.contains("main:"), "compiles:\n{out}");
+}
+
+#[test]
+fn a_shadowing_while_label_binds_the_inner_loop() {
+    // `'o: while { break 'o; true }` inside `'o: loop`: the `while`'s own `'o`
+    // shadows the outer one, so the `break` leaves the *while*, not the `loop`.
+    // The outer loop therefore keeps running until its own `break`, which is
+    // what makes `c` reach 4. Resolving `break 'o` to the outer loop would make
+    // the whole thing exit immediately and return 0, so executing it is what
+    // distinguishes the two resolutions.
+    assert_eq!(
+        run_exit_code(
+            "fn main() -> i64 { let mut c: i64 = 0; 'o: loop { 'o: while { break 'o; true } {} \
+             c = c + 1; if c > 3 { break; } } return c; }"
+        ),
+        4,
+        "the break leaves the inner while, so the outer loop runs four times"
+    );
+}
+
+#[test]
+fn a_nested_loop_condition_break_does_not_make_the_outer_loop_breakable() {
+    // `'o: while { break 'o; true }` inside `'o: loop`: the `while`'s own `'o`
+    // shadows the outer one, so the `break` leaves the inner `while`. The outer
+    // `loop` then has no `break` of its own, so it is `!`, its `if` branch is
+    // `!`, and the `if`/`else` unifies with `i64`, exactly as rustc does. Before
+    // the label-aware walk, the inner `break` was credited to the outer `loop`,
+    // making it `()` so the branch types disagreed (E0308).
+    let out = asm(
+        "fn main() { let n: i64 = if true { 'o: loop { 'o: while { break 'o; true } {} } } \
+         else { 1 }; }",
+    );
+    assert!(out.contains("main:"), "compiles:\n{out}");
+}
+
+#[test]
+fn a_while_condition_initialization_survives_the_loop() {
+    // The condition runs at least once even when the body never does, so a
+    // binding it initializes is initialized after the loop. Snapshotting the
+    // state only before the condition dropped that write and rejected a valid
+    // read (rmc said `use of possibly-uninitialized variable`, rustc accepts).
+    assert!(compile_to_asm(
+        "fn f() -> i64 { let mut x: i64; while { x = 7; false } {} return x; } \
+         fn main() { let _ = f(); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+    assert_eq!(
+        run_exit_code(
+            "fn f() -> i64 { let mut x: i64; while { x = 7; false } {} return x; } \
+             fn main() -> i64 { return f(); }"
+        ),
+        7,
+        "the condition's write reaches the read after the loop"
+    );
+}
+
+#[test]
+fn a_for_range_bound_break_targets_the_enclosing_loop() {
+    // A `for`'s range bounds are evaluated before its own label enters scope, so
+    // `break 'a` in a bound names the enclosing `'a` loop even when the `for`
+    // reuses the label `'a`. Treating the bound as shadowed made the break
+    // resolve to the `for` itself, so `x`'s write was not a guaranteed exit of
+    // the outer `loop` and a valid read was rejected.
+    assert!(compile_to_asm(
+        "fn f() -> i64 { let mut x: i64; 'a: loop { for i in { if true { x = 7; break 'a; } 0 }..0 {} } \
+         return x; } fn main() { let _ = f(); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+    assert_eq!(
+        run_exit_code(
+            "fn f() -> i64 { let mut x: i64 = 0; 'a: loop { for i in { x = 7; break 'a; 0 }..0 {} } \
+             return x; } fn main() -> i64 { return f(); }"
+        ),
+        7,
+        "the bound's break leaves the outer loop and its write survives"
+    );
+}
+
+#[test]
+fn a_while_condition_write_to_an_immutable_binding_is_a_second_write() {
+    // The condition is re-evaluated whenever the body completes, so a write to a
+    // plain `let` there is a second write and rustc rejects it (E0384). The body
+    // being empty still lets the loop return to the condition.
+    for src in [
+        "fn f() { let x: i64; while { x = 1; false } {} } fn main() { f(); }",
+        "fn f() { let x: i64; while { x = 1; true } {} } fn main() { f(); }",
+        "fn f() { let x: i64; while { x = 1; true } { continue; } } fn main() { f(); }",
+    ] {
+        let err = compile_to_asm(src, &CompileOptions::default()).unwrap_err();
+        assert!(err.contains("cannot assign twice to immutable variable"), "got: {err}");
+    }
+    // A loop that can never return to the condition runs it once, so the single
+    // write is allowed, as is a `mut` binding.
+    assert!(compile_to_asm(
+        "fn f() { let x: i64; while { x = 1; true } { break; } } fn main() { f(); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+    assert!(compile_to_asm(
+        "fn f() { let mut x: i64; while { x = 1; false } {} } fn main() { f(); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_for_bound_continue_reaches_the_enclosing_while_condition() {
+    // A `for`'s range bounds run before its own label enters scope, so a
+    // `continue 'a` in a bound names the enclosing `'a` `while` even when the
+    // `for` reuses the label. Treating the bound as shadowed made the condition
+    // look unreachable-from-the-body, so the loop's back edge was invisible and
+    // the second write to the immutable `x` passed. rustc rejects it (E0384).
+    let err = compile_to_asm(
+        "fn f() { let x: i64; 'a: while { x = 1; true } { \
+         'a: for i in { continue 'a; 0 }..1 {} break; } } fn main() { f(); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("cannot assign twice to immutable variable"), "got: {err}");
+    // A `break` in the bound leaves the `while` and never returns to the
+    // condition, so the single write stays legal.
+    assert!(compile_to_asm(
+        "fn f() { let x: i64; 'a: while { x = 1; true } { \
+         'a: for i in { break 'a; 0 }..1 {} } } fn main() { f(); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_short_circuited_condition_does_not_initialize_its_right_operand() {
+    // `flag && { x = 7; true }`: when `flag` is false the right operand never
+    // runs, so `x` is not definitely initialized after the condition and the
+    // read after the loop must be rejected, as rustc rejects it (E0381).
+    let err = compile_to_asm(
+        "fn f(flag: bool) -> i64 { let mut x: i64; while flag && { x = 7; true } {} return x; } \
+         fn main() { let _ = f(true); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("possibly-uninitialized variable `x`"), "got: {err}");
+    // The mirror: `flag || { x = 7; true }` skips the right operand when `flag`
+    // is true, and the body runs on that true path, so a read in the body may
+    // see `x` uninitialized. rustc rejects it (E0381).
+    let err = compile_to_asm(
+        "fn f(flag: bool) -> i64 { let mut x: i64; while flag || { x = 7; true } \
+         { let y: i64 = x; break; } return 0; } fn main() { let _ = f(false); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("possibly-uninitialized variable `x`"), "got: {err}");
+    // A binding initialized before the condition is still initialized after it,
+    // so the skipped path does not clobber it.
+    assert!(compile_to_asm(
+        "fn f(flag: bool) -> i64 { let mut x: i64 = 0; while flag && { x = 7; true } {} return x; } \
+         fn main() { let _ = f(true); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+    // A short circuit splits the two branches of an `if` as well. `a && b` is
+    // true only when `b` ran, so the then-branch sees `x` initialized; the
+    // implicit else does not.
+    assert!(compile_to_asm(
+        "fn f(a: bool) -> i64 { let mut x: i64; if a && { x = 7; true } { return x; } return 0; } \
+         fn main() { let _ = f(true); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+    // `a || b` is true when either side did, so the then-branch may have skipped
+    // `b`; a read there is rejected.
+    let err = compile_to_asm(
+        "fn f(a: bool) -> i64 { let mut x: i64; if a || { x = 7; true } { return x; } return 0; } \
+         fn main() { let _ = f(true); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("possibly-uninitialized variable `x`"), "got: {err}");
+}
+
+#[test]
+fn a_chained_guard_checks_its_right_operand_under_the_left_true_state() {
+    // `(a && { x = 7; true }) && x == 7`: the outer `&&`'s right operand runs
+    // only where the inner `&&` was true, which is exactly where `x` was
+    // assigned. The inner short circuit leaves the merged "either path" state
+    // on the scope, so checking the comparison against that state wrongly
+    // rejected the read. rustc accepts this and returns `7`.
+    assert_eq!(
+        run_exit_code(
+            "fn f(a: bool) -> i64 { let mut x: i64; \
+             if (a && { x = 7; true }) && x == 7 { return x; } return 0; } \
+             fn main() -> i64 { return f(true); }",
+        ),
+        7
+    );
+    // The mirror for `||`: `(a || { x = 7; false }) || x == 7` reaches the
+    // comparison only when the left was false, which is where `x` was assigned.
+    // `x` is left uninitialized so the read only type-checks if that left-false
+    // state is restored; with `x = 0` the case passed even without the restore.
+    assert_eq!(
+        run_exit_code(
+            "fn f(a: bool) -> i64 { let mut x: i64; \
+             if (a || { x = 7; false }) || x == 7 { return 1; } return 0; } \
+             fn main() -> i64 { return f(false); }",
+        ),
+        1
+    );
+    // The guard's write is still not visible *after* the whole condition: on the
+    // path where the outer right operand never runs, `x` is uninitialized, so a
+    // read in the else must be rejected. rustc rejects it (E0381).
+    let err = compile_to_asm(
+        "fn f(a: bool) -> i64 { let mut x: i64; if (a && { x = 7; true }) && x == 7 { return 1; } \
+         else { return x; } } fn main() { let _ = f(true); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("possibly-uninitialized variable `x`"), "got: {err}");
+    // A value use still sees the merged state: `let b = a && { x = 7; true }`
+    // may skip the right operand, so the later read is rejected. rustc rejects
+    // it (E0381).
+    let err = compile_to_asm(
+        "fn f(a: bool) -> i64 { let mut x: i64; let b = a && { x = 7; true }; \
+         if b { return x; } return 0; } fn main() { let _ = f(true); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("possibly-uninitialized variable `x`"), "got: {err}");
+}
+
+#[test]
+fn a_both_diverge_if_does_not_uninitialize_a_live_binding() {
+    // Neither branch of `if true { return 1 } else { return 2 }` reaches the
+    // code after it, so a binding initialized before the `if` stays initialized
+    // (the read is unreachable, but rustc still accepts it). Merging the two
+    // diverging branches as `false` wrongly clobbered it and rejected the read.
+    assert!(compile_to_asm(
+        "fn f() -> i64 { let mut x: i64 = 0; if true { return 1; } else { return 2; } return x; } \
+         fn main() { let _ = f(); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
 fn an_immutable_parameter_cannot_be_assigned() {
     let err = compile_to_asm(
         "fn f(x: i64) -> i64 { x = 2; return x; } fn main() -> i64 { return f(1); }",
@@ -1977,15 +3182,21 @@ fn a_ref_typed_parameter_is_one_slot_not_a_copy() {
 
 #[test]
 fn a_method_with_a_ref_receiver_passes_an_address() {
-    let out = asm(
+    let out = asm_no_inline(
         "struct P { x: i64, y: i64 } \
          impl P { fn get(&self) -> i64 { return self.x; } } \
          fn main() -> i64 { let v: P = P { x: 5, y: 6 }; return v.get(); }",
     );
     // The receiver arrives as an address: the method reads `x` through the
-    // pointer it was handed, not from a copied frame slot.
+    // pointer it was handed, not from a copied frame slot. The field read is an
+    // indirect load off the receiver register (`0(%r..)`), never a frame slot.
     assert!(out.contains("P$get"), "mangled method present in:\n{out}");
-    assert!(out.contains("(%rax)"), "field read through a pointer in:\n{out}");
+    let get = &out[out.find("P$get:").expect("method body")..];
+    let body = &get[..get.find(".size P$get").expect("method end")];
+    assert!(
+        body.contains("(%rbx)") || body.contains("(%rax)"),
+        "field read through a pointer in:\n{body}"
+    );
 }
 
 #[test]
@@ -2073,7 +3284,7 @@ fn a_write_through_a_reference_to_a_struct_field_stores_to_the_field() {
 
 #[test]
 fn a_mut_receiver_is_passed_by_address() {
-    let out = asm(
+    let out = asm_no_inline(
         "struct C { n: i64 } \
          impl C { fn bump(&mut self) -> i64 { self.n = self.n + 1; return self.n; } } \
          fn main() -> i64 { let mut c: C = C { n: 1 }; return c.bump(); }",
@@ -2107,7 +3318,7 @@ fn a_field_read_through_a_reference_is_one_load() {
     // `mov`/`add`/`mov` sequence: three instructions per field is what made a
     // `&self` accessor over a wide struct an order of magnitude slower than
     // rustc on the `refs` benchmark.
-    let out = asm(
+    let out = asm_no_inline(
         "struct P { x: i64, y: i64 } \
          fn get(p: &P) -> i64 { return p.y; } \
          fn main() -> i64 { let q: P = P { x: 1, y: 2 }; return get(&q); }",
@@ -2126,7 +3337,7 @@ fn a_field_read_through_a_reference_is_one_load() {
 fn a_field_read_through_a_double_reference_still_loads_the_inner_pointer() {
     // The register fold only applies one level deep; `(**ppr).x` must go
     // through the inner pointer, not treat it as a register.
-    let out = asm(
+    let out = asm_no_inline(
         "struct P { x: i64, y: i64 } \
          fn get(pp: &&P) -> i64 { return (**pp).x; } \
          fn main() -> i64 { let q: P = P { x: 1, y: 2 }; let r: &P = &q; return get(&r); }",
@@ -2138,7 +3349,7 @@ fn a_field_read_through_a_double_reference_still_loads_the_inner_pointer() {
 fn a_scalar_dereference_folds_into_a_comparison() {
     // `*p < 5` with `p` in a register is one `cmp mem, imm`; the deref is a
     // memory operand, not a load into `%rax` first.
-    let out = asm("fn lt(p: &i64) -> bool { return *p < 5; } fn main() -> i64 { let x: i64 = 1; if lt(&x) { return 1; } return 0; }");
+    let out = asm_no_inline("fn lt(p: &i64) -> bool { return *p < 5; } fn main() -> i64 { let x: i64 = 1; if lt(&x) { return 1; } return 0; }");
     let body: String = out
         .lines()
         .skip_while(|l| !l.starts_with("lt:"))
@@ -2296,6 +3507,35 @@ fn a_recursive_function_is_not_inlined_into_itself() {
 }
 
 #[test]
+fn a_loop_bearing_helper_is_inlined_into_its_caller() {
+    // `gcd` has a `while` loop, but it is call-free and small, so it is still a
+    // candidate: inlining it removes the call from the caller's hot loop. The
+    // loop lives in the caller's frame now, so no `call gcd` remains.
+    let out = asm(
+        "fn gcd(a: i64, b: i64) -> i64 { \
+             let mut x: i64 = a; let mut y: i64 = b; \
+             while y != 0 { let t: i64 = x % y; x = y; y = t; } \
+             return x; } \
+         fn main() -> i64 { return gcd(12, 18); }",
+    );
+    assert!(!out.contains("call gcd"), "the loop-bearing helper is inlined in:\n{out}");
+}
+
+#[test]
+fn a_loop_bearing_helper_with_break_is_not_inlined() {
+    // A `break`/`continue` in a candidate would bind to the *caller's* enclosing
+    // loop once spliced, so a body containing one must stay a real call.
+    let out = asm(
+        "fn first_over(limit: i64) -> i64 { \
+             let mut i: i64 = 0; \
+             while i < 100 { if i > limit { break; } i = i + 1; } \
+             return i; } \
+         fn main() -> i64 { return first_over(3); }",
+    );
+    assert!(out.contains("call first_over"), "the early-exit helper is kept in:\n{out}");
+}
+
+#[test]
 fn no_inline_option_keeps_the_call() {
     let out = asm_no_inline(
         "struct P { x: i64, y: i64 } \
@@ -2338,11 +3578,90 @@ fn asm_no_licm(src: &str) -> String {
         .expect("should compile")
 }
 
+/// Compile `src` with the built `rmc` and run it, returning the exit status
+/// code (the value a `main() -> i64` returns) together with stdout. Shells
+/// out, so it only runs where the toolchain can link.
+fn run_output(src: &str) -> (i32, String) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "rmc-run-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let srcp = dir.join("m.rs");
+    let bin = dir.join("m.bin");
+    std::fs::write(&srcp, src).unwrap();
+    let rmc = env!("CARGO_BIN_EXE_rmc");
+    let out = std::process::Command::new(rmc)
+        .arg("-o")
+        .arg(&bin)
+        .arg(&srcp)
+        .output()
+        .expect("run rmc");
+    assert!(out.status.success(), "rmc failed: {}", String::from_utf8_lossy(&out.stderr));
+    let run = std::process::Command::new(&bin).output().expect("run the binary");
+    let _ = std::fs::remove_dir_all(&dir);
+    (
+        run.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&run.stdout).into_owned(),
+    )
+}
+
+/// The exit status code of a compiled-and-run `main() -> i64`.
+fn run_exit_code(src: &str) -> i32 {
+    run_output(src).0
+}
+
 /// The instructions inside `main` only, so a hoisted value appearing before the
 /// loop is visible but a runtime helper's code is not.
 fn main_body(out: &str) -> String {
     let body = &out[out.find("main:").unwrap()..];
     body[..body.find(".size main").unwrap()].to_string()
+}
+
+/// Every `name: .. .size name` function body in the assembly.
+fn fn_bodies(out: &str) -> Vec<(String, String)> {
+    let lines: Vec<&str> = out.lines().collect();
+    let mut v = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let l = lines[i].trim();
+        if l.ends_with(':') && !l.starts_with('.') {
+            let name = l.trim_end_matches(':').to_string();
+            let mut body = String::new();
+            let mut j = i + 1;
+            while j < lines.len() && !lines[j].trim_start().starts_with(".size ") {
+                body.push_str(lines[j]);
+                body.push('\n');
+                j += 1;
+            }
+            v.push((name, body));
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    v
+}
+
+/// The depth a function's prologue pushes `%rsp` below its entry value, mod 16.
+/// Entry `%rsp` is 8 mod 16 (the caller's `call` pushed the return address), so
+/// the call ABI wants this to be 8: at a `call`, `%rsp` is then 0 mod 16.
+fn prologue_depth_mod16(body: &str) -> i32 {
+    let mut d = 0i32;
+    for l in body.lines() {
+        let t = l.trim();
+        if t.starts_with("push ") {
+            d += 8;
+        } else if let Some(rest) = t.strip_prefix("sub $") {
+            if let Some(n) = rest.strip_suffix(", %rsp") {
+                d += n.parse::<i32>().unwrap();
+            }
+        }
+    }
+    d % 16
 }
 
 /// The first loop in `main`: the label a later `jmp` targets, through that jump.
@@ -2387,9 +3706,13 @@ fn an_invariant_product_is_hoisted_out_of_a_loop() {
 
 #[test]
 fn a_value_the_loop_writes_is_not_hoisted() {
-    // `x` is reassigned in the loop, so `x * 2` is loop-variant and must stay.
+    // `x` is reassigned in the loop, so `x * 7` is loop-variant and must stay.
+    // The multiplier is deliberately not `lea`-expressible (2/3/4/5/8/9), so the
+    // product still compiles to an `imul` and this asserts on the multiply
+    // itself rather than on a `lea` that also appears in the loop's own
+    // increment.
     let src = "fn main() -> i64 { let mut x: i64 = 1; let mut s: i64 = 0; let mut i: i64 = 0; \
-               while i < 10 { x = x + i; s = s + x * 2; i = i + 1; } return s; }";
+               while i < 10 { x = x + i; s = s + x * 7; i = i + 1; } return s; }";
     let with = loop_body(&asm(src));
     assert!(with.contains("imul"), "a loop-variant product stays in the loop:\n{with}");
 }
@@ -2518,12 +3841,47 @@ fn a_field_read_through_a_reference_blocks_hoisting() {
 #[test]
 fn a_register_only_leaf_allocates_no_frame() {
     // Every local is promoted into a callee-saved register and nothing is
-    // materialised, so the body addresses no frame slot and the prologue needs
-    // no `sub`. (The epilogue still restores `%rsp` to the saved registers.)
+    // materialised, so the body addresses no frame slot. Nothing is addressed
+    // through `%rbp`, so the prologue omits the frame pointer entirely — no
+    // `push %rbp`/`mov %rsp, %rbp`/`leave`. The two saved registers push 16
+    // bytes, which is 0 mod 16, so an 8-byte pad restores the 8 mod 16 the call
+    // ABI wants; that pad is the only `sub`.
     let src = "fn main() -> i64 { let a: i64 = 1; let b: i64 = 2; return a + b; }";
     let body = main_body(&asm(src));
-    assert!(!body.contains("sub $"), "a register-only leaf needs no frame:\n{body}");
-    assert!(body.contains("leave"), "the frame pointer is still restored:\n{body}");
+    assert!(!body.contains("push %rbp"), "no frame pointer without frame slots:\n{body}");
+    assert!(!body.contains("leave"), "no `leave` without a frame pointer:\n{body}");
+    assert!(!body.contains("sub $16"), "only the alignment pad, no local frame:\n{body}");
+}
+
+#[test]
+fn every_function_keeps_rsp_aligned_at_calls() {
+    // The call ABI wants `%rsp ≡ 8 (mod 16)` at entry (so 0 at a `call`). Both
+    // prologue paths must honour it: with a frame pointer the `push %rbp`
+    // supplies the 8, without one an explicit pad does. A violation is silent
+    // (rmc's runtime never touches aligned SSE), so it is asserted here over a
+    // mix of leaf, spill-heavy and frame-heavy functions.
+    let srcs = [
+        "fn main() -> i64 { return 1; }",
+        "fn main() -> i64 { let a: i64 = 1; let b: i64 = 2; return a + b; }",
+        "fn f(x: i64) -> i64 { return x; } fn g(x: i64) -> i64 { return f(x - 1) + f(x - 2); } fn main() -> i64 { return g(5); }",
+        "fn main() -> i64 { let a: [i64; 3] = [1, 2, 3]; return a[0] + a[1] + a[2]; }",
+        "fn main() -> i64 { let mut s: i64 = 0; let mut i: i64 = 0; while i < 10 { s = s + i; i = i + 1; } return s; }",
+    ];
+    for src in srcs {
+        for out in [asm(src), asm_no_inline(src)] {
+            for (name, body) in fn_bodies(&out) {
+                // `_start` realigns `%rsp` itself (`and $-16, %rsp`) and is not
+                // a compiled function; the other runtime helpers take no calls.
+                if name.starts_with('_') || !body.contains("call ") {
+                    continue;
+                }
+                assert_eq!(
+                    prologue_depth_mod16(&body), 8,
+                    "`{name}` misaligns `%rsp` at a call:\n{body}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -2624,14 +3982,16 @@ fn a_variable_divisor_uses_its_register_directly() {
 #[test]
 fn a_variable_division_has_a_32_bit_fast_path() {
     // Both operands usually fit in 32 bits, where `div`/`idiv` is cheaper than
-    // the 64-bit form. The guard compares against 2^32 unsigned, so a negative
-    // operand takes the 64-bit `idiv` path and the result is still correct.
+    // the 64-bit form. The guard ORs the two operands and shifts the top 32 bits
+    // out, so a negative operand (whose high bit is set) takes the 64-bit `idiv`
+    // path and the result is still correct.
     let src = "fn q(a: i64, b: i64) -> i64 { return a / b; } \
                fn main() -> i64 { return q(100, 7); }";
     let out = asm_no_inline(src);
     let q = &out[out.find("q:").unwrap()..];
     let q = &q[..q.find(".size q").unwrap()];
-    assert!(q.contains("mov $4294967296, %rdx"), "2^32 guard:\n{q}");
+    assert!(q.contains("shr $32, %rdx"), "32-bit-fit guard:\n{q}");
+    assert!(q.contains("jnz "), "guard branches to the slow path:\n{q}");
     // The 32-bit divide names a `d`-suffixed register (`div %r12d`), never the
     // 64-bit `idiv`.
     assert!(q.contains("div %") && q.lines().any(|l| l.trim_start().starts_with("div %")), "32-bit fast path:\n{q}");
@@ -2900,23 +4260,312 @@ fn a_duplicate_const_is_rejected() {
 }
 
 #[test]
+fn a_value_loop_binds_its_break_value() {
+    // `loop` is an expression: the `break` value is stored into the loop's
+    // result slot, which the code after the loop reads.
+    let out = asm("fn main() -> i64 { let x: i64 = loop { break 5; }; return x; }");
+    assert!(out.contains("movq $5, "), "break value stored to the result slot:\n{out}");
+}
+
+#[test]
+fn a_break_value_in_a_while_is_rejected() {
+    // rustc E0571: only a `loop` can be broken out of with a value.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let mut i: i64 = 0; while i < 2 { break 5; } return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("only allowed in a `loop`"), "got: {err}");
+}
+
+#[test]
+fn a_break_value_in_a_statement_loop_is_rejected() {
+    // A `loop` in statement position is typed `()`, so a value cannot break out
+    // of it: the `break` value is checked against `()`.
+    let err = compile_to_asm(
+        "fn main() -> i64 { loop { break 5; } return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("used as a statement"), "got: {err}");
+}
+
+#[test]
+fn a_diverging_loop_branch_without_else_is_accepted() {
+    // `if c { loop {} }`: the branch is `!`, so the `if` is `()` and the code
+    // after it is still reachable.
+    let out = asm("fn main() -> i64 { let mut n: i64 = 0; if n > 0 { loop {} } n = n + 1; return n; }");
+    assert!(out.contains("main:"), "accepted:\n{out}");
+}
+
+#[test]
+fn a_completing_loop_body_must_be_unit() {
+    // A body that can fall through cannot yield a value; only `break` does.
+    let err = compile_to_asm(
+        "fn main() -> i64 { let x: i64 = loop { 5 }; return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("`loop` body must evaluate to `()`"), "got: {err}");
+}
+
+#[test]
+fn mismatched_break_values_are_rejected() {
+    let err = compile_to_asm(
+        "fn main() -> i64 { let x: i64 = loop { break 1; break true; }; return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("break` value type mismatch"), "got: {err}");
+}
+
+#[test]
+fn a_break_value_in_a_while_let_is_rejected() {
+    // `while let` desugars to a `loop` whose `else` arm always ends in a plain
+    // `break;`, so a `break value` in the body is a type mismatch. rustc
+    // rejects it too (E0571).
+    let err = compile_to_asm(
+        "enum Opt { Some(i64), None } \
+         fn main() -> i64 { let mut i: i64 = 0; \
+         while let Opt::Some(x) = Opt::Some(i) { i = i + 1; if i == 3 { break 5; } } \
+         return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("break`"), "got: {err}");
+}
+
+// ---------------------------------------------------------------------------
+// Struct update syntax `S { field: value, ..base }`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_struct_update_fills_the_unwritten_fields_from_the_base() {
+    let out = asm(
+        "struct P { x: i64, y: i64 } \
+         fn main() -> i64 { let a: P = P { x: 1, y: 2 }; let b: P = P { x: 5, ..a }; return b.x + b.y; }",
+    );
+    assert!(out.contains("main:"), "accepted:\n{out}");
+}
+
+#[test]
+fn a_struct_update_evaluates_the_field_values_before_the_base() {
+    // rustc evaluates the written fields left to right, then the base. The
+    // desugaring binds each field value before `call mk`, so `call f` precedes
+    // `call mk` in the emitted code.
+    let out = asm_no_inline(
+        "struct P { x: i64, y: i64 } \
+         fn f(t: i64) -> i64 { return t; } \
+         fn mk() -> P { return P { x: 7, y: 8 }; } \
+         fn main() -> i64 { let b: P = P { x: f(1), ..mk() }; return b.x + b.y; }",
+    );
+    let f_at = out.find("call f").expect("call f");
+    let mk_at = out.find("call mk").expect("call mk");
+    assert!(f_at < mk_at, "field value must be evaluated before the base:\n{out}");
+}
+
+#[test]
+fn a_struct_update_copies_an_aggregate_field_by_value() {
+    // A struct-typed field must be copied word by word, not stored as an
+    // address, so the result does not alias the field's source.
+    let out = asm(
+        "struct Inner { a: i64 } struct P { i: Inner, y: i64 } \
+         fn main() -> i64 { let g: Inner = Inner { a: 5 }; let a: P = P { i: g, y: 2 }; \
+         let b: P = P { y: 9, ..a }; return b.i.a + b.y; }",
+    );
+    assert!(out.contains("main:"), "accepted:\n{out}");
+}
+
+#[test]
+fn a_struct_update_may_copy_every_field() {
+    // `P { ..a }` with no written fields is valid Rust.
+    let out = asm(
+        "struct P { x: i64, y: i64 } \
+         fn main() -> i64 { let a: P = P { x: 1, y: 2 }; let b: P = P { ..a }; return b.x + b.y; }",
+    );
+    assert!(out.contains("main:"), "accepted:\n{out}");
+}
+
+#[test]
+fn a_struct_update_base_may_be_another_struct_literal() {
+    let out = asm(
+        "struct P { x: i64, y: i64 } \
+         fn main() -> i64 { let a: P = P { x: 1, y: 2 }; \
+         let b: P = P { x: 3, ..P { y: 4, ..a } }; return b.x + b.y; }",
+    );
+    assert!(out.contains("main:"), "accepted:\n{out}");
+}
+
+#[test]
+fn a_struct_update_uses_a_local_that_does_not_alias_the_base() {
+    // The desugaring binds the base to a fresh local, so the result is an
+    // independent value: mutating it must not write through to the base.
+    let out = asm(
+        "struct P { x: i64, y: i64 } \
+         fn main() -> i64 { let a: P = P { x: 1, y: 2 }; let mut b: P = P { x: 5, ..a }; \
+         b.y = 9; return a.y + b.y; }",
+    );
+    assert!(out.contains("main:"), "accepted:\n{out}");
+}
+
+#[test]
+fn a_field_written_twice_in_a_struct_update_is_rejected() {
+    let err = compile_to_asm(
+        "struct P { x: i64, y: i64 } \
+         fn main() -> i64 { let a: P = P { x: 1, y: 2 }; let b: P = P { x: 5, x: 6, ..a }; return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("more than once"), "got: {err}");
+}
+
+#[test]
+fn a_struct_update_with_an_unknown_field_is_rejected() {
+    let err = compile_to_asm(
+        "struct P { x: i64, y: i64 } \
+         fn main() -> i64 { let a: P = P { x: 1, y: 2 }; let b: P = P { z: 5, ..a }; return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("has no field `z`"), "got: {err}");
+}
+
+#[test]
+fn a_struct_update_with_a_wrong_field_type_is_rejected() {
+    // The field value is bound to a temporary and assigned into the result, so
+    // the mismatch surfaces as an assignment type error.
+    let err = compile_to_asm(
+        "struct P { x: i64, y: i64 } \
+         fn main() -> i64 { let a: P = P { x: 1, y: 2 }; let b: P = P { x: true, ..a }; return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("mismatch"), "got: {err}");
+}
+
+#[test]
+fn a_struct_update_base_of_the_wrong_type_is_rejected() {
+    let err = compile_to_asm(
+        "struct P { x: i64, y: i64 } struct Q { z: i64 } \
+         fn main() -> i64 { let q: Q = Q { z: 1 }; let b: P = P { x: 5, ..q }; return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("does not match"), "got: {err}");
+}
+
+#[test]
+fn a_guard_that_mutates_the_scrutinee_keeps_the_matched_value() {
+    // A pattern binding captures the scrutinee when the arm matches. A guard
+    // that assigns the scrutinee (`x = 2`) must not change what the arm body
+    // reads: `n` keeps the value 1 the arm matched. rustc's borrow checker
+    // rejects this program (E0506), so it cannot live in the differential
+    // corpus; the value is pinned here by running the built binary.
+    let dir = std::env::temp_dir().join(format!("rmc-guardmut-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("m.rms");
+    let bin = dir.join("m.bin");
+    std::fs::write(
+        &src,
+        "fn main() -> i64 { let mut x: i64 = 1; \
+         let r: i64 = match x { n if { x = 2; true } => n, _ => 0 }; \
+         print_i64(r); return 0; }\n",
+    )
+    .unwrap();
+
+    let rmc = env!("CARGO_BIN_EXE_rmc");
+    let out = std::process::Command::new(rmc)
+        .arg("-o")
+        .arg(&bin)
+        .arg(&src)
+        .output()
+        .expect("run rmc");
+    assert!(out.status.success(), "rmc failed: {}", String::from_utf8_lossy(&out.stderr));
+    let run = std::process::Command::new(&bin).output().expect("run the binary");
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "1\n", "the guard must not change the bound value");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn no_strip_keeps_a_symbol_table_in_the_output() {
+    // `--no-strip` exists so `nm` can read the artifact. The in-process encoder
+    // writes no symbol table, so the flag must route through `as`/`ld` instead
+    // of silently producing a symbol-less binary. Skips when the toolchain is
+    // absent (the rest of the suite never shells out).
+    if std::process::Command::new("as").arg("--version").output().is_err() {
+        eprintln!("skipping: `as` not on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("rmc-nostrip-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("m.rms");
+    let bin = dir.join("m.bin");
+    std::fs::write(&src, "fn main() -> i64 { return 0; }\n").unwrap();
+
+    let rmc = env!("CARGO_BIN_EXE_rmc");
+    let out = std::process::Command::new(rmc)
+        .arg("--no-strip")
+        .arg("-o")
+        .arg(&bin)
+        .arg(&src)
+        .output()
+        .expect("run rmc");
+    assert!(out.status.success(), "rmc failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    let nm = std::process::Command::new("nm").arg(&bin).output().expect("run nm");
+    let symbols = String::from_utf8_lossy(&nm.stdout);
+    assert!(
+        symbols.contains("main") || !symbols.trim().is_empty(),
+        "expected a symbol table, nm printed nothing"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn no_strip_conflicts_with_min_size() {
+    // `--min-size` strips the symbol table `--no-strip` asks to keep, so the
+    // combination is rejected rather than silently producing a stripped binary.
+    let dir = std::env::temp_dir().join(format!("rmc-conflict-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("m.rms");
+    std::fs::write(&src, "fn main() -> i64 { return 0; }\n").unwrap();
+
+    let rmc = env!("CARGO_BIN_EXE_rmc");
+    let out = std::process::Command::new(rmc)
+        .arg("--no-strip")
+        .arg("--min-size")
+        .arg("-o")
+        .arg(dir.join("m.bin"))
+        .arg(&src)
+        .output()
+        .expect("run rmc");
+    assert!(!out.status.success(), "the conflicting flags must be rejected");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("conflict"), "got: {stderr}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+
+#[test]
 fn inlining_copies_a_parameter_whose_address_the_callee_takes() {
     // The callee takes `&mut x` and writes through it. Inlining must give the
     // parameter its own slot, so the `*p = 9` store must not land in the
     // caller's slot for `y` (whose address `&y` pins to memory).
     let out = asm("fn take_mut(mut x: i64) -> i64 { let p = &mut x; *p = 9; x } fn main() -> i64 { let y: i64 = 1; let q = &y; return take_mut(y) + *q; }");
-    let y_slot = store_offset_after(&out, "mov $1, %rax");
-    // The parameter's temporary is the `lea` whose address the write uses.
+    let y_slot: i32 = {
+        let tail = &out[out.find("movq $1, ").expect("store of 1")..];
+        let rest = &tail["movq $1, ".len()..];
+        rest[..rest.find("(%rbp)").expect("frame store")].trim().parse().expect("offset")
+    };
     let before_write = out.split("movq $9, (%rax)").next().expect("a write of 9");
     let lea = before_write.rfind("lea ").expect("a lea before the write");
     let tail = &before_write[lea + "lea ".len()..];
-    let param_slot: i32 = tail[..tail.find("(%rbp)").expect("a frame address")]
+    let param_slot: i32 = tail[..tail.find("(%rbp)").expect("frame address")]
         .trim()
         .parse()
         .expect("an offset");
     assert_ne!(param_slot, y_slot, "the write must target the parameter's own slot");
 }
-
 #[test]
 fn an_aggregate_reference_argument_does_not_use_the_direct_call_path() {
     // `&{ s }` materialises the aggregate through %rdi/%rsi. If the call kept

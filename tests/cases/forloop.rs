@@ -23,4 +23,25 @@ fn main() {
         u += k;
     }
     println!("{}", u);
+    let mut v: i64 = 0;
+    for i in 0..=10 {
+        v += i;
+    }
+    println!("{}", v);
+    let mut w: i64 = 0;
+    for i in 5..=3 {
+        w += i;
+    }
+    println!("{}", w);
+    let mut z: i64 = 0;
+    for i in 7..=7 {
+        z += i;
+    }
+    println!("{}", z);
+    let m: i64 = 4;
+    let mut q: i64 = 0;
+    for i in 1..=m {
+        q += i;
+    }
+    println!("{}", q);
 }

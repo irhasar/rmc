@@ -10,7 +10,8 @@ time; there are no runtime type errors.
 | ------------ | --------------------------------------------- |
 | `i64`        | signed 64-bit integer                         |
 | `bool`       | `true` or `false`                             |
-| `[T; N]`     | fixed-size array of `N` `i64`, `bool` or unit-enum elements |
+| `str`        | a string (one word: a pointer to a `{len, bytes}` record) |
+| `[T; N]`     | fixed-size array of `N` `T` elements, where `T` is a scalar, a struct or another array |
 | `&T` `&mut T`| a reference to a `T` (one word)               |
 | `Name`       | a struct declared with `struct Name { .. }`   |
 | `Name`       | an enum declared with `enum Name { .. }`      |
@@ -32,13 +33,29 @@ pointer).
 struct Point { x: i64, y: i64 }
 
 let p: Point = Point { x: 3, y: 4 };   // fields may be given in any order
+let x: i64 = 3;
+let y: i64 = 4;
+let r: Point = Point { x, y };         // field init shorthand: `x` means `x: x`
+let s: Point = Point { y: 5, x };      // shorthand and explicit fields mix
 let mut q: Point = Point { x: 0, y: 0 };
 q.x = q.x + 1;                          // field read and write
+
+let base: Point = Point { x: 1, y: 2 };
+let u: Point = Point { x: 9, ..base }; // struct update: y is copied from base
 ```
 
+Struct update syntax `Point { field: value, ..base }` fills every field not
+written above the base from `base`. The written field values are evaluated first,
+left to right, then the base — the order rustc uses — so a field value with a
+side effect runs before the base. The result is a fresh value, so mutating it
+does not change `base`. `Point { ..base }` with no written fields is allowed, as
+is a struct literal as the base (`Point { x: 3, ..Point { y: 4, ..base } }`); a
+comma may not follow the base.
+
 Fields are laid out in declaration order with no padding. A struct may contain
-another struct, but not itself, and it cannot be used as an array element.
-Structs may be passed to and returned from functions by value, assigned to one
+another struct or an array, but not itself. Field init shorthand is supported: `Point { x, y }` is `Point { x: x, y: y }`,
+and a bare name must resolve to a local of that name. Structs may be passed to
+and returned from functions by value, assigned to one
 another (`p = q`), and nested as fields; in every case the value is copied, so a
 change to one does not reach the other. To reuse a
 struct after passing it (as `bump(a)` then reading `a`), annotate it
@@ -51,11 +68,12 @@ and ignores the attribute.
 struct Point { x: i64, y: i64 }
 
 impl Point {
+    fn new(x: i64, y: i64) -> Point { return Point { x, y }; }  // associated fn
     fn sum(self) -> i64 { return self.x + self.y; }
     fn moved(self, dx: i64) -> Point { return Point { x: self.x + dx, y: self.y }; }
 }
 
-let p: Point = Point { x: 3, y: 4 };
+let p: Point = Point::new(3, 4);
 let q: Point = p.moved(1);
 p.sum();                     // 7
 q.sum();                     // 8
@@ -71,6 +89,17 @@ and literal position. The method is resolved from the receiver's type, so two
 structs may define a method with the same name. A method call chains
 (`p.moved(1).sum()`) and a struct literal may be a receiver directly
 (`Point { x: 1, y: 2 }.sum()`).
+
+A function in an `impl` block that does **not** take `self` is an **associated
+function**: it is called through the type, `Point::new(3, 4)`, not on a value.
+This is the usual constructor idiom (`String::new`, `Vec::with_capacity`), and
+it works on enums too (`Tag::from_flag(true)`). An associated function is
+resolved to the mangled free function `Type$name` the same way a method is; the
+only difference is that no receiver is inserted as the first argument. Calling
+one with `.` (`p.new(1, 2)`) is therefore an arity error — the receiver would be
+an extra argument — and naming one without a call (`let f = Point::new;`) is
+rejected, since rmc has no function values. A name in `Type::name` that is not a
+variant of that enum and not an associated function is reported as such.
 
 ## Enums
 
@@ -89,6 +118,21 @@ against another value of the same enum, stored in a struct field, passed and
 returned by value, and used as a `match` scrutinee with `Color::Green` patterns.
 An enum may also have `impl` methods. `as` cannot convert an `i64` **to** an
 enum (rustc rejects that too); use a `match` to go from a tag back to a variant.
+
+A variant may write its value explicitly with `= N`, and the value need not be
+its index:
+
+```rust
+enum Code { Ok = 0, Warn = 4, Err }   // Err is 5, the previous value plus one
+
+Code::Warn as i64;                    // 4, the written value
+```
+
+A variant with no `= N` takes the previous variant's value plus one, starting at
+0. A `match` arm and an `as i64` both read the written value. Only a unit
+variant may have a discriminant — a payload variant's tag is an implementation
+detail, so `Variant(i64) = 5` is rejected, as in rustc. Two variants may not
+share a value.
 
 ### Enums with a payload
 
@@ -165,16 +209,29 @@ namespace, so giving both the same name is an error (rustc's `E0428`).
 ```rust
 let x: i64 = 1;          // immutable binding
 let mut y: i64 = 0;      // mutable binding
+let _ = e;               // discard: evaluate `e` for side effects, bind nothing
+let _: T;                // annotated discard, no initialiser (a no-op)
 y = y + 1;               // assignment (target may be a variable, array element or field)
 y += 1;                  // compound assignment: += -= *= /= %=
 x;                       // expression statement
 if cond { ... } else { ... }
 while cond { ... }
+while let PAT = expr { ... }  // re-tests expr each iteration; stops on no match
 for i in 0..10 { ... }   // i64 range, end exclusive
+for i in 0..=10 { ... }  // i64 range, end inclusive
+for x in arr { ... }     // array, by value, left to right (x is the element)
 loop { ... }
+loop { ... break v; }    // `loop` is an expression: `break v` yields `v`
 break;
+break v;                 // only legal inside a `loop` (rustc's E0571 otherwise)
 continue;
-return expr;
+'a: loop { ... }         // labelled loops
+'a: while cond { ... }
+'a: for i in 0..10 { ... }
+break 'a;                // leave the loop labelled `'a` (any enclosing one)
+break 'a v;              // ... yielding `v`, when `'a` is a `loop`
+continue 'a;             // next iteration of the loop labelled `'a`
+return expr;             // `;` may be omitted at the end of a block
 ```
 
 `let` without an initialiser defers initialisation: the binding must be written
@@ -182,7 +239,11 @@ before it is read, exactly as in Rust. Reading a binding that is not definitely
 initialised on every path is rejected (rustc's `E0381`), so `let x: i64;` then
 `return x;` does not compile. Writing one field or element of an uninitialised
 aggregate leaves it uninitialised as a whole, so reading it is still an error
-(rustc's "partially assigned"). A `let` or parameter without `mut` is
+(rustc's "partially assigned"). `let _ = e;` discards `e`: it is evaluated once
+for its side effects and binds nothing, and any annotation is still checked
+(`let _: bool = 5;` is rejected, rustc's `E0308`). `let _;` with no annotation
+has no type to infer and is rejected (rustc's `E0282`); `let _: T;` is a no-op.
+A `let` or parameter without `mut` is
 immutable: assigning it (rustc's `E0384`), assigning a field or element of it
 (`E0594`), or taking `&mut` of it (`E0596`) is rejected. Add `mut` (or `mut x:
 T` on a parameter) to write it. A `&mut T` reference is writable through without
@@ -191,7 +252,39 @@ names must be unique, and `main` takes no arguments. Constant arithmetic that
 would trap — division or remainder by zero, `i64` overflow, or a shift by 64 or
 more — is a compile error, matching rustc; variable operands are still checked
 at run time only when `--overflow-checks` is on. `for` bounds are evaluated
-once, before the loop; `continue` still runs the increment.
+once, before the loop; `continue` still runs the increment. `for x in arr`
+iterates an array by value: the head is evaluated once, the bound is the
+array's compile-time length, and `x` is a fresh immutable binding each
+iteration. Only a binding or `_` may be the loop variable; `for x in &arr`
+(which Rust iterates by reference) is rejected rather than mistyped. `while let` is
+`loop { if let PAT = expr { body } else { break; } }`: the scrutinee is
+re-evaluated every iteration, and `continue` re-tests it rather than jumping to
+the top.
+
+A branch whose type diverges (`return`, or a `loop` with no reachable `break`)
+unifies with any other branch's type, as Rust's `!` does, so
+`if c { 1 } else { return 2 }` is accepted. The trailing `;` after
+`return`/`break`/`continue` may be omitted when it is the last thing in a block,
+since those diverge and no expression can follow them. A whole block that
+cannot complete is `!` too, so it fits any expected type: `fn f(e: E) -> i64 {
+match e { E::A => { return 1; } E::B => { return 2; } } }` (every arm returns),
+`let x: i64 = if c { return 1; } else { return 2; };`, and `fn g() -> i64 {
+loop {} }` are all accepted, matching rustc.
+
+`loop` is an expression: `break v` makes the loop itself evaluate to `v`, so
+`let x: i64 = loop { ... break 5; };` is accepted. Every `break` in the loop
+must agree on one type, with `!` unifying with anything; a `loop` with no
+reachable `break` is `!` and so unifies with any context. `break v` is only
+legal inside a `loop` (not a `while`/`for`), matching rustc's `E0571`, and a
+`loop` used as a statement is typed `()`, so `break v` there is an error.
+
+A loop may carry a label (`'a: loop`, `'a: while`, `'a: for`), and `break 'a` /
+`continue 'a` target the innermost enclosing loop with that label rather than the
+innermost loop overall, so `break 'a` can leave several nested loops at once.
+`break 'a v` yields `v` from a labelled `loop` exactly as `break v` does. A label
+that names no enclosing loop is rejected (rustc's `E0426`). A label on `while
+let` is rejected rather than silently dropped, because `while let` desugars to a
+plain `loop` and the label would be lost.
 
 ## Overflow
 
@@ -225,9 +318,11 @@ compile-time constant is decided at compile time, not by the trap.
   value stays negative) and a shift count is taken modulo 64, matching Rust.
   Precedence, tightest first: `* / %`, `+ -`, `<< >>`, `&`, `^`, `|`, then the
   comparisons and `&& ||`. So `1 + 2 << 3` is `(1 + 2) << 3`, and
-  `if x & 1 == 0` is `(x & 1) == 0`. rmc has only `i64`, so a literal count is
-  masked to 6 bits; in Rust an unconstrained literal count is `i32` and masks to
-  5, which is why a program that mixes the two types can differ.
+  `if x & 1 == 0` is `(x & 1) == 0`. A cast `e as T` binds looser than the unary
+  operators and tighter than `*`, so `*r as i64` is `(*r) as i64` and
+  `-x as i64` is `(-x) as i64`, as in Rust. rmc has only `i64`, so a literal
+  count is masked to 6 bits; in Rust an unconstrained literal count is `i32` and
+  masks to 5, which is why a program that mixes the two types can differ.
 - Nesting is bounded: an expression, block or type may nest at most 100 levels.
   Deeper input is a compile error, not a crash. No hand-written program comes
   close; the limit exists so that pathological input cannot overflow the stack.
@@ -246,22 +341,60 @@ compile-time constant is decided at compile time, not by the trap.
 - Indexing: `arr[i]`.
 - Array literals: `[a, b, c]` and `[value; count]`. A list literal takes its
   element type from the values, so `[true, false]` is a `[bool; 2]` and
-  `[1, 2, 3]` an `[i64; 3]`; mixing the two is an error. An array element is a
-  scalar — `i64`, `bool` or a unit enum — so arrays of arrays, of structs and of
-  payload enums are not supported (rustc rejects the last two as well).
+  `[1, 2, 3]` an `[i64; 3]`; mixing the two is an error. An array element may be
+  a scalar (`i64`, `bool`, a unit enum), a struct or another array, so
+  `[[i64; 3]; 2]`, `[Point; 4]` and `[[[i64; 2]; 2]; 2]` are all valid; a payload
+  enum and a reference are rejected (rustc rejects both as well). Element `i`
+  lives at `base + i * sizeof(T)`, so a wide element (a nested array or a struct)
+  occupies `size / 8` slots, and a whole element may be read, written or copied
+  (`a[i] = b[j]`, `m[i]` as a `[i64; 3]` value).
 - Struct literals: `Point { x: 1, y: 2 }`, usable as a `let` initialiser.
 - Blocks and `if`/`else` are expressions.
-- `match` on integers or enums: `match x { 0 => a, 1 => b, _ => c }` or
-  `match c { Color::Red => a, _ => b }`. An arm pattern is an integer literal
-  (optionally negated), an `Enum::Variant`, or `_`. The first equal arm runs and
-  `_` matches anything; it is an expression, usable as a statement or a value,
-  and a comma before `}` may be omitted. A `match` must be exhaustive, exactly as
-  in Rust: an arm must be `_` (or a binding name), or the arms must name *every*
-  variant of one enum. A non-exhaustive `match` is rejected with an error even
-  when it stands alone as a statement, since rustc rejects it there too.
+- `match` on integers, enums or strings: `match x { 0 => a, 1 => b, _ => c }`,
+  `match c { Color::Red => a, _ => b }` or `match s { "on" => a, _ => b }`. An
+  arm pattern is an integer literal (optionally negated), an integer *range*
+  `lo..hi` / `lo..=hi`, a *string* literal, an `Enum::Variant`, an *or-pattern*
+  `a | b | c`, or `_`. The first matching arm
+  runs and `_` matches anything; it is an expression, usable as a statement or a
+  value, and a comma before `}` may be omitted. An arm body is an expression,
+  but a bare assignment (`0 => acc = 1`), a compound assignment
+  (`1 => acc += 10`), or a `return`/`break`/`continue` is accepted as well, as
+  in Rust; a block-bodied arm (`_ => {}`) also works.
+- Guards: an arm may carry a condition, `PAT if COND => body`. `COND` is any
+  `bool` expression, parsed like an `if` condition, and may read the pattern's
+  bindings (`Opt::Some(v) if v > 10 => ..`). The arm runs only when the pattern
+  matches *and* the guard holds; otherwise the following arms are tried, so a
+  guard is evaluated at most once, in order, and only after its pattern
+  matched. A guarded arm covers **nothing** for exhaustiveness — the guard may
+  be false — so `match x { n if n > 3 => 1 }` is non-exhaustive even though `n`
+  binds every value, and `match e { E::A if c => 1, E::B => 2 }` still needs a
+  `_` or a `E::A` arm without a guard, exactly as rustc's E0004 requires.
+- A `match` must be exhaustive,
+  exactly as in Rust: an arm must be `_` (or a binding name), or the arms must
+  name *every* variant of one enum (including across or-patterns, so
+  `Color::Red | Color::Green => .., Color::Blue => ..` is exhaustive). A
+  non-exhaustive `match` is rejected with an error even when it stands alone as
+  a statement, since rustc rejects it there too.
+- Or-patterns: `a | b | c` matches when any alternative matches, and the arm
+  body runs once. Alternatives may be integers, ranges, `Enum::Variant`s, or
+  `_` (an or-pattern containing `_` is irrefutable). A *binding* alternative
+  (`x | 1`) is rejected, as rustc's `E0408` rejects it, because rmc does not
+  check that the name is bound in every alternative.
+- Range patterns: `lo..hi` is half-open (`lo <= v && v < hi`) and `lo..=hi`
+  inclusive. Both bounds are `i64` and either may be negative; a range whose
+  bounds are out of order (`5..5`, `6..5`) is an empty range and a compile
+  error, as in rustc. A range is not by itself exhaustive, so a `_` arm is
+  still needed unless the other arms cover every value.
+- String patterns: `"lit"` matches a `str` scrutinee by *content*, not by
+  pointer. A `str` value is the address of its `{len, bytes}` record, so a
+  machine compare of two equal literals at different addresses would answer
+  "not equal"; the pattern test is instead the same byte-wise comparison
+  `==` uses, and so calls the runtime helper. A string pattern is never
+  exhaustive on its own, so a `_` (or binding) arm is still required.
 - `if let PAT = EXPR { .. } else { .. }`, sugar for
   `match EXPR { PAT => then, _ => else_or_unit }`. It reuses the `match` pattern
-  grammar, but unlike `match` it need not be exhaustive: a non-matching value
+  grammar (including or-patterns and ranges, `if let 1..=5 = x`), but unlike
+  `match` it need not be exhaustive: a non-matching value
   falls through to the `_` arm. An `else` is optional; with none and a non-unit
   `then`, the branch types differ and the program is rejected, exactly as rustc
   rejects it — including when the pattern is irrefutable (`if let y = o { 1 }`
@@ -269,8 +402,17 @@ compile-time constant is decided at compile time, not by the trap.
   position, work like `if`.
 - String literals, given their own type (a pointer to a `{len, bytes}` record).
   A string is not an `i64`: it cannot be an arithmetic operand and cannot be
-  passed where an `i64` is expected. The only thing to do with one is pass it to
-  `print_str`.
+  passed where an `i64` is expected. Two strings may be compared with `==`,
+  `!=`, `<`, `<=`, `>` and `>=`, which compare their bytes, not their addresses;
+  `print_str` writes one to standard output. `s.len()` gives the byte length:
+  it reads the record's length word (a runtime helper, since a `str` is a
+  pointer), and is an `i64` where rustc's is a `usize`. `a.len()` on an array of
+  length `N` is the compile-time constant `N`, with no runtime work.
+- The type of a string literal is named `str` and may be written wherever a type
+  goes: a `let` annotation, a parameter, a return type or a struct field
+  (`fn f(s: str) -> str`, `struct M { s: str, n: i64 }`). A `str` is one word, so
+  a `str` parameter is passed by value as its pointer, and a `str` field is
+  copied as one word — unlike Rust's `&str`, which is a two-word fat pointer.
 
 ## Builtins
 
@@ -279,7 +421,7 @@ Provided by the runtime; no declaration or import is required.
 | builtin         | signature      |
 | --------------- | -------------- |
 | `print_i64(x)`  | `(i64) -> ()`  |
-| `print_str(s)`  | `(&str) -> ()` |
+| `print_str(s)`  | `(str) -> ()`  |
 | `print_bool(b)` | `(bool) -> ()` |
 | `putchar(c)`    | `(i64) -> ()`  |
 | `alloc(n)`      | `(i64) -> i64` |
@@ -293,7 +435,7 @@ reuse and coalesces neighbours. Memory is not zeroed.
 ## Not supported
 
 Traits, generics, borrowing, lifetimes, modules, macros, `use`, closures,
-`f32`/`f64`, `u*`/`i*` types other than `i64`, tuples, arrays of aggregates, and
+`f32`/`f64`, `u*`/`i*` types other than `i64`, tuples, and
 the standard library. References exist (`&T` / `&mut T`, `&e`, `*e`, `*e = v`),
 but without borrow checking: rmc does not prove that a reference outlives its
 referent, and `&mut` carries no exclusivity guarantee. An aggregate is still

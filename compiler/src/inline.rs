@@ -1,7 +1,7 @@
 //! Function inlining, run on the AST after semantic analysis and before code
 //! generation.
 //!
-//! Only small, straight-line, scalar functions are inlined. A getter like
+//! Only small, scalar, call-free functions are inlined. A getter like
 //! `Wide::total` is a handful of `add`s around a reference, and the call it
 //! replaces (argument setup, a jump, a return) costs more than the body.
 //! Inlining it also exposes the arithmetic to the code generator's peephole
@@ -14,9 +14,11 @@
 //! * have a scalar or unit return and scalar parameters (a reference is a
 //!   scalar; aggregates are passed and returned by pointer and are left alone),
 //!   and take no `self` by value;
-//! * have a body with no loop, no nested call and no `return` except possibly
-//!   as its last statement (so it is straight-line and inlining cannot add
-//!   control flow or unbounded work);
+//! * have a body with no nested call and no early exit: no `break`, no
+//!   `continue`, and no `return` except possibly as its last statement. A loop
+//!   is allowed - it adds no call and no unbounded work beyond what the callee
+//!   already did, and inlining a small loop-bearing helper like `gcd` removes
+//!   the call from the caller's hot loop;
 //! * be small, at most [`MAX_NODES`] expression nodes.
 //!
 //! Expansion is a slot remap: each inlined call is given a fresh region of the
@@ -119,14 +121,20 @@ impl Cand {
     }
 }
 
-/// True when `s` is straight-line: no loop and no early exit.
+/// True when `s` is call-free with no early exit. A loop is allowed: it adds no
+/// call, and inlining a small loop-bearing helper removes the call from the
+/// caller's hot loop. `break`/`continue` are still rejected - they would bind to
+/// the *caller's* enclosing loop - and so is any `return`, which would return
+/// from the caller. A candidate's sole `return` is split off as its tail by
+/// `Cand::new` before this is consulted.
 fn stmt_ok(s: &Stmt) -> bool {
     match s {
         Stmt::Let { init, .. } => init.as_ref().map_or(true, expr_ok),
         Stmt::Assign { target, value } => expr_ok(target) && expr_ok(value),
         Stmt::Expr(e) => expr_ok(e),
-        Stmt::While(..) | Stmt::Loop(..) | Stmt::For { .. } => false,
-        Stmt::Return(_) | Stmt::Break | Stmt::Continue => false,
+        Stmt::While(c, b, _) => expr_ok(c) && block_ok(b),
+        Stmt::For { start, end, body, .. } => expr_ok(start) && expr_ok(end) && block_ok(body),
+        Stmt::Return(_) | Stmt::Break(..) | Stmt::Continue(_) => false,
     }
 }
 
@@ -151,7 +159,7 @@ fn expr_ok(e: &Expr) -> bool {
             expr_ok(c) && block_ok(t) && els.as_ref().map_or(true, block_ok)
         }
         Expr::Block(b) => block_ok(b),
-        Expr::MatchBoundary(b, _) => block_ok(b),
+        Expr::MatchBoundary(b, _) | Expr::Loop(b, _, _, _) => block_ok(b),
         // Calls, aggregate literals and payload-enum operations are excluded.
         _ => false,
     }
@@ -166,13 +174,12 @@ fn count_stmt(s: &Stmt) -> usize {
         Stmt::Let { init, .. } => init.as_ref().map_or(0, count_expr),
         Stmt::Assign { target, value } => count_expr(target) + count_expr(value),
         Stmt::Expr(e) => count_expr(e),
-        Stmt::While(c, b) => count_expr(c) + b.stmts.iter().map(count_stmt).sum::<usize>(),
-        Stmt::Loop(b) => b.stmts.iter().map(count_stmt).sum::<usize>(),
+        Stmt::While(c, b, _) => count_expr(c) + b.stmts.iter().map(count_stmt).sum::<usize>(),
         Stmt::For { start, end, body, .. } => {
             count_expr(start) + count_expr(end) + body.stmts.iter().map(count_stmt).sum::<usize>()
         }
         Stmt::Return(v) => v.as_ref().map_or(0, count_expr),
-        Stmt::Break | Stmt::Continue => 0,
+        Stmt::Break(..) | Stmt::Continue(_) => 0,
     }
 }
 
@@ -204,7 +211,7 @@ fn count_expr(e: &Expr) -> usize {
             1 + b.stmts.iter().map(count_stmt).sum::<usize>()
                 + b.tail.as_deref().map_or(0, count_expr)
         }
-        Expr::MatchBoundary(b, _) => {
+        Expr::MatchBoundary(b, _) | Expr::Loop(b, _, _, _) => {
             1 + b.stmts.iter().map(count_stmt).sum::<usize>()
                 + b.tail.as_deref().map_or(0, count_expr)
         }
@@ -262,11 +269,10 @@ impl Inliner {
                 self.walk_expr(value, base, expanding);
             }
             Stmt::Expr(e) => self.walk_expr(e, base, expanding),
-            Stmt::While(c, b) => {
+            Stmt::While(c, b, _) => {
                 self.walk_expr(c, base, expanding);
                 self.walk_block(b, base, expanding);
             }
-            Stmt::Loop(b) => self.walk_block(b, base, expanding),
             Stmt::For { start, end, body, .. } => {
                 self.walk_expr(start, base, expanding);
                 self.walk_expr(end, base, expanding);
@@ -277,7 +283,12 @@ impl Inliner {
                     self.walk_expr(e, base, expanding);
                 }
             }
-            Stmt::Break | Stmt::Continue => {}
+            Stmt::Break(v, _) => {
+                if let Some(e) = v {
+                    self.walk_expr(e, base, expanding);
+                }
+            }
+            Stmt::Continue(_) => {}
         }
     }
 
@@ -309,7 +320,7 @@ impl Inliner {
                 }
             }
             Expr::Block(b) => self.walk_block(b, base, expanding),
-            Expr::MatchBoundary(b, _) => self.walk_block(b, base, expanding),
+            Expr::MatchBoundary(b, _) | Expr::Loop(b, _, _, _) => self.walk_block(b, base, expanding),
             Expr::Call { args, .. } => {
                 for a in args {
                     self.walk_expr(a, base, expanding);
@@ -487,12 +498,11 @@ fn has_effect(e: &Expr) -> bool {
     }
 }
 
-/// The slots a candidate body assigns directly (not through a pointer or an
-/// element) or takes the address of. A parameter among them is a local the body
-/// mutates or points at, so it must be copied rather than substituted: a
-/// substituted argument would let a mutation reach the caller, and taking the
-/// address of a non-lvalue argument (a literal, a call) would have no place to
-/// name.
+/// The slots a candidate body assigns directly, or whose address it takes (not
+/// through a pointer or an element). A parameter among them is a local the body
+/// mutates or points at, so it must be copied rather than substituted, or the
+/// mutation would reach the caller and a write through the pointer would land
+/// in the caller's variable.
 fn escaped_slots(stmts: &[Stmt], tail: Option<&Expr>) -> HashSet<i32> {
     fn collect_block(b: &Block, out: &mut HashSet<i32>) {
         for s in &b.stmts {
@@ -517,11 +527,10 @@ fn escaped_slots(stmts: &[Stmt], tail: Option<&Expr>) -> HashSet<i32> {
                 }
             }
             Stmt::Expr(e) => collect_expr(e, out),
-            Stmt::While(c, b) => {
+            Stmt::While(c, b, _) => {
                 collect_expr(c, out);
                 collect_block(b, out);
             }
-            Stmt::Loop(b) => collect_block(b, out),
             Stmt::For { start, end, body, var_slot, end_slot, .. } => {
                 out.insert(*var_slot);
                 out.insert(*end_slot);
@@ -534,7 +543,12 @@ fn escaped_slots(stmts: &[Stmt], tail: Option<&Expr>) -> HashSet<i32> {
                     collect_expr(e, out);
                 }
             }
-            Stmt::Break | Stmt::Continue => {}
+            Stmt::Break(v, _) => {
+                if let Some(e) = v {
+                    collect_expr(e, out);
+                }
+            }
+            Stmt::Continue(_) => {}
         }
     }
     fn collect_expr(e: &Expr, out: &mut HashSet<i32>) {
@@ -561,7 +575,7 @@ fn escaped_slots(stmts: &[Stmt], tail: Option<&Expr>) -> HashSet<i32> {
                 collect_expr(expr, out);
             }
             Expr::Block(b) => collect_block(b, out),
-            Expr::MatchBoundary(b, _) => collect_block(b, out),
+            Expr::MatchBoundary(b, _) | Expr::Loop(b, _, _, _) => collect_block(b, out),
             Expr::If(c, t, els) => {
                 collect_expr(c, out);
                 collect_block(t, out);
@@ -653,11 +667,10 @@ impl Sub<'_> {
                 self.expr(value);
             }
             Stmt::Expr(e) => self.expr(e),
-            Stmt::While(c, b) => {
+            Stmt::While(c, b, _) => {
                 self.expr(c);
                 self.block(b);
             }
-            Stmt::Loop(b) => self.block(b),
             Stmt::For { start, end, body, var_slot, end_slot, .. } => {
                 *var_slot = self.slot(*var_slot);
                 *end_slot = self.slot(*end_slot);
@@ -670,7 +683,12 @@ impl Sub<'_> {
                     self.expr(e);
                 }
             }
-            Stmt::Break | Stmt::Continue => {}
+            Stmt::Break(v, _) => {
+                if let Some(e) = v {
+                    self.expr(e);
+                }
+            }
+            Stmt::Continue(_) => {}
         }
     }
 
@@ -711,6 +729,12 @@ impl Sub<'_> {
             }
             Expr::Block(b) => self.block(b),
             Expr::MatchBoundary(b, _) => self.block(b),
+            Expr::Loop(b, slot, _, _) => {
+                if *slot >= 0 {
+                    *slot = self.slot(*slot);
+                }
+                self.block(b);
+            }
             Expr::Call { args, arg_slots, ret_slot, .. } => {
                 for (s, _) in arg_slots.iter_mut() {
                     if *s >= 0 {

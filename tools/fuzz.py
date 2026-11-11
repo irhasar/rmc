@@ -13,7 +13,8 @@ Usage:
 
 Modes:
     expr  random integer expressions over three variables, with calls,
-          guarded division and comparisons
+          guarded division, comparisons, string comparisons and `.len()` on
+          strings and arrays
     stmt  loops, conditionals, match, arrays and aggregate calls, with
           side-effecting argument order and bounds-checked indexing
     opt   a self-recursive function, an invariant loop and inlined helpers,
@@ -25,8 +26,25 @@ Modes:
           write, which `stmt` never emits
     pat   `match` expressions: a multi-variant enum, a variant with two
           payload fields, a binding pattern, a negative literal, a nested
-          `match`, and a non-trivial side-effecting scrutinee (the temporary
-          `desugar_match` binds it to, which must be evaluated once)
+          `match`, string literal patterns, and a non-trivial side-effecting
+          scrutinee (the temporary `desugar_match` binds it to, which must be
+          evaluated once)
+    order side-effecting arguments, to pin evaluation order
+    shift `<<`/`>>` over the full count range (negative, >= 64, boundary)
+    cast  expressions on the `as` / unary precedence boundary (`*r as i64`,
+          `-x as i64`, `!x as i64`, `x * y as i64`), where a wrong `as` level
+          changes the value
+    assoc associated functions (`Type::name(..)`) and methods on the same
+          struct and enum, so a wrongly passed receiver or a mis-resolved
+          constructor changes the result
+    ref   references (`&T` / `&mut T`): a reference to a scalar, a struct
+          field, a nested field, an array element and a nested array element,
+          read and written through directly and via a callee, plus a whole
+          aggregate read/written through a reference
+    update struct update syntax (`S { f: v, ..base }`): overriding a field,
+          copying every field, chaining, a struct-typed field, and a field
+          value that mutates the base so the evaluation order and the
+          independence of the result are both observable
 
 The reference is `rustc -O`, so a mismatch is a real semantic divergence.
 """
@@ -43,6 +61,84 @@ RUSTC = os.environ.get("RUSTC", "rustc")
 
 def rustc_available():
     return shutil.which(RUSTC) is not None
+
+
+def _inproc_text(path):
+    """The RX LOAD segment's file bytes, i.e. the in-process assembled `.text`."""
+    import struct
+    data = open(path, "rb").read()
+    phoff = struct.unpack_from("<Q", data, 0x20)[0]
+    phentsize = struct.unpack_from("<H", data, 0x36)[0]
+    phnum = struct.unpack_from("<H", data, 0x38)[0]
+    for i in range(phnum):
+        o = phoff + i * phentsize
+        p_type, p_flags = struct.unpack_from("<II", data, o)
+        p_offset = struct.unpack_from("<Q", data, o + 8)[0]
+        p_filesz = struct.unpack_from("<Q", data, o + 32)[0]
+        if p_type == 1 and (p_flags & 1):
+            start = phoff + phnum * phentsize
+            return data[start:p_offset + p_filesz]
+    return None
+
+
+def _binutils_text(path, scratch):
+    subprocess.run(["objcopy", "-O", "binary", "--only-section=.text", path, scratch],
+                   capture_output=True)
+    try:
+        return open(scratch, "rb").read()
+    except OSError:
+        return None
+
+
+def _disasm(raw, scratch):
+    """Normalised instruction list: branch targets folded, alignment nops and
+    immediates reduced to placeholders, so only the instruction *stream* is
+    compared. This is what catches an operand-size or alignment bug, which a
+    behaviour comparison cannot see."""
+    import re
+    open(scratch, "wb").write(raw)
+    out = run(["objdump", "-D", "-b", "binary", "-m", "i386:x86-64", scratch])
+    ins = []
+    for line in out.stdout.decode(errors="replace").splitlines():
+        m = re.match(r"^\s*[0-9a-f]+:\s+(?:[0-9a-f]{2} )+\s*(.*)$", line)
+        if not m:
+            continue
+        t = m.group(1).strip()
+        t = re.sub(r"\$-?0x[0-9a-f]+", "$I", t)
+        t = re.sub(r"\$-?[0-9]+", "$I", t)
+        t = re.sub(r"0x[0-9a-f]+", "A", t)
+        t = re.sub(r"\s+", " ", t)
+        if not t:
+            continue
+        if "nop" in t or t == "xchg %ax,%ax" or t.startswith("data16"):
+            continue
+        ins.append(t)
+    return ins
+
+
+def encoding_divergence(rms, flags, tmp):
+    """Compile both ways and compare the decoded `.text`.
+
+    Returns `None` when either build fails (nothing to compare), `True` when the
+    instruction streams agree, or a `(index, in_process, as)` tuple on a
+    divergence."""
+    direct = f"{tmp}/enc.direct"
+    binut = f"{tmp}/enc.binutils"
+    if run([RMC] + flags + [rms, "-o", direct]).returncode != 0:
+        return None
+    if run([RMC, "--binutils"] + flags + [rms, "-o", binut]).returncode != 0:
+        return None
+    raw = _inproc_text(direct)
+    bu = _binutils_text(binut, f"{tmp}/enc.text")
+    if raw is None or bu is None:
+        return None
+    a = _disasm(raw, f"{tmp}/enc.a.bin")
+    b = _disasm(bu, f"{tmp}/enc.b.bin")
+    n = min(len(a), len(b))
+    if a[:n] != b[:n]:
+        k = next((i for i in range(n) if a[i] != b[i]), n)
+        return (k, a[k] if k < len(a) else "<end>", b[k] if k < len(b) else "<end>")
+    return True
 
 
 def run(cmd, **kw):
@@ -120,6 +216,23 @@ def gen_cmp(rng, depth):
     return f"(({gen_expr(rng, depth + 1)}) {op} ({gen_expr(rng, depth + 1)})) as i64"
 
 
+def gen_str_lit(rng):
+    """A random `str` literal over a two-letter alphabet. The small alphabet is
+    deliberate: it makes equal literals and long shared prefixes common, which
+    is where a pointer comparison instead of a content comparison shows up."""
+    n = rng.randint(0, 5)
+    return '"' + "".join(rng.choice("ab") for _ in range(n)) + '"'
+
+
+def gen_strcmp(rng):
+    """A string comparison, `(lit op lit)`. A `str` is a pointer to its record,
+    so rmc must lower this to a byte-wise helper; comparing the pointers would
+    answer "not equal" for two identical literals. Both sides are literals so
+    the two compilers agree on the type."""
+    op = rng.choice(["==", "!=", "<", "<=", ">", ">="])
+    return f"({gen_str_lit(rng)} {op} {gen_str_lit(rng)})"
+
+
 def gen_expr_program(rng):
     a, b, c = (rng.randint(-1000, 1000) for _ in range(3))
     exprs = []
@@ -164,6 +277,160 @@ def gen_expr_program(rng):
     for e in exprs:
         rms.append(f"    print_i64({e});")
         rs.append(f'    println!("{{}}", {e});')
+    # String comparisons: printed as `bool`, which both compilers render as
+    # `0`/`1` through the `pb` twin. A pointer compare would diverge here.
+    for _ in range(rng.randint(1, 4)):
+        s = gen_strcmp(rng)
+        rms.append(f"    print_bool({s});")
+        rs.append(f'    println!("{{}}", ({s}) as i64);')
+    # Lengths. `"lit".len()` reads the string record's length word, so it must be
+    # an indirect load through the pointer, not a struct field; an array's length
+    # is a compile-time constant. rustc's `len()` is `usize`, so the twin casts.
+    for lit in (gen_str_lit(rng) for _ in range(rng.randint(1, 3))):
+        rms.append(f"    print_i64({lit}.len());")
+        rs.append(f'    println!("{{}}", {lit}.len() as i64);')
+    sv = gen_str_lit(rng)
+    n = rng.randint(1, 6)
+    rms.append(f"    let sv = {sv};")
+    rms.append("    print_i64(sv.len());")
+    rs.append(f"    let sv = {sv};")
+    rs.append('    println!("{}", sv.len() as i64);')
+    rms.append(f"    let arr: [i64; {n}] = [0; {n}];")
+    rms.append("    print_i64(arr.len());")
+    rs.append(f"    let arr: [i64; {n}] = [0; {n}];")
+    rs.append('    println!("{}", arr.len() as i64);')
+    rms += ["    return 0;", "}"]
+    rs += ["}"]
+    return "\n".join(rms), "\n".join(rs)
+
+
+def gen_cast_program(rng):
+    """Expressions that sit on the `as` / unary precedence boundary. `as` binds
+    looser than `* - ! &`, so `*r as i64` is `(*r) as i64` and `-a as i64` is
+    `(-a) as i64`, but tighter than `* / %`, so `a * b as i64` is `a * (b as
+    i64)`. Every shape below changes value if `as` is parsed at the wrong level,
+    which is exactly the bug this mode pins: rmc used to parse `as` in
+    `parse_postfix`, binding it tighter than unary, and rejected `*r as i64`."""
+    a, b, c = (rng.randint(-1000, 1000) for _ in range(3))
+    bl = rng.choice(["true", "false"])
+    i64_leaves = ["a", "b", "c", "*r", "(a - b)", "(-a)", "(!b)", "h(a)"]
+    bool_leaves = ["bl", "(a < b)", "(a == c)", "(!bl)"]
+
+    def X():
+        return rng.choice(i64_leaves)
+
+    def B():
+        return rng.choice(bool_leaves)
+
+    tmpl = [
+        lambda: "(*r as i64)",
+        lambda: f"(-{X()} as i64)",
+        lambda: f"(!{X()} as i64)",
+        lambda: "(-*r as i64)",
+        lambda: "(!*r as i64)",
+        lambda: f"(-{X()} * {X()})",
+        lambda: f"({X()} * -{X()})",
+        lambda: f"({X()} as i64 * {X()})",
+        lambda: f"(-{X()} as i64 * {X()})",
+        lambda: f"(!{X()} as i64 + {X()})",
+        lambda: f"({B()} as i64 * {X()})",
+        lambda: f"(!{B()} as i64 + {X()})",
+        lambda: f"({X()} - {X()} as i64)",
+        lambda: f"(*r as i64 - {X()})",
+        lambda: f"(!({X()} as i64))",
+        lambda: f"(-({X()} as i64))",
+        lambda: f"({X()} + -{X()} as i64)",
+        lambda: f"(a as i64 as i64 + {X()})",
+        lambda: f"({B()} as i64 as i64 - {X()})",
+    ]
+    exprs = [rng.choice(tmpl)() for _ in range(rng.randint(4, 12))]
+    rms = [
+        "fn h(x: i64) -> i64 { return (x * 3 + 1) % 97 - 48; }",
+        "fn main() -> i64 {",
+        f"    let a: i64 = {a};",
+        f"    let b: i64 = {b};",
+        f"    let c: i64 = {c};",
+        f"    let bl: bool = {bl};",
+        "    let r: &i64 = &a;",
+    ]
+    rs = [
+        "fn h(x: i64) -> i64 { (x * 3 + 1) % 97 - 48 }",
+        "fn main() {",
+        f"    let a: i64 = {a};",
+        f"    let b: i64 = {b};",
+        f"    let c: i64 = {c};",
+        f"    let bl: bool = {bl};",
+        "    let r: &i64 = &a;",
+    ]
+    for e in exprs:
+        rms.append(f"    print_i64({e});")
+        rs.append(f'    println!("{{}}", {e});')
+    rms += ["    return 0;", "}"]
+    rs += ["}"]
+    return "\n".join(rms), "\n".join(rs)
+
+
+def gen_assoc_program(rng):
+    """Associated functions (`Type::name(..)`) and methods on the same types.
+    Random constants are baked into constructor calls, and each value is read
+    back through a method, so a receiver wrongly passed to an associated
+    function, or an associated function wrongly resolved, changes the result."""
+    a, b, k = (rng.randint(-500, 500) for _ in range(3))
+    calls = []
+    for _ in range(rng.randint(3, 8)):
+        x, y, m = (rng.randint(-50, 50) for _ in range(3))
+        calls.append((x, y, m))
+    rms = [
+        "struct S { a: i64, b: i64 }",
+        "impl S {",
+        "    fn new(a: i64, b: i64) -> S { return S { a, b }; }",
+        "    fn zero() -> S { return S { a: 0, b: 0 }; }",
+        "    fn scale_of(v: i64) -> i64 { return v * 3; }",
+        "    fn sum(self) -> i64 { return self.a + self.b; }",
+        "    fn bump(self, d: i64) -> S { return S::new(self.a + d, self.b + d); }",
+        "}",
+        "enum E { Off, On }",
+        "impl E {",
+        "    fn from(n: i64) -> E { if n % 2 == 0 { return E::Off; } return E::On; }",
+        "    fn tag(self) -> i64 { return self as i64; }",
+        "}",
+        "fn main() -> i64 {",
+        f"    let s: S = S::new({a}, {b});",
+        "    print_i64(s.sum());",
+        "    print_i64(S::zero().sum());",
+        f"    print_i64(S::scale_of({k}));",
+        f"    print_i64(s.bump({k}).sum());",
+        f"    print_i64(S::new({k}, {k}).bump({a}).sum());",
+        "    print_i64(E::from(0).tag());",
+        "    print_i64(E::from(1).tag());",
+    ]
+    rs = [
+        "struct S { a: i64, b: i64 }",
+        "impl S {",
+        "    fn new(a: i64, b: i64) -> S { S { a, b } }",
+        "    fn zero() -> S { S { a: 0, b: 0 } }",
+        "    fn scale_of(v: i64) -> i64 { v * 3 }",
+        "    fn sum(&self) -> i64 { self.a + self.b }",
+        "    fn bump(&self, d: i64) -> S { S::new(self.a + d, self.b + d) }",
+        "}",
+        "enum E { Off, On }",
+        "impl E {",
+        "    fn from(n: i64) -> E { if n % 2 == 0 { E::Off } else { E::On } }",
+        "    fn tag(self) -> i64 { self as i64 }",
+        "}",
+        "fn main() {",
+        f"    let s = S::new({a}, {b});",
+        '    println!("{}", s.sum());',
+        '    println!("{}", S::zero().sum());',
+        f'    println!("{{}}", S::scale_of({k}));',
+        f'    println!("{{}}", s.bump({k}).sum());',
+        f'    println!("{{}}", S::new({k}, {k}).bump({a}).sum());',
+        '    println!("{}", E::from(0).tag());',
+        '    println!("{}", E::from(1).tag());',
+    ]
+    for (x, y, m) in calls:
+        rms.append(f"    print_i64(S::new({x}, {y}).bump({m}).sum() + E::from({m}).tag());")
+        rs.append(f'    println!("{{}}", S::new({x}, {y}).bump({m}).sum() + E::from({m}).tag());')
     rms += ["    return 0;", "}"]
     rs += ["}"]
     return "\n".join(rms), "\n".join(rs)
@@ -245,15 +512,68 @@ def gen_stmt_program(rng):
         "acc = acc + (i ^ (i >> 1));",
     ])
     rms.append("        " + inner)
-    rs.append("        " + inner.replace("acc = acc +", "acc +=", 1))
+    rs.append("        " + inner.replace("acc = acc +", "acc +=", 1)
+               .replace("arr[i % 4]", "arr[(i % 4) as usize]"))
     rms.append("        acc = acc + match i % 3 { 0 => 5, 1 => 7, _ => 11 };")
     rs.append("        acc += match i % 3 { 0 => 5, 1 => 7, _ => 11 };")
     rms.append("        arr[i % 4] = arr[i % 4] + i;")
-    rs.append("        arr[i % 4] += i;")
+    rs.append("        arr[(i % 4) as usize] += i;")
     rms.append("        i = i + 1;")
     rs.append("        i += 1;")
     rms += ["    }"]
     rs += ["    }"]
+    # `while let` over a payload enum: the scrutinee is a variable here (a
+    # call scrutinee is covered in `pat` mode), and the loop stops when the
+    # value becomes `None`. A `continue` before the `break` check keeps the
+    # re-test path live.
+    rms.append("    let mut wl: i64 = 0;")
+    rs.append("    let mut wl: i64 = 0;")
+    rms.append("    let mut wo: Opt = Opt::Some(2);")
+    rs.append("    let mut wo: Opt = Opt::Some(2);")
+    rms.append("    while let Opt::Some(v) = wo { wl = wl + v; if wl > 100 { wo = Opt::None; continue; } if wl > 6 { wo = Opt::None; } }")
+    rs.append("    while let Opt::Some(v) = wo { wl += v; if wl > 100 { wo = Opt::None; continue; } if wl > 6 { wo = Opt::None; } }")
+    rms.append("    acc = acc + wl * 7 + nodiv(i);")
+    rs.append("    acc += wl * 7 + nodiv(i);")
+    # A bare `loop` whose `break` is the last thing in the block, so the `;` is
+    # omitted (rustc allows it because `break` diverges).
+    rms.append("    let mut lc: i64 = 0;")
+    rs.append("    let mut lc: i64 = 0;")
+    rms.append("    loop { lc = lc + 1; if lc >= 3 { break } }")
+    rs.append("    loop { lc += 1; if lc >= 3 { break } }")
+    rms.append("    acc = acc + lc * 11;")
+    rs.append("    acc += lc * 11;")
+    # A `for` range over i64 variables, exclusive or inclusive. The bounds are
+    # named `i64` locals so Rust does not default the literals to `i32`; that
+    # also exercises a non-literal bound and `..=`'s strict exit test.
+    fa, fb = rng.randint(-3, 3), rng.randint(-3, 3)
+    op = rng.choice(["..", "..="])
+    rms.append(f"    let fa: i64 = {fa};")
+    rs.append(f"    let fa: i64 = {fa};")
+    rms.append(f"    let fb: i64 = {fb};")
+    rs.append(f"    let fb: i64 = {fb};")
+    rms.append(f"    for fi in fa{op}fb {{ acc = acc + fi * 3; }}")
+    rs.append(f"    for fi in fa{op}fb {{ acc += fi * 3; }}")
+    # An inclusive range ending at `i64::MAX`. A loop that increments before the
+    # `<=` test wraps the counter to `i64::MIN` and never terminates (the run
+    # times out); the body adds a bounded amount, so a wrong iteration count
+    # shows up as well if the loop does stop.
+    rms.append("    for mi in 9223372036854775805..=9223372036854775807 { acc = acc + 1; }")
+    rs.append("    for mi in 9223372036854775805i64..=9223372036854775807 { acc += 1; }")
+    # `for x in ARRAY`: the array is iterated by value, and the head is a local
+    # (not a literal) so a stale read shows up. A `continue` keeps the increment
+    # path live, and a wildcard counts the elements.
+    rms.append("    let farr: [i64; 3] = [1, 2, 3];")
+    rs.append("    let farr: [i64; 3] = [1, 2, 3];")
+    rms.append("    for fv in farr { acc = acc + fv * 5; }")
+    rs.append("    for fv in farr { acc += fv * 5; }")
+    rms.append("    let mut fc: i64 = 0;")
+    rs.append("    let mut fc: i64 = 0;")
+    rms.append("    for fv in farr { if fv == 2 { continue; } fc = fc + fv; }")
+    rs.append("    for fv in farr { if fv == 2 { continue; } fc += fv; }")
+    rms.append("    for _ in farr { fc = fc + 1; }")
+    rs.append("    for _ in farr { fc += 1; }")
+    rms.append("    acc = acc + fc * 17;")
+    rs.append("    acc += fc * 17;")
     # A bool array built from a list literal, then counted. Guards the
     # list-literal element-type inference and bool indexing.
     rms.append("    let flags: [bool; 4] = [true, false, i < 1, true];")
@@ -271,6 +591,17 @@ def gen_stmt_program(rng):
     rs.append("    let e = match i % 3 { 0 => E::P, 1 => E::Q, _ => E::R };")
     rms.append("    acc = acc + tag(e) * 100 + (e as i64);")
     rs.append("    acc += tag(e) * 100 + (e as i64);")
+    # `let _ = e;` discards `e`: a side-effecting call must still run once and a
+    # discarded aggregate must not corrupt the frame. Annotated and unannotated
+    # forms both appear.
+    rms.append("    let _ = sc(5);")
+    rs.append("    let _ = sc(5);")
+    rms.append("    let _: i64 = sc(6);")
+    rs.append("    let _: i64 = sc(6);")
+    rms.append("    let _ = mk(7);")
+    rs.append("    let _ = mk(7);")
+    rms.append("    let _ = [1, 2, 3];")
+    rs.append("    let _ = [1, 2, 3];")
     # An exhaustive enum `match` with no `_` arm, used as a value.
     rms.append("    acc = acc + exval(e);")
     rs.append("    acc += exval(e);")
@@ -311,8 +642,12 @@ def gen_stmt_program(rng):
     rs.append('    println!("{}", acc);')
     rms += ["    return 0;", "}"]
     rs += ["}"]
+    rms.insert(0, "fn nodiv(c: i64) -> i64 { if c > 0 { 1 } else { return 2 } }")
     rms.insert(0, "fn h(x: i64) -> i64 { return (x * 3 + 1) % 97; }")
-    rs.insert(1, "fn h(x: i64) -> i64 { (x * 3 + 1) % 97 }")
+    # `rs[0]` is the struct's `#[derive]`, so the helper has to go *before* it:
+    # inserting at 1 puts the attribute on `fn h`, which rustc rejects.
+    rs.insert(0, "fn nodiv(c: i64) -> i64 { if c > 0 { 1 } else { return 2 } }")
+    rs.insert(0, "fn h(x: i64) -> i64 { (x * 3 + 1) % 97 }")
     return "\n".join(rms), "\n".join(rs)
 
 
@@ -446,6 +781,7 @@ def gen_nest_program(rng):
     inner_mk = ", ".join(f"{f}: n + {j + 1}" for j, f in enumerate(inner))
     arr_mk = ", ".join(f"n + {j}" for j in range(na))
     inner_lit = ", ".join(f"{f}: base + {j + 1}" for j, f in enumerate(inner))
+    inner_lit2 = ", ".join(f"{f}: base + {j + 5}" for j, f in enumerate(inner))
     sum_terms = ["o.s"] + [f"o.mid.{f}" for f in inner] + [f"o.arr[{j}]" for j in range(na)]
     wval = " + ".join(
         f"v.{f} * {10 ** (len(inner) - 1 - j)}" for j, f in enumerate(inner)
@@ -453,6 +789,24 @@ def gen_nest_program(rng):
     m1, m2 = rng.randint(10, 30), rng.randint(50, 99)
     base_k = rng.randint(1, 6)
     f0 = inner[0]
+
+    # A 2D array `[[i64; c2]; r2]` and an array of structs `[Inner; ns]`, so the
+    # stride-aware indexing and the aggregate element copy are exercised. The
+    # element stride is the element's size in slots, not one: a wrong stride
+    # reads a neighbouring element and shows up as a wrong final value. Every
+    # struct element gets distinct field values for the same reason.
+    r2, c2 = rng.randint(2, 3), rng.randint(2, 3)
+    ns = rng.randint(2, 3)
+    grid_lit = ", ".join(
+        "[" + ", ".join(f"base + {r * c2 + c}" for c in range(c2)) + "]"
+        for r in range(r2)
+    )
+    st_lit = ", ".join(
+        "Inner { "
+        + ", ".join(f"{f}: base + {r * 10 + j + 1}" for j, f in enumerate(inner))
+        + " }"
+        for r in range(ns)
+    )
 
     rms = [
         "fn seed(x: i64) -> i64 { return x * 7 + 1; }",
@@ -485,6 +839,22 @@ def gen_nest_program(rng):
         "    let mut o2: Outer = mk(base + 1);",
         "    bump(&mut o2);",
         f"    acc = acc + o2.mid.{f0} + o2.s;",
+        # Nested arrays and arrays of structs: literal, splat, variable-index
+        # reads, element write, whole-element copy.
+        f"    let g: [[i64; {c2}]; {r2}] = [{grid_lit}];",
+        "    let mut gi: i64 = 0;",
+        f"    while gi < {r2} {{ let mut gj: i64 = 0; while gj < {c2} {{ acc = acc + g[gi][gj]; gj = gj + 1; }} gi = gi + 1; }}",
+        f"    acc = acc + g[0][0] + g[{r2 - 1}][{c2 - 1}];",
+        f"    let mut gm: [[i64; {c2}]; {r2}] = [[3; {c2}]; {r2}];",
+        f"    gm[{r2 - 1}][0] = acc;",
+        f"    acc = acc + gm[0][0] + gm[{r2 - 1}][0] + gm[{r2 - 1}][{c2 - 1}];",
+        f"    let mut sa: [Inner; {ns}] = [{st_lit}];",
+        f"    sa[{ns - 1}].{f0} = sa[{ns - 1}].{f0} + 3;",
+        f"    let sc: [Inner; 2] = [Inner {{ {inner_lit2} }}; 2];",
+        f"    sa[0] = sc[1];",
+        "    let mut si: i64 = 0;",
+        f"    while si < {ns} {{ acc = acc + sa[si].{f0} + sa[si].{inner[1]}; si = si + 1; }}",
+        f"    acc = acc + sc[0].{f0} + sc[1].{inner[1]};",
         "    print_i64(acc);",
         "    return 0;",
         "}",
@@ -524,6 +894,232 @@ def gen_nest_program(rng):
         "    let mut o2: Outer = mk(base + 1);",
         "    bump(&mut o2);",
         f"    acc += o2.mid.{f0} + o2.s;",
+        f"    let g: [[i64; {c2}]; {r2}] = [{grid_lit}];",
+        "    let mut gi: i64 = 0;",
+        f"    while gi < {r2} {{ let mut gj: i64 = 0; while gj < {c2} {{ acc += g[gi as usize][gj as usize]; gj += 1; }} gi += 1; }}",
+        f"    acc += g[0][0] + g[{r2 - 1}][{c2 - 1}];",
+        f"    let mut gm: [[i64; {c2}]; {r2}] = [[3; {c2}]; {r2}];",
+        f"    gm[{r2 - 1}][0] = acc;",
+        f"    acc += gm[0][0] + gm[{r2 - 1}][0] + gm[{r2 - 1}][{c2 - 1}];",
+        f"    let mut sa: [Inner; {ns}] = [{st_lit}];",
+        f"    sa[{ns - 1}].{f0} += 3;",
+        f"    let sc: [Inner; 2] = [Inner {{ {inner_lit2} }}; 2];",
+        "    sa[0] = sc[1];",
+        "    let mut si: i64 = 0;",
+        f"    while si < {ns} {{ acc += sa[si as usize].{f0} + sa[si as usize].{inner[1]}; si += 1; }}",
+        f"    acc += sc[0].{f0} + sc[1].{inner[1]};",
+        '    println!("{}", acc);',
+        "}",
+    ]
+    return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
+
+def gen_update_program(rng):
+    """Struct update syntax `S { field: value, ..base }`. No other mode emits
+    it, so the desugaring's two invariants were untested: the result must be an
+    independent value (a shallow copy would alias the base), and the written
+    field values must be evaluated before the base. The `mutate` call below
+    makes both observable — it bumps the base's `y` as a side effect of
+    evaluating a field value, so if the base were evaluated first the update
+    would pick up the bumped `y`, and if the result aliased the base a later
+    write through the result would change the base.
+
+    Values descend from a call (`seed`) so nothing is constant-folded.
+    """
+    b = rng.randint(1, 9)
+    d = rng.randint(1, 9)
+    rms = [
+        "struct P { x: i64, y: i64 }",
+        "struct Q { p: P, t: i64 }",
+        f"fn seed(n: i64) -> i64 {{ return n * 3 + {b}; }}",
+        "fn mk(n: i64) -> P { return P { x: n, y: n + 1 }; }",
+        # Bumps the base's `y` and returns the value to store, so the order in
+        # which the update evaluates it against the base is observable.
+        "fn mutate(p: &mut P, v: i64) -> i64 { p.y = p.y + 100; return v; }",
+        "fn sumq(q: Q) -> i64 { return q.p.x + q.p.y + q.t; }",
+        "fn main() -> i64 {",
+        f"    let n: i64 = seed({d});",
+        "    let mut acc: i64 = 0;",
+        "    let mut base: P = mk(n);",
+        # Written field value mutates the base before the base is read.
+        "    let a: P = P { x: mutate(&mut base, n), ..base };",
+        "    acc = acc + a.x + a.y + base.y;",
+        # Overriding one field, copying the rest.
+        "    let b2: P = P { y: n + 7, ..base };",
+        "    acc = acc + b2.x + b2.y;",
+        # The result is independent of the base.
+        "    let mut c: P = P { x: n + 1, ..base };",
+        "    c.y = c.y + 50;",
+        "    acc = acc + c.y + base.y;",
+        # Copy every field.
+        "    let e: P = P { ..base };",
+        "    acc = acc + e.x + e.y;",
+        # Chained, and through a struct-typed field.
+        "    let f: P = P { x: n + 2, ..e };",
+        "    let g: P = P { y: n + 3, ..f };",
+        "    let q: Q = Q { p: g, t: n };",
+        "    let r: Q = Q { t: n + 4, ..q };",
+        "    acc = acc + r.p.x + r.p.y + r.t + sumq(r);",
+        # In a loop and as an argument.
+        "    let mut i: i64 = 0;",
+        "    while i < 3 { let p: P = P { x: i, ..base }; acc = acc + p.x + p.y; i = i + 1; }",
+        "    print_i64(acc);",
+        "    return 0;",
+        "}",
+    ]
+    rs = [
+        "#[derive(Copy, Clone)]",
+        "struct P { x: i64, y: i64 }",
+        "#[derive(Copy, Clone)]",
+        "struct Q { p: P, t: i64 }",
+        f"fn seed(n: i64) -> i64 {{ n * 3 + {b} }}",
+        "fn mk(n: i64) -> P { P { x: n, y: n + 1 } }",
+        "fn mutate(p: &mut P, v: i64) -> i64 { p.y = p.y + 100; v }",
+        "fn sumq(q: Q) -> i64 { q.p.x + q.p.y + q.t }",
+        "fn main() {",
+        f"    let n: i64 = seed({d});",
+        "    let mut acc: i64 = 0;",
+        "    let mut base: P = mk(n);",
+        "    let a: P = P { x: mutate(&mut base, n), ..base };",
+        "    acc += a.x + a.y + base.y;",
+        "    let b2: P = P { y: n + 7, ..base };",
+        "    acc += b2.x + b2.y;",
+        "    let mut c: P = P { x: n + 1, ..base };",
+        "    c.y = c.y + 50;",
+        "    acc += c.y + base.y;",
+        "    let e: P = P { ..base };",
+        "    acc += e.x + e.y;",
+        "    let f: P = P { x: n + 2, ..e };",
+        "    let g: P = P { y: n + 3, ..f };",
+        "    let q: Q = Q { p: g, t: n };",
+        "    let r: Q = Q { t: n + 4, ..q };",
+        "    acc += r.p.x + r.p.y + r.t + sumq(r);",
+        "    let mut i: i64 = 0;",
+        "    while i < 3 { let p: P = P { x: i, ..base }; acc += p.x + p.y; i += 1; }",
+        '    println!("{}", acc);',
+        "}",
+    ]
+    return "\n".join(rms) + "\n", "\n".join(rs) + "\n"
+
+def gen_ref_program(rng):
+    """A program built from references (`&T` / `&mut T`), which no other mode
+    exercises. A reference is one word holding an address, so `*r = v` writes
+    through it, `r.field` / `r[i]` reach the referent, and a reference travels
+    to a callee in one register. The shapes that are easy to get wrong are a
+    reference to a *place* that is not a plain local: a struct field
+    (`&mut o.mid.f`), an array element (`&mut a[i]`), a nested array element
+    (`&mut m[i][j]`), and the local that *is* the destination (`&mut acc`). A
+    wrong address reads or writes a neighbouring word and shows up as a wrong
+    final value.
+
+    Every value descends from a call (`seed`), so no local is constant-folded
+    and the addresses stay live.
+    """
+    inner = [f"i{j}" for j in range(rng.randint(2, 3))]
+    na = rng.randint(2, 4)
+    r2, c2 = rng.randint(2, 3), rng.randint(2, 3)
+    idecl = ", ".join(f"{f}: i64" for f in inner)
+    arr_lit = ", ".join(f"base + {j}" for j in range(na))
+    inner_lit = ", ".join(f"{f}: base + {j + 1}" for j, f in enumerate(inner))
+    grid_lit = ", ".join(
+        "[" + ", ".join(f"base + {r * c2 + c}" for c in range(c2)) + "]"
+        for r in range(r2)
+    )
+    sumf = " + ".join([f"r.mid.{f}" for f in inner] + ["r.s", "r.arr[0]"])
+    f0 = inner[0]
+    k = rng.randint(1, 9)
+
+    rms = [
+        "fn seed(x: i64) -> i64 { return x * 7 + 1; }",
+        f"struct Inner {{ {idecl} }}",
+        f"struct Outer {{ s: i64, mid: Inner, arr: [i64; {na}] }}",
+        "fn inc(r: &mut i64) { *r = *r + 1; }",
+        "fn addto(r: &mut i64, v: i64) { *r = *r + v; }",
+        "fn twice(r: &mut i64) { inc(r); inc(r); }",
+        "fn get(r: &i64) -> i64 { return *r; }",
+        f"fn sumfields(r: &Outer) -> i64 {{ return {sumf}; }}",
+        f"fn setfield(r: &mut Outer, v: i64) {{ r.s = r.s + v; r.mid.{f0} = r.mid.{f0} + v; }}",
+        f"fn sumarr(a: &[i64; {na}]) -> i64 {{ let mut s: i64 = 0; let mut i: i64 = 0; "
+        f"while i < {na} {{ s = s + a[i]; i = i + 1; }} return s; }}",
+        "fn main() -> i64 {",
+        f"    let base: i64 = seed({k});",
+        "    let mut acc: i64 = 0;",
+        # A reference to a scalar local, written through directly and by callee.
+        "    let mut x: i64 = base;",
+        "    let r: &mut i64 = &mut x;",
+        "    *r = *r + 3;",
+        "    inc(&mut x);",
+        "    twice(&mut x);",
+        "    acc = acc + x + get(&x);",
+        # A reference to a struct field, including a nested one.
+        f"    let mut o: Outer = Outer {{ s: base, mid: Inner {{ {inner_lit} }}, arr: [{arr_lit}] }};",
+        "    addto(&mut o.s, 5);",
+        f"    inc(&mut o.mid.{f0});",
+        f"    acc = acc + o.s + o.mid.{f0};",
+        # A reference to an array element.
+        f"    let mut a: [i64; {na}] = [{arr_lit}];",
+        "    inc(&mut a[0]);",
+        f"    addto(&mut a[{na - 1}], 9);",
+        f"    acc = acc + a[0] + a[{na - 1}];",
+        # Read and write a whole aggregate through a reference.
+        "    acc = acc + sumfields(&o);",
+        "    setfield(&mut o, 7);",
+        f"    acc = acc + o.s + o.mid.{f0};",
+        "    acc = acc + sumarr(&a);",
+        # A reference to a nested array element.
+        f"    let mut m: [[i64; {c2}]; {r2}] = [{grid_lit}];",
+        f"    inc(&mut m[{r2 - 1}][{c2 - 1}]);",
+        f"    acc = acc + m[0][0] + m[{r2 - 1}][{c2 - 1}];",
+        # A reference local that is the destination of an accumulator update.
+        "    let rl: &mut i64 = &mut acc;",
+        "    *rl = *rl + 1;",
+        "    let mut y: i64 = base;",
+        "    twice(&mut y);",
+        "    acc = acc + y;",
+        "    print_i64(acc);",
+        "    return 0;",
+        "}",
+    ]
+    rs = [
+        "fn seed(x: i64) -> i64 { x * 7 + 1 }",
+        f"struct Inner {{ {idecl} }}",
+        f"struct Outer {{ s: i64, mid: Inner, arr: [i64; {na}] }}",
+        "fn inc(r: &mut i64) { *r += 1; }",
+        "fn addto(r: &mut i64, v: i64) { *r += v; }",
+        "fn twice(r: &mut i64) { inc(r); inc(r); }",
+        "fn get(r: &i64) -> i64 { *r }",
+        f"fn sumfields(r: &Outer) -> i64 {{ {sumf} }}",
+        f"fn setfield(r: &mut Outer, v: i64) {{ r.s += v; r.mid.{f0} += v; }}",
+        f"fn sumarr(a: &[i64; {na}]) -> i64 {{ let mut s = 0i64; let mut i = 0usize; "
+        f"while i < {na} {{ s += a[i]; i += 1; }} s }}",
+        "fn main() {",
+        f"    let base: i64 = seed({k});",
+        "    let mut acc: i64 = 0;",
+        "    let mut x: i64 = base;",
+        "    let r = &mut x;",
+        "    *r += 3;",
+        "    inc(&mut x);",
+        "    twice(&mut x);",
+        "    acc += x + get(&x);",
+        f"    let mut o: Outer = Outer {{ s: base, mid: Inner {{ {inner_lit} }}, arr: [{arr_lit}] }};",
+        "    addto(&mut o.s, 5);",
+        f"    inc(&mut o.mid.{f0});",
+        f"    acc += o.s + o.mid.{f0};",
+        f"    let mut a: [i64; {na}] = [{arr_lit}];",
+        "    inc(&mut a[0]);",
+        f"    addto(&mut a[{na - 1}], 9);",
+        f"    acc += a[0] + a[{na - 1}];",
+        "    acc += sumfields(&o);",
+        "    setfield(&mut o, 7);",
+        f"    acc += o.s + o.mid.{f0};",
+        "    acc += sumarr(&a);",
+        f"    let mut m: [[i64; {c2}]; {r2}] = [{grid_lit}];",
+        f"    inc(&mut m[{r2 - 1}][{c2 - 1}]);",
+        f"    acc += m[0][0] + m[{r2 - 1}][{c2 - 1}];",
+        "    let rl = &mut acc;",
+        "    *rl += 1;",
+        "    let mut y: i64 = base;",
+        "    twice(&mut y);",
+        "    acc += y;",
         '    println!("{}", acc);',
         "}",
     ]
@@ -540,7 +1136,9 @@ def gen_pat_program(rng):
     operator, an index or a field, which `desugar_match` binds to a temporary)
     were never generated. That
     temporary must be evaluated exactly once: re-evaluating it per arm repeats
-    a side effect, and a stale one reads the wrong value.
+    a side effect, and a stale one reads the wrong value. An enum with explicit
+    discriminants is generated too, so a tag that is the variant's index rather
+    than its written value shows up in a `match` arm and in an `as i64`.
     """
     k = rng.randint(1, 9)
     v = rng.randint(2, 9)
@@ -553,6 +1151,19 @@ def gen_pat_program(rng):
     color_def = ", ".join(colors)
     color_arms = ", ".join(f"Color::{c} => {j + 1}" for j, c in enumerate(colors))
     color_pick = ", ".join(f"{j} => Color::{c}" for j, c in enumerate(colors))
+    # An or-pattern arm naming a group of variants: `C0 | C1 => 1`. Splitting the
+    # variants into two groups covers every variant, so the match is exhaustive
+    # and usable as a value, which exercises or-pattern exhaustiveness.
+    half = max(1, ncolors // 2)
+    or_arms = " | ".join(f"Color::{c}" for c in colors[:half]) + " => 1, " \
+        + " | ".join(f"Color::{c}" for c in colors[half:]) + " => 2"
+    # A non-empty integer range, half-open and inclusive.
+    rlo = rng.randint(-5, 2)
+    rhi = rlo + rng.randint(1, 5)
+    # Two string literals from the shared two-letter alphabet, so collisions
+    # and shared prefixes are common: a pointer compare and a content compare
+    # then disagree on which arm fires.
+    s0, s1 = gen_str_lit(rng), gen_str_lit(rng)
 
     rms = [
         "fn side(k: i64) -> i64 { print_i64(k); return k * 3 + 1; }",
@@ -568,6 +1179,12 @@ def gen_pat_program(rng):
         f"fn color_code(c: Color) -> i64 {{ return match c {{ {color_arms} }}; }}",
         "enum Shape { Dot, Line(i64), Rect(i64, i64) }",
         "fn area(s: Shape) -> i64 { return match s { Shape::Dot => 0, Shape::Line(w) => w, Shape::Rect(w, h) => w * h }; }",
+        # Explicit discriminants: the tag is the written value, not the
+        # variant's index, so a `match` arm or an `as i64` that still used the
+        # index would read a different number.
+        "enum Disc { D0 = 4, D1, D2 = 10 }",
+        "fn disc_code(d: Disc) -> i64 { return match d { Disc::D0 => 1, Disc::D1 => 2, Disc::D2 => 3 }; }",
+        "fn disc_cast(d: Disc) -> i64 { return d as i64; }",
         "struct S { a: i64, b: i64 }",
         f"fn fscr(s: S) -> i64 {{ return match s.b {{ {v} => 20, _ => 0 }}; }}",
         f"fn iflet_int(x: i64) -> i64 {{ if let {v} = x {{ 50 }} else {{ 60 }} }}",
@@ -576,6 +1193,26 @@ def gen_pat_program(rng):
         f"fn iflet_color(c: Color) -> i64 {{ if let Color::{colors[0]} = c {{ 1 }} else {{ 2 }} }}",
         "fn iflet_rect(s: Shape) -> i64 { if let Shape::Rect(w, h) = s { w * h } else { 0 } }",
         f"fn iflet_chain(x: i64) -> i64 {{ if let {v} = x {{ 10 }} else if let {v + 1} = x {{ 20 }} else {{ 30 }} }}",
+        f"fn orpat(x: i64) -> i64 {{ return match x {{ {v} | {v + 1} | {v + 2} => 77, _ => 0 }}; }}",
+        f"fn orpat_color(c: Color) -> i64 {{ return match c {{ {or_arms} }}; }}",
+        f"fn rangepat(x: i64) -> i64 {{ return match x {{ {rlo}..={rhi} => 88, _ => 0 }}; }}",
+        f"fn range_excl(x: i64) -> i64 {{ return match x {{ {rlo}..{rhi} => 99, _ => 0 }}; }}",
+        f"fn orrange(x: i64) -> i64 {{ return match x {{ {rlo}..={rhi} => 1, {v} | {v + 5} => 2, _ => 0 }}; }}",
+        f"fn oriflet(x: i64) -> i64 {{ if let {v} | {v + 1} = x {{ 5 }} else {{ 6 }} }}",
+        f"fn rangeiflet(x: i64) -> i64 {{ if let {rlo}..={rhi} = x {{ 7 }} else {{ 8 }} }}",
+        f"fn strmatch(sel: i64) -> i64 {{ let s = if sel == 0 {{ {s0} }} else {{ {s1} }}; return match s {{ {s0} => 1, {s1} => 2, _ => 3 }}; }}",
+        f"fn stror(sel: i64) -> i64 {{ let s = if sel == 0 {{ {s0} }} else {{ {s1} }}; return match s {{ {s0} | {s1} => 1, _ => 2 }}; }}",
+        f"fn striflet(sel: i64) -> i64 {{ let s = if sel == 0 {{ {s0} }} else {{ {s1} }}; if let {s0} = s {{ 5 }} else {{ 6 }} }}",
+        f"fn strbind(sel: i64) -> i64 {{ let s = if sel == 0 {{ {s0} }} else {{ {s1} }}; return match s {{ {s0} => 1, other => if other == {s1} {{ 2 }} else {{ 3 }} }}; }}",
+        f"fn armassign(x: i64) -> i64 {{ let mut a: i64 = 100; match x % 3 {{ 0 => a = a + 1, 1 => a += 10, _ => a = a - 5 }} return a; }}",
+        f"fn gguard(x: i64) -> i64 {{ return match x {{ n if n > {v} => 100, n if n > {v} - 3 => 200, _ => 0 }}; }}",
+        f"fn gbind(x: i64) -> i64 {{ return match x {{ n if n % 2 == 1 => n * 3, _ => 0 }}; }}",
+        f"fn gcolor(c: Color) -> i64 {{ return match c {{ Color::{colors[0]} if c as i64 == 0 => 1, _ => 2 }}; }}",
+        "fn gshape(s: Shape) -> i64 { return match s { Shape::Line(w) if w > 3 => w, Shape::Line(w) => 0 - w, _ => 0 }; }",
+        f"fn gorpat(x: i64) -> i64 {{ return match x {{ {v} | {v + 1} if x > {v} => 1, _ => 0 }}; }}",
+        f"fn grange(x: i64) -> i64 {{ return match x {{ n if n > 0 && n < {v + 5} => 1, _ => 0 }}; }}",
+        "fn gbool(b: bool) -> i64 { return match b { true if b => 1, _ => 0 }; }",
+        f"fn gwild(x: i64) -> i64 {{ return match x {{ _ if x == {v} => 9, _ => 8 }}; }}",
         "fn main() -> i64 {",
         "    let mut acc: i64 = 0;",
         f"    let arr: [i64; 4] = [{a0}, {a1}, {v}, {k}];",
@@ -591,7 +1228,15 @@ def gen_pat_program(rng):
         "        acc = acc + bmatch(i % 2 == 0);",
         f"        acc = acc + bmatch(side(i) > {v});",
         "        acc = acc + iflet_int(i) + iflet_bind(i) + iflet_side(i) + iflet_chain(i);",
+        "        acc = acc + orpat(i) + orpat_color(c) + rangepat(i) + range_excl(i);",
+        "        acc = acc + orrange(i) + oriflet(i) + rangeiflet(i);",
         "        acc = acc + iflet_color(c) + iflet_rect(s);",
+        "        acc = acc + strmatch(i % 2) + stror(i % 2) + striflet(i % 2) + strbind(i % 2);",
+        "        acc = acc + armassign(i);",
+        "        acc = acc + gguard(i) + gbind(i) + gorpat(i) + grange(i);",
+        "        acc = acc + gcolor(c) + gshape(s) + gbool(i % 2 == 0) + gwild(i);",
+        "        let d: Disc = match i % 3 { 0 => Disc::D0, 1 => Disc::D1, _ => Disc::D2 };",
+        "        acc = acc + disc_code(d) * 100 + disc_cast(d);",
         "        i = i + 1;",
         "    }",
         "    print_i64(acc);",
@@ -615,6 +1260,10 @@ def gen_pat_program(rng):
         "enum Shape { Dot, Line(i64), Rect(i64, i64) }",
         "fn area(s: Shape) -> i64 { match s { Shape::Dot => 0, Shape::Line(w) => w, Shape::Rect(w, h) => w * h } }",
         "#[derive(Copy, Clone)]",
+        "enum Disc { D0 = 4, D1, D2 = 10 }",
+        "fn disc_code(d: Disc) -> i64 { match d { Disc::D0 => 1, Disc::D1 => 2, Disc::D2 => 3 } }",
+        "fn disc_cast(d: Disc) -> i64 { d as i64 }",
+        "#[derive(Copy, Clone)]",
         "struct S { a: i64, b: i64 }",
         f"fn fscr(s: S) -> i64 {{ match s.b {{ {v} => 20, _ => 0 }} }}",
         f"fn iflet_int(x: i64) -> i64 {{ if let {v} = x {{ 50 }} else {{ 60 }} }}",
@@ -623,6 +1272,26 @@ def gen_pat_program(rng):
         f"fn iflet_color(c: Color) -> i64 {{ if let Color::{colors[0]} = c {{ 1 }} else {{ 2 }} }}",
         "fn iflet_rect(s: Shape) -> i64 { if let Shape::Rect(w, h) = s { w * h } else { 0 } }",
         f"fn iflet_chain(x: i64) -> i64 {{ if let {v} = x {{ 10 }} else if let {v + 1} = x {{ 20 }} else {{ 30 }} }}",
+        f"fn orpat(x: i64) -> i64 {{ match x {{ {v} | {v + 1} | {v + 2} => 77, _ => 0 }} }}",
+        f"fn orpat_color(c: Color) -> i64 {{ match c {{ {or_arms} }} }}",
+        f"fn rangepat(x: i64) -> i64 {{ match x {{ {rlo}..={rhi} => 88, _ => 0 }} }}",
+        f"fn range_excl(x: i64) -> i64 {{ match x {{ {rlo}..{rhi} => 99, _ => 0 }} }}",
+        f"fn orrange(x: i64) -> i64 {{ match x {{ {rlo}..={rhi} => 1, {v} | {v + 5} => 2, _ => 0 }} }}",
+        f"fn oriflet(x: i64) -> i64 {{ if let {v} | {v + 1} = x {{ 5 }} else {{ 6 }} }}",
+        f"fn rangeiflet(x: i64) -> i64 {{ if let {rlo}..={rhi} = x {{ 7 }} else {{ 8 }} }}",
+        f"fn strmatch(sel: i64) -> i64 {{ let s = if sel == 0 {{ {s0} }} else {{ {s1} }}; match s {{ {s0} => 1, {s1} => 2, _ => 3 }} }}",
+        f"fn stror(sel: i64) -> i64 {{ let s = if sel == 0 {{ {s0} }} else {{ {s1} }}; match s {{ {s0} | {s1} => 1, _ => 2 }} }}",
+        f"fn striflet(sel: i64) -> i64 {{ let s = if sel == 0 {{ {s0} }} else {{ {s1} }}; if let {s0} = s {{ 5 }} else {{ 6 }} }}",
+        f"fn strbind(sel: i64) -> i64 {{ let s = if sel == 0 {{ {s0} }} else {{ {s1} }}; match s {{ {s0} => 1, other => if other == {s1} {{ 2 }} else {{ 3 }} }} }}",
+        f"fn armassign(x: i64) -> i64 {{ let mut a: i64 = 100; match x % 3 {{ 0 => a = a + 1, 1 => a += 10, _ => a = a - 5 }} return a; }}",
+        f"fn gguard(x: i64) -> i64 {{ match x {{ n if n > {v} => 100, n if n > {v} - 3 => 200, _ => 0 }} }}",
+        f"fn gbind(x: i64) -> i64 {{ match x {{ n if n % 2 == 1 => n * 3, _ => 0 }} }}",
+        f"fn gcolor(c: Color) -> i64 {{ match c {{ Color::{colors[0]} if c as i64 == 0 => 1, _ => 2 }} }}",
+        "fn gshape(s: Shape) -> i64 { match s { Shape::Line(w) if w > 3 => w, Shape::Line(w) => 0 - w, _ => 0 } }",
+        f"fn gorpat(x: i64) -> i64 {{ match x {{ {v} | {v + 1} if x > {v} => 1, _ => 0 }} }}",
+        f"fn grange(x: i64) -> i64 {{ match x {{ n if n > 0 && n < {v + 5} => 1, _ => 0 }} }}",
+        "fn gbool(b: bool) -> i64 { match b { true if b => 1, _ => 0 } }",
+        f"fn gwild(x: i64) -> i64 {{ match x {{ _ if x == {v} => 9, _ => 8 }} }}",
         "fn main() {",
         "    let mut acc: i64 = 0;",
         f"    let arr: [i64; 4] = [{a0}, {a1}, {v}, {k}];",
@@ -638,7 +1307,15 @@ def gen_pat_program(rng):
         "        acc += bmatch(i % 2 == 0);",
         f"        acc += bmatch(side(i) > {v});",
         "        acc += iflet_int(i) + iflet_bind(i) + iflet_side(i) + iflet_chain(i);",
+        "        acc += orpat(i) + orpat_color(c) + rangepat(i) + range_excl(i);",
+        "        acc += orrange(i) + oriflet(i) + rangeiflet(i);",
         "        acc += iflet_color(c) + iflet_rect(s);",
+        "        acc += strmatch(i % 2) + stror(i % 2) + striflet(i % 2) + strbind(i % 2);",
+        "        acc += armassign(i);",
+        "        acc += gguard(i) + gbind(i) + gorpat(i) + grange(i);",
+        "        acc += gcolor(c) + gshape(s) + gbool(i % 2 == 0) + gwild(i);",
+        "        let d: Disc = match i % 3 { 0 => Disc::D0, 1 => Disc::D1, _ => Disc::D2 };",
+        "        acc += disc_code(d) * 100 + disc_cast(d);",
         "        i += 1;",
         "    }",
         '    println!("{}", acc);',
@@ -961,6 +1638,16 @@ def reject_corpus():
         "stmt_in_loop": stmt(
             "let mut i: i64 = 0; while i < 1 { match e { E::A => { print_i64(1); } } i = i + 1; }",
             rs_decl="let e = E::A;"),
+        # A guarded arm covers nothing for exhaustiveness — the guard may be
+        # false, so `E::A if ..` does not cover `A` (rustc's E0004). A match
+        # that would be exhaustive without the guard is non-exhaustive with it.
+        "guard_variant_gap": both("match a { E::A if a as i64 == 0 => 1, E::B => 2 }"),
+        # A *guarded binding* arm covers nothing either, even though a bare
+        # binding would: `e if ..` is not a catch-all.
+        "guard_binding_not_catchall": both("match a { e if e as i64 == 0 => 1 }"),
+        # Same, in statement position: the arms are unit-typed, so only the
+        # exhaustiveness walk rejects it.
+        "stmt_guard_gap": stmt("match e { E::A if 1 == 1 => { print_i64(1); } }"),
         # Assignment to an immutable binding. rmc used to accept these and let
         # codegen write the slot; rustc rejects each with E0384.
         "assign_immutable_let": (
@@ -1057,6 +1744,13 @@ def reject_corpus():
         "print_str_int": (
             "fn main() -> i64 { let x: i64 = 42; print_str(x); return 0; }\n",
             "fn main() { let s: &str = 42; println!(\"{}\", s); }\n",
+        ),
+        # Comparing a `str` with an integer. rmc used to compare the string's
+        # address against the integer, which compiled to nonsense; rustc rejects
+        # it (E0308). The two are different types, so both must refuse.
+        "str_vs_int": (
+            "fn main() -> i64 { if \"a\" == 1 { return 1; } return 0; }\n",
+            "fn main() { if \"a\" == 1 { } }\n",
         ),
         # Writing through a place whose root binding is not `mut`. The first
         # mutability check only looked at a bare `Var` target, so these all
@@ -1185,6 +1879,39 @@ def reject_corpus():
             "fn main() -> i64 { let o: i64 = 3; if let y = o { 1 } return 0; }\n",
             "fn main() { let o = 3i64; if let y = o { 1 } }\n",
         ),
+        # `for PAT in ARRAY` needs a plain binding or `_`. A compound pattern
+        # (`[a, b]`, `(a, b)`, a struct pattern) is rejected rather than
+        # mis-bound to a single element, since rmc has no destructuring `let`.
+        "for_array_compound_pattern": (
+            "fn main() -> i64 {\n"
+            "    let a: [i64; 3] = [10, 20, 30];\n"
+            "    let mut s: i64 = 0;\n"
+            "    for [x, y, z] in a { s = s + x + y + z; }\n"
+            "    print_i64(s);\n"
+            "    return 0;\n"
+            "}\n",
+            "fn main() {\n"
+            "    let a = [10i64, 20, 30];\n"
+            "    let mut s = 0i64;\n"
+            "    for [x, y, z] in a { s += x + y + z; }\n"
+            "    println!(\"{}\", s);\n"
+            "}\n",
+        ),
+        "for_array_tuple_pattern": (
+            "fn main() -> i64 {\n"
+            "    let a: [i64; 2] = [10, 20];\n"
+            "    let mut s: i64 = 0;\n"
+            "    for (x, y) in a { s = s + x + y; }\n"
+            "    print_i64(s);\n"
+            "    return 0;\n"
+            "}\n",
+            "fn main() {\n"
+            "    let a = [10i64, 20];\n"
+            "    let mut s = 0i64;\n"
+            "    for (x, y) in a { s += x + y; }\n"
+            "    println!(\"{}\", s);\n"
+            "}\n",
+        ),
         # A `break` inside an inner loop's `if` condition still leaves that
         # loop, so the outer loop repeats and a write to an immutable binding
         # before the inner loop is a second write (E0384). The break walk must
@@ -1239,6 +1966,13 @@ def reject_corpus():
             "fn main() -> i64 { loop { while { for i in { break; 0 }..1 {} true } {} } return 0; }\n",
             "fn main() { loop { while { for i in { break; 0 }..1 {} true } {} } }\n",
         ),
+        # A labelled `continue` in a nested `while` condition (or a `for` bound)
+        # targets the outer loop, so a write before the nested loop repeats
+        # (E0384). The reach walk must follow it out of the nested loop.
+        "assign_immutable_cond_continue_nested": (
+            "fn main() { let x: i64; 'o: loop { x = 1; while { continue 'o; true } {} break 'o; } }\n",
+            "fn main() { let x: i64; 'o: loop { x = 1; while { continue 'o; true } {} break 'o; } }\n",
+        ),
     }
 
 
@@ -1276,12 +2010,16 @@ def run_reject():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "robust", "reject"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "robust", "reject"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
     ap.add_argument("--bounds", action="store_true",
                     help="also compile with --bounds-checks, to exercise the trap codegen")
+    ap.add_argument("--encoding", action="store_true",
+                    help="also compare the in-process .text against the as+ld "
+                         ".text instruction-for-instruction (catches encoding "
+                         "drift that a behaviour comparison cannot see)")
     ap.add_argument("--overflow", action="store_true",
                     help="also compile with --overflow-checks, against a rustc built "
                          "with -C overflow-checks=on")
@@ -1312,7 +2050,9 @@ def main():
     gen = {"expr": gen_expr_program, "stmt": gen_stmt_program,
            "opt": gen_opt_program, "arith": gen_arith_program,
            "nest": gen_nest_program, "pat": gen_pat_program,
-           "order": gen_order_program, "shift": gen_shift_program}[args.mode]
+           "order": gen_order_program, "shift": gen_shift_program,
+           "cast": gen_cast_program, "assoc": gen_assoc_program,
+           "ref": gen_ref_program, "update": gen_update_program}[args.mode]
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus
     # suite; a fuzz program is otherwise only checked with every pass on, so a
@@ -1393,6 +2133,13 @@ def main():
                 bad = (f"rmc[{label}] argv={argv} exit={o1.returncode} stdout={o1.stdout!r}\n"
                        f"  rustc    exit={o2.returncode} stdout={o2.stdout!r}")
                 break
+            if args.encoding:
+                enc = encoding_divergence(f"{tmp}/p.rms", flags, tmp)
+                if enc is not None and enc is not True:
+                    k, ip, asm = enc
+                    bad = (f"rmc[{label}] in-process vs as differ at instruction {k}\n"
+                           f"  in-process = {ip}\n  as+ld      = {asm}")
+                    break
         if bad:
             print(f"[{args.mode} seed={args.seed} iter={t}] DIVERGENCE\n{rms}\n  {bad}")
             if args.keep:

@@ -1,8 +1,11 @@
 //! rmc: a small ahead-of-time compiler for a Rust subset.
 //!
 //! Pipeline: source -> lex -> parse -> semantic analysis -> x86-64 assembly ->
-//! GNU as -> GNU ld. No LLVM, no external crates. The emitted program links
-//! against a freestanding assembly runtime and makes raw Linux syscalls.
+//! ELF64 executable. No LLVM, no external crates, and by default no external
+//! assembler or linker: the assembly the code generator emits is assembled and
+//! linked in-process. The emitted program links against a freestanding assembly
+//! runtime and makes raw Linux syscalls. `--binutils` falls back to GNU `as`
+//! and `ld` when the assembly text must be handed to the system tools.
 
 use rmc::{compile_to_asm, CompileOptions};
 use std::io::Write;
@@ -15,6 +18,9 @@ struct Options {
     output: PathBuf,
     emit_asm: bool,
     keep_asm: bool,
+    strip: bool,
+    min_size: bool,
+    binutils: bool,
     overflow_checks: bool,
     bounds_checks: bool,
     no_inline: bool,
@@ -28,6 +34,9 @@ fn parse_args() -> Result<Options, String> {
     let mut output: Option<PathBuf> = None;
     let mut emit_asm = false;
     let mut keep_asm = false;
+    let mut strip = true;
+    let mut min_size = false;
+    let mut binutils = false;
     let mut overflow_checks = false;
     let mut bounds_checks = false;
     let mut no_inline = false;
@@ -42,6 +51,9 @@ fn parse_args() -> Result<Options, String> {
             }
             "--emit-asm" => emit_asm = true,
             "--keep-asm" => keep_asm = true,
+            "--no-strip" => strip = false,
+            "--min-size" => min_size = true,
+            "--binutils" => binutils = true,
             "--overflow-checks" => overflow_checks = true,
             "--bounds-checks" => bounds_checks = true,
             "--no-inline" => no_inline = true,
@@ -64,6 +76,20 @@ fn parse_args() -> Result<Options, String> {
     }
 
     let input = input.ok_or("no input file given (see --help)")?;
+    // `--no-strip` asks for a symbol table so `nm`/`gdb` can read the artifact;
+    // `--min-size` runs `strip --strip-all`, which removes exactly that table.
+    // The two request opposite artifacts, so reject the combination rather than
+    // silently letting `--min-size` win.
+    if !strip && min_size {
+        return Err("--no-strip and --min-size conflict: --min-size strips the symbol table --no-strip keeps".into());
+    }
+    // `--no-strip` exists so `nm`/`gdb`/`objdump` can read the artifact, which
+    // needs a symbol table. The in-process encoder builds none, so the flag
+    // selects the binutils path instead of silently producing a symbol-less
+    // binary.
+    if !strip {
+        binutils = true;
+    }
     let output = output.unwrap_or_else(|| {
         let stem = input.file_stem().unwrap_or_default();
         Path::new(".").join(stem)
@@ -73,6 +99,9 @@ fn parse_args() -> Result<Options, String> {
         output,
         emit_asm,
         keep_asm,
+        strip,
+        min_size,
+        binutils,
         overflow_checks,
         bounds_checks,
         no_inline,
@@ -91,6 +120,9 @@ fn print_help() {
          \x20   -o <path>      output binary path\n\
          \x20   --emit-asm     print generated assembly to stdout and stop\n\
          \x20   --keep-asm     keep the intermediate .s file next to the output\n\
+         \x20   --no-strip     keep the symbol table in the output binary\n\
+         \x20   --min-size     with --binutils, also drop the section headers\n\
+         \x20   --binutils     use GNU `as` and `ld` instead of linking in-process\n\
          \x20   --overflow-checks  trap on i64 +,-,* overflow (off by default)\n\
          \x20   --bounds-checks    trap on an out-of-range array index (off by default)\n\
          \x20   --no-inline        disable the inlining pass (on by default)\n\
@@ -142,12 +174,38 @@ fn run(opts: Options) -> Result<(), String> {
         return Ok(());
     }
 
+    if !opts.binutils {
+        // Assemble and link in-process. This is the default: it removes the two
+        // binutils processes that dominate compile time and produces a smaller
+        // executable (no symbol or section-header tables to begin with).
+        let bytes = rmc::elf::assemble(&asm)?;
+        std::fs::write(&opts.output, &bytes)
+            .map_err(|e| format!("cannot write {}: {e}", opts.output.display()))?;
+        if opts.keep_asm {
+            let asm_path = opts.output.with_extension("s");
+            std::fs::write(&asm_path, &asm)
+                .map_err(|e| format!("cannot write {}: {e}", asm_path.display()))?;
+        }
+        // `ld` marks its output executable; the in-process path must too.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::Permissions::from_mode(0o755);
+            std::fs::set_permissions(&opts.output, mode)
+                .map_err(|e| format!("cannot chmod {}: {e}", opts.output.display()))?;
+        }
+        return Ok(());
+    }
+
     let asm_path = opts.output.with_extension("s");
     std::fs::write(&asm_path, &asm).map_err(|e| format!("cannot write {}: {e}", asm_path.display()))?;
 
     let obj_path = opts.output.with_extension("o");
     assemble(&asm_path, &obj_path)?;
-    link(&obj_path, &opts.output)?;
+    link(&obj_path, &opts.output, opts.strip)?;
+    if opts.min_size {
+        strip_section_headers(&opts.output)?;
+    }
 
     if !opts.keep_asm {
         let _ = std::fs::remove_file(&asm_path);
@@ -171,7 +229,7 @@ fn assemble(asm: &Path, obj: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn link(obj: &Path, exe: &Path) -> Result<(), String> {
+fn link(obj: &Path, exe: &Path, strip: bool) -> Result<(), String> {
     // The assembly carries a `.note.GNU-stack` section, so the stack is marked
     // non-executable without an explicit `-z noexecstack`.
     //
@@ -180,18 +238,48 @@ fn link(obj: &Path, exe: &Path) -> Result<(), String> {
     // read+write one. That is both smaller than `-n` (which packs *everything*
     // into one read+write+execute segment, an avoidable W^X hazard) and the
     // smallest layout `ld` offers here: 3304 bytes vs 7344 for the hello case.
-    let out = Command::new("ld")
-        .arg("-o")
+    let mut cmd = Command::new("ld");
+    cmd.arg("-o")
         .arg(exe)
         .arg("--build-id=none")
         .arg("-z")
-        .arg("noseparate-code")
+        .arg("noseparate-code");
+    // Dropping the symbol and section-name tables is worth about a third of
+    // the artifact at this size (1376 -> 888 bytes on `hello`) and changes
+    // nothing the loader reads. `--no-strip` keeps them for `nm`/`gdb`.
+    if strip {
+        cmd.arg("--strip-all");
+    }
+    let out = cmd
         .arg(obj)
         .output()
         .map_err(|e| format!("failed to run `ld`: {e}"))?;
     if !out.status.success() {
         let _ = std::io::stderr().write_all(&out.stderr);
         return Err("linker failed".into());
+    }
+    Ok(())
+}
+
+/// `--min-size`: run `strip --strip-section-headers` on the linked binary.
+///
+/// The section-header table is not read by the loader, so dropping it is safe
+/// and saves another 40% of the file (888 -> 536 bytes on `hello`). It needs a
+/// second binutils process (~2.3 ms), which is a third of rmc's own compile
+/// time, so it is opt-in rather than the default. `strip` ships with `as`/`ld`,
+/// so it adds no new dependency. The binary still runs and `readelf -lW` still
+/// works, but `nm`/`objdump -d` need the section table, so this is for a
+/// deployment artifact, not a debugging one.
+fn strip_section_headers(exe: &Path) -> Result<(), String> {
+    let out = Command::new("strip")
+        .arg("--strip-all")
+        .arg("--strip-section-headers")
+        .arg(exe)
+        .output()
+        .map_err(|e| format!("failed to run `strip`: {e}"))?;
+    if !out.status.success() {
+        let _ = std::io::stderr().write_all(&out.stderr);
+        return Err("strip failed".into());
     }
     Ok(())
 }

@@ -155,6 +155,234 @@ def check_bounds_traps(combos):
     return failures
 
 
+def check_stripped():
+    """Size behaviour of both link paths.
+
+    The default in-process link writes no symbol table and no section-header
+    table, so it is the smallest artifact and needs no strip step. The
+    `--binutils` fallback links with `ld`, which keeps the symbol table by
+    default; there `--no-strip` keeps it and `--min-size` drops the section
+    headers as well. Pin the ordering and that every artifact runs.
+    """
+    rms = os.path.join(OUT, "strip_hello.rms")
+    with open(rms, "w") as f:
+        f.write("fn main() -> i64 { print_i64(1); return 0; }\n")
+
+    default = os.path.join(OUT, "strip_default.bin")
+    binstrip = os.path.join(OUT, "strip_binutils.bin")
+    binkeep = os.path.join(OUT, "strip_binutils_kept.bin")
+    binmin = os.path.join(OUT, "strip_binutils_min.bin")
+
+    builds = [
+        (default, [RMC, rms, "-o", default]),
+        (binstrip, [RMC, "--binutils", rms, "-o", binstrip]),
+        (binkeep, [RMC, "--binutils", "--no-strip", rms, "-o", binkeep]),
+        (binmin, [RMC, "--binutils", "--min-size", rms, "-o", binmin]),
+    ]
+    for path, cmd in builds:
+        p = subprocess.run(cmd, capture_output=True)
+        if p.returncode != 0:
+            print(f"FAIL strip: {cmd[1:-2]} failed:\n{p.stderr.decode(errors='replace')}")
+            return 1
+        p = subprocess.run([path], capture_output=True)
+        if p.returncode != 0 or p.stdout != b"1\n":
+            print(f"FAIL strip: {path} misbehaved: rc={p.returncode} out={p.stdout!r}")
+            return 1
+
+    # The default link carries no section-header table at all.
+    p = subprocess.run(["readelf", "-SW", default], capture_output=True)
+    if p.returncode != 0 or b"There are no sections" not in p.stdout:
+        print("FAIL strip: default binary has a section-header table")
+        return 1
+
+    # `--binutils` strips symbols by default; `--no-strip` keeps them.
+    p = subprocess.run(["readelf", "-sW", binstrip], capture_output=True)
+    if p.returncode != 0:
+        print("FAIL strip: readelf failed on the binutils binary")
+        return 1
+    if b"main" in p.stdout:
+        print("FAIL strip: symbol table present in the binutils default binary")
+        return 1
+    p = subprocess.run(["readelf", "-sW", binkeep], capture_output=True)
+    if p.returncode != 0 or b"main" not in p.stdout:
+        print("FAIL strip: --no-strip dropped the symbol table")
+        return 1
+
+    # Size ordering: direct < binutils --min-size < binutils stripped < kept.
+    order = [default, binmin, binstrip, binkeep]
+    sizes = [os.path.getsize(x) for x in order]
+    if any(a >= b for a, b in zip(sizes, sizes[1:])):
+        print(f"FAIL strip: artifact sizes not increasing {sizes}")
+        return 1
+
+    # An absolute bound. A one-line program is a few hundred bytes; a 4 KB
+    # regression (e.g. a section that should be in the RX segment getting
+    # page-aligned into its own) would not change the ordering above but would
+    # blow this bound.
+    if sizes[0] >= 1024:
+        print(f"FAIL strip: default artifact is {sizes[0]} bytes (want < 1024)")
+        return 1
+    return 0
+
+
+def check_link_paths_agree():
+    """The in-process assembler and the `as`+`ld` path must agree.
+
+    The default link no longer shells out, so the two paths can drift. Compile
+    a handful of cases that between them exercise every encoding the in-process
+    assembler implements (immediates, byte moves, sign extension, RIP-relative
+    data, traps) and require identical stdout and exit status from both.
+    """
+    cases = ["arith", "div", "io", "utf8", "structs", "match", "bounds", "heap"]
+    failures = 0
+    for name in cases:
+        rms = os.path.join(CASES, f"{name}.rms")
+        if not os.path.exists(rms):
+            continue
+        direct = os.path.join(OUT, f"paths_{name}.direct")
+        binut = os.path.join(OUT, f"paths_{name}.binutils")
+        p = subprocess.run([RMC, rms, "-o", direct], capture_output=True)
+        q = subprocess.run([RMC, "--binutils", rms, "-o", binut], capture_output=True)
+        if p.returncode != 0 or q.returncode != 0:
+            print(f"FAIL paths {name}: compile failed "
+                  f"(direct={p.returncode} binutils={q.returncode})")
+            failures += 1
+            continue
+        for argv in load_args().get(name, [[]]):
+            a = subprocess.run([direct] + argv, capture_output=True)
+            b = subprocess.run([binut] + argv, capture_output=True)
+            if (a.returncode, a.stdout) != (b.returncode, b.stdout):
+                print(f"FAIL paths {name} {argv}: direct={a.returncode}/{a.stdout[:40]!r} "
+                      f"binutils={b.returncode}/{b.stdout[:40]!r}")
+                failures += 1
+                break
+    if failures == 0:
+        print("in-process link and the `as`+`ld` path produce identical behaviour")
+    return failures
+
+
+def disassemble_text(path, raw_text):
+    """Normalised instruction list for a `.text` blob, or a linked binary.
+
+    Branch and call targets are folded to a placeholder (the two paths lay code
+    out differently) and alignment `nop`s are dropped (GNU `as` emits the
+    multi-byte forms, the in-process encoder the one-byte form). What is left is
+    the instruction stream, which must be identical.
+    """
+    import re
+    if raw_text:
+        blob = os.path.join(OUT, "_enc_raw.bin")
+        with open(blob, "wb") as f:
+            f.write(raw_text)
+        cmd = ["objdump", "-D", "-b", "binary", "-m", "i386:x86-64", blob]
+    else:
+        cmd = ["objdump", "-d", path]
+    p = subprocess.run(cmd, capture_output=True)
+    if p.returncode != 0:
+        return None
+    ins = []
+    for line in p.stdout.decode(errors="replace").splitlines():
+        m = re.match(r"^\s*[0-9a-f]+:\s+(?:[0-9a-f]{2} )+\s*(.*)$", line)
+        if not m:
+            continue
+        text = m.group(1).strip()
+        # `objdump -b binary` prints immediates in hex, ELF mode in decimal, so
+        # fold immediates first, then remaining addresses.
+        text = re.sub(r"\$-?0x[0-9a-f]+", "$I", text)
+        text = re.sub(r"\$-?[0-9]+", "$I", text)
+        text = re.sub(r"0x[0-9a-f]+", "A", text)
+        text = re.sub(r"\s+", " ", text)
+        if not text:
+            # A long multi-byte `nop` wraps: objdump prints its trailing bytes
+            # on a continuation line with no mnemonic.
+            continue
+        # Alignment padding: the encoder emits single-byte `nop`s, `as` the
+        # multi-byte forms that objdump renders as `nopw`/`nopl`/`data16 ...`
+        # or the `xchg %ax,%ax` idiom. Drop them all; they carry no behaviour.
+        if "nop" in text or text in ("xchg %ax,%ax",) or text.startswith("data16"):
+            continue
+        ins.append(text)
+    return ins
+
+
+def in_process_text(path):
+    """The RX LOAD segment's file bytes, i.e. the assembled `.text`."""
+    import struct
+    data = open(path, "rb").read()
+    phoff = struct.unpack_from("<Q", data, 0x20)[0]
+    phentsize = struct.unpack_from("<H", data, 0x36)[0]
+    phnum = struct.unpack_from("<H", data, 0x38)[0]
+    for i in range(phnum):
+        o = phoff + i * phentsize
+        p_type, p_flags = struct.unpack_from("<II", data, o)
+        p_offset = struct.unpack_from("<Q", data, o + 8)[0]
+        p_filesz = struct.unpack_from("<Q", data, o + 32)[0]
+        if p_type == 1 and (p_flags & 1):
+            start = phoff + phnum * phentsize
+            return data[start:p_offset + p_filesz]
+    return None
+
+
+def check_encoding_matches_as():
+    """The in-process encoder must agree with `as` instruction-for-instruction.
+
+    `check_link_paths_agree` compares behaviour, which cannot see an encoding
+    that is merely slower: `enc_div` set REX.W on `div %ebx`, turning the 32-bit
+    divide into the 64-bit one, and `.p2align 4` aligned to 4 bytes instead of
+    16. Both produced identical stdout and exit status while costing 14% at run
+    time on a divide-bound loop. This compares the decoded instruction streams,
+    so an operand-size or alignment regression fails the suite.
+    """
+    names = sorted(f[:-4] for f in os.listdir(CASES) if f.endswith(".rms"))
+    # Encoding is chosen by the codegen, so the optimiser passes can change which
+    # instruction forms appear. Check the default and the plainest path.
+    combos = [("", []), (" [no-inline]", ["--no-inline"])]
+    failures = 0
+    for name in names:
+        rms = os.path.join(CASES, f"{name}.rms")
+        for label, flags in combos:
+            tag = name + label.replace(" ", "_").replace("[", "").replace("]", "")
+            direct = os.path.join(OUT, f"enc_{tag}.direct")
+            binut = os.path.join(OUT, f"enc_{tag}.binutils")
+            p = subprocess.run([RMC, rms, "-o", direct] + flags, capture_output=True)
+            q = subprocess.run([RMC, "--binutils", rms, "-o", binut] + flags,
+                               capture_output=True)
+            if p.returncode != 0 or q.returncode != 0:
+                print(f"FAIL encoding {name}{label}: compile failed")
+                failures += 1
+                continue
+            raw = in_process_text(direct)
+            # dump the as+ld `.text` with objcopy for the same treatment
+            blob = os.path.join(OUT, f"_enc_{tag}.text")
+            r = subprocess.run(["objcopy", "-O", "binary", "--only-section=.text",
+                                binut, blob], capture_output=True)
+            if raw is None or r.returncode != 0:
+                print(f"FAIL encoding {name}{label}: could not extract .text")
+                failures += 1
+                continue
+            a = disassemble_text(direct, raw)
+            b = disassemble_text(binut, open(blob, "rb").read())
+            if a is None or b is None:
+                print(f"FAIL encoding {name}{label}: objdump failed")
+                failures += 1
+                continue
+            # The in-process RX segment packs `.rodata` after `.text`, so the
+            # disassembly of its tail is string data, not code. Compare the
+            # common prefix; a genuine encoding difference shows up mid-stream,
+            # where the instruction counts still line up.
+            n = min(len(a), len(b))
+            if a[:n] != b[:n]:
+                k = next((i for i in range(n) if a[i] != b[i]), n)
+                print(f"FAIL encoding {name}{label}: in-process vs as differ at "
+                      f"instruction {k}")
+                print(f"    in-process = {a[k] if k < len(a) else '<end>'}")
+                print(f"    as+ld      = {b[k] if k < len(b) else '<end>'}")
+                failures += 1
+    if failures == 0:
+        print("in-process encoder matches `as` instruction-for-instruction")
+    return failures
+
+
 def check_no_rwx():
     """The linked executable must have no writable-and-executable LOAD segment.
 
@@ -251,10 +479,16 @@ def main():
                     print(f"ok   {name}{label} {argv}")
 
     failures += check_bounds_traps(combos)
+    stripped = check_stripped()
+    failures += stripped
+    if stripped == 0:
+        print("default link is smallest; --binutils strip/--min-size behave")
     rwx = check_no_rwx()
     failures += rwx
     if rwx == 0:
         print("linked binary has no writable+executable LOAD segment")
+    failures += check_link_paths_agree()
+    failures += check_encoding_matches_as()
 
     total = len(names)
     if failures == 0:

@@ -5,9 +5,11 @@ Repository-specific notes for future sessions. Keep this file current.
 ## What this is
 
 `rmc` is an experimental ahead-of-time compiler for a small Rust subset. It emits
-x86-64 assembly directly, assembles with GNU `as`, and links with GNU `ld`
-against a freestanding assembly runtime (raw Linux syscalls, no libc, no LLVM,
-no external crates). The `bench/` directory compares it against real `rustc`.
+x86-64 assembly directly, then assembles and links it in-process into a static
+ELF64 executable (`src/elf.rs`) against a freestanding assembly runtime (raw
+Linux syscalls, no libc, no LLVM, no external crates, and by default no `as` or
+`ld`). `--binutils` restores the old `as`+`ld` path. The `bench/` directory
+compares it against real `rustc`.
 
 ## Build and run
 
@@ -40,6 +42,11 @@ python3 tools/fuzz.py --mode arith --n 500 --seed 1
 python3 tools/fuzz.py --mode nest --n 500 --seed 1
 python3 tools/fuzz.py --mode pat --n 500 --seed 1
 python3 tools/fuzz.py --mode order --n 500 --seed 1
+python3 tools/fuzz.py --mode shift --n 500 --seed 1
+python3 tools/fuzz.py --mode cast --n 500 --seed 1
+python3 tools/fuzz.py --mode assoc --n 500 --seed 1
+python3 tools/fuzz.py --mode ref --n 500 --seed 1
+python3 tools/fuzz.py --mode update --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 ```
 
@@ -59,6 +66,44 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   so sema and codegen have no `match` case. A non-`Var`/`Int` scrutinee is bound
   to a hidden `let` first, so a call in the scrutinee runs once. An arm after
   `_` is unreachable and dropped (the `_` body becomes the `else`).
+  An arm *body* is parsed by `parse_arm_body`, not `parse_expr`: assignment is
+  only a statement here, so a bare `0 => acc = 1` would otherwise stop at the
+  `=` and fail, and `return`/`break`/`continue` would be rejected outright.
+  `parse_arm_body` builds an `Assign` for `expr = value` and `expr op= value`
+  (via `desugar_compound`), or a `Return`/`Break`/`Continue` statement, and
+  wraps it in a `Block`; the block is what `match_arm` places as the branch
+  expression. A terminator's optional value stops at the arm's `,`/`}`
+  (`arm_terminator_value`), so `0 => return 5,` keeps the comma for the arm
+  list. Only `match` arms use it: `if let`/`while let` bodies are blocks.
+  An arm pattern may be an integer, a *range* `lo..hi`/`lo..=hi`, a *string
+  literal*, an `Enum::Variant`, an *or-pattern* `a | b | c`, or `_`. A range
+  desugars to `Bin(And, Le, Lt/Le)`, an or-pattern to `Bin(Or, ..)` over the
+  alternatives' tests with the *same* body (`or_cond` builds only the test, so
+  the body is not duplicated), so neither needs a sema or codegen case. A
+  *string* pattern desugars to `Bin(Eq, scrutinee, Str(s))`, which sema already
+  lowers to the byte-wise `__rmc_str_lt` helper: the scrutinee is a pointer, so
+  a machine compare would never match two distinct-but-equal literals. An
+  or-pattern with a
+  `_` alternative, and one whose alternatives cover every variant, are handled
+  by `pat_irrefutable` and `or_leaves` (in sema) respectively. A *binding*
+  alternative is rejected, as rustc's E0408 rejects it.
+  An arm may carry a *guard*, `PAT if COND => body`. `parse_match` reads the
+  optional `if COND` after the pattern (`parse_cond`, so a struct literal needs
+  parentheses) and threads it through `desugar_arm` as an `Option<Expr>`. The
+  guard folds into the arm's condition rather than becoming a node, so sema and
+  codegen gain no case; see the exhaustiveness notes below for the three rules a
+  guard changes. `desugar_match_arms` snapshots the scrutinee into a temporary
+  before the arm chain whenever it is not a literal or an enum constant, so a
+  guard that assigns the matched value (`match x { n if { x = 2; true } => n }`)
+  cannot change what the arm body's binding reads: the guard and the body share
+  the snapshot. rustc's borrow checker rejects that program (E0506), so no
+  differential twin exists; the snapshot is pinned by an end-to-end test.
+  `while let PAT = EXPR { body }` is parsed here and desugared by
+  `desugar_while_let` to `loop { if let PAT = EXPR { body } else { break; } }`,
+  reusing the `if let` path, so sema and codegen gain no case. The scrutinee sits
+  inside the loop, so it is re-evaluated each iteration and `continue` re-tests
+  it. The `;` after `return`/`break`/`continue` may be omitted at the end of a
+  block (`eat_semi_at_block_end`), as in Rust.
   `if let PAT = EXPR { .. } else { .. }` is parsed here too and desugared by
   `desugar_if_let` into a two-arm `match` (`PAT => then, _ => else_or_unit`),
   reusing `desugar_match_arms` and the `parse_pattern` shared with `match` arms,
@@ -74,6 +119,21 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   accepts a program rustc rejects; wrapping the dead arms for `match` instead
   rejects a program rustc accepts (`match o { _ => 5, 3 => 9 }` in value
   position), which is why the flag exists.
+  `sema` also unifies a diverging branch: `if c { 1 } else { return 2 }` is
+  well typed because `!` unifies with any type. `block_diverges` decides it,
+  and `stmt_diverges` treats `loop { .. }` as diverging unless `block_has_break`
+  finds a `break` that targets it (a nested loop captures its own `break`s).
+  Definite initialization follows: only the non-diverging branch's writes
+  survive the `if`.
+  `check_block` returns `Never` for a block that cannot complete, and every
+  consumer of a block type accepts `Never` where a value is expected (`let`,
+  `return`, the function-body check, and both arms of an `if`). That is what
+  makes `fn f(e: E) -> i64 { match e { E::A => { return 1; } E::B => { return 2;
+  } } }` and `let x: i64 = if c { return 1; } else { return 2; };` compile, as
+  in rustc. The one case a block type cannot express is a `match` chain whose
+  every arm diverges: its last step is an `if` with no `else`, which completes
+  as `()`, so `Sema::match_chain_diverges` walks the chain and the no-`else`
+  branch propagates `Never` for a `total` chain.
 - `compiler/src/ast.rs` — AST and `Type` (`I64`, `Bool`, `Str`, `Unit`, `Array`,
   `Struct`, and the parser-only placeholder `Named`). `Str` is the type of a
   string literal: one slot holding a pointer to NUL-terminated static data. It
@@ -84,26 +144,66 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   builtin sigs, and the soundness checks (mutability, definite initialization,
   constant array bounds, string typing — see "Soundness checks" below). Resolves
   `Type::Named`, fills `Field`/`FieldInit` offsets, and allocates the hidden
-  slots for aggregate arguments and returns.
+  slots for aggregate arguments and returns. Field init shorthand
+  (`P { x, y }`) is resolved by the *parser*, which rewrites a bare field name
+  to `x: x`; sema then checks the `Var` it built like any other, so an unbound
+  name reports `unknown variable` rather than a missing-field error.
 - `compiler/src/consts.rs` — shared constant folding: `const_i64`/`const_binop`
   (used by sema to fold a constant index or operand) and `resolve`/`eval_i64`
   (used by the parser to evaluate `const` items). A `const` item has no storage
   and no codegen; its value is substituted at every use.
-- `compiler/src/inline.rs` — AST inlining of small, straight-line, scalar
-  functions, run after sema and before codegen. See the inlining gotcha below.
+- `compiler/src/inline.rs` — AST inlining of small, call-free, scalar functions
+  (a loop is allowed, an early exit is not), run after sema and before codegen.
+  See the inlining gotcha below.
 - `compiler/src/licm.rs` — loop-invariant code motion, run after inlining and
   before codegen. See the LICM gotcha below.
+- `compiler/src/dce.rs` — dead-function elimination, run after LICM and before
+  codegen. Keeps only the functions reachable from `main` (see "Runtime pruning"
+  below for why this composes with runtime selection).
 - `compiler/src/codegen.rs` — AST to AT&T x86-64 assembly.
 - `compiler/src/runtime.rs` — freestanding assembly runtime (`_start`, I/O,
-  `alloc`/`free`, `arg_i64`, the overflow trap).
-- `compiler/src/main.rs` — CLI: reads source, calls the library, runs `as`/`ld`.
-  Flags: `--emit-asm`, `--keep-asm`, `--overflow-checks`, `--bounds-checks`,
-  `--no-inline`, `--no-licm`.
+  `alloc`/`free`, `arg_i64`, the traps). Stored as a table of selectable
+  `PIECES`; `for_program(user_asm)` links only the pieces the program reaches
+  (see "Runtime pruning" below).
+- `compiler/src/elf.rs` — the in-process assembler and ELF64 linker. Parses the
+  assembly text `codegen`/`runtime` produce and emits a static executable with
+  two `PT_LOAD` segments (R+X for text/rodata, R+W for data). See "In-process
+  assembler" below before adding an instruction or a codegen form.
+- `compiler/src/main.rs` — CLI: reads source, calls the library, writes the ELF.
+  Flags: `--emit-asm`, `--keep-asm`, `--binutils`, `--no-strip`, `--min-size`,
+  `--overflow-checks`, `--bounds-checks`, `--no-inline`, `--no-licm`,
+  `--no-tco`.
 - `compiler/tests/compile.rs` — unit tests for the front end and codegen; these
   run without `as`/`ld`.
 
 ## Things that are easy to get wrong
 
+- **`loop` is an expression, and codegen must report its own type, not `I64`.**
+  `loop { .. }` parses to `Expr::Loop(body, slot, ty)`; a `loop` in statement
+  position is a `Stmt::Expr` around it with `slot == -2`, so its value is
+  discarded and it is typed `()`. Sema fills `ty` with the type of the loop's
+  `break`s (or `Unit` for a `!` loop, matching every other diverging
+  expression), and codegen returns that `ty`. Hardcoding `Type::I64` there
+  compiles but silently mis-types a loop that yields a `bool` (so `!loop { break
+  true }` becomes a bitwise `not` instead of a logical one) and a loop that
+  yields an aggregate (so an enum-constructor argument or `value_copies_aggregate`
+  takes the wrong path). A value-yielding loop carries its result in a hidden
+  slot sized by the result's word count (`slot >= 0`); `break value` stores into
+  it and the loop loads it after `break_label`. The slot's `-1`/`-2` sentinels
+  are load-bearing: `-1` means "no value to carry", `-2` means "statement
+  position, value discarded".
+- **Do not weight `promote`'s mention count by loop depth.** It looks obviously
+  right — a variable inside a loop runs many more times than one in straight-line
+  code — but it loses: weights 2, 3, 4 and 8 all moved mandel from ~95 ms to
+  ~101 ms and heap from 3.20 to ~3.4 ms. The five registers are a fixed budget,
+  so promoting an innermost-loop local demotes an outer one, and mandel's inner
+  loop is division-bound and does not notice its own memory traffic while the
+  outer counters `x`/`y`/`size`/`acc` pay a store and reload on every iteration.
+  `promote` ranks by the raw mention count on purpose; measure before touching it
+  (the full account is in `docs/design.md`). A depth *tiebreak* (same count,
+  prefer the deeper loop) fails the same way: mandel's five locals tie at four
+  mentions, the tiebreak promotes the innermost `i` and demotes `x`, and mandel
+  goes 31.7 -> 32.4 ms.
 - **A local whose address is taken must be forced into memory before promotion.**
   The promotion pass picks the hottest scalar locals and keeps them only in
   registers, so their frame slot goes stale. `&x` needs `x` to be in memory, so
@@ -162,6 +262,37 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   register (`mov %r, %r`) and to `field_operand`'s `disp(%reg)` form. Measured
   +5% on `heap`. The two store-shape tests (`a_write_through_a_dereference...`,
   `field_write_targets_the_right_slot`) assert the folded form.
+- **A simple initialiser or assignment stores straight into its home.**
+  `store_simple` collapses `mov X, %rax; mov %rax, dst` into `mov X, dst` when
+  `X` is already a bare operand: a small immediate (`movq $k, dst`) or a
+  register (`mov %r, dst`). It is used from all four store sites — a `let` into
+  an unpromoted local, an assignment to one, a struct field in a promoted
+  register (via `gen_expr_into_reg`, so `mov $k, %rbx`), and a field in memory —
+  and never accepts a memory operand, which would make an illegal
+  `mov mem, mem`. A promoted *local* still uses `gen_expr_into_reg`, so its
+  constant becomes `mov $k, %r` directly. Neither an immediate nor a register
+  copy can trap, so the fold never changes when a trap would fire; it only ever
+  removes a `%rax` bounce. `refs` loses eight instructions from its struct
+  literal, and the frame store of a promoted field copied into an address-taken
+  local loses one. A *store-to-load forwarding* rewrite of the same shape
+  (`mov %r, X; mov X, %rY` -> `mov %r, %rY`) was measured perf-neutral on the
+  whole suite and not kept. A fuller textual version that tracked the live
+  register per frame slot (`forward_stores`) removed one instruction across the
+  whole corpus and cost 3-30% of compile time (`div.rms` 1.30x) for no runtime
+  change, so it was reverted too: the generator already keeps the value in a
+  register or reloads where a load is genuinely needed, and a whole-body rewrite
+  pass is the wrong price for the project's headline metric. `gen_expr_to_slot(e, slot)` is the one entry point
+  for "evaluate into a local": the promoted register when there is one, else a
+  folded frame store. `let`, assignment and both `for` bounds go through it, so
+  a constant `for` start is `mov $0, %rbx` rather than a bounce through `%rax`.
+- **An `if` whose whole body is `break`/`continue` branches straight to the
+  loop label.** In statement position (`discard`), `bare_exit` recognises a
+  single-statement body that is a lone `break` or `continue` and has the `if`
+  emit `gen_branch_true(cond, exit)` instead of branch-over-a-jump
+  (`jle .L12; jmp .L11; .L12:`). The taken path is one jump, the fall-through
+  path none. This is the escape test in `mandel`'s inner loop and the guards in
+  `sieve`/`forloops`. Guarded on `discard` so a value-position `if` still
+  materialises its unit.
 - **`trim_dead` drops unreachable instructions, self-moves, inverse-move pairs,
   and a jump to the next label.** After each function body is generated it
   removes instructions following an unconditional `jmp`/`ret` up to the next
@@ -199,10 +330,17 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   A trivial argument (a name or literal) is substituted in place only when no
   *later* argument can write memory (`has_effect`); otherwise it is copied to a
   fresh slot, so `sum(x, set(&mut x))` reads the `x` from before `set` ran.
-  A candidate body must be call-free and straight-line; because it is, inlining it
-  cannot expose new calls, but the pass still runs to a *fixpoint* because a
-  function only becomes call-free after its own callees are inlined (the `refs`
-  wrapper `sum_via_ref` needs round two). A statement-free block is unwrapped to
+  A candidate body must be call-free with no early exit; because it is call-free,
+  inlining it cannot expose new calls, but the pass still runs to a *fixpoint*
+  because a function only becomes call-free after its own callees are inlined
+  (the `refs` wrapper `sum_via_ref` needs round two). A loop is allowed — a small
+  helper like `gcd` has one and is still worth inlining, since that removes the
+  call from the caller's hot loop (measured 1.12x on a `tri(i % 50)` shape). A
+  `break`/`continue` is *not* allowed: once spliced into the caller it would bind
+  to the caller's enclosing loop. A non-final `return` is not allowed either, for
+  the same reason. `Sub` already rewrites `while`/`loop`/`for` bodies and their
+  counter slots, and `assigned_slots` already descends into them, so a
+  loop-bearing body needs no extra splice work. A statement-free block is unwrapped to
   its tail after expansion: the spliced body of an accessor would otherwise stay
   wrapped in an `Expr::Block`, and later passes (`simple_operand`, the
   accumulator fold) cannot see through a block, so the hot loop would bounce its
@@ -255,10 +393,42 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   10.6 ms. The measurement is a `Cell` because `off`/`array_off` take `&self`;
   the dry pass measures and the final pass is seeded with the result, so the
   prologue (emitted before the body) allocates the exact size.
+- **A function that addresses no frame slot also omits `%rbp`.** When
+  `frame_slots == 0 && spill_slots == 0` nothing is ever addressed through the
+  frame pointer, so `push %rbp`/`mov %rsp, %rbp`/`leave` are dropped and the
+  epilogue `add`s the frame back instead of pointing `%rsp` at the saved
+  registers. This is the same reasoning the hand-written `alloc` already uses
+  (see below), generalised to compiled functions. On the current benchmark set
+  it is a wash at run time — the out-of-order core hides a three-instruction
+  prologue — but it is strictly fewer instructions and a couple of bytes smaller
+  on a register-only leaf like `fib`. `uses_frame` is read *before* the body is
+  emitted, because emitting re-measures `frame_slots` and `off` is `&self`.
+- **The no-frame-pointer path needs its own alignment pad.** The call ABI wants
+  `%rsp ≡ 8 (mod 16)` at a call. With a frame pointer `push %rbp` supplies the
+  8; without it, the saved registers plus the frame must total 8 mod 16, so an
+  even number of saved registers (16 bytes) is followed by an 8-byte `sub`.
+  A misalignment is silent — rmc's runtime makes no aligned SSE access, so it
+  never faults — which is why it is checked statically over every program in
+  `bench/` and `tests/cases/` (every call-site function must show
+  `%rsp ≡ 8 (mod 16)`) rather than trusted to the behavioural suite.
 - **Two-pass codegen must reset every counter.** `gen_fn` runs the body twice and
   truncates the output between passes; the label counter, string table, spill
   high-water mark and frame-size measurement are part of that reset. Miss one and
   the two passes diverge.
+- **Cold blocks keep the hot path straight.** The 64-bit divide slow path
+  (the `i64::MIN`/`-1` check and `idiv`) is correct but almost never taken, so
+  `emit_div` routes it through `cold_start`/`cold_end` into a buffer appended
+  after the function body. Inlined, its ~30 bytes sat between the hot loop's
+  `div` and its back edge. The hot path then falls through to the join point and
+  `trim_dead` drops the `jmp` it used to need; the cold block keeps its own jump
+  back. The measured win is small (~0.5% on `mix`) but consistent, and the
+  layout no longer depends on where the slow path happens to land.
+- **The dry pass skips `trim_dead`.** The dry run only measures the spill
+  high-water mark and the deepest slot, and the dead/round-trip instructions
+  `trim_dead` removes change neither, so `Codegen::dry` turns the pass off for
+  it. That is a pure compile-time saving on a function whose body is one long
+  straight line: `div.rms` (a 531-line `main`) drops 6% of its compile time, and
+  the emitted assembly is byte-for-byte identical to running the pass twice.
 - **A callee-saved *temporary* is not worth it; a callee-saved *spill* is.** An
   early attempt kept every short-lived value in `%r12`-`%r15` and measured
   *slower* — the unconditional save/restore in the prologue/epilogue cost more
@@ -288,10 +458,24 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   promoted field that stays in memory on the copy path but is read from its
   register on the field path is a silent wrong-answer bug, which is what
   `fieldpromo.rms` guards.
-- **A struct's base slot is its last field and is never promoted.** Field `k`
-  lives at `slot + fields - 1 - k`, so field `fields - 1` *is* `slot`, whose
-  address is the struct's base; promoting it would break every `&struct`-style
-  use. At most `fields - 1` fields can be promoted.
+- **A struct's base slot is its last field, and it stays promotable unless the
+  struct is used as a whole.** Field `k` lives at `slot + fields - 1 - k`, so
+  field `fields - 1` *is* `slot`. A whole-value use (copy, return, pass by
+  value, `let` of a whole copy) already marks every slot via `copied`, so the
+  base slot needs no special case; a field-by-field use reaches every field by
+  address off `array_off` or by register, so the last field competes for a
+  register like any other. `field_operand` must test the *field's own* slot
+  (`slot + n - 1 - offset/8`), not the struct's base slot, before trusting a
+  `%rbp` operand — otherwise a promoted last field reads a stale frame word.
+  A payload enum is the exception: it is read as a whole through its base word,
+  so that word always stays in memory. Promoting `stats`'s last field is worth
+  0.88x -> 1.14x of its rustc twin.
+- **A base-less SIB operand must use mod=00 with a disp32.** `lea 0(,%rax,8)` is
+  SIB base field 101, which means "no base" only at mod=00; at mod=01/10 it
+  selects `%rbp` instead. Emitting a disp8 there reads the wrong address (a
+  silent miscompile that surfaced as `4 * c` printing a stack pointer). The
+  mirror case is `%rbp`/`%r13` as a base (rm 101), which is invalid at mod=00
+  and needs a disp8 0. `elf.rs` unit tests pin both.
 - **Field-to-slot uses the slot count, not the field count.** A struct with an
   array field has more slots than fields (`WithArr` is 2 fields, 4 slots), so
   `fields.len()` gives the wrong map. Use `size / 8`.
@@ -304,22 +488,117 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   `aggregate_base` returns this base for both arrays and structs; use it
   everywhere, including the struct-literal store in `gen_stmt` (an earlier bug
   used `off(slot)`, the wrong end of the range).
+- **A wide element has stride `size()/8`, not 1.** An array of nested arrays or
+  of structs addresses element `i` at `base + i * stride`, so `array_off` must be
+  called with the *slot* count `n * stride`, never the element count `n`. Every
+  load, store, copy and splat scales by that stride. The stride comes from
+  `elem_stride(base)`, which reads `array_elem_ty(base)`; that must look through
+  an `Index` base (`m[i][j]` uses the inner array's element type), or the inner
+  index silently uses stride 1 and reads a neighbouring element. `sema`'s
+  list-literal and repeat-literal desugars must also allocate `n * stride` slots:
+  allocating `n` makes wide elements overlap.
+- **A splat copies one value into every element.** In `splat_aggregate`'s
+  counting loop only the destination pointer advances; the source stays put. An
+  earlier version stepped both, so element `i` was read from `v + i*elem_size`
+  and only element 0 held `v` — invisible for a scalar splat, wrong for a wide
+  element over the 8-word small-path threshold.
 - **`for` is not a `while`.** `continue` must run the increment, so `for` keeps
-  its own node with a dedicated continue label. Desugaring it to `while` would
-  make `continue` skip the increment and loop forever. For the same reason `for`
-  is *not* rotated while `while` is: its increment sits between the body and the
-  guard, so a rotated form would run the increment before the first body
-  iteration (skipping it) or need the guard duplicated.
+  its own node with a dedicated continue label (`cont`). Desugaring it to `while`
+  would make `continue` skip the increment and loop forever. It *is* rotated like
+  `while`, but with a different shape: the guard tests the *un-incremented*
+  counter at the bottom and loops back to `top`, and the increment sits on the
+  fall-through path between the body and the guard. The entry `jmp` therefore
+  reaches the guard with `var == start`, the first body runs before any
+  increment, and `continue` targets `cont` so it still runs the increment exactly
+  once. Duplicating the guard at the top instead (the naive rotation) is what
+  would skip the first iteration or double the increment.
+- **A loop label selects the target loop, not the innermost one.** `sema` and
+  `codegen` each keep a stack of the enclosing loops (`loop_stack` / `loops`)
+  with the loop's label, and resolve a `break 'a` / `continue 'a` by searching
+  that stack from the top for the label (an unlabelled `break`/`continue` takes
+  the innermost entry). The label is carried through the desugarings that build
+  a loop: `'a: for x in arr` copies the label onto the index `for` it expands
+  to. `while let` desugars to a plain `loop`, so a label on it is rejected in the
+  parser rather than silently dropped. The `if`-with-a-lone-`break`/`continue`
+  fast path in `bare_exit` only fires for an *unlabelled* `break`/`continue`,
+  since a labelled one may leave an outer loop.
+- **A `for` bound is compared directly when it is a constant, and through a
+  hidden slot otherwise.** `0..=1000` needs no `end_slot`: the guard is
+  `cmp $1000, %rax`, so no frame word is written and no reload happens each
+  iteration. A non-constant bound (e.g. `0..n`) is evaluated once into `end_slot`
+  and compared register-to-register. `count_expr` must count the hidden counter
+  and bound slots so they compete for a callee-saved register like any other
+  loop-carried local; otherwise the bound is reloaded from the frame every pass.
+- **`for x in ARRAY` desugars to an index loop**, not a new node:
+  `{ let a = EXPR; for i in 0..a.len() { let x = a[i]; body } }`. `parse_for`
+  binds `EXPR` to a hidden `\0fa<n>` temporary so an array expression with a
+  side effect (a call, a literal) runs once, and `a.len()` folds to the array's
+  compile-time length, so the loop bound is a constant and `end_slot` is unused
+  (see the note above). `x` is a fresh `let` per iteration, so it is immutable
+  and a stale read across iterations is impossible. `continue`/`break` work
+  because the desugared loop is the ordinary `For` node. Two guards matter:
+  the loop variable must be a binding or `_` (a compound pattern is rejected
+  rather than mis-bound, since rmc has no destructuring `let`), and `for x in
+  &arr` is rejected — Rust iterates a reference by reference (`x: &i64`), so
+  accepting it would silently mistype `x`. `parse_for` also checks the pattern
+  name against the constant table *before* `parse_pattern`, because a bare
+  constant name there resolves to its value (not a binding), which would turn
+  `for N in 0..3` into an iteration over a literal and lose the E0530 error.
+  `tests/cases/forarr.{rms,rs}` and the `stmt` fuzzer cover it.
+- **`..=` exits on `jle` back-edge, not `jl`.** The guard is the loop-back
+  condition, so the inclusive form loops while `var <= end` (`jle`) and the
+  exclusive one while `var < end` (`jl`); a `jg`/`jge` *exit* test is the
+  un-rotated mirror of the same thing. `forloop.rms` and
+  `an_inclusive_range_uses_a_strict_exit_test` pin both bounds, and `..=` is a
+  three-character token, so it must be lexed in the three-char table (before
+  `..`), or it lexes as `..` then `=`.
+- **Loop bodies are aligned to 16 bytes.** Each loop's body label is preceded
+  by `.p2align 4`. Without it the body's start address drifts whenever unrelated
+  code elsewhere in the function changes size, and a one- or two-byte shift can
+  flip a hot loop between fetch-friendly and straddling alignments - a
+  two-byte *shrink* once cost `forloops` 0.69x. Aligning pins the body so the
+  same loop compiles to the same speed regardless of what moves around it. This
+  needs `trim_dead` to keep directives: it must test the *trimmed* line for a
+  leading `.`, because `.p2align` is emitted indented and otherwise looks like
+  dead text after the entry `jmp`. `a_loop_body_starts_on_a_sixteen_byte_boundary`
+  pins it.
+- **A divisor that fits i32 uses `mov` not `movabs`.** `gen_div_const`
+  materialises the divisor and the magic multiplier; `mov_imm64` picks the
+  7-byte `mov $k, reg` when the value is a sign-extended 32-bit immediate and
+  the 10-byte `movabs` only when it is not. Small divisors are common, so this
+  trims the divide sequence and the artifact. The in-process ELF encoder
+  (`emit_mov_imm` in `elf.rs`) already made this choice, so the default path is
+  unchanged and only the `--binutils` artifact and the emitted `.s` shrink
+  (~0.7% across the corpus). `a_small_divisor_uses_a_short_immediate` and
+  `a_wide_magic_multiplier_keeps_movabs` pin both directions.
+- **`mov $imm, %reg` width follows the destination register.** The encoder
+  (`enc_mov_generic`/`emit_mov_imm`) picks the encoding from the register name
+  and the mnemonic: an unsuffixed `mov` to a 32-bit register (`%eax`) is the
+  5-byte `B8+rd` form with no REX.W, an unsuffixed `mov` to a 64-bit register
+  (`%rax`) is `C7 /0` (a sign-extended 32-bit immediate) unless the value does
+  not fit i32, `movq` is always 64-bit, and `movabs` is always the 10-byte
+  `B8+rd` form even for a small value. Getting this wrong is a silent
+  disagreement with `as`, which the `--encoding` fuzz oracle and the
+  `tests/cases/strcmp` case (a `mov $1, %eax`) catch; `elf.rs`'s unit tests pin
+  each form.
 - **`while` is rotated.** The test is emitted at the bottom as the back edge
   (`gen_branch_true`, a `jl`/`jne`) with an entry `jmp` reusing the same test, so
   an iteration is one branch fewer than the top-tested form. `continue` targets
   the bottom test and `break` the label it falls into. If you change the loop
   shape, keep both: a rotation that forgets the entry test loops forever on a
   false condition, and one that targets the body for `continue` skips the test.
-- **Promotion counting must stay linear.** `counts` is built in slot order and
-  `count_expr` indexes it directly by slot; do not reintroduce a linear `find`
-  per reference or per excluded slot, which is O(n^2) and made a 200k-element
-  array take seconds to compile. `large_array_compiles_in_linear_time` guards it.
+- **Promotion counting is sparse, not a dense table over `nslots`.** `counts`
+  and `mem` are a `HashMap`/`HashSet` keyed by slot, and only slots something
+  actually names get an entry. A dense `vec![_; nslots]` plus a sort over
+  `0..nslots` is O(array length) — and the array's *element* slots are never
+  named, so the table is almost all zeros. A 200k-element array made that path
+  take ~1.9 ms (codegen was 90% of the compile); the sparse form is ~20 µs.
+  `large_array_compiles_in_linear_time` guards it.
+- **An array never needs its element slots marked in memory.** Only the base
+  slot can be named (elements are reached as `base + i*8`), so `Expr::Var` on an
+  array, a `let` of one, and `mark_addressed` all mark just the base. Marking
+  every element is O(length) per mention and promotes nothing that was not
+  already unpromotable.
 - **Struct layout must agree between read and write.** `sema` resolves a field
   to an offset from the aggregate base; codegen must add that offset to the same
   base used for reads (`field_operand`) and writes.
@@ -418,6 +697,18 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   right-to-left rule above. The subscript is still bound once, so `a[next()] += 1`
   advances the counter once, not twice, and the cheap two-instruction form is
   kept when the subscript has no call.
+- **A struct update evaluates its fields before its base.** `S { f: v, ..base }`
+  is desugared by `desugar_struct_update` into
+  `{ let v = <field value>; ...; let mut t = base; t.f = v; ...; t }`: every
+  written field value is bound to a temporary *before* the base runs, which is
+  rustc's order (verified against `rustc -O`). Evaluating the base first is a
+  silent wrong answer when a field value mutates the base, so
+  `tools/fuzz.py --mode update` emits `S { x: mutate(&mut base, ..), ..base }`
+  and pins it. The result is a fresh local, so it never aliases the base, and a
+  field written twice is rejected at parse time (the plain-literal path catches
+  that in sema). A comma may not follow the base (rustc rejects it), and a
+  struct literal *is* allowed as the base (`..P { ..a }`), unlike the
+  struct-literal-in-condition restriction.
 - **Statements vs. tail expressions.** Assignments inside a block must be
   detected before the trailing-`;` check in `parse_block`, otherwise `x = ...;`
   is parsed as an expression and rejected.
@@ -433,15 +724,130 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
   across the syscall: the total block size rides the stack (the syscall clobbers
   `%rcx`/`%r11`) and the chunk length stays in `%rsi`. Keep new code off the
   callee-saved set, or the whole-function frame comes back.
-- **Link flags.** The driver uses `ld -o <out> --build-id=none -z noseparate-code
-  <obj>`; the assembly already carries `.note.GNU-stack` so no `-z noexecstack` is
-  needed. It used to use `-n` (nmagic), which packed every section into one
-  read+write+execute `LOAD` segment: a W^X violation. `-z noseparate-code` keeps
-  the read-only and executable sections in one read+execute segment and the
-  writable data in a separate read+write one, and is *smaller* than `-n` (3304
-  bytes vs 7344 for `hello`). Do not "optimise" it back to `-n`. `tests/run.py`
-  runs `readelf -lW` on a compiled binary and fails if any `LOAD` segment is both
-  writable and executable.
+- **Linking.** By default `src/elf.rs` assembles and links in-process; `as` and
+  `ld` are only used under `--binutils`. The in-process path is what makes rmc
+  ~4–5x faster to compile than the binutils path (the two child processes were
+  ~80% of the wall time) and gives a *smaller* artifact, because it never emits
+  a symbol table or a section-header table to begin with. It writes exactly two
+  `PT_LOAD` segments — one R+X for `.text`/`.rodata`, one R+W for `.data` — so
+  there is no W^X segment. Writable sections start on their own page: the kernel
+  maps each `PT_LOAD` rounded down to a page, so a RW segment sharing a page with
+  the RX one would have its `mprotect`-like mapping replace the execute
+  permission. The runtime's writable globals are all zero, so they are emitted
+  as `.bss` (`p_filesz = 0`, `p_memsz` set): mapping them from the file would
+  cost a page of padding and about 4 KB on every artifact. Only a *writable*
+  section may be demoted to `.bss`. A read-only `.rodata` that happens to be all
+  zeros — a program whose only string literal is `""` emits just `.quad 0` — is
+  still file-backed and part of the RX segment; demoting it left `rx_end`
+  reading its unassigned `file_off` of 0, so the RX segment covered 8 bytes and
+  the binary segfaulted on entry while the `--binutils` path worked. When adding an
+  instruction or a codegen form, remember the encoder only implements the subset
+  the code generator emits and errors on anything else — run `tests/run.py`,
+  which compiles every case through both paths and requires identical output.
+  The `--binutils` path still uses `ld --build-id=none -z noseparate-code
+  --strip-all`; `--no-strip` keeps the symbol table, `--min-size` also runs
+  `strip --strip-section-headers`. `--no-strip` and `--min-size` request
+  opposite artifacts, so `parse_args` rejects the pair instead of letting
+  `--min-size` strip the symbols `--no-strip` asked to keep. Do not change the
+  `--binutils` link back to `-n` (nmagic): it packs every section into one
+  read+write+execute `LOAD` segment, a W^X violation, and is *larger*.
+  `tests/run.py`'s `check_stripped` pins the size ordering of all four variants,
+  `check_no_rwx` fails on any writable+executable `LOAD` segment, and
+  `check_link_paths_agree` requires the two link paths to behave identically.
+- **In-process assembler gotchas.** The encoder in `src/elf.rs` is deliberately
+  narrow; these are the encodings that are easy to get wrong and were each a
+  real bug:
+  - Group opcodes: `inc`/`dec` are group-5 (`FF /0,/1`) but `not`/`neg` are
+    group-3 (`F7 /2,/3`). `FF /3` is `call far`, which faults at run time.
+  - ModRM direction: for `mov src, dst` and `op src, dst` the *source* is the
+    reg field (REX.R) and the *destination* is r/m (REX.B). Swapping them
+    silently moves the wrong register.
+  - SIB: a byte is required for an index, for no base, and for a base of
+    `%rsp`/`%r12` (rm encoding 100). `(%base,%index)` is two parts with an
+    implied scale of 1; parsing only three-part forms drops the index (a
+    `lea 0(%r,%r)` used as `x*2` came out as `x`).
+  - A base of `%rbp`/`%r13` (rm encoding 101) needs an explicit displacement,
+    or mod=00/rm=101 means "disp32, no base".
+  - RIP-relative memory (`sym(%rip)`) writes the disp32 *after* the ModRM, not
+    before the opcode; the fixup is recorded at the trailing four bytes.
+  - Byte operands: `mov $imm, mem` and byte `mov %dl, mem` use the byte opcodes
+    (the mnemonic `mov` carries no `b` suffix but a byte-width register makes it
+    a byte move). A byte register `%sil`/`%dil` (>= 4) needs a bare `0x40` REX
+    prefix to mean itself; `setcc` does *not* (a byte name is not an extended
+    register). `movzbq` sets REX.W, `movzbl` does not.
+  - `mov $imm, %r64` sign-extends a 32-bit immediate (`C7 /0`); a negative value
+    through the zero-extending `B8+rd` form would clear the high half.
+  - Symbol immediates (`mov $__rmc_overflow_len, %rdx`) come from `.set name,
+    . - other`; resolve them after all labels are placed, not during the walk.
+  - Operand size comes from the register the caller names, *not* from the
+    mnemonic. `div %ebx` is the 32-bit form (`F7 /6`, no REX.W) and `div %rbx`
+    is the 64-bit one; forcing REX.W turned every 32-bit divide into the 64-bit
+    instruction. On the divide-bound `mix` loop that was **14% slower** at run
+    time, and it made the in-process binary disagree with `as`+`ld` for the same
+    source. The generator picks the 32-bit form deliberately (see `emit_div`),
+    so the encoder must honour it. `enc_div` now derives REX.W from
+    `reg_is_64`; a `None` REX byte is omitted entirely, matching `as`.
+  - Register-operand width must survive encoding. A 32-bit register name
+    selects the narrow form and must not set REX.W: `xor %eax,%eax` is the
+    two-byte zeroing idiom (`31 C0`), `mov %ebx,%eax` is `89 D8`. Forcing W
+    gave `xor %rax,%rax`/`mov %rbx,%rax`, which grows the artifact and
+    disagrees with `as`. A bare `0x40` REX byte (no W, no R/X/B) is dropped
+    entirely, matching `as`; an extended register (`%r8d`) still needs its
+    REX.R. `reg_is_64`/`reg_is_32` decide, and `rex_if_needed` omits the
+    no-op byte.
+  - An unsuffixed `mov $imm, mem` is a *32-bit* store. `as` has no register
+    operand to infer a width from, so it picks `movl` and warns; only an
+    explicit `movq` stores 64 bits. The generator must therefore size every
+    immediate-to-memory store (`store_operand` does), and the encoder must
+    reproduce `as`'s default rather than promoting the store to 64 bits.
+    Getting this wrong leaves the destination's high four bytes stale, which
+    is only observable when the slot previously held a value with a set high
+    half — the payload-enum path zeroes the slot first, so the encoding test,
+    not a behaviour test, is what catches it.
+  - `.p2align n` means "align to 2^n", `.balign`/`.align n` mean "align to n
+    bytes". They shared one arm that treated both as a byte count, so every loop
+    the generator padded with `.p2align 4` came out 4-byte aligned in-process
+    where `as` gave 16. The bug was invisible to the behaviour-only
+    in-process-vs-`as` test; only a byte-level check catches it. `run.py`'s
+    `check_encoding_matches_as` now compares the decoded instruction streams
+    (folding branch targets and dropping alignment `nop`s), so an operand-size
+    or alignment regression fails the suite.
+- **`.balign`/`.p2align` pads executable sections with `nop`, not zero.** The
+  in-process encoder fills an aligned gap with `0x90` in a section whose ELF
+  flags include `X` and with `0x00` elsewhere. A zero byte decodes as
+  `add %al,(%rax)`, which faults if a jump lands in the pad; the one-byte `nop`
+  is safe (GNU `as` would emit a multi-byte `nop`, but the encoder only has the
+  single-byte form). `pad_to_align` is shared with `.rodata`/`.data`, where
+  zeros are what a reader wants, so the fill is chosen from the section flags.
+- **Runtime pruning.** `runtime.rs` stores the runtime as `PIECES`, each naming
+  the symbols it defines; `for_program(user_asm)` keeps `_start` plus every
+  piece the program (or a kept piece) names a symbol of, to a fixpoint. A new
+  runtime helper is a new piece, and its `defines` list must include *every*
+  symbol the linker needs — the function label *and* any global it owns (e.g.
+  `alloc`'s piece must name `__rmc_arena`/`__rmc_freelist`, or the arena
+  vanishes and the link fails with an undefined symbol). Symbol matching is
+  word-boundary aware and strips `#` comments, so `free` does not match inside
+  `__rmc_freelist` or in `alloc`'s "free list" comment. If a trap stops being
+  emitted, its piece drops out — that is the point, but a test that asserts on
+  runtime text must first force the construct that pulls the piece in (see
+  `the_bounds_handler_is_in_an_executable_section`).
+- **`for_program` must tokenise, not rescan per symbol.** The piece texts are
+  static, so their identifier sets are built once (`piece_idents`, a
+  `OnceLock`); the program is tokenised once (`idents`) and each symbol looked
+  up in the set. The old form called `mentions` for every (piece, symbol) pair
+  over the *whole* text — O(text × symbols), the single largest cost in a
+  compile. Keep the whole-identifier matching: a substring test would pull in
+  `free` for `__rmc_freelist`.
+- **Dead-function elimination feeds runtime pruning.** `dce.rs` runs just before
+  codegen and drops every function `main` cannot reach, so a dead function that
+  called `print_str`/`alloc` no longer drags those pieces into the binary
+  (`unused_helper` calling both: 1688 → 1016 bytes). Reachability
+  over-approximates on purpose — a call in a branch that cannot run still keeps
+  its callee — because dropping a live function is a miscompile while keeping a
+  dead one is only size. A program with no `main` is left untouched so the
+  "undefined reference to `main`" link error survives. Unit tests that inspect a
+  helper's own codegen must now either have `main` call it or use
+  `asm_no_inline`; twelve such tests were updated when the pass landed.
 - **A runtime function must be emitted in `.text`.** `-n` merged sections so a
   misplaced handler still ran under the CLI link, but with any sane link (the
   library path, or the CLI's `-z noseparate-code`) a handler left in `.rodata`
@@ -485,6 +891,14 @@ python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 
 - Runtime is process-spawn dominated for small programs; use large enough
   workloads (see `ARGS` in `bench/run.py`) for a meaningful runtime comparison.
+  At the recorded sizes the small-program ratios swing several percent run to
+  run (a re-measure of `fib`/`mandel` at the same `ARGS` landed at 0.99/1.00
+  where `RESULTS.md` had 0.80/0.85), so treat the run column as indicative and
+  never chase a sub-percent runtime difference without many repetitions.
+- **A `*` of two runtime values is not provably non-negative.** `(x*x)/C` looks
+  like it can skip the signed-division sign fixup, but `i64` multiplication
+  wraps, so `x*x` may be negative and rustc keeps the fixup. Removing it is
+  unsound; do not add a "square is non-negative" case to `gen_div_const`.
 - `bench/run.py` measures both compilers and both binaries the same way: wall
   and CPU time from `wait4()`, and peak RAM from the child's own `VmHWM`. Do not
   read peak RAM from `wait4()`'s `ru_maxrss`: a freshly spawned child shares
@@ -594,6 +1008,15 @@ resolve to `Type::Enum` through `resolve_ty`, which every type site uses, and
 enum patterns are a `Pat::Variant` the parser desugars into an `EnumVariant`
 comparison. `as` may not target an enum, matching rustc.
 
+A variant may write its tag explicitly (`enum E { A = 5, B, C }`). The tag is
+then the written value, not the index, so it is computed once in `layout_enum`
+(a variant with no `= N` is the previous tag plus one) and carried in the fourth
+field of `EnumInfo::variants`. Every tag use goes through `tag_of`/the tuple, so
+a `match` arm and an `as i64` both read the written value. `layout_enum` also
+rejects a duplicate tag, and a variant with no `= N` after `i64::MAX` (rustc
+E0370) — the check is lazy, so a final `= i64::MAX` is fine. The parser rejects
+`= N` on a payload variant and folds `-9223372036854775808` to `i64::MIN`.
+
 A pattern is a wildcard, an integer or `bool` literal, an `Enum::Variant`, or a
 bare binding name. A `bool` pattern (`true`/`false`) desugars to a `BoolTest`,
 a node like `VariantTest` that compares the scrutinee word; a chain of two of
@@ -626,6 +1049,36 @@ exhaustiveness (`match_chain_is_exhaustive`, plus the catch-all flag the parser
 records) and errors when it fails. Do not relax this to statement position only:
 rustc rejects a non-exhaustive `match` there too, and rmc must match rustc.
 
+A guard (`PAT if COND => body`) is desugared, not given a node: `desugar_arm`
+folds it into the pattern test as `Bin(And, test, cond)`, and an *irrefutable*
+arm's guard (no test of its own) becomes the whole `if` condition, paired with a
+literal `true` test so the exhaustiveness walk can still recognise the arm. A
+failed guard falls through to the next arm, so the guard is evaluated at most
+once and only after its pattern matched. Three rules matter for exhaustiveness,
+all matching rustc (RFC 2005):
+  - a *guarded* arm covers **nothing** — the guard may be false — so
+    `if_chain_is_exhaustive` skips it entirely (`arm_guard`). Counting it would
+    wrongly accept `match e { E::A if c => 1, E::B => 2 }`, which rustc rejects
+    (E0004).
+  - a guarded *binding* arm (`n if c`) is not a catch-all, so `has_catch_all`
+    is set only for an *unguarded* irrefutable arm. The parser's `true`-test
+    marker is what distinguishes the two: without it, `n if c` would either be
+    miscounted as a catch-all or (with no pattern test) abort the walk.
+  - a repeated variant (only reachable when one of the duplicates is guarded and
+    therefore skipped) is redundant, not a gap: `seen_variants` is a set, and a
+    duplicate is ignored rather than treated as non-exhaustive.
+`arm_pattern_test`/`arm_guard`/`is_pattern_test` peel the guard off a condition.
+They must not mistake a *range* pattern (which also folds to `Bin(And, ..)`) for
+a guarded one, so they strip only when the left operand is itself a pattern test.
+
+Two exhaustiveness-walk bugs this exposed are fixed. A payload-binding arm
+(`O::S(v) => ..`) wraps its `if` in a block holding the binding `let`s, and that
+block used to hide the chain: `match o { O::Some(v) => v, O::None => 0 }` (no
+`_`) was wrongly rejected. `chain_tail` now unwraps block wrappers while
+descending the chain, and the walk no longer requires an arm's `else` block to
+have empty `stmts`. `tests/cases/guard.{rms,rs}` and the `pat` fuzzer cover
+guards; the `reject` fuzzer's `guard_*` cases pin the exhaustiveness rules.
+
 The `match` desugaring wraps its first step in `Expr::MatchBoundary`, a
 transparent node that marks where the chain begins. Its `bool` field records
 whether some arm is a catch-all (`_` or a binding), which makes the match
@@ -655,6 +1108,19 @@ receiver whose type is `Struct`, `Enum` (unit) or `EnumData` (payload); all
 three give the same mangled prefix, and a `self` method on an aggregate receiver
 passes it by pointer. `Self` resolves through the parser's `current_impl`.
 
+A function in an `impl` block with no `self` is an **associated function**. The
+parser sets `takes_self = false` and emits the same `Type$name` mangling with no
+receiver parameter; sema inserts the `self` parameter only when `takes_self` is
+true, so an associated function registers like a free function. A call
+`Type::name(..)` arrives as `Expr::EnumCtor` (the parser cannot tell a
+payload-variant constructor from an associated function), so sema checks whether
+the enum has that variant; if not and `Type$name` is in `sigs`, it rewrites the
+node to a `Call`. A struct qualifier always takes this path. `Qual::name` with
+no call and no matching variant is reported as an associated function that must
+be called (rmc has no function values), not as an unknown enum. Calling an
+associated function with `.` (`p.new(1)`) passes the receiver as an extra
+argument, so it fails on arity — which matches rustc's E0599 closely enough.
+
 An array's element type is a scalar: `i64`, `bool` or a unit enum. Nested
 arrays, arrays of structs and arrays of payload enums are rejected. A unit enum
 is one 8-byte slot emitted like `i64`, so `[E; N]` lays out and indexes
@@ -663,6 +1129,14 @@ reference as array elements. A list literal `[a, b, c]` is parsed as
 `Expr::ArrayList` and rewritten by sema, which infers the element type from the
 values — the parser must not guess it, because it does not type-check, and
 guessing `i64` is what made `[true, false]` fail.
+
+`let _ = e;` (and `let _: T = e;`, and the no-op `let _: T;`) is a **discard**.
+The parser lowers it to a block holding a hidden `let _ = e;` binding, so the
+initializer is still evaluated once and an annotation is still checked, then the
+binding is dropped. The hidden binding is literally named `_` so a type-mismatch
+diagnostic reads `variable `_``; `_` cannot be written as an ordinary binding
+(`expect_ident` rejects it), so the name never clashes with user code. Bare
+`let _;` with no annotation is rejected at parse time (rustc's E0282).
 
 ## Soundness checks
 
@@ -709,6 +1183,17 @@ The checks, all in `sema.rs`:
   the uninitialized-array-filled-in-a-loop pattern (`let mut a: [i64; N]; while
   ... { a[i] = ..; } a[0]`), which rustc also rejects. Write the array with `= [0;
   N]` instead; the corpus cases do.
+- **A short circuit has two outcome states, and a chained guard needs both.**
+  `&&`/`||` run their right operand on only one path, so `check_expr` records
+  the true and false entry states in `cond_then_init`/`cond_else_init` for the
+  `if`/`while` that branches on the condition. Checking a right operand against
+  the scope's merged "either path" state loses a write the guard guarantees:
+  `(a && { x = 7; true }) && x == 7` reaches the comparison only where the inner
+  `&&` was true, yet the merged state says `x` is uninitialized (E0381). Compose
+  the outcomes per operand instead — check the right operand under the left-true
+  state for `&&` (left-false for `||`), then merge for the true, false and
+  post-expression states. The post-expression state stays conservative, so a
+  value use (`let b = a && { x = 7; true }`) still cannot assume `x` is set.
 - **Constant array bounds.** A constant index outside the array (`a[5]` on a
   `[i64; 2]`, the negated `a[-1]`, or an expression like `a[1 + 4]`) is a compile
   error, with or without `--bounds-checks`, matching rustc (`E0080`/`E0608`).
@@ -724,6 +1209,24 @@ The checks, all in `sema.rs`:
   string's address, `E0369`) and cannot be passed where an `i64` is expected
   (`print_str(42)` used to compile and then segfault, dereferencing the integer
   as a pointer). `print_str` takes `Type::Str`.
+- **String comparison.** A `str` value is the address of its `{len, bytes}`
+  record, so a machine `cmp` compares *pointers*: `"abc" == "abc"` answered
+  false because the two literals live at different addresses (a silent
+  wrong-answer bug — rustc says true). `Sema::str_cmp` rewrites `==`/`!=`/`<`/
+  `<=`/`>`/`>=` on two strings into calls to the runtime helper `__rmc_str_lt`,
+  which walks the bytes, so ordering matches Rust's. Both operands are pure
+  literals or variables, so the helper is never double-evaluated. Comparing a
+  `str` with an `i64` is rejected (`E0308`), as rustc does. `str` is a builtin
+  type nameable in a signature, field or `let` (`fn f(s: str) -> str`,
+  `struct M { s: str, n: i64 }`): `resolve_ty_rec`/`resolve_in` map `Named("str")`
+  to `Type::Str`, one word passed by value, rather than reporting "unknown type".
+- **`str::len` and array `.len()`.** `len()` is special-cased in the `MethodCall`
+  arm of sema *before* the struct/enum method lookup, because `str` is a pointer:
+  a `str` receiver lowers to `Call __rmc_str_len` (the record's first word), and
+  an array receiver folds to the constant `N`, keeping the receiver only for side
+  effects (dropped entirely when it is a named local). A user `len` on a struct or
+  enum still falls through to the mangled-method path. rmc's `.len()` is `i64`
+  where rustc's is `usize`, so a differential twin casts with `as i64`.
 - **Parameter names (`E0415`) and `main` (`E0580`).** A function's parameters
   must be uniquely named; `check_fn` rejects a duplicate (rmc used to bind both
   to one slot). `main` takes no parameters, checked in `analyze`.
@@ -736,6 +1239,13 @@ The checks, all in `sema.rs`:
   first), both used by the corpus (`boolops`, `listptr`) and the heap benchmark.
   Before this, `r as i64`, `r as &mut T`, `&T as &U` and `bool as &T` all
   compiled, reinterpreting a pointer as a value or forging mutability.
+  `as` is parsed at its own precedence level (`parse_cast`, between `parse_mul`
+  and `parse_unary`), looser than the unary operators and tighter than `*`. It
+  used to live in `parse_postfix`, which bound it tighter than unary, so
+  `*r as i64` parsed as `*(r as i64)` and a valid program failed with a
+  reference-cast error. Rust's `as` sits just above `*` in the binary chain; this
+  level is the same place, and the right-hand side is a type, so there is no
+  operand recursion and no depth cost.
 - **Constant arithmetic (`E0080`-like).** `const_binop` folds an operator whose
   operands are both constant (through `Sema::const_of`) and rejects the cases
   rustc denies: division/remainder by zero, `MIN / -1`, `+`/`-`/`*` overflow,
@@ -796,7 +1306,20 @@ another struct and an array, and an enum whose payload is a struct — with a
 deep copy (`let mut o1 = o0`) and a nested-path write (`o1.mid.f = ...`,
 `o1.arr[0] = ...`) that the copy must not alias: `stmt` mode only ever gives a
 struct plain `i64` fields, so the field-offset arithmetic for a nested path and
-the aggregate copy were never generated. `pat` mode builds `match`
+the aggregate copy were never generated. `nest` mode also builds nested arrays
+(`[[i64; c]; r]`) and arrays of structs: a list literal, a nested splat, a
+variable-index read, an element write and a whole-element copy. Those pin the
+stride (`size()/8` slots per element, so `array_off` takes `n * stride`) and the
+splat loop, which for a wide element over the 8-word threshold copies one source
+value into every element instead of walking the source along with the
+destination. `ref` mode builds references (`&T` / `&mut T`): a reference to a
+scalar local, a struct field, a nested field, an array element and a nested
+array element, each read and written both directly and through a callee, plus a
+whole aggregate read and written through a reference. A reference is one word
+holding an address, so a wrong address on a *place* that is not a plain local
+(`&mut o.mid.f`, `&mut a[i]`, `&mut m[i][j]`) writes a neighbouring word; no
+other mode generates `&`/`*` at all, so this is the only randomised coverage of
+the reference codegen. `pat` mode builds `match`
 expressions: a multi-variant unit enum, a variant with two payload fields, a
 binding pattern, a negative literal, a nested `match`, an `if let` (integer,
 binding, payload-binding, `else if let` chain and a side-effecting scrutinee),
@@ -817,14 +1340,38 @@ would overwrite each other's `p.s` and report a bogus assembler failure.
 A generated shift amount must stay `i64`-typed: rustc infers
 `i32` for an unconstrained literal and masks the count to 5 bits, while rmc is
 `i64`-only and masks to 6, so an untyped count reports a divergence that is not a
-bug.
+bug. `stmt` mode's reference build also has to be valid Rust in its own right:
+`rustc` indexes an array with `usize`, so every generated `arr[...]` in the
+reference carries an `as usize` cast (rmc is `i64`-only), and the `fn h` helper
+is inserted at the *front* of the reference — inserting it after the struct's
+`#[derive(Copy, Clone)]` puts that attribute on a function, which rustc rejects
+outright. When that happened the whole `stmt` mode was vacuous: rustc refused
+every generated program, the fuzzer skipped all of them, and the mode reported a
+clean run while testing nothing. If a fuzz mode ever reports a suspiciously
+pristine run, check its skip rate rather than trusting the summary.
+
+`--encoding` makes the fuzzer compile each program both ways and compare the
+decoded `.text` instruction-for-instruction (branch targets folded, alignment
+nops dropped, immediates reduced to a placeholder), the same normalisation the
+corpus suite's `check_encoding_matches_as` uses. This is what catches an
+operand-size or alignment bug that both builds execute identically — the
+in-process encoder and `as`/`ld` can produce the same behaviour from different
+bytes, and only the decoded stream shows it.
 
 The fuzzer's grammar is narrower than the language, so it does not reach every
 construct; three divergences found by hand-probing were an enum `match` with no
 `_` arm used as a *value* (not a statement), a method on a *payload* enum, and an
 array of a unit enum. `stmt` mode now emits all three, so a regression in any of
-them fails the fuzz job at `iter=0`. When adding a language feature, extend the
+them fails the fuzz job at `iter=0`. `expr` mode emits `str::len` and array
+`.len()`. When adding a language feature, extend the
 generator to exercise it — a clean fuzz run only covers the shapes it emits.
+
+A new generator must be checked for *validity*, not just a clean run. The first
+`ref` generator wrote `r.i0` (a field of the referent struct, not of the nested
+one), which rustc rejected for every seed; the fuzzer skips a program rustc
+cannot compile, so the mode reported "all match rustc" while generating nothing.
+Run a new mode's programs through both compilers and count the rejections before
+trusting the summary — a mode with a 100% skip rate is silent, not clean.
 
 ## Scope
 
@@ -899,7 +1446,16 @@ The README's roadmap lists the intended next steps.
   `k*x + c` for the scales `lea` can express (1, 2, 3, 4, 5, 8, 9) and a constant
   offset, so `2*i+3` becomes one instruction. It is only valid when overflow
   checks are off (a `lea` cannot trap); with `--overflow-checks` it falls through
-  to `gen_expr`, which emits the `jo`. `gen_expr_into_reg(e, dst)` is also the
+  to `gen_expr`, which emits the `jo`.
+- **`x * k` for a small constant `k` is a `lea`, not an `imul`.** The immediate
+  arm of `gen_bin`'s `Mul` calls `lea_mul_scale`: for a positive `k` in
+  {1,2,3,4,5,8,9} it emits one `lea 0(,%rax,scale)` (1 cycle) instead of
+  `imul $k` (3 cycles), and `k == 1` drops the multiply entirely. This is the
+  `2 * zr` in `mandel`'s inner loop — worth ~3% there. It needs the same
+  overflow-checks guard as the `lea_shape` fold, because `lea` sets no flags and
+  `imul`'s `OF` is what the trap test reads. `imul` is still used for a
+  non-`lea` scale (`7 * x`) and for a negative constant (`-2 * x`, where the
+  scale cannot be encoded). `gen_expr_into_reg(e, dst)` is also the
   safe way to materialise an expression straight into a destination register
   during argument setup, and a scalar `let`/assignment writes straight into a
   promoted local's register rather than bouncing through `%rax`.
@@ -911,6 +1467,14 @@ The README's roadmap lists the intended next steps.
     extra move) and shrank the artifact by only 8 bytes on two of eight programs.
     The transform also has to be careful: truncating to the pre-expression
     offset wipes the whole expression, not just the final move.
+- **A constant initialiser stores straight to its frame slot.** `store_imm`
+  folds `let x: i64 = 7` and an unpromoted struct field `P { x: 1 }` into one
+  `movq $7, off(%rbp)` instead of the `mov $7, %rax` + `mov %rax, off(%rbp)`
+  bounce the value would otherwise take through the accumulator. It only fires
+  when the destination is memory (a promoted local keeps its register store) and
+  only for a constant the `small_imm` path accepts, so no overflow check is
+  owed. This is the eight-field struct literal in `refs` and the small scalars
+  in `stats`/`mandel`; the instruction count drops without changing behaviour.
 - **`emit_cmp` folds a register operand.** `cmp %r, %r` and `cmp %r, mem` are
   legal, so a comparison between two promoted locals is one instruction; only a
   `mem, mem` compare must materialise one side into `%rax`.
@@ -979,20 +1543,26 @@ The README's roadmap lists the intended next steps.
   - `tests/cases/div.{rms,rs}` covers both variants, powers of two, negatives,
     and boundary dividends, and is the regression guard for all of the above.
 - Division or modulo by a *variable* divisor uses `idiv`, but only after a
-  32-bit fast path. `emit_div` first tests both operands unsigned against 2^32
-  (`mov $4294967296, %rdx` + two `cmp`/`jae`); when both fit, `xor %edx,%edx`
-  + `div <reg>d` computes the same result in ~20 cycles instead of ~30–40, and
-  when either does not, the 64-bit `cqto` + `idiv <reg>` runs. This is what
-  closes the `mix` gap: its `gcd` operands are always small, so it takes the
-  narrow path every iteration, and `mix` went from 0.92× to 1.06× versus rustc.
-  - **The comparison must be unsigned** (`jae`, not `jge`): a negative operand
-    has the sign bit set and compares as a huge unsigned value, so it correctly
-    falls through to the 64-bit path. A signed test would send a negative
-    dividend down the 32-bit path and truncate it.
-  - **The 32-bit divide zeroes its own `%rdx`**, so no `cqto` is needed on the
-    fast path, and `%rdx` is free for the 2^32 constant because `cqto` has not
-    run yet. `mov $4294967296, %rdx` is used rather than a `shr $32` test because
-    the shift would destroy the dividend in `%rax`.
+  32-bit fast path. `emit_div` tests whether both operands fit in 32 bits by
+  ORing them and shifting the top 32 bits out (`mov %rax, %rdx` + `or <rd>`,
+  `%rdx` + `shr $32, %rdx` + `jnz <slow>`); when both fit, `div <reg>d`
+  computes the same result in ~20 cycles instead of ~30–40, and when either does
+  not, the 64-bit `cqto` + `idiv <reg>` runs. Its `gcd` operands are always
+  small, so `mix` takes the narrow path every iteration — this is what keeps
+  `mix` close, though it is still the documented weak spot (0.92×, division-
+  bound; see `bench/RESULTS.md`).
+  - **The fit test must be unsigned.** ORing the two operands and reading the
+    top 32 bits is an unsigned test: a negative operand has a high bit set and
+    the shift leaves a non-zero result, so it falls through to the 64-bit path,
+    exactly as the earlier `cmp $2^32`/`jae` pair did. A signed test would send
+    a negative dividend down the 32-bit path and truncate it. (This replaced the
+    pair of `cmp`/`jae` against `mov $4294967296, %rdx`; the OR form is one
+    instruction fewer and needs no 10-byte `movabs` in the loop. Copying the
+    dividend into `%rdx` first is what lets the shift run without destroying
+    `%rax`, which the old 2^32 form could not do.)
+  - **The 32-bit divide reads `%rdx` as the dividend's high half**, and the
+    `shr $32, %rdx` above already left it zero, so no `xor` is needed before
+    `div <reg>d`. `%rdx` is scratch on the fast path because `cqto` has not run.
   - The divisor is read from its own register (`idiv %rbx`) when it is a
     promoted local, and from `%rcx` otherwise; `r32` maps each to its 32-bit
     half. A one-off sweep of 1042 `q(a,b)` pairs across the full `i64` range —
@@ -1037,3 +1607,16 @@ The README's roadmap lists the intended next steps.
   `1 + f(n-1) + f(n-2)` shape; unit tests pin the non-associative
   `f(x-1) - f(x-2)` case, a `return` in an argument, a foreign call in the left
   operand, and overflow checks.
+
+## Pushing
+
+Pushing needs a token with `contents: write`. The `GITHUB_TOKEN` provided in
+this environment is **read-only**: it authenticates as the repo owner and the
+REST API even reports `admin` on the repo, yet `git push` and the Git Data API
+both return `403 Resource not accessible by integration` (`receive-pack` is
+refused while `git fetch` works). That combination — API says `push: true`, push
+says "not accessible by integration" — is the signature of a read-only token,
+not a missing scope. Do not re-derive it: ask the user for a token with
+`contents: write` and push with it once, inline in the URL
+(`git push https://<token>@github.com/irhasar/rmc.git <branch>`), so it is not
+written to `.git/config`. Never persist the token in a remote URL or a file.

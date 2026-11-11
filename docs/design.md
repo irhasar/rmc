@@ -3,8 +3,9 @@
 `rmc` is a single-pass-per-stage, ahead-of-time compiler for a Rust subset. It
 is deliberately small: no external crates, no LLVM, no libc. The whole pipeline
 is `source -> lexer -> parser -> sema -> inline -> tco -> licm -> codegen
--> asm text`, after which the
-driver shells out to GNU `as` and `ld`.
+-> asm text -> ELF64`, where the last step is an in-process assembler and linker
+(`elf.rs`). By default the driver shells out to nothing; `--binutils` restores a
+path through GNU `as` and `ld` for comparison.
 
 ## Pipeline
 
@@ -61,29 +62,46 @@ driver shells out to GNU `as` and `ld`.
 7. **Code generation** (`codegen.rs`) — emits AT&T-syntax x86-64 assembly. Every
    expression leaves its result in `%rax`; the result type is returned to the
    caller so callers know how to use it.
-8. **Assemble and link** (`main.rs`) — writes the assembly, runs `as --64`, then
-   `ld -o <out> --build-id=none -z noseparate-code <obj>`, with the runtime text
-   prepended. `-z noseparate-code` packs the read-only and executable sections
-   into one read+execute `LOAD` segment and leaves the writable data in its own
-   read+write one, so no page is ever both writable and executable. It is also
-   the smallest layout `ld` produces here (3304 bytes vs 7344 for `-n`, which
-   packs *everything* into one read+write+execute segment).
+8. **Assemble and link** (`elf.rs`) — the assembly text, with the runtime text
+   appended, is assembled and linked into a static ELF64 executable in-process.
+   The encoder implements the narrow subset of instructions the code generator
+   emits; a form it does not know is a compile error, not a silent miscompile.
+   The output has two `PT_LOAD` segments: read+execute for `.text`/`.rodata` and
+   read+write for `.data`, so no page is ever both writable and executable. The
+   runtime's writable globals are all zero, so they are emitted as `.bss`
+   (`p_filesz = 0`) and cost no file space. This path never writes a symbol
+   table or a section-header table, so it is both the fastest (no `as`/`ld`
+   process to fork and exec) and the smallest artifact.
+   `--binutils` instead writes the assembly and runs `as --64` then
+   `ld -o <out> --build-id=none -z noseparate-code --strip-all <obj>`, with
+   `--no-strip` keeping the symbol table and `--min-size` additionally running
+   `strip --strip-section-headers`.
 
 ## Stack layout
 
-Each function prologue is `push %rbp; mov %rsp, %rbp; sub $N, %rsp`. Slots are
+A function that addresses a frame slot has the prologue
+`push %rbp; mov %rsp, %rbp; sub $N, %rsp`; slots are
 numbered from zero and addressed as `-(slot+1)*8(%rbp)`, so they grow downward
 and never collide with the saved frame pointer or return address above `%rbp`.
-`sub $N` rounds the frame up to a multiple of 16 to keep the stack 16-byte
-aligned for calls.
+A function that touches no frame slot — every local promoted into a register,
+no materialised aggregate, no frame spill — omits `%rbp` altogether, so a
+register-only leaf like `fib` pays no `push %rbp`/`mov %rsp, %rbp`/`leave` on
+its (recursive) calls. Its epilogue then `add`s the frame back instead of
+`leave`.
 
 `N` is not `nslots`: the parser sizes `nslots` for every local a function could
 declare, but a function that promotes its locals into registers and never
 materialises an aggregate touches none of them. `off`/`array_off` record the
 deepest slot the emitted body actually names, and the prologue allocates just
-that plus the spill slots — so an all-register leaf like `fib` gets no `sub` at
-all. (The measurement is a `Cell` filled during the dry codegen pass, since
+that plus the spill slots — so an all-register leaf like `fib` gets no local
+frame. (The measurement is a `Cell` filled during the dry codegen pass, since
 `off` takes `&self` and the prologue is emitted before the body it sizes.)
+
+`N` is padded so that `%rsp` is 8 mod 16 at every call, as the ABI requires.
+With a frame pointer, `push %rbp` supplies the 8 mod 16 and `N` rounds the
+saved registers plus slots up to a multiple of 16. Without one, the saved
+registers and slots must themselves total 8 mod 16, so an even number of saved
+registers (16 bytes) is followed by an 8-byte pad.
 
 Arrays and structs occupy `n` consecutive slots. Because slot addresses decrease
 as the slot index rises, an aggregate's element 0 / field 0 is at the *lowest*
@@ -106,6 +124,13 @@ Structs live in memory and are named by their address, which is also how they
 cross a call: a struct literal is materialised into a `sema`-allocated frame
 buffer, so it has an address in every context (a `let` initialiser, an argument,
 a `return`, or a tail expression).
+
+Struct update syntax `S { f: v, ..base }` is desugared by the parser into a block
+that binds each written field value to a temporary, binds `base` to a fresh
+mutable local, assigns the temporaries into it, and yields it. Sema and codegen
+never see the update, so no new layout or copy path is needed. The desugaring
+mirrors rustc's evaluation order — field values first, left to right, then the
+base — so a field value that mutates the base is read back consistently.
 
 ## Expression convention
 
@@ -222,7 +247,10 @@ where a frame slot does not.
 
 **Hot locals** are promoted: `promote` counts how often each scalar local is
 mentioned, takes the top five, and assigns them `%rbx`, `%r12`–`%r15` for the
-whole function.
+whole function. The counts are a sparse map keyed by slot, not a table over
+every slot: an array's element slots are never named, so a 200k-element array
+would otherwise make the pass O(length) for no promotion it could not already
+reject.
 
 **Spill temporaries** — the values that must outlive a subexpression, such as
 the first recursive result in `fib`'s `fib(n-1) + fib(n-2)` — go to registers
@@ -245,16 +273,40 @@ within noise (±1.5%). A true linear scan over live ranges would do more — reu
 a register for a temporary that dies before a local is born — but the spill
 register is the part the call-heavy code actually notices.
 
+Weighting a mention by its loop depth looks like an obvious improvement — a
+variable inside a loop runs many more times than one in straight-line code — but
+it *loses* on the benchmarks, so `promote` ranks by the raw mention count alone.
+The idea was tried at weights 2, 3, 4 and 8: every one moved mandel from ~95 ms
+to ~101 ms and heap from 3.20 ms to ~3.4 ms, while leaving the rest flat. The
+mechanism is that the five registers are a fixed budget, so promoting an
+innermost-loop local demotes an outer one to memory; mandel's inner loop is
+division-bound (three 64-bit divides per iteration) and barely notices its own
+memory traffic, whereas the outer loop counters `x`, `y`, `size` and `acc` pay a
+store and reload on every iteration of the loops they drive. Depth weighting
+helps only when the innermost loop is memory-bound, which none of the benchmarks
+are. Before "fixing" this again, measure it — the intuition is wrong here.
+
+A softer variant — keep the raw count, but break a *tie* toward the deeper loop
+— fails for the same reason. mandel has five locals tied at four mentions
+(`size`, `acc`, `y`, `x`, `i`), so the tiebreak promotes `i`, the innermost
+counter, and demotes `x`; mandel went from 31.7 to 32.4 ms (min of 7 runs). The
+innermost loop does not profit from one more register, and the loop that runs it
+now pays a reload. Ties are broken by slot index instead.
+
 Scalar struct fields take part in promotion too, so a hot `acc.sum` stays in a
 register. A field is named by its register only where its slot is known: field
 `k` of a struct at `slot` lives at `slot + fields - 1 - k` (field 0 is the
-highest slot). Two kinds of field stay in memory. The struct's base slot is its
-last field, whose address *is* the struct's base, so it must stay addressable —
-this is why at most `fields - 1` fields of a struct can ever be promoted. And a
-struct that is ever read or written as a whole (copied, returned, passed by
-value, or declared by a `let` whose initialiser is a whole-value copy) is
-accessed through memory, so all of its fields stay there. `promote` records
-those cases during its walk and zeroes the whole struct's slots.
+highest slot). A struct that is ever read or written as a whole (copied,
+returned, passed by value, or declared by a `let` whose initialiser is a
+whole-value copy) is accessed through memory, so all of its fields stay there;
+`promote` records those cases during its walk and zeroes the whole struct's
+slots. A struct used only field by field keeps every field promotable, the last
+one included: a field access names a register through `field_reg` or an address
+`base + offset` off `array_off`, and neither needs the last field's own slot to
+be addressable. This is worth a real benchmark — promoting `stats`'s last field
+(`sum`, the hot one) takes it from 0.88x to 1.14x of its rustc twin. A payload
+enum is the exception: it is read as a whole through its base word, so that word
+stays in memory.
 
 Arrays are skipped entirely: an element is reached by `base + i*8` through
 memory, so no element slot may be promoted, and neither may any slot used as an
@@ -275,8 +327,10 @@ runs the body twice: the first pass measures the deepest spill, the second sizes
 the frame and emits the final code.
 
 Local selection is whole-function, not per loop, so a local hot in one loop
-competes with one hot in another. The remaining gap to rustc on `fib` is the
-frame-based argument passing and the unoptimised prologue, not the spill.
+competes with one hot in another. `fib` now has a minimal prologue (no frame
+pointer); what remains of the gap to rustc is that rmc passes arguments through
+frame slots rather than keeping them in the argument registers, and that it has
+no cross-call register allocator, not the spill.
 
 ## Control flow
 
@@ -507,9 +561,36 @@ instead of at the iteration that overflows. `--no-licm` turns the pass off.
 `runtime.rs` holds a freestanding assembly runtime. `_start` captures `argc` and
 `argv` from the initial stack, calls `main`, and exits via the `exit` syscall
 with `main`'s return value. I/O (`print_i64`, `print_str`, `print_bool`,
-`putchar`), memory (`alloc`/`free`), `arg_i64` and the overflow trap are all
-implemented with raw syscalls. Because there is no libc, the resulting ELF is
-static and tiny.
+`putchar`), memory (`alloc`/`free`), `arg_i64`, the byte-wise string comparison
+`__rmc_str_lt` and the overflow trap are all implemented with raw syscalls.
+Because there is no libc, the resulting ELF is static and tiny.
+
+The runtime is stored as a table of pieces (`PIECES`), each naming the symbols it
+defines. `for_program` walks the generated assembly, keeps `_start`, and then
+keeps every piece the program — or another kept piece — names a symbol of, to a
+fixpoint. So a program that never allocates carries no allocator, one that never
+indexes an array carries no bounds trap, and one that never divides carries
+neither divide trap. Symbol matching is word-boundary aware and strips `#`
+comments, so `free` does not match inside `__rmc_freelist` or in `alloc`'s
+comment. The piece texts are static, so their identifier sets are computed once
+and cached; the generated assembly is tokenised once and each symbol looked up
+in the set. Scanning every piece's text for every symbol instead is
+O(text × symbols) and dominated compile time. On a binary this small the dropped pieces are a large fraction of the
+artifact: `hello` shrank from 3304 to 1384 bytes, and every benchmark artifact
+lost 42–58%.
+
+Dead-function elimination runs just before codegen (`dce.rs`): only the
+functions reachable from `main` are emitted. This composes with runtime
+pruning — a function `main` never calls is dropped, and with it any runtime
+piece that only that function named, so a dead `print_str`/`alloc` helper no
+longer drags the printer and the allocator into the binary. Reachability
+over-approximates on purpose (a call in a branch that cannot run still keeps its
+callee), because dropping a live function would be a miscompile while keeping a
+dead one is only size. The pass leaves a program without a `main` untouched, so
+the existing "undefined reference to `main`" link error is preserved rather than
+turned into an empty translation unit. On the benchmark suite it removes the
+standalone method bodies inlining had already left dead, shrinking `refs` from
+2056 to 1704 bytes; the other programs have no dead function and are unchanged.
 
 ### Heap
 
@@ -544,10 +625,11 @@ a branch per arithmetic operation.
 ## What is intentionally missing
 
 There is no optimiser beyond the folding, local promotion, inlining, self-
-recursion to loop, loop-invariant code motion and dead-instruction trim described
-above. No global register allocation, no common-subexpression elimination, no
-other loop transforms, no instruction scheduling. The compiler is optimised for compile
-speed and simplicity, not for the speed of the code it produces. The non-trivial
+recursion to loop, loop-invariant code motion, dead-function elimination and
+dead-instruction trim described above. No global register allocation, no
+common-subexpression elimination, no other loop transforms, no instruction
+scheduling. The compiler is optimised for compile speed and simplicity, not for
+the speed of the code it produces. The non-trivial
 passes are division by a constant (1.4x on `mandel.rms`), the top-five local
 promotion (a few percent on `mix` and `sieve`), the reference-operand folds plus
 `trim_dead` (1.4x on the `refs` benchmark), inlining (2.6x on `refs`, by removing
