@@ -2830,6 +2830,80 @@ fn a_while_condition_write_to_an_immutable_binding_is_a_second_write() {
 }
 
 #[test]
+fn a_for_bound_continue_reaches_the_enclosing_while_condition() {
+    // A `for`'s range bounds run before its own label enters scope, so a
+    // `continue 'a` in a bound names the enclosing `'a` `while` even when the
+    // `for` reuses the label. Treating the bound as shadowed made the condition
+    // look unreachable-from-the-body, so the loop's back edge was invisible and
+    // the second write to the immutable `x` passed. rustc rejects it (E0384).
+    let err = compile_to_asm(
+        "fn f() { let x: i64; 'a: while { x = 1; true } { \
+         'a: for i in { continue 'a; 0 }..1 {} break; } } fn main() { f(); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("cannot assign twice to immutable variable"), "got: {err}");
+    // A `break` in the bound leaves the `while` and never returns to the
+    // condition, so the single write stays legal.
+    assert!(compile_to_asm(
+        "fn f() { let x: i64; 'a: while { x = 1; true } { \
+         'a: for i in { break 'a; 0 }..1 {} } } fn main() { f(); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn a_short_circuited_condition_does_not_initialize_its_right_operand() {
+    // `flag && { x = 7; true }`: when `flag` is false the right operand never
+    // runs, so `x` is not definitely initialized after the condition and the
+    // read after the loop must be rejected, as rustc rejects it (E0381).
+    let err = compile_to_asm(
+        "fn f(flag: bool) -> i64 { let mut x: i64; while flag && { x = 7; true } {} return x; } \
+         fn main() { let _ = f(true); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("possibly-uninitialized variable `x`"), "got: {err}");
+    // The mirror: `flag || { x = 7; true }` skips the right operand when `flag`
+    // is true, and the body runs on that true path, so a read in the body may
+    // see `x` uninitialized. rustc rejects it (E0381).
+    let err = compile_to_asm(
+        "fn f(flag: bool) -> i64 { let mut x: i64; while flag || { x = 7; true } \
+         { let y: i64 = x; break; } return 0; } fn main() { let _ = f(false); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("possibly-uninitialized variable `x`"), "got: {err}");
+    // A binding initialized before the condition is still initialized after it,
+    // so the skipped path does not clobber it.
+    assert!(compile_to_asm(
+        "fn f(flag: bool) -> i64 { let mut x: i64 = 0; while flag && { x = 7; true } {} return x; } \
+         fn main() { let _ = f(true); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+    // A short circuit splits the two branches of an `if` as well. `a && b` is
+    // true only when `b` ran, so the then-branch sees `x` initialized; the
+    // implicit else does not.
+    assert!(compile_to_asm(
+        "fn f(a: bool) -> i64 { let mut x: i64; if a && { x = 7; true } { return x; } return 0; } \
+         fn main() { let _ = f(true); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+    // `a || b` is true when either side did, so the then-branch may have skipped
+    // `b`; a read there is rejected.
+    let err = compile_to_asm(
+        "fn f(a: bool) -> i64 { let mut x: i64; if a || { x = 7; true } { return x; } return 0; } \
+         fn main() { let _ = f(true); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("possibly-uninitialized variable `x`"), "got: {err}");
+}
+
+#[test]
 fn a_both_diverge_if_does_not_uninitialize_a_live_binding() {
     // Neither branch of `if true { return 1 } else { return 2 }` reaches the
     // code after it, so a binding initialized before the `if` stays initialized
