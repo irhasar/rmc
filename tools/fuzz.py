@@ -1787,6 +1787,41 @@ def gen_boolbit_program(rng):
     return "\n".join(head + rs) + "\n"
 
 
+def gen_vis_program(rng):
+    """`pub` on items, fields, methods and nested `fn`s, and an inline `mod`.
+
+    rmc drops visibility (one flat namespace), so a `pub` must not change the
+    program's behaviour: the twin is generated with `pub` sprinkled on and must
+    print the same bytes as rustc. An inline `mod NAME { .. }` is skipped, so a
+    program that declares one and uses only the flat items still runs.
+    """
+    items = []
+    items.append("pub const K: i64 = %d;" % rng.randint(1, 20))
+    items.append("pub type Alias = i64;")
+    items.append("pub struct P { pub a: i64, pub b: i64 }")
+    items.append(
+        "impl P { pub fn total(&self) -> i64 { self.a + self.b } }"
+    )
+    items.append("pub mod unused { pub fn never() -> i64 { 0 } }")
+    # A function that uses the items, sometimes `pub`.
+    qual = "pub " if rng.random() < 0.5 else ""
+    items.append(
+        f"{qual}fn helper(x: Alias) -> i64 {{ let p = P {{ a: x, b: K }}; p.total() }}"
+    )
+    main = [
+        "fn main() {",
+        "    let p = P { a: %d, b: %d };" % (rng.randint(-5, 5), rng.randint(-5, 5)),
+        '    println!("{}", p.total());',
+        '    println!("{}", helper(%d));' % rng.randint(-9, 9),
+        '    println!("{}", K);',
+    ]
+    if rng.random() < 0.5:
+        main.append("    pub fn inner() -> i64 { %d }" % rng.randint(0, 9))
+        main.append('    println!("{}", inner());')
+    main.append("}")
+    return "\n".join(items + main) + "\n"
+
+
 def gen_intmeth_program(rng):
     """A program built from the built-in `i64` methods. Each method desugars to
     operators, so the shapes that matter are the receiver being a non-trivial
@@ -3187,7 +3222,7 @@ def gen_typealias_program(rng):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "patshadow", "intmeth", "nestedfn", "typealias", "printfmt", "ptr", "char", "semi", "boolbit", "robust", "reject", "mutate"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "patshadow", "intmeth", "nestedfn", "typealias", "printfmt", "ptr", "char", "semi", "boolbit", "vis", "robust", "reject", "mutate"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -3248,7 +3283,8 @@ def main():
            "ptr": gen_ptr_program,
            "char": gen_char_program,
            "semi": gen_semi_program,
-           "boolbit": gen_boolbit_program}[args.mode]
+           "boolbit": gen_boolbit_program,
+           "vis": gen_vis_program}[args.mode]
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus
     # suite; a fuzz program is otherwise only checked with every pass on, so a

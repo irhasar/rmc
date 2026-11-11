@@ -849,6 +849,15 @@ rmc resolves every name globally, so an import has nothing to do. A `use` of a
 `process::exit(0)` resolves to the same item as the full `std::process::exit`.
 Any other `std::` path is a compile error.
 
+A `pub` visibility qualifier — on an item, a struct field, an `impl` method or a
+nested `fn` — is parsed and dropped, along with any restriction
+(`pub(crate)`, `pub(super)`, `pub(in ..)`). rmc resolves every name in one flat
+namespace, so visibility carries no meaning; accepting it lets an ordinary Rust
+source file parse unchanged. An inline `mod NAME { .. }` is likewise dropped:
+its body is not visible, but a program that declares one and uses only the flat
+items still compiles. A `mod NAME;` that would load another file is a compile
+error, since rmc compiles a single file and cannot resolve it.
+
 ## Not supported
 
 Traits, generics, borrowing, lifetimes, modules, closures, `f32`/`f64`,

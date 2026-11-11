@@ -7064,3 +7064,63 @@ fn a_bitwise_not_of_an_integer_stays_bitwise() {
     let out = asm("fn main() -> i64 { let x: i64 = 5; return !x; }");
     assert!(out.contains("not %rax"), "`!` on i64 must be a bitwise not");
 }
+
+#[test]
+fn a_pub_item_is_accepted() {
+    // `pub` may prefix a top-level item. rmc resolves every name in one flat
+    // namespace, so the visibility is dropped; accepting it lets an ordinary
+    // Rust source file parse unchanged.
+    let out = asm(
+        "pub const N: i64 = 1; pub type T = i64; pub struct S { x: i64 } \
+         pub enum E { A } pub fn f(v: T) -> i64 { v } fn main() -> i64 { f(N) }",
+    );
+    assert!(out.contains("main:"), "a `pub` item must compile");
+}
+
+#[test]
+fn a_pub_struct_field_is_accepted() {
+    let out = asm("pub struct S { pub x: i64 } fn main() -> i64 { let s = S { x: 3 }; s.x }");
+    assert!(out.contains("main:"), "a `pub` field must compile");
+}
+
+#[test]
+fn a_pub_impl_method_is_accepted() {
+    let out = asm(
+        "struct S { x: i64 } impl S { pub fn get(&self) -> i64 { self.x } } \
+         fn main() -> i64 { let s = S { x: 5 }; s.get() }",
+    );
+    assert!(out.contains("main:"), "a `pub` method must compile");
+}
+
+#[test]
+fn a_pub_nested_fn_is_accepted() {
+    // A nested `pub fn` is accepted by rustc, so it must parse here too.
+    let out = asm("fn main() -> i64 { pub fn g() -> i64 { 4 } g() }");
+    assert!(out.contains("main:"), "a nested `pub fn` must compile");
+}
+
+#[test]
+fn a_pub_with_a_restriction_is_accepted() {
+    // `pub(crate)`, `pub(super)` and `pub(in ..)` carry a parenthesised
+    // restriction; the whole qualifier is dropped.
+    let out = asm("pub(crate) fn f() -> i64 { 2 } fn main() -> i64 { f() }");
+    assert!(out.contains("main:"), "`pub(crate)` must compile");
+    let sup = asm("pub(super) fn f() -> i64 { 3 } fn main() -> i64 { f() }");
+    assert!(sup.contains("main:"), "`pub(super)` must compile");
+}
+
+#[test]
+fn an_inline_module_is_skipped() {
+    // rmc has no module system, so an inline `mod NAME { .. }` body is dropped.
+    // A program that declares one and uses only the flat items still compiles.
+    let out = asm("mod m { pub fn never() -> i64 { 0 } } fn main() -> i64 { 7 }");
+    assert!(out.contains("main:"), "an inline module must be skipped");
+}
+
+#[test]
+fn a_file_module_declaration_is_rejected() {
+    // `mod NAME;` loads another file, which rmc cannot resolve. Rejecting it
+    // matches rustc when the file is absent and avoids a silent divergence.
+    let err = compile_to_asm("mod m; fn main() -> i64 { 0 }", &CompileOptions::default());
+    assert!(err.is_err(), "`mod NAME;` must be rejected");
+}

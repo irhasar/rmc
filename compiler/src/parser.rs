@@ -310,6 +310,10 @@ impl Parser {
         let mut consts = Vec::new();
         let mut fns = Vec::new();
         while self.peek().is_some() {
+            // `pub` (and `pub(crate)` / `pub(super)` / `pub(in ..)`) may prefix
+            // any item. rmc has one flat namespace, so the visibility is
+            // dropped; skipping it here lets an ordinary `.rs` file parse.
+            self.skip_pub()?;
             match self.peek() {
                 Some(Tok::Struct) => structs.push(self.parse_struct()?),
                 Some(Tok::Enum) => enums.push(self.parse_enum()?),
@@ -336,6 +340,10 @@ impl Parser {
                 // does not provide fails later at its use site, with a clearer
                 // message than a parse error here.
                 Some(Tok::Ident(id)) if id == "use" => self.skip_use()?,
+                // `mod NAME;` / `mod NAME { .. }`: rmc has no module system, so
+                // the module is skipped. The items it would contain are not
+                // visible; a use of one fails later at its use site.
+                Some(Tok::Ident(id)) if id == "mod" => self.skip_mod()?,
                 other => {
                     return Err(format!(
                         "at byte {}: expected `fn`, `struct`, `enum`, `const`, `type` or `impl`, found {}",
@@ -357,6 +365,7 @@ impl Parser {
     }
 
     fn parse_enum(&mut self) -> PResult<EnumDef> {
+        self.skip_pub()?;
         self.expect(Tok::Enum)?;
         let name = self.expect_ident()?;
         self.expect(Tok::LBrace)?;
@@ -446,6 +455,10 @@ impl Parser {
         let mut enum_names: Vec<String> = Vec::new();
         self.i = 0;
         loop {
+            // A `pub` on an item is dropped (rmc has one flat namespace), so
+            // skip it before matching the item keyword, exactly as the real
+            // parse loop does.
+            self.skip_pub()?;
             match self.peek() {
                 None => break,
                 Some(Tok::Const) => items.push(self.parse_const()?),
@@ -490,6 +503,9 @@ impl Parser {
                         self.i += 1;
                         let mut fields = std::collections::HashSet::new();
                         while self.peek() != Some(&Tok::RBrace) && self.peek().is_some() {
+                            // A field may carry its own `pub`; skip it so the
+                            // field name is recorded, not `pub`.
+                            self.skip_pub()?;
                             if let Some(Tok::Ident(f)) = self.peek() {
                                 fields.insert(f.clone());
                                 self.i += 1;
@@ -537,6 +553,10 @@ impl Parser {
                     }
                     self.skip_balanced(Tok::LBrace, Tok::RBrace)?;
                 }
+                // A `mod NAME;` / `mod NAME { .. }` is skipped, so a `const`
+                // inside a module body is not collected (its items are not
+                // visible to the flat namespace anyway).
+                Some(Tok::Ident(id)) if id == "mod" => self.skip_mod()?,
                 Some(Tok::Fn) => {
                     // Skip the name, the parameter list, the return type and the
                     // body, so a `const` inside a function body is not seen.
@@ -641,6 +661,38 @@ impl Parser {
         self.skip_to_semi()
     }
 
+    /// Skip a `pub` visibility qualifier, with its optional restriction
+    /// (`pub(crate)`, `pub(super)`, `pub(in path)`). rmc resolves every name in
+    /// one flat namespace, so visibility carries no meaning and is dropped here.
+    /// Accepting it lets an ordinary Rust source file parse unchanged.
+    fn skip_pub(&mut self) -> PResult<()> {
+        if self.peek() == Some(&Tok::Ident("pub".into())) {
+            self.i += 1;
+            if self.peek() == Some(&Tok::LParen) {
+                self.skip_balanced(Tok::LParen, Tok::RParen)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Skip an inline `mod NAME { .. }`. rmc has no module system — every name
+    /// is resolved in one flat namespace — so the module body is dropped, which
+    /// lets an ordinary `.rs` file that declares inline modules parse. A
+    /// `mod NAME;` that would load another file is rejected: rmc compiles one
+    /// file and cannot resolve it, and accepting it would diverge from rustc
+    /// when the file is absent.
+    fn skip_mod(&mut self) -> PResult<()> {
+        let pos = self.pos();
+        self.i += 1; // the `mod` keyword
+        let name = self.expect_ident()?;
+        if self.peek() == Some(&Tok::Semi) {
+            return Err(format!(
+                "at byte {pos}: `mod {name};` loads another file, which rmc does not support"
+            ));
+        }
+        self.skip_balanced(Tok::LBrace, Tok::RBrace)
+    }
+
     /// Record the module names a `use` of the `std` tree brings into scope.
     /// Walks the token run up to the `;`, so `use std::process;`,
     /// `use std::process::exit;` and `use std::{process, hint};` all register
@@ -714,6 +766,7 @@ impl Parser {
     /// constant declared later) is left for `resolve_consts`, which reruns once
     /// every item has been seen.
     fn parse_const(&mut self) -> PResult<ConstDef> {
+        self.skip_pub()?;
         self.expect(Tok::Const)?;
         let name = self.expect_ident()?;
         self.expect(Tok::Colon)?;
@@ -765,6 +818,7 @@ impl Parser {
     /// registered by `prescan`, so it may be used before this point, which means
     /// `type A = B;` and `type B = i64;` resolve in either order.
     fn parse_type_alias(&mut self) -> PResult<()> {
+        self.skip_pub()?;
         self.expect(Tok::Type)?;
         let name = self.expect_ident()?;
         self.expect(Tok::Eq)?;
@@ -799,11 +853,13 @@ impl Parser {
     }
 
     fn parse_struct(&mut self) -> PResult<StructDef> {
+        self.skip_pub()?;
         self.expect(Tok::Struct)?;
         let name = self.expect_ident()?;
         self.expect(Tok::LBrace)?;
         let mut fields = Vec::new();
         while self.peek() != Some(&Tok::RBrace) {
+            self.skip_pub()?;
             let fname = self.expect_ident()?;
             self.expect(Tok::Colon)?;
             let fty = self.parse_type()?;
@@ -837,6 +893,7 @@ impl Parser {
     }
 
     fn parse_fn(&mut self) -> PResult<FnDef> {
+        self.skip_pub()?;
         self.expect(Tok::Fn)?;
         let name = self.expect_ident()?;
         self.expect(Tok::LParen)?;
@@ -889,6 +946,7 @@ impl Parser {
     }
 
     fn parse_method(&mut self, ty: &str) -> PResult<FnDef> {
+        self.skip_pub()?;
         self.expect(Tok::Fn)?;
         let name = self.expect_ident()?;
         self.expect(Tok::LParen)?;
@@ -1410,10 +1468,18 @@ impl Parser {
                 Tok::Fn if depth == 0 => {
                     // `fn name ( .. ) -> .. { body }`. The body brace is skipped
                     // as a unit by the `depth` counter, so a `fn` inside it is
-                    // not seen here.
-                    if let Some(Token { tok: Tok::Ident(name), .. }) = self.toks.get(i + 1) {
+                    // not seen here. A `pub` before the `fn` is skipped too, so a
+                    // nested `pub fn` (which rustc accepts) is scanned.
+                    let fn_tok = if matches!(
+                        self.toks.get(i.wrapping_sub(1)).map(|t| &t.tok),
+                        Some(Tok::Ident(p)) if p == "pub"
+                    ) {
+                        i + 1
+                    } else {
+                        i
+                    };
+                    if let Some(Token { tok: Tok::Ident(name), .. }) = self.toks.get(fn_tok + 1) {
                         let name = name.clone();
-                        // Two `fn`s with the same name in one block is rustc's
                         // E0428. A later one shadowing an outer one is fine and
                         // keeps its own unique symbol.
                         if frame.iter().any(|(n, _)| *n == name) {
@@ -1477,6 +1543,17 @@ impl Parser {
                 && matches!(self.peek2(), Some(Tok::Ident(_)) | Some(Tok::ColonColon))
             {
                 self.skip_use()?;
+                continue;
+            }
+            // `pub fn` (or `pub` before any item) in a block: drop the
+            // visibility and parse the item. Guarded on what follows so a
+            // variable named `pub` (which rmc, unlike rustc, would otherwise
+            // allow) is not swallowed.
+            if self.peek() == Some(&Tok::Ident("pub".into()))
+                && matches!(self.peek2(), Some(Tok::Fn))
+            {
+                self.skip_pub()?;
+                self.parse_stmt_into(&mut stmts)?;
                 continue;
             }
             // A stray `;` is an empty statement; Rust accepts any number of

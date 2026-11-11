@@ -318,7 +318,11 @@ block-scoped, so it shadows a top-level `fn` of the same name and is visible
 throughout its block, exactly as rustc); `as` casts at Rust's
 precedence (looser than the unary operators, so `*r as i64` is `(*r) as i64`);
 attributes such as `#[derive(Copy, Clone)]` (parsed and ignored); `use`
-statements (parsed and discarded, since every name is resolved globally);
+statements (parsed and discarded, since every name is resolved globally); `pub`
+visibility on an item, a struct field, an `impl` method or a nested `fn` (with
+any `(crate)`/`(super)`/`(in ..)` restriction — dropped, since visibility has no
+meaning in a single flat namespace); an inline `mod NAME { .. }` (skipped, since
+rmc has no module system; a `mod NAME;` that loads another file is an error);
 `print!`/`println!` with `{}` substitution, and `assert!`/`assert_eq!`/
 `assert_ne!`/`panic!`/`unreachable!` (a failure exits with rustc's panic code
 101); the `std::process::exit` and `std::hint::black_box` paths; and a small

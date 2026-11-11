@@ -1830,7 +1830,13 @@ arguments are parsed and discarded. `use` items are skipped at the top level
 and inside a block; a `use` of a `std` subtree is recorded so a later
 `process::exit(0)` after `use std::process;` resolves, and only
 `std::process::exit` and `std::hint::black_box` are understood among `std::`
-paths. `str` and `&str` are the same one-word value, so `ref_coerces` lets them
+paths. A `pub` qualifier (on an item, a struct field, an `impl` method or a
+nested `fn`, with any `(crate)`/`(super)`/`(in ..)` restriction) is dropped by
+`skip_pub`, since every name resolves in one flat namespace; the prescan and the
+block-body loop skip it too, and `scan_block_fns` looks through a `pub` before a
+nested `fn`. An inline `mod NAME { .. }` is skipped by `skip_mod` (its items are
+not visible); a `mod NAME;` that would load another file is a compile error. `str`
+and `&str` are the same one-word value, so `ref_coerces` lets them
 be exchanged at a variable, parameter, struct-field, enum-variant-field or
 comparison site; there is no lifetime checking, so a `&'static str` field or
 `&str` parameter may be written `str`.
