@@ -3984,6 +3984,16 @@ fn a_short_circuited_condition_does_not_initialize_its_right_operand() {
     )
     .unwrap_err();
     assert!(err.contains("possibly-uninitialized variable `x`"), "got: {err}");
+    // The mirror: `flag || { x = 7; true }` skips the right operand when `flag`
+    // is true, and the body runs on that true path, so a read in the body may
+    // see `x` uninitialized. rustc rejects it (E0381).
+    let err = compile_to_asm(
+        "fn f(flag: bool) -> i64 { let mut x: i64; while flag || { x = 7; true } \
+         { let y: i64 = x; break; } return 0; } fn main() { let _ = f(false); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("possibly-uninitialized variable `x`"), "got: {err}");
     // A binding initialized before the condition is still initialized after it,
     // so the skipped path does not clobber it.
     assert!(compile_to_asm(
@@ -3992,6 +4002,24 @@ fn a_short_circuited_condition_does_not_initialize_its_right_operand() {
         &CompileOptions::default(),
     )
     .is_ok());
+    // A short circuit splits the two branches of an `if` as well. `a && b` is
+    // true only when `b` ran, so the then-branch sees `x` initialized; the
+    // implicit else does not.
+    assert!(compile_to_asm(
+        "fn f(a: bool) -> i64 { let mut x: i64; if a && { x = 7; true } { return x; } return 0; } \
+         fn main() { let _ = f(true); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+    // `a || b` is true when either side did, so the then-branch may have skipped
+    // `b`; a read there is rejected.
+    let err = compile_to_asm(
+        "fn f(a: bool) -> i64 { let mut x: i64; if a || { x = 7; true } { return x; } return 0; } \
+         fn main() { let _ = f(true); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("possibly-uninitialized variable `x`"), "got: {err}");
 }
 
 #[test]

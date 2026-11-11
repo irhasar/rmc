@@ -129,6 +129,13 @@ pub struct Sema {
     /// Whether the `if` being checked is a non-root step of such a chain, so it
     /// inherits `match_total` instead of recomputing it.
     match_chain: bool,
+    /// Set by `check_expr` for a top-level `&&`/`||` condition: the
+    /// definite-initialization state on entry to the true (`cond_then_init`)
+    /// and false (`cond_else_init`) branch. A short circuit means the right
+    /// operand runs on only one of the two paths, so the branches see
+    /// different states. Consumed and cleared by `check_stmt`'s `if`/`while`.
+    cond_then_init: Option<Vec<bool>>,
+    cond_else_init: Option<Vec<bool>>,
     /// The constant value of each local, by slot, if it is known. A local is
     /// entered only when rustc's constant propagation would know it: its
     /// initializer is constant and it is never written or mutably borrowed
@@ -344,6 +351,8 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         match_chain: false,
         tmp: 0,
         in_builtin_neg: false,
+        cond_then_init: None,
+        cond_else_init: None,
         const_locals: HashMap::new(),
         assign_count: HashMap::new(),
         mut_borrowed: std::collections::HashSet::new(),
@@ -1690,14 +1699,31 @@ impl Sema {
                     );
                 }
                 let ct = self.check_expr(cond, scope)?;
+                // A top-level `&&`/`||` condition runs its right operand on only
+                // one of the two paths: the body enters on the condition-true
+                // state, the post-loop fall-through on the condition-false one.
+                // Only a top-level short circuit splits the branches; a nested
+                // one inside a larger condition does not. Always consume the
+                // slots so a nested one cannot leak to a later condition.
+                let (mut cond_then, mut cond_else) =
+                    (self.cond_then_init.take(), self.cond_else_init.take());
+                if !matches!(cond, Expr::Bin(BinOp::And | BinOp::Or, ..)) {
+                    cond_then = None;
+                    cond_else = None;
+                }
                 if ct != Type::Bool && ct != Type::Never {
                     return Err(format!("`while` condition must be `bool`, found {ct:?}"));
                 }
                 // The condition is evaluated at least once, even when the body
                 // never runs, so a binding it initializes is initialized on the
                 // fall-through exit. Snapshot that state: the body may still run
-                // zero times, so its writes do not count on their own.
-                let cond_init = Self::init_snapshot(scope);
+                // zero times, so its writes do not count on their own. A short
+                // circuit takes the condition-false path's state instead.
+                let cond_init = cond_else.unwrap_or_else(|| Self::init_snapshot(scope));
+                // The body runs only when the condition is true.
+                if let Some(st) = &cond_then {
+                    Self::init_restore(scope, st);
+                }
                 self.check_block_inner(body, scope, true, label.as_deref())?;
                 let breaks = self.break_assigned.pop().unwrap();
                 let exits = self.loop_exits.pop().unwrap();
@@ -2414,25 +2440,39 @@ impl Sema {
             }
             Expr::Bin(op, a, b) => {
                 // `&&`/`||` short-circuit: the right operand runs only when the
-                // left does not decide the result, so a binding initialized
-                // only in the right operand is not definitely initialized after
-                // the expression. Merge the skipped path (the left operand's
-                // state) with the evaluated path (both operands) before the
-                // caller snapshots the state, or `while flag && { x = 7; true }
-                // {}` would report `x` initialized even when `flag` is false.
+                // left does not decide the result. Record the two branch-entry
+                // states for a caller that branches on this expression (an
+                // `if`/`while` condition), and leave the scope with the
+                // conservative "either path" state so a value use
+                // (`let b = a && x`) cannot assume the right operand ran.
                 if matches!(op, BinOp::And | BinOp::Or) {
                     let ta = self.check_expr(a, scope)?;
-                    let skipped = Self::init_snapshot(scope);
+                    let skip = Self::init_snapshot(scope);
                     let tb = self.check_expr(b, scope)?;
-                    let evaluated = Self::init_snapshot(scope);
+                    let eval = Self::init_snapshot(scope);
                     if ta != Type::Bool || tb != Type::Bool {
                         return Err(format!(
                             "logical operator expects `bool`, found {ta:?} and {tb:?}"
                         ));
                     }
-                    for (i, bl) in scope.iter_mut().enumerate() {
-                        bl.init = skipped.get(i).copied().unwrap_or(false)
-                            && evaluated.get(i).copied().unwrap_or(false);
+                    // A binding is initialized after the expression only if it
+                    // is initialized whether or not the right operand ran.
+                    let either: Vec<bool> = (0..scope.len())
+                        .map(|i| {
+                            skip.get(i).copied().unwrap_or(false)
+                                && eval.get(i).copied().unwrap_or(false)
+                        })
+                        .collect();
+                    // `a && b` is true only when `b` ran; false when either `a`
+                    // was false (`b` skipped) or `b` ran. `a || b` is the mirror.
+                    let (then_state, else_state) = match op {
+                        BinOp::And => (eval, either.clone()),
+                        _ => (either.clone(), eval),
+                    };
+                    self.cond_then_init = Some(then_state);
+                    self.cond_else_init = Some(else_state);
+                    for (bl, &m) in scope.iter_mut().zip(&either) {
+                        bl.init = m;
                     }
                     return Ok(Type::Bool);
                 }
@@ -2615,6 +2655,16 @@ impl Sema {
                 self.match_chain = false;
                 self.match_total = false;
                 let ct = self.check_expr(cond, scope)?;
+                // A top-level `&&`/`||` condition runs its right operand on only
+                // one of the two branches, so the branches enter with different
+                // initialization states. Only a top-level short circuit splits
+                // them; always consume the slots so a nested one cannot leak.
+                let (mut cond_then, mut cond_else) =
+                    (self.cond_then_init.take(), self.cond_else_init.take());
+                if !matches!(&**cond, Expr::Bin(BinOp::And | BinOp::Or, ..)) {
+                    cond_then = None;
+                    cond_else = None;
+                }
                 if ct != Type::Bool && ct != Type::Never {
                     return Err(format!("`if` condition must be `bool`, found {ct:?}"));
                 }
@@ -2628,6 +2678,10 @@ impl Sema {
                 // paths. `init_before` is the state on entry to the branch.
                 let init_before = Self::init_snapshot(scope);
                 let assigned_before = Self::assigned_snapshot(scope);
+                // Enter the then-branch in the state its guard guarantees.
+                if let Some(st) = &cond_then {
+                    Self::init_restore(scope, st);
+                }
                 let tt = self.check_block(then, scope)?;
                 let then_init = Self::init_snapshot(scope);
                 let then_assigned = Self::assigned_snapshot(scope);
@@ -2642,7 +2696,10 @@ impl Sema {
                         self.match_total = total;
                         // Restore the entry state before the else, so the else
                         // sees the same scope the then saw.
-                        Self::init_restore(scope, &init_before);
+                        Self::init_restore(
+                            scope,
+                            cond_else.as_deref().unwrap_or(&init_before),
+                        );
                         Self::assigned_restore(scope, &assigned_before);
                         let et = self.check_block(e, scope)?;
                         self.match_chain = false;
@@ -2723,8 +2780,12 @@ impl Sema {
                         // (every variant is named), so a diverging then-branch
                         // makes the whole step `!` rather than `()` — which is
                         // what lets an all-`return` exhaustive match stand as a
-                        // `!` tail.
-                        Self::init_restore(scope, &init_before);
+                        // `!` tail. The implicit else is the condition-false
+                        // path, whose state a short circuit may differ on.
+                        Self::init_restore(
+                            scope,
+                            cond_else.as_deref().unwrap_or(&init_before),
+                        );
                         // An arm that cannot fall through must not contribute:
                         // its write is unreachable from the next statement.
                         if block_diverges(then) && !total {
