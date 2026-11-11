@@ -15,4 +15,12 @@ fn main() {
     println!("{}", b);
     let c: i64 = env::args().nth(3).unwrap().parse().unwrap();
     println!("{}", c);
+    // `.and_then(|s| s.parse().ok())` leaves an `Option`: its `unwrap()` must
+    // trap on both a missing argument and a malformed one, unlike the
+    // `unwrap_or` form above.
+    let d: i64 = env::args()
+        .nth(4)
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap();
+    println!("{}", d);
 }

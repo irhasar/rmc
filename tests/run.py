@@ -507,6 +507,46 @@ def check_reject_array_pat_len():
     return failures
 
 
+def check_reject_parse_type():
+    """A `parse::<T>()` turbofish other than `i64` is rejected.
+
+    rmc lowers every `args().nth(..).parse()` to the i64 parser, so accepting
+    `parse::<bool>()` would compile a program that treats a valid `true` as a
+    parse failure. Reject the unsupported types with a diagnostic instead.
+    """
+    bad = {
+        "bool": "use std::env; fn main() { let b = env::args().nth(1).unwrap().parse::<bool>().unwrap() as i64; println!(\"{}\", b); }",
+        "char": "use std::env; fn main() { let c = env::args().nth(1).unwrap().parse::<char>().unwrap() as i64; println!(\"{}\", c); }",
+        "u64": "use std::env; fn main() { let n = env::args().nth(1).unwrap().parse::<u64>().unwrap(); println!(\"{}\", n); }",
+    }
+    good = {
+        "i64": "use std::env; fn main() { let n = env::args().nth(1).unwrap().parse::<i64>().unwrap_or(7); println!(\"{}\", n); }",
+        "bare": "use std::env; fn main() { let n = env::args().nth(1).unwrap().parse().unwrap_or(7); println!(\"{}\", n); }",
+    }
+    failures = 0
+    for name, src in bad.items():
+        path = os.path.join(OUT, f"rejparsety_{name}.rs")
+        with open(path, "w") as f:
+            f.write(src)
+        p = subprocess.run([RMC, path, "-o", os.path.join(OUT, f"rejparsety_{name}.bin")],
+                           capture_output=True)
+        if p.returncode == 0 or b"unsupported `parse` type" not in p.stderr:
+            failures += 1
+            print(f"FAIL reject_parse_type {name}: exit={p.returncode} stderr={p.stderr!r}")
+    for name, src in good.items():
+        path = os.path.join(OUT, f"okparsety_{name}.rs")
+        with open(path, "w") as f:
+            f.write(src)
+        p = subprocess.run([RMC, path, "-o", os.path.join(OUT, f"okparsety_{name}.bin")],
+                           capture_output=True)
+        if p.returncode != 0:
+            failures += 1
+            print(f"FAIL ok_parse_type {name}: rmc failed:\n{p.stderr.decode(errors='replace')}")
+    if failures == 0:
+        print("a non-i64 `parse` turbofish is rejected; i64 and bare still build")
+    return failures
+
+
 def main():
     verbose = "-v" in sys.argv
     os.makedirs(OUT, exist_ok=True)
@@ -571,6 +611,7 @@ def main():
                     print(f"ok   {name}{label} {argv}")
 
     failures += check_reject_array_pat_len()
+    failures += check_reject_parse_type()
     failures += check_bounds_traps(combos)
     failures += check_clamp_trap(combos)
     stripped = check_stripped()

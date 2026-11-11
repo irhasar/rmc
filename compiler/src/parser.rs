@@ -2573,6 +2573,10 @@ impl Parser {
         let mut default: Option<Expr> = None;
         let mut missing_required = false;
         let mut parse_required = false;
+        // Set by `and_then(|s| s.parse().ok())`: the chain is an `Option` again,
+        // so a following `unwrap()` traps on both a missing and a malformed
+        // argument rather than only on a missing one.
+        let mut and_then_parse = false;
         // After `.parse()` the chain is a `Result`; an `unwrap()` there is a
         // parse failure, not a missing argument, and `unwrap_or(d)` only
         // recovers the parse failure. The two must be tracked separately:
@@ -2585,10 +2589,23 @@ impl Parser {
             let m = self.expect_ident()?;
             match m.as_str() {
                 "parse" => {
-                    // `parse::<i64>()` carries a turbofish; the type name is a
-                    // keyword token (`i64`/`bool`/`char`), so accept either.
+                    // `parse::<i64>()` carries a turbofish whose type name is a
+                    // keyword token. rmc lowers every `parse` to the i64 parser,
+                    // so a `bool`/`char` turbofish (which would compile but parse
+                    // as an integer) is rejected rather than mis-lowered.
                     if self.eat(&Tok::ColonColon) {
                         self.expect(Tok::Lt)?;
+                        if !matches!(self.peek(), Some(Tok::TyI64)) {
+                            let got = self
+                                .peek()
+                                .map(|t| t.describe())
+                                .unwrap_or_else(|| "end of input".into());
+                            return Err(format!(
+                                "at byte {}: unsupported `parse` type {got} \
+                                 (only `i64` is accepted)",
+                                self.pos()
+                            ));
+                        }
                         self.bump();
                         self.expect(Tok::Gt)?;
                     }
@@ -2599,7 +2616,13 @@ impl Parser {
                 "unwrap" => {
                     self.expect(Tok::LParen)?;
                     self.expect(Tok::RParen)?;
-                    if in_result {
+                    if and_then_parse {
+                        // `.and_then(|s| s.parse().ok()).unwrap()`: the `Option`
+                        // is `None` both when the argument is absent and when it
+                        // is present but non-numeric, so both failures trap.
+                        missing_required = true;
+                        parse_required = true;
+                    } else if in_result {
                         parse_required = true;
                     } else {
                         // `.unwrap()` on the `Option`: a missing argument
@@ -2619,9 +2642,11 @@ impl Parser {
                     self.expect(Tok::LParen)?;
                     self.skip_closure()?;
                     self.expect(Tok::RParen)?;
-                    // The closure's `.ok()` yields an `Option`, and the
-                    // following `unwrap_or(d)` recovers both failures.
+                    // The closure's `.ok()` yields an `Option`; a following
+                    // `unwrap_or(d)` recovers both failures, while a following
+                    // `unwrap()` must trap on both.
                     in_result = true;
+                    and_then_parse = true;
                 }
                 other => {
                     return Err(format!(

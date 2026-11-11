@@ -192,11 +192,13 @@ arg_i64:
 __rmc_arg_or:
     push %rbp
     mov %rsp, %rbp
-    # `missing` lives in %r10 and `parse` in %r11: `__rmc_arg_parse` clobbers
-    # %rax/%rcx/%rdx/%rdi/%r8/%r9 but neither, and %rsi (the default) survives
-    # the call too.
+    sub $16, %rsp
+    # `missing` lives in %r10: `__rmc_arg_parse` clobbers %rax/%rcx/%rdx/%rdi/
+    # %r8/%r9/%r11 but not %r10, and %rsi (the default) survives the call too.
+    # `parse` cannot live in %r11, because the helper loads its digit limit
+    # there; keep it in a frame slot across the call.
     mov %rdx, %r10
-    mov %rcx, %r11
+    mov %rcx, -8(%rbp)
     test %rdi, %rdi
     js .Lao_miss
     mov __rmc_argc(%rip), %rcx
@@ -216,7 +218,7 @@ __rmc_arg_or:
     leave
     ret
 .Lao_parse:
-    test %r11, %r11
+    cmpq $0, -8(%rbp)
     jnz .Lao_trap
     mov %rsi, %rax
     leave
