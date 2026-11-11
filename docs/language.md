@@ -355,8 +355,22 @@ pattern, where a bare constant name is that value rather than a fresh binding.
 A constant may be named before it is declared, as in Rust. Arithmetic in an
 initializer that would trap at run time — division or remainder by zero, `i64`
 overflow, or a shift by 64 or more — is rejected, as is a cycle between
-constants and an initializer that is not a constant expression. Only top-level
-`const` items are supported; a `const` inside a function body is rejected.
+constants and an initializer that is not a constant expression.
+
+A `const` may also be declared inside a block, where it is folded and in scope
+for the rest of that block. Like a top-level `const` it may be named before it is
+declared (rustc hoists block items), and it shadows an outer constant of the same
+name until the block ends, when the outer value returns. Two `const`s of the same
+name in one block is an error (rustc's `E0428`).
+
+```rust
+fn main() {
+    let a = N;             // usable before its declaration
+    const N: i64 = 5;
+    let b = { const N: i64 = 9; N };   // an inner shadow, 9
+    // here `N` is 5 again
+}
+```
 
 A local binding may not reuse a constant's name (rustc's `E0530`), whether it is
 a `let`, a parameter or a `for` variable. A `const` and a function share a
@@ -364,9 +378,9 @@ namespace, so giving both the same name is an error (rustc's `E0428`).
 
 An immutable `static NAME: TYPE = EXPR;` (optionally `pub`) is lowered to a
 `const`: rmc has no mutable global storage, so a `static` has the same fold-and-
-substitute semantics and the same restrictions. `static mut` is rejected, since
-rmc cannot represent a mutable global and a program that mutated one would
-diverge.
+substitute semantics and the same restrictions. A block-scoped `static` is folded
+the same way. `static mut` is rejected, since rmc cannot represent a mutable
+global and a program that mutated one would diverge.
 
 ## Type aliases
 

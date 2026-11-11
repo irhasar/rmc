@@ -20,6 +20,25 @@ enum NameScope {
     Ptr(String, Option<i64>),
     /// `args_vecs`: a `std::env::args()...collect()` binding.
     ArgsVec(String, Option<i64>),
+    /// A `const` declared inside the block, so the name is removed (or its
+    /// outer value restored) when the block ends. The `Option` is the value the
+    /// name had before, if any.
+    ConstInt(String, Option<i64>),
+    ConstBool(String, Option<bool>),
+    ConstChar(String, Option<u32>),
+}
+
+/// A `const` (or immutable `static`) declared inside a block. It is folded by
+/// the block scan and in scope for the rest of the block, exactly like a
+/// top-level `const` is in scope for the rest of the file; it is never added to
+/// the program's item list, so codegen never sees it. `start`/`end` are token
+/// indices: the `const`/`static` keyword and the token just past the `;`, so the
+/// main parse can skip the item the scan already folded.
+#[derive(Debug, Clone)]
+struct LocalConst {
+    start: usize,
+    end: usize,
+    name: String,
 }
 
 pub struct Parser {
@@ -77,6 +96,12 @@ pub struct Parser {
     /// only the program's items (a top-level `fn`, `struct`, `enum` or `const`),
     /// never an enclosing local, so nothing needs to be closed over.
     nested_fns: Vec<FnDef>,
+    /// One frame per block being parsed, innermost last, of the `const`s (and
+    /// immutable `static`s) declared directly in that block. A block-scoped
+    /// `const` is folded when it is parsed and shadows an outer one until the
+    /// block ends, matching rustc's scoping; the name table `consts`/`const_bools`/
+    /// `const_chars` is updated in place and restored by `pop_name_scope`.
+    local_consts: Vec<Vec<LocalConst>>,
     /// True while parsing a pattern that may be refutable (a `match` arm, an
     /// `if let` / `while let` scrutinee). A tuple pattern is irrefutable only
     /// when every element is, but in a refutable position its elements may be
@@ -199,6 +224,7 @@ impl Parser {
                 m
             },
             nested_fns: Vec::new(),
+            local_consts: Vec::new(),
             pat_refutable_ok: false,
             fn_scopes: vec![Vec::new()],
             fn_at: std::collections::HashMap::new(),
@@ -811,6 +837,43 @@ impl Parser {
         self.parse_const_tail()
     }
 
+    /// Parse a `const`/immutable-`static` item found at token `start`, fold its
+    /// value, and return the value plus the token index just past its `;`. The
+    /// declared type is honoured (an `i64`/`bool`/`char` item folds to that
+    /// kind); any other type folds to nothing, so a later use is diagnosed the
+    /// way an unresolved constant is. `static mut` is refused, as at the top
+    /// level. `self.i` is left at `start` so a caller that wants to parse the
+    /// item normally (the top-level loop) can.
+    fn fold_const_item(&mut self, start: usize) -> PResult<(Option<crate::consts::ConstVal>, usize)> {
+        let saved = self.i;
+        self.i = start;
+        self.skip_pub()?;
+        let def = if self.peek() == Some(&Tok::Const) {
+            self.i += 1;
+            self.parse_const_tail()?
+        } else {
+            // `static [mut] ..`; `parse_static` consumes the keyword itself.
+            self.parse_static()?
+        };
+        let end = self.i;
+        self.i = saved;
+        // A constant may name one declared earlier (in this block or outside
+        // it), so fold against the live tables, which already hold every value
+        // in scope.
+        let items = [(def.name.clone(), def.ty.clone(), def.value.clone())];
+        let mut val = crate::consts::resolve(&items).get(&def.name).copied();
+        // A `char` constant folds through `eval_char`, which the item `resolve`
+        // path covers; an alias-typed one is rare enough to leave unresolved.
+        if val.is_none() {
+            if let Some(v) = crate::consts::eval_i64(&def.value, &self.consts) {
+                if def.ty == Type::I64 {
+                    val = Some(crate::consts::ConstVal::Int(v));
+                }
+            }
+        }
+        Ok((val, end))
+    }
+
     /// Rewrite every alias name in `t` to its target, so no later pass sees an
     /// alias. `depth` bounds a cycle (`type A = B; type B = A;`), which would
     /// otherwise expand forever; a cycle is reported as an error, matching
@@ -1375,12 +1438,169 @@ impl Parser {
         self.fn_scopes.push(frame);
         // The `Vec`/pointer name tables are scoped the same way: a binding this
         // block introduces (or shadows) is undone when the block ends, so an
-        // outer `v: Vec<u8>` regains its byte stride after a nested `v`.
+        // outer `v: Vec<u8>` regains its byte stride after a nested `v`. Pushed
+        // before the const scan so the restore notes it records land in this
+        // block's frame.
         self.name_scopes.push(Vec::new());
+        // A block-scoped `const` is an item too: rustc hoists it for the whole
+        // block, so `println!("{}", N); const N: i64 = 5;` resolves. Fold every
+        // one now, in declaration order (a later one may name an earlier one),
+        // and note the names so the main parse skips the items it already folded.
+        let cframe = self.scan_block_consts()?;
+        self.local_consts.push(cframe);
         let r = self.parse_block_body();
         self.pop_name_scope();
+        self.local_consts.pop();
         self.fn_scopes.pop();
         r
+    }
+
+    /// Scan the block starting at the current `{` for the `const`/immutable
+    /// `static` items declared directly in it, fold each, and enter its value in
+    /// the live constant tables so a later statement in the block (and a nested
+    /// block) resolves the name. Returns the frame of their token spans, which
+    /// the main parse skips. A `const` nested deeper is left to the scan of that
+    /// block. The frame is popped with the block by `pop_name_scope`, so the name
+    /// is gone after the block ends. Names in the frame are also noted as
+    /// `NameScope` entries, so `pop_name_scope` restores an outer value the block
+    /// shadowed.
+    fn scan_block_consts(&mut self) -> PResult<Vec<LocalConst>> {
+        let mut frame: Vec<LocalConst> = Vec::new();
+        let mut depth = 0u32;
+        let mut i = self.i;
+        while i < self.toks.len() {
+            // Decide by a short-lived borrow, so the mutable calls below (which
+            // fold the item and enter its value) do not conflict with it.
+            let mut is_item = false;
+            match &self.toks[i].tok {
+                Tok::LBrace | Tok::LParen | Tok::LBracket => depth += 1,
+                Tok::RBrace => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                Tok::RParen | Tok::RBracket => {
+                    depth = depth.saturating_sub(1);
+                }
+                // A `const`/`static` item at the top level of this block. A
+                // `pub` before it is skipped, as in a top-level item. A `const`
+                // inside a `fn` body or a nested `{ .. }` has `depth > 0`, so it
+                // is left to that block's own scan.
+                Tok::Const if depth == 0 => {
+                    // A raw pointer type `*const T` also lexes the `const`
+                    // keyword; an item's `const` is never preceded by `*`.
+                    if self.toks.get(i.wrapping_sub(1)).map(|t| &t.tok) != Some(&Tok::Star) {
+                        is_item = true;
+                    }
+                }
+                Tok::Ident(id) if id == "static" && depth == 0 => is_item = true,
+                _ => {}
+            }
+            if is_item {
+                let raw_start = i;
+                // `static mut` has no meaning in rmc; reject it here, where the
+                // block scan sees it, rather than let `fold_const_item` fail with
+                // a less specific message.
+                if let Some(Tok::Ident(id)) = self.toks.get(i + 1).map(|t| &t.tok) {
+                    if id == "mut" {
+                        return Err(format!(
+                            "at byte {}: `static mut` is not supported; rmc has no mutable global",
+                            self.toks[i].pos
+                        ));
+                    }
+                }
+                let start = self.skip_pub_at(i);
+                let (val, end) = self.fold_const_item(start)?;
+                if let Some(Tok::Ident(n)) = self.toks.get(start + 1).map(|t| t.tok.clone()) {
+                    // Two `const`s of the same name in one block is E0428, as for
+                    // two `fn`s (`scan_block_fns`). A `let` of the same name is a
+                    // binding, not an item, and shadows rather than collides.
+                    if frame.iter().any(|c| c.name == n) {
+                        return Err(format!(
+                            "at byte {}: the name `{n}` is defined multiple times in this block",
+                            self.toks[raw_start].pos
+                        ));
+                    }
+                    self.enter_local_const(&n, val);
+                    // `start` is the `const`/`static` keyword (past any `pub`),
+                    // so the main parse, which drops a `pub` before it, matches
+                    // on the same index.
+                    frame.push(LocalConst { start, end, name: n });
+                    i = end;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        Ok(frame)
+    }
+
+    /// True when the token at the cursor begins a `const`/immutable-`static`
+    /// item that `scan_block_consts` already folded for this block, so the main
+    /// parse should skip it. A `const` a block does not own (a nested block's,
+    /// seen from outside) is not in any active frame and returns false.
+    fn at_local_const(&self) -> bool {
+        self.local_consts.iter().any(|f| f.iter().any(|c| c.start == self.i))
+    }
+
+    /// The token index of the item at `i`, skipping a `pub` / `pub(..)` before
+    /// it. Used by `scan_block_consts`, which needs the keyword's own index.
+    fn skip_pub_at(&self, mut i: usize) -> usize {
+        if matches!(self.toks.get(i).map(|t| &t.tok), Some(Tok::Ident(p)) if p == "pub") {
+            i += 1;
+            if self.toks.get(i).map(|t| &t.tok) == Some(&Tok::LParen) {
+                let mut d = 0u32;
+                while i < self.toks.len() {
+                    match &self.toks[i].tok {
+                        Tok::LParen => d += 1,
+                        Tok::RParen => {
+                            d -= 1;
+                            if d == 0 {
+                                i += 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+        }
+        i
+    }
+
+    /// Enter a folded block-scoped constant in the live tables, noting the
+    /// previous value so `pop_name_scope` can restore it when the block ends.
+    fn enter_local_const(&mut self, name: &str, val: Option<crate::consts::ConstVal>) {
+        use crate::consts::ConstVal;
+        // The name is in the value namespace, but `consts`/`const_bools`/
+        // `const_chars` are three tables; a name could in principle be in two
+        // (never in one well-typed program). Note all three so the restore is
+        // exact.
+        if let Some(frame) = self.name_scopes.last_mut() {
+            frame.push(NameScope::ConstInt(name.to_string(), self.consts.get(name).copied()));
+            frame.push(NameScope::ConstBool(name.to_string(), self.const_bools.get(name).copied()));
+            frame.push(NameScope::ConstChar(name.to_string(), self.const_chars.get(name).copied()));
+        }
+        // A `const` that does not fold (a call, a cycle) is left out, so a use
+        // is diagnosed the way an unresolved constant is; drop any outer value
+        // of the same name so the shadowing is honest.
+        self.consts.remove(name);
+        self.const_bools.remove(name);
+        self.const_chars.remove(name);
+        match val {
+            Some(ConstVal::Int(v)) => {
+                self.consts.insert(name.to_string(), v);
+            }
+            Some(ConstVal::Bool(v)) => {
+                self.const_bools.insert(name.to_string(), v);
+            }
+            Some(ConstVal::Char(v)) => {
+                self.const_chars.insert(name.to_string(), v);
+            }
+            None => {}
+        }
     }
 
     /// Record the current state of one `Vec`/pointer name table entry before a
@@ -1470,6 +1690,30 @@ impl Parser {
                         }
                         None => {
                             self.args_vecs.remove(&n);
+                        }
+                    },
+                    NameScope::ConstInt(n, prev) => match prev {
+                        Some(v) => {
+                            self.consts.insert(n, v);
+                        }
+                        None => {
+                            self.consts.remove(&n);
+                        }
+                    },
+                    NameScope::ConstBool(n, prev) => match prev {
+                        Some(v) => {
+                            self.const_bools.insert(n, v);
+                        }
+                        None => {
+                            self.const_bools.remove(&n);
+                        }
+                    },
+                    NameScope::ConstChar(n, prev) => match prev {
+                        Some(v) => {
+                            self.const_chars.insert(n, v);
+                        }
+                        None => {
+                            self.const_chars.remove(&n);
                         }
                     },
                 }
@@ -1583,12 +1827,38 @@ impl Parser {
             // visibility and parse the item. Guarded on what follows so a
             // variable named `pub` (which rmc, unlike rustc, would otherwise
             // allow) is not swallowed.
-            if self.peek() == Some(&Tok::Ident("pub".into()))
-                && matches!(self.peek2(), Some(Tok::Fn))
-            {
-                self.skip_pub()?;
-                self.parse_stmt_into(&mut stmts)?;
-                continue;
+            if self.peek() == Some(&Tok::Ident("pub".into())) {
+                let p2 = self.peek2().cloned();
+                if p2 == Some(Tok::Fn) {
+                    self.skip_pub()?;
+                    self.parse_stmt_into(&mut stmts)?;
+                    continue;
+                }
+                // `pub const` / `pub static`: drop the `pub` and let the local
+                // constant skip below consume the item (already folded).
+                if p2 == Some(Tok::Const)
+                    || matches!(p2, Some(Tok::Ident(ref id)) if id == "static")
+                {
+                    self.skip_pub()?;
+                    continue;
+                }
+            }
+            // A `const`/immutable-`static` item directly in the block. Its value
+            // was folded by `scan_block_consts` when the block began (rustc
+            // hoists block items), so skip the item here; the constant is
+            // substituted at every use, so it has no statement.
+            if self.at_local_const() {
+                let end = self
+                    .local_consts
+                    .iter()
+                    .rev()
+                    .flat_map(|f| f.iter().rev())
+                    .find(|c| c.start == self.i)
+                    .map(|c| c.end);
+                if let Some(end) = end {
+                    self.i = end;
+                    continue;
+                }
             }
             // A stray `;` is an empty statement; Rust accepts any number of
             // them between statements and at the end of a block.

@@ -5380,6 +5380,51 @@ fn a_duplicate_const_is_rejected() {
 }
 
 #[test]
+fn a_block_const_is_folded_like_a_top_level_one() {
+    // A `const` inside a function body is an item rustc hoists for the block, so
+    // it is usable before its declaration and has no storage of its own.
+    let out = asm("fn main() -> i64 { const N: i64 = 7; return N; }");
+    let body = main_body(&out);
+    assert!(body.contains("$7"), "the value is folded in:\n{body}");
+
+    let fwd = asm("fn main() -> i64 { let x = N; const N: i64 = 9; return x; }");
+    assert!(main_body(&fwd).contains("$9"), "forward reference folded:\n{fwd}");
+
+    let stat = asm("fn main() -> i64 { static N: i64 = 4; return N; }");
+    assert!(main_body(&stat).contains("$4"), "an immutable `static` folds too:\n{stat}");
+}
+
+#[test]
+fn a_block_const_shadows_a_top_level_one() {
+    // A block-scoped constant shadows an outer one until the block ends, then
+    // the outer value returns: the inner `N` folds to 2, the outer to 1.
+    let out = asm("const N: i64 = 1; fn main() -> i64 { let a: i64 = { const N: i64 = 2; N }; return a + N; }");
+    let body = main_body(&out);
+    assert!(body.contains("$2"), "the inner shadow is folded:\n{body}");
+    assert!(body.contains("$1"), "the outer value returns after the block:\n{body}");
+}
+
+#[test]
+fn a_duplicate_block_const_is_rejected() {
+    let err = compile_to_asm(
+        "fn main() -> i64 { const N: i64 = 2; const N: i64 = 3; return N; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("defined multiple times"), "got: {err}");
+}
+
+#[test]
+fn a_block_const_is_out_of_scope_after_its_block() {
+    let err = compile_to_asm(
+        "fn main() -> i64 { { const N: i64 = 2; } return N; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("N"), "got: {err}");
+}
+
+#[test]
 fn a_value_loop_binds_its_break_value() {
     // `loop` is an expression: the `break` value is stored into the loop's
     // result slot, which the code after the loop reads.

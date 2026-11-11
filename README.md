@@ -215,6 +215,7 @@ python3 tools/fuzz.py --mode order --n 500 --seed 1
 python3 tools/fuzz.py --mode shift --n 500 --seed 1
 python3 tools/fuzz.py --mode semi --n 500 --seed 1
 python3 tools/fuzz.py --mode boolbit --n 500 --seed 1
+python3 tools/fuzz.py --mode localconst --n 500 --seed 1
 # also exercise the trap codegen: --bounds-checks and --overflow-checks runs
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 python3 tools/fuzz.py --mode robust
@@ -308,7 +309,8 @@ operators or a small runtime helper, so `i64::MIN.abs()` maps to itself as in
 `rustc -O`);
 `mut` enforcement and definite
 initialisation; `const` items (folded to a value and substituted at every use,
-including array lengths and `match` patterns) and an immutable `static` (lowered
+including array lengths and `match` patterns; also inside a function body, where
+it is in scope for the rest of the block) and an immutable `static` (lowered
 to a `const`; `static mut` is rejected); `type` aliases (a transparent
 second name for any type, resolved at parse time, usable before declaration);
 references (`&T` / `&mut T`, `&e`, `*e`,

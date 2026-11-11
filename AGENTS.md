@@ -63,6 +63,7 @@ python3 tools/fuzz.py --mode ptr --n 500 --seed 1
 python3 tools/fuzz.py --mode char --n 500 --seed 1
 python3 tools/fuzz.py --mode semi --n 500 --seed 1
 python3 tools/fuzz.py --mode boolbit --n 500 --seed 1
+python3 tools/fuzz.py --mode localconst --n 500 --seed 1
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 
 # robustness / soundness: rmc must error cleanly, never crash
@@ -1231,7 +1232,8 @@ desugaring: integer, binding, payload-binding, `else if let` chain,
 side-effecting scrutinee, and value position) and `consts` (top-level `const`
 items in expression position, as array lengths and repeat counts, as a `for`
 bound, in conditions, and as `match` patterns, including a negative constant and
-one defined in terms of another) guard the
+one defined in terms of another, plus a `const`/`static` declared inside a block,
+usable before its declaration and shadowing an outer one) guard the
 front-end/codegen fixes below. There is no separate rmc dialect: each case is a
 single `.rs` file that rmc compiles directly, and rustc compiles the same file
 as the reference, so rmc can stand in for rustc on the supported subset. When

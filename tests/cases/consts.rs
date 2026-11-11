@@ -62,4 +62,18 @@ fn main() {
     // A `static` behaves exactly like the `const` it lowers to.
     println!("{}", S);
     println!("{}", S2);
+
+    // Block-scoped constants: a `const`/immutable-`static` inside a function
+    // body is folded and in scope for the rest of its block, and usable before
+    // its declaration (rustc hoists block items). An inner block shadows an
+    // outer constant of the same name; the outer value returns when it ends.
+    let f = LATER;
+    const LOCAL: i64 = 7;
+    static LOCAL_STATIC: i64 = 8;
+    const LATER: i64 = 9;
+    let shadow = {
+        const LOCAL: i64 = 100;
+        LOCAL
+    };
+    println!("{}", LOCAL + LOCAL_STATIC + f + shadow);
 }
