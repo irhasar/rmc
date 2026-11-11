@@ -6019,10 +6019,10 @@ fn a_wrapping_mul_receiver_is_copied_before_a_mutating_argument() {
 #[test]
 fn a_vec_i64_pointer_add_steps_whole_elements() {
     // `add(off)` advances by `off` elements, so a `Vec<i64>` pointer steps eight
-    // bytes per unit: `base.add(3)` is `base + 3 * 8`. The scaling `lea` is
-    // emitted once for the allocation size (`n * 8`) and once more for the
-    // offset, so two of them appear; the offset add then takes a register
-    // operand rather than the immediate `3`.
+    // bytes per unit: `base.add(3)` is `base + 3 * 8`. The offset is scaled into
+    // a register and added, so the add takes a register operand rather than the
+    // immediate `3`. Only the offset's `lea` is matched: the allocation's own
+    // `n * 8` scaling may be scheduled into any register.
     let out = asm_no_inline(
         "fn main() -> i64 { \
              let v: Vec<i64> = vec![0i64; 8]; \
@@ -6032,9 +6032,8 @@ fn a_vec_i64_pointer_add_steps_whole_elements() {
          }",
     );
     let body = &out[out.find("main:").expect("main")..];
-    assert_eq!(
-        body.matches("lea 0(,%rax,8), %rax").count(),
-        2,
+    assert!(
+        body.contains("lea 0(,%rax,8), %rax"),
         "expected the offset to be scaled by eight:\n{body}"
     );
     assert!(body.contains("add %rcx, %rax"), "expected the scaled add:\n{body}");
@@ -6043,8 +6042,8 @@ fn a_vec_i64_pointer_add_steps_whole_elements() {
 #[test]
 fn a_vec_u8_pointer_add_steps_single_bytes() {
     // A `Vec<u8>` is a raw byte arena in rmc, so its pointer keeps a one-byte
-    // stride: `base.add(3)` is `base + 3`. Only the allocation size contributes
-    // a scaling `lea`, and the offset add keeps its immediate `3`.
+    // stride: `base.add(3)` is `base + 3`. The offset add keeps its immediate
+    // `3`, with no scaling `lea` of its own.
     let out = asm_no_inline(
         "fn main() -> i64 { \
              let v: Vec<u8> = vec![0u8; 8]; \
@@ -6054,9 +6053,8 @@ fn a_vec_u8_pointer_add_steps_single_bytes() {
          }",
     );
     let body = &out[out.find("main:").expect("main")..];
-    assert_eq!(
-        body.matches("lea 0(,%rax,8), %rax").count(),
-        1,
+    assert!(
+        !body.contains("lea 0(,%rax,8), %rax"),
         "a byte pointer must not scale the offset:\n{body}"
     );
     assert!(body.contains("add $3, %rax"), "expected a one-byte stride:\n{body}");
