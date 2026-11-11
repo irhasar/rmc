@@ -265,6 +265,7 @@ fn run_mir_text(opts: &Options, mir: &str) -> Result<(), String> {
     rmc::mir::fold_accumulators(&mut prog);
     rmc::mir::close_counted_loops(&mut prog, opts.overflow_checks);
     rmc::mir::jump_thread(&mut prog);
+    rmc::mir::prune_unreachable(&mut prog);
     rmc::mir::rotate_loops(&mut prog);
     rmc::mir::layout_blocks(&mut prog);
     let mir_opts = rmc::mir_codegen::Options {

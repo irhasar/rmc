@@ -5796,6 +5796,77 @@ impl Function {
     }
 }
 
+/// Drop blocks unreachable from the entry and renumber what is left.
+///
+/// `jump_thread` retargets branches past its empty trampoline blocks but leaves
+/// the trampolines in place; with no predecessors they become unreachable. They
+/// are not merely dead weight: `rotate_loops` and `close_counted_loops` seed
+/// their dominator sets with "every block dominates every block" and refine
+/// downward, and an unreachable block can never be refined, so it keeps
+/// dominating *everything*. A dead block numbered below a loop then appears to
+/// dominate its header, which makes the loop look like it has a second entry
+/// and silently blocks rotation. Pruning restores the single-entry property.
+pub fn prune_unreachable(prog: &mut Program) {
+    for f in &mut prog.funcs {
+        f.prune_unreachable();
+    }
+}
+
+impl Function {
+    fn prune_unreachable(&mut self) {
+        let n = self.blocks.len();
+        if n == 0 {
+            return;
+        }
+        let succs: Vec<Vec<u32>> = self.blocks.iter().map(|b| successors(&b.term)).collect();
+        let mut live = vec![false; n];
+        live[0] = true;
+        let mut stack = vec![0usize];
+        while let Some(b) = stack.pop() {
+            for &s in &succs[b] {
+                if !live[s as usize] {
+                    live[s as usize] = true;
+                    stack.push(s as usize);
+                }
+            }
+        }
+        if live.iter().all(|&l| l) {
+            return;
+        }
+        let mut map = vec![u32::MAX; n];
+        let mut kept: Vec<BasicBlock> = Vec::with_capacity(n);
+        for b in 0..n {
+            if live[b] {
+                map[b] = kept.len() as u32;
+                kept.push(self.blocks[b].clone());
+            }
+        }
+        for blk in &mut kept {
+            remap_targets(&mut blk.term, &map);
+        }
+        self.blocks = kept;
+    }
+}
+
+/// Rewrite every successor through `map`. Only called with targets that are
+/// themselves reachable, so `u32::MAX` is never read.
+fn remap_targets(t: &mut Terminator, map: &[u32]) {
+    let m = |b: u32| map[b as usize];
+    match t {
+        Terminator::Goto(b) => *b = m(*b),
+        Terminator::SwitchInt { targets, otherwise, .. } => {
+            for (_, b) in targets.iter_mut() {
+                *b = m(*b);
+            }
+            *otherwise = m(*otherwise);
+        }
+        Terminator::Call { target: Some(b), .. } => *b = m(*b),
+        Terminator::Assert { target, .. } => *target = m(*target),
+        Terminator::Drop { target, .. } => *target = m(*target),
+        _ => {}
+    }
+}
+
 /// Run loop-invariant code motion over the whole crate, to a fixpoint: hoisting
 /// a binding can make the loads that read through it invariant on the next
 /// round.
