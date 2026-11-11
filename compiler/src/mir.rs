@@ -1636,7 +1636,7 @@ fn parse_fn(lines: &[String], start: usize) -> Result<(Function, usize), String>
             blocks[n as usize].term = term;
             continue;
         }
-        match parse_line_stmt(t) {
+        match parse_line_stmt(t, &locals) {
             Ok(Some(s)) => blocks[n as usize].stmts.push(s),
             Ok(None) => {}
             Err(e) => {
@@ -1718,16 +1718,68 @@ fn parse_bb_id(s: &str) -> Option<u32> {
 
 /// Parse one body line as a statement, if it is one. A call is a terminator,
 /// not a statement, and is handled by [`parse_call_terminator`].
-fn parse_line_stmt(t: &str) -> Result<Option<Stmt>, String> {
+fn parse_line_stmt(t: &str, locals: &[LocalDecl]) -> Result<Option<Stmt>, String> {
     if is_ignorable(t) || parse_call_terminator(t).is_some() {
         return Ok(None);
     }
     if let Some((lhs, rhs)) = split_assign(t) {
         let dest = parse_place(lhs)?;
         let rv = parse_rvalue(rhs)?;
+        let rv = reclassify_enum_aggregate(rv, rhs, &dest, locals);
         return Ok(Some(Stmt::Assign(dest, rv)));
     }
     Err("unrecognised statement".to_string())
+}
+
+/// rustc prints a named-field enum variant (`e::Some { x }`) as a brace
+/// aggregate, so by shape alone it is indistinguishable from a struct literal.
+/// The destination's declared type disambiguates: when it is the enum itself,
+/// the aggregate is the variant, and the back end must write the discriminant.
+/// A struct spelled with a module path (`a::A { .. }`) has a path *prefix* (`a`)
+/// that differs from its own type (`a::A`), so it stays an aggregate.
+fn reclassify_enum_aggregate(rv: Rvalue, rhs: &str, dest: &Place, locals: &[LocalDecl]) -> Rvalue {
+    let Rvalue::Aggregate(ops) = rv else { return rv };
+    let Some(brace) = rhs.find('{') else { return Rvalue::Aggregate(ops) };
+    let name = normalize_fmt_struct(rhs[..brace].trim());
+    // A literal names an enum variant only when a `::variant` segment follows
+    // the type path once its generics are stripped: `Option::<i64>::Some`
+    // reduces to `Option::Some` (a variant), while `G::<T>` reduces to `G` (a
+    // plain generic struct). Splitting the raw name would take `G::<T>`'s
+    // turbofish as the variant and add a phantom tag to a struct.
+    let base = strip_generics(name);
+    let Some((prefix, variant)) = base.rsplit_once("::") else {
+        return Rvalue::Aggregate(ops);
+    };
+    if prefix.is_empty() || variant.is_empty() {
+        return Rvalue::Aggregate(ops);
+    }
+    if dest_enum_name(locals, dest).as_deref() != Some(prefix) {
+        return Rvalue::Aggregate(ops);
+    }
+    Rvalue::Enum { name: name.to_string(), ops }
+}
+
+/// The enum name a place's type names, following at most a chain of derefs.
+/// A field or index projection lands *inside* an aggregate, where a variant's
+/// tag is not the whole value, so those yield `None` and the caller leaves the
+/// aggregate alone.
+fn dest_enum_name(locals: &[LocalDecl], p: &Place) -> Option<String> {
+    let mut ty: &Ty = &locals.get(p.local as usize)?.ty;
+    for proj in &p.proj {
+        match proj {
+            Proj::Deref => {
+                ty = match ty {
+                    Ty::Ref(t) | Ty::Ptr(t) => t,
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        }
+    }
+    match ty {
+        Ty::Struct(n) => Some(n.clone()),
+        _ => None,
+    }
 }
 
 /// `_4 = f(args) -> [return: bbX, unwind ...]` is a call terminator.
@@ -6157,3 +6209,4 @@ fn rv_operands(rv: &Rvalue) -> Vec<Place> {
     }
     v
 }
+

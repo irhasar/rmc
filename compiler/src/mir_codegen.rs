@@ -86,6 +86,11 @@ struct FnGen<'a> {
     /// Local index -> spill slot, for a promoted *caller-saved* local (spilled
     /// around a call).
     caller_spill: HashMap<u32, i64>,
+    /// True while emitting a destructor tree. The tree makes calls that clobber
+    /// the caller-saved registers, and the promoted caller-saved locals are
+    /// spilled once at its start, so a read inside the tree must take the value
+    /// from the spill slot rather than the (by then clobbered) register.
+    in_drop: bool,
     /// Locals that are an operand of a loop's counted comparison (the counter
     /// and its bound), promoted first.
     loop_operands: Vec<u32>,
@@ -1217,6 +1222,7 @@ impl<'a> FnGen<'a> {
             promo: HashMap::new(),
             shadow: HashMap::new(),
             caller_spill: HashMap::new(),
+            in_drop: false,
             loop_operands: Vec::new(),
             allocates: func_calls(prog, &func.name, "alloc"),
             saved_regs: 0,
@@ -1266,7 +1272,18 @@ impl<'a> FnGen<'a> {
     /// A scalar local's home: its promoted register or its frame slot.
     fn local_operand(&self, local: u32) -> String {
         match self.promo.get(&local) {
-            Some(p) => p.reg.to_string(),
+            Some(p) => {
+                // Inside a destructor tree the caller-saved registers have been
+                // clobbered by the calls already made, but the local's value was
+                // spilled to its caller-spill slot at the tree's start. Read the
+                // slot there instead of the stale register.
+                if self.in_drop && p.caller_saved {
+                    if let Some(slot) = self.caller_spill.get(&local) {
+                        return self.off(*slot);
+                    }
+                }
+                p.reg.to_string()
+            }
             None => self.off(self.local_base(local)),
         }
     }
@@ -4009,7 +4026,10 @@ impl<'a> FnGen<'a> {
             // would overwrite the outer's saved value with an argument register
             // that already holds an address.
             let saved = self.spill_caller_saved();
+            let was_in_drop = self.in_drop;
+            self.in_drop = true;
             self.gen_drop_glue(place, &ty)?;
+            self.in_drop = was_in_drop;
             self.restore_caller_saved(&saved);
         }
         Ok(())
