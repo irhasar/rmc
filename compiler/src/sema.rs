@@ -1863,6 +1863,29 @@ impl Sema {
                 }
             }
             Expr::Bin(op, a, b) => {
+                // `&&`/`||` short-circuit: the right operand runs only when the
+                // left does not decide the result, so a binding initialized
+                // only in the right operand is not definitely initialized after
+                // the expression. Merge the skipped path (the left operand's
+                // state) with the evaluated path (both operands) before the
+                // caller snapshots the state, or `while flag && { x = 7; true }
+                // {}` would report `x` initialized even when `flag` is false.
+                if matches!(op, BinOp::And | BinOp::Or) {
+                    let ta = self.check_expr(a, scope)?;
+                    let skipped = Self::init_snapshot(scope);
+                    let tb = self.check_expr(b, scope)?;
+                    let evaluated = Self::init_snapshot(scope);
+                    if ta != Type::Bool || tb != Type::Bool {
+                        return Err(format!(
+                            "logical operator expects `bool`, found {ta:?} and {tb:?}"
+                        ));
+                    }
+                    for (i, bl) in scope.iter_mut().enumerate() {
+                        bl.init = skipped.get(i).copied().unwrap_or(false)
+                            && evaluated.get(i).copied().unwrap_or(false);
+                    }
+                    return Ok(Type::Bool);
+                }
                 let ta = self.check_expr(a, scope)?;
                 let tb = self.check_expr(b, scope)?;
                 use BinOp::*;
@@ -3266,11 +3289,12 @@ fn stmt_contains_continue(s: &Stmt, label: Option<&str>, nested: bool) -> bool {
         }
         Stmt::For { start, end, body, label: lbl, .. } => {
             let outward = lbl.as_deref() != label;
-            // The range bounds run before the loop, so a bound that cannot
-            // complete makes the body unreachable.
-            (outward
-                && (expr_contains_continue(start, label, nested)
-                    || expr_contains_continue(end, label, nested)))
+            // The range bounds run *before* the loop's own label enters scope,
+            // so a `continue` naming `label` there targets the enclosing loop
+            // even when the `for` reuses that label. Only the body is shadowed.
+            // A bound that cannot complete makes the body unreachable.
+            expr_contains_continue(start, label, nested)
+                || expr_contains_continue(end, label, nested)
                 || (outward
                     && expr_can_fall(start)
                     && expr_can_fall(end)
