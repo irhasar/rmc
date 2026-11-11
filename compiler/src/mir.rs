@@ -958,6 +958,25 @@ fn canonicalize_types(prog: &mut Program) {
         }
     }
 
+    // A spelling in a crate-root body is absolute: the printer strips the path
+    // prefix of the *mentioning* item, and the crate root has none to strip, so
+    // `a::A` there is `crate::a::A`. Collect those so the per-body loop can tell
+    // a root type from a nested one with the same tail.
+    let mut root_names: BTreeSet<String> = BTreeSet::new();
+    for f in &prog.funcs {
+        if !f.module.is_empty() {
+            continue;
+        }
+        for l in &f.locals {
+            collect_struct_names(&l.ty, &mut root_names);
+        }
+        for b in &f.blocks {
+            for s in &b.stmts {
+                collect_stmt_tys(s, &mut root_names);
+            }
+        }
+    }
+
     for f in &mut prog.funcs {
         // The printer spells a type *relative to the item that mentions it*, so
         // a qualified spelling can be relative too: inside `outer::get`, the
@@ -979,6 +998,15 @@ fn canonicalize_types(prog: &mut Program) {
         let mut fcanon = canon.clone();
         for n in &body_names {
             if !n.contains("::") || mods.is_empty() {
+                continue;
+            }
+            // A short `n` here means the *root* type `n` when one exists: rustc
+            // gives the root type the short spelling and prints a colliding
+            // nested type in full (inside `outer`, `crate::a::A` stays `a::A`
+            // while `outer::a::A` becomes `outer::a::A`). Adopting `m::n` then
+            // would hand the root type the nested type's layout - a miscompile.
+            // Only adopt `m::n` when no root `n` competes.
+            if root_names.contains(n) {
                 continue;
             }
             for m in &mods {
@@ -1840,7 +1868,18 @@ fn reclassify_enum_aggregate(rv: Rvalue, rhs: &str, dest: &Place, locals: &[Loca
         .map(|(p, v)| (p.to_string(), v.to_string()))
         .filter(|(p, v)| !p.is_empty() && !v.is_empty());
     let is_variant = match (split, dest_enum_name(locals, dest)) {
-        (Some((prefix, _)), Some(ty)) => prefix == ty,
+        // The literal is spelled relative to the item that mentions it, so a
+        // nested enum's variant prints without the enclosing module: inside
+        // `outer`, `outer::a::E::X` prints as `a::E::X` while the destination
+        // local prints `outer::a::E` in full. Matching the prefix against the
+        // destination alone would then miss, demote the variant to a plain
+        // aggregate and drop its tag. Accept a prefix that is a `::`-suffix of
+        // the destination type as well: `a::E` names the tail of
+        // `outer::a::E`. The destination being strictly longer keeps the exact
+        // match from being widened.
+        (Some((prefix, _)), Some(ty)) => {
+            prefix == ty || ty.ends_with(&format!("::{prefix}"))
+        }
         (Some(_), None) => parsed_as_enum,
         (None, _) => false,
     };
