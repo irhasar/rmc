@@ -1434,6 +1434,17 @@ The checks, all in `sema.rs`:
   the uninitialized-array-filled-in-a-loop pattern (`let mut a: [i64; N]; while
   ... { a[i] = ..; } a[0]`), which rustc also rejects. Write the array with `= [0;
   N]` instead; the corpus cases do.
+- **A short circuit has two outcome states, and a chained guard needs both.**
+  `&&`/`||` run their right operand on only one path, so `check_expr` records
+  the true and false entry states in `cond_then_init`/`cond_else_init` for the
+  `if`/`while` that branches on the condition. Checking a right operand against
+  the scope's merged "either path" state loses a write the guard guarantees:
+  `(a && { x = 7; true }) && x == 7` reaches the comparison only where the inner
+  `&&` was true, yet the merged state says `x` is uninitialized (E0381). Compose
+  the outcomes per operand instead — check the right operand under the left-true
+  state for `&&` (left-false for `||`), then merge for the true, false and
+  post-expression states. The post-expression state stays conservative, so a
+  value use (`let b = a && { x = 7; true }`) still cannot assume `x` is set.
 - **Constant array bounds.** A constant index outside the array (`a[5]` on a
   `[i64; 2]`, the negated `a[-1]`, or an expression like `a[1 + 4]`) is a compile
   error, with or without `--bounds-checks`, matching rustc (`E0080`/`E0608`).
