@@ -114,6 +114,64 @@ struct LetTarget {
     by_field: bool,
 }
 
+/// How a byte referent loads: `u8` zero-extends and `i8` sign-extends, so a
+/// `*const u8` read of `0xFF` is `255` and a `*const i8` read is `-1`. A
+/// non-byte referent returns `None` and uses a plain 64-bit load.
+enum LoadKind {
+    Zero,
+    Sign,
+}
+
+fn byte_load(ty: &Type) -> Option<LoadKind> {
+    match ty {
+        Type::U8 => Some(LoadKind::Zero),
+        Type::I8 => Some(LoadKind::Sign),
+        _ => None,
+    }
+}
+
+/// True when `target` is a byte-referent dereference, so its store must write
+/// only the low byte (`movb`) rather than a word: a `*mut u8` write leaves the
+/// other seven bytes of the slot alone.
+fn is_byte_store(target: &Expr) -> bool {
+    matches!(target, Expr::Deref { ty, .. } if matches!(ty, Type::U8 | Type::I8))
+}
+
+/// The value type a byte referent yields: `i64` (see `byte_load`). Mirrors
+/// `sema::byte_value_ty`; the byte-ness is a property of the referent, not of
+/// the value the program manipulates.
+fn byte_value_ty(t: &Type) -> Type {
+    match t {
+        Type::U8 | Type::I8 => Type::I64,
+        other => other.clone(),
+    }
+}
+
+/// True for an integer width narrower than a machine word. A value of such a
+/// type is kept truncated to its width in a 64-bit register, so a later use
+/// (printing, division, a comparison) sees the same value rustc would.
+fn is_narrow_int(t: &Type) -> bool {
+    matches!(t, Type::Int { bits, .. } if *bits < 64)
+}
+
+/// The bit width of a narrow integer, or `None` for anything else.
+fn narrow_bits(t: &Type) -> Option<u16> {
+    match t {
+        Type::Int { bits, .. } if *bits < 64 => Some(*bits),
+        _ => None,
+    }
+}
+
+/// True for a 64-bit general-purpose register name, so `mov %rax, %rax` can be
+/// dropped as a no-op while `mov %eax, %eax` (a zero-extend) is kept.
+fn is_64bit_reg(s: &str) -> bool {
+    matches!(
+        s,
+        "%rax" | "%rbx" | "%rcx" | "%rdx" | "%rsi" | "%rdi" | "%rbp" | "%rsp"
+            | "%r8" | "%r9" | "%r10" | "%r11" | "%r12" | "%r13" | "%r14" | "%r15"
+    )
+}
+
 impl Codegen {
     pub fn new() -> Self {
         Codegen {
@@ -257,7 +315,7 @@ impl Codegen {
             Expr::Cast(_, to) => Some(to.clone()),
             Expr::Loop(_, _, lty, _) => Some(lty.clone()),
             Expr::Un(op, inner) => match op {
-                UnOp::Neg => Some(Type::I64),
+                UnOp::Neg => Self::static_ty(inner).filter(|t| is_narrow_int(t)).or(Some(Type::I64)),
                 UnOp::Not => Self::static_ty(inner),
             },
             Expr::Bin(op, a, b) => match op {
@@ -271,10 +329,19 @@ impl Codegen {
                     match (Self::static_ty(a), Self::static_ty(b)) {
                         (Some(Type::Bool), _) | (_, Some(Type::Bool)) => Some(Type::Bool),
                         (Some(Type::I64), _) | (_, Some(Type::I64)) => Some(Type::I64),
+                        (Some(t), _) => Some(t),
+                        (_, Some(t)) => Some(t),
                         _ => None,
                     }
                 }
-                _ => Some(Type::I64),
+                // Arithmetic, shifts and `wrapping_mul` keep a narrow integer
+                // width, so `gen_expr` truncates the 64-bit result to it. A
+                // 64-bit or unknown operand is `i64`.
+                _ => match (Self::static_ty(a), Self::static_ty(b)) {
+                    (Some(t), _) if is_narrow_int(&t) => Some(t),
+                    (_, Some(t)) if is_narrow_int(&t) => Some(t),
+                    _ => Some(Type::I64),
+                },
             },
             // An element of an array has the array's element type, which
             // `array_elem_ty` resolves (it looks through a reference too).
@@ -685,8 +752,10 @@ impl Codegen {
             if let Some(rest) = text.strip_prefix("mov ") {
                 if let Some((src, dst)) = rest.split_once(',') {
                     let (src, dst) = (src.trim(), dst.trim());
-                    // `mov %r, %r` with the same operand twice is a no-op.
-                    if src == dst && src.starts_with('%') {
+                    // `mov %r, %r` with the same operand twice is a no-op — but
+                    // only for a 64-bit register: `mov %eax, %eax` is a real
+                    // instruction that zero-extends into `%rax`.
+                    if src == dst && is_64bit_reg(src) {
                         continue;
                     }
                     // A `mov` whose source and destination are the reverse of
@@ -1793,11 +1862,15 @@ Expr::PatScrutinee(_) => {
             self.gen_addr(target);
             self.line("mov %rax, %rcx");
             self.pop_to("%rax");
-            self.line("mov %rax, (%rcx)");
+            if is_byte_store(target) {
+                self.line("movb %al, (%rcx)");
+            } else {
+                self.line("mov %rax, (%rcx)");
+            }
             return;
         }
         if let (Some(op), Some(k)) = (self.simple_operand(value), off) {
-            if op.starts_with('%') || op.starts_with('$') {
+            if (op.starts_with('%') || op.starts_with('$')) && !is_byte_store(target) {
                 self.gen_addr(target);
                 let disp = if k == 0 { String::new() } else { format!("{k}") };
                 self.store_operand(&op, &format!("{disp}(%rax)"));
@@ -1808,7 +1881,11 @@ Expr::PatScrutinee(_) => {
         self.push_rax();
         self.gen_expr(value);
         self.pop_to("%rcx");
-        self.line("mov %rax, (%rcx)");
+        if is_byte_store(target) {
+            self.line("movb %al, (%rcx)");
+        } else {
+            self.line("mov %rax, (%rcx)");
+        }
     }
 
     /// Assign aggregate `value` (an address in `%rax`) into aggregate place
@@ -1943,7 +2020,81 @@ Expr::PatScrutinee(_) => {
         }
     }
 
+    /// Generate `e` and, when its result is a narrow integer, truncate the
+    /// 64-bit register to that width (sign- or zero-extended back to 64 bits).
+    /// rustc keeps a `u8`/`u16`/`i32`/... value wrapped at its width, so a
+    /// later use — printing with `{}`, a division, an ordering comparison, a
+    /// cast to a wider type — must see the wrapped value, not the raw 64-bit
+    /// arithmetic result. A 64-bit or non-integer result is left alone, so an
+    /// `i64` program is unaffected.
     fn gen_expr(&mut self, e: &Expr) -> Type {
+        let ty = self.gen_expr_raw(e);
+        // The narrowing key is `static_ty`, which models a narrow arithmetic
+        // result (`gen_expr_raw` reports a bare `i64` for a `Bin`, since the
+        // emitted instruction is 64-bit).
+        self.narrow_trunc(e, "%rax");
+        ty
+    }
+
+    /// Truncate `reg` back to `e`'s narrow width when `e` is a genuine
+    /// arithmetic result that may have wrapped past it. A literal, a variable
+    /// load or a byte load is already in range, so only the forms `may_wrap`
+    /// reports need this; the `lea`/`accumulate` fast paths in
+    /// `gen_expr_into_reg` call this directly because they bypass `gen_expr`.
+    fn narrow_trunc(&mut self, e: &Expr, reg: &str) {
+        if let Some(st) = Self::static_ty(e) {
+            if let Some(bits) = narrow_bits(&st) {
+                if Self::may_wrap(e) {
+                    self.truncate_reg(reg, bits, matches!(st, Type::Int { signed: true, .. }));
+                }
+            }
+        }
+    }
+
+    /// True for the expression forms whose 64-bit result may exceed a narrow
+    /// integer's range, so the value needs truncating. A literal, a variable, a
+    /// field, a dereference, a call and a cast are already in range (or are the
+    /// cast's own job); an `Index` of a narrow array element is too.
+    fn may_wrap(e: &Expr) -> bool {
+        match e {
+            Expr::Bin(..) | Expr::Un(UnOp::Neg, _) | Expr::Un(UnOp::Not, _) => true,
+            Expr::If(_, then, Some(els)) => {
+                Self::may_wrap_tail(then) || Self::may_wrap_tail(els)
+            }
+            Expr::Block(b) | Expr::MatchBoundary(b, _) => Self::may_wrap_tail(b),
+            _ => false,
+        }
+    }
+
+    fn may_wrap_tail(b: &Block) -> bool {
+        b.tail.as_ref().map(|t| Self::may_wrap(t)).unwrap_or(false)
+    }
+
+    /// Truncate `%rax` to the low `bits` and extend back to 64 bits, signed or
+    /// unsigned. `bits` is 8, 16 or 32 (a narrower integer is not modelled).
+    fn truncate_to(&mut self, bits: u16, signed: bool) {
+        self.truncate_reg("%rax", bits, signed);
+    }
+
+    /// Truncate the 64-bit register `reg` to the low `bits` and extend back to
+    /// 64 bits, signed or unsigned. `reg` must be a full 64-bit name (`%rax`,
+    /// `%r12`); the sub-register names are derived from it.
+    fn truncate_reg(&mut self, reg: &str, bits: u16, signed: bool) {
+        let ext = match (bits, signed) {
+            (8, true) => format!("movsbq {}, {reg}", reg8(reg)),
+            (8, false) => format!("movzbq {}, {reg}", reg8(reg)),
+            (16, true) => format!("movswq {}, {reg}", reg16(reg)),
+            (16, false) => format!("movzwq {}, {reg}", reg16(reg)),
+            (32, true) => format!("movslq {}, {reg}", r32(reg)),
+            // A 32-bit value is already zero-extended in `reg` by any 32-bit
+            // operation; a 64-bit result needs its high half cleared.
+            (32, false) => format!("mov {}, {}", r32(reg), r32(reg)),
+            _ => return,
+        };
+        self.line(&ext);
+    }
+
+    fn gen_expr_raw(&mut self, e: &Expr) -> Type {
         match e {
             Expr::ArrayList(_) => unreachable!("sema rewrites ArrayList into a block"),
             Expr::TupleLit(_) => unreachable!("sema rewrites TupleLit into a StructLit"),
@@ -2194,10 +2345,15 @@ Expr::PatScrutinee(_) => {
                 // A dereference is a place: read it. An aggregate referent is
                 // named by its address, so reading it yields the pointer itself.
                 self.gen_expr(expr);
-                if !ty.is_aggregate() {
-                    self.line("mov (%rax), %rax");
+                match byte_load(ty) {
+                    Some(LoadKind::Zero) => self.line("movzbq (%rax), %rax"),
+                    Some(LoadKind::Sign) => self.line("movsbq (%rax), %rax"),
+                    None if !ty.is_aggregate() => self.line("mov (%rax), %rax"),
+                    None => {}
                 }
-                ty.clone()
+                // The value is an `i64` even for a byte referent, which is what
+                // makes `*p` usable in printing and arithmetic.
+                byte_value_ty(ty)
             }
             Expr::Un(op, inner) => {
                 let inner_ty = self.gen_expr(inner);
@@ -2294,6 +2450,11 @@ Expr::PatScrutinee(_) => {
                     self.line("test %rax, %rax");
                     self.line("setne %al");
                     self.line("movzbq %al, %rax");
+                } else if let Some(bits) = narrow_bits(to) {
+                    // `x as u8` keeps only the low byte; `x as i32` sign-extends
+                    // the low word. A cast to a 64-bit type is a no-op on the
+                    // register.
+                    self.truncate_to(bits, matches!(to, Type::Int { signed: true, .. }));
                 }
                 to.clone()
             }
@@ -2331,7 +2492,7 @@ Expr::PatScrutinee(_) => {
             // `*p` reading a scalar through a reference in a register is a bare
             // memory operand, so `x + *p` folds into one `add`. An aggregate
             // referent's value is its address, which is not a simple operand.
-            Expr::Deref { expr, ty } if !ty.is_aggregate() => {
+            Expr::Deref { expr, ty } if !ty.is_aggregate() && byte_load(ty).is_none() => {
                 self.ptr_reg(expr).map(|r| format!("({r})"))
             }
             Expr::Index(base, idx) => {
@@ -2434,10 +2595,12 @@ Expr::PatScrutinee(_) => {
                 // `reg` alone is a plain move; anything else is one `lea`.
                 if k != 1 || c != 0 {
                     self.line(&format!("lea {}, {dst}", Self::lea_operand(&reg, k, c)));
+                    self.narrow_trunc(e, dst);
                     return;
                 }
             }
             if self.gen_accumulate(e, dst) {
+                self.narrow_trunc(e, dst);
                 return;
             }
         }
@@ -3640,6 +3803,50 @@ fn setcc(op: BinOp) -> &'static str {
         BinOp::Gt => "setg",
         BinOp::Ge => "setge",
         _ => unreachable!(),
+    }
+}
+
+/// The 8-bit sub-register of a 64-bit register name (`%rax` -> `%al`). The
+/// high-byte registers (`%ah`..) are never used, so the low-byte encoding is
+/// always the plain one.
+fn reg8(r: &str) -> &'static str {
+    match r {
+        "%rax" => "%al",
+        "%rbx" => "%bl",
+        "%rcx" => "%cl",
+        "%rdx" => "%dl",
+        "%rsi" => "%sil",
+        "%rdi" => "%dil",
+        "%r8" => "%r8b",
+        "%r9" => "%r9b",
+        "%r10" => "%r10b",
+        "%r11" => "%r11b",
+        "%r12" => "%r12b",
+        "%r13" => "%r13b",
+        "%r14" => "%r14b",
+        "%r15" => "%r15b",
+        _ => unreachable!("no 8-bit form of {r}"),
+    }
+}
+
+/// The 16-bit sub-register of a 64-bit register name (`%rax` -> `%ax`).
+fn reg16(r: &str) -> &'static str {
+    match r {
+        "%rax" => "%ax",
+        "%rbx" => "%bx",
+        "%rcx" => "%cx",
+        "%rdx" => "%dx",
+        "%rsi" => "%si",
+        "%rdi" => "%di",
+        "%r8" => "%r8w",
+        "%r9" => "%r9w",
+        "%r10" => "%r10w",
+        "%r11" => "%r11w",
+        "%r12" => "%r12w",
+        "%r13" => "%r13w",
+        "%r14" => "%r14w",
+        "%r15" => "%r15w",
+        _ => unreachable!("no 16-bit form of {r}"),
     }
 }
 

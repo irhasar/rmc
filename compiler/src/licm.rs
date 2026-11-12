@@ -264,13 +264,30 @@ fn is_frame_ref(e: &Expr) -> bool {
 
 /// True when `e` names a frame place: a local, or a non-reference field of one.
 /// A reference-typed field is a pointer, so a place past it is not a frame
-/// place.
+/// place. Nor is a field whose *base* is a reference: `r.inner` where `r: &S`
+/// lives at `*r + offset`, so forming its address dereferences `r`, which may be
+/// null or dangle. Only a field reached through a real in-frame aggregate
+/// (`&local.field`) is frame-owned. `&r` itself stays a frame place — it is the
+/// address of the local pointer slot — which is why the base check is on the
+/// field arm rather than on `Var`.
 fn is_frame_place(e: &Expr) -> bool {
     match e {
         Expr::Var { .. } => true,
-        Expr::Field { base, ty, .. } => !matches!(ty, Type::Ref(..)) && is_frame_place(base),
+        Expr::Field { base, ty, .. } => {
+            !matches!(ty, Type::Ref(..)) && !is_ref_typed(base) && is_frame_place(base)
+        }
         _ => false,
     }
+}
+
+/// True when `e`'s type is a reference, so reaching a field or element through
+/// it dereferences a pointer rather than naming a frame place.
+fn is_ref_typed(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Var { ty, .. } | Expr::Field { ty, .. } | Expr::Deref { ty, .. }
+            if matches!(ty, Type::Ref(..))
+    )
 }
 
 /// Record the destination of an immutable `let` that is bound to a proven
@@ -841,3 +858,87 @@ fn count_expr(e: &Expr) -> usize {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{lexer, parser, sema};
+
+    /// The proven-reference slots of `main` after a full front-end run.
+    fn proven_main(src: &str) -> HashSet<i32> {
+        let toks = lexer::lex(src).expect("lex");
+        let mut prog = parser::Parser::new(toks).parse_program().expect("parse");
+        sema::analyze(&mut prog).expect("sema");
+        let main = prog.fns.iter().find(|f| f.name == "main").expect("main");
+        proven_refs(&main.body)
+    }
+
+    /// The slot of the local named `name` in `main`.
+    fn slot_of(src: &str, name: &str) -> i32 {
+        let toks = lexer::lex(src).expect("lex");
+        let mut prog = parser::Parser::new(toks).parse_program().expect("parse");
+        sema::analyze(&mut prog).expect("sema");
+        let main = prog.fns.iter().find(|f| f.name == "main").expect("main");
+        find_slot(&main.body, name).expect("slot")
+    }
+
+    fn find_slot(b: &Block, name: &str) -> Option<i32> {
+        for s in &b.stmts {
+            if let Stmt::Let { name: n, slot, .. } = s {
+                if n == name {
+                    return Some(*slot);
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn a_reference_to_a_local_is_proven() {
+        // `let r = &v;` addresses a live local, so `r` may be speculated through.
+        let src = "fn main() { let v: i64 = 1; let r: &i64 = &v; println!(\"{}\", *r); }";
+        let r = slot_of(src, "r");
+        assert!(proven_main(src).contains(&r));
+    }
+
+    #[test]
+    fn a_reference_to_a_field_of_a_local_is_proven() {
+        // `&s.inner` is `&local + offset`, still frame storage.
+        let src = "struct I { x: i64 } struct S { inner: I } \
+                   fn main() { let s: S = S { inner: I { x: 1 } }; \
+                   let q: &I = &s.inner; println!(\"{}\", q.x); }";
+        let q = slot_of(src, "q");
+        assert!(proven_main(src).contains(&q));
+    }
+
+    #[test]
+    fn a_reference_to_a_field_of_a_reference_is_not_proven() {
+        // The reported bug: `&r.inner` where `r: &S` dereferences `r`, which may
+        // be null, so `q` must not be treated as pointing at frame storage.
+        let src = "struct I { x: i64 } struct S { inner: I } \
+                   fn main() { let r: &S = 0 as &S; let q: &I = &r.inner; \
+                   println!(\"{}\", q.x); }";
+        let q = slot_of(src, "q");
+        assert!(!proven_main(src).contains(&q));
+    }
+
+    #[test]
+    fn a_reference_to_a_reference_local_itself_is_proven() {
+        // `&r` (not `&r.field`) addresses the local pointer slot, which is live
+        // frame storage, so it stays proven.
+        let src = "fn main() { let v: i64 = 1; let r: &i64 = &v; \
+                   let rr: &&i64 = &r; println!(\"{}\", **rr); }";
+        let rr = slot_of(src, "rr");
+        assert!(proven_main(src).contains(&rr));
+    }
+
+    #[test]
+    fn a_deeper_reference_field_chain_is_not_proven() {
+        // `&r.mid.leaf`: the base `r.mid` is reached through a reference, so no
+        // link in the chain is frame storage.
+        let src = "struct L { x: i64 } struct M { leaf: L } struct S { mid: M } \
+                   fn main() { let r: &S = 0 as &S; let q: &L = &r.mid.leaf; \
+                   println!(\"{}\", q.x); }";
+        let q = slot_of(src, "q");
+        assert!(!proven_main(src).contains(&q));
+    }
+}

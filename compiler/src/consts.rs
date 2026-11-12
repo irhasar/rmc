@@ -4,7 +4,7 @@
 //! rustc's constant propagation does, and the parser, to evaluate a `const`
 //! item's initializer so its value can be substituted at every use.
 
-use crate::ast::{BinOp, Expr, Type, UnOp};
+use crate::ast::{to_unsigned, wrap_int, BinOp, Expr, Type, UnOp};
 use std::collections::HashMap;
 
 /// The value of a resolved constant: an `i64`, a `bool`, or a `char`.
@@ -57,7 +57,7 @@ pub fn resolve_with(
                 continue;
             }
             match ty {
-                Type::I64 => {
+                Type::I64 | Type::Int { .. } => {
                     if let Some(v) = eval_i64(value, &ints) {
                         ints.insert(name.clone(), v);
                         progress = true;
@@ -193,8 +193,17 @@ pub fn const_i64(e: &Expr) -> Option<i64> {
         // `usize` and the other integer widths are transparent aliases for
         // `i64`, so `i as usize` (the usual spelling of an index) is an
         // identity cast that must not hide a constant index from the bound
-        // check.
+        // check. A *narrowing* cast (a suffixed literal `200u8`, or `300 as u8`)
+        // folds to the width's value, exactly as sema emits it.
         Expr::Cast(inner, ty) if *ty == Type::I64 => const_i64(inner),
+        Expr::Cast(inner, Type::Int { signed, bits }) => {
+            let v = const_i64(inner)?;
+            if *bits >= 64 {
+                Some(v)
+            } else {
+                Some(wrap_int(v, *signed, *bits))
+            }
+        }
         // Fold the integer operators too, so a constant index written as an
         // expression (`a[1 + 4]`) is bounds-checked exactly like a literal.
         Expr::Bin(op, a, b) => {
@@ -221,6 +230,88 @@ pub fn const_i64(e: &Expr) -> Option<i64> {
             }
         }
         _ => None,
+    }
+}
+
+/// Evaluate a constant binary operation at a width narrower than 64 bits the
+/// way rustc does: `+`/`-`/`*` overflow, a division or remainder by zero, an
+/// `MIN / -1`, and an out-of-range shift are rejected; `wrapping_mul` wraps.
+/// The operands are in-width values (a two's-complement bit pattern in an
+/// `i64`), so the result is the in-width result, matching what codegen computes.
+pub fn int_const_binop(
+    op: BinOp,
+    x: i64,
+    y: i64,
+    signed: bool,
+    bits: u16,
+) -> Result<i64, String> {
+    use BinOp::*;
+    if bits >= 64 {
+        return const_binop(op, x, y);
+    }
+    let overflow = || "this arithmetic operation overflows".to_string();
+    match op {
+        WrappingMul => Ok(wrap_int(x.wrapping_mul(y), signed, bits)),
+        Add | Sub | Mul => {
+            if signed {
+                let a = wrap_int(x, true, bits) as i128;
+                let b = wrap_int(y, true, bits) as i128;
+                let r = match op {
+                    Add => a + b,
+                    Sub => a - b,
+                    _ => a * b,
+                };
+                let lo = -(1i128 << (bits - 1));
+                let hi = (1i128 << (bits - 1)) - 1;
+                if r < lo || r > hi {
+                    return Err(overflow());
+                }
+                Ok(wrap_int(r as i64, true, bits))
+            } else {
+                let a = to_unsigned(x, bits) as u128;
+                let b = to_unsigned(y, bits) as u128;
+                let r = match op {
+                    Add => a + b,
+                    Sub => a.wrapping_sub(b),
+                    _ => a * b,
+                };
+                if r >= (1u128 << bits) {
+                    return Err(overflow());
+                }
+                Ok(r as i64)
+            }
+        }
+        Div | Mod => {
+            if y == 0 {
+                return Err("division by zero panics at run time".into());
+            }
+            if signed {
+                let min = wrap_int(1i64 << (bits - 1), true, bits);
+                if x == min && y == -1 {
+                    return Err("attempt to divide with overflow panics at run time".into());
+                }
+                Ok(if op == Div { x / y } else { x % y })
+            } else {
+                let (a, b) = (to_unsigned(x, bits), to_unsigned(y, bits));
+                Ok(if op == Div { (a / b) as i64 } else { (a % b) as i64 })
+            }
+        }
+        Shl | Shr => {
+            if !(0..bits as i64).contains(&y) {
+                return Err(format!("shift amount is out of range for a {bits}-bit integer"));
+            }
+            Ok(if op == Shl {
+                wrap_int(x.wrapping_shl(y as u32), signed, bits)
+            } else if signed {
+                x >> y
+            } else {
+                (to_unsigned(x, bits) >> y) as i64
+            })
+        }
+        BitAnd => Ok(x & y),
+        BitOr => Ok(x | y),
+        BitXor => Ok(x ^ y),
+        _ => Ok(0),
     }
 }
 

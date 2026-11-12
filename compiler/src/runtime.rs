@@ -493,6 +493,38 @@ __rmc_write_i64:
     },
     Piece {
         text: r#"
+# void __rmc_write_u64(unsigned long n)  -- unsigned decimal, no trailing newline
+.globl __rmc_write_u64
+.type __rmc_write_u64, @function
+__rmc_write_u64:
+    push %rbp
+    mov %rsp, %rbp
+    sub $64, %rsp
+    lea -1(%rbp), %rsi
+    mov $0, %rcx
+    mov %rdi, %rax
+    mov $10, %r9
+.Lwu_loop:
+    xor %rdx, %rdx
+    div %r9
+    add $48, %dl
+    dec %rsi
+    mov %dl, (%rsi)
+    inc %rcx
+    test %rax, %rax
+    jnz .Lwu_loop
+    mov %rcx, %rdx
+    mov $1, %rax
+    mov $1, %rdi
+    syscall
+    leave
+    ret
+.size __rmc_write_u64, .-__rmc_write_u64
+"#,
+        defines: &["__rmc_write_u64"],
+    },
+    Piece {
+        text: r#"
 # void __rmc_write_bool(bool b)  -- `true` or `false`, no trailing newline
 .globl __rmc_write_bool
 .type __rmc_write_bool, @function

@@ -437,7 +437,14 @@ Expr::PatScrutinee(_) => {
             // write memory is therefore copied into a fresh slot first, so each
             // parameter sees its argument's value at call time, in order.
             let later_effect = last_effect.map_or(false, |j| j > i);
-            if trivial(&arg) && !escaped.contains(&param_slots[i]) && !later_effect {
+            // A narrow integer parameter needs a correctly-typed binding even
+            // for a trivial argument: substituting a literal would let the body
+            // treat it as `i64` and skip the width's truncation, so
+            // `f(200) + 100` on a `u8` parameter would compute 300 instead of
+            // wrapping to 44.
+            let narrow_param = matches!(&param_tys[i], Type::Int { bits, .. } if *bits < 64);
+            if trivial(&arg) && !escaped.contains(&param_slots[i]) && !later_effect && !narrow_param
+            {
                 subst.push(arg);
             } else {
                 let slot = *base;

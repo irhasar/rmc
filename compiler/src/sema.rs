@@ -10,7 +10,7 @@
 //! always a multiple of 8 and every field is naturally aligned.
 
 use crate::ast::*;
-use crate::consts::{const_binop, const_binop_checked, const_i64};
+use crate::consts::{const_binop, const_binop_checked, const_i64, int_const_binop};
 use std::collections::HashMap;
 
 #[derive(Clone)]
@@ -25,6 +25,9 @@ pub struct Sig {
     /// True when the receiver was `&mut self`, so the synthesized parameter is
     /// `&mut T` and matches the address the call site builds.
     pub ref_self_mut: bool,
+    /// True when the receiver was `mut self`: by value, but the binding may be
+    /// assigned in the body.
+    pub self_mut: bool,
 }
 
 /// A laid-out struct: each field's name, resolved type and byte offset, plus the
@@ -169,6 +172,16 @@ pub struct Sema {
     /// (rustc E0530), so a `let`, a parameter or a `for` variable is checked
     /// against this set.
     const_names: std::collections::HashSet<String>,
+    /// The integer type an integer literal at the current point should take,
+    /// set from the declared type, the parameter, the assignment target or the
+    /// `return` type while a literal is checked. A literal is an `i64` unless
+    /// this says otherwise, so `let x: u32 = 5` types `5` as `u32`. `None`
+    /// outside such a context, e.g. inside a call argument.
+    expected_int: Option<Type>,
+    /// The element type a *direct* array literal at the current point should
+    /// take, set from a declared `[T; n]` whose element is an integer width
+    /// (`let bs: [u8; 3] = [b'a', ..]`). `None` outside such a context.
+    expected_elem_int: Option<Type>,
 }
 
 /// A lexical scope entry. `mutable` records whether the binding was declared
@@ -206,7 +219,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     // Runtime helpers provided by the freestanding assembly runtime. They are
     // linked in automatically, so they do not appear in the source program.
-    let builtins: [(&str, &[Type], Type); 27] = [
+    let builtins: [(&str, &[Type], Type); 28] = [
         ("print_i64", &[Type::I64], Type::Unit),
         ("print_str", &[Type::Str], Type::Unit),
         ("print_bool", &[Type::Bool], Type::Unit),
@@ -261,6 +274,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         // `println!` line of several pieces stays on one line and the macro
         // appends the newline itself. They are not written in source.
         ("__rmc_write_i64", &[Type::I64], Type::Unit),
+        ("__rmc_write_u64", &[Type::I64], Type::Unit),
         ("__rmc_write_bool", &[Type::Bool], Type::Unit),
         ("__rmc_write_str", &[Type::Str], Type::Unit),
         ("__rmc_write_char", &[Type::Char], Type::Unit),
@@ -274,6 +288,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
                 takes_self: false,
                 ref_self: false,
                 ref_self_mut: false,
+                self_mut: false,
             },
         );
     }
@@ -290,7 +305,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
                     Type::Named(ty)
                 };
                 f.params.insert(0, ("self".to_string(), rt));
-                f.param_mut.insert(0, false);
+                f.param_mut.insert(0, f.self_mut);
                 f.param_pats.insert(0, None);
             }
         }
@@ -325,6 +340,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
                 takes_self: f.takes_self,
                 ref_self: f.ref_self,
                 ref_self_mut: f.ref_self_mut,
+                self_mut: f.self_mut,
             },
         );
     }
@@ -363,6 +379,8 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         assign_count: HashMap::new(),
         mut_borrowed: std::collections::HashSet::new(),
         const_names,
+        expected_int: None,
+        expected_elem_int: None,
     };
     for f in &mut prog.fns {
         sema.check_fn(f)?;
@@ -620,7 +638,7 @@ fn check_consts(
         }
         let ty = resolve_in(&c.ty, structs, enums)?;
         match ty {
-            Type::I64 | Type::Bool | Type::Char => {}
+            Type::I64 | Type::Bool | Type::Char | Type::Int { .. } => {}
             other => {
                 return Err(format!(
                     "constant `{}` has type {other:?}; rmc only folds `i64`, `bool` and `char` constants",
@@ -633,6 +651,7 @@ fn check_consts(
         // of a cycle).
         match (ty, resolved.get(&c.name)) {
             (Type::I64, Some(crate::consts::ConstVal::Int(_))) => {}
+            (Type::Int { .. }, Some(crate::consts::ConstVal::Int(_))) => {}
             (Type::Bool, Some(crate::consts::ConstVal::Bool(_))) => {}
             (Type::Char, Some(crate::consts::ConstVal::Char(_))) => {}
             (Type::I64, _) => {
@@ -650,6 +669,12 @@ fn check_consts(
             (Type::Char, _) => {
                 return Err(format!(
                     "constant `{}` is not a constant `char` expression",
+                    c.name
+                ))
+            }
+            (Type::Int { .. }, _) => {
+                return Err(format!(
+                    "constant `{}` is not a constant integer expression",
                     c.name
                 ))
             }
@@ -852,7 +877,9 @@ impl Sema {
         /// temporary every iteration).
         fn arg_can_assign(e: &Expr) -> bool {
             match e {
-                Expr::Block(b) | Expr::MatchBoundary(b, _) => block_assigns(b),
+                Expr::Block(b) | Expr::MatchBoundary(b, _) | Expr::Loop(b, _, _, _) => {
+                    block_assigns(b)
+                }
                 Expr::If(c, t, els) => {
                     arg_can_assign(c)
                         || block_assigns(t)
@@ -1635,7 +1662,27 @@ impl Sema {
                     None => None,
                 };
                 let init_ty = match init {
-                    Some(e) => Some(self.check_let_init(e, scope)?),
+                    Some(e) => {
+                        // An integer literal in the initializer takes the
+                        // declared width (`let x: u32 = 5`); an array literal
+                        // takes the declared element width (`let b: [u8; 3] =
+                        // [1, 2, 3]`).
+                        let saved = self.expected_int.take();
+                        let saved_elem = self.expected_elem_int.take();
+                        if let Some(d) = &declared {
+                            if is_int_ty(d) {
+                                self.expected_int = Some(d.clone());
+                            } else if let Type::Array(elem, _) = d {
+                                if is_int_ty(elem) {
+                                    self.expected_elem_int = Some((**elem).clone());
+                                }
+                            }
+                        }
+                        let r = self.check_let_init(e, scope);
+                        self.expected_int = saved;
+                        self.expected_elem_int = saved_elem;
+                        Some(r?)
+                    }
                     None => None,
                 };
                 let final_ty = match (declared, init_ty) {
@@ -1723,6 +1770,15 @@ impl Sema {
                     }
                 }
                 let tty = self.check_lvalue(target, scope)?;
+                // An integer literal on the right of `=` takes the target's
+                // width; re-check it in that context so `x = 5` where `x: u32`
+                // types `5` as `u32` and is range-checked.
+                let mut vty = vty;
+                if is_int_literal(value) {
+                    if let Type::Int { .. } = &tty {
+                        vty = self.check_expr_expected(value, scope, &tty)?;
+                    }
+                }
                 // A deferred single init (`let i; i = -1;`) is the one
                 // assignment rustc folds; a second assignment would make the
                 // count 2 and the gate fail. This runs after `check_lvalue`,
@@ -1906,7 +1962,12 @@ impl Sema {
             Stmt::Return(v) => {
                 match v {
                     Some(e) => {
-                        let t = self.check_expr(e, scope)?;
+                        let t = if is_int_literal(e) {
+                            let rt = self.ret_ty.clone();
+                            self.check_expr_expected(e, scope, &rt)?
+                        } else {
+                            self.check_expr(e, scope)?
+                        };
                         // `!` unifies with anything: `return loop {};` never
                         // actually returns a value.
                         if t != self.ret_ty && t != Type::Never {
@@ -2127,7 +2188,12 @@ impl Sema {
     fn check_cast(&self, from: &Type, to: &Type) -> Result<(), String> {
         match (from, to) {
             (Type::Ref(a, a_mut), Type::Ref(b, b_mut)) => {
-                if a != b {
+                // A byte referent (`*const u8`) and a word one (`*const i64`)
+                // are both one address, so only the byte-ness is normalised
+                // away here: `*mut u8 as *mut i8` (both byte) and `*mut u8 as
+                // *mut i64` are accepted, while a mismatch between two
+                // non-byte referents stays rejected.
+                if byte_ref_norm(a) != byte_ref_norm(b) {
                     return Err(format!(
                         "cannot cast a `{a:?}` reference to a `{b:?}` reference"
                     ));
@@ -2142,12 +2208,13 @@ impl Sema {
             // `*mut T` and `&mut T` to `Ref(_, true)`, and rustc *does* allow
             // `*mut T as i64`, so the mutable form is accepted (the raw-pointer
             // extension). A shared reference stays rejected, matching E0606.
-            (Type::Ref(_, true), Type::I64) => Ok(()),
+            // `*mut T as u32` and the like are the same extension.
+            (Type::Ref(_, true), t) if is_int_ty(t) => Ok(()),
             (Type::Ref(..), _) => {
                 Err(format!("cannot cast a reference `{from:?}` to `{to:?}`"))
             }
             // The raw pointer cast extension: an integer becomes a reference.
-            (Type::I64, Type::Ref(..)) => Ok(()),
+            (t, Type::Ref(..)) if is_int_ty(t) => Ok(()),
             // Any other scalar may not become a reference (rustc E0605).
             (_, Type::Ref(..)) => {
                 Err(format!("cannot cast `{from:?}` to a reference `{to:?}`"))
@@ -2156,19 +2223,19 @@ impl Sema {
             (Type::Str, _) | (_, Type::Str) => {
                 Err(format!("cannot cast `{from:?}` to `{to:?}`"))
             }
-            // rustc allows only `u8 as char`; rmc has no `u8` type (a suffixed
-            // literal is an `i64`), so it rejects every integer-to-`char` cast
-            // rather than accept one rustc would reject.
-            (Type::I64, Type::Char) => {
-                Err("cannot cast `i64` to `char` (rustc allows only `u8 as char`)".into())
+            // rustc allows only `u8 as char`.
+            (Type::Int { signed: false, bits: 8 }, Type::Char) => Ok(()),
+            (t, Type::Char) if is_int_ty(t) => {
+                Err("cannot cast an integer to `char` (rustc allows only `u8 as char`)".into())
             }
-            // `char` converts to an integer as its scalar value.
-            (Type::Char, Type::I64) => Ok(()),
+            // `char` converts to any integer as its scalar value.
+            (Type::Char, t) if is_int_ty(t) => Ok(()),
             // Any other `char` cast is not one rustc performs.
             (Type::Char, _) | (_, Type::Char) => {
                 Err(format!("cannot cast `{from:?}` to `{to:?}`"))
             }
-            // `i64`, `bool` and an enum tag convert among themselves.
+            // An integer width converts to any other; `bool` and an enum tag
+            // convert among themselves.
             _ => Ok(()),
         }
     }
@@ -2482,9 +2549,55 @@ impl Sema {
         }
     }
 
+    /// The type an integer literal takes at the current point: the expected
+    /// width when the context set one (`let x: u32 = 5`), else `i64`. A literal
+    /// is an `i64` unless a declared type, parameter or `return` type says
+    /// otherwise, exactly as rustc infers a literal's type from its expected
+    /// type.
+    fn int_lit_ty(&self) -> Type {
+        match &self.expected_int {
+            Some(t) if is_int_ty(t) => t.clone(),
+            _ => Type::I64,
+        }
+    }
+
+    /// Check `e` in the context of an expected integer type (a declared type,
+    /// a parameter or a `return` type), so an integer literal takes that width.
+    /// The expected type is saved and restored around the call, so an
+    /// unrelated literal elsewhere is not mis-typed.
+    fn check_expr_expected(
+        &mut self,
+        e: &mut Expr,
+        scope: &mut Scope,
+        expected: &Type,
+    ) -> Result<Type, String> {
+        let saved = self.expected_int.take();
+        if is_int_ty(expected) {
+            self.expected_int = Some(expected.clone());
+        }
+        let r = self.check_expr(e, scope);
+        self.expected_int = saved;
+        r
+    }
+
+    /// Reject an integer value that does not fit its width, the way rustc's
+    /// `literal out of range` does (`let x: u8 = 300;`). A 64-bit width always
+    /// fits, since the value is an `i64`.
+    fn check_int_range(&self, v: i64, ty: &Type) -> Result<(), String> {
+        let bits = int_bits(ty);
+        if bits >= 64 || fits_int(v, int_signed(ty), bits) {
+            return Ok(());
+        }
+        Err(format!("literal out of range for `{}`", int_ty_name(ty)))
+    }
+
     fn check_expr(&mut self, e: &mut Expr, scope: &mut Scope) -> Result<Type, String> {
         match e {
-            Expr::Int(_) => Ok(Type::I64),
+            Expr::Int(v) => {
+                let t = self.int_lit_ty();
+                self.check_int_range(*v, &t)?;
+                Ok(t)
+            }
             Expr::Bool(_) => Ok(Type::Bool),
             Expr::Char(_) => Ok(Type::Char),
             // A string literal has its own type, so it cannot be added to an
@@ -2507,28 +2620,35 @@ impl Sema {
                 let t = self.check_expr(inner, scope)?;
                 match op {
                     UnOp::Neg => {
-                        if t != Type::I64 {
-                            return Err(format!("unary `-` expects `i64`, found {t:?}"));
+                        if !is_int_ty(&t) {
+                            return Err(format!("unary `-` expects an integer, found {t:?}"));
                         }
-                        // Negating `i64::MIN` overflows. rustc's
-                        // `arithmetic_overflow` deny lint catches it when the
-                        // operand folds to a constant, so rmc does too; the
-                        // `i64::MIN` literal itself is parsed as `Int(i64::MIN)`,
-                        // not a negation, so only a written `-` reaches here.
+                        // rustc rejects negating an unsigned value.
+                        if !int_signed(&t) {
+                            return Err(format!(
+                                "cannot apply unary `-` to an unsigned integer `{}`",
+                                int_ty_name(&t)
+                            ));
+                        }
                         // The negation inside a built-in `abs` is exempt: it is
                         // not a written `-`, and rustc accepts it.
-                        if !self.in_builtin_neg
-                            && self.const_of(inner, &self.const_locals) == Some(i64::MIN)
-                        {
-                            return Err("this arithmetic operation overflows".into());
+                        if !self.in_builtin_neg {
+                            if let Some(v) = self.const_of(inner, &self.const_locals) {
+                                let neg = v.checked_neg().ok_or_else(|| {
+                                    "this arithmetic operation overflows".to_string()
+                                })?;
+                                self.check_int_range(neg, &t)?;
+                            }
                         }
-                        Ok(Type::I64)
+                        Ok(t)
                     }
                     UnOp::Not => match t {
                         // `!` is logical not on `bool` and bitwise not on an
                         // integer, matching Rust. It yields its operand's type.
-                        Type::Bool | Type::I64 => Ok(t),
-                        _ => Err(format!("unary `!` expects `bool` or `i64`, found {t:?}")),
+                        Type::Bool | Type::I64 | Type::Int { .. } => Ok(t),
+                        _ => Err(format!(
+                            "unary `!` expects `bool` or an integer, found {t:?}"
+                        )),
                     },
                 }
             }
@@ -2588,6 +2708,25 @@ impl Sema {
                 }
                 let ta = self.check_expr(a, scope)?;
                 let tb = self.check_expr(b, scope)?;
+                // An integer literal operand takes the other operand's width,
+                // exactly as rustc infers it: `let c: u16 = 5; c + 10` types
+                // `10` as `u16`. A literal is pure, so re-checking it in that
+                // context is safe and also range-checks it.
+                let (ta, tb) = if ta != tb {
+                    match (&ta, &tb) {
+                        (Type::I64, Type::Int { .. }) if is_int_literal(a) => {
+                            let w = tb.clone();
+                            (self.check_expr_expected(a, scope, &w)?, tb)
+                        }
+                        (Type::Int { .. }, Type::I64) if is_int_literal(b) => {
+                            let w = ta.clone();
+                            (ta, self.check_expr_expected(b, scope, &w)?)
+                        }
+                        _ => (ta, tb),
+                    }
+                } else {
+                    (ta, tb)
+                };
                 use BinOp::*;
                 // Two `str` operands compare by content through a runtime
                 // helper, not by pointer. Rewrite the whole node and re-check
@@ -2606,40 +2745,69 @@ impl Sema {
                 }
                 match op {
                     Add | Sub | Mul | Div | Mod | WrappingMul => {
-                        if ta != Type::I64 || tb != Type::I64 {
-                            return Err(format!("arithmetic expects `i64` operands, found {ta:?} and {tb:?}"));
+                        if !is_int_ty(&ta) || !is_int_ty(&tb) {
+                            return Err(format!(
+                                "arithmetic expects integer operands, found {ta:?} and {tb:?}"
+                            ));
                         }
-                        // `wrapping_mul` never traps, so a constant product that
-                        // overflows is folded as a wrap rather than rejected.
-                        if *op != WrappingMul {
-                            if let (Some(x), Some(y)) = (self.const_of(a, &self.const_locals), self.const_of(b, &self.const_locals)) {
-                                const_binop(*op, x, y)?;
+                        if ta != tb {
+                            return Err(format!(
+                                "arithmetic between different integer types: {ta:?} and {tb:?}"
+                            ));
+                        }
+                        // A 64-bit operand keeps the original `i64` path, so a
+                        // 64-bit program is unchanged. A narrower width folds a
+                        // constant product with the width's overflow rule and
+                        // otherwise yields the width.
+                        if ta == Type::I64 {
+                            // `wrapping_mul` never traps, so a constant product
+                            // that overflows is folded as a wrap rather than
+                            // rejected.
+                            if *op != WrappingMul {
+                                if let (Some(x), Some(y)) = (
+                                    self.const_of(a, &self.const_locals),
+                                    self.const_of(b, &self.const_locals),
+                                ) {
+                                    const_binop(*op, x, y)?;
+                                }
+                            }
+                        } else if let Type::Int { signed, bits } = ta {
+                            if let (Some(x), Some(y)) = (
+                                self.const_of(a, &self.const_locals),
+                                self.const_of(b, &self.const_locals),
+                            ) {
+                                int_const_binop(*op, x, y, signed, bits)?;
                             }
                         }
-                        Ok(Type::I64)
+                        Ok(ta)
                     }
                     Eq | Ne => {
                         if ta != tb {
-                            return Err(format!("comparison between different types: {ta:?} and {tb:?}"));
+                            return Err(format!(
+                                "comparison between different types: {ta:?} and {tb:?}"
+                            ));
                         }
                         // `is_scalar` here, so a matching enum compares but an
                         // aggregate (array/struct) does not.
                         if !ta.is_scalar() {
                             return Err(format!(
-                                "comparison expects `i64`, `bool` or a matching enum, found {ta:?}"
+                                "comparison expects an integer, `bool` or a matching enum, found {ta:?}"
                             ));
                         }
                         Ok(Type::Bool)
                     }
                     Lt | Le | Gt | Ge => {
                         // `char` orders by its scalar value, so two `char`s
-                        // compare; anything else must be `i64`, matching rustc,
-                        // which does not order a `char` against an integer.
+                        // compare; anything else must be an integer of the same
+                        // width, matching rustc, which does not order a `char`
+                        // against an integer.
                         if ta == Type::Char && tb == Type::Char {
                             return Ok(Type::Bool);
                         }
-                        if ta != Type::I64 || tb != Type::I64 {
-                            return Err(format!("ordering comparison expects `i64`, found {ta:?} and {tb:?}"));
+                        if !is_int_ty(&ta) || !is_int_ty(&tb) || ta != tb {
+                            return Err(format!(
+                                "ordering comparison expects two integers of the same type, found {ta:?} and {tb:?}"
+                            ));
                         }
                         Ok(Type::Bool)
                     }
@@ -2650,37 +2818,59 @@ impl Sema {
                         Ok(Type::Bool)
                     }
                     BitAnd | BitOr | BitXor | Shl | Shr => {
-                        // `&`, `|` and `^` are defined on `bool` as well as
-                        // `i64` (rustc's `BitAnd`/`BitOr`/`BitXor` impls). A
+                        // `&`, `|` and `^` are defined on `bool` as well as an
+                        // integer (rustc's `BitAnd`/`BitOr`/`BitXor` impls). A
                         // `bool` is a 0/1 word, so the bitwise instruction is
                         // already the logical result and codegen is unchanged;
-                        // only the operand check differs. The shifts stay
-                        // `i64`-only.
+                        // only the operand check differs.
                         if matches!(op, BitAnd | BitOr | BitXor)
                             && ta == Type::Bool
                             && tb == Type::Bool
                         {
                             return Ok(Type::Bool);
                         }
-                        if ta != Type::I64 || tb != Type::I64 {
-                            return Err(format!("bitwise operator expects `i64` operands, found {ta:?} and {tb:?}"));
+                        if !is_int_ty(&ta) || !is_int_ty(&tb) {
+                            return Err(format!(
+                                "bitwise operator expects integer operands, found {ta:?} and {tb:?}"
+                            ));
+                        }
+                        // A shift's right operand may be any integer width and
+                        // is not masked at the type level; every other bitwise
+                        // operator needs both operands the same width.
+                        let (signed, bits) = match &ta {
+                            Type::Int { signed, bits } => (*signed, *bits),
+                            _ => (true, 64),
+                        };
+                        if !matches!(op, Shl | Shr) && ta != tb {
+                            return Err(format!(
+                                "bitwise operator between different integer types: {ta:?} and {tb:?}"
+                            ));
                         }
                         // rustc rejects a shift whose count is a known constant
-                        // outside 0..=63 even when the shifted value is a
+                        // outside `0..bits` even when the shifted value is a
                         // runtime value (`x << 81` is a compile error, not a
                         // wrapped result), so the count is checked on its own
                         // rather than only when both sides are constant.
                         if matches!(op, Shl | Shr) {
                             if let Some(y) = self.const_of(b, &self.const_locals) {
-                                if !(0..64).contains(&y) {
-                                    return Err("shift amount is out of range for `i64`".into());
+                                if !(0..bits as i64).contains(&y) {
+                                    return Err(format!(
+                                        "shift amount is out of range for a {bits}-bit integer"
+                                    ));
                                 }
                             }
                         }
-                        if let (Some(x), Some(y)) = (self.const_of(a, &self.const_locals), self.const_of(b, &self.const_locals)) {
-                            const_binop(*op, x, y)?;
+                        if let (Some(x), Some(y)) = (
+                            self.const_of(a, &self.const_locals),
+                            self.const_of(b, &self.const_locals),
+                        ) {
+                            if ta == Type::I64 {
+                                const_binop(*op, x, y)?;
+                            } else {
+                                int_const_binop(*op, x, y, signed, bits)?;
+                            }
                         }
-                        Ok(Type::I64)
+                        Ok(ta)
                     }
                 }
             }
@@ -2695,6 +2885,10 @@ impl Sema {
                     let t = self.check_expr(&mut args[0], scope)?;
                     let helper = if t == Type::I64 {
                         "__rmc_write_i64"
+                    } else if matches!(&t, Type::Int { signed: true, .. }) {
+                        "__rmc_write_i64"
+                    } else if matches!(&t, Type::Int { signed: false, .. }) {
+                        "__rmc_write_u64"
                     } else if t == Type::Bool {
                         "__rmc_write_bool"
                     } else if t == Type::Char {
@@ -2741,7 +2935,12 @@ impl Sema {
                 }
                 arg_slots.clear();
                 for (a, p) in args.iter_mut().zip(sig.params.iter()) {
-                    let t = self.check_expr(a, scope)?;
+                    let t = if is_int_literal(a) && matches!(p, Type::Int { .. }) {
+                        let p2 = p.clone();
+                        self.check_expr_expected(a, scope, &p2)?
+                    } else {
+                        self.check_expr(a, scope)?
+                    };
                     // `!` unifies with any parameter type: an argument that never
                     // materialises (a block ending in `break`/`return`/`continue`)
                     // coerces, exactly as rustc allows.
@@ -3169,7 +3368,13 @@ impl Sema {
                 Ok(Type::Struct(name.clone(), info.size))
             }
             Expr::ArrayLit(val, n) => {
-                let t = self.check_expr(val, scope)?;
+                // An element integer literal takes the declared element width
+                // (`let b: [u8; 3] = [7; 3]`), else `i64`.
+                let t = if let Some(elem) = self.expected_elem_int.clone() {
+                    self.check_expr_expected(val, scope, &elem)?
+                } else {
+                    self.check_expr(val, scope)?
+                };
                 if !t.is_array_elem() {
                     return Err(format!("array elements must be `i64`, `bool`, a unit enum, a struct or an array, found {t:?}"));
                 }
@@ -3202,14 +3407,22 @@ impl Sema {
             Expr::ArrayList(elems) => {
                 // The parser never produces an empty list: it requires at least
                 // one element before the `]`, so `[]` fails there.
-                let elem_ty = self.check_expr(&mut elems[0], scope)?;
+                let elem_ty = if let Some(elem) = self.expected_elem_int.clone() {
+                    self.check_expr_expected(&mut elems[0], scope, &elem)?
+                } else {
+                    self.check_expr(&mut elems[0], scope)?
+                };
                 if !elem_ty.is_array_elem() {
                     return Err(format!(
                         "array elements must be `i64`, `bool`, a unit enum, a struct or an array, found {elem_ty:?}"
                     ));
                 }
                 for e in elems.iter_mut().skip(1) {
-                    let t = self.check_expr(e, scope)?;
+                    let t = if let Some(elem) = self.expected_elem_int.clone() {
+                        self.check_expr_expected(e, scope, &elem)?
+                    } else {
+                        self.check_expr(e, scope)?
+                    };
                     if t != elem_ty {
                         return Err(format!(
                             "array literal: element type mismatch, expected {elem_ty:?}, found {t:?}"
@@ -3703,9 +3916,23 @@ impl Sema {
                     *e = operand;
                     return Ok(Type::Ref(Box::new(Type::Str), mutability));
                 }
-                *ty = t.clone();
-                *e = Expr::AddrOf { expr: Box::new(operand), ty: t.clone(), mutable: mutability, slot: *slot };
-                Ok(Type::Ref(Box::new(t), mutability))
+                // The referent is the *place* type, which for a dereference is
+                // the node's own referent, not the value it yields: `&mut *m`
+                // on a `*mut u8` borrows a byte (`U8`), even though reading
+                // `*m` yields the `i64` value. Every other place's value type is
+                // its place type.
+                let place_t = match &operand {
+                    Expr::Deref { ty, .. } => ty.clone(),
+                    _ => t.clone(),
+                };
+                *ty = place_t.clone();
+                *e = Expr::AddrOf {
+                    expr: Box::new(operand),
+                    ty: place_t.clone(),
+                    mutable: mutability,
+                    slot: *slot,
+                };
+                Ok(Type::Ref(Box::new(place_t), mutability))
             }
             Expr::Deref { expr, ty } => {
                 // `&str` and `str` share one representation (the record
@@ -3724,8 +3951,14 @@ impl Sema {
                     Type::Ref(inner, _) => {
                         *ty = (*inner).clone();
                         let inner = *inner;
+                        // A byte referent (`*const u8`/`*mut i8`) keeps its byte
+                        // type on the node so codegen emits a one-byte load, but
+                        // the value the program sees is an `i64`: rmc has no
+                        // byte-valued local, so `*p` behaves as `i64` everywhere
+                        // else (printing, arithmetic, comparison).
+                        let value_ty = byte_value_ty(&inner);
                         *e = Expr::Deref { expr: Box::new(operand), ty: inner.clone() };
-                        Ok(inner)
+                        Ok(value_ty)
                     }
                     other => Err(format!("cannot dereference a value of type {other:?}")),
                 }
@@ -3744,7 +3977,11 @@ impl Sema {
                     Type::Ref(referent, _) => {
                         let referent = *referent;
                         *e = Expr::Deref { expr: Box::new(r), ty: referent.clone() };
-                        Ok(referent)
+                        // A byte referent keeps its byte type on the node so
+                        // codegen loads one byte, but the matched value is an
+                        // `i64` (see `byte_value_ty`), so a literal pattern
+                        // `7` compares equal.
+                        Ok(byte_value_ty(&referent))
                     }
                     other => {
                         *e = r;
@@ -3829,6 +4066,19 @@ impl Sema {
                     }
                 }
                 let rt = self.resolve_ty(to)?;
+                // A literal cast folds at compile time to its in-width value, so
+                // `300 as u8` is `44` and `-1 as u32` is `4294967295`; every
+                // other cast is emitted and narrows at run time.
+                if is_int_literal(inner) {
+                    if let Some(v) = const_i64(inner) {
+                        if is_int_ty(&rt) {
+                            let folded = wrap_int(v, int_signed(&rt), int_bits(&rt));
+                            **inner = Expr::Int(folded);
+                            *to = rt.clone();
+                            return Ok(rt);
+                        }
+                    }
+                }
                 // Only scalars can be cast. Casting an integer to an aggregate
                 // would let codegen reinterpret the integer as an address and
                 // read arbitrary memory.
@@ -3847,6 +4097,44 @@ impl Sema {
 /// the address of the `{len, bytes}` record, so they are interchangeable.
 fn is_string_ty(t: &Type) -> bool {
     *t == Type::Str || matches!(t, Type::Ref(i, _) if **i == Type::Str)
+}
+
+/// True for the integer types: the native `i64` and any narrower `Int`. A
+/// `char`, `bool` and an enum are excluded, so this is exactly what arithmetic
+/// and an ordering comparison accept.
+fn is_int_ty(t: &Type) -> bool {
+    matches!(t, Type::I64 | Type::Int { .. })
+}
+
+/// The bit width of an integer type, for the shift-count range and for a cast.
+/// `char` is 32-bit (its scalar value), everything else that reaches here is
+/// 64-bit.
+fn int_bits(t: &Type) -> u16 {
+    match t {
+        Type::Int { bits, .. } => *bits,
+        Type::Char => 32,
+        _ => 64,
+    }
+}
+
+/// The signedness of an integer type: `u*` is unsigned, `i*`/`isize` signed.
+/// A cast to an unsigned width zero-extends, to a signed one sign-extends.
+fn int_signed(t: &Type) -> bool {
+    match t {
+        Type::Int { signed, .. } => *signed,
+        _ => true,
+    }
+}
+
+/// True for an integer literal or a `-`-negated integer literal: the only
+/// expressions that coerce to any integer width, exactly as rustc infers a
+/// literal's type from its expected type.
+fn is_int_literal(e: &Expr) -> bool {
+    match e {
+        Expr::Int(_) => true,
+        Expr::Un(UnOp::Neg, inner) => matches!(inner.as_ref(), Expr::Int(_)),
+        _ => false,
+    }
 }
 
 /// True when a value of type `found` may be used where `expected` is wanted.
@@ -3876,6 +4164,33 @@ fn deref_ty(t: Type) -> Type {
     match t {
         Type::Ref(inner, _) => *inner,
         other => other,
+    }
+}
+
+/// The value type a byte referent yields: `i64`. A `*const u8`/`*mut i8` carries
+/// the byte type on the `Deref` node so codegen emits a one-byte access, but the
+/// value is an `i64` — rmc has no byte-valued local, so a byte read must behave
+/// as an `i64` in printing, arithmetic and comparison. Every non-byte referent is
+/// returned unchanged.
+/// The value type a byte referent yields: the byte-width integer itself. A
+/// `*const u8` read is a `u8` value, so `*p as i64` and `*p + 1` type exactly as
+/// rustc types them; codegen still emits a one-byte load (see `byte_load`).
+fn byte_value_ty(t: &Type) -> Type {
+    match t {
+        Type::U8 => Type::Int { signed: false, bits: 8 },
+        Type::I8 => Type::Int { signed: true, bits: 8 },
+        other => other.clone(),
+    }
+}
+
+/// Normalise a reference referent's byte-ness away for a cast: both the parser's
+/// byte referent (`U8`/`I8`) and the 8-bit `Int` a byte value has are one byte,
+/// so `*mut u8 as *mut i8` and `*mut u8 as *mut i64` compare equal, while a
+/// width mismatch between two non-byte referents stays rejected.
+fn byte_ref_norm(t: &Type) -> Type {
+    match t {
+        Type::U8 | Type::I8 | Type::Int { bits: 8, .. } => Type::I64,
+        other => other.clone(),
     }
 }
 

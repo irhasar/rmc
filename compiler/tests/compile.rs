@@ -3405,15 +3405,15 @@ fn an_array_of_structs_compiles() {
 }
 
 #[test]
-fn an_array_of_payload_enums_is_still_rejected() {
-    // A payload enum is not a fixed-width scalar; rustc rejects it as an array
-    // element too, so rmc must give a clean error rather than miscompile.
-    let err = compile_to_asm(
-        "enum O { N, S(i64) } fn main() -> i64 { let a: [O; 2] = [O::N, O::S(1)]; return 0; }",
+fn an_array_of_payload_enums_is_allowed() {
+    // A payload enum is a fixed-width aggregate (tag + widest payload), so rustc
+    // accepts it as an array element; rmc lays the element out at the enum's
+    // size and indexes it like any other aggregate element.
+    assert!(compile_to_asm(
+        "enum O { N, S(i64) } fn main() { let a: [O; 2] = [O::N, O::S(1)]; let v = match a[1] { O::S(v) => v, O::N => 0 }; println!(\"{}\", v); }",
         &CompileOptions::default(),
     )
-    .unwrap_err();
-    assert!(err.contains("array elements must be"), "got: {err}");
+    .is_ok());
 }
 
 #[test]
@@ -3613,12 +3613,12 @@ fn a_struct_and_an_enum_cannot_share_a_name() {
 #[test]
 fn a_unit_enum_array_is_allowed() {
     // A unit enum occupies one 8-byte slot and codegen emits it like `i64`, so
-    // `[E; N]` lays out and indexes correctly. A payload enum is still rejected.
+    // `[E; N]` lays out and indexes correctly. A payload enum is a fixed-width
+    // aggregate and rustc accepts it as an element too, so rmc does as well.
     let ok = "enum C { A, B } fn main() -> i64 { let a: [C; 2] = [C::A, C::B]; return a[1] as i64; }";
     assert!(compile_to_asm(ok, &CompileOptions::default()).is_ok());
-    let bad = "enum O { N, S(i64) } fn main() -> i64 { let a: [O; 2] = [O::N; 2]; return 0; }";
-    let err = compile_to_asm(bad, &CompileOptions::default()).unwrap_err();
-    assert!(err.contains("array elements must be"), "got: {err}");
+    let payload = "enum O { N, S(i64) } fn main() { let a: [O; 2] = [O::N; 2]; let v = match a[0] { O::S(v) => v, O::N => 0 }; println!(\"{}\", v); }";
+    assert!(compile_to_asm(payload, &CompileOptions::default()).is_ok());
 }
 
 #[test]

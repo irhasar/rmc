@@ -427,7 +427,7 @@ impl Parser {
                 }
                 let neg = self.eat(&Tok::Minus);
                 match self.peek().cloned() {
-                    Some(Tok::Int(n)) => {
+                    Some(Tok::Int(n)) | Some(Tok::IntSuffixed(n, _)) => {
                         self.bump();
                         discr = Some(if neg {
                             n.checked_neg().ok_or_else(|| {
@@ -868,7 +868,7 @@ impl Parser {
             other => other,
         };
         match ty {
-            Type::I64 | Type::Bool | Type::Char => Ok(ty),
+            Type::I64 | Type::Bool | Type::Char | Type::Int { .. } => Ok(ty),
             other => Err(format!(
                 "at byte {pos}: constant `{name}` has type {other:?}; rmc only folds `i64`, `bool` and `char` constants"
             )),
@@ -908,6 +908,39 @@ impl Parser {
             }
         }
         elem_byte_width(&cur)
+    }
+
+    /// The byte type a referent *name* denotes, if any: `u8` -> `U8`, `i8` ->
+    /// `I8`, following `type` aliases (`type Byte = u8`). `None` for every other
+    /// name, so the byte type only appears where the source wrote a byte width.
+    fn byte_referent(&self, name: &str) -> Option<Type> {
+        let mut cur = name.to_string();
+        for _ in 0..64 {
+            match self.alias_target.get(&cur) {
+                Some(next) if *next != cur => cur = next.clone(),
+                _ => break,
+            }
+        }
+        match cur.as_str() {
+            "u8" => Some(Type::U8),
+            "i8" => Some(Type::I8),
+            _ => None,
+        }
+    }
+
+    /// Parse the referent of a `*const`/`*mut`/`&` type. A byte width named
+    /// here is kept as a byte type; every other referent goes through
+    /// `parse_type`, which collapses `u8`-named non-byte aliases to `i64`. This
+    /// is why a `*const u8` load or store is one byte while `*p` still yields
+    /// an `i64`: the byte-ness lives only in the referent.
+    fn parse_referent_type(&mut self) -> PResult<Type> {
+        if let Some(Tok::Ident(n)) = self.peek().cloned() {
+            if let Some(bt) = self.byte_referent(&n) {
+                self.i += 1;
+                return Ok(bt);
+            }
+        }
+        self.parse_type()
     }
 
     /// `type NAME = TYPE;`. The target is parsed here (aliases in it expanded by
@@ -1012,7 +1045,7 @@ impl Parser {
             Type::Unit
         };
         let body = self.parse_block()?;
-        Ok(FnDef { name, self_ty: None, takes_self: false, ref_self: false, ref_self_mut: false, params, param_mut, param_pats, ret, body, param_slots: Vec::new(), ret_slot: -1, nslots: 0 })
+        Ok(FnDef { name, self_ty: None, takes_self: false, ref_self: false, ref_self_mut: false, self_mut: false, params, param_mut, param_pats, ret, body, param_slots: Vec::new(), ret_slot: -1, nslots: 0 })
     }
 
     /// `impl Type { fn method(self, ..) -> .. { .. } }`. The methods are pushed
@@ -1056,25 +1089,33 @@ impl Parser {
         let takes_self = match self.peek() {
             Some(Tok::Amp) => true,
             Some(Tok::Ident(n)) => n == "self",
+            // `mut self`: the receiver is by value but the binding is mutable.
+            Some(Tok::Mut) => matches!(
+                self.toks.get(self.i + 1).map(|t| &t.tok),
+                Some(Tok::Ident(n)) if n == "self"
+            ),
             _ => false,
         };
         let mut params = Vec::new();
         let mut param_mut = Vec::new();
         let mut param_pats = Vec::new();
-        let (by_ref, by_mut) = if takes_self {
+        let (by_ref, by_mut, self_mut) = if takes_self {
             let by_ref = self.eat(&Tok::Amp);
+            // `&mut self` makes the receiver a `&mut`; a by-value `mut self`
+            // only makes the local binding mutable, so it does not set `by_mut`.
             let by_mut = by_ref && self.eat(&Tok::Mut);
+            let self_mut = !by_ref && self.eat(&Tok::Mut);
             let first = self.expect_ident()?;
             debug_assert_eq!(first, "self");
             if self.eat(&Tok::Comma) {
                 self.parse_param_list(&mut params, &mut param_mut, &mut param_pats)?;
             }
-            (by_ref, by_mut)
+            (by_ref, by_mut, self_mut)
         } else {
             if self.peek() != Some(&Tok::RParen) {
                 self.parse_param_list(&mut params, &mut param_mut, &mut param_pats)?;
             }
-            (false, false)
+            (false, false, false)
         };
         self.expect(Tok::RParen)?;
         Self::check_dup_param_names(&params, &param_pats)?;
@@ -1086,6 +1127,7 @@ impl Parser {
             takes_self,
             ref_self: by_ref,
             ref_self_mut: by_mut,
+            self_mut,
             params,
             param_mut,
             param_pats,
@@ -1280,7 +1322,7 @@ impl Parser {
                     ))
                 }
             };
-            let inner = self.parse_type()?;
+            let inner = self.parse_referent_type()?;
             return Ok(Type::Ref(Box::new(inner), mutable));
         }
         if self.eat(&Tok::Amp) {
@@ -1290,12 +1332,14 @@ impl Parser {
                 self.i += 1;
             }
             let mutable = self.eat(&Tok::Mut);
-            let inner = self.parse_type()?;
+            let inner = self.parse_referent_type()?;
             return Ok(Type::Ref(Box::new(inner), mutable));
         }
-        // `&&T` lexes as one token; treat it as two references.
+        // `&&T` lexes as one token; treat it as two references. The innermost
+        // referent goes through `parse_referent_type` too, so `&&u8` keeps the
+        // byte type and matches a reference to an existing `&u8`.
         if self.eat(&Tok::AmpAmp) {
-            let inner = self.parse_type()?;
+            let inner = self.parse_referent_type()?;
             return Ok(Type::Ref(Box::new(Type::Ref(Box::new(inner), false)), false));
         }
         match self.peek() {
@@ -2382,6 +2426,7 @@ impl Parser {
         matches!(
             self.peek(),
             Some(Tok::Int(_))
+                | Some(Tok::IntSuffixed(..))
                 | Some(Tok::Str(_))
                 | Some(Tok::Ident(_))
                 | Some(Tok::True)
@@ -2706,7 +2751,16 @@ impl Parser {
                             };
                             Expr::Call {
                                 name: fill.into(),
-                                args: vec![addr, count_use, args[0].clone()],
+                                // The count is the single-eval temporary (a
+                                // side-effecting count must not run twice), and
+                                // the fill helpers write a whole word, so a
+                                // narrow element (`vec![7u8; n]`) is widened to
+                                // `i64`; the identity cast folds away.
+                                args: vec![
+                                    addr,
+                                    count_use,
+                                    Expr::Cast(Box::new(args[0].clone()), Type::I64),
+                                ],
                                 arg_slots: Vec::new(),
                                 ret_slot: -1,
                                 ret_ty: Type::I64,
@@ -3842,6 +3896,16 @@ impl Parser {
                     self.i += 1;
                     return Ok(Expr::Int(i64::MIN));
                 }
+                // `-128i8` is the literal `-128`: fold the sign into the
+                // suffixed magnitude before narrowing, so the width check sees
+                // 128 (in range) rather than the cast's wrapped -128 (whose
+                // negation back to 128 is out of range). `-1u8` negates an
+                // unsigned literal, which the check below rejects.
+                if let Some(Tok::IntSuffixed(v, s)) = self.peek().cloned() {
+                    let pos = self.pos();
+                    self.i += 1;
+                    return suffixed_int_lit(v, &s, true, pos);
+                }
                 let e = self.parse_unary()?;
                 Ok(Expr::Un(UnOp::Neg, Box::new(e)))
             }
@@ -4049,6 +4113,11 @@ impl Parser {
                 format!("at byte {}: pattern literal out of range", self.pos())
             })?),
             Tok::Int(v) => Ok(v),
+            // A suffixed pattern literal (`200u8`) is typed at its width, so a
+            // `match x { 200u8 => .. }` on a `u8` compares against `200` and a
+            // magnitude that does not fit is an error, exactly as the
+            // expression `200u8` is.
+            Tok::IntSuffixed(v, s) => suffixed_int_value(v, &s, neg, self.pos()),
             Tok::IntMinMagnitude if neg => Ok(i64::MIN),
             Tok::IntMinMagnitude => Err(format!(
                 "at byte {}: integer literal `9223372036854775808` is out of range for `i64`",
@@ -4088,7 +4157,7 @@ impl Parser {
                 self.i += 1;
                 Ok(Pat::Wild)
             }
-            Some(Tok::Minus) | Some(Tok::Int(_)) => {
+            Some(Tok::Minus) | Some(Tok::Int(_)) | Some(Tok::IntSuffixed(..)) => {
                 let lo = self.parse_signed_pat_int()?;
                 self.maybe_range(lo)
             }
@@ -5766,6 +5835,14 @@ impl Parser {
                 self.i += 1;
                 Ok(Expr::Int(v))
             }
+            // A suffixed literal (`200u8`) names its width: the value is
+            // kept in it for later arithmetic, and a magnitude that does not
+            // fit is an error, exactly as rustc reports.
+            Some(Tok::IntSuffixed(v, s)) => {
+                let pos = self.pos();
+                self.i += 1;
+                suffixed_int_lit(v, &s, false, pos)
+            }
             Some(Tok::Char(c)) => {
                 self.i += 1;
                 Ok(Expr::Char(c))
@@ -6309,19 +6386,120 @@ fn stmt_has_call_p(s: &Stmt) -> bool {
     }
 }
 
-/// The built-in integer-width type names. rmc has one integer type, `i64`, but
-/// a Rust source spells widths (`usize`, `u32`, `i8`, ...). Each is pre-seeded
-/// as a transparent alias for `i64` so `let i: usize = 0;` and
-/// `x as usize` parse; the value is `i64` throughout, so the alias is exactly
-/// what a `type usize = i64;` would give. A program may shadow any of them with
-/// its own `type`, which is why this is the alias map and not a reserved word.
+/// The built-in integer-width type names. A Rust source spells widths
+/// (`usize`, `u32`, `i8`, ...); rmc resolves each to its real width so
+/// arithmetic wraps and a cast truncates as rustc does. `i64`/`isize`/`u64`/
+/// `usize` stay the native 64-bit `Type::I64` (rmc's only pre-width integer, so
+/// a 64-bit program is unchanged); a narrower width becomes `Type::Int`. A
+/// program may shadow any of them with its own `type`, which is why this is the
+/// alias map and not a reserved word.
 fn builtin_aliases() -> std::collections::HashMap<String, Type> {
     let mut m = std::collections::HashMap::new();
-    for name in [
-        "usize", "isize", "u8", "u16", "u32", "u64", "u128",
-        "i8", "i16", "i32", "i128",
+    for (name, ty) in [
+        ("usize", Type::I64),
+        ("isize", Type::I64),
+        ("u64", Type::I64),
+        ("i64", Type::I64),
+        ("u8", Type::Int { signed: false, bits: 8 }),
+        ("u16", Type::Int { signed: false, bits: 16 }),
+        ("u32", Type::Int { signed: false, bits: 32 }),
+        ("u128", Type::Int { signed: false, bits: 128 }),
+        ("i8", Type::Int { signed: true, bits: 8 }),
+        ("i16", Type::Int { signed: true, bits: 16 }),
+        ("i32", Type::Int { signed: true, bits: 32 }),
+        ("i128", Type::Int { signed: true, bits: 128 }),
     ] {
-        m.insert(name.to_string(), Type::I64);
+        m.insert(name.to_string(), ty);
     }
     m
+}
+
+/// Build the expression for an integer literal carrying a width suffix
+/// (`200u8`, `-128i8`). The value is folded to the width the way rustc does:
+/// the magnitude must fit, an unsigned suffix cannot be negated, and a fitting
+/// value is kept in-range (a negative signed value is the negated magnitude).
+/// A suffix naming the native width (`5i64`) is a plain `i64` with the same
+/// range check. `neg` is true when the literal is the operand of a `-`.
+fn suffixed_int_lit(v: i64, s: &str, neg: bool, pos: u32) -> PResult<Expr> {
+    let (ty, value) = suffixed_int_typed(v, s, neg, pos)?;
+    // A literal keeps its width so arithmetic on it overflows at that width
+    // (`200u8 + 100` is an overflow, as rustc reports). The cast is folded to
+    // the in-range value by sema; a native-width suffix is a plain `i64`.
+    match ty {
+        Type::I64 => Ok(Expr::Int(value)),
+        ty => Ok(Expr::Cast(Box::new(Expr::Int(value)), ty)),
+    }
+}
+
+/// The in-range value of a suffixed integer literal and the width it names,
+/// shared by an expression literal and a pattern literal.
+fn suffixed_int_typed(v: i64, s: &str, neg: bool, pos: u32) -> PResult<(Type, i64)> {
+    let ty = match suffix_int_ty(s) {
+        Some(ty) => ty,
+        None => {
+            return Err(format!("at byte {pos}: invalid integer-literal suffix `{s}`"));
+        }
+    };
+    let (signed, bits) = match ty {
+        Type::I64 => (true, 64u16),
+        Type::Int { signed, bits } => (signed, bits),
+        _ => (true, 64),
+    };
+    if neg && !signed {
+        return Err(format!(
+            "at byte {pos}: cannot apply unary `-` to an unsigned integer `{s}`"
+        ));
+    }
+    // A negative signed literal is the negated magnitude; the magnitude must be
+    // at most `|MIN|`, which is `MAX + 1`.
+    let mag_limit: i128 = if neg && signed {
+        if bits >= 128 {
+            i128::MAX
+        } else {
+            1i128 << (bits - 1)
+        }
+    } else if signed {
+        if bits >= 128 {
+            i128::MAX
+        } else {
+            (1i128 << (bits - 1)) - 1
+        }
+    } else if bits >= 128 {
+        i128::MAX
+    } else {
+        (1i128 << bits) - 1
+    };
+    if (v as i128) > mag_limit {
+        return Err(format!(
+            "at byte {pos}: literal out of range for `{}`",
+            int_width_name(signed, bits)
+        ));
+    }
+    let value = if neg { -(v as i128) } else { v as i128 };
+    Ok((ty, value as i64))
+}
+
+/// The in-range value of a suffixed integer literal, for a pattern position
+/// (which does not carry the width onward).
+fn suffixed_int_value(v: i64, s: &str, neg: bool, pos: u32) -> PResult<i64> {
+    suffixed_int_typed(v, s, neg, pos).map(|(_, value)| value)
+}
+
+/// The Rust name of an integer width, for an out-of-range diagnostic.
+fn int_width_name(signed: bool, bits: u16) -> String {
+    if bits == 64 && signed {
+        "i64".into()
+    } else if bits == 64 {
+        "u64".into()
+    } else {
+        format!("{}{bits}", if signed { "i" } else { "u" })
+    }
+}
+
+/// The type an integer-literal suffix names (`200u8` -> `u8`). A width that
+/// names the native 64-bit integer (`i64`/`u64`/`isize`/`usize`) resolves to
+/// `Type::I64`; a narrower or wider one to its `Type::Int`. `None` for a
+/// non-suffix, which the lexer already rejects before this is reached.
+fn suffix_int_ty(s: &str) -> Option<Type> {
+    builtin_aliases().remove(s)
 }

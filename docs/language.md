@@ -21,7 +21,11 @@ are no runtime type errors.
 | `Name`       | a `type` alias declared with `type Name = T;` |
 | `()`         | unit, the result of a statement or `main`     |
 
-Integer, boolean and character literals are inferred. The smallest `i64` value
+Integer, boolean and character literals are inferred. An integer literal may
+carry a width suffix (`200u8`, `1i64`, `0xffu32`, `100usize`); the value is typed
+at that width, so `200u8 + 100` is an overflow (as in Rust) and a magnitude that
+does not fit (`300u8`, `128i8`) is a compile error. A suffix naming the native
+64-bit integer (`i64`/`u64`/`isize`/`usize`) is a plain `i64`. The smallest `i64` value
 is written `-9223372036854775808` (or `-0x8000000000000000`); the magnitude
 alone is out of range, as in Rust. A `char` literal is a single Unicode scalar
 in single quotes, with the usual escapes (`\n`, `\t`, `\r`, `\0`, `\'`, `\\`,

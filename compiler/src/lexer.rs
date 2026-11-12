@@ -5,6 +5,12 @@ pub enum Tok {
     // literals / identifiers
     Ident(String),
     Int(i64),
+    /// An integer literal with a width suffix (`200u8`, `1i64`, `0xffu32`).
+    /// The value is the raw magnitude; the suffix names the width, which the
+    /// parser types at that width and keeps in it for later arithmetic.
+    /// A suffix that names the native width (`i64`/`u64`/`isize`/`usize`) keeps
+    /// the plain `i64` value.
+    IntSuffixed(i64, String),
     /// The magnitude `2^63`, which does not fit an `i64` but is the operand of
     /// the `i64::MIN` literal `-9223372036854775808`. The parser folds it into
     /// `Expr::Int(i64::MIN)` only when it directly follows a `-`; anywhere else
@@ -101,6 +107,7 @@ impl Tok {
         match self {
             Tok::Ident(s) => format!("identifier `{s}`"),
             Tok::Int(v) => format!("integer `{v}`"),
+            Tok::IntSuffixed(v, s) => format!("integer `{v}{s}`"),
             Tok::IntMinMagnitude => "integer `9223372036854775808`".into(),
             Tok::Str(_) => "string literal".into(),
             Tok::Char(c) => format!("character `{}`", char::from_u32(*c).unwrap_or('\u{fffd}')),
@@ -393,12 +400,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             } else {
                 (raw.as_str(), 10)
             };
-            // A trailing integer suffix (`1i64`, `0u8`, `0xffu32`) is not part of
-            // the value: split off the leading run of radix digits and check the
-            // rest against the known suffixes. rmc is `i64`-only, so every
-            // suffix is accepted and lowered to the same value (a `u8`/`u32`
-            // suffix does not change the representation), which lets a Rust
-            // source that names an integer width compile unchanged.
+            // A trailing integer suffix (`1i64`, `0u8`, `0xffu32`) names the
+            // literal's width: split off the leading run of radix digits and
+            // check the rest against the known suffixes. The suffix is kept on
+            // the token so the parser can narrow the value the way rustc does
+            // (`200u8` is `200`, `300u8` is an error); an unsuffixed literal is `i64`.
             let digits_len = body
                 .find(|c: char| c.to_digit(radix).is_none())
                 .unwrap_or(body.len());
@@ -407,17 +413,22 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 return Err(format!("invalid integer literal `{raw}` at byte {start}"));
             }
             let v = i64::from_str_radix(digits, radix);
-            match v {
-                Ok(v) => out.push(Token { tok: Tok::Int(v), pos }),
+            let tok = match v {
+                Ok(v) => {
+                    if suffix.is_empty() {
+                        Tok::Int(v)
+                    } else {
+                        Tok::IntSuffixed(v, suffix.to_string())
+                    }
+                }
                 // The one magnitude above `i64::MAX` that a `-` can make valid:
                 // the operand of `i64::MIN`. Defer the sign check to the parser.
-                Err(_) if is_i64_min_magnitude(digits, radix) => {
-                    out.push(Token { tok: Tok::IntMinMagnitude, pos })
-                }
+                Err(_) if is_i64_min_magnitude(digits, radix) => Tok::IntMinMagnitude,
                 Err(_) => {
                     return Err(format!("invalid integer literal `{raw}` at byte {start}"));
                 }
-            }
+            };
+            out.push(Token { tok, pos });
             continue;
         }
         // three-char operators (must precede `<<`/`>>`)
@@ -521,9 +532,9 @@ fn is_i64_min_magnitude(digits: &str, radix: u32) -> bool {
 }
 
 /// True when `s` is a Rust integer-literal suffix (`i8`..`i128`, `u8`..`u128`,
-/// `isize`/`usize`). rmc is `i64`-only, so a suffix is accepted but discarded:
-/// the literal's value is unchanged. This lets a Rust source that names a width
-/// (`0u8`, `1i64`, `100usize`) compile, which matters for a `.rs` file.
+/// `isize`/`usize`). The suffix names the literal's width; the parser narrows
+/// the value at it and keeps it in the width, so a Rust source that
+/// names a width compiles and behaves as rustc does.
 fn is_int_suffix(s: &str) -> bool {
     matches!(
         s,
