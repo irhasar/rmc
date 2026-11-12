@@ -3572,6 +3572,15 @@ impl<'a> FnGen<'a> {
         // accumulator pattern (`_acc = Add(_acc, k)`), which copy propagation
         // exposes by rewriting `_acc = Add(_tmp, k); _tmp = copy _acc` into a
         // self-update. It saves the value's trip through `%rax`.
+        //
+        // The destination can be *either* operand: rustc prints `x = x + y` as
+        // `Add(copy y, copy x)` in some pipelines and `Add(copy x, copy y)` in
+        // others, so `_acc` may be the second operand. Writing `a` into `reg`
+        // first would then overwrite the accumulator before it is read
+        // (`_acc = Add(x, _acc)` became `x + x`), so the operand that is the
+        // destination decides the order: a commutative operator with `_acc` on
+        // the right is folded right-to-left, and `Sub` — whose accumulator is
+        // always the left operand — computes `a` first and reads `_acc` after.
         if dest.proj.is_empty()
             && matches!(
                 op,
@@ -3580,7 +3589,30 @@ impl<'a> FnGen<'a> {
             && self.promo.contains_key(&dest.local)
         {
             let reg = self.promo[&dest.local].reg.to_string();
-            if !operand_is_local(a, dest.local) {
+            let acc_left = operand_is_local(a, dest.local);
+            let acc_right = operand_is_local(b, dest.local);
+            if acc_right && op != BinOp::Sub {
+                // Commutative, accumulator on the right: `_acc = x op _acc`
+                // is `_acc op= x`. `keep_rax` leaves `reg` (the accumulator)
+                // live, so the old value is not lost.
+                let (xv, _) = self.eval_operand_keep_rax(a)?;
+                let xv = self.wide_imm(&xv, "%rcx");
+                self.emit(&format!("  {} {xv}, {reg}", alu_mnem(op)));
+                return Ok(());
+            }
+            if acc_right {
+                // `_acc = x - _acc`: compute `x` before reading `_acc`, since
+                // the subtraction is not commutative.
+                let (xv, _) = self.eval_operand(a)?;
+                if xv != "%rax" {
+                    self.emit(&format!("  mov {xv}, %rax"));
+                }
+                let (acc, _) = self.eval_operand_keep_rax(b)?;
+                self.emit(&format!("  sub {acc}, %rax"));
+                self.emit(&format!("  mov %rax, {reg}"));
+                return Ok(());
+            }
+            if !acc_left {
                 let (av, _) = self.eval_operand(a)?;
                 if av != reg {
                     self.emit(&format!("  mov {av}, {reg}"));
@@ -4117,14 +4149,30 @@ impl<'a> FnGen<'a> {
                 }
                 self.emit("  imul %rcx");
                 if add {
+                    // `m` does not fit a positive `i64`, so `imul` multiplied by
+                    // its negative two's-complement value and the product does
+                    // not carry the dividend's sign. Fold in the bias first, then
+                    // take the correction term from the dividend copy in `%r10`.
                     self.emit("  add %r10, %rdx");
+                    if s > 0 {
+                        self.emit(&format!("  sar ${s}, %rdx"));
+                    }
+                    self.emit("  mov %r10, %rcx");
+                    self.emit("  shr $63, %rcx");
+                    self.emit("  add %rcx, %rdx");
+                } else {
+                    // `m` is positive, so the product has the dividend's sign,
+                    // which is `%rdx >> 63`; taking the correction term from
+                    // `%rdx` straight after the `imul` keeps the `%r10` copy off
+                    // the critical path (only the `add` above reads it, and only
+                    // when `add` is set, which is not this branch).
+                    self.emit("  mov %rdx, %rcx");
+                    self.emit("  shr $63, %rcx");
+                    if s > 0 {
+                        self.emit(&format!("  sar ${s}, %rdx"));
+                    }
+                    self.emit("  add %rcx, %rdx");
                 }
-                if s > 0 {
-                    self.emit(&format!("  sar ${s}, %rdx"));
-                }
-                self.emit("  mov %r10, %rcx");
-                self.emit("  shr $63, %rcx");
-                self.emit("  add %rcx, %rdx");
                 if d < 0 {
                     self.emit("  neg %rdx");
                 }
@@ -5522,7 +5570,172 @@ fn optimize(body: &str) -> String {
         body = drop_unread_stores(&body);
         body = drop_noop_arith(&body);
     }
+    body = interleave_div_pairs(&body);
     body
+}
+
+/// Interleave two adjacent `mul`/`div`-by-constant units so the two long
+/// `imul` latencies overlap. `mandel`'s inner loop computes `zr*zr/1000` and
+/// `zi*zi/1000`, two independent units the emitter writes back to back. Each
+/// unit is short, so the CPU cannot hide the second `imul` behind the first
+/// unit's tail and the pair runs serially; issuing the second multiply above
+/// the first division lets it run while the first chain is still in flight,
+/// which the hand-built interleave measured at LLVM parity.
+///
+/// A unit is `mov src, %rax; imul src, %rax; mov %rax, %r10; <divide by a
+/// constant>`: the product in `%rax`, saved to `%r10` as the division's
+/// dividend, then the magic-multiply divide. Two adjacent units are independent
+/// when they name the same constant (the same shift and magic multiplier) and
+/// take their products from different registers. The transform parks the two
+/// products in `%r10`/`%r11` -- scratch in this path (see `gen_div_const`) and
+/// never promoted -- and runs the two divides back to back:
+///
+///   mov A, %rax; imul A, %rax; mov %rax, %r10; <div>   ->  mov A, %rax; imul A, %rax
+///   mov B, %rax; imul B, %rax; mov %rax, %r10; <div>       mov %rax, %r10
+///                                                          mov B, %rax; imul B, %rax
+///                                                          mov %rax, %r11
+///                                                          mov %r10, %rax; <div A>
+///                                                          mov %r11, %rax; <div B>
+fn interleave_div_pairs(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if let Some((a, b)) = match_div_pair(&lines, i) {
+            emit_unit_pair(&mut out, &lines, &a, &b);
+            i = b.end;
+            continue;
+        }
+        out.push_str(lines[i]);
+        out.push('\n');
+        i += 1;
+    }
+    out
+}
+
+/// One `mul`-then-`div`-by-constant unit: the register the product is taken
+/// from, the divide's magic multiplier and shift, and its span in the body.
+struct DivUnit {
+    src: String,
+    magic: String,
+    shift: String,
+    start: usize,
+    end: usize,
+}
+
+/// The divide half of a unit: `mov %rax, %r10` (the dividend save), a magic
+/// constant into `%rcx`, an `imul %rcx`, the sign-correction tail, and the
+/// quotient store out of `%rdx`. The tail only reads `%r10`/`%r11`, never
+/// writes them, so the caller may hold the other unit's dividend there.
+fn read_div_block(lines: &[&str], start: usize) -> Option<(usize, String, String, String)> {
+    if lines.get(start)?.trim() != "mov %rax, %r10" {
+        return None;
+    }
+    let limit = (start + 20).min(lines.len());
+    let (mut magic, mut shift, mut saw_imul) = (None, None, false);
+    let mut j = start + 1;
+    while j < limit {
+        let t = lines[j].trim();
+        if t.is_empty() || t.ends_with(':') || t.starts_with('.') {
+            return None;
+        }
+        if t.starts_with("j") || t.starts_with("call") {
+            return None;
+        }
+        // The tail must not touch the two scratch registers the caller parks
+        // the products in. The `add`-biased divide reads `%r10` for its sign
+        // correction, so it is rejected here; only the plain magic divide,
+        // whose correction comes from `%rdx`, is safe to interleave.
+        if t.contains("%r10") || t.contains("%r11") {
+            return None;
+        }
+        if let Some(rest) = t.strip_prefix("movabs $") {
+            let (m, reg) = rest.split_once(", ")?;
+            if reg != "%rcx" || magic.is_some() {
+                return None;
+            }
+            magic = Some(m.to_string());
+        } else if t == "imul %rcx" {
+            saw_imul = true;
+        } else if let Some(rest) = t.strip_prefix("sar $") {
+            if let Some((s, reg)) = rest.split_once(", ") {
+                if reg == "%rdx" && shift.is_none() {
+                    shift = Some(s.to_string());
+                }
+            }
+        } else if let Some(dst) = t.strip_prefix("mov %rdx, ") {
+            // The chain has two `mov %rdx, ..`: the sign correction writes the
+            // scratch `%rcx`, and the final quotient store writes a real
+            // register. Skip the former and end at the latter.
+            if matches!(dst, "%rax" | "%rcx" | "%rdx" | "%r10" | "%r11") {
+                j += 1;
+                continue;
+            }
+            if !is_reg(dst) {
+                return None;
+            }
+            if !saw_imul {
+                return None;
+            }
+            return Some((
+                j - start + 1,
+                dst.to_string(),
+                magic?,
+                shift.unwrap_or_else(|| "0".to_string()),
+            ));
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Read a full unit at `start`: `mov src, %rax; imul src, %rax`, then the divide
+/// block. `src` must be a plain register that is not one of the two scratch
+/// registers the transform parks products in.
+fn read_div_unit(lines: &[&str], start: usize) -> Option<DivUnit> {
+    let load = lines.get(start)?.trim();
+    let (src, dst) = load.strip_prefix("mov ")?.split_once(", ")?;
+    if dst != "%rax" || !is_reg(src) || matches!(src, "%r10" | "%r11") {
+        return None;
+    }
+    if lines.get(start + 1)?.trim() != format!("imul {src}, %rax") {
+        return None;
+    }
+    let (len, _dst, magic, shift) = read_div_block(lines, start + 2)?;
+    Some(DivUnit { src: src.to_string(), magic, shift, start, end: start + 2 + len })
+}
+
+/// Match two adjacent units that divide by the same constant from different
+/// registers, so they are the two independent halves of one expression pair.
+fn match_div_pair(lines: &[&str], start: usize) -> Option<(DivUnit, DivUnit)> {
+    let a = read_div_unit(lines, start)?;
+    let b = read_div_unit(lines, a.end)?;
+    if a.magic != b.magic || a.shift != b.shift || a.src == b.src {
+        return None;
+    }
+    Some((a, b))
+}
+
+/// Emit the two units with the second multiply hoisted above the first divide.
+fn emit_unit_pair(out: &mut String, lines: &[&str], a: &DivUnit, b: &DivUnit) {
+    let line = |out: &mut String, s: &str| {
+        out.push_str(s);
+        out.push('\n');
+    };
+    line(out, lines[a.start]);
+    line(out, lines[a.start + 1]);
+    line(out, "  mov %rax, %r10");
+    line(out, lines[b.start]);
+    line(out, lines[b.start + 1]);
+    line(out, "  mov %rax, %r11");
+    line(out, "  mov %r10, %rax");
+    for l in &lines[a.start + 3..a.end] {
+        line(out, l);
+    }
+    line(out, "  mov %r11, %rax");
+    for l in &lines[b.start + 3..b.end] {
+        line(out, l);
+    }
 }
 
 /// Drop an arithmetic instruction that cannot change its destination: `add $0`
@@ -6152,5 +6365,70 @@ fn main() -> () {
         let flags = "  add $0, %rcx\n  jle .Lx\n";
         let out = drop_noop_arith(flags);
         assert!(out.contains("add $0"), "flagged add wrongly dropped:\n{out}");
+    }
+
+    /// Two adjacent `mul`/`div`-by-constant units are interleaved: the second
+    /// multiply is hoisted above the first divide so the two latencies overlap.
+    #[test]
+    fn adjacent_division_units_are_interleaved() {
+        let body = "\
+  mov %rsi, %rax
+  imul %rsi, %rax
+  mov %rax, %r10
+  movabs $2361183241434822607, %rcx
+  imul %rcx
+  mov %rdx, %rcx
+  shr $63, %rcx
+  sar $7, %rdx
+  add %rcx, %rdx
+  mov %rdx, %r8
+  mov %rdi, %rax
+  imul %rdi, %rax
+  mov %rax, %r10
+  movabs $2361183241434822607, %rcx
+  imul %rcx
+  mov %rdx, %rcx
+  shr $63, %rcx
+  sar $7, %rdx
+  add %rcx, %rdx
+  mov %rdx, %r9
+";
+        let out = interleave_div_pairs(body);
+        // Both multiplies appear before the first divide's `movabs`.
+        let first_movabs = out.find("movabs").expect("a movabs");
+        let second_imul = out.match_indices("imul %rsi, %rax")
+            .chain(out.match_indices("imul %rdi, %rax"))
+            .map(|(i, _)| i)
+            .max()
+            .expect("an imul");
+        assert!(
+            second_imul < first_movabs,
+            "the second multiply must precede the first divide:\n{out}"
+        );
+        assert_eq!(
+            out.matches("movabs").count(),
+            2,
+            "both divides survive:\n{out}"
+        );
+    }
+
+    /// A lone division unit (no adjacent partner) is left untouched, so the
+    /// pass never rewrites an unpaired divide.
+    #[test]
+    fn a_lone_division_unit_is_not_rewritten() {
+        let body = "\
+  mov %rsi, %rax
+  imul %rsi, %rax
+  mov %rax, %r10
+  movabs $2361183241434822607, %rcx
+  imul %rcx
+  mov %rdx, %rcx
+  shr $63, %rcx
+  sar $7, %rdx
+  add %rcx, %rdx
+  mov %rdx, %r8
+  add %r8, %r9
+";
+        assert_eq!(interleave_div_pairs(body), body, "an unpaired divide moved");
     }
 }

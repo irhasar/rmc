@@ -5,3 +5,6 @@ __pycache__/
 # Stray build artifacts
 compiler/c.bin
 compiler/c.err
+
+# rustc codegen-backend build artifacts
+backend/target/
