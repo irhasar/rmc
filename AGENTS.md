@@ -454,8 +454,14 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   `&x.field`): rmc's `&T` carries no guarantee that it is dereferenceable, so a
   speculative load out of a loop that might never run could fault where the
   source would not. `refs` binds its reference to a local, so the read is hoisted
-  and `refs` now wins (~2.2x an honest rustc twin, which `black_box`es a term, or
-  LLVM closes the whole loop into `128 * n`). A loop that reads through a
+  and `refs` now wins (~1.7x). The benchmark keeps the loop real for *both*
+  compilers without an in-loop `black_box`: the struct is built from an opaque
+  `black_box`ed seed (so LLVM cannot constant-fold the accessor sum) and the
+  accumulator is reduced by a data-dependent branch (so LLVM can neither close
+  the loop into `K * n` nor vectorise it). An earlier design put `black_box`
+  inside the loop and reported 2.2x; that number was withdrawn because rmc
+  lowers `black_box` to the identity while rustc makes it opaque, so the barrier
+  charged rustc a store/reload rmc never emitted. A loop that reads through a
   reference of unproven origin (a parameter, a cast, a mutable ref) still reloads
   every iteration and loses; that is the honest limit, and the gap is the
   reference, not the arithmetic. The fold is deliberately *one* level
@@ -1193,12 +1199,24 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   referent (`0 as &i64` is accepted), so a speculative deref of a reference of
   unknown origin can fault on a loop that never runs, where the in-body read
   would not. `refs` binds its reference to a local, so the accessor sum is
-  hoisted and rmc wins (~2.2x). A loop that reads through an unproven reference
+  hoisted and rmc wins (~1.7x). A loop that reads through an unproven reference
   (a parameter, a cast, a mutable ref) is still recomputed every iteration and
-  loses; a frame-based loop of the same shape is hoisted and wins. Keeping the
-  Rust loop real needs an in-loop `black_box` (a store/reload per iteration), so
-  read the ratio as "two real loops doing the same arithmetic", not an
-  instruction-for-instruction tie.
+  loses; a frame-based loop of the same shape is hoisted and wins. The loop is
+  kept real for *both* compilers without an in-loop `black_box`: the struct is
+  built from an opaque `black_box`ed seed and the accumulator is reduced by a
+  data-dependent branch, so LLVM can neither constant-fold the accessor sum nor
+  close the loop into `K * n` nor vectorise it. An in-loop `black_box` was the
+  earlier design; it was withdrawn because rmc lowers `black_box` to the identity
+  while rustc makes it opaque, so the barrier charged rustc a store/reload rmc
+  never emitted and the 2.2x it produced measured the barrier, not the loop.
+- **The two builds must carry matching safety semantics.** rmc defaults bounds
+  checks *off* and overflow checks *off*; `rustc -O` keeps bounds checks *on*
+  and overflow checks *off*. `bench/run.py` builds rmc with `--bounds-checks`
+  and rustc with `-C overflow-checks=off`, so both carry bounds checks and
+  neither carries overflow checks. Without the rmc flag, rmc would skip a
+  per-index check rustc emits; the check costs ~1% on the array-heavy programs,
+  so the flag does not decide any ratio, but the default would be an unfair
+  comparison. Never build the two sides with different check settings.
 - **`callrec` is the call-heavy case, and it used to lose.** Non-tail recursion
   (`tree(n) = 1 + tree(n-1) + tree(n-2)`) cannot be inlined by either compiler,
   so it measures raw call overhead plus argument setup, where the stack-based

@@ -643,9 +643,13 @@ and through a reference only when a provenance pre-pass proves the reference is
 bound to a live local (rmc's `&T` is not known to be dereferenceable, so a
 speculative load through a reference of unknown origin could fault on a loop that
 never runs). The `refs` benchmark binds its `&Wide` to a local, so its loop is
-hoisted to one add per iteration and `refs` wins (~2.2x an honest rustc twin); a
+hoisted to one add per iteration and `refs` wins (~1.7x); a
 loop reading through an unproven reference still reloads every iteration and
-loses.
+loses. The benchmark keeps the loop real for both compilers without an in-loop
+`black_box` (which rmc would erase and rustc would not): it seeds the struct from
+an opaque value and reduces the accumulator with a data-dependent branch, so
+LLVM can neither constant-fold the accessor sum nor close the loop into `K * n`
+nor vectorise it.
 
 On the language side the notable absences are: `u*`/`i*` widths other than
 `i64`, floating point, traits and generics, closures, `for` over arbitrary

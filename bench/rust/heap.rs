@@ -35,12 +35,15 @@ fn main() {
     }
 
     // Pointer chasing: each step depends on the previous load, so the walk
-    // cannot be folded into a closed form the way a plain sum could.
+    // cannot be folded into a closed form the way a plain sum could, and no
+    // in-loop `black_box` is needed to keep it real. That matters for fairness:
+    // rmc lowers `black_box` to the identity while rustc makes it opaque, so an
+    // in-loop one would charge rustc a store/reload rmc never emits.
     let mut sum: i64 = 0;
     let mut cur: i64 = head;
     while cur != 0 {
         let cp = cur as *const Node;
-        sum += unsafe { std::hint::black_box((*cp).val) };
+        sum += unsafe { (*cp).val };
         cur = unsafe { (*cp).next };
     }
     println!("{}", sum);
