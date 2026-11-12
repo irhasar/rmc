@@ -360,8 +360,13 @@ constants and an initializer that is not a constant expression.
 A `const` may also be declared inside a block, where it is folded and in scope
 for the rest of that block. Like a top-level `const` it may be named before it is
 declared (rustc hoists block items), and it shadows an outer constant of the same
-name until the block ends, when the outer value returns. Two `const`s of the same
-name in one block is an error (rustc's `E0428`).
+name until the block ends, when the outer value returns. The whole block's
+constants are resolved together, so a forward reference (`const A = B + 1; const
+B = 2;`) works and a self-reference (`const K = K + 1;`, where an outer `K`
+exists) is a cycle, not a read of the outer value. Every block constant is
+validated even when unused, so `const N: i64 = true;` is rejected as it would be
+at the top level. Two `const`s of the same name in one block is an error, and so
+is a `const` and a `fn` of the same name (rustc's `E0428`).
 
 ```rust
 fn main() {
@@ -369,6 +374,8 @@ fn main() {
     const N: i64 = 5;
     let b = { const N: i64 = 9; N };   // an inner shadow, 9
     // here `N` is 5 again
+    const A: i64 = B + 1;  // a forward reference
+    const B: i64 = 2;      // A folds to 3
 }
 ```
 
@@ -847,13 +854,15 @@ with a length or capacity field, so only the methods below are understood.
 | source                              | lowered to                                    |
 | ----------------------------------- | --------------------------------------------- |
 | `let v: Vec<i64> = Vec::with_capacity(k);` | `alloc(k * 8)`; `v.capacity()` is `k`  |
-| `let v: Vec<u8> = vec![e; n];`      | `alloc(n * 8)` filled by `__rmc_fill`         |
+| `let v: Vec<u8> = vec![e; n];`      | `alloc(n)` filled by `__rmc_fill_bytes` (one byte per element) |
 | `v.len()` (constant `n`)            | `n`                                           |
 | `v.as_mut_ptr()` / `v.as_ptr()`     | the address; a following `.add(off)` is `p + off * elem` |
 | `let a: Vec<i64> = std::env::args().skip(k).map(..).collect();` | no allocation at all (see below) |
 
-`vec![e; n]` takes a runtime `n`; `alloc` and `__rmc_fill` both take it as a
-value. A `vec![a, b, c]` list form is rejected. `add(off)` scales `off` by the
+`vec![e; n]` takes a runtime `n`; `alloc` and the fill helper both take it as a
+value, and the allocation is `n * elem_width` bytes (`elem_width` is 1 for a
+`u8`/`i8` element and 8 otherwise, so a `Vec<u8>` allocates `n` bytes and a
+`Vec<i64>` `n` words). A `vec![a, b, c]` list form is rejected. `add(off)` scales `off` by the
 element width taken from the `Vec<T>` annotation, so a `Vec<i64>` pointer steps
 a whole word while a `Vec<u8>` stays byte-addressed. An args-vector is never
 materialised: `for v in &args` desugars to `for i in k..__rmc_nargs()` and

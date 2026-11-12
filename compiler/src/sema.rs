@@ -206,7 +206,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     // Runtime helpers provided by the freestanding assembly runtime. They are
     // linked in automatically, so they do not appear in the source program.
-    let builtins: [(&str, &[Type], Type); 26] = [
+    let builtins: [(&str, &[Type], Type); 27] = [
         ("print_i64", &[Type::I64], Type::Unit),
         ("print_str", &[Type::Str], Type::Unit),
         ("print_bool", &[Type::Bool], Type::Unit),
@@ -230,6 +230,10 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         // `__rmc_fill(addr, count, elem)`: store `elem` at each of `count` words
         // from `addr`, for the `vec![e; n]` desugar; returns `addr`.
         ("__rmc_fill", &[Type::I64, Type::I64, Type::I64], Type::I64),
+        // `__rmc_fill_bytes(addr, count, elem)`: the same, but for a one-byte
+        // element, storing the low byte of `elem` `count` times. Emitted for a
+        // `vec![e; n]` whose element is `u8`/`i8`.
+        ("__rmc_fill_bytes", &[Type::I64, Type::I64, Type::I64], Type::I64),
         // Byte-wise lexicographic `str` compare; emitted by sema for a string
         // comparison and never written in source.
         ("__rmc_str_lt", &[Type::Str, Type::Str], Type::Bool),
@@ -838,17 +842,72 @@ impl Sema {
             )
         }
 
+        /// True when `e` can change the value of a variable by evaluating it: a
+        /// call, or a block/`if` that assigns a local. Such an argument can
+        /// mutate the receiver's slot, so the receiver must be snapshotted
+        /// before it. A pure argument — a variable read, a field read, an
+        /// arithmetic tree over those — cannot, so the receiver needs no
+        /// snapshot and stays a direct read of its slot (which keeps a
+        /// `wrapping_mul` in a hot loop from copying its receiver into a
+        /// temporary every iteration).
+        fn arg_can_assign(e: &Expr) -> bool {
+            match e {
+                Expr::Block(b) | Expr::MatchBoundary(b, _) => block_assigns(b),
+                Expr::If(c, t, els) => {
+                    arg_can_assign(c)
+                        || block_assigns(t)
+                        || els.as_ref().map_or(false, |b| block_assigns(b))
+                }
+                Expr::Bin(_, a, b) => arg_can_assign(a) || arg_can_assign(b),
+                Expr::Un(_, a) | Expr::Cast(a, _) => arg_can_assign(a),
+                Expr::Index(a, b) => arg_can_assign(a) || arg_can_assign(b),
+                Expr::Field { base, .. } => arg_can_assign(base),
+                Expr::Deref { expr, .. } | Expr::AddrOf { expr, .. } => arg_can_assign(expr),
+                Expr::EnumCtor { args, .. } => args.iter().any(arg_can_assign),
+                Expr::VariantTest { scrutinee, .. } | Expr::BoolTest { scrutinee, .. } => {
+                    arg_can_assign(scrutinee)
+                }
+                Expr::EnumPayload { recv, .. } => arg_can_assign(recv),
+                Expr::StructLit { fields, .. } => fields.iter().any(|f| arg_can_assign(&f.value)),
+                Expr::ArrayLit(v, _) => arg_can_assign(v),
+                Expr::ArrayList(v) => v.iter().any(arg_can_assign),
+                Expr::Call { .. } => true,
+                _ => false,
+            }
+        }
+
+        /// True when a block assigns any local, directly or nested.
+        fn block_assigns(b: &Block) -> bool {
+            b.stmts.iter().any(stmt_assigns) || b.tail.as_deref().map_or(false, arg_can_assign)
+        }
+
+        fn stmt_assigns(s: &Stmt) -> bool {
+            match s {
+                Stmt::Assign { .. } => true,
+                Stmt::Expr(e) => arg_can_assign(e),
+                Stmt::Let { init: Some(e), .. } => arg_can_assign(e),
+                Stmt::While(c, b, _) => arg_can_assign(c) || block_assigns(b),
+                Stmt::For { start, end, body, .. } => {
+                    arg_can_assign(start) || arg_can_assign(end) || block_assigns(body)
+                }
+                Stmt::Return(Some(e)) | Stmt::Break(Some(e), _) => arg_can_assign(e),
+                _ => false,
+            }
+        }
+
         let mut stmts = Vec::new();
         // A method evaluates and copies its scalar receiver before its
         // arguments, so an argument that writes the receiver's slot must not
         // change the value the desugaring reads. `bind` leaves a plain variable
-        // as a direct read of its slot, so force a snapshot temporary when the
-        // method takes an argument that could mutate it (`div_euclid`/
-        // `rem_euclid` force the receiver unconditionally further down, for the
-        // overflow lint). A literal receiver cannot be mutated, and any other
-        // shape already gets a temporary from `bind`.
+        // as a direct read of its slot, so force a snapshot temporary only when
+        // the method takes an argument that could assign a local
+        // (`div_euclid`/`rem_euclid` force the receiver unconditionally further
+        // down, for the overflow lint). A literal receiver cannot be mutated,
+        // and any other shape already gets a temporary from `bind`.
         let x = match recv {
-            Expr::Var { .. } if !args.is_empty() => self.force_temp(recv, &mut stmts),
+            Expr::Var { .. } if args.iter().any(arg_can_assign) => {
+                self.force_temp(recv, &mut stmts)
+            }
             other => bind(self, other, &mut stmts),
         };
         let (body, ty) = match name {

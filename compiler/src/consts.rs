@@ -22,9 +22,33 @@ pub enum ConstVal {
 /// diagnoses it. `i64` and `bool` items are folded; any other declared type is
 /// skipped (the caller rejects it).
 pub fn resolve(items: &[(String, Type, Expr)]) -> HashMap<String, ConstVal> {
-    let mut ints: HashMap<String, i64> = HashMap::new();
-    let mut bools: HashMap<String, bool> = HashMap::new();
-    let mut chars: HashMap<String, u32> = HashMap::new();
+    resolve_with(items, &HashMap::new(), &HashMap::new(), &HashMap::new())
+}
+
+/// Resolve `items` seeded with the values already in scope (`base_ints`,
+/// `base_bools`, `base_chars`), so a block-scoped item may name an enclosing
+/// constant. Each item's own name is removed from the base first: rustc resolves
+/// a name in a `const` initializer to the item itself, so a self-reference is a
+/// cycle, not a read of the outer constant of the same name. The result holds
+/// only the items, never a base-only name.
+pub fn resolve_with(
+    items: &[(String, Type, Expr)],
+    base_ints: &HashMap<String, i64>,
+    base_bools: &HashMap<String, bool>,
+    base_chars: &HashMap<String, u32>,
+) -> HashMap<String, ConstVal> {
+    let mut ints = base_ints.clone();
+    let mut bools = base_bools.clone();
+    let mut chars = base_chars.clone();
+    // An item shadows an enclosing constant of the same name for the whole
+    // block, so drop the base value: a reference inside any initializer
+    // resolves to the item (a cycle when it is the item's own initializer),
+    // never to the outer value.
+    for (name, _, _) in items {
+        ints.remove(name);
+        bools.remove(name);
+        chars.remove(name);
+    }
     // Iterate to a fixpoint so a constant may name one declared later.
     loop {
         let mut progress = false;
@@ -59,14 +83,14 @@ pub fn resolve(items: &[(String, Type, Expr)]) -> HashMap<String, ConstVal> {
         }
     }
     let mut out = HashMap::new();
-    for (k, v) in ints {
-        out.insert(k, ConstVal::Int(v));
-    }
-    for (k, v) in bools {
-        out.insert(k, ConstVal::Bool(v));
-    }
-    for (k, v) in chars {
-        out.insert(k, ConstVal::Char(v));
+    for (name, _, _) in items {
+        if let Some(v) = ints.get(name) {
+            out.insert(name.clone(), ConstVal::Int(*v));
+        } else if let Some(v) = bools.get(name) {
+            out.insert(name.clone(), ConstVal::Bool(*v));
+        } else if let Some(v) = chars.get(name) {
+            out.insert(name.clone(), ConstVal::Char(*v));
+        }
     }
     out
 }

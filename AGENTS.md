@@ -78,7 +78,9 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   The compiler is a library plus a thin CLI, so it can be embedded.
 - `compiler/src/lexer.rs` — byte scanner, tokens carry byte positions. A byte
   literal `b'A'` lexes to a `Tok::Int` (rmc has no `u8`); `b".."` is not a
-  literal it recognises, so it is rejected downstream.
+  literal it recognises, so it is rejected downstream. `lex_byte_lit` reads the
+  first content byte with `get`, so an input ending in `b'` is an
+  unterminated-literal error rather than an out-of-bounds panic.
 - `compiler/src/parser.rs` — recursive descent; `is_block_like` allows
   `if`/blocks as statements without a trailing `;`. `parse_cond` sets
   `no_struct_lit` so a `{` after a condition starts the body, not a struct.
@@ -349,14 +351,20 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   and no codegen; its value is substituted at every use. An immutable `static`
   is parsed by `parse_static` and lowered to the same `ConstDef`, so it shares
   this path; `static mut` is rejected, since rmc has no mutable global.
-  A `const`/immutable-`static` declared inside a block is folded by
-  `scan_block_consts` when the block begins (rustc hoists block items), so it is
-  in scope for the whole block and shadows an outer one until the block ends.
-  Because such a constant never reaches sema, the parser must enforce the checks
-  sema applies to a top-level one: `fold_const_item` resolves the declared type
-  and requires a foldable kind (a block-scoped `const S: str` is rejected like a
-  top-level one), and `reject_const_shadow` rejects a `let`/`@`/struct-field
-  binding that reuses the name (rustc's `E0530`).
+  A `const`/immutable-`static` declared inside a block is collected and resolved
+  by `scan_block_consts` when the block begins (rustc hoists block items), so it
+  is in scope for the whole block and shadows an outer one until the block ends.
+  The whole block's items are collected before any is folded, then resolved
+  together (`consts::resolve_with`) seeded with the enclosing scope: a forward
+  reference resolves, and a self-reference is a cycle rather than a read of the
+  outer value (the items are parsed with the live constant tables cleared, so a
+  name in an initializer stays symbolic). Because such a constant never reaches
+  sema, the parser must enforce the checks sema applies to a top-level one:
+  `resolve_const_ty` requires a foldable kind (a block-scoped `const S: str` is
+  rejected like a top-level one), every item must fold even when unused (a call,
+  a cycle or a type mismatch is an error), a `const`/`fn` name collision is
+  `E0428`, and `reject_const_shadow` rejects a `let`/`@`/struct-field binding that
+  reuses the name (rustc's `E0530`).
 - `compiler/src/inline.rs` — AST inlining of small, call-free, scalar functions
   (a loop is allowed, an early exit is not), run after sema and before codegen.
   See the inlining gotcha below.
@@ -440,14 +448,24 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   Before this, an `&self` accessor over an 8-field struct emitted ~3 instructions
   per field and the `refs` benchmark ran at 69 ms; the fold brought rmc's own
   runtime down ~1.4x to ~50 ms. Inlining the accessors then removed the calls
-  entirely, taking `refs` to ~20 ms, and LICM hoisted the now-inlined struct
-  reads out of the loop, taking it to ~6 ms. Flattening the accumulator fold over
-  the nested sum LICM leaves (`acc + t + (t + p) + p`), and unwrapping the
-  inliner's spliced block so the fold can see it, took `refs` to ~4.7 ms. Against
-  an honest rustc twin (which `black_box`es a term, or LLVM closes the whole loop
-  into `128 * n`) that is ~0.8x, not the ~0.14x an earlier run reported from the
-  folded loop; rustc is only ~1.2x ahead now, keeping the struct in registers
-  across the loop, which rmc does not. The fold is deliberately *one* level deep:
+  entirely, taking `refs` to ~20 ms. The current `refs` benchmark reaches its
+  fields through a `&Wide`, and LICM hoists a read through a reference only when
+  a provenance pre-pass proves the reference points at a live local (`&x`,
+  `&x.field`): rmc's `&T` carries no guarantee that it is dereferenceable, so a
+  speculative load out of a loop that might never run could fault where the
+  source would not. `refs` binds its reference to a local, so the read is hoisted
+  and `refs` now wins (~1.7x). The benchmark keeps the loop real for *both*
+  compilers without an in-loop `black_box`: the struct is built from an opaque
+  `black_box`ed seed (so LLVM cannot constant-fold the accessor sum) and the
+  accumulator is reduced by a data-dependent branch (so LLVM can neither close
+  the loop into `K * n` nor vectorise it). An earlier design put `black_box`
+  inside the loop and reported 2.2x; that number was withdrawn because rmc
+  lowers `black_box` to the identity while rustc makes it opaque, so the barrier
+  charged rustc a store/reload rmc never emitted. A loop that reads through a
+  reference of unproven origin (a parameter, a cast, a mutable ref) still reloads
+  every iteration and loses; that is the honest limit, and the gap is the
+  reference, not the arithmetic. The fold is deliberately *one* level
+  deep:
   a `*p` used as a reference has its pointer in memory, so `ptr_reg` only matches
   a reference *local*, never a `Deref`. `addr_reg` (local or one `Deref` of a
   local) is the form `gen_addr` folds for a `lea`. Extending either to a deeper
@@ -682,8 +700,9 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   (`slot + n - 1 - offset/8`), not the struct's base slot, before trusting a
   `%rbp` operand — otherwise a promoted last field reads a stale frame word.
   A payload enum is the exception: it is read as a whole through its base word,
-  so that word always stays in memory. Promoting `stats`'s last field is worth
-  0.88x -> 1.14x of its rustc twin.
+  so that word always stays in memory. Promoting `stats`'s last field, together
+  with keeping an i64-method receiver in its slot and folding field
+  accumulators, is worth ~0.9x -> ~1.15x of its rustc twin.
 - **A base-less SIB operand must use mod=00 with a disp32.** `lea 0(,%rax,8)` is
   SIB base field 101, which means "no base" only at mod=00; at mod=01/10 it
   selects `%rbp` instead. Emitting a disp8 there reads the wrong address (a
@@ -1173,18 +1192,31 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   The Rust twin must use the same 24-byte stride or its smaller working set
   flatters the walk; it still does not run a free list, so the ratio is about the
   generated pointer code, not the allocators.
-- **`refs` is the reference-read loss, and it is deliberate.** The loop reads a
-  fixed struct through `&self` accessors. `licm` will not hoist a read through a
-  reference: rmc lets a reference outlive its referent (`0 as &i64` is accepted),
-  so a speculative deref can fault on a loop that never runs, where the in-body
-  read would not. The accessor sum is therefore recomputed every iteration and
-  rmc loses to rustc by roughly 8x. A frame-based loop of the same shape is
-  hoisted and wins. Keeping the Rust loop real needs an in-loop `black_box`
-  (a store/reload per iteration), so read the ratio as "two real loops doing the
-  same arithmetic", not an instruction-for-instruction tie - but do not claim a
-  win here; there is not one. This was the state before the faulting-hoist fix
-  (the LICM reference-read restriction); the docstrings and this note were not
-  updated when the fix landed, and a stale 2.23x win sat in `RESULTS.md`.
+- **`refs` is the reference-read case, and the hoist is provenance-gated.** The
+  loop reads a fixed struct through `&self` accessors. `licm` hoists a read
+  through a reference only when a provenance pre-pass proves the reference is
+  bound to a live local (`&x`, `&x.field`): rmc lets a reference outlive its
+  referent (`0 as &i64` is accepted), so a speculative deref of a reference of
+  unknown origin can fault on a loop that never runs, where the in-body read
+  would not. `refs` binds its reference to a local, so the accessor sum is
+  hoisted and rmc wins (~1.7x). A loop that reads through an unproven reference
+  (a parameter, a cast, a mutable ref) is still recomputed every iteration and
+  loses; a frame-based loop of the same shape is hoisted and wins. The loop is
+  kept real for *both* compilers without an in-loop `black_box`: the struct is
+  built from an opaque `black_box`ed seed and the accumulator is reduced by a
+  data-dependent branch, so LLVM can neither constant-fold the accessor sum nor
+  close the loop into `K * n` nor vectorise it. An in-loop `black_box` was the
+  earlier design; it was withdrawn because rmc lowers `black_box` to the identity
+  while rustc makes it opaque, so the barrier charged rustc a store/reload rmc
+  never emitted and the 2.2x it produced measured the barrier, not the loop.
+- **The two builds must carry matching safety semantics.** rmc defaults bounds
+  checks *off* and overflow checks *off*; `rustc -O` keeps bounds checks *on*
+  and overflow checks *off*. `bench/run.py` builds rmc with `--bounds-checks`
+  and rustc with `-C overflow-checks=off`, so both carry bounds checks and
+  neither carries overflow checks. Without the rmc flag, rmc would skip a
+  per-index check rustc emits; the check costs ~1% on the array-heavy programs,
+  so the flag does not decide any ratio, but the default would be an unfair
+  comparison. Never build the two sides with different check settings.
 - **`callrec` is the call-heavy case, and it used to lose.** Non-tail recursion
   (`tree(n) = 1 + tree(n-1) + tree(n-2)`) cannot be inlined by either compiler,
   so it measures raw call overhead plus argument setup, where the stack-based
@@ -1851,8 +1883,10 @@ and inside a block; a `use` of a `std` subtree is recorded so a later
 paths. A `pub` qualifier (on an item, a struct field, an `impl` method or a
 nested `fn`, with any `(crate)`/`(super)`/`(in ..)` restriction) is dropped by
 `skip_pub`, since every name resolves in one flat namespace; the prescan and the
-block-body loop skip it too, and `scan_block_fns` looks through a `pub` before a
-nested `fn`. An inline `mod NAME { .. }` is skipped by `skip_mod` (its items are
+block-body loop skip it too. `scan_block_fns` reads the name directly after the
+`fn` keyword (the `pub`, if any, is a separate earlier token and is never landed
+on, since the scan advances one token at a time), and `fn_at` is keyed to that
+same `fn` token. An inline `mod NAME { .. }` is skipped by `skip_mod` (its items are
 not visible); a `mod NAME;` that would load another file is a compile error. `str`
 and `&str` are the same one-word value, so `ref_coerces` lets them
 be exchanged at a variable, parameter, struct-field, enum-variant-field or
@@ -1861,7 +1895,9 @@ comparison site; there is no lifetime checking, so a `&'static str` field or
 
 There is no `Vec`, but the parser folds the few shapes the corpus uses to an
 `i64` address: `Vec::with_capacity(k)`/`Vec::new()` become `alloc(k * 8)`,
-`vec![e; n]` becomes `alloc(n * 8)` plus a `__rmc_fill`, `v.capacity()`/`v.len()`
+`vec![e; n]` becomes `alloc(n * elem_width)` plus a `__rmc_fill` (or
+`__rmc_fill_bytes` for a one-byte element, which fills `n` bytes with `rep stosb`
+rather than `n` words), `v.capacity()`/`v.len()`
 fold to the constant count, and `v.as_mut_ptr()` keeps the address so a later
 `.add(off)` is `p + off * elem`, scaling by the element width from the `Vec<T>`
 annotation (`Vec<u8>` stays byte-addressed, and a `type Byte = u8` alias is
@@ -1870,8 +1906,8 @@ in a `let` initializer; anywhere else the `\0`-prefixed parser marker reaches
 sema, which reports the source construct (see the `\0vecnew` arm). An
 args-vector is never built: `std::env::args()...collect()` records the binding,
 `for v in &args` desugars to `for i in skip..__rmc_nargs()`, and `args[i]`
-becomes `__rmc_arg_or(i + skip, 0, 0, 0)`. The `__rmc_arg_or`, `__rmc_nargs` and
-`__rmc_fill` helpers live in `runtime.rs`.
+becomes `__rmc_arg_or(i + skip, 0, 0, 0)`. The `__rmc_arg_or`, `__rmc_nargs`,
+`__rmc_fill` and `__rmc_fill_bytes` helpers live in `runtime.rs`.
 
 The `args().nth(i)` chain has two independent failure points, and
 `finish_args_nth` tracks them in `__rmc_arg_or`'s last two arguments: `missing`

@@ -89,6 +89,17 @@ pub struct Codegen {
 /// register name keeps the generated assembly readable.
 const ALLOC_REGS: [&str; 5] = ["%rbx", "%r12", "%r13", "%r14", "%r15"];
 
+/// How much a mention inside a loop body or condition is worth, relative to one
+/// in straight-line code. The promotion heuristic ranks locals by how often they
+/// are named, which alone ranks a cold temporary mentioned a few times on the
+/// entry path above a scalar read once per iteration of the hot loop. Weighting
+/// a loop mention this much keeps the loop-carried scalars in registers. It is a
+/// fixed weight, not a trip-count estimate: the loop bounds are runtime values
+/// here, and a scalar in any loop is a better register candidate than one in
+/// none. The value only needs to dominate a plausible straight-line count, so a
+/// small power of two is enough.
+const LOOP_W: u32 = 32;
+
 /// Callee-saved registers reserved for spill temporaries, after the locals have
 /// taken what they need. The deepest is two at once (a binary op whose left
 /// operand crosses a call in the right), so a handful covers every expression
@@ -806,6 +817,17 @@ impl Codegen {
             .collect()
     }
 
+
+    /// Fold a loop's own counts into the running total at `LOOP_W`, saturating so
+    /// a deeply nested loop cannot overflow the counter and wrap a hot local to
+    /// the bottom of the ranking.
+    fn merge_loop(counts: &mut HashMap<i32, u32>, sub: HashMap<i32, u32>) {
+        for (slot, c) in sub {
+            let e = counts.entry(slot).or_insert(0);
+            *e = e.saturating_add(c.saturating_mul(LOOP_W));
+        }
+    }
+
     fn count_block(
         b: &Block,
         counts: &mut HashMap<i32, u32>,
@@ -876,8 +898,16 @@ impl Codegen {
             }
             Stmt::Expr(e) => Self::count_expr(e, counts, mem, copied, true, let_tmps),
             Stmt::While(c, b, _) => {
-                Self::count_expr(c, counts, mem, copied, true, let_tmps);
-                Self::count_block(b, counts, mem, copied, true, let_tmps);
+                // A loop's condition and body run once per iteration, so a
+                // mention there is worth `LOOP_W` mentions in straight-line
+                // code: a scalar read only inside the loop should outrank a
+                // colder one that is merely mentioned more times outside it.
+                // The body is counted into a fresh map so the whole subtree is
+                // weighted once; a nested loop inside it weights again.
+                let mut sub = HashMap::new();
+                Self::count_expr(c, &mut sub, mem, copied, true, let_tmps);
+                Self::count_block(b, &mut sub, mem, copied, true, let_tmps);
+                Self::merge_loop(counts, sub);
             }
             Stmt::For { start, end, body, var_slot, end_slot, .. } => {
                 Self::count_expr(start, counts, mem, copied, true, let_tmps);
@@ -886,12 +916,15 @@ impl Codegen {
                 // names, yet both are read (and the counter written) every
                 // iteration. Count them so they compete for a register like any
                 // other loop-carried local instead of being reloaded from the
-                // frame on each pass.
-                *counts.entry(*var_slot).or_insert(0) += 1;
+                // frame on each pass. They are counted at loop weight because
+                // that is where they are touched.
+                let mut sub = HashMap::new();
+                *sub.entry(*var_slot).or_insert(0) += 1;
                 if Self::small_imm(end).is_none() {
-                    *counts.entry(*end_slot).or_insert(0) += 1;
+                    *sub.entry(*end_slot).or_insert(0) += 1;
                 }
-                Self::count_block(body, counts, mem, copied, true, let_tmps);
+                Self::count_block(body, &mut sub, mem, copied, true, let_tmps);
+                Self::merge_loop(counts, sub);
             }
             Stmt::Return(v) => {
                 if let Some(e) = v {
@@ -1295,15 +1328,22 @@ Expr::PatScrutinee(_) => {
                             }
                         } else {
                             match self.field_operand(base, *offset) {
-                                Some(op) => match self.simple_operand(value) {
-                                    Some(v) if v.starts_with('%') || v.starts_with('$') => {
-                                        self.store_operand(&v, &op);
+                                Some(op) => {
+                                    // `field += x` folds into one read-modify-write
+                                    // `add`/`sub`, the shape of a running total.
+                                    if self.gen_mem_accumulate(&op, value) {
+                                        return;
                                     }
-                                    _ => {
-                                        self.gen_expr(value);
-                                        self.line(&format!("mov %rax, {op}"));
+                                    match self.simple_operand(value) {
+                                        Some(v) if v.starts_with('%') || v.starts_with('$') => {
+                                            self.store_operand(&v, &op);
+                                        }
+                                        _ => {
+                                            self.gen_expr(value);
+                                            self.line(&format!("mov %rax, {op}"));
+                                        }
                                     }
-                                },
+                                }
                                 None => self.store_through_addr(target, value, Some(0)),
                             }
                         }
@@ -2411,6 +2451,51 @@ Expr::PatScrutinee(_) => {
         if dst != "%rax" {
             self.line(&format!("mov %rax, {dst}"));
         }
+    }
+
+    /// Fold `field += a - b + ...` into a run of read-modify-write `add`/`sub`
+    /// against the field's memory operand, when the chain's base term is the
+    /// field itself. The generic path loads the field, evaluates the whole sum
+    /// in registers and stores it back; this keeps the running total in memory
+    /// and touches each term once, which is the shape of an accumulator or a
+    /// counter field in a hot loop. Only a register or immediate term folds
+    /// into the instruction: a memory term would need `add mem, mem`, which is
+    /// not an instruction, and could alias the field being written, so such a
+    /// value falls back to the generic path. Overflow checks are also left to
+    /// the generic path, where each `add` gets its own `jo`.
+    fn gen_mem_accumulate(&mut self, op: &str, value: &Expr) -> bool {
+        if self.overflow {
+            return false;
+        }
+        let mut terms: Vec<(bool, &Expr)> = Vec::new();
+        Self::flatten_chain(value, false, &mut terms);
+        let (base_sub, first) = terms[0];
+        let first_is_target = matches!(
+            first,
+            Expr::Field { base, offset, .. }
+                if self.field_operand(base, *offset).as_deref() == Some(op)
+        );
+        if base_sub || !first_is_target {
+            return false;
+        }
+        // Resolve every term before emitting anything, so a term that cannot
+        // fold bails out without a half-written chain.
+        let mut plan: Vec<(bool, String)> = Vec::new();
+        for (is_sub, term) in &terms[1..] {
+            match self.simple_operand(term) {
+                Some(src) if !src.contains('(') => plan.push((*is_sub, src)),
+                _ => return false,
+            }
+        }
+        for (is_sub, src) in plan {
+            let m = if is_sub { "sub" } else { "add" };
+            // An immediate operand needs an explicit 64-bit width: `as` reads a
+            // suffixless `add $imm, mem` as a 32-bit add, which would truncate.
+            // A register operand names its own width, so it needs no suffix.
+            let m = if src.starts_with('$') { format!("{m}q") } else { m.to_string() };
+            self.line(&format!("{m} {src}, {op}"));
+        }
+        true
     }
 
     /// Fold `dst = dst + a + b - c + ...` into one `add`/`sub` per term, when
@@ -3622,3 +3707,4 @@ fn setcc_cc(op: BinOp) -> Option<&'static str> {
         _ => return None,
     })
 }
+

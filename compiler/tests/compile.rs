@@ -94,12 +94,17 @@ fn a_constant_assignment_stores_straight_to_the_frame() {
 
 #[test]
 fn a_register_initialiser_stores_straight_to_the_frame() {
-    // `q.x` is promoted to `%rbx`; copying it into `a`, whose address is taken,
-    // is one `mov %rbx, off(%rbp)`, not `mov %rbx, %rax; mov %rax, off(%rbp)`.
+    // `q.x` is promoted to a callee-saved register; copying it into `a`, whose
+    // address is taken, is one `mov %rXX, off(%rbp)`, not `mov %rXX, %rax; mov
+    // %rax, off(%rbp)`. Which register holds `q.x` depends on the promotion
+    // ranking, so accept any callee-saved one.
     let out = asm(
         "struct P { x: i64, y: i64 } fn main() -> i64 { let mut q: P = P { x: 1, y: 2 }; let mut i: i64 = 0; while i < 10 { q.x = q.x + q.y; i = i + 1; } let mut a: i64 = 0; let ra: &i64 = &a; a = q.x; return a + *ra; }",
     );
-    assert!(out.contains("mov %rbx, -"), "register stored direct:\n{out}");
+    let direct = ["%rbx", "%r12", "%r13", "%r14", "%r15"]
+        .iter()
+        .any(|r| out.contains(&format!("mov {r}, -")));
+    assert!(direct, "register stored direct:\n{out}");
 }
 
 #[test]
@@ -4187,6 +4192,50 @@ fn self_recursion_becomes_a_loop_with_one_call_per_level() {
 }
 
 #[test]
+fn a_tail_expression_recursion_becomes_a_loop() {
+    // The idiomatic tail form (`fib(n-1) + fib(n-2)` as the block's value) must
+    // fold the right spine exactly like the explicit-`return` form. Requiring
+    // the `return` keyword skipped every function written this way, which is how
+    // the benchmark twins are written.
+    let out = asm(
+        "fn fib(n: i64) -> i64 { if n < 2 { return n; } fib(n - 1) + fib(n - 2) } \
+         fn main() -> i64 { return fib(arg_i64(1)); }",
+    );
+    let fib = &out[out.find("fib:").unwrap()..];
+    let fib = &fib[..fib.find(".size fib").unwrap()];
+    assert_eq!(fib.matches("call fib").count(), 1, "one call per level:\n{fib}");
+    assert!(fib.contains("lea -2(%rbx), %rbx"), "the loop advances n by -2:\n{fib}");
+}
+
+#[test]
+fn a_tail_expression_recursion_still_keeps_a_foreign_call() {
+    // The tail form must keep the same guard as the `return` form: a call to
+    // another function in the left operand stays, only the self-call folds.
+    let out = asm(
+        "fn g(n: i64) -> i64 { if n < 2 { return n; } g(n - 1) + g(n - 2) } \
+         fn f(n: i64) -> i64 { if n < 2 { return n; } g(n) + f(n - 1) } \
+         fn main() -> i64 { return f(5); }",
+    );
+    let f = &out[out.find("f:").unwrap()..];
+    let f = &f[..f.find(".size f").unwrap()];
+    assert_eq!(f.matches("call f").count(), 1, "the self-call is folded:\n{f}");
+    assert!(f.contains("call g"), "the foreign call is kept:\n{f}");
+}
+
+#[test]
+fn a_tail_expression_recursion_is_not_folded_under_overflow_checks() {
+    let out = compile_to_asm(
+        "fn fib(n: i64) -> i64 { if n < 2 { return n; } fib(n - 1) + fib(n - 2) } \
+         fn main() -> i64 { return fib(5); }",
+        &CompileOptions { overflow_checks: true, ..Default::default() },
+    )
+    .unwrap();
+    let fib = &out[out.find("fib:").unwrap()..];
+    let fib = &fib[..fib.find(".size fib").unwrap()];
+    assert_eq!(fib.matches("call fib").count(), 2, "both calls kept:\n{fib}");
+}
+
+#[test]
 fn a_left_operand_that_is_not_a_self_call_still_folds_the_right_spine() {
     // `tree(n) = 1 + tree(n-1) + tree(n-2)` parses as `(1 + tree(n-1)) + tree(n-2)`,
     // so the left operand of the top `+` is *not* a self-call. The right operand
@@ -4959,6 +5008,74 @@ fn a_field_read_through_a_reference_blocks_hoisting() {
 }
 
 #[test]
+fn a_read_through_a_local_reference_is_hoisted() {
+    // `wr` is `&w`, an immutable binding to a live local, so the pointer cannot
+    // be null or dangle and a read through it cannot fault. The accessor sum is
+    // invariant and the loop writes no memory, so it is hoisted and the loop
+    // keeps one add per iteration (the same code a frame-based loop gets).
+    let src = "struct S { n: i64, m: i64 } \
+               fn main() -> i64 { let s: S = S { n: 5, m: 3 }; let r: &S = &s; \
+               let mut acc: i64 = 0; let mut i: i64 = 0; \
+               while i < 4 { acc = acc + r.n * r.m; i = i + 1; } return acc; }";
+    let with = loop_body(&asm(src));
+    assert!(!with.contains("imul"), "a read through a proven reference is hoisted:\n{with}");
+    let without = loop_body(&asm_no_licm(src));
+    assert!(without.contains("imul"), "without LICM the product stays in the loop:\n{without}");
+}
+
+#[test]
+fn a_proven_reference_copy_is_hoisted() {
+    // `q` is bound to `p`, which is proven, so `q` is proven too even though it
+    // is declared after the loop and the scan sees it only on the second pass.
+    let src = "struct S { n: i64, m: i64 } \
+               fn main() -> i64 { let s: S = S { n: 5, m: 3 }; let p: &S = &s; \
+               let mut acc: i64 = 0; let mut i: i64 = 0; \
+               while i < 4 { acc = acc + p.n * p.m; i = i + 1; } \
+               let q: &S = p; return acc + q.n; }";
+    let with = loop_body(&asm(src));
+    assert!(!with.contains("imul"), "a copy of a proven reference is hoisted:\n{with}");
+}
+
+#[test]
+fn a_read_through_a_reference_parameter_is_not_hoisted() {
+    // A parameter is not proven: the caller may pass a null or dangling
+    // pointer, so a speculative read could fault on a loop that never runs. The
+    // loop is in `f`, so its body is inspected directly.
+    let src = "struct S { n: i64, m: i64 } \
+               fn f(r: &S) -> i64 { let mut acc: i64 = 0; let mut i: i64 = 0; \
+               while i < 4 { acc = acc + r.n * r.m; i = i + 1; } return acc; } \
+               fn main() -> i64 { let s: S = S { n: 5, m: 3 }; return f(&s); }";
+    let out = asm_no_inline(src);
+    let (_, fbody) = fn_bodies(&out).into_iter().find(|(n, _)| n == "f").unwrap();
+    assert!(fbody.contains("imul"), "a read through a reference parameter stays in the loop:\n{fbody}");
+}
+
+#[test]
+fn a_read_through_a_mutable_reference_is_not_hoisted() {
+    // A `mut` binding can be reassigned to a dangling pointer, so it is not
+    // proven even when its initializer is `&local`.
+    let src = "struct S { n: i64, m: i64 } \
+               fn main() -> i64 { let s: S = S { n: 5, m: 3 }; let mut r: &S = &s; \
+               let mut acc: i64 = 0; let mut i: i64 = 0; \
+               while i < 4 { acc = acc + r.n * r.m; i = i + 1; } return acc; }";
+    let with = loop_body(&asm(src));
+    assert!(with.contains("imul"), "a read through a mutable reference stays in the loop:\n{with}");
+}
+
+#[test]
+fn a_read_through_a_cast_reference_is_not_hoisted() {
+    // `0 as &S` is an integer cast to a reference; rmc accepts it and it is
+    // null, so a speculative read would fault.
+    let src = "struct S { n: i64, m: i64 } \
+               fn main() -> i64 { let r: &S = 0 as &S; \
+               let mut acc: i64 = 0; let mut i: i64 = 0; \
+               while i < 0 { acc = acc + r.n * r.m; i = i + 1; } return acc; }";
+    let with = loop_body(&asm(src));
+    assert!(with.contains("imul"), "a read through a cast reference stays in the loop:\n{with}");
+}
+
+
+#[test]
 fn a_register_only_leaf_allocates_no_frame() {
     // Every local is promoted into a callee-saved register and nothing is
     // materialised, so the body addresses no frame slot. Nothing is addressed
@@ -5468,6 +5585,75 @@ fn a_struct_field_binding_shadowing_a_block_const_is_rejected() {
     )
     .unwrap_err();
     assert!(err.contains("shadows a constant"), "got: {err}");
+}
+
+#[test]
+fn an_incomplete_byte_literal_is_a_lexer_error_not_a_panic() {
+    // `b'` at end of input used to index past the byte slice and panic.
+    let err = compile_to_asm("fn main() { b'", &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("unterminated byte literal"), "got: {err}");
+}
+
+#[test]
+fn a_self_referential_block_const_is_a_cycle() {
+    // The inner `K` shadows the outer one, so its initializer resolves to
+    // itself (a cycle), not to the outer value.
+    let err = compile_to_asm(
+        "const K: i64 = 1; fn main() { const K: i64 = K + 1; println!(\"{}\", K); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("K"), "got: {err}");
+}
+
+#[test]
+fn an_unused_block_const_is_still_validated() {
+    // The item is never read, but a non-foldable initializer or a type
+    // mismatch must still be an error, as at the top level.
+    let mismatch = compile_to_asm(
+        "fn main() { const N: i64 = true; }",
+        &CompileOptions::default(),
+    );
+    assert!(mismatch.is_err(), "`const N: i64 = true` must be rejected");
+
+    let non_const = compile_to_asm(
+        "fn main() { const N: i64 = f(); } fn f() -> i64 { 5 }",
+        &CompileOptions::default(),
+    );
+    assert!(non_const.is_err(), "`const N: i64 = f()` must be rejected");
+}
+
+#[test]
+fn a_forward_referenced_block_const_resolves() {
+    // The whole block is resolved to a fixpoint, so `A` may name the later `B`.
+    let out = asm("fn main() { const A: i64 = B + 1; const B: i64 = 2; println!(\"{}\", A); }");
+    assert!(out.contains("mov $3, "), "A folds to 3:\n{out}");
+}
+
+#[test]
+fn a_block_const_may_name_an_enclosing_const() {
+    let out = asm("const X: i64 = 5; fn main() { const Y: i64 = X + 1; println!(\"{}\", Y); }");
+    assert!(out.contains("mov $6, "), "Y folds to 6:\n{out}");
+}
+
+#[test]
+fn a_block_const_colliding_with_a_fn_is_rejected() {
+    let err = compile_to_asm(
+        "fn main() { const N: i64 = 1; fn N() -> i64 { 2 } }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("defined multiple times"), "got: {err}");
+}
+
+#[test]
+fn a_nested_pub_fn_shadows_an_outer_fn() {
+    // The `pub` must not hide the nested `fn` from the block scan, or the two
+    // definitions would collide under one name.
+    let out = asm_no_inline(
+        "fn g() -> i64 { 1 } fn main() { pub fn g() -> i64 { 2 } println!(\"{}\", g()); }",
+    );
+    assert!(out.contains("rmc$nf"), "the nested `fn` gets a unique name:\n{out}");
 }
 
 #[test]
@@ -6017,6 +6203,46 @@ fn a_wrapping_mul_receiver_is_copied_before_a_mutating_argument() {
 }
 
 #[test]
+fn a_pure_wrapping_mul_argument_keeps_the_receiver_in_its_slot() {
+    // A pure argument cannot write the receiver's slot, so the receiver needs
+    // no snapshot: `i.wrapping_mul(2654435761)` reads `i` directly instead of
+    // copying it into a temporary every iteration.
+    let out = asm_no_inline(
+        "fn main() -> i64 { let mut i: i64 = 7; let r = i.wrapping_mul(2654435761); return r; }",
+    );
+    let body = &out[out.find("main:").expect("main")..];
+    assert!(!body.contains("\u{0}im"), "no receiver temp is introduced:\n{body}");
+    assert!(body.contains("imul"), "the product is still computed:\n{body}");
+}
+
+#[test]
+fn a_field_accumulation_is_a_read_modify_write() {
+    // `a.sum += v` through a `&mut` receiver folds into one `add %v, off(%rbx)`
+    // rather than a load, an add and a store, keeping the running total in the
+    // field (which cannot be promoted, since the pointer escapes).
+    let out = asm_no_inline(
+        "struct A { sum: i64, k: i64 } \
+         fn bump(a: &mut A, v: i64) { a.sum += v; a.k += 1; } \
+         fn main() -> i64 { let mut a = A { sum: 0, k: 0 }; bump(&mut a, 5); return a.sum; }",
+    );
+    let (_, body) = fn_bodies(&out).into_iter().find(|(n, _)| n == "bump").unwrap();
+    assert!(body.contains("add %r"), "expected a read-modify-write add:\n{body}");
+}
+
+#[test]
+fn an_immediate_field_accumulation_is_64_bit() {
+    // An immediate operand needs the `q` suffix; without it `as` assembles a
+    // 32-bit add and truncates the field's high half.
+    let out = asm_no_inline(
+        "struct A { sum: i64, k: i64 } \
+         fn bump(a: &mut A) { a.k += 1; } \
+         fn main() -> i64 { let mut a = A { sum: 0, k: 0 }; bump(&mut a); return a.k; }",
+    );
+    let (_, body) = fn_bodies(&out).into_iter().find(|(n, _)| n == "bump").unwrap();
+    assert!(body.contains("addq $1,"), "expected a 64-bit immediate add:\n{body}");
+}
+
+#[test]
 fn a_vec_i64_pointer_add_steps_whole_elements() {
     // `add(off)` advances by `off` elements, so a `Vec<i64>` pointer steps eight
     // bytes per unit: `base.add(3)` is `base + 3 * 8`. The offset is scaled into
@@ -6041,9 +6267,9 @@ fn a_vec_i64_pointer_add_steps_whole_elements() {
 
 #[test]
 fn a_vec_u8_pointer_add_steps_single_bytes() {
-    // A `Vec<u8>` is a raw byte arena in rmc, so its pointer keeps a one-byte
-    // stride: `base.add(3)` is `base + 3`. The offset add keeps its immediate
-    // `3`, with no scaling `lea` of its own.
+    // A `Vec<u8>` is a raw byte arena in rmc, so neither the allocation nor the
+    // pointer's `add` scales the count by eight: `vec![0u8; 8]` requests 8 bytes
+    // (not 64) and `base.add(3)` is `base + 3`.
     let out = asm_no_inline(
         "fn main() -> i64 { \
              let v: Vec<u8> = vec![0u8; 8]; \
@@ -6053,11 +6279,13 @@ fn a_vec_u8_pointer_add_steps_single_bytes() {
          }",
     );
     let body = &out[out.find("main:").expect("main")..];
-    assert!(
-        !body.contains("lea 0(,%rax,8), %rax"),
-        "a byte pointer must not scale the offset:\n{body}"
+    assert_eq!(
+        body.matches("lea 0(,%rax,8), %rax").count(),
+        0,
+        "a byte arena must not scale by eight:\n{body}"
     );
     assert!(body.contains("add $3, %rax"), "expected a one-byte stride:\n{body}");
+    assert!(body.contains("call __rmc_fill_bytes"), "expected the byte fill:\n{body}");
 }
 
 #[test]

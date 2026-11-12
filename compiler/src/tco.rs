@@ -84,22 +84,36 @@ fn try_transform(f: &FnDef) -> Option<Block> {
     }
     let (pname, _) = &f.params[0];
     let pslot = f.param_slots[0];
-    if f.body.tail.is_some() || f.body.stmts.len() != 2 {
-        return None;
-    }
 
-    // Statement 0: `if cond { return guard; }`, no `else`.
-    let (cond, guard) = match &f.body.stmts[0] {
-        Stmt::Expr(Expr::If(c, then, None)) if then.tail.is_none() => match then.stmts.as_slice() {
-            [Stmt::Return(Some(g))] => (c.as_ref().clone(), g.clone()),
-            _ => return None,
-        },
+    // Statement 0 is the base-case `if cond { return guard; }`, no `else`. The
+    // recursion then follows either as the tail expression
+    // (`fib(n - 1) + fib(n - 2)`) or as an explicit trailing `return`. rustc
+    // rewrites both; requiring the explicit `return` would skip every function
+    // written in the idiomatic tail style, which is what the benchmark twins and
+    // most real code use. Either way the recursion must be the *only* thing
+    // after the base case: any other statement would sit outside the loop and
+    // be evaluated once instead of once per level.
+    let (cond, guard, rec): (Expr, Expr, &Expr) = match (&f.body.tail, f.body.stmts.as_slice()) {
+        (Some(tail), [Stmt::Expr(Expr::If(c, then, None))]) if then.tail.is_none() => {
+            match then.stmts.as_slice() {
+                [Stmt::Return(Some(g))] => (c.as_ref().clone(), g.clone(), tail.as_ref()),
+                _ => return None,
+            }
+        }
+        (None, [Stmt::Expr(Expr::If(c, then, None)), Stmt::Return(Some(r))])
+            if then.tail.is_none() =>
+        {
+            match then.stmts.as_slice() {
+                [Stmt::Return(Some(g))] => (c.as_ref().clone(), g.clone(), r),
+                _ => return None,
+            }
+        }
         _ => return None,
     };
 
-    // Statement 1: `return t op f(h)`, `op` associative, `f(h)` a self-call.
-    let (op, t, h) = match &f.body.stmts[1] {
-        Stmt::Return(Some(Expr::Bin(op @ (BinOp::Add | BinOp::Mul), l, r))) => {
+    // The recursion: `t op f(h)`, `op` associative, `f(h)` a self-call.
+    let (op, t, h) = match rec {
+        Expr::Bin(op @ (BinOp::Add | BinOp::Mul), l, r) => {
             let h = self_arg(r, &f.name)?;
             (*op, l.as_ref().clone(), h)
         }

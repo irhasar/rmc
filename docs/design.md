@@ -304,7 +304,9 @@ slots. A struct used only field by field keeps every field promotable, the last
 one included: a field access names a register through `field_reg` or an address
 `base + offset` off `array_off`, and neither needs the last field's own slot to
 be addressable. This is worth a real benchmark — promoting `stats`'s last field
-(`sum`, the hot one) takes it from 0.88x to 1.14x of its rustc twin. A payload
+(`sum`, the hot one), together with keeping an i64-method receiver in its slot
+and folding field accumulators, takes `stats` from ~0.9x to ~1.15x of its rustc
+twin. A payload
 enum is the exception: it is read as a whole through its base word, so that word
 stays in memory.
 
@@ -634,14 +636,20 @@ the speed of the code it produces. The non-trivial
 passes are division by a constant (1.4x on `mandel.rs`), the top-five local
 promotion (a few percent on `mix` and `sieve`), the reference-operand folds plus
 `trim_dead` (1.4x on the `refs` benchmark), inlining (2.6x on `refs`, by removing
-the three accessor calls from its hot loop), and loop-invariant code motion (a
-further 2.9x on `refs`, by hoisting the now-inlined struct reads out of the
-loop), the self-recursion rewrite (2.0x on `fib`, by halving its call tree);
-everything else is local and cheap to compute. Flattening the accumulator
-fold over a nested sum, plus unwrapping the inliner's spliced block so the fold
-can see the accessor arithmetic, is what turns LICM's three hoisted values into
-a six-instruction loop (`refs` 6.4 → 4.7 ms of rmc's own runtime, within ~20% of
-an honest rustc twin).
+the three accessor calls from its hot loop), and the self-recursion rewrite (2.0x
+on `fib`, by halving its call tree); everything else is local and cheap to
+compute. LICM hoists a field read through a *local aggregate* (it cannot fault)
+and through a reference only when a provenance pre-pass proves the reference is
+bound to a live local (rmc's `&T` is not known to be dereferenceable, so a
+speculative load through a reference of unknown origin could fault on a loop that
+never runs). The `refs` benchmark binds its `&Wide` to a local, so its loop is
+hoisted to one add per iteration and `refs` wins (~1.7x); a
+loop reading through an unproven reference still reloads every iteration and
+loses. The benchmark keeps the loop real for both compilers without an in-loop
+`black_box` (which rmc would erase and rustc would not): it seeds the struct from
+an opaque value and reduces the accumulator with a data-dependent branch, so
+LLVM can neither constant-fold the accessor sum nor close the loop into `K * n`
+nor vectorise it.
 
 On the language side the notable absences are: `u*`/`i*` widths other than
 `i64`, floating point, traits and generics, closures, `for` over arbitrary

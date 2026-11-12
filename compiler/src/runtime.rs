@@ -251,20 +251,41 @@ __rmc_nargs:
 .globl __rmc_fill
 .type __rmc_fill, @function
 __rmc_fill:
-    mov %rdi, %rax
+    mov %rdi, %r8
     test %rsi, %rsi
     jle .Lfill_done
-    xor %rcx, %rcx
-.Lfill_loop:
-    mov %rdx, (%rax,%rcx,8)
-    inc %rcx
-    cmp %rsi, %rcx
-    jl .Lfill_loop
+    mov %rdx, %rax           # the word to store
+    mov %rsi, %rcx           # count
+    rep stosq
 .Lfill_done:
+    mov %r8, %rax            # return the original address
     ret
 .size __rmc_fill, .-__rmc_fill
 "#,
         defines: &["__rmc_fill"],
+    },
+    Piece {
+        text: r#"
+# long __rmc_fill_bytes(long addr, long count, long elem)  -- store the low byte
+# of `elem` at each of `count` bytes from `addr`; returns `addr`. Backs the
+# `vec![0u8; n]` desugar, whose elements are one byte wide. A `rep stosb` fill
+# is far faster than a scalar byte loop for the arena sizes `vec![..]` is used
+# with.
+.globl __rmc_fill_bytes
+.type __rmc_fill_bytes, @function
+__rmc_fill_bytes:
+    mov %rdi, %r8
+    test %rsi, %rsi
+    jle .Lfillb_done
+    mov %rdx, %rax           # `stosb` stores %al
+    mov %rsi, %rcx           # count
+    rep stosb
+.Lfillb_done:
+    mov %r8, %rax            # return the original address
+    ret
+.size __rmc_fill_bytes, .-__rmc_fill_bytes
+"#,
+        defines: &["__rmc_fill_bytes"],
     },
     Piece {
         text: r#"

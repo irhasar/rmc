@@ -1785,7 +1785,6 @@ def gen_boolbit_program(rng):
     rs.append('    println!("{}", b as i64);')
     # As an `if` condition (an `i64` operand would be a type error there).
     rs.append(f"    if {bexpr(2)} {{ println!(\"{{}}\", 1); }} else {{ println!(\"{{}}\", 0); }}")
-    rs.append("}")
     # A `const bool` folded from the operators, and an array of bool operands.
     cname = "C"
     cbody = bexpr(2)
@@ -1806,6 +1805,7 @@ def gen_boolbit_program(rng):
     rs.append("    let mut acc: i64 = 0;")
     rs.append(f"    while i < 3 {{ if !{inv} {{ acc += 1; }} i += 1; }}")
     rs.append('    println!("{}", acc);')
+    rs.append("}")
     return "\n".join(head + rs) + "\n"
 
 
@@ -2999,6 +2999,14 @@ def reject_corpus():
         # not shadow a block-scoped constant either (rustc E0530).
         "at_binding_shadows_block_const": "fn main() { const N: i64 = 5; if let N @ 1 = 1 { println!(\"{}\", N); } }\n",
         "struct_pat_field_shadows_block_const": "struct S { N: i64 } fn main() { const N: i64 = 5; let S { N } = S { N: 1 }; println!(\"{}\", N); }\n",
+        # A block-scoped `const` is resolved together with the whole block, so a
+        # self-reference is a cycle (not a read of the outer constant), an
+        # unused bad initializer is still rejected, and a `const` colliding with
+        # a `fn` in the same block is E0428.
+        "block_const_self_reference": "const K: i64 = 1; fn main() { const K: i64 = K + 1; println!(\"{}\", K); }\n",
+        "block_const_type_mismatch_unused": "fn main() { const N: i64 = true; }\n",
+        "block_const_non_const_call_unused": "fn main() { const N: i64 = f(); } fn f() -> i64 { 5 }\n",
+        "block_const_fn_collision": "fn main() { const N: i64 = 1; fn N() -> i64 { 2 } }\n",
     }
 
 

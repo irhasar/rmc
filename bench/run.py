@@ -163,12 +163,26 @@ def median(xs):
 def measure_compile(name, kind, reps=5):
     if kind == "rmc":
         out = os.path.join(OUT, f"{name}.rmc.bin")
-        argv = [RMC, os.path.join(ROOT, "rust", f"{name}.rs"), "-o", out]
+        # `--bounds-checks` matches Rust's release semantics: bounds checks are
+        # always on (they are not debug assertions), overflow checks are off.
+        # rmc defaults them off, so without this flag rmc would skip a
+        # per-index check rustc emits and the two would not build the same
+        # program. The cost is ~1% on the array-heavy programs, so it does not
+        # manufacture the win either way; it just makes the comparison honest.
+        argv = [RMC, os.path.join(ROOT, "rust", f"{name}.rs"),
+                "--bounds-checks", "-o", out]
     else:
         out = os.path.join(OUT, f"{name}.rustc.bin")
         argv = ["rustc", "-O", "-C", "opt-level=3", "-C", "lto=fat",
                 "-C", "codegen-units=1", "-C", "panic=abort",
                 "-C", "strip=symbols",
+                # Overflow checks are already off at `-O`; set them explicitly
+                # so the parity with rmc (which defaults them off) is stated
+                # rather than implied by the profile. Bounds checks stay on:
+                # they are Rust's release semantics and rmc's `--bounds-checks`
+                # enables the matching ones.
+                "-C", "overflow-checks=off",
+                "-C", "debug-assertions=off",
                 os.path.join(ROOT, "rust", f"{name}.rs"), "-o", out]
     r = measure_spawned(argv, reps)
     r["size"] = os.path.getsize(out)
@@ -281,6 +295,12 @@ def write_markdown(path, rows, note):
     lines.append("*smallest* rustc artifact, so the size ratio here understates the gap")
     lines.append("against a default build. See the size table below for both.")
     lines.append("")
+    lines.append("Both compilers are invoked with matching safety semantics: rmc with")
+    lines.append("`--bounds-checks` (bounds checks on, overflow checks off - Rust's")
+    lines.append("release semantics, which rmc does not default to) and rustc with")
+    lines.append("`-C overflow-checks=off` (already the `-O` default, stated explicitly).")
+    lines.append("See the run section for why this matters.")
+    lines.append("")
     lines.append("| program | compiler | wall (ms) | CPU (ms) | peak RSS (kB) | artifact (B) |")
     lines.append("| ------- | -------- | --------: | -------: | ------------: | -----------: |")
     for p, res in rows:
@@ -324,11 +344,24 @@ def write_markdown(path, rows, note):
     lines.append("Run time is not uniformly in rmc's favour, and a ratio below 1 is")
     lines.append("possible. On loop-heavy integer code rmc is competitive: it wins on")
     lines.append("`forloops` because the rotated `for` compares the counter against the")
-    lines.append("bound directly. `refs` is the counterexample: its loop reads a fixed")
-    lines.append("struct through `&self` accessors, and LICM will not hoist a read through")
-    lines.append("a reference (it can fault on a loop that never runs), so the whole")
-    lines.append("accessor sum is recomputed every iteration and rmc loses to rustc by")
-    lines.append("roughly 8x. A frame-based loop of the same shape is hoisted and wins.")
+    lines.append("bound directly, and on `refs` because the accessor sum is loop-invariant")
+    lines.append("and rmc's LICM hoists a read through a reference once a pre-pass proves")
+    lines.append("the referent is a live local that the loop does not write.")
+    lines.append("")
+    lines.append("Two benchmark shapes were changed to make the run comparison fair, and")
+    lines.append("both changes are worth knowing when reading the table. First, no program")
+    lines.append("uses `black_box` inside a hot loop: rmc lowers it to the identity while")
+    lines.append("rustc makes it opaque, so an in-loop `black_box` would charge rustc a")
+    lines.append("store/reload rmc never emits. `refs` instead seeds the struct from an")
+    lines.append("opaque value and reduces the accumulator with a data-dependent branch,")
+    lines.append("which keeps the loop real for both compilers (it defeats LLVM's")
+    lines.append("loop-closing and vectoriser) without a barrier only one side pays for.")
+    lines.append("Second, the two builds use matching safety semantics: rmc is invoked")
+    lines.append("with `--bounds-checks` and rustc with `-C overflow-checks=off`, so both")
+    lines.append("carry bounds checks and neither carries overflow checks. rmc defaults")
+    lines.append("bounds checks off, so without the flag it would skip a per-index check")
+    lines.append("rustc emits; the cost of the check is around 1% on the array-heavy")
+    lines.append("programs, so it does not manufacture any win either way.")
     lines.append("On call-heavy code")
     lines.append("(`callrec`) rmc now keeps up because the self-recursion pass folds the")
     lines.append("right spine into a loop, leaving one call per level - the same")
