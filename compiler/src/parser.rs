@@ -368,7 +368,31 @@ impl Parser {
                 self.toks[self.i].tok = Tok::Ge;
                 self.toks.insert(self.i, Token { tok: Tok::Gt, pos });
             }
-            _ => {}
+            _ => return,
+        }
+        self.shift_token_indices(self.i);
+    }
+
+    /// Shift every recorded token index at or after `at` by one, after a token
+    /// was inserted there by `split_gt`. `fn_at` and the `LocalConst` frames
+    /// hold indices captured *before* a block's items are parsed, so an insert
+    /// inside a later item would otherwise leave them one token short: the
+    /// `fn`/`const` would no longer be recognised and the item would be parsed
+    /// as an ordinary statement.
+    fn shift_token_indices(&mut self, at: usize) {
+        self.fn_at = std::mem::take(&mut self.fn_at)
+            .into_iter()
+            .map(|(k, v)| (if k >= at { k + 1 } else { k }, v))
+            .collect();
+        for frame in self.local_consts.iter_mut() {
+            for c in frame.iter_mut() {
+                if c.start >= at {
+                    c.start += 1;
+                }
+                if c.end >= at {
+                    c.end += 1;
+                }
+            }
         }
     }
 
