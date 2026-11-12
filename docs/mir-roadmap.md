@@ -57,10 +57,10 @@ Grouped by cause, because the cause decides the fix:
   not provide: `Vec`, `Box`, `String`, iterator adapters with closure state
   (`map`, `step_by`), `str::chars()`. Fix: a larger freestanding `core`/`alloc`
   shim, or accept these as out of scope.
-* **Back-end gaps** — `mir_codegen` bails: function pointers / indirect calls,
-  `dyn Trait` (trait objects), `Range` as a value (an aggregate constant it
-  cannot materialise), closures passed as `impl Fn` parameters (same indirect
-  call), promoted aggregate constants.
+* **Back-end gaps** — `mir_codegen` bails: `dyn Trait` (trait objects),
+  `Range` as a value (an aggregate constant it cannot materialise), promoted
+  aggregate constants. Function pointers and indirect calls are now
+  **supported** (see P4).
 * **Wrong or stale messages** — `classify_unsupported` in `mir.rs` still claims
   "floating-point types are not implemented" and "128-bit integers are not
   implemented", but `f64` arithmetic/comparison/loops and `i128`
@@ -133,10 +133,32 @@ mode selection in `mir_codegen`; the AST path already wins the same-shaped
 kernel, so the MIR path is leaving something on the table. Target: no program
 below ~0.95×.
 
-**P4 — widen the front-end-reachable surface.**
-Function pointers and indirect calls (unlocks closures-as-parameters), then
-iterator adapters and `Range` as a value. These are `mir_codegen` gaps, so they
-do not depend on a bigger `core` shim.
+**P4 — widen the front-end-reachable surface. (function pointers done)**
+Function pointers and indirect calls are implemented. Taking a function as a
+value (`add as fn(i64, i64) -> i64`, MIR `PointerCoercion(ReifyFnPointer)`)
+reifies its address as a `lea add(%rip), %reg`; a call through a `fn`-typed
+place is lowered to an indirect `call *%reg` (the callee is evaluated into a
+frame slot and reached memory-indirect, because `%r11` is the scratch register
+for array copies and division). Covered: a pointer passed as an argument,
+returned from a function, stored in a struct field, and held in an array
+(`tests/mir/fnptr.rs`). The `reject/fnptr` case is retired.
+
+Three latent bugs had to be fixed for this to work, each of which would have
+broken any operand-shaped callee:
+
+* `split_top_args` counted the `>` of a `->` as a closing angle bracket, so a
+  signature containing a `fn(..) -> ..` parameter was parsed as a *single*
+  argument and every later parameter was dropped.
+* The inliner cloned `CallTarget::Indirect` verbatim, so an inlined indirect
+  call still named the *caller's* local (its own `_1`) instead of the inlined
+  argument.
+* Every MIR use/def and rewrite pass (`copy_propagate`, `rewrite_term`,
+  use-counting, `other_place`) ignored the callee operand, so a `fn` pointer
+  local looked dead and its definition was dropped.
+
+Still open in P4: closures passed as `impl Fn` parameters, iterator adapters,
+`Range` as a value. These are `mir_codegen` gaps, so they do not depend on a
+bigger `core` shim.
 
 **P5 — the architecturally correct interface.**
 Replace the printed-MIR text parser with a `rustc_private`

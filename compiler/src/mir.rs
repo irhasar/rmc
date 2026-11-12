@@ -123,6 +123,12 @@ pub enum Operand {
     Copy(Place),
     Move(Place),
     Const(Const),
+    /// `f` — a function or method taken as a value (a `fn` pointer). rustc
+    /// prints this as `f as fn(..) (PointerCoercion(ReifyFnPointer(..)))`, and
+    /// a bare path in a call position (`call f(..)`) reaches here too. The
+    /// value is the function's own address, so the back end materialises the
+    /// symbol; a `call` on this operand indirects through it.
+    Fn(String),
     /// `<T as Trait>::fmt` — a reified method. `ty_name` and `trait_name`
     /// identify which runtime formatter the back end must materialise the
     /// address of; the MIR path never calls it indirectly. The type is kept as
@@ -307,8 +313,12 @@ pub enum Terminator {
 pub enum CallTarget {
     /// A direct call to a named function (which may be a runtime builtin).
     Direct(String),
-    /// An indirect call through a local (a function pointer); unsupported.
-    Indirect,
+    /// A call through a computed callee (`f(a, b)` where `f` is a `fn` pointer
+    /// local, a struct field, or a `fn` item used as a value). The operand is
+    /// evaluated to the code address and `call *%reg` is emitted. `None` is a
+    /// callee the parser could not read; the back end reports it cleanly rather
+    /// than emitting a call to nothing.
+    Indirect(Option<Operand>),
 }
 
 #[derive(Debug, Clone)]
@@ -440,8 +450,11 @@ impl Function {
                     Terminator::SwitchInt { discr, .. } => operand_indices(discr),
                     Terminator::Assert { cond, .. } => operand_indices(cond),
                     Terminator::Drop { place, .. } => place_indices(place),
-                    Terminator::Call { args, .. } => {
-                        args.iter().flat_map(operand_indices).collect::<Vec<_>>()
+                    Terminator::Call { func, args, .. } => {
+                        args.iter()
+                            .chain(call_callee(func))
+                            .flat_map(operand_indices)
+                            .collect::<Vec<_>>()
                     }
                     _ => Vec::new(),
                 });
@@ -538,8 +551,8 @@ impl Function {
                 Terminator::Drop { place, .. } => {
                     *uses.entry(place.local).or_insert(0) += 1;
                 }
-                Terminator::Call { args, .. } => {
-                    for a in args {
+                Terminator::Call { func, args, .. } => {
+                    for a in args.iter().chain(call_callee(func)) {
                         read_op(a, &mut uses);
                     }
                 }
@@ -788,9 +801,12 @@ fn rewrite_term(t: &mut Terminator, subst: &HashMap<u32, Place>) {
         Terminator::SwitchInt { discr, .. } => rewrite_op(discr, subst),
         Terminator::Assert { cond, .. } => rewrite_op(cond, subst),
         Terminator::Drop { place, .. } => rewrite_place(place, subst),
-        Terminator::Call { args, .. } => {
+        Terminator::Call { func, args, .. } => {
             for a in args {
                 rewrite_op(a, subst);
+            }
+            if let Some(callee) = call_callee_mut(func) {
+                rewrite_op(callee, subst);
             }
         }
         _ => {}
@@ -1192,7 +1208,7 @@ fn rename_op_tys(op: &mut Operand, canon: &BTreeMap<String, String>) {
 }
 
 /// Every operand a statement's rvalue reads, for the type-canonicalization walk.
-fn rv_all_operands(rv: &Rvalue) -> Vec<&Operand> {
+pub(crate) fn rv_all_operands(rv: &Rvalue) -> Vec<&Operand> {
     match rv {
         Rvalue::Use(op) => vec![op],
         Rvalue::Binary(_, a, b) => vec![a, b],
@@ -1924,6 +1940,23 @@ fn parse_call_terminator(t: &str) -> Option<Terminator> {
     // path segment starts with `_`, so `normalize_call_name` would reject them
     // as indirect; map them to the runtime helpers that consume a
     // `core::fmt::Arguments` before that happens.
+    let fname = func.trim();
+    // A computed callee prints as an *operand*: `copy _1(...)`, `move _3(...)`,
+    // `(*_4)(...)`, or a bare local `_5(...)`. Detect those before name
+    // normalization, which would otherwise read `copy _1` as a function name.
+    if fname.starts_with("copy ")
+        || fname.starts_with("move ")
+        || fname.starts_with("(*")
+        || (fname.starts_with('_') && !fname.contains(':'))
+    {
+        let callee = parse_operand(fname).ok();
+        return Some(Terminator::Call {
+            dest,
+            func: CallTarget::Indirect(callee),
+            args,
+            target,
+        });
+    }
     let func = match func.trim() {
         "std::io::_print" | "core::fmt::_print" => CallTarget::Direct("__rmc_print".to_string()),
         "std::io::_eprint" | "core::fmt::_eprint" => CallTarget::Direct("__rmc_eprint".to_string()),
@@ -1933,7 +1966,13 @@ fn parse_call_terminator(t: &str) -> Option<Terminator> {
             Some(name) => CallTarget::Direct(name),
             None => match normalize_call_name(&func) {
                 Some(name) => CallTarget::Direct(name),
-                None => CallTarget::Indirect,
+                // A call through a computed callee: `_5(...)`, `(*_3)(...)`, or
+                // a `fn` item used as a value. Keep the operand so the back end
+                // can materialise its address and `call *%reg`.
+                None => match parse_operand(func.trim()) {
+                    Ok(op) => CallTarget::Indirect(Some(op)),
+                    Err(_) => CallTarget::Indirect(None),
+                },
             },
         },
     };
@@ -2118,7 +2157,9 @@ fn split_arrow(t: &str) -> Option<(&str, &str)> {
 
 /// `f(move _1, const 2)` -> `("f", [Move(_1), Const(2)])`.
 fn parse_call_head(s: &str) -> Result<(String, Vec<Operand>), String> {
-    let open = s.find('(').ok_or_else(|| format!("mir: bad call `{s}`"))?;
+    // The callee may itself contain parens (`(*_4)(a, b)`, `(f)(x)`), so the
+    // argument list is the *last* top-level `(...)` group, not the first.
+    let open = last_top_open_paren(s).ok_or_else(|| format!("mir: bad call `{s}`"))?;
     let func = s[..open].trim().to_string();
     let close = matching(s, open, '(', ')').ok_or_else(|| format!("mir: unbalanced call `{s}`"))?;
     let args = split_top_args(&s[open + 1..close]);
@@ -2130,6 +2171,35 @@ fn parse_call_head(s: &str) -> Result<(String, Vec<Operand>), String> {
         ops.push(parse_operand(a.trim())?);
     }
     Ok((func, ops))
+}
+
+/// The index of the last `(` at bracket depth 0, i.e. the one that opens a
+/// call's argument list. Depth counts `()`/`[]`/`{}` so a paren inside the
+/// callee expression is skipped.
+fn last_top_open_paren(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut last = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(end) = string_end(bytes, i) {
+            i = end;
+            continue;
+        }
+        match bytes[i] {
+            b'(' => {
+                if depth == 0 {
+                    last = Some(i);
+                }
+                depth += 1;
+            }
+            b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    last
 }
 
 /// The return edge of a call: `[return: bbN, unwind ...]`. Older MIR prints
@@ -2398,6 +2468,18 @@ fn parse_rvalue(s: &str) -> Result<Rvalue, String> {
                 });
             }
             return Ok(Rvalue::Use(Operand::Fmt { ty_name, trait_name }));
+        }
+    }
+    // A function item taken as a value: `add as fn(i64, i64) -> i64
+    // (PointerCoercion(ReifyFnPointer(Safe), Implicit))`. The value is the
+    // function's own address, so keep the symbol and let the back end `lea` it.
+    // This must run before the generic cast split, which would try to read the
+    // operand part (`add`) as a place and fail.
+    if let Some((op_part, ty_kind)) = split_top_as(s) {
+        if ty_kind.contains("ReifyFnPointer") {
+            let name = normalize_call_name(op_part.trim())
+                .ok_or_else(|| format!("mir: bad fn-pointer source `{op_part}`"))?;
+            return Ok(Rvalue::Use(Operand::Fn(name)));
         }
     }
     // A cast: `OPERAND as TY (KIND)`.
@@ -3490,6 +3572,13 @@ fn split_top_args(s: &str) -> Vec<String> {
                 depth += 1;
                 cur.push(c);
             }
+            // The `>` of a `->` (a function type, `fn(i64) -> i64`) is not a
+            // closing angle bracket; counting it would drive the depth negative
+            // and hide every following top-level comma, so a multi-argument
+            // signature with a `fn` parameter would be read as one argument.
+            '>' if i > 0 && bytes[i - 1] == b'-' => {
+                cur.push(c);
+            }
             ')' | ']' | '}' | '>' => {
                 depth -= 1;
                 cur.push(c);
@@ -3783,7 +3872,7 @@ impl Remap {
             Operand::Copy(p) => Operand::Copy(self.place_ret(p, dest_local)),
             Operand::Move(p) => Operand::Move(self.place_ret(p, dest_local)),
             Operand::Const(c) => Operand::Const(self.const_(c)),
-            Operand::Fmt { .. } => o.clone(),
+            Operand::Fmt { .. } | Operand::Fn(_) => o.clone(),
         }
     }
 
@@ -3871,7 +3960,17 @@ impl Remap {
             Terminator::Return => Terminator::Goto(self.join),
             Terminator::Call { dest, func, args, target } => Terminator::Call {
                 dest: self.place_ret(dest, dest_local),
-                func: func.clone(),
+                // A direct callee names a function, which does not move; an
+                // indirect callee is an operand in the callee's namespace (its
+                // own `_1`), so it must be remapped like any other operand or
+                // the inlined body would call the caller's local of that index.
+                func: match func {
+                    CallTarget::Direct(_) => func.clone(),
+                    CallTarget::Indirect(Some(o)) => {
+                        CallTarget::Indirect(Some(self.op_ret(o, dest_local)))
+                    }
+                    CallTarget::Indirect(None) => CallTarget::Indirect(None),
+                },
                 args: args.iter().map(|a| self.op_ret(a, dest_local)).collect(),
                 target: target.map(|b| self.block(b)),
             },
@@ -4407,7 +4506,9 @@ impl Function {
                         out.push((b as u32, blk.stmts.len()));
                     }
                 }
-                Terminator::Call { args, .. } => args.iter().for_each(&mut read_term),
+                Terminator::Call { func, args, .. } => {
+                    args.iter().chain(call_callee(func)).for_each(&mut read_term)
+                }
                 _ => {}
             }
         }
@@ -4988,8 +5089,12 @@ impl Function {
                         return true;
                     }
                 }
-                Terminator::Call { args, .. } => {
-                    if args.iter().any(|a| other_place(a) == Some(local)) {
+                Terminator::Call { func, args, .. } => {
+                    if args
+                        .iter()
+                        .chain(call_callee(func))
+                        .any(|a| other_place(a) == Some(local))
+                    {
                         return true;
                     }
                 }
@@ -5034,8 +5139,12 @@ impl Function {
                         return true;
                     }
                 }
-                Terminator::Call { args, .. } => {
-                    if args.iter().any(|a| other_place(a) == Some(local)) {
+                Terminator::Call { func, args, .. } => {
+                    if args
+                        .iter()
+                        .chain(call_callee(func))
+                        .any(|a| other_place(a) == Some(local))
+                    {
                         return true;
                     }
                 }
@@ -5486,8 +5595,8 @@ impl Function {
                         *uses.entry(p.local).or_insert(0) += 1;
                     }
                 }
-                Terminator::Call { args, .. } => {
-                    for a in args {
+                Terminator::Call { func, args, .. } => {
+                    for a in args.iter().chain(call_callee(func)) {
                         if let Operand::Copy(p) | Operand::Move(p) = a {
                             *uses.entry(p.local).or_insert(0) += 1;
                         }
@@ -5559,8 +5668,8 @@ impl Function {
                         rewrite(p);
                     }
                 }
-                Terminator::Call { args, .. } => {
-                    for a in args {
+                Terminator::Call { func, args, .. } => {
+                    for a in args.iter_mut().chain(call_callee_mut(func)) {
                         if let Operand::Copy(p) | Operand::Move(p) = a {
                             rewrite(p);
                         }
@@ -6200,7 +6309,25 @@ fn edges_with_facts(t: &Terminator) -> Vec<(u32, EdgeFact)> {
 fn operand_place(op: &Operand) -> Option<&Place> {
     match op {
         Operand::Copy(p) | Operand::Move(p) => Some(p),
-        Operand::Const(_) | Operand::Fmt { .. } => None,
+        Operand::Const(_) | Operand::Fmt { .. } | Operand::Fn(_) => None,
+    }
+}
+
+/// The callee operand of an indirect call, if any. A direct call names a
+/// function and reads no local, but an indirect call reads its callee (a `fn`
+/// pointer local, a field, ...), so every use/def and rewrite pass must see it.
+fn call_callee(func: &CallTarget) -> Option<&Operand> {
+    match func {
+        CallTarget::Indirect(op) => op.as_ref(),
+        CallTarget::Direct(_) => None,
+    }
+}
+
+/// Mutable form of [`call_callee`], for the rewrite passes.
+fn call_callee_mut(func: &mut CallTarget) -> Option<&mut Operand> {
+    match func {
+        CallTarget::Indirect(op) => op.as_mut(),
+        CallTarget::Direct(_) => None,
     }
 }
 
@@ -6744,7 +6871,7 @@ fn call_args_invariant(args: &[Operand], is_invariant: &impl Fn(u32) -> bool) ->
     args.iter().all(|a| match a {
         Operand::Const(_) => true,
         Operand::Copy(p) | Operand::Move(p) => p.proj.is_empty() && is_invariant(p.local),
-        Operand::Fmt { .. } => true,
+        Operand::Fmt { .. } | Operand::Fn(_) => true,
     })
 }
 
@@ -6800,7 +6927,7 @@ fn block_self_impure(b: &BasicBlock) -> bool {
         Stmt::Nop => false,
     }) || matches!(
         &b.term,
-        Terminator::Call { func: CallTarget::Indirect, .. }
+        Terminator::Call { func: CallTarget::Indirect(_), .. }
     )
 }
 
@@ -6810,7 +6937,7 @@ fn block_has_impure_call(b: &BasicBlock, pure_fns: &HashSet<String>) -> bool {
         Terminator::Call { func: CallTarget::Direct(name), .. } => {
             !call_is_pure(name, pure_fns)
         }
-        Terminator::Call { func: CallTarget::Indirect, .. } => true,
+        Terminator::Call { func: CallTarget::Indirect(_), .. } => true,
         _ => false,
     }
 }

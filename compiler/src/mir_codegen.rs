@@ -307,8 +307,27 @@ fn reachable(
         }
         if let Some(f) = prog.func(&name) {
             for b in &f.blocks {
+                for s in &b.stmts {
+                    if let Stmt::Assign(_, rv) = s {
+                        for op in rv_all_operands(rv) {
+                            if let Operand::Fn(n) = op {
+                                if prog.func(n).is_some() {
+                                    stack.push(n.clone());
+                                }
+                            }
+                        }
+                    }
+                }
                 match &b.term {
                     Terminator::Call { func: CallTarget::Direct(callee), .. } => {
+                        if prog.func(callee).is_some() {
+                            stack.push(callee.clone());
+                        }
+                    }
+                    // An indirect call whose callee is a named function still
+                    // needs that function emitted; a computed callee is a value,
+                    // not a name, and names no function on its own.
+                    Terminator::Call { func: CallTarget::Indirect(Some(Operand::Fn(callee))), .. } => {
                         if prog.func(callee).is_some() {
                             stack.push(callee.clone());
                         }
@@ -2368,6 +2387,12 @@ impl<'a> FnGen<'a> {
     fn eval_operand(&mut self, op: &Operand) -> Result<(String, bool), String> {
         match op {
             Operand::Const(c) => Ok((self.const_operand(c)?, false)),
+            Operand::Fn(name) => {
+                // A function taken as a value is its own address; materialise
+                // the symbol so it can be stored, passed, or called.
+                self.emit(&format!("  lea {}(%rip), %rax", asm_sym(name)));
+                Ok(("%rax".to_string(), false))
+            }
             Operand::Fmt { ty_name, trait_name } => {
                 // A reified formatter is the address of rmc's own runtime
                 // formatter for this type/trait pair.
@@ -2391,6 +2416,10 @@ impl<'a> FnGen<'a> {
     /// is returned directly, a complex one is loaded into `%rcx`.
     fn eval_operand_keep_rax(&mut self, op: &Operand) -> Result<(String, bool), String> {
         match op {
+            Operand::Fn(name) => {
+                self.emit(&format!("  lea {}(%rip), %rcx", asm_sym(name)));
+                Ok(("%rcx".to_string(), false))
+            }
             Operand::Fmt { ty_name, trait_name } => {
                 let label = self.fmt_label(ty_name, trait_name)?;
                 self.emit(&format!("  lea {label}(%rip), %rcx"));
@@ -2441,7 +2470,8 @@ impl<'a> FnGen<'a> {
             // template byte string.
             Operand::Const(Const::Str(_))
             | Operand::Const(Const::Bytes(_))
-            | Operand::Fmt { .. } => false,
+            | Operand::Fmt { .. }
+            | Operand::Fn(_) => false,
             Operand::Const(_) => true,
             Operand::Copy(p) | Operand::Move(p) => self.place_is_simple(p),
         }
@@ -2909,6 +2939,9 @@ impl<'a> FnGen<'a> {
             Operand::Const(c) => self.materialize_const_agg(c),
             Operand::Fmt { .. } => {
                 Err("mir_codegen: a reified formatter is not an aggregate".into())
+            }
+            Operand::Fn(_) => {
+                Err("mir_codegen: a function pointer is not an aggregate".into())
             }
         }
     }
@@ -4448,10 +4481,31 @@ impl<'a> FnGen<'a> {
     }
 
     fn gen_call(&mut self, dest: &Place, func: &CallTarget, args: &[Operand]) -> Result<(), String> {
+        // A call through a computed callee: evaluate the callee's address into a
+        // fresh frame slot, then use the same argument-marshalling path as a
+        // direct call and emit `call *slot(%rbp)`. A frame slot (not `%r10`/
+        // `%r11`) is used because those are scratch for `div`/`rem` and the
+        // block copy, which an aggregate argument's evaluation may run. The
+        // callee is computed *first* so a callee expression that reads an
+        // argument local sees the pre-call values (as MIR does).
+        let mut indirect: Option<String> = None;
         let name = match func {
             CallTarget::Direct(n) => n.clone(),
-            CallTarget::Indirect => {
-                return Err("mir_codegen: indirect call (fn pointer) unsupported".into())
+            CallTarget::Indirect(op) => {
+                let op = op.as_ref().ok_or_else(|| {
+                    "mir_codegen: indirect call (fn pointer) unsupported".to_string()
+                })?;
+                // A direct reference to a named function is a plain direct call.
+                if let Operand::Fn(n) = op {
+                    n.clone()
+                } else {
+                    let (v, _) = self.eval_operand(op)?;
+                    let slot = self.alloc_slot();
+                    let off = self.off(slot);
+                    self.store_word(&v, &off);
+                    indirect = Some(off);
+                    "<fn ptr>".to_string()
+                }
             }
         };
         if name == "alloc" {
@@ -4507,7 +4561,10 @@ impl<'a> FnGen<'a> {
                 self.emit(&format!("  mov {v}, {}", ARG_REGS[*i]));
             }
         }
-        self.emit(&format!("  call {}", asm_sym(&name)));
+        match &indirect {
+            Some(reg) => self.emit(&format!("  call *{reg}")),
+            None => self.emit(&format!("  call {}", asm_sym(&name))),
+        }
         self.restore_caller_saved(&caller_promos);
         if self.place_ty(dest).is_aggregate() {
             // Aggregates return by hidden pointer in %rdi; rmc's builtins do
@@ -4537,7 +4594,7 @@ impl<'a> FnGen<'a> {
             // A string constant is a byte pointer, so `Offset` scales by 1.
             Operand::Const(Const::Str(_)) => Ty::Ptr(Box::new(Ty::U8)),
             Operand::Const(_) => Ty::I64,
-            Operand::Fmt { .. } => Ty::Ptr(Box::new(Ty::Unit)),
+            Operand::Fmt { .. } | Operand::Fn(_) => Ty::Ptr(Box::new(Ty::Unit)),
         }
     }
 }
@@ -5689,7 +5746,7 @@ fn alu_mnem(op: BinOp) -> &'static str {
 fn operand_is_local(op: &Operand, local: u32) -> bool {
     match op {
         Operand::Copy(p) | Operand::Move(p) => p.local == local && p.proj.is_empty(),
-        Operand::Const(_) | Operand::Fmt { .. } => false,
+        Operand::Const(_) | Operand::Fmt { .. } | Operand::Fn(_) => false,
     }
 }
 
