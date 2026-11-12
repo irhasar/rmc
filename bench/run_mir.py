@@ -42,7 +42,7 @@ RMC = os.path.join(PROJ, "compiler", "target", "release", "rmc")
 RMCMIR = os.path.join(PROJ, "compiler", "target", "release", "examples", "rmcmir")
 OUT = "/tmp/rmcmirbench"
 
-PROGRAMS = ["hello", "fib", "mandel", "sieve", "mix", "stats", "refs", "heap", "callrec", "forloops"]
+PROGRAMS = ["hello", "fib", "mandel", "sieve", "mix", "stats", "refs", "heap", "callrec", "forloops", "light", "heavy"]
 ARGS = {
     "hello": [],
     "fib": ["32"],
@@ -54,6 +54,8 @@ ARGS = {
     "heap": ["200000"],
     "callrec": ["30"],
     "forloops": ["2000000"],
+    "light": ["2000000"],
+    "heavy": ["1000000000"],
 }
 
 RUSTC_MIR = ["rustc", "--emit=mir", "-O", "-Zno-codegen", "-C", "panic=abort",

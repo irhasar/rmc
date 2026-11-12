@@ -1217,6 +1217,17 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   per-index check rustc emits; the check costs ~1% on the array-heavy programs,
   so the flag does not decide any ratio, but the default would be an unfair
   comparison. Never build the two sides with different check settings.
+- **`light` and `heavy` bracket the load spectrum, and both must stay.** `light`
+  is the short, cache-resident case (a 2 KiB table scanned with a data-dependent
+  branch for a few ms), so process startup and per-iteration codegen are a real
+  share of its cost. `heavy` is the long, throughput-bound case (~1e9 iterations
+  over two accumulators, hundreds of ms), where the measured time is the
+  generated loop and a startup-only win cannot flatter rmc. Together they stop a
+  regression in either regime from hiding behind a win in the other; keep both
+  when editing `ARGS` or `PROGRAMS`. Both keep the loop real for *both*
+  compilers the same way as `refs`/`heap` - the trip count is read from `argv`
+  and a data-dependent branch (plus a second accumulator in `heavy`) defeats
+  LLVM's loop-closing and vectoriser - and neither uses an in-loop `black_box`.
 - **`callrec` is the call-heavy case, and it used to lose.** Non-tail recursion
   (`tree(n) = 1 + tree(n-1) + tree(n-2)`) cannot be inlined by either compiler,
   so it measures raw call overhead plus argument setup, where the stack-based

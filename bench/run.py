@@ -31,9 +31,11 @@ RUSTFLAGS_BASE = []
 # 0.02 matches `run_fair.py` and keeps the verdict from calling a tie a loss.
 NOISE_BAND = 0.02
 
-PROGRAMS = ["hello", "fib", "mandel", "sieve", "mix", "stats", "refs", "heap", "callrec", "forloops"]
+PROGRAMS = ["hello", "fib", "mandel", "sieve", "mix", "stats", "refs", "heap", "callrec", "forloops", "light", "heavy"]
 # Runtime input per program, passed as argv so the workload is opaque to the
-# optimizer and cannot be constant-folded away.
+# optimizer and cannot be constant-folded away. `light` is a short (few ms)
+# cache-resident run; `heavy` runs the loop for ~1e9 iterations, so the two
+# bracket the load spectrum.
 ARGS = {
     "hello": [],
     "fib": ["32"],
@@ -45,6 +47,8 @@ ARGS = {
     "heap": ["200000"],
     "callrec": ["30"],
     "forloops": ["2000000"],
+    "light": ["2000000"],
+    "heavy": ["1000000000"],
 }
 
 
