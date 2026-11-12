@@ -109,6 +109,53 @@ def measure_spawned(argv, reps):
     return dict(wall=min(walls), cpu=min(cpus), rss=max(rsss))
 
 
+def verify_outputs(bins, args):
+    """Require both compilers to produce the same program.
+
+    Run each produced binary once and compare stdout and exit status. If they
+    differ, the two compilers are not producing the same program and the
+    run-time comparison below is meaningless, so abort rather than report a
+    verdict. This is the fairness precondition for the run axes.
+    """
+    first = next(iter(bins))
+    ref = subprocess.run([bins[first]] + list(args), capture_output=True)
+    for name, path in bins.items():
+        got = subprocess.run([path] + list(args), capture_output=True)
+        if got.returncode != ref.returncode or got.stdout != ref.stdout:
+            raise SystemExit(
+                f"output mismatch for {args!r}: {name} exited "
+                f"{got.returncode} with {got.stdout!r}, {first} exited "
+                f"{ref.returncode} with {ref.stdout!r}; the compilers disagree, "
+                f"so the run-time comparison would be invalid")
+
+
+def measure_runs(bins, args, reps):
+    """Run several binaries of the same workload interleaved.
+
+    A sequential sweep measures the first binary on a cool core and the last on
+    a warmed-up one, which can flip a near-parity case. Round-robin sampling
+    spreads frequency and thermal drift evenly across the binaries.
+    `measure_spawned` already separates the wall/CPU pass from the RSS pass, so
+    this only has to interleave the order.
+    """
+    names = list(bins)
+    walls = {n: [] for n in names}
+    cpus = {n: [] for n in names}
+    for _ in range(reps):
+        for n in names:
+            r = measure_spawned([bins[n]] + list(args), 1)
+            walls[n].append(r["wall"])
+            cpus[n].append(r["cpu"])
+    rss = {n: 0 for n in names}
+    for _ in range(reps):
+        for n in names:
+            r = measure_spawned([bins[n]] + list(args), 1)
+            if r["rss"] > rss[n]:
+                rss[n] = r["rss"]
+    return {n: dict(wall=min(walls[n]), cpu=min(cpus[n]), rss=rss[n])
+            for n in names}
+
+
 def median(xs):
     return statistics.median(xs)
 
@@ -190,9 +237,12 @@ def collect():
         res = {}
         for kind in ("rmc", "rustc"):
             res[kind] = measure_compile(p, kind)
+        bins = {kind: os.path.join(OUT, f"{p}.{kind}.bin")
+                for kind in ("rmc", "rustc")}
+        verify_outputs(bins, ARGS[p])
+        runs = measure_runs(bins, ARGS[p], 25)
         for kind in ("rmc", "rustc"):
-            binpath = os.path.join(OUT, f"{p}.{kind}.bin")
-            res[kind]["run"] = measure_spawned([binpath] + ARGS[p], 9)
+            res[kind]["run"] = runs[kind]
         res["plain"] = measure_rustc_plain(p)
         res["static"] = measure_rustc_static(p)
         rows.append((p, res))

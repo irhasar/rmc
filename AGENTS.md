@@ -2136,6 +2136,45 @@ rmc's own freestanding runtime. Read the harness before trusting a number.
   something the back end can fix; the front end is rustc in *both* pipelines.
 - **The compile CPU win is real and large** (~1.2x): skipping LLVM codegen.
   Wall time is a near-tie because both fronts pay rustc's ~25-30 ms startup.
+- **Ratios inside +/- 0.02 are a tie.** The run axes take the minimum of 50
+  interleaved samples, but two runs of the *same* binary still land within
+  ~1% of each other on this host (measured spread 0.8-1.3% for `mix`/`heap`),
+  so `0.99` carries no signal. `NOISE_BAND = 0.02` keeps the verdict from
+  calling a tie a loss; the harness also prints the mean speedup per axis, so
+  one program's tie cannot hide a regression. On the current host that mean is
+  `wall 1.08, cpu 1.12, rss 1.00 (tie), size 18.8, run_wall 1.10, run_cpu 1.11,
+  run_rss 1.20`: six wins and the one documented front-end tie.
+- **`run_rss` above 1 is rmc *winning*.** rmc's `_start` is a bare syscall exit
+  with no libc, so a short program peaks at ~36 kB while the LLVM+`ld` binary
+  pays the ELF loader's ~48 kB. A `run_rss` of 1.2-1.3 is a 12-33% RAM win, not
+  a loss; do not "fix" it.
+- **Strip the LLVM link (`ld -s`).** rmc's linker emits no section headers, so
+  its binary is symbol-free already; leaving LLVM's symtab in credits rmc with
+  ~5.7 kB it did not save. `run.py` strips rustc for the same reason.
+
+### The harness gates on output equality and interleaves sampling
+
+Two properties make the verdict defensible, and both are easy to lose when
+editing the harness:
+
+- **Correctness gate.** `verify_outputs` runs both produced binaries once and
+  aborts if stdout or exit status differ, before any run-time number is
+  reported. A back end is only "faster" on a workload the other also computes
+  correctly; without the gate, a back end that miscompiles (or traps early)
+  would look fast.
+- **Interleaved sampling.** `measure_stages` times the four compile stages
+  (`mir.front`, `mir.back`, `llvm.front`, `llvm.back`) round-robin in one pass,
+  and `measure_interleaved` does the same for the produced binaries, so CPU
+  frequency and thermal drift cannot favour whichever pipeline ran first. A
+  sequential sweep can flip a near-parity run axis (`mix`/`heap` sit at ~1.00)
+  on its own.
+
+`bench/run.py` (AST path) carries the same gate (`verify_outputs`) and
+round-robin run sampling (`measure_runs`). `bench/run_mir.py` does *not*: its
+`mir` column compiles `bench/mir/*.rs` while its `ast`/`llvm` columns compile
+`bench/rust/*.rs`, so its run-time axes compare two different programs. Treat
+its run numbers as indicative and use `run_fair.py` for the apples-to-apples
+claim; the caveat is recorded in its docstring.
 
 ### Branchless min/max (`cmov`) was tried and rejected
 

@@ -17,6 +17,15 @@ is read from the child's own ``VmHWM`` (see ``run.py`` for why ``ru_maxrss`` is
 not usable here).
 
 Pass ``--markdown PATH`` to record the comparison in the repo.
+
+Fairness caveat. The three pipelines do **not** compile the same source file:
+``mir`` uses ``bench/mir/{name}.rs`` (a freestanding twin) while ``ast`` and
+``llvm`` use ``bench/rust/{name}.rs`` (the ``std`` version). The compile axes
+still compare a front end and a back end of the same size class, but the
+run-time axes compare two different programs, so a run-time ratio here is
+indicative rather than authoritative. For the apples-to-apples comparison - one
+source, both back ends, a correctness gate and interleaved sampling - use
+``bench/run_fair.py``.
 """
 import os, subprocess, sys, time, shutil, statistics
 
