@@ -2396,6 +2396,49 @@ future session does not re-derive them by hand:
   allocator, so a scheduler-sensitive kernel could lose it back.
   `docs/mir-roadmap.md` P3 is the work that keeps it closed.
 
+### The codegen-backend pipeline (`cb`): the dylib must be a `cdylib`
+
+`backend/` builds rmc as a rustc `-Zcodegen-backend` dylib, the complete form
+of the pipeline the printed-MIR prototype (`rmcmir`) stands in for: rustc hands
+the backend the same optimised MIR LLVM would see, and rmc lowers it straight
+to a freestanding ELF. `bench/run_codegen.py` compares it to `rustc -O -C
+lto=fat` per program.
+
+- **`crate-type = ["cdylib"]`, not `["dylib"]`.** A `dylib` exports every
+  `pub` symbol of its dependency, so all 194 `rmc::*` items stay dynamically
+  exported and the linker cannot drop the unused AST front end
+  (parser/sema/lexer, ~17k lines). A `cdylib` exports only
+  `__rustc_codegen_backend`, the `.so` halves (2.1 -> 1.2 MB), and the
+  whole-pipeline compile-RSS mean moves from a loss to a tie. Add `lto = true`,
+  `strip = true`, `codegen-units = 1` to match the compiler crate's profile.
+- **Drive the backend through `rustc` directly, not the `backend/rmc-rustc`
+  shell wrapper.** The wrapper's extra `sh` process is a fixed ~1.9 ms tax; the
+  LLVM row is one `rustc` process, so the harness must be too or the comparison
+  is unfair. `run_codegen.py` passes `-Zcodegen-backend=<so>` to `rustc +nightly`
+  itself. The `.so` carries an rpath to the toolchain `lib` (set by
+  `backend/build.sh`), so no environment fixup is needed.
+- **`interleave_div_pairs` is the whole of `mandel`'s gap to LLVM.** Its inner
+  loop computes `zr*zr/1000` and `zi*zi/1000`: two adjacent
+  `mov;imul;mov %rax,%r10;<magic divide>` units. Each is short enough that the
+  CPU cannot hide the second `imul` behind the first unit's tail, so the pair
+  runs serially. The pass hoists the second multiply above the first divide and
+  parks the two products in `%r10`/`%r11` (scratch on this path). Constant
+  hoisting alone does *not* help (verified, 5 sites) -- the win is purely ILP.
+- **`gen_div_const` takes its sign correction from `%rdx` on the plain path.**
+  Only the biased (`add`) path -- where the magic `m` does not fit a positive
+  `i64` and the product does not carry the dividend's sign -- needs the dividend
+  copy in `%r10`. The plain path reads `%rdx >> 63` straight after the `imul`,
+  keeping `%r10` off its critical path (and free for the interleave pass).
+- **`-C opt-level=3` (with rustc's MIR optimiser) is mandatory, not a knob.**
+  `-Zmir-opt-level=0` compiles `hello` ~1 ms faster and ~1 MB lighter, but
+  `mandel` runs 1.6x slower, `stats`/`forloops` 2x, and `fib` is wrong. rmc
+  reuses rustc's optimised MIR; it does not re-do those passes.
+- **The remaining `hello` compile-RSS loss (0.97) is structural.** Stubbing out
+  rmc's lowering entirely (`compile_mir_text` returns early) still peaks at
+  84.6 MB against LLVM's 83.0 MB, so it is the shared rustc front end plus the
+  ~1.4 MB cost of loading a codegen backend at all -- not rmc's codegen. The
+  mean RSS is a tie (1.01); do not chase the per-program flag.
+
 ### An unsupported construct must exit 1, never panic
 
 Three separate panics on *expected* input were found and fixed (P1):
