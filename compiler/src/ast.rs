@@ -9,6 +9,11 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
     I64,
+    /// An integer narrower than 64 bits, e.g. `u8`, `i32`, `usize`. It occupies
+    /// one 8-byte slot like `I64`, but arithmetic wraps and compares at `bits`
+    /// and a cast truncates/sign- or zero-extends. `I64` stays a separate
+    /// variant so 64-bit programs are unchanged.
+    Int { signed: bool, bits: u16 },
     Bool,
     /// `char`: one Unicode scalar value, held in a 32-bit slot. A `char`
     /// converts to an integer with `as` and compares as one, but is a distinct
@@ -61,6 +66,7 @@ impl Type {
     pub fn size(&self) -> usize {
         match self {
             Type::I64
+            | Type::Int { .. }
             | Type::Bool
             | Type::Char
             | Type::Str
@@ -83,6 +89,7 @@ impl Type {
         matches!(
             self,
             Type::I64
+                | Type::Int { .. }
                 | Type::Bool
                 | Type::Char
                 | Type::Str
@@ -102,6 +109,7 @@ impl Type {
         matches!(
             self,
             Type::I64
+                | Type::Int { .. }
                 | Type::Bool
                 | Type::Char
                 | Type::Enum(_)
@@ -119,6 +127,7 @@ impl Type {
         matches!(
             self,
             Type::I64
+                | Type::Int { .. }
                 | Type::Bool
                 | Type::Char
                 | Type::Enum(_)
@@ -151,6 +160,7 @@ impl Type {
     pub fn key(&self) -> String {
         match self {
             Type::I64 => "i".to_string(),
+            Type::Int { signed, bits } => format!("w{}{}", if *signed { "s" } else { "u" }, bits),
             Type::U8 => "U".to_string(),
             Type::I8 => "J".to_string(),
             Type::Bool => "b".to_string(),
@@ -188,12 +198,75 @@ impl Type {
 pub fn tuple_struct_name(elem_keys: &[String]) -> String {
     format!("\u{0}tuple({})", elem_keys.join(","))
 }
-
 /// True for the anonymous structs `tuple_struct_name` produces. The name starts
 /// with a NUL, which no source identifier can contain, so it can never collide
 /// with a user struct or be written in source.
 pub fn is_tuple_name(name: &str) -> bool {
     name.starts_with("\u{0}tuple(")
+}
+
+/// The source spelling of an integer type (`u32`, `i8`, `usize`, `i64`), used
+/// in diagnostics. Any non-`Int` type reads as `i64`, the native integer.
+pub fn int_ty_name(t: &Type) -> &'static str {
+    match t {
+        Type::Int { signed: false, bits: 8 } => "u8",
+        Type::Int { signed: false, bits: 16 } => "u16",
+        Type::Int { signed: false, bits: 32 } => "u32",
+        Type::Int { signed: true, bits: 8 } => "i8",
+        Type::Int { signed: true, bits: 16 } => "i16",
+        Type::Int { signed: true, bits: 32 } => "i32",
+        Type::Int { signed: true, bits: 128 } => "i128",
+        Type::Int { signed: false, bits: 128 } => "u128",
+        _ => "i64",
+    }
+}
+
+/// Whether the signed integer `v` fits `bits`, for the literal-range check.
+pub fn fits_int(v: i64, signed: bool, bits: u16) -> bool {
+    if bits >= 64 {
+        return true;
+    }
+    if signed {
+        let lo = -(1i64 << (bits - 1));
+        let hi = (1i64 << (bits - 1)) - 1;
+        v >= lo && v <= hi
+    } else {
+        v >= 0 && (v as u64) < (1u64 << bits)
+    }
+}
+
+/// Wrap `v` to the width `bits` as a two's-complement bit pattern, stored in an
+/// `i64` the way the machine keeps a narrow value. This is what the hardware
+/// does after an arithmetic instruction and what a cast to a width yields.
+pub fn wrap_int(v: i64, signed: bool, bits: u16) -> i64 {
+    if bits >= 64 {
+        return v;
+    }
+    if signed {
+        let shift = 64 - bits;
+        (v << shift) >> shift
+    } else {
+        (v as u64 & ((1u64 << bits) - 1)) as i64
+    }
+}
+
+/// Interpret the low `bits` of `v` as an unsigned value. Used to decide whether
+/// `a op b` overflows a width and to fold a narrow constant expression.
+pub fn to_unsigned(v: i64, bits: u16) -> u64 {
+    if bits >= 64 {
+        v as u64
+    } else {
+        (v as u64) & ((1u64 << bits) - 1)
+    }
+}
+
+/// Whether the low `bits` of `v`, read signed, are negative.
+pub fn is_negative(v: i64, bits: u16) -> bool {
+    if bits >= 64 {
+        v < 0
+    } else {
+        (v >> (bits - 1)) & 1 == 1
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

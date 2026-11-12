@@ -868,7 +868,7 @@ impl Parser {
             other => other,
         };
         match ty {
-            Type::I64 | Type::Bool | Type::Char => Ok(ty),
+            Type::I64 | Type::Bool | Type::Char | Type::Int { .. } => Ok(ty),
             other => Err(format!(
                 "at byte {pos}: constant `{name}` has type {other:?}; rmc only folds `i64`, `bool` and `char` constants"
             )),
@@ -6220,19 +6220,29 @@ fn stmt_has_call_p(s: &Stmt) -> bool {
     }
 }
 
-/// The built-in integer-width type names. rmc has one integer type, `i64`, but
-/// a Rust source spells widths (`usize`, `u32`, `i8`, ...). Each is pre-seeded
-/// as a transparent alias for `i64` so `let i: usize = 0;` and
-/// `x as usize` parse; the value is `i64` throughout, so the alias is exactly
-/// what a `type usize = i64;` would give. A program may shadow any of them with
-/// its own `type`, which is why this is the alias map and not a reserved word.
+/// The built-in integer-width type names. A Rust source spells widths
+/// (`usize`, `u32`, `i8`, ...); rmc resolves each to its real width so
+/// arithmetic wraps and a cast truncates as rustc does. `i64`/`isize`/`u64`/
+/// `usize` stay the native 64-bit `Type::I64` (rmc's only pre-width integer, so
+/// a 64-bit program is unchanged); a narrower width becomes `Type::Int`. A
+/// program may shadow any of them with its own `type`, which is why this is the
+/// alias map and not a reserved word.
 fn builtin_aliases() -> std::collections::HashMap<String, Type> {
     let mut m = std::collections::HashMap::new();
-    for name in [
-        "usize", "isize", "u8", "u16", "u32", "u64", "u128",
-        "i8", "i16", "i32", "i128",
+    for (name, ty) in [
+        ("usize", Type::I64),
+        ("isize", Type::I64),
+        ("u64", Type::I64),
+        ("u8", Type::Int { signed: false, bits: 8 }),
+        ("u16", Type::Int { signed: false, bits: 16 }),
+        ("u32", Type::Int { signed: false, bits: 32 }),
+        ("u128", Type::Int { signed: false, bits: 128 }),
+        ("i8", Type::Int { signed: true, bits: 8 }),
+        ("i16", Type::Int { signed: true, bits: 16 }),
+        ("i32", Type::Int { signed: true, bits: 32 }),
+        ("i128", Type::Int { signed: true, bits: 128 }),
     ] {
-        m.insert(name.to_string(), Type::I64);
+        m.insert(name.to_string(), ty);
     }
     m
 }
