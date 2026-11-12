@@ -33,6 +33,15 @@ pub enum Type {
     /// even when `T` is an aggregate. There is no lifetime or borrow checking:
     /// rmc trusts the programmer not to outlive the referent.
     Ref(Box<Type>, bool),
+    /// A byte referent: `u8` or `i8`. It only ever appears as the referent of a
+    /// pointer (`*const u8`, `*mut i8`, `&u8`), never as a standalone value
+    /// type — rmc has no byte-valued local, so `*p` on such a pointer still
+    /// yields `i64`. The variant exists so codegen can emit a one-byte load or
+    /// store for the referent while the value the program sees stays a word,
+    /// which is what keeps a `*const u8` read from returning eight bytes. `u8`
+    /// zero-extends and `i8` sign-extends on load, matching Rust.
+    U8,
+    I8,
     /// A string literal: a pointer to a NUL-terminated byte string in static
     /// data. It occupies one slot and travels in one register like `i64`, but it
     /// is a distinct type so it cannot be added to an integer or passed where an
@@ -51,7 +60,14 @@ pub enum Type {
 impl Type {
     pub fn size(&self) -> usize {
         match self {
-            Type::I64 | Type::Bool | Type::Char | Type::Str | Type::Enum(_) | Type::Ref(..) => 8,
+            Type::I64
+            | Type::Bool
+            | Type::Char
+            | Type::Str
+            | Type::Enum(_)
+            | Type::Ref(..)
+            | Type::U8
+            | Type::I8 => 8,
             Type::EnumData(_, size) => *size,
             Type::Unit | Type::Never => 0,
             Type::Array(elem, n) => elem.size() * n,
@@ -66,7 +82,14 @@ impl Type {
     pub fn is_scalar(&self) -> bool {
         matches!(
             self,
-            Type::I64 | Type::Bool | Type::Char | Type::Str | Type::Enum(_) | Type::Ref(..)
+            Type::I64
+                | Type::Bool
+                | Type::Char
+                | Type::Str
+                | Type::Enum(_)
+                | Type::Ref(..)
+                | Type::U8
+                | Type::I8
         )
     }
 
@@ -76,7 +99,15 @@ impl Type {
     /// and indexes correctly. A payload enum or a reference is excluded,
     /// matching rustc, which rejects both as array elements.
     pub fn is_int_or_bool(&self) -> bool {
-        matches!(self, Type::I64 | Type::Bool | Type::Char | Type::Enum(_))
+        matches!(
+            self,
+            Type::I64
+                | Type::Bool
+                | Type::Char
+                | Type::Enum(_)
+                | Type::U8
+                | Type::I8
+        )
     }
 
     /// True for the types an array element may have now that nested aggregates
@@ -87,7 +118,14 @@ impl Type {
     pub fn is_array_elem(&self) -> bool {
         matches!(
             self,
-            Type::I64 | Type::Bool | Type::Char | Type::Enum(_) | Type::Array(..) | Type::Struct(..)
+            Type::I64
+                | Type::Bool
+                | Type::Char
+                | Type::Enum(_)
+                | Type::Array(..)
+                | Type::Struct(..)
+                | Type::U8
+                | Type::I8
         )
     }
 
@@ -113,6 +151,8 @@ impl Type {
     pub fn key(&self) -> String {
         match self {
             Type::I64 => "i".to_string(),
+            Type::U8 => "U".to_string(),
+            Type::I8 => "J".to_string(),
             Type::Bool => "b".to_string(),
             Type::Char => "c".to_string(),
             Type::Str => "s".to_string(),

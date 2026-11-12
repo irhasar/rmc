@@ -910,6 +910,39 @@ impl Parser {
         elem_byte_width(&cur)
     }
 
+    /// The byte type a referent *name* denotes, if any: `u8` -> `U8`, `i8` ->
+    /// `I8`, following `type` aliases (`type Byte = u8`). `None` for every other
+    /// name, so the byte type only appears where the source wrote a byte width.
+    fn byte_referent(&self, name: &str) -> Option<Type> {
+        let mut cur = name.to_string();
+        for _ in 0..64 {
+            match self.alias_target.get(&cur) {
+                Some(next) if *next != cur => cur = next.clone(),
+                _ => break,
+            }
+        }
+        match cur.as_str() {
+            "u8" => Some(Type::U8),
+            "i8" => Some(Type::I8),
+            _ => None,
+        }
+    }
+
+    /// Parse the referent of a `*const`/`*mut`/`&` type. A byte width named
+    /// here is kept as a byte type; every other referent goes through
+    /// `parse_type`, which collapses `u8`-named non-byte aliases to `i64`. This
+    /// is why a `*const u8` load or store is one byte while `*p` still yields
+    /// an `i64`: the byte-ness lives only in the referent.
+    fn parse_referent_type(&mut self) -> PResult<Type> {
+        if let Some(Tok::Ident(n)) = self.peek().cloned() {
+            if let Some(bt) = self.byte_referent(&n) {
+                self.i += 1;
+                return Ok(bt);
+            }
+        }
+        self.parse_type()
+    }
+
     /// `type NAME = TYPE;`. The target is parsed here (aliases in it expanded by
     /// `parse_type_inner`) and stored; a use is rewritten to it by
     /// `expand_alias_ty`, so the alias never reaches sema. The name was
@@ -1280,7 +1313,7 @@ impl Parser {
                     ))
                 }
             };
-            let inner = self.parse_type()?;
+            let inner = self.parse_referent_type()?;
             return Ok(Type::Ref(Box::new(inner), mutable));
         }
         if self.eat(&Tok::Amp) {
@@ -1290,7 +1323,7 @@ impl Parser {
                 self.i += 1;
             }
             let mutable = self.eat(&Tok::Mut);
-            let inner = self.parse_type()?;
+            let inner = self.parse_referent_type()?;
             return Ok(Type::Ref(Box::new(inner), mutable));
         }
         // `&&T` lexes as one token; treat it as two references.

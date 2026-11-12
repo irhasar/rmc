@@ -114,6 +114,39 @@ struct LetTarget {
     by_field: bool,
 }
 
+/// How a byte referent loads: `u8` zero-extends and `i8` sign-extends, so a
+/// `*const u8` read of `0xFF` is `255` and a `*const i8` read is `-1`. A
+/// non-byte referent returns `None` and uses a plain 64-bit load.
+enum LoadKind {
+    Zero,
+    Sign,
+}
+
+fn byte_load(ty: &Type) -> Option<LoadKind> {
+    match ty {
+        Type::U8 => Some(LoadKind::Zero),
+        Type::I8 => Some(LoadKind::Sign),
+        _ => None,
+    }
+}
+
+/// True when `target` is a byte-referent dereference, so its store must write
+/// only the low byte (`movb`) rather than a word: a `*mut u8` write leaves the
+/// other seven bytes of the slot alone.
+fn is_byte_store(target: &Expr) -> bool {
+    matches!(target, Expr::Deref { ty, .. } if matches!(ty, Type::U8 | Type::I8))
+}
+
+/// The value type a byte referent yields: `i64` (see `byte_load`). Mirrors
+/// `sema::byte_value_ty`; the byte-ness is a property of the referent, not of
+/// the value the program manipulates.
+fn byte_value_ty(t: &Type) -> Type {
+    match t {
+        Type::U8 | Type::I8 => Type::I64,
+        other => other.clone(),
+    }
+}
+
 impl Codegen {
     pub fn new() -> Self {
         Codegen {
@@ -1793,11 +1826,15 @@ Expr::PatScrutinee(_) => {
             self.gen_addr(target);
             self.line("mov %rax, %rcx");
             self.pop_to("%rax");
-            self.line("mov %rax, (%rcx)");
+            if is_byte_store(target) {
+                self.line("movb %al, (%rcx)");
+            } else {
+                self.line("mov %rax, (%rcx)");
+            }
             return;
         }
         if let (Some(op), Some(k)) = (self.simple_operand(value), off) {
-            if op.starts_with('%') || op.starts_with('$') {
+            if (op.starts_with('%') || op.starts_with('$')) && !is_byte_store(target) {
                 self.gen_addr(target);
                 let disp = if k == 0 { String::new() } else { format!("{k}") };
                 self.store_operand(&op, &format!("{disp}(%rax)"));
@@ -1808,7 +1845,11 @@ Expr::PatScrutinee(_) => {
         self.push_rax();
         self.gen_expr(value);
         self.pop_to("%rcx");
-        self.line("mov %rax, (%rcx)");
+        if is_byte_store(target) {
+            self.line("movb %al, (%rcx)");
+        } else {
+            self.line("mov %rax, (%rcx)");
+        }
     }
 
     /// Assign aggregate `value` (an address in `%rax`) into aggregate place
@@ -2194,10 +2235,15 @@ Expr::PatScrutinee(_) => {
                 // A dereference is a place: read it. An aggregate referent is
                 // named by its address, so reading it yields the pointer itself.
                 self.gen_expr(expr);
-                if !ty.is_aggregate() {
-                    self.line("mov (%rax), %rax");
+                match byte_load(ty) {
+                    Some(LoadKind::Zero) => self.line("movzbq (%rax), %rax"),
+                    Some(LoadKind::Sign) => self.line("movsbq (%rax), %rax"),
+                    None if !ty.is_aggregate() => self.line("mov (%rax), %rax"),
+                    None => {}
                 }
-                ty.clone()
+                // The value is an `i64` even for a byte referent, which is what
+                // makes `*p` usable in printing and arithmetic.
+                byte_value_ty(ty)
             }
             Expr::Un(op, inner) => {
                 let inner_ty = self.gen_expr(inner);
@@ -2331,7 +2377,7 @@ Expr::PatScrutinee(_) => {
             // `*p` reading a scalar through a reference in a register is a bare
             // memory operand, so `x + *p` folds into one `add`. An aggregate
             // referent's value is its address, which is not a simple operand.
-            Expr::Deref { expr, ty } if !ty.is_aggregate() => {
+            Expr::Deref { expr, ty } if !ty.is_aggregate() && byte_load(ty).is_none() => {
                 self.ptr_reg(expr).map(|r| format!("({r})"))
             }
             Expr::Index(base, idx) => {

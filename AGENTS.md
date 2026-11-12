@@ -77,7 +77,9 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
 - `compiler/src/lib.rs` — library entry point: `compile_to_asm(src, options)`.
   The compiler is a library plus a thin CLI, so it can be embedded.
 - `compiler/src/lexer.rs` — byte scanner, tokens carry byte positions. A byte
-  literal `b'A'` lexes to a `Tok::Int` (rmc has no `u8`); `b".."` is not a
+  literal `b'A'` lexes to a `Tok::Int` (a byte *value* is an `i64`; only a byte
+  *referent* `*const u8`/`*mut i8` carries `Type::U8`/`I8`, see below);
+  `b".."` is not a
   literal it recognises, so it is rejected downstream. `lex_byte_lit` reads the
   first content byte with `get`, so an input ending in `b'` is an
   unterminated-literal error rather than an out-of-bounds panic.
@@ -586,8 +588,12 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   read through `&T` dereferences a pointer that may be null (`0 as &S`) or
   dangling, so hoisting it would fault on a loop whose body never runs. Any
   field in the chain whose own type is a reference holds such a pointer, so
-  `h.p.n` (where `p: &S`) is not a frame access either. Local aggregate fields
-  are frame accesses and stay hoistable.
+  `h.p.n` (where `p: &S`) is not a frame access either. Nor is a field whose
+  *base* is a reference: `&r.inner` (where `r: &S`) forms `*r + offset`, so it
+  dereferences `r` and is not frame storage. `is_frame_place` rejects a
+  reference-typed base before recursing, which is what keeps `&r.inner` out of
+  `proven_refs`; `&r` itself (the local pointer slot) stays a frame place. Local
+  aggregate fields are frame accesses and stay hoistable.
 - **LICM hoists a loop body's invariant arithmetic, and `for` slots are
   loop-carried.** The pass rewrites only a loop *body*; a `while` condition and
   a `for`'s bounds run once per iteration by design. A `for`'s variable and
@@ -1913,6 +1919,17 @@ shapes type: `*mut T as i64` is allowed (rmc maps `*mut T` and `&mut T` alike,
 and rustc allows the raw form) and an integer/pointer coerce both ways, matching
 the existing `i64 as &T` extension; a shared reference still may not become a
 `&mut` one.
+
+A byte *referent* is tracked. `*const u8`, `*mut u8` and `*mut i8` parse to
+`Type::U8`/`Type::I8` (through `parse_referent_type`, so a `type Byte = u8`
+alias works), and only there: the byte-ness is a property of the pointer, not of
+the value, so a deref still yields an `i64` (sema's `byte_value_ty`, which is
+also why `&mut *m` borrows `U8` while reading `*m` gives an `i64`). Codegen then
+emits a one-byte `movzbq`/`movsbq` load and a `movb` store; a plain `mov` read
+eight bytes, so `*p` on a `vec![7u8; 8]` printed `0x0707070707070707` and a
+`*p = x` clobbered the following seven bytes. A pointer cast normalises the
+byte-ness (`byte_value_ty`) so `*mut u8 as *mut i8` and `*mut u8 as *mut i64`
+both type.
 
 The `Vec`/pointer name tables (`vec_names`, `vec_elem`, `vec_len`, `vec_cap`,
 `ptr_vars`, `args_vecs`) are lexically scoped like the nested-`fn` frames above:

@@ -469,7 +469,9 @@ impl Elf {
         };
         let ops = split_ops(rest);
         match mnem {
-            "mov" | "movq" | "movb" | "movabs" | "movzbq" | "movzbl" => self.enc_mov(mnem, &ops, sec),
+            "mov" | "movq" | "movb" | "movabs" | "movzbq" | "movzbl" | "movsbq" | "movsbl" => {
+                self.enc_mov(mnem, &ops, sec)
+            }
             "lea" => self.enc_lea(&ops, sec),
             "push" | "pop" => self.enc_push_pop(mnem, &ops, sec),
             "add" | "addq" | "sub" | "and" | "or" | "xor" | "cmp" | "cmpq" | "test" => {
@@ -543,9 +545,10 @@ impl Elf {
     fn enc_mov(&mut self, mnem: &str, ops: &[String], sec: usize) -> Result<(), String> {
         let (src, dst) = (ops[0].clone(), ops[1].clone());
         match mnem {
-            "movzbq" | "movzbl" => {
+            "movzbq" | "movzbl" | "movsbq" | "movsbl" => {
                 let (dreg, _) = parse_reg(&dst)?;
-                let w = mnem == "movzbq";
+                let w = mnem == "movzbq" || mnem == "movsbq";
+                let sx = mnem == "movsbq" || mnem == "movsbl";
                 if let Ok((sreg, s8)) = parse_reg(&src) {
                     let mut rex = 0x40;
                     if w {
@@ -562,7 +565,8 @@ impl Elf {
                     if rex != 0x40 || (s8 && sreg >= 4) {
                         self.sections[sec].data.push(rex);
                     }
-                    self.sections[sec].data.extend_from_slice(&[0x0F, 0xB6]);
+                    let op = if sx { 0xBE } else { 0xB6 };
+                    self.sections[sec].data.extend_from_slice(&[0x0F, op]);
                     modrm_reg_reg(&mut self.sections[sec].data, dreg, sreg);
                     return Ok(());
                 }
@@ -583,7 +587,8 @@ impl Elf {
                 if rex != 0x40 {
                     self.sections[sec].data.push(rex);
                 }
-                self.sections[sec].data.extend_from_slice(&[0x0F, 0xB6]);
+                let op = if sx { 0xBE } else { 0xB6 };
+                self.sections[sec].data.extend_from_slice(&[0x0F, op]);
                 emit_mem_modrm(&mut self.sections[sec].data, &m, dreg);
                 if let Some(sym) = m.rip_label.clone() {
                     let len = self.sections[sec].data.len();
@@ -1412,6 +1417,38 @@ mod tests {
             abs_imm: Vec::new(),
             text_idx: 0,
         }
+    }
+
+    fn encode_one(line: &str) -> Vec<u8> {
+        let mut e = test_elf(0x5);
+        e.instruction(line, 0).expect("encodes");
+        e.sections[0].data[3..].to_vec()
+    }
+
+    #[test]
+    fn movzbq_loads_a_byte_and_zero_extends() {
+        // `movzbq (%rax), %rax`: REX.W 0F B6 /r. A plain `mov` would read eight
+        // bytes, which is the byte-pointer bug this encoding exists to fix.
+        assert_eq!(encode_one("movzbq (%rax), %rax"), [0x48, 0x0F, 0xB6, 0x00]);
+    }
+
+    #[test]
+    fn movsbq_loads_a_byte_and_sign_extends() {
+        // `movsbq (%rax), %rax`: REX.W 0F BE /r, the sign-extending twin.
+        assert_eq!(encode_one("movsbq (%rax), %rax"), [0x48, 0x0F, 0xBE, 0x00]);
+    }
+
+    #[test]
+    fn movsbl_stays_32_bit_without_rex_w() {
+        // The `movzbl`/`movsbl` width follows the destination register, so the
+        // 32-bit form carries no REX.W.
+        assert_eq!(encode_one("movsbl (%rax), %eax"), [0x0F, 0xBE, 0x00]);
+    }
+
+    #[test]
+    fn movb_stores_only_the_low_byte() {
+        // `movb %al, (%rcx)`: 88 /r, the one-byte store a `*mut u8` needs.
+        assert_eq!(encode_one("movb %al, (%rcx)"), [0x88, 0x01]);
     }
 
     #[test]

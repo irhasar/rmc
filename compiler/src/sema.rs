@@ -850,7 +850,9 @@ impl Sema {
         /// temporary every iteration).
         fn arg_can_assign(e: &Expr) -> bool {
             match e {
-                Expr::Block(b) | Expr::MatchBoundary(b, _) => block_assigns(b),
+                Expr::Block(b) | Expr::MatchBoundary(b, _) | Expr::Loop(b, _, _, _) => {
+                    block_assigns(b)
+                }
                 Expr::If(c, t, els) => {
                     arg_can_assign(c)
                         || block_assigns(t)
@@ -2125,7 +2127,12 @@ impl Sema {
     fn check_cast(&self, from: &Type, to: &Type) -> Result<(), String> {
         match (from, to) {
             (Type::Ref(a, a_mut), Type::Ref(b, b_mut)) => {
-                if a != b {
+                // A byte referent (`*const u8`) and a word one (`*const i64`)
+                // are both one address, so only the byte-ness is normalised
+                // away here: `*mut u8 as *mut i8` (both byte) and `*mut u8 as
+                // *mut i64` are accepted, while a mismatch between two
+                // non-byte referents stays rejected.
+                if byte_value_ty(a) != byte_value_ty(b) {
                     return Err(format!(
                         "cannot cast a `{a:?}` reference to a `{b:?}` reference"
                     ));
@@ -3701,9 +3708,23 @@ impl Sema {
                     *e = operand;
                     return Ok(Type::Ref(Box::new(Type::Str), mutability));
                 }
-                *ty = t.clone();
-                *e = Expr::AddrOf { expr: Box::new(operand), ty: t.clone(), mutable: mutability, slot: *slot };
-                Ok(Type::Ref(Box::new(t), mutability))
+                // The referent is the *place* type, which for a dereference is
+                // the node's own referent, not the value it yields: `&mut *m`
+                // on a `*mut u8` borrows a byte (`U8`), even though reading
+                // `*m` yields the `i64` value. Every other place's value type is
+                // its place type.
+                let place_t = match &operand {
+                    Expr::Deref { ty, .. } => ty.clone(),
+                    _ => t.clone(),
+                };
+                *ty = place_t.clone();
+                *e = Expr::AddrOf {
+                    expr: Box::new(operand),
+                    ty: place_t.clone(),
+                    mutable: mutability,
+                    slot: *slot,
+                };
+                Ok(Type::Ref(Box::new(place_t), mutability))
             }
             Expr::Deref { expr, ty } => {
                 // `&str` and `str` share one representation (the record
@@ -3722,8 +3743,14 @@ impl Sema {
                     Type::Ref(inner, _) => {
                         *ty = (*inner).clone();
                         let inner = *inner;
+                        // A byte referent (`*const u8`/`*mut i8`) keeps its byte
+                        // type on the node so codegen emits a one-byte load, but
+                        // the value the program sees is an `i64`: rmc has no
+                        // byte-valued local, so `*p` behaves as `i64` everywhere
+                        // else (printing, arithmetic, comparison).
+                        let value_ty = byte_value_ty(&inner);
                         *e = Expr::Deref { expr: Box::new(operand), ty: inner.clone() };
-                        Ok(inner)
+                        Ok(value_ty)
                     }
                     other => Err(format!("cannot dereference a value of type {other:?}")),
                 }
@@ -3854,7 +3881,7 @@ fn is_string_ty(t: &Type) -> bool {
 /// `{len, bytes}` record.
 fn ref_coerces(found: &Type, expected: &Type) -> bool {
     match (found, expected) {
-        (Type::Ref(f, true), Type::Ref(e, false)) => f == e,
+        (Type::Ref(f, true), Type::Ref(e, false)) => byte_value_ty(f) == byte_value_ty(e),
         (Type::Str, Type::Ref(e, false)) => **e == Type::Str,
         (Type::Ref(e, false), Type::Str) => **e == Type::Str,
         // An integer and a reference (raw pointer) coerce both ways. rmc has no
@@ -3874,6 +3901,18 @@ fn deref_ty(t: Type) -> Type {
     match t {
         Type::Ref(inner, _) => *inner,
         other => other,
+    }
+}
+
+/// The value type a byte referent yields: `i64`. A `*const u8`/`*mut i8` carries
+/// the byte type on the `Deref` node so codegen emits a one-byte access, but the
+/// value is an `i64` — rmc has no byte-valued local, so a byte read must behave
+/// as an `i64` in printing, arithmetic and comparison. Every non-byte referent is
+/// returned unchanged.
+fn byte_value_ty(t: &Type) -> Type {
+    match t {
+        Type::U8 | Type::I8 => Type::I64,
+        other => other.clone(),
     }
 }
 
