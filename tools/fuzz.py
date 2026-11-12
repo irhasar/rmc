@@ -2769,6 +2769,19 @@ def reject_corpus():
             '    println!("{}", r);\n'
             "}\n"
         ),
+        # A variant with two enum fields: arms that test *different* fields do
+        # not cover the cross-product, so the match is non-exhaustive (E0004).
+        # `W(I::A, _)` and `W(_, I::B)` together name both variants of `I`, but
+        # `W(I::B, I::A)` is uncovered.
+        "nested_variant_cross_field": (
+            "enum I { A, B }\n"
+            "enum O { W(I, I) }\n"
+            "fn main() {\n"
+            "    let o: O = O::W(I::B, I::A);\n"
+            "    let r = match o { O::W(I::A, _) => 1, O::W(_, I::B) => 2 };\n"
+            '    println!("{}", r);\n'
+            "}\n"
+        ),
         # Assignment to an immutable binding. rmc used to accept these and let
         # codegen write the slot; rustc rejects each with E0384.
         "assign_immutable_let": "fn main() { let x: i64 = 1; x = 2; println!(\"{}\", x); }\n",

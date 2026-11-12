@@ -421,13 +421,16 @@ pub enum Expr {
         /// fields are ignored rather than named. Only meaningful when the
         /// pattern has an argument list (`n_binds >= 0`).
         has_rest: bool,
-        /// Tests for refutable payload sub-patterns, each read through the
-        /// field it belongs to (`E::A(Some(x))` adds the `Some` test over
+        /// Tests for refutable payload sub-patterns, each paired with the index
+        /// of the field it reads (`E::A(Some(x))` adds the `Some` test over
         /// field 0). All must hold for the arm to match; codegen `&&`s them
         /// after the tag test, so a read only runs once the tag matched. A
         /// `_`/binding sub-pattern contributes none, and a struct/tuple
-        /// sub-pattern contributes only its own refutable elements'.
-        sub_tests: Vec<Expr>,
+        /// sub-pattern contributes only its own refutable elements'. The field
+        /// index is kept so exhaustiveness can union only tests of the *same*
+        /// field: `W(I::A, _)` and `W(_, I::B)` cover different fields, so
+        /// together they do not cover `W(I::B, I::A)`.
+        sub_tests: Vec<(usize, Expr)>,
     },
     /// `value == true`/`false`, as a `bool`. The arm test a `bool` literal
     /// pattern desugars to. It is a distinct node rather than a plain

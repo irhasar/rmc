@@ -5777,7 +5777,7 @@ impl Parser {
     ) -> Expr {
         let n_binds = args.as_ref().map_or(-1, |(a, _)| a.len() as i32);
         let has_rest = args.as_ref().map_or(false, |(_, rest)| *rest);
-        let mut sub_tests: Vec<Expr> = Vec::new();
+        let mut sub_tests: Vec<(usize, Expr)> = Vec::new();
         if let Some((args, _)) = args {
             for (idx, (_, pat)) in args.iter().enumerate() {
                 let payload = Expr::EnumPayload {
@@ -5789,7 +5789,7 @@ impl Parser {
                     ty: Type::Unit,
                 };
                 if let Some(t) = Self::pat_test(pat, &payload) {
-                    sub_tests.push(t);
+                    sub_tests.push((idx, t));
                 }
             }
         }

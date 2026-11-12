@@ -2175,7 +2175,7 @@ Expr::PatScrutinee(_) => {
                 // test passed, so the payload is valid; each sub-test reads its
                 // field and must hold too. `&&` short-circuits the whole arm, so
                 // a failing sub-test yields `false` immediately.
-                for t in sub_tests {
+                for (_, t) in sub_tests {
                     let end = self.new_label();
                     self.line("test %rax, %rax");
                     self.line(&format!("jz {end}"));

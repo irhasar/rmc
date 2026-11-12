@@ -1528,7 +1528,7 @@ impl Sema {
                             // cover every variant of the payload enum; otherwise
                             // the arm can fall through and the chain is not
                             // total.
-                            if !sub_tests.iter().all(|t| self.sub_test_complete(t)) {
+                            if !sub_tests.iter().all(|(_, t)| self.sub_test_complete(t)) {
                                 return false;
                             }
                         }
@@ -1660,7 +1660,7 @@ impl Sema {
             None => return false,
         };
         for (variant_name, fields, _, _) in &info.variants {
-            let mut lists: Vec<&[Expr]> = Vec::new();
+            let mut lists: Vec<&[(usize, Expr)]> = Vec::new();
             for leaf in &leaves {
                 match leaf {
                     Expr::VariantTest { enum_name: e, variant, sub_tests, .. } => {
@@ -1681,20 +1681,28 @@ impl Sema {
             if lists.iter().any(|l| l.is_empty()) {
                 continue;
             }
-            // A multi-field variant would need a cross-product of its fields'
-            // patterns, which rmc does not reason about.
+            // rmc unions one field's variants, so every arm must test exactly
+            // one field and all arms the same field. Otherwise the union spans
+            // different fields and proves nothing: `W(I::A, _)` and
+            // `W(_, I::B)` together name both variants of `I` but leave
+            // `W(I::B, I::A)` uncovered. A cross-product of the fields would be
+            // needed, which rmc does not reason about, so reject instead.
             if !lists.iter().all(|l| l.len() == 1) {
                 return false;
             }
-            // The payload must be an enum for the recursion to mean anything;
+            let idx = lists[0][0].0;
+            if lists.iter().any(|l| l[0].0 != idx) {
+                return false;
+            }
+            // The tested field must be an enum for the union to mean anything;
             // a scalar, struct or tuple field cannot be shown covered here.
             if !matches!(
-                fields.first(),
+                fields.get(idx),
                 Some((Type::Enum(_) | Type::EnumData(_, _), _))
             ) {
                 return false;
             }
-            let sub_arms: Vec<&Expr> = lists.iter().map(|l| &l[0]).collect();
+            let sub_arms: Vec<&Expr> = lists.iter().map(|l| &l[0].1).collect();
             if !self.chain_covers(&sub_arms) {
                 return false;
             }
@@ -1732,7 +1740,7 @@ impl Sema {
             if !seen.contains(&var) {
                 seen.push(var);
             }
-            if !sub.iter().all(|t| self.sub_test_complete(t)) {
+            if !sub.iter().all(|(_, t)| self.sub_test_complete(t)) {
                 return false;
             }
         }
@@ -4067,7 +4075,7 @@ impl Sema {
                 // Check each nested sub-pattern test through the payload read it
                 // was built from, so its enum is resolved and its own tag filled
                 // in. Codegen `&&`s these after the tag test.
-                for t in sub_tests.iter_mut() {
+                for (_, t) in sub_tests.iter_mut() {
                     let tt = self.check_expr(t, scope)?;
                     if tt != Type::Bool {
                         return Err(format!(
