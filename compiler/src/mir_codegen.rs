@@ -94,6 +94,11 @@ struct FnGen<'a> {
     /// spilled once at its start, so a read inside the tree must take the value
     /// from the spill slot rather than the (by then clobbered) register.
     in_drop: bool,
+    /// Frame slot holding the caller-supplied address of the return place, when
+    /// this function returns an aggregate (`-1` otherwise). The address arrives
+    /// in `%rdi` under the SysV ABI, the same convention rustc uses, so the
+    /// arguments of such a function are shifted one register along.
+    sret_slot: i64,
     /// Locals that are an operand of a loop's counted comparison (the counter
     /// and its bound), promoted first.
     loop_operands: Vec<u32>,
@@ -1232,6 +1237,7 @@ impl<'a> FnGen<'a> {
             shadow: HashMap::new(),
             caller_spill: HashMap::new(),
             in_drop: false,
+            sret_slot: -1,
             loop_operands: Vec::new(),
             const_regs: HashMap::new(),
             const_caller_regs: HashMap::new(),
@@ -1727,6 +1733,14 @@ impl<'a> FnGen<'a> {
     fn gen_fn(&mut self) -> Result<String, String> {
         self.analyze();
         self.plan_promotion();
+        // A function that returns an aggregate receives a hidden pointer to the
+        // caller's return place in `%rdi` and stores `_0` through it. The
+        // address lives in a frame slot for the whole call, so it must be taken
+        // before the argument registers are overwritten -- the arguments of
+        // such a function start at `%rsi`.
+        if self.local_ty(0).is_aggregate() {
+            self.sret_slot = self.alloc_slot();
+        }
         // A shadow slot for each promoted local, so taking its address has a
         // stable home. Allocated once, before the frame is sized.
         for l in 0..self.func.locals.len() as u32 {
@@ -1916,6 +1930,15 @@ impl<'a> FnGen<'a> {
     /// Argument setup plus every basic block. Run twice (dry, then real).
     fn gen_body(&mut self) -> Result<(), String> {
         self.pinned.clear();
+        // A hidden return pointer arrives in `%rdi` and is stashed in its frame
+        // slot before the argument moves, which would overwrite `%rdi`. The
+        // arguments of an aggregate-returning function therefore start at
+        // `%rsi`.
+        let arg_shift = if self.sret_slot >= 0 { 1 } else { 0 };
+        if arg_shift == 1 {
+            let slot = self.off(self.sret_slot);
+            self.emit(&format!("  mov %rdi, {slot}"));
+        }
         // MIR numbers arguments from `_1`, so the register is chosen by the
         // argument's ordinal, not by its local index.
         let mut args: Vec<u32> = (0..self.func.locals.len() as u32)
@@ -1923,11 +1946,11 @@ impl<'a> FnGen<'a> {
             .collect();
         args.sort_unstable();
         for (ord, li) in args.into_iter().enumerate() {
-            if ord >= ARG_REGS.len() {
+            if ord + arg_shift >= ARG_REGS.len() {
                 return Err(format!("mir_codegen: {} takes more than 6 arguments", self.func.name));
             }
             let dst = self.local_operand(li);
-            let _ = writeln!(self.out, "  mov {}, {}", ARG_REGS[ord], dst);
+            let _ = writeln!(self.out, "  mov {}, {}", ARG_REGS[ord + arg_shift], dst);
         }
         // Materialise caller-saved hoisted constants after the argument moves:
         // until the last move the argument registers still hold incoming
@@ -2199,7 +2222,17 @@ impl<'a> FnGen<'a> {
             }
             Terminator::Return => {
                 // A non-unit return value lives in `_0`.
-                if self.local_ty(0) != Ty::Unit && !self.func.locals.is_empty() {
+                if self.sret_slot >= 0 {
+                    // An aggregate is returned by copy: `_0` holds the value, and
+                    // the caller's return place is the pointer received in `%rdi`.
+                    // Copy it word by word (`copy_words` reads `%r10`/`%r11`).
+                    let size = self.place_size(&Place { local: 0, proj: Vec::new() });
+                    self.place_addr(&Place { local: 0, proj: Vec::new() })?;
+                    self.emit("  mov %rax, %r10");
+                    let slot = self.off(self.sret_slot);
+                    self.emit(&format!("  mov {slot}, %r11"));
+                    self.copy_words(size);
+                } else if self.local_ty(0) != Ty::Unit && !self.func.locals.is_empty() {
                     let src = self.local_operand(0);
                     if src != "%rax" {
                         self.emit(&format!("  mov {src}, %rax"));
@@ -4560,6 +4593,13 @@ impl<'a> FnGen<'a> {
             // rustc models `alloc` as an unsafe fn with an `Option`-like ABI;
             // the program's own `alloc` is rmc's builtin, so call it directly.
         }
+        // A call that returns an aggregate takes a hidden pointer to the
+        // destination in `%rdi`, so every real argument shifts one register
+        // along and the pointer is computed after the argument moves. That
+        // pointer setup clobbers `%rax`/`%rcx`, which the "leave the last
+        // argument in its scratch register" shortcut relies on, so the shortcut
+        // is disabled here and every computed argument goes through a spill slot.
+        let agg_ret = self.place_ty(dest).is_aggregate();
         // Evaluate arguments left to right. An aggregate is passed by address;
         // a scalar in a frame slot or an immediate is stable and used directly;
         // only a value that landed in `%rax`/`%rcx` is stashed in a spill slot,
@@ -4573,7 +4613,11 @@ impl<'a> FnGen<'a> {
         let is_stable = |a: &Operand| {
             !self.operand_ty(a).is_aggregate() && self.operand_is_simple(a)
         };
-        let last_unstable = args.iter().rposition(|a| !is_stable(a));
+        let last_unstable = if agg_ret {
+            None
+        } else {
+            args.iter().rposition(|a| !is_stable(a))
+        };
         let mut reg_ops: Vec<(usize, String)> = Vec::new();
         for (i, arg) in args.iter().enumerate() {
             if i >= ARG_REGS.len() {
@@ -4604,20 +4648,34 @@ impl<'a> FnGen<'a> {
         // which overwrite them, and restore afterwards. `%rax` carries the
         // result, so the spills use memory operands directly.
         let caller_promos = self.spill_caller_saved();
+        // A hidden aggregate-return pointer claims `%rdi`, so every real
+        // argument moves one register along (`%rsi` for argument 0).
+        let arg_shift = agg_ret as usize;
+        if arg_shift == 1 && reg_ops.iter().any(|(i, _)| *i + 1 >= ARG_REGS.len()) {
+            return Err(format!(
+                "mir_codegen: aggregate-returning call to {name} with six arguments unsupported"
+            ));
+        }
         for (i, v) in &reg_ops {
-            if ARG_REGS[*i] != *v {
-                self.emit(&format!("  mov {v}, {}", ARG_REGS[*i]));
+            if ARG_REGS[*i + arg_shift] != *v {
+                self.emit(&format!("  mov {v}, {}", ARG_REGS[*i + arg_shift]));
             }
+        }
+        if agg_ret {
+            // Compute the destination address last, into `%rdi`, after every
+            // other register is final (`place_addr` clobbers `%rax`/`%rcx`).
+            self.place_addr(dest)?;
+            self.emit("  mov %rax, %rdi");
         }
         match &indirect {
             Some(reg) => self.emit(&format!("  call *{reg}")),
             None => self.emit(&format!("  call {}", asm_sym(&name))),
         }
         self.restore_caller_saved(&caller_promos);
-        if self.place_ty(dest).is_aggregate() {
-            // Aggregates return by hidden pointer in %rdi; rmc's builtins do
-            // not, so this only appears for functions this backend owns.
-            return Err("mir_codegen: aggregate return unsupported".into());
+        if agg_ret {
+            // The aggregate was written straight into `dest` through the hidden
+            // pointer, so there is nothing to store.
+            return Ok(());
         }
         if !matches!(dest.proj.as_slice(), []) || self.local_ty(dest.local) != Ty::Unit {
             // A `()` destination still has a slot; storing is harmless.
@@ -4735,14 +4793,24 @@ fn coalesce_scratch(body: &str) -> String {
 /// True when `reg` is mentioned outside `lines[start..end]` only by a `push` or
 /// a `pop`, i.e. it carries nothing across the region.
 fn dead_after(lines: &[&str], start: usize, end: usize, reg: &str) -> bool {
+    // A `call` reads the integer argument registers without naming them, so a
+    // value parked in `%rsi`/`%rdi`/`%r8`/`%r9` is live at the call even though
+    // no later line mentions the register. Treating it as dead would delete the
+    // `mov` that set up an argument register. The other caller-saved registers
+    // (`%rax`, `%rcx`, `%rdx`, `%r10`, `%r11`) are only clobbered, never read,
+    // by a call, so a value there really is dead and the rewrite stays.
+    let arg_reg = matches!(reg, "%rsi" | "%rdi" | "%r8" | "%r9");
     for (idx, line) in lines.iter().enumerate() {
         if (idx >= start + 1 && idx < end) || idx == start {
             continue;
         }
+        let op = line.trim().split_whitespace().next().unwrap_or("");
+        if arg_reg && op == "call" {
+            return false;
+        }
         if !reg_mentions(line, reg) {
             continue;
         }
-        let op = line.trim().split_whitespace().next().unwrap_or("");
         if op != "push" && op != "pop" {
             return false;
         }
