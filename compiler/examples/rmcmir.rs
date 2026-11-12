@@ -47,7 +47,7 @@ fn main() {
     // message and status 1, not a panic and a backtrace note. `tools/fuzz.py`
     // and the differential suite both rely on "unsupported" being a status, not
     // a crash.
-    let mut prog = match rmc::mir::parse(&text) {
+    let mut prog = match rmc::mir::parse_with(&text, overflow_checks) {
         Ok(p) => p,
         Err(e) => {
             let _ = writeln!(std::io::stderr(), "rmc-mir: error: {e}");

@@ -5617,6 +5617,11 @@ fn interleave_div_pairs(body: &str) -> String {
 /// from, the divide's magic multiplier and shift, and its span in the body.
 struct DivUnit {
     src: String,
+    /// The register the divide's quotient is written to. If this is the *next*
+    /// unit's `src`, the two units are dependent: the second multiply must read
+    /// this quotient, but the reorder reads `src` before this store runs, so the
+    /// pair must not be interleaved.
+    dst: String,
     magic: String,
     shift: String,
     start: usize,
@@ -5701,16 +5706,19 @@ fn read_div_unit(lines: &[&str], start: usize) -> Option<DivUnit> {
     if lines.get(start + 1)?.trim() != format!("imul {src}, %rax") {
         return None;
     }
-    let (len, _dst, magic, shift) = read_div_block(lines, start + 2)?;
-    Some(DivUnit { src: src.to_string(), magic, shift, start, end: start + 2 + len })
+    let (len, dst, magic, shift) = read_div_block(lines, start + 2)?;
+    Some(DivUnit { src: src.to_string(), dst, magic, shift, start, end: start + 2 + len })
 }
 
 /// Match two adjacent units that divide by the same constant from different
 /// registers, so they are the two independent halves of one expression pair.
+/// The pair must be genuinely independent: if the first divide writes the
+/// register the second multiplies, the second product depends on the first
+/// quotient, and reordering would square the register's *old* value.
 fn match_div_pair(lines: &[&str], start: usize) -> Option<(DivUnit, DivUnit)> {
     let a = read_div_unit(lines, start)?;
     let b = read_div_unit(lines, a.end)?;
-    if a.magic != b.magic || a.shift != b.shift || a.src == b.src {
+    if a.magic != b.magic || a.shift != b.shift || a.src == b.src || a.dst == b.src {
         return None;
     }
     Some((a, b))
@@ -6430,5 +6438,40 @@ fn main() -> () {
   add %r8, %r9
 ";
         assert_eq!(interleave_div_pairs(body), body, "an unpaired divide moved");
+    }
+
+    /// Two division units whose quotient feeds the next unit's multiply are
+    /// *dependent*: the second product must square the first quotient, so the
+    /// pair must be left alone. Interleaving would read the register before the
+    /// first quotient is written and square its stale value.
+    #[test]
+    fn a_dependent_division_pair_is_not_interleaved() {
+        let body = "\
+  mov %rbx, %rax
+  imul %rbx, %rax
+  mov %rax, %r10
+  movabs $2361183241434822607, %rcx
+  imul %rcx
+  mov %rdx, %rcx
+  shr $63, %rcx
+  sar $7, %rdx
+  add %rcx, %rdx
+  mov %rdx, %r12
+  mov %r12, %rax
+  imul %r12, %rax
+  mov %rax, %r10
+  movabs $2361183241434822607, %rcx
+  imul %rcx
+  mov %rdx, %rcx
+  shr $63, %rcx
+  sar $7, %rdx
+  add %rcx, %rdx
+  mov %rdx, %r13
+";
+        assert_eq!(
+            interleave_div_pairs(body),
+            body,
+            "a dependent pair was reordered, so the second multiply reads a stale quotient"
+        );
     }
 }

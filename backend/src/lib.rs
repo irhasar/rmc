@@ -49,10 +49,16 @@ struct RmcBackend;
 
 /// The lowering, factored out so it is callable (and testable) without a
 /// `TyCtxt`. `mir_text` is exactly what `--emit=mir` would print.
-fn compile_mir_text(mir_text: &str) -> Result<Vec<u8>, String> {
-    let mut prog = rmc::mir::parse(mir_text).map_err(|e| format!("rmc-mir: error: {e}"))?;
+///
+/// `overflow_checks` must be the session's setting: the MIR dump contains the
+/// checked-arithmetic shapes only under `-C overflow-checks=on`, and both the
+/// parser's `switchInt(OverflowChecks)` fold and the loop rewrites below change
+/// behavior with it.
+fn compile_mir_text(mir_text: &str, overflow_checks: bool) -> Result<Vec<u8>, String> {
+    let mut prog = rmc::mir::parse_with(mir_text, overflow_checks)
+        .map_err(|e| format!("rmc-mir: error: {e}"))?;
     let opts = rmc::mir_codegen::Options { promote: true };
-    rmc::mir::tco(&mut prog, false);
+    rmc::mir::tco(&mut prog, overflow_checks);
     rmc::mir::inline_calls(&mut prog);
     rmc::mir::coalesce_call_results(&mut prog);
     rmc::mir::merge_blocks(&mut prog);
@@ -61,7 +67,7 @@ fn compile_mir_text(mir_text: &str) -> Result<Vec<u8>, String> {
     rmc::mir::licm(&mut prog);
     rmc::mir::fold_accumulators(&mut prog);
     rmc::mir::strength_reduce(&mut prog);
-    rmc::mir::close_counted_loops(&mut prog, false);
+    rmc::mir::close_counted_loops(&mut prog, overflow_checks);
     rmc::mir::jump_thread(&mut prog);
     rmc::mir::rotate_loops(&mut prog);
     rmc::mir::layout_blocks(&mut prog);
@@ -109,12 +115,31 @@ impl CodegenBackend for RmcBackend {
     }
 
     fn codegen_crate<'tcx>(&self, tcx: TyCtxt<'tcx>) -> Box<dyn Any> {
+        // `assemble` only ever writes x86-64 ELF, so a cross-target invocation
+        // would silently produce an executable for the wrong machine.
+        if tcx.sess.target.arch != Arch::X86_64 {
+            tcx.dcx().fatal(format!(
+                "rmc codegen backend only supports the x86-64 target, not `{}`",
+                tcx.sess.target.llvm_target
+            ));
+        }
+
         // Only an executable is in scope: rmc emits a complete freestanding
         // ELF (its own runtime and `_start`), so there is nothing to link
-        // afterwards and no object file to hand back.
+        // afterwards and no object file to hand back. Reject `--emit=obj`,
+        // `--emit=asm` and the other codegen modes explicitly instead of
+        // writing an executable to the path they asked for.
         let crate_types = tcx.crate_types();
         if !crate_types.contains(&CrateType::Executable) {
             tcx.dcx().fatal("rmc codegen backend only supports `--crate-type=bin`");
+        }
+        for ty in tcx.sess.opts.output_types.keys() {
+            if *ty != OutputType::Exe && *ty != OutputType::Metadata && *ty != OutputType::DepInfo {
+                tcx.dcx().fatal(format!(
+                    "rmc codegen backend cannot emit `{}`; only an executable is supported",
+                    ty.shorthand()
+                ));
+            }
         }
 
         let mut mir_bytes: Vec<u8> = Vec::new();
@@ -133,7 +158,7 @@ impl CodegenBackend for RmcBackend {
         }
         let mir_text = String::from_utf8_lossy(&mir_bytes);
 
-        let bytes = match compile_mir_text(&mir_text) {
+        let bytes = match compile_mir_text(&mir_text, tcx.sess.overflow_checks()) {
             Ok(b) => b,
             Err(e) => tcx.dcx().fatal(e),
         };
