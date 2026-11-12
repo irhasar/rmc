@@ -2136,6 +2136,11 @@ rmc's own freestanding runtime. Read the harness before trusting a number.
   something the back end can fix; the front end is rustc in *both* pipelines.
 - **The compile CPU win is real and large** (~1.2x): skipping LLVM codegen.
   Wall time is a near-tie because both fronts pay rustc's ~25-30 ms startup.
+  The win does not depend on the aggressive LLVM flags: on `stats`,
+  `rustc --emit=mir -O -Zno-codegen` is 26.2 ms wall / 25.8 ms CPU, a plain
+  `rustc --emit=obj -O` is 29.9/30.4, and the harness's
+  `-C lto=fat -C codegen-units=1` build is 30.2/30.7. The MIR front end is
+  cheaper than the LLVM one even when LLVM does no LTO at all.
 - **Ratios inside +/- 0.02 are a tie.** The run axes take the minimum of 50
   interleaved samples, but two runs of the *same* binary still land within
   ~1% of each other on this host (measured spread 0.8-1.3% for `mix`/`heap`),
