@@ -294,7 +294,9 @@ array elements and struct fields (including compound `+=` and friends);
 (array iteration, by value); `match` on integers,
 `bool`s, `char`s, enums and strings (literal, `true`/`false`, char, string,
 `Enum::Variant`, struct and
-`_` patterns, plus payload bindings and binding names, and a per-arm guard
+`_` patterns, plus payload bindings and binding names, nested variant
+patterns (`O::W(I::A)`) and refutable payload arguments (`E::A(1)`,
+`E::A(1 | 2)`), and a per-arm guard
 `PAT if COND`) and `if let` with the
 same patterns
 (desugared to a two-arm `match`); enums with unit variants (an optional

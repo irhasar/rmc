@@ -1490,14 +1490,16 @@ def gen_parampat_program(rng):
 
 def gen_enumpat_program(rng):
     """Payload variant patterns with sub-patterns: a wildcard (`_`), a `mut`
-    binding, a trailing `..`, and a nested struct/array sub-pattern inside
-    `E::V(..)`. Each argument is the payload read at its field index, fed to the
-    same sub-pattern expansion a `let` uses, so a mis-indexed payload read, a
-    `_` that still reads, or a wrong nested offset changes the total. Every
-    function is called twice with different arguments, so a shared slot or a
-    leaked `mut` write is observable. No other mode emits a nested payload
-    sub-pattern, a `..` inside a variant's parentheses, or a payload read
-    through a `&E` scrutinee (match ergonomics dereferences it).
+    binding, a trailing `..`, a nested struct/array sub-pattern inside
+    `E::V(..)`, a nested variant pattern (`O::W(I::A)`) and a scalar payload
+    test (`E::Pair(B, y)`). Each argument is the payload read at its field
+    index, fed to the same sub-pattern expansion a `let` uses, so a mis-indexed
+    payload read, a `_` that still reads, a wrong nested offset, or a sub-test
+    that fails to gate the arm changes the total. Every function is called twice
+    with different arguments, so a shared slot or a leaked `mut` write is
+    observable. No other mode emits a nested payload sub-pattern, a `..` inside
+    a variant's parentheses, a nested variant pattern, or a payload read through
+    a `&E` scrutinee (match ergonomics dereferences it).
     """
     b = rng.randint(1, 9)
     m = rng.randint(1, 9)
@@ -1525,6 +1527,14 @@ def gen_enumpat_program(rng):
         "fn wref(e: &E) -> i64 { match e { E::Pair(x, _) => x * 2, E::Trip(x, ..) => x * 3, _ => 0 } }",
         "fn nref(e: &E) -> i64 { match e { E::Hold(S { a: [p, q], b: I { u } }) => p * 100 + q * 10 + u, _ => 0 } }",
         "fn uref(e: &E) -> i64 { match e { E::None => 100, E::Pair(_, _) => 200, E::Trip(_, _, _) => 300, E::Hold(_) => 400, E::Arr(_) => 500, E::Mix(_, _, _) => 600 } }",
+        "#[derive(Copy, Clone)]",
+        "enum I { A, B }",
+        "#[derive(Copy, Clone)]",
+        "enum O { W(I), Z }",
+        "fn outer(o: O) -> i64 { match o { O::W(I::A) => 1, O::W(I::B) => 2, O::Z => 3 } }",
+        "fn owild(o: O) -> i64 { match o { O::W(_) => 7, O::Z => 8 } }",
+        "fn nvia_ref(o: &O) -> i64 { match o { O::W(I::A) => 10, O::W(I::B) => 20, O::Z => 30 } }",
+        f"fn scal(e: E) -> i64 {{ match e {{ E::Pair({b}, y) => y, E::Pair(x, _) => x, E::Trip({b}, y, ..) => y, _ => 0 }} }}",
     ]
 
 
@@ -1548,6 +1558,18 @@ def gen_enumpat_program(rng):
         f"nref(&E::Hold(S {{ a: [s + {o[12]}, s + {o[13]}], b: I {{ u: s + {o[14]} }} }}))",
         "uref(&E::None)",
         f"uref(&E::Arr([s + {o[18]}, s + {o[19]}]))",
+        "outer(O::W(I::A))",
+        "outer(O::W(I::B))",
+        "outer(O::Z)",
+        "owild(O::W(I::B))",
+        "owild(O::Z)",
+        "nvia_ref(&O::W(I::A))",
+        "nvia_ref(&O::W(I::B))",
+        "nvia_ref(&O::Z)",
+        f"scal(E::Pair({b}, s + 1))",
+        f"scal(E::Pair(s + 2, s + 3))",
+        f"scal(E::Trip({b}, s + 4, s + 5))",
+        "scal(E::None)",
     ]
     body_rs = ["fn main() {", "    let mut acc: i64 = 0;", f"    let s: i64 = mk({b});"]
     for c in calls:
@@ -2713,6 +2735,40 @@ def reject_corpus():
         # Same, in statement position: the arms are unit-typed, so only the
         # exhaustiveness walk rejects it.
         "stmt_guard_gap": stmt("match e { E::A if 1 == 1 => { print_i64(1); } }"),
+        # A nested variant pattern covers only its payload value, so a match
+        # that omits one payload variant is non-exhaustive (E0004). `O::W(I::A)`
+        # alone does not cover `O::W(I::B)`, and the outer enum's other variants
+        # must still be named.
+        "nested_variant_gap": (
+            "enum I { A, B }\n"
+            "enum O { W(I), Z }\n"
+            "fn main() {\n"
+            "    let o: O = O::W(I::A);\n"
+            "    match o { O::W(I::A) => { print_i64(1); } O::Z => { print_i64(3); } }\n"
+            "}\n"
+        ),
+        # Naming the payload variant of the wrong enum inside a nested pattern:
+        # `O::W(I::A)` is fine, but `O::W(J::A)` names a variant `J` does not
+        # have, which rustc rejects.
+        "nested_variant_unknown": (
+            "enum I { A, B }\n"
+            "enum O { W(I), Z }\n"
+            "fn main() {\n"
+            "    let o: O = O::W(I::A);\n"
+            "    let r = match o { O::W(I::C) => 1, O::W(I::B) => 2, O::Z => 3 };\n"
+            '    println!("{}", r);\n'
+            "}\n"
+        ),
+        # A refutable scalar argument overruns the variant's field count when a
+        # second field is named without `..`.
+        "nested_variant_overrun": (
+            "enum E { A(i64), B }\n"
+            "fn main() {\n"
+            "    let e: E = E::A(3);\n"
+            "    let r = match e { E::A(1, 2) => 1, E::A(_) => 0, E::B => 0 };\n"
+            '    println!("{}", r);\n'
+            "}\n"
+        ),
         # Assignment to an immutable binding. rmc used to accept these and let
         # codegen write the slot; rustc rejects each with E0384.
         "assign_immutable_let": "fn main() { let x: i64 = 1; x = 2; println!(\"{}\", x); }\n",

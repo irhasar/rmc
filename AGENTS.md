@@ -1422,6 +1422,19 @@ descending the chain, and the walk no longer requires an arm's `else` block to
 have empty `stmts`. `tests/cases/guard.rs` and the `pat` fuzzer cover
 guards; the `reject` fuzzer's `guard_*` cases pin the exhaustiveness rules.
 
+A nested or refutable variant argument (`O::W(I::A)`, `E::A(1)`) is handled by a
+second walk, `chain_is_exhaustive_nested` → `chain_covers`, tried after
+`if_chain_is_exhaustive`. `if_chain_is_exhaustive` counts only the outer
+`VariantTest`s, so it would call such a chain total even when a payload arm
+covers just one payload value; `chain_covers` instead groups the arms by outer
+variant and, for each variant whose arms carry `sub_tests`, unions those tests
+and recurses through the payload enum, so `O::W(I::A) => .., O::W(I::B) => ..,
+O::Z => ..` is total while `O::W(I::A) => .., O::Z => ..` is not. An arm that
+binds the whole field (`O::W(x)`, `O::W(_)`, no `sub_tests`) covers its variant
+outright; a variant whose payload is a scalar, struct or tuple field cannot be
+shown covered, so the walk reports it non-exhaustive (safe — rustc needs a `_`
+arm there too unless the field has a single value).
+
 The `match` desugaring wraps its first step in `Expr::MatchBoundary`, a
 transparent node that marks where the chain begins. Its `bool` field records
 whether some arm is a catch-all (`_` or a binding), which makes the match
@@ -1724,20 +1737,28 @@ The checks, all in `sema.rs`:
   pattern (literal, variant, or-pattern) is rejected (`param_pat_binds`), and
   `mut` on the whole pattern is rejected. `sema` inserts a `None` into
   `param_pats` when it prepends the `self` receiver, keeping the vectors aligned.
-- **Enum payload sub-patterns.** A payload variant's argument list takes the
-  same sub-patterns a struct field or array element does: `E::A(_, y)`,
-  `E::A(mut x)`, `E::A(S { x })`, `E::A([a, b])`, and a trailing `..`
+- **Enum payload sub-patterns.** A payload variant's argument list takes any
+  sub-pattern rmc can test and bind: `E::A(_, y)`, `E::A(mut x)`,
+  `E::A(S { x })`, `E::A([a, b])`, a nested variant pattern (`O::W(I::A)`), a
+  scalar or or-pattern test (`E::A(1)`, `E::A(1 | 2)`), and a trailing `..`
   (`E::A(x, ..)`, `E::A(..)`). `Pat::Variant` carries `Option<(Vec<(bool, Pat)>,
   bool)>` — the argument patterns and the `..` flag. `desugar_arm` reads each
   argument as `EnumPayload { idx }` (the payload at its field index) and feeds it
   to `pat_binds_into`, which recurses through `struct_pat_binds` /
-  `array_pat_binds`, so a nested pattern reads *through* the payload at its
-  offset rather than copying the whole aggregate first. `VariantTest` carries
-  `n_binds` (the argument count) and `has_rest`; `check_expr` requires
-  `n_binds == fields.len()` unless `has_rest`, and rejects a payload read past
-  the last field. A nested *variant* argument (`E::A(Inner::X(v))`) is
-  refutable, so `parse_variant_pat_args` rejects it, as it rejects a literal
-  argument, since rmc generates no per-field test.
+  `array_pat_binds` / `pat_binds` (a nested variant), so a nested pattern reads
+  *through* the payload at its offset rather than copying the whole aggregate
+  first. `VariantTest` carries `n_binds` (the argument count), `has_rest`, and
+  `sub_tests` — the tests of the refutable sub-patterns, each over the matching
+  payload read. `check_expr` requires `n_binds == fields.len()` unless
+  `has_rest`, rejects a payload read past the last field, and checks each
+  sub-test through its read (filling in the inner variant's tag). Codegen `&&`s
+  the sub-tests after the outer tag test, so `E::A(1)` compares the payload and
+  `O::W(I::A)` tests the inner tag, and a nested read only runs once the outer
+  tag matched. Exhaustiveness (`chain_covers`) recurses through payload enums:
+  an arm that binds the whole field (`O::W(x)`, `O::W(_)`) covers its variant,
+  and arms with sub-tests for one variant are combined and must themselves cover
+  the payload enum; a variant whose payload is not an enum cannot be shown
+  covered, so such a match needs a `_` arm.
 - **Casts (`E0054`/`E0605`/`E0606`).** `check_cast` restricts `as` to the
   conversions rustc allows plus rmc's two documented extensions. A reference may
   only become a reference to the same type (`&mut T` may lose mutability to
