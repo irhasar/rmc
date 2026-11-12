@@ -476,7 +476,8 @@ impl Elf {
             }
             "lea" => self.enc_lea(&ops, sec),
             "push" | "pop" => self.enc_push_pop(mnem, &ops, sec),
-            "add" | "addq" | "sub" | "and" | "or" | "xor" | "cmp" | "cmpq" | "test" => {
+            "add" | "addq" | "sub" | "subq" | "and" | "andq" | "or" | "orq"
+            | "xor" | "xorq" | "cmp" | "cmpq" | "test" | "testq" => {
                 self.enc_arith(mnem, &ops, sec)
             }
             "imul" => self.enc_imul(&ops, sec),
