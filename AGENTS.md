@@ -2327,6 +2327,25 @@ compiled with checks *off* — must not trap), and `tests/mir/ovfcheck.rs` +
 link the reference against small stubs that route core's
 `panic_const_*_overflow` symbols to `__rmc_overflow`.
 
+### `strength_reduce` may not reuse a multiply destination read after the loop
+
+`strength_reduce` rewrites `p = i * C` inside a loop into a running value
+(`piv`) advanced by `s * C` in the latch, and it reuses the multiply's own
+destination for `piv` to avoid spending a fresh local. The advance is inserted
+after the increment, so it also runs on the final iteration: once the loop
+exits, the reused destination holds `n * C`, not the `(n - 1) * C` the last body
+execution stored. `while i < n { p = i * 7; i += 1 }` printed 70 instead of 63.
+
+Reuse is gated on `reuse_ok`: the destination may double as the running value
+only when every read of it is inside the loop, after the multiply and before the
+latch's increment. That is the window in which the running value equals the
+multiply's original result. A destination read after the loop, or before the
+multiply (where the running value is one step ahead), gets a fresh private local
+instead. The gate is precise enough to keep the optimisation where it pays:
+`stats`'s `v = i.wrapping_mul(2654435761)` feeds only an in-loop accumulator, so
+it still strength-reduces with no `imul` in the hot loop. Regression:
+`tests/mir/srread.rs`.
+
 ### A type spelling is relative to the item that mentions it, and it can be qualified
 
 rustc prints a type relative to the body that mentions it, and that relative
