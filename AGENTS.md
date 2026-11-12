@@ -2151,6 +2151,25 @@ reduces the `i * 2654435761` multiply into two induction variables, not because
 of `cmov`. Do not re-add the fold without measuring a program whose min/max
 input is genuinely unpredictable.
 
+### Recurring wide constants are hoisted into idle callee-saved registers
+
+An i64 immediate that does not fit a sign-extended i32 needs a `movabs` to
+materialise, and one named inside a loop pays that on every iteration (`stats`'s
+`i * 2654435761` and the `% 1000003` magic multiplier are two per iteration).
+`hoist_consts` ranks the constants that recur by loop depth (a single use in a
+loop clears the bar) and materialises each into a callee-saved register once, at
+function entry; `const_operand` and `gen_div_const` then read the register
+instead of re-emitting the immediate.
+
+Promotion runs first and claims the registers it wants; hoisting only fills what
+is left. That ordering matters: hoisting *first* (so it claimed the spare
+registers) displaced `stats`'s hot `count` local into memory, and the extra
+load/store per iteration cost more than the two `movabs` it saved. A promoted
+local is worth more than a hoisted constant -- a load versus a `movabs` -- so
+hoisting is the tie-breaker, not the priority. It is a wash on programs whose
+hot loop already uses all five callee-saved registers (`mandel`) and helps those
+with registers to spare.
+
 ### No-op arithmetic (`add $0, %reg`) must be dropped
 
 A struct field at offset 0 lowers to `add $0, %rax`. The instruction cannot
