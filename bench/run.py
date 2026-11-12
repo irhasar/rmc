@@ -25,6 +25,12 @@ RMC = os.path.join(PROJ, "compiler", "target", "release", "rmc")
 OUT = "/tmp/rmcbench"
 RUSTFLAGS_BASE = []
 
+# A ratio inside +/- this band is a statistical tie, not a win or a loss. The
+# run axes are near parity on `fib`/`callrec`, and the same binary still lands
+# within ~1-3% across runs on this host, so a bare `1.01` carries no signal.
+# 0.02 matches `run_fair.py` and keeps the verdict from calling a tie a loss.
+NOISE_BAND = 0.02
+
 PROGRAMS = ["hello", "fib", "mandel", "sieve", "mix", "stats", "refs", "heap", "callrec", "forloops"]
 # Runtime input per program, passed as argv so the workload is opaque to the
 # optimizer and cannot be constant-folded away.
@@ -278,6 +284,61 @@ def print_table(rows):
               f"{c['run']['wall']/n['run']['wall']:9.2f}")
 
 
+# The seven axes `run.py` scores, as (label, extractor) over a program's result.
+# Each extractor returns the rustc/rmc ratio, so > 1 means rmc is better.
+AXES = (
+    ("compile_wall", lambda n, c: c["wall"] / n["wall"]),
+    ("compile_cpu", lambda n, c: c["cpu"] / n["cpu"]),
+    ("compile_rss", lambda n, c: c["rss"] / n["rss"]),
+    ("size", lambda n, c: c["size"] / n["size"]),
+    ("run_wall", lambda n, c: c["run"]["wall"] / n["run"]["wall"]),
+    ("run_cpu", lambda n, c: c["run"]["cpu"] / n["run"]["cpu"]),
+    ("run_rss", lambda n, c: c["run"]["rss"] / n["run"]["rss"]),
+)
+
+
+def axis_means(rows):
+    """Mean rustc/rmc ratio per axis, plus the axes tied and lost."""
+    means, tied, lost = [], [], []
+    for label, f in AXES:
+        vals = [f(res["rmc"], res["rustc"]) for _, res in rows]
+        mean = sum(vals) / len(vals)
+        if mean >= 1.0 + NOISE_BAND:
+            word = "win"
+        elif mean >= 1.0 - NOISE_BAND:
+            word = "tie"
+            tied.append(label)
+        else:
+            word = "loss"
+            lost.append(label)
+        means.append((label, mean, word))
+    return means, tied, lost
+
+
+def verdict(rows):
+    """Print and return the per-axis verdict of the whole run.
+
+    `run.py` is the end-to-end comparison (rmc's own front end *and* back end
+    against rustc/LLVM on one source), so unlike `run_fair.py` there is no
+    shared front end to excuse a tie: an axis the mean calls a tie here is a
+    real limit of the whole compiler, not a measurement artefact.
+    """
+    means, tied, lost = axis_means(rows)
+    print()
+    print("mean speedup per axis (rustc/rmc; > 1 means rmc better)")
+    for label, mean, word in means:
+        print(f"  {label:<13} {mean:8.2f}  ({word})")
+    for label, f in AXES:
+        for p, res in rows:
+            r = f(res["rmc"], res["rustc"])
+            if r < 1.0 - NOISE_BAND:
+                print(f"  LOSS {p} {label}: ratio {r:.2f}")
+    if not tied and not lost:
+        print()
+        print("ALL AXES WON")
+    return tied, lost
+
+
 def write_markdown(path, rows, note):
     """Record the full comparison, so the numbers live in the repo, not a log."""
     lines = ["# Benchmark results: rmc vs rustc", ""]
@@ -387,6 +448,21 @@ def write_markdown(path, rows, note):
     lines.append("couple of MB regardless of what the program does. That gap is real but")
     lines.append("is mostly the C library's footprint, not the generated code's.")
     lines.append("")
+    lines.append("## Verdict")
+    lines.append("")
+    lines.append("This is the end-to-end comparison: rmc's own front end *and* back end")
+    lines.append("against rustc/LLVM, one source each. There is no shared front end to")
+    lines.append("excuse a tie here, so a tie is a real limit of the whole compiler.")
+    lines.append("Mean ratio per axis, rustc divided by rmc (> 1 means rmc better):")
+    lines.append("")
+    lines.append("| axis | mean rustc/rmc | verdict |")
+    lines.append("| ---- | -------------: | ------- |")
+    means, tied, lost = axis_means(rows)
+    for label, mean, word in means:
+        lines.append(f"| {label} | {mean:.2f} | {word} |")
+    lines.append("")
+    lines.append("ALL AXES WON" if not tied and not lost else
+                 f"tied: {tied or 'none'}; lost: {lost or 'none'}")
     with open(path, "w") as f:
         f.write("\n".join(lines))
 
@@ -398,6 +474,7 @@ def main():
         md = args[args.index("--markdown") + 1]
     rows = collect()
     print_table(rows)
+    verdict(rows)
     if md:
         write_markdown(md, rows, env_note())
         print(f"\nwrote {md}")

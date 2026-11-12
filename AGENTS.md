@@ -2224,6 +2224,17 @@ editing the harness:
   frequency and thermal drift cannot favour whichever pipeline ran first. A
   sequential sweep can flip a near-parity run axis (`mix`/`heap` sit at ~1.00)
   on its own.
+- **`run.py` is the end-to-end claim, and it reports a machine-checked
+  verdict.** rmc's own front end *and* back end against rustc/LLVM on one
+  source, so unlike `run_fair.py` there is no shared front end to excuse a tie:
+  a tie there would be a real limit of the whole compiler. `verdict`/`axis_means`
+  print the mean `rustc/rmc` ratio per axis with a `win`/`tie`/`loss` word
+  (`NOISE_BAND = 0.02`, matching `run_fair.py`), list every per-program loss, and
+  print `ALL AXES WON` only when all seven axes win; `write_markdown` records the
+  same table under `## Verdict`. The current run is `ALL AXES WON`
+  (`compile_wall 1156x`, `compile_cpu 1246x`, `compile_rss 52x`, `size 301x`,
+  `run_wall 1.46x`, `run_cpu 1.71x`, `run_rss 72x`). The run axes are the honest
+  ones: 1.46x/1.71x/72x, not the four-digit compile ratios.
 
 `bench/run.py` (AST path) carries the same gate (`verify_outputs`) and
 round-robin run sampling (`measure_runs`). `bench/run_mir.py` does *not*: its
