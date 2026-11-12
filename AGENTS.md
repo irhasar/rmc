@@ -2374,12 +2374,23 @@ future session does not re-derive them by hand:
   by `runtime::tests`. Any future runtime piece that a *compiler* may emit a
   call to (not just the user) needs the same treatment.
 - **The honest scoreboard is `run_fair.py`'s "some axes lost".** After the P3
-  codegen work the whole-pipeline mean is wall 1.08, cpu 1.11, rss 0.99 (tie),
+  codegen work the whole-pipeline mean is wall 1.08, cpu 1.11, rss 1.00 (tie),
   size 18.8, run_wall 1.12, run_cpu 1.13, run_rss 1.31. The one remaining
-  per-program flag is `hello` **compile RSS 0.96**, which is the shared rustc
-  front end (below), not rmc. `light` run wall is now 1.09 — the old 0.81 loss
-  is closed. Back-end-only compile wins every program (wall/cpu/rss/size
-  1.14/1.15/1.44/18.8).
+  per-program flag is `hello` **compile RSS 0.97**, which is the shared rustc
+  front end (below), not rmc. `light` run wall is now 1.11 — the old 0.81 loss
+  is closed. Back-end-only compile is still behind `ld` on `refs`/`sieve`/
+  `mandel` (0.81/0.85/0.89), a slow path in rmc's own assembler, not in the
+  codegen: the one-process `cb` pipeline beats LLVM on all three.
+- **`fold_lea_terms` closed the `light` run-time loss.** An array element access
+  was `lea base(%rbp), %rax; mov index, %rcx; lea (%rax,%rcx,8), %rax` — three
+  instructions where x86-64 fits base, scaled index and displacement in one.
+  The pass fuses the chain into `lea base(%rbp, index, 8), %rax` and drops the
+  index copy, but only when `%rcx`'s next mention is a pure write (a `mov`/`lea`
+  whose destination is `%rcx` and whose source is not), so a live scratch value
+  is never clobbered. It sits after `fold_addresses` in the fixed-point loop and
+  is pinned by `an_indexed_address_chain_folds_to_one_lea` plus the negative
+  `an_indexed_chain_whose_scratch_is_still_live_is_not_folded`. Measured: `light`
+  run wall 0.81 → 1.11; no program is below 0.98.
 - **The `hello` compile-RSS flag is rustc's front end, not rmc.** `rustc
   --emit=mir -Zno-codegen` peaks ~3.5 MB above `--emit=obj` on the same source
   (84.2 vs 80.9 MB), because emitting the MIR text keeps every body resident,
@@ -2403,6 +2414,13 @@ of the pipeline the printed-MIR prototype (`rmcmir`) stands in for: rustc hands
 the backend the same optimised MIR LLVM would see, and rmc lowers it straight
 to a freestanding ELF. `bench/run_codegen.py` compares it to `rustc -O -C
 lto=fat` per program.
+
+- **`cb` wins or ties every mean axis against LLVM.** Measured: wall 1.12, cpu
+  1.15, rss 1.01 (tie), size 18.7, run_wall 1.11, run_cpu 1.12, run_rss 1.28.
+  The only cell below the band is `hello` compile RSS 0.97, the shared rustc
+  front end plus the ~1.2 MB dylib (vs LLVM's 208 MB `libLLVM`). Against the
+  printed-MIR prototype (`mir`) it is faster to compile (wall 1.04, cpu 1.03)
+  at identical run time: one process, no MIR text, no `ld`.
 
 - **The backend is x86-64/executable only, and says so.** `assemble` writes
   x86-64 ELF and rmc supplies its own `_start`, so `codegen_crate` fatals on a

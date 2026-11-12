@@ -361,6 +361,11 @@ def main():
                 return r["run"][a[4:]]
             return r[a]
         b = val(base)
+        # A run shorter than the sampler's resolution can finish between two
+        # `/proc` reads and come back as 0. Reporting that as a ratio would be a
+        # fabricated loss, so leave it unmeasured.
+        if a == "run_rss" and (b == 0 or val(kind) == 0):
+            return None
         return b / val(kind) if val(kind) else None
 
     print()

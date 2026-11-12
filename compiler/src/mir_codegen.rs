@@ -4840,6 +4840,85 @@ fn fold_local_offsets(body: &str) -> String {
     out
 }
 
+/// `lea (Rbase,Ridx,S), Rdst` or `lea D(Rbase,Ridx,S), Rdst`, returning the
+/// displacement, base, index, scale and destination.
+fn lea_indexed(line: &str) -> Option<(i64, &str, &str, i64, &str)> {
+    let t = line.trim();
+    let rest = t.strip_prefix("lea ")?;
+    // Split at the comma *after* the closing paren: the memory operand itself
+    // contains commas (`(%rax,%rcx,8)`), so the first comma is not the separator.
+    let open = rest.find('(')?;
+    let close = rest.find(')')?;
+    let mem = rest[..close + 1].trim();
+    let dst = rest[close + 1..].trim().strip_prefix(',')?.trim();
+    let disp: i64 = if open == 0 { 0 } else { mem[..open].trim().parse().ok()? };
+    let parts: Vec<&str> = mem[open + 1..close].split(',').collect();
+    let (base, idx, scale) = match parts.as_slice() {
+        [b, i] => (b.trim(), i.trim(), 1),
+        [b, i, s] => (b.trim(), i.trim(), s.trim().parse().ok()?),
+        _ => return None,
+    };
+    if !is_reg(base) || !is_reg(idx) || !is_reg(dst) {
+        return None;
+    }
+    Some((disp, base, idx, scale, dst))
+}
+
+/// Whether the next mention of `%rcx` is a pure write, so dropping a write to
+/// it cannot leave a stale value behind.
+fn rcx_next_is_write(lines: &[&str], from: usize) -> bool {
+    for line in lines.iter().skip(from) {
+        let t = line.trim();
+        if !reg_mentions(t, "%rcx") {
+            continue;
+        }
+        if let Some((src, dst)) = t.split_once(',') {
+            let op = t.split_whitespace().next().unwrap_or("");
+            if dst.trim() == "%rcx" && !src.contains("%rcx") && matches!(op, "mov" | "movq" | "lea") {
+                return true;
+            }
+        }
+        return false;
+    }
+    true
+}
+
+/// Fuse `lea D(%B), %R1; mov %I, %rcx; lea (%R1,%rcx,S), %R1` into
+/// `lea D(%B,%I,S), %R1`, dropping the copy of the index into the scratch
+/// register. The generator materialises an array base and its index into
+/// separate registers before combining them; on x86-64 the base, the scaled
+/// index and the displacement all fit one addressing mode, which is a load or
+/// store fewer per element access.
+fn fold_lea_terms(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if i + 2 < lines.len() {
+            if let Some((disp, bbase, r1)) = lea_disp(lines[i]) {
+                if let Some((idx, t)) = mov_reg_reg(lines[i + 1]) {
+                    if let Some((0, cbase, cidx, scale, cdst)) = lea_indexed(lines[i + 2]) {
+                        if cbase == r1
+                            && cidx == t
+                            && cdst == r1
+                            && t == "%rcx"
+                            && rcx_next_is_write(&lines, i + 3)
+                        {
+                            out.push_str(&format!("  lea {disp}({bbase}, {idx}, {scale}), {r1}\n"));
+                            i += 3;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        out.push_str(lines[i]);
+        out.push('\n');
+        i += 1;
+    }
+    out
+}
+
 /// `lea <disp>(%rbp), <reg>`, returning the displacement and the register.
 fn lea_local(line: &str) -> Option<(i64, &str)> {
     let t = line.trim();
@@ -5565,6 +5644,7 @@ fn optimize(body: &str) -> String {
         body = coalesce_scratch(&body);
         body = forward_stores(&body);
         body = fold_addresses(&body);
+        body = fold_lea_terms(&body);
         body = fold_local_offsets(&body);
         body = dead_stores(&body);
         body = drop_unread_stores(&body);
@@ -6473,5 +6553,35 @@ fn main() -> () {
             body,
             "a dependent pair was reordered, so the second multiply reads a stale quotient"
         );
+    }
+
+    /// The array-index address chain folds into one addressing mode: the base
+    /// `lea`, the index copy into `%rcx`, and the indexed `lea` become a single
+    /// `lea` naming the base register, the index and the scale.
+    #[test]
+    fn an_indexed_address_chain_folds_to_one_lea() {
+        let body = "\
+  lea -2096(%rbp), %rax
+  mov %rsi, %rcx
+  lea (%rax,%rcx,8), %rax
+  mov (%rax), %rax
+";
+        let out = fold_lea_terms(body);
+        assert_eq!(out, "  lea -2096(%rbp, %rsi, 8), %rax\n  mov (%rax), %rax\n");
+    }
+
+    /// The fold is refused when the scratch register still holds a live value:
+    /// here the following instruction reads `%rcx`, so dropping the index copy
+    /// would leave it stale.
+    #[test]
+    fn an_indexed_chain_whose_scratch_is_still_live_is_not_folded() {
+        let body = "\
+  lea -2096(%rbp), %rax
+  mov %rsi, %rcx
+  lea (%rax,%rcx,8), %rax
+  mov (%rax), %rdx
+  add %rcx, %rdx
+";
+        assert_eq!(fold_lea_terms(body), body, "a live scratch value was dropped");
     }
 }
