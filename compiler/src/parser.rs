@@ -1920,6 +1920,7 @@ impl Parser {
             &self.consts,
             &self.const_bools,
             &self.const_chars,
+            &self.const_narrow,
         )
         .map_err(|e| format!("at byte {}: {e}", self.toks[self.i].pos))?;
         // Every item must fold, including an unused one. `resolve_with` leaves
@@ -2857,6 +2858,121 @@ impl Parser {
         Ok(Stmt::Expr(Expr::Block(Block { stmts: head, tail: None })))
     }
 
+    /// Desugar a *plain* reversed range, `for i in (lo..hi).rev() { .. }`, to a
+    /// loop that indexes down from the high bound, so the span `hi - lo` is
+    /// never materialised as a signed count. A `rev`-only chain maps its index
+    /// `j` to `hi - 1 - j` (exclusive) or `hi - j` (inclusive), and the loop
+    /// runs `j` over `0..=span` with `span = hi - lo`; counting up to `span`
+    /// never overflows, unlike the count `hi - lo + 1` the general path forms
+    /// (which traps for `(0..=i64::MAX).rev()`). `continue` targets the loop
+    /// counter, as for any `for` loop. Returns `None` for any other adapter
+    /// chain (a `skip`/`take`/`step_by` before or after the `rev`), which the
+    /// general adapter path handles. Borrows its inputs so the caller can fall
+    /// back with them intact.
+    fn desugar_for_range_rev_plain(
+        &mut self,
+        pat: &Pat,
+        lo: &Expr,
+        hi: &Expr,
+        inclusive: bool,
+        adapters: &[String],
+        args: &[Expr],
+        body: &Block,
+        label: &Option<String>,
+    ) -> PResult<Option<Stmt>> {
+        // Only a lone `rev` applied directly to the raw range takes this path;
+        // any `skip`/`take`/`step_by` needs the general desugaring.
+        if adapters.len() != 1 || adapters[0] != "rev" {
+            return Ok(None);
+        }
+        let _ = args;
+        let var = match pat {
+            Pat::Bind(n) => n.clone(),
+            Pat::Wild => {
+                let n = format!("\u{0}fi{}", self.tmp);
+                self.tmp += 1;
+                n
+            }
+            _ => {
+                return Err(format!(
+                    "at byte {}: `for` over a range needs a binding or `_`",
+                    self.pos()
+                ))
+            }
+        };
+        let vlo = |n: &str| Expr::Var { name: n.to_string(), slot: -1, ty: Type::I64 };
+        let lo_name = format!("\u{0}rl{}", self.tmp);
+        let hi_name = format!("\u{0}rh{}", self.tmp);
+        let i_name = format!("\u{0}ri{}", self.tmp);
+        let n_name = format!("\u{0}rn{}", self.tmp);
+        self.tmp += 1;
+        // `span = hi - lo`, the loop's inclusive end. For `(0..=i64::MAX)` it is
+        // `i64::MAX` (no overflow); a span exceeding `i64::MAX` (the full
+        // `i64::MIN..=i64::MAX`) still traps, a documented limit.
+        let span = Expr::Bin(BinOp::Sub, Box::new(vlo(&hi_name)), Box::new(vlo(&lo_name)));
+        // The exclusive end is `span - 1` (elements `hi-1 ..= lo`); the
+        // inclusive end is `span` (elements `hi ..= lo`).
+        let end = if inclusive {
+            span
+        } else {
+            Expr::Bin(BinOp::Sub, Box::new(span), Box::new(Expr::Int(1)))
+        };
+        // Element `j` of the reversed sequence: `hi - j` (inclusive) or
+        // `hi - 1 - j` (exclusive).
+        let map: Expr = if inclusive {
+            Expr::Bin(BinOp::Sub, Box::new(vlo(&hi_name)), Box::new(vlo(&i_name)))
+        } else {
+            Expr::Bin(
+                BinOp::Sub,
+                Box::new(Expr::Bin(BinOp::Sub, Box::new(vlo(&hi_name)), Box::new(Expr::Int(1)))),
+                Box::new(vlo(&i_name)),
+            )
+        };
+        let mut head: Vec<Stmt> = vec![
+            Stmt::Let {
+                name: lo_name.clone(),
+                ty: None,
+                init: Some(lo.clone()),
+                slot: -1,
+                mutable: false,
+            },
+            Stmt::Let {
+                name: hi_name.clone(),
+                ty: None,
+                init: Some(hi.clone()),
+                slot: -1,
+                mutable: false,
+            },
+            Stmt::Let {
+                name: n_name.clone(),
+                ty: None,
+                init: Some(end),
+                slot: -1,
+                mutable: false,
+            },
+        ];
+        let mut stmts = vec![Stmt::Let {
+            name: var,
+            ty: None,
+            init: Some(map),
+            slot: -1,
+            mutable: false,
+        }];
+        stmts.extend(body.stmts.iter().cloned());
+        let body = Block { stmts, tail: body.tail.clone() };
+        head.push(Stmt::For {
+            var: i_name,
+            var_slot: -1,
+            start: Expr::Int(0),
+            end: vlo(&n_name),
+            end_slot: -1,
+            inclusive: true,
+            body,
+            label: label.clone(),
+        });
+        Ok(Some(Stmt::Expr(Expr::Block(Block { stmts: head, tail: None }))))
+    }
+
     fn parse_for_labeled(&mut self, label: Option<String>) -> PResult<Stmt> {
         // A loop variable that names a constant shadows it (rustc E0530).
         // `parse_pattern` would otherwise read the name as that constant's
@@ -2900,6 +3016,15 @@ impl Parser {
                 }
             }
             let body = self.parse_block()?;
+            // A pure reverse (`rev` applied directly to the raw range, maybe
+            // with `skip`/`take` after it) is desugared to a downward loop, so a
+            // span that does not fit `i64` (`(0..=i64::MAX).rev()`) still runs.
+            // The general path handles a `step_by`/`skip` before the `rev`.
+            if let Some(stmt) = self.desugar_for_range_rev_plain(
+                &pat, &lo, &hi, inclusive, &adapters, &args, &body, &label,
+            )? {
+                return Ok(stmt);
+            }
             return self.desugar_for_range_adapter(
                 pat, lo, hi, inclusive, &adapters, args, body, label,
             );
@@ -3610,6 +3735,30 @@ impl Parser {
                         } else {
                             Type::I64
                         };
+                        // An element that names an outer binding of the same
+                        // name (`let v = 5; let v: Vec<i64> = vec![v]`) must read
+                        // that outer value: rustc evaluates the initializer
+                        // before the new binding enters scope, so a direct store
+                        // after `name` is declared would read the allocation
+                        // address instead. Only then is each element evaluated
+                        // into its own temporary ahead of the declaration; the
+                        // common case stores each element directly.
+                        let shadowed = args.iter().any(|e| Self::expr_mentions_name(e, &name));
+                        let mut temps: Vec<String> = Vec::new();
+                        if shadowed {
+                            for elem in args.iter() {
+                                let t = format!("\u{0}vt{}", self.tmp);
+                                self.tmp += 1;
+                                out.push(Stmt::Let {
+                                    name: t.clone(),
+                                    ty: None,
+                                    init: Some(Expr::Cast(Box::new(elem.clone()), value_ty.clone())),
+                                    slot: -1,
+                                    mutable: false,
+                                });
+                                temps.push(t);
+                            }
+                        }
                         let base = Expr::Var { name: name.clone(), slot: -1, ty: Type::I64 };
                         out.push(Stmt::Let {
                             name,
@@ -3626,9 +3775,14 @@ impl Parser {
                             );
                             let ptr_ty = if byte_elem { Type::U8 } else { Type::I64 };
                             let ptr = Expr::Cast(Box::new(offset), Type::Ref(Box::new(ptr_ty), true));
+                            let value = if shadowed {
+                                Expr::Var { name: temps[i].clone(), slot: -1, ty: Type::I64 }
+                            } else {
+                                Expr::Cast(Box::new(elem.clone()), value_ty.clone())
+                            };
                             out.push(Stmt::Assign {
                                 target: Expr::Deref { expr: Box::new(ptr), ty: Type::I64 },
-                                value: Expr::Cast(Box::new(elem.clone()), value_ty.clone()),
+                                value,
                             });
                         }
                         return Ok(());
@@ -6536,6 +6690,55 @@ impl Parser {
         match init {
             Expr::Var { name, .. } => names.iter().any(|n| n == name),
             _ => false,
+        }
+    }
+
+    /// Whether `e` mentions the variable `name` anywhere. A shape that is not
+    /// inspected returns `true`, so a caller that uses this to decide whether
+    /// evaluation order matters (and evaluates into temporaries when it does)
+    /// stays conservative. Used by the `vec![..]` desugar, whose elements must
+    /// be evaluated before the binding that names the vector enters scope.
+    fn expr_mentions_name(e: &Expr, name: &str) -> bool {
+        match e {
+            Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) => false,
+            Expr::Var { name: n, .. } => n == name,
+            Expr::Bin(_, a, b) => {
+                Self::expr_mentions_name(a, name) || Self::expr_mentions_name(b, name)
+            }
+            Expr::Un(_, a) | Expr::Cast(a, _) | Expr::ArrayLit(a, _) => {
+                Self::expr_mentions_name(a, name)
+            }
+            Expr::Index(a, b) => {
+                Self::expr_mentions_name(a, name) || Self::expr_mentions_name(b, name)
+            }
+            Expr::Deref { expr, .. } | Expr::AddrOf { expr, .. } => {
+                Self::expr_mentions_name(expr, name)
+            }
+            Expr::Field { base, .. } => Self::expr_mentions_name(base, name),
+            Expr::MethodCall { recv, args, .. } => {
+                Self::expr_mentions_name(recv, name)
+                    || args.iter().any(|a| Self::expr_mentions_name(a, name))
+            }
+            Expr::Call { args, .. } => args.iter().any(|a| Self::expr_mentions_name(a, name)),
+            Expr::TupleLit(v) | Expr::ArrayList(v) => {
+                v.iter().any(|a| Self::expr_mentions_name(a, name))
+            }
+            Expr::StructLit { fields, .. } => {
+                fields.iter().any(|f| Self::expr_mentions_name(&f.value, name))
+            }
+            Expr::EnumCtor { args, .. } => args.iter().any(|a| Self::expr_mentions_name(a, name)),
+            Expr::EnumPayload { recv, .. } => Self::expr_mentions_name(recv, name),
+            Expr::BoolTest { scrutinee, .. } => Self::expr_mentions_name(scrutinee, name),
+            Expr::VariantTest { scrutinee, sub_tests, .. } => {
+                Self::expr_mentions_name(scrutinee, name)
+                    || sub_tests.iter().any(|(_, t)| Self::expr_mentions_name(t, name))
+            }
+            Expr::PatScrutinee(a) => Self::expr_mentions_name(a, name),
+            Expr::PatCheck { base, .. } | Expr::PatArity { base, .. } => {
+                Self::expr_mentions_name(base, name)
+            }
+            // A block, `if`, `loop` or `match` can hide the name.
+            _ => true,
         }
     }
 

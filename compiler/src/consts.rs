@@ -33,7 +33,13 @@ pub enum ConstVal {
 /// diagnoses it. `i64` and `bool` items are folded; any other declared type is
 /// skipped (the caller rejects it).
 pub fn resolve(items: &[(String, Type, Expr)]) -> Result<HashMap<String, ConstVal>, String> {
-    resolve_with(items, &HashMap::new(), &HashMap::new(), &HashMap::new())
+    resolve_with(
+        items,
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+    )
 }
 
 /// Resolve `items` seeded with the values already in scope (`base_ints`,
@@ -47,10 +53,15 @@ pub fn resolve_with(
     base_ints: &HashMap<String, i64>,
     base_bools: &HashMap<String, bool>,
     base_chars: &HashMap<String, u32>,
+    base_narrow: &HashMap<String, Type>,
 ) -> Result<HashMap<String, ConstVal>, String> {
     let mut ints = base_ints.clone();
     let mut bools = base_bools.clone();
     let mut chars = base_chars.clone();
+    // The declared width of each already-resolved narrow constant, so an
+    // initializer that names one folds a method at *that* width
+    // (`const A: u8 = 250; const B: u16 = A.saturating_add(10)` clamps at `u8`).
+    let mut narrow = base_narrow.clone();
     // An item shadows an enclosing constant of the same name for the whole
     // block, so drop the base value: a reference inside any initializer
     // resolves to the item (a cycle when it is the item's own initializer),
@@ -59,6 +70,7 @@ pub fn resolve_with(
         ints.remove(name);
         bools.remove(name);
         chars.remove(name);
+        narrow.remove(name);
     }
     // Iterate to a fixpoint so a constant may name one declared later.
     loop {
@@ -73,9 +85,10 @@ pub fn resolve_with(
                 // range, and `const N: u8 = 200 + 100` overflows a `u8`), and
                 // the stored value is the in-width result.
                 Type::Int { signed, bits } => {
-                    match eval_int_at(value, &ints, Some((*signed, *bits))) {
+                    match eval_int_at(value, &ints, &narrow, Some((*signed, *bits))) {
                         Ok(v) if fits_int(v, *signed, *bits) => {
                             ints.insert(name.clone(), wrap_int(v, *signed, *bits));
+                            narrow.insert(name.clone(), ty.clone());
                             progress = true;
                         }
                         Ok(_) => {
@@ -93,7 +106,7 @@ pub fn resolve_with(
                     }
                 }
                 Type::I64 => {
-                    if let Some(v) = eval_i64(value, &ints) {
+                    if let Some(v) = eval_i64_at(value, &ints, &narrow, None) {
                         ints.insert(name.clone(), v);
                         progress = true;
                     }
@@ -161,15 +174,55 @@ fn int_bounds(signed: bool, bits: u16) -> (i128, i128) {
 }
 
 /// The width an operand names, if any: a suffixed literal (`200u8`), a cast to
-/// a narrow type, or a negation of one. A bare literal (`200`) names no width
-/// and adopts the operation's, and a variable names none here (its width is
-/// carried by the declared type of the `const` being folded).
-fn operand_width(e: &Expr) -> Option<(bool, u16)> {
+/// a narrow type, a negation of one, or a resolved constant whose declared type
+/// was narrow. A bare literal (`200`) names no width and adopts the operation's,
+/// and a variable names none unless it is a narrow constant in `narrow`.
+fn operand_width(e: &Expr, narrow: &HashMap<String, Type>) -> Option<(bool, u16)> {
     match e {
         Expr::Cast(_, Type::Int { signed, bits }) if *bits < 64 => Some((*signed, *bits)),
-        Expr::Un(UnOp::Neg, inner) => operand_width(inner),
+        Expr::Un(UnOp::Neg, inner) => operand_width(inner, narrow),
+        Expr::Var { name, .. } => match narrow.get(name) {
+            Some(Type::Int { signed, bits }) if *bits < 64 => Some((*signed, *bits)),
+            _ => None,
+        },
         _ => None,
     }
+}
+
+/// Validate a *bare* (unsuffixed) integer literal used as a binary operand
+/// against the width the operation runs at. rustc types the literal at that
+/// width, so `const N: u8 = 300 + 0` is a literal out of range rather than a
+/// wrap of `300` to `44`. A suffixed or cast operand already carries its own
+/// width (`operand_width`), so it is left alone, as is a resolved name (its
+/// value was checked when the item it names was folded).
+fn check_literal_fits(e: &Expr, signed: bool, bits: u16) -> Result<(), String> {
+    if operand_width(e, &HashMap::new()).is_some() {
+        return Ok(());
+    }
+    match e {
+        Expr::Int(v) => {
+            if !fits_int(*v, signed, bits) {
+                return Err(format!(
+                    "literal out of range for `{}`",
+                    int_width_name(signed, bits)
+                ));
+            }
+        }
+        Expr::Un(UnOp::Neg, inner) => {
+            if let Expr::Int(v) = inner.as_ref() {
+                if let Some(n) = v.checked_neg() {
+                    if !fits_int(n, signed, bits) {
+                        return Err(format!(
+                            "literal out of range for `{}`",
+                            int_width_name(signed, bits)
+                        ));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Evaluate a constant integer expression at its declared width, returning the
@@ -183,12 +236,13 @@ fn operand_width(e: &Expr) -> Option<(bool, u16)> {
 /// width decides, so `250 + 10` is fine under an `i64` item but an overflow
 /// under a `u8` one.
 pub fn eval_int(e: &Expr, ints: &HashMap<String, i64>) -> Result<i64, String> {
-    eval_int_at(e, ints, None)
+    eval_int_at(e, ints, &HashMap::new(), None)
 }
 
 fn eval_int_at(
     e: &Expr,
     ints: &HashMap<String, i64>,
+    narrow: &HashMap<String, Type>,
     ctx: Option<(bool, u16)>,
 ) -> Result<i64, String> {
     use BinOp::*;
@@ -196,10 +250,10 @@ fn eval_int_at(
     match e {
         Expr::Var { name, .. } => ints.get(name).copied().ok_or_else(not_const),
         Expr::Int(k) => Ok(*k),
-        Expr::Un(UnOp::Neg, inner) => eval_int_at(inner, ints, ctx)?
+        Expr::Un(UnOp::Neg, inner) => eval_int_at(inner, ints, narrow, ctx)?
             .checked_neg()
             .ok_or_else(|| "this arithmetic operation overflows".to_string()),
-        Expr::Cast(inner, ty) if *ty == Type::I64 => eval_int_at(inner, ints, None),
+        Expr::Cast(inner, ty) if *ty == Type::I64 => eval_int_at(inner, ints, narrow, None),
         Expr::Cast(inner, Type::Int { signed, bits }) => {
             // A bare literal cast (`300 as u8`) is typed by the cast, so it must
             // fit the destination; a suffixed literal (`300u16 as u8`) carries
@@ -217,7 +271,7 @@ fn eval_int_at(
             // so the inner is folded with no context. A suffixed literal
             // (`300u16 as u8`) still carries its own width through its own
             // `Cast` node.
-            let v = eval_int_at(inner, ints, None)?;
+            let v = eval_int_at(inner, ints, narrow, None)?;
             if *bits >= 64 {
                 Ok(v)
             } else {
@@ -225,14 +279,21 @@ fn eval_int_at(
             }
         }
         Expr::Bin(op, a, b) => {
-            let x = eval_int_at(a, ints, ctx)?;
-            let y = eval_int_at(b, ints, ctx)?;
+            let x = eval_int_at(a, ints, narrow, ctx)?;
+            let y = eval_int_at(b, ints, narrow, ctx)?;
             // The operation runs at the width an operand names, else the
             // context's (the `const`'s declared width). With neither, it is an
             // unbounded `i64` fold.
-            let w = operand_width(a).or_else(|| operand_width(b)).or(ctx);
+            let w = operand_width(a, narrow)
+                .or_else(|| operand_width(b, narrow))
+                .or(ctx);
             match w {
                 Some((signed, bits)) if bits < 64 => {
+                    // A bare literal operand is typed at the operation's width,
+                    // so an oversized one is a literal out of range rather than
+                    // a wrap (`const N: u8 = 300 + 0` is rejected, not `44`).
+                    check_literal_fits(a, signed, bits)?;
+                    check_literal_fits(b, signed, bits)?;
                     let (x, y) = (wrap_int(x, signed, bits), wrap_int(y, signed, bits));
                     match op {
                         BitAnd => Ok(x & y),
@@ -293,9 +354,14 @@ fn eval_int_at(
         // sees the method-call form; sema's lowering to the runtime helpers
         // happens later.
         Expr::MethodCall { recv, name, args } if args.len() == 1 => {
-            let x = eval_int_at(recv, ints, ctx)?;
-            let y = eval_int_at(&args[0], ints, ctx)?;
-            let w = operand_width(recv).or_else(|| operand_width(&args[0])).or(ctx);
+            let x = eval_int_at(recv, ints, narrow, ctx)?;
+            let y = eval_int_at(&args[0], ints, narrow, ctx)?;
+            // A method folds at its *receiver's* width, not the destination's:
+            // `const A: u8 = 250; const B: u16 = A.saturating_add(10)` clamps at
+            // `u8` (255), because the receiver `A` is a `u8`. Only when the
+            // receiver names no width (a bare literal, an unsuffixed fold) does
+            // the declared width `ctx` apply.
+            let w = operand_width(recv, narrow).or(ctx);
             eval_int_method(name, x, y, w).ok_or_else(not_const)
         }
         _ => Err(not_const()),
@@ -332,16 +398,30 @@ fn eval_int_method(name: &str, x: i64, y: i64, w: Option<(bool, u16)>) -> Option
         "saturating_mul" => Some((a * b).clamp(lo, hi) as i64),
         "pow" => {
             // `pow` takes a `u32` exponent; a negative one is not a constant
-            // exponent here. An overflow at the width is rejected, as rustc's
-            // const evaluator does.
+            // exponent here. Exponentiation by squaring mirrors rustc's const
+            // evaluator: O(log y) multiplications, so a huge literal exponent
+            // (`1u8.pow(1_000_000_000)`) folds at once instead of stalling, and
+            // each multiplication is checked at the width, so an overflow is
+            // rejected exactly where rustc rejects it. The zero exponent is one.
             if y < 0 {
                 return None;
             }
+            let mut exp = y as u64;
+            let mut base = a;
             let mut acc: i128 = 1;
-            for _ in 0..y {
-                acc = acc.checked_mul(a)?;
-                if !in_range(acc) {
-                    return None;
+            while exp > 0 {
+                if exp & 1 == 1 {
+                    acc = acc.checked_mul(base)?;
+                    if !in_range(acc) {
+                        return None;
+                    }
+                }
+                exp >>= 1;
+                if exp > 0 {
+                    base = base.checked_mul(base)?;
+                    if !in_range(base) {
+                        return None;
+                    }
                 }
             }
             Some(acc as i64)
@@ -364,17 +444,26 @@ pub fn eval_char(e: &Expr, chars: &HashMap<String, u32>) -> Option<u32> {
 /// constant by name (`ints`). This is the same folding as `const_i64` plus the
 /// name lookup a `const` initializer needs.
 pub fn eval_i64(e: &Expr, ints: &HashMap<String, i64>) -> Option<i64> {
+    eval_i64_at(e, ints, &HashMap::new(), None)
+}
+
+fn eval_i64_at(
+    e: &Expr,
+    ints: &HashMap<String, i64>,
+    narrow: &HashMap<String, Type>,
+    ctx: Option<(bool, u16)>,
+) -> Option<i64> {
     match e {
         Expr::Var { name, .. } => ints.get(name).copied(),
         Expr::Int(k) => Some(*k),
-        Expr::Un(UnOp::Neg, inner) => eval_i64(inner, ints)?.checked_neg(),
+        Expr::Un(UnOp::Neg, inner) => eval_i64_at(inner, ints, narrow, ctx)?.checked_neg(),
         // A cast to `i64` (or any width, all of which rmc treats as `i64`) is
         // the identity here, so an array length written `N as usize` still
         // folds. A narrow cast (`N as u8`) folds to the width's value, matching
         // how a narrow constant use is substituted (`Cast(Int, u8)`).
-        Expr::Cast(inner, ty) if *ty == Type::I64 => eval_i64(inner, ints),
+        Expr::Cast(inner, ty) if *ty == Type::I64 => eval_i64_at(inner, ints, narrow, None),
         Expr::Cast(inner, Type::Int { signed, bits }) => {
-            let v = eval_i64(inner, ints)?;
+            let v = eval_i64_at(inner, ints, narrow, None)?;
             if *bits >= 64 {
                 Some(v)
             } else {
@@ -382,19 +471,22 @@ pub fn eval_i64(e: &Expr, ints: &HashMap<String, i64>) -> Option<i64> {
             }
         }
         Expr::Bin(op, a, b) => {
-            let x = eval_i64(a, ints)?;
-            let y = eval_i64(b, ints)?;
+            let x = eval_i64_at(a, ints, narrow, ctx)?;
+            let y = eval_i64_at(b, ints, narrow, ctx)?;
             const_binop_checked(*op, x, y)
         }
         // The arithmetic methods rustc folds in a `const`: `wrapping_mul` (and
         // the rest of the `wrapping_*`/`saturating_*` family and `pow`). The
         // parser sees the method-call form — sema lowers it to a runtime helper
         // only later — so folding here is what lets `const K: i64 =
-        // a.wrapping_mul(b)` and `2i64.pow(3)` resolve.
+        // a.wrapping_mul(b)` and `2i64.pow(3)` resolve. The width comes from the
+        // receiver (a narrow constant name or a suffixed/cast receiver), else
+        // the context, so `A.saturating_add(10)` on a `u8` `A` clamps at `u8`.
         Expr::MethodCall { recv, name, args } if args.len() == 1 => {
-            let x = eval_i64(recv, ints)?;
-            let y = eval_i64(&args[0], ints)?;
-            eval_int_method(name, x, y, None)
+            let x = eval_i64_at(recv, ints, narrow, ctx)?;
+            let y = eval_i64_at(&args[0], ints, narrow, ctx)?;
+            let w = operand_width(recv, narrow).or(ctx);
+            eval_int_method(name, x, y, w)
         }
         _ => None,
     }

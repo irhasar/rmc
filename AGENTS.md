@@ -382,6 +382,15 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   and no codegen; its value is substituted at every use. An immutable `static`
   is parsed by `parse_static` and lowered to the same `ConstDef`, so it shares
   this path; `static mut` is rejected, since rmc has no mutable global.
+  Folding threads an *operand width* (`eval_int_at`/`eval_i64_at`): a
+  `const N: u8` folds at `u8`, and a method folds at its *receiver's* width, not
+  the destination's (`A.saturating_add(10)` on a `u8` `A` clamps at 255 even when
+  bound to an `i64`). `resolve_with` carries the declared width of each resolved
+  narrow item so an initializer that names one folds the method at that width.
+  `pow` folds by squaring (`while exp > 0 { if exp & 1 { acc *= base } exp >>= 1;
+  base *= base }`), so `1u8.pow(1_000_000_000)` is O(log exponent), not a
+  billion multiplications; the base is squared only while exponent bits remain,
+  so an unused high square cannot reject a result that fits.
   A `const`/immutable-`static` declared inside a block is collected and resolved
   by `scan_block_consts` when the block begins (rustc hoists block items), so it
   is in scope for the whole block and shadows an outer one until the block ends.
@@ -862,14 +871,21 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   `step_by` needs no `min`). A negative *literal* count (`skip(-1)`,
   `step_by(-1)`) is rejected as a unary `-` on a `usize` (rustc's `E0600`),
   checked in the forward pass before the adapter's argument runs; a non-literal
-  negative count is left to run time, since rustc accepts it. A *known
-  divergence*: the adapter path computes an inclusive range's element count as
-  `hi - lo + 1`, which overflows `i64` when `hi` is `i64::MAX`
-  (`(n..=i64::MAX).rev()` is rejected while rustc accepts it); the plain path
-  (no adapter) is correct, since its `..=` loop tests `var <= end` without a
-  count.
-  `tests/cases/rangeadapt.rs` and `counting_range_adapters_compile` cover the
-  chains.
+  negative count is left to run time, since rustc accepts it. A `rev` applied
+  *directly* to the raw range with no other adapter is a special case:
+  `desugar_for_range_rev_plain` lowers `(lo..hi).rev()` to an *inclusive*
+  upward counter `0..=span` (with `span = hi - lo`) whose element expression is
+  `hi - 1 - i` (or `hi - i` for `..=`), so the count `hi - lo + 1` is never
+  formed and a range whose length does not fit `i64`
+  (`(0..=i64::MAX).rev()`) still runs. The caller tries this path first and
+  falls back to `desugar_for_range_adapter` when it returns `None` (a
+  `skip`/`take`/`step_by` is present), so the general path keeps its
+  `__rmc_min`-based counts. A *remaining divergence*: only a `rev` chained
+  after a `skip`/`step_by` still materialises the span as a count, and the full
+  `i64::MIN..=i64::MAX` inclusive span overflows (rustc accepts it).
+  `tests/cases/rangeadapt.rs`, `tests/cases/revrange.rs` and
+  `counting_range_adapters_compile`/`a_plain_reversed_range_does_not_form_the_span_count`
+  cover the chains.
 - **`..=` exits on `jle` back-edge, not `jl`.** The guard is the loop-back
   condition, so the inclusive form loops while `var <= end` (`jle`) and the
   exclusive one while `var < end` (`jl`); a `jg`/`jge` *exit* test is the
@@ -2059,7 +2075,12 @@ rather than `n` words), `v.capacity()`/`v.len()`
 fold to the constant count, and `v.as_mut_ptr()` keeps the address so a later
 `.add(off)` is `p + off * elem`, scaling by the element width from the `Vec<T>`
 annotation (`Vec<u8>` stays byte-addressed, and a `type Byte = u8` alias is
-chased to its target). Each shape is recognised only directly
+chased to its target). A `vec![a, b, c]` *list* allocates one slot per element
+and stores each; an element that names the binding being defined (`let x = 5;
+let x: Vec<i64> = vec![x];`) must read the *outer* value, so when
+`expr_mentions_name` finds such an element each is evaluated into a
+`\0vt`-prefixed temporary before the binding is declared, and the common case
+stores each element directly. Each shape is recognised only directly
 in a `let` initializer; anywhere else the `\0`-prefixed parser marker reaches
 sema, which reports the source construct (see the `\0vecnew` arm). An
 args-vector is never built: `std::env::args()...collect()` records the binding,

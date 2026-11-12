@@ -5738,6 +5738,41 @@ fn a_const_with_a_forward_reference_resolves() {
 }
 
 #[test]
+fn a_const_pow_with_a_huge_exponent_folds_by_squaring() {
+    // `1u8.pow(1_000_000_000)` is a valid program. Folding it by repeated
+    // multiplication would run a billion steps and stall the compiler; folding
+    // by squaring is O(log exponent), so it finishes at once and yields 1. The
+    // zero exponent yields 1 too, and `0^huge` yields 0.
+    let out = asm("const N: u8 = 1u8.pow(1_000_000_000); fn main() -> i64 { return N as i64; }");
+    let body = main_body(&out);
+    assert!(body.contains("$1"), "1^huge is 1:\n{body}");
+    let zero = asm("const N: u8 = 0u8.pow(1_000_000_000); fn main() -> i64 { return N as i64; }");
+    assert!(main_body(&zero).contains("$0"), "0^huge is 0:\n{zero}");
+    let e0 = asm("const N: u8 = 3u8.pow(0); fn main() -> i64 { return N as i64; }");
+    assert!(main_body(&e0).contains("$1"), "x^0 is 1:\n{e0}");
+}
+
+#[test]
+fn a_const_method_folds_at_its_receiver_width() {
+    // The method folds at the *receiver's* width, not the destination's: a
+    // `u8` `A`'s `saturating_add` clamps at `u8` (255) even when the result is
+    // bound to an `i64`. `wrapping_add` wraps at the same width.
+    let sat = asm(
+        "const A: u8 = 250; const B: i64 = A.saturating_add(10) as i64; \
+         fn main() -> i64 { return B; }",
+    );
+    assert!(main_body(&sat).contains("$255"), "clamped at u8:\n{sat}");
+    let wrap = asm(
+        "const A: u8 = 250; const B: i64 = A.wrapping_add(10) as i64; \
+         fn main() -> i64 { return B; }",
+    );
+    assert!(main_body(&wrap).contains("$4"), "wrapped at u8:\n{wrap}");
+    // A `u16` receiver's `pow` stays exact within `u16`.
+    let p = asm("const A: u16 = 3; const B: u16 = A.pow(5); fn main() -> i64 { return B as i64; }");
+    assert!(main_body(&p).contains("$243"), "3^5 within u16:\n{p}");
+}
+
+#[test]
 fn a_const_cycle_is_rejected() {
     let err = compile_to_asm(
         "const A: i64 = B; const B: i64 = A; fn main() -> i64 { return A; }",
@@ -7955,6 +7990,25 @@ fn counting_range_adapters_compile() {
 }
 
 #[test]
+fn a_plain_reversed_range_does_not_form_the_span_count() {
+    // A `rev`-only chain indexes down from the high bound and counts up to
+    // `hi - lo`, so it never forms the count `hi - lo + 1`, which overflows
+    // `i64` for `(0..=i64::MAX).rev()`. That program is valid Rust and must
+    // compile. A reversed range with a `skip`/`take` keeps the general path.
+    assert!(
+        compile_to_asm(
+            "fn main() { for i in (0..=i64::MAX).rev() { let _ = i; } }",
+            &CompileOptions::default()
+        )
+        .is_ok(),
+        "a full-width reversed inclusive range compiles"
+    );
+    // The downward loop is an inclusive `for` over `0..=span`.
+    let out = asm("fn main() { for i in (0..5).rev() { let _ = i; } }");
+    assert!(out.contains("main:"), "the reversed range compiles:\n{out}");
+}
+
+#[test]
 fn a_vec_list_literal_compiles_and_stores_each_element() {
     // `vec![a, b, c]` allocates one slot per element and stores each, so the
     // lowered code holds one `alloc` call and one store per element rather than
@@ -7982,6 +8036,29 @@ fn a_vec_list_literal_reads_back_its_elements() {
         "fn main() { let v: Vec<i64> = vec![]; let _ = v.len(); }",
         &CompileOptions::default()
     ).is_ok());
+}
+
+#[test]
+fn a_vec_list_element_that_shadows_the_binding_reads_the_outer_value() {
+    // `let x = 5; let x: Vec<i64> = vec![x];` must store the outer `x` (5), not
+    // the allocation address: the initializer is evaluated before the new
+    // binding enters scope. When an element names the binding being defined,
+    // each element is evaluated into a temporary first.
+    let out = asm("fn main() { let x = 5; let x: Vec<i64> = vec![x, x + 1]; let _ = x.len(); }");
+    assert!(out.contains("call alloc"), "the list allocates:\n{out}");
+    // The element values 5 and 6 are materialised and stored, not the address
+    // the allocator returned; the diff case `veclist.rs` checks the values.
+    assert!(out.contains("$5") && out.contains("$6"), "values materialised:\n{out}");
+    assert!(
+        out.matches("(%rax)").count() >= 2,
+        "each element is stored to the allocation:\n{out}"
+    );
+    // The common case stores each element directly, with no temporary.
+    let plain = asm("fn main() { let v: Vec<i64> = vec![11, 22]; let _ = v.len(); }");
+    assert!(
+        !plain.contains("\u{0}vt"),
+        "no temporary is needed without a shadow:\n{plain}"
+    );
 }
 
 #[test]

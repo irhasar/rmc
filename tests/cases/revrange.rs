@@ -27,4 +27,17 @@ fn main() {
         print!("{} ", i);
     }
     println!("labelled");
+    // A reversed range whose length does not fit `i64`: the loop indexes down
+    // from the high bound rather than forming `hi - lo + 1` as a signed count.
+    for i in (0..=i64::MAX).rev() {
+        println!("{}", i);
+        break;
+    }
+    for i in (i64::MIN..=i64::MIN).rev() {
+        println!("{}", i);
+    }
+    for i in (5..=4).rev() {
+        print!("{} ", i);
+    }
+    println!("emptyincl");
 }

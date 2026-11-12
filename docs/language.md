@@ -429,7 +429,14 @@ arithmetic methods rustc folds in a constant are folded here too —
 `wrapping_add`/`wrapping_sub`/`wrapping_mul` wrap, `saturating_add`/
 `saturating_sub`/`saturating_mul` clamp to the width, and `pow` is exact within
 it — so `const W: u8 = 200u8.wrapping_mul(2)` is 144 and
-`const S: u8 = 250u8.saturating_add(10)` is 255. A use of a narrow constant is
+`const S: u8 = 250u8.saturating_add(10)` is 255. A method folds at its
+*receiver's* width, not the destination's: `A.saturating_add(10)` on a `u8` `A`
+clamps at `u8` (255) even when the result is bound to an `i64`, the width coming
+from the receiver (a narrow constant name, a suffixed literal or a cast) and
+falling back to the declared width only when the receiver names none. A `pow`
+fold is exponentiation by squaring, so a huge literal exponent
+(`const N: u8 = 1u8.pow(1_000_000_000)`) folds in time logarithmic in the
+exponent rather than stalling. A use of a narrow constant is
 substituted at its declared width, so `A + 200` still overflows a `u8` `A`
 rather than widening to `i64`.
 
@@ -600,7 +607,12 @@ refutable and rejected. A range may be iterated downward with `.rev()`, written
 `for i in (lo..hi).rev()` or `(lo..=hi).rev()`: `lo` and `hi` are evaluated
 once each, the loop yields `hi - 1` down to `lo` (or `hi` down to `lo`
 inclusive), and `continue` still runs the decrement. The parentheses are
-required, as in Rust. Three counting adapters are also supported and may chain:
+required, as in Rust. A `rev`-only range is lowered to a downward index rather
+than to a count of `hi - lo + 1`, so a range whose length does not fit `i64`
+(`for i in (0..=i64::MAX).rev()`) still runs; only a `rev` chained after a
+`skip`/`step_by` materialises the span as a count, and the full
+`i64::MIN..=i64::MAX` span overflows. Three counting adapters are also supported
+and may chain:
 `.step_by(k)` yields every `k`-th element, `.skip(k)` drops the first `k`, and
 `.take(k)` keeps only the first `k`. Adapters apply left to right, so
 `(0..10).skip(2).take(3).rev()` reverses the slice `[2, 3, 4]`; each bound is
@@ -1010,7 +1022,11 @@ value, and the allocation is `n * elem_width` bytes (`elem_width` is 1 for a
 `u8`/`i8` element and 8 otherwise, so a `Vec<u8>` allocates `n` bytes and a
 `Vec<i64>` `n` words). A `vec![a, b, c]` list allocates one slot per element and
 stores each (one byte for a `u8`/`i8` element, one word otherwise); `.len()` and
-`.capacity()` fold to the element count. `add(off)` scales `off` by the
+`.capacity()` fold to the element count. An element that names the binding being
+defined (`let x = 5; let x: Vec<i64> = vec![x];`) reads the *outer* value, as
+rustc does: the initializer is evaluated before the new binding enters scope, so
+when an element names that binding each element is evaluated into a temporary
+first. `add(off)` scales `off` by the
 element width taken from the `Vec<T>` annotation, so a `Vec<i64>` pointer steps
 a whole word while a `Vec<u8>` stays byte-addressed. An args-vector is never
 materialised: `for v in &args` desugars to `for i in k..__rmc_nargs()` and
