@@ -2528,6 +2528,17 @@ and `mir-opt-level=1`/`2` shave 0.5-1 MB but make `light` uncompilable
 is a no-op for `--emit=mir`. The `light`/`fib` asymmetry is why the axis is
 reported per program rather than hidden behind the mean.
 
+Re-verified after merging `rmc-5-frontend`: still 0.96-0.98 on `hello`, and
+three more levers are ruled out. `-Zno-embed-metadata` (no `=`) is not a flag
+at all -- rustc rejects it and exits before compiling, which is why a naive RSS
+probe reads a bogus ~33 MB; only the `-Z embed-metadata=<value>` form parses.
+`MALLOC_ARENA_MAX=1`/`2` does not move rustc's peak (84.0 -> 84.0 MB). And the
+gap is the whole front end, not the MIR print: `-Zmir-opt-level=0` reaches
+82.8 MB, still above LLVM's 81.2 MB, while changing MIR semantics (it is the
+flag that makes `light` uncompilable). rmc's own stage, `rmcmir`, peaks at
+3.4 MB against `ld`'s 4.9 MB, so on this one program the backend already wins
+its stage and only the shared rustc front end decides the pipeline peak.
+
 ## Pushing
 
 `git push origin <branch>` needs a token with `contents: write`. The
