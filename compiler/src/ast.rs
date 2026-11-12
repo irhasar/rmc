@@ -542,7 +542,10 @@ pub enum Stmt {
 }
 
 /// A user-defined struct. Field offsets are assigned by sema in declaration
-/// order, so the layout is exactly the declaration order with no padding.
+/// order, so the layout is exactly the declaration order with no padding. A
+/// tuple struct (`struct P(T, T);`) stores its fields under the positional
+/// names `"0"`, `"1"`, ..., so it lays out and reads exactly like a braced
+/// struct; the parser records which names are constructors separately.
 #[derive(Debug, Clone)]
 pub struct StructDef {
     pub name: String,

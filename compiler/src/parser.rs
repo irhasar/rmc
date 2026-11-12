@@ -80,6 +80,17 @@ pub struct Parser {
     /// struct declared later in the file is covered because the whole list is
     /// scanned first.
     struct_fields: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// Names of tuple structs (`struct P(T, T);`), collected before parsing so
+    /// that a call `P(a, b)` lowers to a `StructLit` rather than a function call
+    /// and a pattern `P(x, y)` to a struct pattern rather than an enum variant
+    /// or a call. A tuple struct declared later in the file is covered because
+    /// the whole file is scanned first. Maps the name to its field count, so a
+    /// constructor call and a tuple pattern can be checked at parse time.
+    struct_ctors: std::collections::HashMap<String, usize>,
+    /// Names of unit structs (`struct U;`). Unlike an empty braced struct
+    /// (`struct E {}`), a unit struct's name is also its value, so `let u = U;`
+    /// is legal; it lowers to a zero-sized `StructLit`.
+    unit_structs: std::collections::HashSet<String>,
     /// Anonymous structs introduced by tuple *types*, keyed by the canonical
     /// name `ast::tuple_struct_name` produces. A tuple is lowered to a struct
     /// (element `k` is field `"k"`), so it reuses the whole struct path through
@@ -285,6 +296,8 @@ impl Parser {
             const_chars: std::collections::HashMap::new(),
             const_narrow: std::collections::HashMap::new(),
             struct_fields: std::collections::HashMap::new(),
+            struct_ctors: std::collections::HashMap::new(),
+            unit_structs: std::collections::HashSet::new(),
             tuple_structs: std::collections::HashSet::new(),
             tuple_defs: Vec::new(),
             std_mods: {
@@ -666,6 +679,20 @@ impl Parser {
                         if let Some(n) = name {
                             self.struct_fields.insert(n, fields);
                         }
+                    } else if self.peek() == Some(&Tok::LParen) {
+                        // A tuple struct `struct P(T, T);`: record its field
+                        // count so a later `P(a, b)` call and a `P(x, y)`
+                        // pattern are recognised. A unit struct `struct U;` has
+                        // no constructor and is left out.
+                        let count = self.skip_tuple_struct_fields()?;
+                        if let Some(n) = name {
+                            self.struct_ctors.insert(n, count);
+                        }
+                    } else if self.peek() == Some(&Tok::Semi) {
+                        // A unit struct `struct U;`: its name is also its value.
+                        if let Some(n) = name {
+                            self.unit_structs.insert(n);
+                        }
                     } else {
                         self.skip_balanced(Tok::LBrace, Tok::RBrace)?;
                     }
@@ -893,6 +920,36 @@ impl Parser {
         Err(format!("at byte {}: unexpected end of input", self.pos()))
     }
 
+    /// Skip a tuple struct's field list `(T, T, ..)`, counting the fields, with
+    /// the opening `(` current and the closing `)` and the `;` left current.
+    /// Used by the prescan, which only needs the count. A field may carry its
+    /// own `pub`, which is skipped.
+    fn skip_tuple_struct_fields(&mut self) -> PResult<usize> {
+        self.i += 1; // the `(`
+        let mut count = 0usize;
+        while self.peek() != Some(&Tok::RParen) {
+            if self.peek().is_none() {
+                return Err(format!("at byte {}: unexpected end of input", self.pos()));
+            }
+            self.skip_pub()?;
+            // A field type may itself contain parentheses (`(i64, i64)`), so
+            // skip a balanced group rather than a bare token.
+            if self.peek() == Some(&Tok::LParen) {
+                self.skip_balanced(Tok::LParen, Tok::RParen)?;
+            } else if self.peek() == Some(&Tok::LBracket) {
+                self.skip_balanced(Tok::LBracket, Tok::RBracket)?;
+            } else {
+                self.i += 1;
+            }
+            count += 1;
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(Tok::RParen)?;
+        Ok(count)
+    }
+
     /// `const NAME: TYPE = EXPR;`. The declared type is resolved by sema; the
     /// value is evaluated here, as soon as it is parsed, so a later array type
     /// or pattern can use it. A value that does not fold yet (it names a
@@ -1104,6 +1161,32 @@ impl Parser {
         self.skip_pub()?;
         self.expect(Tok::Struct)?;
         let name = self.expect_ident()?;
+        // `struct P(T, T);` — a tuple struct. Its fields are stored with
+        // positional names `"0"`, `"1"`, ... so the layout, field read and
+        // destructuring paths treat it exactly like a braced struct; only the
+        // constructor (`P(a, b)`) and the pattern (`P(x, y)`) differ, and the
+        // prescan's `struct_ctors` records which names those are.
+        if self.peek() == Some(&Tok::LParen) {
+            self.i += 1;
+            let mut fields = Vec::new();
+            while self.peek() != Some(&Tok::RParen) {
+                self.skip_pub()?;
+                let fty = self.parse_type()?;
+                fields.push((fields.len().to_string(), fty));
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect(Tok::RParen)?;
+            self.expect(Tok::Semi)?;
+            return Ok(StructDef { name, fields });
+        }
+        // `struct U;` — a unit struct. It has no fields and no constructor
+        // value, but `U` still names the type and a `let _u = U;` is legal, so
+        // it is a zero-sized struct.
+        if self.eat(&Tok::Semi) {
+            return Ok(StructDef { name, fields: Vec::new() });
+        }
         self.expect(Tok::LBrace)?;
         let mut fields = Vec::new();
         while self.peek() != Some(&Tok::RBrace) {
@@ -1291,9 +1374,16 @@ impl Parser {
         // but there `mut` is legal and attaches to `n`.
         let at_pat = matches!(self.peek(), Some(Tok::Ident(_)))
             && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::At);
+        // `P(a, b): T` destructures a tuple struct parameter; the name must be
+        // a known constructor, so a plain `x: T` is unaffected.
+        let tuple_struct_pat = matches!(
+            self.peek(),
+            Some(Tok::Ident(n)) if self.struct_ctors.contains_key(n)
+        ) && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::LParen);
         let pat = if matches!(self.peek(), Some(Tok::LBracket))
             || matches!(self.peek(), Some(Tok::LParen))
             || at_pat
+            || tuple_struct_pat
             || matches!(self.peek(), Some(Tok::Ident(_))
                 if self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::LBrace))
         {
@@ -1840,6 +1930,18 @@ impl Parser {
             {
                 return Err(format!(
                     "at byte {}: identifier `{name}` shadows a constant of the same name",
+                    self.pos()
+                ));
+            }
+            // A binding cannot shadow a struct of any kind (rustc E0530): a
+            // tuple struct's name is a constructor and a unit struct's name is a
+            // value, so `let P = ..` would make `P` ambiguous.
+            if self.struct_ctors.contains_key(name)
+                || self.unit_structs.contains(name)
+                || self.struct_fields.contains_key(name)
+            {
+                return Err(format!(
+                    "at byte {}: identifier `{name}` shadows a struct of the same name",
                     self.pos()
                 ));
             }
@@ -3076,11 +3178,31 @@ impl Parser {
                 // from it. `..` and `f: _` are the only way to drop fields.
                 let struct_pat = matches!(self.peek(), Some(Tok::Ident(_)))
                     && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::LBrace);
+                // `let P(a, b) = e;` destructures a tuple struct. The name must
+                // be a known constructor, so a plain `let f(x)` (which is not a
+                // pattern) still falls through to the binding path and is
+                // diagnosed there.
+                let tuple_struct_pat = matches!(
+                    self.peek(),
+                    Some(Tok::Ident(n)) if self.struct_ctors.contains_key(n)
+                ) && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::LParen);
+                // `let Unit = e;` matches a unit struct, whose name is also its
+                // value. A trailing `{` or `(` would make it a (rejected)
+                // braced or tuple pattern instead.
+                let unit_struct_pat = matches!(
+                    self.peek(),
+                    Some(Tok::Ident(n)) if self.unit_structs.contains(n)
+                ) && !matches!(
+                    self.toks.get(self.i + 1).map(|t| &t.tok),
+                    Some(&Tok::LBrace) | Some(&Tok::LParen)
+                );
                 // `let n @ subpat = e;` binds the whole value to `n` and also
                 // destructures it. Detected by the `@` after the name.
                 let at_pat = matches!(self.peek(), Some(Tok::Ident(_)))
                     && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::At);
                 if struct_pat
+                    || tuple_struct_pat
+                    || unit_struct_pat
                     || at_pat
                     || self.peek() == Some(&Tok::LBracket)
                     || self.peek() == Some(&Tok::LParen)
@@ -4730,6 +4852,21 @@ impl Parser {
                         args = Some(self.parse_variant_pat_args()?);
                     }
                     Ok(Pat::Variant(n, variant, args))
+                } else if let Some(&count) = self.struct_ctors.get(&n) {
+                    // `P(a, b)`: a tuple struct pattern. The fields are named
+                    // positionally, so it reuses the struct-pattern path; the
+                    // arity must match the struct exactly.
+                    if self.peek() != Some(&Tok::LParen) {
+                        // A bare tuple struct name is neither a binding nor a
+                        // pattern (rustc E0530: a binding cannot shadow a tuple
+                        // struct, and the name alone is not a valid pattern).
+                        return Err(format!(
+                            "at byte {}: identifier `{n}` is a tuple struct, not a binding",
+                            self.pos()
+                        ));
+                    }
+                    let fields = self.parse_tuple_struct_pat_args(&n, count)?;
+                    Ok(Pat::Struct(n, fields))
                 } else if self.peek() == Some(&Tok::LBrace) {
                     // `S { f, g: h, i: _, .. }`: a struct pattern. Fields may be
                     // written in any order, and each is either a shorthand
@@ -4752,6 +4889,12 @@ impl Parser {
                     };
                     let fields = self.parse_struct_pat_fields(&n, &known)?;
                     Ok(Pat::Struct(n, fields))
+                } else if self.unit_structs.contains(&n) {
+                    // A unit struct's name is its value, so `U` as a pattern is
+                    // a struct pattern that matches the unit struct `U` with no
+                    // fields. It reuses `Pat::Struct`, so sema's `PatCheck`
+                    // verifies the scrutinee really is `U`.
+                    Ok(Pat::Struct(n, Vec::new()))
                 } else if let Some(v) = self.consts.get(&n) {
                     // A bare name that names a constant is that constant's
                     // value, not a fresh binding, exactly as rustc reads it.
@@ -4918,6 +5061,24 @@ impl Parser {
                         ));
                     }
                     Some((false, inner))
+                } else if matches!(
+                    self.peek(),
+                    Some(Tok::Ident(n)) if self.struct_ctors.contains_key(n)
+                ) && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::LParen)
+                {
+                    // `f: P(a, b)` — a nested tuple struct pattern for a
+                    // tuple-struct-typed field; `mut` is rejected, as for any
+                    // nested pattern.
+                    if m {
+                        return Err(format!(
+                            "at byte {}: `mut` is not allowed on a nested pattern",
+                            self.pos()
+                        ));
+                    }
+                    let n = self.expect_ident()?;
+                    let count = self.struct_ctors[&n];
+                    let inner = self.parse_tuple_struct_pat_args(&n, count)?;
+                    Some((false, Pat::Struct(n, inner)))
                 } else if self.peek() == Some(&Tok::LBracket) {
                     // `f: [x, y]` — a nested array pattern for an array-typed
                     // field; `mut` is likewise rejected.
@@ -4992,6 +5153,70 @@ impl Parser {
         self.i += 1; // the `{`
         let fields = self.parse_struct_pat_fields(&name, &known)?;
         Ok(Some(Pat::Struct(name, fields)))
+    }
+
+    /// `(a, b, ..)`: a tuple struct pattern's field list, with the `(` current.
+    /// The fields are named positionally (`"0"`, `"1"`, ...) so the pattern
+    /// reuses the struct-pattern path. `count` is the struct's field count from
+    /// the prescan, so the arity is checked before the fields are read.
+    fn parse_tuple_struct_pat_args(&mut self, n: &str, count: usize) -> PResult<Vec<FieldPat>> {
+        self.i += 1; // the `(`
+        let mut fields: Vec<FieldPat> = Vec::new();
+        while self.peek() != Some(&Tok::RParen) {
+            if self.peek().is_none() {
+                return Err(format!(
+                    "at byte {}: unexpected end of input in tuple struct pattern",
+                    self.pos()
+                ));
+            }
+            let k = fields.len();
+            let m = self.eat(&Tok::Mut);
+            if self.peek() == Some(&Tok::Underscore) {
+                self.i += 1;
+                if m {
+                    return Err(format!(
+                        "at byte {}: `mut` is not allowed on `_`",
+                        self.pos()
+                    ));
+                }
+                // `_` ignores the field, exactly like `f: _` in a braced
+                // pattern: stored as `None`, so no read is emitted for it.
+                fields.push((k.to_string(), None));
+            } else {
+                let p = self.parse_pattern_primary()?;
+                if m && !matches!(p, Pat::Bind(_) | Pat::At(..)) {
+                    return Err(format!(
+                        "at byte {}: `mut` is not allowed here; it attaches to a binding",
+                        self.pos()
+                    ));
+                }
+                fields.push((k.to_string(), Some((m, p))));
+            }
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(Tok::RParen)?;
+        if fields.len() != count {
+            return Err(format!(
+                "at byte {}: tuple struct `{n}` has {count} field(s), but {} were bound",
+                self.pos(),
+                fields.len()
+            ));
+        }
+        // A tuple struct pattern is irrefutable, like a braced struct pattern:
+        // rmc generates no per-field test, so a refutable element (`P(1, x)`) is
+        // rejected rather than mis-bound as an always-true read.
+        if fields
+            .iter()
+            .any(|(_, b)| b.as_ref().map_or(false, |(_, p)| !Self::pat_irrefutable(p)))
+        {
+            return Err(format!(
+                "at byte {}: tuple struct pattern fields must be bindings, `_`, or nested patterns",
+                self.pos()
+            ));
+        }
+        Ok(fields)
     }
 
     /// `[a, b, .., c]`: an array pattern, with the opening `[` already peeked.
@@ -6603,6 +6828,30 @@ impl Parser {
                         }
                     }
                     self.expect(Tok::RParen)?;
+                    // `P(a, b)` names a tuple struct's constructor, not a
+                    // function: it lowers to a `StructLit` whose fields are the
+                    // positional names `"0"`, `"1"`, ... so it reuses the whole
+                    // struct path. The arity is checked here against the prescan.
+                    if let Some(&n) = self.struct_ctors.get(&name) {
+                        if args.len() != n {
+                            return Err(format!(
+                                "at byte {}: tuple struct `{name}` takes {n} field(s) but {} were given",
+                                self.pos(),
+                                args.len()
+                            ));
+                        }
+                        let fields = args
+                            .into_iter()
+                            .enumerate()
+                            .map(|(k, value)| FieldInit {
+                                name: k.to_string(),
+                                offset: 0,
+                                ty: Type::I64,
+                                value,
+                            })
+                            .collect();
+                        return Ok(Expr::StructLit { name, fields, slot: -1 });
+                    }
                     // A call names a nested `fn` if one is in scope, so a nested
                     // `fn` shadows a top-level one of the same name. The rewrite
                     // is to the hoisted function's unique name.
@@ -6618,6 +6867,10 @@ impl Parser {
                     Ok(Expr::Bool(*b))
                 } else if let Some(c) = self.const_chars.get(&name) {
                     Ok(Expr::Char(*c))
+                } else if self.unit_structs.contains(&name) {
+                    // `U` names a unit struct: its value is a fieldless
+                    // `StructLit`, not a variable read.
+                    Ok(Expr::StructLit { name, fields: Vec::new(), slot: -1 })
                 } else {
                     Ok(Expr::Var { name, slot: -1, ty: Type::I64 })
                 }
@@ -6808,7 +7061,10 @@ enum Pat {
     /// `mut` on the pattern as a whole. A struct pattern is irrefutable, so it
     /// has no test: it desugars to the field reads its bindings name (see
     /// `desugar_arm` and `let` destructuring). The struct name is resolved by
-    /// sema, so it may name a struct declared later in the file.
+    /// sema, so it may name a struct declared later in the file. A tuple struct
+    /// pattern `P(a, b)` reuses this node: its fields are the positional names
+    /// `"0"`, `"1"`, ..., and its arity is checked against the prescan when it
+    /// is parsed.
     Struct(String, Vec<FieldPat>),
     /// `[a, b, .., c]`: an array pattern. Each element is a sub-pattern with its
     /// own `mut` flag (`[mut a, b]`); `None` marks the single `..` rest, which

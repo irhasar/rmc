@@ -16,7 +16,7 @@ are no runtime type errors.
 | `[T; N]`     | fixed-size array of `N` `T` elements, where `T` is a scalar, `str`, a reference, a struct, a payload enum or another array |
 | `(A, B)`     | a tuple of the given element types (an aggregate) |
 | `&T` `&mut T`| a reference to a `T` (one word)               |
-| `Name`       | a struct declared with `struct Name { .. }`   |
+| `Name`       | a struct declared with `struct Name { .. }`, `struct Name(T, T);` (a tuple struct) or `struct Name;` (a unit struct) |
 | `Name`       | an enum declared with `enum Name { .. }`      |
 | `Name`       | a `type` alias declared with `type Name = T;` |
 | `()`         | unit, the result of a statement or `main`     |
@@ -77,6 +77,40 @@ change to one does not reach the other. To reuse a
 struct after passing it (as `bump(a)` then reading `a`), annotate it
 `#[derive(Copy, Clone)]` so the same source also compiles with rustc; rmc parses
 and ignores the attribute.
+
+A tuple struct declares its fields positionally and constructs them with a call:
+
+```rust
+struct Pair(i64, i64);
+
+let p: Pair = Pair(3, 4);
+let x: i64 = p.0;                       // fields are named "0", "1", ...
+let y: i64 = p.1;
+let Pair(a, b) = p;                     // positional pattern
+fn sum(Pair(a, b): Pair) -> i64 { a + b }
+```
+
+It lays out and reads exactly like a braced struct with the same field types —
+only the syntax differs — so `p.0` is an ordinary field read and `Pair(a, b)` is
+an ordinary literal. A one-field tuple struct (`struct Meters(i64);`) and a
+tuple struct nested in another field or destructured through one (`S { p: Pair(a, b) }`)
+both work.
+
+A unit struct declares no fields; its name is also its value, so `U` is a
+zero-sized value that can be bound and matched:
+
+```rust
+struct Unit;
+
+let u: Unit = Unit;
+let Unit = u;                           // matches the unit struct
+```
+
+Unlike a tuple struct, a unit struct's bare name is a valid *pattern* as well as
+a value; unlike an empty braced struct (`struct E {}`, constructed `E {}`), it is
+named by `U` alone. As in rustc, a `let` binding may not shadow a struct of any
+kind (a tuple struct's name is a constructor and a unit struct's name is a
+value), so `let Pair = 5;` and `let Unit = 5;` are rejected.
 
 ## Methods
 
@@ -452,6 +486,8 @@ let [a, b] = arr;        // array destructuring: bind `a` = arr[0], `b` = arr[1]
 let [x, _, .., z] = arr; // `_` ignores an element, `..` absorbs the middle
 let [mut a, b] = arr;    // per-element `mut`, optional annotation
 let S { a: [x, y], b } = s; // array-typed field destructured in place
+let Pair(a, b) = p;      // tuple-struct destructuring: bind `a` = p.0, `b` = p.1
+let Unit = u;            // unit-struct pattern: matches the unit struct `Unit`
 let _ = e;               // discard: evaluate `e` for side effects, bind nothing
 let _: T;                // annotated discard, no initialiser (a no-op)
 y = y + 1;               // assignment (target may be a variable, array element or field)
@@ -502,6 +538,9 @@ rejected (`mut` must be attached to each individual binding, as in rustc).
 A struct-typed field may be destructured by a nested sub-pattern
 (`let S { a: I { x } } = e;`), and an array-typed field by an array pattern
 (`let S { a: [x, y], b } = e;`); see Struct patterns for the full field grammar.
+A tuple struct is destructured positionally (`let Pair(a, b) = p;`, or nested as
+`let S { p: Pair(a, b) } = s;`), binding field `"0"`, `"1"`, ... in order, and a
+unit struct matches by its bare name (`let Unit = u;`).
 A `let [a, b, .., c] = e;` destructures an array the same way: each named element
 is bound as a fresh local in the enclosing block, the scrutinee is evaluated
 exactly once, and a type annotation after the pattern (`let [x, y]: [i64; 2] =
@@ -731,7 +770,11 @@ compile-time constant is decided at compile time, not by the trap.
   enum section). A wrong field name is an error,
   even for `i: _`, and a field bound twice is an error. Because a struct pattern
   is irrefutable, a *binding* struct pattern in an or-pattern is rejected, as is
-  any binding alternative (a nested binding counts).
+  any binding alternative (a nested binding counts). A tuple struct pattern
+  `P(a, b)` reuses the same machinery with positional fields `"0"`, `"1"`, ...;
+  its arity must equal the struct's field count, and a bare tuple-struct name is
+  neither a binding nor a pattern. A unit struct's name is itself a pattern
+  (`U`, binding nothing), since its name is also its value.
 - At-bindings: `name @ subpat` binds the whole value to `name` and also matches
   it against `subpat`, so the arm body (or the rest of the block) sees both the
   whole value and the sub-pattern's bindings. `name @ _` is the plain alias, and
@@ -972,8 +1015,8 @@ error, since rmc compiles a single file and cannot resolve it.
 
 ## Not supported
 
-Traits, generics, borrowing, lifetimes, modules, closures, tuple structs
-(`struct S(i64, i64)`), raw string literals (`r".."`), `f32`/`f64`, and the
+Traits, generics, borrowing, lifetimes, modules, closures,
+raw string literals (`r".."`), `f32`/`f64`, and the
 standard library beyond the two `std` paths above and the `Vec` shims. The
 integer widths (`u8`/`i8`/.../`u64`/`i64`/`usize`/`isize`) exist, but only as a
 value's width: a `let x: u8` binding and a `200u8` literal carry their width

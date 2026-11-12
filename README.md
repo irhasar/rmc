@@ -182,8 +182,11 @@ head, a refutable `n @ 1..=5` in a `match` arm and an `if let`, and `n @ _` /
 `mut n @ _` parameters), `tuple` for
 tuples (construction, `.0` element access, destructuring in a `let`, a `match`
 arm and a parameter, nesting, a tuple-typed struct field, an array of tuples,
-and a tuple behind a reference, used as parameter and return types), `nestedfn`
-for nested `fn` items (hoisting, a call before the declaration, a sibling called
+and a tuple behind a reference, used as parameter and return types), `tuplestruct` for
+tuple structs (construction `P(a, b)`, positional `.0` access, a `let`/`match`/`for`
+destructuring, a parameter pattern, one-field and unit structs, a tuple struct
+nested in a struct field and destructured through it, and a nested array
+pattern), `nestedfn` for nested `fn` items (hoisting, a call before the declaration, a sibling called
 after it, a nested `fn` inside another body, a nested `fn` shadowing a top-level
 one of the same name, and the shadowed name called to confirm the inner one
 wins), `typealias` for `type` aliases (a scalar, tuple, array and struct alias,

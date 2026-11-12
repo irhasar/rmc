@@ -605,6 +605,98 @@ fn a_nested_struct_sub_pattern_may_be_deep() {
 }
 
 #[test]
+fn a_tuple_struct_constructs_and_reads_by_position() {
+    // `struct P(i64, i64);` stores its fields under the positional names `"0"`
+    // and `"1"`, so `P(a, b)` is a `StructLit` and `p.0` / `p.1` are ordinary
+    // field reads. It must compile to the same code as the braced form.
+    let tuple = "struct P(i64, i64); \
+                 fn f(p: &P) -> i64 { return p.0 * 10 + p.1; } \
+                 fn main() -> i64 { let p: P = P(1, 2); return f(&p); }";
+    let braced = "struct P { x: i64, y: i64 } \
+                  fn f(p: &P) -> i64 { return p.x * 10 + p.y; } \
+                  fn main() -> i64 { let p: P = P { x: 1, y: 2 }; return f(&p); }";
+    assert_eq!(asm(tuple), asm(braced));
+}
+
+#[test]
+fn a_tuple_struct_pattern_binds_its_fields() {
+    // `P(a, b)` is a pattern for the positional fields, and an ignored field
+    // (`_`) emits no read.
+    let src = "struct P(i64, i64); \
+               fn main() -> i64 { let p: P = P(3, 4); \
+               let P(a, _) = p; return a; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_tuple_struct_pattern_with_the_wrong_arity_is_rejected() {
+    let err = compile_to_asm(
+        "struct P(i64, i64); fn main() -> i64 { let p: P = P(1, 2); let P(a) = p; return a; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("field(s)"), "got: {err}");
+}
+
+#[test]
+fn a_tuple_struct_constructor_with_the_wrong_arity_is_rejected() {
+    let err = compile_to_asm(
+        "struct P(i64, i64); fn main() -> i64 { let p: P = P(1); return 0; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("field(s)"), "got: {err}");
+}
+
+#[test]
+fn a_bare_tuple_struct_name_is_not_a_binding() {
+    // rustc E0530: a binding cannot shadow a tuple struct.
+    let err = compile_to_asm(
+        "struct P(i64); fn main() -> i64 { let P = 5; return P; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("shadows a struct"), "got: {err}");
+}
+
+#[test]
+fn a_tuple_struct_pattern_field_must_be_irrefutable() {
+    // rmc generates no per-field test, so `P(1, x)` is rejected rather than
+    // silently mis-bound.
+    let err = compile_to_asm(
+        "struct P(i64, i64); fn main() -> i64 { let p: P = P(1, 2); let P(1, x) = p; return x; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("bindings"), "got: {err}");
+}
+
+#[test]
+fn a_unit_struct_is_a_zero_sized_value() {
+    // `struct U;` makes `U` both a type and its own value; `let u = U;` and the
+    // matching pattern `let U = u;` are both accepted.
+    let src = "struct U; fn make() -> U { U } \
+               fn main() -> i64 { let u: U = U; let U = u; let U = make(); return 0; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_tuple_struct_parameter_pattern_binds_by_position() {
+    let src = "struct P(i64, i64); \
+               fn add(P(a, b): P) -> i64 { return a + b; } \
+               fn main() -> i64 { return add(P(4, 5)); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_nested_tuple_struct_sub_pattern_binds_through_the_field() {
+    let src = "struct P(i64, i64); struct S { p: P } \
+               fn main() -> i64 { let s: S = S { p: P(7, 8) }; \
+               let S { p: P(a, b) } = s; return a * 10 + b; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
 fn a_nested_struct_sub_pattern_with_an_unknown_struct_is_rejected() {
     let err = compile_to_asm(
         "struct I { x: i64 } struct S { a: I } \

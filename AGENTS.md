@@ -245,6 +245,23 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   struct (`tuple_struct_for` introduces the layout if the parser did not). An
   element is written `.0`, `.1`, ...: `parse_postfix` accepts a decimal literal
   after `.` as the field name.
+  *Tuple structs* `struct P(T, T);` are a second way to write a struct: the
+  fields are stored with the positional names `"0"`, `"1"`, ..., so layout, the
+  field read `p.0`, and the destructuring paths treat it exactly like a braced
+  struct, and sema and codegen gain no case. Only the constructor and the
+  pattern differ, so the prescan records the name and field count in
+  `struct_ctors` (a unit struct `struct U;` goes in `unit_structs` instead, since
+  its name is also its value). A call `P(a, b)` in `parse_primary` becomes a
+  `StructLit` (arity checked against `struct_ctors`), and the pattern
+  `P(a, b)` in `parse_pattern_primary` becomes the existing `Pat::Struct` with
+  positional field names, so `struct_pat_binds` desugars it to the same chain of
+  field reads. The shared `parse_tuple_struct_pat_args` helper reads the field
+  list (used at the top level, in a `let`, in a parameter via `parse_param`, and
+  as a nested field sub-pattern `f: P(a, b)`); it checks the arity and rejects a
+  refutable element, as the braced path does. A unit struct's bare name `U` is a
+  fieldless `StructLit` in a value position and a fieldless `Pat::Struct` in a
+  pattern position. `reject_const_shadow` rejects a `let` binding that shadows
+  any struct name (rustc's E0530), which covers `let P = ..` and `let U = ..`.
   *At-bindings* `name @ subpat` bind the whole value to `name` and also match it
   against `subpat`. `Pat::At(String, bool, Box<Pat>)` is parsed by
   `parse_pattern_primary` (an identifier followed by `@`), so it is reachable in
