@@ -2466,6 +2466,38 @@ prefix first. Regression: `tests/mir/modrelpath.rs` (reads `1 5` instead of
 `1 13` without the per-body pass). The inliner masks this: the callee needs a
 large body (or `#[inline(never)]`) to be emitted at all.
 
+### A masked index's bounds check is dropped, and the index is promoted anyway
+
+`table[i & 255]` with `table: [i64; 256]` keeps a `cmp`/`jge` on every
+iteration: the bounds `assert(i & 255 < 256)` is provably true. `AssertFacts`
+gained two facts to see that -- `masked` (`d = x & M` puts `d` in `[0, M]`, and
+a widening `IntToInt` cast carries the bound along) and `lt` (`b = x < LEN`) --
+and `drop_redundant_asserts` drops the assert when the index's bound is below
+the length. Both facts survive a join only when the two sides agree exactly.
+
+Dropping the assert leaves the index with a *single* textual use, and the
+register allocator's two-use threshold then spilled it, which ate the whole win
+(the assert is one branch per iteration; a spilled index is a load plus a store).
+The fix is in the same change: a local used as an array index is promoted with
+one use when it is read inside a loop. Every other local keeps the two-use rule,
+so `fib`'s `n - 1`/`n - 2` temporaries still fold into `lea` and do not take a
+register and a spill -- relaxing the threshold globally cost `fib` 22 -> 31 ms.
+
+`light` run_wall went 0.85 -> 1.11 against LLVM on this change alone.
+
+### The `hello` compile-RSS tie is rustc's, not rmc's
+
+The whole-pipeline compile-RSS axis is a tie overall (mean 0.99), but `hello`
+reads 0.97: rustc's `--emit=mir` front end peaks ~3.5 MB above `--emit=obj` on
+the same source (84.6 vs 81.2 MB), and that dominates the pipeline peak because
+`rmcmir` (3.4 MB) is far below `ld` (4.9 MB). The direction is data-dependent --
+`fib` is the other way (MIR front end *below* LLVM's) -- so it is not a
+systematic penalty. No front-end flag combination closes it: `opt-level=1`/`0`
+and `mir-opt-level=1`/`2` shave 0.5-1 MB but make `light` uncompilable
+(`const LEN`/`wrapping_mul` leak through to rmc's parser), and `-Z embed-metadata=no`
+is a no-op for `--emit=mir`. The `light`/`fib` asymmetry is why the axis is
+reported per program rather than hidden behind the mean.
+
 ## Pushing
 
 `git push origin <branch>` needs a token with `contents: write`. The
