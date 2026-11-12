@@ -6737,10 +6737,9 @@ fn an_immediate_field_accumulation_is_64_bit() {
 #[test]
 fn a_vec_i64_pointer_add_steps_whole_elements() {
     // `add(off)` advances by `off` elements, so a `Vec<i64>` pointer steps eight
-    // bytes per unit: `base.add(3)` is `base + 3 * 8`. The scaling `lea` is
-    // emitted once for the allocation size (`n * 8`) and once more for the
-    // offset, so two of them appear; the offset add then takes a register
-    // operand rather than the immediate `3`.
+    // bytes per unit: `base.add(3)` is `base + 3 * 8`, one scaling `lea`. The
+    // vector's own allocation is inside `__rmc_vec_repeat`, so only the offset
+    // scaling appears in `main`.
     let out = asm_no_inline(
         "fn main() -> i64 { \
              let v: Vec<i64> = vec![0i64; 8]; \
@@ -6752,7 +6751,7 @@ fn a_vec_i64_pointer_add_steps_whole_elements() {
     let body = &out[out.find("main:").expect("main")..];
     assert_eq!(
         body.matches("lea 0(,%rax,8), %rax").count(),
-        2,
+        1,
         "expected the offset to be scaled by eight:\n{body}"
     );
     assert!(body.contains("add %rcx, %rax"), "expected the scaled add:\n{body}");
@@ -8176,28 +8175,39 @@ fn a_plain_reversed_range_does_not_form_the_span_count() {
 
 #[test]
 fn a_vec_list_literal_compiles_and_stores_each_element() {
-    // `vec![a, b, c]` allocates one slot per element and stores each, so the
-    // lowered code holds one `alloc` call and one store per element rather than
-    // rejecting the form.
+    // `vec![a, b, c]` builds a vector of exactly three elements: one
+    // `__rmc_vec_new(3, 8)` reserves the store with capacity three, then one
+    // `__rmc_vec_push` per element fills it without ever growing.
     let out = asm("fn main() { let v: Vec<i64> = vec![11, 22, 33]; let _ = v.len(); }");
-    assert_eq!(out.matches("call alloc").count(), 1, "one allocation:\n{out}");
-    // Three element stores reach memory, one per element.
-    let stores = out.lines().filter(|l| l.trim_start().starts_with("mov %rax, (")).count();
-    assert_eq!(stores, 3, "each element is stored once:\n{out}");
-    assert_eq!(out.matches("add $0, %rax").count(), 1, "the first store is at the base");
-    assert!(out.contains("add $8, %rax"), "the second store steps one word:\n{out}");
-    assert!(out.contains("add $16, %rax"), "the third store steps two words:\n{out}");
+    assert_eq!(out.matches("call __rmc_vec_new").count(), 1, "one allocation:\n{out}");
+    assert_eq!(
+        out.matches("call __rmc_vec_push").count(),
+        3,
+        "each element is pushed once:\n{out}"
+    );
+    assert!(out.contains("mov $3, %rdi"), "capacity three is reserved:\n{out}");
+    for v in ["$11", "$22", "$33"] {
+        assert!(out.contains(v), "element {v} is materialised:\n{out}");
+    }
 }
 
 #[test]
 fn a_vec_list_literal_reads_back_its_elements() {
-    // A byte element list allocates one byte per element (three bytes, not
-    // three words), so `vec![7u8, 8u8, 9u8]` requests three bytes.
+    // A byte element list reserves one byte per element (three bytes, not three
+    // words), so `vec![7u8, 8u8, 9u8]` asks `__rmc_vec_new` for capacity three at
+    // width one.
     let bytes = asm("fn main() { let v: Vec<u8> = vec![7u8, 8u8, 9u8]; let _ = v.len(); }");
-    assert_eq!(bytes.matches("call alloc").count(), 1, "one allocation:\n{bytes}");
-    assert!(bytes.contains("mov $3, %rax"), "three bytes are requested:\n{bytes}");
-    assert!(!bytes.contains("mov $24, %rax"), "a byte list is not word-sized:\n{bytes}");
-    // The empty list with a type annotation is valid Rust and folds to length 0.
+    assert_eq!(bytes.matches("call __rmc_vec_new").count(), 1, "one allocation:\n{bytes}");
+    assert!(bytes.contains("mov $3, %rdi"), "capacity three:\n{bytes}");
+    assert!(bytes.contains("mov $1, %rsi"), "a byte element has width one:\n{bytes}");
+    // The `main` body reserves capacity three at width one, not three words.
+    let body = &bytes[bytes.find("main:").expect("main")..];
+    assert!(
+        body.contains("mov $1, %rsi"),
+        "the byte list's element width is one:\n{body}"
+    );
+    // The empty list with a type annotation is valid Rust and builds a
+    // zero-length, zero-capacity vector.
     assert!(compile_to_asm(
         "fn main() { let v: Vec<i64> = vec![]; let _ = v.len(); }",
         &CompileOptions::default()
@@ -8207,19 +8217,17 @@ fn a_vec_list_literal_reads_back_its_elements() {
 #[test]
 fn a_vec_list_element_that_shadows_the_binding_reads_the_outer_value() {
     // `let x = 5; let x: Vec<i64> = vec![x];` must store the outer `x` (5), not
-    // the allocation address: the initializer is evaluated before the new
-    // binding enters scope. When an element names the binding being defined,
-    // each element is evaluated into a temporary first.
+    // the new vector: the initializer is evaluated before the new binding enters
+    // scope. When an element names the binding being defined, each element is
+    // evaluated into a temporary first, then pushed.
     let out = asm("fn main() { let x = 5; let x: Vec<i64> = vec![x, x + 1]; let _ = x.len(); }");
-    assert!(out.contains("call alloc"), "the list allocates:\n{out}");
-    // The element values 5 and 6 are materialised and stored, not the address
-    // the allocator returned; the diff case `veclist.rs` checks the values.
+    assert!(out.contains("call __rmc_vec_new"), "the list allocates:\n{out}");
+    // The element values 5 and 6 are materialised and pushed, not the vector
+    // address the allocator returned; the diff case `veclist.rs` checks the
+    // values.
     assert!(out.contains("$5") && out.contains("$6"), "values materialised:\n{out}");
-    assert!(
-        out.matches("(%rax)").count() >= 2,
-        "each element is stored to the allocation:\n{out}"
-    );
-    // The common case stores each element directly, with no temporary.
+    assert_eq!(out.matches("call __rmc_vec_push").count(), 2, "one push per element:\n{out}");
+    // The common case pushes each element directly, with no temporary.
     let plain = asm("fn main() { let v: Vec<i64> = vec![11, 22]; let _ = v.len(); }");
     assert!(
         !plain.contains("\u{0}vt"),
@@ -8230,12 +8238,85 @@ fn a_vec_list_element_that_shadows_the_binding_reads_the_outer_value() {
 #[test]
 fn vec_new_consumes_its_closing_paren_and_folds_to_zero() {
     // `Vec::new()` takes no argument; the parser must consume the `)` or the
-    // statement ends early. It folds to a zero-length, zero-capacity binding
-    // (the lowered `alloc(0)`), so `v.len()` is 0 with no allocation count to
-    // read back.
+    // statement ends early. It builds a zero-length, zero-capacity vector
+    // (`__rmc_vec_new(0, 8)`), so `v.len()` reads back 0.
     let out = asm("fn main() { let v: Vec<i64> = Vec::new(); let _ = v.len(); }");
-    assert_eq!(out.matches("call alloc").count(), 1, "one allocation:\n{out}");
-    assert!(out.contains("mov $0, %rax"), "the length is zero:\n{out}");
+    assert_eq!(out.matches("call __rmc_vec_new").count(), 1, "one allocation:\n{out}");
+    assert!(out.contains("mov $0, %rdi"), "capacity zero:\n{out}");
+    assert!(out.contains("call __rmc_vec_len"), "the length is a runtime read:\n{out}");
+}
+
+#[test]
+fn vec_len_and_capacity_are_runtime_reads() {
+    // `len()`/`capacity()` are not folded to constants: both read the header
+    // through the runtime helpers, so they stay correct after a `push` grows the
+    // vector. The element width is not needed for a read.
+    let out = asm(
+        "fn main() { \
+             let v: Vec<i64> = vec![0i64; 3]; \
+             let _ = v.len(); \
+             let _ = v.capacity(); \
+         }",
+    );
+    assert!(out.contains("call __rmc_vec_len"), "len reads the length:\n{out}");
+    assert!(out.contains("call __rmc_vec_cap"), "capacity reads the capacity:\n{out}");
+}
+
+#[test]
+fn vec_push_calls_the_grow_helper_and_writes_the_address_back() {
+    // `v.push(x)` lowers to `__rmc_vec_push(v, x, width)`, which can move the
+    // store; its result (the new address) is stored back into `v`, so the call
+    // result is the assignment value.
+    let out = asm("fn main() { let mut v: Vec<i64> = Vec::new(); v.push(7); }");
+    assert!(out.contains("call __rmc_vec_push"), "push calls the helper:\n{out}");
+    assert!(out.contains("mov $7, %rax"), "the value is materialised:\n{out}");
+    assert!(out.contains("mov $8, %rax"), "the element width is eight:\n{out}");
+}
+
+#[test]
+fn vec_index_is_scaled_pointer_arithmetic() {
+    // `v[i]` on a `Vec<i64>` is `*(v + i * 8)`, one scaling `lea` and a load,
+    // not a method call.
+    let out = asm("fn main() { let v: Vec<i64> = vec![1, 2, 3]; let _ = v[2]; }");
+    assert!(out.contains("lea 0(,%rax,8), %rax"), "the index scales by eight:\n{out}");
+    assert!(out.contains("(%rax)"), "the element is loaded through the address:\n{out}");
+}
+
+#[test]
+fn for_over_a_vec_reference_indexes_the_store() {
+    // `for x in &v` reads the length at runtime and indexes the store, so the
+    // bound is the live length and a `*x` reads the element in place.
+    let out = asm(
+        "fn main() { \
+             let v: Vec<i64> = vec![10, 20]; \
+             let mut s = 0; \
+             for x in &v { s += *x; } \
+             let _ = s; \
+         }",
+    );
+    assert!(out.contains("call __rmc_vec_len"), "the bound is the runtime length:\n{out}");
+    assert!(out.contains("lea 0(,%rax,8), %rax"), "the element index scales:\n{out}");
+}
+
+#[test]
+fn for_by_value_over_a_vec_binds_the_address_once() {
+    // `for x in v` binds the vector's address to a hidden local before the loop,
+    // so the bound is fixed for the whole iteration.
+    let out = asm(
+        "fn main() { \
+             let v: Vec<i64> = vec![1, 2, 3]; \
+             let mut s = 0; \
+             for x in v { s += x; } \
+             let _ = s; \
+         }",
+    );
+    assert!(out.contains("call __rmc_vec_len"), "the bound is the runtime length:\n{out}");
+    // Only the three pushes that build the literal, none from the loop.
+    assert_eq!(
+        out.matches("call __rmc_vec_push").count(),
+        3,
+        "the loop adds no push:\n{out}"
+    );
 }
 
 #[test]

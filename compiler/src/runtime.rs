@@ -922,6 +922,184 @@ free:
     Piece {
         text: r#"
 .text
+# ---- growable `Vec<T>` helpers ----
+# A `Vec<T>` value is the address of its element store, exactly as before, so
+# `.as_ptr()`/`.add(off)` and element indexing stay plain pointer arithmetic.
+# The length and capacity live in a 16-byte header just *before* that address:
+# `[data-16]` is the length and `[data-8]` the capacity, both in elements. This
+# keeps `Vec` a bare word while letting `push` grow it, and it needs no static
+# element type at the use site: the element width travels as an argument, as it
+# does for `add`/`free`.
+#
+# rdi = capacity, rsi = element width  ->  rax = data address
+.globl __rmc_vec_new
+.type __rmc_vec_new, @function
+__rmc_vec_new:
+    push %rbx
+    push %r12
+    push %r13
+    sub $8, %rsp              # keep %rsp 16-byte aligned at the `call`
+    mov %rdi, %r12            # capacity
+    mov %rsi, %r13            # element width
+    mov %r12, %rdi
+    imul %r13, %rdi           # bytes = capacity * width
+    add $16, %rdi             # plus the length/capacity header
+    call alloc
+    mov %rax, %rbx
+    movq $0, (%rbx)           # length = 0
+    mov %r12, 8(%rbx)         # capacity
+    lea 16(%rbx), %rax        # the value is the element store
+    add $8, %rsp
+    pop %r13
+    pop %r12
+    pop %rbx
+    ret
+.size __rmc_vec_new, .-__rmc_vec_new
+
+# rdi = count, rsi = value, rdx = element width  ->  rax = data address.
+# `vec![value; count]`: a fresh vector of `count` copies, length == capacity.
+.globl __rmc_vec_repeat
+.type __rmc_vec_repeat, @function
+__rmc_vec_repeat:
+    push %rbx
+    push %r12
+    push %r13
+    push %r14
+    push %r15
+    sub $8, %rsp
+    mov %rdi, %r12            # count
+    mov %rsi, %r13            # value
+    mov %rdx, %r14            # element width
+    mov %r12, %rdi
+    imul %r14, %rdi
+    add $16, %rdi
+    call alloc
+    mov %rax, %rbx
+    mov %r12, (%rbx)          # length = count
+    mov %r12, 8(%rbx)         # capacity = count
+    lea 16(%rbx), %r15        # data
+    mov %r15, %rdi
+    mov %r12, %rsi
+    mov %r13, %rdx
+    cmp $8, %r14
+    je .Lvec_rep_word
+    call __rmc_fill_bytes     # a narrow element fills `count` bytes
+    jmp .Lvec_rep_done
+.Lvec_rep_word:
+    call __rmc_fill           # a word element fills `count` words
+.Lvec_rep_done:
+    mov %r15, %rax
+    add $8, %rsp
+    pop %r15
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %rbx
+    ret
+.size __rmc_vec_repeat, .-__rmc_vec_repeat
+
+# rdi = vec, rsi = value, rdx = element width  ->  rax = the (possibly moved)
+# vector. Appends one element, doubling the store when it is full; the first
+# push of an empty vector grows it to a capacity of one.
+.globl __rmc_vec_push
+.type __rmc_vec_push, @function
+__rmc_vec_push:
+    push %rbx
+    push %r12
+    push %r13
+    push %r14
+    push %r15
+    sub $8, %rsp
+    mov %rdi, %rbx            # vec
+    mov %rsi, %r13            # value
+    mov %rdx, %r14            # element width
+    mov -16(%rbx), %r12       # length
+    mov -8(%rbx), %r15        # capacity
+    cmp %r15, %r12
+    jb .Lvec_push_room
+    # Full: double the capacity, but never below Rust's minimum non-zero
+    # capacity (8 elements for a one-byte element, 4 otherwise), matching
+    # `RawVec::grow_amortized`.
+    shl $1, %r15
+    mov $4, %rax
+    cmp $1, %r14
+    jne .Lvec_push_min
+    mov $8, %rax
+.Lvec_push_min:
+    cmp %rax, %r15
+    jae .Lvec_push_have_cap
+    mov %rax, %r15
+.Lvec_push_have_cap:
+    mov %r15, %rdi
+    imul %r14, %rdi
+    add $16, %rdi
+    call alloc
+    mov %rax, %r9             # new base
+    lea 16(%r9), %r10         # new data
+    mov %rbx, %rsi            # old data
+    mov %r12, %rcx
+    imul %r14, %rcx           # bytes to copy = length * width
+    test %rcx, %rcx
+    jz .Lvec_push_installed
+.Lvec_push_copy:
+    mov (%rsi), %dl
+    mov %dl, (%r10)
+    inc %rsi
+    inc %r10
+    dec %rcx
+    jnz .Lvec_push_copy
+.Lvec_push_installed:
+    mov %r12, (%r9)           # length
+    mov %r15, 8(%r9)          # capacity
+    lea 16(%r9), %rbx         # vec = new data
+.Lvec_push_room:
+    mov %r12, %rax
+    imul %r14, %rax           # offset = length * width
+    add %rbx, %rax
+    cmp $8, %r14
+    je .Lvec_push_word
+    mov %r13b, (%rax)         # a narrow element stores its low byte
+    jmp .Lvec_push_inc
+.Lvec_push_word:
+    mov %r13, (%rax)
+.Lvec_push_inc:
+    inc %r12
+    mov %r12, -16(%rbx)       # length += 1
+    mov %rbx, %rax
+    add $8, %rsp
+    pop %r15
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %rbx
+    ret
+.size __rmc_vec_push, .-__rmc_vec_push
+
+.globl __rmc_vec_len
+.type __rmc_vec_len, @function
+__rmc_vec_len:
+    mov -16(%rdi), %rax
+    ret
+.size __rmc_vec_len, .-__rmc_vec_len
+
+.globl __rmc_vec_cap
+.type __rmc_vec_cap, @function
+__rmc_vec_cap:
+    mov -8(%rdi), %rax
+    ret
+.size __rmc_vec_cap, .-__rmc_vec_cap
+"#,
+        defines: &[
+            "__rmc_vec_new",
+            "__rmc_vec_repeat",
+            "__rmc_vec_push",
+            "__rmc_vec_len",
+            "__rmc_vec_cap",
+        ],
+    },
+    Piece {
+        text: r#"
+.text
 # void __rmc_overflow(void)  -- a checked +,-,* overflowed; write a fixed
 # message and exit with status 101, mirroring a Rust panic.
 .globl __rmc_overflow
