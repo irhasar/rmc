@@ -317,6 +317,17 @@ def gen_expr_program(rng):
     rs.append('    println!("{}", sv.len() as i64);')
     rs.append(f"    let arr: [i64; {n}] = [0; {n}];")
     rs.append('    println!("{}", arr.len() as i64);')
+    # Prefix / suffix / substring searches. Each walks the bytes of the two
+    # records, so a pointer compare or a wrong length bound diverges here. The
+    # small alphabet makes shared prefixes and near-misses common.
+    for _ in range(rng.randint(1, 4)):
+        hay, needle = gen_str_lit(rng), gen_str_lit(rng)
+        m = rng.choice(["starts_with", "ends_with", "contains"])
+        rs.append(f'    println!("{{}}", {hay}.{m}({needle}));')
+    for _ in range(rng.randint(1, 2)):
+        needle = gen_str_lit(rng)
+        m = rng.choice(["starts_with", "ends_with", "contains"])
+        rs.append(f'    println!("{{}}", sv.{m}({needle}));')
     rs += ["}"]
     return "\n".join(rs)
 

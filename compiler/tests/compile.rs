@@ -2857,6 +2857,40 @@ fn the_string_helper_is_dropped_when_unused() {
 }
 
 #[test]
+fn str_prefix_and_suffix_methods_lower_to_their_helpers() {
+    // `starts_with`/`ends_with` are byte scans over the two `{len, bytes}`
+    // records, so each lowers to its runtime helper with the receiver and the
+    // argument as the two addresses.
+    let out = asm(
+        "fn main() -> i64 { \
+         let s = \"hello\"; \
+         if s.starts_with(\"he\") { print_i64(1); } \
+         if s.ends_with(\"lo\") { print_i64(2); } \
+         return 0; }",
+    );
+    assert!(out.contains("call __rmc_str_starts"), "prefix helper emitted: {out}");
+    assert!(out.contains("call __rmc_str_ends"), "suffix helper emitted: {out}");
+}
+
+#[test]
+fn str_contains_lowers_to_find_compared_against_minus_one() {
+    let out = asm(
+        "fn main() -> i64 { let s = \"hello\"; if s.contains(\"ell\") { return 1; } return 0; }",
+    );
+    assert!(out.contains("call __rmc_str_find"), "find helper emitted: {out}");
+}
+
+#[test]
+fn the_string_search_helpers_are_dropped_when_unused() {
+    // The three helpers are separate pieces, so a program that never searches a
+    // string must not carry any of them.
+    let out = asm("fn main() -> i64 { print_str(\"hi\"); return 0; }");
+    assert!(!out.contains("__rmc_str_starts"), "unused prefix helper dropped: {out}");
+    assert!(!out.contains("__rmc_str_ends"), "unused suffix helper dropped: {out}");
+    assert!(!out.contains("__rmc_str_find"), "unused find helper dropped: {out}");
+}
+
+#[test]
 fn a_string_pattern_matches_by_content() {
     // A `str` scrutinee is a pointer, so a `match` on it must compare bytes,
     // not addresses: `match s { "a" => .. }` has to fire for a `let s = "a"`.

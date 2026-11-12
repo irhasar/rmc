@@ -599,6 +599,126 @@ __rmc_str_len:
     },
     Piece {
         text: r#"
+# long __rmc_str_starts(long s, long pre)  -- 1 when the bytes of `pre` are a
+# prefix of `s`, 0 otherwise. Both are `{len: i64, bytes...}` records, so a
+# prefix is `pre.len <= s.len` and the first `pre.len` bytes equal.
+.globl __rmc_str_starts
+.type __rmc_str_starts, @function
+__rmc_str_starts:
+    mov (%rdi), %r8          # len(s)
+    mov (%rsi), %r9          # len(pre)
+    cmp %r9, %r8
+    jb .Lss_no               # s is shorter than the prefix
+    lea 8(%rdi), %rdi
+    lea 8(%rsi), %rsi
+    xor %rcx, %rcx
+.Lss_loop:
+    cmp %r9, %rcx
+    jae .Lss_yes
+    movzbl (%rdi,%rcx), %eax
+    movzbl (%rsi,%rcx), %edx
+    cmp %edx, %eax
+    jne .Lss_no
+    inc %rcx
+    jmp .Lss_loop
+.Lss_yes:
+    mov $1, %eax
+    ret
+.Lss_no:
+    xor %eax, %eax
+    ret
+.size __rmc_str_starts, .-__rmc_str_starts
+"#,
+        defines: &["__rmc_str_starts"],
+    },
+    Piece {
+        text: r#"
+# long __rmc_str_ends(long s, long suf)  -- 1 when the bytes of `suf` are a
+# suffix of `s`, 0 otherwise. Both are `{len: i64, bytes...}` records, so a
+# suffix is `suf.len <= s.len` and the last `suf.len` bytes equal.
+.globl __rmc_str_ends
+.type __rmc_str_ends, @function
+__rmc_str_ends:
+    mov (%rdi), %r8          # len(s)
+    mov (%rsi), %r9          # len(suf)
+    cmp %r9, %r8
+    jb .Lse_no               # s is shorter than the suffix
+    lea 8(%rdi), %rdi
+    lea 8(%rsi), %rsi
+    mov %r8, %rdx
+    sub %r9, %rdx            # rdx = len(s) - len(suf): the suffix's start
+    xor %rcx, %rcx
+.Lse_loop:
+    cmp %r9, %rcx
+    jae .Lse_yes
+    movzbl (%rdi,%rdx), %eax
+    movzbl (%rsi,%rcx), %r10d
+    cmp %r10d, %eax
+    jne .Lse_no
+    inc %rcx
+    inc %rdx
+    jmp .Lse_loop
+.Lse_yes:
+    mov $1, %eax
+    ret
+.Lse_no:
+    xor %eax, %eax
+    ret
+.size __rmc_str_ends, .-__rmc_str_ends
+"#,
+        defines: &["__rmc_str_ends"],
+    },
+    Piece {
+        text: r#"
+# long __rmc_str_find(long s, long needle)  -- the byte index of the first
+# occurrence of `needle`'s bytes inside `s`, or -1 when absent. Both are
+# `{len: i64, bytes...}` records. An empty needle matches at index 0.
+.globl __rmc_str_find
+.type __rmc_str_find, @function
+__rmc_str_find:
+    mov (%rdi), %r8          # len(s)
+    mov (%rsi), %r9          # len(needle)
+    test %r9, %r9
+    jz .Lsf_zero             # an empty needle is at 0
+    cmp %r9, %r8
+    jb .Lsf_none             # the needle is longer than the haystack
+    lea 8(%rdi), %rdi
+    lea 8(%rsi), %rsi
+    sub %r9, %r8
+    inc %r8                  # last start index: len(s) - len(needle)
+    xor %rcx, %rcx           # i = 0
+.Lsf_outer:
+    cmp %r8, %rcx
+    jae .Lsf_none
+    xor %rdx, %rdx           # j = 0
+.Lsf_inner:
+    cmp %r9, %rdx
+    jae .Lsf_found
+    lea (%rdi,%rcx), %r10
+    movzbl (%r10,%rdx), %eax
+    movzbl (%rsi,%rdx), %r10d
+    cmp %r10d, %eax
+    jne .Lsf_next
+    inc %rdx
+    jmp .Lsf_inner
+.Lsf_next:
+    inc %rcx
+    jmp .Lsf_outer
+.Lsf_found:
+    mov %rcx, %rax
+    ret
+.Lsf_zero:
+    xor %eax, %eax
+    ret
+.Lsf_none:
+    mov $-1, %rax
+    ret
+.size __rmc_str_find, .-__rmc_str_find
+"#,
+        defines: &["__rmc_str_find"],
+    },
+    Piece {
+        text: r#"
 # void print_bool(bool b)  -- prints 0 or 1 followed by a newline
 .globl print_bool
 .type print_bool, @function

@@ -308,7 +308,9 @@ works as an expression), `continue`,
 loop); arithmetic, comparison, bitwise (`!`/`&`/`|`/`^`) and shift (`<<`/`>>`)
 operators; `&&`/`||`; strings (a `str` literal or `str`-typed parameter, return
 or field, compared by content with `==`/`!=`/`<`/`<=`/`>`/`>=`, with `.len()` for
-the byte length); array `.len()` (a compile-time constant); built-in `i64` methods
+the byte length and `.starts_with(t)` / `.ends_with(t)` / `.contains(t)` for
+byte-wise prefix, suffix and substring tests); array `.len()` (a compile-time
+constant); built-in `i64` methods
 (`x.abs()`, `x.signum()`, `x.min(y)`, `x.max(y)`, `x.clamp(lo, hi)`,
 `x.is_positive()`, `x.is_negative()`, `x.div_euclid(y)`, `x.rem_euclid(y)`,
 `x.midpoint(y)`, `x.pow(n)`, `x.wrapping_add(y)`, `x.wrapping_sub(y)`,

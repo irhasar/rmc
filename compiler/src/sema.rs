@@ -219,7 +219,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     // Runtime helpers provided by the freestanding assembly runtime. They are
     // linked in automatically, so they do not appear in the source program.
-    let builtins: [(&str, &[Type], Type); 35] = [
+    let builtins: [(&str, &[Type], Type); 38] = [
         ("print_i64", &[Type::I64], Type::Unit),
         ("print_str", &[Type::Str], Type::Unit),
         ("print_bool", &[Type::Bool], Type::Unit),
@@ -255,6 +255,13 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         ("__rmc_str_lt", &[Type::Str, Type::Str], Type::Bool),
         // `str::len`, the record's length word; emitted by sema for `s.len()`.
         ("__rmc_str_len", &[Type::Str], Type::I64),
+        // `str::starts_with` / `str::ends_with`: 1 when the second string is a
+        // prefix / suffix of the first, 0 otherwise; emitted by sema.
+        ("__rmc_str_starts", &[Type::Str, Type::Str], Type::Bool),
+        ("__rmc_str_ends", &[Type::Str, Type::Str], Type::Bool),
+        // `str::find`: the byte index of the first occurrence of the second
+        // string in the first, or -1 when absent; emitted by sema.
+        ("__rmc_str_find", &[Type::Str, Type::Str], Type::I64),
         // `i64::clamp`'s `min > max` trap; emitted by sema for the failure arm.
         // Typed `i64` because it stands in one arm of the desugar's `if`.
         ("__rmc_clamp", &[], Type::I64),
@@ -3764,6 +3771,45 @@ impl Sema {
                             return Ok(Type::I64);
                         }
                         _ => {}
+                    }
+                }
+                // `str::starts_with` / `str::ends_with` / `str::contains`.
+                // Each is a byte scan over the two `{len, bytes}` records, so
+                // it lowers to a runtime helper; the receiver and argument are
+                // the two record addresses. A `&str` receiver is dereferenced
+                // to that word first. `contains` reuses the find helper and
+                // tests its result against -1.
+                if matches!(base_ty, Type::Str) {
+                    let helper = match name.as_str() {
+                        "starts_with" => Some("__rmc_str_starts"),
+                        "ends_with" => Some("__rmc_str_ends"),
+                        "contains" => Some("__rmc_str_find"),
+                        _ => None,
+                    };
+                    if let Some(helper) = helper {
+                        if args.len() != 1 {
+                            return Err(format!("method `{name}` takes one argument"));
+                        }
+                        let arg = std::mem::replace(&mut args[0], Expr::Int(0));
+                        let recv = std::mem::replace(recv.as_mut(), Expr::Int(0));
+                        let recv = if via_ref {
+                            Expr::Deref { expr: Box::new(recv), ty: Type::Str }
+                        } else {
+                            recv
+                        };
+                        let call = Expr::Call {
+                            name: helper.into(),
+                            args: vec![recv, arg],
+                            arg_slots: vec![(-1, 0), (-1, 0)],
+                            ret_slot: -1,
+                            ret_ty: if name == "contains" { Type::I64 } else { Type::Bool },
+                        };
+                        *e = if name == "contains" {
+                            Expr::Bin(BinOp::Ne, Box::new(call), Box::new(Expr::Int(-1)))
+                        } else {
+                            call
+                        };
+                        return self.check_expr(e, scope);
                     }
                 }
                 // Built-in integer methods on an `i64` receiver. They desugar

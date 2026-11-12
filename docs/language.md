@@ -927,6 +927,13 @@ compile-time constant is decided at compile time, not by the trap.
   it reads the record's length word (a runtime helper, since a `str` is a
   pointer), and is an `i64` where rustc's is a `usize`. `a.len()` on an array of
   length `N` is the compile-time constant `N`, with no runtime work.
+  `s.starts_with(t)`, `s.ends_with(t)` and `s.contains(t)` compare the bytes of
+  the two records (each is a runtime helper, since a `str` is a pointer) and
+  yield a `bool`: `starts_with`/`ends_with` test a prefix/suffix, and `contains`
+  tests a substring. An empty `t` is a prefix, a suffix and a substring; a `t`
+  longer than `s` is none of them. These are the `bool`-returning string
+  methods only: `find` (which returns an `Option<usize>`) and the mutating
+  `String` methods are not provided.
 - The type of a string literal is named `str` and may be written wherever a type
   goes: a `let` annotation, a parameter, a return type or a struct field
   (`fn f(s: str) -> str`, `struct M { s: str, n: i64 }`). A `str` is one word, so

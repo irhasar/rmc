@@ -1668,6 +1668,18 @@ The checks, all in `sema.rs`:
   effects (dropped entirely when it is a named local). A user `len` on a struct or
   enum still falls through to the mangled-method path. rmc's `.len()` is `i64`
   where rustc's is `usize`, so a differential twin casts with `as i64`.
+- **`str::starts_with` / `str::ends_with` / `str::contains`.** The other three
+  `bool`-returning string methods, special-cased in the same `MethodCall` arm
+  right after `len`, and only when the receiver's type is `Str` (so a user method
+  of the same name on a struct or enum is untouched). Each lowers to a runtime
+  helper that walks the two `{len, bytes}` records: `__rmc_str_starts` and
+  `__rmc_str_ends` scan the first / last `needle.len` bytes, and `__rmc_str_find`
+  returns the first matching byte index or `-1`, which `contains` tests against
+  `-1`. A `&str` receiver is dereferenced to its one word first, as for `len`.
+  Each helper is its own runtime piece, so a program that never searches a string
+  does not carry one. `find` itself is *not* exposed: rustc types it
+  `Option<usize>`, and rmc has neither, so a bare `s.find(..)` still falls
+  through to the "not a struct or enum" error rather than mis-typing the result.
 - **Built-in `i64` methods
   (`abs`/`min`/`max`/`clamp`/`signum`/`is_positive`/`is_negative`/
   `div_euclid`/`rem_euclid`/`midpoint`/`pow`/`wrapping_add`/`wrapping_sub`/
