@@ -856,6 +856,18 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   names (`rl`/`rh` for the bounds, `ri` for the counter, `rk`/`ra`/`rc`/`rs` for
   the stride, argument, count and length-substitution); the counter is `ri`, not
   `rc`, so it cannot collide with the `c` of the first `skip`/`take`.
+  `step_by`'s count is `ceil(len / k)` built as `len / k + (len % k != 0)`, not
+  `(len + k - 1) / k` (which overflows for a stride near `i64::MAX`) and not
+  `len / k + min(len % k, 1)` (which pulled in `__rmc_min`, and the test asserts
+  `step_by` needs no `min`). A negative *literal* count (`skip(-1)`,
+  `step_by(-1)`) is rejected as a unary `-` on a `usize` (rustc's `E0600`),
+  checked in the forward pass before the adapter's argument runs; a non-literal
+  negative count is left to run time, since rustc accepts it. A *known
+  divergence*: the adapter path computes an inclusive range's element count as
+  `hi - lo + 1`, which overflows `i64` when `hi` is `i64::MAX`
+  (`(n..=i64::MAX).rev()` is rejected while rustc accepts it); the plain path
+  (no adapter) is correct, since its `..=` loop tests `var <= end` without a
+  count.
   `tests/cases/rangeadapt.rs` and `counting_range_adapters_compile` cover the
   chains.
 - **`..=` exits on `jle` back-edge, not `jl`.** The guard is the loop-back
