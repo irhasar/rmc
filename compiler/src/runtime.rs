@@ -301,6 +301,82 @@ exit:
     },
     Piece {
         text: r#"
+# LLVM lowers a wide zero/byte initialisation (`[0i64; 512]`, a large struct
+# literal) to a `memset` call rather than an inline loop, so the same source
+# that rmc compiles to a `rep stos` reaches the linker as an undefined symbol.
+# These are the four `mem*` primitives LLVM emits. They are freestanding (no
+# libc), each kept only when a program names it, so rmc's own output is
+# unchanged and only an LLVM-compiled object pulls them in.
+.globl memset
+.type memset, @function
+memset:
+    mov %rdi, %r8
+    test %rdx, %rdx
+    jle .Lmemset_done
+    mov %rsi, %rax           # `stosb` stores %al
+    mov %rdx, %rcx
+    rep stosb
+.Lmemset_done:
+    mov %r8, %rax            # return the original address
+    ret
+.size memset, .-memset
+
+.globl memcpy
+.type memcpy, @function
+memcpy:
+    mov %rdi, %r8
+    test %rdx, %rdx
+    jle .Lmemcpy_done
+    mov %rdx, %rcx
+    rep movsb
+.Lmemcpy_done:
+    mov %r8, %rax
+    ret
+.size memcpy, .-memcpy
+
+.globl memmove
+.type memmove, @function
+memmove:
+    mov %rdi, %r8
+    test %rdx, %rdx
+    jle .Lmemmove_done
+    cmp %rsi, %rdi
+    jbe .Lmemmove_fwd        # dst <= src: no overlap, copy forwards
+    mov %rdx, %rcx           # dst > src: copy backwards to survive overlap
+    lea -1(%rsi,%rcx), %rsi
+    lea -1(%rdi,%rcx), %rdi
+    std
+    rep movsb
+    cld
+    jmp .Lmemmove_done
+.Lmemmove_fwd:
+    mov %rdx, %rcx
+    rep movsb
+.Lmemmove_done:
+    mov %r8, %rax
+    ret
+.size memmove, .-memmove
+
+.globl memcmp
+.type memcmp, @function
+memcmp:
+    xor %eax, %eax
+    test %rdx, %rdx
+    jle .Lmemcmp_done
+    mov %rdx, %rcx
+    repe cmpsb
+    je .Lmemcmp_done
+    movzbl -1(%rdi), %eax
+    movzbl -1(%rsi), %edx
+    sub %edx, %eax
+.Lmemcmp_done:
+    ret
+.size memcmp, .-memcmp
+"#,
+        defines: &["memset", "memcpy", "memmove", "memcmp"],
+    },
+    Piece {
+        text: r#"
 # void print_i64(long n)  -- decimal value followed by a newline
 .globl print_i64
 .type print_i64, @function
@@ -2915,5 +2991,31 @@ mod tests {
         for p in PIECES {
             assert!(!p.defines.is_empty(), "a piece with no symbols");
         }
+    }
+
+    #[test]
+    fn mem_primitives_are_kept_only_when_named() {
+        // An LLVM-compiled object lowers a wide zero-init to a `memset` call,
+        // so the linker needs these symbols; rmc's own output inlines the loop
+        // and never names them, so its binary must not carry them.
+        let r = for_program("main:\n\tcall memset\n\tcall memcpy\n\tcall memmove\n\tcall memcmp\n\tret\n");
+        for s in ["memset:", "memcpy:", "memmove:", "memcmp:"] {
+            assert!(r.contains(s), "{s} kept when named:\n{r}");
+        }
+        let bare = for_program(".globl main\nmain:\n\tmov $0, %rax\n\tret\n");
+        for s in ["memset:", "memcpy:", "memmove:", "memcmp:"] {
+            assert!(!bare.contains(s), "{s} dropped when unused:\n{bare}");
+        }
+    }
+
+    #[test]
+    fn memmove_copies_backwards_on_an_overlap() {
+        // The overlap direction is a data hazard the linker cannot catch: a
+        // forward `rep movsb` corrupts `dst > src`. The piece must choose the
+        // direction at run time (`cmp`/`jbe`), not unconditionally forward.
+        let r = for_program("main:\n\tcall memmove\n\tret\n");
+        assert!(r.contains("cmp %rsi, %rdi"), "direction compared:\n{r}");
+        assert!(r.contains("std"), "backwards copy uses `std`:\n{r}");
+        assert!(r.contains("cld"), "direction flag cleared:\n{r}");
     }
 }

@@ -80,6 +80,7 @@ tests/
 docs/
   language.md        the supported language subset
   design.md          compiler architecture and code generation notes
+  mir-roadmap.md     rustc-front-end/rmc-back-end: status, limits, roadmap
 ```
 
 ## Building

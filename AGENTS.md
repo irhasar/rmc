@@ -2254,6 +2254,48 @@ round-robin run sampling (`measure_runs`). `bench/run_mir.py` does *not*: its
 its run numbers as indicative and use `run_fair.py` for the apples-to-apples
 claim; the caveat is recorded in its docstring.
 
+### The rustc-front-end / rmc-back-end pipeline: state and gaps
+
+`docs/mir-roadmap.md` is the milestone plan. The measured facts behind it, so a
+future session does not re-derive them by hand:
+
+- **The MIR path is far more capable than its own doc comments say.** Probes
+  (compile + run + diff against a native `rustc -O` twin) show `f64`/`f32`
+  arithmetic and loops, `i128` arithmetic/division/comparison, capturing and
+  non-capturing closures *called directly*, by-value struct/tuple returns,
+  `&mut` through a reference, `impl`/trait static dispatch, slice iterators,
+  `Option`/`Result`, monomorphised generics, and 2-D/array-of-struct all
+  **produce correct results**. But `classify_unsupported` in `mir.rs` still
+  claims "floating-point types are not implemented" and "128-bit integers are
+  not implemented". Trust the probe, not the message; fixing the list is P1.
+- **The real back-end gaps are indirect calls / function pointers and `dyn
+  Trait`.** Closures called directly work (they are inlined by rustc's MIR
+  optimiser), but a closure passed as `impl Fn` becomes an indirect call and
+  `mir_codegen` bails (`indirect call (fn pointer) unsupported`). `Range` as a
+  value (`(0..10).step_by(2)`) hits `aggregate constant not yet materialised`.
+  `Vec`/`Box`/`String` fail earlier, at the front end, because the `#![no_std]`
+  stub has no `alloc`.
+- **LLVM emits `memset` for a wide zero-init; rmc's runtime must provide it.**
+  `bench/mir/light.rs`'s `[0i64; 256]` made LLVM call `memset`, which rmc's
+  freestanding runtime did not define, so `run_fair.py` failed at the link with
+  `undefined reference to memset`. The `mem*` primitives are now runtime pieces
+  (`compiler/src/runtime.rs`), selected only when a program names them, so rmc's
+  own output is byte-identical; they are verified against a C harness and pinned
+  by `runtime::tests`. Any future runtime piece that a *compiler* may emit a
+  call to (not just the user) needs the same treatment.
+- **The honest scoreboard is `run_fair.py`'s "some axes lost", and it is two
+  programs.** Whole-pipeline mean is wall 1.085, cpu 1.120, rss 0.996 (tie),
+  size 18.7, run_wall 1.100, run_cpu 1.109, run_rss 1.306. The losses:
+  `hello` compile wall 0.99 (a tie in noise, shared rustc start-up) and `light`
+  run wall **0.81** (LLVM's generated code really is faster on that kernel — a
+  codegen gap, not an artefact). Back-end-only compile also loses on
+  `refs`/`sieve`/`mandel` (0.83/0.88/0.94): `rmcmir` is slower than `ld` there.
+- **Do not promise "beats LLVM on every axis".** The compile/memory/size axes
+  are structural wins (skip LLVM codegen, link no libc). The run-time axis is
+  not: the back end has no real register allocator, so scheduler-sensitive
+  kernels can lose. `docs/mir-roadmap.md` P3 is the work that closes it.
+
+
 ### Branchless min/max (`cmov`) was tried and rejected
 
 A min/max diamond (`if v > acc { acc = v }`) lowered to a branch; LLVM emits
