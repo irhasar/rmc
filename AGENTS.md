@@ -833,10 +833,25 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   irrefutable: a binding, `_`, or a struct pattern — including a nested
   sub-pattern, which `struct_pat_binds` recurses into like the `let`/`match`
   paths (a refutable pattern like an enum variant is rejected rather than
-  mis-bound). `for x in
-  &arr` is rejected — Rust iterates a reference by reference (`x: &i64`), so
-  accepting it would silently mistype `x`. `parse_for` also checks the pattern
-  name against the constant table *before* `parse_pattern`, because a bare
+  mis-bound). **`for x in &arr` / `for x in &mut arr`** iterates by reference:
+  the element binds to a real `&arr[i]` / `&mut arr[i]`, so `*x` reads and
+  `*x = v` writes the element in place, and the array place is indexed directly
+  (never copied — a `&mut` write reaches the original binding). `parse_for`
+  recognises the `Expr::AddrOf` head and hands the inner place to
+  `desugar_for_array_ref`, which builds `for i in 0..arr.len() { let PAT =
+  &arr[i]; body }`; `is_iterable_place` gates it to a binding or an
+  `Index`/`Field`/`Deref` chain rooted at one, so `&arr[i]` works but a
+  reference to a temporary (`&mk()`, whose head is a `Call`) is rejected rather
+  than mistyped. A `Vec` binding is excluded (`vec_names`) because it is a bare
+  address with no element type to address. The pattern must be a binding or `_`.
+  **`arr.iter()` / `arr.iter_mut()`** are recognised just before the range
+  checks and map to the same `desugar_for_array_ref` with `mutable` false/true.
+  `into_iter` is deliberately *not* accepted: on an array its element type is
+  edition-dependent (by-reference before Rust 2021, by-value after), and rmc has
+  no edition, so a fixed choice would diverge from one of them. `tests/cases/forref.rs`
+  and the by-reference unit tests cover it. `parse_for`
+  also checks the pattern name against the constant table *before*
+  `parse_pattern`, because a bare
   constant name there resolves to its value (not a binding), which would turn
   `for N in 0..3` into an iteration over a literal and lose the E0530 error.
   `tests/cases/forarr.rs` and the `stmt` fuzzer cover it.

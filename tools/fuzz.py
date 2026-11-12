@@ -1138,6 +1138,66 @@ def gen_fordestr_program(rng):
     return "\n".join(rs) + "\n"
 
 
+def gen_forref_program(rng):
+    """`for x in &arr` / `for x in &mut arr`: the loop variable is a reference to
+    the element, so `*x` reads and `*x = v` writes the element in place. The
+    array place is indexed directly (never copied), so a `&mut` write reaches the
+    original binding. Compares the by-reference loop against the equivalent
+    explicit index loop, and a nested `&mut` write against a plain mutation.
+    No other mode emits a by-reference `for`.
+    """
+    b = rng.randint(1, 9)
+    n = rng.choice([1, 2, 3])
+    elems = ", ".join(str(b + i) for i in range(n))
+    kind = rng.choice(["read", "write", "nested", "struct"])
+    rs = ["fn main() {", "    let mut acc: i64 = 0;"]
+    if kind == "struct":
+        rs = [
+            "struct P { x: i64, y: i64 }",
+            "fn main() {",
+            "    let mut acc: i64 = 0;",
+            f"    let ps: [P; {n}] = ["
+            + ", ".join(f"P {{ x: {b + i}, y: {b + i + 10} }}" for i in range(n))
+            + "];",
+        ]
+        if rng.random() < 0.5:
+            # read the fields through the reference
+            rs.append("    for p in &ps { acc += p.x * 10 + p.y; }")
+            rs.append('    println!("{}", acc);')
+            rs.append("}")
+            return "\n".join(rs) + "\n"
+        # write a field through a mutable reference
+        rs.append("    for p in &mut ps { p.x += 100; }")
+        rs.append("    for p in &ps { acc += p.x; }")
+        rs.append('    println!("{}", acc);')
+        rs.append("}")
+        return "\n".join(rs) + "\n"
+    rs.append(f"    let mut a: [i64; {n}] = [{elems}];")
+    # The head spelling: the `&a` / `&mut a` forms, or the equivalent
+    # `a.iter()` / `a.iter_mut()` methods.
+    read_head = rng.choice(["&a", "a.iter()"])
+    write_head = rng.choice(["&mut a", "a.iter_mut()"])
+    if kind == "read":
+        # By-reference read must equal the explicit index read.
+        rs.append(f"    for x in {read_head} {{ acc += *x; }}")
+        rs.append("    for i in 0..a.len() { acc += a[i]; }")
+    elif kind == "write":
+        # `*x += k` through `&mut` must equal mutating the element by index.
+        rs.append(f"    for x in {write_head} {{ *x += {b}; }}")
+        rs.append(f"    for i in 0..a.len() {{ a[i] += {b}; }}")
+        rs.append(f"    for x in {read_head} {{ acc += *x; }}")
+    else:
+        # A nested `&` over an inner array reached by `&a[i]`/`&m[j]`.
+        rs = ["fn main() {", "    let mut acc: i64 = 0;"]
+        rs.append("    let m: [[i64; 2]; 2] = [[%d, %d], [%d, %d]];"
+                  % (b, b + 1, b + 2, b + 3))
+        rs.append("    for row in &m { for x in row { acc += x; } }")
+        rs.append("    for x in &m[1] { acc += *x; }")
+    rs.append('    println!("{}", acc);')
+    rs.append("}")
+    return "\n".join(rs) + "\n"
+
+
 # A chain of struct types for the nested-pattern fuzzer: each entry is
 # `(struct_field_name, struct_field_type, [i64 field names])`. The chain ends at
 # a type with no struct field, so a pattern nests at most `len(CHAIN)` deep.
@@ -3412,7 +3472,7 @@ def gen_typealias_program(rng):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "patshadow", "intmeth", "nestedfn", "typealias", "printfmt", "ptr", "char", "semi", "boolbit", "vis", "localconst", "robust", "reject", "mutate"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "forref", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "patshadow", "intmeth", "nestedfn", "typealias", "printfmt", "ptr", "char", "semi", "boolbit", "vis", "localconst", "robust", "reject", "mutate"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -3459,6 +3519,7 @@ def main():
            "ref": gen_ref_program, "update": gen_update_program,
            "letdestr": gen_letdestr_program,
            "fordestr": gen_fordestr_program,
+           "forref": gen_forref_program,
            "nestpat": gen_nestpat_program,
            "arrpat": gen_arrpat_program,
            "parampat": gen_parampat_program,

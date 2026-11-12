@@ -3089,16 +3089,55 @@ impl Parser {
             }
             return self.desugar_for_argsvec(pat, skip, body?, label);
         }
-        // `for x in &arr` iterates by *reference* in Rust: `x` is `&i64`, not
-        // `i64`. rmc iterates by value, so accepting the `&` form would silently
-        // give `x` the wrong type (and diverge from rustc's typing). Reject it
-        // rather than mis-compile; the by-value form is `for x in arr`.
+        // `for x in &arr` / `for x in &mut arr` iterates by *reference*: `x` is
+        // `&i64` (or `&mut i64`), not `i64`. rmc's `&arr[i]` is a real
+        // reference, so the element binds to `&arr[i]` / `&mut arr[i]`, and the
+        // body's `*x` reads (or `*x = v` writes) the element in place. The array
+        // place is used directly, never copied, so a `&mut` write reaches the
+        // original binding. Only an array is supported; a `Vec` binding is an
+        // address with no addressable element here, and any other head falls
+        // through to the by-value paths below.
+        if let Expr::AddrOf { expr: inner, mutable, .. } = &head {
+            let is_vec = matches!(inner.as_ref(), Expr::Var { name, .. } if self.vec_names.contains(name));
+            if !is_vec && Self::is_iterable_place(inner) {
+                let inner = (**inner).clone();
+                let mutable = *mutable;
+                let body = self.parse_block()?;
+                return self.desugar_for_array_ref(pat, inner, mutable, body, label);
+            }
+        }
         if matches!(head, Expr::AddrOf { .. }) {
             return Err(format!(
                 "at byte {}: `for` over a reference is not supported; \
                  iterate by value with `for x in arr`",
                 self.pos()
             ));
+        }
+        // `for x in arr.iter()` / `.iter_mut()`: the iterator forms of the
+        // array loops above. `iter` yields `&T` and `iter_mut` yields `&mut T`,
+        // so each maps onto the loop rmc already has for `&arr` / `&mut arr`.
+        // `into_iter` is deliberately not accepted: on an array its element type
+        // is edition-dependent (by-reference before Rust 2021, by-value after),
+        // and rmc has no edition, so a fixed choice would diverge from one of
+        // them; the by-value form is spelled `for x in arr`. Only an array place
+        // is supported (a `Vec` binding is excluded, and a non-place receiver
+        // falls through to the by-value path, which reports the unknown method).
+        if let Expr::MethodCall { recv, name, args } = &head {
+            if args.is_empty() {
+                let mutable = match name.as_str() {
+                    "iter" => Some(false),
+                    "iter_mut" => Some(true),
+                    _ => None,
+                };
+                if let Some(m) = mutable {
+                    let is_vec = matches!(recv.as_ref(), Expr::Var { name, .. } if self.vec_names.contains(name));
+                    if !is_vec && Self::is_iterable_place(recv) {
+                        let recv = (**recv).clone();
+                        let body = self.parse_block()?;
+                        return self.desugar_for_array_ref(pat, recv, m, body, label);
+                    }
+                }
+            }
         }
         if self.peek() == Some(&Tok::DotDot) || self.peek() == Some(&Tok::DotDotEq) {
             let inclusive = self.eat(&Tok::DotDotEq);
@@ -3161,6 +3200,87 @@ impl Parser {
                 self.pos()
             )),
         }
+    }
+
+    /// Whether `e` is a place rmc can iterate by reference (`&e`): an array
+    /// binding or a constant index into one (`&a`, `&a[i]`, `&a[i].f`). A `Vec`
+    /// binding is a bare address with no element type to address here, and any
+    /// other shape (a call result, a literal) has no stable place, so it is not
+    /// iterable by reference and the caller falls back to the by-value path.
+    fn is_iterable_place(e: &Expr) -> bool {
+        match e {
+            Expr::Var { .. } => true,
+            Expr::Index(base, _) | Expr::Field { base, .. } => Self::is_iterable_place(base),
+            Expr::Deref { expr, .. } => Self::is_iterable_place(expr),
+            _ => false,
+        }
+    }
+
+    /// `for PAT in &ARR { body }` (or `&mut ARR`): bind the element by reference
+    /// and index the array place directly, so a `&mut` write through `*x`
+    /// reaches the original binding. The loop is `for i in 0..arr.len() { let
+    /// PAT = &arr[i]; body }`, with `&mut arr[i]` when the borrow is mutable.
+    /// Only a binding or `_` pattern is supported, matching the by-value array
+    /// loop's simplest form.
+    fn desugar_for_array_ref(
+        &mut self,
+        pat: Pat,
+        arr: Expr,
+        mutable: bool,
+        body: Block,
+        label: Option<String>,
+    ) -> PResult<Stmt> {
+        let n = self.tmp;
+        self.tmp += 1;
+        let idx_name = format!("\u{0}fi{n}");
+        let idx_var = Expr::Var { name: idx_name.clone(), slot: -1, ty: Type::I64 };
+        let len = Expr::MethodCall {
+            recv: Box::new(arr.clone()),
+            name: "len".to_string(),
+            args: Vec::new(),
+        };
+        // `&arr[i]` / `&mut arr[i]`: the borrow of the indexed place is a real
+        // reference to the element, so `*x` reads and `*x = v` writes it.
+        let elem_ref = Expr::AddrOf {
+            expr: Box::new(Expr::Index(Box::new(arr), Box::new(idx_var))),
+            ty: Type::I64,
+            mutable,
+            slot: -1,
+        };
+        let mut stmts = match pat {
+            Pat::Bind(name) => vec![Stmt::Let {
+                name,
+                ty: None,
+                init: Some(elem_ref),
+                slot: -1,
+                mutable: false,
+            }],
+            Pat::Wild => vec![Stmt::Let {
+                name: format!("\u{0}fd{n}"),
+                ty: None,
+                init: Some(elem_ref),
+                slot: -1,
+                mutable: false,
+            }],
+            _ => {
+                return Err(format!(
+                    "at byte {}: `for` over a reference needs a binding or `_`",
+                    self.pos()
+                ))
+            }
+        };
+        stmts.extend(body.stmts);
+        let loop_body = Block { stmts, tail: body.tail };
+        Ok(Stmt::For {
+            var: idx_name,
+            var_slot: -1,
+            start: Expr::Int(0),
+            end: len,
+            end_slot: -1,
+            inclusive: false,
+            body: loop_body,
+            label,
+        })
     }
 
     /// `for PAT in ARRAY { body }` -> an index loop over the array (see

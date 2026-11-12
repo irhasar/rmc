@@ -272,16 +272,87 @@ fn for_over_an_array_rejects_a_refutable_pattern() {
 }
 
 #[test]
-fn for_over_a_reference_is_rejected() {
-    // `for x in &a` would iterate by reference in Rust; rmc iterates by value,
-    // so it rejects the form rather than silently mistype `x`.
+fn for_over_an_array_by_reference_binds_a_reference_to_each_element() {
+    // `for x in &a` binds `x` to `&a[i]`, so `*x` reads the element; the
+    // desugared loop indexes the array place directly.
+    let src = "fn main() -> i64 { let a: [i64; 3] = [1, 2, 3]; \
+               let mut s: i64 = 0; for x in &a { s = s + *x; } return s; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn for_over_an_array_by_mutable_reference_writes_through() {
+    // `for x in &mut a` binds `&mut a[i]`, so `*x = v` writes the element in
+    // place; the binding is used directly, never copied.
+    let src = "fn main() -> i64 { let mut a: [i64; 3] = [1, 2, 3]; \
+               for x in &mut a { *x = *x * 2; } return a[0] + a[1] + a[2]; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn for_over_an_array_by_reference_indexes_the_array_place() {
+    // The desugared loop indexes the array place with a scaled index (element
+    // stride 8), the same addressing the explicit `&a[i]` form uses. The two
+    // forms are not byte-identical because rmc's frame-slot allocation follows
+    // parse order, so the invariant checked here is the indexed access itself.
+    let src = "fn main() -> i64 { let a: [i64; 3] = [1, 2, 3]; \
+               let mut s: i64 = 0; for x in &a { s = s + *x; } return s; }";
+    let asm = compile_to_asm(src, &CompileOptions::default()).unwrap();
+    assert!(asm.contains(",8)"), "the element is read through a scaled index:\n{asm}");
+}
+
+#[test]
+fn for_over_a_reference_to_a_non_place_is_rejected() {
+    // `&mk()` is a reference to a call result, which has no stable place to
+    // index, so the by-reference loop is not supported and the form is rejected
+    // rather than mis-compiled.
+    let err = compile_to_asm(
+        "fn mk() -> [i64; 3] { return [1, 2, 3]; } \
+         fn main() -> i64 { let mut s: i64 = 0; for x in &mk() { s = s + *x; } return s; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("reference"), "got: {err}");
+}
+
+#[test]
+fn a_reference_element_cannot_be_added_without_a_deref() {
+    // `for x in &a` makes `x` a `&i64`; `s + x` is then a type error, exactly as
+    // rustc rejects it. The rejection is what proves `x` really is a reference.
     let err = compile_to_asm(
         "fn main() -> i64 { let a: [i64; 3] = [1, 2, 3]; \
          let mut s: i64 = 0; for x in &a { s = s + x; } return s; }",
         &CompileOptions::default(),
     )
     .unwrap_err();
-    assert!(err.contains("reference"), "got: {err}");
+    assert!(!err.is_empty(), "got: {err}");
+}
+
+#[test]
+fn for_over_iter_and_iter_mut_are_by_reference() {
+    // `arr.iter()` yields `&T` and `arr.iter_mut()` yields `&mut T`, so each is
+    // the `&arr` / `&mut arr` loop; `into_iter` is not accepted because its
+    // element type is edition-dependent on an array.
+    let opts = CompileOptions::default();
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let a: [i64; 3] = [1, 2, 3]; \
+         let mut s: i64 = 0; for x in a.iter() { s = s + *x; } return s; }",
+        &opts,
+    )
+    .is_ok());
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let mut a: [i64; 3] = [1, 2, 3]; \
+         for x in a.iter_mut() { *x = *x * 2; } return a[0]; }",
+        &opts,
+    )
+    .is_ok());
+    let err = compile_to_asm(
+        "fn main() -> i64 { let a: [i64; 3] = [1, 2, 3]; \
+         let mut s: i64 = 0; for x in a.into_iter() { s = s + x; } return s; }",
+        &opts,
+    )
+    .unwrap_err();
+    assert!(err.contains("into_iter"), "got: {err}");
 }
 
 #[test]

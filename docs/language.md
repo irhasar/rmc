@@ -536,6 +536,10 @@ for i in (0..10).skip(3) { ... }     // drop the first three
 for i in (0..10).take(3) { ... }     // keep only the first three
 for i in (0..10).skip(2).take(3).rev() { ... }  // adapters chain, left to right
 for x in arr { ... }     // array, by value, left to right (x is the element)
+for x in &arr { ... }    // array, by reference (x is &T; `*x` reads the element)
+for x in &mut arr { ... }// array, by mutable reference (`*x = v` writes in place)
+for x in arr.iter() { ... }      // the same as `for x in &arr`
+for x in arr.iter_mut() { ... }  // the same as `for x in &mut arr`
 loop { ... }
 loop { ... break v; }    // `loop` is an expression: `break v` yields `v`
 break;
@@ -603,7 +607,15 @@ iteration. The loop variable may be a binding, `_`, a struct pattern
 (`for S { f, .. } in arr`), an array pattern (`for [x, y] in pairs`), or an
 at-binding (`for n @ _ in arr`, `for i @ j in 0..3`), which binds
 each element's fields or elements fresh each iteration; any other pattern is
-refutable and rejected. A range may be iterated downward with `.rev()`, written
+refutable and rejected. `for x in &arr` iterates the array by *reference*: `x`
+is `&T` (or `&mut T` for `&mut arr`), bound to `&arr[i]`, so `*x` reads the
+element and, through a `&mut`, `*x = v` writes it in place. The array place is
+indexed directly (never copied), and the head must be a place (`&arr`,
+`&arr[i]`, `&arr[i].f`); a reference to a temporary (`&mk()`) is rejected.
+`arr.iter()` and `arr.iter_mut()` are the same loops (`&arr` and `&mut arr`);
+`arr.into_iter()` is not accepted, because on an array its element type is
+edition-dependent. A
+range may be iterated downward with `.rev()`, written
 `for i in (lo..hi).rev()` or `(lo..=hi).rev()`: `lo` and `hi` are evaluated
 once each, the loop yields `hi - 1` down to `lo` (or `hi` down to `lo`
 inclusive), and `continue` still runs the decrement. The parentheses are
@@ -618,8 +630,8 @@ and may chain:
 `(0..10).skip(2).take(3).rev()` reverses the slice `[2, 3, 4]`; each bound is
 evaluated once, and `continue` still runs the counter increment. A count is a
 `usize`, so a negative literal (`skip(-1)`) is rejected, matching rustc's
-`E0600`. `for x in &arr`
-(which Rust iterates by reference) is rejected rather than mistyped. `while let` is
+`E0600`. `for x in &arr` (and `&mut arr`) is supported as above; any other
+reference head (`for x in &mk()`) is rejected rather than mistyped. `while let` is
 `loop { if let PAT = expr { body } else { break; } }`: the scrutinee is
 re-evaluated every iteration, and `continue` re-tests it rather than jumping to
 the top.
