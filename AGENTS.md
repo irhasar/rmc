@@ -2404,6 +2404,21 @@ the backend the same optimised MIR LLVM would see, and rmc lowers it straight
 to a freestanding ELF. `bench/run_codegen.py` compares it to `rustc -O -C
 lto=fat` per program.
 
+- **The backend is x86-64/executable only, and says so.** `assemble` writes
+  x86-64 ELF and rmc supplies its own `_start`, so `codegen_crate` fatals on a
+  non-x86-64 `--target` and on any `--emit` other than an executable
+  (`--emit=obj`/`asm` would otherwise get a silently mislabeled ELF), and on a
+  non-`bin` crate type.
+- **`-C opt-level` must be passed by the caller.** opt-level drives rustc's MIR
+  passes, which run *before* `codegen_crate`, so the backend cannot set it. The
+  `backend/rmc-rustc` wrapper supplies `-C opt-level=3` by default (a later
+  `-O`/`-C opt-level=N` on the command line still wins); `bench/run_codegen.py`
+  passes it explicitly.
+- **`overflow_checks` is read from the session and threaded through.** The MIR
+  dump only carries the checked-arithmetic shapes under `-C overflow-checks=on`,
+  and `switchInt(OverflowChecks)` folds to a different arm, so `codegen_crate`
+  passes `tcx.sess.overflow_checks()` to both `mir::parse_with` and the loop
+  rewrites (`tco`, `close_counted_loops`), which would otherwise move a trap.
 - **`crate-type = ["cdylib"]`, not `["dylib"]`.** A `dylib` exports every
   `pub` symbol of its dependency, so all 194 `rmc::*` items stay dynamically
   exported and the linker cannot drop the unused AST front end
@@ -2424,6 +2439,9 @@ lto=fat` per program.
   runs serially. The pass hoists the second multiply above the first divide and
   parks the two products in `%r10`/`%r11` (scratch on this path). Constant
   hoisting alone does *not* help (verified, 5 sites) -- the win is purely ILP.
+  The pair must be independent: `match_div_pair` rejects it when the first
+  divide's destination is the second's multiplicand, since reordering would
+  then square the register's pre-division value.
 - **`gen_div_const` takes its sign correction from `%rdx` on the plain path.**
   Only the biased (`add`) path -- where the magic `m` does not fit a positive
   `i64` and the product does not carry the dividend's sign -- needs the dividend
@@ -2668,24 +2686,34 @@ conversation logs for one.
 The token must never be persisted in `.git/config` or a file, so `origin` is a
 plain token-free URL (`https://github.com/irhasar/rmc.git`) and there is no
 credential helper. A bare `git push origin <branch>` therefore prompts for a
-username and hangs — do not run it. Push with the token supplied inline so it
-never lands on disk:
+username and hangs — do not run it. Supply the token through an *environment*
+variable and a one-shot credential helper, so it never reaches `argv` or shell
+history (an inline `https://x-access-token:<token>@...` URL is visible in both
+`ps` and the history file, and an output filter cannot hide either copy):
 
 ```
-git push "https://x-access-token:<token>@github.com/irhasar/rmc.git" <branch>
+RMC_PUSH_TOKEN=<token> \
+  git -c credential.helper='!f(){ echo username=x-access-token; echo "password=$RMC_PUSH_TOKEN"; };f' \
+  push origin <branch>
 ```
 
-A read (`git ls-remote <same-url>`) confirms the remote state. The inline URL
-leaves the tracking ref stale, so refresh it with
-`git fetch "<url>" <branch>:refs/remotes/origin/<branch>` afterwards.
+The helper text on the command line names the *variable*, not its value. A read
+works the same way:
+
+```
+RMC_PUSH_TOKEN=<token> \
+  git -c credential.helper='!f(){ echo username=x-access-token; echo "password=$RMC_PUSH_TOKEN"; };f' \
+  fetch origin <branch>:refs/remotes/origin/<branch>
+```
+
+Do not `export` the token into the persistent shell either; pass it on the one
+command that needs it, so it is gone when that command exits.
 
 **Always push at the end of every session.** After committing, push the current
 branch so the remote branch is never behind the local one. Verify with
 `git rev-parse HEAD` vs `git rev-parse origin/<branch>` (they must match)
 before reporting done. Do not open a PR unless asked — the push is the expected
-end state. When a command line or URL would otherwise echo the token, pipe
-through `sed 's/ghp_[A-Za-z0-9]*/<token-hidden>/g'` so it never lands in the
-log.
+end state.
 
 ## PR branch stack
 

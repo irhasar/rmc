@@ -819,6 +819,14 @@ fn rewrite_term(t: &mut Terminator, subst: &HashMap<u32, Place>) {
 
 /// Parse the text `rustc --emit=mir` prints into a [`Program`].
 pub fn parse(text: &str) -> Result<Program, String> {
+    parse_with(text, false)
+}
+
+/// Parse a MIR dump, resolving the compile-time switches that depend on how the
+/// crate was built. `switchInt(OverflowChecks)` picks a different arm under
+/// `-C overflow-checks=on`, so the caller must pass the build's actual setting
+/// or the backend will lower the wrong branch.
+pub fn parse_with(text: &str, overflow_checks: bool) -> Result<Program, String> {
     let lines: Vec<String> = text.lines().map(strip_comment).collect();
     let mut prog = Program {
         funcs: Vec::new(),
@@ -835,7 +843,7 @@ pub fn parse(text: &str) -> Result<Program, String> {
             continue;
         }
         if l.starts_with("fn ") {
-            let (f, next) = parse_fn(&lines, i)?;
+            let (f, next) = parse_fn(&lines, i, overflow_checks)?;
             // Record a `Drop` impl's receiver type -> its renamed symbol, so the
             // back end can resolve a `drop(_N)` terminator to the impl.
             if l.contains("<impl") {
@@ -1631,7 +1639,7 @@ fn parse_const_value(s: &str) -> Option<i64> {
     }
 }
 
-fn parse_fn(lines: &[String], start: usize) -> Result<(Function, usize), String> {
+fn parse_fn(lines: &[String], start: usize, overflow_checks: bool) -> Result<(Function, usize), String> {
     let header = lines[start].trim();
     let rest = header.strip_prefix("fn ").unwrap();
     let open = rest.find('(').ok_or_else(|| format!("mir: bad fn header `{header}`"))?;
@@ -1753,7 +1761,7 @@ fn parse_fn(lines: &[String], start: usize) -> Result<(Function, usize), String>
         let Some(n) = cur else { continue };
         // A terminator line (`return;`, `goto -> bbX`, `switchInt(..)`, a call
         // or `assert(..)`) is not a statement; try it first.
-        if let Some(term) = parse_call_terminator(t).or_else(|| parse_terminator(t)) {
+        if let Some(term) = parse_call_terminator(t).or_else(|| parse_terminator(t, overflow_checks)) {
             blocks[n as usize].term = term;
             continue;
         }
@@ -2216,18 +2224,18 @@ fn parse_success_target(targets: &str) -> Option<u32> {
     None
 }
 
-fn parse_terminator(t: &str) -> Option<Terminator> {
+fn parse_terminator(t: &str, overflow_checks: bool) -> Option<Terminator> {
     let t = t.trim();
     if let Some(rest) = t.strip_prefix("goto -> ") {
         return Some(Terminator::Goto(parse_bb_id(rest.trim())?));
     }
     if t.starts_with("switchInt(") {
         // `switchInt(OverflowChecks)` branches on whether the crate was built
-        // with overflow checks. The front end always runs `-O` with them off,
-        // so the `0:` arm is the one taken; the `otherwise` arm is dead. Folding
-        // it here keeps the branch out of the back end rather than teaching it
-        // about a compile-time constant it can never see vary.
-        if let Some(target) = parse_overflow_checks_switch(t) {
+        // with overflow checks. Fold it here to the arm the build actually
+        // takes, rather than teaching the back end about a compile-time constant
+        // it can never see vary. With checks on, `1` (the `otherwise` arm) is
+        // taken; with checks off, the `0` arm is.
+        if let Some(target) = parse_overflow_checks_switch(t, overflow_checks) {
             return Some(target);
         }
         return Some(parse_switch(t).ok()?);
@@ -2278,26 +2286,34 @@ fn parse_terminator(t: &str) -> Option<Terminator> {
     None
 }
 
-/// `switchInt(OverflowChecks) -> [0: bbX, otherwise: bbY]` folds to `goto bbX`:
-/// the front end always compiles with overflow checks off, so `0` is the only
-/// arm that can be taken.
-fn parse_overflow_checks_switch(t: &str) -> Option<Terminator> {
+/// `switchInt(OverflowChecks) -> [0: bbX, otherwise: bbY]` folds to the arm the
+/// build actually takes: `0` (checks off) or `otherwise` (checks on).
+fn parse_overflow_checks_switch(t: &str, overflow_checks: bool) -> Option<Terminator> {
     let open = t.find('(')?;
     let close = matching(t, open, '(', ')')?;
     if t[open + 1..close].trim() != "OverflowChecks" {
         return None;
     }
     let after = t[close + 1..].trim().strip_prefix("->")?.trim();
-    let inner = after.trim_start_matches('[').trim_end_matches(']').trim_end_matches(';');
+    // Strip the closing `;` before the `]`: the line ends `...];`, so trimming
+    // `]` first leaves a stray `]` on the last arm's target.
+    let inner = after.trim_start_matches('[').trim_end_matches(';').trim_end_matches(']');
+    let mut zero = None;
+    let mut otherwise = None;
     for part in inner.split(',') {
         let p = part.trim();
-        if let Some((val, bb)) = p.split_once(':') {
+        if let Some(rest) = p.strip_prefix("otherwise:") {
+            otherwise = Some(rest.trim());
+        } else if let Some((val, bb)) = p.split_once(':') {
             if val.trim().trim_end_matches("_bool").trim() == "0" {
-                return Some(Terminator::Goto(parse_bb_id(bb.trim())?));
+                zero = Some(bb.trim());
             }
         }
     }
-    None
+    // The switch is `0` vs `otherwise`, and `otherwise` is the taken arm only
+    // when `0` is not. A `1:` arm may also be printed; it is the same branch.
+    let taken = if overflow_checks { otherwise.or(zero)? } else { zero.or(otherwise)? };
+    Some(Terminator::Goto(parse_bb_id(taken)?))
 }
 
 fn parse_switch(t: &str) -> Result<Terminator, String> {
@@ -7113,6 +7129,44 @@ fn main() -> () {
         assert!(
             format!("{:?}", prog.funcs[0].blocks[0].term).contains("Assert"),
             "`i & 256` can reach a length of 256, so the check must stay"
+        );
+    }
+
+    #[test]
+    fn the_overflow_checks_switch_folds_to_the_builds_arm() {
+        // rustc prints `switchInt(OverflowChecks) -> [0: bbX, otherwise: bbY]`
+        // when a program asks for the intrinsic. With checks off the `0` arm
+        // runs; with checks on the `otherwise` arm does. The parser must pick
+        // the arm the crate was actually built with, not always the unchecked
+        // one.
+        let text = "\
+fn main() -> () {
+    let mut _0: ();
+
+    bb0: {
+        switchInt(OverflowChecks) -> [0: bb1, otherwise: bb2];
+    }
+
+    bb1: {
+        _0 = ();
+        return;
+    }
+
+    bb2: {
+        _0 = ();
+        return;
+    }
+}
+";
+        let off = parse_with(text, false).expect("fixture parses (off)");
+        assert!(
+            format!("{:?}", off.funcs[0].blocks[0].term).contains("Goto(1)"),
+            "checks off must take the `0` arm (bb1)"
+        );
+        let on = parse_with(text, true).expect("fixture parses (on)");
+        assert!(
+            format!("{:?}", on.funcs[0].blocks[0].term).contains("Goto(2)"),
+            "checks on must take the `otherwise` arm (bb2)"
         );
     }
 }
