@@ -289,13 +289,22 @@ A pattern that matches a payload variant must bind its fields, `Opt::Some(v)`;
 matching it bare (`Opt::Some`) is an error, because there is no way to name the
 value. An argument may be a wildcard (`Opt::Some(_)`), a `mut` binding
 (`Opt::Some(mut v)`), a nested struct or array sub-pattern (`E::A(S { x })`,
-`E::A([a, b])`), or a trailing `..` that ignores the remaining fields
+`E::A([a, b])`), a nested variant pattern (`O::W(I::A)`), a scalar test
+(`E::A(1)`, `E::A(1 | 2)`), or a trailing `..` that ignores the remaining fields
 (`E::A(x, ..)`, `E::A(..)`). Each argument is the payload read at its field
 index, fed to the same sub-pattern expansion a `let` destructuring uses, so the
-naming directions compose. An argument must be irrefutable — a literal
-(`E::A(1)`) would need a per-field test rmc does not generate, so it is
-rejected, as is `mut` on a nested pattern. Naming more fields than the variant
-has, or fewer without a `..`, is an error.
+naming directions compose. A refutable argument adds its own test, `&&`-ed after
+the variant's tag test, so `E::A(1)` matches only a payload of `1` and
+`O::W(I::A)` does not match `O::W(I::B)`; `mut` on a nested pattern is rejected
+(it attaches to a binding). Naming more fields than the variant has, or fewer
+without a `..`, is an error.
+A match whose arms enumerate every variant of the scrutinee's enum, and — for
+each payload arm with a sub-pattern — every variant of the payload enum, is
+exhaustive without a `_` arm, as in rustc:
+`match o { O::W(I::A) => .., O::W(I::B) => .., O::Z => .. }` is total. A payload
+arm that binds the whole field (`O::W(x)`, `O::W(_)`) covers its variant
+outright; a variant whose payload is a scalar, struct or tuple field cannot be
+shown complete this way, so such a match needs a `_` arm.
 A pattern reads through a reference to the scrutinee, as Rust's match ergonomics
 do: `match &e { Opt::Some(v) => .. }` dereferences `&E` to the `E` underneath, so
 the test and every payload read go through the one deref (a struct pattern

@@ -2305,6 +2305,63 @@ fn a_variant_payload_pattern_may_be_nested() {
 }
 
 #[test]
+fn a_nested_variant_payload_pattern_tests_the_inner_variant() {
+    // `O::W(I::A)` must not match `O::W(I::B)`: the arm test is the outer tag
+    // test `&&`-ed with the inner tag test, so the wrong payload falls through.
+    let src = "enum I { A, B } enum O { W(I), Z } \
+               fn f(o: O) -> i64 { \
+                 match o { O::W(I::A) => 1, O::W(I::B) => 2, O::Z => 3 } } \
+               fn main() -> i64 { \
+                 return f(O::W(I::A)) * 100 + f(O::W(I::B)) * 10 + f(O::Z); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_nested_variant_payload_pattern_can_be_exhaustive() {
+    // Enumerating every payload variant of every outer variant, with no `_`,
+    // is a total match, exactly as rustc accepts it.
+    let src = "enum I { A, B } enum O { W(I), Z } \
+               fn main() -> i64 { let o: O = O::W(I::B); \
+                 return match o { O::W(I::A) => 1, O::W(I::B) => 2, O::Z => 3 }; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn an_incomplete_nested_variant_payload_pattern_is_rejected() {
+    // `O::W(I::A)` covers only one value of `O::W`, so a match that omits
+    // `O::W(I::B)` is not exhaustive. Statement position reports it as such
+    // (value position reports the more specific `if` without `else` first).
+    let err = compile_to_asm(
+        "enum I { A, B } enum O { W(I), Z } \
+         fn main() { let o: O = O::W(I::A); \
+         match o { O::W(I::A) => {}, O::Z => {} } }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("non-exhaustive"), "got: {err}");
+}
+
+#[test]
+fn a_scalar_variant_payload_argument_is_tested() {
+    // `E::A(1)` matches only a payload of `1`; the test is a comparison on the
+    // payload read, so the second arm still handles `E::A(_)`.
+    let src = "enum E { A(i64), B } \
+               fn f(e: E) -> i64 { match e { E::A(1) => 1, E::A(_) => 2, E::B => 3 } } \
+               fn main() -> i64 { return f(E::A(1)) * 100 + f(E::A(9)) * 10 + f(E::B); }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
+fn a_wildcard_variant_payload_argument_still_covers_the_variant() {
+    // `E::A(_)` has no refutable sub-pattern, so the variant is fully covered
+    // and the match is exhaustive without a `_` arm.
+    let src = "enum E { A(i64), B } \
+               fn main() -> i64 { let e: E = E::A(3); \
+                 return match e { E::A(_) => 1, E::B => 2 }; }";
+    assert!(compile_to_asm(src, &CompileOptions::default()).is_ok());
+}
+
+#[test]
 fn a_variant_payload_pattern_reads_through_the_payload() {
     // A nested payload pattern reads its fields straight from the payload,
     // offset past the tag word, rather than copying the whole aggregate payload
@@ -2347,16 +2404,15 @@ fn a_variant_payload_pattern_may_not_omit_a_field_without_rest() {
 }
 
 #[test]
-fn a_refutable_variant_payload_argument_is_rejected() {
-    // `E::A(1)` would need a per-field test, which rmc does not generate.
-    let err = compile_to_asm(
+fn a_refutable_variant_payload_argument_is_now_tested() {
+    // `E::A(1)` adds a comparison on the payload read; rmc used to reject it.
+    let out = asm(
         "enum E { A(i64), B } \
          fn main() -> i64 { let e: E = E::A(3); \
          return match e { E::A(1) => 1, E::A(_) => 0, E::B => 0 }; }",
-        &CompileOptions::default(),
-    )
-    .unwrap_err();
-    assert!(err.contains("variant pattern arguments"), "got: {err}");
+    );
+    // The arm test compares the payload (offset 8, past the tag word) to `1`.
+    assert!(out.contains("cmp $1, %rax"), "payload comparison:\n{out}");
 }
 
 #[test]

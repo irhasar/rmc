@@ -1511,7 +1511,7 @@ impl Sema {
                 }
                 for leaf in leaves {
                     match leaf {
-                        Expr::VariantTest { enum_name, variant, .. } => {
+                        Expr::VariantTest { enum_name, variant, sub_tests, .. } => {
                             match kind {
                                 Some(Kind::Enum(e)) if e == enum_name.as_str() => {}
                                 None => kind = Some(Kind::Enum(enum_name.as_str())),
@@ -1522,6 +1522,14 @@ impl Sema {
                             // ones) is redundant, not a gap: rustc accepts it.
                             if !seen_variants.contains(&variant.as_str()) {
                                 seen_variants.push(variant.as_str());
+                            }
+                            // A nested variant pattern (`O::W(I::A)`) only
+                            // covers its payload value when its own sub-patterns
+                            // cover every variant of the payload enum; otherwise
+                            // the arm can fall through and the chain is not
+                            // total.
+                            if !sub_tests.iter().all(|t| self.sub_test_complete(t)) {
+                                return false;
                             }
                         }
                         Expr::BoolTest { scrutinee, value } => {
@@ -1585,7 +1593,151 @@ impl Sema {
     /// `MatchBoundary` (not a bare `If`) still delimits the walk.
     fn match_chain_is_exhaustive(&self, b: &Block) -> bool {
         match Self::chain_tail(b.tail.as_deref()) {
-            Some((cond, els)) => self.if_chain_is_exhaustive(cond, els),
+            Some((cond, els)) => self.chain_is_exhaustive(cond, els),
+            None => false,
+        }
+    }
+
+    /// Whether a desugared `match` chain is total: the simple all-variants walk
+    /// first (which also recognises a total `bool` chain), then the nested walk
+    /// that folds in payload sub-patterns (`O::W(I::A) => .., O::W(I::B) => ..,
+    /// O::Z => ..`).
+    fn chain_is_exhaustive(&self, cond: &Expr, els: &Option<Block>) -> bool {
+        self.if_chain_is_exhaustive(cond, els) || self.chain_is_exhaustive_nested(cond, els)
+    }
+
+    /// Whether a desugared `match` chain is total when some arms carry nested
+    /// variant patterns. Collects the unguarded arm tests and hands them to
+    /// `chain_covers`, which recurses through payload enums.
+    fn chain_is_exhaustive_nested(&self, cond: &Expr, els: &Option<Block>) -> bool {
+        let mut arms: Vec<&Expr> = Vec::new();
+        let mut cur_cond = cond;
+        let mut cur_els = els;
+        loop {
+            // A guard makes the arm cover nothing.
+            if Self::arm_guard(cur_cond).is_none() {
+                arms.push(Self::arm_pattern_test(cur_cond));
+            }
+            match Self::chain_tail(cur_els.as_ref().and_then(|b| b.tail.as_deref())) {
+                Some((c, e)) => {
+                    cur_cond = c;
+                    cur_els = e;
+                }
+                None => break,
+            }
+        }
+        self.chain_covers(&arms)
+    }
+
+    /// Whether a set of variant-test arms covers every variant of their enum,
+    /// and — for each arm that names a payload sub-pattern — recursively every
+    /// variant of the payload enum. `arms` are guard-stripped pattern tests; an
+    /// or-pattern arm is flattened into its alternatives. An arm that binds a
+    /// whole payload (`O::W(x)` or `O::W(_)`) has no sub-test and covers its
+    /// variant outright; arms with sub-tests for the same variant are combined
+    /// (their payload tests are unioned). A variant whose payload is not an enum
+    /// (a scalar, struct or tuple field) cannot be proven covered here, so the
+    /// match is reported non-exhaustive — safe, since rustc would need a `_` arm
+    /// there too unless the field has a single value.
+    fn chain_covers<'a>(&self, arms: &[&'a Expr]) -> bool {
+        let mut leaves: Vec<&'a Expr> = Vec::new();
+        for a in arms {
+            let mut ls: Vec<&'a Expr> = Vec::new();
+            if !Self::or_leaves(a, &mut ls) {
+                return false;
+            }
+            leaves.extend(ls);
+        }
+        let enum_name = match leaves.iter().find_map(|l| match l {
+            Expr::VariantTest { enum_name, .. } => Some(enum_name.clone()),
+            _ => None,
+        }) {
+            Some(n) => n,
+            None => return false,
+        };
+        let info = match self.enums.get(&enum_name) {
+            Some(i) => i.clone(),
+            None => return false,
+        };
+        for (variant_name, fields, _, _) in &info.variants {
+            let mut lists: Vec<&[Expr]> = Vec::new();
+            for leaf in &leaves {
+                match leaf {
+                    Expr::VariantTest { enum_name: e, variant, sub_tests, .. } => {
+                        if *e != enum_name {
+                            return false;
+                        }
+                        if variant == variant_name {
+                            lists.push(sub_tests.as_slice());
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+            if lists.is_empty() {
+                return false;
+            }
+            // An arm with no refutable sub-pattern binds the whole variant.
+            if lists.iter().any(|l| l.is_empty()) {
+                continue;
+            }
+            // A multi-field variant would need a cross-product of its fields'
+            // patterns, which rmc does not reason about.
+            if !lists.iter().all(|l| l.len() == 1) {
+                return false;
+            }
+            // The payload must be an enum for the recursion to mean anything;
+            // a scalar, struct or tuple field cannot be shown covered here.
+            if !matches!(
+                fields.first(),
+                Some((Type::Enum(_) | Type::EnumData(_, _), _))
+            ) {
+                return false;
+            }
+            let sub_arms: Vec<&Expr> = lists.iter().map(|l| &l[0]).collect();
+            if !self.chain_covers(&sub_arms) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether one payload sub-pattern test covers every variant of its enum.
+    /// `Bool(true)` (a `_` or binding) is trivially complete; otherwise the test
+    /// must name every variant of one enum, pairwise distinct, with complete
+    /// sub-tests of its own. Used to decide whether a nested variant arm such
+    /// as `O::W(I::A | I::B)` covers all of `O::W`.
+    fn sub_test_complete(&self, e: &Expr) -> bool {
+        if matches!(e, Expr::Bool(true)) {
+            return true;
+        }
+        let mut leaves: Vec<&Expr> = Vec::new();
+        if !Self::or_leaves(e, &mut leaves) {
+            return false;
+        }
+        let mut enum_name: Option<&str> = None;
+        let mut seen: Vec<&str> = Vec::new();
+        for leaf in leaves {
+            let (en, var, sub) = match leaf {
+                Expr::VariantTest { enum_name, variant, sub_tests, .. } => {
+                    (enum_name.as_str(), variant.as_str(), sub_tests)
+                }
+                _ => return false,
+            };
+            match enum_name {
+                Some(x) if x == en => {}
+                None => enum_name = Some(en),
+                _ => return false,
+            }
+            if !seen.contains(&var) {
+                seen.push(var);
+            }
+            if !sub.iter().all(|t| self.sub_test_complete(t)) {
+                return false;
+            }
+        }
+        match enum_name {
+            Some(name) => self.enums.get(name).map_or(false, |i| i.variants.len() == seen.len()),
             None => false,
         }
     }
@@ -3056,7 +3208,7 @@ impl Sema {
                     return Err(format!("`if` condition must be `bool`, found {ct:?}"));
                 }
                 let total = if is_root {
-                    self.if_chain_is_exhaustive(cond, els)
+                    self.chain_is_exhaustive(cond, els)
                 } else {
                     total
                 };
@@ -3856,7 +4008,7 @@ impl Sema {
                 }
                 Ok(Type::Bool)
             }
-            Expr::VariantTest { scrutinee, enum_name, variant, tag, n_binds, has_rest } => {
+            Expr::VariantTest { scrutinee, enum_name, variant, tag, n_binds, has_rest, sub_tests } => {
                 let n_binds = *n_binds;
                 let has_rest = *has_rest;
                 let st = self.check_expr(scrutinee, scope)?;
@@ -3912,6 +4064,17 @@ impl Sema {
                     ));
                 }
                 *tag = info.tag_of(variant).unwrap();
+                // Check each nested sub-pattern test through the payload read it
+                // was built from, so its enum is resolved and its own tag filled
+                // in. Codegen `&&`s these after the tag test.
+                for t in sub_tests.iter_mut() {
+                    let tt = self.check_expr(t, scope)?;
+                    if tt != Type::Bool {
+                        return Err(format!(
+                            "internal: a variant payload sub-pattern test is `{tt:?}`, not `bool`"
+                        ));
+                    }
+                }
                 Ok(Type::Bool)
             }
             Expr::EnumPayload { recv, enum_name, variant, idx, offset, ty } => {

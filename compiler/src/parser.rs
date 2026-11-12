@@ -4987,12 +4987,14 @@ impl Parser {
                 break;
             }
             let m = self.eat(&Tok::Mut);
-            // `_` ignores the field: it binds nothing and tests nothing.
+            // `_` ignores the field: it binds nothing and tests nothing. Any
+            // other sub-pattern is a full pattern, so an or-pattern
+            // (`E::A(1 | 2)`) and a nested variant pattern are both allowed.
             let p = if self.peek() == Some(&Tok::Underscore) {
                 self.i += 1;
                 Pat::Wild
             } else {
-                self.parse_pattern_primary()?
+                self.parse_pattern()?
             };
             if m && !matches!(p, Pat::Bind(_) | Pat::At(..)) {
                 return Err(format!(
@@ -5006,15 +5008,13 @@ impl Parser {
             }
         }
         self.expect(Tok::RParen)?;
-        // Every argument must be irrefutable: a refutable one (`E::V(1)`) would
-        // need a per-field test, which rmc does not generate. Reject it here
-        // rather than mis-bind it as an always-true read.
-        if args.iter().any(|(_, p)| !Self::pat_irrefutable(p)) {
-            return Err(format!(
-                "at byte {}: variant pattern arguments must be bindings, `_`, or nested patterns",
-                self.pos()
-            ));
-        }
+        // An argument may be any sub-pattern rmc can test and bind: a binding,
+        // `_`, a nested struct/tuple/array pattern, a nested variant pattern
+        // (`E::A(Some(x))`), or a scalar test. A refutable sub-pattern adds its
+        // own test, carried in the variant test after the tag test (see
+        // `variant_pat_cond`), so `E::A(Some(x))` does not match `E::A(None)`.
+        // Anything else (`mut` on a non-binding, handled above) is rejected
+        // where it is parsed.
         Ok((args, rest))
     }
 
@@ -5510,6 +5510,9 @@ impl Parser {
                 // A struct or tuple sub-pattern inside an array element.
                 Pat::Struct(name, fields) => out.extend(Self::struct_pat_binds(fields, &index, &name)),
                 Pat::Tuple(elems) => out.extend(Self::tuple_pat_binds(elems, &index)),
+                // A nested variant pattern inside an array element reads its
+                // payload through the element index.
+                Pat::Variant(..) => Self::pat_binds(pat, *m, &index, &mut out),
                 _ => unreachable!("unexpected array sub-pattern"),
             }
         }
@@ -5690,6 +5693,9 @@ impl Parser {
             // test is the whole test.
             Pat::At(_, _, sub) => Self::pat_test(sub, subj),
             Pat::Tuple(elems) => Self::tuple_pat_test(elems, subj),
+            Pat::Array { elems, rest, front } => {
+                Self::array_pat_test(elems, *rest, *front, subj)
+            }
             // `a | b | c` as an element: any alternative matching passes. A `_`
             // alternative makes the whole element always true, so there is no
             // test; otherwise fold the alternatives' tests with `||`.
@@ -5748,7 +5754,53 @@ impl Parser {
                 );
                 Some(Expr::Bin(BinOp::And, Box::new(lower), Box::new(upper)))
             }
-            _ => unreachable!("a tuple element is validated when the tuple is parsed"),
+            // A nested variant pattern: its own tag test over `subj`, folded
+            // with any refutable sub-pattern of its own. Used both as a
+            // payload field's sub-pattern and inside `variant_pat_cond`.
+            Pat::Variant(enum_name, variant, args) => {
+                Some(Self::variant_pat_cond(enum_name, variant, args, subj))
+            }
+        }
+    }
+
+    /// The boolean test for one `Enum::Variant(..)` pattern over `subj`: a
+    /// `VariantTest` carrying the tag test and, for each refutable payload
+    /// sub-pattern, a test read through that field. `E::A(Some(x))` yields a
+    /// `VariantTest` for `A` whose `sub_tests` hold the `Some` test over field
+    /// 0, so it does not match `E::A(None)`. Codegen `&&`s the sub-tests after
+    /// the tag test, so a read only runs once the tag matched.
+    fn variant_pat_cond(
+        enum_name: &str,
+        variant: &str,
+        args: &Option<(Vec<(bool, Pat)>, bool)>,
+        subj: &Expr,
+    ) -> Expr {
+        let n_binds = args.as_ref().map_or(-1, |(a, _)| a.len() as i32);
+        let has_rest = args.as_ref().map_or(false, |(_, rest)| *rest);
+        let mut sub_tests: Vec<Expr> = Vec::new();
+        if let Some((args, _)) = args {
+            for (idx, (_, pat)) in args.iter().enumerate() {
+                let payload = Expr::EnumPayload {
+                    recv: Box::new(subj.clone()),
+                    enum_name: enum_name.to_string(),
+                    variant: variant.to_string(),
+                    idx,
+                    offset: 0,
+                    ty: Type::Unit,
+                };
+                if let Some(t) = Self::pat_test(pat, &payload) {
+                    sub_tests.push(t);
+                }
+            }
+        }
+        Expr::VariantTest {
+            scrutinee: Box::new(subj.clone()),
+            enum_name: enum_name.to_string(),
+            variant: variant.to_string(),
+            tag: -1,
+            n_binds,
+            has_rest,
+            sub_tests,
         }
     }
 
@@ -5766,6 +5818,46 @@ impl Parser {
                 ty: Type::Unit,
             };
             if let Some(t) = Self::pat_test(p, &field) {
+                cond = Some(match cond {
+                    None => t,
+                    Some(c) => Expr::Bin(BinOp::And, Box::new(c), Box::new(t)),
+                });
+            }
+        }
+        cond
+    }
+
+    /// The boolean test for an array pattern: the `&&` of its refutable
+    /// elements' tests, each read through the element's index. `None` when every
+    /// element is irrefutable, so the arm is a catch-all. A `..` rest never adds
+    /// a test (it matches any count). Used when an array pattern is a payload
+    /// field's sub-pattern, so `E::A([1, x])` tests field 0 against `1`.
+    fn array_pat_test(
+        elems: &[Option<(bool, Pat)>],
+        rest: bool,
+        front: usize,
+        subj: &Expr,
+    ) -> Option<Expr> {
+        let mut cond: Option<Expr> = None;
+        for (j, elem) in elems.iter().enumerate() {
+            let (_, p) = match elem {
+                Some(x) => x,
+                None => continue,
+            };
+            let idx = if !rest || j < front {
+                Expr::Int(j as i64)
+            } else {
+                let behind = elems.len() - front;
+                let from_end = behind - (j - front);
+                let len = Expr::MethodCall {
+                    recv: Box::new(subj.clone()),
+                    name: "len".to_string(),
+                    args: Vec::new(),
+                };
+                Expr::Bin(BinOp::Sub, Box::new(len), Box::new(Expr::Int(from_end as i64)))
+            };
+            let index = Expr::Index(Box::new(subj.clone()), Box::new(idx));
+            if let Some(t) = Self::pat_test(p, &index) {
                 cond = Some(match cond {
                     None => t,
                     Some(c) => Expr::Bin(BinOp::And, Box::new(c), Box::new(t)),
@@ -6006,14 +6098,9 @@ impl Parser {
                 );
                 Expr::Bin(BinOp::And, Box::new(lower), Box::new(upper))
             }
-            Pat::Variant(enum_name, variant, args) => Expr::VariantTest {
-                scrutinee: Box::new(subj.clone()),
-                enum_name: enum_name.clone(),
-                variant: variant.clone(),
-                tag: -1,
-                n_binds: args.as_ref().map_or(-1, |(a, _)| a.len() as i32),
-                has_rest: args.as_ref().map_or(false, |(_, rest)| *rest),
-            },
+            Pat::Variant(enum_name, variant, args) => {
+                Self::variant_pat_cond(enum_name, variant, args, subj)
+            }
             // `_` in an or-pattern: always true, so the whole condition is true.
             // A struct pattern is likewise always true; a binding one is
             // rejected before this point. A tuple alternative folds its
@@ -6232,11 +6319,28 @@ impl Parser {
             Pat::Array { elems, rest, front } => {
                 out.extend(Self::array_pat_binds(elems, *rest, *front, subj))
             }
+            // A nested variant pattern reads its payload fields through `subj`
+            // (the outer payload), so `E::A(Some(x))` binds `x` from
+            // `subj`'s field 0 read as an `Option`.
+            Pat::Variant(enum_name, variant, args) => {
+                if let Some((args, _)) = args {
+                    for (idx, (am, sub)) in args.iter().enumerate() {
+                        let payload = Expr::EnumPayload {
+                            recv: Box::new(subj.clone()),
+                            enum_name: enum_name.clone(),
+                            variant: variant.clone(),
+                            idx,
+                            offset: 0,
+                            ty: Type::Unit,
+                        };
+                        Self::pat_binds(sub, *am, &payload, out);
+                    }
+                }
+            }
             // A scalar element binds nothing (its test is generated
             // separately); an or-pattern binds nothing (rmc rejects a binding
             // in an or-pattern when it is parsed).
             Pat::Int(_) | Pat::Char(_) | Pat::CharRange(..) | Pat::Bool(_) | Pat::Str(_) | Pat::Range(..) | Pat::Or(_) => {}
-            _ => unreachable!("unexpected sub-pattern"),
         }
     }
 
@@ -6304,8 +6408,7 @@ impl Parser {
             // binds.
             Pat::At(n, _, _) => Some(n.clone()),
             // A payload variant pattern binds the names of its argument
-            // sub-patterns; a nested variant pattern would too, but it is
-            // rejected before this point.
+            // sub-patterns; a nested variant pattern recurses through them.
             Pat::Variant(_, _, Some((args, _))) => {
                 args.iter().find_map(|(_, sub)| Self::first_bound_name(sub))
             }
@@ -6456,21 +6559,16 @@ impl Parser {
                 }),
             ),
             Pat::Variant(enum_name, variant, args) => {
-                let n_binds = args.as_ref().map_or(-1, |(a, _)| a.len() as i32);
-                let has_rest = args.as_ref().map_or(false, |(_, rest)| *rest);
-                let cond = Expr::VariantTest {
-                    scrutinee: Box::new(subj.clone()),
-                    enum_name: enum_name.clone(),
-                    variant: variant.clone(),
-                    tag: -1,
-                    n_binds,
-                    has_rest,
-                };
+                // The tag test, carrying any refutable payload sub-pattern's
+                // test as `sub_tests` (a nested variant pattern such as
+                // `E::A(Some(x))`). Codegen runs the sub-tests only once the
+                // outer tag matched, so a nested payload read is guarded.
+                let cond = Self::variant_pat_cond(&enum_name, &variant, &args, subj);
                 // `Enum::V(w, x)` binds each payload field in the arm body. Each
                 // argument is the payload read at its field index, fed to the
                 // same per-pattern expansion the `let` and `match` paths use, so
-                // `_` reads nothing and a nested struct/array sub-pattern reads
-                // through the payload.
+                // `_` reads nothing, a nested struct/array sub-pattern reads
+                // through the payload, and a nested variant recurses.
                 let binds = match args {
                     Some((args, _)) => {
                         let mut out = Vec::new();
