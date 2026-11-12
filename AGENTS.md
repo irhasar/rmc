@@ -809,6 +809,27 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   constant name there resolves to its value (not a binding), which would turn
   `for N in 0..3` into an iteration over a literal and lose the E0530 error.
   `tests/cases/forarr.rs` and the `stmt` fuzzer cover it.
+- **Range adapters desugar to one upward counter, and the maps compose.** `for
+  i in (lo..hi).rev()` / `.step_by(k)` / `.skip(k)` / `.take(k)`, chained in any
+  order, are recognised by a token lookahead (`at_parenthesized_range_adapter`,
+  which requires the parentheses Rust requires) and desugared by
+  `desugar_for_range_adapter` into the ordinary `Stmt::For` upward counter, so
+  `continue` still reaches the increment — a downward `while` would skip it and
+  loop forever. The desugar is two passes: a forward pass gives each adapter a
+  `let` bound (evaluated once, not per step) and threads the sequence length
+  through, and a reverse pass composes each adapter's *index* map into the
+  element expression. The maps stay relative to the raw range and `lo` is added
+  once at the end, which is what makes `rev` after another adapter reverse that
+  adapter's slice rather than the whole range. `rev`'s length is bound to a
+  temporary when it is itself a computed count (a `step_by`), so it is not
+  recomputed per iteration. `skip`/`take` use `__rmc_min(a, b)` (a new runtime
+  helper) for `c = min(k, len)`; `skip` shifts the map by `c`, the count it
+  actually removes, not the overshoot. Adapter temporaries use `\u{0}r`-prefixed
+  names (`rl`/`rh` for the bounds, `ri` for the counter, `rk`/`ra`/`rc`/`rs` for
+  the stride, argument, count and length-substitution); the counter is `ri`, not
+  `rc`, so it cannot collide with the `c` of the first `skip`/`take`.
+  `tests/cases/rangeadapt.rs` and `counting_range_adapters_compile` cover the
+  chains.
 - **`..=` exits on `jle` back-edge, not `jl`.** The guard is the loop-back
   condition, so the inclusive form loops while `var <= end` (`jle`) and the
   exclusive one while `var < end` (`jl`); a `jg`/`jge` *exit* test is the
