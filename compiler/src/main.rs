@@ -263,6 +263,7 @@ fn run_mir_text(opts: &Options, mir: &str) -> Result<(), String> {
         rmc::mir::licm(&mut prog);
     }
     rmc::mir::fold_accumulators(&mut prog);
+    rmc::mir::strength_reduce(&mut prog);
     rmc::mir::close_counted_loops(&mut prog, opts.overflow_checks);
     rmc::mir::jump_thread(&mut prog);
     rmc::mir::prune_unreachable(&mut prog);

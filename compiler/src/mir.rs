@@ -4258,6 +4258,274 @@ pub fn fold_accumulators(prog: &mut Program) {
     }
 }
 
+/// Strength-reduce an in-loop multiply by a loop-invariant constant into a
+/// running value advanced by an add.
+///
+/// `p = i * C` inside a loop, where `i` is an induction variable stepping by
+/// `s` and `C` is invariant, is the running value `i * C` advanced by `s * C`
+/// each iteration. rustc leaves the multiply for LLVM's scalar evolution to
+/// remove, so without this the `stats` hot loop pays a full 64-bit multiply per
+/// iteration. Both the multiply and the increment must be wrapping `Binary`
+/// ops (a checked multiply lowers to `WithOverflow`, which does not match), so
+/// the rewrite is exact under overflow checks too.
+pub fn strength_reduce(prog: &mut Program) {
+    for f in &mut prog.funcs {
+        f.strength_reduce();
+    }
+}
+
+impl Function {
+    fn strength_reduce(&mut self) {
+        let n = self.blocks.len();
+        if n == 0 {
+            return;
+        }
+        let succs: Vec<Vec<u32>> = self.blocks.iter().map(|b| successors(&b.term)).collect();
+        let src = self.copy_sources();
+        let mut preds: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for (b, ss) in succs.iter().enumerate() {
+            for &s in ss {
+                if !preds[s as usize].contains(&(b as u32)) {
+                    preds[s as usize].push(b as u32);
+                }
+            }
+        }
+        let mut dom: Vec<HashSet<usize>> = vec![HashSet::new(); n];
+        for b in 0..n {
+            if b == 0 {
+                dom[b].insert(0);
+            } else {
+                dom[b].extend(0..n);
+            }
+        }
+        loop {
+            let mut changed = false;
+            for b in 1..n {
+                let mut new: HashSet<usize> = HashSet::new();
+                if let Some((first, rest)) = preds[b].split_first() {
+                    new = dom[*first as usize].clone();
+                    for p in rest {
+                        new.retain(|x| dom[*p as usize].contains(x));
+                    }
+                }
+                new.insert(b);
+                if new != dom[b] {
+                    dom[b] = new;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        for h in 0..n {
+            self.sr_one_loop(h as u32, &preds, &dom, n, &src);
+        }
+    }
+
+    /// `local -> source local` for every local defined exactly once by a plain
+    /// `q = copy p` (or `move p`). rustc splits `i * C` across a copy
+    /// (`_9 = copy _3; _8 = Mul(move _9, const C)`), so the multiply's operand
+    /// has to be chased back to the induction variable.
+    fn copy_sources(&self) -> HashMap<u32, u32> {
+        let mut defs: HashMap<u32, u32> = HashMap::new();
+        let mut src: HashMap<u32, u32> = HashMap::new();
+        for b in &self.blocks {
+            for s in &b.stmts {
+                let Stmt::Assign(d, rv) = s else { continue };
+                if !d.proj.is_empty() {
+                    continue;
+                }
+                *defs.entry(d.local).or_insert(0) += 1;
+                if let Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) = rv {
+                    if p.proj.is_empty() {
+                        src.insert(d.local, p.local);
+                    }
+                }
+            }
+        }
+        src.retain(|k, v| defs.get(k).copied() == Some(1) && k != v);
+        src
+    }
+
+    fn sr_one_loop(
+        &mut self,
+        h: u32,
+        preds: &[Vec<u32>],
+        dom: &[HashSet<usize>],
+        n: usize,
+        src: &HashMap<u32, u32>,
+    ) {
+        // One back edge, so one latch: the header's only predecessor it dominates.
+        let latch: Vec<u32> = preds[h as usize]
+            .iter()
+            .copied()
+            .filter(|&u| u != h && dom[u as usize].contains(&(h as usize)))
+            .collect();
+        if latch.len() != 1 {
+            return;
+        }
+        let latch = latch[0];
+        // The loop is the latch plus every block that reaches it without the header.
+        let mut in_loop = vec![false; n];
+        in_loop[h as usize] = true;
+        let mut stack = vec![latch];
+        while let Some(x) = stack.pop() {
+            if in_loop[x as usize] {
+                continue;
+            }
+            in_loop[x as usize] = true;
+            for &p in &preds[x as usize] {
+                if p != h {
+                    stack.push(p);
+                }
+            }
+        }
+        // A single entry from outside is the preheader, and it must fall into the
+        // header so the init runs exactly once before the loop.
+        let outside: Vec<u32> =
+            preds[h as usize].iter().copied().filter(|&p| !in_loop[p as usize]).collect();
+        if outside.len() != 1 {
+            return;
+        }
+        let preheader = outside[0];
+        if !matches!(self.blocks[preheader as usize].term, Terminator::Goto(t) if t == h) {
+            return;
+        }
+        // The induction variable: assigned exactly once in the loop, by
+        // `iv = iv + s` with `s` a nonzero constant, with the increment in the
+        // latch so the running value can be advanced right after it.
+        let mut iv: Option<(u32, i64, usize)> = None;
+        for (si, s) in self.blocks[latch as usize].stmts.iter().enumerate() {
+            let Stmt::Assign(d, Rvalue::Binary(BinOp::Add, a, c)) = s else { continue };
+            if !d.proj.is_empty() {
+                continue;
+            }
+            let Some(k) = const_operand(c) else { continue };
+            if other_place(a) != Some(d.local) || k == 0 {
+                continue;
+            }
+            if !matches!(self.local_ty(d.local), Ty::I64) {
+                continue;
+            }
+            let defs = (0..n)
+                .filter(|&b| in_loop[b])
+                .flat_map(|b| self.blocks[b].stmts.iter())
+                .filter(|s| written_local(s) == Some(d.local))
+                .count();
+            if defs != 1 {
+                continue;
+            }
+            iv = Some((d.local, k, si));
+        }
+        let Some((iv_local, step, incr_idx)) = iv else { return };
+        // Every `p = iv * C` in the loop, one running value per distinct `C`.
+        let mut consts: Vec<i64> = Vec::new();
+        let mut targets: Vec<(u32, usize, i64)> = Vec::new();
+        for b in 0..n {
+            if !in_loop[b] {
+                continue;
+            }
+            for (si, s) in self.blocks[b].stmts.iter().enumerate() {
+                let Stmt::Assign(d, Rvalue::Binary(BinOp::Mul, a, c)) = s else { continue };
+                if !d.proj.is_empty() || d.local == 0 || d.local == iv_local {
+                    continue;
+                }
+                if !matches!(self.local_ty(d.local), Ty::I64) {
+                    continue;
+                }
+                let Some(cv) = const_operand(c) else { continue };
+                let Some(al) = other_place(a) else { continue };
+                if resolve_copy(src, al) != iv_local {
+                    continue;
+                }
+                // A multiply after the increment in the latch would read the
+                // already-advanced running value.
+                if b as u32 == latch && si > incr_idx {
+                    return;
+                }
+                if !consts.contains(&cv) {
+                    consts.push(cv);
+                }
+                targets.push((b as u32, si, cv));
+            }
+        }
+        if targets.is_empty() {
+            return;
+        }
+        // Reuse the multiply's own destination as the running value rather than
+        // spending a fresh local on it. The destination is the `i * C` the loop
+        // would otherwise recompute every iteration, so it is already a hot
+        // local; a fresh PIV local would be just as hot and evict the accumulator
+        // from the register file. Every target with the same `C` reads this one
+        // running value. The destination is reused only when the loop writes it
+        // nowhere else, so the running value cannot be clobbered mid-loop.
+        let mut piv: Vec<(i64, u32)> = Vec::new();
+        for &c in &consts {
+            let dest = targets
+                .iter()
+                .find(|&&(_, _, tc)| tc == c)
+                .and_then(|&(b, si, _)| match &self.blocks[b as usize].stmts[si] {
+                    Stmt::Assign(d, _) => Some((d.local, b, si)),
+                    _ => None,
+                })
+                .filter(|&(l, _, _)| {
+                    let defs = (0..n)
+                        .filter(|&bb| in_loop[bb])
+                        .flat_map(|bb| self.blocks[bb].stmts.iter())
+                        .filter(|s| written_local(s) == Some(l))
+                        .count();
+                    defs == 1
+                })
+                .map(|(l, _, _)| l)
+                .unwrap_or_else(|| self.fresh_local());
+            piv.push((c, dest));
+        }
+        // `piv_C = iv * C` once, in the preheader; then `piv_C += s * C` after
+        // the increment, so `piv_C == iv * C` at the start of every iteration.
+        let mut init: Vec<Stmt> = Vec::new();
+        let mut adv: Vec<Stmt> = Vec::new();
+        for &(c, l) in &piv {
+            let pl = Place { local: l, proj: Vec::new() };
+            init.push(Stmt::Assign(
+                pl.clone(),
+                Rvalue::Binary(
+                    BinOp::Mul,
+                    Operand::Copy(Place { local: iv_local, proj: Vec::new() }),
+                    Operand::Const(Const::Int(c)),
+                ),
+            ));
+            adv.push(Stmt::Assign(
+                pl.clone(),
+                Rvalue::Binary(
+                    BinOp::Add,
+                    Operand::Copy(pl),
+                    Operand::Const(Const::Int(step.wrapping_mul(c))),
+                ),
+            ));
+        }
+        let rewrites: Vec<(u32, usize, u32)> = targets
+            .iter()
+            .map(|&(b, si, c)| (b, si, piv.iter().find(|(k, _)| *k == c).unwrap().1))
+            .collect();
+        for (b, si, l) in rewrites {
+            let dest = match &self.blocks[b as usize].stmts[si] {
+                Stmt::Assign(d, _) => d.clone(),
+                _ => continue,
+            };
+            self.blocks[b as usize].stmts[si] = Stmt::Assign(
+                dest,
+                Rvalue::Use(Operand::Copy(Place { local: l, proj: Vec::new() })),
+            );
+        }
+        let latch_stmts = &mut self.blocks[latch as usize].stmts;
+        for (k, s) in adv.into_iter().enumerate() {
+            latch_stmts.insert(incr_idx + 1 + k, s);
+        }
+        self.blocks[preheader as usize].stmts.extend(init);
+    }
+}
+
 /// Fold a counted loop into its closed form.
 ///
 /// `for _ in 0..n { acc += K }`, with `K` loop-invariant, is `acc += K * n`.
@@ -4698,6 +4966,17 @@ fn other_place(op: &Operand) -> Option<u32> {
         Operand::Copy(p) | Operand::Move(p) if p.proj.is_empty() => Some(p.local),
         _ => None,
     }
+}
+
+/// Chase a local through a chain of single-definition copies.
+fn resolve_copy(src: &HashMap<u32, u32>, mut l: u32) -> u32 {
+    for _ in 0..16 {
+        match src.get(&l) {
+            Some(&next) if next != l => l = next,
+            _ => break,
+        }
+    }
+    l
 }
 
 /// Force an operand to a copy: a `Move` becomes a `Copy`, so the operand can be
