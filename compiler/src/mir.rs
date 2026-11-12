@@ -2576,16 +2576,22 @@ fn operand_ty(op: &Operand) -> Ty {
 
 fn bin_op(name: &str) -> Option<BinOp> {
     Some(match name {
-        "Add" | "UncheckedAdd" => BinOp::Add,
-        "Sub" | "UncheckedSub" => BinOp::Sub,
-        "Mul" | "UncheckedMul" => BinOp::Mul,
+        // rustc prints the wrapping forms of `+`/`-`/`*`/`<<`/`>>` (from
+        // `wrapping_*`, and from its own range/iterator desugaring) as
+        // `AddUnchecked` and friends; older dumps spelled them `UncheckedAdd`.
+        // They lower to the same instruction as the plain spelling, because a
+        // checked operation's trap is a separate `assert` in the MIR, so both
+        // names map to one variant and every pass and code path sees it.
+        "Add" | "AddUnchecked" | "UncheckedAdd" => BinOp::Add,
+        "Sub" | "SubUnchecked" | "UncheckedSub" => BinOp::Sub,
+        "Mul" | "MulUnchecked" | "UncheckedMul" => BinOp::Mul,
         "Div" => BinOp::Div,
         "Rem" => BinOp::Rem,
         "BitXor" => BinOp::BitXor,
         "BitAnd" => BinOp::BitAnd,
         "BitOr" => BinOp::BitOr,
-        "Shl" | "UncheckedShl" => BinOp::Shl,
-        "Shr" | "UncheckedShr" => BinOp::Shr,
+        "Shl" | "ShlUnchecked" | "UncheckedShl" => BinOp::Shl,
+        "Shr" | "ShrUnchecked" | "UncheckedShr" => BinOp::Shr,
         "Eq" => BinOp::Eq,
         "Ne" => BinOp::Ne,
         "Lt" => BinOp::Lt,

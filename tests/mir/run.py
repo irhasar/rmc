@@ -51,6 +51,9 @@ ARGS = {
     "genstruct": [["7"], ["0"], ["42"]],
     "modgen": [["7"], ["0"], ["42"]],
     "modrelpath": [["1", "2", "3", "4"], ["9", "8", "7", "6"]],
+    # ovfcheck runs with overflow checks on: the first vector is in range, the
+    # second overflows the add and must exit 101 on both binaries.
+    "ovfcheck": [["2", "3"], ["9223372036854775807", "1"]],
 }
 
 
@@ -71,6 +74,38 @@ def runtime_asm():
     return rt
 
 
+def overflow_checks(name):
+    """A `NAME.overflow` marker turns on overflow checks on both sides."""
+    return os.path.exists(os.path.join(ROOT, f"{name}.overflow"))
+
+
+def overflow_stubs(rt):
+    """An object defining core's panic-const symbols as `__rmc_overflow`.
+
+    With overflow checks on, the reference calls
+    `core::panicking::panic_const::*_overflow`, which a `#![no_std]` static
+    link has no definition for. The three symbols only have to trap the way
+    rmc's own checked arithmetic does, so each jumps to `__rmc_overflow` in the
+    shared runtime. Only `ovfcheck` needs this; the other cases link as before.
+    """
+    stubs = os.path.join(OUT, "overflow_stubs.o")
+    src = os.path.join(OUT, "overflow_stubs.s")
+    if not os.path.exists(stubs):
+        names = [
+            "_RNvNtNtCskADBYZwJmSU_4core9panicking11panic_const24panic_const_add_overflow",
+            "_RNvNtNtCskADBYZwJmSU_4core9panicking11panic_const24panic_const_sub_overflow",
+            "_RNvNtNtCskADBYZwJmSU_4core9panicking11panic_const24panic_const_mul_overflow",
+        ]
+        with open(src, "w") as f:
+            f.write(".text\n")
+            for n in names:
+                f.write(f".globl {n}\n.type {n}, @function\n{n}:\n  jmp __rmc_overflow\n")
+        rc, _, err = run(["cc", "-c", src, "-o", stubs])
+        if rc != 0:
+            sys.exit(f"overflow stub assembly failed:\n{err.decode(errors='replace')}")
+    return stubs
+
+
 def build_reference(name, rt):
     """rustc -> object -> static link against the shared runtime."""
     src = os.path.join(ROOT, f"{name}.rs")
@@ -79,13 +114,17 @@ def build_reference(name, rt):
     rc, _, err = run([
         "rustc", "-O", "-C", "opt-level=3", "-C", "panic=abort",
         "--crate-type=bin", "--edition", "2021",
-        "-C", "relocation-model=static", "--emit=obj", src, "-o", obj,
+        "-C", "relocation-model=static", "--emit=obj",
+        "-C", "overflow-checks=on" if overflow_checks(name) else "overflow-checks=off",
+        src, "-o", obj,
     ])
     if rc != 0:
         return None, f"rustc failed:\n{err.decode(errors='replace')}"
-    rc, _, err = run([
-        "cc", "-static", "-nostdlib", "-no-pie", obj, rt, "-o", ref,
-    ])
+    link = ["cc", "-static", "-nostdlib", "-no-pie", obj, rt]
+    if overflow_checks(name):
+        link.append(overflow_stubs(rt))
+    link += ["-o", ref]
+    rc, _, err = run(link)
     if rc != 0:
         return None, f"cc failed:\n{err.decode(errors='replace')}"
     return ref, None
@@ -94,7 +133,10 @@ def build_reference(name, rt):
 def build_rmc(name):
     src = os.path.join(ROOT, f"{name}.rs")
     mir = os.path.join(OUT, f"{name}.mir.bin")
-    rc, _, err = run([RMC, "--rustc-frontend", src, "-o", mir])
+    argv = [RMC, "--rustc-frontend", src, "-o", mir]
+    if overflow_checks(name):
+        argv.insert(2, "--overflow-checks")
+    rc, _, err = run(argv)
     if rc != 0:
         return None, f"rmc failed:\n{err.decode(errors='replace')}"
     return mir, None

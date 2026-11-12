@@ -30,7 +30,10 @@ fn main() {
     let output = output.unwrap_or_else(|| input.with_extension(""));
 
     let text = std::fs::read_to_string(&input).expect("cannot read input");
-    let opts = Options { overflow_checks, promote: !no_promote };
+    // `--overflow-checks` still gates the MIR passes below (a hoisted or
+    // loop-closed `+` would move a trap); the trap itself is already an
+    // `assert` in the input MIR, so the back end needs no switch of its own.
+    let opts = Options { promote: !no_promote };
     let timing = std::env::var_os("RMC_TIME").is_some();
     let mut t0 = std::time::Instant::now();
     let mark = |label: &str, t0: &mut std::time::Instant| {
@@ -57,7 +60,7 @@ fn main() {
     mark("licm", &mut t0);
     rmc::mir::fold_accumulators(&mut prog);
     rmc::mir::strength_reduce(&mut prog);
-    rmc::mir::close_counted_loops(&mut prog, opts.overflow_checks);
+    rmc::mir::close_counted_loops(&mut prog, overflow_checks);
     mark("fold_accumulators", &mut t0);
     rmc::mir::jump_thread(&mut prog);
     mark("jump_thread", &mut t0);

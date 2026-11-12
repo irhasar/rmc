@@ -2287,6 +2287,46 @@ one (`G::<T>` with a module-qualified argument gave 12 instead of 119). Reducing
 first makes `Option::<i64>::Some` -> `Option::Some` (a variant) and `G::<T>` ->
 `G` (a struct). Regression: `tests/mir/genstruct.rs`.
 
+### Overflow checks are rustc's rewrite, not the back end's switch
+
+On the MIR path the back end must never emit an overflow trap of its own. rustc
+encodes a checked `+`/`-`/`*` as `AddWithOverflow`/`SubWithOverflow`/
+`MulWithOverflow` followed by an `assert`, and encodes the wrapping forms
+(`wrapping_add`, and rustc's own range/iterator desugaring, which prints as
+`AddUnchecked` and friends) as a bare `Add`. So a trap is always an explicit
+`assert` in the MIR, and the instruction itself is identical either way. The
+back end's job is only to lower both spellings to the same instruction; whether
+the operation traps is decided entirely by whether rustc put the `assert` there.
+
+For the same reason `bin_op` maps `AddUnchecked`/`SubUnchecked`/`MulUnchecked`
+(and the shift forms, and the older `UncheckedAdd` spelling) straight to
+`BinOp::Add` and friends rather than to separate variants. A separate variant
+would lower correctly but would also stop matching the many loop passes that
+pattern-match `Rvalue::Binary(BinOp::Add, ..)` on a literal, so the counter
+induction of a `for i in 0..n` written over a slice (where rustc emits
+`AddUnchecked`) would silently stop strength-reducing while the same loop over a
+plain range (which emits `AddWithOverflow` + `assert`) still did.
+
+`--overflow-checks` is therefore passed to the *rustc* invocation
+(`-C overflow-checks=on|off` in `main.rs`), not to `mir_codegen`. An earlier
+version had the back end add `jo __rmc_overflow` after every `add`/`sub`/`mul`,
+which is wrong twice over: it traps `wrapping_add` (rustc emits it as a plain
+`Add`, so nothing should trap) and it double-traps the checked forms (rustc's
+`assert` already fires). It also cannot see a value that is only out of range at
+run time, so a runtime `i64::MAX + 1` slipped through until the flag was passed
+through to rustc. `mir_codegen::Options` has no `overflow_checks` field for this
+reason. Division overflow is the one case rustc guards regardless of the flag
+(`assert(!(y == -1 && x == i64::MIN))` before a `Div`), so `gen_div_const`'s
+`neg %rax` needs no trap either.
+
+Regressions: `tests/mir/wrapping.rs` (the wrapping family and a range `for`,
+compiled with checks *off* — must not trap), and `tests/mir/ovfcheck.rs` +
+`ovfcheck.overflow` (checked arithmetic compiled with checks *on* — must exit
+101 on overflow). The `.overflow` marker makes `tests/mir/run.py` pass
+`--overflow-checks` to rmc and `-C overflow-checks=on` to the reference, and
+link the reference against small stubs that route core's
+`panic_const_*_overflow` symbols to `__rmc_overflow`.
+
 ### A type spelling is relative to the item that mentions it, and it can be qualified
 
 rustc prints a type relative to the body that mentions it, and that relative

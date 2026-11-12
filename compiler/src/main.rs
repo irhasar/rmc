@@ -145,7 +145,8 @@ fn print_help() {
          \x20   --no-strip     keep the symbol table in the output binary\n\
          \x20   --min-size     with --binutils, also drop the section headers\n\
          \x20   --binutils     use GNU `as` and `ld` instead of linking in-process\n\
-         \x20   --overflow-checks  trap on i64 +,-,* overflow (off by default)\n\
+         \x20   --overflow-checks  trap on i64 +,-,* overflow (off by default;\n\
+         \x20                      on the MIR path rustc applies the rewrite)\n\
          \x20   --bounds-checks    trap on an out-of-range array index (off by default)\n\
          \x20   --no-inline        disable the inlining pass (on by default)\n\
          \x20   --no-licm          disable loop-invariant code motion (on by default)\n\
@@ -191,16 +192,20 @@ fn main() {
 /// dropping it triples the run time of the emitted code (`fib` 5.4 ms ->
 /// 20.4 ms), because the MIR-level optimisations it runs are the ones rmc's
 /// own passes build on.
-fn front_end_mir(input: &Path) -> Result<String, String> {
-    match run_rustc_front_end(input, true) {
+fn front_end_mir(input: &Path, overflow_checks: bool) -> Result<String, String> {
+    match run_rustc_front_end(input, true, overflow_checks) {
         Ok(mir) => Ok(mir),
-        Err(_) => run_rustc_front_end(input, false),
+        Err(_) => run_rustc_front_end(input, false, overflow_checks),
     }
 }
 
 /// One rustc front-end invocation. `no_codegen` selects `-Zno-codegen` (with
 /// `RUSTC_BOOTSTRAP=1`); the fallback call passes `false`.
-fn run_rustc_front_end(input: &Path, no_codegen: bool) -> Result<String, String> {
+fn run_rustc_front_end(
+    input: &Path,
+    no_codegen: bool,
+    overflow_checks: bool,
+) -> Result<String, String> {
     let mut cmd = Command::new("rustc");
     cmd.arg("--emit=mir")
         .arg("-o")
@@ -208,6 +213,14 @@ fn run_rustc_front_end(input: &Path, no_codegen: bool) -> Result<String, String>
         .arg("-O")
         .arg("-C")
         .arg("panic=abort")
+        // `--overflow-checks` is rustc's switch here, not the back end's:
+        // rustc rewrites checked `+`/`-`/`*` into `AddWithOverflow` plus an
+        // `assert`, and leaves the wrapping forms (`wrapping_add`, its own
+        // range/iterator desugaring) as a bare `Add`. Passing the flag through
+        // is what makes the MIR carry the trap, and it is why the back end must
+        // not add one of its own.
+        .arg("-C")
+        .arg(if overflow_checks { "overflow-checks=on" } else { "overflow-checks=off" })
         .arg("--crate-type=bin")
         .arg("--edition")
         .arg("2021");
@@ -236,7 +249,7 @@ fn run_rustc_front_end(input: &Path, no_codegen: bool) -> Result<String, String>
 
 /// Compile a `.rs` input through the rustc-MIR front end and the rmc back end.
 fn run_mir_pipeline(opts: &Options) -> Result<(), String> {
-    let mir = front_end_mir(&opts.input)?;
+    let mir = front_end_mir(&opts.input, opts.overflow_checks)?;
     if opts.keep_mir {
         let mir_path = opts.output.with_extension("mir");
         std::fs::write(&mir_path, &mir)
@@ -269,10 +282,7 @@ fn run_mir_text(opts: &Options, mir: &str) -> Result<(), String> {
     rmc::mir::prune_unreachable(&mut prog);
     rmc::mir::rotate_loops(&mut prog);
     rmc::mir::layout_blocks(&mut prog);
-    let mir_opts = rmc::mir_codegen::Options {
-        overflow_checks: opts.overflow_checks,
-        promote: true,
-    };
+    let mir_opts = rmc::mir_codegen::Options { promote: true };
     let asm = rmc::compile_mir_to_asm(&prog, &mir_opts)?;
     emit_binary(opts, &asm)
 }

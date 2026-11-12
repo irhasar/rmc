@@ -37,15 +37,18 @@ const PROMOTE_REGS: [&str; 5] = ["%rbx", "%r12", "%r13", "%r14", "%r15"];
 const CALLER_REGS: [&str; 4] = ["%rsi", "%rdi", "%r8", "%r9"];
 
 pub struct Options {
-    /// Emit `jo __rmc_overflow` after `+`/`-`/`*` (rustc's overflow-checks).
-    pub overflow_checks: bool,
     /// Promote hot locals into callee-saved registers (on by default).
+    ///
+    /// There is no overflow-check switch: on this path the trap is an `assert`
+    /// rustc already put in the MIR (`AddWithOverflow` + `assert` for checked
+    /// arithmetic, a bare `Add` for the wrapping forms), so the back end must
+    /// not add one of its own.
     pub promote: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { overflow_checks: false, promote: true }
+        Options { promote: true }
     }
 }
 
@@ -3540,9 +3543,6 @@ impl<'a> FnGen<'a> {
             let (bv, _) = self.eval_operand_keep_rax(b)?;
             let bv = self.wide_imm(&bv, "%rcx");
             self.emit(&format!("  {} {bv}, {reg}", alu_mnem(op)));
-            if self.opts.overflow_checks && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
-                self.emit("  jo __rmc_overflow");
-            }
             return Ok(());
         }
         match op {
@@ -3923,9 +3923,6 @@ impl<'a> FnGen<'a> {
                 // materialised in a register first.
                 let bv = self.wide_imm(&bv, "%rcx");
                 self.emit(&format!("  {m} {bv}, %rax"));
-                if self.opts.overflow_checks && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
-                    self.emit("  jo __rmc_overflow");
-                }
             }
             BinOp::Shl | BinOp::Shr => {
                 // The shift count must be in `%cl`. Evaluating it may make a
@@ -4038,9 +4035,6 @@ impl<'a> FnGen<'a> {
             // The dividend is already in `%rax`.
         } else if d == -1 {
             self.emit("  neg %rax");
-            if self.opts.overflow_checks {
-                self.emit("  jo __rmc_overflow");
-            }
         } else {
             let mag = d.unsigned_abs();
             if mag.is_power_of_two() {
