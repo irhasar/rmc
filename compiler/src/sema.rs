@@ -224,7 +224,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     // Runtime helpers provided by the freestanding assembly runtime. They are
     // linked in automatically, so they do not appear in the source program.
-    let builtins: [(&str, &[Type], Type); 43] = [
+    let builtins: [(&str, &[Type], Type); 48] = [
         ("print_i64", &[Type::I64], Type::Unit),
         ("print_str", &[Type::Str], Type::Unit),
         ("print_bool", &[Type::Bool], Type::Unit),
@@ -266,6 +266,19 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         ("__rmc_vec_push", &[Type::I64, Type::I64, Type::I64], Type::I64),
         ("__rmc_vec_len", &[Type::I64], Type::I64),
         ("__rmc_vec_cap", &[Type::I64], Type::I64),
+        // The growable-`String` helpers. A `String` value is the address of a
+        // `{len, bytes}` record — the same shape a `str` is — so every `str`
+        // helper reads a `String` unchanged and `as_str` is the value itself.
+        // The capacity is the word before the length. `__rmc_str_new` makes an
+        // empty string of a given capacity, `__rmc_str_from` copies a `str`
+        // record, `__rmc_str_push_str`/`_char` append (growing, and returning
+        // the possibly-moved address), and `__rmc_string_cap` reads the
+        // capacity. Emitted by the parser, never written in source.
+        ("__rmc_str_new", &[Type::I64], Type::Str),
+        ("__rmc_str_from", &[Type::Str], Type::Str),
+        ("__rmc_str_push_str", &[Type::Str, Type::Str], Type::Str),
+        ("__rmc_str_push_char", &[Type::Str, Type::Char], Type::Str),
+        ("__rmc_string_cap", &[Type::Str], Type::I64),
         // `__rmc_min(a, b)`: the smaller of two `i64`, backing the `skip`/`take`
         // range adapters' count. Emitted by the parser, never written in source.
         ("__rmc_min", &[Type::I64, Type::I64], Type::I64),
@@ -573,6 +586,10 @@ fn resolve_ty_rec(
 ) -> Result<Type, String> {
     match t {
         Type::Named(n) if n == "str" => Ok(Type::Str),
+        // `String` shares `str`'s `{len, bytes}` record layout in rmc, so a
+        // `String` binding is a `Str` value; its methods are lowered by the
+        // parser (see `string_names`).
+        Type::Named(n) if n == "String" => Ok(Type::Str),
         Type::Named(n) => {
             if raw_e.contains_key(n.as_str()) {
                 layout_enum(n, raw_s, raw_e, so, eo, visiting)?;
@@ -614,6 +631,7 @@ fn resolve_in(
 ) -> Result<Type, String> {
     match t {
         Type::Named(n) if n == "str" => Ok(Type::Str),
+        Type::Named(n) if n == "String" => Ok(Type::Str),
         Type::Named(n) => {
             if let Some(info) = enums.get(n) {
                 return Ok(if info.has_payload {
@@ -3209,6 +3227,7 @@ impl Sema {
                             "vecrepeat" | "veclist" => "`vec![..]`",
                             "argsvec" => "`std::env::args()...collect()`",
                             "ptr" => "`as_mut_ptr` / `as_ptr`",
+                            "strnew" | "strfrom" => "`String::new` / `String::with_capacity` / `String::from`",
                             _ => "this construct",
                         };
                         return format!("{what} is only supported directly in a `let` initializer");

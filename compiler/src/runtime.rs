@@ -1099,6 +1099,294 @@ __rmc_vec_cap:
     },
     Piece {
         text: r#"
+# A `String` is a growable heap byte buffer. Its *value* is the address of a
+# `{len, bytes}` record, exactly what a `str` is, so `s.as_str()` is the value
+# itself and every `str` helper (`__rmc_str_len`, `__rmc_write_str`,
+# `__rmc_str_lt`, `__rmc_str_starts`, ...) reads a `String` with no change. The
+# capacity lives in the word *before* the length: the block is
+# `[cap][len][bytes...]`, the string value points at `[len]`, and `s.capacity()`
+# is `-8(%rdi)`. `len` and `cap` are byte counts. `String` grows to
+# `max(2*cap, needed)`, never below a minimum capacity of 8 (what makes an empty
+# string's first `push_str` reach 8), matching `String::reserve` in Rust.
+#
+# rdi = capacity  ->  rax = the record view of a fresh, empty String
+.globl __rmc_str_new
+.type __rmc_str_new, @function
+__rmc_str_new:
+    push %rbx
+    sub $16, %rsp
+    mov %rdi, %rbx            # capacity
+    lea 16(%rdi), %rdi        # bytes = capacity + {cap, len}
+    call alloc
+    mov %rbx, (%rax)          # capacity
+    movq $0, 8(%rax)          # length = 0
+    add $8, %rax              # the value is the {len, bytes} record
+    add $16, %rsp
+    pop %rbx
+    ret
+.size __rmc_str_new, .-__rmc_str_new
+
+# rdi = src (a `{len, bytes}` record, e.g. a string literal)  ->  rax = the
+# record view of a new String holding a copy of its bytes. `String::from("lit")`
+# copies the literal so the result is owned and growable; the capacity is the
+# literal's length, matching `str::to_string`/`String::from` in Rust.
+.globl __rmc_str_from
+.type __rmc_str_from, @function
+__rmc_str_from:
+    push %rbx
+    push %r12
+    sub $8, %rsp
+    mov (%rdi), %r12          # src length
+    lea 8(%rdi), %rbx         # src bytes
+    mov %r12, %rdi
+    add $16, %rdi
+    call alloc
+    mov %r12, (%rax)          # capacity = src length
+    mov %r12, 8(%rax)         # length = src length
+    lea 16(%rax), %rax        # dst data
+    xor %rcx, %rcx
+.Lstr_from_copy:
+    cmp %r12, %rcx
+    jae .Lstr_from_done
+    movzbl (%rbx,%rcx), %edx
+    mov %dl, (%rax,%rcx)
+    inc %rcx
+    jmp .Lstr_from_copy
+.Lstr_from_done:
+    lea -8(%rax), %rax        # the {len, bytes} record view
+    add $8, %rsp
+    pop %r12
+    pop %rbx
+    ret
+.size __rmc_str_from, .-__rmc_str_from
+
+# rdi = string (a `{len, bytes}` record), rsi = src record  ->  rax = the
+# (possibly moved) string. `push_str` appends the record's bytes. If the result
+# fits the current capacity it is written in place and the same address is
+# returned; otherwise the store grows (Rust's `String` policy: `max(2*cap,
+# needed)`, minimum 8), the old bytes are copied and the new record view is
+# returned.
+.globl __rmc_str_push_str
+.type __rmc_str_push_str, @function
+__rmc_str_push_str:
+    push %rbx
+    push %r12
+    push %r13
+    push %r14
+    push %r15
+    sub $8, %rsp
+    mov %rdi, %rbx            # string record view
+    mov (%rsi), %r13          # appended byte count
+    lea 8(%rsi), %r14         # appended bytes
+    mov (%rbx), %r12          # current length
+    mov -8(%rbx), %r15        # current capacity
+    lea (%r12,%r13), %rax     # needed = length + appended
+    cmp %r15, %rax
+    jbe .Lstr_push_place
+    # Grow: capacity = max(2*cap, needed), but never below the minimum 8.
+    shl $1, %r15
+    cmp %rax, %r15
+    jae .Lstr_push_have_cap
+    mov %rax, %r15
+.Lstr_push_have_cap:
+    cmp $8, %r15
+    jae .Lstr_push_cap_ok
+    mov $8, %r15
+.Lstr_push_cap_ok:
+    mov %r15, %rdi
+    add $16, %rdi
+    call alloc
+    mov %rax, %r9             # new base
+    mov %r15, (%r9)           # capacity
+    mov %r12, 8(%r9)          # length
+    lea 16(%r9), %r10         # new data
+    lea 8(%rbx), %rsi         # old data
+    mov %r12, %rcx
+    test %rcx, %rcx
+    jz .Lstr_push_installed
+.Lstr_push_copy:
+    mov (%rsi), %dl
+    mov %dl, (%r10)
+    inc %rsi
+    inc %r10
+    dec %rcx
+    jnz .Lstr_push_copy
+.Lstr_push_installed:
+    lea 8(%r9), %rbx          # string = new record view
+.Lstr_push_place:
+    lea 8(%rbx,%r12), %rdi    # destination = data + length
+    mov %r14, %rsi
+    mov %r13, %rcx
+    test %rcx, %rcx
+    jz .Lstr_push_done
+.Lstr_push_append:
+    mov (%rsi), %dl
+    mov %dl, (%rdi)
+    inc %rsi
+    inc %rdi
+    dec %rcx
+    jnz .Lstr_push_append
+.Lstr_push_done:
+    add %r13, %r12
+    mov %r12, (%rbx)          # length += appended
+    mov %rbx, %rax
+    add $8, %rsp
+    pop %r15
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %rbx
+    ret
+.size __rmc_str_push_str, .-__rmc_str_push_str
+
+# rdi = string, rsi = code point  ->  rax = the (possibly moved) string.
+# Appends the UTF-8 encoding of `rsi` (1..4 bytes), growing as `push_str` does.
+.globl __rmc_str_push_char
+.type __rmc_str_push_char, @function
+__rmc_str_push_char:
+    push %rbx
+    push %r12
+    push %r13
+    push %r14
+    push %r15
+    sub $8, %rsp
+    mov %rdi, %rbx            # string record view
+    mov %rsi, %r14            # code point
+    # Encode into a 4-byte scratch buffer on the stack.
+    sub $8, %rsp              # scratch[0..4]
+    cmp $0x80, %r14
+    jae .Lstr_pc_two
+    mov %r14b, (%rsp)
+    mov $1, %r13
+    jmp .Lstr_pc_enc
+.Lstr_pc_two:
+    cmp $0x800, %r14
+    jae .Lstr_pc_three
+    mov %r14, %rax
+    shr $6, %rax
+    or $0xc0, %eax
+    mov %al, (%rsp)
+    mov %r14, %rax
+    and $0x3f, %eax
+    or $0x80, %eax
+    mov %al, 1(%rsp)
+    mov $2, %r13
+    jmp .Lstr_pc_enc
+.Lstr_pc_three:
+    cmp $0x10000, %r14
+    jae .Lstr_pc_four
+    mov %r14, %rax
+    shr $12, %rax
+    or $0xe0, %eax
+    mov %al, (%rsp)
+    mov %r14, %rax
+    shr $6, %rax
+    and $0x3f, %eax
+    or $0x80, %eax
+    mov %al, 1(%rsp)
+    mov %r14, %rax
+    and $0x3f, %eax
+    or $0x80, %eax
+    mov %al, 2(%rsp)
+    mov $3, %r13
+    jmp .Lstr_pc_enc
+.Lstr_pc_four:
+    mov %r14, %rax
+    shr $18, %rax
+    or $0xf0, %eax
+    mov %al, (%rsp)
+    mov %r14, %rax
+    shr $12, %rax
+    and $0x3f, %eax
+    or $0x80, %eax
+    mov %al, 1(%rsp)
+    mov %r14, %rax
+    shr $6, %rax
+    and $0x3f, %eax
+    or $0x80, %eax
+    mov %al, 2(%rsp)
+    mov %r14, %rax
+    and $0x3f, %eax
+    or $0x80, %eax
+    mov %al, 3(%rsp)
+    mov $4, %r13
+.Lstr_pc_enc:
+    mov (%rbx), %r12          # current length
+    mov -8(%rbx), %r15        # current capacity
+    lea (%r12,%r13), %rax     # needed
+    cmp %r15, %rax
+    jbe .Lstr_pc_place
+    shl $1, %r15
+    cmp %rax, %r15
+    jae .Lstr_pc_have_cap
+    mov %rax, %r15
+.Lstr_pc_have_cap:
+    cmp $8, %r15
+    jae .Lstr_pc_cap_ok
+    mov $8, %r15
+.Lstr_pc_cap_ok:
+    mov %r15, %rdi
+    add $16, %rdi
+    call alloc
+    mov %rax, %r9
+    mov %r15, (%r9)
+    mov %r12, 8(%r9)
+    lea 16(%r9), %r10
+    lea 8(%rbx), %rsi
+    mov %r12, %rcx
+    test %rcx, %rcx
+    jz .Lstr_pc_installed
+.Lstr_pc_copy:
+    mov (%rsi), %dl
+    mov %dl, (%r10)
+    inc %rsi
+    inc %r10
+    dec %rcx
+    jnz .Lstr_pc_copy
+.Lstr_pc_installed:
+    lea 8(%r9), %rbx
+.Lstr_pc_place:
+    lea 8(%rbx,%r12), %rdi    # destination
+    mov %rsp, %rsi            # scratch bytes
+    mov %r13, %rcx
+.Lstr_pc_store:
+    mov (%rsi), %dl
+    mov %dl, (%rdi)
+    inc %rsi
+    inc %rdi
+    dec %rcx
+    jnz .Lstr_pc_store
+    add %r13, %r12
+    mov %r12, (%rbx)
+    mov %rbx, %rax
+    add $8, %rsp              # scratch
+    add $8, %rsp
+    pop %r15
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %rbx
+    ret
+.size __rmc_str_push_char, .-__rmc_str_push_char
+
+# rdi = string  ->  rax = its byte capacity (the word before the length).
+.globl __rmc_string_cap
+.type __rmc_string_cap, @function
+__rmc_string_cap:
+    mov -8(%rdi), %rax
+    ret
+.size __rmc_string_cap, .-__rmc_string_cap
+"#,
+        defines: &[
+            "__rmc_str_new",
+            "__rmc_str_from",
+            "__rmc_str_push_str",
+            "__rmc_str_push_char",
+            "__rmc_string_cap",
+        ],
+    },
+    Piece {
+        text: r#"
 .text
 # void __rmc_overflow(void)  -- a checked +,-,* overflowed; write a fixed
 # message and exit with status 101, mirroring a Rust panic.

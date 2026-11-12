@@ -2168,6 +2168,28 @@ The three `for` forms over a vector desugar to index loops, all bounded by
 and reads each element by value, so a `push` in the body grows the original
 binding without moving the bound.
 
+`String` is a growable byte buffer with no `std` type in sema: its *value* is the
+address of a `{len, bytes}` record, exactly what a `str` is, so `s.as_str()` is
+the value itself and every `str` helper (`__rmc_str_len`, `__rmc_write_str`,
+`__rmc_str_lt`, `__rmc_str_starts`, ...) reads a `String` with no change, and a
+`String` compares byte-wise against a `str` or another `String` through the
+existing `str` compare. The capacity is the word *before* the length: the block
+is `[cap][len][bytes...]`, the value points at `[len]`, and `s.capacity()` reads
+`-8`. `__rmc_str_new(cap)` allocates and returns the empty record,
+`__rmc_str_from(src)` copies a `str` record (so `String::from("lit")` is owned
+and growable, with capacity equal to the literal's length, as in `std`),
+`__rmc_str_push_str(s, src)` and `__rmc_str_push_char(s, cp)` append (the latter
+UTF-8-encodes the code point into a stack scratch), and `__rmc_string_cap(s)`
+reads the capacity. Both push helpers grow to `max(2*cap, needed)`, never below
+the minimum capacity of 8 (`std`'s `String` policy), and return the possibly
+moved record; `expr_stmt` writes that result back into a simple receiver
+binding, as it does for a `Vec` push. The parser recognises `String::new`,
+`String::with_capacity` and `String::from` in a `let` initializer (the
+`\0strnew`/`\0strfrom` markers) and rewrites the `capacity`/`as_str`/`push_str`/
+`push` methods on a name in `string_names`; `len`, `is_empty`, `starts_with`,
+`ends_with` and `contains` are left to the `str` handling in sema, because the
+layout is identical.
+
 A byte *referent* is tracked. `*const u8`, `*mut u8` and `*mut i8` parse to
 `Type::U8`/`Type::I8` (through `parse_referent_type`, so a `type Byte = u8`
 alias works), and only there: the byte-ness is a property of the pointer, not of

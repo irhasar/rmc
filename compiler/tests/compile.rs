@@ -8274,6 +8274,81 @@ fn vec_push_calls_the_grow_helper_and_writes_the_address_back() {
 }
 
 #[test]
+fn string_new_and_from_call_the_string_helpers() {
+    // `String::new()`/`with_capacity(k)` allocate an empty buffer through
+    // `__rmc_str_new`, and `String::from("lit")` copies the literal through
+    // `__rmc_str_from`. A `String` value is a `str` record, so the binding is a
+    // `Str`, not an `i64`.
+    let out = asm("fn main() { let s = String::from(\"abc\"); let _ = s.len(); }");
+    assert!(out.contains("call __rmc_str_from"), "from copies the literal:\n{out}");
+    let out = asm("fn main() { let s = String::new(); let _ = s.len(); }");
+    assert!(out.contains("call __rmc_str_new"), "new allocates:\n{out}");
+    let out = asm("fn main() { let s = String::with_capacity(10); let _ = s.len(); }");
+    assert!(out.contains("call __rmc_str_new"), "with_capacity allocates:\n{out}");
+}
+
+#[test]
+fn string_len_is_a_str_len_read_and_capacity_reads_before_the_record() {
+    // `s.len()` reads the record's length word through the shared `str` helper,
+    // so a `String` and a `str` take the same path; `s.capacity()` reads the
+    // word before the record.
+    let out = asm("fn main() { let s = String::from(\"abc\"); let _ = s.len(); let _ = s.capacity(); }");
+    assert!(out.contains("call __rmc_str_len"), "len reads the record:\n{out}");
+    assert!(out.contains("call __rmc_string_cap"), "capacity reads before it:\n{out}");
+}
+
+#[test]
+fn string_push_str_calls_the_grow_helper_and_writes_the_record_back() {
+    // `s.push_str(x)` lowers to `__rmc_str_push_str(s, x)`, which can move the
+    // store; its result (the new record) is stored back into `s`.
+    let out = asm("fn main() { let mut s = String::from(\"a\"); s.push_str(\"bc\"); }");
+    assert!(out.contains("call __rmc_str_push_str"), "push_str calls the helper:\n{out}");
+}
+
+#[test]
+fn string_push_char_calls_the_char_helper() {
+    let out = asm("fn main() { let mut s = String::new(); s.push('x'); }");
+    assert!(out.contains("call __rmc_str_push_char"), "push calls the char helper:\n{out}");
+}
+
+#[test]
+fn string_as_str_is_the_value_itself() {
+    // `s.as_str()` is the value itself (a `String` already is a `str` record),
+    // so it emits no call and no copy.
+    let out = asm("fn main() { let s = String::from(\"abc\"); let t = s.as_str(); let _ = t.len(); }");
+    assert!(!out.contains("call __rmc_str_push"), "as_str is a no-op:\n{out}");
+    assert!(out.contains("call __rmc_str_len"), "the view is a str:\n{out}");
+}
+
+#[test]
+fn string_comparison_reuses_the_str_compare() {
+    // `s == "lit"` lowers through the byte-wise `str` compare, because a
+    // `String` is a `str` record; the pointer compare would be wrong.
+    let out = asm("fn main() { let s = String::from(\"abc\"); let b = s == \"abc\"; let _ = b; }");
+    assert!(out.contains("call __rmc_str_lt"), "compared byte-wise:\n{out}");
+}
+
+#[test]
+fn a_string_binding_without_a_constructor_is_rejected() {
+    let err = compile_to_asm(
+        "fn main() { let s: String = 3; }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("must be initialized by"), "got: {err}");
+}
+
+#[test]
+fn an_unsupported_string_constructor_is_rejected() {
+    let err = compile_to_asm(
+        "fn main() { let s = String::from_utf8(3); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("unsupported `String::"), "got: {err}");
+}
+
+#[test]
 fn vec_index_is_scaled_pointer_arithmetic() {
     // `v[i]` on a `Vec<i64>` is `*(v + i * 8)`, one scaling `lea` and a load,
     // not a method call.

@@ -18,6 +18,8 @@ enum NameScope {
     Ptr(String, Option<i64>),
     /// `args_vecs`: a `std::env::args()...collect()` binding.
     ArgsVec(String, Option<i64>),
+    /// `string_names`: whether the name was already present.
+    StringName(String, bool),
     /// A `const` declared inside the block, so the name is removed (or its
     /// outer value restored) when the block ends. The `Option` is the value the
     /// name had before, if any.
@@ -179,6 +181,11 @@ pub struct Parser {
     /// `let` that consumes the type can record it against the binding name.
     /// Only `Vec` bindings read it, and they always follow their annotation.
     vec_elem_pending: Option<i64>,
+    /// Names bound to a `String` (a growable byte buffer). A `String` value is
+    /// the address of a `{len, bytes}` record, so it shares `str`'s layout and
+    /// only its methods (`push_str`, `push`, `capacity`, `as_str`) and its
+    /// growth-returning push need to know the binding is a `String`.
+    string_names: std::collections::HashSet<String>,
     /// The bare-identifier target of each `type` alias (`type Byte = u8` ->
     /// `Byte` -> `u8`), so a `Vec<Byte>` can resolve the element to its
     /// underlying byte width. Only a target that is a single identifier is
@@ -311,6 +318,7 @@ impl Parser {
             ptr_vars: std::collections::HashMap::new(),
             vec_elem: std::collections::HashMap::new(),
             vec_elem_pending: None,
+            string_names: std::collections::HashSet::new(),
             alias_target: std::collections::HashMap::new(),
             name_scopes: Vec::new(),
             in_prelude: false,
@@ -1678,6 +1686,13 @@ impl Parser {
                     Tok::Ident(s) => s,
                     _ => unreachable!(),
                 };
+                // `String` has no `std` type in rmc, but it shares a `str`'s
+                // record layout, so its annotation resolves to `Str` in sema
+                // (see `resolve_ty_rec`). Keeping the `Named` marker here lets
+                // the `let` that declares it see the annotation before sema.
+                if name == "String" {
+                    return Ok(Type::Named("String".into()));
+                }
                 // `Vec<T>` has no real type in rmc; the `let` that declares an
                 // `args()`-vector consumes the `<..>` and its initializer is
                 // desugared. Here only the `<..>` is skipped and a placeholder
@@ -2102,6 +2117,11 @@ impl Parser {
             frame.push(NameScope::ArgsVec(name.to_string(), self.args_vecs.get(name).copied()));
         }
     }
+    fn note_string_name(&mut self, name: &str) {
+        if let Some(frame) = self.name_scopes.last_mut() {
+            frame.push(NameScope::StringName(name.to_string(), self.string_names.contains(name)));
+        }
+    }
 
     /// Undo the bindings the innermost block introduced, in reverse, so each
     /// name returns to the state it had before the block (present-and-old, or
@@ -2141,6 +2161,13 @@ impl Parser {
                             self.args_vecs.remove(&n);
                         }
                     },
+                    NameScope::StringName(n, had) => {
+                        if had {
+                            self.string_names.insert(n);
+                        } else {
+                            self.string_names.remove(&n);
+                        }
+                    }
                     NameScope::ConstInt(n, prev) => match prev {
                         Some(v) => {
                             self.consts.insert(n, v);
@@ -3291,7 +3318,10 @@ impl Parser {
     /// that can grow.
     fn expr_stmt(&self, e: Expr) -> Stmt {
         if let Expr::Call { name, args, .. } = &e {
-            if name == "__rmc_vec_push" {
+            if name == "__rmc_vec_push"
+                || name == "__rmc_str_push_str"
+                || name == "__rmc_str_push_char"
+            {
                 if let Some(Expr::Var { name: recv, .. }) = args.first() {
                     let target = Expr::Var { name: recv.clone(), slot: -1, ty: Type::I64 };
                     return Stmt::Assign { target, value: e };
@@ -3909,6 +3939,36 @@ impl Parser {
                         self.args_vecs.insert(name.clone(), self.args_skip);
                         return Ok(());
                     }
+                    // `String::new()`, `String::with_capacity(k)` and
+                    // `String::from("lit")`: a growable byte buffer. A `String`
+                    // value is the `{len, bytes}` record (the `str` layout), so
+                    // the binding is a `Str` and only the constructors are
+                    // rewritten. Recognised regardless of an annotation, like the
+                    // `Vec` constructors, so `let s = String::from("x");` needs
+                    // no `: String`.
+                    if m == "\u{0}strnew" || m == "\u{0}strfrom" {
+                        let helper = if m == "\u{0}strnew" {
+                            "__rmc_str_new"
+                        } else {
+                            "__rmc_str_from"
+                        };
+                        self.note_string_name(&name);
+                        self.string_names.insert(name.clone());
+                        out.push(Stmt::Let {
+                            name,
+                            ty: Some(Type::Str),
+                            init: Some(Expr::Call {
+                                name: helper.into(),
+                                args,
+                                arg_slots: Vec::new(),
+                                ret_slot: -1,
+                                ret_ty: Type::Str,
+                            }),
+                            slot: -1,
+                            mutable,
+                        });
+                        return Ok(());
+                    }
                     if m == "\u{0}vecnew" || m == "\u{0}vecrepeat" {
                         let n_expr = if m == "\u{0}vecnew" {
                             args[0].clone()
@@ -4047,6 +4107,13 @@ impl Parser {
                         });
                         return Ok(());
                     }
+                }
+                if matches!(ty, Some(Type::Named(ref n)) if n == "String") {
+                    return Err(format!(
+                        "at byte {}: a `String` binding must be initialized by \
+                         `String::new()`, `String::with_capacity(k)` or `String::from(\"lit\")`",
+                        self.pos()
+                    ));
                 }
                 if matches!(ty, Some(Type::Named(ref n)) if n == "Vec") {
                     return Err(format!(
@@ -5251,6 +5318,54 @@ impl Parser {
                     // address (marked so a later `.add` folds), and `.add(off)`
                     // is `ptr + off`.
                     if let Expr::Var { name: recv, .. } = &e {
+                        // `String` methods. A `String` value is the `{len,
+                        // bytes}` record, so `as_str()` is the value itself and
+                        // `len()`/`is_empty()`/`starts_with`/... fall through to
+                        // the `str` handling in sema. `capacity()` reads the
+                        // word before the length, and `push_str`/`push` append
+                        // and may grow (returning the new record), so they are
+                        // written back like a `Vec` push.
+                        if self.string_names.contains(recv) {
+                            if args.is_empty() && name == "capacity" {
+                                let recv_expr = e.clone();
+                                e = Expr::Call {
+                                    name: "__rmc_string_cap".into(),
+                                    args: vec![recv_expr],
+                                    arg_slots: Vec::new(),
+                                    ret_slot: -1,
+                                    ret_ty: Type::I64,
+                                };
+                                continue;
+                            }
+                            if args.is_empty() && name == "as_str" {
+                                // The value already is the record view.
+                                continue;
+                            }
+                            if name == "push_str" && args.len() == 1 {
+                                let recv_expr = e.clone();
+                                let value = args.pop().unwrap();
+                                e = Expr::Call {
+                                    name: "__rmc_str_push_str".into(),
+                                    args: vec![recv_expr, value],
+                                    arg_slots: Vec::new(),
+                                    ret_slot: -1,
+                                    ret_ty: Type::Str,
+                                };
+                                continue;
+                            }
+                            if name == "push" && args.len() == 1 {
+                                let recv_expr = e.clone();
+                                let value = args.pop().unwrap();
+                                e = Expr::Call {
+                                    name: "__rmc_str_push_char".into(),
+                                    args: vec![recv_expr, value],
+                                    arg_slots: Vec::new(),
+                                    ret_slot: -1,
+                                    ret_ty: Type::Str,
+                                };
+                                continue;
+                            }
+                        }
                         if args.is_empty()
                             && name == "capacity"
                             && self.vec_names.contains(recv)
@@ -7495,6 +7610,53 @@ impl Parser {
                 // `Enum::Variant` or `Enum::Variant(args)` — resolved and
                 // range-checked by sema.
                 if self.eat(&Tok::ColonColon) {
+                    // `String::new()`, `String::with_capacity(k)` and
+                    // `String::from("lit")`: a growable byte buffer. A `String`
+                    // value is a `{len, bytes}` record (the `str` layout), so
+                    // only the constructors differ; the methods are handled at
+                    // the `let`/method sites. Recognised only in a `let`
+                    // initializer, like the `Vec` shapes.
+                    if name == "String" {
+                        let assoc = self.expect_ident()?;
+                        self.expect(Tok::LParen)?;
+                        let e = match assoc.as_str() {
+                            "new" => Expr::Call {
+                                name: "\u{0}strnew".into(),
+                                args: vec![Expr::Int(0)],
+                                arg_slots: Vec::new(),
+                                ret_slot: -1,
+                                ret_ty: Type::I64,
+                            },
+                            "with_capacity" => {
+                                let cap = self.parse_bracketed_expr()?;
+                                Expr::Call {
+                                    name: "\u{0}strnew".into(),
+                                    args: vec![cap],
+                                    arg_slots: Vec::new(),
+                                    ret_slot: -1,
+                                    ret_ty: Type::I64,
+                                }
+                            }
+                            "from" => {
+                                let a = self.parse_bracketed_expr()?;
+                                Expr::Call {
+                                    name: "\u{0}strfrom".into(),
+                                    args: vec![a],
+                                    arg_slots: Vec::new(),
+                                    ret_slot: -1,
+                                    ret_ty: Type::I64,
+                                }
+                            }
+                            other => {
+                                return Err(format!(
+                                    "at byte {}: unsupported `String::{other}` (only `String::new`, `String::with_capacity` and `String::from`)",
+                                    self.pos()
+                                ))
+                            }
+                        };
+                        self.expect(Tok::RParen)?;
+                        return Ok(e);
+                    }
                     // `Vec::with_capacity(k)` and `Vec::new()` allocate the
                     // backing store; the returned `Vec` value is the block
                     // address (an `i64`). Only these two constructors are
