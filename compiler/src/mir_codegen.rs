@@ -116,6 +116,10 @@ struct FnGen<'a> {
     const_spill: HashMap<i64, i64>,
     /// Callee-saved registers saved below `%rbp`; frame slots start past them.
     saved_regs: i64,
+    /// Per block, the locals live at its entry. A promoted caller-saved local is
+    /// spilled around a call only when it is live after it, so a value that is
+    /// dead (or not yet defined) at the call costs no store/reload pair.
+    live_in: Vec<HashSet<u32>>,
     /// Dry-pass slot index -> compacted slot index. `None` until the dry pass
     /// has revealed which slots the body actually touches.
     slot_map: Option<Vec<i64>>,
@@ -1243,6 +1247,7 @@ impl<'a> FnGen<'a> {
             const_caller_regs: HashMap::new(),
             const_spill: HashMap::new(),
             saved_regs: 0,
+            live_in: Vec::new(),
             slot_map: None,
             next_slot: 0,
             pinned: Vec::new(),
@@ -1611,6 +1616,105 @@ impl<'a> FnGen<'a> {
         depths
     }
 
+    /// Which locals are live at each block's entry, by a backwards fixpoint over
+    /// the standard `use`/`def` sets. Only the promoted caller-saved locals and
+    /// hoisted caller-saved constants are queried, so a coarse but conservative
+    /// answer is enough: a local counts as live if any path from the block reads
+    /// it before redefining it. Spilling around a call is then needed only when
+    /// the register holds a value the code after the call still reads, which is
+    /// what removes the store/reload pair a call in a non-looping region
+    /// otherwise pays.
+    fn compute_liveness(&mut self) {
+        let n = self.func.blocks.len();
+        let succ: Vec<Vec<u32>> = self
+            .func
+            .blocks
+            .iter()
+            .map(|b| successors(&b.term).into_iter().filter(|s| (*s as usize) < n).collect())
+            .collect();
+        let mut live_out: Vec<HashSet<u32>> = vec![HashSet::new(); n];
+        let mut live_in: Vec<HashSet<u32>> = vec![HashSet::new(); n];
+        // `use` and `def` per block, computed once.
+        let mut uses: Vec<HashSet<u32>> = vec![HashSet::new(); n];
+        let mut defs: Vec<HashSet<u32>> = vec![HashSet::new(); n];
+        for (bi, b) in self.func.blocks.iter().enumerate() {
+            let mut u: HashSet<u32> = HashSet::new();
+            let mut d: HashSet<u32> = HashSet::new();
+            for s in &b.stmts {
+                if let Stmt::Assign(p, rv) = s {
+                    let mut r: HashSet<u32> = HashSet::new();
+                    scan_rv_uses(rv, &mut r);
+                    for l in r {
+                        if !d.contains(&l) {
+                            u.insert(l);
+                        }
+                    }
+                    // A destination with a projection only writes part of the
+                    // local, so the local stays live; treat it as a use as well.
+                    if p.proj.is_empty() {
+                        d.insert(p.local);
+                    } else {
+                        if !d.contains(&p.local) {
+                            u.insert(p.local);
+                        }
+                    }
+                }
+            }
+            let mut r: HashSet<u32> = HashSet::new();
+            scan_term_uses(&b.term, &mut r);
+            for l in r {
+                if !d.contains(&l) {
+                    u.insert(l);
+                }
+            }
+            if let Terminator::Call { dest, .. } = &b.term {
+                if dest.proj.is_empty() {
+                    d.insert(dest.local);
+                }
+            }
+            uses[bi] = u;
+            defs[bi] = d;
+        }
+        loop {
+            let mut changed = false;
+            for bi in (0..n).rev() {
+                let mut out: HashSet<u32> = HashSet::new();
+                for s in &succ[bi] {
+                    out.extend(live_in[*s as usize].iter().copied());
+                }
+                let mut inn = uses[bi].clone();
+                for l in &out {
+                    if !defs[bi].contains(l) {
+                        inn.insert(*l);
+                    }
+                }
+                if out != live_out[bi] || inn != live_in[bi] {
+                    live_out[bi] = out;
+                    live_in[bi] = inn;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        self.live_in = live_in;
+    }
+
+    /// Whether `local` is live after a call in `bb`: that is, whether the
+    /// call's successor reads the value before redefining it. A local held in a
+    /// caller-saved register must be spilled around the call exactly then.
+    fn live_across_call(&self, bb: u32, local: u32) -> bool {
+        let Some(block) = self.func.blocks.get(bb as usize) else { return true };
+        let Terminator::Call { target, dest, .. } = &block.term else { return true };
+        // If the call writes the local itself, the old value is dead.
+        if dest.local == local && dest.proj.is_empty() {
+            return false;
+        }
+        let Some(t) = target else { return false };
+        self.live_in.get(*t as usize).map(|s| s.contains(&local)).unwrap_or(true)
+    }
+
     /// The registers this function may promote into. Caller-saved registers are
     /// usable too; the generator spills them around any call. This holds even
     /// for a function that reaches `alloc`: `alloc` keeps its state in globals,
@@ -1733,6 +1837,7 @@ impl<'a> FnGen<'a> {
     fn gen_fn(&mut self) -> Result<String, String> {
         self.analyze();
         self.plan_promotion();
+        self.compute_liveness();
         // A function that returns an aggregate receives a hidden pointer to the
         // caller's return place in `%rdi` and stores `_0` through it. The
         // address lives in a frame slot for the whole call, so it must be taken
@@ -2315,7 +2420,7 @@ impl<'a> FnGen<'a> {
                 // has no body to call, so skip it and continue.
                 let cold = matches!(func, CallTarget::Direct(n) if n == "cold_path" || n.ends_with("::cold_path"));
                 if !cold {
-                    self.gen_call(dest, func, args)?;
+                    self.gen_call(dest, func, args, bb)?;
                 }
                 let t = target.unwrap_or_else(|| {
                     // A call with no return edge is `-> []` (noreturn).
@@ -4261,7 +4366,13 @@ impl<'a> FnGen<'a> {
     /// `(local, register)` list `restore_caller_saved` reloads. `%rdi`, `%rsi`,
     /// `%r8` and `%r9` are all clobbered by a call, so a local that lives in one
     /// must be saved around it. `gen_call` and the drop glue both call this.
-    fn spill_caller_saved(&mut self) -> Vec<(u32, &'static str)> {
+    ///
+    /// When `bb` is a call block, a local is saved only when it is live after
+    /// the call (`live_across_call`): a register whose value the code never reads
+    /// again does not need a store/reload pair. The drop-glue path passes `None`
+    /// and saves every promoted caller-saved local, because its calls are spread
+    /// across a tree with no single block to query.
+    fn spill_caller_saved(&mut self, bb: Option<u32>) -> Vec<(u32, &'static str)> {
         let mut caller_promos: Vec<(u32, &'static str)> = self
             .promo
             .iter()
@@ -4269,6 +4380,9 @@ impl<'a> FnGen<'a> {
             .map(|(l, p)| (*l, p.reg))
             .collect();
         caller_promos.sort_unstable();
+        if let Some(bb) = bb {
+            caller_promos.retain(|(l, _)| self.live_across_call(bb, *l));
+        }
         for (l, reg) in &caller_promos {
             let slot = self.off(self.caller_spill[l]);
             self.emit(&format!("  mov {reg}, {slot}"));
@@ -4319,7 +4433,7 @@ impl<'a> FnGen<'a> {
             // glue: every level shares one slot per local, so an inner spill
             // would overwrite the outer's saved value with an argument register
             // that already holds an address.
-            let saved = self.spill_caller_saved();
+            let saved = self.spill_caller_saved(None);
             let was_in_drop = self.in_drop;
             self.in_drop = true;
             self.gen_drop_glue(place, &ty)?;
@@ -4561,7 +4675,7 @@ impl<'a> FnGen<'a> {
             .unwrap_or(false)
     }
 
-    fn gen_call(&mut self, dest: &Place, func: &CallTarget, args: &[Operand]) -> Result<(), String> {
+    fn gen_call(&mut self, dest: &Place, func: &CallTarget, args: &[Operand], bb: u32) -> Result<(), String> {
         // A call through a computed callee: evaluate the callee's address into a
         // fresh frame slot, then use the same argument-marshalling path as a
         // direct call and emit `call *slot(%rbp)`. A frame slot (not `%r10`/
@@ -4647,7 +4761,7 @@ impl<'a> FnGen<'a> {
         // Spill the promoted caller-saved registers before the argument moves,
         // which overwrite them, and restore afterwards. `%rax` carries the
         // result, so the spills use memory operands directly.
-        let caller_promos = self.spill_caller_saved();
+        let caller_promos = self.spill_caller_saved(Some(bb));
         // A hidden aggregate-return pointer claims `%rdi`, so every real
         // argument moves one register along (`%rsi` for argument 0).
         let arg_shift = agg_ret as usize;
@@ -6162,7 +6276,70 @@ fn operand_place(op: &Operand) -> Option<&Place> {
     }
 }
 
-/// Every operand a statement reads, in source order.
+/// Every local an rvalue reads. Used by the liveness analysis, which needs a
+/// plain set rather than the counted maps `scan_rv` builds.
+fn scan_rv_uses(rv: &Rvalue, out: &mut HashSet<u32>) {
+    fn add_place(p: &Place, out: &mut HashSet<u32>) {
+        out.insert(p.local);
+        for proj in &p.proj {
+            if let Proj::IndexLocal(i) = proj {
+                out.insert(*i);
+            }
+        }
+    }
+    fn add_op(op: &Operand, out: &mut HashSet<u32>) {
+        if let Operand::Copy(p) | Operand::Move(p) = op {
+            add_place(p, out);
+        }
+    }
+    match rv {
+        Rvalue::Use(op) | Rvalue::Unary(_, op) => add_op(op, out),
+        Rvalue::Repeat { op, .. } => add_op(op, out),
+        Rvalue::Cast { op, .. } => add_op(op, out),
+        Rvalue::Binary(_, a, b) | Rvalue::WithOverflow { a, b, .. } => {
+            add_op(a, out);
+            add_op(b, out);
+        }
+        Rvalue::Array(ops) | Rvalue::Aggregate(ops) | Rvalue::Enum { ops, .. } => {
+            for op in ops {
+                add_op(op, out);
+            }
+        }
+        Rvalue::Ref { place, .. }
+        | Rvalue::RawRef { place, .. }
+        | Rvalue::Len(place)
+        | Rvalue::Discriminant(place) => add_place(place, out),
+        Rvalue::Unsupported(_) => {}
+    }
+}
+
+/// Every local a terminator reads (not a call destination, which is a write).
+fn scan_term_uses(t: &Terminator, out: &mut HashSet<u32>) {
+    fn add_op(op: &Operand, out: &mut HashSet<u32>) {
+        if let Operand::Copy(p) | Operand::Move(p) = op {
+            out.insert(p.local);
+            for proj in &p.proj {
+                if let Proj::IndexLocal(i) = proj {
+                    out.insert(*i);
+                }
+            }
+        }
+    }
+    match t {
+        Terminator::SwitchInt { discr, .. } => add_op(discr, out),
+        Terminator::Assert { cond, .. } => add_op(cond, out),
+        Terminator::Call { args, .. } => {
+            for a in args {
+                add_op(a, out);
+            }
+        }
+        Terminator::Drop { place, .. } => {
+            out.insert(place.local);
+        }
+        _ => {}
+    }
+}
+
 fn scan_operands(s: &Stmt, f: &mut impl FnMut(&Operand)) {
     let Stmt::Assign(_, rv) = s else { return };
     match rv {
