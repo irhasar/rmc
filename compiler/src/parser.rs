@@ -186,6 +186,10 @@ pub struct Parser {
     /// when the block ends, and an outer binding it shadowed is restored, so a
     /// name's recorded stride and shape are lexically scoped.
     name_scopes: Vec<Vec<NameScope>>,
+    /// True while parsing the injected `Option`/`Result` prelude, so that
+    /// prelude's own `parse_program` does not inject it again (which would
+    /// recurse forever).
+    in_prelude: bool,
 }
 
 /// The deepest expression, block or type nesting the parser accepts. Deeply
@@ -199,6 +203,66 @@ pub struct Parser {
 /// is roughly 800 KiB, which leaves room, and is far above any hand-written
 /// program.
 const MAX_DEPTH: u32 = 100;
+
+/// The `Option`/`Result` prelude, injected into every program (see
+/// `parse_program`). It is written in the language rmc already compiles — a
+/// payload enum plus `impl` methods — so the parser, sema and codegen need no
+/// special case for it. `Option<T>`/`Result<T, E>` type arguments and the
+/// `Some`/`None`/`Ok`/`Err` constructors are sugar the parser rewrites to these
+/// names (rmc is monomorphic in `i64`, so the type parameters carry no meaning).
+/// `unwrap`/`expect` panic with exit 101 on the failing variant, matching
+/// rustc's panic code. Unused methods are removed by the dead-function pass, so
+/// a program that never names them pays nothing.
+const OPTION_RESULT_PRELUDE: &str = r#"
+enum Option { None, Some(i64) }
+enum Result { Ok(i64), Err(i64) }
+impl Option {
+    fn unwrap(self) -> i64 {
+        match self { Option::Some(v) => v, Option::None => exit(101) }
+    }
+    fn expect(self, _m: str) -> i64 {
+        match self { Option::Some(v) => v, Option::None => exit(101) }
+    }
+    fn unwrap_or(self, d: i64) -> i64 {
+        match self { Option::Some(v) => v, Option::None => d }
+    }
+    fn is_some(&self) -> bool {
+        match self { Option::Some(_) => true, Option::None => false }
+    }
+    fn is_none(&self) -> bool {
+        match self { Option::Some(_) => false, Option::None => true }
+    }
+    fn or(self, other: Option) -> Option {
+        match self { Option::Some(v) => Option::Some(v), Option::None => other }
+    }
+    fn ok_or(self, e: i64) -> Result {
+        match self { Option::Some(v) => Result::Ok(v), Option::None => Result::Err(e) }
+    }
+}
+impl Result {
+    fn unwrap(self) -> i64 {
+        match self { Result::Ok(v) => v, Result::Err(_) => exit(101) }
+    }
+    fn expect(self, _m: str) -> i64 {
+        match self { Result::Ok(v) => v, Result::Err(_) => exit(101) }
+    }
+    fn unwrap_or(self, d: i64) -> i64 {
+        match self { Result::Ok(v) => v, Result::Err(_) => d }
+    }
+    fn is_ok(&self) -> bool {
+        match self { Result::Ok(_) => true, Result::Err(_) => false }
+    }
+    fn is_err(&self) -> bool {
+        match self { Result::Ok(_) => false, Result::Err(_) => true }
+    }
+    fn ok(self) -> Option {
+        match self { Result::Ok(v) => Option::Some(v), Result::Err(_) => Option::None }
+    }
+    fn err(self) -> Option {
+        match self { Result::Ok(_) => Option::None, Result::Err(e) => Option::Some(e) }
+    }
+}
+"#;
 
 /// Expressions that are allowed as statements without a trailing `;`.
 fn is_block_like(e: &Expr) -> bool {
@@ -246,6 +310,7 @@ impl Parser {
             vec_elem_pending: None,
             alias_target: std::collections::HashMap::new(),
             name_scopes: Vec::new(),
+            in_prelude: false,
         }
     }
 
@@ -395,6 +460,36 @@ impl Parser {
         // Nested functions are hoisted to the top level, so the flat list sema
         // and codegen walk holds them like any other function.
         fns.append(&mut self.nested_fns);
+        // Inject the `Option`/`Result` prelude unless the user defined those
+        // names. It is ordinary user-level code (a payload enum plus `impl`
+        // methods), so no later pass needs to know it exists; the dead-function
+        // pass drops whatever the program does not call, so an unused prelude
+        // costs nothing in the artifact. The prelude is parsed by a parser with
+        // `in_prelude` set, so it does not inject itself (which would recurse).
+        if !self.in_prelude {
+            // A user type named `Option` or `Result` shadows the prelude's, so
+            // the whole prelude is dropped: its `Option` and `Result` methods
+            // reference each other's variants (`Result::ok` builds
+            // `Option::Some`), so injecting half of it would not type-check.
+            let user_owns = enums
+                .iter()
+                .map(|e| e.name.as_str())
+                .chain(structs.iter().map(|s| s.name.as_str()))
+                .any(|n| n == "Option" || n == "Result");
+            if !user_owns {
+                let mut inner = Parser::new(crate::lexer::lex(OPTION_RESULT_PRELUDE)?);
+                inner.in_prelude = true;
+                let pre = inner.parse_program()?;
+                for e in pre.enums {
+                    enums.push(e);
+                }
+                for f in pre.fns {
+                    if !fns.iter().any(|u| u.name == f.name) {
+                        fns.push(f);
+                    }
+                }
+            }
+        }
         Ok(Program { structs, enums, consts, fns })
     }
 
@@ -1439,9 +1534,32 @@ impl Parser {
                 // anywhere but that one `let` fails when it reaches sema (the
                 // name resolves to no struct).
                 if self.peek() == Some(&Tok::Lt) {
+                    // `Option<T>` / `Result<T, E>`: the prelude enums. rmc is
+                    // monomorphic in `i64`, so the type arguments carry no
+                    // meaning; skip the `<..>` and return the bare name, which
+                    // resolves to the injected enum.
+                    if name == "Option" || name == "Result" {
+                        self.i += 1; // `<`
+                        let mut depth = 1i32;
+                        while depth > 0 {
+                            match self.peek() {
+                                None => {
+                                    return Err(format!(
+                                        "at byte {}: unexpected end of input in `{name}<..>`",
+                                        self.pos()
+                                    ))
+                                }
+                                Some(Tok::Lt) => depth += 1,
+                                Some(Tok::Gt) => depth -= 1,
+                                _ => {}
+                            }
+                            self.i += 1;
+                        }
+                        return Ok(Type::Named(name));
+                    }
                     if name != "Vec" {
                         return Err(format!(
-                            "at byte {}: unsupported generic type `{name}` (only `Vec<T>` is accepted)",
+                            "at byte {}: unsupported generic type `{name}` (only `Vec<T>`, `Option<T>` and `Result<T, E>` are accepted)",
                             self.pos()
                         ));
                     }
@@ -3157,6 +3275,32 @@ impl Parser {
         ))
     }
 
+    /// `matches!(expr, pat)`: `true` when `expr` matches `pat`, else `false`.
+    /// It lowers to the same arm chain a two-arm `match` produces, so the
+    /// existing pattern machinery (including an or-pattern, a range, or a
+    /// guarded arm) does the work. `matches!` accepts a comma or a `|` before
+    /// the pattern, as Rust's macro does.
+    fn parse_matches(&mut self) -> PResult<Expr> {
+        self.i += 1; // the `!`
+        self.expect(Tok::LParen)?;
+        let scrutinee = self.parse_bracketed_expr()?;
+        self.expect(Tok::Comma)?;
+        self.eat(&Tok::Pipe);
+        let pat = self.parse_refutable_pattern()?;
+        // A guard is accepted and, if present, folds into the arm test.
+        let guard = if self.eat(&Tok::If) {
+            Some(self.parse_cond()?)
+        } else {
+            None
+        };
+        self.expect(Tok::RParen)?;
+        let arms = vec![
+            (pat, guard, Expr::Bool(true)),
+            (Pat::Wild, None, Expr::Bool(false)),
+        ];
+        self.desugar_match(scrutinee, arms)
+    }
+
     /// `panic!()`, `unreachable!()`, `todo!()` and `unimplemented!()`: exit with
     /// status 101, rustc's panic code. Any arguments (a message) are discarded.
     fn parse_panic(&mut self, _name: &str) -> PResult<Expr> {
@@ -4186,6 +4330,20 @@ impl Parser {
                     Ok(Pat::Bool(*b))
                 } else if let Some(c) = self.const_chars.get(&n) {
                     Ok(Pat::Char(*c))
+                } else if matches!(n.as_str(), "Some" | "Ok" | "Err")
+                    && self.peek() == Some(&Tok::LParen)
+                {
+                    // The `Option`/`Result` variant patterns, written
+                    // unqualified: `Some(x)`, `Ok(v)`, `Err(e)`. A bare `None`
+                    // is the unit variant and is handled by the wildcard case.
+                    let (en, var) = match n.as_str() {
+                        "Some" => ("Option", "Some"),
+                        "Ok" => ("Result", "Ok"),
+                        _ => ("Result", "Err"),
+                    };
+                    self.i += 1; // `(`
+                    let args = self.parse_variant_pat_args()?;
+                    Ok(Pat::Variant(en.into(), var.into(), Some(args)))
                 } else {
                     // A bare name binds the scrutinee; `_` already matched the
                     // wildcard case above.
@@ -5829,6 +5987,7 @@ impl Parser {
                         "assert" | "assert_eq" | "assert_ne" => {
                             return self.parse_assert(&name)
                         }
+                        "matches" => return self.parse_matches(),
                         "panic" | "unreachable" | "todo" | "unimplemented" => {
                             return self.parse_panic(&name)
                         }
@@ -5849,6 +6008,47 @@ impl Parser {
                     if let Some(e) = self.try_parse_std_path(&name)? {
                         return Ok(e);
                     }
+                }
+                // The `Option`/`Result` constructors are written unqualified in
+                // Rust: `Some(x)`, `None`, `Ok(x)`, `Err(e)`. Map them to the
+                // injected prelude enums so `use std::option::Option::*` need
+                // not be written. `None` is a unit variant only when it stands
+                // alone (not followed by `(`).
+                if let Some((en, var)) = match name.as_str() {
+                    "Some" => Some(("Option", "Some")),
+                    "Ok" => Some(("Result", "Ok")),
+                    "Err" => Some(("Result", "Err")),
+                    _ => None,
+                } {
+                    if self.peek() == Some(&Tok::LParen) {
+                        self.i += 1;
+                        let mut args = Vec::new();
+                        while self.peek() != Some(&Tok::RParen) {
+                            args.push(self.parse_bracketed_expr()?);
+                            if !self.eat(&Tok::Comma) {
+                                break;
+                            }
+                        }
+                        self.expect(Tok::RParen)?;
+                        return Ok(Expr::EnumCtor {
+                            enum_name: en.into(),
+                            variant: var.into(),
+                            tag: -1,
+                            args,
+                            arg_offsets: Vec::new(),
+                            slot: -1,
+                            size: 0,
+                        });
+                    }
+                }
+                if name == "None"
+                    && !matches!(self.peek(), Some(Tok::ColonColon) | Some(&Tok::LParen))
+                {
+                    return Ok(Expr::EnumVariant {
+                        enum_name: "Option".into(),
+                        variant: "None".into(),
+                        tag: -1,
+                    });
                 }
                 // `Enum::Variant` or `Enum::Variant(args)` — resolved and
                 // range-checked by sema.

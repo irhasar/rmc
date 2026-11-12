@@ -7639,3 +7639,54 @@ fn a_byte_string_is_not_supported() {
     // `b".."` needs an array of bytes, which rmc does not have.
     assert!(compile_to_asm("fn main() { let s = b\"hi\"; }", &CompileOptions::default()).is_err());
 }
+
+#[test]
+fn exit_is_never_typed() {
+    // `std::process::exit` returns `!` in rustc, so it may stand in for any
+    // value: a function whose whole body is `exit(..)` type-checks without a
+    // trailing expression, and `let x: i64 = exit(0);` is accepted.
+    assert!(compile_to_asm("fn f() -> i64 { exit(1) } fn main() { }", &CompileOptions::default()).is_ok());
+    assert!(compile_to_asm("fn main() { let x: i64 = exit(0); }", &CompileOptions::default()).is_ok());
+    assert!(compile_to_asm(
+        "fn main() { let x: bool = if 1 > 0 { true } else { exit(1) }; }",
+        &CompileOptions::default()
+    ).is_ok());
+}
+
+#[test]
+fn the_option_and_result_prelude_is_available() {
+    // `Option`/`Result` and their methods are injected as ordinary user code.
+    let out = asm("fn main() -> i64 { let o: Option<i64> = Some(3); o.unwrap() }");
+    assert!(out.contains("main:"), "`Option` must be usable");
+    let r = asm("fn main() -> i64 { let r: Result<i64, i64> = Ok(4); r.unwrap() }");
+    assert!(r.contains("main:"), "`Result` must be usable");
+    // `if let` on the unqualified constructors.
+    let iflet = asm("fn main() { let o = Some(1); if let Some(x) = o { let _ = x; } }");
+    assert!(iflet.contains("main:"), "`if let Some(x)` must compile");
+    // The type arguments and constructors are sugar; a user enum of the same
+    // name is not overridden, so a shadowing definition still wins.
+    let shadow = asm("enum Option { A } fn main() { let o = Option::A; let _ = o; }");
+    assert!(shadow.contains("main:"), "a user `Option` is not overridden");
+}
+
+#[test]
+fn an_unused_prelude_costs_nothing() {
+    // The dead-function pass removes prelude methods a program never calls, so
+    // a plain program's assembly does not mention them.
+    let out = asm("fn main() -> i64 { 1 }");
+    assert!(!out.contains("Option$unwrap"), "an unused prelude method must be dropped");
+    assert!(!out.contains("Result$unwrap"), "an unused prelude method must be dropped");
+}
+
+#[test]
+fn matches_macro_lowers_to_a_match() {
+    // `matches!(e, pat)` is `true`/`false`; the leading `|` Rust allows is
+    // accepted, and a guard folds into the arm test.
+    assert!(compile_to_asm("fn main() -> bool { matches!(1, 1) }", &CompileOptions::default()).is_ok());
+    assert!(compile_to_asm("fn main() -> bool { matches!(5, | 1 | 3 | 5) }", &CompileOptions::default()).is_ok());
+    assert!(compile_to_asm("fn main() -> bool { matches!(5, n if n > 3) }", &CompileOptions::default()).is_ok());
+    assert!(compile_to_asm(
+        "fn main() -> bool { let o = Some(2); matches!(o, Some(v) if v > 1) }",
+        &CompileOptions::default()
+    ).is_ok());
+}

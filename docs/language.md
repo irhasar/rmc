@@ -824,14 +824,46 @@ Provided by the runtime; no declaration or import is required.
 | `alloc(n)`      | `(i64) -> i64` |
 | `free(p)`       | `(i64) -> ()`  |
 | `arg_i64(i)`    | `(i64) -> i64` |
-| `exit(code)`    | `(i64) -> ()`  |
+| `exit(code)`    | `(i64) -> !`  |
 
 `alloc` returns a pointer to `n` bytes of writable memory, or 0 on failure; it
 is a first-fit allocator over an mmap'd arena, and `free` returns a block for
 reuse and coalesces neighbours. Memory is not zeroed.
 
 `exit(code)` terminates the process with `code` via the raw `exit` syscall. It
-is the target of `std::process::exit`, a failed `assert!`, and `panic!`.
+is the target of `std::process::exit`, a failed `assert!`, and `panic!`. Like
+rustc's, it returns `!` (never), so it may stand in for any value.
+
+### `Option` and `Result`
+
+`Option<i64>` (`Some(i64)` / `None`) and `Result<i64, i64>` (`Ok(i64)` /
+`Err(i64)`) are built in. rmc is monomorphic in `i64`, so the type arguments
+carry no meaning and are accepted and ignored: `Option<i64>` and `Option` name
+the same enum. The constructors are written unqualified, as in Rust —
+`Some(x)`, `None`, `Ok(v)`, `Err(e)` — in both expressions and patterns, so
+`if let Some(x) = o`, `while let Some(x) = o` and
+`match o { Some(x) => .., None => .. }` all work.
+
+These types are not a special case in the compiler: they are injected as
+ordinary user-level code (a payload enum plus `impl` methods) before semantic
+analysis, so the same machinery that handles a user enum handles them. A
+program that defines its own `Option` or `Result` shadows the built-in
+entirely.
+
+| method | on | signature | behaviour |
+| --- | --- | --- | --- |
+| `unwrap()` | `Option`, `Result` | `(self) -> i64` | the value, or exit 101 on the failing variant |
+| `expect(m)` | `Option`, `Result` | `(self, str) -> i64` | as `unwrap`; `m` is accepted and ignored |
+| `unwrap_or(d)` | `Option`, `Result` | `(self, i64) -> i64` | the value, or `d` |
+| `is_some()` / `is_none()` | `Option` | `(&self) -> bool` | which variant it is |
+| `is_ok()` / `is_err()` | `Result` | `(&self) -> bool` | which variant it is |
+| `or(o)` | `Option` | `(self, Option) -> Option` | `self` if `Some`, else `o` |
+| `ok_or(e)` | `Option` | `(self, i64) -> Result` | `Ok(v)` or `Err(e)` |
+| `ok()` / `err()` | `Result` | `(self) -> Option` | the payload as an `Option` |
+
+`unwrap` and `expect` exit with status 101, matching rustc's panic code. A
+method a program never calls is removed by dead-function elimination, so the
+prelude costs nothing in the artifact unless it is used.
 
 ### Macros
 
@@ -847,6 +879,12 @@ braces, and the usual escapes
 evaluate their condition and, when it fails, exit with status 101 (rustc's panic
 code). The optional message is not printed. `panic!`, `unreachable!`, `todo!`
 and `unimplemented!` always exit 101; their arguments are ignored.
+
+`matches!(expr, pat)` evaluates to `true` when `expr` matches `pat`, else
+`false`. The pattern is the same one a `match` arm accepts — a literal, a
+range, `Enum::Variant(..)`, an or-pattern, `_` — and the optional leading `|`
+Rust allows (`matches!(x, | 1 | 2)`) is accepted. A guard (`matches!(x, n if n
+> 3)`) folds into the test.
 
 ### Vec shims
 

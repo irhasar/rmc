@@ -225,9 +225,11 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         ("print_bool", &[Type::Bool], Type::Unit),
         ("print_char", &[Type::Char], Type::Unit),
         // `std::process::exit(code)`, lowered to the runtime's raw `exit`
-        // syscall wrapper by the parser. It never returns, but it is typed as
-        // returning `()` so it may be used as a statement or tail expression.
-        ("exit", &[Type::I64], Type::Unit),
+        // syscall wrapper by the parser. It never returns, so it is typed `!`
+        // (Never), exactly as rustc types it: `let x: i64 = exit(0);` and a
+        // non-unit match arm ending in `exit(..)` both type-check, and code
+        // after it is unreachable but still checked.
+        ("exit", &[Type::I64], Type::Never),
         ("putchar", &[Type::I64], Type::Unit),
         ("alloc", &[Type::I64], Type::I64),
         ("free", &[Type::I64], Type::Unit),
