@@ -2206,6 +2206,14 @@ to `rmc-1-core` through `rmc-4-patterns` succeed. If a push is ever refused,
 check `git ls-remote` first before concluding the token lacks `contents: write`,
 and never persist a token in `.git/config` or a file.
 
+**Always push at the end of every session.** The user asked for this
+explicitly: after committing, run `git push origin <current-branch>` so the
+remote branch is never behind the local one. Verify with
+`git rev-parse HEAD` vs `git rev-parse origin/<branch>` (they must match) before
+reporting done. Do not open a PR unless asked — the push is the expected end
+state. When a command line or URL would otherwise echo the token, pipe through
+`sed 's/ghp_[A-Za-z0-9]*/<token-hidden>/g'` so it never lands in the log.
+
 ## PR branch stack
 
 The four PRs stack linearly: `rmc-1-core` -> `rmc-2-optimiser` ->
