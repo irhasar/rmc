@@ -1129,10 +1129,10 @@ __rmc_rotate_right:
     Piece {
         text: r#"
 .text
-# long __rmc_wrapping_add(long a, long b) / __rmc_wrapping_sub  -- two's
-# complement wrapping, identical to the bare `add`/`sub` the operator path
-# emits. They exist so `a.wrapping_add(b)` has the same operand evaluation
-# (left to right, each once) as a binary operator, without a `BinOp` variant.
+# long __rmc_wrapping_add(long a, long b)  -- two's complement wrapping,
+# identical to the bare `add` the operator path emits. It exists so
+# `a.wrapping_add(b)` has the same operand evaluation (left to right, each once)
+# as a binary operator, without a `BinOp` variant.
 .globl __rmc_wrapping_add
 .type __rmc_wrapping_add, @function
 __rmc_wrapping_add:
@@ -1140,7 +1140,13 @@ __rmc_wrapping_add:
     add %rsi, %rax
     ret
 .size __rmc_wrapping_add, .-__rmc_wrapping_add
-
+"#,
+        defines: &["__rmc_wrapping_add"],
+    },
+    Piece {
+        text: r#"
+.text
+# long __rmc_wrapping_sub(long a, long b)  -- `a - b`, wrapping, as above.
 .globl __rmc_wrapping_sub
 .type __rmc_wrapping_sub, @function
 __rmc_wrapping_sub:
@@ -1149,7 +1155,7 @@ __rmc_wrapping_sub:
     ret
 .size __rmc_wrapping_sub, .-__rmc_wrapping_sub
 "#,
-        defines: &["__rmc_wrapping_add", "__rmc_wrapping_sub"],
+        defines: &["__rmc_wrapping_sub"],
     },
     Piece {
         text: r#"
