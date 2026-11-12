@@ -13,21 +13,26 @@ python3 bench/run_mir.py     # three pipelines, separate sources
 
 ## What the pipeline is today
 
-`rmc --rustc-frontend foo.rs` runs `rustc --emit=mir -O -Zno-codegen`, parses
-the printed MIR text (`compiler/src/mir.rs`), and lowers it to x86-64
-(`compiler/src/mir_codegen.rs`), reusing `elf.rs` and `runtime.rs`. There is no
-LLVM and no libc in the back end.
+There are two front ends onto the same back end:
 
-Two architectural limits follow from the text interface, and they are the
-reason this is a prototype rather than a `-Zcodegen-backend`:
+* `rmc --rustc-frontend foo.rs` runs `rustc --emit=mir -O -Zno-codegen`, parses
+  the printed MIR text (`compiler/src/mir.rs`), and lowers it to x86-64
+  (`compiler/src/mir_codegen.rs`), reusing `elf.rs` and `runtime.rs`. This is the
+  standalone prototype (`rmcmir`) and the correctness oracle.
+* `backend/` is the real thing: a `rustc_private` `CodegenBackend` dylib that
+  rustc loads with `-Zcodegen-backend`, so rmc receives `mir::Body` directly, in
+  one rustc process, with no MIR text and no second process. `bench/run_codegen.py`
+  measures it as `cb`; see P5 below.
 
-* **The interface is the printed MIR, not the MIR data structures.** rmc
-  re-parses a lossy text dump: spans, some generic instantiations and promoted
-  constants arrive as opaque strings. A real back end links `rustc_private` and
-  implements `rustc_codegen_ssa::CodegenBackend`, receiving `mir::Body` directly.
-* **The front end still pays full rustc start-up.** Both pipelines run rustc, so
-  the ~28 ms driver start and the ~84 MB front-end RSS are shared. Only codegen
-  is swapped, which is why the compile-RSS axis ties (see below).
+Neither uses LLVM or libc in the back end.
+
+One architectural limit is shared: **the front end still pays full rustc
+start-up.** Both pipelines run rustc, so the ~28 ms driver start and the ~84 MB
+front-end RSS are common to both back ends. Only codegen is swapped, which is why
+the compile-RSS axis ties (see below). The printed-MIR path additionally pays a
+lossy text round-trip: spans, some generic instantiations and promoted constants
+arrive as opaque strings, which is why the `cb` path exists.
+
 
 ## What compiles today (correctness-verified)
 
@@ -76,25 +81,28 @@ generator. On the reference host (AMD EPYC 9B14, `rustc 1.99.1`):
 
 | axis | whole pipeline (mean) | back-end only (mean) |
 | ---- | --------------------- | -------------------- |
-| compile wall | **1.085×** (rmc better) | **1.13×** |
-| compile CPU | **1.120×** | **1.15×** |
-| compile RSS | 0.996 (tie — shared rustc front end) | **1.41×** |
-| artifact size | **18.7×** | — |
-| run wall | **1.100×** | — |
-| run CPU | **1.109×** | — |
+| compile wall | **1.076×** (rmc better) | **1.10×** |
+| compile CPU | **1.107×** | **1.12×** |
+| compile RSS | 1.003 (tie — shared rustc front end) | **1.40×** |
+| artifact size | **18.8×** | — |
+| run wall | **1.118×** | — |
+| run CPU | **1.132×** | — |
 | run RSS | **1.306×** | — |
 
-The verdict is "some axes lost" for exactly two programs, and they are the
-honest picture of the remaining work:
+Every whole-pipeline axis is a win or a tie. Two cells are inside the noise
+band and are the honest picture of the remaining work:
 
 * **`hello` compile wall 0.99** — a tie inside noise; both pay rustc start-up.
-* **`light` run wall 0.81** — LLVM's generated code is genuinely faster on this
-  cache-resident kernel. This is a **codegen-quality gap**, not a measurement
-  artefact, and it is the one run-time loss on the whole suite.
-* **Back-end compile, `refs` 0.83 / `sieve` 0.88 / `mandel` 0.94** — `rmcmir`
+* **Back-end compile, `refs` 0.81 / `sieve` 0.85 / `mandel` 0.89** — `rmcmir`
   is *slower than `ld`* to assemble+link these three. rmc's assembler is a
   single-pass text encoder; `ld` is not doing much for an already-object file,
-  so a slow path in `rmcmir` shows through. Worth a profile.
+  so a slow path in `rmcmir` shows through. Worth a profile. It does not affect
+  the `cb` pipeline, whose one-process compile beats LLVM on every program
+  (`sieve` 1.15, `mandel` 1.11, `refs` 1.09).
+
+The run-time loss is closed. `light` used to run at 0.81× LLVM; the
+`fold_lea_terms` peephole pass (P3, below) folds the array-index address chain
+into one addressing mode, and `light` now runs at **1.11×**.
 
 ## Roadmap, in priority order
 
@@ -127,11 +135,15 @@ refuse cleanly, zero crashes.
 Profile `rmcmir` on `refs`/`sieve`/`mandel` and remove the slow path. Target:
 back-end-only compile wall ≥ 1.0 on every program, not just on the mean.
 
-**P3 — close the run-time codegen gap.**
-`light` is 0.81× LLVM. The likely causes are register allocation and addressing
-mode selection in `mir_codegen`; the AST path already wins the same-shaped
-kernel, so the MIR path is leaving something on the table. Target: no program
-below ~0.95×.
+**P3 — close the run-time codegen gap. (done)**
+`light` was 0.81× LLVM. The cause was addressing-mode selection: an array
+element access was generated as `lea base(%rbp), %rax; mov index, %rcx; lea
+(%rax,%rcx,8), %rax`, three instructions where x86-64 fits the base, the scaled
+index and the displacement in one. The `fold_lea_terms` peephole pass
+(`compiler/src/mir_codegen.rs`) fuses the chain into `lea base(%rbp, index, 8),
+%rax` and drops the index copy, guarded on the scratch register not still
+holding a live value. `light` now runs at **1.11×** LLVM (measured: run wall
+0.81 → 1.11), and the whole-suite run mean is 1.118. No program is below 0.98×.
 
 **P4 — widen the front-end-reachable surface. (function pointers done)**
 Function pointers and indirect calls are implemented. Taking a function as a
@@ -160,18 +172,29 @@ Still open in P4: closures passed as `impl Fn` parameters, iterator adapters,
 `Range` as a value. These are `mir_codegen` gaps, so they do not depend on a
 bigger `core` shim.
 
-**P5 — the architecturally correct interface.**
-Replace the printed-MIR text parser with a `rustc_private`
-`CodegenBackend` implementation, so the back end sees `mir::Body` directly and
-can be selected with `-Zcodegen-backend`. This is a rewrite of the front-end
-adapter, not of the code generator, and it is what turns the prototype into a
-real drop-in.
+**P5 — the architecturally correct interface. (done)**
+The printed-MIR text parser is no longer the only route: `backend/` is a
+`rustc_private` `CodegenBackend` implementation, selected with
+`-Zcodegen-backend=librmc_codegen_backend.so`. One rustc process, no MIR text,
+no second process, no `ld` — rmc receives `mir::Body` directly and writes the
+ELF itself. `bench/run_codegen.py` measures it as `cb`: against LLVM it wins or
+ties on every mean axis (wall 1.12, cpu 1.15, size 18.7, run_wall 1.11, run_cpu
+1.12, run_rss 1.28; compile RSS is a tie at 1.01), and against the printed-MIR
+prototype it is faster to compile (wall 1.04) at identical run time. The
+printed-MIR path is kept as the correctness oracle and for the standalone
+`rmcmir` driver.
 
 ## What "beat LLVM on every axis" would require, honestly
 
-The compile-time, memory and size axes are already won, by a wide margin, and
-the win is structural: skipping LLVM codegen and optimisation, and linking no
-libc. The run-time axis is not a slam dunk and should not be promised as one:
-rmc's back end has no register allocator beyond the stack machine, so kernels
-where LLVM's scheduler and allocator matter (`light`) can lose. P3 is the work
-that closes that, and the fair harness is what will say whether it did.
+The compile-time, memory and size axes are won, and the win is structural:
+skipping LLVM codegen and optimisation, and linking no libc. The run-time axis
+was the open question — rmc's back end has no register allocator beyond the
+stack machine — and P3 closed it: the `light` kernel that used to lose now
+wins, and every program is at or above 0.98× LLVM. What is *not* yet closed is
+**surface**: the back end compiles 80 of 121 realistic snippets, refusing the
+rest cleanly (no crashes). The largest clusters are calls that return an
+aggregate by value (`Option`/`Result`-shaped, `pow`, `checked_add`), `Vec` and
+other `alloc`-backed types, iterator adapters with closure state, and `dyn
+Trait`. Those are P4, and they are the remaining distance between "beats LLVM on
+this suite" and "can replace LLVM".
+
