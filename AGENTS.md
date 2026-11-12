@@ -847,6 +847,25 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   leading `.`, because `.p2align` is emitted indented and otherwise looks like
   dead text after the entry `jmp`. `a_loop_body_starts_on_a_sixteen_byte_boundary`
   pins it.
+- **A hot loop's speed is an alignment lottery, so do not chase it.** Two
+  builds whose loop body is byte-identical differ by up to 1.4x when a preceding
+  change shifts the body by one byte (a `stats` variant measured min 2.61 ms at
+  one header offset and 3.08 ms two bytes later). This is not a codegen-quality
+  signal: the body the emitter produced was the same. The `.rms` path pins the
+  loop *body* to 16 bytes so unrelated edits cannot move it (above); the MIR
+  path (`mir_codegen.rs`) does **not**, which is why `stats`'s run-time drifts
+  with unrelated function-size changes. Do not try to steer it with per-header
+  `.p2align`/`nop` padding: a blanket 32-byte header alignment helped `sieve`
+  but lost on `callrec`/`fib`, and a size-thresholded version (align only bodies
+  of >=9 MIR statements) still lost on `mix`/`mandel`. `stats`'s ~0.97 run-time
+  against LLVM is this effect, not a scheduling gap.
+- **A caller-saved promotion is spilled around a call only when it is live
+  after it.** `spill_caller_saved` consults a backwards liveness fixpoint
+  (`compute_liveness`, built on `scan_rv_uses`/`scan_term_uses`) and skips a
+  promotion whose value the call's successor never reads again; the drop-glue
+  path passes `None` and keeps saving every one, because its calls span a tree
+  with no single block to query. This removes a store/reload pair around calls
+  in non-looping regions.
 - **A divisor that fits i32 uses `mov` not `movabs`.** `gen_div_const`
   materialises the divisor and the magic multiplier; `mov_imm64` picks the
   7-byte `mov $k, reg` when the value is a sign-extended 32-bit immediate and
