@@ -306,7 +306,9 @@ or field, compared by content with `==`/`!=`/`<`/`<=`/`>`/`>=`, with `.len()` fo
 the byte length); array `.len()` (a compile-time constant); built-in `i64` methods
 (`x.abs()`, `x.signum()`, `x.min(y)`, `x.max(y)`, `x.clamp(lo, hi)`,
 `x.is_positive()`, `x.is_negative()`, `x.div_euclid(y)`, `x.rem_euclid(y)`,
-`x.midpoint(y)`,
+`x.midpoint(y)`, `x.pow(n)`, `x.wrapping_add(y)`, `x.wrapping_sub(y)`,
+`x.wrapping_mul(y)`, `x.saturating_add(y)`, `x.saturating_sub(y)`,
+`x.saturating_mul(y)`,
 `x.count_ones()`, `x.count_zeros()`, `x.leading_zeros()`, `x.trailing_zeros()`,
 `x.leading_ones()`, `x.trailing_ones()`, `x.swap_bytes()`, `x.reverse_bits()`,
 `x.rotate_left(n)`, `x.rotate_right(n)`, desugared to
@@ -598,12 +600,14 @@ of value per unit of effort:
    the check — rmc does not prove a reference outlives its referent or that
    `&mut` is exclusive, so an aliasing bug is a wrong answer, not a compile
    error.
-3. **More types.** `u*`/`i*` widths and `f64`, which together cover most of what
-   small programs actually need. (`match` on integers is done.) **Slices**
-   (`&[T]`, and the slice literals and sub-slicing `&a[lo..hi]` that build them)
-   are the other large gap: a slice is a *fat* pointer (a data pointer plus a
-   length), so it needs a two-word value kind threaded through parameters,
-   returns and indexing, unlike the one-word `&T` and `str` rmc has today.
+3. **More types.** `u*`/`i*` widths are done (a suffixed literal is typed at
+   its width, with width-aware overflow). `f64` is the remaining scalar gap:
+   it needs the SSE register file and a floating-point calling convention, so it
+   is a larger change than a new integer width. **Slices** (`&[T]`, and the
+   slice literals and sub-slicing `&a[lo..hi]` that build them) are the other
+   large gap: a slice is a *fat* pointer (a data pointer plus a length), so it
+   needs a two-word value kind threaded through parameters, returns and
+   indexing, unlike the one-word `&T` and `str` rmc has today.
 4. **More backends.** A second target (ARM64 or a simple VM) would force the
    code generator's assumptions out into the open.
 5. **Debug info.** Line tables so a debugger can point at source.

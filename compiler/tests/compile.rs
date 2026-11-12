@@ -6752,6 +6752,57 @@ fn the_rotates_call_their_helper_with_value_and_count() {
 }
 
 #[test]
+fn the_arithmetic_methods_call_their_helper_once_per_operand() {
+    // `pow`, the `wrapping_*` pair and the `saturating_*` family all bind the
+    // receiver, then the argument, and hand both to a runtime helper, so a call
+    // operand runs a single time and left to right.
+    for (m, helper) in [
+        ("pow", "__rmc_pow"),
+        ("wrapping_add", "__rmc_wrapping_add"),
+        ("wrapping_sub", "__rmc_wrapping_sub"),
+        ("saturating_add", "__rmc_saturating_add"),
+        ("saturating_sub", "__rmc_saturating_sub"),
+        ("saturating_mul", "__rmc_saturating_mul"),
+    ] {
+        let out = asm_no_inline(&format!(
+            "fn g() -> i64 {{ return 3; }} \
+             fn main() -> i64 {{ return g().{m}(g()); }}"
+        ));
+        let body = &out[out.find("main:").expect("main")..];
+        assert_eq!(body.matches("call g").count(), 2, "{m}: each operand once:\n{body}");
+        assert!(body.contains(&format!("call {helper}")), "{m}: helper called:\n{body}");
+    }
+}
+
+#[test]
+fn the_arithmetic_helpers_are_dropped_when_unused() {
+    // Each helper is a runtime piece kept only when the program names it, so a
+    // program that never calls the method must not carry the piece.
+    let out = asm("fn main() -> i64 { return 1; }");
+    for sym in [
+        "__rmc_pow",
+        "__rmc_wrapping_add",
+        "__rmc_wrapping_sub",
+        "__rmc_saturating_add",
+        "__rmc_saturating_sub",
+        "__rmc_saturating_mul",
+    ] {
+        assert!(!out.contains(sym), "{sym} dropped when unused:\n{out}");
+    }
+}
+
+#[test]
+fn a_plain_variable_receiver_needs_no_temp_for_the_arithmetic_methods() {
+    // A bare local has no side effect, so `x.pow(2)` passes it straight to the
+    // helper: the only call in the body is the helper itself.
+    let out = asm_no_inline("fn main() -> i64 { let x: i64 = 5; return x.pow(2); }");
+    let body = &out[out.find("main:").expect("main")..];
+    let body = &body[..body.find(".size main").expect("end of main")];
+    assert_eq!(body.matches("call ").count(), 1, "only the helper is called:\n{body}");
+    assert!(body.contains("call __rmc_pow"), "helper called:\n{body}");
+}
+
+#[test]
 fn swap_bytes_lowers_to_a_single_bswap() {
     // `swap_bytes` is one `bswap` on the receiver, matching rustc; no loop.
     let out = asm_no_inline("fn main() -> i64 { return 5.swap_bytes(); }");

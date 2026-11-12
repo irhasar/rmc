@@ -1586,7 +1586,9 @@ The checks, all in `sema.rs`:
   where rustc's is `usize`, so a differential twin casts with `as i64`.
 - **Built-in `i64` methods
   (`abs`/`min`/`max`/`clamp`/`signum`/`is_positive`/`is_negative`/
-  `div_euclid`/`rem_euclid`/`midpoint`/`count_ones`/`count_zeros`/`leading_zeros`/
+  `div_euclid`/`rem_euclid`/`midpoint`/`pow`/`wrapping_add`/`wrapping_sub`/
+  `wrapping_mul`/`saturating_add`/`saturating_sub`/`saturating_mul`/
+  `count_ones`/`count_zeros`/`leading_zeros`/
   `trailing_zeros`/`leading_ones`/`trailing_ones`/`swap_bytes`/`reverse_bits`/
   `rotate_left`/`rotate_right`).**
   Like `len()`, they
@@ -1594,10 +1596,13 @@ The checks, all in `sema.rs`:
   and only when the receiver's type is `i64`, so a user `min` on a struct is
   untouched. `desugar_i64_method` rewrites the call into an expression over the
   operators rmc already lowers, so codegen gains no case
-  (`clamp`'s `min > max` panic and the ten bit methods are the exceptions — a
+  (`clamp`'s `min > max` panic and the sixteen helper methods — the ten bit
+  methods and the six arithmetic methods — are the exceptions: a
   call to the `__rmc_clamp` / `__rmc_count_ones` / `__rmc_leading_zeros` /
   `__rmc_trailing_zeros` / `__rmc_swap_bytes` / `__rmc_reverse_bits` /
-  `__rmc_rotate_left` / `__rmc_rotate_right` runtime
+  `__rmc_rotate_left` / `__rmc_rotate_right` / `__rmc_pow` /
+  `__rmc_wrapping_add` / `__rmc_wrapping_sub` / `__rmc_saturating_add` /
+  `__rmc_saturating_sub` / `__rmc_saturating_mul` runtime
   pieces, each linked only when its method appears):
   `abs` is `if x < 0 { -x } else { x }` (so `i64::MIN` maps to itself, matching
   `rustc -O`; under `--overflow-checks` the `neg` traps, matching a debug build),
@@ -1629,6 +1634,21 @@ The checks, all in `sema.rs`:
   `MIN.midpoint(MAX)` is `0` with or without `--overflow-checks`. The half-sum is
   bound to a temp so the sign test reads the same value the `+` does. This is
   exactly `rustc`'s definition, so no helper is added.
+  `pow`/`wrapping_add`/`wrapping_sub`/`saturating_add`/`saturating_sub`/
+  `saturating_mul` each bind the receiver then the argument (so each runs once,
+  left to right) and call a two-argument runtime helper. They cannot lower to a
+  bare operator: `pow` is binary exponentiation, and the `saturating_*` family
+  clamps, which no `BinOp` expresses; `wrapping_add`/`wrapping_sub` *are* the
+  bare `add`/`sub`, but are still a helper so operand evaluation matches an
+  operator's without a `BinOp` variant (unlike `wrapping_mul`, which reuses the
+  existing `WrappingMul` op). `pow` wraps in two's complement like `rustc -O`
+  (`2.pow(64)` is `0`, `(-2).pow(63)` is `MIN`); the `saturating_*` helpers test
+  the overflow flag (`jno`) and select a bound — by the sign of `a` for `+`/`-`,
+  by the sign of `a ^ b` for `*`. All six are `jno`-guarded and trap-free, so the
+  result is the same with and without `--overflow-checks`. Because the encoder
+  rejects `test $imm, reg`, `pow`'s low-bit test is `mov`+`and $1, %ecx`, and the
+  `saturating_mul` sign test is `xor`+`jns` rather than two byte-register
+  `setl`s (which the encoder mis-encoded in combination).
   `count_ones`/`leading_zeros`/`trailing_zeros` take no argument and lower to a
   `Call __rmc_<name>` on the receiver (no operators): the usual `x & (x - 1)`
   bit trick overflows for `i64::MIN`, and rustc's answer for `MIN` is exact

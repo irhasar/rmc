@@ -219,7 +219,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     // Runtime helpers provided by the freestanding assembly runtime. They are
     // linked in automatically, so they do not appear in the source program.
-    let builtins: [(&str, &[Type], Type); 29] = [
+    let builtins: [(&str, &[Type], Type); 35] = [
         ("print_i64", &[Type::I64], Type::Unit),
         ("print_str", &[Type::Str], Type::Unit),
         ("print_bool", &[Type::Bool], Type::Unit),
@@ -272,6 +272,17 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         // helpers with two parameters.
         ("__rmc_rotate_left", &[Type::I64, Type::I64], Type::I64),
         ("__rmc_rotate_right", &[Type::I64, Type::I64], Type::I64),
+        // The arithmetic methods that need a runtime helper because their
+        // semantics differ from the bare operator: `wrapping_add`/`_sub` (a bare
+        // `add`/`sub`, emitted as a call so operand evaluation matches a binary
+        // operator's), the `saturating_*` family (clamped), and `pow`. Emitted
+        // by sema for the matching method, never written in source.
+        ("__rmc_wrapping_add", &[Type::I64, Type::I64], Type::I64),
+        ("__rmc_wrapping_sub", &[Type::I64, Type::I64], Type::I64),
+        ("__rmc_saturating_add", &[Type::I64, Type::I64], Type::I64),
+        ("__rmc_saturating_sub", &[Type::I64, Type::I64], Type::I64),
+        ("__rmc_saturating_mul", &[Type::I64, Type::I64], Type::I64),
+        ("__rmc_pow", &[Type::I64, Type::I64], Type::I64),
         // `print!`/`println!`'s `{}` pieces, chosen by the value's type. Unlike
         // `print_i64` and friends they print *no* trailing newline, so a
         // `println!` line of several pieces stays on one line and the macro
@@ -1217,6 +1228,37 @@ impl Sema {
                 }
                 let y = bind(self, args[0].clone(), &mut stmts);
                 (Expr::Bin(WrappingMul, Box::new(x), Box::new(y)), Type::I64)
+            }
+            // The remaining arithmetic methods lower straight to a two-argument
+            // runtime helper. The receiver is bound first and the argument
+            // second, so each runs once and left to right, matching rustc's
+            // `x.method(y)` order. Each helper reproduces the `rustc -O` result
+            // and none can trap: `wrapping_add`/`_sub` are the bare `add`/`sub`,
+            // the `saturating_*` family clamps, and `pow` wraps.
+            "wrapping_add" | "wrapping_sub" | "saturating_add" | "saturating_sub"
+            | "saturating_mul" | "pow" => {
+                if args.len() != 1 {
+                    return Err(format!("method `{name}` takes exactly one argument"));
+                }
+                let y = bind(self, args[0].clone(), &mut stmts);
+                let helper = match name {
+                    "wrapping_add" => "__rmc_wrapping_add",
+                    "wrapping_sub" => "__rmc_wrapping_sub",
+                    "saturating_add" => "__rmc_saturating_add",
+                    "saturating_sub" => "__rmc_saturating_sub",
+                    "saturating_mul" => "__rmc_saturating_mul",
+                    _ => "__rmc_pow",
+                };
+                (
+                    Expr::Call {
+                        name: helper.into(),
+                        args: vec![x, y],
+                        arg_slots: vec![(-1, 0), (-1, 0)],
+                        ret_slot: -1,
+                        ret_ty: Type::I64,
+                    },
+                    Type::I64,
+                )
             }
             _ => unreachable!("checked by the caller"),
         };
@@ -3598,6 +3640,12 @@ impl Sema {
                             | "rotate_right"
                             | "midpoint"
                             | "wrapping_mul"
+                            | "wrapping_add"
+                            | "wrapping_sub"
+                            | "saturating_add"
+                            | "saturating_sub"
+                            | "saturating_mul"
+                            | "pow"
                     )
                 {
                     // `abs` synthesises `-x`, a compiler-generated negation, so

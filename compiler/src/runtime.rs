@@ -1126,6 +1126,131 @@ __rmc_rotate_right:
 "#,
         defines: &["__rmc_rotate_right"],
     },
+    Piece {
+        text: r#"
+.text
+# long __rmc_wrapping_add(long a, long b) / __rmc_wrapping_sub  -- two's
+# complement wrapping, identical to the bare `add`/`sub` the operator path
+# emits. They exist so `a.wrapping_add(b)` has the same operand evaluation
+# (left to right, each once) as a binary operator, without a `BinOp` variant.
+.globl __rmc_wrapping_add
+.type __rmc_wrapping_add, @function
+__rmc_wrapping_add:
+    mov %rdi, %rax
+    add %rsi, %rax
+    ret
+.size __rmc_wrapping_add, .-__rmc_wrapping_add
+
+.globl __rmc_wrapping_sub
+.type __rmc_wrapping_sub, @function
+__rmc_wrapping_sub:
+    mov %rdi, %rax
+    sub %rsi, %rax
+    ret
+.size __rmc_wrapping_sub, .-__rmc_wrapping_sub
+"#,
+        defines: &["__rmc_wrapping_add", "__rmc_wrapping_sub"],
+    },
+    Piece {
+        text: r#"
+.text
+# long __rmc_saturating_add(long a, long b)  -- `a + b`, clamped to `i64::MIN`
+# / `i64::MAX` instead of wrapping. `add` sets `OF` exactly when the signed sum
+# does not fit, so the overflowed result is replaced by the bound the sign of
+# `a` selects: a positive `a` overflowed upward, a negative one downward.
+.globl __rmc_saturating_add
+.type __rmc_saturating_add, @function
+__rmc_saturating_add:
+    mov %rdi, %rax
+    add %rsi, %rax
+    jno .Lsatadd_done
+    test %rdi, %rdi
+    movabs $9223372036854775807, %rax
+    jns .Lsatadd_done
+    movabs $-9223372036854775808, %rax
+.Lsatadd_done:
+    ret
+.size __rmc_saturating_add, .-__rmc_saturating_add
+"#,
+        defines: &["__rmc_saturating_add"],
+    },
+    Piece {
+        text: r#"
+.text
+# long __rmc_saturating_sub(long a, long b)  -- `a - b`, clamped. `sub` sets
+# `OF` when the difference does not fit; the sign of `a` picks the bound (a
+# positive `a` overflowed upward, a negative one downward), exactly as for the
+# sum.
+.globl __rmc_saturating_sub
+.type __rmc_saturating_sub, @function
+__rmc_saturating_sub:
+    mov %rdi, %rax
+    sub %rsi, %rax
+    jno .Lsatsub_done
+    test %rdi, %rdi
+    movabs $9223372036854775807, %rax
+    jns .Lsatsub_done
+    movabs $-9223372036854775808, %rax
+.Lsatsub_done:
+    ret
+.size __rmc_saturating_sub, .-__rmc_saturating_sub
+"#,
+        defines: &["__rmc_saturating_sub"],
+    },
+    Piece {
+        text: r#"
+.text
+# long __rmc_saturating_mul(long a, long b)  -- `a * b`, clamped. `imul` sets
+# `OF` exactly when the product does not fit. When it does not, the true product
+# is positive when the operands share a sign and negative otherwise, so the
+# bound is chosen by the sign of `a ^ b`: a clear sign bit means the same sign,
+# hence `i64::MAX`.
+.globl __rmc_saturating_mul
+.type __rmc_saturating_mul, @function
+__rmc_saturating_mul:
+    mov %rdi, %rax
+    imul %rsi, %rax
+    jno .Lsatsmul_done
+    mov %rdi, %rcx
+    xor %rsi, %rcx
+    movabs $9223372036854775807, %rax
+    jns .Lsatsmul_done
+    movabs $-9223372036854775808, %rax
+.Lsatsmul_done:
+    ret
+.size __rmc_saturating_mul, .-__rmc_saturating_mul
+"#,
+        defines: &["__rmc_saturating_mul"],
+    },
+    Piece {
+        text: r#"
+.text
+# long __rmc_pow(long base, long exp)  -- `base` raised to `exp` by binary
+# exponentiation, in wrapping two's-complement arithmetic (the product is
+# unchecked, so `i64::MIN` and other overflow cases wrap as `rustc -O` does).
+# A negative `exp` has no `i64` result, so the loop is skipped and `1` is
+# returned, matching the constant `0` exponent's value.
+.globl __rmc_pow
+.type __rmc_pow, @function
+__rmc_pow:
+    mov $1, %rax             # result
+    test %rsi, %rsi
+    jle .Lpow_done
+.Lpow_loop:
+    mov %rsi, %rcx
+    and $1, %ecx             # the low bit of the exponent
+    jz .Lpow_skip
+    imul %rdi, %rax
+.Lpow_skip:
+    imul %rdi, %rdi          # square the base
+    shr $1, %rsi             # drop the bit just used
+    jnz .Lpow_loop
+.Lpow_done:
+    ret
+.size __rmc_pow, .-__rmc_pow
+"#,
+        defines: &["__rmc_pow"],
+    },
 ];
 
 /// The identifiers in `src`, with `#`-to-end-of-line comments dropped. Matching

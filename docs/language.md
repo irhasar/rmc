@@ -119,9 +119,10 @@ variant of that enum and not an associated function is reported as such.
 
 ### Built-in integer methods
 
-An `i64` receiver has twenty methods built in, which desugar to the operators
+An `i64` receiver has twenty-six methods built in, which desugar to the operators
 rmc already lowers (so they cost no call, except `clamp`, for its panic, and the
-ten bit methods below, for their per-bit work):
+sixteen helpers below — the ten bit methods, for their per-bit work, and the six
+arithmetic methods, for their overflow semantics):
 
 | call                    | meaning                                        |
 | ----------------------- | ---------------------------------------------- |
@@ -135,6 +136,13 @@ ten bit methods below, for their per-bit work):
 | `x.div_euclid(y)`       | `x / y` rounded toward the mathematical quotient |
 | `x.rem_euclid(y)`       | the remainder in `[0, abs(y))`                  |
 | `x.midpoint(y)`         | the mean of `x` and `y`, rounded toward zero    |
+| `x.pow(n)`              | `x` raised to `n` (wrapping on overflow)        |
+| `x.wrapping_add(y)`     | `x + y`, wrapping on overflow                   |
+| `x.wrapping_sub(y)`     | `x - y`, wrapping on overflow                   |
+| `x.wrapping_mul(y)`     | `x * y`, wrapping on overflow                   |
+| `x.saturating_add(y)`   | `x + y`, clamped to the `i64` bounds            |
+| `x.saturating_sub(y)`   | `x - y`, clamped to the `i64` bounds            |
+| `x.saturating_mul(y)`   | `x * y`, clamped to the `i64` bounds            |
 | `x.count_ones()`        | the number of set bits                          |
 | `x.count_zeros()`       | the number of clear bits                        |
 | `x.leading_zeros()`     | the zeros above the top set bit (64 when `x` is 0) |
@@ -149,9 +157,9 @@ ten bit methods below, for their per-bit work):
 The semantics match `rustc -O`: `i64::MIN.abs()` is `i64::MIN` (it does not
 trap; with `--overflow-checks` it traps, as in a debug build), and `signum` is
 computed with comparisons only, so `i64::MIN.signum()` is `-1` without overflow.
-`is_positive`/`is_negative` return `bool` — unlike the eighteen arithmetic and
-bit methods, which return `i64` — and `0` is neither positive nor negative, so
-both are `false` there.
+`is_positive`/`is_negative` return `bool` — unlike the twenty-five arithmetic
+and bit methods, which return `i64` — and `0` is neither positive nor negative,
+so both are `false` there.
 `div_euclid`/`rem_euclid` compute `q = x / y` and `r = x % y` and round toward
 the mathematical quotient: when `r` is negative, `q` moves one step further from
 zero and `r` gains `abs(y)`. They reuse `/` and `%`, so a zero divisor and
@@ -165,6 +173,13 @@ same with and without `--overflow-checks`.
 `clamp` returns `lo`, `x` or `hi`, and panics when `lo > hi` (a message and exit
 101, like rustc); it is the one built-in whose panic is a runtime call, so a
 program that never calls it does not carry the helper.
+`pow`, `wrapping_add`/`_sub`/`_mul` and `saturating_add`/`_sub`/`_mul` each lower
+to a runtime helper, so the result matches `rustc -O` for every operand and none
+can trap. `wrapping_*` and `pow` wrap in two's complement (`2i64.pow(64)` is `0`,
+`(-2i64).pow(63)` is `i64::MIN`); the `saturating_*` family clamps at `i64::MIN`
+or `i64::MAX` instead of wrapping. `pow` is binary exponentiation, and its
+argument is an `i64` like every other rmc value (rustc's `pow` takes a `u32`),
+so an exponent written as a literal or a plain expression behaves identically.
 The bit methods each lower to a small runtime helper rather than to operators:
 `x & (x - 1)` would overflow for `i64::MIN`, whereas a loop over the 64 bits is
 exact for every input, so the result is the same with and without
@@ -956,9 +971,13 @@ error, since rmc compiles a single file and cannot resolve it.
 ## Not supported
 
 Traits, generics, borrowing, lifetimes, modules, closures, tuple structs
-(`struct S(i64, i64)`), raw string literals (`r".."`), `f32`/`f64`,
-`u*`/`i*` types other than `i64`, and the standard library beyond the two `std`
-paths above and the `Vec` shims. A `Vec` is not a real container: only the
+(`struct S(i64, i64)`), raw string literals (`r".."`), `f32`/`f64`, and the
+standard library beyond the two `std` paths above and the `Vec` shims. The
+integer widths (`u8`/`i8`/.../`u64`/`i64`/`usize`/`isize`) exist, but only as a
+value's width: a `let x: u8` binding and a `200u8` literal carry their width
+through arithmetic, yet rmc has no `u8`-*typed* `b'A'` (a byte literal is an
+`i64`, unlike rustc's `u8`), and a width larger than 64 bits (`u128`/`i128`) is
+treated as `i64`. A `Vec` is not a real container: only the
 handful of shapes in "Vec shims" are recognised, and any other `Vec` method or
 use is a compile error. A `char` is a scalar, but its full `char` API
 (`char::from_u32`, `is_alphabetic`, `to_digit`, ...) is not provided, and
