@@ -590,7 +590,9 @@ required, as in Rust. Three counting adapters are also supported and may chain:
 `.step_by(k)` yields every `k`-th element, `.skip(k)` drops the first `k`, and
 `.take(k)` keeps only the first `k`. Adapters apply left to right, so
 `(0..10).skip(2).take(3).rev()` reverses the slice `[2, 3, 4]`; each bound is
-evaluated once, and `continue` still runs the counter increment. `for x in &arr`
+evaluated once, and `continue` still runs the counter increment. A count is a
+`usize`, so a negative literal (`skip(-1)`) is rejected, matching rustc's
+`E0600`. `for x in &arr`
 (which Rust iterates by reference) is rejected rather than mistyped. `while let` is
 `loop { if let PAT = expr { body } else { break; } }`: the scrutinee is
 re-evaluated every iteration, and `continue` re-tests it rather than jumping to

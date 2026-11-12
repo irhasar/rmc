@@ -71,4 +71,13 @@ fn main() {
     print!("step_by k=1: ");
     for i in (0..4).step_by(1) { print!("{} ", i); }
     println!();
+
+    // A parenthesized range with no adapter is accepted directly, as in Rust.
+    print!("plain paren: ");
+    for i in (0..4) { print!("{} ", i); }
+    println!();
+
+    print!("plain paren inclusive: ");
+    for i in (2..=5) { print!("{} ", i); }
+    println!();
 }

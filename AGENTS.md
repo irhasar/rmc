@@ -837,7 +837,13 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   which requires the parentheses Rust requires) and desugared by
   `desugar_for_range_adapter` into the ordinary `Stmt::For` upward counter, so
   `continue` still reaches the increment — a downward `while` would skip it and
-  loop forever. The desugar is two passes: a forward pass gives each adapter a
+  loop forever. The lookahead shares `parenthesized_range_end` (the token index
+  past a `( lo..hi )` group, `None` when it is not a range) with the plain form:
+  a parenthesized range with *no* adapter (`for i in (0..4)`) is unwrapped by
+  `at_parenthesized_range_plain` to the ordinary range loop, since `(lo..hi)` is
+  not an rmc expression. The plain check runs only after the adapter check fails,
+  so `(a..b).rev()` still takes the adapter path; both require the `..` at depth
+  one, so `((a..b))` and `(a..b).sum()` match neither. The desugar is two passes: a forward pass gives each adapter a
   `let` bound (evaluated once, not per step) and threads the sequence length
   through, and a reverse pass composes each adapter's *index* map into the
   element expression. The maps stay relative to the raw range and `lo` is added

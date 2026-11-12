@@ -2864,6 +2864,19 @@ def reject_corpus():
         # literal (E0080 in rustc).
         "const_local_overflow": "fn main() { let x = 9223372036854775807i64; let y = x + 1; let _ = y; }\n",
         "const_local_div_zero": "fn main() { let d = 0i64; let y = 1i64 / d; let _ = y; }\n",
+        # A narrow `const` folds at its declared width: `250 + 10` overflows a
+        # `u8` (E0080), a bare `300` is a literal out of range, and `300 as u8`
+        # is rejected at the cast. rmc must reject all three, not fold them as
+        # an unbounded `i64`.
+        "const_u8_add_overflow": "const N: u8 = 250 + 10; fn main() { println!(\"{}\", N); }\n",
+        "const_u8_literal_oob": "const N: u8 = 300; fn main() { println!(\"{}\", N); }\n",
+        "const_u8_cast_literal_oob": "const N: u8 = 300 as u8; fn main() { println!(\"{}\", N); }\n",
+        "const_u8_sub_overflow": "const N: u8 = 10 - 20; fn main() { println!(\"{}\", N); }\n",
+        # A negative adapter count is a unary `-` on a `usize` (E0600), which
+        # rmc must reject rather than treat as a wrapped stride or skip.
+        "skip_negative": "fn main() { for i in (0..3).skip(-1) { println!(\"{}\", i); } }\n",
+        "take_negative": "fn main() { for i in (0..3).take(-1) { println!(\"{}\", i); } }\n",
+        "step_by_negative": "fn main() { for i in (0..3).step_by(-1) { println!(\"{}\", i); } }\n",
         # A reference may only be cast to a reference of the same type, may not
         # gain mutability, and may not become a scalar (E0605/E0606). rmc's
         # `i64 as &T` raw pointer cast is a documented extension and stays.

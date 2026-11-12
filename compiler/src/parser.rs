@@ -1,7 +1,7 @@
 //! Recursive-descent parser for the rmc Rust subset.
 
 use crate::ast::*;
-use crate::consts::eval_i64;
+use crate::consts::{const_i64, eval_i64};
 use crate::lexer::{Tok, Token};
 
 /// One saved entry of a parser name table, so a block's bindings are forgotten
@@ -2458,15 +2458,11 @@ impl Parser {
     /// the array's compile-time length, so the loop bound is a literal and the
     /// loop carries no hidden slot.
     ///
-    /// The tokens at the cursor are `( <..> .. <..> )` followed by one or more
-    /// adapters: the head of a `for i in (lo..hi).rev()` / `.step_by(k)` /
-    /// `.skip(k)` / `.take(k)`, possibly chained (`.skip(3).take(4)`). A
-    /// non-nested token scan: the first `)` at depth zero ends the parenthesised
-    /// range, and only a `..`/`..=` directly inside it (no parentheses of its
-    /// own) counts, so `(f(..))`, `((a..b))` and `(a..b).sum()` are all
-    /// rejected. Returns the adapters in source order, or `None` when the shape
-    /// does not match.
-    fn at_parenthesized_range_adapter(&self) -> Option<Vec<String>> {
+    /// The token index just past a parenthesized range at the cursor, or `None`
+    /// when the tokens are not `( lo..hi )` / `( lo..=hi )`. A `..`/`..=` counts
+    /// only at depth one (a `..` inside a nested `(..)` does not), and the range
+    /// must be the whole group, so `(f(..))` and `(a..b).sum()` do not match.
+    fn parenthesized_range_end(&self) -> Option<usize> {
         if self.peek() != Some(&Tok::LParen) {
             return None;
         }
@@ -2496,7 +2492,29 @@ impl Parser {
         if !saw_dots || self.toks.get(j).map(|t| &t.tok) != Some(&Tok::RParen) {
             return None;
         }
-        j += 1;
+        Some(j + 1)
+    }
+
+    /// True at the head of `(lo..hi)` / `(lo..=hi)` used directly as a `for`
+    /// iterable (no adapter). `(a..b).rev()` is handled by
+    /// `at_parenthesized_range_adapter` first, so this sees only the plain form.
+    fn at_parenthesized_range_plain(&self) -> bool {
+        match self.parenthesized_range_end() {
+            Some(j) => self.toks.get(j).map(|t| &t.tok) != Some(&Tok::Dot),
+            None => false,
+        }
+    }
+
+    /// The tokens at the cursor are `( <..> .. <..> )` followed by one or more
+    /// adapters: the head of a `for i in (lo..hi).rev()` / `.step_by(k)` /
+    /// `.skip(k)` / `.take(k)`, possibly chained (`.skip(3).take(4)`). A
+    /// non-nested token scan: the first `)` at depth zero ends the parenthesised
+    /// range, and only a `..`/`..=` directly inside it (no parentheses of its
+    /// own) counts, so `(f(..))`, `((a..b))` and `(a..b).sum()` are all
+    /// rejected. Returns the adapters in source order, or `None` when the shape
+    /// does not match.
+    fn at_parenthesized_range_adapter(&self) -> Option<Vec<String>> {
+        let mut j = self.parenthesized_range_end()?;
         let mut adapters = Vec::new();
         loop {
             if self.toks.get(j).map(|t| &t.tok) != Some(&Tok::Dot) {
@@ -2645,6 +2663,21 @@ impl Parser {
         let mut prev_len = total;
         for (t, adapter) in adapters.iter().enumerate() {
             lens.push(prev_len.clone());
+            // A negative literal count (`skip(-1)`, `step_by(-1)`) is rejected
+            // by rustc: the adapters take a `usize`, which cannot be negated.
+            // rmc's `-1` is an `i64`, and a negative count would otherwise
+            // silently mean "no skip" or a backward stride, so reject it here.
+            // A non-literal negative (a variable, a cast) is not a compile
+            // error in rustc, so it is left to run time, matching a `usize`
+            // that wrapped.
+            if let Some(k) = args.get(head_a).and_then(const_i64) {
+                if k < 0 {
+                    return Err(format!(
+                        "at byte {}: cannot apply unary `-` to a `usize` adapter count",
+                        self.pos()
+                    ));
+                }
+            }
             match adapter.as_str() {
                 "rev" => counts.push(prev_len.clone()),
                 "step_by" => {
@@ -2659,21 +2692,44 @@ impl Parser {
                     });
                     head_a += 1;
                     strides[t] = Some(k_name.clone());
-                    // `ceil(len / k)` as `(len + k - 1) / k`; a zero stride is a
-                    // runtime divide-by-zero, which is what rustc reports.
-                    counts.push(Expr::Bin(
+                    // `ceil(len / k)` as `len / k + (len % k != 0)`. The
+                    // obvious `(len + k - 1) / k` overflows for a stride near
+                    // `i64::MAX` (`(0..3).step_by(i64::MAX)` must yield one
+                    // element), so the count is built from `len / k` plus a
+                    // 0/1 remainder indicator instead. A zero stride divides by
+                    // zero here, trapping like rustc — and because the count is
+                    // bound now, that happens when `step_by` is applied, before
+                    // a later adapter's argument runs.
+                    let c_name = c_name(t);
+                    let quot = Expr::Bin(
                         BinOp::Div,
-                        Box::new(Expr::Bin(
+                        Box::new(prev_len.clone()),
+                        Box::new(vlo(&k_name)),
+                    );
+                    let rem = Expr::Bin(
+                        BinOp::Mod,
+                        Box::new(prev_len.clone()),
+                        Box::new(vlo(&k_name)),
+                    );
+                    head.push(Stmt::Let {
+                        name: c_name.clone(),
+                        ty: None,
+                        init: Some(Expr::Bin(
                             BinOp::Add,
-                            Box::new(prev_len.clone()),
-                            Box::new(Expr::Bin(
-                                BinOp::Sub,
-                                Box::new(vlo(&k_name)),
-                                Box::new(Expr::Int(1)),
+                            Box::new(quot),
+                            Box::new(Expr::Cast(
+                                Box::new(Expr::Bin(
+                                    BinOp::Ne,
+                                    Box::new(rem),
+                                    Box::new(Expr::Int(0)),
+                                )),
+                                Type::I64,
                             )),
                         )),
-                        Box::new(vlo(&k_name)),
-                    ));
+                        slot: -1,
+                        mutable: false,
+                    });
+                    counts.push(vlo(&c_name));
                 }
                 "skip" | "take" => {
                     let m = m_name(t);
@@ -2848,6 +2904,36 @@ impl Parser {
                 pat, lo, hi, inclusive, &adapters, args, body, label,
             );
         }
+        // `for i in (lo..hi) { .. }`: Rust allows the range to be parenthesized
+        // even with no adapter. rmc's `(lo..hi)` is not an expression, so the
+        // shape is unwrapped here to the plain range loop below.
+        if self.at_parenthesized_range_plain() {
+            self.expect(Tok::LParen)?;
+            let lo = self.parse_cond()?;
+            let inclusive = self.eat(&Tok::DotDotEq);
+            if !inclusive {
+                self.expect(Tok::DotDot)?;
+            }
+            let hi = self.parse_cond()?;
+            self.expect(Tok::RParen)?;
+            let mut body = self.parse_block()?;
+            let (var, extra) = self.range_for_binding(pat)?;
+            if !extra.is_empty() {
+                let mut stmts = extra;
+                stmts.extend(body.stmts);
+                body = Block { stmts, tail: body.tail };
+            }
+            return Ok(Stmt::For {
+                var,
+                var_slot: -1,
+                start: lo,
+                end: hi,
+                end_slot: -1,
+                inclusive,
+                body,
+                label,
+            });
+        }
         let head = self.parse_cond()?;
         // `for v in &args` (and `for v in args`) over an `args()`-vector binding
         // desugars to a range over the argument count; the element is read from
@@ -2899,32 +2985,7 @@ impl Parser {
             // A range's loop variable is bound directly, so only an irrefutable
             // pattern is allowed: `for n @ _ in 0..5` binds `n`, and
             // `for n @ m in 0..5` also binds `m` (an alias) in the body.
-            let (var, extra) = match pat {
-                Pat::Bind(n) => (n, Vec::new()),
-                Pat::Wild => {
-                    let n = format!("\u{0}fi{}", self.tmp);
-                    self.tmp += 1;
-                    (n, Vec::new())
-                }
-                Pat::At(n, _, sub) => {
-                    if !Self::pat_irrefutable(&sub) {
-                        return Err(format!(
-                            "at byte {}: refutable pattern in `for` binding",
-                            self.pos()
-                        ));
-                    }
-                    let subj = Expr::Var { name: n.clone(), slot: -1, ty: Type::I64 };
-                    let mut binds = Vec::new();
-                    Self::pat_binds(&sub, false, &subj, &mut binds);
-                    (n, binds)
-                }
-                _ => {
-                    return Err(format!(
-                        "at byte {}: `for` over a range needs a binding or `_`",
-                        self.pos()
-                    ))
-                }
-            };
+            let (var, extra) = self.range_for_binding(pat)?;
             if !extra.is_empty() {
                 let mut stmts = extra;
                 stmts.extend(body.stmts);
@@ -2943,6 +3004,38 @@ impl Parser {
         }
         let body = self.parse_block()?;
         self.desugar_for_array(pat, head, body, label)
+    }
+
+    /// The loop variable and any extra bindings for a `for` over a *range*. A
+    /// range's pattern is irrefutable, so it is a binding, `_`, or an
+    /// at-binding (`n @ _`); anything else is rejected rather than mis-bound.
+    /// `_` gets a fresh temporary name, and an at-binding adds the sub-pattern's
+    /// bindings as statements for the body.
+    fn range_for_binding(&mut self, pat: Pat) -> PResult<(String, Vec<Stmt>)> {
+        match pat {
+            Pat::Bind(n) => Ok((n, Vec::new())),
+            Pat::Wild => {
+                let n = format!("\u{0}fi{}", self.tmp);
+                self.tmp += 1;
+                Ok((n, Vec::new()))
+            }
+            Pat::At(n, _, sub) => {
+                if !Self::pat_irrefutable(&sub) {
+                    return Err(format!(
+                        "at byte {}: refutable pattern in `for` binding",
+                        self.pos()
+                    ));
+                }
+                let subj = Expr::Var { name: n.clone(), slot: -1, ty: Type::I64 };
+                let mut binds = Vec::new();
+                Self::pat_binds(&sub, false, &subj, &mut binds);
+                Ok((n, binds))
+            }
+            _ => Err(format!(
+                "at byte {}: `for` over a range needs a binding or `_`",
+                self.pos()
+            )),
+        }
     }
 
     /// `for PAT in ARRAY { body }` -> an index loop over the array (see
