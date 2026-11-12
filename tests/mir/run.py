@@ -57,6 +57,8 @@ ARGS = {
     # srread reads its loop bounds from argv, so run zero, one and several
     # iterations to catch the off-by-one the strength-reduce guard prevents.
     "srread": [["0"], ["1"], ["2"], ["7"], ["64"]],
+    # float accumulates `n` half-steps; run the empty and non-empty loops.
+    "float": [["0"], ["1"], ["5"], ["9"]],
 }
 
 
@@ -145,6 +147,56 @@ def build_rmc(name):
     return mir, None
 
 
+REJECT = os.path.join(ROOT, "reject")
+
+
+def run_reject_cases(verbose):
+    """Cases in `reject/` that rustc accepts but rmc must refuse *cleanly*.
+
+    The value here is the failure mode, not the success: an unsupported
+    construct must exit with status 1 and a message that names the feature, not
+    a panic (status 101) or a stray `undefined symbol` from the linker. Each
+    case is checked on both sides - the reference must build and run, so the
+    program is real, and rmc must fail with status 1.
+    """
+    if not os.path.isdir(REJECT):
+        return 0, 0
+    rt = runtime_asm()
+    failures = 0
+    cases = sorted(f[:-3] for f in os.listdir(REJECT) if f.endswith(".rs"))
+    for name in cases:
+        src = os.path.join(REJECT, f"{name}.rs")
+        obj = os.path.join(OUT, f"{name}.rej.o")
+        rc, _, err = run([
+            "rustc", "-O", "-C", "panic=abort", "--crate-type=bin",
+            "--edition", "2021", "-C", "relocation-model=static", "--emit=obj",
+            src, "-o", obj,
+        ])
+        if rc != 0:
+            print(f"FAIL reject/{name}: rustc could not build the reference:\n"
+                  f"{err.decode(errors='replace')}")
+            failures += 1
+            continue
+        # rmc must refuse with a clean, named error. Status 1 (not 101) is the
+        # contract; a 101 would be a panic, which is the regression this guards.
+        out_bin = os.path.join(OUT, f"{name}.rej.bin")
+        rc, _, err = run([RMC, "--rustc-frontend", src, "-o", out_bin])
+        msg = err.decode(errors="replace")
+        if rc == 0:
+            print(f"FAIL reject/{name}: rmc accepted a construct it cannot compile")
+            failures += 1
+        elif rc != 1:
+            print(f"FAIL reject/{name}: rmc exited {rc} (want a clean 1, not a "
+                  f"panic/abort):\n{msg}")
+            failures += 1
+        elif "note:" not in msg:
+            print(f"FAIL reject/{name}: the error names no feature (no `note:`):\n{msg}")
+            failures += 1
+        elif verbose:
+            print(f"ok   reject/{name}")
+    return len(cases), failures
+
+
 def main():
     verbose = "-v" in sys.argv
     os.makedirs(OUT, exist_ok=True)
@@ -184,9 +236,18 @@ def main():
             if verbose:
                 print(f"ok   {name}")
 
+    # `reject/` cases: rustc accepts, rmc must refuse cleanly. Counted
+    # separately so the "N cases matched" line stays about the positive suite.
+    n_reject, reject_failures = run_reject_cases(verbose)
+    failures += reject_failures
+
     total = len(cases)
-    print(f"\n{total - failures - skipped}/{total} cases matched"
-          + (f" ({failures} failed, {skipped} skipped)" if failures or skipped else ""))
+    print(f"\n{total - (failures - reject_failures) - skipped}/{total} cases matched"
+          + (f" ({failures - reject_failures} failed, {skipped} skipped)"
+             if (failures - reject_failures) or skipped else ""))
+    if n_reject:
+        print(f"{n_reject - reject_failures}/{n_reject} reject cases refused cleanly"
+              + (f" ({reject_failures} failed)" if reject_failures else ""))
     return 1 if failures else 0
 
 

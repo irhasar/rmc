@@ -2402,6 +2402,19 @@ fn parse_rvalue(s: &str) -> Result<Rvalue, String> {
     }
     // A cast: `OPERAND as TY (KIND)`.
     if let Some((op_part, ty_kind)) = split_top_as(s) {
+        // A cast to a trait object (`&Sq as &dyn Shape`) needs a vtable and a
+        // virtual call, neither of which the back end implements. Reject it
+        // here, where the construct is still visible, rather than let it
+        // through as an identity pointer cast and surface later as a confusing
+        // `undefined symbol` at link time. `classify_unsupported` adds the
+        // "`dyn Trait` ... not implemented" note for this line.
+        if ty_kind.contains("dyn ") {
+            // `ty_kind` carries the coercion kind too, e.g.
+            // `&dyn Shape (PointerCoercion(Unsize, Implicit))`; report just the
+            // type the user wrote.
+            let ty = ty_kind.split(" (").next().unwrap_or(ty_kind).trim();
+            return Err(format!("mir: cast to a trait object (`as {ty}`)"));
+        }
         let (ty, kind) = parse_cast_target(ty_kind)?;
         let op = parse_operand(op_part.trim())?;
         let from = operand_ty(&op);
@@ -2712,16 +2725,25 @@ pub fn classify_unsupported(fragment: &str) -> Option<&'static str> {
         return Some("iterator adapters (`map`/`filter`/`collect`) are not implemented on the MIR path");
     }
     if has("as Fn<") || has("FnOnce") || has("FnMut") {
-        return Some("closures and the `Fn` traits are not implemented on the MIR path");
+        return Some("a closure used as a value (through the `Fn` traits) needs an indirect call, which is not implemented on the MIR path; a closure called directly in place is supported");
     }
     if has("{closure@") || has("closure#") {
-        return Some("closures are not implemented on the MIR path");
+        return Some("this closure is used as a value (an indirect call), which is not implemented on the MIR path; a closure called directly in place is supported");
     }
-    if has("f64") || has("f32") {
-        return Some("floating-point types are not implemented on the MIR path");
-    }
-    if has("i128") || has("u128") {
-        return Some("128-bit integers are not implemented on the MIR path");
+    // `f64`/`f32` arithmetic, comparison and loops *are* implemented
+    // (`tests/mir/float.rs`); only the remainder operator and the intrinsics
+    // rustc lowers to library calls are not. The old rule claimed
+    // "floating-point types are not implemented", which was false and steered
+    // users away from a feature that works.
+    if (has("f64") || has("f32"))
+        && (has("Rem")
+            || has("_number_nsz")
+            || has("powf")
+            || has("powi")
+            || has("sqrt")
+            || has("fabs"))
+    {
+        return Some("this floating-point operation is not implemented on the MIR path: `+`, `-`, `*`, `/` and comparisons work, but `%` and the float intrinsics (`min`/`max`/`abs`/`powf`/...) do not");
     }
     if has("::promoted[") {
         return Some("a promoted constant of a shape the back end cannot fold (an aggregate, or a reference to one) is not implemented on the MIR path");
@@ -6768,3 +6790,51 @@ fn rv_operands(rv: &Rvalue) -> Vec<Place> {
     v
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn float_arithmetic_is_not_reported_unsupported() {
+        // Regression: the classifier used to return "floating-point types are
+        // not implemented" for any fragment containing `f64`, which is false -
+        // `tests/mir/float.rs` compiles and runs (`+`, `-`, `*`, `/`,
+        // comparisons, a float loop). Only `%` and the intrinsics rustc lowers
+        // to library calls are unsupported, so those are the only fragments
+        // that should carry a note.
+        assert_eq!(classify_unsupported("Binary(Add, move _1, const 2f64)"), None);
+        assert_eq!(classify_unsupported("_3 = Eq(move _1, const 1.5f64)"), None);
+        assert_eq!(classify_unsupported("_4 = Lt(move _1, move _2)"), None);
+        assert!(classify_unsupported("Rem(copy _1, const 2f64)").is_some());
+        assert!(classify_unsupported("minimum_number_nsz_f64(move _1, const 3f64)").is_some());
+    }
+
+    #[test]
+    fn wide_integers_are_not_reported_unsupported() {
+        // Regression: the classifier used to return "128-bit integers are not
+        // implemented", which is false - `tests/mir/wideint.rs` compiles and
+        // runs (add, multiply with a carry, divide, remainder, shift, compare).
+        assert_eq!(classify_unsupported("const 5_i128"), None);
+        assert_eq!(classify_unsupported("_5 = Rem(copy _1, const 2_i128)"), None);
+        assert_eq!(classify_unsupported("_6 = Lt(move _1, move _2)"), None);
+        assert_eq!(classify_unsupported("_7 = Shl(move _1, move _2)"), None);
+    }
+
+    #[test]
+    fn a_dyn_cast_is_rejected_at_parse_time() {
+        // A trait-object coercion used to pass as an identity pointer cast and
+        // surface later as `elf: undefined symbol` (the virtual call became a
+        // direct call to a method that has no symbol). It must be a parse error
+        // that names the construct, with `classify_unsupported` adding the note.
+        let e = parse_rvalue("copy _4 as &dyn Shape (PointerCoercion(Unsize, Implicit))")
+            .unwrap_err();
+        assert!(e.contains("trait object"), "message should name `dyn`: {e}");
+        assert!(classify_unsupported(
+            "copy _4 as &dyn Shape (PointerCoercion(Unsize, Implicit))"
+        )
+        .is_some());
+        // An ordinary pointer/integer cast is unaffected.
+        assert!(parse_rvalue("copy _1 as i64 (IntToInt)").is_ok());
+    }
+}

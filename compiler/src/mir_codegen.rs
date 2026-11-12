@@ -3681,9 +3681,15 @@ impl<'a> FnGen<'a> {
                 self.store_scalar(dest, "%rax")?;
             }
             _ => {
-                return Err(format!(
-                    "mir_codegen: float operator {op:?} is not implemented"
-                ))
+                // Route through the shared classifier so the user gets the same
+                // `note:` as every other unsupported construct (and so the note
+                // lives in one place, `classify_unsupported`, rather than being
+                // duplicated here).
+                let tyname = if f32 { "f32" } else { "f64" };
+                return Err(unsupported_note(
+                    &format!("mir_codegen: float operator {op:?} is not implemented"),
+                    &format!("{op:?} {tyname}"),
+                ));
             }
         }
         Ok(())

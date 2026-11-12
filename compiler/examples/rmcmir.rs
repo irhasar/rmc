@@ -42,7 +42,18 @@ fn main() {
             *t0 = std::time::Instant::now();
         }
     };
-    let mut prog = rmc::mir::parse(&text).expect("mir parse");
+    // A parse failure is the expected outcome for a construct the back end does
+    // not support, so it must exit like any other compile error: a clean
+    // message and status 1, not a panic and a backtrace note. `tools/fuzz.py`
+    // and the differential suite both rely on "unsupported" being a status, not
+    // a crash.
+    let mut prog = match rmc::mir::parse(&text) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = writeln!(std::io::stderr(), "rmc-mir: error: {e}");
+            std::process::exit(1);
+        }
+    };
     mark("parse", &mut t0);
     rmc::mir::tco(&mut prog, overflow_checks);
     mark("tco", &mut t0);
@@ -75,14 +86,28 @@ fn main() {
                 print!("{asm}");
                 return;
             }
-            let bytes = rmc::elf::assemble(&asm).expect("assemble");
+            // An undefined symbol here is a construct the back end lowered to a
+            // call it cannot satisfy (a float intrinsic such as `min`, say), so
+            // it is an unsupported-input error, not a crash.
+            let bytes = match rmc::elf::assemble(&asm) {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = writeln!(std::io::stderr(), "rmc-mir: error: {e}");
+                    std::process::exit(1);
+                }
+            };
             mark("assemble", &mut t0);
-            std::fs::write(&output, &bytes).expect("write output");
+            if let Err(e) = std::fs::write(&output, &bytes) {
+                let _ = writeln!(std::io::stderr(), "rmc-mir: error: cannot write {}: {e}", output.display());
+                std::process::exit(1);
+            }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o755))
-                    .expect("chmod");
+                if let Err(e) = std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o755)) {
+                    let _ = writeln!(std::io::stderr(), "rmc-mir: error: chmod {}: {e}", output.display());
+                    std::process::exit(1);
+                }
             }
         }
         Err(e) => {

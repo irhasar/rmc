@@ -106,10 +106,22 @@ Added freestanding `memset`/`memcpy`/`memmove`/`memcmp` as runtime pieces
 output is byte-identical. Verified against a C harness (including `memmove`'s
 overlap direction) and pinned by `runtime::tests`.
 
-**P1 — make the supported surface honest and tested.**
-Rewrite `classify_unsupported` to match the measured table above, so the error
-a user sees is the real limit. Add MIR-path regression tests for the constructs
-in the table (they are currently only checked by ad-hoc probes, not in CI).
+**P1 — make the supported surface honest and tested. (done)**
+`classify_unsupported` no longer claims float or 128-bit integers are
+unimplemented; the float rule now fires only for `%` and the intrinsics rustc
+lowers to library calls. Three panics on *expected* input are fixed: the
+standalone `rmcmir` driver used `.expect("mir parse")` / `.expect("assemble")`,
+so any unsupported construct crashed with a backtrace note instead of exiting 1
+(`f_minmax` panicked at `assemble` on an undefined float intrinsic). A `dyn
+Trait` coercion used to pass as an identity pointer cast and surface as a
+confusing `elf: undefined symbol`; it is now a parse error naming the construct.
+Coverage added: `tests/mir/float.rs` and `tests/mir/wideint.rs` (float and
+128-bit arithmetic, the two features the stale messages had hidden), three
+`tests/mir/reject/` cases asserting a *clean named* refusal, and
+`tools/mir_survey.py` now actually passes `--rustc-frontend` (it had been
+surveying the AST path, so the crashes were invisible) and runs in CI. Measured
+after the fix: 80/121 realistic Rust snippets compile through the MIR path, 38
+refuse cleanly, zero crashes.
 
 **P2 — close the back-end compile-time gaps.**
 Profile `rmcmir` on `refs`/`sieve`/`mandel` and remove the slow path. Target:

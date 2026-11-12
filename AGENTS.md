@@ -2295,6 +2295,31 @@ future session does not re-derive them by hand:
   not: the back end has no real register allocator, so scheduler-sensitive
   kernels can lose. `docs/mir-roadmap.md` P3 is the work that closes it.
 
+### An unsupported construct must exit 1, never panic
+
+Three separate panics on *expected* input were found and fixed (P1):
+
+- `compiler/examples/rmcmir.rs` used `.expect("mir parse")` and
+  `.expect("assemble")`, so an unsupported construct printed a Rust panic and a
+  `RUST_BACKTRACE` note with status **101**. Both now exit 1 with `rmc-mir:
+  error: ...`, matching the `.rs` path in `main.rs` (which already propagated
+  errors). `f_minmax` (`.min(3.0)`, an undefined float intrinsic) panicked at
+  `assemble` on `elf: undefined symbol`.
+- A `dyn Trait` coercion was parsed as an identity pointer cast; the virtual
+  call then became a direct call to a method with no symbol, so the user saw
+  `elf: undefined symbol 'area'` at link time. `parse_rvalue` now rejects a
+  `dyn` cast target where the construct is still visible.
+- `classify_unsupported` claimed "floating-point types are not implemented" and
+  "128-bit integers are not implemented". Both are false: `tests/mir/float.rs`
+  and `tests/mir/wideint.rs` compile and run. Only float `%` and the intrinsics
+  (`min`/`max`/`abs`/`powf`) are unsupported. Trust a probe over the message.
+
+The invariant is now enforced, not just documented: `tests/mir/reject/` holds
+cases rustc accepts but rmc must refuse, and `tests/mir/run.py` asserts status 1
+plus a `note:` (status 101 would be a panic). `tools/mir_survey.py` had been
+calling `rmc` *without* `--rustc-frontend`, so it surveyed the AST path and
+could not see any of these crashes; it now passes the flag and runs in CI.
+
 
 ### Branchless min/max (`cmov`) was tried and rejected
 

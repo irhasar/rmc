@@ -163,7 +163,13 @@ def classify(name, src, tmp, keep):
         f.write(src + "\n")
     exe = os.path.join(tmp, name + ".bin")
     try:
-        p = subprocess.run([RMC, path, "-o", exe], capture_output=True, timeout=60)
+        # `--rustc-frontend` is what makes this a *MIR path* survey. Without it
+        # rmc treats the file as its own source language and the corpus (real
+        # Rust: `trait`, `String`, `println!`) is rejected by the AST parser
+        # before the MIR back end ever runs, so the crashes this tool exists to
+        # find would be invisible.
+        p = subprocess.run([RMC, "--rustc-frontend", path, "-o", exe],
+                           capture_output=True, timeout=60)
     except subprocess.TimeoutExpired:
         return "CRASH", "timeout (hang)"
     err = p.stderr.decode(errors="replace")

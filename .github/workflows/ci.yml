@@ -33,6 +33,13 @@ jobs:
       - name: MIR differential tests
         run: python3 tests/mir/run.py
 
+      # Realistic Rust through the MIR back end must produce a clean error or a
+      # working binary, never a panic or a signal. The suite above only feeds
+      # the back end programs it is known to support; this reaches the
+      # diagnostics path a user typing arbitrary Rust actually hits.
+      - name: MIR crash survey
+        run: python3 tools/mir_survey.py
+
   fuzz:
     runs-on: ubuntu-latest
     steps:
