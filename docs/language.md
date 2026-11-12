@@ -408,9 +408,10 @@ const M: i64 = N * 2;      // a constant may name one declared later
 ```
 
 A `const NAME: TYPE = EXPR;` item is folded at compile time to a single value
-and substituted at every use, so it has no storage and no codegen. Only `i64`
-and `bool` constants are accepted, which is what an array length or a scalar
-expression can use; any other type is rejected. A reference to a constant is
+and substituted at every use, so it has no storage and no codegen. Only an
+integer (`i64` or a narrow width), `bool` or `char` constant is accepted, which
+is what an array length or a scalar expression can use; any other type is
+rejected. A reference to a constant is
 resolved wherever a value may appear, including an array length (`[i64; N]`), an
 array repeat count (`[x; N]`), a `for` bound, a condition, and a `match`
 pattern, where a bare constant name is that value rather than a fresh binding.
@@ -418,6 +419,19 @@ A constant may be named before it is declared, as in Rust. Arithmetic in an
 initializer that would trap at run time — division or remainder by zero, `i64`
 overflow, or a shift by 64 or more — is rejected, as is a cycle between
 constants and an initializer that is not a constant expression.
+
+A `const` may carry a narrow integer type (`u8`, `i16`, `u32`, ...). The
+initializer then folds at that declared width, exactly as rustc's const
+evaluator does: `const N: u8 = 250 + 10` is an overflow (rustc's `E0080`),
+`const N: u8 = 300` is a literal out of range, and a bare `300 as u8` is
+rejected at the cast, while `300u16 as u8` is a valid narrowing cast. The
+arithmetic methods rustc folds in a constant are folded here too —
+`wrapping_add`/`wrapping_sub`/`wrapping_mul` wrap, `saturating_add`/
+`saturating_sub`/`saturating_mul` clamp to the width, and `pow` is exact within
+it — so `const W: u8 = 200u8.wrapping_mul(2)` is 144 and
+`const S: u8 = 250u8.saturating_add(10)` is 255. A use of a narrow constant is
+substituted at its declared width, so `A + 200` still overflows a `u8` `A`
+rather than widening to `i64`.
 
 A `const` may also be declared inside a block, where it is folded and in scope
 for the rest of that block. Like a top-level `const` it may be named before it is

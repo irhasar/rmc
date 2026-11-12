@@ -1822,7 +1822,21 @@ The checks, all in `sema.rs`:
   A narrow `const` carries its declared width through resolution
   (`ConstVal::NarrowInt(i64, Type)`), so a use is substituted at that width and
   folds/checks like a literal of it; `consts::resolve` is fallible so a
-  non-folding item is a compile error rather than a silent widen.
+  non-folding item is a compile error rather than a silent widen. The
+  initializer folds at that width too: `consts::eval_int_at` threads a
+  `ctx: Option<(signed, bits)>` down the expression, an operand's own suffix or
+  cast overrides it, and `+`/`-`/`*` route through `int_const_binop` at the
+  width, so `const N: u8 = 250 + 10` is an `E0080` overflow rather than an
+  unbounded `i64` fold of 260. A cast target does *not* type its operand
+  (`(250 + 10) as u8` folds the sum as `i64`, then narrows), matching rustc. The
+  same evaluator folds the `wrapping_*`/`saturating_*`/`pow` methods
+  (`eval_int_method`), which the parser sees in method-call form — sema lowers
+  them to runtime helpers only later — so `const W: u8 = 200u8.wrapping_mul(2)`
+  and `const P: u8 = 3u8.pow(5)` resolve. `eval_int_at` returns the shared
+  `NOT_CONST` message for an unresolved name, and `resolve_with` treats exactly
+  that string as "retry next fixpoint pass" while any other error (an overflow,
+  a division by zero) is fatal — otherwise a forward reference to a narrow
+  constant was reported as an overflow instead of resolving.
 - **Constant-local propagation, matching rustc.** `Sema::const_locals` maps a
   slot to a known constant, and `const_of` reads it. A local is entered only
   when rustc would know it: its initializer is constant and it is assigned at
