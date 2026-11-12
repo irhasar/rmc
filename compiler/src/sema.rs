@@ -626,7 +626,7 @@ fn check_consts(
         .iter()
         .map(|c| (c.name.clone(), c.ty.clone(), c.value.clone()))
         .collect();
-    let resolved = crate::consts::resolve(&items);
+    let resolved = crate::consts::resolve(&items)?;
     for c in &prog.consts {
         if !names.insert(c.name.clone()) {
             return Err(format!("the name `{}` is defined multiple times", c.name));
@@ -649,7 +649,7 @@ fn check_consts(
         // of a cycle).
         match (ty, resolved.get(&c.name)) {
             (Type::I64, Some(crate::consts::ConstVal::Int(_))) => {}
-            (Type::Int { .. }, Some(crate::consts::ConstVal::Int(_))) => {}
+            (Type::Int { .. }, Some(crate::consts::ConstVal::NarrowInt(..))) => {}
             (Type::Bool, Some(crate::consts::ConstVal::Bool(_))) => {}
             (Type::Char, Some(crate::consts::ConstVal::Char(_))) => {}
             (Type::I64, _) => {
@@ -2615,6 +2615,27 @@ impl Sema {
                 None => Err(format!("unknown variable `{name}`")),
             },
             Expr::Un(op, inner) => {
+                // A negated integer literal takes its destination's width, so
+                // `let x: i8 = -128` is the signed minimum, not the
+                // out-of-range positive 128. rustc types the literal at the
+                // destination width and then applies the sign; range-check the
+                // *negated* magnitude against that width and skip the positive
+                // check on the inner literal (which would reject 128 on its
+                // own). Without an expected width the literal stays `i64`, so
+                // the ordinary path below applies.
+                if matches!(op, UnOp::Neg) {
+                    if let Expr::Int(v) = inner.as_ref() {
+                        if let Some(exp) = self.expected_int.clone() {
+                            if is_int_ty(&exp) && int_signed(&exp) {
+                                let neg = v.checked_neg().ok_or_else(|| {
+                                    "this arithmetic operation overflows".to_string()
+                                })?;
+                                self.check_int_range(neg, &exp)?;
+                                return Ok(exp);
+                            }
+                        }
+                    }
+                }
                 let t = self.check_expr(inner, scope)?;
                 match op {
                     UnOp::Neg => {
@@ -3351,7 +3372,10 @@ impl Sema {
                     }
                     seen[idx] = true;
                     let want = info.fields[idx].1.clone();
-                    let got = self.check_expr(&mut fi.value, scope)?;
+                    // A field's declared width types an integer literal in its
+                    // initializer (`S { a: 200 }` for an `a: u8`), exactly as a
+                    // `let x: u8 = 200` does.
+                    let got = self.check_expr_expected(&mut fi.value, scope, &want)?;
                     if got != want && !ref_coerces(&got, &want) {
                         return Err(format!(
                             "struct `{name}` field `{}`: expected {want:?}, found {got:?}",
@@ -4052,7 +4076,16 @@ impl Sema {
                 Ok(Type::Bool)
             }
             Expr::Cast(inner, to) => {
-                let it = self.check_expr(inner, scope)?;
+                // A cast has its own type boundary: its operand is typed
+                // independently of the destination, so `let x: u8 = 300u16 as u8`
+                // checks `300u16` at its own width (fits `u16`) and only the cast
+                // narrows it. Clear the binding's expected width while checking
+                // the operand, or `300` would be range-checked as a `u8` before
+                // the cast can legally truncate it.
+                let saved_expected = self.expected_int.take();
+                let it = self.check_expr(inner, scope);
+                self.expected_int = saved_expected;
+                let it = it?;
                 // An enum may be cast to `i64` (its tag), but not the reverse:
                 // rustc rejects `i64 as Enum`, and rmc is a subset of Rust, so
                 // it rejects it too rather than inventing a conversion.
@@ -4065,12 +4098,46 @@ impl Sema {
                 }
                 let rt = self.resolve_ty(to)?;
                 // A literal cast folds at compile time to its in-width value, so
-                // `300 as u8` is `44` and `-1 as u32` is `4294967295`; every
+                // `300u16 as u8` is `44` and `-1 as u32` is `4294967295`; every
                 // other cast is emitted and narrows at run time.
                 if is_int_literal(inner) {
                     if let Some(v) = const_i64(inner) {
                         if is_int_ty(&rt) {
-                            let folded = wrap_int(v, int_signed(&rt), int_bits(&rt));
+                            let bits = int_bits(&rt);
+                            let signed = int_signed(&rt);
+                            match &**inner {
+                                // A *bare* literal operand (`300 as u8`) is typed
+                                // by the cast itself, so it must fit the
+                                // destination — rustc rejects `300 as u8` as
+                                // `literal out of range for u8`. A *suffixed*
+                                // literal carries its own width (`300u16 as u8`),
+                                // so the cast legitimately narrows it and no
+                                // range check applies here.
+                                Expr::Int(_) => self.check_int_range(v, &rt)?,
+                                // A negated literal keeps its sign: `-128 as i8`
+                                // is the signed minimum and is accepted, but
+                                // `-129 as i8` is out of range and `-1 as u8`
+                                // applies `-` to an unsigned type, both rejected
+                                // like rustc.
+                                Expr::Un(UnOp::Neg, operand)
+                                    if matches!(operand.as_ref(), Expr::Int(_)) =>
+                                {
+                                    if !signed && v != 0 {
+                                        return Err(format!(
+                                            "cannot apply unary `-` to an unsigned integer `{}`",
+                                            int_ty_name(&rt)
+                                        ));
+                                    }
+                                    if bits < 64 && !fits_int(v, signed, bits) {
+                                        return Err(format!(
+                                            "literal out of range for `{}`",
+                                            int_ty_name(&rt)
+                                        ));
+                                    }
+                                }
+                                _ => {}
+                            }
+                            let folded = wrap_int(v, signed, bits);
                             **inner = Expr::Int(folded);
                             *to = rt.clone();
                             return Ok(rt);

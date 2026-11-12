@@ -26,6 +26,7 @@ enum NameScope {
     ConstInt(String, Option<i64>),
     ConstBool(String, Option<bool>),
     ConstChar(String, Option<u32>),
+    ConstNarrow(String, Option<Type>),
 }
 
 /// A `const` (or immutable `static`) declared inside a block. It is folded by
@@ -68,6 +69,10 @@ pub struct Parser {
     /// Constant `char` items by name, so a `const C: char` used as a `match`
     /// pattern becomes the character pattern.
     const_chars: std::collections::HashMap<String, u32>,
+    /// The declared width of each narrow integer constant (`const N: u8`), so a
+    /// use is substituted as a value of that width rather than as an `i64`. The
+    /// value itself lives in `consts`; this only records the width.
+    const_narrow: std::collections::HashMap<String, Type>,
     /// Struct field names by struct name, collected before parsing so a struct
     /// pattern (`S { f, .. }`) can be checked at parse time. A struct pattern
     /// has no runtime test, so the parser rewrites it into field reads; that
@@ -214,6 +219,7 @@ impl Parser {
             consts: std::collections::HashMap::new(),
             const_bools: std::collections::HashMap::new(),
             const_chars: std::collections::HashMap::new(),
+            const_narrow: std::collections::HashMap::new(),
             struct_fields: std::collections::HashMap::new(),
             tuple_structs: std::collections::HashSet::new(),
             tuple_defs: Vec::new(),
@@ -614,7 +620,7 @@ impl Parser {
             }
         }
         self.i = saved;
-        self.resolve_consts(&items);
+        self.resolve_consts(&items)?;
         // Parse each alias target now that the constants are known. Two passes
         // let `type A = B; type B = i64;` resolve: the first lays down every
         // direct target, the second fills any left as a bare `Named` (a target
@@ -663,7 +669,7 @@ impl Parser {
                 value: d.value.clone(),
             })
             .collect();
-        self.resolve_consts(&expanded_items);
+        self.resolve_consts(&expanded_items)?;
         // A `type` shares the type namespace with a struct and an enum, so a
         // collision is an error (rustc's E0428). It does *not* collide with a
         // `const` or a `fn`, which live in the value namespace. rmc keeps a
@@ -963,15 +969,19 @@ impl Parser {
     /// fixpoint so a constant may name one declared later. Runs after the whole
     /// program is parsed, so a forward reference resolves here even though it
     /// did not while the use site was parsed.
-    fn resolve_consts(&mut self, defs: &[ConstDef]) {
+    fn resolve_consts(&mut self, defs: &[ConstDef]) -> PResult<()> {
         let items: Vec<(String, Type, Expr)> = defs
             .iter()
             .map(|d| (d.name.clone(), d.ty.clone(), d.value.clone()))
             .collect();
-        for (name, val) in crate::consts::resolve(&items) {
+        for (name, val) in crate::consts::resolve(&items)? {
             match val {
                 crate::consts::ConstVal::Int(v) => {
                     self.consts.insert(name, v);
+                }
+                crate::consts::ConstVal::NarrowInt(v, ty) => {
+                    self.consts.insert(name.clone(), v);
+                    self.const_narrow.insert(name, ty);
                 }
                 crate::consts::ConstVal::Bool(v) => {
                     self.const_bools.insert(name, v);
@@ -980,6 +990,18 @@ impl Parser {
                     self.const_chars.insert(name, v);
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// The expression a constant use is substituted with: a plain `i64`
+    /// literal, or a suffixed literal at the constant's declared width (folded
+    /// to `Expr::Cast(Int, width)`) so arithmetic on it keeps that width. `v` is
+    /// the constant's in-width value.
+    fn const_value_expr(&self, name: &str, v: i64) -> Expr {
+        match self.const_narrow.get(name) {
+            Some(ty) => Expr::Cast(Box::new(Expr::Int(v)), ty.clone()),
+            None => Expr::Int(v),
         }
     }
 
@@ -1612,8 +1634,13 @@ impl Parser {
                 Ok((d.name.clone(), ty, d.value.clone()))
             })
             .collect::<PResult<Vec<_>>>()?;
-        let resolved =
-            crate::consts::resolve_with(&items, &self.consts, &self.const_bools, &self.const_chars);
+        let resolved = crate::consts::resolve_with(
+            &items,
+            &self.consts,
+            &self.const_bools,
+            &self.const_chars,
+        )
+        .map_err(|e| format!("at byte {}: {e}", self.toks[self.i].pos))?;
         // Every item must fold, including an unused one. `resolve_with` leaves
         // out an item whose initializer is not a constant expression (a call, a
         // cycle, a reference to an unresolved name), which at the top level
@@ -1633,7 +1660,7 @@ impl Parser {
         }
         let mut frame: Vec<LocalConst> = Vec::new();
         for (_, start, end, def) in &raw {
-            self.enter_local_const(&def.name, resolved.get(&def.name).copied());
+            self.enter_local_const(&def.name, resolved.get(&def.name).cloned());
             // `start` is the `const`/`static` keyword (past any `pub`), so the
             // main parse, which drops a `pub` before it, matches on the same
             // index.
@@ -1740,6 +1767,7 @@ impl Parser {
             frame.push(NameScope::ConstInt(name.to_string(), self.consts.get(name).copied()));
             frame.push(NameScope::ConstBool(name.to_string(), self.const_bools.get(name).copied()));
             frame.push(NameScope::ConstChar(name.to_string(), self.const_chars.get(name).copied()));
+            frame.push(NameScope::ConstNarrow(name.to_string(), self.const_narrow.get(name).cloned()));
         }
         // A `const` that does not fold (a call, a cycle) is left out, so a use
         // is diagnosed the way an unresolved constant is; drop any outer value
@@ -1747,9 +1775,14 @@ impl Parser {
         self.consts.remove(name);
         self.const_bools.remove(name);
         self.const_chars.remove(name);
+        self.const_narrow.remove(name);
         match val {
             Some(ConstVal::Int(v)) => {
                 self.consts.insert(name.to_string(), v);
+            }
+            Some(ConstVal::NarrowInt(v, ty)) => {
+                self.consts.insert(name.to_string(), v);
+                self.const_narrow.insert(name.to_string(), ty);
             }
             Some(ConstVal::Bool(v)) => {
                 self.const_bools.insert(name.to_string(), v);
@@ -1872,6 +1905,14 @@ impl Parser {
                         }
                         None => {
                             self.const_chars.remove(&n);
+                        }
+                    },
+                    NameScope::ConstNarrow(n, prev) => match prev {
+                        Some(v) => {
+                            self.const_narrow.insert(n, v);
+                        }
+                        None => {
+                            self.const_narrow.remove(&n);
                         }
                     },
                 }
@@ -5939,8 +5980,10 @@ impl Parser {
                     Ok(Expr::Call { name, args, arg_slots: Vec::new(), ret_slot: -1, ret_ty: Type::I64 })
                 } else if let Some(v) = self.consts.get(&name) {
                     // A reference to a constant is its value, substituted here
-                    // so sema and codegen never see a constant as a variable.
-                    Ok(Expr::Int(*v))
+                    // so sema and codegen never see a constant as a variable. A
+                    // narrow constant keeps its width, so `N + 200` on a
+                    // `const N: u8` still overflows a `u8` rather than an `i64`.
+                    Ok(self.const_value_expr(&name, *v))
                 } else if let Some(b) = self.const_bools.get(&name) {
                     Ok(Expr::Bool(*b))
                 } else if let Some(c) = self.const_chars.get(&name) {

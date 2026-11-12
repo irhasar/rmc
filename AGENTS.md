@@ -1704,6 +1704,35 @@ The checks, all in `sema.rs`:
   `idiv` that raised SIGFPE). A constant local counts as constant, so `let d =
   0; 1 / d` and `let x = i64::MAX; x + 1` are diagnosed like the literals, as
   rustc does.
+- **Narrow-integer width is a first-class part of the value, not an `i64`
+  annotation.** A `u8`/`i8`/`u16`/... value must be range-checked at *its* width
+  everywhere rustc does, because the 64-bit instruction that computes it does not
+  overflow when the narrow result does (`250u8 + 10` wraps to `4` with no 64-bit
+  overflow flag). Four places carry the width:
+  - *Overflow.* `Codegen::arith_narrow` reads the narrow width of an `+`/`-`/`*`
+    operand and `check_overflow_ty` compares the 64-bit result against its
+    width-extended self (`shl` to drop the top bits, `sar`/`shr` back, `cmp`), so
+    the trap fires before `narrow_trunc` discards the excess. Negation keeps the
+    operand's width too (`i8::MIN` traps).
+  - *Division.* `i8::MIN / -1` overflows an `i8` even though `-128 / -1` is fine
+    at 64 bits, so the `MIN / -1` guard compares the dividend against *its own*
+    minimum (`cmp $-128, %rax`), not `i64::MIN`; the constant-divisor `-1`
+    shortcut needs the same bound instead of the free `jo` after `neg`.
+  - *Shifts.* The count is valid in `0..bits` for the left operand's width
+    (`u8 << 8` traps), and a constant count is checked at compile time in the
+    inlined/immediate path (`check_shift_count_imm`), which the ordinary
+    `check_shift_count` does not see.
+  - *Casts and literals.* A cast is a type boundary: its operand is checked at
+    its own width (clear `expected_int` while checking it) and only the cast
+    narrows, so `300u16 as u8` is `44` while `300 as u8` is `literal out of
+    range`. A negated literal cast keeps its sign — `-128 as i8` is accepted,
+    `-129 as i8` is out of range, and `-1 as u8` is `cannot apply unary - to an
+    unsigned type`. A struct field's declared width types a literal in its
+    initializer (`S { a: 200 }` for `a: u8`), exactly as `let x: u8 = 200` does.
+  A narrow `const` carries its declared width through resolution
+  (`ConstVal::NarrowInt(i64, Type)`), so a use is substituted at that width and
+  folds/checks like a literal of it; `consts::resolve` is fallible so a
+  non-folding item is a compile error rather than a silent widen.
 - **Constant-local propagation, matching rustc.** `Sema::const_locals` maps a
   slot to a known constant, and `const_of` reads it. A local is entered only
   when rustc would know it: its initializer is constant and it is assigned at
