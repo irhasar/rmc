@@ -1402,7 +1402,8 @@ impl<'a> FnGen<'a> {
                     let mut lc: HashMap<u32, u32> = HashMap::new();
                     let mut pj: HashSet<u32> = HashSet::new();
                     let mut at: HashSet<u32> = HashSet::new();
-                    scan_rv(rv, &mut lc, &mut pj, &mut at);
+                    let mut ix: HashSet<u32> = HashSet::new();
+                    scan_rv(rv, &mut lc, &mut pj, &mut at, &mut ix);
                     for (l, c) in lc {
                         use_depth
                             .entry(l)
@@ -1415,7 +1416,8 @@ impl<'a> FnGen<'a> {
             let mut lc: HashMap<u32, u32> = HashMap::new();
             let mut pj: HashSet<u32> = HashSet::new();
             let mut at: HashSet<u32> = HashSet::new();
-            scan_term(&b.term, &mut lc, &mut pj, &mut at);
+            let mut ix: HashSet<u32> = HashSet::new();
+            scan_term(&b.term, &mut lc, &mut pj, &mut at, &mut ix);
             for (l, c) in lc {
                 use_depth
                     .entry(l)
@@ -1460,6 +1462,7 @@ impl<'a> FnGen<'a> {
         let mut weighted: HashMap<u32, u32> = HashMap::new();
         let mut projected: HashSet<u32> = HashSet::new();
         let mut addr_taken: HashSet<u32> = HashSet::new();
+        let mut index_locals: HashSet<u32> = HashSet::new();
         for (bi, b) in self.func.blocks.iter().enumerate() {
             let w = depths.get(bi).copied().unwrap_or(0) + 1;
             let mut local_counts: HashMap<u32, u32> = HashMap::new();
@@ -1468,10 +1471,10 @@ impl<'a> FnGen<'a> {
                     if !p.proj.is_empty() {
                         projected.insert(p.local);
                     }
-                    scan_rv(rv, &mut local_counts, &mut projected, &mut addr_taken);
+                    scan_rv(rv, &mut local_counts, &mut projected, &mut addr_taken, &mut index_locals);
                 }
             }
-            scan_term(&b.term, &mut local_counts, &mut projected, &mut addr_taken);
+            scan_term(&b.term, &mut local_counts, &mut projected, &mut addr_taken, &mut index_locals);
             for (l, c) in local_counts {
                 *counts.entry(l).or_insert(0) += c;
                 *weighted.entry(l).or_insert(0) += c * w;
@@ -1480,7 +1483,17 @@ impl<'a> FnGen<'a> {
         let ranked: Vec<(u32, u32, u32)> = counts
             .into_iter()
             .filter(|(l, c)| {
-                *c >= 2 && !projected.contains(l) && !addr_taken.contains(l)
+                // A local used as an array index is worth a register even with
+                // a single textual use, because it is read on the address path
+                // of every access: `i & 255` feeding `table[i & 255]` in a loop
+                // has one use and would otherwise spill. Every other local
+                // keeps the two-use rule, so a one-shot arithmetic temporary is
+                // still folded into its consumer rather than given a register.
+                let index_use = index_locals.contains(l)
+                    && weighted.get(l).copied().unwrap_or(*c) >= 2;
+                (*c >= 2 || index_use)
+                    && !projected.contains(l)
+                    && !addr_taken.contains(l)
             })
             .filter(|(l, _)| !self.promo.contains_key(l))
             .filter(|(l, _)| !self.size.get(*l as usize).copied().unwrap_or(8).eq(&8) || {
@@ -5812,19 +5825,20 @@ fn scan_rv(
     counts: &mut HashMap<u32, u32>,
     projected: &mut HashSet<u32>,
     addr_taken: &mut HashSet<u32>,
+    index_locals: &mut HashSet<u32>,
 ) {
     match rv {
-        Rvalue::Use(op) => scan_operand(op, counts, projected),
+        Rvalue::Use(op) => scan_operand(op, counts, projected, index_locals),
         Rvalue::Binary(_, a, b) => {
-            scan_operand(a, counts, projected);
-            scan_operand(b, counts, projected);
+            scan_operand(a, counts, projected, index_locals);
+            scan_operand(b, counts, projected, index_locals);
         }
-        Rvalue::Unary(_, a) => scan_operand(a, counts, projected),
-        Rvalue::Cast { op, .. } => scan_operand(op, counts, projected),
-        Rvalue::Repeat { op, .. } => scan_operand(op, counts, projected),
+        Rvalue::Unary(_, a) => scan_operand(a, counts, projected, index_locals),
+        Rvalue::Cast { op, .. } => scan_operand(op, counts, projected, index_locals),
+        Rvalue::Repeat { op, .. } => scan_operand(op, counts, projected, index_locals),
         Rvalue::Array(ops) | Rvalue::Aggregate(ops) | Rvalue::Enum { ops, .. } => {
             for op in ops {
-                scan_operand(op, counts, projected);
+                scan_operand(op, counts, projected, index_locals);
             }
         }
         Rvalue::Ref { place, .. } | Rvalue::RawRef { place, .. } => {
@@ -5840,20 +5854,26 @@ fn scan_rv(
             addr_taken.insert(p.local);
         }
         Rvalue::WithOverflow { a, b, .. } => {
-            scan_operand(a, counts, projected);
-            scan_operand(b, counts, projected);
+            scan_operand(a, counts, projected, index_locals);
+            scan_operand(b, counts, projected, index_locals);
         }
         Rvalue::Unsupported(_) => {}
     }
 }
 
-fn scan_operand(op: &Operand, counts: &mut HashMap<u32, u32>, projected: &mut HashSet<u32>) {
+fn scan_operand(
+    op: &Operand,
+    counts: &mut HashMap<u32, u32>,
+    projected: &mut HashSet<u32>,
+    index_locals: &mut HashSet<u32>,
+) {
     if let Operand::Copy(p) | Operand::Move(p) = op {
         // An index local inside a place (`_1[_7]`) is read as often as the place
         // is, so count it toward promotion.
         for proj in &p.proj {
             if let Proj::IndexLocal(i) = proj {
                 *counts.entry(*i).or_insert(0) += 1;
+                index_locals.insert(*i);
             }
         }
         bump(p, counts, projected);
@@ -5865,13 +5885,14 @@ fn scan_term(
     counts: &mut HashMap<u32, u32>,
     projected: &mut HashSet<u32>,
     _addr_taken: &mut HashSet<u32>,
+    index_locals: &mut HashSet<u32>,
 ) {
     match term {
-        Terminator::SwitchInt { discr, .. } => scan_operand(discr, counts, projected),
+        Terminator::SwitchInt { discr, .. } => scan_operand(discr, counts, projected, index_locals),
         Terminator::Call { dest, args, .. } => {
             bump(dest, counts, projected);
             for a in args {
-                scan_operand(a, counts, projected);
+                scan_operand(a, counts, projected, index_locals);
             }
         }
         // A `drop(_N)` takes `_N`'s address, so the local must not be promoted

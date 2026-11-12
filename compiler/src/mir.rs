@@ -5861,6 +5861,14 @@ struct AssertFacts {
     alias: HashMap<u32, u32>,
     /// A bool `b = (x == 0)`: `b` is true exactly when `x` is zero.
     iszero: HashMap<u32, u32>,
+    /// A local proven to hold a value in `[0, M]`: `d = x & M` sets `M`, and a
+    /// widening integer cast carries the bound along. An index derived from such
+    /// a local is below any length greater than `M`, so the `table[i & 255]`
+    /// bounds check is provably redundant.
+    masked: HashMap<u32, u64>,
+    /// A bool `b = (x < LEN)`: `b` is the bounds check for an index derived
+    /// from `x` against length `LEN`.
+    lt: HashMap<u32, (u32, u64)>,
 }
 
 impl Function {
@@ -5921,6 +5929,16 @@ impl Function {
                         .is_some_and(|x| facts.nonzero.contains(&facts.resolve(*x)))
             } else {
                 facts.nonzero.contains(&facts.resolve(p.local))
+                    // A bounds check `assert(x < LEN)` is redundant when `x` is
+                    // derived from a masked value below `LEN`: `i & 255` can
+                    // never reach a length of 256, so the comparison always
+                    // holds.
+                    || facts.lt.get(&p.local).is_some_and(|(x, len)| {
+                        facts
+                            .masked
+                            .get(&facts.resolve(*x))
+                            .is_some_and(|m| m < len)
+                    })
             };
             if holds {
                 let target = *target;
@@ -5996,6 +6014,8 @@ impl AssertFacts {
         self.alias.retain(|_, v| *v != l);
         self.iszero.remove(&l);
         self.iszero.retain(|_, v| *v != l);
+        self.masked.remove(&l);
+        self.lt.remove(&l);
     }
 
     fn intersect(&self, other: &AssertFacts) -> AssertFacts {
@@ -6013,6 +6033,22 @@ impl AssertFacts {
                 .iter()
                 .filter(|(b, x)| other.iszero.get(b) == Some(x))
                 .map(|(b, x)| (*b, *x))
+                .collect(),
+            // A bound only survives a join when both sides agree on it; taking
+            // the smaller of two bounds would be sound, but `M` is a constant
+            // here and a differing `M` is rare enough that the simple rule is
+            // not worth a second comparison.
+            masked: self
+                .masked
+                .iter()
+                .filter(|(d, m)| other.masked.get(d) == Some(m))
+                .map(|(d, m)| (*d, *m))
+                .collect(),
+            lt: self
+                .lt
+                .iter()
+                .filter(|(b, v)| other.lt.get(b) == Some(v))
+                .map(|(b, v)| (*b, *v))
                 .collect(),
         }
     }
@@ -6057,6 +6093,41 @@ fn facts_at_term(block: &BasicBlock, entry: &Option<AssertFacts>) -> Option<Asse
                     Rvalue::Binary(BinOp::Eq, a, b) => {
                         if let Some(x) = zero_eq_source(a, b) {
                             facts.iszero.insert(d.local, x);
+                        }
+                    }
+                    // `d = x & M` with `M` a non-negative constant: `d`'s value
+                    // is in `[0, M]` (a bitwise and cannot set a bit above
+                    // `M`'s highest).
+                    Rvalue::Binary(BinOp::BitAnd, a, b) => {
+                        let const_of = |o: &Operand| match o {
+                            Operand::Const(Const::Int(v)) if *v >= 0 => Some(*v as u64),
+                            _ => None,
+                        };
+                        let bound = const_of(a).or_else(|| const_of(b));
+                        if let Some(m) = bound {
+                            facts.masked.insert(d.local, m);
+                        }
+                    }
+                    // `d = x as T (IntToInt)` widens an already-bounded value:
+                    // `x & 255` stays in `[0, 255]` after the `as usize` the
+                    // index path inserts, so the bound must follow the cast or
+                    // the check below would not see it.
+                    Rvalue::Cast { op, kind: CastKind::IntToInt, .. } => {
+                        if let Some(x) = whole_local(op) {
+                            if let Some(m) = facts.masked.get(&x).copied() {
+                                facts.masked.insert(d.local, m);
+                            }
+                        }
+                    }
+                    // `b = (x < LEN)` with `LEN` a non-negative constant: the
+                    // bounds check for an index derived from `x`.
+                    Rvalue::Binary(BinOp::Lt, a, b) => {
+                        if let (Some(x), Operand::Const(Const::Int(len))) =
+                            (whole_local(a), b)
+                        {
+                            if *len >= 0 {
+                                facts.lt.insert(d.local, (x, *len as u64));
+                            }
                         }
                     }
                     _ => {}
@@ -6131,6 +6202,13 @@ fn operand_place(op: &Operand) -> Option<&Place> {
         Operand::Copy(p) | Operand::Move(p) => Some(p),
         Operand::Const(_) | Operand::Fmt { .. } => None,
     }
+}
+
+/// The local an operand names, when it is a whole local (no projection).
+fn whole_local(op: &Operand) -> Option<u32> {
+    operand_place(op)
+        .filter(|p| p.proj.is_empty())
+        .map(|p| p.local)
 }
 
 /// Collapse `goto`-only blocks. LICM leaves a chain of empty blocks behind when
@@ -6836,5 +6914,78 @@ mod tests {
         .is_some());
         // An ordinary pointer/integer cast is unaffected.
         assert!(parse_rvalue("copy _1 as i64 (IntToInt)").is_ok());
+    }
+
+    #[test]
+    fn a_masked_index_bounds_check_is_dropped() {
+        // `table[i & 255]` with `table: [i64; 256]`: the index can never reach
+        // the length, so the `assert(_4 < 256)` is redundant. The bound must
+        // survive the `as usize` cast the index path inserts, or the check is
+        // kept and the loop pays a compare-and-branch every iteration.
+        let text = "\
+fn main() -> () {
+    let mut _0: ();
+    let mut _1: [i64; 256];
+    let mut _2: i64;
+    let mut _3: i64;
+    let mut _4: usize;
+    let mut _5: bool;
+
+    bb0: {
+        _2 = const 3_i64;
+        _3 = BitAnd(move _2, const 255_i64);
+        _4 = move _3 as usize (IntToInt);
+        _5 = Lt(copy _4, const 256_usize);
+        assert(move _5, \"index out of bounds\") -> [success: bb1, unwind unreachable];
+    }
+
+    bb1: {
+        _0 = ();
+        return;
+    }
+}
+";
+        let mut prog = parse(text).expect("fixture parses");
+        drop_redundant_asserts(&mut prog);
+        assert!(
+            !format!("{:?}", prog.funcs[0].blocks[0].term).contains("Assert"),
+            "the bounds check on `i & 255` against a length of 256 is redundant"
+        );
+    }
+
+    #[test]
+    fn a_masked_index_that_can_reach_the_length_keeps_its_check() {
+        // The same shape with a mask of 256 against a length of 256: `i & 256`
+        // can equal 256, so the check must stay. This is the guard against the
+        // elision being too eager.
+        let text = "\
+fn main() -> () {
+    let mut _0: ();
+    let mut _1: [i64; 256];
+    let mut _2: i64;
+    let mut _3: i64;
+    let mut _4: usize;
+    let mut _5: bool;
+
+    bb0: {
+        _2 = const 3_i64;
+        _3 = BitAnd(move _2, const 256_i64);
+        _4 = move _3 as usize (IntToInt);
+        _5 = Lt(copy _4, const 256_usize);
+        assert(move _5, \"index out of bounds\") -> [success: bb1, unwind unreachable];
+    }
+
+    bb1: {
+        _0 = ();
+        return;
+    }
+}
+";
+        let mut prog = parse(text).expect("fixture parses");
+        drop_redundant_asserts(&mut prog);
+        assert!(
+            format!("{:?}", prog.funcs[0].blocks[0].term).contains("Assert"),
+            "`i & 256` can reach a length of 256, so the check must stay"
+        );
     }
 }
