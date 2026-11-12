@@ -228,8 +228,14 @@ mod tests {
     #[test]
     fn a_program_without_main_is_left_alone() {
         let mut p = analyzed("fn f() -> i64 { return 1; } fn g() -> i64 { return 2; }");
+        let before = p.fns.len();
         run(&mut p);
-        assert_eq!(p.fns.len(), 2, "no `main` means nothing is pruned");
+        // No `main` means nothing is pruned. The count includes the injected
+        // `Option`/`Result` prelude, so compare before/after rather than to a
+        // literal.
+        assert_eq!(p.fns.len(), before, "no `main` means nothing is pruned");
+        assert!(p.fns.iter().any(|f| f.name == "f"));
+        assert!(p.fns.iter().any(|f| f.name == "g"));
     }
 
     #[test]

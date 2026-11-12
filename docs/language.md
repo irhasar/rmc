@@ -448,6 +448,12 @@ while cond { ... }
 while let PAT = expr { ... }  // re-tests expr each iteration; stops on no match
 for i in 0..10 { ... }   // i64 range, end exclusive
 for i in 0..=10 { ... }  // i64 range, end inclusive
+for i in (0..10).rev() { ... }  // i64 range, end exclusive, downward
+for i in (0..=10).rev() { ... } // i64 range, end inclusive, downward
+for i in (0..10).step_by(2) { ... }  // every other element
+for i in (0..10).skip(3) { ... }     // drop the first three
+for i in (0..10).take(3) { ... }     // keep only the first three
+for i in (0..10).skip(2).take(3).rev() { ... }  // adapters chain, left to right
 for x in arr { ... }     // array, by value, left to right (x is the element)
 loop { ... }
 loop { ... break v; }    // `loop` is an expression: `break v` yields `v`
@@ -513,7 +519,15 @@ iteration. The loop variable may be a binding, `_`, a struct pattern
 (`for S { f, .. } in arr`), an array pattern (`for [x, y] in pairs`), or an
 at-binding (`for n @ _ in arr`, `for i @ j in 0..3`), which binds
 each element's fields or elements fresh each iteration; any other pattern is
-refutable and rejected. `for x in &arr`
+refutable and rejected. A range may be iterated downward with `.rev()`, written
+`for i in (lo..hi).rev()` or `(lo..=hi).rev()`: `lo` and `hi` are evaluated
+once each, the loop yields `hi - 1` down to `lo` (or `hi` down to `lo`
+inclusive), and `continue` still runs the decrement. The parentheses are
+required, as in Rust. Three counting adapters are also supported and may chain:
+`.step_by(k)` yields every `k`-th element, `.skip(k)` drops the first `k`, and
+`.take(k)` keeps only the first `k`. Adapters apply left to right, so
+`(0..10).skip(2).take(3).rev()` reverses the slice `[2, 3, 4]`; each bound is
+evaluated once, and `continue` still runs the counter increment. `for x in &arr`
 (which Rust iterates by reference) is rejected rather than mistyped. `while let` is
 `loop { if let PAT = expr { body } else { break; } }`: the scrutinee is
 re-evaluated every iteration, and `continue` re-tests it rather than jumping to
@@ -824,14 +838,46 @@ Provided by the runtime; no declaration or import is required.
 | `alloc(n)`      | `(i64) -> i64` |
 | `free(p)`       | `(i64) -> ()`  |
 | `arg_i64(i)`    | `(i64) -> i64` |
-| `exit(code)`    | `(i64) -> ()`  |
+| `exit(code)`    | `(i64) -> !`  |
 
 `alloc` returns a pointer to `n` bytes of writable memory, or 0 on failure; it
 is a first-fit allocator over an mmap'd arena, and `free` returns a block for
 reuse and coalesces neighbours. Memory is not zeroed.
 
 `exit(code)` terminates the process with `code` via the raw `exit` syscall. It
-is the target of `std::process::exit`, a failed `assert!`, and `panic!`.
+is the target of `std::process::exit`, a failed `assert!`, and `panic!`. Like
+rustc's, it returns `!` (never), so it may stand in for any value.
+
+### `Option` and `Result`
+
+`Option<i64>` (`Some(i64)` / `None`) and `Result<i64, i64>` (`Ok(i64)` /
+`Err(i64)`) are built in. rmc is monomorphic in `i64`, so the type arguments
+carry no meaning and are accepted and ignored: `Option<i64>` and `Option` name
+the same enum. The constructors are written unqualified, as in Rust —
+`Some(x)`, `None`, `Ok(v)`, `Err(e)` — in both expressions and patterns, so
+`if let Some(x) = o`, `while let Some(x) = o` and
+`match o { Some(x) => .., None => .. }` all work.
+
+These types are not a special case in the compiler: they are injected as
+ordinary user-level code (a payload enum plus `impl` methods) before semantic
+analysis, so the same machinery that handles a user enum handles them. A
+program that defines its own `Option` or `Result` shadows the built-in
+entirely.
+
+| method | on | signature | behaviour |
+| --- | --- | --- | --- |
+| `unwrap()` | `Option`, `Result` | `(self) -> i64` | the value, or exit 101 on the failing variant |
+| `expect(m)` | `Option`, `Result` | `(self, str) -> i64` | as `unwrap`; `m` is accepted and ignored |
+| `unwrap_or(d)` | `Option`, `Result` | `(self, i64) -> i64` | the value, or `d` |
+| `is_some()` / `is_none()` | `Option` | `(&self) -> bool` | which variant it is |
+| `is_ok()` / `is_err()` | `Result` | `(&self) -> bool` | which variant it is |
+| `or(o)` | `Option` | `(self, Option) -> Option` | `self` if `Some`, else `o` |
+| `ok_or(e)` | `Option` | `(self, i64) -> Result` | `Ok(v)` or `Err(e)` |
+| `ok()` / `err()` | `Result` | `(self) -> Option` | the payload as an `Option` |
+
+`unwrap` and `expect` exit with status 101, matching rustc's panic code. A
+method a program never calls is removed by dead-function elimination, so the
+prelude costs nothing in the artifact unless it is used.
 
 ### Macros
 
@@ -848,6 +894,12 @@ evaluate their condition and, when it fails, exit with status 101 (rustc's panic
 code). The optional message is not printed. `panic!`, `unreachable!`, `todo!`
 and `unimplemented!` always exit 101; their arguments are ignored.
 
+`matches!(expr, pat)` evaluates to `true` when `expr` matches `pat`, else
+`false`. The pattern is the same one a `match` arm accepts — a literal, a
+range, `Enum::Variant(..)`, an or-pattern, `_` — and the optional leading `|`
+Rust allows (`matches!(x, | 1 | 2)`) is accepted. A guard (`matches!(x, n if n
+> 3)`) folds into the test.
+
 ### Vec shims
 
 rmc has no `Vec`. A few `Vec` shapes appear in real Rust, so the parser folds
@@ -859,6 +911,7 @@ with a length or capacity field, so only the methods below are understood.
 | ----------------------------------- | --------------------------------------------- |
 | `let v: Vec<i64> = Vec::with_capacity(k);` | `alloc(k * 8)`; `v.capacity()` is `k`  |
 | `let v: Vec<u8> = vec![e; n];`      | `alloc(n)` filled by `__rmc_fill_bytes` (one byte per element) |
+| `let v: Vec<i64> = vec![a, b, c];`  | `alloc(3 * 8)` with each element stored (`vec![a, b, c]`) |
 | `v.len()` (constant `n`)            | `n`                                           |
 | `v.as_mut_ptr()` / `v.as_ptr()`     | the address; a following `.add(off)` is `p + off * elem` |
 | `let a: Vec<i64> = std::env::args().skip(k).map(..).collect();` | no allocation at all (see below) |
@@ -866,7 +919,9 @@ with a length or capacity field, so only the methods below are understood.
 `vec![e; n]` takes a runtime `n`; `alloc` and the fill helper both take it as a
 value, and the allocation is `n * elem_width` bytes (`elem_width` is 1 for a
 `u8`/`i8` element and 8 otherwise, so a `Vec<u8>` allocates `n` bytes and a
-`Vec<i64>` `n` words). A `vec![a, b, c]` list form is rejected. `add(off)` scales `off` by the
+`Vec<i64>` `n` words). A `vec![a, b, c]` list allocates one slot per element and
+stores each (one byte for a `u8`/`i8` element, one word otherwise); `.len()` and
+`.capacity()` fold to the element count. `add(off)` scales `off` by the
 element width taken from the `Vec<T>` annotation, so a `Vec<i64>` pointer steps
 a whole word while a `Vec<u8>` stays byte-addressed. An args-vector is never
 materialised: `for v in &args` desugars to `for i in k..__rmc_nargs()` and

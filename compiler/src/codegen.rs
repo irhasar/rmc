@@ -2372,7 +2372,11 @@ Expr::PatScrutinee(_) => {
                 match op {
                     UnOp::Neg => {
                         self.line("neg %rax");
-                        self.check_overflow();
+                        // Negation keeps the operand's width, so a narrow
+                        // `i8::MIN` (whose negation overflows the width but not
+                        // 64 bits) must trap against that width.
+                        let ty = Self::static_ty(inner);
+                        self.check_overflow_ty(ty.as_ref());
                     }
                     UnOp::Not if inner_is_bool => {
                         self.line("test %rax, %rax");
@@ -2521,14 +2525,66 @@ Expr::PatScrutinee(_) => {
         }
     }
 
-    /// Trap if `reg` is not a valid shift count (0..=63). The hardware masks a
-    /// shift count to 6 bits, so without this a count of 81 silently shifts by
-    /// 17; Rust's `<<`/`>>` panics instead. Only called when overflow checks are
-    /// enabled.
-    fn check_shift_count(&mut self, reg: &str) {
+    /// Trap if the 64-bit result in `%rax` does not fit the narrow width `ty`
+    /// (`u8`, `i16`, ...). A 64-bit result has no narrower width, so the `jo`
+    /// check on the instruction's own overflow flag is enough; a narrow one can
+    /// exceed its declared range *without* overflowing 64 bits (`250u8 + 10`
+    /// wraps to `4` in a 64-bit register), so the result is compared against its
+    /// width-extended self. This must run before `narrow_trunc` discards the
+    /// excess bits, or the trap would be missed. Clobbers `%rdx`.
+    fn check_overflow_ty(&mut self, ty: Option<&Type>) {
+        if !self.overflow {
+            return;
+        }
+        match ty {
+            Some(Type::Int { signed, bits }) if *bits < 64 => {
+                let sh = 64 - *bits;
+                self.line("mov %rax, %rdx");
+                self.line(&format!("shl ${sh}, %rdx"));
+                // A signed value sign-extends from its width, an unsigned one
+                // zero-extends; either way a value that changed was out of range.
+                self.line(&format!("{} ${sh}, %rdx", if *signed { "sar" } else { "shr" }));
+                self.line("cmp %rdx, %rax");
+                self.line("jne __rmc_overflow");
+            }
+            _ => self.check_overflow(),
+        }
+    }
+
+    /// The narrow integer width of `a op b` when one operand is narrow (an
+    /// arithmetic result keeps that width), so the overflow check knows which
+    /// range to test. `None` for a 64-bit result.
+    fn arith_narrow(op: BinOp, a: &Expr, b: &Expr) -> Option<Type> {
+        if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::WrappingMul) {
+            return None;
+        }
+        match (Self::static_ty(a), Self::static_ty(b)) {
+            (Some(t), _) if is_narrow_int(&t) => Some(t),
+            (_, Some(t)) if is_narrow_int(&t) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// Trap if `reg` is not a valid shift count for a `bits`-wide left operand
+    /// (0..=bits-1). The hardware masks a shift count to 6 bits, so without this
+    /// a count of 81 silently shifts by 17 and a `u8 << 8` shifts the whole
+    /// 64-bit register; Rust's `<<`/`>>` panics instead. `bits` is the left
+    /// operand's width (64 for `i64`, the width for a narrow integer). Only
+    /// called when overflow checks are enabled.
+    fn check_shift_count(&mut self, reg: &str, bits: u16) {
         if self.overflow {
-            self.line(&format!("cmp $63, {reg}"));
+            self.line(&format!("cmp ${}, {reg}", bits - 1));
             self.line("ja __rmc_shift_overflow");
+        }
+    }
+
+    /// Trap if a *constant* shift count `k` is outside `0..=bits-1`. A count in
+    /// range emits nothing; an out-of-range one is an unconditional trap, so the
+    /// following `sal`/`sar` is unreachable. Only called when overflow checks are
+    /// enabled.
+    fn check_shift_count_imm(&mut self, k: i64, bits: u16) {
+        if self.overflow && !(0..bits as i64).contains(&k) {
+            self.line("jmp __rmc_shift_overflow");
         }
     }
 
@@ -2953,7 +3009,14 @@ Expr::PatScrutinee(_) => {
         // there is no shortcut, since the dividend must be in `%rax` and the
         // divisor in a register.
         if matches!(op, Div | Mod) {
-            if self.gen_div_const(op, a, b) {
+            // The dividend's width fixes the overflow bound: `i8::MIN / -1`
+            // overflows an `i8` (and traps) even though `-128 / -1` is fine at 64
+            // bits, so the check must test the narrow minimum, not `i64::MIN`.
+            let div_bits = match Self::static_ty(a) {
+                Some(Type::Int { bits, .. }) => bits,
+                _ => 64,
+            };
+            if self.gen_div_const(op, a, b, div_bits) {
                 return Type::I64;
             }
             // A promoted-local divisor is a callee-saved register, so `idiv`
@@ -2964,12 +3027,12 @@ Expr::PatScrutinee(_) => {
             if let Some(rb) = self.simple_operand(b) {
                 if rb.starts_with('%') {
                     self.gen_expr(a);
-                    self.emit_div(op, &rb, r32(&rb));
+                    self.emit_div(op, &rb, r32(&rb), div_bits);
                     return Type::I64;
                 }
             }
             self.eval_operands(a, b, false);
-            self.emit_div(op, "%rcx", "%ecx");
+            self.emit_div(op, "%rcx", "%ecx", div_bits);
             return Type::I64;
         }
 
@@ -2978,6 +3041,16 @@ Expr::PatScrutinee(_) => {
         // saves the constant load. Folding a *memory* operand into `imul`/`add`
         // measured slower on the cores this was tuned on, so only immediates
         // are folded.
+        //
+        // The overflow check tests the result against the operation's declared
+        // width, not just 64-bit overflow: a narrow `u8`/`u16`/... result can
+        // exceed its range without the 64-bit instruction overflowing. The
+        // shift-count check likewise uses the left operand's width.
+        let narrow = Self::arith_narrow(op, a, b);
+        let shift_bits = match Self::static_ty(a) {
+            Some(Type::Int { bits, .. }) => bits,
+            _ => 64,
+        };
         let (imm, other) = match Self::small_imm(b) {
             Some(k) => (Some(k), a),
             // Commutative ops accept the constant on either side; subtraction
@@ -2994,11 +3067,11 @@ Expr::PatScrutinee(_) => {
             match op {
                 Add => {
                     self.line(&format!("add ${k}, %rax"));
-                    self.check_overflow();
+                    self.check_overflow_ty(narrow.as_ref());
                 }
                 Sub => {
                     self.line(&format!("sub ${k}, %rax"));
-                    self.check_overflow();
+                    self.check_overflow_ty(narrow.as_ref());
                 }
                 Mul => {
                     // `x * k` for a `lea`-expressible `k` is one 1-cycle `lea`;
@@ -3019,17 +3092,26 @@ Expr::PatScrutinee(_) => {
                         }
                     }
                     self.line(&format!("imul ${k}, %rax, %rax"));
-                    self.check_overflow();
+                    self.check_overflow_ty(narrow.as_ref());
                 }
                 BitAnd => self.line(&format!("and ${k}, %rax")),
                 BitOr => self.line(&format!("or ${k}, %rax")),
                 BitXor => self.line(&format!("xor ${k}, %rax")),
                 // The shift count is masked to 6 bits by hardware, exactly as
                 // Rust's `<<`/`>>` on `i64`; `sal`/`sar` take the count directly.
-                // A count outside 0..=63 is a compile-time error when the shift
-                // is constant (rejected in sema), so this arm only sees 0..=63.
-                Shl => self.line(&format!("sal ${}, %rax", k & 63)),
-                Shr => self.line(&format!("sar ${}, %rax", k & 63)),
+                // A constant count outside 0..=bits-1 traps under overflow
+                // checks: sema rejects a *literal* count, but inlining can fold a
+                // computed count to a constant after that check, so the range
+                // test is emitted here too (a no-op when the count is in range).
+                // `shift_bits` is the left operand's width.
+                Shl => {
+                    self.check_shift_count_imm(k, shift_bits);
+                    self.line(&format!("sal ${}, %rax", k & 63));
+                }
+                Shr => {
+                    self.check_shift_count_imm(k, shift_bits);
+                    self.line(&format!("sar ${}, %rax", k & 63));
+                }
                 _ => unreachable!(),
             }
             return Type::I64;
@@ -3050,15 +3132,15 @@ Expr::PatScrutinee(_) => {
                     match op {
                         Add => {
                             self.line(&format!("add {rb}, %rax"));
-                            self.check_overflow();
+                            self.check_overflow_ty(narrow.as_ref());
                         }
                         Sub => {
                             self.line(&format!("sub {rb}, %rax"));
-                            self.check_overflow();
+                            self.check_overflow_ty(narrow.as_ref());
                         }
                         Mul => {
                             self.line(&format!("imul {rb}, %rax"));
-                            self.check_overflow();
+                            self.check_overflow_ty(narrow.as_ref());
                         }
                         BitAnd => self.line(&format!("and {rb}, %rax")),
                         BitOr => self.line(&format!("or {rb}, %rax")),
@@ -3073,15 +3155,15 @@ Expr::PatScrutinee(_) => {
         match op {
             Add => {
                 self.line("add %rcx, %rax");
-                self.check_overflow();
+                self.check_overflow_ty(narrow.as_ref());
             }
             Sub => {
                 self.line("sub %rcx, %rax");
-                self.check_overflow();
+                self.check_overflow_ty(narrow.as_ref());
             }
             Mul => {
                 self.line("imul %rcx, %rax");
-                self.check_overflow();
+                self.check_overflow_ty(narrow.as_ref());
             }
             BitAnd => self.line("and %rcx, %rax"),
             BitOr => self.line("or %rcx, %rax"),
@@ -3089,11 +3171,11 @@ Expr::PatScrutinee(_) => {
             // The variable shift count must be in `%cl`; `eval_operands`
             // already leaves the right operand in `%rcx`.
             Shl => {
-                self.check_shift_count("%rcx");
+                self.check_shift_count("%rcx", shift_bits);
                 self.line("sal %cl, %rax");
             }
             Shr => {
-                self.check_shift_count("%rcx");
+                self.check_shift_count("%rcx", shift_bits);
                 self.line("sar %cl, %rax");
             }
             _ => unreachable!(),
@@ -3135,7 +3217,7 @@ Expr::PatScrutinee(_) => {
     /// signed comparison trick is needed. `%rdx` is free — `cqto` has not run
     /// yet and a 32-bit `div` zeroes its own `%rdx` — and the dividend and
     /// divisor are still in `%rax`/`rd` when the fast path is taken.
-    fn emit_div(&mut self, op: BinOp, rd: &str, rd32: &str) {
+    fn emit_div(&mut self, op: BinOp, rd: &str, rd32: &str, bits: u16) {
         let slow = self.new_label();
         let done = self.new_label();
         let ok = self.new_label();
@@ -3173,13 +3255,21 @@ Expr::PatScrutinee(_) => {
         // falls through to `{done}:`, so `trim_dead` drops it.
         self.cold_start();
         self.raw(&format!("{slow}:"));
-        // `i64::MIN / -1` (and `% -1`) has no representable quotient and the
-        // 64-bit `idiv` would fault; trap like Rust. Only a 64-bit-path dividend
-        // can be `MIN` (a 32-bit one has the high bit clear), so the check sits
-        // in the slow path and the fast path pays nothing for it. `%rdx` is
-        // scratch here: `cqto` below overwrites it before it is read.
-        self.line("movabs $0x8000000000000000, %rdx");
-        self.line("cmp %rdx, %rax");
+        // `MIN / -1` (and `% -1`) has no representable quotient and `idiv`
+        // would fault; trap like Rust. `MIN` is the dividend's own width, not
+        // `i64::MIN`: `i8::MIN / -1` overflows an `i8` even though `-128 / -1`
+        // is representable at 64 bits. The check sits in the slow path, so the
+        // 32-bit fast path pays nothing for it. `%rdx` is scratch here: `cqto`
+        // below overwrites it before it is read.
+        if bits >= 64 {
+            self.line("movabs $0x8000000000000000, %rdx");
+            self.line("cmp %rdx, %rax");
+        } else {
+            // The narrow minimum fits in a sign-extended 32-bit immediate, which
+            // is exactly the value a narrowed register holds.
+            let min = -(1i64 << (bits - 1));
+            self.line(&format!("cmp ${min}, %rax"));
+        }
         self.line(&format!("jne {ok}"));
         self.line(&format!("cmp $-1, {rd}"));
         self.line("je __rmc_divide_overflow");
@@ -3203,7 +3293,7 @@ Expr::PatScrutinee(_) => {
     ///
     /// `D` stays in `%rax` until the quotient or remainder is known; `%rdx` and
     /// `%r8` are scratch.
-    fn gen_div_const(&mut self, op: BinOp, a: &Expr, b: &Expr) -> bool {
+    fn gen_div_const(&mut self, op: BinOp, a: &Expr, b: &Expr, bits: u16) -> bool {
         let d = match Self::small_imm(b) {
             Some(v) if v != 0 => v,
             _ => return false,
@@ -3213,12 +3303,21 @@ Expr::PatScrutinee(_) => {
         if d == 1 {
             // The dividend is already in %rax.
         } else if d == -1 {
-            // `i64::MIN / -1` and `i64::MIN % -1` overflow; `neg` sets OF for
-            // exactly that operand, so the check is free. Rust traps here even
+            // `MIN / -1` and `MIN % -1` overflow; `neg` sets OF for exactly
+            // `i64::MIN`, so at 64 bits the check is free. A narrow dividend
+            // needs an explicit compare against its own minimum: `-128` is not
+            // `i64::MIN`, so `neg` would not set OF. Rust traps here even
             // without `overflow-checks`, because `idiv` cannot produce the
             // wrapping result.
-            self.line("neg %rax");
-            self.line("jo __rmc_divide_overflow");
+            if bits >= 64 {
+                self.line("neg %rax");
+                self.line("jo __rmc_divide_overflow");
+            } else {
+                let min = -(1i64 << (bits - 1));
+                self.line(&format!("cmp ${min}, %rax"));
+                self.line("je __rmc_divide_overflow");
+                self.line("neg %rax");
+            }
         } else {
             let mag = d.unsigned_abs();
             if mag.is_power_of_two() {

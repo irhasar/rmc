@@ -4,13 +4,18 @@
 //! rustc's constant propagation does, and the parser, to evaluate a `const`
 //! item's initializer so its value can be substituted at every use.
 
-use crate::ast::{to_unsigned, wrap_int, BinOp, Expr, Type, UnOp};
+use crate::ast::{fits_int, to_unsigned, wrap_int, BinOp, Expr, Type, UnOp};
 use std::collections::HashMap;
 
-/// The value of a resolved constant: an `i64`, a `bool`, or a `char`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The value of a resolved constant: an `i64`, a `bool`, or a `char`. A narrow
+/// integer constant also carries the width it was declared at, so a use is
+/// substituted back at that width (`const N: u8 = 5` used in `N + 200` still
+/// overflows a `u8`) rather than collapsing to a plain `i64`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConstVal {
     Int(i64),
+    /// A narrow integer constant: its in-width value and the declared width.
+    NarrowInt(i64, Type),
     Bool(bool),
     Char(u32),
 }
@@ -21,7 +26,7 @@ pub enum ConstVal {
 /// rmc does not fold) is simply absent from the result and the caller
 /// diagnoses it. `i64` and `bool` items are folded; any other declared type is
 /// skipped (the caller rejects it).
-pub fn resolve(items: &[(String, Type, Expr)]) -> HashMap<String, ConstVal> {
+pub fn resolve(items: &[(String, Type, Expr)]) -> Result<HashMap<String, ConstVal>, String> {
     resolve_with(items, &HashMap::new(), &HashMap::new(), &HashMap::new())
 }
 
@@ -36,7 +41,7 @@ pub fn resolve_with(
     base_ints: &HashMap<String, i64>,
     base_bools: &HashMap<String, bool>,
     base_chars: &HashMap<String, u32>,
-) -> HashMap<String, ConstVal> {
+) -> Result<HashMap<String, ConstVal>, String> {
     let mut ints = base_ints.clone();
     let mut bools = base_bools.clone();
     let mut chars = base_chars.clone();
@@ -57,7 +62,26 @@ pub fn resolve_with(
                 continue;
             }
             match ty {
-                Type::I64 | Type::Int { .. } => {
+                // A narrow integer item is folded at its declared width: the
+                // initializer must fit (`const N: u8 = 300` is a literal out of
+                // range, and `const N: u8 = 200 + 100` overflows a `u8`), and
+                // the stored value is the in-width result.
+                Type::Int { signed, bits } => {
+                    match eval_int(value, &ints) {
+                        Ok(v) if fits_int(v, *signed, *bits) => {
+                            ints.insert(name.clone(), wrap_int(v, *signed, *bits));
+                            progress = true;
+                        }
+                        Ok(_) => {
+                            return Err(format!(
+                                "literal out of range for `{}`",
+                                int_width_name(*signed, *bits)
+                            ))
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                Type::I64 => {
                     if let Some(v) = eval_i64(value, &ints) {
                         ints.insert(name.clone(), v);
                         progress = true;
@@ -83,16 +107,116 @@ pub fn resolve_with(
         }
     }
     let mut out = HashMap::new();
-    for (name, _, _) in items {
+    for (name, ty, _) in items {
         if let Some(v) = ints.get(name) {
-            out.insert(name.clone(), ConstVal::Int(*v));
+            // A narrow item keeps its width in the value, so a use is
+            // substituted back at that width rather than as a plain `i64`.
+            if let Type::Int { .. } = ty {
+                out.insert(name.clone(), ConstVal::NarrowInt(*v, ty.clone()));
+            } else {
+                out.insert(name.clone(), ConstVal::Int(*v));
+            }
         } else if let Some(v) = bools.get(name) {
             out.insert(name.clone(), ConstVal::Bool(*v));
         } else if let Some(v) = chars.get(name) {
             out.insert(name.clone(), ConstVal::Char(*v));
         }
     }
-    out
+    Ok(out)
+}
+
+/// The Rust name of an integer width, for an out-of-range diagnostic.
+fn int_width_name(signed: bool, bits: u16) -> String {
+    if bits == 64 && signed {
+        "i64".into()
+    } else if bits == 64 {
+        "u64".into()
+    } else {
+        format!("{}{bits}", if signed { "i" } else { "u" })
+    }
+}
+
+/// Evaluate a constant integer expression to an unbounded `i64`, without the
+/// width-relative overflow rejection `const_binop_checked` applies. Used to fold
+/// a narrow `const` item's initializer, where the *declared width* decides
+/// overflow: `const N: u8 = 200 + 100` folds to 300 and is then range-checked
+/// against `u8`, rather than rejected as an `i64` overflow (it is not one).
+/// Division by zero and an out-of-range shift are still errors. A `wrapping_mul`
+/// wraps, as its name promises.
+pub fn eval_int(e: &Expr, ints: &HashMap<String, i64>) -> Result<i64, String> {
+    use BinOp::*;
+    let not_const = || "not a constant integer expression".to_string();
+    match e {
+        Expr::Var { name, .. } => ints.get(name).copied().ok_or_else(not_const),
+        Expr::Int(k) => Ok(*k),
+        Expr::Un(UnOp::Neg, inner) => eval_int(inner, ints)?
+            .checked_neg()
+            .ok_or_else(|| "this arithmetic operation overflows".to_string()),
+        Expr::Cast(inner, ty) if *ty == Type::I64 => eval_int(inner, ints),
+        Expr::Cast(inner, Type::Int { signed, bits }) => {
+            // A bare literal cast (`300 as u8`) is typed by the cast, so it must
+            // fit the destination; a suffixed literal (`300u16 as u8`) carries
+            // its own width and the cast narrows it. rustc rejects the former.
+            if let Expr::Int(v) = inner.as_ref() {
+                if *bits < 64 && !fits_int(*v, *signed, *bits) {
+                    return Err(format!(
+                        "literal out of range for `{}`",
+                        int_width_name(*signed, *bits)
+                    ));
+                }
+            }
+            let v = eval_int(inner, ints)?;
+            if *bits >= 64 {
+                Ok(v)
+            } else {
+                Ok(wrap_int(v, *signed, *bits))
+            }
+        }
+        Expr::Bin(op, a, b) => {
+            let x = eval_int(a, ints)?;
+            let y = eval_int(b, ints)?;
+            match op {
+                Add => Ok(x.wrapping_add(y)),
+                Sub => Ok(x.wrapping_sub(y)),
+                Mul | WrappingMul => Ok(x.wrapping_mul(y)),
+                Div => {
+                    if y == 0 {
+                        return Err("division by zero panics at run time".into());
+                    }
+                    if x == i64::MIN && y == -1 {
+                        return Err("attempt to divide with overflow panics at run time".into());
+                    }
+                    Ok(x / y)
+                }
+                Mod => {
+                    if y == 0 {
+                        return Err("division by zero panics at run time".into());
+                    }
+                    if x == i64::MIN && y == -1 {
+                        return Err("attempt to divide with overflow panics at run time".into());
+                    }
+                    Ok(x % y)
+                }
+                Shl => {
+                    if !(0..64).contains(&y) {
+                        return Err("shift amount is out of range".into());
+                    }
+                    Ok(x << y)
+                }
+                Shr => {
+                    if !(0..64).contains(&y) {
+                        return Err("shift amount is out of range".into());
+                    }
+                    Ok(x >> y)
+                }
+                BitAnd => Ok(x & y),
+                BitOr => Ok(x | y),
+                BitXor => Ok(x ^ y),
+                _ => Err(not_const()),
+            }
+        }
+        _ => Err(not_const()),
+    }
 }
 
 /// A constant `char` expression: a character literal, or another `char`
@@ -115,8 +239,17 @@ pub fn eval_i64(e: &Expr, ints: &HashMap<String, i64>) -> Option<i64> {
         Expr::Un(UnOp::Neg, inner) => eval_i64(inner, ints)?.checked_neg(),
         // A cast to `i64` (or any width, all of which rmc treats as `i64`) is
         // the identity here, so an array length written `N as usize` still
-        // folds. A cast to `bool` is not an integer and does not.
+        // folds. A narrow cast (`N as u8`) folds to the width's value, matching
+        // how a narrow constant use is substituted (`Cast(Int, u8)`).
         Expr::Cast(inner, ty) if *ty == Type::I64 => eval_i64(inner, ints),
+        Expr::Cast(inner, Type::Int { signed, bits }) => {
+            let v = eval_i64(inner, ints)?;
+            if *bits >= 64 {
+                Some(v)
+            } else {
+                Some(wrap_int(v, *signed, *bits))
+            }
+        }
         Expr::Bin(op, a, b) => {
             let x = eval_i64(a, ints)?;
             let y = eval_i64(b, ints)?;

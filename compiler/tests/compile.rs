@@ -1282,6 +1282,149 @@ fn overflow_checks_add_a_jo() {
 }
 
 #[test]
+fn a_narrow_arithmetic_overflow_checks_the_narrow_width() {
+    // `250u8 + 10` wraps to `4` without overflowing 64 bits, so a plain `jo`
+    // would miss it. The narrow check compares `%rax` against its width-extended
+    // self (`mov`/`shl`/`shr`/`cmp`/`jne`) instead.
+    let src = "fn add(a: u8, b: u8) -> u8 { a + b } fn main() -> i64 { return add(250, 10) as i64; }";
+    let plain = asm(src);
+    assert!(!plain.contains("jne __rmc_overflow"), "no trap without the flag");
+    let checked = compile_to_asm(
+        src,
+        &CompileOptions { overflow_checks: true, ..Default::default() },
+    )
+    .unwrap();
+    assert!(
+        checked.contains("jne __rmc_overflow"),
+        "a narrow add must trap against its width:\n{checked}"
+    );
+    assert!(checked.contains("shl $56, %rdx"), "u8 test shifts by 64-8");
+}
+
+#[test]
+fn a_narrow_shift_count_traps_at_the_operand_width() {
+    // `u8 << 8` is a Rust panic: the count must be < 8, not < 64. The check
+    // compares the count against `bits - 1` for the left operand's width.
+    let src = "fn sh(x: u8, n: u8) -> u8 { x << n } fn main() -> i64 { return sh(1, 8) as i64; }";
+    let checked = compile_to_asm(
+        src,
+        &CompileOptions { overflow_checks: true, ..Default::default() },
+    )
+    .unwrap();
+    assert!(
+        checked.contains("cmp $7, %rcx"),
+        "a u8 shift checks the count against 7:\n{checked}"
+    );
+    assert!(checked.contains("ja __rmc_shift_overflow"));
+}
+
+#[test]
+fn a_constant_shift_count_from_inlining_still_traps() {
+    // After inlining, `n` folds to a constant and the shift becomes an immediate
+    // `sal $8, %rax`. The count must still be range-checked for the operand's
+    // width, so the folded immediate is rejected too.
+    let src = "fn sh(x: u8, n: i64) -> u8 { x << n } fn main() -> i64 { return sh(1, 8) as i64; }";
+    let checked = compile_to_asm(
+        src,
+        &CompileOptions { overflow_checks: true, ..Default::default() },
+    )
+    .unwrap();
+    assert!(
+        checked.contains("jmp __rmc_shift_overflow"),
+        "a folded out-of-range u8 shift count traps:\n{checked}"
+    );
+}
+
+#[test]
+fn a_narrow_unary_negation_traps_against_its_width() {
+    // `-i8::MIN` overflows the width but not 64 bits, so it must trap against
+    // the narrow width, like the binary operators.
+    let src = "fn neg(a: i8) -> i8 { -a } fn main() -> i64 { return neg(-128) as i64; }";
+    let checked = compile_to_asm(
+        src,
+        &CompileOptions { overflow_checks: true, ..Default::default() },
+    )
+    .unwrap();
+    assert!(
+        checked.contains("jne __rmc_overflow"),
+        "a narrow negation traps against its width:\n{checked}"
+    );
+}
+
+#[test]
+fn a_narrow_constant_folds_at_its_width() {
+    // A `const N: u8 = 5` is substituted at its width, so `N + 200` overflows a
+    // `u8`; a value that does not fit the declared width is rejected outright.
+    let ok = asm("const N: u8 = 5; fn main() -> i64 { return N as i64; }");
+    assert!(ok.contains("main:"));
+    let err = compile_to_asm("const N: u8 = 300; fn main() -> i64 { return 0; }", &CompileOptions::default())
+        .unwrap_err();
+    assert!(err.contains("literal out of range for `u8`"), "got: {err}");
+}
+
+#[test]
+fn a_narrowing_cast_in_a_typed_binding_truncates() {
+    // `let x: u8 = 300u16 as u8` is `44`: the cast's operand is checked at its
+    // own width, and the cast narrows. A bare literal cast is still rejected.
+    let ok = asm("fn main() -> i64 { let x: u8 = 300u16 as u8; return x as i64; }");
+    assert!(ok.contains("main:"));
+    let err = compile_to_asm("fn main() -> i64 { let x: u8 = 300 as u8; return x as i64; }", &CompileOptions::default())
+        .unwrap_err();
+    assert!(err.contains("literal out of range for `u8`"), "got: {err}");
+}
+
+#[test]
+fn a_signed_minimum_literal_is_accepted_in_a_narrow_binding() {
+    // `let x: i8 = -128` is the signed minimum, not the out-of-range positive
+    // 128; `-129` is still rejected.
+    let ok = asm("fn main() -> i64 { let x: i8 = -128; return x as i64; }");
+    assert!(ok.contains("main:"));
+    let err = compile_to_asm("fn main() -> i64 { let x: i8 = -129; return 0; }", &CompileOptions::default())
+        .unwrap_err();
+    assert!(err.contains("literal out of range for `i8`"), "got: {err}");
+}
+
+#[test]
+fn a_narrow_division_overflow_traps_at_the_dividend_width() {
+    // `i8::MIN / -1` is not `i64::MIN / -1`: the 64-bit `idiv` would produce the
+    // right bits, but the value overflows an `i8`, so Rust traps. The check
+    // compares the dividend against the *narrow* minimum. This traps with or
+    // without the overflow flag, exactly as rustc.
+    let src = "fn f(a: i8, b: i8) -> i8 { a / b } fn main() -> i64 { return f(-128, -1) as i64; }";
+    let out = asm(src);
+    assert!(
+        out.contains("cmp $-128, %rax") && out.contains("__rmc_divide_overflow"),
+        "a narrow divide checks its own minimum:\n{out}"
+    );
+    // A constant `-1` divisor takes the `neg` shortcut and needs the same bound.
+    let cst = asm("fn f(a: i8) -> i8 { a / -1 } fn main() -> i64 { return f(-128) as i64; }");
+    assert!(cst.contains("cmp $-128, %rax"), "narrow const divide bound:\n{cst}");
+    // A 64-bit divide still uses the free `jo` test after `neg`.
+    let wide = asm("fn f(a: i64) -> i64 { a / -1 } fn main() -> i64 { return f(1); }");
+    assert!(wide.contains("jo __rmc_divide_overflow"));
+    assert!(!wide.contains("movabs $0x8000000000000000, %rdx\n\tcmp $-128"));
+}
+
+#[test]
+fn a_negated_literal_cast_is_range_checked_with_its_sign() {
+    // `-128 as i8` is the signed minimum (accepted), `-129 as i8` is out of
+    // range, and `-1 as u8` applies `-` to an unsigned type; all match rustc.
+    let ok = asm("fn main() -> i64 { return (-128 as i8) as i64; }");
+    assert!(ok.contains("main:"));
+    for (src, want) in [
+        ("fn main() -> i64 { return (-129 as i8) as i64; }", "literal out of range for `i8`"),
+        ("fn main() -> i64 { return (-1 as u8) as i64; }", "cannot apply unary `-` to an unsigned integer `u8`"),
+    ] {
+        let err = compile_to_asm(src, &CompileOptions::default()).unwrap_err();
+        assert!(err.contains(want), "want {want:?}, got: {err}");
+    }
+    // A suffixed negative literal carries its own width, so a narrowing cast of
+    // it is legal (`-129i16 as i8` is `127`).
+    let ok2 = asm("fn main() -> i64 { return (-129i16 as i8) as i64; }");
+    assert!(ok2.contains("main:"));
+}
+
+#[test]
 fn large_array_compiles_in_linear_time() {
     // Promotion counts references to every slot. An array of N elements must not
     // make that quadratic: a regression here took ~6s for 200k, this is ~7ms.
@@ -7592,4 +7735,129 @@ fn a_byte_literal_is_an_integer() {
 fn a_byte_string_is_not_supported() {
     // `b".."` needs an array of bytes, which rmc does not have.
     assert!(compile_to_asm("fn main() { let s = b\"hi\"; }", &CompileOptions::default()).is_err());
+}
+
+#[test]
+fn exit_is_never_typed() {
+    // `std::process::exit` returns `!` in rustc, so it may stand in for any
+    // value: a function whose whole body is `exit(..)` type-checks without a
+    // trailing expression, and `let x: i64 = exit(0);` is accepted.
+    assert!(compile_to_asm("fn f() -> i64 { exit(1) } fn main() { }", &CompileOptions::default()).is_ok());
+    assert!(compile_to_asm("fn main() { let x: i64 = exit(0); }", &CompileOptions::default()).is_ok());
+    assert!(compile_to_asm(
+        "fn main() { let x: bool = if 1 > 0 { true } else { exit(1) }; }",
+        &CompileOptions::default()
+    ).is_ok());
+}
+
+#[test]
+fn the_option_and_result_prelude_is_available() {
+    // `Option`/`Result` and their methods are injected as ordinary user code.
+    let out = asm("fn main() -> i64 { let o: Option<i64> = Some(3); o.unwrap() }");
+    assert!(out.contains("main:"), "`Option` must be usable");
+    let r = asm("fn main() -> i64 { let r: Result<i64, i64> = Ok(4); r.unwrap() }");
+    assert!(r.contains("main:"), "`Result` must be usable");
+    // `if let` on the unqualified constructors.
+    let iflet = asm("fn main() { let o = Some(1); if let Some(x) = o { let _ = x; } }");
+    assert!(iflet.contains("main:"), "`if let Some(x)` must compile");
+    // The type arguments and constructors are sugar; a user enum of the same
+    // name is not overridden, so a shadowing definition still wins.
+    let shadow = asm("enum Option { A } fn main() { let o = Option::A; let _ = o; }");
+    assert!(shadow.contains("main:"), "a user `Option` is not overridden");
+}
+
+#[test]
+fn an_unused_prelude_costs_nothing() {
+    // The dead-function pass removes prelude methods a program never calls, so
+    // a plain program's assembly does not mention them.
+    let out = asm("fn main() -> i64 { 1 }");
+    assert!(!out.contains("Option$unwrap"), "an unused prelude method must be dropped");
+    assert!(!out.contains("Result$unwrap"), "an unused prelude method must be dropped");
+}
+
+#[test]
+fn matches_macro_lowers_to_a_match() {
+    // `matches!(e, pat)` is `true`/`false`; the leading `|` Rust allows is
+    // accepted, and a guard folds into the arm test.
+    assert!(compile_to_asm("fn main() -> bool { matches!(1, 1) }", &CompileOptions::default()).is_ok());
+    assert!(compile_to_asm("fn main() -> bool { matches!(5, | 1 | 3 | 5) }", &CompileOptions::default()).is_ok());
+    assert!(compile_to_asm("fn main() -> bool { matches!(5, n if n > 3) }", &CompileOptions::default()).is_ok());
+    assert!(compile_to_asm(
+        "fn main() -> bool { let o = Some(2); matches!(o, Some(v) if v > 1) }",
+        &CompileOptions::default()
+    ).is_ok());
+}
+
+#[test]
+fn a_reversed_range_for_loop_compiles() {
+    // `for i in (lo..hi).rev()` and the inclusive form both compile, and the
+    // shape is only recognised with the parentheses Rust requires.
+    assert!(compile_to_asm(
+        "fn main() { for i in (0..5).rev() { let _ = i; } }",
+        &CompileOptions::default()
+    ).is_ok());
+    assert!(compile_to_asm(
+        "fn main() { for i in (0..=5).rev() { let _ = i; } }",
+        &CompileOptions::default()
+    ).is_ok());
+    assert!(compile_to_asm(
+        "fn main() { for _ in (0..5).rev() { } }",
+        &CompileOptions::default()
+    ).is_ok());
+}
+
+#[test]
+fn counting_range_adapters_compile() {
+    // `step_by`/`skip`/`take`, including chains, are recognised with the
+    // parentheses Rust requires and lower to the same upward-counter loop.
+    for src in [
+        "fn main() { for i in (0..10).step_by(2) { let _ = i; } }",
+        "fn main() { for i in (0..10).skip(3) { let _ = i; } }",
+        "fn main() { for i in (0..10).take(3) { let _ = i; } }",
+        "fn main() { for i in (0..10).skip(2).take(3) { let _ = i; } }",
+        "fn main() { for i in (0..10).step_by(2).rev() { let _ = i; } }",
+        "fn main() { for i in (0..10).take(3).rev() { let _ = i; } }",
+        "fn main() { for i in (0..=10).step_by(3) { let _ = i; } }",
+        "fn main() { for _ in (0..10).skip(1).take(2).rev() { } }",
+    ] {
+        assert!(
+            compile_to_asm(src, &CompileOptions::default()).is_ok(),
+            "should compile: {src}"
+        );
+    }
+    // `min` is only pulled in by `skip`/`take`.
+    let out = asm("fn main() { for i in (0..10).skip(2) { let _ = i; } }");
+    assert!(out.contains("call __rmc_min"), "the skip count uses min:\n{out}");
+    let step = asm("fn main() { for i in (0..10).step_by(2) { let _ = i; } }");
+    assert!(!step.contains("call __rmc_min"), "step_by needs no min:\n{step}");
+}
+
+#[test]
+fn a_vec_list_literal_compiles_and_stores_each_element() {
+    // `vec![a, b, c]` allocates one slot per element and stores each, so the
+    // lowered code holds one `alloc` call and one store per element rather than
+    // rejecting the form.
+    let out = asm("fn main() { let v: Vec<i64> = vec![11, 22, 33]; let _ = v.len(); }");
+    assert_eq!(out.matches("call alloc").count(), 1, "one allocation:\n{out}");
+    // Three element stores reach memory, one per element.
+    let stores = out.lines().filter(|l| l.trim_start().starts_with("mov %rax, (")).count();
+    assert_eq!(stores, 3, "each element is stored once:\n{out}");
+    assert_eq!(out.matches("add $0, %rax").count(), 1, "the first store is at the base");
+    assert!(out.contains("add $8, %rax"), "the second store steps one word:\n{out}");
+    assert!(out.contains("add $16, %rax"), "the third store steps two words:\n{out}");
+}
+
+#[test]
+fn a_vec_list_literal_reads_back_its_elements() {
+    // A byte element list allocates one byte per element (three bytes, not
+    // three words), so `vec![7u8, 8u8, 9u8]` requests three bytes.
+    let bytes = asm("fn main() { let v: Vec<u8> = vec![7u8, 8u8, 9u8]; let _ = v.len(); }");
+    assert_eq!(bytes.matches("call alloc").count(), 1, "one allocation:\n{bytes}");
+    assert!(bytes.contains("mov $3, %rax"), "three bytes are requested:\n{bytes}");
+    assert!(!bytes.contains("mov $24, %rax"), "a byte list is not word-sized:\n{bytes}");
+    // The empty list with a type annotation is valid Rust and folds to length 0.
+    assert!(compile_to_asm(
+        "fn main() { let v: Vec<i64> = vec![]; let _ = v.len(); }",
+        &CompileOptions::default()
+    ).is_ok());
 }
