@@ -3769,7 +3769,11 @@ impl Sema {
                     Type::Ref(referent, _) => {
                         let referent = *referent;
                         *e = Expr::Deref { expr: Box::new(r), ty: referent.clone() };
-                        Ok(referent)
+                        // A byte referent keeps its byte type on the node so
+                        // codegen loads one byte, but the matched value is an
+                        // `i64` (see `byte_value_ty`), so a literal pattern
+                        // `7` compares equal.
+                        Ok(byte_value_ty(&referent))
                     }
                     other => {
                         *e = r;
@@ -3881,7 +3885,7 @@ fn is_string_ty(t: &Type) -> bool {
 /// `{len, bytes}` record.
 fn ref_coerces(found: &Type, expected: &Type) -> bool {
     match (found, expected) {
-        (Type::Ref(f, true), Type::Ref(e, false)) => byte_value_ty(f) == byte_value_ty(e),
+        (Type::Ref(f, true), Type::Ref(e, false)) => f == e,
         (Type::Str, Type::Ref(e, false)) => **e == Type::Str,
         (Type::Ref(e, false), Type::Str) => **e == Type::Str,
         // An integer and a reference (raw pointer) coerce both ways. rmc has no

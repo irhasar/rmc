@@ -75,4 +75,35 @@ fn main() {
     let mr2a = c.as_ptr();
     let mr2 = mr2a as *const u8;
     println!("{}", unsafe { *mr2 });
+
+    // A reference to a byte reference nests: `&&u8` and `& &u8` both keep the
+    // byte referent, so `&r` (with `r: &u8`) satisfies either spelling.
+    let nb = c.as_ptr();
+    let nbp = nb as *const u8;
+    let nr: &u8 = unsafe { &*nbp };
+    let nrr: &&u8 = &nr;
+    let nrr2: & &u8 = &nr;
+    println!("{}", unsafe { **nrr });
+    println!("{}", unsafe { **nrr2 });
+
+    // A byte reference matches a literal pattern: the value is an `i64`, so a
+    // byte of `7` matches `7`, and `250` read as `i8` matches `-6`.
+    let mut d: Vec<u8> = vec![0u8; 4];
+    let dp0 = d.as_mut_ptr();
+    let dp = dp0 as *mut u8;
+    unsafe { *dp = 7; }
+    let dr0 = d.as_ptr();
+    let drp = dr0 as *const u8;
+    let dr: &u8 = unsafe { &*drp };
+    let mv = match dr { 7 => 1, _ => 0 };
+    println!("{}", mv);
+    let mut e: Vec<u8> = vec![0u8; 4];
+    let ep0 = e.as_mut_ptr();
+    let ep = ep0 as *mut u8;
+    unsafe { *ep = 250; }
+    let er0 = e.as_ptr();
+    let erp = er0 as *const i8;
+    let er: &i8 = unsafe { &*erp };
+    let sv = match er { -6 => 10, _ => 20 };
+    println!("{}", sv);
 }

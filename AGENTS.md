@@ -1927,9 +1927,15 @@ the value, so a deref still yields an `i64` (sema's `byte_value_ty`, which is
 also why `&mut *m` borrows `U8` while reading `*m` gives an `i64`). Codegen then
 emits a one-byte `movzbq`/`movsbq` load and a `movb` store; a plain `mov` read
 eight bytes, so `*p` on a `vec![7u8; 8]` printed `0x0707070707070707` and a
-`*p = x` clobbered the following seven bytes. A pointer cast normalises the
-byte-ness (`byte_value_ty`) so `*mut u8 as *mut i8` and `*mut u8 as *mut i64`
-both type.
+`*p = x` clobbered the following seven bytes. A pointer *cast* normalises the
+byte-ness (`byte_value_ty`), so `*mut u8 as *mut i8` and `*mut u8 as *mut i64`
+both type, but an implicit `&mut u8` -> `&i64` coercion must not: the referents
+have to match exactly (`ref_coerces`), or a deref would read eight bytes from a
+one-byte referent (rustc rejects it with E0308). A `&&u8`/`& &u8` keeps the byte
+referent (`parse_referent_type` on the `AmpAmp` path), and a byte reference in a
+scalar `match` compares against an `i64` pattern (the `PatScrutinee` deref also
+normalises with `byte_value_ty`, while leaving `U8`/`I8` on the node for the load
+width).
 
 The `Vec`/pointer name tables (`vec_names`, `vec_elem`, `vec_len`, `vec_cap`,
 `ptr_vars`, `args_vecs`) are lexically scoped like the nested-`fn` frames above:

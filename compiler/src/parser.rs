@@ -1326,9 +1326,11 @@ impl Parser {
             let inner = self.parse_referent_type()?;
             return Ok(Type::Ref(Box::new(inner), mutable));
         }
-        // `&&T` lexes as one token; treat it as two references.
+        // `&&T` lexes as one token; treat it as two references. The innermost
+        // referent goes through `parse_referent_type` too, so `&&u8` keeps the
+        // byte type and matches a reference to an existing `&u8`.
         if self.eat(&Tok::AmpAmp) {
-            let inner = self.parse_type()?;
+            let inner = self.parse_referent_type()?;
             return Ok(Type::Ref(Box::new(Type::Ref(Box::new(inner), false)), false));
         }
         match self.peek() {

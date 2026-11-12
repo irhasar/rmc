@@ -2663,6 +2663,13 @@ def reject_corpus():
         "char_empty": "fn main() { let c = ''; println!(\"{}\", c as i64); }\n",
         "char_bare_quote": "fn main() { let c = '''; println!(\"{}\", c as i64); }\n",
         "char_from_i64_cast": "fn main() { let n: i64 = 65; let c = n as char; println!(\"{}\", c as i64); }\n",
+        # A byte reference must not widen to a word reference: `&mut u8` as
+        # `&i64` would make a deref read eight bytes past the byte. rustc
+        # rejects it (E0308); rmc must too, not coerce it and read a word.
+        "byte_ref_widens_to_word": "fn f(x: &i64) -> i64 { *x }\n"
+            "fn main() { let p: *mut u8 = 0 as *mut u8;\n"
+            "    let r: &mut u8 = unsafe { &mut *p };\n"
+            '    println!("{}", f(r)); }\n',
         # A `char` range pattern with the bounds the wrong way round, and an
         # empty inclusive range; rustc rejects both with E0579.
         "char_range_reversed": "fn main() { let c = 'q'; let r = match c { 'z'..'a' => 1, _ => 0 }; println!(\"{}\", r); }\n",
