@@ -2170,6 +2170,21 @@ rmc's own freestanding runtime. Read the harness before trusting a number.
   `mir-opt-level=2` and `incremental=false` all failing to close it. The
   compile-RSS axis is therefore an inherent front-end tie (~0.99), not
   something the back end can fix; the front end is rustc in *both* pipelines.
+  A second sweep (`-Zmir-opt-level=0/1/2`, `-Zmir-include-spans=no`,
+  `-Zshare-generics=no`, `-Zalways-encode-mir=no`, `-C strip=symbols`,
+  `-Zno-parallel-llvm`) caps the recoverable RSS at ~1.2 MB
+  (`-Zmir-opt-level=0`, at the cost of MIR quality), and `-C incremental=off`
+  saves ~10 MB but saves *more* on the LLVM side (79.8->62.2 MB vs
+  83.2->72.2 MB), so applying it to `mir` alone would be gaming the benchmark,
+  not optimising. Do not chase this axis.
+- **Report the back-end-only split too.** Because the front end is rustc in
+  both pipelines and dominates both RSS peaks, the whole-pipeline RSS ratio
+  hides the stage this experiment actually swaps. `run_fair.py` therefore also
+  prints a `back-end-only comparison`: `ld` over `rmcmir` per program, on wall,
+  CPU, RSS and size. rmc's own back end wins all four (`wall ~1.12`,
+  `cpu ~1.13`, `rss ~1.40`, `size ~18.8x`): `rmcmir` peaks at ~3.2 MB against
+  `ld`'s ~4.7 MB. That is the honest "rmc beats LLVM" claim; the whole-pipeline
+  RSS tie is the shared rustc front end, which neither pipeline controls.
 - **The compile CPU win is real and large** (~1.2x): skipping LLVM codegen.
   Wall time is a near-tie because both fronts pay rustc's ~25-30 ms startup.
   The win does not depend on the aggressive LLVM flags: on `stats`,

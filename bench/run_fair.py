@@ -221,6 +221,8 @@ def measure_program(name, runtime_obj, stub_obj, reps=9):
             "wall": mf["wall"] + mb["wall"], "cpu": mf["cpu"] + mb["cpu"],
             "rss": max(mf["rss"], mb["rss"]),
             "front_wall": mf["wall"], "back_wall": mb["wall"],
+            "front_cpu": mf["cpu"], "back_cpu": mb["cpu"],
+            "front_rss": mf["rss"], "back_rss": mb["rss"],
             "size": os.path.getsize(mir_bin),
         },
         "llvm": {
@@ -230,6 +232,8 @@ def measure_program(name, runtime_obj, stub_obj, reps=9):
             # RSS on both sides, so leaving it out would flatter LLVM.
             "rss": max(lf["rss"], lb["rss"]),
             "front_wall": lf["wall"], "back_wall": lb["wall"],
+            "front_cpu": lf["cpu"], "back_cpu": lb["cpu"],
+            "front_rss": lf["rss"], "back_rss": lb["rss"],
             "size": os.path.getsize(llvm_bin),
         },
     }
@@ -377,6 +381,31 @@ def main():
         verdict = "win" if mean >= 1.0 + NOISE_BAND else (
             "tie" if mean >= 1.0 - NOISE_BAND else "loss")
         print(f"  {a:<9} {mean:6.3f}  ({verdict})")
+
+    # The one axis the whole-pipeline view calls a tie is compile RSS, and the
+    # split shows why: rustc's front end dominates both peaks, and `--emit=mir`
+    # allocates ~3-4 MB more than `--emit=obj` *inside the same rustc*, while
+    # rmc's own back end (`rmcmir`) peaks below `ld`. The front end is rustc in
+    # both pipelines, so the back-end-only view isolates the stage this
+    # experiment actually swaps.
+    print()
+    print("back-end-only comparison (the stage rmc replaces: rmcmir vs ld)")
+    print(f"{'program':<9} {'be_wall':>8} {'be_cpu':>7} {'be_rss':>7} "
+          f"{'be_size':>8}   (llvm/rmc, >1 means rmc better)")
+    be_wall, be_cpu, be_rss = [], [], []
+    for p, res in rows:
+        m, l = res["mir"], res["llvm"]
+        rw = l["back_wall"] / m["back_wall"] if m["back_wall"] else None
+        rc = l["back_cpu"] / m["back_cpu"] if m["back_cpu"] else None
+        rr = l["back_rss"] / m["back_rss"] if m["back_rss"] else None
+        be_wall.append(rw); be_cpu.append(rc); be_rss.append(rr)
+        print(f"{p:<9} {rw:>8.2f} {rc:>7.2f} {rr:>7.2f} "
+              f"{res['llvm']['size']/res['mir']['size']:>8.2f}")
+    def _mean(vs):
+        vs = [v for v in vs if v is not None]
+        return sum(vs) / len(vs) if vs else 0.0
+    print(f"{'mean':<9} {_mean(be_wall):>8.2f} {_mean(be_cpu):>7.2f} "
+          f"{_mean(be_rss):>7.2f}")
 
     print()
     print("ALL MIR WINS" if all_ok else "some axes lost")
