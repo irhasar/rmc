@@ -54,6 +54,9 @@ ARGS = {
     # ovfcheck runs with overflow checks on: the first vector is in range, the
     # second overflows the add and must exit 101 on both binaries.
     "ovfcheck": [["2", "3"], ["9223372036854775807", "1"]],
+    # srread reads its loop bounds from argv, so run zero, one and several
+    # iterations to catch the off-by-one the strength-reduce guard prevents.
+    "srread": [["0"], ["1"], ["2"], ["7"], ["64"]],
 }
 
 

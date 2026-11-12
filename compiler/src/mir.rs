@@ -4354,6 +4354,81 @@ impl Function {
         src
     }
 
+    /// Every position that reads `local`, as `(block, stmt index)`; a read in
+    /// a terminator is reported at `stmts.len()`.
+    fn read_positions(&self, local: u32) -> Vec<(u32, usize)> {
+        let mut out = Vec::new();
+        for (b, blk) in self.blocks.iter().enumerate() {
+            for (i, s) in blk.stmts.iter().enumerate() {
+                if let Stmt::Assign(_, rv) = s {
+                    scan_rv_operands(rv, &mut |op| {
+                        if let Operand::Copy(p) | Operand::Move(p) = op {
+                            if p.local == local {
+                                out.push((b as u32, i));
+                            }
+                        }
+                    });
+                }
+            }
+            let mut read_term = |op: &Operand| {
+                if let Operand::Copy(p) | Operand::Move(p) = op {
+                    if p.local == local {
+                        out.push((b as u32, blk.stmts.len()));
+                    }
+                }
+            };
+            match &blk.term {
+                Terminator::SwitchInt { discr, .. } => read_term(discr),
+                Terminator::Assert { cond, .. } => read_term(cond),
+                Terminator::Drop { place, .. } => {
+                    if place.local == local {
+                        out.push((b as u32, blk.stmts.len()));
+                    }
+                }
+                Terminator::Call { args, .. } => args.iter().for_each(&mut read_term),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Whether the multiply's destination `l`, defined at `mul_idx` in block
+    /// `m`, may double as the running value.
+    ///
+    /// Reuse makes `l` hold `iv * C` at every point in the loop and one step
+    /// past the last body execution (the advance in the latch fires once more,
+    /// after the final increment). That equals the original value only from the
+    /// multiply through to the latch's increment, so reuse is sound only when
+    /// every read of `l` falls in that window and none is after the loop.
+    fn reuse_ok(
+        &self,
+        l: u32,
+        m: u32,
+        mul_idx: usize,
+        in_loop: &[bool],
+        latch: u32,
+        incr_idx: usize,
+        dom: &[HashSet<usize>],
+    ) -> bool {
+        for (b, pos) in self.read_positions(l) {
+            if !in_loop[b as usize] {
+                return false;
+            }
+            // After the advance in the latch (`pos > incr_idx`): `l` already
+            // holds the next iteration's value.
+            if b == latch && pos > incr_idx {
+                return false;
+            }
+            // Before the multiply: the running value is one step ahead.
+            let after_mul = (b == m && pos > mul_idx)
+                || (b != m && dom[b as usize].contains(&(m as usize)));
+            if !after_mul {
+                return false;
+            }
+        }
+        true
+    }
+
     fn sr_one_loop(
         &mut self,
         h: u32,
@@ -4464,8 +4539,16 @@ impl Function {
         // would otherwise recompute every iteration, so it is already a hot
         // local; a fresh PIV local would be just as hot and evict the accumulator
         // from the register file. Every target with the same `C` reads this one
-        // running value. The destination is reused only when the loop writes it
-        // nowhere else, so the running value cannot be clobbered mid-loop.
+        // running value.
+        //
+        // Reuse is only sound when the destination is not observed after the
+        // loop. The advance (`+= s * C`) runs in the latch after the increment,
+        // so it also fires on the final iteration: with `p = i * C` as the
+        // destination, `p` leaves the loop at `n * C` instead of `(n - 1) * C`.
+        // A fresh local keeps the running value private, so the multiply's own
+        // result stays exact on every iteration including the last. `reuse_ok`
+        // also rules out a read in the latch after the advance, which would see
+        // the moved value.
         let mut piv: Vec<(i64, u32)> = Vec::new();
         for &c in &consts {
             let dest = targets
@@ -4483,9 +4566,9 @@ impl Function {
                         .count();
                     defs == 1
                 })
-                .map(|(l, _, _)| l)
-                .unwrap_or_else(|| self.fresh_local());
-            piv.push((c, dest));
+                .filter(|&(l, b, si)| self.reuse_ok(l, b, si, &in_loop, latch, incr_idx, dom));
+            let l = dest.map(|(l, _, _)| l).unwrap_or_else(|| self.fresh_local());
+            piv.push((c, l));
         }
         // `piv_C = iv * C` once, in the preheader; then `piv_C += s * C` after
         // the increment, so `piv_C == iv * C` at the start of every iteration.
