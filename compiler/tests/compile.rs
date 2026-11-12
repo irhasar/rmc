@@ -7708,3 +7708,33 @@ fn a_reversed_range_for_loop_compiles() {
         &CompileOptions::default()
     ).is_ok());
 }
+
+#[test]
+fn a_vec_list_literal_compiles_and_stores_each_element() {
+    // `vec![a, b, c]` allocates one slot per element and stores each, so the
+    // lowered code holds one `alloc` call and one store per element rather than
+    // rejecting the form.
+    let out = asm("fn main() { let v: Vec<i64> = vec![11, 22, 33]; let _ = v.len(); }");
+    assert_eq!(out.matches("call alloc").count(), 1, "one allocation:\n{out}");
+    // Three element stores reach memory, one per element.
+    let stores = out.lines().filter(|l| l.trim_start().starts_with("mov %rax, (")).count();
+    assert_eq!(stores, 3, "each element is stored once:\n{out}");
+    assert_eq!(out.matches("add $0, %rax").count(), 1, "the first store is at the base");
+    assert!(out.contains("add $8, %rax"), "the second store steps one word:\n{out}");
+    assert!(out.contains("add $16, %rax"), "the third store steps two words:\n{out}");
+}
+
+#[test]
+fn a_vec_list_literal_reads_back_its_elements() {
+    // A byte element list allocates one byte per element (three bytes, not
+    // three words), so `vec![7u8, 8u8, 9u8]` requests three bytes.
+    let bytes = asm("fn main() { let v: Vec<u8> = vec![7u8, 8u8, 9u8]; let _ = v.len(); }");
+    assert_eq!(bytes.matches("call alloc").count(), 1, "one allocation:\n{bytes}");
+    assert!(bytes.contains("mov $3, %rax"), "three bytes are requested:\n{bytes}");
+    assert!(!bytes.contains("mov $24, %rax"), "a byte list is not word-sized:\n{bytes}");
+    // The empty list with a type annotation is valid Rust and folds to length 0.
+    assert!(compile_to_asm(
+        "fn main() { let v: Vec<i64> = vec![]; let _ = v.len(); }",
+        &CompileOptions::default()
+    ).is_ok());
+}

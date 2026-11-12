@@ -3051,10 +3051,64 @@ impl Parser {
                         return Ok(());
                     }
                     if m == "\u{0}veclist" {
-                        return Err(format!(
-                            "at byte {}: `vec![a, b, c]` is not supported (use `vec![e; n]`)",
-                            self.pos()
-                        ));
+                        // `vec![a, b, c]`: allocate one slot per element and
+                        // store each. A one-byte element (`vec![1u8, 2u8]`)
+                        // allocates one byte per element and stores a byte; a
+                        // wider element allocates eight bytes and stores a word.
+                        // The element value is cast to `i64` because a byte
+                        // pointer's deref-store expects an `i64` value at a byte
+                        // address; the identity cast on a word element folds
+                        // away, and on a byte element it is the truncation the
+                        // store needs.
+                        let count = args.len() as i64;
+                        self.note_vec_name(&name);
+                        self.note_vec_elem(&name);
+                        self.note_vec_len(&name);
+                        self.note_vec_cap(&name);
+                        self.vec_names.insert(name.clone());
+                        self.vec_elem.insert(name.clone(), elem_width);
+                        self.vec_len.insert(name.clone(), count);
+                        self.vec_cap.insert(name.clone(), count);
+                        let bytes = Expr::Bin(
+                            BinOp::Mul,
+                            Box::new(Expr::Int(count)),
+                            Box::new(Expr::Int(elem_width)),
+                        );
+                        let addr = Expr::Call {
+                            name: "alloc".into(),
+                            args: vec![bytes],
+                            arg_slots: Vec::new(),
+                            ret_slot: -1,
+                            ret_ty: Type::I64,
+                        };
+                        let byte_elem = elem_width == 1;
+                        let value_ty = if byte_elem {
+                            Type::Int { signed: false, bits: 8 }
+                        } else {
+                            Type::I64
+                        };
+                        let base = Expr::Var { name: name.clone(), slot: -1, ty: Type::I64 };
+                        out.push(Stmt::Let {
+                            name,
+                            ty: Some(Type::I64),
+                            init: Some(addr),
+                            slot: -1,
+                            mutable,
+                        });
+                        for (i, elem) in args.iter().enumerate() {
+                            let offset = Expr::Bin(
+                                BinOp::Add,
+                                Box::new(base.clone()),
+                                Box::new(Expr::Int(i as i64 * elem_width)),
+                            );
+                            let ptr_ty = if byte_elem { Type::U8 } else { Type::I64 };
+                            let ptr = Expr::Cast(Box::new(offset), Type::Ref(Box::new(ptr_ty), true));
+                            out.push(Stmt::Assign {
+                                target: Expr::Deref { expr: Box::new(ptr), ty: Type::I64 },
+                                value: Expr::Cast(Box::new(elem.clone()), value_ty.clone()),
+                            });
+                        }
+                        return Ok(());
                     }
                     // `let p = base.as_mut_ptr();`: `base` is a `Vec` address, so
                     // `p` holds that same address. Record it a raw pointer, with
@@ -3083,7 +3137,8 @@ impl Parser {
                 if matches!(ty, Some(Type::Named(ref n)) if n == "Vec") {
                     return Err(format!(
                         "at byte {}: a `Vec` binding must be initialized by \
-                         `Vec::with_capacity(k)`, `vec![e; n]` or an `args()` collect",
+                         `Vec::with_capacity(k)`, `vec![e; n]`, `vec![a, b, c]` or an \
+                         `args()` collect",
                         self.pos()
                     ));
                 }
