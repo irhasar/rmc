@@ -251,7 +251,12 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   struct, and sema and codegen gain no case. Only the constructor and the
   pattern differ, so the prescan records the name and field count in
   `struct_ctors` (a unit struct `struct U;` goes in `unit_structs` instead, since
-  its name is also its value). A call `P(a, b)` in `parse_primary` becomes a
+  its name is also its value). The prescan's `skip_tuple_struct_fields` must step
+  over a whole field *type*, not one token: `struct P(&i64, i64)`, `struct
+  P(*const i64, i64)` and `struct P(Vec<i64>)` all span several tokens, and the
+  helper `skip_to_field_end` advances to the field-separating `,`/`)` at bracket
+  depth zero (balancing `(`/`[`/`<` and splitting a `>>`), so the count is right.
+  A call `P(a, b)` in `parse_primary` becomes a
   `StructLit` (arity checked against `struct_ctors`), and the pattern
   `P(a, b)` in `parse_pattern_primary` becomes the existing `Pat::Struct` with
   positional field names, so `struct_pat_binds` desugars it to the same chain of

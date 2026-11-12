@@ -984,15 +984,12 @@ impl Parser {
                 return Err(format!("at byte {}: unexpected end of input", self.pos()));
             }
             self.skip_pub()?;
-            // A field type may itself contain parentheses (`(i64, i64)`), so
-            // skip a balanced group rather than a bare token.
-            if self.peek() == Some(&Tok::LParen) {
-                self.skip_balanced(Tok::LParen, Tok::RParen)?;
-            } else if self.peek() == Some(&Tok::LBracket) {
-                self.skip_balanced(Tok::LBracket, Tok::RBracket)?;
-            } else {
-                self.i += 1;
-            }
+            // A field type is a whole type, not one token: `&i64`,
+            // `*const i64`, `Vec<i64>`, `(i64, i64)` and `[i64; 3]` all span
+            // several tokens and some contain a `,` at depth. Skip to the
+            // field-separating `,` (or the closing `)`), balancing every bracket
+            // so a nested comma is not mistaken for a field boundary.
+            self.skip_to_field_end()?;
             count += 1;
             if !self.eat(&Tok::Comma) {
                 break;
@@ -1000,6 +997,28 @@ impl Parser {
         }
         self.expect(Tok::RParen)?;
         Ok(count)
+    }
+
+    /// Advance to the next field boundary: a `,` or a `)` at bracket depth zero
+    /// (neither is consumed). Used by the prescan to step over a whole field
+    /// type. A `>>`/`>=` that closes two generic lists at once is split first,
+    /// so the depth stays correct.
+    fn skip_to_field_end(&mut self) -> PResult<()> {
+        let mut depth = 0i32;
+        while let Some(t) = self.peek().cloned() {
+            match t {
+                Tok::Comma | Tok::RParen if depth == 0 => return Ok(()),
+                Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+                Tok::RParen | Tok::RBracket | Tok::RBrace => depth -= 1,
+                Tok::Lt => depth += 1,
+                Tok::Gt => depth -= 1,
+                Tok::Shr => depth -= 2,
+                Tok::Ge => depth -= 1,
+                _ => {}
+            }
+            self.i += 1;
+        }
+        Err(format!("at byte {}: unexpected end of input", self.pos()))
     }
 
     /// `const NAME: TYPE = EXPR;`. The declared type is resolved by sema; the
