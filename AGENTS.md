@@ -2298,13 +2298,23 @@ future session does not re-derive them by hand:
   **produce correct results**. But `classify_unsupported` in `mir.rs` still
   claims "floating-point types are not implemented" and "128-bit integers are
   not implemented". Trust the probe, not the message; fixing the list is P1.
-- **The real back-end gaps are indirect calls / function pointers and `dyn
-  Trait`.** Closures called directly work (they are inlined by rustc's MIR
-  optimiser), but a closure passed as `impl Fn` becomes an indirect call and
-  `mir_codegen` bails (`indirect call (fn pointer) unsupported`). `Range` as a
-  value (`(0..10).step_by(2)`) hits `aggregate constant not yet materialised`.
-  `Vec`/`Box`/`String` fail earlier, at the front end, because the `#![no_std]`
-  stub has no `alloc`.
+- **Function pointers and indirect calls are implemented (P4).** Taking a
+  function as a value (`add as fn(i64, i64) -> i64`, MIR
+  `PointerCoercion(ReifyFnPointer)`) reifies its address, and a call through a
+  `fn`-typed place lowers to an indirect `call *%reg`. Covered by
+  `tests/mir/fnptr.rs`: a pointer passed as an argument, returned from a
+  function, stored in a struct field, and held in an array. Three latent bugs
+  had to be fixed, each of which would break *any* operand-shaped callee:
+  `split_top_args` counted the `>` of a `->` as a closing angle bracket (so a
+  `fn(..) -> ..` parameter swallowed every later argument); the inliner cloned
+  `CallTarget::Indirect` verbatim (so an inlined indirect call still named the
+  *caller's* local); and the MIR use/def and rewrite passes ignored the callee
+  operand (so a `fn` pointer local looked dead and its definition was dropped).
+  Still open: a closure passed as `impl Fn` becomes an indirect call but needs
+  the closure *value* to be built, which is a separate aggregate gap; `dyn
+  Trait`; `Range` as a value (`(0..10).step_by(2)`) hits `aggregate constant
+  not yet materialised`. `Vec`/`Box`/`String` fail earlier, at the front end,
+  because the `#![no_std]` stub has no `alloc`.
 - **LLVM emits `memset` for a wide zero-init; rmc's runtime must provide it.**
   `bench/mir/light.rs`'s `[0i64; 256]` made LLVM call `memset`, which rmc's
   freestanding runtime did not define, so `run_fair.py` failed at the link with
@@ -2313,17 +2323,28 @@ future session does not re-derive them by hand:
   own output is byte-identical; they are verified against a C harness and pinned
   by `runtime::tests`. Any future runtime piece that a *compiler* may emit a
   call to (not just the user) needs the same treatment.
-- **The honest scoreboard is `run_fair.py`'s "some axes lost", and it is two
-  programs.** Whole-pipeline mean is wall 1.085, cpu 1.120, rss 0.996 (tie),
-  size 18.7, run_wall 1.100, run_cpu 1.109, run_rss 1.306. The losses:
-  `hello` compile wall 0.99 (a tie in noise, shared rustc start-up) and `light`
-  run wall **0.81** (LLVM's generated code really is faster on that kernel — a
-  codegen gap, not an artefact). Back-end-only compile also loses on
-  `refs`/`sieve`/`mandel` (0.83/0.88/0.94): `rmcmir` is slower than `ld` there.
+- **The honest scoreboard is `run_fair.py`'s "some axes lost".** After the P3
+  codegen work the whole-pipeline mean is wall 1.08, cpu 1.11, rss 0.99 (tie),
+  size 18.8, run_wall 1.12, run_cpu 1.13, run_rss 1.31. The one remaining
+  per-program flag is `hello` **compile RSS 0.96**, which is the shared rustc
+  front end (below), not rmc. `light` run wall is now 1.09 — the old 0.81 loss
+  is closed. Back-end-only compile wins every program (wall/cpu/rss/size
+  1.14/1.15/1.44/18.8).
+- **The `hello` compile-RSS flag is rustc's front end, not rmc.** `rustc
+  --emit=mir -Zno-codegen` peaks ~3.5 MB above `--emit=obj` on the same source
+  (84.2 vs 80.9 MB), because emitting the MIR text keeps every body resident,
+  while `--emit=obj` frees them once LLVM has consumed them. rmc's own back end
+  peaks at 3.2 MB against `ld`'s 4.7 MB, so on the stage this experiment swaps
+  rmc wins by 1.4x. The whole-pipeline ratio is `max(front, back)` on both
+  sides and the shared front end dominates both peaks, so this axis is a
+  structural tie; do not chase it (a flag sweep in the MIR-bench section shows
+  the recoverable headroom is ~1 MB and only at the cost of MIR quality).
 - **Do not promise "beats LLVM on every axis".** The compile/memory/size axes
-  are structural wins (skip LLVM codegen, link no libc). The run-time axis is
-  not: the back end has no real register allocator, so scheduler-sensitive
-  kernels can lose. `docs/mir-roadmap.md` P3 is the work that closes it.
+  are structural wins (skip LLVM codegen, link no libc), and the back-end-only
+  split wins all four. The whole-pipeline run-time axis is now a win too, but
+  it is the least structural: the back end still has no real register
+  allocator, so a scheduler-sensitive kernel could lose it back.
+  `docs/mir-roadmap.md` P3 is the work that keeps it closed.
 
 ### An unsupported construct must exit 1, never panic
 
