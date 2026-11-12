@@ -20,8 +20,14 @@ fn main() {
     let n: Option<i64> = None;
     println!("{}", matches!(o, Some(_)));
     println!("{}", matches!(n, Some(_)));
+    println!("{}", matches!(o, None));
+    println!("{}", matches!(n, None));
     println!("{}", matches!(o, Some(v) if v > 2));
     println!("{}", matches!(o, Some(v) if v > 5));
+
+    // An unqualified `None` in a `match` is the unit variant, not a binding.
+    match n { None => println!("n is none"), Some(v) => println!("n is {}", v) }
+    match o { None => println!("o is none"), Some(v) => println!("o is {}", v) }
 
     println!("{}", classify(0));
     println!("{}", classify(7));

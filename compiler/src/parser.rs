@@ -4938,7 +4938,7 @@ impl Parser {
                 {
                     // The `Option`/`Result` variant patterns, written
                     // unqualified: `Some(x)`, `Ok(v)`, `Err(e)`. A bare `None`
-                    // is the unit variant and is handled by the wildcard case.
+                    // is the unit variant and is handled by the branch below.
                     let (en, var) = match n.as_str() {
                         "Some" => ("Option", "Some"),
                         "Ok" => ("Result", "Ok"),
@@ -4947,6 +4947,12 @@ impl Parser {
                     self.i += 1; // `(`
                     let args = self.parse_variant_pat_args()?;
                     Ok(Pat::Variant(en.into(), var.into(), Some(args)))
+                } else if n == "None" {
+                    // An unqualified `None` is the unit variant of the injected
+                    // `Option` enum, not a binding: `matches!(Some(1), None)`
+                    // must be `false`. Without this it would fall through to
+                    // `Pat::Bind`, a catch-all that matches every `Option`.
+                    Ok(Pat::Variant("Option".into(), "None".into(), None))
                 } else {
                     // A bare name binds the scrutinee; `_` already matched the
                     // wildcard case above.
