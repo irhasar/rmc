@@ -6725,9 +6725,9 @@ impl Parser {
                             Expr::Int(0)
                         } else {
                             let e = self.parse_bracketed_expr()?;
-                            self.expect(Tok::RParen)?;
                             e
                         };
+                        self.expect(Tok::RParen)?;
                         return Ok(Expr::Call {
                             name: "\u{0}vecnew".into(),
                             args: vec![cap],

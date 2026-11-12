@@ -7,4 +7,8 @@ fn main() {
         }
     }
     println!("{}", ok);
+
+    // `Vec::new()` is the empty constructor: no allocation, a zero length.
+    let e: Vec<i64> = Vec::new();
+    println!("{} {}", e.len(), e.capacity());
 }

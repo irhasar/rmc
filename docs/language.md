@@ -969,6 +969,7 @@ with a length or capacity field, so only the methods below are understood.
 
 | source                              | lowered to                                    |
 | ----------------------------------- | --------------------------------------------- |
+| `let v: Vec<i64> = Vec::new();`     | `alloc(0)`; `v.len()` and `v.capacity()` are `0` |
 | `let v: Vec<i64> = Vec::with_capacity(k);` | `alloc(k * 8)`; `v.capacity()` is `k`  |
 | `let v: Vec<u8> = vec![e; n];`      | `alloc(n)` filled by `__rmc_fill_bytes` (one byte per element) |
 | `let v: Vec<i64> = vec![a, b, c];`  | `alloc(3 * 8)` with each element stored (`vec![a, b, c]`) |

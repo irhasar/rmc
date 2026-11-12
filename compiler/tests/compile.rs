@@ -7909,6 +7909,17 @@ fn a_vec_list_literal_reads_back_its_elements() {
 }
 
 #[test]
+fn vec_new_consumes_its_closing_paren_and_folds_to_zero() {
+    // `Vec::new()` takes no argument; the parser must consume the `)` or the
+    // statement ends early. It folds to a zero-length, zero-capacity binding
+    // (the lowered `alloc(0)`), so `v.len()` is 0 with no allocation count to
+    // read back.
+    let out = asm("fn main() { let v: Vec<i64> = Vec::new(); let _ = v.len(); }");
+    assert_eq!(out.matches("call alloc").count(), 1, "one allocation:\n{out}");
+    assert!(out.contains("mov $0, %rax"), "the length is zero:\n{out}");
+}
+
+#[test]
 fn a_str_or_ref_array_is_an_array_of_one_word_pointers() {
     // A `&str` is a one-word pointer, so `[&str; n]` is an array of pointers:
     // the constant index 2 reads element offset 16 (stride one word), exactly
