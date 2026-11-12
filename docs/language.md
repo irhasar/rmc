@@ -450,6 +450,10 @@ for i in 0..10 { ... }   // i64 range, end exclusive
 for i in 0..=10 { ... }  // i64 range, end inclusive
 for i in (0..10).rev() { ... }  // i64 range, end exclusive, downward
 for i in (0..=10).rev() { ... } // i64 range, end inclusive, downward
+for i in (0..10).step_by(2) { ... }  // every other element
+for i in (0..10).skip(3) { ... }     // drop the first three
+for i in (0..10).take(3) { ... }     // keep only the first three
+for i in (0..10).skip(2).take(3).rev() { ... }  // adapters chain, left to right
 for x in arr { ... }     // array, by value, left to right (x is the element)
 loop { ... }
 loop { ... break v; }    // `loop` is an expression: `break v` yields `v`
@@ -519,7 +523,11 @@ refutable and rejected. A range may be iterated downward with `.rev()`, written
 `for i in (lo..hi).rev()` or `(lo..=hi).rev()`: `lo` and `hi` are evaluated
 once each, the loop yields `hi - 1` down to `lo` (or `hi` down to `lo`
 inclusive), and `continue` still runs the decrement. The parentheses are
-required, as in Rust. `for x in &arr`
+required, as in Rust. Three counting adapters are also supported and may chain:
+`.step_by(k)` yields every `k`-th element, `.skip(k)` drops the first `k`, and
+`.take(k)` keeps only the first `k`. Adapters apply left to right, so
+`(0..10).skip(2).take(3).rev()` reverses the slice `[2, 3, 4]`; each bound is
+evaluated once, and `continue` still runs the counter increment. `for x in &arr`
 (which Rust iterates by reference) is rejected rather than mistyped. `while let` is
 `loop { if let PAT = expr { body } else { break; } }`: the scrutinee is
 re-evaluated every iteration, and `continue` re-tests it rather than jumping to

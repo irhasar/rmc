@@ -203,6 +203,25 @@ __rmc_fill_bytes:
     },
     Piece {
         text: r#"
+# long __rmc_min(long a, long b)  -- the smaller of two signed words. Backs the
+# `skip`/`take` range adapters' count, where it caps the number of iterations at
+# the range length. Signed compare, since a range length is never negative but
+# the operands are `i64`.
+.globl __rmc_min
+.type __rmc_min, @function
+__rmc_min:
+    mov %rdi, %rax
+    cmp %rsi, %rax
+    jle .Lmin_done
+    mov %rsi, %rax
+.Lmin_done:
+    ret
+.size __rmc_min, .-__rmc_min
+"#,
+        defines: &["__rmc_min"],
+    },
+    Piece {
+        text: r#"
 # void exit(long code)
 .globl exit
 .type exit, @function

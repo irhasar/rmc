@@ -2283,14 +2283,17 @@ impl Parser {
     /// the array's compile-time length, so the loop bound is a literal and the
     /// loop carries no hidden slot.
     ///
-    /// Whether the tokens at the cursor are `( <..> .. <..> ) . rev ( )`, the
-    /// head of a `for i in (lo..hi).rev()`. A non-nested token scan: the first
-    /// `)` at depth zero ends the parenthesised range, and only a `..`/`..=`
-    /// directly inside it (no parentheses of its own) counts, so `(f(..))`,
-    /// `((a..b))` and `(a..b).sum()` are all rejected.
-    fn at_parenthesized_range_rev(&self) -> bool {
+    /// The tokens at the cursor are `( <..> .. <..> )` followed by one or more
+    /// adapters: the head of a `for i in (lo..hi).rev()` / `.step_by(k)` /
+    /// `.skip(k)` / `.take(k)`, possibly chained (`.skip(3).take(4)`). A
+    /// non-nested token scan: the first `)` at depth zero ends the parenthesised
+    /// range, and only a `..`/`..=` directly inside it (no parentheses of its
+    /// own) counts, so `(f(..))`, `((a..b))` and `(a..b).sum()` are all
+    /// rejected. Returns the adapters in source order, or `None` when the shape
+    /// does not match.
+    fn at_parenthesized_range_adapter(&self) -> Option<Vec<String>> {
         if self.peek() != Some(&Tok::LParen) {
-            return false;
+            return None;
         }
         let mut j = self.i + 1;
         let mut depth = 1u32;
@@ -2306,7 +2309,7 @@ impl Parser {
                 }
                 Tok::RBracket | Tok::RBrace => {
                     if depth == 1 {
-                        return false;
+                        return None;
                     }
                     depth -= 1;
                 }
@@ -2316,30 +2319,97 @@ impl Parser {
             j += 1;
         }
         if !saw_dots || self.toks.get(j).map(|t| &t.tok) != Some(&Tok::RParen) {
-            return false;
+            return None;
         }
         j += 1;
-        matches!(self.toks.get(j).map(|t| &t.tok), Some(Tok::Dot))
-            && matches!(self.toks.get(j + 1).map(|t| &t.tok), Some(Tok::Ident(n)) if n == "rev")
-            && matches!(self.toks.get(j + 2).map(|t| &t.tok), Some(Tok::LParen))
-            && matches!(self.toks.get(j + 3).map(|t| &t.tok), Some(Tok::RParen))
+        let mut adapters = Vec::new();
+        loop {
+            if self.toks.get(j).map(|t| &t.tok) != Some(&Tok::Dot) {
+                break;
+            }
+            let name = match self.toks.get(j + 1).map(|t| &t.tok) {
+                Some(Tok::Ident(n)) => n.clone(),
+                _ => break,
+            };
+            let argc = match name.as_str() {
+                "rev" => 0,
+                "step_by" | "skip" | "take" => 1,
+                // A method rmc does not desugar ends the chain; the head then
+                // parses as an ordinary expression and reports its own error.
+                _ => break,
+            };
+            if self.toks.get(j + 2).map(|t| &t.tok) != Some(&Tok::LParen) {
+                break;
+            }
+            // Skip to the matching `)` of this adapter's argument list.
+            let mut k = j + 3;
+            let mut d = 1u32;
+            while let Some(t) = self.toks.get(k).map(|t| &t.tok) {
+                match t {
+                    Tok::LParen => d += 1,
+                    Tok::RParen => {
+                        d -= 1;
+                        if d == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                k += 1;
+            }
+            if self.toks.get(k).map(|t| &t.tok) != Some(&Tok::RParen) {
+                break;
+            }
+            if argc == 0 {
+                if k != j + 3 {
+                    break;
+                }
+            } else if k == j + 3 {
+                break;
+            }
+            adapters.push(name);
+            j = k + 1;
+        }
+        if adapters.is_empty() {
+            None
+        } else {
+            Some(adapters)
+        }
     }
 
-    /// `for PAT in (lo..hi).rev() { body }` (or `lo..=hi`), with the head
-    /// already consumed. Iterating a range downward is `while`-shaped, so a
-    /// `while` cannot be used directly: `continue` in a `while` skips the
-    /// decrement and loops forever. Instead the counter runs *upward* — the
-    /// loop variable is a fresh local computed as `hi - i` (or `hi - i - 1`
-    /// for the exclusive form) — so the counter's own increment is the
-    /// decrement, `continue` reaches it like any other `for`, and the `For`
-    /// codegen is reused unchanged. The upward count is bounded by
-    /// `hi - lo` iterations, so it cannot wrap.
-    fn desugar_for_range_rev(
+    /// `for PAT in (lo..hi).ADAPTERS { body }` (or `lo..=hi`), with the head
+    /// already consumed. `adapters` is the source-order list the lookahead
+    /// found, e.g. `["skip", "take"]`.
+    ///
+    /// The loop runs a single upward counter `i` from `0` to a computed count,
+    /// so `continue` reaches the counter increment like any other `for` and the
+    /// `For` codegen is reused unchanged. Each adapter defines the count and the
+    /// element:
+    ///
+    /// * `rev` — element `len - 1 - i`, `n` steps. Iterating a range downward is
+    ///   otherwise `while`-shaped, where `continue` would skip the decrement and
+    ///   loop forever; running the counter up and mapping it down sidesteps
+    ///   that, and the count is bounded by `hi - lo`, so it cannot wrap.
+    /// * `step_by(k)` — element `i * k`, `ceil(n / k)` steps.
+    /// * `skip(k)` / `take(k)` — element `i` (`i + c` after a skip), `n - c` /
+    ///   `c` steps, where `c = min(k, n)`. Their argument is a step count, not a
+    ///   stride.
+    ///
+    /// Adapters apply left to right, each transforming the previous one's
+    /// sequence: the element is a composition of per-adapter index maps (a `rev`
+    /// after a `take` reverses that slice), and the count threads through each
+    /// adapter's length. The maps stay relative to the raw range, so `lo` is
+    /// added once at the end. Every bound (`lo`, `hi`, `n`, each `k`) is bound
+    /// to a temporary in the enclosing block, so a side-effecting bound runs
+    /// once, not per step.
+    fn desugar_for_range_adapter(
         &mut self,
         pat: Pat,
         lo: Expr,
         hi: Expr,
         inclusive: bool,
+        adapters: &[String],
+        args: Vec<Expr>,
         body: Block,
         label: Option<String>,
     ) -> PResult<Stmt> {
@@ -2359,47 +2429,201 @@ impl Parser {
         };
         let lo_name = format!("\u{0}rl{}", self.tmp);
         let hi_name = format!("\u{0}rh{}", self.tmp);
-        let i_name = format!("\u{0}rc{}", self.tmp);
-        self.tmp += 1;
+        let i_name = format!("\u{0}ri{}", self.tmp);
+        // One stride temporary per `step_by(k)`; the names line up with the
+        // matching entry in `args`.
+        let k_names: Vec<String> = adapters
+            .iter()
+            .filter(|a| a.as_str() == "step_by")
+            .map(|_| {
+                let n = format!("\u{0}rk{}", self.tmp);
+                self.tmp += 1;
+                n
+            })
+            .collect();
         let vlo = |n: &str| Expr::Var { name: n.to_string(), slot: -1, ty: Type::I64 };
-        // `let var = hi - i [- 1];`, the downward value from the upward counter.
-        let mut value = Expr::Bin(BinOp::Sub, Box::new(vlo(&hi_name)), Box::new(vlo(&i_name)));
-        if !inclusive {
-            value = Expr::Bin(BinOp::Sub, Box::new(value), Box::new(Expr::Int(1)));
+        let c_name = |t: usize| format!("\u{0}rc{t}");
+        let m_name = |t: usize| format!("\u{0}ra{t}");
+        let s_name = |t: usize| format!("\u{0}rs{t}");
+        // The span of the range before any adapter: `hi - lo` exclusive,
+        // `hi - lo + 1` inclusive.
+        let span = Expr::Bin(BinOp::Sub, Box::new(vlo(&hi_name)), Box::new(vlo(&lo_name)));
+        let total = if inclusive {
+            Expr::Bin(BinOp::Add, Box::new(span), Box::new(Expr::Int(1)))
+        } else {
+            span
+        };
+        let mut head: Vec<Stmt> = vec![
+            Stmt::Let { name: lo_name.clone(), ty: None, init: Some(lo), slot: -1, mutable: false },
+            Stmt::Let { name: hi_name.clone(), ty: None, init: Some(hi), slot: -1, mutable: false },
+        ];
+        // Pass one, forward. `lens[t]` is the sequence length the `t`-th adapter
+        // receives (`lens[0]` is the raw range length) and `counts[t]` the length
+        // it emits; `strides[t]` holds the `step_by` stride temporary. Each
+        // adapter's bound is a `let`, so it is evaluated once, not per step.
+        let n = adapters.len();
+        let mut lens: Vec<Expr> = Vec::with_capacity(n);
+        let mut counts: Vec<Expr> = Vec::with_capacity(n);
+        let mut strides: Vec<Option<String>> = vec![None; n];
+        let mut head_a = 0usize;
+        let mut head_k = 0usize;
+        let mut prev_len = total;
+        for (t, adapter) in adapters.iter().enumerate() {
+            lens.push(prev_len.clone());
+            match adapter.as_str() {
+                "rev" => counts.push(prev_len.clone()),
+                "step_by" => {
+                    let k_name = k_names[head_k].clone();
+                    head_k += 1;
+                    head.push(Stmt::Let {
+                        name: k_name.clone(),
+                        ty: None,
+                        init: Some(args[head_a].clone()),
+                        slot: -1,
+                        mutable: false,
+                    });
+                    head_a += 1;
+                    strides[t] = Some(k_name.clone());
+                    // `ceil(len / k)` as `(len + k - 1) / k`; a zero stride is a
+                    // runtime divide-by-zero, which is what rustc reports.
+                    counts.push(Expr::Bin(
+                        BinOp::Div,
+                        Box::new(Expr::Bin(
+                            BinOp::Add,
+                            Box::new(prev_len.clone()),
+                            Box::new(Expr::Bin(
+                                BinOp::Sub,
+                                Box::new(vlo(&k_name)),
+                                Box::new(Expr::Int(1)),
+                            )),
+                        )),
+                        Box::new(vlo(&k_name)),
+                    ));
+                }
+                "skip" | "take" => {
+                    let m = m_name(t);
+                    head.push(Stmt::Let {
+                        name: m.clone(),
+                        ty: None,
+                        init: Some(args[head_a].clone()),
+                        slot: -1,
+                        mutable: false,
+                    });
+                    head_a += 1;
+                    // `c = min(bound, len)`: the number of steps the bound
+                    // actually removes, so it can never exceed the sequence.
+                    head.push(Stmt::Let {
+                        name: c_name(t),
+                        ty: None,
+                        init: Some(Expr::Call {
+                            name: "__rmc_min".into(),
+                            args: vec![vlo(&m), prev_len.clone()],
+                            arg_slots: Vec::new(),
+                            ret_slot: -1,
+                            ret_ty: Type::I64,
+                        }),
+                        slot: -1,
+                        mutable: false,
+                    });
+                    if adapter == "skip" {
+                        counts.push(Expr::Bin(
+                            BinOp::Sub,
+                            Box::new(prev_len.clone()),
+                            Box::new(vlo(&c_name(t))),
+                        ));
+                    } else {
+                        counts.push(vlo(&c_name(t)));
+                    }
+                }
+                _ => unreachable!("unknown range adapter {adapter}"),
+            }
+            prev_len = counts[t].clone();
         }
+        // Pass two, reverse. `map` is the counter-to-element index for the
+        // `t`-th adapter's sequence, built from the innermost (last) adapter
+        // outward and kept relative to the raw range (`lo` is added once at the
+        // end). `rev` maps `i` to `len - 1 - i`, `step_by(k)` to `i * k`, `skip`
+        // shifts by `c`. A `rev` needs the length of the sequence it reverses
+        // (`lens[t]`); that expression may reference a `step_by` count, so it is
+        // bound once to `s_t` rather than recomputed per iteration.
+        let mut subst: Vec<Option<String>> = vec![None; n];
+        let mut map = Expr::Var { name: i_name.clone(), slot: -1, ty: Type::I64 };
+        for t in (0..n).rev() {
+            let needs_len = adapters[t] == "rev" || (t > 0 && adapters[t - 1] == "rev");
+            if needs_len && subst[t].is_none() {
+                let s = s_name(t);
+                head.push(Stmt::Let {
+                    name: s.clone(),
+                    ty: None,
+                    init: Some(lens[t].clone()),
+                    slot: -1,
+                    mutable: false,
+                });
+                subst[t] = Some(s);
+            }
+            let l = match &subst[t] {
+                Some(name) => vlo(name),
+                None => lens[t].clone(),
+            };
+            match adapters[t].as_str() {
+                "rev" => {
+                    // Element `i` of the reversed sequence is `len - 1 - i` of
+                    // this one.
+                    map = Expr::Bin(
+                        BinOp::Sub,
+                        Box::new(Expr::Bin(BinOp::Sub, Box::new(l), Box::new(Expr::Int(1)))),
+                        Box::new(map),
+                    );
+                }
+                "step_by" => {
+                    // `X_t[i] = X_{t-1}[i * k]`.
+                    let k_name = strides[t].clone().expect("a step_by stride");
+                    map = Expr::Bin(BinOp::Mul, Box::new(map), Box::new(vlo(&k_name)));
+                }
+                "skip" => {
+                    // Drop the first `c` elements: shift the map by `c`. When the
+                    // bound exceeds the length, `c` is the whole sequence and the
+                    // count is zero, so the shift is never observed.
+                    map = Expr::Bin(BinOp::Add, Box::new(map), Box::new(vlo(&c_name(t))));
+                }
+                "take" => {}
+                _ => unreachable!("unknown range adapter"),
+            }
+        }
+        // The final length is the last adapter's count, bound so the loop bound
+        // is one slot read; it may reference an `s_t` bound just above.
+        let n_name = format!("\u{0}rn{}", self.tmp);
+        self.tmp += 1;
+        head.push(Stmt::Let {
+            name: n_name.clone(),
+            ty: None,
+            init: Some(counts[n - 1].clone()),
+            slot: -1,
+            mutable: false,
+        });
         let mut stmts = vec![
-            Stmt::Let { name: var, ty: None, init: Some(value), slot: -1, mutable: false },
+            // `map` is a pure index into the raw range, so `lo` is added once.
+            Stmt::Let {
+                name: var,
+                ty: None,
+                init: Some(Expr::Bin(BinOp::Add, Box::new(vlo(&lo_name)), Box::new(map))),
+                slot: -1,
+                mutable: false,
+            },
         ];
         stmts.extend(body.stmts);
         let body = Block { stmts, tail: body.tail };
-        let count = {
-            let span = Expr::Bin(BinOp::Sub, Box::new(vlo(&hi_name)), Box::new(vlo(&lo_name)));
-            // `lo..=hi` covers one more value than `lo..hi`, so the upward
-            // counter runs one step further.
-            if inclusive {
-                Expr::Bin(BinOp::Add, Box::new(span), Box::new(Expr::Int(1)))
-            } else {
-                span
-            }
-        };
-        let for_stmt = Stmt::For {
+        head.push(Stmt::For {
             var: i_name,
             var_slot: -1,
             start: Expr::Int(0),
-            end: count,
+            end: vlo(&n_name),
             end_slot: -1,
             inclusive: false,
             body,
             label,
-        };
-        Ok(Stmt::Expr(Expr::Block(Block {
-            stmts: vec![
-                Stmt::Let { name: lo_name, ty: None, init: Some(lo), slot: -1, mutable: false },
-                Stmt::Let { name: hi_name, ty: None, init: Some(hi), slot: -1, mutable: false },
-                for_stmt,
-            ],
-            tail: None,
-        })))
+        });
+        Ok(Stmt::Expr(Expr::Block(Block { stmts: head, tail: None })))
     }
 
     fn parse_for_labeled(&mut self, label: Option<String>) -> PResult<Stmt> {
@@ -2418,11 +2642,12 @@ impl Parser {
         }
         let pat = self.parse_pattern()?;
         self.expect(Tok::In)?;
-        // `for i in (lo..hi).rev() { .. }`: iterate a range downward. The
-        // parentheses are required in Rust (`lo..hi.rev()` would read the
-        // method call on `hi`), and `(lo..hi)` is not an rmc expression, so
-        // the whole shape is recognised before the head is parsed.
-        if self.at_parenthesized_range_rev() {
+        // `for i in (lo..hi).rev() { .. }` (and `.step_by(k)` / `.skip(k)` /
+        // `.take(k)`): adapt a range. The parentheses are required in Rust
+        // (`lo..hi.rev()` would read the method call on `hi`), and `(lo..hi)`
+        // is not an rmc expression, so the whole shape is recognised before the
+        // head is parsed.
+        if let Some(adapters) = self.at_parenthesized_range_adapter() {
             self.expect(Tok::LParen)?;
             let lo = self.parse_cond()?;
             let inclusive = self.eat(&Tok::DotDotEq);
@@ -2431,12 +2656,22 @@ impl Parser {
             }
             let hi = self.parse_cond()?;
             self.expect(Tok::RParen)?;
-            self.expect(Tok::Dot)?;
-            self.expect_ident()?; // `rev`
-            self.expect(Tok::LParen)?;
-            self.expect(Tok::RParen)?;
+            let mut args = Vec::new();
+            for adapter in &adapters {
+                self.expect(Tok::Dot)?;
+                self.expect_ident()?; // the adapter name
+                self.expect(Tok::LParen)?;
+                if adapter == "rev" {
+                    self.expect(Tok::RParen)?;
+                } else {
+                    args.push(self.parse_cond()?);
+                    self.expect(Tok::RParen)?;
+                }
+            }
             let body = self.parse_block()?;
-            return self.desugar_for_range_rev(pat, lo, hi, inclusive, body, label);
+            return self.desugar_for_range_adapter(
+                pat, lo, hi, inclusive, &adapters, args, body, label,
+            );
         }
         let head = self.parse_cond()?;
         // `for v in &args` (and `for v in args`) over an `args()`-vector binding

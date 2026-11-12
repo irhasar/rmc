@@ -7710,6 +7710,32 @@ fn a_reversed_range_for_loop_compiles() {
 }
 
 #[test]
+fn counting_range_adapters_compile() {
+    // `step_by`/`skip`/`take`, including chains, are recognised with the
+    // parentheses Rust requires and lower to the same upward-counter loop.
+    for src in [
+        "fn main() { for i in (0..10).step_by(2) { let _ = i; } }",
+        "fn main() { for i in (0..10).skip(3) { let _ = i; } }",
+        "fn main() { for i in (0..10).take(3) { let _ = i; } }",
+        "fn main() { for i in (0..10).skip(2).take(3) { let _ = i; } }",
+        "fn main() { for i in (0..10).step_by(2).rev() { let _ = i; } }",
+        "fn main() { for i in (0..10).take(3).rev() { let _ = i; } }",
+        "fn main() { for i in (0..=10).step_by(3) { let _ = i; } }",
+        "fn main() { for _ in (0..10).skip(1).take(2).rev() { } }",
+    ] {
+        assert!(
+            compile_to_asm(src, &CompileOptions::default()).is_ok(),
+            "should compile: {src}"
+        );
+    }
+    // `min` is only pulled in by `skip`/`take`.
+    let out = asm("fn main() { for i in (0..10).skip(2) { let _ = i; } }");
+    assert!(out.contains("call __rmc_min"), "the skip count uses min:\n{out}");
+    let step = asm("fn main() { for i in (0..10).step_by(2) { let _ = i; } }");
+    assert!(!step.contains("call __rmc_min"), "step_by needs no min:\n{step}");
+}
+
+#[test]
 fn a_vec_list_literal_compiles_and_stores_each_element() {
     // `vec![a, b, c]` allocates one slot per element and stores each, so the
     // lowered code holds one `alloc` call and one store per element rather than
