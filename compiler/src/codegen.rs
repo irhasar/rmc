@@ -3197,23 +3197,6 @@ Expr::PatScrutinee(_) => {
         }
     }
 
-    /// The frame displacement of element `idx` of the local array at `slot` with
-    /// `n` slots and a `stride`-slot element, for a *constant* index. `None`
-    /// when `base` is not a local array. Used where an element is named directly
-    /// rather than through `array_elem_operand` (which handles only stride 1).
-    fn const_elem_off(&self, base: &Expr, idx: &Expr) -> Option<i32> {
-        let (slot, n) = match base {
-            Expr::Var { slot, ty: Type::Array(_, n), .. } => (*slot, *n),
-            _ => return None,
-        };
-        match idx {
-            Expr::Int(v) if (-2_147_483_648..=2_147_483_647).contains(v) => {
-                Some(self.array_off(slot, n) + *v as i32 * 8 * Self::elem_stride(base) as i32)
-            }
-            _ => None,
-        }
-    }
-
     /// Emit a `cmp` that leaves the flags for `a - b`, i.e. the flags for
     /// `a op b`. Returns false when neither operand can be named without a
     /// register, so the caller can fall back to the general path. x86 rejects

@@ -1474,7 +1474,7 @@ impl<'a> FnGen<'a> {
                 *weighted.entry(l).or_insert(0) += c * w;
             }
         }
-        let mut ranked: Vec<(u32, u32, u32)> = counts
+        let ranked: Vec<(u32, u32, u32)> = counts
             .into_iter()
             .filter(|(l, c)| {
                 *c >= 2 && !projected.contains(l) && !addr_taken.contains(l)
