@@ -7815,3 +7815,29 @@ fn a_vec_list_literal_reads_back_its_elements() {
         &CompileOptions::default()
     ).is_ok());
 }
+
+#[test]
+fn a_str_or_ref_array_is_an_array_of_one_word_pointers() {
+    // A `&str` is a one-word pointer, so `[&str; n]` is an array of pointers:
+    // the constant index 2 reads element offset 16 (stride one word), exactly
+    // like an `[i64; 3]`, not a wider stride.
+    let out = asm(r#"fn main() { let a = ["aa", "bb", "cc"]; let _ = a[2]; }"#);
+    assert!(out.contains("mov 16(%rax), %rdx"), "index 2 steps two words:\n{out}");
+    assert!(!out.contains("mov 24(%rax), %rdx"), "not a struct stride:\n{out}");
+
+    // An annotated type, a repeat literal and a mutation all compile, and a
+    // `&str` array passed by value keeps its pointer elements.
+    for src in [
+        r#"fn main() { let a: [&str; 2] = ["x", "y"]; let _ = a[1]; }"#,
+        r#"fn main() { let a = ["z"; 3]; let _ = a[2]; }"#,
+        r#"fn main() { let mut a = ["a", "b"]; a[0] = "c"; let _ = a[0]; }"#,
+        r#"fn f(a: [&str; 2]) -> &str { a[1] }
+            fn main() { let a = ["hi", "bye"]; let _ = f(a); }"#,
+        r#"fn main() { let x = 5; let r = [&x, &x]; let _ = *r[0]; }"#,
+    ] {
+        assert!(
+            compile_to_asm(src, &CompileOptions::default()).is_ok(),
+            "should compile: {src}"
+        );
+    }
+}

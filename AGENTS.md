@@ -1475,11 +1475,11 @@ function and its call sites agree. A nested `fn` captures nothing, so this is
 exactly rustc's semantics for the subset — including that a nested `fn` in a
 `loop` body is the same function every iteration (it is not re-created).
 
-An array's element type is a scalar: `i64`, `bool` or a unit enum. Nested
-arrays, arrays of structs and arrays of payload enums are rejected. A unit enum
-is one 8-byte slot emitted like `i64`, so `[E; N]` lays out and indexes
-correctly; rustc likewise accepts a unit enum and rejects a payload enum and a
-reference as array elements. A list literal `[a, b, c]` is parsed as
+An array's element type may be a scalar (`i64`, `bool`, a `char` or a unit
+enum), `str`, a reference, a nested array, a struct or a payload enum. A unit
+enum is one 8-byte slot emitted like `i64`, so `[E; N]` lays out and indexes
+correctly. `str` and a reference are one-word pointers, so `[&str; N]` and
+`[&T; N]` are arrays of pointers. A list literal `[a, b, c]` is parsed as
 `Expr::ArrayList` and rewritten by sema, which infers the element type from the
 values — the parser must not guess it, because it does not type-check, and
 guessing `i64` is what made `[true, false]` fail.

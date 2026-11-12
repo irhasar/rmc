@@ -13,7 +13,7 @@ are no runtime type errors.
 | `bool`       | `true` or `false`                             |
 | `char`       | a Unicode scalar value (a 4-byte code point, held in an 8-byte slot) |
 | `str`        | a string (one word: a pointer to a `{len, bytes}` record) |
-| `[T; N]`     | fixed-size array of `N` `T` elements, where `T` is a scalar, a struct or another array |
+| `[T; N]`     | fixed-size array of `N` `T` elements, where `T` is a scalar, `str`, a reference, a struct, a payload enum or another array |
 | `(A, B)`     | a tuple of the given element types (an aggregate) |
 | `&T` `&mut T`| a reference to a `T` (one word)               |
 | `Name`       | a struct declared with `struct Name { .. }`   |
@@ -269,7 +269,7 @@ auto-derefs a `&S` scrutinee in the same way, and so does a literal, range or
 bool pattern — `match &x { 5 => .. }`). The referent is what the pattern
 is checked against, so a variant of a different enum is still rejected.
 A payload variant is not comparable with `==` and cannot be cast with
-`as` (it is not a scalar), and it may not be an array element.
+`as` (it is not a scalar).
 
 A recursive enum such as `enum L { Nil, Cons(i64, L) }` is rejected: rmc has no
 indirection, so an enum may not contain itself.
@@ -649,9 +649,11 @@ compile-time constant is decided at compile time, not by the trap.
 - Array literals: `[a, b, c]` and `[value; count]`. A list literal takes its
   element type from the values, so `[true, false]` is a `[bool; 2]` and
   `[1, 2, 3]` an `[i64; 3]`; mixing the two is an error. An array element may be
-  a scalar (`i64`, `bool`, a unit enum), a struct or another array, so
-  `[[i64; 3]; 2]`, `[Point; 4]` and `[[[i64; 2]; 2]; 2]` are all valid; a payload
-  enum and a reference are rejected (rustc rejects both as well). Element `i`
+  a scalar (`i64`, `bool`, a char or a unit enum), a `str`, a reference, a
+  struct, a payload enum or another array, so `[[i64; 3]; 2]`, `[Point; 4]`,
+  `[&str; 3]`, `[&i64; 2]` and `[[[i64; 2]; 2]; 2]` are all valid. A `str` and a
+  reference are one-word pointers, so `[&str; n]` and `[&T; n]` are arrays of
+  pointers. Element `i`
   lives at `base + i * sizeof(T)`, so a wide element (a nested array or a struct)
   occupies `size / 8` slots, and a whole element may be read, written or copied
   (`a[i] = b[j]`, `m[i]` as a `[i64; 3]` value).

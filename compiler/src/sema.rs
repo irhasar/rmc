@@ -563,7 +563,7 @@ fn resolve_ty_rec(
         Type::Array(elem, n) => {
             let e = resolve_ty_rec(elem, raw_s, raw_e, so, eo, visiting)?;
             if !e.is_array_elem() {
-                return Err(format!("array elements must be `i64`, `bool`, a unit enum, a struct or an array, not {e:?}"));
+                return Err(format!("array elements must be a scalar, `str`, a reference, a struct, a payload enum or an array, not {e:?}"));
             }
             Ok(Type::Array(Box::new(e), *n))
         }
@@ -603,7 +603,7 @@ fn resolve_in(
         Type::Array(elem, n) => {
             let e = resolve_in(elem, structs, enums)?;
             if !e.is_array_elem() {
-                return Err(format!("array elements must be `i64`, `bool`, a unit enum, a struct or an array, not {e:?}"));
+                return Err(format!("array elements must be a scalar, `str`, a reference, a struct, a payload enum or an array, not {e:?}"));
             }
             Ok(Type::Array(Box::new(e), *n))
         }
@@ -1347,7 +1347,7 @@ impl Sema {
         if let Expr::ArrayLit(val, n) = e {
             let t = self.check_expr(val, scope)?;
             if !t.is_array_elem() {
-                return Err(format!("array elements must be `i64`, `bool`, a unit enum, a struct or an array, found {t:?}"));
+                return Err(format!("array elements must be a scalar, `str`, a reference, a struct, a payload enum or an array, found {t:?}"));
             }
             return Ok(Type::Array(Box::new(t), *n));
         }
@@ -3445,7 +3445,7 @@ impl Sema {
                     self.check_expr(val, scope)?
                 };
                 if !t.is_array_elem() {
-                    return Err(format!("array elements must be `i64`, `bool`, a unit enum, a struct or an array, found {t:?}"));
+                    return Err(format!("array elements must be a scalar, `str`, a reference, a struct, a payload enum or an array, found {t:?}"));
                 }
                 let ty = Type::Array(Box::new(t), *n);
                 // Value position: `[v; n]` has no address of its own, so rewrite
@@ -3483,7 +3483,7 @@ impl Sema {
                 };
                 if !elem_ty.is_array_elem() {
                     return Err(format!(
-                        "array elements must be `i64`, `bool`, a unit enum, a struct or an array, found {elem_ty:?}"
+                        "array elements must be a scalar, `str`, a reference, a struct, a payload enum or an array, found {elem_ty:?}"
                     ));
                 }
                 for e in elems.iter_mut().skip(1) {

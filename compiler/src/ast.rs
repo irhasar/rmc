@@ -118,11 +118,12 @@ impl Type {
         )
     }
 
-    /// True for the types an array element may have now that nested aggregates
-    /// are supported: the integer-like scalars plus a nested array, a struct or
-    /// a payload enum. Every such type is a multiple of 8 bytes, so an element's
-    /// stride is `size() / 8` slots. A reference and `str` stay excluded (rustc
-    /// rejects a reference as an array element too).
+    /// True for the types an array element may have: the integer-like scalars
+    /// plus `str`, a reference, a nested array, a struct or a payload enum.
+    /// Every such type is a multiple of 8 bytes, so an element's stride is
+    /// `size() / 8` slots. `str` and a reference are one-word pointers, so
+    /// `[&str; n]` and `[&T; n]` are arrays of pointers, exactly as rustc lays
+    /// them out.
     pub fn is_array_elem(&self) -> bool {
         matches!(
             self,
@@ -136,6 +137,8 @@ impl Type {
                 | Type::Struct(..)
                 | Type::U8
                 | Type::I8
+                | Type::Str
+                | Type::Ref(..)
         )
     }
 
