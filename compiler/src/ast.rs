@@ -119,10 +119,10 @@ impl Type {
     }
 
     /// True for the types an array element may have now that nested aggregates
-    /// are supported: the integer-like scalars plus a nested array or a struct.
-    /// Every such type is a multiple of 8 bytes, so an element's stride is
-    /// `size() / 8` slots. A payload enum, a reference and `str` stay excluded
-    /// (rustc rejects a payload enum and a reference as array elements too).
+    /// are supported: the integer-like scalars plus a nested array, a struct or
+    /// a payload enum. Every such type is a multiple of 8 bytes, so an element's
+    /// stride is `size() / 8` slots. A reference and `str` stay excluded (rustc
+    /// rejects a reference as an array element too).
     pub fn is_array_elem(&self) -> bool {
         matches!(
             self,
@@ -131,6 +131,7 @@ impl Type {
                 | Type::Bool
                 | Type::Char
                 | Type::Enum(_)
+                | Type::EnumData(..)
                 | Type::Array(..)
                 | Type::Struct(..)
                 | Type::U8
