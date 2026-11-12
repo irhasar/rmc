@@ -193,8 +193,17 @@ pub fn const_i64(e: &Expr) -> Option<i64> {
         // `usize` and the other integer widths are transparent aliases for
         // `i64`, so `i as usize` (the usual spelling of an index) is an
         // identity cast that must not hide a constant index from the bound
-        // check.
+        // check. A *narrowing* cast (a suffixed literal `200u8`, or `300 as u8`)
+        // folds to the width's value, exactly as sema emits it.
         Expr::Cast(inner, ty) if *ty == Type::I64 => const_i64(inner),
+        Expr::Cast(inner, Type::Int { signed, bits }) => {
+            let v = const_i64(inner)?;
+            if *bits >= 64 {
+                Some(v)
+            } else {
+                Some(wrap_int(v, *signed, *bits))
+            }
+        }
         // Fold the integer operators too, so a constant index written as an
         // expression (`a[1 + 4]`) is bounds-checked exactly like a literal.
         Expr::Bin(op, a, b) => {

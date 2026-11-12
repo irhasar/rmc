@@ -427,7 +427,7 @@ impl Parser {
                 }
                 let neg = self.eat(&Tok::Minus);
                 match self.peek().cloned() {
-                    Some(Tok::Int(n)) => {
+                    Some(Tok::Int(n)) | Some(Tok::IntSuffixed(n, _)) => {
                         self.bump();
                         discr = Some(if neg {
                             n.checked_neg().ok_or_else(|| {
@@ -2425,6 +2425,7 @@ impl Parser {
         matches!(
             self.peek(),
             Some(Tok::Int(_))
+                | Some(Tok::IntSuffixed(..))
                 | Some(Tok::Str(_))
                 | Some(Tok::Ident(_))
                 | Some(Tok::True)
@@ -2728,7 +2729,14 @@ impl Parser {
                             };
                             Expr::Call {
                                 name: fill.into(),
-                                args: vec![addr, n_expr, args[0].clone()],
+                                // The fill helpers write a whole word, so a
+                                // narrow element (`vec![7u8; n]`) is widened to
+                                // `i64`; the identity cast folds away.
+                                args: vec![
+                                    addr,
+                                    n_expr,
+                                    Expr::Cast(Box::new(args[0].clone()), Type::I64),
+                                ],
                                 arg_slots: Vec::new(),
                                 ret_slot: -1,
                                 ret_ty: Type::I64,
@@ -3801,6 +3809,16 @@ impl Parser {
                     self.i += 1;
                     return Ok(Expr::Int(i64::MIN));
                 }
+                // `-128i8` is the literal `-128`: fold the sign into the
+                // suffixed magnitude before narrowing, so the width check sees
+                // 128 (in range) rather than the cast's wrapped -128 (whose
+                // negation back to 128 is out of range). `-1u8` negates an
+                // unsigned literal, which the check below rejects.
+                if let Some(Tok::IntSuffixed(v, s)) = self.peek().cloned() {
+                    let pos = self.pos();
+                    self.i += 1;
+                    return suffixed_int_lit(v, &s, true, pos);
+                }
                 let e = self.parse_unary()?;
                 Ok(Expr::Un(UnOp::Neg, Box::new(e)))
             }
@@ -4008,6 +4026,11 @@ impl Parser {
                 format!("at byte {}: pattern literal out of range", self.pos())
             })?),
             Tok::Int(v) => Ok(v),
+            // A suffixed pattern literal (`200u8`) is typed at its width, so a
+            // `match x { 200u8 => .. }` on a `u8` compares against `200` and a
+            // magnitude that does not fit is an error, exactly as the
+            // expression `200u8` is.
+            Tok::IntSuffixed(v, s) => suffixed_int_value(v, &s, neg, self.pos()),
             Tok::IntMinMagnitude if neg => Ok(i64::MIN),
             Tok::IntMinMagnitude => Err(format!(
                 "at byte {}: integer literal `9223372036854775808` is out of range for `i64`",
@@ -4047,7 +4070,7 @@ impl Parser {
                 self.i += 1;
                 Ok(Pat::Wild)
             }
-            Some(Tok::Minus) | Some(Tok::Int(_)) => {
+            Some(Tok::Minus) | Some(Tok::Int(_)) | Some(Tok::IntSuffixed(..)) => {
                 let lo = self.parse_signed_pat_int()?;
                 self.maybe_range(lo)
             }
@@ -5686,6 +5709,14 @@ impl Parser {
                 self.i += 1;
                 Ok(Expr::Int(v))
             }
+            // A suffixed literal (`200u8`) names its width: the value is
+            // kept in it for later arithmetic, and a magnitude that does not
+            // fit is an error, exactly as rustc reports.
+            Some(Tok::IntSuffixed(v, s)) => {
+                let pos = self.pos();
+                self.i += 1;
+                suffixed_int_lit(v, &s, false, pos)
+            }
             Some(Tok::Char(c)) => {
                 self.i += 1;
                 Ok(Expr::Char(c))
@@ -6242,6 +6273,7 @@ fn builtin_aliases() -> std::collections::HashMap<String, Type> {
         ("usize", Type::I64),
         ("isize", Type::I64),
         ("u64", Type::I64),
+        ("i64", Type::I64),
         ("u8", Type::Int { signed: false, bits: 8 }),
         ("u16", Type::Int { signed: false, bits: 16 }),
         ("u32", Type::Int { signed: false, bits: 32 }),
@@ -6254,4 +6286,94 @@ fn builtin_aliases() -> std::collections::HashMap<String, Type> {
         m.insert(name.to_string(), ty);
     }
     m
+}
+
+/// Build the expression for an integer literal carrying a width suffix
+/// (`200u8`, `-128i8`). The value is folded to the width the way rustc does:
+/// the magnitude must fit, an unsigned suffix cannot be negated, and a fitting
+/// value is kept in-range (a negative signed value is the negated magnitude).
+/// A suffix naming the native width (`5i64`) is a plain `i64` with the same
+/// range check. `neg` is true when the literal is the operand of a `-`.
+fn suffixed_int_lit(v: i64, s: &str, neg: bool, pos: u32) -> PResult<Expr> {
+    let (ty, value) = suffixed_int_typed(v, s, neg, pos)?;
+    // A literal keeps its width so arithmetic on it overflows at that width
+    // (`200u8 + 100` is an overflow, as rustc reports). The cast is folded to
+    // the in-range value by sema; a native-width suffix is a plain `i64`.
+    match ty {
+        Type::I64 => Ok(Expr::Int(value)),
+        ty => Ok(Expr::Cast(Box::new(Expr::Int(value)), ty)),
+    }
+}
+
+/// The in-range value of a suffixed integer literal and the width it names,
+/// shared by an expression literal and a pattern literal.
+fn suffixed_int_typed(v: i64, s: &str, neg: bool, pos: u32) -> PResult<(Type, i64)> {
+    let ty = match suffix_int_ty(s) {
+        Some(ty) => ty,
+        None => {
+            return Err(format!("at byte {pos}: invalid integer-literal suffix `{s}`"));
+        }
+    };
+    let (signed, bits) = match ty {
+        Type::I64 => (true, 64u16),
+        Type::Int { signed, bits } => (signed, bits),
+        _ => (true, 64),
+    };
+    if neg && !signed {
+        return Err(format!(
+            "at byte {pos}: cannot apply unary `-` to an unsigned integer `{s}`"
+        ));
+    }
+    // A negative signed literal is the negated magnitude; the magnitude must be
+    // at most `|MIN|`, which is `MAX + 1`.
+    let mag_limit: i128 = if neg && signed {
+        if bits >= 128 {
+            i128::MAX
+        } else {
+            1i128 << (bits - 1)
+        }
+    } else if signed {
+        if bits >= 128 {
+            i128::MAX
+        } else {
+            (1i128 << (bits - 1)) - 1
+        }
+    } else if bits >= 128 {
+        i128::MAX
+    } else {
+        (1i128 << bits) - 1
+    };
+    if (v as i128) > mag_limit {
+        return Err(format!(
+            "at byte {pos}: literal out of range for `{}`",
+            int_width_name(signed, bits)
+        ));
+    }
+    let value = if neg { -(v as i128) } else { v as i128 };
+    Ok((ty, value as i64))
+}
+
+/// The in-range value of a suffixed integer literal, for a pattern position
+/// (which does not carry the width onward).
+fn suffixed_int_value(v: i64, s: &str, neg: bool, pos: u32) -> PResult<i64> {
+    suffixed_int_typed(v, s, neg, pos).map(|(_, value)| value)
+}
+
+/// The Rust name of an integer width, for an out-of-range diagnostic.
+fn int_width_name(signed: bool, bits: u16) -> String {
+    if bits == 64 && signed {
+        "i64".into()
+    } else if bits == 64 {
+        "u64".into()
+    } else {
+        format!("{}{bits}", if signed { "i" } else { "u" })
+    }
+}
+
+/// The type an integer-literal suffix names (`200u8` -> `u8`). A width that
+/// names the native 64-bit integer (`i64`/`u64`/`isize`/`usize`) resolves to
+/// `Type::I64`; a narrower or wider one to its `Type::Int`. `None` for a
+/// non-suffix, which the lexer already rejects before this is reached.
+fn suffix_int_ty(s: &str) -> Option<Type> {
+    builtin_aliases().remove(s)
 }

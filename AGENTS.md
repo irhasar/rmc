@@ -82,7 +82,14 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   `b".."` is not a
   literal it recognises, so it is rejected downstream. `lex_byte_lit` reads the
   first content byte with `get`, so an input ending in `b'` is an
-  unterminated-literal error rather than an out-of-bounds panic.
+  unterminated-literal error rather than an out-of-bounds panic. An integer
+  literal's width suffix (`200u8`, `1i64`, `0xffu32`) is kept on the token
+  (`Tok::IntSuffixed`); the parser types the value at that width and keeps it in
+  the width for later arithmetic (`200u8 + 100` overflows, as rustc reports),
+  and rejects a magnitude that does not fit (`300u8` is an error). A suffix
+  naming the native width (`5i64`) is a plain `i64`. A negated suffixed literal
+  (`-128i8`) folds the sign into the magnitude before the range check, so `128`
+  is checked rather than the cast's wrapped `-128`.
 - `compiler/src/parser.rs` — recursive descent; `is_block_like` allows
   `if`/blocks as statements without a trailing `;`. `parse_cond` sets
   `no_struct_lit` so a `{` after a condition starts the body, not a struct.
