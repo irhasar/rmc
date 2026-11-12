@@ -7690,3 +7690,21 @@ fn matches_macro_lowers_to_a_match() {
         &CompileOptions::default()
     ).is_ok());
 }
+
+#[test]
+fn a_reversed_range_for_loop_compiles() {
+    // `for i in (lo..hi).rev()` and the inclusive form both compile, and the
+    // shape is only recognised with the parentheses Rust requires.
+    assert!(compile_to_asm(
+        "fn main() { for i in (0..5).rev() { let _ = i; } }",
+        &CompileOptions::default()
+    ).is_ok());
+    assert!(compile_to_asm(
+        "fn main() { for i in (0..=5).rev() { let _ = i; } }",
+        &CompileOptions::default()
+    ).is_ok());
+    assert!(compile_to_asm(
+        "fn main() { for _ in (0..5).rev() { } }",
+        &CompileOptions::default()
+    ).is_ok());
+}

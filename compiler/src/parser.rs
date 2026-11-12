@@ -2282,6 +2282,126 @@ impl Parser {
     /// effect (a call, a literal) runs exactly once, and `arr.len()` folds to
     /// the array's compile-time length, so the loop bound is a literal and the
     /// loop carries no hidden slot.
+    ///
+    /// Whether the tokens at the cursor are `( <..> .. <..> ) . rev ( )`, the
+    /// head of a `for i in (lo..hi).rev()`. A non-nested token scan: the first
+    /// `)` at depth zero ends the parenthesised range, and only a `..`/`..=`
+    /// directly inside it (no parentheses of its own) counts, so `(f(..))`,
+    /// `((a..b))` and `(a..b).sum()` are all rejected.
+    fn at_parenthesized_range_rev(&self) -> bool {
+        if self.peek() != Some(&Tok::LParen) {
+            return false;
+        }
+        let mut j = self.i + 1;
+        let mut depth = 1u32;
+        let mut saw_dots = false;
+        while let Some(t) = self.toks.get(j).map(|t| &t.tok) {
+            match t {
+                Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+                Tok::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                Tok::RBracket | Tok::RBrace => {
+                    if depth == 1 {
+                        return false;
+                    }
+                    depth -= 1;
+                }
+                Tok::DotDot | Tok::DotDotEq if depth == 1 => saw_dots = true,
+                _ => {}
+            }
+            j += 1;
+        }
+        if !saw_dots || self.toks.get(j).map(|t| &t.tok) != Some(&Tok::RParen) {
+            return false;
+        }
+        j += 1;
+        matches!(self.toks.get(j).map(|t| &t.tok), Some(Tok::Dot))
+            && matches!(self.toks.get(j + 1).map(|t| &t.tok), Some(Tok::Ident(n)) if n == "rev")
+            && matches!(self.toks.get(j + 2).map(|t| &t.tok), Some(Tok::LParen))
+            && matches!(self.toks.get(j + 3).map(|t| &t.tok), Some(Tok::RParen))
+    }
+
+    /// `for PAT in (lo..hi).rev() { body }` (or `lo..=hi`), with the head
+    /// already consumed. Iterating a range downward is `while`-shaped, so a
+    /// `while` cannot be used directly: `continue` in a `while` skips the
+    /// decrement and loops forever. Instead the counter runs *upward* — the
+    /// loop variable is a fresh local computed as `hi - i` (or `hi - i - 1`
+    /// for the exclusive form) — so the counter's own increment is the
+    /// decrement, `continue` reaches it like any other `for`, and the `For`
+    /// codegen is reused unchanged. The upward count is bounded by
+    /// `hi - lo` iterations, so it cannot wrap.
+    fn desugar_for_range_rev(
+        &mut self,
+        pat: Pat,
+        lo: Expr,
+        hi: Expr,
+        inclusive: bool,
+        body: Block,
+        label: Option<String>,
+    ) -> PResult<Stmt> {
+        let var = match pat {
+            Pat::Bind(n) => n,
+            Pat::Wild => {
+                let n = format!("\u{0}fi{}", self.tmp);
+                self.tmp += 1;
+                n
+            }
+            _ => {
+                return Err(format!(
+                    "at byte {}: `for` over a range needs a binding or `_`",
+                    self.pos()
+                ))
+            }
+        };
+        let lo_name = format!("\u{0}rl{}", self.tmp);
+        let hi_name = format!("\u{0}rh{}", self.tmp);
+        let i_name = format!("\u{0}rc{}", self.tmp);
+        self.tmp += 1;
+        let vlo = |n: &str| Expr::Var { name: n.to_string(), slot: -1, ty: Type::I64 };
+        // `let var = hi - i [- 1];`, the downward value from the upward counter.
+        let mut value = Expr::Bin(BinOp::Sub, Box::new(vlo(&hi_name)), Box::new(vlo(&i_name)));
+        if !inclusive {
+            value = Expr::Bin(BinOp::Sub, Box::new(value), Box::new(Expr::Int(1)));
+        }
+        let mut stmts = vec![
+            Stmt::Let { name: var, ty: None, init: Some(value), slot: -1, mutable: false },
+        ];
+        stmts.extend(body.stmts);
+        let body = Block { stmts, tail: body.tail };
+        let count = {
+            let span = Expr::Bin(BinOp::Sub, Box::new(vlo(&hi_name)), Box::new(vlo(&lo_name)));
+            // `lo..=hi` covers one more value than `lo..hi`, so the upward
+            // counter runs one step further.
+            if inclusive {
+                Expr::Bin(BinOp::Add, Box::new(span), Box::new(Expr::Int(1)))
+            } else {
+                span
+            }
+        };
+        let for_stmt = Stmt::For {
+            var: i_name,
+            var_slot: -1,
+            start: Expr::Int(0),
+            end: count,
+            end_slot: -1,
+            inclusive: false,
+            body,
+            label,
+        };
+        Ok(Stmt::Expr(Expr::Block(Block {
+            stmts: vec![
+                Stmt::Let { name: lo_name, ty: None, init: Some(lo), slot: -1, mutable: false },
+                Stmt::Let { name: hi_name, ty: None, init: Some(hi), slot: -1, mutable: false },
+                for_stmt,
+            ],
+            tail: None,
+        })))
+    }
+
     fn parse_for_labeled(&mut self, label: Option<String>) -> PResult<Stmt> {
         // A loop variable that names a constant shadows it (rustc E0530).
         // `parse_pattern` would otherwise read the name as that constant's
@@ -2298,6 +2418,26 @@ impl Parser {
         }
         let pat = self.parse_pattern()?;
         self.expect(Tok::In)?;
+        // `for i in (lo..hi).rev() { .. }`: iterate a range downward. The
+        // parentheses are required in Rust (`lo..hi.rev()` would read the
+        // method call on `hi`), and `(lo..hi)` is not an rmc expression, so
+        // the whole shape is recognised before the head is parsed.
+        if self.at_parenthesized_range_rev() {
+            self.expect(Tok::LParen)?;
+            let lo = self.parse_cond()?;
+            let inclusive = self.eat(&Tok::DotDotEq);
+            if !inclusive {
+                self.expect(Tok::DotDot)?;
+            }
+            let hi = self.parse_cond()?;
+            self.expect(Tok::RParen)?;
+            self.expect(Tok::Dot)?;
+            self.expect_ident()?; // `rev`
+            self.expect(Tok::LParen)?;
+            self.expect(Tok::RParen)?;
+            let body = self.parse_block()?;
+            return self.desugar_for_range_rev(pat, lo, hi, inclusive, body, label);
+        }
         let head = self.parse_cond()?;
         // `for v in &args` (and `for v in args`) over an `args()`-vector binding
         // desugars to a range over the argument count; the element is read from

@@ -448,6 +448,8 @@ while cond { ... }
 while let PAT = expr { ... }  // re-tests expr each iteration; stops on no match
 for i in 0..10 { ... }   // i64 range, end exclusive
 for i in 0..=10 { ... }  // i64 range, end inclusive
+for i in (0..10).rev() { ... }  // i64 range, end exclusive, downward
+for i in (0..=10).rev() { ... } // i64 range, end inclusive, downward
 for x in arr { ... }     // array, by value, left to right (x is the element)
 loop { ... }
 loop { ... break v; }    // `loop` is an expression: `break v` yields `v`
@@ -513,7 +515,11 @@ iteration. The loop variable may be a binding, `_`, a struct pattern
 (`for S { f, .. } in arr`), an array pattern (`for [x, y] in pairs`), or an
 at-binding (`for n @ _ in arr`, `for i @ j in 0..3`), which binds
 each element's fields or elements fresh each iteration; any other pattern is
-refutable and rejected. `for x in &arr`
+refutable and rejected. A range may be iterated downward with `.rev()`, written
+`for i in (lo..hi).rev()` or `(lo..=hi).rev()`: `lo` and `hi` are evaluated
+once each, the loop yields `hi - 1` down to `lo` (or `hi` down to `lo`
+inclusive), and `continue` still runs the decrement. The parentheses are
+required, as in Rust. `for x in &arr`
 (which Rust iterates by reference) is rejected rather than mistyped. `while let` is
 `loop { if let PAT = expr { body } else { break; } }`: the scrutinee is
 re-evaluated every iteration, and `continue` re-tests it rather than jumping to

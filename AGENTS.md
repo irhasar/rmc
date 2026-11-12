@@ -2199,19 +2199,27 @@ The README's roadmap lists the intended next steps.
 
 ## Pushing
 
-`git push origin <branch>` works with the `GITHUB_TOKEN` in this environment.
-An earlier note here claimed the token was read-only (`403 Resource not
-accessible by integration` on `receive-pack`); that is no longer true — pushes
-to `rmc-1-core` through `rmc-4-patterns` succeed. If a push is ever refused,
-check `git ls-remote` first before concluding the token lacks `contents: write`,
-and never persist a token in `.git/config` or a file.
+The token must never be persisted in `.git/config` or a file, so `origin` is a
+plain token-free URL (`https://github.com/irhasar/rmc.git`) and there is no
+credential helper. A bare `git push origin <branch>` therefore prompts for a
+username and hangs — do not run it. Push with the token supplied inline, taken
+from the environment, so it never lands on disk:
+
+```
+git push "https://x-access-token:${GITHUB_TOKEN}@github.com/irhasar/rmc.git" <branch>
+```
+
+A read (`git ls-remote <same-url>`) confirms the remote state; if a push is ever
+refused, check `git ls-remote` before concluding the token lacks
+`contents: write`. The inline URL leaves the tracking ref stale, so refresh it
+with `git fetch "<url>" <branch>:refs/remotes/origin/<branch>` afterwards.
 
 **Always push at the end of every session.** The user asked for this
-explicitly: after committing, run `git push origin <current-branch>` so the
-remote branch is never behind the local one. Verify with
-`git rev-parse HEAD` vs `git rev-parse origin/<branch>` (they must match) before
-reporting done. Do not open a PR unless asked — the push is the expected end
-state. When a command line or URL would otherwise echo the token, pipe through
+explicitly: after committing, push the current branch so the remote branch is
+never behind the local one. Verify with `git rev-parse HEAD` vs
+`git rev-parse origin/<branch>` (they must match) before reporting done. Do not
+open a PR unless asked — the push is the expected end state. When a command line
+or URL would otherwise echo the token, pipe through
 `sed 's/ghp_[A-Za-z0-9]*/<token-hidden>/g'` so it never lands in the log.
 
 ## PR branch stack
