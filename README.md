@@ -625,7 +625,11 @@ of value per unit of effort:
    `&mut` is exclusive, so an aliasing bug is a wrong answer, not a compile
    error.
 3. **More types.** `u*`/`i*` widths and `f64`, which together cover most of what
-   small programs actually need. (`match` on integers is done.)
+   small programs actually need. (`match` on integers is done.) **Slices**
+   (`&[T]`, and the slice literals and sub-slicing `&a[lo..hi]` that build them)
+   are the other large gap: a slice is a *fat* pointer (a data pointer plus a
+   length), so it needs a two-word value kind threaded through parameters,
+   returns and indexing, unlike the one-word `&T` and `str` rmc has today.
 4. **More backends.** A second target (ARM64 or a simple VM) would force the
    code generator's assumptions out into the open.
 5. **Debug info.** Line tables so a debugger can point at source.

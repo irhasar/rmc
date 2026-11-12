@@ -26,6 +26,7 @@ enum NameScope {
     ConstInt(String, Option<i64>),
     ConstBool(String, Option<bool>),
     ConstChar(String, Option<u32>),
+    ConstNarrow(String, Option<Type>),
 }
 
 /// A `const` (or immutable `static`) declared inside a block. It is folded by
@@ -68,6 +69,10 @@ pub struct Parser {
     /// Constant `char` items by name, so a `const C: char` used as a `match`
     /// pattern becomes the character pattern.
     const_chars: std::collections::HashMap<String, u32>,
+    /// The declared width of each narrow integer constant (`const N: u8`), so a
+    /// use is substituted as a value of that width rather than as an `i64`. The
+    /// value itself lives in `consts`; this only records the width.
+    const_narrow: std::collections::HashMap<String, Type>,
     /// Struct field names by struct name, collected before parsing so a struct
     /// pattern (`S { f, .. }`) can be checked at parse time. A struct pattern
     /// has no runtime test, so the parser rewrites it into field reads; that
@@ -181,6 +186,10 @@ pub struct Parser {
     /// when the block ends, and an outer binding it shadowed is restored, so a
     /// name's recorded stride and shape are lexically scoped.
     name_scopes: Vec<Vec<NameScope>>,
+    /// True while parsing the injected `Option`/`Result` prelude, so that
+    /// prelude's own `parse_program` does not inject it again (which would
+    /// recurse forever).
+    in_prelude: bool,
 }
 
 /// The deepest expression, block or type nesting the parser accepts. Deeply
@@ -194,6 +203,66 @@ pub struct Parser {
 /// is roughly 800 KiB, which leaves room, and is far above any hand-written
 /// program.
 const MAX_DEPTH: u32 = 100;
+
+/// The `Option`/`Result` prelude, injected into every program (see
+/// `parse_program`). It is written in the language rmc already compiles — a
+/// payload enum plus `impl` methods — so the parser, sema and codegen need no
+/// special case for it. `Option<T>`/`Result<T, E>` type arguments and the
+/// `Some`/`None`/`Ok`/`Err` constructors are sugar the parser rewrites to these
+/// names (rmc is monomorphic in `i64`, so the type parameters carry no meaning).
+/// `unwrap`/`expect` panic with exit 101 on the failing variant, matching
+/// rustc's panic code. Unused methods are removed by the dead-function pass, so
+/// a program that never names them pays nothing.
+const OPTION_RESULT_PRELUDE: &str = r#"
+enum Option { None, Some(i64) }
+enum Result { Ok(i64), Err(i64) }
+impl Option {
+    fn unwrap(self) -> i64 {
+        match self { Option::Some(v) => v, Option::None => exit(101) }
+    }
+    fn expect(self, _m: str) -> i64 {
+        match self { Option::Some(v) => v, Option::None => exit(101) }
+    }
+    fn unwrap_or(self, d: i64) -> i64 {
+        match self { Option::Some(v) => v, Option::None => d }
+    }
+    fn is_some(&self) -> bool {
+        match self { Option::Some(_) => true, Option::None => false }
+    }
+    fn is_none(&self) -> bool {
+        match self { Option::Some(_) => false, Option::None => true }
+    }
+    fn or(self, other: Option) -> Option {
+        match self { Option::Some(v) => Option::Some(v), Option::None => other }
+    }
+    fn ok_or(self, e: i64) -> Result {
+        match self { Option::Some(v) => Result::Ok(v), Option::None => Result::Err(e) }
+    }
+}
+impl Result {
+    fn unwrap(self) -> i64 {
+        match self { Result::Ok(v) => v, Result::Err(_) => exit(101) }
+    }
+    fn expect(self, _m: str) -> i64 {
+        match self { Result::Ok(v) => v, Result::Err(_) => exit(101) }
+    }
+    fn unwrap_or(self, d: i64) -> i64 {
+        match self { Result::Ok(v) => v, Result::Err(_) => d }
+    }
+    fn is_ok(&self) -> bool {
+        match self { Result::Ok(_) => true, Result::Err(_) => false }
+    }
+    fn is_err(&self) -> bool {
+        match self { Result::Ok(_) => false, Result::Err(_) => true }
+    }
+    fn ok(self) -> Option {
+        match self { Result::Ok(v) => Option::Some(v), Result::Err(_) => Option::None }
+    }
+    fn err(self) -> Option {
+        match self { Result::Ok(_) => Option::None, Result::Err(e) => Option::Some(e) }
+    }
+}
+"#;
 
 /// Expressions that are allowed as statements without a trailing `;`.
 fn is_block_like(e: &Expr) -> bool {
@@ -214,6 +283,7 @@ impl Parser {
             consts: std::collections::HashMap::new(),
             const_bools: std::collections::HashMap::new(),
             const_chars: std::collections::HashMap::new(),
+            const_narrow: std::collections::HashMap::new(),
             struct_fields: std::collections::HashMap::new(),
             tuple_structs: std::collections::HashSet::new(),
             tuple_defs: Vec::new(),
@@ -240,6 +310,7 @@ impl Parser {
             vec_elem_pending: None,
             alias_target: std::collections::HashMap::new(),
             name_scopes: Vec::new(),
+            in_prelude: false,
         }
     }
 
@@ -389,6 +460,36 @@ impl Parser {
         // Nested functions are hoisted to the top level, so the flat list sema
         // and codegen walk holds them like any other function.
         fns.append(&mut self.nested_fns);
+        // Inject the `Option`/`Result` prelude unless the user defined those
+        // names. It is ordinary user-level code (a payload enum plus `impl`
+        // methods), so no later pass needs to know it exists; the dead-function
+        // pass drops whatever the program does not call, so an unused prelude
+        // costs nothing in the artifact. The prelude is parsed by a parser with
+        // `in_prelude` set, so it does not inject itself (which would recurse).
+        if !self.in_prelude {
+            // A user type named `Option` or `Result` shadows the prelude's, so
+            // the whole prelude is dropped: its `Option` and `Result` methods
+            // reference each other's variants (`Result::ok` builds
+            // `Option::Some`), so injecting half of it would not type-check.
+            let user_owns = enums
+                .iter()
+                .map(|e| e.name.as_str())
+                .chain(structs.iter().map(|s| s.name.as_str()))
+                .any(|n| n == "Option" || n == "Result");
+            if !user_owns {
+                let mut inner = Parser::new(crate::lexer::lex(OPTION_RESULT_PRELUDE)?);
+                inner.in_prelude = true;
+                let pre = inner.parse_program()?;
+                for e in pre.enums {
+                    enums.push(e);
+                }
+                for f in pre.fns {
+                    if !fns.iter().any(|u| u.name == f.name) {
+                        fns.push(f);
+                    }
+                }
+            }
+        }
         Ok(Program { structs, enums, consts, fns })
     }
 
@@ -614,7 +715,7 @@ impl Parser {
             }
         }
         self.i = saved;
-        self.resolve_consts(&items);
+        self.resolve_consts(&items)?;
         // Parse each alias target now that the constants are known. Two passes
         // let `type A = B; type B = i64;` resolve: the first lays down every
         // direct target, the second fills any left as a bare `Named` (a target
@@ -663,7 +764,7 @@ impl Parser {
                 value: d.value.clone(),
             })
             .collect();
-        self.resolve_consts(&expanded_items);
+        self.resolve_consts(&expanded_items)?;
         // A `type` shares the type namespace with a struct and an enum, so a
         // collision is an error (rustc's E0428). It does *not* collide with a
         // `const` or a `fn`, which live in the value namespace. rmc keeps a
@@ -963,15 +1064,19 @@ impl Parser {
     /// fixpoint so a constant may name one declared later. Runs after the whole
     /// program is parsed, so a forward reference resolves here even though it
     /// did not while the use site was parsed.
-    fn resolve_consts(&mut self, defs: &[ConstDef]) {
+    fn resolve_consts(&mut self, defs: &[ConstDef]) -> PResult<()> {
         let items: Vec<(String, Type, Expr)> = defs
             .iter()
             .map(|d| (d.name.clone(), d.ty.clone(), d.value.clone()))
             .collect();
-        for (name, val) in crate::consts::resolve(&items) {
+        for (name, val) in crate::consts::resolve(&items)? {
             match val {
                 crate::consts::ConstVal::Int(v) => {
                     self.consts.insert(name, v);
+                }
+                crate::consts::ConstVal::NarrowInt(v, ty) => {
+                    self.consts.insert(name.clone(), v);
+                    self.const_narrow.insert(name, ty);
                 }
                 crate::consts::ConstVal::Bool(v) => {
                     self.const_bools.insert(name, v);
@@ -980,6 +1085,18 @@ impl Parser {
                     self.const_chars.insert(name, v);
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// The expression a constant use is substituted with: a plain `i64`
+    /// literal, or a suffixed literal at the constant's declared width (folded
+    /// to `Expr::Cast(Int, width)`) so arithmetic on it keeps that width. `v` is
+    /// the constant's in-width value.
+    fn const_value_expr(&self, name: &str, v: i64) -> Expr {
+        match self.const_narrow.get(name) {
+            Some(ty) => Expr::Cast(Box::new(Expr::Int(v)), ty.clone()),
+            None => Expr::Int(v),
         }
     }
 
@@ -1417,9 +1534,32 @@ impl Parser {
                 // anywhere but that one `let` fails when it reaches sema (the
                 // name resolves to no struct).
                 if self.peek() == Some(&Tok::Lt) {
+                    // `Option<T>` / `Result<T, E>`: the prelude enums. rmc is
+                    // monomorphic in `i64`, so the type arguments carry no
+                    // meaning; skip the `<..>` and return the bare name, which
+                    // resolves to the injected enum.
+                    if name == "Option" || name == "Result" {
+                        self.i += 1; // `<`
+                        let mut depth = 1i32;
+                        while depth > 0 {
+                            match self.peek() {
+                                None => {
+                                    return Err(format!(
+                                        "at byte {}: unexpected end of input in `{name}<..>`",
+                                        self.pos()
+                                    ))
+                                }
+                                Some(Tok::Lt) => depth += 1,
+                                Some(Tok::Gt) => depth -= 1,
+                                _ => {}
+                            }
+                            self.i += 1;
+                        }
+                        return Ok(Type::Named(name));
+                    }
                     if name != "Vec" {
                         return Err(format!(
-                            "at byte {}: unsupported generic type `{name}` (only `Vec<T>` is accepted)",
+                            "at byte {}: unsupported generic type `{name}` (only `Vec<T>`, `Option<T>` and `Result<T, E>` are accepted)",
                             self.pos()
                         ));
                     }
@@ -1612,8 +1752,13 @@ impl Parser {
                 Ok((d.name.clone(), ty, d.value.clone()))
             })
             .collect::<PResult<Vec<_>>>()?;
-        let resolved =
-            crate::consts::resolve_with(&items, &self.consts, &self.const_bools, &self.const_chars);
+        let resolved = crate::consts::resolve_with(
+            &items,
+            &self.consts,
+            &self.const_bools,
+            &self.const_chars,
+        )
+        .map_err(|e| format!("at byte {}: {e}", self.toks[self.i].pos))?;
         // Every item must fold, including an unused one. `resolve_with` leaves
         // out an item whose initializer is not a constant expression (a call, a
         // cycle, a reference to an unresolved name), which at the top level
@@ -1633,7 +1778,7 @@ impl Parser {
         }
         let mut frame: Vec<LocalConst> = Vec::new();
         for (_, start, end, def) in &raw {
-            self.enter_local_const(&def.name, resolved.get(&def.name).copied());
+            self.enter_local_const(&def.name, resolved.get(&def.name).cloned());
             // `start` is the `const`/`static` keyword (past any `pub`), so the
             // main parse, which drops a `pub` before it, matches on the same
             // index.
@@ -1740,6 +1885,7 @@ impl Parser {
             frame.push(NameScope::ConstInt(name.to_string(), self.consts.get(name).copied()));
             frame.push(NameScope::ConstBool(name.to_string(), self.const_bools.get(name).copied()));
             frame.push(NameScope::ConstChar(name.to_string(), self.const_chars.get(name).copied()));
+            frame.push(NameScope::ConstNarrow(name.to_string(), self.const_narrow.get(name).cloned()));
         }
         // A `const` that does not fold (a call, a cycle) is left out, so a use
         // is diagnosed the way an unresolved constant is; drop any outer value
@@ -1747,9 +1893,14 @@ impl Parser {
         self.consts.remove(name);
         self.const_bools.remove(name);
         self.const_chars.remove(name);
+        self.const_narrow.remove(name);
         match val {
             Some(ConstVal::Int(v)) => {
                 self.consts.insert(name.to_string(), v);
+            }
+            Some(ConstVal::NarrowInt(v, ty)) => {
+                self.consts.insert(name.to_string(), v);
+                self.const_narrow.insert(name.to_string(), ty);
             }
             Some(ConstVal::Bool(v)) => {
                 self.const_bools.insert(name.to_string(), v);
@@ -1872,6 +2023,14 @@ impl Parser {
                         }
                         None => {
                             self.const_chars.remove(&n);
+                        }
+                    },
+                    NameScope::ConstNarrow(n, prev) => match prev {
+                        Some(v) => {
+                            self.const_narrow.insert(n, v);
+                        }
+                        None => {
+                            self.const_narrow.remove(&n);
                         }
                     },
                 }
@@ -2123,6 +2282,350 @@ impl Parser {
     /// effect (a call, a literal) runs exactly once, and `arr.len()` folds to
     /// the array's compile-time length, so the loop bound is a literal and the
     /// loop carries no hidden slot.
+    ///
+    /// The tokens at the cursor are `( <..> .. <..> )` followed by one or more
+    /// adapters: the head of a `for i in (lo..hi).rev()` / `.step_by(k)` /
+    /// `.skip(k)` / `.take(k)`, possibly chained (`.skip(3).take(4)`). A
+    /// non-nested token scan: the first `)` at depth zero ends the parenthesised
+    /// range, and only a `..`/`..=` directly inside it (no parentheses of its
+    /// own) counts, so `(f(..))`, `((a..b))` and `(a..b).sum()` are all
+    /// rejected. Returns the adapters in source order, or `None` when the shape
+    /// does not match.
+    fn at_parenthesized_range_adapter(&self) -> Option<Vec<String>> {
+        if self.peek() != Some(&Tok::LParen) {
+            return None;
+        }
+        let mut j = self.i + 1;
+        let mut depth = 1u32;
+        let mut saw_dots = false;
+        while let Some(t) = self.toks.get(j).map(|t| &t.tok) {
+            match t {
+                Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+                Tok::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                Tok::RBracket | Tok::RBrace => {
+                    if depth == 1 {
+                        return None;
+                    }
+                    depth -= 1;
+                }
+                Tok::DotDot | Tok::DotDotEq if depth == 1 => saw_dots = true,
+                _ => {}
+            }
+            j += 1;
+        }
+        if !saw_dots || self.toks.get(j).map(|t| &t.tok) != Some(&Tok::RParen) {
+            return None;
+        }
+        j += 1;
+        let mut adapters = Vec::new();
+        loop {
+            if self.toks.get(j).map(|t| &t.tok) != Some(&Tok::Dot) {
+                break;
+            }
+            let name = match self.toks.get(j + 1).map(|t| &t.tok) {
+                Some(Tok::Ident(n)) => n.clone(),
+                _ => break,
+            };
+            let argc = match name.as_str() {
+                "rev" => 0,
+                "step_by" | "skip" | "take" => 1,
+                // A method rmc does not desugar ends the chain; the head then
+                // parses as an ordinary expression and reports its own error.
+                _ => break,
+            };
+            if self.toks.get(j + 2).map(|t| &t.tok) != Some(&Tok::LParen) {
+                break;
+            }
+            // Skip to the matching `)` of this adapter's argument list.
+            let mut k = j + 3;
+            let mut d = 1u32;
+            while let Some(t) = self.toks.get(k).map(|t| &t.tok) {
+                match t {
+                    Tok::LParen => d += 1,
+                    Tok::RParen => {
+                        d -= 1;
+                        if d == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                k += 1;
+            }
+            if self.toks.get(k).map(|t| &t.tok) != Some(&Tok::RParen) {
+                break;
+            }
+            if argc == 0 {
+                if k != j + 3 {
+                    break;
+                }
+            } else if k == j + 3 {
+                break;
+            }
+            adapters.push(name);
+            j = k + 1;
+        }
+        if adapters.is_empty() {
+            None
+        } else {
+            Some(adapters)
+        }
+    }
+
+    /// `for PAT in (lo..hi).ADAPTERS { body }` (or `lo..=hi`), with the head
+    /// already consumed. `adapters` is the source-order list the lookahead
+    /// found, e.g. `["skip", "take"]`.
+    ///
+    /// The loop runs a single upward counter `i` from `0` to a computed count,
+    /// so `continue` reaches the counter increment like any other `for` and the
+    /// `For` codegen is reused unchanged. Each adapter defines the count and the
+    /// element:
+    ///
+    /// * `rev` — element `len - 1 - i`, `n` steps. Iterating a range downward is
+    ///   otherwise `while`-shaped, where `continue` would skip the decrement and
+    ///   loop forever; running the counter up and mapping it down sidesteps
+    ///   that, and the count is bounded by `hi - lo`, so it cannot wrap.
+    /// * `step_by(k)` — element `i * k`, `ceil(n / k)` steps.
+    /// * `skip(k)` / `take(k)` — element `i` (`i + c` after a skip), `n - c` /
+    ///   `c` steps, where `c = min(k, n)`. Their argument is a step count, not a
+    ///   stride.
+    ///
+    /// Adapters apply left to right, each transforming the previous one's
+    /// sequence: the element is a composition of per-adapter index maps (a `rev`
+    /// after a `take` reverses that slice), and the count threads through each
+    /// adapter's length. The maps stay relative to the raw range, so `lo` is
+    /// added once at the end. Every bound (`lo`, `hi`, `n`, each `k`) is bound
+    /// to a temporary in the enclosing block, so a side-effecting bound runs
+    /// once, not per step.
+    fn desugar_for_range_adapter(
+        &mut self,
+        pat: Pat,
+        lo: Expr,
+        hi: Expr,
+        inclusive: bool,
+        adapters: &[String],
+        args: Vec<Expr>,
+        body: Block,
+        label: Option<String>,
+    ) -> PResult<Stmt> {
+        let var = match pat {
+            Pat::Bind(n) => n,
+            Pat::Wild => {
+                let n = format!("\u{0}fi{}", self.tmp);
+                self.tmp += 1;
+                n
+            }
+            _ => {
+                return Err(format!(
+                    "at byte {}: `for` over a range needs a binding or `_`",
+                    self.pos()
+                ))
+            }
+        };
+        let lo_name = format!("\u{0}rl{}", self.tmp);
+        let hi_name = format!("\u{0}rh{}", self.tmp);
+        let i_name = format!("\u{0}ri{}", self.tmp);
+        // One stride temporary per `step_by(k)`; the names line up with the
+        // matching entry in `args`.
+        let k_names: Vec<String> = adapters
+            .iter()
+            .filter(|a| a.as_str() == "step_by")
+            .map(|_| {
+                let n = format!("\u{0}rk{}", self.tmp);
+                self.tmp += 1;
+                n
+            })
+            .collect();
+        let vlo = |n: &str| Expr::Var { name: n.to_string(), slot: -1, ty: Type::I64 };
+        let c_name = |t: usize| format!("\u{0}rc{t}");
+        let m_name = |t: usize| format!("\u{0}ra{t}");
+        let s_name = |t: usize| format!("\u{0}rs{t}");
+        // The span of the range before any adapter: `hi - lo` exclusive,
+        // `hi - lo + 1` inclusive.
+        let span = Expr::Bin(BinOp::Sub, Box::new(vlo(&hi_name)), Box::new(vlo(&lo_name)));
+        let total = if inclusive {
+            Expr::Bin(BinOp::Add, Box::new(span), Box::new(Expr::Int(1)))
+        } else {
+            span
+        };
+        let mut head: Vec<Stmt> = vec![
+            Stmt::Let { name: lo_name.clone(), ty: None, init: Some(lo), slot: -1, mutable: false },
+            Stmt::Let { name: hi_name.clone(), ty: None, init: Some(hi), slot: -1, mutable: false },
+        ];
+        // Pass one, forward. `lens[t]` is the sequence length the `t`-th adapter
+        // receives (`lens[0]` is the raw range length) and `counts[t]` the length
+        // it emits; `strides[t]` holds the `step_by` stride temporary. Each
+        // adapter's bound is a `let`, so it is evaluated once, not per step.
+        let n = adapters.len();
+        let mut lens: Vec<Expr> = Vec::with_capacity(n);
+        let mut counts: Vec<Expr> = Vec::with_capacity(n);
+        let mut strides: Vec<Option<String>> = vec![None; n];
+        let mut head_a = 0usize;
+        let mut head_k = 0usize;
+        let mut prev_len = total;
+        for (t, adapter) in adapters.iter().enumerate() {
+            lens.push(prev_len.clone());
+            match adapter.as_str() {
+                "rev" => counts.push(prev_len.clone()),
+                "step_by" => {
+                    let k_name = k_names[head_k].clone();
+                    head_k += 1;
+                    head.push(Stmt::Let {
+                        name: k_name.clone(),
+                        ty: None,
+                        init: Some(args[head_a].clone()),
+                        slot: -1,
+                        mutable: false,
+                    });
+                    head_a += 1;
+                    strides[t] = Some(k_name.clone());
+                    // `ceil(len / k)` as `(len + k - 1) / k`; a zero stride is a
+                    // runtime divide-by-zero, which is what rustc reports.
+                    counts.push(Expr::Bin(
+                        BinOp::Div,
+                        Box::new(Expr::Bin(
+                            BinOp::Add,
+                            Box::new(prev_len.clone()),
+                            Box::new(Expr::Bin(
+                                BinOp::Sub,
+                                Box::new(vlo(&k_name)),
+                                Box::new(Expr::Int(1)),
+                            )),
+                        )),
+                        Box::new(vlo(&k_name)),
+                    ));
+                }
+                "skip" | "take" => {
+                    let m = m_name(t);
+                    head.push(Stmt::Let {
+                        name: m.clone(),
+                        ty: None,
+                        init: Some(args[head_a].clone()),
+                        slot: -1,
+                        mutable: false,
+                    });
+                    head_a += 1;
+                    // `c = min(bound, len)`: the number of steps the bound
+                    // actually removes, so it can never exceed the sequence.
+                    head.push(Stmt::Let {
+                        name: c_name(t),
+                        ty: None,
+                        init: Some(Expr::Call {
+                            name: "__rmc_min".into(),
+                            args: vec![vlo(&m), prev_len.clone()],
+                            arg_slots: Vec::new(),
+                            ret_slot: -1,
+                            ret_ty: Type::I64,
+                        }),
+                        slot: -1,
+                        mutable: false,
+                    });
+                    if adapter == "skip" {
+                        counts.push(Expr::Bin(
+                            BinOp::Sub,
+                            Box::new(prev_len.clone()),
+                            Box::new(vlo(&c_name(t))),
+                        ));
+                    } else {
+                        counts.push(vlo(&c_name(t)));
+                    }
+                }
+                _ => unreachable!("unknown range adapter {adapter}"),
+            }
+            prev_len = counts[t].clone();
+        }
+        // Pass two, reverse. `map` is the counter-to-element index for the
+        // `t`-th adapter's sequence, built from the innermost (last) adapter
+        // outward and kept relative to the raw range (`lo` is added once at the
+        // end). `rev` maps `i` to `len - 1 - i`, `step_by(k)` to `i * k`, `skip`
+        // shifts by `c`. A `rev` needs the length of the sequence it reverses
+        // (`lens[t]`); that expression may reference a `step_by` count, so it is
+        // bound once to `s_t` rather than recomputed per iteration.
+        let mut subst: Vec<Option<String>> = vec![None; n];
+        let mut map = Expr::Var { name: i_name.clone(), slot: -1, ty: Type::I64 };
+        for t in (0..n).rev() {
+            let needs_len = adapters[t] == "rev" || (t > 0 && adapters[t - 1] == "rev");
+            if needs_len && subst[t].is_none() {
+                let s = s_name(t);
+                head.push(Stmt::Let {
+                    name: s.clone(),
+                    ty: None,
+                    init: Some(lens[t].clone()),
+                    slot: -1,
+                    mutable: false,
+                });
+                subst[t] = Some(s);
+            }
+            let l = match &subst[t] {
+                Some(name) => vlo(name),
+                None => lens[t].clone(),
+            };
+            match adapters[t].as_str() {
+                "rev" => {
+                    // Element `i` of the reversed sequence is `len - 1 - i` of
+                    // this one.
+                    map = Expr::Bin(
+                        BinOp::Sub,
+                        Box::new(Expr::Bin(BinOp::Sub, Box::new(l), Box::new(Expr::Int(1)))),
+                        Box::new(map),
+                    );
+                }
+                "step_by" => {
+                    // `X_t[i] = X_{t-1}[i * k]`.
+                    let k_name = strides[t].clone().expect("a step_by stride");
+                    map = Expr::Bin(BinOp::Mul, Box::new(map), Box::new(vlo(&k_name)));
+                }
+                "skip" => {
+                    // Drop the first `c` elements: shift the map by `c`. When the
+                    // bound exceeds the length, `c` is the whole sequence and the
+                    // count is zero, so the shift is never observed.
+                    map = Expr::Bin(BinOp::Add, Box::new(map), Box::new(vlo(&c_name(t))));
+                }
+                "take" => {}
+                _ => unreachable!("unknown range adapter"),
+            }
+        }
+        // The final length is the last adapter's count, bound so the loop bound
+        // is one slot read; it may reference an `s_t` bound just above.
+        let n_name = format!("\u{0}rn{}", self.tmp);
+        self.tmp += 1;
+        head.push(Stmt::Let {
+            name: n_name.clone(),
+            ty: None,
+            init: Some(counts[n - 1].clone()),
+            slot: -1,
+            mutable: false,
+        });
+        let mut stmts = vec![
+            // `map` is a pure index into the raw range, so `lo` is added once.
+            Stmt::Let {
+                name: var,
+                ty: None,
+                init: Some(Expr::Bin(BinOp::Add, Box::new(vlo(&lo_name)), Box::new(map))),
+                slot: -1,
+                mutable: false,
+            },
+        ];
+        stmts.extend(body.stmts);
+        let body = Block { stmts, tail: body.tail };
+        head.push(Stmt::For {
+            var: i_name,
+            var_slot: -1,
+            start: Expr::Int(0),
+            end: vlo(&n_name),
+            end_slot: -1,
+            inclusive: false,
+            body,
+            label,
+        });
+        Ok(Stmt::Expr(Expr::Block(Block { stmts: head, tail: None })))
+    }
+
     fn parse_for_labeled(&mut self, label: Option<String>) -> PResult<Stmt> {
         // A loop variable that names a constant shadows it (rustc E0530).
         // `parse_pattern` would otherwise read the name as that constant's
@@ -2139,6 +2642,37 @@ impl Parser {
         }
         let pat = self.parse_pattern()?;
         self.expect(Tok::In)?;
+        // `for i in (lo..hi).rev() { .. }` (and `.step_by(k)` / `.skip(k)` /
+        // `.take(k)`): adapt a range. The parentheses are required in Rust
+        // (`lo..hi.rev()` would read the method call on `hi`), and `(lo..hi)`
+        // is not an rmc expression, so the whole shape is recognised before the
+        // head is parsed.
+        if let Some(adapters) = self.at_parenthesized_range_adapter() {
+            self.expect(Tok::LParen)?;
+            let lo = self.parse_cond()?;
+            let inclusive = self.eat(&Tok::DotDotEq);
+            if !inclusive {
+                self.expect(Tok::DotDot)?;
+            }
+            let hi = self.parse_cond()?;
+            self.expect(Tok::RParen)?;
+            let mut args = Vec::new();
+            for adapter in &adapters {
+                self.expect(Tok::Dot)?;
+                self.expect_ident()?; // the adapter name
+                self.expect(Tok::LParen)?;
+                if adapter == "rev" {
+                    self.expect(Tok::RParen)?;
+                } else {
+                    args.push(self.parse_cond()?);
+                    self.expect(Tok::RParen)?;
+                }
+            }
+            let body = self.parse_block()?;
+            return self.desugar_for_range_adapter(
+                pat, lo, hi, inclusive, &adapters, args, body, label,
+            );
+        }
         let head = self.parse_cond()?;
         // `for v in &args` (and `for v in args`) over an `args()`-vector binding
         // desugars to a range over the argument count; the element is read from
@@ -2783,10 +3317,64 @@ impl Parser {
                         return Ok(());
                     }
                     if m == "\u{0}veclist" {
-                        return Err(format!(
-                            "at byte {}: `vec![a, b, c]` is not supported (use `vec![e; n]`)",
-                            self.pos()
-                        ));
+                        // `vec![a, b, c]`: allocate one slot per element and
+                        // store each. A one-byte element (`vec![1u8, 2u8]`)
+                        // allocates one byte per element and stores a byte; a
+                        // wider element allocates eight bytes and stores a word.
+                        // The element value is cast to `i64` because a byte
+                        // pointer's deref-store expects an `i64` value at a byte
+                        // address; the identity cast on a word element folds
+                        // away, and on a byte element it is the truncation the
+                        // store needs.
+                        let count = args.len() as i64;
+                        self.note_vec_name(&name);
+                        self.note_vec_elem(&name);
+                        self.note_vec_len(&name);
+                        self.note_vec_cap(&name);
+                        self.vec_names.insert(name.clone());
+                        self.vec_elem.insert(name.clone(), elem_width);
+                        self.vec_len.insert(name.clone(), count);
+                        self.vec_cap.insert(name.clone(), count);
+                        let bytes = Expr::Bin(
+                            BinOp::Mul,
+                            Box::new(Expr::Int(count)),
+                            Box::new(Expr::Int(elem_width)),
+                        );
+                        let addr = Expr::Call {
+                            name: "alloc".into(),
+                            args: vec![bytes],
+                            arg_slots: Vec::new(),
+                            ret_slot: -1,
+                            ret_ty: Type::I64,
+                        };
+                        let byte_elem = elem_width == 1;
+                        let value_ty = if byte_elem {
+                            Type::Int { signed: false, bits: 8 }
+                        } else {
+                            Type::I64
+                        };
+                        let base = Expr::Var { name: name.clone(), slot: -1, ty: Type::I64 };
+                        out.push(Stmt::Let {
+                            name,
+                            ty: Some(Type::I64),
+                            init: Some(addr),
+                            slot: -1,
+                            mutable,
+                        });
+                        for (i, elem) in args.iter().enumerate() {
+                            let offset = Expr::Bin(
+                                BinOp::Add,
+                                Box::new(base.clone()),
+                                Box::new(Expr::Int(i as i64 * elem_width)),
+                            );
+                            let ptr_ty = if byte_elem { Type::U8 } else { Type::I64 };
+                            let ptr = Expr::Cast(Box::new(offset), Type::Ref(Box::new(ptr_ty), true));
+                            out.push(Stmt::Assign {
+                                target: Expr::Deref { expr: Box::new(ptr), ty: Type::I64 },
+                                value: Expr::Cast(Box::new(elem.clone()), value_ty.clone()),
+                            });
+                        }
+                        return Ok(());
                     }
                     // `let p = base.as_mut_ptr();`: `base` is a `Vec` address, so
                     // `p` holds that same address. Record it a raw pointer, with
@@ -2815,7 +3403,8 @@ impl Parser {
                 if matches!(ty, Some(Type::Named(ref n)) if n == "Vec") {
                     return Err(format!(
                         "at byte {}: a `Vec` binding must be initialized by \
-                         `Vec::with_capacity(k)`, `vec![e; n]` or an `args()` collect",
+                         `Vec::with_capacity(k)`, `vec![e; n]`, `vec![a, b, c]` or an \
+                         `args()` collect",
                         self.pos()
                     ));
                 }
@@ -3145,6 +3734,32 @@ impl Parser {
             Block { stmts: vec![Stmt::Expr(Self::panic_call())], tail: None },
             None,
         ))
+    }
+
+    /// `matches!(expr, pat)`: `true` when `expr` matches `pat`, else `false`.
+    /// It lowers to the same arm chain a two-arm `match` produces, so the
+    /// existing pattern machinery (including an or-pattern, a range, or a
+    /// guarded arm) does the work. `matches!` accepts a comma or a `|` before
+    /// the pattern, as Rust's macro does.
+    fn parse_matches(&mut self) -> PResult<Expr> {
+        self.i += 1; // the `!`
+        self.expect(Tok::LParen)?;
+        let scrutinee = self.parse_bracketed_expr()?;
+        self.expect(Tok::Comma)?;
+        self.eat(&Tok::Pipe);
+        let pat = self.parse_refutable_pattern()?;
+        // A guard is accepted and, if present, folds into the arm test.
+        let guard = if self.eat(&Tok::If) {
+            Some(self.parse_cond()?)
+        } else {
+            None
+        };
+        self.expect(Tok::RParen)?;
+        let arms = vec![
+            (pat, guard, Expr::Bool(true)),
+            (Pat::Wild, None, Expr::Bool(false)),
+        ];
+        self.desugar_match(scrutinee, arms)
     }
 
     /// `panic!()`, `unreachable!()`, `todo!()` and `unimplemented!()`: exit with
@@ -4232,6 +4847,20 @@ impl Parser {
                     Ok(Pat::Bool(*b))
                 } else if let Some(c) = self.const_chars.get(&n) {
                     Ok(Pat::Char(*c))
+                } else if matches!(n.as_str(), "Some" | "Ok" | "Err")
+                    && self.peek() == Some(&Tok::LParen)
+                {
+                    // The `Option`/`Result` variant patterns, written
+                    // unqualified: `Some(x)`, `Ok(v)`, `Err(e)`. A bare `None`
+                    // is the unit variant and is handled by the wildcard case.
+                    let (en, var) = match n.as_str() {
+                        "Some" => ("Option", "Some"),
+                        "Ok" => ("Result", "Ok"),
+                        _ => ("Result", "Err"),
+                    };
+                    self.i += 1; // `(`
+                    let args = self.parse_variant_pat_args()?;
+                    Ok(Pat::Variant(en.into(), var.into(), Some(args)))
                 } else {
                     // A bare name binds the scrutinee; `_` already matched the
                     // wildcard case above.
@@ -5914,6 +6543,7 @@ impl Parser {
                         "assert" | "assert_eq" | "assert_ne" => {
                             return self.parse_assert(&name)
                         }
+                        "matches" => return self.parse_matches(),
                         "panic" | "unreachable" | "todo" | "unimplemented" => {
                             return self.parse_panic(&name)
                         }
@@ -5934,6 +6564,47 @@ impl Parser {
                     if let Some(e) = self.try_parse_std_path(&name)? {
                         return Ok(e);
                     }
+                }
+                // The `Option`/`Result` constructors are written unqualified in
+                // Rust: `Some(x)`, `None`, `Ok(x)`, `Err(e)`. Map them to the
+                // injected prelude enums so `use std::option::Option::*` need
+                // not be written. `None` is a unit variant only when it stands
+                // alone (not followed by `(`).
+                if let Some((en, var)) = match name.as_str() {
+                    "Some" => Some(("Option", "Some")),
+                    "Ok" => Some(("Result", "Ok")),
+                    "Err" => Some(("Result", "Err")),
+                    _ => None,
+                } {
+                    if self.peek() == Some(&Tok::LParen) {
+                        self.i += 1;
+                        let mut args = Vec::new();
+                        while self.peek() != Some(&Tok::RParen) {
+                            args.push(self.parse_bracketed_expr()?);
+                            if !self.eat(&Tok::Comma) {
+                                break;
+                            }
+                        }
+                        self.expect(Tok::RParen)?;
+                        return Ok(Expr::EnumCtor {
+                            enum_name: en.into(),
+                            variant: var.into(),
+                            tag: -1,
+                            args,
+                            arg_offsets: Vec::new(),
+                            slot: -1,
+                            size: 0,
+                        });
+                    }
+                }
+                if name == "None"
+                    && !matches!(self.peek(), Some(Tok::ColonColon) | Some(&Tok::LParen))
+                {
+                    return Ok(Expr::EnumVariant {
+                        enum_name: "Option".into(),
+                        variant: "None".into(),
+                        tag: -1,
+                    });
                 }
                 // `Enum::Variant` or `Enum::Variant(args)` — resolved and
                 // range-checked by sema.
@@ -6065,8 +6736,10 @@ impl Parser {
                     Ok(Expr::Call { name, args, arg_slots: Vec::new(), ret_slot: -1, ret_ty: Type::I64 })
                 } else if let Some(v) = self.consts.get(&name) {
                     // A reference to a constant is its value, substituted here
-                    // so sema and codegen never see a constant as a variable.
-                    Ok(Expr::Int(*v))
+                    // so sema and codegen never see a constant as a variable. A
+                    // narrow constant keeps its width, so `N + 200` on a
+                    // `const N: u8` still overflows a `u8` rather than an `i64`.
+                    Ok(self.const_value_expr(&name, *v))
                 } else if let Some(b) = self.const_bools.get(&name) {
                     Ok(Expr::Bool(*b))
                 } else if let Some(c) = self.const_chars.get(&name) {

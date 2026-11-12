@@ -809,6 +809,27 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   constant name there resolves to its value (not a binding), which would turn
   `for N in 0..3` into an iteration over a literal and lose the E0530 error.
   `tests/cases/forarr.rs` and the `stmt` fuzzer cover it.
+- **Range adapters desugar to one upward counter, and the maps compose.** `for
+  i in (lo..hi).rev()` / `.step_by(k)` / `.skip(k)` / `.take(k)`, chained in any
+  order, are recognised by a token lookahead (`at_parenthesized_range_adapter`,
+  which requires the parentheses Rust requires) and desugared by
+  `desugar_for_range_adapter` into the ordinary `Stmt::For` upward counter, so
+  `continue` still reaches the increment — a downward `while` would skip it and
+  loop forever. The desugar is two passes: a forward pass gives each adapter a
+  `let` bound (evaluated once, not per step) and threads the sequence length
+  through, and a reverse pass composes each adapter's *index* map into the
+  element expression. The maps stay relative to the raw range and `lo` is added
+  once at the end, which is what makes `rev` after another adapter reverse that
+  adapter's slice rather than the whole range. `rev`'s length is bound to a
+  temporary when it is itself a computed count (a `step_by`), so it is not
+  recomputed per iteration. `skip`/`take` use `__rmc_min(a, b)` (a new runtime
+  helper) for `c = min(k, len)`; `skip` shifts the map by `c`, the count it
+  actually removes, not the overshoot. Adapter temporaries use `\u{0}r`-prefixed
+  names (`rl`/`rh` for the bounds, `ri` for the counter, `rk`/`ra`/`rc`/`rs` for
+  the stride, argument, count and length-substitution); the counter is `ri`, not
+  `rc`, so it cannot collide with the `c` of the first `skip`/`take`.
+  `tests/cases/rangeadapt.rs` and `counting_range_adapters_compile` cover the
+  chains.
 - **`..=` exits on `jle` back-edge, not `jl`.** The guard is the loop-back
   condition, so the inclusive form loops while `var <= end` (`jle`) and the
   exclusive one while `var < end` (`jl`); a `jg`/`jge` *exit* test is the
@@ -1715,6 +1736,35 @@ The checks, all in `sema.rs`:
   `idiv` that raised SIGFPE). A constant local counts as constant, so `let d =
   0; 1 / d` and `let x = i64::MAX; x + 1` are diagnosed like the literals, as
   rustc does.
+- **Narrow-integer width is a first-class part of the value, not an `i64`
+  annotation.** A `u8`/`i8`/`u16`/... value must be range-checked at *its* width
+  everywhere rustc does, because the 64-bit instruction that computes it does not
+  overflow when the narrow result does (`250u8 + 10` wraps to `4` with no 64-bit
+  overflow flag). Four places carry the width:
+  - *Overflow.* `Codegen::arith_narrow` reads the narrow width of an `+`/`-`/`*`
+    operand and `check_overflow_ty` compares the 64-bit result against its
+    width-extended self (`shl` to drop the top bits, `sar`/`shr` back, `cmp`), so
+    the trap fires before `narrow_trunc` discards the excess. Negation keeps the
+    operand's width too (`i8::MIN` traps).
+  - *Division.* `i8::MIN / -1` overflows an `i8` even though `-128 / -1` is fine
+    at 64 bits, so the `MIN / -1` guard compares the dividend against *its own*
+    minimum (`cmp $-128, %rax`), not `i64::MIN`; the constant-divisor `-1`
+    shortcut needs the same bound instead of the free `jo` after `neg`.
+  - *Shifts.* The count is valid in `0..bits` for the left operand's width
+    (`u8 << 8` traps), and a constant count is checked at compile time in the
+    inlined/immediate path (`check_shift_count_imm`), which the ordinary
+    `check_shift_count` does not see.
+  - *Casts and literals.* A cast is a type boundary: its operand is checked at
+    its own width (clear `expected_int` while checking it) and only the cast
+    narrows, so `300u16 as u8` is `44` while `300 as u8` is `literal out of
+    range`. A negated literal cast keeps its sign — `-128 as i8` is accepted,
+    `-129 as i8` is out of range, and `-1 as u8` is `cannot apply unary - to an
+    unsigned type`. A struct field's declared width types a literal in its
+    initializer (`S { a: 200 }` for `a: u8`), exactly as `let x: u8 = 200` does.
+  A narrow `const` carries its declared width through resolution
+  (`ConstVal::NarrowInt(i64, Type)`), so a use is substituted at that width and
+  folds/checks like a literal of it; `consts::resolve` is fallible so a
+  non-folding item is a compile error rather than a silent widen.
 - **Constant-local propagation, matching rustc.** `Sema::const_locals` maps a
   slot to a known constant, and `const_of` reads it. A local is entered only
   when rustc would know it: its initializer is constant and it is assigned at
@@ -2562,16 +2612,37 @@ its stage and only the shared rustc front end decides the pipeline peak.
 
 ## Pushing
 
-`git push origin <branch>` needs a token with `contents: write`. The
-`GITHUB_TOKEN` in this environment is sometimes such a token — pushes to
-`rmc-1-core` through `rmc-4-patterns` have succeeded — and sometimes a
-read-only GitHub App installation token (`ghu_` prefix, empty
-`x-oauth-scopes`), which fetches fine but answers every write with `403
-Resource not accessible by integration` on `receive-pack` and on the git-refs
-API alike. The repo permission list can still read `push: true` for the app's
-own account, so that is not a reliable signal. Check `git ls-remote` first,
-then try the push; if it 403s, leave the commits local and report the block
-rather than retrying. Never persist a token in `.git/config` or a file.
+A push needs a token with `contents: write`. The `GITHUB_TOKEN` in this
+environment is sometimes such a token and sometimes a read-only GitHub App
+installation token (`ghu_` prefix, empty `x-oauth-scopes`), which fetches fine
+but answers every write with `403 Resource not accessible by integration` on
+`receive-pack` and on the git-refs API alike. The repo permission list can
+still read `push: true` for the app's own account, so that is not a reliable
+signal. Check `git ls-remote` first, then try the push; if it 403s, ask the
+user for a write-capable `ghp_` token and push with it — do not scan
+conversation logs for one.
+
+The token must never be persisted in `.git/config` or a file, so `origin` is a
+plain token-free URL (`https://github.com/irhasar/rmc.git`) and there is no
+credential helper. A bare `git push origin <branch>` therefore prompts for a
+username and hangs — do not run it. Push with the token supplied inline so it
+never lands on disk:
+
+```
+git push "https://x-access-token:<token>@github.com/irhasar/rmc.git" <branch>
+```
+
+A read (`git ls-remote <same-url>`) confirms the remote state. The inline URL
+leaves the tracking ref stale, so refresh it with
+`git fetch "<url>" <branch>:refs/remotes/origin/<branch>` afterwards.
+
+**Always push at the end of every session.** After committing, push the current
+branch so the remote branch is never behind the local one. Verify with
+`git rev-parse HEAD` vs `git rev-parse origin/<branch>` (they must match)
+before reporting done. Do not open a PR unless asked — the push is the expected
+end state. When a command line or URL would otherwise echo the token, pipe
+through `sed 's/ghp_[A-Za-z0-9]*/<token-hidden>/g'` so it never lands in the
+log.
 
 ## PR branch stack
 
