@@ -100,6 +100,12 @@ struct FnGen<'a> {
     /// entry instead. Only callee-saved registers are used, so no call can
     /// clobber the value.
     const_regs: HashMap<i64, &'static str>,
+    /// Wide constants hoisted into *caller-saved* registers once the callee-saved
+    /// pool is exhausted. A call clobbers these, so each gets a spill slot and is
+    /// saved and restored around every call.
+    const_caller_regs: HashMap<i64, &'static str>,
+    /// Hoisted-constant value -> its caller-saved spill slot.
+    const_spill: HashMap<i64, i64>,
     /// Callee-saved registers saved below `%rbp`; frame slots start past them.
     saved_regs: i64,
     /// Dry-pass slot index -> compacted slot index. `None` until the dry pass
@@ -1206,6 +1212,8 @@ impl<'a> FnGen<'a> {
             in_drop: false,
             loop_operands: Vec::new(),
             const_regs: HashMap::new(),
+            const_caller_regs: HashMap::new(),
+            const_spill: HashMap::new(),
             saved_regs: 0,
             slot_map: None,
             next_slot: 0,
@@ -1477,7 +1485,19 @@ impl<'a> FnGen<'a> {
             })
             .map(|(l, c)| (l, weighted.get(&l).copied().unwrap_or(c), c))
             .collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)).then(a.0.cmp(&b.0)));
+        // A `bool` temp is the result of a comparison consumed by the very next
+        // `switchInt`, so keeping it in memory costs a store and a load once per
+        // iteration; a `bool` in a register saves no more than that. An `i64`
+        // accumulator is read-modify-written every iteration, so a register saves
+        // a load *and* a store, and a loop constant saves a `movabs` on every
+        // iteration. Both are worth a register more than a `bool` temp, so the
+        // `bool` temps are promoted only after the `i64` locals and the constants
+        // have taken what they want.
+        let is_bool = |l: u32| matches!(self.ty.get(l as usize), Some(Ty::Bool));
+        let (mut bool_temps, mut ranked): (Vec<_>, Vec<_>) =
+            ranked.into_iter().partition(|(l, _, _)| is_bool(*l));
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
+        bool_temps.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&b.2)).then(a.0.cmp(&b.0)));
         let pool = self.reg_pool();
         for (l, _, _) in ranked {
             if self.promo.len() >= pool.len() {
@@ -1485,10 +1505,18 @@ impl<'a> FnGen<'a> {
             }
             self.promote_local(l, &mut used);
         }
-        // Spend any registers promotion left idle on wide constants that recur
-        // in the body. Promoting a local is worth more than hoisting a constant
-        // (a load versus a `movabs`), so this runs last and only fills gaps.
+        // Spend any registers the `i64` locals left idle on wide constants that
+        // recur in the body. A constant named in a loop pays a `movabs` on every
+        // iteration, the same order of cost as the load a promoted local saves;
+        // running before the `bool` temps lets it claim the last register when
+        // the loop has no room otherwise.
         self.hoist_consts(&mut used);
+        for (l, _, _) in bool_temps {
+            if self.promo.len() >= pool.len() {
+                break;
+            }
+            self.promote_local(l, &mut used);
+        }
     }
 
     /// The nesting depth of each block: how many natural loops contain it.
@@ -1574,14 +1602,17 @@ impl<'a> FnGen<'a> {
         self.promo.insert(local, Promo { reg, caller_saved });
     }
 
-    /// Hoist the wide constants that recur in the body into spare callee-saved
-    /// registers. An i64 immediate that does not fit a sign-extended i32 needs a
-    /// `movabs` to materialise, and a constant named inside a loop pays that on
-    /// every iteration. Keeping it in a register costs one `movabs` at entry.
+    /// Hoist the wide constants that recur in the body into spare registers. An
+    /// i64 immediate that does not fit a sign-extended i32 needs a `movabs` to
+    /// materialise, and a constant named inside a loop pays that on every
+    /// iteration. Keeping it in a register costs one `movabs` at entry.
     ///
-    /// Only callee-saved registers are used, so a call cannot clobber the value.
-    /// Promotion runs first and claims the registers it wants; this fills what
-    /// is left, so hoisting never displaces a hot local.
+    /// A callee-saved register is used first (a call cannot clobber it); once
+    /// those run out the constant goes into a caller-saved register the body
+    /// does not otherwise name, saved and restored around each call.
+    /// `plan_promotion` calls this after the loop operands and loop-invariant
+    /// locals have claimed their registers, so a constant never displaces the
+    /// values a register is worth most.
     fn hoist_consts(&mut self, used: &mut HashSet<&'static str>) {
         if !self.opts.promote {
             return;
@@ -1626,13 +1657,33 @@ impl<'a> FnGen<'a> {
             .collect();
         ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
 
-        // Only registers promotion did not claim.
-        for (v, _) in ranked {
+        // Only registers promotion did not claim. Index-based so a constant the
+        // callee-saved pool cannot take is retried against the caller-saved one
+        // rather than dropped: a `break` in a `for ... by_ref()` would consume
+        // and discard that entry.
+        let mut idx = 0;
+        while idx < ranked.len() {
             let Some(reg) = PROMOTE_REGS.iter().find(|r| !used.contains(*r)).copied() else {
                 break;
             };
             used.insert(reg);
-            self.const_regs.insert(v, reg);
+            self.const_regs.insert(ranked[idx].0, reg);
+            idx += 1;
+        }
+        // The callee-saved pool is exhausted, so the next hottest constants go
+        // into the caller-saved registers the body does not otherwise name. A
+        // call clobbers them, so each is saved and restored around every call
+        // (see `spill_caller_saved`). This is what closes `stats`: LLVM keeps
+        // the `% 1000003` magic multiplier in a caller-saved register for the
+        // whole loop, and rmc's five callee-saved registers are all held by hot
+        // locals there.
+        while idx < ranked.len() {
+            let Some(reg) = CALLER_REGS.iter().find(|r| !used.contains(*r)).copied() else {
+                break;
+            };
+            used.insert(reg);
+            self.const_caller_regs.insert(ranked[idx].0, reg);
+            idx += 1;
         }
     }
 
@@ -1655,6 +1706,14 @@ impl<'a> FnGen<'a> {
                 let s = self.alloc_slot();
                 self.caller_spill.insert(l, s);
             }
+        }
+        // A caller-saved hoisted constant is clobbered by a call too, so it
+        // needs the same home.
+        let mut const_caller_vals: Vec<i64> = self.const_caller_regs.keys().copied().collect();
+        const_caller_vals.sort_unstable();
+        for v in const_caller_vals {
+            let s = self.alloc_slot();
+            self.const_spill.insert(v, s);
         }
         let base_slots = self.next_slot;
 
@@ -1834,6 +1893,14 @@ impl<'a> FnGen<'a> {
             }
             let dst = self.local_operand(li);
             let _ = writeln!(self.out, "  mov {}, {}", ARG_REGS[ord], dst);
+        }
+        // Materialise caller-saved hoisted constants after the argument moves:
+        // until the last move the argument registers still hold incoming
+        // arguments, so a `movabs` into one before that would be overwritten.
+        let mut caller_consts: Vec<(&i64, &&str)> = self.const_caller_regs.iter().collect();
+        caller_consts.sort_by_key(|(v, _)| **v);
+        for (v, reg) in caller_consts {
+            let _ = writeln!(self.out, "  movabs ${v}, {reg}");
         }
         for i in 0..self.func.blocks.len() as u32 {
             // No loop-header alignment. Aligning a loop header to 32 bytes
@@ -2459,6 +2526,15 @@ impl<'a> FnGen<'a> {
             // A wide constant hoisted into a register (see `hoist_consts`) is
             // read from there instead of re-materialised with `movabs`.
             Const::Int(n) if self.const_regs.contains_key(n) => self.const_regs[n].to_string(),
+            // A caller-saved hoisted constant has been clobbered once a
+            // destructor tree has made its calls; read the spill slot there.
+            Const::Int(n) if self.const_caller_regs.contains_key(n) => {
+                if self.in_drop {
+                    self.off(self.const_spill[n])
+                } else {
+                    self.const_caller_regs[n].to_string()
+                }
+            }
             Const::Int(n) => format!("${n}"),
             Const::Bool(b) => format!("${}", *b as i64),
             // A float's value as a general-purpose register is its bit pattern;
@@ -3983,6 +4059,13 @@ impl<'a> FnGen<'a> {
                 let (m, s, add) = sdiv_magic(mag);
                 if let Some(reg) = self.const_regs.get(&m) {
                     self.emit(&format!("  mov {reg}, %rcx"));
+                } else if let Some(reg) = self.const_caller_regs.get(&m).copied() {
+                    if self.in_drop {
+                        let slot = self.off(self.const_spill[&m]);
+                        self.emit(&format!("  mov {slot}, %rcx"));
+                    } else {
+                        self.emit(&format!("  mov {reg}, %rcx"));
+                    }
                 } else {
                     self.emit(&format!("  movabs ${m}, %rcx"));
                 }
@@ -4063,6 +4146,17 @@ impl<'a> FnGen<'a> {
             let slot = self.off(self.caller_spill[l]);
             self.emit(&format!("  mov {reg}, {slot}"));
         }
+        // Caller-saved hoisted constants are clobbered by the call too.
+        let mut consts: Vec<(i64, &'static str)> = self
+            .const_caller_regs
+            .iter()
+            .map(|(v, r)| (*v, *r))
+            .collect();
+        consts.sort_unstable();
+        for (v, reg) in consts {
+            let slot = self.off(self.const_spill[&v]);
+            self.emit(&format!("  mov {reg}, {slot}"));
+        }
         caller_promos
     }
 
@@ -4070,6 +4164,16 @@ impl<'a> FnGen<'a> {
     fn restore_caller_saved(&mut self, saved: &[(u32, &'static str)]) {
         for (l, reg) in saved {
             let slot = self.off(self.caller_spill[l]);
+            self.emit(&format!("  mov {slot}, {reg}"));
+        }
+        let mut consts: Vec<(i64, &'static str)> = self
+            .const_caller_regs
+            .iter()
+            .map(|(v, r)| (*v, *r))
+            .collect();
+        consts.sort_unstable();
+        for (v, reg) in consts {
+            let slot = self.off(self.const_spill[&v]);
             self.emit(&format!("  mov {slot}, {reg}"));
         }
     }
