@@ -1,0 +1,16 @@
+#!/bin/sh
+# `rustc` with rmc as the codegen backend.
+#
+#   ./backend/rmc-rustc foo.rs -o foo [other rustc flags]
+#
+# Same CLI as rustc; the only addition is `-Zcodegen-backend`. The backend
+# dylib carries an rpath to the toolchain's `lib` directory (see build.sh), so
+# no environment fixup is needed here and no extra `rustc` process is spawned.
+set -eu
+here=$(cd "$(dirname "$0")" && pwd)
+so="$here/target/release/librmc_codegen_backend.so"
+if [ ! -f "$so" ]; then
+    echo "rmc-rustc: $so missing; run backend/build.sh first" >&2
+    exit 1
+fi
+exec rustc +nightly -Zcodegen-backend="$so" "$@"

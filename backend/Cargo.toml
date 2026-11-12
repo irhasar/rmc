@@ -1,0 +1,24 @@
+[package]
+name = "rmc_codegen_backend"
+version = "0.1.0"
+edition = "2021"
+description = "rmc as a rustc `-Zcodegen-backend`: rustc's MIR in, rmc's x86-64 out, no LLVM."
+
+# A rustc codegen backend must be a `dylib` and must link `rustc_private`
+# crates from the toolchain it will be loaded into, so it is built with the
+# nightly toolchain and the `rustc-dev` component (see backend/build.sh). It
+# is not part of the default workspace build.
+
+[lib]
+name = "rmc_codegen_backend"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+rmc = { path = "../compiler" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
