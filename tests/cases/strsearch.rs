@@ -61,6 +61,23 @@ fn main() {
     println!("{}", "aaaa".contains("aaa"));
     println!("{}", "abcabc".contains("bcab"));
     println!("{}", "abcabc".ends_with("abc"));
+
+    // `is_empty` is `len() == 0` for a `str` and a compile-time constant for an
+    // array; both agree with the `starts_with("")` prefix test.
+    println!("{}", s.is_empty());
+    println!("{}", "".is_empty());
+    println!("{}", r.is_empty());
+    println!("{}", p.name.is_empty());
+    let a = [1, 2, 3];
+    println!("{}", a.is_empty());
+    let z: [i64; 0] = [];
+    println!("{}", z.is_empty());
+    println!("{}", z.len());
+    let mut acc = 0;
+    for x in &z {
+        acc += *x;
+    }
+    println!("{}", acc);
 }
 
 fn pick(s: &'static str) -> &'static str {

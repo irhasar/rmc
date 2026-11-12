@@ -182,6 +182,11 @@ pub struct Sema {
     /// take, set from a declared `[T; n]` whose element is an integer width
     /// (`let bs: [u8; 3] = [b'a', ..]`). `None` outside such a context.
     expected_elem_int: Option<Type>,
+    /// The declared return type, active only while checking a function body's
+    /// tail expression. A tail array literal takes its element width from it
+    /// (`fn g() -> [u8; 3] { [1, 2, 3] }`), and a tail `[]` can be typed at all;
+    /// it is cleared inside nested blocks so an inner array is not mis-typed.
+    expected_ret: Option<Type>,
 }
 
 /// A lexical scope entry. `mutable` records whether the binding was declared
@@ -402,6 +407,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         const_names,
         expected_int: None,
         expected_elem_int: None,
+        expected_ret: None,
     };
     for f in &mut prog.fns {
         sema.check_fn(f)?;
@@ -801,7 +807,7 @@ impl Sema {
             f.body.stmts = pats;
         }
 
-        let body_ty = self.check_block(&mut f.body, &mut scope)?;
+        let body_ty = self.check_fn_body(&mut f.body, &mut scope)?;
         // A body whose tail is a value must match the declared return type.
         // `!` unifies with anything: a body that diverges on every path never
         // yields a value, so it satisfies any declared return type. A body
@@ -1762,6 +1768,20 @@ impl Sema {
         self.check_block_inner(b, scope, false, label.as_deref())
     }
 
+    /// Check a function body, arming `expected_ret` for an array return type so
+    /// the body's tail literal takes its element width (`fn g() -> [u8; 3] {
+    /// [1, 2, 3] }`) and a tail `[]` can be typed at all. `check_block_inner`
+    /// consumes the flag at its tail, so it never leaks into a nested block.
+    fn check_fn_body(&mut self, b: &mut Block, scope: &mut Scope) -> Result<Type, String> {
+        let saved = self.expected_ret.take();
+        if matches!(self.ret_ty, Type::Array(..)) {
+            self.expected_ret = Some(self.ret_ty.clone());
+        }
+        let r = self.check_block(b, scope);
+        self.expected_ret = saved;
+        r
+    }
+
     /// Check a block. When `loop_body` is set the block is a loop body, whose
     /// normal completion loops back to the top (seed `true`) and whose
     /// `continue`s target `label`; any other block falls through to the code
@@ -1776,6 +1796,10 @@ impl Sema {
         loop_body: bool,
         label: Option<&str>,
     ) -> Result<Type, String> {
+        // `expected_ret` applies to this block's tail only; consume it up front
+        // so a nested block in one of the statements below is not mis-typed by
+        // the enclosing function's return type.
+        let want_ret = self.expected_ret.take();
         let mark = scope.len();
         let saved_reach = self.loop_reach.last().copied().unwrap_or(false);
         let saved_cont = self.loop_cont.last().copied().unwrap_or(false);
@@ -1831,7 +1855,13 @@ impl Sema {
                 if let Some(l) = self.loop_cont.last_mut() {
                     *l = seed;
                 }
-                self.check_expr(e, scope)?
+                // The tail is the only place `expected_ret` applies, and it was
+                // consumed at the top of this block.
+                let t = match want_ret {
+                    Some(rt) => self.check_expr_expected(e, scope, &rt)?,
+                    None => self.check_expr(e, scope)?,
+                };
+                t
             }
             None => Type::Unit,
         };
@@ -1885,7 +1915,9 @@ impl Sema {
                             if is_int_ty(d) {
                                 self.expected_int = Some(d.clone());
                             } else if let Type::Array(elem, _) = d {
-                                if is_int_ty(elem) {
+                                if is_int_ty(elem)
+                                    || matches!(elem.as_ref(), Type::Array(..))
+                                {
                                     self.expected_elem_int = Some((**elem).clone());
                                 }
                             }
@@ -2174,7 +2206,7 @@ impl Sema {
             Stmt::Return(v) => {
                 match v {
                     Some(e) => {
-                        let t = if is_int_literal(e) {
+                        let t = if is_int_literal(e) || matches!(self.ret_ty, Type::Array(..)) {
                             let rt = self.ret_ty.clone();
                             self.check_expr_expected(e, scope, &rt)?
                         } else {
@@ -2784,11 +2816,21 @@ impl Sema {
         expected: &Type,
     ) -> Result<Type, String> {
         let saved = self.expected_int.take();
+        let saved_elem = self.expected_elem_int.take();
         if is_int_ty(expected) {
             self.expected_int = Some(expected.clone());
         }
+        // An array literal in this position takes the expected element width
+        // (`f([1, 2, 3])` for an `[u8; 3]` parameter), and an empty `[]` can
+        // only be typed here at all.
+        if let Type::Array(elem, _) = expected {
+            if is_int_ty(elem) || matches!(elem.as_ref(), Type::Array(..)) {
+                self.expected_elem_int = Some((**elem).clone());
+            }
+        }
         let r = self.check_expr(e, scope);
         self.expected_int = saved;
+        self.expected_elem_int = saved_elem;
         r
     }
 
@@ -3168,7 +3210,9 @@ impl Sema {
                 }
                 arg_slots.clear();
                 for (a, p) in args.iter_mut().zip(sig.params.iter()) {
-                    let t = if is_int_literal(a) && matches!(p, Type::Int { .. }) {
+                    let t = if (is_int_literal(a) && matches!(p, Type::Int { .. }))
+                        || matches!(p, Type::Array(..))
+                    {
                         let p2 = p.clone();
                         self.check_expr_expected(a, scope, &p2)?
                     } else {
@@ -3641,8 +3685,32 @@ impl Sema {
                 self.check_expr(e, scope)
             }
             Expr::ArrayList(elems) => {
-                // The parser never produces an empty list: it requires at least
-                // one element before the `]`, so `[]` fails there.
+                // An empty list `[]` has no element to infer the type from, so
+                // it only type-checks where the annotation supplies one: the
+                // expected element type is set for `let z: [i64; 0] = [];`. The
+                // result is an empty array block (its value is the zero-length
+                // array), never an assignment.
+                if elems.is_empty() {
+                    let elem_ty = match self.expected_elem_int.clone() {
+                        Some(t) => t,
+                        None => {
+                            return Err(
+                                "cannot infer the element type of an empty array".into()
+                            )
+                        }
+                    };
+                    if !elem_ty.is_array_elem() {
+                        return Err(format!(
+                            "array elements must be a scalar, `str`, a reference, a struct, a payload enum or an array, found {elem_ty:?}"
+                        ));
+                    }
+                    let arr_ty = Type::Array(Box::new(elem_ty), 0);
+                    *e = Expr::Block(Block {
+                        stmts: Vec::new(),
+                        tail: Some(Box::new(Expr::Bool(false))),
+                    });
+                    return Ok(arr_ty);
+                }
                 let elem_ty = if let Some(elem) = self.expected_elem_int.clone() {
                     self.check_expr_expected(&mut elems[0], scope, &elem)?
                 } else {
@@ -3769,6 +3837,46 @@ impl Sema {
                                 tail: Some(Box::new(Expr::Int(n))),
                             });
                             return Ok(Type::I64);
+                        }
+                        _ => {}
+                    }
+                }
+                // `is_empty()` is `len() == 0` for both a `str` and an array.
+                // The `str` form reuses the length helper; the array form folds
+                // to the compile-time constant `N == 0`, keeping the receiver
+                // only for its side effects, exactly as `len()` does above.
+                if name == "is_empty" && args.is_empty() {
+                    match &base_ty {
+                        Type::Str => {
+                            let recv = std::mem::replace(recv.as_mut(), Expr::Int(0));
+                            let recv = if via_ref {
+                                Expr::Deref { expr: Box::new(recv), ty: Type::Str }
+                            } else {
+                                recv
+                            };
+                            let call = Expr::Call {
+                                name: "__rmc_str_len".into(),
+                                args: vec![recv],
+                                arg_slots: vec![(-1, 0)],
+                                ret_slot: -1,
+                                ret_ty: Type::I64,
+                            };
+                            *e = Expr::Bin(BinOp::Eq, Box::new(call), Box::new(Expr::Int(0)));
+                            return self.check_expr(e, scope);
+                        }
+                        Type::Array(_, n) => {
+                            let empty = *n == 0;
+                            let recv = std::mem::replace(recv.as_mut(), Expr::Int(0));
+                            let stmts = if matches!(recv, Expr::Var { .. }) {
+                                Vec::new()
+                            } else {
+                                vec![Stmt::Expr(recv)]
+                            };
+                            *e = Expr::Block(Block {
+                                stmts,
+                                tail: Some(Box::new(Expr::Bool(empty))),
+                            });
+                            return Ok(Type::Bool);
                         }
                         _ => {}
                     }

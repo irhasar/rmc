@@ -1680,6 +1680,31 @@ The checks, all in `sema.rs`:
   does not carry one. `find` itself is *not* exposed: rustc types it
   `Option<usize>`, and rmc has neither, so a bare `s.find(..)` still falls
   through to the "not a struct or enum" error rather than mis-typing the result.
+- **`is_empty()`.** Special-cased in the same `MethodCall` arm as `len` and the
+  three searches, and only for a `str` or array receiver. `str::is_empty` is
+  `Call __rmc_str_len` compared `== 0`, so it carries the length helper but no
+  search helper; `<[T; N]>::is_empty` folds to the constant `N == 0`, dropping a
+  named receiver as `len` does. A user `is_empty` on a struct or enum is
+  untouched.
+- **Empty array literal `[]`.** The parser accepts `[]` as an empty
+  `ArrayList`, but with no element to infer from sema rejects it unless the
+  context supplies the element type (`let z: [i64; 0] = [];` sets the expected
+  element type; a bare `let a = [];` is an error, as rustc's `E0282`). It lowers
+  to a block whose value is the zero-length array, with no assignment; `z.len()`
+  is `0` and `z.is_empty()` is `true`, and `for x in &z` runs zero times.
+- **Array element width comes from the context.** An array literal takes its
+  element width from the surrounding declared type the way a bare integer literal
+  does. `expected_elem_int` (sema state) is armed in the point positions — a
+  `let` annotation, a struct field, a call argument and a `return` expression —
+  and by `expected_ret`, which is set only while checking a function body's tail
+  expression so a tail array literal (`fn g() -> [u8; 3] { [1, 2, 3] }`) is
+  typed. `expected_ret` is consumed at the top of `check_block_inner`, so it
+  never leaks into a nested block. The width is threaded through nested array
+  literals too (`[[u8; 2]; 2] = [[1, 2], [3, 4]]`). Known gap: a literal element
+  does not yet *coerce* to a sibling element's inferred width (`[9u8, 8]` is
+  rejected, as is a wide `let a = [..]` bound to a `[u8; 3]`), and the expected
+  element type is not propagated through an `if`/`match`/block arm — rustc
+  accepts both.
 - **Built-in `i64` methods
   (`abs`/`min`/`max`/`clamp`/`signum`/`is_positive`/`is_negative`/
   `div_euclid`/`rem_euclid`/`midpoint`/`pow`/`wrapping_add`/`wrapping_sub`/

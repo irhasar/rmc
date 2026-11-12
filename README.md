@@ -309,8 +309,9 @@ loop); arithmetic, comparison, bitwise (`!`/`&`/`|`/`^`) and shift (`<<`/`>>`)
 operators; `&&`/`||`; strings (a `str` literal or `str`-typed parameter, return
 or field, compared by content with `==`/`!=`/`<`/`<=`/`>`/`>=`, with `.len()` for
 the byte length and `.starts_with(t)` / `.ends_with(t)` / `.contains(t)` for
-byte-wise prefix, suffix and substring tests); array `.len()` (a compile-time
-constant); built-in `i64` methods
+byte-wise prefix, suffix and substring tests, and `.is_empty()`); array `.len()`
+(a compile-time constant) and `.is_empty()` (the constant `N == 0`); built-in
+`i64` methods
 (`x.abs()`, `x.signum()`, `x.min(y)`, `x.max(y)`, `x.clamp(lo, hi)`,
 `x.is_positive()`, `x.is_negative()`, `x.div_euclid(y)`, `x.rem_euclid(y)`,
 `x.midpoint(y)`, `x.pow(n)`, `x.wrapping_add(y)`, `x.wrapping_sub(y)`,

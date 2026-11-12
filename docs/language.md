@@ -933,7 +933,15 @@ compile-time constant is decided at compile time, not by the trap.
   tests a substring. An empty `t` is a prefix, a suffix and a substring; a `t`
   longer than `s` is none of them. These are the `bool`-returning string
   methods only: `find` (which returns an `Option<usize>`) and the mutating
-  `String` methods are not provided.
+  `String` methods are not provided. `s.is_empty()` is `s.len() == 0`; on an
+  array it folds to the compile-time constant `N == 0`. An empty array literal
+  `[]` is accepted where the annotation supplies the element type
+  (`let z: [i64; 0] = [];`), and rejected otherwise, as rustc's `E0282` rejects
+  `let a = [];`. An array literal takes its element width from its context — a
+  `let` annotation, a struct field, a parameter, a `return` type (including a
+  function body's tail) — so `let a: [u8; 3] = [1, 2, 3]`,
+  `S { a: [1, 2, 3] }`, `f([1, 2, 3])` and `fn g() -> [u8; 3] { [1, 2, 3] }`
+  all narrow the elements, and the width threads through nested literals.
 - The type of a string literal is named `str` and may be written wherever a type
   goes: a `let` annotation, a parameter, a return type or a struct field
   (`fn f(s: str) -> str`, `struct M { s: str, n: i64 }`). A `str` is one word, so

@@ -328,6 +328,19 @@ def gen_expr_program(rng):
         needle = gen_str_lit(rng)
         m = rng.choice(["starts_with", "ends_with", "contains"])
         rs.append(f'    println!("{{}}", sv.{m}({needle}));')
+    # `is_empty` on a `str` (a length test) and on an array (a constant). The
+    # empty array is written with an annotation because `[]` has no element to
+    # infer from.
+    for _ in range(rng.randint(1, 3)):
+        rs.append(f'    println!("{{}}", {gen_str_lit(rng)}.is_empty());')
+    rs.append('    println!("{}", sv.is_empty());')
+    m = rng.randint(0, 4)
+    rs.append(f"    let ez: [i64; {m}] = [0; {m}];")
+    rs.append('    println!("{}", ez.is_empty());')
+    if rng.random() < 0.5:
+        rs.append('    let z: [i64; 0] = [];')
+        rs.append('    println!("{}", z.is_empty());')
+        rs.append('    println!("{}", z.len());')
     rs += ["}"]
     return "\n".join(rs)
 

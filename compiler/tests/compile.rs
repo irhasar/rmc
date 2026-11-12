@@ -2891,6 +2891,55 @@ fn the_string_search_helpers_are_dropped_when_unused() {
 }
 
 #[test]
+fn str_is_empty_lowers_to_a_length_test() {
+    // `str::is_empty` is `len() == 0`, so it reuses the length helper and a
+    // comparison rather than a pointer test.
+    let out = asm("fn main() -> i64 { let s = \"\"; if s.is_empty() { return 1; } return 0; }");
+    assert!(out.contains("call __rmc_str_len"), "length helper emitted: {out}");
+    assert!(!out.contains("__rmc_str_starts"), "no search helper: {out}");
+}
+
+#[test]
+fn array_is_empty_folds_to_a_constant() {
+    // An array's length is known at compile time, so `is_empty()` is a constant
+    // and a named receiver is dropped entirely.
+    let nonempty = asm("fn main() -> i64 { let a = [1, 2, 3]; if a.is_empty() { return 1; } return 0; }");
+    assert!(nonempty.contains("mov $0,") || !nonempty.contains("call"),
+            "non-empty array folds to false: {nonempty}");
+    let empty = asm("fn main() -> i64 { let z: [i64; 0] = []; if z.is_empty() { return 1; } return 0; }");
+    assert!(empty.contains("mov $1,"), "empty array folds to true: {empty}");
+}
+
+#[test]
+fn an_array_literal_takes_its_element_width_from_the_context() {
+    // A narrow element type reaches an array literal through a `let`
+    // annotation, a field, a parameter and a `return` type, exactly as a bare
+    // integer literal takes its width from the context.
+    for src in [
+        "fn main() -> i64 { let a: [u8; 3] = [1, 2, 3]; return a[0] as i64; }",
+        "struct S { a: [u8; 3] } fn main() -> i64 { let s = S { a: [1, 2, 3] }; return s.a[0] as i64; }",
+        "fn f(a: [u8; 3]) -> i64 { a[0] as i64 } fn main() -> i64 { return f([1, 2, 3]); }",
+        "fn g() -> [u8; 3] { [1, 2, 3] } fn main() -> i64 { return g()[0] as i64; }",
+        "fn main() -> i64 { let a: [[u8; 2]; 2] = [[1, 2], [3, 4]]; return a[1][0] as i64; }",
+    ] {
+        assert!(compile_to_asm(src, &CompileOptions::default()).is_ok(), "should compile: {src}");
+    }
+}
+
+#[test]
+fn an_empty_array_literal_works_in_point_positions() {
+    // `[]` is typed by the surrounding annotation in each position, so a field,
+    // a parameter and a `let` all accept it; only the untyped `let a = [];` is
+    // rejected (see `an_empty_list_literal_needs_an_element_type`).
+    for src in [
+        "struct S { a: [i64; 0] } fn main() -> i64 { let s = S { a: [] }; return s.a.len(); }",
+        "fn f(a: [i64; 0]) -> i64 { a.len() } fn main() -> i64 { return f([]); }",
+    ] {
+        assert!(compile_to_asm(src, &CompileOptions::default()).is_ok(), "should compile: {src}");
+    }
+}
+
+#[test]
 fn a_string_pattern_matches_by_content() {
     // A `str` scrutinee is a pointer, so a `match` on it must compare bytes,
     // not addresses: `match s { "a" => .. }` has to fire for a `let s = "a"`.
@@ -3813,10 +3862,22 @@ fn an_array_of_payload_enums_is_allowed() {
 }
 
 #[test]
-fn an_empty_list_literal_is_rejected() {
-    // `[]` has no element to infer from; the parser rejects it before sema.
+fn an_empty_list_literal_needs_an_element_type() {
+    // `[]` has no element to infer from, so it is rejected unless the context
+    // supplies one — as rustc rejects `let a = [];` with E0282.
     let err = compile_to_asm("fn main() -> i64 { let a = []; return 0; }", &CompileOptions::default()).unwrap_err();
-    assert!(err.contains("expected an expression"), "got: {err}");
+    assert!(err.contains("cannot infer the element type"), "got: {err}");
+}
+
+#[test]
+fn an_annotated_empty_list_literal_compiles() {
+    // `let z: [i64; 0] = [];` names the element type, so it is accepted, and
+    // `z.is_empty()` folds to `true` while `z.len()` folds to `0`.
+    assert!(compile_to_asm(
+        "fn main() -> i64 { let z: [i64; 0] = []; return z.len(); }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
 }
 
 #[test]

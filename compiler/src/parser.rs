@@ -7576,6 +7576,12 @@ impl Parser {
             Some(Tok::LBrace) => Ok(Expr::Block(self.parse_block()?)),
             Some(Tok::LBracket) => {
                 self.i += 1;
+                // `[]`: an empty array literal. It has no element to infer a
+                // type from, so sema only accepts it where the annotation
+                // supplies one (`let z: [i64; 0] = [];`).
+                if self.eat(&Tok::RBracket) {
+                    return Ok(Expr::ArrayList(Vec::new()));
+                }
                 let first = self.parse_bracketed_expr()?;
                 if self.eat(&Tok::Semi) {
                     // `[v; N]`: the repeat count is a constant expression.
