@@ -7813,6 +7813,26 @@ fn the_option_and_result_prelude_is_available() {
 }
 
 #[test]
+fn a_generic_type_closes_before_a_glued_operator() {
+    // `Result<i64,i64>=Ok(5)`: the lexer sees `>=` as one token, but the type
+    // parser splits it so the `>` closes the generic and `=` starts the
+    // initializer, exactly as rustc reads it. Without the split the annotation
+    // ran to end-of-input.
+    let out = asm("fn main() { let r: Result<i64,i64>=Ok(5); let _ = r; }");
+    assert!(out.contains("main:"), "`Result<..>=` must parse:\n{out}");
+    // The same for a nested `Vec` closed by `>>`, and for a triple-nested
+    // `Vec` whose `>>>` must split into `>` and a further `>>`.
+    let nested = asm("fn main() { let v: Vec<Vec<i64>> = Vec::new(); let _ = v.len(); }");
+    assert!(nested.contains("main:"), "`Vec<Vec<i64>>` must parse:\n{nested}");
+    let deep = asm("fn main() { let v: Vec<Vec<Vec<i64>>> = Vec::new(); let _ = v.len(); }");
+    assert!(deep.contains("main:"), "`Vec<Vec<Vec<i64>>>` must parse:\n{deep}");
+    // A genuine comparison and shift are untouched: the split only fires where
+    // a closing `>` is expected.
+    let cmp = asm("fn main() { let a = 5; let b = 3; let _ = a >= b; let _ = 8 >> 1; }");
+    assert!(cmp.contains("main:"), "a real `>=`/`>>` still parses:\n{cmp}");
+}
+
+#[test]
 fn an_unused_prelude_costs_nothing() {
     // The dead-function pass removes prelude methods a program never calls, so
     // a plain program's assembly does not mention them.

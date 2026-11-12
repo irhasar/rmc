@@ -344,6 +344,34 @@ impl Parser {
         self.toks.get(self.i).map(|t| &t.tok)
     }
 
+    /// Split a `>=` or `>>` token at the current position into a `>` now and
+    /// the rest (`=` or `>`) as a fresh token, so a type's closing `>` can be
+    /// taken even when the source glued it to a following operator
+    /// (`Result<i64,i64>=Ok(5)`, `Vec<Vec<i64>>`). Rust's own parser does the
+    /// same split. Called only where a `>` is expected, so it never fires on a
+    /// genuine comparison.
+    fn split_gt(&mut self) {
+        if self.i >= self.toks.len() {
+            return;
+        }
+        let pos = self.toks[self.i].pos;
+        match self.toks[self.i].tok {
+            Tok::Ge => {
+                self.toks[self.i].tok = Tok::Eq;
+                self.toks.insert(self.i, Token { tok: Tok::Gt, pos });
+            }
+            Tok::Shr => {
+                self.toks[self.i].tok = Tok::Gt;
+                self.toks.insert(self.i, Token { tok: Tok::Gt, pos });
+            }
+            Tok::ShrEq => {
+                self.toks[self.i].tok = Tok::Ge;
+                self.toks.insert(self.i, Token { tok: Tok::Gt, pos });
+            }
+            _ => {}
+        }
+    }
+
     /// The token after the next one, for a two-token lookahead (`'a: loop`).
     fn peek2(&self) -> Option<&Tok> {
         self.toks.get(self.i + 1).map(|t| &t.tok)
@@ -1632,6 +1660,7 @@ impl Parser {
                         self.i += 1; // `<`
                         let mut depth = 1i32;
                         while depth > 0 {
+                            self.split_gt();
                             match self.peek() {
                                 None => {
                                     return Err(format!(
@@ -1665,6 +1694,7 @@ impl Parser {
                     };
                     let mut depth = 1i32;
                     while depth > 0 {
+                        self.split_gt();
                         match self.peek() {
                             None => {
                                 return Err(format!(

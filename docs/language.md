@@ -916,7 +916,10 @@ carry no meaning and are accepted and ignored: `Option<i64>` and `Option` name
 the same enum. The constructors are written unqualified, as in Rust —
 `Some(x)`, `None`, `Ok(v)`, `Err(e)` — in both expressions and patterns, so
 `if let Some(x) = o`, `while let Some(x) = o` and
-`match o { Some(x) => .., None => .. }` all work.
+`match o { Some(x) => .., None => .. }` all work. A type argument list may nest
+(`Vec<Vec<i64>>`) and may run straight into a following operator
+(`Result<i64,i64>=Ok(5)`): the closing `>` is split off the glued `>=`, `>>` or
+`>>=` token, as rustc's parser does, so no space is required around it.
 
 These types are not a special case in the compiler: they are injected as
 ordinary user-level code (a payload enum plus `impl` methods) before semantic
