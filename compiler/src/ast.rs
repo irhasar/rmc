@@ -564,6 +564,9 @@ pub struct FnDef {
     /// checking (`&mut T` and `&T` are distinct types); there is no exclusivity
     /// check.
     pub ref_self_mut: bool,
+    /// True when the receiver was written `mut self`: it is taken by value, but
+    /// the binding is mutable, so the body may assign it.
+    pub self_mut: bool,
     pub params: Vec<(String, Type)>,
     /// Whether each parameter was declared `mut`, parallel to `params`. A
     /// non-`mut` parameter is an immutable binding, so assigning it is rejected

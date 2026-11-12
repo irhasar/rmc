@@ -25,6 +25,9 @@ pub struct Sig {
     /// True when the receiver was `&mut self`, so the synthesized parameter is
     /// `&mut T` and matches the address the call site builds.
     pub ref_self_mut: bool,
+    /// True when the receiver was `mut self`: by value, but the binding may be
+    /// assigned in the body.
+    pub self_mut: bool,
 }
 
 /// A laid-out struct: each field's name, resolved type and byte offset, plus the
@@ -283,6 +286,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
                 takes_self: false,
                 ref_self: false,
                 ref_self_mut: false,
+                self_mut: false,
             },
         );
     }
@@ -299,7 +303,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
                     Type::Named(ty)
                 };
                 f.params.insert(0, ("self".to_string(), rt));
-                f.param_mut.insert(0, false);
+                f.param_mut.insert(0, f.self_mut);
                 f.param_pats.insert(0, None);
             }
         }
@@ -334,6 +338,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
                 takes_self: f.takes_self,
                 ref_self: f.ref_self,
                 ref_self_mut: f.ref_self_mut,
+                self_mut: f.self_mut,
             },
         );
     }

@@ -1045,7 +1045,7 @@ impl Parser {
             Type::Unit
         };
         let body = self.parse_block()?;
-        Ok(FnDef { name, self_ty: None, takes_self: false, ref_self: false, ref_self_mut: false, params, param_mut, param_pats, ret, body, param_slots: Vec::new(), ret_slot: -1, nslots: 0 })
+        Ok(FnDef { name, self_ty: None, takes_self: false, ref_self: false, ref_self_mut: false, self_mut: false, params, param_mut, param_pats, ret, body, param_slots: Vec::new(), ret_slot: -1, nslots: 0 })
     }
 
     /// `impl Type { fn method(self, ..) -> .. { .. } }`. The methods are pushed
@@ -1089,25 +1089,33 @@ impl Parser {
         let takes_self = match self.peek() {
             Some(Tok::Amp) => true,
             Some(Tok::Ident(n)) => n == "self",
+            // `mut self`: the receiver is by value but the binding is mutable.
+            Some(Tok::Mut) => matches!(
+                self.toks.get(self.i + 1).map(|t| &t.tok),
+                Some(Tok::Ident(n)) if n == "self"
+            ),
             _ => false,
         };
         let mut params = Vec::new();
         let mut param_mut = Vec::new();
         let mut param_pats = Vec::new();
-        let (by_ref, by_mut) = if takes_self {
+        let (by_ref, by_mut, self_mut) = if takes_self {
             let by_ref = self.eat(&Tok::Amp);
+            // `&mut self` makes the receiver a `&mut`; a by-value `mut self`
+            // only makes the local binding mutable, so it does not set `by_mut`.
             let by_mut = by_ref && self.eat(&Tok::Mut);
+            let self_mut = !by_ref && self.eat(&Tok::Mut);
             let first = self.expect_ident()?;
             debug_assert_eq!(first, "self");
             if self.eat(&Tok::Comma) {
                 self.parse_param_list(&mut params, &mut param_mut, &mut param_pats)?;
             }
-            (by_ref, by_mut)
+            (by_ref, by_mut, self_mut)
         } else {
             if self.peek() != Some(&Tok::RParen) {
                 self.parse_param_list(&mut params, &mut param_mut, &mut param_pats)?;
             }
-            (false, false)
+            (false, false, false)
         };
         self.expect(Tok::RParen)?;
         Self::check_dup_param_names(&params, &param_pats)?;
@@ -1119,6 +1127,7 @@ impl Parser {
             takes_self,
             ref_self: by_ref,
             ref_self_mut: by_mut,
+            self_mut,
             params,
             param_mut,
             param_pats,
