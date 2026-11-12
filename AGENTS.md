@@ -2684,25 +2684,36 @@ user for a write-capable `ghp_` token and push with it — do not scan
 conversation logs for one.
 
 The token must never be persisted in `.git/config` or a file, so `origin` is a
-plain token-free URL (`https://github.com/irhasar/rmc.git`) and there is no
-credential helper. A bare `git push origin <branch>` therefore prompts for a
-username and hangs — do not run it. Supply the token through an *environment*
-variable and a one-shot credential helper, so it never reaches `argv` or shell
-history (an inline `https://x-access-token:<token>@...` URL is visible in both
-`ps` and the history file, and an output filter cannot hide either copy):
+plain token-free URL (`https://github.com/irhasar/rmc.git`). But the environment
+*does* install a global credential helper
+(`~/.openhands/git-credential-helper`, via
+`credential.https://github.com.helper`), and it answers with the same read-only
+token as `GITHUB_TOKEN`. A `-c credential.helper=<mine>` only *appends* to that
+list, so the global helper still runs first and the push still 403s — the token
+is never even consulted. Clear the list and install the one-shot helper on the
+URL-specific key:
 
 ```
-RMC_PUSH_TOKEN=<token> \
-  git -c credential.helper='!f(){ echo username=x-access-token; echo "password=$RMC_PUSH_TOKEN"; };f' \
+RMC_PUSH_TOKEN=<token> git \
+  -c credential.helper= \
+  -c credential.https://github.com.helper= \
+  -c credential.https://github.com.helper='!f(){ echo username=x-access-token; echo "password=$RMC_PUSH_TOKEN"; };f' \
+  -c credential.https://github.com.username=x-access-token \
   push origin <branch>
 ```
 
-The helper text on the command line names the *variable*, not its value. A read
+The two empty `-c` assignments reset the inherited helpers; the helper text
+names the *variable*, not its value, so the token never reaches `argv` or shell
+history (an inline `https://x-access-token:<token>@...` URL is visible in both
+`ps` and the history file, and an output filter cannot hide either copy). A read
 works the same way:
 
 ```
-RMC_PUSH_TOKEN=<token> \
-  git -c credential.helper='!f(){ echo username=x-access-token; echo "password=$RMC_PUSH_TOKEN"; };f' \
+RMC_PUSH_TOKEN=<token> git \
+  -c credential.helper= \
+  -c credential.https://github.com.helper= \
+  -c credential.https://github.com.helper='!f(){ echo username=x-access-token; echo "password=$RMC_PUSH_TOKEN"; };f' \
+  -c credential.https://github.com.username=x-access-token \
   fetch origin <branch>:refs/remotes/origin/<branch>
 ```
 
