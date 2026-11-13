@@ -188,8 +188,11 @@ head, a refutable `n @ 1..=5` in a `match` arm and an `if let`, and `n @ _` /
 `mut n @ _` parameters), `tuple` for
 tuples (construction, `.0` element access, destructuring in a `let`, a `match`
 arm and a parameter, nesting, a tuple-typed struct field, an array of tuples,
-and a tuple behind a reference, used as parameter and return types), `nestedfn`
-for nested `fn` items (hoisting, a call before the declaration, a sibling called
+and a tuple behind a reference, used as parameter and return types), `tuplestruct` for
+tuple structs (construction `P(a, b)`, positional `.0` access, a `let`/`match`/`for`
+destructuring, a parameter pattern, one-field and unit structs, a tuple struct
+nested in a struct field and destructured through it, and a nested array
+pattern), `nestedfn` for nested `fn` items (hoisting, a call before the declaration, a sibling called
 after it, a nested `fn` inside another body, a nested `fn` shadowing a top-level
 one of the same name, and the shadowed name called to confirm the inner one
 wins), `typealias` for `type` aliases (a scalar, tuple, array and struct alias,
@@ -297,7 +300,9 @@ array elements and struct fields (including compound `+=` and friends);
 (array iteration, by value); `match` on integers,
 `bool`s, `char`s, enums and strings (literal, `true`/`false`, char, string,
 `Enum::Variant`, struct and
-`_` patterns, plus payload bindings and binding names, and a per-arm guard
+`_` patterns, plus payload bindings and binding names, nested variant
+patterns (`O::W(I::A)`) and refutable payload arguments (`E::A(1)`,
+`E::A(1 | 2)`), and a per-arm guard
 `PAT if COND`) and `if let` with the
 same patterns
 (desugared to a two-arm `match`); enums with unit variants (an optional
@@ -309,10 +314,15 @@ works as an expression), `continue`,
 loop); arithmetic, comparison, bitwise (`!`/`&`/`|`/`^`) and shift (`<<`/`>>`)
 operators; `&&`/`||`; strings (a `str` literal or `str`-typed parameter, return
 or field, compared by content with `==`/`!=`/`<`/`<=`/`>`/`>=`, with `.len()` for
-the byte length); array `.len()` (a compile-time constant); built-in `i64` methods
+the byte length and `.starts_with(t)` / `.ends_with(t)` / `.contains(t)` for
+byte-wise prefix, suffix and substring tests, and `.is_empty()`); array `.len()`
+(a compile-time constant) and `.is_empty()` (the constant `N == 0`); built-in
+`i64` methods
 (`x.abs()`, `x.signum()`, `x.min(y)`, `x.max(y)`, `x.clamp(lo, hi)`,
 `x.is_positive()`, `x.is_negative()`, `x.div_euclid(y)`, `x.rem_euclid(y)`,
-`x.midpoint(y)`,
+`x.midpoint(y)`, `x.pow(n)`, `x.wrapping_add(y)`, `x.wrapping_sub(y)`,
+`x.wrapping_mul(y)`, `x.saturating_add(y)`, `x.saturating_sub(y)`,
+`x.saturating_mul(y)`,
 `x.count_ones()`, `x.count_zeros()`, `x.leading_zeros()`, `x.trailing_zeros()`,
 `x.leading_ones()`, `x.trailing_ones()`, `x.swap_bytes()`, `x.reverse_bits()`,
 `x.rotate_left(n)`, `x.rotate_right(n)`, desugared to
@@ -624,12 +634,14 @@ of value per unit of effort:
    the check — rmc does not prove a reference outlives its referent or that
    `&mut` is exclusive, so an aliasing bug is a wrong answer, not a compile
    error.
-3. **More types.** `u*`/`i*` widths and `f64`, which together cover most of what
-   small programs actually need. (`match` on integers is done.) **Slices**
-   (`&[T]`, and the slice literals and sub-slicing `&a[lo..hi]` that build them)
-   are the other large gap: a slice is a *fat* pointer (a data pointer plus a
-   length), so it needs a two-word value kind threaded through parameters,
-   returns and indexing, unlike the one-word `&T` and `str` rmc has today.
+3. **More types.** `u*`/`i*` widths are done (a suffixed literal is typed at
+   its width, with width-aware overflow). `f64` is the remaining scalar gap:
+   it needs the SSE register file and a floating-point calling convention, so it
+   is a larger change than a new integer width. **Slices** (`&[T]`, and the
+   slice literals and sub-slicing `&a[lo..hi]` that build them) are the other
+   large gap: a slice is a *fat* pointer (a data pointer plus a length), so it
+   needs a two-word value kind threaded through parameters, returns and
+   indexing, unlike the one-word `&T` and `str` rmc has today.
 4. **More backends.** A second target (ARM64 or a simple VM) would force the
    code generator's assumptions out into the open.
 5. **Debug info.** Line tables so a debugger can point at source.

@@ -13,10 +13,10 @@ are no runtime type errors.
 | `bool`       | `true` or `false`                             |
 | `char`       | a Unicode scalar value (a 4-byte code point, held in an 8-byte slot) |
 | `str`        | a string (one word: a pointer to a `{len, bytes}` record) |
-| `[T; N]`     | fixed-size array of `N` `T` elements, where `T` is a scalar, a struct or another array |
+| `[T; N]`     | fixed-size array of `N` `T` elements, where `T` is a scalar, `str`, a reference, a struct, a payload enum or another array |
 | `(A, B)`     | a tuple of the given element types (an aggregate) |
 | `&T` `&mut T`| a reference to a `T` (one word)               |
-| `Name`       | a struct declared with `struct Name { .. }`   |
+| `Name`       | a struct declared with `struct Name { .. }`, `struct Name(T, T);` (a tuple struct) or `struct Name;` (a unit struct) |
 | `Name`       | an enum declared with `enum Name { .. }`      |
 | `Name`       | a `type` alias declared with `type Name = T;` |
 | `()`         | unit, the result of a statement or `main`     |
@@ -78,6 +78,40 @@ struct after passing it (as `bump(a)` then reading `a`), annotate it
 `#[derive(Copy, Clone)]` so the same source also compiles with rustc; rmc parses
 and ignores the attribute.
 
+A tuple struct declares its fields positionally and constructs them with a call:
+
+```rust
+struct Pair(i64, i64);
+
+let p: Pair = Pair(3, 4);
+let x: i64 = p.0;                       // fields are named "0", "1", ...
+let y: i64 = p.1;
+let Pair(a, b) = p;                     // positional pattern
+fn sum(Pair(a, b): Pair) -> i64 { a + b }
+```
+
+It lays out and reads exactly like a braced struct with the same field types —
+only the syntax differs — so `p.0` is an ordinary field read and `Pair(a, b)` is
+an ordinary literal. A one-field tuple struct (`struct Meters(i64);`) and a
+tuple struct nested in another field or destructured through one (`S { p: Pair(a, b) }`)
+both work.
+
+A unit struct declares no fields; its name is also its value, so `U` is a
+zero-sized value that can be bound and matched:
+
+```rust
+struct Unit;
+
+let u: Unit = Unit;
+let Unit = u;                           // matches the unit struct
+```
+
+Unlike a tuple struct, a unit struct's bare name is a valid *pattern* as well as
+a value; unlike an empty braced struct (`struct E {}`, constructed `E {}`), it is
+named by `U` alone. As in rustc, a `let` binding may not shadow a struct of any
+kind (a tuple struct's name is a constructor and a unit struct's name is a
+value), so `let Pair = 5;` and `let Unit = 5;` are rejected.
+
 ## Methods
 
 ```rust
@@ -119,9 +153,10 @@ variant of that enum and not an associated function is reported as such.
 
 ### Built-in integer methods
 
-An `i64` receiver has twenty methods built in, which desugar to the operators
+An `i64` receiver has twenty-six methods built in, which desugar to the operators
 rmc already lowers (so they cost no call, except `clamp`, for its panic, and the
-ten bit methods below, for their per-bit work):
+sixteen helpers below — the ten bit methods, for their per-bit work, and the six
+arithmetic methods, for their overflow semantics):
 
 | call                    | meaning                                        |
 | ----------------------- | ---------------------------------------------- |
@@ -135,6 +170,13 @@ ten bit methods below, for their per-bit work):
 | `x.div_euclid(y)`       | `x / y` rounded toward the mathematical quotient |
 | `x.rem_euclid(y)`       | the remainder in `[0, abs(y))`                  |
 | `x.midpoint(y)`         | the mean of `x` and `y`, rounded toward zero    |
+| `x.pow(n)`              | `x` raised to `n` (wrapping on overflow)        |
+| `x.wrapping_add(y)`     | `x + y`, wrapping on overflow                   |
+| `x.wrapping_sub(y)`     | `x - y`, wrapping on overflow                   |
+| `x.wrapping_mul(y)`     | `x * y`, wrapping on overflow                   |
+| `x.saturating_add(y)`   | `x + y`, clamped to the `i64` bounds            |
+| `x.saturating_sub(y)`   | `x - y`, clamped to the `i64` bounds            |
+| `x.saturating_mul(y)`   | `x * y`, clamped to the `i64` bounds            |
 | `x.count_ones()`        | the number of set bits                          |
 | `x.count_zeros()`       | the number of clear bits                        |
 | `x.leading_zeros()`     | the zeros above the top set bit (64 when `x` is 0) |
@@ -149,9 +191,9 @@ ten bit methods below, for their per-bit work):
 The semantics match `rustc -O`: `i64::MIN.abs()` is `i64::MIN` (it does not
 trap; with `--overflow-checks` it traps, as in a debug build), and `signum` is
 computed with comparisons only, so `i64::MIN.signum()` is `-1` without overflow.
-`is_positive`/`is_negative` return `bool` — unlike the eighteen arithmetic and
-bit methods, which return `i64` — and `0` is neither positive nor negative, so
-both are `false` there.
+`is_positive`/`is_negative` return `bool` — unlike the twenty-five arithmetic
+and bit methods, which return `i64` — and `0` is neither positive nor negative,
+so both are `false` there.
 `div_euclid`/`rem_euclid` compute `q = x / y` and `r = x % y` and round toward
 the mathematical quotient: when `r` is negative, `q` moves one step further from
 zero and `r` gains `abs(y)`. They reuse `/` and `%`, so a zero divisor and
@@ -165,6 +207,13 @@ same with and without `--overflow-checks`.
 `clamp` returns `lo`, `x` or `hi`, and panics when `lo > hi` (a message and exit
 101, like rustc); it is the one built-in whose panic is a runtime call, so a
 program that never calls it does not carry the helper.
+`pow`, `wrapping_add`/`_sub`/`_mul` and `saturating_add`/`_sub`/`_mul` each lower
+to a runtime helper, so the result matches `rustc -O` for every operand and none
+can trap. `wrapping_*` and `pow` wrap in two's complement (`2i64.pow(64)` is `0`,
+`(-2i64).pow(63)` is `i64::MIN`); the `saturating_*` family clamps at `i64::MIN`
+or `i64::MAX` instead of wrapping. `pow` is binary exponentiation, and its
+argument is an `i64` like every other rmc value (rustc's `pow` takes a `u32`),
+so an exponent written as a literal or a plain expression behaves identically.
 The bit methods each lower to a small runtime helper rather than to operators:
 `x & (x - 1)` would overflow for `i64::MIN`, whereas a loop over the 64 bits is
 exact for every input, so the result is the same with and without
@@ -240,13 +289,22 @@ A pattern that matches a payload variant must bind its fields, `Opt::Some(v)`;
 matching it bare (`Opt::Some`) is an error, because there is no way to name the
 value. An argument may be a wildcard (`Opt::Some(_)`), a `mut` binding
 (`Opt::Some(mut v)`), a nested struct or array sub-pattern (`E::A(S { x })`,
-`E::A([a, b])`), or a trailing `..` that ignores the remaining fields
+`E::A([a, b])`), a nested variant pattern (`O::W(I::A)`), a scalar test
+(`E::A(1)`, `E::A(1 | 2)`), or a trailing `..` that ignores the remaining fields
 (`E::A(x, ..)`, `E::A(..)`). Each argument is the payload read at its field
 index, fed to the same sub-pattern expansion a `let` destructuring uses, so the
-naming directions compose. An argument must be irrefutable — a literal
-(`E::A(1)`) would need a per-field test rmc does not generate, so it is
-rejected, as is `mut` on a nested pattern. Naming more fields than the variant
-has, or fewer without a `..`, is an error.
+naming directions compose. A refutable argument adds its own test, `&&`-ed after
+the variant's tag test, so `E::A(1)` matches only a payload of `1` and
+`O::W(I::A)` does not match `O::W(I::B)`; `mut` on a nested pattern is rejected
+(it attaches to a binding). Naming more fields than the variant has, or fewer
+without a `..`, is an error.
+A match whose arms enumerate every variant of the scrutinee's enum, and — for
+each payload arm with a sub-pattern — every variant of the payload enum, is
+exhaustive without a `_` arm, as in rustc:
+`match o { O::W(I::A) => .., O::W(I::B) => .., O::Z => .. }` is total. A payload
+arm that binds the whole field (`O::W(x)`, `O::W(_)`) covers its variant
+outright; a variant whose payload is a scalar, struct or tuple field cannot be
+shown complete this way, so such a match needs a `_` arm.
 A pattern reads through a reference to the scrutinee, as Rust's match ergonomics
 do: `match &e { Opt::Some(v) => .. }` dereferences `&E` to the `E` underneath, so
 the test and every payload read go through the one deref (a struct pattern
@@ -254,7 +312,7 @@ auto-derefs a `&S` scrutinee in the same way, and so does a literal, range or
 bool pattern — `match &x { 5 => .. }`). The referent is what the pattern
 is checked against, so a variant of a different enum is still rejected.
 A payload variant is not comparable with `==` and cannot be cast with
-`as` (it is not a scalar), and it may not be an array element.
+`as` (it is not a scalar).
 
 A recursive enum such as `enum L { Nil, Cons(i64, L) }` is rejected: rmc has no
 indirection, so an enum may not contain itself.
@@ -350,9 +408,10 @@ const M: i64 = N * 2;      // a constant may name one declared later
 ```
 
 A `const NAME: TYPE = EXPR;` item is folded at compile time to a single value
-and substituted at every use, so it has no storage and no codegen. Only `i64`
-and `bool` constants are accepted, which is what an array length or a scalar
-expression can use; any other type is rejected. A reference to a constant is
+and substituted at every use, so it has no storage and no codegen. Only an
+integer (`i64` or a narrow width), `bool` or `char` constant is accepted, which
+is what an array length or a scalar expression can use; any other type is
+rejected. A reference to a constant is
 resolved wherever a value may appear, including an array length (`[i64; N]`), an
 array repeat count (`[x; N]`), a `for` bound, a condition, and a `match`
 pattern, where a bare constant name is that value rather than a fresh binding.
@@ -360,6 +419,26 @@ A constant may be named before it is declared, as in Rust. Arithmetic in an
 initializer that would trap at run time — division or remainder by zero, `i64`
 overflow, or a shift by 64 or more — is rejected, as is a cycle between
 constants and an initializer that is not a constant expression.
+
+A `const` may carry a narrow integer type (`u8`, `i16`, `u32`, ...). The
+initializer then folds at that declared width, exactly as rustc's const
+evaluator does: `const N: u8 = 250 + 10` is an overflow (rustc's `E0080`),
+`const N: u8 = 300` is a literal out of range, and a bare `300 as u8` is
+rejected at the cast, while `300u16 as u8` is a valid narrowing cast. The
+arithmetic methods rustc folds in a constant are folded here too —
+`wrapping_add`/`wrapping_sub`/`wrapping_mul` wrap, `saturating_add`/
+`saturating_sub`/`saturating_mul` clamp to the width, and `pow` is exact within
+it — so `const W: u8 = 200u8.wrapping_mul(2)` is 144 and
+`const S: u8 = 250u8.saturating_add(10)` is 255. A method folds at its
+*receiver's* width, not the destination's: `A.saturating_add(10)` on a `u8` `A`
+clamps at `u8` (255) even when the result is bound to an `i64`, the width coming
+from the receiver (a narrow constant name, a suffixed literal or a cast) and
+falling back to the declared width only when the receiver names none. A `pow`
+fold is exponentiation by squaring, so a huge literal exponent
+(`const N: u8 = 1u8.pow(1_000_000_000)`) folds in time logarithmic in the
+exponent rather than stalling. A use of a narrow constant is
+substituted at its declared width, so `A + 200` still overflows a `u8` `A`
+rather than widening to `i64`.
 
 A `const` may also be declared inside a block, where it is folded and in scope
 for the rest of that block. Like a top-level `const` it may be named before it is
@@ -437,6 +516,8 @@ let [a, b] = arr;        // array destructuring: bind `a` = arr[0], `b` = arr[1]
 let [x, _, .., z] = arr; // `_` ignores an element, `..` absorbs the middle
 let [mut a, b] = arr;    // per-element `mut`, optional annotation
 let S { a: [x, y], b } = s; // array-typed field destructured in place
+let Pair(a, b) = p;      // tuple-struct destructuring: bind `a` = p.0, `b` = p.1
+let Unit = u;            // unit-struct pattern: matches the unit struct `Unit`
 let _ = e;               // discard: evaluate `e` for side effects, bind nothing
 let _: T;                // annotated discard, no initialiser (a no-op)
 y = y + 1;               // assignment (target may be a variable, array element or field)
@@ -455,6 +536,10 @@ for i in (0..10).skip(3) { ... }     // drop the first three
 for i in (0..10).take(3) { ... }     // keep only the first three
 for i in (0..10).skip(2).take(3).rev() { ... }  // adapters chain, left to right
 for x in arr { ... }     // array, by value, left to right (x is the element)
+for x in &arr { ... }    // array, by reference (x is &T; `*x` reads the element)
+for x in &mut arr { ... }// array, by mutable reference (`*x = v` writes in place)
+for x in arr.iter() { ... }      // the same as `for x in &arr`
+for x in arr.iter_mut() { ... }  // the same as `for x in &mut arr`
 loop { ... }
 loop { ... break v; }    // `loop` is an expression: `break v` yields `v`
 break;
@@ -487,6 +572,9 @@ rejected (`mut` must be attached to each individual binding, as in rustc).
 A struct-typed field may be destructured by a nested sub-pattern
 (`let S { a: I { x } } = e;`), and an array-typed field by an array pattern
 (`let S { a: [x, y], b } = e;`); see Struct patterns for the full field grammar.
+A tuple struct is destructured positionally (`let Pair(a, b) = p;`, or nested as
+`let S { p: Pair(a, b) } = s;`), binding field `"0"`, `"1"`, ... in order, and a
+unit struct matches by its bare name (`let Unit = u;`).
 A `let [a, b, .., c] = e;` destructures an array the same way: each named element
 is bound as a fresh local in the enclosing block, the scrutinee is evaluated
 exactly once, and a type annotation after the pattern (`let [x, y]: [i64; 2] =
@@ -519,16 +607,31 @@ iteration. The loop variable may be a binding, `_`, a struct pattern
 (`for S { f, .. } in arr`), an array pattern (`for [x, y] in pairs`), or an
 at-binding (`for n @ _ in arr`, `for i @ j in 0..3`), which binds
 each element's fields or elements fresh each iteration; any other pattern is
-refutable and rejected. A range may be iterated downward with `.rev()`, written
+refutable and rejected. `for x in &arr` iterates the array by *reference*: `x`
+is `&T` (or `&mut T` for `&mut arr`), bound to `&arr[i]`, so `*x` reads the
+element and, through a `&mut`, `*x = v` writes it in place. The array place is
+indexed directly (never copied), and the head must be a place (`&arr`,
+`&arr[i]`, `&arr[i].f`); a reference to a temporary (`&mk()`) is rejected.
+`arr.iter()` and `arr.iter_mut()` are the same loops (`&arr` and `&mut arr`);
+`arr.into_iter()` is not accepted, because on an array its element type is
+edition-dependent. A
+range may be iterated downward with `.rev()`, written
 `for i in (lo..hi).rev()` or `(lo..=hi).rev()`: `lo` and `hi` are evaluated
 once each, the loop yields `hi - 1` down to `lo` (or `hi` down to `lo`
 inclusive), and `continue` still runs the decrement. The parentheses are
-required, as in Rust. Three counting adapters are also supported and may chain:
+required, as in Rust. A `rev`-only range is lowered to a downward index rather
+than to a count of `hi - lo + 1`, so a range whose length does not fit `i64`
+(`for i in (0..=i64::MAX).rev()`) still runs; only a `rev` chained after a
+`skip`/`step_by` materialises the span as a count, and the full
+`i64::MIN..=i64::MAX` span overflows. Three counting adapters are also supported
+and may chain:
 `.step_by(k)` yields every `k`-th element, `.skip(k)` drops the first `k`, and
 `.take(k)` keeps only the first `k`. Adapters apply left to right, so
 `(0..10).skip(2).take(3).rev()` reverses the slice `[2, 3, 4]`; each bound is
-evaluated once, and `continue` still runs the counter increment. `for x in &arr`
-(which Rust iterates by reference) is rejected rather than mistyped. `while let` is
+evaluated once, and `continue` still runs the counter increment. A count is a
+`usize`, so a negative literal (`skip(-1)`) is rejected, matching rustc's
+`E0600`. `for x in &arr` (and `&mut arr`) is supported as above; any other
+reference head (`for x in &mk()`) is rejected rather than mistyped. `while let` is
 `loop { if let PAT = expr { body } else { break; } }`: the scrutinee is
 re-evaluated every iteration, and `continue` re-tests it rather than jumping to
 the top.
@@ -634,9 +737,11 @@ compile-time constant is decided at compile time, not by the trap.
 - Array literals: `[a, b, c]` and `[value; count]`. A list literal takes its
   element type from the values, so `[true, false]` is a `[bool; 2]` and
   `[1, 2, 3]` an `[i64; 3]`; mixing the two is an error. An array element may be
-  a scalar (`i64`, `bool`, a unit enum), a struct or another array, so
-  `[[i64; 3]; 2]`, `[Point; 4]` and `[[[i64; 2]; 2]; 2]` are all valid; a payload
-  enum and a reference are rejected (rustc rejects both as well). Element `i`
+  a scalar (`i64`, `bool`, a char or a unit enum), a `str`, a reference, a
+  struct, a payload enum or another array, so `[[i64; 3]; 2]`, `[Point; 4]`,
+  `[&str; 3]`, `[&i64; 2]` and `[[[i64; 2]; 2]; 2]` are all valid. A `str` and a
+  reference are one-word pointers, so `[&str; n]` and `[&T; n]` are arrays of
+  pointers. Element `i`
   lives at `base + i * sizeof(T)`, so a wide element (a nested array or a struct)
   occupies `size / 8` slots, and a whole element may be read, written or copied
   (`a[i] = b[j]`, `m[i]` as a `[i64; 3]` value).
@@ -714,7 +819,11 @@ compile-time constant is decided at compile time, not by the trap.
   enum section). A wrong field name is an error,
   even for `i: _`, and a field bound twice is an error. Because a struct pattern
   is irrefutable, a *binding* struct pattern in an or-pattern is rejected, as is
-  any binding alternative (a nested binding counts).
+  any binding alternative (a nested binding counts). A tuple struct pattern
+  `P(a, b)` reuses the same machinery with positional fields `"0"`, `"1"`, ...;
+  its arity must equal the struct's field count, and a bare tuple-struct name is
+  neither a binding nor a pattern. A unit struct's name is itself a pattern
+  (`U`, binding nothing), since its name is also its value.
 - At-bindings: `name @ subpat` binds the whole value to `name` and also matches
   it against `subpat`, so the arm body (or the rest of the block) sees both the
   whole value and the sub-pattern's bindings. `name @ _` is the plain alias, and
@@ -818,6 +927,21 @@ compile-time constant is decided at compile time, not by the trap.
   it reads the record's length word (a runtime helper, since a `str` is a
   pointer), and is an `i64` where rustc's is a `usize`. `a.len()` on an array of
   length `N` is the compile-time constant `N`, with no runtime work.
+  `s.starts_with(t)`, `s.ends_with(t)` and `s.contains(t)` compare the bytes of
+  the two records (each is a runtime helper, since a `str` is a pointer) and
+  yield a `bool`: `starts_with`/`ends_with` test a prefix/suffix, and `contains`
+  tests a substring. An empty `t` is a prefix, a suffix and a substring; a `t`
+  longer than `s` is none of them. These are the `bool`-returning string
+  methods only: `find` (which returns an `Option<usize>`) and the mutating
+  `String` methods are not provided. `s.is_empty()` is `s.len() == 0`; on an
+  array it folds to the compile-time constant `N == 0`. An empty array literal
+  `[]` is accepted where the annotation supplies the element type
+  (`let z: [i64; 0] = [];`), and rejected otherwise, as rustc's `E0282` rejects
+  `let a = [];`. An array literal takes its element width from its context — a
+  `let` annotation, a struct field, a parameter, a `return` type (including a
+  function body's tail) — so `let a: [u8; 3] = [1, 2, 3]`,
+  `S { a: [1, 2, 3] }`, `f([1, 2, 3])` and `fn g() -> [u8; 3] { [1, 2, 3] }`
+  all narrow the elements, and the width threads through nested literals.
 - The type of a string literal is named `str` and may be written wherever a type
   goes: a `let` annotation, a parameter, a return type or a struct field
   (`fn f(s: str) -> str`, `struct M { s: str, n: i64 }`). A `str` is one word, so
@@ -856,7 +980,10 @@ carry no meaning and are accepted and ignored: `Option<i64>` and `Option` name
 the same enum. The constructors are written unqualified, as in Rust —
 `Some(x)`, `None`, `Ok(v)`, `Err(e)` — in both expressions and patterns, so
 `if let Some(x) = o`, `while let Some(x) = o` and
-`match o { Some(x) => .., None => .. }` all work.
+`match o { Some(x) => .., None => .. }` all work. A type argument list may nest
+(`Vec<Vec<i64>>`) and may run straight into a following operator
+(`Result<i64,i64>=Ok(5)`): the closing `>` is split off the glued `>=`, `>>` or
+`>>=` token, as rustc's parser does, so no space is required around it.
 
 These types are not a special case in the compiler: they are injected as
 ordinary user-level code (a payload enum plus `impl` methods) before semantic
@@ -909,6 +1036,7 @@ with a length or capacity field, so only the methods below are understood.
 
 | source                              | lowered to                                    |
 | ----------------------------------- | --------------------------------------------- |
+| `let v: Vec<i64> = Vec::new();`     | `alloc(0)`; `v.len()` and `v.capacity()` are `0` |
 | `let v: Vec<i64> = Vec::with_capacity(k);` | `alloc(k * 8)`; `v.capacity()` is `k`  |
 | `let v: Vec<u8> = vec![e; n];`      | `alloc(n)` filled by `__rmc_fill_bytes` (one byte per element) |
 | `let v: Vec<i64> = vec![a, b, c];`  | `alloc(3 * 8)` with each element stored (`vec![a, b, c]`) |
@@ -921,7 +1049,11 @@ value, and the allocation is `n * elem_width` bytes (`elem_width` is 1 for a
 `u8`/`i8` element and 8 otherwise, so a `Vec<u8>` allocates `n` bytes and a
 `Vec<i64>` `n` words). A `vec![a, b, c]` list allocates one slot per element and
 stores each (one byte for a `u8`/`i8` element, one word otherwise); `.len()` and
-`.capacity()` fold to the element count. `add(off)` scales `off` by the
+`.capacity()` fold to the element count. An element that names the binding being
+defined (`let x = 5; let x: Vec<i64> = vec![x];`) reads the *outer* value, as
+rustc does: the initializer is evaluated before the new binding enters scope, so
+when an element names that binding each element is evaluated into a temporary
+first. `add(off)` scales `off` by the
 element width taken from the `Vec<T>` annotation, so a `Vec<i64>` pointer steps
 a whole word while a `Vec<u8>` stays byte-addressed. An args-vector is never
 materialised: `for v in &args` desugars to `for i in k..__rmc_nargs()` and
@@ -955,10 +1087,14 @@ error, since rmc compiles a single file and cannot resolve it.
 
 ## Not supported
 
-Traits, generics, borrowing, lifetimes, modules, closures, tuple structs
-(`struct S(i64, i64)`), raw string literals (`r".."`), `f32`/`f64`,
-`u*`/`i*` types other than `i64`, and the standard library beyond the two `std`
-paths above and the `Vec` shims. A `Vec` is not a real container: only the
+Traits, generics, borrowing, lifetimes, modules, closures,
+raw string literals (`r".."`), `f32`/`f64`, and the
+standard library beyond the two `std` paths above and the `Vec` shims. The
+integer widths (`u8`/`i8`/.../`u64`/`i64`/`usize`/`isize`) exist, but only as a
+value's width: a `let x: u8` binding and a `200u8` literal carry their width
+through arithmetic, yet rmc has no `u8`-*typed* `b'A'` (a byte literal is an
+`i64`, unlike rustc's `u8`), and a width larger than 64 bits (`u128`/`i128`) is
+treated as `i64`. A `Vec` is not a real container: only the
 handful of shapes in "Vec shims" are recognised, and any other `Vec` method or
 use is a compile error. A `char` is a scalar, but its full `char` API
 (`char::from_u32`, `is_alphabetic`, `to_digit`, ...) is not provided, and

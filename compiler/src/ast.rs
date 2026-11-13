@@ -118,11 +118,12 @@ impl Type {
         )
     }
 
-    /// True for the types an array element may have now that nested aggregates
-    /// are supported: the integer-like scalars plus a nested array, a struct or
-    /// a payload enum. Every such type is a multiple of 8 bytes, so an element's
-    /// stride is `size() / 8` slots. A reference and `str` stay excluded (rustc
-    /// rejects a reference as an array element too).
+    /// True for the types an array element may have: the integer-like scalars
+    /// plus `str`, a reference, a nested array, a struct or a payload enum.
+    /// Every such type is a multiple of 8 bytes, so an element's stride is
+    /// `size() / 8` slots. `str` and a reference are one-word pointers, so
+    /// `[&str; n]` and `[&T; n]` are arrays of pointers, exactly as rustc lays
+    /// them out.
     pub fn is_array_elem(&self) -> bool {
         matches!(
             self,
@@ -136,6 +137,8 @@ impl Type {
                 | Type::Struct(..)
                 | Type::U8
                 | Type::I8
+                | Type::Str
+                | Type::Ref(..)
         )
     }
 
@@ -418,6 +421,16 @@ pub enum Expr {
         /// fields are ignored rather than named. Only meaningful when the
         /// pattern has an argument list (`n_binds >= 0`).
         has_rest: bool,
+        /// Tests for refutable payload sub-patterns, each paired with the index
+        /// of the field it reads (`E::A(Some(x))` adds the `Some` test over
+        /// field 0). All must hold for the arm to match; codegen `&&`s them
+        /// after the tag test, so a read only runs once the tag matched. A
+        /// `_`/binding sub-pattern contributes none, and a struct/tuple
+        /// sub-pattern contributes only its own refutable elements'. The field
+        /// index is kept so exhaustiveness can union only tests of the *same*
+        /// field: `W(I::A, _)` and `W(_, I::B)` cover different fields, so
+        /// together they do not cover `W(I::B, I::A)`.
+        sub_tests: Vec<(usize, Expr)>,
     },
     /// `value == true`/`false`, as a `bool`. The arm test a `bool` literal
     /// pattern desugars to. It is a distinct node rather than a plain
@@ -539,7 +552,10 @@ pub enum Stmt {
 }
 
 /// A user-defined struct. Field offsets are assigned by sema in declaration
-/// order, so the layout is exactly the declaration order with no padding.
+/// order, so the layout is exactly the declaration order with no padding. A
+/// tuple struct (`struct P(T, T);`) stores its fields under the positional
+/// names `"0"`, `"1"`, ..., so it lays out and reads exactly like a braced
+/// struct; the parser records which names are constructors separately.
 #[derive(Debug, Clone)]
 pub struct StructDef {
     pub name: String,

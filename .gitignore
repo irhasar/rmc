@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 
 # Stray build artifacts
+/a.out
 compiler/c.bin
 compiler/c.err
 

@@ -245,6 +245,28 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   struct (`tuple_struct_for` introduces the layout if the parser did not). An
   element is written `.0`, `.1`, ...: `parse_postfix` accepts a decimal literal
   after `.` as the field name.
+  *Tuple structs* `struct P(T, T);` are a second way to write a struct: the
+  fields are stored with the positional names `"0"`, `"1"`, ..., so layout, the
+  field read `p.0`, and the destructuring paths treat it exactly like a braced
+  struct, and sema and codegen gain no case. Only the constructor and the
+  pattern differ, so the prescan records the name and field count in
+  `struct_ctors` (a unit struct `struct U;` goes in `unit_structs` instead, since
+  its name is also its value). The prescan's `skip_tuple_struct_fields` must step
+  over a whole field *type*, not one token: `struct P(&i64, i64)`, `struct
+  P(*const i64, i64)` and `struct P(Vec<i64>)` all span several tokens, and the
+  helper `skip_to_field_end` advances to the field-separating `,`/`)` at bracket
+  depth zero (balancing `(`/`[`/`<` and splitting a `>>`), so the count is right.
+  A call `P(a, b)` in `parse_primary` becomes a
+  `StructLit` (arity checked against `struct_ctors`), and the pattern
+  `P(a, b)` in `parse_pattern_primary` becomes the existing `Pat::Struct` with
+  positional field names, so `struct_pat_binds` desugars it to the same chain of
+  field reads. The shared `parse_tuple_struct_pat_args` helper reads the field
+  list (used at the top level, in a `let`, in a parameter via `parse_param`, and
+  as a nested field sub-pattern `f: P(a, b)`); it checks the arity and rejects a
+  refutable element, as the braced path does. A unit struct's bare name `U` is a
+  fieldless `StructLit` in a value position and a fieldless `Pat::Struct` in a
+  pattern position. `reject_const_shadow` rejects a `let` binding that shadows
+  any struct name (rustc's E0530), which covers `let P = ..` and `let U = ..`.
   *At-bindings* `name @ subpat` bind the whole value to `name` and also match it
   against `subpat`. `Pat::At(String, bool, Box<Pat>)` is parsed by
   `parse_pattern_primary` (an identifier followed by `@`), so it is reachable in
@@ -360,6 +382,15 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   and no codegen; its value is substituted at every use. An immutable `static`
   is parsed by `parse_static` and lowered to the same `ConstDef`, so it shares
   this path; `static mut` is rejected, since rmc has no mutable global.
+  Folding threads an *operand width* (`eval_int_at`/`eval_i64_at`): a
+  `const N: u8` folds at `u8`, and a method folds at its *receiver's* width, not
+  the destination's (`A.saturating_add(10)` on a `u8` `A` clamps at 255 even when
+  bound to an `i64`). `resolve_with` carries the declared width of each resolved
+  narrow item so an initializer that names one folds the method at that width.
+  `pow` folds by squaring (`while exp > 0 { if exp & 1 { acc *= base } exp >>= 1;
+  base *= base }`), so `1u8.pow(1_000_000_000)` is O(log exponent), not a
+  billion multiplications; the base is squared only while exponent bits remain,
+  so an unused high square cannot reject a result that fits.
   A `const`/immutable-`static` declared inside a block is collected and resolved
   by `scan_block_consts` when the block begins (rustc hoists block items), so it
   is in scope for the whole block and shadows an outer one until the block ends.
@@ -802,10 +833,25 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   irrefutable: a binding, `_`, or a struct pattern — including a nested
   sub-pattern, which `struct_pat_binds` recurses into like the `let`/`match`
   paths (a refutable pattern like an enum variant is rejected rather than
-  mis-bound). `for x in
-  &arr` is rejected — Rust iterates a reference by reference (`x: &i64`), so
-  accepting it would silently mistype `x`. `parse_for` also checks the pattern
-  name against the constant table *before* `parse_pattern`, because a bare
+  mis-bound). **`for x in &arr` / `for x in &mut arr`** iterates by reference:
+  the element binds to a real `&arr[i]` / `&mut arr[i]`, so `*x` reads and
+  `*x = v` writes the element in place, and the array place is indexed directly
+  (never copied — a `&mut` write reaches the original binding). `parse_for`
+  recognises the `Expr::AddrOf` head and hands the inner place to
+  `desugar_for_array_ref`, which builds `for i in 0..arr.len() { let PAT =
+  &arr[i]; body }`; `is_iterable_place` gates it to a binding or an
+  `Index`/`Field`/`Deref` chain rooted at one, so `&arr[i]` works but a
+  reference to a temporary (`&mk()`, whose head is a `Call`) is rejected rather
+  than mistyped. A `Vec` binding is excluded (`vec_names`) because it is a bare
+  address with no element type to address. The pattern must be a binding or `_`.
+  **`arr.iter()` / `arr.iter_mut()`** are recognised just before the range
+  checks and map to the same `desugar_for_array_ref` with `mutable` false/true.
+  `into_iter` is deliberately *not* accepted: on an array its element type is
+  edition-dependent (by-reference before Rust 2021, by-value after), and rmc has
+  no edition, so a fixed choice would diverge from one of them. `tests/cases/forref.rs`
+  and the by-reference unit tests cover it. `parse_for`
+  also checks the pattern name against the constant table *before*
+  `parse_pattern`, because a bare
   constant name there resolves to its value (not a binding), which would turn
   `for N in 0..3` into an iteration over a literal and lose the E0530 error.
   `tests/cases/forarr.rs` and the `stmt` fuzzer cover it.
@@ -815,7 +861,13 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   which requires the parentheses Rust requires) and desugared by
   `desugar_for_range_adapter` into the ordinary `Stmt::For` upward counter, so
   `continue` still reaches the increment — a downward `while` would skip it and
-  loop forever. The desugar is two passes: a forward pass gives each adapter a
+  loop forever. The lookahead shares `parenthesized_range_end` (the token index
+  past a `( lo..hi )` group, `None` when it is not a range) with the plain form:
+  a parenthesized range with *no* adapter (`for i in (0..4)`) is unwrapped by
+  `at_parenthesized_range_plain` to the ordinary range loop, since `(lo..hi)` is
+  not an rmc expression. The plain check runs only after the adapter check fails,
+  so `(a..b).rev()` still takes the adapter path; both require the `..` at depth
+  one, so `((a..b))` and `(a..b).sum()` match neither. The desugar is two passes: a forward pass gives each adapter a
   `let` bound (evaluated once, not per step) and threads the sequence length
   through, and a reverse pass composes each adapter's *index* map into the
   element expression. The maps stay relative to the raw range and `lo` is added
@@ -828,8 +880,27 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   names (`rl`/`rh` for the bounds, `ri` for the counter, `rk`/`ra`/`rc`/`rs` for
   the stride, argument, count and length-substitution); the counter is `ri`, not
   `rc`, so it cannot collide with the `c` of the first `skip`/`take`.
-  `tests/cases/rangeadapt.rs` and `counting_range_adapters_compile` cover the
-  chains.
+  `step_by`'s count is `ceil(len / k)` built as `len / k + (len % k != 0)`, not
+  `(len + k - 1) / k` (which overflows for a stride near `i64::MAX`) and not
+  `len / k + min(len % k, 1)` (which pulled in `__rmc_min`, and the test asserts
+  `step_by` needs no `min`). A negative *literal* count (`skip(-1)`,
+  `step_by(-1)`) is rejected as a unary `-` on a `usize` (rustc's `E0600`),
+  checked in the forward pass before the adapter's argument runs; a non-literal
+  negative count is left to run time, since rustc accepts it. A `rev` applied
+  *directly* to the raw range with no other adapter is a special case:
+  `desugar_for_range_rev_plain` lowers `(lo..hi).rev()` to an *inclusive*
+  upward counter `0..=span` (with `span = hi - lo`) whose element expression is
+  `hi - 1 - i` (or `hi - i` for `..=`), so the count `hi - lo + 1` is never
+  formed and a range whose length does not fit `i64`
+  (`(0..=i64::MAX).rev()`) still runs. The caller tries this path first and
+  falls back to `desugar_for_range_adapter` when it returns `None` (a
+  `skip`/`take`/`step_by` is present), so the general path keeps its
+  `__rmc_min`-based counts. A *remaining divergence*: only a `rev` chained
+  after a `skip`/`step_by` still materialises the span as a count, and the full
+  `i64::MIN..=i64::MAX` inclusive span overflows (rustc accepts it).
+  `tests/cases/rangeadapt.rs`, `tests/cases/revrange.rs` and
+  `counting_range_adapters_compile`/`a_plain_reversed_range_does_not_form_the_span_count`
+  cover the chains.
 - **`..=` exits on `jle` back-edge, not `jl`.** The guard is the loop-back
   condition, so the inclusive form loops while `var <= end` (`jle`) and the
   exclusive one while `var < end` (`jl`); a `jg`/`jge` *exit* test is the
@@ -1435,6 +1506,19 @@ descending the chain, and the walk no longer requires an arm's `else` block to
 have empty `stmts`. `tests/cases/guard.rs` and the `pat` fuzzer cover
 guards; the `reject` fuzzer's `guard_*` cases pin the exhaustiveness rules.
 
+A nested or refutable variant argument (`O::W(I::A)`, `E::A(1)`) is handled by a
+second walk, `chain_is_exhaustive_nested` → `chain_covers`, tried after
+`if_chain_is_exhaustive`. `if_chain_is_exhaustive` counts only the outer
+`VariantTest`s, so it would call such a chain total even when a payload arm
+covers just one payload value; `chain_covers` instead groups the arms by outer
+variant and, for each variant whose arms carry `sub_tests`, unions those tests
+and recurses through the payload enum, so `O::W(I::A) => .., O::W(I::B) => ..,
+O::Z => ..` is total while `O::W(I::A) => .., O::Z => ..` is not. An arm that
+binds the whole field (`O::W(x)`, `O::W(_)`, no `sub_tests`) covers its variant
+outright; a variant whose payload is a scalar, struct or tuple field cannot be
+shown covered, so the walk reports it non-exhaustive (safe — rustc needs a `_`
+arm there too unless the field has a single value).
+
 The `match` desugaring wraps its first step in `Expr::MatchBoundary`, a
 transparent node that marks where the chain begins. Its `bool` field records
 whether some arm is a catch-all (`_` or a binding), which makes the match
@@ -1505,11 +1589,11 @@ function and its call sites agree. A nested `fn` captures nothing, so this is
 exactly rustc's semantics for the subset — including that a nested `fn` in a
 `loop` body is the same function every iteration (it is not re-created).
 
-An array's element type is a scalar: `i64`, `bool` or a unit enum. Nested
-arrays, arrays of structs and arrays of payload enums are rejected. A unit enum
-is one 8-byte slot emitted like `i64`, so `[E; N]` lays out and indexes
-correctly; rustc likewise accepts a unit enum and rejects a payload enum and a
-reference as array elements. A list literal `[a, b, c]` is parsed as
+An array's element type may be a scalar (`i64`, `bool`, a `char` or a unit
+enum), `str`, a reference, a nested array, a struct or a payload enum. A unit
+enum is one 8-byte slot emitted like `i64`, so `[E; N]` lays out and indexes
+correctly. `str` and a reference are one-word pointers, so `[&str; N]` and
+`[&T; N]` are arrays of pointers. A list literal `[a, b, c]` is parsed as
 `Expr::ArrayList` and rewritten by sema, which infers the element type from the
 values — the parser must not guess it, because it does not type-check, and
 guessing `i64` is what made `[true, false]` fail.
@@ -1614,9 +1698,48 @@ The checks, all in `sema.rs`:
   effects (dropped entirely when it is a named local). A user `len` on a struct or
   enum still falls through to the mangled-method path. rmc's `.len()` is `i64`
   where rustc's is `usize`, so a differential twin casts with `as i64`.
+- **`str::starts_with` / `str::ends_with` / `str::contains`.** The other three
+  `bool`-returning string methods, special-cased in the same `MethodCall` arm
+  right after `len`, and only when the receiver's type is `Str` (so a user method
+  of the same name on a struct or enum is untouched). Each lowers to a runtime
+  helper that walks the two `{len, bytes}` records: `__rmc_str_starts` and
+  `__rmc_str_ends` scan the first / last `needle.len` bytes, and `__rmc_str_find`
+  returns the first matching byte index or `-1`, which `contains` tests against
+  `-1`. A `&str` receiver is dereferenced to its one word first, as for `len`.
+  Each helper is its own runtime piece, so a program that never searches a string
+  does not carry one. `find` itself is *not* exposed: rustc types it
+  `Option<usize>`, and rmc has neither, so a bare `s.find(..)` still falls
+  through to the "not a struct or enum" error rather than mis-typing the result.
+- **`is_empty()`.** Special-cased in the same `MethodCall` arm as `len` and the
+  three searches, and only for a `str` or array receiver. `str::is_empty` is
+  `Call __rmc_str_len` compared `== 0`, so it carries the length helper but no
+  search helper; `<[T; N]>::is_empty` folds to the constant `N == 0`, dropping a
+  named receiver as `len` does. A user `is_empty` on a struct or enum is
+  untouched.
+- **Empty array literal `[]`.** The parser accepts `[]` as an empty
+  `ArrayList`, but with no element to infer from sema rejects it unless the
+  context supplies the element type (`let z: [i64; 0] = [];` sets the expected
+  element type; a bare `let a = [];` is an error, as rustc's `E0282`). It lowers
+  to a block whose value is the zero-length array, with no assignment; `z.len()`
+  is `0` and `z.is_empty()` is `true`, and `for x in &z` runs zero times.
+- **Array element width comes from the context.** An array literal takes its
+  element width from the surrounding declared type the way a bare integer literal
+  does. `expected_elem_int` (sema state) is armed in the point positions — a
+  `let` annotation, a struct field, a call argument and a `return` expression —
+  and by `expected_ret`, which is set only while checking a function body's tail
+  expression so a tail array literal (`fn g() -> [u8; 3] { [1, 2, 3] }`) is
+  typed. `expected_ret` is consumed at the top of `check_block_inner`, so it
+  never leaks into a nested block. The width is threaded through nested array
+  literals too (`[[u8; 2]; 2] = [[1, 2], [3, 4]]`). Known gap: a literal element
+  does not yet *coerce* to a sibling element's inferred width (`[9u8, 8]` is
+  rejected, as is a wide `let a = [..]` bound to a `[u8; 3]`), and the expected
+  element type is not propagated through an `if`/`match`/block arm — rustc
+  accepts both.
 - **Built-in `i64` methods
   (`abs`/`min`/`max`/`clamp`/`signum`/`is_positive`/`is_negative`/
-  `div_euclid`/`rem_euclid`/`midpoint`/`count_ones`/`count_zeros`/`leading_zeros`/
+  `div_euclid`/`rem_euclid`/`midpoint`/`pow`/`wrapping_add`/`wrapping_sub`/
+  `wrapping_mul`/`saturating_add`/`saturating_sub`/`saturating_mul`/
+  `count_ones`/`count_zeros`/`leading_zeros`/
   `trailing_zeros`/`leading_ones`/`trailing_ones`/`swap_bytes`/`reverse_bits`/
   `rotate_left`/`rotate_right`).**
   Like `len()`, they
@@ -1624,10 +1747,13 @@ The checks, all in `sema.rs`:
   and only when the receiver's type is `i64`, so a user `min` on a struct is
   untouched. `desugar_i64_method` rewrites the call into an expression over the
   operators rmc already lowers, so codegen gains no case
-  (`clamp`'s `min > max` panic and the ten bit methods are the exceptions — a
+  (`clamp`'s `min > max` panic and the sixteen helper methods — the ten bit
+  methods and the six arithmetic methods — are the exceptions: a
   call to the `__rmc_clamp` / `__rmc_count_ones` / `__rmc_leading_zeros` /
   `__rmc_trailing_zeros` / `__rmc_swap_bytes` / `__rmc_reverse_bits` /
-  `__rmc_rotate_left` / `__rmc_rotate_right` runtime
+  `__rmc_rotate_left` / `__rmc_rotate_right` / `__rmc_pow` /
+  `__rmc_wrapping_add` / `__rmc_wrapping_sub` / `__rmc_saturating_add` /
+  `__rmc_saturating_sub` / `__rmc_saturating_mul` runtime
   pieces, each linked only when its method appears):
   `abs` is `if x < 0 { -x } else { x }` (so `i64::MIN` maps to itself, matching
   `rustc -O`; under `--overflow-checks` the `neg` traps, matching a debug build),
@@ -1659,6 +1785,21 @@ The checks, all in `sema.rs`:
   `MIN.midpoint(MAX)` is `0` with or without `--overflow-checks`. The half-sum is
   bound to a temp so the sign test reads the same value the `+` does. This is
   exactly `rustc`'s definition, so no helper is added.
+  `pow`/`wrapping_add`/`wrapping_sub`/`saturating_add`/`saturating_sub`/
+  `saturating_mul` each bind the receiver then the argument (so each runs once,
+  left to right) and call a two-argument runtime helper. They cannot lower to a
+  bare operator: `pow` is binary exponentiation, and the `saturating_*` family
+  clamps, which no `BinOp` expresses; `wrapping_add`/`wrapping_sub` *are* the
+  bare `add`/`sub`, but are still a helper so operand evaluation matches an
+  operator's without a `BinOp` variant (unlike `wrapping_mul`, which reuses the
+  existing `WrappingMul` op). `pow` wraps in two's complement like `rustc -O`
+  (`2.pow(64)` is `0`, `(-2).pow(63)` is `MIN`); the `saturating_*` helpers test
+  the overflow flag (`jno`) and select a bound — by the sign of `a` for `+`/`-`,
+  by the sign of `a ^ b` for `*`. All six are `jno`-guarded and trap-free, so the
+  result is the same with and without `--overflow-checks`. Because the encoder
+  rejects `test $imm, reg`, `pow`'s low-bit test is `mov`+`and $1, %ecx`, and the
+  `saturating_mul` sign test is `xor`+`jns` rather than two byte-register
+  `setl`s (which the encoder mis-encoded in combination).
   `count_ones`/`leading_zeros`/`trailing_zeros` take no argument and lower to a
   `Call __rmc_<name>` on the receiver (no operators): the usual `x & (x - 1)`
   bit trick overflows for `i64::MIN`, and rustc's answer for `MIN` is exact
@@ -1717,20 +1858,28 @@ The checks, all in `sema.rs`:
   pattern (literal, variant, or-pattern) is rejected (`param_pat_binds`), and
   `mut` on the whole pattern is rejected. `sema` inserts a `None` into
   `param_pats` when it prepends the `self` receiver, keeping the vectors aligned.
-- **Enum payload sub-patterns.** A payload variant's argument list takes the
-  same sub-patterns a struct field or array element does: `E::A(_, y)`,
-  `E::A(mut x)`, `E::A(S { x })`, `E::A([a, b])`, and a trailing `..`
+- **Enum payload sub-patterns.** A payload variant's argument list takes any
+  sub-pattern rmc can test and bind: `E::A(_, y)`, `E::A(mut x)`,
+  `E::A(S { x })`, `E::A([a, b])`, a nested variant pattern (`O::W(I::A)`), a
+  scalar or or-pattern test (`E::A(1)`, `E::A(1 | 2)`), and a trailing `..`
   (`E::A(x, ..)`, `E::A(..)`). `Pat::Variant` carries `Option<(Vec<(bool, Pat)>,
   bool)>` — the argument patterns and the `..` flag. `desugar_arm` reads each
   argument as `EnumPayload { idx }` (the payload at its field index) and feeds it
   to `pat_binds_into`, which recurses through `struct_pat_binds` /
-  `array_pat_binds`, so a nested pattern reads *through* the payload at its
-  offset rather than copying the whole aggregate first. `VariantTest` carries
-  `n_binds` (the argument count) and `has_rest`; `check_expr` requires
-  `n_binds == fields.len()` unless `has_rest`, and rejects a payload read past
-  the last field. A nested *variant* argument (`E::A(Inner::X(v))`) is
-  refutable, so `parse_variant_pat_args` rejects it, as it rejects a literal
-  argument, since rmc generates no per-field test.
+  `array_pat_binds` / `pat_binds` (a nested variant), so a nested pattern reads
+  *through* the payload at its offset rather than copying the whole aggregate
+  first. `VariantTest` carries `n_binds` (the argument count), `has_rest`, and
+  `sub_tests` — the tests of the refutable sub-patterns, each over the matching
+  payload read. `check_expr` requires `n_binds == fields.len()` unless
+  `has_rest`, rejects a payload read past the last field, and checks each
+  sub-test through its read (filling in the inner variant's tag). Codegen `&&`s
+  the sub-tests after the outer tag test, so `E::A(1)` compares the payload and
+  `O::W(I::A)` tests the inner tag, and a nested read only runs once the outer
+  tag matched. Exhaustiveness (`chain_covers`) recurses through payload enums:
+  an arm that binds the whole field (`O::W(x)`, `O::W(_)`) covers its variant,
+  and arms with sub-tests for one variant are combined and must themselves cover
+  the payload enum; a variant whose payload is not an enum cannot be shown
+  covered, so such a match needs a `_` arm.
 - **Casts (`E0054`/`E0605`/`E0606`).** `check_cast` restricts `as` to the
   conversions rustc allows plus rmc's two documented extensions. A reference may
   only become a reference to the same type (`&mut T` may lose mutability to
@@ -1783,7 +1932,21 @@ The checks, all in `sema.rs`:
   A narrow `const` carries its declared width through resolution
   (`ConstVal::NarrowInt(i64, Type)`), so a use is substituted at that width and
   folds/checks like a literal of it; `consts::resolve` is fallible so a
-  non-folding item is a compile error rather than a silent widen.
+  non-folding item is a compile error rather than a silent widen. The
+  initializer folds at that width too: `consts::eval_int_at` threads a
+  `ctx: Option<(signed, bits)>` down the expression, an operand's own suffix or
+  cast overrides it, and `+`/`-`/`*` route through `int_const_binop` at the
+  width, so `const N: u8 = 250 + 10` is an `E0080` overflow rather than an
+  unbounded `i64` fold of 260. A cast target does *not* type its operand
+  (`(250 + 10) as u8` folds the sum as `i64`, then narrows), matching rustc. The
+  same evaluator folds the `wrapping_*`/`saturating_*`/`pow` methods
+  (`eval_int_method`), which the parser sees in method-call form — sema lowers
+  them to runtime helpers only later — so `const W: u8 = 200u8.wrapping_mul(2)`
+  and `const P: u8 = 3u8.pow(5)` resolve. `eval_int_at` returns the shared
+  `NOT_CONST` message for an unresolved name, and `resolve_with` treats exactly
+  that string as "retry next fixpoint pass" while any other error (an overflow,
+  a division by zero) is fatal — otherwise a forward reference to a narrow
+  constant was reported as an overflow instead of resolving.
 - **Constant-local propagation, matching rustc.** `Sema::const_locals` maps a
   slot to a known constant, and `const_of` reads it. A local is entered only
   when rustc would know it: its initializer is constant and it is assigned at
@@ -1994,7 +2157,12 @@ rather than `n` words), `v.capacity()`/`v.len()`
 fold to the constant count, and `v.as_mut_ptr()` keeps the address so a later
 `.add(off)` is `p + off * elem`, scaling by the element width from the `Vec<T>`
 annotation (`Vec<u8>` stays byte-addressed, and a `type Byte = u8` alias is
-chased to its target). Each shape is recognised only directly
+chased to its target). A `vec![a, b, c]` *list* allocates one slot per element
+and stores each; an element that names the binding being defined (`let x = 5;
+let x: Vec<i64> = vec![x];`) must read the *outer* value, so when
+`expr_mentions_name` finds such an element each is evaluated into a
+`\0vt`-prefixed temporary before the binding is declared, and the common case
+stores each element directly. Each shape is recognised only directly
 in a `let` initializer; anywhere else the `\0`-prefixed parser marker reaches
 sema, which reports the source construct (see the `\0vecnew` arm). An
 args-vector is never built: `std::env::args()...collect()` records the binding,

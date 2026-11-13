@@ -2160,7 +2160,7 @@ Expr::PatScrutinee(_) => {
                 self.line("movzbq %al, %rax");
                 Type::Bool
             }
-            Expr::VariantTest { scrutinee, tag, .. } => {
+            Expr::VariantTest { scrutinee, tag, sub_tests, .. } => {
                 // Compare the value's tag word. `gen_expr` yields the address
                 // for an aggregate enum and the tag itself for a unit enum, so
                 // branch on the returned type rather than on syntax.
@@ -2171,6 +2171,17 @@ Expr::PatScrutinee(_) => {
                 self.line(&format!("cmp ${tag}, %rax"));
                 self.line("sete %al");
                 self.line("movzbq %al, %rax");
+                // Nested payload sub-pattern tests (`E::A(Some(x))`): the tag
+                // test passed, so the payload is valid; each sub-test reads its
+                // field and must hold too. `&&` short-circuits the whole arm, so
+                // a failing sub-test yields `false` immediately.
+                for (_, t) in sub_tests {
+                    let end = self.new_label();
+                    self.line("test %rax, %rax");
+                    self.line(&format!("jz {end}"));
+                    self.gen_expr(t);
+                    self.raw(&format!("{end}:"));
+                }
                 Type::Bool
             }
             Expr::EnumPayload { recv, offset, ty, .. } => {

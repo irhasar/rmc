@@ -27,4 +27,15 @@ fn main() {
 
     let empty: Vec<i64> = vec![0; 0];
     println!("{}", empty.len());
+
+    // An element that names an outer binding of the same name reads that outer
+    // value: the initializer is evaluated before the new binding enters scope.
+    // `vec![x]` under a shadowing `x` must store the outer `x` (5), not the
+    // allocation address.
+    let x = 5;
+    let x: Vec<i64> = vec![x, x + 1];
+    let xp = x.as_ptr();
+    let x0 = xp as *const i64;
+    let x1 = unsafe { xp.add(1) } as *const i64;
+    println!("{} {}", unsafe { *x0 }, unsafe { *x1 });
 }

@@ -317,6 +317,30 @@ def gen_expr_program(rng):
     rs.append('    println!("{}", sv.len() as i64);')
     rs.append(f"    let arr: [i64; {n}] = [0; {n}];")
     rs.append('    println!("{}", arr.len() as i64);')
+    # Prefix / suffix / substring searches. Each walks the bytes of the two
+    # records, so a pointer compare or a wrong length bound diverges here. The
+    # small alphabet makes shared prefixes and near-misses common.
+    for _ in range(rng.randint(1, 4)):
+        hay, needle = gen_str_lit(rng), gen_str_lit(rng)
+        m = rng.choice(["starts_with", "ends_with", "contains"])
+        rs.append(f'    println!("{{}}", {hay}.{m}({needle}));')
+    for _ in range(rng.randint(1, 2)):
+        needle = gen_str_lit(rng)
+        m = rng.choice(["starts_with", "ends_with", "contains"])
+        rs.append(f'    println!("{{}}", sv.{m}({needle}));')
+    # `is_empty` on a `str` (a length test) and on an array (a constant). The
+    # empty array is written with an annotation because `[]` has no element to
+    # infer from.
+    for _ in range(rng.randint(1, 3)):
+        rs.append(f'    println!("{{}}", {gen_str_lit(rng)}.is_empty());')
+    rs.append('    println!("{}", sv.is_empty());')
+    m = rng.randint(0, 4)
+    rs.append(f"    let ez: [i64; {m}] = [0; {m}];")
+    rs.append('    println!("{}", ez.is_empty());')
+    if rng.random() < 0.5:
+        rs.append('    let z: [i64; 0] = [];')
+        rs.append('    println!("{}", z.is_empty());')
+        rs.append('    println!("{}", z.len());')
     rs += ["}"]
     return "\n".join(rs)
 
@@ -1138,6 +1162,66 @@ def gen_fordestr_program(rng):
     return "\n".join(rs) + "\n"
 
 
+def gen_forref_program(rng):
+    """`for x in &arr` / `for x in &mut arr`: the loop variable is a reference to
+    the element, so `*x` reads and `*x = v` writes the element in place. The
+    array place is indexed directly (never copied), so a `&mut` write reaches the
+    original binding. Compares the by-reference loop against the equivalent
+    explicit index loop, and a nested `&mut` write against a plain mutation.
+    No other mode emits a by-reference `for`.
+    """
+    b = rng.randint(1, 9)
+    n = rng.choice([1, 2, 3])
+    elems = ", ".join(str(b + i) for i in range(n))
+    kind = rng.choice(["read", "write", "nested", "struct"])
+    rs = ["fn main() {", "    let mut acc: i64 = 0;"]
+    if kind == "struct":
+        rs = [
+            "struct P { x: i64, y: i64 }",
+            "fn main() {",
+            "    let mut acc: i64 = 0;",
+            f"    let ps: [P; {n}] = ["
+            + ", ".join(f"P {{ x: {b + i}, y: {b + i + 10} }}" for i in range(n))
+            + "];",
+        ]
+        if rng.random() < 0.5:
+            # read the fields through the reference
+            rs.append("    for p in &ps { acc += p.x * 10 + p.y; }")
+            rs.append('    println!("{}", acc);')
+            rs.append("}")
+            return "\n".join(rs) + "\n"
+        # write a field through a mutable reference
+        rs.append("    for p in &mut ps { p.x += 100; }")
+        rs.append("    for p in &ps { acc += p.x; }")
+        rs.append('    println!("{}", acc);')
+        rs.append("}")
+        return "\n".join(rs) + "\n"
+    rs.append(f"    let mut a: [i64; {n}] = [{elems}];")
+    # The head spelling: the `&a` / `&mut a` forms, or the equivalent
+    # `a.iter()` / `a.iter_mut()` methods.
+    read_head = rng.choice(["&a", "a.iter()"])
+    write_head = rng.choice(["&mut a", "a.iter_mut()"])
+    if kind == "read":
+        # By-reference read must equal the explicit index read.
+        rs.append(f"    for x in {read_head} {{ acc += *x; }}")
+        rs.append("    for i in 0..a.len() { acc += a[i]; }")
+    elif kind == "write":
+        # `*x += k` through `&mut` must equal mutating the element by index.
+        rs.append(f"    for x in {write_head} {{ *x += {b}; }}")
+        rs.append(f"    for i in 0..a.len() {{ a[i] += {b}; }}")
+        rs.append(f"    for x in {read_head} {{ acc += *x; }}")
+    else:
+        # A nested `&` over an inner array reached by `&a[i]`/`&m[j]`.
+        rs = ["fn main() {", "    let mut acc: i64 = 0;"]
+        rs.append("    let m: [[i64; 2]; 2] = [[%d, %d], [%d, %d]];"
+                  % (b, b + 1, b + 2, b + 3))
+        rs.append("    for row in &m { for x in row { acc += x; } }")
+        rs.append("    for x in &m[1] { acc += *x; }")
+    rs.append('    println!("{}", acc);')
+    rs.append("}")
+    return "\n".join(rs) + "\n"
+
+
 # A chain of struct types for the nested-pattern fuzzer: each entry is
 # `(struct_field_name, struct_field_type, [i64 field names])`. The chain ends at
 # a type with no struct field, so a pattern nests at most `len(CHAIN)` deep.
@@ -1490,14 +1574,16 @@ def gen_parampat_program(rng):
 
 def gen_enumpat_program(rng):
     """Payload variant patterns with sub-patterns: a wildcard (`_`), a `mut`
-    binding, a trailing `..`, and a nested struct/array sub-pattern inside
-    `E::V(..)`. Each argument is the payload read at its field index, fed to the
-    same sub-pattern expansion a `let` uses, so a mis-indexed payload read, a
-    `_` that still reads, or a wrong nested offset changes the total. Every
-    function is called twice with different arguments, so a shared slot or a
-    leaked `mut` write is observable. No other mode emits a nested payload
-    sub-pattern, a `..` inside a variant's parentheses, or a payload read
-    through a `&E` scrutinee (match ergonomics dereferences it).
+    binding, a trailing `..`, a nested struct/array sub-pattern inside
+    `E::V(..)`, a nested variant pattern (`O::W(I::A)`) and a scalar payload
+    test (`E::Pair(B, y)`). Each argument is the payload read at its field
+    index, fed to the same sub-pattern expansion a `let` uses, so a mis-indexed
+    payload read, a `_` that still reads, a wrong nested offset, or a sub-test
+    that fails to gate the arm changes the total. Every function is called twice
+    with different arguments, so a shared slot or a leaked `mut` write is
+    observable. No other mode emits a nested payload sub-pattern, a `..` inside
+    a variant's parentheses, a nested variant pattern, or a payload read through
+    a `&E` scrutinee (match ergonomics dereferences it).
     """
     b = rng.randint(1, 9)
     m = rng.randint(1, 9)
@@ -1525,6 +1611,14 @@ def gen_enumpat_program(rng):
         "fn wref(e: &E) -> i64 { match e { E::Pair(x, _) => x * 2, E::Trip(x, ..) => x * 3, _ => 0 } }",
         "fn nref(e: &E) -> i64 { match e { E::Hold(S { a: [p, q], b: I { u } }) => p * 100 + q * 10 + u, _ => 0 } }",
         "fn uref(e: &E) -> i64 { match e { E::None => 100, E::Pair(_, _) => 200, E::Trip(_, _, _) => 300, E::Hold(_) => 400, E::Arr(_) => 500, E::Mix(_, _, _) => 600 } }",
+        "#[derive(Copy, Clone)]",
+        "enum I { A, B }",
+        "#[derive(Copy, Clone)]",
+        "enum O { W(I), Z }",
+        "fn outer(o: O) -> i64 { match o { O::W(I::A) => 1, O::W(I::B) => 2, O::Z => 3 } }",
+        "fn owild(o: O) -> i64 { match o { O::W(_) => 7, O::Z => 8 } }",
+        "fn nvia_ref(o: &O) -> i64 { match o { O::W(I::A) => 10, O::W(I::B) => 20, O::Z => 30 } }",
+        f"fn scal(e: E) -> i64 {{ match e {{ E::Pair({b}, y) => y, E::Pair(x, _) => x, E::Trip({b}, y, ..) => y, _ => 0 }} }}",
     ]
 
 
@@ -1548,6 +1642,18 @@ def gen_enumpat_program(rng):
         f"nref(&E::Hold(S {{ a: [s + {o[12]}, s + {o[13]}], b: I {{ u: s + {o[14]} }} }}))",
         "uref(&E::None)",
         f"uref(&E::Arr([s + {o[18]}, s + {o[19]}]))",
+        "outer(O::W(I::A))",
+        "outer(O::W(I::B))",
+        "outer(O::Z)",
+        "owild(O::W(I::B))",
+        "owild(O::Z)",
+        "nvia_ref(&O::W(I::A))",
+        "nvia_ref(&O::W(I::B))",
+        "nvia_ref(&O::Z)",
+        f"scal(E::Pair({b}, s + 1))",
+        f"scal(E::Pair(s + 2, s + 3))",
+        f"scal(E::Trip({b}, s + 4, s + 5))",
+        "scal(E::None)",
     ]
     body_rs = ["fn main() {", "    let mut acc: i64 = 0;", f"    let s: i64 = mk({b});"]
     for c in calls:
@@ -2713,6 +2819,53 @@ def reject_corpus():
         # Same, in statement position: the arms are unit-typed, so only the
         # exhaustiveness walk rejects it.
         "stmt_guard_gap": stmt("match e { E::A if 1 == 1 => { print_i64(1); } }"),
+        # A nested variant pattern covers only its payload value, so a match
+        # that omits one payload variant is non-exhaustive (E0004). `O::W(I::A)`
+        # alone does not cover `O::W(I::B)`, and the outer enum's other variants
+        # must still be named.
+        "nested_variant_gap": (
+            "enum I { A, B }\n"
+            "enum O { W(I), Z }\n"
+            "fn main() {\n"
+            "    let o: O = O::W(I::A);\n"
+            "    match o { O::W(I::A) => { print_i64(1); } O::Z => { print_i64(3); } }\n"
+            "}\n"
+        ),
+        # Naming the payload variant of the wrong enum inside a nested pattern:
+        # `O::W(I::A)` is fine, but `O::W(J::A)` names a variant `J` does not
+        # have, which rustc rejects.
+        "nested_variant_unknown": (
+            "enum I { A, B }\n"
+            "enum O { W(I), Z }\n"
+            "fn main() {\n"
+            "    let o: O = O::W(I::A);\n"
+            "    let r = match o { O::W(I::C) => 1, O::W(I::B) => 2, O::Z => 3 };\n"
+            '    println!("{}", r);\n'
+            "}\n"
+        ),
+        # A refutable scalar argument overruns the variant's field count when a
+        # second field is named without `..`.
+        "nested_variant_overrun": (
+            "enum E { A(i64), B }\n"
+            "fn main() {\n"
+            "    let e: E = E::A(3);\n"
+            "    let r = match e { E::A(1, 2) => 1, E::A(_) => 0, E::B => 0 };\n"
+            '    println!("{}", r);\n'
+            "}\n"
+        ),
+        # A variant with two enum fields: arms that test *different* fields do
+        # not cover the cross-product, so the match is non-exhaustive (E0004).
+        # `W(I::A, _)` and `W(_, I::B)` together name both variants of `I`, but
+        # `W(I::B, I::A)` is uncovered.
+        "nested_variant_cross_field": (
+            "enum I { A, B }\n"
+            "enum O { W(I, I) }\n"
+            "fn main() {\n"
+            "    let o: O = O::W(I::B, I::A);\n"
+            "    let r = match o { O::W(I::A, _) => 1, O::W(_, I::B) => 2 };\n"
+            '    println!("{}", r);\n'
+            "}\n"
+        ),
         # Assignment to an immutable binding. rmc used to accept these and let
         # codegen write the slot; rustc rejects each with E0384.
         "assign_immutable_let": "fn main() { let x: i64 = 1; x = 2; println!(\"{}\", x); }\n",
@@ -2795,6 +2948,19 @@ def reject_corpus():
         # literal (E0080 in rustc).
         "const_local_overflow": "fn main() { let x = 9223372036854775807i64; let y = x + 1; let _ = y; }\n",
         "const_local_div_zero": "fn main() { let d = 0i64; let y = 1i64 / d; let _ = y; }\n",
+        # A narrow `const` folds at its declared width: `250 + 10` overflows a
+        # `u8` (E0080), a bare `300` is a literal out of range, and `300 as u8`
+        # is rejected at the cast. rmc must reject all three, not fold them as
+        # an unbounded `i64`.
+        "const_u8_add_overflow": "const N: u8 = 250 + 10; fn main() { println!(\"{}\", N); }\n",
+        "const_u8_literal_oob": "const N: u8 = 300; fn main() { println!(\"{}\", N); }\n",
+        "const_u8_cast_literal_oob": "const N: u8 = 300 as u8; fn main() { println!(\"{}\", N); }\n",
+        "const_u8_sub_overflow": "const N: u8 = 10 - 20; fn main() { println!(\"{}\", N); }\n",
+        # A negative adapter count is a unary `-` on a `usize` (E0600), which
+        # rmc must reject rather than treat as a wrapped stride or skip.
+        "skip_negative": "fn main() { for i in (0..3).skip(-1) { println!(\"{}\", i); } }\n",
+        "take_negative": "fn main() { for i in (0..3).take(-1) { println!(\"{}\", i); } }\n",
+        "step_by_negative": "fn main() { for i in (0..3).step_by(-1) { println!(\"{}\", i); } }\n",
         # A reference may only be cast to a reference of the same type, may not
         # gain mutability, and may not become a scalar (E0605/E0606). rmc's
         # `i64 as &T` raw pointer cast is a documented extension and stays.
@@ -3330,7 +3496,7 @@ def gen_typealias_program(rng):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "patshadow", "intmeth", "nestedfn", "typealias", "printfmt", "ptr", "char", "semi", "boolbit", "vis", "localconst", "robust", "reject", "mutate"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "forref", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "patshadow", "intmeth", "nestedfn", "typealias", "printfmt", "ptr", "char", "semi", "boolbit", "vis", "localconst", "robust", "reject", "mutate"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -3377,6 +3543,7 @@ def main():
            "ref": gen_ref_program, "update": gen_update_program,
            "letdestr": gen_letdestr_program,
            "fordestr": gen_fordestr_program,
+           "forref": gen_forref_program,
            "nestpat": gen_nestpat_program,
            "arrpat": gen_arrpat_program,
            "parampat": gen_parampat_program,

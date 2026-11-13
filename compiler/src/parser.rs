@@ -1,7 +1,7 @@
 //! Recursive-descent parser for the rmc Rust subset.
 
 use crate::ast::*;
-use crate::consts::eval_i64;
+use crate::consts::{const_i64, eval_i64};
 use crate::lexer::{Tok, Token};
 
 /// One saved entry of a parser name table, so a block's bindings are forgotten
@@ -80,6 +80,17 @@ pub struct Parser {
     /// struct declared later in the file is covered because the whole list is
     /// scanned first.
     struct_fields: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// Names of tuple structs (`struct P(T, T);`), collected before parsing so
+    /// that a call `P(a, b)` lowers to a `StructLit` rather than a function call
+    /// and a pattern `P(x, y)` to a struct pattern rather than an enum variant
+    /// or a call. A tuple struct declared later in the file is covered because
+    /// the whole file is scanned first. Maps the name to its field count, so a
+    /// constructor call and a tuple pattern can be checked at parse time.
+    struct_ctors: std::collections::HashMap<String, usize>,
+    /// Names of unit structs (`struct U;`). Unlike an empty braced struct
+    /// (`struct E {}`), a unit struct's name is also its value, so `let u = U;`
+    /// is legal; it lowers to a zero-sized `StructLit`.
+    unit_structs: std::collections::HashSet<String>,
     /// Anonymous structs introduced by tuple *types*, keyed by the canonical
     /// name `ast::tuple_struct_name` produces. A tuple is lowered to a struct
     /// (element `k` is field `"k"`), so it reuses the whole struct path through
@@ -285,6 +296,8 @@ impl Parser {
             const_chars: std::collections::HashMap::new(),
             const_narrow: std::collections::HashMap::new(),
             struct_fields: std::collections::HashMap::new(),
+            struct_ctors: std::collections::HashMap::new(),
+            unit_structs: std::collections::HashSet::new(),
             tuple_structs: std::collections::HashSet::new(),
             tuple_defs: Vec::new(),
             std_mods: {
@@ -329,6 +342,58 @@ impl Parser {
 
     fn peek(&self) -> Option<&Tok> {
         self.toks.get(self.i).map(|t| &t.tok)
+    }
+
+    /// Split a `>=` or `>>` token at the current position into a `>` now and
+    /// the rest (`=` or `>`) as a fresh token, so a type's closing `>` can be
+    /// taken even when the source glued it to a following operator
+    /// (`Result<i64,i64>=Ok(5)`, `Vec<Vec<i64>>`). Rust's own parser does the
+    /// same split. Called only where a `>` is expected, so it never fires on a
+    /// genuine comparison.
+    fn split_gt(&mut self) {
+        if self.i >= self.toks.len() {
+            return;
+        }
+        let pos = self.toks[self.i].pos;
+        match self.toks[self.i].tok {
+            Tok::Ge => {
+                self.toks[self.i].tok = Tok::Eq;
+                self.toks.insert(self.i, Token { tok: Tok::Gt, pos });
+            }
+            Tok::Shr => {
+                self.toks[self.i].tok = Tok::Gt;
+                self.toks.insert(self.i, Token { tok: Tok::Gt, pos });
+            }
+            Tok::ShrEq => {
+                self.toks[self.i].tok = Tok::Ge;
+                self.toks.insert(self.i, Token { tok: Tok::Gt, pos });
+            }
+            _ => return,
+        }
+        self.shift_token_indices(self.i);
+    }
+
+    /// Shift every recorded token index at or after `at` by one, after a token
+    /// was inserted there by `split_gt`. `fn_at` and the `LocalConst` frames
+    /// hold indices captured *before* a block's items are parsed, so an insert
+    /// inside a later item would otherwise leave them one token short: the
+    /// `fn`/`const` would no longer be recognised and the item would be parsed
+    /// as an ordinary statement.
+    fn shift_token_indices(&mut self, at: usize) {
+        self.fn_at = std::mem::take(&mut self.fn_at)
+            .into_iter()
+            .map(|(k, v)| (if k >= at { k + 1 } else { k }, v))
+            .collect();
+        for frame in self.local_consts.iter_mut() {
+            for c in frame.iter_mut() {
+                if c.start >= at {
+                    c.start += 1;
+                }
+                if c.end >= at {
+                    c.end += 1;
+                }
+            }
+        }
     }
 
     /// The token after the next one, for a two-token lookahead (`'a: loop`).
@@ -666,6 +731,20 @@ impl Parser {
                         if let Some(n) = name {
                             self.struct_fields.insert(n, fields);
                         }
+                    } else if self.peek() == Some(&Tok::LParen) {
+                        // A tuple struct `struct P(T, T);`: record its field
+                        // count so a later `P(a, b)` call and a `P(x, y)`
+                        // pattern are recognised. A unit struct `struct U;` has
+                        // no constructor and is left out.
+                        let count = self.skip_tuple_struct_fields()?;
+                        if let Some(n) = name {
+                            self.struct_ctors.insert(n, count);
+                        }
+                    } else if self.peek() == Some(&Tok::Semi) {
+                        // A unit struct `struct U;`: its name is also its value.
+                        if let Some(n) = name {
+                            self.unit_structs.insert(n);
+                        }
                     } else {
                         self.skip_balanced(Tok::LBrace, Tok::RBrace)?;
                     }
@@ -893,6 +972,55 @@ impl Parser {
         Err(format!("at byte {}: unexpected end of input", self.pos()))
     }
 
+    /// Skip a tuple struct's field list `(T, T, ..)`, counting the fields, with
+    /// the opening `(` current and the closing `)` and the `;` left current.
+    /// Used by the prescan, which only needs the count. A field may carry its
+    /// own `pub`, which is skipped.
+    fn skip_tuple_struct_fields(&mut self) -> PResult<usize> {
+        self.i += 1; // the `(`
+        let mut count = 0usize;
+        while self.peek() != Some(&Tok::RParen) {
+            if self.peek().is_none() {
+                return Err(format!("at byte {}: unexpected end of input", self.pos()));
+            }
+            self.skip_pub()?;
+            // A field type is a whole type, not one token: `&i64`,
+            // `*const i64`, `Vec<i64>`, `(i64, i64)` and `[i64; 3]` all span
+            // several tokens and some contain a `,` at depth. Skip to the
+            // field-separating `,` (or the closing `)`), balancing every bracket
+            // so a nested comma is not mistaken for a field boundary.
+            self.skip_to_field_end()?;
+            count += 1;
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(Tok::RParen)?;
+        Ok(count)
+    }
+
+    /// Advance to the next field boundary: a `,` or a `)` at bracket depth zero
+    /// (neither is consumed). Used by the prescan to step over a whole field
+    /// type. A `>>`/`>=` that closes two generic lists at once is split first,
+    /// so the depth stays correct.
+    fn skip_to_field_end(&mut self) -> PResult<()> {
+        let mut depth = 0i32;
+        while let Some(t) = self.peek().cloned() {
+            match t {
+                Tok::Comma | Tok::RParen if depth == 0 => return Ok(()),
+                Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+                Tok::RParen | Tok::RBracket | Tok::RBrace => depth -= 1,
+                Tok::Lt => depth += 1,
+                Tok::Gt => depth -= 1,
+                Tok::Shr => depth -= 2,
+                Tok::Ge => depth -= 1,
+                _ => {}
+            }
+            self.i += 1;
+        }
+        Err(format!("at byte {}: unexpected end of input", self.pos()))
+    }
+
     /// `const NAME: TYPE = EXPR;`. The declared type is resolved by sema; the
     /// value is evaluated here, as soon as it is parsed, so a later array type
     /// or pattern can use it. A value that does not fold yet (it names a
@@ -1104,6 +1232,32 @@ impl Parser {
         self.skip_pub()?;
         self.expect(Tok::Struct)?;
         let name = self.expect_ident()?;
+        // `struct P(T, T);` — a tuple struct. Its fields are stored with
+        // positional names `"0"`, `"1"`, ... so the layout, field read and
+        // destructuring paths treat it exactly like a braced struct; only the
+        // constructor (`P(a, b)`) and the pattern (`P(x, y)`) differ, and the
+        // prescan's `struct_ctors` records which names those are.
+        if self.peek() == Some(&Tok::LParen) {
+            self.i += 1;
+            let mut fields = Vec::new();
+            while self.peek() != Some(&Tok::RParen) {
+                self.skip_pub()?;
+                let fty = self.parse_type()?;
+                fields.push((fields.len().to_string(), fty));
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect(Tok::RParen)?;
+            self.expect(Tok::Semi)?;
+            return Ok(StructDef { name, fields });
+        }
+        // `struct U;` — a unit struct. It has no fields and no constructor
+        // value, but `U` still names the type and a `let _u = U;` is legal, so
+        // it is a zero-sized struct.
+        if self.eat(&Tok::Semi) {
+            return Ok(StructDef { name, fields: Vec::new() });
+        }
         self.expect(Tok::LBrace)?;
         let mut fields = Vec::new();
         while self.peek() != Some(&Tok::RBrace) {
@@ -1291,9 +1445,16 @@ impl Parser {
         // but there `mut` is legal and attaches to `n`.
         let at_pat = matches!(self.peek(), Some(Tok::Ident(_)))
             && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::At);
+        // `P(a, b): T` destructures a tuple struct parameter; the name must be
+        // a known constructor, so a plain `x: T` is unaffected.
+        let tuple_struct_pat = matches!(
+            self.peek(),
+            Some(Tok::Ident(n)) if self.struct_ctors.contains_key(n)
+        ) && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::LParen);
         let pat = if matches!(self.peek(), Some(Tok::LBracket))
             || matches!(self.peek(), Some(Tok::LParen))
             || at_pat
+            || tuple_struct_pat
             || matches!(self.peek(), Some(Tok::Ident(_))
                 if self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::LBrace))
         {
@@ -1542,6 +1703,7 @@ impl Parser {
                         self.i += 1; // `<`
                         let mut depth = 1i32;
                         while depth > 0 {
+                            self.split_gt();
                             match self.peek() {
                                 None => {
                                     return Err(format!(
@@ -1575,6 +1737,7 @@ impl Parser {
                     };
                     let mut depth = 1i32;
                     while depth > 0 {
+                        self.split_gt();
                         match self.peek() {
                             None => {
                                 return Err(format!(
@@ -1757,6 +1920,7 @@ impl Parser {
             &self.consts,
             &self.const_bools,
             &self.const_chars,
+            &self.const_narrow,
         )
         .map_err(|e| format!("at byte {}: {e}", self.toks[self.i].pos))?;
         // Every item must fold, including an unused one. `resolve_with` leaves
@@ -1840,6 +2004,18 @@ impl Parser {
             {
                 return Err(format!(
                     "at byte {}: identifier `{name}` shadows a constant of the same name",
+                    self.pos()
+                ));
+            }
+            // A binding cannot shadow a struct of any kind (rustc E0530): a
+            // tuple struct's name is a constructor and a unit struct's name is a
+            // value, so `let P = ..` would make `P` ambiguous.
+            if self.struct_ctors.contains_key(name)
+                || self.unit_structs.contains(name)
+                || self.struct_fields.contains_key(name)
+            {
+                return Err(format!(
+                    "at byte {}: identifier `{name}` shadows a struct of the same name",
                     self.pos()
                 ));
             }
@@ -2283,15 +2459,11 @@ impl Parser {
     /// the array's compile-time length, so the loop bound is a literal and the
     /// loop carries no hidden slot.
     ///
-    /// The tokens at the cursor are `( <..> .. <..> )` followed by one or more
-    /// adapters: the head of a `for i in (lo..hi).rev()` / `.step_by(k)` /
-    /// `.skip(k)` / `.take(k)`, possibly chained (`.skip(3).take(4)`). A
-    /// non-nested token scan: the first `)` at depth zero ends the parenthesised
-    /// range, and only a `..`/`..=` directly inside it (no parentheses of its
-    /// own) counts, so `(f(..))`, `((a..b))` and `(a..b).sum()` are all
-    /// rejected. Returns the adapters in source order, or `None` when the shape
-    /// does not match.
-    fn at_parenthesized_range_adapter(&self) -> Option<Vec<String>> {
+    /// The token index just past a parenthesized range at the cursor, or `None`
+    /// when the tokens are not `( lo..hi )` / `( lo..=hi )`. A `..`/`..=` counts
+    /// only at depth one (a `..` inside a nested `(..)` does not), and the range
+    /// must be the whole group, so `(f(..))` and `(a..b).sum()` do not match.
+    fn parenthesized_range_end(&self) -> Option<usize> {
         if self.peek() != Some(&Tok::LParen) {
             return None;
         }
@@ -2321,7 +2493,29 @@ impl Parser {
         if !saw_dots || self.toks.get(j).map(|t| &t.tok) != Some(&Tok::RParen) {
             return None;
         }
-        j += 1;
+        Some(j + 1)
+    }
+
+    /// True at the head of `(lo..hi)` / `(lo..=hi)` used directly as a `for`
+    /// iterable (no adapter). `(a..b).rev()` is handled by
+    /// `at_parenthesized_range_adapter` first, so this sees only the plain form.
+    fn at_parenthesized_range_plain(&self) -> bool {
+        match self.parenthesized_range_end() {
+            Some(j) => self.toks.get(j).map(|t| &t.tok) != Some(&Tok::Dot),
+            None => false,
+        }
+    }
+
+    /// The tokens at the cursor are `( <..> .. <..> )` followed by one or more
+    /// adapters: the head of a `for i in (lo..hi).rev()` / `.step_by(k)` /
+    /// `.skip(k)` / `.take(k)`, possibly chained (`.skip(3).take(4)`). A
+    /// non-nested token scan: the first `)` at depth zero ends the parenthesised
+    /// range, and only a `..`/`..=` directly inside it (no parentheses of its
+    /// own) counts, so `(f(..))`, `((a..b))` and `(a..b).sum()` are all
+    /// rejected. Returns the adapters in source order, or `None` when the shape
+    /// does not match.
+    fn at_parenthesized_range_adapter(&self) -> Option<Vec<String>> {
+        let mut j = self.parenthesized_range_end()?;
         let mut adapters = Vec::new();
         loop {
             if self.toks.get(j).map(|t| &t.tok) != Some(&Tok::Dot) {
@@ -2470,6 +2664,21 @@ impl Parser {
         let mut prev_len = total;
         for (t, adapter) in adapters.iter().enumerate() {
             lens.push(prev_len.clone());
+            // A negative literal count (`skip(-1)`, `step_by(-1)`) is rejected
+            // by rustc: the adapters take a `usize`, which cannot be negated.
+            // rmc's `-1` is an `i64`, and a negative count would otherwise
+            // silently mean "no skip" or a backward stride, so reject it here.
+            // A non-literal negative (a variable, a cast) is not a compile
+            // error in rustc, so it is left to run time, matching a `usize`
+            // that wrapped.
+            if let Some(k) = args.get(head_a).and_then(const_i64) {
+                if k < 0 {
+                    return Err(format!(
+                        "at byte {}: cannot apply unary `-` to a `usize` adapter count",
+                        self.pos()
+                    ));
+                }
+            }
             match adapter.as_str() {
                 "rev" => counts.push(prev_len.clone()),
                 "step_by" => {
@@ -2484,21 +2693,44 @@ impl Parser {
                     });
                     head_a += 1;
                     strides[t] = Some(k_name.clone());
-                    // `ceil(len / k)` as `(len + k - 1) / k`; a zero stride is a
-                    // runtime divide-by-zero, which is what rustc reports.
-                    counts.push(Expr::Bin(
+                    // `ceil(len / k)` as `len / k + (len % k != 0)`. The
+                    // obvious `(len + k - 1) / k` overflows for a stride near
+                    // `i64::MAX` (`(0..3).step_by(i64::MAX)` must yield one
+                    // element), so the count is built from `len / k` plus a
+                    // 0/1 remainder indicator instead. A zero stride divides by
+                    // zero here, trapping like rustc — and because the count is
+                    // bound now, that happens when `step_by` is applied, before
+                    // a later adapter's argument runs.
+                    let c_name = c_name(t);
+                    let quot = Expr::Bin(
                         BinOp::Div,
-                        Box::new(Expr::Bin(
+                        Box::new(prev_len.clone()),
+                        Box::new(vlo(&k_name)),
+                    );
+                    let rem = Expr::Bin(
+                        BinOp::Mod,
+                        Box::new(prev_len.clone()),
+                        Box::new(vlo(&k_name)),
+                    );
+                    head.push(Stmt::Let {
+                        name: c_name.clone(),
+                        ty: None,
+                        init: Some(Expr::Bin(
                             BinOp::Add,
-                            Box::new(prev_len.clone()),
-                            Box::new(Expr::Bin(
-                                BinOp::Sub,
-                                Box::new(vlo(&k_name)),
-                                Box::new(Expr::Int(1)),
+                            Box::new(quot),
+                            Box::new(Expr::Cast(
+                                Box::new(Expr::Bin(
+                                    BinOp::Ne,
+                                    Box::new(rem),
+                                    Box::new(Expr::Int(0)),
+                                )),
+                                Type::I64,
                             )),
                         )),
-                        Box::new(vlo(&k_name)),
-                    ));
+                        slot: -1,
+                        mutable: false,
+                    });
+                    counts.push(vlo(&c_name));
                 }
                 "skip" | "take" => {
                     let m = m_name(t);
@@ -2626,6 +2858,121 @@ impl Parser {
         Ok(Stmt::Expr(Expr::Block(Block { stmts: head, tail: None })))
     }
 
+    /// Desugar a *plain* reversed range, `for i in (lo..hi).rev() { .. }`, to a
+    /// loop that indexes down from the high bound, so the span `hi - lo` is
+    /// never materialised as a signed count. A `rev`-only chain maps its index
+    /// `j` to `hi - 1 - j` (exclusive) or `hi - j` (inclusive), and the loop
+    /// runs `j` over `0..=span` with `span = hi - lo`; counting up to `span`
+    /// never overflows, unlike the count `hi - lo + 1` the general path forms
+    /// (which traps for `(0..=i64::MAX).rev()`). `continue` targets the loop
+    /// counter, as for any `for` loop. Returns `None` for any other adapter
+    /// chain (a `skip`/`take`/`step_by` before or after the `rev`), which the
+    /// general adapter path handles. Borrows its inputs so the caller can fall
+    /// back with them intact.
+    fn desugar_for_range_rev_plain(
+        &mut self,
+        pat: &Pat,
+        lo: &Expr,
+        hi: &Expr,
+        inclusive: bool,
+        adapters: &[String],
+        args: &[Expr],
+        body: &Block,
+        label: &Option<String>,
+    ) -> PResult<Option<Stmt>> {
+        // Only a lone `rev` applied directly to the raw range takes this path;
+        // any `skip`/`take`/`step_by` needs the general desugaring.
+        if adapters.len() != 1 || adapters[0] != "rev" {
+            return Ok(None);
+        }
+        let _ = args;
+        let var = match pat {
+            Pat::Bind(n) => n.clone(),
+            Pat::Wild => {
+                let n = format!("\u{0}fi{}", self.tmp);
+                self.tmp += 1;
+                n
+            }
+            _ => {
+                return Err(format!(
+                    "at byte {}: `for` over a range needs a binding or `_`",
+                    self.pos()
+                ))
+            }
+        };
+        let vlo = |n: &str| Expr::Var { name: n.to_string(), slot: -1, ty: Type::I64 };
+        let lo_name = format!("\u{0}rl{}", self.tmp);
+        let hi_name = format!("\u{0}rh{}", self.tmp);
+        let i_name = format!("\u{0}ri{}", self.tmp);
+        let n_name = format!("\u{0}rn{}", self.tmp);
+        self.tmp += 1;
+        // `span = hi - lo`, the loop's inclusive end. For `(0..=i64::MAX)` it is
+        // `i64::MAX` (no overflow); a span exceeding `i64::MAX` (the full
+        // `i64::MIN..=i64::MAX`) still traps, a documented limit.
+        let span = Expr::Bin(BinOp::Sub, Box::new(vlo(&hi_name)), Box::new(vlo(&lo_name)));
+        // The exclusive end is `span - 1` (elements `hi-1 ..= lo`); the
+        // inclusive end is `span` (elements `hi ..= lo`).
+        let end = if inclusive {
+            span
+        } else {
+            Expr::Bin(BinOp::Sub, Box::new(span), Box::new(Expr::Int(1)))
+        };
+        // Element `j` of the reversed sequence: `hi - j` (inclusive) or
+        // `hi - 1 - j` (exclusive).
+        let map: Expr = if inclusive {
+            Expr::Bin(BinOp::Sub, Box::new(vlo(&hi_name)), Box::new(vlo(&i_name)))
+        } else {
+            Expr::Bin(
+                BinOp::Sub,
+                Box::new(Expr::Bin(BinOp::Sub, Box::new(vlo(&hi_name)), Box::new(Expr::Int(1)))),
+                Box::new(vlo(&i_name)),
+            )
+        };
+        let mut head: Vec<Stmt> = vec![
+            Stmt::Let {
+                name: lo_name.clone(),
+                ty: None,
+                init: Some(lo.clone()),
+                slot: -1,
+                mutable: false,
+            },
+            Stmt::Let {
+                name: hi_name.clone(),
+                ty: None,
+                init: Some(hi.clone()),
+                slot: -1,
+                mutable: false,
+            },
+            Stmt::Let {
+                name: n_name.clone(),
+                ty: None,
+                init: Some(end),
+                slot: -1,
+                mutable: false,
+            },
+        ];
+        let mut stmts = vec![Stmt::Let {
+            name: var,
+            ty: None,
+            init: Some(map),
+            slot: -1,
+            mutable: false,
+        }];
+        stmts.extend(body.stmts.iter().cloned());
+        let body = Block { stmts, tail: body.tail.clone() };
+        head.push(Stmt::For {
+            var: i_name,
+            var_slot: -1,
+            start: Expr::Int(0),
+            end: vlo(&n_name),
+            end_slot: -1,
+            inclusive: true,
+            body,
+            label: label.clone(),
+        });
+        Ok(Some(Stmt::Expr(Expr::Block(Block { stmts: head, tail: None }))))
+    }
+
     fn parse_for_labeled(&mut self, label: Option<String>) -> PResult<Stmt> {
         // A loop variable that names a constant shadows it (rustc E0530).
         // `parse_pattern` would otherwise read the name as that constant's
@@ -2669,9 +3016,48 @@ impl Parser {
                 }
             }
             let body = self.parse_block()?;
+            // A pure reverse (`rev` applied directly to the raw range, maybe
+            // with `skip`/`take` after it) is desugared to a downward loop, so a
+            // span that does not fit `i64` (`(0..=i64::MAX).rev()`) still runs.
+            // The general path handles a `step_by`/`skip` before the `rev`.
+            if let Some(stmt) = self.desugar_for_range_rev_plain(
+                &pat, &lo, &hi, inclusive, &adapters, &args, &body, &label,
+            )? {
+                return Ok(stmt);
+            }
             return self.desugar_for_range_adapter(
                 pat, lo, hi, inclusive, &adapters, args, body, label,
             );
+        }
+        // `for i in (lo..hi) { .. }`: Rust allows the range to be parenthesized
+        // even with no adapter. rmc's `(lo..hi)` is not an expression, so the
+        // shape is unwrapped here to the plain range loop below.
+        if self.at_parenthesized_range_plain() {
+            self.expect(Tok::LParen)?;
+            let lo = self.parse_cond()?;
+            let inclusive = self.eat(&Tok::DotDotEq);
+            if !inclusive {
+                self.expect(Tok::DotDot)?;
+            }
+            let hi = self.parse_cond()?;
+            self.expect(Tok::RParen)?;
+            let mut body = self.parse_block()?;
+            let (var, extra) = self.range_for_binding(pat)?;
+            if !extra.is_empty() {
+                let mut stmts = extra;
+                stmts.extend(body.stmts);
+                body = Block { stmts, tail: body.tail };
+            }
+            return Ok(Stmt::For {
+                var,
+                var_slot: -1,
+                start: lo,
+                end: hi,
+                end_slot: -1,
+                inclusive,
+                body,
+                label,
+            });
         }
         let head = self.parse_cond()?;
         // `for v in &args` (and `for v in args`) over an `args()`-vector binding
@@ -2703,16 +3089,55 @@ impl Parser {
             }
             return self.desugar_for_argsvec(pat, skip, body?, label);
         }
-        // `for x in &arr` iterates by *reference* in Rust: `x` is `&i64`, not
-        // `i64`. rmc iterates by value, so accepting the `&` form would silently
-        // give `x` the wrong type (and diverge from rustc's typing). Reject it
-        // rather than mis-compile; the by-value form is `for x in arr`.
+        // `for x in &arr` / `for x in &mut arr` iterates by *reference*: `x` is
+        // `&i64` (or `&mut i64`), not `i64`. rmc's `&arr[i]` is a real
+        // reference, so the element binds to `&arr[i]` / `&mut arr[i]`, and the
+        // body's `*x` reads (or `*x = v` writes) the element in place. The array
+        // place is used directly, never copied, so a `&mut` write reaches the
+        // original binding. Only an array is supported; a `Vec` binding is an
+        // address with no addressable element here, and any other head falls
+        // through to the by-value paths below.
+        if let Expr::AddrOf { expr: inner, mutable, .. } = &head {
+            let is_vec = matches!(inner.as_ref(), Expr::Var { name, .. } if self.vec_names.contains(name));
+            if !is_vec && Self::is_iterable_place(inner) {
+                let inner = (**inner).clone();
+                let mutable = *mutable;
+                let body = self.parse_block()?;
+                return self.desugar_for_array_ref(pat, inner, mutable, body, label);
+            }
+        }
         if matches!(head, Expr::AddrOf { .. }) {
             return Err(format!(
                 "at byte {}: `for` over a reference is not supported; \
                  iterate by value with `for x in arr`",
                 self.pos()
             ));
+        }
+        // `for x in arr.iter()` / `.iter_mut()`: the iterator forms of the
+        // array loops above. `iter` yields `&T` and `iter_mut` yields `&mut T`,
+        // so each maps onto the loop rmc already has for `&arr` / `&mut arr`.
+        // `into_iter` is deliberately not accepted: on an array its element type
+        // is edition-dependent (by-reference before Rust 2021, by-value after),
+        // and rmc has no edition, so a fixed choice would diverge from one of
+        // them; the by-value form is spelled `for x in arr`. Only an array place
+        // is supported (a `Vec` binding is excluded, and a non-place receiver
+        // falls through to the by-value path, which reports the unknown method).
+        if let Expr::MethodCall { recv, name, args } = &head {
+            if args.is_empty() {
+                let mutable = match name.as_str() {
+                    "iter" => Some(false),
+                    "iter_mut" => Some(true),
+                    _ => None,
+                };
+                if let Some(m) = mutable {
+                    let is_vec = matches!(recv.as_ref(), Expr::Var { name, .. } if self.vec_names.contains(name));
+                    if !is_vec && Self::is_iterable_place(recv) {
+                        let recv = (**recv).clone();
+                        let body = self.parse_block()?;
+                        return self.desugar_for_array_ref(pat, recv, m, body, label);
+                    }
+                }
+            }
         }
         if self.peek() == Some(&Tok::DotDot) || self.peek() == Some(&Tok::DotDotEq) {
             let inclusive = self.eat(&Tok::DotDotEq);
@@ -2724,32 +3149,7 @@ impl Parser {
             // A range's loop variable is bound directly, so only an irrefutable
             // pattern is allowed: `for n @ _ in 0..5` binds `n`, and
             // `for n @ m in 0..5` also binds `m` (an alias) in the body.
-            let (var, extra) = match pat {
-                Pat::Bind(n) => (n, Vec::new()),
-                Pat::Wild => {
-                    let n = format!("\u{0}fi{}", self.tmp);
-                    self.tmp += 1;
-                    (n, Vec::new())
-                }
-                Pat::At(n, _, sub) => {
-                    if !Self::pat_irrefutable(&sub) {
-                        return Err(format!(
-                            "at byte {}: refutable pattern in `for` binding",
-                            self.pos()
-                        ));
-                    }
-                    let subj = Expr::Var { name: n.clone(), slot: -1, ty: Type::I64 };
-                    let mut binds = Vec::new();
-                    Self::pat_binds(&sub, false, &subj, &mut binds);
-                    (n, binds)
-                }
-                _ => {
-                    return Err(format!(
-                        "at byte {}: `for` over a range needs a binding or `_`",
-                        self.pos()
-                    ))
-                }
-            };
+            let (var, extra) = self.range_for_binding(pat)?;
             if !extra.is_empty() {
                 let mut stmts = extra;
                 stmts.extend(body.stmts);
@@ -2768,6 +3168,119 @@ impl Parser {
         }
         let body = self.parse_block()?;
         self.desugar_for_array(pat, head, body, label)
+    }
+
+    /// The loop variable and any extra bindings for a `for` over a *range*. A
+    /// range's pattern is irrefutable, so it is a binding, `_`, or an
+    /// at-binding (`n @ _`); anything else is rejected rather than mis-bound.
+    /// `_` gets a fresh temporary name, and an at-binding adds the sub-pattern's
+    /// bindings as statements for the body.
+    fn range_for_binding(&mut self, pat: Pat) -> PResult<(String, Vec<Stmt>)> {
+        match pat {
+            Pat::Bind(n) => Ok((n, Vec::new())),
+            Pat::Wild => {
+                let n = format!("\u{0}fi{}", self.tmp);
+                self.tmp += 1;
+                Ok((n, Vec::new()))
+            }
+            Pat::At(n, _, sub) => {
+                if !Self::pat_irrefutable(&sub) {
+                    return Err(format!(
+                        "at byte {}: refutable pattern in `for` binding",
+                        self.pos()
+                    ));
+                }
+                let subj = Expr::Var { name: n.clone(), slot: -1, ty: Type::I64 };
+                let mut binds = Vec::new();
+                Self::pat_binds(&sub, false, &subj, &mut binds);
+                Ok((n, binds))
+            }
+            _ => Err(format!(
+                "at byte {}: `for` over a range needs a binding or `_`",
+                self.pos()
+            )),
+        }
+    }
+
+    /// Whether `e` is a place rmc can iterate by reference (`&e`): an array
+    /// binding or a constant index into one (`&a`, `&a[i]`, `&a[i].f`). A `Vec`
+    /// binding is a bare address with no element type to address here, and any
+    /// other shape (a call result, a literal) has no stable place, so it is not
+    /// iterable by reference and the caller falls back to the by-value path.
+    fn is_iterable_place(e: &Expr) -> bool {
+        match e {
+            Expr::Var { .. } => true,
+            Expr::Index(base, _) | Expr::Field { base, .. } => Self::is_iterable_place(base),
+            Expr::Deref { expr, .. } => Self::is_iterable_place(expr),
+            _ => false,
+        }
+    }
+
+    /// `for PAT in &ARR { body }` (or `&mut ARR`): bind the element by reference
+    /// and index the array place directly, so a `&mut` write through `*x`
+    /// reaches the original binding. The loop is `for i in 0..arr.len() { let
+    /// PAT = &arr[i]; body }`, with `&mut arr[i]` when the borrow is mutable.
+    /// Only a binding or `_` pattern is supported, matching the by-value array
+    /// loop's simplest form.
+    fn desugar_for_array_ref(
+        &mut self,
+        pat: Pat,
+        arr: Expr,
+        mutable: bool,
+        body: Block,
+        label: Option<String>,
+    ) -> PResult<Stmt> {
+        let n = self.tmp;
+        self.tmp += 1;
+        let idx_name = format!("\u{0}fi{n}");
+        let idx_var = Expr::Var { name: idx_name.clone(), slot: -1, ty: Type::I64 };
+        let len = Expr::MethodCall {
+            recv: Box::new(arr.clone()),
+            name: "len".to_string(),
+            args: Vec::new(),
+        };
+        // `&arr[i]` / `&mut arr[i]`: the borrow of the indexed place is a real
+        // reference to the element, so `*x` reads and `*x = v` writes it.
+        let elem_ref = Expr::AddrOf {
+            expr: Box::new(Expr::Index(Box::new(arr), Box::new(idx_var))),
+            ty: Type::I64,
+            mutable,
+            slot: -1,
+        };
+        let mut stmts = match pat {
+            Pat::Bind(name) => vec![Stmt::Let {
+                name,
+                ty: None,
+                init: Some(elem_ref),
+                slot: -1,
+                mutable: false,
+            }],
+            Pat::Wild => vec![Stmt::Let {
+                name: format!("\u{0}fd{n}"),
+                ty: None,
+                init: Some(elem_ref),
+                slot: -1,
+                mutable: false,
+            }],
+            _ => {
+                return Err(format!(
+                    "at byte {}: `for` over a reference needs a binding or `_`",
+                    self.pos()
+                ))
+            }
+        };
+        stmts.extend(body.stmts);
+        let loop_body = Block { stmts, tail: body.tail };
+        Ok(Stmt::For {
+            var: idx_name,
+            var_slot: -1,
+            start: Expr::Int(0),
+            end: len,
+            end_slot: -1,
+            inclusive: false,
+            body: loop_body,
+            label,
+        })
     }
 
     /// `for PAT in ARRAY { body }` -> an index loop over the array (see
@@ -3077,11 +3590,31 @@ impl Parser {
                 // from it. `..` and `f: _` are the only way to drop fields.
                 let struct_pat = matches!(self.peek(), Some(Tok::Ident(_)))
                     && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::LBrace);
+                // `let P(a, b) = e;` destructures a tuple struct. The name must
+                // be a known constructor, so a plain `let f(x)` (which is not a
+                // pattern) still falls through to the binding path and is
+                // diagnosed there.
+                let tuple_struct_pat = matches!(
+                    self.peek(),
+                    Some(Tok::Ident(n)) if self.struct_ctors.contains_key(n)
+                ) && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::LParen);
+                // `let Unit = e;` matches a unit struct, whose name is also its
+                // value. A trailing `{` or `(` would make it a (rejected)
+                // braced or tuple pattern instead.
+                let unit_struct_pat = matches!(
+                    self.peek(),
+                    Some(Tok::Ident(n)) if self.unit_structs.contains(n)
+                ) && !matches!(
+                    self.toks.get(self.i + 1).map(|t| &t.tok),
+                    Some(&Tok::LBrace) | Some(&Tok::LParen)
+                );
                 // `let n @ subpat = e;` binds the whole value to `n` and also
                 // destructures it. Detected by the `@` after the name.
                 let at_pat = matches!(self.peek(), Some(Tok::Ident(_)))
                     && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::At);
                 if struct_pat
+                    || tuple_struct_pat
+                    || unit_struct_pat
                     || at_pat
                     || self.peek() == Some(&Tok::LBracket)
                     || self.peek() == Some(&Tok::LParen)
@@ -3353,6 +3886,30 @@ impl Parser {
                         } else {
                             Type::I64
                         };
+                        // An element that names an outer binding of the same
+                        // name (`let v = 5; let v: Vec<i64> = vec![v]`) must read
+                        // that outer value: rustc evaluates the initializer
+                        // before the new binding enters scope, so a direct store
+                        // after `name` is declared would read the allocation
+                        // address instead. Only then is each element evaluated
+                        // into its own temporary ahead of the declaration; the
+                        // common case stores each element directly.
+                        let shadowed = args.iter().any(|e| Self::expr_mentions_name(e, &name));
+                        let mut temps: Vec<String> = Vec::new();
+                        if shadowed {
+                            for elem in args.iter() {
+                                let t = format!("\u{0}vt{}", self.tmp);
+                                self.tmp += 1;
+                                out.push(Stmt::Let {
+                                    name: t.clone(),
+                                    ty: None,
+                                    init: Some(Expr::Cast(Box::new(elem.clone()), value_ty.clone())),
+                                    slot: -1,
+                                    mutable: false,
+                                });
+                                temps.push(t);
+                            }
+                        }
                         let base = Expr::Var { name: name.clone(), slot: -1, ty: Type::I64 };
                         out.push(Stmt::Let {
                             name,
@@ -3369,9 +3926,14 @@ impl Parser {
                             );
                             let ptr_ty = if byte_elem { Type::U8 } else { Type::I64 };
                             let ptr = Expr::Cast(Box::new(offset), Type::Ref(Box::new(ptr_ty), true));
+                            let value = if shadowed {
+                                Expr::Var { name: temps[i].clone(), slot: -1, ty: Type::I64 }
+                            } else {
+                                Expr::Cast(Box::new(elem.clone()), value_ty.clone())
+                            };
                             out.push(Stmt::Assign {
                                 target: Expr::Deref { expr: Box::new(ptr), ty: Type::I64 },
-                                value: Expr::Cast(Box::new(elem.clone()), value_ty.clone()),
+                                value,
                             });
                         }
                         return Ok(());
@@ -4817,6 +5379,21 @@ impl Parser {
                         args = Some(self.parse_variant_pat_args()?);
                     }
                     Ok(Pat::Variant(n, variant, args))
+                } else if let Some(&count) = self.struct_ctors.get(&n) {
+                    // `P(a, b)`: a tuple struct pattern. The fields are named
+                    // positionally, so it reuses the struct-pattern path; the
+                    // arity must match the struct exactly.
+                    if self.peek() != Some(&Tok::LParen) {
+                        // A bare tuple struct name is neither a binding nor a
+                        // pattern (rustc E0530: a binding cannot shadow a tuple
+                        // struct, and the name alone is not a valid pattern).
+                        return Err(format!(
+                            "at byte {}: identifier `{n}` is a tuple struct, not a binding",
+                            self.pos()
+                        ));
+                    }
+                    let fields = self.parse_tuple_struct_pat_args(&n, count)?;
+                    Ok(Pat::Struct(n, fields))
                 } else if self.peek() == Some(&Tok::LBrace) {
                     // `S { f, g: h, i: _, .. }`: a struct pattern. Fields may be
                     // written in any order, and each is either a shorthand
@@ -4839,6 +5416,12 @@ impl Parser {
                     };
                     let fields = self.parse_struct_pat_fields(&n, &known)?;
                     Ok(Pat::Struct(n, fields))
+                } else if self.unit_structs.contains(&n) {
+                    // A unit struct's name is its value, so `U` as a pattern is
+                    // a struct pattern that matches the unit struct `U` with no
+                    // fields. It reuses `Pat::Struct`, so sema's `PatCheck`
+                    // verifies the scrutinee really is `U`.
+                    Ok(Pat::Struct(n, Vec::new()))
                 } else if let Some(v) = self.consts.get(&n) {
                     // A bare name that names a constant is that constant's
                     // value, not a fresh binding, exactly as rustc reads it.
@@ -4852,7 +5435,7 @@ impl Parser {
                 {
                     // The `Option`/`Result` variant patterns, written
                     // unqualified: `Some(x)`, `Ok(v)`, `Err(e)`. A bare `None`
-                    // is the unit variant and is handled by the wildcard case.
+                    // is the unit variant and is handled by the branch below.
                     let (en, var) = match n.as_str() {
                         "Some" => ("Option", "Some"),
                         "Ok" => ("Result", "Ok"),
@@ -4861,6 +5444,12 @@ impl Parser {
                     self.i += 1; // `(`
                     let args = self.parse_variant_pat_args()?;
                     Ok(Pat::Variant(en.into(), var.into(), Some(args)))
+                } else if n == "None" {
+                    // An unqualified `None` is the unit variant of the injected
+                    // `Option` enum, not a binding: `matches!(Some(1), None)`
+                    // must be `false`. Without this it would fall through to
+                    // `Pat::Bind`, a catch-all that matches every `Option`.
+                    Ok(Pat::Variant("Option".into(), "None".into(), None))
                 } else {
                     // A bare name binds the scrutinee; `_` already matched the
                     // wildcard case above.
@@ -4901,12 +5490,14 @@ impl Parser {
                 break;
             }
             let m = self.eat(&Tok::Mut);
-            // `_` ignores the field: it binds nothing and tests nothing.
+            // `_` ignores the field: it binds nothing and tests nothing. Any
+            // other sub-pattern is a full pattern, so an or-pattern
+            // (`E::A(1 | 2)`) and a nested variant pattern are both allowed.
             let p = if self.peek() == Some(&Tok::Underscore) {
                 self.i += 1;
                 Pat::Wild
             } else {
-                self.parse_pattern_primary()?
+                self.parse_pattern()?
             };
             if m && !matches!(p, Pat::Bind(_) | Pat::At(..)) {
                 return Err(format!(
@@ -4920,15 +5511,13 @@ impl Parser {
             }
         }
         self.expect(Tok::RParen)?;
-        // Every argument must be irrefutable: a refutable one (`E::V(1)`) would
-        // need a per-field test, which rmc does not generate. Reject it here
-        // rather than mis-bind it as an always-true read.
-        if args.iter().any(|(_, p)| !Self::pat_irrefutable(p)) {
-            return Err(format!(
-                "at byte {}: variant pattern arguments must be bindings, `_`, or nested patterns",
-                self.pos()
-            ));
-        }
+        // An argument may be any sub-pattern rmc can test and bind: a binding,
+        // `_`, a nested struct/tuple/array pattern, a nested variant pattern
+        // (`E::A(Some(x))`), or a scalar test. A refutable sub-pattern adds its
+        // own test, carried in the variant test after the tag test (see
+        // `variant_pat_cond`), so `E::A(Some(x))` does not match `E::A(None)`.
+        // Anything else (`mut` on a non-binding, handled above) is rejected
+        // where it is parsed.
         Ok((args, rest))
     }
 
@@ -5005,6 +5594,24 @@ impl Parser {
                         ));
                     }
                     Some((false, inner))
+                } else if matches!(
+                    self.peek(),
+                    Some(Tok::Ident(n)) if self.struct_ctors.contains_key(n)
+                ) && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::LParen)
+                {
+                    // `f: P(a, b)` — a nested tuple struct pattern for a
+                    // tuple-struct-typed field; `mut` is rejected, as for any
+                    // nested pattern.
+                    if m {
+                        return Err(format!(
+                            "at byte {}: `mut` is not allowed on a nested pattern",
+                            self.pos()
+                        ));
+                    }
+                    let n = self.expect_ident()?;
+                    let count = self.struct_ctors[&n];
+                    let inner = self.parse_tuple_struct_pat_args(&n, count)?;
+                    Some((false, Pat::Struct(n, inner)))
                 } else if self.peek() == Some(&Tok::LBracket) {
                     // `f: [x, y]` — a nested array pattern for an array-typed
                     // field; `mut` is likewise rejected.
@@ -5079,6 +5686,70 @@ impl Parser {
         self.i += 1; // the `{`
         let fields = self.parse_struct_pat_fields(&name, &known)?;
         Ok(Some(Pat::Struct(name, fields)))
+    }
+
+    /// `(a, b, ..)`: a tuple struct pattern's field list, with the `(` current.
+    /// The fields are named positionally (`"0"`, `"1"`, ...) so the pattern
+    /// reuses the struct-pattern path. `count` is the struct's field count from
+    /// the prescan, so the arity is checked before the fields are read.
+    fn parse_tuple_struct_pat_args(&mut self, n: &str, count: usize) -> PResult<Vec<FieldPat>> {
+        self.i += 1; // the `(`
+        let mut fields: Vec<FieldPat> = Vec::new();
+        while self.peek() != Some(&Tok::RParen) {
+            if self.peek().is_none() {
+                return Err(format!(
+                    "at byte {}: unexpected end of input in tuple struct pattern",
+                    self.pos()
+                ));
+            }
+            let k = fields.len();
+            let m = self.eat(&Tok::Mut);
+            if self.peek() == Some(&Tok::Underscore) {
+                self.i += 1;
+                if m {
+                    return Err(format!(
+                        "at byte {}: `mut` is not allowed on `_`",
+                        self.pos()
+                    ));
+                }
+                // `_` ignores the field, exactly like `f: _` in a braced
+                // pattern: stored as `None`, so no read is emitted for it.
+                fields.push((k.to_string(), None));
+            } else {
+                let p = self.parse_pattern_primary()?;
+                if m && !matches!(p, Pat::Bind(_) | Pat::At(..)) {
+                    return Err(format!(
+                        "at byte {}: `mut` is not allowed here; it attaches to a binding",
+                        self.pos()
+                    ));
+                }
+                fields.push((k.to_string(), Some((m, p))));
+            }
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(Tok::RParen)?;
+        if fields.len() != count {
+            return Err(format!(
+                "at byte {}: tuple struct `{n}` has {count} field(s), but {} were bound",
+                self.pos(),
+                fields.len()
+            ));
+        }
+        // A tuple struct pattern is irrefutable, like a braced struct pattern:
+        // rmc generates no per-field test, so a refutable element (`P(1, x)`) is
+        // rejected rather than mis-bound as an always-true read.
+        if fields
+            .iter()
+            .any(|(_, b)| b.as_ref().map_or(false, |(_, p)| !Self::pat_irrefutable(p)))
+        {
+            return Err(format!(
+                "at byte {}: tuple struct pattern fields must be bindings, `_`, or nested patterns",
+                self.pos()
+            ));
+        }
+        Ok(fields)
     }
 
     /// `[a, b, .., c]`: an array pattern, with the opening `[` already peeked.
@@ -5342,6 +6013,9 @@ impl Parser {
                 // A struct or tuple sub-pattern inside an array element.
                 Pat::Struct(name, fields) => out.extend(Self::struct_pat_binds(fields, &index, &name)),
                 Pat::Tuple(elems) => out.extend(Self::tuple_pat_binds(elems, &index)),
+                // A nested variant pattern inside an array element reads its
+                // payload through the element index.
+                Pat::Variant(..) => Self::pat_binds(pat, *m, &index, &mut out),
                 _ => unreachable!("unexpected array sub-pattern"),
             }
         }
@@ -5522,6 +6196,9 @@ impl Parser {
             // test is the whole test.
             Pat::At(_, _, sub) => Self::pat_test(sub, subj),
             Pat::Tuple(elems) => Self::tuple_pat_test(elems, subj),
+            Pat::Array { elems, rest, front } => {
+                Self::array_pat_test(elems, *rest, *front, subj)
+            }
             // `a | b | c` as an element: any alternative matching passes. A `_`
             // alternative makes the whole element always true, so there is no
             // test; otherwise fold the alternatives' tests with `||`.
@@ -5580,7 +6257,53 @@ impl Parser {
                 );
                 Some(Expr::Bin(BinOp::And, Box::new(lower), Box::new(upper)))
             }
-            _ => unreachable!("a tuple element is validated when the tuple is parsed"),
+            // A nested variant pattern: its own tag test over `subj`, folded
+            // with any refutable sub-pattern of its own. Used both as a
+            // payload field's sub-pattern and inside `variant_pat_cond`.
+            Pat::Variant(enum_name, variant, args) => {
+                Some(Self::variant_pat_cond(enum_name, variant, args, subj))
+            }
+        }
+    }
+
+    /// The boolean test for one `Enum::Variant(..)` pattern over `subj`: a
+    /// `VariantTest` carrying the tag test and, for each refutable payload
+    /// sub-pattern, a test read through that field. `E::A(Some(x))` yields a
+    /// `VariantTest` for `A` whose `sub_tests` hold the `Some` test over field
+    /// 0, so it does not match `E::A(None)`. Codegen `&&`s the sub-tests after
+    /// the tag test, so a read only runs once the tag matched.
+    fn variant_pat_cond(
+        enum_name: &str,
+        variant: &str,
+        args: &Option<(Vec<(bool, Pat)>, bool)>,
+        subj: &Expr,
+    ) -> Expr {
+        let n_binds = args.as_ref().map_or(-1, |(a, _)| a.len() as i32);
+        let has_rest = args.as_ref().map_or(false, |(_, rest)| *rest);
+        let mut sub_tests: Vec<(usize, Expr)> = Vec::new();
+        if let Some((args, _)) = args {
+            for (idx, (_, pat)) in args.iter().enumerate() {
+                let payload = Expr::EnumPayload {
+                    recv: Box::new(subj.clone()),
+                    enum_name: enum_name.to_string(),
+                    variant: variant.to_string(),
+                    idx,
+                    offset: 0,
+                    ty: Type::Unit,
+                };
+                if let Some(t) = Self::pat_test(pat, &payload) {
+                    sub_tests.push((idx, t));
+                }
+            }
+        }
+        Expr::VariantTest {
+            scrutinee: Box::new(subj.clone()),
+            enum_name: enum_name.to_string(),
+            variant: variant.to_string(),
+            tag: -1,
+            n_binds,
+            has_rest,
+            sub_tests,
         }
     }
 
@@ -5598,6 +6321,46 @@ impl Parser {
                 ty: Type::Unit,
             };
             if let Some(t) = Self::pat_test(p, &field) {
+                cond = Some(match cond {
+                    None => t,
+                    Some(c) => Expr::Bin(BinOp::And, Box::new(c), Box::new(t)),
+                });
+            }
+        }
+        cond
+    }
+
+    /// The boolean test for an array pattern: the `&&` of its refutable
+    /// elements' tests, each read through the element's index. `None` when every
+    /// element is irrefutable, so the arm is a catch-all. A `..` rest never adds
+    /// a test (it matches any count). Used when an array pattern is a payload
+    /// field's sub-pattern, so `E::A([1, x])` tests field 0 against `1`.
+    fn array_pat_test(
+        elems: &[Option<(bool, Pat)>],
+        rest: bool,
+        front: usize,
+        subj: &Expr,
+    ) -> Option<Expr> {
+        let mut cond: Option<Expr> = None;
+        for (j, elem) in elems.iter().enumerate() {
+            let (_, p) = match elem {
+                Some(x) => x,
+                None => continue,
+            };
+            let idx = if !rest || j < front {
+                Expr::Int(j as i64)
+            } else {
+                let behind = elems.len() - front;
+                let from_end = behind - (j - front);
+                let len = Expr::MethodCall {
+                    recv: Box::new(subj.clone()),
+                    name: "len".to_string(),
+                    args: Vec::new(),
+                };
+                Expr::Bin(BinOp::Sub, Box::new(len), Box::new(Expr::Int(from_end as i64)))
+            };
+            let index = Expr::Index(Box::new(subj.clone()), Box::new(idx));
+            if let Some(t) = Self::pat_test(p, &index) {
                 cond = Some(match cond {
                     None => t,
                     Some(c) => Expr::Bin(BinOp::And, Box::new(c), Box::new(t)),
@@ -5838,14 +6601,9 @@ impl Parser {
                 );
                 Expr::Bin(BinOp::And, Box::new(lower), Box::new(upper))
             }
-            Pat::Variant(enum_name, variant, args) => Expr::VariantTest {
-                scrutinee: Box::new(subj.clone()),
-                enum_name: enum_name.clone(),
-                variant: variant.clone(),
-                tag: -1,
-                n_binds: args.as_ref().map_or(-1, |(a, _)| a.len() as i32),
-                has_rest: args.as_ref().map_or(false, |(_, rest)| *rest),
-            },
+            Pat::Variant(enum_name, variant, args) => {
+                Self::variant_pat_cond(enum_name, variant, args, subj)
+            }
             // `_` in an or-pattern: always true, so the whole condition is true.
             // A struct pattern is likewise always true; a binding one is
             // rejected before this point. A tuple alternative folds its
@@ -6103,11 +6861,28 @@ impl Parser {
             Pat::Array { elems, rest, front } => {
                 out.extend(Self::array_pat_binds(elems, *rest, *front, subj))
             }
+            // A nested variant pattern reads its payload fields through `subj`
+            // (the outer payload), so `E::A(Some(x))` binds `x` from
+            // `subj`'s field 0 read as an `Option`.
+            Pat::Variant(enum_name, variant, args) => {
+                if let Some((args, _)) = args {
+                    for (idx, (am, sub)) in args.iter().enumerate() {
+                        let payload = Expr::EnumPayload {
+                            recv: Box::new(subj.clone()),
+                            enum_name: enum_name.clone(),
+                            variant: variant.clone(),
+                            idx,
+                            offset: 0,
+                            ty: Type::Unit,
+                        };
+                        Self::pat_binds(sub, *am, &payload, out);
+                    }
+                }
+            }
             // A scalar element binds nothing (its test is generated
             // separately); an or-pattern binds nothing (rmc rejects a binding
             // in an or-pattern when it is parsed).
             Pat::Int(_) | Pat::Char(_) | Pat::CharRange(..) | Pat::Bool(_) | Pat::Str(_) | Pat::Range(..) | Pat::Or(_) => {}
-            _ => unreachable!("unexpected sub-pattern"),
         }
     }
 
@@ -6164,6 +6939,55 @@ impl Parser {
         }
     }
 
+    /// Whether `e` mentions the variable `name` anywhere. A shape that is not
+    /// inspected returns `true`, so a caller that uses this to decide whether
+    /// evaluation order matters (and evaluates into temporaries when it does)
+    /// stays conservative. Used by the `vec![..]` desugar, whose elements must
+    /// be evaluated before the binding that names the vector enters scope.
+    fn expr_mentions_name(e: &Expr, name: &str) -> bool {
+        match e {
+            Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) => false,
+            Expr::Var { name: n, .. } => n == name,
+            Expr::Bin(_, a, b) => {
+                Self::expr_mentions_name(a, name) || Self::expr_mentions_name(b, name)
+            }
+            Expr::Un(_, a) | Expr::Cast(a, _) | Expr::ArrayLit(a, _) => {
+                Self::expr_mentions_name(a, name)
+            }
+            Expr::Index(a, b) => {
+                Self::expr_mentions_name(a, name) || Self::expr_mentions_name(b, name)
+            }
+            Expr::Deref { expr, .. } | Expr::AddrOf { expr, .. } => {
+                Self::expr_mentions_name(expr, name)
+            }
+            Expr::Field { base, .. } => Self::expr_mentions_name(base, name),
+            Expr::MethodCall { recv, args, .. } => {
+                Self::expr_mentions_name(recv, name)
+                    || args.iter().any(|a| Self::expr_mentions_name(a, name))
+            }
+            Expr::Call { args, .. } => args.iter().any(|a| Self::expr_mentions_name(a, name)),
+            Expr::TupleLit(v) | Expr::ArrayList(v) => {
+                v.iter().any(|a| Self::expr_mentions_name(a, name))
+            }
+            Expr::StructLit { fields, .. } => {
+                fields.iter().any(|f| Self::expr_mentions_name(&f.value, name))
+            }
+            Expr::EnumCtor { args, .. } => args.iter().any(|a| Self::expr_mentions_name(a, name)),
+            Expr::EnumPayload { recv, .. } => Self::expr_mentions_name(recv, name),
+            Expr::BoolTest { scrutinee, .. } => Self::expr_mentions_name(scrutinee, name),
+            Expr::VariantTest { scrutinee, sub_tests, .. } => {
+                Self::expr_mentions_name(scrutinee, name)
+                    || sub_tests.iter().any(|(_, t)| Self::expr_mentions_name(t, name))
+            }
+            Expr::PatScrutinee(a) => Self::expr_mentions_name(a, name),
+            Expr::PatCheck { base, .. } | Expr::PatArity { base, .. } => {
+                Self::expr_mentions_name(base, name)
+            }
+            // A block, `if`, `loop` or `match` can hide the name.
+            _ => true,
+        }
+    }
+
     /// The first variable a pattern binds, if any. A struct pattern binds the
     /// names of its sub-patterns; an or-pattern binds through its alternatives.
     /// Used to reject a binding in an or-pattern (rustc's E0408), which rmc
@@ -6175,8 +6999,7 @@ impl Parser {
             // binds.
             Pat::At(n, _, _) => Some(n.clone()),
             // A payload variant pattern binds the names of its argument
-            // sub-patterns; a nested variant pattern would too, but it is
-            // rejected before this point.
+            // sub-patterns; a nested variant pattern recurses through them.
             Pat::Variant(_, _, Some((args, _))) => {
                 args.iter().find_map(|(_, sub)| Self::first_bound_name(sub))
             }
@@ -6327,21 +7150,16 @@ impl Parser {
                 }),
             ),
             Pat::Variant(enum_name, variant, args) => {
-                let n_binds = args.as_ref().map_or(-1, |(a, _)| a.len() as i32);
-                let has_rest = args.as_ref().map_or(false, |(_, rest)| *rest);
-                let cond = Expr::VariantTest {
-                    scrutinee: Box::new(subj.clone()),
-                    enum_name: enum_name.clone(),
-                    variant: variant.clone(),
-                    tag: -1,
-                    n_binds,
-                    has_rest,
-                };
+                // The tag test, carrying any refutable payload sub-pattern's
+                // test as `sub_tests` (a nested variant pattern such as
+                // `E::A(Some(x))`). Codegen runs the sub-tests only once the
+                // outer tag matched, so a nested payload read is guarded.
+                let cond = Self::variant_pat_cond(&enum_name, &variant, &args, subj);
                 // `Enum::V(w, x)` binds each payload field in the arm body. Each
                 // argument is the payload read at its field index, fed to the
                 // same per-pattern expansion the `let` and `match` paths use, so
-                // `_` reads nothing and a nested struct/array sub-pattern reads
-                // through the payload.
+                // `_` reads nothing, a nested struct/array sub-pattern reads
+                // through the payload, and a nested variant recurses.
                 let binds = match args {
                     Some((args, _)) => {
                         let mut out = Vec::new();
@@ -6626,9 +7444,9 @@ impl Parser {
                             Expr::Int(0)
                         } else {
                             let e = self.parse_bracketed_expr()?;
-                            self.expect(Tok::RParen)?;
                             e
                         };
+                        self.expect(Tok::RParen)?;
                         return Ok(Expr::Call {
                             name: "\u{0}vecnew".into(),
                             args: vec![cap],
@@ -6729,6 +7547,30 @@ impl Parser {
                         }
                     }
                     self.expect(Tok::RParen)?;
+                    // `P(a, b)` names a tuple struct's constructor, not a
+                    // function: it lowers to a `StructLit` whose fields are the
+                    // positional names `"0"`, `"1"`, ... so it reuses the whole
+                    // struct path. The arity is checked here against the prescan.
+                    if let Some(&n) = self.struct_ctors.get(&name) {
+                        if args.len() != n {
+                            return Err(format!(
+                                "at byte {}: tuple struct `{name}` takes {n} field(s) but {} were given",
+                                self.pos(),
+                                args.len()
+                            ));
+                        }
+                        let fields = args
+                            .into_iter()
+                            .enumerate()
+                            .map(|(k, value)| FieldInit {
+                                name: k.to_string(),
+                                offset: 0,
+                                ty: Type::I64,
+                                value,
+                            })
+                            .collect();
+                        return Ok(Expr::StructLit { name, fields, slot: -1 });
+                    }
                     // A call names a nested `fn` if one is in scope, so a nested
                     // `fn` shadows a top-level one of the same name. The rewrite
                     // is to the hoisted function's unique name.
@@ -6744,6 +7586,10 @@ impl Parser {
                     Ok(Expr::Bool(*b))
                 } else if let Some(c) = self.const_chars.get(&name) {
                     Ok(Expr::Char(*c))
+                } else if self.unit_structs.contains(&name) {
+                    // `U` names a unit struct: its value is a fieldless
+                    // `StructLit`, not a variable read.
+                    Ok(Expr::StructLit { name, fields: Vec::new(), slot: -1 })
                 } else {
                     Ok(Expr::Var { name, slot: -1, ty: Type::I64 })
                 }
@@ -6856,6 +7702,12 @@ impl Parser {
             Some(Tok::LBrace) => Ok(Expr::Block(self.parse_block()?)),
             Some(Tok::LBracket) => {
                 self.i += 1;
+                // `[]`: an empty array literal. It has no element to infer a
+                // type from, so sema only accepts it where the annotation
+                // supplies one (`let z: [i64; 0] = [];`).
+                if self.eat(&Tok::RBracket) {
+                    return Ok(Expr::ArrayList(Vec::new()));
+                }
                 let first = self.parse_bracketed_expr()?;
                 if self.eat(&Tok::Semi) {
                     // `[v; N]`: the repeat count is a constant expression.
@@ -6934,7 +7786,10 @@ enum Pat {
     /// `mut` on the pattern as a whole. A struct pattern is irrefutable, so it
     /// has no test: it desugars to the field reads its bindings name (see
     /// `desugar_arm` and `let` destructuring). The struct name is resolved by
-    /// sema, so it may name a struct declared later in the file.
+    /// sema, so it may name a struct declared later in the file. A tuple struct
+    /// pattern `P(a, b)` reuses this node: its fields are the positional names
+    /// `"0"`, `"1"`, ..., and its arity is checked against the prescan when it
+    /// is parsed.
     Struct(String, Vec<FieldPat>),
     /// `[a, b, .., c]`: an array pattern. Each element is a sub-pattern with its
     /// own `mut` flag (`[mut a, b]`); `None` marks the single `..` rest, which
