@@ -8295,6 +8295,49 @@ fn vec_push_calls_the_grow_helper_and_writes_the_address_back() {
 }
 
 #[test]
+fn vec_push_rejects_a_different_aggregate_of_the_same_size() {
+    // `P` and `Q` are both two words, so a size-only check cannot tell them
+    // apart. The parser records the declared element type on the call and sema
+    // compares it: storing a `Q` in a `Vec<P>` would otherwise be accepted and
+    // a later `v[i].y` would read `Q`'s padding as `P::y`.
+    let err = compile_to_asm(
+        "struct P { x: i64, y: i64 } struct Q { x: i64, y: i64 } \
+         fn main() { let mut v: Vec<P> = Vec::new(); v.push(Q { x: 1, y: 2 }); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("__rmc_vec_push"), "got: {err}");
+    assert!(err.contains("expected an element of type"), "got: {err}");
+}
+
+#[test]
+fn vec_push_rejects_a_scalar_into_an_aggregate_vector() {
+    // The converse of the same confusion: an `i64` is one word and a `Vec<P>`
+    // element is two, so the size check catches it, but the element-type check
+    // reports it before any layout arithmetic runs.
+    let err = compile_to_asm(
+        "struct P { x: i64, y: i64 } \
+         fn main() { let mut v: Vec<P> = Vec::new(); v.push(7); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("__rmc_vec_push"), "got: {err}");
+}
+
+#[test]
+fn vec_push_accepts_the_matching_aggregate_element() {
+    // The same shape with the right element type must still compile, so the
+    // check rejects only a mismatch.
+    assert!(compile_to_asm(
+        "struct P { x: i64, y: i64 } \
+         fn main() { let mut v: Vec<P> = Vec::new(); v.push(P { x: 1, y: 2 }); \
+         let p = v[0]; let _ = p.x; }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
 fn string_new_and_from_call_the_string_helpers() {
     // `String::new()`/`with_capacity(k)` allocate an empty buffer through
     // `__rmc_str_new`, and `String::from("lit")` copies the literal through

@@ -69,6 +69,7 @@ _start:
     },
     Piece {
         text: r#"
+.text
 # long arg_i64(long idx)  -- parse argv[idx] as a signed decimal integer.
 # Returns 0 when the index is out of range. Used by benchmarks so the input is
 # opaque to the compiler and cannot be constant-folded away.
@@ -121,6 +122,7 @@ arg_i64:
     },
     Piece {
         text: r#"
+.text
 # long __rmc_arg_or(long idx, long default)  -- arg_i64(idx) when idx is a
 # valid index, else `default`. Lowers the `std::env::args().nth(i)...unwrap_or(d)`
 # idiom (and its `.and_then(..).ok()` spelling) without an Option type.
@@ -147,6 +149,7 @@ __rmc_arg_or:
     },
     Piece {
         text: r#"
+.text
 # long __rmc_nargs(void)  -- the argument count. The `for v in &args` desugar
 # bounds its loop by this, so an args-vector is never materialised.
 .globl __rmc_nargs
@@ -160,6 +163,7 @@ __rmc_nargs:
     },
     Piece {
         text: r#"
+.text
 # long __rmc_fill(long addr, long count, long elem)  -- store `elem` at each of
 # `count` words from `addr`; returns `addr`. Backs the `vec![e; n]` desugar.
 .globl __rmc_fill
@@ -180,6 +184,7 @@ __rmc_fill:
     },
     Piece {
         text: r#"
+.text
 # long __rmc_fill_bytes(long addr, long count, long elem)  -- store the low byte
 # of `elem` at each of `count` bytes from `addr`; returns `addr`. Backs the
 # `vec![0u8; n]` desugar, whose elements are one byte wide. A `rep stosb` fill
@@ -203,6 +208,7 @@ __rmc_fill_bytes:
     },
     Piece {
         text: r#"
+.text
 # long __rmc_min(long a, long b)  -- the smaller of two signed words. Backs the
 # `skip`/`take` range adapters' count, where it caps the number of iterations at
 # the range length. Signed compare, since a range length is never negative but
@@ -222,6 +228,7 @@ __rmc_min:
     },
     Piece {
         text: r#"
+.text
 # void exit(long code)
 .globl exit
 .type exit, @function
@@ -234,6 +241,7 @@ exit:
     },
     Piece {
         text: r#"
+.text
 # void print_i64(long n)  -- decimal value followed by a newline
 .globl print_i64
 .type print_i64, @function
@@ -279,6 +287,7 @@ print_i64:
     },
     Piece {
         text: r#"
+.text
 # void print_str(long ptr)  -- ptr points at a {len: i64, bytes...} record
 .globl print_str
 .type print_str, @function
@@ -306,6 +315,7 @@ print_str:
     },
     Piece {
         text: r#"
+.text
 # void __rmc_write_i64(long n)  -- decimal value, no trailing newline
 .globl __rmc_write_i64
 .type __rmc_write_i64, @function
@@ -350,6 +360,7 @@ __rmc_write_i64:
     },
     Piece {
         text: r#"
+.text
 # void __rmc_write_u64(unsigned long n)  -- unsigned decimal, no trailing newline
 .globl __rmc_write_u64
 .type __rmc_write_u64, @function
@@ -382,6 +393,7 @@ __rmc_write_u64:
     },
     Piece {
         text: r#"
+.text
 # void __rmc_write_bool(bool b)  -- `true` or `false`, no trailing newline
 .globl __rmc_write_bool
 .type __rmc_write_bool, @function
@@ -418,6 +430,7 @@ __rmc_write_bool:
     },
     Piece {
         text: r#"
+.text
 # void __rmc_write_str(long ptr)  -- ptr points at a {len: i64, bytes...} record,
 # written with no trailing newline (unlike print_str)
 .globl __rmc_write_str
@@ -438,6 +451,7 @@ __rmc_write_str:
     },
     Piece {
         text: r#"
+.text
 # void __rmc_write_char(long c)  -- c is a Unicode scalar value, written as its
 # UTF-8 bytes with no trailing newline (like `{}` for a `char`).
 .globl __rmc_write_char
@@ -516,6 +530,7 @@ __rmc_write_char:
     },
     Piece {
         text: r#"
+.text
 # void print_char(char c)  -- the character written as UTF-8 bytes followed by
 # a newline, the char analogue of print_i64/print_bool.
 .globl print_char
@@ -539,6 +554,7 @@ print_char:
     },
     Piece {
         text: r#"
+.text
 # bool __rmc_str_lt(long a, long b)  -- a and b point at {len: i64, bytes...}
 # records. Returns 1 when the byte string a is lexicographically less than b,
 # 0 otherwise. A `str` value is the address of its record, so a string
@@ -585,6 +601,7 @@ __rmc_str_lt:
     },
     Piece {
         text: r#"
+.text
 # long __rmc_str_len(long s)  -- the byte length of the string record at `s`,
 # which is `{len: i64, bytes...}`. A `str` value is the address of its record,
 # so `s.len()` is the record's first word; sema lowers it to a call here.
@@ -599,6 +616,7 @@ __rmc_str_len:
     },
     Piece {
         text: r#"
+.text
 # long __rmc_str_starts(long s, long pre)  -- 1 when the bytes of `pre` are a
 # prefix of `s`, 0 otherwise. Both are `{len: i64, bytes...}` records, so a
 # prefix is `pre.len <= s.len` and the first `pre.len` bytes equal.
@@ -633,6 +651,7 @@ __rmc_str_starts:
     },
     Piece {
         text: r#"
+.text
 # long __rmc_str_ends(long s, long suf)  -- 1 when the bytes of `suf` are a
 # suffix of `s`, 0 otherwise. Both are `{len: i64, bytes...}` records, so a
 # suffix is `suf.len <= s.len` and the last `suf.len` bytes equal.
@@ -670,6 +689,7 @@ __rmc_str_ends:
     },
     Piece {
         text: r#"
+.text
 # long __rmc_str_find(long s, long needle)  -- the byte index of the first
 # occurrence of `needle`'s bytes inside `s`, or -1 when absent. Both are
 # `{len: i64, bytes...}` records. An empty needle matches at index 0.
@@ -719,6 +739,7 @@ __rmc_str_find:
     },
     Piece {
         text: r#"
+.text
 # void print_bool(bool b)  -- prints 0 or 1 followed by a newline
 .globl print_bool
 .type print_bool, @function
@@ -744,6 +765,7 @@ print_bool:
     },
     Piece {
         text: r#"
+.text
 # void putchar(long c)
 .globl putchar
 .type putchar, @function
@@ -765,6 +787,7 @@ putchar:
     },
     Piece {
         text: r#"
+.text
 # long alloc(long n)  -- first-fit block from the free list, else carve from the
 # arena, else mmap a fresh chunk. Returns a pointer with room for `n` bytes.
 # Layout of a block: [size: 8 bytes][payload ...]; the pointer handed out points
@@ -853,6 +876,7 @@ alloc:
     },
     Piece {
         text: r#"
+.text
 # void free(long p)  -- return a block to the free list, keeping the list
 # address-ordered so adjacent blocks can be coalesced.
 .globl free
@@ -922,6 +946,35 @@ free:
     Piece {
         text: r#"
 .text
+# void __rmc_cap_overflow(void)  -- a `Vec`/`String` constructor or grow was
+# asked for a capacity whose byte size does not fit (a negative capacity read
+# as `usize`, or `count * width` overflowing `i64`). The byte count is computed
+# by signed `imul`, so it is negative exactly when the true product overflows or
+# the input was negative; without this check the request would wrap to a small
+# positive size and the header/store would then be written past the allocation.
+# Write a fixed message and exit with status 101, mirroring a Rust panic.
+.globl __rmc_cap_overflow
+.type __rmc_cap_overflow, @function
+__rmc_cap_overflow:
+    mov $1, %rax
+    mov $2, %rdi             # stderr, like a Rust panic
+    lea __rmc_cap_overflow_msg(%rip), %rsi
+    mov $__rmc_cap_overflow_len, %rdx
+    syscall
+    mov $101, %rdi
+    mov $60, %rax
+    syscall
+.size __rmc_cap_overflow, .-__rmc_cap_overflow
+
+.section .rodata
+__rmc_cap_overflow_msg: .ascii "rmc: capacity overflow\n"
+.set __rmc_cap_overflow_len, . - __rmc_cap_overflow_msg
+"#,
+        defines: &["__rmc_cap_overflow", "__rmc_cap_overflow_msg", "__rmc_cap_overflow_len"],
+    },
+    Piece {
+        text: r#"
+.text
 # ---- growable `Vec<T>` helpers ----
 # A `Vec<T>` value is the address of its element store, exactly as before, so
 # `.as_ptr()`/`.add(off)` and element indexing stay plain pointer arithmetic.
@@ -941,8 +994,11 @@ __rmc_vec_new:
     sub $8, %rsp              # keep %rsp 16-byte aligned at the `call`
     mov %rdi, %r12            # capacity
     mov %rsi, %r13            # element width
+    test %r12, %r12
+    js __rmc_cap_overflow     # a negative capacity (a huge `usize`) would wrap
     mov %r12, %rdi
     imul %r13, %rdi           # bytes = capacity * width
+    jo __rmc_cap_overflow     # the byte size overflowed 64 bits
     add $16, %rdi             # plus the length/capacity header
     call alloc
     mov %rax, %rbx
@@ -984,7 +1040,10 @@ __rmc_vec_repeat:
 .Lvec_rep_flag:
     mov %rax, (%rsp)
     mov %r12, %rdi
+    test %r12, %r12
+    js __rmc_cap_overflow       # a negative count would wrap
     imul %r14, %rdi
+    jo __rmc_cap_overflow       # the byte size overflowed 64 bits
     add $16, %rdi
     call alloc
     mov %rax, %rbx
@@ -1163,6 +1222,7 @@ __rmc_vec_cap:
     },
     Piece {
         text: r#"
+.text
 # rdi = vector, rsi = index, rdx = element stride  ->  rax = element address.
 # The checked `v[i]`: reads the length from the header just before the store and
 # traps (like a Rust panic) when the index is out of range, so a bad index can
@@ -1184,6 +1244,7 @@ __rmc_vec_at:
     },
     Piece {
         text: r#"
+.text
 # A `String` is a growable heap byte buffer. Its *value* is the address of a
 # `{len, bytes}` record, exactly what a `str` is, so `s.as_str()` is the value
 # itself and every `str` helper (`__rmc_str_len`, `__rmc_write_str`,
@@ -1201,6 +1262,8 @@ __rmc_str_new:
     push %rbx
     sub $16, %rsp
     mov %rdi, %rbx            # capacity
+    test %rbx, %rbx
+    js __rmc_cap_overflow     # a negative capacity (a huge `usize`) would wrap
     lea 16(%rdi), %rdi        # bytes = capacity + {cap, len}
     call alloc
     mov %rbx, (%rax)          # capacity
@@ -2146,6 +2209,31 @@ mod tests {
         // table; make sure each one defines at least one symbol.
         for p in PIECES {
             assert!(!p.defines.is_empty(), "a piece with no symbols");
+        }
+    }
+
+    #[test]
+    fn every_piece_names_its_own_section() {
+        // A piece must set its own section, so any subset concatenates into a
+        // valid unit. A function piece that omits `.text` inherits whatever
+        // section the previous piece left current (for example `.rodata`),
+        // landing code in a non-executable section: a trap handler or helper
+        // assembled there faults at run time instead of running.
+        for p in PIECES {
+            let first = p
+                .text
+                .lines()
+                .map(str::trim_start)
+                .find(|l| !l.is_empty() && !l.starts_with('#'))
+                .expect("every piece has a body");
+            assert!(
+                first.starts_with(".text")
+                    || first.starts_with(".section")
+                    || first.starts_with(".data")
+                    || first.starts_with(".rodata")
+                    || first.starts_with(".bss"),
+                "a piece must name its own section, got: {first:?}"
+            );
         }
     }
 }

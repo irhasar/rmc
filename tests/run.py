@@ -214,6 +214,62 @@ def check_clamp_trap(combos):
     return failures
 
 
+def check_cap_traps(combos):
+    """A `Vec`/`String` constructor asked for a capacity that does not fit must
+    write its message and exit 101, not corrupt adjacent memory or fault. A
+    negative capacity read as `usize` is enormous; the byte size `count * width`
+    then wraps to a small positive number, so the store is allocated too small
+    and the header (or the element write) lands past it. The capacity comes from
+    a parameter, so it is not a literal sema could reject at compile time.
+
+    `String::with_capacity`, `Vec::with_capacity` and the `vec![v; n]` repeat
+    each compute a byte size and so each need the check; the repeat also scales
+    by the element width, so it can overflow for a huge positive count too."""
+    cases = {
+        "str": ("fn f(k: i64) -> i64 { let s = String::with_capacity(k as usize); s.capacity() } fn main() { let _ = f(-16); }", b""),
+        "vec": ("fn f(k: i64) -> i64 { let v: Vec<i64> = Vec::with_capacity(k as usize); v.capacity() } fn main() { let _ = f(-16); }", b""),
+        "repeat": ("fn f(k: i64) -> i64 { let v: Vec<i64> = vec![7; k as usize]; v.len() } fn main() { let _ = f(-1); }", b""),
+    }
+    failures = 0
+    for name, (src, want_stdout) in cases.items():
+        src_path = os.path.join(OUT, f"cap_{name}.rs")
+        with open(src_path, "w") as f:
+            f.write(src)
+        for label, opt_flags in combos:
+            asm = subprocess.run([RMC] + list(opt_flags) + ["--emit-asm", src_path],
+                                 capture_output=True)
+            if asm.returncode != 0:
+                print(f"FAIL cap {name}{label}: rmc failed:\n{asm.stderr.decode(errors='replace')}")
+                failures += 1
+                continue
+            s_path = os.path.join(OUT, f"cap_{name}.s")
+            o_path = os.path.join(OUT, f"cap_{name}.o")
+            exe = os.path.join(OUT, f"cap_{name}.exe")
+            with open(s_path, "wb") as f:
+                f.write(asm.stdout)
+            p = subprocess.run(["as", s_path, "-o", o_path], capture_output=True)
+            if p.returncode != 0:
+                print(f"FAIL cap {name}{label}: as failed:\n{p.stderr.decode(errors='replace')}")
+                failures += 1
+                continue
+            p = subprocess.run(["ld", "-o", exe, o_path], capture_output=True)
+            if p.returncode != 0:
+                print(f"FAIL cap {name}{label}: ld failed:\n{p.stderr.decode(errors='replace')}")
+                failures += 1
+                continue
+            p = subprocess.run([exe], capture_output=True)
+            if p.returncode != 101 or b"capacity overflow" not in p.stderr:
+                print(f"FAIL cap {name}{label}: exit={p.returncode} stderr={p.stderr!r} (want 101 + message)")
+                failures += 1
+            elif not p.stdout.startswith(want_stdout):
+                print(f"FAIL cap {name}{label}: stdout={p.stdout!r} (want prefix {want_stdout!r})")
+                failures += 1
+    if failures == 0:
+        print(f"all {len(cases)} capacity traps exit 101 under a plain `ld` link, "
+              f"in {len(combos)} optimiser configurations")
+    return failures
+
+
 def check_stripped():
     """Size behaviour of both link paths.
 
@@ -539,6 +595,7 @@ def main():
 
     failures += check_bounds_traps(combos)
     failures += check_clamp_trap(combos)
+    failures += check_cap_traps(combos)
     stripped = check_stripped()
     failures += stripped
     if stripped == 0:

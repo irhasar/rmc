@@ -3023,6 +3023,7 @@ impl Parser {
                             arg_slots: Vec::new(),
                             ret_slot: -1,
                             ret_ty: Type::I64,
+                            elem_ty: None,
                         }),
                         slot: -1,
                         mutable: false,
@@ -3130,6 +3131,7 @@ impl Parser {
                     arg_slots: Vec::new(),
                     ret_slot: -1,
                     ret_ty: Type::I64,
+                    elem_ty: None,
                 },
                 None,
             ),
@@ -3811,6 +3813,7 @@ impl Parser {
                             arg_slots: Vec::new(),
                             ret_slot: -1,
                             ret_ty: Type::I64,
+                            elem_ty: None,
                         }),
                         slot: -1,
                         mutable: false,
@@ -4272,6 +4275,7 @@ impl Parser {
             arg_slots: Vec::new(),
             ret_slot: -1,
             ret_ty: Type::I64,
+            elem_ty: None,
         };
         let elem = self.vec_elem_place(&vec_name, &recv, idx_var);
         let mut stmts = match pat {
@@ -4408,6 +4412,7 @@ impl Parser {
             arg_slots: Vec::new(),
             ret_slot: -1,
             ret_ty: Type::I64,
+            elem_ty: None,
         };
         let val_ty = match self.vec_elem_ty.get(&recv) {
             Some(t) => t.clone(),
@@ -4674,6 +4679,7 @@ impl Parser {
                 arg_slots: Vec::new(),
                 ret_slot: -1,
                 ret_ty: Type::I64,
+                elem_ty: None,
             },
             end_slot: -1,
             inclusive: false,
@@ -4692,6 +4698,7 @@ impl Parser {
             arg_slots: Vec::new(),
             ret_slot: -1,
             ret_ty: Type::I64,
+            elem_ty: None,
         }
     }
 
@@ -5042,6 +5049,7 @@ impl Parser {
                                 arg_slots: Vec::new(),
                                 ret_slot: -1,
                                 ret_ty: Type::Str,
+                                elem_ty: None,
                             }),
                             slot: -1,
                             mutable,
@@ -5092,6 +5100,7 @@ impl Parser {
                                 arg_slots: Vec::new(),
                                 ret_slot: -1,
                                 ret_ty: Type::I64,
+                                elem_ty: None,
                             }
                         } else {
                             // `vec![value; count]`: `count` copies of `value`,
@@ -5115,6 +5124,7 @@ impl Parser {
                                 arg_slots: Vec::new(),
                                 ret_slot: -1,
                                 ret_ty: Type::I64,
+                                elem_ty: elem_ty.clone(),
                             }
                         };
                         out.push(Stmt::Let {
@@ -5201,6 +5211,7 @@ impl Parser {
                                 arg_slots: Vec::new(),
                                 ret_slot: -1,
                                 ret_ty: Type::I64,
+                                elem_ty: None,
                             }),
                             slot: -1,
                             mutable,
@@ -5226,6 +5237,7 @@ impl Parser {
                                 arg_slots: Vec::new(),
                                 ret_slot: -1,
                                 ret_ty: Type::I64,
+                                elem_ty: elem_ty.clone(),
                             }));
                         }
                         return Ok(());
@@ -5646,6 +5658,7 @@ impl Parser {
             arg_slots: vec![(-1, 0)],
             ret_slot: -1,
             ret_ty: Type::Unit,
+            elem_ty: None,
         }
     }
 
@@ -5700,6 +5713,7 @@ impl Parser {
                 arg_slots: Vec::new(),
                 ret_slot: -1,
                 ret_ty: Type::I64,
+                elem_ty: None,
             }));
         }
         if !known {
@@ -5739,6 +5753,7 @@ impl Parser {
                 arg_slots: Vec::new(),
                 ret_slot: -1,
                 ret_ty: Type::Unit,
+                elem_ty: None,
             },
             // `std::hint::black_box(x)`: the identity. rmc has no optimizer that
             // would otherwise fold the value away, so the barrier is a no-op.
@@ -5896,6 +5911,7 @@ impl Parser {
             arg_slots: Vec::new(),
             ret_slot: -1,
             ret_ty: Type::I64,
+            elem_ty: None,
         })
     }
 
@@ -5951,6 +5967,7 @@ impl Parser {
             arg_slots: Vec::new(),
             ret_slot: -1,
             ret_ty: Type::I64,
+            elem_ty: None,
         }
     }
     /// `println!("...")` / `print!("...")`: format the literal and its `{}`
@@ -6019,6 +6036,7 @@ impl Parser {
                 arg_slots: Vec::new(),
                 ret_slot: -1,
                 ret_ty: Type::I64,
+                elem_ty: None,
             });
         }
         let first = self.parse_bracketed_expr()?;
@@ -6032,6 +6050,7 @@ impl Parser {
                 arg_slots: Vec::new(),
                 ret_slot: -1,
                 ret_ty: Type::I64,
+                elem_ty: None,
             });
         }
         // `vec![a, b, c]`: the elements are stored in order.
@@ -6049,6 +6068,7 @@ impl Parser {
             arg_slots: Vec::new(),
             ret_slot: -1,
             ret_ty: Type::I64,
+            elem_ty: None,
         })
     }
 
@@ -6095,6 +6115,7 @@ impl Parser {
                     arg_slots: vec![(-1, 0)],
                     ret_slot: -1,
                     ret_ty: Type::Unit,
+                    elem_ty: None,
                 }));
             }
         };
@@ -6121,6 +6142,7 @@ impl Parser {
                         arg_slots: vec![(-1, 0)],
                         ret_slot: -1,
                         ret_ty: Type::Unit,
+                        elem_ty: None,
                     }));
                     k += 2;
                 }
@@ -6152,6 +6174,7 @@ impl Parser {
                 arg_slots: vec![(-1, 0)],
                 ret_slot: -1,
                 ret_ty: Type::Unit,
+                elem_ty: None,
             }));
         }
         Ok(Expr::Block(Block { stmts, tail: None }))
@@ -6432,6 +6455,7 @@ impl Parser {
                                 arg_slots: Vec::new(),
                                 ret_slot: -1,
                                 ret_ty: Type::I64,
+                                elem_ty: None,
                             }
                         } else {
                             let off = if stride == 1 {
@@ -6544,6 +6568,7 @@ impl Parser {
                                     arg_slots: Vec::new(),
                                     ret_slot: -1,
                                     ret_ty: Type::I64,
+                                    elem_ty: None,
                                 };
                                 continue;
                             }
@@ -6560,6 +6585,7 @@ impl Parser {
                                     arg_slots: Vec::new(),
                                     ret_slot: -1,
                                     ret_ty: Type::Str,
+                                    elem_ty: None,
                                 };
                                 continue;
                             }
@@ -6572,6 +6598,7 @@ impl Parser {
                                     arg_slots: Vec::new(),
                                     ret_slot: -1,
                                     ret_ty: Type::Str,
+                                    elem_ty: None,
                                 };
                                 continue;
                             }
@@ -6587,6 +6614,7 @@ impl Parser {
                                 arg_slots: Vec::new(),
                                 ret_slot: -1,
                                 ret_ty: Type::I64,
+                                elem_ty: None,
                             };
                             continue;
                         }
@@ -6598,6 +6626,7 @@ impl Parser {
                                 arg_slots: Vec::new(),
                                 ret_slot: -1,
                                 ret_ty: Type::I64,
+                                elem_ty: None,
                             };
                             continue;
                         }
@@ -6612,6 +6641,7 @@ impl Parser {
                                     arg_slots: Vec::new(),
                                     ret_slot: -1,
                                     ret_ty: Type::I64,
+                                    elem_ty: None,
                                 }),
                                 Box::new(Expr::Int(0)),
                             );
@@ -6654,6 +6684,7 @@ impl Parser {
                                 arg_slots: Vec::new(),
                                 ret_slot: -1,
                                 ret_ty: Type::I64,
+                                elem_ty: self.vec_elem_ty.get(recv).cloned(),
                             };
                             continue;
                         }
@@ -6668,6 +6699,7 @@ impl Parser {
                                 arg_slots: Vec::new(),
                                 ret_slot: -1,
                                 ret_ty: Type::I64,
+                                elem_ty: None,
                             };
                             continue;
                         }
@@ -8866,6 +8898,7 @@ impl Parser {
                                 arg_slots: Vec::new(),
                                 ret_slot: -1,
                                 ret_ty: Type::I64,
+                                elem_ty: None,
                             },
                             "with_capacity" => {
                                 let cap = self.parse_bracketed_expr()?;
@@ -8875,6 +8908,7 @@ impl Parser {
                                     arg_slots: Vec::new(),
                                     ret_slot: -1,
                                     ret_ty: Type::I64,
+                                    elem_ty: None,
                                 }
                             }
                             "from" => {
@@ -8885,6 +8919,7 @@ impl Parser {
                                     arg_slots: Vec::new(),
                                     ret_slot: -1,
                                     ret_ty: Type::I64,
+                                    elem_ty: None,
                                 }
                             }
                             other => {
@@ -8923,6 +8958,7 @@ impl Parser {
                             arg_slots: Vec::new(),
                             ret_slot: -1,
                             ret_ty: Type::I64,
+                            elem_ty: None,
                         });
                     }
                     // `i64::MIN`, `usize::MAX`, `u32::BITS`: an integer-width
@@ -9045,7 +9081,7 @@ impl Parser {
                     // `fn` shadows a top-level one of the same name. The rewrite
                     // is to the hoisted function's unique name.
                     let name = self.resolve_fn_name(name);
-                    Ok(Expr::Call { name, args, arg_slots: Vec::new(), ret_slot: -1, ret_ty: Type::I64 })
+                    Ok(Expr::Call { name, args, arg_slots: Vec::new(), ret_slot: -1, ret_ty: Type::I64, elem_ty: None })
                 } else if let Some(v) = self.consts.get(&name) {
                     // A reference to a constant is its value, substituted here
                     // so sema and codegen never see a constant as a variable. A

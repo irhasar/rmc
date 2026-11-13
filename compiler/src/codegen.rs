@@ -2404,7 +2404,7 @@ Expr::PatScrutinee(_) => {
                 }
             }
             Expr::Bin(op, a, b) => self.gen_bin(*op, a, b),
-            Expr::Call { name, args, arg_slots, ret_slot, ret_ty } => {
+            Expr::Call { name, args, arg_slots, ret_slot, ret_ty, .. } => {
                 self.gen_call(name, args, arg_slots, *ret_slot, ret_ty)
             }
             Expr::If(cond, then, els) => {

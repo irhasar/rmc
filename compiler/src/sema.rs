@@ -1139,6 +1139,7 @@ impl Sema {
                     arg_slots: Vec::new(),
                     ret_slot: -1,
                     ret_ty: Type::I64,
+                    elem_ty: None,
                 };
                 let below = if_then_else(
                     Expr::Bin(Lt, Box::new(x.clone()), Box::new(lo.clone())),
@@ -1217,6 +1218,7 @@ impl Sema {
                         arg_slots: vec![(-1, 0)],
                         ret_slot: -1,
                         ret_ty: Type::I64,
+                        elem_ty: None,
                     },
                     Type::I64,
                 )
@@ -1243,6 +1245,7 @@ impl Sema {
                         arg_slots: vec![(-1, 0), (-1, 0)],
                         ret_slot: -1,
                         ret_ty: Type::I64,
+                        elem_ty: None,
                     },
                     Type::I64,
                 )
@@ -1320,6 +1323,7 @@ impl Sema {
                         arg_slots: vec![(-1, 0), (-1, 0)],
                         ret_slot: -1,
                         ret_ty: Type::I64,
+                        elem_ty: None,
                     },
                     Type::I64,
                 )
@@ -2838,6 +2842,7 @@ impl Sema {
             arg_slots: vec![(-1, 0), (-1, 0)],
             ret_slot: -1,
             ret_ty: Type::Bool,
+            elem_ty: None,
         };
         let not = |e: Expr| Expr::Un(UnOp::Not, Box::new(e));
         use BinOp::*;
@@ -3208,7 +3213,7 @@ impl Sema {
                     }
                 }
             }
-            Expr::Call { name, args, arg_slots, ret_slot, ret_ty } => {
+            Expr::Call { name, args, arg_slots, ret_slot, ret_ty, elem_ty } => {
                 // `__rmc_print` is the placeholder a `print!`/`println!` `{}`
                 // emits. The type of the value is known only here, so pick the
                 // runtime helper that matches it and rewrite the call.
@@ -3301,6 +3306,36 @@ impl Sema {
                     // aggregate travels as its address, so its type need not
                     // match the declared `I64`.
                     let vec_elem_arg = vec_helper && i == 1;
+                    // The element's own type must be the vector's element type.
+                    // The value argument is type-erased to `I64`, so a size
+                    // check alone cannot tell a valid element from a *different*
+                    // aggregate of the same size (`v.push(Q{..})` on a `Vec<P>`
+                    // where `P` and `Q` are both 16 bytes): the runtime would
+                    // store the wrong type, and a later read would misread it.
+                    // The parser records the declared element type on the call,
+                    // so compare against it here. A missing element type (an
+                    // unannotated `Vec` whose element was not inferred) leaves
+                    // the size check below as the only guard.
+                    if vec_elem_arg {
+                        if let Some(expected) = elem_ty.clone() {
+                            if expected.is_aggregate() {
+                                if t != Type::Never && !t.is_aggregate() {
+                                    return Err(format!(
+                                        "`{name}`: expected an element of type {expected:?}, found {t:?}"
+                                    ));
+                                }
+                                if t.is_aggregate() && t != expected {
+                                    return Err(format!(
+                                        "`{name}`: expected an element of type {expected:?}, found {t:?}"
+                                    ));
+                                }
+                            } else if t.is_aggregate() {
+                                return Err(format!(
+                                    "`{name}`: expected a scalar element ({expected:?}), found an aggregate {t:?}"
+                                ));
+                            }
+                        }
+                    }
                     // An aggregate element must match the vector's element size
                     // exactly, or the runtime copies the wrong byte count (past a
                     // narrower temporary, or past the destination).
@@ -3914,6 +3949,7 @@ impl Sema {
                                 arg_slots: vec![(-1, 0)],
                                 ret_slot: -1,
                                 ret_ty: Type::I64,
+                                elem_ty: None,
                             };
                             return self.check_expr(e, scope);
                         }
@@ -3957,6 +3993,7 @@ impl Sema {
                                 arg_slots: vec![(-1, 0)],
                                 ret_slot: -1,
                                 ret_ty: Type::I64,
+                                elem_ty: None,
                             };
                             *e = Expr::Bin(BinOp::Eq, Box::new(call), Box::new(Expr::Int(0)));
                             return self.check_expr(e, scope);
@@ -4008,6 +4045,7 @@ impl Sema {
                             arg_slots: vec![(-1, 0), (-1, 0)],
                             ret_slot: -1,
                             ret_ty: if name == "contains" { Type::I64 } else { Type::Bool },
+                            elem_ty: None,
                         };
                         *e = if name == "contains" {
                             Expr::Bin(BinOp::Ne, Box::new(call), Box::new(Expr::Int(-1)))
@@ -4122,6 +4160,7 @@ impl Sema {
                     arg_slots: Vec::new(),
                     ret_slot: -1,
                     ret_ty: Type::I64,
+                    elem_ty: None,
                 };
                 self.check_expr(e, scope)
             }
@@ -4206,6 +4245,7 @@ impl Sema {
                             arg_slots: Vec::new(),
                             ret_slot: -1,
                             ret_ty: Type::I64,
+                            elem_ty: None,
                         };
                         return self.check_expr(e, scope);
                     }

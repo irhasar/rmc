@@ -2661,3 +2661,45 @@ constructors pass as the helper's last argument. `__rmc_vec_push`/
 (a `v.push(Q{..})` on a `Vec<P>` is otherwise accepted and copies the wrong byte
 count), and a scalar element is cast to a word so its type need not match the
 declared `I64`.
+
+A *size* check alone cannot tell a valid element from a different aggregate of
+the same size: `struct P { x: i64, y: i64 }` and `struct Q { x: i64, y: i64 }`
+are both 16 bytes, so `v.push(Q { .. })` on a `Vec<P>` would store `Q` and a
+later `v[i].y` would read `Q`'s second word as `P::y`. The value argument is
+type-erased to `I64` (a scalar word, or an aggregate's address), so the element
+type is not otherwise recoverable at the call. `Expr::Call` therefore carries an
+`elem_ty: Option<Type>` — the element type the destination `Vec<T>` was declared
+with, recorded by the parser for the `__rmc_vec_push`/`__rmc_vec_repeat`/
+`__rmc_veclist` shapes and `None` for every other call. sema compares it against
+the argument type: an aggregate element must equal it (a struct, a payload enum,
+an array, a tuple), a scalar element is rejected when the vector's element is an
+aggregate and vice versa. `rustc` agrees (`E0308`). The check is skipped when
+`elem_ty` is `None` (an unannotated `Vec` whose element type was not inferred),
+leaving the width check as the only guard.
+
+## Capacity overflow traps at run time
+
+A `Vec`/`String` constructor asked for a capacity that does not fit must trap
+(exit 101, message `rmc: capacity overflow`, mirroring a panic) rather than
+corrupt memory. The capacity often comes from a parameter, so sema cannot reject
+it at compile time; a negative value read as `usize` is enormous, and the byte
+size `cap * width` then wraps to a small positive number, so the store is
+allocated too small and the header — or the element write — lands past it (a
+`String`'s length word was misread, and a `Vec` faulted). `__rmc_vec_new`,
+`__rmc_vec_repeat` and `__rmc_str_new` each test their byte size before
+allocating: `test reg, reg; js __rmc_cap_overflow` for a negative size, plus
+`jo __rmc_cap_overflow` after the `imul` that scales by the element width (the
+repeat can overflow for a huge positive count too). The `test` is not optional:
+`imul` leaves `SF` undefined, so a `js` right after it is width-dependent and
+misses the negative case. `__rmc_cap_overflow` lives in its own piece.
+
+## Every runtime piece names its own section
+
+A `Piece`'s assembly is concatenated with the other kept pieces into one
+translation unit, so a function piece must emit its own `.text` (and a data
+piece its own `.data`/`.rodata`/`.bss`). A piece that omits it inherits whatever
+section the previous piece left current — after a `.rodata`-ending piece (for
+example `__rmc_cap_overflow`'s message), a following `__rmc_str_new` assembled
+into `.rodata` and faulted at run time under `as`+`ld` because the section is not
+executable (the in-process encoder did not, masking it). The
+`every_piece_names_its_own_section` test in `runtime.rs` pins the invariant.
