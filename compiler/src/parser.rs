@@ -15,6 +15,8 @@ enum NameScope {
     /// `vec_names`: whether the name was already present.
     VecName(String, bool),
     VecElem(String, Option<i64>),
+    /// `vec_elem_ty`: the element type a binding shadowed, if any.
+    VecElemTy(String, Option<Type>),
     Ptr(String, Option<i64>),
     /// `args_vecs`: a `std::env::args()...collect()` binding.
     ArgsVec(String, Option<i64>),
@@ -82,6 +84,20 @@ pub struct Parser {
     /// struct declared later in the file is covered because the whole list is
     /// scanned first.
     struct_fields: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// Byte size of each struct, from sema's own layout once the aliases are
+    /// known. A `Vec<Struct>` element is stored inline, so its stride is this
+    /// size; reusing sema's layout keeps the two in agreement.
+    struct_sizes: std::collections::HashMap<String, usize>,
+    /// Byte size of each enum, from sema's own layout. A payload-enum element of
+    /// a `Vec` is an aggregate stored inline, so its stride is this size; a unit
+    /// enum is one word.
+    enum_sizes: std::collections::HashMap<String, usize>,
+    /// Token index of the `struct`/`enum` keyword of every top-level type
+    /// definition, in source order. `compute_struct_sizes` re-parses each one
+    /// once the aliases and constants are known, so the parser lays types out
+    /// with sema's own `resolve_layouts` rather than a second implementation
+    /// that could disagree.
+    type_def_starts: Vec<usize>,
     /// Names of tuple structs (`struct P(T, T);`), collected before parsing so
     /// that a call `P(a, b)` lowers to a `StructLit` rather than a function call
     /// and a pattern `P(x, y)` to a struct pattern rather than an enum variant
@@ -179,10 +195,21 @@ pub struct Parser {
     /// stride. rmc stores every element in a word, so an absent or unrecognised
     /// element type defaults to eight.
     vec_elem: std::collections::HashMap<String, i64>,
+    /// The element *type* of each `Vec<T>` binding, when the annotation named a
+    /// struct or enum. An element that is an aggregate is stored inline (its
+    /// stride is its size), and `v[i]` must yield the aggregate so a field
+    /// access or a whole-element copy works; a scalar element is absent and
+    /// reads as `i64` (its `vec_elem` width carries any narrowing). Without
+    /// this, `v[i]` on a `Vec<Struct>` was typed `i64` and rejected.
+    vec_elem_ty: std::collections::HashMap<String, Type>,
     /// The element width of the most recently parsed `Vec<T>` type, so the
     /// `let` that consumes the type can record it against the binding name.
     /// Only `Vec` bindings read it, and they always follow their annotation.
     vec_elem_pending: Option<i64>,
+    /// The element *type* of the most recently parsed `Vec<T>` type, when it is
+    /// a struct or enum name (else `None`). Consumed alongside
+    /// `vec_elem_pending`.
+    vec_elem_pending_ty: Option<Type>,
     /// Names bound to a `String` (a growable byte buffer). A `String` value is
     /// the address of a `{len, bytes}` record, so it shares `str`'s layout and
     /// only its methods (`push_str`, `push`, `capacity`, `as_str`) and its
@@ -302,6 +329,9 @@ impl Parser {
             const_chars: std::collections::HashMap::new(),
             const_narrow: std::collections::HashMap::new(),
             struct_fields: std::collections::HashMap::new(),
+            struct_sizes: std::collections::HashMap::new(),
+            enum_sizes: std::collections::HashMap::new(),
+            type_def_starts: Vec::new(),
             struct_ctors: std::collections::HashMap::new(),
             unit_structs: std::collections::HashSet::new(),
             tuple_structs: std::collections::HashSet::new(),
@@ -324,7 +354,9 @@ impl Parser {
             vec_names: std::collections::HashSet::new(),
             ptr_vars: std::collections::HashMap::new(),
             vec_elem: std::collections::HashMap::new(),
+            vec_elem_ty: std::collections::HashMap::new(),
             vec_elem_pending: None,
+            vec_elem_pending_ty: None,
             string_names: std::collections::HashSet::new(),
             arr_elem: std::collections::HashMap::new(),
             alias_target: std::collections::HashMap::new(),
@@ -692,6 +724,7 @@ impl Parser {
                     // Record the field names, then skip the body. Only a braced
                     // struct has named fields to collect; a later `struct S { .. }`
                     // is what a pattern `S { f }` needs.
+                    self.type_def_starts.push(self.i);
                     self.i += 1;
                     let name = if let Some(Tok::Ident(n)) = self.peek() {
                         let n = n.clone();
@@ -717,25 +750,16 @@ impl Parser {
                                 self.i += 1;
                                 continue;
                             }
-                            // Skip the `: Type`, which may contain braces in an
-                            // array type; stop at the next `,` or `}`.
-                            while let Some(t) = self.peek() {
-                                if *t == Tok::Comma || *t == Tok::RBrace {
-                                    break;
-                                }
-                                if *t == Tok::LBracket {
-                                    self.skip_balanced(Tok::LBracket, Tok::RBracket)?;
-                                } else {
-                                    self.i += 1;
-                                }
-                            }
+                            // Skip the `: Type` to the next field boundary.
+                            self.expect(Tok::Colon)?;
+                            self.skip_to_brace_field_end()?;
                             if !self.eat(&Tok::Comma) {
                                 break;
                             }
                         }
                         self.expect(Tok::RBrace)?;
                         if let Some(n) = name {
-                            self.struct_fields.insert(n, fields);
+                            self.struct_fields.insert(n.clone(), fields);
                         }
                     } else if self.peek() == Some(&Tok::LParen) {
                         // A tuple struct `struct P(T, T);`: record its field
@@ -757,6 +781,7 @@ impl Parser {
                 }
                 Some(Tok::Enum) => {
                     // Record the name, then skip a balanced `{ .. }` body.
+                    self.type_def_starts.push(self.i);
                     self.i += 1;
                     if let Some(Tok::Ident(n)) = self.peek() {
                         enum_names.push(n.clone());
@@ -850,6 +875,15 @@ impl Parser {
             })
             .collect();
         self.resolve_consts(&expanded_items)?;
+        // Size every struct and enum now that the aliases and constants are
+        // known, so a `Vec<T>` annotation can scale its stride by the element's
+        // size. The definitions are re-parsed and laid out by sema's own
+        // `resolve_layouts`, so the parser and sema can never disagree on a
+        // layout. A program sema will reject (a recursive struct, an unknown
+        // field type) leaves the sizes it could not compute absent; the
+        // annotation then falls back to the word width and sema reports the
+        // real error.
+        self.compute_struct_sizes();
         // A `type` shares the type namespace with a struct and an enum, so a
         // collision is an error (rustc's E0428). It does *not* collide with a
         // `const` or a `fn`, which live in the value namespace. rmc keeps a
@@ -1027,6 +1061,28 @@ impl Parser {
         Err(format!("at byte {}: unexpected end of input", self.pos()))
     }
 
+    /// Advance to the next struct field boundary: a `,` or the closing `}` of the
+    /// field list at bracket depth zero (neither is consumed). A field type never
+    /// contains a `}` at depth zero, so a braced struct body ends exactly here.
+    /// Same shape as `skip_to_field_end`, which is for a `( .. )` field list.
+    fn skip_to_brace_field_end(&mut self) -> PResult<()> {
+        let mut depth = 0i32;
+        while let Some(t) = self.peek().cloned() {
+            match t {
+                Tok::Comma | Tok::RBrace if depth == 0 => return Ok(()),
+                Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+                Tok::RParen | Tok::RBracket | Tok::RBrace => depth -= 1,
+                Tok::Lt => depth += 1,
+                Tok::Gt => depth -= 1,
+                Tok::Shr => depth -= 2,
+                Tok::Ge => depth -= 1,
+                _ => {}
+            }
+            self.i += 1;
+        }
+        Err(format!("at byte {}: unexpected end of input", self.pos()))
+    }
+
     /// `const NAME: TYPE = EXPR;`. The declared type is resolved by sema; the
     /// value is evaluated here, as soon as it is parsed, so a later array type
     /// or pattern can use it. A value that does not fold yet (it names a
@@ -1135,6 +1191,12 @@ impl Parser {
     /// `Vec<Byte>` still get a one-byte stride. The chain is bounded so a
     /// cyclic alias (which `expand_alias_ty` rejects elsewhere) cannot loop.
     fn elem_width_of(&self, t: &str) -> i64 {
+        let cur = self.resolve_alias_name(t);
+        elem_byte_width(&cur)
+    }
+
+    /// Chase a `type` alias chain to its final name.
+    fn resolve_alias_name(&self, t: &str) -> String {
         let mut cur = t.to_string();
         for _ in 0..64 {
             match self.alias_target.get(&cur) {
@@ -1142,7 +1204,51 @@ impl Parser {
                 _ => break,
             }
         }
-        elem_byte_width(&cur)
+        cur
+    }
+
+
+    /// Lay out every top-level struct and enum, storing each one's byte size in
+    /// `struct_sizes`/`enum_sizes`. The definitions are re-parsed from their
+    /// recorded token positions with the real parser (so a field type is parsed
+    /// exactly as anywhere else: `[i64; 2]`, `(i64, i64)`, `Option<i64>`, a
+    /// struct or enum name, ...), then sized by sema's own `layout_sizes`. Reuse
+    /// is what keeps a `Vec<Struct>` element stride equal to the size sema
+    /// resolves for `Type::Struct`, so the parser never maintains a second
+    /// layout that could disagree. A program sema will reject (a recursive
+    /// struct, an unknown type) leaves the sizes it could not compute absent;
+    /// the annotation then falls back to the word width and sema reports the
+    /// real error.
+    fn compute_struct_sizes(&mut self) {
+        let saved = self.i;
+        let mut structs: Vec<StructDef> = Vec::new();
+        let mut enums: Vec<EnumDef> = Vec::new();
+        for start in std::mem::take(&mut self.type_def_starts) {
+            self.i = start;
+            match self.peek() {
+                Some(Tok::Struct) => {
+                    if let Ok(d) = self.parse_struct() {
+                        structs.push(d);
+                    }
+                }
+                Some(Tok::Enum) => {
+                    if let Ok(d) = self.parse_enum() {
+                        enums.push(d);
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.i = saved;
+        // A tuple field (`(i64, i64)`) is lowered to an anonymous struct whose
+        // definition the re-parse just produced; it must be laid out alongside
+        // the named ones, exactly as the program's struct list carries both.
+        let mut all = structs;
+        all.extend(self.tuple_defs.iter().cloned());
+        if let Ok((sizes, esizes)) = crate::sema::layout_sizes(&all, &enums) {
+            self.struct_sizes = sizes;
+            self.enum_sizes = esizes;
+        }
     }
 
     /// The byte type a referent *name* denotes, if any: `u8` -> `U8`, `i8` ->
@@ -1744,9 +1850,27 @@ impl Parser {
                     // collapses `u8` to `i64`; `size_of::<T>()` is what rustc
                     // scales `add` by. A `type Byte = u8` alias is chased to its
                     // target so `Vec<Byte>` still gets a one-byte stride.
-                    let width = match self.peek() {
-                        Some(Tok::Ident(t)) => self.elem_width_of(t),
-                        _ => 8,
+                    // A struct or enum element is stored inline, so its stride is
+                    // the *size* sema resolves for it (not the word width) and
+                    // `v[i]` is typed as that aggregate; a scalar name keeps the
+                    // word width (one byte for `u8`/`i8`).
+                    let (width, elem_ty) = match self.peek() {
+                        Some(Tok::Ident(t)) => {
+                            let base = self.resolve_alias_name(t);
+                            if let Some(sz) = self.struct_sizes.get(&base) {
+                                (*sz as i64, Some(Type::Struct(base, *sz)))
+                            } else if let Some(sz) = self.enum_sizes.get(&base) {
+                                let ty = if *sz > 8 {
+                                    Type::EnumData(base, *sz)
+                                } else {
+                                    Type::Enum(base)
+                                };
+                                (*sz as i64, Some(ty))
+                            } else {
+                                (self.elem_width_of(t), None)
+                            }
+                        }
+                        _ => (8, None),
                     };
                     let mut depth = 1i32;
                     while depth > 0 {
@@ -1765,6 +1889,7 @@ impl Parser {
                         self.i += 1;
                     }
                     self.vec_elem_pending = Some(width);
+                    self.vec_elem_pending_ty = elem_ty;
                     return Ok(Type::Named("Vec".into()));
                 }
                 // An alias is transparent: a use is rewritten to its target here,
@@ -2113,6 +2238,7 @@ impl Parser {
     fn note_vec_elem(&mut self, name: &str) {
         if let Some(frame) = self.name_scopes.last_mut() {
             frame.push(NameScope::VecElem(name.to_string(), self.vec_elem.get(name).copied()));
+            frame.push(NameScope::VecElemTy(name.to_string(), self.vec_elem_ty.get(name).cloned()));
         }
     }
     fn note_ptr(&mut self, name: &str) {
@@ -2156,6 +2282,14 @@ impl Parser {
                         }
                         None => {
                             self.vec_elem.remove(&n);
+                        }
+                    },
+                    NameScope::VecElemTy(n, prev) => match prev {
+                        Some(v) => {
+                            self.vec_elem_ty.insert(n, v);
+                        }
+                        None => {
+                            self.vec_elem_ty.remove(&n);
                         }
                     },
                     NameScope::Ptr(n, prev) => match prev {
@@ -3005,15 +3139,64 @@ impl Parser {
                 Expr::Index(Box::new(var("\u{0}isrc")), Box::new(map.clone()))
             }
         };
+        let agg = matches!(&elem, Expr::Deref { ty, .. } if ty.is_aggregate());
         let stmt = Stmt::Let {
             name: e_name.clone(),
             ty: None,
-            init: Some(Expr::Cast(Box::new(elem), Type::I64)),
+            init: Some(if agg { elem } else { Expr::Cast(Box::new(elem), Type::I64) }),
             slot: -1,
             mutable: false,
         };
         (stmt, e_name)
     }
+
+    /// Infer a `Vec` element type from its initializer when no annotation
+    /// fixes it: a `vec![S{..}, ..]` or `vec![S{..}; n]` whose elements are
+    /// struct literals is a `Vec<S>`, exactly as rustc infers. `None` for any
+    /// other element shape (a scalar, a variable, a call), which keeps the
+    /// default word stride and lets the type check reject a mismatch later.
+    fn infer_vec_elem_ty(&self, elems: &[Expr]) -> Option<Type> {
+        let first = elems.first()?;
+        if let Expr::StructLit { name, .. } = first {
+            if let Some(sz) = self.struct_sizes.get(name) {
+                return Some(Type::Struct(name.clone(), *sz));
+            }
+        }
+        None
+    }
+
+    /// The place `var_name[idx]` for a `Vec` binding: a dereference of the
+    /// element address `var_name + idx * width` through a reference of the
+    /// element's type. The element type is the one recorded for `recv` (the
+    /// source binding name; `var_name` may be a hidden copy holding the same
+    /// address); when it is unknown the element is a word (`U8` for a byte
+    /// referent, else `I64`). A struct or payload-enum element yields an
+    /// aggregate place (named by its address), a scalar one a value read.
+    fn vec_elem_place(&self, var_name: &str, recv: &str, idx: Expr) -> Expr {
+        let (width, ptr_ty, val_ty) = match self.vec_elem_ty.get(recv) {
+            Some(t) => (t.size() as i64, t.clone(), t.clone()),
+            None => {
+                let w = self.vec_elem.get(recv).copied().unwrap_or(8);
+                if w == 1 {
+                    (1, Type::U8, Type::I64)
+                } else {
+                    (w, Type::I64, Type::I64)
+                }
+            }
+        };
+        let vec_var = Expr::Var { name: var_name.to_string(), slot: -1, ty: Type::I64 };
+        let off = if width == 1 {
+            idx
+        } else {
+            Expr::Bin(BinOp::Mul, Box::new(idx), Box::new(Expr::Int(width)))
+        };
+        let addr = Expr::Bin(BinOp::Add, Box::new(vec_var), Box::new(off));
+        Expr::Deref {
+            expr: Box::new(Expr::Cast(Box::new(addr), Type::Ref(Box::new(ptr_ty), true))),
+            ty: val_ty,
+        }
+    }
+
 
     /// Lower `<src>.<adapters>.<terminal>()` to a block expression. `terminal`
     /// is `sum`, `count`, `max`, `min`, `last` or `nth` (`nth` carries `k`).
@@ -4016,7 +4199,6 @@ impl Parser {
         let idx_name = format!("\u{0}fi{n}");
         let vec_var = Expr::Var { name: vec_name.clone(), slot: -1, ty: Type::I64 };
         let idx_var = Expr::Var { name: idx_name.clone(), slot: -1, ty: Type::I64 };
-        let width = self.vec_elem.get(&recv).copied().unwrap_or(8);
         let len = Expr::Call {
             name: "__rmc_vec_len".into(),
             args: vec![vec_var.clone()],
@@ -4024,20 +4206,7 @@ impl Parser {
             ret_slot: -1,
             ret_ty: Type::I64,
         };
-        let off = if width == 1 {
-            idx_var
-        } else {
-            Expr::Bin(BinOp::Mul, Box::new(idx_var), Box::new(Expr::Int(width)))
-        };
-        let addr = Expr::Bin(BinOp::Add, Box::new(vec_var), Box::new(off));
-        let ptr_ty = if width == 1 { Type::U8 } else { Type::I64 };
-        let elem = Expr::Deref {
-            expr: Box::new(Expr::Cast(
-                Box::new(addr),
-                Type::Ref(Box::new(ptr_ty), false),
-            )),
-            ty: Type::I64,
-        };
+        let elem = self.vec_elem_place(&vec_name, &recv, idx_var);
         let mut stmts = match pat {
             Pat::Bind(name) => vec![Stmt::Let {
                 name,
@@ -4166,7 +4335,6 @@ impl Parser {
         let idx_name = format!("\u{0}fi{n}");
         let idx_var = Expr::Var { name: idx_name.clone(), slot: -1, ty: Type::I64 };
         let vec_var = Expr::Var { name: recv.clone(), slot: -1, ty: Type::I64 };
-        let width = self.vec_elem.get(&recv).copied().unwrap_or(8);
         let len = Expr::Call {
             name: "__rmc_vec_len".into(),
             args: vec![vec_var.clone()],
@@ -4174,23 +4342,13 @@ impl Parser {
             ret_slot: -1,
             ret_ty: Type::I64,
         };
-        let off = if width == 1 {
-            idx_var
-        } else {
-            Expr::Bin(BinOp::Mul, Box::new(idx_var), Box::new(Expr::Int(width)))
-        };
-        let addr = Expr::Bin(BinOp::Add, Box::new(vec_var), Box::new(off));
-        let ptr_ty = if width == 1 { Type::U8 } else { Type::I64 };
-        let deref = Expr::Deref {
-            expr: Box::new(Expr::Cast(
-                Box::new(addr),
-                Type::Ref(Box::new(ptr_ty), mutable),
-            )),
-            ty: Type::I64,
+        let val_ty = match self.vec_elem_ty.get(&recv) {
+            Some(t) => t.clone(),
+            None => Type::I64,
         };
         let elem_ref = Expr::AddrOf {
-            expr: Box::new(deref),
-            ty: Type::I64,
+            expr: Box::new(self.vec_elem_place(&recv, &recv, idx_var)),
+            ty: val_ty,
             mutable,
             slot: -1,
         };
@@ -4733,6 +4891,15 @@ impl Parser {
                     self.vec_elem_pending = None;
                     8
                 };
+                // The element type of a `Vec<Struct>`/`Vec<Enum>` binding, for
+                // the index lowering. Consumed with the width; cleared for any
+                // other annotation so a stale type never leaks.
+                let elem_ty = if matches!(ty, Some(Type::Named(ref n)) if n == "Vec") {
+                    self.vec_elem_pending_ty.take()
+                } else {
+                    self.vec_elem_pending_ty = None;
+                    None
+                };
                 // An array annotation records the element width, so
                 // `arr.iter().sum()` accumulates a `[u8; N]` in `u8` (wrapping)
                 // and an `[i64; N]` in `i64`, matching rustc. Any other
@@ -4820,10 +4987,28 @@ impl Parser {
                         } else {
                             args[1].clone()
                         };
+                        // Without an annotation the element type is inferred from
+                        // a struct-literal element, so `let v = vec![S{..}; n]` is
+                        // a `Vec<S>` as in rustc.
+                        let (elem_width, elem_ty) = if elem_ty.is_none()
+                            && m == "\u{0}vecrepeat"
+                        {
+                            match self.infer_vec_elem_ty(std::slice::from_ref(&args[0])) {
+                                Some(t) => (t.size() as i64, Some(t)),
+                                None => (elem_width, elem_ty),
+                            }
+                        } else {
+                            (elem_width, elem_ty)
+                        };
                         self.note_vec_name(&name);
                         self.note_vec_elem(&name);
                         self.vec_names.insert(name.clone());
                         self.vec_elem.insert(name.clone(), elem_width);
+                        if let Some(t) = &elem_ty {
+                            self.vec_elem_ty.insert(name.clone(), t.clone());
+                        } else {
+                            self.vec_elem_ty.remove(&name);
+                        }
                         // The value is the element store's address; the helper
                         // writes a 16-byte header before it holding the length
                         // (0 here) and the capacity, so `.len()`/`.capacity()`
@@ -4841,13 +5026,24 @@ impl Parser {
                             }
                         } else {
                             // `vec![value; count]`: `count` copies of `value`,
-                            // length and capacity both `count`.
+                            // length and capacity both `count`. An aggregate
+                            // element is passed by address (its value already is
+                            // its address); a scalar is widened to a word.
+                            let elem_arg = if elem_ty.is_some() {
+                                args[0].clone()
+                            } else {
+                                Expr::Cast(Box::new(args[0].clone()), Type::I64)
+                            };
                             Expr::Call {
                                 name: "__rmc_vec_repeat".into(),
                                 args: vec![
                                     n_expr,
-                                    Expr::Cast(Box::new(args[0].clone()), Type::I64),
-                                    Expr::Int(elem_width),
+                                    elem_arg,
+                                    Expr::Int(if elem_ty.is_some() {
+                                        -elem_width
+                                    } else {
+                                        elem_width
+                                    }),
                                 ],
                                 arg_slots: Vec::new(),
                                 ret_slot: -1,
@@ -4872,10 +5068,26 @@ impl Parser {
                         // fine), and the length ends at `count`. An empty list is
                         // simply capacity 0.
                         let count = args.len() as i64;
+                        // Without an annotation the element type is inferred from
+                        // a struct-literal element (`let v = vec![S{..}, ..]`),
+                        // matching rustc; a non-aggregate list keeps the default.
+                        let (elem_width, elem_ty) = if elem_ty.is_none() {
+                            match self.infer_vec_elem_ty(&args) {
+                                Some(t) => (t.size() as i64, Some(t)),
+                                None => (elem_width, elem_ty),
+                            }
+                        } else {
+                            (elem_width, elem_ty)
+                        };
                         self.note_vec_name(&name);
                         self.note_vec_elem(&name);
                         self.vec_names.insert(name.clone());
                         self.vec_elem.insert(name.clone(), elem_width);
+                        if let Some(t) = &elem_ty {
+                            self.vec_elem_ty.insert(name.clone(), t.clone());
+                        } else {
+                            self.vec_elem_ty.remove(&name);
+                        }
                         // An element that names an outer binding of the same
                         // name (`let v = 5; let v: Vec<i64> = vec![v]`) must read
                         // that outer value: rustc evaluates the initializer
@@ -4889,10 +5101,18 @@ impl Parser {
                             for elem in args.iter() {
                                 let t = format!("\u{0}vt{}", self.tmp);
                                 self.tmp += 1;
+                                // An aggregate element binds by address (a
+                                // temporary for a literal/field read); a scalar
+                                // widens to a word.
+                                let init = if elem_ty.is_some() {
+                                    elem.clone()
+                                } else {
+                                    Expr::Cast(Box::new(elem.clone()), Type::I64)
+                                };
                                 out.push(Stmt::Let {
                                     name: t.clone(),
                                     ty: None,
-                                    init: Some(Expr::Cast(Box::new(elem.clone()), Type::I64)),
+                                    init: Some(init),
                                     slot: -1,
                                     mutable: false,
                                 });
@@ -4914,14 +5134,26 @@ impl Parser {
                         });
                         let base = Expr::Var { name: name.clone(), slot: -1, ty: Type::I64 };
                         for (i, elem) in args.iter().enumerate() {
+                            // An aggregate element is pushed by address; a scalar
+                            // widens to a word.
                             let value = if shadowed {
                                 Expr::Var { name: temps[i].clone(), slot: -1, ty: Type::I64 }
+                            } else if elem_ty.is_some() {
+                                elem.clone()
                             } else {
                                 Expr::Cast(Box::new(elem.clone()), Type::I64)
                             };
                             out.push(Stmt::Expr(Expr::Call {
                                 name: "__rmc_vec_push".into(),
-                                args: vec![base.clone(), value, Expr::Int(elem_width)],
+                                args: vec![
+                                    base.clone(),
+                                    value,
+                                    Expr::Int(if elem_ty.is_some() {
+                                        -elem_width
+                                    } else {
+                                        elem_width
+                                    }),
+                                ],
                                 arg_slots: Vec::new(),
                                 ret_slot: -1,
                                 ret_ty: Type::I64,
@@ -6107,29 +6339,48 @@ impl Parser {
                 self.expect(Tok::RBracket)?;
                 // `v[i]` on a `Vec` binding is `*(v + i * elem)`: the value is
                 // the element store's address, so indexing is pointer arithmetic
-                // at the element width. A `Vec` element that is itself a `Vec`
-                // is a word, so its stride is eight.
+                // at the element stride. The stride is the element *size*: eight
+                // for a word-sized scalar, one for `u8`/`i8`, and the struct's
+                // size for an aggregate element (stored inline). A `Vec` element
+                // that is itself a `Vec` is a word, so its stride is eight.
                 if let Expr::Var { name: recv, .. } = &e {
                     if self.vec_names.contains(recv) {
-                        let width = self.vec_elem.get(recv).copied().unwrap_or(8);
+                        let elem_ty = self.vec_elem_ty.get(recv).cloned();
+                        let stride = match &elem_ty {
+                            Some(t) => t.size() as i64,
+                            None => self.vec_elem.get(recv).copied().unwrap_or(8),
+                        };
                         let recv_expr = e.clone();
-                        let off = if width == 1 {
+                        let off = if stride == 1 {
                             idx
                         } else {
                             Expr::Bin(
                                 BinOp::Mul,
                                 Box::new(idx),
-                                Box::new(Expr::Int(width)),
+                                Box::new(Expr::Int(stride)),
                             )
                         };
                         let addr = Expr::Bin(BinOp::Add, Box::new(recv_expr), Box::new(off));
-                        let ptr_ty = if width == 1 { Type::U8 } else { Type::I64 };
+                        // The referent carries the element type so codegen loads
+                        // the right width and, for an aggregate, addresses the
+                        // element in place (a struct element is not a word, so a
+                        // bare word load would be wrong). A scalar element is a
+                        // word (`U8` for a byte referent, else `I64`).
+                        let (ptr_ty, val_ty) = match &elem_ty {
+                            Some(t) => (t.clone(), t.clone()),
+                            None if stride == 1 => (Type::U8, Type::I64),
+                            None => (Type::I64, Type::I64),
+                        };
+                        // A `Vec` element is a mutable place (`v[i] = x` writes
+                        // it), so the reference is `&mut` even when the binding
+                        // is read-only: the binding's own mutability is what
+                        // rustc checks, and sema enforces that separately.
                         e = Expr::Deref {
                             expr: Box::new(Expr::Cast(
                                 Box::new(addr),
-                                Type::Ref(Box::new(ptr_ty), false),
+                                Type::Ref(Box::new(ptr_ty), true),
                             )),
-                            ty: Type::I64,
+                            ty: val_ty,
                         };
                         continue;
                     }
@@ -6285,11 +6536,27 @@ impl Parser {
                             && self.vec_names.contains(recv)
                         {
                             let recv_expr = e.clone();
-                            let width = self.vec_elem.get(recv).copied().unwrap_or(8);
-                            let value = Expr::Cast(Box::new(args.pop().unwrap()), Type::I64);
+                            let agg = self.vec_elem_ty.contains_key(recv);
+                            let width = match self.vec_elem_ty.get(recv) {
+                                Some(t) => t.size() as i64,
+                                None => self.vec_elem.get(recv).copied().unwrap_or(8),
+                            };
+                            // An aggregate element is pushed by address (and the
+                            // width is negated so the helper copies it inline); a
+                            // scalar widens to a word.
+                            let arg = args.pop().unwrap();
+                            let value = if agg {
+                                arg
+                            } else {
+                                Expr::Cast(Box::new(arg), Type::I64)
+                            };
                             e = Expr::Call {
                                 name: "__rmc_vec_push".into(),
-                                args: vec![recv_expr, value, Expr::Int(width)],
+                                args: vec![
+                                    recv_expr,
+                                    value,
+                                    Expr::Int(if agg { -width } else { width }),
+                                ],
                                 arg_slots: Vec::new(),
                                 ret_slot: -1,
                                 ret_ty: Type::I64,

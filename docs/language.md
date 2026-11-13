@@ -1115,6 +1115,11 @@ error, since rmc compiles a single file and cannot resolve it.
 
 ## Not supported
 
+This section is the *current* status, not a permanent boundary: the README
+roadmap tracks each of these as a planned tier, so treat "not supported" as
+"not yet". The one thing that stays a non-goal is changing rmc's identity (no
+LLVM, no crates, no libc, in-process link).
+
 Traits, generics, borrowing, lifetimes, modules, closures,
 raw string literals (`r".."`), `f32`/`f64`, and the
 standard library beyond the two `std` paths above, the `Vec` shims and

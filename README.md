@@ -598,35 +598,101 @@ rmc is a small, self-contained compiler, not a drop-in replacement for rustc.
 
 ## Roadmap
 
-What would move rmc from a serious toy toward something usable, roughly in order
-of value per unit of effort:
+The items below used to be split into "next steps" and a one-line "out of
+scope". That split was wrong: the goal is for `rmc` to replace `rustc` on real
+programs, and every item here is somewhere on the path to that. The tiers are
+therefore *ordering*, not permission — a trait system is further out than an
+`f64`, but it is still on the list. The only thing that stays a non-goal is
+becoming a second rustc: `rmc` keeps its "no LLVM, no crates, no libc, in-process
+link" identity at every tier.
+
+### Tier 1 — finish what already exists (highest value per unit of effort)
 
 1. **A real register allocator.** Spill temporaries now live in callee-saved
-   registers (see design.md). The recursion-to-loop pass already closed the gap
-   on the call-heavy benchmarks, but the calls that remain still pay argument
-   setup and register save/restore that a register allocator would shrink. A full
-   linear scan over live ranges would also let a dying temporary's register go to
-   a local born after it.
-2. **Borrowing.** `&T` / `&mut T` now exist: a reference is one word, so a
-   `&T` parameter or a `&self` receiver is passed by address rather than copied,
-   and `*r = v` writes through a reference (see language.md). What is missing is
-   the check — rmc does not prove a reference outlives its referent or that
-   `&mut` is exclusive, so an aliasing bug is a wrong answer, not a compile
-   error.
-3. **More types.** `u*`/`i*` widths are done (a suffixed literal is typed at
-   its width, with width-aware overflow). `f64` is the remaining scalar gap:
-   it needs the SSE register file and a floating-point calling convention, so it
-   is a larger change than a new integer width. **Slices** (`&[T]`, and the
-   slice literals and sub-slicing `&a[lo..hi]` that build them) are the other
-   large gap: a slice is a *fat* pointer (a data pointer plus a length), so it
-   needs a two-word value kind threaded through parameters, returns and
-   indexing, unlike the one-word `&T` and `str` rmc has today.
-4. **More backends.** A second target (ARM64 or a simple VM) would force the
-   code generator's assumptions out into the open.
-5. **Debug info.** Line tables so a debugger can point at source.
+   registers (see design.md). The recursion-to-loop pass closed the gap on the
+   call-heavy benchmarks, but the calls that remain still pay argument setup and
+   register save/restore that a register allocator would shrink. A full linear
+   scan over live ranges would also let a dying temporary's register go to a
+   local born after it.
+2. **Close the known correctness gaps.** These are wrong answers today, not
+   missing features, so they outrank any new syntax:
+   - `iter().sum()` over `[u8; n]` diverges from rustc (accumulator width).
+   - `for x in [1, 2, 3].iter()` — an array-literal chain head is rejected.
+   - **`Vec<T>` with an aggregate element.** `v[i]` where the element is a
+     struct or enum was rejected with "cannot cast Struct to I64": the index
+     lowering hardcoded the element type to `i64` and only the *width* was
+     recorded at the binding, so an aggregate element was mis-typed, and the
+     parser's own size pass disagreed with sema on any struct holding a
+     `u8`/`i8`, array, tuple, enum or nested-struct field, mis-scaling the
+     stride. Both are now fixed: the element *type* is carried through the
+     index lowering, sema and codegen, and the stride comes from sema's own
+     `resolve_layouts` so the two can never disagree (`tests/cases/vecstruct.rs`,
+     `vecfield.rs`).
+3. **Borrowing, the check half.** `&T` / `&mut T` exist: a reference is one word,
+   so a `&T` parameter or a `&self` receiver is passed by address rather than
+   copied, and `*r = v` writes through a reference (see language.md). What is
+   missing is the check — `rmc` does not prove a reference outlives its referent
+   or that `&mut` is exclusive, so an aliasing bug is a wrong answer, not a
+   compile error. A real (even if simple) borrow checker is what lets the
+   optimiser speculate through a reference without the provenance pre-pass.
 
-Anything involving borrowing, generics or the trait system is out of scope: it
-would make rmc a different project rather than a better one.
+### Tier 2 — the remaining scalar and aggregate types
+
+4. **`f64` / `f32`.** The last scalar gap. It needs the SSE register file and a
+   floating-point calling convention, so it is a larger change than a new
+   integer width: a `Float` type kind, a separate register class in the code
+   generator, `movsd`/`addsd`-family emission, the `xmm` argument registers in
+   the System V classifier, and the float half of the integer methods
+   (`abs`, `min`, `max`, `is_nan`, formatting). It also unlocks the arithmetic
+   that most real numeric code assumes.
+5. **Slices (`&[T]`).** A slice is a *fat* pointer (a data pointer plus a
+   length), so it needs a two-word value kind threaded through parameters,
+   returns and indexing, unlike the one-word `&T` and `str` today. It is the
+   other large aggregate gap, and it is what makes `&v[..]`, `&a[lo..hi]` and
+   `fn f(xs: &[i64])` work — the shapes almost every non-trivial function uses.
+6. **`u128` / `i128`.** Currently collapsed to `i64`. A real 128-bit kind needs a
+   two-register representation and the multiply/divide helpers.
+
+### Tier 3 — generics, traits, closures, modules
+
+These are what separate "a subset with structs and enums" from "Rust". They are
+ordered here because each is a large, cross-cutting change.
+
+7. **Modules and `use`.** `mod`, `use`, paths and visibility. Mostly a front-end
+   change (name resolution over a tree rather than a flat program), but it gates
+   multi-file programs and any real standard-library surface.
+8. **Generics (monomorphisation).** A generic function or struct is a template
+   instantiated per concrete type. With no trait bounds this is "substitute the
+   type and re-check the body"; the work is in the name/type representation and
+   in keeping monomorphisation bounded.
+9. **Traits and `impl` blocks with bounds.** The core of Rust's abstraction.
+   Starts with inherent `impl` (already present) plus a static-dispatch subset
+   (trait objects deferred), then method resolution and coherence.
+10. **Closures.** A closure is a function plus captured state. The parser already
+    rejects `|x| ...`; supporting it means an anonymous struct for captures, a
+    callable-representation decision, and interaction with the trait work above
+    (closures desugar to `Fn`/`FnMut`/`FnOnce` impls).
+11. **The `?` operator.** Small on its own (`Try` over `Option`/`Result`), but it
+    belongs with the trait work because a general `?` is `Try`.
+12. **A usable standard-library surface.** Beyond today's two `std` paths, the
+    `Vec` shims and `String`: `format!`, the iterator adapters
+    (`map`/`filter`/`fold`/`enumerate`/...), `HashMap`, `fs`/`io`, and the
+    `println!`/`format!` formatting machinery. Each is a runtime addition, not
+    just front-end work.
+
+### Tier 4 — infrastructure
+
+13. **More backends.** A second target (ARM64 or a simple VM) would force the
+    code generator's assumptions out into the open.
+14. **Debug info.** Line tables so a debugger can point at source.
+15. **Incremental compilation and a module cache.** Today every compile is from
+    scratch; a cache would matter once programs are large enough that the
+    ~1.5 ms floor is no longer the whole story.
+
+The through-line: Tier 1 makes the existing subset *correct*, Tier 2 makes it
+*complete* for scalar and aggregate types, Tier 3 makes it *Rust*, and Tier 4
+makes it *practical*. None of it requires giving up the no-LLVM, no-libc,
+in-process-link design that is the point of the experiment.
 
 ## License
 

@@ -969,7 +969,20 @@ __rmc_vec_repeat:
     sub $8, %rsp
     mov %rdi, %r12            # count
     mov %rsi, %r13            # value
-    mov %rdx, %r14            # element width
+    mov %rdx, %r14            # element width (negative marks an aggregate)
+    # Normalise the width to its byte size and record whether the element is an
+    # aggregate (its value is then an address, copied inline) in the stack
+    # scratch, so the alloc sizing and the fill below both see a positive width.
+    mov %r14, %rax
+    test %rax, %rax
+    jns .Lvec_rep_scalar
+    neg %r14
+    mov $1, %rax
+    jmp .Lvec_rep_flag
+.Lvec_rep_scalar:
+    xor %eax, %eax
+.Lvec_rep_flag:
+    mov %rax, (%rsp)
     mov %r12, %rdi
     imul %r14, %rdi
     add $16, %rdi
@@ -978,6 +991,8 @@ __rmc_vec_repeat:
     mov %r12, (%rbx)          # length = count
     mov %r12, 8(%rbx)         # capacity = count
     lea 16(%rbx), %r15        # data
+    cmpq $0, (%rsp)
+    jne .Lvec_rep_agg
     mov %r15, %rdi
     mov %r12, %rsi
     mov %r13, %rdx
@@ -987,6 +1002,36 @@ __rmc_vec_repeat:
     jmp .Lvec_rep_done
 .Lvec_rep_word:
     call __rmc_fill           # a word element fills `count` words
+    jmp .Lvec_rep_done
+.Lvec_rep_agg:
+    # An aggregate element repeats inline: store the source element, then copy
+    # it forward over itself so the whole run ends up filled (a doubling
+    # memcpy). `%r13` is the source element's address.
+    test %r12, %r12
+    jle .Lvec_rep_done
+    mov %r15, %rdi
+    mov %r13, %rsi
+    mov %r14, %rcx
+    rep movsb                 # element 0
+    mov $1, %r8               # elements written
+.Lvec_rep_agg_loop:
+    cmp %r12, %r8
+    jae .Lvec_rep_done
+    mov %r12, %rcx
+    sub %r8, %rcx             # remaining
+    cmp %r8, %rcx
+    jbe .Lvec_rep_agg_n
+    mov %r8, %rcx             # copy `min(written, remaining)` elements
+.Lvec_rep_agg_n:
+    mov %r15, %rdi            # dst = data + written * width
+    mov %r8, %rax
+    imul %r14, %rax
+    add %rax, %rdi
+    mov %r15, %rsi            # src = data
+    imul %r14, %rcx           # bytes to copy
+    rep movsb
+    add %r8, %r8              # written *= 2
+    jmp .Lvec_rep_agg_loop
 .Lvec_rep_done:
     mov %r15, %rax
     add $8, %rsp
@@ -1012,7 +1057,20 @@ __rmc_vec_push:
     sub $8, %rsp
     mov %rdi, %rbx            # vec
     mov %rsi, %r13            # value
-    mov %rdx, %r14            # element width
+    mov %rdx, %r14            # element width (negative marks an aggregate)
+    # Normalise the width to its byte size and record whether the element is an
+    # aggregate (its value is then an address, copied inline) in the stack
+    # scratch, so the growth sizing below sees a positive width.
+    mov %r14, %rax
+    test %rax, %rax
+    jns .Lvec_push_scalar
+    neg %r14
+    mov $1, %rax
+    jmp .Lvec_push_flag
+.Lvec_push_scalar:
+    xor %eax, %eax
+.Lvec_push_flag:
+    mov %rax, (%rsp)
     mov -16(%rbx), %r12       # length
     mov -8(%rbx), %r15        # capacity
     cmp %r15, %r12
@@ -1041,13 +1099,8 @@ __rmc_vec_push:
     imul %r14, %rcx           # bytes to copy = length * width
     test %rcx, %rcx
     jz .Lvec_push_installed
-.Lvec_push_copy:
-    mov (%rsi), %dl
-    mov %dl, (%r10)
-    inc %rsi
-    inc %r10
-    dec %rcx
-    jnz .Lvec_push_copy
+    mov %r10, %rdi            # rep movsb copies rcx bytes from rsi to rdi
+    rep movsb
 .Lvec_push_installed:
     mov %r12, (%r9)           # length
     mov %r15, 8(%r9)          # capacity
@@ -1056,12 +1109,23 @@ __rmc_vec_push:
     mov %r12, %rax
     imul %r14, %rax           # offset = length * width
     add %rbx, %rax
+    cmpq $0, (%rsp)
+    jne .Lvec_push_agg
     cmp $8, %r14
+    ja .Lvec_push_agg
     je .Lvec_push_word
     mov %r13b, (%rax)         # a narrow element stores its low byte
     jmp .Lvec_push_inc
 .Lvec_push_word:
     mov %r13, (%rax)
+    jmp .Lvec_push_inc
+.Lvec_push_agg:
+    # An aggregate element is copied in full from the source address the caller
+    # passed in `%r13`; the element spans `%r14` bytes.
+    mov %rax, %rdi            # dst
+    mov %r13, %rsi            # src
+    mov %r14, %rcx            # width bytes
+    rep movsb
 .Lvec_push_inc:
     inc %r12
     mov %r12, -16(%rbx)       # length += 1

@@ -478,6 +478,22 @@ fn resolve_layouts(
     Ok((so, eo))
 }
 
+/// The byte size of every struct and enum, for the parser's `Vec<T>` stride.
+/// It runs sema's own layout (`resolve_layouts`), so a `Vec<Struct>` element's
+/// stride and the `Type::Struct(name, size)` sema resolves are always equal —
+/// the parser never re-derives a layout that could disagree. Returns
+/// `(struct_sizes, enum_sizes)`.
+pub fn layout_sizes(
+    structs: &[StructDef],
+    enums: &[EnumDef],
+) -> Result<(HashMap<String, usize>, HashMap<String, usize>), String> {
+    let (so, eo) = resolve_layouts(structs, enums)?;
+    Ok((
+        so.into_iter().map(|(k, v)| (k, v.size)).collect(),
+        eo.into_iter().map(|(k, v)| (k, v.size)).collect(),
+    ))
+}
+
 /// Lay out a struct: field `k` at the sum of the sizes of fields `0..k`, no
 /// padding. A struct may refer to a struct or enum declared later, but not to
 /// itself, directly or indirectly.
@@ -3250,7 +3266,7 @@ impl Sema {
                     ));
                 }
                 arg_slots.clear();
-                for (a, p) in args.iter_mut().zip(sig.params.iter()) {
+                for (i, (a, p)) in args.iter_mut().zip(sig.params.iter()).enumerate() {
                     let t = if (is_int_literal(a) && matches!(p, Type::Int { .. }))
                         || matches!(p, Type::Array(..))
                     {
@@ -3259,16 +3275,26 @@ impl Sema {
                     } else {
                         self.check_expr(a, scope)?
                     };
-                    // `!` unifies with any parameter type: an argument that never
-                    // materialises (a block ending in `break`/`return`/`continue`)
-                    // coerces, exactly as rustc allows.
-                    if &t != p && t != Type::Never && !ref_coerces(&t, p) {
+                    // `__rmc_vec_push`/`__rmc_vec_repeat` take the element as
+                    // their second argument: a scalar travels as a word, but an
+                    // aggregate travels as its address, so its type need not
+                    // match the declared `I64`.
+                    let vec_elem_arg = matches!(
+                        name.as_str(),
+                        "__rmc_vec_push" | "__rmc_vec_repeat"
+                    ) && i == 1;
+                    if !(vec_elem_arg && t.is_aggregate())
+                        && &t != p
+                        && t != Type::Never
+                        && !ref_coerces(&t, p)
+                    {
                         return Err(format!("function `{name}`: argument type mismatch, expected {p:?}, found {t:?}"));
                     }
                     // An aggregate argument is passed by pointer, so give it a
                     // hidden frame slot to hold its address for the call.
-                    arg_slots.push(if p.is_aggregate() {
-                        let n = p.size() / 8;
+                    let agg_ty = if vec_elem_arg { &t } else { p };
+                    arg_slots.push(if agg_ty.is_aggregate() {
+                        let n = agg_ty.size() / 8;
                         (self.alloc_slots(n as i32), n)
                     } else {
                         (-1, 0)

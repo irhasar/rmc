@@ -2604,3 +2604,23 @@ The iterator-chain lowering demands a terminal method, so a bare `a.iter()`
 must be left as a `MethodCall` for the `for` desugar. The postfix method loop
 therefore only lowers a chain when a `.` follows the `.iter()`/`.into_iter()`
 call; otherwise `for x in a.iter()` is misread as an unterminated chain.
+
+## `Vec<T>` element stride reuses sema's layout
+
+The parser has to know a `Vec<T>` element's byte stride *before* sema runs (the
+stride scales the `v[i]` address, and the element type is needed to type the
+place). It must not re-derive struct/enum layout itself: an ad-hoc pass
+silently disagreed with sema on any struct holding a `u8`/`i8`, an array, a
+tuple, an enum, or a nested struct, mis-scaling the stride and corrupting the
+store. The rule is that the parser never computes a second layout.
+
+Instead, the pre-scan records the token index of every top-level `struct`/`enum`
+(`type_def_starts`), and `compute_struct_sizes` re-parses each definition with
+the real parser once aliases and constants are known, then feeds the resulting
+`StructDef`/`EnumDef` list (plus the tuple `StructDef`s in `tuple_defs`) to
+`sema::layout_sizes`, which is `resolve_layouts` under a thin wrapper. The
+parser and sema therefore agree by construction. A definition sema will reject
+(a recursive struct, an unknown field type) is skipped, leaving its size absent;
+the `Vec<T>` annotation falls back to the word width and sema reports the real
+error. The re-parse must save/restore `self.i` and is read-only apart from the
+`tuple_defs` it legitimately produces for tuple fields.
