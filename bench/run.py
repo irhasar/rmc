@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark harness: rmc vs rustc for compile time, CPU, RAM, size, runtime.
+"""Benchmark harness: rmc vs rustc (LLVM) vs rustc (Cranelift).
 
 Measures both halves of the comparison, so "faster" is answered on every axis
 that matters:
@@ -7,6 +7,13 @@ that matters:
   * compile: build wall time, compiler CPU, compiler peak RAM, and artifact size
     (the on-disk footprint of the linked executable);
   * run:     wall time, CPU and peak RAM of the compiled program.
+
+Three compilers are compared. rustc with the LLVM backend is the headline
+opponent. rustc with the Cranelift backend (`-Zcodegen-backend=cranelift`, a
+nightly-only component) is the fair baseline for the "no LLVM" claim: it is
+also LLVM-free, so a gap between it and rmc is rmc's own codegen and link step,
+not the cost of an optimiser rmc never had. The Cranelift column is detected at
+run time and simply omitted where the host has no nightly toolchain.
 
 Wall and CPU time come from wait4(). Peak RAM comes from each process's own
 `VmHWM`, not wait4()'s ru_maxrss: a spawned child shares this Python process's
@@ -16,6 +23,9 @@ real peak of a small binary. The same measurement is applied to the compilers
 
 Pass `--markdown PATH` to also record the whole comparison to a file in the
 repo, so the numbers are versioned rather than lost in a terminal log.
+
+Set `RMC_BENCH_CRANELIFT_RUSTC` to a nightly `rustc` path to override the
+auto-detected Cranelift compiler.
 """
 import os, subprocess, sys, time, shutil, statistics
 
@@ -24,6 +34,15 @@ PROJ = os.path.dirname(ROOT)
 RMC = os.path.join(PROJ, "compiler", "target", "release", "rmc")
 OUT = "/tmp/rmcbench"
 RUSTFLAGS_BASE = []
+
+# `rustc_codegen_cranelift` is the third compiler in the comparison. It is a
+# nightly-only backend (the `rustc-codegen-cranelift-preview` component), and it
+# sits at the opposite end of the compile/run trade-off from LLVM: it compiles
+# far faster but optimises far less, so it is the honest baseline for "how much
+# of rmc's win is the frontend and how much is simply not running LLVM". It is
+# detected, not assumed, so the harness still runs on a host without nightly
+# (the cranelift column is then omitted rather than the suite failing).
+CRANELIFT_ENV = "RMC_BENCH_CRANELIFT_RUSTC"
 
 PROGRAMS = ["hello", "fib", "mandel", "sieve", "mix", "stats", "refs", "heap", "callrec", "forloops"]
 # Runtime input per program, passed as argv so the workload is opaque to the
@@ -113,6 +132,47 @@ def median(xs):
     return statistics.median(xs)
 
 
+_cranelift_rustc = None
+
+
+def cranelift_rustc():
+    """Path to a rustc whose cranelift backend is usable, or None.
+
+    Prefers `RMC_BENCH_CRANELIFT_RUSTC` (an explicit path, for a host where the
+    nightly toolchain lives elsewhere), then asks rustup for the nightly rustc.
+    The returned path is the toolchain's own `rustc` binary, not the `rustup`
+    proxy: the proxy forks a second process, which would show up as compile
+    time the backend does not actually cost. Cached after the first probe.
+    """
+    global _cranelift_rustc
+    if _cranelift_rustc is not None:
+        return _cranelift_rustc or None
+    candidate = os.environ.get(CRANELIFT_ENV)
+    if not candidate:
+        try:
+            r = subprocess.run(["rustup", "which", "--toolchain", "nightly", "rustc"],
+                               capture_output=True, text=True)
+            if r.returncode == 0:
+                candidate = r.stdout.strip()
+        except FileNotFoundError:
+            candidate = None
+    # Verify the backend is present and functional with a trivial compile, so a
+    # nightly without the component (or a broken one) drops the column instead
+    # of failing mid-suite.
+    if candidate and os.path.exists(candidate):
+        try:
+            probe = subprocess.run(
+                [candidate, "-Zcodegen-backend=cranelift", "--version"],
+                capture_output=True, text=True)
+            if probe.returncode == 0:
+                _cranelift_rustc = candidate
+                return candidate
+        except OSError:
+            pass
+    _cranelift_rustc = False
+    return None
+
+
 def measure_compile(name, kind, reps=5):
     if kind == "rmc":
         out = os.path.join(OUT, f"{name}.rmc.bin")
@@ -124,6 +184,18 @@ def measure_compile(name, kind, reps=5):
         # manufacture the win either way; it just makes the comparison honest.
         argv = [RMC, os.path.join(ROOT, "rust", f"{name}.rs"),
                 "--bounds-checks", "-o", out]
+    elif kind == "cranelift":
+        out = os.path.join(OUT, f"{name}.cranelift.bin")
+        # The nightly backend via the rustup proxy. `codegen-units=1` and
+        # `panic=abort` are accepted; `lto` is not (cranelift rejects it), so
+        # the flag set is the closest supported match to the LLVM column
+        # rather than a byte-for-byte copy of it. `-C opt-level=3` is implied
+        # by `-O` and kept for symmetry with the LLVM invocation.
+        argv = [cranelift_rustc(), "-Zcodegen-backend=cranelift", "-O",
+                "-C", "opt-level=3", "-C", "codegen-units=1",
+                "-C", "panic=abort", "-C", "strip=symbols",
+                "-C", "overflow-checks=off", "-C", "debug-assertions=off",
+                os.path.join(ROOT, "rust", f"{name}.rs"), "-o", out]
     else:
         out = os.path.join(OUT, f"{name}.rustc.bin")
         argv = ["rustc", "-O", "-C", "opt-level=3", "-C", "lto=fat",
@@ -188,64 +260,120 @@ def env_note():
                     break
     except OSError:
         pass
+    cl = cranelift_rustc()
+    cranelift_ver = ""
+    if cl:
+        cr = subprocess.run([cl, "-Zcodegen-backend=cranelift", "--version"],
+                            capture_output=True, text=True)
+        cranelift_ver = (cr.stdout or "unknown").strip()
     return {
         "date": time.strftime("%Y-%m-%d %H:%M %Z"),
         "host": platform.platform(),
         "cpu": cpu or "unknown",
         "rustc": (rustc.stdout or "unknown").strip(),
+        "cranelift": cranelift_ver,
     }
 
 
+def verify_parity(rows, kinds):
+    """Run every produced binary once and require identical stdout across kinds.
+
+    The benchmark compares *speed*; this guards the premise that all three
+    compilers built the same program. A silent miscompile would otherwise show
+    up as a suspiciously fast (or slow) column rather than a failure. Only the
+    compilers in `kinds` are checked, so a host without Cranelift still verifies
+    rmc against LLVM.
+    """
+    for p, res in rows:
+        outs = {}
+        for kind in kinds:
+            binpath = os.path.join(OUT, f"{p}.{kind}.bin")
+            r = subprocess.run([binpath] + ARGS[p], capture_output=True)
+            outs[kind] = r.stdout
+        ref = outs["rmc"]
+        for kind in [k for k in kinds if k != "rmc"]:
+            if outs[kind] != ref:
+                raise RuntimeError(
+                    f"{p}: {kind} output differs from rmc\n"
+                    f"  rmc:       {ref!r}\n  {kind}: {outs[kind]!r}")
+
+
 def collect():
-    """Run the whole suite and return per-program results for both compilers."""
+    """Run the whole suite and return per-program results for each compiler.
+
+    The compiler set is rmc, LLVM-backed rustc, and (when the nightly cranelift
+    backend is present) cranelift-backed rustc. The last is the fair baseline
+    for the "no LLVM" claim: it is also LLVM-free, so any gap between it and rmc
+    is rmc's own, not the cost of the optimiser rustc shares with neither.
+    """
     os.makedirs(OUT, exist_ok=True)
+    kinds = ["rmc", "rustc"]
+    cl = cranelift_rustc()
+    if cl:
+        kinds.append("cranelift")
     rows = []
     for p in PROGRAMS:
         res = {}
-        for kind in ("rmc", "rustc"):
+        for kind in kinds:
             res[kind] = measure_compile(p, kind)
-        for kind in ("rmc", "rustc"):
+        for kind in kinds:
             binpath = os.path.join(OUT, f"{p}.{kind}.bin")
             res[kind]["run"] = measure_spawned([binpath] + ARGS[p], 9)
         res["plain"] = measure_rustc_plain(p)
         res["static"] = measure_rustc_static(p)
         rows.append((p, res))
-    return rows
+    verify_parity(rows, kinds)
+    return rows, kinds
 
 
-def print_table(rows):
-    hdr = f"{'program':<8} {'compiler':<8} {'wall_ms':>9} {'cpu_ms':>9} {'rss_kb':>9} {'size_b':>9} {'run_ms':>9}"
+def print_table(rows, kinds):
+    hdr = f"{'program':<8} {'compiler':<10} {'wall_ms':>9} {'cpu_ms':>9} {'rss_kb':>9} {'size_b':>9} {'run_ms':>9}"
     print(hdr)
     print("-" * len(hdr))
     for p, res in rows:
-        for kind in ("rmc", "rustc"):
+        for kind in kinds:
             r = res[kind]
-            print(f"{p:<8} {kind:<8} {r['wall']*1000:9.2f} {r['cpu']*1000:9.2f} "
+            print(f"{p:<8} {kind:<10} {r['wall']*1000:9.2f} {r['cpu']*1000:9.2f} "
                   f"{r['rss']:9.0f} {r['size']:9.0f} {r['run']['wall']*1000:9.2f}")
-        n, c = res["rmc"], res["rustc"]
-        print(f"{'':8} {'ratio':<8} {c['wall']/n['wall']:9.1f} {c['cpu']/n['cpu']:9.1f} "
-              f"{c['rss']/n['rss']:9.1f} {c['size']/n['size']:9.1f} "
-              f"{c['run']['wall']/n['run']['wall']:9.2f}")
+        # Ratios are always against rmc: >1 means rmc is better. rustc (LLVM) is
+        # the headline opponent; cranelift is the fair no-LLVM baseline.
+        for kind in [k for k in kinds if k != "rmc"]:
+            n, c = res["rmc"], res[kind]
+            print(f"{'':8} {kind+'/rmc':<10} {c['wall']/n['wall']:9.1f} {c['cpu']/n['cpu']:9.1f} "
+                  f"{c['rss']/n['rss']:9.1f} {c['size']/n['size']:9.1f} "
+                  f"{c['run']['wall']/n['run']['wall']:9.2f}")
 
 
-def write_markdown(path, rows, note):
+def write_markdown(path, rows, note, kinds):
     """Record the full comparison, so the numbers live in the repo, not a log."""
-    lines = ["# Benchmark results: rmc vs rustc", ""]
+    has_cl = "cranelift" in kinds
+    lines = ["# Benchmark results: rmc vs rustc (LLVM) vs rustc (Cranelift)", ""]
     lines.append(f"Recorded {note['date']} on {note['host']}.")
     lines.append(f"CPU: {note['cpu']}.")
     lines.append(f"`{note['rustc']}`.")
+    if has_cl:
+        lines.append(f"Cranelift backend: `{note.get('cranelift', 'unknown')}`.")
     lines.append("")
     lines.append("Regenerate with `python3 bench/run.py --markdown bench/RESULTS.md`.")
     lines.append("")
     lines.append("## Compile: build time, CPU, RAM, artifact size")
     lines.append("")
-    lines.append("The rustc column is an aggressive configuration (`-O` with fat LTO,")
-    lines.append("`codegen-units=1`, `panic=abort`, stripped). That is the right target")
-    lines.append("for *compile cost* - it is the slowest rustc build - but it is the")
-    lines.append("*smallest* rustc artifact, so the size ratio here understates the gap")
-    lines.append("against a default build. See the size table below for both.")
+    lines.append("The rustc (LLVM) column is an aggressive configuration (`-O` with fat")
+    lines.append("LTO, `codegen-units=1`, `panic=abort`, stripped). That is the right")
+    lines.append("target for *compile cost* - it is the slowest rustc build - but it is")
+    lines.append("the *smallest* rustc artifact, so the size ratio here understates the")
+    lines.append("gap against a default build. See the size table below for both.")
     lines.append("")
-    lines.append("Both compilers are invoked with matching safety semantics: rmc with")
+    if has_cl:
+        lines.append("The rustc (Cranelift) column is the fair comparison for the")
+        lines.append("no-LLVM claim: it runs the same rustc frontend rmc is measured")
+        lines.append("against, but a backend that also does not use LLVM. Any gap between")
+        lines.append("it and rmc is rmc's own codegen and link step, not the optimiser.")
+        lines.append("Cranelift rejects `lto`, so that flag is omitted; the rest of the")
+        lines.append("flag set matches the LLVM column. It is a nightly-only component,")
+        lines.append("so the column is present only where the host has it installed.")
+        lines.append("")
+    lines.append("Every compiler is invoked with matching safety semantics: rmc with")
     lines.append("`--bounds-checks` (bounds checks on, overflow checks off - Rust's")
     lines.append("release semantics, which rmc does not default to) and rustc with")
     lines.append("`-C overflow-checks=off` (already the `-O` default, stated explicitly).")
@@ -254,21 +382,32 @@ def write_markdown(path, rows, note):
     lines.append("| program | compiler | wall (ms) | CPU (ms) | peak RSS (kB) | artifact (B) |")
     lines.append("| ------- | -------- | --------: | -------: | ------------: | -----------: |")
     for p, res in rows:
-        for kind in ("rmc", "rustc"):
+        for kind in kinds:
             r = res[kind]
             lines.append(f"| {p} | {kind} | {r['wall']*1000:.2f} | {r['cpu']*1000:.2f} | "
                          f"{r['rss']:.0f} | {r['size']:.0f} |")
-        n, c = res["rmc"], res["rustc"]
-        lines.append(f"| {p} | ratio (rustc/rmc) | {c['wall']/n['wall']:.1f} | {c['cpu']/n['cpu']:.1f} | "
-                     f"{c['rss']/n['rss']:.1f} | {c['size']/n['size']:.1f} |")
+        for kind in [k for k in kinds if k != "rmc"]:
+            n, c = res["rmc"], res[kind]
+            lines.append(f"| {p} | ratio ({kind}/rmc) | {c['wall']/n['wall']:.1f} | {c['cpu']/n['cpu']:.1f} | "
+                         f"{c['rss']/n['rss']:.1f} | {c['size']/n['size']:.1f} |")
     lines.append("")
     lines.append("## Artifact size against each rustc build")
     lines.append("")
-    lines.append("| program | rmc (B) | rustc -O fat-LTO stripped (B) | rustc -O plain (B) | rustc -O static stripped (B) |")
-    lines.append("| ------- | ------: | ----------------------------: | -----------------: | ---------------------------: |")
+    size_hdr = "| program | rmc (B) | rustc LLVM fat-LTO stripped (B) |"
+    size_sep = "| ------- | ------: | -------------------------------: |"
+    if has_cl:
+        size_hdr += " rustc Cranelift stripped (B) |"
+        size_sep += " ---------------------------: |"
+    size_hdr += " rustc -O plain (B) | rustc -O static stripped (B) |"
+    size_sep += " -----------------: | ---------------------------: |"
+    lines.append(size_hdr)
+    lines.append(size_sep)
     for p, res in rows:
-        lines.append(f"| {p} | {res['rmc']['size']:.0f} | {res['rustc']['size']:.0f} | "
-                     f"{res['plain']:.0f} | {res['static']:.0f} |")
+        row = f"| {p} | {res['rmc']['size']:.0f} | {res['rustc']['size']:.0f} |"
+        if has_cl:
+            row += f" {res['cranelift']['size']:.0f} |"
+        row += f" {res['plain']:.0f} | {res['static']:.0f} |"
+        lines.append(row)
     lines.append("")
     lines.append("rmc links no libc and no runtime, so a plain `rustc -O` build (which")
     lines.append("statically links libstd, the panic machinery and the allocator) is the")
@@ -281,16 +420,26 @@ def write_markdown(path, rows, note):
     lines.append("| program | compiler | wall (ms) | CPU (ms) | peak RSS (kB) |")
     lines.append("| ------- | -------- | --------: | -------: | ------------: |")
     for p, res in rows:
-        for kind in ("rmc", "rustc"):
+        for kind in kinds:
             r = res[kind]["run"]
             lines.append(f"| {p} | {kind} | {r['wall']*1000:.2f} | {r['cpu']*1000:.2f} | {r['rss']:.0f} |")
-        n, c = res["rmc"]["run"], res["rustc"]["run"]
-        lines.append(f"| {p} | ratio (rustc/rmc) | {c['wall']/n['wall']:.2f} | {c['cpu']/n['cpu']:.2f} | "
-                     f"{c['rss']/n['rss']:.2f} |")
+        for kind in [k for k in kinds if k != "rmc"]:
+            n, c = res["rmc"]["run"], res[kind]["run"]
+            lines.append(f"| {p} | ratio ({kind}/rmc) | {c['wall']/n['wall']:.2f} | {c['cpu']/n['cpu']:.2f} | "
+                         f"{c['rss']/n['rss']:.2f} |")
     lines.append("")
-    lines.append("Ratios are rustc divided by rmc, so a value above 1 means rmc is")
-    lines.append("better on that dimension.")
+    lines.append("Ratios are the other compiler divided by rmc, so a value above 1 means")
+    lines.append("rmc is better on that dimension. Both the LLVM and the Cranelift ratios")
+    lines.append("use rmc as the denominator.")
     lines.append("")
+    if has_cl:
+        lines.append("The Cranelift run column is the one to read when asking whether rmc's")
+        lines.append("*generated code* is good, as opposed to how fast it compiles. LLVM is")
+        lines.append("a much stronger optimiser than either rmc or Cranelift, so a run-time")
+        lines.append("loss to LLVM may only mean LLVM optimised harder. Where rmc and")
+        lines.append("Cranelift are close on run time, rmc's codegen is doing its job; where")
+        lines.append("Cranelift is clearly faster, rmc is leaving performance on the table.")
+        lines.append("")
     lines.append("Run time is not uniformly in rmc's favour, and a ratio below 1 is")
     lines.append("possible. On loop-heavy integer code rmc is competitive: it wins on")
     lines.append("`forloops` because the rotated `for` compares the counter against the")
@@ -346,10 +495,10 @@ def main():
     md = None
     if "--markdown" in args:
         md = args[args.index("--markdown") + 1]
-    rows = collect()
-    print_table(rows)
+    rows, kinds = collect()
+    print_table(rows, kinds)
     if md:
-        write_markdown(md, rows, env_note())
+        write_markdown(md, rows, env_note(), kinds)
         print(f"\nwrote {md}")
 
 

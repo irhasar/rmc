@@ -1276,7 +1276,7 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   like it can skip the signed-division sign fixup, but `i64` multiplication
   wraps, so `x*x` may be negative and rustc keeps the fixup. Removing it is
   unsound; do not add a "square is non-negative" case to `gen_div_const`.
-- `bench/run.py` measures both compilers and both binaries the same way: wall
+- **`bench/run.py` measures both compilers and both binaries the same way:** wall
   and CPU time from `wait4()`, and peak RAM from the child's own `VmHWM`. Do not
   read peak RAM from `wait4()`'s `ru_maxrss`: a freshly spawned child shares
   Python's address space before `exec`, so it floors at Python's RSS (~15 MB) and
@@ -1285,6 +1285,25 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   read back as zero. It raises if a produced binary exits non-zero, which
   catches the classic "measured a nonexistent path" bug. `--markdown PATH` writes
   the dated result to a file; the current one lives at `bench/RESULTS.md`.
+- **Cranelift is the fair baseline for the "no LLVM" claim.** The headline
+  opponent is `rustc` with LLVM, but LLVM is a far stronger optimiser than rmc
+  has, so a run-time loss to it may only mean LLVM optimised harder, and a
+  compile-time win may only mean rmc skipped the optimiser. `rustc
+  -Zcodegen-backend=cranelift` runs the *same* rustc frontend with a backend
+  that also does not use LLVM, so the gap between it and rmc is rmc's own codegen
+  and in-process link, not the optimiser. It is a nightly-only component
+  (`rustc-codegen-cranelift-preview`); `bench/run.py` detects it via `rustup
+  which --toolchain nightly rustc` and drops the column when absent, so the
+  suite still runs on a stable-only host. `RMC_BENCH_CRANELIFT_RUSTC` overrides
+  the path. Cranelift rejects `-C lto`, so that flag is omitted from its
+  invocation; the rest matches the LLVM column. Read the Cranelift *run* column
+  when judging rmc's generated code, and the LLVM column when judging rmc
+  against the best available optimiser. The recorded run is strong for rmc: it
+  beats Cranelift on both axes at once - ~30x faster to compile, and faster at
+  run time on every program (closest are `heap` 1.06x and `mandel` 1.15x, widest
+  `forloops` 2.73x). So the "no LLVM" win is not merely "rmc skipped the
+  optimiser": against the one other LLVM-free backend it also wins on the
+  generated code. The remaining gap is to LLVM, which is the harder target.
 - **The sampler yields, it does not spin.** The `VmHWM` poll calls
   `os.sched_yield()` between reads. A tight `wait4(WNOHANG)` spin keeps the
   harness runnable for the whole child lifetime and competes with the benchmark
