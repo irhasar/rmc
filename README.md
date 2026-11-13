@@ -65,16 +65,24 @@ compiler/            the rmc compiler (Rust, std only, no dependencies)
   src/runtime.rs     freestanding runtime written in assembly
   src/main.rs        CLI driver: source -> asm -> ELF executable
   tests/compile.rs   unit tests for the front end and code generator
+backend/             rmc as a rustc `-Zcodegen-backend` dylib (rustc_private)
+  rust-toolchain.toml  the pinned nightly + rustc-dev/llvm-tools/cranelift
+  build.sh, rmc-rustc  build/run the dylib on the pinned channel
 bench/
   rust/*.rs          benchmark programs (plain Rust, compiled by rmc)
   mir/*.rs           freestanding twins of the same programs (for run_mir.py)
+  uni/*.rs           one source compiled by all four pipelines (run_four.py)
   run.py             benchmark harness (compile time, CPU, RAM, size, runtime)
   run_fair.py        same-source, two-back-end comparison (rmc vs LLVM)
+  run_codegen.py     the codegen-backend (`cb`) pipeline vs LLVM
+  run_four.py        one source through rmc / cb / Cranelift / LLVM
   run_mir.py         three-way comparison: rustc-MIR+rmc, rmc-AST, rustc-LLVM
 tools/
   fuzz.py            differential fuzzer and robustness checker
 tests/
   run.py             differential test suite: rmc vs rustc on twin programs
+  mir/run.py         differential suite for the MIR-text path
+  cb/run.py          differential suite for the codegen-backend pipeline
   cases/*.rs         programs compiled by both rmc and rustc
   args.json          per-case argv vectors (for runtime inputs)
 docs/
@@ -110,6 +118,42 @@ rmc input.rs --no-tco              # disable self-recursion-to-loop (on by defau
 
 Run the produced binary directly; it is a static ELF executable with no
 dynamic dependencies.
+
+## Using rmc as a rustc codegen backend
+
+`backend/` builds rmc as a `rustc_private` `CodegenBackend` dylib that rustc
+loads with `-Zcodegen-backend`. rustc does lexing, parsing and type checking;
+rmc replaces LLVM and writes the ELF itself. Because the dylib links one exact
+nightly's `rustc_private`, the channel is pinned in `backend/rust-toolchain.toml`
+(scoped to `backend/`, so the rest of the repo and CI stay on stable). Install
+the pinned channel and build:
+
+```sh
+rustup toolchain install "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' \
+    backend/rust-toolchain.toml)" \
+    --component rustc-dev --component llvm-tools --component rustc-codegen-cranelift
+./backend/build.sh
+```
+
+Then compile through it. `rmc-rustc` is a thin wrapper that runs the *pinned*
+channel with the dylib (use plain `rustc +<channel>` directly for a fair
+comparison against LLVM, since a wrapper is an extra process):
+
+```sh
+backend/rmc-rustc prog.rs -o prog        # rustc front end + rmc back end
+rustc +"$(sed -n 's/^channel *= *"\(.*\)"/\1/p' backend/rust-toolchain.toml)" \
+    -Zcodegen-backend=backend/target/release/librmc_codegen_backend.so \
+    -C opt-level=3 -C panic=abort prog.rs -o prog
+```
+
+The backend is x86-64/executable only: it rejects a non-x86-64 `--target`, any
+`--emit` other than an executable, and a non-`bin` crate type, rather than
+producing a mislabeled ELF.
+
+Note that, like the `--rustc-frontend` path, this route currently renders MIR
+to text (`write_mir_pretty`) and re-parses it; it saves the second `rustc`
+process and the `ld` call, but does not yet consume `mir::Body` directly. See
+`docs/mir-roadmap.md`.
 
 ## Using rmc as a library
 
@@ -555,6 +599,33 @@ Three benchmarks need a word of caution when reading their ratio:
   loop and reported 2.15×; that number was withdrawn once the barrier asymmetry
   was found, because without the barrier rustc folded the loop to a constant and
   with it rustc paid a store/reload rmc did not.
+
+### The rustc-back-end comparison
+
+The benchmarks above compare rmc's own front end against the full `rustc`
+driver. A separate set of harnesses answers the other question — *if you keep
+rustc's front end and only swap the back end, how does rmc compare to LLVM?* —
+on the **same** source for both sides, so a difference is the code generator:
+
+```sh
+python3 bench/run_fair.py     # same source, rmc-MIR vs rmc-AST vs rustc-LLVM
+python3 bench/run_codegen.py  # the `cb` dylib pipeline vs rustc-LLVM
+python3 bench/run_four.py     # one source through rmc / cb / Cranelift / LLVM
+```
+
+`cb` loads rmc as a `-Zcodegen-backend` dylib, so rustc runs **one process** for
+both sides and rmc sees the same optimised MIR LLVM would. On the development
+host (AMD EPYC 9B14, pinned `rustc 1.102.0-nightly`) it beats LLVM on every
+mean axis — compile wall 1.33, CPU 1.36, RSS 1.11, artifact size 21.0, run wall
+1.09, CPU 1.09, RSS 1.25 — and beats rustc's Cranelift backend on every axis
+too. These harnesses need the pinned nightly (see "Using rmc as a rustc codegen
+backend"), and `tests/cb/run.py` is their differential correctness suite. The
+dated numbers live in [`bench/RESULTS-CB.md`](bench/RESULTS-CB.md) and
+[`bench/RESULTS-4WAY.md`](bench/RESULTS-4WAY.md).
+
+Unlike rmc's own front end, the back-end pipelines inherit rustc's front-end
+cost (start-up and RSS) and the subset of MIR they can lower is narrower, so
+they are not a replacement for the `run.py` numbers — they isolate the back end.
 
 ## Honest limitations
 
