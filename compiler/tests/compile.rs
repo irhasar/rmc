@@ -3766,9 +3766,14 @@ fn a_very_long_operator_chain_is_an_error_not_a_crash() {
 #[test]
 fn nesting_below_the_limit_still_compiles() {
     // 30 parens (2 depth each) plus a 30-long `+` chain is ~90, under the 100
-    // limit, so this must still compile.
-    let src = format!("fn main() -> i64 {{ return {}1{} + {}; }}", "(".repeat(30), ")".repeat(30), "1+".repeat(30) + "1");
-    assert!(compile_to_asm(&src, &CompileOptions::default()).is_ok());
+    // limit, so this must still compile. The recursive descent uses a large
+    // frame per level in a debug build, so run it on the big test stack like
+    // the other deep-nesting cases; the default 2 MiB test thread is not
+    // enough.
+    with_big_stack(|| {
+        let src = format!("fn main() -> i64 {{ return {}1{} + {}; }}", "(".repeat(30), ")".repeat(30), "1+".repeat(30) + "1");
+        assert!(compile_to_asm(&src, &CompileOptions::default()).is_ok());
+    });
 }
 
 #[test]
