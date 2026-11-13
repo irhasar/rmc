@@ -1167,6 +1167,13 @@ pub(crate) fn struct_const_identity(name: &str) -> String {
 /// the prefix. The marker may still carry generic arguments
 /// (`PhantomData::<&()>`), which `strip_generics` removes.
 fn is_zst_const(s: &str) -> bool {
+    let s = s.trim();
+    // `ZeroSized: <ty>` — the backend route spells out a zero-sized constant
+    // (a closure that is never called, so its type is a ZST) where
+    // `--emit=mir` folds the assignment away entirely. It occupies no bytes.
+    if s.starts_with("ZeroSized:") {
+        return true;
+    }
     let base = strip_generics(s);
     base.rsplit("::").next().unwrap_or(&base).trim() == "PhantomData"
 }
