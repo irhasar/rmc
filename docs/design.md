@@ -606,6 +606,17 @@ LIFO) precisely so coalescing is possible; the cost is a linear scan on both
 `alloc` and `free`, which is fine at this scale. Memory is never returned to the
 kernel.
 
+The growable collections build on `alloc`. A `Vec<T>` value is the address of
+its element store with a two-word `{length, capacity}` header immediately before
+it; a `String` value is the address of a `{len, bytes}` record (the `str`
+layout) with the capacity in the single word before it. Both grow by allocating
+a fresh block, copying the old bytes and returning the new address, which the
+caller writes back into the binding; growth doubles the capacity (with `std`'s
+minimum of 8 for a one-byte element, or of 4 for a `Vec`'s wider elements).
+Because a `Vec` element store starts at the value, `v[i]` is `*(v + i*elem)`
+with no header offset, and because a `String` value *is* a `str` record, every
+`str` helper reads a `String` unchanged.
+
 ### Bounds checks
 
 With `--bounds-checks`, every array index is preceded by a compare against the

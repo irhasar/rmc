@@ -1084,6 +1084,472 @@ free:
     Piece {
         text: r#"
 .text
+# ---- growable `Vec<T>` helpers ----
+# A `Vec<T>` value is the address of its element store, exactly as before, so
+# `.as_ptr()`/`.add(off)` and element indexing stay plain pointer arithmetic.
+# The length and capacity live in a 16-byte header just *before* that address:
+# `[data-16]` is the length and `[data-8]` the capacity, both in elements. This
+# keeps `Vec` a bare word while letting `push` grow it, and it needs no static
+# element type at the use site: the element width travels as an argument, as it
+# does for `add`/`free`.
+#
+# rdi = capacity, rsi = element width  ->  rax = data address
+.globl __rmc_vec_new
+.type __rmc_vec_new, @function
+__rmc_vec_new:
+    push %rbx
+    push %r12
+    push %r13
+    sub $8, %rsp              # keep %rsp 16-byte aligned at the `call`
+    mov %rdi, %r12            # capacity
+    mov %rsi, %r13            # element width
+    mov %r12, %rdi
+    imul %r13, %rdi           # bytes = capacity * width
+    add $16, %rdi             # plus the length/capacity header
+    call alloc
+    mov %rax, %rbx
+    movq $0, (%rbx)           # length = 0
+    mov %r12, 8(%rbx)         # capacity
+    lea 16(%rbx), %rax        # the value is the element store
+    add $8, %rsp
+    pop %r13
+    pop %r12
+    pop %rbx
+    ret
+.size __rmc_vec_new, .-__rmc_vec_new
+
+# rdi = count, rsi = value, rdx = element width  ->  rax = data address.
+# `vec![value; count]`: a fresh vector of `count` copies, length == capacity.
+.globl __rmc_vec_repeat
+.type __rmc_vec_repeat, @function
+__rmc_vec_repeat:
+    push %rbx
+    push %r12
+    push %r13
+    push %r14
+    push %r15
+    sub $8, %rsp
+    mov %rdi, %r12            # count
+    mov %rsi, %r13            # value
+    mov %rdx, %r14            # element width
+    mov %r12, %rdi
+    imul %r14, %rdi
+    add $16, %rdi
+    call alloc
+    mov %rax, %rbx
+    mov %r12, (%rbx)          # length = count
+    mov %r12, 8(%rbx)         # capacity = count
+    lea 16(%rbx), %r15        # data
+    mov %r15, %rdi
+    mov %r12, %rsi
+    mov %r13, %rdx
+    cmp $8, %r14
+    je .Lvec_rep_word
+    call __rmc_fill_bytes     # a narrow element fills `count` bytes
+    jmp .Lvec_rep_done
+.Lvec_rep_word:
+    call __rmc_fill           # a word element fills `count` words
+.Lvec_rep_done:
+    mov %r15, %rax
+    add $8, %rsp
+    pop %r15
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %rbx
+    ret
+.size __rmc_vec_repeat, .-__rmc_vec_repeat
+
+# rdi = vec, rsi = value, rdx = element width  ->  rax = the (possibly moved)
+# vector. Appends one element, doubling the store when it is full; the first
+# push of an empty vector grows it to a capacity of one.
+.globl __rmc_vec_push
+.type __rmc_vec_push, @function
+__rmc_vec_push:
+    push %rbx
+    push %r12
+    push %r13
+    push %r14
+    push %r15
+    sub $8, %rsp
+    mov %rdi, %rbx            # vec
+    mov %rsi, %r13            # value
+    mov %rdx, %r14            # element width
+    mov -16(%rbx), %r12       # length
+    mov -8(%rbx), %r15        # capacity
+    cmp %r15, %r12
+    jb .Lvec_push_room
+    # Full: double the capacity, but never below Rust's minimum non-zero
+    # capacity (8 elements for a one-byte element, 4 otherwise), matching
+    # `RawVec::grow_amortized`.
+    shl $1, %r15
+    mov $4, %rax
+    cmp $1, %r14
+    jne .Lvec_push_min
+    mov $8, %rax
+.Lvec_push_min:
+    cmp %rax, %r15
+    jae .Lvec_push_have_cap
+    mov %rax, %r15
+.Lvec_push_have_cap:
+    mov %r15, %rdi
+    imul %r14, %rdi
+    add $16, %rdi
+    call alloc
+    mov %rax, %r9             # new base
+    lea 16(%r9), %r10         # new data
+    mov %rbx, %rsi            # old data
+    mov %r12, %rcx
+    imul %r14, %rcx           # bytes to copy = length * width
+    test %rcx, %rcx
+    jz .Lvec_push_installed
+.Lvec_push_copy:
+    mov (%rsi), %dl
+    mov %dl, (%r10)
+    inc %rsi
+    inc %r10
+    dec %rcx
+    jnz .Lvec_push_copy
+.Lvec_push_installed:
+    mov %r12, (%r9)           # length
+    mov %r15, 8(%r9)          # capacity
+    lea 16(%r9), %rbx         # vec = new data
+.Lvec_push_room:
+    mov %r12, %rax
+    imul %r14, %rax           # offset = length * width
+    add %rbx, %rax
+    cmp $8, %r14
+    je .Lvec_push_word
+    mov %r13b, (%rax)         # a narrow element stores its low byte
+    jmp .Lvec_push_inc
+.Lvec_push_word:
+    mov %r13, (%rax)
+.Lvec_push_inc:
+    inc %r12
+    mov %r12, -16(%rbx)       # length += 1
+    mov %rbx, %rax
+    add $8, %rsp
+    pop %r15
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %rbx
+    ret
+.size __rmc_vec_push, .-__rmc_vec_push
+
+.globl __rmc_vec_len
+.type __rmc_vec_len, @function
+__rmc_vec_len:
+    mov -16(%rdi), %rax
+    ret
+.size __rmc_vec_len, .-__rmc_vec_len
+
+.globl __rmc_vec_cap
+.type __rmc_vec_cap, @function
+__rmc_vec_cap:
+    mov -8(%rdi), %rax
+    ret
+.size __rmc_vec_cap, .-__rmc_vec_cap
+"#,
+        defines: &[
+            "__rmc_vec_new",
+            "__rmc_vec_repeat",
+            "__rmc_vec_push",
+            "__rmc_vec_len",
+            "__rmc_vec_cap",
+        ],
+    },
+    Piece {
+        text: r#"
+# A `String` is a growable heap byte buffer. Its *value* is the address of a
+# `{len, bytes}` record, exactly what a `str` is, so `s.as_str()` is the value
+# itself and every `str` helper (`__rmc_str_len`, `__rmc_write_str`,
+# `__rmc_str_lt`, `__rmc_str_starts`, ...) reads a `String` with no change. The
+# capacity lives in the word *before* the length: the block is
+# `[cap][len][bytes...]`, the string value points at `[len]`, and `s.capacity()`
+# is `-8(%rdi)`. `len` and `cap` are byte counts. `String` grows to
+# `max(2*cap, needed)`, never below a minimum capacity of 8 (what makes an empty
+# string's first `push_str` reach 8), matching `String::reserve` in Rust.
+#
+# rdi = capacity  ->  rax = the record view of a fresh, empty String
+.globl __rmc_str_new
+.type __rmc_str_new, @function
+__rmc_str_new:
+    push %rbx
+    sub $16, %rsp
+    mov %rdi, %rbx            # capacity
+    lea 16(%rdi), %rdi        # bytes = capacity + {cap, len}
+    call alloc
+    mov %rbx, (%rax)          # capacity
+    movq $0, 8(%rax)          # length = 0
+    add $8, %rax              # the value is the {len, bytes} record
+    add $16, %rsp
+    pop %rbx
+    ret
+.size __rmc_str_new, .-__rmc_str_new
+
+# rdi = src (a `{len, bytes}` record, e.g. a string literal)  ->  rax = the
+# record view of a new String holding a copy of its bytes. `String::from("lit")`
+# copies the literal so the result is owned and growable; the capacity is the
+# literal's length, matching `str::to_string`/`String::from` in Rust.
+.globl __rmc_str_from
+.type __rmc_str_from, @function
+__rmc_str_from:
+    push %rbx
+    push %r12
+    sub $8, %rsp
+    mov (%rdi), %r12          # src length
+    lea 8(%rdi), %rbx         # src bytes
+    mov %r12, %rdi
+    add $16, %rdi
+    call alloc
+    mov %r12, (%rax)          # capacity = src length
+    mov %r12, 8(%rax)         # length = src length
+    lea 16(%rax), %rax        # dst data
+    xor %rcx, %rcx
+.Lstr_from_copy:
+    cmp %r12, %rcx
+    jae .Lstr_from_done
+    movzbl (%rbx,%rcx), %edx
+    mov %dl, (%rax,%rcx)
+    inc %rcx
+    jmp .Lstr_from_copy
+.Lstr_from_done:
+    lea -8(%rax), %rax        # the {len, bytes} record view
+    add $8, %rsp
+    pop %r12
+    pop %rbx
+    ret
+.size __rmc_str_from, .-__rmc_str_from
+
+# rdi = string (a `{len, bytes}` record), rsi = src record  ->  rax = the
+# (possibly moved) string. `push_str` appends the record's bytes. If the result
+# fits the current capacity it is written in place and the same address is
+# returned; otherwise the store grows (Rust's `String` policy: `max(2*cap,
+# needed)`, minimum 8), the old bytes are copied and the new record view is
+# returned.
+.globl __rmc_str_push_str
+.type __rmc_str_push_str, @function
+__rmc_str_push_str:
+    push %rbx
+    push %r12
+    push %r13
+    push %r14
+    push %r15
+    sub $8, %rsp
+    mov %rdi, %rbx            # string record view
+    mov (%rsi), %r13          # appended byte count
+    lea 8(%rsi), %r14         # appended bytes
+    mov (%rbx), %r12          # current length
+    mov -8(%rbx), %r15        # current capacity
+    lea (%r12,%r13), %rax     # needed = length + appended
+    cmp %r15, %rax
+    jbe .Lstr_push_place
+    # Grow: capacity = max(2*cap, needed), but never below the minimum 8.
+    shl $1, %r15
+    cmp %rax, %r15
+    jae .Lstr_push_have_cap
+    mov %rax, %r15
+.Lstr_push_have_cap:
+    cmp $8, %r15
+    jae .Lstr_push_cap_ok
+    mov $8, %r15
+.Lstr_push_cap_ok:
+    mov %r15, %rdi
+    add $16, %rdi
+    call alloc
+    mov %rax, %r9             # new base
+    mov %r15, (%r9)           # capacity
+    mov %r12, 8(%r9)          # length
+    lea 16(%r9), %r10         # new data
+    lea 8(%rbx), %rsi         # old data
+    mov %r12, %rcx
+    test %rcx, %rcx
+    jz .Lstr_push_installed
+.Lstr_push_copy:
+    mov (%rsi), %dl
+    mov %dl, (%r10)
+    inc %rsi
+    inc %r10
+    dec %rcx
+    jnz .Lstr_push_copy
+.Lstr_push_installed:
+    lea 8(%r9), %rbx          # string = new record view
+.Lstr_push_place:
+    lea 8(%rbx,%r12), %rdi    # destination = data + length
+    mov %r14, %rsi
+    mov %r13, %rcx
+    test %rcx, %rcx
+    jz .Lstr_push_done
+.Lstr_push_append:
+    mov (%rsi), %dl
+    mov %dl, (%rdi)
+    inc %rsi
+    inc %rdi
+    dec %rcx
+    jnz .Lstr_push_append
+.Lstr_push_done:
+    add %r13, %r12
+    mov %r12, (%rbx)          # length += appended
+    mov %rbx, %rax
+    add $8, %rsp
+    pop %r15
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %rbx
+    ret
+.size __rmc_str_push_str, .-__rmc_str_push_str
+
+# rdi = string, rsi = code point  ->  rax = the (possibly moved) string.
+# Appends the UTF-8 encoding of `rsi` (1..4 bytes), growing as `push_str` does.
+.globl __rmc_str_push_char
+.type __rmc_str_push_char, @function
+__rmc_str_push_char:
+    push %rbx
+    push %r12
+    push %r13
+    push %r14
+    push %r15
+    sub $8, %rsp
+    mov %rdi, %rbx            # string record view
+    mov %rsi, %r14            # code point
+    # Encode into a 4-byte scratch buffer on the stack.
+    sub $8, %rsp              # scratch[0..4]
+    cmp $0x80, %r14
+    jae .Lstr_pc_two
+    mov %r14b, (%rsp)
+    mov $1, %r13
+    jmp .Lstr_pc_enc
+.Lstr_pc_two:
+    cmp $0x800, %r14
+    jae .Lstr_pc_three
+    mov %r14, %rax
+    shr $6, %rax
+    or $0xc0, %eax
+    mov %al, (%rsp)
+    mov %r14, %rax
+    and $0x3f, %eax
+    or $0x80, %eax
+    mov %al, 1(%rsp)
+    mov $2, %r13
+    jmp .Lstr_pc_enc
+.Lstr_pc_three:
+    cmp $0x10000, %r14
+    jae .Lstr_pc_four
+    mov %r14, %rax
+    shr $12, %rax
+    or $0xe0, %eax
+    mov %al, (%rsp)
+    mov %r14, %rax
+    shr $6, %rax
+    and $0x3f, %eax
+    or $0x80, %eax
+    mov %al, 1(%rsp)
+    mov %r14, %rax
+    and $0x3f, %eax
+    or $0x80, %eax
+    mov %al, 2(%rsp)
+    mov $3, %r13
+    jmp .Lstr_pc_enc
+.Lstr_pc_four:
+    mov %r14, %rax
+    shr $18, %rax
+    or $0xf0, %eax
+    mov %al, (%rsp)
+    mov %r14, %rax
+    shr $12, %rax
+    and $0x3f, %eax
+    or $0x80, %eax
+    mov %al, 1(%rsp)
+    mov %r14, %rax
+    shr $6, %rax
+    and $0x3f, %eax
+    or $0x80, %eax
+    mov %al, 2(%rsp)
+    mov %r14, %rax
+    and $0x3f, %eax
+    or $0x80, %eax
+    mov %al, 3(%rsp)
+    mov $4, %r13
+.Lstr_pc_enc:
+    mov (%rbx), %r12          # current length
+    mov -8(%rbx), %r15        # current capacity
+    lea (%r12,%r13), %rax     # needed
+    cmp %r15, %rax
+    jbe .Lstr_pc_place
+    shl $1, %r15
+    cmp %rax, %r15
+    jae .Lstr_pc_have_cap
+    mov %rax, %r15
+.Lstr_pc_have_cap:
+    cmp $8, %r15
+    jae .Lstr_pc_cap_ok
+    mov $8, %r15
+.Lstr_pc_cap_ok:
+    mov %r15, %rdi
+    add $16, %rdi
+    call alloc
+    mov %rax, %r9
+    mov %r15, (%r9)
+    mov %r12, 8(%r9)
+    lea 16(%r9), %r10
+    lea 8(%rbx), %rsi
+    mov %r12, %rcx
+    test %rcx, %rcx
+    jz .Lstr_pc_installed
+.Lstr_pc_copy:
+    mov (%rsi), %dl
+    mov %dl, (%r10)
+    inc %rsi
+    inc %r10
+    dec %rcx
+    jnz .Lstr_pc_copy
+.Lstr_pc_installed:
+    lea 8(%r9), %rbx
+.Lstr_pc_place:
+    lea 8(%rbx,%r12), %rdi    # destination
+    mov %rsp, %rsi            # scratch bytes
+    mov %r13, %rcx
+.Lstr_pc_store:
+    mov (%rsi), %dl
+    mov %dl, (%rdi)
+    inc %rsi
+    inc %rdi
+    dec %rcx
+    jnz .Lstr_pc_store
+    add %r13, %r12
+    mov %r12, (%rbx)
+    mov %rbx, %rax
+    add $8, %rsp              # scratch
+    add $8, %rsp
+    pop %r15
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %rbx
+    ret
+.size __rmc_str_push_char, .-__rmc_str_push_char
+
+# rdi = string  ->  rax = its byte capacity (the word before the length).
+.globl __rmc_string_cap
+.type __rmc_string_cap, @function
+__rmc_string_cap:
+    mov -8(%rdi), %rax
+    ret
+.size __rmc_string_cap, .-__rmc_string_cap
+"#,
+        defines: &[
+            "__rmc_str_new",
+            "__rmc_str_from",
+            "__rmc_str_push_str",
+            "__rmc_str_push_char",
+            "__rmc_string_cap",
+        ],
+    },
+    Piece {
+        text: r#"
+.text
 # void __rmc_overflow(void)  -- a checked +,-,* overflowed; write a fixed
 # message and exit with status 101, mirroring a Rust panic.
 .globl __rmc_overflow

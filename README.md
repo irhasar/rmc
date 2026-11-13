@@ -315,7 +315,10 @@ loop); arithmetic, comparison, bitwise (`!`/`&`/`|`/`^`) and shift (`<<`/`>>`)
 operators; `&&`/`||`; strings (a `str` literal or `str`-typed parameter, return
 or field, compared by content with `==`/`!=`/`<`/`<=`/`>`/`>=`, with `.len()` for
 the byte length and `.starts_with(t)` / `.ends_with(t)` / `.contains(t)` for
-byte-wise prefix, suffix and substring tests, and `.is_empty()`); array `.len()`
+byte-wise prefix, suffix and substring tests, and `.is_empty()`); a growable
+`String` (`String::new()` / `String::with_capacity(k)` / `String::from("lit")`,
+with `.len()` / `.capacity()` / `.is_empty()` / `.as_str()` and `.push_str(s)` /
+`.push(c)`, growing exactly as `std` does and compared by content); array `.len()`
 (a compile-time constant) and `.is_empty()` (the constant `N == 0`); built-in
 `i64` methods
 (`x.abs()`, `x.signum()`, `x.min(y)`, `x.max(y)`, `x.clamp(lo, hi)`,
@@ -559,9 +562,11 @@ rmc is a small, self-contained compiler, not a drop-in replacement for rustc.
 
 - The language subset is small (see `docs/language.md`). Structs, arrays, `for`,
   aggregates across calls, overflow checks, integer `match`, enums,
-  references, the `print!`/`println!` and `assert!` families, and `use`/`std`
+  references, a growable `Vec`/`String`, the `print!`/`println!` and `assert!`
+  families, and `use`/`std`
   paths exist; traits, generics, borrowing, closures, floating point and the
-  standard library beyond `std::process::exit` / `std::hint::black_box` do not.
+  standard library beyond `std::process::exit` / `std::hint::black_box`, the
+  `Vec`/`String` shapes and the `str` methods do not.
   An aggregate is passed by value through a hidden
   pointer unless a reference (`&T` / `&self`) is used, which passes the address
   and copies nothing. References are not checked: nothing proves a reference

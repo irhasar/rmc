@@ -14,12 +14,12 @@ use crate::lexer::{Tok, Token};
 enum NameScope {
     /// `vec_names`: whether the name was already present.
     VecName(String, bool),
-    VecCap(String, Option<i64>),
-    VecLen(String, Option<i64>),
     VecElem(String, Option<i64>),
     Ptr(String, Option<i64>),
     /// `args_vecs`: a `std::env::args()...collect()` binding.
     ArgsVec(String, Option<i64>),
+    /// `string_names`: whether the name was already present.
+    StringName(String, bool),
     /// A `const` declared inside the block, so the name is removed (or its
     /// outer value restored) when the block ends. The `Option` is the value the
     /// name had before, if any.
@@ -166,12 +166,6 @@ pub struct Parser {
     /// as an `i64` address, and the few methods the corpus uses are folded here
     /// (`.as_mut_ptr()`, `.capacity()`, `.len()`).
     vec_names: std::collections::HashSet<String>,
-    /// The constant capacity of a `Vec::with_capacity(k)` binding, for
-    /// `v.capacity()`.
-    vec_cap: std::collections::HashMap<String, i64>,
-    /// The constant length of a `vec![e; n]` binding with a constant `n`, for
-    /// `v.len()`.
-    vec_len: std::collections::HashMap<String, i64>,
     /// Names holding a raw pointer (an `i64` address) taken by `.as_mut_ptr()`
     /// or `.as_ptr()`, mapped to the byte stride of one element. A `.add(off)`
     /// on one is `ptr + off * stride`, matching the raw-pointer method: `add`
@@ -187,6 +181,11 @@ pub struct Parser {
     /// `let` that consumes the type can record it against the binding name.
     /// Only `Vec` bindings read it, and they always follow their annotation.
     vec_elem_pending: Option<i64>,
+    /// Names bound to a `String` (a growable byte buffer). A `String` value is
+    /// the address of a `{len, bytes}` record, so it shares `str`'s layout and
+    /// only its methods (`push_str`, `push`, `capacity`, `as_str`) and its
+    /// growth-returning push need to know the binding is a `String`.
+    string_names: std::collections::HashSet<String>,
     /// The bare-identifier target of each `type` alias (`type Byte = u8` ->
     /// `Byte` -> `u8`), so a `Vec<Byte>` can resolve the element to its
     /// underlying byte width. Only a target that is a single identifier is
@@ -316,11 +315,10 @@ impl Parser {
             args_vecs: std::collections::HashMap::new(),
             args_elems: std::collections::HashSet::new(),
             vec_names: std::collections::HashSet::new(),
-            vec_cap: std::collections::HashMap::new(),
-            vec_len: std::collections::HashMap::new(),
             ptr_vars: std::collections::HashMap::new(),
             vec_elem: std::collections::HashMap::new(),
             vec_elem_pending: None,
+            string_names: std::collections::HashSet::new(),
             alias_target: std::collections::HashMap::new(),
             name_scopes: Vec::new(),
             in_prelude: false,
@@ -1688,6 +1686,13 @@ impl Parser {
                     Tok::Ident(s) => s,
                     _ => unreachable!(),
                 };
+                // `String` has no `std` type in rmc, but it shares a `str`'s
+                // record layout, so its annotation resolves to `Str` in sema
+                // (see `resolve_ty_rec`). Keeping the `Named` marker here lets
+                // the `let` that declares it see the annotation before sema.
+                if name == "String" {
+                    return Ok(Type::Named("String".into()));
+                }
                 // `Vec<T>` has no real type in rmc; the `let` that declares an
                 // `args()`-vector consumes the `<..>` and its initializer is
                 // desugared. Here only the `<..>` is skipped and a placeholder
@@ -2097,16 +2102,6 @@ impl Parser {
             frame.push(NameScope::VecName(name.to_string(), self.vec_names.contains(name)));
         }
     }
-    fn note_vec_cap(&mut self, name: &str) {
-        if let Some(frame) = self.name_scopes.last_mut() {
-            frame.push(NameScope::VecCap(name.to_string(), self.vec_cap.get(name).copied()));
-        }
-    }
-    fn note_vec_len(&mut self, name: &str) {
-        if let Some(frame) = self.name_scopes.last_mut() {
-            frame.push(NameScope::VecLen(name.to_string(), self.vec_len.get(name).copied()));
-        }
-    }
     fn note_vec_elem(&mut self, name: &str) {
         if let Some(frame) = self.name_scopes.last_mut() {
             frame.push(NameScope::VecElem(name.to_string(), self.vec_elem.get(name).copied()));
@@ -2120,6 +2115,11 @@ impl Parser {
     fn note_args_vec(&mut self, name: &str) {
         if let Some(frame) = self.name_scopes.last_mut() {
             frame.push(NameScope::ArgsVec(name.to_string(), self.args_vecs.get(name).copied()));
+        }
+    }
+    fn note_string_name(&mut self, name: &str) {
+        if let Some(frame) = self.name_scopes.last_mut() {
+            frame.push(NameScope::StringName(name.to_string(), self.string_names.contains(name)));
         }
     }
 
@@ -2137,22 +2137,6 @@ impl Parser {
                             self.vec_names.remove(&n);
                         }
                     }
-                    NameScope::VecCap(n, prev) => match prev {
-                        Some(v) => {
-                            self.vec_cap.insert(n, v);
-                        }
-                        None => {
-                            self.vec_cap.remove(&n);
-                        }
-                    },
-                    NameScope::VecLen(n, prev) => match prev {
-                        Some(v) => {
-                            self.vec_len.insert(n, v);
-                        }
-                        None => {
-                            self.vec_len.remove(&n);
-                        }
-                    },
                     NameScope::VecElem(n, prev) => match prev {
                         Some(v) => {
                             self.vec_elem.insert(n, v);
@@ -2177,6 +2161,13 @@ impl Parser {
                             self.args_vecs.remove(&n);
                         }
                     },
+                    NameScope::StringName(n, had) => {
+                        if had {
+                            self.string_names.insert(n);
+                        } else {
+                            self.string_names.remove(&n);
+                        }
+                    }
                     NameScope::ConstInt(n, prev) => match prev {
                         Some(v) => {
                             self.consts.insert(n, v);
@@ -2373,7 +2364,7 @@ impl Parser {
                     continue;
                 }
                 if self.eat(&Tok::Semi) {
-                    stmts.push(Stmt::Expr(e));
+                    stmts.push(self.expr_stmt(e));
                     continue;
                 }
                 if self.peek() == Some(&Tok::RBrace) {
@@ -3099,7 +3090,14 @@ impl Parser {
         // through to the by-value paths below.
         if let Expr::AddrOf { expr: inner, mutable, .. } = &head {
             let is_vec = matches!(inner.as_ref(), Expr::Var { name, .. } if self.vec_names.contains(name));
-            if !is_vec && Self::is_iterable_place(inner) {
+            if is_vec {
+                let Expr::Var { name: recv, .. } = inner.as_ref() else { unreachable!() };
+                let recv = recv.clone();
+                let mutable = *mutable;
+                let body = self.parse_block()?;
+                return self.desugar_for_vec_ref(pat, recv, mutable, body, label);
+            }
+            if Self::is_iterable_place(inner) {
                 let inner = (**inner).clone();
                 let mutable = *mutable;
                 let body = self.parse_block()?;
@@ -3130,8 +3128,14 @@ impl Parser {
                     _ => None,
                 };
                 if let Some(m) = mutable {
-                    let is_vec = matches!(recv.as_ref(), Expr::Var { name, .. } if self.vec_names.contains(name));
-                    if !is_vec && Self::is_iterable_place(recv) {
+                    if let Expr::Var { name: recv, .. } = recv.as_ref() {
+                        if self.vec_names.contains(recv) {
+                            let recv = recv.clone();
+                            let body = self.parse_block()?;
+                            return self.desugar_for_vec_ref(pat, recv, m, body, label);
+                        }
+                    }
+                    if Self::is_iterable_place(recv) {
                         let recv = (**recv).clone();
                         let body = self.parse_block()?;
                         return self.desugar_for_array_ref(pat, recv, m, body, label);
@@ -3167,7 +3171,98 @@ impl Parser {
             });
         }
         let body = self.parse_block()?;
+        // `for x in v` over a `Vec` binding iterates by value over a copy of the
+        // vector, so growing it inside the body cannot affect the loop bound.
+        if let Expr::Var { name, .. } = &head {
+            if self.vec_names.contains(name) {
+                let recv = name.clone();
+                return self.desugar_for_vec_owned(pat, recv, body, label);
+            }
+        }
         self.desugar_for_array(pat, head, body, label)
+    }
+
+    /// `for PAT in VEC { body }`: iterate by value. The vector is bound once to a
+    /// hidden local (a copy of the binding's address), and the loop indexes that
+    /// copy from 0 to its length, so a `push` inside the body grows the original
+    /// binding without disturbing the bound. The element is read by value.
+    fn desugar_for_vec_owned(
+        &mut self,
+        pat: Pat,
+        recv: String,
+        body: Block,
+        label: Option<String>,
+    ) -> PResult<Stmt> {
+        let n = self.tmp;
+        self.tmp += 1;
+        let vec_name = format!("\u{0}fv{n}");
+        let idx_name = format!("\u{0}fi{n}");
+        let vec_var = Expr::Var { name: vec_name.clone(), slot: -1, ty: Type::I64 };
+        let idx_var = Expr::Var { name: idx_name.clone(), slot: -1, ty: Type::I64 };
+        let width = self.vec_elem.get(&recv).copied().unwrap_or(8);
+        let len = Expr::Call {
+            name: "__rmc_vec_len".into(),
+            args: vec![vec_var.clone()],
+            arg_slots: Vec::new(),
+            ret_slot: -1,
+            ret_ty: Type::I64,
+        };
+        let off = if width == 1 {
+            idx_var
+        } else {
+            Expr::Bin(BinOp::Mul, Box::new(idx_var), Box::new(Expr::Int(width)))
+        };
+        let addr = Expr::Bin(BinOp::Add, Box::new(vec_var), Box::new(off));
+        let ptr_ty = if width == 1 { Type::U8 } else { Type::I64 };
+        let elem = Expr::Deref {
+            expr: Box::new(Expr::Cast(
+                Box::new(addr),
+                Type::Ref(Box::new(ptr_ty), false),
+            )),
+            ty: Type::I64,
+        };
+        let mut stmts = match pat {
+            Pat::Bind(name) => vec![Stmt::Let {
+                name,
+                ty: None,
+                init: Some(elem),
+                slot: -1,
+                mutable: false,
+            }],
+            Pat::Wild => vec![Stmt::Let {
+                name: format!("\u{0}fd{n}"),
+                ty: None,
+                init: Some(elem),
+                slot: -1,
+                mutable: false,
+            }],
+            _ => {
+                return Err(format!(
+                    "at byte {}: `for` over a `Vec` needs a binding or `_`",
+                    self.pos()
+                ))
+            }
+        };
+        stmts.extend(body.stmts);
+        let loop_body = Block { stmts, tail: body.tail };
+        let for_stmt = Stmt::For {
+            var: idx_name,
+            var_slot: -1,
+            start: Expr::Int(0),
+            end: len,
+            end_slot: -1,
+            inclusive: false,
+            body: loop_body,
+            label,
+        };
+        let vec_let = Stmt::Let {
+            name: vec_name,
+            ty: None,
+            init: Some(Expr::Var { name: recv, slot: -1, ty: Type::I64 }),
+            slot: -1,
+            mutable: false,
+        };
+        Ok(Stmt::Expr(Expr::Block(Block { stmts: vec![vec_let, for_stmt], tail: None })))
     }
 
     /// The loop variable and any extra bindings for a `for` over a *range*. A
@@ -3214,6 +3309,108 @@ impl Parser {
             Expr::Deref { expr, .. } => Self::is_iterable_place(expr),
             _ => false,
         }
+    }
+
+    /// Wrap a parsed expression statement. `v.push(x)` can move the element
+    /// store (a grow reallocates) and the helper returns the new address, so it
+    /// is stored back into the receiver; every other expression keeps its value
+    /// discarded. Only a simple `v` binding is written back, which is the shape
+    /// that can grow.
+    fn expr_stmt(&self, e: Expr) -> Stmt {
+        if let Expr::Call { name, args, .. } = &e {
+            if name == "__rmc_vec_push"
+                || name == "__rmc_str_push_str"
+                || name == "__rmc_str_push_char"
+            {
+                if let Some(Expr::Var { name: recv, .. }) = args.first() {
+                    let target = Expr::Var { name: recv.clone(), slot: -1, ty: Type::I64 };
+                    return Stmt::Assign { target, value: e };
+                }
+            }
+        }
+        Stmt::Expr(e)
+    }
+
+    /// `for PAT in &VEC { body }` (or `&mut VEC`): bind the element by reference
+    /// and index the vector's store directly. The loop is `for i in
+    /// 0..__rmc_vec_len(v) { let PAT = &v[i]; body }` (a mutable borrow for
+    /// `&mut`), where `&v[i]` is `&*(v + i * elem)`, the same place the `v[i]`
+    /// intercept builds. `PAT` may be a binding or `_`.
+    fn desugar_for_vec_ref(
+        &mut self,
+        pat: Pat,
+        recv: String,
+        mutable: bool,
+        body: Block,
+        label: Option<String>,
+    ) -> PResult<Stmt> {
+        let n = self.tmp;
+        self.tmp += 1;
+        let idx_name = format!("\u{0}fi{n}");
+        let idx_var = Expr::Var { name: idx_name.clone(), slot: -1, ty: Type::I64 };
+        let vec_var = Expr::Var { name: recv.clone(), slot: -1, ty: Type::I64 };
+        let width = self.vec_elem.get(&recv).copied().unwrap_or(8);
+        let len = Expr::Call {
+            name: "__rmc_vec_len".into(),
+            args: vec![vec_var.clone()],
+            arg_slots: Vec::new(),
+            ret_slot: -1,
+            ret_ty: Type::I64,
+        };
+        let off = if width == 1 {
+            idx_var
+        } else {
+            Expr::Bin(BinOp::Mul, Box::new(idx_var), Box::new(Expr::Int(width)))
+        };
+        let addr = Expr::Bin(BinOp::Add, Box::new(vec_var), Box::new(off));
+        let ptr_ty = if width == 1 { Type::U8 } else { Type::I64 };
+        let deref = Expr::Deref {
+            expr: Box::new(Expr::Cast(
+                Box::new(addr),
+                Type::Ref(Box::new(ptr_ty), mutable),
+            )),
+            ty: Type::I64,
+        };
+        let elem_ref = Expr::AddrOf {
+            expr: Box::new(deref),
+            ty: Type::I64,
+            mutable,
+            slot: -1,
+        };
+        let mut stmts = match pat {
+            Pat::Bind(name) => vec![Stmt::Let {
+                name,
+                ty: None,
+                init: Some(elem_ref),
+                slot: -1,
+                mutable: false,
+            }],
+            Pat::Wild => vec![Stmt::Let {
+                name: format!("\u{0}fd{n}"),
+                ty: None,
+                init: Some(elem_ref),
+                slot: -1,
+                mutable: false,
+            }],
+            _ => {
+                return Err(format!(
+                    "at byte {}: `for` over a `Vec` reference needs a binding or `_`",
+                    self.pos()
+                ))
+            }
+        };
+        stmts.extend(body.stmts);
+        let loop_body = Block { stmts, tail: body.tail };
+        Ok(Stmt::For {
+            var: idx_name,
+            var_slot: -1,
+            start: Expr::Int(0),
+            end: len,
+            end_slot: -1,
+            inclusive: false,
+            body: loop_body,
+            label,
+        })
     }
 
     /// `for PAT in &ARR { body }` (or `&mut ARR`): bind the element by reference
@@ -3753,93 +3950,76 @@ impl Parser {
                         self.args_vecs.insert(name.clone(), self.args_skip);
                         return Ok(());
                     }
+                    // `String::new()`, `String::with_capacity(k)` and
+                    // `String::from("lit")`: a growable byte buffer. A `String`
+                    // value is the `{len, bytes}` record (the `str` layout), so
+                    // the binding is a `Str` and only the constructors are
+                    // rewritten. Recognised regardless of an annotation, like the
+                    // `Vec` constructors, so `let s = String::from("x");` needs
+                    // no `: String`.
+                    if m == "\u{0}strnew" || m == "\u{0}strfrom" {
+                        let helper = if m == "\u{0}strnew" {
+                            "__rmc_str_new"
+                        } else {
+                            "__rmc_str_from"
+                        };
+                        self.note_string_name(&name);
+                        self.string_names.insert(name.clone());
+                        out.push(Stmt::Let {
+                            name,
+                            ty: Some(Type::Str),
+                            init: Some(Expr::Call {
+                                name: helper.into(),
+                                args,
+                                arg_slots: Vec::new(),
+                                ret_slot: -1,
+                                ret_ty: Type::Str,
+                            }),
+                            slot: -1,
+                            mutable,
+                        });
+                        return Ok(());
+                    }
                     if m == "\u{0}vecnew" || m == "\u{0}vecrepeat" {
                         let n_expr = if m == "\u{0}vecnew" {
                             args[0].clone()
                         } else {
                             args[1].clone()
                         };
-                        // The count may be a constant or a runtime value; only a
-                        // constant is recorded for a later `.len()`/`.capacity()`
-                        // fold. Either way the size is `count * 8` bytes at run
-                        // time and `__rmc_fill` takes the count as a value.
-                        let count = eval_i64(&n_expr, &self.consts);
                         self.note_vec_name(&name);
                         self.note_vec_elem(&name);
-                        self.note_vec_len(&name);
-                        self.note_vec_cap(&name);
                         self.vec_names.insert(name.clone());
                         self.vec_elem.insert(name.clone(), elem_width);
-                        if let Some(c) = count {
-                            self.vec_len.insert(name.clone(), c);
-                            if m == "\u{0}vecnew" {
-                                self.vec_cap.insert(name.clone(), c);
-                            }
-                        }
-                        // `alloc(count * elem_width)`; an `i64`/pointer element
-                        // is one machine word, a `u8`/`i8` element is one byte.
-                        // Sizing by the element width (not always 8) is what
-                        // keeps `vec![0u8; n]` from allocating eight times the
-                        // memory the source asks for. The count expression is
-                        // evaluated once: bind it to a temporary and reuse it for
-                        // both the allocation size and the fill, or a
-                        // side-effecting count (e.g. a call) would run twice and
-                        // the two uses could disagree.
-                        let count_tmp = format!("\u{0}vc{}", self.tmp);
-                        self.tmp += 1;
-                        let count_use = Expr::Var {
-                            name: count_tmp.clone(),
-                            slot: -1,
-                            ty: Type::I64,
-                        };
-                        let bytes = Expr::Bin(
-                            BinOp::Mul,
-                            Box::new(count_use.clone()),
-                            Box::new(Expr::Int(elem_width)),
-                        );
-                        let addr = Expr::Call {
-                            name: "alloc".into(),
-                            args: vec![bytes],
-                            arg_slots: Vec::new(),
-                            ret_slot: -1,
-                            ret_ty: Type::I64,
-                        };
+                        // The value is the element store's address; the helper
+                        // writes a 16-byte header before it holding the length
+                        // (0 here) and the capacity, so `.len()`/`.capacity()`
+                        // are runtime reads and a later `push` can grow the
+                        // store. The element width travels as an argument, as it
+                        // does for `add`/`free`.
                         let init_expr = if m == "\u{0}vecnew" {
-                            addr
-                        } else {
-                            // Write the repeated element. A one-byte element uses
-                            // the byte fill (writing `count` words would overrun a
-                            // `count`-byte block); every wider element uses the
-                            // word fill, `count` words being `count * 8` bytes.
-                            let fill = if elem_width == 1 {
-                                "__rmc_fill_bytes"
-                            } else {
-                                "__rmc_fill"
-                            };
+                            // `Vec::new()` is capacity 0, `with_capacity(k)` is `k`.
                             Expr::Call {
-                                name: fill.into(),
-                                // The count is the single-eval temporary (a
-                                // side-effecting count must not run twice), and
-                                // the fill helpers write a whole word, so a
-                                // narrow element (`vec![7u8; n]`) is widened to
-                                // `i64`; the identity cast folds away.
+                                name: "__rmc_vec_new".into(),
+                                args: vec![n_expr, Expr::Int(elem_width)],
+                                arg_slots: Vec::new(),
+                                ret_slot: -1,
+                                ret_ty: Type::I64,
+                            }
+                        } else {
+                            // `vec![value; count]`: `count` copies of `value`,
+                            // length and capacity both `count`.
+                            Expr::Call {
+                                name: "__rmc_vec_repeat".into(),
                                 args: vec![
-                                    addr,
-                                    count_use,
+                                    n_expr,
                                     Expr::Cast(Box::new(args[0].clone()), Type::I64),
+                                    Expr::Int(elem_width),
                                 ],
                                 arg_slots: Vec::new(),
                                 ret_slot: -1,
                                 ret_ty: Type::I64,
                             }
                         };
-                        out.push(Stmt::Let {
-                            name: count_tmp,
-                            ty: Some(Type::I64),
-                            init: Some(n_expr),
-                            slot: -1,
-                            mutable: false,
-                        });
                         out.push(Stmt::Let {
                             name,
                             ty: Some(Type::I64),
@@ -3850,50 +4030,25 @@ impl Parser {
                         return Ok(());
                     }
                     if m == "\u{0}veclist" {
-                        // `vec![a, b, c]`: allocate one slot per element and
-                        // store each. A one-byte element (`vec![1u8, 2u8]`)
-                        // allocates one byte per element and stores a byte; a
-                        // wider element allocates eight bytes and stores a word.
-                        // The element value is cast to `i64` because a byte
-                        // pointer's deref-store expects an `i64` value at a byte
-                        // address; the identity cast on a word element folds
-                        // away, and on a byte element it is the truncation the
-                        // store needs.
+                        // `vec![a, b, c]`: a fresh vector of exactly `count`
+                        // elements. `__rmc_vec_new(count, width)` gives the
+                        // header and store with capacity `count` and length 0;
+                        // one `push` per element fills it without ever growing
+                        // (so the address never moves and a non-`mut` binding is
+                        // fine), and the length ends at `count`. An empty list is
+                        // simply capacity 0.
                         let count = args.len() as i64;
                         self.note_vec_name(&name);
                         self.note_vec_elem(&name);
-                        self.note_vec_len(&name);
-                        self.note_vec_cap(&name);
                         self.vec_names.insert(name.clone());
                         self.vec_elem.insert(name.clone(), elem_width);
-                        self.vec_len.insert(name.clone(), count);
-                        self.vec_cap.insert(name.clone(), count);
-                        let bytes = Expr::Bin(
-                            BinOp::Mul,
-                            Box::new(Expr::Int(count)),
-                            Box::new(Expr::Int(elem_width)),
-                        );
-                        let addr = Expr::Call {
-                            name: "alloc".into(),
-                            args: vec![bytes],
-                            arg_slots: Vec::new(),
-                            ret_slot: -1,
-                            ret_ty: Type::I64,
-                        };
-                        let byte_elem = elem_width == 1;
-                        let value_ty = if byte_elem {
-                            Type::Int { signed: false, bits: 8 }
-                        } else {
-                            Type::I64
-                        };
                         // An element that names an outer binding of the same
                         // name (`let v = 5; let v: Vec<i64> = vec![v]`) must read
                         // that outer value: rustc evaluates the initializer
                         // before the new binding enters scope, so a direct store
-                        // after `name` is declared would read the allocation
-                        // address instead. Only then is each element evaluated
-                        // into its own temporary ahead of the declaration; the
-                        // common case stores each element directly.
+                        // after `name` is declared would read the vector instead.
+                        // Only then is each element evaluated into its own
+                        // temporary ahead of the declaration.
                         let shadowed = args.iter().any(|e| Self::expr_mentions_name(e, &name));
                         let mut temps: Vec<String> = Vec::new();
                         if shadowed {
@@ -3903,38 +4058,40 @@ impl Parser {
                                 out.push(Stmt::Let {
                                     name: t.clone(),
                                     ty: None,
-                                    init: Some(Expr::Cast(Box::new(elem.clone()), value_ty.clone())),
+                                    init: Some(Expr::Cast(Box::new(elem.clone()), Type::I64)),
                                     slot: -1,
                                     mutable: false,
                                 });
                                 temps.push(t);
                             }
                         }
-                        let base = Expr::Var { name: name.clone(), slot: -1, ty: Type::I64 };
                         out.push(Stmt::Let {
-                            name,
+                            name: name.clone(),
                             ty: Some(Type::I64),
-                            init: Some(addr),
+                            init: Some(Expr::Call {
+                                name: "__rmc_vec_new".into(),
+                                args: vec![Expr::Int(count), Expr::Int(elem_width)],
+                                arg_slots: Vec::new(),
+                                ret_slot: -1,
+                                ret_ty: Type::I64,
+                            }),
                             slot: -1,
                             mutable,
                         });
+                        let base = Expr::Var { name: name.clone(), slot: -1, ty: Type::I64 };
                         for (i, elem) in args.iter().enumerate() {
-                            let offset = Expr::Bin(
-                                BinOp::Add,
-                                Box::new(base.clone()),
-                                Box::new(Expr::Int(i as i64 * elem_width)),
-                            );
-                            let ptr_ty = if byte_elem { Type::U8 } else { Type::I64 };
-                            let ptr = Expr::Cast(Box::new(offset), Type::Ref(Box::new(ptr_ty), true));
                             let value = if shadowed {
                                 Expr::Var { name: temps[i].clone(), slot: -1, ty: Type::I64 }
                             } else {
-                                Expr::Cast(Box::new(elem.clone()), value_ty.clone())
+                                Expr::Cast(Box::new(elem.clone()), Type::I64)
                             };
-                            out.push(Stmt::Assign {
-                                target: Expr::Deref { expr: Box::new(ptr), ty: Type::I64 },
-                                value,
-                            });
+                            out.push(Stmt::Expr(Expr::Call {
+                                name: "__rmc_vec_push".into(),
+                                args: vec![base.clone(), value, Expr::Int(elem_width)],
+                                arg_slots: Vec::new(),
+                                ret_slot: -1,
+                                ret_ty: Type::I64,
+                            }));
                         }
                         return Ok(());
                     }
@@ -3961,6 +4118,13 @@ impl Parser {
                         });
                         return Ok(());
                     }
+                }
+                if matches!(ty, Some(Type::Named(ref n)) if n == "String") {
+                    return Err(format!(
+                        "at byte {}: a `String` binding must be initialized by \
+                         `String::new()`, `String::with_capacity(k)` or `String::from(\"lit\")`",
+                        self.pos()
+                    ));
                 }
                 if matches!(ty, Some(Type::Named(ref n)) if n == "Vec") {
                     return Err(format!(
@@ -4052,7 +4216,7 @@ impl Parser {
                     return Ok(());
                 }
                 self.expect(Tok::Semi)?;
-                out.push(Stmt::Expr(e));
+                out.push(self.expr_stmt(e));
                 Ok(())
             }
         }
@@ -5163,6 +5327,35 @@ impl Parser {
             if self.eat(&Tok::LBracket) {
                 let idx = self.parse_bracketed_expr()?;
                 self.expect(Tok::RBracket)?;
+                // `v[i]` on a `Vec` binding is `*(v + i * elem)`: the value is
+                // the element store's address, so indexing is pointer arithmetic
+                // at the element width. A `Vec` element that is itself a `Vec`
+                // is a word, so its stride is eight.
+                if let Expr::Var { name: recv, .. } = &e {
+                    if self.vec_names.contains(recv) {
+                        let width = self.vec_elem.get(recv).copied().unwrap_or(8);
+                        let recv_expr = e.clone();
+                        let off = if width == 1 {
+                            idx
+                        } else {
+                            Expr::Bin(
+                                BinOp::Mul,
+                                Box::new(idx),
+                                Box::new(Expr::Int(width)),
+                            )
+                        };
+                        let addr = Expr::Bin(BinOp::Add, Box::new(recv_expr), Box::new(off));
+                        let ptr_ty = if width == 1 { Type::U8 } else { Type::I64 };
+                        e = Expr::Deref {
+                            expr: Box::new(Expr::Cast(
+                                Box::new(addr),
+                                Type::Ref(Box::new(ptr_ty), false),
+                            )),
+                            ty: Type::I64,
+                        };
+                        continue;
+                    }
+                }
                 e = Expr::Index(Box::new(e), Box::new(idx));
             } else if self.eat(&Tok::Dot) {
                 // A tuple field is written `.0`, `.1`, ...: the "name" is a
@@ -5192,13 +5385,109 @@ impl Parser {
                     // address (marked so a later `.add` folds), and `.add(off)`
                     // is `ptr + off`.
                     if let Expr::Var { name: recv, .. } = &e {
-                        if args.is_empty() && name == "capacity" && self.vec_cap.contains_key(recv)
+                        // `String` methods. A `String` value is the `{len,
+                        // bytes}` record, so `as_str()` is the value itself and
+                        // `len()`/`is_empty()`/`starts_with`/... fall through to
+                        // the `str` handling in sema. `capacity()` reads the
+                        // word before the length, and `push_str`/`push` append
+                        // and may grow (returning the new record), so they are
+                        // written back like a `Vec` push.
+                        if self.string_names.contains(recv) {
+                            if args.is_empty() && name == "capacity" {
+                                let recv_expr = e.clone();
+                                e = Expr::Call {
+                                    name: "__rmc_string_cap".into(),
+                                    args: vec![recv_expr],
+                                    arg_slots: Vec::new(),
+                                    ret_slot: -1,
+                                    ret_ty: Type::I64,
+                                };
+                                continue;
+                            }
+                            if args.is_empty() && name == "as_str" {
+                                // The value already is the record view.
+                                continue;
+                            }
+                            if name == "push_str" && args.len() == 1 {
+                                let recv_expr = e.clone();
+                                let value = args.pop().unwrap();
+                                e = Expr::Call {
+                                    name: "__rmc_str_push_str".into(),
+                                    args: vec![recv_expr, value],
+                                    arg_slots: Vec::new(),
+                                    ret_slot: -1,
+                                    ret_ty: Type::Str,
+                                };
+                                continue;
+                            }
+                            if name == "push" && args.len() == 1 {
+                                let recv_expr = e.clone();
+                                let value = args.pop().unwrap();
+                                e = Expr::Call {
+                                    name: "__rmc_str_push_char".into(),
+                                    args: vec![recv_expr, value],
+                                    arg_slots: Vec::new(),
+                                    ret_slot: -1,
+                                    ret_ty: Type::Str,
+                                };
+                                continue;
+                            }
+                        }
+                        if args.is_empty()
+                            && name == "capacity"
+                            && self.vec_names.contains(recv)
                         {
-                            e = Expr::Int(self.vec_cap[recv]);
+                            let recv_expr = e.clone();
+                            e = Expr::Call {
+                                name: "__rmc_vec_cap".into(),
+                                args: vec![recv_expr],
+                                arg_slots: Vec::new(),
+                                ret_slot: -1,
+                                ret_ty: Type::I64,
+                            };
                             continue;
                         }
-                        if args.is_empty() && name == "len" && self.vec_len.contains_key(recv) {
-                            e = Expr::Int(self.vec_len[recv]);
+                        if args.is_empty() && name == "len" && self.vec_names.contains(recv) {
+                            let recv_expr = e.clone();
+                            e = Expr::Call {
+                                name: "__rmc_vec_len".into(),
+                                args: vec![recv_expr],
+                                arg_slots: Vec::new(),
+                                ret_slot: -1,
+                                ret_ty: Type::I64,
+                            };
+                            continue;
+                        }
+                        if args.is_empty() && name == "is_empty" && self.vec_names.contains(recv)
+                        {
+                            let recv_expr = e.clone();
+                            e = Expr::Bin(
+                                BinOp::Eq,
+                                Box::new(Expr::Call {
+                                    name: "__rmc_vec_len".into(),
+                                    args: vec![recv_expr],
+                                    arg_slots: Vec::new(),
+                                    ret_slot: -1,
+                                    ret_ty: Type::I64,
+                                }),
+                                Box::new(Expr::Int(0)),
+                            );
+                            continue;
+                        }
+                        if name == "push"
+                            && args.len() == 1
+                            && self.vec_names.contains(recv)
+                        {
+                            let recv_expr = e.clone();
+                            let width = self.vec_elem.get(recv).copied().unwrap_or(8);
+                            let value = Expr::Cast(Box::new(args.pop().unwrap()), Type::I64);
+                            e = Expr::Call {
+                                name: "__rmc_vec_push".into(),
+                                args: vec![recv_expr, value, Expr::Int(width)],
+                                arg_slots: Vec::new(),
+                                ret_slot: -1,
+                                ret_ty: Type::I64,
+                            };
                             continue;
                         }
                         if args.is_empty()
@@ -7427,6 +7716,53 @@ impl Parser {
                 // `Enum::Variant` or `Enum::Variant(args)` — resolved and
                 // range-checked by sema.
                 if self.eat(&Tok::ColonColon) {
+                    // `String::new()`, `String::with_capacity(k)` and
+                    // `String::from("lit")`: a growable byte buffer. A `String`
+                    // value is a `{len, bytes}` record (the `str` layout), so
+                    // only the constructors differ; the methods are handled at
+                    // the `let`/method sites. Recognised only in a `let`
+                    // initializer, like the `Vec` shapes.
+                    if name == "String" {
+                        let assoc = self.expect_ident()?;
+                        self.expect(Tok::LParen)?;
+                        let e = match assoc.as_str() {
+                            "new" => Expr::Call {
+                                name: "\u{0}strnew".into(),
+                                args: vec![Expr::Int(0)],
+                                arg_slots: Vec::new(),
+                                ret_slot: -1,
+                                ret_ty: Type::I64,
+                            },
+                            "with_capacity" => {
+                                let cap = self.parse_bracketed_expr()?;
+                                Expr::Call {
+                                    name: "\u{0}strnew".into(),
+                                    args: vec![cap],
+                                    arg_slots: Vec::new(),
+                                    ret_slot: -1,
+                                    ret_ty: Type::I64,
+                                }
+                            }
+                            "from" => {
+                                let a = self.parse_bracketed_expr()?;
+                                Expr::Call {
+                                    name: "\u{0}strfrom".into(),
+                                    args: vec![a],
+                                    arg_slots: Vec::new(),
+                                    ret_slot: -1,
+                                    ret_ty: Type::I64,
+                                }
+                            }
+                            other => {
+                                return Err(format!(
+                                    "at byte {}: unsupported `String::{other}` (only `String::new`, `String::with_capacity` and `String::from`)",
+                                    self.pos()
+                                ))
+                            }
+                        };
+                        self.expect(Tok::RParen)?;
+                        return Ok(e);
+                    }
                     // `Vec::with_capacity(k)` and `Vec::new()` allocate the
                     // backing store; the returned `Vec` value is the block
                     // address (an `i64`). Only these two constructors are

@@ -13,6 +13,7 @@ are no runtime type errors.
 | `bool`       | `true` or `false`                             |
 | `char`       | a Unicode scalar value (a 4-byte code point, held in an 8-byte slot) |
 | `str`        | a string (one word: a pointer to a `{len, bytes}` record) |
+| `String`     | a growable byte buffer; the same one-word record as `str` (see "String") |
 | `[T; N]`     | fixed-size array of `N` `T` elements, where `T` is a scalar, `str`, a reference, a struct, a payload enum or another array |
 | `(A, B)`     | a tuple of the given element types (an aggregate) |
 | `&T` `&mut T`| a reference to a `T` (one word)               |
@@ -1061,6 +1062,33 @@ materialised: `for v in &args` desugars to `for i in k..__rmc_nargs()` and
 argument itself. Each of these constructs is only recognised directly in a
 `let` initializer; used elsewhere it is a compile error naming the construct.
 
+### String
+
+A `String` is a growable heap byte buffer. Its value is the address of a
+`{len, bytes}` record, exactly what a `str` is, so `s.as_str()` is the value
+itself and every `str` method (`len`, `is_empty`, `starts_with`, `ends_with`,
+`contains`, comparison) works on a `String` unchanged. The capacity lives in the
+word *before* the length, so `s.capacity()` reads `-8`.
+
+| source                              | lowered to                                    |
+| ----------------------------------- | --------------------------------------------- |
+| `let s = String::new();`            | `__rmc_str_new(0)`; length and capacity `0`   |
+| `let s = String::with_capacity(k);` | `__rmc_str_new(k)`; capacity `k`              |
+| `let s = String::from("lit");`      | `__rmc_str_from(lit)`; copies the literal, capacity = its length |
+| `s.len()`                           | `__rmc_str_len(s)` (the record's first word)  |
+| `s.capacity()`                      | `__rmc_string_cap(s)` (the word before it)    |
+| `s.as_str()`                        | `s` itself (no copy)                          |
+| `s.push_str(x)`                     | `__rmc_str_push_str(s, x)`, result written back into `s` |
+| `s.push(c)`                         | `__rmc_str_push_char(s, c)`, result written back into `s` |
+
+Both pushes grow to `max(2*cap, needed)` and never below a minimum capacity of
+8, matching `std`'s `String` policy, and may move the record; the write-back
+keeps the binding pointing at the current record. `String::new`/`with_capacity`/
+`from` are recognised in a `let` initializer (with or without a `: String`
+annotation); `push_str`/`push` are only understood on a simple `String` binding.
+A `String` binding without one of those constructors, or any other `String`
+constructor, is a compile error.
+
 ### std paths
 
 Two `std` items are provided so ordinary Rust can be compiled unchanged:
@@ -1089,14 +1117,17 @@ error, since rmc compiles a single file and cannot resolve it.
 
 Traits, generics, borrowing, lifetimes, modules, closures,
 raw string literals (`r".."`), `f32`/`f64`, and the
-standard library beyond the two `std` paths above and the `Vec` shims. The
-integer widths (`u8`/`i8`/.../`u64`/`i64`/`usize`/`isize`) exist, but only as a
-value's width: a `let x: u8` binding and a `200u8` literal carry their width
-through arithmetic, yet rmc has no `u8`-*typed* `b'A'` (a byte literal is an
-`i64`, unlike rustc's `u8`), and a width larger than 64 bits (`u128`/`i128`) is
-treated as `i64`. A `Vec` is not a real container: only the
+standard library beyond the two `std` paths above, the `Vec` shims and
+`String`. The integer widths (`u8`/`i8`/.../`u64`/`i64`/`usize`/`isize`) exist,
+but only as a value's width: a `let x: u8` binding and a `200u8` literal carry
+their width through arithmetic, yet rmc has no `u8`-*typed* `b'A'` (a byte
+literal is an `i64`, unlike rustc's `u8`), and a width larger than 64 bits
+(`u128`/`i128`) is treated as `i64`. A `Vec` is not a real container: only the
 handful of shapes in "Vec shims" are recognised, and any other `Vec` method or
-use is a compile error. A `char` is a scalar, but its full `char` API
+use is a compile error. A `String` is a growable byte buffer, but only the
+constructors and methods in "String" are understood; the rest of the `String`
+API (`insert`, `replace`, `split`, `format!`, ...) is not provided. A `char` is
+a scalar, but its full `char` API
 (`char::from_u32`, `is_alphabetic`, `to_digit`, ...) is not provided, and
 `char` may not be cast from an integer (`i64 as char` is rejected, as in
 rustc). References exist (`&T` / `&mut T`, `&e`, `*e`, `*e = v`),

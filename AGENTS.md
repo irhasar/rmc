@@ -2149,22 +2149,38 @@ be exchanged at a variable, parameter, struct-field, enum-variant-field or
 comparison site; there is no lifetime checking, so a `&'static str` field or
 `&str` parameter may be written `str`.
 
-There is no `Vec`, but the parser folds the few shapes the corpus uses to an
-`i64` address: `Vec::with_capacity(k)`/`Vec::new()` become `alloc(k * 8)`,
-`vec![e; n]` becomes `alloc(n * elem_width)` plus a `__rmc_fill` (or
-`__rmc_fill_bytes` for a one-byte element, which fills `n` bytes with `rep stosb`
-rather than `n` words), `v.capacity()`/`v.len()`
-fold to the constant count, and `v.as_mut_ptr()` keeps the address so a later
-`.add(off)` is `p + off * elem`, scaling by the element width from the `Vec<T>`
-annotation (`Vec<u8>` stays byte-addressed, and a `type Byte = u8` alias is
-chased to its target). A `vec![a, b, c]` *list* allocates one slot per element
-and stores each; an element that names the binding being defined (`let x = 5;
-let x: Vec<i64> = vec![x];`) must read the *outer* value, so when
-`expr_mentions_name` finds such an element each is evaluated into a
-`\0vt`-prefixed temporary before the binding is declared, and the common case
-stores each element directly. Each shape is recognised only directly
-in a `let` initializer; anywhere else the `\0`-prefixed parser marker reaches
-sema, which reports the source construct (see the `\0vecnew` arm). An
+There is no `Vec` type in sema, but the parser lowers the supported shapes to
+runtime helpers that keep a real growable vector. A `Vec<T>` *value* is the
+address of its element store; a two-word header `{length, capacity}` sits
+immediately before that address, so `.as_ptr()`/`.as_mut_ptr()` is the value
+itself and `v[i]` is `*(v + i * elem)` with no header offset. Three helpers in
+`runtime.rs` implement the model: `__rmc_vec_new(cap, width)` allocates
+`16 + cap * width` bytes, writes the header and returns the data address;
+`__rmc_vec_push(vec, value, width)` appends one element, growing (doubling, with
+`std`'s minimum non-zero capacity of 8 for a one-byte element and 4 otherwise)
+by `alloc`ing a fresh block, copying the old elements and returning the *new*
+address; `__rmc_vec_len(vec)` reads the length word. `__rmc_vec_cap` reads the
+capacity word.
+
+The parser recognises each shape in a `let` initializer: `Vec::new()` and
+`Vec::with_capacity(k)` call `__rmc_vec_new`, `vec![e; n]` calls
+`__rmc_vec_new(n, width)` plus a `__rmc_fill` (or `__rmc_fill_bytes` for a
+one-byte element, which fills `n` bytes with `rep stosb` rather than `n` words),
+and `vec![a, b, c]` reserves `__rmc_vec_new(3, width)` then one `__rmc_vec_push`
+per element. `v.len()`/`v.capacity()` become runtime loads (never constant
+folds, so they stay correct after a `push` grows the vector), `v.is_empty()` is
+`__rmc_vec_len(v) == 0`, and `v.push(x)` is `__rmc_vec_push(v, x, width)`.
+Because a grow can move the store, the push result (the new address) is written
+back into the receiver: `expr_stmt` rewrites a `v.push(x);` statement whose
+receiver is a simple `v` binding into `v = __rmc_vec_push(v, x, width)`. That
+write-back lives in `expr_stmt`, which both the block-body statement path and
+`parse_stmt_into` call, so the assignment is emitted wherever the statement
+appears. `v[i]` is the element read through the store, and `v.as_mut_ptr()`
+keeps the address so a later `.add(off)` is `p + off * elem`, scaling by the
+element width from the `Vec<T>` annotation (`Vec<u8>` stays byte-addressed, and
+a `type Byte = u8` alias is chased to its target). Each shape is recognised only
+directly in a `let` initializer; anywhere else the `\0`-prefixed parser marker
+reaches sema, which reports the source construct (see the `\0vecnew` arm). An
 args-vector is never built: `std::env::args()...collect()` records the binding,
 `for v in &args` desugars to `for i in skip..__rmc_nargs()`, and `args[i]`
 becomes `__rmc_arg_or(i + skip, 0, 0, 0)`. The `__rmc_arg_or`, `__rmc_nargs`,
@@ -2186,6 +2202,35 @@ and rustc allows the raw form) and an integer/pointer coerce both ways, matching
 the existing `i64 as &T` extension; a shared reference still may not become a
 `&mut` one.
 
+The three `for` forms over a vector desugar to index loops, all bounded by
+`__rmc_vec_len(v)` read once at the loop head: `for x in &v` binds `x` to
+`&v[i]`, `for x in v.iter()`/`iter_mut()` map onto the `&v`/`&mut v` forms, and
+`for x in v` binds the vector's address to a hidden `\0fv` local before the loop
+and reads each element by value, so a `push` in the body grows the original
+binding without moving the bound.
+
+`String` is a growable byte buffer with no `std` type in sema: its *value* is the
+address of a `{len, bytes}` record, exactly what a `str` is, so `s.as_str()` is
+the value itself and every `str` helper (`__rmc_str_len`, `__rmc_write_str`,
+`__rmc_str_lt`, `__rmc_str_starts`, ...) reads a `String` with no change, and a
+`String` compares byte-wise against a `str` or another `String` through the
+existing `str` compare. The capacity is the word *before* the length: the block
+is `[cap][len][bytes...]`, the value points at `[len]`, and `s.capacity()` reads
+`-8`. `__rmc_str_new(cap)` allocates and returns the empty record,
+`__rmc_str_from(src)` copies a `str` record (so `String::from("lit")` is owned
+and growable, with capacity equal to the literal's length, as in `std`),
+`__rmc_str_push_str(s, src)` and `__rmc_str_push_char(s, cp)` append (the latter
+UTF-8-encodes the code point into a stack scratch), and `__rmc_string_cap(s)`
+reads the capacity. Both push helpers grow to `max(2*cap, needed)`, never below
+the minimum capacity of 8 (`std`'s `String` policy), and return the possibly
+moved record; `expr_stmt` writes that result back into a simple receiver
+binding, as it does for a `Vec` push. The parser recognises `String::new`,
+`String::with_capacity` and `String::from` in a `let` initializer (the
+`\0strnew`/`\0strfrom` markers) and rewrites the `capacity`/`as_str`/`push_str`/
+`push` methods on a name in `string_names`; `len`, `is_empty`, `starts_with`,
+`ends_with` and `contains` are left to the `str` handling in sema, because the
+layout is identical.
+
 A byte *referent* is tracked. `*const u8`, `*mut u8` and `*mut i8` parse to
 `Type::U8`/`Type::I8` (through `parse_referent_type`, so a `type Byte = u8`
 alias works), and only there: the byte-ness is a property of the pointer, not of
@@ -2203,8 +2248,8 @@ scalar `match` compares against an `i64` pattern (the `PatScrutinee` deref also
 normalises with `byte_value_ty`, while leaving `U8`/`I8` on the node for the load
 width).
 
-The `Vec`/pointer name tables (`vec_names`, `vec_elem`, `vec_len`, `vec_cap`,
-`ptr_vars`, `args_vecs`) are lexically scoped like the nested-`fn` frames above:
+The `Vec`/pointer name tables (`vec_names`, `vec_elem`, `ptr_vars`,
+`args_vecs`) are lexically scoped like the nested-`fn` frames above:
 `parse_block_inner` pushes a frame onto `name_scopes` and every binding pushes an
 undo entry first (the `note_*` helpers), so `pop_name_scope` at block exit
 removes a binding the block introduced and restores one it shadowed. Without
