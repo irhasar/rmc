@@ -60,6 +60,9 @@ ARGS = {
     "srread": [["0"], ["1"], ["2"], ["7"], ["64"]],
     # float accumulates `n` half-steps; run the empty and non-empty loops.
     "float": [["0"], ["1"], ["5"], ["9"]],
+    # resenum builds a `Result` at runtime: n > 0 takes `Ok`, n <= 0 takes
+    # `Err`, so both the payload read and the failure arm are exercised.
+    "resenum": [["5"], ["0"]],
 }
 
 

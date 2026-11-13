@@ -1127,10 +1127,17 @@ fn collect_rv_tys(rv: &Rvalue, out: &mut BTreeSet<String>) {
         collect_struct_names(to, out);
     }
     // An enum variant names its enum in the path prefix (`a::E::A` -> `a::E`);
-    // that prefix must canonicalize with the enum's own type spelling.
+    // that prefix must canonicalize with the enum's own type spelling. Drop the
+    // generic arguments first: the two renderers disagree on how much of the
+    // enum's path they print, so `--emit=mir` writes a construction as the bare
+    // `Result::<i64, String>::Ok` while the local's type is the qualified
+    // `std::result::Result<..>`. `strip_generics` leaves the bare `Result`,
+    // which the reconciliation below can then match to the type's spelling;
+    // keeping the arguments (`Result::<i64, String>`) would leave it looking
+    // like a complete path that never adopts anything.
     if let Rvalue::Enum { name, ops } = rv {
         if let Some(prefix) = name.rsplit_once("::").map(|(p, _)| p) {
-            out.insert(prefix.to_string());
+            out.insert(strip_generics(prefix));
         }
         for op in ops {
             collect_op_tys(op, out);
@@ -1233,7 +1240,11 @@ fn rename_rv_tys(rv: &mut Rvalue, canon: &BTreeMap<String, String>) {
     }
     if let Rvalue::Enum { name, ops } = rv {
         if let Some((prefix, variant)) = name.rsplit_once("::") {
-            if let Some(c) = canon.get(prefix) {
+            // Look the prefix up with its generic arguments dropped, matching
+            // the key `collect_rv_tys` inserted; the canonical identity carries
+            // no generics, so the rewrite drops them too (the parser's
+            // `split_ev` strips them regardless).
+            if let Some(c) = canon.get(&strip_generics(prefix)) {
                 *name = format!("{c}::{variant}");
             }
         }
