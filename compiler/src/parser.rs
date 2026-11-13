@@ -17,6 +17,8 @@ enum NameScope {
     VecElem(String, Option<i64>),
     /// `vec_elem_ty`: the element type a binding shadowed, if any.
     VecElemTy(String, Option<Type>),
+    /// `vec_mut`: the mutability a binding shadowed, if any.
+    VecMut(String, Option<bool>),
     Ptr(String, Option<i64>),
     /// `args_vecs`: a `std::env::args()...collect()` binding.
     ArgsVec(String, Option<i64>),
@@ -202,6 +204,11 @@ pub struct Parser {
     /// reads as `i64` (its `vec_elem` width carries any narrowing). Without
     /// this, `v[i]` on a `Vec<Struct>` was typed `i64` and rejected.
     vec_elem_ty: std::collections::HashMap<String, Type>,
+    /// Whether each `Vec<T>` binding was declared `mut`. A `v[i] = x` write is
+    /// rejected by sema only when the element reference is shared, so the index
+    /// lowering forms `&mut` or `&` from this: a read-only binding yields a
+    /// shared reference and the write is rejected, matching rustc.
+    vec_mut: std::collections::HashMap<String, bool>,
     /// The element width of the most recently parsed `Vec<T>` type, so the
     /// `let` that consumes the type can record it against the binding name.
     /// Only `Vec` bindings read it, and they always follow their annotation.
@@ -210,6 +217,11 @@ pub struct Parser {
     /// a struct or enum name (else `None`). Consumed alongside
     /// `vec_elem_pending`.
     vec_elem_pending_ty: Option<Type>,
+    /// Whether `--bounds-checks` is on. A `v[i]` on a `Vec` then lowers through
+    /// the runtime's `__rmc_vec_at`, which traps on an out-of-range index
+    /// instead of reading past the element store. Off by default, so the index
+    /// is plain pointer arithmetic.
+    bounds_checks: bool,
     /// Names bound to a `String` (a growable byte buffer). A `String` value is
     /// the address of a `{len, bytes}` record, so it shares `str`'s layout and
     /// only its methods (`push_str`, `push`, `capacity`, `as_str`) and its
@@ -355,14 +367,22 @@ impl Parser {
             ptr_vars: std::collections::HashMap::new(),
             vec_elem: std::collections::HashMap::new(),
             vec_elem_ty: std::collections::HashMap::new(),
+            vec_mut: std::collections::HashMap::new(),
             vec_elem_pending: None,
             vec_elem_pending_ty: None,
+            bounds_checks: false,
             string_names: std::collections::HashSet::new(),
             arr_elem: std::collections::HashMap::new(),
             alias_target: std::collections::HashMap::new(),
             name_scopes: Vec::new(),
             in_prelude: false,
         }
+    }
+
+    /// Turn on `--bounds-checks` for `v[i]` on a `Vec`.
+    pub fn bounds_checks(mut self, on: bool) -> Self {
+        self.bounds_checks = on;
+        self
     }
 
     /// Count one level of nesting and fail past `MAX_DEPTH`.
@@ -1245,6 +1265,27 @@ impl Parser {
         // the named ones, exactly as the program's struct list carries both.
         let mut all = structs;
         all.extend(self.tuple_defs.iter().cloned());
+        // `parse_program` injects the `Option`/`Result` prelude *after* this
+        // pass runs, so a user struct with an `Option<i64>` field would name a
+        // type sema's layout cannot see, failing the whole batch. Inject the
+        // prelude's enum definitions here too, under the same condition
+        // `parse_program` uses (the user owning no `Option`/`Result` struct or
+        // enum): a genuinely unresolvable field then fails alone and an
+        // unrelated `Vec<P>` keeps its size.
+        let user_owns = all
+            .iter()
+            .map(|s| s.name.as_str())
+            .chain(enums.iter().map(|e| e.name.as_str()))
+            .any(|n| n == "Option" || n == "Result");
+        if !self.in_prelude && !user_owns {
+            if let Ok(toks) = crate::lexer::lex(OPTION_RESULT_PRELUDE) {
+                let mut inner = Parser::new(toks);
+                inner.in_prelude = true;
+                if let Ok(pre) = inner.parse_program() {
+                    enums.extend(pre.enums);
+                }
+            }
+        }
         if let Ok((sizes, esizes)) = crate::sema::layout_sizes(&all, &enums) {
             self.struct_sizes = sizes;
             self.enum_sizes = esizes;
@@ -2239,6 +2280,7 @@ impl Parser {
         if let Some(frame) = self.name_scopes.last_mut() {
             frame.push(NameScope::VecElem(name.to_string(), self.vec_elem.get(name).copied()));
             frame.push(NameScope::VecElemTy(name.to_string(), self.vec_elem_ty.get(name).cloned()));
+            frame.push(NameScope::VecMut(name.to_string(), self.vec_mut.get(name).copied()));
         }
     }
     fn note_ptr(&mut self, name: &str) {
@@ -2290,6 +2332,14 @@ impl Parser {
                         }
                         None => {
                             self.vec_elem_ty.remove(&n);
+                        }
+                    },
+                    NameScope::VecMut(n, prev) => match prev {
+                        Some(v) => {
+                            self.vec_mut.insert(n, v);
+                        }
+                        None => {
+                            self.vec_mut.remove(&n);
                         }
                     },
                     NameScope::Ptr(n, prev) => match prev {
@@ -3148,6 +3198,23 @@ impl Parser {
             mutable: false,
         };
         (stmt, e_name)
+    }
+
+    /// Reject a `Vec<T>` whose element is a zero-sized aggregate. rmc stores an
+    /// aggregate element inline by negating its width, but `-0` is `0`, so the
+    /// runtime would take its scalar path and write a byte past the header. The
+    /// zero-sized type is a unit struct (`struct Z;`) or an empty braced struct
+    /// (`struct Z {}`); a unit *enum* is an eight-byte scalar, so it is fine.
+    fn reject_zst_vec_elem(&self, elem_ty: Option<&Type>) -> PResult<()> {
+        if let Some(t) = elem_ty {
+            if t.is_aggregate() && t.size() == 0 {
+                return Err(format!(
+                    "at byte {}: `Vec<{t:?}>` has a zero-sized element type, which rmc does not support",
+                    self.pos()
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Infer a `Vec` element type from its initializer when no annotation
@@ -5000,9 +5067,11 @@ impl Parser {
                         } else {
                             (elem_width, elem_ty)
                         };
+                        self.reject_zst_vec_elem(elem_ty.as_ref())?;
                         self.note_vec_name(&name);
                         self.note_vec_elem(&name);
                         self.vec_names.insert(name.clone());
+                        self.vec_mut.insert(name.clone(), mutable);
                         self.vec_elem.insert(name.clone(), elem_width);
                         if let Some(t) = &elem_ty {
                             self.vec_elem_ty.insert(name.clone(), t.clone());
@@ -5028,8 +5097,10 @@ impl Parser {
                             // `vec![value; count]`: `count` copies of `value`,
                             // length and capacity both `count`. An aggregate
                             // element is passed by address (its value already is
-                            // its address); a scalar is widened to a word.
-                            let elem_arg = if elem_ty.is_some() {
+                            // its address); a scalar, including a unit-enum
+                            // value, is widened to a word.
+                            let agg = elem_ty.as_ref().map_or(false, |t| t.is_aggregate());
+                            let elem_arg = if agg {
                                 args[0].clone()
                             } else {
                                 Expr::Cast(Box::new(args[0].clone()), Type::I64)
@@ -5039,11 +5110,7 @@ impl Parser {
                                 args: vec![
                                     n_expr,
                                     elem_arg,
-                                    Expr::Int(if elem_ty.is_some() {
-                                        -elem_width
-                                    } else {
-                                        elem_width
-                                    }),
+                                    Expr::Int(if agg { -elem_width } else { elem_width }),
                                 ],
                                 arg_slots: Vec::new(),
                                 ret_slot: -1,
@@ -5079,9 +5146,15 @@ impl Parser {
                         } else {
                             (elem_width, elem_ty)
                         };
+                        // Only a genuinely aggregate element (a struct, a payload
+                        // enum, an array) is stored by address; a unit-enum value
+                        // is an eight-byte scalar and widens to a word.
+                        let agg = elem_ty.as_ref().map_or(false, |t| t.is_aggregate());
+                        self.reject_zst_vec_elem(elem_ty.as_ref())?;
                         self.note_vec_name(&name);
                         self.note_vec_elem(&name);
                         self.vec_names.insert(name.clone());
+                        self.vec_mut.insert(name.clone(), mutable);
                         self.vec_elem.insert(name.clone(), elem_width);
                         if let Some(t) = &elem_ty {
                             self.vec_elem_ty.insert(name.clone(), t.clone());
@@ -5104,7 +5177,7 @@ impl Parser {
                                 // An aggregate element binds by address (a
                                 // temporary for a literal/field read); a scalar
                                 // widens to a word.
-                                let init = if elem_ty.is_some() {
+                                let init = if agg {
                                     elem.clone()
                                 } else {
                                     Expr::Cast(Box::new(elem.clone()), Type::I64)
@@ -5138,7 +5211,7 @@ impl Parser {
                             // widens to a word.
                             let value = if shadowed {
                                 Expr::Var { name: temps[i].clone(), slot: -1, ty: Type::I64 }
-                            } else if elem_ty.is_some() {
+                            } else if agg {
                                 elem.clone()
                             } else {
                                 Expr::Cast(Box::new(elem.clone()), Type::I64)
@@ -5148,11 +5221,7 @@ impl Parser {
                                 args: vec![
                                     base.clone(),
                                     value,
-                                    Expr::Int(if elem_ty.is_some() {
-                                        -elem_width
-                                    } else {
-                                        elem_width
-                                    }),
+                                    Expr::Int(if agg { -elem_width } else { elem_width }),
                                 ],
                                 arg_slots: Vec::new(),
                                 ret_slot: -1,
@@ -6351,16 +6420,31 @@ impl Parser {
                             None => self.vec_elem.get(recv).copied().unwrap_or(8),
                         };
                         let recv_expr = e.clone();
-                        let off = if stride == 1 {
-                            idx
+                        let addr = if self.bounds_checks {
+                            // The runtime helper checks `idx` against the
+                            // vector's live length (in the header just before
+                            // the store) and traps when out of range, so `v[i]`
+                            // cannot read or write past the allocation. The
+                            // index is evaluated exactly once, inside the call.
+                            Expr::Call {
+                                name: "__rmc_vec_at".into(),
+                                args: vec![recv_expr, idx, Expr::Int(stride)],
+                                arg_slots: Vec::new(),
+                                ret_slot: -1,
+                                ret_ty: Type::I64,
+                            }
                         } else {
-                            Expr::Bin(
-                                BinOp::Mul,
-                                Box::new(idx),
-                                Box::new(Expr::Int(stride)),
-                            )
+                            let off = if stride == 1 {
+                                idx
+                            } else {
+                                Expr::Bin(
+                                    BinOp::Mul,
+                                    Box::new(idx),
+                                    Box::new(Expr::Int(stride)),
+                                )
+                            };
+                            Expr::Bin(BinOp::Add, Box::new(recv_expr), Box::new(off))
                         };
-                        let addr = Expr::Bin(BinOp::Add, Box::new(recv_expr), Box::new(off));
                         // The referent carries the element type so codegen loads
                         // the right width and, for an aggregate, addresses the
                         // element in place (a struct element is not a word, so a
@@ -6371,14 +6455,16 @@ impl Parser {
                             None if stride == 1 => (Type::U8, Type::I64),
                             None => (Type::I64, Type::I64),
                         };
-                        // A `Vec` element is a mutable place (`v[i] = x` writes
-                        // it), so the reference is `&mut` even when the binding
-                        // is read-only: the binding's own mutability is what
-                        // rustc checks, and sema enforces that separately.
+                        // A `Vec` element is a place: `v[i] = x` writes it and
+                        // `v[i]` reads it. The reference's mutability mirrors the
+                        // binding's, so a write through a read-only binding is a
+                        // shared-reference write that sema rejects (`v` is not
+                        // `mut`), exactly as rustc does, while a read stays fine.
+                        let ref_mut = self.vec_mut.get(recv).copied().unwrap_or(true);
                         e = Expr::Deref {
                             expr: Box::new(Expr::Cast(
                                 Box::new(addr),
-                                Type::Ref(Box::new(ptr_ty), true),
+                                Type::Ref(Box::new(ptr_ty), ref_mut),
                             )),
                             ty: val_ty,
                         };
@@ -6536,7 +6622,15 @@ impl Parser {
                             && self.vec_names.contains(recv)
                         {
                             let recv_expr = e.clone();
-                            let agg = self.vec_elem_ty.contains_key(recv);
+                            // Only a genuinely aggregate element (a struct, a
+                            // payload enum, an array) travels by address; a
+                            // *unit* enum is an eight-byte scalar, so it must
+                            // widen to a word like any other scalar, not be
+                            // passed as an address.
+                            let agg = self
+                                .vec_elem_ty
+                                .get(recv)
+                                .map_or(false, |t| t.is_aggregate());
                             let width = match self.vec_elem_ty.get(recv) {
                                 Some(t) => t.size() as i64,
                                 None => self.vec_elem.get(recv).copied().unwrap_or(8),

@@ -1035,6 +1035,20 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   adjacent memory. A field store through a shared `&T` is rejected by
   `place_writable` ("cannot assign through a shared reference; use `&mut`"), and
   a `&mut` binding itself is not reassignable unless declared `mut`.
+- **`--bounds-checks` covers `v[i]` on a `Vec`, not just a fixed array.** An
+  array's length is static, so `check_bounds` folds it in codegen; a `Vec`'s
+  length is a runtime header word, so under `--bounds-checks` the parser lowers
+  `v[i]` through `__rmc_vec_at(vector, index, stride)`, which reads the live
+  length and traps (`jae __rmc_bounds`) before forming the address. Without this
+  the index was plain pointer arithmetic and read or wrote past the store even
+  with the flag on. The index is evaluated exactly once, inside the call, so a
+  base or index with a side effect still runs once, in order. `run.py`'s
+  `vec_read`/`vec_store`/`vec_struct` trap cases pin it under a plain `ld` link.
+- **A `v[i] = x` write needs a `mut` binding.** The index lowering forms the
+  element reference `&mut` or `&` from the binding's own mutability (`vec_mut`),
+  so a write through a read-only binding is a shared-reference write that sema
+  rejects, exactly as rustc does, while a read stays fine. (The earlier code
+  hardcoded `&mut`, so `let v: Vec<i64> = vec![..]; v[0] = 1;` was accepted.)
 - **Assignment evaluates its value before its place.** rustc orders assignment
   operands right-to-left (the one expression that does), so `a[li(1)] = li(5)`
   must run `li(5)` before `li(1)`. Codegen's general index/deref store path and
@@ -2624,3 +2638,26 @@ parser and sema therefore agree by construction. A definition sema will reject
 the `Vec<T>` annotation falls back to the word width and sema reports the real
 error. The re-parse must save/restore `self.i` and is read-only apart from the
 `tuple_defs` it legitimately produces for tuple fields.
+
+Because `parse_program` injects the `Option`/`Result` prelude *after* this pass,
+a struct with a prelude-typed field (`struct W { value: Option<i64> }`) would name
+a type `layout_sizes` cannot see. That one failure rejects the whole batch, so
+*every* struct size is dropped and an unrelated `Vec<P>` silently reverts to a
+word stride. The size pass therefore injects the prelude's enum definitions too,
+under the same condition `parse_program` uses (the user owning no `Option`/
+`Result` struct or enum), so a bad field fails alone. `vecoption.rs` pins this.
+
+A `Vec<T>` element is stored by address only when `T` is a genuine aggregate
+(`is_aggregate`: struct, payload enum, array). A *unit* enum is an eight-byte
+scalar, so `Vec<Color>` must widen each element to a word on `push`/`repeat`/
+`vec![..]`; treating it as an address stored a pointer and lost the tag
+(`vecenumunit.rs`). A zero-sized aggregate element (`struct Z;`) is rejected:
+the runtime marks an aggregate by *negating* its width, but `-0` is `0`, so it
+would take the scalar path and write past the header.
+
+Two more element checks live in sema's call check, keyed on the width the
+constructors pass as the helper's last argument. `__rmc_vec_push`/
+`__rmc_vec_repeat` must see an element whose size equals the vector's stride
+(a `v.push(Q{..})` on a `Vec<P>` is otherwise accepted and copies the wrong byte
+count), and a scalar element is cast to a word so its type need not match the
+declared `I64`.

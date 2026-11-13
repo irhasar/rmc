@@ -685,6 +685,11 @@ constant local, `let i = -1; a[i]`) is rejected at compile time whether or not
 it is assigned at most once and never taken by `&mut`, the same rule rustc uses,
 so `let mut i = -1; i = 0; a[i]` stays a runtime (checked) index.
 
+`--bounds-checks` also covers `v[i]` on a supported `Vec`, whose length is only
+known at run time: the index is checked against the vector's live length and an
+out-of-range one traps the same way. Writing `v[i] = x` requires the binding to
+be `mut`, as in rustc; a read through a read-only binding is fine.
+
 By default integer arithmetic wraps, as in release-mode Rust. Compiling with
 `--overflow-checks` (or `CompileOptions { overflow_checks: true }` from the
 library) inserts a trap after every `+`, `-` and `*`, and range-checks every
@@ -1046,9 +1051,11 @@ with a length or capacity field, so only the methods below are understood.
 | `let a: Vec<i64> = std::env::args().skip(k).map(..).collect();` | no allocation at all (see below) |
 
 `vec![e; n]` takes a runtime `n`; `alloc` and the fill helper both take it as a
-value, and the allocation is `n * elem_width` bytes (`elem_width` is 1 for a
-`u8`/`i8` element and 8 otherwise, so a `Vec<u8>` allocates `n` bytes and a
-`Vec<i64>` `n` words). A `vec![a, b, c]` list allocates one slot per element and
+value, and the allocation is `n * elem_width` bytes (`elem_width` is the
+element's byte size: 1 for a `u8`/`i8` element, 8 for a scalar or a unit enum,
+and the struct/payload-enum size for an aggregate element stored inline, so a
+`Vec<u8>` allocates `n` bytes and a `Vec<i64>` `n` words). A `vec![a, b, c]`
+list allocates one slot per element and
 stores each (one byte for a `u8`/`i8` element, one word otherwise); `.len()` and
 `.capacity()` fold to the element count. An element that names the binding being
 defined (`let x = 5; let x: Vec<i64> = vec![x];`) reads the *outer* value, as

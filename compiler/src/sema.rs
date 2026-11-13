@@ -224,7 +224,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     // Runtime helpers provided by the freestanding assembly runtime. They are
     // linked in automatically, so they do not appear in the source program.
-    let builtins: [(&str, &[Type], Type); 48] = [
+    let builtins: [(&str, &[Type], Type); 49] = [
         ("print_i64", &[Type::I64], Type::Unit),
         ("print_str", &[Type::Str], Type::Unit),
         ("print_bool", &[Type::Bool], Type::Unit),
@@ -265,6 +265,9 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         ("__rmc_vec_repeat", &[Type::I64, Type::I64, Type::I64], Type::I64),
         ("__rmc_vec_push", &[Type::I64, Type::I64, Type::I64], Type::I64),
         ("__rmc_vec_len", &[Type::I64], Type::I64),
+        // The checked `v[i]` under `--bounds-checks`: `(vector, index, stride)`
+        // yields the element address, trapping on an out-of-range index.
+        ("__rmc_vec_at", &[Type::I64, Type::I64, Type::I64], Type::I64),
         ("__rmc_vec_cap", &[Type::I64], Type::I64),
         // The growable-`String` helpers. A `String` value is the address of a
         // `{len, bytes}` record — the same shape a `str` is — so every `str`
@@ -3266,6 +3269,24 @@ impl Sema {
                     ));
                 }
                 arg_slots.clear();
+                // `__rmc_vec_push`/`__rmc_vec_repeat` carry the element as
+                // their second argument and its byte width (negated for an
+                // aggregate) as their last. The width must agree with the
+                // element value's own size, or the runtime would copy the wrong
+                // number of bytes — reading past a narrower temporary, or
+                // writing past the destination. A mismatch means the pushed
+                // value is not the vector's element type (`v.push(Q{..})` for a
+                // `Vec<P>`), which rustc rejects.
+                let vec_helper = name.as_str() == "__rmc_vec_push"
+                    || name.as_str() == "__rmc_vec_repeat";
+                let elem_width = if vec_helper {
+                    match args.last() {
+                        Some(Expr::Int(w)) => Some(*w),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 for (i, (a, p)) in args.iter_mut().zip(sig.params.iter()).enumerate() {
                     let t = if (is_int_literal(a) && matches!(p, Type::Int { .. }))
                         || matches!(p, Type::Array(..))
@@ -3279,10 +3300,19 @@ impl Sema {
                     // their second argument: a scalar travels as a word, but an
                     // aggregate travels as its address, so its type need not
                     // match the declared `I64`.
-                    let vec_elem_arg = matches!(
-                        name.as_str(),
-                        "__rmc_vec_push" | "__rmc_vec_repeat"
-                    ) && i == 1;
+                    let vec_elem_arg = vec_helper && i == 1;
+                    // An aggregate element must match the vector's element size
+                    // exactly, or the runtime copies the wrong byte count (past a
+                    // narrower temporary, or past the destination).
+                    if let (true, Some(w)) = (vec_elem_arg, elem_width) {
+                        if t.is_aggregate() && w.abs() != t.size() as i64 {
+                            return Err(format!(
+                                "`{name}`: element of {} bytes does not match the vector's element size of {}",
+                                t.size(),
+                                w.abs()
+                            ));
+                        }
+                    }
                     if !(vec_elem_arg && t.is_aggregate())
                         && &t != p
                         && t != Type::Never

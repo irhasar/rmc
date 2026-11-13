@@ -1163,6 +1163,27 @@ __rmc_vec_cap:
     },
     Piece {
         text: r#"
+# rdi = vector, rsi = index, rdx = element stride  ->  rax = element address.
+# The checked `v[i]`: reads the length from the header just before the store and
+# traps (like a Rust panic) when the index is out of range, so a bad index can
+# never read or write past the allocation. An unsigned `jae` also catches a
+# negative index, which is an enormous unsigned value. Only linked when a
+# `--bounds-checks` build lowers a `Vec` index through it.
+.globl __rmc_vec_at
+.type __rmc_vec_at, @function
+__rmc_vec_at:
+    mov -16(%rdi), %rax       # length
+    cmp %rax, %rsi
+    jae __rmc_bounds
+    imul %rdx, %rsi           # index * stride
+    lea (%rdi,%rsi), %rax
+    ret
+.size __rmc_vec_at, .-__rmc_vec_at
+"#,
+        defines: &["__rmc_vec_at"],
+    },
+    Piece {
+        text: r#"
 # A `String` is a growable heap byte buffer. Its *value* is the address of a
 # `{len, bytes}` record, exactly what a `str` is, so `s.as_str()` is the value
 # itself and every `str` helper (`__rmc_str_len`, `__rmc_write_str`,

@@ -114,6 +114,13 @@ def check_bounds_traps(combos):
         "field": ("struct S { n: i64, a: [i64; 3] } fn f(i: i64) -> i64 { let s: S = S { n: 0, a: [4, 5, 6] }; s.a[i] } fn main() { let _ = f(5); }", b""),
         "store": ("fn f(i: i64) -> i64 { let mut a: [i64; 3] = [1, 2, 3]; a[i] = 9; a[0] } fn main() { let _ = f(4); }", b""),
         "array_ref": ("fn f(i: i64) -> i64 { let a: [i64; 3] = [1, 2, 3]; let r: &[i64; 3] = &a; r[i] } fn main() { let _ = f(9); }", b""),
+        # A `Vec` index must trap too: `v[i]` used to be plain pointer
+        # arithmetic with no check even under `--bounds-checks`, so it read or
+        # wrote past the store. Read, write, and an aggregate element (whose
+        # stride is its size) each get a case.
+        "vec_read": ("fn f(i: i64) -> i64 { let v: Vec<i64> = vec![1, 2, 3]; v[i] } fn main() { let _ = f(3); }", b""),
+        "vec_store": ("fn f(i: i64) -> i64 { let mut v: Vec<i64> = vec![1, 2, 3]; v[i] = 9; v[0] } fn main() { let _ = f(4); }", b""),
+        "vec_struct": ("struct P { x: i64, y: i64 } fn f(i: i64) -> i64 { let v: Vec<P> = vec![P { x: 1, y: 2 }]; v[i].x } fn main() { let _ = f(5); }", b""),
     }
     failures = 0
     for name, (src, want_stdout) in cases.items():

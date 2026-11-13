@@ -56,7 +56,9 @@ pub struct CompileOptions {
 /// `src`.
 pub fn compile_to_asm(src: &str, opts: &CompileOptions) -> Result<String, String> {
     let toks = lexer::lex(src)?;
-    let mut prog = parser::Parser::new(toks).parse_program()?;
+    let mut prog = parser::Parser::new(toks)
+        .bounds_checks(opts.bounds_checks)
+        .parse_program()?;
     sema::analyze(&mut prog)?;
     if !opts.no_inline {
         inline::run(&mut prog);
