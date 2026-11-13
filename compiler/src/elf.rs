@@ -469,10 +469,15 @@ impl Elf {
         };
         let ops = split_ops(rest);
         match mnem {
-            "mov" | "movq" | "movb" | "movabs" | "movzbq" | "movzbl" => self.enc_mov(mnem, &ops, sec),
+            "mov" | "movq" | "movb" | "movabs" | "movzbq" | "movzbl" | "movzbw"
+            | "movzwl" | "movzwq" | "movsbq" | "movsbl" | "movsbw" | "movswl"
+            | "movswq" | "movslq" => {
+                self.enc_mov(mnem, &ops, sec)
+            }
             "lea" => self.enc_lea(&ops, sec),
             "push" | "pop" => self.enc_push_pop(mnem, &ops, sec),
-            "add" | "addq" | "sub" | "and" | "or" | "xor" | "cmp" | "cmpq" | "test" => {
+            "add" | "addq" | "sub" | "subq" | "and" | "andq" | "or" | "orq"
+            | "xor" | "xorq" | "cmp" | "cmpq" | "test" | "testq" => {
                 self.enc_arith(mnem, &ops, sec)
             }
             "imul" => self.enc_imul(&ops, sec),
@@ -514,6 +519,28 @@ impl Elf {
             "sete" | "setne" | "setl" | "setle" | "setg" | "setge" | "setb" | "setbe" | "seta"
             | "setae" => self.enc_setcc(mnem, &ops, sec),
             "bswap" => self.enc_bswap(&ops, sec),
+            // The `rep`-prefixed forms the runtime emits: the two `stos` fills
+            // (`rep stosq` is `F3 48 AB`, `rep stosb` `F3 AA`) and the two
+            // `movs` copies (`rep movsb` is `F3 A4`, `rep movsq` `F3 48 A5`).
+            "rep" => match rest {
+                "stosq" => {
+                    self.sections[sec].data.extend_from_slice(&[0xf3, 0x48, 0xab]);
+                    Ok(())
+                }
+                "stosb" => {
+                    self.sections[sec].data.extend_from_slice(&[0xf3, 0xaa]);
+                    Ok(())
+                }
+                "movsb" => {
+                    self.sections[sec].data.extend_from_slice(&[0xf3, 0xa4]);
+                    Ok(())
+                }
+                "movsq" => {
+                    self.sections[sec].data.extend_from_slice(&[0xf3, 0x48, 0xa5]);
+                    Ok(())
+                }
+                other => Err(format!("elf: unsupported rep form `{other}`")),
+            },
             j if j.starts_with('j') => self.enc_jcc(j, &ops, sec),
             other => Err(format!("elf: unsupported instruction `{other}`")),
         }
@@ -529,47 +556,65 @@ impl Elf {
     fn enc_mov(&mut self, mnem: &str, ops: &[String], sec: usize) -> Result<(), String> {
         let (src, dst) = (ops[0].clone(), ops[1].clone());
         match mnem {
-            "movzbq" | "movzbl" => {
+            "movzbq" | "movzbl" | "movzbw" | "movzwl" | "movzwq" | "movsbq"
+            | "movsbl" | "movsbw" | "movswl" | "movswq" | "movslq" => {
+                // (opcode, whether the opcode is 0F-prefixed). The source width
+                // is implied by the mnemonic's shape, which `as` checks; the
+                // destination width follows the trailing `q`/`l`/`w`.
+                let (opcode, two_byte) = match mnem {
+                    "movzbq" | "movzbl" | "movzbw" => (0xB6u8, true),
+                    "movsbq" | "movsbl" | "movsbw" => (0xBE, true),
+                    "movzwl" | "movzwq" => (0xB7, true),
+                    "movswl" | "movswq" => (0xBF, true),
+                    "movslq" => (0x63, false),
+                    _ => unreachable!(),
+                };
+                let dst64 = mnem.ends_with('q');
+                let dst16 = mnem.ends_with('w');
                 let (dreg, _) = parse_reg(&dst)?;
-                let w = mnem == "movzbq";
-                if let Ok((sreg, s8)) = parse_reg(&src) {
-                    let mut rex = 0x40;
-                    if w {
-                        rex |= 0x08;
-                    }
-                    if dreg >= 8 {
-                        rex |= 0x04;
-                    }
-                    if sreg >= 8 {
-                        rex |= 0x01;
-                    }
-                    // A byte source of %sil/%dil needs the prefix even with no
-                    // extended register in play.
-                    if rex != 0x40 || (s8 && sreg >= 4) {
-                        self.sections[sec].data.push(rex);
-                    }
-                    self.sections[sec].data.extend_from_slice(&[0x0F, 0xB6]);
-                    modrm_reg_reg(&mut self.sections[sec].data, dreg, sreg);
-                    return Ok(());
-                }
-                let m = parse_mem(&src).ok_or_else(|| format!("elf: bad movz src `{src}`"))?;
+                // A 16-bit destination takes the `66` prefix; a 64-bit one takes
+                // REX.W. The two never combine.
                 let mut rex = 0x40;
-                if w {
+                if dst64 {
                     rex |= 0x08;
                 }
                 if dreg >= 8 {
                     rex |= 0x04;
                 }
+                let emit_prefixes = |out: &mut Vec<u8>, rex: u8, force_rex: bool| {
+                    if dst16 {
+                        out.push(0x66);
+                    }
+                    if rex != 0x40 || force_rex {
+                        out.push(rex);
+                    }
+                };
+                if let Ok((sreg, s8)) = parse_reg(&src) {
+                    if sreg >= 8 {
+                        rex |= 0x01;
+                    }
+                    // A byte source of %sil/%dil needs the prefix even with no
+                    // extended register in play.
+                    emit_prefixes(&mut self.sections[sec].data, rex, s8 && sreg >= 4);
+                    if two_byte {
+                        self.sections[sec].data.push(0x0F);
+                    }
+                    self.sections[sec].data.push(opcode);
+                    modrm_reg_reg(&mut self.sections[sec].data, dreg, sreg);
+                    return Ok(());
+                }
+                let m = parse_mem(&src).ok_or_else(|| format!("elf: bad movz src `{src}`"))?;
                 if m.base.map_or(false, |b| b >= 8) {
                     rex |= 0x01;
                 }
                 if m.index.map_or(false, |i| i >= 8) {
                     rex |= 0x02;
                 }
-                if rex != 0x40 {
-                    self.sections[sec].data.push(rex);
+                emit_prefixes(&mut self.sections[sec].data, rex, false);
+                if two_byte {
+                    self.sections[sec].data.push(0x0F);
                 }
-                self.sections[sec].data.extend_from_slice(&[0x0F, 0xB6]);
+                self.sections[sec].data.push(opcode);
                 emit_mem_modrm(&mut self.sections[sec].data, &m, dreg);
                 if let Some(sym) = m.rip_label.clone() {
                     let len = self.sections[sec].data.len();
@@ -1105,6 +1150,22 @@ fn parse_reg(s: &str) -> Result<(u8, bool), String> {
         "r13b" => (13, true),
         "r14b" => (14, true),
         "r15b" => (15, true),
+        "ax" => (0, false),
+        "cx" => (1, false),
+        "dx" => (2, false),
+        "bx" => (3, false),
+        "sp" => (4, false),
+        "bp" => (5, false),
+        "si" => (6, false),
+        "di" => (7, false),
+        "r8w" => (8, false),
+        "r9w" => (9, false),
+        "r10w" => (10, false),
+        "r11w" => (11, false),
+        "r12w" => (12, false),
+        "r13w" => (13, false),
+        "r14w" => (14, false),
+        "r15w" => (15, false),
         other => return Err(format!("elf: unknown register `%{other}`")),
     };
     Ok(r)
@@ -1398,6 +1459,56 @@ mod tests {
             abs_imm: Vec::new(),
             text_idx: 0,
         }
+    }
+
+    fn encode_one(line: &str) -> Vec<u8> {
+        let mut e = test_elf(0x5);
+        e.instruction(line, 0).expect("encodes");
+        e.sections[0].data[3..].to_vec()
+    }
+
+    #[test]
+    fn movzbq_loads_a_byte_and_zero_extends() {
+        // `movzbq (%rax), %rax`: REX.W 0F B6 /r. A plain `mov` would read eight
+        // bytes, which is the byte-pointer bug this encoding exists to fix.
+        assert_eq!(encode_one("movzbq (%rax), %rax"), [0x48, 0x0F, 0xB6, 0x00]);
+    }
+
+    #[test]
+    fn movsbq_loads_a_byte_and_sign_extends() {
+        // `movsbq (%rax), %rax`: REX.W 0F BE /r, the sign-extending twin.
+        assert_eq!(encode_one("movsbq (%rax), %rax"), [0x48, 0x0F, 0xBE, 0x00]);
+    }
+
+    #[test]
+    fn movsbl_stays_32_bit_without_rex_w() {
+        // The `movzbl`/`movsbl` width follows the destination register, so the
+        // 32-bit form carries no REX.W.
+        assert_eq!(encode_one("movsbl (%rax), %eax"), [0x0F, 0xBE, 0x00]);
+    }
+
+    #[test]
+    fn movslq_sign_extends_a_32_bit_register() {
+        // `movslq %eax, %rax`: REX.W 63 /r, the sign-extending load an `i32`
+        // division needs to widen its result back to a full register.
+        assert_eq!(encode_one("movslq %eax, %rax"), [0x48, 0x63, 0xC0]);
+        assert_eq!(encode_one("movslq %eax, %r14"), [0x4C, 0x63, 0xF0]);
+    }
+
+    #[test]
+    fn movswq_and_movzwq_extend_a_16_bit_register() {
+        // `movswq %ax, %rax`: REX.W 0F BF /r; the zero-extending twin uses 0F
+        // B7. A 16-bit destination would take the `66` prefix instead of REX.W.
+        assert_eq!(encode_one("movswq %ax, %rax"), [0x48, 0x0F, 0xBF, 0xC0]);
+        assert_eq!(encode_one("movzwq %ax, %rax"), [0x48, 0x0F, 0xB7, 0xC0]);
+        assert_eq!(encode_one("movzwq %ax, %r13"), [0x4C, 0x0F, 0xB7, 0xE8]);
+        assert_eq!(encode_one("movzwl %ax, %eax"), [0x0F, 0xB7, 0xC0]);
+    }
+
+    #[test]
+    fn movb_stores_only_the_low_byte() {
+        // `movb %al, (%rcx)`: 88 /r, the one-byte store a `*mut u8` needs.
+        assert_eq!(encode_one("movb %al, (%rcx)"), [0x88, 0x01]);
     }
 
     #[test]

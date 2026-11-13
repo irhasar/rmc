@@ -56,4 +56,13 @@ fn main() {
         'a'..='z' | 'A'..='Z' => println!("{}", 1),
         _ => println!("{}", 0),
     }
+    // A byte literal `b'A'` is an integer (its byte value). rmc has no `u8`, so
+    // it is an `i64`; the printed value matches rustc's `u8` byte. `\xFF` is a
+    // valid byte escape (unlike in a `char`, where `\x` is ASCII-only).
+    println!("{}", b'A');
+    println!("{}", b'\n');
+    println!("{}", b'\xFF');
+    println!("{}", b'\0');
+    let bs: [u8; 3] = [b'a', b'b', b'c'];
+    println!("{}", (bs[0] as i64) + (bs[1] as i64) + (bs[2] as i64));
 }

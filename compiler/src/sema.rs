@@ -10,7 +10,7 @@
 //! always a multiple of 8 and every field is naturally aligned.
 
 use crate::ast::*;
-use crate::consts::{const_binop, const_binop_checked, const_i64};
+use crate::consts::{const_binop, const_binop_checked, const_i64, int_const_binop};
 use std::collections::HashMap;
 
 #[derive(Clone)]
@@ -25,6 +25,9 @@ pub struct Sig {
     /// True when the receiver was `&mut self`, so the synthesized parameter is
     /// `&mut T` and matches the address the call site builds.
     pub ref_self_mut: bool,
+    /// True when the receiver was `mut self`: by value, but the binding may be
+    /// assigned in the body.
+    pub self_mut: bool,
 }
 
 /// A laid-out struct: each field's name, resolved type and byte offset, plus the
@@ -169,6 +172,21 @@ pub struct Sema {
     /// (rustc E0530), so a `let`, a parameter or a `for` variable is checked
     /// against this set.
     const_names: std::collections::HashSet<String>,
+    /// The integer type an integer literal at the current point should take,
+    /// set from the declared type, the parameter, the assignment target or the
+    /// `return` type while a literal is checked. A literal is an `i64` unless
+    /// this says otherwise, so `let x: u32 = 5` types `5` as `u32`. `None`
+    /// outside such a context, e.g. inside a call argument.
+    expected_int: Option<Type>,
+    /// The element type a *direct* array literal at the current point should
+    /// take, set from a declared `[T; n]` whose element is an integer width
+    /// (`let bs: [u8; 3] = [b'a', ..]`). `None` outside such a context.
+    expected_elem_int: Option<Type>,
+    /// The declared return type, active only while checking a function body's
+    /// tail expression. A tail array literal takes its element width from it
+    /// (`fn g() -> [u8; 3] { [1, 2, 3] }`), and a tail `[]` can be typed at all;
+    /// it is cleared inside nested blocks so an inner array is not mis-typed.
+    expected_ret: Option<Type>,
 }
 
 /// A lexical scope entry. `mutable` records whether the binding was declared
@@ -206,15 +224,17 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     // Runtime helpers provided by the freestanding assembly runtime. They are
     // linked in automatically, so they do not appear in the source program.
-    let builtins: [(&str, &[Type], Type); 26] = [
+    let builtins: [(&str, &[Type], Type); 49] = [
         ("print_i64", &[Type::I64], Type::Unit),
         ("print_str", &[Type::Str], Type::Unit),
         ("print_bool", &[Type::Bool], Type::Unit),
         ("print_char", &[Type::Char], Type::Unit),
         // `std::process::exit(code)`, lowered to the runtime's raw `exit`
-        // syscall wrapper by the parser. It never returns, but it is typed as
-        // returning `()` so it may be used as a statement or tail expression.
-        ("exit", &[Type::I64], Type::Unit),
+        // syscall wrapper by the parser. It never returns, so it is typed `!`
+        // (Never), exactly as rustc types it: `let x: i64 = exit(0);` and a
+        // non-unit match arm ending in `exit(..)` both type-check, and code
+        // after it is unreachable but still checked.
+        ("exit", &[Type::I64], Type::Never),
         ("putchar", &[Type::I64], Type::Unit),
         ("alloc", &[Type::I64], Type::I64),
         ("free", &[Type::I64], Type::Unit),
@@ -228,11 +248,55 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         // `__rmc_fill(addr, count, elem)`: store `elem` at each of `count` words
         // from `addr`, for the `vec![e; n]` desugar; returns `addr`.
         ("__rmc_fill", &[Type::I64, Type::I64, Type::I64], Type::I64),
+        // `__rmc_fill_bytes(addr, count, elem)`: the same, but for a one-byte
+        // element, storing the low byte of `elem` `count` times. Emitted for a
+        // `vec![e; n]` whose element is `u8`/`i8`.
+        ("__rmc_fill_bytes", &[Type::I64, Type::I64, Type::I64], Type::I64),
+        // The growable-`Vec` helpers. A `Vec<T>` value is the address of its
+        // element store; a 16-byte header just before it holds the length and
+        // the capacity in elements. `__rmc_vec_new(cap, width)` allocates the
+        // header and store, `__rmc_vec_repeat(count, value, width)` builds
+        // `vec![value; count]`, `__rmc_vec_push(vec, value, width)` appends one
+        // element (growing the store and returning the possibly-moved address),
+        // and `__rmc_vec_len`/`__rmc_vec_cap` read the two header words. Emitted
+        // by the parser for the `Vec` constructors and methods, never written in
+        // source.
+        ("__rmc_vec_new", &[Type::I64, Type::I64], Type::I64),
+        ("__rmc_vec_repeat", &[Type::I64, Type::I64, Type::I64], Type::I64),
+        ("__rmc_vec_push", &[Type::I64, Type::I64, Type::I64], Type::I64),
+        ("__rmc_vec_len", &[Type::I64], Type::I64),
+        // The checked `v[i]` under `--bounds-checks`: `(vector, index, stride)`
+        // yields the element address, trapping on an out-of-range index.
+        ("__rmc_vec_at", &[Type::I64, Type::I64, Type::I64], Type::I64),
+        ("__rmc_vec_cap", &[Type::I64], Type::I64),
+        // The growable-`String` helpers. A `String` value is the address of a
+        // `{len, bytes}` record — the same shape a `str` is — so every `str`
+        // helper reads a `String` unchanged and `as_str` is the value itself.
+        // The capacity is the word before the length. `__rmc_str_new` makes an
+        // empty string of a given capacity, `__rmc_str_from` copies a `str`
+        // record, `__rmc_str_push_str`/`_char` append (growing, and returning
+        // the possibly-moved address), and `__rmc_string_cap` reads the
+        // capacity. Emitted by the parser, never written in source.
+        ("__rmc_str_new", &[Type::I64], Type::Str),
+        ("__rmc_str_from", &[Type::Str], Type::Str),
+        ("__rmc_str_push_str", &[Type::Str, Type::Str], Type::Str),
+        ("__rmc_str_push_char", &[Type::Str, Type::Char], Type::Str),
+        ("__rmc_string_cap", &[Type::Str], Type::I64),
+        // `__rmc_min(a, b)`: the smaller of two `i64`, backing the `skip`/`take`
+        // range adapters' count. Emitted by the parser, never written in source.
+        ("__rmc_min", &[Type::I64, Type::I64], Type::I64),
         // Byte-wise lexicographic `str` compare; emitted by sema for a string
         // comparison and never written in source.
         ("__rmc_str_lt", &[Type::Str, Type::Str], Type::Bool),
         // `str::len`, the record's length word; emitted by sema for `s.len()`.
         ("__rmc_str_len", &[Type::Str], Type::I64),
+        // `str::starts_with` / `str::ends_with`: 1 when the second string is a
+        // prefix / suffix of the first, 0 otherwise; emitted by sema.
+        ("__rmc_str_starts", &[Type::Str, Type::Str], Type::Bool),
+        ("__rmc_str_ends", &[Type::Str, Type::Str], Type::Bool),
+        // `str::find`: the byte index of the first occurrence of the second
+        // string in the first, or -1 when absent; emitted by sema.
+        ("__rmc_str_find", &[Type::Str, Type::Str], Type::I64),
         // `i64::clamp`'s `min > max` trap; emitted by sema for the failure arm.
         // Typed `i64` because it stands in one arm of the desugar's `if`.
         ("__rmc_clamp", &[], Type::I64),
@@ -250,11 +314,23 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         // helpers with two parameters.
         ("__rmc_rotate_left", &[Type::I64, Type::I64], Type::I64),
         ("__rmc_rotate_right", &[Type::I64, Type::I64], Type::I64),
+        // The arithmetic methods that need a runtime helper because their
+        // semantics differ from the bare operator: `wrapping_add`/`_sub` (a bare
+        // `add`/`sub`, emitted as a call so operand evaluation matches a binary
+        // operator's), the `saturating_*` family (clamped), and `pow`. Emitted
+        // by sema for the matching method, never written in source.
+        ("__rmc_wrapping_add", &[Type::I64, Type::I64], Type::I64),
+        ("__rmc_wrapping_sub", &[Type::I64, Type::I64], Type::I64),
+        ("__rmc_saturating_add", &[Type::I64, Type::I64], Type::I64),
+        ("__rmc_saturating_sub", &[Type::I64, Type::I64], Type::I64),
+        ("__rmc_saturating_mul", &[Type::I64, Type::I64], Type::I64),
+        ("__rmc_pow", &[Type::I64, Type::I64], Type::I64),
         // `print!`/`println!`'s `{}` pieces, chosen by the value's type. Unlike
         // `print_i64` and friends they print *no* trailing newline, so a
         // `println!` line of several pieces stays on one line and the macro
         // appends the newline itself. They are not written in source.
         ("__rmc_write_i64", &[Type::I64], Type::Unit),
+        ("__rmc_write_u64", &[Type::I64], Type::Unit),
         ("__rmc_write_bool", &[Type::Bool], Type::Unit),
         ("__rmc_write_str", &[Type::Str], Type::Unit),
         ("__rmc_write_char", &[Type::Char], Type::Unit),
@@ -268,6 +344,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
                 takes_self: false,
                 ref_self: false,
                 ref_self_mut: false,
+                self_mut: false,
             },
         );
     }
@@ -284,7 +361,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
                     Type::Named(ty)
                 };
                 f.params.insert(0, ("self".to_string(), rt));
-                f.param_mut.insert(0, false);
+                f.param_mut.insert(0, f.self_mut);
                 f.param_pats.insert(0, None);
             }
         }
@@ -319,6 +396,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
                 takes_self: f.takes_self,
                 ref_self: f.ref_self,
                 ref_self_mut: f.ref_self_mut,
+                self_mut: f.self_mut,
             },
         );
     }
@@ -357,6 +435,9 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         assign_count: HashMap::new(),
         mut_borrowed: std::collections::HashSet::new(),
         const_names,
+        expected_int: None,
+        expected_elem_int: None,
+        expected_ret: None,
     };
     for f in &mut prog.fns {
         sema.check_fn(f)?;
@@ -398,6 +479,22 @@ fn resolve_layouts(
         layout_enum(&d.name, &raw_s, &raw_e, &mut so, &mut eo, &mut Vec::new())?;
     }
     Ok((so, eo))
+}
+
+/// The byte size of every struct and enum, for the parser's `Vec<T>` stride.
+/// It runs sema's own layout (`resolve_layouts`), so a `Vec<Struct>` element's
+/// stride and the `Type::Struct(name, size)` sema resolves are always equal —
+/// the parser never re-derives a layout that could disagree. Returns
+/// `(struct_sizes, enum_sizes)`.
+pub fn layout_sizes(
+    structs: &[StructDef],
+    enums: &[EnumDef],
+) -> Result<(HashMap<String, usize>, HashMap<String, usize>), String> {
+    let (so, eo) = resolve_layouts(structs, enums)?;
+    Ok((
+        so.into_iter().map(|(k, v)| (k, v.size)).collect(),
+        eo.into_iter().map(|(k, v)| (k, v.size)).collect(),
+    ))
 }
 
 /// Lay out a struct: field `k` at the sum of the sizes of fields `0..k`, no
@@ -508,6 +605,10 @@ fn resolve_ty_rec(
 ) -> Result<Type, String> {
     match t {
         Type::Named(n) if n == "str" => Ok(Type::Str),
+        // `String` shares `str`'s `{len, bytes}` record layout in rmc, so a
+        // `String` binding is a `Str` value; its methods are lowered by the
+        // parser (see `string_names`).
+        Type::Named(n) if n == "String" => Ok(Type::Str),
         Type::Named(n) => {
             if raw_e.contains_key(n.as_str()) {
                 layout_enum(n, raw_s, raw_e, so, eo, visiting)?;
@@ -525,7 +626,7 @@ fn resolve_ty_rec(
         Type::Array(elem, n) => {
             let e = resolve_ty_rec(elem, raw_s, raw_e, so, eo, visiting)?;
             if !e.is_array_elem() {
-                return Err(format!("array elements must be `i64`, `bool`, a unit enum, a struct or an array, not {e:?}"));
+                return Err(format!("array elements must be a scalar, `str`, a reference, a struct, a payload enum or an array, not {e:?}"));
             }
             Ok(Type::Array(Box::new(e), *n))
         }
@@ -549,6 +650,7 @@ fn resolve_in(
 ) -> Result<Type, String> {
     match t {
         Type::Named(n) if n == "str" => Ok(Type::Str),
+        Type::Named(n) if n == "String" => Ok(Type::Str),
         Type::Named(n) => {
             if let Some(info) = enums.get(n) {
                 return Ok(if info.has_payload {
@@ -565,7 +667,7 @@ fn resolve_in(
         Type::Array(elem, n) => {
             let e = resolve_in(elem, structs, enums)?;
             if !e.is_array_elem() {
-                return Err(format!("array elements must be `i64`, `bool`, a unit enum, a struct or an array, not {e:?}"));
+                return Err(format!("array elements must be a scalar, `str`, a reference, a struct, a payload enum or an array, not {e:?}"));
             }
             Ok(Type::Array(Box::new(e), *n))
         }
@@ -604,7 +706,7 @@ fn check_consts(
         .iter()
         .map(|c| (c.name.clone(), c.ty.clone(), c.value.clone()))
         .collect();
-    let resolved = crate::consts::resolve(&items);
+    let resolved = crate::consts::resolve(&items)?;
     for c in &prog.consts {
         if !names.insert(c.name.clone()) {
             return Err(format!("the name `{}` is defined multiple times", c.name));
@@ -614,7 +716,7 @@ fn check_consts(
         }
         let ty = resolve_in(&c.ty, structs, enums)?;
         match ty {
-            Type::I64 | Type::Bool | Type::Char => {}
+            Type::I64 | Type::Bool | Type::Char | Type::Int { .. } => {}
             other => {
                 return Err(format!(
                     "constant `{}` has type {other:?}; rmc only folds `i64`, `bool` and `char` constants",
@@ -627,6 +729,7 @@ fn check_consts(
         // of a cycle).
         match (ty, resolved.get(&c.name)) {
             (Type::I64, Some(crate::consts::ConstVal::Int(_))) => {}
+            (Type::Int { .. }, Some(crate::consts::ConstVal::NarrowInt(..))) => {}
             (Type::Bool, Some(crate::consts::ConstVal::Bool(_))) => {}
             (Type::Char, Some(crate::consts::ConstVal::Char(_))) => {}
             (Type::I64, _) => {
@@ -644,6 +747,12 @@ fn check_consts(
             (Type::Char, _) => {
                 return Err(format!(
                     "constant `{}` is not a constant `char` expression",
+                    c.name
+                ))
+            }
+            (Type::Int { .. }, _) => {
+                return Err(format!(
+                    "constant `{}` is not a constant integer expression",
                     c.name
                 ))
             }
@@ -749,7 +858,7 @@ impl Sema {
             f.body.stmts = pats;
         }
 
-        let body_ty = self.check_block(&mut f.body, &mut scope)?;
+        let body_ty = self.check_fn_body(&mut f.body, &mut scope)?;
         // A body whose tail is a value must match the declared return type.
         // `!` unifies with anything: a body that diverges on every path never
         // yields a value, so it satisfies any declared return type. A body
@@ -836,17 +945,74 @@ impl Sema {
             )
         }
 
+        /// True when `e` can change the value of a variable by evaluating it: a
+        /// call, or a block/`if` that assigns a local. Such an argument can
+        /// mutate the receiver's slot, so the receiver must be snapshotted
+        /// before it. A pure argument — a variable read, a field read, an
+        /// arithmetic tree over those — cannot, so the receiver needs no
+        /// snapshot and stays a direct read of its slot (which keeps a
+        /// `wrapping_mul` in a hot loop from copying its receiver into a
+        /// temporary every iteration).
+        fn arg_can_assign(e: &Expr) -> bool {
+            match e {
+                Expr::Block(b) | Expr::MatchBoundary(b, _) | Expr::Loop(b, _, _, _) => {
+                    block_assigns(b)
+                }
+                Expr::If(c, t, els) => {
+                    arg_can_assign(c)
+                        || block_assigns(t)
+                        || els.as_ref().map_or(false, |b| block_assigns(b))
+                }
+                Expr::Bin(_, a, b) => arg_can_assign(a) || arg_can_assign(b),
+                Expr::Un(_, a) | Expr::Cast(a, _) => arg_can_assign(a),
+                Expr::Index(a, b) => arg_can_assign(a) || arg_can_assign(b),
+                Expr::Field { base, .. } => arg_can_assign(base),
+                Expr::Deref { expr, .. } | Expr::AddrOf { expr, .. } => arg_can_assign(expr),
+                Expr::EnumCtor { args, .. } => args.iter().any(arg_can_assign),
+                Expr::VariantTest { scrutinee, .. } | Expr::BoolTest { scrutinee, .. } => {
+                    arg_can_assign(scrutinee)
+                }
+                Expr::EnumPayload { recv, .. } => arg_can_assign(recv),
+                Expr::StructLit { fields, .. } => fields.iter().any(|f| arg_can_assign(&f.value)),
+                Expr::ArrayLit(v, _) => arg_can_assign(v),
+                Expr::ArrayList(v) => v.iter().any(arg_can_assign),
+                Expr::Call { .. } => true,
+                _ => false,
+            }
+        }
+
+        /// True when a block assigns any local, directly or nested.
+        fn block_assigns(b: &Block) -> bool {
+            b.stmts.iter().any(stmt_assigns) || b.tail.as_deref().map_or(false, arg_can_assign)
+        }
+
+        fn stmt_assigns(s: &Stmt) -> bool {
+            match s {
+                Stmt::Assign { .. } => true,
+                Stmt::Expr(e) => arg_can_assign(e),
+                Stmt::Let { init: Some(e), .. } => arg_can_assign(e),
+                Stmt::While(c, b, _) => arg_can_assign(c) || block_assigns(b),
+                Stmt::For { start, end, body, .. } => {
+                    arg_can_assign(start) || arg_can_assign(end) || block_assigns(body)
+                }
+                Stmt::Return(Some(e)) | Stmt::Break(Some(e), _) => arg_can_assign(e),
+                _ => false,
+            }
+        }
+
         let mut stmts = Vec::new();
         // A method evaluates and copies its scalar receiver before its
         // arguments, so an argument that writes the receiver's slot must not
         // change the value the desugaring reads. `bind` leaves a plain variable
-        // as a direct read of its slot, so force a snapshot temporary when the
-        // method takes an argument that could mutate it (`div_euclid`/
-        // `rem_euclid` force the receiver unconditionally further down, for the
-        // overflow lint). A literal receiver cannot be mutated, and any other
-        // shape already gets a temporary from `bind`.
+        // as a direct read of its slot, so force a snapshot temporary only when
+        // the method takes an argument that could assign a local
+        // (`div_euclid`/`rem_euclid` force the receiver unconditionally further
+        // down, for the overflow lint). A literal receiver cannot be mutated,
+        // and any other shape already gets a temporary from `bind`.
         let x = match recv {
-            Expr::Var { .. } if !args.is_empty() => self.force_temp(recv, &mut stmts),
+            Expr::Var { .. } if args.iter().any(arg_can_assign) => {
+                self.force_temp(recv, &mut stmts)
+            }
             other => bind(self, other, &mut stmts),
         };
         let (body, ty) = match name {
@@ -973,6 +1139,7 @@ impl Sema {
                     arg_slots: Vec::new(),
                     ret_slot: -1,
                     ret_ty: Type::I64,
+                    elem_ty: None,
                 };
                 let below = if_then_else(
                     Expr::Bin(Lt, Box::new(x.clone()), Box::new(lo.clone())),
@@ -1051,6 +1218,7 @@ impl Sema {
                         arg_slots: vec![(-1, 0)],
                         ret_slot: -1,
                         ret_ty: Type::I64,
+                        elem_ty: None,
                     },
                     Type::I64,
                 )
@@ -1077,6 +1245,7 @@ impl Sema {
                         arg_slots: vec![(-1, 0), (-1, 0)],
                         ret_slot: -1,
                         ret_ty: Type::I64,
+                        elem_ty: None,
                     },
                     Type::I64,
                 )
@@ -1126,6 +1295,38 @@ impl Sema {
                 }
                 let y = bind(self, args[0].clone(), &mut stmts);
                 (Expr::Bin(WrappingMul, Box::new(x), Box::new(y)), Type::I64)
+            }
+            // The remaining arithmetic methods lower straight to a two-argument
+            // runtime helper. The receiver is bound first and the argument
+            // second, so each runs once and left to right, matching rustc's
+            // `x.method(y)` order. Each helper reproduces the `rustc -O` result
+            // and none can trap: `wrapping_add`/`_sub` are the bare `add`/`sub`,
+            // the `saturating_*` family clamps, and `pow` wraps.
+            "wrapping_add" | "wrapping_sub" | "saturating_add" | "saturating_sub"
+            | "saturating_mul" | "pow" => {
+                if args.len() != 1 {
+                    return Err(format!("method `{name}` takes exactly one argument"));
+                }
+                let y = bind(self, args[0].clone(), &mut stmts);
+                let helper = match name {
+                    "wrapping_add" => "__rmc_wrapping_add",
+                    "wrapping_sub" => "__rmc_wrapping_sub",
+                    "saturating_add" => "__rmc_saturating_add",
+                    "saturating_sub" => "__rmc_saturating_sub",
+                    "saturating_mul" => "__rmc_saturating_mul",
+                    _ => "__rmc_pow",
+                };
+                (
+                    Expr::Call {
+                        name: helper.into(),
+                        args: vec![x, y],
+                        arg_slots: vec![(-1, 0), (-1, 0)],
+                        ret_slot: -1,
+                        ret_ty: Type::I64,
+                        elem_ty: None,
+                    },
+                    Type::I64,
+                )
             }
             _ => unreachable!("checked by the caller"),
         };
@@ -1214,7 +1415,7 @@ impl Sema {
         if let Expr::ArrayLit(val, n) = e {
             let t = self.check_expr(val, scope)?;
             if !t.is_array_elem() {
-                return Err(format!("array elements must be `i64`, `bool`, a unit enum, a struct or an array, found {t:?}"));
+                return Err(format!("array elements must be a scalar, `str`, a reference, a struct, a payload enum or an array, found {t:?}"));
             }
             return Ok(Type::Array(Box::new(t), *n));
         }
@@ -1378,7 +1579,7 @@ impl Sema {
                 }
                 for leaf in leaves {
                     match leaf {
-                        Expr::VariantTest { enum_name, variant, .. } => {
+                        Expr::VariantTest { enum_name, variant, sub_tests, .. } => {
                             match kind {
                                 Some(Kind::Enum(e)) if e == enum_name.as_str() => {}
                                 None => kind = Some(Kind::Enum(enum_name.as_str())),
@@ -1389,6 +1590,14 @@ impl Sema {
                             // ones) is redundant, not a gap: rustc accepts it.
                             if !seen_variants.contains(&variant.as_str()) {
                                 seen_variants.push(variant.as_str());
+                            }
+                            // A nested variant pattern (`O::W(I::A)`) only
+                            // covers its payload value when its own sub-patterns
+                            // cover every variant of the payload enum; otherwise
+                            // the arm can fall through and the chain is not
+                            // total.
+                            if !sub_tests.iter().all(|(_, t)| self.sub_test_complete(t)) {
+                                return false;
                             }
                         }
                         Expr::BoolTest { scrutinee, value } => {
@@ -1452,7 +1661,159 @@ impl Sema {
     /// `MatchBoundary` (not a bare `If`) still delimits the walk.
     fn match_chain_is_exhaustive(&self, b: &Block) -> bool {
         match Self::chain_tail(b.tail.as_deref()) {
-            Some((cond, els)) => self.if_chain_is_exhaustive(cond, els),
+            Some((cond, els)) => self.chain_is_exhaustive(cond, els),
+            None => false,
+        }
+    }
+
+    /// Whether a desugared `match` chain is total: the simple all-variants walk
+    /// first (which also recognises a total `bool` chain), then the nested walk
+    /// that folds in payload sub-patterns (`O::W(I::A) => .., O::W(I::B) => ..,
+    /// O::Z => ..`).
+    fn chain_is_exhaustive(&self, cond: &Expr, els: &Option<Block>) -> bool {
+        self.if_chain_is_exhaustive(cond, els) || self.chain_is_exhaustive_nested(cond, els)
+    }
+
+    /// Whether a desugared `match` chain is total when some arms carry nested
+    /// variant patterns. Collects the unguarded arm tests and hands them to
+    /// `chain_covers`, which recurses through payload enums.
+    fn chain_is_exhaustive_nested(&self, cond: &Expr, els: &Option<Block>) -> bool {
+        let mut arms: Vec<&Expr> = Vec::new();
+        let mut cur_cond = cond;
+        let mut cur_els = els;
+        loop {
+            // A guard makes the arm cover nothing.
+            if Self::arm_guard(cur_cond).is_none() {
+                arms.push(Self::arm_pattern_test(cur_cond));
+            }
+            match Self::chain_tail(cur_els.as_ref().and_then(|b| b.tail.as_deref())) {
+                Some((c, e)) => {
+                    cur_cond = c;
+                    cur_els = e;
+                }
+                None => break,
+            }
+        }
+        self.chain_covers(&arms)
+    }
+
+    /// Whether a set of variant-test arms covers every variant of their enum,
+    /// and — for each arm that names a payload sub-pattern — recursively every
+    /// variant of the payload enum. `arms` are guard-stripped pattern tests; an
+    /// or-pattern arm is flattened into its alternatives. An arm that binds a
+    /// whole payload (`O::W(x)` or `O::W(_)`) has no sub-test and covers its
+    /// variant outright; arms with sub-tests for the same variant are combined
+    /// (their payload tests are unioned). A variant whose payload is not an enum
+    /// (a scalar, struct or tuple field) cannot be proven covered here, so the
+    /// match is reported non-exhaustive — safe, since rustc would need a `_` arm
+    /// there too unless the field has a single value.
+    fn chain_covers<'a>(&self, arms: &[&'a Expr]) -> bool {
+        let mut leaves: Vec<&'a Expr> = Vec::new();
+        for a in arms {
+            let mut ls: Vec<&'a Expr> = Vec::new();
+            if !Self::or_leaves(a, &mut ls) {
+                return false;
+            }
+            leaves.extend(ls);
+        }
+        let enum_name = match leaves.iter().find_map(|l| match l {
+            Expr::VariantTest { enum_name, .. } => Some(enum_name.clone()),
+            _ => None,
+        }) {
+            Some(n) => n,
+            None => return false,
+        };
+        let info = match self.enums.get(&enum_name) {
+            Some(i) => i.clone(),
+            None => return false,
+        };
+        for (variant_name, fields, _, _) in &info.variants {
+            let mut lists: Vec<&[(usize, Expr)]> = Vec::new();
+            for leaf in &leaves {
+                match leaf {
+                    Expr::VariantTest { enum_name: e, variant, sub_tests, .. } => {
+                        if *e != enum_name {
+                            return false;
+                        }
+                        if variant == variant_name {
+                            lists.push(sub_tests.as_slice());
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+            if lists.is_empty() {
+                return false;
+            }
+            // An arm with no refutable sub-pattern binds the whole variant.
+            if lists.iter().any(|l| l.is_empty()) {
+                continue;
+            }
+            // rmc unions one field's variants, so every arm must test exactly
+            // one field and all arms the same field. Otherwise the union spans
+            // different fields and proves nothing: `W(I::A, _)` and
+            // `W(_, I::B)` together name both variants of `I` but leave
+            // `W(I::B, I::A)` uncovered. A cross-product of the fields would be
+            // needed, which rmc does not reason about, so reject instead.
+            if !lists.iter().all(|l| l.len() == 1) {
+                return false;
+            }
+            let idx = lists[0][0].0;
+            if lists.iter().any(|l| l[0].0 != idx) {
+                return false;
+            }
+            // The tested field must be an enum for the union to mean anything;
+            // a scalar, struct or tuple field cannot be shown covered here.
+            if !matches!(
+                fields.get(idx),
+                Some((Type::Enum(_) | Type::EnumData(_, _), _))
+            ) {
+                return false;
+            }
+            let sub_arms: Vec<&Expr> = lists.iter().map(|l| &l[0].1).collect();
+            if !self.chain_covers(&sub_arms) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether one payload sub-pattern test covers every variant of its enum.
+    /// `Bool(true)` (a `_` or binding) is trivially complete; otherwise the test
+    /// must name every variant of one enum, pairwise distinct, with complete
+    /// sub-tests of its own. Used to decide whether a nested variant arm such
+    /// as `O::W(I::A | I::B)` covers all of `O::W`.
+    fn sub_test_complete(&self, e: &Expr) -> bool {
+        if matches!(e, Expr::Bool(true)) {
+            return true;
+        }
+        let mut leaves: Vec<&Expr> = Vec::new();
+        if !Self::or_leaves(e, &mut leaves) {
+            return false;
+        }
+        let mut enum_name: Option<&str> = None;
+        let mut seen: Vec<&str> = Vec::new();
+        for leaf in leaves {
+            let (en, var, sub) = match leaf {
+                Expr::VariantTest { enum_name, variant, sub_tests, .. } => {
+                    (enum_name.as_str(), variant.as_str(), sub_tests)
+                }
+                _ => return false,
+            };
+            match enum_name {
+                Some(x) if x == en => {}
+                None => enum_name = Some(en),
+                _ => return false,
+            }
+            if !seen.contains(&var) {
+                seen.push(var);
+            }
+            if !sub.iter().all(|(_, t)| self.sub_test_complete(t)) {
+                return false;
+            }
+        }
+        match enum_name {
+            Some(name) => self.enums.get(name).map_or(false, |i| i.variants.len() == seen.len()),
             None => false,
         }
     }
@@ -1460,6 +1821,20 @@ impl Sema {
     fn check_block(&mut self, b: &mut Block, scope: &mut Scope) -> Result<Type, String> {
         let label = self.loop_stack.last().and_then(|c| c.label.clone());
         self.check_block_inner(b, scope, false, label.as_deref())
+    }
+
+    /// Check a function body, arming `expected_ret` for an array return type so
+    /// the body's tail literal takes its element width (`fn g() -> [u8; 3] {
+    /// [1, 2, 3] }`) and a tail `[]` can be typed at all. `check_block_inner`
+    /// consumes the flag at its tail, so it never leaks into a nested block.
+    fn check_fn_body(&mut self, b: &mut Block, scope: &mut Scope) -> Result<Type, String> {
+        let saved = self.expected_ret.take();
+        if matches!(self.ret_ty, Type::Array(..)) {
+            self.expected_ret = Some(self.ret_ty.clone());
+        }
+        let r = self.check_block(b, scope);
+        self.expected_ret = saved;
+        r
     }
 
     /// Check a block. When `loop_body` is set the block is a loop body, whose
@@ -1476,6 +1851,10 @@ impl Sema {
         loop_body: bool,
         label: Option<&str>,
     ) -> Result<Type, String> {
+        // `expected_ret` applies to this block's tail only; consume it up front
+        // so a nested block in one of the statements below is not mis-typed by
+        // the enclosing function's return type.
+        let want_ret = self.expected_ret.take();
         let mark = scope.len();
         let saved_reach = self.loop_reach.last().copied().unwrap_or(false);
         let saved_cont = self.loop_cont.last().copied().unwrap_or(false);
@@ -1531,7 +1910,13 @@ impl Sema {
                 if let Some(l) = self.loop_cont.last_mut() {
                     *l = seed;
                 }
-                self.check_expr(e, scope)?
+                // The tail is the only place `expected_ret` applies, and it was
+                // consumed at the top of this block.
+                let t = match want_ret {
+                    Some(rt) => self.check_expr_expected(e, scope, &rt)?,
+                    None => self.check_expr(e, scope)?,
+                };
+                t
             }
             None => Type::Unit,
         };
@@ -1574,7 +1959,29 @@ impl Sema {
                     None => None,
                 };
                 let init_ty = match init {
-                    Some(e) => Some(self.check_let_init(e, scope)?),
+                    Some(e) => {
+                        // An integer literal in the initializer takes the
+                        // declared width (`let x: u32 = 5`); an array literal
+                        // takes the declared element width (`let b: [u8; 3] =
+                        // [1, 2, 3]`).
+                        let saved = self.expected_int.take();
+                        let saved_elem = self.expected_elem_int.take();
+                        if let Some(d) = &declared {
+                            if is_int_ty(d) {
+                                self.expected_int = Some(d.clone());
+                            } else if let Type::Array(elem, _) = d {
+                                if is_int_ty(elem)
+                                    || matches!(elem.as_ref(), Type::Array(..))
+                                {
+                                    self.expected_elem_int = Some((**elem).clone());
+                                }
+                            }
+                        }
+                        let r = self.check_let_init(e, scope);
+                        self.expected_int = saved;
+                        self.expected_elem_int = saved_elem;
+                        Some(r?)
+                    }
                     None => None,
                 };
                 let final_ty = match (declared, init_ty) {
@@ -1603,7 +2010,15 @@ impl Sema {
                 *ty = Some(final_ty.clone());
                 let s = self.alloc_slots((final_ty.size() / 8) as i32);
                 *slot = s;
-                let initialized = init.is_some();
+                // A compiler-generated `\0`-prefixed temp may be declared
+                // without an initializer and filled by the statements that
+                // follow it (`\0list` in the array-literal desugar writes each
+                // element). Its only reads are those writes, so it counts as
+                // initialized. Without this, re-checking the desugared block —
+                // which any method desugar does to its receiver, e.g.
+                // `[3, 1, 2].iter().max().unwrap()` — reports a spurious
+                // "use of possibly-uninitialized variable".
+                let initialized = init.is_some() || name.starts_with('\u{0}');
                 scope.push(Binding {
                     name: name.clone(),
                     slot: s,
@@ -1662,6 +2077,15 @@ impl Sema {
                     }
                 }
                 let tty = self.check_lvalue(target, scope)?;
+                // An integer literal on the right of `=` takes the target's
+                // width; re-check it in that context so `x = 5` where `x: u32`
+                // types `5` as `u32` and is range-checked.
+                let mut vty = vty;
+                if is_int_literal(value) {
+                    if let Type::Int { .. } = &tty {
+                        vty = self.check_expr_expected(value, scope, &tty)?;
+                    }
+                }
                 // A deferred single init (`let i; i = -1;`) is the one
                 // assignment rustc folds; a second assignment would make the
                 // count 2 and the gate fail. This runs after `check_lvalue`,
@@ -1845,7 +2269,12 @@ impl Sema {
             Stmt::Return(v) => {
                 match v {
                     Some(e) => {
-                        let t = self.check_expr(e, scope)?;
+                        let t = if is_int_literal(e) || matches!(self.ret_ty, Type::Array(..)) {
+                            let rt = self.ret_ty.clone();
+                            self.check_expr_expected(e, scope, &rt)?
+                        } else {
+                            self.check_expr(e, scope)?
+                        };
                         // `!` unifies with anything: `return loop {};` never
                         // actually returns a value.
                         if t != self.ret_ty && t != Type::Never {
@@ -2066,7 +2495,12 @@ impl Sema {
     fn check_cast(&self, from: &Type, to: &Type) -> Result<(), String> {
         match (from, to) {
             (Type::Ref(a, a_mut), Type::Ref(b, b_mut)) => {
-                if a != b {
+                // A byte referent (`*const u8`) and a word one (`*const i64`)
+                // are both one address, so only the byte-ness is normalised
+                // away here: `*mut u8 as *mut i8` (both byte) and `*mut u8 as
+                // *mut i64` are accepted, while a mismatch between two
+                // non-byte referents stays rejected.
+                if byte_ref_norm(a) != byte_ref_norm(b) {
                     return Err(format!(
                         "cannot cast a `{a:?}` reference to a `{b:?}` reference"
                     ));
@@ -2081,12 +2515,13 @@ impl Sema {
             // `*mut T` and `&mut T` to `Ref(_, true)`, and rustc *does* allow
             // `*mut T as i64`, so the mutable form is accepted (the raw-pointer
             // extension). A shared reference stays rejected, matching E0606.
-            (Type::Ref(_, true), Type::I64) => Ok(()),
+            // `*mut T as u32` and the like are the same extension.
+            (Type::Ref(_, true), t) if is_int_ty(t) => Ok(()),
             (Type::Ref(..), _) => {
                 Err(format!("cannot cast a reference `{from:?}` to `{to:?}`"))
             }
             // The raw pointer cast extension: an integer becomes a reference.
-            (Type::I64, Type::Ref(..)) => Ok(()),
+            (t, Type::Ref(..)) if is_int_ty(t) => Ok(()),
             // Any other scalar may not become a reference (rustc E0605).
             (_, Type::Ref(..)) => {
                 Err(format!("cannot cast `{from:?}` to a reference `{to:?}`"))
@@ -2095,19 +2530,19 @@ impl Sema {
             (Type::Str, _) | (_, Type::Str) => {
                 Err(format!("cannot cast `{from:?}` to `{to:?}`"))
             }
-            // rustc allows only `u8 as char`; rmc has no `u8` type (a suffixed
-            // literal is an `i64`), so it rejects every integer-to-`char` cast
-            // rather than accept one rustc would reject.
-            (Type::I64, Type::Char) => {
-                Err("cannot cast `i64` to `char` (rustc allows only `u8 as char`)".into())
+            // rustc allows only `u8 as char`.
+            (Type::Int { signed: false, bits: 8 }, Type::Char) => Ok(()),
+            (t, Type::Char) if is_int_ty(t) => {
+                Err("cannot cast an integer to `char` (rustc allows only `u8 as char`)".into())
             }
-            // `char` converts to an integer as its scalar value.
-            (Type::Char, Type::I64) => Ok(()),
+            // `char` converts to any integer as its scalar value.
+            (Type::Char, t) if is_int_ty(t) => Ok(()),
             // Any other `char` cast is not one rustc performs.
             (Type::Char, _) | (_, Type::Char) => {
                 Err(format!("cannot cast `{from:?}` to `{to:?}`"))
             }
-            // `i64`, `bool` and an enum tag convert among themselves.
+            // An integer width converts to any other; `bool` and an enum tag
+            // convert among themselves.
             _ => Ok(()),
         }
     }
@@ -2407,6 +2842,7 @@ impl Sema {
             arg_slots: vec![(-1, 0), (-1, 0)],
             ret_slot: -1,
             ret_ty: Type::Bool,
+            elem_ty: None,
         };
         let not = |e: Expr| Expr::Un(UnOp::Not, Box::new(e));
         use BinOp::*;
@@ -2421,9 +2857,65 @@ impl Sema {
         }
     }
 
+    /// The type an integer literal takes at the current point: the expected
+    /// width when the context set one (`let x: u32 = 5`), else `i64`. A literal
+    /// is an `i64` unless a declared type, parameter or `return` type says
+    /// otherwise, exactly as rustc infers a literal's type from its expected
+    /// type.
+    fn int_lit_ty(&self) -> Type {
+        match &self.expected_int {
+            Some(t) if is_int_ty(t) => t.clone(),
+            _ => Type::I64,
+        }
+    }
+
+    /// Check `e` in the context of an expected integer type (a declared type,
+    /// a parameter or a `return` type), so an integer literal takes that width.
+    /// The expected type is saved and restored around the call, so an
+    /// unrelated literal elsewhere is not mis-typed.
+    fn check_expr_expected(
+        &mut self,
+        e: &mut Expr,
+        scope: &mut Scope,
+        expected: &Type,
+    ) -> Result<Type, String> {
+        let saved = self.expected_int.take();
+        let saved_elem = self.expected_elem_int.take();
+        if is_int_ty(expected) {
+            self.expected_int = Some(expected.clone());
+        }
+        // An array literal in this position takes the expected element width
+        // (`f([1, 2, 3])` for an `[u8; 3]` parameter), and an empty `[]` can
+        // only be typed here at all.
+        if let Type::Array(elem, _) = expected {
+            if is_int_ty(elem) || matches!(elem.as_ref(), Type::Array(..)) {
+                self.expected_elem_int = Some((**elem).clone());
+            }
+        }
+        let r = self.check_expr(e, scope);
+        self.expected_int = saved;
+        self.expected_elem_int = saved_elem;
+        r
+    }
+
+    /// Reject an integer value that does not fit its width, the way rustc's
+    /// `literal out of range` does (`let x: u8 = 300;`). A 64-bit width always
+    /// fits, since the value is an `i64`.
+    fn check_int_range(&self, v: i64, ty: &Type) -> Result<(), String> {
+        let bits = int_bits(ty);
+        if bits >= 64 || fits_int(v, int_signed(ty), bits) {
+            return Ok(());
+        }
+        Err(format!("literal out of range for `{}`", int_ty_name(ty)))
+    }
+
     fn check_expr(&mut self, e: &mut Expr, scope: &mut Scope) -> Result<Type, String> {
         match e {
-            Expr::Int(_) => Ok(Type::I64),
+            Expr::Int(v) => {
+                let t = self.int_lit_ty();
+                self.check_int_range(*v, &t)?;
+                Ok(t)
+            }
             Expr::Bool(_) => Ok(Type::Bool),
             Expr::Char(_) => Ok(Type::Char),
             // A string literal has its own type, so it cannot be added to an
@@ -2443,31 +2935,59 @@ impl Sema {
                 None => Err(format!("unknown variable `{name}`")),
             },
             Expr::Un(op, inner) => {
+                // A negated integer literal takes its destination's width, so
+                // `let x: i8 = -128` is the signed minimum, not the
+                // out-of-range positive 128. rustc types the literal at the
+                // destination width and then applies the sign; range-check the
+                // *negated* magnitude against that width and skip the positive
+                // check on the inner literal (which would reject 128 on its
+                // own). Without an expected width the literal stays `i64`, so
+                // the ordinary path below applies.
+                if matches!(op, UnOp::Neg) {
+                    if let Expr::Int(v) = inner.as_ref() {
+                        if let Some(exp) = self.expected_int.clone() {
+                            if is_int_ty(&exp) && int_signed(&exp) {
+                                let neg = v.checked_neg().ok_or_else(|| {
+                                    "this arithmetic operation overflows".to_string()
+                                })?;
+                                self.check_int_range(neg, &exp)?;
+                                return Ok(exp);
+                            }
+                        }
+                    }
+                }
                 let t = self.check_expr(inner, scope)?;
                 match op {
                     UnOp::Neg => {
-                        if t != Type::I64 {
-                            return Err(format!("unary `-` expects `i64`, found {t:?}"));
+                        if !is_int_ty(&t) {
+                            return Err(format!("unary `-` expects an integer, found {t:?}"));
                         }
-                        // Negating `i64::MIN` overflows. rustc's
-                        // `arithmetic_overflow` deny lint catches it when the
-                        // operand folds to a constant, so rmc does too; the
-                        // `i64::MIN` literal itself is parsed as `Int(i64::MIN)`,
-                        // not a negation, so only a written `-` reaches here.
+                        // rustc rejects negating an unsigned value.
+                        if !int_signed(&t) {
+                            return Err(format!(
+                                "cannot apply unary `-` to an unsigned integer `{}`",
+                                int_ty_name(&t)
+                            ));
+                        }
                         // The negation inside a built-in `abs` is exempt: it is
                         // not a written `-`, and rustc accepts it.
-                        if !self.in_builtin_neg
-                            && self.const_of(inner, &self.const_locals) == Some(i64::MIN)
-                        {
-                            return Err("this arithmetic operation overflows".into());
+                        if !self.in_builtin_neg {
+                            if let Some(v) = self.const_of(inner, &self.const_locals) {
+                                let neg = v.checked_neg().ok_or_else(|| {
+                                    "this arithmetic operation overflows".to_string()
+                                })?;
+                                self.check_int_range(neg, &t)?;
+                            }
                         }
-                        Ok(Type::I64)
+                        Ok(t)
                     }
                     UnOp::Not => match t {
                         // `!` is logical not on `bool` and bitwise not on an
                         // integer, matching Rust. It yields its operand's type.
-                        Type::Bool | Type::I64 => Ok(t),
-                        _ => Err(format!("unary `!` expects `bool` or `i64`, found {t:?}")),
+                        Type::Bool | Type::I64 | Type::Int { .. } => Ok(t),
+                        _ => Err(format!(
+                            "unary `!` expects `bool` or an integer, found {t:?}"
+                        )),
                     },
                 }
             }
@@ -2527,6 +3047,25 @@ impl Sema {
                 }
                 let ta = self.check_expr(a, scope)?;
                 let tb = self.check_expr(b, scope)?;
+                // An integer literal operand takes the other operand's width,
+                // exactly as rustc infers it: `let c: u16 = 5; c + 10` types
+                // `10` as `u16`. A literal is pure, so re-checking it in that
+                // context is safe and also range-checks it.
+                let (ta, tb) = if ta != tb {
+                    match (&ta, &tb) {
+                        (Type::I64, Type::Int { .. }) if is_int_literal(a) => {
+                            let w = tb.clone();
+                            (self.check_expr_expected(a, scope, &w)?, tb)
+                        }
+                        (Type::Int { .. }, Type::I64) if is_int_literal(b) => {
+                            let w = ta.clone();
+                            (ta, self.check_expr_expected(b, scope, &w)?)
+                        }
+                        _ => (ta, tb),
+                    }
+                } else {
+                    (ta, tb)
+                };
                 use BinOp::*;
                 // Two `str` operands compare by content through a runtime
                 // helper, not by pointer. Rewrite the whole node and re-check
@@ -2545,40 +3084,69 @@ impl Sema {
                 }
                 match op {
                     Add | Sub | Mul | Div | Mod | WrappingMul => {
-                        if ta != Type::I64 || tb != Type::I64 {
-                            return Err(format!("arithmetic expects `i64` operands, found {ta:?} and {tb:?}"));
+                        if !is_int_ty(&ta) || !is_int_ty(&tb) {
+                            return Err(format!(
+                                "arithmetic expects integer operands, found {ta:?} and {tb:?}"
+                            ));
                         }
-                        // `wrapping_mul` never traps, so a constant product that
-                        // overflows is folded as a wrap rather than rejected.
-                        if *op != WrappingMul {
-                            if let (Some(x), Some(y)) = (self.const_of(a, &self.const_locals), self.const_of(b, &self.const_locals)) {
-                                const_binop(*op, x, y)?;
+                        if ta != tb {
+                            return Err(format!(
+                                "arithmetic between different integer types: {ta:?} and {tb:?}"
+                            ));
+                        }
+                        // A 64-bit operand keeps the original `i64` path, so a
+                        // 64-bit program is unchanged. A narrower width folds a
+                        // constant product with the width's overflow rule and
+                        // otherwise yields the width.
+                        if ta == Type::I64 {
+                            // `wrapping_mul` never traps, so a constant product
+                            // that overflows is folded as a wrap rather than
+                            // rejected.
+                            if *op != WrappingMul {
+                                if let (Some(x), Some(y)) = (
+                                    self.const_of(a, &self.const_locals),
+                                    self.const_of(b, &self.const_locals),
+                                ) {
+                                    const_binop(*op, x, y)?;
+                                }
+                            }
+                        } else if let Type::Int { signed, bits } = ta {
+                            if let (Some(x), Some(y)) = (
+                                self.const_of(a, &self.const_locals),
+                                self.const_of(b, &self.const_locals),
+                            ) {
+                                int_const_binop(*op, x, y, signed, bits)?;
                             }
                         }
-                        Ok(Type::I64)
+                        Ok(ta)
                     }
                     Eq | Ne => {
                         if ta != tb {
-                            return Err(format!("comparison between different types: {ta:?} and {tb:?}"));
+                            return Err(format!(
+                                "comparison between different types: {ta:?} and {tb:?}"
+                            ));
                         }
                         // `is_scalar` here, so a matching enum compares but an
                         // aggregate (array/struct) does not.
                         if !ta.is_scalar() {
                             return Err(format!(
-                                "comparison expects `i64`, `bool` or a matching enum, found {ta:?}"
+                                "comparison expects an integer, `bool` or a matching enum, found {ta:?}"
                             ));
                         }
                         Ok(Type::Bool)
                     }
                     Lt | Le | Gt | Ge => {
                         // `char` orders by its scalar value, so two `char`s
-                        // compare; anything else must be `i64`, matching rustc,
-                        // which does not order a `char` against an integer.
+                        // compare; anything else must be an integer of the same
+                        // width, matching rustc, which does not order a `char`
+                        // against an integer.
                         if ta == Type::Char && tb == Type::Char {
                             return Ok(Type::Bool);
                         }
-                        if ta != Type::I64 || tb != Type::I64 {
-                            return Err(format!("ordering comparison expects `i64`, found {ta:?} and {tb:?}"));
+                        if !is_int_ty(&ta) || !is_int_ty(&tb) || ta != tb {
+                            return Err(format!(
+                                "ordering comparison expects two integers of the same type, found {ta:?} and {tb:?}"
+                            ));
                         }
                         Ok(Type::Bool)
                     }
@@ -2589,29 +3157,63 @@ impl Sema {
                         Ok(Type::Bool)
                     }
                     BitAnd | BitOr | BitXor | Shl | Shr => {
-                        if ta != Type::I64 || tb != Type::I64 {
-                            return Err(format!("bitwise operator expects `i64` operands, found {ta:?} and {tb:?}"));
+                        // `&`, `|` and `^` are defined on `bool` as well as an
+                        // integer (rustc's `BitAnd`/`BitOr`/`BitXor` impls). A
+                        // `bool` is a 0/1 word, so the bitwise instruction is
+                        // already the logical result and codegen is unchanged;
+                        // only the operand check differs.
+                        if matches!(op, BitAnd | BitOr | BitXor)
+                            && ta == Type::Bool
+                            && tb == Type::Bool
+                        {
+                            return Ok(Type::Bool);
+                        }
+                        if !is_int_ty(&ta) || !is_int_ty(&tb) {
+                            return Err(format!(
+                                "bitwise operator expects integer operands, found {ta:?} and {tb:?}"
+                            ));
+                        }
+                        // A shift's right operand may be any integer width and
+                        // is not masked at the type level; every other bitwise
+                        // operator needs both operands the same width.
+                        let (signed, bits) = match &ta {
+                            Type::Int { signed, bits } => (*signed, *bits),
+                            _ => (true, 64),
+                        };
+                        if !matches!(op, Shl | Shr) && ta != tb {
+                            return Err(format!(
+                                "bitwise operator between different integer types: {ta:?} and {tb:?}"
+                            ));
                         }
                         // rustc rejects a shift whose count is a known constant
-                        // outside 0..=63 even when the shifted value is a
+                        // outside `0..bits` even when the shifted value is a
                         // runtime value (`x << 81` is a compile error, not a
                         // wrapped result), so the count is checked on its own
                         // rather than only when both sides are constant.
                         if matches!(op, Shl | Shr) {
                             if let Some(y) = self.const_of(b, &self.const_locals) {
-                                if !(0..64).contains(&y) {
-                                    return Err("shift amount is out of range for `i64`".into());
+                                if !(0..bits as i64).contains(&y) {
+                                    return Err(format!(
+                                        "shift amount is out of range for a {bits}-bit integer"
+                                    ));
                                 }
                             }
                         }
-                        if let (Some(x), Some(y)) = (self.const_of(a, &self.const_locals), self.const_of(b, &self.const_locals)) {
-                            const_binop(*op, x, y)?;
+                        if let (Some(x), Some(y)) = (
+                            self.const_of(a, &self.const_locals),
+                            self.const_of(b, &self.const_locals),
+                        ) {
+                            if ta == Type::I64 {
+                                const_binop(*op, x, y)?;
+                            } else {
+                                int_const_binop(*op, x, y, signed, bits)?;
+                            }
                         }
-                        Ok(Type::I64)
+                        Ok(ta)
                     }
                 }
             }
-            Expr::Call { name, args, arg_slots, ret_slot, ret_ty } => {
+            Expr::Call { name, args, arg_slots, ret_slot, ret_ty, elem_ty } => {
                 // `__rmc_print` is the placeholder a `print!`/`println!` `{}`
                 // emits. The type of the value is known only here, so pick the
                 // runtime helper that matches it and rewrite the call.
@@ -2622,6 +3224,10 @@ impl Sema {
                     let t = self.check_expr(&mut args[0], scope)?;
                     let helper = if t == Type::I64 {
                         "__rmc_write_i64"
+                    } else if matches!(&t, Type::Int { signed: true, .. }) {
+                        "__rmc_write_i64"
+                    } else if matches!(&t, Type::Int { signed: false, .. }) {
+                        "__rmc_write_u64"
                     } else if t == Type::Bool {
                         "__rmc_write_bool"
                     } else if t == Type::Char {
@@ -2653,6 +3259,7 @@ impl Sema {
                             "vecrepeat" | "veclist" => "`vec![..]`",
                             "argsvec" => "`std::env::args()...collect()`",
                             "ptr" => "`as_mut_ptr` / `as_ptr`",
+                            "strnew" | "strfrom" => "`String::new` / `String::with_capacity` / `String::from`",
                             _ => "this construct",
                         };
                         return format!("{what} is only supported directly in a `let` initializer");
@@ -2667,18 +3274,92 @@ impl Sema {
                     ));
                 }
                 arg_slots.clear();
-                for (a, p) in args.iter_mut().zip(sig.params.iter()) {
-                    let t = self.check_expr(a, scope)?;
-                    // `!` unifies with any parameter type: an argument that never
-                    // materialises (a block ending in `break`/`return`/`continue`)
-                    // coerces, exactly as rustc allows.
-                    if &t != p && t != Type::Never && !ref_coerces(&t, p) {
+                // `__rmc_vec_push`/`__rmc_vec_repeat` carry the element as
+                // their second argument and its byte width (negated for an
+                // aggregate) as their last. The width must agree with the
+                // element value's own size, or the runtime would copy the wrong
+                // number of bytes — reading past a narrower temporary, or
+                // writing past the destination. A mismatch means the pushed
+                // value is not the vector's element type (`v.push(Q{..})` for a
+                // `Vec<P>`), which rustc rejects.
+                let vec_helper = name.as_str() == "__rmc_vec_push"
+                    || name.as_str() == "__rmc_vec_repeat";
+                let elem_width = if vec_helper {
+                    match args.last() {
+                        Some(Expr::Int(w)) => Some(*w),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                for (i, (a, p)) in args.iter_mut().zip(sig.params.iter()).enumerate() {
+                    let t = if (is_int_literal(a) && matches!(p, Type::Int { .. }))
+                        || matches!(p, Type::Array(..))
+                    {
+                        let p2 = p.clone();
+                        self.check_expr_expected(a, scope, &p2)?
+                    } else {
+                        self.check_expr(a, scope)?
+                    };
+                    // `__rmc_vec_push`/`__rmc_vec_repeat` take the element as
+                    // their second argument: a scalar travels as a word, but an
+                    // aggregate travels as its address, so its type need not
+                    // match the declared `I64`.
+                    let vec_elem_arg = vec_helper && i == 1;
+                    // The element's own type must be the vector's element type.
+                    // The value argument is type-erased to `I64`, so a size
+                    // check alone cannot tell a valid element from a *different*
+                    // aggregate of the same size (`v.push(Q{..})` on a `Vec<P>`
+                    // where `P` and `Q` are both 16 bytes): the runtime would
+                    // store the wrong type, and a later read would misread it.
+                    // The parser records the declared element type on the call,
+                    // so compare against it here. A missing element type (an
+                    // unannotated `Vec` whose element was not inferred) leaves
+                    // the size check below as the only guard.
+                    if vec_elem_arg {
+                        if let Some(expected) = elem_ty.clone() {
+                            if expected.is_aggregate() {
+                                if t != Type::Never && !t.is_aggregate() {
+                                    return Err(format!(
+                                        "`{name}`: expected an element of type {expected:?}, found {t:?}"
+                                    ));
+                                }
+                                if t.is_aggregate() && t != expected {
+                                    return Err(format!(
+                                        "`{name}`: expected an element of type {expected:?}, found {t:?}"
+                                    ));
+                                }
+                            } else if t.is_aggregate() {
+                                return Err(format!(
+                                    "`{name}`: expected a scalar element ({expected:?}), found an aggregate {t:?}"
+                                ));
+                            }
+                        }
+                    }
+                    // An aggregate element must match the vector's element size
+                    // exactly, or the runtime copies the wrong byte count (past a
+                    // narrower temporary, or past the destination).
+                    if let (true, Some(w)) = (vec_elem_arg, elem_width) {
+                        if t.is_aggregate() && w.abs() != t.size() as i64 {
+                            return Err(format!(
+                                "`{name}`: element of {} bytes does not match the vector's element size of {}",
+                                t.size(),
+                                w.abs()
+                            ));
+                        }
+                    }
+                    if !(vec_elem_arg && t.is_aggregate())
+                        && &t != p
+                        && t != Type::Never
+                        && !ref_coerces(&t, p)
+                    {
                         return Err(format!("function `{name}`: argument type mismatch, expected {p:?}, found {t:?}"));
                     }
                     // An aggregate argument is passed by pointer, so give it a
                     // hidden frame slot to hold its address for the call.
-                    arg_slots.push(if p.is_aggregate() {
-                        let n = p.size() / 8;
+                    let agg_ty = if vec_elem_arg { &t } else { p };
+                    arg_slots.push(if agg_ty.is_aggregate() {
+                        let n = agg_ty.size() / 8;
                         (self.alloc_slots(n as i32), n)
                     } else {
                         (-1, 0)
@@ -2718,7 +3399,7 @@ impl Sema {
                     return Err(format!("`if` condition must be `bool`, found {ct:?}"));
                 }
                 let total = if is_root {
-                    self.if_chain_is_exhaustive(cond, els)
+                    self.chain_is_exhaustive(cond, els)
                 } else {
                     total
                 };
@@ -3081,7 +3762,10 @@ impl Sema {
                     }
                     seen[idx] = true;
                     let want = info.fields[idx].1.clone();
-                    let got = self.check_expr(&mut fi.value, scope)?;
+                    // A field's declared width types an integer literal in its
+                    // initializer (`S { a: 200 }` for an `a: u8`), exactly as a
+                    // `let x: u8 = 200` does.
+                    let got = self.check_expr_expected(&mut fi.value, scope, &want)?;
                     if got != want && !ref_coerces(&got, &want) {
                         return Err(format!(
                             "struct `{name}` field `{}`: expected {want:?}, found {got:?}",
@@ -3096,9 +3780,15 @@ impl Sema {
                 Ok(Type::Struct(name.clone(), info.size))
             }
             Expr::ArrayLit(val, n) => {
-                let t = self.check_expr(val, scope)?;
+                // An element integer literal takes the declared element width
+                // (`let b: [u8; 3] = [7; 3]`), else `i64`.
+                let t = if let Some(elem) = self.expected_elem_int.clone() {
+                    self.check_expr_expected(val, scope, &elem)?
+                } else {
+                    self.check_expr(val, scope)?
+                };
                 if !t.is_array_elem() {
-                    return Err(format!("array elements must be `i64`, `bool`, a unit enum, a struct or an array, found {t:?}"));
+                    return Err(format!("array elements must be a scalar, `str`, a reference, a struct, a payload enum or an array, found {t:?}"));
                 }
                 let ty = Type::Array(Box::new(t), *n);
                 // Value position: `[v; n]` has no address of its own, so rewrite
@@ -3127,16 +3817,48 @@ impl Sema {
                 self.check_expr(e, scope)
             }
             Expr::ArrayList(elems) => {
-                // The parser never produces an empty list: it requires at least
-                // one element before the `]`, so `[]` fails there.
-                let elem_ty = self.check_expr(&mut elems[0], scope)?;
+                // An empty list `[]` has no element to infer the type from, so
+                // it only type-checks where the annotation supplies one: the
+                // expected element type is set for `let z: [i64; 0] = [];`. The
+                // result is an empty array block (its value is the zero-length
+                // array), never an assignment.
+                if elems.is_empty() {
+                    let elem_ty = match self.expected_elem_int.clone() {
+                        Some(t) => t,
+                        None => {
+                            return Err(
+                                "cannot infer the element type of an empty array".into()
+                            )
+                        }
+                    };
+                    if !elem_ty.is_array_elem() {
+                        return Err(format!(
+                            "array elements must be a scalar, `str`, a reference, a struct, a payload enum or an array, found {elem_ty:?}"
+                        ));
+                    }
+                    let arr_ty = Type::Array(Box::new(elem_ty), 0);
+                    *e = Expr::Block(Block {
+                        stmts: Vec::new(),
+                        tail: Some(Box::new(Expr::Bool(false))),
+                    });
+                    return Ok(arr_ty);
+                }
+                let elem_ty = if let Some(elem) = self.expected_elem_int.clone() {
+                    self.check_expr_expected(&mut elems[0], scope, &elem)?
+                } else {
+                    self.check_expr(&mut elems[0], scope)?
+                };
                 if !elem_ty.is_array_elem() {
                     return Err(format!(
-                        "array elements must be `i64`, `bool`, a unit enum, a struct or an array, found {elem_ty:?}"
+                        "array elements must be a scalar, `str`, a reference, a struct, a payload enum or an array, found {elem_ty:?}"
                     ));
                 }
                 for e in elems.iter_mut().skip(1) {
-                    let t = self.check_expr(e, scope)?;
+                    let t = if let Some(elem) = self.expected_elem_int.clone() {
+                        self.check_expr_expected(e, scope, &elem)?
+                    } else {
+                        self.check_expr(e, scope)?
+                    };
                     if t != elem_ty {
                         return Err(format!(
                             "array literal: element type mismatch, expected {elem_ty:?}, found {t:?}"
@@ -3227,6 +3949,7 @@ impl Sema {
                                 arg_slots: vec![(-1, 0)],
                                 ret_slot: -1,
                                 ret_ty: Type::I64,
+                                elem_ty: None,
                             };
                             return self.check_expr(e, scope);
                         }
@@ -3249,6 +3972,87 @@ impl Sema {
                             return Ok(Type::I64);
                         }
                         _ => {}
+                    }
+                }
+                // `is_empty()` is `len() == 0` for both a `str` and an array.
+                // The `str` form reuses the length helper; the array form folds
+                // to the compile-time constant `N == 0`, keeping the receiver
+                // only for its side effects, exactly as `len()` does above.
+                if name == "is_empty" && args.is_empty() {
+                    match &base_ty {
+                        Type::Str => {
+                            let recv = std::mem::replace(recv.as_mut(), Expr::Int(0));
+                            let recv = if via_ref {
+                                Expr::Deref { expr: Box::new(recv), ty: Type::Str }
+                            } else {
+                                recv
+                            };
+                            let call = Expr::Call {
+                                name: "__rmc_str_len".into(),
+                                args: vec![recv],
+                                arg_slots: vec![(-1, 0)],
+                                ret_slot: -1,
+                                ret_ty: Type::I64,
+                                elem_ty: None,
+                            };
+                            *e = Expr::Bin(BinOp::Eq, Box::new(call), Box::new(Expr::Int(0)));
+                            return self.check_expr(e, scope);
+                        }
+                        Type::Array(_, n) => {
+                            let empty = *n == 0;
+                            let recv = std::mem::replace(recv.as_mut(), Expr::Int(0));
+                            let stmts = if matches!(recv, Expr::Var { .. }) {
+                                Vec::new()
+                            } else {
+                                vec![Stmt::Expr(recv)]
+                            };
+                            *e = Expr::Block(Block {
+                                stmts,
+                                tail: Some(Box::new(Expr::Bool(empty))),
+                            });
+                            return Ok(Type::Bool);
+                        }
+                        _ => {}
+                    }
+                }
+                // `str::starts_with` / `str::ends_with` / `str::contains`.
+                // Each is a byte scan over the two `{len, bytes}` records, so
+                // it lowers to a runtime helper; the receiver and argument are
+                // the two record addresses. A `&str` receiver is dereferenced
+                // to that word first. `contains` reuses the find helper and
+                // tests its result against -1.
+                if matches!(base_ty, Type::Str) {
+                    let helper = match name.as_str() {
+                        "starts_with" => Some("__rmc_str_starts"),
+                        "ends_with" => Some("__rmc_str_ends"),
+                        "contains" => Some("__rmc_str_find"),
+                        _ => None,
+                    };
+                    if let Some(helper) = helper {
+                        if args.len() != 1 {
+                            return Err(format!("method `{name}` takes one argument"));
+                        }
+                        let arg = std::mem::replace(&mut args[0], Expr::Int(0));
+                        let recv = std::mem::replace(recv.as_mut(), Expr::Int(0));
+                        let recv = if via_ref {
+                            Expr::Deref { expr: Box::new(recv), ty: Type::Str }
+                        } else {
+                            recv
+                        };
+                        let call = Expr::Call {
+                            name: helper.into(),
+                            args: vec![recv, arg],
+                            arg_slots: vec![(-1, 0), (-1, 0)],
+                            ret_slot: -1,
+                            ret_ty: if name == "contains" { Type::I64 } else { Type::Bool },
+                            elem_ty: None,
+                        };
+                        *e = if name == "contains" {
+                            Expr::Bin(BinOp::Ne, Box::new(call), Box::new(Expr::Int(-1)))
+                        } else {
+                            call
+                        };
+                        return self.check_expr(e, scope);
                     }
                 }
                 // Built-in integer methods on an `i64` receiver. They desugar
@@ -3285,6 +4089,12 @@ impl Sema {
                             | "rotate_right"
                             | "midpoint"
                             | "wrapping_mul"
+                            | "wrapping_add"
+                            | "wrapping_sub"
+                            | "saturating_add"
+                            | "saturating_sub"
+                            | "saturating_mul"
+                            | "pow"
                     )
                 {
                     // `abs` synthesises `-x`, a compiler-generated negation, so
@@ -3350,6 +4160,7 @@ impl Sema {
                     arg_slots: Vec::new(),
                     ret_slot: -1,
                     ret_ty: Type::I64,
+                    elem_ty: None,
                 };
                 self.check_expr(e, scope)
             }
@@ -3434,6 +4245,7 @@ impl Sema {
                             arg_slots: Vec::new(),
                             ret_slot: -1,
                             ret_ty: Type::I64,
+                            elem_ty: None,
                         };
                         return self.check_expr(e, scope);
                     }
@@ -3495,7 +4307,7 @@ impl Sema {
                 }
                 Ok(Type::Bool)
             }
-            Expr::VariantTest { scrutinee, enum_name, variant, tag, n_binds, has_rest } => {
+            Expr::VariantTest { scrutinee, enum_name, variant, tag, n_binds, has_rest, sub_tests } => {
                 let n_binds = *n_binds;
                 let has_rest = *has_rest;
                 let st = self.check_expr(scrutinee, scope)?;
@@ -3551,6 +4363,17 @@ impl Sema {
                     ));
                 }
                 *tag = info.tag_of(variant).unwrap();
+                // Check each nested sub-pattern test through the payload read it
+                // was built from, so its enum is resolved and its own tag filled
+                // in. Codegen `&&`s these after the tag test.
+                for (_, t) in sub_tests.iter_mut() {
+                    let tt = self.check_expr(t, scope)?;
+                    if tt != Type::Bool {
+                        return Err(format!(
+                            "internal: a variant payload sub-pattern test is `{tt:?}`, not `bool`"
+                        ));
+                    }
+                }
                 Ok(Type::Bool)
             }
             Expr::EnumPayload { recv, enum_name, variant, idx, offset, ty } => {
@@ -3630,9 +4453,23 @@ impl Sema {
                     *e = operand;
                     return Ok(Type::Ref(Box::new(Type::Str), mutability));
                 }
-                *ty = t.clone();
-                *e = Expr::AddrOf { expr: Box::new(operand), ty: t.clone(), mutable: mutability, slot: *slot };
-                Ok(Type::Ref(Box::new(t), mutability))
+                // The referent is the *place* type, which for a dereference is
+                // the node's own referent, not the value it yields: `&mut *m`
+                // on a `*mut u8` borrows a byte (`U8`), even though reading
+                // `*m` yields the `i64` value. Every other place's value type is
+                // its place type.
+                let place_t = match &operand {
+                    Expr::Deref { ty, .. } => ty.clone(),
+                    _ => t.clone(),
+                };
+                *ty = place_t.clone();
+                *e = Expr::AddrOf {
+                    expr: Box::new(operand),
+                    ty: place_t.clone(),
+                    mutable: mutability,
+                    slot: *slot,
+                };
+                Ok(Type::Ref(Box::new(place_t), mutability))
             }
             Expr::Deref { expr, ty } => {
                 // `&str` and `str` share one representation (the record
@@ -3651,8 +4488,14 @@ impl Sema {
                     Type::Ref(inner, _) => {
                         *ty = (*inner).clone();
                         let inner = *inner;
+                        // A byte referent (`*const u8`/`*mut i8`) keeps its byte
+                        // type on the node so codegen emits a one-byte load, but
+                        // the value the program sees is an `i64`: rmc has no
+                        // byte-valued local, so `*p` behaves as `i64` everywhere
+                        // else (printing, arithmetic, comparison).
+                        let value_ty = byte_value_ty(&inner);
                         *e = Expr::Deref { expr: Box::new(operand), ty: inner.clone() };
-                        Ok(inner)
+                        Ok(value_ty)
                     }
                     other => Err(format!("cannot dereference a value of type {other:?}")),
                 }
@@ -3671,7 +4514,11 @@ impl Sema {
                     Type::Ref(referent, _) => {
                         let referent = *referent;
                         *e = Expr::Deref { expr: Box::new(r), ty: referent.clone() };
-                        Ok(referent)
+                        // A byte referent keeps its byte type on the node so
+                        // codegen loads one byte, but the matched value is an
+                        // `i64` (see `byte_value_ty`), so a literal pattern
+                        // `7` compares equal.
+                        Ok(byte_value_ty(&referent))
                     }
                     other => {
                         *e = r;
@@ -3744,7 +4591,16 @@ impl Sema {
                 Ok(Type::Bool)
             }
             Expr::Cast(inner, to) => {
-                let it = self.check_expr(inner, scope)?;
+                // A cast has its own type boundary: its operand is typed
+                // independently of the destination, so `let x: u8 = 300u16 as u8`
+                // checks `300u16` at its own width (fits `u16`) and only the cast
+                // narrows it. Clear the binding's expected width while checking
+                // the operand, or `300` would be range-checked as a `u8` before
+                // the cast can legally truncate it.
+                let saved_expected = self.expected_int.take();
+                let it = self.check_expr(inner, scope);
+                self.expected_int = saved_expected;
+                let it = it?;
                 // An enum may be cast to `i64` (its tag), but not the reverse:
                 // rustc rejects `i64 as Enum`, and rmc is a subset of Rust, so
                 // it rejects it too rather than inventing a conversion.
@@ -3756,6 +4612,53 @@ impl Sema {
                     }
                 }
                 let rt = self.resolve_ty(to)?;
+                // A literal cast folds at compile time to its in-width value, so
+                // `300u16 as u8` is `44` and `-1 as u32` is `4294967295`; every
+                // other cast is emitted and narrows at run time.
+                if is_int_literal(inner) {
+                    if let Some(v) = const_i64(inner) {
+                        if is_int_ty(&rt) {
+                            let bits = int_bits(&rt);
+                            let signed = int_signed(&rt);
+                            match &**inner {
+                                // A *bare* literal operand (`300 as u8`) is typed
+                                // by the cast itself, so it must fit the
+                                // destination — rustc rejects `300 as u8` as
+                                // `literal out of range for u8`. A *suffixed*
+                                // literal carries its own width (`300u16 as u8`),
+                                // so the cast legitimately narrows it and no
+                                // range check applies here.
+                                Expr::Int(_) => self.check_int_range(v, &rt)?,
+                                // A negated literal keeps its sign: `-128 as i8`
+                                // is the signed minimum and is accepted, but
+                                // `-129 as i8` is out of range and `-1 as u8`
+                                // applies `-` to an unsigned type, both rejected
+                                // like rustc.
+                                Expr::Un(UnOp::Neg, operand)
+                                    if matches!(operand.as_ref(), Expr::Int(_)) =>
+                                {
+                                    if !signed && v != 0 {
+                                        return Err(format!(
+                                            "cannot apply unary `-` to an unsigned integer `{}`",
+                                            int_ty_name(&rt)
+                                        ));
+                                    }
+                                    if bits < 64 && !fits_int(v, signed, bits) {
+                                        return Err(format!(
+                                            "literal out of range for `{}`",
+                                            int_ty_name(&rt)
+                                        ));
+                                    }
+                                }
+                                _ => {}
+                            }
+                            let folded = wrap_int(v, signed, bits);
+                            **inner = Expr::Int(folded);
+                            *to = rt.clone();
+                            return Ok(rt);
+                        }
+                    }
+                }
                 // Only scalars can be cast. Casting an integer to an aggregate
                 // would let codegen reinterpret the integer as an address and
                 // read arbitrary memory.
@@ -3774,6 +4677,44 @@ impl Sema {
 /// the address of the `{len, bytes}` record, so they are interchangeable.
 fn is_string_ty(t: &Type) -> bool {
     *t == Type::Str || matches!(t, Type::Ref(i, _) if **i == Type::Str)
+}
+
+/// True for the integer types: the native `i64` and any narrower `Int`. A
+/// `char`, `bool` and an enum are excluded, so this is exactly what arithmetic
+/// and an ordering comparison accept.
+fn is_int_ty(t: &Type) -> bool {
+    matches!(t, Type::I64 | Type::Int { .. })
+}
+
+/// The bit width of an integer type, for the shift-count range and for a cast.
+/// `char` is 32-bit (its scalar value), everything else that reaches here is
+/// 64-bit.
+fn int_bits(t: &Type) -> u16 {
+    match t {
+        Type::Int { bits, .. } => *bits,
+        Type::Char => 32,
+        _ => 64,
+    }
+}
+
+/// The signedness of an integer type: `u*` is unsigned, `i*`/`isize` signed.
+/// A cast to an unsigned width zero-extends, to a signed one sign-extends.
+fn int_signed(t: &Type) -> bool {
+    match t {
+        Type::Int { signed, .. } => *signed,
+        _ => true,
+    }
+}
+
+/// True for an integer literal or a `-`-negated integer literal: the only
+/// expressions that coerce to any integer width, exactly as rustc infers a
+/// literal's type from its expected type.
+fn is_int_literal(e: &Expr) -> bool {
+    match e {
+        Expr::Int(_) => true,
+        Expr::Un(UnOp::Neg, inner) => matches!(inner.as_ref(), Expr::Int(_)),
+        _ => false,
+    }
 }
 
 /// True when a value of type `found` may be used where `expected` is wanted.
@@ -3803,6 +4744,33 @@ fn deref_ty(t: Type) -> Type {
     match t {
         Type::Ref(inner, _) => *inner,
         other => other,
+    }
+}
+
+/// The value type a byte referent yields: `i64`. A `*const u8`/`*mut i8` carries
+/// the byte type on the `Deref` node so codegen emits a one-byte access, but the
+/// value is an `i64` — rmc has no byte-valued local, so a byte read must behave
+/// as an `i64` in printing, arithmetic and comparison. Every non-byte referent is
+/// returned unchanged.
+/// The value type a byte referent yields: the byte-width integer itself. A
+/// `*const u8` read is a `u8` value, so `*p as i64` and `*p + 1` type exactly as
+/// rustc types them; codegen still emits a one-byte load (see `byte_load`).
+fn byte_value_ty(t: &Type) -> Type {
+    match t {
+        Type::U8 => Type::Int { signed: false, bits: 8 },
+        Type::I8 => Type::Int { signed: true, bits: 8 },
+        other => other.clone(),
+    }
+}
+
+/// Normalise a reference referent's byte-ness away for a cast: both the parser's
+/// byte referent (`U8`/`I8`) and the 8-bit `Int` a byte value has are one byte,
+/// so `*mut u8 as *mut i8` and `*mut u8 as *mut i64` compare equal, while a
+/// width mismatch between two non-byte referents stays rejected.
+fn byte_ref_norm(t: &Type) -> Type {
+    match t {
+        Type::U8 | Type::I8 | Type::Int { bits: 8, .. } => Type::I64,
+        other => other.clone(),
     }
 }
 

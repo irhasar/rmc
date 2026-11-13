@@ -9,6 +9,11 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
     I64,
+    /// An integer narrower than 64 bits, e.g. `u8`, `i32`, `usize`. It occupies
+    /// one 8-byte slot like `I64`, but arithmetic wraps and compares at `bits`
+    /// and a cast truncates/sign- or zero-extends. `I64` stays a separate
+    /// variant so 64-bit programs are unchanged.
+    Int { signed: bool, bits: u16 },
     Bool,
     /// `char`: one Unicode scalar value, held in a 32-bit slot. A `char`
     /// converts to an integer with `as` and compares as one, but is a distinct
@@ -33,6 +38,15 @@ pub enum Type {
     /// even when `T` is an aggregate. There is no lifetime or borrow checking:
     /// rmc trusts the programmer not to outlive the referent.
     Ref(Box<Type>, bool),
+    /// A byte referent: `u8` or `i8`. It only ever appears as the referent of a
+    /// pointer (`*const u8`, `*mut i8`, `&u8`), never as a standalone value
+    /// type — rmc has no byte-valued local, so `*p` on such a pointer still
+    /// yields `i64`. The variant exists so codegen can emit a one-byte load or
+    /// store for the referent while the value the program sees stays a word,
+    /// which is what keeps a `*const u8` read from returning eight bytes. `u8`
+    /// zero-extends and `i8` sign-extends on load, matching Rust.
+    U8,
+    I8,
     /// A string literal: a pointer to a NUL-terminated byte string in static
     /// data. It occupies one slot and travels in one register like `i64`, but it
     /// is a distinct type so it cannot be added to an integer or passed where an
@@ -51,7 +65,15 @@ pub enum Type {
 impl Type {
     pub fn size(&self) -> usize {
         match self {
-            Type::I64 | Type::Bool | Type::Char | Type::Str | Type::Enum(_) | Type::Ref(..) => 8,
+            Type::I64
+            | Type::Int { .. }
+            | Type::Bool
+            | Type::Char
+            | Type::Str
+            | Type::Enum(_)
+            | Type::Ref(..)
+            | Type::U8
+            | Type::I8 => 8,
             Type::EnumData(_, size) => *size,
             Type::Unit | Type::Never => 0,
             Type::Array(elem, n) => elem.size() * n,
@@ -66,7 +88,15 @@ impl Type {
     pub fn is_scalar(&self) -> bool {
         matches!(
             self,
-            Type::I64 | Type::Bool | Type::Char | Type::Str | Type::Enum(_) | Type::Ref(..)
+            Type::I64
+                | Type::Int { .. }
+                | Type::Bool
+                | Type::Char
+                | Type::Str
+                | Type::Enum(_)
+                | Type::Ref(..)
+                | Type::U8
+                | Type::I8
         )
     }
 
@@ -76,18 +106,39 @@ impl Type {
     /// and indexes correctly. A payload enum or a reference is excluded,
     /// matching rustc, which rejects both as array elements.
     pub fn is_int_or_bool(&self) -> bool {
-        matches!(self, Type::I64 | Type::Bool | Type::Char | Type::Enum(_))
+        matches!(
+            self,
+            Type::I64
+                | Type::Int { .. }
+                | Type::Bool
+                | Type::Char
+                | Type::Enum(_)
+                | Type::U8
+                | Type::I8
+        )
     }
 
-    /// True for the types an array element may have now that nested aggregates
-    /// are supported: the integer-like scalars plus a nested array or a struct.
+    /// True for the types an array element may have: the integer-like scalars
+    /// plus `str`, a reference, a nested array, a struct or a payload enum.
     /// Every such type is a multiple of 8 bytes, so an element's stride is
-    /// `size() / 8` slots. A payload enum, a reference and `str` stay excluded
-    /// (rustc rejects a payload enum and a reference as array elements too).
+    /// `size() / 8` slots. `str` and a reference are one-word pointers, so
+    /// `[&str; n]` and `[&T; n]` are arrays of pointers, exactly as rustc lays
+    /// them out.
     pub fn is_array_elem(&self) -> bool {
         matches!(
             self,
-            Type::I64 | Type::Bool | Type::Char | Type::Enum(_) | Type::Array(..) | Type::Struct(..)
+            Type::I64
+                | Type::Int { .. }
+                | Type::Bool
+                | Type::Char
+                | Type::Enum(_)
+                | Type::EnumData(..)
+                | Type::Array(..)
+                | Type::Struct(..)
+                | Type::U8
+                | Type::I8
+                | Type::Str
+                | Type::Ref(..)
         )
     }
 
@@ -113,6 +164,9 @@ impl Type {
     pub fn key(&self) -> String {
         match self {
             Type::I64 => "i".to_string(),
+            Type::Int { signed, bits } => format!("w{}{}", if *signed { "s" } else { "u" }, bits),
+            Type::U8 => "U".to_string(),
+            Type::I8 => "J".to_string(),
             Type::Bool => "b".to_string(),
             Type::Char => "c".to_string(),
             Type::Str => "s".to_string(),
@@ -148,12 +202,75 @@ impl Type {
 pub fn tuple_struct_name(elem_keys: &[String]) -> String {
     format!("\u{0}tuple({})", elem_keys.join(","))
 }
-
 /// True for the anonymous structs `tuple_struct_name` produces. The name starts
 /// with a NUL, which no source identifier can contain, so it can never collide
 /// with a user struct or be written in source.
 pub fn is_tuple_name(name: &str) -> bool {
     name.starts_with("\u{0}tuple(")
+}
+
+/// The source spelling of an integer type (`u32`, `i8`, `usize`, `i64`), used
+/// in diagnostics. Any non-`Int` type reads as `i64`, the native integer.
+pub fn int_ty_name(t: &Type) -> &'static str {
+    match t {
+        Type::Int { signed: false, bits: 8 } => "u8",
+        Type::Int { signed: false, bits: 16 } => "u16",
+        Type::Int { signed: false, bits: 32 } => "u32",
+        Type::Int { signed: true, bits: 8 } => "i8",
+        Type::Int { signed: true, bits: 16 } => "i16",
+        Type::Int { signed: true, bits: 32 } => "i32",
+        Type::Int { signed: true, bits: 128 } => "i128",
+        Type::Int { signed: false, bits: 128 } => "u128",
+        _ => "i64",
+    }
+}
+
+/// Whether the signed integer `v` fits `bits`, for the literal-range check.
+pub fn fits_int(v: i64, signed: bool, bits: u16) -> bool {
+    if bits >= 64 {
+        return true;
+    }
+    if signed {
+        let lo = -(1i64 << (bits - 1));
+        let hi = (1i64 << (bits - 1)) - 1;
+        v >= lo && v <= hi
+    } else {
+        v >= 0 && (v as u64) < (1u64 << bits)
+    }
+}
+
+/// Wrap `v` to the width `bits` as a two's-complement bit pattern, stored in an
+/// `i64` the way the machine keeps a narrow value. This is what the hardware
+/// does after an arithmetic instruction and what a cast to a width yields.
+pub fn wrap_int(v: i64, signed: bool, bits: u16) -> i64 {
+    if bits >= 64 {
+        return v;
+    }
+    if signed {
+        let shift = 64 - bits;
+        (v << shift) >> shift
+    } else {
+        (v as u64 & ((1u64 << bits) - 1)) as i64
+    }
+}
+
+/// Interpret the low `bits` of `v` as an unsigned value. Used to decide whether
+/// `a op b` overflows a width and to fold a narrow constant expression.
+pub fn to_unsigned(v: i64, bits: u16) -> u64 {
+    if bits >= 64 {
+        v as u64
+    } else {
+        (v as u64) & ((1u64 << bits) - 1)
+    }
+}
+
+/// Whether the low `bits` of `v`, read signed, are negative.
+pub fn is_negative(v: i64, bits: u16) -> bool {
+    if bits >= 64 {
+        v < 0
+    } else {
+        (v >> (bits - 1)) & 1 == 1
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,6 +333,13 @@ pub enum Expr {
         arg_slots: Vec<(i32, usize)>,
         ret_slot: i32,
         ret_ty: Type,
+        /// For a `__rmc_vec_push`/`__rmc_vec_repeat`/`__rmc_veclist` call, the
+        /// element type the destination `Vec<T>` was declared with. The value
+        /// argument travels type-erased as `I64` (a scalar word, or an
+        /// aggregate's address), so without this sema cannot tell a valid
+        /// element from a different aggregate of the same size (`v.push(Q{..})`
+        /// on a `Vec<P>`). `None` for every other call.
+        elem_ty: Option<Type>,
     },
     /// `(a, b, ...)`: a tuple literal. `sema` resolves its element types and
     /// rewrites it into a `StructLit` of the anonymous struct that lays the
@@ -304,6 +428,16 @@ pub enum Expr {
         /// fields are ignored rather than named. Only meaningful when the
         /// pattern has an argument list (`n_binds >= 0`).
         has_rest: bool,
+        /// Tests for refutable payload sub-patterns, each paired with the index
+        /// of the field it reads (`E::A(Some(x))` adds the `Some` test over
+        /// field 0). All must hold for the arm to match; codegen `&&`s them
+        /// after the tag test, so a read only runs once the tag matched. A
+        /// `_`/binding sub-pattern contributes none, and a struct/tuple
+        /// sub-pattern contributes only its own refutable elements'. The field
+        /// index is kept so exhaustiveness can union only tests of the *same*
+        /// field: `W(I::A, _)` and `W(_, I::B)` cover different fields, so
+        /// together they do not cover `W(I::B, I::A)`.
+        sub_tests: Vec<(usize, Expr)>,
     },
     /// `value == true`/`false`, as a `bool`. The arm test a `bool` literal
     /// pattern desugars to. It is a distinct node rather than a plain
@@ -425,7 +559,10 @@ pub enum Stmt {
 }
 
 /// A user-defined struct. Field offsets are assigned by sema in declaration
-/// order, so the layout is exactly the declaration order with no padding.
+/// order, so the layout is exactly the declaration order with no padding. A
+/// tuple struct (`struct P(T, T);`) stores its fields under the positional
+/// names `"0"`, `"1"`, ..., so it lays out and reads exactly like a braced
+/// struct; the parser records which names are constructors separately.
 #[derive(Debug, Clone)]
 pub struct StructDef {
     pub name: String,
@@ -450,6 +587,9 @@ pub struct FnDef {
     /// checking (`&mut T` and `&T` are distinct types); there is no exclusivity
     /// check.
     pub ref_self_mut: bool,
+    /// True when the receiver was written `mut self`: it is taken by value, but
+    /// the binding is mutable, so the body may assign it.
+    pub self_mut: bool,
     pub params: Vec<(String, Type)>,
     /// Whether each parameter was declared `mut`, parallel to `params`. A
     /// non-`mut` parameter is an immutable binding, so assigning it is rejected

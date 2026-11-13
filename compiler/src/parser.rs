@@ -1,7 +1,7 @@
 //! Recursive-descent parser for the rmc Rust subset.
 
 use crate::ast::*;
-use crate::consts::eval_i64;
+use crate::consts::{const_i64, eval_i64};
 use crate::lexer::{Tok, Token};
 
 /// One saved entry of a parser name table, so a block's bindings are forgotten
@@ -14,12 +14,37 @@ use crate::lexer::{Tok, Token};
 enum NameScope {
     /// `vec_names`: whether the name was already present.
     VecName(String, bool),
-    VecCap(String, Option<i64>),
-    VecLen(String, Option<i64>),
     VecElem(String, Option<i64>),
+    /// `vec_elem_ty`: the element type a binding shadowed, if any.
+    VecElemTy(String, Option<Type>),
+    /// `vec_mut`: the mutability a binding shadowed, if any.
+    VecMut(String, Option<bool>),
     Ptr(String, Option<i64>),
     /// `args_vecs`: a `std::env::args()...collect()` binding.
     ArgsVec(String, Option<i64>),
+    /// `string_names`: whether the name was already present.
+    StringName(String, bool),
+    /// `arr_elem`: the array element width a binding shadowed, if any.
+    ArrElem(String, Option<i64>),
+    /// A `const` declared inside the block, so the name is removed (or its
+    /// outer value restored) when the block ends. The `Option` is the value the
+    /// name had before, if any.
+    ConstInt(String, Option<i64>),
+    ConstBool(String, Option<bool>),
+    ConstChar(String, Option<u32>),
+    ConstNarrow(String, Option<Type>),
+}
+
+/// A `const` (or immutable `static`) declared inside a block. It is folded by
+/// the block scan and in scope for the rest of the block, exactly like a
+/// top-level `const` is in scope for the rest of the file; it is never added to
+/// the program's item list, so codegen never sees it. `start`/`end` are token
+/// indices: the `const`/`static` keyword and the token just past the `;`, so the
+/// main parse can skip the item the scan already folded.
+#[derive(Debug, Clone)]
+struct LocalConst {
+    start: usize,
+    end: usize,
 }
 
 pub struct Parser {
@@ -50,6 +75,10 @@ pub struct Parser {
     /// Constant `char` items by name, so a `const C: char` used as a `match`
     /// pattern becomes the character pattern.
     const_chars: std::collections::HashMap<String, u32>,
+    /// The declared width of each narrow integer constant (`const N: u8`), so a
+    /// use is substituted as a value of that width rather than as an `i64`. The
+    /// value itself lives in `consts`; this only records the width.
+    const_narrow: std::collections::HashMap<String, Type>,
     /// Struct field names by struct name, collected before parsing so a struct
     /// pattern (`S { f, .. }`) can be checked at parse time. A struct pattern
     /// has no runtime test, so the parser rewrites it into field reads; that
@@ -57,6 +86,31 @@ pub struct Parser {
     /// struct declared later in the file is covered because the whole list is
     /// scanned first.
     struct_fields: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// Byte size of each struct, from sema's own layout once the aliases are
+    /// known. A `Vec<Struct>` element is stored inline, so its stride is this
+    /// size; reusing sema's layout keeps the two in agreement.
+    struct_sizes: std::collections::HashMap<String, usize>,
+    /// Byte size of each enum, from sema's own layout. A payload-enum element of
+    /// a `Vec` is an aggregate stored inline, so its stride is this size; a unit
+    /// enum is one word.
+    enum_sizes: std::collections::HashMap<String, usize>,
+    /// Token index of the `struct`/`enum` keyword of every top-level type
+    /// definition, in source order. `compute_struct_sizes` re-parses each one
+    /// once the aliases and constants are known, so the parser lays types out
+    /// with sema's own `resolve_layouts` rather than a second implementation
+    /// that could disagree.
+    type_def_starts: Vec<usize>,
+    /// Names of tuple structs (`struct P(T, T);`), collected before parsing so
+    /// that a call `P(a, b)` lowers to a `StructLit` rather than a function call
+    /// and a pattern `P(x, y)` to a struct pattern rather than an enum variant
+    /// or a call. A tuple struct declared later in the file is covered because
+    /// the whole file is scanned first. Maps the name to its field count, so a
+    /// constructor call and a tuple pattern can be checked at parse time.
+    struct_ctors: std::collections::HashMap<String, usize>,
+    /// Names of unit structs (`struct U;`). Unlike an empty braced struct
+    /// (`struct E {}`), a unit struct's name is also its value, so `let u = U;`
+    /// is legal; it lowers to a zero-sized `StructLit`.
+    unit_structs: std::collections::HashSet<String>,
     /// Anonymous structs introduced by tuple *types*, keyed by the canonical
     /// name `ast::tuple_struct_name` produces. A tuple is lowered to a struct
     /// (element `k` is field `"k"`), so it reuses the whole struct path through
@@ -77,6 +131,12 @@ pub struct Parser {
     /// only the program's items (a top-level `fn`, `struct`, `enum` or `const`),
     /// never an enclosing local, so nothing needs to be closed over.
     nested_fns: Vec<FnDef>,
+    /// One frame per block being parsed, innermost last, of the `const`s (and
+    /// immutable `static`s) declared directly in that block. A block-scoped
+    /// `const` is folded when it is parsed and shadows an outer one until the
+    /// block ends, matching rustc's scoping; the name table `consts`/`const_bools`/
+    /// `const_chars` is updated in place and restored by `pop_name_scope`.
+    local_consts: Vec<Vec<LocalConst>>,
     /// True while parsing a pattern that may be refutable (a `match` arm, an
     /// `if let` / `while let` scrutinee). A tuple pattern is irrefutable only
     /// when every element is, but in a refutable position its elements may be
@@ -126,12 +186,6 @@ pub struct Parser {
     /// as an `i64` address, and the few methods the corpus uses are folded here
     /// (`.as_mut_ptr()`, `.capacity()`, `.len()`).
     vec_names: std::collections::HashSet<String>,
-    /// The constant capacity of a `Vec::with_capacity(k)` binding, for
-    /// `v.capacity()`.
-    vec_cap: std::collections::HashMap<String, i64>,
-    /// The constant length of a `vec![e; n]` binding with a constant `n`, for
-    /// `v.len()`.
-    vec_len: std::collections::HashMap<String, i64>,
     /// Names holding a raw pointer (an `i64` address) taken by `.as_mut_ptr()`
     /// or `.as_ptr()`, mapped to the byte stride of one element. A `.add(off)`
     /// on one is `ptr + off * stride`, matching the raw-pointer method: `add`
@@ -143,10 +197,42 @@ pub struct Parser {
     /// stride. rmc stores every element in a word, so an absent or unrecognised
     /// element type defaults to eight.
     vec_elem: std::collections::HashMap<String, i64>,
+    /// The element *type* of each `Vec<T>` binding, when the annotation named a
+    /// struct or enum. An element that is an aggregate is stored inline (its
+    /// stride is its size), and `v[i]` must yield the aggregate so a field
+    /// access or a whole-element copy works; a scalar element is absent and
+    /// reads as `i64` (its `vec_elem` width carries any narrowing). Without
+    /// this, `v[i]` on a `Vec<Struct>` was typed `i64` and rejected.
+    vec_elem_ty: std::collections::HashMap<String, Type>,
+    /// Whether each `Vec<T>` binding was declared `mut`. A `v[i] = x` write is
+    /// rejected by sema only when the element reference is shared, so the index
+    /// lowering forms `&mut` or `&` from this: a read-only binding yields a
+    /// shared reference and the write is rejected, matching rustc.
+    vec_mut: std::collections::HashMap<String, bool>,
     /// The element width of the most recently parsed `Vec<T>` type, so the
     /// `let` that consumes the type can record it against the binding name.
     /// Only `Vec` bindings read it, and they always follow their annotation.
     vec_elem_pending: Option<i64>,
+    /// The element *type* of the most recently parsed `Vec<T>` type, when it is
+    /// a struct or enum name (else `None`). Consumed alongside
+    /// `vec_elem_pending`.
+    vec_elem_pending_ty: Option<Type>,
+    /// Whether the per-index bounds check is on. A `v[i]` on a `Vec` then lowers
+    /// through the runtime's `__rmc_vec_at`, which traps on an out-of-range
+    /// index instead of reading past the element store. On by default, so the
+    /// index is a checked access; `--no-bounds-checks` makes it plain pointer
+    /// arithmetic.
+    bounds_checks: bool,
+    /// Names bound to a `String` (a growable byte buffer). A `String` value is
+    /// the address of a `{len, bytes}` record, so it shares `str`'s layout and
+    /// only its methods (`push_str`, `push`, `capacity`, `as_str`) and its
+    /// growth-returning push need to know the binding is a `String`.
+    string_names: std::collections::HashSet<String>,
+    /// Element byte width of each array binding declared with a `[T; N]`
+    /// annotation, so `arr.iter().sum()` knows whether the element is a `u8`
+    /// (accumulated in `u8`, wrapping) or an `i64`. An unannotated array is
+    /// absent and defaults to eight.
+    arr_elem: std::collections::HashMap<String, i64>,
     /// The bare-identifier target of each `type` alias (`type Byte = u8` ->
     /// `Byte` -> `u8`), so a `Vec<Byte>` can resolve the element to its
     /// underlying byte width. Only a target that is a single identifier is
@@ -157,6 +243,10 @@ pub struct Parser {
     /// when the block ends, and an outer binding it shadowed is restored, so a
     /// name's recorded stride and shape are lexically scoped.
     name_scopes: Vec<Vec<NameScope>>,
+    /// True while parsing the injected `Option`/`Result` prelude, so that
+    /// prelude's own `parse_program` does not inject it again (which would
+    /// recurse forever).
+    in_prelude: bool,
 }
 
 /// The deepest expression, block or type nesting the parser accepts. Deeply
@@ -170,6 +260,66 @@ pub struct Parser {
 /// is roughly 800 KiB, which leaves room, and is far above any hand-written
 /// program.
 const MAX_DEPTH: u32 = 100;
+
+/// The `Option`/`Result` prelude, injected into every program (see
+/// `parse_program`). It is written in the language rmc already compiles — a
+/// payload enum plus `impl` methods — so the parser, sema and codegen need no
+/// special case for it. `Option<T>`/`Result<T, E>` type arguments and the
+/// `Some`/`None`/`Ok`/`Err` constructors are sugar the parser rewrites to these
+/// names (rmc is monomorphic in `i64`, so the type parameters carry no meaning).
+/// `unwrap`/`expect` panic with exit 101 on the failing variant, matching
+/// rustc's panic code. Unused methods are removed by the dead-function pass, so
+/// a program that never names them pays nothing.
+const OPTION_RESULT_PRELUDE: &str = r#"
+enum Option { None, Some(i64) }
+enum Result { Ok(i64), Err(i64) }
+impl Option {
+    fn unwrap(self) -> i64 {
+        match self { Option::Some(v) => v, Option::None => exit(101) }
+    }
+    fn expect(self, _m: str) -> i64 {
+        match self { Option::Some(v) => v, Option::None => exit(101) }
+    }
+    fn unwrap_or(self, d: i64) -> i64 {
+        match self { Option::Some(v) => v, Option::None => d }
+    }
+    fn is_some(&self) -> bool {
+        match self { Option::Some(_) => true, Option::None => false }
+    }
+    fn is_none(&self) -> bool {
+        match self { Option::Some(_) => false, Option::None => true }
+    }
+    fn or(self, other: Option) -> Option {
+        match self { Option::Some(v) => Option::Some(v), Option::None => other }
+    }
+    fn ok_or(self, e: i64) -> Result {
+        match self { Option::Some(v) => Result::Ok(v), Option::None => Result::Err(e) }
+    }
+}
+impl Result {
+    fn unwrap(self) -> i64 {
+        match self { Result::Ok(v) => v, Result::Err(_) => exit(101) }
+    }
+    fn expect(self, _m: str) -> i64 {
+        match self { Result::Ok(v) => v, Result::Err(_) => exit(101) }
+    }
+    fn unwrap_or(self, d: i64) -> i64 {
+        match self { Result::Ok(v) => v, Result::Err(_) => d }
+    }
+    fn is_ok(&self) -> bool {
+        match self { Result::Ok(_) => true, Result::Err(_) => false }
+    }
+    fn is_err(&self) -> bool {
+        match self { Result::Ok(_) => false, Result::Err(_) => true }
+    }
+    fn ok(self) -> Option {
+        match self { Result::Ok(v) => Option::Some(v), Result::Err(_) => Option::None }
+    }
+    fn err(self) -> Option {
+        match self { Result::Ok(_) => Option::None, Result::Err(e) => Option::Some(e) }
+    }
+}
+"#;
 
 /// Expressions that are allowed as statements without a trailing `;`.
 fn is_block_like(e: &Expr) -> bool {
@@ -190,7 +340,13 @@ impl Parser {
             consts: std::collections::HashMap::new(),
             const_bools: std::collections::HashMap::new(),
             const_chars: std::collections::HashMap::new(),
+            const_narrow: std::collections::HashMap::new(),
             struct_fields: std::collections::HashMap::new(),
+            struct_sizes: std::collections::HashMap::new(),
+            enum_sizes: std::collections::HashMap::new(),
+            type_def_starts: Vec::new(),
+            struct_ctors: std::collections::HashMap::new(),
+            unit_structs: std::collections::HashSet::new(),
             tuple_structs: std::collections::HashSet::new(),
             tuple_defs: Vec::new(),
             std_mods: {
@@ -199,6 +355,7 @@ impl Parser {
                 m
             },
             nested_fns: Vec::new(),
+            local_consts: Vec::new(),
             pat_refutable_ok: false,
             fn_scopes: vec![Vec::new()],
             fn_at: std::collections::HashMap::new(),
@@ -208,14 +365,26 @@ impl Parser {
             args_vecs: std::collections::HashMap::new(),
             args_elems: std::collections::HashSet::new(),
             vec_names: std::collections::HashSet::new(),
-            vec_cap: std::collections::HashMap::new(),
-            vec_len: std::collections::HashMap::new(),
             ptr_vars: std::collections::HashMap::new(),
             vec_elem: std::collections::HashMap::new(),
+            vec_elem_ty: std::collections::HashMap::new(),
+            vec_mut: std::collections::HashMap::new(),
             vec_elem_pending: None,
+            vec_elem_pending_ty: None,
+            bounds_checks: true,
+            string_names: std::collections::HashSet::new(),
+            arr_elem: std::collections::HashMap::new(),
             alias_target: std::collections::HashMap::new(),
             name_scopes: Vec::new(),
+            in_prelude: false,
         }
+    }
+
+    /// Turn the per-index bounds check on or off for `v[i]` on a `Vec`. On by
+    /// default; `--no-bounds-checks` passes `false`.
+    pub fn bounds_checks(mut self, on: bool) -> Self {
+        self.bounds_checks = on;
+        self
     }
 
     /// Count one level of nesting and fail past `MAX_DEPTH`.
@@ -233,6 +402,58 @@ impl Parser {
 
     fn peek(&self) -> Option<&Tok> {
         self.toks.get(self.i).map(|t| &t.tok)
+    }
+
+    /// Split a `>=` or `>>` token at the current position into a `>` now and
+    /// the rest (`=` or `>`) as a fresh token, so a type's closing `>` can be
+    /// taken even when the source glued it to a following operator
+    /// (`Result<i64,i64>=Ok(5)`, `Vec<Vec<i64>>`). Rust's own parser does the
+    /// same split. Called only where a `>` is expected, so it never fires on a
+    /// genuine comparison.
+    fn split_gt(&mut self) {
+        if self.i >= self.toks.len() {
+            return;
+        }
+        let pos = self.toks[self.i].pos;
+        match self.toks[self.i].tok {
+            Tok::Ge => {
+                self.toks[self.i].tok = Tok::Eq;
+                self.toks.insert(self.i, Token { tok: Tok::Gt, pos });
+            }
+            Tok::Shr => {
+                self.toks[self.i].tok = Tok::Gt;
+                self.toks.insert(self.i, Token { tok: Tok::Gt, pos });
+            }
+            Tok::ShrEq => {
+                self.toks[self.i].tok = Tok::Ge;
+                self.toks.insert(self.i, Token { tok: Tok::Gt, pos });
+            }
+            _ => return,
+        }
+        self.shift_token_indices(self.i);
+    }
+
+    /// Shift every recorded token index at or after `at` by one, after a token
+    /// was inserted there by `split_gt`. `fn_at` and the `LocalConst` frames
+    /// hold indices captured *before* a block's items are parsed, so an insert
+    /// inside a later item would otherwise leave them one token short: the
+    /// `fn`/`const` would no longer be recognised and the item would be parsed
+    /// as an ordinary statement.
+    fn shift_token_indices(&mut self, at: usize) {
+        self.fn_at = std::mem::take(&mut self.fn_at)
+            .into_iter()
+            .map(|(k, v)| (if k >= at { k + 1 } else { k }, v))
+            .collect();
+        for frame in self.local_consts.iter_mut() {
+            for c in frame.iter_mut() {
+                if c.start >= at {
+                    c.start += 1;
+                }
+                if c.end >= at {
+                    c.end += 1;
+                }
+            }
+        }
     }
 
     /// The token after the next one, for a two-token lookahead (`'a: loop`).
@@ -310,10 +531,17 @@ impl Parser {
         let mut consts = Vec::new();
         let mut fns = Vec::new();
         while self.peek().is_some() {
+            // `pub` (and `pub(crate)` / `pub(super)` / `pub(in ..)`) may prefix
+            // any item. rmc has one flat namespace, so the visibility is
+            // dropped; skipping it here lets an ordinary `.rs` file parse.
+            self.skip_pub()?;
             match self.peek() {
                 Some(Tok::Struct) => structs.push(self.parse_struct()?),
                 Some(Tok::Enum) => enums.push(self.parse_enum()?),
                 Some(Tok::Const) => consts.push(self.parse_const()?),
+                // `static [mut] NAME: T = EXPR;`. An immutable `static` is a
+                // `const`; `static mut` is rejected (rmc has no mutable global).
+                Some(Tok::Ident(id)) if id == "static" => consts.push(self.parse_static()?),
                 Some(Tok::Type) => self.parse_type_alias()?,
                 Some(Tok::Fn) => fns.push(self.parse_fn()?),
                 Some(Tok::Impl) => self.parse_impl(&mut fns)?,
@@ -336,6 +564,10 @@ impl Parser {
                 // does not provide fails later at its use site, with a clearer
                 // message than a parse error here.
                 Some(Tok::Ident(id)) if id == "use" => self.skip_use()?,
+                // `mod NAME;` / `mod NAME { .. }`: rmc has no module system, so
+                // the module is skipped. The items it would contain are not
+                // visible; a use of one fails later at its use site.
+                Some(Tok::Ident(id)) if id == "mod" => self.skip_mod()?,
                 other => {
                     return Err(format!(
                         "at byte {}: expected `fn`, `struct`, `enum`, `const`, `type` or `impl`, found {}",
@@ -353,10 +585,41 @@ impl Parser {
         // Nested functions are hoisted to the top level, so the flat list sema
         // and codegen walk holds them like any other function.
         fns.append(&mut self.nested_fns);
+        // Inject the `Option`/`Result` prelude unless the user defined those
+        // names. It is ordinary user-level code (a payload enum plus `impl`
+        // methods), so no later pass needs to know it exists; the dead-function
+        // pass drops whatever the program does not call, so an unused prelude
+        // costs nothing in the artifact. The prelude is parsed by a parser with
+        // `in_prelude` set, so it does not inject itself (which would recurse).
+        if !self.in_prelude {
+            // A user type named `Option` or `Result` shadows the prelude's, so
+            // the whole prelude is dropped: its `Option` and `Result` methods
+            // reference each other's variants (`Result::ok` builds
+            // `Option::Some`), so injecting half of it would not type-check.
+            let user_owns = enums
+                .iter()
+                .map(|e| e.name.as_str())
+                .chain(structs.iter().map(|s| s.name.as_str()))
+                .any(|n| n == "Option" || n == "Result");
+            if !user_owns {
+                let mut inner = Parser::new(crate::lexer::lex(OPTION_RESULT_PRELUDE)?);
+                inner.in_prelude = true;
+                let pre = inner.parse_program()?;
+                for e in pre.enums {
+                    enums.push(e);
+                }
+                for f in pre.fns {
+                    if !fns.iter().any(|u| u.name == f.name) {
+                        fns.push(f);
+                    }
+                }
+            }
+        }
         Ok(Program { structs, enums, consts, fns })
     }
 
     fn parse_enum(&mut self) -> PResult<EnumDef> {
+        self.skip_pub()?;
         self.expect(Tok::Enum)?;
         let name = self.expect_ident()?;
         self.expect(Tok::LBrace)?;
@@ -390,7 +653,7 @@ impl Parser {
                 }
                 let neg = self.eat(&Tok::Minus);
                 match self.peek().cloned() {
-                    Some(Tok::Int(n)) => {
+                    Some(Tok::Int(n)) | Some(Tok::IntSuffixed(n, _)) => {
                         self.bump();
                         discr = Some(if neg {
                             n.checked_neg().ok_or_else(|| {
@@ -446,9 +709,17 @@ impl Parser {
         let mut enum_names: Vec<String> = Vec::new();
         self.i = 0;
         loop {
+            // A `pub` on an item is dropped (rmc has one flat namespace), so
+            // skip it before matching the item keyword, exactly as the real
+            // parse loop does.
+            self.skip_pub()?;
             match self.peek() {
                 None => break,
                 Some(Tok::Const) => items.push(self.parse_const()?),
+                // `static [mut] NAME: T = EXPR;` is collected like a `const`:
+                // an immutable `static` is lowered to one, and `static mut` is
+                // rejected here too.
+                Some(Tok::Ident(id)) if id == "static" => items.push(self.parse_static()?),
                 Some(Tok::Type) => {
                     // `type NAME = TYPE;`. The target is not parsed yet: a
                     // `[T; N]` target needs the constant values, which are still
@@ -475,6 +746,7 @@ impl Parser {
                     // Record the field names, then skip the body. Only a braced
                     // struct has named fields to collect; a later `struct S { .. }`
                     // is what a pattern `S { f }` needs.
+                    self.type_def_starts.push(self.i);
                     self.i += 1;
                     let name = if let Some(Tok::Ident(n)) = self.peek() {
                         let n = n.clone();
@@ -490,6 +762,9 @@ impl Parser {
                         self.i += 1;
                         let mut fields = std::collections::HashSet::new();
                         while self.peek() != Some(&Tok::RBrace) && self.peek().is_some() {
+                            // A field may carry its own `pub`; skip it so the
+                            // field name is recorded, not `pub`.
+                            self.skip_pub()?;
                             if let Some(Tok::Ident(f)) = self.peek() {
                                 fields.insert(f.clone());
                                 self.i += 1;
@@ -497,25 +772,30 @@ impl Parser {
                                 self.i += 1;
                                 continue;
                             }
-                            // Skip the `: Type`, which may contain braces in an
-                            // array type; stop at the next `,` or `}`.
-                            while let Some(t) = self.peek() {
-                                if *t == Tok::Comma || *t == Tok::RBrace {
-                                    break;
-                                }
-                                if *t == Tok::LBracket {
-                                    self.skip_balanced(Tok::LBracket, Tok::RBracket)?;
-                                } else {
-                                    self.i += 1;
-                                }
-                            }
+                            // Skip the `: Type` to the next field boundary.
+                            self.expect(Tok::Colon)?;
+                            self.skip_to_brace_field_end()?;
                             if !self.eat(&Tok::Comma) {
                                 break;
                             }
                         }
                         self.expect(Tok::RBrace)?;
                         if let Some(n) = name {
-                            self.struct_fields.insert(n, fields);
+                            self.struct_fields.insert(n.clone(), fields);
+                        }
+                    } else if self.peek() == Some(&Tok::LParen) {
+                        // A tuple struct `struct P(T, T);`: record its field
+                        // count so a later `P(a, b)` call and a `P(x, y)`
+                        // pattern are recognised. A unit struct `struct U;` has
+                        // no constructor and is left out.
+                        let count = self.skip_tuple_struct_fields()?;
+                        if let Some(n) = name {
+                            self.struct_ctors.insert(n, count);
+                        }
+                    } else if self.peek() == Some(&Tok::Semi) {
+                        // A unit struct `struct U;`: its name is also its value.
+                        if let Some(n) = name {
+                            self.unit_structs.insert(n);
                         }
                     } else {
                         self.skip_balanced(Tok::LBrace, Tok::RBrace)?;
@@ -523,6 +803,7 @@ impl Parser {
                 }
                 Some(Tok::Enum) => {
                     // Record the name, then skip a balanced `{ .. }` body.
+                    self.type_def_starts.push(self.i);
                     self.i += 1;
                     if let Some(Tok::Ident(n)) = self.peek() {
                         enum_names.push(n.clone());
@@ -537,6 +818,10 @@ impl Parser {
                     }
                     self.skip_balanced(Tok::LBrace, Tok::RBrace)?;
                 }
+                // A `mod NAME;` / `mod NAME { .. }` is skipped, so a `const`
+                // inside a module body is not collected (its items are not
+                // visible to the flat namespace anyway).
+                Some(Tok::Ident(id)) if id == "mod" => self.skip_mod()?,
                 Some(Tok::Fn) => {
                     // Skip the name, the parameter list, the return type and the
                     // body, so a `const` inside a function body is not seen.
@@ -562,7 +847,7 @@ impl Parser {
             }
         }
         self.i = saved;
-        self.resolve_consts(&items);
+        self.resolve_consts(&items)?;
         // Parse each alias target now that the constants are known. Two passes
         // let `type A = B; type B = i64;` resolve: the first lays down every
         // direct target, the second fills any left as a bare `Named` (a target
@@ -611,7 +896,16 @@ impl Parser {
                 value: d.value.clone(),
             })
             .collect();
-        self.resolve_consts(&expanded_items);
+        self.resolve_consts(&expanded_items)?;
+        // Size every struct and enum now that the aliases and constants are
+        // known, so a `Vec<T>` annotation can scale its stride by the element's
+        // size. The definitions are re-parsed and laid out by sema's own
+        // `resolve_layouts`, so the parser and sema can never disagree on a
+        // layout. A program sema will reject (a recursive struct, an unknown
+        // field type) leaves the sizes it could not compute absent; the
+        // annotation then falls back to the word width and sema reports the
+        // real error.
+        self.compute_struct_sizes();
         // A `type` shares the type namespace with a struct and an enum, so a
         // collision is an error (rustc's E0428). It does *not* collide with a
         // `const` or a `fn`, which live in the value namespace. rmc keeps a
@@ -639,6 +933,38 @@ impl Parser {
         self.i += 1; // the `use` identifier
         self.collect_std_use();
         self.skip_to_semi()
+    }
+
+    /// Skip a `pub` visibility qualifier, with its optional restriction
+    /// (`pub(crate)`, `pub(super)`, `pub(in path)`). rmc resolves every name in
+    /// one flat namespace, so visibility carries no meaning and is dropped here.
+    /// Accepting it lets an ordinary Rust source file parse unchanged.
+    fn skip_pub(&mut self) -> PResult<()> {
+        if self.peek() == Some(&Tok::Ident("pub".into())) {
+            self.i += 1;
+            if self.peek() == Some(&Tok::LParen) {
+                self.skip_balanced(Tok::LParen, Tok::RParen)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Skip an inline `mod NAME { .. }`. rmc has no module system — every name
+    /// is resolved in one flat namespace — so the module body is dropped, which
+    /// lets an ordinary `.rs` file that declares inline modules parse. A
+    /// `mod NAME;` that would load another file is rejected: rmc compiles one
+    /// file and cannot resolve it, and accepting it would diverge from rustc
+    /// when the file is absent.
+    fn skip_mod(&mut self) -> PResult<()> {
+        let pos = self.pos();
+        self.i += 1; // the `mod` keyword
+        let name = self.expect_ident()?;
+        if self.peek() == Some(&Tok::Semi) {
+            return Err(format!(
+                "at byte {pos}: `mod {name};` loads another file, which rmc does not support"
+            ));
+        }
+        self.skip_balanced(Tok::LBrace, Tok::RBrace)
     }
 
     /// Record the module names a `use` of the `std` tree brings into scope.
@@ -708,13 +1034,94 @@ impl Parser {
         Err(format!("at byte {}: unexpected end of input", self.pos()))
     }
 
+    /// Skip a tuple struct's field list `(T, T, ..)`, counting the fields, with
+    /// the opening `(` current and the closing `)` and the `;` left current.
+    /// Used by the prescan, which only needs the count. A field may carry its
+    /// own `pub`, which is skipped.
+    fn skip_tuple_struct_fields(&mut self) -> PResult<usize> {
+        self.i += 1; // the `(`
+        let mut count = 0usize;
+        while self.peek() != Some(&Tok::RParen) {
+            if self.peek().is_none() {
+                return Err(format!("at byte {}: unexpected end of input", self.pos()));
+            }
+            self.skip_pub()?;
+            // A field type is a whole type, not one token: `&i64`,
+            // `*const i64`, `Vec<i64>`, `(i64, i64)` and `[i64; 3]` all span
+            // several tokens and some contain a `,` at depth. Skip to the
+            // field-separating `,` (or the closing `)`), balancing every bracket
+            // so a nested comma is not mistaken for a field boundary.
+            self.skip_to_field_end()?;
+            count += 1;
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(Tok::RParen)?;
+        Ok(count)
+    }
+
+    /// Advance to the next field boundary: a `,` or a `)` at bracket depth zero
+    /// (neither is consumed). Used by the prescan to step over a whole field
+    /// type. A `>>`/`>=` that closes two generic lists at once is split first,
+    /// so the depth stays correct.
+    fn skip_to_field_end(&mut self) -> PResult<()> {
+        let mut depth = 0i32;
+        while let Some(t) = self.peek().cloned() {
+            match t {
+                Tok::Comma | Tok::RParen if depth == 0 => return Ok(()),
+                Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+                Tok::RParen | Tok::RBracket | Tok::RBrace => depth -= 1,
+                Tok::Lt => depth += 1,
+                Tok::Gt => depth -= 1,
+                Tok::Shr => depth -= 2,
+                Tok::Ge => depth -= 1,
+                _ => {}
+            }
+            self.i += 1;
+        }
+        Err(format!("at byte {}: unexpected end of input", self.pos()))
+    }
+
+    /// Advance to the next struct field boundary: a `,` or the closing `}` of the
+    /// field list at bracket depth zero (neither is consumed). A field type never
+    /// contains a `}` at depth zero, so a braced struct body ends exactly here.
+    /// Same shape as `skip_to_field_end`, which is for a `( .. )` field list.
+    fn skip_to_brace_field_end(&mut self) -> PResult<()> {
+        let mut depth = 0i32;
+        while let Some(t) = self.peek().cloned() {
+            match t {
+                Tok::Comma | Tok::RBrace if depth == 0 => return Ok(()),
+                Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+                Tok::RParen | Tok::RBracket | Tok::RBrace => depth -= 1,
+                Tok::Lt => depth += 1,
+                Tok::Gt => depth -= 1,
+                Tok::Shr => depth -= 2,
+                Tok::Ge => depth -= 1,
+                _ => {}
+            }
+            self.i += 1;
+        }
+        Err(format!("at byte {}: unexpected end of input", self.pos()))
+    }
+
     /// `const NAME: TYPE = EXPR;`. The declared type is resolved by sema; the
     /// value is evaluated here, as soon as it is parsed, so a later array type
     /// or pattern can use it. A value that does not fold yet (it names a
     /// constant declared later) is left for `resolve_consts`, which reruns once
     /// every item has been seen.
     fn parse_const(&mut self) -> PResult<ConstDef> {
+        self.skip_pub()?;
         self.expect(Tok::Const)?;
+        self.parse_const_tail()
+    }
+
+    /// The `NAME : TYPE = EXPR ;` tail shared by `const` and an immutable
+    /// `static`. rmc has no mutable global storage, so a `static` is treated
+    /// exactly like a `const`: its initialiser must be a constant expression
+    /// (as rustc requires too), and every read yields that value. `static mut`
+    /// is rejected before this point, since mutation has no meaning here.
+    fn parse_const_tail(&mut self) -> PResult<ConstDef> {
         let name = self.expect_ident()?;
         self.expect(Tok::Colon)?;
         let ty = self.parse_type()?;
@@ -722,6 +1129,63 @@ impl Parser {
         let value = self.parse_expr()?;
         self.expect(Tok::Semi)?;
         Ok(ConstDef { name, ty, value })
+    }
+
+    /// `static [mut] NAME: TYPE = EXPR;`. An immutable `static` is lowered to a
+    /// `const`. `static mut` is rejected: rmc has no mutable global, and a
+    /// program that mutates one would diverge, so refusing is safer than
+    /// silently dropping the mutation.
+    fn parse_static(&mut self) -> PResult<ConstDef> {
+        self.skip_pub()?;
+        self.i += 1; // `static`
+        if let Some(Tok::Ident(id)) = self.peek() {
+            if id == "mut" {
+                return Err(format!(
+                    "at byte {}: `static mut` is not supported; rmc has no mutable global",
+                    self.pos()
+                ));
+            }
+        }
+        self.parse_const_tail()
+    }
+
+    /// Parse the `const`/immutable-`static` item whose keyword is at token
+    /// `start` (past any `pub`), returning the definition and the token index
+    /// just past its `;`. `self.i` is left at `start` so a caller that wants to
+    /// parse the item normally (the top-level loop) can. `static mut` is
+    /// refused, as at the top level.
+    fn parse_const_item_at(&mut self, start: usize) -> PResult<(ConstDef, usize)> {
+        let saved = self.i;
+        self.i = start;
+        self.skip_pub()?;
+        let def = if self.peek() == Some(&Tok::Const) {
+            self.i += 1;
+            self.parse_const_tail()?
+        } else {
+            // `static [mut] ..`; `parse_static` consumes the keyword itself.
+            self.parse_static()?
+        };
+        let end = self.i;
+        self.i = saved;
+        Ok((def, end))
+    }
+
+    /// The declared type of a `const`/`static`, resolved the way a top-level
+    /// `const` is (`str`, and an alias to a scalar), then required to be a kind
+    /// rmc can fold. Without this a block-scoped `const S: str = "hi";` would be
+    /// accepted while the same item at the top level is rejected.
+    fn resolve_const_ty(&self, ty: &Type, name: &str, pos: u32) -> PResult<Type> {
+        let ty = self.expand_alias_ty(ty, 0)?;
+        let ty = match ty {
+            Type::Named(n) if n == "str" => Type::Str,
+            other => other,
+        };
+        match ty {
+            Type::I64 | Type::Bool | Type::Char | Type::Int { .. } => Ok(ty),
+            other => Err(format!(
+                "at byte {pos}: constant `{name}` has type {other:?}; rmc only folds `i64`, `bool` and `char` constants"
+            )),
+        }
     }
 
     /// Rewrite every alias name in `t` to its target, so no later pass sees an
@@ -749,6 +1213,12 @@ impl Parser {
     /// `Vec<Byte>` still get a one-byte stride. The chain is bounded so a
     /// cyclic alias (which `expand_alias_ty` rejects elsewhere) cannot loop.
     fn elem_width_of(&self, t: &str) -> i64 {
+        let cur = self.resolve_alias_name(t);
+        elem_byte_width(&cur)
+    }
+
+    /// Chase a `type` alias chain to its final name.
+    fn resolve_alias_name(&self, t: &str) -> String {
         let mut cur = t.to_string();
         for _ in 0..64 {
             match self.alias_target.get(&cur) {
@@ -756,7 +1226,105 @@ impl Parser {
                 _ => break,
             }
         }
-        elem_byte_width(&cur)
+        cur
+    }
+
+
+    /// Lay out every top-level struct and enum, storing each one's byte size in
+    /// `struct_sizes`/`enum_sizes`. The definitions are re-parsed from their
+    /// recorded token positions with the real parser (so a field type is parsed
+    /// exactly as anywhere else: `[i64; 2]`, `(i64, i64)`, `Option<i64>`, a
+    /// struct or enum name, ...), then sized by sema's own `layout_sizes`. Reuse
+    /// is what keeps a `Vec<Struct>` element stride equal to the size sema
+    /// resolves for `Type::Struct`, so the parser never maintains a second
+    /// layout that could disagree. A program sema will reject (a recursive
+    /// struct, an unknown type) leaves the sizes it could not compute absent;
+    /// the annotation then falls back to the word width and sema reports the
+    /// real error.
+    fn compute_struct_sizes(&mut self) {
+        let saved = self.i;
+        let mut structs: Vec<StructDef> = Vec::new();
+        let mut enums: Vec<EnumDef> = Vec::new();
+        for start in std::mem::take(&mut self.type_def_starts) {
+            self.i = start;
+            match self.peek() {
+                Some(Tok::Struct) => {
+                    if let Ok(d) = self.parse_struct() {
+                        structs.push(d);
+                    }
+                }
+                Some(Tok::Enum) => {
+                    if let Ok(d) = self.parse_enum() {
+                        enums.push(d);
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.i = saved;
+        // A tuple field (`(i64, i64)`) is lowered to an anonymous struct whose
+        // definition the re-parse just produced; it must be laid out alongside
+        // the named ones, exactly as the program's struct list carries both.
+        let mut all = structs;
+        all.extend(self.tuple_defs.iter().cloned());
+        // `parse_program` injects the `Option`/`Result` prelude *after* this
+        // pass runs, so a user struct with an `Option<i64>` field would name a
+        // type sema's layout cannot see, failing the whole batch. Inject the
+        // prelude's enum definitions here too, under the same condition
+        // `parse_program` uses (the user owning no `Option`/`Result` struct or
+        // enum): a genuinely unresolvable field then fails alone and an
+        // unrelated `Vec<P>` keeps its size.
+        let user_owns = all
+            .iter()
+            .map(|s| s.name.as_str())
+            .chain(enums.iter().map(|e| e.name.as_str()))
+            .any(|n| n == "Option" || n == "Result");
+        if !self.in_prelude && !user_owns {
+            if let Ok(toks) = crate::lexer::lex(OPTION_RESULT_PRELUDE) {
+                let mut inner = Parser::new(toks);
+                inner.in_prelude = true;
+                if let Ok(pre) = inner.parse_program() {
+                    enums.extend(pre.enums);
+                }
+            }
+        }
+        if let Ok((sizes, esizes)) = crate::sema::layout_sizes(&all, &enums) {
+            self.struct_sizes = sizes;
+            self.enum_sizes = esizes;
+        }
+    }
+
+    /// The byte type a referent *name* denotes, if any: `u8` -> `U8`, `i8` ->
+    /// `I8`, following `type` aliases (`type Byte = u8`). `None` for every other
+    /// name, so the byte type only appears where the source wrote a byte width.
+    fn byte_referent(&self, name: &str) -> Option<Type> {
+        let mut cur = name.to_string();
+        for _ in 0..64 {
+            match self.alias_target.get(&cur) {
+                Some(next) if *next != cur => cur = next.clone(),
+                _ => break,
+            }
+        }
+        match cur.as_str() {
+            "u8" => Some(Type::U8),
+            "i8" => Some(Type::I8),
+            _ => None,
+        }
+    }
+
+    /// Parse the referent of a `*const`/`*mut`/`&` type. A byte width named
+    /// here is kept as a byte type; every other referent goes through
+    /// `parse_type`, which collapses `u8`-named non-byte aliases to `i64`. This
+    /// is why a `*const u8` load or store is one byte while `*p` still yields
+    /// an `i64`: the byte-ness lives only in the referent.
+    fn parse_referent_type(&mut self) -> PResult<Type> {
+        if let Some(Tok::Ident(n)) = self.peek().cloned() {
+            if let Some(bt) = self.byte_referent(&n) {
+                self.i += 1;
+                return Ok(bt);
+            }
+        }
+        self.parse_type()
     }
 
     /// `type NAME = TYPE;`. The target is parsed here (aliases in it expanded by
@@ -765,6 +1333,7 @@ impl Parser {
     /// registered by `prescan`, so it may be used before this point, which means
     /// `type A = B;` and `type B = i64;` resolve in either order.
     fn parse_type_alias(&mut self) -> PResult<()> {
+        self.skip_pub()?;
         self.expect(Tok::Type)?;
         let name = self.expect_ident()?;
         self.expect(Tok::Eq)?;
@@ -778,15 +1347,19 @@ impl Parser {
     /// fixpoint so a constant may name one declared later. Runs after the whole
     /// program is parsed, so a forward reference resolves here even though it
     /// did not while the use site was parsed.
-    fn resolve_consts(&mut self, defs: &[ConstDef]) {
+    fn resolve_consts(&mut self, defs: &[ConstDef]) -> PResult<()> {
         let items: Vec<(String, Type, Expr)> = defs
             .iter()
             .map(|d| (d.name.clone(), d.ty.clone(), d.value.clone()))
             .collect();
-        for (name, val) in crate::consts::resolve(&items) {
+        for (name, val) in crate::consts::resolve(&items)? {
             match val {
                 crate::consts::ConstVal::Int(v) => {
                     self.consts.insert(name, v);
+                }
+                crate::consts::ConstVal::NarrowInt(v, ty) => {
+                    self.consts.insert(name.clone(), v);
+                    self.const_narrow.insert(name, ty);
                 }
                 crate::consts::ConstVal::Bool(v) => {
                     self.const_bools.insert(name, v);
@@ -796,14 +1369,54 @@ impl Parser {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// The expression a constant use is substituted with: a plain `i64`
+    /// literal, or a suffixed literal at the constant's declared width (folded
+    /// to `Expr::Cast(Int, width)`) so arithmetic on it keeps that width. `v` is
+    /// the constant's in-width value.
+    fn const_value_expr(&self, name: &str, v: i64) -> Expr {
+        match self.const_narrow.get(name) {
+            Some(ty) => Expr::Cast(Box::new(Expr::Int(v)), ty.clone()),
+            None => Expr::Int(v),
+        }
     }
 
     fn parse_struct(&mut self) -> PResult<StructDef> {
+        self.skip_pub()?;
         self.expect(Tok::Struct)?;
         let name = self.expect_ident()?;
+        // `struct P(T, T);` — a tuple struct. Its fields are stored with
+        // positional names `"0"`, `"1"`, ... so the layout, field read and
+        // destructuring paths treat it exactly like a braced struct; only the
+        // constructor (`P(a, b)`) and the pattern (`P(x, y)`) differ, and the
+        // prescan's `struct_ctors` records which names those are.
+        if self.peek() == Some(&Tok::LParen) {
+            self.i += 1;
+            let mut fields = Vec::new();
+            while self.peek() != Some(&Tok::RParen) {
+                self.skip_pub()?;
+                let fty = self.parse_type()?;
+                fields.push((fields.len().to_string(), fty));
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect(Tok::RParen)?;
+            self.expect(Tok::Semi)?;
+            return Ok(StructDef { name, fields });
+        }
+        // `struct U;` — a unit struct. It has no fields and no constructor
+        // value, but `U` still names the type and a `let _u = U;` is legal, so
+        // it is a zero-sized struct.
+        if self.eat(&Tok::Semi) {
+            return Ok(StructDef { name, fields: Vec::new() });
+        }
         self.expect(Tok::LBrace)?;
         let mut fields = Vec::new();
         while self.peek() != Some(&Tok::RBrace) {
+            self.skip_pub()?;
             let fname = self.expect_ident()?;
             self.expect(Tok::Colon)?;
             let fty = self.parse_type()?;
@@ -837,6 +1450,7 @@ impl Parser {
     }
 
     fn parse_fn(&mut self) -> PResult<FnDef> {
+        self.skip_pub()?;
         self.expect(Tok::Fn)?;
         let name = self.expect_ident()?;
         self.expect(Tok::LParen)?;
@@ -857,7 +1471,7 @@ impl Parser {
             Type::Unit
         };
         let body = self.parse_block()?;
-        Ok(FnDef { name, self_ty: None, takes_self: false, ref_self: false, ref_self_mut: false, params, param_mut, param_pats, ret, body, param_slots: Vec::new(), ret_slot: -1, nslots: 0 })
+        Ok(FnDef { name, self_ty: None, takes_self: false, ref_self: false, ref_self_mut: false, self_mut: false, params, param_mut, param_pats, ret, body, param_slots: Vec::new(), ret_slot: -1, nslots: 0 })
     }
 
     /// `impl Type { fn method(self, ..) -> .. { .. } }`. The methods are pushed
@@ -889,6 +1503,7 @@ impl Parser {
     }
 
     fn parse_method(&mut self, ty: &str) -> PResult<FnDef> {
+        self.skip_pub()?;
         self.expect(Tok::Fn)?;
         let name = self.expect_ident()?;
         self.expect(Tok::LParen)?;
@@ -900,25 +1515,33 @@ impl Parser {
         let takes_self = match self.peek() {
             Some(Tok::Amp) => true,
             Some(Tok::Ident(n)) => n == "self",
+            // `mut self`: the receiver is by value but the binding is mutable.
+            Some(Tok::Mut) => matches!(
+                self.toks.get(self.i + 1).map(|t| &t.tok),
+                Some(Tok::Ident(n)) if n == "self"
+            ),
             _ => false,
         };
         let mut params = Vec::new();
         let mut param_mut = Vec::new();
         let mut param_pats = Vec::new();
-        let (by_ref, by_mut) = if takes_self {
+        let (by_ref, by_mut, self_mut) = if takes_self {
             let by_ref = self.eat(&Tok::Amp);
+            // `&mut self` makes the receiver a `&mut`; a by-value `mut self`
+            // only makes the local binding mutable, so it does not set `by_mut`.
             let by_mut = by_ref && self.eat(&Tok::Mut);
+            let self_mut = !by_ref && self.eat(&Tok::Mut);
             let first = self.expect_ident()?;
             debug_assert_eq!(first, "self");
             if self.eat(&Tok::Comma) {
                 self.parse_param_list(&mut params, &mut param_mut, &mut param_pats)?;
             }
-            (by_ref, by_mut)
+            (by_ref, by_mut, self_mut)
         } else {
             if self.peek() != Some(&Tok::RParen) {
                 self.parse_param_list(&mut params, &mut param_mut, &mut param_pats)?;
             }
-            (false, false)
+            (false, false, false)
         };
         self.expect(Tok::RParen)?;
         Self::check_dup_param_names(&params, &param_pats)?;
@@ -930,6 +1553,7 @@ impl Parser {
             takes_self,
             ref_self: by_ref,
             ref_self_mut: by_mut,
+            self_mut,
             params,
             param_mut,
             param_pats,
@@ -976,9 +1600,16 @@ impl Parser {
         // but there `mut` is legal and attaches to `n`.
         let at_pat = matches!(self.peek(), Some(Tok::Ident(_)))
             && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::At);
+        // `P(a, b): T` destructures a tuple struct parameter; the name must be
+        // a known constructor, so a plain `x: T` is unaffected.
+        let tuple_struct_pat = matches!(
+            self.peek(),
+            Some(Tok::Ident(n)) if self.struct_ctors.contains_key(n)
+        ) && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::LParen);
         let pat = if matches!(self.peek(), Some(Tok::LBracket))
             || matches!(self.peek(), Some(Tok::LParen))
             || at_pat
+            || tuple_struct_pat
             || matches!(self.peek(), Some(Tok::Ident(_))
                 if self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::LBrace))
         {
@@ -1124,7 +1755,7 @@ impl Parser {
                     ))
                 }
             };
-            let inner = self.parse_type()?;
+            let inner = self.parse_referent_type()?;
             return Ok(Type::Ref(Box::new(inner), mutable));
         }
         if self.eat(&Tok::Amp) {
@@ -1134,12 +1765,14 @@ impl Parser {
                 self.i += 1;
             }
             let mutable = self.eat(&Tok::Mut);
-            let inner = self.parse_type()?;
+            let inner = self.parse_referent_type()?;
             return Ok(Type::Ref(Box::new(inner), mutable));
         }
-        // `&&T` lexes as one token; treat it as two references.
+        // `&&T` lexes as one token; treat it as two references. The innermost
+        // referent goes through `parse_referent_type` too, so `&&u8` keeps the
+        // byte type and matches a reference to an existing `&u8`.
         if self.eat(&Tok::AmpAmp) {
-            let inner = self.parse_type()?;
+            let inner = self.parse_referent_type()?;
             return Ok(Type::Ref(Box::new(Type::Ref(Box::new(inner), false)), false));
         }
         match self.peek() {
@@ -1210,6 +1843,13 @@ impl Parser {
                     Tok::Ident(s) => s,
                     _ => unreachable!(),
                 };
+                // `String` has no `std` type in rmc, but it shares a `str`'s
+                // record layout, so its annotation resolves to `Str` in sema
+                // (see `resolve_ty_rec`). Keeping the `Named` marker here lets
+                // the `let` that declares it see the annotation before sema.
+                if name == "String" {
+                    return Ok(Type::Named("String".into()));
+                }
                 // `Vec<T>` has no real type in rmc; the `let` that declares an
                 // `args()`-vector consumes the `<..>` and its initializer is
                 // desugared. Here only the `<..>` is skipped and a placeholder
@@ -1217,9 +1857,33 @@ impl Parser {
                 // anywhere but that one `let` fails when it reaches sema (the
                 // name resolves to no struct).
                 if self.peek() == Some(&Tok::Lt) {
+                    // `Option<T>` / `Result<T, E>`: the prelude enums. rmc is
+                    // monomorphic in `i64`, so the type arguments carry no
+                    // meaning; skip the `<..>` and return the bare name, which
+                    // resolves to the injected enum.
+                    if name == "Option" || name == "Result" {
+                        self.i += 1; // `<`
+                        let mut depth = 1i32;
+                        while depth > 0 {
+                            self.split_gt();
+                            match self.peek() {
+                                None => {
+                                    return Err(format!(
+                                        "at byte {}: unexpected end of input in `{name}<..>`",
+                                        self.pos()
+                                    ))
+                                }
+                                Some(Tok::Lt) => depth += 1,
+                                Some(Tok::Gt) => depth -= 1,
+                                _ => {}
+                            }
+                            self.i += 1;
+                        }
+                        return Ok(Type::Named(name));
+                    }
                     if name != "Vec" {
                         return Err(format!(
-                            "at byte {}: unsupported generic type `{name}` (only `Vec<T>` is accepted)",
+                            "at byte {}: unsupported generic type `{name}` (only `Vec<T>`, `Option<T>` and `Result<T, E>` are accepted)",
                             self.pos()
                         ));
                     }
@@ -1229,12 +1893,31 @@ impl Parser {
                     // collapses `u8` to `i64`; `size_of::<T>()` is what rustc
                     // scales `add` by. A `type Byte = u8` alias is chased to its
                     // target so `Vec<Byte>` still gets a one-byte stride.
-                    let width = match self.peek() {
-                        Some(Tok::Ident(t)) => self.elem_width_of(t),
-                        _ => 8,
+                    // A struct or enum element is stored inline, so its stride is
+                    // the *size* sema resolves for it (not the word width) and
+                    // `v[i]` is typed as that aggregate; a scalar name keeps the
+                    // word width (one byte for `u8`/`i8`).
+                    let (width, elem_ty) = match self.peek() {
+                        Some(Tok::Ident(t)) => {
+                            let base = self.resolve_alias_name(t);
+                            if let Some(sz) = self.struct_sizes.get(&base) {
+                                (*sz as i64, Some(Type::Struct(base, *sz)))
+                            } else if let Some(sz) = self.enum_sizes.get(&base) {
+                                let ty = if *sz > 8 {
+                                    Type::EnumData(base, *sz)
+                                } else {
+                                    Type::Enum(base)
+                                };
+                                (*sz as i64, Some(ty))
+                            } else {
+                                (self.elem_width_of(t), None)
+                            }
+                        }
+                        _ => (8, None),
                     };
                     let mut depth = 1i32;
                     while depth > 0 {
+                        self.split_gt();
                         match self.peek() {
                             None => {
                                 return Err(format!(
@@ -1249,6 +1932,7 @@ impl Parser {
                         self.i += 1;
                     }
                     self.vec_elem_pending = Some(width);
+                    self.vec_elem_pending_ty = elem_ty;
                     return Ok(Type::Named("Vec".into()));
                 }
                 // An alias is transparent: a use is rewritten to its target here,
@@ -1283,12 +1967,306 @@ impl Parser {
         self.fn_scopes.push(frame);
         // The `Vec`/pointer name tables are scoped the same way: a binding this
         // block introduces (or shadows) is undone when the block ends, so an
-        // outer `v: Vec<u8>` regains its byte stride after a nested `v`.
+        // outer `v: Vec<u8>` regains its byte stride after a nested `v`. Pushed
+        // before the const scan so the restore notes it records land in this
+        // block's frame.
         self.name_scopes.push(Vec::new());
+        // A block-scoped `const` is an item too: rustc hoists it for the whole
+        // block, so `println!("{}", N); const N: i64 = 5;` resolves. Fold every
+        // one now, in declaration order (a later one may name an earlier one),
+        // and note the names so the main parse skips the items it already folded.
+        let cframe = self.scan_block_consts()?;
+        self.local_consts.push(cframe);
         let r = self.parse_block_body();
         self.pop_name_scope();
+        self.local_consts.pop();
         self.fn_scopes.pop();
         r
+    }
+
+    /// Scan the block starting at the current `{` for the `const`/immutable
+    /// `static` items declared directly in it, resolve their values together,
+    /// and enter them in the live constant tables so a later statement in the
+    /// block (and a nested block) resolves the name. Returns the frame of their
+    /// token spans, which the main parse skips. A `const` nested deeper is left
+    /// to the scan of that block.
+    ///
+    /// The whole block's items are collected before any is folded, then resolved
+    /// to a fixpoint seeded with the enclosing scope, so a forward reference
+    /// (`const A = B + 1; const B = 2;`) resolves and a self-reference
+    /// (`const K = K + 1;`, where an outer `K` exists) is a cycle rather than a
+    /// read of the outer value. Every item is validated, including an unused
+    /// one: a non-foldable initializer (`const N: i64 = true;`) or an
+    /// unsupported type is an error, as at the top level. A `const` colliding
+    /// with another `const` or with a `fn` in the same block is E0428.
+    fn scan_block_consts(&mut self) -> PResult<Vec<LocalConst>> {
+        let mut raw: Vec<(usize, usize, usize, ConstDef)> = Vec::new();
+        let mut depth = 0u32;
+        let mut i = self.i;
+        // Parse the items with the live constant tables cleared, so a name in an
+        // initializer stays symbolic: otherwise `const K: i64 = K + 1;` would
+        // have the enclosing `K` substituted in while parsing, hiding the cycle,
+        // and a forward reference to a later item that shadows an outer constant
+        // would bake in the outer value. The tables are restored for the resolve
+        // below, which needs them as the enclosing scope.
+        let saved_consts = std::mem::take(&mut self.consts);
+        let saved_bools = std::mem::take(&mut self.const_bools);
+        let saved_chars = std::mem::take(&mut self.const_chars);
+        while i < self.toks.len() {
+            // Decide by a short-lived borrow, so the parsing below does not
+            // conflict with it.
+            let mut is_item = false;
+            match &self.toks[i].tok {
+                Tok::LBrace | Tok::LParen | Tok::LBracket => depth += 1,
+                Tok::RBrace => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                Tok::RParen | Tok::RBracket => {
+                    depth = depth.saturating_sub(1);
+                }
+                // A `const`/`static` item at the top level of this block. A
+                // `pub` before it is skipped, as in a top-level item. A `const`
+                // inside a `fn` body or a nested `{ .. }` has `depth > 0`, so it
+                // is left to that block's own scan.
+                Tok::Const if depth == 0 => {
+                    // A raw pointer type `*const T` also lexes the `const`
+                    // keyword; an item's `const` is never preceded by `*`.
+                    if self.toks.get(i.wrapping_sub(1)).map(|t| &t.tok) != Some(&Tok::Star) {
+                        is_item = true;
+                    }
+                }
+                Tok::Ident(id) if id == "static" && depth == 0 => is_item = true,
+                _ => {}
+            }
+            if is_item {
+                let raw_start = i;
+                // `static mut` has no meaning in rmc; reject it here, where the
+                // block scan sees it, rather than let the parse fail with a less
+                // specific message.
+                if let Some(Tok::Ident(id)) = self.toks.get(i + 1).map(|t| &t.tok) {
+                    if id == "mut" {
+                        self.consts = saved_consts;
+                        self.const_bools = saved_bools;
+                        self.const_chars = saved_chars;
+                        return Err(format!(
+                            "at byte {}: `static mut` is not supported; rmc has no mutable global",
+                            self.toks[i].pos
+                        ));
+                    }
+                }
+                let start = self.skip_pub_at(i);
+                let (def, end) = self.parse_const_item_at(start)?;
+                raw.push((raw_start, start, end, def));
+                i = end;
+                continue;
+            }
+            i += 1;
+        }
+        self.consts = saved_consts;
+        self.const_bools = saved_bools;
+        self.const_chars = saved_chars;
+        // E0428: two items of the same name, a `const` and a `fn`, or two
+        // `fn`s (`scan_block_fns`). The block's nested `fn` names are already in
+        // the frame `parse_block_inner` pushed, so include them here, along with
+        // any `fn` declared later in the block.
+        let mut fn_names: Vec<String> = self
+            .fn_scopes
+            .last()
+            .map(|f| f.iter().map(|(n, _)| n.clone()).collect())
+            .unwrap_or_default();
+        fn_names.extend(self.scan_block_fn_names());
+        for (k, (_, _, _, def)) in raw.iter().enumerate() {
+            if raw[..k].iter().any(|(_, _, _, d)| d.name == def.name)
+                || fn_names.contains(&def.name)
+            {
+                return Err(format!(
+                    "at byte {}: the name `{}` is defined multiple times in this block",
+                    self.toks[raw[k].0].pos, def.name
+                ));
+            }
+        }
+        // Resolve the whole block at once against the enclosing scope.
+        let items: Vec<(String, Type, Expr)> = raw
+            .iter()
+            .map(|(raw_start, _, _, d)| {
+                let ty = self.resolve_const_ty(&d.ty, &d.name, self.toks[*raw_start].pos)?;
+                Ok((d.name.clone(), ty, d.value.clone()))
+            })
+            .collect::<PResult<Vec<_>>>()?;
+        let resolved = crate::consts::resolve_with(
+            &items,
+            &self.consts,
+            &self.const_bools,
+            &self.const_chars,
+            &self.const_narrow,
+        )
+        .map_err(|e| format!("at byte {}: {e}", self.toks[self.i].pos))?;
+        // Every item must fold, including an unused one. `resolve_with` leaves
+        // out an item whose initializer is not a constant expression (a call, a
+        // cycle, a reference to an unresolved name), which at the top level
+        // `check_consts` rejects; do the same here.
+        for ((raw_start, _, _, def), (_, ty, _)) in raw.iter().zip(items.iter()) {
+            if !resolved.contains_key(&def.name) {
+                let kind = match ty {
+                    Type::Bool => "bool",
+                    Type::Char => "char",
+                    _ => "i64",
+                };
+                return Err(format!(
+                    "at byte {}: constant `{}` is not a constant `{kind}` expression",
+                    self.toks[*raw_start].pos, def.name
+                ));
+            }
+        }
+        let mut frame: Vec<LocalConst> = Vec::new();
+        for (_, start, end, def) in &raw {
+            self.enter_local_const(&def.name, resolved.get(&def.name).cloned());
+            // `start` is the `const`/`static` keyword (past any `pub`), so the
+            // main parse, which drops a `pub` before it, matches on the same
+            // index.
+            frame.push(LocalConst { start: *start, end: *end });
+        }
+        Ok(frame)
+    }
+
+    /// The names of the `fn`s declared directly in the block at the cursor,
+    /// without registering them (used only for the `const`/`fn` collision check;
+    /// `scan_block_fns` does the real hoisting).
+    fn scan_block_fn_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut depth = 0u32;
+        let mut i = self.i;
+        while i < self.toks.len() {
+            match &self.toks[i].tok {
+                Tok::LBrace | Tok::LParen | Tok::LBracket => depth += 1,
+                Tok::RBrace => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                Tok::RParen | Tok::RBracket => {
+                    depth = depth.saturating_sub(1);
+                }
+                Tok::Fn if depth == 0 => {
+                    // The name always follows the `fn` keyword.
+                    if let Some(Token { tok: Tok::Ident(name), .. }) = self.toks.get(i + 1) {
+                        names.push(name.clone());
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        names
+    }
+
+    /// True when the token at the cursor begins a `const`/immutable-`static`
+    /// item that `scan_block_consts` already folded for this block, so the main
+    /// parse should skip it. A `const` a block does not own (a nested block's,
+    /// seen from outside) is not in any active frame and returns false.
+    fn at_local_const(&self) -> bool {
+        self.local_consts.iter().any(|f| f.iter().any(|c| c.start == self.i))
+    }
+
+    /// Reject a local binding that shadows a constant (rustc E0530). sema
+    /// enforces this for a top-level constant, but a block-scoped one is folded
+    /// at parse time and never reaches sema, so the parser checks every binding
+    /// it lowers against the live constant tables. `names` are the names a `let`
+    /// pattern binds, in source order.
+    fn reject_const_shadow(&self, names: &[String]) -> PResult<()> {
+        for name in names {
+            if self.consts.contains_key(name)
+                || self.const_bools.contains_key(name)
+                || self.const_chars.contains_key(name)
+            {
+                return Err(format!(
+                    "at byte {}: identifier `{name}` shadows a constant of the same name",
+                    self.pos()
+                ));
+            }
+            // A binding cannot shadow a struct of any kind (rustc E0530): a
+            // tuple struct's name is a constructor and a unit struct's name is a
+            // value, so `let P = ..` would make `P` ambiguous.
+            if self.struct_ctors.contains_key(name)
+                || self.unit_structs.contains(name)
+                || self.struct_fields.contains_key(name)
+            {
+                return Err(format!(
+                    "at byte {}: identifier `{name}` shadows a struct of the same name",
+                    self.pos()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The token index of the item at `i`, skipping a `pub` / `pub(..)` before
+    /// it. Used by `scan_block_consts`, which needs the keyword's own index.
+    fn skip_pub_at(&self, mut i: usize) -> usize {
+        if matches!(self.toks.get(i).map(|t| &t.tok), Some(Tok::Ident(p)) if p == "pub") {
+            i += 1;
+            if self.toks.get(i).map(|t| &t.tok) == Some(&Tok::LParen) {
+                let mut d = 0u32;
+                while i < self.toks.len() {
+                    match &self.toks[i].tok {
+                        Tok::LParen => d += 1,
+                        Tok::RParen => {
+                            d -= 1;
+                            if d == 0 {
+                                i += 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+        }
+        i
+    }
+
+    /// Enter a folded block-scoped constant in the live tables, noting the
+    /// previous value so `pop_name_scope` can restore it when the block ends.
+    fn enter_local_const(&mut self, name: &str, val: Option<crate::consts::ConstVal>) {
+        use crate::consts::ConstVal;
+        // The name is in the value namespace, but `consts`/`const_bools`/
+        // `const_chars` are three tables; a name could in principle be in two
+        // (never in one well-typed program). Note all three so the restore is
+        // exact.
+        if let Some(frame) = self.name_scopes.last_mut() {
+            frame.push(NameScope::ConstInt(name.to_string(), self.consts.get(name).copied()));
+            frame.push(NameScope::ConstBool(name.to_string(), self.const_bools.get(name).copied()));
+            frame.push(NameScope::ConstChar(name.to_string(), self.const_chars.get(name).copied()));
+            frame.push(NameScope::ConstNarrow(name.to_string(), self.const_narrow.get(name).cloned()));
+        }
+        // A `const` that does not fold (a call, a cycle) is left out, so a use
+        // is diagnosed the way an unresolved constant is; drop any outer value
+        // of the same name so the shadowing is honest.
+        self.consts.remove(name);
+        self.const_bools.remove(name);
+        self.const_chars.remove(name);
+        self.const_narrow.remove(name);
+        match val {
+            Some(ConstVal::Int(v)) => {
+                self.consts.insert(name.to_string(), v);
+            }
+            Some(ConstVal::NarrowInt(v, ty)) => {
+                self.consts.insert(name.to_string(), v);
+                self.const_narrow.insert(name.to_string(), ty);
+            }
+            Some(ConstVal::Bool(v)) => {
+                self.const_bools.insert(name.to_string(), v);
+            }
+            Some(ConstVal::Char(v)) => {
+                self.const_chars.insert(name.to_string(), v);
+            }
+            None => {}
+        }
     }
 
     /// Record the current state of one `Vec`/pointer name table entry before a
@@ -1300,19 +2278,11 @@ impl Parser {
             frame.push(NameScope::VecName(name.to_string(), self.vec_names.contains(name)));
         }
     }
-    fn note_vec_cap(&mut self, name: &str) {
-        if let Some(frame) = self.name_scopes.last_mut() {
-            frame.push(NameScope::VecCap(name.to_string(), self.vec_cap.get(name).copied()));
-        }
-    }
-    fn note_vec_len(&mut self, name: &str) {
-        if let Some(frame) = self.name_scopes.last_mut() {
-            frame.push(NameScope::VecLen(name.to_string(), self.vec_len.get(name).copied()));
-        }
-    }
     fn note_vec_elem(&mut self, name: &str) {
         if let Some(frame) = self.name_scopes.last_mut() {
             frame.push(NameScope::VecElem(name.to_string(), self.vec_elem.get(name).copied()));
+            frame.push(NameScope::VecElemTy(name.to_string(), self.vec_elem_ty.get(name).cloned()));
+            frame.push(NameScope::VecMut(name.to_string(), self.vec_mut.get(name).copied()));
         }
     }
     fn note_ptr(&mut self, name: &str) {
@@ -1323,6 +2293,16 @@ impl Parser {
     fn note_args_vec(&mut self, name: &str) {
         if let Some(frame) = self.name_scopes.last_mut() {
             frame.push(NameScope::ArgsVec(name.to_string(), self.args_vecs.get(name).copied()));
+        }
+    }
+    fn note_string_name(&mut self, name: &str) {
+        if let Some(frame) = self.name_scopes.last_mut() {
+            frame.push(NameScope::StringName(name.to_string(), self.string_names.contains(name)));
+        }
+    }
+    fn note_arr_elem(&mut self, name: &str) {
+        if let Some(frame) = self.name_scopes.last_mut() {
+            frame.push(NameScope::ArrElem(name.to_string(), self.arr_elem.get(name).copied()));
         }
     }
 
@@ -1340,28 +2320,28 @@ impl Parser {
                             self.vec_names.remove(&n);
                         }
                     }
-                    NameScope::VecCap(n, prev) => match prev {
-                        Some(v) => {
-                            self.vec_cap.insert(n, v);
-                        }
-                        None => {
-                            self.vec_cap.remove(&n);
-                        }
-                    },
-                    NameScope::VecLen(n, prev) => match prev {
-                        Some(v) => {
-                            self.vec_len.insert(n, v);
-                        }
-                        None => {
-                            self.vec_len.remove(&n);
-                        }
-                    },
                     NameScope::VecElem(n, prev) => match prev {
                         Some(v) => {
                             self.vec_elem.insert(n, v);
                         }
                         None => {
                             self.vec_elem.remove(&n);
+                        }
+                    },
+                    NameScope::VecElemTy(n, prev) => match prev {
+                        Some(v) => {
+                            self.vec_elem_ty.insert(n, v);
+                        }
+                        None => {
+                            self.vec_elem_ty.remove(&n);
+                        }
+                    },
+                    NameScope::VecMut(n, prev) => match prev {
+                        Some(v) => {
+                            self.vec_mut.insert(n, v);
+                        }
+                        None => {
+                            self.vec_mut.remove(&n);
                         }
                     },
                     NameScope::Ptr(n, prev) => match prev {
@@ -1378,6 +2358,53 @@ impl Parser {
                         }
                         None => {
                             self.args_vecs.remove(&n);
+                        }
+                    },
+                    NameScope::StringName(n, had) => {
+                        if had {
+                            self.string_names.insert(n);
+                        } else {
+                            self.string_names.remove(&n);
+                        }
+                    }
+                    NameScope::ArrElem(n, prev) => match prev {
+                        Some(v) => {
+                            self.arr_elem.insert(n, v);
+                        }
+                        None => {
+                            self.arr_elem.remove(&n);
+                        }
+                    },
+                    NameScope::ConstInt(n, prev) => match prev {
+                        Some(v) => {
+                            self.consts.insert(n, v);
+                        }
+                        None => {
+                            self.consts.remove(&n);
+                        }
+                    },
+                    NameScope::ConstBool(n, prev) => match prev {
+                        Some(v) => {
+                            self.const_bools.insert(n, v);
+                        }
+                        None => {
+                            self.const_bools.remove(&n);
+                        }
+                    },
+                    NameScope::ConstChar(n, prev) => match prev {
+                        Some(v) => {
+                            self.const_chars.insert(n, v);
+                        }
+                        None => {
+                            self.const_chars.remove(&n);
+                        }
+                    },
+                    NameScope::ConstNarrow(n, prev) => match prev {
+                        Some(v) => {
+                            self.const_narrow.insert(n, v);
+                        }
+                        None => {
+                            self.const_narrow.remove(&n);
                         }
                     },
                 }
@@ -1410,10 +2437,13 @@ impl Parser {
                 Tok::Fn if depth == 0 => {
                     // `fn name ( .. ) -> .. { body }`. The body brace is skipped
                     // as a unit by the `depth` counter, so a `fn` inside it is
-                    // not seen here.
+                    // not seen here. The name always follows the `fn` keyword;
+                    // a preceding `pub` is irrelevant, since `i` still points at
+                    // the `fn` itself (the loop only advances one token at a
+                    // time, so it never lands on the `pub`). `fn_at` is keyed to
+                    // that same `i`, which is what `parse_stmt_into` looks up.
                     if let Some(Token { tok: Tok::Ident(name), .. }) = self.toks.get(i + 1) {
                         let name = name.clone();
-                        // Two `fn`s with the same name in one block is rustc's
                         // E0428. A later one shadowing an outer one is fine and
                         // keeps its own unique symbol.
                         if frame.iter().any(|(n, _)| *n == name) {
@@ -1479,24 +2509,69 @@ impl Parser {
                 self.skip_use()?;
                 continue;
             }
+            // `pub fn` (or `pub` before any item) in a block: drop the
+            // visibility and parse the item. Guarded on what follows so a
+            // variable named `pub` (which rmc, unlike rustc, would otherwise
+            // allow) is not swallowed.
+            if self.peek() == Some(&Tok::Ident("pub".into())) {
+                let p2 = self.peek2().cloned();
+                if p2 == Some(Tok::Fn) {
+                    self.skip_pub()?;
+                    self.parse_stmt_into(&mut stmts)?;
+                    continue;
+                }
+                // `pub const` / `pub static`: drop the `pub` and let the local
+                // constant skip below consume the item (already folded).
+                if p2 == Some(Tok::Const)
+                    || matches!(p2, Some(Tok::Ident(ref id)) if id == "static")
+                {
+                    self.skip_pub()?;
+                    continue;
+                }
+            }
+            // A `const`/immutable-`static` item directly in the block. Its value
+            // was folded by `scan_block_consts` when the block began (rustc
+            // hoists block items), so skip the item here; the constant is
+            // substituted at every use, so it has no statement.
+            if self.at_local_const() {
+                let end = self
+                    .local_consts
+                    .iter()
+                    .rev()
+                    .flat_map(|f| f.iter().rev())
+                    .find(|c| c.start == self.i)
+                    .map(|c| c.end);
+                if let Some(end) = end {
+                    self.i = end;
+                    continue;
+                }
+            }
+            // A stray `;` is an empty statement; Rust accepts any number of
+            // them between statements and at the end of a block.
+            if self.eat(&Tok::Semi) {
+                continue;
+            }
             // tail expression: an expression not followed by `;`
             if self.starts_expr() {
                 let e = self.parse_expr()?;
                 if self.eat(&Tok::Eq) {
                     let value = self.parse_expr()?;
-                    self.expect(Tok::Semi)?;
+                    // An assignment is a `()`-valued expression, so its trailing
+                    // `;` may be omitted when it is the last thing in a block,
+                    // just as after `return`/`break`/`continue`.
+                    self.eat_semi_at_block_end()?;
                     stmts.push(Stmt::Assign { target: e, value });
                     continue;
                 }
                 if let Some(op) = self.peek_compound_op() {
                     self.i += 1;
                     let value = self.parse_expr()?;
-                    self.expect(Tok::Semi)?;
+                    self.eat_semi_at_block_end()?;
                     stmts.push(self.desugar_compound(&e, op, value));
                     continue;
                 }
                 if self.eat(&Tok::Semi) {
-                    stmts.push(Stmt::Expr(e));
+                    stmts.push(self.expr_stmt(e));
                     continue;
                 }
                 if self.peek() == Some(&Tok::RBrace) {
@@ -1581,6 +2656,1386 @@ impl Parser {
     /// effect (a call, a literal) runs exactly once, and `arr.len()` folds to
     /// the array's compile-time length, so the loop bound is a literal and the
     /// loop carries no hidden slot.
+    ///
+    /// The token index just past a parenthesized range at the cursor, or `None`
+    /// when the tokens are not `( lo..hi )` / `( lo..=hi )`. A `..`/`..=` counts
+    /// only at depth one (a `..` inside a nested `(..)` does not), and the range
+    /// must be the whole group, so `(f(..))` and `(a..b).sum()` do not match.
+    fn parenthesized_range_end(&self) -> Option<usize> {
+        if self.peek() != Some(&Tok::LParen) {
+            return None;
+        }
+        let mut j = self.i + 1;
+        let mut depth = 1u32;
+        let mut saw_dots = false;
+        while let Some(t) = self.toks.get(j).map(|t| &t.tok) {
+            match t {
+                Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+                Tok::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                Tok::RBracket | Tok::RBrace => {
+                    if depth == 1 {
+                        return None;
+                    }
+                    depth -= 1;
+                }
+                Tok::DotDot | Tok::DotDotEq if depth == 1 => saw_dots = true,
+                _ => {}
+            }
+            j += 1;
+        }
+        if !saw_dots || self.toks.get(j).map(|t| &t.tok) != Some(&Tok::RParen) {
+            return None;
+        }
+        Some(j + 1)
+    }
+
+    /// `[a, b, c]` at the cursor: the element expressions, or `None` when the
+    /// brackets do not hold a plain element list (a `[e; n]` repeat, or a
+    /// `[T; n]` type). Used to recognise an array literal that is the head of an
+    /// iterator chain, a shape the normal expression path leaves to sema.
+    fn try_array_list_lit(&mut self) -> PResult<Option<Vec<Expr>>> {
+        if self.peek() != Some(&Tok::LBracket) {
+            return Ok(None);
+        }
+        let save = self.i;
+        self.i += 1;
+        if self.peek() == Some(&Tok::RBracket) {
+            self.i += 1;
+            return Ok(Some(Vec::new()));
+        }
+        let saved = self.no_struct_lit;
+        self.no_struct_lit = false;
+        let restore = |p: &mut Self, saved: bool| {
+            p.i = save;
+            p.no_struct_lit = saved;
+        };
+        let first = match self.parse_expr() {
+            Ok(e) => e,
+            Err(_) => {
+                restore(self, saved);
+                return Ok(None);
+            }
+        };
+        if self.peek() == Some(&Tok::Semi) {
+            restore(self, saved);
+            return Ok(None);
+        }
+        let mut elems = vec![first];
+        while self.eat(&Tok::Comma) {
+            if self.peek() == Some(&Tok::RBracket) {
+                break;
+            }
+            match self.parse_expr() {
+                Ok(e) => elems.push(e),
+                Err(_) => {
+                    restore(self, saved);
+                    return Ok(None);
+                }
+            }
+        }
+        if self.peek() != Some(&Tok::RBracket) {
+            restore(self, saved);
+            return Ok(None);
+        }
+        self.i += 1;
+        self.no_struct_lit = saved;
+        Ok(Some(elems))
+    }
+
+    /// The token index just past the `]` that closes a `[..]` starting at index
+    /// `j`, or `None` when unbalanced.
+    fn bracket_end(&self, j: usize) -> Option<usize> {
+        let mut depth = 0i32;
+        let mut k = j;
+        while let Some(t) = self.toks.get(k).map(|t| &t.tok) {
+            match t {
+                Tok::LBracket | Tok::LParen | Tok::LBrace => depth += 1,
+                Tok::RBracket | Tok::RParen | Tok::RBrace => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(k + 1);
+                    }
+                }
+                _ => {}
+            }
+            k += 1;
+        }
+        None
+    }
+
+    /// True when the cursor is the head of an iterator chain rmc lowers: an
+    /// array literal or a parenthesized range immediately followed by
+    /// `.iter()`/`.into_iter()` (or a directly applied iterator method).
+    fn at_iter_chain_start(&self) -> bool {
+        let after = if self.peek() == Some(&Tok::LBracket) {
+            match self.bracket_end(self.i) {
+                Some(j) => j,
+                None => return false,
+            }
+        } else if self.peek() == Some(&Tok::LParen) {
+            match self.parenthesized_range_end() {
+                Some(j) => j,
+                None => return false,
+            }
+        } else {
+            return false;
+        };
+        if self.toks.get(after).map(|t| &t.tok) != Some(&Tok::Dot) {
+            return false;
+        }
+        matches!(
+            self.toks.get(after + 1).map(|t| &t.tok),
+            Some(Tok::Ident(n)) if is_iter_method(n)
+        )
+    }
+
+    /// Lower an iterator chain at the cursor to a value, when the receiver is an
+    /// array literal or a parenthesized range (shapes rmc does not otherwise
+    /// parse as expressions). Returns `None`, leaving the cursor untouched, for
+    /// any other receiver, so the normal expression path runs.
+    fn try_lower_iter_chain(&mut self) -> PResult<Option<Expr>> {
+        if !self.at_iter_chain_start() {
+            return Ok(None);
+        }
+        let save = self.i;
+        let src = if let Some(elems) = self.try_array_list_lit()? {
+            IterSrc::ArrayLit(elems)
+        } else if self.parenthesized_range_end().is_some() {
+            self.i += 1; // `(`
+            let lo = self.parse_cond()?;
+            let inclusive = self.eat(&Tok::DotDotEq);
+            if !inclusive {
+                self.expect(Tok::DotDot)?;
+            }
+            let hi = self.parse_cond()?;
+            self.expect(Tok::RParen)?;
+            IterSrc::Range(Box::new(lo), Box::new(hi), inclusive)
+        } else {
+            return Ok(None);
+        };
+        match self.lower_iter_chain(src) {
+            Ok(e) => Ok(Some(e)),
+            Err(err) => {
+                self.i = save;
+                Err(err)
+            }
+        }
+    }
+
+    /// Lower `<src>.<adapter>*(.<terminal>())` to a block expression that
+    /// computes the terminal's value, consuming the chain from the cursor. An
+    /// unsupported method, or a chain with no terminal, is an error; the caller
+    /// resets the cursor so a shape rmc does not own can report its own error.
+    fn lower_iter_chain(&mut self, src: IterSrc) -> PResult<Expr> {
+        let mut adapters: Vec<String> = Vec::new();
+        let mut args: Vec<Expr> = Vec::new();
+        loop {
+            if self.peek() != Some(&Tok::Dot) {
+                return Err(format!(
+                    "at byte {}: an iterator chain needs a terminal method \
+                     (`.sum()`, `.count()`, `.max()`, `.min()`, `.last()`, `.nth(..)`, `.collect()`)",
+                    self.pos()
+                ));
+            }
+            self.i += 1;
+            let name = self.expect_ident()?;
+            // A turbofish (`sum::<i64>()`) sits between the name and the
+            // argument list; it is skipped, since rmc is monomorphic and the
+            // element width comes from the source.
+            if self.peek() == Some(&Tok::ColonColon)
+                && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::Lt)
+            {
+                self.i += 2; // `::` `<`
+                let mut depth = 1i32;
+                while depth > 0 {
+                    self.split_gt();
+                    match self.peek() {
+                        None => {
+                            return Err(format!(
+                                "at byte {}: unexpected end of input in a turbofish",
+                                self.pos()
+                            ))
+                        }
+                        Some(Tok::Lt) => {
+                            depth += 1;
+                            self.i += 1;
+                        }
+                        Some(Tok::Gt) => {
+                            depth -= 1;
+                            self.i += 1;
+                        }
+                        _ => self.i += 1,
+                    }
+                }
+            }
+            self.expect(Tok::LParen)?;
+            let mut margs = Vec::new();
+            if self.peek() != Some(&Tok::RParen) {
+                loop {
+                    margs.push(self.parse_bracketed_expr()?);
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect(Tok::RParen)?;
+            match name.as_str() {
+                // `.copied()`/`.cloned()` change a `&T` element to `T`; rmc reads
+                // the value either way, so they only permit `.sum()`/`.max()`
+                // after `.iter()` and are otherwise no-ops. `.iter()`/
+                // `.into_iter()` on an array literal or range are likewise
+                // no-ops: the loop reads the elements directly.
+                "copied" | "cloned" | "iter" | "into_iter" => {
+                    if !margs.is_empty() {
+                        return Err(format!("at byte {}: `{name}` takes no arguments", self.pos()));
+                    }
+                }
+                "rev" | "step_by" | "skip" | "take" => {
+                    let want = if name == "rev" { 0 } else { 1 };
+                    if margs.len() != want {
+                        return Err(format!(
+                            "at byte {}: `{name}` takes {want} argument(s)",
+                            self.pos()
+                        ));
+                    }
+                    adapters.push(name);
+                    args.extend(margs);
+                }
+                "sum" | "count" | "max" | "min" | "last" => {
+                    if !margs.is_empty() {
+                        return Err(format!("at byte {}: `{name}` takes no arguments", self.pos()));
+                    }
+                    return self.finish_iter_terminal(&src, &adapters, &args, name.as_str(), None);
+                }
+                "nth" => {
+                    if margs.len() != 1 {
+                        return Err(format!("at byte {}: `nth` takes one argument", self.pos()));
+                    }
+                    let k = margs.pop().unwrap();
+                    return self.finish_iter_terminal(&src, &adapters, &args, "nth", Some(k));
+                }
+                "collect" => {
+                    if !margs.is_empty() {
+                        return Err(format!("at byte {}: `collect` takes no arguments", self.pos()));
+                    }
+                    return self.finish_iter_collect(&src, &adapters, &args);
+                }
+                other => {
+                    return Err(format!(
+                        "at byte {}: unsupported iterator method `{other}` (supported: copied, \
+                         cloned, rev, skip, take, step_by, sum, count, max, min, last, nth, collect)",
+                        self.pos()
+                    ))
+                }
+            }
+        }
+    }
+
+    /// The adapter index math shared with the `for`-range form: given the source
+    /// sequence length `base_len`, the source-order adapters and their
+    /// arguments, return the `let`s that bind each adapter's bound (evaluated
+    /// once), the final element count, the source-index map for loop counter
+    /// `i`, and `i`'s name. `rev`/`step_by`/`skip`/`take` behave exactly as in
+    /// `desugar_for_range_adapter`.
+    fn adapter_index_math(
+        &mut self,
+        base_len: Expr,
+        adapters: &[String],
+        args: &[Expr],
+    ) -> PResult<(Vec<Stmt>, Expr, Expr, String)> {
+        let n = adapters.len();
+        let i_name = format!("\u{0}ii{}", self.tmp);
+        self.tmp += 1;
+        let vlo = |n: &str| Expr::Var { name: n.to_string(), slot: -1, ty: Type::I64 };
+        let c_name = |t: usize| format!("\u{0}ic{t}");
+        let s_name = |t: usize| format!("\u{0}is{t}");
+        let k_name = |t: usize| format!("\u{0}ik{t}");
+        let mut head: Vec<Stmt> = Vec::new();
+        let mut lens: Vec<Expr> = Vec::with_capacity(n);
+        let mut counts: Vec<Expr> = Vec::with_capacity(n);
+        let mut strides: Vec<Option<String>> = vec![None; n];
+        let mut head_a = 0usize;
+        let mut prev_len = base_len.clone();
+        for (t, adapter) in adapters.iter().enumerate() {
+            lens.push(prev_len.clone());
+            if let Some(k) = args.get(head_a).and_then(const_i64) {
+                if k < 0 {
+                    return Err(format!(
+                        "at byte {}: cannot apply unary `-` to a `usize` adapter count",
+                        self.pos()
+                    ));
+                }
+            }
+            match adapter.as_str() {
+                "rev" => counts.push(prev_len.clone()),
+                "step_by" => {
+                    let kn = k_name(t);
+                    head.push(Stmt::Let {
+                        name: kn.clone(),
+                        ty: None,
+                        init: Some(args[head_a].clone()),
+                        slot: -1,
+                        mutable: false,
+                    });
+                    head_a += 1;
+                    strides[t] = Some(kn.clone());
+                    // `ceil(len / k)` as `len / k + (len % k != 0)`, so a stride
+                    // near `i64::MAX` does not overflow.
+                    let quot = Expr::Bin(BinOp::Div, Box::new(prev_len.clone()), Box::new(vlo(&kn)));
+                    let rem = Expr::Bin(BinOp::Mod, Box::new(prev_len.clone()), Box::new(vlo(&kn)));
+                    let c = c_name(t);
+                    head.push(Stmt::Let {
+                        name: c.clone(),
+                        ty: None,
+                        init: Some(Expr::Bin(
+                            BinOp::Add,
+                            Box::new(quot),
+                            Box::new(Expr::Cast(
+                                Box::new(Expr::Bin(BinOp::Ne, Box::new(rem), Box::new(Expr::Int(0)))),
+                                Type::I64,
+                            )),
+                        )),
+                        slot: -1,
+                        mutable: false,
+                    });
+                    counts.push(vlo(&c));
+                }
+                "skip" | "take" => {
+                    let m = format!("\u{0}im{t}");
+                    head.push(Stmt::Let {
+                        name: m.clone(),
+                        ty: None,
+                        init: Some(args[head_a].clone()),
+                        slot: -1,
+                        mutable: false,
+                    });
+                    head_a += 1;
+                    let c = c_name(t);
+                    head.push(Stmt::Let {
+                        name: c.clone(),
+                        ty: None,
+                        init: Some(Expr::Call {
+                            name: "__rmc_min".into(),
+                            args: vec![vlo(&m), prev_len.clone()],
+                            arg_slots: Vec::new(),
+                            ret_slot: -1,
+                            ret_ty: Type::I64,
+                            elem_ty: None,
+                        }),
+                        slot: -1,
+                        mutable: false,
+                    });
+                    if adapter == "skip" {
+                        counts.push(Expr::Bin(
+                            BinOp::Sub,
+                            Box::new(prev_len.clone()),
+                            Box::new(vlo(&c)),
+                        ));
+                    } else {
+                        counts.push(vlo(&c));
+                    }
+                }
+                _ => unreachable!("unknown iterator adapter {adapter}"),
+            }
+            prev_len = counts[t].clone();
+        }
+        // Pass two: the source-index map, built from the last adapter outward and
+        // kept relative to the raw sequence (a range's `lo` is added once, in
+        // `iter_elem_read`).
+        let mut subst: Vec<Option<String>> = vec![None; n];
+        let mut map = vlo(&i_name);
+        for t in (0..n).rev() {
+            let needs_len = adapters[t] == "rev" || (t > 0 && adapters[t - 1] == "rev");
+            if needs_len && subst[t].is_none() {
+                let s = s_name(t);
+                head.push(Stmt::Let {
+                    name: s.clone(),
+                    ty: None,
+                    init: Some(lens[t].clone()),
+                    slot: -1,
+                    mutable: false,
+                });
+                subst[t] = Some(s);
+            }
+            let l = match &subst[t] {
+                Some(name) => vlo(name),
+                None => lens[t].clone(),
+            };
+            match adapters[t].as_str() {
+                "rev" => {
+                    map = Expr::Bin(
+                        BinOp::Sub,
+                        Box::new(Expr::Bin(BinOp::Sub, Box::new(l), Box::new(Expr::Int(1)))),
+                        Box::new(map),
+                    );
+                }
+                "step_by" => {
+                    let kn = strides[t].clone().expect("a step_by stride");
+                    map = Expr::Bin(BinOp::Mul, Box::new(map), Box::new(vlo(&kn)));
+                }
+                "skip" => {
+                    map = Expr::Bin(BinOp::Add, Box::new(map), Box::new(vlo(&c_name(t))));
+                }
+                "take" => {}
+                _ => unreachable!("unknown iterator adapter"),
+            }
+        }
+        let count = if n == 0 { base_len } else { counts[n - 1].clone() };
+        Ok((head, count, map, i_name))
+    }
+
+    /// The statements that bind the source to a stable place, plus its length
+    /// expression. A `Vec` reads its header length; an array binding or literal
+    /// folds `arr.len()` to the compile-time length; a range's length is
+    /// `hi - lo` (`+ 1` inclusive). An array literal is stored in a hidden `let`
+    /// so the element reads index it.
+    fn iter_source_stmts(&mut self, src: &IterSrc) -> (Vec<Stmt>, Expr, Option<String>) {
+        let var = |n: &str| Expr::Var { name: n.to_string(), slot: -1, ty: Type::I64 };
+        match src {
+            IterSrc::Range(lo, hi, inclusive) => {
+                let lo_n = format!("\u{0}ilo{}", self.tmp);
+                let hi_n = format!("\u{0}ihi{}", self.tmp);
+                self.tmp += 1;
+                let stmts = vec![
+                    Stmt::Let {
+                        name: lo_n.clone(),
+                        ty: None,
+                        init: Some((**lo).clone()),
+                        slot: -1,
+                        mutable: false,
+                    },
+                    Stmt::Let {
+                        name: hi_n.clone(),
+                        ty: None,
+                        init: Some((**hi).clone()),
+                        slot: -1,
+                        mutable: false,
+                    },
+                ];
+                let span = Expr::Bin(BinOp::Sub, Box::new(var(&hi_n)), Box::new(var(&lo_n)));
+                let len = if *inclusive {
+                    Expr::Bin(BinOp::Add, Box::new(span), Box::new(Expr::Int(1)))
+                } else {
+                    span
+                };
+                (stmts, len, Some(lo_n))
+            }
+            IterSrc::Vec(name, _) => (
+                Vec::new(),
+                Expr::Call {
+                    name: "__rmc_vec_len".into(),
+                    args: vec![var(name)],
+                    arg_slots: Vec::new(),
+                    ret_slot: -1,
+                    ret_ty: Type::I64,
+                    elem_ty: None,
+                },
+                None,
+            ),
+            IterSrc::ArrayVar(name, _) => (
+                Vec::new(),
+                Expr::MethodCall {
+                    recv: Box::new(var(name)),
+                    name: "len".to_string(),
+                    args: Vec::new(),
+                },
+                None,
+            ),
+            IterSrc::ArrayLit(elems) => {
+                let len = elems.len() as i64;
+                let ty = Type::Array(Box::new(Type::I64), elems.len());
+                let stmt = Stmt::Let {
+                    name: "\u{0}isrc".to_string(),
+                    ty: Some(ty),
+                    init: Some(Expr::ArrayList(elems.clone())),
+                    slot: -1,
+                    mutable: false,
+                };
+                (vec![stmt], Expr::Int(len), None)
+            }
+        }
+    }
+
+    /// Bind element `map` (a source index) of `src` to a fresh `i64` binding and
+    /// return the `let` plus that binding's name. A range's element is `lo +
+    /// map` (`lo_name` is the low bound `iter_source_stmts` bound); a `Vec`'s is
+    /// read through an element-width pointer; an array's (or array literal's) is
+    /// an ordinary index.
+    fn iter_elem_read(&mut self, src: &IterSrc, map: &Expr, lo_name: &Option<String>) -> (Stmt, String) {
+        let e_name = format!("\u{0}ie{}", self.tmp);
+        self.tmp += 1;
+        let var = |n: &str| Expr::Var { name: n.to_string(), slot: -1, ty: Type::I64 };
+        let elem: Expr = match src {
+            IterSrc::Range(_, _, _) => {
+                let lo = lo_name.as_ref().expect("a range has a low bound");
+                Expr::Bin(BinOp::Add, Box::new(var(lo)), Box::new(map.clone()))
+            }
+            IterSrc::Vec(name, width) => {
+                let off = if *width == 1 {
+                    map.clone()
+                } else {
+                    Expr::Bin(BinOp::Mul, Box::new(map.clone()), Box::new(Expr::Int(*width)))
+                };
+                let addr = Expr::Bin(BinOp::Add, Box::new(var(name)), Box::new(off));
+                let ptr_ty = if *width == 1 { Type::U8 } else { Type::I64 };
+                Expr::Deref {
+                    expr: Box::new(Expr::Cast(Box::new(addr), Type::Ref(Box::new(ptr_ty), false))),
+                    ty: Type::I64,
+                }
+            }
+            IterSrc::ArrayVar(name, _) => Expr::Index(Box::new(var(name)), Box::new(map.clone())),
+            IterSrc::ArrayLit(_) => {
+                Expr::Index(Box::new(var("\u{0}isrc")), Box::new(map.clone()))
+            }
+        };
+        let agg = matches!(&elem, Expr::Deref { ty, .. } if ty.is_aggregate());
+        let stmt = Stmt::Let {
+            name: e_name.clone(),
+            ty: None,
+            init: Some(if agg { elem } else { Expr::Cast(Box::new(elem), Type::I64) }),
+            slot: -1,
+            mutable: false,
+        };
+        (stmt, e_name)
+    }
+
+    /// Reject a `Vec<T>` whose element is a zero-sized aggregate. rmc stores an
+    /// aggregate element inline by negating its width, but `-0` is `0`, so the
+    /// runtime would take its scalar path and write a byte past the header. The
+    /// zero-sized type is a unit struct (`struct Z;`) or an empty braced struct
+    /// (`struct Z {}`); a unit *enum* is an eight-byte scalar, so it is fine.
+    fn reject_zst_vec_elem(&self, elem_ty: Option<&Type>) -> PResult<()> {
+        if let Some(t) = elem_ty {
+            if t.is_aggregate() && t.size() == 0 {
+                return Err(format!(
+                    "at byte {}: `Vec<{t:?}>` has a zero-sized element type, which rmc does not support",
+                    self.pos()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Infer a `Vec` element type from its initializer when no annotation
+    /// fixes it: a `vec![S{..}, ..]` or `vec![S{..}; n]` whose elements are
+    /// struct literals is a `Vec<S>`, exactly as rustc infers. `None` for any
+    /// other element shape (a scalar, a variable, a call), which keeps the
+    /// default word stride and lets the type check reject a mismatch later.
+    fn infer_vec_elem_ty(&self, elems: &[Expr]) -> Option<Type> {
+        let first = elems.first()?;
+        if let Expr::StructLit { name, .. } = first {
+            if let Some(sz) = self.struct_sizes.get(name) {
+                return Some(Type::Struct(name.clone(), *sz));
+            }
+        }
+        None
+    }
+
+    /// The place `var_name[idx]` for a `Vec` binding: a dereference of the
+    /// element address `var_name + idx * width` through a reference of the
+    /// element's type. The element type is the one recorded for `recv` (the
+    /// source binding name; `var_name` may be a hidden copy holding the same
+    /// address); when it is unknown the element is a word (`U8` for a byte
+    /// referent, else `I64`). A struct or payload-enum element yields an
+    /// aggregate place (named by its address), a scalar one a value read.
+    fn vec_elem_place(&self, var_name: &str, recv: &str, idx: Expr) -> Expr {
+        let (width, ptr_ty, val_ty) = match self.vec_elem_ty.get(recv) {
+            Some(t) => (t.size() as i64, t.clone(), t.clone()),
+            None => {
+                let w = self.vec_elem.get(recv).copied().unwrap_or(8);
+                if w == 1 {
+                    (1, Type::U8, Type::I64)
+                } else {
+                    (w, Type::I64, Type::I64)
+                }
+            }
+        };
+        let vec_var = Expr::Var { name: var_name.to_string(), slot: -1, ty: Type::I64 };
+        let off = if width == 1 {
+            idx
+        } else {
+            Expr::Bin(BinOp::Mul, Box::new(idx), Box::new(Expr::Int(width)))
+        };
+        let addr = Expr::Bin(BinOp::Add, Box::new(vec_var), Box::new(off));
+        Expr::Deref {
+            expr: Box::new(Expr::Cast(Box::new(addr), Type::Ref(Box::new(ptr_ty), true))),
+            ty: val_ty,
+        }
+    }
+
+
+    /// Lower `<src>.<adapters>.<terminal>()` to a block expression. `terminal`
+    /// is `sum`, `count`, `max`, `min`, `last` or `nth` (`nth` carries `k`).
+    fn finish_iter_terminal(
+        &mut self,
+        src: &IterSrc,
+        adapters: &[String],
+        args: &[Expr],
+        terminal: &str,
+        nth_k: Option<Expr>,
+    ) -> PResult<Expr> {
+        let (src_stmts, base_len, lo_name) = self.iter_source_stmts(src);
+        let (math_stmts, count, map, i_name) = self.adapter_index_math(base_len, adapters, args)?;
+        let n_name = format!("\u{0}in{}", self.tmp);
+        self.tmp += 1;
+        let mut stmts = src_stmts;
+        stmts.extend(math_stmts);
+        stmts.push(Stmt::Let {
+            name: n_name.clone(),
+            ty: None,
+            init: Some(count),
+            slot: -1,
+            mutable: false,
+        });
+        let n_var = Expr::Var { name: n_name.clone(), slot: -1, ty: Type::I64 };
+        let i_var = Expr::Var { name: i_name.clone(), slot: -1, ty: Type::I64 };
+        match terminal {
+            "count" => Ok(Expr::Block(Block { stmts, tail: Some(Box::new(n_var)) })),
+            "sum" => {
+                let (elem_let, elem_name) = self.iter_elem_read(src, &map, &lo_name);
+                let acc_name = format!("\u{0}ia{}", self.tmp);
+                self.tmp += 1;
+                stmts.push(Stmt::Let {
+                    name: acc_name.clone(),
+                    ty: None,
+                    init: Some(Expr::Int(0)),
+                    slot: -1,
+                    mutable: true,
+                });
+                let acc_var = Expr::Var { name: acc_name.clone(), slot: -1, ty: Type::I64 };
+                let elem_var = Expr::Var { name: elem_name, slot: -1, ty: Type::I64 };
+                let acc_ty = match src {
+                    IterSrc::Vec(_, 1) | IterSrc::ArrayVar(_, 1) => Type::U8,
+                    _ => Type::I64,
+                };
+                // `Sum<u8>` accumulates in `u8`, so a `u8` element adds with a
+                // wrapping `u8` add (rustc's `u8 + u8` in release mode); every
+                // other source accumulates in `i64`.
+                let elem_add = if acc_ty == Type::U8 {
+                    Expr::Bin(
+                        BinOp::Add,
+                        Box::new(Expr::Cast(Box::new(acc_var.clone()), Type::U8)),
+                        Box::new(Expr::Cast(Box::new(elem_var.clone()), Type::U8)),
+                    )
+                } else {
+                    Expr::Bin(BinOp::Add, Box::new(acc_var.clone()), Box::new(elem_var))
+                };
+                let body = Block {
+                    stmts: vec![
+                        elem_let,
+                        Stmt::Assign { target: acc_var.clone(), value: elem_add },
+                    ],
+                    tail: None,
+                };
+                stmts.push(Stmt::For {
+                    var: i_name,
+                    var_slot: -1,
+                    start: Expr::Cast(Box::new(Expr::Int(0)), Type::I64),
+                    end: n_var,
+                    end_slot: -1,
+                    inclusive: false,
+                    body,
+                    label: None,
+                });
+                Ok(Expr::Block(Block { stmts, tail: Some(Box::new(acc_var)) }))
+            }
+            "max" | "min" => {
+                let (elem_let, elem_name) = self.iter_elem_read(src, &map, &lo_name);
+                let best_name = format!("\u{0}ib{}", self.tmp);
+                self.tmp += 1;
+                stmts.push(Stmt::Let {
+                    name: best_name.clone(),
+                    ty: None,
+                    init: Some(Expr::Int(0)),
+                    slot: -1,
+                    mutable: true,
+                });
+                let best_var = Expr::Var { name: best_name.clone(), slot: -1, ty: Type::I64 };
+                let elem_var = Expr::Var { name: elem_name, slot: -1, ty: Type::I64 };
+                let cmp = if terminal == "max" { BinOp::Gt } else { BinOp::Lt };
+                // `i == 0 || e <cmp> best`: the first element always seeds `best`,
+                // so a run of equal elements keeps the earliest, as rustc does.
+                let cond = Expr::Bin(
+                    BinOp::Or,
+                    Box::new(Expr::Bin(BinOp::Eq, Box::new(i_var), Box::new(Expr::Int(0)))),
+                    Box::new(Expr::Bin(cmp, Box::new(elem_var.clone()), Box::new(best_var.clone()))),
+                );
+                let body = Block {
+                    stmts: vec![
+                        elem_let,
+                        Stmt::Expr(Expr::If(
+                            Box::new(cond),
+                            Block {
+                                stmts: vec![Stmt::Assign {
+                                    target: best_var.clone(),
+                                    value: elem_var,
+                                }],
+                                tail: None,
+                            },
+                            None,
+                        )),
+                    ],
+                    tail: None,
+                };
+                stmts.push(Stmt::For {
+                    var: i_name,
+                    var_slot: -1,
+                    start: Expr::Cast(Box::new(Expr::Int(0)), Type::I64),
+                    end: n_var.clone(),
+                    end_slot: -1,
+                    inclusive: false,
+                    body,
+                    label: None,
+                });
+                Ok(Expr::Block(Block {
+                    stmts,
+                    tail: Some(Box::new(self.iter_option(n_var, best_var, false))),
+                }))
+            }
+            "last" => {
+                let (elem_let, elem_name) = self.iter_elem_read(src, &map, &lo_name);
+                let last_name = format!("\u{0}il{}", self.tmp);
+                self.tmp += 1;
+                stmts.push(Stmt::Let {
+                    name: last_name.clone(),
+                    ty: None,
+                    init: Some(Expr::Int(0)),
+                    slot: -1,
+                    mutable: true,
+                });
+                let last_var = Expr::Var { name: last_name.clone(), slot: -1, ty: Type::I64 };
+                let elem_var = Expr::Var { name: elem_name, slot: -1, ty: Type::I64 };
+                let body = Block {
+                    stmts: vec![elem_let, Stmt::Assign { target: last_var.clone(), value: elem_var }],
+                    tail: None,
+                };
+                stmts.push(Stmt::For {
+                    var: i_name,
+                    var_slot: -1,
+                    start: Expr::Cast(Box::new(Expr::Int(0)), Type::I64),
+                    end: n_var.clone(),
+                    end_slot: -1,
+                    inclusive: false,
+                    body,
+                    label: None,
+                });
+                Ok(Expr::Block(Block {
+                    stmts,
+                    tail: Some(Box::new(self.iter_option(n_var, last_var, false))),
+                }))
+            }
+            "nth" => {
+                let k = nth_k.expect("nth carries an index");
+                let k_name = format!("\u{0}ix{}", self.tmp);
+                self.tmp += 1;
+                stmts.push(Stmt::Let {
+                    name: k_name.clone(),
+                    ty: None,
+                    init: Some(Expr::Cast(Box::new(k), Type::I64)),
+                    slot: -1,
+                    mutable: false,
+                });
+                let k_var = Expr::Var { name: k_name.clone(), slot: -1, ty: Type::I64 };
+                let map_k = rename_index(&map, &i_name, &k_var);
+                let (elem_let, elem_name) = self.iter_elem_read(src, &map_k, &lo_name);
+                let elem_var = Expr::Var { name: elem_name, slot: -1, ty: Type::I64 };
+                let some = Expr::EnumCtor {
+                    enum_name: "Option".into(),
+                    variant: "Some".into(),
+                    tag: -1,
+                    args: vec![elem_var],
+                    arg_offsets: Vec::new(),
+                    slot: -1,
+                    size: 0,
+                };
+                let none = Expr::EnumVariant {
+                    enum_name: "Option".into(),
+                    variant: "None".into(),
+                    tag: -1,
+                };
+                // `if k < n { Some(elem) } else { None }`: the read runs only in
+                // the in-range arm, so an out-of-range index never touches the
+                // store.
+                let result = Expr::If(
+                    Box::new(Expr::Bin(BinOp::Lt, Box::new(k_var), Box::new(n_var))),
+                    Block { stmts: vec![elem_let], tail: Some(Box::new(some)) },
+                    Some(Block { stmts: Vec::new(), tail: Some(Box::new(none)) }),
+                );
+                Ok(Expr::Block(Block { stmts, tail: Some(Box::new(result)) }))
+            }
+            _ => unreachable!("unknown iterator terminal {terminal}"),
+        }
+    }
+
+    /// `if n == 0 { None } else { Some(v) }`, the empty-aware wrapper `max`,
+    /// `min` and `last` share.
+    fn iter_option(&self, n: Expr, v: Expr, _unused: bool) -> Expr {
+        let some = Expr::EnumCtor {
+            enum_name: "Option".into(),
+            variant: "Some".into(),
+            tag: -1,
+            args: vec![v],
+            arg_offsets: Vec::new(),
+            slot: -1,
+            size: 0,
+        };
+        let none = Expr::EnumVariant {
+            enum_name: "Option".into(),
+            variant: "None".into(),
+            tag: -1,
+        };
+        Expr::If(
+            Box::new(Expr::Bin(BinOp::Eq, Box::new(n), Box::new(Expr::Int(0)))),
+            Block { stmts: Vec::new(), tail: Some(Box::new(none)) },
+            Some(Block { stmts: Vec::new(), tail: Some(Box::new(some)) }),
+        )
+    }
+
+    /// Lower `<src>.<adapters>.collect()` to an array value. Only a
+    /// compile-time-length source is supported: an array binding or literal (a
+    /// copy), or a range with constant bounds. A `Vec` source has a runtime
+    /// length and no fixed array type, so it is rejected.
+    fn finish_iter_collect(
+        &mut self,
+        src: &IterSrc,
+        adapters: &[String],
+        args: &[Expr],
+    ) -> PResult<Expr> {
+        let var = |n: &str| Expr::Var { name: n.to_string(), slot: -1, ty: Type::I64 };
+        match src {
+            IterSrc::ArrayVar(name, _) => Ok(Expr::Block(Block {
+                stmts: vec![Stmt::Let {
+                    name: "\u{0}icol".to_string(),
+                    ty: None,
+                    init: Some(var(name)),
+                    slot: -1,
+                    mutable: false,
+                }],
+                tail: Some(Box::new(var("\u{0}icol"))),
+            })),
+            IterSrc::ArrayLit(elems) => Ok(Expr::Block(Block {
+                stmts: vec![Stmt::Let {
+                    name: "\u{0}icol".to_string(),
+                    ty: None,
+                    init: Some(Expr::ArrayList(elems.clone())),
+                    slot: -1,
+                    mutable: false,
+                }],
+                tail: Some(Box::new(var("\u{0}icol"))),
+            })),
+            IterSrc::Range(lo, hi, inclusive) => {
+                if !adapters.is_empty() {
+                    return Err(format!(
+                        "at byte {}: `.collect()` on a range supports no adapters",
+                        self.pos()
+                    ));
+                }
+                let _ = args;
+                let (Some(lo_v), Some(hi_v)) = (const_i64(lo), const_i64(hi)) else {
+                    return Err(format!(
+                        "at byte {}: `.collect()` on a range needs constant bounds",
+                        self.pos()
+                    ));
+                };
+                let end = if *inclusive { hi_v + 1 } else { hi_v };
+                if end <= lo_v {
+                    return Ok(Expr::ArrayList(Vec::new()));
+                }
+                let elems: Vec<Expr> = (lo_v..end).map(Expr::Int).collect();
+                Ok(Expr::ArrayList(elems))
+            }
+            IterSrc::Vec(..) => Err(format!(
+                "at byte {}: `.collect()` on a `Vec` is not supported (its length is not a \
+                 compile-time constant); collect from an array or a constant range",
+                self.pos()
+            )),
+        }
+    }
+
+
+    /// True at the head of `(lo..hi)` / `(lo..=hi)` used directly as a `for`
+    /// iterable (no adapter). `(a..b).rev()` is handled by
+    /// `at_parenthesized_range_adapter` first, so this sees only the plain form.
+    fn at_parenthesized_range_plain(&self) -> bool {
+        match self.parenthesized_range_end() {
+            Some(j) => self.toks.get(j).map(|t| &t.tok) != Some(&Tok::Dot),
+            None => false,
+        }
+    }
+
+    /// The tokens at the cursor are `( <..> .. <..> )` followed by one or more
+    /// adapters: the head of a `for i in (lo..hi).rev()` / `.step_by(k)` /
+    /// `.skip(k)` / `.take(k)`, possibly chained (`.skip(3).take(4)`). A
+    /// non-nested token scan: the first `)` at depth zero ends the parenthesised
+    /// range, and only a `..`/`..=` directly inside it (no parentheses of its
+    /// own) counts, so `(f(..))`, `((a..b))` and `(a..b).sum()` are all
+    /// rejected. Returns the adapters in source order, or `None` when the shape
+    /// does not match.
+    fn at_parenthesized_range_adapter(&self) -> Option<Vec<String>> {
+        let mut j = self.parenthesized_range_end()?;
+        let mut adapters = Vec::new();
+        loop {
+            if self.toks.get(j).map(|t| &t.tok) != Some(&Tok::Dot) {
+                break;
+            }
+            let name = match self.toks.get(j + 1).map(|t| &t.tok) {
+                Some(Tok::Ident(n)) => n.clone(),
+                _ => break,
+            };
+            let argc = match name.as_str() {
+                "rev" => 0,
+                "step_by" | "skip" | "take" => 1,
+                // A method rmc does not desugar ends the chain; the head then
+                // parses as an ordinary expression and reports its own error.
+                _ => break,
+            };
+            if self.toks.get(j + 2).map(|t| &t.tok) != Some(&Tok::LParen) {
+                break;
+            }
+            // Skip to the matching `)` of this adapter's argument list.
+            let mut k = j + 3;
+            let mut d = 1u32;
+            while let Some(t) = self.toks.get(k).map(|t| &t.tok) {
+                match t {
+                    Tok::LParen => d += 1,
+                    Tok::RParen => {
+                        d -= 1;
+                        if d == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                k += 1;
+            }
+            if self.toks.get(k).map(|t| &t.tok) != Some(&Tok::RParen) {
+                break;
+            }
+            if argc == 0 {
+                if k != j + 3 {
+                    break;
+                }
+            } else if k == j + 3 {
+                break;
+            }
+            adapters.push(name);
+            j = k + 1;
+        }
+        if adapters.is_empty() {
+            None
+        } else {
+            Some(adapters)
+        }
+    }
+
+    /// `for PAT in (lo..hi).ADAPTERS { body }` (or `lo..=hi`), with the head
+    /// already consumed. `adapters` is the source-order list the lookahead
+    /// found, e.g. `["skip", "take"]`.
+    ///
+    /// The loop runs a single upward counter `i` from `0` to a computed count,
+    /// so `continue` reaches the counter increment like any other `for` and the
+    /// `For` codegen is reused unchanged. Each adapter defines the count and the
+    /// element:
+    ///
+    /// * `rev` — element `len - 1 - i`, `n` steps. Iterating a range downward is
+    ///   otherwise `while`-shaped, where `continue` would skip the decrement and
+    ///   loop forever; running the counter up and mapping it down sidesteps
+    ///   that, and the count is bounded by `hi - lo`, so it cannot wrap.
+    /// * `step_by(k)` — element `i * k`, `ceil(n / k)` steps.
+    /// * `skip(k)` / `take(k)` — element `i` (`i + c` after a skip), `n - c` /
+    ///   `c` steps, where `c = min(k, n)`. Their argument is a step count, not a
+    ///   stride.
+    ///
+    /// Adapters apply left to right, each transforming the previous one's
+    /// sequence: the element is a composition of per-adapter index maps (a `rev`
+    /// after a `take` reverses that slice), and the count threads through each
+    /// adapter's length. The maps stay relative to the raw range, so `lo` is
+    /// added once at the end. Every bound (`lo`, `hi`, `n`, each `k`) is bound
+    /// to a temporary in the enclosing block, so a side-effecting bound runs
+    /// once, not per step.
+    fn desugar_for_range_adapter(
+        &mut self,
+        pat: Pat,
+        lo: Expr,
+        hi: Expr,
+        inclusive: bool,
+        adapters: &[String],
+        args: Vec<Expr>,
+        body: Block,
+        label: Option<String>,
+    ) -> PResult<Stmt> {
+        let var = match pat {
+            Pat::Bind(n) => n,
+            Pat::Wild => {
+                let n = format!("\u{0}fi{}", self.tmp);
+                self.tmp += 1;
+                n
+            }
+            _ => {
+                return Err(format!(
+                    "at byte {}: `for` over a range needs a binding or `_`",
+                    self.pos()
+                ))
+            }
+        };
+        let lo_name = format!("\u{0}rl{}", self.tmp);
+        let hi_name = format!("\u{0}rh{}", self.tmp);
+        let i_name = format!("\u{0}ri{}", self.tmp);
+        // One stride temporary per `step_by(k)`; the names line up with the
+        // matching entry in `args`.
+        let k_names: Vec<String> = adapters
+            .iter()
+            .filter(|a| a.as_str() == "step_by")
+            .map(|_| {
+                let n = format!("\u{0}rk{}", self.tmp);
+                self.tmp += 1;
+                n
+            })
+            .collect();
+        let vlo = |n: &str| Expr::Var { name: n.to_string(), slot: -1, ty: Type::I64 };
+        let c_name = |t: usize| format!("\u{0}rc{t}");
+        let m_name = |t: usize| format!("\u{0}ra{t}");
+        let s_name = |t: usize| format!("\u{0}rs{t}");
+        // The span of the range before any adapter: `hi - lo` exclusive,
+        // `hi - lo + 1` inclusive.
+        let span = Expr::Bin(BinOp::Sub, Box::new(vlo(&hi_name)), Box::new(vlo(&lo_name)));
+        let total = if inclusive {
+            Expr::Bin(BinOp::Add, Box::new(span), Box::new(Expr::Int(1)))
+        } else {
+            span
+        };
+        let mut head: Vec<Stmt> = vec![
+            Stmt::Let { name: lo_name.clone(), ty: None, init: Some(lo), slot: -1, mutable: false },
+            Stmt::Let { name: hi_name.clone(), ty: None, init: Some(hi), slot: -1, mutable: false },
+        ];
+        // Pass one, forward. `lens[t]` is the sequence length the `t`-th adapter
+        // receives (`lens[0]` is the raw range length) and `counts[t]` the length
+        // it emits; `strides[t]` holds the `step_by` stride temporary. Each
+        // adapter's bound is a `let`, so it is evaluated once, not per step.
+        let n = adapters.len();
+        let mut lens: Vec<Expr> = Vec::with_capacity(n);
+        let mut counts: Vec<Expr> = Vec::with_capacity(n);
+        let mut strides: Vec<Option<String>> = vec![None; n];
+        let mut head_a = 0usize;
+        let mut head_k = 0usize;
+        let mut prev_len = total;
+        for (t, adapter) in adapters.iter().enumerate() {
+            lens.push(prev_len.clone());
+            // A negative literal count (`skip(-1)`, `step_by(-1)`) is rejected
+            // by rustc: the adapters take a `usize`, which cannot be negated.
+            // rmc's `-1` is an `i64`, and a negative count would otherwise
+            // silently mean "no skip" or a backward stride, so reject it here.
+            // A non-literal negative (a variable, a cast) is not a compile
+            // error in rustc, so it is left to run time, matching a `usize`
+            // that wrapped.
+            if let Some(k) = args.get(head_a).and_then(const_i64) {
+                if k < 0 {
+                    return Err(format!(
+                        "at byte {}: cannot apply unary `-` to a `usize` adapter count",
+                        self.pos()
+                    ));
+                }
+            }
+            match adapter.as_str() {
+                "rev" => counts.push(prev_len.clone()),
+                "step_by" => {
+                    let k_name = k_names[head_k].clone();
+                    head_k += 1;
+                    head.push(Stmt::Let {
+                        name: k_name.clone(),
+                        ty: None,
+                        init: Some(args[head_a].clone()),
+                        slot: -1,
+                        mutable: false,
+                    });
+                    head_a += 1;
+                    strides[t] = Some(k_name.clone());
+                    // `ceil(len / k)` as `len / k + (len % k != 0)`. The
+                    // obvious `(len + k - 1) / k` overflows for a stride near
+                    // `i64::MAX` (`(0..3).step_by(i64::MAX)` must yield one
+                    // element), so the count is built from `len / k` plus a
+                    // 0/1 remainder indicator instead. A zero stride divides by
+                    // zero here, trapping like rustc — and because the count is
+                    // bound now, that happens when `step_by` is applied, before
+                    // a later adapter's argument runs.
+                    let c_name = c_name(t);
+                    let quot = Expr::Bin(
+                        BinOp::Div,
+                        Box::new(prev_len.clone()),
+                        Box::new(vlo(&k_name)),
+                    );
+                    let rem = Expr::Bin(
+                        BinOp::Mod,
+                        Box::new(prev_len.clone()),
+                        Box::new(vlo(&k_name)),
+                    );
+                    head.push(Stmt::Let {
+                        name: c_name.clone(),
+                        ty: None,
+                        init: Some(Expr::Bin(
+                            BinOp::Add,
+                            Box::new(quot),
+                            Box::new(Expr::Cast(
+                                Box::new(Expr::Bin(
+                                    BinOp::Ne,
+                                    Box::new(rem),
+                                    Box::new(Expr::Int(0)),
+                                )),
+                                Type::I64,
+                            )),
+                        )),
+                        slot: -1,
+                        mutable: false,
+                    });
+                    counts.push(vlo(&c_name));
+                }
+                "skip" | "take" => {
+                    let m = m_name(t);
+                    head.push(Stmt::Let {
+                        name: m.clone(),
+                        ty: None,
+                        init: Some(args[head_a].clone()),
+                        slot: -1,
+                        mutable: false,
+                    });
+                    head_a += 1;
+                    // `c = min(bound, len)`: the number of steps the bound
+                    // actually removes, so it can never exceed the sequence.
+                    head.push(Stmt::Let {
+                        name: c_name(t),
+                        ty: None,
+                        init: Some(Expr::Call {
+                            name: "__rmc_min".into(),
+                            args: vec![vlo(&m), prev_len.clone()],
+                            arg_slots: Vec::new(),
+                            ret_slot: -1,
+                            ret_ty: Type::I64,
+                            elem_ty: None,
+                        }),
+                        slot: -1,
+                        mutable: false,
+                    });
+                    if adapter == "skip" {
+                        counts.push(Expr::Bin(
+                            BinOp::Sub,
+                            Box::new(prev_len.clone()),
+                            Box::new(vlo(&c_name(t))),
+                        ));
+                    } else {
+                        counts.push(vlo(&c_name(t)));
+                    }
+                }
+                _ => unreachable!("unknown range adapter {adapter}"),
+            }
+            prev_len = counts[t].clone();
+        }
+        // Pass two, reverse. `map` is the counter-to-element index for the
+        // `t`-th adapter's sequence, built from the innermost (last) adapter
+        // outward and kept relative to the raw range (`lo` is added once at the
+        // end). `rev` maps `i` to `len - 1 - i`, `step_by(k)` to `i * k`, `skip`
+        // shifts by `c`. A `rev` needs the length of the sequence it reverses
+        // (`lens[t]`); that expression may reference a `step_by` count, so it is
+        // bound once to `s_t` rather than recomputed per iteration.
+        let mut subst: Vec<Option<String>> = vec![None; n];
+        let mut map = Expr::Var { name: i_name.clone(), slot: -1, ty: Type::I64 };
+        for t in (0..n).rev() {
+            let needs_len = adapters[t] == "rev" || (t > 0 && adapters[t - 1] == "rev");
+            if needs_len && subst[t].is_none() {
+                let s = s_name(t);
+                head.push(Stmt::Let {
+                    name: s.clone(),
+                    ty: None,
+                    init: Some(lens[t].clone()),
+                    slot: -1,
+                    mutable: false,
+                });
+                subst[t] = Some(s);
+            }
+            let l = match &subst[t] {
+                Some(name) => vlo(name),
+                None => lens[t].clone(),
+            };
+            match adapters[t].as_str() {
+                "rev" => {
+                    // Element `i` of the reversed sequence is `len - 1 - i` of
+                    // this one.
+                    map = Expr::Bin(
+                        BinOp::Sub,
+                        Box::new(Expr::Bin(BinOp::Sub, Box::new(l), Box::new(Expr::Int(1)))),
+                        Box::new(map),
+                    );
+                }
+                "step_by" => {
+                    // `X_t[i] = X_{t-1}[i * k]`.
+                    let k_name = strides[t].clone().expect("a step_by stride");
+                    map = Expr::Bin(BinOp::Mul, Box::new(map), Box::new(vlo(&k_name)));
+                }
+                "skip" => {
+                    // Drop the first `c` elements: shift the map by `c`. When the
+                    // bound exceeds the length, `c` is the whole sequence and the
+                    // count is zero, so the shift is never observed.
+                    map = Expr::Bin(BinOp::Add, Box::new(map), Box::new(vlo(&c_name(t))));
+                }
+                "take" => {}
+                _ => unreachable!("unknown range adapter"),
+            }
+        }
+        // The final length is the last adapter's count, bound so the loop bound
+        // is one slot read; it may reference an `s_t` bound just above.
+        let n_name = format!("\u{0}rn{}", self.tmp);
+        self.tmp += 1;
+        head.push(Stmt::Let {
+            name: n_name.clone(),
+            ty: None,
+            init: Some(counts[n - 1].clone()),
+            slot: -1,
+            mutable: false,
+        });
+        let mut stmts = vec![
+            // `map` is a pure index into the raw range, so `lo` is added once.
+            Stmt::Let {
+                name: var,
+                ty: None,
+                init: Some(Expr::Bin(BinOp::Add, Box::new(vlo(&lo_name)), Box::new(map))),
+                slot: -1,
+                mutable: false,
+            },
+        ];
+        stmts.extend(body.stmts);
+        let body = Block { stmts, tail: body.tail };
+        head.push(Stmt::For {
+            var: i_name,
+            var_slot: -1,
+            start: Expr::Int(0),
+            end: vlo(&n_name),
+            end_slot: -1,
+            inclusive: false,
+            body,
+            label,
+        });
+        Ok(Stmt::Expr(Expr::Block(Block { stmts: head, tail: None })))
+    }
+
+    /// Desugar a *plain* reversed range, `for i in (lo..hi).rev() { .. }`, to a
+    /// loop that indexes down from the high bound, so the span `hi - lo` is
+    /// never materialised as a signed count. A `rev`-only chain maps its index
+    /// `j` to `hi - 1 - j` (exclusive) or `hi - j` (inclusive), and the loop
+    /// runs `j` over `0..=span` with `span = hi - lo`; counting up to `span`
+    /// never overflows, unlike the count `hi - lo + 1` the general path forms
+    /// (which traps for `(0..=i64::MAX).rev()`). `continue` targets the loop
+    /// counter, as for any `for` loop. Returns `None` for any other adapter
+    /// chain (a `skip`/`take`/`step_by` before or after the `rev`), which the
+    /// general adapter path handles. Borrows its inputs so the caller can fall
+    /// back with them intact.
+    fn desugar_for_range_rev_plain(
+        &mut self,
+        pat: &Pat,
+        lo: &Expr,
+        hi: &Expr,
+        inclusive: bool,
+        adapters: &[String],
+        args: &[Expr],
+        body: &Block,
+        label: &Option<String>,
+    ) -> PResult<Option<Stmt>> {
+        // Only a lone `rev` applied directly to the raw range takes this path;
+        // any `skip`/`take`/`step_by` needs the general desugaring.
+        if adapters.len() != 1 || adapters[0] != "rev" {
+            return Ok(None);
+        }
+        let _ = args;
+        let var = match pat {
+            Pat::Bind(n) => n.clone(),
+            Pat::Wild => {
+                let n = format!("\u{0}fi{}", self.tmp);
+                self.tmp += 1;
+                n
+            }
+            _ => {
+                return Err(format!(
+                    "at byte {}: `for` over a range needs a binding or `_`",
+                    self.pos()
+                ))
+            }
+        };
+        let vlo = |n: &str| Expr::Var { name: n.to_string(), slot: -1, ty: Type::I64 };
+        let lo_name = format!("\u{0}rl{}", self.tmp);
+        let hi_name = format!("\u{0}rh{}", self.tmp);
+        let i_name = format!("\u{0}ri{}", self.tmp);
+        let n_name = format!("\u{0}rn{}", self.tmp);
+        self.tmp += 1;
+        // `span = hi - lo`, the loop's inclusive end. For `(0..=i64::MAX)` it is
+        // `i64::MAX` (no overflow); a span exceeding `i64::MAX` (the full
+        // `i64::MIN..=i64::MAX`) still traps, a documented limit.
+        let span = Expr::Bin(BinOp::Sub, Box::new(vlo(&hi_name)), Box::new(vlo(&lo_name)));
+        // The exclusive end is `span - 1` (elements `hi-1 ..= lo`); the
+        // inclusive end is `span` (elements `hi ..= lo`).
+        let end = if inclusive {
+            span
+        } else {
+            Expr::Bin(BinOp::Sub, Box::new(span), Box::new(Expr::Int(1)))
+        };
+        // Element `j` of the reversed sequence: `hi - j` (inclusive) or
+        // `hi - 1 - j` (exclusive).
+        let map: Expr = if inclusive {
+            Expr::Bin(BinOp::Sub, Box::new(vlo(&hi_name)), Box::new(vlo(&i_name)))
+        } else {
+            Expr::Bin(
+                BinOp::Sub,
+                Box::new(Expr::Bin(BinOp::Sub, Box::new(vlo(&hi_name)), Box::new(Expr::Int(1)))),
+                Box::new(vlo(&i_name)),
+            )
+        };
+        let mut head: Vec<Stmt> = vec![
+            Stmt::Let {
+                name: lo_name.clone(),
+                ty: None,
+                init: Some(lo.clone()),
+                slot: -1,
+                mutable: false,
+            },
+            Stmt::Let {
+                name: hi_name.clone(),
+                ty: None,
+                init: Some(hi.clone()),
+                slot: -1,
+                mutable: false,
+            },
+            Stmt::Let {
+                name: n_name.clone(),
+                ty: None,
+                init: Some(end),
+                slot: -1,
+                mutable: false,
+            },
+        ];
+        let mut stmts = vec![Stmt::Let {
+            name: var,
+            ty: None,
+            init: Some(map),
+            slot: -1,
+            mutable: false,
+        }];
+        stmts.extend(body.stmts.iter().cloned());
+        let body = Block { stmts, tail: body.tail.clone() };
+        head.push(Stmt::For {
+            var: i_name,
+            var_slot: -1,
+            start: Expr::Int(0),
+            end: vlo(&n_name),
+            end_slot: -1,
+            inclusive: true,
+            body,
+            label: label.clone(),
+        });
+        Ok(Some(Stmt::Expr(Expr::Block(Block { stmts: head, tail: None }))))
+    }
+
     fn parse_for_labeled(&mut self, label: Option<String>) -> PResult<Stmt> {
         // A loop variable that names a constant shadows it (rustc E0530).
         // `parse_pattern` would otherwise read the name as that constant's
@@ -1597,6 +4052,76 @@ impl Parser {
         }
         let pat = self.parse_pattern()?;
         self.expect(Tok::In)?;
+        // `for i in (lo..hi).rev() { .. }` (and `.step_by(k)` / `.skip(k)` /
+        // `.take(k)`): adapt a range. The parentheses are required in Rust
+        // (`lo..hi.rev()` would read the method call on `hi`), and `(lo..hi)`
+        // is not an rmc expression, so the whole shape is recognised before the
+        // head is parsed.
+        if let Some(adapters) = self.at_parenthesized_range_adapter() {
+            self.expect(Tok::LParen)?;
+            let lo = self.parse_cond()?;
+            let inclusive = self.eat(&Tok::DotDotEq);
+            if !inclusive {
+                self.expect(Tok::DotDot)?;
+            }
+            let hi = self.parse_cond()?;
+            self.expect(Tok::RParen)?;
+            let mut args = Vec::new();
+            for adapter in &adapters {
+                self.expect(Tok::Dot)?;
+                self.expect_ident()?; // the adapter name
+                self.expect(Tok::LParen)?;
+                if adapter == "rev" {
+                    self.expect(Tok::RParen)?;
+                } else {
+                    args.push(self.parse_cond()?);
+                    self.expect(Tok::RParen)?;
+                }
+            }
+            let body = self.parse_block()?;
+            // A pure reverse (`rev` applied directly to the raw range, maybe
+            // with `skip`/`take` after it) is desugared to a downward loop, so a
+            // span that does not fit `i64` (`(0..=i64::MAX).rev()`) still runs.
+            // The general path handles a `step_by`/`skip` before the `rev`.
+            if let Some(stmt) = self.desugar_for_range_rev_plain(
+                &pat, &lo, &hi, inclusive, &adapters, &args, &body, &label,
+            )? {
+                return Ok(stmt);
+            }
+            return self.desugar_for_range_adapter(
+                pat, lo, hi, inclusive, &adapters, args, body, label,
+            );
+        }
+        // `for i in (lo..hi) { .. }`: Rust allows the range to be parenthesized
+        // even with no adapter. rmc's `(lo..hi)` is not an expression, so the
+        // shape is unwrapped here to the plain range loop below.
+        if self.at_parenthesized_range_plain() {
+            self.expect(Tok::LParen)?;
+            let lo = self.parse_cond()?;
+            let inclusive = self.eat(&Tok::DotDotEq);
+            if !inclusive {
+                self.expect(Tok::DotDot)?;
+            }
+            let hi = self.parse_cond()?;
+            self.expect(Tok::RParen)?;
+            let mut body = self.parse_block()?;
+            let (var, extra) = self.range_for_binding(pat)?;
+            if !extra.is_empty() {
+                let mut stmts = extra;
+                stmts.extend(body.stmts);
+                body = Block { stmts, tail: body.tail };
+            }
+            return Ok(Stmt::For {
+                var,
+                var_slot: -1,
+                start: lo,
+                end: hi,
+                end_slot: -1,
+                inclusive,
+                body,
+                label,
+            });
+        }
         let head = self.parse_cond()?;
         // `for v in &args` (and `for v in args`) over an `args()`-vector binding
         // desugars to a range over the argument count; the element is read from
@@ -1627,16 +4152,68 @@ impl Parser {
             }
             return self.desugar_for_argsvec(pat, skip, body?, label);
         }
-        // `for x in &arr` iterates by *reference* in Rust: `x` is `&i64`, not
-        // `i64`. rmc iterates by value, so accepting the `&` form would silently
-        // give `x` the wrong type (and diverge from rustc's typing). Reject it
-        // rather than mis-compile; the by-value form is `for x in arr`.
+        // `for x in &arr` / `for x in &mut arr` iterates by *reference*: `x` is
+        // `&i64` (or `&mut i64`), not `i64`. rmc's `&arr[i]` is a real
+        // reference, so the element binds to `&arr[i]` / `&mut arr[i]`, and the
+        // body's `*x` reads (or `*x = v` writes) the element in place. The array
+        // place is used directly, never copied, so a `&mut` write reaches the
+        // original binding. Only an array is supported; a `Vec` binding is an
+        // address with no addressable element here, and any other head falls
+        // through to the by-value paths below.
+        if let Expr::AddrOf { expr: inner, mutable, .. } = &head {
+            let is_vec = matches!(inner.as_ref(), Expr::Var { name, .. } if self.vec_names.contains(name));
+            if is_vec {
+                let Expr::Var { name: recv, .. } = inner.as_ref() else { unreachable!() };
+                let recv = recv.clone();
+                let mutable = *mutable;
+                let body = self.parse_block()?;
+                return self.desugar_for_vec_ref(pat, recv, mutable, body, label);
+            }
+            if Self::is_iterable_place(inner) {
+                let inner = (**inner).clone();
+                let mutable = *mutable;
+                let body = self.parse_block()?;
+                return self.desugar_for_array_ref(pat, inner, mutable, body, label);
+            }
+        }
         if matches!(head, Expr::AddrOf { .. }) {
             return Err(format!(
                 "at byte {}: `for` over a reference is not supported; \
                  iterate by value with `for x in arr`",
                 self.pos()
             ));
+        }
+        // `for x in arr.iter()` / `.iter_mut()`: the iterator forms of the
+        // array loops above. `iter` yields `&T` and `iter_mut` yields `&mut T`,
+        // so each maps onto the loop rmc already has for `&arr` / `&mut arr`.
+        // `into_iter` is deliberately not accepted: on an array its element type
+        // is edition-dependent (by-reference before Rust 2021, by-value after),
+        // and rmc has no edition, so a fixed choice would diverge from one of
+        // them; the by-value form is spelled `for x in arr`. Only an array place
+        // is supported (a `Vec` binding is excluded, and a non-place receiver
+        // falls through to the by-value path, which reports the unknown method).
+        if let Expr::MethodCall { recv, name, args } = &head {
+            if args.is_empty() {
+                let mutable = match name.as_str() {
+                    "iter" => Some(false),
+                    "iter_mut" => Some(true),
+                    _ => None,
+                };
+                if let Some(m) = mutable {
+                    if let Expr::Var { name: recv, .. } = recv.as_ref() {
+                        if self.vec_names.contains(recv) {
+                            let recv = recv.clone();
+                            let body = self.parse_block()?;
+                            return self.desugar_for_vec_ref(pat, recv, m, body, label);
+                        }
+                    }
+                    if Self::is_iterable_place(recv) {
+                        let recv = (**recv).clone();
+                        let body = self.parse_block()?;
+                        return self.desugar_for_array_ref(pat, recv, m, body, label);
+                    }
+                }
+            }
         }
         if self.peek() == Some(&Tok::DotDot) || self.peek() == Some(&Tok::DotDotEq) {
             let inclusive = self.eat(&Tok::DotDotEq);
@@ -1648,32 +4225,7 @@ impl Parser {
             // A range's loop variable is bound directly, so only an irrefutable
             // pattern is allowed: `for n @ _ in 0..5` binds `n`, and
             // `for n @ m in 0..5` also binds `m` (an alias) in the body.
-            let (var, extra) = match pat {
-                Pat::Bind(n) => (n, Vec::new()),
-                Pat::Wild => {
-                    let n = format!("\u{0}fi{}", self.tmp);
-                    self.tmp += 1;
-                    (n, Vec::new())
-                }
-                Pat::At(n, _, sub) => {
-                    if !Self::pat_irrefutable(&sub) {
-                        return Err(format!(
-                            "at byte {}: refutable pattern in `for` binding",
-                            self.pos()
-                        ));
-                    }
-                    let subj = Expr::Var { name: n.clone(), slot: -1, ty: Type::I64 };
-                    let mut binds = Vec::new();
-                    Self::pat_binds(&sub, false, &subj, &mut binds);
-                    (n, binds)
-                }
-                _ => {
-                    return Err(format!(
-                        "at byte {}: `for` over a range needs a binding or `_`",
-                        self.pos()
-                    ))
-                }
-            };
+            let (var, extra) = self.range_for_binding(pat)?;
             if !extra.is_empty() {
                 let mut stmts = extra;
                 stmts.extend(body.stmts);
@@ -1691,7 +4243,290 @@ impl Parser {
             });
         }
         let body = self.parse_block()?;
+        // `for x in v` over a `Vec` binding iterates by value over a copy of the
+        // vector, so growing it inside the body cannot affect the loop bound.
+        if let Expr::Var { name, .. } = &head {
+            if self.vec_names.contains(name) {
+                let recv = name.clone();
+                return self.desugar_for_vec_owned(pat, recv, body, label);
+            }
+        }
         self.desugar_for_array(pat, head, body, label)
+    }
+
+    /// `for PAT in VEC { body }`: iterate by value. The vector is bound once to a
+    /// hidden local (a copy of the binding's address), and the loop indexes that
+    /// copy from 0 to its length, so a `push` inside the body grows the original
+    /// binding without disturbing the bound. The element is read by value.
+    fn desugar_for_vec_owned(
+        &mut self,
+        pat: Pat,
+        recv: String,
+        body: Block,
+        label: Option<String>,
+    ) -> PResult<Stmt> {
+        let n = self.tmp;
+        self.tmp += 1;
+        let vec_name = format!("\u{0}fv{n}");
+        let idx_name = format!("\u{0}fi{n}");
+        let vec_var = Expr::Var { name: vec_name.clone(), slot: -1, ty: Type::I64 };
+        let idx_var = Expr::Var { name: idx_name.clone(), slot: -1, ty: Type::I64 };
+        let len = Expr::Call {
+            name: "__rmc_vec_len".into(),
+            args: vec![vec_var.clone()],
+            arg_slots: Vec::new(),
+            ret_slot: -1,
+            ret_ty: Type::I64,
+            elem_ty: None,
+        };
+        let elem = self.vec_elem_place(&vec_name, &recv, idx_var);
+        let mut stmts = match pat {
+            Pat::Bind(name) => vec![Stmt::Let {
+                name,
+                ty: None,
+                init: Some(elem),
+                slot: -1,
+                mutable: false,
+            }],
+            Pat::Wild => vec![Stmt::Let {
+                name: format!("\u{0}fd{n}"),
+                ty: None,
+                init: Some(elem),
+                slot: -1,
+                mutable: false,
+            }],
+            _ => {
+                return Err(format!(
+                    "at byte {}: `for` over a `Vec` needs a binding or `_`",
+                    self.pos()
+                ))
+            }
+        };
+        stmts.extend(body.stmts);
+        let loop_body = Block { stmts, tail: body.tail };
+        let for_stmt = Stmt::For {
+            var: idx_name,
+            var_slot: -1,
+            start: Expr::Int(0),
+            end: len,
+            end_slot: -1,
+            inclusive: false,
+            body: loop_body,
+            label,
+        };
+        let vec_let = Stmt::Let {
+            name: vec_name,
+            ty: None,
+            init: Some(Expr::Var { name: recv, slot: -1, ty: Type::I64 }),
+            slot: -1,
+            mutable: false,
+        };
+        Ok(Stmt::Expr(Expr::Block(Block { stmts: vec![vec_let, for_stmt], tail: None })))
+    }
+
+    /// The loop variable and any extra bindings for a `for` over a *range*. A
+    /// range's pattern is irrefutable, so it is a binding, `_`, or an
+    /// at-binding (`n @ _`); anything else is rejected rather than mis-bound.
+    /// `_` gets a fresh temporary name, and an at-binding adds the sub-pattern's
+    /// bindings as statements for the body.
+    fn range_for_binding(&mut self, pat: Pat) -> PResult<(String, Vec<Stmt>)> {
+        match pat {
+            Pat::Bind(n) => Ok((n, Vec::new())),
+            Pat::Wild => {
+                let n = format!("\u{0}fi{}", self.tmp);
+                self.tmp += 1;
+                Ok((n, Vec::new()))
+            }
+            Pat::At(n, _, sub) => {
+                if !Self::pat_irrefutable(&sub) {
+                    return Err(format!(
+                        "at byte {}: refutable pattern in `for` binding",
+                        self.pos()
+                    ));
+                }
+                let subj = Expr::Var { name: n.clone(), slot: -1, ty: Type::I64 };
+                let mut binds = Vec::new();
+                Self::pat_binds(&sub, false, &subj, &mut binds);
+                Ok((n, binds))
+            }
+            _ => Err(format!(
+                "at byte {}: `for` over a range needs a binding or `_`",
+                self.pos()
+            )),
+        }
+    }
+
+    /// Whether `e` is a place rmc can iterate by reference (`&e`): an array
+    /// binding or a constant index into one (`&a`, `&a[i]`, `&a[i].f`). A `Vec`
+    /// binding is a bare address with no element type to address here, and any
+    /// other shape (a call result, a literal) has no stable place, so it is not
+    /// iterable by reference and the caller falls back to the by-value path.
+    fn is_iterable_place(e: &Expr) -> bool {
+        match e {
+            Expr::Var { .. } => true,
+            Expr::Index(base, _) | Expr::Field { base, .. } => Self::is_iterable_place(base),
+            Expr::Deref { expr, .. } => Self::is_iterable_place(expr),
+            _ => false,
+        }
+    }
+
+    /// Wrap a parsed expression statement. `v.push(x)` can move the element
+    /// store (a grow reallocates) and the helper returns the new address, so it
+    /// is stored back into the receiver; every other expression keeps its value
+    /// discarded. Only a simple `v` binding is written back, which is the shape
+    /// that can grow.
+    fn expr_stmt(&self, e: Expr) -> Stmt {
+        if let Expr::Call { name, args, .. } = &e {
+            if name == "__rmc_vec_push"
+                || name == "__rmc_str_push_str"
+                || name == "__rmc_str_push_char"
+            {
+                if let Some(Expr::Var { name: recv, .. }) = args.first() {
+                    let target = Expr::Var { name: recv.clone(), slot: -1, ty: Type::I64 };
+                    return Stmt::Assign { target, value: e };
+                }
+            }
+        }
+        Stmt::Expr(e)
+    }
+
+    /// `for PAT in &VEC { body }` (or `&mut VEC`): bind the element by reference
+    /// and index the vector's store directly. The loop is `for i in
+    /// 0..__rmc_vec_len(v) { let PAT = &v[i]; body }` (a mutable borrow for
+    /// `&mut`), where `&v[i]` is `&*(v + i * elem)`, the same place the `v[i]`
+    /// intercept builds. `PAT` may be a binding or `_`.
+    fn desugar_for_vec_ref(
+        &mut self,
+        pat: Pat,
+        recv: String,
+        mutable: bool,
+        body: Block,
+        label: Option<String>,
+    ) -> PResult<Stmt> {
+        let n = self.tmp;
+        self.tmp += 1;
+        let idx_name = format!("\u{0}fi{n}");
+        let idx_var = Expr::Var { name: idx_name.clone(), slot: -1, ty: Type::I64 };
+        let vec_var = Expr::Var { name: recv.clone(), slot: -1, ty: Type::I64 };
+        let len = Expr::Call {
+            name: "__rmc_vec_len".into(),
+            args: vec![vec_var.clone()],
+            arg_slots: Vec::new(),
+            ret_slot: -1,
+            ret_ty: Type::I64,
+            elem_ty: None,
+        };
+        let val_ty = match self.vec_elem_ty.get(&recv) {
+            Some(t) => t.clone(),
+            None => Type::I64,
+        };
+        let elem_ref = Expr::AddrOf {
+            expr: Box::new(self.vec_elem_place(&recv, &recv, idx_var)),
+            ty: val_ty,
+            mutable,
+            slot: -1,
+        };
+        let mut stmts = match pat {
+            Pat::Bind(name) => vec![Stmt::Let {
+                name,
+                ty: None,
+                init: Some(elem_ref),
+                slot: -1,
+                mutable: false,
+            }],
+            Pat::Wild => vec![Stmt::Let {
+                name: format!("\u{0}fd{n}"),
+                ty: None,
+                init: Some(elem_ref),
+                slot: -1,
+                mutable: false,
+            }],
+            _ => {
+                return Err(format!(
+                    "at byte {}: `for` over a `Vec` reference needs a binding or `_`",
+                    self.pos()
+                ))
+            }
+        };
+        stmts.extend(body.stmts);
+        let loop_body = Block { stmts, tail: body.tail };
+        Ok(Stmt::For {
+            var: idx_name,
+            var_slot: -1,
+            start: Expr::Int(0),
+            end: len,
+            end_slot: -1,
+            inclusive: false,
+            body: loop_body,
+            label,
+        })
+    }
+
+    /// `for PAT in &ARR { body }` (or `&mut ARR`): bind the element by reference
+    /// and index the array place directly, so a `&mut` write through `*x`
+    /// reaches the original binding. The loop is `for i in 0..arr.len() { let
+    /// PAT = &arr[i]; body }`, with `&mut arr[i]` when the borrow is mutable.
+    /// Only a binding or `_` pattern is supported, matching the by-value array
+    /// loop's simplest form.
+    fn desugar_for_array_ref(
+        &mut self,
+        pat: Pat,
+        arr: Expr,
+        mutable: bool,
+        body: Block,
+        label: Option<String>,
+    ) -> PResult<Stmt> {
+        let n = self.tmp;
+        self.tmp += 1;
+        let idx_name = format!("\u{0}fi{n}");
+        let idx_var = Expr::Var { name: idx_name.clone(), slot: -1, ty: Type::I64 };
+        let len = Expr::MethodCall {
+            recv: Box::new(arr.clone()),
+            name: "len".to_string(),
+            args: Vec::new(),
+        };
+        // `&arr[i]` / `&mut arr[i]`: the borrow of the indexed place is a real
+        // reference to the element, so `*x` reads and `*x = v` writes it.
+        let elem_ref = Expr::AddrOf {
+            expr: Box::new(Expr::Index(Box::new(arr), Box::new(idx_var))),
+            ty: Type::I64,
+            mutable,
+            slot: -1,
+        };
+        let mut stmts = match pat {
+            Pat::Bind(name) => vec![Stmt::Let {
+                name,
+                ty: None,
+                init: Some(elem_ref),
+                slot: -1,
+                mutable: false,
+            }],
+            Pat::Wild => vec![Stmt::Let {
+                name: format!("\u{0}fd{n}"),
+                ty: None,
+                init: Some(elem_ref),
+                slot: -1,
+                mutable: false,
+            }],
+            _ => {
+                return Err(format!(
+                    "at byte {}: `for` over a reference needs a binding or `_`",
+                    self.pos()
+                ))
+            }
+        };
+        stmts.extend(body.stmts);
+        let loop_body = Block { stmts, tail: body.tail };
+        Ok(Stmt::For {
+            var: idx_name,
+            var_slot: -1,
+            start: Expr::Int(0),
+            end: len,
+            end_slot: -1,
+            inclusive: false,
+            body: loop_body,
+            label,
+        })
     }
 
     /// `for PAT in ARRAY { body }` -> an index loop over the array (see
@@ -1846,6 +4681,7 @@ impl Parser {
                 arg_slots: Vec::new(),
                 ret_slot: -1,
                 ret_ty: Type::I64,
+                elem_ty: None,
             },
             end_slot: -1,
             inclusive: false,
@@ -1864,6 +4700,7 @@ impl Parser {
             arg_slots: Vec::new(),
             ret_slot: -1,
             ret_ty: Type::I64,
+            elem_ty: None,
         }
     }
 
@@ -1883,6 +4720,7 @@ impl Parser {
         matches!(
             self.peek(),
             Some(Tok::Int(_))
+                | Some(Tok::IntSuffixed(..))
                 | Some(Tok::Str(_))
                 | Some(Tok::Ident(_))
                 | Some(Tok::True)
@@ -1999,11 +4837,31 @@ impl Parser {
                 // from it. `..` and `f: _` are the only way to drop fields.
                 let struct_pat = matches!(self.peek(), Some(Tok::Ident(_)))
                     && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::LBrace);
+                // `let P(a, b) = e;` destructures a tuple struct. The name must
+                // be a known constructor, so a plain `let f(x)` (which is not a
+                // pattern) still falls through to the binding path and is
+                // diagnosed there.
+                let tuple_struct_pat = matches!(
+                    self.peek(),
+                    Some(Tok::Ident(n)) if self.struct_ctors.contains_key(n)
+                ) && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::LParen);
+                // `let Unit = e;` matches a unit struct, whose name is also its
+                // value. A trailing `{` or `(` would make it a (rejected)
+                // braced or tuple pattern instead.
+                let unit_struct_pat = matches!(
+                    self.peek(),
+                    Some(Tok::Ident(n)) if self.unit_structs.contains(n)
+                ) && !matches!(
+                    self.toks.get(self.i + 1).map(|t| &t.tok),
+                    Some(&Tok::LBrace) | Some(&Tok::LParen)
+                );
                 // `let n @ subpat = e;` binds the whole value to `n` and also
                 // destructures it. Detected by the `@` after the name.
                 let at_pat = matches!(self.peek(), Some(Tok::Ident(_)))
                     && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::At);
                 if struct_pat
+                    || tuple_struct_pat
+                    || unit_struct_pat
                     || at_pat
                     || self.peek() == Some(&Tok::LBracket)
                     || self.peek() == Some(&Tok::LParen)
@@ -2015,6 +4873,13 @@ impl Parser {
                         ));
                     }
                     let pat = self.parse_pattern_primary()?;
+                    // Every name the pattern binds is a local binding, so none
+                    // may shadow a constant (rustc E0530). sema covers a
+                    // top-level constant; a block-scoped one is folded here in
+                    // the parser, so check it here.
+                    let mut bound = Vec::new();
+                    Self::pat_bound_names(&pat, &mut bound);
+                    self.reject_const_shadow(&bound)?;
                     let ty = if self.eat(&Tok::Colon) {
                         Some(self.parse_type()?)
                     } else {
@@ -2084,6 +4949,10 @@ impl Parser {
                     return Ok(());
                 }
                 let name = self.expect_ident()?;
+                // A `let` may not shadow a constant (rustc E0530). sema enforces
+                // this for a top-level constant, but a block-scoped one is folded
+                // at parse time and never reaches sema, so enforce it here too.
+                self.reject_const_shadow(&[name.clone()])?;
                 // A `Vec<T>` annotation leaves its element width in
                 // `vec_elem_pending`; consume it here so it is bound to this
                 // name, and clear it for every other annotation.
@@ -2098,12 +4967,49 @@ impl Parser {
                     self.vec_elem_pending = None;
                     8
                 };
+                // The element type of a `Vec<Struct>`/`Vec<Enum>` binding, for
+                // the index lowering. Consumed with the width; cleared for any
+                // other annotation so a stale type never leaks.
+                let elem_ty = if matches!(ty, Some(Type::Named(ref n)) if n == "Vec") {
+                    self.vec_elem_pending_ty.take()
+                } else {
+                    self.vec_elem_pending_ty = None;
+                    None
+                };
+                // An array annotation records the element width, so
+                // `arr.iter().sum()` accumulates a `[u8; N]` in `u8` (wrapping)
+                // and an `[i64; N]` in `i64`, matching rustc. Any other
+                // annotation clears a shadowed width.
+                let arr_w = match &ty {
+                    Some(Type::Array(elem, _)) => {
+                        Some(if matches!(**elem, Type::U8 | Type::I8) { 1 } else { 8 })
+                    }
+                    _ => None,
+                };
                 let init = if self.eat(&Tok::Eq) {
                     Some(self.parse_expr()?)
                 } else {
                     None
                 };
                 self.expect(Tok::Semi)?;
+                // A binding whose initializer is an array literal is an array
+                // even without an annotation (`let a = [1, 2, 3];`), so record
+                // its width too; otherwise `a.iter()` would not be recognised.
+                let arr_w = arr_w.or_else(|| {
+                    match &init {
+                        Some(Expr::ArrayList(_)) | Some(Expr::ArrayLit(..)) => Some(8),
+                        _ => None,
+                    }
+                });
+                self.note_arr_elem(&name);
+                match arr_w {
+                    Some(w) => {
+                        self.arr_elem.insert(name.clone(), w);
+                    }
+                    None => {
+                        self.arr_elem.remove(&name);
+                    }
+                }
                 // A `Vec` binding is lowered to an `i64` address of its backing
                 // allocation. Three initializers are supported, each replaced by
                 // the allocation (plus, for `vec![..]`, a fill). The binding and
@@ -2121,53 +5027,106 @@ impl Parser {
                         self.args_vecs.insert(name.clone(), self.args_skip);
                         return Ok(());
                     }
+                    // `String::new()`, `String::with_capacity(k)` and
+                    // `String::from("lit")`: a growable byte buffer. A `String`
+                    // value is the `{len, bytes}` record (the `str` layout), so
+                    // the binding is a `Str` and only the constructors are
+                    // rewritten. Recognised regardless of an annotation, like the
+                    // `Vec` constructors, so `let s = String::from("x");` needs
+                    // no `: String`.
+                    if m == "\u{0}strnew" || m == "\u{0}strfrom" {
+                        let helper = if m == "\u{0}strnew" {
+                            "__rmc_str_new"
+                        } else {
+                            "__rmc_str_from"
+                        };
+                        self.note_string_name(&name);
+                        self.string_names.insert(name.clone());
+                        out.push(Stmt::Let {
+                            name,
+                            ty: Some(Type::Str),
+                            init: Some(Expr::Call {
+                                name: helper.into(),
+                                args,
+                                arg_slots: Vec::new(),
+                                ret_slot: -1,
+                                ret_ty: Type::Str,
+                                elem_ty: None,
+                            }),
+                            slot: -1,
+                            mutable,
+                        });
+                        return Ok(());
+                    }
                     if m == "\u{0}vecnew" || m == "\u{0}vecrepeat" {
                         let n_expr = if m == "\u{0}vecnew" {
                             args[0].clone()
                         } else {
                             args[1].clone()
                         };
-                        // The count may be a constant or a runtime value; only a
-                        // constant is recorded for a later `.len()`/`.capacity()`
-                        // fold. Either way the size is `count * 8` bytes at run
-                        // time and `__rmc_fill` takes the count as a value.
-                        let count = eval_i64(&n_expr, &self.consts);
+                        // Without an annotation the element type is inferred from
+                        // a struct-literal element, so `let v = vec![S{..}; n]` is
+                        // a `Vec<S>` as in rustc.
+                        let (elem_width, elem_ty) = if elem_ty.is_none()
+                            && m == "\u{0}vecrepeat"
+                        {
+                            match self.infer_vec_elem_ty(std::slice::from_ref(&args[0])) {
+                                Some(t) => (t.size() as i64, Some(t)),
+                                None => (elem_width, elem_ty),
+                            }
+                        } else {
+                            (elem_width, elem_ty)
+                        };
+                        self.reject_zst_vec_elem(elem_ty.as_ref())?;
                         self.note_vec_name(&name);
                         self.note_vec_elem(&name);
-                        self.note_vec_len(&name);
-                        self.note_vec_cap(&name);
                         self.vec_names.insert(name.clone());
+                        self.vec_mut.insert(name.clone(), mutable);
                         self.vec_elem.insert(name.clone(), elem_width);
-                        if let Some(c) = count {
-                            self.vec_len.insert(name.clone(), c);
-                            if m == "\u{0}vecnew" {
-                                self.vec_cap.insert(name.clone(), c);
-                            }
-                        }
-                        // `alloc(count * 8)`; each element is one machine word.
-                        let bytes = Expr::Bin(
-                            BinOp::Mul,
-                            Box::new(n_expr.clone()),
-                            Box::new(Expr::Int(8)),
-                        );
-                        let addr = Expr::Call {
-                            name: "alloc".into(),
-                            args: vec![bytes],
-                            arg_slots: Vec::new(),
-                            ret_slot: -1,
-                            ret_ty: Type::I64,
-                        };
-                        let init_expr = if m == "\u{0}vecnew" {
-                            addr
+                        if let Some(t) = &elem_ty {
+                            self.vec_elem_ty.insert(name.clone(), t.clone());
                         } else {
-                            // `__rmc_fill(addr, count, elem)` writes the repeated
-                            // element; it returns the address.
+                            self.vec_elem_ty.remove(&name);
+                        }
+                        // The value is the element store's address; the helper
+                        // writes a 16-byte header before it holding the length
+                        // (0 here) and the capacity, so `.len()`/`.capacity()`
+                        // are runtime reads and a later `push` can grow the
+                        // store. The element width travels as an argument, as it
+                        // does for `add`/`free`.
+                        let init_expr = if m == "\u{0}vecnew" {
+                            // `Vec::new()` is capacity 0, `with_capacity(k)` is `k`.
                             Expr::Call {
-                                name: "__rmc_fill".into(),
-                                args: vec![addr, n_expr, args[0].clone()],
+                                name: "__rmc_vec_new".into(),
+                                args: vec![n_expr, Expr::Int(elem_width)],
                                 arg_slots: Vec::new(),
                                 ret_slot: -1,
                                 ret_ty: Type::I64,
+                                elem_ty: None,
+                            }
+                        } else {
+                            // `vec![value; count]`: `count` copies of `value`,
+                            // length and capacity both `count`. An aggregate
+                            // element is passed by address (its value already is
+                            // its address); a scalar, including a unit-enum
+                            // value, is widened to a word.
+                            let agg = elem_ty.as_ref().map_or(false, |t| t.is_aggregate());
+                            let elem_arg = if agg {
+                                args[0].clone()
+                            } else {
+                                Expr::Cast(Box::new(args[0].clone()), Type::I64)
+                            };
+                            Expr::Call {
+                                name: "__rmc_vec_repeat".into(),
+                                args: vec![
+                                    n_expr,
+                                    elem_arg,
+                                    Expr::Int(if agg { -elem_width } else { elem_width }),
+                                ],
+                                arg_slots: Vec::new(),
+                                ret_slot: -1,
+                                ret_ty: Type::I64,
+                                elem_ty: elem_ty.clone(),
                             }
                         };
                         out.push(Stmt::Let {
@@ -2180,10 +5139,110 @@ impl Parser {
                         return Ok(());
                     }
                     if m == "\u{0}veclist" {
-                        return Err(format!(
-                            "at byte {}: `vec![a, b, c]` is not supported (use `vec![e; n]`)",
-                            self.pos()
-                        ));
+                        // `vec![a, b, c]`: a fresh vector of exactly `count`
+                        // elements. `__rmc_vec_new(count, width)` gives the
+                        // header and store with capacity `count` and length 0;
+                        // one `push` per element fills it without ever growing
+                        // (so the address never moves and a non-`mut` binding is
+                        // fine), and the length ends at `count`. An empty list is
+                        // simply capacity 0.
+                        let count = args.len() as i64;
+                        // Without an annotation the element type is inferred from
+                        // a struct-literal element (`let v = vec![S{..}, ..]`),
+                        // matching rustc; a non-aggregate list keeps the default.
+                        let (elem_width, elem_ty) = if elem_ty.is_none() {
+                            match self.infer_vec_elem_ty(&args) {
+                                Some(t) => (t.size() as i64, Some(t)),
+                                None => (elem_width, elem_ty),
+                            }
+                        } else {
+                            (elem_width, elem_ty)
+                        };
+                        // Only a genuinely aggregate element (a struct, a payload
+                        // enum, an array) is stored by address; a unit-enum value
+                        // is an eight-byte scalar and widens to a word.
+                        let agg = elem_ty.as_ref().map_or(false, |t| t.is_aggregate());
+                        self.reject_zst_vec_elem(elem_ty.as_ref())?;
+                        self.note_vec_name(&name);
+                        self.note_vec_elem(&name);
+                        self.vec_names.insert(name.clone());
+                        self.vec_mut.insert(name.clone(), mutable);
+                        self.vec_elem.insert(name.clone(), elem_width);
+                        if let Some(t) = &elem_ty {
+                            self.vec_elem_ty.insert(name.clone(), t.clone());
+                        } else {
+                            self.vec_elem_ty.remove(&name);
+                        }
+                        // An element that names an outer binding of the same
+                        // name (`let v = 5; let v: Vec<i64> = vec![v]`) must read
+                        // that outer value: rustc evaluates the initializer
+                        // before the new binding enters scope, so a direct store
+                        // after `name` is declared would read the vector instead.
+                        // Only then is each element evaluated into its own
+                        // temporary ahead of the declaration.
+                        let shadowed = args.iter().any(|e| Self::expr_mentions_name(e, &name));
+                        let mut temps: Vec<String> = Vec::new();
+                        if shadowed {
+                            for elem in args.iter() {
+                                let t = format!("\u{0}vt{}", self.tmp);
+                                self.tmp += 1;
+                                // An aggregate element binds by address (a
+                                // temporary for a literal/field read); a scalar
+                                // widens to a word.
+                                let init = if agg {
+                                    elem.clone()
+                                } else {
+                                    Expr::Cast(Box::new(elem.clone()), Type::I64)
+                                };
+                                out.push(Stmt::Let {
+                                    name: t.clone(),
+                                    ty: None,
+                                    init: Some(init),
+                                    slot: -1,
+                                    mutable: false,
+                                });
+                                temps.push(t);
+                            }
+                        }
+                        out.push(Stmt::Let {
+                            name: name.clone(),
+                            ty: Some(Type::I64),
+                            init: Some(Expr::Call {
+                                name: "__rmc_vec_new".into(),
+                                args: vec![Expr::Int(count), Expr::Int(elem_width)],
+                                arg_slots: Vec::new(),
+                                ret_slot: -1,
+                                ret_ty: Type::I64,
+                                elem_ty: None,
+                            }),
+                            slot: -1,
+                            mutable,
+                        });
+                        let base = Expr::Var { name: name.clone(), slot: -1, ty: Type::I64 };
+                        for (i, elem) in args.iter().enumerate() {
+                            // An aggregate element is pushed by address; a scalar
+                            // widens to a word.
+                            let value = if shadowed {
+                                Expr::Var { name: temps[i].clone(), slot: -1, ty: Type::I64 }
+                            } else if agg {
+                                elem.clone()
+                            } else {
+                                Expr::Cast(Box::new(elem.clone()), Type::I64)
+                            };
+                            out.push(Stmt::Expr(Expr::Call {
+                                name: "__rmc_vec_push".into(),
+                                args: vec![
+                                    base.clone(),
+                                    value,
+                                    Expr::Int(if agg { -elem_width } else { elem_width }),
+                                ],
+                                arg_slots: Vec::new(),
+                                ret_slot: -1,
+                                ret_ty: Type::I64,
+                                elem_ty: elem_ty.clone(),
+                            }));
+                        }
+                        return Ok(());
                     }
                     // `let p = base.as_mut_ptr();`: `base` is a `Vec` address, so
                     // `p` holds that same address. Record it a raw pointer, with
@@ -2209,10 +5268,18 @@ impl Parser {
                         return Ok(());
                     }
                 }
+                if matches!(ty, Some(Type::Named(ref n)) if n == "String") {
+                    return Err(format!(
+                        "at byte {}: a `String` binding must be initialized by \
+                         `String::new()`, `String::with_capacity(k)` or `String::from(\"lit\")`",
+                        self.pos()
+                    ));
+                }
                 if matches!(ty, Some(Type::Named(ref n)) if n == "Vec") {
                     return Err(format!(
                         "at byte {}: a `Vec` binding must be initialized by \
-                         `Vec::with_capacity(k)`, `vec![e; n]` or an `args()` collect",
+                         `Vec::with_capacity(k)`, `vec![e; n]`, `vec![a, b, c]` or an \
+                         `args()` collect",
                         self.pos()
                     ));
                 }
@@ -2285,20 +5352,20 @@ impl Parser {
                 let e = self.parse_expr()?;
                 if self.eat(&Tok::Eq) {
                     let value = self.parse_expr()?;
-                    self.expect(Tok::Semi)?;
+                    self.eat_semi_at_block_end()?;
                     out.push(Stmt::Assign { target: e, value });
                     return Ok(());
                 }
                 if let Some(op) = self.peek_compound_op() {
                     self.i += 1;
                     let value = self.parse_expr()?;
-                    self.expect(Tok::Semi)?;
+                    self.eat_semi_at_block_end()?;
                     let s = self.desugar_compound(&e, op, value);
                     out.push(s);
                     return Ok(());
                 }
                 self.expect(Tok::Semi)?;
-                out.push(Stmt::Expr(e));
+                out.push(self.expr_stmt(e));
                 Ok(())
             }
         }
@@ -2544,6 +5611,32 @@ impl Parser {
         ))
     }
 
+    /// `matches!(expr, pat)`: `true` when `expr` matches `pat`, else `false`.
+    /// It lowers to the same arm chain a two-arm `match` produces, so the
+    /// existing pattern machinery (including an or-pattern, a range, or a
+    /// guarded arm) does the work. `matches!` accepts a comma or a `|` before
+    /// the pattern, as Rust's macro does.
+    fn parse_matches(&mut self) -> PResult<Expr> {
+        self.i += 1; // the `!`
+        self.expect(Tok::LParen)?;
+        let scrutinee = self.parse_bracketed_expr()?;
+        self.expect(Tok::Comma)?;
+        self.eat(&Tok::Pipe);
+        let pat = self.parse_refutable_pattern()?;
+        // A guard is accepted and, if present, folds into the arm test.
+        let guard = if self.eat(&Tok::If) {
+            Some(self.parse_cond()?)
+        } else {
+            None
+        };
+        self.expect(Tok::RParen)?;
+        let arms = vec![
+            (pat, guard, Expr::Bool(true)),
+            (Pat::Wild, None, Expr::Bool(false)),
+        ];
+        self.desugar_match(scrutinee, arms)
+    }
+
     /// `panic!()`, `unreachable!()`, `todo!()` and `unimplemented!()`: exit with
     /// status 101, rustc's panic code. Any arguments (a message) are discarded.
     fn parse_panic(&mut self, _name: &str) -> PResult<Expr> {
@@ -2567,6 +5660,7 @@ impl Parser {
             arg_slots: vec![(-1, 0)],
             ret_slot: -1,
             ret_ty: Type::Unit,
+            elem_ty: None,
         }
     }
 
@@ -2621,6 +5715,7 @@ impl Parser {
                 arg_slots: Vec::new(),
                 ret_slot: -1,
                 ret_ty: Type::I64,
+                elem_ty: None,
             }));
         }
         if !known {
@@ -2660,6 +5755,7 @@ impl Parser {
                 arg_slots: Vec::new(),
                 ret_slot: -1,
                 ret_ty: Type::Unit,
+                elem_ty: None,
             },
             // `std::hint::black_box(x)`: the identity. rmc has no optimizer that
             // would otherwise fold the value away, so the barrier is a no-op.
@@ -2817,6 +5913,7 @@ impl Parser {
             arg_slots: Vec::new(),
             ret_slot: -1,
             ret_ty: Type::I64,
+            elem_ty: None,
         })
     }
 
@@ -2872,6 +5969,7 @@ impl Parser {
             arg_slots: Vec::new(),
             ret_slot: -1,
             ret_ty: Type::I64,
+            elem_ty: None,
         }
     }
     /// `println!("...")` / `print!("...")`: format the literal and its `{}`
@@ -2940,6 +6038,7 @@ impl Parser {
                 arg_slots: Vec::new(),
                 ret_slot: -1,
                 ret_ty: Type::I64,
+                elem_ty: None,
             });
         }
         let first = self.parse_bracketed_expr()?;
@@ -2953,6 +6052,7 @@ impl Parser {
                 arg_slots: Vec::new(),
                 ret_slot: -1,
                 ret_ty: Type::I64,
+                elem_ty: None,
             });
         }
         // `vec![a, b, c]`: the elements are stored in order.
@@ -2970,6 +6070,7 @@ impl Parser {
             arg_slots: Vec::new(),
             ret_slot: -1,
             ret_ty: Type::I64,
+            elem_ty: None,
         })
     }
 
@@ -3016,6 +6117,7 @@ impl Parser {
                     arg_slots: vec![(-1, 0)],
                     ret_slot: -1,
                     ret_ty: Type::Unit,
+                    elem_ty: None,
                 }));
             }
         };
@@ -3042,6 +6144,7 @@ impl Parser {
                         arg_slots: vec![(-1, 0)],
                         ret_slot: -1,
                         ret_ty: Type::Unit,
+                        elem_ty: None,
                     }));
                     k += 2;
                 }
@@ -3073,6 +6176,7 @@ impl Parser {
                 arg_slots: vec![(-1, 0)],
                 ret_slot: -1,
                 ret_ty: Type::Unit,
+                elem_ty: None,
             }));
         }
         Ok(Expr::Block(Block { stmts, tail: None }))
@@ -3099,23 +6203,33 @@ impl Parser {
     }
 
     fn parse_cmp(&mut self) -> PResult<Expr> {
-        let mut lhs = self.parse_bitor()?;
-        loop {
-            let op = match self.peek() {
-                Some(Tok::EqEq) => BinOp::Eq,
-                Some(Tok::Ne) => BinOp::Ne,
-                Some(Tok::Lt) => BinOp::Lt,
-                Some(Tok::Le) => BinOp::Le,
-                Some(Tok::Gt) => BinOp::Gt,
-                Some(Tok::Ge) => BinOp::Ge,
-                _ => break,
-            };
-            self.i += 1;
-            let rhs = self.parse_bitor()?;
-            self.bump_depth()?;
-            lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs));
+        let lhs = self.parse_bitor()?;
+        let op = match self.peek() {
+            Some(Tok::EqEq) => BinOp::Eq,
+            Some(Tok::Ne) => BinOp::Ne,
+            Some(Tok::Lt) => BinOp::Lt,
+            Some(Tok::Le) => BinOp::Le,
+            Some(Tok::Gt) => BinOp::Gt,
+            Some(Tok::Ge) => BinOp::Ge,
+            _ => return Ok(lhs),
+        };
+        self.i += 1;
+        let rhs = self.parse_bitor()?;
+        self.bump_depth()?;
+        // Comparison is non-associative in Rust: `a < b < c` is a hard error
+        // ("comparison operators cannot be chained"), not `(a < b) < c`. Reject
+        // a second comparison operator here so rmc does not accept what rustc
+        // rejects.
+        if matches!(
+            self.peek(),
+            Some(Tok::EqEq | Tok::Ne | Tok::Lt | Tok::Le | Tok::Gt | Tok::Ge)
+        ) {
+            return Err(format!(
+                "at byte {}: comparison operators cannot be chained",
+                self.pos()
+            ));
         }
-        Ok(lhs)
+        Ok(Expr::Bin(op, Box::new(lhs), Box::new(rhs)))
     }
 
     /// `|`, then `^`, then `&`, matching Rust's precedence. Each is left
@@ -3227,6 +6341,16 @@ impl Parser {
                     self.i += 1;
                     return Ok(Expr::Int(i64::MIN));
                 }
+                // `-128i8` is the literal `-128`: fold the sign into the
+                // suffixed magnitude before narrowing, so the width check sees
+                // 128 (in range) rather than the cast's wrapped -128 (whose
+                // negation back to 128 is out of range). `-1u8` negates an
+                // unsigned literal, which the check below rejects.
+                if let Some(Tok::IntSuffixed(v, s)) = self.peek().cloned() {
+                    let pos = self.pos();
+                    self.i += 1;
+                    return suffixed_int_lit(v, &s, true, pos);
+                }
                 let e = self.parse_unary()?;
                 Ok(Expr::Un(UnOp::Neg, Box::new(e)))
             }
@@ -3307,6 +6431,72 @@ impl Parser {
             if self.eat(&Tok::LBracket) {
                 let idx = self.parse_bracketed_expr()?;
                 self.expect(Tok::RBracket)?;
+                // `v[i]` on a `Vec` binding is `*(v + i * elem)`: the value is
+                // the element store's address, so indexing is pointer arithmetic
+                // at the element stride. The stride is the element *size*: eight
+                // for a word-sized scalar, one for `u8`/`i8`, and the struct's
+                // size for an aggregate element (stored inline). A `Vec` element
+                // that is itself a `Vec` is a word, so its stride is eight.
+                if let Expr::Var { name: recv, .. } = &e {
+                    if self.vec_names.contains(recv) {
+                        let elem_ty = self.vec_elem_ty.get(recv).cloned();
+                        let stride = match &elem_ty {
+                            Some(t) => t.size() as i64,
+                            None => self.vec_elem.get(recv).copied().unwrap_or(8),
+                        };
+                        let recv_expr = e.clone();
+                        let addr = if self.bounds_checks {
+                            // The runtime helper checks `idx` against the
+                            // vector's live length (in the header just before
+                            // the store) and traps when out of range, so `v[i]`
+                            // cannot read or write past the allocation. The
+                            // index is evaluated exactly once, inside the call.
+                            Expr::Call {
+                                name: "__rmc_vec_at".into(),
+                                args: vec![recv_expr, idx, Expr::Int(stride)],
+                                arg_slots: Vec::new(),
+                                ret_slot: -1,
+                                ret_ty: Type::I64,
+                                elem_ty: None,
+                            }
+                        } else {
+                            let off = if stride == 1 {
+                                idx
+                            } else {
+                                Expr::Bin(
+                                    BinOp::Mul,
+                                    Box::new(idx),
+                                    Box::new(Expr::Int(stride)),
+                                )
+                            };
+                            Expr::Bin(BinOp::Add, Box::new(recv_expr), Box::new(off))
+                        };
+                        // The referent carries the element type so codegen loads
+                        // the right width and, for an aggregate, addresses the
+                        // element in place (a struct element is not a word, so a
+                        // bare word load would be wrong). A scalar element is a
+                        // word (`U8` for a byte referent, else `I64`).
+                        let (ptr_ty, val_ty) = match &elem_ty {
+                            Some(t) => (t.clone(), t.clone()),
+                            None if stride == 1 => (Type::U8, Type::I64),
+                            None => (Type::I64, Type::I64),
+                        };
+                        // A `Vec` element is a place: `v[i] = x` writes it and
+                        // `v[i]` reads it. The reference's mutability mirrors the
+                        // binding's, so a write through a read-only binding is a
+                        // shared-reference write that sema rejects (`v` is not
+                        // `mut`), exactly as rustc does, while a read stays fine.
+                        let ref_mut = self.vec_mut.get(recv).copied().unwrap_or(true);
+                        e = Expr::Deref {
+                            expr: Box::new(Expr::Cast(
+                                Box::new(addr),
+                                Type::Ref(Box::new(ptr_ty), ref_mut),
+                            )),
+                            ty: val_ty,
+                        };
+                        continue;
+                    }
+                }
                 e = Expr::Index(Box::new(e), Box::new(idx));
             } else if self.eat(&Tok::Dot) {
                 // A tuple field is written `.0`, `.1`, ...: the "name" is a
@@ -3329,6 +6519,34 @@ impl Parser {
                         }
                     }
                     self.expect(Tok::RParen)?;
+                    // `.iter()`/`.into_iter()` on a `Vec` or array binding
+                    // starts an iterator chain, lowered to a loop over the same
+                    // value. `.iter()` borrows and `.into_iter()` moves in
+                    // rustc; rmc reads the scalar element values either way,
+                    // which is observationally identical for the supported
+                    // elements.
+                    if args.is_empty() && (name == "iter" || name == "into_iter") {
+                        if let Expr::Var { name: recv, .. } = &e {
+                            let src = if self.vec_names.contains(recv) {
+                                let w = self.vec_elem.get(recv).copied().unwrap_or(8);
+                                Some(IterSrc::Vec(recv.clone(), w))
+                            } else if self.arr_elem.contains_key(recv) {
+                                Some(IterSrc::ArrayVar(recv.clone(), self.arr_elem.get(recv).copied().unwrap_or(8)))
+                            } else {
+                                None
+                            };
+                            // Only lower a *chain*: a bare `a.iter()` with no
+                            // following method is left as a `MethodCall` so the
+                            // `for x in a.iter()` desugar still sees it (the
+                            // chain lowering demands a terminal method).
+                            if let Some(src) = src {
+                                if self.peek() == Some(&Tok::Dot) {
+                                    e = self.lower_iter_chain(src)?;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     // Methods on a `Vec`/raw-pointer binding that rmc lowers to
                     // plain arithmetic. The receiver is an `i64` (a `Vec` is its
                     // backing address), so `capacity`/`len` fold to the constant
@@ -3336,13 +6554,140 @@ impl Parser {
                     // address (marked so a later `.add` folds), and `.add(off)`
                     // is `ptr + off`.
                     if let Expr::Var { name: recv, .. } = &e {
-                        if args.is_empty() && name == "capacity" && self.vec_cap.contains_key(recv)
+                        // `String` methods. A `String` value is the `{len,
+                        // bytes}` record, so `as_str()` is the value itself and
+                        // `len()`/`is_empty()`/`starts_with`/... fall through to
+                        // the `str` handling in sema. `capacity()` reads the
+                        // word before the length, and `push_str`/`push` append
+                        // and may grow (returning the new record), so they are
+                        // written back like a `Vec` push.
+                        if self.string_names.contains(recv) {
+                            if args.is_empty() && name == "capacity" {
+                                let recv_expr = e.clone();
+                                e = Expr::Call {
+                                    name: "__rmc_string_cap".into(),
+                                    args: vec![recv_expr],
+                                    arg_slots: Vec::new(),
+                                    ret_slot: -1,
+                                    ret_ty: Type::I64,
+                                    elem_ty: None,
+                                };
+                                continue;
+                            }
+                            if args.is_empty() && name == "as_str" {
+                                // The value already is the record view.
+                                continue;
+                            }
+                            if name == "push_str" && args.len() == 1 {
+                                let recv_expr = e.clone();
+                                let value = args.pop().unwrap();
+                                e = Expr::Call {
+                                    name: "__rmc_str_push_str".into(),
+                                    args: vec![recv_expr, value],
+                                    arg_slots: Vec::new(),
+                                    ret_slot: -1,
+                                    ret_ty: Type::Str,
+                                    elem_ty: None,
+                                };
+                                continue;
+                            }
+                            if name == "push" && args.len() == 1 {
+                                let recv_expr = e.clone();
+                                let value = args.pop().unwrap();
+                                e = Expr::Call {
+                                    name: "__rmc_str_push_char".into(),
+                                    args: vec![recv_expr, value],
+                                    arg_slots: Vec::new(),
+                                    ret_slot: -1,
+                                    ret_ty: Type::Str,
+                                    elem_ty: None,
+                                };
+                                continue;
+                            }
+                        }
+                        if args.is_empty()
+                            && name == "capacity"
+                            && self.vec_names.contains(recv)
                         {
-                            e = Expr::Int(self.vec_cap[recv]);
+                            let recv_expr = e.clone();
+                            e = Expr::Call {
+                                name: "__rmc_vec_cap".into(),
+                                args: vec![recv_expr],
+                                arg_slots: Vec::new(),
+                                ret_slot: -1,
+                                ret_ty: Type::I64,
+                                elem_ty: None,
+                            };
                             continue;
                         }
-                        if args.is_empty() && name == "len" && self.vec_len.contains_key(recv) {
-                            e = Expr::Int(self.vec_len[recv]);
+                        if args.is_empty() && name == "len" && self.vec_names.contains(recv) {
+                            let recv_expr = e.clone();
+                            e = Expr::Call {
+                                name: "__rmc_vec_len".into(),
+                                args: vec![recv_expr],
+                                arg_slots: Vec::new(),
+                                ret_slot: -1,
+                                ret_ty: Type::I64,
+                                elem_ty: None,
+                            };
+                            continue;
+                        }
+                        if args.is_empty() && name == "is_empty" && self.vec_names.contains(recv)
+                        {
+                            let recv_expr = e.clone();
+                            e = Expr::Bin(
+                                BinOp::Eq,
+                                Box::new(Expr::Call {
+                                    name: "__rmc_vec_len".into(),
+                                    args: vec![recv_expr],
+                                    arg_slots: Vec::new(),
+                                    ret_slot: -1,
+                                    ret_ty: Type::I64,
+                                    elem_ty: None,
+                                }),
+                                Box::new(Expr::Int(0)),
+                            );
+                            continue;
+                        }
+                        if name == "push"
+                            && args.len() == 1
+                            && self.vec_names.contains(recv)
+                        {
+                            let recv_expr = e.clone();
+                            // Only a genuinely aggregate element (a struct, a
+                            // payload enum, an array) travels by address; a
+                            // *unit* enum is an eight-byte scalar, so it must
+                            // widen to a word like any other scalar, not be
+                            // passed as an address.
+                            let agg = self
+                                .vec_elem_ty
+                                .get(recv)
+                                .map_or(false, |t| t.is_aggregate());
+                            let width = match self.vec_elem_ty.get(recv) {
+                                Some(t) => t.size() as i64,
+                                None => self.vec_elem.get(recv).copied().unwrap_or(8),
+                            };
+                            // An aggregate element is pushed by address (and the
+                            // width is negated so the helper copies it inline); a
+                            // scalar widens to a word.
+                            let arg = args.pop().unwrap();
+                            let value = if agg {
+                                arg
+                            } else {
+                                Expr::Cast(Box::new(arg), Type::I64)
+                            };
+                            e = Expr::Call {
+                                name: "__rmc_vec_push".into(),
+                                args: vec![
+                                    recv_expr,
+                                    value,
+                                    Expr::Int(if agg { -width } else { width }),
+                                ],
+                                arg_slots: Vec::new(),
+                                ret_slot: -1,
+                                ret_ty: Type::I64,
+                                elem_ty: self.vec_elem_ty.get(recv).cloned(),
+                            };
                             continue;
                         }
                         if args.is_empty()
@@ -3356,6 +6701,7 @@ impl Parser {
                                 arg_slots: Vec::new(),
                                 ret_slot: -1,
                                 ret_ty: Type::I64,
+                                elem_ty: None,
                             };
                             continue;
                         }
@@ -3434,6 +6780,11 @@ impl Parser {
                 format!("at byte {}: pattern literal out of range", self.pos())
             })?),
             Tok::Int(v) => Ok(v),
+            // A suffixed pattern literal (`200u8`) is typed at its width, so a
+            // `match x { 200u8 => .. }` on a `u8` compares against `200` and a
+            // magnitude that does not fit is an error, exactly as the
+            // expression `200u8` is.
+            Tok::IntSuffixed(v, s) => suffixed_int_value(v, &s, neg, self.pos()),
             Tok::IntMinMagnitude if neg => Ok(i64::MIN),
             Tok::IntMinMagnitude => Err(format!(
                 "at byte {}: integer literal `9223372036854775808` is out of range for `i64`",
@@ -3473,7 +6824,7 @@ impl Parser {
                 self.i += 1;
                 Ok(Pat::Wild)
             }
-            Some(Tok::Minus) | Some(Tok::Int(_)) => {
+            Some(Tok::Minus) | Some(Tok::Int(_)) | Some(Tok::IntSuffixed(..)) => {
                 let lo = self.parse_signed_pat_int()?;
                 self.maybe_range(lo)
             }
@@ -3498,6 +6849,10 @@ impl Parser {
             // the sub-pattern. `@` cannot begin any other pattern, so it is
             // unambiguous here; a `mut` may precede the name.
             Some(Tok::Ident(n)) if self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::At) => {
+                // `n @ subpat` is a binding, so it may not shadow a constant
+                // (rustc E0530); sema covers a top-level one, the parser a
+                // block-scoped one.
+                self.reject_const_shadow(std::slice::from_ref(&n))?;
                 self.i += 2;
                 let sub = self.parse_pattern_primary()?;
                 Ok(Pat::At(n, false, Box::new(sub)))
@@ -3514,6 +6869,21 @@ impl Parser {
                         args = Some(self.parse_variant_pat_args()?);
                     }
                     Ok(Pat::Variant(n, variant, args))
+                } else if let Some(&count) = self.struct_ctors.get(&n) {
+                    // `P(a, b)`: a tuple struct pattern. The fields are named
+                    // positionally, so it reuses the struct-pattern path; the
+                    // arity must match the struct exactly.
+                    if self.peek() != Some(&Tok::LParen) {
+                        // A bare tuple struct name is neither a binding nor a
+                        // pattern (rustc E0530: a binding cannot shadow a tuple
+                        // struct, and the name alone is not a valid pattern).
+                        return Err(format!(
+                            "at byte {}: identifier `{n}` is a tuple struct, not a binding",
+                            self.pos()
+                        ));
+                    }
+                    let fields = self.parse_tuple_struct_pat_args(&n, count)?;
+                    Ok(Pat::Struct(n, fields))
                 } else if self.peek() == Some(&Tok::LBrace) {
                     // `S { f, g: h, i: _, .. }`: a struct pattern. Fields may be
                     // written in any order, and each is either a shorthand
@@ -3536,6 +6906,12 @@ impl Parser {
                     };
                     let fields = self.parse_struct_pat_fields(&n, &known)?;
                     Ok(Pat::Struct(n, fields))
+                } else if self.unit_structs.contains(&n) {
+                    // A unit struct's name is its value, so `U` as a pattern is
+                    // a struct pattern that matches the unit struct `U` with no
+                    // fields. It reuses `Pat::Struct`, so sema's `PatCheck`
+                    // verifies the scrutinee really is `U`.
+                    Ok(Pat::Struct(n, Vec::new()))
                 } else if let Some(v) = self.consts.get(&n) {
                     // A bare name that names a constant is that constant's
                     // value, not a fresh binding, exactly as rustc reads it.
@@ -3544,6 +6920,26 @@ impl Parser {
                     Ok(Pat::Bool(*b))
                 } else if let Some(c) = self.const_chars.get(&n) {
                     Ok(Pat::Char(*c))
+                } else if matches!(n.as_str(), "Some" | "Ok" | "Err")
+                    && self.peek() == Some(&Tok::LParen)
+                {
+                    // The `Option`/`Result` variant patterns, written
+                    // unqualified: `Some(x)`, `Ok(v)`, `Err(e)`. A bare `None`
+                    // is the unit variant and is handled by the branch below.
+                    let (en, var) = match n.as_str() {
+                        "Some" => ("Option", "Some"),
+                        "Ok" => ("Result", "Ok"),
+                        _ => ("Result", "Err"),
+                    };
+                    self.i += 1; // `(`
+                    let args = self.parse_variant_pat_args()?;
+                    Ok(Pat::Variant(en.into(), var.into(), Some(args)))
+                } else if n == "None" {
+                    // An unqualified `None` is the unit variant of the injected
+                    // `Option` enum, not a binding: `matches!(Some(1), None)`
+                    // must be `false`. Without this it would fall through to
+                    // `Pat::Bind`, a catch-all that matches every `Option`.
+                    Ok(Pat::Variant("Option".into(), "None".into(), None))
                 } else {
                     // A bare name binds the scrutinee; `_` already matched the
                     // wildcard case above.
@@ -3584,12 +6980,14 @@ impl Parser {
                 break;
             }
             let m = self.eat(&Tok::Mut);
-            // `_` ignores the field: it binds nothing and tests nothing.
+            // `_` ignores the field: it binds nothing and tests nothing. Any
+            // other sub-pattern is a full pattern, so an or-pattern
+            // (`E::A(1 | 2)`) and a nested variant pattern are both allowed.
             let p = if self.peek() == Some(&Tok::Underscore) {
                 self.i += 1;
                 Pat::Wild
             } else {
-                self.parse_pattern_primary()?
+                self.parse_pattern()?
             };
             if m && !matches!(p, Pat::Bind(_) | Pat::At(..)) {
                 return Err(format!(
@@ -3603,15 +7001,13 @@ impl Parser {
             }
         }
         self.expect(Tok::RParen)?;
-        // Every argument must be irrefutable: a refutable one (`E::V(1)`) would
-        // need a per-field test, which rmc does not generate. Reject it here
-        // rather than mis-bind it as an always-true read.
-        if args.iter().any(|(_, p)| !Self::pat_irrefutable(p)) {
-            return Err(format!(
-                "at byte {}: variant pattern arguments must be bindings, `_`, or nested patterns",
-                self.pos()
-            ));
-        }
+        // An argument may be any sub-pattern rmc can test and bind: a binding,
+        // `_`, a nested struct/tuple/array pattern, a nested variant pattern
+        // (`E::A(Some(x))`), or a scalar test. A refutable sub-pattern adds its
+        // own test, carried in the variant test after the tag test (see
+        // `variant_pat_cond`), so `E::A(Some(x))` does not match `E::A(None)`.
+        // Anything else (`mut` on a non-binding, handled above) is rejected
+        // where it is parsed.
         Ok((args, rest))
     }
 
@@ -3688,6 +7084,24 @@ impl Parser {
                         ));
                     }
                     Some((false, inner))
+                } else if matches!(
+                    self.peek(),
+                    Some(Tok::Ident(n)) if self.struct_ctors.contains_key(n)
+                ) && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::LParen)
+                {
+                    // `f: P(a, b)` — a nested tuple struct pattern for a
+                    // tuple-struct-typed field; `mut` is rejected, as for any
+                    // nested pattern.
+                    if m {
+                        return Err(format!(
+                            "at byte {}: `mut` is not allowed on a nested pattern",
+                            self.pos()
+                        ));
+                    }
+                    let n = self.expect_ident()?;
+                    let count = self.struct_ctors[&n];
+                    let inner = self.parse_tuple_struct_pat_args(&n, count)?;
+                    Some((false, Pat::Struct(n, inner)))
                 } else if self.peek() == Some(&Tok::LBracket) {
                     // `f: [x, y]` — a nested array pattern for an array-typed
                     // field; `mut` is likewise rejected.
@@ -3705,6 +7119,7 @@ impl Parser {
                     // destructures it. The sub-pattern must be irrefutable,
                     // since rmc generates no per-field test.
                     let name = self.expect_ident()?;
+                    self.reject_const_shadow(std::slice::from_ref(&name))?;
                     self.i += 1; // the `@`
                     let sub = self.parse_pattern_primary()?;
                     if !Self::pat_irrefutable(&sub) {
@@ -3715,11 +7130,14 @@ impl Parser {
                     }
                     Some((m, Pat::At(name, m, Box::new(sub))))
                 } else {
-                    Some((m, Pat::Bind(self.expect_ident()?)))
+                    let name = self.expect_ident()?;
+                    self.reject_const_shadow(std::slice::from_ref(&name))?;
+                    Some((m, Pat::Bind(name)))
                 }
             } else {
                 // Shorthand: `S { f }` binds `f`, or `S { mut f }` binds a
-                // mutable `f`.
+                // mutable `f`. The binding may not shadow a constant (E0530).
+                self.reject_const_shadow(std::slice::from_ref(&fname))?;
                 Some((leading_mut, Pat::Bind(fname.clone())))
             };
             fields.push((fname, bind));
@@ -3758,6 +7176,70 @@ impl Parser {
         self.i += 1; // the `{`
         let fields = self.parse_struct_pat_fields(&name, &known)?;
         Ok(Some(Pat::Struct(name, fields)))
+    }
+
+    /// `(a, b, ..)`: a tuple struct pattern's field list, with the `(` current.
+    /// The fields are named positionally (`"0"`, `"1"`, ...) so the pattern
+    /// reuses the struct-pattern path. `count` is the struct's field count from
+    /// the prescan, so the arity is checked before the fields are read.
+    fn parse_tuple_struct_pat_args(&mut self, n: &str, count: usize) -> PResult<Vec<FieldPat>> {
+        self.i += 1; // the `(`
+        let mut fields: Vec<FieldPat> = Vec::new();
+        while self.peek() != Some(&Tok::RParen) {
+            if self.peek().is_none() {
+                return Err(format!(
+                    "at byte {}: unexpected end of input in tuple struct pattern",
+                    self.pos()
+                ));
+            }
+            let k = fields.len();
+            let m = self.eat(&Tok::Mut);
+            if self.peek() == Some(&Tok::Underscore) {
+                self.i += 1;
+                if m {
+                    return Err(format!(
+                        "at byte {}: `mut` is not allowed on `_`",
+                        self.pos()
+                    ));
+                }
+                // `_` ignores the field, exactly like `f: _` in a braced
+                // pattern: stored as `None`, so no read is emitted for it.
+                fields.push((k.to_string(), None));
+            } else {
+                let p = self.parse_pattern_primary()?;
+                if m && !matches!(p, Pat::Bind(_) | Pat::At(..)) {
+                    return Err(format!(
+                        "at byte {}: `mut` is not allowed here; it attaches to a binding",
+                        self.pos()
+                    ));
+                }
+                fields.push((k.to_string(), Some((m, p))));
+            }
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(Tok::RParen)?;
+        if fields.len() != count {
+            return Err(format!(
+                "at byte {}: tuple struct `{n}` has {count} field(s), but {} were bound",
+                self.pos(),
+                fields.len()
+            ));
+        }
+        // A tuple struct pattern is irrefutable, like a braced struct pattern:
+        // rmc generates no per-field test, so a refutable element (`P(1, x)`) is
+        // rejected rather than mis-bound as an always-true read.
+        if fields
+            .iter()
+            .any(|(_, b)| b.as_ref().map_or(false, |(_, p)| !Self::pat_irrefutable(p)))
+        {
+            return Err(format!(
+                "at byte {}: tuple struct pattern fields must be bindings, `_`, or nested patterns",
+                self.pos()
+            ));
+        }
+        Ok(fields)
     }
 
     /// `[a, b, .., c]`: an array pattern, with the opening `[` already peeked.
@@ -4021,6 +7503,9 @@ impl Parser {
                 // A struct or tuple sub-pattern inside an array element.
                 Pat::Struct(name, fields) => out.extend(Self::struct_pat_binds(fields, &index, &name)),
                 Pat::Tuple(elems) => out.extend(Self::tuple_pat_binds(elems, &index)),
+                // A nested variant pattern inside an array element reads its
+                // payload through the element index.
+                Pat::Variant(..) => Self::pat_binds(pat, *m, &index, &mut out),
                 _ => unreachable!("unexpected array sub-pattern"),
             }
         }
@@ -4201,6 +7686,9 @@ impl Parser {
             // test is the whole test.
             Pat::At(_, _, sub) => Self::pat_test(sub, subj),
             Pat::Tuple(elems) => Self::tuple_pat_test(elems, subj),
+            Pat::Array { elems, rest, front } => {
+                Self::array_pat_test(elems, *rest, *front, subj)
+            }
             // `a | b | c` as an element: any alternative matching passes. A `_`
             // alternative makes the whole element always true, so there is no
             // test; otherwise fold the alternatives' tests with `||`.
@@ -4259,7 +7747,53 @@ impl Parser {
                 );
                 Some(Expr::Bin(BinOp::And, Box::new(lower), Box::new(upper)))
             }
-            _ => unreachable!("a tuple element is validated when the tuple is parsed"),
+            // A nested variant pattern: its own tag test over `subj`, folded
+            // with any refutable sub-pattern of its own. Used both as a
+            // payload field's sub-pattern and inside `variant_pat_cond`.
+            Pat::Variant(enum_name, variant, args) => {
+                Some(Self::variant_pat_cond(enum_name, variant, args, subj))
+            }
+        }
+    }
+
+    /// The boolean test for one `Enum::Variant(..)` pattern over `subj`: a
+    /// `VariantTest` carrying the tag test and, for each refutable payload
+    /// sub-pattern, a test read through that field. `E::A(Some(x))` yields a
+    /// `VariantTest` for `A` whose `sub_tests` hold the `Some` test over field
+    /// 0, so it does not match `E::A(None)`. Codegen `&&`s the sub-tests after
+    /// the tag test, so a read only runs once the tag matched.
+    fn variant_pat_cond(
+        enum_name: &str,
+        variant: &str,
+        args: &Option<(Vec<(bool, Pat)>, bool)>,
+        subj: &Expr,
+    ) -> Expr {
+        let n_binds = args.as_ref().map_or(-1, |(a, _)| a.len() as i32);
+        let has_rest = args.as_ref().map_or(false, |(_, rest)| *rest);
+        let mut sub_tests: Vec<(usize, Expr)> = Vec::new();
+        if let Some((args, _)) = args {
+            for (idx, (_, pat)) in args.iter().enumerate() {
+                let payload = Expr::EnumPayload {
+                    recv: Box::new(subj.clone()),
+                    enum_name: enum_name.to_string(),
+                    variant: variant.to_string(),
+                    idx,
+                    offset: 0,
+                    ty: Type::Unit,
+                };
+                if let Some(t) = Self::pat_test(pat, &payload) {
+                    sub_tests.push((idx, t));
+                }
+            }
+        }
+        Expr::VariantTest {
+            scrutinee: Box::new(subj.clone()),
+            enum_name: enum_name.to_string(),
+            variant: variant.to_string(),
+            tag: -1,
+            n_binds,
+            has_rest,
+            sub_tests,
         }
     }
 
@@ -4277,6 +7811,46 @@ impl Parser {
                 ty: Type::Unit,
             };
             if let Some(t) = Self::pat_test(p, &field) {
+                cond = Some(match cond {
+                    None => t,
+                    Some(c) => Expr::Bin(BinOp::And, Box::new(c), Box::new(t)),
+                });
+            }
+        }
+        cond
+    }
+
+    /// The boolean test for an array pattern: the `&&` of its refutable
+    /// elements' tests, each read through the element's index. `None` when every
+    /// element is irrefutable, so the arm is a catch-all. A `..` rest never adds
+    /// a test (it matches any count). Used when an array pattern is a payload
+    /// field's sub-pattern, so `E::A([1, x])` tests field 0 against `1`.
+    fn array_pat_test(
+        elems: &[Option<(bool, Pat)>],
+        rest: bool,
+        front: usize,
+        subj: &Expr,
+    ) -> Option<Expr> {
+        let mut cond: Option<Expr> = None;
+        for (j, elem) in elems.iter().enumerate() {
+            let (_, p) = match elem {
+                Some(x) => x,
+                None => continue,
+            };
+            let idx = if !rest || j < front {
+                Expr::Int(j as i64)
+            } else {
+                let behind = elems.len() - front;
+                let from_end = behind - (j - front);
+                let len = Expr::MethodCall {
+                    recv: Box::new(subj.clone()),
+                    name: "len".to_string(),
+                    args: Vec::new(),
+                };
+                Expr::Bin(BinOp::Sub, Box::new(len), Box::new(Expr::Int(from_end as i64)))
+            };
+            let index = Expr::Index(Box::new(subj.clone()), Box::new(idx));
+            if let Some(t) = Self::pat_test(p, &index) {
                 cond = Some(match cond {
                     None => t,
                     Some(c) => Expr::Bin(BinOp::And, Box::new(c), Box::new(t)),
@@ -4517,14 +8091,9 @@ impl Parser {
                 );
                 Expr::Bin(BinOp::And, Box::new(lower), Box::new(upper))
             }
-            Pat::Variant(enum_name, variant, args) => Expr::VariantTest {
-                scrutinee: Box::new(subj.clone()),
-                enum_name: enum_name.clone(),
-                variant: variant.clone(),
-                tag: -1,
-                n_binds: args.as_ref().map_or(-1, |(a, _)| a.len() as i32),
-                has_rest: args.as_ref().map_or(false, |(_, rest)| *rest),
-            },
+            Pat::Variant(enum_name, variant, args) => {
+                Self::variant_pat_cond(enum_name, variant, args, subj)
+            }
             // `_` in an or-pattern: always true, so the whole condition is true.
             // A struct pattern is likewise always true; a binding one is
             // rejected before this point. A tuple alternative folds its
@@ -4743,11 +8312,28 @@ impl Parser {
             Pat::Array { elems, rest, front } => {
                 out.extend(Self::array_pat_binds(elems, *rest, *front, subj))
             }
+            // A nested variant pattern reads its payload fields through `subj`
+            // (the outer payload), so `E::A(Some(x))` binds `x` from
+            // `subj`'s field 0 read as an `Option`.
+            Pat::Variant(enum_name, variant, args) => {
+                if let Some((args, _)) = args {
+                    for (idx, (am, sub)) in args.iter().enumerate() {
+                        let payload = Expr::EnumPayload {
+                            recv: Box::new(subj.clone()),
+                            enum_name: enum_name.clone(),
+                            variant: variant.clone(),
+                            idx,
+                            offset: 0,
+                            ty: Type::Unit,
+                        };
+                        Self::pat_binds(sub, *am, &payload, out);
+                    }
+                }
+            }
             // A scalar element binds nothing (its test is generated
             // separately); an or-pattern binds nothing (rmc rejects a binding
             // in an or-pattern when it is parsed).
             Pat::Int(_) | Pat::Char(_) | Pat::CharRange(..) | Pat::Bool(_) | Pat::Str(_) | Pat::Range(..) | Pat::Or(_) => {}
-            _ => unreachable!("unexpected sub-pattern"),
         }
     }
 
@@ -4804,6 +8390,55 @@ impl Parser {
         }
     }
 
+    /// Whether `e` mentions the variable `name` anywhere. A shape that is not
+    /// inspected returns `true`, so a caller that uses this to decide whether
+    /// evaluation order matters (and evaluates into temporaries when it does)
+    /// stays conservative. Used by the `vec![..]` desugar, whose elements must
+    /// be evaluated before the binding that names the vector enters scope.
+    fn expr_mentions_name(e: &Expr, name: &str) -> bool {
+        match e {
+            Expr::Int(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) => false,
+            Expr::Var { name: n, .. } => n == name,
+            Expr::Bin(_, a, b) => {
+                Self::expr_mentions_name(a, name) || Self::expr_mentions_name(b, name)
+            }
+            Expr::Un(_, a) | Expr::Cast(a, _) | Expr::ArrayLit(a, _) => {
+                Self::expr_mentions_name(a, name)
+            }
+            Expr::Index(a, b) => {
+                Self::expr_mentions_name(a, name) || Self::expr_mentions_name(b, name)
+            }
+            Expr::Deref { expr, .. } | Expr::AddrOf { expr, .. } => {
+                Self::expr_mentions_name(expr, name)
+            }
+            Expr::Field { base, .. } => Self::expr_mentions_name(base, name),
+            Expr::MethodCall { recv, args, .. } => {
+                Self::expr_mentions_name(recv, name)
+                    || args.iter().any(|a| Self::expr_mentions_name(a, name))
+            }
+            Expr::Call { args, .. } => args.iter().any(|a| Self::expr_mentions_name(a, name)),
+            Expr::TupleLit(v) | Expr::ArrayList(v) => {
+                v.iter().any(|a| Self::expr_mentions_name(a, name))
+            }
+            Expr::StructLit { fields, .. } => {
+                fields.iter().any(|f| Self::expr_mentions_name(&f.value, name))
+            }
+            Expr::EnumCtor { args, .. } => args.iter().any(|a| Self::expr_mentions_name(a, name)),
+            Expr::EnumPayload { recv, .. } => Self::expr_mentions_name(recv, name),
+            Expr::BoolTest { scrutinee, .. } => Self::expr_mentions_name(scrutinee, name),
+            Expr::VariantTest { scrutinee, sub_tests, .. } => {
+                Self::expr_mentions_name(scrutinee, name)
+                    || sub_tests.iter().any(|(_, t)| Self::expr_mentions_name(t, name))
+            }
+            Expr::PatScrutinee(a) => Self::expr_mentions_name(a, name),
+            Expr::PatCheck { base, .. } | Expr::PatArity { base, .. } => {
+                Self::expr_mentions_name(base, name)
+            }
+            // A block, `if`, `loop` or `match` can hide the name.
+            _ => true,
+        }
+    }
+
     /// The first variable a pattern binds, if any. A struct pattern binds the
     /// names of its sub-patterns; an or-pattern binds through its alternatives.
     /// Used to reject a binding in an or-pattern (rustc's E0408), which rmc
@@ -4815,8 +8450,7 @@ impl Parser {
             // binds.
             Pat::At(n, _, _) => Some(n.clone()),
             // A payload variant pattern binds the names of its argument
-            // sub-patterns; a nested variant pattern would too, but it is
-            // rejected before this point.
+            // sub-patterns; a nested variant pattern recurses through them.
             Pat::Variant(_, _, Some((args, _))) => {
                 args.iter().find_map(|(_, sub)| Self::first_bound_name(sub))
             }
@@ -4967,21 +8601,16 @@ impl Parser {
                 }),
             ),
             Pat::Variant(enum_name, variant, args) => {
-                let n_binds = args.as_ref().map_or(-1, |(a, _)| a.len() as i32);
-                let has_rest = args.as_ref().map_or(false, |(_, rest)| *rest);
-                let cond = Expr::VariantTest {
-                    scrutinee: Box::new(subj.clone()),
-                    enum_name: enum_name.clone(),
-                    variant: variant.clone(),
-                    tag: -1,
-                    n_binds,
-                    has_rest,
-                };
+                // The tag test, carrying any refutable payload sub-pattern's
+                // test as `sub_tests` (a nested variant pattern such as
+                // `E::A(Some(x))`). Codegen runs the sub-tests only once the
+                // outer tag matched, so a nested payload read is guarded.
+                let cond = Self::variant_pat_cond(&enum_name, &variant, &args, subj);
                 // `Enum::V(w, x)` binds each payload field in the arm body. Each
                 // argument is the payload read at its field index, fed to the
                 // same per-pattern expansion the `let` and `match` paths use, so
-                // `_` reads nothing and a nested struct/array sub-pattern reads
-                // through the payload.
+                // `_` reads nothing, a nested struct/array sub-pattern reads
+                // through the payload, and a nested variant recurses.
                 let binds = match args {
                     Some((args, _)) => {
                         let mut out = Vec::new();
@@ -5099,10 +8728,24 @@ impl Parser {
     }
 
     fn parse_primary_inner(&mut self) -> PResult<Expr> {
+        // An `.iter()` chain on an array literal or a parenthesized range is
+        // lowered here, before the normal expression path, because neither head
+        // is otherwise a legal expression receiver.
+        if let Some(e) = self.try_lower_iter_chain()? {
+            return Ok(e);
+        }
         match self.peek().cloned() {
             Some(Tok::Int(v)) => {
                 self.i += 1;
                 Ok(Expr::Int(v))
+            }
+            // A suffixed literal (`200u8`) names its width: the value is
+            // kept in it for later arithmetic, and a magnitude that does not
+            // fit is an error, exactly as rustc reports.
+            Some(Tok::IntSuffixed(v, s)) => {
+                let pos = self.pos();
+                self.i += 1;
+                suffixed_int_lit(v, &s, false, pos)
             }
             Some(Tok::Char(c)) => {
                 self.i += 1;
@@ -5175,6 +8818,7 @@ impl Parser {
                         "assert" | "assert_eq" | "assert_ne" => {
                             return self.parse_assert(&name)
                         }
+                        "matches" => return self.parse_matches(),
                         "panic" | "unreachable" | "todo" | "unimplemented" => {
                             return self.parse_panic(&name)
                         }
@@ -5196,9 +8840,100 @@ impl Parser {
                         return Ok(e);
                     }
                 }
+                // The `Option`/`Result` constructors are written unqualified in
+                // Rust: `Some(x)`, `None`, `Ok(x)`, `Err(e)`. Map them to the
+                // injected prelude enums so `use std::option::Option::*` need
+                // not be written. `None` is a unit variant only when it stands
+                // alone (not followed by `(`).
+                if let Some((en, var)) = match name.as_str() {
+                    "Some" => Some(("Option", "Some")),
+                    "Ok" => Some(("Result", "Ok")),
+                    "Err" => Some(("Result", "Err")),
+                    _ => None,
+                } {
+                    if self.peek() == Some(&Tok::LParen) {
+                        self.i += 1;
+                        let mut args = Vec::new();
+                        while self.peek() != Some(&Tok::RParen) {
+                            args.push(self.parse_bracketed_expr()?);
+                            if !self.eat(&Tok::Comma) {
+                                break;
+                            }
+                        }
+                        self.expect(Tok::RParen)?;
+                        return Ok(Expr::EnumCtor {
+                            enum_name: en.into(),
+                            variant: var.into(),
+                            tag: -1,
+                            args,
+                            arg_offsets: Vec::new(),
+                            slot: -1,
+                            size: 0,
+                        });
+                    }
+                }
+                if name == "None"
+                    && !matches!(self.peek(), Some(Tok::ColonColon) | Some(&Tok::LParen))
+                {
+                    return Ok(Expr::EnumVariant {
+                        enum_name: "Option".into(),
+                        variant: "None".into(),
+                        tag: -1,
+                    });
+                }
                 // `Enum::Variant` or `Enum::Variant(args)` — resolved and
                 // range-checked by sema.
                 if self.eat(&Tok::ColonColon) {
+                    // `String::new()`, `String::with_capacity(k)` and
+                    // `String::from("lit")`: a growable byte buffer. A `String`
+                    // value is a `{len, bytes}` record (the `str` layout), so
+                    // only the constructors differ; the methods are handled at
+                    // the `let`/method sites. Recognised only in a `let`
+                    // initializer, like the `Vec` shapes.
+                    if name == "String" {
+                        let assoc = self.expect_ident()?;
+                        self.expect(Tok::LParen)?;
+                        let e = match assoc.as_str() {
+                            "new" => Expr::Call {
+                                name: "\u{0}strnew".into(),
+                                args: vec![Expr::Int(0)],
+                                arg_slots: Vec::new(),
+                                ret_slot: -1,
+                                ret_ty: Type::I64,
+                                elem_ty: None,
+                            },
+                            "with_capacity" => {
+                                let cap = self.parse_bracketed_expr()?;
+                                Expr::Call {
+                                    name: "\u{0}strnew".into(),
+                                    args: vec![cap],
+                                    arg_slots: Vec::new(),
+                                    ret_slot: -1,
+                                    ret_ty: Type::I64,
+                                    elem_ty: None,
+                                }
+                            }
+                            "from" => {
+                                let a = self.parse_bracketed_expr()?;
+                                Expr::Call {
+                                    name: "\u{0}strfrom".into(),
+                                    args: vec![a],
+                                    arg_slots: Vec::new(),
+                                    ret_slot: -1,
+                                    ret_ty: Type::I64,
+                                    elem_ty: None,
+                                }
+                            }
+                            other => {
+                                return Err(format!(
+                                    "at byte {}: unsupported `String::{other}` (only `String::new`, `String::with_capacity` and `String::from`)",
+                                    self.pos()
+                                ))
+                            }
+                        };
+                        self.expect(Tok::RParen)?;
+                        return Ok(e);
+                    }
                     // `Vec::with_capacity(k)` and `Vec::new()` allocate the
                     // backing store; the returned `Vec` value is the block
                     // address (an `i64`). Only these two constructors are
@@ -5216,15 +8951,16 @@ impl Parser {
                             Expr::Int(0)
                         } else {
                             let e = self.parse_bracketed_expr()?;
-                            self.expect(Tok::RParen)?;
                             e
                         };
+                        self.expect(Tok::RParen)?;
                         return Ok(Expr::Call {
                             name: "\u{0}vecnew".into(),
                             args: vec![cap],
                             arg_slots: Vec::new(),
                             ret_slot: -1,
                             ret_ty: Type::I64,
+                            elem_ty: None,
                         });
                     }
                     // `i64::MIN`, `usize::MAX`, `u32::BITS`: an integer-width
@@ -5319,19 +9055,49 @@ impl Parser {
                         }
                     }
                     self.expect(Tok::RParen)?;
+                    // `P(a, b)` names a tuple struct's constructor, not a
+                    // function: it lowers to a `StructLit` whose fields are the
+                    // positional names `"0"`, `"1"`, ... so it reuses the whole
+                    // struct path. The arity is checked here against the prescan.
+                    if let Some(&n) = self.struct_ctors.get(&name) {
+                        if args.len() != n {
+                            return Err(format!(
+                                "at byte {}: tuple struct `{name}` takes {n} field(s) but {} were given",
+                                self.pos(),
+                                args.len()
+                            ));
+                        }
+                        let fields = args
+                            .into_iter()
+                            .enumerate()
+                            .map(|(k, value)| FieldInit {
+                                name: k.to_string(),
+                                offset: 0,
+                                ty: Type::I64,
+                                value,
+                            })
+                            .collect();
+                        return Ok(Expr::StructLit { name, fields, slot: -1 });
+                    }
                     // A call names a nested `fn` if one is in scope, so a nested
                     // `fn` shadows a top-level one of the same name. The rewrite
                     // is to the hoisted function's unique name.
                     let name = self.resolve_fn_name(name);
-                    Ok(Expr::Call { name, args, arg_slots: Vec::new(), ret_slot: -1, ret_ty: Type::I64 })
+                    Ok(Expr::Call { name, args, arg_slots: Vec::new(), ret_slot: -1, ret_ty: Type::I64, elem_ty: None })
                 } else if let Some(v) = self.consts.get(&name) {
                     // A reference to a constant is its value, substituted here
-                    // so sema and codegen never see a constant as a variable.
-                    Ok(Expr::Int(*v))
+                    // so sema and codegen never see a constant as a variable. A
+                    // narrow constant keeps its width, so `N + 200` on a
+                    // `const N: u8` still overflows a `u8` rather than an `i64`.
+                    Ok(self.const_value_expr(&name, *v))
                 } else if let Some(b) = self.const_bools.get(&name) {
                     Ok(Expr::Bool(*b))
                 } else if let Some(c) = self.const_chars.get(&name) {
                     Ok(Expr::Char(*c))
+                } else if self.unit_structs.contains(&name) {
+                    // `U` names a unit struct: its value is a fieldless
+                    // `StructLit`, not a variable read.
+                    Ok(Expr::StructLit { name, fields: Vec::new(), slot: -1 })
                 } else {
                     Ok(Expr::Var { name, slot: -1, ty: Type::I64 })
                 }
@@ -5444,6 +9210,12 @@ impl Parser {
             Some(Tok::LBrace) => Ok(Expr::Block(self.parse_block()?)),
             Some(Tok::LBracket) => {
                 self.i += 1;
+                // `[]`: an empty array literal. It has no element to infer a
+                // type from, so sema only accepts it where the annotation
+                // supplies one (`let z: [i64; 0] = [];`).
+                if self.eat(&Tok::RBracket) {
+                    return Ok(Expr::ArrayList(Vec::new()));
+                }
                 let first = self.parse_bracketed_expr()?;
                 if self.eat(&Tok::Semi) {
                     // `[v; N]`: the repeat count is a constant expression.
@@ -5522,7 +9294,10 @@ enum Pat {
     /// `mut` on the pattern as a whole. A struct pattern is irrefutable, so it
     /// has no test: it desugars to the field reads its bindings name (see
     /// `desugar_arm` and `let` destructuring). The struct name is resolved by
-    /// sema, so it may name a struct declared later in the file.
+    /// sema, so it may name a struct declared later in the file. A tuple struct
+    /// pattern `P(a, b)` reuses this node: its fields are the positional names
+    /// `"0"`, `"1"`, ..., and its arity is checked against the prescan when it
+    /// is parsed.
     Struct(String, Vec<FieldPat>),
     /// `[a, b, .., c]`: an array pattern. Each element is a sub-pattern with its
     /// own `mut` flag (`[mut a, b]`); `None` marks the single `..` rest, which
@@ -5552,6 +9327,57 @@ enum Pat {
 /// binding (`f`/`f: b`) or a nested struct pattern (`f: I { a }`). `mut` is only
 /// meaningful on a binding, so a nested sub-pattern is stored with `false`.
 type FieldPat = (String, Option<(bool, Pat)>);
+
+/// The source an iterator chain walks: an array literal, a `Vec` binding (with
+/// its element byte width), an array binding (with its element width), or a
+/// parenthesized range. The adapters and terminal are lowered over it into a
+/// plain `for` loop, so no iterator value ever exists at run time.
+enum IterSrc {
+    ArrayLit(Vec<Expr>),
+    Vec(String, i64),
+    ArrayVar(String, i64),
+    Range(Box<Expr>, Box<Expr>, bool),
+}
+
+/// Whether `name` is a method rmc lowers in an iterator chain, used only to
+/// recognise a chain's head; the actual lowering rejects anything unsupported.
+fn is_iter_method(name: &str) -> bool {
+    matches!(
+        name,
+        "iter"
+            | "into_iter"
+            | "copied"
+            | "cloned"
+            | "rev"
+            | "step_by"
+            | "skip"
+            | "take"
+            | "sum"
+            | "count"
+            | "max"
+            | "min"
+            | "last"
+            | "nth"
+            | "collect"
+    )
+}
+
+/// Rewrite every occurrence of the variable `from` in `e` to `to`, leaving the
+/// index-free parts alone. Used by `.nth(k)` to read `src[map(k)]` with no loop.
+fn rename_index(e: &Expr, from: &str, to: &Expr) -> Expr {
+    match e {
+        Expr::Var { name, slot, ty } if name == from => {
+            let _ = (slot, ty);
+            to.clone()
+        }
+        Expr::Bin(op, a, b) => {
+            Expr::Bin(*op, Box::new(rename_index(a, from, to)), Box::new(rename_index(b, from, to)))
+        }
+        Expr::Un(op, a) => Expr::Un(*op, Box::new(rename_index(a, from, to))),
+        Expr::Cast(a, ty) => Expr::Cast(Box::new(rename_index(a, from, to)), ty.clone()),
+        other => other.clone(),
+    }
+}
 
 /// Whether `e` syntactically contains a call, used to decide if a subscript in
 /// a compound assignment must be evaluated into a temporary.
@@ -5647,19 +9473,120 @@ fn stmt_has_call_p(s: &Stmt) -> bool {
     }
 }
 
-/// The built-in integer-width type names. rmc has one integer type, `i64`, but
-/// a Rust source spells widths (`usize`, `u32`, `i8`, ...). Each is pre-seeded
-/// as a transparent alias for `i64` so `let i: usize = 0;` and
-/// `x as usize` parse; the value is `i64` throughout, so the alias is exactly
-/// what a `type usize = i64;` would give. A program may shadow any of them with
-/// its own `type`, which is why this is the alias map and not a reserved word.
+/// The built-in integer-width type names. A Rust source spells widths
+/// (`usize`, `u32`, `i8`, ...); rmc resolves each to its real width so
+/// arithmetic wraps and a cast truncates as rustc does. `i64`/`isize`/`u64`/
+/// `usize` stay the native 64-bit `Type::I64` (rmc's only pre-width integer, so
+/// a 64-bit program is unchanged); a narrower width becomes `Type::Int`. A
+/// program may shadow any of them with its own `type`, which is why this is the
+/// alias map and not a reserved word.
 fn builtin_aliases() -> std::collections::HashMap<String, Type> {
     let mut m = std::collections::HashMap::new();
-    for name in [
-        "usize", "isize", "u8", "u16", "u32", "u64", "u128",
-        "i8", "i16", "i32", "i128",
+    for (name, ty) in [
+        ("usize", Type::I64),
+        ("isize", Type::I64),
+        ("u64", Type::I64),
+        ("i64", Type::I64),
+        ("u8", Type::Int { signed: false, bits: 8 }),
+        ("u16", Type::Int { signed: false, bits: 16 }),
+        ("u32", Type::Int { signed: false, bits: 32 }),
+        ("u128", Type::Int { signed: false, bits: 128 }),
+        ("i8", Type::Int { signed: true, bits: 8 }),
+        ("i16", Type::Int { signed: true, bits: 16 }),
+        ("i32", Type::Int { signed: true, bits: 32 }),
+        ("i128", Type::Int { signed: true, bits: 128 }),
     ] {
-        m.insert(name.to_string(), Type::I64);
+        m.insert(name.to_string(), ty);
     }
     m
+}
+
+/// Build the expression for an integer literal carrying a width suffix
+/// (`200u8`, `-128i8`). The value is folded to the width the way rustc does:
+/// the magnitude must fit, an unsigned suffix cannot be negated, and a fitting
+/// value is kept in-range (a negative signed value is the negated magnitude).
+/// A suffix naming the native width (`5i64`) is a plain `i64` with the same
+/// range check. `neg` is true when the literal is the operand of a `-`.
+fn suffixed_int_lit(v: i64, s: &str, neg: bool, pos: u32) -> PResult<Expr> {
+    let (ty, value) = suffixed_int_typed(v, s, neg, pos)?;
+    // A literal keeps its width so arithmetic on it overflows at that width
+    // (`200u8 + 100` is an overflow, as rustc reports). The cast is folded to
+    // the in-range value by sema; a native-width suffix is a plain `i64`.
+    match ty {
+        Type::I64 => Ok(Expr::Int(value)),
+        ty => Ok(Expr::Cast(Box::new(Expr::Int(value)), ty)),
+    }
+}
+
+/// The in-range value of a suffixed integer literal and the width it names,
+/// shared by an expression literal and a pattern literal.
+fn suffixed_int_typed(v: i64, s: &str, neg: bool, pos: u32) -> PResult<(Type, i64)> {
+    let ty = match suffix_int_ty(s) {
+        Some(ty) => ty,
+        None => {
+            return Err(format!("at byte {pos}: invalid integer-literal suffix `{s}`"));
+        }
+    };
+    let (signed, bits) = match ty {
+        Type::I64 => (true, 64u16),
+        Type::Int { signed, bits } => (signed, bits),
+        _ => (true, 64),
+    };
+    if neg && !signed {
+        return Err(format!(
+            "at byte {pos}: cannot apply unary `-` to an unsigned integer `{s}`"
+        ));
+    }
+    // A negative signed literal is the negated magnitude; the magnitude must be
+    // at most `|MIN|`, which is `MAX + 1`.
+    let mag_limit: i128 = if neg && signed {
+        if bits >= 128 {
+            i128::MAX
+        } else {
+            1i128 << (bits - 1)
+        }
+    } else if signed {
+        if bits >= 128 {
+            i128::MAX
+        } else {
+            (1i128 << (bits - 1)) - 1
+        }
+    } else if bits >= 128 {
+        i128::MAX
+    } else {
+        (1i128 << bits) - 1
+    };
+    if (v as i128) > mag_limit {
+        return Err(format!(
+            "at byte {pos}: literal out of range for `{}`",
+            int_width_name(signed, bits)
+        ));
+    }
+    let value = if neg { -(v as i128) } else { v as i128 };
+    Ok((ty, value as i64))
+}
+
+/// The in-range value of a suffixed integer literal, for a pattern position
+/// (which does not carry the width onward).
+fn suffixed_int_value(v: i64, s: &str, neg: bool, pos: u32) -> PResult<i64> {
+    suffixed_int_typed(v, s, neg, pos).map(|(_, value)| value)
+}
+
+/// The Rust name of an integer width, for an out-of-range diagnostic.
+fn int_width_name(signed: bool, bits: u16) -> String {
+    if bits == 64 && signed {
+        "i64".into()
+    } else if bits == 64 {
+        "u64".into()
+    } else {
+        format!("{}{bits}", if signed { "i" } else { "u" })
+    }
+}
+
+/// The type an integer-literal suffix names (`200u8` -> `u8`). A width that
+/// names the native 64-bit integer (`i64`/`u64`/`isize`/`usize`) resolves to
+/// `Type::I64`; a narrower or wider one to its `Type::Int`. `None` for a
+/// non-suffix, which the lexer already rejects before this is reached.
+fn suffix_int_ty(s: &str) -> Option<Type> {
+    builtin_aliases().remove(s)
 }

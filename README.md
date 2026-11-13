@@ -15,29 +15,34 @@ The point of the experiment is to measure the trade-off at the extremes:
 | -------------------------------- | ------------------------------------- | -------------------------------- |
 | compile pipeline                 | lex → parse → typecheck → asm → ELF encoder | MIR → LLVM IR → LLVM opt → MC → `ld` |
 | third-party code                 | none (Rust `std` only)                | LLVM + rustc                          |
-| compiler peak RSS                | ~2.7 MB                               | ~188 MB                          |
+| compiler peak RSS                | ~3.1 MB                               | ~188 MB                          |
 | compile time (small programs)    | ~1.5 ms                               | ~2.1 s                           |
-| artifact size                    | ~0.5–0.9 KB (static, no libc)         | ~290 KB (fat-LTO stripped); ~4.5 MB (plain `-O`); ~1.2 MB (static stripped) |
+| artifact size                    | ~0.5–1.2 KB (static, no libc)         | ~290 KB (fat-LTO stripped); ~4.5 MB (plain `-O`); ~1.2 MB (static stripped) |
 | generated-code quality           | peephole + top-five local promotion   | highly optimised                 |
 
 `rmc` wins big on compile time, compiler memory, and artifact size, and those
 three are the point of the experiment. Because it links in-process rather than
-forking `as` and `ld`, a small program compiles in about 1.2–1.6 ms against
+forking `as` and `ld`, a small program compiles in about 1.5–1.9 ms against
 rustc's ~2.1 s. On **runtime** the result is mixed and program-dependent: rmc is
-at parity or ahead on almost the whole suite (`hello` 3.9×, `forloops` 2.3×,
-`refs` 2.2×, `sieve` 1.6×, `mandel` 1.14×, `stats` 1.13×, `heap` 1.05×, `fib`
-1.02×), ties on `callrec` (0.99×), and trails on `mix` (0.92×). The loop-body
-alignment below is what pulled `fib` back from an earlier 0.80× reading: its
-code had not changed, the loop had simply landed on a worse fetch boundary.
-Several of those are within run-to-run noise, and a call-heavy shape the
-recursion-to-loop pass does not match would lose. It is not uniformly faster and
-there is no single speedup number; `bench/RESULTS.md` reports the per-program
-ratio.
+ahead on eight of ten programs (`hello` 3.6×, `forloops` 2.3×, `refs` 1.7×,
+`sieve` 1.3×, `stats` 1.2×, `mandel` 1.1×, `mix` 1.0×, `heap` 1.0×), with
+`fib` at parity (1.00×) and `callrec` marginally behind (0.97×) — both inside
+run-to-run noise on a recursive shape where the two compilers emit the same loop.
+`refs` used to be the one structural loss — LICM would not hoist a read through a
+reference, because rmc's `&T` carries no guarantee that it is dereferenceable and
+speculating the load out of a loop that might never run could fault. A provenance
+pre-pass now marks a reference that is bound directly to a live local (`&x`,
+`&x.field`) as provably frame-pointing, so a read through it *can* be hoisted;
+that took `refs` from a structural loss to a 1.7× win. The rest are within
+run-to-run noise, and a call-heavy shape the recursion-to-loop pass does not
+match would lose. It is not uniformly faster and there is no single speedup
+number; `bench/RESULTS.md` reports the per-program ratio and the harness's
+fairness rules.
 
 The artifact-size comparison depends entirely on which rustc build is the
 reference. Against a plain `rustc -O` (which statically links libstd, the panic
-runtime and the allocator) rmc is ~4884–9492× smaller; against a stripped static
-build, ~1273–2470×; against an aggressive fat-LTO stripped build, ~314–606×. The
+runtime and the allocator) rmc is ~3899–9166× smaller; against a stripped static
+build, ~1016–2385×; against an aggressive fat-LTO stripped build, ~251–585×. The
 first is the closest like-for-like, the last is the one that flatters rustc
 least. The gap is this wide because the linker keeps only the runtime pieces a
 program reaches: a program that never allocates carries no allocator, and one
@@ -91,7 +96,7 @@ rmc input.rs --binutils -o out     # assemble and link with `as`/`ld` instead
 rmc input.rs --binutils --no-strip -o out    # keep the symbol table
 rmc input.rs --binutils --min-size -o out    # drop the section headers too
 rmc input.rs --overflow-checks     # trap on i64 +,-,* overflow (exit 101)
-rmc input.rs --bounds-checks       # trap on an out-of-range array index (exit 101)
+rmc input.rs --no-bounds-checks    # drop the per-index bounds check (unsafe opt-out)
 rmc input.rs --no-inline           # disable inlining (on by default)
 rmc input.rs --no-licm             # disable loop-invariant code motion (on by default)
 rmc input.rs --no-tco              # disable self-recursion-to-loop (on by default)
@@ -177,8 +182,11 @@ head, a refutable `n @ 1..=5` in a `match` arm and an `if let`, and `n @ _` /
 `mut n @ _` parameters), `tuple` for
 tuples (construction, `.0` element access, destructuring in a `let`, a `match`
 arm and a parameter, nesting, a tuple-typed struct field, an array of tuples,
-and a tuple behind a reference, used as parameter and return types), `nestedfn`
-for nested `fn` items (hoisting, a call before the declaration, a sibling called
+and a tuple behind a reference, used as parameter and return types), `tuplestruct` for
+tuple structs (construction `P(a, b)`, positional `.0` access, a `let`/`match`/`for`
+destructuring, a parameter pattern, one-field and unit structs, a tuple struct
+nested in a struct field and destructured through it, and a nested array
+pattern), `nestedfn` for nested `fn` items (hoisting, a call before the declaration, a sibling called
 after it, a nested `fn` inside another body, a nested `fn` shadowing a top-level
 one of the same name, and the shadowed name called to confirm the inner one
 wins), `typealias` for `type` aliases (a scalar, tuple, array and struct alias,
@@ -188,7 +196,8 @@ for `print!`/`println!` (a literal format with `{}` filled by an `i64`, a
 `bool`, a `char` or a `str`, literal `{{`/`}}` braces, escapes, a leading `\n`,
 and a
 bare `println!()` with no format string), `char` for `char` literals
-(plain, escaped, `\xNN`, `\u{..}`), `as i64`, `char` ordering and equality, a
+(plain, escaped, `\xNN`, `\u{..}`) and byte literals (`b'A'`, `b'\xFF'`),
+`as i64`, `char` ordering and equality, a
 `char` `match` with literal, or-pattern and range arms, a `char` array, a
 `const char`, a `char` parameter/return, and the `print_char` builtin, and
 `order` for assignment evaluation order (a
@@ -212,7 +221,10 @@ python3 tools/fuzz.py --mode printfmt --n 500 --seed 1
 python3 tools/fuzz.py --mode pat --n 500 --seed 1
 python3 tools/fuzz.py --mode order --n 500 --seed 1
 python3 tools/fuzz.py --mode shift --n 500 --seed 1
-# also exercise the trap codegen: --bounds-checks and --overflow-checks runs
+python3 tools/fuzz.py --mode semi --n 500 --seed 1
+python3 tools/fuzz.py --mode boolbit --n 500 --seed 1
+python3 tools/fuzz.py --mode localconst --n 500 --seed 1
+# also exercise the trap codegen: --no-bounds-checks and --overflow-checks runs
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 python3 tools/fuzz.py --mode robust
 python3 tools/fuzz.py --mode reject
@@ -282,7 +294,9 @@ array elements and struct fields (including compound `+=` and friends);
 (array iteration, by value); `match` on integers,
 `bool`s, `char`s, enums and strings (literal, `true`/`false`, char, string,
 `Enum::Variant`, struct and
-`_` patterns, plus payload bindings and binding names, and a per-arm guard
+`_` patterns, plus payload bindings and binding names, nested variant
+patterns (`O::W(I::A)`) and refutable payload arguments (`E::A(1)`,
+`E::A(1 | 2)`), and a per-arm guard
 `PAT if COND`) and `if let` with the
 same patterns
 (desugared to a two-arm `match`); enums with unit variants (an optional
@@ -294,10 +308,18 @@ works as an expression), `continue`,
 loop); arithmetic, comparison, bitwise (`!`/`&`/`|`/`^`) and shift (`<<`/`>>`)
 operators; `&&`/`||`; strings (a `str` literal or `str`-typed parameter, return
 or field, compared by content with `==`/`!=`/`<`/`<=`/`>`/`>=`, with `.len()` for
-the byte length); array `.len()` (a compile-time constant); built-in `i64` methods
+the byte length and `.starts_with(t)` / `.ends_with(t)` / `.contains(t)` for
+byte-wise prefix, suffix and substring tests, and `.is_empty()`); a growable
+`String` (`String::new()` / `String::with_capacity(k)` / `String::from("lit")`,
+with `.len()` / `.capacity()` / `.is_empty()` / `.as_str()` and `.push_str(s)` /
+`.push(c)`, growing exactly as `std` does and compared by content); array `.len()`
+(a compile-time constant) and `.is_empty()` (the constant `N == 0`); built-in
+`i64` methods
 (`x.abs()`, `x.signum()`, `x.min(y)`, `x.max(y)`, `x.clamp(lo, hi)`,
 `x.is_positive()`, `x.is_negative()`, `x.div_euclid(y)`, `x.rem_euclid(y)`,
-`x.midpoint(y)`,
+`x.midpoint(y)`, `x.pow(n)`, `x.wrapping_add(y)`, `x.wrapping_sub(y)`,
+`x.wrapping_mul(y)`, `x.saturating_add(y)`, `x.saturating_sub(y)`,
+`x.saturating_mul(y)`,
 `x.count_ones()`, `x.count_zeros()`, `x.leading_zeros()`, `x.trailing_zeros()`,
 `x.leading_ones()`, `x.trailing_ones()`, `x.swap_bytes()`, `x.reverse_bits()`,
 `x.rotate_left(n)`, `x.rotate_right(n)`, desugared to
@@ -305,7 +327,10 @@ operators or a small runtime helper, so `i64::MIN.abs()` maps to itself as in
 `rustc -O`);
 `mut` enforcement and definite
 initialisation; `const` items (folded to a value and substituted at every use,
-including array lengths and `match` patterns); `type` aliases (a transparent
+including array lengths and `match` patterns; also inside a function body, where
+it is in scope for the whole block and may be used before its declaration) and an
+immutable `static` (lowered to a `const`; `static mut` is rejected); `type`
+ aliases (a transparent
 second name for any type, resolved at parse time, usable before declaration);
 references (`&T` / `&mut T`, `&e`, `*e`,
 with auto-deref for `r.x`, `r[i]` and `r.m()`, and `&self` receivers); methods
@@ -316,7 +341,11 @@ block-scoped, so it shadows a top-level `fn` of the same name and is visible
 throughout its block, exactly as rustc); `as` casts at Rust's
 precedence (looser than the unary operators, so `*r as i64` is `(*r) as i64`);
 attributes such as `#[derive(Copy, Clone)]` (parsed and ignored); `use`
-statements (parsed and discarded, since every name is resolved globally);
+statements (parsed and discarded, since every name is resolved globally); `pub`
+visibility on an item, a struct field, an `impl` method or a nested `fn` (with
+any `(crate)`/`(super)`/`(in ..)` restriction — dropped, since visibility has no
+meaning in a single flat namespace); an inline `mod NAME { .. }` (skipped, since
+rmc has no module system; a `mod NAME;` that loads another file is an error);
 `print!`/`println!` with `{}` substitution, and `assert!`/`assert_eq!`/
 `assert_ne!`/`panic!`/`unreachable!` (a failure exits with rustc's panic code
 101); the `std::process::exit` and `std::hint::black_box` paths; and a small
@@ -324,8 +353,9 @@ set of runtime builtins. A `str` and a `&str` are the same one-word value, so
 they coerce freely and a `&'static str` field or `&str` parameter may be
 written `str`. Structs and arrays may be passed to and returned from
 functions by value, or by reference to avoid the copy. Overflow checks are
-opt-in with `--overflow-checks`, and array bounds checks with
-`--bounds-checks`. See `docs/language.md` for the full grammar.
+opt-in with `--overflow-checks`; bounds checks are on by default, matching
+rustc, and `--no-bounds-checks` is the unsafe opt-out. See `docs/language.md`
+for the full grammar.
 
 Runtime builtins (provided by `src/runtime.rs`, no imports needed):
 
@@ -344,7 +374,10 @@ Runtime builtins (provided by `src/runtime.rs`, no imports needed):
 ## Benchmarks
 
 `bench/run.py` compares `rmc` against `rustc -O -C lto=fat -C codegen-units=1
--C panic=abort -C strip=symbols` on ten programs. It measures both halves of
+-C panic=abort -C strip=symbols` on ten programs, with matching safety
+semantics: rmc checks bounds by default and rustc is invoked with
+`-C overflow-checks=off`, so both carry bounds checks and neither carries
+overflow checks (see below). It measures both halves of
 the comparison, because "faster" means two different things here:
 
 * **compile** — build wall time, compiler CPU time, compiler peak RAM, and the
@@ -368,53 +401,51 @@ host):
 
 | program | compiler | compile wall | compile CPU | compile RAM | artifact | run wall | run CPU | run RAM |
 | ------- | -------- | -----------: | ----------: | ----------: | -------: | -------: | ------: | ------: |
-| hello | rmc | 1.20 ms | 1.09 ms | 2.8 MB | 478 B | 0.21 ms | 0.12 ms | 24 kB |
-| hello | rustc | 2109.66 ms | 2112.26 ms | 188.6 MB | 289416 B | 0.83 ms | 0.70 ms | 2012 kB |
-| fib | rmc | 1.44 ms | 1.26 ms | 2.8 MB | 611 B | 7.12 ms | 7.00 ms | 24 kB |
-| fib | rustc | 2070.83 ms | 2074.79 ms | 189.4 MB | 291696 B | 7.23 ms | 7.06 ms | 2084 kB |
-| mandel | rmc | 1.39 ms | 1.27 ms | 2.8 MB | 918 B | 92.78 ms | 92.56 ms | 24 kB |
-| mandel | rustc | 2114.50 ms | 2118.65 ms | 189.8 MB | 291776 B | 105.46 ms | 105.25 ms | 2028 kB |
-| sieve | rmc | 1.31 ms | 1.19 ms | 2.8 MB | 692 B | 1.57 ms | 1.47 ms | 1584 kB |
-| sieve | rustc | 2137.30 ms | 2141.19 ms | 186.9 MB | 292016 B | 2.47 ms | 2.35 ms | 3612 kB |
-| mix | rmc | 1.35 ms | 1.24 ms | 2.8 MB | 853 B | 16.79 ms | 16.67 ms | 24 kB |
-| mix | rustc | 2057.63 ms | 2061.97 ms | 190.9 MB | 291864 B | 15.43 ms | 15.29 ms | 2032 kB |
-| stats | rmc | 1.36 ms | 1.25 ms | 2.8 MB | 767 B | 3.30 ms | 3.16 ms | 20 kB |
-| stats | rustc | 2112.84 ms | 2109.91 ms | 187.5 MB | 292048 B | 3.73 ms | 3.61 ms | 2104 kB |
-| refs | rmc | 1.54 ms | 1.38 ms | 2.8 MB | 890 B | 1.76 ms | 1.64 ms | 24 kB |
-| refs | rustc | 2144.25 ms | 2147.20 ms | 192.6 MB | 292240 B | 3.85 ms | 3.72 ms | 2052 kB |
-| heap | rmc | 1.35 ms | 1.23 ms | 2.8 MB | 932 B | 3.33 ms | 3.19 ms | 4712 kB |
-| heap | rustc | 2151.64 ms | 2156.11 ms | 187.1 MB | 292384 B | 3.50 ms | 3.37 ms | 6692 kB |
-| callrec | rmc | 1.30 ms | 1.19 ms | 2.8 MB | 615 B | 2.87 ms | 2.75 ms | 24 kB |
-| callrec | rustc | 2125.38 ms | 2129.64 ms | 187.6 MB | 291680 B | 2.84 ms | 2.70 ms | 2108 kB |
-| forloops | rmc | 1.34 ms | 1.21 ms | 2.8 MB | 726 B | 1.46 ms | 1.34 ms | 24 kB |
-| forloops | rustc | 2167.46 ms | 2171.71 ms | 188.3 MB | 292480 B | 3.34 ms | 3.21 ms | 2028 kB |
+| hello | rmc | 1.34 ms | 1.22 ms | 3.0 MB | 495 B | 0.26 ms | 0.14 ms | 20 kB |
+| hello | rustc | 2076.10 ms | 2072.60 ms | 183.4 MB | 289416 B | 0.82 ms | 0.72 ms | 2068 kB |
+| fib | rmc | 1.46 ms | 1.33 ms | 3.0 MB | 692 B | 7.10 ms | 6.99 ms | 24 kB |
+| fib | rustc | 2043.10 ms | 2047.51 ms | 182.6 MB | 291696 B | 7.09 ms | 6.96 ms | 2056 kB |
+| mandel | rmc | 1.57 ms | 1.45 ms | 3.1 MB | 1041 B | 95.89 ms | 95.67 ms | 24 kB |
+| mandel | rustc | 2083.71 ms | 2087.25 ms | 185.9 MB | 291776 B | 105.14 ms | 104.91 ms | 2036 kB |
+| sieve | rmc | 1.95 ms | 1.82 ms | 3.1 MB | 953 B | 1.83 ms | 1.70 ms | 1588 kB |
+| sieve | rustc | 2078.26 ms | 2082.36 ms | 182.8 MB | 292032 B | 2.42 ms | 2.30 ms | 3588 kB |
+| mix | rmc | 1.52 ms | 1.40 ms | 3.0 MB | 941 B | 14.82 ms | 14.69 ms | 24 kB |
+| mix | rustc | 2067.95 ms | 2071.18 ms | 187.8 MB | 291880 B | 15.45 ms | 15.29 ms | 2044 kB |
+| stats | rmc | 1.54 ms | 1.43 ms | 3.1 MB | 924 B | 3.23 ms | 3.12 ms | 24 kB |
+| stats | rustc | 2074.10 ms | 2077.53 ms | 183.6 MB | 292048 B | 3.71 ms | 3.60 ms | 2080 kB |
+| refs | rmc | 1.72 ms | 1.61 ms | 3.1 MB | 1115 B | 3.23 ms | 3.11 ms | 28 kB |
+| refs | rustc | 2090.36 ms | 2091.62 ms | 188.3 MB | 292512 B | 5.48 ms | 5.34 ms | 2104 kB |
+| heap | rmc | 1.61 ms | 1.48 ms | 3.1 MB | 1165 B | 3.27 ms | 3.15 ms | 4716 kB |
+| heap | rustc | 2082.95 ms | 2086.35 ms | 188.7 MB | 292384 B | 3.31 ms | 3.17 ms | 6708 kB |
+| callrec | rmc | 1.45 ms | 1.31 ms | 3.0 MB | 695 B | 2.90 ms | 2.77 ms | 24 kB |
+| callrec | rustc | 2070.15 ms | 2073.55 ms | 184.2 MB | 291680 B | 2.84 ms | 2.70 ms | 2020 kB |
+| forloops | rmc | 1.61 ms | 1.49 ms | 3.1 MB | 851 B | 1.46 ms | 1.35 ms | 24 kB |
+| forloops | rustc | 2072.64 ms | 2076.65 ms | 182.6 MB | 292480 B | 3.32 ms | 3.19 ms | 2096 kB |
 
 Summary of the ratios (rustc ÷ rmc, so >1 means rmc is better):
 
 | dimension         | ratio      |
 | ----------------- | ---------: |
-| compile wall      | ~1431–1658× |
-| compile CPU       | ~1588–1868× |
-| compiler peak RAM | ~67–69×    |
-| artifact size     | ~314–606× vs fat-LTO stripped; ~1271–2470× vs static stripped; ~4860–9524× vs plain `-O` |
-| run wall time     | 0.92–3.95× (rmc ahead on `hello`, `forloops`, `refs`, `sieve`, `mandel`, `stats`, `heap`, `fib`; at parity on `callrec` 0.99×; behind on `mix` 0.92×) |
-| run peak RAM      | ~1.42× on `heap`, ~2.28× on `sieve`, ~84–105× elsewhere |
+| compile wall      | ~1102–1445× |
+| compile CPU       | ~1202–1580× |
+| compiler peak RAM | ~60–62×    |
+| artifact size     | ~251–585× vs fat-LTO stripped; ~1016–2385× vs static stripped; ~3899–9166× vs plain `-O` |
+| run wall time     | 0.97–3.55× (rmc ahead on eight of ten; `callrec` within noise of parity) |
+| run peak RAM      | ~1.42× on `heap`, ~2.29× on `sieve`, ~71–75× elsewhere |
 
-The compile-time win is the point of the project: `rmc` builds in about 1.2–1.6 ms
-where rustc needs about 2.1 s, using ~2.8 MB of RAM against ~188 MB, and writing
-a ~0.5–0.9 KB static binary against ~290 KB (fat-LTO stripped), ~1.2 MB (static
+The compile-time win is the point of the project: `rmc` builds in about 1.5–1.9 ms
+where rustc needs about 2.1 s, using ~3.1 MB of RAM against ~188 MB, and writing
+a ~0.5–1.2 KB static binary against ~290 KB (fat-LTO stripped), ~1.2 MB (static
 stripped) or ~4.5 MB (plain `-O`). The binary is small because it links only the
 runtime pieces the program reaches: a program that never allocates carries no
 allocator, and one that never indexes an array carries no bounds trap. The
 run-time picture is mixed and remains the honest weak spot: rmc wins on `hello`
-(3.29×, mostly process startup), `forloops` (2.26×), `refs` (2.19×), `sieve`
-(1.61×), `mandel` (1.14×), `stats` (1.12×) and `heap` (1.06×), is at parity on
-`callrec` (0.97×), and trails only on `mix` (0.92×), where the inner loop is
-dominated by `x % y` in `gcd`. `fib` sits at parity too, but its ratio is the
-noisiest in the suite — a run of this same binary read 0.80×, then 0.99× on a
-re-run, with byte-identical code, so treat it as a coin flip rather than a loss. Both compilers inline
+(3.55×, mostly process startup), `forloops` (2.25×), `refs` (1.70×), `sieve`
+(1.33×), `stats` (1.15×), `mandel` (1.10×), `heap` (1.01×) and `mix` (1.03×),
+and sits at parity on `fib` (1.00×) and `callrec` (0.97×, inside noise). `refs`
+is no longer the structural loss it was — see below. Both compilers inline
 `gcd` into `main` (the inliner now accepts a small loop-bearing helper) and both
-emit a 32-bit `div` fast path with a 64-bit `idiv` fallback, so the gap is the
+emit a 32-bit `div` fast path with a 64-bit `idiv` fallback, so the `mix` gap is the
 code around the divide rather than the divide's checks: rmc reloads the bound and
 the swapped operands from the frame each iteration where LLVM keeps them in
 registers. The call-heavy cases (`fib`, `mix`,
@@ -429,8 +460,10 @@ machine, and a program near parity (`fib`, `mix`, `callrec`) flips sign between
 runs, so treat a single run's ratio as indicative and re-measure with many
 samples before trusting a sub-5% difference. (An early `refs` run reported
 0.14×; that was LLVM folding the *whole* loop into `128 * n` in the Rust twin,
-not a measurement of the loop. The twin now `black_box`es a term.) The binary's
-tiny footprint also shows at run time: an `rmc` program peaks at ~20–24 kB of
+not a measurement of the loop — the fix was to keep the loop real without a
+barrier only one side pays for; see "Reproducing the comparison honestly".)
+The binary's
+tiny footprint also shows at run time: an `rmc` program peaks at ~28 kB of
 RAM, a rustc one at ~2 MB
 — except on `heap` and `sieve`, where the arena each program allocates dominates
 and the two converge. The ~2 MB floor is the dynamically linked C library
@@ -444,12 +477,32 @@ closest equivalent to "compile everything, then link". The `rmc` time includes
 spawning `as` and `ld`; the `rustc` time includes LLVM and the system linker.
 Both compilers and both binaries are measured the same way, peak RAM comes from
 each process's own `VmHWM`, and both programs read their workload from `argv` so
-neither can fold the answer at compile time. The Rust twins additionally
-`black_box` their input, because a workload the optimiser can see through is not
-a workload: LLVM otherwise closes the `refs` loop into `128 * n`, which measured
-its own constant folding rather than the loop both compilers are supposed to be
-running. Every twin that has a loop now passes its trip count (or a term inside
-it) through `black_box`.
+neither can fold the answer at compile time.
+
+Two deliberate choices keep the comparison from flattering either side.
+
+* **Matching safety semantics.** rmc checks bounds by default and leaves
+  overflow checks *off*; `rustc -O` keeps bounds checks *on* and overflow checks
+  *off*. Both builds therefore carry bounds checks and neither carries overflow
+  checks (`rustc` is invoked with `-C overflow-checks=off` explicitly). The
+  check costs about 1% on the array-heavy programs (`sieve` is the largest, and
+  its run ratio barely moves), so it does not flatter either side.
+
+* **No `black_box` inside a hot loop.** rmc lowers `std::hint::black_box` to the
+  identity (it has no optimiser that could elide the value anyway); rustc makes
+  it opaque, which forces a store/reload the optimiser cannot see through. An
+  in-loop `black_box` therefore charges rustc work rmc never emits, and a
+  benchmark whose ratio turns on it is measuring the barrier, not the code.
+  A benchmark still has to stop LLVM from folding the loop away, so the
+  workload is kept real in a way both compilers see the same: trip counts are
+  read from `argv`, and where a loop body is otherwise loop-invariant (`refs`,
+  `heap`) it is kept non-invariant by a data-dependent branch (`refs`) or by a
+  pointer chase whose next address is the value just loaded (`heap`) rather than
+  by a barrier.
+
+The Rust twins do `black_box` their *inputs* — the trip count, the opaque seed
+the struct is built from — because a workload the optimiser can see through is
+not a workload. What they do not do is put a barrier *inside* the measured loop.
 
 Two benchmarks need a word of caution when reading their ratio:
 
@@ -460,12 +513,20 @@ Two benchmarks need a word of caution when reading their ratio:
   flatter the comparison. The two are still not identical — rmc's free-list
   allocator runs, glibc's does not — so the ratio is about the generated walk,
   not a claim that the allocators cost the same.
-* **`refs`** needs the in-loop `black_box` to keep the Rust loop real (without
-  it LLVM folds the whole thing to `128 * n`). rmc has no such barrier and
-  instead hoists the loop-invariant method results with its own `licm`, so the
-  two loops are not instruction-identical: both add a constant per iteration,
-  but only the Rust loop pays the store/reload. Read the `refs` ratio as "two
-  real loops doing the same arithmetic", not as an instruction-level tie.
+* **`refs`** reads a fixed struct through `&self` accessors. The struct is built
+  from an opaque seed and the accumulator is reduced by a data-dependent branch,
+  so the loop is real for both compilers without an in-loop `black_box`. rmc's
+  `licm` hoists a read through a reference only when a provenance pre-pass
+  proves the reference points at a live local (`&x`, `&x.field`): rmc's `&T`
+  carries no guarantee that it is dereferenceable, so a reference of unknown
+  origin — a parameter, a cast, a mutable ref — must not have its load
+  speculated out of a loop that might never run. `refs` binds its reference to a
+  local, so the read is hoisted and rmc wins (1.70×); a loop that reads through a
+  reference of unproven origin would still reload every iteration and lose, and
+  that is the honest limit. An earlier `refs` design put `black_box` inside the
+  loop and reported 2.15×; that number was withdrawn once the barrier asymmetry
+  was found, because without the barrier rustc folded the loop to a constant and
+  with it rustc paid a store/reload rmc did not.
 
 ## Honest limitations
 
@@ -473,9 +534,11 @@ rmc is a small, self-contained compiler, not a drop-in replacement for rustc.
 
 - The language subset is small (see `docs/language.md`). Structs, arrays, `for`,
   aggregates across calls, overflow checks, integer `match`, enums,
-  references, the `print!`/`println!` and `assert!` families, and `use`/`std`
+  references, a growable `Vec`/`String`, the `print!`/`println!` and `assert!`
+  families, and `use`/`std`
   paths exist; traits, generics, borrowing, closures, floating point and the
-  standard library beyond `std::process::exit` / `std::hint::black_box` do not.
+  standard library beyond `std::process::exit` / `std::hint::black_box`, the
+  `Vec`/`String` shapes and the `str` methods do not.
   An aggregate is passed by value through a hidden
   pointer unless a reference (`&T` / `&self`) is used, which passes the address
   and copies nothing. References are not checked: nothing proves a reference
@@ -504,10 +567,10 @@ rmc is a small, self-contained compiler, not a drop-in replacement for rustc.
   turn them off.
 - The backend targets x86-64 Linux only, using the System V ABI and raw Linux
   syscalls. There is no Windows, macOS, ARM, or WebAssembly support.
-- Array indexing is unchecked by default: an out-of-range index reads or writes
-  adjacent stack memory, exactly as in C. `--bounds-checks` inserts a check
-  before every index that traps with `rmc: index out of bounds` (exit 101); a
-  constant index is decided at compile time.
+- Array indexing is bounds-checked by default: an out-of-range index traps with
+  `rmc: index out of bounds` (exit 101), matching rustc. A constant index is
+  decided at compile time. `--no-bounds-checks` is an unsafe opt-out that reads
+  or writes adjacent stack memory, exactly as in C.
 - There is no stack probe and no stack-depth check in generated code, and rmc
   emits no stack-overflow guard. A function that recurses too deeply, or a
   program with a very large frame, runs off the end of the stack and dies with
@@ -533,29 +596,101 @@ rmc is a small, self-contained compiler, not a drop-in replacement for rustc.
 
 ## Roadmap
 
-What would move rmc from a serious toy toward something usable, roughly in order
-of value per unit of effort:
+The items below used to be split into "next steps" and a one-line "out of
+scope". That split was wrong: the goal is for `rmc` to replace `rustc` on real
+programs, and every item here is somewhere on the path to that. The tiers are
+therefore *ordering*, not permission — a trait system is further out than an
+`f64`, but it is still on the list. The only thing that stays a non-goal is
+becoming a second rustc: `rmc` keeps its "no LLVM, no crates, no libc, in-process
+link" identity at every tier.
+
+### Tier 1 — finish what already exists (highest value per unit of effort)
 
 1. **A real register allocator.** Spill temporaries now live in callee-saved
-   registers (see design.md). The recursion-to-loop pass already closed the gap
-   on the call-heavy benchmarks, but the calls that remain still pay argument
-   setup and register save/restore that a register allocator would shrink. A full
-   linear scan over live ranges would also let a dying temporary's register go to
-   a local born after it.
-2. **Borrowing.** `&T` / `&mut T` now exist: a reference is one word, so a
-   `&T` parameter or a `&self` receiver is passed by address rather than copied,
-   and `*r = v` writes through a reference (see language.md). What is missing is
-   the check — rmc does not prove a reference outlives its referent or that
-   `&mut` is exclusive, so an aliasing bug is a wrong answer, not a compile
-   error.
-3. **More types.** `u*`/`i*` widths and `f64`, which together cover most of what
-   small programs actually need. (`match` on integers is done.)
-4. **More backends.** A second target (ARM64 or a simple VM) would force the
-   code generator's assumptions out into the open.
-5. **Debug info.** Line tables so a debugger can point at source.
+   registers (see design.md). The recursion-to-loop pass closed the gap on the
+   call-heavy benchmarks, but the calls that remain still pay argument setup and
+   register save/restore that a register allocator would shrink. A full linear
+   scan over live ranges would also let a dying temporary's register go to a
+   local born after it.
+2. **Close the known correctness gaps.** These are wrong answers today, not
+   missing features, so they outrank any new syntax:
+   - `iter().sum()` over `[u8; n]` diverges from rustc (accumulator width).
+   - `for x in [1, 2, 3].iter()` — an array-literal chain head is rejected.
+   - **`Vec<T>` with an aggregate element.** `v[i]` where the element is a
+     struct or enum was rejected with "cannot cast Struct to I64": the index
+     lowering hardcoded the element type to `i64` and only the *width* was
+     recorded at the binding, so an aggregate element was mis-typed, and the
+     parser's own size pass disagreed with sema on any struct holding a
+     `u8`/`i8`, array, tuple, enum or nested-struct field, mis-scaling the
+     stride. Both are now fixed: the element *type* is carried through the
+     index lowering, sema and codegen, and the stride comes from sema's own
+     `resolve_layouts` so the two can never disagree (`tests/cases/vecstruct.rs`,
+     `vecfield.rs`).
+3. **Borrowing, the check half.** `&T` / `&mut T` exist: a reference is one word,
+   so a `&T` parameter or a `&self` receiver is passed by address rather than
+   copied, and `*r = v` writes through a reference (see language.md). What is
+   missing is the check — `rmc` does not prove a reference outlives its referent
+   or that `&mut` is exclusive, so an aliasing bug is a wrong answer, not a
+   compile error. A real (even if simple) borrow checker is what lets the
+   optimiser speculate through a reference without the provenance pre-pass.
 
-Anything involving borrowing, generics or the trait system is out of scope: it
-would make rmc a different project rather than a better one.
+### Tier 2 — the remaining scalar and aggregate types
+
+4. **`f64` / `f32`.** The last scalar gap. It needs the SSE register file and a
+   floating-point calling convention, so it is a larger change than a new
+   integer width: a `Float` type kind, a separate register class in the code
+   generator, `movsd`/`addsd`-family emission, the `xmm` argument registers in
+   the System V classifier, and the float half of the integer methods
+   (`abs`, `min`, `max`, `is_nan`, formatting). It also unlocks the arithmetic
+   that most real numeric code assumes.
+5. **Slices (`&[T]`).** A slice is a *fat* pointer (a data pointer plus a
+   length), so it needs a two-word value kind threaded through parameters,
+   returns and indexing, unlike the one-word `&T` and `str` today. It is the
+   other large aggregate gap, and it is what makes `&v[..]`, `&a[lo..hi]` and
+   `fn f(xs: &[i64])` work — the shapes almost every non-trivial function uses.
+6. **`u128` / `i128`.** Currently collapsed to `i64`. A real 128-bit kind needs a
+   two-register representation and the multiply/divide helpers.
+
+### Tier 3 — generics, traits, closures, modules
+
+These are what separate "a subset with structs and enums" from "Rust". They are
+ordered here because each is a large, cross-cutting change.
+
+7. **Modules and `use`.** `mod`, `use`, paths and visibility. Mostly a front-end
+   change (name resolution over a tree rather than a flat program), but it gates
+   multi-file programs and any real standard-library surface.
+8. **Generics (monomorphisation).** A generic function or struct is a template
+   instantiated per concrete type. With no trait bounds this is "substitute the
+   type and re-check the body"; the work is in the name/type representation and
+   in keeping monomorphisation bounded.
+9. **Traits and `impl` blocks with bounds.** The core of Rust's abstraction.
+   Starts with inherent `impl` (already present) plus a static-dispatch subset
+   (trait objects deferred), then method resolution and coherence.
+10. **Closures.** A closure is a function plus captured state. The parser already
+    rejects `|x| ...`; supporting it means an anonymous struct for captures, a
+    callable-representation decision, and interaction with the trait work above
+    (closures desugar to `Fn`/`FnMut`/`FnOnce` impls).
+11. **The `?` operator.** Small on its own (`Try` over `Option`/`Result`), but it
+    belongs with the trait work because a general `?` is `Try`.
+12. **A usable standard-library surface.** Beyond today's two `std` paths, the
+    `Vec` shims and `String`: `format!`, the iterator adapters
+    (`map`/`filter`/`fold`/`enumerate`/...), `HashMap`, `fs`/`io`, and the
+    `println!`/`format!` formatting machinery. Each is a runtime addition, not
+    just front-end work.
+
+### Tier 4 — infrastructure
+
+13. **More backends.** A second target (ARM64 or a simple VM) would force the
+    code generator's assumptions out into the open.
+14. **Debug info.** Line tables so a debugger can point at source.
+15. **Incremental compilation and a module cache.** Today every compile is from
+    scratch; a cache would matter once programs are large enough that the
+    ~1.5 ms floor is no longer the whole story.
+
+The through-line: Tier 1 makes the existing subset *correct*, Tier 2 makes it
+*complete* for scalar and aggregate types, Tier 3 makes it *Rust*, and Tier 4
+makes it *practical*. None of it requires giving up the no-LLVM, no-libc,
+in-process-link design that is the point of the experiment.
 
 ## License
 

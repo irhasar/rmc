@@ -317,6 +317,30 @@ def gen_expr_program(rng):
     rs.append('    println!("{}", sv.len() as i64);')
     rs.append(f"    let arr: [i64; {n}] = [0; {n}];")
     rs.append('    println!("{}", arr.len() as i64);')
+    # Prefix / suffix / substring searches. Each walks the bytes of the two
+    # records, so a pointer compare or a wrong length bound diverges here. The
+    # small alphabet makes shared prefixes and near-misses common.
+    for _ in range(rng.randint(1, 4)):
+        hay, needle = gen_str_lit(rng), gen_str_lit(rng)
+        m = rng.choice(["starts_with", "ends_with", "contains"])
+        rs.append(f'    println!("{{}}", {hay}.{m}({needle}));')
+    for _ in range(rng.randint(1, 2)):
+        needle = gen_str_lit(rng)
+        m = rng.choice(["starts_with", "ends_with", "contains"])
+        rs.append(f'    println!("{{}}", sv.{m}({needle}));')
+    # `is_empty` on a `str` (a length test) and on an array (a constant). The
+    # empty array is written with an annotation because `[]` has no element to
+    # infer from.
+    for _ in range(rng.randint(1, 3)):
+        rs.append(f'    println!("{{}}", {gen_str_lit(rng)}.is_empty());')
+    rs.append('    println!("{}", sv.is_empty());')
+    m = rng.randint(0, 4)
+    rs.append(f"    let ez: [i64; {m}] = [0; {m}];")
+    rs.append('    println!("{}", ez.is_empty());')
+    if rng.random() < 0.5:
+        rs.append('    let z: [i64; 0] = [];')
+        rs.append('    println!("{}", z.is_empty());')
+        rs.append('    println!("{}", z.len());')
     rs += ["}"]
     return "\n".join(rs)
 
@@ -367,6 +391,20 @@ def gen_char_range_lit(rng):
     return f"{lo_src}{op}{hi_src}"
 
 
+def gen_byte_lit(rng):
+    """A random byte literal `b'A'` / `b'\\n'` / `b'\\xNN'` / `b'\\0'`. rmc has
+    no `u8`, so a byte literal is an `i64`; its value must match rustc's `u8`
+    byte. `\\xFF` is included because a byte literal, unlike a `char`, allows the
+    full `\\x00..=\\xFF` range."""
+    r = rng.random()
+    if r < 0.5:
+        c = rng.choice("abXYZ019 ~")
+        return f"b'{c}'"
+    if r < 0.75:
+        return "b'" + rng.choice(["\\n", "\\t", "\\0", "\\r", "\\'", "\\\\"]) + "'"
+    return f"b'\\x{rng.randint(0, 0xff):02x}'"
+
+
 def gen_char_program(rng):
     """`char` literals, `as i64`, `char` ordering and equality, `match` on a
     `char` (literal, or-pattern and range arms), a `char` array, a `const char`,
@@ -382,6 +420,8 @@ def gen_char_program(rng):
     c_const = lit()
     arr = [lit() for _ in range(3)]
     base_lit = lit()
+    b_arr = [gen_byte_lit(rng) for _ in range(3)]
+    b_const = gen_byte_lit(rng)
     exprs = []
     for _ in range(rng.randint(2, 6)):
         r = rng.random()
@@ -406,10 +446,12 @@ def gen_char_program(rng):
     arr_src = "[" + ", ".join(arr) + "]"
     rs = [
         f"const C: char = {c_const};",
+        f"const BC: u8 = {b_const};",
         "fn id(c: char) -> char { return c; }",
         "fn code(c: char) -> i64 { return c as i64; }",
         "fn main() {",
         f"    let cs: [char; 3] = {arr_src};",
+        f"    let bs: [u8; 3] = [{' , '.join(b_arr)}];",
         f"    let base: char = {base_lit};",
         "    let mut acc: i64 = 0;",
     ]
@@ -422,6 +464,10 @@ def gen_char_program(rng):
         "    acc = acc + code(id(base));",
         "    acc = acc + (C as i64);",
         "    acc = acc + (base as i64);",
+        # Byte literals: each is an `i64` in rmc and a `u8` in rustc, so both
+        # sides are widened with `as i64` to keep the sum an `i64`.
+        "    acc = acc + (bs[0] as i64) + (bs[1] as i64) + (bs[2] as i64);",
+        "    acc = acc + (BC as i64);",
     ]
     for t in tail:
         rs.append(t.replace("acc = acc + ", "acc += "))
@@ -1116,6 +1162,66 @@ def gen_fordestr_program(rng):
     return "\n".join(rs) + "\n"
 
 
+def gen_forref_program(rng):
+    """`for x in &arr` / `for x in &mut arr`: the loop variable is a reference to
+    the element, so `*x` reads and `*x = v` writes the element in place. The
+    array place is indexed directly (never copied), so a `&mut` write reaches the
+    original binding. Compares the by-reference loop against the equivalent
+    explicit index loop, and a nested `&mut` write against a plain mutation.
+    No other mode emits a by-reference `for`.
+    """
+    b = rng.randint(1, 9)
+    n = rng.choice([1, 2, 3])
+    elems = ", ".join(str(b + i) for i in range(n))
+    kind = rng.choice(["read", "write", "nested", "struct"])
+    rs = ["fn main() {", "    let mut acc: i64 = 0;"]
+    if kind == "struct":
+        rs = [
+            "struct P { x: i64, y: i64 }",
+            "fn main() {",
+            "    let mut acc: i64 = 0;",
+            f"    let ps: [P; {n}] = ["
+            + ", ".join(f"P {{ x: {b + i}, y: {b + i + 10} }}" for i in range(n))
+            + "];",
+        ]
+        if rng.random() < 0.5:
+            # read the fields through the reference
+            rs.append("    for p in &ps { acc += p.x * 10 + p.y; }")
+            rs.append('    println!("{}", acc);')
+            rs.append("}")
+            return "\n".join(rs) + "\n"
+        # write a field through a mutable reference
+        rs.append("    for p in &mut ps { p.x += 100; }")
+        rs.append("    for p in &ps { acc += p.x; }")
+        rs.append('    println!("{}", acc);')
+        rs.append("}")
+        return "\n".join(rs) + "\n"
+    rs.append(f"    let mut a: [i64; {n}] = [{elems}];")
+    # The head spelling: the `&a` / `&mut a` forms, or the equivalent
+    # `a.iter()` / `a.iter_mut()` methods.
+    read_head = rng.choice(["&a", "a.iter()"])
+    write_head = rng.choice(["&mut a", "a.iter_mut()"])
+    if kind == "read":
+        # By-reference read must equal the explicit index read.
+        rs.append(f"    for x in {read_head} {{ acc += *x; }}")
+        rs.append("    for i in 0..a.len() { acc += a[i]; }")
+    elif kind == "write":
+        # `*x += k` through `&mut` must equal mutating the element by index.
+        rs.append(f"    for x in {write_head} {{ *x += {b}; }}")
+        rs.append(f"    for i in 0..a.len() {{ a[i] += {b}; }}")
+        rs.append(f"    for x in {read_head} {{ acc += *x; }}")
+    else:
+        # A nested `&` over an inner array reached by `&a[i]`/`&m[j]`.
+        rs = ["fn main() {", "    let mut acc: i64 = 0;"]
+        rs.append("    let m: [[i64; 2]; 2] = [[%d, %d], [%d, %d]];"
+                  % (b, b + 1, b + 2, b + 3))
+        rs.append("    for row in &m { for x in row { acc += x; } }")
+        rs.append("    for x in &m[1] { acc += *x; }")
+    rs.append('    println!("{}", acc);')
+    rs.append("}")
+    return "\n".join(rs) + "\n"
+
+
 # A chain of struct types for the nested-pattern fuzzer: each entry is
 # `(struct_field_name, struct_field_type, [i64 field names])`. The chain ends at
 # a type with no struct field, so a pattern nests at most `len(CHAIN)` deep.
@@ -1468,14 +1574,16 @@ def gen_parampat_program(rng):
 
 def gen_enumpat_program(rng):
     """Payload variant patterns with sub-patterns: a wildcard (`_`), a `mut`
-    binding, a trailing `..`, and a nested struct/array sub-pattern inside
-    `E::V(..)`. Each argument is the payload read at its field index, fed to the
-    same sub-pattern expansion a `let` uses, so a mis-indexed payload read, a
-    `_` that still reads, or a wrong nested offset changes the total. Every
-    function is called twice with different arguments, so a shared slot or a
-    leaked `mut` write is observable. No other mode emits a nested payload
-    sub-pattern, a `..` inside a variant's parentheses, or a payload read
-    through a `&E` scrutinee (match ergonomics dereferences it).
+    binding, a trailing `..`, a nested struct/array sub-pattern inside
+    `E::V(..)`, a nested variant pattern (`O::W(I::A)`) and a scalar payload
+    test (`E::Pair(B, y)`). Each argument is the payload read at its field
+    index, fed to the same sub-pattern expansion a `let` uses, so a mis-indexed
+    payload read, a `_` that still reads, a wrong nested offset, or a sub-test
+    that fails to gate the arm changes the total. Every function is called twice
+    with different arguments, so a shared slot or a leaked `mut` write is
+    observable. No other mode emits a nested payload sub-pattern, a `..` inside
+    a variant's parentheses, a nested variant pattern, or a payload read through
+    a `&E` scrutinee (match ergonomics dereferences it).
     """
     b = rng.randint(1, 9)
     m = rng.randint(1, 9)
@@ -1503,6 +1611,14 @@ def gen_enumpat_program(rng):
         "fn wref(e: &E) -> i64 { match e { E::Pair(x, _) => x * 2, E::Trip(x, ..) => x * 3, _ => 0 } }",
         "fn nref(e: &E) -> i64 { match e { E::Hold(S { a: [p, q], b: I { u } }) => p * 100 + q * 10 + u, _ => 0 } }",
         "fn uref(e: &E) -> i64 { match e { E::None => 100, E::Pair(_, _) => 200, E::Trip(_, _, _) => 300, E::Hold(_) => 400, E::Arr(_) => 500, E::Mix(_, _, _) => 600 } }",
+        "#[derive(Copy, Clone)]",
+        "enum I { A, B }",
+        "#[derive(Copy, Clone)]",
+        "enum O { W(I), Z }",
+        "fn outer(o: O) -> i64 { match o { O::W(I::A) => 1, O::W(I::B) => 2, O::Z => 3 } }",
+        "fn owild(o: O) -> i64 { match o { O::W(_) => 7, O::Z => 8 } }",
+        "fn nvia_ref(o: &O) -> i64 { match o { O::W(I::A) => 10, O::W(I::B) => 20, O::Z => 30 } }",
+        f"fn scal(e: E) -> i64 {{ match e {{ E::Pair({b}, y) => y, E::Pair(x, _) => x, E::Trip({b}, y, ..) => y, _ => 0 }} }}",
     ]
 
 
@@ -1526,6 +1642,18 @@ def gen_enumpat_program(rng):
         f"nref(&E::Hold(S {{ a: [s + {o[12]}, s + {o[13]}], b: I {{ u: s + {o[14]} }} }}))",
         "uref(&E::None)",
         f"uref(&E::Arr([s + {o[18]}, s + {o[19]}]))",
+        "outer(O::W(I::A))",
+        "outer(O::W(I::B))",
+        "outer(O::Z)",
+        "owild(O::W(I::B))",
+        "owild(O::Z)",
+        "nvia_ref(&O::W(I::A))",
+        "nvia_ref(&O::W(I::B))",
+        "nvia_ref(&O::Z)",
+        f"scal(E::Pair({b}, s + 1))",
+        f"scal(E::Pair(s + 2, s + 3))",
+        f"scal(E::Trip({b}, s + 4, s + 5))",
+        "scal(E::None)",
     ]
     body_rs = ["fn main() {", "    let mut acc: i64 = 0;", f"    let s: i64 = mk({b});"]
     for c in calls:
@@ -1661,6 +1789,203 @@ def gen_patshadow_program(rng):
         "}",
     ]
     return "\n".join(rs) + "\n"
+
+
+def gen_semi_program(rng):
+    """Statements whose trailing `;` is omitted, and empty `;` statements.
+
+    An assignment (or compound assignment) is a `()`-valued expression, so its
+    trailing `;` may be dropped when it is the last thing in a block, exactly as
+    after `return`/`break`/`continue`. A bare `;` is an empty statement and may
+    appear anywhere. Every block here ends in an assignment with no `;`, so a
+    parser that demands the `;` rejects the program (a compile divergence), and
+    the value written is printed so a mis-parse would also show up as a value
+    difference. Empty statements are scattered between real ones to pin that a
+    run of `;` is skipped rather than treated as a statement.
+    """
+    ops = rng.sample(["+", "-", "*", "|", "^"], 5)
+    seeds = [rng.randint(1, 9) for _ in range(10)]
+    rs = ["fn main() {"]
+    rs += ["    let mut acc: i64 = 0;"]
+    # A plain assignment as the last statement of a nested block.
+    rs += [
+        "    {",
+        f"        acc = {seeds[0]}",
+        "    }",
+        "    ;",
+        '    println!("{}", acc);',
+    ]
+    # Each compound operator in tail position of an `if` arm.
+    for i, op in enumerate(ops):
+        rs += [
+            f"    if acc >= 0 {{",
+            f"        acc {op}= {seeds[i + 1]}",
+            "    } else {",
+            f"        acc {op}= {seeds[i + 1]}",
+            "    }",
+            ";",
+        ]
+    rs.append('    println!("{}", acc);')
+    # A `while` body whose only statement is an assignment with no `;`.
+    rs += [
+        f"    let mut n: i64 = {seeds[6] % 5 + 1};",
+        "    while n > 0 {",
+        "        acc += n;",
+        "        n -= 1",
+        "    }",
+        '    println!("{}", acc);',
+    ]
+    # A `loop` that breaks out of an assignment-terminated body.
+    rs += [
+        "    let mut k: i64 = 0;",
+        "    loop {",
+        "        k += 1;",
+        f"        if k == {seeds[7] % 5 + 1} {{",
+        "            break",
+        "        }",
+        "    }",
+        "    acc += k;",
+        # A `match` arm body that is a bare assignment (comma after), and a
+        # block-bodied arm ending in an assignment with no `;`.
+        "    match k {",
+        f"        1 => acc = {seeds[8]},",
+        f"        _ => {{ acc = {seeds[9]} }}",
+        "    }",
+        "    ;;",
+        '    println!("{}", acc);',
+        "}",
+    ]
+    return "\n".join(rs) + "\n"
+
+
+def gen_boolbit_program(rng):
+    """`&`, `|` and `^` on `bool`. rustc defines these as the logical operators
+    through the `BitAnd`/`BitOr`/`BitXor` impls, so they must type-check and give
+    the same 0/1 result as `&&`/`||`/`!=`. Each result is printed `as i64`, so a
+    wrong instruction (or a wrong precedence) shows up as a value difference, and
+    the operators are also used in a `const`, a compound assignment, a call, an
+    `if` condition and an array element."""
+    def bvar():
+        # A comparison is a bool-valued expression, so it can be an operand
+        # without needing a `bool` local.
+        return f"({rng.randint(-9, 9)} < {rng.randint(-9, 9)})"
+
+    def bexpr(depth):
+        r = rng.random()
+        if depth <= 0 or r < 0.35:
+            return bvar()
+        if r < 0.45:
+            return f"(!{bexpr(depth - 1)})"
+        op = rng.choice(["&", "|", "^"])
+        return f"({bexpr(depth - 1)} {op} {bexpr(depth - 1)})"
+
+    rs = ["fn main() {"]
+    for _ in range(rng.randint(4, 10)):
+        rs.append(f'    println!("{{}}", ({bexpr(3)}) as i64);')
+    # Compound assignment on a `bool` local.
+    init = rng.choice(["true", "false"])
+    rs.append(f"    let mut b: bool = {init};")
+    for _ in range(rng.randint(2, 6)):
+        op = rng.choice(["&=", "|=", "^="])
+        rs.append(f"    b {op} {rng.choice(['true', 'false'])};")
+    rs.append('    println!("{}", b as i64);')
+    # As an `if` condition (an `i64` operand would be a type error there).
+    rs.append(f"    if {bexpr(2)} {{ println!(\"{{}}\", 1); }} else {{ println!(\"{{}}\", 0); }}")
+    # A `const bool` folded from the operators, and an array of bool operands.
+    cname = "C"
+    cbody = bexpr(2)
+    head = [f"const {cname}: bool = {cbody};"]
+    rs.insert(1, f'    println!("{{}}", {cname} as i64);')
+    rs.insert(2, f'    let arr: [bool; 2] = [{bexpr(1)}, {bexpr(1)}];')
+    rs.insert(3, '    println!("{} {}", arr[0] as i64, arr[1] as i64);')
+    # An indexed bool operand: `!` must stay logical here too, and the bitwise
+    # ops must still type-check on an element.
+    rs.insert(4, '    println!("{}", (!arr[0]) as i64);')
+    rs.insert(5, '    println!("{}", (arr[0] | arr[1]) as i64);')
+    rs.insert(6, '    println!("{}", (!(arr[0] & arr[1])) as i64);')
+    # A loop-invariant bool bitwise expression under `!`: LICM may hoist the
+    # bitwise op, so the hoisted value's type must stay `bool` or `!` becomes a
+    # bitwise not.
+    inv = f"({bexpr(1)} | {bexpr(1)})"
+    rs.append("    let mut i: i64 = 0;")
+    rs.append("    let mut acc: i64 = 0;")
+    rs.append(f"    while i < 3 {{ if !{inv} {{ acc += 1; }} i += 1; }}")
+    rs.append('    println!("{}", acc);')
+    rs.append("}")
+    return "\n".join(head + rs) + "\n"
+
+
+def gen_vis_program(rng):
+    """`pub` on items, fields, methods and nested `fn`s, and an inline `mod`.
+
+    rmc drops visibility (one flat namespace), so a `pub` must not change the
+    program's behaviour: the twin is generated with `pub` sprinkled on and must
+    print the same bytes as rustc. An inline `mod NAME { .. }` is skipped, so a
+    program that declares one and uses only the flat items still runs.
+    """
+    items = []
+    items.append("pub const K: i64 = %d;" % rng.randint(1, 20))
+    items.append("pub type Alias = i64;")
+    items.append("pub struct P { pub a: i64, pub b: i64 }")
+    items.append(
+        "impl P { pub fn total(&self) -> i64 { self.a + self.b } }"
+    )
+    items.append("pub mod unused { pub fn never() -> i64 { 0 } }")
+    # A function that uses the items, sometimes `pub`.
+    qual = "pub " if rng.random() < 0.5 else ""
+    items.append(
+        f"{qual}fn helper(x: Alias) -> i64 {{ let p = P {{ a: x, b: K }}; p.total() }}"
+    )
+    main = [
+        "fn main() {",
+        "    let p = P { a: %d, b: %d };" % (rng.randint(-5, 5), rng.randint(-5, 5)),
+        '    println!("{}", p.total());',
+        '    println!("{}", helper(%d));' % rng.randint(-9, 9),
+        '    println!("{}", K);',
+    ]
+    if rng.random() < 0.5:
+        main.append("    pub fn inner() -> i64 { %d }" % rng.randint(0, 9))
+        main.append('    println!("{}", inner());')
+    main.append("}")
+    return "\n".join(items + main) + "\n"
+
+
+def gen_localconst_program(rng):
+    """A `const` (or immutable `static`) declared inside a block, and a
+    block-scoped shadow of a top-level one.
+
+    rustc hoists block items, so a local constant is usable anywhere in its
+    block, including before its own declaration; it shadows an outer constant of
+    the same name until the block ends, then the outer value returns. rmc folds
+    the item and substitutes the value, so the printed bytes must match. The
+    name is sometimes reused across sibling blocks to exercise the scope
+    restore.
+    """
+    top = rng.randint(1, 50)
+    items = ["const K: i64 = %d;" % top]
+    # A helper that uses the top-level constant, so a local shadow in `main`
+    # must not leak into it.
+    items.append("fn helper() -> i64 { K * 2 }")
+    local = rng.randint(51, 99)
+    inner = rng.randint(100, 199)
+    kind = rng.choice(["const", "static"])
+    body = [
+        "fn main() {",
+        # Forward reference: the value is folded when the block is scanned.
+        '    println!("{}", L);',
+        "    %s L: i64 = %d;" % (kind, local),
+        '    println!("{}", L);',
+        '    println!("{}", helper());',
+        "    {",
+        "        const L: i64 = %d;" % inner,
+        '        println!("{}", L);',
+        "    }",
+        # The inner block's shadow is gone, so the outer local is back.
+        '    println!("{}", L);',
+        '    println!("{}", K);',
+        "}",
+    ]
+    return "\n".join(items + body) + "\n"
 
 
 def gen_intmeth_program(rng):
@@ -2444,6 +2769,13 @@ def reject_corpus():
         "char_empty": "fn main() { let c = ''; println!(\"{}\", c as i64); }\n",
         "char_bare_quote": "fn main() { let c = '''; println!(\"{}\", c as i64); }\n",
         "char_from_i64_cast": "fn main() { let n: i64 = 65; let c = n as char; println!(\"{}\", c as i64); }\n",
+        # A byte reference must not widen to a word reference: `&mut u8` as
+        # `&i64` would make a deref read eight bytes past the byte. rustc
+        # rejects it (E0308); rmc must too, not coerce it and read a word.
+        "byte_ref_widens_to_word": "fn f(x: &i64) -> i64 { *x }\n"
+            "fn main() { let p: *mut u8 = 0 as *mut u8;\n"
+            "    let r: &mut u8 = unsafe { &mut *p };\n"
+            '    println!("{}", f(r)); }\n',
         # A `char` range pattern with the bounds the wrong way round, and an
         # empty inclusive range; rustc rejects both with E0579.
         "char_range_reversed": "fn main() { let c = 'q'; let r = match c { 'z'..'a' => 1, _ => 0 }; println!(\"{}\", r); }\n",
@@ -2487,6 +2819,53 @@ def reject_corpus():
         # Same, in statement position: the arms are unit-typed, so only the
         # exhaustiveness walk rejects it.
         "stmt_guard_gap": stmt("match e { E::A if 1 == 1 => { print_i64(1); } }"),
+        # A nested variant pattern covers only its payload value, so a match
+        # that omits one payload variant is non-exhaustive (E0004). `O::W(I::A)`
+        # alone does not cover `O::W(I::B)`, and the outer enum's other variants
+        # must still be named.
+        "nested_variant_gap": (
+            "enum I { A, B }\n"
+            "enum O { W(I), Z }\n"
+            "fn main() {\n"
+            "    let o: O = O::W(I::A);\n"
+            "    match o { O::W(I::A) => { print_i64(1); } O::Z => { print_i64(3); } }\n"
+            "}\n"
+        ),
+        # Naming the payload variant of the wrong enum inside a nested pattern:
+        # `O::W(I::A)` is fine, but `O::W(J::A)` names a variant `J` does not
+        # have, which rustc rejects.
+        "nested_variant_unknown": (
+            "enum I { A, B }\n"
+            "enum O { W(I), Z }\n"
+            "fn main() {\n"
+            "    let o: O = O::W(I::A);\n"
+            "    let r = match o { O::W(I::C) => 1, O::W(I::B) => 2, O::Z => 3 };\n"
+            '    println!("{}", r);\n'
+            "}\n"
+        ),
+        # A refutable scalar argument overruns the variant's field count when a
+        # second field is named without `..`.
+        "nested_variant_overrun": (
+            "enum E { A(i64), B }\n"
+            "fn main() {\n"
+            "    let e: E = E::A(3);\n"
+            "    let r = match e { E::A(1, 2) => 1, E::A(_) => 0, E::B => 0 };\n"
+            '    println!("{}", r);\n'
+            "}\n"
+        ),
+        # A variant with two enum fields: arms that test *different* fields do
+        # not cover the cross-product, so the match is non-exhaustive (E0004).
+        # `W(I::A, _)` and `W(_, I::B)` together name both variants of `I`, but
+        # `W(I::B, I::A)` is uncovered.
+        "nested_variant_cross_field": (
+            "enum I { A, B }\n"
+            "enum O { W(I, I) }\n"
+            "fn main() {\n"
+            "    let o: O = O::W(I::B, I::A);\n"
+            "    let r = match o { O::W(I::A, _) => 1, O::W(_, I::B) => 2 };\n"
+            '    println!("{}", r);\n'
+            "}\n"
+        ),
         # Assignment to an immutable binding. rmc used to accept these and let
         # codegen write the slot; rustc rejects each with E0384.
         "assign_immutable_let": "fn main() { let x: i64 = 1; x = 2; println!(\"{}\", x); }\n",
@@ -2569,6 +2948,19 @@ def reject_corpus():
         # literal (E0080 in rustc).
         "const_local_overflow": "fn main() { let x = 9223372036854775807i64; let y = x + 1; let _ = y; }\n",
         "const_local_div_zero": "fn main() { let d = 0i64; let y = 1i64 / d; let _ = y; }\n",
+        # A narrow `const` folds at its declared width: `250 + 10` overflows a
+        # `u8` (E0080), a bare `300` is a literal out of range, and `300 as u8`
+        # is rejected at the cast. rmc must reject all three, not fold them as
+        # an unbounded `i64`.
+        "const_u8_add_overflow": "const N: u8 = 250 + 10; fn main() { println!(\"{}\", N); }\n",
+        "const_u8_literal_oob": "const N: u8 = 300; fn main() { println!(\"{}\", N); }\n",
+        "const_u8_cast_literal_oob": "const N: u8 = 300 as u8; fn main() { println!(\"{}\", N); }\n",
+        "const_u8_sub_overflow": "const N: u8 = 10 - 20; fn main() { println!(\"{}\", N); }\n",
+        # A negative adapter count is a unary `-` on a `usize` (E0600), which
+        # rmc must reject rather than treat as a wrapped stride or skip.
+        "skip_negative": "fn main() { for i in (0..3).skip(-1) { println!(\"{}\", i); } }\n",
+        "take_negative": "fn main() { for i in (0..3).take(-1) { println!(\"{}\", i); } }\n",
+        "step_by_negative": "fn main() { for i in (0..3).step_by(-1) { println!(\"{}\", i); } }\n",
         # A reference may only be cast to a reference of the same type, may not
         # gain mutability, and may not become a scalar (E0605/E0606). rmc's
         # `i64 as &T` raw pointer cast is a documented extension and stays.
@@ -2747,6 +3139,47 @@ def reject_corpus():
         "let_tuple_pat_on_array": "fn main() { let a: [i64; 2] = [1, 2]; let (x, y) = a; let _ = x; }\n",
         "let_tuple_pat_wildcards_on_array": "fn main() { let a: [i64; 2] = [1, 2]; let (_, _) = a; }\n",
         "match_tuple_pat_on_array": "fn main() { let a: [i64; 2] = [1, 2]; let _ = match a { (x, y) => x }; }\n",
+        # Comparison operators are non-associative: `a < b < c` is a hard error
+        # in rustc ("comparison operators cannot be chained"), not `(a < b) < c`.
+        # rmc must reject a second comparison operator at the same level.
+        "chained_comparison_int": "fn main() { println!(\"{}\", 1 < 2 < 3); }\n",
+        "chained_comparison_eq": "fn main() { println!(\"{}\", 1 == 1 == true); }\n",
+        "chained_comparison_ne": "fn main() { println!(\"{}\", 1 != 2 != false); }\n",
+        "chained_comparison_mixed": "fn main() { println!(\"{}\", 1 <= 2 >= 1); }\n",
+        "chained_comparison_bool": "fn main() { println!(\"{}\", true == true == true); }\n",
+        # `static mut` needs `unsafe` to read, and rmc has no mutable global at
+        # all, so it is refused (E0133 in rustc for the un-`unsafe` read).
+        "static_mut_read": "static mut X: i64 = 5; fn main() { println!(\"{}\", X); }\n",
+        # `mod NAME;` loads another file, which rmc cannot resolve; rejecting it
+        # matches rustc when the file is absent.
+        "file_module_declaration": "mod m; fn main() { println!(\"{}\", 1); }\n",
+        # `b'\\u{41}'`: rustc forbids a `\u` escape in a byte literal, and rmc
+        # refuses it too.
+        "byte_literal_unicode_escape": "fn main() { println!(\"{}\", b'\\u{41}'); }\n",
+        # `b'\\x{41}'` is not a byte escape either; rustc wants exactly two hex
+        # digits, and so does rmc.
+        "byte_literal_bad_hex_escape": "fn main() { println!(\"{}\", b'\\x{41}'); }\n",
+        # A block-scoped `const` must be type-checked like a top-level one: a
+        # `str` constant is unsized in rustc (E0277), and rmc folds only `i64`,
+        # `bool` and `char`, so it must reject the item rather than skip it.
+        "block_const_str_type": "fn main() { const S: str = \"hi\"; println!(\"{}\", 1); }\n",
+        # A `let` may not shadow a constant (rustc E0530). sema checks this for a
+        # top-level constant; a block-scoped one is folded in the parser, so the
+        # check must happen there too.
+        "let_shadows_block_const": "fn main() { const N: i64 = 5; let N = 3; println!(\"{}\", N); }\n",
+        "let_mut_shadows_block_const": "fn main() { const N: i64 = 5; let mut N = 3; println!(\"{}\", N); }\n",
+        # An `@` binding and a struct-pattern field are bindings too, so they may
+        # not shadow a block-scoped constant either (rustc E0530).
+        "at_binding_shadows_block_const": "fn main() { const N: i64 = 5; if let N @ 1 = 1 { println!(\"{}\", N); } }\n",
+        "struct_pat_field_shadows_block_const": "struct S { N: i64 } fn main() { const N: i64 = 5; let S { N } = S { N: 1 }; println!(\"{}\", N); }\n",
+        # A block-scoped `const` is resolved together with the whole block, so a
+        # self-reference is a cycle (not a read of the outer constant), an
+        # unused bad initializer is still rejected, and a `const` colliding with
+        # a `fn` in the same block is E0428.
+        "block_const_self_reference": "const K: i64 = 1; fn main() { const K: i64 = K + 1; println!(\"{}\", K); }\n",
+        "block_const_type_mismatch_unused": "fn main() { const N: i64 = true; }\n",
+        "block_const_non_const_call_unused": "fn main() { const N: i64 = f(); } fn f() -> i64 { 5 }\n",
+        "block_const_fn_collision": "fn main() { const N: i64 = 1; fn N() -> i64 { 2 } }\n",
     }
 
 
@@ -3063,7 +3496,7 @@ def gen_typealias_program(rng):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "patshadow", "intmeth", "nestedfn", "typealias", "printfmt", "ptr", "char", "robust", "reject", "mutate"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "forref", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "patshadow", "intmeth", "nestedfn", "typealias", "printfmt", "ptr", "char", "semi", "boolbit", "vis", "localconst", "robust", "reject", "mutate"], default="expr")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -3110,6 +3543,7 @@ def main():
            "ref": gen_ref_program, "update": gen_update_program,
            "letdestr": gen_letdestr_program,
            "fordestr": gen_fordestr_program,
+           "forref": gen_forref_program,
            "nestpat": gen_nestpat_program,
            "arrpat": gen_arrpat_program,
            "parampat": gen_parampat_program,
@@ -3122,7 +3556,11 @@ def main():
            "typealias": gen_typealias_program,
            "printfmt": gen_printfmt_program,
            "ptr": gen_ptr_program,
-           "char": gen_char_program}[args.mode]
+           "char": gen_char_program,
+           "semi": gen_semi_program,
+           "boolbit": gen_boolbit_program,
+           "vis": gen_vis_program,
+           "localconst": gen_localconst_program}[args.mode]
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus
     # suite; a fuzz program is otherwise only checked with every pass on, so a
@@ -3139,14 +3577,16 @@ def main():
         ("no-tco", ["--no-tco"], []),
         ("all-off", ["--no-inline", "--no-licm", "--no-tco"], []),
     ]
-    # `--bounds-checks` turns on the trap path, which the default configs never
-    # reach: every generated index is in bounds (see the generators), so no
-    # program should trap and the outputs must still match rustc. A spurious
-    # trap, or a miscompile the check codegen introduces, shows up here.
+    # Bounds checks are on by default, so the trap path is already exercised by
+    # the configs above: every generated index is in bounds (see the
+    # generators), so no program should trap and the outputs must still match
+    # rustc. A spurious trap, or a miscompile the check codegen introduces,
+    # shows up here. `--bounds` adds the explicit opt-out instead, to exercise
+    # the unchecked lowering.
     if args.bounds:
         configs += [
-            ("bounds", ["--bounds-checks"], []),
-            ("bounds-all-off", ["--bounds-checks", "--no-inline", "--no-licm", "--no-tco"], []),
+            ("no-bounds", ["--no-bounds-checks"], []),
+            ("no-bounds-all-off", ["--no-bounds-checks", "--no-inline", "--no-licm", "--no-tco"], []),
         ]
     # `--overflow-checks` traps on `+`/`-`/`*` overflow at runtime; the reference
     # must overflow-check too or the two disagree by design. `<<`/`>>` are not

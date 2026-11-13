@@ -89,6 +89,17 @@ pub struct Codegen {
 /// register name keeps the generated assembly readable.
 const ALLOC_REGS: [&str; 5] = ["%rbx", "%r12", "%r13", "%r14", "%r15"];
 
+/// How much a mention inside a loop body or condition is worth, relative to one
+/// in straight-line code. The promotion heuristic ranks locals by how often they
+/// are named, which alone ranks a cold temporary mentioned a few times on the
+/// entry path above a scalar read once per iteration of the hot loop. Weighting
+/// a loop mention this much keeps the loop-carried scalars in registers. It is a
+/// fixed weight, not a trip-count estimate: the loop bounds are runtime values
+/// here, and a scalar in any loop is a better register candidate than one in
+/// none. The value only needs to dominate a plausible straight-line count, so a
+/// small power of two is enough.
+const LOOP_W: u32 = 32;
+
 /// Callee-saved registers reserved for spill temporaries, after the locals have
 /// taken what they need. The deepest is two at once (a binary op whose left
 /// operand crosses a call in the right), so a handful covers every expression
@@ -101,6 +112,64 @@ struct LetTarget {
     slot: i32,
     fields: i32,
     by_field: bool,
+}
+
+/// How a byte referent loads: `u8` zero-extends and `i8` sign-extends, so a
+/// `*const u8` read of `0xFF` is `255` and a `*const i8` read is `-1`. A
+/// non-byte referent returns `None` and uses a plain 64-bit load.
+enum LoadKind {
+    Zero,
+    Sign,
+}
+
+fn byte_load(ty: &Type) -> Option<LoadKind> {
+    match ty {
+        Type::U8 => Some(LoadKind::Zero),
+        Type::I8 => Some(LoadKind::Sign),
+        _ => None,
+    }
+}
+
+/// True when `target` is a byte-referent dereference, so its store must write
+/// only the low byte (`movb`) rather than a word: a `*mut u8` write leaves the
+/// other seven bytes of the slot alone.
+fn is_byte_store(target: &Expr) -> bool {
+    matches!(target, Expr::Deref { ty, .. } if matches!(ty, Type::U8 | Type::I8))
+}
+
+/// The value type a byte referent yields: `i64` (see `byte_load`). Mirrors
+/// `sema::byte_value_ty`; the byte-ness is a property of the referent, not of
+/// the value the program manipulates.
+fn byte_value_ty(t: &Type) -> Type {
+    match t {
+        Type::U8 | Type::I8 => Type::I64,
+        other => other.clone(),
+    }
+}
+
+/// True for an integer width narrower than a machine word. A value of such a
+/// type is kept truncated to its width in a 64-bit register, so a later use
+/// (printing, division, a comparison) sees the same value rustc would.
+fn is_narrow_int(t: &Type) -> bool {
+    matches!(t, Type::Int { bits, .. } if *bits < 64)
+}
+
+/// The bit width of a narrow integer, or `None` for anything else.
+fn narrow_bits(t: &Type) -> Option<u16> {
+    match t {
+        Type::Int { bits, .. } if *bits < 64 => Some(*bits),
+        _ => None,
+    }
+}
+
+/// True for a 64-bit general-purpose register name, so `mov %rax, %rax` can be
+/// dropped as a no-op while `mov %eax, %eax` (a zero-extend) is kept.
+fn is_64bit_reg(s: &str) -> bool {
+    matches!(
+        s,
+        "%rax" | "%rbx" | "%rcx" | "%rdx" | "%rsi" | "%rdi" | "%rbp" | "%rsp"
+            | "%r8" | "%r9" | "%r10" | "%r11" | "%r12" | "%r13" | "%r14" | "%r15"
+    )
 }
 
 impl Codegen {
@@ -226,6 +295,67 @@ impl Codegen {
 
     fn array_elem_ty_tail(b: &Block) -> Option<Type> {
         b.tail.as_deref().and_then(Self::array_elem_ty)
+    }
+
+    /// The type of `e` when codegen can tell it statically. `gen_expr` already
+    /// returns a type for every node, but a `&`/`|`/`^` on `bool` reports `i64`
+    /// (the emitted instruction is the same for a 0/1 `bool` and an integer),
+    /// so a consumer that must tell a bool from an integer — `!`, which is a
+    /// logical not on `bool` and a bitwise not on `i64` — needs this. `None`
+    /// means "not statically known".
+    fn static_ty(e: &Expr) -> Option<Type> {
+        match e {
+            Expr::Bool(_) => Some(Type::Bool),
+            Expr::Int(_) | Expr::Str(_) => Some(Type::I64),
+            Expr::Char(_) => Some(Type::Char),
+            Expr::Var { ty, .. } | Expr::Field { ty, .. } | Expr::Deref { ty, .. } => {
+                Some(ty.clone())
+            }
+            Expr::Call { ret_ty, .. } => Some(ret_ty.clone()),
+            Expr::Cast(_, to) => Some(to.clone()),
+            Expr::Loop(_, _, lty, _) => Some(lty.clone()),
+            Expr::Un(op, inner) => match op {
+                UnOp::Neg => Self::static_ty(inner).filter(|t| is_narrow_int(t)).or(Some(Type::I64)),
+                UnOp::Not => Self::static_ty(inner),
+            },
+            Expr::Bin(op, a, b) => match op {
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                | BinOp::And | BinOp::Or => Some(Type::Bool),
+                // The result of a bitwise op has the operand's type, so a
+                // `bool` operand makes a `bool` result. Either side may carry
+                // the type (`a[0] | a[1]`); a `bool` on either side wins because
+                // sema rejects a mix of `bool` and `i64`.
+                BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                    match (Self::static_ty(a), Self::static_ty(b)) {
+                        (Some(Type::Bool), _) | (_, Some(Type::Bool)) => Some(Type::Bool),
+                        (Some(Type::I64), _) | (_, Some(Type::I64)) => Some(Type::I64),
+                        (Some(t), _) => Some(t),
+                        (_, Some(t)) => Some(t),
+                        _ => None,
+                    }
+                }
+                // Arithmetic, shifts and `wrapping_mul` keep a narrow integer
+                // width, so `gen_expr` truncates the 64-bit result to it. A
+                // 64-bit or unknown operand is `i64`.
+                _ => match (Self::static_ty(a), Self::static_ty(b)) {
+                    (Some(t), _) if is_narrow_int(&t) => Some(t),
+                    (_, Some(t)) if is_narrow_int(&t) => Some(t),
+                    _ => Some(Type::I64),
+                },
+            },
+            // An element of an array has the array's element type, which
+            // `array_elem_ty` resolves (it looks through a reference too).
+            Expr::Index(base, _) => Self::array_elem_ty(base),
+            Expr::If(_, then, Some(els)) => {
+                Self::static_ty_tail(then).or_else(|| Self::static_ty_tail(els))
+            }
+            Expr::Block(b) | Expr::MatchBoundary(b, _) => Self::static_ty_tail(b),
+            _ => None,
+        }
+    }
+
+    fn static_ty_tail(b: &Block) -> Option<Type> {
+        b.tail.as_deref().and_then(Self::static_ty)
     }
 
     /// The stride of `base`'s elements in 8-byte slots. One for a scalar array,
@@ -622,8 +752,10 @@ impl Codegen {
             if let Some(rest) = text.strip_prefix("mov ") {
                 if let Some((src, dst)) = rest.split_once(',') {
                     let (src, dst) = (src.trim(), dst.trim());
-                    // `mov %r, %r` with the same operand twice is a no-op.
-                    if src == dst && src.starts_with('%') {
+                    // `mov %r, %r` with the same operand twice is a no-op — but
+                    // only for a 64-bit register: `mov %eax, %eax` is a real
+                    // instruction that zero-extends into `%rax`.
+                    if src == dst && is_64bit_reg(src) {
                         continue;
                     }
                     // A `mov` whose source and destination are the reverse of
@@ -754,6 +886,17 @@ impl Codegen {
             .collect()
     }
 
+
+    /// Fold a loop's own counts into the running total at `LOOP_W`, saturating so
+    /// a deeply nested loop cannot overflow the counter and wrap a hot local to
+    /// the bottom of the ranking.
+    fn merge_loop(counts: &mut HashMap<i32, u32>, sub: HashMap<i32, u32>) {
+        for (slot, c) in sub {
+            let e = counts.entry(slot).or_insert(0);
+            *e = e.saturating_add(c.saturating_mul(LOOP_W));
+        }
+    }
+
     fn count_block(
         b: &Block,
         counts: &mut HashMap<i32, u32>,
@@ -824,8 +967,16 @@ impl Codegen {
             }
             Stmt::Expr(e) => Self::count_expr(e, counts, mem, copied, true, let_tmps),
             Stmt::While(c, b, _) => {
-                Self::count_expr(c, counts, mem, copied, true, let_tmps);
-                Self::count_block(b, counts, mem, copied, true, let_tmps);
+                // A loop's condition and body run once per iteration, so a
+                // mention there is worth `LOOP_W` mentions in straight-line
+                // code: a scalar read only inside the loop should outrank a
+                // colder one that is merely mentioned more times outside it.
+                // The body is counted into a fresh map so the whole subtree is
+                // weighted once; a nested loop inside it weights again.
+                let mut sub = HashMap::new();
+                Self::count_expr(c, &mut sub, mem, copied, true, let_tmps);
+                Self::count_block(b, &mut sub, mem, copied, true, let_tmps);
+                Self::merge_loop(counts, sub);
             }
             Stmt::For { start, end, body, var_slot, end_slot, .. } => {
                 Self::count_expr(start, counts, mem, copied, true, let_tmps);
@@ -834,12 +985,15 @@ impl Codegen {
                 // names, yet both are read (and the counter written) every
                 // iteration. Count them so they compete for a register like any
                 // other loop-carried local instead of being reloaded from the
-                // frame on each pass.
-                *counts.entry(*var_slot).or_insert(0) += 1;
+                // frame on each pass. They are counted at loop weight because
+                // that is where they are touched.
+                let mut sub = HashMap::new();
+                *sub.entry(*var_slot).or_insert(0) += 1;
                 if Self::small_imm(end).is_none() {
-                    *counts.entry(*end_slot).or_insert(0) += 1;
+                    *sub.entry(*end_slot).or_insert(0) += 1;
                 }
-                Self::count_block(body, counts, mem, copied, true, let_tmps);
+                Self::count_block(body, &mut sub, mem, copied, true, let_tmps);
+                Self::merge_loop(counts, sub);
             }
             Stmt::Return(v) => {
                 if let Some(e) = v {
@@ -1243,15 +1397,22 @@ Expr::PatScrutinee(_) => {
                             }
                         } else {
                             match self.field_operand(base, *offset) {
-                                Some(op) => match self.simple_operand(value) {
-                                    Some(v) if v.starts_with('%') || v.starts_with('$') => {
-                                        self.store_operand(&v, &op);
+                                Some(op) => {
+                                    // `field += x` folds into one read-modify-write
+                                    // `add`/`sub`, the shape of a running total.
+                                    if self.gen_mem_accumulate(&op, value) {
+                                        return;
                                     }
-                                    _ => {
-                                        self.gen_expr(value);
-                                        self.line(&format!("mov %rax, {op}"));
+                                    match self.simple_operand(value) {
+                                        Some(v) if v.starts_with('%') || v.starts_with('$') => {
+                                            self.store_operand(&v, &op);
+                                        }
+                                        _ => {
+                                            self.gen_expr(value);
+                                            self.line(&format!("mov %rax, {op}"));
+                                        }
                                     }
-                                },
+                                }
                                 None => self.store_through_addr(target, value, Some(0)),
                             }
                         }
@@ -1701,11 +1862,15 @@ Expr::PatScrutinee(_) => {
             self.gen_addr(target);
             self.line("mov %rax, %rcx");
             self.pop_to("%rax");
-            self.line("mov %rax, (%rcx)");
+            if is_byte_store(target) {
+                self.line("movb %al, (%rcx)");
+            } else {
+                self.line("mov %rax, (%rcx)");
+            }
             return;
         }
         if let (Some(op), Some(k)) = (self.simple_operand(value), off) {
-            if op.starts_with('%') || op.starts_with('$') {
+            if (op.starts_with('%') || op.starts_with('$')) && !is_byte_store(target) {
                 self.gen_addr(target);
                 let disp = if k == 0 { String::new() } else { format!("{k}") };
                 self.store_operand(&op, &format!("{disp}(%rax)"));
@@ -1716,7 +1881,11 @@ Expr::PatScrutinee(_) => {
         self.push_rax();
         self.gen_expr(value);
         self.pop_to("%rcx");
-        self.line("mov %rax, (%rcx)");
+        if is_byte_store(target) {
+            self.line("movb %al, (%rcx)");
+        } else {
+            self.line("mov %rax, (%rcx)");
+        }
     }
 
     /// Assign aggregate `value` (an address in `%rax`) into aggregate place
@@ -1851,7 +2020,81 @@ Expr::PatScrutinee(_) => {
         }
     }
 
+    /// Generate `e` and, when its result is a narrow integer, truncate the
+    /// 64-bit register to that width (sign- or zero-extended back to 64 bits).
+    /// rustc keeps a `u8`/`u16`/`i32`/... value wrapped at its width, so a
+    /// later use — printing with `{}`, a division, an ordering comparison, a
+    /// cast to a wider type — must see the wrapped value, not the raw 64-bit
+    /// arithmetic result. A 64-bit or non-integer result is left alone, so an
+    /// `i64` program is unaffected.
     fn gen_expr(&mut self, e: &Expr) -> Type {
+        let ty = self.gen_expr_raw(e);
+        // The narrowing key is `static_ty`, which models a narrow arithmetic
+        // result (`gen_expr_raw` reports a bare `i64` for a `Bin`, since the
+        // emitted instruction is 64-bit).
+        self.narrow_trunc(e, "%rax");
+        ty
+    }
+
+    /// Truncate `reg` back to `e`'s narrow width when `e` is a genuine
+    /// arithmetic result that may have wrapped past it. A literal, a variable
+    /// load or a byte load is already in range, so only the forms `may_wrap`
+    /// reports need this; the `lea`/`accumulate` fast paths in
+    /// `gen_expr_into_reg` call this directly because they bypass `gen_expr`.
+    fn narrow_trunc(&mut self, e: &Expr, reg: &str) {
+        if let Some(st) = Self::static_ty(e) {
+            if let Some(bits) = narrow_bits(&st) {
+                if Self::may_wrap(e) {
+                    self.truncate_reg(reg, bits, matches!(st, Type::Int { signed: true, .. }));
+                }
+            }
+        }
+    }
+
+    /// True for the expression forms whose 64-bit result may exceed a narrow
+    /// integer's range, so the value needs truncating. A literal, a variable, a
+    /// field, a dereference, a call and a cast are already in range (or are the
+    /// cast's own job); an `Index` of a narrow array element is too.
+    fn may_wrap(e: &Expr) -> bool {
+        match e {
+            Expr::Bin(..) | Expr::Un(UnOp::Neg, _) | Expr::Un(UnOp::Not, _) => true,
+            Expr::If(_, then, Some(els)) => {
+                Self::may_wrap_tail(then) || Self::may_wrap_tail(els)
+            }
+            Expr::Block(b) | Expr::MatchBoundary(b, _) => Self::may_wrap_tail(b),
+            _ => false,
+        }
+    }
+
+    fn may_wrap_tail(b: &Block) -> bool {
+        b.tail.as_ref().map(|t| Self::may_wrap(t)).unwrap_or(false)
+    }
+
+    /// Truncate `%rax` to the low `bits` and extend back to 64 bits, signed or
+    /// unsigned. `bits` is 8, 16 or 32 (a narrower integer is not modelled).
+    fn truncate_to(&mut self, bits: u16, signed: bool) {
+        self.truncate_reg("%rax", bits, signed);
+    }
+
+    /// Truncate the 64-bit register `reg` to the low `bits` and extend back to
+    /// 64 bits, signed or unsigned. `reg` must be a full 64-bit name (`%rax`,
+    /// `%r12`); the sub-register names are derived from it.
+    fn truncate_reg(&mut self, reg: &str, bits: u16, signed: bool) {
+        let ext = match (bits, signed) {
+            (8, true) => format!("movsbq {}, {reg}", reg8(reg)),
+            (8, false) => format!("movzbq {}, {reg}", reg8(reg)),
+            (16, true) => format!("movswq {}, {reg}", reg16(reg)),
+            (16, false) => format!("movzwq {}, {reg}", reg16(reg)),
+            (32, true) => format!("movslq {}, {reg}", r32(reg)),
+            // A 32-bit value is already zero-extended in `reg` by any 32-bit
+            // operation; a 64-bit result needs its high half cleared.
+            (32, false) => format!("mov {}, {}", r32(reg), r32(reg)),
+            _ => return,
+        };
+        self.line(&ext);
+    }
+
+    fn gen_expr_raw(&mut self, e: &Expr) -> Type {
         match e {
             Expr::ArrayList(_) => unreachable!("sema rewrites ArrayList into a block"),
             Expr::TupleLit(_) => unreachable!("sema rewrites TupleLit into a StructLit"),
@@ -1917,7 +2160,7 @@ Expr::PatScrutinee(_) => {
                 self.line("movzbq %al, %rax");
                 Type::Bool
             }
-            Expr::VariantTest { scrutinee, tag, .. } => {
+            Expr::VariantTest { scrutinee, tag, sub_tests, .. } => {
                 // Compare the value's tag word. `gen_expr` yields the address
                 // for an aggregate enum and the tag itself for a unit enum, so
                 // branch on the returned type rather than on syntax.
@@ -1928,6 +2171,17 @@ Expr::PatScrutinee(_) => {
                 self.line(&format!("cmp ${tag}, %rax"));
                 self.line("sete %al");
                 self.line("movzbq %al, %rax");
+                // Nested payload sub-pattern tests (`E::A(Some(x))`): the tag
+                // test passed, so the payload is valid; each sub-test reads its
+                // field and must hold too. `&&` short-circuits the whole arm, so
+                // a failing sub-test yields `false` immediately.
+                for (_, t) in sub_tests {
+                    let end = self.new_label();
+                    self.line("test %rax, %rax");
+                    self.line(&format!("jz {end}"));
+                    self.gen_expr(t);
+                    self.raw(&format!("{end}:"));
+                }
                 Type::Bool
             }
             Expr::EnumPayload { recv, offset, ty, .. } => {
@@ -2102,22 +2356,40 @@ Expr::PatScrutinee(_) => {
                 // A dereference is a place: read it. An aggregate referent is
                 // named by its address, so reading it yields the pointer itself.
                 self.gen_expr(expr);
-                if !ty.is_aggregate() {
-                    self.line("mov (%rax), %rax");
+                match byte_load(ty) {
+                    Some(LoadKind::Zero) => self.line("movzbq (%rax), %rax"),
+                    Some(LoadKind::Sign) => self.line("movsbq (%rax), %rax"),
+                    None if !ty.is_aggregate() => self.line("mov (%rax), %rax"),
+                    None => {}
                 }
-                ty.clone()
+                // The value is an `i64` even for a byte referent, which is what
+                // makes `*p` usable in printing and arithmetic.
+                byte_value_ty(ty)
             }
             Expr::Un(op, inner) => {
                 let inner_ty = self.gen_expr(inner);
+                // `!` is logical not on `bool` (1 when the operand is zero)
+                // and bitwise not on an integer, matching Rust. Sema has
+                // already checked the operand is `bool` or `i64`. The operand's
+                // type is taken from `static_ty` where it is known, because a
+                // `&`/`|`/`^` on `bool` makes `gen_expr` report `i64` (the
+                // emitted instruction is the same) and `!(a | b)` would
+                // otherwise be a bitwise `not`. For a node `static_ty` does not
+                // model (an index, say) `gen_expr`'s type is exact.
+                let inner_is_bool = match Self::static_ty(inner) {
+                    Some(t) => t == Type::Bool,
+                    None => inner_ty == Type::Bool,
+                };
                 match op {
                     UnOp::Neg => {
                         self.line("neg %rax");
-                        self.check_overflow();
+                        // Negation keeps the operand's width, so a narrow
+                        // `i8::MIN` (whose negation overflows the width but not
+                        // 64 bits) must trap against that width.
+                        let ty = Self::static_ty(inner);
+                        self.check_overflow_ty(ty.as_ref());
                     }
-                    // `!` is logical not on `bool` (1 when the operand is zero)
-                    // and bitwise not on an integer, matching Rust. Sema has
-                    // already checked the operand is `bool` or `i64`.
-                    UnOp::Not if inner_ty == Type::Bool => {
+                    UnOp::Not if inner_is_bool => {
                         self.line("test %rax, %rax");
                         self.line("sete %al");
                         self.line("movzbq %al, %rax");
@@ -2132,7 +2404,7 @@ Expr::PatScrutinee(_) => {
                 }
             }
             Expr::Bin(op, a, b) => self.gen_bin(*op, a, b),
-            Expr::Call { name, args, arg_slots, ret_slot, ret_ty } => {
+            Expr::Call { name, args, arg_slots, ret_slot, ret_ty, .. } => {
                 self.gen_call(name, args, arg_slots, *ret_slot, ret_ty)
             }
             Expr::If(cond, then, els) => {
@@ -2193,6 +2465,11 @@ Expr::PatScrutinee(_) => {
                     self.line("test %rax, %rax");
                     self.line("setne %al");
                     self.line("movzbq %al, %rax");
+                } else if let Some(bits) = narrow_bits(to) {
+                    // `x as u8` keeps only the low byte; `x as i32` sign-extends
+                    // the low word. A cast to a 64-bit type is a no-op on the
+                    // register.
+                    self.truncate_to(bits, matches!(to, Type::Int { signed: true, .. }));
                 }
                 to.clone()
             }
@@ -2230,7 +2507,7 @@ Expr::PatScrutinee(_) => {
             // `*p` reading a scalar through a reference in a register is a bare
             // memory operand, so `x + *p` folds into one `add`. An aggregate
             // referent's value is its address, which is not a simple operand.
-            Expr::Deref { expr, ty } if !ty.is_aggregate() => {
+            Expr::Deref { expr, ty } if !ty.is_aggregate() && byte_load(ty).is_none() => {
                 self.ptr_reg(expr).map(|r| format!("({r})"))
             }
             Expr::Index(base, idx) => {
@@ -2259,14 +2536,66 @@ Expr::PatScrutinee(_) => {
         }
     }
 
-    /// Trap if `reg` is not a valid shift count (0..=63). The hardware masks a
-    /// shift count to 6 bits, so without this a count of 81 silently shifts by
-    /// 17; Rust's `<<`/`>>` panics instead. Only called when overflow checks are
-    /// enabled.
-    fn check_shift_count(&mut self, reg: &str) {
+    /// Trap if the 64-bit result in `%rax` does not fit the narrow width `ty`
+    /// (`u8`, `i16`, ...). A 64-bit result has no narrower width, so the `jo`
+    /// check on the instruction's own overflow flag is enough; a narrow one can
+    /// exceed its declared range *without* overflowing 64 bits (`250u8 + 10`
+    /// wraps to `4` in a 64-bit register), so the result is compared against its
+    /// width-extended self. This must run before `narrow_trunc` discards the
+    /// excess bits, or the trap would be missed. Clobbers `%rdx`.
+    fn check_overflow_ty(&mut self, ty: Option<&Type>) {
+        if !self.overflow {
+            return;
+        }
+        match ty {
+            Some(Type::Int { signed, bits }) if *bits < 64 => {
+                let sh = 64 - *bits;
+                self.line("mov %rax, %rdx");
+                self.line(&format!("shl ${sh}, %rdx"));
+                // A signed value sign-extends from its width, an unsigned one
+                // zero-extends; either way a value that changed was out of range.
+                self.line(&format!("{} ${sh}, %rdx", if *signed { "sar" } else { "shr" }));
+                self.line("cmp %rdx, %rax");
+                self.line("jne __rmc_overflow");
+            }
+            _ => self.check_overflow(),
+        }
+    }
+
+    /// The narrow integer width of `a op b` when one operand is narrow (an
+    /// arithmetic result keeps that width), so the overflow check knows which
+    /// range to test. `None` for a 64-bit result.
+    fn arith_narrow(op: BinOp, a: &Expr, b: &Expr) -> Option<Type> {
+        if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::WrappingMul) {
+            return None;
+        }
+        match (Self::static_ty(a), Self::static_ty(b)) {
+            (Some(t), _) if is_narrow_int(&t) => Some(t),
+            (_, Some(t)) if is_narrow_int(&t) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// Trap if `reg` is not a valid shift count for a `bits`-wide left operand
+    /// (0..=bits-1). The hardware masks a shift count to 6 bits, so without this
+    /// a count of 81 silently shifts by 17 and a `u8 << 8` shifts the whole
+    /// 64-bit register; Rust's `<<`/`>>` panics instead. `bits` is the left
+    /// operand's width (64 for `i64`, the width for a narrow integer). Only
+    /// called when overflow checks are enabled.
+    fn check_shift_count(&mut self, reg: &str, bits: u16) {
         if self.overflow {
-            self.line(&format!("cmp $63, {reg}"));
+            self.line(&format!("cmp ${}, {reg}", bits - 1));
             self.line("ja __rmc_shift_overflow");
+        }
+    }
+
+    /// Trap if a *constant* shift count `k` is outside `0..=bits-1`. A count in
+    /// range emits nothing; an out-of-range one is an unconditional trap, so the
+    /// following `sal`/`sar` is unreachable. Only called when overflow checks are
+    /// enabled.
+    fn check_shift_count_imm(&mut self, k: i64, bits: u16) {
+        if self.overflow && !(0..bits as i64).contains(&k) {
+            self.line("jmp __rmc_shift_overflow");
         }
     }
 
@@ -2333,10 +2662,12 @@ Expr::PatScrutinee(_) => {
                 // `reg` alone is a plain move; anything else is one `lea`.
                 if k != 1 || c != 0 {
                     self.line(&format!("lea {}, {dst}", Self::lea_operand(&reg, k, c)));
+                    self.narrow_trunc(e, dst);
                     return;
                 }
             }
             if self.gen_accumulate(e, dst) {
+                self.narrow_trunc(e, dst);
                 return;
             }
         }
@@ -2350,6 +2681,51 @@ Expr::PatScrutinee(_) => {
         if dst != "%rax" {
             self.line(&format!("mov %rax, {dst}"));
         }
+    }
+
+    /// Fold `field += a - b + ...` into a run of read-modify-write `add`/`sub`
+    /// against the field's memory operand, when the chain's base term is the
+    /// field itself. The generic path loads the field, evaluates the whole sum
+    /// in registers and stores it back; this keeps the running total in memory
+    /// and touches each term once, which is the shape of an accumulator or a
+    /// counter field in a hot loop. Only a register or immediate term folds
+    /// into the instruction: a memory term would need `add mem, mem`, which is
+    /// not an instruction, and could alias the field being written, so such a
+    /// value falls back to the generic path. Overflow checks are also left to
+    /// the generic path, where each `add` gets its own `jo`.
+    fn gen_mem_accumulate(&mut self, op: &str, value: &Expr) -> bool {
+        if self.overflow {
+            return false;
+        }
+        let mut terms: Vec<(bool, &Expr)> = Vec::new();
+        Self::flatten_chain(value, false, &mut terms);
+        let (base_sub, first) = terms[0];
+        let first_is_target = matches!(
+            first,
+            Expr::Field { base, offset, .. }
+                if self.field_operand(base, *offset).as_deref() == Some(op)
+        );
+        if base_sub || !first_is_target {
+            return false;
+        }
+        // Resolve every term before emitting anything, so a term that cannot
+        // fold bails out without a half-written chain.
+        let mut plan: Vec<(bool, String)> = Vec::new();
+        for (is_sub, term) in &terms[1..] {
+            match self.simple_operand(term) {
+                Some(src) if !src.contains('(') => plan.push((*is_sub, src)),
+                _ => return false,
+            }
+        }
+        for (is_sub, src) in plan {
+            let m = if is_sub { "sub" } else { "add" };
+            // An immediate operand needs an explicit 64-bit width: `as` reads a
+            // suffixless `add $imm, mem` as a 32-bit add, which would truncate.
+            // A register operand names its own width, so it needs no suffix.
+            let m = if src.starts_with('$') { format!("{m}q") } else { m.to_string() };
+            self.line(&format!("{m} {src}, {op}"));
+        }
+        true
     }
 
     /// Fold `dst = dst + a + b - c + ...` into one `add`/`sub` per term, when
@@ -2644,7 +3020,14 @@ Expr::PatScrutinee(_) => {
         // there is no shortcut, since the dividend must be in `%rax` and the
         // divisor in a register.
         if matches!(op, Div | Mod) {
-            if self.gen_div_const(op, a, b) {
+            // The dividend's width fixes the overflow bound: `i8::MIN / -1`
+            // overflows an `i8` (and traps) even though `-128 / -1` is fine at 64
+            // bits, so the check must test the narrow minimum, not `i64::MIN`.
+            let div_bits = match Self::static_ty(a) {
+                Some(Type::Int { bits, .. }) => bits,
+                _ => 64,
+            };
+            if self.gen_div_const(op, a, b, div_bits) {
                 return Type::I64;
             }
             // A promoted-local divisor is a callee-saved register, so `idiv`
@@ -2655,12 +3038,12 @@ Expr::PatScrutinee(_) => {
             if let Some(rb) = self.simple_operand(b) {
                 if rb.starts_with('%') {
                     self.gen_expr(a);
-                    self.emit_div(op, &rb, r32(&rb));
+                    self.emit_div(op, &rb, r32(&rb), div_bits);
                     return Type::I64;
                 }
             }
             self.eval_operands(a, b, false);
-            self.emit_div(op, "%rcx", "%ecx");
+            self.emit_div(op, "%rcx", "%ecx", div_bits);
             return Type::I64;
         }
 
@@ -2669,6 +3052,16 @@ Expr::PatScrutinee(_) => {
         // saves the constant load. Folding a *memory* operand into `imul`/`add`
         // measured slower on the cores this was tuned on, so only immediates
         // are folded.
+        //
+        // The overflow check tests the result against the operation's declared
+        // width, not just 64-bit overflow: a narrow `u8`/`u16`/... result can
+        // exceed its range without the 64-bit instruction overflowing. The
+        // shift-count check likewise uses the left operand's width.
+        let narrow = Self::arith_narrow(op, a, b);
+        let shift_bits = match Self::static_ty(a) {
+            Some(Type::Int { bits, .. }) => bits,
+            _ => 64,
+        };
         let (imm, other) = match Self::small_imm(b) {
             Some(k) => (Some(k), a),
             // Commutative ops accept the constant on either side; subtraction
@@ -2685,11 +3078,11 @@ Expr::PatScrutinee(_) => {
             match op {
                 Add => {
                     self.line(&format!("add ${k}, %rax"));
-                    self.check_overflow();
+                    self.check_overflow_ty(narrow.as_ref());
                 }
                 Sub => {
                     self.line(&format!("sub ${k}, %rax"));
-                    self.check_overflow();
+                    self.check_overflow_ty(narrow.as_ref());
                 }
                 Mul => {
                     // `x * k` for a `lea`-expressible `k` is one 1-cycle `lea`;
@@ -2710,17 +3103,26 @@ Expr::PatScrutinee(_) => {
                         }
                     }
                     self.line(&format!("imul ${k}, %rax, %rax"));
-                    self.check_overflow();
+                    self.check_overflow_ty(narrow.as_ref());
                 }
                 BitAnd => self.line(&format!("and ${k}, %rax")),
                 BitOr => self.line(&format!("or ${k}, %rax")),
                 BitXor => self.line(&format!("xor ${k}, %rax")),
                 // The shift count is masked to 6 bits by hardware, exactly as
                 // Rust's `<<`/`>>` on `i64`; `sal`/`sar` take the count directly.
-                // A count outside 0..=63 is a compile-time error when the shift
-                // is constant (rejected in sema), so this arm only sees 0..=63.
-                Shl => self.line(&format!("sal ${}, %rax", k & 63)),
-                Shr => self.line(&format!("sar ${}, %rax", k & 63)),
+                // A constant count outside 0..=bits-1 traps under overflow
+                // checks: sema rejects a *literal* count, but inlining can fold a
+                // computed count to a constant after that check, so the range
+                // test is emitted here too (a no-op when the count is in range).
+                // `shift_bits` is the left operand's width.
+                Shl => {
+                    self.check_shift_count_imm(k, shift_bits);
+                    self.line(&format!("sal ${}, %rax", k & 63));
+                }
+                Shr => {
+                    self.check_shift_count_imm(k, shift_bits);
+                    self.line(&format!("sar ${}, %rax", k & 63));
+                }
                 _ => unreachable!(),
             }
             return Type::I64;
@@ -2741,15 +3143,15 @@ Expr::PatScrutinee(_) => {
                     match op {
                         Add => {
                             self.line(&format!("add {rb}, %rax"));
-                            self.check_overflow();
+                            self.check_overflow_ty(narrow.as_ref());
                         }
                         Sub => {
                             self.line(&format!("sub {rb}, %rax"));
-                            self.check_overflow();
+                            self.check_overflow_ty(narrow.as_ref());
                         }
                         Mul => {
                             self.line(&format!("imul {rb}, %rax"));
-                            self.check_overflow();
+                            self.check_overflow_ty(narrow.as_ref());
                         }
                         BitAnd => self.line(&format!("and {rb}, %rax")),
                         BitOr => self.line(&format!("or {rb}, %rax")),
@@ -2764,15 +3166,15 @@ Expr::PatScrutinee(_) => {
         match op {
             Add => {
                 self.line("add %rcx, %rax");
-                self.check_overflow();
+                self.check_overflow_ty(narrow.as_ref());
             }
             Sub => {
                 self.line("sub %rcx, %rax");
-                self.check_overflow();
+                self.check_overflow_ty(narrow.as_ref());
             }
             Mul => {
                 self.line("imul %rcx, %rax");
-                self.check_overflow();
+                self.check_overflow_ty(narrow.as_ref());
             }
             BitAnd => self.line("and %rcx, %rax"),
             BitOr => self.line("or %rcx, %rax"),
@@ -2780,11 +3182,11 @@ Expr::PatScrutinee(_) => {
             // The variable shift count must be in `%cl`; `eval_operands`
             // already leaves the right operand in `%rcx`.
             Shl => {
-                self.check_shift_count("%rcx");
+                self.check_shift_count("%rcx", shift_bits);
                 self.line("sal %cl, %rax");
             }
             Shr => {
-                self.check_shift_count("%rcx");
+                self.check_shift_count("%rcx", shift_bits);
                 self.line("sar %cl, %rax");
             }
             _ => unreachable!(),
@@ -2826,7 +3228,7 @@ Expr::PatScrutinee(_) => {
     /// signed comparison trick is needed. `%rdx` is free — `cqto` has not run
     /// yet and a 32-bit `div` zeroes its own `%rdx` — and the dividend and
     /// divisor are still in `%rax`/`rd` when the fast path is taken.
-    fn emit_div(&mut self, op: BinOp, rd: &str, rd32: &str) {
+    fn emit_div(&mut self, op: BinOp, rd: &str, rd32: &str, bits: u16) {
         let slow = self.new_label();
         let done = self.new_label();
         let ok = self.new_label();
@@ -2864,13 +3266,21 @@ Expr::PatScrutinee(_) => {
         // falls through to `{done}:`, so `trim_dead` drops it.
         self.cold_start();
         self.raw(&format!("{slow}:"));
-        // `i64::MIN / -1` (and `% -1`) has no representable quotient and the
-        // 64-bit `idiv` would fault; trap like Rust. Only a 64-bit-path dividend
-        // can be `MIN` (a 32-bit one has the high bit clear), so the check sits
-        // in the slow path and the fast path pays nothing for it. `%rdx` is
-        // scratch here: `cqto` below overwrites it before it is read.
-        self.line("movabs $0x8000000000000000, %rdx");
-        self.line("cmp %rdx, %rax");
+        // `MIN / -1` (and `% -1`) has no representable quotient and `idiv`
+        // would fault; trap like Rust. `MIN` is the dividend's own width, not
+        // `i64::MIN`: `i8::MIN / -1` overflows an `i8` even though `-128 / -1`
+        // is representable at 64 bits. The check sits in the slow path, so the
+        // 32-bit fast path pays nothing for it. `%rdx` is scratch here: `cqto`
+        // below overwrites it before it is read.
+        if bits >= 64 {
+            self.line("movabs $0x8000000000000000, %rdx");
+            self.line("cmp %rdx, %rax");
+        } else {
+            // The narrow minimum fits in a sign-extended 32-bit immediate, which
+            // is exactly the value a narrowed register holds.
+            let min = -(1i64 << (bits - 1));
+            self.line(&format!("cmp ${min}, %rax"));
+        }
         self.line(&format!("jne {ok}"));
         self.line(&format!("cmp $-1, {rd}"));
         self.line("je __rmc_divide_overflow");
@@ -2894,7 +3304,7 @@ Expr::PatScrutinee(_) => {
     ///
     /// `D` stays in `%rax` until the quotient or remainder is known; `%rdx` and
     /// `%r8` are scratch.
-    fn gen_div_const(&mut self, op: BinOp, a: &Expr, b: &Expr) -> bool {
+    fn gen_div_const(&mut self, op: BinOp, a: &Expr, b: &Expr, bits: u16) -> bool {
         let d = match Self::small_imm(b) {
             Some(v) if v != 0 => v,
             _ => return false,
@@ -2904,12 +3314,21 @@ Expr::PatScrutinee(_) => {
         if d == 1 {
             // The dividend is already in %rax.
         } else if d == -1 {
-            // `i64::MIN / -1` and `i64::MIN % -1` overflow; `neg` sets OF for
-            // exactly that operand, so the check is free. Rust traps here even
+            // `MIN / -1` and `MIN % -1` overflow; `neg` sets OF for exactly
+            // `i64::MIN`, so at 64 bits the check is free. A narrow dividend
+            // needs an explicit compare against its own minimum: `-128` is not
+            // `i64::MIN`, so `neg` would not set OF. Rust traps here even
             // without `overflow-checks`, because `idiv` cannot produce the
             // wrapping result.
-            self.line("neg %rax");
-            self.line("jo __rmc_divide_overflow");
+            if bits >= 64 {
+                self.line("neg %rax");
+                self.line("jo __rmc_divide_overflow");
+            } else {
+                let min = -(1i64 << (bits - 1));
+                self.line(&format!("cmp ${min}, %rax"));
+                self.line("je __rmc_divide_overflow");
+                self.line("neg %rax");
+            }
         } else {
             let mag = d.unsigned_abs();
             if mag.is_power_of_two() {
@@ -3046,23 +3465,6 @@ Expr::PatScrutinee(_) => {
                 // The index lives in a slot; the caller must load it into %rax
                 // and bake the array base offset into the displacement.
                 Some(format!("{}(%rbp,%rax,8)", self.array_off(slot, n)))
-            }
-            _ => None,
-        }
-    }
-
-    /// The frame displacement of element `idx` of the local array at `slot` with
-    /// `n` slots and a `stride`-slot element, for a *constant* index. `None`
-    /// when `base` is not a local array. Used where an element is named directly
-    /// rather than through `array_elem_operand` (which handles only stride 1).
-    fn const_elem_off(&self, base: &Expr, idx: &Expr) -> Option<i32> {
-        let (slot, n) = match base {
-            Expr::Var { slot, ty: Type::Array(_, n), .. } => (*slot, *n),
-            _ => return None,
-        };
-        match idx {
-            Expr::Int(v) if (-2_147_483_648..=2_147_483_647).contains(v) => {
-                Some(self.array_off(slot, n) + *v as i32 * 8 * Self::elem_stride(base) as i32)
             }
             _ => None,
         }
@@ -3514,6 +3916,50 @@ fn setcc(op: BinOp) -> &'static str {
     }
 }
 
+/// The 8-bit sub-register of a 64-bit register name (`%rax` -> `%al`). The
+/// high-byte registers (`%ah`..) are never used, so the low-byte encoding is
+/// always the plain one.
+fn reg8(r: &str) -> &'static str {
+    match r {
+        "%rax" => "%al",
+        "%rbx" => "%bl",
+        "%rcx" => "%cl",
+        "%rdx" => "%dl",
+        "%rsi" => "%sil",
+        "%rdi" => "%dil",
+        "%r8" => "%r8b",
+        "%r9" => "%r9b",
+        "%r10" => "%r10b",
+        "%r11" => "%r11b",
+        "%r12" => "%r12b",
+        "%r13" => "%r13b",
+        "%r14" => "%r14b",
+        "%r15" => "%r15b",
+        _ => unreachable!("no 8-bit form of {r}"),
+    }
+}
+
+/// The 16-bit sub-register of a 64-bit register name (`%rax` -> `%ax`).
+fn reg16(r: &str) -> &'static str {
+    match r {
+        "%rax" => "%ax",
+        "%rbx" => "%bx",
+        "%rcx" => "%cx",
+        "%rdx" => "%dx",
+        "%rsi" => "%si",
+        "%rdi" => "%di",
+        "%r8" => "%r8w",
+        "%r9" => "%r9w",
+        "%r10" => "%r10w",
+        "%r11" => "%r11w",
+        "%r12" => "%r12w",
+        "%r13" => "%r13w",
+        "%r14" => "%r14w",
+        "%r15" => "%r15w",
+        _ => unreachable!("no 16-bit form of {r}"),
+    }
+}
+
 /// The 32-bit half of a 64-bit register mnemonic, for the `div`/`idiv` fast
 /// path in [`Codegen::emit_div`].
 fn r32(r: &str) -> &'static str {
@@ -3561,3 +4007,4 @@ fn setcc_cc(op: BinOp) -> Option<&'static str> {
         _ => return None,
     })
 }
+

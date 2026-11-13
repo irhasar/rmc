@@ -22,7 +22,7 @@ struct Options {
     min_size: bool,
     binutils: bool,
     overflow_checks: bool,
-    bounds_checks: bool,
+    no_bounds_checks: bool,
     no_inline: bool,
     no_licm: bool,
     no_tco: bool,
@@ -38,7 +38,7 @@ fn parse_args() -> Result<Options, String> {
     let mut min_size = false;
     let mut binutils = false;
     let mut overflow_checks = false;
-    let mut bounds_checks = false;
+    let mut no_bounds_checks = false;
     let mut no_inline = false;
     let mut no_licm = false;
     let mut no_tco = false;
@@ -55,7 +55,8 @@ fn parse_args() -> Result<Options, String> {
             "--min-size" => min_size = true,
             "--binutils" => binutils = true,
             "--overflow-checks" => overflow_checks = true,
-            "--bounds-checks" => bounds_checks = true,
+            "--bounds-checks" => {} // no-op: checks are on by default
+            "--no-bounds-checks" => no_bounds_checks = true,
             "--no-inline" => no_inline = true,
             "--no-licm" => no_licm = true,
             "--no-tco" => no_tco = true,
@@ -103,7 +104,7 @@ fn parse_args() -> Result<Options, String> {
         min_size,
         binutils,
         overflow_checks,
-        bounds_checks,
+        no_bounds_checks,
         no_inline,
         no_licm,
         no_tco,
@@ -124,7 +125,9 @@ fn print_help() {
          \x20   --min-size     with --binutils, also drop the section headers\n\
          \x20   --binutils     use GNU `as` and `ld` instead of linking in-process\n\
          \x20   --overflow-checks  trap on i64 +,-,* overflow (off by default)\n\
-         \x20   --bounds-checks    trap on an out-of-range array index (off by default)\n\
+         \x20   --bounds-checks    accepted and ignored: bounds checks are on by default\n\
+         \x20   --no-bounds-checks turn the per-index bounds check off (unsafe; for a\n\
+         \x20                      program that has already proven its indices in range)\n\
          \x20   --no-inline        disable the inlining pass (on by default)\n\
          \x20   --no-licm          disable loop-invariant code motion (on by default)\n\
          \x20   --no-tco           disable self-recursion-to-loop (on by default)\n\
@@ -162,7 +165,7 @@ fn run(opts: Options) -> Result<(), String> {
         &src,
         &CompileOptions {
             overflow_checks: opts.overflow_checks,
-            bounds_checks: opts.bounds_checks,
+            no_bounds_checks: opts.no_bounds_checks,
             no_inline: opts.no_inline,
             no_licm: opts.no_licm,
             no_tco: opts.no_tco,

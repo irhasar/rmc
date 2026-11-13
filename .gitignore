@@ -1,3 +1,6 @@
 /compiler/target/
 __pycache__/
 *.pyc
+/a.out
+/compiler/c.bin
+/compiler/c.err

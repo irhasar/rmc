@@ -304,7 +304,9 @@ slots. A struct used only field by field keeps every field promotable, the last
 one included: a field access names a register through `field_reg` or an address
 `base + offset` off `array_off`, and neither needs the last field's own slot to
 be addressable. This is worth a real benchmark — promoting `stats`'s last field
-(`sum`, the hot one) takes it from 0.88x to 1.14x of its rustc twin. A payload
+(`sum`, the hot one), together with keeping an i64-method receiver in its slot
+and folding field accumulators, takes `stats` from ~0.9x to ~1.15x of its rustc
+twin. A payload
 enum is the exception: it is read as a whole through its base word, so that word
 stays in memory.
 
@@ -604,17 +606,28 @@ LIFO) precisely so coalescing is possible; the cost is a linear scan on both
 `alloc` and `free`, which is fine at this scale. Memory is never returned to the
 kernel.
 
+The growable collections build on `alloc`. A `Vec<T>` value is the address of
+its element store with a two-word `{length, capacity}` header immediately before
+it; a `String` value is the address of a `{len, bytes}` record (the `str`
+layout) with the capacity in the single word before it. Both grow by allocating
+a fresh block, copying the old bytes and returning the new address, which the
+caller writes back into the binding; growth doubles the capacity (with `std`'s
+minimum of 8 for a one-byte element, or of 4 for a `Vec`'s wider elements).
+Because a `Vec` element store starts at the value, `v[i]` is `*(v + i*elem)`
+with no header offset, and because a `String` value *is* a `str` record, every
+`str` helper reads a `String` unchanged.
+
 ### Bounds checks
 
-With `--bounds-checks`, every array index is preceded by a compare against the
-array's length and a `jae` to a runtime trap; `jae` catches a negative index too,
-since it is an enormous unsigned value. A constant index is folded: in range
-emits nothing, out of range is an unconditional `jmp` to the trap. When the flag
-is on, an array element is never used as a bare memory operand, so no access can
-bypass the check. The base is evaluated before the check, matching Rust: a base
-that is a call or block runs its side effects even when the index is out of
-range. The check itself uses no register, so the base address survives in `%rax`
-for the load.
+With bounds checks on (the default), every array index is preceded by a compare
+against the array's length and a `jae` to a runtime trap; `jae` catches a
+negative index too, since it is an enormous unsigned value. A constant index is
+folded: in range emits nothing, out of range is an unconditional `jmp` to the
+trap. When the check is on, an array element is never used as a bare memory
+operand, so no access can bypass the check. The base is evaluated before the
+check, matching Rust: a base that is a call or block runs its side effects even
+when the index is out of range. The check itself uses no register, so the base
+address survives in `%rax` for the load. `--no-bounds-checks` drops the check.
 
 ### Overflow checks
 
@@ -634,14 +647,20 @@ the speed of the code it produces. The non-trivial
 passes are division by a constant (1.4x on `mandel.rs`), the top-five local
 promotion (a few percent on `mix` and `sieve`), the reference-operand folds plus
 `trim_dead` (1.4x on the `refs` benchmark), inlining (2.6x on `refs`, by removing
-the three accessor calls from its hot loop), and loop-invariant code motion (a
-further 2.9x on `refs`, by hoisting the now-inlined struct reads out of the
-loop), the self-recursion rewrite (2.0x on `fib`, by halving its call tree);
-everything else is local and cheap to compute. Flattening the accumulator
-fold over a nested sum, plus unwrapping the inliner's spliced block so the fold
-can see the accessor arithmetic, is what turns LICM's three hoisted values into
-a six-instruction loop (`refs` 6.4 → 4.7 ms of rmc's own runtime, within ~20% of
-an honest rustc twin).
+the three accessor calls from its hot loop), and the self-recursion rewrite (2.0x
+on `fib`, by halving its call tree); everything else is local and cheap to
+compute. LICM hoists a field read through a *local aggregate* (it cannot fault)
+and through a reference only when a provenance pre-pass proves the reference is
+bound to a live local (rmc's `&T` is not known to be dereferenceable, so a
+speculative load through a reference of unknown origin could fault on a loop that
+never runs). The `refs` benchmark binds its `&Wide` to a local, so its loop is
+hoisted to one add per iteration and `refs` wins (~1.7x); a
+loop reading through an unproven reference still reloads every iteration and
+loses. The benchmark keeps the loop real for both compilers without an in-loop
+`black_box` (which rmc would erase and rustc would not): it seeds the struct from
+an opaque value and reduces the accumulator with a data-dependent branch, so
+LLVM can neither constant-fold the accessor sum nor close the loop into `K * n`
+nor vectorise it.
 
 On the language side the notable absences are: `u*`/`i*` widths other than
 `i64`, floating point, traits and generics, closures, `for` over arbitrary
