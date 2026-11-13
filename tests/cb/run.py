@@ -38,10 +38,28 @@ PROJ = os.path.dirname(os.path.dirname(ROOT))
 SO = os.path.join(PROJ, "backend", "target", "release", "librmc_codegen_backend.so")
 OUT = "/tmp/rmccbtests"
 
+
+def pinned_channel():
+    """The toolchain channel from `backend/rust-toolchain.toml`.
+
+    The backend dylib links the `rustc_private` of one specific nightly, so the
+    harness must invoke that nightly rather than whatever `+nightly` resolves
+    to. Read the pin (the single source of truth) instead of repeating it.
+    """
+    path = os.path.join(PROJ, "backend", "rust-toolchain.toml")
+    with open(path) as f:
+        for line in f:
+            key, _, val = line.partition("=")
+            if key.strip() == "channel":
+                return val.strip().strip('"')
+    raise SystemExit(f"no `channel` in {path}")
+
+CHANNEL = pinned_channel()
+
 # argv vectors per case. A case with no entry runs once with no arguments.
 ARGS = {}
 
-CB = ["rustc", "+nightly", "-Zcodegen-backend=" + SO, "--edition", "2021",
+CB = ["rustc", "+" + CHANNEL, "-Zcodegen-backend=" + SO, "--edition", "2021",
       "-C", "opt-level=3", "-C", "panic=abort", "--crate-type=bin"]
 REF = ["rustc", "-O", "-C", "panic=abort", "--edition", "2021", "--crate-type=bin"]
 
@@ -55,10 +73,11 @@ def have_prereqs():
     if not os.path.exists(SO):
         print(f"skip: {SO} not built (run backend/build.sh)")
         return False
-    p = subprocess.run(["rustc", "+nightly", "--print", "sysroot"],
+    p = subprocess.run(["rustc", "+" + CHANNEL, "--print", "sysroot"],
                        capture_output=True)
     if p.returncode != 0:
-        print("skip: nightly toolchain not installed")
+        print(f"skip: pinned toolchain {CHANNEL} not installed "
+              f"(rustup toolchain install {CHANNEL} --component rustc-dev)")
         return False
     sysroot = p.stdout.decode().strip()
     libdir = os.path.join(sysroot, "lib")

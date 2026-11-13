@@ -40,6 +40,24 @@ import sys
 import time
 import shutil
 
+
+def pinned_channel():
+    """The toolchain channel from `backend/rust-toolchain.toml`.
+
+    `run_codegen.py`'s `cb` pipeline links one specific nightly's
+    `rustc_private`, and this harness compares against it, so every rustc here
+    must be that nightly rather than whatever `+nightly` points at. Read the pin
+    (the single source of truth) instead of repeating the date.
+    """
+    pin = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "backend", "rust-toolchain.toml")
+    with open(pin) as f:
+        for line in f:
+            key, _, val = line.partition("=")
+            if key.strip() == "channel":
+                return val.strip().strip('"')
+    raise SystemExit(f"no `channel` in {pin}")
+
 # `rmc` drives rustc with `-Zno-codegen` so the front end stops after the MIR
 # optimisations instead of preparing codegen it will never use. The flag is
 # nightly-only, so rmc sets `RUSTC_BOOTSTRAP=1` on the child rustc (see
@@ -70,10 +88,12 @@ ARGS = {
     "heavy": ["1000000000"],
 }
 
-RUSTC_MIR = ["rustc", "--emit=mir", "-O", "-Zno-codegen", "-C", "panic=abort",
-             "--crate-type=bin", "--edition", "2021"]
-RUSTC_OBJ = ["rustc", "--emit=obj", "-O", "-C", "opt-level=3", "-C", "lto=fat",
-             "-C", "codegen-units=1", "-C", "panic=abort", "--edition", "2021"]
+RUSTC = ["rustc", "+" + pinned_channel()]
+RUSTC_MIR = RUSTC + ["--emit=mir", "-O", "-Zno-codegen", "-C", "panic=abort",
+                     "--crate-type=bin", "--edition", "2021"]
+RUSTC_OBJ = RUSTC + ["--emit=obj", "-O", "-C", "opt-level=3", "-C", "lto=fat",
+                     "-C", "codegen-units=1", "-C", "panic=abort",
+                     "--edition", "2021"]
 
 # Speedup ratios inside +/- this band are a statistical tie, not a win or a
 # loss. The run axes take the minimum of 50 interleaved samples, but two runs of
@@ -82,20 +102,30 @@ RUSTC_OBJ = ["rustc", "--emit=obj", "-O", "-C", "opt-level=3", "-C", "lto=fat",
 # 1.02 keeps the verdict from calling that tie a loss.
 NOISE_BAND = 0.02
 
-# Panic entry points the LLVM object references (the `mir` back end lowers the
-# same checks to its own trap). Both paths exit 101, so the runtime comparison
-# stays apples to apples.
-PANIC_SYMS = [
-    "core::panicking::panic_bounds_check",
-    "core::panicking::panic_const::panic_const_rem_overflow",
-    "core::panicking::panic_const::panic_const_div_overflow",
-    "core::panicking::panic_const::panic_const_add_overflow",
-    "core::panicking::panic_const::panic_const_mul_overflow",
-    "core::panicking::panic_const::panic_const_sub_overflow",
-    "core::panicking::panic_const::panic_const_neg_overflow",
-    "core::panicking::panic_const::panic_const_shl_overflow",
-    "core::panicking::panic_const::panic_const_shr_overflow",
-]
+# Panic entry points the LLVM object may reference; the `mir` back end lowers
+# the same checks to its own trap. Both paths exit 101, so the runtime
+# comparison stays apples to apples. The names are *not* listed here: the
+# mangled spelling embeds the hash of one libcore build, so it is read off the
+# object under test instead (see `panic_stubs`), which keeps the harness working
+# on any toolchain.
+PANIC_MARKERS = ("panic", "overflow")
+
+
+def undefined_symbols(obj):
+    """The symbols `obj` references but does not define (see `nm -u`)."""
+    p = subprocess.run(["nm", "-u", obj], capture_output=True)
+    if p.returncode != 0:
+        raise SystemExit(f"nm failed on {obj}:\n{p.stderr.decode(errors='replace')}")
+    names = []
+    for line in p.stdout.decode(errors="replace").splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        if len(parts) >= 2 and parts[-2] == "U":
+            names.append(parts[-1])
+        elif len(parts) == 1:
+            names.append(parts[0])
+    return names
 
 
 def peak_rss_kb(pid):
@@ -167,17 +197,31 @@ def build_runtime():
     obj = os.path.join(OUT, "runtime.o")
     subprocess.run(["as", "--64", "-o", obj, asm_path], check=True)
 
+    # Discover the panic symbols from the programs themselves rather than
+    # hard-coding them: `lto=fat` mangles every entry point with the hash of
+    # one particular libcore build, so a literal list breaks the link on any
+    # other toolchain. Compile each program once (untimed, before sampling) and
+    # union the undefined `panic`/`overflow` names, so the stub set adapts to
+    # whatever codegen actually emits.
+    names = set()
+    for name in PROGRAMS:
+        src = os.path.join(ROOT, "mir", f"{name}.rs")
+        probe = os.path.join(OUT, f"{name}.probe.o")
+        p = subprocess.run(RUSTC_OBJ + [src, "-o", probe], capture_output=True)
+        if p.returncode != 0:
+            raise SystemExit(f"probe compile failed for {name}:\n"
+                             f"{p.stderr.decode(errors='replace')}")
+        names.update(n for n in undefined_symbols(probe)
+                     if any(m in n for m in PANIC_MARKERS))
+    if not names:
+        raise SystemExit(
+            "no panic/overflow symbols found in any program; the stub set "
+            "cannot be built, so the LLVM link would fail")
+
     stubs = ["\t.text", "\t.globl __rmc_trap_stub", "__rmc_trap_stub:",
              "\tmov $60, %rax", "\tmov $101, %rdi", "\tsyscall"]
-    for s in PANIC_SYMS:
+    for s in sorted(names):
         stubs += [f'\t.globl "{s}"', f'"{s}":', "\tjmp __rmc_trap_stub"]
-    # `lto=fat` mangles the symbols, so match the mangled name too.
-    stubs += ['\t.globl _RNvNtCskADBYZwJmSU_4core9panicking18panic_bounds_check',
-              '_RNvNtCskADBYZwJmSU_4core9panicking18panic_bounds_check:',
-              "\tjmp __rmc_trap_stub",
-              '\t.globl _RNvNtNtCskADBYZwJmSU_4core9panicking11panic_const24panic_const_rem_overflow',
-              '_RNvNtNtCskADBYZwJmSU_4core9panicking11panic_const24panic_const_rem_overflow:',
-              "\tjmp __rmc_trap_stub"]
     stub_s = os.path.join(OUT, "panic_stubs.s")
     with open(stub_s, "w") as f:
         f.write("\n".join(stubs) + "\n")

@@ -132,7 +132,7 @@ def md_detail(rows):
 def write_markdown(rows, verdicts, path):
     def ver(cmd):
         return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
-    rustc_v = ver(["rustc", "+nightly", "-V"])
+    rustc_v = ver(rc.RUSTC + ["-V"])
     lines = [
         "# Four-way benchmark on one source: rmc, rustc+rmc, Cranelift, LLVM",
         "",

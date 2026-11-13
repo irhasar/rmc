@@ -13,9 +13,15 @@
 #   ./backend/rmc-rustc foo.rs -o foo     # wrapper that sets the paths
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
-sysroot=$(rustc +nightly --print sysroot)
+# The toolchain is pinned by `backend/rust-toolchain.toml`; rustup selects it
+# from the *working directory*, and this script may be invoked from anywhere,
+# so cd here for every toolchain query. Read the channel back out rather than
+# repeating it, so the pin lives in exactly one place.
+cd "$here"
+channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+sysroot=$(rustc +"$channel" --print sysroot)
 # `-L` lets the link find `librustc_driver`; the rpath is baked in so the
 # wrapper does not have to run `rustc --print sysroot` on every invocation
 # (that extra process was the entire compile-time cost of the `cb` pipeline).
 RUSTFLAGS="-L $sysroot/lib -C link-arg=-Wl,-rpath,$sysroot/lib" \
-    cargo +nightly build --release --manifest-path "$here/Cargo.toml"
+    cargo +"$channel" build --release --manifest-path "$here/Cargo.toml"

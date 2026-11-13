@@ -50,10 +50,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install nightly with rustc-dev
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rustc-dev
+      - name: Install the pinned nightly
+        # The channel comes from `backend/rust-toolchain.toml`, so the toolchain
+        # the backend links against is the one CI tests against. `rustc-dev` for
+        # the backend dylib, `llvm-tools`/`rustc-codegen-cranelift` for the
+        # benches below.
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' backend/rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal \
+            --component rustc-dev --component llvm-tools \
+            --component rustc-codegen-cranelift
 
       - name: Build compiler
         run: cargo build --release --manifest-path compiler/Cargo.toml
@@ -63,6 +69,39 @@ jobs:
 
       - name: Codegen-backend differential tests
         run: python3 tests/cb/run.py
+
+  # The benchmark harnesses must run on a fresh machine with only the README's
+  # steps: this is where their toolchain independence (no hard-coded mangled
+  # symbol names) is checked, since a hard-coded spelling only breaks on a
+  # toolchain other than the author's.
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned nightly
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' backend/rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal \
+            --component rustc-dev --component llvm-tools \
+            --component rustc-codegen-cranelift
+
+      - name: Install binutils
+        run: sudo apt-get update && sudo apt-get install -y binutils
+
+      - name: Build compiler and example
+        run: cargo build --release --manifest-path compiler/Cargo.toml --example rmcmir
+
+      - name: Build backend
+        run: ./backend/build.sh
+
+      # One source, two back ends, from an empty output directory: the harness
+      # must create its own directories and discover the panic symbols itself.
+      - name: Fair benchmark (must complete)
+        run: python3 bench/run_fair.py
+
+      - name: Four-way benchmark (must complete)
+        run: python3 bench/run_four.py
 
   fuzz:
     runs-on: ubuntu-latest

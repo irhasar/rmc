@@ -43,6 +43,22 @@ CBSO = os.path.join(PROJ, "backend", "target", "release",
                     "librmc_codegen_backend.so")
 OUT = "/tmp/rmccodegen"
 
+
+def pinned_channel():
+    """The toolchain channel from `backend/rust-toolchain.toml`.
+
+    The `cb` dylib links one specific nightly's `rustc_private`, so every rustc
+    this harness spawns (cb, mir, cl, LLVM) must be that nightly, not whatever
+    `+nightly` currently points at. Read the pin - the single source of truth -
+    instead of repeating the date here.
+    """
+    with open(os.path.join(PROJ, "backend", "rust-toolchain.toml")) as f:
+        for line in f:
+            key, _, val = line.partition("=")
+            if key.strip() == "channel":
+                return val.strip().strip('"')
+    raise SystemExit("no `channel` in backend/rust-toolchain.toml")
+
 PROGRAMS = ["hello", "fib", "mandel", "sieve", "mix", "stats", "refs",
             "heap", "callrec", "forloops", "light", "heavy"]
 ARGS = {
@@ -52,7 +68,7 @@ ARGS = {
     "light": ["2000000"], "heavy": ["1000000000"],
 }
 
-RUSTC = ["rustc", "+nightly"]
+RUSTC = ["rustc", "+" + pinned_channel()]
 RUSTC_MIR = RUSTC + ["--emit=mir", "-O", "-Zno-codegen", "-C", "panic=abort",
                      "--crate-type=bin", "--edition", "2021", "-Awarnings"]
 RUSTC_OBJ = RUSTC + ["--emit=obj", "-O", "-C", "opt-level=3", "-C", "lto=fat",
@@ -230,6 +246,9 @@ def probe_panic_syms():
 
 
 def build_runtime():
+    # `run_four.py` calls this directly and only creates its own output
+    # directory, so make `OUT` here rather than relying on `main` to.
+    os.makedirs(OUT, exist_ok=True)
     asm = subprocess.run([RMC, "--emit-runtime-asm"], capture_output=True,
                          check=True).stdout
     asm_path = os.path.join(OUT, "runtime.s")

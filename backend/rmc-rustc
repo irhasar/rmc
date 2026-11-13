@@ -18,4 +18,9 @@ if [ ! -f "$so" ]; then
     echo "rmc-rustc: $so missing; run backend/build.sh first" >&2
     exit 1
 fi
-exec rustc +nightly -Zcodegen-backend="$so" -C opt-level=3 "$@"
+# Use the toolchain pinned next to this script rather than whatever `+nightly`
+# resolves to, so the dylib links against the same `rustc_private` it was built
+# with. rustup reads the pin from the working directory, not the script's, so
+# pass the toolchain explicitly.
+channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$here/rust-toolchain.toml")
+exec rustc +"$channel" -Zcodegen-backend="$so" -C opt-level=3 "$@"

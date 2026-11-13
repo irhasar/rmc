@@ -88,30 +88,53 @@ def overflow_checks(name):
     return os.path.exists(os.path.join(ROOT, f"{name}.overflow"))
 
 
-def overflow_stubs(rt):
-    """An object defining core's panic-const symbols as `__rmc_overflow`.
+def undefined_symbols(obj):
+    """The symbols `obj` references but does not define.
 
-    With overflow checks on, the reference calls
-    `core::panicking::panic_const::*_overflow`, which a `#![no_std]` static
-    link has no definition for. The three symbols only have to trap the way
-    rmc's own checked arithmetic does, so each jumps to `__rmc_overflow` in the
-    shared runtime. Only `ovfcheck` needs this; the other cases link as before.
+    `nm` reports them with a `U` type on the standard three-column line and a
+    blank type on the single-column form, so match both: the name is the last
+    field of a `U` line, or the whole line when the type is blank.
     """
-    stubs = os.path.join(OUT, "overflow_stubs.o")
-    src = os.path.join(OUT, "overflow_stubs.s")
-    if not os.path.exists(stubs):
-        names = [
-            "_RNvNtNtCskADBYZwJmSU_4core9panicking11panic_const24panic_const_add_overflow",
-            "_RNvNtNtCskADBYZwJmSU_4core9panicking11panic_const24panic_const_sub_overflow",
-            "_RNvNtNtCskADBYZwJmSU_4core9panicking11panic_const24panic_const_mul_overflow",
-        ]
-        with open(src, "w") as f:
-            f.write(".text\n")
-            for n in names:
-                f.write(f".globl {n}\n.type {n}, @function\n{n}:\n  jmp __rmc_overflow\n")
-        rc, _, err = run(["cc", "-c", src, "-o", stubs])
-        if rc != 0:
-            sys.exit(f"overflow stub assembly failed:\n{err.decode(errors='replace')}")
+    p = subprocess.run(["nm", "-u", obj], capture_output=True)
+    if p.returncode != 0:
+        sys.exit(f"nm failed on {obj}:\n{p.stderr.decode(errors='replace')}")
+    names = []
+    for line in p.stdout.decode(errors="replace").splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        if len(parts) >= 2 and parts[-2] == "U":
+            names.append(parts[-1])
+        elif len(parts) == 1:
+            names.append(parts[0])
+    return names
+
+
+def overflow_stubs(obj):
+    """Stubs for the panic symbols the reference object leaves undefined.
+
+    With overflow checks on, the reference calls the *mangled*
+    `core::panicking::panic_const::*_overflow`, whose name embeds the hash of
+    the particular libcore build and therefore changes with every toolchain.
+    Hard-coding the spelling (as this harness once did) makes the reference
+    link fail on any other nightly. Read the names off the object instead, and
+    define each as a jump to `__rmc_overflow` in the shared runtime, so the
+    stub traps exactly the way rmc's own checked arithmetic does regardless of
+    toolchain. The symbol set is not assumed: whatever `nm -u` reports is what
+    gets stubbed (`panic_bounds_check` and the other panic entries included).
+    Skip `arg_i64`/`print_i64` -- those come from the shared runtime.
+    """
+    stubs = os.path.join(OUT, f"overflow_stubs_{os.path.basename(obj)}.o")
+    src = os.path.join(OUT, f"overflow_stubs_{os.path.basename(obj)}.s")
+    names = [n for n in undefined_symbols(obj)
+             if "panic" in n or "overflow" in n]
+    with open(src, "w") as f:
+        f.write(".text\n")
+        for n in names:
+            f.write(f'.globl "{n}"\n.type "{n}", @function\n"{n}":\n  jmp __rmc_overflow\n')
+    rc, _, err = run(["cc", "-c", src, "-o", stubs])
+    if rc != 0:
+        sys.exit(f"overflow stub assembly failed:\n{err.decode(errors='replace')}")
     return stubs
 
 
@@ -131,7 +154,7 @@ def build_reference(name, rt):
         return None, f"rustc failed:\n{err.decode(errors='replace')}"
     link = ["cc", "-static", "-nostdlib", "-no-pie", obj, rt]
     if overflow_checks(name):
-        link.append(overflow_stubs(rt))
+        link.append(overflow_stubs(obj))
     link += ["-o", ref]
     rc, _, err = run(link)
     if rc != 0:

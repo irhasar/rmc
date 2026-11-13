@@ -7,9 +7,26 @@ assumed), where it stands against LLVM, and the ordered work to close the gap.
 Regenerate the numbers with:
 
 ```sh
-python3 bench/run_fair.py    # same source, both back ends
-python3 bench/run_mir.py     # three pipelines, separate sources
+# The backend links one exact nightly's `rustc_private`. The channel is pinned
+# in `backend/rust-toolchain.toml`, and every harness reads the pin from there,
+# so a fresh checkout needs only:
+rustup toolchain install "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' \
+    backend/rust-toolchain.toml)" \
+    --component rustc-dev --component llvm-tools --component rustc-codegen-cranelift
+cargo build --release --manifest-path compiler/Cargo.toml --example rmcmir
+./backend/build.sh
+
+python3 bench/run_fair.py     # same source, two back ends (rmc vs LLVM)
+python3 bench/run_codegen.py  # four pipelines, one source (adds cb and Cranelift)
+python3 bench/run_four.py     # the same four, via run_codegen's measurement code
+python3 bench/run_mir.py      # three pipelines, separate sources
 ```
+
+None of the harnesses hard-codes a mangled symbol name any more: the reference
+link's panic stubs are read from the object with `nm -u` (`tests/mir/run.py`,
+`bench/run_fair.py`) or generated for the probe crate's disambiguator
+(`bench/run_codegen.py`), so they keep working on a toolchain the author never
+ran.
 
 ## What the pipeline is today
 
