@@ -1304,6 +1304,19 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   read back as zero. It raises if a produced binary exits non-zero, which
   catches the classic "measured a nonexistent path" bug. `--markdown PATH` writes
   the dated result to a file; the current one lives at `bench/RESULTS.md`.
+- **Every harness reports RAM on every axis, console and markdown alike.** Both
+  the compile side (`rss`/`compile_rss`) and the run side (`run_rss`) are
+  columns in each of `run.py`, `run_codegen.py`, `run_fair.py`, `run_four.py` and
+  `run_mir.py`, and each is scored in the per-axis mean and the verdict table. Do
+  not drop one: the RAM axes are part of the "faster on every axis" claim, so a
+  table missing them understates the comparison. `run.py`'s console table
+  carries the same nine columns as the others (`wall_ms cpu_ms rss_kb size_b
+  run_ms run_cpu run_rss`) so the terminal view and the recorded markdown agree.
+- **A ratio must guard a zero denominator.** A run that exits between two `/proc`
+  reads reports peak RSS 0, and `rustc/rmc` on 0 would crash the harness. Each
+  harness divides through a guard (`run.py`'s `ratio()`, `run_codegen.py`'s
+  `speedup()`, `run_mir.py`'s `safe_div()`) that returns 0/None instead, and the
+  run axes below the sampler floor are left unmeasured rather than scored.
 - **Cranelift is the fair baseline for the "no LLVM" claim.** The headline
   opponent is `rustc` with LLVM, but LLVM is a far stronger optimiser than rmc
   has, so a run-time loss to it may only mean LLVM optimised harder, and a

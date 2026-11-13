@@ -1,6 +1,6 @@
 # Benchmark results: rmc vs rustc (LLVM) vs rustc (Cranelift)
 
-Recorded 2026-11-13 06:24 UTC on Linux-6.8.0-1055-gke-x86_64-with-glibc2.41.
+Recorded 2026-11-13 09:34 UTC on Linux-6.8.0-1055-gke-x86_64-with-glibc2.41.
 CPU: AMD EPYC 9B14.
 `rustc 1.99.1 (58cf8f9c3 2026-10-13)`.
 Cranelift backend: `rustc 1.102.0-nightly (3ef0c22cd 2026-11-11)`.
@@ -31,66 +31,66 @@ See the run section for why this matters.
 
 | program | compiler | wall (ms) | CPU (ms) | peak RSS (kB) | artifact (B) |
 | ------- | -------- | --------: | -------: | ------------: | -----------: |
-| hello | rmc | 2.06 | 1.94 | 3812 | 495 |
-| hello | rustc | 2055.33 | 2059.12 | 188496 | 289416 |
-| hello | cranelift | 54.31 | 59.84 | 88796 | 337328 |
-| hello | ratio (rustc/rmc) | 998.1 | 1059.8 | 49.4 | 584.7 |
-| hello | ratio (cranelift/rmc) | 26.4 | 30.8 | 23.3 | 681.5 |
-| fib | rmc | 2.17 | 2.02 | 3900 | 789 |
-| fib | rustc | 2142.07 | 2145.19 | 191596 | 291696 |
-| fib | cranelift | 67.36 | 74.72 | 105980 | 347280 |
-| fib | ratio (rustc/rmc) | 985.1 | 1064.1 | 49.1 | 369.7 |
-| fib | ratio (cranelift/rmc) | 31.0 | 37.1 | 27.2 | 440.2 |
-| mandel | rmc | 2.43 | 2.25 | 3936 | 1124 |
-| mandel | rustc | 2158.21 | 2161.38 | 192524 | 291776 |
-| mandel | cranelift | 66.79 | 74.36 | 106496 | 347376 |
-| mandel | ratio (rustc/rmc) | 888.5 | 961.0 | 48.9 | 259.6 |
-| mandel | ratio (cranelift/rmc) | 27.5 | 33.1 | 27.1 | 309.1 |
-| sieve | rmc | 2.26 | 2.12 | 3852 | 1041 |
-| sieve | rustc | 2138.68 | 2142.87 | 191028 | 292032 |
-| sieve | cranelift | 69.63 | 76.75 | 106328 | 347632 |
-| sieve | ratio (rustc/rmc) | 944.4 | 1009.4 | 49.6 | 280.5 |
-| sieve | ratio (cranelift/rmc) | 30.7 | 36.2 | 27.6 | 333.9 |
-| mix | rmc | 2.39 | 2.25 | 3920 | 1029 |
-| mix | rustc | 2090.84 | 2095.10 | 187356 | 291880 |
-| mix | cranelift | 68.00 | 75.05 | 106452 | 347720 |
-| mix | ratio (rustc/rmc) | 873.8 | 932.0 | 47.8 | 283.7 |
-| mix | ratio (cranelift/rmc) | 28.4 | 33.4 | 27.2 | 337.9 |
-| stats | rmc | 2.29 | 2.15 | 3880 | 1015 |
-| stats | rustc | 2127.10 | 2131.64 | 187136 | 292048 |
-| stats | cranelift | 68.12 | 75.59 | 107432 | 347872 |
-| stats | ratio (rustc/rmc) | 929.2 | 992.4 | 48.2 | 287.7 |
-| stats | ratio (cranelift/rmc) | 29.8 | 35.2 | 27.7 | 342.7 |
-| refs | rmc | 2.47 | 2.33 | 3864 | 1194 |
-| refs | rustc | 2130.16 | 2134.80 | 191600 | 292512 |
-| refs | cranelift | 69.13 | 76.35 | 108624 | 348256 |
-| refs | ratio (rustc/rmc) | 862.1 | 915.0 | 49.6 | 245.0 |
-| refs | ratio (cranelift/rmc) | 28.0 | 32.7 | 28.1 | 291.7 |
-| heap | rmc | 2.44 | 2.29 | 3944 | 1567 |
-| heap | rustc | 2123.08 | 2126.74 | 192844 | 292384 |
-| heap | cranelift | 69.87 | 77.27 | 109248 | 350696 |
-| heap | ratio (rustc/rmc) | 869.4 | 929.9 | 48.9 | 186.6 |
-| heap | ratio (cranelift/rmc) | 28.6 | 33.8 | 27.7 | 223.8 |
-| callrec | rmc | 2.14 | 2.02 | 3904 | 792 |
-| callrec | rustc | 2146.99 | 2150.57 | 187136 | 291680 |
-| callrec | cranelift | 66.68 | 73.72 | 106160 | 347280 |
-| callrec | ratio (rustc/rmc) | 1002.5 | 1062.5 | 47.9 | 368.3 |
-| callrec | ratio (cranelift/rmc) | 31.1 | 36.4 | 27.2 | 438.5 |
-| forloops | rmc | 2.22 | 2.10 | 3908 | 930 |
-| forloops | rustc | 2130.56 | 2132.09 | 192488 | 292480 |
-| forloops | cranelift | 70.24 | 77.17 | 108188 | 348264 |
-| forloops | ratio (rustc/rmc) | 959.7 | 1013.3 | 49.3 | 314.5 |
-| forloops | ratio (cranelift/rmc) | 31.6 | 36.7 | 27.7 | 374.5 |
-| light | rmc | 2.24 | 2.12 | 3892 | 1113 |
-| light | rustc | 2077.87 | 2082.34 | 187500 | 291904 |
-| light | cranelift | 67.94 | 75.34 | 107256 | 347648 |
-| light | ratio (rustc/rmc) | 926.5 | 984.1 | 48.2 | 262.3 |
-| light | ratio (cranelift/rmc) | 30.3 | 35.6 | 27.6 | 312.4 |
-| heavy | rmc | 2.24 | 2.09 | 3888 | 865 |
-| heavy | rustc | 2133.43 | 2135.75 | 187164 | 291792 |
-| heavy | cranelift | 67.89 | 75.37 | 106412 | 347344 |
-| heavy | ratio (rustc/rmc) | 953.8 | 1019.9 | 48.1 | 337.3 |
-| heavy | ratio (cranelift/rmc) | 30.4 | 36.0 | 27.4 | 401.6 |
+| hello | rmc | 2.02 | 1.89 | 3724 | 495 |
+| hello | rustc | 2041.48 | 2045.04 | 188388 | 289416 |
+| hello | cranelift | 54.62 | 60.46 | 88824 | 337328 |
+| hello | ratio (rustc/rmc) | 1011.0 | 1079.7 | 50.6 | 584.7 |
+| hello | ratio (cranelift/rmc) | 27.1 | 31.9 | 23.9 | 681.5 |
+| fib | rmc | 2.16 | 2.04 | 3860 | 789 |
+| fib | rustc | 2092.70 | 2096.16 | 188120 | 291696 |
+| fib | cranelift | 66.83 | 73.94 | 105900 | 347280 |
+| fib | ratio (rustc/rmc) | 969.6 | 1025.5 | 48.7 | 369.7 |
+| fib | ratio (cranelift/rmc) | 31.0 | 36.2 | 27.4 | 440.2 |
+| mandel | rmc | 2.29 | 2.17 | 3912 | 1124 |
+| mandel | rustc | 2091.47 | 2095.96 | 192136 | 291776 |
+| mandel | cranelift | 69.15 | 76.16 | 107020 | 347376 |
+| mandel | ratio (rustc/rmc) | 913.9 | 967.7 | 49.1 | 259.6 |
+| mandel | ratio (cranelift/rmc) | 30.2 | 35.2 | 27.4 | 309.1 |
+| sieve | rmc | 2.25 | 2.11 | 3856 | 1041 |
+| sieve | rustc | 2086.32 | 2090.91 | 187340 | 292032 |
+| sieve | cranelift | 66.96 | 74.47 | 106420 | 347632 |
+| sieve | ratio (rustc/rmc) | 926.5 | 990.0 | 48.6 | 280.5 |
+| sieve | ratio (cranelift/rmc) | 29.7 | 35.3 | 27.6 | 333.9 |
+| mix | rmc | 2.24 | 2.11 | 3928 | 1029 |
+| mix | rustc | 2104.39 | 2106.62 | 191136 | 291880 |
+| mix | cranelift | 68.24 | 75.41 | 106448 | 347720 |
+| mix | ratio (rustc/rmc) | 940.3 | 999.8 | 48.7 | 283.7 |
+| mix | ratio (cranelift/rmc) | 30.5 | 35.8 | 27.1 | 337.9 |
+| stats | rmc | 2.27 | 2.13 | 3876 | 1015 |
+| stats | rustc | 2109.39 | 2114.62 | 188004 | 292048 |
+| stats | cranelift | 68.79 | 75.57 | 107552 | 347872 |
+| stats | ratio (rustc/rmc) | 928.7 | 994.6 | 48.5 | 287.7 |
+| stats | ratio (cranelift/rmc) | 30.3 | 35.5 | 27.7 | 342.7 |
+| refs | rmc | 2.56 | 2.40 | 3904 | 1194 |
+| refs | rustc | 2121.38 | 2125.46 | 193624 | 292512 |
+| refs | cranelift | 69.86 | 77.43 | 108656 | 348256 |
+| refs | ratio (rustc/rmc) | 828.2 | 885.6 | 49.6 | 245.0 |
+| refs | ratio (cranelift/rmc) | 27.3 | 32.3 | 27.8 | 291.7 |
+| heap | rmc | 2.40 | 2.26 | 3948 | 1567 |
+| heap | rustc | 2100.37 | 2105.32 | 189800 | 292384 |
+| heap | cranelift | 70.84 | 77.70 | 109300 | 350696 |
+| heap | ratio (rustc/rmc) | 876.8 | 930.7 | 48.1 | 186.6 |
+| heap | ratio (cranelift/rmc) | 29.6 | 34.4 | 27.7 | 223.8 |
+| callrec | rmc | 2.17 | 2.04 | 3920 | 792 |
+| callrec | rustc | 2087.65 | 2091.87 | 187360 | 291680 |
+| callrec | cranelift | 69.58 | 76.47 | 106100 | 347280 |
+| callrec | ratio (rustc/rmc) | 963.4 | 1024.4 | 47.8 | 368.3 |
+| callrec | ratio (cranelift/rmc) | 32.1 | 37.5 | 27.1 | 438.5 |
+| forloops | rmc | 2.96 | 2.81 | 3912 | 930 |
+| forloops | rustc | 2102.07 | 2106.67 | 187740 | 292480 |
+| forloops | cranelift | 70.93 | 78.49 | 108400 | 348264 |
+| forloops | ratio (rustc/rmc) | 710.9 | 750.0 | 48.0 | 314.5 |
+| forloops | ratio (cranelift/rmc) | 24.0 | 27.9 | 27.7 | 374.5 |
+| light | rmc | 2.30 | 2.16 | 3856 | 1113 |
+| light | rustc | 2120.34 | 2124.47 | 188092 | 291904 |
+| light | cranelift | 67.97 | 75.73 | 107256 | 347648 |
+| light | ratio (rustc/rmc) | 920.3 | 983.6 | 48.8 | 262.3 |
+| light | ratio (cranelift/rmc) | 29.5 | 35.1 | 27.8 | 312.4 |
+| heavy | rmc | 2.17 | 2.05 | 3828 | 865 |
+| heavy | rustc | 2103.87 | 2108.44 | 187996 | 291792 |
+| heavy | cranelift | 67.45 | 74.38 | 106884 | 347344 |
+| heavy | ratio (rustc/rmc) | 968.2 | 1029.5 | 49.1 | 337.3 |
+| heavy | ratio (cranelift/rmc) | 31.0 | 36.3 | 27.9 | 401.6 |
 
 ## Artifact size against each rustc build
 
@@ -119,66 +119,66 @@ fat-LTO stripped build quoted in the headline table.
 
 | program | compiler | wall (ms) | CPU (ms) | peak RSS (kB) |
 | ------- | -------- | --------: | -------: | ------------: |
-| hello | rmc | 0.23 | 0.12 | 24 |
-| hello | rustc | 0.81 | 0.70 | 2064 |
-| hello | cranelift | 0.83 | 0.71 | 2232 |
-| hello | ratio (rustc/rmc) | 3.53 | 5.85 | 86.00 |
-| hello | ratio (cranelift/rmc) | 3.62 | 5.94 | 93.00 |
-| fib | rmc | 6.79 | 6.63 | 24 |
-| fib | rustc | 7.12 | 6.98 | 2108 |
-| fib | cranelift | 17.22 | 17.07 | 2244 |
-| fib | ratio (rustc/rmc) | 1.05 | 1.05 | 87.83 |
-| fib | ratio (cranelift/rmc) | 2.54 | 2.57 | 93.50 |
-| mandel | rmc | 95.77 | 95.53 | 24 |
-| mandel | rustc | 105.22 | 104.99 | 2088 |
-| mandel | cranelift | 110.17 | 109.95 | 2244 |
-| mandel | ratio (rustc/rmc) | 1.10 | 1.10 | 87.00 |
-| mandel | ratio (cranelift/rmc) | 1.15 | 1.15 | 93.50 |
-| sieve | rmc | 1.64 | 1.53 | 1584 |
-| sieve | rustc | 2.41 | 2.29 | 3676 |
-| sieve | cranelift | 2.65 | 2.54 | 3800 |
-| sieve | ratio (rustc/rmc) | 1.47 | 1.50 | 2.32 |
-| sieve | ratio (cranelift/rmc) | 1.62 | 1.66 | 2.40 |
-| mix | rmc | 14.74 | 14.58 | 24 |
-| mix | rustc | 15.52 | 15.36 | 2112 |
-| mix | cranelift | 17.71 | 17.55 | 2240 |
-| mix | ratio (rustc/rmc) | 1.05 | 1.05 | 88.00 |
-| mix | ratio (cranelift/rmc) | 1.20 | 1.20 | 93.33 |
-| stats | rmc | 3.47 | 3.34 | 24 |
-| stats | rustc | 3.78 | 3.63 | 2068 |
-| stats | cranelift | 4.47 | 4.32 | 2228 |
-| stats | ratio (rustc/rmc) | 1.09 | 1.09 | 86.17 |
-| stats | ratio (cranelift/rmc) | 1.29 | 1.29 | 92.83 |
-| refs | rmc | 3.27 | 3.12 | 24 |
-| refs | rustc | 5.50 | 5.37 | 2116 |
-| refs | cranelift | 6.87 | 6.73 | 2188 |
-| refs | ratio (rustc/rmc) | 1.68 | 1.72 | 88.17 |
-| refs | ratio (cranelift/rmc) | 2.10 | 2.15 | 91.17 |
-| heap | rmc | 3.22 | 3.09 | 4712 |
-| heap | rustc | 3.34 | 3.20 | 6716 |
-| heap | cranelift | 3.42 | 3.29 | 6852 |
-| heap | ratio (rustc/rmc) | 1.04 | 1.04 | 1.43 |
-| heap | ratio (cranelift/rmc) | 1.06 | 1.06 | 1.45 |
-| callrec | rmc | 2.77 | 2.64 | 24 |
-| callrec | rustc | 2.83 | 2.69 | 2116 |
-| callrec | cranelift | 7.16 | 7.01 | 2240 |
-| callrec | ratio (rustc/rmc) | 1.02 | 1.02 | 88.17 |
-| callrec | ratio (cranelift/rmc) | 2.59 | 2.65 | 93.33 |
-| forloops | rmc | 2.08 | 1.96 | 24 |
-| forloops | rustc | 3.32 | 3.19 | 2044 |
-| forloops | cranelift | 3.99 | 3.86 | 2212 |
-| forloops | ratio (rustc/rmc) | 1.59 | 1.63 | 85.17 |
-| forloops | ratio (cranelift/rmc) | 1.92 | 1.97 | 92.17 |
-| light | rmc | 2.13 | 2.01 | 24 |
-| light | rustc | 2.62 | 2.50 | 2068 |
-| light | cranelift | 3.72 | 3.58 | 2224 |
-| light | ratio (rustc/rmc) | 1.23 | 1.25 | 86.17 |
-| light | ratio (cranelift/rmc) | 1.75 | 1.79 | 92.67 |
-| heavy | rmc | 606.02 | 605.82 | 24 |
-| heavy | rustc | 1031.99 | 1031.71 | 2104 |
-| heavy | cranelift | 1065.56 | 1065.28 | 2240 |
-| heavy | ratio (rustc/rmc) | 1.70 | 1.70 | 87.67 |
-| heavy | ratio (cranelift/rmc) | 1.76 | 1.76 | 93.33 |
+| hello | rmc | 0.23 | 0.12 | 28 |
+| hello | rustc | 0.82 | 0.71 | 2104 |
+| hello | cranelift | 0.83 | 0.72 | 2236 |
+| hello | ratio (rustc/rmc) | 3.52 | 5.85 | 75.14 |
+| hello | ratio (cranelift/rmc) | 3.55 | 5.93 | 79.86 |
+| fib | rmc | 6.73 | 6.59 | 28 |
+| fib | rustc | 7.11 | 6.98 | 2056 |
+| fib | cranelift | 17.18 | 17.04 | 2244 |
+| fib | ratio (rustc/rmc) | 1.06 | 1.06 | 73.43 |
+| fib | ratio (cranelift/rmc) | 2.55 | 2.59 | 80.14 |
+| mandel | rmc | 95.66 | 95.43 | 28 |
+| mandel | rustc | 105.15 | 104.96 | 2036 |
+| mandel | cranelift | 110.22 | 110.02 | 2240 |
+| mandel | ratio (rustc/rmc) | 1.10 | 1.10 | 72.71 |
+| mandel | ratio (cranelift/rmc) | 1.15 | 1.15 | 80.00 |
+| sieve | rmc | 1.62 | 1.51 | 1588 |
+| sieve | rustc | 2.36 | 2.24 | 3668 |
+| sieve | cranelift | 2.62 | 2.49 | 3816 |
+| sieve | ratio (rustc/rmc) | 1.45 | 1.49 | 2.31 |
+| sieve | ratio (cranelift/rmc) | 1.61 | 1.65 | 2.40 |
+| mix | rmc | 14.72 | 14.56 | 28 |
+| mix | rustc | 15.50 | 15.35 | 2108 |
+| mix | cranelift | 17.68 | 17.50 | 2228 |
+| mix | ratio (rustc/rmc) | 1.05 | 1.05 | 75.29 |
+| mix | ratio (cranelift/rmc) | 1.20 | 1.20 | 79.57 |
+| stats | rmc | 3.46 | 3.33 | 28 |
+| stats | rustc | 3.73 | 3.59 | 2096 |
+| stats | cranelift | 4.45 | 4.33 | 2240 |
+| stats | ratio (rustc/rmc) | 1.08 | 1.08 | 74.86 |
+| stats | ratio (cranelift/rmc) | 1.29 | 1.30 | 80.00 |
+| refs | rmc | 3.25 | 3.12 | 28 |
+| refs | rustc | 5.50 | 5.37 | 2108 |
+| refs | cranelift | 6.89 | 6.76 | 2196 |
+| refs | ratio (rustc/rmc) | 1.69 | 1.72 | 75.29 |
+| refs | ratio (cranelift/rmc) | 2.12 | 2.16 | 78.43 |
+| heap | rmc | 3.23 | 3.10 | 4716 |
+| heap | rustc | 3.33 | 3.20 | 6720 |
+| heap | cranelift | 3.43 | 3.31 | 6856 |
+| heap | ratio (rustc/rmc) | 1.03 | 1.03 | 1.42 |
+| heap | ratio (cranelift/rmc) | 1.06 | 1.07 | 1.45 |
+| callrec | rmc | 2.74 | 2.62 | 28 |
+| callrec | rustc | 2.84 | 2.71 | 2112 |
+| callrec | cranelift | 7.09 | 6.94 | 2236 |
+| callrec | ratio (rustc/rmc) | 1.04 | 1.04 | 75.43 |
+| callrec | ratio (cranelift/rmc) | 2.58 | 2.65 | 79.86 |
+| forloops | rmc | 2.07 | 1.95 | 28 |
+| forloops | rustc | 3.31 | 3.19 | 2112 |
+| forloops | cranelift | 3.99 | 3.87 | 2236 |
+| forloops | ratio (rustc/rmc) | 1.60 | 1.64 | 75.43 |
+| forloops | ratio (cranelift/rmc) | 1.93 | 1.98 | 79.86 |
+| light | rmc | 2.09 | 1.97 | 28 |
+| light | rustc | 2.62 | 2.51 | 2120 |
+| light | cranelift | 3.74 | 3.61 | 2236 |
+| light | ratio (rustc/rmc) | 1.25 | 1.27 | 75.71 |
+| light | ratio (cranelift/rmc) | 1.79 | 1.84 | 79.86 |
+| heavy | rmc | 605.75 | 605.39 | 28 |
+| heavy | rustc | 1032.46 | 1032.09 | 2080 |
+| heavy | cranelift | 1069.74 | 1069.47 | 2232 |
+| heavy | ratio (rustc/rmc) | 1.70 | 1.70 | 74.29 |
+| heavy | ratio (cranelift/rmc) | 1.77 | 1.77 | 79.71 |
 
 Ratios are the other compiler divided by rmc, so a value above 1 means
 rmc is better on that dimension. Both the LLVM and the Cranelift ratios
@@ -246,12 +246,12 @@ Mean ratio per axis, rustc divided by rmc (> 1 means rmc better):
 
 | axis | mean rustc/rmc | verdict |
 | ---- | -------------: | ------- |
-| compile_wall | 932.76 | win |
-| compile_cpu | 995.29 | win |
-| compile_rss | 48.76 | win |
+| compile_wall | 913.15 | win |
+| compile_cpu | 971.77 | win |
+| compile_rss | 48.79 | win |
 | size | 314.99 | win |
 | run_wall | 1.46 | win |
 | run_cpu | 1.67 | win |
-| run_rss | 72.84 | win |
+| run_rss | 62.61 | win |
 
 Every axis is a win.

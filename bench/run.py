@@ -169,6 +169,16 @@ def median(xs):
     return statistics.median(xs)
 
 
+def ratio(better_den, worse_num):
+    """`worse_num / better_den`, or 0 when the denominator could not be sampled.
+
+    A program that exits between two `/proc` reads reports a peak RSS of 0;
+    dividing by it would crash the harness, so report 0 (an obvious "no ratio")
+    rather than a fabricated one. The other harnesses guard the same way.
+    """
+    return worse_num / better_den if better_den else 0.0
+
+
 _cranelift_rustc = None
 
 
@@ -365,21 +375,27 @@ def collect():
 
 
 def print_table(rows, kinds):
-    hdr = f"{'program':<8} {'compiler':<10} {'wall_ms':>9} {'cpu_ms':>9} {'rss_kb':>9} {'size_b':>9} {'run_ms':>9}"
+    hdr = (f"{'program':<8} {'compiler':<10} {'wall_ms':>9} {'cpu_ms':>9} "
+           f"{'rss_kb':>9} {'size_b':>9} {'run_ms':>9} {'run_cpu':>9} "
+           f"{'run_rss':>9}")
     print(hdr)
     print("-" * len(hdr))
     for p, res in rows:
         for kind in kinds:
             r = res[kind]
             print(f"{p:<8} {kind:<10} {r['wall']*1000:9.2f} {r['cpu']*1000:9.2f} "
-                  f"{r['rss']:9.0f} {r['size']:9.0f} {r['run']['wall']*1000:9.2f}")
+                  f"{r['rss']:9.0f} {r['size']:9.0f} "
+                  f"{r['run']['wall']*1000:9.2f} "
+                  f"{r['run']['cpu']*1000:9.2f} {r['run']['rss']:9.0f}")
         # Ratios are always against rmc: >1 means rmc is better. rustc (LLVM) is
         # the headline opponent; cranelift is the fair no-LLVM baseline.
         for kind in [k for k in kinds if k != "rmc"]:
             n, c = res["rmc"], res[kind]
             print(f"{'':8} {kind+'/rmc':<10} {c['wall']/n['wall']:9.1f} {c['cpu']/n['cpu']:9.1f} "
-                  f"{c['rss']/n['rss']:9.1f} {c['size']/n['size']:9.1f} "
-                  f"{c['run']['wall']/n['run']['wall']:9.2f}")
+                  f"{ratio(n['rss'], c['rss']):9.1f} {c['size']/n['size']:9.1f} "
+                  f"{c['run']['wall']/n['run']['wall']:9.2f} "
+                  f"{c['run']['cpu']/n['run']['cpu']:9.2f} "
+                  f"{ratio(n['run']['rss'], c['run']['rss']):9.2f}")
 
 
 # The seven axes `run.py` scores, as (label, extractor) over a program's result.
@@ -387,11 +403,11 @@ def print_table(rows, kinds):
 AXES = (
     ("compile_wall", lambda n, c: c["wall"] / n["wall"]),
     ("compile_cpu", lambda n, c: c["cpu"] / n["cpu"]),
-    ("compile_rss", lambda n, c: c["rss"] / n["rss"]),
+    ("compile_rss", lambda n, c: ratio(n["rss"], c["rss"])),
     ("size", lambda n, c: c["size"] / n["size"]),
     ("run_wall", lambda n, c: c["run"]["wall"] / n["run"]["wall"]),
     ("run_cpu", lambda n, c: c["run"]["cpu"] / n["run"]["cpu"]),
-    ("run_rss", lambda n, c: c["run"]["rss"] / n["run"]["rss"]),
+    ("run_rss", lambda n, c: ratio(n["run"]["rss"], c["run"]["rss"])),
 )
 
 
@@ -482,7 +498,7 @@ def write_markdown(path, rows, note, kinds):
         for kind in [k for k in kinds if k != "rmc"]:
             n, c = res["rmc"], res[kind]
             lines.append(f"| {p} | ratio ({kind}/rmc) | {c['wall']/n['wall']:.1f} | {c['cpu']/n['cpu']:.1f} | "
-                         f"{c['rss']/n['rss']:.1f} | {c['size']/n['size']:.1f} |")
+                         f"{ratio(n['rss'], c['rss']):.1f} | {c['size']/n['size']:.1f} |")
     lines.append("")
     lines.append("## Artifact size against each rustc build")
     lines.append("")
@@ -519,7 +535,7 @@ def write_markdown(path, rows, note, kinds):
         for kind in [k for k in kinds if k != "rmc"]:
             n, c = res["rmc"]["run"], res[kind]["run"]
             lines.append(f"| {p} | ratio ({kind}/rmc) | {c['wall']/n['wall']:.2f} | {c['cpu']/n['cpu']:.2f} | "
-                         f"{c['rss']/n['rss']:.2f} |")
+                         f"{ratio(n['rss'], c['rss']):.2f} |")
     lines.append("")
     lines.append("Ratios are the other compiler divided by rmc, so a value above 1 means")
     lines.append("rmc is better on that dimension. Both the LLVM and the Cranelift ratios")
