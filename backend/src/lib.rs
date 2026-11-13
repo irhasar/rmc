@@ -158,10 +158,25 @@ impl CodegenBackend for RmcBackend {
         if let Err(e) = rendered {
             tcx.dcx().fatal(format!("rmc: could not render MIR: {e}"));
         }
-        // A codegen backend renders MIR as an implementation detail rather
-        // than for the user, so clear the "must produce a diagnostic" guard
-        // rustc arms around path-decorating output; otherwise `DiagCtxt`
-        // teardown panics.
+        // A codegen backend renders MIR as an implementation detail rather than
+        // for the user, so rustc arms a "must produce a diagnostic" guard when
+        // the printer touches `trimmed_def_paths`, and `DiagCtxt` teardown
+        // panics if that guard is still armed. `with_no_trimmed_paths!` above
+        // suppresses the *query*, but `write_mir_pretty` can still reach it
+        // through a path the wrappers do not cover, so clear the guard before
+        // it can fire. The guard is only about diagnostics the backend never
+        // emits, but `reset_err_count` also drops any *real* error, and a
+        // backend must never swallow one: assert the count is 0 first, so a
+        // genuine error reaching codegen aborts loudly instead of silently
+        // clearing it. (`codegen_crate` only runs after type checking passed,
+        // so a non-zero count here would itself be a rustc bug.)
+        assert_eq!(
+            tcx.dcx().err_count(),
+            0,
+            "rmc codegen backend reached codegen with {} diagnostics already \
+             emitted; refusing to reset the error count and hide them",
+            tcx.dcx().err_count()
+        );
         tcx.dcx().reset_err_count();
         if let Some(path) = std::env::var_os("RMC_DUMP_MIR") {
             let _ = std::fs::write(&path, &mir_bytes);

@@ -72,6 +72,34 @@ def have_prereqs():
     return True
 
 
+# A program the type checker rejects. `codegen_crate` clears the diagnostic
+# error count to disarm a rustc guard, so this proves the backend does not also
+# swallow a *real* error: the compile must fail, print the diagnostic, and
+# produce no binary. Without the guard in `backend/src/lib.rs` (or with the
+# count reset unconditionally) a genuine error would be silently dropped.
+BAD_SRC = "fn main() { let _x: i32 = \"not an int\"; }\n"
+
+
+def check_error_path():
+    """A source with a real error must fail loudly through the backend."""
+    bad = os.path.join(OUT, "bad.rs")
+    out = os.path.join(OUT, "bad.bin")
+    with open(bad, "w") as f:
+        f.write(BAD_SRC)
+    p = subprocess.run(CB + [bad, "-o", out], capture_output=True)
+    err = p.stderr.decode(errors="replace")
+    if p.returncode == 0:
+        print("FAIL error-path: the backend compiled a program with a type error")
+        return 1
+    if os.path.exists(out):
+        print("FAIL error-path: the backend wrote a binary for a rejected program")
+        return 1
+    if "E0308" not in err or "mismatched types" not in err:
+        print(f"FAIL error-path: the diagnostic was swallowed:\n{err}")
+        return 1
+    return 0
+
+
 def main():
     verbose = "-v" in sys.argv[1:]
     if not have_prereqs():
@@ -83,7 +111,9 @@ def main():
         print("no cases in tests/cb/")
         return 1
 
-    failures = 0
+    failures = check_error_path()
+    if failures == 0 and verbose:
+        print("ok   error-path")
     for name in names:
         src = os.path.join(ROOT, f"{name}.rs")
         ref = os.path.join(OUT, f"{name}.rust")
