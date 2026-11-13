@@ -129,6 +129,22 @@ def md_detail(rows):
     return lines
 
 
+def cpu_model():
+    """The CPU model from `/proc/cpuinfo`.
+
+    `platform.processor()` is empty on Linux, which recorded `CPU: unknown` in
+    `bench/RESULTS-4WAY.md`; every other harness reads `/proc/cpuinfo` directly.
+    """
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return platform.processor() or "unknown"
+
+
 def write_markdown(rows, verdicts, path):
     def ver(cmd):
         return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
@@ -138,7 +154,7 @@ def write_markdown(rows, verdicts, path):
         "",
         f"Recorded {datetime.datetime.now(datetime.timezone.utc):%Y-%m-%d %H:%M} UTC "
         f"on {platform.platform()}.",
-        f"CPU: {platform.processor() or 'unknown'}.",
+        f"CPU: {cpu_model()}.",
         f"`{rustc_v}`.",
         "",
         "Regenerate with `python3 bench/run_four.py`.",

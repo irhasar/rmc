@@ -2740,6 +2740,58 @@ lto=fat` per program.
   ~1.4 MB cost of loading a codegen backend at all -- not rmc's codegen. The
   mean RSS is a tie (1.01); do not chase the per-program flag.
 
+### The harnesses must not hard-code mangled names, and the toolchain is pinned
+
+The differential and benchmark harnesses once hard-coded v0-mangled panic
+symbols with the crate hash of one libcore build:
+
+```
+_RNvNtNtCskADBYZwJmSU_4core9panicking11panic_const24panic_const_add_overflow
+_RNvNtCskADBYZwJmSU_4core9panicking18panic_bounds_check
+```
+
+The hash is not stable across toolchains, so on any other build the reference
+link failed with `undefined reference to ...panic_bounds_check` and the
+harness aborted or reported a false failure (reproduced on stable 1.97 and on
+`nightly-2026-11-12`, the channel this branch uses).
+
+- **Read the undefined symbols off the object.** `tests/mir/run.py`
+  (`flow_checks` cases) and `bench/run_fair.py` now run `nm -u` on the
+  reference object and stub exactly the `panic`/`overflow` names it reports,
+  rather than a literal list. The stub set then adapts to whatever codegen
+  emits. `nm` prints an undefined name either as a `U`-typed three-column line
+  or as a bare name, so match both forms.
+- **Pin the toolchain for the backend, not the repo.** `backend/rust-toolchain.toml`
+  pins the exact nightly plus `rustc-dev`, `llvm-tools` and
+  `rustc-codegen-cranelift`. It is scoped to `backend/` on purpose: a root pin
+  would force the AST/MIR prototype suites and CI's stable `test` job onto
+  nightly. rustup resolves the nearest pin from the *working directory*, so
+  `backend/build.sh` cds into `backend/` first, and `backend/rmc-rustc` passes
+  the channel explicitly (`rustc +"$channel"`) since it may be run from
+  anywhere. Every harness reads the channel back out of the TOML
+  (`backend/rust-toolchain.toml`) instead of writing `+nightly`, so the pin is
+  the single source of truth and the backend dylib is always loaded by the
+  toolchain it was built against.
+- **The harness creates its own directories.** `bench/run_codegen.py::build_runtime`
+  does `os.makedirs(OUT, exist_ok=True)` because `bench/run_four.py` calls it
+  directly and only creates its own `/tmp/rmcfour`; a fresh machine previously
+  hit `FileNotFoundError` for `/tmp/rmccodegen`.
+- **CI proves it on a fresh machine.** The `bench` job installs only the pinned
+  toolchain (channel read from the TOML) plus binutils, builds, and runs both
+  harnesses from empty output directories. A hard-coded mangling only breaks on
+  a toolchain the author did not use, so a fresh-machine job is the only way to
+  gate it.
+
+### A codegen backend must not swallow a real diagnostic
+
+`codegen_crate` calls `tcx.dcx().reset_err_count()` to disarm the "must produce
+a diagnostic" guard rustc arms around MIR printing, but `reset_err_count` also
+discards any *real* error. Assert the count is 0 first, so a genuine error
+reaching codegen aborts instead of being silently cleared (`codegen_crate` only
+runs after type checking passed, so a non-zero count there is itself a rustc
+bug). `tests/cb/run.py` pins it: a program with a type error must exit non-zero
+through `rmc-rustc`, print the `E0308` diagnostic, and write no binary.
+
 ### An unsupported construct must exit 1, never panic
 
 Three separate panics on *expected* input were found and fixed (P1):
