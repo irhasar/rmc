@@ -9,3 +9,6 @@ compiler/c.err
 
 # rustc codegen-backend build artifacts
 backend/target/
+
+# rustc incremental-compilation directories (never commit build outputs)
+/off/
