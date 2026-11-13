@@ -1299,6 +1299,11 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   read back as zero. It raises if a produced binary exits non-zero, which
   catches the classic "measured a nonexistent path" bug. `--markdown PATH` writes
   the dated result to a file; the current one lives at `bench/RESULTS.md`.
+- **Every table reports RAM, on both sides of the comparison.** The console
+  table (`print_table`) carries compile `rss_kb` and run `run_rss_kb` (with
+  `run_cpu_ms`), and both markdown tables carry `peak RSS (kB)`; do not drop a
+  RAM column when editing the printer, or the headline claim ("lower RAM") loses
+  its evidence in the terminal even though `RESULTS.md` still has it.
 - **Cranelift is the fair baseline for the "no LLVM" claim.** The headline
   opponent is `rustc` with LLVM, but LLVM is a far stronger optimiser than rmc
   has, so a run-time loss to it may only mean LLVM optimised harder, and a

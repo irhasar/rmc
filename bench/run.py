@@ -327,21 +327,31 @@ def collect():
 
 
 def print_table(rows, kinds):
-    hdr = f"{'program':<8} {'compiler':<10} {'wall_ms':>9} {'cpu_ms':>9} {'rss_kb':>9} {'size_b':>9} {'run_ms':>9}"
+    # One line per compiler per program, with both halves of the comparison:
+    # compile wall/CPU/RAM/size, then run wall/CPU/RAM. The run-time RAM column
+    # matters as much as the compile-time one (a rustc binary floors at the
+    # libc/ld.so footprint), so it is reported here too, not only in the
+    # markdown.
+    hdr = (f"{'program':<8} {'compiler':<10} {'wall_ms':>9} {'cpu_ms':>9} "
+           f"{'rss_kb':>9} {'size_b':>9} {'run_ms':>9} {'run_cpu_ms':>11} "
+           f"{'run_rss_kb':>11}")
     print(hdr)
     print("-" * len(hdr))
     for p, res in rows:
         for kind in kinds:
             r = res[kind]
             print(f"{p:<8} {kind:<10} {r['wall']*1000:9.2f} {r['cpu']*1000:9.2f} "
-                  f"{r['rss']:9.0f} {r['size']:9.0f} {r['run']['wall']*1000:9.2f}")
+                  f"{r['rss']:9.0f} {r['size']:9.0f} {r['run']['wall']*1000:9.2f} "
+                  f"{r['run']['cpu']*1000:11.2f} {r['run']['rss']:11.0f}")
         # Ratios are always against rmc: >1 means rmc is better. rustc (LLVM) is
         # the headline opponent; cranelift is the fair no-LLVM baseline.
         for kind in [k for k in kinds if k != "rmc"]:
             n, c = res["rmc"], res[kind]
             print(f"{'':8} {kind+'/rmc':<10} {c['wall']/n['wall']:9.1f} {c['cpu']/n['cpu']:9.1f} "
                   f"{c['rss']/n['rss']:9.1f} {c['size']/n['size']:9.1f} "
-                  f"{c['run']['wall']/n['run']['wall']:9.2f}")
+                  f"{c['run']['wall']/n['run']['wall']:9.2f} "
+                  f"{c['run']['cpu']/n['run']['cpu']:11.2f} "
+                  f"{c['run']['rss']/n['run']['rss']:11.2f}")
 
 
 def write_markdown(path, rows, note, kinds):
