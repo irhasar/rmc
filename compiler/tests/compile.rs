@@ -3766,9 +3766,12 @@ fn a_very_long_operator_chain_is_an_error_not_a_crash() {
 #[test]
 fn nesting_below_the_limit_still_compiles() {
     // 30 parens (2 depth each) plus a 30-long `+` chain is ~90, under the 100
-    // limit, so this must still compile.
+    // limit, so this must still compile. Like the two depth-limit tests above,
+    // it drives the parser near its limit, so it needs the large stack: a debug
+    // parser costs about 10 KiB per level, which the default test thread cannot
+    // hold.
     let src = format!("fn main() -> i64 {{ return {}1{} + {}; }}", "(".repeat(30), ")".repeat(30), "1+".repeat(30) + "1");
-    assert!(compile_to_asm(&src, &CompileOptions::default()).is_ok());
+    assert!(with_big_stack(move || compile_to_asm(&src, &CompileOptions::default()).is_ok()));
 }
 
 #[test]
