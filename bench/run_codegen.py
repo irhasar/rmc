@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Compare three pipelines on the same source: the true `-Zcodegen-backend`,
-the printed-MIR prototype, and LLVM.
+"""Compare four pipelines on the same source: the true `-Zcodegen-backend`,
+the printed-MIR prototype, LLVM, and rustc's Cranelift back end.
 
   * ``cb``   -- ``rustc +nightly -Zcodegen-backend=libr... .so src -o bin``.
                 One rustc process; rmc lowers the MIR in-process and writes
@@ -9,14 +9,18 @@ the printed-MIR prototype, and LLVM.
                 prototype: same back end, but the interface is printed MIR.
   * ``llvm`` -- ``rustc --emit=obj -O -C lto=fat`` then ``ld -s``. The
                 reference the whole experiment is against.
+  * ``cl``   -- ``rustc -Zcodegen-backend=cranelift --emit=obj -O`` then
+                ``ld -s``. rustc's other non-LLVM back end, and the closest
+                like-for-like rival: it has no LTO, so that one flag is the
+                only difference from the ``llvm`` row.
 
-All three use the *same* nightly front end, so a compile difference is the
+All four use the *same* nightly front end, so a compile difference is the
 back end and the interface, not the parser. ``cb`` and ``mir`` link the same
-freestanding runtime; ``llvm`` links it too (plus trap stubs for the panic
-entry points rmc lowers to its own traps), so run-time numbers compare the
-same program.
+freestanding runtime; ``llvm`` and ``cl`` link it too (plus trap stubs for the
+panic entry points rmc lowers to its own traps), so run-time numbers compare
+the same program.
 
-Fairness rules, the same as ``run_fair.py``: both back ends must produce the
+Fairness rules, the same as ``run_fair.py``: every back end must produce the
 same stdout and exit status, and every stage is sampled round-robin so thermal
 drift cannot favour whichever ran first.
 
@@ -60,8 +64,23 @@ RUSTC_OBJ = RUSTC + ["--emit=obj", "-O", "-C", "opt-level=3", "-C", "lto=fat",
 CB = RUSTC + ["-Zcodegen-backend=" + CBSO, "--edition", "2021",
               "-C", "panic=abort", "-C", "opt-level=3",
               "--crate-type=bin", "-Awarnings"]
+# rustc's Cranelift back end: the other non-LLVM codegen path in the toolchain,
+# and the closest like-for-like rival to rmc. Cranelift does not implement LTO
+# (`-C lto=fat` is rejected outright), so this row keeps every other setting the
+# same but omits LTO; that gap is a property of the back end, not a choice made
+# here. It emits an object that is linked the same way the LLVM row's is.
+CL = RUSTC + ["-Zcodegen-backend=cranelift", "--emit=obj", "-O",
+              "-C", "opt-level=3", "-C", "codegen-units=1", "-C", "panic=abort",
+              "--edition", "2021", "-Awarnings"]
 
 NOISE_BAND = 0.02
+
+# A whole program can finish inside the sampler's resolution. `refs` is folded
+# to a closed form by every optimising back end, so its run is fork+exec, and
+# `hello` is barely longer; comparing wall/CPU there measures process start-up,
+# not the code under test. Runs below this floor are reported as unmeasured
+# rather than as a ratio, so noise cannot show up as a fabricated loss.
+RUN_FLOOR = 1e-3
 
 PANIC_SYMS = [
     "core::panicking::panic_bounds_check",
@@ -241,6 +260,8 @@ def pipeline_stages(name, runtime_obj, stub_obj):
     mir_bin = os.path.join(OUT, f"{name}.mir.bin")
     obj = os.path.join(OUT, f"{name}.llvm.o")
     llvm_bin = os.path.join(OUT, f"{name}.llvm.bin")
+    cl_obj = os.path.join(OUT, f"{name}.cl.o")
+    cl_bin = os.path.join(OUT, f"{name}.cl.bin")
     stages = [
         # Single process: rustc drives rmc's backend, which writes the ELF.
         ("cb", CB + [src, "-o", cb_bin]),
@@ -249,12 +270,15 @@ def pipeline_stages(name, runtime_obj, stub_obj):
         ("llvm.front", RUSTC_OBJ + [src, "-o", obj]),
         ("llvm.back", ["ld", "-s", "-o", llvm_bin, "-e", "_start", obj,
                        runtime_obj, stub_obj]),
+        ("cl.front", CL + [src, "-o", cl_obj]),
+        ("cl.back", ["ld", "-s", "-o", cl_bin, "-e", "_start", cl_obj,
+                     runtime_obj, stub_obj]),
     ]
-    return stages, cb_bin, mir_bin, llvm_bin
+    return stages, cb_bin, mir_bin, llvm_bin, cl_bin
 
 
 def measure_program(name, runtime_obj, stub_obj, reps=9):
-    stages, cb_bin, mir_bin, llvm_bin = pipeline_stages(
+    stages, cb_bin, mir_bin, llvm_bin, cl_bin = pipeline_stages(
         name, runtime_obj, stub_obj)
     r = measure_stages(stages, reps)
     return {
@@ -268,6 +292,10 @@ def measure_program(name, runtime_obj, stub_obj, reps=9):
                  "cpu": r["llvm.front"]["cpu"] + r["llvm.back"]["cpu"],
                  "rss": max(r["llvm.front"]["rss"], r["llvm.back"]["rss"]),
                  "size": os.path.getsize(llvm_bin)},
+        "cl": {"wall": r["cl.front"]["wall"] + r["cl.back"]["wall"],
+               "cpu": r["cl.front"]["cpu"] + r["cl.back"]["cpu"],
+               "rss": max(r["cl.front"]["rss"], r["cl.back"]["rss"]),
+               "size": os.path.getsize(cl_bin)},
     }
 
 
@@ -323,6 +351,61 @@ def measure_interleaved(bins, args, reps):
             for n in names}
 
 
+def speedup(res, kind, a, base):
+    """`base / kind` for one axis, or `None` when the ratio is meaningless."""
+    def val(k):
+        r = res[k]
+        if a == "size":
+            return r["size"]
+        if a.startswith("run_"):
+            return r["run"][a[4:]]
+        return r[a]
+
+    b = val(base)
+    # A run shorter than the sampler's resolution can finish between two
+    # `/proc` reads and come back as 0, and a run near it measures process
+    # start-up rather than the code. Reporting either as a ratio would be a
+    # fabricated win or loss, so leave it unmeasured.
+    if a in ("run_wall", "run_cpu", "run_rss"):
+        if b < RUN_FLOOR or val(kind) < RUN_FLOOR:
+            return None
+    return b / val(kind) if val(kind) else None
+
+
+def report_vs(rows, base, label, axes, flag_losses=False, kind="cb"):
+    """Print the `kind`-vs-`base` table and per-axis means; return all-win."""
+    print(f"{kind} vs {label}  (>1 means the first is better; +/- "
+          f"{NOISE_BAND:.2f} counts as a tie)")
+    print(f"{'program':<9} " + " ".join(f"{a:>9}" for a in axes))
+    means = {a: [] for a in axes}
+    all_ok = True
+    for p, res in rows:
+        cells = []
+        ok = True
+        for a in axes:
+            v = speedup(res, kind, a, base)
+            means[a].append(v)
+            cells.append("        -" if v is None else f"{v:9.2f}")
+            if v is not None and v < 1.0 - NOISE_BAND:
+                ok = False
+        all_ok = all_ok and ok
+        suffix = "" if (ok or not flag_losses) else "  <-- LOSS"
+        print(f"{p:<9} " + " ".join(cells) + suffix)
+    print()
+    print(f"mean speedup per axis ({kind} vs {base})")
+    for a in axes:
+        vs = [v for v in means[a] if v is not None]
+        if not vs:
+            print(f"  {a:<9}       -  (unmeasured)")
+            continue
+        m = sum(vs) / len(vs)
+        verdict = "win" if m >= 1.0 + NOISE_BAND else (
+            "tie" if m >= 1.0 - NOISE_BAND else "loss")
+        print(f"  {a:<9} {m:6.3f}  ({verdict})")
+    print()
+    return all_ok
+
+
 def main():
     progs = sys.argv[1:] or PROGRAMS
     if not os.path.exists(CBWRAP) or not os.path.exists(CBSO):
@@ -332,10 +415,11 @@ def main():
     rows = []
     for p in progs:
         res = measure_program(p, runtime_obj, stub_obj)
-        bins = {k: os.path.join(OUT, f"{p}.{k}.bin") for k in ("cb", "mir", "llvm")}
+        bins = {k: os.path.join(OUT, f"{p}.{k}.bin")
+                for k in ("cb", "mir", "llvm", "cl")}
         verify_outputs(bins, ARGS[p])
         runs = measure_interleaved(bins, ARGS[p], 50)
-        for k in ("cb", "mir", "llvm"):
+        for k in ("cb", "mir", "llvm", "cl"):
             res[k]["run"] = runs[k]
         rows.append((p, res))
 
@@ -346,73 +430,16 @@ def main():
     print(hdr)
     print("-" * len(hdr))
     for p, res in rows:
-        for k in ("cb", "mir", "llvm"):
+        for k in ("cb", "mir", "llvm", "cl"):
             r = res[k]
             print(f"{p:<9} {k:<5} {r['wall']*1000:9.2f} {r['cpu']*1000:9.2f} "
                   f"{r['rss']:9.0f} {r['size']:9.0f} {r['run']['wall']*1000:9.2f} "
                   f"{r['run']['cpu']*1000:9.2f} {r['run']['rss']:9.0f}")
 
-    def speedup(res, kind, a, base):
-        def val(k):
-            r = res[k]
-            if a == "size":
-                return r["size"]
-            if a.startswith("run_"):
-                return r["run"][a[4:]]
-            return r[a]
-        b = val(base)
-        # A run shorter than the sampler's resolution can finish between two
-        # `/proc` reads and come back as 0. Reporting that as a ratio would be a
-        # fabricated loss, so leave it unmeasured.
-        if a == "run_rss" and (b == 0 or val(kind) == 0):
-            return None
-        return b / val(kind) if val(kind) else None
-
     print()
-    print("compile-backend (`cb`) vs LLVM  (>1 means rmc better; +/- "
-          f"{NOISE_BAND:.2f} counts as a tie)")
-    print(f"{'program':<9} " + " ".join(f"{a:>9}" for a in axes))
-    means = {a: [] for a in axes}
-    all_ok = True
-    for p, res in rows:
-        cells = []
-        ok = True
-        for a in axes:
-            v = speedup(res, "cb", a, "llvm")
-            means[a].append(v)
-            cells.append("        -" if v is None else f"{v:9.2f}")
-            if v is not None and v < 1.0 - NOISE_BAND:
-                ok = False
-        all_ok = all_ok and ok
-        print(f"{p:<9} " + " ".join(cells) + ("" if ok else "  <-- LOSS"))
-    print()
-    print("mean speedup per axis (cb vs llvm)")
-    for a in axes:
-        vs = [v for v in means[a] if v is not None]
-        m = sum(vs) / len(vs)
-        verdict = "win" if m >= 1.0 + NOISE_BAND else (
-            "tie" if m >= 1.0 - NOISE_BAND else "loss")
-        print(f"  {a:<9} {m:6.3f}  ({verdict})")
-
-    print()
-    print("compile-backend (`cb`) vs printed-MIR prototype (`mir`)")
-    print(f"{'program':<9} " + " ".join(f"{a:>9}" for a in axes))
-    mmeans = {a: [] for a in axes}
-    for p, res in rows:
-        cells = []
-        for a in axes:
-            v = speedup(res, "cb", a, "mir")
-            mmeans[a].append(v)
-            cells.append("        -" if v is None else f"{v:9.2f}")
-        print(f"{p:<9} " + " ".join(cells))
-    print()
-    print("mean speedup per axis (cb vs mir)")
-    for a in axes:
-        vs = [v for v in mmeans[a] if v is not None]
-        m = sum(vs) / len(vs)
-        verdict = "win" if m >= 1.0 + NOISE_BAND else (
-            "tie" if m >= 1.0 - NOISE_BAND else "loss")
-        print(f"  {a:<9} {m:6.3f}  ({verdict})")
+    all_ok = report_vs(rows, "llvm", "LLVM", axes, flag_losses=True)
+    report_vs(rows, "mir", "printed-MIR prototype (`mir`)", axes)
+    report_vs(rows, "cl", "rustc Cranelift (`cl`)", axes)
 
     print()
     print("ALL CB WINS" if all_ok else "some axes lost (cb vs llvm)")
