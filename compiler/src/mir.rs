@@ -2173,6 +2173,12 @@ fn is_panic_fn(name: &str) -> bool {
             | "panic_nounwind_fmt"
             | "begin_panic"
             | "panic_display"
+            // `todo!()`/`unreachable!()`. `-Zno-codegen` folds these to a
+            // `panic(const "...")`; the `-Zcodegen-backend` route can leave the
+            // no-argument message helper in the body instead. Both abort, so
+            // both map to the same runtime sink.
+            | "todo_default_msg"
+            | "unreachable_default_msg"
     )
 }
 
@@ -2199,6 +2205,18 @@ fn std_intrinsic_name(name: &str) -> Option<String> {
     if n.contains("as Pattern>::is_contained_in") {
         return Some("__rmc_str_contains".to_string());
     }
+    // `core::intrinsics::integer_min::<T>` / `integer_max::<T>` — the intrinsic
+    // the `-Zcodegen-backend` route leaves in the body when it inlines
+    // `Ord::min`/`max` but not the intrinsic itself (`-Zno-codegen` inlines both,
+    // so the printed-MIR prototype never sees this). It lowers to the same
+    // runtime helper as the `<T as Ord>::min` form. Checked before the
+    // `<`-qualified form below, whose leading `strip_prefix('<')?` would return
+    // early for this spelling.
+    if let Some(name) = integer_minmax_intrinsic(n, "integer_min")
+        .or_else(|| integer_minmax_intrinsic(n, "integer_max"))
+    {
+        return Some(name);
+    }
     // `<T as Ord>::min(a, b)` and `max`, for an integer `T`.
     let rest = n.strip_prefix('<')?;
     let (ty, tail) = rest.split_once(" as ")?;
@@ -2209,6 +2227,19 @@ fn std_intrinsic_name(name: &str) -> Option<String> {
         return Some(format!("__rmc_{kind}{method}"));
     }
     None
+}
+
+/// See the call site in [`std_intrinsic_name`].
+fn integer_minmax_intrinsic(n: &str, which: &str) -> Option<String> {
+    let idx = n.find(which)?;
+    // Reject a suffix of a longer identifier (`my_integer_min`).
+    if n[..idx].chars().last().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let ty = n[idx + which.len()..].strip_prefix("::")?.strip_prefix('<')?;
+    let ty = ty.split('>').next()?.trim();
+    let kind = if ty.starts_with('i') || ty == "isize" { "i" } else { "u" };
+    Some(format!("__rmc_{kind}{}", if which == "integer_min" { "min" } else { "max" }))
 }
 
 /// The name a call should target, or `None` for a call that is not a plain

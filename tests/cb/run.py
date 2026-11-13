@@ -16,9 +16,11 @@ Each case in `tests/cb/` is a plain `std` program compiled two ways:
   * reference -- `rustc -O -C panic=abort` (the full LLVM pipeline with libstd).
   * rmc       -- `rustc +nightly -Zcodegen-backend=<...>.so -C opt-level=3`.
 
-Both binaries must print identical stdout and exit with the same status. stderr
-is compared only when both succeed, because rmc's `panic!` sink writes a fixed
-line rather than reproducing libstd's message (a deliberate simplification).
+Both binaries must print identical stdout and either both succeed or both
+abort; a panic's exact status is not compared, because rmc's `panic!` sink exits
+101 where libstd raises SIGABRT, and stderr is not compared, because the sink
+writes a fixed line rather than reproducing libstd's message (deliberate
+simplifications).
 
 Needs the nightly toolchain with the `rustc-dev` component, and the backend
 dylib built by `backend/build.sh`. When either is missing the suite reports it
@@ -102,7 +104,11 @@ def main():
         for argv in (ARGS.get(name) or [[]]):
             want = run(ref, argv)
             have = run(got, argv)
-            mismatch = want[:2] != have[:2] or (want[0] == 0 and want[2] != have[2])
+            # Success is compared exactly (stdout + status); a non-zero exit is
+            # only compared for "did it fail", since rmc's abort exits 101 and
+            # libstd's raises SIGABRT.
+            ok_want, ok_have = want[0] == 0, have[0] == 0
+            mismatch = ok_want != ok_have or (ok_want and want[1] != have[1])
             if mismatch:
                 print(f"FAIL {name} {argv}: rustc={want!r} rmc={have!r}")
                 failures += 1
