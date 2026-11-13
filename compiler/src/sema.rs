@@ -1989,7 +1989,15 @@ impl Sema {
                 *ty = Some(final_ty.clone());
                 let s = self.alloc_slots((final_ty.size() / 8) as i32);
                 *slot = s;
-                let initialized = init.is_some();
+                // A compiler-generated `\0`-prefixed temp may be declared
+                // without an initializer and filled by the statements that
+                // follow it (`\0list` in the array-literal desugar writes each
+                // element). Its only reads are those writes, so it counts as
+                // initialized. Without this, re-checking the desugared block —
+                // which any method desugar does to its receiver, e.g.
+                // `[3, 1, 2].iter().max().unwrap()` — reports a spurious
+                // "use of possibly-uninitialized variable".
+                let initialized = init.is_some() || name.starts_with('\u{0}');
                 scope.push(Binding {
                     name: name.clone(),
                     slot: s,

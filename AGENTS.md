@@ -1295,7 +1295,7 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   like it can skip the signed-division sign fixup, but `i64` multiplication
   wraps, so `x*x` may be negative and rustc keeps the fixup. Removing it is
   unsound; do not add a "square is non-negative" case to `gen_div_const`.
-- `bench/run.py` measures both compilers and both binaries the same way: wall
+- **`bench/run.py` measures both compilers and both binaries the same way:** wall
   and CPU time from `wait4()`, and peak RAM from the child's own `VmHWM`. Do not
   read peak RAM from `wait4()`'s `ru_maxrss`: a freshly spawned child shares
   Python's address space before `exec`, so it floors at Python's RSS (~15 MB) and
@@ -1304,6 +1304,25 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   read back as zero. It raises if a produced binary exits non-zero, which
   catches the classic "measured a nonexistent path" bug. `--markdown PATH` writes
   the dated result to a file; the current one lives at `bench/RESULTS.md`.
+- **Cranelift is the fair baseline for the "no LLVM" claim.** The headline
+  opponent is `rustc` with LLVM, but LLVM is a far stronger optimiser than rmc
+  has, so a run-time loss to it may only mean LLVM optimised harder, and a
+  compile-time win may only mean rmc skipped the optimiser. `rustc
+  -Zcodegen-backend=cranelift` runs the *same* rustc frontend with a backend
+  that also does not use LLVM, so the gap between it and rmc is rmc's own codegen
+  and in-process link, not the optimiser. It is a nightly-only component
+  (`rustc-codegen-cranelift-preview`); `bench/run.py` detects it via `rustup
+  which --toolchain nightly rustc` and drops the column when absent, so the
+  suite still runs on a stable-only host. `RMC_BENCH_CRANELIFT_RUSTC` overrides
+  the path. Cranelift rejects `-C lto`, so that flag is omitted from its
+  invocation; the rest matches the LLVM column. Read the Cranelift *run* column
+  when judging rmc's generated code, and the LLVM column when judging rmc
+  against the best available optimiser. The recorded run is strong for rmc: it
+  beats Cranelift on both axes at once - ~30x faster to compile, and faster at
+  run time on every program (closest are `heap` 1.06x and `mandel` 1.15x, widest
+  `forloops` 2.73x). So the "no LLVM" win is not merely "rmc skipped the
+  optimiser": against the one other LLVM-free backend it also wins on the
+  generated code. The remaining gap is to LLVM, which is the harder target.
 - **The sampler yields, it does not spin.** The `VmHWM` poll calls
   `os.sched_yield()` between reads. A tight `wait4(WNOHANG)` spin keeps the
   harness runnable for the whole child lifetime and competes with the benchmark
@@ -3091,3 +3110,28 @@ covered by a test in `compiler/tests/compile.rs`:
 Tests that claim to guard a runtime bug must *execute* the program and assert
 the result (`run_exit_code` / `run_output`); an `asm(...).contains("main:")`
 assertion passes even when the emitted code is wrong.
+
+## Array-literal lowering is re-check-safe
+
+`Expr::ArrayList` (`[a, b, c]`, list form) desugars in sema to a block
+`{ let mut \0list: [T; n]; \0list[0] = a; ...; \0list }`. The `let` is
+deliberately uninitialised (an aggregate element type has no default to spell),
+and the desugar returns without re-checking the block. A *method* receiver,
+though, is checked twice — once to resolve its type, once when the rewritten
+call is re-checked — so `unwrap()` on such a block walked it a second time. The
+second walk re-allocated the `\0list` slot and read it as a possibly-
+uninitialised binding. `[3, 1, 2].iter().max().unwrap()` is the shape that
+exposed this. The fix marks a `\0`-prefixed `let` initialised even with no
+initialiser, since its only reads are the writes that follow it.
+
+A related trap in the same area: the parser's chain-head recogniser
+(`try_array_list_lit`) must accept a *single-element* list `[5]` (no trailing
+comma) as well as `[5,]`. A `[T; n]` repeat still has a `;` after the first
+element, which is the shape to reject.
+
+## `for x in a.iter()` vs a chain
+
+The iterator-chain lowering demands a terminal method, so a bare `a.iter()`
+must be left as a `MethodCall` for the `for` desugar. The postfix method loop
+therefore only lowers a chain when a `.` follows the `.iter()`/`.into_iter()`
+call; otherwise `for x in a.iter()` is misread as an unterminated chain.

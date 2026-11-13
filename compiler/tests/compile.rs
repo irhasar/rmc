@@ -356,6 +356,27 @@ fn for_over_iter_and_iter_mut_are_by_reference() {
 }
 
 #[test]
+fn an_array_literal_iter_chain_survives_a_rechecking_terminal() {
+    // `unwrap()` type-checks its receiver, rewrites it to a call, then checks
+    // the receiver *again*. The array-literal desugar builds
+    // `{ let mut \0list: [T; n]; \0list[0] = ..; ..; \0list }`, whose `let` is
+    // deliberately uninitialised; the second walk must not report it as a use
+    // of an uninitialised binding. `[3, 1, 2].iter().max().unwrap()` is the
+    // shape that first exposed this.
+    assert_eq!(run_output("fn main() -> i64 { return [3, 1, 2].iter().max().unwrap(); }").0, 3);
+    assert_eq!(run_output("fn main() -> i64 { return [3, 1, 2].iter().min().unwrap(); }").0, 1);
+    assert_eq!(run_output("fn main() -> i64 { return [3, 1, 2].iter().nth(1).unwrap(); }").0, 1);
+    assert_eq!(run_output("fn main() -> i64 { return [3, 1, 2].iter().last().unwrap(); }").0, 2);
+    assert_eq!(run_output("fn main() -> i64 { return [3, 1, 2].len().abs(); }").0, 3);
+    // A single-element list has no trailing comma; the head recogniser must
+    // still accept it.
+    assert_eq!(run_output("fn main() -> i64 { return [5].iter().max().unwrap(); }").0, 5);
+    // The adapters fold to a loop, which also re-checks its source.
+    assert_eq!(run_output("fn main() -> i64 { return [1, 2, 3, 4].iter().skip(1).take(2).sum(); }").0, 5);
+    assert_eq!(run_output("fn main() -> i64 { return [1, 2, 3, 4].iter().rev().nth(0).unwrap(); }").0, 4);
+}
+
+#[test]
 fn a_labelled_break_leaves_the_named_outer_loop() {
     // `break 'outer` from a nested loop must target the labelled loop, not the
     // innermost one. The body runs `i` up to 5 and then leaves both loops.
