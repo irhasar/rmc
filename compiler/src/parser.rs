@@ -217,10 +217,11 @@ pub struct Parser {
     /// a struct or enum name (else `None`). Consumed alongside
     /// `vec_elem_pending`.
     vec_elem_pending_ty: Option<Type>,
-    /// Whether `--bounds-checks` is on. A `v[i]` on a `Vec` then lowers through
-    /// the runtime's `__rmc_vec_at`, which traps on an out-of-range index
-    /// instead of reading past the element store. Off by default, so the index
-    /// is plain pointer arithmetic.
+    /// Whether the per-index bounds check is on. A `v[i]` on a `Vec` then lowers
+    /// through the runtime's `__rmc_vec_at`, which traps on an out-of-range
+    /// index instead of reading past the element store. On by default, so the
+    /// index is a checked access; `--no-bounds-checks` makes it plain pointer
+    /// arithmetic.
     bounds_checks: bool,
     /// Names bound to a `String` (a growable byte buffer). A `String` value is
     /// the address of a `{len, bytes}` record, so it shares `str`'s layout and
@@ -370,7 +371,7 @@ impl Parser {
             vec_mut: std::collections::HashMap::new(),
             vec_elem_pending: None,
             vec_elem_pending_ty: None,
-            bounds_checks: false,
+            bounds_checks: true,
             string_names: std::collections::HashSet::new(),
             arr_elem: std::collections::HashMap::new(),
             alias_target: std::collections::HashMap::new(),
@@ -379,7 +380,8 @@ impl Parser {
         }
     }
 
-    /// Turn on `--bounds-checks` for `v[i]` on a `Vec`.
+    /// Turn the per-index bounds check on or off for `v[i]` on a `Vec`. On by
+    /// default; `--no-bounds-checks` passes `false`.
     pub fn bounds_checks(mut self, on: bool) -> Self {
         self.bounds_checks = on;
         self

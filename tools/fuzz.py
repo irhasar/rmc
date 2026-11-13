@@ -3577,14 +3577,16 @@ def main():
         ("no-tco", ["--no-tco"], []),
         ("all-off", ["--no-inline", "--no-licm", "--no-tco"], []),
     ]
-    # `--bounds-checks` turns on the trap path, which the default configs never
-    # reach: every generated index is in bounds (see the generators), so no
-    # program should trap and the outputs must still match rustc. A spurious
-    # trap, or a miscompile the check codegen introduces, shows up here.
+    # Bounds checks are on by default, so the trap path is already exercised by
+    # the configs above: every generated index is in bounds (see the
+    # generators), so no program should trap and the outputs must still match
+    # rustc. A spurious trap, or a miscompile the check codegen introduces,
+    # shows up here. `--bounds` adds the explicit opt-out instead, to exercise
+    # the unchecked lowering.
     if args.bounds:
         configs += [
-            ("bounds", ["--bounds-checks"], []),
-            ("bounds-all-off", ["--bounds-checks", "--no-inline", "--no-licm", "--no-tco"], []),
+            ("no-bounds", ["--no-bounds-checks"], []),
+            ("no-bounds-all-off", ["--no-bounds-checks", "--no-inline", "--no-licm", "--no-tco"], []),
         ]
     # `--overflow-checks` traps on `+`/`-`/`*` overflow at runtime; the reference
     # must overflow-check too or the two disagree by design. `<<`/`>>` are not

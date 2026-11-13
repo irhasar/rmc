@@ -675,17 +675,17 @@ would a labelled `while`.
 
 ## Overflow
 
-Array indices are `i64` and are unchecked by default, as in C. Compiling with
-`--bounds-checks` (or `CompileOptions { bounds_checks: true }`) checks every
-*variable* index against the array's length; an out-of-range index writes
-`rmc: index out of bounds` to stderr and exits with status 101. A *constant*
-index outside the array (including a negated one, `a[-1]`, and one held in a
-constant local, `let i = -1; a[i]`) is rejected at compile time whether or not
-`--bounds-checks` is set, matching rustc. A local counts as constant only when
-it is assigned at most once and never taken by `&mut`, the same rule rustc uses,
-so `let mut i = -1; i = 0; a[i]` stays a runtime (checked) index.
+Array indices are `i64` and are bounds-checked by default, matching rustc. Every
+*variable* index is checked against the array's length; an out-of-range index
+writes `rmc: index out of bounds` to stderr and exits with status 101. A
+*constant* index outside the array (including a negated one, `a[-1]`, and one
+held in a constant local, `let i = -1; a[i]`) is rejected at compile time,
+matching rustc. A local counts as constant only when it is assigned at most once
+and never taken by `&mut`, the same rule rustc uses, so `let mut i = -1; i = 0;
+a[i]` stays a runtime (checked) index. `--no-bounds-checks` (or `CompileOptions
+{ no_bounds_checks: true }` from the library) is the explicit unsafe opt-out.
 
-`--bounds-checks` also covers `v[i]` on a supported `Vec`, whose length is only
+The check also covers `v[i]` on a supported `Vec`, whose length is only
 known at run time: the index is checked against the vector's live length and an
 out-of-range one traps the same way. Writing `v[i] = x` requires the binding to
 be `mut`, as in rustc; a read through a read-only binding is fine.

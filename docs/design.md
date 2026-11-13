@@ -619,15 +619,15 @@ with no header offset, and because a `String` value *is* a `str` record, every
 
 ### Bounds checks
 
-With `--bounds-checks`, every array index is preceded by a compare against the
-array's length and a `jae` to a runtime trap; `jae` catches a negative index too,
-since it is an enormous unsigned value. A constant index is folded: in range
-emits nothing, out of range is an unconditional `jmp` to the trap. When the flag
-is on, an array element is never used as a bare memory operand, so no access can
-bypass the check. The base is evaluated before the check, matching Rust: a base
-that is a call or block runs its side effects even when the index is out of
-range. The check itself uses no register, so the base address survives in `%rax`
-for the load.
+With bounds checks on (the default), every array index is preceded by a compare
+against the array's length and a `jae` to a runtime trap; `jae` catches a
+negative index too, since it is an enormous unsigned value. A constant index is
+folded: in range emits nothing, out of range is an unconditional `jmp` to the
+trap. When the check is on, an array element is never used as a bare memory
+operand, so no access can bypass the check. The base is evaluated before the
+check, matching Rust: a base that is a call or block runs its side effects even
+when the index is out of range. The check itself uses no register, so the base
+address survives in `%rax` for the load. `--no-bounds-checks` drops the check.
 
 ### Overflow checks
 

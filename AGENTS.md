@@ -424,8 +424,9 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   assembler" below before adding an instruction or a codegen form.
 - `compiler/src/main.rs` — CLI: reads source, calls the library, writes the ELF.
   Flags: `--emit-asm`, `--keep-asm`, `--binutils`, `--no-strip`, `--min-size`,
-  `--overflow-checks`, `--bounds-checks`, `--no-inline`, `--no-licm`,
-  `--no-tco`.
+  `--overflow-checks`, `--no-bounds-checks`, `--no-inline`, `--no-licm`,
+  `--no-tco`. (`--bounds-checks` is accepted and ignored: bounds checks are on
+  by default.)
 - `compiler/tests/compile.rs` — unit tests for the front end and codegen; these
   run without `as`/`ld`.
 
@@ -1031,18 +1032,21 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   order initializer side effects run in.
 - **A bounds check sees through a reference to an array.** `array_len_of` /
   `array_len_ty` unwrap an `Expr::Ref` base, so `let r: &[i64; 3] = &a; r[i]`
-  traps on an out-of-range `i` under `--bounds-checks` instead of reading
-  adjacent memory. A field store through a shared `&T` is rejected by
-  `place_writable` ("cannot assign through a shared reference; use `&mut`"), and
-  a `&mut` binding itself is not reassignable unless declared `mut`.
-- **`--bounds-checks` covers `v[i]` on a `Vec`, not just a fixed array.** An
-  array's length is static, so `check_bounds` folds it in codegen; a `Vec`'s
-  length is a runtime header word, so under `--bounds-checks` the parser lowers
+  traps on an out-of-range `i` by default instead of reading adjacent memory. A
+  field store through a shared `&T` is rejected by `place_writable` ("cannot
+  assign through a shared reference; use `&mut`"), and a `&mut` binding itself
+  is not reassignable unless declared `mut`.
+- **Bounds checks are on by default and cover `v[i]` on a `Vec`, not just a
+  fixed array.** An array's length is static, so `check_bounds` folds it in
+  codegen; a `Vec`'s length is a runtime header word, so the parser lowers
   `v[i]` through `__rmc_vec_at(vector, index, stride)`, which reads the live
-  length and traps (`jae __rmc_bounds`) before forming the address. Without this
-  the index was plain pointer arithmetic and read or wrote past the store even
-  with the flag on. The index is evaluated exactly once, inside the call, so a
-  base or index with a side effect still runs once, in order. `run.py`'s
+  length and traps (`jae __rmc_bounds`) before forming the address. `rmc` used to
+  leave `v[i]` as plain pointer arithmetic unless `--bounds-checks` was passed,
+  so an out-of-range index read or wrote past the store with exit 0 where rustc
+  panics - a silent out-of-bounds read (CWE-125). Now the check is the default,
+  matching rustc, and `--no-bounds-checks` is the explicit unsafe opt-out. The
+  index is evaluated exactly once, inside the call, so a base or index with a
+  side effect still runs once, in order. `run.py`'s
   `vec_read`/`vec_store`/`vec_struct` trap cases pin it under a plain `ld` link.
 - **A `v[i] = x` write needs a `mut` binding.** The index lowering forms the
   element reference `&mut` or `&` from the binding's own mutability (`vec_mut`),
@@ -1352,14 +1356,13 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   earlier design; it was withdrawn because rmc lowers `black_box` to the identity
   while rustc makes it opaque, so the barrier charged rustc a store/reload rmc
   never emitted and the 2.2x it produced measured the barrier, not the loop.
-- **The two builds must carry matching safety semantics.** rmc defaults bounds
-  checks *off* and overflow checks *off*; `rustc -O` keeps bounds checks *on*
-  and overflow checks *off*. `bench/run.py` builds rmc with `--bounds-checks`
-  and rustc with `-C overflow-checks=off`, so both carry bounds checks and
-  neither carries overflow checks. Without the rmc flag, rmc would skip a
-  per-index check rustc emits; the check costs ~1% on the array-heavy programs,
-  so the flag does not decide any ratio, but the default would be an unfair
-  comparison. Never build the two sides with different check settings.
+- **The two builds must carry matching safety semantics.** rmc checks bounds by
+  default and leaves overflow checks *off*; `rustc -O` keeps bounds checks *on*
+  and overflow checks *off*. `bench/run.py` passes rustc `-C overflow-checks=off`
+  and relies on rmc's default, so both carry bounds checks and neither carries
+  overflow checks. If rmc ever skipped a per-index check rustc emits, the ratio
+  would be unfair; the check costs ~1% on the array-heavy programs, so it does
+  not decide any ratio. Never build the two sides with different check settings.
 - **`callrec` is the call-heavy case, and it used to lose.** Non-tail recursion
   (`tree(n) = 1 + tree(n-1) + tree(n-2)`) cannot be inlined by either compiler,
   so it measures raw call overhead plus argument setup, where the stack-based
@@ -2049,8 +2052,9 @@ stdout and exit status against `rustc -O`, and it recompiles each program with
 every optimiser pass off in turn (`--no-inline`, `--no-licm`, `--no-tco`, all
 three), the same matrix the corpus suite uses — a pass-specific bug is otherwise
 invisible, because the fuzzer used to run only the default configuration.
-`--bounds` adds `--bounds-checks` runs (every generated index is in bounds, so a
-spurious trap or a check-codegen miscompile shows up) and `--overflow` adds
+`--bounds` adds runs with `--no-bounds-checks` (every generated index is in
+bounds, so a spurious trap or a check-codegen miscompile shows up) and
+`--overflow` adds
 `--overflow-checks` runs, each compared against a `rustc` built with
 `-C overflow-checks=on` (the default `rustc -O` wraps, so it would disagree by
 design). The temp directory is per-PID: two concurrent fuzz runs sharing one
@@ -2116,10 +2120,10 @@ may contain a self-call becomes a loop with one call per level, halving the call
 tree of both `fib` and `tree`), a loop-invariant code motion pass, plus a
 small peephole pass (operand/comparison/array-address folding, constant folding,
 division by a constant, a 32-bit `div` fast path for a variable divisor). A *constant* index out of
-range is a compile error; a *variable* index is unchecked by default (used
-as-is, like C), so an out-of-range one reads or writes adjacent stack memory.
-`--bounds-checks` turns on a per-index runtime check that traps (see the codegen
-notes and "Soundness checks").
+range is a compile error; a *variable* index is bounds-checked by default,
+matching rustc: an out-of-range one traps with exit 101 and `rmc: index out of
+bounds`. `--no-bounds-checks` is the explicit unsafe opt-out that drops the
+check (see the codegen notes and "Soundness checks").
 
 The macro surface is lowered at parse time and is deliberately tiny.
 `print!`/`println!` take a literal format string and rewrite each `{}` to a
@@ -2285,8 +2289,8 @@ The README's roadmap lists the intended next steps.
   path returns, using `block_diverges`. It is deliberately conservative: an
   `if` with no `else`, a `while`, and a `loop` are not treated as guaranteed
   returns.
-- **With `--bounds-checks`, an array element is never a bare operand.**
-  `simple_operand` returns `None` for `Expr::Index` when `self.bounds` is set, so
+- **A bounds-checked array element is never a bare operand.**
+  `simple_operand` returns `None` for `Expr::Index` when bounds checks are on, so
   every access is materialised through `gen_expr`/`gen_addr`, which emit the
   check. If you add a code path that folds an element into an instruction
   operand, it must also emit the check, or an out-of-range index can bypass it.

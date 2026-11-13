@@ -39,12 +39,12 @@ def load_args():
 
 def extra_flags(name):
     """Per-case compiler flags. A `NAME.overflow` marker turns on overflow
-    checks for both compilers, so the case can be diffed like any other."""
+    checks for both compilers, so the case can be diffed like any other.
+
+    Bounds checks need no marker: they are on by default in rmc, matching
+    rustc, which always checks an index."""
     if os.path.exists(os.path.join(CASES, f"{name}.overflow")):
         return ["--overflow-checks"], ["-C", "overflow-checks=on"]
-    if os.path.exists(os.path.join(CASES, f"{name}.bounds")):
-        # rustc checks array bounds by default, so only rmc needs the flag.
-        return ["--bounds-checks"], []
     return [], []
 
 
@@ -95,7 +95,10 @@ def check_bounds_traps(combos):
     Each case is run under every optimiser configuration in `combos`, so a pass
     cannot hide a check: a hoist or inline that drops the `cmp`/`jae` would let
     the program read or write out of range and exit without the message.
-    """
+
+    No `--bounds-checks` flag is passed: checks are on by default, and this
+    check exists precisely to prove that. `--bounds-checks` is accepted as a
+    no-op for compatibility."""
     # Each case is (source, required stdout prefix). The prefix checks that a
     # base with a side effect runs before the trap: Rust evaluates the base and
     # index before the bounds check, so `make()[2]` must print before it exits.
@@ -128,7 +131,7 @@ def check_bounds_traps(combos):
         with open(src_path, "w") as f:
             f.write(src)
         for label, opt_flags in combos:
-            asm = subprocess.run([RMC, "--bounds-checks"] + list(opt_flags)
+            asm = subprocess.run([RMC] + list(opt_flags)
                                  + ["--emit-asm", src_path], capture_output=True)
             if asm.returncode != 0:
                 print(f"FAIL trap {name}{label}: rmc failed:\n{asm.stderr.decode(errors='replace')}")

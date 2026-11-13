@@ -96,7 +96,7 @@ rmc input.rs --binutils -o out     # assemble and link with `as`/`ld` instead
 rmc input.rs --binutils --no-strip -o out    # keep the symbol table
 rmc input.rs --binutils --min-size -o out    # drop the section headers too
 rmc input.rs --overflow-checks     # trap on i64 +,-,* overflow (exit 101)
-rmc input.rs --bounds-checks       # trap on an out-of-range array index (exit 101)
+rmc input.rs --no-bounds-checks    # drop the per-index bounds check (unsafe opt-out)
 rmc input.rs --no-inline           # disable inlining (on by default)
 rmc input.rs --no-licm             # disable loop-invariant code motion (on by default)
 rmc input.rs --no-tco              # disable self-recursion-to-loop (on by default)
@@ -224,7 +224,7 @@ python3 tools/fuzz.py --mode shift --n 500 --seed 1
 python3 tools/fuzz.py --mode semi --n 500 --seed 1
 python3 tools/fuzz.py --mode boolbit --n 500 --seed 1
 python3 tools/fuzz.py --mode localconst --n 500 --seed 1
-# also exercise the trap codegen: --bounds-checks and --overflow-checks runs
+# also exercise the trap codegen: --no-bounds-checks and --overflow-checks runs
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 python3 tools/fuzz.py --mode robust
 python3 tools/fuzz.py --mode reject
@@ -353,8 +353,9 @@ set of runtime builtins. A `str` and a `&str` are the same one-word value, so
 they coerce freely and a `&'static str` field or `&str` parameter may be
 written `str`. Structs and arrays may be passed to and returned from
 functions by value, or by reference to avoid the copy. Overflow checks are
-opt-in with `--overflow-checks`, and array bounds checks with
-`--bounds-checks`. See `docs/language.md` for the full grammar.
+opt-in with `--overflow-checks`; bounds checks are on by default, matching
+rustc, and `--no-bounds-checks` is the unsafe opt-out. See `docs/language.md`
+for the full grammar.
 
 Runtime builtins (provided by `src/runtime.rs`, no imports needed):
 
@@ -374,7 +375,7 @@ Runtime builtins (provided by `src/runtime.rs`, no imports needed):
 
 `bench/run.py` compares `rmc` against `rustc -O -C lto=fat -C codegen-units=1
 -C panic=abort -C strip=symbols` on ten programs, with matching safety
-semantics: rmc is invoked with `--bounds-checks` and rustc with
+semantics: rmc checks bounds by default and rustc is invoked with
 `-C overflow-checks=off`, so both carry bounds checks and neither carries
 overflow checks (see below). It measures both halves of
 the comparison, because "faster" means two different things here:
@@ -480,15 +481,12 @@ neither can fold the answer at compile time.
 
 Two deliberate choices keep the comparison from flattering either side.
 
-* **Matching safety semantics.** rmc defaults bounds checks *off* and overflow
-  checks *off*; `rustc -O` keeps bounds checks *on* and overflow checks *off*.
-  A run with rmc's defaults would have rmc skip a per-index check rustc emits.
-  The harness closes the gap from the rmc side: `rmc --bounds-checks` and
-  `rustc -C overflow-checks=off`, so both builds carry bounds checks and
-  neither carries overflow checks. The check costs about 1% on the array-heavy
-  programs (`sieve` is the largest, and its run ratio barely moves), so the
-  choice does not manufacture any win; it removes a check rmc would otherwise
-  not pay for.
+* **Matching safety semantics.** rmc checks bounds by default and leaves
+  overflow checks *off*; `rustc -O` keeps bounds checks *on* and overflow checks
+  *off*. Both builds therefore carry bounds checks and neither carries overflow
+  checks (`rustc` is invoked with `-C overflow-checks=off` explicitly). The
+  check costs about 1% on the array-heavy programs (`sieve` is the largest, and
+  its run ratio barely moves), so it does not flatter either side.
 
 * **No `black_box` inside a hot loop.** rmc lowers `std::hint::black_box` to the
   identity (it has no optimiser that could elide the value anyway); rustc makes
@@ -569,10 +567,10 @@ rmc is a small, self-contained compiler, not a drop-in replacement for rustc.
   turn them off.
 - The backend targets x86-64 Linux only, using the System V ABI and raw Linux
   syscalls. There is no Windows, macOS, ARM, or WebAssembly support.
-- Array indexing is unchecked by default: an out-of-range index reads or writes
-  adjacent stack memory, exactly as in C. `--bounds-checks` inserts a check
-  before every index that traps with `rmc: index out of bounds` (exit 101); a
-  constant index is decided at compile time.
+- Array indexing is bounds-checked by default: an out-of-range index traps with
+  `rmc: index out of bounds` (exit 101), matching rustc. A constant index is
+  decided at compile time. `--no-bounds-checks` is an unsafe opt-out that reads
+  or writes adjacent stack memory, exactly as in C.
 - There is no stack probe and no stack-depth check in generated code, and rmc
   emits no stack-overflow guard. A function that recurses too deeply, or a
   program with a very large frame, runs off the end of the stack and dies with
