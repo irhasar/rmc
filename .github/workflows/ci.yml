@@ -40,6 +40,30 @@ jobs:
       - name: MIR crash survey
         run: python3 tools/mir_survey.py
 
+  # The real codegen-backend pipeline. `test` above runs on stable and so only
+  # covers the printed-MIR prototype; this job installs the nightly `rustc-dev`
+  # component, builds the backend dylib, and runs the differential suite that
+  # drives `-Zcodegen-backend` for real. That is the only place the backend's
+  # defining-path MIR rendering (vs the prototype's visible paths) is exercised.
+  cb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly with rustc-dev
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustc-dev
+
+      - name: Build compiler
+        run: cargo build --release --manifest-path compiler/Cargo.toml
+
+      - name: Build backend
+        run: ./backend/build.sh
+
+      - name: Codegen-backend differential tests
+        run: python3 tests/cb/run.py
+
   fuzz:
     runs-on: ubuntu-latest
     steps:

@@ -1160,6 +1160,42 @@ pub(crate) fn struct_const_identity(name: &str) -> String {
     }
 }
 
+/// Whether a constant's text denotes a zero-sized marker (`PhantomData`).
+///
+/// The path spelling differs by renderer (visible `PhantomData` vs defining
+/// `core::marker::PhantomData`), so compare the last path segment rather than
+/// the prefix. The marker may still carry generic arguments
+/// (`PhantomData::<&()>`), which `strip_generics` removes.
+fn is_zst_const(s: &str) -> bool {
+    let base = strip_generics(s);
+    base.rsplit("::").next().unwrap_or(&base).trim() == "PhantomData"
+}
+
+/// If `s` names the free function `name` under any module path — `size_of` in
+/// `std::mem::size_of::<i64>()` or `core::mem::size_of::<i64>()` — return the
+/// text from the `<` that opens its generic arguments (or the `(` when it has
+/// none). The renderer picks the visible or defining path, so matching the
+/// final segment is what keeps both spellings working.
+fn strip_path_fn<'a>(s: &'a str, name: &str) -> Option<&'a str> {
+    let s = s.trim();
+    let idx = s.find(name)?;
+    let after = &s[idx + name.len()..];
+    // A turbofish (`size_of::<i64>`) or a bare call (`size_of(`).
+    let after = after.strip_prefix("::").unwrap_or(after);
+    if !after.starts_with('<') && !after.starts_with('(') {
+        return None;
+    }
+    // Reject a suffix of a longer identifier (`my_size_of`).
+    if s[..idx]
+        .chars()
+        .last()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    Some(after)
+}
+
 /// The type a `Const::Agg` names: the whole path for a struct (`a::A`), the
 /// enum prefix for a variant (`a::E::A` -> `a::E`). Returns the type name and
 /// the `::variant` suffix to re-append, if the constant is a variant.
@@ -1506,8 +1542,10 @@ fn parse_promoted_value(rhs: &str, ty_text: &str, consts: &HashMap<String, i64>)
         }
     }
     // `_1 = std::mem::size_of::<i64>();` — a size query the front end left in
-    // the promoted body rather than folding.
-    if let Some(r) = s.strip_prefix("std::mem::size_of") {
+    // the promoted body rather than folding. The renderer may spell the path
+    // visibly (`std::mem::size_of`) or by its defining module
+    // (`core::mem::size_of`), so match the final segment.
+    if let Some(r) = strip_path_fn(s, "size_of") {
         if let Some(t) = r.split('<').nth(1).and_then(|t| t.split('>').next()) {
             return Some(size_of_type_text(t.trim()));
         }
@@ -1965,26 +2003,68 @@ fn parse_call_terminator(t: &str) -> Option<Terminator> {
             target,
         });
     }
-    let func = match func.trim() {
-        "std::io::_print" | "core::fmt::_print" => CallTarget::Direct("__rmc_print".to_string()),
-        "std::io::_eprint" | "core::fmt::_eprint" => CallTarget::Direct("__rmc_eprint".to_string()),
-        "compare_bytes" => CallTarget::Direct("__rmc_compare_bytes".to_string()),
-        _ if is_panic_fn(func.trim()) => CallTarget::Direct("__rmc_panic".to_string()),
-        _ => match std_intrinsic_name(&func) {
-            Some(name) => CallTarget::Direct(name),
-            None => match normalize_call_name(&func) {
+    let fname = func.trim();
+    let func = if let Some(sym) = print_sink(fname) {
+        CallTarget::Direct(sym.to_string())
+    } else {
+        match fname {
+            _ if is_compare_bytes(fname) => {
+                CallTarget::Direct("__rmc_compare_bytes".to_string())
+            }
+            _ if is_panic_fn(fname) => CallTarget::Direct("__rmc_panic".to_string()),
+            _ => match std_intrinsic_name(fname) {
                 Some(name) => CallTarget::Direct(name),
-                // A call through a computed callee: `_5(...)`, `(*_3)(...)`, or
-                // a `fn` item used as a value. Keep the operand so the back end
-                // can materialise its address and `call *%reg`.
-                None => match parse_operand(func.trim()) {
-                    Ok(op) => CallTarget::Indirect(Some(op)),
-                    Err(_) => CallTarget::Indirect(None),
+                None => match normalize_call_name(fname) {
+                    Some(name) => CallTarget::Direct(name),
+                    // A call through a computed callee: `_5(...)`, `(*_3)(...)`, or
+                    // a `fn` item used as a value. Keep the operand so the back end
+                    // can materialise its address and `call *%reg`.
+                    None => match parse_operand(fname) {
+                        Ok(op) => CallTarget::Indirect(Some(op)),
+                        Err(_) => CallTarget::Indirect(None),
+                    },
                 },
             },
-        },
+        }
     };
     Some(Terminator::Call { dest, func, args, target })
+}
+
+/// The `print!`/`println!`/`eprint!`/`eprintln!` sinks, mapped to the runtime
+/// helpers that consume a `core::fmt::Arguments`.
+///
+/// The spelling depends on which MIR renderer produced the text. `rustc
+/// --emit=mir` resolves the *visible* path (`std::io::_print`), but the
+/// `-Zcodegen-backend` route renders with `with_no_visible_paths!` (see
+/// `backend/src/lib.rs`, where avoiding that resolution is what keeps the
+/// backend's peak RSS down) and so prints the *defining* path
+/// (`std::io::stdio::_print`). Matching the exact string made the two
+/// pipelines disagree on the same program, so match the defining module chain
+/// instead: the final segment is `_print`/`_eprint` and an ancestor is `io` or
+/// `fmt`.
+fn print_sink(name: &str) -> Option<&'static str> {
+    // Drop generic arguments (`Arguments<'_>`) before splitting the path.
+    let head = name.split('<').next().unwrap_or(name).trim();
+    let segs: Vec<&str> = head.split("::").collect();
+    let helper = match *segs.last()? {
+        "_print" => "__rmc_print",
+        "_eprint" => "__rmc_eprint",
+        _ => return None,
+    };
+    if segs[..segs.len() - 1].iter().any(|s| *s == "io" || *s == "fmt") {
+        Some(helper)
+    } else {
+        None
+    }
+}
+
+/// The `core::intrinsics::compare_bytes` intrinsic, which `str`/`[u8]` equality
+/// lowers to. It is matched by its final path segment because the renderer
+/// decides whether the path is shown bare (`compare_bytes`) or qualified
+/// (`core::intrinsics::compare_bytes`).
+fn is_compare_bytes(name: &str) -> bool {
+    let head = name.split('<').next().unwrap_or(name).trim();
+    head.rsplit("::").next().unwrap_or(head).trim() == "compare_bytes"
 }
 
 /// The `panic!`/`todo!`/`unreachable!`/`assert!` sinks. They print a message and
@@ -1993,16 +2073,25 @@ fn parse_call_terminator(t: &str) -> Option<Terminator> {
 /// `Arguments`), so the helper ignores the argument rather than modelling the
 /// `core::fmt` machinery these bring in.
 fn is_panic_fn(name: &str) -> bool {
+    // The real sinks live under `core::panicking`/`std::panicking`/`std::rt`,
+    // but the renderer may drop or keep the leading crate, so match on the
+    // defining module chain and the final segment rather than the exact path.
+    // Requiring the module keeps a user function that happens to be called
+    // `panic` from being misrouted to the runtime abort helper.
+    let head = name.split('<').next().unwrap_or(name).trim();
+    let segs: Vec<&str> = head.split("::").collect();
+    if !segs.iter().any(|s| *s == "panicking" || *s == "rt") {
+        return false;
+    }
     matches!(
-        name,
-        "std::rt::panic_fmt"
-            | "core::panicking::panic_fmt"
-            | "core::panicking::panic"
-            | "core::panicking::panic_str"
-            | "core::panicking::panic_nounwind"
-            | "core::panicking::panic_nounwind_fmt"
-            | "std::panicking::begin_panic"
-            | "core::panicking::panic_display"
+        *segs.last().unwrap_or(&""),
+        "panic_fmt"
+            | "panic"
+            | "panic_str"
+            | "panic_nounwind"
+            | "panic_nounwind_fmt"
+            | "begin_panic"
+            | "panic_display"
     )
 }
 
@@ -2872,7 +2961,14 @@ fn parse_const(s: &str) -> Option<Const> {
     }
     // A zero-sized constant: `PhantomData::<..>` and the like. It takes no
     // storage, so the aggregate that lists it must not reserve a word.
-    if s.starts_with("PhantomData") {
+    //
+    // The spelling is renderer-dependent: `rustc --emit=mir` prints the visible
+    // path (`PhantomData::<&()>`), the `-Zcodegen-backend` route the defining
+    // one (`core::marker::PhantomData::<&()>`). Matching on the *last* path
+    // segment keeps both. Missing this made the `format_args!`
+    // `ArgumentType::Placeholder` aggregate reserve a word for `_lifetime`,
+    // shifting its layout and segfaulting on the second runtime argument.
+    if is_zst_const(s) {
         return Some(Const::Zst);
     }
     if let Some(bytes) = parse_byte_string(s) {
