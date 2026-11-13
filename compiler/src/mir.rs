@@ -6881,6 +6881,30 @@ pub(crate) fn successors(t: &Terminator) -> Vec<u32> {
     }
 }
 
+/// Block-level reachability: `reach[i][j]` when block `i` can reach block `j`
+/// by any path, as the transitive closure of the successor relation.
+pub(crate) fn block_reachability(succ: &[Vec<u32>]) -> Vec<Vec<bool>> {
+    let n = succ.len();
+    let mut reach: Vec<Vec<bool>> = vec![vec![false; n]; n];
+    for (i, s) in succ.iter().enumerate() {
+        for &t in s {
+            reach[i][t as usize] = true;
+        }
+    }
+    for k in 0..n {
+        for i in 0..n {
+            if reach[i][k] {
+                for j in 0..n {
+                    if reach[k][j] {
+                        reach[i][j] = true;
+                    }
+                }
+            }
+        }
+    }
+    reach
+}
+
 /// True when a call's arguments are all invariant: each is a constant, or a
 /// read of a whole local that the loop neither defines nor moves.
 fn call_args_invariant(args: &[Operand], is_invariant: &impl Fn(u32) -> bool) -> bool {

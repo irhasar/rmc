@@ -23,16 +23,42 @@ struct Sym {
     /// True for a `.set` constant, whose `off` is its value rather than an
     /// offset into `sec`.
     abs: bool,
+    /// Where the label appeared relative to an align directive at the same
+    /// offset. `parse` numbers definitions and align points off one counter;
+    /// a smaller `ord` means "defined before the padding". Without this the two
+    /// are indistinguishable, and a label sharing an offset with `.p2align`
+    /// could land on the far side of the pad.
+    ord: u64,
+}
+
+/// How a fixup's displacement field is written once every section has an
+/// address.
+#[derive(Clone, Copy, PartialEq)]
+enum FixKind {
+    /// A 32-bit displacement: a RIP-relative memory operand, or a `call`.
+    Rel32,
+    /// A `jmp rel32` (`E9`), which `relax_branches` may shrink to `EB rel8`.
+    Jmp,
+    /// A `jcc rel32` (`0F 8x`) with this condition code, which
+    /// `relax_branches` may shrink to `7x rel8`.
+    Jcc(u8),
 }
 
 /// A reference resolved once every section has an address.
+#[derive(Clone)]
 struct Fixup {
     sec: usize,
-    /// Offset of the 4-byte PC-relative field to patch.
+    /// Offset of the PC-relative field to patch.
     disp_off: usize,
     /// Offset of the end of the instruction the field belongs to.
     next_off: usize,
     sym: String,
+    kind: FixKind,
+    /// Field width in bytes: 4 normally, 1 once a branch is relaxed.
+    width: u8,
+    /// Which branch this is, in emission order, for `assemble`'s relaxation
+    /// fixpoint; `usize::MAX` for a non-branch fixup.
+    branch: usize,
 }
 
 struct Section {
@@ -57,6 +83,17 @@ pub struct Elf {
     /// 4-byte absolute symbol immediates (`mov $sym, %reg`).
     abs_imm: Vec<(usize, usize, String)>,
     text_idx: usize,
+    /// Branches seen so far, used to number them for `relax_branches`.
+    nbranches: usize,
+    /// Every `.p2align`/`.balign` the parser honoured, as `(section, offset,
+    /// alignment)`. Relaxing a branch removes bytes, which would pull a later
+    /// `.p2align` out of alignment, so `realign` re-establishes these once the
+    /// branch lengths are settled. The last field is the definition order, so a
+    /// label at the same offset can be placed on the correct side of the pad.
+    align_pts: Vec<(usize, u64, u64, u64)>,
+    /// Definition counter: labels and align directives share it so their
+    /// relative order at the same offset is preserved.
+    defs: u64,
 }
 
 /// Assemble `asm` (the text `compile_to_asm` returns) into a static executable.
@@ -82,8 +119,12 @@ pub fn assemble(asm: &str) -> Result<Vec<u8>, String> {
         abs64: Vec::new(),
         abs_imm: Vec::new(),
         text_idx: 0,
+        nbranches: 0,
+        align_pts: Vec::new(),
+        defs: 0,
     };
     e.parse(asm)?;
+    e.relax_branches()?;
     e.layout()?;
     Ok(e.emit())
 }
@@ -124,7 +165,9 @@ impl Elf {
                 let name = name.trim();
                 if !name.is_empty() && !name.contains(char::is_whitespace) {
                     let off = self.sections[cur].data.len() as u64;
-                    self.syms.insert(name.to_string(), Sym { sec: cur, off, abs: false });
+                    let ord = self.defs;
+                    self.defs += 1;
+                    self.syms.insert(name.to_string(), Sym { sec: cur, off, abs: false, ord });
                     line = rest[1..].trim();
                     if line.is_empty() {
                         continue;
@@ -145,7 +188,7 @@ impl Elf {
             // the end of whatever section the file finished in.
             let (va, sa) = self.sym_value_at(&a, sec, dot)?;
             let (vb, _) = self.sym_value_at(&b, sec, dot)?;
-            self.syms.insert(name, Sym { sec: sa, off: (va - vb) as u64, abs: true });
+            self.syms.insert(name, Sym { sec: sa, off: (va - vb) as u64, abs: true, ord: 0 });
         }
         Ok(())
     }
@@ -183,13 +226,17 @@ impl Elf {
             "align" | "balign" => {
                 let n: u64 = arg.parse().map_err(|_| format!("elf: bad .align `{arg}`"))?;
                 if n > 1 {
-                    self.pad_to_align(*cur, n);
+                    let ord = self.defs;
+                    self.defs += 1;
+                    self.align_pts.push((*cur, self.sections[*cur].data.len() as u64, n, ord));
                 }
             }
             "p2align" => {
                 let n: u32 = arg.parse().map_err(|_| format!("elf: bad .p2align `{arg}`"))?;
                 if n > 0 {
-                    self.pad_to_align(*cur, 1u64 << n);
+                    let ord = self.defs;
+                    self.defs += 1;
+                    self.align_pts.push((*cur, self.sections[*cur].data.len() as u64, 1u64 << n, ord));
                 }
             }
             "globl" | "type" | "size" => {}
@@ -236,6 +283,7 @@ impl Elf {
         Ok(())
     }
 
+    #[cfg(test)]
     fn pad_to_align(&mut self, sec: usize, n: u64) {
         let len = self.sections[sec].data.len() as u64;
         let pad = (n - (len % n)) % n;
@@ -248,23 +296,8 @@ impl Elf {
             // long run of 1-byte nops -- plus the branch that jumps over it --
             // costs real run-time in a hot loop. Multi-byte `nop`s keep the
             // padding to one or two instructions, which is what `as` emits.
-            let mut left = pad as usize;
-            while left > 0 {
-                let k = left.min(9);
-                let nop: &[u8] = match k {
-                    1 => &[0x90],
-                    2 => &[0x66, 0x90],
-                    3 => &[0x0F, 0x1F, 0x00],
-                    4 => &[0x0F, 0x1F, 0x40, 0x00],
-                    5 => &[0x0F, 0x1F, 0x44, 0x00, 0x00],
-                    6 => &[0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00],
-                    7 => &[0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00],
-                    8 => &[0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
-                    _ => &[0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
-                };
-                self.sections[sec].data.extend_from_slice(nop);
-                left -= k;
-            }
+            let nops = nop_fill(pad as usize);
+            self.sections[sec].data.extend_from_slice(&nops);
         } else {
             // A zero byte is `add %al,(%rax)` in an executable section, which
             // would fault if control ever reached it; other sections want real
@@ -294,6 +327,262 @@ impl Elf {
     /// Assign every section a file offset and a virtual address, then resolve
     /// fixups. `vaddr = BASE + file_off`, so the kernel's `p_vaddr % p_align ==
     /// p_offset % p_align` requirement holds automatically.
+    /// Shrink every branch whose target is close enough to reach with an 8-bit
+    /// displacement, the way GNU `as` relaxes branches: `jmp` becomes `EB rel8`
+    /// (5 bytes to 2) and `jcc` becomes `7x rel8` (6 bytes to 2). Also insert
+    /// the padding for every `.p2align`/`.balign`.
+    ///
+    /// The two run together because they interact. Shortening a branch removes
+    /// bytes from before every later label, which moves the `.p2align` points
+    /// that follow it; re-establishing the alignment inserts bytes back, which
+    /// moves the labels again. A branch is relaxed only when its displacement
+    /// fits *with the padding that the relaxed layout itself creates*, so the
+    /// two are solved as one fixed point rather than one after the other.
+    ///
+    /// Each round recomputes every branch's displacement from the same layout
+    /// and decides all of them at once. Deciding one at a time from a layout
+    /// that is stale by one branch is how an earlier version produced a `jcc`
+    /// whose displacement did not fit in the 8 bits it was written into.
+    ///
+    /// Branch length is not cosmetic. `stats`'s inner loop came out 22% slower
+    /// than LLVM with its three branches left as rel32 and 15% faster once they
+    /// were relaxed: the extra bytes are extra work on every iteration.
+    fn relax_branches(&mut self) -> Result<(), String> {
+        let n = self.nbranches;
+        let mut order: Vec<usize> = self
+            .fixups
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.branch != usize::MAX)
+            .map(|(i, _)| i)
+            .collect();
+        order.sort_by_key(|&i| self.fixups[i].next_off);
+        let len_of = |k: FixKind| match k {
+            FixKind::Jcc(_) => 6,
+            FixKind::Jmp => 5,
+            FixKind::Rel32 => 0,
+        };
+        let orig_len: Vec<i64> = order.iter().map(|&i| len_of(self.fixups[i].kind)).collect();
+        let orig_start: Vec<i64> = order
+            .iter()
+            .map(|&i| self.fixups[i].next_off as i64 - len_of(self.fixups[i].kind))
+            .collect();
+        let orig_end: Vec<i64> = order.iter().map(|&i| self.fixups[i].next_off as i64).collect();
+        let sec_of: Vec<usize> = order.iter().map(|&i| self.fixups[i].sec).collect();
+        let target: Vec<Option<i64>> = order
+            .iter()
+            .map(|&i| {
+                let f = &self.fixups[i];
+                match self.syms.get(&f.sym) {
+                    // Only a branch to a label in the same section can be near;
+                    // anything else keeps its rel32 encoding.
+                    Some(s) if s.sec == f.sec && !s.abs => Some(s.off as i64),
+                    _ => None,
+                }
+            })
+            .collect();
+        // A branch's target is an instruction position: any padding at the same
+        // offset comes *after* it, so it is not moved by that padding.
+        let target_ord: Vec<u64> = order
+            .iter()
+            .map(|&i| {
+                let f = &self.fixups[i];
+                self.syms
+                    .get(&f.sym)
+                    .filter(|s| s.sec == f.sec && !s.abs)
+                    .map(|s| s.ord)
+                    .unwrap_or(u64::MAX)
+            })
+            .collect();
+        // A pad at an instruction's *start* offset comes from a `.p2align`
+        // before it, so it precedes the instruction; a pad at an instruction's
+        // *end* offset comes from a `.p2align` after it, so it follows. The two
+        // sentinels let `net` place a pad on the correct side of each end.
+        const PAD_BEFORE: u64 = u64::MAX;
+        const PAD_AFTER: u64 = 0;
+        let nsec = self.sections.len();
+        // Align points in layout order. Two at the same offset keep their
+        // definition order, so the pad they describe lands where the source put
+        // it.
+        let mut al: Vec<(usize, i64, i64, u64)> = self
+            .align_pts
+            .iter()
+            .map(|(s, o, a, ord)| (*s, *o as i64, *a as i64, *ord))
+            .collect();
+        al.sort_by_key(|(s, o, _, ord)| (*s, *o, *ord));
+
+        // Padding inserted at `o` moves a definition at the same offset only
+        // when the padding comes first in the source (`pad_ord < ord`).
+        // `PAD_BEFORE`/`PAD_AFTER` place a pad at an instruction's start/end on
+        // the correct side of it.
+        let inserted_before = |pts: &[(i64, i64, u64)], o: i64, ord: u64| -> i64 {
+            pts.iter()
+                .filter(|(e, _, pord)| *e < o || (*e == o && *pord < ord))
+                .map(|(_, a, _)| *a)
+                .sum()
+        };
+        // The layout implied by `short`: the bytes each shortened branch
+        // removes, and the padding each align point then needs.
+        let compute = |short: &[bool]| -> (Vec<Vec<(i64, i64)>>, Vec<Vec<(i64, i64, u64)>>) {
+            let mut rem = vec![Vec::new(); nsec];
+            for b in 0..n {
+                if short[b] {
+                    rem[sec_of[b]].push((orig_end[b], orig_len[b] - 2));
+                }
+            }
+            // A removal at `e` takes bytes that lie before `e`, so it shifts
+            // `e` itself and counts with `<=`. Padding lands after whatever is
+            // already at its offset; whether it moves a given definition at the
+            // same offset is decided by `ord` in `net`.
+            let removed_before = |pts: &[(i64, i64)], o: i64| -> i64 {
+                pts.iter().filter(|(e, _)| *e <= o).map(|(_, a)| *a).sum()
+            };
+            let mut pads: Vec<Vec<(i64, i64, u64)>> = vec![Vec::new(); nsec];
+            for &(sec, o, a, ord) in &al {
+                let pos = o - removed_before(&rem[sec], o) + inserted_before(&pads[sec], o, ord);
+                let pad = (a - pos.rem_euclid(a)) % a;
+                if pad > 0 {
+                    pads[sec].push((o, pad, ord));
+                }
+            }
+            (rem, pads)
+        };
+        // How far an original offset moves: down by the removals before it, up
+        // by the padding inserted before it.
+        let net = |rem: &[Vec<(i64, i64)>],
+                   pads: &[Vec<(i64, i64, u64)>],
+                   sec: usize,
+                   o: i64,
+                   ord: u64|
+         -> i64 {
+            let rm: i64 = rem[sec].iter().filter(|(e, _)| *e <= o).map(|(_, a)| *a).sum();
+            let ins: i64 = inserted_before(&pads[sec], o, ord);
+            rm - ins
+        };
+        let disp = |rem: &[Vec<(i64, i64)>],
+                    pads: &[Vec<(i64, i64, u64)>],
+                    short: &[bool],
+                    b: usize|
+         -> Option<i64> {
+            let t0 = target[b]?;
+            let sec = sec_of[b];
+            let start = orig_start[b] - net(rem, pads, sec, orig_start[b], PAD_BEFORE);
+            let len = if short[b] { 2 } else { orig_len[b] };
+            let t = t0 - net(rem, pads, sec, t0, target_ord[b]);
+            Some(t - (start + len))
+        };
+
+        let mut short = vec![false; n];
+        for _ in 0..64 {
+            let (rem, pads) = compute(&short);
+            let next: Vec<bool> = (0..n)
+                .map(|b| matches!(disp(&rem, &pads, &short, b), Some(d) if (-128..=127).contains(&d)))
+                .collect();
+            if next == short {
+                break;
+            }
+            short = next;
+        }
+        // A branch that ends up out of range keeps its rel32 form; the rel32
+        // encoding reaches anywhere this compiler emits.
+        for _ in 0..64 {
+            let (rem, pads) = compute(&short);
+            let mut changed = false;
+            for b in 0..n {
+                if short[b] {
+                    let fits = matches!(disp(&rem, &pads, &short, b), Some(d) if (-128..=127).contains(&d));
+                    if !fits {
+                        short[b] = false;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let (rem, pads) = compute(&short);
+
+        // Splice the shortened branches, furthest along first, so each branch's
+        // start is still at its original offset when it is reached.
+        for b in (0..n).rev() {
+            if !short[b] {
+                continue;
+            }
+            let f = self.fixups[order[b]].clone();
+            let short_op = match f.kind {
+                FixKind::Jmp => 0xEBu8,
+                FixKind::Jcc(cc) => cc - 0x10,
+                FixKind::Rel32 => unreachable!("only branches carry a branch id"),
+            };
+            let start = orig_start[b] as usize;
+            let d = &mut self.sections[f.sec].data;
+            d[start] = short_op;
+            d.drain(start + 1..start + 1 + (orig_len[b] - 2) as usize);
+        }
+        // Insert the padding, in address order, tracking what is already in.
+        for sec in 0..nsec {
+            for &(o, pad, ord) in &pads[sec].clone() {
+                let removed: i64 = rem[sec].iter().filter(|(e, _)| *e <= o).map(|(_, a)| *a).sum();
+                let inserted: i64 = pads[sec]
+                    .iter()
+                    .filter(|(e, _, pord)| *e < o || (*e == o && *pord < ord))
+                    .map(|(_, a, _)| *a)
+                    .sum();
+                let at = (o - removed + inserted) as usize;
+                let fill = if self.sections[sec].flags & 0x1 != 0 {
+                    nop_fill(pad as usize)
+                } else {
+                    vec![0u8; pad as usize]
+                };
+                self.sections[sec].data.splice(at..at, fill);
+            }
+        }
+        // Move every offset to its final place.
+        let sections = self.sections.len();
+        for sec in 0..sections {
+            for sym in self.syms.values_mut() {
+                if sym.sec == sec && !sym.abs {
+                    sym.off =
+                        (sym.off as i64 - net(&rem, &pads, sec, sym.off as i64, sym.ord)) as u64;
+                }
+            }
+            for (s, o, _) in self.abs64.iter_mut() {
+                if *s == sec {
+                    *o = (*o as i64 - net(&rem, &pads, sec, *o as i64, PAD_BEFORE)) as usize;
+                }
+            }
+            for (s, o, _) in self.abs_imm.iter_mut() {
+                if *s == sec {
+                    *o = (*o as i64 - net(&rem, &pads, sec, *o as i64, PAD_BEFORE)) as usize;
+                }
+            }
+            for fx in self.fixups.iter_mut() {
+                if fx.sec == sec {
+                    fx.disp_off = (fx.disp_off as i64
+                        - net(&rem, &pads, sec, fx.disp_off as i64, PAD_BEFORE))
+                        as usize;
+                    fx.next_off = (fx.next_off as i64
+                        - net(&rem, &pads, sec, fx.next_off as i64, PAD_AFTER))
+                        as usize;
+                }
+            }
+        }
+        // Point each shortened branch at its new 1-byte field.
+        for b in 0..n {
+            if !short[b] {
+                continue;
+            }
+            let sec = sec_of[b];
+            let start = orig_start[b] - net(&rem, &pads, sec, orig_start[b], PAD_BEFORE);
+            let fx = &mut self.fixups[order[b]];
+            fx.disp_off = start as usize + 1;
+            fx.next_off = start as usize + 2;
+            fx.width = 1;
+        }
+        Ok(())
+    }
+
     fn layout(&mut self) -> Result<(), String> {
         let nphdr = 2usize; // RX and RW
         let mut off = (64 + nphdr * 56) as u64;
@@ -339,9 +628,13 @@ impl Elf {
             let tva = self.sections[target.sec].vaddr + target.off;
             let next = self.sections[f.sec].vaddr + f.next_off as u64;
             let disp = (tva as i64) - (next as i64);
-            let b = (disp as i32).to_le_bytes();
             let d = &mut self.sections[f.sec].data;
-            d[f.disp_off..f.disp_off + 4].copy_from_slice(&b);
+            if f.width == 1 {
+                d[f.disp_off] = disp as i8 as u8;
+            } else {
+                let b = (disp as i32).to_le_bytes();
+                d[f.disp_off..f.disp_off + 4].copy_from_slice(&b);
+            }
         }
 
         for (sec, o, sym) in self.abs64.clone() {
@@ -448,6 +741,43 @@ impl Elf {
     }
 }
 
+/// The longest single-instruction `nop` encodings, indexed by length 1..=11.
+/// 11 bytes is the longest a single x86-64 `nop` can be.
+fn long_nop(n: usize) -> &'static [u8] {
+    match n {
+        1 => &[0x90],
+        2 => &[0x66, 0x90],
+        3 => &[0x0F, 0x1F, 0x00],
+        4 => &[0x0F, 0x1F, 0x40, 0x00],
+        5 => &[0x0F, 0x1F, 0x44, 0x00, 0x00],
+        6 => &[0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00],
+        7 => &[0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00],
+        8 => &[0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        9 => &[0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        10 => &[0x66, 0x2E, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        _ => &[0x66, 0x66, 0x2E, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+    }
+}
+
+/// The `nop` sequence to pad `n` bytes of code with, using as few instructions
+/// as possible: the longest `nop` that fits, then the longest that fits in what
+/// is left.
+///
+/// This is not cosmetic. A loop's `.p2align` padding sits on the fall-through
+/// path, so it runs on every iteration that does not take the loop's exit
+/// branch. Filling a 15-byte gap with a 9-byte `nop` plus a `66 90` plus a
+/// 4-byte one added an instruction per iteration and cost 18% on `stats`'s
+/// inner loop -- 3.08 ms against 2.53 ms for the two-`nop` fill.
+fn nop_fill(n: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(n);
+    let mut left = n;
+    while left > 0 {
+        let k = left.min(11);
+        out.extend_from_slice(long_nop(k));
+        left -= k;
+    }
+    out
+}
 fn align_up(v: u64, a: u64) -> u64 {
     if a <= 1 {
         v
@@ -538,7 +868,7 @@ impl Elf {
             }
             "jmp" => {
                 self.sections[sec].data.push(0xE9);
-                self.pc_rel(sec, &ops[0]);
+                self.pc_rel(sec, &ops[0], FixKind::Jmp);
                 Ok(())
             }
             "call" => {
@@ -560,7 +890,7 @@ impl Elf {
                     return Ok(());
                 }
                 self.sections[sec].data.push(0xE8);
-                self.pc_rel(sec, &ops[0]);
+                self.pc_rel(sec, &ops[0], FixKind::Rel32);
                 Ok(())
             }
             "ret" => {
@@ -602,9 +932,24 @@ impl Elf {
     }
 
     /// Reserve a 4-byte PC-relative field and record the fixup.
-    fn pc_rel(&mut self, sec: usize, sym: &str) {
+    fn pc_rel(&mut self, sec: usize, sym: &str, kind: FixKind) {
         let disp_off = self.sections[sec].data.len();
-        self.fixups.push(Fixup { sec, disp_off, next_off: disp_off + 4, sym: sym.to_string() });
+        let branch = if kind == FixKind::Rel32 {
+            usize::MAX
+        } else {
+            let b = self.nbranches;
+            self.nbranches += 1;
+            b
+        };
+        self.fixups.push(Fixup {
+            sec,
+            disp_off,
+            next_off: disp_off + 4,
+            sym: sym.to_string(),
+            kind,
+            width: 4,
+            branch,
+        });
         self.sections[sec].data.extend_from_slice(&[0; 4]);
     }
 
@@ -692,7 +1037,15 @@ impl Elf {
             if let Some(sym) = m.rip_label.clone() {
                 self.sections[sec].data.extend_from_slice(&out);
                 let len = self.sections[sec].data.len();
-                self.fixups.push(Fixup { sec, disp_off: len - 4, next_off: len, sym });
+                self.fixups.push(Fixup {
+                    sec,
+                    disp_off: len - 4,
+                    next_off: len,
+                    sym,
+                    kind: FixKind::Rel32,
+                    width: 4,
+                    branch: usize::MAX,
+                });
                 return Ok(());
             }
         }
@@ -716,7 +1069,15 @@ impl Elf {
             if let Some(sym) = m.rip_label.clone() {
                 self.sections[sec].data.extend_from_slice(&out);
                 let len = self.sections[sec].data.len();
-                self.fixups.push(Fixup { sec, disp_off: len - 4, next_off: len, sym });
+                self.fixups.push(Fixup {
+                    sec,
+                    disp_off: len - 4,
+                    next_off: len,
+                    sym,
+                    kind: FixKind::Rel32,
+                    width: 4,
+                    branch: usize::MAX,
+                });
                 return Ok(());
             }
         }
@@ -756,7 +1117,15 @@ impl Elf {
                     if let Some(sym) = m.rip_label.clone() {
                         self.sections[sec].data.extend_from_slice(&out);
                         let len = self.sections[sec].data.len();
-                        self.fixups.push(Fixup { sec, disp_off: len - 4, next_off: len, sym });
+                        self.fixups.push(Fixup {
+                    sec,
+                    disp_off: len - 4,
+                    next_off: len,
+                    sym,
+                    kind: FixKind::Rel32,
+                    width: 4,
+                    branch: usize::MAX,
+                });
                         return Ok(());
                     }
                 }
@@ -837,7 +1206,15 @@ impl Elf {
         emit_mem_modrm(&mut self.sections[sec].data, &m, dreg);
         if let Some(sym) = m.rip_label.clone() {
             let len = self.sections[sec].data.len();
-            self.fixups.push(Fixup { sec, disp_off: len - 4, next_off: len, sym });
+            self.fixups.push(Fixup {
+                sec,
+                disp_off: len - 4,
+                next_off: len,
+                sym,
+                kind: FixKind::Rel32,
+                width: 4,
+                branch: usize::MAX,
+            });
         }
         Ok(())
     }
@@ -887,7 +1264,15 @@ impl Elf {
         emit_mem_op(&mut self.sections[sec].data, opcode, m, reg, rex_w, force_rex);
         if let Some(sym) = m.rip_label.clone() {
             let len = self.sections[sec].data.len();
-            self.fixups.push(Fixup { sec, disp_off: len - 4, next_off: len, sym });
+            self.fixups.push(Fixup {
+                sec,
+                disp_off: len - 4,
+                next_off: len,
+                sym,
+                kind: FixKind::Rel32,
+                width: 4,
+                branch: usize::MAX,
+            });
         }
     }
 
@@ -1354,35 +1739,13 @@ impl Elf {
             "jnp" => 0x8B,
             other => return Err(format!("elf: unsupported branch `{other}`")),
         };
-        // A backward branch to an already-defined label is almost always a loop
-        // back-edge, and its length decides where the code after the loop
-        // lands: the 6-byte rel32 form shifts the loop exit 4 bytes later than
-        // the 2-byte rel8 form `as` emits, which measured a 20% run-time
-        // regression on `fib`. Emit rel8 when the target is in range; otherwise
-        // fall back to rel32.
-        if self.try_short_jcc(cc, sec, &ops[0]) {
-            return Ok(());
-        }
+        // Always emit the 6-byte `jcc rel32` here; `relax_branches` shrinks it
+        // to the 2-byte `jcc rel8` once every label's address is known. The
+        // length matters: the rel32 form puts the code after the branch 4 bytes
+        // further along than `as`'s relaxed rel8, which measured 22% on `stats`.
         self.sections[sec].data.extend_from_slice(&[0x0F, cc]);
-        self.pc_rel(sec, &ops[0]);
+        self.pc_rel(sec, &ops[0], FixKind::Jcc(cc));
         Ok(())
-    }
-
-    /// Emit a 2-byte `jcc rel8` when the target is a label already defined in
-    /// this section and the displacement fits. Returns whether it did.
-    fn try_short_jcc(&mut self, cc: u8, sec: usize, sym: &str) -> bool {
-        if let Some(s) = self.syms.get(sym) {
-            if s.sec == sec && !s.abs {
-                let at = self.sections[sec].data.len() as i64;
-                let disp = s.off as i64 - (at + 2);
-                if (-128..=127).contains(&disp) {
-                    self.sections[sec].data.push(cc - 0x10);
-                    self.sections[sec].data.push(disp as u8);
-                    return true;
-                }
-            }
-        }
-        false
     }
 }
 
@@ -1872,6 +2235,9 @@ mod tests {
             fixups: Vec::new(),
             abs64: Vec::new(),
             abs_imm: Vec::new(),
+            nbranches: 0,
+            align_pts: Vec::new(),
+            defs: 0,
             text_idx: 0,
         }
     }
@@ -1959,6 +2325,8 @@ mod tests {
         let mut e = test_elf(0x5);
         let (mut cur, mut sets) = (0usize, Vec::new());
         e.directive("p2align 4", &mut cur, &mut sets).unwrap();
+        assert_eq!(e.sections[0].data.len(), 3, "recorded, not padded yet");
+        e.relax_branches().unwrap();
         assert_eq!(e.sections[0].data.len(), 16);
     }
 
@@ -1968,6 +2336,8 @@ mod tests {
         let mut e = test_elf(0x5);
         let (mut cur, mut sets) = (0usize, Vec::new());
         e.directive("balign 8", &mut cur, &mut sets).unwrap();
+        assert_eq!(e.sections[0].data.len(), 3, "recorded, not padded yet");
+        e.relax_branches().unwrap();
         assert_eq!(e.sections[0].data.len(), 8);
     }
 

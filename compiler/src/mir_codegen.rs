@@ -36,6 +36,11 @@ const PROMOTE_REGS: [&str; 5] = ["%rbx", "%r12", "%r13", "%r14", "%r15"];
 /// functions that contain no call at all.
 const CALLER_REGS: [&str; 4] = ["%rsi", "%rdi", "%r8", "%r9"];
 
+/// A loop whose body holds at least this many MIR statements is pinned to a
+/// 16-byte boundary (`loop_bodies_to_align`). Below it the body is short enough
+/// to sit inside one fetch window already, and pinning it only adds padding.
+const LOOP_ALIGN_MIN_STMTS: usize = 10;
+
 pub struct Options {
     /// Promote hot locals into callee-saved registers (on by default).
     ///
@@ -1579,24 +1584,7 @@ impl<'a> FnGen<'a> {
             .iter()
             .map(|b| successors(&b.term).into_iter().filter(|s| (*s as usize) < n).collect())
             .collect();
-        // Transitive closure: `reach[i][j]` when `i` can reach `j`.
-        let mut reach: Vec<Vec<bool>> = vec![vec![false; n]; n];
-        for (i, s) in succ.iter().enumerate() {
-            for &t in s {
-                reach[i][t as usize] = true;
-            }
-        }
-        for k in 0..n {
-            for i in 0..n {
-                if reach[i][k] {
-                    for j in 0..n {
-                        if reach[k][j] {
-                            reach[i][j] = true;
-                        }
-                    }
-                }
-            }
-        }
+        let reach = block_reachability(&succ);
         let mut depths = vec![0u32; n];
         for (latch, s) in succ.iter().enumerate() {
             for &header in s {
@@ -1614,6 +1602,62 @@ impl<'a> FnGen<'a> {
             }
         }
         depths
+    }
+
+    /// The loop-body entry block of each natural loop, to pin to a 16-byte
+    /// boundary. A loop's body is the hot region, and its speed is otherwise an
+    /// alignment lottery: a one-byte shift anywhere earlier in the function
+    /// moves it relative to the fetch windows, which measured up to 1.4x on
+    /// `stats`'s division loop. The body entry is the header's successor that
+    /// belongs to the loop; that is the block the loop runs first, whether the
+    /// header falls through to it or jumps.
+    ///
+    /// A back edge here is an edge `latch -> header` with `header` before
+    /// `latch` in block order and a cycle back from `header` to `latch`. Block
+    /// order is the emission order, so a lower index means an earlier address
+    /// and the edge really does jump backwards. Dominance would be the textbook
+    /// test, but `stats` reaches its latch from a block outside the loop as
+    /// well, so its header does not strictly dominate the latch; the index
+    /// order identifies that loop where dominance would miss it.
+    fn loop_bodies_to_align(&self) -> HashSet<u32> {
+        let n = self.func.blocks.len();
+        let succ: Vec<Vec<u32>> = self
+            .func
+            .blocks
+            .iter()
+            .map(|b| successors(&b.term).into_iter().filter(|s| (*s as usize) < n).collect())
+            .collect();
+        let reach = block_reachability(&succ);
+        let mut bodies: HashSet<u32> = HashSet::new();
+        for (latch, s) in succ.iter().enumerate() {
+            for &header in s {
+                let h = header as usize;
+                if h >= latch || !reach[h][latch] {
+                    continue;
+                }
+                let body: Vec<u32> = (0..n)
+                    .filter(|x| *x == h || (reach[h][*x] && reach[*x][latch]))
+                    .map(|x| x as u32)
+                    .collect();
+                let stmts: usize = body
+                    .iter()
+                    .map(|x| self.func.blocks[*x as usize].stmts.len())
+                    .sum();
+                if stmts < LOOP_ALIGN_MIN_STMTS {
+                    continue;
+                }
+                let members: HashSet<u32> = body.iter().copied().collect();
+                let entry = successors(&self.func.blocks[h].term)
+                    .into_iter()
+                    .filter(|s| members.contains(s))
+                    .min()
+                    .or_else(|| body.iter().copied().filter(|x| *x != header).min());
+                if let Some(entry) = entry {
+                    bodies.insert(entry);
+                }
+            }
+        }
+        bodies
     }
 
     /// Which locals are live at each block's entry, by a backwards fixpoint over
@@ -2065,16 +2109,18 @@ impl<'a> FnGen<'a> {
         for (v, reg) in caller_consts {
             let _ = writeln!(self.out, "  movabs ${v}, {reg}");
         }
+        let bodies = self.loop_bodies_to_align();
         for i in 0..self.func.blocks.len() as u32 {
-            // No loop-header alignment. Aligning a loop header to 32 bytes
-            // inserts a run of `nop`s the preheader jumps over, and whether that
-            // helps or hurts is a per-loop lottery: it measured +8% on `sieve`
-            // (a long marking loop that then fits one fetch window) and -15% on
-            // `callrec` (a three-instruction recursion, where the padding and
-            // the entry jump cost more than the straddle they remove). Leaving
-            // the loop where the layout put it keeps the common case -- a short
-            // loop that already sits inside a window -- untouched, and never
-            // pays for padding it does not need.
+            // Pin a loop's body entry to a 16-byte fetch boundary, as the `.rms`
+            // path does. The body is where the loop spends its iterations, and
+            // without the pin a one-byte shift earlier in the function moves it
+            // relative to the fetch windows -- up to 1.4x on `stats`'s division
+            // loop. The header is left where the layout put it: pinning the
+            // header instead costs padding on the preheader's fall-through and
+            // measured a net loss on short loops.
+            if bodies.contains(&i) {
+                let _ = writeln!(self.out, "  .p2align 4");
+            }
             let _ = writeln!(self.out, ".Lbb{}:", self.bb_label(i));
             self.gen_block(i)?;
         }
@@ -4819,6 +4865,217 @@ impl<'a> FnGen<'a> {
     }
 }
 
+/// Fold `mov %a, %b` into the reads of `%b` that follow, when `%b` is dead
+/// afterwards.
+///
+/// `heap`'s traversal loop copies its cursor into a second register before each
+/// dereference (`mov %r15, %r14; mov %rax, %r15; mov (%rax), ...`), because the
+/// register allocator works per MIR local. While `%b` still holds `%a` and
+/// neither is rewritten, every read of `%b` can name `%a`; if `%b` carries
+/// nothing past the region, the copy goes too.
+///
+/// The region stops at the first label (a branch could enter with a different
+/// `%a`), the first control transfer, or the first write to either register.
+/// Only registers with no implicit operand role take part: renaming a read of
+/// `%rax` or `%rcx` would leave a `mul`/`div`/shift's implicit use pointing at a
+/// value the dropped copy no longer put there.
+fn propagate_copies(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let Some((a, b)) = mov_reg_reg(lines[i]) else {
+            out.push_str(lines[i]);
+            out.push('\n');
+            i += 1;
+            continue;
+        };
+        if !is_copy_safe_reg(a) || !is_copy_safe_reg(b) || a == b {
+            out.push_str(lines[i]);
+            out.push('\n');
+            i += 1;
+            continue;
+        }
+        let mut k = i + 1;
+        while k < lines.len() {
+            let lt = lines[k].trim();
+            let op = lt.split_whitespace().next().unwrap_or("");
+            if lt.ends_with(':') || lt.starts_with('.') {
+                break;
+            }
+            if op.starts_with('j') || matches!(op, "ret" | "call" | "syscall") {
+                break;
+            }
+            if written_regs(op, lt).iter().any(|r| r == a || r == b) {
+                break;
+            }
+            k += 1;
+        }
+        if k > i + 1 && dead_after(&lines, i, k, b) {
+            for m in &lines[i + 1..k] {
+                out.push_str(&replace_reg(m, b, a));
+                out.push('\n');
+            }
+            i = k;
+            continue;
+        }
+        out.push_str(lines[i]);
+        out.push('\n');
+        i += 1;
+    }
+    out
+}
+
+/// True for a register the copy rename cannot disturb: it has no implicit
+/// operand role in any instruction the generator emits.
+fn is_copy_safe_reg(r: &str) -> bool {
+    matches!(
+        r,
+        "%rbx" | "%r8" | "%r9" | "%r10" | "%r11" | "%r12" | "%r13" | "%r14" | "%r15"
+    )
+}
+
+/// The register a memory operand is based on: `8(%r14)` -> `%r14`.
+fn base_reg(slot: &str) -> Option<&str> {
+    let l = slot.find('(')?;
+    let r = slot[l + 1..].find(')')? + l + 1;
+    let b = &slot[l + 1..r];
+    is_reg(b).then_some(b)
+}
+
+/// Rewrite a memory operand's base register: `8(%rax)` -> `8(%r14)`.
+fn replace_base(slot: &str, from: &str, to: &str) -> String {
+    let Some(l) = slot.find('(') else { return slot.to_string() };
+    let Some(rel) = slot[l + 1..].find(')') else { return slot.to_string() };
+    let r = rel + l + 1;
+    if &slot[l + 1..r] != from {
+        return slot.to_string();
+    }
+    format!("{}({}){}", &slot[..l], to, &slot[r + 1..])
+}
+
+/// Fold `mov <base>, t` into the loads that immediately follow it through `t`.
+///
+/// The allocator parks an address in a scratch register before each
+/// dereference, so `heap`'s traversal loop reads
+/// `mov %r14, %rax; mov (%rax), %rax; add %rax, %rsi` where LLVM folds the base
+/// straight into the load. The region is the contiguous run of loads based on
+/// `t`; the run must end by writing `t` itself, so the address in `t` is dead
+/// there and the dropped `mov` cannot be missed. A second load based on `t`
+/// would read the *loaded* value rather than the address, so the run stops at
+/// the first load that writes `t`.
+fn fold_load_copies(body: &str) -> String {
+    const SCRATCH: &[&str] = &["%rax", "%rcx", "%rdx", "%r10", "%r11"];
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if let Some((src, t)) = mov_reg_reg(lines[i]) {
+            // `%rcx`/`%rdx` carry implicit shift and divide operands, so a
+            // dropped `mov` that fed one would change the instruction's
+            // meaning.
+            if SCRATCH.contains(&t) && !matches!(t, "%rcx" | "%rdx") {
+                let mut j = i + 1;
+                let mut loads: Vec<(String, String)> = Vec::new();
+                while j < lines.len() {
+                    let lt = lines[j].trim();
+                    let op = lt.split_whitespace().next().unwrap_or("");
+                    if lt.ends_with(':') || lt.starts_with('.') || op.starts_with('j')
+                        || matches!(op, "ret" | "call" | "syscall")
+                    {
+                        break;
+                    }
+                    match load_pair(lines[j]) {
+                        Some((slot, dst)) if base_reg(slot) == Some(t) => {
+                            let stops = dst == t;
+                            loads.push((replace_base(slot, t, src), dst.to_string()));
+                            j += 1;
+                            if stops {
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                if !loads.is_empty() && loads.last().is_some_and(|(_, d)| d == t) {
+                    for (slot, dst) in &loads {
+                        out.push_str(&format!("  mov {slot}, {dst}\n"));
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        out.push_str(lines[i]);
+        out.push('\n');
+        i += 1;
+    }
+    out
+}
+
+/// Drop the copy back in a `mov %x, %y` ... `mov %y, %x` round trip.
+///
+/// After the first copy `%y` already holds `%x`, so the copy back leaves `%x`
+/// exactly as it was. `heap`'s loops emit the pair around every allocation
+/// (`mov %rax, %r13; ...; mov %r13, %rax`) with a basic-block label between the
+/// two, because the block split falls between them.
+///
+/// Only labels that no branch targets may sit between the pair: control could
+/// otherwise enter with a different value in `%x`, and the copy back would then
+/// be doing real work. Unlike a general copy propagation this needs no
+/// liveness reasoning and is safe for every register, including the
+/// implicit-operand ones.
+fn drop_round_trips(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    // Only a label a branch actually names is a possible entry point; a label
+    // definition (`foo:`) mentions its own name and must not count.
+    let targets: std::collections::HashSet<&str> = lines
+        .iter()
+        .filter(|l| l.trim_start().starts_with('j'))
+        .flat_map(|l| l.split_whitespace())
+        .filter(|t| t.starts_with(".L"))
+        .collect();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if let Some((a, b)) = mov_reg_reg(lines[i]) {
+            if a != b {
+                let mut k = i + 1;
+                let mut blocked = false;
+                while k < lines.len() {
+                    let lt = lines[k].trim();
+                    if lt.ends_with(':') {
+                        if targets.contains(lt.trim_end_matches(':')) {
+                            blocked = true;
+                        }
+                        k += 1;
+                        continue;
+                    }
+                    break;
+                }
+                if !blocked {
+                    if let Some((c, d)) = lines.get(k).and_then(|l| mov_reg_reg(l)) {
+                        if a == d && b == c {
+                            out.push_str(lines[i]);
+                            out.push('\n');
+                            for m in &lines[i + 1..k] {
+                                out.push_str(m);
+                                out.push('\n');
+                            }
+                            i = k + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        out.push_str(lines[i]);
+        out.push('\n');
+        i += 1;
+    }
+    out
+}
+
 /// Collapse a scratch-register round trip into the register it came from.
 ///
 /// A value that lives in a promoted register is copied into `%rax` to be
@@ -5824,6 +6081,9 @@ fn optimize(body: &str) -> String {
         body = fuse_imm(&body);
         body = fuse_lea(&body);
         body = coalesce_scratch(&body);
+        body = drop_round_trips(&body);
+        body = propagate_copies(&body);
+        body = fold_load_copies(&body);
         body = forward_stores(&body);
         body = fold_addresses(&body);
         body = fold_lea_terms(&body);

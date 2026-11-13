@@ -2684,29 +2684,50 @@ register and a spill -- relaxing the threshold globally cost `fib` 22 -> 31 ms.
 
 `light` run_wall went 0.85 -> 1.11 against LLVM on this change alone.
 
-### The `hello` compile-RSS tie is rustc's, not rmc's
+### The `hello` compile-RSS loss was rustc's visible-path resolution
 
-The whole-pipeline compile-RSS axis is a tie overall (mean 0.99), but `hello`
-reads 0.97: rustc's `--emit=mir` front end peaks ~3.5 MB above `--emit=obj` on
-the same source (84.6 vs 81.2 MB), and that dominates the pipeline peak because
-`rmcmir` (3.4 MB) is far below `ld` (4.9 MB). The direction is data-dependent --
-`fib` is the other way (MIR front end *below* LLVM's) -- so it is not a
-systematic penalty. No front-end flag combination closes it: `opt-level=1`/`0`
-and `mir-opt-level=1`/`2` shave 0.5-1 MB but make `light` uncompilable
-(`const LEN`/`wrapping_mul` leak through to rmc's parser), and `-Z embed-metadata=no`
-is a no-op for `--emit=mir`. The `light`/`fib` asymmetry is why the axis is
-reported per program rather than hidden behind the mean.
+The `cb` pipeline used to read 0.97 on `hello`'s compile RSS. The cause was not
+rmc's back end but `write_mir_pretty`: for every type it prints, the pretty
+printer resolves a *visible* path, which walks `visible_parent_map` and
+`module_children` and caches the resulting per-crate maps for the rest of the
+process. On `hello` that alone is ~9 MB of peak RSS, for text rmc immediately
+parses and discards.
 
-Re-verified after merging `rmc-5-frontend`: still 0.96-0.98 on `hello`, and
-three more levers are ruled out. `-Zno-embed-metadata` (no `=`) is not a flag
-at all -- rustc rejects it and exits before compiling, which is why a naive RSS
-probe reads a bogus ~33 MB; only the `-Z embed-metadata=<value>` form parses.
-`MALLOC_ARENA_MAX=1`/`2` does not move rustc's peak (84.0 -> 84.0 MB). And the
-gap is the whole front end, not the MIR print: `-Zmir-opt-level=0` reaches
-82.8 MB, still above LLVM's 81.2 MB, while changing MIR semantics (it is the
-flag that makes `light` uncompilable). rmc's own stage, `rmcmir`, peaks at
-3.4 MB against `ld`'s 4.9 MB, so on this one program the backend already wins
-its stage and only the shared rustc front end decides the pipeline peak.
+A no-op codegen backend pinned it down. Forcing only `mir_keys` costs 0.1 MB
+over `-Zno-codegen`; forcing `optimized_mir` for every key costs ~15.6 MB; and
+`def_path_str` on every key costs ~8.8 MB on its own, which is the whole gap.
+Rendering to a `sink` costs the same as rendering to a `Vec`, so the text is
+not the cost — the path resolution is.
+
+The fix is to render under both path guards:
+
+```rust
+rustc_middle::ty::print::with_no_visible_paths!(
+    rustc_middle::ty::print::with_no_trimmed_paths!({
+        write_mir_pretty(tcx, &mut mir_bytes)
+    })
+);
+```
+
+`with_no_visible_paths!` is the one that pays: `with_no_trimmed_paths!` alone
+moves nothing (`trimmed_def_paths` is a separate query, ~8.1 MB, but the printer
+reaches it only after the visible-path walk). Neither guard changes the
+semantics rmc needs — the parser reads the canonical `core::panicking::panic`
+spelling just as well — and all 12 benchmark programs still produce identical
+output. The `DiagCtxt` "must produce a diagnostic" guard that rendering arms is
+still cleared with `reset_err_count()`; the guards do not disable it.
+
+With the fix, `cb` reads 1.07-1.13 on `hello`'s compile RSS and the whole
+benchmark is `ALL CB WINS` (mean RSS 1.111, wall 1.340, cpu 1.370, size 21.0,
+run_wall 1.079, run_cpu 1.088, run_rss 1.282).
+
+Superseded notes, kept for the record: `opt-level=1`/`0` and `mir-opt-level=1`/`2`
+shave 0.5-1 MB but make `light` uncompilable (`const LEN`/`wrapping_mul` leak
+through to rmc's parser); `-Z embed-metadata=no` is a no-op for `--emit=mir`;
+`-Zno-embed-metadata` (no `=`) is not a flag at all, and rustc exits before
+compiling, which is why a naive RSS probe reads a bogus ~33 MB;
+`MALLOC_ARENA_MAX=1`/`2` does not move the peak; and `-Zmir-opt-level=0`
+reaches 82.8 MB, still above LLVM.
 
 ## Pushing
 

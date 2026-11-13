@@ -143,15 +143,25 @@ impl CodegenBackend for RmcBackend {
         }
 
         let mut mir_bytes: Vec<u8> = Vec::new();
-        if let Err(e) = write_mir_pretty(tcx, &mut mir_bytes) {
+        // Render the MIR without rustc's diagnostic path decoration. The pretty
+        // printer otherwise resolves a *visible* path for every type it prints,
+        // which walks `visible_parent_map` and `module_children` and pins the
+        // resulting per-crate maps for the rest of the process: on `hello` that
+        // costs ~9 MB of peak RSS for text rmc immediately parses and throws
+        // away. Neither decoration is needed here — the parser reads the
+        // canonical `core::panicking::panic` spelling just as well.
+        let rendered = rustc_middle::ty::print::with_no_visible_paths!(
+            rustc_middle::ty::print::with_no_trimmed_paths!({
+                write_mir_pretty(tcx, &mut mir_bytes)
+            })
+        );
+        if let Err(e) = rendered {
             tcx.dcx().fatal(format!("rmc: could not render MIR: {e}"));
         }
-        // Rendering the MIR walks `trimmed_def_paths`, which arms a
-        // "must produce a diagnostic" guard: rustc assumes that any pass
-        // needing trimmed paths is printing something the user will read
-        // (`--emit=mir`, `-Zunpretty`, `-Zdump-mir`, ...). A codegen backend
-        // renders MIR as an implementation detail, so the guard is cleared
-        // here — otherwise rustc's `DiagCtxt` teardown panics.
+        // A codegen backend renders MIR as an implementation detail rather
+        // than for the user, so clear the "must produce a diagnostic" guard
+        // rustc arms around path-decorating output; otherwise `DiagCtxt`
+        // teardown panics.
         tcx.dcx().reset_err_count();
         if let Some(path) = std::env::var_os("RMC_DUMP_MIR") {
             let _ = std::fs::write(&path, &mir_bytes);
