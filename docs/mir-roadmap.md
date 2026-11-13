@@ -177,12 +177,21 @@ The printed-MIR text parser is no longer the only route: `backend/` is a
 `rustc_private` `CodegenBackend` implementation, selected with
 `-Zcodegen-backend=librmc_codegen_backend.so`. One rustc process, no MIR text,
 no second process, no `ld` — rmc receives `mir::Body` directly and writes the
-ELF itself. `bench/run_codegen.py` measures it as `cb`: against LLVM it wins or
-ties on every mean axis (wall 1.12, cpu 1.15, size 18.7, run_wall 1.11, run_cpu
-1.12, run_rss 1.28; compile RSS is a tie at 1.01), and against the printed-MIR
-prototype it is faster to compile (wall 1.04) at identical run time. The
+ELF itself. `bench/run_codegen.py` measures it as `cb`: against LLVM it wins
+every mean axis (wall 1.33, cpu 1.36, rss 1.11, size 21.0, run_wall 1.09,
+run_cpu 1.09, run_rss 1.25), and against the printed-MIR prototype it is faster
+to compile (wall 1.25, cpu 1.24, rss 1.08) at identical run time. The
 printed-MIR path is kept as the correctness oracle and for the standalone
 `rmcmir` driver.
+
+`tests/cb/` is the differential suite for the backend path specifically: it
+drives the real `-Zcodegen-backend` route (skipping cleanly when nightly
+`rustc-dev` is absent) over the shapes the prototype never sees — defining vs
+visible paths, bare unit-struct constants, split promoted chains, the
+`integer_min`/`integer_max` intrinsics, the `todo!`/`unreachable!` message
+helpers, and `const ZeroSized` closures. With those handled, the
+prototype/backend divergence scan over the survey corpus is clean: every case
+the prototype compiles now compiles identically under the backend.
 
 ## What "beat LLVM on every axis" would require, honestly
 

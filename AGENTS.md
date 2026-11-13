@@ -2666,12 +2666,13 @@ the backend the same optimised MIR LLVM would see, and rmc lowers it straight
 to a freestanding ELF. `bench/run_codegen.py` compares it to `rustc -O -C
 lto=fat` per program.
 
-- **`cb` wins or ties every mean axis against LLVM.** Measured: wall 1.12, cpu
-  1.15, rss 1.01 (tie), size 18.7, run_wall 1.11, run_cpu 1.12, run_rss 1.28.
-  The only cell below the band is `hello` compile RSS 0.97, the shared rustc
-  front end plus the ~1.2 MB dylib (vs LLVM's 208 MB `libLLVM`). Against the
-  printed-MIR prototype (`mir`) it is faster to compile (wall 1.04, cpu 1.03)
-  at identical run time: one process, no MIR text, no `ld`.
+- **`cb` wins every mean axis against LLVM.** Measured: wall 1.33, cpu 1.36,
+  rss 1.11, size 21.0, run_wall 1.09, run_cpu 1.09, run_rss 1.25. No per-program
+  cell is below the band any more (the old `hello` compile-RSS loss is gone; see
+  the visible-path note below). Against the printed-MIR prototype (`mir`) it is
+  faster to compile (wall 1.25, cpu 1.24, rss 1.08) at identical run time: one
+  process, no MIR text, no `ld`. Against rustc's Cranelift backend it wins every
+  axis too (wall 1.13, cpu 1.16, size 20.9, run_wall 1.61).
 
 - **The backend is x86-64/executable only, and says so.** `assemble` writes
   x86-64 ELF and rmc supplies its own `_start`, so `codegen_crate` fatals on a
@@ -2960,6 +2961,47 @@ through to rmc's parser); `-Z embed-metadata=no` is a no-op for `--emit=mir`;
 compiling, which is why a naive RSS probe reads a bogus ~33 MB;
 `MALLOC_ARENA_MAX=1`/`2` does not move the peak; and `-Zmir-opt-level=0`
 reaches 82.8 MB, still above LLVM.
+
+### The `cb` route reaches MIR the printed-MIR prototype never sees
+
+`with_no_visible_paths!` is not the only difference between the two routes.
+`-Zno-codegen` and `-Zcodegen-backend` stop the pipeline at different points,
+so the backend sees MIR that `--emit=mir` has already folded away, and it sees
+it spelled with *defining* paths. `tests/cb/` is the differential suite for the
+real backend path (it skips cleanly when nightly `rustc-dev` is absent); the
+cases below are each a shape the prototype never encounters:
+
+- **Defining vs visible paths.** `std::io::stdio::_print`,
+  `core::marker::PhantomData`, `core::intrinsics::compare_bytes`,
+  `core::mem::size_of`. The front end keys every one by path *tail*, so both
+  spellings land on the same symbol.
+- **Bare unit-struct constants.** `--emit=mir` folds `let _p = P;` away;
+  the backend leaves `_1 = const P;`. `parse_const` accepts a bare identifier
+  only when it starts uppercase — a lowercase one (`add`, the operand of
+  `add as fn(..)` in a cast the caller has not split off) must stay a place, or
+  the fn-pointer tests segfault on a lost operand.
+- **Split promoted chains.** `--emit=mir` folds a promoted referent to one
+  line; the backend can leave `_2 = size_of::<i32>(); _1 = Mul(move _2, const
+  4_usize)` (`unsupported constant main::promoted[0]`). `eval_promoted_referent`
+  is a small forward evaluator over the block that resolves earlier locals as
+  binary-op operands.
+- **`core::intrinsics::integer_min`/`integer_max`.** The backend inlines
+  `Ord::min` but not the intrinsic, so the call survives where the prototype
+  sees `<T as Ord>::min`. `parse_const` read the path as a unit-struct constant;
+  it now maps to the same `__rmc_{i,u}min/max` helper.
+- **`core::panicking::todo_default_msg`/`unreachable_default_msg`.** The
+  prototype folds `todo!()` to `panic(const "...")`; the backend leaves the
+  no-argument helper (an undefined symbol). Both abort, so both map to
+  `__rmc_panic`.
+- **`const ZeroSized: {closure@..}`.** A closure returned but never called in
+  place; `--emit=mir` folds it away, the backend spells it out. Treated as the
+  zero-sized constant it is, alongside `PhantomData`.
+
+With all of these the divergence scan over `tools/mir_survey.py`'s corpus is
+clean: every case the prototype compiles now compiles identically under the
+backend. The suite's runner compares "both succeed or both abort" rather than
+the exact status, because rmc's panic sink exits 101 where libstd raises
+`SIGABRT`.
 
 ## Pushing
 
