@@ -1499,21 +1499,22 @@ fn parse_promoted(
     };
     let size = referent_size(ty_text);
 
-    // The value: `_1 = const V;`, `_1 = Add(const A, const B);`, or a zero-sized
-    // construction `_1 = Q;`. Only a scalar referent is folded; anything else is
-    // left unmodelled.
+    // The value: the referent is set by a straight-line chain of statements.
+    // `--emit=mir` folds that chain to one line, but the `-Zcodegen-backend`
+    // route can leave it split — `_2 = size_of::<i32>(); _1 = Mul(_2, 4)` — so
+    // evaluate the chain rather than a single statement.
     let mut bytes: Vec<(i64, i64)> = Vec::new();
     let mut str_ref: Option<String> = None;
-    for line in body {
-        let t = line.trim();
-        if let Some((lhs, rhs)) = split_assign(t) {
-            if parse_local_id(lhs.trim()) == Some(ref_local) {
-                let r = rhs.trim();
-                if let Some(v) = parse_promoted_value(r, ty_text, consts) {
-                    bytes.push((0, v));
-                } else if ty_text.trim() == "&str" {
-                    // A `&str` referent: the promoted blob holds the address of
-                    // the string record the literal becomes.
+    if let Some(v) = eval_promoted_referent(body, ref_local, ty_text, consts) {
+        bytes.push((0, v));
+    } else if ty_text.trim() == "&str" {
+        // A `&str` referent: the promoted blob holds the address of the string
+        // record the literal becomes.
+        for line in body {
+            let t = line.trim();
+            if let Some((lhs, rhs)) = split_assign(t) {
+                if parse_local_id(lhs.trim()) == Some(ref_local) {
+                    let r = rhs.trim();
                     if let Some(Const::Str(s)) = parse_const(r.strip_prefix("const ").unwrap_or(r)) {
                         str_ref = Some(s);
                     }
@@ -1525,6 +1526,86 @@ fn parse_promoted(
         return Ok((name, None, end + 1));
     }
     Ok((name, Some(Promoted { size, bytes, str_ref }), end + 1))
+}
+
+/// Evaluate the value a promoted constant returns the address of, following the
+/// straight-line statements of its single block. A statement the evaluator does
+/// not understand leaves its destination unknown rather than discarding the
+/// values already computed, so an unrelated statement earlier in the block does
+/// not hide a foldable referent.
+fn eval_promoted_referent(
+    body: &[String],
+    ref_local: u32,
+    ty_text: &str,
+    consts: &HashMap<String, i64>,
+) -> Option<i64> {
+    let mut vals: HashMap<u32, i64> = HashMap::new();
+    for line in body {
+        let Some((lhs, rhs)) = split_assign(line.trim()) else { continue };
+        let Some(dest) = parse_local_id(lhs.trim()) else { continue };
+        // `_0 = &_1` is the return, not a value.
+        if dest == 0 {
+            continue;
+        }
+        if let Some(v) = eval_promoted_rhs(rhs.trim(), ty_text, consts, &vals) {
+            vals.insert(dest, v);
+        }
+    }
+    vals.get(&ref_local).copied()
+}
+
+/// Evaluate one promoted statement's right-hand side, resolving operands that
+/// name earlier locals in the same block (`move _2`) as well as literals.
+fn eval_promoted_rhs(
+    s: &str,
+    ty_text: &str,
+    consts: &HashMap<String, i64>,
+    vals: &HashMap<u32, i64>,
+) -> Option<i64> {
+    let s = s.trim().trim_end_matches(';').trim();
+    if let Some(v) = parse_promoted_value(s, ty_text, consts) {
+        return Some(v);
+    }
+    // `Mul(move _2, const 4_usize)` — a binary op with a local operand, which
+    // `parse_promoted_value` (literals only) cannot fold.
+    let open = s.find('(')?;
+    let close = s.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    let op = s[..open].trim();
+    let (a, b) = split_top_comma(&s[open + 1..close])?;
+    let x = eval_promoted_operand(a.trim(), consts, vals)?;
+    let y = eval_promoted_operand(b.trim(), consts, vals)?;
+    eval_binop(op, x, y, ty_text)
+}
+
+/// One operand of a promoted binary op: a literal, a `const` item, a
+/// `size_of` query, or an earlier local (`move _2` / `copy _2` / `_2`).
+fn eval_promoted_operand(
+    s: &str,
+    consts: &HashMap<String, i64>,
+    vals: &HashMap<u32, i64>,
+) -> Option<i64> {
+    let s = s
+        .strip_prefix("move ")
+        .or_else(|| s.strip_prefix("copy "))
+        .unwrap_or(s)
+        .trim();
+    if let Some(v) = parse_const_value(s) {
+        return Some(v);
+    }
+    if let Some(name) = s.strip_prefix("const ") {
+        if let Some(v) = consts.get(name.trim()) {
+            return Some(*v);
+        }
+    }
+    if let Some(r) = strip_path_fn(s, "size_of") {
+        if let Some(t) = r.split('<').nth(1).and_then(|t| t.split('>').next()) {
+            return Some(size_of_type_text(t.trim()));
+        }
+    }
+    parse_local_id(s).and_then(|id| vals.get(&id).copied())
 }
 
 /// The scalar a promoted referent is set to: a literal, a binary op folded over
@@ -3076,6 +3157,17 @@ fn parse_const(s: &str) -> Option<Const> {
             ops.push(parse_operand(p).ok()?);
         }
         return Some(Const::Agg { name: String::new(), ops });
+    }
+    // A bare identifier (`P`) names a unit struct or a fieldless enum variant,
+    // so it is a zero-sized value. `--emit=mir` folds `let _p = P;` away, but
+    // the `-Zcodegen-backend` route leaves `_1 = const P;` in the body. Require
+    // the conventional uppercase first letter: without it, a bare lowercase
+    // identifier (`add`, the operand of `add as fn(..)` in a cast the caller
+    // has not split off) is read as a constant and the real operand is lost.
+    if s.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Some(Const::Agg { name: s.to_string(), ops: Vec::new() });
     }
     if s.contains("::") {
         let bare = strip_generics(s);
