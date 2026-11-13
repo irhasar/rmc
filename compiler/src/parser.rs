@@ -20,6 +20,8 @@ enum NameScope {
     ArgsVec(String, Option<i64>),
     /// `string_names`: whether the name was already present.
     StringName(String, bool),
+    /// `arr_elem`: the array element width a binding shadowed, if any.
+    ArrElem(String, Option<i64>),
     /// A `const` declared inside the block, so the name is removed (or its
     /// outer value restored) when the block ends. The `Option` is the value the
     /// name had before, if any.
@@ -186,6 +188,11 @@ pub struct Parser {
     /// only its methods (`push_str`, `push`, `capacity`, `as_str`) and its
     /// growth-returning push need to know the binding is a `String`.
     string_names: std::collections::HashSet<String>,
+    /// Element byte width of each array binding declared with a `[T; N]`
+    /// annotation, so `arr.iter().sum()` knows whether the element is a `u8`
+    /// (accumulated in `u8`, wrapping) or an `i64`. An unannotated array is
+    /// absent and defaults to eight.
+    arr_elem: std::collections::HashMap<String, i64>,
     /// The bare-identifier target of each `type` alias (`type Byte = u8` ->
     /// `Byte` -> `u8`), so a `Vec<Byte>` can resolve the element to its
     /// underlying byte width. Only a target that is a single identifier is
@@ -319,6 +326,7 @@ impl Parser {
             vec_elem: std::collections::HashMap::new(),
             vec_elem_pending: None,
             string_names: std::collections::HashSet::new(),
+            arr_elem: std::collections::HashMap::new(),
             alias_target: std::collections::HashMap::new(),
             name_scopes: Vec::new(),
             in_prelude: false,
@@ -2122,6 +2130,11 @@ impl Parser {
             frame.push(NameScope::StringName(name.to_string(), self.string_names.contains(name)));
         }
     }
+    fn note_arr_elem(&mut self, name: &str) {
+        if let Some(frame) = self.name_scopes.last_mut() {
+            frame.push(NameScope::ArrElem(name.to_string(), self.arr_elem.get(name).copied()));
+        }
+    }
 
     /// Undo the bindings the innermost block introduced, in reverse, so each
     /// name returns to the state it had before the block (present-and-old, or
@@ -2168,6 +2181,14 @@ impl Parser {
                             self.string_names.remove(&n);
                         }
                     }
+                    NameScope::ArrElem(n, prev) => match prev {
+                        Some(v) => {
+                            self.arr_elem.insert(n, v);
+                        }
+                        None => {
+                            self.arr_elem.remove(&n);
+                        }
+                    },
                     NameScope::ConstInt(n, prev) => match prev {
                         Some(v) => {
                             self.consts.insert(n, v);
@@ -2486,6 +2507,802 @@ impl Parser {
         }
         Some(j + 1)
     }
+
+    /// `[a, b, c]` at the cursor: the element expressions, or `None` when the
+    /// brackets do not hold a plain element list (a `[e; n]` repeat, or a
+    /// `[T; n]` type). Used to recognise an array literal that is the head of an
+    /// iterator chain, a shape the normal expression path leaves to sema.
+    fn try_array_list_lit(&mut self) -> PResult<Option<Vec<Expr>>> {
+        if self.peek() != Some(&Tok::LBracket) {
+            return Ok(None);
+        }
+        let save = self.i;
+        self.i += 1;
+        if self.peek() == Some(&Tok::RBracket) {
+            self.i += 1;
+            return Ok(Some(Vec::new()));
+        }
+        let saved = self.no_struct_lit;
+        self.no_struct_lit = false;
+        let restore = |p: &mut Self, saved: bool| {
+            p.i = save;
+            p.no_struct_lit = saved;
+        };
+        let first = match self.parse_expr() {
+            Ok(e) => e,
+            Err(_) => {
+                restore(self, saved);
+                return Ok(None);
+            }
+        };
+        if self.peek() == Some(&Tok::Semi) {
+            restore(self, saved);
+            return Ok(None);
+        }
+        let mut elems = vec![first];
+        while self.eat(&Tok::Comma) {
+            if self.peek() == Some(&Tok::RBracket) {
+                break;
+            }
+            match self.parse_expr() {
+                Ok(e) => elems.push(e),
+                Err(_) => {
+                    restore(self, saved);
+                    return Ok(None);
+                }
+            }
+        }
+        if self.peek() != Some(&Tok::RBracket) {
+            restore(self, saved);
+            return Ok(None);
+        }
+        self.i += 1;
+        self.no_struct_lit = saved;
+        Ok(Some(elems))
+    }
+
+    /// The token index just past the `]` that closes a `[..]` starting at index
+    /// `j`, or `None` when unbalanced.
+    fn bracket_end(&self, j: usize) -> Option<usize> {
+        let mut depth = 0i32;
+        let mut k = j;
+        while let Some(t) = self.toks.get(k).map(|t| &t.tok) {
+            match t {
+                Tok::LBracket | Tok::LParen | Tok::LBrace => depth += 1,
+                Tok::RBracket | Tok::RParen | Tok::RBrace => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(k + 1);
+                    }
+                }
+                _ => {}
+            }
+            k += 1;
+        }
+        None
+    }
+
+    /// True when the cursor is the head of an iterator chain rmc lowers: an
+    /// array literal or a parenthesized range immediately followed by
+    /// `.iter()`/`.into_iter()` (or a directly applied iterator method).
+    fn at_iter_chain_start(&self) -> bool {
+        let after = if self.peek() == Some(&Tok::LBracket) {
+            match self.bracket_end(self.i) {
+                Some(j) => j,
+                None => return false,
+            }
+        } else if self.peek() == Some(&Tok::LParen) {
+            match self.parenthesized_range_end() {
+                Some(j) => j,
+                None => return false,
+            }
+        } else {
+            return false;
+        };
+        if self.toks.get(after).map(|t| &t.tok) != Some(&Tok::Dot) {
+            return false;
+        }
+        matches!(
+            self.toks.get(after + 1).map(|t| &t.tok),
+            Some(Tok::Ident(n)) if is_iter_method(n)
+        )
+    }
+
+    /// Lower an iterator chain at the cursor to a value, when the receiver is an
+    /// array literal or a parenthesized range (shapes rmc does not otherwise
+    /// parse as expressions). Returns `None`, leaving the cursor untouched, for
+    /// any other receiver, so the normal expression path runs.
+    fn try_lower_iter_chain(&mut self) -> PResult<Option<Expr>> {
+        if !self.at_iter_chain_start() {
+            return Ok(None);
+        }
+        let save = self.i;
+        let src = if let Some(elems) = self.try_array_list_lit()? {
+            IterSrc::ArrayLit(elems)
+        } else if self.parenthesized_range_end().is_some() {
+            self.i += 1; // `(`
+            let lo = self.parse_cond()?;
+            let inclusive = self.eat(&Tok::DotDotEq);
+            if !inclusive {
+                self.expect(Tok::DotDot)?;
+            }
+            let hi = self.parse_cond()?;
+            self.expect(Tok::RParen)?;
+            IterSrc::Range(Box::new(lo), Box::new(hi), inclusive)
+        } else {
+            return Ok(None);
+        };
+        match self.lower_iter_chain(src) {
+            Ok(e) => Ok(Some(e)),
+            Err(err) => {
+                self.i = save;
+                Err(err)
+            }
+        }
+    }
+
+    /// Lower `<src>.<adapter>*(.<terminal>())` to a block expression that
+    /// computes the terminal's value, consuming the chain from the cursor. An
+    /// unsupported method, or a chain with no terminal, is an error; the caller
+    /// resets the cursor so a shape rmc does not own can report its own error.
+    fn lower_iter_chain(&mut self, src: IterSrc) -> PResult<Expr> {
+        let mut adapters: Vec<String> = Vec::new();
+        let mut args: Vec<Expr> = Vec::new();
+        loop {
+            if self.peek() != Some(&Tok::Dot) {
+                return Err(format!(
+                    "at byte {}: an iterator chain needs a terminal method \
+                     (`.sum()`, `.count()`, `.max()`, `.min()`, `.last()`, `.nth(..)`, `.collect()`)",
+                    self.pos()
+                ));
+            }
+            self.i += 1;
+            let name = self.expect_ident()?;
+            // A turbofish (`sum::<i64>()`) sits between the name and the
+            // argument list; it is skipped, since rmc is monomorphic and the
+            // element width comes from the source.
+            if self.peek() == Some(&Tok::ColonColon)
+                && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::Lt)
+            {
+                self.i += 2; // `::` `<`
+                let mut depth = 1i32;
+                while depth > 0 {
+                    self.split_gt();
+                    match self.peek() {
+                        None => {
+                            return Err(format!(
+                                "at byte {}: unexpected end of input in a turbofish",
+                                self.pos()
+                            ))
+                        }
+                        Some(Tok::Lt) => {
+                            depth += 1;
+                            self.i += 1;
+                        }
+                        Some(Tok::Gt) => {
+                            depth -= 1;
+                            self.i += 1;
+                        }
+                        _ => self.i += 1,
+                    }
+                }
+            }
+            self.expect(Tok::LParen)?;
+            let mut margs = Vec::new();
+            if self.peek() != Some(&Tok::RParen) {
+                loop {
+                    margs.push(self.parse_bracketed_expr()?);
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect(Tok::RParen)?;
+            match name.as_str() {
+                // `.copied()`/`.cloned()` change a `&T` element to `T`; rmc reads
+                // the value either way, so they only permit `.sum()`/`.max()`
+                // after `.iter()` and are otherwise no-ops. `.iter()`/
+                // `.into_iter()` on an array literal or range are likewise
+                // no-ops: the loop reads the elements directly.
+                "copied" | "cloned" | "iter" | "into_iter" => {
+                    if !margs.is_empty() {
+                        return Err(format!("at byte {}: `{name}` takes no arguments", self.pos()));
+                    }
+                }
+                "rev" | "step_by" | "skip" | "take" => {
+                    let want = if name == "rev" { 0 } else { 1 };
+                    if margs.len() != want {
+                        return Err(format!(
+                            "at byte {}: `{name}` takes {want} argument(s)",
+                            self.pos()
+                        ));
+                    }
+                    adapters.push(name);
+                    args.extend(margs);
+                }
+                "sum" | "count" | "max" | "min" | "last" => {
+                    if !margs.is_empty() {
+                        return Err(format!("at byte {}: `{name}` takes no arguments", self.pos()));
+                    }
+                    return self.finish_iter_terminal(&src, &adapters, &args, name.as_str(), None);
+                }
+                "nth" => {
+                    if margs.len() != 1 {
+                        return Err(format!("at byte {}: `nth` takes one argument", self.pos()));
+                    }
+                    let k = margs.pop().unwrap();
+                    return self.finish_iter_terminal(&src, &adapters, &args, "nth", Some(k));
+                }
+                "collect" => {
+                    if !margs.is_empty() {
+                        return Err(format!("at byte {}: `collect` takes no arguments", self.pos()));
+                    }
+                    return self.finish_iter_collect(&src, &adapters, &args);
+                }
+                other => {
+                    return Err(format!(
+                        "at byte {}: unsupported iterator method `{other}` (supported: copied, \
+                         cloned, rev, skip, take, step_by, sum, count, max, min, last, nth, collect)",
+                        self.pos()
+                    ))
+                }
+            }
+        }
+    }
+
+    /// The adapter index math shared with the `for`-range form: given the source
+    /// sequence length `base_len`, the source-order adapters and their
+    /// arguments, return the `let`s that bind each adapter's bound (evaluated
+    /// once), the final element count, the source-index map for loop counter
+    /// `i`, and `i`'s name. `rev`/`step_by`/`skip`/`take` behave exactly as in
+    /// `desugar_for_range_adapter`.
+    fn adapter_index_math(
+        &mut self,
+        base_len: Expr,
+        adapters: &[String],
+        args: &[Expr],
+    ) -> PResult<(Vec<Stmt>, Expr, Expr, String)> {
+        let n = adapters.len();
+        let i_name = format!("\u{0}ii{}", self.tmp);
+        self.tmp += 1;
+        let vlo = |n: &str| Expr::Var { name: n.to_string(), slot: -1, ty: Type::I64 };
+        let c_name = |t: usize| format!("\u{0}ic{t}");
+        let s_name = |t: usize| format!("\u{0}is{t}");
+        let k_name = |t: usize| format!("\u{0}ik{t}");
+        let mut head: Vec<Stmt> = Vec::new();
+        let mut lens: Vec<Expr> = Vec::with_capacity(n);
+        let mut counts: Vec<Expr> = Vec::with_capacity(n);
+        let mut strides: Vec<Option<String>> = vec![None; n];
+        let mut head_a = 0usize;
+        let mut prev_len = base_len.clone();
+        for (t, adapter) in adapters.iter().enumerate() {
+            lens.push(prev_len.clone());
+            if let Some(k) = args.get(head_a).and_then(const_i64) {
+                if k < 0 {
+                    return Err(format!(
+                        "at byte {}: cannot apply unary `-` to a `usize` adapter count",
+                        self.pos()
+                    ));
+                }
+            }
+            match adapter.as_str() {
+                "rev" => counts.push(prev_len.clone()),
+                "step_by" => {
+                    let kn = k_name(t);
+                    head.push(Stmt::Let {
+                        name: kn.clone(),
+                        ty: None,
+                        init: Some(args[head_a].clone()),
+                        slot: -1,
+                        mutable: false,
+                    });
+                    head_a += 1;
+                    strides[t] = Some(kn.clone());
+                    // `ceil(len / k)` as `len / k + (len % k != 0)`, so a stride
+                    // near `i64::MAX` does not overflow.
+                    let quot = Expr::Bin(BinOp::Div, Box::new(prev_len.clone()), Box::new(vlo(&kn)));
+                    let rem = Expr::Bin(BinOp::Mod, Box::new(prev_len.clone()), Box::new(vlo(&kn)));
+                    let c = c_name(t);
+                    head.push(Stmt::Let {
+                        name: c.clone(),
+                        ty: None,
+                        init: Some(Expr::Bin(
+                            BinOp::Add,
+                            Box::new(quot),
+                            Box::new(Expr::Cast(
+                                Box::new(Expr::Bin(BinOp::Ne, Box::new(rem), Box::new(Expr::Int(0)))),
+                                Type::I64,
+                            )),
+                        )),
+                        slot: -1,
+                        mutable: false,
+                    });
+                    counts.push(vlo(&c));
+                }
+                "skip" | "take" => {
+                    let m = format!("\u{0}im{t}");
+                    head.push(Stmt::Let {
+                        name: m.clone(),
+                        ty: None,
+                        init: Some(args[head_a].clone()),
+                        slot: -1,
+                        mutable: false,
+                    });
+                    head_a += 1;
+                    let c = c_name(t);
+                    head.push(Stmt::Let {
+                        name: c.clone(),
+                        ty: None,
+                        init: Some(Expr::Call {
+                            name: "__rmc_min".into(),
+                            args: vec![vlo(&m), prev_len.clone()],
+                            arg_slots: Vec::new(),
+                            ret_slot: -1,
+                            ret_ty: Type::I64,
+                        }),
+                        slot: -1,
+                        mutable: false,
+                    });
+                    if adapter == "skip" {
+                        counts.push(Expr::Bin(
+                            BinOp::Sub,
+                            Box::new(prev_len.clone()),
+                            Box::new(vlo(&c)),
+                        ));
+                    } else {
+                        counts.push(vlo(&c));
+                    }
+                }
+                _ => unreachable!("unknown iterator adapter {adapter}"),
+            }
+            prev_len = counts[t].clone();
+        }
+        // Pass two: the source-index map, built from the last adapter outward and
+        // kept relative to the raw sequence (a range's `lo` is added once, in
+        // `iter_elem_read`).
+        let mut subst: Vec<Option<String>> = vec![None; n];
+        let mut map = vlo(&i_name);
+        for t in (0..n).rev() {
+            let needs_len = adapters[t] == "rev" || (t > 0 && adapters[t - 1] == "rev");
+            if needs_len && subst[t].is_none() {
+                let s = s_name(t);
+                head.push(Stmt::Let {
+                    name: s.clone(),
+                    ty: None,
+                    init: Some(lens[t].clone()),
+                    slot: -1,
+                    mutable: false,
+                });
+                subst[t] = Some(s);
+            }
+            let l = match &subst[t] {
+                Some(name) => vlo(name),
+                None => lens[t].clone(),
+            };
+            match adapters[t].as_str() {
+                "rev" => {
+                    map = Expr::Bin(
+                        BinOp::Sub,
+                        Box::new(Expr::Bin(BinOp::Sub, Box::new(l), Box::new(Expr::Int(1)))),
+                        Box::new(map),
+                    );
+                }
+                "step_by" => {
+                    let kn = strides[t].clone().expect("a step_by stride");
+                    map = Expr::Bin(BinOp::Mul, Box::new(map), Box::new(vlo(&kn)));
+                }
+                "skip" => {
+                    map = Expr::Bin(BinOp::Add, Box::new(map), Box::new(vlo(&c_name(t))));
+                }
+                "take" => {}
+                _ => unreachable!("unknown iterator adapter"),
+            }
+        }
+        let count = if n == 0 { base_len } else { counts[n - 1].clone() };
+        Ok((head, count, map, i_name))
+    }
+
+    /// The statements that bind the source to a stable place, plus its length
+    /// expression. A `Vec` reads its header length; an array binding or literal
+    /// folds `arr.len()` to the compile-time length; a range's length is
+    /// `hi - lo` (`+ 1` inclusive). An array literal is stored in a hidden `let`
+    /// so the element reads index it.
+    fn iter_source_stmts(&mut self, src: &IterSrc) -> (Vec<Stmt>, Expr, Option<String>) {
+        let var = |n: &str| Expr::Var { name: n.to_string(), slot: -1, ty: Type::I64 };
+        match src {
+            IterSrc::Range(lo, hi, inclusive) => {
+                let lo_n = format!("\u{0}ilo{}", self.tmp);
+                let hi_n = format!("\u{0}ihi{}", self.tmp);
+                self.tmp += 1;
+                let stmts = vec![
+                    Stmt::Let {
+                        name: lo_n.clone(),
+                        ty: None,
+                        init: Some((**lo).clone()),
+                        slot: -1,
+                        mutable: false,
+                    },
+                    Stmt::Let {
+                        name: hi_n.clone(),
+                        ty: None,
+                        init: Some((**hi).clone()),
+                        slot: -1,
+                        mutable: false,
+                    },
+                ];
+                let span = Expr::Bin(BinOp::Sub, Box::new(var(&hi_n)), Box::new(var(&lo_n)));
+                let len = if *inclusive {
+                    Expr::Bin(BinOp::Add, Box::new(span), Box::new(Expr::Int(1)))
+                } else {
+                    span
+                };
+                (stmts, len, Some(lo_n))
+            }
+            IterSrc::Vec(name, _) => (
+                Vec::new(),
+                Expr::Call {
+                    name: "__rmc_vec_len".into(),
+                    args: vec![var(name)],
+                    arg_slots: Vec::new(),
+                    ret_slot: -1,
+                    ret_ty: Type::I64,
+                },
+                None,
+            ),
+            IterSrc::ArrayVar(name, _) => (
+                Vec::new(),
+                Expr::MethodCall {
+                    recv: Box::new(var(name)),
+                    name: "len".to_string(),
+                    args: Vec::new(),
+                },
+                None,
+            ),
+            IterSrc::ArrayLit(elems) => {
+                let len = elems.len() as i64;
+                let ty = Type::Array(Box::new(Type::I64), elems.len());
+                let stmt = Stmt::Let {
+                    name: "\u{0}isrc".to_string(),
+                    ty: Some(ty),
+                    init: Some(Expr::ArrayList(elems.clone())),
+                    slot: -1,
+                    mutable: false,
+                };
+                (vec![stmt], Expr::Int(len), None)
+            }
+        }
+    }
+
+    /// Bind element `map` (a source index) of `src` to a fresh `i64` binding and
+    /// return the `let` plus that binding's name. A range's element is `lo +
+    /// map` (`lo_name` is the low bound `iter_source_stmts` bound); a `Vec`'s is
+    /// read through an element-width pointer; an array's (or array literal's) is
+    /// an ordinary index.
+    fn iter_elem_read(&mut self, src: &IterSrc, map: &Expr, lo_name: &Option<String>) -> (Stmt, String) {
+        let e_name = format!("\u{0}ie{}", self.tmp);
+        self.tmp += 1;
+        let var = |n: &str| Expr::Var { name: n.to_string(), slot: -1, ty: Type::I64 };
+        let elem: Expr = match src {
+            IterSrc::Range(_, _, _) => {
+                let lo = lo_name.as_ref().expect("a range has a low bound");
+                Expr::Bin(BinOp::Add, Box::new(var(lo)), Box::new(map.clone()))
+            }
+            IterSrc::Vec(name, width) => {
+                let off = if *width == 1 {
+                    map.clone()
+                } else {
+                    Expr::Bin(BinOp::Mul, Box::new(map.clone()), Box::new(Expr::Int(*width)))
+                };
+                let addr = Expr::Bin(BinOp::Add, Box::new(var(name)), Box::new(off));
+                let ptr_ty = if *width == 1 { Type::U8 } else { Type::I64 };
+                Expr::Deref {
+                    expr: Box::new(Expr::Cast(Box::new(addr), Type::Ref(Box::new(ptr_ty), false))),
+                    ty: Type::I64,
+                }
+            }
+            IterSrc::ArrayVar(name, _) => Expr::Index(Box::new(var(name)), Box::new(map.clone())),
+            IterSrc::ArrayLit(_) => {
+                Expr::Index(Box::new(var("\u{0}isrc")), Box::new(map.clone()))
+            }
+        };
+        let stmt = Stmt::Let {
+            name: e_name.clone(),
+            ty: None,
+            init: Some(Expr::Cast(Box::new(elem), Type::I64)),
+            slot: -1,
+            mutable: false,
+        };
+        (stmt, e_name)
+    }
+
+    /// Lower `<src>.<adapters>.<terminal>()` to a block expression. `terminal`
+    /// is `sum`, `count`, `max`, `min`, `last` or `nth` (`nth` carries `k`).
+    fn finish_iter_terminal(
+        &mut self,
+        src: &IterSrc,
+        adapters: &[String],
+        args: &[Expr],
+        terminal: &str,
+        nth_k: Option<Expr>,
+    ) -> PResult<Expr> {
+        let (src_stmts, base_len, lo_name) = self.iter_source_stmts(src);
+        let (math_stmts, count, map, i_name) = self.adapter_index_math(base_len, adapters, args)?;
+        let n_name = format!("\u{0}in{}", self.tmp);
+        self.tmp += 1;
+        let mut stmts = src_stmts;
+        stmts.extend(math_stmts);
+        stmts.push(Stmt::Let {
+            name: n_name.clone(),
+            ty: None,
+            init: Some(count),
+            slot: -1,
+            mutable: false,
+        });
+        let n_var = Expr::Var { name: n_name.clone(), slot: -1, ty: Type::I64 };
+        let i_var = Expr::Var { name: i_name.clone(), slot: -1, ty: Type::I64 };
+        match terminal {
+            "count" => Ok(Expr::Block(Block { stmts, tail: Some(Box::new(n_var)) })),
+            "sum" => {
+                let (elem_let, elem_name) = self.iter_elem_read(src, &map, &lo_name);
+                let acc_name = format!("\u{0}ia{}", self.tmp);
+                self.tmp += 1;
+                stmts.push(Stmt::Let {
+                    name: acc_name.clone(),
+                    ty: None,
+                    init: Some(Expr::Int(0)),
+                    slot: -1,
+                    mutable: true,
+                });
+                let acc_var = Expr::Var { name: acc_name.clone(), slot: -1, ty: Type::I64 };
+                let elem_var = Expr::Var { name: elem_name, slot: -1, ty: Type::I64 };
+                let acc_ty = match src {
+                    IterSrc::Vec(_, 1) | IterSrc::ArrayVar(_, 1) => Type::U8,
+                    _ => Type::I64,
+                };
+                // `Sum<u8>` accumulates in `u8`, so a `u8` element adds with a
+                // wrapping `u8` add (rustc's `u8 + u8` in release mode); every
+                // other source accumulates in `i64`.
+                let elem_add = if acc_ty == Type::U8 {
+                    Expr::Bin(
+                        BinOp::Add,
+                        Box::new(Expr::Cast(Box::new(acc_var.clone()), Type::U8)),
+                        Box::new(Expr::Cast(Box::new(elem_var.clone()), Type::U8)),
+                    )
+                } else {
+                    Expr::Bin(BinOp::Add, Box::new(acc_var.clone()), Box::new(elem_var))
+                };
+                let body = Block {
+                    stmts: vec![
+                        elem_let,
+                        Stmt::Assign { target: acc_var.clone(), value: elem_add },
+                    ],
+                    tail: None,
+                };
+                stmts.push(Stmt::For {
+                    var: i_name,
+                    var_slot: -1,
+                    start: Expr::Cast(Box::new(Expr::Int(0)), Type::I64),
+                    end: n_var,
+                    end_slot: -1,
+                    inclusive: false,
+                    body,
+                    label: None,
+                });
+                Ok(Expr::Block(Block { stmts, tail: Some(Box::new(acc_var)) }))
+            }
+            "max" | "min" => {
+                let (elem_let, elem_name) = self.iter_elem_read(src, &map, &lo_name);
+                let best_name = format!("\u{0}ib{}", self.tmp);
+                self.tmp += 1;
+                stmts.push(Stmt::Let {
+                    name: best_name.clone(),
+                    ty: None,
+                    init: Some(Expr::Int(0)),
+                    slot: -1,
+                    mutable: true,
+                });
+                let best_var = Expr::Var { name: best_name.clone(), slot: -1, ty: Type::I64 };
+                let elem_var = Expr::Var { name: elem_name, slot: -1, ty: Type::I64 };
+                let cmp = if terminal == "max" { BinOp::Gt } else { BinOp::Lt };
+                // `i == 0 || e <cmp> best`: the first element always seeds `best`,
+                // so a run of equal elements keeps the earliest, as rustc does.
+                let cond = Expr::Bin(
+                    BinOp::Or,
+                    Box::new(Expr::Bin(BinOp::Eq, Box::new(i_var), Box::new(Expr::Int(0)))),
+                    Box::new(Expr::Bin(cmp, Box::new(elem_var.clone()), Box::new(best_var.clone()))),
+                );
+                let body = Block {
+                    stmts: vec![
+                        elem_let,
+                        Stmt::Expr(Expr::If(
+                            Box::new(cond),
+                            Block {
+                                stmts: vec![Stmt::Assign {
+                                    target: best_var.clone(),
+                                    value: elem_var,
+                                }],
+                                tail: None,
+                            },
+                            None,
+                        )),
+                    ],
+                    tail: None,
+                };
+                stmts.push(Stmt::For {
+                    var: i_name,
+                    var_slot: -1,
+                    start: Expr::Cast(Box::new(Expr::Int(0)), Type::I64),
+                    end: n_var.clone(),
+                    end_slot: -1,
+                    inclusive: false,
+                    body,
+                    label: None,
+                });
+                Ok(Expr::Block(Block {
+                    stmts,
+                    tail: Some(Box::new(self.iter_option(n_var, best_var, false))),
+                }))
+            }
+            "last" => {
+                let (elem_let, elem_name) = self.iter_elem_read(src, &map, &lo_name);
+                let last_name = format!("\u{0}il{}", self.tmp);
+                self.tmp += 1;
+                stmts.push(Stmt::Let {
+                    name: last_name.clone(),
+                    ty: None,
+                    init: Some(Expr::Int(0)),
+                    slot: -1,
+                    mutable: true,
+                });
+                let last_var = Expr::Var { name: last_name.clone(), slot: -1, ty: Type::I64 };
+                let elem_var = Expr::Var { name: elem_name, slot: -1, ty: Type::I64 };
+                let body = Block {
+                    stmts: vec![elem_let, Stmt::Assign { target: last_var.clone(), value: elem_var }],
+                    tail: None,
+                };
+                stmts.push(Stmt::For {
+                    var: i_name,
+                    var_slot: -1,
+                    start: Expr::Cast(Box::new(Expr::Int(0)), Type::I64),
+                    end: n_var.clone(),
+                    end_slot: -1,
+                    inclusive: false,
+                    body,
+                    label: None,
+                });
+                Ok(Expr::Block(Block {
+                    stmts,
+                    tail: Some(Box::new(self.iter_option(n_var, last_var, false))),
+                }))
+            }
+            "nth" => {
+                let k = nth_k.expect("nth carries an index");
+                let k_name = format!("\u{0}ix{}", self.tmp);
+                self.tmp += 1;
+                stmts.push(Stmt::Let {
+                    name: k_name.clone(),
+                    ty: None,
+                    init: Some(Expr::Cast(Box::new(k), Type::I64)),
+                    slot: -1,
+                    mutable: false,
+                });
+                let k_var = Expr::Var { name: k_name.clone(), slot: -1, ty: Type::I64 };
+                let map_k = rename_index(&map, &i_name, &k_var);
+                let (elem_let, elem_name) = self.iter_elem_read(src, &map_k, &lo_name);
+                let elem_var = Expr::Var { name: elem_name, slot: -1, ty: Type::I64 };
+                let some = Expr::EnumCtor {
+                    enum_name: "Option".into(),
+                    variant: "Some".into(),
+                    tag: -1,
+                    args: vec![elem_var],
+                    arg_offsets: Vec::new(),
+                    slot: -1,
+                    size: 0,
+                };
+                let none = Expr::EnumVariant {
+                    enum_name: "Option".into(),
+                    variant: "None".into(),
+                    tag: -1,
+                };
+                // `if k < n { Some(elem) } else { None }`: the read runs only in
+                // the in-range arm, so an out-of-range index never touches the
+                // store.
+                let result = Expr::If(
+                    Box::new(Expr::Bin(BinOp::Lt, Box::new(k_var), Box::new(n_var))),
+                    Block { stmts: vec![elem_let], tail: Some(Box::new(some)) },
+                    Some(Block { stmts: Vec::new(), tail: Some(Box::new(none)) }),
+                );
+                Ok(Expr::Block(Block { stmts, tail: Some(Box::new(result)) }))
+            }
+            _ => unreachable!("unknown iterator terminal {terminal}"),
+        }
+    }
+
+    /// `if n == 0 { None } else { Some(v) }`, the empty-aware wrapper `max`,
+    /// `min` and `last` share.
+    fn iter_option(&self, n: Expr, v: Expr, _unused: bool) -> Expr {
+        let some = Expr::EnumCtor {
+            enum_name: "Option".into(),
+            variant: "Some".into(),
+            tag: -1,
+            args: vec![v],
+            arg_offsets: Vec::new(),
+            slot: -1,
+            size: 0,
+        };
+        let none = Expr::EnumVariant {
+            enum_name: "Option".into(),
+            variant: "None".into(),
+            tag: -1,
+        };
+        Expr::If(
+            Box::new(Expr::Bin(BinOp::Eq, Box::new(n), Box::new(Expr::Int(0)))),
+            Block { stmts: Vec::new(), tail: Some(Box::new(none)) },
+            Some(Block { stmts: Vec::new(), tail: Some(Box::new(some)) }),
+        )
+    }
+
+    /// Lower `<src>.<adapters>.collect()` to an array value. Only a
+    /// compile-time-length source is supported: an array binding or literal (a
+    /// copy), or a range with constant bounds. A `Vec` source has a runtime
+    /// length and no fixed array type, so it is rejected.
+    fn finish_iter_collect(
+        &mut self,
+        src: &IterSrc,
+        adapters: &[String],
+        args: &[Expr],
+    ) -> PResult<Expr> {
+        let var = |n: &str| Expr::Var { name: n.to_string(), slot: -1, ty: Type::I64 };
+        match src {
+            IterSrc::ArrayVar(name, _) => Ok(Expr::Block(Block {
+                stmts: vec![Stmt::Let {
+                    name: "\u{0}icol".to_string(),
+                    ty: None,
+                    init: Some(var(name)),
+                    slot: -1,
+                    mutable: false,
+                }],
+                tail: Some(Box::new(var("\u{0}icol"))),
+            })),
+            IterSrc::ArrayLit(elems) => Ok(Expr::Block(Block {
+                stmts: vec![Stmt::Let {
+                    name: "\u{0}icol".to_string(),
+                    ty: None,
+                    init: Some(Expr::ArrayList(elems.clone())),
+                    slot: -1,
+                    mutable: false,
+                }],
+                tail: Some(Box::new(var("\u{0}icol"))),
+            })),
+            IterSrc::Range(lo, hi, inclusive) => {
+                if !adapters.is_empty() {
+                    return Err(format!(
+                        "at byte {}: `.collect()` on a range supports no adapters",
+                        self.pos()
+                    ));
+                }
+                let _ = args;
+                let (Some(lo_v), Some(hi_v)) = (const_i64(lo), const_i64(hi)) else {
+                    return Err(format!(
+                        "at byte {}: `.collect()` on a range needs constant bounds",
+                        self.pos()
+                    ));
+                };
+                let end = if *inclusive { hi_v + 1 } else { hi_v };
+                if end <= lo_v {
+                    return Ok(Expr::ArrayList(Vec::new()));
+                }
+                let elems: Vec<Expr> = (lo_v..end).map(Expr::Int).collect();
+                Ok(Expr::ArrayList(elems))
+            }
+            IterSrc::Vec(..) => Err(format!(
+                "at byte {}: `.collect()` on a `Vec` is not supported (its length is not a \
+                 compile-time constant); collect from an array or a constant range",
+                self.pos()
+            )),
+        }
+    }
+
 
     /// True at the head of `(lo..hi)` / `(lo..=hi)` used directly as a `for`
     /// iterable (no adapter). `(a..b).rev()` is handled by
@@ -3916,12 +4733,40 @@ impl Parser {
                     self.vec_elem_pending = None;
                     8
                 };
+                // An array annotation records the element width, so
+                // `arr.iter().sum()` accumulates a `[u8; N]` in `u8` (wrapping)
+                // and an `[i64; N]` in `i64`, matching rustc. Any other
+                // annotation clears a shadowed width.
+                let arr_w = match &ty {
+                    Some(Type::Array(elem, _)) => {
+                        Some(if matches!(**elem, Type::U8 | Type::I8) { 1 } else { 8 })
+                    }
+                    _ => None,
+                };
                 let init = if self.eat(&Tok::Eq) {
                     Some(self.parse_expr()?)
                 } else {
                     None
                 };
                 self.expect(Tok::Semi)?;
+                // A binding whose initializer is an array literal is an array
+                // even without an annotation (`let a = [1, 2, 3];`), so record
+                // its width too; otherwise `a.iter()` would not be recognised.
+                let arr_w = arr_w.or_else(|| {
+                    match &init {
+                        Some(Expr::ArrayList(_)) | Some(Expr::ArrayLit(..)) => Some(8),
+                        _ => None,
+                    }
+                });
+                self.note_arr_elem(&name);
+                match arr_w {
+                    Some(w) => {
+                        self.arr_elem.insert(name.clone(), w);
+                    }
+                    None => {
+                        self.arr_elem.remove(&name);
+                    }
+                }
                 // A `Vec` binding is lowered to an `i64` address of its backing
                 // allocation. Three initializers are supported, each replaced by
                 // the allocation (plus, for `vec![..]`, a fill). The binding and
@@ -5311,6 +6156,34 @@ impl Parser {
                         }
                     }
                     self.expect(Tok::RParen)?;
+                    // `.iter()`/`.into_iter()` on a `Vec` or array binding
+                    // starts an iterator chain, lowered to a loop over the same
+                    // value. `.iter()` borrows and `.into_iter()` moves in
+                    // rustc; rmc reads the scalar element values either way,
+                    // which is observationally identical for the supported
+                    // elements.
+                    if args.is_empty() && (name == "iter" || name == "into_iter") {
+                        if let Expr::Var { name: recv, .. } = &e {
+                            let src = if self.vec_names.contains(recv) {
+                                let w = self.vec_elem.get(recv).copied().unwrap_or(8);
+                                Some(IterSrc::Vec(recv.clone(), w))
+                            } else if self.arr_elem.contains_key(recv) {
+                                Some(IterSrc::ArrayVar(recv.clone(), self.arr_elem.get(recv).copied().unwrap_or(8)))
+                            } else {
+                                None
+                            };
+                            // Only lower a *chain*: a bare `a.iter()` with no
+                            // following method is left as a `MethodCall` so the
+                            // `for x in a.iter()` desugar still sees it (the
+                            // chain lowering demands a terminal method).
+                            if let Some(src) = src {
+                                if self.peek() == Some(&Tok::Dot) {
+                                    e = self.lower_iter_chain(src)?;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     // Methods on a `Vec`/raw-pointer binding that rmc lowers to
                     // plain arithmetic. The receiver is an `i64` (a `Vec` is its
                     // backing address), so `capacity`/`len` fold to the constant
@@ -7460,6 +8333,12 @@ impl Parser {
     }
 
     fn parse_primary_inner(&mut self) -> PResult<Expr> {
+        // An `.iter()` chain on an array literal or a parenthesized range is
+        // lowered here, before the normal expression path, because neither head
+        // is otherwise a legal expression receiver.
+        if let Some(e) = self.try_lower_iter_chain()? {
+            return Ok(e);
+        }
         match self.peek().cloned() {
             Some(Tok::Int(v)) => {
                 self.i += 1;
@@ -8049,6 +8928,57 @@ enum Pat {
 /// binding (`f`/`f: b`) or a nested struct pattern (`f: I { a }`). `mut` is only
 /// meaningful on a binding, so a nested sub-pattern is stored with `false`.
 type FieldPat = (String, Option<(bool, Pat)>);
+
+/// The source an iterator chain walks: an array literal, a `Vec` binding (with
+/// its element byte width), an array binding (with its element width), or a
+/// parenthesized range. The adapters and terminal are lowered over it into a
+/// plain `for` loop, so no iterator value ever exists at run time.
+enum IterSrc {
+    ArrayLit(Vec<Expr>),
+    Vec(String, i64),
+    ArrayVar(String, i64),
+    Range(Box<Expr>, Box<Expr>, bool),
+}
+
+/// Whether `name` is a method rmc lowers in an iterator chain, used only to
+/// recognise a chain's head; the actual lowering rejects anything unsupported.
+fn is_iter_method(name: &str) -> bool {
+    matches!(
+        name,
+        "iter"
+            | "into_iter"
+            | "copied"
+            | "cloned"
+            | "rev"
+            | "step_by"
+            | "skip"
+            | "take"
+            | "sum"
+            | "count"
+            | "max"
+            | "min"
+            | "last"
+            | "nth"
+            | "collect"
+    )
+}
+
+/// Rewrite every occurrence of the variable `from` in `e` to `to`, leaving the
+/// index-free parts alone. Used by `.nth(k)` to read `src[map(k)]` with no loop.
+fn rename_index(e: &Expr, from: &str, to: &Expr) -> Expr {
+    match e {
+        Expr::Var { name, slot, ty } if name == from => {
+            let _ = (slot, ty);
+            to.clone()
+        }
+        Expr::Bin(op, a, b) => {
+            Expr::Bin(*op, Box::new(rename_index(a, from, to)), Box::new(rename_index(b, from, to)))
+        }
+        Expr::Un(op, a) => Expr::Un(*op, Box::new(rename_index(a, from, to))),
+        Expr::Cast(a, ty) => Expr::Cast(Box::new(rename_index(a, from, to)), ty.clone()),
+        other => other.clone(),
+    }
+}
 
 /// Whether `e` syntactically contains a call, used to decide if a subscript in
 /// a compound assignment must be evaluated into a temporary.

@@ -2560,3 +2560,28 @@ covered by a test in `compiler/tests/compile.rs`:
 Tests that claim to guard a runtime bug must *execute* the program and assert
 the result (`run_exit_code` / `run_output`); an `asm(...).contains("main:")`
 assertion passes even when the emitted code is wrong.
+
+## Array-literal lowering is re-check-safe
+
+`Expr::ArrayList` (`[a, b, c]`, list form) desugars in sema to a block
+`{ let mut \0list: [T; n]; \0list[0] = a; ...; \0list }`. The `let` is
+deliberately uninitialised (an aggregate element type has no default to spell),
+and the desugar returns without re-checking the block. A *method* receiver,
+though, is checked twice — once to resolve its type, once when the rewritten
+call is re-checked — so `unwrap()` on such a block walked it a second time. The
+second walk re-allocated the `\0list` slot and read it as a possibly-
+uninitialised binding. `[3, 1, 2].iter().max().unwrap()` is the shape that
+exposed this. The fix marks a `\0`-prefixed `let` initialised even with no
+initialiser, since its only reads are the writes that follow it.
+
+A related trap in the same area: the parser's chain-head recogniser
+(`try_array_list_lit`) must accept a *single-element* list `[5]` (no trailing
+comma) as well as `[5,]`. A `[T; n]` repeat still has a `;` after the first
+element, which is the shape to reject.
+
+## `for x in a.iter()` vs a chain
+
+The iterator-chain lowering demands a terminal method, so a bare `a.iter()`
+must be left as a `MethodCall` for the `for` desugar. The postfix method loop
+therefore only lowers a chain when a `.` follows the `.iter()`/`.into_iter()`
+call; otherwise `for x in a.iter()` is misread as an unterminated chain.
