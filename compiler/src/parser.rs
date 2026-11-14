@@ -4691,12 +4691,13 @@ impl Parser {
         Ok(for_stmt)
     }
 
-    /// `__rmc_arg_or(i, default)` for a runtime index `i` (the constant form is
-    /// `args_or`).
+    /// `__rmc_arg_or(i, default, 0, 0)` for a runtime index `i` (the constant
+    /// form is `args_or`). The `for v in &args` desugar has no `unwrap`, so both
+    /// failure flags are 0 and a malformed argument takes the fallback.
     fn args_or_at(&self, idx: &Expr, default: i64) -> Expr {
         Expr::Call {
             name: "__rmc_arg_or".into(),
-            args: vec![idx.clone(), Expr::Int(default)],
+            args: vec![idx.clone(), Expr::Int(default), Expr::Int(0), Expr::Int(0)],
             arg_slots: Vec::new(),
             ret_slot: -1,
             ret_ty: Type::I64,
@@ -4896,6 +4897,16 @@ impl Parser {
                             out.extend(self.let_destructure_tuple_stmts(elems, ty, init))
                         }
                         Pat::Array { elems, rest, front } => {
+                            // An array pattern must match the array's length
+                            // exactly (rustc E0527); a `..` rest only makes the
+                            // count a lower bound. rmc desugars to one index
+                            // read per element, so a mismatch would read past
+                            // the array instead of being rejected. Check it here
+                            // when the length is known from the annotation or a
+                            // literal initializer.
+                            if let Some(len) = Self::array_len_of(&ty, &init) {
+                                Self::check_array_pat_len(&elems, rest, len, self.pos())?;
+                            }
                             out.extend(self.let_destructure_array_stmts(elems, rest, front, ty, init))
                         }
                         // A parenthesised pattern that is not a tuple: `(x)` is
@@ -5844,24 +5855,64 @@ impl Parser {
     /// `__rmc_arg_or(idx, default)`.
     fn finish_args_nth(&mut self, idx: i64) -> PResult<Expr> {
         let mut default: Option<Expr> = None;
+        let mut missing_required = false;
+        let mut parse_required = false;
+        // Set by `and_then(|s| s.parse().ok())`: the chain is an `Option` again,
+        // so a following `unwrap()` traps on both a missing and a malformed
+        // argument rather than only on a missing one.
+        let mut and_then_parse = false;
+        // After `.parse()` the chain is a `Result`; an `unwrap()` there is a
+        // parse failure, not a missing argument, and `unwrap_or(d)` only
+        // recovers the parse failure. The two must be tracked separately:
+        // `.nth(i).unwrap().parse().unwrap_or(d)` still exits when the argument
+        // is absent but yields `d` when it is present and non-numeric.
+        let mut in_result = false;
         let mut done = false;
         while self.peek() == Some(&Tok::Dot) {
             self.i += 1;
             let m = self.expect_ident()?;
             match m.as_str() {
                 "parse" => {
-                    // `parse::<i64>()` carries a turbofish; skip it.
+                    // `parse::<i64>()` carries a turbofish whose type name is a
+                    // keyword token. rmc lowers every `parse` to the i64 parser,
+                    // so a `bool`/`char` turbofish (which would compile but parse
+                    // as an integer) is rejected rather than mis-lowered.
                     if self.eat(&Tok::ColonColon) {
                         self.expect(Tok::Lt)?;
-                        self.expect_ident()?; // the type name
+                        if !matches!(self.peek(), Some(Tok::TyI64)) {
+                            let got = self
+                                .peek()
+                                .map(|t| t.describe())
+                                .unwrap_or_else(|| "end of input".into());
+                            return Err(format!(
+                                "at byte {}: unsupported `parse` type {got} \
+                                 (only `i64` is accepted)",
+                                self.pos()
+                            ));
+                        }
+                        self.bump();
                         self.expect(Tok::Gt)?;
                     }
                     self.expect(Tok::LParen)?;
                     self.expect(Tok::RParen)?;
+                    in_result = true;
                 }
                 "unwrap" => {
                     self.expect(Tok::LParen)?;
                     self.expect(Tok::RParen)?;
+                    if and_then_parse {
+                        // `.and_then(|s| s.parse().ok()).unwrap()`: the `Option`
+                        // is `None` both when the argument is absent and when it
+                        // is present but non-numeric, so both failures trap.
+                        missing_required = true;
+                        parse_required = true;
+                    } else if in_result {
+                        parse_required = true;
+                    } else {
+                        // `.unwrap()` on the `Option`: a missing argument
+                        // panics. `.unwrap().parse().unwrap()` is required too.
+                        missing_required = true;
+                    }
                     done = true;
                 }
                 "unwrap_or" => {
@@ -5875,6 +5926,11 @@ impl Parser {
                     self.expect(Tok::LParen)?;
                     self.skip_closure()?;
                     self.expect(Tok::RParen)?;
+                    // The closure's `.ok()` yields an `Option`; a following
+                    // `unwrap_or(d)` recovers both failures, while a following
+                    // `unwrap()` must trap on both.
+                    in_result = true;
+                    and_then_parse = true;
                 }
                 other => {
                     return Err(format!(
@@ -5890,7 +5946,7 @@ impl Parser {
                 self.pos()
             ));
         }
-        Ok(self.args_or(idx, default.unwrap_or(Expr::Int(0))))
+        Ok(self.args_or(idx, default.unwrap_or(Expr::Int(0)), missing_required, parse_required))
     }
 
     /// `.skip(k).map(|s| s.parse::<i64>().unwrap()).collect()`: the arguments
@@ -5961,17 +6017,28 @@ impl Parser {
         Ok(())
     }
 
-    /// `__rmc_arg_or(idx, default)`.
-    fn args_or(&self, idx: i64, default: Expr) -> Expr {
+    /// `__rmc_arg_or(idx, default, missing_required, parse_required)`.
+    fn args_or(&self, idx: i64, default: Expr, missing_required: bool, parse_required: bool) -> Expr {
         Expr::Call {
             name: "__rmc_arg_or".into(),
-            args: vec![Expr::Int(idx), default],
+            // `missing_required` mirrors `unwrap()` on the `Option`: the runtime
+            // exits (101) when the argument is absent. `parse_required` mirrors
+            // `unwrap()` on the `Result`: it exits when the argument is present
+            // but not a whole integer. `unwrap_or(d)` passes both `false` and
+            // gets `d`; `.unwrap().parse().unwrap_or(d)` passes only the first.
+            args: vec![
+                Expr::Int(idx),
+                default,
+                Expr::Int(missing_required as i64),
+                Expr::Int(parse_required as i64),
+            ],
             arg_slots: Vec::new(),
             ret_slot: -1,
             ret_ty: Type::I64,
             elem_ty: None,
         }
     }
+
     /// `println!("...")` / `print!("...")`: format the literal and its `{}`
     /// arguments, then print. `println!` appends a newline. The format string
     /// must be a literal (a variable one is not supported), and a `{}` is filled
@@ -6413,7 +6480,7 @@ impl Parser {
                                 self.pos()
                             )
                         })?;
-                        e = self.args_or(k + skip, Expr::Int(0));
+                        e = self.args_or(k + skip, Expr::Int(0), false, false);
                         continue;
                     }
                 }
@@ -8136,6 +8203,45 @@ impl Parser {
         let (mut out, subj) = self.let_destructure_prelude(ty, init, force);
         out.extend(Self::struct_pat_binds(&fields, &subj, &name));
         out
+    }
+
+    /// The element count an array pattern's subject is known to have, from its
+    /// written type (`[i64; 2]`) or an array literal initializer. `None` when
+    /// neither is present, so the length check is skipped rather than guessed.
+    fn array_len_of(ty: &Option<Type>, init: &Expr) -> Option<usize> {
+        if let Some(Type::Array(_, n)) = ty {
+            return Some(*n);
+        }
+        match init {
+            Expr::ArrayLit(_, n) => Some(*n),
+            Expr::ArrayList(vs) => Some(vs.len()),
+            _ => None,
+        }
+    }
+
+    /// Reject an array pattern whose element count cannot match `len`, as rustc
+    /// does (E0527): exactly `len` elements without a `..`, and at most `len`
+    /// with one.
+    fn check_array_pat_len(
+        elems: &[Option<(bool, Pat)>],
+        rest: bool,
+        len: usize,
+        pos: u32,
+    ) -> PResult<()> {
+        if rest {
+            if elems.len() > len {
+                return Err(format!(
+                    "at byte {pos}: pattern requires at most {len} elements but array has {len}"
+                ));
+            }
+        } else if elems.len() != len {
+            return Err(format!(
+                "at byte {pos}: pattern requires {} element{} but array has {len}",
+                elems.len(),
+                if elems.len() == 1 { "" } else { "s" }
+            ));
+        }
+        Ok(())
     }
 
     /// The same expansion for an array pattern: bind the scrutinee to a hidden

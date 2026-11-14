@@ -44,9 +44,17 @@ RUSTFLAGS_BASE = []
 # (the cranelift column is then omitted rather than the suite failing).
 CRANELIFT_ENV = "RMC_BENCH_CRANELIFT_RUSTC"
 
-PROGRAMS = ["hello", "fib", "mandel", "sieve", "mix", "stats", "refs", "heap", "callrec", "forloops"]
+# A ratio inside +/- this band is a statistical tie, not a win or a loss. The
+# run axes are near parity on `fib`/`callrec`, and the same binary still lands
+# within ~1-3% across runs on this host, so a bare `1.01` carries no signal.
+# 0.02 matches `run_fair.py` and keeps the verdict from calling a tie a loss.
+NOISE_BAND = 0.02
+
+PROGRAMS = ["hello", "fib", "mandel", "sieve", "mix", "stats", "refs", "heap", "callrec", "forloops", "light", "heavy"]
 # Runtime input per program, passed as argv so the workload is opaque to the
-# optimizer and cannot be constant-folded away.
+# optimizer and cannot be constant-folded away. `light` is a short (few ms)
+# cache-resident run; `heavy` runs the loop for ~1e9 iterations, so the two
+# bracket the load spectrum.
 ARGS = {
     "hello": [],
     "fib": ["32"],
@@ -58,6 +66,8 @@ ARGS = {
     "heap": ["200000"],
     "callrec": ["30"],
     "forloops": ["2000000"],
+    "light": ["2000000"],
+    "heavy": ["1000000000"],
 }
 
 
@@ -128,8 +138,45 @@ def measure_spawned(argv, reps):
     return dict(wall=min(walls), cpu=min(cpus), rss=max(rsss))
 
 
+def measure_runs(bins, args, reps):
+    """Run several binaries of the same workload interleaved.
+
+    A sequential sweep measures the first binary on a cool core and the last on
+    a warmed-up one, which can flip a near-parity case. Round-robin sampling
+    spreads frequency and thermal drift evenly across the binaries.
+    `measure_spawned` already separates the wall/CPU pass from the RSS pass, so
+    this only has to interleave the order.
+    """
+    names = list(bins)
+    walls = {n: [] for n in names}
+    cpus = {n: [] for n in names}
+    for _ in range(reps):
+        for n in names:
+            r = measure_spawned([bins[n]] + list(args), 1)
+            walls[n].append(r["wall"])
+            cpus[n].append(r["cpu"])
+    rss = {n: 0 for n in names}
+    for _ in range(reps):
+        for n in names:
+            r = measure_spawned([bins[n]] + list(args), 1)
+            if r["rss"] > rss[n]:
+                rss[n] = r["rss"]
+    return {n: dict(wall=min(walls[n]), cpu=min(cpus[n]), rss=rss[n])
+            for n in names}
+
+
 def median(xs):
     return statistics.median(xs)
+
+
+def ratio(better_den, worse_num):
+    """`worse_num / better_den`, or 0 when the denominator could not be sampled.
+
+    A program that exits between two `/proc` reads reports a peak RSS of 0;
+    dividing by it would crash the harness, so report 0 (an obvious "no ratio")
+    rather than a fabricated one. The other harnesses guard the same way.
+    """
+    return worse_num / better_den if better_den else 0.0
 
 
 _cranelift_rustc = None
@@ -201,8 +248,7 @@ def measure_compile(name, kind, reps=5):
                 # Overflow checks are already off at `-O`; set them explicitly
                 # so the parity with rmc (which defaults them off) is stated
                 # rather than implied by the profile. Bounds checks stay on:
-                # they are Rust's release semantics and rmc's `--bounds-checks`
-                # enables the matching ones.
+                # they are Rust's release semantics and rmc's default too.
                 "-C", "overflow-checks=off",
                 "-C", "debug-assertions=off",
                 os.path.join(ROOT, "rust", f"{name}.rs"), "-o", out]
@@ -313,9 +359,10 @@ def collect():
         res = {}
         for kind in kinds:
             res[kind] = measure_compile(p, kind)
+        bins = {kind: os.path.join(OUT, f"{p}.{kind}.bin") for kind in kinds}
+        runs = measure_runs(bins, ARGS[p], 25)
         for kind in kinds:
-            binpath = os.path.join(OUT, f"{p}.{kind}.bin")
-            res[kind]["run"] = measure_spawned([binpath] + ARGS[p], 9)
+            res[kind]["run"] = runs[kind]
         res["plain"] = measure_rustc_plain(p)
         res["static"] = measure_rustc_static(p)
         rows.append((p, res))
@@ -324,31 +371,82 @@ def collect():
 
 
 def print_table(rows, kinds):
-    # One line per compiler per program, with both halves of the comparison:
-    # compile wall/CPU/RAM/size, then run wall/CPU/RAM. The run-time RAM column
-    # matters as much as the compile-time one (a rustc binary floors at the
-    # libc/ld.so footprint), so it is reported here too, not only in the
-    # markdown.
     hdr = (f"{'program':<8} {'compiler':<10} {'wall_ms':>9} {'cpu_ms':>9} "
-           f"{'rss_kb':>9} {'size_b':>9} {'run_ms':>9} {'run_cpu_ms':>11} "
-           f"{'run_rss_kb':>11}")
+           f"{'rss_kb':>9} {'size_b':>9} {'run_ms':>9} {'run_cpu':>9} "
+           f"{'run_rss':>9}")
     print(hdr)
     print("-" * len(hdr))
     for p, res in rows:
         for kind in kinds:
             r = res[kind]
             print(f"{p:<8} {kind:<10} {r['wall']*1000:9.2f} {r['cpu']*1000:9.2f} "
-                  f"{r['rss']:9.0f} {r['size']:9.0f} {r['run']['wall']*1000:9.2f} "
-                  f"{r['run']['cpu']*1000:11.2f} {r['run']['rss']:11.0f}")
+                  f"{r['rss']:9.0f} {r['size']:9.0f} "
+                  f"{r['run']['wall']*1000:9.2f} "
+                  f"{r['run']['cpu']*1000:9.2f} {r['run']['rss']:9.0f}")
         # Ratios are always against rmc: >1 means rmc is better. rustc (LLVM) is
         # the headline opponent; cranelift is the fair no-LLVM baseline.
         for kind in [k for k in kinds if k != "rmc"]:
             n, c = res["rmc"], res[kind]
             print(f"{'':8} {kind+'/rmc':<10} {c['wall']/n['wall']:9.1f} {c['cpu']/n['cpu']:9.1f} "
-                  f"{c['rss']/n['rss']:9.1f} {c['size']/n['size']:9.1f} "
+                  f"{ratio(n['rss'], c['rss']):9.1f} {c['size']/n['size']:9.1f} "
                   f"{c['run']['wall']/n['run']['wall']:9.2f} "
-                  f"{c['run']['cpu']/n['run']['cpu']:11.2f} "
-                  f"{c['run']['rss']/n['run']['rss']:11.2f}")
+                  f"{c['run']['cpu']/n['run']['cpu']:9.2f} "
+                  f"{ratio(n['run']['rss'], c['run']['rss']):9.2f}")
+
+
+# The seven axes `run.py` scores, as (label, extractor) over a program's result.
+# Each extractor returns the rustc/rmc ratio, so > 1 means rmc is better.
+AXES = (
+    ("compile_wall", lambda n, c: c["wall"] / n["wall"]),
+    ("compile_cpu", lambda n, c: c["cpu"] / n["cpu"]),
+    ("compile_rss", lambda n, c: ratio(n["rss"], c["rss"])),
+    ("size", lambda n, c: c["size"] / n["size"]),
+    ("run_wall", lambda n, c: c["run"]["wall"] / n["run"]["wall"]),
+    ("run_cpu", lambda n, c: c["run"]["cpu"] / n["run"]["cpu"]),
+    ("run_rss", lambda n, c: ratio(n["run"]["rss"], c["run"]["rss"])),
+)
+
+
+def axis_means(rows):
+    """Mean rustc/rmc ratio per axis, plus the axes tied and lost."""
+    means, tied, lost = [], [], []
+    for label, f in AXES:
+        vals = [f(res["rmc"], res["rustc"]) for _, res in rows]
+        mean = sum(vals) / len(vals)
+        if mean >= 1.0 + NOISE_BAND:
+            word = "win"
+        elif mean >= 1.0 - NOISE_BAND:
+            word = "tie"
+            tied.append(label)
+        else:
+            word = "loss"
+            lost.append(label)
+        means.append((label, mean, word))
+    return means, tied, lost
+
+
+def verdict(rows):
+    """Print and return the per-axis verdict of the whole run.
+
+    `run.py` is the end-to-end comparison (rmc's own front end *and* back end
+    against rustc/LLVM on one source), so unlike `run_fair.py` there is no
+    shared front end to excuse a tie: an axis the mean calls a tie here is a
+    real limit of the whole compiler, not a measurement artefact.
+    """
+    means, tied, lost = axis_means(rows)
+    print()
+    print("mean speedup per axis (rustc/rmc; > 1 means rmc better)")
+    for label, mean, word in means:
+        print(f"  {label:<13} {mean:8.2f}  ({word})")
+    for label, f in AXES:
+        for p, res in rows:
+            r = f(res["rmc"], res["rustc"])
+            if r < 1.0 - NOISE_BAND:
+                print(f"  LOSS {p} {label}: ratio {r:.2f}")
+    if not tied and not lost:
+        print()
+        print("ALL AXES WON")
+    return tied, lost
 
 
 def write_markdown(path, rows, note, kinds):
@@ -395,7 +493,7 @@ def write_markdown(path, rows, note, kinds):
         for kind in [k for k in kinds if k != "rmc"]:
             n, c = res["rmc"], res[kind]
             lines.append(f"| {p} | ratio ({kind}/rmc) | {c['wall']/n['wall']:.1f} | {c['cpu']/n['cpu']:.1f} | "
-                         f"{c['rss']/n['rss']:.1f} | {c['size']/n['size']:.1f} |")
+                         f"{ratio(n['rss'], c['rss']):.1f} | {c['size']/n['size']:.1f} |")
     lines.append("")
     lines.append("## Artifact size against each rustc build")
     lines.append("")
@@ -432,7 +530,7 @@ def write_markdown(path, rows, note, kinds):
         for kind in [k for k in kinds if k != "rmc"]:
             n, c = res["rmc"]["run"], res[kind]["run"]
             lines.append(f"| {p} | ratio ({kind}/rmc) | {c['wall']/n['wall']:.2f} | {c['cpu']/n['cpu']:.2f} | "
-                         f"{c['rss']/n['rss']:.2f} |")
+                         f"{ratio(n['rss'], c['rss']):.2f} |")
     lines.append("")
     lines.append("Ratios are the other compiler divided by rmc, so a value above 1 means")
     lines.append("rmc is better on that dimension. Both the LLVM and the Cranelift ratios")
@@ -491,6 +589,22 @@ def write_markdown(path, rows, note, kinds):
     lines.append("couple of MB regardless of what the program does. That gap is real but")
     lines.append("is mostly the C library's footprint, not the generated code's.")
     lines.append("")
+    lines.append("## Verdict")
+    lines.append("")
+    lines.append("This is the end-to-end comparison: rmc's own front end *and* back end")
+    lines.append("against rustc/LLVM, one source each. There is no shared front end to")
+    lines.append("excuse a tie here, so a tie is a real limit of the whole compiler.")
+    lines.append("Mean ratio per axis, rustc divided by rmc (> 1 means rmc better):")
+    lines.append("")
+    lines.append("| axis | mean rustc/rmc | verdict |")
+    lines.append("| ---- | -------------: | ------- |")
+    means, tied, lost = axis_means(rows)
+    for label, mean, word in means:
+        lines.append(f"| {label} | {mean:.2f} | {word} |")
+    lines.append("")
+    if not tied and not lost:
+        lines.append("Every axis is a win.")
+        lines.append("")
     with open(path, "w") as f:
         f.write("\n".join(lines))
 
@@ -502,6 +616,7 @@ def main():
         md = args[args.index("--markdown") + 1]
     rows, kinds = collect()
     print_table(rows, kinds)
+    verdict(rows)
     if md:
         write_markdown(md, rows, env_note(), kinds)
         print(f"\nwrote {md}")

@@ -1,4 +1,4 @@
-// Build a linked list by bumping through one
+// The Rust twin of `bench/mir/heap.rs`: build a linked list by bumping through one
 // arena, then walk it. A bump arena (not `Box`/`malloc`) keeps the comparison
 // about the generated code — the same pointer arithmetic and loads — rather
 // than about rmc's free-list allocator versus glibc's.

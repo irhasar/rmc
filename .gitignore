@@ -1,6 +1,14 @@
 /compiler/target/
 __pycache__/
 *.pyc
+
+# Stray build artifacts
 /a.out
-/compiler/c.bin
-/compiler/c.err
+compiler/c.bin
+compiler/c.err
+
+# rustc codegen-backend build artifacts
+backend/target/
+
+# rustc incremental-compilation directories (never commit build outputs)
+/off/

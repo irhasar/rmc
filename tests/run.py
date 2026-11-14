@@ -533,6 +533,86 @@ def check_no_rwx():
     return 0
 
 
+def check_reject_array_pat_len():
+    """An array pattern whose element count cannot match its subject is rejected
+    at compile time (rustc E0527). rmc desugars `let [a, b] = arr` to one index
+    read per element, so a mismatch must be a compile error, not a read past the
+    array. The length is known only from a written type or a literal
+    initializer, so check those two forms and that the valid forms still build.
+    """
+    bad = {
+        "literal": "fn main() { let [x, y] = [1i64, 2, 3]; println!(\"{} {}\", x, y); }",
+        "annot": "fn main() { let a = [1i64, 2, 3]; let [x, y]: [i64; 3] = a; println!(\"{} {}\", x, y); }",
+        "rest": "fn main() { let [a, b, c, ..] = [1i64, 2]; println!(\"{} {} {}\", a, b, c); }",
+    }
+    good = {
+        "exact": "fn main() { let [x, y, z] = [1i64, 2, 3]; println!(\"{} {} {}\", x, y, z); }",
+        "rest_ok": "fn main() { let [x, .., z] = [1i64, 2, 3]; println!(\"{} {}\", x, z); }",
+    }
+    failures = 0
+    for name, src in bad.items():
+        path = os.path.join(OUT, f"rejarrpat_{name}.rs")
+        with open(path, "w") as f:
+            f.write(src)
+        p = subprocess.run([RMC, path, "-o", os.path.join(OUT, f"rejarrpat_{name}.bin")],
+                           capture_output=True)
+        if p.returncode == 0 or b"pattern requires" not in p.stderr:
+            failures += 1
+            print(f"FAIL reject_array_pat_len {name}: exit={p.returncode} stderr={p.stderr!r}")
+    for name, src in good.items():
+        path = os.path.join(OUT, f"okarrpat_{name}.rs")
+        with open(path, "w") as f:
+            f.write(src)
+        p = subprocess.run([RMC, path, "-o", os.path.join(OUT, f"okarrpat_{name}.bin")],
+                           capture_output=True)
+        if p.returncode != 0:
+            failures += 1
+            print(f"FAIL ok_array_pat_len {name}: rmc failed:\n{p.stderr.decode(errors='replace')}")
+    if failures == 0:
+        print("mismatched array patterns are rejected; matching ones still build")
+    return failures
+
+
+def check_reject_parse_type():
+    """A `parse::<T>()` turbofish other than `i64` is rejected.
+
+    rmc lowers every `args().nth(..).parse()` to the i64 parser, so accepting
+    `parse::<bool>()` would compile a program that treats a valid `true` as a
+    parse failure. Reject the unsupported types with a diagnostic instead.
+    """
+    bad = {
+        "bool": "use std::env; fn main() { let b = env::args().nth(1).unwrap().parse::<bool>().unwrap() as i64; println!(\"{}\", b); }",
+        "char": "use std::env; fn main() { let c = env::args().nth(1).unwrap().parse::<char>().unwrap() as i64; println!(\"{}\", c); }",
+        "u64": "use std::env; fn main() { let n = env::args().nth(1).unwrap().parse::<u64>().unwrap(); println!(\"{}\", n); }",
+    }
+    good = {
+        "i64": "use std::env; fn main() { let n = env::args().nth(1).unwrap().parse::<i64>().unwrap_or(7); println!(\"{}\", n); }",
+        "bare": "use std::env; fn main() { let n = env::args().nth(1).unwrap().parse().unwrap_or(7); println!(\"{}\", n); }",
+    }
+    failures = 0
+    for name, src in bad.items():
+        path = os.path.join(OUT, f"rejparsety_{name}.rs")
+        with open(path, "w") as f:
+            f.write(src)
+        p = subprocess.run([RMC, path, "-o", os.path.join(OUT, f"rejparsety_{name}.bin")],
+                           capture_output=True)
+        if p.returncode == 0 or b"unsupported `parse` type" not in p.stderr:
+            failures += 1
+            print(f"FAIL reject_parse_type {name}: exit={p.returncode} stderr={p.stderr!r}")
+    for name, src in good.items():
+        path = os.path.join(OUT, f"okparsety_{name}.rs")
+        with open(path, "w") as f:
+            f.write(src)
+        p = subprocess.run([RMC, path, "-o", os.path.join(OUT, f"okparsety_{name}.bin")],
+                           capture_output=True)
+        if p.returncode != 0:
+            failures += 1
+            print(f"FAIL ok_parse_type {name}: rmc failed:\n{p.stderr.decode(errors='replace')}")
+    if failures == 0:
+        print("a non-i64 `parse` turbofish is rejected; i64 and bare still build")
+    return failures
+
+
 def main():
     verbose = "-v" in sys.argv
     os.makedirs(OUT, exist_ok=True)
@@ -596,6 +676,8 @@ def main():
                 elif verbose:
                     print(f"ok   {name}{label} {argv}")
 
+    failures += check_reject_array_pat_len()
+    failures += check_reject_parse_type()
     failures += check_bounds_traps(combos)
     failures += check_clamp_trap(combos)
     failures += check_cap_traps(combos)

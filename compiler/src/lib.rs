@@ -21,6 +21,8 @@ pub mod elf;
 pub mod inline;
 pub mod licm;
 pub mod lexer;
+pub mod mir;
+pub mod mir_codegen;
 pub mod parser;
 pub mod runtime;
 pub mod sema;
@@ -83,6 +85,23 @@ pub fn compile_to_asm(src: &str, opts: &CompileOptions) -> Result<String, String
     }
     let user_asm = cg.compile(&prog);
 
+    let runtime = runtime::for_program(&user_asm);
+    let mut asm = String::with_capacity(user_asm.len() + runtime.len() + 64);
+    asm.push_str(&user_asm);
+    asm.push_str(&runtime);
+    Ok(asm)
+}
+
+/// Compile a parsed MIR program to x86-64 assembly (program plus runtime).
+///
+/// The MIR path shares the freestanding runtime and the in-process assembler
+/// with [`compile_to_asm`]; only the front end (rustc's MIR) and the lowering
+/// (`mir_codegen`) differ.
+pub fn compile_mir_to_asm(
+    prog: &mir::Program,
+    opts: &mir_codegen::Options,
+) -> Result<String, String> {
+    let user_asm = mir_codegen::compile(prog, opts)?;
     let runtime = runtime::for_program(&user_asm);
     let mut asm = String::with_capacity(user_asm.len() + runtime.len() + 64);
     asm.push_str(&user_asm);

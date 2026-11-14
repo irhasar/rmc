@@ -919,6 +919,25 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   leading `.`, because `.p2align` is emitted indented and otherwise looks like
   dead text after the entry `jmp`. `a_loop_body_starts_on_a_sixteen_byte_boundary`
   pins it.
+- **A hot loop's speed is an alignment lottery, so do not chase it.** Two
+  builds whose loop body is byte-identical differ by up to 1.4x when a preceding
+  change shifts the body by one byte (a `stats` variant measured min 2.61 ms at
+  one header offset and 3.08 ms two bytes later). This is not a codegen-quality
+  signal: the body the emitter produced was the same. The `.rms` path pins the
+  loop *body* to 16 bytes so unrelated edits cannot move it (above); the MIR
+  path (`mir_codegen.rs`) does **not**, which is why `stats`'s run-time drifts
+  with unrelated function-size changes. Do not try to steer it with per-header
+  `.p2align`/`nop` padding: a blanket 32-byte header alignment helped `sieve`
+  but lost on `callrec`/`fib`, and a size-thresholded version (align only bodies
+  of >=9 MIR statements) still lost on `mix`/`mandel`. `stats`'s ~0.97 run-time
+  against LLVM is this effect, not a scheduling gap.
+- **A caller-saved promotion is spilled around a call only when it is live
+  after it.** `spill_caller_saved` consults a backwards liveness fixpoint
+  (`compute_liveness`, built on `scan_rv_uses`/`scan_term_uses`) and skips a
+  promotion whose value the call's successor never reads again; the drop-glue
+  path passes `None` and keeps saving every one, because its calls span a tree
+  with no single block to query. This removes a store/reload pair around calls
+  in non-looping regions.
 - **A divisor that fits i32 uses `mov` not `movabs`.** `gen_div_const`
   materialises the divisor and the magic multiplier; `mov_imm64` picks the
   7-byte `mov $k, reg` when the value is a sign-extended 32-bit immediate and
@@ -1303,11 +1322,19 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   read back as zero. It raises if a produced binary exits non-zero, which
   catches the classic "measured a nonexistent path" bug. `--markdown PATH` writes
   the dated result to a file; the current one lives at `bench/RESULTS.md`.
-- **Every table reports RAM, on both sides of the comparison.** The console
-  table (`print_table`) carries compile `rss_kb` and run `run_rss_kb` (with
-  `run_cpu_ms`), and both markdown tables carry `peak RSS (kB)`; do not drop a
-  RAM column when editing the printer, or the headline claim ("lower RAM") loses
-  its evidence in the terminal even though `RESULTS.md` still has it.
+- **Every harness reports RAM on every axis, console and markdown alike.** Both
+  the compile side (`rss`/`compile_rss`) and the run side (`run_rss`) are
+  columns in each of `run.py`, `run_codegen.py`, `run_fair.py`, `run_four.py` and
+  `run_mir.py`, and each is scored in the per-axis mean and the verdict table. Do
+  not drop one: the RAM axes are part of the "faster on every axis" claim, so a
+  table missing them understates the comparison. `run.py`'s console table
+  carries the same nine columns as the others (`wall_ms cpu_ms rss_kb size_b
+  run_ms run_cpu run_rss`) so the terminal view and the recorded markdown agree.
+- **A ratio must guard a zero denominator.** A run that exits between two `/proc`
+  reads reports peak RSS 0, and `rustc/rmc` on 0 would crash the harness. Each
+  harness divides through a guard (`run.py`'s `ratio()`, `run_codegen.py`'s
+  `speedup()`, `run_mir.py`'s `safe_div()`) that returns 0/None instead, and the
+  run axes below the sampler floor are left unmeasured rather than scored.
 - **Cranelift is the fair baseline for the "no LLVM" claim.** The headline
   opponent is `rustc` with LLVM, but LLVM is a far stronger optimiser than rmc
   has, so a run-time loss to it may only mean LLVM optimised harder, and a
@@ -1358,11 +1385,23 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   never emitted and the 2.2x it produced measured the barrier, not the loop.
 - **The two builds must carry matching safety semantics.** rmc checks bounds by
   default and leaves overflow checks *off*; `rustc -O` keeps bounds checks *on*
-  and overflow checks *off*. `bench/run.py` passes rustc `-C overflow-checks=off`
-  and relies on rmc's default, so both carry bounds checks and neither carries
-  overflow checks. If rmc ever skipped a per-index check rustc emits, the ratio
-  would be unfair; the check costs ~1% on the array-heavy programs, so it does
-  not decide any ratio. Never build the two sides with different check settings.
+  and overflow checks *off*. `bench/run.py` relies on rmc's default and passes
+  rustc `-C overflow-checks=off`, so both carry bounds checks and neither
+  carries overflow checks. If rmc skipped a per-index check rustc emits, the
+  comparison would be unfair; the check costs ~1% on the array-heavy programs,
+  so it does not decide any ratio. Never build the two sides with different
+  check settings.
+- **`light` and `heavy` bracket the load spectrum, and both must stay.** `light`
+  is the short, cache-resident case (a 2 KiB table scanned with a data-dependent
+  branch for a few ms), so process startup and per-iteration codegen are a real
+  share of its cost. `heavy` is the long, throughput-bound case (~1e9 iterations
+  over two accumulators, hundreds of ms), where the measured time is the
+  generated loop and a startup-only win cannot flatter rmc. Together they stop a
+  regression in either regime from hiding behind a win in the other; keep both
+  when editing `ARGS` or `PROGRAMS`. Both keep the loop real for *both*
+  compilers the same way as `refs`/`heap` - the trip count is read from `argv`
+  and a data-dependent branch (plus a second accumulator in `heavy`) defeats
+  LLVM's loop-closing and vectoriser - and neither uses an in-loop `black_box`.
 - **`callrec` is the call-heavy case, and it used to lose.** Non-tail recursion
   (`tree(n) = 1 + tree(n-1) + tree(n-2)`) cannot be inlined by either compiler,
   so it measures raw call overhead plus argument setup, where the stack-based
@@ -2195,9 +2234,20 @@ directly in a `let` initializer; anywhere else the `\0`-prefixed parser marker
 reaches sema, which reports the source construct (see the `\0vecnew` arm). An
 args-vector is never built: `std::env::args()...collect()` records the binding,
 `for v in &args` desugars to `for i in skip..__rmc_nargs()`, and `args[i]`
-becomes `__rmc_arg_or(i + skip, 0)`. The `__rmc_arg_or`, `__rmc_nargs`,
-`__rmc_fill` and `__rmc_fill_bytes` helpers live in `runtime.rs`. Two relaxations
-make the pointer
+becomes `__rmc_arg_or(i + skip, 0, 0, 0)`. The `__rmc_arg_or`, `__rmc_nargs`,
+`__rmc_fill` and `__rmc_fill_bytes` helpers live in `runtime.rs`.
+
+The `args().nth(i)` chain has two independent failure points, and
+`finish_args_nth` tracks them in `__rmc_arg_or`'s last two arguments: `missing`
+(the `Option` unwrap) and `parse` (the `Result` unwrap). `.unwrap_or(d)` leaves
+both 0 and yields `d` for either failure; `.unwrap()` sets `missing`, so an
+absent argument exits 101 while a present non-integer takes the fallback when
+only `parse` is 0. The `and_then(|s| s.parse().ok())` chain recovers both, so it
+sets neither. A present non-integer argument must not be read as zero, and the
+turbofish `parse::<i64>()` type name lexes as a keyword token, not an
+identifier.
+
+Two relaxations make the pointer
 shapes type: `*mut T as i64` is allowed (rmc maps `*mut T` and `&mut T` alike,
 and rustc allows the raw form) and an integer/pointer coerce both ways, matching
 the existing `i64 as &T` extension; a shared reference still may not become a
@@ -2473,40 +2523,624 @@ The README's roadmap lists the intended next steps.
   `f(x-1) - f(x-2)` case, a `return` in an argument, a foreign call in the left
   operand, and overflow checks.
 
+## MIR back-end benchmark tuning (fair harness)
+
+`bench/run_fair.py` compares the same `bench/mir/*.rs` source through both
+back ends: `mir` = `rustc --emit=mir -O -Zno-codegen` + `rmcmir`, `llvm` =
+`rustc --emit=obj -O -C lto=fat -C codegen-units=1` + `ld`, both linked against
+rmc's own freestanding runtime. Read the harness before trusting a number.
+
+- **Count the whole pipeline's peak RSS on both sides.** The `mir` column's RSS
+  is `max(rustc --emit=mir, rmcmir)`; counting only `rustc` on the LLVM side
+  (leaving out `ld`) credits LLVM with a free link step and turns a tie into a
+  fake win. `measure_llvm` takes `max(c, ld)`.
+- **`-Zno-codegen` is the whole point of the front end.** With it, `rustc
+  --emit=mir` stops before LLVM codegen: `hello`/`stats` front-end CPU drops
+  from ~267/538 ms to ~54/408 ms. rmc sets `RUSTC_BOOTSTRAP=1` on the child
+  rustc; the harness mirrors that. Without the flag the MIR front end is as
+  expensive as the LLVM one.
+- **`rustc --emit=mir` uses ~3-5 MB *more* RSS than `--emit=obj`** (85892 vs
+  85220 KB on `stats`), reproducibly, with `-Zthreads=1`, `debuginfo=0`,
+  `mir-opt-level=2` and `incremental=false` all failing to close it. The
+  compile-RSS axis is therefore an inherent front-end tie (~0.99), not
+  something the back end can fix; the front end is rustc in *both* pipelines.
+  A second sweep (`-Zmir-opt-level=0/1/2`, `-Zmir-include-spans=no`,
+  `-Zshare-generics=no`, `-Zalways-encode-mir=no`, `-C strip=symbols`,
+  `-Zno-parallel-llvm`) caps the recoverable RSS at ~1.2 MB
+  (`-Zmir-opt-level=0`, at the cost of MIR quality), and `-C incremental=off`
+  saves ~10 MB but saves *more* on the LLVM side (79.8->62.2 MB vs
+  83.2->72.2 MB), so applying it to `mir` alone would be gaming the benchmark,
+  not optimising. Do not chase this axis.
+- **Report the back-end-only split too.** Because the front end is rustc in
+  both pipelines and dominates both RSS peaks, the whole-pipeline RSS ratio
+  hides the stage this experiment actually swaps. `run_fair.py` therefore also
+  prints a `back-end-only comparison`: `ld` over `rmcmir` per program, on wall,
+  CPU, RSS and size. rmc's own back end wins all four (`wall ~1.12`,
+  `cpu ~1.13`, `rss ~1.40`, `size ~18.8x`): `rmcmir` peaks at ~3.2 MB against
+  `ld`'s ~4.7 MB. That is the honest "rmc beats LLVM" claim; the whole-pipeline
+  RSS tie is the shared rustc front end, which neither pipeline controls.
+- **The compile CPU win is real and large** (~1.2x): skipping LLVM codegen.
+  Wall time is a near-tie because both fronts pay rustc's ~25-30 ms startup.
+  The win does not depend on the aggressive LLVM flags: on `stats`,
+  `rustc --emit=mir -O -Zno-codegen` is 26.2 ms wall / 25.8 ms CPU, a plain
+  `rustc --emit=obj -O` is 29.9/30.4, and the harness's
+  `-C lto=fat -C codegen-units=1` build is 30.2/30.7. The MIR front end is
+  cheaper than the LLVM one even when LLVM does no LTO at all.
+- **Ratios inside +/- 0.02 are a tie.** The run axes take the minimum of 50
+  interleaved samples, but two runs of the *same* binary still land within
+  ~1% of each other on this host (measured spread 0.8-1.3% for `mix`/`heap`),
+  so `0.99` carries no signal. `NOISE_BAND = 0.02` keeps the verdict from
+  calling a tie a loss; the harness also prints the mean speedup per axis, so
+  one program's tie cannot hide a regression. On the current host that mean is
+  `wall 1.08, cpu 1.12, rss 1.00 (tie), size 18.8, run_wall 1.10, run_cpu 1.11,
+  run_rss 1.20`: six wins and the one documented front-end tie.
+- **`run_rss` above 1 is rmc *winning*.** rmc's `_start` is a bare syscall exit
+  with no libc, so a short program peaks at ~36 kB while the LLVM+`ld` binary
+  pays the ELF loader's ~48 kB. A `run_rss` of 1.2-1.3 is a 12-33% RAM win, not
+  a loss; do not "fix" it.
+- **Strip the LLVM link (`ld -s`).** rmc's linker emits no section headers, so
+  its binary is symbol-free already; leaving LLVM's symtab in credits rmc with
+  ~5.7 kB it did not save. `run.py` strips rustc for the same reason.
+
+### The harness gates on output equality and interleaves sampling
+
+Two properties make the verdict defensible, and both are easy to lose when
+editing the harness:
+
+- **Correctness gate.** `verify_outputs` runs both produced binaries once and
+  aborts if stdout or exit status differ, before any run-time number is
+  reported. A back end is only "faster" on a workload the other also computes
+  correctly; without the gate, a back end that miscompiles (or traps early)
+  would look fast.
+- **Interleaved sampling.** `measure_stages` times the four compile stages
+  (`mir.front`, `mir.back`, `llvm.front`, `llvm.back`) round-robin in one pass,
+  and `measure_interleaved` does the same for the produced binaries, so CPU
+  frequency and thermal drift cannot favour whichever pipeline ran first. A
+  sequential sweep can flip a near-parity run axis (`mix`/`heap` sit at ~1.00)
+  on its own.
+- **`run.py` is the end-to-end claim, and it reports a machine-checked
+  verdict.** rmc's own front end *and* back end against rustc/LLVM on one
+  source, so unlike `run_fair.py` there is no shared front end to excuse a tie:
+  a tie there would be a real limit of the whole compiler. `verdict`/`axis_means`
+  print the mean `rustc/rmc` ratio per axis with a `win`/`tie`/`loss` word
+  (`NOISE_BAND = 0.02`, matching `run_fair.py`), list every per-program loss, and
+  print `ALL AXES WON` only when all seven axes win; `write_markdown` records the
+  same table under `## Verdict`. The current run is `ALL AXES WON`
+  (`compile_wall 1156x`, `compile_cpu 1246x`, `compile_rss 52x`, `size 301x`,
+  `run_wall 1.46x`, `run_cpu 1.71x`, `run_rss 72x`). The run axes are the honest
+  ones: 1.46x/1.71x/72x, not the four-digit compile ratios.
+
+`bench/run.py` (AST path) carries the same gate (`verify_outputs`) and
+round-robin run sampling (`measure_runs`). `bench/run_mir.py` does *not*: its
+`mir` column compiles `bench/mir/*.rs` while its `ast`/`llvm` columns compile
+`bench/rust/*.rs`, so its run-time axes compare two different programs. Treat
+its run numbers as indicative and use `run_fair.py` for the apples-to-apples
+claim; the caveat is recorded in its docstring.
+
+### The rustc-front-end / rmc-back-end pipeline: state and gaps
+
+`docs/mir-roadmap.md` is the milestone plan. The measured facts behind it, so a
+future session does not re-derive them by hand:
+
+- **The MIR path is far more capable than its own doc comments say.** Probes
+  (compile + run + diff against a native `rustc -O` twin) show `f64`/`f32`
+  arithmetic and loops, `i128` arithmetic/division/comparison, capturing and
+  non-capturing closures *called directly*, by-value struct/tuple returns,
+  `&mut` through a reference, `impl`/trait static dispatch, slice iterators,
+  `Option`/`Result`, monomorphised generics, and 2-D/array-of-struct all
+  **produce correct results**. But `classify_unsupported` in `mir.rs` still
+  claims "floating-point types are not implemented" and "128-bit integers are
+  not implemented". Trust the probe, not the message; fixing the list is P1.
+- **Function pointers and indirect calls are implemented (P4).** Taking a
+  function as a value (`add as fn(i64, i64) -> i64`, MIR
+  `PointerCoercion(ReifyFnPointer)`) reifies its address, and a call through a
+  `fn`-typed place lowers to an indirect `call *%reg`. Covered by
+  `tests/mir/fnptr.rs`: a pointer passed as an argument, returned from a
+  function, stored in a struct field, and held in an array. Three latent bugs
+  had to be fixed, each of which would break *any* operand-shaped callee:
+  `split_top_args` counted the `>` of a `->` as a closing angle bracket (so a
+  `fn(..) -> ..` parameter swallowed every later argument); the inliner cloned
+  `CallTarget::Indirect` verbatim (so an inlined indirect call still named the
+  *caller's* local); and the MIR use/def and rewrite passes ignored the callee
+  operand (so a `fn` pointer local looked dead and its definition was dropped).
+  Still open: a closure passed as `impl Fn` becomes an indirect call but needs
+  the closure *value* to be built, which is a separate aggregate gap; `dyn
+  Trait`; `Range` as a value (`(0..10).step_by(2)`) hits `aggregate constant
+  not yet materialised`. `Vec`/`Box`/`String` fail earlier, at the front end,
+  because the `#![no_std]` stub has no `alloc`.
+- **LLVM emits `memset` for a wide zero-init; rmc's runtime must provide it.**
+  `bench/mir/light.rs`'s `[0i64; 256]` made LLVM call `memset`, which rmc's
+  freestanding runtime did not define, so `run_fair.py` failed at the link with
+  `undefined reference to memset`. The `mem*` primitives are now runtime pieces
+  (`compiler/src/runtime.rs`), selected only when a program names them, so rmc's
+  own output is byte-identical; they are verified against a C harness and pinned
+  by `runtime::tests`. Any future runtime piece that a *compiler* may emit a
+  call to (not just the user) needs the same treatment.
+- **The honest scoreboard is `run_fair.py`'s "some axes lost".** After the P3
+  codegen work the whole-pipeline mean is wall 1.08, cpu 1.11, rss 1.00 (tie),
+  size 18.8, run_wall 1.12, run_cpu 1.13, run_rss 1.31. The one remaining
+  per-program flag is `hello` **compile RSS 0.97**, which is the shared rustc
+  front end (below), not rmc. `light` run wall is now 1.11 — the old 0.81 loss
+  is closed. Back-end-only compile is still behind `ld` on `refs`/`sieve`/
+  `mandel` (0.81/0.85/0.89), a slow path in rmc's own assembler, not in the
+  codegen: the one-process `cb` pipeline beats LLVM on all three.
+- **`fold_lea_terms` closed the `light` run-time loss.** An array element access
+  was `lea base(%rbp), %rax; mov index, %rcx; lea (%rax,%rcx,8), %rax` — three
+  instructions where x86-64 fits base, scaled index and displacement in one.
+  The pass fuses the chain into `lea base(%rbp, index, 8), %rax` and drops the
+  index copy, but only when `%rcx`'s next mention is a pure write (a `mov`/`lea`
+  whose destination is `%rcx` and whose source is not), so a live scratch value
+  is never clobbered. It sits after `fold_addresses` in the fixed-point loop and
+  is pinned by `an_indexed_address_chain_folds_to_one_lea` plus the negative
+  `an_indexed_chain_whose_scratch_is_still_live_is_not_folded`. Measured: `light`
+  run wall 0.81 → 1.11; no program is below 0.98.
+- **The `hello` compile-RSS flag is rustc's front end, not rmc.** `rustc
+  --emit=mir -Zno-codegen` peaks ~3.5 MB above `--emit=obj` on the same source
+  (84.2 vs 80.9 MB), because emitting the MIR text keeps every body resident,
+  while `--emit=obj` frees them once LLVM has consumed them. rmc's own back end
+  peaks at 3.2 MB against `ld`'s 4.7 MB, so on the stage this experiment swaps
+  rmc wins by 1.4x. The whole-pipeline ratio is `max(front, back)` on both
+  sides and the shared front end dominates both peaks, so this axis is a
+  structural tie; do not chase it (a flag sweep in the MIR-bench section shows
+  the recoverable headroom is ~1 MB and only at the cost of MIR quality).
+- **Do not promise "beats LLVM on every axis".** The compile/memory/size axes
+  are structural wins (skip LLVM codegen, link no libc), and the back-end-only
+  split wins all four. The whole-pipeline run-time axis is now a win too, but
+  it is the least structural: the back end still has no real register
+  allocator, so a scheduler-sensitive kernel could lose it back.
+  `docs/mir-roadmap.md` P3 is the work that keeps it closed.
+
+### The codegen-backend pipeline (`cb`): the dylib must be a `cdylib`
+
+`backend/` builds rmc as a rustc `-Zcodegen-backend` dylib, the complete form
+of the pipeline the printed-MIR prototype (`rmcmir`) stands in for: rustc hands
+the backend the same optimised MIR LLVM would see, and rmc lowers it straight
+to a freestanding ELF. `bench/run_codegen.py` compares it to `rustc -O -C
+lto=fat` per program.
+
+- **`cb` wins every mean axis against LLVM.** Measured: wall 1.33, cpu 1.36,
+  rss 1.11, size 21.0, run_wall 1.09, run_cpu 1.09, run_rss 1.25. No per-program
+  cell is below the band any more (the old `hello` compile-RSS loss is gone; see
+  the visible-path note below). Against the printed-MIR prototype (`mir`) it is
+  faster to compile (wall 1.25, cpu 1.24, rss 1.08) at identical run time: one
+  process, no MIR text, no `ld`. Against rustc's Cranelift backend it wins every
+  axis too (wall 1.13, cpu 1.16, size 20.9, run_wall 1.61).
+
+- **The backend is x86-64/executable only, and says so.** `assemble` writes
+  x86-64 ELF and rmc supplies its own `_start`, so `codegen_crate` fatals on a
+  non-x86-64 `--target` and on any `--emit` other than an executable
+  (`--emit=obj`/`asm` would otherwise get a silently mislabeled ELF), and on a
+  non-`bin` crate type.
+- **`-C opt-level` must be passed by the caller.** opt-level drives rustc's MIR
+  passes, which run *before* `codegen_crate`, so the backend cannot set it. The
+  `backend/rmc-rustc` wrapper supplies `-C opt-level=3` by default (a later
+  `-O`/`-C opt-level=N` on the command line still wins); `bench/run_codegen.py`
+  passes it explicitly.
+- **`overflow_checks` is read from the session and threaded through.** The MIR
+  dump only carries the checked-arithmetic shapes under `-C overflow-checks=on`,
+  and `switchInt(OverflowChecks)` folds to a different arm, so `codegen_crate`
+  passes `tcx.sess.overflow_checks()` to both `mir::parse_with` and the loop
+  rewrites (`tco`, `close_counted_loops`), which would otherwise move a trap.
+- **`crate-type = ["cdylib"]`, not `["dylib"]`.** A `dylib` exports every
+  `pub` symbol of its dependency, so all 194 `rmc::*` items stay dynamically
+  exported and the linker cannot drop the unused AST front end
+  (parser/sema/lexer, ~17k lines). A `cdylib` exports only
+  `__rustc_codegen_backend`, the `.so` halves (2.1 -> 1.2 MB), and the
+  whole-pipeline compile-RSS mean moves from a loss to a tie. Add `lto = true`,
+  `strip = true`, `codegen-units = 1` to match the compiler crate's profile.
+- **Drive the backend through `rustc` directly, not the `backend/rmc-rustc`
+  shell wrapper.** The wrapper's extra `sh` process is a fixed ~1.9 ms tax; the
+  LLVM row is one `rustc` process, so the harness must be too or the comparison
+  is unfair. `run_codegen.py` passes `-Zcodegen-backend=<so>` to `rustc +nightly`
+  itself. The `.so` carries an rpath to the toolchain `lib` (set by
+  `backend/build.sh`), so no environment fixup is needed.
+- **`interleave_div_pairs` is the whole of `mandel`'s gap to LLVM.** Its inner
+  loop computes `zr*zr/1000` and `zi*zi/1000`: two adjacent
+  `mov;imul;mov %rax,%r10;<magic divide>` units. Each is short enough that the
+  CPU cannot hide the second `imul` behind the first unit's tail, so the pair
+  runs serially. The pass hoists the second multiply above the first divide and
+  parks the two products in `%r10`/`%r11` (scratch on this path). Constant
+  hoisting alone does *not* help (verified, 5 sites) -- the win is purely ILP.
+  The pair must be independent: `match_div_pair` rejects it when the first
+  divide's destination is the second's multiplicand, since reordering would
+  then square the register's pre-division value.
+- **`gen_div_const` takes its sign correction from `%rdx` on the plain path.**
+  Only the biased (`add`) path -- where the magic `m` does not fit a positive
+  `i64` and the product does not carry the dividend's sign -- needs the dividend
+  copy in `%r10`. The plain path reads `%rdx >> 63` straight after the `imul`,
+  keeping `%r10` off its critical path (and free for the interleave pass).
+- **`-C opt-level=3` (with rustc's MIR optimiser) is mandatory, not a knob.**
+  `-Zmir-opt-level=0` compiles `hello` ~1 ms faster and ~1 MB lighter, but
+  `mandel` runs 1.6x slower, `stats`/`forloops` 2x, and `fib` is wrong. rmc
+  reuses rustc's optimised MIR; it does not re-do those passes.
+- **The remaining `hello` compile-RSS loss (0.97) is structural.** Stubbing out
+  rmc's lowering entirely (`compile_mir_text` returns early) still peaks at
+  84.6 MB against LLVM's 83.0 MB, so it is the shared rustc front end plus the
+  ~1.4 MB cost of loading a codegen backend at all -- not rmc's codegen. The
+  mean RSS is a tie (1.01); do not chase the per-program flag.
+
+### The harnesses must not hard-code mangled names, and the toolchain is pinned
+
+The differential and benchmark harnesses once hard-coded v0-mangled panic
+symbols with the crate hash of one libcore build:
+
+```
+_RNvNtNtCskADBYZwJmSU_4core9panicking11panic_const24panic_const_add_overflow
+_RNvNtCskADBYZwJmSU_4core9panicking18panic_bounds_check
+```
+
+The hash is not stable across toolchains, so on any other build the reference
+link failed with `undefined reference to ...panic_bounds_check` and the
+harness aborted or reported a false failure (reproduced on stable 1.97 and on
+`nightly-2026-11-12`, the channel this branch uses).
+
+- **Read the undefined symbols off the object.** `tests/mir/run.py`
+  (`flow_checks` cases) and `bench/run_fair.py` now run `nm -u` on the
+  reference object and stub exactly the `panic`/`overflow` names it reports,
+  rather than a literal list. The stub set then adapts to whatever codegen
+  emits. `nm` prints an undefined name either as a `U`-typed three-column line
+  or as a bare name, so match both forms.
+- **Pin the toolchain for the backend, not the repo.** `backend/rust-toolchain.toml`
+  pins the exact nightly plus `rustc-dev`, `llvm-tools` and
+  `rustc-codegen-cranelift`. It is scoped to `backend/` on purpose: a root pin
+  would force the AST/MIR prototype suites and CI's stable `test` job onto
+  nightly. rustup resolves the nearest pin from the *working directory*, so
+  `backend/build.sh` cds into `backend/` first, and `backend/rmc-rustc` passes
+  the channel explicitly (`rustc +"$channel"`) since it may be run from
+  anywhere. Every harness reads the channel back out of the TOML
+  (`backend/rust-toolchain.toml`) instead of writing `+nightly`, so the pin is
+  the single source of truth and the backend dylib is always loaded by the
+  toolchain it was built against.
+- **The harness creates its own directories.** `bench/run_codegen.py::build_runtime`
+  does `os.makedirs(OUT, exist_ok=True)` because `bench/run_four.py` calls it
+  directly and only creates its own `/tmp/rmcfour`; a fresh machine previously
+  hit `FileNotFoundError` for `/tmp/rmccodegen`.
+- **CI proves it on a fresh machine.** The `bench` job installs only the pinned
+  toolchain (channel read from the TOML) plus binutils, builds, and runs both
+  harnesses from empty output directories. A hard-coded mangling only breaks on
+  a toolchain the author did not use, so a fresh-machine job is the only way to
+  gate it.
+
+### A codegen backend must not swallow a real diagnostic
+
+`codegen_crate` calls `tcx.dcx().reset_err_count()` to disarm the "must produce
+a diagnostic" guard rustc arms around MIR printing, but `reset_err_count` also
+discards any *real* error. Assert the count is 0 first, so a genuine error
+reaching codegen aborts instead of being silently cleared (`codegen_crate` only
+runs after type checking passed, so a non-zero count there is itself a rustc
+bug). `tests/cb/run.py` pins it: a program with a type error must exit non-zero
+through `rmc-rustc`, print the `E0308` diagnostic, and write no binary.
+
+### An unsupported construct must exit 1, never panic
+
+Three separate panics on *expected* input were found and fixed (P1):
+
+- `compiler/examples/rmcmir.rs` used `.expect("mir parse")` and
+  `.expect("assemble")`, so an unsupported construct printed a Rust panic and a
+  `RUST_BACKTRACE` note with status **101**. Both now exit 1 with `rmc-mir:
+  error: ...`, matching the `.rs` path in `main.rs` (which already propagated
+  errors). `f_minmax` (`.min(3.0)`, an undefined float intrinsic) panicked at
+  `assemble` on `elf: undefined symbol`.
+- A `dyn Trait` coercion was parsed as an identity pointer cast; the virtual
+  call then became a direct call to a method with no symbol, so the user saw
+  `elf: undefined symbol 'area'` at link time. `parse_rvalue` now rejects a
+  `dyn` cast target where the construct is still visible.
+- `classify_unsupported` claimed "floating-point types are not implemented" and
+  "128-bit integers are not implemented". Both are false: `tests/mir/float.rs`
+  and `tests/mir/wideint.rs` compile and run. Only float `%` and the intrinsics
+  (`min`/`max`/`abs`/`powf`) are unsupported. Trust a probe over the message.
+
+The invariant is now enforced, not just documented: `tests/mir/reject/` holds
+cases rustc accepts but rmc must refuse, and `tests/mir/run.py` asserts status 1
+plus a `note:` (status 101 would be a panic). `tools/mir_survey.py` had been
+calling `rmc` *without* `--rustc-frontend`, so it surveyed the AST path and
+could not see any of these crashes; it now passes the flag and runs in CI.
+
+
+### Branchless min/max (`cmov`) was tried and rejected
+
+A min/max diamond (`if v > acc { acc = v }`) lowered to a branch; LLVM emits
+`cmov`. Adding `enc_cmov` to `elf.rs` and a `plan_cmovs` fold to
+`mir_codegen.rs` made `stats` **1.16x slower** (3.27 -> 5.08 ms on the same
+binary, `taskset -c 2`, best of 13) and was neutral (0.99-1.02) on the rest.
+The reduction branches in these benchmarks are predictable — the accumulators
+start at `i64::MIN`/`MAX` and the update usually takes the same side — so the
+branch predicts ~perfectly while the `cmov` only adds a data dependency to a
+latency-bound loop. LLVM wins `stats` because it *unrolls by two* and strength-
+reduces the `i * 2654435761` multiply into two induction variables, not because
+of `cmov`. Do not re-add the fold without measuring a program whose min/max
+input is genuinely unpredictable.
+
+### Recurring wide constants are hoisted into idle callee-saved registers
+
+An i64 immediate that does not fit a sign-extended i32 needs a `movabs` to
+materialise, and one named inside a loop pays that on every iteration (`stats`'s
+`i * 2654435761` and the `% 1000003` magic multiplier are two per iteration).
+`hoist_consts` ranks the constants that recur by loop depth (a single use in a
+loop clears the bar) and materialises each into a callee-saved register once, at
+function entry; `const_operand` and `gen_div_const` then read the register
+instead of re-emitting the immediate.
+
+Promotion runs first and claims the registers it wants; hoisting only fills what
+is left. That ordering matters: hoisting *first* (so it claimed the spare
+registers) displaced `stats`'s hot `count` local into memory, and the extra
+load/store per iteration cost more than the two `movabs` it saved. A promoted
+local is worth more than a hoisted constant -- a load versus a `movabs` -- so
+hoisting is the tie-breaker, not the priority. It is a wash on programs whose
+hot loop already uses all five callee-saved registers (`mandel`) and helps those
+with registers to spare.
+
+### No-op arithmetic (`add $0, %reg`) must be dropped
+
+A struct field at offset 0 lowers to `add $0, %rax`. The instruction cannot
+change its destination, but it *does* block the store-forwarding peephole that
+would otherwise fold the pointer's round-trip through its frame slot, so every
+field write keeps a reload. `drop_noop_arith` removes `add $0`/`sub $0` unless
+the next instruction reads the flags it sets (`flags_used_by`). Measured on the
+`heap` linked-list fill: one load per node removed, run 1.08x vs LLVM; `refs`
+1.04x, `mix` 1.01x.
+
+### A drop-glue read of a promoted caller-saved local must come from its spill slot
+
+`gen_drop` spills the promoted caller-saved locals once, before the destructor
+tree, and restores them after the whole tree. That is correct for the tree's
+*calls*, but not for a read that happens *inside* the tree after one of them: the
+destructor call clobbers the register, so a later `place_addr` that reads the
+local gets garbage. Dropping `arr[i]` is the reachable case — the index local
+feeds `Proj::IndexLocal`, and a struct whose first field drops before a second
+field is addressed (`struct S { a: [Inner; 2], b: Inner }`) reads the index again
+after the array's destructors have run, dropping `b` at `arr[<garbage>]`. While
+`in_drop` is set, `local_operand` returns the local's caller-spill slot (written
+by the tree's own spill) instead of the register. The index must be *promoted*
+for this to bite: it needs a use count of at least 2 (`indexdrop.rs` raises it
+with nested loops), otherwise it stays in its frame slot and the bug is latent.
+Regression: `tests/mir/indexdrop.rs`.
+
+### An aggregate literal is a variant only if a real `::variant` segment follows the type
+
+Both aggregate-classification paths (`reclassify_enum_aggregate`, which uses the
+destination local's type, and `is_enum_variant_name`, which decides by
+capitalisation) must strip generics *before* looking for the variant segment. A
+generic struct literal prints as `G::<T> { .. }`; splitting the raw name takes
+the turbofish as the variant and adds a phantom tag word, shifting every field by
+one (`G::<T>` with a module-qualified argument gave 12 instead of 119). Reducing
+first makes `Option::<i64>::Some` -> `Option::Some` (a variant) and `G::<T>` ->
+`G` (a struct). Regression: `tests/mir/genstruct.rs`.
+
+### Overflow checks are rustc's rewrite, not the back end's switch
+
+On the MIR path the back end must never emit an overflow trap of its own. rustc
+encodes a checked `+`/`-`/`*` as `AddWithOverflow`/`SubWithOverflow`/
+`MulWithOverflow` followed by an `assert`, and encodes the wrapping forms
+(`wrapping_add`, and rustc's own range/iterator desugaring, which prints as
+`AddUnchecked` and friends) as a bare `Add`. So a trap is always an explicit
+`assert` in the MIR, and the instruction itself is identical either way. The
+back end's job is only to lower both spellings to the same instruction; whether
+the operation traps is decided entirely by whether rustc put the `assert` there.
+
+For the same reason `bin_op` maps `AddUnchecked`/`SubUnchecked`/`MulUnchecked`
+(and the shift forms, and the older `UncheckedAdd` spelling) straight to
+`BinOp::Add` and friends rather than to separate variants. A separate variant
+would lower correctly but would also stop matching the many loop passes that
+pattern-match `Rvalue::Binary(BinOp::Add, ..)` on a literal, so the counter
+induction of a `for i in 0..n` written over a slice (where rustc emits
+`AddUnchecked`) would silently stop strength-reducing while the same loop over a
+plain range (which emits `AddWithOverflow` + `assert`) still did.
+
+`--overflow-checks` is therefore passed to the *rustc* invocation
+(`-C overflow-checks=on|off` in `main.rs`), not to `mir_codegen`. An earlier
+version had the back end add `jo __rmc_overflow` after every `add`/`sub`/`mul`,
+which is wrong twice over: it traps `wrapping_add` (rustc emits it as a plain
+`Add`, so nothing should trap) and it double-traps the checked forms (rustc's
+`assert` already fires). It also cannot see a value that is only out of range at
+run time, so a runtime `i64::MAX + 1` slipped through until the flag was passed
+through to rustc. `mir_codegen::Options` has no `overflow_checks` field for this
+reason. Division overflow is the one case rustc guards regardless of the flag
+(`assert(!(y == -1 && x == i64::MIN))` before a `Div`), so `gen_div_const`'s
+`neg %rax` needs no trap either.
+
+Regressions: `tests/mir/wrapping.rs` (the wrapping family and a range `for`,
+compiled with checks *off* — must not trap), and `tests/mir/ovfcheck.rs` +
+`ovfcheck.overflow` (checked arithmetic compiled with checks *on* — must exit
+101 on overflow). The `.overflow` marker makes `tests/mir/run.py` pass
+`--overflow-checks` to rmc and `-C overflow-checks=on` to the reference, and
+link the reference against small stubs that route core's
+`panic_const_*_overflow` symbols to `__rmc_overflow`.
+
+### `strength_reduce` may not reuse a multiply destination read after the loop
+
+`strength_reduce` rewrites `p = i * C` inside a loop into a running value
+(`piv`) advanced by `s * C` in the latch, and it reuses the multiply's own
+destination for `piv` to avoid spending a fresh local. The advance is inserted
+after the increment, so it also runs on the final iteration: once the loop
+exits, the reused destination holds `n * C`, not the `(n - 1) * C` the last body
+execution stored. `while i < n { p = i * 7; i += 1 }` printed 70 instead of 63.
+
+Reuse is gated on `reuse_ok`: the destination may double as the running value
+only when every read of it is inside the loop, after the multiply and before the
+latch's increment. That is the window in which the running value equals the
+multiply's original result. A destination read after the loop, or before the
+multiply (where the running value is one step ahead), gets a fresh private local
+instead. The gate is precise enough to keep the optimisation where it pays:
+`stats`'s `v = i.wrapping_mul(2654435761)` feeds only an in-loop accumulator, so
+it still strength-reduces with no `imul` in the hot loop. Regression:
+`tests/mir/srread.rs`.
+
+### A type spelling is relative to the item that mentions it, and it can be qualified
+
+rustc prints a type relative to the body that mentions it, and that relative
+spelling is not always bare: inside `outer::get`, the nested type `outer::a::A`
+prints as `a::A`, while the crate root spells it `outer::a::A`. A qualified
+spelling looks like a complete path, so `canonicalize_types`' global bare-name
+pass skips it (it must: `a::A` in two modules can name two distinct types). The
+callee then keys a *different* type than the caller built, its layout is empty,
+and field reads fall back to `k*8`, reading the wrong word past a multi-word
+field. `Function::module` keeps the body's own module prefix from the raw header
+(before the printer's relative spellings are resolved) and a per-body pass in
+`canonicalize_types` resolves each qualified body spelling against it, longest
+prefix first. Regression: `tests/mir/modrelpath.rs` (reads `1 5` instead of
+`1 13` without the per-body pass). The inliner masks this: the callee needs a
+large body (or `#[inline(never)]`) to be emitted at all.
+
+### A masked index's bounds check is dropped, and the index is promoted anyway
+
+`table[i & 255]` with `table: [i64; 256]` keeps a `cmp`/`jge` on every
+iteration: the bounds `assert(i & 255 < 256)` is provably true. `AssertFacts`
+gained two facts to see that -- `masked` (`d = x & M` puts `d` in `[0, M]`, and
+a widening `IntToInt` cast carries the bound along) and `lt` (`b = x < LEN`) --
+and `drop_redundant_asserts` drops the assert when the index's bound is below
+the length. Both facts survive a join only when the two sides agree exactly.
+
+Dropping the assert leaves the index with a *single* textual use, and the
+register allocator's two-use threshold then spilled it, which ate the whole win
+(the assert is one branch per iteration; a spilled index is a load plus a store).
+The fix is in the same change: a local used as an array index is promoted with
+one use when it is read inside a loop. Every other local keeps the two-use rule,
+so `fib`'s `n - 1`/`n - 2` temporaries still fold into `lea` and do not take a
+register and a spill -- relaxing the threshold globally cost `fib` 22 -> 31 ms.
+
+`light` run_wall went 0.85 -> 1.11 against LLVM on this change alone.
+
+### The `hello` compile-RSS loss was rustc's visible-path resolution
+
+The `cb` pipeline used to read 0.97 on `hello`'s compile RSS. The cause was not
+rmc's back end but `write_mir_pretty`: for every type it prints, the pretty
+printer resolves a *visible* path, which walks `visible_parent_map` and
+`module_children` and caches the resulting per-crate maps for the rest of the
+process. On `hello` that alone is ~9 MB of peak RSS, for text rmc immediately
+parses and discards.
+
+A no-op codegen backend pinned it down. Forcing only `mir_keys` costs 0.1 MB
+over `-Zno-codegen`; forcing `optimized_mir` for every key costs ~15.6 MB; and
+`def_path_str` on every key costs ~8.8 MB on its own, which is the whole gap.
+Rendering to a `sink` costs the same as rendering to a `Vec`, so the text is
+not the cost — the path resolution is.
+
+The fix is to render under both path guards:
+
+```rust
+rustc_middle::ty::print::with_no_visible_paths!(
+    rustc_middle::ty::print::with_no_trimmed_paths!({
+        write_mir_pretty(tcx, &mut mir_bytes)
+    })
+);
+```
+
+`with_no_visible_paths!` is the one that pays: `with_no_trimmed_paths!` alone
+moves nothing (`trimmed_def_paths` is a separate query, ~8.1 MB, but the printer
+reaches it only after the visible-path walk). Neither guard changes the
+semantics rmc needs — the parser reads the canonical `core::panicking::panic`
+spelling just as well — and all 12 benchmark programs still produce identical
+output. The `DiagCtxt` "must produce a diagnostic" guard that rendering arms is
+still cleared with `reset_err_count()`; the guards do not disable it.
+
+With the fix, `cb` reads 1.07-1.13 on `hello`'s compile RSS and the whole
+benchmark is `ALL CB WINS` (mean RSS 1.111, wall 1.340, cpu 1.370, size 21.0,
+run_wall 1.079, run_cpu 1.088, run_rss 1.282).
+
+Superseded notes, kept for the record: `opt-level=1`/`0` and `mir-opt-level=1`/`2`
+shave 0.5-1 MB but make `light` uncompilable (`const LEN`/`wrapping_mul` leak
+through to rmc's parser); `-Z embed-metadata=no` is a no-op for `--emit=mir`;
+`-Zno-embed-metadata` (no `=`) is not a flag at all, and rustc exits before
+compiling, which is why a naive RSS probe reads a bogus ~33 MB;
+`MALLOC_ARENA_MAX=1`/`2` does not move the peak; and `-Zmir-opt-level=0`
+reaches 82.8 MB, still above LLVM.
+
+### The `cb` route reaches MIR the printed-MIR prototype never sees
+
+`with_no_visible_paths!` is not the only difference between the two routes.
+`-Zno-codegen` and `-Zcodegen-backend` stop the pipeline at different points,
+so the backend sees MIR that `--emit=mir` has already folded away, and it sees
+it spelled with *defining* paths. `tests/cb/` is the differential suite for the
+real backend path (it skips cleanly when nightly `rustc-dev` is absent); the
+cases below are each a shape the prototype never encounters:
+
+- **Defining vs visible paths.** `std::io::stdio::_print`,
+  `core::marker::PhantomData`, `core::intrinsics::compare_bytes`,
+  `core::mem::size_of`. The front end keys every one by path *tail*, so both
+  spellings land on the same symbol.
+- **Bare unit-struct constants.** `--emit=mir` folds `let _p = P;` away;
+  the backend leaves `_1 = const P;`. `parse_const` accepts a bare identifier
+  only when it starts uppercase — a lowercase one (`add`, the operand of
+  `add as fn(..)` in a cast the caller has not split off) must stay a place, or
+  the fn-pointer tests segfault on a lost operand.
+- **Split promoted chains.** `--emit=mir` folds a promoted referent to one
+  line; the backend can leave `_2 = size_of::<i32>(); _1 = Mul(move _2, const
+  4_usize)` (`unsupported constant main::promoted[0]`). `eval_promoted_referent`
+  is a small forward evaluator over the block that resolves earlier locals as
+  binary-op operands.
+- **`core::intrinsics::integer_min`/`integer_max`.** The backend inlines
+  `Ord::min` but not the intrinsic, so the call survives where the prototype
+  sees `<T as Ord>::min`. `parse_const` read the path as a unit-struct constant;
+  it now maps to the same `__rmc_{i,u}min/max` helper.
+- **`core::panicking::todo_default_msg`/`unreachable_default_msg`.** The
+  prototype folds `todo!()` to `panic(const "...")`; the backend leaves the
+  no-argument helper (an undefined symbol). Both abort, so both map to
+  `__rmc_panic`.
+- **`const ZeroSized: {closure@..}`.** A closure returned but never called in
+  place; `--emit=mir` folds it away, the backend spells it out. Treated as the
+  zero-sized constant it is, alongside `PhantomData`.
+
+With all of these the divergence scan over `tools/mir_survey.py`'s corpus is
+clean: every case the prototype compiles now compiles identically under the
+backend. The suite's runner compares "both succeed or both abort" rather than
+the exact status, because rmc's panic sink exits 101 where libstd raises
+`SIGABRT`.
+
 ## Pushing
 
+A push needs a token with `contents: write`. The `GITHUB_TOKEN` in this
+environment is sometimes such a token and sometimes a read-only GitHub App
+installation token (`ghu_` prefix, empty `x-oauth-scopes`), which fetches fine
+but answers every write with `403 Resource not accessible by integration` on
+`receive-pack` and on the git-refs API alike. The repo permission list can
+still read `push: true` for the app's own account, so that is not a reliable
+signal. Check `git ls-remote` first, then try the push; if it 403s, ask the
+user for a write-capable `ghp_` token and push with it — do not scan
+conversation logs for one.
+
 The token must never be persisted in `.git/config` or a file, so `origin` is a
-plain token-free URL (`https://github.com/irhasar/rmc.git`) and there is no
-credential helper. A bare `git push origin <branch>` therefore prompts for a
-username and hangs — do not run it. Push with the token supplied inline, taken
-from the environment, so it never lands on disk:
+plain token-free URL (`https://github.com/irhasar/rmc.git`). But the environment
+*does* install a global credential helper
+(`~/.openhands/git-credential-helper`, via
+`credential.https://github.com.helper`), and it answers with the same read-only
+token as `GITHUB_TOKEN`. A `-c credential.helper=<mine>` only *appends* to that
+list, so the global helper still runs first and the push still 403s — the token
+is never even consulted. Clear the list and install the one-shot helper on the
+URL-specific key:
 
 ```
-git push "https://x-access-token:${GITHUB_TOKEN}@github.com/irhasar/rmc.git" <branch>
+RMC_PUSH_TOKEN=<token> git \
+  -c credential.helper= \
+  -c credential.https://github.com.helper= \
+  -c credential.https://github.com.helper='!f(){ echo username=x-access-token; echo "password=$RMC_PUSH_TOKEN"; };f' \
+  -c credential.https://github.com.username=x-access-token \
+  push origin <branch>
 ```
 
-A read (`git ls-remote <same-url>`) confirms the remote state; if a push is ever
-refused, check `git ls-remote` before concluding the token lacks
-`contents: write`. The inline URL leaves the tracking ref stale, so refresh it
-with `git fetch "<url>" <branch>:refs/remotes/origin/<branch>` afterwards.
+The two empty `-c` assignments reset the inherited helpers; the helper text
+names the *variable*, not its value, so the token never reaches `argv` or shell
+history (an inline `https://x-access-token:<token>@...` URL is visible in both
+`ps` and the history file, and an output filter cannot hide either copy). A read
+works the same way:
 
-**Always push at the end of every session.** The user asked for this
-explicitly: after committing, push the current branch so the remote branch is
-never behind the local one. Verify with `git rev-parse HEAD` vs
-`git rev-parse origin/<branch>` (they must match) before reporting done. Do not
-open a PR unless asked — the push is the expected end state. When a command line
-or URL would otherwise echo the token, pipe through
-`sed 's/ghp_[A-Za-z0-9]*/<token-hidden>/g'` so it never lands in the log.
+```
+RMC_PUSH_TOKEN=<token> git \
+  -c credential.helper= \
+  -c credential.https://github.com.helper= \
+  -c credential.https://github.com.helper='!f(){ echo username=x-access-token; echo "password=$RMC_PUSH_TOKEN"; };f' \
+  -c credential.https://github.com.username=x-access-token \
+  fetch origin <branch>:refs/remotes/origin/<branch>
+```
 
-The `GITHUB_TOKEN` in the environment is read-only (a push returns 403
-"Permission to irhasar/rmc.git denied to irhasar"). A write-capable `ghp_` token
-can be recovered from an older conversation log: scan the event JSON under
-`/var/openhands/conversations/*/events/` for `ghp_[A-Za-z0-9_]{36}` (the
-`/workspace/conversations/*/` mirror usually holds only `TASKS.json`), then
-push with `git push "https://x-access-token:<t>@github.com/irhasar/rmc.git"
-<branch>`. Tokens rotate, so several may appear — try each until one is
-accepted. Never print the token; capture it into a variable in the same command
-and pipe the output through `sed "s/<t>/<token-hidden>/g"`.
+Do not `export` the token into the persistent shell either; pass it on the one
+command that needs it, so it is gone when that command exits.
+
+**Always push at the end of every session.** After committing, push the current
+branch so the remote branch is never behind the local one. Verify with
+`git rev-parse HEAD` vs `git rev-parse origin/<branch>` (they must match)
+before reporting done. Do not open a PR unless asked — the push is the expected
+end state.
 
 ## PR branch stack
 

@@ -23,16 +23,42 @@ struct Sym {
     /// True for a `.set` constant, whose `off` is its value rather than an
     /// offset into `sec`.
     abs: bool,
+    /// Where the label appeared relative to an align directive at the same
+    /// offset. `parse` numbers definitions and align points off one counter;
+    /// a smaller `ord` means "defined before the padding". Without this the two
+    /// are indistinguishable, and a label sharing an offset with `.p2align`
+    /// could land on the far side of the pad.
+    ord: u64,
+}
+
+/// How a fixup's displacement field is written once every section has an
+/// address.
+#[derive(Clone, Copy, PartialEq)]
+enum FixKind {
+    /// A 32-bit displacement: a RIP-relative memory operand, or a `call`.
+    Rel32,
+    /// A `jmp rel32` (`E9`), which `relax_branches` may shrink to `EB rel8`.
+    Jmp,
+    /// A `jcc rel32` (`0F 8x`) with this condition code, which
+    /// `relax_branches` may shrink to `7x rel8`.
+    Jcc(u8),
 }
 
 /// A reference resolved once every section has an address.
+#[derive(Clone)]
 struct Fixup {
     sec: usize,
-    /// Offset of the 4-byte PC-relative field to patch.
+    /// Offset of the PC-relative field to patch.
     disp_off: usize,
     /// Offset of the end of the instruction the field belongs to.
     next_off: usize,
     sym: String,
+    kind: FixKind,
+    /// Field width in bytes: 4 normally, 1 once a branch is relaxed.
+    width: u8,
+    /// Which branch this is, in emission order, for `assemble`'s relaxation
+    /// fixpoint; `usize::MAX` for a non-branch fixup.
+    branch: usize,
 }
 
 struct Section {
@@ -57,6 +83,17 @@ pub struct Elf {
     /// 4-byte absolute symbol immediates (`mov $sym, %reg`).
     abs_imm: Vec<(usize, usize, String)>,
     text_idx: usize,
+    /// Branches seen so far, used to number them for `relax_branches`.
+    nbranches: usize,
+    /// Every `.p2align`/`.balign` the parser honoured, as `(section, offset,
+    /// alignment)`. Relaxing a branch removes bytes, which would pull a later
+    /// `.p2align` out of alignment, so `realign` re-establishes these once the
+    /// branch lengths are settled. The last field is the definition order, so a
+    /// label at the same offset can be placed on the correct side of the pad.
+    align_pts: Vec<(usize, u64, u64, u64)>,
+    /// Definition counter: labels and align directives share it so their
+    /// relative order at the same offset is preserved.
+    defs: u64,
 }
 
 /// Assemble `asm` (the text `compile_to_asm` returns) into a static executable.
@@ -65,7 +102,13 @@ pub fn assemble(asm: &str) -> Result<Vec<u8>, String> {
         sections: vec![Section {
             name: ".text",
             flags: 0x5,
-            align: 16,
+            // A cache-line base for `.text`. The generator emits `.p2align 4`
+            // at every function entry, which is relative to the section, so a
+            // 16-aligned section base would still let a function start 16 mod 64
+            // -- mid-cache-line for every 64-byte fetch. A 64-byte base makes
+            // the directive mean what it says and keeps the first function's
+            // entry in the same line as its prologue.
+            align: 64,
             data: Vec::new(),
             vaddr: 0,
             file_off: 0,
@@ -76,8 +119,12 @@ pub fn assemble(asm: &str) -> Result<Vec<u8>, String> {
         abs64: Vec::new(),
         abs_imm: Vec::new(),
         text_idx: 0,
+        nbranches: 0,
+        align_pts: Vec::new(),
+        defs: 0,
     };
     e.parse(asm)?;
+    e.relax_branches()?;
     e.layout()?;
     Ok(e.emit())
 }
@@ -104,10 +151,6 @@ impl Elf {
 
     fn parse(&mut self, asm: &str) -> Result<(), String> {
         let mut cur = self.text_idx;
-        // Each `.set` records the section current when it appeared, plus the
-        // section's length at that point, so a `.` (the current location) in the
-        // expression resolves to the position of the `.set` itself rather than
-        // the end of the section once the whole file has been parsed.
         let mut sets: Vec<(String, String, String, usize, u64)> = Vec::new();
 
         for (lineno, raw) in asm.lines().enumerate() {
@@ -122,7 +165,9 @@ impl Elf {
                 let name = name.trim();
                 if !name.is_empty() && !name.contains(char::is_whitespace) {
                     let off = self.sections[cur].data.len() as u64;
-                    self.syms.insert(name.to_string(), Sym { sec: cur, off, abs: false });
+                    let ord = self.defs;
+                    self.defs += 1;
+                    self.syms.insert(name.to_string(), Sym { sec: cur, off, abs: false, ord });
                     line = rest[1..].trim();
                     if line.is_empty() {
                         continue;
@@ -143,7 +188,7 @@ impl Elf {
             // the end of whatever section the file finished in.
             let (va, sa) = self.sym_value_at(&a, sec, dot)?;
             let (vb, _) = self.sym_value_at(&b, sec, dot)?;
-            self.syms.insert(name, Sym { sec: sa, off: (va - vb) as u64, abs: true });
+            self.syms.insert(name, Sym { sec: sa, off: (va - vb) as u64, abs: true, ord: 0 });
         }
         Ok(())
     }
@@ -181,19 +226,27 @@ impl Elf {
             "align" | "balign" => {
                 let n: u64 = arg.parse().map_err(|_| format!("elf: bad .align `{arg}`"))?;
                 if n > 1 {
-                    self.pad_to_align(*cur, n);
+                    let ord = self.defs;
+                    self.defs += 1;
+                    self.align_pts.push((*cur, self.sections[*cur].data.len() as u64, n, ord));
                 }
             }
             "p2align" => {
                 let n: u32 = arg.parse().map_err(|_| format!("elf: bad .p2align `{arg}`"))?;
                 if n > 0 {
-                    self.pad_to_align(*cur, 1u64 << n);
+                    let ord = self.defs;
+                    self.defs += 1;
+                    self.align_pts.push((*cur, self.sections[*cur].data.len() as u64, 1u64 << n, ord));
                 }
             }
             "globl" | "type" | "size" => {}
             "quad" => {
+                // A bare number (signed or unsigned, e.g. `u64::MAX` printed as
+                // 18446744073709551615) is data; anything else is a symbol.
                 if let Ok(v) = arg.parse::<i64>() {
                     self.sections[*cur].data.extend_from_slice(&(v as u64).to_le_bytes());
+                } else if let Ok(v) = arg.parse::<u64>() {
+                    self.sections[*cur].data.extend_from_slice(&v.to_le_bytes());
                 } else {
                     let off = self.sections[*cur].data.len();
                     self.abs64.push((*cur, off, arg.to_string()));
@@ -214,6 +267,8 @@ impl Elf {
             "set" => {
                 let (n, expr) = arg.split_once(',').ok_or("elf: bad .set")?;
                 let (a, b) = expr.split_once('-').ok_or("elf: bad .set expression")?;
+                // Capture `.` here: it is the position of the `.set` itself, not
+                // the end of whichever section the file finishes in.
                 let dot = self.sections[*cur].data.len() as u64;
                 sets.push((
                     n.trim().to_string(),
@@ -228,14 +283,27 @@ impl Elf {
         Ok(())
     }
 
+    #[cfg(test)]
     fn pad_to_align(&mut self, sec: usize, n: u64) {
         let len = self.sections[sec].data.len() as u64;
         let pad = (n - (len % n)) % n;
-        // A zero byte is `add %al,(%rax)` in an executable section, which would
-        // fault if control ever reached it; pad with `nop` there. Other sections
-        // (`.rodata`, `.data`) want real zeros.
-        let fill = if self.sections[sec].flags & 0x1 != 0 { 0x90 } else { 0 };
-        self.sections[sec].data.resize(len as usize + pad as usize, fill);
+        if pad == 0 {
+            return;
+        }
+        if self.sections[sec].flags & 0x1 != 0 {
+            // Executable: pad the way GAS does. A run of one-byte `nop`s is
+            // legal but decodes as many instructions, and on some cores the
+            // long run of 1-byte nops -- plus the branch that jumps over it --
+            // costs real run-time in a hot loop. Multi-byte `nop`s keep the
+            // padding to one or two instructions, which is what `as` emits.
+            let nops = nop_fill(pad as usize);
+            self.sections[sec].data.extend_from_slice(&nops);
+        } else {
+            // A zero byte is `add %al,(%rax)` in an executable section, which
+            // would fault if control ever reached it; other sections want real
+            // zeros.
+            self.sections[sec].data.resize(len as usize + pad as usize, 0);
+        }
     }
 
     fn sym_value(&self, name: &str, cur: usize) -> Result<(i64, usize), String> {
@@ -246,9 +314,9 @@ impl Elf {
         Ok((s.off as i64, s.sec))
     }
 
-    /// `sym_value`, but `.` means the fixed position `dot` in section `sec`
-    /// rather than the section's current end. Used to resolve a `.set` after the
-    /// whole file is parsed, when the section lengths have moved on.
+    /// Like `sym_value`, but `.` resolves to `dot` rather than the section's
+    /// current end. `.set` uses this so a length is measured at the position of
+    /// the `.set`, not wherever the section ends up.
     fn sym_value_at(&self, name: &str, sec: usize, dot: u64) -> Result<(i64, usize), String> {
         if name == "." {
             return Ok((dot as i64, sec));
@@ -259,6 +327,262 @@ impl Elf {
     /// Assign every section a file offset and a virtual address, then resolve
     /// fixups. `vaddr = BASE + file_off`, so the kernel's `p_vaddr % p_align ==
     /// p_offset % p_align` requirement holds automatically.
+    /// Shrink every branch whose target is close enough to reach with an 8-bit
+    /// displacement, the way GNU `as` relaxes branches: `jmp` becomes `EB rel8`
+    /// (5 bytes to 2) and `jcc` becomes `7x rel8` (6 bytes to 2). Also insert
+    /// the padding for every `.p2align`/`.balign`.
+    ///
+    /// The two run together because they interact. Shortening a branch removes
+    /// bytes from before every later label, which moves the `.p2align` points
+    /// that follow it; re-establishing the alignment inserts bytes back, which
+    /// moves the labels again. A branch is relaxed only when its displacement
+    /// fits *with the padding that the relaxed layout itself creates*, so the
+    /// two are solved as one fixed point rather than one after the other.
+    ///
+    /// Each round recomputes every branch's displacement from the same layout
+    /// and decides all of them at once. Deciding one at a time from a layout
+    /// that is stale by one branch is how an earlier version produced a `jcc`
+    /// whose displacement did not fit in the 8 bits it was written into.
+    ///
+    /// Branch length is not cosmetic. `stats`'s inner loop came out 22% slower
+    /// than LLVM with its three branches left as rel32 and 15% faster once they
+    /// were relaxed: the extra bytes are extra work on every iteration.
+    fn relax_branches(&mut self) -> Result<(), String> {
+        let n = self.nbranches;
+        let mut order: Vec<usize> = self
+            .fixups
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.branch != usize::MAX)
+            .map(|(i, _)| i)
+            .collect();
+        order.sort_by_key(|&i| self.fixups[i].next_off);
+        let len_of = |k: FixKind| match k {
+            FixKind::Jcc(_) => 6,
+            FixKind::Jmp => 5,
+            FixKind::Rel32 => 0,
+        };
+        let orig_len: Vec<i64> = order.iter().map(|&i| len_of(self.fixups[i].kind)).collect();
+        let orig_start: Vec<i64> = order
+            .iter()
+            .map(|&i| self.fixups[i].next_off as i64 - len_of(self.fixups[i].kind))
+            .collect();
+        let orig_end: Vec<i64> = order.iter().map(|&i| self.fixups[i].next_off as i64).collect();
+        let sec_of: Vec<usize> = order.iter().map(|&i| self.fixups[i].sec).collect();
+        let target: Vec<Option<i64>> = order
+            .iter()
+            .map(|&i| {
+                let f = &self.fixups[i];
+                match self.syms.get(&f.sym) {
+                    // Only a branch to a label in the same section can be near;
+                    // anything else keeps its rel32 encoding.
+                    Some(s) if s.sec == f.sec && !s.abs => Some(s.off as i64),
+                    _ => None,
+                }
+            })
+            .collect();
+        // A branch's target is an instruction position: any padding at the same
+        // offset comes *after* it, so it is not moved by that padding.
+        let target_ord: Vec<u64> = order
+            .iter()
+            .map(|&i| {
+                let f = &self.fixups[i];
+                self.syms
+                    .get(&f.sym)
+                    .filter(|s| s.sec == f.sec && !s.abs)
+                    .map(|s| s.ord)
+                    .unwrap_or(u64::MAX)
+            })
+            .collect();
+        // A pad at an instruction's *start* offset comes from a `.p2align`
+        // before it, so it precedes the instruction; a pad at an instruction's
+        // *end* offset comes from a `.p2align` after it, so it follows. The two
+        // sentinels let `net` place a pad on the correct side of each end.
+        const PAD_BEFORE: u64 = u64::MAX;
+        const PAD_AFTER: u64 = 0;
+        let nsec = self.sections.len();
+        // Align points in layout order. Two at the same offset keep their
+        // definition order, so the pad they describe lands where the source put
+        // it.
+        let mut al: Vec<(usize, i64, i64, u64)> = self
+            .align_pts
+            .iter()
+            .map(|(s, o, a, ord)| (*s, *o as i64, *a as i64, *ord))
+            .collect();
+        al.sort_by_key(|(s, o, _, ord)| (*s, *o, *ord));
+
+        // Padding inserted at `o` moves a definition at the same offset only
+        // when the padding comes first in the source (`pad_ord < ord`).
+        // `PAD_BEFORE`/`PAD_AFTER` place a pad at an instruction's start/end on
+        // the correct side of it.
+        let inserted_before = |pts: &[(i64, i64, u64)], o: i64, ord: u64| -> i64 {
+            pts.iter()
+                .filter(|(e, _, pord)| *e < o || (*e == o && *pord < ord))
+                .map(|(_, a, _)| *a)
+                .sum()
+        };
+        // The layout implied by `short`: the bytes each shortened branch
+        // removes, and the padding each align point then needs.
+        let compute = |short: &[bool]| -> (Vec<Vec<(i64, i64)>>, Vec<Vec<(i64, i64, u64)>>) {
+            let mut rem = vec![Vec::new(); nsec];
+            for b in 0..n {
+                if short[b] {
+                    rem[sec_of[b]].push((orig_end[b], orig_len[b] - 2));
+                }
+            }
+            // A removal at `e` takes bytes that lie before `e`, so it shifts
+            // `e` itself and counts with `<=`. Padding lands after whatever is
+            // already at its offset; whether it moves a given definition at the
+            // same offset is decided by `ord` in `net`.
+            let removed_before = |pts: &[(i64, i64)], o: i64| -> i64 {
+                pts.iter().filter(|(e, _)| *e <= o).map(|(_, a)| *a).sum()
+            };
+            let mut pads: Vec<Vec<(i64, i64, u64)>> = vec![Vec::new(); nsec];
+            for &(sec, o, a, ord) in &al {
+                let pos = o - removed_before(&rem[sec], o) + inserted_before(&pads[sec], o, ord);
+                let pad = (a - pos.rem_euclid(a)) % a;
+                if pad > 0 {
+                    pads[sec].push((o, pad, ord));
+                }
+            }
+            (rem, pads)
+        };
+        // How far an original offset moves: down by the removals before it, up
+        // by the padding inserted before it.
+        let net = |rem: &[Vec<(i64, i64)>],
+                   pads: &[Vec<(i64, i64, u64)>],
+                   sec: usize,
+                   o: i64,
+                   ord: u64|
+         -> i64 {
+            let rm: i64 = rem[sec].iter().filter(|(e, _)| *e <= o).map(|(_, a)| *a).sum();
+            let ins: i64 = inserted_before(&pads[sec], o, ord);
+            rm - ins
+        };
+        let disp = |rem: &[Vec<(i64, i64)>],
+                    pads: &[Vec<(i64, i64, u64)>],
+                    short: &[bool],
+                    b: usize|
+         -> Option<i64> {
+            let t0 = target[b]?;
+            let sec = sec_of[b];
+            let start = orig_start[b] - net(rem, pads, sec, orig_start[b], PAD_BEFORE);
+            let len = if short[b] { 2 } else { orig_len[b] };
+            let t = t0 - net(rem, pads, sec, t0, target_ord[b]);
+            Some(t - (start + len))
+        };
+
+        let mut short = vec![false; n];
+        for _ in 0..64 {
+            let (rem, pads) = compute(&short);
+            let next: Vec<bool> = (0..n)
+                .map(|b| matches!(disp(&rem, &pads, &short, b), Some(d) if (-128..=127).contains(&d)))
+                .collect();
+            if next == short {
+                break;
+            }
+            short = next;
+        }
+        // A branch that ends up out of range keeps its rel32 form; the rel32
+        // encoding reaches anywhere this compiler emits.
+        for _ in 0..64 {
+            let (rem, pads) = compute(&short);
+            let mut changed = false;
+            for b in 0..n {
+                if short[b] {
+                    let fits = matches!(disp(&rem, &pads, &short, b), Some(d) if (-128..=127).contains(&d));
+                    if !fits {
+                        short[b] = false;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let (rem, pads) = compute(&short);
+
+        // Splice the shortened branches, furthest along first, so each branch's
+        // start is still at its original offset when it is reached.
+        for b in (0..n).rev() {
+            if !short[b] {
+                continue;
+            }
+            let f = self.fixups[order[b]].clone();
+            let short_op = match f.kind {
+                FixKind::Jmp => 0xEBu8,
+                FixKind::Jcc(cc) => cc - 0x10,
+                FixKind::Rel32 => unreachable!("only branches carry a branch id"),
+            };
+            let start = orig_start[b] as usize;
+            let d = &mut self.sections[f.sec].data;
+            d[start] = short_op;
+            d.drain(start + 1..start + 1 + (orig_len[b] - 2) as usize);
+        }
+        // Insert the padding, in address order, tracking what is already in.
+        for sec in 0..nsec {
+            for &(o, pad, ord) in &pads[sec].clone() {
+                let removed: i64 = rem[sec].iter().filter(|(e, _)| *e <= o).map(|(_, a)| *a).sum();
+                let inserted: i64 = pads[sec]
+                    .iter()
+                    .filter(|(e, _, pord)| *e < o || (*e == o && *pord < ord))
+                    .map(|(_, a, _)| *a)
+                    .sum();
+                let at = (o - removed + inserted) as usize;
+                let fill = if self.sections[sec].flags & 0x1 != 0 {
+                    nop_fill(pad as usize)
+                } else {
+                    vec![0u8; pad as usize]
+                };
+                self.sections[sec].data.splice(at..at, fill);
+            }
+        }
+        // Move every offset to its final place.
+        let sections = self.sections.len();
+        for sec in 0..sections {
+            for sym in self.syms.values_mut() {
+                if sym.sec == sec && !sym.abs {
+                    sym.off =
+                        (sym.off as i64 - net(&rem, &pads, sec, sym.off as i64, sym.ord)) as u64;
+                }
+            }
+            for (s, o, _) in self.abs64.iter_mut() {
+                if *s == sec {
+                    *o = (*o as i64 - net(&rem, &pads, sec, *o as i64, PAD_BEFORE)) as usize;
+                }
+            }
+            for (s, o, _) in self.abs_imm.iter_mut() {
+                if *s == sec {
+                    *o = (*o as i64 - net(&rem, &pads, sec, *o as i64, PAD_BEFORE)) as usize;
+                }
+            }
+            for fx in self.fixups.iter_mut() {
+                if fx.sec == sec {
+                    fx.disp_off = (fx.disp_off as i64
+                        - net(&rem, &pads, sec, fx.disp_off as i64, PAD_BEFORE))
+                        as usize;
+                    fx.next_off = (fx.next_off as i64
+                        - net(&rem, &pads, sec, fx.next_off as i64, PAD_AFTER))
+                        as usize;
+                }
+            }
+        }
+        // Point each shortened branch at its new 1-byte field.
+        for b in 0..n {
+            if !short[b] {
+                continue;
+            }
+            let sec = sec_of[b];
+            let start = orig_start[b] - net(&rem, &pads, sec, orig_start[b], PAD_BEFORE);
+            let fx = &mut self.fixups[order[b]];
+            fx.disp_off = start as usize + 1;
+            fx.next_off = start as usize + 2;
+            fx.width = 1;
+        }
+        Ok(())
+    }
+
     fn layout(&mut self) -> Result<(), String> {
         let nphdr = 2usize; // RX and RW
         let mut off = (64 + nphdr * 56) as u64;
@@ -304,9 +628,13 @@ impl Elf {
             let tva = self.sections[target.sec].vaddr + target.off;
             let next = self.sections[f.sec].vaddr + f.next_off as u64;
             let disp = (tva as i64) - (next as i64);
-            let b = (disp as i32).to_le_bytes();
             let d = &mut self.sections[f.sec].data;
-            d[f.disp_off..f.disp_off + 4].copy_from_slice(&b);
+            if f.width == 1 {
+                d[f.disp_off] = disp as i8 as u8;
+            } else {
+                let b = (disp as i32).to_le_bytes();
+                d[f.disp_off..f.disp_off + 4].copy_from_slice(&b);
+            }
         }
 
         for (sec, o, sym) in self.abs64.clone() {
@@ -413,6 +741,43 @@ impl Elf {
     }
 }
 
+/// The longest single-instruction `nop` encodings, indexed by length 1..=11.
+/// 11 bytes is the longest a single x86-64 `nop` can be.
+fn long_nop(n: usize) -> &'static [u8] {
+    match n {
+        1 => &[0x90],
+        2 => &[0x66, 0x90],
+        3 => &[0x0F, 0x1F, 0x00],
+        4 => &[0x0F, 0x1F, 0x40, 0x00],
+        5 => &[0x0F, 0x1F, 0x44, 0x00, 0x00],
+        6 => &[0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00],
+        7 => &[0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00],
+        8 => &[0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        9 => &[0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        10 => &[0x66, 0x2E, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        _ => &[0x66, 0x66, 0x2E, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+    }
+}
+
+/// The `nop` sequence to pad `n` bytes of code with, using as few instructions
+/// as possible: the longest `nop` that fits, then the longest that fits in what
+/// is left.
+///
+/// This is not cosmetic. A loop's `.p2align` padding sits on the fall-through
+/// path, so it runs on every iteration that does not take the loop's exit
+/// branch. Filling a 15-byte gap with a 9-byte `nop` plus a `66 90` plus a
+/// 4-byte one added an instruction per iteration and cost 18% on `stats`'s
+/// inner loop -- 3.08 ms against 2.53 ms for the two-`nop` fill.
+fn nop_fill(n: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(n);
+    let mut left = n;
+    while left > 0 {
+        let k = left.min(11);
+        out.extend_from_slice(long_nop(k));
+        left -= k;
+    }
+    out
+}
 fn align_up(v: u64, a: u64) -> u64 {
     if a <= 1 {
         v
@@ -469,6 +834,17 @@ impl Elf {
         };
         let ops = split_ops(rest);
         match mnem {
+            "movq" | "movd" if ops.get(0).map_or(false, |o| parse_xmm(o).is_some()) => {
+                self.enc_mov_xmm_gpr(mnem, &ops, sec)
+            }
+            "movq" | "movd" if ops.get(1).map_or(false, |o| parse_xmm(o).is_some()) => {
+                self.enc_mov_gpr_xmm(mnem, &ops, sec)
+            }
+            "movsd" | "movss" => self.enc_mov_sse(mnem, &ops, sec),
+            "addss" | "addsd" | "subss" | "subsd" | "mulss" | "mulsd" | "divss" | "divsd"
+            | "ucomiss" | "ucomisd" | "cvtss2sd" | "cvtsd2ss" => self.enc_sse_arith(mnem, &ops, sec),
+            "cvtsi2ss" | "cvtsi2sd" | "cvttss2si" | "cvttsd2si" => self.enc_sse_cvt(mnem, &ops, sec),
+            "setp" | "setnp" => self.enc_setcc(mnem, &ops, sec),
             "mov" | "movq" | "movb" | "movabs" | "movzbq" | "movzbl" | "movzbw"
             | "movzwl" | "movzwq" | "movsbq" | "movsbl" | "movsbw" | "movswl"
             | "movswq" | "movslq" => {
@@ -492,12 +868,29 @@ impl Elf {
             }
             "jmp" => {
                 self.sections[sec].data.push(0xE9);
-                self.pc_rel(sec, &ops[0]);
+                self.pc_rel(sec, &ops[0], FixKind::Jmp);
                 Ok(())
             }
             "call" => {
+                // `call *%reg` is the indirect register form (FF /2, mod=11),
+                // `call *mem` indirects through memory (FF /2 with an r/m
+                // operand), and the bare form is a PC-relative `E8 rel32`.
+                if let Some(reg) = ops[0].strip_prefix('*') {
+                    if let Ok((r, _)) = parse_reg(reg) {
+                        if r >= 8 {
+                            self.sections[sec].data.push(0x41);
+                        }
+                        self.sections[sec].data.push(0xFF);
+                        modrm_reg_reg(&mut self.sections[sec].data, 2, r);
+                        return Ok(());
+                    }
+                    let m = parse_mem(reg)
+                        .ok_or_else(|| format!("elf: bad indirect call operand `{}`", ops[0]))?;
+                    self.mem_op(sec, 0xFF, &m, 2, false, false);
+                    return Ok(());
+                }
                 self.sections[sec].data.push(0xE8);
-                self.pc_rel(sec, &ops[0]);
+                self.pc_rel(sec, &ops[0], FixKind::Rel32);
                 Ok(())
             }
             "ret" => {
@@ -517,7 +910,7 @@ impl Elf {
                 Ok(())
             }
             "sete" | "setne" | "setl" | "setle" | "setg" | "setge" | "setb" | "setbe" | "seta"
-            | "setae" => self.enc_setcc(mnem, &ops, sec),
+            | "setae" | "seto" | "setno" | "sets" | "setns" => self.enc_setcc(mnem, &ops, sec),
             "bswap" => self.enc_bswap(&ops, sec),
             // The `rep`-prefixed forms the runtime emits: the two `stos` fills
             // (`rep stosq` is `F3 48 AB`, `rep stosb` `F3 AA`) and the two
@@ -547,84 +940,291 @@ impl Elf {
     }
 
     /// Reserve a 4-byte PC-relative field and record the fixup.
-    fn pc_rel(&mut self, sec: usize, sym: &str) {
+    fn pc_rel(&mut self, sec: usize, sym: &str, kind: FixKind) {
         let disp_off = self.sections[sec].data.len();
-        self.fixups.push(Fixup { sec, disp_off, next_off: disp_off + 4, sym: sym.to_string() });
+        let branch = if kind == FixKind::Rel32 {
+            usize::MAX
+        } else {
+            let b = self.nbranches;
+            self.nbranches += 1;
+            b
+        };
+        self.fixups.push(Fixup {
+            sec,
+            disp_off,
+            next_off: disp_off + 4,
+            sym: sym.to_string(),
+            kind,
+            width: 4,
+            branch,
+        });
         self.sections[sec].data.extend_from_slice(&[0; 4]);
     }
 
     fn enc_mov(&mut self, mnem: &str, ops: &[String], sec: usize) -> Result<(), String> {
         let (src, dst) = (ops[0].clone(), ops[1].clone());
+        // `movz`/`movs` loads: a 2-byte opcode (`0F B6`/`0F B7`/`0F BE`/`0F BF`/
+        // `63`), an optional REX.W, and a byte-width source that forces a REX
+        // prefix for %sil/%dil. `movslq` is the sign-extending `63 /r`.
+        // (sign, source width, REX.W, 16-bit destination). A 16-bit destination
+        // takes the `66` prefix instead of REX.W.
+        let ext = match mnem {
+            "movzbq" => Some((false, 1u8, true, false)),
+            "movzbl" => Some((false, 1u8, false, false)),
+            "movzbw" => Some((false, 1u8, false, true)),
+            "movzwq" => Some((false, 2u8, true, false)),
+            "movzwl" => Some((false, 2u8, false, false)),
+            "movsbq" => Some((true, 1u8, true, false)),
+            "movsbl" => Some((true, 1u8, false, false)),
+            "movsbw" => Some((true, 1u8, false, true)),
+            "movswq" => Some((true, 2u8, true, false)),
+            "movswl" => Some((true, 2u8, false, false)),
+            "movslq" => Some((true, 4u8, true, false)),
+            _ => None,
+        };
+        if let Some((sign, srcw, w, dst16)) = ext {
+            return self.enc_movx(&src, &dst, sec, sign, srcw, w, dst16);
+        }
         match mnem {
-            "movzbq" | "movzbl" | "movzbw" | "movzwl" | "movzwq" | "movsbq"
-            | "movsbl" | "movsbw" | "movswl" | "movswq" | "movslq" => {
-                // (opcode, whether the opcode is 0F-prefixed). The source width
-                // is implied by the mnemonic's shape, which `as` checks; the
-                // destination width follows the trailing `q`/`l`/`w`.
-                let (opcode, two_byte) = match mnem {
-                    "movzbq" | "movzbl" | "movzbw" => (0xB6u8, true),
-                    "movsbq" | "movsbl" | "movsbw" => (0xBE, true),
-                    "movzwl" | "movzwq" => (0xB7, true),
-                    "movswl" | "movswq" => (0xBF, true),
-                    "movslq" => (0x63, false),
-                    _ => unreachable!(),
-                };
-                let dst64 = mnem.ends_with('q');
-                let dst16 = mnem.ends_with('w');
-                let (dreg, _) = parse_reg(&dst)?;
-                // A 16-bit destination takes the `66` prefix; a 64-bit one takes
-                // REX.W. The two never combine.
-                let mut rex = 0x40;
-                if dst64 {
-                    rex |= 0x08;
-                }
-                if dreg >= 8 {
-                    rex |= 0x04;
-                }
-                let emit_prefixes = |out: &mut Vec<u8>, rex: u8, force_rex: bool| {
-                    if dst16 {
-                        out.push(0x66);
-                    }
-                    if rex != 0x40 || force_rex {
-                        out.push(rex);
-                    }
-                };
-                if let Ok((sreg, s8)) = parse_reg(&src) {
-                    if sreg >= 8 {
-                        rex |= 0x01;
-                    }
-                    // A byte source of %sil/%dil needs the prefix even with no
-                    // extended register in play.
-                    emit_prefixes(&mut self.sections[sec].data, rex, s8 && sreg >= 4);
-                    if two_byte {
-                        self.sections[sec].data.push(0x0F);
-                    }
-                    self.sections[sec].data.push(opcode);
-                    modrm_reg_reg(&mut self.sections[sec].data, dreg, sreg);
-                    return Ok(());
-                }
-                let m = parse_mem(&src).ok_or_else(|| format!("elf: bad movz src `{src}`"))?;
-                if m.base.map_or(false, |b| b >= 8) {
-                    rex |= 0x01;
-                }
-                if m.index.map_or(false, |i| i >= 8) {
-                    rex |= 0x02;
-                }
-                emit_prefixes(&mut self.sections[sec].data, rex, false);
-                if two_byte {
-                    self.sections[sec].data.push(0x0F);
-                }
-                self.sections[sec].data.push(opcode);
-                emit_mem_modrm(&mut self.sections[sec].data, &m, dreg);
-                if let Some(sym) = m.rip_label.clone() {
-                    let len = self.sections[sec].data.len();
-                    self.fixups.push(Fixup { sec, disp_off: len - 4, next_off: len, sym });
-                }
-                Ok(())
-            }
             "movb" => self.enc_mov_bytes(&src, &dst, sec),
             _ => self.enc_mov_generic(mnem, &src, &dst, sec),
         }
+    }
+
+    /// `movq %xmmN, %r64` (opcode `66 0F 7E`, REX.W) and `movd %xmmN, %r32`
+    /// (`66 0F 7E`, no REX.W) — the `%xmm` register is the source.
+    fn enc_mov_xmm_gpr(&mut self, mnem: &str, ops: &[String], sec: usize) -> Result<(), String> {
+        let (src, dst) = (ops[0].clone(), ops[1].clone());
+        let xmm = parse_xmm(&src).ok_or_else(|| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+        let (gpr, _) = parse_reg(&dst).map_err(|_| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+        let w = mnem == "movq";
+        let mut out = Vec::new();
+        out.push(0x66);
+        let r = rex(w, xmm, gpr);
+        if r != 0x40 {
+            out.push(r);
+        }
+        out.extend_from_slice(&[0x0F, 0x7E]);
+        modrm_reg_reg(&mut out, xmm, gpr);
+        self.sections[sec].data.extend_from_slice(&out);
+        Ok(())
+    }
+
+    /// `movq %r64, %xmmN` (opcode `66 0F 6E`, REX.W) and `movd %r32, %xmmN`
+    /// (`66 0F 6E`, no REX.W) — the general-purpose register is the source.
+    fn enc_mov_gpr_xmm(&mut self, mnem: &str, ops: &[String], sec: usize) -> Result<(), String> {
+        let (src, dst) = (ops[0].clone(), ops[1].clone());
+        let (gpr, _) = parse_reg(&src).map_err(|_| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+        let xmm = parse_xmm(&dst).ok_or_else(|| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+        let w = mnem == "movq";
+        let mut out = Vec::new();
+        out.push(0x66);
+        let r = rex(w, xmm, gpr);
+        if r != 0x40 {
+            out.push(r);
+        }
+        out.extend_from_slice(&[0x0F, 0x6E]);
+        modrm_reg_reg(&mut out, xmm, gpr);
+        self.sections[sec].data.extend_from_slice(&out);
+        Ok(())
+    }
+
+    /// `movsd`/`movss` between two `%xmm` registers or from memory to an
+    /// `%xmm` register. The load is `F2/F3 0F 10 /r`; the store form
+    /// (`... 11 /r`) is not emitted by the back end.
+    fn enc_mov_sse(&mut self, mnem: &str, ops: &[String], sec: usize) -> Result<(), String> {
+        let (src, dst) = (ops[0].clone(), ops[1].clone());
+        let prefix: &[u8] = if mnem == "movsd" { &[0xF2] } else { &[0xF3] };
+        let reg = parse_xmm(&dst).ok_or_else(|| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+        let mut out = Vec::new();
+        if let Some(rm) = parse_xmm(&src) {
+            emit_sse_rr(&mut out, prefix, false, 0x10, reg, rm);
+        } else {
+            let m = parse_mem(&src).ok_or_else(|| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+            emit_sse_mem(&mut out, prefix, false, 0x10, reg, &m);
+            if let Some(sym) = m.rip_label.clone() {
+                self.sections[sec].data.extend_from_slice(&out);
+                let len = self.sections[sec].data.len();
+                self.fixups.push(Fixup {
+                    sec,
+                    disp_off: len - 4,
+                    next_off: len,
+                    sym,
+                    kind: FixKind::Rel32,
+                    width: 4,
+                    branch: usize::MAX,
+                });
+                return Ok(());
+            }
+        }
+        self.sections[sec].data.extend_from_slice(&out);
+        Ok(())
+    }
+
+    /// An SSE arithmetic or compare op with the destination in the `%xmm` reg
+    /// field and the source either an `%xmm` register or memory.
+    fn enc_sse_arith(&mut self, mnem: &str, ops: &[String], sec: usize) -> Result<(), String> {
+        let (src, dst) = (ops[0].clone(), ops[1].clone());
+        let (prefix, opcode) =
+            sse_reg_rm(mnem).ok_or_else(|| format!("elf: unsupported sse op `{mnem}`"))?;
+        let reg = parse_xmm(&dst).ok_or_else(|| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+        let mut out = Vec::new();
+        if let Some(rm) = parse_xmm(&src) {
+            emit_sse_rr(&mut out, prefix, false, opcode, reg, rm);
+        } else {
+            let m = parse_mem(&src).ok_or_else(|| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+            emit_sse_mem(&mut out, prefix, false, opcode, reg, &m);
+            if let Some(sym) = m.rip_label.clone() {
+                self.sections[sec].data.extend_from_slice(&out);
+                let len = self.sections[sec].data.len();
+                self.fixups.push(Fixup {
+                    sec,
+                    disp_off: len - 4,
+                    next_off: len,
+                    sym,
+                    kind: FixKind::Rel32,
+                    width: 4,
+                    branch: usize::MAX,
+                });
+                return Ok(());
+            }
+        }
+        self.sections[sec].data.extend_from_slice(&out);
+        Ok(())
+    }
+
+    /// The `%xmm`/general-purpose conversions: `cvtsi2ss`/`cvtsi2sd` (`F3/F2 0F
+    /// 2A /r`) read a general-purpose register and write an `%xmm`; `cvttss2si`/
+    /// `cvttsd2si` (`F3/F2 0F 2C /r`) read an `%xmm` (or memory) and write a
+    /// general-purpose register, with REX.W for the 64-bit destination.
+    fn enc_sse_cvt(&mut self, mnem: &str, ops: &[String], sec: usize) -> Result<(), String> {
+        let (src, dst) = (ops[0].clone(), ops[1].clone());
+        let mut out = Vec::new();
+        match mnem {
+            "cvtsi2ss" | "cvtsi2sd" => {
+                let prefix: &[u8] = if mnem == "cvtsi2ss" { &[0xF3] } else { &[0xF2] };
+                let (gpr, _) =
+                    parse_reg(&src).map_err(|_| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+                let xmm = parse_xmm(&dst).ok_or_else(|| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+                // The source is a 64-bit register (`%rax`); REX.W selects the
+                // 64-bit form of the conversion.
+                let w = reg_is_64(&src);
+                emit_sse_rr(&mut out, prefix, w, 0x2A, xmm, gpr);
+            }
+            "cvttss2si" | "cvttsd2si" => {
+                let prefix: &[u8] = if mnem == "cvttss2si" { &[0xF3] } else { &[0xF2] };
+                let (gpr, _) =
+                    parse_reg(&dst).map_err(|_| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+                let w = reg_is_64(&dst);
+                if let Some(xmm) = parse_xmm(&src) {
+                    emit_sse_rr(&mut out, prefix, w, 0x2C, gpr, xmm);
+                } else {
+                    let m =
+                        parse_mem(&src).ok_or_else(|| format!("elf: bad `{mnem} {src}, {dst}`"))?;
+                    emit_sse_mem(&mut out, prefix, w, 0x2C, gpr, &m);
+                    if let Some(sym) = m.rip_label.clone() {
+                        self.sections[sec].data.extend_from_slice(&out);
+                        let len = self.sections[sec].data.len();
+                        self.fixups.push(Fixup {
+                    sec,
+                    disp_off: len - 4,
+                    next_off: len,
+                    sym,
+                    kind: FixKind::Rel32,
+                    width: 4,
+                    branch: usize::MAX,
+                });
+                        return Ok(());
+                    }
+                }
+            }
+            _ => return Err(format!("elf: unsupported sse cvt `{mnem}`")),
+        }
+        self.sections[sec].data.extend_from_slice(&out);
+        Ok(())
+    }
+
+    /// A sign/zero-extending move: `movz{b,w}`/`movs{b,w,l}` into a 64-bit (or
+    /// 32-bit) destination register. `sign` selects movs over movz, `srcw` is
+    /// the source width in bytes, and `w` sets REX.W for a 64-bit destination.
+    fn enc_movx(
+        &mut self,
+        src: &str,
+        dst: &str,
+        sec: usize,
+        sign: bool,
+        srcw: u8,
+        w: bool,
+        dst16: bool,
+    ) -> Result<(), String> {
+        let (dreg, _) = parse_reg(dst)?;
+        let opcode = if sign {
+            if srcw == 4 {
+                vec![0x63]
+            } else {
+                vec![0x0F, if srcw == 1 { 0xBE } else { 0xBF }]
+            }
+        } else {
+            vec![0x0F, if srcw == 1 { 0xB6 } else { 0xB7 }]
+        };
+        if let Ok((sreg, s8)) = parse_reg(src) {
+            let mut rex = 0x40;
+            if w {
+                rex |= 0x08;
+            }
+            if dreg >= 8 {
+                rex |= 0x04;
+            }
+            if sreg >= 8 {
+                rex |= 0x01;
+            }
+            if dst16 {
+                self.sections[sec].data.push(0x66);
+            }
+            // A byte source of %sil/%dil needs the prefix even with no extended
+            // register in play.
+            if rex != 0x40 || (srcw == 1 && s8 && sreg >= 4) {
+                self.sections[sec].data.push(rex);
+            }
+            self.sections[sec].data.extend_from_slice(&opcode);
+            modrm_reg_reg(&mut self.sections[sec].data, dreg, sreg);
+            return Ok(());
+        }
+        let m = parse_mem(src).ok_or_else(|| format!("elf: bad movx src `{src}`"))?;
+        let mut rex = 0x40;
+        if w {
+            rex |= 0x08;
+        }
+        if dreg >= 8 {
+            rex |= 0x04;
+        }
+        if m.base.map_or(false, |b| b >= 8) {
+            rex |= 0x01;
+        }
+        if m.index.map_or(false, |i| i >= 8) {
+            rex |= 0x02;
+        }
+        if dst16 {
+            self.sections[sec].data.push(0x66);
+        }
+        if rex != 0x40 {
+            self.sections[sec].data.push(rex);
+        }
+        self.sections[sec].data.extend_from_slice(&opcode);
+        emit_mem_modrm(&mut self.sections[sec].data, &m, dreg);
+        if let Some(sym) = m.rip_label.clone() {
+            let len = self.sections[sec].data.len();
+            self.fixups.push(Fixup {
+                sec,
+                disp_off: len - 4,
+                next_off: len,
+                sym,
+                kind: FixKind::Rel32,
+                width: 4,
+                branch: usize::MAX,
+            });
+        }
+        Ok(())
     }
 
     fn enc_mov_bytes(&mut self, src: &str, dst: &str, sec: usize) -> Result<(), String> {
@@ -672,7 +1272,15 @@ impl Elf {
         emit_mem_op(&mut self.sections[sec].data, opcode, m, reg, rex_w, force_rex);
         if let Some(sym) = m.rip_label.clone() {
             let len = self.sections[sec].data.len();
-            self.fixups.push(Fixup { sec, disp_off: len - 4, next_off: len, sym });
+            self.fixups.push(Fixup {
+                sec,
+                disp_off: len - 4,
+                next_off: len,
+                sym,
+                kind: FixKind::Rel32,
+                width: 4,
+                branch: usize::MAX,
+            });
         }
     }
 
@@ -718,7 +1326,12 @@ impl Elf {
             // because there is no operand to infer a width from; only an explicit
             // `movq` stores 64 bits. Matching that keeps the encoder a faithful
             // stand-in and stops an unsuffixed store silently leaving the high
-            // half of the destination stale.
+            // half of the destination stale. Either form sign-extends a 32-bit
+            // immediate, so a wider one has no encoding at all and must be
+            // materialised in a register by the caller.
+            if !fits_i32(v) {
+                return Err(format!("elf: `{mnem}` immediate {v} does not fit i32; use a register"));
+            }
             self.mem_op(sec, 0xC7, &m, 0, mnem != "mov", false);
             self.sections[sec].data.extend_from_slice(&(v as i32).to_le_bytes());
             return Ok(());
@@ -744,15 +1357,34 @@ impl Elf {
             }
             if let Some(m) = parse_mem(dst) {
                 // `mov %dl, (%rsi)` is a one-byte store even though the
-                // mnemonic carries no `b` suffix.
-                self.mem_op(sec, if s8 { 0x88 } else { 0x89 }, &m, sreg, !s8, s8 && sreg >= 4);
+                // mnemonic carries no `b` suffix. A `movl`/`movq` suffix pins
+                // the width; otherwise the source register's name does, so
+                // `mov %eax, (%rdi)` is a 32-bit store, not a 64-bit one.
+                let wide = if mnem == "movl" {
+                    false
+                } else if mnem == "movq" || mnem == "movabs" {
+                    true
+                } else {
+                    reg_is_64(src)
+                };
+                self.mem_op(sec, if s8 { 0x88 } else { 0x89 }, &m, sreg, wide, s8 && sreg >= 4);
                 return Ok(());
             }
             return Err(format!("elf: bad mov dst `{dst}`"));
         }
         if let Some(m) = parse_mem(src) {
             let (dreg, d8) = parse_reg(dst)?;
-            self.mem_op(sec, if d8 { 0x8A } else { 0x8B }, &m, dreg, !d8, d8 && dreg >= 4);
+            // The destination register's width selects the load: `mov (%rdi),
+            // %eax` is a 32-bit load (`8B /r`), `mov (%rdi), %rax` a 64-bit one
+            // (`48 8B /r`). A `movl`/`movq` suffix pins it too.
+            let wide = if mnem == "movl" {
+                false
+            } else if mnem == "movq" || mnem == "movabs" {
+                true
+            } else {
+                reg_is_64(dst)
+            };
+            self.mem_op(sec, if d8 { 0x8A } else { 0x8B }, &m, dreg, wide, d8 && dreg >= 4);
             return Ok(());
         }
         Err(format!("elf: unsupported mov `{src}, {dst}`"))
@@ -807,10 +1439,45 @@ impl Elf {
         if let Some(rest) = src.strip_prefix('$') {
             let v = parse_imm(rest)?;
             if base == "test" {
-                return Err("elf: test with an immediate operand is not emitted".into());
+                // `test` has no sign-extended byte form: always `F7 /0 id`.
+                // The width follows the r/m operand, so only a 64-bit operand
+                // takes REX.W.
+                if !fits_i32(v) {
+                    return Err(format!("elf: `{mnem}` immediate {v} does not fit i32"));
+                }
+                if let Some(m) = parse_mem(&dst) {
+                    self.mem_op(sec, 0xF7, &m, 0, true, false);
+                    self.sections[sec].data.extend_from_slice(&(v as i32).to_le_bytes());
+                    return Ok(());
+                }
+                let (dreg, d8) = parse_reg(&dst)?;
+                if d8 {
+                    // `test $imm8, %r8b`: F6 /0 ib.
+                    let mut rex = 0x40;
+                    if dreg >= 8 {
+                        rex |= 0x01;
+                    }
+                    if rex != 0x40 || dreg >= 4 {
+                        self.sections[sec].data.push(rex);
+                    }
+                    self.sections[sec].data.push(0xF6);
+                    modrm_reg_reg(&mut self.sections[sec].data, 0, dreg);
+                    self.sections[sec].data.push(v as u8);
+                    return Ok(());
+                }
+                if let Some(r) = rex_if_needed(!reg_is_32(&dst), 0, dreg) {
+                    self.sections[sec].data.push(r);
+                }
+                self.sections[sec].data.push(0xF7);
+                modrm_reg_reg(&mut self.sections[sec].data, 0, dreg);
+                self.sections[sec].data.extend_from_slice(&(v as i32).to_le_bytes());
+                return Ok(());
             }
             if let Some(m) = parse_mem(&dst) {
                 // `cmp $imm, mem`: 81 /7 id, or the sign-extended 83 /7 ib.
+                if !fits_i32(v) {
+                    return Err(format!("elf: `{mnem}` immediate {v} does not fit i32"));
+                }
                 if fits_i8(v) {
                     self.mem_op(sec, 0x83, &m, ext, true, false);
                     self.sections[sec].data.push(v as u8);
@@ -838,6 +1505,9 @@ impl Elf {
             }
             // Width follows the destination: `add $1, %eax` must stay 32-bit
             // (`83 /0 ib`, no REX.W), like every other register form.
+            if !fits_i32(v) {
+                return Err(format!("elf: `{mnem}` immediate {v} does not fit i32"));
+            }
             if let Some(r) = rex_if_needed(!reg_is_32(&dst), ext, dreg) {
                 self.sections[sec].data.push(r);
             }
@@ -898,6 +1568,23 @@ impl Elf {
             self.sections[sec].data.extend_from_slice(&(v as i32).to_le_bytes());
             return Ok(());
         }
+        if ops.len() == 2 && ops[0].starts_with('$') {
+            // `imul $imm, %reg`: the two-operand immediate form, which is the
+            // three-operand form with source and destination the same register.
+            // The immediate is sign-extended from 32 bits, so a value that does
+            // not fit i32 would silently multiply by a different number; refuse
+            // it so the caller materialises the constant in a register instead.
+            let v = parse_imm(&ops[0][1..])?;
+            if !fits_i32(v) {
+                return Err(format!("elf: imul immediate {v} does not fit in 32 bits"));
+            }
+            let (reg, _) = parse_reg(&ops[1])?;
+            self.sections[sec].data.push(rex(true, reg, reg));
+            self.sections[sec].data.push(0x69);
+            modrm_reg_reg(&mut self.sections[sec].data, reg, reg);
+            self.sections[sec].data.extend_from_slice(&(v as i32).to_le_bytes());
+            return Ok(());
+        }
         if ops.len() == 1 {
             // One-operand `imul %reg`: signed multiply of %rax by the operand,
             // result in %rdx:%rax. Used by the division magic multiply.
@@ -905,6 +1592,25 @@ impl Elf {
             self.sections[sec].data.push(rex(true, 5, reg));
             self.sections[sec].data.push(0xF7);
             modrm_reg_reg(&mut self.sections[sec].data, 5, reg);
+            return Ok(());
+        }
+        if let Some(m) = parse_mem(&ops[0]) {
+            // `imul mem, %reg`: two-operand form with a memory source.
+            let (dreg, _) = parse_reg(&ops[1])?;
+            let before = self.sections[sec].data.len();
+            self.mem_op(sec, 0x0F, &m, dreg, true, false);
+            // `mem_op` writes the opcode byte, but `imul r/m64` is the two-byte
+            // `0F AF`; the second byte must follow the first, before the ModRM.
+            // REX.W is always set here, so the layout is `[REX] 0F <ModRM...>`
+            // and the splice point is right after the `0F`.
+            let data = &mut self.sections[sec].data;
+            data.insert(before + 2, 0xAF);
+            // The splice shifted everything after the opcode, so any fixup the
+            // memory operand registered (a RIP-relative disp32) moves by one.
+            for fx in self.fixups.iter_mut().filter(|f| f.sec == sec && f.next_off > before) {
+                fx.disp_off += 1;
+                fx.next_off += 1;
+            }
             return Ok(());
         }
         let (sreg, _) = parse_reg(&ops[0])?;
@@ -1006,6 +1712,10 @@ impl Elf {
             "setbe" => 0x96,
             "seta" => 0x97,
             "setae" => 0x93,
+            "seto" => 0x90,
+            "setno" => 0x91,
+            "sets" => 0x98,
+            "setns" => 0x99,
             _ => unreachable!(),
         };
         let (reg, _) = parse_reg(&ops[0])?;
@@ -1037,10 +1747,12 @@ impl Elf {
             "jnp" => 0x8B,
             other => return Err(format!("elf: unsupported branch `{other}`")),
         };
-        // Always the 6-byte rel32 form, so branch length never depends on the
-        // distance to the target.
+        // Always emit the 6-byte `jcc rel32` here; `relax_branches` shrinks it
+        // to the 2-byte `jcc rel8` once every label's address is known. The
+        // length matters: the rel32 form puts the code after the branch 4 bytes
+        // further along than `as`'s relaxed rel8, which measured 22% on `stats`.
         self.sections[sec].data.extend_from_slice(&[0x0F, cc]);
-        self.pc_rel(sec, &ops[0]);
+        self.pc_rel(sec, &ops[0], FixKind::Jcc(cc));
         Ok(())
     }
 }
@@ -1099,6 +1811,10 @@ fn parse_imm(s: &str) -> Result<i64, String> {
 
 fn fits_i8(v: i64) -> bool {
     (-128..=127).contains(&v)
+}
+
+fn fits_i32(v: i64) -> bool {
+    (i32::MIN as i64..=i32::MAX as i64).contains(&v)
 }
 
 /// Register number, plus whether it was named with a byte-width name.
@@ -1272,6 +1988,76 @@ fn rex(w: bool, reg: u8, rm: u8) -> u8 {
 /// ModRM for a register/register form: mod=11, reg field, rm field.
 fn modrm_reg_reg(out: &mut Vec<u8>, reg: u8, rm: u8) {
     out.push(0xC0 | ((reg & 7) << 3) | (rm & 7));
+}
+
+/// `%xmmN` register number, if `s` names one. The `%xmm` file is separate from
+/// the general-purpose registers, so these never appear in `parse_reg`.
+fn parse_xmm(s: &str) -> Option<u8> {
+    let n = s.trim().strip_prefix("%xmm")?;
+    n.parse::<u8>().ok().filter(|r| *r < 16)
+}
+
+/// The mandatory prefix and two-byte opcode of an SSE op that takes the
+/// destination `%xmm` in the ModRM `reg` field and the source — an `%xmm` or a
+/// memory operand — in the r/m field. The prefix selects the operand width
+/// (`F3` single, `F2` double, `66` for the integer compares).
+fn sse_reg_rm(mnem: &str) -> Option<(&'static [u8], u8)> {
+    Some(match mnem {
+        "addss" => (&[0xF3], 0x58),
+        "addsd" => (&[0xF2], 0x58),
+        "subss" => (&[0xF3], 0x5C),
+        "subsd" => (&[0xF2], 0x5C),
+        "mulss" => (&[0xF3], 0x59),
+        "mulsd" => (&[0xF2], 0x59),
+        "divss" => (&[0xF3], 0x5E),
+        "divsd" => (&[0xF2], 0x5E),
+        "ucomiss" => (&[], 0x2E),
+        "ucomisd" => (&[0x66], 0x2E),
+        "cvtss2sd" => (&[0xF3], 0x5A),
+        "cvtsd2ss" => (&[0xF2], 0x5A),
+        _ => return None,
+    })
+}
+
+/// Emit an SSE instruction in the `%xmm`-register-to-`%xmm`-register form:
+/// mandatory prefix, REX (only when needed), the `0F` escape, the opcode and a
+/// mod=11 ModRM byte.
+fn emit_sse_rr(out: &mut Vec<u8>, prefix: &[u8], rex_w: bool, opcode: u8, reg: u8, rm: u8) {
+    out.extend_from_slice(prefix);
+    let r = rex(rex_w, reg, rm);
+    if r != 0x40 {
+        out.push(r);
+    }
+    out.push(0x0F);
+    out.push(opcode);
+    modrm_reg_reg(out, reg, rm);
+}
+
+/// Emit an SSE instruction whose r/m operand is memory. The REX byte precedes
+/// the `0F` escape (unlike `emit_mem_op`, which takes a one-byte opcode).
+fn emit_sse_mem(out: &mut Vec<u8>, prefix: &[u8], rex_w: bool, opcode: u8, reg: u8, m: &Mem) {
+    out.extend_from_slice(prefix);
+    let mut r = 0x40;
+    if rex_w {
+        r |= 0x08;
+    }
+    if reg >= 8 {
+        r |= 0x04;
+    }
+    if m.rip_label.is_none() {
+        if m.base.map_or(false, |b| b >= 8) {
+            r |= 0x01;
+        }
+        if m.index.map_or(false, |i| i >= 8) {
+            r |= 0x02;
+        }
+    }
+    if r != 0x40 {
+        out.push(r);
+    }
+    out.push(0x0F);
+    out.push(opcode);
+    emit_mem_modrm(out, m, reg);
 }
 
 fn emit_mov_imm(out: &mut Vec<u8>, reg: u8, v: i64, w: bool, abs: bool) {
@@ -1457,6 +2243,9 @@ mod tests {
             fixups: Vec::new(),
             abs64: Vec::new(),
             abs_imm: Vec::new(),
+            nbranches: 0,
+            align_pts: Vec::new(),
+            defs: 0,
             text_idx: 0,
         }
     }
@@ -1514,10 +2303,17 @@ mod tests {
     #[test]
     fn balign_pads_an_executable_section_with_nop() {
         // A zero byte decodes as `add %al,(%rax)`; a jump into the pad would
-        // fault, so an executable section pads with the one-byte `nop`.
+        // fault, so an executable section pads with `nop`s, never zero. The
+        // pad here is one multi-byte `nop` (the form `as` uses to keep padding
+        // to one instruction); its trailing zero bytes are part of that
+        // encoding, not separate instructions.
         let mut e = test_elf(0x5);
         e.pad_to_align(0, 8);
-        assert_eq!(e.sections[0].data, [1, 2, 3, 0x90, 0x90, 0x90, 0x90, 0x90]);
+        let data = &e.sections[0].data;
+        assert_eq!(data.len(), 8, "padded to the requested alignment");
+        assert_eq!(data[..3], [1, 2, 3], "existing bytes untouched");
+        assert_eq!(&data[3..], [0x0f, 0x1f, 0x44, 0x00, 0x00], "nop pad");
+        assert_ne!(data[3], 0, "the pad does not begin with a zero byte");
     }
 
     #[test]
@@ -1537,6 +2333,8 @@ mod tests {
         let mut e = test_elf(0x5);
         let (mut cur, mut sets) = (0usize, Vec::new());
         e.directive("p2align 4", &mut cur, &mut sets).unwrap();
+        assert_eq!(e.sections[0].data.len(), 3, "recorded, not padded yet");
+        e.relax_branches().unwrap();
         assert_eq!(e.sections[0].data.len(), 16);
     }
 
@@ -1546,6 +2344,8 @@ mod tests {
         let mut e = test_elf(0x5);
         let (mut cur, mut sets) = (0usize, Vec::new());
         e.directive("balign 8", &mut cur, &mut sets).unwrap();
+        assert_eq!(e.sections[0].data.len(), 3, "recorded, not padded yet");
+        e.relax_branches().unwrap();
         assert_eq!(e.sections[0].data.len(), 8);
     }
 
@@ -1565,27 +2365,6 @@ mod tests {
         // The RX segment's file size must cover the whole image, not 8 bytes.
         let filesz = u64::from_le_bytes(elf[96..104].try_into().unwrap());
         assert!(filesz > 64, "RX segment covers the code, got {filesz}");
-    }
-
-    #[test]
-    fn a_set_length_is_measured_at_its_own_position_not_the_section_end() {
-        // Two messages in `.rodata`, each followed by a `.set` length, and a
-        // `.data` section after both. At the end of parsing `.rodata` is 5
-        // bytes, so resolving `.` as the section's current end makes the first
-        // length 5 (its own offset is 0) — the later message's bytes leak into
-        // the first trap's output. Each length must be the distance from its
-        // message to its own `.set` (3 and 2).
-        let mut e = test_elf(0x5);
-        e.parse(
-            ".text\nmain:\n.quad 0\n\
-             .section .rodata\n\
-             msg1: .ascii \"abc\"\n.set msg1_len, . - msg1\n\
-             msg2: .ascii \"de\"\n.set msg2_len, . - msg2\n\
-             .data\n.quad 0\n",
-        )
-        .unwrap();
-        assert_eq!(e.syms["msg1_len"].off, 3);
-        assert_eq!(e.syms["msg2_len"].off, 2);
     }
 
     #[test]
@@ -1708,6 +2487,26 @@ mod tests {
         emit_mem_op(&mut out, 0x8B, &mem("(%rbp)"), 0, true, false);
         assert_eq!(out, [0x48, 0x8B, 0x45, 0x00]);
     }
+    #[test]
+    fn a_set_length_is_measured_at_its_own_position_not_the_section_end() {
+        // Two messages in `.rodata`, each followed by a `.set` length, and a
+        // `.data` section after both. At the end of parsing `.rodata` is 5
+        // bytes, so resolving `.` as the section's current end makes the first
+        // length 5 (its own offset is 0) — the later message's bytes leak into
+        // the first trap's output. Each length must be the distance from its
+        // message to its own `.set` (3 and 2).
+        let mut e = test_elf(0x5);
+        e.parse(
+            ".text\nmain:\n.quad 0\n\
+             .section .rodata\n\
+             msg1: .ascii \"abc\"\n.set msg1_len, . - msg1\n\
+             msg2: .ascii \"de\"\n.set msg2_len, . - msg2\n\
+             .data\n.quad 0\n",
+        )
+        .unwrap();
+        assert_eq!(e.syms["msg1_len"].off, 3);
+        assert_eq!(e.syms["msg2_len"].off, 2);
+    }
 
     #[test]
     fn bswap_names_its_register_in_the_opcode() {
@@ -1755,4 +2554,5 @@ mod tests {
         e.instruction("shl %cl, %eax", 0).unwrap();
         assert_eq!(e.sections[0].data[3..], [0xD3, 0xE0]);
     }
+
 }

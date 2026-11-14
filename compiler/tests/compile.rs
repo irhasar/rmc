@@ -7825,6 +7825,104 @@ fn no_strip_conflicts_with_min_size() {
 }
 
 
+/// Build a `for i in 0..bound { acc += k }` MIR function by hand, so the
+/// counted-loop matcher can be tested without a rustc front end. `exit_reads_cmp`
+/// makes the exit observe the loop condition; `reversed` flips the switch arms so
+/// `false` enters the body.
+fn counted_loop_mir(exit_reads_cmp: bool, reversed: bool) -> rmc::mir::Program {
+    use rmc::mir::{BasicBlock, Function, Operand, Place, Program, Rvalue, Stmt, Terminator};
+    let pl = |l: u32| Place { local: l, proj: Vec::new() };
+    let cpl = |l: u32| Operand::Copy(pl(l));
+    let assign = |l: u32, rv: Rvalue| Stmt::Assign(pl(l), rv);
+    // 0: dest, 1: iv, 2: acc, 3: cmp, 4: bound, 5: k
+    let decl = |n: usize| {
+        (0..n)
+            .map(|_| rmc::mir::LocalDecl {
+                ty: Box::new(rmc::mir::Ty::I64),
+                is_arg: false,
+                name: None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let switch = if reversed {
+        Terminator::SwitchInt { discr: cpl(3), targets: vec![(1, 3)], otherwise: 2 }
+    } else {
+        Terminator::SwitchInt { discr: cpl(3), targets: vec![(0, 3)], otherwise: 2 }
+    };
+    let exit_val = if exit_reads_cmp {
+        Rvalue::Binary(rmc::mir::BinOp::Add, cpl(2), cpl(3))
+    } else {
+        Rvalue::Use(cpl(2))
+    };
+    let blocks = vec![
+        BasicBlock {
+            stmts: vec![
+                assign(1, Rvalue::Use(Operand::Const(rmc::mir::Const::Int(0)))),
+                assign(2, Rvalue::Use(Operand::Const(rmc::mir::Const::Int(0)))),
+                assign(4, Rvalue::Use(Operand::Const(rmc::mir::Const::Int(5)))),
+                assign(5, Rvalue::Use(Operand::Const(rmc::mir::Const::Int(10)))),
+            ],
+            term: Terminator::Goto(1),
+        },
+        BasicBlock {
+            stmts: vec![assign(3, Rvalue::Binary(rmc::mir::BinOp::Lt, cpl(1), cpl(4)))],
+            term: switch,
+        },
+        BasicBlock {
+            stmts: vec![
+                assign(2, Rvalue::Binary(rmc::mir::BinOp::Add, cpl(2), cpl(5))),
+                assign(1, Rvalue::Binary(rmc::mir::BinOp::Add, cpl(1), Operand::Const(rmc::mir::Const::Int(1)))),
+            ],
+            term: Terminator::Goto(1),
+        },
+        BasicBlock { stmts: vec![assign(0, exit_val)], term: Terminator::Return },
+    ];
+    Program {
+        funcs: vec![Function {
+            name: "main".into(),
+            module: String::new(),
+            locals: decl(6),
+            blocks,
+            consts: Default::default(),
+        }],
+        allocs: Default::default(),
+        consts: Default::default(),
+        promoted: Default::default(),
+        drop_impls: Default::default(),
+    }
+}
+
+/// Whether `close_counted_loops` replaced the body's back edge with a jump to the
+/// exit (a `Goto` to block 3 instead of the loop header).
+fn counted_loop_closed(prog: &rmc::mir::Program) -> bool {
+    matches!(prog.funcs[0].blocks[2].term, rmc::mir::Terminator::Goto(3))
+}
+
+#[test]
+fn closes_a_counted_loop_whose_condition_is_unobserved() {
+    let mut prog = counted_loop_mir(false, false);
+    rmc::mir::close_counted_loops(&mut prog, false);
+    assert!(counted_loop_closed(&prog), "the plain counted loop should close");
+}
+
+#[test]
+fn keeps_a_counted_loop_whose_condition_the_exit_reads() {
+    // The closed form never runs the final failing test, so the condition local
+    // would be left *true*; the exit reads it, so the rewrite must be rejected.
+    let mut prog = counted_loop_mir(true, false);
+    rmc::mir::close_counted_loops(&mut prog, false);
+    assert!(!counted_loop_closed(&prog), "an observed condition must block the rewrite");
+}
+
+#[test]
+fn keeps_a_counted_loop_with_reversed_switch_arms() {
+    // `[1: exit, otherwise: body]` means a false comparison enters the body; the
+    // rewrite assumes true enters the body, so this shape must be rejected.
+    let mut prog = counted_loop_mir(false, true);
+    rmc::mir::close_counted_loops(&mut prog, false);
+    assert!(!counted_loop_closed(&prog), "a reversed switch must block the rewrite");
+}
+
 #[test]
 fn inlining_copies_a_parameter_whose_address_the_callee_takes() {
     // The callee takes `&mut x` and writes through it. Inlining must give the
@@ -8250,6 +8348,126 @@ fn a_vec_list_literal_reads_back_its_elements() {
         "fn main() { let v: Vec<i64> = vec![]; let _ = v.len(); }",
         &CompileOptions::default()
     ).is_ok());
+}
+
+#[test]
+fn a_binary_op_whose_dest_aliases_the_second_operand_keeps_the_first() {
+    // `x = a + x` (the destination *is* the second operand) reaches the MIR
+    // back end whenever the first operand is an integer constant, because
+    // `copy_propagate` folds the constant into the right operand. The promoted
+    // register fast path in `gen_binary` must not load the first operand into
+    // the accumulator's own register before reading the second, or it reads the
+    // just-clobbered value. `x = 100 + x` twice from `x = 5` is 100+5=105 then
+    // 100+105=205; the buggy form doubles the accumulator instead.
+    use rmc::mir::{
+        BasicBlock, Const, Function, LocalDecl, Operand, Place, Program, Rvalue, Stmt, Terminator,
+        Ty,
+    };
+    let pl = |l: u32| Place { local: l, proj: Vec::new() };
+    let cpl = |l: u32| Operand::Copy(pl(l));
+    let int = |v: i64| Operand::Const(Const::Int(v));
+    let assign = |l: u32, rv: Rvalue| Stmt::Assign(pl(l), rv);
+    let decl = |n: usize| {
+        (0..n)
+            .map(|_| LocalDecl { ty: Box::new(Ty::I64), is_arg: false, name: None })
+            .collect::<Vec<_>>()
+    };
+    // 0: ret, 1: `a` (the non-aliasing first operand), 2: `x`.
+    let prog = Program {
+        funcs: vec![Function {
+            name: "main".into(),
+            module: String::new(),
+            locals: decl(3),
+            blocks: vec![BasicBlock {
+                stmts: vec![
+                    assign(1, Rvalue::Use(int(100))),
+                    assign(2, Rvalue::Use(int(5))),
+                    // Both fold to `Add(copy 1, move 2)` with dest = local 2.
+                    assign(2, Rvalue::Binary(rmc::mir::BinOp::Add, cpl(1), cpl(2))),
+                    assign(2, Rvalue::Binary(rmc::mir::BinOp::Add, cpl(1), cpl(2))),
+                    assign(0, Rvalue::Use(cpl(2))),
+                ],
+                term: Terminator::Return,
+            }],
+            consts: Default::default(),
+        }],
+        allocs: Default::default(),
+        consts: Default::default(),
+        promoted: Default::default(),
+        drop_impls: Default::default(),
+    };
+    let asm = rmc::compile_mir_to_asm(&prog, &rmc::mir_codegen::Options { promote: true })
+        .expect("the MIR compiles");
+    // The accumulator (`x`, local 2) is promoted to a callee-saved register;
+    // a self-add of that register is the doubling bug.
+    let main = &asm[asm.find("main:").expect("a main label")..];
+    let main = &main[..main.find(".size main").unwrap_or(main.len())];
+    for reg in ["%rbx", "%r12", "%r13", "%r14", "%r15"] {
+        assert!(
+            !main.contains(&format!("add {reg}, {reg}")),
+            "the accumulator must not be doubled in:\n{main}"
+        );
+    }
+
+    if std::process::Command::new("as").arg("--version").output().is_err() {
+        eprintln!("skipping the run: `as` not on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("rmc-alias-add-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("m.bin");
+    let elf = rmc::elf::assemble(&asm).expect("the assembly assembles");
+    std::fs::write(&bin, &elf).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let out = std::process::Command::new(&bin).output().expect("run the binary");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(out.status.code(), Some(205), "100 + 5, then 100 + 105, must be 205");
+}
+
+#[test]
+fn a_signed_division_by_a_constant_rounds_a_negative_dividend_toward_zero() {
+    // A signed divide by a non-power-of-two constant lowers to a magic
+    // multiply plus a sign correction. The correction is the sign of the
+    // dividend; when the magic multiplier fits a positive `i64` the back end
+    // takes it from the product's high word (`%rdx >> 63`), and when it does
+    // not (`add`) it folds the bias in first and reads the dividend copy. Both
+    // forms must floor a negative dividend toward zero. `100` takes the `add`
+    // form and `1000` the other; `-7/1000` is `0`, not `-1`.
+    let dir = std::env::temp_dir().join(format!("rmc-divconst-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("m.rs");
+    let bin = dir.join("m.bin");
+    std::fs::write(
+        &src,
+        "fn main() -> i64 { \
+         let mut i: i64 = -700; \
+         let mut acc: i64 = 0; \
+         while i < 700 { acc = acc + (i / 1000) + (i / 100); i = i + 1; } \
+         print_i64(acc); return 0; }\n",
+    )
+    .unwrap();
+
+    let rmc = env!("CARGO_BIN_EXE_rmc");
+    let out = std::process::Command::new(rmc)
+        .arg("-o")
+        .arg(&bin)
+        .arg(&src)
+        .output()
+        .expect("run rmc");
+    assert!(out.status.success(), "rmc failed: {}", String::from_utf8_lossy(&out.stderr));
+    let run = std::process::Command::new(&bin).output().expect("run the binary");
+    // Sum of trunc(i/1000) + trunc(i/100) for i in [-700, 699].
+    let expect: i64 = (-700..700).map(|i| i / 1000 + i / 100).sum();
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        format!("{expect}\n"),
+        "a signed constant divide must truncate toward zero"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

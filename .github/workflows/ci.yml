@@ -25,6 +25,88 @@ jobs:
       - name: Differential tests
         run: python3 tests/run.py
 
+      # The MIR pipeline (rustc front end + rmc back end): same differential
+      # contract, but the reference and the subject share one freestanding
+      # runtime, so the only variable is the code generator. `rmc` drives
+      # `rustc --emit=mir` itself (with `RUSTC_BOOTSTRAP=1` for `-Zno-codegen`),
+      # so the stable toolchain installed above is enough.
+      - name: MIR differential tests
+        run: python3 tests/mir/run.py
+
+      # Realistic Rust through the MIR back end must produce a clean error or a
+      # working binary, never a panic or a signal. The suite above only feeds
+      # the back end programs it is known to support; this reaches the
+      # diagnostics path a user typing arbitrary Rust actually hits.
+      - name: MIR crash survey
+        run: python3 tools/mir_survey.py
+
+  # The real codegen-backend pipeline. `test` above runs on stable and so only
+  # covers the printed-MIR prototype; this job installs the nightly `rustc-dev`
+  # component, builds the backend dylib, and runs the differential suite that
+  # drives `-Zcodegen-backend` for real. That is the only place the backend's
+  # defining-path MIR rendering (vs the prototype's visible paths) is exercised.
+  cb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned nightly
+        # The channel comes from `backend/rust-toolchain.toml`, so the toolchain
+        # the backend links against is the one CI tests against. `rustc-dev` for
+        # the backend dylib, `llvm-tools`/`rustc-codegen-cranelift` for the
+        # benches below.
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' backend/rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal \
+            --component rustc-dev --component llvm-tools \
+            --component rustc-codegen-cranelift
+
+      - name: Build compiler
+        run: cargo build --release --manifest-path compiler/Cargo.toml
+
+      - name: Build backend
+        run: ./backend/build.sh
+
+      - name: Codegen-backend differential tests
+        run: python3 tests/cb/run.py
+
+  # The benchmark harnesses must run on a fresh machine with only the README's
+  # steps: this is where their toolchain independence (no hard-coded mangled
+  # symbol names) is checked, since a hard-coded spelling only breaks on a
+  # toolchain other than the author's.
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned nightly
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' backend/rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal \
+            --component rustc-dev --component llvm-tools \
+            --component rustc-codegen-cranelift
+
+      - name: Install binutils
+        run: sudo apt-get update && sudo apt-get install -y binutils
+
+      # The harnesses drive both the `rmc` binary and the `rmcmir` example, so
+      # build the whole package plus the example: `--example` alone would leave
+      # `compiler/target/release/rmc` missing and the harness would fail to
+      # spawn it.
+      - name: Build compiler and example
+        run: cargo build --release --manifest-path compiler/Cargo.toml --bins --examples
+
+      - name: Build backend
+        run: ./backend/build.sh
+
+      # One source, two back ends, from an empty output directory: the harness
+      # must create its own directories and discover the panic symbols itself.
+      - name: Fair benchmark (must complete)
+        run: python3 bench/run_fair.py
+
+      - name: Four-way benchmark (must complete)
+        run: python3 bench/run_four.py
+
   fuzz:
     runs-on: ubuntu-latest
     steps:

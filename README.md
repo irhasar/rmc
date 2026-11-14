@@ -22,22 +22,24 @@ The point of the experiment is to measure the trade-off at the extremes:
 
 `rmc` wins big on compile time, compiler memory, and artifact size, and those
 three are the point of the experiment. Because it links in-process rather than
-forking `as` and `ld`, a small program compiles in about 1.5–1.9 ms against
-rustc's ~2.1 s. On **runtime** the result is mixed and program-dependent: rmc is
-ahead on eight of ten programs (`hello` 3.6×, `forloops` 2.3×, `refs` 1.7×,
-`sieve` 1.3×, `stats` 1.2×, `mandel` 1.1×, `mix` 1.0×, `heap` 1.0×), with
-`fib` at parity (1.00×) and `callrec` marginally behind (0.97×) — both inside
-run-to-run noise on a recursive shape where the two compilers emit the same loop.
+forking `as` and `ld`, a small program compiles in about 1.8 ms against
+rustc's ~2.1 s. On **runtime** the result is program-dependent but, in the
+current recording, in rmc's favour on all twelve programs: from `hello` 3.7×
+(mostly process startup) and `forloops` 2.3×, through `sieve` 1.5×, the new
+`heavy` (a 1e9-iteration steady-state loop) at 1.35×, `light` (a cache-resident
+scan) at 1.26× and `refs` 1.17×, down to `mandel` 1.10×, `stats` 1.09×, `fib`
+1.06×, `mix` 1.05×, `heap` 1.04× and `callrec` 1.04×. Several of those margins
+— `fib`, `mix`, `heap`, `callrec` — sit inside run-to-run noise and flip sign
+between recordings, so a single ratio is indicative, not a stable property.
 `refs` used to be the one structural loss — LICM would not hoist a read through a
 reference, because rmc's `&T` carries no guarantee that it is dereferenceable and
 speculating the load out of a loop that might never run could fault. A provenance
 pre-pass now marks a reference that is bound directly to a live local (`&x`,
 `&x.field`) as provably frame-pointing, so a read through it *can* be hoisted;
-that took `refs` from a structural loss to a 1.7× win. The rest are within
-run-to-run noise, and a call-heavy shape the recursion-to-loop pass does not
-match would lose. It is not uniformly faster and there is no single speedup
-number; `bench/RESULTS.md` reports the per-program ratio and the harness's
-fairness rules.
+that took `refs` from a structural loss to a 1.2× win. A call-heavy shape the
+recursion-to-loop pass does not match would lose. It is not uniformly faster and
+there is no single speedup number; `bench/RESULTS.md` reports the per-program
+ratio and the harness's fairness rules.
 
 The artifact-size comparison depends entirely on which rustc build is the
 reference. Against a plain `rustc -O` (which statically links libstd, the panic
@@ -63,18 +65,30 @@ compiler/            the rmc compiler (Rust, std only, no dependencies)
   src/runtime.rs     freestanding runtime written in assembly
   src/main.rs        CLI driver: source -> asm -> ELF executable
   tests/compile.rs   unit tests for the front end and code generator
+backend/             rmc as a rustc `-Zcodegen-backend` dylib (rustc_private)
+  rust-toolchain.toml  the pinned nightly + rustc-dev/llvm-tools/cranelift
+  build.sh, rmc-rustc  build/run the dylib on the pinned channel
 bench/
   rust/*.rs          benchmark programs (plain Rust, compiled by rmc)
+  mir/*.rs           freestanding twins of the same programs (for run_mir.py)
+  uni/*.rs           one source compiled by all four pipelines (run_four.py)
   run.py             benchmark harness (compile time, CPU, RAM, size, runtime)
+  run_fair.py        same-source, two-back-end comparison (rmc vs LLVM)
+  run_codegen.py     the codegen-backend (`cb`) pipeline vs LLVM
+  run_four.py        one source through rmc / cb / Cranelift / LLVM
+  run_mir.py         three-way comparison: rustc-MIR+rmc, rmc-AST, rustc-LLVM
 tools/
   fuzz.py            differential fuzzer and robustness checker
 tests/
   run.py             differential test suite: rmc vs rustc on twin programs
+  mir/run.py         differential suite for the MIR-text path
+  cb/run.py          differential suite for the codegen-backend pipeline
   cases/*.rs         programs compiled by both rmc and rustc
   args.json          per-case argv vectors (for runtime inputs)
 docs/
   language.md        the supported language subset
   design.md          compiler architecture and code generation notes
+  mir-roadmap.md     rustc-front-end/rmc-back-end: status, limits, roadmap
 ```
 
 ## Building
@@ -104,6 +118,42 @@ rmc input.rs --no-tco              # disable self-recursion-to-loop (on by defau
 
 Run the produced binary directly; it is a static ELF executable with no
 dynamic dependencies.
+
+## Using rmc as a rustc codegen backend
+
+`backend/` builds rmc as a `rustc_private` `CodegenBackend` dylib that rustc
+loads with `-Zcodegen-backend`. rustc does lexing, parsing and type checking;
+rmc replaces LLVM and writes the ELF itself. Because the dylib links one exact
+nightly's `rustc_private`, the channel is pinned in `backend/rust-toolchain.toml`
+(scoped to `backend/`, so the rest of the repo and CI stay on stable). Install
+the pinned channel and build:
+
+```sh
+rustup toolchain install "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' \
+    backend/rust-toolchain.toml)" \
+    --component rustc-dev --component llvm-tools --component rustc-codegen-cranelift
+./backend/build.sh
+```
+
+Then compile through it. `rmc-rustc` is a thin wrapper that runs the *pinned*
+channel with the dylib (use plain `rustc +<channel>` directly for a fair
+comparison against LLVM, since a wrapper is an extra process):
+
+```sh
+backend/rmc-rustc prog.rs -o prog        # rustc front end + rmc back end
+rustc +"$(sed -n 's/^channel *= *"\(.*\)"/\1/p' backend/rust-toolchain.toml)" \
+    -Zcodegen-backend=backend/target/release/librmc_codegen_backend.so \
+    -C opt-level=3 -C panic=abort prog.rs -o prog
+```
+
+The backend is x86-64/executable only: it rejects a non-x86-64 `--target`, any
+`--emit` other than an executable, and a non-`bin` crate type, rather than
+producing a mislabeled ELF.
+
+Note that, like the `--rustc-frontend` path, this route currently renders MIR
+to text (`write_mir_pretty`) and re-parses it; it saves the second `rustc`
+process and the `ld` call, but does not yet consume `mir::Body` directly. See
+`docs/mir-roadmap.md`.
 
 ## Using rmc as a library
 
@@ -374,10 +424,13 @@ Runtime builtins (provided by `src/runtime.rs`, no imports needed):
 ## Benchmarks
 
 `bench/run.py` compares `rmc` against `rustc -O -C lto=fat -C codegen-units=1
--C panic=abort -C strip=symbols` on ten programs, with matching safety
+-C panic=abort -C strip=symbols` on twelve programs, with matching safety
 semantics: rmc checks bounds by default and rustc is invoked with
 `-C overflow-checks=off`, so both carry bounds checks and neither carries
-overflow checks (see below). It measures both halves of
+overflow checks (see below). The last two bracket the load spectrum: `light`
+runs a short, cache-resident loop (a few ms), `heavy` a ~1e9-iteration
+steady-state loop (hundreds of ms), so neither a startup-dominated nor a
+throughput-dominated shape can hide a regression. It measures both halves of
 the comparison, because "faster" means two different things here:
 
 * **compile** — build wall time, compiler CPU time, compiler peak RAM, and the
@@ -401,74 +454,82 @@ host):
 
 | program | compiler | compile wall | compile CPU | compile RAM | artifact | run wall | run CPU | run RAM |
 | ------- | -------- | -----------: | ----------: | ----------: | -------: | -------: | ------: | ------: |
-| hello | rmc | 1.34 ms | 1.22 ms | 3.0 MB | 495 B | 0.26 ms | 0.14 ms | 20 kB |
-| hello | rustc | 2076.10 ms | 2072.60 ms | 183.4 MB | 289416 B | 0.82 ms | 0.72 ms | 2068 kB |
-| fib | rmc | 1.46 ms | 1.33 ms | 3.0 MB | 692 B | 7.10 ms | 6.99 ms | 24 kB |
-| fib | rustc | 2043.10 ms | 2047.51 ms | 182.6 MB | 291696 B | 7.09 ms | 6.96 ms | 2056 kB |
-| mandel | rmc | 1.57 ms | 1.45 ms | 3.1 MB | 1041 B | 95.89 ms | 95.67 ms | 24 kB |
-| mandel | rustc | 2083.71 ms | 2087.25 ms | 185.9 MB | 291776 B | 105.14 ms | 104.91 ms | 2036 kB |
-| sieve | rmc | 1.95 ms | 1.82 ms | 3.1 MB | 953 B | 1.83 ms | 1.70 ms | 1588 kB |
-| sieve | rustc | 2078.26 ms | 2082.36 ms | 182.8 MB | 292032 B | 2.42 ms | 2.30 ms | 3588 kB |
-| mix | rmc | 1.52 ms | 1.40 ms | 3.0 MB | 941 B | 14.82 ms | 14.69 ms | 24 kB |
-| mix | rustc | 2067.95 ms | 2071.18 ms | 187.8 MB | 291880 B | 15.45 ms | 15.29 ms | 2044 kB |
-| stats | rmc | 1.54 ms | 1.43 ms | 3.1 MB | 924 B | 3.23 ms | 3.12 ms | 24 kB |
-| stats | rustc | 2074.10 ms | 2077.53 ms | 183.6 MB | 292048 B | 3.71 ms | 3.60 ms | 2080 kB |
-| refs | rmc | 1.72 ms | 1.61 ms | 3.1 MB | 1115 B | 3.23 ms | 3.11 ms | 28 kB |
-| refs | rustc | 2090.36 ms | 2091.62 ms | 188.3 MB | 292512 B | 5.48 ms | 5.34 ms | 2104 kB |
-| heap | rmc | 1.61 ms | 1.48 ms | 3.1 MB | 1165 B | 3.27 ms | 3.15 ms | 4716 kB |
-| heap | rustc | 2082.95 ms | 2086.35 ms | 188.7 MB | 292384 B | 3.31 ms | 3.17 ms | 6708 kB |
-| callrec | rmc | 1.45 ms | 1.31 ms | 3.0 MB | 695 B | 2.90 ms | 2.77 ms | 24 kB |
-| callrec | rustc | 2070.15 ms | 2073.55 ms | 184.2 MB | 291680 B | 2.84 ms | 2.70 ms | 2020 kB |
-| forloops | rmc | 1.61 ms | 1.49 ms | 3.1 MB | 851 B | 1.46 ms | 1.35 ms | 24 kB |
-| forloops | rustc | 2072.64 ms | 2076.65 ms | 182.6 MB | 292480 B | 3.32 ms | 3.19 ms | 2096 kB |
+| hello | rmc | 1.62 ms | 1.49 ms | 3.6 MB | 503 B | 0.21 ms | 0.12 ms | 24 kB |
+| hello | rustc | 2110.17 ms | 2112.41 ms | 188.2 MB | 289416 B | 0.80 ms | 0.70 ms | 2104 kB |
+| fib | rmc | 1.72 ms | 1.58 ms | 3.6 MB | 870 B | 6.72 ms | 6.61 ms | 24 kB |
+| fib | rustc | 2146.25 ms | 2147.34 ms | 188.5 MB | 291696 B | 7.12 ms | 6.96 ms | 2040 kB |
+| mandel | rmc | 1.89 ms | 1.77 ms | 3.7 MB | 1209 B | 95.75 ms | 95.50 ms | 24 kB |
+| mandel | rustc | 2131.60 ms | 2135.78 ms | 186.9 MB | 291776 B | 105.17 ms | 104.95 ms | 2096 kB |
+| sieve | rmc | 1.86 ms | 1.73 ms | 3.6 MB | 1137 B | 1.64 ms | 1.52 ms | 1584 kB |
+| sieve | rustc | 2167.75 ms | 2168.35 ms | 186.7 MB | 292032 B | 2.39 ms | 2.26 ms | 3660 kB |
+| mix | rmc | 1.91 ms | 1.77 ms | 3.6 MB | 1117 B | 14.71 ms | 14.56 ms | 24 kB |
+| mix | rustc | 2174.82 ms | 2178.58 ms | 187.4 MB | 291880 B | 15.50 ms | 15.36 ms | 2076 kB |
+| stats | rmc | 1.86 ms | 1.74 ms | 3.7 MB | 1104 B | 3.42 ms | 3.30 ms | 24 kB |
+| stats | rustc | 2177.36 ms | 2180.97 ms | 187.9 MB | 292048 B | 3.72 ms | 3.59 ms | 2092 kB |
+| refs | rmc | 2.04 ms | 1.92 ms | 3.8 MB | 1279 B | 4.68 ms | 4.56 ms | 24 kB |
+| refs | rustc | 2149.20 ms | 2152.70 ms | 189.0 MB | 292512 B | 5.48 ms | 5.35 ms | 2104 kB |
+| heap | rmc | 1.91 ms | 1.78 ms | 3.6 MB | 1335 B | 3.19 ms | 3.06 ms | 4712 kB |
+| heap | rustc | 2183.21 ms | 2187.70 ms | 188.4 MB | 292384 B | 3.31 ms | 3.19 ms | 6716 kB |
+| callrec | rmc | 1.75 ms | 1.63 ms | 3.7 MB | 873 B | 2.74 ms | 2.62 ms | 24 kB |
+| callrec | rustc | 2150.84 ms | 2155.09 ms | 186.8 MB | 291680 B | 2.83 ms | 2.71 ms | 2088 kB |
+| forloops | rmc | 1.81 ms | 1.69 ms | 3.7 MB | 1011 B | 1.46 ms | 1.35 ms | 24 kB |
+| forloops | rustc | 2201.07 ms | 2205.34 ms | 187.9 MB | 292480 B | 3.31 ms | 3.18 ms | 2084 kB |
+| light | rmc | 1.83 ms | 1.72 ms | 3.7 MB | 1209 B | 2.09 ms | 1.98 ms | 24 kB |
+| light | rustc | 2154.45 ms | 2158.88 ms | 189.9 MB | 291904 B | 2.63 ms | 2.50 ms | 2092 kB |
+| heavy | rmc | 1.76 ms | 1.65 ms | 3.6 MB | 969 B | 766.19 ms | 765.93 ms | 24 kB |
+| heavy | rustc | 2207.43 ms | 2211.42 ms | 187.2 MB | 291792 B | 1030.97 ms | 1030.60 ms | 2060 kB |
 
 Summary of the ratios (rustc ÷ rmc, so >1 means rmc is better):
 
 | dimension         | ratio      |
 | ----------------- | ---------: |
-| compile wall      | ~1102–1445× |
-| compile CPU       | ~1202–1580× |
-| compiler peak RAM | ~60–62×    |
-| artifact size     | ~251–585× vs fat-LTO stripped; ~1016–2385× vs static stripped; ~3899–9166× vs plain `-O` |
-| run wall time     | 0.97–3.55× (rmc ahead on eight of ten; `callrec` within noise of parity) |
-| run peak RAM      | ~1.42× on `heap`, ~2.29× on `sieve`, ~71–75× elsewhere |
+| compile wall      | ~1054–1303× |
+| compile CPU       | ~1121–1418× |
+| compiler peak RAM | ~50–53×    |
+| artifact size     | ~219–575× vs fat-LTO stripped; ~887–2347× vs static stripped; ~3402–9020× vs plain `-O` |
+| run wall time     | 1.04–3.73× (rmc ahead on all twelve in this recording; the four sub-1.10× margins are inside run-to-run noise) |
+| run peak RAM      | ~1.4× on `heap`, ~2.3× on `sieve`, ~86–88× elsewhere |
 
-The compile-time win is the point of the project: `rmc` builds in about 1.5–1.9 ms
-where rustc needs about 2.1 s, using ~3.1 MB of RAM against ~188 MB, and writing
-a ~0.5–1.2 KB static binary against ~290 KB (fat-LTO stripped), ~1.2 MB (static
+The compile-time win is the point of the project: `rmc` builds in about 1.6–2.0 ms
+where rustc needs about 2.1 s, using ~3.6 MB of RAM against ~188 MB, and writing
+a ~0.5–1.3 KB static binary against ~290 KB (fat-LTO stripped), ~1.2 MB (static
 stripped) or ~4.5 MB (plain `-O`). The binary is small because it links only the
 runtime pieces the program reaches: a program that never allocates carries no
 allocator, and one that never indexes an array carries no bounds trap. The
-run-time picture is mixed and remains the honest weak spot: rmc wins on `hello`
-(3.55×, mostly process startup), `forloops` (2.25×), `refs` (1.70×), `sieve`
-(1.33×), `stats` (1.15×), `mandel` (1.10×), `heap` (1.01×) and `mix` (1.03×),
-and sits at parity on `fib` (1.00×) and `callrec` (0.97×, inside noise). `refs`
-is no longer the structural loss it was — see below. Both compilers inline
-`gcd` into `main` (the inliner now accepts a small loop-bearing helper) and both
-emit a 32-bit `div` fast path with a 64-bit `idiv` fallback, so the `mix` gap is the
-code around the divide rather than the divide's checks: rmc reloads the bound and
-the swapped operands from the frame each iteration where LLVM keeps them in
-registers. The call-heavy cases (`fib`, `mix`,
-`callrec`) used to lose; they no longer do because the recursion-to-loop pass now
-folds the right spine of a shape like `1 + f(n-1) + f(n-2)`, leaving one call per
-level the way rustc does. That pass is still narrow — one `i64` parameter, an
-associative `+`/`*`, and a pure left operand — so a call-heavy shape it does not
-match would lose again, since a stack-based generator with no register allocator
-pays the argument setup and register save/restore on every call that LLVM avoids.
-Run times are the noisiest column: they move ±20% between recordings on a shared
-machine, and a program near parity (`fib`, `mix`, `callrec`) flips sign between
-runs, so treat a single run's ratio as indicative and re-measure with many
-samples before trusting a sub-5% difference. (An early `refs` run reported
-0.14×; that was LLVM folding the *whole* loop into `128 * n` in the Rust twin,
-not a measurement of the loop — the fix was to keep the loop real without a
-barrier only one side pays for; see "Reproducing the comparison honestly".)
+run-time picture is program-dependent but, in this recording, rmc's favour on
+every program: `hello` (3.73×, mostly process startup), `forloops` (2.26×),
+`sieve` (1.46×), `heavy` (1.35×), `light` (1.26×), `refs` (1.17×), `mandel`
+(1.10×), `stats` (1.09×), `fib` (1.06×), `mix` (1.05×), `heap` (1.04×) and
+`callrec` (1.04×). The last four sit within run-to-run noise, so treat them as
+parity rather than a stable win. `refs` is no longer the structural loss it was —
+see below. Both compilers inline `gcd` into `main` (the inliner now accepts a
+small loop-bearing helper) and both emit a 32-bit `div` fast path with a 64-bit
+`idiv` fallback, so the `mix` gap is the code around the divide rather than the
+divide's checks: rmc reloads the bound and the swapped operands from the frame
+each iteration where LLVM keeps them in registers. The call-heavy cases (`fib`,
+`mix`, `callrec`) used to lose; they no longer do because the recursion-to-loop
+pass now folds the right spine of a shape like `1 + f(n-1) + f(n-2)`, leaving one
+call per level the way rustc does. That pass is still narrow — one `i64`
+parameter, an associative `+`/`*`, and a pure left operand — so a call-heavy
+shape it does not match would lose again, since a stack-based generator with no
+register allocator pays the argument setup and register save/restore on every
+call that LLVM avoids. `heavy` is the shape rmc's codegen handles best: a long
+scalar loop the vectoriser cannot rewrite, where the loop the compiler emits is
+what runs for hundreds of milliseconds. Run times are the noisiest column: they
+move ±20% between recordings on a shared machine, and a program near parity
+(`fib`, `mix`, `heap`, `callrec`) flips sign between runs, so treat a single
+run's ratio as indicative and re-measure with many samples before trusting a
+sub-5% difference. (An early `refs` run reported 0.14×; that was LLVM folding the
+*whole* loop into `128 * n` in the Rust twin, not a measurement of the loop — the
+fix was to keep the loop real without a barrier only one side pays for; see
+"Reproducing the comparison honestly".)
 The binary's
-tiny footprint also shows at run time: an `rmc` program peaks at ~28 kB of
+tiny footprint also shows at run time: an `rmc` program peaks at ~24 kB of
 RAM, a rustc one at ~2 MB
 — except on `heap` and `sieve`, where the arena each program allocates dominates
-and the two converge. The ~2 MB floor is the dynamically linked C library
-(`ld.so` + `libc`) that a rustc binary pulls in, not the generated code; rmc
-links neither.
+and the gap narrows to ~1.4× and ~2.3×. The ~2 MB floor is the dynamically
+linked C library (`ld.so` + `libc`) that a rustc binary pulls in, not the
+generated code; rmc links neither.
 
 ### Reproducing the comparison honestly
 
@@ -504,8 +565,17 @@ The Rust twins do `black_box` their *inputs* — the trip count, the opaque seed
 the struct is built from — because a workload the optimiser can see through is
 not a workload. What they do not do is put a barrier *inside* the measured loop.
 
-Two benchmarks need a word of caution when reading their ratio:
+Three benchmarks need a word of caution when reading their ratio:
 
+* **`light`** and **`heavy`** bracket the load spectrum. `light` is the short,
+  cache-resident case: a 2 KiB table (so it stays in L1) scanned with a
+  data-dependent branch, run for a few ms, where process startup and
+  per-iteration codegen are a real share of the cost. `heavy` is the long,
+  throughput-bound case: a ~1e9-iteration loop over two accumulators, run for
+  hundreds of ms, where the measured time is the generated loop rather than a
+  closed form (the data-dependent branch keeps it scalar and the second
+  accumulator stops it collapsing to a running sum). This is the regime where
+  rmc's codegen is strongest, and a startup-only win cannot flatter it.
 * **`heap`** builds its list with rmc's own `alloc`, which returns a payload 8
   bytes past a size header, so 16-byte nodes land 24 bytes apart. The Rust twin
   uses the same 24-byte stride (`base + 8 + i*24`) so both walks touch the same
@@ -521,12 +591,39 @@ Two benchmarks need a word of caution when reading their ratio:
   carries no guarantee that it is dereferenceable, so a reference of unknown
   origin — a parameter, a cast, a mutable ref — must not have its load
   speculated out of a loop that might never run. `refs` binds its reference to a
-  local, so the read is hoisted and rmc wins (1.70×); a loop that reads through a
+  local, so the read is hoisted and rmc wins (1.17×); a loop that reads through a
   reference of unproven origin would still reload every iteration and lose, and
   that is the honest limit. An earlier `refs` design put `black_box` inside the
   loop and reported 2.15×; that number was withdrawn once the barrier asymmetry
   was found, because without the barrier rustc folded the loop to a constant and
   with it rustc paid a store/reload rmc did not.
+
+### The rustc-back-end comparison
+
+The benchmarks above compare rmc's own front end against the full `rustc`
+driver. A separate set of harnesses answers the other question — *if you keep
+rustc's front end and only swap the back end, how does rmc compare to LLVM?* —
+on the **same** source for both sides, so a difference is the code generator:
+
+```sh
+python3 bench/run_fair.py     # same source, rmc-MIR vs rmc-AST vs rustc-LLVM
+python3 bench/run_codegen.py  # the `cb` dylib pipeline vs rustc-LLVM
+python3 bench/run_four.py     # one source through rmc / cb / Cranelift / LLVM
+```
+
+`cb` loads rmc as a `-Zcodegen-backend` dylib, so rustc runs **one process** for
+both sides and rmc sees the same optimised MIR LLVM would. On the development
+host (AMD EPYC 9B14, pinned `rustc 1.102.0-nightly`) it beats LLVM on every
+mean axis — compile wall 1.33, CPU 1.36, RSS 1.11, artifact size 21.0, run wall
+1.09, CPU 1.09, RSS 1.25 — and beats rustc's Cranelift backend on every axis
+too. These harnesses need the pinned nightly (see "Using rmc as a rustc codegen
+backend"), and `tests/cb/run.py` is their differential correctness suite. The
+dated numbers live in [`bench/RESULTS-CB.md`](bench/RESULTS-CB.md) and
+[`bench/RESULTS-4WAY.md`](bench/RESULTS-4WAY.md).
+
+Unlike rmc's own front end, the back-end pipelines inherit rustc's front-end
+cost (start-up and RSS) and the subset of MIR they can lower is narrower, so
+they are not a replacement for the `run.py` numbers — they isolate the back end.
 
 ## Honest limitations
 

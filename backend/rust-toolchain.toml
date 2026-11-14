@@ -1,0 +1,12 @@
+# The codegen backend links `rustc_private` crates, so it is built with the
+# exact nightly the rest of the project's reported numbers used. A *scoped*
+# pin (this directory, not the repo root) keeps the AST/MIR prototype suites
+# and CI's stable `test` job on stable; rustup picks the nearest toolchain file
+# from the working directory, and `backend/build.sh` cds here first.
+#
+# `rustc-dev` provides the `rustc_private` dylibs; `llvm-tools` the LLVM
+# binaries; `rustc-codegen-cranelift` the `cl` pipeline `bench/run_four.py`
+# measures against.
+[toolchain]
+channel = "nightly-2026-11-12"
+components = ["rustc-dev", "llvm-tools", "rustc-codegen-cranelift"]
