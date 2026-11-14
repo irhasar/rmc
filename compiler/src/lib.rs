@@ -35,10 +35,13 @@ pub struct CompileOptions {
     /// with status 101 instead of wrapping. Off by default because it costs a
     /// branch per arithmetic operation.
     pub overflow_checks: bool,
-    /// Insert a bounds check before every array index so that an out-of-range
-    /// index exits with status 101 instead of reading or writing adjacent stack
-    /// memory. Off by default because it costs a compare and branch per index.
-    pub bounds_checks: bool,
+    /// Disable the bounds check before every runtime index. Checks are **on**
+    /// by default: an out-of-range `a[i]` / `v[i]` traps with exit status 101
+    /// and `rmc: index out of bounds`, matching rustc, instead of reading or
+    /// writing memory the program does not own. This flag is the explicit
+    /// unsafe opt-out; it exists for the rare program that has already proven
+    /// its indices in range and wants the compare and branch gone.
+    pub no_bounds_checks: bool,
     /// Skip the inlining pass. Inlining is on by default: it is what makes a
     /// call to a small accessor as cheap as the arithmetic it wraps.
     pub no_inline: bool,
@@ -58,7 +61,9 @@ pub struct CompileOptions {
 /// `src`.
 pub fn compile_to_asm(src: &str, opts: &CompileOptions) -> Result<String, String> {
     let toks = lexer::lex(src)?;
-    let mut prog = parser::Parser::new(toks).parse_program()?;
+    let mut prog = parser::Parser::new(toks)
+        .bounds_checks(!opts.no_bounds_checks)
+        .parse_program()?;
     sema::analyze(&mut prog)?;
     if !opts.no_inline {
         inline::run(&mut prog);
@@ -75,7 +80,7 @@ pub fn compile_to_asm(src: &str, opts: &CompileOptions) -> Result<String, String
     if opts.overflow_checks {
         cg = cg.overflow_checks();
     }
-    if opts.bounds_checks {
+    if !opts.no_bounds_checks {
         cg = cg.bounds_checks();
     }
     let user_asm = cg.compile(&prog);

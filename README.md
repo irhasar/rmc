@@ -110,7 +110,7 @@ rmc input.rs --binutils -o out     # assemble and link with `as`/`ld` instead
 rmc input.rs --binutils --no-strip -o out    # keep the symbol table
 rmc input.rs --binutils --min-size -o out    # drop the section headers too
 rmc input.rs --overflow-checks     # trap on i64 +,-,* overflow (exit 101)
-rmc input.rs --bounds-checks       # trap on an out-of-range array index (exit 101)
+rmc input.rs --no-bounds-checks    # drop the per-index bounds check (unsafe opt-out)
 rmc input.rs --no-inline           # disable inlining (on by default)
 rmc input.rs --no-licm             # disable loop-invariant code motion (on by default)
 rmc input.rs --no-tco              # disable self-recursion-to-loop (on by default)
@@ -274,7 +274,7 @@ python3 tools/fuzz.py --mode shift --n 500 --seed 1
 python3 tools/fuzz.py --mode semi --n 500 --seed 1
 python3 tools/fuzz.py --mode boolbit --n 500 --seed 1
 python3 tools/fuzz.py --mode localconst --n 500 --seed 1
-# also exercise the trap codegen: --bounds-checks and --overflow-checks runs
+# also exercise the trap codegen: --no-bounds-checks and --overflow-checks runs
 python3 tools/fuzz.py --mode stmt --n 500 --seed 1 --bounds --overflow
 python3 tools/fuzz.py --mode robust
 python3 tools/fuzz.py --mode reject
@@ -403,8 +403,9 @@ set of runtime builtins. A `str` and a `&str` are the same one-word value, so
 they coerce freely and a `&'static str` field or `&str` parameter may be
 written `str`. Structs and arrays may be passed to and returned from
 functions by value, or by reference to avoid the copy. Overflow checks are
-opt-in with `--overflow-checks`, and array bounds checks with
-`--bounds-checks`. See `docs/language.md` for the full grammar.
+opt-in with `--overflow-checks`; bounds checks are on by default, matching
+rustc, and `--no-bounds-checks` is the unsafe opt-out. See `docs/language.md`
+for the full grammar.
 
 Runtime builtins (provided by `src/runtime.rs`, no imports needed):
 
@@ -424,7 +425,7 @@ Runtime builtins (provided by `src/runtime.rs`, no imports needed):
 
 `bench/run.py` compares `rmc` against `rustc -O -C lto=fat -C codegen-units=1
 -C panic=abort -C strip=symbols` on twelve programs, with matching safety
-semantics: rmc is invoked with `--bounds-checks` and rustc with
+semantics: rmc checks bounds by default and rustc is invoked with
 `-C overflow-checks=off`, so both carry bounds checks and neither carries
 overflow checks (see below). The last two bracket the load spectrum: `light`
 runs a short, cache-resident loop (a few ms), `heavy` a ~1e9-iteration
@@ -541,15 +542,12 @@ neither can fold the answer at compile time.
 
 Two deliberate choices keep the comparison from flattering either side.
 
-* **Matching safety semantics.** rmc defaults bounds checks *off* and overflow
-  checks *off*; `rustc -O` keeps bounds checks *on* and overflow checks *off*.
-  A run with rmc's defaults would have rmc skip a per-index check rustc emits.
-  The harness closes the gap from the rmc side: `rmc --bounds-checks` and
-  `rustc -C overflow-checks=off`, so both builds carry bounds checks and
-  neither carries overflow checks. The check costs about 1% on the array-heavy
-  programs (`sieve` is the largest, and its run ratio barely moves), so the
-  choice does not manufacture any win; it removes a check rmc would otherwise
-  not pay for.
+* **Matching safety semantics.** rmc checks bounds by default and leaves
+  overflow checks *off*; `rustc -O` keeps bounds checks *on* and overflow checks
+  *off*. Both builds therefore carry bounds checks and neither carries overflow
+  checks (`rustc` is invoked with `-C overflow-checks=off` explicitly). The
+  check costs about 1% on the array-heavy programs (`sieve` is the largest, and
+  its run ratio barely moves), so it does not flatter either side.
 
 * **No `black_box` inside a hot loop.** rmc lowers `std::hint::black_box` to the
   identity (it has no optimiser that could elide the value anyway); rustc makes
@@ -666,10 +664,10 @@ rmc is a small, self-contained compiler, not a drop-in replacement for rustc.
   turn them off.
 - The backend targets x86-64 Linux only, using the System V ABI and raw Linux
   syscalls. There is no Windows, macOS, ARM, or WebAssembly support.
-- Array indexing is unchecked by default: an out-of-range index reads or writes
-  adjacent stack memory, exactly as in C. `--bounds-checks` inserts a check
-  before every index that traps with `rmc: index out of bounds` (exit 101); a
-  constant index is decided at compile time.
+- Array indexing is bounds-checked by default: an out-of-range index traps with
+  `rmc: index out of bounds` (exit 101), matching rustc. A constant index is
+  decided at compile time. `--no-bounds-checks` is an unsafe opt-out that reads
+  or writes adjacent stack memory, exactly as in C.
 - There is no stack probe and no stack-depth check in generated code, and rmc
   emits no stack-overflow guard. A function that recurses too deeply, or a
   program with a very large frame, runs off the end of the stack and dies with
@@ -695,35 +693,101 @@ rmc is a small, self-contained compiler, not a drop-in replacement for rustc.
 
 ## Roadmap
 
-What would move rmc from a serious toy toward something usable, roughly in order
-of value per unit of effort:
+The items below used to be split into "next steps" and a one-line "out of
+scope". That split was wrong: the goal is for `rmc` to replace `rustc` on real
+programs, and every item here is somewhere on the path to that. The tiers are
+therefore *ordering*, not permission — a trait system is further out than an
+`f64`, but it is still on the list. The only thing that stays a non-goal is
+becoming a second rustc: `rmc` keeps its "no LLVM, no crates, no libc, in-process
+link" identity at every tier.
+
+### Tier 1 — finish what already exists (highest value per unit of effort)
 
 1. **A real register allocator.** Spill temporaries now live in callee-saved
-   registers (see design.md). The recursion-to-loop pass already closed the gap
-   on the call-heavy benchmarks, but the calls that remain still pay argument
-   setup and register save/restore that a register allocator would shrink. A full
-   linear scan over live ranges would also let a dying temporary's register go to
-   a local born after it.
-2. **Borrowing.** `&T` / `&mut T` now exist: a reference is one word, so a
-   `&T` parameter or a `&self` receiver is passed by address rather than copied,
-   and `*r = v` writes through a reference (see language.md). What is missing is
-   the check — rmc does not prove a reference outlives its referent or that
-   `&mut` is exclusive, so an aliasing bug is a wrong answer, not a compile
-   error.
-3. **More types.** `u*`/`i*` widths are done (a suffixed literal is typed at
-   its width, with width-aware overflow). `f64` is the remaining scalar gap:
-   it needs the SSE register file and a floating-point calling convention, so it
-   is a larger change than a new integer width. **Slices** (`&[T]`, and the
-   slice literals and sub-slicing `&a[lo..hi]` that build them) are the other
-   large gap: a slice is a *fat* pointer (a data pointer plus a length), so it
-   needs a two-word value kind threaded through parameters, returns and
-   indexing, unlike the one-word `&T` and `str` rmc has today.
-4. **More backends.** A second target (ARM64 or a simple VM) would force the
-   code generator's assumptions out into the open.
-5. **Debug info.** Line tables so a debugger can point at source.
+   registers (see design.md). The recursion-to-loop pass closed the gap on the
+   call-heavy benchmarks, but the calls that remain still pay argument setup and
+   register save/restore that a register allocator would shrink. A full linear
+   scan over live ranges would also let a dying temporary's register go to a
+   local born after it.
+2. **Close the known correctness gaps.** These are wrong answers today, not
+   missing features, so they outrank any new syntax:
+   - `iter().sum()` over `[u8; n]` diverges from rustc (accumulator width).
+   - `for x in [1, 2, 3].iter()` — an array-literal chain head is rejected.
+   - **`Vec<T>` with an aggregate element.** `v[i]` where the element is a
+     struct or enum was rejected with "cannot cast Struct to I64": the index
+     lowering hardcoded the element type to `i64` and only the *width* was
+     recorded at the binding, so an aggregate element was mis-typed, and the
+     parser's own size pass disagreed with sema on any struct holding a
+     `u8`/`i8`, array, tuple, enum or nested-struct field, mis-scaling the
+     stride. Both are now fixed: the element *type* is carried through the
+     index lowering, sema and codegen, and the stride comes from sema's own
+     `resolve_layouts` so the two can never disagree (`tests/cases/vecstruct.rs`,
+     `vecfield.rs`).
+3. **Borrowing, the check half.** `&T` / `&mut T` exist: a reference is one word,
+   so a `&T` parameter or a `&self` receiver is passed by address rather than
+   copied, and `*r = v` writes through a reference (see language.md). What is
+   missing is the check — `rmc` does not prove a reference outlives its referent
+   or that `&mut` is exclusive, so an aliasing bug is a wrong answer, not a
+   compile error. A real (even if simple) borrow checker is what lets the
+   optimiser speculate through a reference without the provenance pre-pass.
 
-Anything involving borrowing, generics or the trait system is out of scope: it
-would make rmc a different project rather than a better one.
+### Tier 2 — the remaining scalar and aggregate types
+
+4. **`f64` / `f32`.** The last scalar gap. It needs the SSE register file and a
+   floating-point calling convention, so it is a larger change than a new
+   integer width: a `Float` type kind, a separate register class in the code
+   generator, `movsd`/`addsd`-family emission, the `xmm` argument registers in
+   the System V classifier, and the float half of the integer methods
+   (`abs`, `min`, `max`, `is_nan`, formatting). It also unlocks the arithmetic
+   that most real numeric code assumes.
+5. **Slices (`&[T]`).** A slice is a *fat* pointer (a data pointer plus a
+   length), so it needs a two-word value kind threaded through parameters,
+   returns and indexing, unlike the one-word `&T` and `str` today. It is the
+   other large aggregate gap, and it is what makes `&v[..]`, `&a[lo..hi]` and
+   `fn f(xs: &[i64])` work — the shapes almost every non-trivial function uses.
+6. **`u128` / `i128`.** Currently collapsed to `i64`. A real 128-bit kind needs a
+   two-register representation and the multiply/divide helpers.
+
+### Tier 3 — generics, traits, closures, modules
+
+These are what separate "a subset with structs and enums" from "Rust". They are
+ordered here because each is a large, cross-cutting change.
+
+7. **Modules and `use`.** `mod`, `use`, paths and visibility. Mostly a front-end
+   change (name resolution over a tree rather than a flat program), but it gates
+   multi-file programs and any real standard-library surface.
+8. **Generics (monomorphisation).** A generic function or struct is a template
+   instantiated per concrete type. With no trait bounds this is "substitute the
+   type and re-check the body"; the work is in the name/type representation and
+   in keeping monomorphisation bounded.
+9. **Traits and `impl` blocks with bounds.** The core of Rust's abstraction.
+   Starts with inherent `impl` (already present) plus a static-dispatch subset
+   (trait objects deferred), then method resolution and coherence.
+10. **Closures.** A closure is a function plus captured state. The parser already
+    rejects `|x| ...`; supporting it means an anonymous struct for captures, a
+    callable-representation decision, and interaction with the trait work above
+    (closures desugar to `Fn`/`FnMut`/`FnOnce` impls).
+11. **The `?` operator.** Small on its own (`Try` over `Option`/`Result`), but it
+    belongs with the trait work because a general `?` is `Try`.
+12. **A usable standard-library surface.** Beyond today's two `std` paths, the
+    `Vec` shims and `String`: `format!`, the iterator adapters
+    (`map`/`filter`/`fold`/`enumerate`/...), `HashMap`, `fs`/`io`, and the
+    `println!`/`format!` formatting machinery. Each is a runtime addition, not
+    just front-end work.
+
+### Tier 4 — infrastructure
+
+13. **More backends.** A second target (ARM64 or a simple VM) would force the
+    code generator's assumptions out into the open.
+14. **Debug info.** Line tables so a debugger can point at source.
+15. **Incremental compilation and a module cache.** Today every compile is from
+    scratch; a cache would matter once programs are large enough that the
+    ~1.5 ms floor is no longer the whole story.
+
+The through-line: Tier 1 makes the existing subset *correct*, Tier 2 makes it
+*complete* for scalar and aggregate types, Tier 3 makes it *Rust*, and Tier 4
+makes it *practical*. None of it requires giving up the no-LLVM, no-libc,
+in-process-link design that is the point of the experiment.
 
 ## License
 

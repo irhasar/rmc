@@ -69,6 +69,7 @@ _start:
     },
     Piece {
         text: r#"
+.text
 # long __rmc_arg_parse(const char *s)  -- parse a whole C string as a signed
 # decimal integer, as `str::parse::<i64>()` does. On success returns the value
 # and leaves `%rdx` zero; on failure (empty, no digits, a non-digit byte, or a
@@ -145,6 +146,7 @@ __rmc_arg_parse:
     },
     Piece {
         text: r#"
+.text
 # long arg_i64(long idx)  -- parse argv[idx] as a signed decimal integer.
 # Returns 0 when the index is out of range or the text is not an integer. Used
 # by benchmarks so the input is opaque to the compiler and cannot be
@@ -176,6 +178,7 @@ arg_i64:
     },
     Piece {
         text: r#"
+.text
 # long __rmc_arg_or(long idx, long default, long missing, long parse)
 #   -- the value of argv[idx] when `idx` names a present, whole integer;
 #      otherwise `default`, unless the corresponding failure is required.
@@ -233,6 +236,7 @@ __rmc_arg_or:
     },
     Piece {
         text: r#"
+.text
 # long __rmc_nargs(void)  -- the argument count. The `for v in &args` desugar
 # bounds its loop by this, so an args-vector is never materialised.
 .globl __rmc_nargs
@@ -246,6 +250,7 @@ __rmc_nargs:
     },
     Piece {
         text: r#"
+.text
 # long __rmc_fill(long addr, long count, long elem)  -- store `elem` at each of
 # `count` words from `addr`; returns `addr`. Backs the `vec![e; n]` desugar.
 .globl __rmc_fill
@@ -266,6 +271,7 @@ __rmc_fill:
     },
     Piece {
         text: r#"
+.text
 # long __rmc_fill_bytes(long addr, long count, long elem)  -- store the low byte
 # of `elem` at each of `count` bytes from `addr`; returns `addr`. Backs the
 # `vec![0u8; n]` desugar, whose elements are one byte wide. A `rep stosb` fill
@@ -289,6 +295,7 @@ __rmc_fill_bytes:
     },
     Piece {
         text: r#"
+.text
 # long __rmc_min(long a, long b)  -- the smaller of two signed words. Backs the
 # `skip`/`take` range adapters' count, where it caps the number of iterations at
 # the range length. Signed compare, since a range length is never negative but
@@ -308,6 +315,7 @@ __rmc_min:
     },
     Piece {
         text: r#"
+.text
 # void exit(long code)
 .globl exit
 .type exit, @function
@@ -320,6 +328,7 @@ exit:
     },
     Piece {
         text: r#"
+.text
 # LLVM lowers a wide zero/byte initialisation (`[0i64; 512]`, a large struct
 # literal) to a `memset` call rather than an inline loop, so the same source
 # that rmc compiles to a `rep stos` reaches the linker as an undefined symbol.
@@ -396,6 +405,7 @@ memcmp:
     },
     Piece {
         text: r#"
+.text
 # void print_i64(long n)  -- decimal value followed by a newline
 .globl print_i64
 .type print_i64, @function
@@ -441,6 +451,7 @@ print_i64:
     },
     Piece {
         text: r#"
+.text
 # void print_str(long ptr)  -- ptr points at a {len: i64, bytes...} record
 .globl print_str
 .type print_str, @function
@@ -468,6 +479,7 @@ print_str:
     },
     Piece {
         text: r#"
+.text
 # void __rmc_write_i64(long n)  -- decimal value, no trailing newline
 .globl __rmc_write_i64
 .type __rmc_write_i64, @function
@@ -512,6 +524,7 @@ __rmc_write_i64:
     },
     Piece {
         text: r#"
+.text
 # void __rmc_write_u64(unsigned long n)  -- unsigned decimal, no trailing newline
 .globl __rmc_write_u64
 .type __rmc_write_u64, @function
@@ -544,6 +557,7 @@ __rmc_write_u64:
     },
     Piece {
         text: r#"
+.text
 # void __rmc_write_bool(bool b)  -- `true` or `false`, no trailing newline
 .globl __rmc_write_bool
 .type __rmc_write_bool, @function
@@ -580,6 +594,7 @@ __rmc_write_bool:
     },
     Piece {
         text: r#"
+.text
 # void __rmc_write_str(long ptr)  -- ptr points at a {len: i64, bytes...} record,
 # written with no trailing newline (unlike print_str)
 .globl __rmc_write_str
@@ -600,6 +615,7 @@ __rmc_write_str:
     },
     Piece {
         text: r#"
+.text
 # void __rmc_write_char(long c)  -- c is a Unicode scalar value, written as its
 # UTF-8 bytes with no trailing newline (like `{}` for a `char`).
 .globl __rmc_write_char
@@ -678,6 +694,7 @@ __rmc_write_char:
     },
     Piece {
         text: r#"
+.text
 # void print_char(char c)  -- the character written as UTF-8 bytes followed by
 # a newline, the char analogue of print_i64/print_bool.
 .globl print_char
@@ -701,6 +718,7 @@ print_char:
     },
     Piece {
         text: r#"
+.text
 # bool __rmc_str_lt(long a, long b)  -- a and b point at {len: i64, bytes...}
 # records. Returns 1 when the byte string a is lexicographically less than b,
 # 0 otherwise. A `str` value is the address of its record, so a string
@@ -747,6 +765,7 @@ __rmc_str_lt:
     },
     Piece {
         text: r#"
+.text
 # long __rmc_str_len(long s)  -- the byte length of the string record at `s`,
 # which is `{len: i64, bytes...}`. A `str` value is the address of its record,
 # so `s.len()` is the record's first word; sema lowers it to a call here.
@@ -761,6 +780,7 @@ __rmc_str_len:
     },
     Piece {
         text: r#"
+.text
 # long __rmc_str_starts(long s, long pre)  -- 1 when the bytes of `pre` are a
 # prefix of `s`, 0 otherwise. Both are `{len: i64, bytes...}` records, so a
 # prefix is `pre.len <= s.len` and the first `pre.len` bytes equal.
@@ -795,6 +815,7 @@ __rmc_str_starts:
     },
     Piece {
         text: r#"
+.text
 # long __rmc_str_ends(long s, long suf)  -- 1 when the bytes of `suf` are a
 # suffix of `s`, 0 otherwise. Both are `{len: i64, bytes...}` records, so a
 # suffix is `suf.len <= s.len` and the last `suf.len` bytes equal.
@@ -832,6 +853,7 @@ __rmc_str_ends:
     },
     Piece {
         text: r#"
+.text
 # long __rmc_str_find(long s, long needle)  -- the byte index of the first
 # occurrence of `needle`'s bytes inside `s`, or -1 when absent. Both are
 # `{len: i64, bytes...}` records. An empty needle matches at index 0.
@@ -881,6 +903,7 @@ __rmc_str_find:
     },
     Piece {
         text: r#"
+.text
 # void print_bool(bool b)  -- prints 0 or 1 followed by a newline
 .globl print_bool
 .type print_bool, @function
@@ -906,6 +929,7 @@ print_bool:
     },
     Piece {
         text: r#"
+.text
 # void putchar(long c)
 .globl putchar
 .type putchar, @function
@@ -927,6 +951,7 @@ putchar:
     },
     Piece {
         text: r#"
+.text
 # long alloc(long n)  -- first-fit block from the free list, else carve from the
 # arena, else mmap a fresh chunk. Returns a pointer with room for `n` bytes.
 # Layout of a block: [size: 8 bytes][payload ...]; the pointer handed out points
@@ -1015,6 +1040,7 @@ alloc:
     },
     Piece {
         text: r#"
+.text
 # void free(long p)  -- return a block to the free list, keeping the list
 # address-ordered so adjacent blocks can be coalesced.
 .globl free
@@ -1084,6 +1110,35 @@ free:
     Piece {
         text: r#"
 .text
+# void __rmc_cap_overflow(void)  -- a `Vec`/`String` constructor or grow was
+# asked for a capacity whose byte size does not fit (a negative capacity read
+# as `usize`, or `count * width` overflowing `i64`). The byte count is computed
+# by signed `imul`, so it is negative exactly when the true product overflows or
+# the input was negative; without this check the request would wrap to a small
+# positive size and the header/store would then be written past the allocation.
+# Write a fixed message and exit with status 101, mirroring a Rust panic.
+.globl __rmc_cap_overflow
+.type __rmc_cap_overflow, @function
+__rmc_cap_overflow:
+    mov $1, %rax
+    mov $2, %rdi             # stderr, like a Rust panic
+    lea __rmc_cap_overflow_msg(%rip), %rsi
+    mov $__rmc_cap_overflow_len, %rdx
+    syscall
+    mov $101, %rdi
+    mov $60, %rax
+    syscall
+.size __rmc_cap_overflow, .-__rmc_cap_overflow
+
+.section .rodata
+__rmc_cap_overflow_msg: .ascii "rmc: capacity overflow\n"
+.set __rmc_cap_overflow_len, . - __rmc_cap_overflow_msg
+"#,
+        defines: &["__rmc_cap_overflow", "__rmc_cap_overflow_msg", "__rmc_cap_overflow_len"],
+    },
+    Piece {
+        text: r#"
+.text
 # ---- growable `Vec<T>` helpers ----
 # A `Vec<T>` value is the address of its element store, exactly as before, so
 # `.as_ptr()`/`.add(off)` and element indexing stay plain pointer arithmetic.
@@ -1103,8 +1158,11 @@ __rmc_vec_new:
     sub $8, %rsp              # keep %rsp 16-byte aligned at the `call`
     mov %rdi, %r12            # capacity
     mov %rsi, %r13            # element width
+    test %r12, %r12
+    js __rmc_cap_overflow     # a negative capacity (a huge `usize`) would wrap
     mov %r12, %rdi
     imul %r13, %rdi           # bytes = capacity * width
+    jo __rmc_cap_overflow     # the byte size overflowed 64 bits
     add $16, %rdi             # plus the length/capacity header
     call alloc
     mov %rax, %rbx
@@ -1131,15 +1189,33 @@ __rmc_vec_repeat:
     sub $8, %rsp
     mov %rdi, %r12            # count
     mov %rsi, %r13            # value
-    mov %rdx, %r14            # element width
+    mov %rdx, %r14            # element width (negative marks an aggregate)
+    # Normalise the width to its byte size and record whether the element is an
+    # aggregate (its value is then an address, copied inline) in the stack
+    # scratch, so the alloc sizing and the fill below both see a positive width.
+    mov %r14, %rax
+    test %rax, %rax
+    jns .Lvec_rep_scalar
+    neg %r14
+    mov $1, %rax
+    jmp .Lvec_rep_flag
+.Lvec_rep_scalar:
+    xor %eax, %eax
+.Lvec_rep_flag:
+    mov %rax, (%rsp)
     mov %r12, %rdi
+    test %r12, %r12
+    js __rmc_cap_overflow       # a negative count would wrap
     imul %r14, %rdi
+    jo __rmc_cap_overflow       # the byte size overflowed 64 bits
     add $16, %rdi
     call alloc
     mov %rax, %rbx
     mov %r12, (%rbx)          # length = count
     mov %r12, 8(%rbx)         # capacity = count
     lea 16(%rbx), %r15        # data
+    cmpq $0, (%rsp)
+    jne .Lvec_rep_agg
     mov %r15, %rdi
     mov %r12, %rsi
     mov %r13, %rdx
@@ -1149,6 +1225,36 @@ __rmc_vec_repeat:
     jmp .Lvec_rep_done
 .Lvec_rep_word:
     call __rmc_fill           # a word element fills `count` words
+    jmp .Lvec_rep_done
+.Lvec_rep_agg:
+    # An aggregate element repeats inline: store the source element, then copy
+    # it forward over itself so the whole run ends up filled (a doubling
+    # memcpy). `%r13` is the source element's address.
+    test %r12, %r12
+    jle .Lvec_rep_done
+    mov %r15, %rdi
+    mov %r13, %rsi
+    mov %r14, %rcx
+    rep movsb                 # element 0
+    mov $1, %r8               # elements written
+.Lvec_rep_agg_loop:
+    cmp %r12, %r8
+    jae .Lvec_rep_done
+    mov %r12, %rcx
+    sub %r8, %rcx             # remaining
+    cmp %r8, %rcx
+    jbe .Lvec_rep_agg_n
+    mov %r8, %rcx             # copy `min(written, remaining)` elements
+.Lvec_rep_agg_n:
+    mov %r15, %rdi            # dst = data + written * width
+    mov %r8, %rax
+    imul %r14, %rax
+    add %rax, %rdi
+    mov %r15, %rsi            # src = data
+    imul %r14, %rcx           # bytes to copy
+    rep movsb
+    add %r8, %r8              # written *= 2
+    jmp .Lvec_rep_agg_loop
 .Lvec_rep_done:
     mov %r15, %rax
     add $8, %rsp
@@ -1174,7 +1280,20 @@ __rmc_vec_push:
     sub $8, %rsp
     mov %rdi, %rbx            # vec
     mov %rsi, %r13            # value
-    mov %rdx, %r14            # element width
+    mov %rdx, %r14            # element width (negative marks an aggregate)
+    # Normalise the width to its byte size and record whether the element is an
+    # aggregate (its value is then an address, copied inline) in the stack
+    # scratch, so the growth sizing below sees a positive width.
+    mov %r14, %rax
+    test %rax, %rax
+    jns .Lvec_push_scalar
+    neg %r14
+    mov $1, %rax
+    jmp .Lvec_push_flag
+.Lvec_push_scalar:
+    xor %eax, %eax
+.Lvec_push_flag:
+    mov %rax, (%rsp)
     mov -16(%rbx), %r12       # length
     mov -8(%rbx), %r15        # capacity
     cmp %r15, %r12
@@ -1203,13 +1322,8 @@ __rmc_vec_push:
     imul %r14, %rcx           # bytes to copy = length * width
     test %rcx, %rcx
     jz .Lvec_push_installed
-.Lvec_push_copy:
-    mov (%rsi), %dl
-    mov %dl, (%r10)
-    inc %rsi
-    inc %r10
-    dec %rcx
-    jnz .Lvec_push_copy
+    mov %r10, %rdi            # rep movsb copies rcx bytes from rsi to rdi
+    rep movsb
 .Lvec_push_installed:
     mov %r12, (%r9)           # length
     mov %r15, 8(%r9)          # capacity
@@ -1218,12 +1332,23 @@ __rmc_vec_push:
     mov %r12, %rax
     imul %r14, %rax           # offset = length * width
     add %rbx, %rax
+    cmpq $0, (%rsp)
+    jne .Lvec_push_agg
     cmp $8, %r14
+    ja .Lvec_push_agg
     je .Lvec_push_word
     mov %r13b, (%rax)         # a narrow element stores its low byte
     jmp .Lvec_push_inc
 .Lvec_push_word:
     mov %r13, (%rax)
+    jmp .Lvec_push_inc
+.Lvec_push_agg:
+    # An aggregate element is copied in full from the source address the caller
+    # passed in `%r13`; the element spans `%r14` bytes.
+    mov %rax, %rdi            # dst
+    mov %r13, %rsi            # src
+    mov %r14, %rcx            # width bytes
+    rep movsb
 .Lvec_push_inc:
     inc %r12
     mov %r12, -16(%rbx)       # length += 1
@@ -1261,6 +1386,29 @@ __rmc_vec_cap:
     },
     Piece {
         text: r#"
+.text
+# rdi = vector, rsi = index, rdx = element stride  ->  rax = element address.
+# The checked `v[i]`: reads the length from the header just before the store and
+# traps (like a Rust panic) when the index is out of range, so a bad index can
+# never read or write past the allocation. An unsigned `jae` also catches a
+# negative index, which is an enormous unsigned value. Only linked when a
+# `--bounds-checks` build lowers a `Vec` index through it.
+.globl __rmc_vec_at
+.type __rmc_vec_at, @function
+__rmc_vec_at:
+    mov -16(%rdi), %rax       # length
+    cmp %rax, %rsi
+    jae __rmc_bounds
+    imul %rdx, %rsi           # index * stride
+    lea (%rdi,%rsi), %rax
+    ret
+.size __rmc_vec_at, .-__rmc_vec_at
+"#,
+        defines: &["__rmc_vec_at"],
+    },
+    Piece {
+        text: r#"
+.text
 # A `String` is a growable heap byte buffer. Its *value* is the address of a
 # `{len, bytes}` record, exactly what a `str` is, so `s.as_str()` is the value
 # itself and every `str` helper (`__rmc_str_len`, `__rmc_write_str`,
@@ -1278,6 +1426,8 @@ __rmc_str_new:
     push %rbx
     sub $16, %rsp
     mov %rdi, %rbx            # capacity
+    test %rbx, %rbx
+    js __rmc_cap_overflow     # a negative capacity (a huge `usize`) would wrap
     lea 16(%rdi), %rdi        # bytes = capacity + {cap, len}
     call alloc
     mov %rbx, (%rax)          # capacity
@@ -1876,6 +2026,7 @@ __rmc_rotate_right:
     },
     Piece {
         text: r#"
+.text
 # void __rmc_write(long ptr, long len)  -- write `len` bytes at `ptr` to
 # stdout, no newline. This is the primitive the `core::fmt` lowering uses to
 # emit a literal run; unlike `print_str` it neither prefixes a length word nor
@@ -1895,6 +2046,7 @@ __rmc_write:
     },
     Piece {
         text: r#"
+.text
 # void __rmc_print(long a)  -- the sink for `print!`/`println!`. `a` is the
 # address of a `core::fmt::Arguments` {template: ptr, args: ptr}. When the low
 # bit of `args` is set the value came from `Arguments::from_str`, which is what
@@ -2076,6 +2228,7 @@ __rmc_write_template:
     },
     Piece {
         text: r#"
+.text
 # void __rmc_panic(long msg)  -- the `panic!`/`todo!`/`unreachable!` sink. A
 # freestanding program has no unwinder, so it writes a fixed diagnostic to
 # stderr and exits non-zero, which is the observable behaviour of
@@ -2102,6 +2255,7 @@ __rmc_panic_msg: .ascii "panicked\n"
     },
     Piece {
         text: r#"
+.text
 # int __rmc_compare_bytes(const u8 *a, const u8 *b, usize n)  -- the
 # `compare_bytes` intrinsic `str`/`[u8]` equality lowers to. rmc represents a
 # string literal as the address of a `{len: i64, bytes..}` record and the
@@ -2134,6 +2288,7 @@ __rmc_compare_bytes:
     },
     Piece {
         text: r#"
+.text
 # bool __rmc_slice_starts_with(const u8 *a, const u8 *b)  -- `[u8]::starts_with`,
 # the byte-slice predicate `str::starts_with` inlines to. Both operands are the
 # addresses of `{len: i64, bytes..}` records (rmc's `&[u8]`), so word 0 of each
@@ -3348,6 +3503,7 @@ __rmc_utf8_encode:
     },
     Piece {
         text: r#"
+.text
 # long __rmc_imin(long a, long b) / __rmc_imax  -- signed
 # long __rmc_umin(long a, long b) / __rmc_umax  -- unsigned
 # `a.min(b)` and `a.max(b)` on an integer lower to `<T as Ord>::min`/`max`,
@@ -3785,5 +3941,28 @@ mod tests {
         assert!(r.contains("cmp %rsi, %rdi"), "direction compared:\n{r}");
         assert!(r.contains("std"), "backwards copy uses `std`:\n{r}");
         assert!(r.contains("cld"), "direction flag cleared:\n{r}");
+    }
+    fn every_piece_names_its_own_section() {
+        // A piece must set its own section, so any subset concatenates into a
+        // valid unit. A function piece that omits `.text` inherits whatever
+        // section the previous piece left current (for example `.rodata`),
+        // landing code in a non-executable section: a trap handler or helper
+        // assembled there faults at run time instead of running.
+        for p in PIECES {
+            let first = p
+                .text
+                .lines()
+                .map(str::trim_start)
+                .find(|l| !l.is_empty() && !l.starts_with('#'))
+                .expect("every piece has a body");
+            assert!(
+                first.starts_with(".text")
+                    || first.starts_with(".section")
+                    || first.starts_with(".data")
+                    || first.starts_with(".rodata")
+                    || first.starts_with(".bss"),
+                "a piece must name its own section, got: {first:?}"
+            );
+        }
     }
 }

@@ -3355,16 +3355,30 @@ fn a_return_before_unreachable_statements_is_accepted() {
 }
 
 #[test]
-fn bounds_checks_are_off_by_default() {
+fn bounds_checks_are_on_by_default() {
+    // A variable index is checked without any flag: rustc bounds-checks every
+    // index, so rmc must too, or a program it accepts reads memory it does not
+    // own.
     let out = asm("fn main() -> i64 { let a: [i64; 2] = [1, 2]; let i: i64 = 0; return a[i]; }");
-    assert!(!out.contains("jae __rmc_bounds"), "no check without the flag");
+    assert!(out.contains("jae __rmc_bounds"), "a check is emitted by default");
+}
+
+#[test]
+fn no_bounds_checks_removes_the_check() {
+    // The explicit unsafe opt-out still exists.
+    let out = compile_to_asm(
+        "fn main() -> i64 { let a: [i64; 2] = [1, 2]; let i: i64 = 0; return a[i]; }",
+        &CompileOptions { no_bounds_checks: true, ..Default::default() },
+    )
+    .unwrap();
+    assert!(!out.contains("jae __rmc_bounds"), "the opt-out drops the check");
 }
 
 #[test]
 fn bounds_checks_guard_a_variable_index() {
     let out = compile_to_asm(
         "fn main() -> i64 { let a: [i64; 2] = [1, 2]; let i: i64 = 0; return a[i]; }",
-        &CompileOptions { bounds_checks: true, ..Default::default() },
+        &CompileOptions::default(),
     )
     .unwrap();
     assert!(out.contains("cmp $2, %rax"), "compares the index to the length");
@@ -3377,7 +3391,7 @@ fn a_constant_index_out_of_range_is_a_compile_error() {
     // runtime bounds checks, exactly as rustc rejects it (E0080/E0608). This is
     // the soundness-relevant direction: a program rmc accepts must not read
     // memory it does not own.
-    for opts in [CompileOptions::default(), CompileOptions { bounds_checks: true, ..Default::default() }] {
+    for opts in [CompileOptions::default(), CompileOptions { no_bounds_checks: true, ..Default::default() }] {
         let err = compile_to_asm(
             "fn main() -> i64 { let a: [i64; 2] = [1, 2]; return a[5]; }",
             &opts,
@@ -3402,7 +3416,7 @@ fn bounds_checks_guard_a_loop_expression_base() {
     let out = compile_to_asm(
         "fn f(i: i64) -> i64 { let a: [i64; 3] = [1, 2, 3]; return loop { break a; }[i]; } \
          fn main() -> i64 { return f(9); }",
-        &CompileOptions { bounds_checks: true, ..Default::default() },
+        &CompileOptions::default(),
     )
     .unwrap();
     assert!(out.contains("cmp $3, %rax"), "compares to the loop's array length:\n{out}");
@@ -3462,7 +3476,7 @@ fn a_unit_break_still_evaluates_its_value_expression() {
 fn bounds_checks_leave_an_in_range_constant_alone() {
     let out = compile_to_asm(
         "fn main() -> i64 { let a: [i64; 2] = [1, 2]; return a[1]; }",
-        &CompileOptions { bounds_checks: true, ..Default::default() },
+        &CompileOptions::default(),
     )
     .unwrap();
     assert!(!out.contains("jae __rmc_bounds"), "an in-range constant needs no check");
@@ -3478,7 +3492,7 @@ fn bounds_checks_guard_a_block_base() {
     let out = compile_to_asm(
         "fn f(i: i64) -> i64 { let v: i64 = { let t: [i64; 3] = [1; 3]; t }[i]; return v; } \
          fn main() -> i64 { return f(9); }",
-        &CompileOptions { bounds_checks: true, ..Default::default() },
+        &CompileOptions::default(),
     )
     .unwrap();
     assert!(out.contains("cmp $3, %rax"), "compares to the block's array length");
@@ -3494,7 +3508,7 @@ fn bounds_checks_guard_a_runtime_index_on_a_non_local_base() {
         "fn make() -> [i64; 3] { let a: [i64; 3] = [1; 3]; return a; } \
          fn f(i: i64) -> i64 { return make()[i]; } \
          fn main() -> i64 { return f(10); }",
-        &CompileOptions { bounds_checks: true, ..Default::default() },
+        &CompileOptions::default(),
     )
     .unwrap();
     assert!(out.contains("cmp $3, %rax"), "compares to the array length");
@@ -3508,7 +3522,7 @@ fn the_bounds_handler_is_in_an_executable_section() {
     let out = compile_to_asm(
         "fn f(i: i64) -> i64 { let v: i64 = { let t: [i64; 3] = [1; 3]; t }[i]; return v; } \
          fn main() -> i64 { return f(9); }",
-        &CompileOptions { bounds_checks: true, ..Default::default() },
+        &CompileOptions::default(),
     )
     .unwrap();
     let at = out.find(".globl __rmc_bounds").expect("handler present");
@@ -3531,7 +3545,7 @@ fn a_base_with_side_effects_runs_before_the_bounds_trap() {
         "fn make() -> [i64; 1] { print_i64(7); return [4]; } \
          fn f(i: i64) -> i64 { return make()[i]; } \
          fn main() -> i64 { return f(2); }",
-        &CompileOptions { bounds_checks: true, ..Default::default() },
+        &CompileOptions::default(),
     )
     .unwrap();
     let call = out.find("call make").expect("the base call is emitted");
@@ -3766,14 +3780,12 @@ fn a_very_long_operator_chain_is_an_error_not_a_crash() {
 #[test]
 fn nesting_below_the_limit_still_compiles() {
     // 30 parens (2 depth each) plus a 30-long `+` chain is ~90, under the 100
-    // limit, so this must still compile. The recursive descent uses a large
-    // frame per level in a debug build, so run it on the big test stack like
-    // the other deep-nesting cases; the default 2 MiB test thread is not
-    // enough.
-    with_big_stack(|| {
-        let src = format!("fn main() -> i64 {{ return {}1{} + {}; }}", "(".repeat(30), ")".repeat(30), "1+".repeat(30) + "1");
-        assert!(compile_to_asm(&src, &CompileOptions::default()).is_ok());
-    });
+    // limit, so this must still compile. Like the two depth-limit tests above,
+    // it drives the parser near its limit, so it needs the large stack: a debug
+    // parser costs about 10 KiB per level, which the default test thread cannot
+    // hold.
+    let src = format!("fn main() -> i64 {{ return {}1{} + {}; }}", "(".repeat(30), ")".repeat(30), "1+".repeat(30) + "1");
+    assert!(with_big_stack(move || compile_to_asm(&src, &CompileOptions::default()).is_ok()));
 }
 
 #[test]
@@ -8518,6 +8530,49 @@ fn vec_push_calls_the_grow_helper_and_writes_the_address_back() {
 }
 
 #[test]
+fn vec_push_rejects_a_different_aggregate_of_the_same_size() {
+    // `P` and `Q` are both two words, so a size-only check cannot tell them
+    // apart. The parser records the declared element type on the call and sema
+    // compares it: storing a `Q` in a `Vec<P>` would otherwise be accepted and
+    // a later `v[i].y` would read `Q`'s padding as `P::y`.
+    let err = compile_to_asm(
+        "struct P { x: i64, y: i64 } struct Q { x: i64, y: i64 } \
+         fn main() { let mut v: Vec<P> = Vec::new(); v.push(Q { x: 1, y: 2 }); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("__rmc_vec_push"), "got: {err}");
+    assert!(err.contains("expected an element of type"), "got: {err}");
+}
+
+#[test]
+fn vec_push_rejects_a_scalar_into_an_aggregate_vector() {
+    // The converse of the same confusion: an `i64` is one word and a `Vec<P>`
+    // element is two, so the size check catches it, but the element-type check
+    // reports it before any layout arithmetic runs.
+    let err = compile_to_asm(
+        "struct P { x: i64, y: i64 } \
+         fn main() { let mut v: Vec<P> = Vec::new(); v.push(7); }",
+        &CompileOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("__rmc_vec_push"), "got: {err}");
+}
+
+#[test]
+fn vec_push_accepts_the_matching_aggregate_element() {
+    // The same shape with the right element type must still compile, so the
+    // check rejects only a mismatch.
+    assert!(compile_to_asm(
+        "struct P { x: i64, y: i64 } \
+         fn main() { let mut v: Vec<P> = Vec::new(); v.push(P { x: 1, y: 2 }); \
+         let p = v[0]; let _ = p.x; }",
+        &CompileOptions::default(),
+    )
+    .is_ok());
+}
+
+#[test]
 fn string_new_and_from_call_the_string_helpers() {
     // `String::new()`/`with_capacity(k)` allocate an empty buffer through
     // `__rmc_str_new`, and `String::from("lit")` copies the literal through
@@ -8594,11 +8649,24 @@ fn an_unsupported_string_constructor_is_rejected() {
 
 #[test]
 fn vec_index_is_scaled_pointer_arithmetic() {
-    // `v[i]` on a `Vec<i64>` is `*(v + i * 8)`, one scaling `lea` and a load,
-    // not a method call.
-    let out = asm("fn main() { let v: Vec<i64> = vec![1, 2, 3]; let _ = v[2]; }");
+    // With the check off (`--no-bounds-checks`), `v[i]` on a `Vec<i64>` is
+    // `*(v + i * 8)`, one scaling `lea` and a load, not a method call.
+    let out = compile_to_asm(
+        "fn main() { let v: Vec<i64> = vec![1, 2, 3]; let _ = v[2]; }",
+        &CompileOptions { no_bounds_checks: true, ..Default::default() },
+    )
+    .unwrap();
     assert!(out.contains("lea 0(,%rax,8), %rax"), "the index scales by eight:\n{out}");
     assert!(out.contains("(%rax)"), "the element is loaded through the address:\n{out}");
+}
+
+#[test]
+fn vec_index_is_checked_by_default() {
+    // By default a `Vec` index goes through `__rmc_vec_at`, which compares the
+    // index against the live length and traps out of range. rustc bounds-checks
+    // every index, so the unchecked lowering must not be the default.
+    let out = asm("fn main() { let v: Vec<i64> = vec![1, 2, 3]; let _ = v[2]; }");
+    assert!(out.contains("call __rmc_vec_at"), "the checked accessor is called:\n{out}");
 }
 
 #[test]

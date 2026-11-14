@@ -424,8 +424,9 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   assembler" below before adding an instruction or a codegen form.
 - `compiler/src/main.rs` — CLI: reads source, calls the library, writes the ELF.
   Flags: `--emit-asm`, `--keep-asm`, `--binutils`, `--no-strip`, `--min-size`,
-  `--overflow-checks`, `--bounds-checks`, `--no-inline`, `--no-licm`,
-  `--no-tco`.
+  `--overflow-checks`, `--no-bounds-checks`, `--no-inline`, `--no-licm`,
+  `--no-tco`. (`--bounds-checks` is accepted and ignored: bounds checks are on
+  by default.)
 - `compiler/tests/compile.rs` — unit tests for the front end and codegen; these
   run without `as`/`ld`.
 
@@ -1050,10 +1051,27 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   order initializer side effects run in.
 - **A bounds check sees through a reference to an array.** `array_len_of` /
   `array_len_ty` unwrap an `Expr::Ref` base, so `let r: &[i64; 3] = &a; r[i]`
-  traps on an out-of-range `i` under `--bounds-checks` instead of reading
-  adjacent memory. A field store through a shared `&T` is rejected by
-  `place_writable` ("cannot assign through a shared reference; use `&mut`"), and
-  a `&mut` binding itself is not reassignable unless declared `mut`.
+  traps on an out-of-range `i` by default instead of reading adjacent memory. A
+  field store through a shared `&T` is rejected by `place_writable` ("cannot
+  assign through a shared reference; use `&mut`"), and a `&mut` binding itself
+  is not reassignable unless declared `mut`.
+- **Bounds checks are on by default and cover `v[i]` on a `Vec`, not just a
+  fixed array.** An array's length is static, so `check_bounds` folds it in
+  codegen; a `Vec`'s length is a runtime header word, so the parser lowers
+  `v[i]` through `__rmc_vec_at(vector, index, stride)`, which reads the live
+  length and traps (`jae __rmc_bounds`) before forming the address. `rmc` used to
+  leave `v[i]` as plain pointer arithmetic unless `--bounds-checks` was passed,
+  so an out-of-range index read or wrote past the store with exit 0 where rustc
+  panics - a silent out-of-bounds read (CWE-125). Now the check is the default,
+  matching rustc, and `--no-bounds-checks` is the explicit unsafe opt-out. The
+  index is evaluated exactly once, inside the call, so a base or index with a
+  side effect still runs once, in order. `run.py`'s
+  `vec_read`/`vec_store`/`vec_struct` trap cases pin it under a plain `ld` link.
+- **A `v[i] = x` write needs a `mut` binding.** The index lowering forms the
+  element reference `&mut` or `&` from the binding's own mutability (`vec_mut`),
+  so a write through a read-only binding is a shared-reference write that sema
+  rejects, exactly as rustc does, while a read stays fine. (The earlier code
+  hardcoded `&mut`, so `let v: Vec<i64> = vec![..]; v[0] = 1;` was accepted.)
 - **Assignment evaluates its value before its place.** rustc orders assignment
   operands right-to-left (the one expression that does), so `a[li(1)] = li(5)`
   must run `li(5)` before `li(1)`. Codegen's general index/deref store path and
@@ -1365,14 +1383,14 @@ python3 tools/fuzz.py --mode mutate --n 500 --seed 1
   earlier design; it was withdrawn because rmc lowers `black_box` to the identity
   while rustc makes it opaque, so the barrier charged rustc a store/reload rmc
   never emitted and the 2.2x it produced measured the barrier, not the loop.
-- **The two builds must carry matching safety semantics.** rmc defaults bounds
-  checks *off* and overflow checks *off*; `rustc -O` keeps bounds checks *on*
-  and overflow checks *off*. `bench/run.py` builds rmc with `--bounds-checks`
-  and rustc with `-C overflow-checks=off`, so both carry bounds checks and
-  neither carries overflow checks. Without the rmc flag, rmc would skip a
-  per-index check rustc emits; the check costs ~1% on the array-heavy programs,
-  so the flag does not decide any ratio, but the default would be an unfair
-  comparison. Never build the two sides with different check settings.
+- **The two builds must carry matching safety semantics.** rmc checks bounds by
+  default and leaves overflow checks *off*; `rustc -O` keeps bounds checks *on*
+  and overflow checks *off*. `bench/run.py` relies on rmc's default and passes
+  rustc `-C overflow-checks=off`, so both carry bounds checks and neither
+  carries overflow checks. If rmc skipped a per-index check rustc emits, the
+  comparison would be unfair; the check costs ~1% on the array-heavy programs,
+  so it does not decide any ratio. Never build the two sides with different
+  check settings.
 - **`light` and `heavy` bracket the load spectrum, and both must stay.** `light`
   is the short, cache-resident case (a 2 KiB table scanned with a data-dependent
   branch for a few ms), so process startup and per-iteration codegen are a real
@@ -2073,8 +2091,9 @@ stdout and exit status against `rustc -O`, and it recompiles each program with
 every optimiser pass off in turn (`--no-inline`, `--no-licm`, `--no-tco`, all
 three), the same matrix the corpus suite uses — a pass-specific bug is otherwise
 invisible, because the fuzzer used to run only the default configuration.
-`--bounds` adds `--bounds-checks` runs (every generated index is in bounds, so a
-spurious trap or a check-codegen miscompile shows up) and `--overflow` adds
+`--bounds` adds runs with `--no-bounds-checks` (every generated index is in
+bounds, so a spurious trap or a check-codegen miscompile shows up) and
+`--overflow` adds
 `--overflow-checks` runs, each compared against a `rustc` built with
 `-C overflow-checks=on` (the default `rustc -O` wraps, so it would disagree by
 design). The temp directory is per-PID: two concurrent fuzz runs sharing one
@@ -2140,10 +2159,10 @@ may contain a self-call becomes a loop with one call per level, halving the call
 tree of both `fib` and `tree`), a loop-invariant code motion pass, plus a
 small peephole pass (operand/comparison/array-address folding, constant folding,
 division by a constant, a 32-bit `div` fast path for a variable divisor). A *constant* index out of
-range is a compile error; a *variable* index is unchecked by default (used
-as-is, like C), so an out-of-range one reads or writes adjacent stack memory.
-`--bounds-checks` turns on a per-index runtime check that traps (see the codegen
-notes and "Soundness checks").
+range is a compile error; a *variable* index is bounds-checked by default,
+matching rustc: an out-of-range one traps with exit 101 and `rmc: index out of
+bounds`. `--no-bounds-checks` is the explicit unsafe opt-out that drops the
+check (see the codegen notes and "Soundness checks").
 
 The macro surface is lowered at parse time and is deliberately tiny.
 `print!`/`println!` take a literal format string and rewrite each `{}` to a
@@ -2320,8 +2339,8 @@ The README's roadmap lists the intended next steps.
   path returns, using `block_diverges`. It is deliberately conservative: an
   `if` with no `else`, a `while`, and a `loop` are not treated as guaranteed
   returns.
-- **With `--bounds-checks`, an array element is never a bare operand.**
-  `simple_operand` returns `None` for `Expr::Index` when `self.bounds` is set, so
+- **A bounds-checked array element is never a bare operand.**
+  `simple_operand` returns `None` for `Expr::Index` when bounds checks are on, so
   every access is materialised through `gen_expr`/`gen_addr`, which emit the
   check. If you add a code path that folds an element into an instruction
   operand, it must also emit the check, or an out-of-range index can bypass it.
@@ -3242,3 +3261,88 @@ The iterator-chain lowering demands a terminal method, so a bare `a.iter()`
 must be left as a `MethodCall` for the `for` desugar. The postfix method loop
 therefore only lowers a chain when a `.` follows the `.iter()`/`.into_iter()`
 call; otherwise `for x in a.iter()` is misread as an unterminated chain.
+
+## `Vec<T>` element stride reuses sema's layout
+
+The parser has to know a `Vec<T>` element's byte stride *before* sema runs (the
+stride scales the `v[i]` address, and the element type is needed to type the
+place). It must not re-derive struct/enum layout itself: an ad-hoc pass
+silently disagreed with sema on any struct holding a `u8`/`i8`, an array, a
+tuple, an enum, or a nested struct, mis-scaling the stride and corrupting the
+store. The rule is that the parser never computes a second layout.
+
+Instead, the pre-scan records the token index of every top-level `struct`/`enum`
+(`type_def_starts`), and `compute_struct_sizes` re-parses each definition with
+the real parser once aliases and constants are known, then feeds the resulting
+`StructDef`/`EnumDef` list (plus the tuple `StructDef`s in `tuple_defs`) to
+`sema::layout_sizes`, which is `resolve_layouts` under a thin wrapper. The
+parser and sema therefore agree by construction. A definition sema will reject
+(a recursive struct, an unknown field type) is skipped, leaving its size absent;
+the `Vec<T>` annotation falls back to the word width and sema reports the real
+error. The re-parse must save/restore `self.i` and is read-only apart from the
+`tuple_defs` it legitimately produces for tuple fields.
+
+Because `parse_program` injects the `Option`/`Result` prelude *after* this pass,
+a struct with a prelude-typed field (`struct W { value: Option<i64> }`) would name
+a type `layout_sizes` cannot see. That one failure rejects the whole batch, so
+*every* struct size is dropped and an unrelated `Vec<P>` silently reverts to a
+word stride. The size pass therefore injects the prelude's enum definitions too,
+under the same condition `parse_program` uses (the user owning no `Option`/
+`Result` struct or enum), so a bad field fails alone. `vecoption.rs` pins this.
+
+A `Vec<T>` element is stored by address only when `T` is a genuine aggregate
+(`is_aggregate`: struct, payload enum, array). A *unit* enum is an eight-byte
+scalar, so `Vec<Color>` must widen each element to a word on `push`/`repeat`/
+`vec![..]`; treating it as an address stored a pointer and lost the tag
+(`vecenumunit.rs`). A zero-sized aggregate element (`struct Z;`) is rejected:
+the runtime marks an aggregate by *negating* its width, but `-0` is `0`, so it
+would take the scalar path and write past the header.
+
+Two more element checks live in sema's call check, keyed on the width the
+constructors pass as the helper's last argument. `__rmc_vec_push`/
+`__rmc_vec_repeat` must see an element whose size equals the vector's stride
+(a `v.push(Q{..})` on a `Vec<P>` is otherwise accepted and copies the wrong byte
+count), and a scalar element is cast to a word so its type need not match the
+declared `I64`.
+
+A *size* check alone cannot tell a valid element from a different aggregate of
+the same size: `struct P { x: i64, y: i64 }` and `struct Q { x: i64, y: i64 }`
+are both 16 bytes, so `v.push(Q { .. })` on a `Vec<P>` would store `Q` and a
+later `v[i].y` would read `Q`'s second word as `P::y`. The value argument is
+type-erased to `I64` (a scalar word, or an aggregate's address), so the element
+type is not otherwise recoverable at the call. `Expr::Call` therefore carries an
+`elem_ty: Option<Type>` — the element type the destination `Vec<T>` was declared
+with, recorded by the parser for the `__rmc_vec_push`/`__rmc_vec_repeat`/
+`__rmc_veclist` shapes and `None` for every other call. sema compares it against
+the argument type: an aggregate element must equal it (a struct, a payload enum,
+an array, a tuple), a scalar element is rejected when the vector's element is an
+aggregate and vice versa. `rustc` agrees (`E0308`). The check is skipped when
+`elem_ty` is `None` (an unannotated `Vec` whose element type was not inferred),
+leaving the width check as the only guard.
+
+## Capacity overflow traps at run time
+
+A `Vec`/`String` constructor asked for a capacity that does not fit must trap
+(exit 101, message `rmc: capacity overflow`, mirroring a panic) rather than
+corrupt memory. The capacity often comes from a parameter, so sema cannot reject
+it at compile time; a negative value read as `usize` is enormous, and the byte
+size `cap * width` then wraps to a small positive number, so the store is
+allocated too small and the header — or the element write — lands past it (a
+`String`'s length word was misread, and a `Vec` faulted). `__rmc_vec_new`,
+`__rmc_vec_repeat` and `__rmc_str_new` each test their byte size before
+allocating: `test reg, reg; js __rmc_cap_overflow` for a negative size, plus
+`jo __rmc_cap_overflow` after the `imul` that scales by the element width (the
+repeat can overflow for a huge positive count too). The `test` is not optional:
+`imul` leaves `SF` undefined, so a `js` right after it is width-dependent and
+misses the negative case. `__rmc_cap_overflow` lives in its own piece.
+
+## Every runtime piece names its own section
+
+A `Piece`'s assembly is concatenated with the other kept pieces into one
+translation unit, so a function piece must emit its own `.text` (and a data
+piece its own `.data`/`.rodata`/`.bss`). A piece that omits it inherits whatever
+section the previous piece left current — after a `.rodata`-ending piece (for
+example `__rmc_cap_overflow`'s message), a following `__rmc_str_new` assembled
+into `.rodata` and faulted at run time under `as`+`ld` because the section is not
+executable (the in-process encoder did not, masking it). The
+`every_piece_names_its_own_section` test in `runtime.rs` pins the invariant.

@@ -912,9 +912,9 @@ impl Elf {
             "sete" | "setne" | "setl" | "setle" | "setg" | "setge" | "setb" | "setbe" | "seta"
             | "setae" | "seto" | "setno" | "sets" | "setns" => self.enc_setcc(mnem, &ops, sec),
             "bswap" => self.enc_bswap(&ops, sec),
-            // The only `rep`-prefixed forms the runtime emits are the two
-            // `stos` fills, so a whole `rep` form is accepted rather than a
-            // general prefix. `rep stosq` is `F3 48 AB`, `rep stosb` `F3 AA`.
+            // The `rep`-prefixed forms the runtime emits: the two `stos` fills
+            // (`rep stosq` is `F3 48 AB`, `rep stosb` `F3 AA`) and the two
+            // `movs` copies (`rep movsb` is `F3 A4`, `rep movsq` `F3 48 A5`).
             "rep" => match rest {
                 "stosq" => {
                     self.sections[sec].data.extend_from_slice(&[0xf3, 0x48, 0xab]);
@@ -922,6 +922,14 @@ impl Elf {
                 }
                 "stosb" => {
                     self.sections[sec].data.extend_from_slice(&[0xf3, 0xaa]);
+                    Ok(())
+                }
+                "movsb" => {
+                    self.sections[sec].data.extend_from_slice(&[0xf3, 0xa4]);
+                    Ok(())
+                }
+                "movsq" => {
+                    self.sections[sec].data.extend_from_slice(&[0xf3, 0x48, 0xa5]);
                     Ok(())
                 }
                 other => Err(format!("elf: unsupported rep form `{other}`")),

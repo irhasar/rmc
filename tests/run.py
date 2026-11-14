@@ -39,12 +39,12 @@ def load_args():
 
 def extra_flags(name):
     """Per-case compiler flags. A `NAME.overflow` marker turns on overflow
-    checks for both compilers, so the case can be diffed like any other."""
+    checks for both compilers, so the case can be diffed like any other.
+
+    Bounds checks need no marker: they are on by default in rmc, matching
+    rustc, which always checks an index."""
     if os.path.exists(os.path.join(CASES, f"{name}.overflow")):
         return ["--overflow-checks"], ["-C", "overflow-checks=on"]
-    if os.path.exists(os.path.join(CASES, f"{name}.bounds")):
-        # rustc checks array bounds by default, so only rmc needs the flag.
-        return ["--bounds-checks"], []
     return [], []
 
 
@@ -95,7 +95,10 @@ def check_bounds_traps(combos):
     Each case is run under every optimiser configuration in `combos`, so a pass
     cannot hide a check: a hoist or inline that drops the `cmp`/`jae` would let
     the program read or write out of range and exit without the message.
-    """
+
+    No `--bounds-checks` flag is passed: checks are on by default, and this
+    check exists precisely to prove that. `--bounds-checks` is accepted as a
+    no-op for compatibility."""
     # Each case is (source, required stdout prefix). The prefix checks that a
     # base with a side effect runs before the trap: Rust evaluates the base and
     # index before the bounds check, so `make()[2]` must print before it exits.
@@ -114,6 +117,13 @@ def check_bounds_traps(combos):
         "field": ("struct S { n: i64, a: [i64; 3] } fn f(i: i64) -> i64 { let s: S = S { n: 0, a: [4, 5, 6] }; s.a[i] } fn main() { let _ = f(5); }", b""),
         "store": ("fn f(i: i64) -> i64 { let mut a: [i64; 3] = [1, 2, 3]; a[i] = 9; a[0] } fn main() { let _ = f(4); }", b""),
         "array_ref": ("fn f(i: i64) -> i64 { let a: [i64; 3] = [1, 2, 3]; let r: &[i64; 3] = &a; r[i] } fn main() { let _ = f(9); }", b""),
+        # A `Vec` index must trap too: `v[i]` used to be plain pointer
+        # arithmetic with no check even under `--bounds-checks`, so it read or
+        # wrote past the store. Read, write, and an aggregate element (whose
+        # stride is its size) each get a case.
+        "vec_read": ("fn f(i: i64) -> i64 { let v: Vec<i64> = vec![1, 2, 3]; v[i] } fn main() { let _ = f(3); }", b""),
+        "vec_store": ("fn f(i: i64) -> i64 { let mut v: Vec<i64> = vec![1, 2, 3]; v[i] = 9; v[0] } fn main() { let _ = f(4); }", b""),
+        "vec_struct": ("struct P { x: i64, y: i64 } fn f(i: i64) -> i64 { let v: Vec<P> = vec![P { x: 1, y: 2 }]; v[i].x } fn main() { let _ = f(5); }", b""),
     }
     failures = 0
     for name, (src, want_stdout) in cases.items():
@@ -121,7 +131,7 @@ def check_bounds_traps(combos):
         with open(src_path, "w") as f:
             f.write(src)
         for label, opt_flags in combos:
-            asm = subprocess.run([RMC, "--bounds-checks"] + list(opt_flags)
+            asm = subprocess.run([RMC] + list(opt_flags)
                                  + ["--emit-asm", src_path], capture_output=True)
             if asm.returncode != 0:
                 print(f"FAIL trap {name}{label}: rmc failed:\n{asm.stderr.decode(errors='replace')}")
@@ -203,6 +213,62 @@ def check_clamp_trap(combos):
                 failures += 1
     if failures == 0:
         print(f"clamp `min > max` traps exit 101 under a plain `ld` link, "
+              f"in {len(combos)} optimiser configurations")
+    return failures
+
+
+def check_cap_traps(combos):
+    """A `Vec`/`String` constructor asked for a capacity that does not fit must
+    write its message and exit 101, not corrupt adjacent memory or fault. A
+    negative capacity read as `usize` is enormous; the byte size `count * width`
+    then wraps to a small positive number, so the store is allocated too small
+    and the header (or the element write) lands past it. The capacity comes from
+    a parameter, so it is not a literal sema could reject at compile time.
+
+    `String::with_capacity`, `Vec::with_capacity` and the `vec![v; n]` repeat
+    each compute a byte size and so each need the check; the repeat also scales
+    by the element width, so it can overflow for a huge positive count too."""
+    cases = {
+        "str": ("fn f(k: i64) -> i64 { let s = String::with_capacity(k as usize); s.capacity() } fn main() { let _ = f(-16); }", b""),
+        "vec": ("fn f(k: i64) -> i64 { let v: Vec<i64> = Vec::with_capacity(k as usize); v.capacity() } fn main() { let _ = f(-16); }", b""),
+        "repeat": ("fn f(k: i64) -> i64 { let v: Vec<i64> = vec![7; k as usize]; v.len() } fn main() { let _ = f(-1); }", b""),
+    }
+    failures = 0
+    for name, (src, want_stdout) in cases.items():
+        src_path = os.path.join(OUT, f"cap_{name}.rs")
+        with open(src_path, "w") as f:
+            f.write(src)
+        for label, opt_flags in combos:
+            asm = subprocess.run([RMC] + list(opt_flags) + ["--emit-asm", src_path],
+                                 capture_output=True)
+            if asm.returncode != 0:
+                print(f"FAIL cap {name}{label}: rmc failed:\n{asm.stderr.decode(errors='replace')}")
+                failures += 1
+                continue
+            s_path = os.path.join(OUT, f"cap_{name}.s")
+            o_path = os.path.join(OUT, f"cap_{name}.o")
+            exe = os.path.join(OUT, f"cap_{name}.exe")
+            with open(s_path, "wb") as f:
+                f.write(asm.stdout)
+            p = subprocess.run(["as", s_path, "-o", o_path], capture_output=True)
+            if p.returncode != 0:
+                print(f"FAIL cap {name}{label}: as failed:\n{p.stderr.decode(errors='replace')}")
+                failures += 1
+                continue
+            p = subprocess.run(["ld", "-o", exe, o_path], capture_output=True)
+            if p.returncode != 0:
+                print(f"FAIL cap {name}{label}: ld failed:\n{p.stderr.decode(errors='replace')}")
+                failures += 1
+                continue
+            p = subprocess.run([exe], capture_output=True)
+            if p.returncode != 101 or b"capacity overflow" not in p.stderr:
+                print(f"FAIL cap {name}{label}: exit={p.returncode} stderr={p.stderr!r} (want 101 + message)")
+                failures += 1
+            elif not p.stdout.startswith(want_stdout):
+                print(f"FAIL cap {name}{label}: stdout={p.stdout!r} (want prefix {want_stdout!r})")
+                failures += 1
+    if failures == 0:
+        print(f"all {len(cases)} capacity traps exit 101 under a plain `ld` link, "
               f"in {len(combos)} optimiser configurations")
     return failures
 
@@ -614,6 +680,7 @@ def main():
     failures += check_reject_parse_type()
     failures += check_bounds_traps(combos)
     failures += check_clamp_trap(combos)
+    failures += check_cap_traps(combos)
     stripped = check_stripped()
     failures += stripped
     if stripped == 0:

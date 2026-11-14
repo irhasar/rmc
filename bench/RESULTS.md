@@ -24,8 +24,7 @@ flag set matches the LLVM column. It is a nightly-only component,
 so the column is present only where the host has it installed.
 
 Every compiler is invoked with matching safety semantics: rmc with
-`--bounds-checks` (bounds checks on, overflow checks off - Rust's
-release semantics, which rmc does not default to) and rustc with
+bounds checks on (the default; Rust's release semantics) and rustc with
 `-C overflow-checks=off` (already the `-O` default, stated explicitly).
 See the run section for why this matters.
 
@@ -206,12 +205,11 @@ store/reload rmc never emits. `refs` instead seeds the struct from an
 opaque value and reduces the accumulator with a data-dependent branch,
 which keeps the loop real for both compilers (it defeats LLVM's
 loop-closing and vectoriser) without a barrier only one side pays for.
-Second, the two builds use matching safety semantics: rmc is invoked
-with `--bounds-checks` and rustc with `-C overflow-checks=off`, so both
-carry bounds checks and neither carries overflow checks. rmc defaults
-bounds checks off, so without the flag it would skip a per-index check
-rustc emits; the cost of the check is around 1% on the array-heavy
-programs, so it does not manufacture any win either way.
+Second, the two builds use matching safety semantics: rmc checks bounds
+by default and rustc is invoked with `-C overflow-checks=off`, so both
+carry bounds checks and neither carries overflow checks. The check costs
+about 1% on the array-heavy programs, so it does not manufacture any win
+either way.
 On call-heavy code
 (`callrec`) rmc now keeps up because the self-recursion pass folds the
 right spine into a loop, leaving one call per level - the same

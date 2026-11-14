@@ -224,7 +224,7 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     // Runtime helpers provided by the freestanding assembly runtime. They are
     // linked in automatically, so they do not appear in the source program.
-    let builtins: [(&str, &[Type], Type); 48] = [
+    let builtins: [(&str, &[Type], Type); 49] = [
         ("print_i64", &[Type::I64], Type::Unit),
         ("print_str", &[Type::Str], Type::Unit),
         ("print_bool", &[Type::Bool], Type::Unit),
@@ -267,6 +267,9 @@ pub fn analyze(prog: &mut Program) -> Result<(), String> {
         ("__rmc_vec_repeat", &[Type::I64, Type::I64, Type::I64], Type::I64),
         ("__rmc_vec_push", &[Type::I64, Type::I64, Type::I64], Type::I64),
         ("__rmc_vec_len", &[Type::I64], Type::I64),
+        // The checked `v[i]` under `--bounds-checks`: `(vector, index, stride)`
+        // yields the element address, trapping on an out-of-range index.
+        ("__rmc_vec_at", &[Type::I64, Type::I64, Type::I64], Type::I64),
         ("__rmc_vec_cap", &[Type::I64], Type::I64),
         // The growable-`String` helpers. A `String` value is the address of a
         // `{len, bytes}` record — the same shape a `str` is — so every `str`
@@ -478,6 +481,22 @@ fn resolve_layouts(
         layout_enum(&d.name, &raw_s, &raw_e, &mut so, &mut eo, &mut Vec::new())?;
     }
     Ok((so, eo))
+}
+
+/// The byte size of every struct and enum, for the parser's `Vec<T>` stride.
+/// It runs sema's own layout (`resolve_layouts`), so a `Vec<Struct>` element's
+/// stride and the `Type::Struct(name, size)` sema resolves are always equal —
+/// the parser never re-derives a layout that could disagree. Returns
+/// `(struct_sizes, enum_sizes)`.
+pub fn layout_sizes(
+    structs: &[StructDef],
+    enums: &[EnumDef],
+) -> Result<(HashMap<String, usize>, HashMap<String, usize>), String> {
+    let (so, eo) = resolve_layouts(structs, enums)?;
+    Ok((
+        so.into_iter().map(|(k, v)| (k, v.size)).collect(),
+        eo.into_iter().map(|(k, v)| (k, v.size)).collect(),
+    ))
 }
 
 /// Lay out a struct: field `k` at the sum of the sizes of fields `0..k`, no
@@ -1122,6 +1141,7 @@ impl Sema {
                     arg_slots: Vec::new(),
                     ret_slot: -1,
                     ret_ty: Type::I64,
+                    elem_ty: None,
                 };
                 let below = if_then_else(
                     Expr::Bin(Lt, Box::new(x.clone()), Box::new(lo.clone())),
@@ -1200,6 +1220,7 @@ impl Sema {
                         arg_slots: vec![(-1, 0)],
                         ret_slot: -1,
                         ret_ty: Type::I64,
+                        elem_ty: None,
                     },
                     Type::I64,
                 )
@@ -1226,6 +1247,7 @@ impl Sema {
                         arg_slots: vec![(-1, 0), (-1, 0)],
                         ret_slot: -1,
                         ret_ty: Type::I64,
+                        elem_ty: None,
                     },
                     Type::I64,
                 )
@@ -1303,6 +1325,7 @@ impl Sema {
                         arg_slots: vec![(-1, 0), (-1, 0)],
                         ret_slot: -1,
                         ret_ty: Type::I64,
+                        elem_ty: None,
                     },
                     Type::I64,
                 )
@@ -2821,6 +2844,7 @@ impl Sema {
             arg_slots: vec![(-1, 0), (-1, 0)],
             ret_slot: -1,
             ret_ty: Type::Bool,
+            elem_ty: None,
         };
         let not = |e: Expr| Expr::Un(UnOp::Not, Box::new(e));
         use BinOp::*;
@@ -3191,7 +3215,7 @@ impl Sema {
                     }
                 }
             }
-            Expr::Call { name, args, arg_slots, ret_slot, ret_ty } => {
+            Expr::Call { name, args, arg_slots, ret_slot, ret_ty, elem_ty } => {
                 // `__rmc_print` is the placeholder a `print!`/`println!` `{}`
                 // emits. The type of the value is known only here, so pick the
                 // runtime helper that matches it and rewrite the call.
@@ -3252,7 +3276,25 @@ impl Sema {
                     ));
                 }
                 arg_slots.clear();
-                for (a, p) in args.iter_mut().zip(sig.params.iter()) {
+                // `__rmc_vec_push`/`__rmc_vec_repeat` carry the element as
+                // their second argument and its byte width (negated for an
+                // aggregate) as their last. The width must agree with the
+                // element value's own size, or the runtime would copy the wrong
+                // number of bytes — reading past a narrower temporary, or
+                // writing past the destination. A mismatch means the pushed
+                // value is not the vector's element type (`v.push(Q{..})` for a
+                // `Vec<P>`), which rustc rejects.
+                let vec_helper = name.as_str() == "__rmc_vec_push"
+                    || name.as_str() == "__rmc_vec_repeat";
+                let elem_width = if vec_helper {
+                    match args.last() {
+                        Some(Expr::Int(w)) => Some(*w),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                for (i, (a, p)) in args.iter_mut().zip(sig.params.iter()).enumerate() {
                     let t = if (is_int_literal(a) && matches!(p, Type::Int { .. }))
                         || matches!(p, Type::Array(..))
                     {
@@ -3261,16 +3303,65 @@ impl Sema {
                     } else {
                         self.check_expr(a, scope)?
                     };
-                    // `!` unifies with any parameter type: an argument that never
-                    // materialises (a block ending in `break`/`return`/`continue`)
-                    // coerces, exactly as rustc allows.
-                    if &t != p && t != Type::Never && !ref_coerces(&t, p) {
+                    // `__rmc_vec_push`/`__rmc_vec_repeat` take the element as
+                    // their second argument: a scalar travels as a word, but an
+                    // aggregate travels as its address, so its type need not
+                    // match the declared `I64`.
+                    let vec_elem_arg = vec_helper && i == 1;
+                    // The element's own type must be the vector's element type.
+                    // The value argument is type-erased to `I64`, so a size
+                    // check alone cannot tell a valid element from a *different*
+                    // aggregate of the same size (`v.push(Q{..})` on a `Vec<P>`
+                    // where `P` and `Q` are both 16 bytes): the runtime would
+                    // store the wrong type, and a later read would misread it.
+                    // The parser records the declared element type on the call,
+                    // so compare against it here. A missing element type (an
+                    // unannotated `Vec` whose element was not inferred) leaves
+                    // the size check below as the only guard.
+                    if vec_elem_arg {
+                        if let Some(expected) = elem_ty.clone() {
+                            if expected.is_aggregate() {
+                                if t != Type::Never && !t.is_aggregate() {
+                                    return Err(format!(
+                                        "`{name}`: expected an element of type {expected:?}, found {t:?}"
+                                    ));
+                                }
+                                if t.is_aggregate() && t != expected {
+                                    return Err(format!(
+                                        "`{name}`: expected an element of type {expected:?}, found {t:?}"
+                                    ));
+                                }
+                            } else if t.is_aggregate() {
+                                return Err(format!(
+                                    "`{name}`: expected a scalar element ({expected:?}), found an aggregate {t:?}"
+                                ));
+                            }
+                        }
+                    }
+                    // An aggregate element must match the vector's element size
+                    // exactly, or the runtime copies the wrong byte count (past a
+                    // narrower temporary, or past the destination).
+                    if let (true, Some(w)) = (vec_elem_arg, elem_width) {
+                        if t.is_aggregate() && w.abs() != t.size() as i64 {
+                            return Err(format!(
+                                "`{name}`: element of {} bytes does not match the vector's element size of {}",
+                                t.size(),
+                                w.abs()
+                            ));
+                        }
+                    }
+                    if !(vec_elem_arg && t.is_aggregate())
+                        && &t != p
+                        && t != Type::Never
+                        && !ref_coerces(&t, p)
+                    {
                         return Err(format!("function `{name}`: argument type mismatch, expected {p:?}, found {t:?}"));
                     }
                     // An aggregate argument is passed by pointer, so give it a
                     // hidden frame slot to hold its address for the call.
-                    arg_slots.push(if p.is_aggregate() {
-                        let n = p.size() / 8;
+                    let agg_ty = if vec_elem_arg { &t } else { p };
+                    arg_slots.push(if agg_ty.is_aggregate() {
+                        let n = agg_ty.size() / 8;
                         (self.alloc_slots(n as i32), n)
                     } else {
                         (-1, 0)
@@ -3860,6 +3951,7 @@ impl Sema {
                                 arg_slots: vec![(-1, 0)],
                                 ret_slot: -1,
                                 ret_ty: Type::I64,
+                                elem_ty: None,
                             };
                             return self.check_expr(e, scope);
                         }
@@ -3903,6 +3995,7 @@ impl Sema {
                                 arg_slots: vec![(-1, 0)],
                                 ret_slot: -1,
                                 ret_ty: Type::I64,
+                                elem_ty: None,
                             };
                             *e = Expr::Bin(BinOp::Eq, Box::new(call), Box::new(Expr::Int(0)));
                             return self.check_expr(e, scope);
@@ -3954,6 +4047,7 @@ impl Sema {
                             arg_slots: vec![(-1, 0), (-1, 0)],
                             ret_slot: -1,
                             ret_ty: if name == "contains" { Type::I64 } else { Type::Bool },
+                            elem_ty: None,
                         };
                         *e = if name == "contains" {
                             Expr::Bin(BinOp::Ne, Box::new(call), Box::new(Expr::Int(-1)))
@@ -4068,6 +4162,7 @@ impl Sema {
                     arg_slots: Vec::new(),
                     ret_slot: -1,
                     ret_ty: Type::I64,
+                    elem_ty: None,
                 };
                 self.check_expr(e, scope)
             }
@@ -4152,6 +4247,7 @@ impl Sema {
                             arg_slots: Vec::new(),
                             ret_slot: -1,
                             ret_ty: Type::I64,
+                            elem_ty: None,
                         };
                         return self.check_expr(e, scope);
                     }

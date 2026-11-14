@@ -223,14 +223,11 @@ def cranelift_rustc():
 def measure_compile(name, kind, reps=5):
     if kind == "rmc":
         out = os.path.join(OUT, f"{name}.rmc.bin")
-        # `--bounds-checks` matches Rust's release semantics: bounds checks are
-        # always on (they are not debug assertions), overflow checks are off.
-        # rmc defaults them off, so without this flag rmc would skip a
-        # per-index check rustc emits and the two would not build the same
-        # program. The cost is ~1% on the array-heavy programs, so it does not
-        # manufacture the win either way; it just makes the comparison honest.
-        argv = [RMC, os.path.join(ROOT, "rust", f"{name}.rs"),
-                "--bounds-checks", "-o", out]
+        # Bounds checks are on by default, matching Rust's release semantics
+        # (bounds checks are always on; overflow checks are off). rustc is
+        # invoked with `-C overflow-checks=off` below, so the two build the same
+        # program: both check every index, neither checks arithmetic.
+        argv = [RMC, os.path.join(ROOT, "rust", f"{name}.rs"), "-o", out]
     elif kind == "cranelift":
         out = os.path.join(OUT, f"{name}.cranelift.bin")
         # The nightly backend via the rustup proxy. `codegen-units=1` and
@@ -251,8 +248,7 @@ def measure_compile(name, kind, reps=5):
                 # Overflow checks are already off at `-O`; set them explicitly
                 # so the parity with rmc (which defaults them off) is stated
                 # rather than implied by the profile. Bounds checks stay on:
-                # they are Rust's release semantics and rmc's `--bounds-checks`
-                # enables the matching ones.
+                # they are Rust's release semantics and rmc's default too.
                 "-C", "overflow-checks=off",
                 "-C", "debug-assertions=off",
                 os.path.join(ROOT, "rust", f"{name}.rs"), "-o", out]
@@ -483,8 +479,7 @@ def write_markdown(path, rows, note, kinds):
         lines.append("so the column is present only where the host has it installed.")
         lines.append("")
     lines.append("Every compiler is invoked with matching safety semantics: rmc with")
-    lines.append("`--bounds-checks` (bounds checks on, overflow checks off - Rust's")
-    lines.append("release semantics, which rmc does not default to) and rustc with")
+    lines.append("bounds checks on (the default; Rust's release semantics) and rustc with")
     lines.append("`-C overflow-checks=off` (already the `-O` default, stated explicitly).")
     lines.append("See the run section for why this matters.")
     lines.append("")
@@ -564,12 +559,11 @@ def write_markdown(path, rows, note, kinds):
     lines.append("opaque value and reduces the accumulator with a data-dependent branch,")
     lines.append("which keeps the loop real for both compilers (it defeats LLVM's")
     lines.append("loop-closing and vectoriser) without a barrier only one side pays for.")
-    lines.append("Second, the two builds use matching safety semantics: rmc is invoked")
-    lines.append("with `--bounds-checks` and rustc with `-C overflow-checks=off`, so both")
-    lines.append("carry bounds checks and neither carries overflow checks. rmc defaults")
-    lines.append("bounds checks off, so without the flag it would skip a per-index check")
-    lines.append("rustc emits; the cost of the check is around 1% on the array-heavy")
-    lines.append("programs, so it does not manufacture any win either way.")
+    lines.append("Second, the two builds use matching safety semantics: rmc checks bounds")
+    lines.append("by default and rustc is invoked with `-C overflow-checks=off`, so both")
+    lines.append("carry bounds checks and neither carries overflow checks. The check costs")
+    lines.append("about 1% on the array-heavy programs, so it does not manufacture any win")
+    lines.append("either way.")
     lines.append("On call-heavy code")
     lines.append("(`callrec`) rmc now keeps up because the self-recursion pass folds the")
     lines.append("right spine into a loop, leaving one call per level - the same")

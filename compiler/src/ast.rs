@@ -333,6 +333,13 @@ pub enum Expr {
         arg_slots: Vec<(i32, usize)>,
         ret_slot: i32,
         ret_ty: Type,
+        /// For a `__rmc_vec_push`/`__rmc_vec_repeat`/`__rmc_veclist` call, the
+        /// element type the destination `Vec<T>` was declared with. The value
+        /// argument travels type-erased as `I64` (a scalar word, or an
+        /// aggregate's address), so without this sema cannot tell a valid
+        /// element from a different aggregate of the same size (`v.push(Q{..})`
+        /// on a `Vec<P>`). `None` for every other call.
+        elem_ty: Option<Type>,
     },
     /// `(a, b, ...)`: a tuple literal. `sema` resolves its element types and
     /// rewrites it into a `StructLit` of the anonymous struct that lays the
