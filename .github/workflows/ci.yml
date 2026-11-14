@@ -89,8 +89,12 @@ jobs:
       - name: Install binutils
         run: sudo apt-get update && sudo apt-get install -y binutils
 
+      # The harnesses drive both the `rmc` binary and the `rmcmir` example, so
+      # build the whole package plus the example: `--example` alone would leave
+      # `compiler/target/release/rmc` missing and the harness would fail to
+      # spawn it.
       - name: Build compiler and example
-        run: cargo build --release --manifest-path compiler/Cargo.toml --example rmcmir
+        run: cargo build --release --manifest-path compiler/Cargo.toml --bins --examples
 
       - name: Build backend
         run: ./backend/build.sh
