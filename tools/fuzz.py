@@ -3494,9 +3494,135 @@ def gen_typealias_program(rng):
     return "\n".join(lines_rs)
 
 
+def gen_mir_program(rng):
+    """A program inside the subset both MIR routes lower (`rmc --rustc-frontend`
+    and the `-Zcodegen-backend` dylib), aimed at what broke them: a constant on
+    either side of every operator (`5 - x` was computed as `x - 5`), more live
+    locals than registers (a memory-to-memory `cmp`), `[T; N]` repeats of byte
+    and word elements read at runtime indices (an 8-byte stride for `u8`), a
+    helper that writes through `&mut [i64; N]` and gets inlined (the parameter
+    copy was deleted), several functions with loops (duplicate local labels),
+    and an integer `match`. Inputs go through `black_box`, so rustc cannot
+    fold the program before the back end sees it. Every operation is total:
+    divisors are made positive, shift counts are masked, indices are reduced
+    into range, and plain `+ - *` wrap under `rustc -O` exactly as in rmc."""
+    nv = rng.randint(6, 12)
+    na = rng.randint(3, 9)
+    nb = rng.randint(3, 17)
+    vars_ = [f"v{i}" for i in range(nv)]
+    ops = ["+", "-", "*", "&", "|", "^"]
+
+    def atom():
+        r = rng.random()
+        if r < 0.45:
+            return rng.choice(vars_)
+        if r < 0.75:
+            return str(rng.randint(-50, 50))
+        return f"({rng.choice(vars_)} {rng.choice(ops)} {rng.randint(-9, 9)})"
+
+    def expr(d=0):
+        r = rng.random()
+        if d > 2 or r < 0.25:
+            return atom()
+        if r < 0.55:
+            # A constant on the left of a non-commutative operator is the shape
+            # the `fuse_imm` bug reversed; make it common.
+            k = rng.randint(-100, 100)
+            return f"({k} {rng.choice(['-', '-', '+', '*', '^'])} {expr(d + 1)})"
+        if r < 0.70:
+            return f"({expr(d + 1)} {rng.choice(ops)} {expr(d + 1)})"
+        if r < 0.80:
+            return f"({expr(d + 1)} / ((({expr(d + 1)}) & 15) + 1))"
+        if r < 0.88:
+            return f"({expr(d + 1)} % ((({expr(d + 1)}) & 31) + 1))"
+        if r < 0.94:
+            return f"({expr(d + 1)} {rng.choice(['<<', '>>'])} (({expr(d + 1)}) & 15))"
+        return f"(({expr(d + 1)} {rng.choice(['<', '<=', '>', '==', '!='])} {expr(d + 1)}) as i64)"
+
+    def idx(n):
+        return f"(((({expr(1)}) % {n}) + {n}) % {n}) as usize"
+
+    lines = [
+        "use std::hint::black_box;",
+        "",
+        "#[derive(Clone, Copy)]",
+        "struct S {",
+        "    a: i64,",
+        "    b: i64,",
+        "}",
+        "",
+        f"fn poke(arr: &mut [i64; {na}], k: i64) -> i64 {{",
+        f"    let i = (((k % {na}) + {na}) % {na}) as usize;",
+        f"    arr[i] = {rng.randint(-9, 9)} - arr[i] * {rng.randint(1, 5)};",
+        f"    arr[({na} - 1 - i) as usize] ^= k;",
+        "    arr[i] + k",
+        "}",
+        "",
+        "fn spin(n: i64, seed: i64) -> i64 {",
+        "    let mut acc: i64 = seed;",
+        "    let mut i: i64 = 0;",
+        "    while i < n {",
+        f"        acc = {rng.randint(1, 40)} - acc + i * {rng.randint(1, 7)};",
+        "        i += 1;",
+        "    }",
+        "    acc",
+        "}",
+        "",
+        "fn main() {",
+    ]
+    for v in vars_:
+        lines.append(f"    let mut {v}: i64 = black_box({rng.randint(-1000, 1000)});")
+    lines.append(f"    let mut arr: [i64; {na}] = [black_box({rng.randint(-20, 20)}); {na}];")
+    lines.append(f"    let mut bytes: [u8; {nb}] = [black_box({rng.randint(0, 255)}u8); {nb}];")
+    lines.append(f"    let guard: [i64; 2] = [black_box({rng.randint(-5, 5)}); 2];")
+    lines.append(f"    let mut s = S {{ a: {rng.choice(vars_)}, b: {rng.randint(-9, 9)} }};")
+    for _ in range(rng.randint(6, 14)):
+        r = rng.random()
+        v = rng.choice(vars_)
+        if r < 0.35:
+            lines.append(f"    {v} = {expr()};")
+        elif r < 0.50:
+            lines.append(f"    arr[{idx(na)}] = {expr()};")
+        elif r < 0.60:
+            lines.append(f"    bytes[{idx(nb)}] = ({expr()}) as u8;")
+        elif r < 0.70:
+            lines.append(f"    {v} = poke(&mut arr, {expr()});")
+        elif r < 0.78:
+            lines.append(f"    {v} = spin(black_box({rng.randint(0, 6)}), {expr()});")
+        elif r < 0.86:
+            lines.append(f"    s.{rng.choice(['a', 'b'])} = {expr()} - s.{rng.choice(['a', 'b'])};")
+        elif r < 0.93:
+            arms = ", ".join(f"{k} => {expr()}" for k in range(rng.randint(1, 4)))
+            lines.append(f"    {v} = match ({expr()}) & 3 {{ {arms}, _ => {expr()} }};")
+        else:
+            w = rng.choice(vars_)
+            lines += [
+                "    {",
+                f"        let mut i: i64 = 0;",
+                f"        while i < black_box({rng.randint(0, 5)}) {{",
+                f"            {w} = {expr()} - {w};",
+                f"            i += 1;",
+                "        }",
+                "    }",
+            ]
+    for v in vars_:
+        lines.append(f'    println!("{{}}", {v});')
+    lines.append(f'    println!("{{}}", arr[{idx(na)}] + arr[0]);')
+    lines.append(f'    println!("{{}}", bytes[{idx(nb)}] as i64 + bytes[{nb - 1}] as i64);')
+    lines.append('    println!("{}", guard[0] + guard[1]);')
+    lines.append('    println!("{} {}", s.a, s.b);')
+    lines.append("}")
+    return "\n".join(lines)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "forref", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "patshadow", "intmeth", "nestedfn", "typealias", "printfmt", "ptr", "char", "semi", "boolbit", "vis", "localconst", "robust", "reject", "mutate"], default="expr")
+    ap.add_argument("--mode", choices=["expr", "stmt", "opt", "arith", "nest", "pat", "order", "shift", "cast", "assoc", "ref", "update", "letdestr", "fordestr", "forref", "nestpat", "arrpat", "parampat", "enumpat", "atpat", "tuple", "patshadow", "intmeth", "nestedfn", "typealias", "printfmt", "ptr", "char", "semi", "boolbit", "vis", "localconst", "mir", "robust", "reject", "mutate"], default="expr")
+    ap.add_argument("--pipeline", choices=["ast", "mir", "cb"], default=None,
+                    help="which rmc route compiles the program: `ast` (rmc's own "
+                         "front end, the default for every mode but `mir`), `mir` "
+                         "(`rmc --rustc-frontend`) or `cb` (the -Zcodegen-backend "
+                         "dylib through backend/rmc-rustc)")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None, help="write failing programs here")
@@ -3560,7 +3686,9 @@ def main():
            "semi": gen_semi_program,
            "boolbit": gen_boolbit_program,
            "vis": gen_vis_program,
-           "localconst": gen_localconst_program}[args.mode]
+           "localconst": gen_localconst_program,
+           "mir": gen_mir_program}[args.mode]
+    pipeline = args.pipeline or ("mir" if args.mode == "mir" else "ast")
     rng = random.Random(args.seed)
     # The optimiser passes are off in the rustc reference only in the corpus
     # suite; a fuzz program is otherwise only checked with every pass on, so a
@@ -3597,6 +3725,21 @@ def main():
             ("ovf", ["--overflow-checks"], ovf),
             ("ovf-all-off", ["--overflow-checks", "--no-inline", "--no-licm", "--no-tco"], ovf),
         ]
+    if pipeline != "ast":
+        # The AST pass switches mean nothing to the MIR routes; one config.
+        configs = [("", [], [])]
+        if args.overflow:
+            configs.append(("ovf", ["--overflow-checks"], ["-C", "overflow-checks=on"]))
+    cb_wrapper = os.path.join(os.path.dirname(__file__), "..", "backend", "rmc-rustc")
+
+    def rmc_cmd(flags, src, out):
+        if pipeline == "mir":
+            return [RMC, "--rustc-frontend", *flags, src, "-o", out]
+        if pipeline == "cb":
+            extra = ["-C", "overflow-checks=on"] if "--overflow-checks" in flags else []
+            return [cb_wrapper, "--edition", "2021", "-Awarnings", *extra, src, "-o", out]
+        return [RMC, *flags, src, "-o", out]
+
     failures = 0
     for t in range(args.n):
         rs = gen(rng)
@@ -3630,7 +3773,7 @@ def main():
             continue
         bad = None
         for label, flags, rf in configs:
-            c = run([RMC] + flags + [f"{tmp}/p.rs", "-o", f"{tmp}/p.bin"])
+            c = run(rmc_cmd(flags, f"{tmp}/p.rs", f"{tmp}/p.bin"))
             if c.returncode != 0:
                 # rmc rejects the program. If rustc rejects it too the generator
                 # produced an ill-formed program (a constant shift or overflow

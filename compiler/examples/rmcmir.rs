@@ -34,19 +34,19 @@ fn main() {
     // loop-closed `+` would move a trap); the trap itself is already an
     // `assert` in the input MIR, so the back end needs no switch of its own.
     let opts = Options { promote: !no_promote };
-    let timing = std::env::var_os("RMC_TIME").is_some();
-    let mut t0 = std::time::Instant::now();
-    let mark = |label: &str, t0: &mut std::time::Instant| {
-        if timing {
-            eprintln!("{:>22} {:8.1} ms", label, t0.elapsed().as_secs_f64() * 1000.0);
-            *t0 = std::time::Instant::now();
-        }
-    };
     // A parse failure is the expected outcome for a construct the back end does
     // not support, so it must exit like any other compile error: a clean
     // message and status 1, not a panic and a backtrace note. `tools/fuzz.py`
     // and the differential suite both rely on "unsupported" being a status, not
     // a crash.
+    // `RMC_TIME=1` prints parse, each MIR pass, codegen and assembly times.
+    let timing = std::env::var_os("RMC_TIME").is_some();
+    let phase = |label: &str, t: std::time::Instant| {
+        if timing {
+            eprintln!("{label:>24} {:8.1} ms", t.elapsed().as_secs_f64() * 1000.0);
+        }
+    };
+    let t = std::time::Instant::now();
     let mut prog = match rmc::mir::parse_with(&text, overflow_checks) {
         Ok(p) => p,
         Err(e) => {
@@ -54,34 +54,16 @@ fn main() {
             std::process::exit(1);
         }
     };
-    mark("parse", &mut t0);
-    rmc::mir::tco(&mut prog, overflow_checks);
-    mark("tco", &mut t0);
-    rmc::mir::inline_calls(&mut prog);
-    mark("inline", &mut t0);
-    rmc::mir::coalesce_call_results(&mut prog);
-    mark("coalesce", &mut t0);
-    rmc::mir::merge_blocks(&mut prog);
-    mark("merge_blocks", &mut t0);
-    prog.copy_propagate();
-    mark("copy_propagate", &mut t0);
-    rmc::mir::drop_redundant_asserts(&mut prog);
-    mark("drop_asserts", &mut t0);
-    rmc::mir::licm(&mut prog);
-    mark("licm", &mut t0);
-    rmc::mir::fold_accumulators(&mut prog);
-    rmc::mir::strength_reduce(&mut prog);
-    rmc::mir::close_counted_loops(&mut prog, overflow_checks);
-    mark("fold_accumulators", &mut t0);
-    rmc::mir::jump_thread(&mut prog);
-    mark("jump_thread", &mut t0);
-    rmc::mir::rotate_loops(&mut prog);
-    mark("rotate_loops", &mut t0);
-    rmc::mir::layout_blocks(&mut prog);
-    mark("layout_blocks", &mut t0);
+    // The same pass list as `rmc --rustc-frontend` and the codegen backend;
+    // `RMC_TIME=1` prints per-pass timings.
+    phase("parse", t);
+    let mo = rmc::MirOptions { overflow_checks, ..rmc::MirOptions::default() };
+    rmc::optimize_mir(&mut prog, &mo);
+    let t = std::time::Instant::now();
     match rmc::compile_mir_to_asm(&prog, &opts) {
         Ok(asm) => {
-            mark("codegen", &mut t0);
+            phase("codegen", t);
+            let t = std::time::Instant::now();
             if emit_asm {
                 print!("{asm}");
                 return;
@@ -96,7 +78,7 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            mark("assemble", &mut t0);
+            phase("assemble", t);
             if let Err(e) = std::fs::write(&output, &bytes) {
                 let _ = writeln!(std::io::stderr(), "rmc-mir: error: cannot write {}: {e}", output.display());
                 std::process::exit(1);

@@ -10,7 +10,7 @@ include!("prelude.rs");
 // read inside the loop, reuse is sound (the second loop).
 #[no_mangle]
 pub extern "C" fn main() -> i64 {
-    let n = arg(0);
+    let n = arg(1);
 
     // Destination read after the loop: must print (n - 1) * 7, not n * 7.
     let mut i = 0i64;

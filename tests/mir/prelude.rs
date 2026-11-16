@@ -23,6 +23,9 @@ fn out(x: i64) {
 fn outb(b: bool) {
     unsafe { print_bool(b as i64) }
 }
+// `arg(0)` is `argv[0]` (the program path, which parses as 0); the first
+// command-line argument is `arg(1)`. Reading `arg(0)` as data made several
+// cases ignore their argument vectors entirely.
 #[inline(always)]
 fn arg(i: i64) -> i64 {
     unsafe { arg_i64(i) }

@@ -29,6 +29,16 @@ OUT = "/tmp/rmcmirtests"
 # argv vectors per case. Each vector is one run; the case passes only if every
 # run matches. A case with no entry runs once with no arguments.
 ARGS = {
+    "regshare": [["5", "3"], ["-4", "9"], ["0", "0"]],
+    "bigindex": [["2"], ["-1"], ["6"]],
+    "cmpkinds": [["3"], ["9"], ["-5"], ["0"]],
+    "looprange": [["9", "5"], ["0", "7"], ["40", "-3"], ["2", "0"], ["30", "11"]],
+    "scalarstruct": [["3"], ["-11"], ["0"], ["40"]],
+    "selects": [["3"], ["4"], ["-7"], ["9"], ["0"], ["6"]],
+    "argshuffle": [["3", "5"], ["-8", "21"], ["0", "0"], ["13", "-2"]],
+    "mulconst": [["7"], ["-1"], ["922337203685477581"], ["-4611686018427387904"], ["255"], ["0"]],
+    "ranges": [["0"], ["7"], ["-95"], ["60"], ["-616"], ["300"]],
+    "stalefacts": [["3", "5", "0"], ["3", "1005", "0"], ["3", "5", "1"], ["3", "1005", "1"]],
     "cmp": [["-5"], ["0"], ["7"]],
     "forloop": [["6"], ["0"]],
     "calls": [["10", "20", "30"]],
@@ -55,9 +65,37 @@ ARGS = {
     # ovfcheck runs with overflow checks on: the first vector is in range, the
     # second overflows the add and must exit 101 on both binaries.
     "ovfcheck": [["2", "3"], ["9223372036854775807", "1"]],
+    # A constant on the left of `-`: small, negative, zero and extreme operands,
+    # and a loop count (the second argument) of zero, one and several.
+    "constleft": [["6", "0"], ["-6", "1"], ["0", "5"], ["9223372036854775807", "3"],
+                  ["-9223372036854775808", "2"]],
+    # With overflow checks: `5 - i64::MIN` overflows and must exit 101 on both
+    # sides; `5 - 6` must not.
+    "constleftovf": [["6"], ["-9223372036854775808"], ["-9223372036854775807"]],
     # srread reads its loop bounds from argv, so run zero, one and several
     # iterations to catch the off-by-one the strength-reduce guard prevents.
     "srread": [["0"], ["1"], ["2"], ["7"], ["64"]],
+    # The counted-loop closure: zero, one, negative and large trip counts for
+    # each of the three bounds, so the zero-trip guard and the fold are both hit.
+    "loopcount": [["0", "0", "0"], ["1", "1", "1"], ["5", "-3", "9"], ["1000", "7", "-1"]],
+    "loopneg": [["0"], ["1"], ["6"], ["-4"]],
+    # `[v; n]` with byte, word and multi-word elements, read at runtime indices.
+    "repeatelem": [["10", "0"], ["-3", "5"], ["7", "3"]],
+    # Realistic workloads, at small sizes. Each one found a back-end bug: a
+    # constant-left `-` (nqueens), an `&mut [T; N]` parameter written after
+    # inlining (fannkuch, matmul), a memory-to-memory `cmp` (sort), duplicate
+    # local labels across functions (vm), and an 8-byte `[0u8; N]` splat
+    # (textparse).
+    "real_vm": [["200"], ["1"]],
+    "real_sort": [["2"]],
+    "real_hashmap": [["20000"]],
+    "real_bfs": [["2"]],
+    "real_life": [["30"]],
+    "real_nqueens": [["8"], ["1"]],
+    "real_fannkuch": [["7"]],
+    "real_matmul": [["2"]],
+    "real_textparse": [["3"]],
+    "real_particles": [["100"]],
     # float accumulates `n` half-steps; run the empty and non-empty loops.
     "float": [["0"], ["1"], ["5"], ["9"]],
     # resenum builds a `Result` at runtime: n > 0 takes `Ok`, n <= 0 takes
@@ -152,9 +190,11 @@ def build_reference(name, rt):
     ])
     if rc != 0:
         return None, f"rustc failed:\n{err.decode(errors='replace')}"
-    link = ["cc", "-static", "-nostdlib", "-no-pie", obj, rt]
-    if overflow_checks(name):
-        link.append(overflow_stubs(obj))
+    # Every case, not only the `.overflow` ones: a runtime index keeps a
+    # `panic_bounds_check` call in the reference even with overflow checks
+    # off, and its mangled name is toolchain-specific, so it is stubbed from
+    # the object's own `nm -u` like the overflow entries.
+    link = ["cc", "-static", "-nostdlib", "-no-pie", obj, rt, overflow_stubs(obj)]
     link += ["-o", ref]
     rc, _, err = run(link)
     if rc != 0:
@@ -162,15 +202,23 @@ def build_reference(name, rt):
     return ref, None
 
 
-def build_rmc(name):
+def build_rmc(name, binutils=False):
+    """Build with rmc. `binutils` assembles with GNU `as` and links with `ld`
+    instead of the in-process encoder: the two must accept the same assembly
+    and produce binaries that behave identically. Label collisions and
+    width-ambiguous instructions (`cmp $k, mem`) each made them disagree."""
     src = os.path.join(ROOT, f"{name}.rs")
-    mir = os.path.join(OUT, f"{name}.mir.bin")
+    mir = os.path.join(OUT, f"{name}.{'bu' if binutils else 'mir'}.bin")
     argv = [RMC, "--rustc-frontend", src, "-o", mir]
     if overflow_checks(name):
         argv.insert(2, "--overflow-checks")
+    if binutils:
+        argv.insert(2, "--binutils")
     rc, _, err = run(argv)
     if rc != 0:
-        return None, f"rmc failed:\n{err.decode(errors='replace')}"
+        return None, f"rmc{' --binutils' if binutils else ''} failed:\n{err.decode(errors='replace')}"
+    if binutils and b"Warning" in err:
+        return None, f"`as` warned about the generated assembly:\n{err.decode(errors='replace')}"
     return mir, None
 
 
@@ -244,6 +292,8 @@ def main():
             failures += 1
             continue
         mir, err = build_rmc(name)
+        if not err:
+            bu, err = build_rmc(name, binutils=True)
         if err:
             print(f"FAIL {name}: {err}")
             failures += 1
@@ -253,9 +303,16 @@ def main():
         for argv in vectors:
             r_rc, r_out, _ = run([ref] + argv)
             m_rc, m_out, _ = run([mir] + argv)
+            b_rc, b_out, _ = run([bu] + argv)
             if r_rc != m_rc or r_out != m_out:
                 print(f"FAIL {name} {argv}: rustc rc={r_rc} out={r_out!r} | "
                       f"rmc rc={m_rc} out={m_out!r}")
+                bad = True
+                failures += 1
+                break
+            if (b_rc, b_out) != (m_rc, m_out):
+                print(f"FAIL {name} {argv}: in-process rc={m_rc} out={m_out!r} | "
+                      f"--binutils rc={b_rc} out={b_out!r}")
                 bad = True
                 failures += 1
                 break

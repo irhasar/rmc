@@ -8731,3 +8731,27 @@ fn a_str_or_ref_array_is_an_array_of_one_word_pointers() {
         );
     }
 }
+
+/// A frame that cannot fit the default 8 MiB stack is a compile error with a
+/// reason, not a binary that segfaults on entry. rmc stores each array element
+/// in an 8-byte slot, so a 1 MiB `[u8; N]` needs an 8 MiB frame.
+#[test]
+fn an_oversized_frame_is_a_clean_error() {
+    let src = "fn main() { let b: [u8; 1048576] = [0; 1048576]; println!(\"{}\", b[7] as i64); }";
+    let err = compile_to_asm(src, &CompileOptions::default()).unwrap_err();
+    assert!(err.contains("stack frame") && err.contains("8-byte slot"), "{err}");
+    // A frame that fits is still accepted.
+    let ok = "fn main() { let b: [u8; 4096] = [0; 4096]; println!(\"{}\", b[7] as i64); }";
+    compile_to_asm(ok, &CompileOptions::default()).unwrap();
+}
+
+/// The repeated value of `[v; n]` takes the declared element width, like a
+/// list literal's elements: `let b: [u8; 3] = [0; 3]` is accepted.
+#[test]
+fn a_repeat_literal_takes_the_declared_element_width() {
+    for ty in ["u8", "i8", "u16", "i32", "u32", "usize"] {
+        let src = format!("fn main() {{ let b: [{ty}; 3] = [1; 3]; println!(\"{{}}\", b[2] as i64); }}");
+        compile_to_asm(&src, &CompileOptions::default())
+            .unwrap_or_else(|e| panic!("[{ty}; 3] = [1; 3] rejected: {e}"));
+    }
+}

@@ -7,9 +7,9 @@ include!("prelude.rs");
 // memory. All four must match rustc, including the zero-trip guard.
 #[no_mangle]
 pub extern "C" fn main() -> i64 {
-    let n = arg(0);
-    let m = arg(1);
-    let k = arg(2);
+    let n = arg(1);
+    let m = arg(2);
+    let k = arg(3);
 
     let mut acc = 0i64;
     for _i in 0..n { acc += 7; }

@@ -4,7 +4,7 @@ include!("prelude.rs");
 fn g(x: i64) -> i64 { x * 2 }
 #[no_mangle]
 pub extern "C" fn main() -> i64 {
-    let n = arg(0);
+    let n = arg(1);
     // IV-dependent addend: must not close.
     let mut a = 0i64;
     for i in 0..n { a += i; }

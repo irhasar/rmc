@@ -40,6 +40,11 @@ jobs:
       - name: MIR crash survey
         run: python3 tools/mir_survey.py
 
+      # `std` programs (`println!` formatting, `black_box`) through the MIR
+      # route. It was not run here, so a formatting regression went unnoticed.
+      - name: MIR std differential tests
+        run: python3 tests/std/run.py
+
   # The real codegen-backend pipeline. `test` above runs on stable and so only
   # covers the printed-MIR prototype; this job installs the nightly `rustc-dev`
   # component, builds the backend dylib, and runs the differential suite that
@@ -70,6 +75,14 @@ jobs:
       - name: Codegen-backend differential tests
         run: python3 tests/cb/run.py
 
+      # Random programs inside the subset the back end lowers, through the
+      # dylib. The fixed suites only hold shapes someone thought of; this is
+      # what found the reversed `k - x` and the scaled-`lea` forwarding bug.
+      - name: Codegen-backend differential fuzz (bounded)
+        run: |
+          python3 tools/fuzz.py --mode mir --pipeline cb --n 200 --seed 1
+          python3 tools/fuzz.py --mode mir --pipeline cb --n 200 --seed 2 --overflow
+
   # The benchmark harnesses must run on a fresh machine with only the README's
   # steps: this is where their toolchain independence (no hard-coded mangled
   # symbol names) is checked, since a hard-coded spelling only breaks on a
@@ -99,13 +112,15 @@ jobs:
       - name: Build backend
         run: ./backend/build.sh
 
-      # One source, two back ends, from an empty output directory: the harness
+      # One source, four back ends, from an empty output directory: the harness
       # must create its own directories and discover the panic symbols itself.
-      - name: Fair benchmark (must complete)
-        run: python3 bench/run_fair.py
+      # Both sets: `core` (what the optimisers were tuned on) and `real` (ten
+      # held-out workloads), so a regression on either fails here.
+      - name: Four-way benchmark, both sets (must complete)
+        run: python3 bench/run_four.py --set all
 
-      - name: Four-way benchmark (must complete)
-        run: python3 bench/run_four.py
+      - name: Compile-time scaling (must complete)
+        run: python3 bench/scale.py --quick
 
   fuzz:
     runs-on: ubuntu-latest
@@ -156,3 +171,12 @@ jobs:
           python3 tools/fuzz.py --mode boolbit --n 400 --seed 2
           python3 tools/fuzz.py --mode vis --n 400 --seed 1
           python3 tools/fuzz.py --mode vis --n 400 --seed 2
+
+      # The MIR route (`rmc --rustc-frontend`) gets its own generator: the
+      # modes above emit constructs it refuses, so they never reach its code
+      # generator.
+      - name: MIR-route differential fuzz (bounded)
+        run: |
+          python3 tools/fuzz.py --mode mir --n 400 --seed 1
+          python3 tools/fuzz.py --mode mir --n 400 --seed 2
+          python3 tools/fuzz.py --mode mir --n 200 --seed 3 --overflow

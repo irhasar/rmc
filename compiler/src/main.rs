@@ -264,29 +264,13 @@ fn run_mir_pipeline(opts: &Options) -> Result<(), String> {
 /// Lower `rustc --emit=mir` text with the rmc back end. Shared by the `.rs`
 /// front end and the `.mir` input path, so both go through the same passes.
 fn run_mir_text(opts: &Options, mir: &str) -> Result<(), String> {
-    let mut prog = rmc::mir::parse(mir)?;
-    if !opts.no_tco {
-        rmc::mir::tco(&mut prog, opts.overflow_checks);
-    }
-    if !opts.no_inline {
-        rmc::mir::inline_calls(&mut prog);
-    }
-    rmc::mir::coalesce_call_results(&mut prog);
-    rmc::mir::merge_blocks(&mut prog);
-    prog.copy_propagate();
-    rmc::mir::drop_redundant_asserts(&mut prog);
-    if !opts.no_licm {
-        rmc::mir::licm(&mut prog);
-    }
-    rmc::mir::fold_accumulators(&mut prog);
-    rmc::mir::strength_reduce(&mut prog);
-    rmc::mir::close_counted_loops(&mut prog, opts.overflow_checks);
-    rmc::mir::jump_thread(&mut prog);
-    rmc::mir::prune_unreachable(&mut prog);
-    rmc::mir::rotate_loops(&mut prog);
-    rmc::mir::layout_blocks(&mut prog);
-    let mir_opts = rmc::mir_codegen::Options { promote: true };
-    let asm = rmc::compile_mir_to_asm(&prog, &mir_opts)?;
+    let mo = rmc::MirOptions {
+        overflow_checks: opts.overflow_checks,
+        inline: !opts.no_inline,
+        licm: !opts.no_licm,
+        tco: !opts.no_tco,
+    };
+    let asm = rmc::mir_text_to_asm(mir, &mo)?;
     emit_binary(opts, &asm)
 }
 
@@ -378,8 +362,16 @@ fn run(opts: Options) -> Result<(), String> {
 }
 
 fn assemble(asm: &Path, obj: &Path) -> Result<(), String> {
+    // Keep branches off 32-byte boundaries the way the in-process assembler
+    // does (`elf.rs`, `branch_pts`), padding with `nop`s only, so the two link
+    // paths lay hot loops out alike.
     let out = Command::new("as")
         .arg("--64")
+        .args([
+            "-malign-branch-boundary=32",
+            "-malign-branch=jcc+fused+jmp",
+            "-malign-branch-prefix-size=0",
+        ])
         .arg("-o")
         .arg(obj)
         .arg(asm)
