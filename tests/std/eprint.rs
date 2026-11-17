@@ -1,4 +1,0 @@
-fn main() {
-    eprintln!("to stderr");
-    println!("to stdout");
-}

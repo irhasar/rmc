@@ -1,0 +1,55 @@
+name: Various rustc tests
+
+on:
+  - push
+
+permissions: {}
+
+jobs:
+  bootstrap_rustc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    - name: CPU features
+      run: cat /proc/cpuinfo
+
+    - name: Cache cargo target dir
+      uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+      with:
+        path: build/cg_clif
+        key: ${{ runner.os }}-rustc-test-cargo-build-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+
+    - name: Test
+      run: ./scripts/test_bootstrap.sh
+
+
+  rustc_test_suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    - name: CPU features
+      run: cat /proc/cpuinfo
+
+    - name: Cache cargo target dir
+      uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+      with:
+        path: build/cg_clif
+        key: ${{ runner.os }}-rustc-test-cargo-build-target-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+
+    - name: Install ripgrep
+      run: |
+        sudo apt update
+        sudo apt install -y ripgrep
+
+    - name: Test
+      run: ./scripts/test_rustc_tests.sh
