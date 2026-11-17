@@ -181,6 +181,13 @@ pub(crate) fn compile_fn(
         }
     }
 
+    // Forward stack-slot stores into the loads that read them back, and drop
+    // stores nothing reads. cg_clif materialises aggregates through stack slots,
+    // and Cranelift keeps those round-trips because the slot is not `readonly`.
+    // This must run before `unroll`, whose affine analysis rejects any loop that
+    // still touches memory.
+    crate::store_forward::run(&mut context.func);
+
     // Widen canonical counted loops so their carried dependency chains are
     // shortened. Cranelift has no unrolling pass of its own.
     crate::unroll::run(&mut context.func);

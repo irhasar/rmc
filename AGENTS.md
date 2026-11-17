@@ -70,13 +70,33 @@ Experiments comparing Rust codegen backends: LLVM (`rustc`) vs
   mem micro-kernel 110→65 ms; p2_mem 156→122 ms. This supersedes the earlier
   note that extending SROA to `&mut`/`RawPtr` is always a miscompile: it is only
   unsafe for whole-local borrows, not for deref-through borrows.
+- **NEW** `src/store_forward.rs` **CLIF stack store→load forwarding + dead-store
+  elimination**: forwards a `store` into a private (non-escaping) stack slot to
+  every later `load` of the same address, aliases the load result to the stored
+  value and removes the load; then deletes stores whose bytes no surviving load
+  reads. This is the lever that finally closes p5 (896 ms → **61 ms**, matching
+  LLVM's 57 ms). It must run **before** `unroll`: the affine loop pass rejects any
+  body that still touches memory, and the store/load round-trip cg_clif emits for
+  an iterator's `Option<u64>` otherwise blocks the reassociation.
+  - Why it is needed: Cranelift's egraph only value-numbers loads that are
+    `readonly`, `notrap` and `can_move`. A store to an explicit stack slot is not
+    `readonly`, so a `store`/`load` round-trip of the same slot survives into the
+    machine code, and inside a loop it lands on the carried dependency chain.
+  - Soundness: only slots whose address is *never* used as anything but the
+    address operand of a load/store are touched (`private_slots`), so no call or
+    indirect store can observe the slot. Overlapping (partial) stores are not
+    forwarded: only an exact `(slot, offset, type)` match is. Knob:
+    `CG_CLIF_NO_STORE_FWD`.
+  - Verified by rebuilding the whole standard library with the pass enabled
+    (`./y.sh build --sysroot clif`) and re-checking all program outputs against
+    LLVM.
 
 ## What did NOT work / open leads
 - Extending SROA to **`&mut`/`RawPtr` *whole-local* borrows** (with `local_map`
   redirect) is a **miscompile** (p1/p3/p4 wrong). Shared-only is correct.
   (The `4290fb6` change is different and safe: it only relaxes *deref-through*
   borrows, where the local is read, never written, through the reference.)
-- Remaining runtime gap on p2–p5 (LLVM 17–58 ms vs mod 106–365 ms) is **not**
+- Remaining runtime gap on **p1–p4** (LLVM 17–57 ms vs mod 99–140 ms) is **not**
   loops and **not** the `Vec` header anymore:
   - p2_mem is dominated by `HashMap::entry`/hashbrown: a bare
     `for i { m.entry(i % 65536).or_insert(0) }` loop is 55 ms (LLVM) vs 672 ms
@@ -86,9 +106,9 @@ Experiments comparing Rust codegen backends: LLVM (`rustc`) vs
     single missing pass.
   - p3_calls splits between `fib` recursion (LLVM rewrites the binary recursion
     into one recursive call per step; cg_clif emits both calls) and `format!`.
-  - p5_inline/p6_scalar: same loop, but p5's iterator keeps an `Option<u64>` on
-    the stack (mem2reg), blocking reassociation.
-  - p4_simd has no `Vec`; it is plain memory-heavy code (spills/bounds checks).
+  - p4_simd/p1_arith need autovectorization, which Cranelift does not do. Tested:
+    `-C target-cpu=native` does **not** close it (p2 stays 124 ms vs LLVM 17 ms;
+    p4 141 ms vs 57 ms), so it is not just the baseline-SSE2 default.
   - Raising the inliner budget (`CG_CLIF_INLINE_MAX=256`) buys only ~4% on p2 and
     ~5% on p4, so cross-CGU inlining is not the lever.
 - The inliner is currently redundant: MIR inlining already folds the small
@@ -97,9 +117,6 @@ Experiments comparing Rust codegen backends: LLVM (`rustc`) vs
   the win LLVM gets on p5/p6 is *affine reassociation* of the accumulator chain,
   not unrolling per se. Duplicating the body leaves the loop-carried dependency
   chain intact. Implemented anyway behind `CG_CLIF_UNROLL_CLONE` for completeness.
-- Remaining runtime gap on p2–p5 (LLVM 17–58 ms vs mod 106–365 ms) is memory
-  promotion: cg_clif spills aggregate temporaries to the stack where LLVM keeps
-  them in registers (see the per-program breakdown above).
 
 ## Gotchas
 - `measure.py`/`compare3.sh`: pass the rustc command as separate argv elements;

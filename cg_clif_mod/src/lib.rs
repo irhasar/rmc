@@ -75,6 +75,7 @@ mod num;
 mod optimize;
 mod pointer;
 mod pretty_clif;
+mod store_forward;
 mod toolchain;
 mod unroll;
 mod unsize;
