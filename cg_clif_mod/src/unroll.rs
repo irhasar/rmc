@@ -458,7 +458,7 @@ fn apply_reassoc(func: &mut ir::Function, plan: &Plan, factor: u64, rows: &[Affi
         // Wide path only when all `factor` iterations satisfy the loop test:
         // `iv + (factor-1)*delta` must still pass, and must not have wrapped.
         let iv = plan.iv;
-        let iv_last = pos.ins().iadd_imm(iv, Imm64::new(last as i64));
+        let iv_last = pos.ins().iadd_imm_s(iv, Imm64::new(last as i64));
         let no_wrap = pos.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, iv_last, iv);
         let last_ok = if plan.iv_left {
             pos.ins().icmp(plan.cc, iv_last, plan.bound)
@@ -548,7 +548,7 @@ fn apply_clone(func: &mut ir::Function, plan: &Plan, factor: u64) {
         let bound = plan.bound;
         let mut pos = FuncCursor::new(func);
         pos.goto_first_insertion_point(plan.body);
-        let iv_last = pos.ins().iadd_imm(iv, Imm64::new(last as i64));
+        let iv_last = pos.ins().iadd_imm_s(iv, Imm64::new(last as i64));
         let no_wrap = pos.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, iv_last, iv);
         let last_ok = if plan.iv_left {
             pos.ins().icmp(plan.cc, iv_last, bound)

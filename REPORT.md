@@ -292,17 +292,18 @@ batas wrap `u64`.
 
 | prog | LLVM run | up run | mod run | LLVM size | up size | mod size |
 |------|---------:|-------:|--------:|----------:|--------:|---------:|
-| p1_arith  |  82 ms | 109 ms | 107 ms | 4.64 MB | 5.88 MB | 4.84 MB |
-| p2_mem    |  19 ms | 156 ms | 125 ms | 4.64 MB | 5.94 MB | 4.88 MB |
-| p3_calls  |  37 ms | 117 ms | 109 ms | 4.61 MB | 5.82 MB | 4.78 MB |
-| p4_simd   |  56 ms | 159 ms | 143 ms | 4.64 MB | 5.89 MB | 4.85 MB |
-| p5_inline |  58 ms | 896 ms | 360 ms | 4.61 MB | 5.81 MB | 4.76 MB |
-| p6_scalar |  58 ms | 902 ms | **61 ms** | 4.61 MB | 5.81 MB | 4.76 MB |
+| p1_arith  |  81 ms | 109 ms | 104 ms | 4.64 MB | 5.88 MB | 4.76 MB |
+| p2_mem    |  17 ms | 156 ms | **122 ms** | 4.64 MB | 5.94 MB | 4.80 MB |
+| p3_calls  |  37 ms | 116 ms | 107 ms | 4.61 MB | 5.82 MB | 4.70 MB |
+| p4_simd   |  56 ms | 158 ms | 142 ms | 4.64 MB | 5.89 MB | 4.78 MB |
+| p5_inline |  57 ms | 896 ms | 365 ms | 4.61 MB | 5.81 MB | 4.69 MB |
+| p6_scalar |  57 ms | 902 ms | **61 ms** | 4.61 MB | 5.81 MB | 4.69 MB |
 
 Ringkas: terhadap cg_clif upstream, modifikasi ini memberi **−15% ukuran**,
 **runtime setara LLVM pada kernel skalar murni (p6: 902→61 ms, ~15×)**, dan
 tidak menambah waktu compile. Gap yang masih ada pada p2–p5 berasal dari
-inlining lintas-CGU dan promosi memori yang belum lengkap, bukan dari loop.
+promosi memori (spill agregat) yang belum lengkap, bukan dari loop maupun
+header `Vec` (lihat 8.6 dan 8.7).
 
 Compile time ketiga backend praktis setara (~90–180 ms); cg_clif tidak lebih
 lambat, hanya masih lebih besar dan (pada p2–p5) lebih lambat saat dijalankan.
@@ -314,4 +315,57 @@ lambat, hanya masih lebih besar dan (pada p2–p5) lebih lambat saat dijalankan.
 | `CG_CLIF_UNROLL` | 8 | faktor reassociasi (1 = mati) |
 | `CG_CLIF_UNROLL_CLONE` | unset | aktifkan unroll duplikasi-body (fallback) |
 | `CG_CLIF_INLINE_MAX` | 64 | batas instruksi callee untuk inliner (0 = mati) |
+
+### 8.6 SSA sadar-borrow: header `Vec` tetap di register — LANDED, `4290fb6`
+
+Analisis SSA (`src/analyze.rs`) menandai local `NotSsa` untuk **setiap** borrow
+`&mut`/`&raw`, sehingga local dipaksa ke stack slot. Itu memang perlu bila borrow
+menunjuk **ke dalam** storage local (mis. `&mut v`, `&raw mut v[0]`), tetapi
+**tidak** bila borrow men-*deref* local dulu (`&mut *p`, `&raw mut *p`): pola itu
+hanya membaca nilai local untuk membentuk alamat, lalu menulis lewat pointer yang
+dipegangnya.
+
+Korban utamanya `Vec` yang diindeks di loop. cg_clif menurunkan `_30 = &raw mut
+(*_30)` untuk temporary `*mut [u64]`, menandainya `NotSsa`, sehingga **seluruh
+header `Vec` (ptr/len/cap) tertahan di stack** dan di-reload setiap iterasi —
+bersama rentetan round-trip `Option`/place di sekitarnya.
+
+Perbaikan: hanya paksa `NotSsa` bila proyeksi borrow **tidak** mengandung `Deref`.
+
+Efek pada kernel mikro (40 juta RMW indeks acak atas array 4K, ms):
+
+| kernel | LLVM | mod sebelum | mod sesudah |
+|--------|-----:|------------:|------------:|
+| `mem` (`vec!` + indeks) | 22 | 110 | **65** |
+| `memw` (while + indeks)  | 22 | 87  | **51** |
+| `memp` (raw ptr)         | 22 | 40  | 38 |
+
+p2_mem: 156 → 122 ms. Semua keluaran tetap identik dengan LLVM (lihat 8.8).
+
+### 8.7 Sisa gap: promosi memori, bukan loop
+
+Setelah 8.3 dan 8.6, gap yang tersisa (p2–p5) **bukan** loop dan **bukan** lagi
+header `Vec`, melainkan spill agregat yang belum dipromosikan:
+
+- **p2_mem** didominasi `HashMap::entry`/hashbrown. Loop `for i {
+  m.entry(i % 65536).or_insert(0) }` saja: **55 ms (LLVM) vs 672 ms (mod), ~12×**.
+  Disasm loop probe hashbrown menunjukkan hampir semua temporary di-spill ke
+  stack (~20 slot; mis. `movdqu xmm→stack` sebelum `movemask`). Ini keterbatasan
+  mem2reg/aggregate-SSA pada lowering MIR cg_clif, bukan satu pass yang hilang.
+- **p3_calls** terbagi antara rekursi `fib` (LLVM mengubah rekursi biner menjadi
+  satu panggilan rekursif per langkah; cg_clif tetap dua) dan `format!`.
+- **p5_inline** adalah loop yang sama dengan p6, tetapi iteratornya menyimpan
+  `Option<u64>` di stack (mem2reg), sehingga reassociasi tidak jalan.
+- **p4_simd** tanpa `Vec`: kode berat memori murni (spill + bounds check).
+- Menaikkan budget inliner (`CG_CLIF_INLINE_MAX=256`) hanya memberi ~4% pada p2
+  dan ~5% pada p4, jadi inlining lintas-CGU bukan lever.
+
+### 8.8 Verifikasi (suite keluaran)
+
+Dibandingkan keluaran LLVM vs mod untuk **20 program** (6 prog bench + kernel
+mikro `mem`/`memw`/`memu`/`mema`/`memp`/`call`/`bsrch`/`hm`/`srt`/`fib`/`fmt`
++ `borrow`/`iter`/`aliasing` + p1–p6): **20/20 identik**, termasuk pola aliasing
+yang sengaja menulis lewat borrow (`*r = …`), reborrow, `&mut` field, dan
+`&mut` elemen — memastikan local yang benar-benar ditulis lewat borrow tetap
+di stack dan tidak menjadi stale.
 

@@ -9,7 +9,7 @@ Experiments comparing Rust codegen backends: LLVM (`rustc`) vs
 - `build.sh` — rebuilds the modified cg_clif + its Cranelift std sysroot.
 - `cg_clif_upstream/` — pristine cg_clif (commit 42ac63e).
 - `cg_clif_mod/` — fork with the modifications (see commits
-  `b6c94e4`…`9ea4bbe`).
+  `b6c94e4`…`4290fb6`).
 - `bench/` — harness:
   - `compare3.sh` — 3-way benchmark (LLVM / cg_clif up / cg_clif mod) across 5
     sysroot configs; prints `C`=compile, `S`=size, `R`=run metrics.
@@ -26,7 +26,8 @@ Experiments comparing Rust codegen backends: LLVM (`rustc`) vs
 ## Key facts learned
 - Cranelift is **Apache-2.0 WITH LLVM-exception**; forking/reworking is fine.
 - cg_clif compiles ~20–45% faster than LLVM but produces ~26% larger binaries
-  and runs 2–9× slower.
+  and (upstream) runs 2–9× slower; the modified fork closes most of that gap
+  (p6: 902→61 ms; p2: 156→122 ms).
 - **Size root cause:** `cranelift-object` named every function section
   `.text.subsection` and every data object `.data.rel.ro.subsection`; the linker
   merges same-named sections so `--gc-sections` could not drop dead code.
@@ -60,19 +61,45 @@ Experiments comparing Rust codegen backends: LLVM (`rustc`) vs
   unroller is also present but **off by default** (`CG_CLIF_UNROLL_CLONE`): it is
   correct but slower, because duplicating a body does not shorten the carried
   chain. Knob: `CG_CLIF_UNROLL` (default 8).
+- `4290fb6` **borrow-aware SSA** (`src/analyze.rs`): a mutable/raw borrow now only
+  forces its local to a stack slot when the borrow points *into* that local's own
+  storage. A borrow that dereferences the local first (`&mut *p`, `&raw mut *p`)
+  merely reads it, so the local may stay in a register. Before this, cg_clif
+  emitted `_30 = &raw mut (*_30)` for a `Vec` indexing loop, which pinned the
+  whole `Vec` header (ptr/len/cap) to the stack and reloaded it every iteration.
+  mem micro-kernel 110→65 ms; p2_mem 156→122 ms. This supersedes the earlier
+  note that extending SROA to `&mut`/`RawPtr` is always a miscompile: it is only
+  unsafe for whole-local borrows, not for deref-through borrows.
 
 ## What did NOT work / open leads
-- Extending SROA to **`&mut`/`RawPtr` whole-local borrows** (with `local_map`
+- Extending SROA to **`&mut`/`RawPtr` *whole-local* borrows** (with `local_map`
   redirect) is a **miscompile** (p1/p3/p4 wrong). Shared-only is correct.
+  (The `4290fb6` change is different and safe: it only relaxes *deref-through*
+  borrows, where the local is read, never written, through the reference.)
+- Remaining runtime gap on p2–p5 (LLVM 17–58 ms vs mod 106–365 ms) is **not**
+  loops and **not** the `Vec` header anymore:
+  - p2_mem is dominated by `HashMap::entry`/hashbrown: a bare
+    `for i { m.entry(i % 65536).or_insert(0) }` loop is 55 ms (LLVM) vs 672 ms
+    (mod), ~12×. The hashbrown probe loop spills almost every temporary to the
+    stack (~20 slots, e.g. `movdqu xmm→stack` before `movemask`), so the gap is a
+    pervasive mem2reg/aggregate-SSA limitation of cg_clif's MIR lowering, not a
+    single missing pass.
+  - p3_calls splits between `fib` recursion (LLVM rewrites the binary recursion
+    into one recursive call per step; cg_clif emits both calls) and `format!`.
+  - p5_inline/p6_scalar: same loop, but p5's iterator keeps an `Option<u64>` on
+    the stack (mem2reg), blocking reassociation.
+  - p4_simd has no `Vec`; it is plain memory-heavy code (spills/bounds checks).
+  - Raising the inliner budget (`CG_CLIF_INLINE_MAX=256`) buys only ~4% on p2 and
+    ~5% on p4, so cross-CGU inlining is not the lever.
 - The inliner is currently redundant: MIR inlining already folds the small
   helpers it targets, so it is correct but net-neutral on size/speed.
 - **Body-duplicating unrolling does not help.** Measured slower on p6 (357→423 ms):
   the win LLVM gets on p5/p6 is *affine reassociation* of the accumulator chain,
   not unrolling per se. Duplicating the body leaves the loop-carried dependency
   chain intact. Implemented anyway behind `CG_CLIF_UNROLL_CLONE` for completeness.
-- Remaining runtime gap on p2–p5 (LLVM 19–58 ms vs mod 107–360 ms) is not loops:
-  it is cross-CGU inlining and full memory-to-register promotion, which are not
-  yet complete.
+- Remaining runtime gap on p2–p5 (LLVM 17–58 ms vs mod 106–365 ms) is memory
+  promotion: cg_clif spills aggregate temporaries to the stack where LLVM keeps
+  them in registers (see the per-program breakdown above).
 
 ## Gotchas
 - `measure.py`/`compare3.sh`: pass the rustc command as separate argv elements;

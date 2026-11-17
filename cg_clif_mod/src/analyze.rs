@@ -37,10 +37,19 @@ pub(crate) fn analyze(fx: &FunctionCx<'_, '_, '_>) -> IndexVec<Local, SsaKind> {
                         flag_map[place.local] = SsaKind::NotSsa;
                     }
                 }
-                // Mutable and raw borrows can be written through the reference and outlive the
-                // borrow, so the variable would go stale; keep these locals in a stack slot.
+                // A mutable or raw borrow that points *into* the local's own storage (the local
+                // itself, or a field/array element of it) hands out a pointer through which the
+                // local can be written, so the variable would go stale; keep it in a stack slot.
+                //
+                // A borrow that dereferences the local first (e.g. `&mut *p` for a pointer `p`)
+                // only *reads* the local's value to form the address and writes through the
+                // pointer it holds, not into the local's storage. Such a local can stay in a
+                // variable. This is what keeps a `Vec`'s header (ptr/len/cap) in registers across
+                // an indexing loop instead of reloading it from a stack slot every iteration.
                 Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
-                    flag_map[place.local] = SsaKind::NotSsa;
+                    if !place.projection.iter().any(|elem| matches!(elem, PlaceElem::Deref)) {
+                        flag_map[place.local] = SsaKind::NotSsa;
+                    }
                 }
                 _ => {}
             }
