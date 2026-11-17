@@ -1,11 +1,13 @@
 #!/bin/bash
 # 3-way runtime + size + compile comparison: LLVM vs upstream cg_clif vs modified.
 set -u
+BENCH=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(dirname "$BENCH")
 N=nightly-2026-11-17
 L="rustc +$N"
-U=/workspace/project/experiments/cg_clif_upstream/dist/bin/rustc-clif
-M=/workspace/project/experiments/cg_clif_mod/dist/bin/rustc-clif
-P=/workspace/project/experiments/bench/progs
+U="$ROOT/cg_clif_upstream/dist/bin/rustc-clif"
+M="$ROOT/cg_clif_mod/dist/bin/rustc-clif"
+P="$BENCH/progs"
 D=/tmp/cmp3; mkdir -p $D
 printf "%-10s %8s %8s %8s | %8s %8s %8s | %8s %8s %8s\n" prog Lrun Urun Mrun Lsz Usz Msz Lcpl Ucpl Mcpl
 for src in $P/p*.rs; do
