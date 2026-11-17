@@ -110,6 +110,10 @@ Median wall (ms), program dijalankan 5×:
 cg_clif **1,3×–9× lebih lambat** dari LLVM. Patch ukuran tidak mengubah
 kecepatan runtime (sesuai harapan — hanya membuang kode mati).
 
+> Tabel ini menggambarkan kondisi setelah patch **ukuran** saja. Setelah pass
+> runtime (bagian 8) ditambahkan, angka mod membaik; lihat **8.4** untuk hasil
+> akhir (p2_mem 156→122 ms, p6 902→61 ms, dst.).
+
 ### Akar penyebab runtime (tiga lapis)
 
 **Lapis 1 — tidak ada inlining.** Cranelift menyediakan infrastruktur inlining
