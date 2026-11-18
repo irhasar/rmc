@@ -56,6 +56,7 @@ mod allocator;
 mod analyze;
 mod base;
 mod cast;
+mod clifprof;
 mod codegen_f16_f128;
 mod codegen_i128;
 mod common;
@@ -73,10 +74,12 @@ mod linkage;
 mod main_shim;
 mod num;
 mod optimize;
+mod passtime;
 mod pointer;
 mod pretty_clif;
 mod store_forward;
 mod toolchain;
+mod tunables;
 mod unroll;
 mod unsize;
 mod unwind_module;
@@ -321,9 +324,8 @@ fn build_isa(sess: &Session, jit: bool) -> Arc<dyn TargetIsa + 'static> {
             // ask Cranelift for `speed_and_size`, which lets the backend prefer
             // shorter encodings over the fastest ones. `CG_CLIF_OPT_LEVEL`
             // overrides this for experimentation.
-            let level = std::env::var("CG_CLIF_OPT_LEVEL")
-                .unwrap_or_else(|_| "speed_and_size".to_string());
-            flags_builder.set("opt_level", &level).unwrap();
+            let level = crate::tunables::opt_level().unwrap_or("speed_and_size");
+            flags_builder.set("opt_level", level).unwrap();
         }
     }
 

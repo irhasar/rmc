@@ -236,6 +236,23 @@ Add new programs under `bench/progs/` so they are picked up automatically.
 
 
 
+## Session (2026-11-18, later) — pass cost + SIMD lane ICE fix
+- `cg_clif_mod` head `97617a1` "Speed up CLIF passes, cache knobs, fix SIMD
+  lane ICE". Changes: new `src/tunables.rs` (all env knobs read once via
+  `OnceLock`), new `src/passtime.rs` (`CG_CLIF_PASS_TIME=1`) and
+  `src/clifprof.rs` (`CG_CLIF_CLIF_TIME=1`) pass accounting, `store_forward`
+  rewritten to a single `analyze` setup + one reverse-postorder sweep
+  (9.2ms → 5.1ms on p2_mem), and a fix for the pre-existing SIMD-lane ICE:
+  `value_lane`/`value_typed_lane`/`value_lane_dyn` now spill `ByVal` vectors
+  through `force_stack` instead of hitting `unreachable!()`.
+- `./y.sh test` now **3011 passed / 0 failed** (+596 core benches); the
+  `jit.std_example` / `aot.std_example` ICE is gone.
+- `REPORT.md` §8.13–8.15 updated with the full three-way matrix
+  (`bench/fullbench.sh`, RC=7/RR=9).
+- `rmc_clone` subtree re-synced from `cg_clif_mod` (identical `src/`), plus
+  `bench/fullbench.sh`, `bench/tests/`, refreshed `REPORT.md`.
+- Push to `irhasar/rmc` still 403 (`Resource not accessible by integration`).
+
 ## Push status (T6) — DONE
 - PR **#10** (`replace-main-with-cgclif-experiments` → `main`) is open,
   **mergeable=True (clean)**. Local `rmc_clone` == remote.

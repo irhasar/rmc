@@ -436,6 +436,10 @@ Hasil pada `p2_mem`: runtime **110 → 99 ms** (LLVM 17 ms); ukuran **4.41 MB**
 | `CG_CLIF_INLINE_MAX` | 64 | batas instruksi callee untuk inliner (0 = mati) |
 | `CG_CLIF_INLINE_USES` | 3 | maksimum berapa kali satu callee boleh di-inline ke satu caller |
 | `CG_CLIF_NO_STORE_FWD` | unset | matikan store→load forwarding |
+| `CG_CLIF_PASS_TIME` | unset | cetak waktu per-pass cg_clif (store_forward/unroll/inline/collect) |
+| `CG_CLIF_CLIF_TIME` | unset | cetak waktu per-pass internal Cranelift |
+| `CG_CLIF_SF_NO_CBE` | unset | matikan dataflow store-forwarding lintas blok |
+| `CG_CLIF_SF_CBE_MAX` | 300 | batas instruksi fungsi agar CBE dijalankan |
 
 ### 8.11 Inliner callee yang mereferensi global (revisi ini) — LANDED, `c2e292b`
 
@@ -487,4 +491,65 @@ internal backend dan tidak terjangkau pass sisi cg_clif.
 Semua keluaran stdout identik dengan LLVM (p1–p6, TLS, atomik, static). M
 mengompilasi ~1.7–2× lebih cepat dari LLVM di p2 dan ~7% lebih kecil dari LLVM,
 dengan peak RSS setara.
+
+### 8.13 Biaya pass: dari "berat" jadi "nyaris gratis" — LANDED
+
+Pass CLIF kustom berjalan sekali per fungsi, jadi setiap `std::env::var` di
+dalamnya dibayar ribuan kali per crate — dan `std::env::var` mengunci map global
+tiap panggilan. Tiga perubahan:
+
+1. **`src/tunables.rs`** — semua knob dibaca sekali lewat `OnceLock` lalu
+   di-cache; sisa pass memanggil fungsi tanpa lookup env.
+2. **`store_forward`** — tiga penelusuran setup per-instruksi (slot privat,
+   pointer base non-escaping, byte-range yang dibaca load) digabung jadi satu
+   `analyze`. Dataflow worklist diganti satu sapuan *reverse-postorder*: pada CFG
+   reducible (semua yang cg_clif hasilkan) predecessor selain back edge sudah
+   dikunjungi sebelum sebuah blok, jadi satu sapuan mencapai fakta yang sama
+   dengan fixed point. Back edge yang belum tersedia hanya menyumbang nol fakta —
+   under-approximation konservatif, selalu aman untuk forwarding. Event store
+   tiap blok di-decode sekali.
+3. **Akuntansi pass opt-in** — `src/passtime.rs` (`CG_CLIF_PASS_TIME=1`) untuk
+   pass cg_clif sendiri, `src/clifprof.rs` (`CG_CLIF_CLIF_TIME=1`) untuk pass
+   internal Cranelift. Yang kedua butuh `timing.rs` mengekspos `ALL_PASSES`.
+
+Biaya `store_forward` di p2_mem: **9.2 ms → 5.1 ms**; total pass kustom p2_mem
+≈ 8 ms dari ~128 ms compile (≈6%). Profil pass Cranelift (sampel): total ≈27.9 ms;
+Compilation ≈14.5, Egraph ≈4.6, Regalloc ≈4.2, VCode lower ≈2.0, emit ≈1.5.
+
+### 8.14 Perbaikan ICE SIMD lane — LANDED
+
+Commit `a9d182a` ("Keep SIMD values in registers") membuat nilai `#[repr(simd)]`
+berada di register sebagai `ByVal` CLIF vector, tetapi
+`CValue::value_lane`/`value_typed_lane`/`value_lane_dyn` masih mengasumsikan
+`ByRef` dan langsung `unreachable!()` saat menerima `ByVal`. Akibatnya
+`simd_shuffle` pada `__m128i` (mis. `_mm_slli_si128`) menabrak compiler — ICE
+yang membuat `jit.std_example` dan `aot.std_example` gagal. Ketiganya sekarang
+mem-*spill* lewat `force_stack` (no-op bila nilainya sudah addressable).
+
+Efek: `./y.sh test` **3011 passed / 0 failed** (+596 core benches). Ini menutup
+satu-satunya ICE yang tersisa di jalur `std::arch`.
+
+### 8.15 Matriks lengkap tiga arah (revisi ini)
+
+`bench/fullbench.sh` (RC=7, RR=9), wall/CPU dalam ms, RSS dalam MB.
+
+| prog | cwall L/U/M | ccpu L/U/M | crss L/U/M | size L/U/M (byte) | rwall L/U/M | rcpu L/U/M | rrss L/U/M |
+|------|-------------|------------|------------|-------------------|-------------|------------|------------|
+| p1_arith | 93/85/86 | 112/108/109 | 105/108/109 | 4635232/5878688/4395200 | 82/108/104 | 81/108/103 | 10/10/10 |
+| p2_mem | 248/132/144 | 376/175/194 | 133/131/132 | 4639888/5936880/4418800 | 18/157/61 | 17/157/60 | 10/10/10 |
+| p3_calls | 105/92/96 | 127/117/123 | 116/116/117 | 4612368/5820872/4334960 | 37/116/97 | 37/116/97 | 10/10/10 |
+| p4_simd | 114/98/101 | 134/122/125 | 116/117/118 | 4636096/5893112/4403032 | 56/157/143 | 57/156/141 | 48/49/48 |
+| p5_inline | 88/81/82 | 111/104/110 | 104/106/107 | 4609368/5814440/4325864 | 58/894/61 | 58/893/61 | 10/10/10 |
+| p6_scalar | 96/81/82 | 110/104/104 | 101/103/104 | 4609368/5814424/4325864 | 58/902/61 | 57/902/61 | 10/10/10 |
+
+Kesimpulan tiap sumbu:
+
+- **Compile**: M ≈ U (dalam noise), keduanya 8–15% lebih cepat dari LLVM kecuali
+  p2 di mana M/U ~1.7× lebih cepat. RSS compile setara.
+- **Ukuran**: M ~7% lebih kecil dari LLVM, ~25% lebih kecil dari U (berkat
+  `per_data_object_section`).
+- **Runtime**: M menutup hampir seluruh gap U→LLVM pada loop scalar/inline
+  (p5/p6: 894→61 ms, ≈15×) dan mem (p2: 157→61 ms). Sisanya adalah kualitas
+  codegen Cranelift (regalloc + autovektorisasi), bukan pass sisi cg_clif.
+
 

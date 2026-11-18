@@ -176,7 +176,7 @@ pub(crate) fn compile_fn(
     if !bodies.is_empty() {
         let inliner =
             crate::inliner::CguInliner::new(bodies, codegened_func.func_id.as_u32());
-        if let Err(err) = context.inline(inliner) {
+        if let Err(err) = crate::passtime::time(crate::passtime::INLINE, || context.inline(inliner)) {
             dcx.fatal(format!("inlining failed for {}: {err:?}", codegened_func.symbol_name));
         }
     }
@@ -186,11 +186,13 @@ pub(crate) fn compile_fn(
     // and Cranelift keeps those round-trips because the slot is not `readonly`.
     // This must run before `unroll`, whose affine analysis rejects any loop that
     // still touches memory.
-    crate::store_forward::run(&mut context.func, module.isa().endianness());
+    crate::passtime::time(crate::passtime::STORE_FORWARD, || {
+        crate::store_forward::run(&mut context.func, module.isa().endianness())
+    });
 
     // Widen canonical counted loops so their carried dependency chains are
     // shortened. Cranelift has no unrolling pass of its own.
-    crate::unroll::run(&mut context.func);
+    crate::passtime::time(crate::passtime::UNROLL, || crate::unroll::run(&mut context.func));
 
     #[cfg(false)]
     let _clif_guard = {

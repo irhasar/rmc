@@ -29,17 +29,14 @@ use cranelift_codegen::ir::{
 use rustc_data_structures::fx::FxHashMap;
 
 /// Number of loop iterations folded into one guarded step.
-const UNROLL_FACTOR: u64 = 8;
+pub(crate) const UNROLL_FACTOR: u64 = 8;
 
 /// Upper bound on the induction step we are willing to scale, so that the
 /// arithmetic stays well clear of the type's range.
 const MAX_DELTA: u64 = 1 << 40;
 
 fn unroll_factor() -> u64 {
-    match std::env::var("CG_CLIF_UNROLL") {
-        Ok(v) => v.parse().unwrap_or(UNROLL_FACTOR),
-        Err(_) => UNROLL_FACTOR,
-    }
+    crate::tunables::unroll_factor()
 }
 
 struct Plan {
@@ -426,7 +423,7 @@ fn apply(func: &mut ir::Function, plan: &Plan, factor: u64) {
             return;
         }
     }
-    if std::env::var_os("CG_CLIF_UNROLL_CLONE").is_some() {
+    if crate::tunables::unroll_clone() {
         apply_clone(func, plan, factor);
     }
 }

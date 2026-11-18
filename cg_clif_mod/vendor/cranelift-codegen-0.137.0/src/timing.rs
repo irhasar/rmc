@@ -29,6 +29,10 @@ macro_rules! define_passes {
         /// The amount of profiled passes.
         pub const NUM_PASSES: usize = Pass::None as usize;
 
+        /// All defined passes, in index order. Used by out-of-tree profilers
+        /// that accumulate per-pass totals by index.
+        pub const ALL_PASSES: [Pass; NUM_PASSES] = [$(Pass::$pass,)+];
+
         const DESCRIPTIONS: [&str; NUM_PASSES] = [ $($desc),+ ];
 
         $(

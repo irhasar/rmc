@@ -220,24 +220,30 @@ fn compile_cgu(
     kind: ModuleKind,
 ) -> Result<CompiledModule, String> {
     prof.generic_activity_with_arg("compile functions", &*cgu_name).run(|| {
-        cranelift_codegen::timing::set_thread_profiler(Box::new(super::MeasuremeProfiler(
-            prof.clone(),
-        )));
+        if crate::clifprof::enabled() {
+            cranelift_codegen::timing::set_thread_profiler(Box::new(crate::clifprof::PassProfiler));
+        } else {
+            cranelift_codegen::timing::set_thread_profiler(Box::new(super::MeasuremeProfiler(
+                prof.clone(),
+            )));
+        }
 
         let mut cached_context = Context::new();
 
         // Collect the bodies of small functions in this codegen unit so they can be inlined into
         // their callers. Only small, final (non-interposable) callees are cloned, to keep memory
         // use bounded and to avoid changing the semantics of separately compiled symbols.
-        let bodies = aot_module
-            .codegened_functions
-            .iter()
-            .filter(|f| {
-                f.func.dfg.num_insts() <= crate::inliner::max_callee_insts()
-                    && aot_module.module.declarations().get_function_decl(f.func_id).linkage.is_final()
-            })
-            .map(|f| (f.func_id.as_u32(), f.func.clone()))
-            .collect::<FxHashMap<_, _>>();
+        let bodies = crate::passtime::time(crate::passtime::COLLECT, || {
+            aot_module
+                .codegened_functions
+                .iter()
+                .filter(|f| {
+                    f.func.dfg.num_insts() <= crate::inliner::max_callee_insts()
+                        && aot_module.module.declarations().get_function_decl(f.func_id).linkage.is_final()
+                })
+                .map(|f| (f.func_id.as_u32(), f.func.clone()))
+                .collect::<FxHashMap<_, _>>()
+        });
 
         for codegened_func in aot_module.codegened_functions {
             crate::base::compile_fn(
@@ -253,6 +259,8 @@ fn compile_cgu(
                 codegened_func,
             );
         }
+        crate::passtime::report(&cgu_name);
+        crate::clifprof::report();
     });
 
     let global_asm_object_file =

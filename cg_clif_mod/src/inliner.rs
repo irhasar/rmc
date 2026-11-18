@@ -22,22 +22,16 @@ pub(crate) const MAX_CALLEE_INSTS: usize = 64;
 const INLINE_BUDGET: usize = 512;
 
 /// Maximum number of times a single callee may be inlined into one caller.
-const MAX_CALLEE_USES: usize = 3;
+pub(crate) const MAX_CALLEE_USES: usize = 3;
 
 /// `CG_CLIF_INLINE_USES` overrides [`MAX_CALLEE_USES`] (0 disables inlining); used for bisecting.
 fn max_callee_uses() -> usize {
-    match std::env::var("CG_CLIF_INLINE_USES") {
-        Ok(v) => v.parse().unwrap_or(MAX_CALLEE_USES),
-        Err(_) => MAX_CALLEE_USES,
-    }
+    crate::tunables::inline_max_uses()
 }
 
 /// `CG_CLIF_INLINE_MAX` overrides [`MAX_CALLEE_INSTS`] (0 disables inlining); used for bisecting.
 pub(crate) fn max_callee_insts() -> usize {
-    match std::env::var("CG_CLIF_INLINE_MAX") {
-        Ok(v) => v.parse().unwrap_or(MAX_CALLEE_INSTS),
-        Err(_) => MAX_CALLEE_INSTS,
-    }
+    crate::tunables::inline_max_insts()
 }
 
 pub(crate) struct CguInliner<'a> {
@@ -45,11 +39,22 @@ pub(crate) struct CguInliner<'a> {
     self_id: u32,
     inlined: FxHashMap<u32, usize>,
     budget: usize,
+    max_uses: usize,
+    max_insts: usize,
 }
 
 impl<'a> CguInliner<'a> {
     pub(crate) fn new(bodies: &'a FxHashMap<u32, ir::Function>, self_id: u32) -> Self {
-        CguInliner { bodies, self_id, inlined: FxHashMap::default(), budget: INLINE_BUDGET }
+        CguInliner {
+            bodies,
+            self_id,
+            inlined: FxHashMap::default(),
+            budget: INLINE_BUDGET,
+            // Read the knobs once: `inline` runs per call site and a `std::env`
+            // lookup on each is pure overhead.
+            max_uses: max_callee_uses(),
+            max_insts: max_callee_insts(),
+        }
     }
 }
 
@@ -80,7 +85,7 @@ impl Inline for CguInliner<'_> {
         // `max_callee_uses()` times per caller so that hot small callees called
         // several times are still inlined, while the call-graph budget keeps
         // mutual recursion and code-size growth bounded.
-        if id == self.self_id || self.inlined.get(&id).is_some_and(|&n| n >= max_callee_uses()) {
+        if id == self.self_id || self.inlined.get(&id).is_some_and(|&n| n >= self.max_uses) {
             return InlineCommand::KeepCall;
         }
         let bodies = self.bodies;
@@ -88,7 +93,7 @@ impl Inline for CguInliner<'_> {
             return InlineCommand::KeepCall;
         };
         let size = body.dfg.num_insts();
-        if size > max_callee_insts() || size > self.budget {
+        if size > self.max_insts || size > self.budget {
             return InlineCommand::KeepCall;
         }
         self.inlined.insert(id, self.inlined.get(&id).copied().unwrap_or(0) + 1);
