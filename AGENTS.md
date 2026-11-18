@@ -157,6 +157,22 @@ Add new programs under `bench/progs/` so they are picked up automatically.
   endianness is threaded in from the ISA because Cranelift's verifier requires
   explicit endianness when lane counts differ. `as_i8x16` becomes one
   `bitcast.i8x16`. p2_mem 110→99 ms; size 4.41 MB (LLVM 4.64 MB).
+- `c2e292b` **inline callees that reference globals** (`vendor/cranelift-codegen-0.137.0`,
+  `src/inliner.rs`). Cranelift's inliner copied a callee's `GlobalValueData`
+  verbatim, including `GlobalValueData::Symbol`, whose `ExternalName` indexes the
+  *callee's* `user_named_funcs`/`ext_funcs` tables. Those indices were never
+  translated, so inlining a callee that referenced a const/static/thread-local
+  corrupted the caller (out-of-range `R_X86_64_TLSGD`). cg_clif worked around it
+  by refusing to inline any callee with a non-empty `global_values`, which
+  blocked the hot small helpers (`core::hash::sip`, the branchless sort
+  partition closure). Fix: vendor cranelift-codegen and translate the symbol's
+  user name while copying global values (`translate_symbol_name`), reusing the
+  same caller-side mapping `create_user_external_name_refs` installs — done
+  inline there because global-value copying runs first. Also drop the
+  one-inline-per-callee limit (`MAX_CALLEE_USES`, `CG_CLIF_INLINE_USES`): the
+  partition closure is called 3× and was left out of line; the call-graph budget
+  still bounds recursion. Effect: `slice::sort_unstable` quicksort calls 11→3,
+  srt 28.5→23.1 ms; p2_mem 74.5→59 ms. TLS/atomics/statics verified correct.
 
 ## What did NOT work / open leads
 - **p2_mem runtime gap (fixed)**: the 8× gap (125 ms vs LLVM 16 ms) came from
@@ -179,12 +195,19 @@ Add new programs under `bench/progs/` so they are picked up automatically.
   - Cranelift's `Inline` API clones `GlobalValueData` verbatim and does **not**
     remap the `ExternalName` indices inside `GlobalValueData::Symbol`, so
     inlining a callee that references a const/static/thread-local corrupts the
-    caller (TLS relocations went out of range when the guard was lifted). The
-    `body.global_values.is_empty()` guard in `inliner.rs` is load-bearing.
+    caller (TLS relocations went out of range when the guard was lifted).
+    **FIXED** in the vendored `cranelift-codegen` (see the entry below): the
+    symbol's user name is now translated into the caller's namespace, so the
+    `body.global_values.is_empty()` guard in `inliner.rs` is gone.
 - Extending SROA to **`&mut`/`RawPtr` whole-local borrows** (with `local_map`
   redirect) is a **miscompile** (p1/p3/p4 wrong). Shared-only is correct.
-- The inliner is currently redundant: MIR inlining already folds the small
-  helpers it targets, so it is correct but net-neutral on size/speed.
+- The inliner is redundant **within a crate** (MIR inlining already folds those
+  helpers), but load-bearing **across crates**: the hot helpers in `core::hash`
+  and `slice::sort` live in the pre-built std, so only a CLIF-level inliner can
+  reach them. Once the global-values guard was removed it turns `slice::sort`'s
+  partition closure from an out-of-line call into inlined code (quicksort calls
+  11→3). It remains net-neutral on the p1–p6 microbenchmarks that MIR already
+  folds.
 - **Body-duplicating unrolling does not help.** Measured slower on p6 (357→423 ms):
   the win LLVM gets on p5/p6 is *affine reassociation* of the accumulator chain,
   not unrolling per se. Duplicating the body leaves the loop-carried dependency
@@ -330,3 +353,44 @@ store/load round-trips.
   and `aee9ba3` "docs: record push status for the latest session".
 - The branch replaces the whole `main` tree (subtree `cg_clif_mod/` at repo
   root alongside `cg_clif_upstream/`, `bench/`, `REPORT.md`, `AGENTS.md`).
+
+## Session benchmark report (2026-11-18, inliner-globals fix)
+
+`cd bench && CREPS=3 RREPS=5 ./allaxes.sh` (log `/tmp/allaxes_final.log`).
+L = stock LLVM nightly, U = cg_clif upstream, M = modified. Compile = wall ms,
+run = wall ms, size = bytes.
+
+| prog | Cwall L/U/M | Rwall L/U/M | size L/U/M |
+|------|-------------|-------------|------------|
+| p1_arith  |  90 /  81 /  83 |  82 / 108 / 105 | 4635232 / 5878688 / 4328824 |
+| p2_mem    | 244 / 130 / 144 |  16 / 154 /  59 | 4639888 / 5936880 / 4352336 |
+| p3_calls  | 103 /  88 /  90 |  37 / 116 /  97 | 4612368 / 5820872 / 4270352 |
+| p4_simd   | 111 /  95 / 109 |  55 / 158 / 143 | 4636096 / 5893112 / 4336352 |
+| p5_inline |  86 /  81 /  80 |  58 / 893 /  61 | 4609368 / 5814440 / 4261624 |
+| p6_scalar |  86 /  80 /  80 |  58 / 900 /  61 | 4609368 / 5814424 / 4261624 |
+
+M vs U: p2 154→59 ms, p5 893→61 ms, p6 900→61 ms; p1/p3/p4 unchanged
+(they do not call global-referencing helpers). M compiles ~1.7–2x faster than
+LLVM on p2 and is ~7% smaller than LLVM raw; peak RSS equal on all three.
+
+### What limits the hash workloads (goal: parity with LLVM)
+Micro-benchmarks (M vs L, run wall): `slice::sort_unstable` 23.1 / 8.2 ms,
+`HashMap` insert 35.4 / 10.0 ms, `DefaultHasher` (SipHash) 136.6 / 20.2 ms.
+The inliner-globals fix shrank `quicksort` from 11 out-of-line calls to 3, but
+the residual 3–7x is **Cranelift codegen quality, not inlining**:
+- Forcing `CG_CLIF_INLINE_MAX=200` to inline the SipHash rounds *slows* the
+  hash benchmark (136.6→154 ms): after inlining, the `SipState` round-trip goes
+  through the opaque `&mut self` pointer and Cranelift spills/reloads it every
+  round, while LLVM keeps it in registers. cg_clif's `store_forward` only
+  forwards through *non-escaping* pointer bases, and the `Hasher::write`
+  parameter escapes into `c_rounds`/`d_rounds`, so the round-trip survives.
+- LLVM's advantage on these loops is its register allocator plus
+  autovectorization (the SipHash tail, `u8to64_le`), which Cranelift does not
+  do. These are backend-internal; a cg_clif-side pass cannot reach them.
+
+### Push status (2026-11-18, second update)
+- `cg_clif_mod` head is `c2e292b` "Inline callees that reference globals; allow
+  repeated inlining"; it vendors `vendor/cranelift-codegen-0.137.0` (added to
+  `[patch.crates-io]`) with the `translate_symbol_name` fix.
+- PR **#10** (`replace-main-with-cgclif-experiments` → `main`) is the target;
+  update it with new commits rather than opening another PR.

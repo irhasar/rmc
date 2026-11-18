@@ -41,8 +41,13 @@ smallvec = "1.8.1"
 
 # Local modifications to cranelift-object: emit each function into a uniquely
 # named section so that `--gc-sections` can discard dead code (see vendor/).
+#
+# Local modifications to cranelift-codegen: remap the external names inside
+# `GlobalValueData::Symbol` when inlining, so callees that reference a
+# const/static can be inlined instead of being forced out of line (see vendor/).
 [patch.crates-io]
 cranelift-object = { path = "vendor/cranelift-object-0.137.0" }
+cranelift-codegen = { path = "vendor/cranelift-codegen-0.137.0" }
 
 #gimli = { path = "../" }
 

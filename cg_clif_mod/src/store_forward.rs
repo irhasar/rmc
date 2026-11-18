@@ -18,8 +18,16 @@ use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::ir::{self, Block, Inst, MemFlagsData, Opcode, StackSlot, Value, types, InstBuilder};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
-/// Byte range written or read at a stack slot.
-type Key = (StackSlot, i64);
+/// A memory location a store writes or a load reads: either a private stack
+/// slot or a non-escaping pointer value, each with a byte offset.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum Base {
+    Slot(StackSlot),
+    Ptr(Value),
+}
+
+/// Byte range written or read at a base.
+type Key = (Base, i64);
 
 /// For each byte range, the SSA value last stored to it.
 type Avail = FxHashMap<Key, (Value, types::Type)>;
@@ -38,17 +46,119 @@ pub(crate) fn run(func: &mut ir::Function, endianness: ir::Endianness) {
         }
     }
     let private = private_slots(func);
-    if private.is_empty() {
-        return;
-    }
+    let ptr_bases = private_ptr_bases(func);
     // Facts that hold on every path into a block. Seeding each block with these
     // lets a store in one block reach a load in a dominated successor, which the
     // block-local walk below cannot see.
-    let entry = cross_block_entry(func, &private);
+    let entry = cross_block_entry(func, &private, &ptr_bases);
     for block in func.layout.blocks().collect::<Vec<_>>() {
-        forward_block(func, block, &private, &entry, endianness);
+        forward_block(func, block, &private, &ptr_bases, &entry, endianness);
     }
     drop_dead_stores(func, &private);
+}
+
+/// If `addr` is a `stack_addr` of a known slot, or a tracked pointer base,
+/// return the base and the byte offset at which `inst` accesses it.
+fn mem_key(func: &ir::Function, inst: Inst, addr: Value) -> Option<Key> {
+    let addr = func.dfg.resolve_aliases(addr);
+    if let ir::ValueDef::Result(def_inst, 0) = func.dfg.value_def(addr) {
+        if let ir::InstructionData::StackAddr { stack_slot, offset, .. } = func.dfg.insts[def_inst] {
+            let off = i64::from(offset) + offset_of(func, inst)?;
+            return Some((Base::Slot(stack_slot), off));
+        }
+    }
+    Some((Base::Ptr(addr), offset_of(func, inst)?))
+}
+
+/// Is this key a location the pass is allowed to track?
+fn tracked(key: &Key, private: &FxHashSet<StackSlot>, ptr_bases: &FxHashSet<Value>) -> bool {
+    match key.0 {
+        Base::Slot(s) => private.contains(&s),
+        Base::Ptr(p) => ptr_bases.contains(&p),
+    }
+}
+
+/// Pointer values whose only use is as the address operand of a load or store,
+/// i.e. the address never escapes. A store through such a pointer can be
+/// forwarded to a later load of the same base even though the pass cannot prove
+/// anything about the memory it points at: the address is identical, so no alias
+/// can interpose. This is how `core::hash::sip`'s `State` (`&mut self`) is
+/// handled — cg_clif keeps the state in the caller's frame and reaches it through
+/// the opaque parameter rather than a private stack slot.
+fn private_ptr_bases(func: &ir::Function) -> FxHashSet<Value> {
+    let dfg = &func.dfg;
+    let mut addr_only: FxHashSet<Value> = FxHashSet::default();
+    let mut escaping: FxHashSet<Value> = FxHashSet::default();
+
+    for block in func.layout.blocks() {
+        for inst in func.layout.block_insts(block) {
+            let opcode = dfg.insts[inst].opcode();
+            let addr_index = address_index(opcode);
+            for (i, &arg) in dfg.insts[inst].arguments(&dfg.value_lists).iter().enumerate() {
+                let arg = dfg.resolve_aliases(arg);
+                if addr_index == Some(i) {
+                    addr_only.insert(arg);
+                } else {
+                    escaping.insert(arg);
+                }
+            }
+            for dest in dfg.insts[inst].branch_destination(&dfg.jump_tables, &dfg.exception_tables) {
+                for arg in dest.args(&dfg.value_lists) {
+                    if let Some(v) = arg.as_value() {
+                        escaping.insert(dfg.resolve_aliases(v));
+                    }
+                }
+            }
+        }
+    }
+    addr_only.retain(|v| !escaping.contains(v));
+    addr_only
+}
+
+/// Instructions that may write memory the pass does not track: calls, atomics,
+/// fences and the like. A plain store is handled separately by [`record_store`].
+fn clobbers_memory(opcode: Opcode) -> bool {
+    opcode.is_call() || opcode.other_side_effects()
+}
+
+/// Record the fact that `inst` stores its data operand to `avail`, invalidating
+/// the facts it may overwrite.
+fn record_store(
+    func: &ir::Function,
+    inst: Inst,
+    args: &[Value],
+    avail: &mut Avail,
+    private: &FxHashSet<StackSlot>,
+    ptr_bases: &FxHashSet<Value>,
+) {
+    let Some(addr) = args.get(1).copied() else { return };
+    let value = args[0];
+    let ty = func.dfg.value_type(value);
+    let Some((base, off)) = mem_key(func, inst, addr).filter(|k| tracked(k, private, ptr_bases))
+    else {
+        // Store through an address the pass does not track: it may alias any
+        // tracked pointer base, so every pointer fact is invalidated. A private
+        // stack slot cannot be reached from an untracked address, so it stays.
+        avail.retain(|&(b, _), _| matches!(b, Base::Slot(_)));
+        return;
+    };
+    // An atomic store is a synchronisation point and cannot be forwarded across;
+    // the clobber above already dropped the pointer facts, so do not re-add one.
+    if matches!(base, Base::Ptr(_)) && func.dfg.insts[inst].opcode() != Opcode::Store {
+        return;
+    }
+    let (start, end) = (off, off + i64::from(ty.bytes()));
+    avail.retain(|&(b, o), &mut (_, prev_ty)| {
+        if b == base {
+            let prev_end = o + i64::from(prev_ty.bytes());
+            end <= o || prev_end <= start
+        } else {
+            // A tracked-pointer store may alias a *different* pointer base, but
+            // never a private stack slot; a private-slot store aliases nothing.
+            !(matches!(base, Base::Ptr(_)) && matches!(b, Base::Ptr(_)))
+        }
+    });
+    avail.insert((base, off), (value, ty));
 }
 
 /// The address operand index of a load/store, i.e. the one argument that is a
@@ -72,7 +182,7 @@ fn offset_of(func: &ir::Function, inst: Inst) -> Option<i64> {
 
 /// If `addr` is a `stack_addr` of a known slot, return `(slot, offset)` where
 /// `offset` is the byte offset from the slot base at which `inst` accesses it.
-fn stack_key(func: &ir::Function, inst: Inst, addr: Value) -> Option<Key> {
+fn stack_key(func: &ir::Function, inst: Inst, addr: Value) -> Option<(StackSlot, i64)> {
     let addr = func.dfg.resolve_aliases(addr);
     let ir::ValueDef::Result(def_inst, 0) = func.dfg.value_def(addr) else { return None };
     let ir::InstructionData::StackAddr { stack_slot, offset, .. } = func.dfg.insts[def_inst]
@@ -138,6 +248,7 @@ fn forward_block(
     func: &mut ir::Function,
     block: Block,
     private: &FxHashSet<StackSlot>,
+    ptr_bases: &FxHashSet<Value>,
     entry: &FxHashMap<Block, Avail>,
     endianness: ir::Endianness,
 ) {
@@ -147,24 +258,18 @@ fn forward_block(
         let opcode = func.dfg.insts[inst].opcode();
         let args = func.dfg.insts[inst].arguments(&func.dfg.value_lists).to_vec();
 
+        if clobbers_memory(opcode) {
+            avail.retain(|&(b, _), _| matches!(b, Base::Slot(_)));
+            continue;
+        }
         if opcode.can_store() {
-            let Some(key) = args.get(1).copied().and_then(|a| stack_key(func, inst, a)) else {
-                continue;
-            };
-            if private.contains(&key.0) {
-                let value = args[0];
-                let ty = func.dfg.value_type(value);
-                let (start, end) = (key.1, key.1 + i64::from(ty.bytes()));
-                avail.retain(|&(slot, off), &mut (_, prev_ty)| {
-                    let prev_end = off + i64::from(prev_ty.bytes());
-                    slot != key.0 || end <= off || prev_end <= start
-                });
-                avail.insert(key, (value, ty));
-            }
+            record_store(func, inst, &args, &mut avail, private, ptr_bases);
         } else if opcode.can_load() {
-            let Some(key) = args.first().copied().and_then(|a| stack_key(func, inst, a)) else {
+            let Some(addr) = args.first().copied() else { continue };
+            let Some(key) = mem_key(func, inst, addr) else { continue };
+            if !tracked(&key, private, ptr_bases) {
                 continue;
-            };
+            }
             let Some(&(value, ty)) = avail.get(&key) else { continue };
             let results = func.dfg.inst_results(inst);
             if results.len() != 1 {
@@ -199,27 +304,24 @@ fn forward_block(
 
 /// Run the block-local store transfer over `avail` without rewriting anything.
 /// Used by the cross-block dataflow, which only needs the store facts.
-fn transfer(func: &ir::Function, block: Block, mut avail: Avail, private: &FxHashSet<StackSlot>) -> Avail {
+fn transfer(
+    func: &ir::Function,
+    block: Block,
+    mut avail: Avail,
+    private: &FxHashSet<StackSlot>,
+    ptr_bases: &FxHashSet<Value>,
+) -> Avail {
     for inst in func.layout.block_insts(block) {
         let opcode = func.dfg.insts[inst].opcode();
+        if clobbers_memory(opcode) {
+            avail.retain(|&(b, _), _| matches!(b, Base::Slot(_)));
+            continue;
+        }
         if !opcode.can_store() {
             continue;
         }
         let args = func.dfg.insts[inst].arguments(&func.dfg.value_lists).to_vec();
-        let Some(key) = args.get(1).copied().and_then(|a| stack_key(func, inst, a)) else {
-            continue;
-        };
-        if !private.contains(&key.0) {
-            continue;
-        }
-        let value = args[0];
-        let ty = func.dfg.value_type(value);
-        let (start, end) = (key.1, key.1 + i64::from(ty.bytes()));
-        avail.retain(|&(slot, off), &mut (_, prev_ty)| {
-            let prev_end = off + i64::from(prev_ty.bytes());
-            slot != key.0 || end <= off || prev_end <= start
-        });
-        avail.insert(key, (value, ty));
+        record_store(func, inst, &args, &mut avail, private, ptr_bases);
     }
     avail
 }
@@ -228,7 +330,11 @@ fn transfer(func: &ir::Function, block: Block, mut avail: Avail, private: &FxHas
 /// all predecessors. A fact survives the meet only when every predecessor agrees
 /// on the exact same SSA value, so the value stored is well defined at the merge
 /// point and dominates it.
-fn cross_block_entry(func: &ir::Function, private: &FxHashSet<StackSlot>) -> FxHashMap<Block, Avail> {
+fn cross_block_entry(
+    func: &ir::Function,
+    private: &FxHashSet<StackSlot>,
+    ptr_bases: &FxHashSet<Value>,
+) -> FxHashMap<Block, Avail> {
     let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func);
     let blocks: Vec<Block> = func.layout.blocks().collect();
     // The entry block is also reached from outside the function, where no store
@@ -257,7 +363,7 @@ fn cross_block_entry(func: &ir::Function, private: &FxHashSet<StackSlot>) -> FxH
         let mut changed = false;
         for &block in &blocks {
             let in_avail = meet(&out, block);
-            let new_out = transfer(func, block, in_avail.clone(), private);
+            let new_out = transfer(func, block, in_avail.clone(), private, ptr_bases);
             if out.get(&block) != Some(&new_out) {
                 out.insert(block, new_out);
                 changed = true;

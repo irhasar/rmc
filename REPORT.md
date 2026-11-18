@@ -434,5 +434,57 @@ Hasil pada `p2_mem`: runtime **110 → 99 ms** (LLVM 17 ms); ukuran **4.41 MB**
 | `CG_CLIF_UNROLL` | 8 | faktor reassociasi (1 = mati) |
 | `CG_CLIF_UNROLL_CLONE` | unset | aktifkan unroll duplikasi-body (fallback) |
 | `CG_CLIF_INLINE_MAX` | 64 | batas instruksi callee untuk inliner (0 = mati) |
+| `CG_CLIF_INLINE_USES` | 3 | maksimum berapa kali satu callee boleh di-inline ke satu caller |
 | `CG_CLIF_NO_STORE_FWD` | unset | matikan store→load forwarding |
+
+### 8.11 Inliner callee yang mereferensi global (revisi ini) — LANDED, `c2e292b`
+
+Pengaman "lewati callee ber-`global_values`" di §8.2 adalah penyebab hilangnya
+peluang terbesar: `core::hash::sip` dan closure `partition_lomuto_branchless_cyclic`
+dari `slice::sort_unstable` semuanya mereferensi simbol (konstanta/static),
+sehingga tidak pernah di-inline.
+
+Akar masalahnya ada di **Cranelift**, bukan cg_clif: `create_global_values`
+menyalin `GlobalValueData` apa adanya, termasuk `GlobalValueData::Symbol` yang
+`ExternalName`-nya mengindeks tabel `user_named_funcs`/`ext_funcs` milik
+**callee**. Indeks itu tidak pernah diterjemahkan ke namespace caller, jadi
+meng-inline callee yang mereferensi const/static/thread-local merusak caller
+(relokasi TLS keluar jangkauan).
+
+Perbaikan: `cranelift-codegen` di-vendor (`vendor/cranelift-codegen-0.137.0`,
+ditambahkan ke `[patch.crates-io]`) dan `create_global_values` sekarang
+menerjemahkan nama simbol lewat `translate_symbol_name`, memakai pemetaan nama
+sisi-caller yang sama dengan `create_user_external_name_refs` (dilakukan inline
+di sana karena penyalinan global value berjalan lebih dulu). Ditambah: batas
+"satu callee sekali per caller" dilonggarkan menjadi `MAX_CALLEE_USES` (=3),
+karena closure partition dipanggil 3× dan tetap tertinggal di luar garis.
+
+Efek pada `slice::sort_unstable` (300k u64): panggilan di `quicksort` **11 → 3**,
+runtime **28.5 → 23.1 ms**; `p2_mem` **74.5 → 59 ms**. TLS, atomik, dan referensi
+static diverifikasi benar (sebelumnya `R_X86_64_TLSGD out of range`).
+
+Sisa gap hash (SipHash 136.6 ms vs LLVM 20.2 ms; HashMap 35.4 vs 10.0) **bukan**
+lagi soal inlining: memaksa `CG_CLIF_INLINE_MAX=200` agar round SipHash ikut
+ter-inline justru memperlambat (136.6 → 154 ms), karena round-trip `SipState`
+lewat pointer `&mut self` yang *escaping* tidak bisa di-forward oleh
+`store_forward`, dan Cranelift menumpahkan/memuat ulang state tiap ronde.
+Keunggulan LLVM di sini adalah register allocator + autovektorisasi — keduanya
+internal backend dan tidak terjangkau pass sisi cg_clif.
+
+### 8.12 Ringkasan angka tiga arah (revisi ini)
+
+`bench/allaxes.sh` (CREPS=3, RREPS=5). L = LLVM, U = upstream, M = mod.
+
+| prog | compile wall L/U/M (ms) | run wall L/U/M (ms) | size L/U/M (byte) |
+|------|-------------------------|---------------------|-------------------|
+| p1_arith | 90 / 81 / 83 | 82 / 108 / 105 | 4635232 / 5878688 / 4328824 |
+| p2_mem | 244 / 130 / 144 | 16 / 154 / 59 | 4639888 / 5936880 / 4352336 |
+| p3_calls | 103 / 88 / 90 | 37 / 116 / 97 | 4612368 / 5820872 / 4270352 |
+| p4_simd | 111 / 95 / 109 | 55 / 158 / 143 | 4636096 / 5893112 / 4336352 |
+| p5_inline | 86 / 81 / 80 | 58 / 893 / 61 | 4609368 / 5814440 / 4261624 |
+| p6_scalar | 86 / 80 / 80 | 58 / 900 / 61 | 4609368 / 5814424 / 4261624 |
+
+Semua keluaran stdout identik dengan LLVM (p1–p6, TLS, atomik, static). M
+mengompilasi ~1.7–2× lebih cepat dari LLVM di p2 dan ~7% lebih kecil dari LLVM,
+dengan peak RSS setara.
 
