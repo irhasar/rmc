@@ -320,3 +320,13 @@ store/load round-trips.
   `&mut self` pointer; even inlined they stay memory-bound (opaque-pointer
   aliasing), so raising the inline budget cannot close it. This is a genuine
   cross-crate inlining limit, not a tunable.
+
+## Push status update (2026-11-18)
+- PR **#10** still open, `mergeable=True`, base `main`, remote head `50ab72a`.
+- New local commits **not yet pushed** (token read-only, 403 as above):
+  fork `cg_clif_mod` head `bc9b0f0`; `rmc_clone` branch
+  `replace-main-with-cgclif-experiments` head `467f05c`
+  ("Inline small constant memcpy/memmove and honour CG_CLIF_INLINE_MAX").
+- To publish, push with a `repo`-scoped classic PAT:
+  `git push https://<user>:<PAT>@github.com/irhasar/rmc.git replace-main-with-cgclif-experiments`
+  from `/workspace/project/rmc_clone` (adds commit `467f05c` to PR #10).
