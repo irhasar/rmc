@@ -1,6 +1,59 @@
 # AGENTS.md
 
-## Session (2026-11-18, latest) — inliner growth cap (LANDED locally)
+## Session (2026-11-18, latest) — affine unroll factor 8 → 128 (LANDED locally)
+- `cg_clif_mod` head **`6951858`** "Raise the affine loop unroll factor to 128
+  with a checked step bound"; `rmc_clone` subtree commit **`193ec3e`** (PR #10
+  branch `replace-main-with-cgclif-experiments`), **not pushed** (see below).
+- **Win**: reassociating an affine loop to closed form `S_k = M^k·S + c` removes
+  the loop-carried `imul` chain, and the win keeps scaling with the factor.
+  p5/p6 (300M iters): 61 ms @ f=8, 32 @ 16, 22 @ 32, 12 @ 64, **7 ms @ 128**,
+  4.6 @ 256, 3.3 @ 512, 2.4 @ 2048 (LLVM = 58 ms). Output identical to LLVM at
+  every factor; size +32 B, compile +0.4 ms. `UNROLL_FACTOR` default = 128.
+- **Latent overflow fixed**: the wide-path guard checks `iv + (factor-1)*delta`,
+  valid only while `delta*(factor-1)` does not wrap. Added `safe_factor(delta,
+  factor)` shrinking the factor until `delta*(factor-1) <= 2^62`; both sites now
+  `checked_mul` (was `wrapping_mul`). Large-step loops auto-use a smaller factor.
+- **Environment note**: mid-session the runtime wiped `~/.rustup` + `~/.cargo`
+  (no rustc anywhere). Reinstalled via rustup: `nightly-2026-11-17` +
+  `rust-src,llvm-tools`. `dist/bin/rustc-clif` was intact and works after PATH
+  restore (`export PATH="$HOME/.cargo/bin:$PATH"` — the wrapper needs `rustc`).
+- **Final 3-way matrix** (RC=5/RR=9, `bench/fullbench.sh`; ms, MB, bytes):
+  | prog | rwall L/U/M | rcpu L/U/M | size L/U/M |
+  |------|-------------|------------|------------|
+  | p1_arith | 81/108/**105** | 82/108/**104** | 4.64/5.88/**4.40** MB |
+  | p2_mem | 17/157/**69** | 17/157/**69** | 4.64/5.94/**4.42** MB |
+  | p3_calls | 37/117/**98** | 37/117/**97** | 4.61/5.82/**4.33** MB |
+  | p4_simd | 56/157/**139** | 56/157/**139** | 4.64/5.89/**4.41** MB |
+  | p5_inline | 58/895/**7.3** | 57/892/**6.9** | 4.61/5.81/**4.32** MB |
+  | p6_scalar | 58/905/**7.4** | 57/905/**7.0** | 4.61/5.81/**4.32** MB |
+  Compile: M ≈ U (noise) and both ~1.7× faster than LLVM on p2. Size: M ~5%
+  smaller than LLVM, ~25% smaller than U.
+- **Root cause of the *remaining* runtime gaps (NOT autovectorization).**
+  Disabling LLVM's vectorizer (`-Cno-vectorize-loops -Cno-vectorize-slp`) barely
+  changes LLVM's times (p4 55.4 → 57.2 ms), so the gap is deep scalar codegen:
+  - p4 trig: LLVM unrolls the `sinf` loop 6× for ILP on the calls (and fuses
+    `sin`+`cos` of the same arg into one `sincosf`); M calls `sinf`/`cosf` once
+    per iteration. 2.5× even for sin-only (`trig1`: L 30.9 / M 77.0 ms).
+  - p2 mem: LLVM fully inlines the hashbrown SSE2 probe into `main`; M leaves it
+    out of line (`find_insert_index_in_group` etc.). LLVM's `main` has 9 calls,
+    M's has 12.
+  - p3 fib: LLVM converts the double recursion to a loop; M keeps recursion.
+- **Levers tested and found neutral** (do not re-try without new data):
+  `-Ctarget-cpu=native`; `CG_CLIF_INLINE_MAX` 16/256; aggressive inliner
+  (`INLINE_USES=100 INLINE_MAX=200`) → p1 108→105, others flat; Cranelift
+  `opt_level=speed` vs `speed_and_size` (no difference); clone-based body
+  duplication on multi-block bodies (does not fire — `analyze_affine` requires a
+  single-block body, so trig/sin loops are untouched).
+- `./y.sh test --sysroot clif` → 3011 passed / 0 failed (before the reset).
+- **Push BLOCKED**: `irhasar/rmc` rejects every credential available in this
+  environment (403 `Resource not accessible by integration`). Both the injected
+  `GITHUB_TOKEN` (GitHub App installation, read-only) and the OpenHands
+  credential-helper secret are rejected. To land, push
+  `replace-main-with-cgclif-experiments` with a user-supplied `repo`-scoped PAT;
+  PR #10 then updates in place. Local commits `6951858` (mod) / `193ec3e` (subtree)
+  are ready.
+
+## Session (2026-11-18) — inliner growth cap (LANDED locally)
 - `cg_clif_mod` head **`41dc347`** "Bound inliner growth by caller size; speed up
   dead-store removal".
 - **Root cause of the p2 compile gap vs U**: the inliner grew CLIF by up to 62%
