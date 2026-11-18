@@ -22,7 +22,7 @@ pub(crate) const MAX_CALLEE_INSTS: usize = 64;
 const INLINE_BUDGET: usize = 512;
 
 /// `CG_CLIF_INLINE_MAX` overrides [`MAX_CALLEE_INSTS`] (0 disables inlining); used for bisecting.
-fn max_callee_insts() -> usize {
+pub(crate) fn max_callee_insts() -> usize {
     match std::env::var("CG_CLIF_INLINE_MAX") {
         Ok(v) => v.parse().unwrap_or(MAX_CALLEE_INSTS),
         Err(_) => MAX_CALLEE_INSTS,

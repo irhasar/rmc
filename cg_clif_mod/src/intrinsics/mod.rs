@@ -361,8 +361,31 @@ fn codegen_regular_intrinsic_call<'tcx>(
                 count
             };
 
-            // FIXME emit_small_memmove
-            fx.bcx.call_memmove(fx.target_config, dst, src, byte_amount);
+            // `ptr::copy_nonoverlapping`/`ptr::copy` with a small constant size
+            // (the common case: swapping or moving one or two scalar elements,
+            // e.g. in `slice::sort_unstable`) is lowered by LLVM to a handful of
+            // register loads/stores. Emitting a libc `memcpy`/`memmove` call for
+            // 8 bytes instead costs a full call + return per element and shows
+            // up as a ~10x slowdown in sort-heavy code. When the byte count is a
+            // small compile-time constant, inline it as load/store pairs.
+            match crate::unroll::const_of(&fx.bcx.func, count)
+                .and_then(|c| c.checked_mul(elem_size))
+            {
+                Some(bytes) if bytes != 0 && bytes <= 8 * 8 => {
+                    fx.bcx.emit_small_memory_copy(
+                        fx.target_config,
+                        dst,
+                        src,
+                        bytes,
+                        1,
+                        1,
+                        false,
+                        MemFlagsData::new(),
+                    );
+                }
+                // FIXME emit_small_memmove
+                _ => fx.bcx.call_memmove(fx.target_config, dst, src, byte_amount),
+            }
         }
         sym::volatile_copy_memory | sym::volatile_copy_nonoverlapping_memory => {
             // NOTE: the volatile variants have src and dst swapped

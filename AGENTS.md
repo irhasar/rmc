@@ -229,3 +229,94 @@ Add new programs under `bench/progs/` so they are picked up automatically.
   read-only for this repo — `git push` and all write APIs return 403
   (`Resource not accessible by integration`). `OH_GIT_CREDENTIAL_ACCESS_TOKEN_GITHUB`
   is also rejected (`Invalid username or token`), and there is no SSH key.
+
+## Session benchmark report (2026-11-18, latest)
+
+Full three-way harness: `cd bench && REPS_COMPILE=3 REPS_RUN=5 ./compare3.sh`
+(log `/tmp/compare3_final.log`) and `./sizes2.sh` (log `/tmp/sizes2_final.log`).
+C = compile (wall ms, cpu ms, peak RSS MB, exit), S = size (raw bytes,
+.text, .data.rel.ro, .rodata, .eh_frame, `size -A` total), R = run
+(wall ms, cpu ms, peak RSS MB, exit). "up_llvmstd"/"mod_llvmstd" link the
+stock LLVM std to isolate the backend from the Cranelift-built std.
+
+### Compile
+| prog | backend | wall ms | cpu ms | RSS MB |
+|------|---------|--------:|-------:|-------:|
+| p1_arith | llvm | 89 | 108 | 106 |
+| p1_arith | up | 80 | 102 | 108 |
+| p1_arith | mod | 81 | 105 | 109 |
+| p2_mem | llvm | 253 | 383 | 133 |
+| p2_mem | up | 129 | 175 | 131 |
+| p2_mem | mod | 138 | 192 | 132 |
+| p3_calls | llvm | 103 | 126 | 116 |
+| p3_calls | up | 90 | 111 | 117 |
+| p3_calls | mod | 89 | 115 | 118 |
+| p4_simd | llvm | 111 | 136 | 116 |
+| p4_simd | up | 95 | 117 | 117 |
+| p4_simd | mod | 98 | 123 | 118 |
+| p5_inline | llvm | 85 | 106 | 105 |
+| p5_inline | up | 78 | 102 | 107 |
+| p5_inline | mod | 80 | 104 | 108 |
+| p6_scalar | llvm | 85 | 103 | 101 |
+| p6_scalar | up | 78 | 99 | 103 |
+| p6_scalar | mod | 79 | 101 | 104 |
+
+cg_clif (up and mod) compiles ~1.5–2x faster than LLVM on p2 and slightly
+faster elsewhere, at equal peak RSS. The mod's extra CLIF passes cost ~1 ms
+wall / ~3 ms cpu and are size/run-neutral at compile time.
+
+### Artifact size (raw bytes; section breakdown in the log)
+| prog | llvm | up | mod |
+|------|-----:|---:|----:|
+| p1_arith | 4,635,232 | 5,878,688 | 4,376,376 |
+| p2_mem | 4,639,888 | 5,936,880 | 4,404,664 |
+| p3_calls | 4,612,368 | 5,820,872 | 4,317,616 |
+| p4_simd | 4,636,096 | 5,893,112 | 4,384,824 |
+| p5_inline | 4,609,368 | 5,814,440 | 4,309,064 |
+| p6_scalar | 4,609,368 | 5,814,424 | 4,309,064 |
+
+mod vs up: **−25% raw**, and −40% in `.text` (up 1.19 MB → mod 0.81 MB) with
+`.rodata`/`.data.rel.ro` also ~4x smaller. mod vs LLVM raw: −5%, and `.text`
+is 3x larger than LLVM's (0.81 MB vs 0.26 MB) — LLVM's `.text` is small
+because much of its runtime lives in the shared LLVM-built std/panic
+libraries, whereas the mod links its own Cranelift-built std. With the LLVM
+std (isolates the backend), mod is byte-for-byte the same size as up plus
+only the SIMD lowering: p1 4,631,032 vs 4,631,880, p5/p6 4,603,608 vs
+4,604,376 — i.e. the size win is in the Cranelift-built std (the mod's
+`--gc-sections` + store-forwarding let dead code go).
+
+Stripped (p2_mem/p3_calls, opt-level 3 / z / cu1): up 1.92/1.85 MB →
+mod 1.14/1.08 MB; llvm 0.36/0.34 MB. mod strips 40% smaller than up.
+
+### Runtime
+| prog | llvm ms | up ms | mod ms | mod/llvm |
+|------|--------:|------:|-------:|---------:|
+| p1_arith | 81 | 109 | 106 | 1.31x |
+| p2_mem | 16 | 159 | 75 | 4.7x |
+| p3_calls | 37 | 118 | 99 | 2.7x |
+| p4_simd | 56 | 156 | 139 | 2.5x |
+| p5_inline | 58 | 893 | 61 | 1.05x |
+| p6_scalar | 58 | 900 | 61 | 1.05x |
+
+mod vs up: **p2 159→75 ms (2.1x, the small-memcpy fix)**, p5 893→61 ms
+(14.6x), p6 900→61 ms (14.8x). p5/p6 now match LLVM. Remaining gap is p2
+(SipHash cross-crate inlining), p3 (closure calls), p4 (SSE intrinsics),
+p1 (bounds/arith) — all cross-crate/cross-CGU inlining limits, not loops or
+store/load round-trips.
+
+### New work this session (on top of PR #10 head 4759d90)
+- `badbf0e` Inline small constant-size memcpy/memmove instead of libc calls:
+  `ptr::copy_nonoverlapping`/`ptr::copy` with a constant byte count ≤64
+  (`count * elem_size` folded) become load/store pairs. `slice::sort_unstable`
+  partition (8-byte element moves) went from a `%Memcpy`/`%Memmove` call per
+  element to register moves: sort 44→24 ms on 300k u64 (LLVM 4.3 ms). Verified
+  with a 61×5 fuzz over sizes 0..60, alignments, and both overlap directions
+  (`bad=0`, identical to LLVM).
+- `bc9b0f0` Honour `CG_CLIF_INLINE_MAX` when collecting inlineable bodies:
+  `aot.rs` filtered bodies on the compile-time `MAX_CALLEE_INSTS` while the
+  decision used `max_callee_insts()`, so the knob did nothing. Now both agree.
+  Root-caused the p2 hash gap: `core::hash::sip::SipHasher::write`/`c_rounds`
+  are cross-crate and round-trip the 32-byte `State` through the opaque
+  `&mut self` pointer; even inlined they stay memory-bound (opaque-pointer
+  aliasing), so raising the inline budget cannot close it. This is a genuine
+  cross-crate inlining limit, not a tunable.

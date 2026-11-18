@@ -81,7 +81,7 @@ fn successors(func: &ir::Function, block: Block) -> Vec<Block> {
     out
 }
 
-fn const_of(func: &ir::Function, v: Value) -> Option<u64> {
+pub(crate) fn const_of(func: &ir::Function, v: Value) -> Option<u64> {
     let v = func.dfg.resolve_aliases(v);
     let ir::ValueDef::Result(inst, 0) = func.dfg.value_def(v) else { return None };
     match func.dfg.insts[inst] {

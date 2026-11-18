@@ -988,7 +988,28 @@ fn codegen_stmt<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, cur_block: Block, stmt:
                     count
                 };
 
-                fx.bcx.call_memcpy(fx.target_config, dst, src, bytes);
+                // `ptr::copy_nonoverlapping` with a small constant byte count is
+                // the element move/swap of in-place sorts and vector shuffles.
+                // LLVM lowers those to a couple of register moves; a libc
+                // `memcpy` call per element is ~10x slower. Inline the copy as
+                // load/store pairs when the size is a small constant.
+                let const_bytes = crate::unroll::const_of(&fx.bcx.func, count)
+                    .and_then(|c| c.checked_mul(elem_size));
+                match const_bytes {
+                    Some(bytes) if bytes != 0 && bytes <= 8 * 8 => {
+                        fx.bcx.emit_small_memory_copy(
+                            fx.target_config,
+                            dst,
+                            src,
+                            bytes,
+                            1,
+                            1,
+                            true,
+                            MemFlagsData::new(),
+                        );
+                    }
+                    _ => fx.bcx.call_memcpy(fx.target_config, dst, src, bytes),
+                }
             }
         },
     }

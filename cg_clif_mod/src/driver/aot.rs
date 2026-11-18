@@ -233,7 +233,7 @@ fn compile_cgu(
             .codegened_functions
             .iter()
             .filter(|f| {
-                f.func.dfg.num_insts() <= crate::inliner::MAX_CALLEE_INSTS
+                f.func.dfg.num_insts() <= crate::inliner::max_callee_insts()
                     && aot_module.module.declarations().get_function_decl(f.func_id).linkage.is_final()
             })
             .map(|f| (f.func_id.as_u32(), f.func.clone()))
