@@ -388,9 +388,21 @@ the residual 3–7x is **Cranelift codegen quality, not inlining**:
   autovectorization (the SipHash tail, `u8to64_le`), which Cranelift does not
   do. These are backend-internal; a cg_clif-side pass cannot reach them.
 
-### Push status (2026-11-18, second update)
+### Push status (2026-11-18, second update) — BLOCKED ON CREDENTIALS
 - `cg_clif_mod` head is `c2e292b` "Inline callees that reference globals; allow
   repeated inlining"; it vendors `vendor/cranelift-codegen-0.137.0` (added to
   `[patch.crates-io]`) with the `translate_symbol_name` fix.
-- PR **#10** (`replace-main-with-cgclif-experiments` → `main`) is the target;
-  update it with new commits rather than opening another PR.
+- `rmc_clone` (subtree layout) is committed as **`64b3760`** on branch
+  `replace-main-with-cgclif-experiments`, which is PR **#10**'s head branch
+  (`102ec7b` on remote). The commit is **local only** — it is not pushed.
+- **Push is blocked**: every token in this environment is read-only for
+  `irhasar/rmc`. `GITHUB_TOKEN` authenticates as user `irhasar` and the repo API
+  reports `permissions.push=true`, but all writes return 403
+  (`Resource not accessible by integration`): `git push` (helper token),
+  `git push` with `$GITHUB_TOKEN` embedded, `gh auth token`, and
+  `POST /git/refs` all fail. `OH_GIT_CREDENTIAL_ACCESS_TOKEN_GITHUB` is
+  `401 Bad credentials`. The earlier session pushed with a user-supplied
+  `repo`-scoped classic PAT that is no longer available.
+- To finish: supply a `repo`-scoped PAT (or push manually):
+  `git -C rmc_clone push https://<user>:<PAT>@github.com/irhasar/rmc.git replace-main-with-cgclif-experiments`
+  This updates PR #10 in place; no new PR is needed.
