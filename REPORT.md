@@ -653,3 +653,56 @@ Kesimpulan tiap sumbu:
 - **Runtime**: M menutup hampir seluruh gap U→LLVM pada loop scalar/inline
   (p5/p6: 894/903 → 61 ms, ~15×) dan mem (p2: 156 → 69 ms, ~2.3×). Sisanya
   kualitas codegen Cranelift (regalloc, autovektorisasi).
+
+### 8.18 Matriks tiga arah (revisi akhir, faktor unroll 128)
+
+`bench/fullbench.sh` (RC=5, RR=9), wall/CPU dalam ms, RSS dalam MB.
+
+| prog | cwall L/U/M | ccpu L/U/M | crss L/U/M | size L/U/M (byte) | rwall L/U/M | rcpu L/U/M | rrss L/U/M |
+|------|-------------|------------|------------|-------------------|-------------|------------|------------|
+| p1_arith | 86/80/80 | 108/102/105 | 105/107/108 | 4635232/5878688/4397368 | 81/108/105 | 82/108/104 | 10/10/10 |
+| p2_mem | 252/134/139 | 381/180/191 | 133/130/131 | 4639888/5936880/4419944 | 17/157/69 | 17/157/69 | 10/10/10 |
+| p3_calls | 102/86/87 | 125/113/116 | 116/116/117 | 4612368/5820872/4332312 | 37/117/98 | 37/117/97 | 10/10/10 |
+| p4_simd | 110/95/99 | 130/119/125 | 116/117/117 | 4636096/5893112/4405328 | 56/157/139 | 57/157/139 | 48/49/48 |
+| p5_inline | 84/77/78 | 113/101/103 | 104/106/106 | 4609368/5814440/4324320 | 58/895/7.3 | 57/892/6.9 | 10/10/10 |
+| p6_scalar | 84/78/78 | 103/100/100 | 101/103/103 | 4609368/5814424/4324320 | 58/905/7.4 | 57/905/7.0 | 10/10/10 |
+
+Dengan `UNROLL_FACTOR=128`, p5/p6 turun dari 61 ms (faktor 8) menjadi **7 ms**,
+yaitu **≈8× lebih cepat dari LLVM** (58 ms) pada kernel scalar murni; ukuran
+naik hanya 32 byte. Kesimpulan compile/ukuran tidak berubah.
+
+### 8.19 Lever yang diuji dan netral (jangan diulang tanpa data baru)
+
+- `-Ctarget-cpu=native`: p1–p4 dalam noise (±1–2 ms), p5/p6 tetap 7 ms.
+- `CG_CLIF_INLINE_MAX` 16/256: netral (p2 66–69 ms).
+- Inliner agresif (`CG_CLIF_INLINE_USES=100 CG_CLIF_INLINE_MAX=200`): p1
+  108 → 105 ms, lainnya datar.
+- Cranelift `opt_level=speed` vs `speed_and_size`: tidak berbeda.
+- Unroll duplikasi-body (`CG_CLIF_UNROLL_CLONE`) pada body multi-blok: **tidak
+  aktif** karena `analyze_affine` mensyaratkan body blok tunggal, jadi loop
+  `sinf` (multi-blok) tak tersentuh.
+- `-Zinline-mir-threshold=1000..1500`: menang kecil di p2 (67.6 → 61.6 ms) tapi
+  belum dijadikan default (di luar jangkauan pass sisi cg_clif).
+
+### 8.20 Akar masalah sisa gap runtime (bukan autovektorisasi)
+
+Mematikan vektorisasi LLVM (`-Cno-vectorize-loops -Cno-vectorize-slp`) hampir
+tidak mengubah waktu LLVM (p4 55.4 → 57.2 ms). Jadi gap bukan soal
+autovektorisasi, melainkan kualitas codegen scalar:
+
+- **p4 trig**: LLVM meng-unroll loop `sinf` 6× untuk ILP pada call, dan
+  menggabungkan `sin`+`cos` argumen sama menjadi satu `sincosf`. M memanggil
+  `sinf`/`cosf` sekali per iterasi; bahkan sin-only (trig1) L 30.9 / M 77.0 ms.
+- **p2 mem**: LLVM meng-inline penuh probe SSE2 hashbrown ke dalam `main`
+  (main punya 9 call); M membiarkannya out-of-line (12 call).
+- **p3 fib**: LLVM mengubah rekursi ganda menjadi loop; M tetap rekursif.
+
+Semua ini adalah kualitas codegen/inliner Cranelift, di luar jangkauan pass
+sisi cg_clif; perbaikannya harus di dalam `cranelift-codegen`.
+
+Catatan nuansa: p2 sebenarnya berada di batas jangkauan — inliner **adalah**
+pass sisi cg_clif, dan ambang `MAX_CALLEE_INSTS=64` (badan probe jauh lebih
+besar) mencegah probe di-inline. Namun menaikkan ambang sampai cukup untuk
+probe akan meledakkan ukuran kode pada pemanggil lain, jadi ini bukan trade-off
+yang jelas menang; dibiarkan apa adanya. p3/p4 (konversi rekursi→loop,
+unrolling-call untuk ILP, fusi `sincos`) murni pekerjaan level Cranelift.
