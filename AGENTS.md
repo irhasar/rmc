@@ -388,7 +388,17 @@ the residual 3–7x is **Cranelift codegen quality, not inlining**:
   autovectorization (the SipHash tail, `u8to64_le`), which Cranelift does not
   do. These are backend-internal; a cg_clif-side pass cannot reach them.
 
-### Push status (2026-11-18, second update) — BLOCKED ON CREDENTIALS
+### Push status (2026-11-18, second update) — PUSHED
+- Pushed to PR **#10** (`replace-main-with-cgclif-experiments` → `main`), head
+  now **`8f84035`**, 16 commits, `mergeable=True`, `mergeable_state=clean`.
+  Commits this session: `64b3760` "Inline callees that reference globals; allow
+  repeated inlining" (vendors `cg_clif_mod/vendor/cranelift-codegen-0.137.0` +
+  the `translate_symbol_name` fix) and `8f84035` (docs).
+- The environment's injected `GITHUB_TOKEN` is read-only for this repo (all
+  writes 403 `Resource not accessible by integration`); a user-supplied
+  `repo`-scoped classic PAT was used to push. (History note below kept for the
+  blocked attempt.)
+- Historical note — BLOCKED ON CREDENTIALS
 - `cg_clif_mod` head is `c2e292b` "Inline callees that reference globals; allow
   repeated inlining"; it vendors `vendor/cranelift-codegen-0.137.0` (added to
   `[patch.crates-io]`) with the `translate_symbol_name` fix.
