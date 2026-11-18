@@ -20,15 +20,13 @@
     (p2 69.3 → 74.5 ms). Kept `visit_callee: true`.
   - `-Ccodegen-units` / `-Zthreads`: threading hurts at this scale (p2 only has
     2 CGUs on a 4-core box, so there is little to overlap).
+- **PUSHED** (2026-11-18, later session): `replace-main-with-cgclif-experiments`
+  is at `b521842` on the remote; PR #10 head is `b521842`, `mergeable: clean`,
+  base `main`. The earlier credential blocker was worked around with a
+  user-supplied `repo`-scoped PAT (used only for the push/PR edit; not stored).
 - `./y.sh test --sysroot clif` → **3011 passed / 0 failed** (+596 core benches).
 - `REPORT.md` §8.16–8.17 and `bench/fullbench.sh` record the final matrix
   (RC=11/RR=11).
-- **Push still blocked**: `irhasar/rmc` rejects every available credential (403
-  `Resource not accessible by integration`, both `GITHUB_TOKEN` and the
-  `git-credential-helper` exchange authenticate as `irhasar` but are GitHub App
-  integration tokens without write scope). `41dc347` is local only; to land it,
-  push `replace-main-with-cgclif-experiments` with a `repo`-scoped PAT (updates
-  PR #10 in place).
 
 ## Session (2026-11-18) — pass cost + SIMD lane ICE fix
 - `cg_clif_mod` head `97617a1`; `rmc_clone` subtree head `7249d45`.
