@@ -143,9 +143,12 @@ Add new programs under `bench/progs/` so they are picked up automatically.
   `const fn`s in `core`, so they must be inlined for hashbrown's probe loop to
   become the single `movdqu`/`pcmpeqb`/`pmovmskb` sequence LLVM produces. cg_clif
   never folds them because:
-  - rustc's MIR inliner is **off** by default (`-Zinline-mir`, default: no), and
-    turning it on for the *user* crate does not help — the intrinsics live in the
-    precompiled `core`/`std` sysroot, not in the crate being compiled;
+  - rustc's MIR inliner does **not** fold them: a plain cross-crate `#[inline]`
+    helper *is* inlined with `-Zinline-mir=yes`, but the SSE intrinsics are not
+    (3 `_mm_*` calls survive in the MIR), and marking the *caller*
+    `-Ctarget-feature=+sse2` does not change that. The sysroot is already built
+    with `-Zinline-mir` (see `build_system/build_sysroot.rs`), so this is not a
+    missing flag;
   - cg_clif's own `CguInliner` only sees bodies in the *same* codegen unit
     (`aot.rs` clones `codegened_functions` of one CGU), and it deliberately
     requires `linkage.is_final()`; a cross-crate `#[inline]` generic in `core`
@@ -170,9 +173,11 @@ Add new programs under `bench/progs/` so they are picked up automatically.
   the win LLVM gets on p5/p6 is *affine reassociation* of the accumulator chain,
   not unrolling per se. Duplicating the body leaves the loop-carried dependency
   chain intact. Implemented anyway behind `CG_CLIF_UNROLL_CLONE` for completeness.
-- Remaining runtime gap on p2–p5 (LLVM 19–58 ms vs mod 107–360 ms) is not loops:
-  it is cross-CGU inlining and full memory-to-register promotion, which are not
-  yet complete.
+- Remaining runtime gap on p1–p4 (LLVM 17–58 ms vs mod 99–140 ms) is **not**
+  loops or store/load round-trips — the cross-block pass left runtime unchanged.
+  For p2 it is the out-of-line `core` SSE intrinsics (see the root-cause entry
+  above). p1/p3/p4 gaps are smaller and stem from the same missing cross-CGU
+  inlining plus incomplete memory-to-register promotion.
 
 ## Gotchas
 - `measure.py`/`compare3.sh`: pass the rustc command as separate argv elements;
@@ -193,11 +198,13 @@ Add new programs under `bench/progs/` so they are picked up automatically.
 
 
 ## Push status (T6) — DONE
-- PR **#10** (`replace-main-with-cgclif-experiments` → `main`) is open and
-  **mergeable**. Remote tip is now `628c73b` (6 commits / 624 changed files);
-  local == remote.
-- `628c73b` fixes the store-forward miscompile (branch args were not scanned in
-  `private_slots`). Pushed with a user-supplied classic PAT with `repo` scope:
+- PR **#10** (`replace-main-with-cgclif-experiments` → `main`) is open,
+  **mergeable=True (clean)**. Remote tip is now `e101572` (7 commits / 625
+  changed files); local == remote.
+- `e101572` adds the cross-block store forwarding, syncs the docs and makes the
+  bench scripts path-relative. `628c73b` fixed the store-forward miscompile
+  (branch args were not scanned in `private_slots`). Pushed with a user-supplied
+  classic PAT with `repo` scope:
   `git push https://<user>:<PAT>@github.com/irhasar/rmc.git replace-main-with-cgclif-experiments`.
 - Note: the environment's injected `GITHUB_TOKEN` (GitHub App installation) is
   read-only for this repo — `git push` and all write APIs return 403
