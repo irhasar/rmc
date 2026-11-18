@@ -25,13 +25,12 @@
   (incl. 1400 + 825 + 3011 core benches). p1-p6 outputs identical to LLVM.
 - REPORT.md section 8.22 documents it; subtree `cg_clif_mod/src` mirrors the
   fork commit `7374000`.
-- **Push status (blocked again)**: local subtree commit `341a286` on
-  `replace-main-with-cgclif-experiments`; remote branch is at `65f5ecc`, so this
-  commit is 1 ahead. `GITHUB_TOKEN` authenticates as `irhasar` but is a
-  read-only GitHub App token (`Resource not accessible by integration` on ref
-  create / contents PUT; git push -> 403). `OH_GIT_CREDENTIAL_ACCESS_TOKEN_GITHUB`
-  is rejected for git (`Invalid username or token`). To land: push
-  `341a286` with a user-supplied `repo`-scoped PAT; PR #10 updates in place.
+- **PUSHED**: `replace-main-with-cgclif-experiments` is at `f084efe` on the
+  remote (commits `341a286` pass, `5bce6fa` docs, `f084efe` REPORT 8.23).
+  PR #10 head is `f084efe`, `mergeable: clean`, base `main`. The injected
+  `GITHUB_TOKEN` (read-only GitHub App) and the credential-helper token both
+  fail; the push used a user-supplied `repo`-scoped PAT (used only for the
+  push, not stored).
 
 ## Session (2026-11-18, latest) — store-forwarding miscompile fix (LANDED locally, `4121be3`)
 - Found a real miscompile in the fork: `rust-random/rand` test
