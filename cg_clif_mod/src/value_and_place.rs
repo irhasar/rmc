@@ -637,6 +637,19 @@ impl<'tcx> CPlace<'tcx> {
                                 to_ptr.store(fx, val, flags);
                                 return;
                             }
+                            // A 128-bit SIMD value is copied with one vector load
+                            // and one vector store. `emit_small_memory_copy` below
+                            // would split the 16 bytes into two `i64` loads and two
+                            // `i64` stores, and cg_clif bounces every SIMD op
+                            // through such a stack slot, so the difference is paid
+                            // on each operation. Wider vectors (`__m256i` without
+                            // AVX) have no single store, so they keep the memcpy.
+                            BackendRepr::SimdVector { .. } if dst_layout.size == Size::from_bytes(16) => {
+                                let val = from.load_scalar(fx);
+                                to_ptr.store(fx, val, flags);
+                                return;
+                            }
+                            BackendRepr::SimdVector { .. } => {}
                             BackendRepr::ScalarPair { a: _, b: _, b_offset } => {
                                 let b_offset = Offset32::new(b_offset.bytes().try_into().unwrap());
                                 let (val1, val2) = from.load_scalar_pair(fx);

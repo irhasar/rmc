@@ -14,7 +14,8 @@
 //! restricted to stack slots whose address never escapes the function, so no
 //! call or indirect store can observe the slot between the store and the load.
 
-use cranelift_codegen::ir::{self, Block, Inst, Opcode, StackSlot, Value, types};
+use cranelift_codegen::cursor::{Cursor, FuncCursor};
+use cranelift_codegen::ir::{self, Block, Inst, MemFlagsData, Opcode, StackSlot, Value, types, InstBuilder};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
 /// Byte range written or read at a stack slot.
@@ -27,7 +28,7 @@ fn disabled() -> bool {
     std::env::var_os("CG_CLIF_NO_STORE_FWD").is_some()
 }
 
-pub(crate) fn run(func: &mut ir::Function) {
+pub(crate) fn run(func: &mut ir::Function, endianness: ir::Endianness) {
     if disabled() {
         return;
     }
@@ -45,7 +46,7 @@ pub(crate) fn run(func: &mut ir::Function) {
     // block-local walk below cannot see.
     let entry = cross_block_entry(func, &private);
     for block in func.layout.blocks().collect::<Vec<_>>() {
-        forward_block(func, block, &private, &entry);
+        forward_block(func, block, &private, &entry, endianness);
     }
     drop_dead_stores(func, &private);
 }
@@ -138,6 +139,7 @@ fn forward_block(
     block: Block,
     private: &FxHashSet<StackSlot>,
     entry: &FxHashMap<Block, Avail>,
+    endianness: ir::Endianness,
 ) {
     let mut avail: Avail = entry.get(&block).cloned().unwrap_or_default();
 
@@ -165,13 +167,32 @@ fn forward_block(
             };
             let Some(&(value, ty)) = avail.get(&key) else { continue };
             let results = func.dfg.inst_results(inst);
-            if results.len() != 1 || func.dfg.value_type(results[0]) != ty {
+            if results.len() != 1 {
                 continue;
             }
             let result = results[0];
-            func.dfg.detach_inst_results(inst);
-            func.dfg.change_to_alias(result, value);
-            func.layout.remove_inst(inst);
+            let result_ty = func.dfg.value_type(result);
+            if result_ty == ty {
+                func.dfg.detach_inst_results(inst);
+                func.dfg.change_to_alias(result, value);
+                func.layout.remove_inst(inst);
+            } else if result_ty.bytes() == ty.bytes()
+                && result_ty.is_vector()
+                && ty.is_vector()
+            {
+                // A store and a load of the same bytes but different vector types is
+                // exactly how a SIMD bitcast (`__m128i` <-> `Simd<i8, 16>`) compiles:
+                // the value is stored as one lane type and read back as another.
+                // Forward the stored value through a bitcast instead of leaving the
+                // round-trip for the machine code.
+                let mut pos = FuncCursor::new(func);
+                pos.goto_inst(inst);
+                let flags = MemFlagsData::new().with_endianness(endianness);
+                let cast = pos.ins().bitcast(result_ty, flags, value);
+                pos.func.dfg.detach_inst_results(inst);
+                pos.func.dfg.change_to_alias(result, cast);
+                pos.func.layout.remove_inst(inst);
+            }
         }
     }
 }

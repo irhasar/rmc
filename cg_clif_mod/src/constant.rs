@@ -2,12 +2,13 @@
 
 use std::cmp::Ordering;
 
+use cranelift_codegen::ir;
 use cranelift_module::*;
 use rustc_const_eval::interpret::CTFE_ALLOC_SALT;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::mir::interpret::{
-    AllocId, GlobalAlloc, PointerArithmetic, Scalar, read_target_uint,
+    AllocId, AllocRange, GlobalAlloc, PointerArithmetic, Scalar, read_target_uint,
 };
 use rustc_middle::ty::layout::HasTypingEnv as _;
 use rustc_middle::ty::{ExistentialTraitRef, ScalarInt};
@@ -217,17 +218,70 @@ pub(crate) fn codegen_const_value<'tcx>(
                 CValue::by_val(val, layout)
             }
         },
-        ConstValue::Indirect { alloc_id, offset } => CValue::by_ref(
-            Pointer::new(pointer_for_allocation(fx, alloc_id))
-                .offset_i64(fx, i64::try_from(offset.bytes()).unwrap()),
-            layout,
-        ),
+        ConstValue::Indirect { alloc_id, offset } => {
+            // A 16-byte SIMD constant (e.g. `Simd::ZERO`, `_mm_setzero_si128()`,
+            // or a splat mask) is read-only, pointer-free and fully initialised.
+            // Emit it as a `vconst` instead of an anonymous global + load: the
+            // load is a real memory round-trip on the hot path, and the symbol
+            // it references is a `GlobalValueData` that blocks inlining the
+            // surrounding `core::arch` helper (Cranelift's inliner does not
+            // remap symbol names). `vconst` folds to a single `xmm` load and
+            // carries no global value.
+            if let Some(val) = simd_const_vconst(fx, alloc_id, offset, layout) {
+                return CValue::by_val(val, layout);
+            }
+            CValue::by_ref(
+                Pointer::new(pointer_for_allocation(fx, alloc_id))
+                    .offset_i64(fx, i64::try_from(offset.bytes()).unwrap()),
+                layout,
+            )
+        }
         ConstValue::Slice { alloc_id, meta } => {
             let ptr = pointer_for_allocation(fx, alloc_id);
             let len = fx.bcx.ins().iconst(fx.pointer_type, meta as i64);
             CValue::by_val_pair(ptr, len, layout)
         }
     }
+}
+
+/// Try to materialise a `ConstValue::Indirect` as a single `vconst` vector value.
+///
+/// Only fires for a 16-byte, read-only, pointer-free, fully-initialised
+/// allocation referenced at offset 0 whose type is a 128-bit SIMD vector, which
+/// is the shape of every `core::arch` vector constant (`Simd::ZERO`, splat
+/// masks, `_mm_set1_*` results). Returns `None` for anything else so the caller
+/// falls back to the generic anonymous-global path.
+fn simd_const_vconst<'tcx>(
+    fx: &mut FunctionCx<'_, '_, 'tcx>,
+    alloc_id: AllocId,
+    offset: Size,
+    layout: TyAndLayout<'tcx>,
+) -> Option<Value> {
+    if offset.bytes() != 0 {
+        return None;
+    }
+    let BackendRepr::SimdVector { element, count } = layout.backend_repr else {
+        return None;
+    };
+    let clif_ty = scalar_to_clif_type(fx.tcx, element).by(count.as_u32())?;
+    if !clif_ty.is_vector() || clif_ty.bytes() != 16 {
+        return None;
+    }
+    let GlobalAlloc::Memory(alloc) = fx.tcx.global_alloc(alloc_id) else {
+        return None;
+    };
+    let alloc = alloc.inner();
+    let full = AllocRange { start: Size::ZERO, size: Size::from_bytes(16) };
+    if alloc.mutability.is_mut()
+        || alloc.len() != 16
+        || !alloc.provenance().ptrs().is_empty()
+        || alloc.init_mask().is_range_initialized(full).is_err()
+    {
+        return None;
+    }
+    let bytes = alloc.inspect_with_uninit_and_ptr_outside_interpreter(0..16);
+    let constant = fx.bcx.func.dfg.constants.insert(ir::ConstantData::from(bytes));
+    Some(fx.bcx.ins().vconst(clif_ty, constant))
 }
 
 fn pointer_for_allocation<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, alloc_id: AllocId) -> Value {

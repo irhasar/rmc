@@ -186,7 +186,7 @@ pub(crate) fn compile_fn(
     // and Cranelift keeps those round-trips because the slot is not `readonly`.
     // This must run before `unroll`, whose affine analysis rejects any loop that
     // still touches memory.
-    crate::store_forward::run(&mut context.func);
+    crate::store_forward::run(&mut context.func, module.isa().endianness());
 
     // Widen canonical counted loops so their carried dependency chains are
     // shortened. Cranelift has no unrolling pass of its own.
