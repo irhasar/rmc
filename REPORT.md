@@ -837,3 +837,58 @@ Ringkas lintas sumbu:
   (p5/p6 896/908 → 7 ms, ~130× vs U) dan pada loop branchy murah (p7 105 → 55 ms,
   LLVM 43 ms). Sisa gap murni kualitas codegen Cranelift (autovektorisasi p8,
   fusi `sincos`/unroll-call p4, inlining penuh p2, rekursi→loop p3 — lihat 8.20).
+
+### 8.24 Validasi pada crate pihak ketiga nyata (`github.com/cipansor/crateworks`)
+
+Sampai 8.23 semua program uji adalah kernel sintetis. Untuk memastikan hasilnya
+bukan artefak mikrobenchmark, tiga crate nyata dari `crateworks` dibangun dan
+dijalankan dengan tiga backend. Semua crate ini murni Rust tanpa dependensi
+eksternal dan `#![forbid(unsafe_code)]`, jadi cocok untuk uji lintas backend.
+
+Harness: `extbench/extbench.sh` (compile lib + driver, RC=3; run, RR=5),
+`extbench/exttests.sh` (jalankan test suite milik crate). Tiap crate dikompilasi
+sebagai `--crate-type lib` dengan `-C opt-level=3 --edition 2024`, lalu driver
+kecil di-link dengan `--extern`. Argumen driver dipilih agar tiap run ~2–25 s.
+
+| crate | Cwall L/U/M (ms) | Ccpu L/U/M (ms) | Crss L/U/M (MB) | size L/U/M (byte) | Rwall L/U/M (ms) |
+|-------|------------------|-----------------|-----------------|-------------------|------------------|
+| openlocationcode | 432/247/255 | 599/317/332 | 142.4/140.5/141.2 | 4853894/6322818/4832554 | 2195/26347/16085 |
+| holidays-rs | 809/417/416 | 1708/612/620 | 187.3/166.3/169.3 | 6901646/7800264/6659200 | 8099/37160/23317 |
+| stdnum-rs | 3354/1505/1591 | 9237/2459/2813 | 283.6/263.1/267.7 | 9314804/10610242/9908194 | 1382/17261/9095 |
+
+Rasio kunci (L = rustc+LLVM, U = cg_clif upstream, M = fork modifikasi):
+
+| crate | compile wall M vs L | compile CPU M vs L | ukuran M vs U | ukuran M vs L | runtime M vs U | runtime M vs L |
+|-------|---------------------|--------------------|---------------|---------------|----------------|----------------|
+| openlocationcode | 1.69× lebih cepat | 1.80× lebih cepat | −23.6% | −0.4% | 1.64× lebih cepat | 7.33× lebih lambat |
+| holidays-rs | 1.94× lebih cepat | 2.75× lebih cepat | −14.6% | −3.5% | 1.59× lebih cepat | 2.88× lebih lambat |
+| stdnum-rs | 2.11× lebih cepat | 3.28× lebih cepat | −6.6% | +6.4% | 1.90× lebih cepat | 6.58× lebih lambat |
+
+Temuan:
+
+- **Compile**: M ~1.7–2.1× lebih cepat dari LLVM (wall) dan ~1.8–3.3× lebih
+  cepat (CPU), dengan peak RSS ~1–10% lebih rendah. M ≈ U (selisih ≤6%),
+  konsisten dengan 8.23: keunggulan compile adalah properti Cranelift, bukan
+  tambahan pass.
+- **Ukuran**: M selalu lebih kecil dari U (−7%…−24%) dan di dua dari tiga crate
+  juga lebih kecil dari LLVM (−0.4%, −3.5%); stdnum-rs +6.4% vs LLVM.
+- **Runtime**: M secara konsisten **1.6–1.9× lebih cepat dari U** pada ketiga
+  crate nyata — mengonfirmasi bahwa keunggulan pass (inliner, store-forwarding,
+  if-conversion) berlaku di kode produksi, bukan hanya kernel. Sisa gap ke LLVM
+  (2.9×–7.3×) sesuai 8.20: kualitas codegen Cranelift, bukan bug pass.
+- **RSS runtime**: identik (~10.7–10.8 MB) di ketiga backend; tidak ada
+  regresi memori.
+- **Korrekthesia**: ketiga driver menghasilkan output **identik** di L, U, M
+  (openlocationcode `18446744071467594188`, holidays-rs `22771057172600`,
+  stdnum-rs `4325649`). Test suite milik crate juga dijalankan dengan tiap
+  backend dan **semua lolos** (0 failed):
+
+| suite | L | U | M |
+|-------|---|---|---|
+| openlocationcode: reference / readme / fuzz | 6 / 1 / 4 ok | 6 / 1 / 4 ok | 6 / 1 / 4 ok |
+| holidays-rs: closest / readme / holidays_oracle | 1 / 1 / 1 ok | 1 / 1 / 1 ok | 1 / 1 / 1 ok |
+| stdnum-rs: readme | 3 ok | 3 ok | 3 ok |
+
+Catatan: crate `holidays-rs` memakai `crateworks` yang menargetkan `edition
+2024`/`rust-version 1.88`; sysroot clif yang dibangun dari toolchain
+`nightly-2026-11-17` memenuhi syarat ini tanpa perubahan.
