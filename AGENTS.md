@@ -25,6 +25,11 @@
   before the final commit. `CG_CLIF_SF_TIME=1` dumps per-function pass stats.
 - CLIF dump: `should_write_ir` keys off `--emit llvm-ir`, so `-Cllvm-args` is
   not needed; the `.opt.clif`/`.unopt.clif` files land next to the output.
+- Push status (unchanged): still BLOCKED. `git push origin` → 403
+  "Permission to irhasar/rmc.git denied to irhasar"; token-embedded and
+  helper-token pushes also fail. PR #10 is open/mergeable but its head is still
+  `90c21bb` (the older factor-8 version). Local `rmc_clone` branch head is
+  `d4623ac`, 3 commits ahead of origin. Needs a user-supplied `repo`-scoped PAT.
 
 ## Session (2026-11-18) — affine unroll factor 8 → 128 (LANDED locally, superseded)
 - `cg_clif_mod` head **`6951858`** "Raise the affine loop unroll factor to 128
