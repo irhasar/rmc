@@ -1,6 +1,32 @@
 # AGENTS.md
 
-## Session (2026-11-18, latest) — affine unroll factor 8 → 128 (LANDED locally)
+## Session (2026-11-18, latest) — store-forwarding miscompile fix (LANDED locally, `4121be3`)
+- Found a real miscompile in the fork: `rust-random/rand` test
+  `rngs::std::test::test_stdrng_construction` FAILED in M but passed in
+  upstream cg_clif AND LLVM.
+- Isolation: `CG_CLIF_NO_STORE_FWD=1` → ok; `CG_CLIF_SF_NO_CBE=1` → ok;
+  `CG_CLIF_UNROLL=1` → still FAILED. So the bug is the cross-block
+  store-forwarding dataflow, not the unroller. Upstream has no such pass, so
+  it is a fork-only regression.
+- Root cause: `record_store` returned early (store not in `loaded`, or atomic
+  store) BEFORE the overlap invalidation. Such a store still writes bytes, so a
+  stale fact survived it and a later load was forwarded the old value.
+- Fix: move the `avail.retain(...)` invalidation ahead of both early returns.
+  Strictly more conservative (can only drop forwards), so it cannot introduce a
+  new miscompile. `src/store_forward.rs` only; no knob added in the final commit.
+- Verified: rand workspace all ok (0 failed); `./y.sh test --sysroot clif`
+  0 failed; p1–p6 all match LLVM/upstream; 3-way benchmark unchanged
+  (p5/p6 7 ms, p2 67 ms) — the soundness fix costs nothing.
+- Commits: `cg_clif_mod` `4121be3`; `rmc_clone` subtree `74b78f6`.
+- Debug technique that worked: temporary env knobs to bisect the pass
+  (`CG_CLIF_NO_STORE_FWD`, `CG_CLIF_SF_NO_CBE`, `CG_CLIF_UNROLL`), plus a
+  temporary `CG_CLIF_NO_DEAD_STORE` knob and an `eprintln!` trace guarded by
+  `CG_CLIF_SF_TRACE` in the forward site. Both temporary knobs were removed
+  before the final commit. `CG_CLIF_SF_TIME=1` dumps per-function pass stats.
+- CLIF dump: `should_write_ir` keys off `--emit llvm-ir`, so `-Cllvm-args` is
+  not needed; the `.opt.clif`/`.unopt.clif` files land next to the output.
+
+## Session (2026-11-18) — affine unroll factor 8 → 128 (LANDED locally, superseded)
 - `cg_clif_mod` head **`6951858`** "Raise the affine loop unroll factor to 128
   with a checked step bound"; `rmc_clone` subtree commit **`193ec3e`** (PR #10
   branch `replace-main-with-cgclif-experiments`), **not pushed** (see below).
