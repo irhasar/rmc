@@ -21,6 +21,12 @@ pub(crate) fn store_forward_enabled() -> bool {
     *V.get_or_init(|| !flag("CG_CLIF_NO_STORE_FWD"))
 }
 
+/// Whether the if-conversion pass runs at all (`CG_CLIF_NO_IFCONV` off).
+pub(crate) fn if_convert_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| !flag("CG_CLIF_NO_IFCONV"))
+}
+
 /// Per-function store-forwarding timing output (`CG_CLIF_SF_TIME`).
 pub(crate) fn store_forward_time() -> bool {
     static V: OnceLock<bool> = OnceLock::new();

@@ -1,5 +1,31 @@
 # AGENTS.md
 
+## Session (2026-11-18, latest) — if-conversion diamond → select/cmove (LANDED, `7374000`)
+- New pass `src/if_convert.rs`: collapses a short, side-effect-free two-way
+  diamond (`brif` head -> then/else -> common join) into a `select` in the
+  head, which Cranelift lowers to `cmove`. Runs **before** `unroll` in
+  `src/base.rs` (slot `IF_CONVERT` in `src/passtime.rs`; knob
+  `CG_CLIF_NO_IFCONV`, default ON; tunable `tunables::if_convert_enabled`).
+- Why it matters twice: (1) a data-dependent in-loop branch mispredicts every
+  iteration; (2) the fork's `unroll` only widens a single-block body, so a
+  diamond blocks unrolling. Collapsing first gives the unroller its single block.
+- Guards: head is a `brif` with two successors; each arm is single-pred /
+  single-succ, ends in `jump` to the *same* join, join has no block params, no
+  escaping defs, every arm inst `is_speculatable`, arm <= `MAX_ARM_INSTS = 8`.
+  Rewrites to a fixed point so nested diamonds also collapse.
+- **Cost model is essential**: `cmove` computes both arms, so
+  `is_cheap_to_speculate` rejects arms holding `FcvtToUintSat`/`FcvtToSintSat`
+  (expands to a long branchy sequence on x86) or `Udiv/Sdiv/Urem/Srem/Fdiv`.
+  Without it, p1's `f as u64` arm regressed p1 105 -> 112 ms.
+- **Measured** (wall ms): `w_mod` (hash%7 arm) 62.7 -> **38.1** (LLVM 29.8);
+  `b1` (3-way, cheap arms) 73.8 -> **61.1** (LLVM 60.0); `b2` (predictable cond)
+  39.0 -> 40.7 (small, expected loss); `v_full`/p1 (arm holds `f as u64`)
+  104.6 -> 104.7 (neutral thanks to the cost model).
+- **Tests**: `./y.sh test --sysroot clif` -> 65 `test result: ok`, 0 failed
+  (incl. 1400 + 825 + 3011 core benches). p1-p6 outputs identical to LLVM.
+- REPORT.md section 8.22 documents it; subtree `cg_clif_mod/src` mirrors the
+  fork commit `7374000`.
+
 ## Session (2026-11-18, latest) — store-forwarding miscompile fix (LANDED locally, `4121be3`)
 - Found a real miscompile in the fork: `rust-random/rand` test
   `rngs::std::test::test_stdrng_construction` FAILED in M but passed in

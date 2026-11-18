@@ -463,12 +463,13 @@ Hasil pada `p2_mem`: runtime **110 → 99 ms** (LLVM 17 ms); ukuran **4.41 MB**
 
 | Env | Default | Efek |
 |-----|---------|------|
-| `CG_CLIF_UNROLL` | 8 | faktor reassociasi (1 = mati) |
+| `CG_CLIF_UNROLL` | 128 | faktor reassociasi (1 = mati) |
 | `CG_CLIF_UNROLL_CLONE` | unset | aktifkan unroll duplikasi-body (fallback) |
 | `CG_CLIF_INLINE_MAX` | 64 | batas instruksi callee untuk inliner (0 = mati) |
 | `CG_CLIF_INLINE_USES` | 3 | maksimum berapa kali satu callee boleh di-inline ke satu caller |
 | `CG_CLIF_NO_STORE_FWD` | unset | matikan store→load forwarding |
-| `CG_CLIF_PASS_TIME` | unset | cetak waktu per-pass cg_clif (store_forward/unroll/inline/collect) |
+| `CG_CLIF_NO_IFCONV` | unset | matikan if-conversion diamond→`select` |
+| `CG_CLIF_PASS_TIME` | unset | cetak waktu per-pass cg_clif (store_forward/unroll/inline/collect/if_convert) |
 | `CG_CLIF_CLIF_TIME` | unset | cetak waktu per-pass internal Cranelift |
 | `CG_CLIF_SF_NO_CBE` | unset | matikan dataflow store-forwarding lintas blok |
 | `CG_CLIF_SF_CBE_MAX` | 300 | batas instruksi fungsi agar CBE dijalankan |
@@ -743,3 +744,69 @@ pernah menambah, jadi tidak mungkin memunculkan miscompile baru.
 - Harness benchmark p1–p6: semua keluaran identik dengan LLVM dan upstream.
 - Benchmark tiga arah tidak berubah: p5/p6 tetap 7 ms, p2 tetap 67 ms. Jadi
   perbaikan soundness ini berbiaya nol.
+
+### 8.22 If-conversion diamond → `select`/`cmove` (LANDED)
+
+**Masalah.** `if` pendek di dalam loop tetap berbentuk diamond `brif`: head
+bercabang ke blok *then* dan *else*, keduanya `jump` ke *join* dengan parameter
+nilai terpilih. Bila kondisinya data-dependent (`hash % k == 0`), cabang itu
+sering salah prediksi dan tiap salah prediksi membuang pipeline. Dua efek:
+
+1. **Runtime.** `cmove` tidak bisa salah prediksi; cabang bisa.
+2. **Struktural.** Pass `unroll` fork hanya melebarkan loop yang body-nya satu
+   blok dengan satu back edge. Diamond menambah blok, jadi loop seperti itu
+   tidak pernah di-unroll. Meng-collapse diamond lebih dulu membuat body jadi
+   satu blok yang dibutuhkan unroller.
+
+**Perbaikan.** Pass `if_convert` (`src/if_convert.rs`, ~347 baris) men-collapse
+diamond dua arah yang pendek dan bebas efek samping menjadi `select` di head,
+yang Cranelift lower jadi `cmove`. Dijalankan **sebelum** `unroll` di pipeline.
+
+Syarat konservatif (semua harus terpenuhi):
+
+- head adalah `brif` dengan dua successor; `then`/`else` masing-masing
+  single-predecessor dan single-successor;
+- kedua arm berakhir `jump` ke **join yang sama**;
+- join **tidak** punya block parameter, dan tidak ada nilai yang bocor keluar arm;
+- tiap instruksi arm *speculatable* (`is_speculatable`, cermin
+  `is_pure_for_egraph` yang tidak diekspor vendor) dan **murah** untuk
+  dispekulasi;
+- arm ≤ `MAX_ARM_INSTS = 8` instruksi.
+
+Rewrite dijalankan sampai fixed point agar rantai diamond bersarang ikut
+runtuh.
+
+**Model biaya (temuan penting).** `cmove` menghitung **kedua** arm setiap
+iterasi. Arm yang meluas jadi sequence bercabang/libcall lebih mahal daripada
+cabang yang digantikan. `is_cheap_to_speculate` menolak arm yang memuat
+`FcvtToUintSat`/`FcvtToSintSat` (konversi float→int saturating — di x86 meluas
+jadi blok bercabang panjang) atau `Udiv`/`Sdiv`/`Urem`/`Srem`/`Fdiv`
+(pembagian/modulo non-konstanta). Tanpa model ini, arm `f as u64` di p1
+membuat p1 **regresi** 105 → 112 ms; dengan model ini p1 kembali netral.
+
+**Verifikasi.**
+
+| program | LLVM | upstream | M tanpa ifconv | M dengan ifconv |
+|---------|------|----------|----------------|-----------------|
+| `p7_branchy` (`if acc%7==0 { z^=acc }`) | 44 ms | 102 ms | 62.7 ms | **56 ms** |
+| `b1` (3 arah, arm murah) | 60.0 ms | – | 73.8 ms | **61.1 ms** |
+| `p8_minmax` (min-reduction) | 18 ms | 39 ms | 39.0 ms | 38.8 ms |
+| `b2` (kondisi nyaris selalu false) | 2.4 ms | – | 39.0 ms | 40.7 ms |
+| `v_full`/p1 (arm berisi `f as u64`) | 84 ms | 109 ms | 104.6 ms | 104.7 ms |
+
+Jadi pass menutup sebagian besar gap mispredict pada arm murah (`w_mod`
+microbench 62 → 38 ms; `p7_branchy` 62 → 56 ms; `b1` 74 → 61 ms) dan **netral**
+pada arm mahal. Regresi kecil 4% hanya
+pada kondisi yang nyaris selalu false (b2) — di sana `cmove` menambah kerja di
+jalur hot tanpa menghilangkan mispredict. `b3` sudah ter-if-convert (`cmovb`)
+tetapi tetap jauh dari LLVM karena LLVM meng-autovektorisasi min-reduction
+(lihat 8.20).
+
+- `./y.sh test --sysroot clif`: **65 blok `test result: ok`, 0 failed**
+  (termasuk 1400 + 825 + 3011 core benches).
+- Keluaran p1–p6 identik dengan LLVM dan upstream.
+- Ukuran binary dan waktu compile praktis tidak berubah (pass hanya menyusun
+  ulang blok, tidak menambah instruksi).
+
+**Knob.** `CG_CLIF_NO_IFCONV=1` mematikan pass; waktu pass dilaporkan lewat
+`CG_CLIF_PASS_TIME` sebagai `if_convert`. Default **ON**.

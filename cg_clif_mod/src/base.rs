@@ -193,6 +193,12 @@ pub(crate) fn compile_fn(
         crate::store_forward::run(&mut context.func, module.isa().endianness())
     });
 
+    // Collapse short two-way diamonds into a `select` (a `cmove`) so a
+    // data-dependent branch cannot mispredict. Running before `unroll` also
+    // turns a loop whose body holds such a branch into the single block the
+    // unroller accepts.
+    crate::passtime::time(crate::passtime::IF_CONVERT, || crate::if_convert::run(&mut context.func));
+
     // Widen canonical counted loops so their carried dependency chains are
     // shortened. Cranelift has no unrolling pass of its own.
     crate::passtime::time(crate::passtime::UNROLL, || crate::unroll::run(&mut context.func));

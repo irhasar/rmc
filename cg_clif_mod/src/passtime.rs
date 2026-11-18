@@ -10,15 +10,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
-    static ACC: [Cell<u128>; 4] = [const { Cell::new(0) }; 4];
+    static ACC: [Cell<u128>; 5] = [const { Cell::new(0) }; 5];
 }
 
 pub(crate) const STORE_FORWARD: usize = 0;
 pub(crate) const UNROLL: usize = 1;
 pub(crate) const INLINE: usize = 2;
 pub(crate) const COLLECT: usize = 3;
+pub(crate) const IF_CONVERT: usize = 4;
 
-const NAMES: [&str; 4] = ["store_forward", "unroll", "inline", "collect"];
+const NAMES: [&str; 5] = ["store_forward", "unroll", "inline", "collect", "if_convert"];
 
 fn enabled() -> bool {
     if ENABLED.load(Ordering::Relaxed) {
