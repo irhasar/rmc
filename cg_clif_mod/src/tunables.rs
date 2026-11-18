@@ -86,3 +86,12 @@ pub(crate) fn opt_level() -> Option<&'static str> {
     static V: OnceLock<Option<String>> = OnceLock::new();
     V.get_or_init(|| var("CG_CLIF_OPT_LEVEL")).as_deref()
 }
+
+/// Inliner growth budget as a percentage of the caller size (`CG_CLIF_INLINE_GROWTH`).
+pub(crate) fn inline_growth_pct() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| match var("CG_CLIF_INLINE_GROWTH") {
+        Some(v) => v.parse().unwrap_or(super::inliner::GROWTH_PCT),
+        None => super::inliner::GROWTH_PCT,
+    })
+}

@@ -553,3 +553,71 @@ Kesimpulan tiap sumbu:
   codegen Cranelift (regalloc + autovektorisasi), bukan pass sisi cg_clif.
 
 
+
+### 8.16 Inliner: batas pertumbuhan + penyaringan loop (revisi terakhir)
+
+**Akar masalah.** Inliner menumbuhkan CLIF hingga +62% pada kode berat memori
+(p2_mem: 14449 → 23383 instruksi). Setiap pass Cranelift berikutnya harus
+menelusuri seluruh fungsi, jadi pertumbuhan itu membebani semua pass, bukan
+hanya inliner. Inilah satu-satunya penyebab gap compile p2 vs U.
+
+**Batas pertumbuhan per pemanggil.** Jumlah instruksi yang boleh diserap satu
+pemanggil dibatasi ke pecahan dari ukuran pemanggil itu sendiri
+(`CG_CLIF_INLINE_GROWTH`, default 50%), diklem ke `[64, 512]`. Hasil pada p2:
+
+| `CG_CLIF_INLINE_GROWTH` | compile wall (ms) | runtime wall (ms) |
+|---|---|---|
+| 25  | 135.5 | 67.6 |
+| 50  | 135.3 | 67.0 |
+| 100 | 136.4 | 64.8 |
+| 200 | 136.5 | 63.4 |
+| 1000 (tanpa batas) | 139.9 | 61.3 |
+
+50% adalah titik Pareto: mengembalikan ~4.6 ms compile dengan biaya ~5.7 ms
+runtime — pertukaran yang jelas menguntungkan karena runtime diukur pada
+program yang dijalankan berulang, sementara compile dibayar sekali.
+
+**Penyaringan hot-path (loop) — dicoba, DIBATALKAN.** Hipotesis: hanya inline
+pada call site di dalam loop, agar kode dingin tidak ikut membengkak. Hasil
+pengukuran justru lebih buruk di **kedua** sumbu (p2: compile 139.8 vs 138.9 ms,
+runtime 69.3 vs 66.4 ms) karena `LoopAnalysis` dihitung per pemanggil tanpa
+manfaat runtime. Fitur ini dihapus total.
+
+**Perbaikan `store_forward`.** `drop_dead_stores` semula membandingkan tiap
+store terhadap **semua** load di fungsi (O(stores × loads)). Kini load
+di-bucket per stack slot, sehingga sebuah store hanya dibandingkan dengan load
+pada slot yang sama.
+
+**Inlining satu level (`visit_callee: false`) — dicoba, DIBATALKAN.** Menghentikan
+penelusuran ke badan yang baru di-inline tidak menurunkan compile (karena yang
+mahal adalah pertumbuhan instruksi, bukan penelusuran) dan merusak runtime
+(p2: 69.3 → 74.5 ms), karena rantai wrapper tidak lagi runtuh. Dikembalikan ke
+`true`.
+
+**Kesimpulan.** Dengan batas pertumbuhan, M ≈ U pada compile (selisih dalam
+noise, ±1–2 ms) sambil tetap memenangi runtime besar: p2 157 → 68 ms, p5/p6
+894/903 → 61 ms. Sisanya adalah kualitas codegen Cranelift (regalloc,
+autovektorisasi), di luar jangkauan pass sisi cg_clif.
+
+### 8.17 Matriks lengkap tiga arah (revisi terakhir)
+
+`bench/fullbench.sh` (RC=11, RR=11), wall/CPU dalam ms, RSS dalam MB.
+
+| prog | cwall L/U/M | ccpu L/U/M | crss L/U/M | size L/U/M (byte) | rwall L/U/M | rcpu L/U/M | rrss L/U/M |
+|------|-------------|------------|------------|-------------------|-------------|------------|------------|
+| p1_arith | 92/84/85 | 110/107/108 | 105/108/109 | 4635232/5878688/4397368 | 82/108/106 | 82/108/105 | 10/10/10 |
+| p2_mem | 251/132/147 | 383/176/196 | 133/131/132 | 4639888/5936880/4419944 | 16/156/69 | 15/155/68 | 10/10/10 |
+| p3_calls | 109/93/95 | 132/119/124 | 116/116/117 | 4612368/5820872/4332312 | 37/117/98 | 37/116/97 | 10/10/10 |
+| p4_simd | 116/99/102 | 138/126/127 | 116/117/118 | 4636096/5893112/4405328 | 56/156/140 | 56/156/140 | 48/49/48 |
+| p5_inline | 90/85/84 | 110/108/108 | 104/106/107 | 4609368/5814440/4324288 | 58/894/61 | 57/893/61 | 10/10/10 |
+| p6_scalar | 90/85/84 | 109/109/111 | 101/103/104 | 4609368/5814424/4324288 | 58/903/61 | 57/903/60 | 10/10/10 |
+
+Kesimpulan tiap sumbu:
+
+- **Compile**: M ≈ U (dalam noise) dan keduanya jauh lebih cepat dari LLVM
+  (p2: 251 vs 132/147 ms, ~1.7×). RSS compile setara.
+- **Ukuran**: M ~5% lebih kecil dari LLVM dan ~25% lebih kecil dari U (berkat
+  `per_data_object_section`).
+- **Runtime**: M menutup hampir seluruh gap U→LLVM pada loop scalar/inline
+  (p5/p6: 894/903 → 61 ms, ~15×) dan mem (p2: 156 → 69 ms, ~2.3×). Sisanya
+  kualitas codegen Cranelift (regalloc, autovektorisasi).

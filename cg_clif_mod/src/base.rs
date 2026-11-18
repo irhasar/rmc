@@ -174,8 +174,11 @@ pub(crate) fn compile_fn(
     // Inline small callees that live in the same codegen unit before optimizing. Cranelift only
     // provides the mechanics; the heuristic lives in `crate::inliner`.
     if !bodies.is_empty() {
-        let inliner =
-            crate::inliner::CguInliner::new(bodies, codegened_func.func_id.as_u32());
+        let inliner = crate::inliner::CguInliner::new(
+            bodies,
+            codegened_func.func_id.as_u32(),
+            &context.func,
+        );
         if let Err(err) = crate::passtime::time(crate::passtime::INLINE, || context.inline(inliner)) {
             dcx.fatal(format!("inlining failed for {}: {err:?}", codegened_func.symbol_name));
         }

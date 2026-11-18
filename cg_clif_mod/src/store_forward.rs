@@ -84,6 +84,15 @@ pub(crate) fn run(func: &mut ir::Function, endianness: ir::Endianness) {
     }
 }
 
+/// The stack slot a `stack_addr` value (already alias-resolved) refers to.
+fn slot_of_resolved(dfg: &ir::DataFlowGraph, arg: Value) -> Option<StackSlot> {
+    let ir::ValueDef::Result(def_inst, 0) = dfg.value_def(arg) else { return None };
+    let ir::InstructionData::StackAddr { stack_slot, .. } = dfg.insts[def_inst] else {
+        return None;
+    };
+    Some(stack_slot)
+}
+
 /// If `addr` is a `stack_addr` of a known slot, or a tracked pointer base,
 /// return the base and the byte offset at which `inst` accesses it.
 fn mem_key(func: &ir::Function, inst: Inst, addr: Value) -> Option<Key> {
@@ -128,28 +137,21 @@ fn analyze(func: &ir::Function) -> Bases {
     // Candidate loads; filtered against the final private sets below.
     let mut loads: Vec<(Inst, Value)> = Vec::new();
 
-    // A `stack_addr` value that resolves to a slot, if `arg` is one.
-    let slot_of = |arg: Value| -> Option<StackSlot> {
-        let arg = dfg.resolve_aliases(arg);
-        let ir::ValueDef::Result(def_inst, 0) = dfg.value_def(arg) else { return None };
-        let ir::InstructionData::StackAddr { stack_slot, .. } = dfg.insts[def_inst] else {
-            return None;
-        };
-        Some(stack_slot)
-    };
-
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
             let opcode = dfg.insts[inst].opcode();
             let addr_index = address_index(opcode);
             for (i, &arg) in dfg.insts[inst].arguments(&dfg.value_lists).iter().enumerate() {
-                if let Some(slot) = slot_of(arg) {
+                // Resolve once: `slot_of` and the pointer classification both
+                // need the alias-resolved value, and resolving twice dominated
+                // the walk.
+                let arg = dfg.resolve_aliases(arg);
+                if let Some(slot) = slot_of_resolved(dfg, arg) {
                     slots.insert(slot);
                     if addr_index != Some(i) {
                         escaping_slots.insert(slot);
                     }
                 }
-                let arg = dfg.resolve_aliases(arg);
                 if addr_index == Some(i) {
                     addr_only.insert(arg);
                 } else {
@@ -164,11 +166,12 @@ fn analyze(func: &ir::Function) -> Bases {
             for dest in dfg.insts[inst].branch_destination(&dfg.jump_tables, &dfg.exception_tables) {
                 for arg in dest.args(&dfg.value_lists) {
                     if let Some(v) = arg.as_value() {
-                        if let Some(slot) = slot_of(v) {
+                        let v = dfg.resolve_aliases(v);
+                        if let Some(slot) = slot_of_resolved(dfg, v) {
                             slots.insert(slot);
                             escaping_slots.insert(slot);
                         }
-                        escaping_ptr.insert(dfg.resolve_aliases(v));
+                        escaping_ptr.insert(v);
                     }
                 }
             }
@@ -498,7 +501,9 @@ fn reverse_postorder(
 /// load. Because the slot cannot be observed from outside, such a store has no
 /// effect.
 fn drop_dead_stores(func: &mut ir::Function, private: &FxHashSet<StackSlot>) {
-    let mut read: Vec<(StackSlot, i64, i64)> = Vec::new();
+    // Reads bucketed by slot: a store only has to be compared against the reads
+    // of its own slot, not against every load in the function.
+    let mut reads: FxHashMap<StackSlot, Vec<(i64, i64)>> = FxHashMap::default();
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
             if !func.dfg.insts[inst].opcode().can_load() {
@@ -514,7 +519,7 @@ fn drop_dead_stores(func: &mut ir::Function, private: &FxHashSet<StackSlot>) {
                 .first()
                 .map(|&r| i64::from(func.dfg.value_type(r).bytes()))
                 .unwrap_or(0);
-            read.push((key.0, key.1, size));
+            reads.entry(key.0).or_default().push((key.1, size));
         }
     }
 
@@ -532,9 +537,9 @@ fn drop_dead_stores(func: &mut ir::Function, private: &FxHashSet<StackSlot>) {
                 continue;
             }
             let size = i64::from(func.dfg.value_type(args[0]).bytes());
-            let overlaps = read
-                .iter()
-                .any(|&(slot, off, len)| slot == key.0 && off < key.1 + size && key.1 < off + len);
+            let overlaps = reads
+                .get(&key.0)
+                .is_some_and(|rs| rs.iter().any(|&(off, len)| off < key.1 + size && key.1 < off + len));
             if !overlaps {
                 dead.push(inst);
             }

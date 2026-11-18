@@ -21,8 +21,14 @@ pub(crate) const MAX_CALLEE_INSTS: usize = 64;
 /// Total number of callee instructions we are willing to add to a single caller.
 const INLINE_BUDGET: usize = 512;
 
+/// Lower bound on the growth budget, so a tiny wrapper can still absorb callees.
+const MIN_GROWTH: usize = 64;
+
 /// Maximum number of times a single callee may be inlined into one caller.
 pub(crate) const MAX_CALLEE_USES: usize = 3;
+
+/// Default growth budget, as a percentage of the caller's instruction count.
+pub(crate) const GROWTH_PCT: usize = 50;
 
 /// `CG_CLIF_INLINE_USES` overrides [`MAX_CALLEE_USES`] (0 disables inlining); used for bisecting.
 fn max_callee_uses() -> usize {
@@ -44,18 +50,34 @@ pub(crate) struct CguInliner<'a> {
 }
 
 impl<'a> CguInliner<'a> {
-    pub(crate) fn new(bodies: &'a FxHashMap<u32, ir::Function>, self_id: u32) -> Self {
+    pub(crate) fn new(
+        bodies: &'a FxHashMap<u32, ir::Function>,
+        self_id: u32,
+        caller: &ir::Function,
+    ) -> Self {
         CguInliner {
             bodies,
             self_id,
             inlined: FxHashMap::default(),
-            budget: INLINE_BUDGET,
+            // Inlining a callee costs Cranelift time proportional to the code it
+            // adds, on *every* later pass. Bound the growth to a fraction of the
+            // caller so a large function cannot balloon: the runtime win comes
+            // from small helpers in hot code, not from doubling big bodies.
+            budget: inline_budget(caller.dfg.num_insts()),
             // Read the knobs once: `inline` runs per call site and a `std::env`
             // lookup on each is pure overhead.
             max_uses: max_callee_uses(),
             max_insts: max_callee_insts(),
         }
     }
+}
+
+/// How many CLIF instructions the inliner may add to a caller of `caller_insts`
+/// instructions. Never below [`MIN_GROWTH`] so tiny wrappers can still absorb
+/// their callees, never above [`INLINE_BUDGET`] so compile time stays bounded.
+fn inline_budget(caller_insts: usize) -> usize {
+    let cap = caller_insts.saturating_mul(crate::tunables::inline_growth_pct()) / 100;
+    cap.clamp(MIN_GROWTH, INLINE_BUDGET)
 }
 
 /// Recover the [`FuncId`](cranelift_module::FuncId) behind a direct call.
@@ -98,6 +120,9 @@ impl Inline for CguInliner<'_> {
         }
         self.inlined.insert(id, self.inlined.get(&id).copied().unwrap_or(0) + 1);
         self.budget -= size;
+        // `visit_callee: true` lets the walk descend into the freshly inlined
+        // body so a callee's own calls are inlined too. This is what lets a
+        // wrapper chain collapse; the budget bounds the growth.
         InlineCommand::Inline { callee: Cow::Borrowed(body), visit_callee: true }
     }
 }
