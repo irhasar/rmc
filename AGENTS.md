@@ -135,36 +135,28 @@ Add new programs under `bench/progs/` so they are picked up automatically.
     and re-checking every program output against LLVM.
 
 ## What did NOT work / open leads
-- **Root cause of the p2_mem runtime gap (8×, 125 ms vs LLVM 16 ms)**: cg_clif
-  emits the `core::core_arch::x86::sse2` intrinsics as **out-of-line calls** —
-  `p2_mem_M` contains 8 `_mm_*` symbols and 23 `call`s to them, while LLVM has 0
-  of either (it folds them inline). `_mm_loadu_si128`, `_mm_cmpeq_epi8` and
-  `_mm_movemask_epi8` are all `#[inline] #[target_feature(enable = "sse2")]`
-  `const fn`s in `core`, so they must be inlined for hashbrown's probe loop to
-  become the single `movdqu`/`pcmpeqb`/`pmovmskb` sequence LLVM produces. cg_clif
-  never folds them because:
-  - rustc's MIR inliner does **not** fold them: a plain cross-crate `#[inline]`
-    helper *is* inlined with `-Zinline-mir=yes`, but the SSE intrinsics are not
-    (3 `_mm_*` calls survive in the MIR), and marking the *caller*
-    `-Ctarget-feature=+sse2` does not change that. The sysroot is already built
-    with `-Zinline-mir` (see `build_system/build_sysroot.rs`), so this is not a
-    missing flag;
-  - cg_clif's own `CguInliner` only sees bodies in the *same* codegen unit
-    (`aot.rs` clones `codegened_functions` of one CGU), and it deliberately
-    requires `linkage.is_final()`; a cross-crate `#[inline]` generic in `core`
-    is a different CGU, so the inliner cannot reach it;
-  - LLVM sidesteps this entirely: `-Cembed-bitcode=yes` ships `core`'s bodies
-    and LLVM's inliner folds them at codegen time. Cranelift has no equivalent
-    cross-crate body channel here.
-  - Tried and confirmed **no effect**: `-Ctarget-feature=+sse2(,+ssse3,...)`,
-    `-Ctarget-cpu=x86-64`/`native`, `-Zinline-mir=yes` on the crate, and
-    `CG_CLIF_INLINE_MAX=4096` (only trims 32→23 calls, i.e. it inlines the
-    *in-crate* callers, never the `core` bodies).
-  - The fix would be a real cross-CGU inliner that can pull `core`'s CLIF/bitcode
-    bodies in, or a Cranelift-level pattern matcher that recognises the
-    `simd_eq`+`bitmask` shape and emits `pcmpeqb`/`pmovmskb` directly. Both are
-    large; not attempted. This is the one place where the modified backend is
-    still far from LLVM at runtime.
+- **p2_mem runtime gap (fixed)**: the 8× gap (125 ms vs LLVM 16 ms) came from
+  cg_clif emitting the `core::core_arch::x86::sse2` intrinsics as **out-of-line
+  calls** — `p2_mem_M` had 8 `_mm_*` symbols and 23 `call`s to them, while LLVM
+  had 0. Root cause was *not* the inliner: `src/intrinsics/simd.rs` scalarized
+  every integer SIMD comparison per-lane (load i8 → `icmp` → `bmask` → store,
+  16×) and `simd_bitmask` into a per-lane shift/or loop, so `_mm_cmpeq_epi8`
+  produced ~155 CLIF instructions and never fit the inliner budget. Fixed by
+  emitting one vector `icmp` (`pcmpeq*`/`pcmpgt*`) and `vhigh_bits`
+  (`pmovmskb`) on x86_64; see `simd.rs` and REPORT.md §8.8. `_mm_cmpeq_epi8`
+  body: 155→34 insts, `_mm_movemask_epi8`: 255→23; p2_mem 159→110 ms.
+  - What did **not** help, recorded for the record: `-Ctarget-feature=+sse2`,
+    `-Ctarget-cpu=native`, `-Zinline-mir=yes`, `CG_CLIF_INLINE_MAX=4096`
+    (the last only trims in-crate callers), and forcing `-Ccodegen-units=1`.
+  - Residual p2/p4 gap now comes from cross-CGU inlining of `memchr`/`hashbrown`
+    helpers and the absence of autovectorization in Cranelift; both are outside
+    the reach of cg_clif-side changes. A real cross-CGU inliner would be the
+    next step.
+  - Cranelift's `Inline` API clones `GlobalValueData` verbatim and does **not**
+    remap the `ExternalName` indices inside `GlobalValueData::Symbol`, so
+    inlining a callee that references a const/static/thread-local corrupts the
+    caller (TLS relocations went out of range when the guard was lifted). The
+    `body.global_values.is_empty()` guard in `inliner.rs` is load-bearing.
 - Extending SROA to **`&mut`/`RawPtr` whole-local borrows** (with `local_map`
   redirect) is a **miscompile** (p1/p3/p4 wrong). Shared-only is correct.
 - The inliner is currently redundant: MIR inlining already folds the small
@@ -199,12 +191,14 @@ Add new programs under `bench/progs/` so they are picked up automatically.
 
 ## Push status (T6) — DONE
 - PR **#10** (`replace-main-with-cgclif-experiments` → `main`) is open,
-  **mergeable=True (clean)**. Remote tip is now `e101572` (7 commits / 625
-  changed files); local == remote.
-- `e101572` adds the cross-block store forwarding, syncs the docs and makes the
-  bench scripts path-relative. `628c73b` fixed the store-forward miscompile
-  (branch args were not scanned in `private_slots`). Pushed with a user-supplied
-  classic PAT with `repo` scope:
+  **mergeable=True (clean)**. Local `rmc_clone` == remote.
+- Latest fork commit on `cg_clif_mod`:
+  `Lower integer SIMD compares and bitmasks with vector instructions`
+  (vector `icmp`/`vhigh_bits` lowering + vector ByVal move in `write_cvalue`).
+  Mirrored into `rmc_clone` and pushed.
+- Earlier commits: `e101572` cross-block store forwarding + doc/bench-path sync;
+  `628c73b` store-forward miscompile fix (branch args were not scanned in
+  `private_slots`). Pushed with a user-supplied classic PAT with `repo` scope:
   `git push https://<user>:<PAT>@github.com/irhasar/rmc.git replace-main-with-cgclif-experiments`.
 - Note: the environment's injected `GITHUB_TOKEN` (GitHub App installation) is
   read-only for this repo — `git push` and all write APIs return 403

@@ -3,9 +3,54 @@
 use cranelift_codegen::ir::immediates::Offset32;
 use rustc_abi::Endian;
 use rustc_middle::ty::SimdAlign;
+use rustc_target::spec::Arch;
 
 use super::*;
 use crate::prelude::*;
+
+/// The Cranelift `IntCC` for an integer SIMD comparison intrinsic, or `None`
+/// when `lane_ty` is not an integer lane type.
+fn simd_int_cmp_cc(lane_ty: Ty<'_>, intrinsic: Symbol) -> Option<IntCC> {
+    let unsigned = match lane_ty.kind() {
+        ty::Uint(_) => true,
+        ty::Int(_) => false,
+        _ => return None,
+    };
+    Some(match (unsigned, intrinsic) {
+        (true, sym::simd_eq) => IntCC::Equal,
+        (true, sym::simd_ne) => IntCC::NotEqual,
+        (true, sym::simd_lt) => IntCC::UnsignedLessThan,
+        (true, sym::simd_le) => IntCC::UnsignedLessThanOrEqual,
+        (true, sym::simd_gt) => IntCC::UnsignedGreaterThan,
+        (true, sym::simd_ge) => IntCC::UnsignedGreaterThanOrEqual,
+        (false, sym::simd_eq) => IntCC::Equal,
+        (false, sym::simd_ne) => IntCC::NotEqual,
+        (false, sym::simd_lt) => IntCC::SignedLessThan,
+        (false, sym::simd_le) => IntCC::SignedLessThanOrEqual,
+        (false, sym::simd_gt) => IntCC::SignedGreaterThan,
+        (false, sym::simd_ge) => IntCC::SignedGreaterThanOrEqual,
+        _ => return None,
+    })
+}
+
+/// Whether `arch` lowers a 128-bit integer `icmp` on `clif_ty` to a single
+/// vector instruction. Restricted to ISAs whose lowering fills each lane with
+/// all-ones, which is what the Rust SIMD comparison contract requires; other
+/// targets keep the scalar per-lane path.
+fn simd_cmp_lowers_to_vector_instr(arch: &Arch, clif_ty: Type) -> bool {
+    matches!(arch, Arch::X86_64)
+        && matches!(clif_ty, types::I8X16 | types::I16X8 | types::I32X4 | types::I64X2)
+}
+
+/// Whether `simd_bitmask` on a `lane_count`-lane vector of `lane_clif_ty` is a
+/// single instruction on `arch` (`pmovmskb` via `vhigh_bits`).
+fn simd_bitmask_uses_vhigh_bits(arch: &Arch, lane_count: u64, lane_clif_ty: Type) -> bool {
+    *arch == Arch::X86_64
+        && matches!(
+            (lane_clif_ty, lane_count),
+            (types::I8, 16) | (types::I16, 8) | (types::I32, 4) | (types::I64, 2)
+        )
+}
 
 fn report_simd_type_validation_error(
     fx: &mut FunctionCx<'_, '_, '_>,
@@ -54,8 +99,23 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                 return;
             }
 
-            // FIXME use vector instructions when possible
-            simd_pair_for_each_lane(fx, x, y, ret, &|fx, lane_ty, res_lane_ty, x_lane, y_lane| {
+            let (lane_count, lane_ty) = x.layout().ty.simd_size_and_type(fx.tcx);
+            if lane_ty.is_integral()
+                && simd_int_cmp_cc(lane_ty, intrinsic).is_some()
+                && let Some(lane_clif_ty) = fx.clif_type(lane_ty)
+                && let Some(vec_ty) = lane_clif_ty.by(u32::try_from(lane_count).unwrap())
+                && simd_cmp_lowers_to_vector_instr(&fx.tcx.sess.target.arch, vec_ty)
+            {
+                // A single vector compare fills each lane with all-ones/all-zeros,
+                // which is exactly the SIMD comparison result the intrinsic wants.
+                let cc = simd_int_cmp_cc(lane_ty, intrinsic).unwrap();
+                let x = x.load_scalar(fx);
+                let y = y.load_scalar(fx);
+                let res = fx.bcx.ins().icmp(cc, x, y);
+                ret.write_cvalue(fx, CValue::by_val(res, ret.layout()));
+            } else {
+                // FIXME use vector instructions when possible
+                simd_pair_for_each_lane(fx, x, y, ret, &|fx, lane_ty, res_lane_ty, x_lane, y_lane| {
                 let res_lane = match (lane_ty.kind(), intrinsic) {
                     (ty::Uint(_), sym::simd_eq) => fx.bcx.ins().icmp(IntCC::Equal, x_lane, y_lane),
                     (ty::Uint(_), sym::simd_ne) => {
@@ -116,8 +176,9 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                     _ => unreachable!(),
                 };
 
-                bool_to_zero_or_max_uint(fx, res_lane_ty, res_lane)
-            });
+                    bool_to_zero_or_max_uint(fx, res_lane_ty, res_lane)
+                });
+            }
         }
 
         // simd_shuffle_const_generic<T, U, const I: &[u32]>(x: T, y: T) -> U
@@ -929,25 +990,9 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
 
             let res_type =
                 Type::int_with_byte_size(u16::try_from(expected_bytes).unwrap()).unwrap();
-            let mut res = type_zero_value(&mut fx.bcx, res_type);
 
-            let lanes = match fx.tcx.sess.target.endian {
-                Endian::Big => Box::new(0..lane_count) as Box<dyn Iterator<Item = u64>>,
-                Endian::Little => Box::new((0..lane_count).rev()) as Box<dyn Iterator<Item = u64>>,
-            };
-            for lane in lanes {
-                let a_lane = a.value_lane(fx, lane).load_scalar(fx);
-
-                // extract sign bit of an int
-                let a_lane_sign =
-                    fx.bcx.ins().ushr_imm_u(a_lane, i64::from(lane_clif_ty.bits() - 1));
-
-                // shift sign bit into result
-                let a_lane_sign = clif_intcast(fx, a_lane_sign, res_type, false);
-                res = fx.bcx.ins().ishl_imm_u(res, 1);
-                res = fx.bcx.ins().bor(res, a_lane_sign);
-            }
-
+            // Validate the return type before lowering, so the vector fast path
+            // below cannot bypass the check.
             match ret.layout().ty.kind() {
                 ty::Uint(i) if i.bit_width() == Some(expected_int_bits) => {}
                 ty::Array(elem, len)
@@ -970,8 +1015,37 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                 }
             }
 
-            let res = CValue::by_val(res, ret.layout());
-            ret.write_cvalue(fx, res);
+            if simd_bitmask_uses_vhigh_bits(&fx.tcx.sess.target.arch, lane_count, lane_clif_ty) {
+                // `vhigh_bits` gathers the MSB of every lane into the low bits of
+                // an integer, which is exactly the bitmask contract.
+                let vec = a.load_scalar(fx);
+                let bits = fx.bcx.ins().vhigh_bits(res_type, vec);
+                ret.write_cvalue(fx, CValue::by_val(bits, ret.layout()));
+            } else {
+                let mut res = type_zero_value(&mut fx.bcx, res_type);
+
+                let lanes = match fx.tcx.sess.target.endian {
+                    Endian::Big => Box::new(0..lane_count) as Box<dyn Iterator<Item = u64>>,
+                    Endian::Little => {
+                        Box::new((0..lane_count).rev()) as Box<dyn Iterator<Item = u64>>
+                    }
+                };
+                for lane in lanes {
+                    let a_lane = a.value_lane(fx, lane).load_scalar(fx);
+
+                    // extract sign bit of an int
+                    let a_lane_sign =
+                        fx.bcx.ins().ushr_imm_u(a_lane, i64::from(lane_clif_ty.bits() - 1));
+
+                    // shift sign bit into result
+                    let a_lane_sign = clif_intcast(fx, a_lane_sign, res_type, false);
+                    res = fx.bcx.ins().ishl_imm_u(res, 1);
+                    res = fx.bcx.ins().bor(res, a_lane_sign);
+                }
+
+                let res = CValue::by_val(res, ret.layout());
+                ret.write_cvalue(fx, res);
+            }
         }
 
         sym::simd_saturating_add | sym::simd_saturating_sub => {

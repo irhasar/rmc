@@ -78,8 +78,9 @@ impl Inline for CguInliner<'_> {
         if size > max_callee_insts() || size > self.budget {
             return InlineCommand::KeepCall;
         }
-        // Cranelift's inliner does not reliably remap global value (thread-local / static)
-        // references, so restrict inlining to callees that do not reference any global value.
+        // Cranelift's inliner clones the callee's `GlobalValueData` verbatim but does not remap
+        // the `ExternalName` indices inside `GlobalValueData::Symbol` to the caller's namespace,
+        // so a callee that references a symbol (a const/static/thread-local) must not be inlined.
         if !body.global_values.is_empty() {
             return InlineCommand::KeepCall;
         }

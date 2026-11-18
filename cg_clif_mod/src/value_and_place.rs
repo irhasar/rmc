@@ -575,11 +575,17 @@ impl<'tcx> CPlace<'tcx> {
             CPlaceInner::Var(_local, var) => {
                 let data = match from.1.backend_repr {
                     BackendRepr::Scalar(_) => CValue(from.0, dst_layout).load_scalar(fx),
-                    _ => {
-                        let (ptr, meta) = from.force_stack(fx);
-                        assert!(meta.is_none());
-                        CValue(CValueInner::ByRef(ptr, None), dst_layout).load_scalar(fx)
-                    }
+                    // A vector (or other non-scalar) already held in a register can be moved
+                    // straight into the destination variable; forcing it through a stack slot
+                    // would add a store/load round-trip around every SIMD op.
+                    _ => match from.0 {
+                        CValueInner::ByVal(val) => val,
+                        _ => {
+                            let (ptr, meta) = from.force_stack(fx);
+                            assert!(meta.is_none());
+                            CValue(CValueInner::ByRef(ptr, None), dst_layout).load_scalar(fx)
+                        }
+                    },
                 };
                 let dst_ty = fx.clif_type(self.layout().ty).unwrap();
                 transmute_scalar(fx, var, data, dst_ty);

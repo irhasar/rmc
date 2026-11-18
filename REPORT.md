@@ -344,20 +344,53 @@ Knob: `CG_CLIF_NO_STORE_FWD`.
 
 | prog | LLVM run | up run | mod run | LLVM size | up size | mod size |
 |------|---------:|-------:|--------:|----------:|--------:|---------:|
-| p1_arith  |  83 ms | 110 ms | 106 ms | 4.64 MB | 5.88 MB | 4.47 MB |
-| p2_mem    |  21 ms | 161 ms | 121 ms | 4.64 MB | 5.94 MB | 4.51 MB |
-| p3_calls  |  37 ms | 116 ms |  99 ms | 4.61 MB | 5.82 MB | 4.41 MB |
-| p4_simd   |  57 ms | 158 ms | 140 ms | 4.64 MB | 5.89 MB | 4.48 MB |
-| p5_inline |  58 ms | 894 ms | **61 ms** | 4.61 MB | 5.81 MB | 4.40 MB |
-| p6_scalar |  58 ms | 898 ms | **61 ms** | 4.61 MB | 5.81 MB | 4.40 MB |
+| p1_arith  |  81 ms | 109 ms | 106 ms | 4.64 MB | 5.88 MB | 4.38 MB |
+| p2_mem    |  16 ms | 159 ms | 110 ms | 4.64 MB | 5.94 MB | 4.41 MB |
+| p3_calls  |  37 ms | 118 ms |  99 ms | 4.61 MB | 5.82 MB | 4.32 MB |
+| p4_simd   |  55 ms | 156 ms | 139 ms | 4.64 MB | 5.89 MB | 4.39 MB |
+| p5_inline |  58 ms | 895 ms | **61 ms** | 4.61 MB | 5.81 MB | 4.31 MB |
+| p6_scalar |  58 ms | 902 ms | **61 ms** | 4.61 MB | 5.81 MB | 4.31 MB |
 
-Ringkas terhadap cg_clif upstream: **−24% ukuran**, **runtime setara LLVM pada
+Ringkas terhadap cg_clif upstream: **−26% ukuran**, **runtime setara LLVM pada
 kernel skalar (p5/p6: ~895 → 61 ms, ~15×)**, compile time tidak bertambah. Gap
 yang tersisa pada p1–p4 (1,3×–6×) berasal dari **autovectorization dan
 inlining lintas-CGU Cranelift**, yang tidak bisa diperbaiki dari sisi cg_clif
 (sudah diuji: `-C target-cpu=native` tidak menutupnya).
 
-### 8.8 Ringkasan knob
+### 8.8 Penurunan SIMD integer dengan instruksi vektor
+
+Akar masalah runtime p2_mem: `src/intrinsics/simd.rs` men-skalarisasi setiap
+perbandingan SIMD integer (`simd_eq/ne/lt/le/gt/ge`) menjadi loop per-lane
+(load i8 → `icmp` → `bmask` → store, 16 kali untuk `u8x16`), dan
+`simd_bitmask` menjadi loop shift/or per-lane. Akibatnya `_mm_cmpeq_epi8`
+menghasilkan ±155 instruksi CLIF dan tidak pernah masuk batas inliner.
+
+Cranelift x64 sudah bisa menurunkan `icmp` 128-bit integer menjadi satu
+`pcmpeq*`/`pcmpgt*` (`isa/x64/lower.isle`) dan `vhigh_bits` menjadi `pmovmskb`.
+Perbaikan:
+
+1. Untuk `simd_eq…simd_ge` dengan lane integer pada x86_64, muat operand sebagai
+   satu nilai vektor lalu emit **satu `icmp` vektor**. Semantik lane all-ones /
+   all-zeros sudah sesuai kontrak perbandingan SIMD Rust. ISA lain tetap memakai
+   jalur per-lane.
+2. Untuk `simd_bitmask` pada `i8x16/i16x8/i32x4/i64x2`, emit `vhigh_bits`
+   langsung (satu `pmovmskb`); validasi tipe balikan dipindah ke depan agar
+   jalur cepat tidak melewatinya.
+3. `CValue` vektor yang sudah di register tidak lagi dipaksa lewat stack slot saat
+   ditulis ke lokal (`write_cvalue`), menghapus round-trip store/load yang
+   membungkus setiap op SIMD.
+
+Hasil pada p2_mem: body `_mm_cmpeq_epi8` mengecil 155→34 instruksi CLIF dan
+`_mm_movemask_epi8` 255→23; `_mm_cmpeq_epi8` kini menjadi satu `pcmpeqb`.
+Runtime p2_mem **159 ms (upstream) → 110 ms**. Kebenaran diverifikasi dengan uji
+17 kasus (semua tipe lane integer + float, semua perbandingan, `to_bitmask`) yang
+keluarannya identik dengan LLVM.
+
+Sisa gap p2/p4 berasal dari inlining lintas-CGU Cranelift (helper `memchr` /
+`hashbrown` masih keluar dari baris) dan ketiadaan autovectorization di
+Cranelift — keduanya di luar jangkauan perubahan sisi cg_clif ini.
+
+### 8.9 Ringkasan knob
 
 | Env | Default | Efek |
 |-----|---------|------|
