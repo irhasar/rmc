@@ -29,11 +29,30 @@ use cranelift_codegen::ir::{
 use rustc_data_structures::fx::FxHashMap;
 
 /// Number of loop iterations folded into one guarded step.
-pub(crate) const UNROLL_FACTOR: u64 = 8;
+pub(crate) const UNROLL_FACTOR: u64 = 128;
 
 /// Upper bound on the induction step we are willing to scale, so that the
 /// arithmetic stays well clear of the type's range.
 const MAX_DELTA: u64 = 1 << 40;
+
+/// Largest `delta * (factor - 1)` the wide step may use. The guard proves the
+/// wide path runs `factor` iterations that all satisfy the loop test by
+/// checking `iv + (factor-1)*delta`; that argument only holds while the product
+/// itself does not wrap, so it is bounded here and the factor is shrunk to fit.
+const MAX_LAST: u64 = 1 << 62;
+
+/// Shrink `factor` until `delta * (factor - 1)` cannot overflow, and report the
+/// largest usable factor (>= 2), or `None` when even two iterations overflow.
+fn safe_factor(delta: u64, factor: u64) -> Option<u64> {
+    let mut factor = factor.min(MAX_LAST / delta.max(1) + 1);
+    while factor >= 2 {
+        if delta.checked_mul(factor - 1).is_some_and(|last| last <= MAX_LAST) {
+            return Some(factor);
+        }
+        factor -= 1;
+    }
+    None
+}
 
 fn unroll_factor() -> u64 {
     crate::tunables::unroll_factor()
@@ -64,6 +83,10 @@ pub(crate) fn run(func: &mut ir::Function) {
         return;
     }
     let Some(plan) = analyze(func) else { return };
+    // `apply` scales the induction step by `factor`, and the guard it inserts
+    // assumes `delta * (factor - 1)` did not wrap. Shrink the factor for large
+    // steps so that assumption always holds.
+    let Some(factor) = safe_factor(plan.delta, factor) else { return };
     apply(func, &plan, factor);
 }
 
@@ -433,7 +456,7 @@ fn apply(func: &mut ir::Function, plan: &Plan, factor: u64) {
 /// a short tail falls back to the original single step.
 fn apply_reassoc(func: &mut ir::Function, plan: &Plan, factor: u64, rows: &[Affine]) {
     let delta = plan.delta;
-    let last = delta.wrapping_mul(factor - 1);
+    let last = delta.checked_mul(factor - 1).expect("safe_factor bounds the step");
     let back_edge = plan.back_edge;
 
     // Arguments of the original back edge: already the single-step values.
@@ -518,7 +541,7 @@ fn apply_reassoc(func: &mut ir::Function, plan: &Plan, factor: u64, rows: &[Affi
 /// dependency chain, so it is only used as a fallback when explicitly enabled.
 fn apply_clone(func: &mut ir::Function, plan: &Plan, factor: u64) {
     let delta = plan.delta;
-    let last = delta.wrapping_mul(factor - 1);
+    let last = delta.checked_mul(factor - 1).expect("safe_factor bounds the step");
 
     // Create `factor - 1` clone blocks with the header's parameter types.
     let header_tys: Vec<_> =

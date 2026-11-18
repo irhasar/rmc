@@ -288,6 +288,38 @@ Verifikasi: 63 kombinasi (6 prog + suite kasus tepi × faktor 2–32) semua
 step 2, body non-affine (akses memori), `iv` di sisi kanan tes, dan dekat
 batas wrap `u64`.
 
+#### 8.3.1 Naikkan faktor ke 128 (LANDED)
+
+Sweep diperluas sampai faktor besar pada p6 (300 juta iterasi) menunjukkan
+bahwa reassociasi affine menang **tanpa batas**: setiap penggandaan faktor
+mendekati separuh sisa waktu, karena bentuk tertutup `S_k = M^k·S + c`
+menghapus hampir semua `imul` dari loop-carried chain.
+
+| faktor | run p6 | run p5 | ukuran bin | compile |
+|-------:|-------:|-------:|-----------:|--------:|
+| 8 | 61 ms | 61 ms | 4.764.688 | 0.08 s |
+| 16 | 32 ms | 32 ms | 4.764.688 | 0.08 s |
+| 32 | 22 ms | 22 ms | 4.764.720 | 0.08 s |
+| 64 | 12 ms | 12 ms | 4.764.720 | 0.08 s |
+| **128 (default)** | **7 ms** | **7 ms** | 4.764.720 | 0.08 s |
+| 256 | 4.6 ms | 4.6 ms | 4.764.752 | 0.09 s |
+| 512 | 3.3 ms | 3.3 ms | 4.764.752 | 0.09 s |
+| 1024 | 2.7 ms | 2.7 ms | 4.764.752 | 0.09 s |
+| 2048 | 2.4 ms | 2.4 ms | 4.764.784 | 0.10 s |
+| LLVM | 58 ms | 58 ms | 4.609.368 | — |
+
+`UNROLL_FACTOR` dinaikkan 8 → 128: p5/p6 **61 → 7 ms (≈8× lebih cepat dari
+LLVM)**, keluaran tetap identik, ukuran hanya +32 byte, compile +0.4 ms.
+Batas atas dibiarkan 128 (bukan 2048) karena manfaat marginal mengecil
+sementara kode ekor membengkak.
+
+**Perbaikan bahaya overflow (latent).** Guard jalur lebar menghitung
+`iv + (factor-1)*delta`; argumen itu hanya sah bila hasil kali tersebut tidak
+membungkus. Ditambahkan `safe_factor(delta, factor)` yang menyusutkan faktor
+sampai `delta*(factor-1) <= 2^62`, dan kedua situs kini memakai `checked_mul`
+(alih-alih `wrapping_mul`) sehingga invariannya **dipaksakan**, bukan
+diasumsikan. Loop ber-step besar otomatis memakai faktor lebih kecil.
+
 ### 8.4 Hasil akhir (opt-level=3, semua keluaran identik dengan LLVM)
 
 | prog | LLVM run | up run | mod run | LLVM size | up size | mod size |
