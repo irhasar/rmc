@@ -810,3 +810,30 @@ tetapi tetap jauh dari LLVM karena LLVM meng-autovektorisasi min-reduction
 
 **Knob.** `CG_CLIF_NO_IFCONV=1` mematikan pass; waktu pass dilaporkan lewat
 `CG_CLIF_PASS_TIME` sebagai `if_convert`. Default **ON**.
+
+### 8.23 Matriks tiga arah akhir (8 program, LLVM vs upstream vs modifikasi)
+
+`bench/allaxes.sh` (RC=3, RR=5), wall/CPU dalam ms, RSS dalam MB, ukuran dalam
+byte. L = rustc+LLVM, U = cg_clif upstream, M = fork modifikasi.
+
+| prog | Cwall L/U/M | Crss L/U/M | size L/U/M | Rwall L/U/M | Rrss L/U/M |
+|------|-------------|------------|------------|-------------|------------|
+| p1_arith | 103/81/81 | 106/108/109 | 4635232/5878688/4393872 | 81/108/**104** | 11/11/11 |
+| p2_mem | 262/127/137 | 133/132/132 | 4639888/5936880/4416496 | 16/159/**66** | 11/11/11 |
+| p3_calls | 103/89/90 | 116/117/118 | 4612368/5820872/4329000 | 37/116/**100** | 11/11/11 |
+| p4_simd | 111/95/112 | 117/118/118 | 4636096/5893112/4401888 | 56/160/**140** | 48/49/49 |
+| p5_inline | 89/81/80 | 105/107/107 | 4609368/5814440/4321024 | 58/896/**7** | 11/11/11 |
+| p6_scalar | 87/87/81 | 101/103/104 | 4609368/5814424/4321024 | 58/908/**7** | 11/11/11 |
+| p7_branchy | 90/85/83 | 105/107/108 | 4609520/5814536/4321000 | 43/105/**55** | 11/11/11 |
+| p8_minmax | 92/94/83 | 105/107/107 | 4609544/5814488/4320960 | 18/40/**39** | 11/11/11 |
+
+Ringkas lintas sumbu:
+
+- **Compile**: M ≈ U, keduanya jauh lebih cepat dari LLVM di p2 (137 vs 262 ms,
+  ~1.9×). RSS compile setara.
+- **Ukuran**: M ~5% lebih kecil dari LLVM dan ~25% lebih kecil dari U (berkat
+  `per_data_object_section`).
+- **Runtime**: M menutup hampir seluruh gap U→LLVM pada kernel scalar/inline
+  (p5/p6 896/908 → 7 ms, ~130× vs U) dan pada loop branchy murah (p7 105 → 55 ms,
+  LLVM 43 ms). Sisa gap murni kualitas codegen Cranelift (autovektorisasi p8,
+  fusi `sincos`/unroll-call p4, inlining penuh p2, rekursi→loop p3 — lihat 8.20).
