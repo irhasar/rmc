@@ -264,15 +264,10 @@ fn record_store(
         avail.retain(|&(b, _), _| matches!(b, Base::Slot(_)));
         return;
     };
-    // An atomic store is a synchronisation point and cannot be forwarded across;
-    // the clobber above already dropped the pointer facts, so do not re-add one.
-    if matches!(base, Base::Ptr(_)) && func.dfg.insts[inst].opcode() != Opcode::Store {
-        return;
-    }
-    // A store no load can read is never forwarded, so it need not be recorded.
-    if !loaded.contains(&(base, off)) {
-        return;
-    }
+    // Invalidate every fact this store overwrites before deciding whether the
+    // store itself is worth recording: a store the pass does not track (not in
+    // `loaded`, or an atomic store) still writes the bytes, so a stale fact must
+    // not survive it.
     let (start, end) = (off, off + i64::from(ty.bytes()));
     avail.retain(|&(b, o), &mut (_, prev_ty)| {
         if b == base {
@@ -284,6 +279,16 @@ fn record_store(
             !(matches!(base, Base::Ptr(_)) && matches!(b, Base::Ptr(_)))
         }
     });
+    // An atomic store is a synchronisation point and cannot be forwarded across;
+    // the invalidation above already dropped the pointer facts, so do not re-add
+    // one.
+    if matches!(base, Base::Ptr(_)) && func.dfg.insts[inst].opcode() != Opcode::Store {
+        return;
+    }
+    // A store no load can read is never forwarded, so it need not be recorded.
+    if !loaded.contains(&(base, off)) {
+        return;
+    }
     avail.insert((base, off), (value, ty));
 }
 

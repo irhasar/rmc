@@ -706,3 +706,40 @@ besar) mencegah probe di-inline. Namun menaikkan ambang sampai cukup untuk
 probe akan meledakkan ukuran kode pada pemanggil lain, jadi ini bukan trade-off
 yang jelas menang; dibiarkan apa adanya. p3/p4 (konversi rekursi→loop,
 unrolling-call untuk ILP, fusi `sincos`) murni pekerjaan level Cranelift.
+
+### 8.21 Perbaikan miscompile store-forwarding (LANDED, `4121be3`)
+
+Bug soundness ditemukan saat menjalankan suite `rust-random/rand`: test
+`rngs::std::test::test_stdrng_construction` gagal di M tetapi lulus di
+upstream cg_clif **dan** LLVM. Isolasi lewat knob:
+
+| Konfigurasi | Hasil rand |
+|-------------|-----------|
+| M default | FAILED |
+| `CG_CLIF_NO_STORE_FWD=1` | ok |
+| `CG_CLIF_SF_NO_CBE=1` (cross-block off) | ok |
+| `CG_CLIF_UNROLL=1` | FAILED |
+
+Jadi miscompile berasal dari dataflow store-forwarding lintas blok, bukan dari
+unroller. Upstream cg_clif tidak punya pass ini, jadi ini regresi murni milik
+fork.
+
+**Akar masalah.** `record_store` melakukan `return` lebih awal ketika store
+tidak layak direkam — bukan bagian dari `loaded`, atau store atomik. Kedua
+`return` itu berada **sebelum** langkah invalidasi overlap. Padahal store
+seperti itu tetap menulis byte; fakta lama pada rentang yang tumpang tindih
+harus dibuang. Karena tidak dibuang, load berikutnya di-forward nilai basi.
+Pada `StdRng` ini merusak state RNG hasil `from_seed`.
+
+**Perbaikan.** Pindahkan invalidasi overlap ke depan kedua `return` tersebut,
+sehingga fakta yang tertimpa selalu dibuang apa pun jenis store-nya. Perubahan
+ini **strictly more conservative**: ia hanya bisa menghapus forward, tidak
+pernah menambah, jadi tidak mungkin memunculkan miscompile baru.
+
+**Verifikasi.**
+
+- `rand` seluruh workspace: 80 + 12 + 9 + 128 + 6 + 4 + 2 + 19 + 3 … = semua ok, 0 failed.
+- Suite penuh `./y.sh test --sysroot clif`: **0 failed** (65 blok `test result: ok`).
+- Harness benchmark p1–p6: semua keluaran identik dengan LLVM dan upstream.
+- Benchmark tiga arah tidak berubah: p5/p6 tetap 7 ms, p2 tetap 67 ms. Jadi
+  perbaikan soundness ini berbiaya nol.
