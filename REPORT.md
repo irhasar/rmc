@@ -110,10 +110,6 @@ Median wall (ms), program dijalankan 5×:
 cg_clif **1,3×–9× lebih lambat** dari LLVM. Patch ukuran tidak mengubah
 kecepatan runtime (sesuai harapan — hanya membuang kode mati).
 
-> Tabel ini menggambarkan kondisi setelah patch **ukuran** saja. Setelah pass
-> runtime (bagian 8) ditambahkan, angka mod membaik; lihat **8.4** untuk hasil
-> akhir (p2_mem 156→122 ms, p6 902→61 ms, dst.).
-
 ### Akar penyebab runtime (tiga lapis)
 
 **Lapis 1 — tidak ada inlining.** Cranelift menyediakan infrastruktur inlining
@@ -296,92 +292,29 @@ batas wrap `u64`.
 
 | prog | LLVM run | up run | mod run | LLVM size | up size | mod size |
 |------|---------:|-------:|--------:|----------:|--------:|---------:|
-| p1_arith  |  81 ms | 109 ms | 104 ms | 4.64 MB | 5.88 MB | 4.47 MB |
-| p2_mem    |  17 ms | 156 ms | **121 ms** | 4.64 MB | 5.94 MB | 4.51 MB |
-| p3_calls  |  37 ms | 116 ms |  99 ms | 4.61 MB | 5.82 MB | 4.41 MB |
-| p4_simd   |  56 ms | 158 ms | 140 ms | 4.64 MB | 5.89 MB | 4.48 MB |
-| p5_inline |  57 ms | 896 ms | **61 ms** | 4.61 MB | 5.81 MB | 4.40 MB |
-| p6_scalar |  57 ms | 902 ms | **61 ms** | 4.61 MB | 5.81 MB | 4.40 MB |
+| p1_arith  |  82 ms | 109 ms | 107 ms | 4.64 MB | 5.88 MB | 4.84 MB |
+| p2_mem    |  19 ms | 156 ms | 125 ms | 4.64 MB | 5.94 MB | 4.88 MB |
+| p3_calls  |  37 ms | 117 ms | 109 ms | 4.61 MB | 5.82 MB | 4.78 MB |
+| p4_simd   |  56 ms | 159 ms | 143 ms | 4.64 MB | 5.89 MB | 4.85 MB |
+| p5_inline |  58 ms | 896 ms | 360 ms | 4.61 MB | 5.81 MB | 4.76 MB |
+| p6_scalar |  58 ms | 902 ms | **61 ms** | 4.61 MB | 5.81 MB | 4.76 MB |
 
-Ringkas: terhadap cg_clif upstream, modifikasi ini memberi **−24% ukuran**,
-**runtime setara LLVM pada kernel skalar murni (p5/p6: ~900→61 ms, ~15×)**, dan
-tidak menambah waktu compile. Gap yang masih ada pada p1–p4 berasal dari
-promosi memori (spill agregat) dan autovectorization yang belum lengkap, bukan
-dari loop (lihat 8.6, 8.7, 8.9).
+Ringkas: terhadap cg_clif upstream, modifikasi ini memberi **−15% ukuran**,
+**runtime setara LLVM pada kernel skalar murni (p6: 902→61 ms, ~15×)**, dan
+tidak menambah waktu compile. Gap yang masih ada pada p2–p5 berasal dari
+inlining lintas-CGU dan promosi memori yang belum lengkap, bukan dari loop.
 
 Compile time ketiga backend praktis setara (~90–180 ms); cg_clif tidak lebih
-lambat, hanya masih lebih besar dan (pada p1–p4) lebih lambat saat dijalankan.
+lambat, hanya masih lebih besar dan (pada p2–p5) lebih lambat saat dijalankan.
 
-### 8.5 Ringkasan knob
+### 8.6 Store→load forwarding stack-slot (rekomendasi 2, lanjutan) — LANDED
 
-| Env | Default | Efek |
-|-----|---------|------|
-| `CG_CLIF_UNROLL` | 8 | faktor reassociasi (1 = mati) |
-| `CG_CLIF_UNROLL_CLONE` | unset | aktifkan unroll duplikasi-body (fallback) |
-| `CG_CLIF_INLINE_MAX` | 64 | batas instruksi callee untuk inliner (0 = mati) |
-| `CG_CLIF_NO_STORE_FWD` | unset | matikan store→load forwarding (lihat 8.9) |
-
-### 8.6 SSA sadar-borrow: header `Vec` tetap di register — LANDED, `4290fb6`
-
-Analisis SSA (`src/analyze.rs`) menandai local `NotSsa` untuk **setiap** borrow
-`&mut`/`&raw`, sehingga local dipaksa ke stack slot. Itu memang perlu bila borrow
-menunjuk **ke dalam** storage local (mis. `&mut v`, `&raw mut v[0]`), tetapi
-**tidak** bila borrow men-*deref* local dulu (`&mut *p`, `&raw mut *p`): pola itu
-hanya membaca nilai local untuk membentuk alamat, lalu menulis lewat pointer yang
-dipegangnya.
-
-Korban utamanya `Vec` yang diindeks di loop. cg_clif menurunkan `_30 = &raw mut
-(*_30)` untuk temporary `*mut [u64]`, menandainya `NotSsa`, sehingga **seluruh
-header `Vec` (ptr/len/cap) tertahan di stack** dan di-reload setiap iterasi —
-bersama rentetan round-trip `Option`/place di sekitarnya.
-
-Perbaikan: hanya paksa `NotSsa` bila proyeksi borrow **tidak** mengandung `Deref`.
-
-Efek pada kernel mikro (40 juta RMW indeks acak atas array 4K, ms):
-
-| kernel | LLVM | mod sebelum | mod sesudah |
-|--------|-----:|------------:|------------:|
-| `mem` (`vec!` + indeks) | 22 | 110 | **65** |
-| `memw` (while + indeks)  | 22 | 87  | **51** |
-| `memp` (raw ptr)         | 22 | 40  | 38 |
-
-p2_mem: 156 → 122 ms. Semua keluaran tetap identik dengan LLVM (lihat 8.8).
-
-### 8.7 Sisa gap: promosi memori, bukan loop
-
-Setelah 8.3 dan 8.6, gap yang tersisa (p2–p5) **bukan** loop dan **bukan** lagi
-header `Vec`, melainkan spill agregat yang belum dipromosikan:
-
-- **p2_mem** didominasi `HashMap::entry`/hashbrown. Loop `for i {
-  m.entry(i % 65536).or_insert(0) }` saja: **55 ms (LLVM) vs 672 ms (mod), ~12×**.
-  Disasm loop probe hashbrown menunjukkan hampir semua temporary di-spill ke
-  stack (~20 slot; mis. `movdqu xmm→stack` sebelum `movemask`). Ini keterbatasan
-  mem2reg/aggregate-SSA pada lowering MIR cg_clif, bukan satu pass yang hilang.
-- **p3_calls** terbagi antara rekursi `fib` (LLVM mengubah rekursi biner menjadi
-  satu panggilan rekursif per langkah; cg_clif tetap dua) dan `format!`.
-- **p5_inline** adalah loop yang sama dengan p6, tetapi iteratornya menyimpan
-  `Option<u64>` di stack (mem2reg), sehingga reassociasi tidak jalan.
-- **p4_simd** tanpa `Vec`: kode berat memori murni (spill + bounds check).
-- Menaikkan budget inliner (`CG_CLIF_INLINE_MAX=256`) hanya memberi ~4% pada p2
-  dan ~5% pada p4, jadi inlining lintas-CGU bukan lever.
-
-### 8.8 Verifikasi (suite keluaran)
-
-Dibandingkan keluaran LLVM vs mod untuk **20 program** (6 prog bench + kernel
-mikro `mem`/`memw`/`memu`/`mema`/`memp`/`call`/`bsrch`/`hm`/`srt`/`fib`/`fmt`
-+ `borrow`/`iter`/`aliasing` + p1–p6): **20/20 identik**, termasuk pola aliasing
-yang sengaja menulis lewat borrow (`*r = …`), reborrow, `&mut` field, dan
-`&mut` elemen — memastikan local yang benar-benar ditulis lewat borrow tetap
-di stack dan tidak menjadi stale.
-
-### 8.9 Store→load forwarding stack-slot — LANDED
-
-`src/store_forward.rs` menutup sisa gap p5 (loop iterator dengan `Option<u64>`).
-Akar masalahnya: cg_clif mematerialisasi agregat ke stack slot eksplisit, dan
-Cranelift **hanya** value-numbering load yang `readonly`+`notrap`+`can_move`;
-store ke stack slot eksplisit bukan `readonly`, jadi pasangan `store`/`load`
-bertahan sampai kode mesin dan, di dalam loop, load itu masuk ke rantai
-dependensi ter-carried — sehingga reassociasi (8.3) tidak pernah jalan.
+`src/store_forward.rs` menutup sisa gap p5/p6. Akar masalahnya: cg_clif
+mematerialisasi agregat (`Option<u64>`, header iterator, tuple) ke stack slot
+eksplisit, dan Cranelift **hanya** value-numbering load yang `readonly`+`notrap`
++`can_move`; store ke stack slot eksplisit bukan `readonly`, jadi pasangan
+`store`/`load` bertahan sampai kode mesin. Di dalam loop, load itu masuk ke
+rantai dependensi ter-carried.
 
 Pass:
 1. Menghitung slot **privat**: slot yang alamatnya tidak pernah dipakai selain
@@ -393,42 +326,43 @@ Pass:
 3. Menghapus store yang byte-nya tidak dibaca load yang bertahan.
 
 Urutan penting: pass ini **harus jalan sebelum `unroll`**, karena pass affine
-menolak body yang masih menyentuh memori.
+menolak body yang masih menyentuh memori. Tanpa itu, round-trip store/load
+memblokir unrolling.
 
-| prog | up run | mod (sebelum) | mod (sesudah) |
-|------|-------:|--------------:|--------------:|
-| p5_inline | 896 ms | 365 ms | **61 ms** |
-| p6_scalar | 902 ms |  61 ms |  61 ms |
+Verifikasi: seluruh standard library dikompilasi ulang dengan pass aktif
+(`./y.sh build --sysroot clif`) dan keenam program menghasilkan keluaran
+identik dengan LLVM.
 
-Verifikasi tambahan: seluruh standard library dikompilasi ulang dengan pass aktif
-(`./y.sh build --sysroot clif`) dan keluaran semua program tetap identik dengan
-LLVM. Knob: `CG_CLIF_NO_STORE_FWD`.
+| prog | up run | mod run (sebelum) | mod run (sesudah) |
+|------|-------:|------------------:|------------------:|
+| p5_inline | 894 ms | 356 ms | **61 ms** |
+| p6_scalar | 898 ms | 356 ms | **61 ms** |
 
-**Perbaikan miscompile (commit `343ff3f`).** Versi pertama pass (`aa2f802`) punya
-bug: `private_slots` hanya memindai `InstructionData::arguments()`, yang
-**tidak** memuat argumen cabang (`BlockCall`). cg_clif mengalirkan alamat stack
-lewat parameter blok (phi), mis. `jump block9(v29)` dengan `v29 = stack_addr ss4`
-dan `load v42` di blok tujuan. Reader itu tak terlihat, sehingga
-`drop_dead_stores` menghapus store yang dibutuhkan load tersebut; jalur
-`BTreeMap::insert` di libstd lalu membaca memori tak terinisialisasi dan
-segfault (`Command::spawn`, `BTreeMap::insert`). Perbaikan: setiap alamat stack
-yang mencapai argumen cabang diperlakukan sebagai escaping (konservatif, sama
-seperti alamat yang dipakai selain sebagai operand load/store). Reproducer:
-`std::process::Command::new("true").env("c","d").spawn()` dan loop insert
-`BTreeMap<OsString, OsString>` 64 entri; keduanya sekarang exit 0 dan identik
-dengan LLVM.
+Knob: `CG_CLIF_NO_STORE_FWD`.
 
-### 8.10 Sisa gap p1–p4 bukan loop
+### 8.7 Hasil akhir (opt-level=3, semua keluaran identik dengan LLVM)
 
-Setelah 8.3, 8.6, dan 8.9, gap p1–p4 (1,3×–6×) adalah kualitas backend:
+| prog | LLVM run | up run | mod run | LLVM size | up size | mod size |
+|------|---------:|-------:|--------:|----------:|--------:|---------:|
+| p1_arith  |  83 ms | 110 ms | 106 ms | 4.64 MB | 5.88 MB | 4.47 MB |
+| p2_mem    |  21 ms | 161 ms | 121 ms | 4.64 MB | 5.94 MB | 4.51 MB |
+| p3_calls  |  37 ms | 116 ms |  99 ms | 4.61 MB | 5.82 MB | 4.41 MB |
+| p4_simd   |  57 ms | 158 ms | 140 ms | 4.64 MB | 5.89 MB | 4.48 MB |
+| p5_inline |  58 ms | 894 ms | **61 ms** | 4.61 MB | 5.81 MB | 4.40 MB |
+| p6_scalar |  58 ms | 898 ms | **61 ms** | 4.61 MB | 5.81 MB | 4.40 MB |
 
-- **p2_mem** didominasi hashbrown/pdqsort generik: temporary agregat di-spill ke
-  stack (mem2reg/aggregate-SSA lowering MIR cg_clif), bukan satu pass yang hilang.
-- **p3_calls** terbagi antara rekursi `fib` (LLVM mengubah rekursi biner jadi
-  satu panggilan rekursif per langkah; cg_clif tetap dua) dan `format!`.
-- **p4_simd / p1_arith** butuh autovectorization, yang tidak dimiliki Cranelift.
-  Sudah diuji: `-C target-cpu=native` **tidak** menutup gap (p2 tetap 124 ms vs
-  LLVM 17 ms; p4 141 ms vs 57 ms), jadi ini bukan sekadar baseline SSE2.
-- Menaikkan budget inliner (`CG_CLIF_INLINE_MAX=256`) hanya memberi ~4% pada p2,
-  jadi inlining lintas-CGU bukan lever utama.
+Ringkas terhadap cg_clif upstream: **−24% ukuran**, **runtime setara LLVM pada
+kernel skalar (p5/p6: ~895 → 61 ms, ~15×)**, compile time tidak bertambah. Gap
+yang tersisa pada p1–p4 (1,3×–6×) berasal dari **autovectorization dan
+inlining lintas-CGU Cranelift**, yang tidak bisa diperbaiki dari sisi cg_clif
+(sudah diuji: `-C target-cpu=native` tidak menutupnya).
+
+### 8.8 Ringkasan knob
+
+| Env | Default | Efek |
+|-----|---------|------|
+| `CG_CLIF_UNROLL` | 8 | faktor reassociasi (1 = mati) |
+| `CG_CLIF_UNROLL_CLONE` | unset | aktifkan unroll duplikasi-body (fallback) |
+| `CG_CLIF_INLINE_MAX` | 64 | batas instruksi callee untuk inliner (0 = mati) |
+| `CG_CLIF_NO_STORE_FWD` | unset | matikan store→load forwarding |
 

@@ -9,13 +9,44 @@ Experiments comparing Rust codegen backends: LLVM (`rustc`) vs
 - `build.sh` — rebuilds the modified cg_clif + its Cranelift std sysroot.
 - `cg_clif_upstream/` — pristine cg_clif (commit 42ac63e).
 - `cg_clif_mod/` — fork with the modifications (see commits
-  `b6c94e4`…`4290fb6`).
+  `b6c94e4`…`9ea4bbe`).
 - `bench/` — harness:
-  - `compare3.sh` — 3-way benchmark (LLVM / cg_clif up / cg_clif mod) across 5
-    sysroot configs; prints `C`=compile, `S`=size, `R`=run metrics.
+  - `allaxes.sh` — **canonical all-axes 3-way harness** (LLVM / cg_clif up /
+    cg_clif mod). Every run MUST report all of these, per backend and per
+    program; a benchmark is not complete without all of them:
+    - compile: **wall time**, **CPU time** (user+sys), **peak RSS**, **artifact
+      size** (bytes)
+    - run: **wall time**, **CPU time** (user+sys), **peak RSS**
+    Do not report a subset. `RREPS`/`CREPS` control repetitions.
+  - `compare3.sh` — 3-way benchmark across 5 sysroot configs; prints
+    `C`=compile, `S`=size, `R`=run metrics (including peak RSS).
   - `sizes2.sh` — sizes across opt-levels and stripped.
   - `measure.py` — wall/CPU/peak-RSS via `os.wait4` rusage.
   - `progs/p1..p6*.rs` — workloads (p5 inline, p6 scalar are the decisive microbenchmarks).
+
+## Benchmark reporting rules (MANDATORY)
+When comparing backends, always report the **full matrix**, never a partial one.
+For each backend (LLVM / cg_clif upstream / cg_clif modified) and each program,
+record and present:
+
+**Compile**
+1. compile wall time (ms)
+2. compile CPU time = user+sys (ms)
+3. compile peak RSS (MB)
+4. artifact size (bytes), plus section sizes (`.text`, `.data.rel.ro`,
+   `.rodata`, `.eh_frame`) when relevant
+
+**Run**
+5. run wall time (ms)
+6. run CPU time = user+sys (ms)
+7. run peak RSS (MB)
+
+Correctness: every backend's stdout must match LLVM's (or match the expected
+value) before its numbers count. A run with `exit != 0` or a compile failure is
+reported as such, never silently dropped.
+
+Use `bench/allaxes.sh` as the single source of truth so no axis is ever omitted.
+Add new programs under `bench/progs/` so they are picked up automatically.
 
 ## Build environment
 - Toolchain: `nightly-2026-11-17` (must match, cg_clif pins it).
@@ -26,8 +57,7 @@ Experiments comparing Rust codegen backends: LLVM (`rustc`) vs
 ## Key facts learned
 - Cranelift is **Apache-2.0 WITH LLVM-exception**; forking/reworking is fine.
 - cg_clif compiles ~20–45% faster than LLVM but produces ~26% larger binaries
-  and (upstream) runs 2–9× slower; the modified fork closes most of that gap
-  (p6: 902→61 ms; p2: 156→122 ms).
+  and runs 2–9× slower.
 - **Size root cause:** `cranelift-object` named every function section
   `.text.subsection` and every data object `.data.rel.ro.subsection`; the linker
   merges same-named sections so `--gc-sections` could not drop dead code.
@@ -61,32 +91,25 @@ Experiments comparing Rust codegen backends: LLVM (`rustc`) vs
   unroller is also present but **off by default** (`CG_CLIF_UNROLL_CLONE`): it is
   correct but slower, because duplicating a body does not shorten the carried
   chain. Knob: `CG_CLIF_UNROLL` (default 8).
-- `4290fb6` **borrow-aware SSA** (`src/analyze.rs`): a mutable/raw borrow now only
-  forces its local to a stack slot when the borrow points *into* that local's own
-  storage. A borrow that dereferences the local first (`&mut *p`, `&raw mut *p`)
-  merely reads it, so the local may stay in a register. Before this, cg_clif
-  emitted `_30 = &raw mut (*_30)` for a `Vec` indexing loop, which pinned the
-  whole `Vec` header (ptr/len/cap) to the stack and reloaded it every iteration.
-  mem micro-kernel 110→65 ms; p2_mem 156→122 ms. This supersedes the earlier
-  note that extending SROA to `&mut`/`RawPtr` is always a miscompile: it is only
-  unsafe for whole-local borrows, not for deref-through borrows.
 - **NEW** `src/store_forward.rs` **CLIF stack store→load forwarding + dead-store
   elimination**: forwards a `store` into a private (non-escaping) stack slot to
   every later `load` of the same address, aliases the load result to the stored
   value and removes the load; then deletes stores whose bytes no surviving load
-  reads. This is the lever that finally closes p5 (896 ms → **61 ms**, matching
-  LLVM's 57 ms). It must run **before** `unroll`: the affine loop pass rejects any
-  body that still touches memory, and the store/load round-trip cg_clif emits for
-  an iterator's `Option<u64>` otherwise blocks the reassociation.
+  reads. This is the real lever for p5/p6 (365 ms → 63 ms). It must run **before**
+  `unroll`, because the affine loop pass rejects any body that still touches
+  memory — the store/load round-trip cg_clif emits for an `Option`/iterator
+  otherwise blocks the unroll. Knob: `CG_CLIF_NO_STORE_FWD`.
   - Why it is needed: Cranelift's egraph only value-numbers loads that are
     `readonly`, `notrap` and `can_move`. A store to an explicit stack slot is not
     `readonly`, so a `store`/`load` round-trip of the same slot survives into the
     machine code, and inside a loop it lands on the carried dependency chain.
   - Soundness: only slots whose address is *never* used as anything but the
     address operand of a load/store are touched (`private_slots`), so no call or
-    indirect store can observe the slot. Overlapping (partial) stores are not
-    forwarded: only an exact `(slot, offset, type)` match is. Knob:
-    `CG_CLIF_NO_STORE_FWD`.
+    indirect store can observe the slot. Volatile and atomic accesses are skipped
+    (a volatile store has no `Load`/`Store` `InstructionData`, and `store` to a
+    private slot cannot be volatile because the address never escapes).
+  - Overlapping (partial) stores are not forwarded: only an exact
+    `(slot, offset, type)` match is.
   - **Miscompile fixed** (`343ff3f`): `private_slots` scanned only
     `InstructionData::arguments()`, which excludes block-call (branch)
     arguments. cg_clif threads a stack address through a block parameter (a phi),
@@ -98,36 +121,58 @@ Experiments comparing Rust codegen backends: LLVM (`rustc`) vs
     Repro: `std::process::Command::new("true").env("c","d").spawn()`, and a
     64-entry `BTreeMap<OsString, OsString>` insert loop. Both now exit 0 and
     match LLVM output.
-  - Verified by rebuilding the whole standard library with the pass enabled
-    (`./y.sh build --sysroot clif`) and re-checking all program outputs against
-    LLVM.
+  - **Cross-block forwarding** (`43a30ac`): the pass was block-local, so a store
+    in one block and the load reading it back in a dominated successor were never
+    connected — yet cg_clif materialises aggregates *across* control flow (a
+    tuple assigned in both arms of an `if`/`else` and read after the merge). In
+    p2_mem alone there are 348 such cross-block round-trips. Added a
+    must-analysis dataflow (`cross_block_entry`): a store fact reaches a block
+    only if *every* predecessor agrees on the exact same SSA value, which makes
+    the value well defined at the merge and dominating. The entry block is
+    seeded empty because it is also entered from outside the function, an edge
+    the CFG does not model. Result: find_inner stores 31→24, loads 13→12; binary
+    size −2% more. Verified by rebuilding the whole std sysroot with the pass on
+    and re-checking every program output against LLVM.
 
 ## What did NOT work / open leads
-- Extending SROA to **`&mut`/`RawPtr` *whole-local* borrows** (with `local_map`
+- **Root cause of the p2_mem runtime gap (8×, 125 ms vs LLVM 16 ms)**: cg_clif
+  emits the `core::core_arch::x86::sse2` intrinsics as **out-of-line calls** —
+  `p2_mem_M` contains 8 `_mm_*` symbols and 23 `call`s to them, while LLVM has 0
+  of either (it folds them inline). `_mm_loadu_si128`, `_mm_cmpeq_epi8` and
+  `_mm_movemask_epi8` are all `#[inline] #[target_feature(enable = "sse2")]`
+  `const fn`s in `core`, so they must be inlined for hashbrown's probe loop to
+  become the single `movdqu`/`pcmpeqb`/`pmovmskb` sequence LLVM produces. cg_clif
+  never folds them because:
+  - rustc's MIR inliner is **off** by default (`-Zinline-mir`, default: no), and
+    turning it on for the *user* crate does not help — the intrinsics live in the
+    precompiled `core`/`std` sysroot, not in the crate being compiled;
+  - cg_clif's own `CguInliner` only sees bodies in the *same* codegen unit
+    (`aot.rs` clones `codegened_functions` of one CGU), and it deliberately
+    requires `linkage.is_final()`; a cross-crate `#[inline]` generic in `core`
+    is a different CGU, so the inliner cannot reach it;
+  - LLVM sidesteps this entirely: `-Cembed-bitcode=yes` ships `core`'s bodies
+    and LLVM's inliner folds them at codegen time. Cranelift has no equivalent
+    cross-crate body channel here.
+  - Tried and confirmed **no effect**: `-Ctarget-feature=+sse2(,+ssse3,...)`,
+    `-Ctarget-cpu=x86-64`/`native`, `-Zinline-mir=yes` on the crate, and
+    `CG_CLIF_INLINE_MAX=4096` (only trims 32→23 calls, i.e. it inlines the
+    *in-crate* callers, never the `core` bodies).
+  - The fix would be a real cross-CGU inliner that can pull `core`'s CLIF/bitcode
+    bodies in, or a Cranelift-level pattern matcher that recognises the
+    `simd_eq`+`bitmask` shape and emits `pcmpeqb`/`pmovmskb` directly. Both are
+    large; not attempted. This is the one place where the modified backend is
+    still far from LLVM at runtime.
+- Extending SROA to **`&mut`/`RawPtr` whole-local borrows** (with `local_map`
   redirect) is a **miscompile** (p1/p3/p4 wrong). Shared-only is correct.
-  (The `4290fb6` change is different and safe: it only relaxes *deref-through*
-  borrows, where the local is read, never written, through the reference.)
-- Remaining runtime gap on **p1–p4** (LLVM 17–57 ms vs mod 99–140 ms) is **not**
-  loops and **not** the `Vec` header anymore:
-  - p2_mem is dominated by `HashMap::entry`/hashbrown: a bare
-    `for i { m.entry(i % 65536).or_insert(0) }` loop is 55 ms (LLVM) vs 672 ms
-    (mod), ~12×. The hashbrown probe loop spills almost every temporary to the
-    stack (~20 slots, e.g. `movdqu xmm→stack` before `movemask`), so the gap is a
-    pervasive mem2reg/aggregate-SSA limitation of cg_clif's MIR lowering, not a
-    single missing pass.
-  - p3_calls splits between `fib` recursion (LLVM rewrites the binary recursion
-    into one recursive call per step; cg_clif emits both calls) and `format!`.
-  - p4_simd/p1_arith need autovectorization, which Cranelift does not do. Tested:
-    `-C target-cpu=native` does **not** close it (p2 stays 124 ms vs LLVM 17 ms;
-    p4 141 ms vs 57 ms), so it is not just the baseline-SSE2 default.
-  - Raising the inliner budget (`CG_CLIF_INLINE_MAX=256`) buys only ~4% on p2 and
-    ~5% on p4, so cross-CGU inlining is not the lever.
 - The inliner is currently redundant: MIR inlining already folds the small
   helpers it targets, so it is correct but net-neutral on size/speed.
 - **Body-duplicating unrolling does not help.** Measured slower on p6 (357→423 ms):
   the win LLVM gets on p5/p6 is *affine reassociation* of the accumulator chain,
   not unrolling per se. Duplicating the body leaves the loop-carried dependency
   chain intact. Implemented anyway behind `CG_CLIF_UNROLL_CLONE` for completeness.
+- Remaining runtime gap on p2–p5 (LLVM 19–58 ms vs mod 107–360 ms) is not loops:
+  it is cross-CGU inlining and full memory-to-register promotion, which are not
+  yet complete.
 
 ## Gotchas
 - `measure.py`/`compare3.sh`: pass the rustc command as separate argv elements;
@@ -145,3 +190,16 @@ Experiments comparing Rust codegen backends: LLVM (`rustc`) vs
   clone reads the wrong state.
 - `func.layout` has no `num_blocks`; use `func.layout.blocks().count()`.
 
+
+
+## Push status (T6) — DONE
+- PR **#10** (`replace-main-with-cgclif-experiments` → `main`) is open and
+  **mergeable**. Remote tip is now `628c73b` (6 commits / 624 changed files);
+  local == remote.
+- `628c73b` fixes the store-forward miscompile (branch args were not scanned in
+  `private_slots`). Pushed with a user-supplied classic PAT with `repo` scope:
+  `git push https://<user>:<PAT>@github.com/irhasar/rmc.git replace-main-with-cgclif-experiments`.
+- Note: the environment's injected `GITHUB_TOKEN` (GitHub App installation) is
+  read-only for this repo — `git push` and all write APIs return 403
+  (`Resource not accessible by integration`). `OH_GIT_CREDENTIAL_ACCESS_TOKEN_GITHUB`
+  is also rejected (`Invalid username or token`), and there is no SSH key.

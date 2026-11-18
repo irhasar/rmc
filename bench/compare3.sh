@@ -19,8 +19,8 @@ mkdir -p "$OUT"
 
 NIGHTLY=nightly-2026-11-17
 RUSTC_LLVM="rustc +$NIGHTLY"
-CG_UP="$(dirname "$BENCH")/cg_clif_upstream/dist/bin/rustc-clif"
-CG_MOD="$(dirname "$BENCH")/cg_clif_mod/dist/bin/rustc-clif"
+CG_UP="$(cd "$(dirname "$0")/.." && pwd)/cg_clif_upstream/dist/bin/rustc-clif"
+CG_MOD="$(cd "$(dirname "$0")/.." && pwd)/cg_clif_mod/dist/bin/rustc-clif"
 LLVM_SYSROOT=$(rustc +$NIGHTLY --print sysroot)
 
 REPS_COMPILE=${REPS_COMPILE:-3}

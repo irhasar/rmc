@@ -317,7 +317,13 @@ fn build_isa(sess: &Session, jit: bool) -> Arc<dyn TargetIsa + 'static> {
         | OptLevel::Size
         | OptLevel::SizeMin
         | OptLevel::Aggressive => {
-            flags_builder.set("opt_level", "speed_and_size").unwrap();
+            // LLVM maps `-O3` to a speed-only objective; cg_clif used to always
+            // ask Cranelift for `speed_and_size`, which lets the backend prefer
+            // shorter encodings over the fastest ones. `CG_CLIF_OPT_LEVEL`
+            // overrides this for experimentation.
+            let level = std::env::var("CG_CLIF_OPT_LEVEL")
+                .unwrap_or_else(|_| "speed_and_size".to_string());
+            flags_builder.set("opt_level", &level).unwrap();
         }
     }
 

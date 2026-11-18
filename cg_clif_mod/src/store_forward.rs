@@ -20,6 +20,9 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 /// Byte range written or read at a stack slot.
 type Key = (StackSlot, i64);
 
+/// For each byte range, the SSA value last stored to it.
+type Avail = FxHashMap<Key, (Value, types::Type)>;
+
 fn disabled() -> bool {
     std::env::var_os("CG_CLIF_NO_STORE_FWD").is_some()
 }
@@ -37,8 +40,12 @@ pub(crate) fn run(func: &mut ir::Function) {
     if private.is_empty() {
         return;
     }
+    // Facts that hold on every path into a block. Seeding each block with these
+    // lets a store in one block reach a load in a dominated successor, which the
+    // block-local walk below cannot see.
+    let entry = cross_block_entry(func, &private);
     for block in func.layout.blocks().collect::<Vec<_>>() {
-        forward_block(func, block, &private);
+        forward_block(func, block, &private, &entry);
     }
     drop_dead_stores(func, &private);
 }
@@ -125,8 +132,14 @@ fn private_slots(func: &ir::Function) -> FxHashSet<StackSlot> {
 
 /// Forward stores to loads within a single block. A store is only remembered for
 /// a private slot, so an intervening call or indirect store cannot invalidate it.
-fn forward_block(func: &mut ir::Function, block: Block, private: &FxHashSet<StackSlot>) {
-    let mut avail: FxHashMap<Key, (Value, types::Type)> = FxHashMap::default();
+/// `entry` holds the facts that hold on every path into `block`.
+fn forward_block(
+    func: &mut ir::Function,
+    block: Block,
+    private: &FxHashSet<StackSlot>,
+    entry: &FxHashMap<Block, Avail>,
+) {
+    let mut avail: Avail = entry.get(&block).cloned().unwrap_or_default();
 
     for inst in func.layout.block_insts(block).collect::<Vec<_>>() {
         let opcode = func.dfg.insts[inst].opcode();
@@ -161,6 +174,80 @@ fn forward_block(func: &mut ir::Function, block: Block, private: &FxHashSet<Stac
             func.layout.remove_inst(inst);
         }
     }
+}
+
+/// Run the block-local store transfer over `avail` without rewriting anything.
+/// Used by the cross-block dataflow, which only needs the store facts.
+fn transfer(func: &ir::Function, block: Block, mut avail: Avail, private: &FxHashSet<StackSlot>) -> Avail {
+    for inst in func.layout.block_insts(block) {
+        let opcode = func.dfg.insts[inst].opcode();
+        if !opcode.can_store() {
+            continue;
+        }
+        let args = func.dfg.insts[inst].arguments(&func.dfg.value_lists).to_vec();
+        let Some(key) = args.get(1).copied().and_then(|a| stack_key(func, inst, a)) else {
+            continue;
+        };
+        if !private.contains(&key.0) {
+            continue;
+        }
+        let value = args[0];
+        let ty = func.dfg.value_type(value);
+        let (start, end) = (key.1, key.1 + i64::from(ty.bytes()));
+        avail.retain(|&(slot, off), &mut (_, prev_ty)| {
+            let prev_end = off + i64::from(prev_ty.bytes());
+            slot != key.0 || end <= off || prev_end <= start
+        });
+        avail.insert(key, (value, ty));
+    }
+    avail
+}
+
+/// The store facts that hold on *every* path into each block, i.e. the meet over
+/// all predecessors. A fact survives the meet only when every predecessor agrees
+/// on the exact same SSA value, so the value stored is well defined at the merge
+/// point and dominates it.
+fn cross_block_entry(func: &ir::Function, private: &FxHashSet<StackSlot>) -> FxHashMap<Block, Avail> {
+    let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func);
+    let blocks: Vec<Block> = func.layout.blocks().collect();
+    // The entry block is also reached from outside the function, where no store
+    // has run. The CFG does not model that edge, so a self-loop on the entry
+    // block would otherwise leak facts from the back edge into its own entry.
+    let entry_block = func.layout.entry_block();
+
+    let meet = |out: &FxHashMap<Block, Avail>, block: Block| -> Avail {
+        if Some(block) == entry_block {
+            return Avail::default();
+        }
+        let mut acc: Option<Avail> = None;
+        for pred in cfg.pred_iter(block) {
+            let po = out.get(&pred.block).cloned().unwrap_or_default();
+            match &mut acc {
+                None => acc = Some(po),
+                Some(cur) => cur.retain(|k, v| po.get(k) == Some(v)),
+            }
+        }
+        acc.unwrap_or_default()
+    };
+
+    let mut out: FxHashMap<Block, Avail> = FxHashMap::default();
+    let mut entry: FxHashMap<Block, Avail> = FxHashMap::default();
+    loop {
+        let mut changed = false;
+        for &block in &blocks {
+            let in_avail = meet(&out, block);
+            let new_out = transfer(func, block, in_avail.clone(), private);
+            if out.get(&block) != Some(&new_out) {
+                out.insert(block, new_out);
+                changed = true;
+            }
+            entry.insert(block, in_avail);
+        }
+        if !changed {
+            break;
+        }
+    }
+    entry
 }
 
 /// Remove stores into private slots whose bytes are not read by any surviving
