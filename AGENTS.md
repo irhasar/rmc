@@ -251,7 +251,10 @@ Add new programs under `bench/progs/` so they are picked up automatically.
   (`bench/fullbench.sh`, RC=7/RR=9).
 - `rmc_clone` subtree re-synced from `cg_clif_mod` (identical `src/`), plus
   `bench/fullbench.sh`, `bench/tests/`, refreshed `REPORT.md`.
-- Push to `irhasar/rmc` still 403 (`Resource not accessible by integration`).
+- **PUSHED**: branch `replace-main-with-cgclif-experiments` pushed
+  (`19024f3..7249d45`); PR #10 head is now `7249d45`, 18 commits,
+  `mergeable=True (clean)`, base `main`. Pushed with a user-supplied
+  `repo`-scoped PAT (the injected `GITHUB_TOKEN` is still 403).
 
 ## Push status (T6) — DONE
 - PR **#10** (`replace-main-with-cgclif-experiments` → `main`) is open,
