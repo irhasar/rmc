@@ -133,6 +133,30 @@ Add new programs under `bench/progs/` so they are picked up automatically.
     the CFG does not model. Result: find_inner stores 31→24, loads 13→12; binary
     size −2% more. Verified by rebuilding the whole std sysroot with the pass on
     and re-checking every program output against LLVM.
+- `38923c0` **SIMD 128-bit constants → `vconst`** (`src/constant.rs`). A 16-byte
+  read-only, pointer-free, fully-initialised `ConstValue::Indirect`
+  (`Simd::ZERO`, splat masks, `_mm_set1_*` results) used to become an anonymous
+  global plus a `load`. Now it lowers to a single `vconst`. Two effects: removes
+  a memory round-trip on the hot path, and — the important one — removes the
+  `GlobalValueData::Symbol` that blocks the inliner (it does not remap
+  `ExternalName`). `_mm_*` call sites in `p2_mem` drop 31→3; the residual 3 are
+  cross-CGU (`hashbrown::find_inner`).
+- `0e6c2f0` **128-bit SIMD copy via one vector load/store**
+  (`src/value_and_place.rs`). Writing a by-ref 128-bit SIMD value into a memory
+  place fell through to `emit_small_memory_copy`, splitting 16 bytes into two
+  `i64` loads and two `i64` stores. cg_clif bounces every SIMD op through such a
+  slot, so the bitcast `__m128i → Simd<i8, 16>` alone was 1 store + 2 loads + 2
+  stores. Now a single 16-byte vector load+store. Wider vectors (`__m256i`
+  without AVX) have no single store and keep the `memcpy`.
+- `8ff4779` **cross-type same-size vector store→load forwarding**
+  (`src/store_forward.rs`). The pass only matched a load to a store of the
+  *exact same* CLIF type. A SIMD bitcast (`__m128i ↔ Simd<i8, 16>`) compiles to
+  a store as one lane type and a load back as another, so those round-trips
+  survived to machine code. When byte sizes match and both types are vectors,
+  the stored value is now forwarded through a single `bitcast`; the target
+  endianness is threaded in from the ISA because Cranelift's verifier requires
+  explicit endianness when lane counts differ. `as_i8x16` becomes one
+  `bitcast.i8x16`. p2_mem 110→99 ms; size 4.41 MB (LLVM 4.64 MB).
 
 ## What did NOT work / open leads
 - **p2_mem runtime gap (fixed)**: the 8× gap (125 ms vs LLVM 16 ms) came from
@@ -192,10 +216,11 @@ Add new programs under `bench/progs/` so they are picked up automatically.
 ## Push status (T6) — DONE
 - PR **#10** (`replace-main-with-cgclif-experiments` → `main`) is open,
   **mergeable=True (clean)**. Local `rmc_clone` == remote.
-- Latest fork commit on `cg_clif_mod`:
-  `Lower integer SIMD compares and bitmasks with vector instructions`
-  (vector `icmp`/`vhigh_bits` lowering + vector ByVal move in `write_cvalue`).
-  Mirrored into `rmc_clone` and pushed.
+- Latest fork commit on `cg_clif_mod`: `8ff4779`
+  `Forward same-size vector stores to loads of a different lane type`
+  (on top of `0e6c2f0` SIMD copy via one vector load/store and `38923c0`
+  SIMD constants → `vconst`). Squashed into one commit `4759d90` in
+  `rmc_clone` and pushed; PR #10 head is `4759d90`, 10 commits.
 - Earlier commits: `e101572` cross-block store forwarding + doc/bench-path sync;
   `628c73b` store-forward miscompile fix (branch args were not scanned in
   `private_slots`). Pushed with a user-supplied classic PAT with `repo` scope:

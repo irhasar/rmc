@@ -390,7 +390,44 @@ Sisa gap p2/p4 berasal dari inlining lintas-CGU Cranelift (helper `memchr` /
 `hashbrown` masih keluar dari baris) dan ketiadaan autovectorization di
 Cranelift — keduanya di luar jangkauan perubahan sisi cg_clif ini.
 
-### 8.9 Ringkasan knob
+### 8.9 Konstanta SIMD `vconst` dan forwarding store vektor lintas tipe
+
+Tiga tindak lanjut penurunan SIMD, semuanya diverifikasi terhadap keluaran LLVM
+pada keenam program bench dan uji SIMD 17 kasus.
+
+1. **Konstanta SIMD 128-bit → `vconst`** (`38923c0`). Sebuah
+   `ConstValue::Indirect` 16 byte, read-only, bebas pointer, dan terinisialisasi
+   penuh (`Simd::ZERO`, mask splat, hasil `_mm_set1_*`) sebelumnya menjadi
+   *anonymous global* + `load`. Sekarang diturunkan ke satu `vconst`. Efek
+   gandanya penting: selain menghapus satu round-trip memori di jalur panas,
+   `vconst` tidak membawa `GlobalValueData::Symbol`, dan *symbol* itulah yang
+   memblokir inliner Cranelift (inliner tidak me-*remap* indeks `ExternalName`).
+   Situs pemanggilan `_mm_*` di `p2_mem` turun **31 → 3** (sisa 3 berada di
+   `hashbrown::find_inner`, lintas-CGU).
+
+2. **Penyalinan nilai SIMD 128-bit lewat by-ref → satu load/store vektor**
+   (`0e6c2f0`). Menulis nilai SIMD 128-bit by-ref ke place memori jatuh ke
+   `emit_small_memory_copy`, yang memecah 16 byte menjadi dua `load.i64` + dua
+   `store.i64`. Karena cg_clif melewatkan setiap op SIMD lewat stack slot, biaya
+   ini dibayar per operasi; bitcast `__m128i → Simd<i8, 16>` saja menjadi
+   1 store + 2 load + 2 store. Sekarang dipakai satu load dan satu store vektor
+   16 byte. Vektor yang lebih lebar (`__m256i` tanpa AVX) tidak punya store
+   tunggal, jadi tetap memakai `memcpy`.
+
+3. **Store→load forwarding tipe vektor beda lane, ukuran sama** (`8ff4779`).
+   Pass forwarding hanya mencocokkan load ke store bila tipe CLIF-nya persis
+   sama. Sebuah bitcast SIMD (`__m128i ↔ Simd<i8, 16>`) justru dikompilasi
+   sebagai store dengan satu tipe lane dan load dengan tipe lane lain, sehingga
+   round-trip itu bertahan sampai kode mesin. Bila ukuran byte sama dan kedua
+   tipe vektor, nilai store diteruskan lewat satu instruksi `bitcast`. Endianness
+   target diambil dari ISA dan diberikan ke flag `bitcast` (verifier Cranelift
+   mewajibkan endianness eksplisit bila jumlah lane berbeda).
+
+Hasil pada `p2_mem`: runtime **110 → 99 ms** (LLVM 17 ms); ukuran **4.41 MB**
+(LLVM 4.64 MB). Bitcast `as_i8x16` kini menjadi satu `bitcast.i8x16` (sebelumnya
+`jump` + `stack_addr` + 2 `load.i64` + 2 `store.i64` + `load.i8x16`).
+
+### 8.10 Ringkasan knob
 
 | Env | Default | Efek |
 |-----|---------|------|
