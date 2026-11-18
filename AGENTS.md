@@ -87,6 +87,17 @@ Experiments comparing Rust codegen backends: LLVM (`rustc`) vs
     indirect store can observe the slot. Overlapping (partial) stores are not
     forwarded: only an exact `(slot, offset, type)` match is. Knob:
     `CG_CLIF_NO_STORE_FWD`.
+  - **Miscompile fixed** (`343ff3f`): `private_slots` scanned only
+    `InstructionData::arguments()`, which excludes block-call (branch)
+    arguments. cg_clif threads a stack address through a block parameter (a phi),
+    e.g. `jump block9(v29)` with `v29 = stack_addr ss4` and a later `load v42`;
+    that reader was invisible, so `drop_dead_stores` deleted the store the load
+    depended on. The BTreeMap insert path in libstd then read uninitialised
+    memory and segfaulted (`std::process::Command::spawn`, `BTreeMap::insert`).
+    Fix: treat any stack address that reaches a branch argument as escaping.
+    Repro: `std::process::Command::new("true").env("c","d").spawn()`, and a
+    64-entry `BTreeMap<OsString, OsString>` insert loop. Both now exit 0 and
+    match LLVM output.
   - Verified by rebuilding the whole standard library with the pass enabled
     (`./y.sh build --sysroot clif`) and re-checking all program outputs against
     LLVM.

@@ -28,6 +28,11 @@ pub(crate) fn run(func: &mut ir::Function) {
     if disabled() {
         return;
     }
+    if let Ok(skip) = std::env::var("CG_CLIF_SF_SKIP") {
+        if func.name.to_string().contains(&skip) {
+            return;
+        }
+    }
     let private = private_slots(func);
     if private.is_empty() {
         return;
@@ -78,19 +83,38 @@ fn private_slots(func: &ir::Function) -> FxHashSet<StackSlot> {
     let mut escaping: FxHashSet<StackSlot> = FxHashSet::default();
     let mut slots: FxHashSet<StackSlot> = FxHashSet::default();
 
+    // A `stack_addr` value that resolves to a slot, if `arg` is one.
+    let slot_of = |arg: Value| -> Option<StackSlot> {
+        let arg = dfg.resolve_aliases(arg);
+        let ir::ValueDef::Result(def_inst, 0) = dfg.value_def(arg) else { return None };
+        let ir::InstructionData::StackAddr { stack_slot, .. } = dfg.insts[def_inst] else {
+            return None;
+        };
+        Some(stack_slot)
+    };
+
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
             let opcode = dfg.insts[inst].opcode();
             let addr_index = address_index(opcode);
             for (i, &arg) in dfg.insts[inst].arguments(&dfg.value_lists).iter().enumerate() {
-                let arg = dfg.resolve_aliases(arg);
-                let ir::ValueDef::Result(def_inst, 0) = dfg.value_def(arg) else { continue };
-                let ir::InstructionData::StackAddr { stack_slot, .. } = dfg.insts[def_inst] else {
-                    continue;
-                };
-                slots.insert(stack_slot);
+                let Some(slot) = slot_of(arg) else { continue };
+                slots.insert(slot);
                 if addr_index != Some(i) {
-                    escaping.insert(stack_slot);
+                    escaping.insert(slot);
+                }
+            }
+            // Branch arguments are *not* part of `arguments()`. An address passed
+            // through a block parameter (a phi) is indistinguishable from an
+            // escaping address by this pass, so treat it as one: otherwise a load
+            // that reads the slot through the parameter is invisible and the
+            // store it depends on is wrongly deleted.
+            for dest in dfg.insts[inst].branch_destination(&dfg.jump_tables, &dfg.exception_tables) {
+                for arg in dest.args(&dfg.value_lists) {
+                    if let Some(slot) = arg.as_value().and_then(slot_of) {
+                        slots.insert(slot);
+                        escaping.insert(slot);
+                    }
                 }
             }
         }
@@ -115,6 +139,11 @@ fn forward_block(func: &mut ir::Function, block: Block, private: &FxHashSet<Stac
             if private.contains(&key.0) {
                 let value = args[0];
                 let ty = func.dfg.value_type(value);
+                let (start, end) = (key.1, key.1 + i64::from(ty.bytes()));
+                avail.retain(|&(slot, off), &mut (_, prev_ty)| {
+                    let prev_end = off + i64::from(prev_ty.bytes());
+                    slot != key.0 || end <= off || prev_end <= start
+                });
                 avail.insert(key, (value, ty));
             }
         } else if opcode.can_load() {

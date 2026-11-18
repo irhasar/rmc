@@ -404,6 +404,20 @@ Verifikasi tambahan: seluruh standard library dikompilasi ulang dengan pass akti
 (`./y.sh build --sysroot clif`) dan keluaran semua program tetap identik dengan
 LLVM. Knob: `CG_CLIF_NO_STORE_FWD`.
 
+**Perbaikan miscompile (commit `343ff3f`).** Versi pertama pass (`aa2f802`) punya
+bug: `private_slots` hanya memindai `InstructionData::arguments()`, yang
+**tidak** memuat argumen cabang (`BlockCall`). cg_clif mengalirkan alamat stack
+lewat parameter blok (phi), mis. `jump block9(v29)` dengan `v29 = stack_addr ss4`
+dan `load v42` di blok tujuan. Reader itu tak terlihat, sehingga
+`drop_dead_stores` menghapus store yang dibutuhkan load tersebut; jalur
+`BTreeMap::insert` di libstd lalu membaca memori tak terinisialisasi dan
+segfault (`Command::spawn`, `BTreeMap::insert`). Perbaikan: setiap alamat stack
+yang mencapai argumen cabang diperlakukan sebagai escaping (konservatif, sama
+seperti alamat yang dipakai selain sebagai operand load/store). Reproducer:
+`std::process::Command::new("true").env("c","d").spawn()` dan loop insert
+`BTreeMap<OsString, OsString>` 64 entri; keduanya sekarang exit 0 dan identik
+dengan LLVM.
+
 ### 8.10 Sisa gap p1–p4 bukan loop
 
 Setelah 8.3, 8.6, dan 8.9, gap p1–p4 (1,3×–6×) adalah kualitas backend:
