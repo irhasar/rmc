@@ -580,3 +580,17 @@ the residual 3–7x is **Cranelift codegen quality, not inlining**:
 - To finish: supply a `repo`-scoped PAT (or push manually):
   `git -C rmc_clone push https://<user>:<PAT>@github.com/irhasar/rmc.git replace-main-with-cgclif-experiments`
   This updates PR #10 in place; no new PR is needed.
+
+## Session note — external-crate validation (REPORT 8.24)
+
+- Added `extbench/` (harness `extbench.sh`, `exttests.sh`, `drivers/`) and
+  REPORT section 8.24. Three real crates from `github.com/cipansor/crateworks`
+  are cloned and built with L=LLVM, U=cg_clif upstream, M=modified fork.
+- Crates: `openlocationcode` (fp + string), `holidays-rs` (date search),
+  `stdnum-rs` (checksum/parsing). All pure Rust, no deps, `#![forbid(unsafe_code)]`.
+- Results: compile wall 1.7–2.1× faster than LLVM, M≈U within 6%; artifact
+  7–24% smaller than U; runtime 1.6–1.9× faster than U on all three; run RSS
+  identical (~10.7 MB). All crate test suites pass (0 failed) on L/U/M; driver
+  outputs identical across backends.
+- `dist/` is not committed, so the harness takes `RUSTC_U`, `RUSTC_M`,
+  `CRATEWORKS`, `BENCH_DIR` env overrides. Pushed as `a4278b0`; PR #10 head.
