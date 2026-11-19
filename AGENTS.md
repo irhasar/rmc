@@ -28,13 +28,15 @@
   across L/U/M. Full std rebuilt with the pass active.
 - REPORT.md section 8.25 documents it. Fork commits: `163ab57` (code) + `caecf4f`
   (docs).
-- **Push BLOCKED (again)**: the local commit `e90bf60` on
-  `replace-main-with-cgclif-experiments` could not be pushed. Every available
-  credential is rejected: `git push` returns 403 for the GITHUB_TOKEN and
-  OH_GIT_CREDENTIAL_ACCESS_TOKEN_GITHUB identities, the git credential helper
-  fails auth, and the REST API returns `403 Resource not accessible by
-  integration` on ref create/update (the app token is read-only for this repo).
-  PR #10 head stays at `06599ad` until a `repo`-scoped PAT is supplied.
+- **PUSHED**: `replace-main-with-cgclif-experiments` is now at `3814539` on the
+  remote (commits `e90bf60` code+REPORT 8.25+AGENTS, `96b4941` blocker note,
+  `3814539` A/B script). PR #10 head is `3814539`, `mergeable: MERGEABLE`,
+  `mergeStateStatus: CLEAN`, base `main`. PR description updated via the REST
+  API to add the leaf-tier and if-conversion results.
+- Push history: the injected GITHUB_TOKEN / OH_GIT_CREDENTIAL_ACCESS_TOKEN_GITHUB
+  and the git credential helper are all read-only for `irhasar/rmc` (403). The
+  push and PR edit used a user-supplied `repo`-scoped PAT, used only for the
+  push/PR edit and not stored anywhere.
 
 ## Session (2026-11-18) — if-conversion diamond → select/cmove (LANDED, `7374000`)
 - New pass `src/if_convert.rs`: collapses a short, side-effect-free two-way
