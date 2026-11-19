@@ -1076,8 +1076,118 @@ Penyebab dominan sisanya adalah **auto-vectorization**. Dihitung dengan
 | Cranelift | 29 | 2 |
 
 LLVM memvektorisasi loop blur; Cranelift tidak. Ini pekerjaan di dalam
-`cranelift-codegen` (loop vectorizer), di luar jangkauan pass sisi cg_clif,
-dan tidak ditambal di sini. Angka ini menggantikan klaim lama di §8.20 bahwa
-gap "bukan soal autovektorisasi": untuk blur, vektorisasi adalah faktor
-dominan. §8.20 tetap berlaku untuk benchmark mikro p1–p8 yang loop-nya
-memang skalar.
+`cranelift-codegen`, di luar jangkauan pass sisi cg_clif.
+
+**Koreksi (lihat §9.2).** Paragraf di atas sempat menyebut vektorisasi
+sebagai faktor dominan gap blur. Pengukuran langsung membantahnya: LLVM
+dengan `-Cno-vectorize-loops -Cno-vectorize-slp` menghasilkan 763 instruksi
+dan **0 instruksi SIMD**, tetapi tetap 1248 ms versus 1246 ms versi
+tervektorisasi (551 instruksi, 71 SIMD). Jadi vektorisasi bukan penyebabnya;
+§8.20 (asli) yang benar. Penyebab yang terbukti adalah jump table untuk
+switch kecil (§9.3–§9.5).
+
+---
+
+## 9. Eksperimen lanjutan: jump table pada switch kecil (§9)
+
+### 9.1 Metodologi yang sempat salah
+
+Percobaan pertama memakai `cargo build` tanpa `RUSTC=rustc-clif`, sehingga
+yang terukur adalah **LLVM**, bukan Cranelift. Gejalanya: ukuran biner 579.296
+byte (LLVM) alih-alih 1.629.168 (Cranelift), dan tunable `CG_CLIF_UNROLL`
+1/4/16/128 menghasilkan md5 identik. Setelah `RUSTC=rustc-clif` dipakai,
+barulah angka Cranelift muncul. **Semua angka unroll/inliner di bawah sudah
+memakai build yang benar.**
+
+### 9.2 Yang terbukti BUKAN penyebab
+
+| Hipotesis | Uji | Hasil |
+|---|---|---|
+| Autovektorisasi | LLVM `-Cno-vectorize-loops -Cno-vectorize-slp` | 763 instr, **0 SIMD** → 1248 ms, vs 551 instr/71 SIMD → 1246 ms. **Tidak berpengaruh.** |
+| Unroll CLIF | `CG_CLIF_UNROLL` 1/4/16/128 | 10280–10362 ms, biner identik. Pass hanya menangani loop satu-blok ber-delta konstan; loop blur tidak memenuhi syarat. |
+| Inliner CLIF | `CG_CLIF_INLINE_MAX=200 INLINE_LEAF_MAX=400 INLINE_USES=8` | 10380 ms vs 10359 baseline. Ukuran naik 1.629.168→1.635.000, **runtime tidak membaik**. |
+
+Jadi klaim lama "vektorisasi adalah faktor dominan" **salah**; klaim §8.20
+(asli) yang benar.
+
+### 9.3 Temuan: jump table untuk switch kecil
+
+Menghitung pola jump table PIC (`movslq (%r,%r,4),%r; add %r,%r; jmp *%r`):
+
+| biner | situs jump table |
+|---|---|
+| LLVM | 0 (pakai bentuk absolut `jmp *0x…`, 214 situs) |
+| Cranelift (sebelum) | **2714** |
+| Cranelift (sesudah patch) | **84** |
+
+Contoh nyata: `ImageBuffer::from_fn` menurunkan `match i {0=>r,1=>g,2=>b}`
+menjadi jump table 3-entri. LLVM memakai 2 `cmp`. Biaya jump table di sini
+bukan sekadar 1 cabang tak-langsung: ia juga memaksa alamat dasar dihitung
+(`lea`) dan menghalangi prediksi cabang.
+
+### 9.4 Patch
+
+`src/base.rs`, `TerminatorKind::SwitchInt`: switch dengan ≤8 cabang dan
+diskriminan ≤64-bit diturunkan menjadi rantai `icmp_imm_s` + `brif`, bukan
+`cranelift_frontend::Switch::emit` (yang memilih `br_table`). Batas 64-bit
+wajib: `icmp_imm_s` menerima immediate `i64`, sehingga diskriminan `i128`
+akan terpotong.
+
+### 9.5 Hasil
+
+| metrik | LLVM | CLIF base | CLIF + patch |
+|---|---|---|---|
+| blur 2048² (median 9 rep) | 1217 ms | 10352 ms | **10135 ms** (−2,1%) |
+| ukuran biner | 579.296 | 1.629.168 | **1.500.000** (−7,9%) |
+
+Matriks p1–p8 (REPS=5) tidak meregresi: run total 525 ms (base 528 ms),
+compile total 715 ms (base 719 ms), ukuran total 34.255.448 (base 34.255.448).
+
+### 9.6 Kesalahan yang ditemukan dan diperbaiki saat pengembangan
+
+Versi pertama patch **menggagalkan 13 tes** (`f128`/`i128` switch):
+`*value as i64` memotong diskriminan lebar. Dibatasi ke `value_type(discr).bits() <= 64`;
+setelah itu **3011 lulus / 0 gagal** (suite coretests).
+
+### 9.7 Sisa gap dan di mana harus diperbaiki
+
+Setelah patch, gap blur masih ~8,3×. Profil sampel menunjukkan LLVM
+memusatkan 60,6% waktu fungsi panas di **satu offset** (loop ketat), sedangkan
+Cranelift menyebarkannya ke **213 offset** — gejala loop yang tidak
+di-rotate/di-unroll dan register spill (240 referensi `(%rsp)` vs 66).
+Perbaikannya ada di `cranelift-codegen` (loop rotation, regalloc), bukan di
+lapisan cg_clif, dan tidak dikerjakan di sini.
+
+### 9.8 Matriks tiga arah final (L = LLVM, U = cg_clif upstream, M = modifikasi)
+
+`bench_all.sh`, REPS=5, mesin sama. Runtime & compile dalam ms, ukuran byte.
+
+| prog | run L | run U | run M | size L | size U | size M | cpl L | cpl U | cpl M |
+|---|---|---|---|---|---|---|---|---|---|
+| p1_arith | 82 | 108 | 105 | 4635232 | 5878688 | 4322528 | 91 | 81 | 81 |
+| p2_mem | 16 | 155 | 68 | 4639888 | 5936880 | 4345592 | 242 | 126 | 144 |
+| p3_calls | 37 | 117 | 99 | 4612368 | 5820872 | 4257744 | 100 | 94 | 89 |
+| p4_simd | 55 | 157 | 140 | 4636096 | 5893112 | 4330520 | 111 | 91 | 95 |
+| p5_inline | 58 | 893 | 7 | 4609368 | 5814440 | 4249784 | 83 | 76 | 76 |
+| p6_scalar | 58 | 906 | 7 | 4609368 | 5814424 | 4249784 | 83 | 77 | 76 |
+| p7_branchy | 43 | 100 | 60 | 4609520 | 5814536 | 4249776 | 84 | 83 | 77 |
+| p8_minmax | 18 | 38 | 39 | 4609544 | 5814488 | 4249720 | 85 | 81 | 77 |
+| **total** | **367** | **2474** | **525** | **36961384** | **46787440** | **34255448** | **879** | **709** | **715** |
+
+- Runtime: M **4,71× lebih cepat dari U**, 1,43× lebih lambat dari L.
+- Ukuran: M **73,2% dari U**, **92,7% dari L** — satu-satunya backend lebih
+  kecil dari LLVM.
+- Compile: M 715 ms vs U 709 ms vs L 879 ms — M/U setara (1,01×), M **19%
+  lebih cepat dari L**.
+- Patch switch (§9.4) tidak meregresi satu pun program di tabel ini.
+
+### 9.9 Kesimpulan
+
+Dari tiga hipotesis yang diuji, hanya satu yang terbukti: **jump table untuk
+switch kecil**. Patch-nya kecil (≈25 baris di `src/base.rs`), benar
+(3011 tes lulus, keluaran byte-identik dengan LLVM), dan memberi keuntungan
+ganda: runtime −2,1% dan ukuran −7,9% pada blur.
+
+Sisa gap runtime didominasi kualitas `cranelift-codegen` (loop rotation,
+regalloc/spilling), bukan lapisan cg_clif. Itu perlu perubahan di crate
+`cranelift-codegen` dan berada di luar cakupan fork ini.

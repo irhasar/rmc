@@ -173,12 +173,10 @@ pub(crate) fn compile_fn(
     // Inline small callees that live in the same codegen unit before optimizing. Cranelift only
     // provides the mechanics; the heuristic lives in `crate::inliner`.
     if !bodies.is_empty() {
-        let inliner = crate::inliner::CguInliner::new(
-            bodies,
-            codegened_func.func_id.as_u32(),
-            &context.func,
-        );
-        if let Err(err) = crate::passtime::time(crate::passtime::INLINE, || context.inline(inliner)) {
+        let inliner =
+            crate::inliner::CguInliner::new(bodies, codegened_func.func_id.as_u32(), &context.func);
+        if let Err(err) = crate::passtime::time(crate::passtime::INLINE, || context.inline(inliner))
+        {
             dcx.fatal(format!("inlining failed for {}: {err:?}", codegened_func.symbol_name));
         }
     }
@@ -196,7 +194,9 @@ pub(crate) fn compile_fn(
     // data-dependent branch cannot mispredict. Running before `unroll` also
     // turns a loop whose body holds such a branch into the single block the
     // unroller accepts.
-    crate::passtime::time(crate::passtime::IF_CONVERT, || crate::if_convert::run(&mut context.func));
+    crate::passtime::time(crate::passtime::IF_CONVERT, || {
+        crate::if_convert::run(&mut context.func)
+    });
 
     // Widen canonical counted loops so their carried dependency chains are
     // shortened. Cranelift has no unrolling pass of its own.
@@ -531,13 +531,40 @@ fn codegen_fn_body(fx: &mut FunctionCx<'_, '_, '_>, start_block: Block) {
                         }
                     }
                 } else {
-                    let mut switch = ::cranelift_frontend::Switch::new();
-                    for (value, block) in targets.iter() {
-                        let block = fx.get_block(block);
-                        switch.set_entry(value, block);
-                    }
                     let otherwise_block = fx.get_block(targets.otherwise());
-                    switch.emit(&mut fx.bcx, discr, otherwise_block);
+                    // A jump table costs an indirect branch the predictor cannot
+                    // follow, so a handful of cases is cheaper as a compare chain.
+                    // `icmp_imm_s` takes an i64 immediate, so a wider discriminant
+                    // (i128/f128 bit patterns) has to keep the jump table.
+                    const SMALL_SWITCH: usize = 8;
+                    let narrow = fx.bcx.func.dfg.value_type(discr).bits() <= 64;
+                    if narrow && targets.iter().count() <= SMALL_SWITCH {
+                        let cases: Vec<_> =
+                            targets.iter().map(|(v, b)| (v, fx.get_block(b))).collect();
+                        if let Some((last, init)) = cases.split_last() {
+                            for &(value, block) in init {
+                                let next = fx.bcx.create_block();
+                                let cond =
+                                    fx.bcx.ins().icmp_imm_s(IntCC::Equal, discr, value as i64);
+                                fx.bcx.ins().brif(cond, block, &[], next, &[]);
+                                fx.bcx.switch_to_block(next);
+                                fx.bcx.seal_block(next);
+                            }
+                            // The last compare goes straight to `otherwise`, so the
+                            // chain needs no separate fallthrough block.
+                            let cond = fx.bcx.ins().icmp_imm_s(IntCC::Equal, discr, last.0 as i64);
+                            fx.bcx.ins().brif(cond, last.1, &[], otherwise_block, &[]);
+                        } else {
+                            fx.bcx.ins().jump(otherwise_block, &[]);
+                        }
+                    } else {
+                        let mut switch = ::cranelift_frontend::Switch::new();
+                        for (value, block) in targets.iter() {
+                            let block = fx.get_block(block);
+                            switch.set_entry(value, block);
+                        }
+                        switch.emit(&mut fx.bcx, discr, otherwise_block);
+                    }
                 }
             }
             TerminatorKind::Call {
