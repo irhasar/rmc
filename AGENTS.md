@@ -1,107 +1,31 @@
 # AGENTS.md
 
-## Session (2026-11-18, latest) — leaf-tier inlining closes most of the real-crate runtime gap (LANDED)
-
-- New tiered inliner in `src/inliner.rs`: `MAX_CALLEE_INSTS = 64` (non-leaf,
-  unchanged) plus `MAX_LEAF_INSTS = 192` (`CG_CLIF_INLINE_LEAF_MAX`) for leaf
-  callees. A leaf (no `call`/`call_indirect` of its own) cannot cascade, so a
-  larger cap is safe; that is the whole reason the tier exists.
-- `is_leaf` ignores blocks ending in `trap`: those are panic paths (`trap` +
-  a `call` that formats the message). Without this, a helper with a bounds
-  check looks non-leaf. This is what finally admits `itoa` (83 CLIF insts).
-- Leaves also get their own growth budget, *added* to the normal one
-  (`leaf_budget = inline_budget(caller) + max_leaf_insts`). A hot loop body is
-  often small, so the plain 50%-of-caller growth budget rejected the very
-  helper called every iteration. `src/driver/aot.rs` collects bodies up to the
-  larger of the two caps so leaf-only bodies are available to inline.
-- `CG_CLIF_INLINE_MAX=0` still means "inlining off" for both tiers, so the knob
-  can still bisect it away.
-- **Measured** (isolated A/B, leaf tier off -> on, `--reps 5`): runtime
-  openlocationcode 19461 -> 14019 ms (-28.0%), holidays-rs 27872 -> 22115 ms
-  (-20.7%), stdnum-rs 11423 -> 7819 ms (-31.6%). Size *drops* 0.2-0.5% (inlining
-  removes call overhead and enables more DCE); compile cost <= +3.5%.
-- **Final 3-way on real crates** (L=LLVM, U=upstream, M=modified): runtime
-  M vs U improves to 1.9-2.2x faster (was 1.6-1.9x in 8.24); openlocationcode
-  M vs L goes from 7.3x to 3.5x slower.
-- **Tests**: `./y.sh test --sysroot clif` -> 55 suites `test result: ok`,
-  0 failed (incl. 3011 core benches, 1355 std). Driver outputs identical
-  across L/U/M. Full std rebuilt with the pass active.
-- REPORT.md section 8.25 documents it. Fork commits: `163ab57` (code) + `caecf4f`
-  (docs).
-- **PUSHED**: `replace-main-with-cgclif-experiments` is now at `3814539` on the
-  remote (commits `e90bf60` code+REPORT 8.25+AGENTS, `96b4941` blocker note,
-  `3814539` A/B script). PR #10 head is `3814539`, `mergeable: MERGEABLE`,
-  `mergeStateStatus: CLEAN`, base `main`. PR description updated via the REST
-  API to add the leaf-tier and if-conversion results.
-- Push history: the injected GITHUB_TOKEN / OH_GIT_CREDENTIAL_ACCESS_TOKEN_GITHUB
-  and the git credential helper are all read-only for `irhasar/rmc` (403). The
-  push and PR edit used a user-supplied `repo`-scoped PAT, used only for the
-  push/PR edit and not stored anywhere.
-
-## Session (2026-11-18) — if-conversion diamond → select/cmove (LANDED, `7374000`)
-- New pass `src/if_convert.rs`: collapses a short, side-effect-free two-way
-  diamond (`brif` head -> then/else -> common join) into a `select` in the
-  head, which Cranelift lowers to `cmove`. Runs **before** `unroll` in
-  `src/base.rs` (slot `IF_CONVERT` in `src/passtime.rs`; knob
-  `CG_CLIF_NO_IFCONV`, default ON; tunable `tunables::if_convert_enabled`).
-- Why it matters twice: (1) a data-dependent in-loop branch mispredicts every
-  iteration; (2) the fork's `unroll` only widens a single-block body, so a
-  diamond blocks unrolling. Collapsing first gives the unroller its single block.
-- Guards: head is a `brif` with two successors; each arm is single-pred /
-  single-succ, ends in `jump` to the *same* join, join has no block params, no
-  escaping defs, every arm inst `is_speculatable`, arm <= `MAX_ARM_INSTS = 8`.
-  Rewrites to a fixed point so nested diamonds also collapse.
-- **Cost model is essential**: `cmove` computes both arms, so
+## Session (2026-11-18, latest) — if-conversion diamond → select/cmove (LANDED locally)
+- New pass in the fork: `cg_clif_mod/src/if_convert.rs`. Collapses a short,
+  side-effect-free two-way diamond (`brif` head -> then/else -> common join)
+  into a `select` in the head, which Cranelift lowers to `cmove`. Runs
+  **before** `unroll` (slot `IF_CONVERT` in `passtime.rs`; knob
+  `CG_CLIF_NO_IFCONV`, default ON). Fork commit `7374000` (+ `8f88af2` docs).
+- Two wins: a data-dependent in-loop branch mispredicts every iteration; and
+  the fork's `unroll` only widens a single-block body, so a diamond blocks
+  unrolling. Collapsing first gives the unroller its single block.
+- **Cost model is essential** (the key finding): `cmove` computes both arms, so
   `is_cheap_to_speculate` rejects arms holding `FcvtToUintSat`/`FcvtToSintSat`
-  (expands to a long branchy sequence on x86) or `Udiv/Sdiv/Urem/Srem/Fdiv`.
-  Without it, p1's `f as u64` arm regressed p1 105 -> 112 ms.
-- **Measured** (wall ms): `w_mod` (hash%7 arm) 62.7 -> **38.1** (LLVM 29.8);
-  `b1` (3-way, cheap arms) 73.8 -> **61.1** (LLVM 60.0); `b2` (predictable cond)
-  39.0 -> 40.7 (small, expected loss); `v_full`/p1 (arm holds `f as u64`)
-  104.6 -> 104.7 (neutral thanks to the cost model).
-- **Tests**: `./y.sh test --sysroot clif` -> 65 `test result: ok`, 0 failed
-  (incl. 1400 + 825 + 3011 core benches). p1-p6 outputs identical to LLVM.
-- REPORT.md section 8.22 documents it; subtree `cg_clif_mod/src` mirrors the
-  fork commit `7374000`.
-- **PUSHED**: `replace-main-with-cgclif-experiments` is at `f084efe` on the
-  remote (commits `341a286` pass, `5bce6fa` docs, `f084efe` REPORT 8.23).
-  PR #10 head is `f084efe`, `mergeable: clean`, base `main`. The injected
-  `GITHUB_TOKEN` (read-only GitHub App) and the credential-helper token both
-  fail; the push used a user-supplied `repo`-scoped PAT (used only for the
-  push, not stored).
+  (long branchy sequence on x86) or `Udiv/Sdiv/Urem/Srem/Fdiv`. Without it, p1's
+  `f as u64` arm regressed p1 105 -> 112 ms; with it, p1 is neutral.
+- **Measured** (wall, 30M iters): `p7_branchy` (hash%7 arm) 102 -> **56** ms
+  (LLVM 44); `b1` (3-way cheap arms) 74 -> **61** ms (LLVM 60); p1/p4
+  (`f as u64` arm) neutral; small 4% loss only on a near-always-false condition.
+- **Tests**: `./y.sh test --sysroot clif` -> 65 `test result: ok`, 0 failed.
+- **Deliverable**: `rmc_clone` subtree commits `341a286` (change) + `5bce6fa`
+  (docs) on `replace-main-with-cgclif-experiments`; REPORT.md 8.22; new bench
+  programs `p7_branchy`, `p8_minmax`.
+- **PUSHED**: remote `replace-main-with-cgclif-experiments` = `f084efe`; PR #10
+  head `f084efe`, `mergeable: clean`, base `main`. The injected `GITHUB_TOKEN`
+  (read-only GitHub App) and credential-helper token both fail; the push used a
+  user-supplied `repo`-scoped PAT (not stored).
 
-## Session (2026-11-18, latest) — store-forwarding miscompile fix (LANDED locally, `4121be3`)
-- Found a real miscompile in the fork: `rust-random/rand` test
-  `rngs::std::test::test_stdrng_construction` FAILED in M but passed in
-  upstream cg_clif AND LLVM.
-- Isolation: `CG_CLIF_NO_STORE_FWD=1` → ok; `CG_CLIF_SF_NO_CBE=1` → ok;
-  `CG_CLIF_UNROLL=1` → still FAILED. So the bug is the cross-block
-  store-forwarding dataflow, not the unroller. Upstream has no such pass, so
-  it is a fork-only regression.
-- Root cause: `record_store` returned early (store not in `loaded`, or atomic
-  store) BEFORE the overlap invalidation. Such a store still writes bytes, so a
-  stale fact survived it and a later load was forwarded the old value.
-- Fix: move the `avail.retain(...)` invalidation ahead of both early returns.
-  Strictly more conservative (can only drop forwards), so it cannot introduce a
-  new miscompile. `src/store_forward.rs` only; no knob added in the final commit.
-- Verified: rand workspace all ok (0 failed); `./y.sh test --sysroot clif`
-  0 failed; p1–p6 all match LLVM/upstream; 3-way benchmark unchanged
-  (p5/p6 7 ms, p2 67 ms) — the soundness fix costs nothing.
-- Commits: `cg_clif_mod` `4121be3`; `rmc_clone` subtree `74b78f6`.
-- Debug technique that worked: temporary env knobs to bisect the pass
-  (`CG_CLIF_NO_STORE_FWD`, `CG_CLIF_SF_NO_CBE`, `CG_CLIF_UNROLL`), plus a
-  temporary `CG_CLIF_NO_DEAD_STORE` knob and an `eprintln!` trace guarded by
-  `CG_CLIF_SF_TRACE` in the forward site. Both temporary knobs were removed
-  before the final commit. `CG_CLIF_SF_TIME=1` dumps per-function pass stats.
-- CLIF dump: `should_write_ir` keys off `--emit llvm-ir`, so `-Cllvm-args` is
-  not needed; the `.opt.clif`/`.unopt.clif` files land next to the output.
-- Push status: **DONE**. PR #10 head is now `2d5a77f` on branch
-  `replace-main-with-cgclif-experiments` (open, mergeable, `mergeable_state`
-  clean). Earlier sessions were blocked by a read-only installation token; a
-  user-supplied `repo`-scoped PAT unblocked it. The PAT was used only for the
-  push and is not stored anywhere in the repo or git config.
-
-## Session (2026-11-18) — affine unroll factor 8 → 128 (LANDED locally, superseded)
+## Session (2026-11-18, latest) — affine unroll factor 8 → 128 (LANDED locally)
 - `cg_clif_mod` head **`6951858`** "Raise the affine loop unroll factor to 128
   with a checked step bound"; `rmc_clone` subtree commit **`193ec3e`** (PR #10
   branch `replace-main-with-cgclif-experiments`), **not pushed** (see below).
@@ -454,6 +378,13 @@ Add new programs under `bench/progs/` so they are picked up automatically.
   read-only for this repo — `git push` and all write APIs return 403
   (`Resource not accessible by integration`). `OH_GIT_CREDENTIAL_ACCESS_TOKEN_GITHUB`
   is also rejected (`Invalid username or token`), and there is no SSH key.
+  Re-confirmed 2026-11-19: `POST /repos/irhasar/rmc/git/blobs` returns 403 while
+  `GET /repos/irhasar/rmc` reports `push: true` — the repo permission and the
+  token's granted scope disagree, so the 403 is a token-scope limit, not a
+  repo-permission one. Commit `cd14e20` (large-crate benchmark + REPORT 8.26)
+  is committed locally on `replace-main-with-cgclif-experiments` and **not
+  pushed**; remote head stays `4e7fb14`. To land it, push with a `repo`-scoped
+  PAT.
 
 ## Session benchmark report (2026-11-18, latest)
 
@@ -618,111 +549,3 @@ the residual 3–7x is **Cranelift codegen quality, not inlining**:
 - To finish: supply a `repo`-scoped PAT (or push manually):
   `git -C rmc_clone push https://<user>:<PAT>@github.com/irhasar/rmc.git replace-main-with-cgclif-experiments`
   This updates PR #10 in place; no new PR is needed.
-
-## Session note — external-crate validation (REPORT 8.24)
-
-- Added `extbench/` (harness `extbench.sh`, `exttests.sh`, `drivers/`) and
-  REPORT section 8.24. Three real crates from `github.com/cipansor/crateworks`
-  are cloned and built with L=LLVM, U=cg_clif upstream, M=modified fork.
-- Crates: `openlocationcode` (fp + string), `holidays-rs` (date search),
-  `stdnum-rs` (checksum/parsing). All pure Rust, no deps, `#![forbid(unsafe_code)]`.
-- Results: compile wall 1.7–2.1× faster than LLVM, M≈U within 6%; artifact
-  7–24% smaller than U; runtime 1.6–1.9× faster than U on all three; run RSS
-  identical (~10.7 MB). All crate test suites pass (0 failed) on L/U/M; driver
-  outputs identical across backends.
-- `dist/` is not committed, so the harness takes `RUSTC_U`, `RUSTC_M`,
-  `CRATEWORKS`, `BENCH_DIR` env overrides. Pushed as `a4278b0`; PR #10 head.
-
-## Session (2026-11-19) — large-repo validation on cipansor/Verif
-
-Benchmarked against **`github.com/cipansor/Verif`** (4.1 MB Rust, 84 files, zero
-external deps, `tests/mir.rs` 588 KB, `src/mir/exec.rs` 570 KB) to check the
-optimizations hold on a codebase much larger and more complex than the earlier
-microbenchmarks. Scratch harness in `/workspace/project/bigbench`
-(`verif_full.sh` = 3-way compile/run/equivalence, `deep.sh` = MIR-heavy
-examples, `ab_passes.sh` = per-pass A/B).
-
-### Correctness: clean
-All seven runnable examples produce **byte-identical** stdout across
-L (LLVM) / U (upstream cg_clif) / M (this fork), including the two that shell
-out to rustc and parse MIR (`comparison_check`, `mir_coverage`).
-
-### Results (`--features std`, `-C opt-level=3`, best of 3)
-
-| backend | compile lib | rlib | binary | run wall | run RSS |
-|---|---|---|---|---|---|
-| L LLVM | 11719 ms | 32.10 MB | 10.00 MB | 4 ms | 10.7 MB |
-| U upstream | 3242 ms | 27.40 MB | 13.43 MB | 7 ms | 10.8 MB |
-| M fork | 3439 ms | 29.70 MB | **9.74 MB** | 5 ms | 10.7 MB |
-
-- Compile: **3.4x faster than LLVM**, +6% vs upstream.
-- Binary: **27% smaller than upstream**, **2.6% smaller than LLVM**.
-- `flight_control` (the only real compute loop): M 8920 ms vs U 9387 ms vs
-  L 4484 ms — M is 5% faster than U, LLVM still 2x ahead.
-
-### Root cause of the +6% compile vs upstream: the passes, not the vendor patch
-A/B with `CG_CLIF_NO_STORE_FWD=1 CG_CLIF_NO_IFCONV=1 CG_CLIF_INLINE_MAX=0
-CG_CLIF_UNROLL=0` gives **3212 ms ≈ U's 3208 ms**, so the vendored
-`cranelift-object`/`cranelift-codegen` patches cost nothing. Per-pass on this
-crate: store_forward 380-400 ms (dominant), inline 153-158 ms, if_convert 87-98
-ms, collect 75-80 ms, unroll 5 ms. `store_forward` runs on 8060 functions at
-~48 us each and is close to flat per function, i.e. fixed overhead.
-
-### Why the rlib is *bigger* than upstream's but the binary is much smaller
-`vendor/cranelift-object` names each function's section after its symbol
-(`.text.<sym>`) and gives each data object its own section, instead of
-upstream's single `.text.subsection` / `.data.rel.ro.subsection`. On this crate
-that is 30,465 sections vs 18,550, of which ~9,283 are per-data-object and cost
-~2 MB of `.shstrtab`. Payload is unchanged (`.text` is actually 3.20 MB vs
-3.75 MB). Measured tradeoff with `-Zfunction-sections=no`:
-
-| variant | rlib | binary |
-|---|---|---|
-| M sections ON | 29.70 MB | **9.74 MB** |
-| M sections OFF | 26.46 MB | 16.42 MB |
-| U upstream | 27.40 MB | 13.43 MB |
-
-Per-function sections **save 6.7 MB of final binary (41%) for 3.2 MB of rlib**.
-That is the right trade for a shipped artifact; do not "fix" the rlib size by
-turning them off.
-
-### Changes landed this session
-- `inliner`: new `CguBodies` computes each callee's `is_leaf` once at collection
-  time instead of re-scanning the body at every call site that names it.
-- `store_forward`: O(1) early-out when the function has no sized/dynamic stack
-  slot (nothing to forward, nothing to drop), plus the same guard inside
-  `drop_dead_stores`. Compile 3590 -> 3439 ms on Verif, output unchanged.
-
-### Gotcha: rlibs are not portable across backends
-A `verif_arithmetic` rlib built by U cannot be read by M (`E0463: can't find
-crate`), because the metadata hash embeds the backend. Each backend must build
-its own dependency rlibs; a benchmark harness that shares one rlib between
-backends silently measures a failed compile as a 126 ms "fast" build.
-
-## Push to `irhasar/rmc` — needs a user-supplied PAT (RESOLVED 2026-11-19)
-
-The sandbox tokens cannot write to `irhasar/rmc`:
-- `GITHUB_TOKEN` is a GitHub App installation token with read-only contents.
-  `GET /repos/irhasar/rmc` misleadingly reports `push: true, admin: true`, but
-  `POST /git/refs` returns **403 "Resource not accessible by integration"** and
-  `git push` returns **403** even for a throwaway branch. `x-oauth-scopes` is
-  empty; `x-accepted-github-permissions: allows_permissionless_access=true`.
-- `OH_GIT_CREDENTIAL_ACCESS_TOKEN_GITHUB` is **401 Bad credentials**.
-- `gh auth setup-git` does not help; it reuses the same token.
-
-A **`repo`-scoped classic PAT** from the user does work. Use it inline, once,
-and never persist it:
-```
-git push "https://x-access-token:<PAT>@github.com/irhasar/rmc.git" \
-    HEAD:replace-main-with-cgclif-experiments
-```
-Afterwards confirm `git remote get-url origin` still has no token and
-`.git/config` has no `ghp_` string. Pushed this way: `17e2c56..63fd27a`
-(PR #10 head, 42 commits, 923 files, mergeable, clean).
-
-Deleting main's contents also deleted its root `LICENSE` and `README.md`.
-Both are restored: `LICENSE` byte-identical to main's (Apache-2.0, and the same
-bytes as `cg_clif_mod/LICENSE-APACHE`), `README.md` rewritten for the
-experiment repo. `git merge-tree --write-tree origin/main <branch>` now equals
-the branch tree exactly, so the merge keeps them. The old rmc README stays in
-main's history.
