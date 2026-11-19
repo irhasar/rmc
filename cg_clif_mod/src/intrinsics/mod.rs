@@ -268,6 +268,32 @@ fn bool_to_zero_or_max_uint<'tcx>(
     res
 }
 
+/// Round a float toward zero without SSE4.1.
+///
+/// `ftrunc` lowers to `roundss`/`roundsd` only when the target has SSE4.1; on
+/// the x86-64 baseline Cranelift emits a libcall into compiler_builtins'
+/// soft-float `truncf`, which dominated the image blur profile. An integer
+/// round-trip needs only SSE2.
+///
+/// Every float whose magnitude reaches 2^mantissa_bits is already integral, so
+/// the round-trip is exact precisely where it applies; below that bound the
+/// value converts without overflowing the integer. NaN and infinity fail the
+/// magnitude test and pass through unchanged, which is what truncation returns
+/// for them.
+fn trunc_via_int(fx: &mut FunctionCx<'_, '_, '_>, x: Value, clif_ty: Type, bits: u32) -> Value {
+    let int_ty = if bits == 52 { types::I64 } else { types::I32 };
+    let int_part = fx.bcx.ins().fcvt_to_sint_sat(int_ty, x);
+    let back = fx.bcx.ins().fcvt_from_sint(clif_ty, int_part);
+    let limit = fx.bcx.ins().f64const((2.0f64).powi(bits as i32));
+    let limit = if clif_ty == types::F64 { limit } else { fx.bcx.ins().fdemote(clif_ty, limit) };
+    let abs = fx.bcx.ins().fabs(x);
+    let small = fx.bcx.ins().fcmp(FloatCC::LessThan, abs, limit);
+    // The round-trip loses the sign of zero: trunc(-0.4) must be -0.0, but the
+    // integer conversion yields +0. Reapply x's sign bit.
+    let back = fx.bcx.ins().fcopysign(back, x);
+    fx.bcx.ins().select(small, back, x)
+}
+
 pub(crate) fn codegen_intrinsic_call<'tcx>(
     fx: &mut FunctionCx<'_, '_, 'tcx>,
     instance: Instance<'tcx>,
@@ -1230,7 +1256,11 @@ fn codegen_regular_intrinsic_call<'tcx>(
                 (sym::ceil, F32 | F64) => Codegen(fx.bcx.ins().ceil(x)),
                 (sym::ceil, F128) => Libcall("ceilf128"),
 
-                (sym::trunc, F32 | F64) => Codegen(fx.bcx.ins().trunc(x)),
+                (sym::trunc, F32 | F64) => {
+                    let clif_ty = fx.clif_type(layout.ty).unwrap();
+                    let bits = if *float_ty == F64 { 52 } else { 23 };
+                    Codegen(trunc_via_int(fx, x, clif_ty, bits))
+                }
                 (sym::trunc, F128) => Libcall("truncf128"),
 
                 (sym::round_ties_even, F32 | F64) => Codegen(fx.bcx.ins().nearest(x)),
@@ -1246,6 +1276,7 @@ fn codegen_regular_intrinsic_call<'tcx>(
                     // and its exact fractional remainder and bump the integral
                     // part only when the remainder reaches one half.
                     let clif_ty = fx.clif_type(layout.ty).unwrap();
+                    let bits = if *float_ty == F64 { 52 } else { 23 };
                     let one = fx.bcx.ins().f64const(1.0);
                     let half = fx.bcx.ins().f64const(0.5);
                     let (one, half) = if *float_ty == F64 {
@@ -1253,7 +1284,7 @@ fn codegen_regular_intrinsic_call<'tcx>(
                     } else {
                         (fx.bcx.ins().fdemote(clif_ty, one), fx.bcx.ins().fdemote(clif_ty, half))
                     };
-                    let int_part = fx.bcx.ins().trunc(x);
+                    let int_part = trunc_via_int(fx, x, clif_ty, bits);
                     // Exact: the fractional part is representable, so `fsub`
                     // introduces no error. NaN and infinity yield NaN here, which
                     // fails the comparison below and falls through to int_part.
