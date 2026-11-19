@@ -717,5 +717,12 @@ git push "https://x-access-token:<PAT>@github.com/irhasar/rmc.git" \
     HEAD:replace-main-with-cgclif-experiments
 ```
 Afterwards confirm `git remote get-url origin` still has no token and
-`.git/config` has no `ghp_` string. Pushed this way: `17e2c56..b2d2c5b`
-(PR #10 head, 40 commits, 923 files).
+`.git/config` has no `ghp_` string. Pushed this way: `17e2c56..63fd27a`
+(PR #10 head, 42 commits, 923 files, mergeable, clean).
+
+Deleting main's contents also deleted its root `LICENSE` and `README.md`.
+Both are restored: `LICENSE` byte-identical to main's (Apache-2.0, and the same
+bytes as `cg_clif_mod/LICENSE-APACHE`), `README.md` rewritten for the
+experiment repo. `git merge-tree --write-tree origin/main <branch>` now equals
+the branch tree exactly, so the merge keeps them. The old rmc README stays in
+main's history.
