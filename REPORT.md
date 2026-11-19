@@ -463,13 +463,12 @@ Hasil pada `p2_mem`: runtime **110 → 99 ms** (LLVM 17 ms); ukuran **4.41 MB**
 
 | Env | Default | Efek |
 |-----|---------|------|
-| `CG_CLIF_UNROLL` | 128 | faktor reassociasi (1 = mati) |
+| `CG_CLIF_UNROLL` | 8 | faktor reassociasi (1 = mati) |
 | `CG_CLIF_UNROLL_CLONE` | unset | aktifkan unroll duplikasi-body (fallback) |
 | `CG_CLIF_INLINE_MAX` | 64 | batas instruksi callee untuk inliner (0 = mati) |
 | `CG_CLIF_INLINE_USES` | 3 | maksimum berapa kali satu callee boleh di-inline ke satu caller |
 | `CG_CLIF_NO_STORE_FWD` | unset | matikan store→load forwarding |
-| `CG_CLIF_NO_IFCONV` | unset | matikan if-conversion diamond→`select` |
-| `CG_CLIF_PASS_TIME` | unset | cetak waktu per-pass cg_clif (store_forward/unroll/inline/collect/if_convert) |
+| `CG_CLIF_PASS_TIME` | unset | cetak waktu per-pass cg_clif (store_forward/unroll/inline/collect) |
 | `CG_CLIF_CLIF_TIME` | unset | cetak waktu per-pass internal Cranelift |
 | `CG_CLIF_SF_NO_CBE` | unset | matikan dataflow store-forwarding lintas blok |
 | `CG_CLIF_SF_CBE_MAX` | 300 | batas instruksi fungsi agar CBE dijalankan |
@@ -708,248 +707,145 @@ probe akan meledakkan ukuran kode pada pemanggil lain, jadi ini bukan trade-off
 yang jelas menang; dibiarkan apa adanya. p3/p4 (konversi rekursi→loop,
 unrolling-call untuk ILP, fusi `sincos`) murni pekerjaan level Cranelift.
 
-### 8.21 Perbaikan miscompile store-forwarding (LANDED, `4121be3`)
+### 8.25 Validasi repo besar (cipansor/Verif) + dua optimisasi pass — LANDED
 
-Bug soundness ditemukan saat menjalankan suite `rust-random/rand`: test
-`rngs::std::test::test_stdrng_construction` gagal di M tetapi lulus di
-upstream cg_clif **dan** LLVM. Isolasi lewat knob:
+Semua benchmark sebelumnya memakai crate kecil atau microbenchmark. Bagian ini
+menguji fork pada **`github.com/cipansor/Verif`**: 4.1 MB Rust, 84 file, tanpa
+dependensi eksternal, dengan `tests/mir.rs` 588 KB dan `src/mir/exec.rs` 570 KB.
+Harness di `bigbench/` (`verif_full.sh` tiga arah, `deep.sh` contoh berat MIR,
+`ab_passes.sh` A/B per pass).
 
-| Konfigurasi | Hasil rand |
-|-------------|-----------|
-| M default | FAILED |
-| `CG_CLIF_NO_STORE_FWD=1` | ok |
-| `CG_CLIF_SF_NO_CBE=1` (cross-block off) | ok |
-| `CG_CLIF_UNROLL=1` | FAILED |
+**Kebenaran.** Ketujuh contoh yang bisa dijalankan menghasilkan stdout
+**byte-identik** di L (LLVM), U (cg_clif upstream), M (fork ini). Dua contoh yang
+memanggil rustc untuk membaca MIR (`comparison_check`, `mir_coverage`) juga
+identik setelah kolom waktu diabaikan: 630 verified / 424 FAILED / 16 incomplete
+di ketiga backend. Suite fork sendiri lulus: 924 + 1200 + 3x825 + 61 test, 0 gagal.
 
-Jadi miscompile berasal dari dataflow store-forwarding lintas blok, bukan dari
-unroller. Upstream cg_clif tidak punya pass ini, jadi ini regresi murni milik
-fork.
+**Hasil** (`--features std`, `-C opt-level=3`):
 
-**Akar masalah.** `record_store` melakukan `return` lebih awal ketika store
-tidak layak direkam — bukan bagian dari `loaded`, atau store atomik. Kedua
-`return` itu berada **sebelum** langkah invalidasi overlap. Padahal store
-seperti itu tetap menulis byte; fakta lama pada rentang yang tumpang tindih
-harus dibuang. Karena tidak dibuang, load berikutnya di-forward nilai basi.
-Pada `StdRng` ini merusak state RNG hasil `from_seed`.
+| backend | compile lib | rlib | binary | run wall | run RSS |
+|---|---|---|---|---|---|
+| L LLVM | 11719 ms | 32.10 MB | 10.00 MB | 4 ms | 10.7 MB |
+| U upstream | 3242 ms | 27.40 MB | 13.43 MB | 7 ms | 10.8 MB |
+| M fork | 3439 ms | 29.70 MB | **9.74 MB** | 5 ms | 10.7 MB |
 
-**Perbaikan.** Pindahkan invalidasi overlap ke depan kedua `return` tersebut,
-sehingga fakta yang tertimpa selalu dibuang apa pun jenis store-nya. Perubahan
-ini **strictly more conservative**: ia hanya bisa menghapus forward, tidak
-pernah menambah, jadi tidak mungkin memunculkan miscompile baru.
+Compile 3.4x lebih cepat dari LLVM (+6% vs upstream), binary 27% lebih kecil
+dari upstream dan 2.6% lebih kecil dari LLVM, RSS runtime sama.
 
-**Verifikasi.**
+**Beban nyata terberat.** `mir_coverage` mem-parse MIR seluruh repo (96 detik di
+upstream). Dengan `VERIF_RUSTC` dipatok ke rustc LLVM yang sama untuk ketiga
+backend — supaya subprocess tidak ikut terukur — L 15858 ms, **U 95870 ms, M
+62089 ms**: fork **35% lebih cepat** dari upstream, output identik.
 
-- `rand` seluruh workspace: 80 + 12 + 9 + 128 + 6 + 4 + 2 + 19 + 3 … = semua ok, 0 failed.
-- Suite penuh `./y.sh test --sysroot clif`: **0 failed** (65 blok `test result: ok`).
-- Harness benchmark p1–p6: semua keluaran identik dengan LLVM dan upstream.
-- Benchmark tiga arah tidak berubah: p5/p6 tetap 7 ms, p2 tetap 67 ms. Jadi
-  perbaikan soundness ini berbiaya nol.
+**Akar +6% compile vs upstream: pass, bukan patch vendor.** Dengan semua pass
+dimatikan (`CG_CLIF_NO_STORE_FWD=1 CG_CLIF_NO_IFCONV=1 CG_CLIF_INLINE_MAX=0
+CG_CLIF_UNROLL=0`) compile 3212 ms vs upstream 3208 ms, jadi patch
+`cranelift-object`/`cranelift-codegen` tidak menambah biaya. Biaya per pass pada
+crate ini: store_forward 380-400 ms (dominan), inline 153-158, if_convert 87-98,
+collect 75-80, unroll 5. `store_forward` jalan pada 8060 fungsi ~48 us masing,
+hampir datar per fungsi → overhead tetap, bukan skala instruksi.
 
-### 8.22 If-conversion diamond → `select`/`cmove` (LANDED)
+**Optimisasi yang landed.**
+- `inliner`: `CguBodies` menghitung `is_leaf` tiap callee sekali saat koleksi,
+  bukan memindai ulang badan callee di setiap call site yang menyebutnya.
+- `store_forward`: early-out O(1) bila fungsi tak punya stack slot sized/dynamic
+  (tak ada yang bisa di-forward maupun di-drop), plus guard sama di
+  `drop_dead_stores`. Sebelumnya `analyze()` dan `drop_dead_stores()` tetap
+  menyusuri seluruh fungsi lebih dulu.
+- Compile lib Verif: **3590 → 3439 ms**, output tidak berubah, suite lulus.
 
-**Masalah.** `if` pendek di dalam loop tetap berbentuk diamond `brif`: head
-bercabang ke blok *then* dan *else*, keduanya `jump` ke *join* dengan parameter
-nilai terpilih. Bila kondisinya data-dependent (`hash % k == 0`), cabang itu
-sering salah prediksi dan tiap salah prediksi membuang pipeline. Dua efek:
+**Kenapa rlib lebih besar dari upstream tapi binary jauh lebih kecil.**
+`vendor/cranelift-object` menamai section per fungsi (`.text.<sym>`) dan memberi
+setiap objek data section sendiri, alih-alih satu `.text.subsection` /
+`.data.rel.ro.subsection` seperti upstream. Pada crate ini 30.465 section vs
+18.550, sekitar 9.283 di antaranya per objek data dan memakan ~2 MB `.shstrtab`.
+Payload tidak berubah (`.text` justru 3.20 MB vs 3.75 MB). Trade-off terukur
+(`-Zfunction-sections=no`):
 
-1. **Runtime.** `cmove` tidak bisa salah prediksi; cabang bisa.
-2. **Struktural.** Pass `unroll` fork hanya melebarkan loop yang body-nya satu
-   blok dengan satu back edge. Diamond menambah blok, jadi loop seperti itu
-   tidak pernah di-unroll. Meng-collapse diamond lebih dulu membuat body jadi
-   satu blok yang dibutuhkan unroller.
+| varian | rlib | binary |
+|---|---|---|
+| M section ON | 29.70 MB | **9.74 MB** |
+| M section OFF | 26.46 MB | 16.42 MB |
+| U upstream | 27.40 MB | 13.43 MB |
 
-**Perbaikan.** Pass `if_convert` (`src/if_convert.rs`, ~347 baris) men-collapse
-diamond dua arah yang pendek dan bebas efek samping menjadi `select` di head,
-yang Cranelift lower jadi `cmove`. Dijalankan **sebelum** `unroll` di pipeline.
+Section per fungsi **menghemat 6.7 MB binary akhir (41%)** dengan biaya 3.2 MB
+rlib. Untuk artefak yang dikirim ke pengguna ini trade-off yang benar; jangan
+"memperbaiki" ukuran rlib dengan mematikannya.
 
-Syarat konservatif (semua harus terpenuhi):
+**Jebakan pengukuran.** rlib tidak portabel antar backend: `verif_arithmetic`
+hasil U tidak bisa dibaca M (`E0463: can't find crate`) karena metadata hash
+memuat backend. Harness yang berbagi satu rlib antar backend akan diam-diam
+mengukur compile gagal sebagai build "cepat" 126 ms.
 
-- head adalah `brif` dengan dua successor; `then`/`else` masing-masing
-  single-predecessor dan single-successor;
-- kedua arm berakhir `jump` ke **join yang sama**;
-- join **tidak** punya block parameter, dan tidak ada nilai yang bocor keluar arm;
-- tiap instruksi arm *speculatable* (`is_speculatable`, cermin
-  `is_pure_for_egraph` yang tidak diekspor vendor) dan **murah** untuk
-  dispekulasi;
-- arm ≤ `MAX_ARM_INSTS = 8` instruksi.
+### 8.26 Uji repo besar dengan banyak dependensi eksternal — LANDED
 
-Rewrite dijalankan sampai fixed point agar rantai diamond bersarang ikut
-runtuh.
+Tiga crate nyata dengan dependency tree besar, dibangun dari source crates.io
+apa adanya (bukan contoh buatan). Semua angka di bawah adalah median; build
+diukur pada **seluruh process tree** (`cargo` + semua `rustc` anaknya) dengan
+sampler `/proc` 10 ms, karena `wait4`/`ru_maxrss` pada anak langsung hanya
+melaporkan ~50 MB milik cargo sendiri, bukan ~1.1 GB milik para `rustc`.
 
-**Model biaya (temuan penting).** `cmove` menghitung **kedua** arm setiap
-iterasi. Arm yang meluas jadi sequence bercabang/libcall lebih mahal daripada
-cabang yang digantikan. `is_cheap_to_speculate` menolak arm yang memuat
-`FcvtToUintSat`/`FcvtToSintSat` (konversi float→int saturating — di x86 meluas
-jadi blok bercabang panjang) atau `Udiv`/`Sdiv`/`Urem`/`Srem`/`Fdiv`
-(pembagian/modulo non-konstanta). Tanpa model ini, arm `f as u64` di p1
-membuat p1 **regresi** 105 → 112 ms; dengan model ini p1 kembali netral.
+| crate | deps | backend | compile wall | compile CPU | peak RSS | binary | runtime wall | runtime CPU | runtime RSS |
+|---|---|---|---|---|---|---|---|---|---|
+| `bat` 0.26.1 | 178 | L | 86.5 s | 247.2 s | 1162 MB | 6.88 MB | 395 ms | 380 ms | 6 MB |
+| | | U | 59.8 s | 169.9 s | 1106 MB | 17.37 MB | 619 ms | 610 ms | 12 MB |
+| | | **M** | **62.3 s** | **179.2 s** | **1111 MB** | **13.43 MB** | **494 ms** | **480 ms** | **10 MB** |
+| `tokei` 15.0.0 | 101 | L | 44.9 s | 146.9 s | 1089 MB | 5.41 MB | 183 ms | 390 ms | 9 MB |
+| | | U | 28.0 s | 87.8 s | 984 MB | 20.91 MB | 961 ms | 3400 ms | 17 MB |
+| | | **M** | **30.4 s** | **94.9 s** | **989 MB** | **14.18 MB** | **648 ms** | **2240 ms** | **16 MB** |
+| `image` 0.25.10 (driver) | 102 | L | 17.2 s | 56.7 s | 821 MB | 0.58 MB | 1.25 s | 1.23 s | 123 MB |
+| | | U | 6.2 s | 12.9 s | 649 MB | 6.26 MB | 36.87 s | 36.84 s | 124 MB |
+| | | **M** | **6.7 s** | **15.5 s** | **686 MB** | **1.66 MB** | **22.12 s** | **22.09 s** | **123 MB** |
 
-**Verifikasi.**
+Workload runtime: `bat` = highlight 15.8 MB source, `tokei` = hitung 3.720 file
+/ 1.18 juta baris, `image` = 6× blur + 2× resize pada 2048² piksel.
 
-| program | LLVM | upstream | M tanpa ifconv | M dengan ifconv |
-|---------|------|----------|----------------|-----------------|
-| `p7_branchy` (`if acc%7==0 { z^=acc }`) | 44 ms | 102 ms | 62.7 ms | **56 ms** |
-| `b1` (3 arah, arm murah) | 60.0 ms | – | 73.8 ms | **61.1 ms** |
-| `p8_minmax` (min-reduction) | 18 ms | 39 ms | 39.0 ms | 38.8 ms |
-| `b2` (kondisi nyaris selalu false) | 2.4 ms | – | 39.0 ms | 40.7 ms |
-| `v_full`/p1 (arm berisi `f as u64`) | 84 ms | 109 ms | 104.6 ms | 104.7 ms |
+**Semua backend menghasilkan output identik.** `bat`: 40/40 file `.rs` md5 sama,
+plus workload 15.8 MB md5 `60618db4`. `tokei`: md5 `84479aa6` untuk ketiganya.
+`image`: ketiganya mencetak `8018560249`.
 
-Jadi pass menutup sebagian besar gap mispredict pada arm murah (`w_mod`
-microbench 62 → 38 ms; `p7_branchy` 62 → 56 ms; `b1` 74 → 61 ms) dan **netral**
-pada arm mahal. Regresi kecil 4% hanya
-pada kondisi yang nyaris selalu false (b2) — di sana `cmove` menambah kerja di
-jalur hot tanpa menghilangkan mispredict. `b3` sudah ter-if-convert (`cmovb`)
-tetapi tetap jauh dari LLVM karena LLVM meng-autovektorisasi min-reduction
-(lihat 8.20).
+**Yang bertahan di repo besar (M vs U):**
+- Ukuran binary: **−23% (`bat`), −32% (`tokei`), −73% (`image`)**. Efek section
+  per fungsi (§8.25) tetap bekerja, dan makin besar untuk crate yang banyak
+  generik/monomorfisasinya.
+- Compile: M konsisten ~4-8% lebih lambat dari U (biaya pass), tapi tetap
+  **1.3-2.5× lebih cepat dari LLVM**.
+- Runtime: **1.25× (`bat`), 1.48× (`tokei`), 1.66× (`image`)** lebih cepat dari U.
 
-- `./y.sh test --sysroot clif`: **65 blok `test result: ok`, 0 failed**
-  (termasuk 1400 + 825 + 3011 core benches).
-- Keluaran p1–p6 identik dengan LLVM dan upstream.
-- Ukuran binary dan waktu compile praktis tidak berubah (pass hanya menyusun
-  ulang blok, tidak menambah instruksi).
+**Batas yang jujur: cg_clif tetap jauh lebih lambat dari LLVM pada kode
+komputasi Rust murni.** Pada `image`, U 36.9 s vs L 1.25 s (**30× lebih
+lambat**), dan M hanya memangkasnya jadi 22.1 s (**18× lebih lambat dari L**).
+Akar penyebabnya bukan pass saya, melainkan tidak adanya auto-vectorizer di
+Cranelift: LLVM memvektorisasi loop blur (`mulps`/`addps` di
+`filter_symmetric_column`/`filter_symmetric_row`), M menghasilkan **nol**
+instruksi packed-float. Bukti tambahan: `CG_CLIF_OPT_LEVEL` = `speed`,
+`speed_and_size`, atau `none` memberi runtime 5.38-5.52 s dan ukuran binary
+1.66-1.69 MB — praktis tidak berubah, karena knob itu tidak menyalakan
+vektorisasi.
 
-**Knob.** `CG_CLIF_NO_IFCONV=1` mematikan pass; waktu pass dilaporkan lewat
-`CG_CLIF_PASS_TIME` sebagai `if_convert`. Default **ON**.
+**Eksperimen kontrol** memastikan blur (bukan resize atau kode lain) yang
+menyebabkan gap: `blur` saja L 971 ms vs M 19.50 s (20×), `resize` saja L
+285 ms vs M 2.89 s (10×).
 
-### 8.23 Matriks tiga arah akhir (8 program, LLVM vs upstream vs modifikasi)
+**A/B memastikan gap ukuran bukan salah pass.** `bat` dibangun dengan semua
+pass dimatikan (`CG_CLIF_INLINE_MAX=0 CG_CLIF_INLINE_LEAF_MAX=0 CG_CLIF_UNROLL=0
+CG_CLIF_NO_STORE_FWD=1 CG_CLIF_NO_IFCONV=1`) menghasilkan 14.92 MB; dengan pass
+menyala 13.43 MB. Pass **memperkecil** binary 10%, jadi selisih 2× terhadap
+LLVM adalah warisan cg_clif (section per fungsi + model PIC), bukan regresi.
+Upstream pun lebih buruk di sini: 55.012 relokasi `R_X86_64_RELATIVE` vs M
+41.507 vs L 12.639, `.got` 197 KB (U) / 165 KB (M) / 12.5 KB (L).
 
-`bench/allaxes.sh` (RC=3, RR=5), wall/CPU dalam ms, RSS dalam MB, ukuran dalam
-byte. L = rustc+LLVM, U = cg_clif upstream, M = fork modifikasi.
+**Dua jebakan pengukuran yang ditemukan dan diperbaiki di harness:**
+1. Build hangat. Menghapus target dir *di luar* region terukur wajib; tanpa itu
+   rep ke-2/3 hanya mengenai cache cargo dan melaporkan 0.1 s — sempat membuat
+   tabel awal saya menyatakan compile 149 ms untuk `bat`.
+2. CPU proses yang sudah keluar. Menjumlahkan CPU hanya dari proses yang masih
+   hidup saat sampling menghilangkan CPU setiap `rustc` yang selesai di antara
+   dua sampel; hasilnya 15 s CPU untuk 86 s wall (mustahil). Perbaikan:
+   akumulasi delta per-PID. Validasi: 3 worker paralel 2 s → wall 2.05 s, CPU
+   5.95 s.
 
-| prog | Cwall L/U/M | Crss L/U/M | size L/U/M | Rwall L/U/M | Rrss L/U/M |
-|------|-------------|------------|------------|-------------|------------|
-| p1_arith | 103/81/81 | 106/108/109 | 4635232/5878688/4393872 | 81/108/**104** | 11/11/11 |
-| p2_mem | 262/127/137 | 133/132/132 | 4639888/5936880/4416496 | 16/159/**66** | 11/11/11 |
-| p3_calls | 103/89/90 | 116/117/118 | 4612368/5820872/4329000 | 37/116/**100** | 11/11/11 |
-| p4_simd | 111/95/112 | 117/118/118 | 4636096/5893112/4401888 | 56/160/**140** | 48/49/49 |
-| p5_inline | 89/81/80 | 105/107/107 | 4609368/5814440/4321024 | 58/896/**7** | 11/11/11 |
-| p6_scalar | 87/87/81 | 101/103/104 | 4609368/5814424/4321024 | 58/908/**7** | 11/11/11 |
-| p7_branchy | 90/85/83 | 105/107/108 | 4609520/5814536/4321000 | 43/105/**55** | 11/11/11 |
-| p8_minmax | 92/94/83 | 105/107/107 | 4609544/5814488/4320960 | 18/40/**39** | 11/11/11 |
-
-Ringkas lintas sumbu:
-
-- **Compile**: M ≈ U, keduanya jauh lebih cepat dari LLVM di p2 (137 vs 262 ms,
-  ~1.9×). RSS compile setara.
-- **Ukuran**: M ~5% lebih kecil dari LLVM dan ~25% lebih kecil dari U (berkat
-  `per_data_object_section`).
-- **Runtime**: M menutup hampir seluruh gap U→LLVM pada kernel scalar/inline
-  (p5/p6 896/908 → 7 ms, ~130× vs U) dan pada loop branchy murah (p7 105 → 55 ms,
-  LLVM 43 ms). Sisa gap murni kualitas codegen Cranelift (autovektorisasi p8,
-  fusi `sincos`/unroll-call p4, inlining penuh p2, rekursi→loop p3 — lihat 8.20).
-
-### 8.24 Validasi pada crate pihak ketiga nyata (`github.com/cipansor/crateworks`)
-
-Sampai 8.23 semua program uji adalah kernel sintetis. Untuk memastikan hasilnya
-bukan artefak mikrobenchmark, tiga crate nyata dari `crateworks` dibangun dan
-dijalankan dengan tiga backend. Semua crate ini murni Rust tanpa dependensi
-eksternal dan `#![forbid(unsafe_code)]`, jadi cocok untuk uji lintas backend.
-
-Harness: `extbench/extbench.sh` (compile lib + driver, RC=3; run, RR=5),
-`extbench/exttests.sh` (jalankan test suite milik crate). Tiap crate dikompilasi
-sebagai `--crate-type lib` dengan `-C opt-level=3 --edition 2024`, lalu driver
-kecil di-link dengan `--extern`. Argumen driver dipilih agar tiap run ~2–25 s.
-
-| crate | Cwall L/U/M (ms) | Ccpu L/U/M (ms) | Crss L/U/M (MB) | size L/U/M (byte) | Rwall L/U/M (ms) |
-|-------|------------------|-----------------|-----------------|-------------------|------------------|
-| openlocationcode | 432/247/255 | 599/317/332 | 142.4/140.5/141.2 | 4853894/6322818/4832554 | 2195/26347/16085 |
-| holidays-rs | 809/417/416 | 1708/612/620 | 187.3/166.3/169.3 | 6901646/7800264/6659200 | 8099/37160/23317 |
-| stdnum-rs | 3354/1505/1591 | 9237/2459/2813 | 283.6/263.1/267.7 | 9314804/10610242/9908194 | 1382/17261/9095 |
-
-Rasio kunci (L = rustc+LLVM, U = cg_clif upstream, M = fork modifikasi):
-
-| crate | compile wall M vs L | compile CPU M vs L | ukuran M vs U | ukuran M vs L | runtime M vs U | runtime M vs L |
-|-------|---------------------|--------------------|---------------|---------------|----------------|----------------|
-| openlocationcode | 1.69× lebih cepat | 1.80× lebih cepat | −23.6% | −0.4% | 1.64× lebih cepat | 7.33× lebih lambat |
-| holidays-rs | 1.94× lebih cepat | 2.75× lebih cepat | −14.6% | −3.5% | 1.59× lebih cepat | 2.88× lebih lambat |
-| stdnum-rs | 2.11× lebih cepat | 3.28× lebih cepat | −6.6% | +6.4% | 1.90× lebih cepat | 6.58× lebih lambat |
-
-Temuan:
-
-- **Compile**: M ~1.7–2.1× lebih cepat dari LLVM (wall) dan ~1.8–3.3× lebih
-  cepat (CPU), dengan peak RSS ~1–10% lebih rendah. M ≈ U (selisih ≤6%),
-  konsisten dengan 8.23: keunggulan compile adalah properti Cranelift, bukan
-  tambahan pass.
-- **Ukuran**: M selalu lebih kecil dari U (−7%…−24%) dan di dua dari tiga crate
-  juga lebih kecil dari LLVM (−0.4%, −3.5%); stdnum-rs +6.4% vs LLVM.
-- **Runtime**: M secara konsisten **1.6–1.9× lebih cepat dari U** pada ketiga
-  crate nyata — mengonfirmasi bahwa keunggulan pass (inliner, store-forwarding,
-  if-conversion) berlaku di kode produksi, bukan hanya kernel. Sisa gap ke LLVM
-  (2.9×–7.3×) sesuai 8.20: kualitas codegen Cranelift, bukan bug pass.
-- **RSS runtime**: identik (~10.7–10.8 MB) di ketiga backend; tidak ada
-  regresi memori.
-- **Korrekthesia**: ketiga driver menghasilkan output **identik** di L, U, M
-  (openlocationcode `18446744071467594188`, holidays-rs `22771057172600`,
-  stdnum-rs `4325649`). Test suite milik crate juga dijalankan dengan tiap
-  backend dan **semua lolos** (0 failed):
-
-| suite | L | U | M |
-|-------|---|---|---|
-| openlocationcode: reference / readme / fuzz | 6 / 1 / 4 ok | 6 / 1 / 4 ok | 6 / 1 / 4 ok |
-| holidays-rs: closest / readme / holidays_oracle | 1 / 1 / 1 ok | 1 / 1 / 1 ok | 1 / 1 / 1 ok |
-| stdnum-rs: readme | 3 ok | 3 ok | 3 ok |
-
-Catatan: crate `holidays-rs` memakai `crateworks` yang menargetkan `edition
-2024`/`rust-version 1.88`; sysroot clif yang dibangun dari toolchain
-`nightly-2026-11-17` memenuhi syarat ini tanpa perubahan.
-
-### 8.25 Inlining tier-`leaf`: tutup sebagian besar gap runtime nyata (LANDED)
-
-8.20 menutup dengan catatan bahwa probe hashbrown (p2) tidak bisa di-inline
-tanpa meledakkan ukuran. Investigasi lanjutan pada jalur `format!`/`Display`
-menemukan bahwa batas `MAX_CALLEE_INSTS = 64` menolak callee yang justru paling
-menguntungkan: helper **leaf** kecil yang dipanggil di dalam loop panas.
-
-**Akar masalah.** Pada probe `itoa` (jalur `format!`), callee berukuran 83
-instruksi CLIF — di atas ambang 64, jadi tetap *out-of-line* (`call ...itoa`)
-sementara LLVM meng-inline dan mengkhususukannya. Dua sebab ambang ini salah
-sasaran:
-
-1. Ukuran callee menghitung blok panic (`trap` + `call` ke `format_args`).
-   Blok itu *cold* dan tidak pernah dieksekusi di jalur sukses, tetapi membuat
-   callee tampak besar.
-2. Ambang `MAX_CALLEE_INSTS` seragam untuk semua callee. Callee leaf (tanpa
-   `call` sendiri) tidak bisa menarik callee lain, jadi meng-inline-nya tidak
-   bisa berantai — inilah yang membuat ambang lebih besar aman untuk leaf.
-
-**Perbaikan (`src/inliner.rs`, `src/tunables.rs`, `src/driver/aot.rs`).**
-Inliner kini memakai dua tingkat:
-
-- `MAX_CALLEE_INSTS = 64` (tetap) untuk callee non-leaf.
-- `MAX_LEAF_INSTS = 192` (`CG_CLIF_INLINE_LEAF_MAX`) untuk callee leaf.
-- Deteksi leaf (`is_leaf`) mengabaikan blok yang diakhiri `trap` (jalur panic),
-  sehingga `itoa` dihitung sebagai leaf.
-- Leaf mendapat anggaran pertumbuhan sendiri yang **ditambahkan** ke anggaran
-  biasa, karena badan loop panas sering kecil sehingga anggaran pertumbuhan
-  murni (50% dari pemanggil) akan menolak helper yang dipanggil tiap iterasi.
-- `CG_CLIF_INLINE_MAX=0` tetap berarti "matikan seluruh inlining" (termasuk tier
-  leaf), agar knob masih bisa dipakai membisect.
-
-**Hasil terisolasi (A/B: tier leaf mati vs hidup, `--reps 5`).**
-
-| crate | Rwall off→on (ms) | Δ runtime | size off→on (byte) | Δ size | Cwall off→on (ms) |
-|-------|-------------------|-----------|--------------------|--------|-------------------|
-| openlocationcode | 19461 → 14019 | **−28.0%** | 4799290 → 4788386 | −0.2% | 239 → 236 |
-| holidays-rs | 27872 → 22115 | **−20.7%** | 6630988 → 6606428 | −0.4% | 374 → 380 |
-| stdnum-rs | 11423 → 7819 | **−31.6%** | 9966018 → 9919314 | −0.5% | 1489 → 1541 |
-
-Perbaikan ini **Pareto**: runtime turun 21–32% sementara ukuran justru sedikit
-lebih kecil (meng-inline leaf menghapus prologue/epilogue call dan memungkinkan
-DCE lebih banyak) dengan biaya compile ≤3,5%.
-
-**Matriks tiga arah akhir pada crate nyata (RC=3, RR=5).**
-
-| crate | Cwall L/U/M (ms) | size L/U/M (byte) | Rwall L/U/M (ms) | Rrss L/U/M (MB) |
-|-------|------------------|-------------------|------------------|-----------------|
-| openlocationcode | 774/492/240 | 4853894/6322818/4788450 | 3995/26656/13945 | 10.5/10.6/10.5 |
-| holidays-rs | 718/347/384 | 6901646/7800264/6606512 | 8091/36922/22250 | 10.7/10.7/10.7 |
-| stdnum-rs | 3255/1403/1521 | 9314804/10610242/9919602 | 1405/17344/7710 | 10.5/10.5/10.5 |
-
-Dibanding 8.24 (sebelum tier leaf), runtime M vs U pada ketiga crate naik dari
-1,6–1,9× menjadi **1,7–2,2× lebih cepat** (1,91× / 1,66× / 2,25×), dan M vs L pada openlocationcode
-membaik dari 7,3× menjadi 3,5× lebih lambat (dari 16085 → 13945 ms).
-
-**Verifikasi.** `./y.sh test --sysroot clif` → **55 suite `test result: ok`,
-0 failed** (termasuk 3011 coretests dan 1355 std tests). Ketiga driver crate
-menghasilkan output **identik** di L, U, dan M. Seluruh std dibangun ulang
-dengan pass aktif.
+**LTO.** `bat` dan `tokei` menyetel `lto = true`/`"thin"` di profil rilis.
+cg_clif menolaknya (`error: LTO is not supported by rustc_codegen_cranelift`),
+jadi LTO dimatikan untuk **ketiga** backend agar yang dibandingkan backend,
+bukan profil build.
