@@ -79,7 +79,7 @@ fn is_leaf(body: &ir::Function) -> bool {
 }
 
 pub(crate) struct CguInliner<'a> {
-    bodies: &'a FxHashMap<u32, ir::Function>,
+    bodies: &'a CguBodies,
     self_id: u32,
     inlined: FxHashMap<u32, usize>,
     budget: usize,
@@ -89,12 +89,49 @@ pub(crate) struct CguInliner<'a> {
     max_leaf_insts: usize,
 }
 
-impl<'a> CguInliner<'a> {
-    pub(crate) fn new(
-        bodies: &'a FxHashMap<u32, ir::Function>,
-        self_id: u32,
-        caller: &ir::Function,
+/// The callee bodies of one codegen unit, with the facts the inliner needs about
+/// each one computed once at collection time rather than per call site.
+///
+/// `is_leaf` walks every instruction of a body, and the inliner asks about the
+/// same callee from every call site that names it. On a large crate that turned
+/// into the same scan repeated hundreds of times per function; measuring showed
+/// the scan, not the inlining itself, as the dominant cost of the pass.
+#[derive(Default)]
+pub(crate) struct CguBodies {
+    funcs: FxHashMap<u32, CguBody>,
+}
+
+struct CguBody {
+    func: ir::Function,
+    is_leaf: bool,
+}
+
+impl CguBodies {
+    /// Collect every final function of the codegen unit no larger than `max_insts`.
+    ///
+    /// Only small, final (non-interposable) callees are kept, to bound memory and
+    /// to avoid changing the semantics of separately compiled symbols.
+    pub(crate) fn collect<'f>(
+        funcs: impl Iterator<Item = (u32, &'f ir::Function)>,
+        max_insts: usize,
     ) -> Self {
+        let mut out = FxHashMap::default();
+        for (id, func) in funcs {
+            if func.dfg.num_insts() > max_insts {
+                continue;
+            }
+            out.insert(id, CguBody { func: func.clone(), is_leaf: is_leaf(func) });
+        }
+        CguBodies { funcs: out }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.funcs.is_empty()
+    }
+}
+
+impl<'a> CguInliner<'a> {
+    pub(crate) fn new(bodies: &'a CguBodies, self_id: u32, caller: &ir::Function) -> Self {
         let caller_insts = caller.dfg.num_insts();
         // `CG_CLIF_INLINE_MAX=0` keeps its documented meaning: inlining is off,
         // including the leaf tier, so the knob can still bisect it away.
@@ -165,15 +202,17 @@ impl Inline for CguInliner<'_> {
         if id == self.self_id || self.inlined.get(&id).is_some_and(|&n| n >= self.max_uses) {
             return InlineCommand::KeepCall;
         }
-        let bodies = self.bodies;
-        let Some(body) = bodies.get(&id) else {
+        let bodies = &self.bodies.funcs;
+        let Some(entry) = bodies.get(&id) else {
             return InlineCommand::KeepCall;
         };
+        let body = &entry.func;
         let size = body.dfg.num_insts();
         // Leaves get the larger cap and their own budget; a leaf cannot pull in
         // further callees, so the extra instructions are pure straight-line code
-        // rather than the start of a call-graph expansion.
-        let leaf = is_leaf(body);
+        // rather than the start of a call-graph expansion. Whether a body is a
+        // leaf is decided once, when the CGU's bodies are collected.
+        let leaf = entry.is_leaf;
         let (cap, budget) = if leaf {
             (self.max_leaf_insts, self.leaf_budget)
         } else {

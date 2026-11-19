@@ -7,7 +7,6 @@ use cranelift_module::ModuleError;
 use rustc_ast::InlineAsmOptions;
 use rustc_attr_ir::lang_items::LangItem;
 use rustc_codegen_ssa::base::is_call_from_compiler_builtins_to_upstream_monomorphization;
-use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::profiling::SelfProfilerRef;
 use rustc_errors::DiagCtxtHandle;
 use rustc_index::IndexVec;
@@ -158,7 +157,7 @@ pub(crate) fn compile_fn(
     module: &mut dyn Module,
     debug_context: Option<&mut DebugContext>,
     global_asm: &mut String,
-    bodies: &FxHashMap<u32, Function>,
+    bodies: &crate::inliner::CguBodies,
     codegened_func: CodegenedFunction,
 ) {
     let _timer = prof.generic_activity_with_arg("compile function", &*codegened_func.symbol_name);

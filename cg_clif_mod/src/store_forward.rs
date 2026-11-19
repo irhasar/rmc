@@ -43,6 +43,13 @@ pub(crate) fn run(func: &mut ir::Function, endianness: ir::Endianness) {
             return;
         }
     }
+    // A function with no stack slot has no aggregate round-trip to forward and no
+    // dead store to drop: both halves of the pass key on a slot. Bailing before
+    // `analyze` skips a full instruction walk over every such function, which on
+    // a large crate is most of them (8843 functions, ~45 us each).
+    if func.sized_stack_slots.is_empty() && func.dynamic_stack_slots.is_empty() {
+        return;
+    }
     let Bases { private_slots: private, ptr_bases, loaded } = analyze(func);
     let t1 = std::time::Instant::now();
     // Nothing the pass can track: no private slot and no non-escaping pointer
@@ -506,6 +513,11 @@ fn reverse_postorder(
 /// load. Because the slot cannot be observed from outside, such a store has no
 /// effect.
 fn drop_dead_stores(func: &mut ir::Function, private: &FxHashSet<StackSlot>) {
+    // Every store this pass can prove dead targets a private slot, so with none
+    // the scan below would find nothing to remove.
+    if private.is_empty() {
+        return;
+    }
     // Reads bucketed by slot: a store only has to be compared against the reads
     // of its own slot, not against every load in the function.
     let mut reads: FxHashMap<StackSlot, Vec<(i64, i64)>> = FxHashMap::default();

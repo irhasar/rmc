@@ -231,21 +231,28 @@ fn compile_cgu(
         let mut cached_context = Context::new();
 
         // Collect the bodies of small functions in this codegen unit so they can be inlined into
-        // their callers. Only small, final (non-interposable) callees are cloned, to keep memory
+        // their callers. Only small, final (non-interposable) callees are collected, to keep memory
         // use bounded and to avoid changing the semantics of separately compiled symbols. The
-        // bound is the larger of the two caps so a leaf-only body is still collected.
+        // bound is the larger of the two caps so a leaf-only body is still collected. Each body's
+        // leaf-ness is computed here, once, instead of on every call site that names it.
         let bodies = crate::passtime::time(crate::passtime::COLLECT, || {
             let collect_max =
                 crate::inliner::max_leaf_insts().max(crate::inliner::max_callee_insts());
-            aot_module
-                .codegened_functions
-                .iter()
-                .filter(|f| {
-                    f.func.dfg.num_insts() <= collect_max
-                        && aot_module.module.declarations().get_function_decl(f.func_id).linkage.is_final()
-                })
-                .map(|f| (f.func_id.as_u32(), f.func.clone()))
-                .collect::<FxHashMap<_, _>>()
+            crate::inliner::CguBodies::collect(
+                aot_module
+                    .codegened_functions
+                    .iter()
+                    .filter(|f| {
+                        aot_module
+                            .module
+                            .declarations()
+                            .get_function_decl(f.func_id)
+                            .linkage
+                            .is_final()
+                    })
+                    .map(|f| (f.func_id.as_u32(), &f.func)),
+                collect_max,
+            )
         });
 
         for codegened_func in aot_module.codegened_functions {
