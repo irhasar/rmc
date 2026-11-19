@@ -243,6 +243,19 @@ Add new programs under `bench/progs/` so they are picked up automatically.
 - Need `rust-src` and `llvm-tools`. `$HOME/.cargo/bin` on PATH.
 - Build: `build.sh` → `cg_clif_mod/dist/bin/rustc-clif`.
 - Rebuilding Cranelift std takes ~1–2 min incremental.
+- **The toolchain is not always present.** Some sandbox restarts come back with
+  no `rustc`, `cargo`, `rustup`, or `$HOME/.cargo` at all (`find / -name rustc`
+  returns nothing), while the prebuilt `dist/` trees survive. Measurements that
+  need a fresh `rustc` then cannot be reproduced; the prebuilt binaries under
+  `cg_clif_{mod,upstream}/dist/bin/rustc-clif` still run. Check this before
+  planning a rebuild, and read numbers off `bench/out/` artifacts instead
+  (`stat -c%s` per program sums to the same totals the report cites).
+- Git remotes may prompt for credentials and hang for the full timeout. Push with
+  an explicit token URL and `-c credential.helper=''` rather than letting the
+  prompt block; then `git update-ref refs/remotes/origin/<branch> <sha>` to keep
+  the local remote-tracking ref honest, since `git fetch` will not refresh it.
+- API writes to PRs fail with `Resource not accessible by integration` under the
+  injected `GITHUB_TOKEN`; a user-supplied PAT is required for `PATCH /pulls/N`.
 
 ## Key facts learned
 - Cranelift is **Apache-2.0 WITH LLVM-exception**; forking/reworking is fine.
