@@ -26,9 +26,17 @@
 - **Tests**: `./y.sh test --sysroot clif` -> 55 suites `test result: ok`,
   0 failed (incl. 3011 core benches, 1355 std). Driver outputs identical
   across L/U/M. Full std rebuilt with the pass active.
-- REPORT.md section 8.25 documents it. Fork commits: see below.
+- REPORT.md section 8.25 documents it. Fork commits: `163ab57` (code) + `caecf4f`
+  (docs).
+- **Push BLOCKED (again)**: the local commit `e90bf60` on
+  `replace-main-with-cgclif-experiments` could not be pushed. Every available
+  credential is rejected: `git push` returns 403 for the GITHUB_TOKEN and
+  OH_GIT_CREDENTIAL_ACCESS_TOKEN_GITHUB identities, the git credential helper
+  fails auth, and the REST API returns `403 Resource not accessible by
+  integration` on ref create/update (the app token is read-only for this repo).
+  PR #10 head stays at `06599ad` until a `repo`-scoped PAT is supplied.
 
-## Session (2026-11-18, latest) — if-conversion diamond → select/cmove (LANDED, `7374000`)
+## Session (2026-11-18) — if-conversion diamond → select/cmove (LANDED, `7374000`)
 - New pass `src/if_convert.rs`: collapses a short, side-effect-free two-way
   diamond (`brif` head -> then/else -> common join) into a `select` in the
   head, which Cranelift lowers to `cmove`. Runs **before** `unroll` in
