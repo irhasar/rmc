@@ -809,11 +809,11 @@ plus workload 15.8 MB md5 `60618db4`. `tokei`: md5 `84479aa6` untuk ketiganya.
   per fungsi (§8.25) tetap bekerja, dan makin besar untuk crate yang banyak
   generik/monomorfisasinya.
 - Compile: M konsisten ~4-8% lebih lambat dari U (biaya pass), tapi tetap
-  **1.3-2.5× lebih cepat dari LLVM**.
-- Runtime: **1.25× (`bat`), 1.48× (`tokei`), 1.66× (`image`)** lebih cepat dari U.
+  **1.4-2.6× lebih cepat dari LLVM**.
+- Runtime: **1.25× (`bat`), 1.48× (`tokei`), 1.67× (`image`)** lebih cepat dari U.
 
 **Batas yang jujur: cg_clif tetap jauh lebih lambat dari LLVM pada kode
-komputasi Rust murni.** Pada `image`, U 36.9 s vs L 1.25 s (**30× lebih
+komputasi Rust murni.** Pada `image`, U 36.9 s vs L 1.25 s (**29× lebih
 lambat**), dan M hanya memangkasnya jadi 22.1 s (**18× lebih lambat dari L**).
 Akar penyebabnya bukan pass saya, melainkan tidak adanya auto-vectorizer di
 Cranelift: LLVM memvektorisasi loop blur (`mulps`/`addps` di
