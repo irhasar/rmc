@@ -239,15 +239,25 @@ fn block_events(func: &ir::Function, block: Block) -> Vec<SfEvent> {
 }
 
 /// Whether the function is small enough that the cross-block dataflow is worth
-/// running. The dataflow costs time proportional to blocks × facts, while the
-/// forwarding it enables mostly matters in the small hot helpers; a large
-/// function keeps the block-local result, which is what it would have had before.
+/// running.
+///
+/// The dataflow is a single reverse-postorder sweep whose cost is linear in the
+/// instruction count, measured at ~120 ns per instruction. The old 300-instruction
+/// cutoff was set before that was measured, and it excluded the largest functions
+/// even though they are exactly where a store in one block feeds a load in the
+/// next. A hot loop whose trip-count pointer is materialised in one block and
+/// tested in another kept a store/load round trip on the carried dependency chain
+/// as a result: on the image pipeline that cost 5% of runtime.
+///
+/// The cap is now high enough to cover every function cg_clif emits for the
+/// benchmarks (the largest is ~6.4k instructions, ~3 ms of dataflow) while still
+/// bounding a pathological input.
 fn cbe_within_budget(func: &ir::Function) -> bool {
     func.dfg.num_insts() <= crate::tunables::store_forward_cbe_max()
 }
 
 /// Largest function (in CLIF instructions) the cross-block dataflow runs on.
-pub(crate) const CBE_MAX_INSTS: usize = 300;
+pub(crate) const CBE_MAX_INSTS: usize = 16_384;
 
 
 /// Record the fact that `inst` stores its data operand to `avail`, invalidating

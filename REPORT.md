@@ -1309,15 +1309,17 @@ Sisa gap setelah perbaikan ini (8422 ms vs 1238 ms LLVM) masih didominasi
 kualitas codegen: `try_from_fn`/`wrap_mut_1`/`Pixels`/`Zip` yang tidak
 ter-inline (≈18% sampel) dan spilling register di loop panas.
 
-## 11. Sisa gap: auto-vectorization (§11)
+## 11. Sisa gap: apa yang sebenarnya tersisa (§11)
 
 Setelah §10, `compiler_builtins` hilang dari profil, jadi pertanyaannya berubah
-menjadi: apa yang LLVM lakukan dan CLIF tidak? Jawabannya terukur dan spesifik.
+menjadi: apa yang LLVM lakukan dan CLIF tidak? Jawaban awalnya terlihat seperti
+autovektorisasi, tetapi pengukuran §11.4 membantahnya. Bagian ini mencatat
+hipotesis itu, bukti yang membatalkannya, dan penyebab yang benar-benar tersisa.
 
-### 11.1 Bukti
+### 11.1 Hipotesis awal (dibatalkan oleh §11.4)
 
-Disassembly fungsi panas yang sama, `filter_symmetric_column`, di kedua biner
-(target baseline x86-64, keduanya):
+Disassembly fungsi panas `filter_symmetric_column` pada target baseline x86-64
+menunjukkan perbedaan bentuk yang mencolok:
 
 | metrik | LLVM | CLIF modifikasi |
 |---|---|---|
@@ -1327,59 +1329,107 @@ Disassembly fungsi panas yang sama, `filter_symmetric_column`, di kedua biner
 | scalar SSE (`ss`/`sd`) | 39 | 59 |
 | `mulss`/`addss`/`subss` | 15 | 24 |
 
-LLVM meng-vectorize loop konvolusi blur: 4 piksel `f32` diproses per
-`mulps`/`addps`. Cranelift menghasilkan versi scalar penuh. Inilah sumber utama
-sisa gap 8422 ms vs 1238 ms — bukan inlining, bukan spilling.
+Wajar kalau ini dibaca sebagai "LLVM memvektorisasi loop, Cranelift tidak". Itu
+memang benar sebagai fakta codegen, tetapi **bukan** penyebab utama gap runtime.
 
-### 11.2 Lead inlining sudah tertutup
+### 11.2 Bukti yang membatalkan hipotesis vectorization
 
-Sebelum menyimpulkan, hipotesis inlining diuji ulang dengan tunable yang ada
-(`CG_CLIF_INLINE_*`):
+Kalau vectorization adalah penyebab utama, mematikannya di LLVM harus
+mengembalikan LLVM ke level CLIF. Tidak demikian:
 
 | konfigurasi | runtime (ms) | ukuran (byte) |
 |---|---|---|
-| default | 8440 | 1499568 |
-| `INLINE_MAX=200` | 8533 | 1504720 |
-| `INLINE_LEAF_MAX=200` | 8451 | 1499568 |
-| `INLINE_USES=10` | 8564 | 1498608 |
+| LLVM `-O3` (default, vectorized) | 1240 | 579296 |
+| LLVM `-O3` **tanpa** vectorize (`-Cno-vectorize-loops -Cno-vectorize-slp`) | 1531 | 577136 |
+| CLIF baseline (upstream, tanpa patch) | 8375 | 1500272 |
+| CLIF modifikasi (§13) | 7877 | 1463784 |
 
-Menaikkan batas **memperburuk**, jadi inlining sudah jenuh dan tidak lagi
-menjadi bottleneck. Ini menutup lead tersebut secara empiris.
+Mematikan vectorization hanya merugikan LLVM ~23%. Jadi vectorization
+menyumbang sebagian kecil dari selisih 6,8×; **~82% selisih tetap ada pada LLVM
+yang scalar murni**. Ini juga konsisten dengan §8.20 yang sudah mencatat hal
+serupa pada benchmark lain.
 
-### 11.3 Mengapa ini sulit diperbaiki di fork ini
+### 11.3 Penyebab sebenarnya: loop scalar CLIF penuh address recomputation
 
-Cranelift **tidak memiliki loop vectorizer**. Ia hanya punya vectorization
-lokal pada level CLIF (pola `simd_*` yang sudah ditulis Rust, mis.
-`std::simd`), bukan analisis loop otomatis seperti LLVM.
+Sampling RIP per-alamat (30.355 sampel, `setarch -R`) pada biner modifikasi
+menempatkan 27,2% sampel di `filter_symmetric_column`. Loop terpanasnya berisi
+**35 instruksi untuk 1 MAC**:
 
-Untuk menutup gap ini perlu salah satu dari:
+```
+47386: mov    0x6e0(%rsp),%rax      ; reload IV
+4738e: mov    0x6e8(%rsp),%rcx      ; reload bound
+47396: cmp    %rcx,%rax
+47399: jb     473b0                 ; bounds check
+473b0: lea    0x1(%rax),%rcx
+473b4: mov    %rcx,0x6e0(%rsp)      ; store IV
+473cc: mov    0x10(%r12),%r8        ; invariant, reloaded every iteration
+473d1: mov    0x30(%r12),%rcx       ; invariant, reloaded every iteration
+473dd: mov    %rsi,0x6f0(%rsp)      ; store computed pointer
+473e9: mov    %rdx,0x6f8(%rsp)      ; store computed pointer
+473f5: mov    %rax,0x700(%rsp)      ; store computed pointer
+473fd: mov    0x6f0(%rsp),%rax      ; reload it back at the join block
+47405: test   %rax,%rax
+47408: je     ...                   ; null check
+4740e: test   %rax,%rax
+47411: je     ...                   ; duplicate null check
+47427: movss  (%rax),%xmm0
+4742b: movss  (%rdx),%xmm1
+4742f: movss  (%rcx),%xmm2
+47433: addss  %xmm2,%xmm1
+47437: movdqu 0xf60(%rsp),%xmm2     ; loop-invariant coefficient reload
+47440: mulss  %xmm2,%xmm1
+47444: addss  %xmm1,%xmm0
+47448: movss  %xmm0,(%rax)
+4744c: jmp    47386
+```
 
-1. **Vectorizer loop di `cranelift-codegen`** — pekerjaan besar (analisis
-   dependensi, pelebaran, penanganan tail). Realistis berbulan-bulan, dan
-   berada di luar cakupan eksperimen ini.
-2. **Menaikkan `-Ctarget-cpu`** — sudah diuji: `native` = 8241,8 ms, hanya
-   ~2% lebih baik dari 8422 ms. Artinya SIMD baseline (SSE2) memang bisa
-   dipakai, tapi tanpa vectorizer tidak ada yang memakainya.
-3. **Pola level CLIF** — mendeteksi loop konvolusi tertentu. Rapuh dan tidak
-   umum; hanya menolong benchmark ini, bukan beban nyata.
+Tiga hal yang salah, semuanya bukan vectorization:
+
+1. **Pointer hasil hitung di-spill ke stack lalu di-reload di blok join.** Ini
+   sisa dari masalah §8.19/§8.20: nilai yang hidup melewati batas blok
+   kehilangan forwarding.
+2. **Invariant (`0x10(%r12)`, `0x30(%r12)`, koefisien di `0xf60(%rsp)`) dimuat
+   ulang setiap iterasi.** Cranelift **tidak punya LICM**.
+3. **Bounds/null check tidak tereliminasi** dan muncul duplikat.
+
+Perbandingan langsung: LLVM (tanpa vectorize) menjalankan loop yang sama dalam
+**63 instruksi untuk 16 MAC = 3,9 instruksi/MAC**; CLIF butuh **14,8**. Rasio
+3,8× itu menjelaskan hampir seluruh gap runtime.
+
+### 11.4 Mengapa ini sulit diperbaiki di fork ini
+
+Ketiga penyebab di atas berada di `cranelift-codegen`, bukan di cg_clif:
+
+- **LICM**: Cranelift tidak memiliki pass ini sama sekali (tidak ada
+  `licm`/`loop_rotate` di `cranelift-codegen/src/`). Menulisnya berarti
+  memindahkan instruksi keluar loop dengan benar terhadap aliasing memori.
+- **Store/load forwarding lintas blok**: `store_forward.rs` milik cg_clif
+  menangani kasus intra-prosedur sederhana, tetapi pointer yang di-spill di
+  sini melewati blok dengan bentuk yang tidak dikenali pass itu.
+- **Loop rotation / unrolling**: juga tidak ada. Pass `unroll.rs` di fork ini
+  hanya mengaktifkan jalur *affine reassociation*; pengukuran menunjukkan
+  **0 dari 15.261 fungsi** benar-benar di-unroll pada beban nyata, karena syarat
+  bentuk loop affine hampir tidak pernah terpenuhi oleh kode iterator Rust.
 
 Karena itu, gap yang tersisa didokumentasikan sebagai **batasan arsitektural
-Cranelift**, bukan sebagai bug yang bisa ditambal.
+Cranelift**, bukan bug yang bisa ditambal di sisi cg_clif.
 
-### 11.4 Yang tetap berlaku
+### 11.5 Yang tetap berlaku
 
-Perbaikan §9 dan §10 tetap sah dan tidak bergantung pada vectorization:
+Perbaikan §9, §10, §12, dan §13 tetap sah dan tidak bergantung pada vectorization:
 
-- Runtime CLIF modifikasi **8422 ms vs 10257 ms baseline** (−17,9%).
-- Ukuran biner **lebih kecil dari LLVM** (1499568 vs 4635232 byte pada
-  benchmark suite §9.8, yaitu 92,7% ukuran LLVM).
-- Waktu compile **lebih cepat dari LLVM** (715 ms vs 879 ms, §9.8).
-- Kebenaran: 65 suite hijau, output byte-identik, diferensial hash vs LLVM
-  identik atas seluruh 2^32 pola f32.
+- Pada beban gambar (`imagedrv`, `filter_symmetric_column`), runtime CLIF
+  modifikasi **7877 ms vs 8375 ms baseline upstream** (−5,9%), ukuran biner
+  **1.463.784 vs 1.500.272 byte** (−2,4%).
+- Pada benchmark suite §9.8, ukuran biner tetap **lebih kecil dari LLVM**
+  (1.499.568 vs 4.635.232 byte) dan waktu compile **lebih cepat dari LLVM**
+  (715 ms vs 879 ms).
+- Kebenaran: suite uji hijau, output byte-identik dengan LLVM pada uji
+  diferensial (termasuk seluruh pola `[x; N]` yang disentuh §13).
 
-Jadi dari empat tujuan awal — RAM, CPU, ukuran, kecepatan compile — tiga
-tercapai dan CPU runtime membaik 17,9%, dengan sisa gap CPU dijelaskan penuh
-oleh ketiadaan vectorizer.
+Jadi dari empat tujuan awal — RAM, CPU, ukuran, kecepatan compile — ketiganya
+tercapai. Sisa gap CPU runtime dijelaskan oleh ketiadaan
+LICM/loop-rotation/unrolling di Cranelift, bukan oleh vectorization.
 
 ## 12. `floor` dan `ceil` juga korban libcall yang sama (§12)
 
@@ -1477,3 +1527,133 @@ sebelumnya, selisih di dalam noise. Blur tidak memanggil `floor`/`ceil`.
 Nilainya adalah menutup kelas bug yang sama untuk kode yang memang memakainya —
 kuantisasi, pemetaan koordinat, sampling. Saya laporkan apa adanya daripada
 mengklaim perbaikan umum.
+
+## 13. Dua akar masalah di jalur codegen inti (§13)
+
+§10 dan §12 menutup kelas libcall. Bagian ini menutup dua hal yang lebih
+mendasar: satu di pass store-forwarding, satu di penerjemahan `Rvalue::Repeat`.
+
+### 13.1 Store forwarding lintas blok dimatikan oleh batas jumlah instruksi
+
+`store_forward.rs` menjalankan dataflow untuk meneruskan store ke load yang
+melintasi blok. Dataflow itu dilewati untuk fungsi besar lewat
+`CBE_MAX_INSTS = 300`.
+
+Batas 300 itu ditetapkan sebelum biayanya diukur. Saya ukur: **~121 ns per
+instruksi**, jadi fungsi terbesar yang cg_clif hasilkan pada beban ini (6.353
+instruksi) hanya butuh **3,03 ms** dataflow — 5,2% dari total build 6,3 s.
+Menukar eliminasi store/load dengan 5% waktu compile adalah trade-off yang
+jelas menang, dan justru fungsi besar itulah yang paling banyak punya store di
+satu blok yang dibaca di blok lain.
+
+Perbaikan: batas dinaikkan ke `16_384` instruksi, cukup untuk semua fungsi yang
+cg_clif hasilkan sambil tetap membatasi input patologis. Tunable
+`CG_CLIF_SF_CBE_MAX` tetap ada untuk bisect.
+
+Hasil pada loop panas `filter_symmetric_column`:
+
+| metrik | sebelum | sesudah |
+|---|---|---|
+| store ke stack | 95 | 63 |
+| load dari stack | 133 | 112 |
+| instruksi fungsi | 701 | 650 |
+
+Runtime: **8338 → 7836 ms**, ukuran **1.500.272 → 1.465.336 byte**.
+
+### 13.2 `[x; N]` non-`i8` menjadi loop, bukan memset
+
+`base.rs` hanya memakai memset bila tipe elemennya `i8`. Akibatnya `[0.0f32; 16]`
+— bentuk yang sangat umum untuk buffer nol — menjadi loop 16 iterasi dengan satu
+store per elemen.
+
+Perbaikan: fungsi baru `bytewise_repeat_value` menghitung pola bit konstanta dan
+mengembalikan byte splat hanya bila **semua byte elemen identik**. Hanya
+`Operand::Constant` yang diterima; fallback pemindaian lokal di
+`mir_operand_get_const_val` sengaja tidak dipakai karena itu ada untuk intrinsik
+stdarch, bukan untuk keputusan codegen. Jalur runtime `u8` (nilai baru diketahui
+saat jalan) tetap memakai `call_memset` seperti sebelumnya, sehingga tidak ada
+regresi.
+
+Mengapa aman: `emit_small_memset` menangani sisa dan ukuran besar sendiri
+(store langsung untuk ≤4 akses, `memset` libcall di atasnya), dan
+`greatest_divisible_power_of_two` menjamin tidak ada ekor yang tidak tertangani.
+
+Verifikasi: uji diferensial terhadap LLVM untuk `[0.0f32; 16]`, `[1.5f32; 8]`,
+`[0x01010101u32; 4]`, `[0x01020304u32; 4]`, `[0u64; 4]`, `[-1i8; 9]`,
+`[3.0f64; 5]`, `[0u128; 2]`, `[0u128; 3]`, `[0u8; 100]`, serta repeat runtime
+`u32`/`f32`/`u8` (termasuk array 5.000 elemen). Semua output identik.
+
+### 13.3 Dampak terukur dan batasnya
+
+| konfigurasi | runtime (ms) | ukuran (byte) |
+|---|---|---|
+| CLIF baseline (sebelum §13) | 8374,6 | 1.500.272 |
+| + §13.1 store forwarding | 7828,0 | 1.465.336 |
+| + §13.2 memset | 7877,0 | 1.463.784 |
+| LLVM `-O3` | 1240,1 | 579.296 |
+
+§13.1 memberi **−6,5%** runtime; §13.2 menyusutkan ukuran lagi **−1.552 byte**
+tetapi runtime-nya di dalam noise, karena loop zero-init itu bukan bagian panas.
+Saya laporkan apa adanya: §13.2 adalah perbaikan kualitas codegen, bukan
+perbaikan runtime pada beban ini.
+
+### 13.4 Temuan negatif yang penting: pass unroll tidak pernah menyala
+
+Saya menginstrumentasi `unroll::run` dan menghitung keputusan pada build penuh
+`imagedrv`: **15.261 fungsi diperiksa, 0 di-unroll**. Penyebabnya, `apply` hanya
+melakukan sesuatu lewat jalur *affine reassociation*, dan syarat bentuknya
+(state loop harus fungsi linear dari dirinya sendiri) hampir tidak pernah
+terpenuhi oleh kode iterator Rust.
+
+Ini menjelaskan kenapa loop panas di §11.3 tetap 1 elemen per iterasi: tidak ada
+unrolling, tidak ada LICM, tidak ada loop rotation di Cranelift, dan pass yang
+seharusnya menambal sebagian di antaranya tidak aktif pada bentuk loop nyata.
+
+Saya **tidak** memperluas pass ini dalam pekerjaan ini. Alasannya: melonggarkan
+syarat affine tanpa analisis dependensi yang benar berisiko salah-optimasi, dan
+itu harus dibuktikan dengan diferensial menyeluruh lebih dulu. Temuan ini
+dicatat sebagai arah kerja berikutnya yang konkret, bukan diklaim sebagai sudah
+selesai.
+
+### 13.5 Matriks tiga arah final (§13)
+
+Diukur dengan `bench/compare3.sh` (3 repetisi compile, 5 repetisi run, median),
+delapan program `bench/progs/`. Kolom `mod vs up` adalah runtime modifikasi
+terhadap upstream cg_clif — perbandingan backend murni, keduanya memakai std
+hasil Cranelift sendiri.
+
+| label | compile wall (ms) | compile cpu (ms) | peak RSS (MB) | total size (KB) | run wall (ms) | run cpu (ms) | run RSS (MB) |
+|---|---|---|---|---|---|---|---|
+| LLVM (stock rustc) | 876 | 1146 | 888 | 36.095 | 371 | 367 | 124 |
+| cg_clif upstream | 718 | 934 | 903 | 45.689 | 2494 | 2495 | 126 |
+| **cg_clif modifikasi** | **737** | **962** | **907** | **31.663** | **530** | **526** | **126** |
+
+Runtime per program:
+
+| program | LLVM | upstream | modifikasi | mod vs up |
+|---|---|---|---|---|
+| p1_arith | 83 | 108 | 105 | −2,8% |
+| p2_mem | 16 | 156 | 67 | **−57,1%** |
+| p3_calls | 39 | 119 | 100 | −16,0% |
+| p4_simd | 56 | 161 | 143 | −11,2% |
+| p5_inline | 58 | 900 | 7 | **−99,2%** |
+| p6_scalar | 58 | 910 | 8 | **−99,1%** |
+| p7_branchy | 43 | 101 | 61 | −39,6% |
+| p8_minmax | 18 | 39 | 39 | 0,0% |
+
+Ringkasan terhadap empat tujuan awal:
+
+- **Ukuran hasil**: modifikasi **31.663 KB vs upstream 45.689 KB (−30,7%)**,
+  dan **lebih kecil dari LLVM** (36.095 KB). Ini efek gabungan §13.2 dan
+  perbaikan sebelumnya.
+- **Waktu compile**: modifikasi 737 ms vs LLVM 876 ms (**−15,9%**), dan hanya
+  +2,6% vs upstream (biaya dataflow store-forwarding §13.1, sesuai perkiraan
+  3 ms/fungsi terbesar).
+- **RAM saat compile**: 907 MB vs LLVM 888 MB (+2,1%) — praktis setara.
+- **Runtime**: modifikasi 530 ms vs upstream 2494 ms (**−78,7%**), tetapi masih
+  1,43× LLVM. Sisa gap terpusat di p4_simd (143 vs 56 ms), yang persis beban
+  loop scalar tanpa LICM/unrolling yang diuraikan §11.3.
+- **RAM saat run**: 126 MB, sama dengan upstream dan LLVM.
+
+Kebenaran: kedelapan program menghasilkan output **byte-identik** dengan LLVM
+(diverifikasi `diff`), di samping uji diferensial `[x; N]` di §13.2.

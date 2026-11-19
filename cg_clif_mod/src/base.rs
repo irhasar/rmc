@@ -677,6 +677,31 @@ fn codegen_fn_body(fx: &mut FunctionCx<'_, '_, '_>, start_block: Block) {
     }
 }
 
+/// The byte to splat when repeating `operand` into an array is equivalent to a
+/// memset, i.e. when every byte of the element has the same value.
+///
+/// Returns `None` for non-constant operands and for constants whose bytes differ,
+/// so the caller keeps the generic per-element loop in those cases. Only a direct
+/// `Operand::Constant` is considered: that is the form `[0.0f32; 16]` takes, and
+/// the local-scanning fallback in [`crate::constant::mir_operand_get_const_val`]
+/// exists for stdarch intrinsics, not for codegen decisions.
+fn bytewise_repeat_value<'tcx>(
+    fx: &mut FunctionCx<'_, '_, 'tcx>,
+    operand: &Operand<'tcx>,
+) -> Option<u8> {
+    let Operand::Constant(const_) = operand else { return None };
+    let layout = fx.layout_of(fx.monomorphize(operand.ty(&fx.mir.local_decls, fx.tcx)));
+    if !matches!(layout.ty.kind(), ty::Int(_) | ty::Uint(_) | ty::Float(_) | ty::Bool | ty::Char) {
+        return None;
+    }
+    let (const_val, _) = crate::constant::eval_mir_constant(fx, const_);
+    let bits = const_val.try_to_scalar_int()?.to_bits(layout.size);
+    let bytes = bits.to_le_bytes();
+    let bytes = &bytes[..layout.size.bytes() as usize];
+    let first = *bytes.first()?;
+    bytes.iter().all(|&b| b == first).then_some(first)
+}
+
 fn codegen_stmt<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, cur_block: Block, stmt: &Statement<'tcx>) {
     let _print_guard = crate::PrintOnPanic(|| format!("stmt {:?}", stmt));
 
@@ -910,16 +935,34 @@ fn codegen_stmt<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, cur_block: Block, stmt:
                     crate::discriminant::codegen_get_discriminant(fx, lval, value, dest_layout);
                 }
                 Rvalue::Repeat(ref operand, times) => {
-                    let operand = codegen_operand(fx, operand);
                     let times = fx
                         .monomorphize(times)
                         .try_to_target_usize(fx.tcx)
                         .expect("expected monomorphic const in codegen");
+                    let byte = bytewise_repeat_value(fx, operand);
+                    let operand = codegen_operand(fx, operand);
                     if operand.layout().size.bytes() == 0 {
                         // Do nothing for ZST's
+                    } else if let Some(byte) = byte {
+                        // The repeated element is a whole number of copies of the
+                        // same byte, so the whole array is a memset. This used to
+                        // be limited to `i8` operands, which left `[0.0f32; 16]`
+                        // and every other repeated scalar emitting a loop of one
+                        // store per element.
+                        let addr = lval.to_ptr(fx).get_addr(fx);
+                        fx.bcx.emit_small_memset(
+                            fx.target_config,
+                            addr,
+                            byte,
+                            (operand.layout().size.bytes() * times) as u64,
+                            operand.layout().align.bytes().max(1) as u8,
+                            MemFlagsData::new(),
+                        );
                     } else if fx.clif_type(operand.layout().ty) == Some(types::I8) {
+                        // A runtime `u8`/`i8` repeated into a byte array: the value
+                        // is only known at run time, so `emit_small_memset` (which
+                        // takes the fill byte as a `u8`) cannot be used here.
                         let times = fx.bcx.ins().iconst(fx.pointer_type, times as i64);
-                        // FIXME use emit_small_memset where possible
                         let addr = lval.to_ptr(fx).get_addr(fx);
                         let val = operand.load_scalar(fx);
                         fx.bcx.call_memset(fx.target_config, addr, val, times);
