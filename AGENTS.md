@@ -699,29 +699,23 @@ crate`), because the metadata hash embeds the backend. Each backend must build
 its own dependency rlibs; a benchmark harness that shares one rlib between
 backends silently measures a failed compile as a 126 ms "fast" build.
 
-## Push blocker (recurring) — 2026-11-19
+## Push to `irhasar/rmc` — needs a user-supplied PAT (RESOLVED 2026-11-19)
 
-`GITHUB_TOKEN` and `OH_GIT_CREDENTIAL_ACCESS_TOKEN_GITHUB` cannot write to
-`irhasar/rmc`. Verified this session:
-- `GET /repos/irhasar/rmc` reports `push: true, admin: true` for user
-  `irhasar`, but `POST /git/refs` returns **403 "Resource not accessible by
-  integration"** and `git push` returns **403** for both the existing branch and
-  a throwaway probe branch. `x-oauth-scopes` is empty and
-  `x-accepted-github-permissions: allows_permissionless_access=true`, i.e. this
-  is a GitHub App installation token with read-only contents, not a PAT.
+The sandbox tokens cannot write to `irhasar/rmc`:
+- `GITHUB_TOKEN` is a GitHub App installation token with read-only contents.
+  `GET /repos/irhasar/rmc` misleadingly reports `push: true, admin: true`, but
+  `POST /git/refs` returns **403 "Resource not accessible by integration"** and
+  `git push` returns **403** even for a throwaway branch. `x-oauth-scopes` is
+  empty; `x-accepted-github-permissions: allows_permissionless_access=true`.
 - `OH_GIT_CREDENTIAL_ACCESS_TOKEN_GITHUB` is **401 Bad credentials**.
-- `gh auth setup-git` does not help; it uses the same token.
+- `gh auth setup-git` does not help; it reuses the same token.
 
-So a push needs a **`repo`-scoped classic PAT** supplied by the user. The work
-is committed locally and exported, so pushing needs no rebuild:
+A **`repo`-scoped classic PAT** from the user does work. Use it inline, once,
+and never persist it:
 ```
-# in /workspace/project/rmc_clone, commit 750dfa8 is ready
-git push https://<user>:<PAT>@github.com/irhasar/rmc.git \
-    replace-main-with-cgclif-experiments
+git push "https://x-access-token:<PAT>@github.com/irhasar/rmc.git" \
+    HEAD:replace-main-with-cgclif-experiments
 ```
-That updates PR #10 in place (no new PR needed). Offline fallbacks already
-written to `/workspace/project/`:
-- `0001-Cut-per-function-overhead-in-the-inliner-and-store-f.patch`
-  (`git am` it onto the PR branch)
-- `rmc-update.bundle` (`git fetch rmc-update.bundle
-  replace-main-with-cgclif-experiments`)
+Afterwards confirm `git remote get-url origin` still has no token and
+`.git/config` has no `ghp_` string. Pushed this way: `17e2c56..b2d2c5b`
+(PR #10 head, 40 commits, 923 files).
