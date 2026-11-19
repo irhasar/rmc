@@ -88,6 +88,21 @@ pub(crate) fn inline_max_uses() -> usize {
     })
 }
 
+/// Whether trivial leaves bypass the per-caller use cap (`CG_CLIF_INLINE_NO_TRIVIAL` off).
+pub(crate) fn inline_trivial_leaf() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| !flag("CG_CLIF_INLINE_NO_TRIVIAL"))
+}
+
+/// Instruction cap for the trivial-leaf exemption (`CG_CLIF_INLINE_TRIVIAL_MAX`).
+pub(crate) fn inline_trivial_max_insts() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| match var("CG_CLIF_INLINE_TRIVIAL_MAX") {
+        Some(v) => v.parse().unwrap_or(super::inliner::TRIVIAL_LEAF_INSTS),
+        None => super::inliner::TRIVIAL_LEAF_INSTS,
+    })
+}
+
 /// Loop unroll factor (`CG_CLIF_UNROLL`).
 pub(crate) fn unroll_factor() -> u64 {
     static V: OnceLock<u64> = OnceLock::new();

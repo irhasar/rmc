@@ -36,6 +36,26 @@ const MIN_GROWTH: usize = 64;
 /// Maximum number of times a single callee may be inlined into one caller.
 pub(crate) const MAX_CALLEE_USES: usize = 3;
 
+/// Trivial leaves are exempt from [`MAX_CALLEE_USES`].
+///
+/// A `#[inline]` one-liner such as `<f32 as Mul>::mul` is emitted by cg_clif as
+/// an out-of-line function, and a hot loop may call it dozens of times. Capping
+/// those at three uses leaves the rest as real calls, which costs far more than
+/// the few instructions the inline adds: on a blur kernel it was the difference
+/// between 22.3 s and 12.8 s of runtime. The total growth is still bounded by
+/// `leaf_budget`, so the exemption cannot blow up code size.
+///
+/// The cap is 16 rather than 8 because the iterator adapter bodies a
+/// bounds-checked loop lowers to (`__iterator_get_unchecked`) are 12-13 CLIF
+/// instructions, just above the smaller value; inlining them removed the last
+/// calls from the hot blur loops and was worth another 16%.
+pub(crate) const TRIVIAL_LEAF_INSTS: usize = 16;
+
+/// `CG_CLIF_INLINE_TRIVIAL_MAX` overrides [`TRIVIAL_LEAF_INSTS`]; used to bisect.
+pub(crate) fn trivial_leaf_insts() -> usize {
+    crate::tunables::inline_trivial_max_insts()
+}
+
 /// Default growth budget, as a percentage of the caller's instruction count.
 pub(crate) const GROWTH_PCT: usize = 50;
 
@@ -198,8 +218,20 @@ impl Inline for CguInliner<'_> {
         // Never inline a function into itself. Inline each callee up to
         // `max_callee_uses()` times per caller so that hot small callees called
         // several times are still inlined, while the call-graph budget keeps
-        // mutual recursion and code-size growth bounded.
-        if id == self.self_id || self.inlined.get(&id).is_some_and(|&n| n >= self.max_uses) {
+        // mutual recursion and code-size growth bounded. Trivial leaves are
+        // exempt: they are single operations, and a remaining call site costs
+        // more than the inline. Recursion is still impossible because a leaf
+        // has no calls of its own.
+        let trivial = id != self.self_id
+            && crate::tunables::inline_trivial_leaf()
+            && self
+                .bodies
+                .funcs
+                .get(&id)
+                .is_some_and(|e| e.is_leaf && e.func.dfg.num_insts() <= trivial_leaf_insts());
+        if id == self.self_id
+            || (!trivial && self.inlined.get(&id).is_some_and(|&n| n >= self.max_uses))
+        {
             return InlineCommand::KeepCall;
         }
         let bodies = &self.bodies.funcs;
@@ -221,10 +253,16 @@ impl Inline for CguInliner<'_> {
         if size > cap || size > budget {
             return InlineCommand::KeepCall;
         }
-        if leaf {
-            self.leaf_budget -= size;
-        } else {
-            self.budget -= size;
+        // A trivial leaf is a single operation, so it must not compete for a
+        // budget meant to bound real code growth. Charging it is what left the
+        // last `Add::add` calls in a hot blur loop once the caller had already
+        // absorbed its larger callees.
+        if !trivial {
+            if leaf {
+                self.leaf_budget -= size;
+            } else {
+                self.budget -= size;
+            }
         }
         self.inlined.insert(id, self.inlined.get(&id).copied().unwrap_or(0) + 1);
         // `visit_callee: true` lets the walk descend into the freshly inlined

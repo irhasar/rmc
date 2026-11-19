@@ -849,3 +849,128 @@ Upstream pun lebih buruk di sini: 55.012 relokasi `R_X86_64_RELATIVE` vs M
 cg_clif menolaknya (`error: LTO is not supported by rustc_codegen_cranelift`),
 jadi LTO dimatikan untuk **ketiga** backend agar yang dibandingkan backend,
 bukan profil build.
+
+### 8.27 Inliner: leaf trivial bebas batas pemakaian — LANDED (`4d046cc`)
+
+**Akar masalah.** `MAX_CALLEE_USES = 3` membatasi **semua** callee, termasuk
+yang badannya satu operasi. `<f32 as Mul>::mul`, `<f32 as Add>::add`, dan
+`__iterator_get_unchecked` adalah satu instruksi CLIF, tetapi pemanggil hanya
+boleh meng-inline-nya 3 kali. Loop blur memanggilnya puluhan kali per iterasi,
+jadi sisanya tetap berupa call sungguhan — dan setiap call memaksa spill/reload
+di sekelilingnya. Inilah sebabnya 46 call masih tersisa di `image` blur pada
+revisi 8.16.
+
+**Perbaikan.** Leaf dengan ≤ `TRIVIAL_LEAF_INSTS` instruksi kini:
+
+1. tidak dihitung terhadap `MAX_CALLEE_USES`, dan
+2. tidak dibebankan pada budget pertumbuhan (`budget`/`leaf_budget`).
+
+Pertumbuhan kode tetap terbatas: badan seperti itu satu operasi, dan sebuah
+leaf tidak punya callee sendiri sehingga tidak bisa memicu ekspansi berantai.
+Rekursi tetap mustahil. Knob: `CG_CLIF_INLINE_TRIVIAL_MAX` (ambang) dan
+`CG_CLIF_INLINE_NO_TRIVIAL` (matikan, untuk A/B).
+
+**Ambang 8 → 16.** Dengan ambang 8, `Add`/`Mul` hilang tetapi 8 call
+`__iterator_get_unchecked` masih tersisa. Bisect perambatan call pada
+`filter_symmetric_column`:
+
+| `CG_CLIF_INLINE_TRIVIAL_MAX` | call tersisa di loop kolom | runtime blur |
+|---|---|---|
+| 8  | 8 (`__iterator_get_unchecked`) | 15.27 s |
+| 9  | 8 | — |
+| 11 | 8 | — |
+| 13 | **0** | — |
+| 16 | **0** | **12.80 s** |
+| 32 | 0 | 12.84 s (plateau) |
+
+Badan adapter iterator itu 12–13 instruksi CLIF, jadi ambang 8 tepat di
+bawahnya. 16 memberi margin tanpa biaya terukur; 32 tidak menambah apa pun.
+
+**Dampak pada blur `image` (2048 px, `--release`).** A/B memakai biner compiler
+yang sama, hanya knob yang berbeda:
+
+| konfigurasi | runtime wall | ukuran binary | output |
+|---|---|---|---|
+| sebelum (trivial off) | 22.323 s | 1.647.648 B | 1934409 |
+| ambang 8 | 15.154 s | 1.642.304 B | 1934409 |
+| ambang 16 (final) | **12.790 s** | **1.627.864 B** | 1934409 |
+| LLVM | 1.239 s | — | 1934409 |
+
+Total **1,75× lebih cepat** dan **19 KB lebih kecil** daripada baseline M,
+dengan output identik. Compile time tidak berubah (6,43 s vs 6,32 s, dalam
+noise).
+
+**Efek pada call.** Pada `filter_symmetric_row` (blur, f32):
+
+| | instruksi | byte | `mulss` | call |
+|---|---|---|---|---|
+| LLVM | 446 | 1641 | 3 | 9 |
+| M sebelum | 581 | 2728 | 3 | 37 |
+| M final | 359 | **1568** | 10 | **9** |
+
+M final kini **lebih kecil dari LLVM** untuk fungsi ini dan jumlah call-nya
+sama. LLVM tetap menang lewat vektor (`mulps` 9 vs 0).
+
+**Regresi suite: tidak ada.** `bench_all.sh` (REPS=5), baseline M vs M final,
+selisih wall:
+
+| prog | base | final | delta |
+|---|---|---|---|
+| p1_arith | 105 | 106 | +1.0% |
+| p2_mem | 68 | 69 | +1.5% |
+| p3_calls | 99 | 99 | 0% |
+| p4_simd | 140 | 142 | +1.4% |
+| p5_inline | 7 | 7 | 0% |
+| p6_scalar | 7 | 7 | 0% |
+| p7_branchy | 55 | 60 | +9.1% |
+| p8_minmax | 38 | 38 | 0% |
+
+p7_branchy +9% diperiksa ulang: konfigurasi **trivial-off** sendiri kini
+mengukur 62.2 ms (log lama 55 ms), jadi pergeseran itu berasal dari mesin, bukan
+dari perubahan ini. p1/p2/p4 +1–1.5% berada di bawah noise antar-run.
+
+**Validasi kebenaran.**
+
+- `./y.sh test --sysroot clif`: **25.368 tes lulus, 0 gagal**.
+- `bat` 0.26.1 (13.4 MB, banyak dependensi) dan `tokei` 15.0.0 dibangun ulang
+  dan dijalankan; keluaran tokei identik **per file** dengan baseline M
+  (52 file, 15.966 baris kode). Perbedaan md5 hanya urutan array `reports`
+  (iterasi hashmap), bukan isi.
+
+**Koreksi klaim 8.20.** Bagian 8.20 menyatakan sisa gap runtime "bukan soal
+inliner, harus di dalam `cranelift-codegen`". Itu keliru untuk kasus ini:
+inliner **adalah** pass sisi cg_clif, dan memperbaiki batas pemakaiannya
+menutup 42% gap blur (22.3 → 12.8 s). Yang benar-benar tersisa di
+`cranelift-codegen` adalah dua hal lain:
+
+1. **Vektorisasi** — `mulps` 0 vs 9 pada loop yang sama.
+2. **Regalloc / stack traffic** — `filter_symmetric_column` masih 240 referensi
+   `(%rsp)` vs LLVM 66, meski semua call sudah hilang. Ini spilling, dan
+   penyebab utama sisa gap 10× pada blur.
+
+### 8.28 Matriks tiga arah final (inliner leaf trivial)
+
+`bench_all.sh` (REPS=5), semua dijalankan ulang di mesin yang sama.
+
+| prog | run L | run U | run M | size L | size U | size M | cmp L | cmp U | cmp M |
+|---|---|---|---|---|---|---|---|---|---|
+| p1_arith | 82 | 109 | 106 | 4635232 | 5878688 | 4322528 | 86 | 79 | 81 |
+| p2_mem | 16 | 159 | 69 | 4639888 | 5936880 | 4345592 | 272 | 128 | 141 |
+| p3_calls | 37 | 116 | 99 | 4612368 | 5820872 | 4257744 | 100 | 85 | 88 |
+| p4_simd | 55 | 157 | 142 | 4636096 | 5893112 | 4330520 | 108 | 92 | 95 |
+| p5_inline | 58 | 896 | 7 | 4609368 | 5814440 | 4249784 | 82 | 76 | 79 |
+| p6_scalar | 58 | 902 | 7 | 4609368 | 5814424 | 4249784 | 83 | 83 | 78 |
+| p7_branchy | 43 | 100 | 60 | 4609520 | 5814536 | 4249776 | 84 | 77 | 78 |
+| p8_minmax | 18 | 39 | 38 | 4609544 | 5814488 | 4249720 | 84 | 78 | 79 |
+| **total** | **367** | **2478** | **528** | **36961384** | **46787440** | **34255448** | **899** | **698** | **719** |
+
+Runtime wall (ms), ukuran (byte), compile wall (ms).
+
+- Runtime total: M **4,7× lebih cepat dari U**, 1,44× lebih lambat dari L.
+- Ukuran total: M **73% dari U**, **93% dari L** — M satu-satunya backend
+  yang lebih kecil dari LLVM.
+- Compile total: M **719 ms vs U 698 ms vs L 899 ms**. M dan U setara; L
+  paling lambat karena optimisasinya lebih berat.
+
+p5/p6 adalah bukti terkuat: U 896/902 ms, M 7 ms — **128× lebih cepat**,
+karena unroll affine mengubah loop menjadi closed form.
