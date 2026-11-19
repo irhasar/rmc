@@ -93,6 +93,15 @@ pub(crate) fn codegen_fn<'tcx>(
 
     let exception_slot = bcx.declare_var(pointer_type);
 
+    // Read before `module` moves into the struct below. Cached here because
+    // `isa_flags()` allocates and the rounding intrinsics consult it per call
+    // site.
+    let has_sse41 = module
+        .isa()
+        .isa_flags()
+        .iter()
+        .any(|f| f.name == "has_sse41" && f.as_bool() == Some(true));
+
     let mut fx = FunctionCx {
         module,
         debug_context,
@@ -117,6 +126,7 @@ pub(crate) fn codegen_fn<'tcx>(
         clif_comments,
         inline_asm: String::new(),
         inline_asm_index: 0,
+        has_sse41,
     };
 
     tcx.prof.generic_activity("codegen clif ir").run(|| codegen_fn_body(&mut fx, start_block));

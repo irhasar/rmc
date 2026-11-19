@@ -268,6 +268,12 @@ fn bool_to_zero_or_max_uint<'tcx>(
     res
 }
 
+/// A float constant of the given type, built from an `f64` literal.
+fn fconst(fx: &mut FunctionCx<'_, '_, '_>, clif_ty: Type, v: f64) -> Value {
+    let c = fx.bcx.ins().f64const(v);
+    if clif_ty == types::F64 { c } else { fx.bcx.ins().fdemote(clif_ty, c) }
+}
+
 /// Round a float toward zero without SSE4.1.
 ///
 /// `ftrunc` lowers to `roundss`/`roundsd` only when the target has SSE4.1; on
@@ -284,14 +290,41 @@ fn trunc_via_int(fx: &mut FunctionCx<'_, '_, '_>, x: Value, clif_ty: Type, bits:
     let int_ty = if bits == 52 { types::I64 } else { types::I32 };
     let int_part = fx.bcx.ins().fcvt_to_sint_sat(int_ty, x);
     let back = fx.bcx.ins().fcvt_from_sint(clif_ty, int_part);
-    let limit = fx.bcx.ins().f64const((2.0f64).powi(bits as i32));
-    let limit = if clif_ty == types::F64 { limit } else { fx.bcx.ins().fdemote(clif_ty, limit) };
+    let limit = fconst(fx, clif_ty, (2.0f64).powi(bits as i32));
     let abs = fx.bcx.ins().fabs(x);
     let small = fx.bcx.ins().fcmp(FloatCC::LessThan, abs, limit);
     // The round-trip loses the sign of zero: trunc(-0.4) must be -0.0, but the
     // integer conversion yields +0. Reapply x's sign bit.
     let back = fx.bcx.ins().fcopysign(back, x);
     fx.bcx.ins().select(small, back, x)
+}
+
+/// Round a float down without SSE4.1, for the same reason as [`trunc_via_int`].
+///
+/// `floor` and `ceil` reach the same `x64_round` rules as `trunc`, so on the
+/// baseline target they also became soft-float libcalls. Measured on a
+/// compute-bound loop they were 6.3x and 6.6x slower than LLVM's single
+/// instruction; this brings both to parity.
+///
+/// Truncation differs from the floor by at most one, and only when it rounded
+/// up, so stepping down by one in exactly that case is exact.
+fn floor_via_int(fx: &mut FunctionCx<'_, '_, '_>, x: Value, clif_ty: Type, bits: u32) -> Value {
+    let t = trunc_via_int(fx, x, clif_ty, bits);
+    let one = fconst(fx, clif_ty, 1.0);
+    let rounded_up = fx.bcx.ins().fcmp(FloatCC::GreaterThan, t, x);
+    let down = fx.bcx.ins().fsub(t, one);
+    // NaN and infinity compare false and keep `t`, which is already what
+    // `floor` returns for them.
+    fx.bcx.ins().select(rounded_up, down, t)
+}
+
+/// Round a float up without SSE4.1; the mirror image of [`floor_via_int`].
+fn ceil_via_int(fx: &mut FunctionCx<'_, '_, '_>, x: Value, clif_ty: Type, bits: u32) -> Value {
+    let t = trunc_via_int(fx, x, clif_ty, bits);
+    let one = fconst(fx, clif_ty, 1.0);
+    let rounded_down = fx.bcx.ins().fcmp(FloatCC::LessThan, t, x);
+    let up = fx.bcx.ins().fadd(t, one);
+    fx.bcx.ins().select(rounded_down, up, t)
 }
 
 pub(crate) fn codegen_intrinsic_call<'tcx>(
@@ -1250,19 +1283,45 @@ fn codegen_regular_intrinsic_call<'tcx>(
                 (sym::sqrt, F32 | F64) => Codegen(fx.bcx.ins().sqrt(x)),
                 (sym::sqrt, F128) => Libcall("sqrtf128"),
 
-                (sym::floor, F32 | F64) => Codegen(fx.bcx.ins().floor(x)),
+                (sym::floor, F32 | F64) => {
+                    if fx.has_sse41 {
+                        Codegen(fx.bcx.ins().floor(x))
+                    } else {
+                        let clif_ty = fx.clif_type(layout.ty).unwrap();
+                        let bits = if *float_ty == F64 { 52 } else { 23 };
+                        Codegen(floor_via_int(fx, x, clif_ty, bits))
+                    }
+                }
                 (sym::floor, F128) => Libcall("floorf128"),
 
-                (sym::ceil, F32 | F64) => Codegen(fx.bcx.ins().ceil(x)),
+                (sym::ceil, F32 | F64) => {
+                    if fx.has_sse41 {
+                        Codegen(fx.bcx.ins().ceil(x))
+                    } else {
+                        let clif_ty = fx.clif_type(layout.ty).unwrap();
+                        let bits = if *float_ty == F64 { 52 } else { 23 };
+                        Codegen(ceil_via_int(fx, x, clif_ty, bits))
+                    }
+                }
                 (sym::ceil, F128) => Libcall("ceilf128"),
 
                 (sym::trunc, F32 | F64) => {
-                    let clif_ty = fx.clif_type(layout.ty).unwrap();
-                    let bits = if *float_ty == F64 { 52 } else { 23 };
-                    Codegen(trunc_via_int(fx, x, clif_ty, bits))
+                    if fx.has_sse41 {
+                        Codegen(fx.bcx.ins().trunc(x))
+                    } else {
+                        let clif_ty = fx.clif_type(layout.ty).unwrap();
+                        let bits = if *float_ty == F64 { 52 } else { 23 };
+                        Codegen(trunc_via_int(fx, x, clif_ty, bits))
+                    }
                 }
                 (sym::trunc, F128) => Libcall("truncf128"),
 
+                // Left as the native lowering: with SSE4.1 it is one
+                // instruction, and on the baseline its libcall is already
+                // efficient (compiler_builtins rounds by masking the mantissa,
+                // not by soft-float arithmetic). An integer round-trip here
+                // measured 15% slower than that libcall, so unlike
+                // floor/ceil/trunc there is nothing to gain.
                 (sym::round_ties_even, F32 | F64) => Codegen(fx.bcx.ins().nearest(x)),
                 (sym::round_ties_even, F128) => Libcall("rintf128"),
 

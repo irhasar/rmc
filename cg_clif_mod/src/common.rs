@@ -300,6 +300,16 @@ pub(crate) struct FunctionCx<'m, 'clif, 'tcx: 'm> {
 
     pub(crate) inline_asm: String,
     pub(crate) inline_asm_index: u32,
+
+    /// Whether the target can use SSE4.1 `roundss`/`roundsd`.
+    ///
+    /// `floor`/`ceil`/`trunc`/`nearest` lower to a single instruction only with
+    /// SSE4.1; on the x86-64 baseline Cranelift instead emits a soft-float
+    /// libcall. The integer round-trip used as the fallback is a few
+    /// instructions longer, so it must not replace the native instruction when
+    /// that instruction is available. Cached because `isa_flags()` allocates a
+    /// `Vec` and this is read at every rounding call site.
+    pub(crate) has_sse41: bool,
 }
 
 impl<'tcx> LayoutOfHelpers<'tcx> for FunctionCx<'_, '_, 'tcx> {
