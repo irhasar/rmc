@@ -18,6 +18,15 @@ use rustc_data_structures::fx::FxHashMap;
 /// Largest callee (in CLIF instructions) we are willing to inline.
 pub(crate) const MAX_CALLEE_INSTS: usize = 64;
 
+/// Largest *leaf* callee (no calls of its own) we are willing to inline.
+///
+/// Leaf bodies are the profitable case: inlining one lets the caller's later
+/// passes and register allocator see the arithmetic directly instead of a call
+/// boundary, which is what turns a per-iteration helper call into straight-line
+/// code. They cannot pull in further callees, so a larger cap here does not
+/// cascade the way it would for a wrapper.
+pub(crate) const MAX_LEAF_INSTS: usize = 192;
+
 /// Total number of callee instructions we are willing to add to a single caller.
 const INLINE_BUDGET: usize = 512;
 
@@ -40,13 +49,44 @@ pub(crate) fn max_callee_insts() -> usize {
     crate::tunables::inline_max_insts()
 }
 
+/// `CG_CLIF_INLINE_LEAF_MAX` overrides [`MAX_LEAF_INSTS`].
+pub(crate) fn max_leaf_insts() -> usize {
+    crate::tunables::inline_leaf_max_insts()
+}
+
+/// Whether `body` contains no call of its own (a leaf).
+///
+/// A leaf callee has no callees to pull in, so inlining it cannot cascade; this
+/// is what makes a larger cap safe for leaves while non-leaves keep the small one.
+///
+/// Blocks that end in a `trap` are panic/abort paths (e.g. a failed bounds
+/// check). The calls they contain only format the panic message and never run on
+/// the success path, so they do not stop a body from being treated as a leaf.
+fn is_leaf(body: &ir::Function) -> bool {
+    body.layout.blocks().all(|block| {
+        let traps = body
+            .layout
+            .last_inst(block)
+            .is_some_and(|term| body.dfg.insts[term].opcode() == ir::Opcode::Trap);
+        traps
+            || body.layout.block_insts(block).all(|inst| {
+                !matches!(
+                    body.dfg.insts[inst].opcode(),
+                    ir::Opcode::Call | ir::Opcode::CallIndirect
+                )
+            })
+    })
+}
+
 pub(crate) struct CguInliner<'a> {
     bodies: &'a FxHashMap<u32, ir::Function>,
     self_id: u32,
     inlined: FxHashMap<u32, usize>,
     budget: usize,
+    leaf_budget: usize,
     max_uses: usize,
     max_insts: usize,
+    max_leaf_insts: usize,
 }
 
 impl<'a> CguInliner<'a> {
@@ -55,6 +95,14 @@ impl<'a> CguInliner<'a> {
         self_id: u32,
         caller: &ir::Function,
     ) -> Self {
+        let caller_insts = caller.dfg.num_insts();
+        // `CG_CLIF_INLINE_MAX=0` keeps its documented meaning: inlining is off,
+        // including the leaf tier, so the knob can still bisect it away.
+        let (max_insts, max_leaf_insts) = if max_callee_insts() == 0 {
+            (0, 0)
+        } else {
+            (max_callee_insts(), max_leaf_insts())
+        };
         CguInliner {
             bodies,
             self_id,
@@ -63,11 +111,18 @@ impl<'a> CguInliner<'a> {
             // adds, on *every* later pass. Bound the growth to a fraction of the
             // caller so a large function cannot balloon: the runtime win comes
             // from small helpers in hot code, not from doubling big bodies.
-            budget: inline_budget(caller.dfg.num_insts()),
+            budget: inline_budget(caller_insts),
+            // Leaves get their own allowance, floored at one leaf-sized callee.
+            // A hot loop body is often small, so a growth-only budget would
+            // reject the very helper the loop calls on every iteration. It is
+            // *added* to the caller's budget rather than replacing it so a big
+            // caller does not lose headroom for its ordinary callees.
+            leaf_budget: inline_budget(caller_insts).saturating_add(max_leaf_insts),
             // Read the knobs once: `inline` runs per call site and a `std::env`
             // lookup on each is pure overhead.
             max_uses: max_callee_uses(),
-            max_insts: max_callee_insts(),
+            max_insts,
+            max_leaf_insts,
         }
     }
 }
@@ -115,11 +170,24 @@ impl Inline for CguInliner<'_> {
             return InlineCommand::KeepCall;
         };
         let size = body.dfg.num_insts();
-        if size > self.max_insts || size > self.budget {
+        // Leaves get the larger cap and their own budget; a leaf cannot pull in
+        // further callees, so the extra instructions are pure straight-line code
+        // rather than the start of a call-graph expansion.
+        let leaf = is_leaf(body);
+        let (cap, budget) = if leaf {
+            (self.max_leaf_insts, self.leaf_budget)
+        } else {
+            (self.max_insts, self.budget)
+        };
+        if size > cap || size > budget {
             return InlineCommand::KeepCall;
         }
+        if leaf {
+            self.leaf_budget -= size;
+        } else {
+            self.budget -= size;
+        }
         self.inlined.insert(id, self.inlined.get(&id).copied().unwrap_or(0) + 1);
-        self.budget -= size;
         // `visit_callee: true` lets the walk descend into the freshly inlined
         // body so a callee's own calls are inlined too. This is what lets a
         // wrapper chain collapse; the budget bounds the growth.

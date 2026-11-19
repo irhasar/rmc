@@ -892,3 +892,64 @@ Temuan:
 Catatan: crate `holidays-rs` memakai `crateworks` yang menargetkan `edition
 2024`/`rust-version 1.88`; sysroot clif yang dibangun dari toolchain
 `nightly-2026-11-17` memenuhi syarat ini tanpa perubahan.
+
+### 8.25 Inlining tier-`leaf`: tutup sebagian besar gap runtime nyata (LANDED)
+
+8.20 menutup dengan catatan bahwa probe hashbrown (p2) tidak bisa di-inline
+tanpa meledakkan ukuran. Investigasi lanjutan pada jalur `format!`/`Display`
+menemukan bahwa batas `MAX_CALLEE_INSTS = 64` menolak callee yang justru paling
+menguntungkan: helper **leaf** kecil yang dipanggil di dalam loop panas.
+
+**Akar masalah.** Pada probe `itoa` (jalur `format!`), callee berukuran 83
+instruksi CLIF — di atas ambang 64, jadi tetap *out-of-line* (`call ...itoa`)
+sementara LLVM meng-inline dan mengkhususukannya. Dua sebab ambang ini salah
+sasaran:
+
+1. Ukuran callee menghitung blok panic (`trap` + `call` ke `format_args`).
+   Blok itu *cold* dan tidak pernah dieksekusi di jalur sukses, tetapi membuat
+   callee tampak besar.
+2. Ambang `MAX_CALLEE_INSTS` seragam untuk semua callee. Callee leaf (tanpa
+   `call` sendiri) tidak bisa menarik callee lain, jadi meng-inline-nya tidak
+   bisa berantai — inilah yang membuat ambang lebih besar aman untuk leaf.
+
+**Perbaikan (`src/inliner.rs`, `src/tunables.rs`, `src/driver/aot.rs`).**
+Inliner kini memakai dua tingkat:
+
+- `MAX_CALLEE_INSTS = 64` (tetap) untuk callee non-leaf.
+- `MAX_LEAF_INSTS = 192` (`CG_CLIF_INLINE_LEAF_MAX`) untuk callee leaf.
+- Deteksi leaf (`is_leaf`) mengabaikan blok yang diakhiri `trap` (jalur panic),
+  sehingga `itoa` dihitung sebagai leaf.
+- Leaf mendapat anggaran pertumbuhan sendiri yang **ditambahkan** ke anggaran
+  biasa, karena badan loop panas sering kecil sehingga anggaran pertumbuhan
+  murni (50% dari pemanggil) akan menolak helper yang dipanggil tiap iterasi.
+- `CG_CLIF_INLINE_MAX=0` tetap berarti "matikan seluruh inlining" (termasuk tier
+  leaf), agar knob masih bisa dipakai membisect.
+
+**Hasil terisolasi (A/B: tier leaf mati vs hidup, `--reps 5`).**
+
+| crate | Rwall off→on (ms) | Δ runtime | size off→on (byte) | Δ size | Cwall off→on (ms) |
+|-------|-------------------|-----------|--------------------|--------|-------------------|
+| openlocationcode | 19461 → 14019 | **−28.0%** | 4799290 → 4788386 | −0.2% | 239 → 236 |
+| holidays-rs | 27872 → 22115 | **−20.7%** | 6630988 → 6606428 | −0.4% | 374 → 380 |
+| stdnum-rs | 11423 → 7819 | **−31.6%** | 9966018 → 9919314 | −0.5% | 1489 → 1541 |
+
+Perbaikan ini **Pareto**: runtime turun 21–32% sementara ukuran justru sedikit
+lebih kecil (meng-inline leaf menghapus prologue/epilogue call dan memungkinkan
+DCE lebih banyak) dengan biaya compile ≤3,5%.
+
+**Matriks tiga arah akhir pada crate nyata (RC=3, RR=5).**
+
+| crate | Cwall L/U/M (ms) | size L/U/M (byte) | Rwall L/U/M (ms) | Rrss L/U/M (MB) |
+|-------|------------------|-------------------|------------------|-----------------|
+| openlocationcode | 774/492/240 | 4853894/6322818/4788450 | 3995/26656/13945 | 10.5/10.6/10.5 |
+| holidays-rs | 718/347/384 | 6901646/7800264/6606512 | 8091/36922/22250 | 10.7/10.7/10.7 |
+| stdnum-rs | 3255/1403/1521 | 9314804/10610242/9919602 | 1405/17344/7710 | 10.5/10.5/10.5 |
+
+Dibanding 8.24 (sebelum tier leaf), runtime M vs U pada ketiga crate naik dari
+1,6–1,9× menjadi **1,9–2,2× lebih cepat**, dan M vs L pada openlocationcode
+membaik dari 7,3× menjadi 3,5× lebih lambat (dari 16085 → 13945 ms).
+
+**Verifikasi.** `./y.sh test --sysroot clif` → **55 suite `test result: ok`,
+0 failed** (termasuk 3011 coretests dan 1355 std tests). Ketiga driver crate
+menghasilkan output **identik** di L, U, dan M. Seluruh std dibangun ulang
+dengan pass aktif.

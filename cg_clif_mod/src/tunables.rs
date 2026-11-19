@@ -63,6 +63,22 @@ pub(crate) fn inline_max_insts() -> usize {
     })
 }
 
+/// Largest *leaf* callee (no calls of its own) the inliner accepts
+/// (`CG_CLIF_INLINE_LEAF_MAX`).
+///
+/// A leaf body is pure computation: once inlined, it exposes its arithmetic to
+/// the caller's passes and lets the register allocator keep values in registers
+/// across the former call boundary, which is where the runtime win comes from.
+/// Non-leaf bodies mainly move a call around and can still be duplicated
+/// cheaply, so they keep the smaller [`inline_max_insts`] cap.
+pub(crate) fn inline_leaf_max_insts() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| match var("CG_CLIF_INLINE_LEAF_MAX") {
+        Some(v) => v.parse().unwrap_or(super::inliner::MAX_LEAF_INSTS),
+        None => super::inliner::MAX_LEAF_INSTS,
+    })
+}
+
 /// Maximum times one callee may be inlined per caller (`CG_CLIF_INLINE_USES`).
 pub(crate) fn inline_max_uses() -> usize {
     static V: OnceLock<usize> = OnceLock::new();

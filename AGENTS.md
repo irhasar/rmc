@@ -1,5 +1,33 @@
 # AGENTS.md
 
+## Session (2026-11-18, latest) — leaf-tier inlining closes most of the real-crate runtime gap (LANDED)
+
+- New tiered inliner in `src/inliner.rs`: `MAX_CALLEE_INSTS = 64` (non-leaf,
+  unchanged) plus `MAX_LEAF_INSTS = 192` (`CG_CLIF_INLINE_LEAF_MAX`) for leaf
+  callees. A leaf (no `call`/`call_indirect` of its own) cannot cascade, so a
+  larger cap is safe; that is the whole reason the tier exists.
+- `is_leaf` ignores blocks ending in `trap`: those are panic paths (`trap` +
+  a `call` that formats the message). Without this, a helper with a bounds
+  check looks non-leaf. This is what finally admits `itoa` (83 CLIF insts).
+- Leaves also get their own growth budget, *added* to the normal one
+  (`leaf_budget = inline_budget(caller) + max_leaf_insts`). A hot loop body is
+  often small, so the plain 50%-of-caller growth budget rejected the very
+  helper called every iteration. `src/driver/aot.rs` collects bodies up to the
+  larger of the two caps so leaf-only bodies are available to inline.
+- `CG_CLIF_INLINE_MAX=0` still means "inlining off" for both tiers, so the knob
+  can still bisect it away.
+- **Measured** (isolated A/B, leaf tier off -> on, `--reps 5`): runtime
+  openlocationcode 19461 -> 14019 ms (-28.0%), holidays-rs 27872 -> 22115 ms
+  (-20.7%), stdnum-rs 11423 -> 7819 ms (-31.6%). Size *drops* 0.2-0.5% (inlining
+  removes call overhead and enables more DCE); compile cost <= +3.5%.
+- **Final 3-way on real crates** (L=LLVM, U=upstream, M=modified): runtime
+  M vs U improves to 1.9-2.2x faster (was 1.6-1.9x in 8.24); openlocationcode
+  M vs L goes from 7.3x to 3.5x slower.
+- **Tests**: `./y.sh test --sysroot clif` -> 55 suites `test result: ok`,
+  0 failed (incl. 3011 core benches, 1355 std). Driver outputs identical
+  across L/U/M. Full std rebuilt with the pass active.
+- REPORT.md section 8.25 documents it. Fork commits: see below.
+
 ## Session (2026-11-18, latest) — if-conversion diamond → select/cmove (LANDED, `7374000`)
 - New pass `src/if_convert.rs`: collapses a short, side-effect-free two-way
   diamond (`brif` head -> then/else -> common join) into a `select` in the
