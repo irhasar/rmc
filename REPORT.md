@@ -946,7 +946,7 @@ DCE lebih banyak) dengan biaya compile ≤3,5%.
 | stdnum-rs | 3255/1403/1521 | 9314804/10610242/9919602 | 1405/17344/7710 | 10.5/10.5/10.5 |
 
 Dibanding 8.24 (sebelum tier leaf), runtime M vs U pada ketiga crate naik dari
-1,6–1,9× menjadi **1,9–2,2× lebih cepat**, dan M vs L pada openlocationcode
+1,6–1,9× menjadi **1,7–2,2× lebih cepat** (1,91× / 1,66× / 2,25×), dan M vs L pada openlocationcode
 membaik dari 7,3× menjadi 3,5× lebih lambat (dari 16085 → 13945 ms).
 
 **Verifikasi.** `./y.sh test --sysroot clif` → **55 suite `test result: ok`,
