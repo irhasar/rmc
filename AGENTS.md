@@ -121,16 +121,15 @@
   the `jit/aot.std_example` ICE is gone.
 - `REPORT.md` §8.13–8.15 and `bench/fullbench.sh` record the full three-way
   matrix (RC=7/RR=9).
-- **Push still blocked**: `irhasar/rmc` rejects every available credential (403
-  `Resource not accessible by integration`; `POST /git/refs` on a probe branch
-  also returns 403, and `x-oauth-scopes` is empty — this is a read-only GitHub
-  App installation token, not a PAT). Commit `ad9e9fe` is local only; to land
-  it, push `replace-main-with-cgclif-experiments` with a `repo`-scoped PAT
-  (updates PR #10 in place, which is open and `mergeable: true`, 1 commit
-  behind). Offline artifacts in `/workspace/project/`:
-  - `0002-inline-trivial-leaves.patch` (`git am` it onto the PR branch)
-  - `rmc-update.bundle` (`git fetch rmc-update.bundle
-    replace-main-with-cgclif-experiments`)
+- **Push resolved (2026-11-17)**: the read-only GitHub App token was replaced
+  with a user-supplied `repo`-scoped classic PAT. Branch
+  `replace-main-with-cgclif-experiments` now ends at `405dd8c` on the remote,
+  and PR #10 is open with `mergeable: true` / `mergeable_state: clean`
+  (50 commits, 926 files). The token was used only for this push and the PR
+  description edit; it is not stored in any git config or file.
+  Earlier blocker evidence, kept for context: `POST /git/refs` and `git push`
+  both returned 403 `Resource not accessible by integration`, and
+  `x-oauth-scopes` was empty on the App installation token.
 
 ## Repo purpose
 Experiments comparing Rust codegen backends: LLVM (`rustc`) vs
