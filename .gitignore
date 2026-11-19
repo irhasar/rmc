@@ -10,3 +10,4 @@ cg_clif_mod/target/
 cg_clif_upstream/build/
 cg_clif_upstream/dist/
 cg_clif_upstream/target/
+tools/sampler

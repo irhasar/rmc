@@ -1236,8 +1236,34 @@ fn codegen_regular_intrinsic_call<'tcx>(
                 (sym::round_ties_even, F32 | F64) => Codegen(fx.bcx.ins().nearest(x)),
                 (sym::round_ties_even, F128) => Libcall("rintf128"),
 
-                (sym::round, F32) => Libcall("roundf"),
-                (sym::round, F64) => Libcall("round"),
+                (sym::round, F32 | F64) => {
+                    // `round` is round-half-away-from-zero, which Cranelift has
+                    // no instruction for, so it used to be a libcall into
+                    // compiler_builtins' soft-float. A tempting identity is
+                    // `copysign(trunc(x + copysign(0.5, x)), x)`, but that is
+                    // wrong: for x just below 0.5 the addition rounds up to 1.0
+                    // under ties-to-even. Instead split x into its integral part
+                    // and its exact fractional remainder and bump the integral
+                    // part only when the remainder reaches one half.
+                    let clif_ty = fx.clif_type(layout.ty).unwrap();
+                    let one = fx.bcx.ins().f64const(1.0);
+                    let half = fx.bcx.ins().f64const(0.5);
+                    let (one, half) = if *float_ty == F64 {
+                        (one, half)
+                    } else {
+                        (fx.bcx.ins().fdemote(clif_ty, one), fx.bcx.ins().fdemote(clif_ty, half))
+                    };
+                    let int_part = fx.bcx.ins().trunc(x);
+                    // Exact: the fractional part is representable, so `fsub`
+                    // introduces no error. NaN and infinity yield NaN here, which
+                    // fails the comparison below and falls through to int_part.
+                    let frac = fx.bcx.ins().fsub(x, int_part);
+                    let frac_abs = fx.bcx.ins().fabs(frac);
+                    let round_away = fx.bcx.ins().fcmp(FloatCC::GreaterThanOrEqual, frac_abs, half);
+                    let delta = fx.bcx.ins().fcopysign(one, x);
+                    let bumped = fx.bcx.ins().fadd(int_part, delta);
+                    Codegen(fx.bcx.ins().select(round_away, bumped, int_part))
+                }
                 (sym::round, F128) => Libcall("roundf128"),
 
                 (sym::exp, F32) => Libcall("expf"),

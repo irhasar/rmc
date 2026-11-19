@@ -976,3 +976,108 @@ Runtime wall (ms), ukuran (byte), compile wall (ms).
 
 p5/p6 adalah bukti terkuat: U 896/902 ms, M 7 ms — **128× lebih cepat**,
 karena unroll affine mengubah loop menjadi closed form.
+
+### 8.29 `round` sebagai instruksi native, bukan libcall — LANDED
+
+#### Cara temuan ini muncul
+
+Sampel runtime nyata diambil dengan sampler `ptrace` buatan sendiri
+(`tools/sampler.c`, karena mesin ini tidak punya `perf` dan tidak ada root),
+lalu RIP dipetakan ke simbol dengan `tools/sym.py`. Dua kesalahan pengukuran
+ditemukan dan diperbaiki sebelum angka apa pun dipercaya:
+
+1. Biner bersifat PIE, jadi RIP runtime tidak bisa langsung dicari di tabel
+   simbol. Bias muat **bukan** `mapping_start - file_offset`: pada biner ini
+   segmen executable punya `p_offset 0x1ef90` tetapi `p_vaddr 0x1ff90`, jadi
+   keduanya berbeda satu halaman. Bias yang benar adalah
+   `mapping_start - page_align(p_vaddr)`, dibaca dari header ELF.
+2. Pencarian "simbol terdekat sebelumnya" menyerap padding dan wilayah
+   hot/cold split. Atribusi memakai `nm -S` dan mensyaratkan RIP benar-benar
+   berada di dalam `[start, start+size)`.
+
+Validasi: sampler diuji pada program C dengan loop yang diketahui; sampel
+jatuh persis di batas instruksi (`0x1187`, `0x1191`, `0x1195`). Pada biner
+sasaran, sampel juga jatuh tepat di batas instruksi `movups`.
+
+#### Temuan
+
+| build | sampel | waktu di `compiler_builtins` (soft-float) |
+|---|---|---|
+| LLVM | 1513 | **0,0%** |
+| Cranelift sebelum | 15229 | **30,3%** |
+
+Penyebabnya satu baris di `src/intrinsics/mod.rs`:
+
+```rust
+(sym::round, F32) => Libcall("roundf"),
+(sym::round, F64) => Libcall("round"),
+```
+
+`round` diterjemahkan menjadi panggilan ke `compiler_builtins`. Di biner
+hasilnya `roundf` adalah trampolin 18 byte yang melompat ke libm lewat GOT
+(`call *%rsi`), jadi setiap pembulatan menyeberangi PLT dan membangun frame
+stack. LLVM tidak memanggil apa pun: ia menghasilkan instruksi inline.
+Sekitar 30% waktu blur hilang di sini.
+
+#### Perbaikan
+
+Cranelift tidak punya instruksi round-half-away-from-zero, jadi `round`
+dibangun dari primitif yang ada:
+
+```
+int_part  = trunc(x)
+frac      = x - int_part          // eksak, tidak ada galat pembulatan
+round_away = |frac| >= 0.5
+round(x)  = select(round_away, int_part + copysign(1.0, x), int_part)
+```
+
+Bentuk yang tampak lebih sederhana, `copysign(trunc(x + copysign(0.5, x)), x)`,
+**salah** dan sudah ditolak oleh tes: untuk `x` sedikit di bawah 0.5, `x + 0.5`
+dibulatkan ke atas menjadi 1.0 (ties-to-even), sehingga `round(0.49999997)`
+menghasilkan 1.0 alih-alih 0.0. Tes menangkapnya sebelum masuk.
+
+Gerbang kebenaran: 4051 kasus (NaN, ±0.0, tie 0.5/1.5/2.5, subnormal,
+`MIN_POSITIVE`, `MAX`, ±∞, dan 2000 nilai berjarak 0.25) untuk `round`,
+`trunc`, `floor`, `ceil` pada f32 dan f64. Keluaran **identik byte-per-byte
+dengan LLVM**.
+
+#### Dampak
+
+Blur 2048×2048, 6 lintasan, 9 repetisi:
+
+| build | runtime median | ukuran | peak RSS | panggilan `roundf` |
+|---|---|---|---|---|
+| LLVM | 1233,9 ms | 579.296 B | 122 MB | 0 |
+| Cranelift sebelum | 12752,1 ms | 1.627.864 B | 123 MB | 1 |
+| Cranelift + round native | **10355,5 ms** | 1.629.168 B | 123 MB | **0** |
+
+- Runtime: **−18,8%** (12,75 s → 10,36 s), 1,23× lebih cepat.
+- Ukuran: +1.304 B (+0,08%) — biaya delapan instruksi inline, ditukar dengan
+  hilangnya seluruh jalur libcall.
+- RSS: tidak berubah.
+- Sampel soft-float turun dari 30,3% menjadi ~6,5%; `roundf` hilang dari profil.
+- Keluaran program identik dengan LLVM dan dengan build sebelumnya.
+
+`./y.sh test`: **25.368 lulus, 0 gagal**, sama seperti baseline.
+
+#### Sisa gap dan sebabnya (terukur, bukan dugaan)
+
+Setelah `round` diperbaiki, gap blur yang tersisa ~8,4×. Profil menunjukkan
+sisa 6,5% soft-float berasal dari `trunc_status::<f32>`, yang dipanggil dari
+jalur perangkat lunak `round` di `compiler_builtins` — bukan dari `trunc`
+intrinsik (yang sudah menjadi instruksi native).
+
+Penyebab dominan sisanya adalah **auto-vectorization**. Dihitung dengan
+`objdump`:
+
+| | instruksi SIMD di seluruh biner | di `filter_symmetric_column` (loop terpanas) |
+|---|---|---|
+| LLVM | 1485 | 67 |
+| Cranelift | 29 | 2 |
+
+LLVM memvektorisasi loop blur; Cranelift tidak. Ini pekerjaan di dalam
+`cranelift-codegen` (loop vectorizer), di luar jangkauan pass sisi cg_clif,
+dan tidak ditambal di sini. Angka ini menggantikan klaim lama di §8.20 bahwa
+gap "bukan soal autovektorisasi": untuk blur, vektorisasi adalah faktor
+dominan. §8.20 tetap berlaku untuk benchmark mikro p1–p8 yang loop-nya
+memang skalar.
