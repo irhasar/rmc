@@ -927,7 +927,9 @@ selisih wall:
 
 p7_branchy +9% diperiksa ulang: konfigurasi **trivial-off** sendiri kini
 mengukur 62.2 ms (log lama 55 ms), jadi pergeseran itu berasal dari mesin, bukan
-dari perubahan ini. p1/p2/p4 +1–1.5% berada di bawah noise antar-run.
+dari perubahan ini. p1/p2/p4 +1–1.5% juga noise: A/B langsung p2 dengan 15
+repetisi memberi 69.2 ms (off) vs 68.8 ms (on), yaitu perubahan ini **tidak
+memperlambat** p2.
 
 **Validasi kebenaran.**
 
