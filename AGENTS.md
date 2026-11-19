@@ -381,10 +381,15 @@ Add new programs under `bench/progs/` so they are picked up automatically.
   Re-confirmed 2026-11-19: `POST /repos/irhasar/rmc/git/blobs` returns 403 while
   `GET /repos/irhasar/rmc` reports `push: true` — the repo permission and the
   token's granted scope disagree, so the 403 is a token-scope limit, not a
-  repo-permission one. Commit `cd14e20` (large-crate benchmark + REPORT 8.26)
-  is committed locally on `replace-main-with-cgclif-experiments` and **not
-  pushed**; remote head stays `4e7fb14`. To land it, push with a `repo`-scoped
-  PAT.
+  repo-permission one. A user-supplied classic PAT with `repo` scope does work;
+  pass it inline and reset the remote afterwards so it is not persisted:
+  `git -c credential.helper= push https://<user>:<PAT>@github.com/irhasar/rmc.git
+  HEAD:replace-main-with-cgclif-experiments`, then verify `grep -c ghp_ .git/config`
+  is 0.
+- 2026-11-19 large-crate work is **landed**: remote head `960ae7e`, PR #10 at 46
+  commits / 926 files, `mergeable: True`, `mergeable_state: clean`. Commits:
+  `cd14e20` (treemeasure.py + cratebench.sh + REPORT 8.26), `df39c58` (push
+  status note), `960ae7e` (three derived figures corrected).
 
 ## Session benchmark report (2026-11-18, latest)
 
