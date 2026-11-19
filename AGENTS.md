@@ -632,3 +632,96 @@ the residual 3–7x is **Cranelift codegen quality, not inlining**:
   outputs identical across backends.
 - `dist/` is not committed, so the harness takes `RUSTC_U`, `RUSTC_M`,
   `CRATEWORKS`, `BENCH_DIR` env overrides. Pushed as `a4278b0`; PR #10 head.
+
+## Session (2026-11-19) — large-repo validation on cipansor/Verif
+
+Benchmarked against **`github.com/cipansor/Verif`** (4.1 MB Rust, 84 files, zero
+external deps, `tests/mir.rs` 588 KB, `src/mir/exec.rs` 570 KB) to check the
+optimizations hold on a codebase much larger and more complex than the earlier
+microbenchmarks. Scratch harness in `/workspace/project/bigbench`
+(`verif_full.sh` = 3-way compile/run/equivalence, `deep.sh` = MIR-heavy
+examples, `ab_passes.sh` = per-pass A/B).
+
+### Correctness: clean
+All seven runnable examples produce **byte-identical** stdout across
+L (LLVM) / U (upstream cg_clif) / M (this fork), including the two that shell
+out to rustc and parse MIR (`comparison_check`, `mir_coverage`).
+
+### Results (`--features std`, `-C opt-level=3`, best of 3)
+
+| backend | compile lib | rlib | binary | run wall | run RSS |
+|---|---|---|---|---|---|
+| L LLVM | 11719 ms | 32.10 MB | 10.00 MB | 4 ms | 10.7 MB |
+| U upstream | 3242 ms | 27.40 MB | 13.43 MB | 7 ms | 10.8 MB |
+| M fork | 3439 ms | 29.70 MB | **9.74 MB** | 5 ms | 10.7 MB |
+
+- Compile: **3.4x faster than LLVM**, +6% vs upstream.
+- Binary: **27% smaller than upstream**, **2.6% smaller than LLVM**.
+- `flight_control` (the only real compute loop): M 8920 ms vs U 9387 ms vs
+  L 4484 ms — M is 5% faster than U, LLVM still 2x ahead.
+
+### Root cause of the +6% compile vs upstream: the passes, not the vendor patch
+A/B with `CG_CLIF_NO_STORE_FWD=1 CG_CLIF_NO_IFCONV=1 CG_CLIF_INLINE_MAX=0
+CG_CLIF_UNROLL=0` gives **3212 ms ≈ U's 3208 ms**, so the vendored
+`cranelift-object`/`cranelift-codegen` patches cost nothing. Per-pass on this
+crate: store_forward 380-400 ms (dominant), inline 153-158 ms, if_convert 87-98
+ms, collect 75-80 ms, unroll 5 ms. `store_forward` runs on 8060 functions at
+~48 us each and is close to flat per function, i.e. fixed overhead.
+
+### Why the rlib is *bigger* than upstream's but the binary is much smaller
+`vendor/cranelift-object` names each function's section after its symbol
+(`.text.<sym>`) and gives each data object its own section, instead of
+upstream's single `.text.subsection` / `.data.rel.ro.subsection`. On this crate
+that is 30,465 sections vs 18,550, of which ~9,283 are per-data-object and cost
+~2 MB of `.shstrtab`. Payload is unchanged (`.text` is actually 3.20 MB vs
+3.75 MB). Measured tradeoff with `-Zfunction-sections=no`:
+
+| variant | rlib | binary |
+|---|---|---|
+| M sections ON | 29.70 MB | **9.74 MB** |
+| M sections OFF | 26.46 MB | 16.42 MB |
+| U upstream | 27.40 MB | 13.43 MB |
+
+Per-function sections **save 6.7 MB of final binary (41%) for 3.2 MB of rlib**.
+That is the right trade for a shipped artifact; do not "fix" the rlib size by
+turning them off.
+
+### Changes landed this session
+- `inliner`: new `CguBodies` computes each callee's `is_leaf` once at collection
+  time instead of re-scanning the body at every call site that names it.
+- `store_forward`: O(1) early-out when the function has no sized/dynamic stack
+  slot (nothing to forward, nothing to drop), plus the same guard inside
+  `drop_dead_stores`. Compile 3590 -> 3439 ms on Verif, output unchanged.
+
+### Gotcha: rlibs are not portable across backends
+A `verif_arithmetic` rlib built by U cannot be read by M (`E0463: can't find
+crate`), because the metadata hash embeds the backend. Each backend must build
+its own dependency rlibs; a benchmark harness that shares one rlib between
+backends silently measures a failed compile as a 126 ms "fast" build.
+
+## Push blocker (recurring) — 2026-11-19
+
+`GITHUB_TOKEN` and `OH_GIT_CREDENTIAL_ACCESS_TOKEN_GITHUB` cannot write to
+`irhasar/rmc`. Verified this session:
+- `GET /repos/irhasar/rmc` reports `push: true, admin: true` for user
+  `irhasar`, but `POST /git/refs` returns **403 "Resource not accessible by
+  integration"** and `git push` returns **403** for both the existing branch and
+  a throwaway probe branch. `x-oauth-scopes` is empty and
+  `x-accepted-github-permissions: allows_permissionless_access=true`, i.e. this
+  is a GitHub App installation token with read-only contents, not a PAT.
+- `OH_GIT_CREDENTIAL_ACCESS_TOKEN_GITHUB` is **401 Bad credentials**.
+- `gh auth setup-git` does not help; it uses the same token.
+
+So a push needs a **`repo`-scoped classic PAT** supplied by the user. The work
+is committed locally and exported, so pushing needs no rebuild:
+```
+# in /workspace/project/rmc_clone, commit 750dfa8 is ready
+git push https://<user>:<PAT>@github.com/irhasar/rmc.git \
+    replace-main-with-cgclif-experiments
+```
+That updates PR #10 in place (no new PR needed). Offline fallbacks already
+written to `/workspace/project/`:
+- `0001-Cut-per-function-overhead-in-the-inliner-and-store-f.patch`
+  (`git am` it onto the PR branch)
+- `rmc-update.bundle` (`git fetch rmc-update.bundle
+  replace-main-with-cgclif-experiments`)
