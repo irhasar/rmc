@@ -122,9 +122,15 @@
 - `REPORT.md` §8.13–8.15 and `bench/fullbench.sh` record the full three-way
   matrix (RC=7/RR=9).
 - **Push still blocked**: `irhasar/rmc` rejects every available credential (403
-  `Resource not accessible by integration`). Commit `7249d45` is local only; to
-  land it, push `replace-main-with-cgclif-experiments` with a `repo`-scoped PAT
-  (updates PR #10 in place).
+  `Resource not accessible by integration`; `POST /git/refs` on a probe branch
+  also returns 403, and `x-oauth-scopes` is empty — this is a read-only GitHub
+  App installation token, not a PAT). Commit `ad9e9fe` is local only; to land
+  it, push `replace-main-with-cgclif-experiments` with a `repo`-scoped PAT
+  (updates PR #10 in place, which is open and `mergeable: true`, 1 commit
+  behind). Offline artifacts in `/workspace/project/`:
+  - `0002-inline-trivial-leaves.patch` (`git am` it onto the PR branch)
+  - `rmc-update.bundle` (`git fetch rmc-update.bundle
+    replace-main-with-cgclif-experiments`)
 
 ## Repo purpose
 Experiments comparing Rust codegen backends: LLVM (`rustc`) vs
