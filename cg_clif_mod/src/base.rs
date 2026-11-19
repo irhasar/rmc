@@ -939,7 +939,7 @@ fn codegen_stmt<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, cur_block: Block, stmt:
                         .monomorphize(times)
                         .try_to_target_usize(fx.tcx)
                         .expect("expected monomorphic const in codegen");
-                    let byte = bytewise_repeat_value(fx, operand);
+                    let byte = crate::tunables::repeat_memset().then(|| bytewise_repeat_value(fx, operand)).flatten();
                     let operand = codegen_operand(fx, operand);
                     if operand.layout().size.bytes() == 0 {
                         // Do nothing for ZST's

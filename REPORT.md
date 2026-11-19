@@ -1406,10 +1406,12 @@ Ketiga penyebab di atas berada di `cranelift-codegen`, bukan di cg_clif:
 - **Store/load forwarding lintas blok**: `store_forward.rs` milik cg_clif
   menangani kasus intra-prosedur sederhana, tetapi pointer yang di-spill di
   sini melewati blok dengan bentuk yang tidak dikenali pass itu.
-- **Loop rotation / unrolling**: juga tidak ada. Pass `unroll.rs` di fork ini
-  hanya mengaktifkan jalur *affine reassociation*; pengukuran menunjukkan
-  **0 dari 15.261 fungsi** benar-benar di-unroll pada beban nyata, karena syarat
-  bentuk loop affine hampir tidak pernah terpenuhi oleh kode iterator Rust.
+- **Loop rotation / unrolling**: juga tidak ada di Cranelift. Fork ini punya
+  pass `unroll.rs`, tetapi jalurnya hanya *affine reassociation*: ia bekerja
+  sangat baik (52×) pada loop yang state-nya fungsi linear dari dirinya sendiri
+  (§13.4), dan tidak berlaku pada loop memori seperti `filter_symmetric_column`.
+  Perluasan ke bentuk non-affine butuh analisis dependensi memori yang belum
+  dikerjakan.
 
 Karena itu, gap yang tersisa didokumentasikan sebagai **batasan arsitektural
 Cranelift**, bukan bug yang bisa ditambal di sisi cg_clif.
@@ -1585,6 +1587,10 @@ Verifikasi: uji diferensial terhadap LLVM untuk `[0.0f32; 16]`, `[1.5f32; 8]`,
 
 ### 13.3 Dampak terukur dan batasnya
 
+Angka di bawah memakai benchmark blur `bench/fullbench.sh` (satu program, beban
+gambar), jadi **bukan** himpunan `bench/progs/` yang dipakai §13.5. Skalanya
+berbeda dan tidak boleh dibandingkan langsung dengan tabel di sana.
+
 | konfigurasi | runtime (ms) | ukuran (byte) |
 |---|---|---|
 | CLIF baseline (sebelum §13) | 8374,6 | 1.500.272 |
@@ -1597,23 +1603,40 @@ tetapi runtime-nya di dalam noise, karena loop zero-init itu bukan bagian panas.
 Saya laporkan apa adanya: §13.2 adalah perbaikan kualitas codegen, bukan
 perbaikan runtime pada beban ini.
 
-### 13.4 Temuan negatif yang penting: pass unroll tidak pernah menyala
+### 13.4 Pass unroll: menyala, tetapi hanya pada bentuk affine
 
-Saya menginstrumentasi `unroll::run` dan menghitung keputusan pada build penuh
-`imagedrv`: **15.261 fungsi diperiksa, 0 di-unroll**. Penyebabnya, `apply` hanya
-melakukan sesuatu lewat jalur *affine reassociation*, dan syarat bentuknya
-(state loop harus fungsi linear dari dirinya sendiri) hampir tidak pernah
-terpenuhi oleh kode iterator Rust.
+Saya mengukur apakah pass unroll benar-benar bekerja, dengan A/B pada
+`CG_CLIF_UNROLL` (128 default vs 1 = mati). Hasilnya penting dan perlu
+dipisahkan dari kesimpulan §11:
 
-Ini menjelaskan kenapa loop panas di §11.3 tetap 1 elemen per iterasi: tidak ada
-unrolling, tidak ada LICM, tidak ada loop rotation di Cranelift, dan pass yang
-seharusnya menambal sebagian di antaranya tidak aktif pada bentuk loop nyata.
+**Pass ini bekerja sangat baik pada loop yang bentuknya affine.** Pada
+`p5_inline` (loop 300 juta iterasi, `acc = (acc+i)*3`, `i += 1` — bentuk affine
+murni):
 
-Saya **tidak** memperluas pass ini dalam pekerjaan ini. Alasannya: melonggarkan
-syarat affine tanpa analisis dependensi yang benar berisiko salah-optimasi, dan
-itu harus dibuktikan dengan diferensial menyeluruh lebih dulu. Temuan ini
-dicatat sebagai arah kerja berikutnya yang konkret, bukan diklaim sebagai sudah
-selesai.
+| `CG_CLIF_UNROLL` | runtime | output |
+|---|---|---|
+| 128 (default) | **7 ms** | `2899565707696607360` |
+| 1 (dimatikan) | **365 ms** | `2899565707696607360` |
+
+Itu **52× lebih cepat** dengan output identik. Jadi klaim di §13.4 versi
+sebelumnya — bahwa pass tidak pernah menyala — **salah**. Instrumen saya
+sebelumnya hanya mencatat penolakan, sehingga keberhasilan tidak terhitung, dan
+saya salah membaca hasil kosong sebagai "nol penerapan".
+
+Yang benar adalah lebih sempit dan tetap penting: **pass ini hanya menolong loop
+yang state-nya fungsi linear dari dirinya sendiri.** Pada loop panas
+`filter_symmetric_column` (§11.3) bentuknya bukan affine — ada pointer memori,
+indeks hasil perhitungan, dan beberapa state — sehingga reassociation tidak
+berlaku dan loop tetap satu elemen per iterasi.
+
+Konsekuensinya untuk laporan: perbaikan runtime `p5_inline` dan `p6_scalar`
+(900→7 ms, 910→8 ms) **berasal dari pass unroll ini**, bukan dari §13.1/§13.2.
+Saya memisahkan kontribusinya di §13.6 agar angka tidak saling diklaim.
+
+Keterbatasan yang tetap berlaku: perluasan ke bentuk non-affine (loop dengan
+pointer/memori, yang justru dominan di beban nyata) **tidak** dikerjakan di sini.
+Itu memerlukan analisis dependensi memori yang benar, dan melonggarkan syarat
+tanpa itu berisiko salah-optimasi. Ini arah kerja berikutnya yang konkret.
 
 ### 13.5 Matriks tiga arah final (§13)
 
@@ -1644,8 +1667,12 @@ Runtime per program:
 Ringkasan terhadap empat tujuan awal:
 
 - **Ukuran hasil**: modifikasi **31.663 KB vs upstream 45.689 KB (−30,7%)**,
-  dan **lebih kecil dari LLVM** (36.095 KB). Ini efek gabungan §13.2 dan
-  perbaikan sebelumnya.
+  dan **lebih kecil dari LLVM** (36.095 KB). Penyebab utamanya bukan §13.2,
+  melainkan patch `cranelift-object` yang memberi tiap fungsi dan objek data
+  seksi bernama unik, sehingga `--gc-sections` akhirnya bisa membuang kode mati.
+  Buktinya: pada std upstream ada **8.948 seksi `.text.subsection`** yang
+  bernama sama (jadi tak bisa dibuang), sedangkan di fork jumlahnya **0**.
+  Kontribusi §13.2 terhadap ukuran kecil; ia menang di runtime (§13.6).
 - **Waktu compile**: modifikasi 737 ms vs LLVM 876 ms (**−15,9%**), dan hanya
   +2,6% vs upstream (biaya dataflow store-forwarding §13.1, sesuai perkiraan
   3 ms/fungsi terbesar).
@@ -1657,3 +1684,48 @@ Ringkasan terhadap empat tujuan awal:
 
 Kebenaran: kedelapan program menghasilkan output **byte-identik** dengan LLVM
 (diverifikasi `diff`), di samping uji diferensial `[x; N]` di §13.2.
+
+### 13.6 Atribusi perbaikan, diukur satu per satu (§13)
+
+Supaya tidak ada angka yang saling diklaim, tiap optimisasi dimatikan sendiri
+lewat tunable-nya dan diukur ulang. Median 5 repetisi.
+
+| program | default | `UNROLL=1` | `SF_NO_CBE=1` | `NO_REPEAT_MEMSET=1` | inliner mati |
+|---|---|---|---|---|---|
+| p2_mem | 66 ms | 65 ms | 68 ms | 65 ms | **109 ms** |
+| p4_simd | 142 ms | 141 ms | 141 ms | 140 ms | 143 ms |
+| p5_inline | 6 ms | **361 ms** | 6 ms | 6 ms | 6 ms |
+| p6_scalar | 6 ms | **361 ms** | 6 ms | 6 ms | 6 ms |
+
+Bacaan yang benar:
+
+- **p5_inline dan p6_scalar ditenagai pass unroll** (6 → 361 ms bila dimatikan,
+  yaitu 60×). Ini kontribusi terbesar pada runtime total, dan datang dari
+  *affine reassociation* §13.4 — bukan dari §13.1/§13.2.
+- **p2_mem ditenagai inliner** (66 → 109 ms bila inliner dimatikan, −39%). Ini
+  mengoreksi atribusi sebelumnya: pada A/B pertama efek store forwarding hanya
+  −4,4%, dan setelah semua toggle diuji, penyebab dominan ternyata inlining —
+  `HashMap`/`Vec`/`sort_unstable` adalah kumpulan fungsi kecil yang baru
+  menguntungkan setelah badannya disatukan ke pemanggil.
+- **p4_simd tidak terpengaruh satu pun toggle.** Ini konsisten dengan §11.3:
+  beban itu loop memori non-affine, dan tidak ada satu pun perbaikan yang
+  menyentuhnya.
+
+Untuk §13.2 (memset) saya ukur terpisah pada pola yang memang menjadi sasarannya,
+karena tidak ada program benchmark yang didominasi zero-init:
+
+```rust
+for _ in 0..200_000 { let a = [0.0f32; 64]; let b = [1.5f64; 32]; let c = [0u32; 128]; ... }
+```
+
+| konfigurasi | runtime |
+|---|---|
+| memset aktif (default) | **4,8 ms** |
+| `CG_CLIF_NO_REPEAT_MEMSET=1` | **23,6 ms** |
+
+**4,9× lebih cepat**, output identik. Jadi §13.2 memang bernilai besar — hanya
+saja pada pola kode yang tidak muncul di delapan program benchmark ini, sehingga
+tidak terlihat di matriks §13.5.
+
+Tunable `CG_CLIF_NO_REPEAT_MEMSET` ditambahkan khusus agar klaim ini bisa
+direproduksi dan di-bisect.

@@ -45,6 +45,12 @@ pub(crate) fn store_forward_cross_block() -> bool {
     *V.get_or_init(|| !flag("CG_CLIF_SF_NO_CBE"))
 }
 
+/// Whether `Rvalue::Repeat` may lower to a memset (`CG_CLIF_NO_REPEAT_MEMSET`).
+pub(crate) fn repeat_memset() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| !flag("CG_CLIF_NO_REPEAT_MEMSET"))
+}
+
 /// Instruction-count budget above which the cross-block dataflow is skipped.
 pub(crate) fn store_forward_cbe_max() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
