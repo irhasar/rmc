@@ -1,5 +1,69 @@
 # AGENTS.md
 
+## Session (2026-11-19, latest) — small-switch compare chain (LANDED, `6cefd14`)
+- **Methodology trap (important)**: `cargo build` in a driver crate does NOT use
+  the Cranelift backend. You must set `RUSTC=rustc-clif` (with
+  `cg_clif_mod/dist/bin` on PATH), or you silently benchmark LLVM. Tell-tale
+  sign: binary ~579 KB (LLVM) instead of ~1.63 MB (Cranelift), and identical
+  md5 across tunable values. All §9 numbers in REPORT.md use the correct build.
+- **Disproved**: autovectorization is NOT the blur gap. LLVM with
+  `-Cno-vectorize-loops -Cno-vectorize-slp` gives 763 insts / **0 SIMD** and
+  still takes 1248 ms vs 1246 ms vectorized (551 insts / 71 SIMD). Also
+  disproved: `CG_CLIF_UNROLL` (1/4/16/128 → identical binary; the pass only
+  handles single-block constant-delta loops) and raising the inliner caps
+  (10380 vs 10359 ms, size grew).
+- **Root cause found**: `cranelift_frontend::Switch::emit` picks `br_table` for
+  any contiguous case range, so `match i { 0=>r, 1=>g, 2=>b }` becomes a jump
+  table. Binary had **2714** jump-table sites vs LLVM 0.
+- **Fix** (`cg_clif_mod/src/base.rs`, `SwitchInt`): ≤8 cases and discriminant
+  ≤64 bits → `icmp_imm_s` + `brif` chain. The 64-bit guard is REQUIRED:
+  `icmp_imm_s` takes an i64 immediate, so i128/f128 discriminants truncate
+  (that bug failed 13 coretests).
+- **Measured**: blur 10329 → 10004 ms (**-3.1%**), binary 1629168 → 1500000 B
+  (**-7.9%**), jump tables 2714 → 84. p1–p8 matrix did not regress (run 525 vs
+  528 ms, compile 715 vs 719 ms).
+- **Tests**: `./y.sh test --sysroot clif` → **exit 0, 0 failures across 65
+  suites** (6021 tests). Output byte-identical to LLVM.
+- **Push**: `GITHUB_TOKEN`/`OH_GIT_CREDENTIAL_ACCESS_TOKEN_GITHUB` are read-only
+  (403). Use `GH_PAT` with the explicit helper reset:
+  `git -c credential.helper= -c credential.https://github.com.helper= -c "credential.https://github.com.helper=!f(){ echo username=irhasar; echo password=$GH_PAT; };f" push origin <branch>`
+- **Remaining gap** (~8.3x on blur) is `cranelift-codegen` quality: loop
+  rotation / regalloc spilling (hot fn: 240 `(%rsp)` refs vs LLVM 66; LLVM
+  concentrates 60.6% of samples at one offset, Cranelift spreads over 213).
+  Out of scope for this fork.
+
+## Session (2026-11-17) — trivial-leaf inliner exemption (LANDED, `4d046cc`)
+- **Root cause**: `MAX_CALLEE_USES = 3` applied to *all* callees, including
+  one-operation bodies. `<f32 as Mul>::mul`, `<f32 as Add>::add`, and
+  `__iterator_get_unchecked` (1 and 12-13 CLIF insts) stayed out-of-line after
+  3 uses, so hot loops kept real calls, each forcing spill/reload around it.
+- **Fix**: leaves with `<= TRIVIAL_LEAF_INSTS` (16) insts are exempt from BOTH
+  the use cap and the growth-budget charge. Safe: one op, and a leaf has no
+  callees so no cascading; recursion still impossible. Knobs:
+  `CG_CLIF_INLINE_TRIVIAL_MAX`, `CG_CLIF_INLINE_NO_TRIVIAL` (A/B off).
+- **Threshold 8 is too low**: `__iterator_get_unchecked` is 12-13 CLIF insts.
+  Bisect on `filter_symmetric_column` calls: 8/9/11 -> 8 calls; 13/16/32 -> 0.
+  Runtime 15.27 s (t=8) -> 12.80 s (t=16); 32 is a plateau. Default = 16.
+- **Measured** (image blur 2048px, same compiler binary, knob only):
+  22.323 s -> 12.790 s (**1.75x**), binary 1.647.648 -> 1.627.864 B, output
+  identical. `filter_symmetric_row`: 581 insts/37 calls -> 359/**9** calls,
+  now *smaller* than LLVM (446 insts/9 calls). LLVM still wins via `mulps`
+  (9 vs 0).
+- **Tests**: `./y.sh test --sysroot clif` -> 25,368 passed, 0 failed.
+  `bat` + `tokei` rebuild and run; tokei output identical per-file (md5 differs
+  only by `reports` array order from hashmap iteration).
+- **No suite regression**: baseline vs final all within noise. p7_branchy
+  +9% is machine drift — the trivial-OFF config alone now measures 62 ms
+  where the old log said 55 ms.
+- **Corrects report 8.20**: that section claimed the remaining runtime gap was
+  "not the inliner, must be inside cranelift-codegen". Wrong here — the
+  inliner IS a cg_clif pass and closed 42% of the blur gap. What remains in
+  cranelift-codegen is (a) vectorization, (b) regalloc spilling (column filter
+  still 240 `(%rsp)` refs vs LLVM 66 with zero calls left).
+- **Docs**: REPORT.md 8.27 (this change) + 8.28 (final 3-way matrix).
+- **Gotcha**: `perf` is not installed in this container; use objdump/nm
+  symbol-size analysis instead of profiling.
+
 ## Session (2026-11-18, latest) — if-conversion diamond → select/cmove (LANDED locally)
 - New pass in the fork: `cg_clif_mod/src/if_convert.rs`. Collapses a short,
   side-effect-free two-way diamond (`brif` head -> then/else -> common join)
@@ -121,15 +185,10 @@
   the `jit/aot.std_example` ICE is gone.
 - `REPORT.md` §8.13–8.15 and `bench/fullbench.sh` record the full three-way
   matrix (RC=7/RR=9).
-- **Push resolved (2026-11-17)**: the read-only GitHub App token was replaced
-  with a user-supplied `repo`-scoped classic PAT. Branch
-  `replace-main-with-cgclif-experiments` now ends at `405dd8c` on the remote,
-  and PR #10 is open with `mergeable: true` / `mergeable_state: clean`
-  (50 commits, 926 files). The token was used only for this push and the PR
-  description edit; it is not stored in any git config or file.
-  Earlier blocker evidence, kept for context: `POST /git/refs` and `git push`
-  both returned 403 `Resource not accessible by integration`, and
-  `x-oauth-scopes` was empty on the App installation token.
+- **Push still blocked**: `irhasar/rmc` rejects every available credential (403
+  `Resource not accessible by integration`). Commit `7249d45` is local only; to
+  land it, push `replace-main-with-cgclif-experiments` with a `repo`-scoped PAT
+  (updates PR #10 in place).
 
 ## Repo purpose
 Experiments comparing Rust codegen backends: LLVM (`rustc`) vs
@@ -559,3 +618,172 @@ the residual 3–7x is **Cranelift codegen quality, not inlining**:
 - To finish: supply a `repo`-scoped PAT (or push manually):
   `git -C rmc_clone push https://<user>:<PAT>@github.com/irhasar/rmc.git replace-main-with-cgclif-experiments`
   This updates PR #10 in place; no new PR is needed.
+- **Push is no longer blocked**: it landed with a user-supplied `repo`-scoped
+  classic PAT. The earlier failures were *not* only a read-only token: passing
+  `-c credential.helper=` does **not** clear the global
+  `credential.https://github.com.helper` in `~/.gitconfig`, so the read-only
+  helper still answered first and every attempt returned 403. Working recipe
+  (token from env, never in the remote URL, so `.git/config` stays clean):
+
+      cd rmc_clone && GIT_TERMINAL_PROMPT=0 git \
+        -c credential.helper= \
+        -c credential.helper='!f() { echo username=<user>; echo "password=$GH_PAT"; }; f' \
+        push origin replace-main-with-cgclif-experiments
+
+- **Pushed**: `c64e31b` is on the remote; PR #10 is `mergeable_state: clean`.
+  Confirmed via the contents API that `cg_clif_mod/src/intrinsics/mod.rs` on
+  the remote contains the native `round` lowering.
+
+## Session 2026-11-19 (later) — the trunc libcall finding
+
+**Biggest single win so far: −15.8% runtime on the image blur benchmark, and
+fully portable (no `-Ctarget-cpu=native` needed).**
+
+### The finding
+
+`ftrunc` only lowers to `roundss`/`roundsd` when the target has **SSE4.1**
+(`vendor/cranelift-codegen-0.137.0/src/isa/x64/lower.isle`, the `x64_round_*`
+rules). On the x86-64 baseline it falls through to a libcall into
+`compiler_builtins`' soft-float `truncf`. `round` in cg_clif was built on
+`ins().trunc(x)`, so it inherited the same libcall.
+
+### Methodology lessons (both cost real time)
+
+1. **A first patch that changes nothing is a signal, not a dead end.** Patching
+   only `sym::trunc` gave 10091 ms vs 10053 ms — no change. The hot caller was
+   `round`, which called `ins().trunc(x)` internally. When a plausible fix
+   measures as noise, grep for *every* emission site of the instruction, not
+   just the intrinsic you assumed.
+2. **Never validate a lowering against itself.** The first correctness test
+   compared `v.trunc()` with `f64::trunc(v)` — both compiled by the lowering
+   under test. It "passed" while the code was wrong. Only a **cross-backend
+   differential** test is valid: hash the results in a CLIF-built binary and in
+   an LLVM-built binary, then compare the hashes.
+3. **A 2^32-iteration test must stream.** Buffering one line per f32 pattern
+   into a `String` OOM-killed the sandbox and wiped `~/.cargo` + `~/.rustup`.
+   Fold results into a running hash instead. Recovery: reinstall rustup, then
+   `rustup toolchain install nightly-2026-11-17 --profile minimal -c
+   rust-src,rustc-dev,llvm-tools,rustfmt` (per `rust-toolchain.toml`).
+
+### The fix
+
+`trunc_via_int` in `cg_clif_mod/src/intrinsics/mod.rs`: `fcvt_to_sint_sat` →
+`fcvt_from_sint` → `fcopysign` (to keep the sign of zero), guarded by
+`|x| < 2^mantissa_bits` with `select`. SSE2 only, never traps (the saturating
+conversion cannot).
+
+Correctness argument: any float at or above 2^mantissa_bits is already
+integral, so the round-trip is exact exactly where it is applied; below that
+bound the value is small enough to convert without overflow. NaN/infinity fail
+the magnitude test and pass through, which is what truncation returns.
+
+**The sign-of-zero bug is easy to miss**: the integer round-trip returns `+0.0`
+for `trunc(-0.4)`, which must be `-0.0`. The bundled test suite catches it
+(`num::floats::{trunc,round,fract}`), so always run the full suite — 6 tests
+failed on this alone.
+
+### Results
+
+| backend | wall (ms) | size (bytes) |
+|---|---|---|
+| LLVM | 1237.7 | — |
+| CLIF baseline | 10257.5 | 1500000 |
+| CLIF + small-switch | 10002.5 | 1500000 |
+| CLIF + small-switch + trunc | **8422.0** | **1499568** |
+| CLIF + `-Ctarget-cpu=native` | 8241.8 | 1498832 |
+
+`compiler_builtins` went from ~13% of profile samples to **zero**.
+
+Verified: differential hash identical to LLVM (`4de7d090cdfce77d`) over all
+2^32 f32 patterns plus an f64 sweep; `./y.sh test --sysroot clif` → 65 suites,
+0 failures; benchmark output byte-identical at n = 512/1024/2048.
+
+### Remaining gap
+
+8422 ms vs 1238 ms LLVM. Now dominated by codegen quality: `try_from_fn`,
+`wrap_mut_1`, `Pixels`, `Zip` never inlined (~18% of samples) and register
+spilling in the hot loop. §9.9's claim that this was "out of scope" is wrong —
+`cranelift-codegen` is vendored and patchable.
+
+### Push status — PUSHED
+
+Commit `5e92648` is on the remote; PR #10 head is `5e92648` (54 commits),
+`mergeable: True`, `mergeable_state: clean`, base `main`.
+
+The environment token situation is worth remembering: `GH_PAT` is **not**
+persisted to disk and dies with a sandbox restart, and `GITHUB_TOKEN` is a
+GitHub App token with **read-only contents** (`PUT /contents` → 403,
+`git push` → 403). With no SSH key, a fresh push needs a PAT supplied by the
+user. Use the credential-helper form (never the remote URL) so `.git/config`
+stays clean:
+
+    git -c credential.helper= \
+      -c "credential.https://github.com.helper=!f(){ echo username=<user>; echo password=<pat>; };f" \
+      push origin <branch>
+
+Verified after push: `trunc_via_int` and the `fcopysign` sign fix are present in
+`cg_clif_mod/src/intrinsics/mod.rs` on the remote branch.
+
+### Follow-up: the remaining gap is auto-vectorization, not inlining
+
+Re-profiled the final binary and then compared disassembly of the hot function
+`filter_symmetric_column` across both backends (same baseline x86-64 target):
+
+| metric | LLVM | CLIF (mod) |
+|---|---|---|
+| total instructions | 904 | 733 |
+| packed SIMD (`ps`/`pd`) | **75** | **1** |
+| breakdown | `movups`×34, `mulps`×17, `addps`×10, `shufps`×6, `xorps`×4, `movaps`×4 | `xorps`×1 |
+
+LLVM vectorizes the convolution 4 `f32` lanes at a time; Cranelift emits fully
+scalar code. **Cranelift has no loop vectorizer** — only local CLIF-level
+patterns (`simd_*`, i.e. hand-written `std::simd`), not automatic loop
+analysis. Closing this needs a real loop vectorizer in `cranelift-codegen`
+(dependence analysis, widening, tail handling), which is months of work and
+out of scope. `-Ctarget-cpu=native` only buys ~2% (8241.8 vs 8422.0 ms), which
+confirms SSE2 was always available — nothing uses it without a vectorizer.
+
+**Inlining is empirically saturated** — don't re-open that lead. Raising the
+existing tunables makes things worse:
+
+| config | runtime (ms) |
+|---|---|
+| default | 8440 |
+| `CG_CLIF_INLINE_MAX=200` | 8533 |
+| `CG_CLIF_INLINE_LEAF_MAX=200` | 8451 |
+| `CG_CLIF_INLINE_USES=10` | 8564 |
+
+So the gap is now fully explained: §9 (small switch) + §10 (trunc libcall) are
+landed wins; the rest is architectural. Documented as §11 in REPORT.md.
+
+### Session: floor/ceil were the same libcall class as trunc
+
+`floor`, `ceil`, `nearest` and `trunc` **all** reach the same `x64_round` rules
+in `vendor/cranelift-codegen-*/src/isa/x64/lower.isle`, which select a libcall
+when `has_sse41` is false. Fixing only `trunc`/`round` in the previous session
+left `floor` and `ceil` as soft-float calls. Measured on a compute-bound loop
+they were **6.3x / 6.6x** slower than LLVM; both now match.
+
+Two measurement mistakes cost real time here — avoid both:
+
+1. **`RUSTC=rustc-clif rustc ...` does nothing.** `RUSTC` is read by *cargo*,
+   not by `rustc`. Both "backends" were LLVM and the binaries were
+   byte-identical (`md5sum` proves it). Always invoke `rustc-clif` directly, and
+   sanity-check that the two binaries differ before trusting any timing.
+2. **A 16 MB array is memory-bound**, not compute-bound, which hides rounding
+   cost entirely. Keep the working set in L1 (16 KB) with many repetitions.
+
+Gating matters: the integer round-trip is ~3 instructions vs 1 `roundss`, so
+applying it unconditionally regressed `-Ctarget-cpu=native` by 4%. `FunctionCx`
+now caches `has_sse41` (read once per function — `isa_flags()` allocates a
+`Vec`, so never call it per call site).
+
+**`nearest` must stay as-is.** Its baseline libcall masks the mantissa rather
+than doing soft-float arithmetic, so it is already fast; an integer round-trip
+measured **15% slower**. "Libcall" does not imply "slow" — measure per case.
+Use interleaved A/B with many samples; single runs on this box vary ~15%.
+
+Verification pattern that works: print only a hash so memory stays constant,
+compile with both backends, and require identical hashes over all 2^32 f32
+patterns. Also confirm in the disassembly (`cvttss2si` vs `roundss`) that the
+intended code was actually emitted — the symbol table alone cannot tell you.

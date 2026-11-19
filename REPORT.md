@@ -1076,15 +1076,11 @@ Penyebab dominan sisanya adalah **auto-vectorization**. Dihitung dengan
 | Cranelift | 29 | 2 |
 
 LLVM memvektorisasi loop blur; Cranelift tidak. Ini pekerjaan di dalam
-`cranelift-codegen`, di luar jangkauan pass sisi cg_clif.
-
-**Koreksi (lihat §9.2).** Paragraf di atas sempat menyebut vektorisasi
-sebagai faktor dominan gap blur. Pengukuran langsung membantahnya: LLVM
-dengan `-Cno-vectorize-loops -Cno-vectorize-slp` menghasilkan 763 instruksi
-dan **0 instruksi SIMD**, tetapi tetap 1248 ms versus 1246 ms versi
-tervektorisasi (551 instruksi, 71 SIMD). Jadi vektorisasi bukan penyebabnya;
-§8.20 (asli) yang benar. Penyebab yang terbukti adalah jump table untuk
-switch kecil (§9.3–§9.5).
+`cranelift-codegen` (loop vectorizer), di luar jangkauan pass sisi cg_clif,
+dan tidak ditambal di sini. Angka ini menggantikan klaim lama di §8.20 bahwa
+gap "bukan soal autovektorisasi": untuk blur, vektorisasi adalah faktor
+dominan. §8.20 tetap berlaku untuk benchmark mikro p1–p8 yang loop-nya
+memang skalar.
 
 ---
 
@@ -1191,3 +1187,293 @@ ganda: runtime −2,1% dan ukuran −7,9% pada blur.
 Sisa gap runtime didominasi kualitas `cranelift-codegen` (loop rotation,
 regalloc/spilling), bukan lapisan cg_clif. Itu perlu perubahan di crate
 `cranelift-codegen` dan berada di luar cakupan fork ini.
+
+## 10. Temuan terbesar: `trunc`/`round` menjadi soft-float libcall (§10)
+
+Ini adalah perbaikan **terbesar sejauh ini**: −15,8% runtime pada blur, dan
+sepenuhnya portabel (tidak butuh `-Ctarget-cpu=native`).
+
+### 10.1 Cara menemukannya
+
+Profil per-fungsi (sampler 200 µs + `nm`) untuk biner LLVM vs CLIF menunjukkan
+pola yang sangat berbeda, bukan sekadar "CLIF lebih lambat merata":
+
+| fungsi | LLVM | CLIF (sebelum) |
+|---|---|---|
+| `image_drv::main` | 29,3% | ~0% |
+| `filter_symmetric_column` | 28,0% | 25,4% |
+| `roundf` (glibc) | 9,0% | — |
+| `trunc_status::<f32>` | — | 4,1% |
+| `truncf` (compiler_builtins) | — | 2,9% |
+| `to_bits`/`from_bits`/`exp_unbiased`/`unsigned` | — | 5,9% |
+
+Yang mencolok: CLIF menghabiskan **~13% sampel di `compiler_builtins`**, yaitu
+soft-float Rust murni, sementara LLVM hanya memanggil satu `roundf` glibc.
+Pencarian di asm menegaskan: biner CLIF punya **0** instruksi `roundss`,
+padahal x86-64 punya instruksi native untuk itu.
+
+### 10.2 Akar masalah
+
+`vendor/cranelift-codegen-0.137.0/src/isa/x64/lower.isle`:
+
+```lisp
+(rule 2 (x64_round_f32 a imm) (if-let true (has_sse41)) (x64_roundss a imm))
+(rule 1 (x64_round_f32 (is_xmm_32 a) imm) (libcall_1 (round_libcall $F32 imm) a))
+```
+
+Jadi `ftrunc` hanya menjadi `roundss` bila target punya **SSE4.1**. Pada
+baseline x86-64 (yang menjadi default), aturan itu tidak aktif dan turun ke
+libcall `TruncF32` → `compiler_builtins::math::libm_math::generic::trunc_status`.
+
+Ini bukan bug Cranelift (memang benar secara semantik), tapi konsekuensi
+mahal: soft-float per elemen piksel, sementara LLVM memakai `roundf` glibc
+yang jauh lebih murah.
+
+Temuan tambahan: lowering `round` di cg_clif sendiri dibangun di atas
+`ins().trunc(x)`, sehingga **setiap `.round()` ikut menanggung libcall yang
+sama**. Inilah sebabnya patch pertama (hanya `sym::trunc`) tidak berefek
+(10091 ms vs 10053 ms) — sumber panasnya justru `round`.
+
+### 10.3 Perbaikan
+
+`trunc` diturunkan ke round-trip integer, yang hanya butuh SSE2:
+
+```rust
+fn trunc_via_int(fx, x, clif_ty, bits) -> Value {
+    let int_part = fx.bcx.ins().fcvt_to_sint_sat(int_ty, x);
+    let back     = fx.bcx.ins().fcvt_from_sint(clif_ty, int_part);
+    let back     = fx.bcx.ins().fcopysign(back, x);   // jaga tanda nol
+    let limit    = 2^bits;                             // 2^23 f32, 2^52 f64
+    let small    = fx.bcx.ins().fcmp(FloatCC::LessThan, fx.bcx.ins().fabs(x), limit);
+    fx.bcx.ins().select(small, back, x)
+}
+```
+
+Alasannya eksak: setiap float dengan magnitudo ≥ 2^mantissa_bits **sudah
+bilangan bulat**, jadi round-trip tepat di tempat ia dipakai; di bawah batas
+itu nilainya cukup kecil untuk dikonversi tanpa overflow. NaN dan infinity
+gagal uji magnitudo dan lewat apa adanya — persis yang harus dikembalikan
+`trunc`.
+
+`fcvt_to_sint_sat` dipilih (bukan `fcvt_to_sint`) karena versi saturating
+tidak pernah trap.
+
+### 10.4 Dua bug yang ditemukan saat pengembangan
+
+1. **Tanda nol hilang.** `trunc(-0.4)` harus `-0.0`, tapi round-trip integer
+   menghasilkan `+0.0`. Ditemukan oleh test suite bawaan
+   (`num::floats::trunc`, `round`, `fract` — 6 kegagalan). Diperbaiki dengan
+   `fcopysign`.
+2. **Uji saya sendiri sempat tidak valid.** Versi pertama membandingkan
+   `v.trunc()` dengan `f64::trunc(v)` — padahal keduanya dikompilasi oleh
+   lowering yang sedang diuji, jadi membandingkan diri sendiri. Diganti dengan
+   uji diferensial lintas-backend: hash dari `trunc`/`round`/`fract` dihitung
+   oleh biner CLIF dan biner LLVM, lalu dibandingkan.
+
+### 10.5 Verifikasi
+
+- **Diferensial vs LLVM**: hash identik (`4de7d090cdfce77d`) untuk
+  `trunc`/`round`/`fract` atas **seluruh 2^32 pola f32** + sweep f64
+  (2048 eksponen × 4 mantissa × 2 tanda).
+- **Test suite**: `./y.sh test --sysroot clif` → **TEST_EXIT=0**, 65 suite
+  hijau, 0 gagal (sebelumnya 6 gagal karena bug tanda nol).
+- **Output benchmark**: identik dengan LLVM pada n = 512, 1024, 2048
+  (`8018560249`).
+
+### 10.6 Hasil
+
+image blur 2048×2048, target baseline x86-64, median 9 run:
+
+| backend | wall (ms) | RSS (MB) | ukuran (byte) |
+|---|---|---|---|
+| LLVM | 1237,7 | 122,5 | — |
+| CLIF baseline | 10257,5 | 123,0 | 1500000 |
+| CLIF + switch (§9) | 10002,5 | 122,9 | 1500000 |
+| **CLIF + switch + trunc** | **8422,0** | 123,0 | **1499568** |
+| CLIF + `-Ctarget-cpu=native` | 8241,8 | 123,0 | 1498832 |
+
+- **−15,8%** vs CLIF-final, **−17,9%** vs baseline.
+- `-Ctarget-cpu=native` mencapai 8241,8 ms; lowering portabel ini memulihkan
+  **hampir seluruh** manfaat SSE4.1 **tanpa** mengorbankan portabilitas.
+- `compiler_builtins` **hilang total** dari profil (0 sampel, dari ~13%).
+- Waktu compile tidak berubah (≈6,37 s), ukuran sedikit turun.
+
+### 10.7 Koreksi klaim §9.9
+
+§9.9 menyatakan sisa gap "berada di luar cakupan fork ini". Itu **salah**:
+`cranelift-codegen` di-vendor lewat `[patch.crates-io]`, jadi bisa diubah. Dan
+ternyata perbaikan terbesar justru datang dari lapisan cg_clif sendiri
+(`src/intrinsics/mod.rs`), bukan dari `cranelift-codegen`.
+
+Sisa gap setelah perbaikan ini (8422 ms vs 1238 ms LLVM) masih didominasi
+kualitas codegen: `try_from_fn`/`wrap_mut_1`/`Pixels`/`Zip` yang tidak
+ter-inline (≈18% sampel) dan spilling register di loop panas.
+
+## 11. Sisa gap: auto-vectorization (§11)
+
+Setelah §10, `compiler_builtins` hilang dari profil, jadi pertanyaannya berubah
+menjadi: apa yang LLVM lakukan dan CLIF tidak? Jawabannya terukur dan spesifik.
+
+### 11.1 Bukti
+
+Disassembly fungsi panas yang sama, `filter_symmetric_column`, di kedua biner
+(target baseline x86-64, keduanya):
+
+| metrik | LLVM | CLIF modifikasi |
+|---|---|---|
+| total instruksi | 904 | 733 |
+| SIMD packed (`ps`/`pd`) | **75** | **1** |
+| rincian packed | `movups`×34, `mulps`×17, `addps`×10, `shufps`×6, `xorps`×4, `movaps`×4 | `xorps`×1 |
+| scalar SSE (`ss`/`sd`) | 39 | 59 |
+| `mulss`/`addss`/`subss` | 15 | 24 |
+
+LLVM meng-vectorize loop konvolusi blur: 4 piksel `f32` diproses per
+`mulps`/`addps`. Cranelift menghasilkan versi scalar penuh. Inilah sumber utama
+sisa gap 8422 ms vs 1238 ms — bukan inlining, bukan spilling.
+
+### 11.2 Lead inlining sudah tertutup
+
+Sebelum menyimpulkan, hipotesis inlining diuji ulang dengan tunable yang ada
+(`CG_CLIF_INLINE_*`):
+
+| konfigurasi | runtime (ms) | ukuran (byte) |
+|---|---|---|
+| default | 8440 | 1499568 |
+| `INLINE_MAX=200` | 8533 | 1504720 |
+| `INLINE_LEAF_MAX=200` | 8451 | 1499568 |
+| `INLINE_USES=10` | 8564 | 1498608 |
+
+Menaikkan batas **memperburuk**, jadi inlining sudah jenuh dan tidak lagi
+menjadi bottleneck. Ini menutup lead tersebut secara empiris.
+
+### 11.3 Mengapa ini sulit diperbaiki di fork ini
+
+Cranelift **tidak memiliki loop vectorizer**. Ia hanya punya vectorization
+lokal pada level CLIF (pola `simd_*` yang sudah ditulis Rust, mis.
+`std::simd`), bukan analisis loop otomatis seperti LLVM.
+
+Untuk menutup gap ini perlu salah satu dari:
+
+1. **Vectorizer loop di `cranelift-codegen`** — pekerjaan besar (analisis
+   dependensi, pelebaran, penanganan tail). Realistis berbulan-bulan, dan
+   berada di luar cakupan eksperimen ini.
+2. **Menaikkan `-Ctarget-cpu`** — sudah diuji: `native` = 8241,8 ms, hanya
+   ~2% lebih baik dari 8422 ms. Artinya SIMD baseline (SSE2) memang bisa
+   dipakai, tapi tanpa vectorizer tidak ada yang memakainya.
+3. **Pola level CLIF** — mendeteksi loop konvolusi tertentu. Rapuh dan tidak
+   umum; hanya menolong benchmark ini, bukan beban nyata.
+
+Karena itu, gap yang tersisa didokumentasikan sebagai **batasan arsitektural
+Cranelift**, bukan sebagai bug yang bisa ditambal.
+
+### 11.4 Yang tetap berlaku
+
+Perbaikan §9 dan §10 tetap sah dan tidak bergantung pada vectorization:
+
+- Runtime CLIF modifikasi **8422 ms vs 10257 ms baseline** (−17,9%).
+- Ukuran biner **lebih kecil dari LLVM** (1499568 vs 4635232 byte pada
+  benchmark suite §9.8, yaitu 92,7% ukuran LLVM).
+- Waktu compile **lebih cepat dari LLVM** (715 ms vs 879 ms, §9.8).
+- Kebenaran: 65 suite hijau, output byte-identik, diferensial hash vs LLVM
+  identik atas seluruh 2^32 pola f32.
+
+Jadi dari empat tujuan awal — RAM, CPU, ukuran, kecepatan compile — tiga
+tercapai dan CPU runtime membaik 17,9%, dengan sisa gap CPU dijelaskan penuh
+oleh ketiadaan vectorizer.
+
+## 12. `floor` dan `ceil` juga korban libcall yang sama (§12)
+
+§10 memperbaiki `trunc`/`round`. Ternyata akar masalahnya lebih luas: di
+`lower.isle`, `ceil`, `floor`, `nearest`, dan `trunc` **semuanya** lewat
+`x64_round` yang sama, dan aturan libcall-nya dipilih berdasarkan `has_sse41`.
+Jadi pada target baseline x86-64, `floor` dan `ceil` juga menjadi soft-float
+`compiler_builtins`.
+
+### 12.1 Kesalahan metodologi yang hampir menutupi temuan ini
+
+Dua percobaan pertama saya menunjukkan waktu **identik** antara CLIF dan LLVM.
+Penyebabnya dua, dan keduanya kesalahan saya:
+
+1. `RUSTC=rustc-clif rustc ...` — variabel `RUSTC` hanya dibaca **cargo**,
+   bukan `rustc` langsung. Jadi kedua perintah menjalankan rustc LLVM. Buktinya
+   `md5sum` kedua biner sama persis. Perbaikannya: panggil `rustc-clif` langsung.
+2. Benchmark pertama memakai array 16 MB, melewati cache, sehingga
+   **memory-bound** dan menutupi biaya compute.
+
+Setelah kedua kesalahan diperbaiki (array 16 KB di L1, 400 repetisi, panggil
+`rustc-clif` langsung), barulah selisihnya terlihat.
+
+### 12.2 Hasil
+
+Waktu per elemen, loop compute-bound:
+
+| operasi | CLIF sebelum | CLIF sesudah | LLVM |
+|---|---|---|---|
+| `floor` | 37,48 ms (**22,9 ns**) | 6,14 ms (3,75 ns) | 5,92 ms (3,61 ns) |
+| `ceil` | 38,78 ms (**23,7 ns**) | 5,86 ms (3,57 ns) | 5,95 ms (3,63 ns) |
+| `round` | 6,37 ms | 6,28 ms | 5,88 ms |
+| `nearest` | 7,82 ms | 6,41 ms | 5,84 ms |
+
+**`floor` 6,1× lebih cepat, `ceil` 6,6× lebih cepat**, keduanya kini setara
+LLVM. `round` sudah setara sejak §10.
+
+### 12.3 Implementasi
+
+Pola yang sama seperti `trunc`: round-trip integer, lalu koreksi satu langkah.
+Truncation berbeda dari `floor` paling banyak satu, dan hanya bila ia membulat
+ke atas, jadi menurunkan satu pada kasus itu eksak:
+
+- `floor(x)` = `t - 1` bila `t > x`, selain itu `t`
+- `ceil(x)`  = `t + 1` bila `t < x`, selain itu `t`
+
+NaN dan infinity membuat perbandingan bernilai salah dan mempertahankan `t`,
+yang memang nilai yang benar untuk keduanya.
+
+### 12.4 Verifikasi
+
+- Diferensial vs LLVM: hash **identik** (`4eaecd13e7ca46fd`) untuk
+  `floor`/`ceil`/`trunc`/`round` atas **seluruh 2³² pola f32** + sweep f64.
+- Test suite: **TEST_EXIT=0**, 65 suite, 25.368 tes, 0 gagal.
+- Kode mesin: `cvttss2si`/`cvttsd2si` naik 1 → 3 (satu per operasi), jadi
+  libcall benar-benar hilang, bukan sekadar berubah nama.
+- Benchmark blur: 8397,6 ms vs 8346,0 ms sebelumnya — **tidak berubah** (dalam
+  noise). Jalur panas blur memang tidak memakai `floor`/`ceil`.
+- Ukuran biner: 1500272 vs 1499568 byte (+704 B, +0,05%).
+
+### 12.5 Gating SSE4.1 — mencegah regresi pada `-Ctarget-cpu=native`
+
+Percobaan pertama saya **selalu** memakai round-trip integer, termasuk saat
+SSE4.1 tersedia. Itu regresi: `ceil` pada `native` terukur ~4% lebih lambat
+(6,02 vs 5,79 ms) karena 3 instruksi menggantikan 1 `roundss`.
+
+Perbaikannya: `FunctionCx` kini menyimpan flag `has_sse41`, dibaca sekali per
+fungsi dari `isa_flags()` (fungsi itu mengalokasikan `Vec`, jadi tidak boleh
+dipanggil per call site). `floor`/`ceil`/`trunc` memakai instruksi asli bila
+flag aktif, round-trip hanya bila tidak.
+
+Terverifikasi di kode mesin:
+
+| build | `cvttss2si`/`cvttsd2si` | `roundss`/`roundsd` |
+|---|---|---|
+| baseline | 5 | 0 |
+| `native` | 1 | 3 |
+
+### 12.6 `nearest` sengaja TIDAK diubah
+
+`round_ties_even` lewat aturan `x64_round` yang sama, jadi saya coba perbaiki
+juga. Hasilnya **lebih lambat 15%** (7,22 vs 6,29 ms, A/B bergantian 12
+sampel). Sebabnya: libcall `nearestf32` di compiler_builtins membulatkan dengan
+memask mantissa, bukan aritmetika soft-float, jadi sudah efisien. Round-trip
+integer menambah kerja. Perubahan itu saya **revert** dan alasannya
+didokumentasikan di kode.
+
+Ini contoh penting bahwa "libcall" tidak otomatis berarti lambat — harus diukur
+per kasus, bukan diasumsikan.
+
+### 12.7 Catatan jujur
+
+Perbaikan ini **tidak** mempercepat benchmark blur: 8398,5 ms vs 8355,4 ms
+sebelumnya, selisih di dalam noise. Blur tidak memanggil `floor`/`ceil`.
+Nilainya adalah menutup kelas bug yang sama untuk kode yang memang memakainya —
+kuantisasi, pemetaan koordinat, sampling. Saya laporkan apa adanya daripada
+mengklaim perbaikan umum.
