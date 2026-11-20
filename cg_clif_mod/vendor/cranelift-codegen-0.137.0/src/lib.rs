@@ -88,6 +88,7 @@ mod ctxhash;
 mod egraph;
 mod inst_predicates;
 mod isle_prelude;
+mod licm;
 mod nan_canonicalization;
 mod opts;
 mod ranges;

@@ -26,7 +26,7 @@ use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::ir::{
     self, condcodes::IntCC, immediates::Imm64, Block, Inst, InstBuilder, Opcode, Value,
 };
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
 /// Number of loop iterations folded into one guarded step.
 pub(crate) const UNROLL_FACTOR: u64 = 128;
@@ -77,12 +77,290 @@ struct Plan {
     delta: u64,
 }
 
+/// Collapse blocks that only forward their arguments to another block.
+///
+/// cg_clif's `if`/`match` lowering leaves a one-instruction latch between the
+/// loop body and the header: the body jumps to the latch, the latch passes its
+/// parameters straight back to the header. That shape defeats `analyze`, which
+/// requires the body itself to carry the back edge, so the loop never unrolls
+/// (measured on a min-reduction loop: 2.2x LLVM deficit, unchanged by any
+/// unroll factor).
+///
+/// Threading the jump removes the block: the predecessor's branch is retargeted
+/// at the latch's destination with the latch's arguments substituted for its
+/// parameters. This is only valid when the latch has a single predecessor, so
+/// no other path can observe the removed block, and when every value the latch
+/// forwards is available at the predecessor's terminator -- true because a
+/// direct successor has nothing defined between them.
+fn collapse_forwarders(func: &mut ir::Function) -> bool {
+    let mut changed = false;
+    while let Some((pred, latch)) = find_forwarder(func) {
+        if !thread_forwarder(func, pred, latch) {
+            // The candidate was rejected after selection; nothing else can be
+            // learned by retrying, and re-finding it would loop forever.
+            break;
+        }
+        if std::env::var_os("CG_CLIF_UNROLL_DEBUG").is_some() {
+            eprintln!("[unroll]   collapsed pred={pred:?} latch={latch:?}");
+        }
+        changed = true;
+    }
+    changed
+}
+
+/// Find a `(predecessor, forwarder)` pair to collapse.
+fn find_forwarder(func: &ir::Function) -> Option<(Block, Block)> {
+    let dfg = &func.dfg;
+    let layout = &func.layout;
+    for latch in layout.blocks() {
+        // Trivial: nothing but `nop`s and a single trailing `jump`, and nothing
+        // that defines a value. cg_clif's `nop` can carry results (it stands in
+        // for a MIR statement whose value is discarded), and the jump may then
+        // forward one of them; removing the block would dangle that value, which
+        // the verifier reports as "defined by block N which is not in the layout".
+        let mut jump = None;
+        let mut trivial = true;
+        for inst in layout.block_insts(latch) {
+            if !dfg.inst_results(inst).is_empty() {
+                trivial = false;
+                break;
+            }
+            match dfg.insts[inst].opcode() {
+                Opcode::Nop => {}
+                Opcode::Jump => jump = Some(inst),
+                _ => {
+                    trivial = false;
+                    break;
+                }
+            }
+        }
+        if !trivial {
+            continue;
+        }
+        let Some(jump) = jump else { continue };
+        let ir::InstructionData::Jump { destination, .. } = dfg.insts[jump] else { continue };
+        let target = destination.block(&dfg.value_lists);
+        if target == latch || Some(target) == layout.entry_block() {
+            continue;
+        }
+        // Every forwarded argument must survive the latch's removal: block
+        // params are substituted with the incoming arguments, so only values
+        // *defined by an instruction* in the latch are a hazard, and those are
+        // already excluded above by rejecting blocks with results.
+        if std::env::var_os("CG_CLIF_UNROLL_DEBUG").is_some() {
+            let params: Vec<Value> = dfg.block_params(latch).to_vec();
+            let args: Vec<ir::BlockArg> = destination.args(&dfg.value_lists).collect();
+            eprintln!("[unroll]     latch {latch:?} params={params:?} fwd={args:?}");
+        }
+
+        // Exactly one incoming *edge*, so removing the block cannot strand
+        // another edge. Two subtleties:
+        //  - Count per edge, not per block: a `brif` whose arms both target the
+        //    latch is one predecessor block but two edges.
+        //  - Count *every* terminator kind, including `br_table`. Skipping
+        //    switch edges here let the pass delete a block that a `match` still
+        //    jumped to, which surfaced as "value defined by block N which is not
+        //    in the layout" and then as an invalid-value assertion inside the
+        //    egraph pass.
+        let mut pred = None;
+        let mut edges = 0;
+        for b in layout.blocks() {
+            if b == latch {
+                continue;
+            }
+            for inst in layout.block_insts(b) {
+                for call in
+                    dfg.insts[inst].branch_destination(&dfg.jump_tables, &dfg.exception_tables)
+                {
+                    if call.block(&dfg.value_lists) == latch {
+                        edges += 1;
+                        pred = Some(b);
+                    }
+                }
+            }
+        }
+        if edges != 1 {
+            continue;
+        }
+        let pred = pred.expect("edges == 1");
+        // Only thread through a plain jump or conditional branch: rewriting the
+        // arguments of a switch arm is not something this pass models.
+        let Some(pred_term) = layout.last_inst(pred) else { continue };
+        if !matches!(
+            dfg.insts[pred_term],
+            ir::InstructionData::Jump { .. } | ir::InstructionData::Brif { .. }
+        ) {
+            continue;
+        }
+        // Threading into the predecessor would leave a self-loop the unroller
+        // rejects anyway; skip it rather than build one.
+        if pred == target {
+            continue;
+        }
+        // The latch's parameters must not escape: substituting them with the
+        // predecessor's arguments is only sound on this path, so if any other
+        // block reads them the block cannot be removed.
+        if params_escape(func, latch) {
+            continue;
+        }
+        return Some((pred, latch));
+    }
+    None
+}
+
+/// Whether any block other than `block` reads one of `block`'s parameters.
+fn params_escape(func: &ir::Function, block: Block) -> bool {
+    let dfg = &func.dfg;
+    let params: FxHashSet<Value> = dfg.block_params(block).iter().copied().collect();
+    if params.is_empty() {
+        return false;
+    }
+    let reads_param = |v: Value| params.contains(&v) || params.contains(&dfg.resolve_aliases(v));
+    for b in func.layout.blocks() {
+        if b == block {
+            continue;
+        }
+        for inst in func.layout.block_insts(b) {
+            let data = &dfg.insts[inst];
+            for call in data.branch_destination(&dfg.jump_tables, &dfg.exception_tables) {
+                if call.args(&dfg.value_lists).any(|a| match a {
+                    ir::BlockArg::Value(v) => reads_param(v),
+                    _ => true,
+                }) {
+                    return true;
+                }
+            }
+            if data.arguments(&dfg.value_lists).iter().any(|v| reads_param(*v)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Retarget `pred`'s edge to `latch` at the latch's own destination, replacing
+/// the latch's parameters with the arguments `pred` passed them.
+fn thread_forwarder(func: &mut ir::Function, pred: Block, latch: Block) -> bool {
+    let latch_params: Vec<Value> = func.dfg.block_params(latch).to_vec();
+    let latch_term = func.layout.last_inst(latch).expect("forwarder has a jump");
+    let (target, latch_args) = match &func.dfg.insts[latch_term] {
+        ir::InstructionData::Jump { destination, .. } => (
+            destination.block(&func.dfg.value_lists),
+            destination.args(&func.dfg.value_lists).collect::<Vec<_>>(),
+        ),
+        _ => unreachable!("forwarder ends in a jump"),
+    };
+    let pred_term = func.layout.last_inst(pred).expect("predecessor has a terminator");
+
+    // Arguments the predecessor already passes to the latch, mapped onto the
+    // latch's parameters: these are what the latch forwarded onward.
+    let incoming: Vec<ir::BlockArg> = match &func.dfg.insts[pred_term] {
+        ir::InstructionData::Jump { destination, .. } => {
+            destination.args(&func.dfg.value_lists).collect()
+        }
+        ir::InstructionData::Brif { blocks, .. } => {
+            let idx = blocks
+                .iter()
+                .position(|b| b.block(&func.dfg.value_lists) == latch)
+                .expect("pred jumps to latch");
+            blocks[idx].args(&func.dfg.value_lists).collect()
+        }
+        _ => unreachable!("successor edge must be a jump or brif"),
+    };
+    if incoming.len() != latch_params.len() {
+        return false;
+    }
+    let param_arg: FxHashMap<Value, ir::BlockArg> =
+        latch_params.iter().copied().zip(incoming.iter().copied()).collect();
+
+    // Build the replacement arguments *before* touching the pools. Every value
+    // must be expressible at `pred`: either a latch parameter (substituted with
+    // what `pred` passes in) or a value already defined elsewhere. Anything the
+    // latch itself computes would dangle once the block is gone.
+    let mut new_args: Vec<ir::BlockArg> = Vec::with_capacity(latch_args.len());
+    for a in &latch_args {
+        match a {
+            ir::BlockArg::Value(v) => {
+                let resolved = func.dfg.resolve_aliases(*v);
+                if let Some(arg) = param_arg.get(&resolved).or_else(|| param_arg.get(v)) {
+                    new_args.push(*arg);
+                } else if latch_params.contains(&resolved) || latch_params.contains(v) {
+                    return false;
+                } else if matches!(func.dfg.value_def(resolved), ir::ValueDef::Result(i, _)
+                    if func.layout.inst_block(i) == Some(latch))
+                {
+                    return false;
+                } else {
+                    new_args.push(ir::BlockArg::Value(resolved));
+                }
+            }
+            _ => return false,
+        }
+    }
+
+    let mut pool = std::mem::take(&mut func.dfg.value_lists);
+    let new_call = ir::BlockCall::new(target, new_args.iter().copied(), &mut pool);
+    match &mut func.dfg.insts[pred_term] {
+        ir::InstructionData::Jump { destination, .. } => *destination = new_call,
+        ir::InstructionData::Brif { blocks, .. } => {
+            let idx = blocks
+                .iter()
+                .position(|b| b.block(&pool) == latch)
+                .expect("pred jumps to latch");
+            blocks[idx] = new_call;
+        }
+        _ => unreachable!("successor edge must be a jump or brif"),
+    }
+    func.dfg.value_lists = pool;
+
+    // `Layout::remove_block` only *debug*-asserts that the block is empty, so a
+    // release build would silently drop the block while its instructions stay in
+    // the layout, leaving values pointing at a block that is no longer present.
+    for inst in func.layout.block_insts(latch).collect::<Vec<_>>() {
+        func.layout.remove_inst(inst);
+    }
+    func.layout.remove_block(latch);
+    true
+}
+
 pub(crate) fn run(func: &mut ir::Function) {
     let factor = unroll_factor();
     if factor < 2 {
         return;
     }
-    let Some(plan) = analyze(func) else { return };
+    if super::tunables::collapse_forwarders_enabled() {
+        collapse_forwarders(func);
+    }
+    if std::env::var_os("CG_CLIF_UNROLL_DEBUG").is_some() {
+        eprintln!("[unroll] func {:?} blocks={}", func.name, func.layout.blocks().count());
+        for b in func.layout.blocks() {
+            let params: Vec<String> =
+                func.dfg.block_params(b).iter().map(|v| format!("{v:?}")).collect();
+            eprintln!("[unroll]   {b:?} params=[{}]", params.join(","));
+            for i in func.layout.block_insts(b) {
+                let extra = match &func.dfg.insts[i] {
+                    ir::InstructionData::Jump { destination, .. } => format!(
+                        " -> {:?}({:?})",
+                        destination.block(&func.dfg.value_lists),
+                        destination.args(&func.dfg.value_lists).collect::<Vec<_>>()
+                    ),
+                    ir::InstructionData::Brif { blocks, .. } => format!(
+                        " -> [{:?},{:?}]",
+                        blocks[0].block(&func.dfg.value_lists),
+                        blocks[1].block(&func.dfg.value_lists)
+                    ),
+                    _ => String::new(),
+                };
+                eprintln!("[unroll]   {b:?} {i:?} {}{}", func.dfg.insts[i].opcode(), extra);
+            }
+        }
+    }
+    let Some(plan) = analyze(func) else {
+        if std::env::var_os("CG_CLIF_UNROLL_DEBUG").is_some() {
+            eprintln!("[unroll] -> REJECTED by analyze");
+        }
+        return;
+    };
     // `apply` scales the induction step by `factor`, and the guard it inserts
     // assumes `delta * (factor - 1)` did not wrap. Shrink the factor for large
     // steps so that assumption always holds.
@@ -125,6 +403,7 @@ fn defined_in(func: &ir::Function, v: Value, blocks: &[Block]) -> bool {
 fn analyze(func: &ir::Function) -> Option<Plan> {
     let dfg = &func.dfg;
     let layout = &func.layout;
+    let dbg = std::env::var_os("CG_CLIF_UNROLL_DEBUG").is_some();
 
     for body in layout.blocks() {
         let Some(term) = layout.last_inst(body) else { continue };
@@ -142,7 +421,15 @@ fn analyze(func: &ir::Function) -> Option<Plan> {
         let ir::InstructionData::Brif { arg: cond, blocks, opcode: _ } = dfg.insts[hterm] else {
             continue;
         };
+        if dbg {
+            eprintln!(
+                "[unroll]   cand body={body:?} header={header:?} brif->[{:?},{:?}]",
+                blocks[0].block(&dfg.value_lists),
+                blocks[1].block(&dfg.value_lists)
+            );
+        }
         if blocks[0].block(&dfg.value_lists) != body {
+            if dbg { eprintln!("[unroll]     X: then-arm is not body"); }
             continue;
         }
 
@@ -151,22 +438,27 @@ fn analyze(func: &ir::Function) -> Option<Plan> {
         let back_edges =
             loop_blocks.iter().filter(|&&b| successors(func, b).contains(&header)).count();
         if back_edges != 1 {
+            if dbg { eprintln!("[unroll]     X: back_edges={back_edges}"); }
             continue;
         }
 
         // The continue test must be `icmp(cc, iv, bound)` with a single header
         // parameter on one side and a loop-invariant value on the other.
         let cond = dfg.resolve_aliases(cond);
-        let ir::ValueDef::Result(icmp_inst, 0) = dfg.value_def(cond) else { continue };
+        let ir::ValueDef::Result(icmp_inst, 0) = dfg.value_def(cond) else {
+            if dbg { eprintln!("[unroll]     X: cond not an inst result"); }
+            continue;
+        };
         let ir::InstructionData::IntCompare { cond: cc, args, opcode: _ } = dfg.insts[icmp_inst]
         else {
+            if dbg { eprintln!("[unroll]     X: cond not icmp: {:?}", dfg.insts[icmp_inst].opcode()); }
             continue;
         };
         // Only increasing loops, so the wide step cannot overshoot the bound.
         let iv_left = match cc {
             IntCC::UnsignedLessThan | IntCC::UnsignedLessThanOrEqual => true,
             IntCC::UnsignedGreaterThan | IntCC::UnsignedGreaterThanOrEqual => false,
-            _ => continue,
+            _ => { if dbg { eprintln!("[unroll]     X: cc={cc:?}"); } continue },
         };
         let (lhs, rhs) = (args[0], args[1]);
 
@@ -175,10 +467,10 @@ fn analyze(func: &ir::Function) -> Option<Plan> {
             _ => None,
         };
         let (iv_idx, iv, bound) = if iv_left {
-            let Some(i) = param_of(lhs) else { continue };
+            let Some(i) = param_of(lhs) else { if dbg { eprintln!("[unroll]     X: lhs not header param"); } continue };
             (i, lhs, rhs)
         } else {
-            let Some(i) = param_of(rhs) else { continue };
+            let Some(i) = param_of(rhs) else { if dbg { eprintln!("[unroll]     X: rhs not header param"); } continue };
             (i, rhs, lhs)
         };
         // The bound must be loop-invariant. A value defined inside the loop is
@@ -186,6 +478,7 @@ fn analyze(func: &ir::Function) -> Option<Plan> {
         // the header for a literal trip count.
         let loop_blocks = [header, body];
         if const_of(func, bound).is_none() && defined_in(func, bound, &loop_blocks) {
+            if dbg { eprintln!("[unroll]     X: bound not invariant"); }
             continue;
         }
 
@@ -197,23 +490,26 @@ fn analyze(func: &ir::Function) -> Option<Plan> {
         };
         let args: Vec<ir::BlockArg> = back_call.args(&dfg.value_lists).collect();
         if args.len() != dfg.block_params(header).len() {
+            if dbg { eprintln!("[unroll]     X: arity mismatch"); }
             continue;
         }
-        let ir::BlockArg::Value(step_val) = args[iv_idx] else { continue };
+        let ir::BlockArg::Value(step_val) = args[iv_idx] else { if dbg { eprintln!("[unroll]     X: step not value"); } continue };
         let step_val = dfg.resolve_aliases(step_val);
-        let ir::ValueDef::Result(step_inst, 0) = dfg.value_def(step_val) else { continue };
+        let ir::ValueDef::Result(step_inst, 0) = dfg.value_def(step_val) else { if dbg { eprintln!("[unroll]     X: step not inst result"); } continue };
         let ir::InstructionData::Binary { opcode: Opcode::Iadd, args: sargs, .. } =
             dfg.insts[step_inst]
         else {
+            if dbg { eprintln!("[unroll]     X: step not iadd"); }
             continue;
         };
         let iv = dfg.resolve_aliases(iv);
         let delta = match (const_of(func, sargs[0]), const_of(func, sargs[1])) {
             (None, Some(d)) if dfg.resolve_aliases(sargs[0]) == iv => d,
             (Some(d), None) if dfg.resolve_aliases(sargs[1]) == iv => d,
-            _ => continue,
+            _ => { if dbg { eprintln!("[unroll]     X: step not iv+const: sargs={sargs:?} iv={iv:?}"); } continue },
         };
         if delta == 0 || delta > MAX_DELTA {
+            if dbg { eprintln!("[unroll]     X: delta={delta}"); }
             continue;
         }
 

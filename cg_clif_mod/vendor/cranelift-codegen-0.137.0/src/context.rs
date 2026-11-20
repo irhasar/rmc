@@ -193,6 +193,17 @@ impl Context {
 
         if opt_level != OptLevel::None {
             self.egraph_pass(isa, ctrl_plane)?;
+            if crate::licm::enabled() {
+                // The egraph has already folded and simplified the loop body;
+                // hoisting after it means the invariants we move are the final
+                // ones, not forms that later get rewritten in place.
+                self.compute_cfg();
+                self.compute_domtree();
+                self.compute_loop_analysis();
+                crate::licm::do_licm(&mut self.func);
+                self.compute_cfg();
+                self.compute_domtree();
+            }
         }
 
         Ok(())

@@ -124,6 +124,13 @@ pub(crate) fn unroll_clone() -> bool {
     *V.get_or_init(|| flag("CG_CLIF_UNROLL_CLONE"))
 }
 
+/// Whether the unroller collapses trivial forwarding latches
+/// (`CG_CLIF_NO_COLLAPSE` off).
+pub(crate) fn collapse_forwarders_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| !flag("CG_CLIF_NO_COLLAPSE"))
+}
+
 /// Cranelift `opt_level` override (`CG_CLIF_OPT_LEVEL`).
 pub(crate) fn opt_level() -> Option<&'static str> {
     static V: OnceLock<Option<String>> = OnceLock::new();
