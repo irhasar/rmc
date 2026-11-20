@@ -548,6 +548,13 @@ Biaya `store_forward` di p2_mem: **9.2 ms → 5.1 ms**; total pass kustom p2_mem
 ≈ 8 ms dari ~128 ms compile (≈6%). Profil pass Cranelift (sampel): total ≈27.9 ms;
 Compilation ≈14.5, Egraph ≈4.6, Regalloc ≈4.2, VCode lower ≈2.0, emit ≈1.5.
 
+> **Koreksi (§17):** angka "≈8 ms / ≈6%" di atas **tidak sahih**. Saat itu
+> `passtime::report()` belum pernah dipanggil dan akumulatornya thread-local,
+> sehingga total yang tercetak selalu nol dan sisanya diestimasi, bukan diukur.
+> Setelah instrumentasi benar-benar tersambung, anggaran pass p2_mem ternyata
+> `store_forward` 8–12 ms + `unroll` 2,4 ms + `inline` 3–4 ms + `if_convert`
+> 1,8–2,6 ms + `collect` 1,7–1,8 ms. Rinciannya di §17.6.
+
 ### 8.14 Perbaikan ICE SIMD lane — LANDED
 
 Commit `a9d182a` ("Keep SIMD values in registers") membuat nilai `#[repr(simd)]`
