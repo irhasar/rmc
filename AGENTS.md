@@ -1,6 +1,38 @@
 # AGENTS.md
 
-## Session (2026-11-19, latest) — small-switch compare chain (LANDED, `6cefd14`)
+## Session (2026-11-20, latest) — `unroll` pass was quadratic (LANDED, `f6d2ae5`)
+- **The per-pass instrumentation had never worked.** `passtime::report()` had no
+  caller, and its accumulator was `thread_local!` while codegen runs on rustc's
+  worker threads, so every number it could have printed was zero. Fixed both:
+  `report("aot")` is now called from `codegen_crate`, and the accumulator is a
+  shared `static [AtomicU64; 5]`. Enable with `CG_CLIF_PASS_TIME=1`.
+- **First real numbers** (`p2_mem`, cgu.1): `store_forward=8.4ms unroll=18.9ms
+  inline=3.6ms collect=1.9ms if_convert=1.9ms`. `unroll` was the most expensive
+  pass, ahead of `store_forward` which does far more work.
+- **Root cause**: `collapse_forwarders` → `find_forwarder` rebuilt three
+  whole-function facts (incoming edge counts, edge sources, per-value reader
+  counts for `params_escape`) on **every successful collapse**. `p2_mem` does
+  1419 collapses, so the same function was rescanned 1419 times — quadratic in
+  the block count.
+- **Fix**: those facts moved into `struct Forwarders`, built once in
+  `Forwarders::new` and updated incrementally in `Forwarders::removed` (drop the
+  latch's edge, retarget the predecessor's edge to the latch's target). Trivial
+  block candidates are also filtered once, not per iteration.
+- **Measured**: `unroll` **18.9 → 2.4 ms** (7.9x), `collapse` sub-phase 18.8 →
+  2.7 ms, iterations 1419 → 1093.
+- **Tests**: `./y.sh test` → **25368 passed / 0 failed** (65 suites). p-suite
+  8/8 and s-suite 10/10 output-identical to LLVM.
+- **Note on remaining compile overhead**: mod is still ~13% slower than upstream
+  to compile `p2_mem` (148 vs 130 ms). That is the honest price of four added
+  passes, not a bug — `store_forward` is now the most expensive at 8–12 ms and
+  is linear in instruction count (178 funcs → 10.1 ms total). On programs that
+  do not trigger the passes the cost is zero.
+- **Push still blocked**: `GITHUB_TOKEN` is a read-only GitHub App token
+  (`ghu_`, "Resource not accessible by integration"); the credential helper
+  returns empty. A user-supplied `repo`-scoped `GH_PAT` is required — see the
+  helper-reset recipe in the 2026-11-19 session below.
+
+## Session (2026-11-19) — small-switch compare chain (LANDED, `6cefd14`)
 - **Methodology trap (important)**: `cargo build` in a driver crate does NOT use
   the Cranelift backend. You must set `RUSTC=rustc-clif` (with
   `cg_clif_mod/dist/bin` on PATH), or you silently benchmark LLVM. Tell-tale
