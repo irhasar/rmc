@@ -1975,3 +1975,111 @@ Sisa selisih p4_simd (96,2 vs 55,3 ms) berasal dari hal lain: LLVM menggabungkan
 memanggil `sinf@` dan `cosf@` terpisah). Penggabungan itu adalah transformasi
 tingkat IR (loop fusion + common-subexpression), bukan sesuatu yang bisa
 disimpulkan di level mesin.
+
+## 16. Batas inliner lintas-CGU pada rantai iterator (LANDED)
+
+### 16.1 Gejala
+
+`(0..N).map(|i| f(i)).collect::<Vec<u8>>()` berjalan **10x** lebih lambat
+daripada build LLVM (20,0 ms vs 2,0 ms untuk 4 juta elemen). Angka itu aneh
+karena isi loop-nya hanya aritmetika sepele dan satu tulis byte; 5 ns per byte
+jauh di atas biaya yang wajar untuk kerja sebesar itu.
+
+Yang membuatnya menonjol: `insert` biasa pada `HashMap` justru **2x lebih
+cepat** daripada LLVM, dan `vec![7u8; N]` hanya 2,55x. Jadi bukan "Cranelift
+lambat di memori", melainkan satu bentuk kode tertentu.
+
+### 16.2 Akar masalah
+
+`collect` menurunkan `map` + `Range` menjadi `extend_trusted`, yang menyerahkan
+loop elemen ke `fold`. Loop itu, sebelum perbaikan, berbunyi:
+
+```
+fold:
+  call Range::spec_next        ; per elemen
+  call map_fold (closure)      ; per elemen
+  spill/restore state iterator ; per elemen
+  jmp fold
+```
+
+Dua call nyata per elemen, ditambah simpan-muat state iterator ke stack di
+sekelilingnya. LLVM meng-inline seluruh rantai itu menjadi beberapa instruksi,
+sehingga selisihnya bukan soal kualitas instruksi melainkan soal **ada atau
+tidaknya call**.
+
+Penyebabnya adalah batas inliner fork ini, yang diukur untuk loop numerik padat:
+
+| knob | nilai lama | mengapa gagal di sini |
+|---|---|---|
+| `MAX_CALLEE_INSTS` | 64 | body `fold`/`extend_trusted` jauh lebih besar |
+| `MAX_LEAF_INSTS` | 192 | body leaf rantai iterator melewati 192 |
+| `GROWTH_PCT` | 50 | budget tumbuh habis sebelum call terakhir hilang |
+| `MAX_CALLEE_USES` | 3 | pemanggil yang sama butuh lebih dari 3 inline |
+
+Keempatnya binding **bersamaan**: menaikkan salah satu saja sudah menutup
+sebagian besar gap (20,4 → 10,0-11,3 ms), yang menandakan keempat batas itu
+saling menutup jalan.
+
+### 16.3 Perbaikan
+
+Default dinaikkan ke `MAX_CALLEE_INSTS=128`, `MAX_LEAF_INSTS=384`,
+`GROWTH_PCT=150`, `MAX_CALLEE_USES=5`. Nilai ini dipilih dari sapuan beberapa
+konfigurasi, bukan ditebak: konfigurasi yang lebih agresif (256/512/200/6)
+memang lebih cepat di `collect` tetapi **meregresi p4_simd** (95,5 → 103,7 ms),
+sedangkan 128/384/150/5 menang di keduanya.
+
+### 16.4 Hasil
+
+Runtime, median 9 rep:
+
+| prog | LLVM | sebelum | sesudah | Δ |
+|---|---|---|---|---|
+| p2_mem | 16,2 ms | 65,7 ms | **52,5 ms** | **−20,1%** |
+| p7_branchy | 43,0 ms | 60,6 ms | **55,4 ms** | **−8,6%** |
+| p4_simd | 56,4 ms | 96,9 ms | 96,9 ms | 0,0% |
+| p5_inline | 57,7 ms | 6,4 ms | 6,4 ms | 0,0% |
+| p6_scalar | 58,0 ms | 6,4 ms | 6,4 ms | 0,0% |
+| p1_arith | 81,4 ms | 104,9 ms | 105,9 ms | +1,0% |
+| p8_minmax | 17,7 ms | 38,2 ms | 38,6 ms | +1,0% |
+| p9_u64f32 | 30,2 ms | 34,4 ms | 34,6 ms | +0,6% |
+| p3_calls | 36,9 ms | 96,7 ms | 95,9 ms | −0,8% |
+
+Pada kernel yang menjadi sasaran, efeknya jauh lebih besar:
+
+| kernel | LLVM | sebelum | sesudah | Δ |
+|---|---|---|---|---|
+| `collect` 4 juta byte (i5) | 2,0 ms | 19,9 ms | **10,7 ms** | **−46%** |
+| hitung byte (k2) | 6,9 ms | 24,2 ms | **13,1 ms** | **−46%** |
+
+Biaya yang dibayar **nol**: waktu compile dan ukuran artifact tidak berubah.
+Diukur dengan `wait4`/`rusage`:
+
+| prog | backend | CPU compile | peak RSS | ukuran |
+|---|---|---|---|---|
+| p2_mem | LLVM | 0,39 s | 133 MB | 4531 KB |
+| p2_mem | sebelum | 0,23 s | 133 MB | 4040 KB |
+| p2_mem | sesudah | 0,23 s | 133 MB | 4040 KB |
+| p1_arith | sebelum | 0,10 s | 109 MB | 4033 KB |
+| p1_arith | sesudah | 0,10 s | 109 MB | 4033 KB |
+
+Ukuran binary bahkan sempat **turun** beberapa KB pada beberapa program, karena
+badan fungsi yang tadinya berdiri sendiri kini tidak perlu di-emit terpisah.
+
+### 16.5 Verifikasi
+
+- 25.368 tes lulus, 0 gagal (`./y.sh test`).
+- 9/9 program benchmark menghasilkan output identik dengan LLVM.
+- `bench/tests/t_iter_inline.rs` menutup bentuk kode ini: rantai `map`+`collect`,
+  `filter`+`map`+`collect`, `step_by` (state iterator yang bukan range sederhana),
+  dan `collect` bersarang.
+- Knob `CG_CLIF_INLINE_*` tetap ada untuk bisecting, jadi perubahan ini bisa
+  dimatikan tanpa rebuild bila perlu.
+
+### 16.6 Sisa gap
+
+Setelah call hilang, sisa selisih `collect` (10,7 vs 2,0 ms) berasal dari
+**autovectorization**: LLVM mengubah loop hitung/tulis byte menjadi SIMD
+(`pcmpeqb` + `pand` + horizontal add pada `i4_static`). Cranelift tidak punya
+autovectorizer, dan menambahkannya adalah pekerjaan tingkat pass yang jauh lebih
+besar daripada perubahan budget ini. Gap yang sama muncul di k2/k7 (3x) dan
+k8_sort (3,1x) — semuanya bentuk yang LLVM vectorize atau unroll.

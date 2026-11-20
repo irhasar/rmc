@@ -16,7 +16,7 @@ use cranelift_codegen::inline::{Inline, InlineCommand};
 use rustc_data_structures::fx::FxHashMap;
 
 /// Largest callee (in CLIF instructions) we are willing to inline.
-pub(crate) const MAX_CALLEE_INSTS: usize = 64;
+pub(crate) const MAX_CALLEE_INSTS: usize = 128;
 
 /// Largest *leaf* callee (no calls of its own) we are willing to inline.
 ///
@@ -25,7 +25,14 @@ pub(crate) const MAX_CALLEE_INSTS: usize = 64;
 /// boundary, which is what turns a per-iteration helper call into straight-line
 /// code. They cannot pull in further callees, so a larger cap here does not
 /// cascade the way it would for a wrapper.
-pub(crate) const MAX_LEAF_INSTS: usize = 192;
+///
+/// The iterator chain a `collect` lowers to is the motivating case: `extend_trusted`
+/// hands the element loop to `fold`, which calls `Range::spec_next` and the
+/// `map_fold` closure once per element. Those bodies are a few hundred
+/// instructions together, above the old 192 cap, so the loop kept two real calls
+/// per element along with the spill and reload of the iterator state around each
+/// one. Raising the cap lets the loop become straight-line code.
+pub(crate) const MAX_LEAF_INSTS: usize = 384;
 
 /// Total number of callee instructions we are willing to add to a single caller.
 const INLINE_BUDGET: usize = 512;
@@ -34,7 +41,7 @@ const INLINE_BUDGET: usize = 512;
 const MIN_GROWTH: usize = 64;
 
 /// Maximum number of times a single callee may be inlined into one caller.
-pub(crate) const MAX_CALLEE_USES: usize = 3;
+pub(crate) const MAX_CALLEE_USES: usize = 5;
 
 /// Trivial leaves are exempt from [`MAX_CALLEE_USES`].
 ///
@@ -57,7 +64,7 @@ pub(crate) fn trivial_leaf_insts() -> usize {
 }
 
 /// Default growth budget, as a percentage of the caller's instruction count.
-pub(crate) const GROWTH_PCT: usize = 50;
+pub(crate) const GROWTH_PCT: usize = 150;
 
 /// `CG_CLIF_INLINE_USES` overrides [`MAX_CALLEE_USES`] (0 disables inlining); used for bisecting.
 fn max_callee_uses() -> usize {
