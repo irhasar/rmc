@@ -896,3 +896,46 @@ stat -c%s /tmp/fb/p1_arith_U /tmp/fb/p1_arith_L             # must differ
 must use its own. Do not add one; pointing `--sysroot` at
 `dist/lib/rustlib/<triple>` produces `E0463: can't find crate for std`.
 Rebuild with `./y.sh build --sysroot clif` in both trees before measuring.
+
+## Session 2026-11-17 — divisibility folding pass
+
+**New pass: `cg_clif_mod/src/div_test.rs`** rewrites `x % C == 0` / `!= 0` /
+`brif` on a remainder into a multiply-compare, dropping the `urem` entirely.
+Commit `8aa1dfb` in `rmc_clone` (subtree layout, branch
+`replace-main-with-cgclif-experiments` = PR #10's head).
+
+Identity for odd `C`: `x % C == 0 <=> (x * C^-1 mod 2^64) <= (2^64-1)/C`.
+Even `C` peels its power of two as a mask first. `srem` is left alone
+(truncating division rounds toward zero, so negative `x` breaks the identity).
+
+Two traps worth remembering:
+
+1. **Two use-site shapes need different rewrites.** `brif rem, ..` uses the
+   remainder *as* the condition — swap `blocks` targets and feed the new test
+   in. `icmp eq rem, 0` produces a *separate value* that other code consumes —
+   redirect that result with `detach_inst_results` + `change_to_alias`, never
+   the comparison's operands. Getting this wrong is silent and type-checks:
+   the icmp ends up testing its own boolean result, so `filter(|x| x % 3 == 0)`
+   keeps the complement and `t_iter` prints exactly 2x the right number.
+   Eight benchmarks all passed while this bug was live — `t_iter` is the
+   regression test that catches it.
+2. **`CG_CLIF_*` tunables are read at compile time, not run time.**
+   `CG_CLIF_NO_DIVTEST=1 ./binary` disables nothing; it must prefix the
+   `rustc-clif` invocation.
+
+Result: `p1_arith` 104.8 -> 96.7 ms (LLVM 82.2), `mulq` gone from the hot loop,
+isolated kernel 108.7 -> 55.9 ms vs LLVM's 61.3 ms (faster than LLVM because
+`cmovbe` beats `setb`+`xor`). Remaining `p1_arith` gap is the branchy saturating
+`f64->u64` conversion in `cranelift-codegen`, not the pass.
+
+Also gated `store_forward`'s timing counters behind `CG_CLIF_SF_TIME`; they
+called `Instant::now()` twice per block unconditionally.
+
+**Loop folding can look impossible.** `p5_inline` (300M iterations) runs in
+6.8 ms = 48 G iter/s. Not a miscompile: unroll-128 plus strength reduction
+collapses it to a closed form, and the value matches Python. Passing `n` as a
+runtime argument restores linear scaling (364 ms for 300M), which proves the
+folding is compile-time.
+
+**Push still 403** (`Permission to irhasar/rmc.git denied to irhasar`) with the
+injected `GITHUB_TOKEN`; same as previous sessions. `8aa1dfb` is local only.

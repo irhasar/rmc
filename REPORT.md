@@ -2243,3 +2243,119 @@ Tiga hal yang perlu dibaca dari tabel ini:
 inliner (256/384/512) menunjukkan default sudah optimal — angka 52,5 ms yang
 sempat terlihat di satu run adalah noise, bukan sinyal. Keduanya dicatat sebagai
 lever yang **sudah diuji dan netral**, supaya tidak diuji ulang tanpa alasan.
+
+## 18. Uji habis dibagi: `x % C == 0` tanpa menghitung sisa (LANDED)
+
+### 18.1 Gejala
+
+`p1_arith` tetap 1,26x lebih lambat dari LLVM (103,2 vs 82,2 ms) walaupun
+inliner, unroll, SROA, dan store-forwarding sudah jalan. Badan loop-nya:
+
+```rust
+acc = acc.wrapping_mul(6364136223846793005).wrapping_add(i | 1);
+f += (i as f64).sqrt() * 0.5;
+if acc % 7 == 0 { acc ^= f as u64; }
+```
+
+### 18.2 Eksperimen terkontrol: mengisolasi biaya `%`
+
+Dua program identik kecuali satu baris. Yang pertama menguji habis dibagi dengan
+tes tulis tangan (`(acc.wrapping_mul(m)) <= T`), yang kedua memakai
+`acc % 7 == 0`:
+
+| Varian | LLVM | cg_clif |
+|---|---|---|
+| tes tulis tangan | 55,2 ms | **55,8 ms** |
+| `acc % 7 == 0` | 61,4 ms | **108,7 ms** |
+
+Tes tulis tangan **setara** — jadi gap-nya bukan kualitas loop secara umum,
+melainkan khusus operator `%`. Hipotesis lain sudah dieliminasi lebih dulu:
+konversi `u64→f64` bertanda (`jl`) bukan penyebabnya (signedconv == modonly),
+dan if-conversion fork ini memang bekerja (memakai `cmovne`).
+
+Dump CLIF (`--emit llvm-ir` menulis `.clif`, karena `should_write_ir` memeriksa
+`OutputType::LlvmAssembly`) menunjukkan bentuk persisnya:
+
+```text
+v87 = iconst.i64 7
+v88 = urem.i64 v86, v87
+    brif v88, block4, block3
+```
+
+### 18.3 Akar masalah
+
+Cranelift men-strength-reduce `urem` oleh konstanta menjadi multiply-shift, tapi
+tetap **mematerialisasi seluruh sisa**: `mulq` + 2 shift + `imul` + `sub`, enam
+instruksi, ditambah dua cabang per iterasi karena loop tidak dirotasi. LLVM
+melipat `x % C == 0` menjadi dua instruksi (`imul`, `cmp`) plus `setb`/`xor`
+yang branchless. Sisanya adalah nilai sisa yang tidak pernah dipakai.
+
+### 18.4 Identitas
+
+Untuk `C` ganjil, dengan `m = C⁻¹ mod 2^64` dan `T = (2^64 − 1) / C`:
+
+```text
+x % C == 0   <=>   (x * m mod 2^64) <= T
+```
+
+`m` adalah unit, jadi `x ↦ x·m` injektif; kelipatan `C` memetakan tepat ke
+`T + 1` nilai `0, m, 2m, …, T·m` yang `<= T`, dan setiap nilai di atas `T`
+adalah `m·k` untuk `k` yang bukan kelipatan `C`. `C` genap ditangani dengan
+mengupas faktor dua sebagai mask lebih dulu. `srem` **tidak** diubah: pembagian
+truncating membulatkan ke arah nol, sehingga `x` negatif bisa bersisa nol tanpa
+menjadi kelipatan `C`.
+
+Diverifikasi menyeluruh: 151 pembagi ganjil 1..301 dan pembagi besar
+(1000003, 999999937, 9223372036854775783, 6148914691236517205,
+9223372036854775807) — nol kegagalan. Dua unit test di `src/div_test.rs`
+menjaga identitas dan invers untuk semua pembagi ganjil < 512 dan < 4096.
+
+### 18.5 Bug yang tertangkap: dua bentuk use-site
+
+Frontend menghasilkan dua bentuk, dan keduanya butuh penanganan berbeda:
+
+- `brif v88, block4, block3` — sisa dipakai **langsung** sebagai kondisi.
+  Benar: tukar blok tujuan (`blocks.swap(0, 1)`) dan pakai hasil tes baru
+  sebagai kondisi; membalik nilai malah menambah `xor $1`.
+- `icmp eq v88, 0` — `icmp` adalah **nilai terpisah** yang dikonsumsi kode
+  lain. Yang harus dialihkan adalah *hasil* icmp itu
+  (`detach_inst_results` + `change_to_alias`), bukan operand-nya.
+
+Versi pertama salah untuk bentuk kedua: ia mengganti operand icmp, sehingga
+perbandingan menguji hasil boolean-nya sendiri. Hasilnya tetap valid secara tipe
+dan lolos delapan benchmark, tapi `filter(|x| x % 3 == 0)` membuang komplemen
+himpunan — `t_iter` mencetak `1666633334` alih-alih `833316666` (tepat 2x).
+Karena itu `t_iter` dijadikan regression test: kesalahan ini **senyap**.
+
+### 18.6 Hasil
+
+| Metrik | sebelum | sesudah | LLVM |
+|---|---|---|---|
+| `p1_arith` eksekusi | 104,8 ms | **96,7 ms** | 82,2 ms |
+| `mulq` di loop utama | ada | **hilang** | tidak ada |
+| loop `modonly` (terisolasi) | 108,7 ms | **55,9 ms** | 61,3 ms |
+
+Pada kernel terisolasi, versi modifikasi kini **lebih cepat dari LLVM**
+(55,9 vs 61,3 ms) karena `cmovbe` menggantikan `setb`+`xor` LLVM. Pada
+`p1_arith` sisa gap 1,18x bukan lagi soal `%` melainkan konversi `f64→u64`
+saturating yang di Cranelift memakai rantai cabang (LLVM branchless) — itu
+pekerjaan level `cranelift-codegen`, bukan pass sisi cg_clif.
+
+Knob: `CG_CLIF_NO_DIVTEST=1`. Semua delapan benchmark dan seluruh test suite
+menghasilkan keluaran identik dengan LLVM (kecuali thread-id di `t_panic`/`t_tls`,
+yang memang berbeda antar-run; `t_panic` juga kehilangan baris `println`
+terakhir di **kedua** backend — bug pra-ada, bukan akibat pass ini).
+
+### 18.7 Catatan pengukuran
+
+Dua jebakan yang memakan waktu di sini:
+
+1. **Variabel `CG_CLIF_*` dibaca saat kompilasi, bukan saat run.** Menjalankan
+   `CG_CLIF_NO_DIVTEST=1 ./binary` tidak mematikan apa pun. Harus
+   `CG_CLIF_NO_DIVTEST=1 rustc-clif ... -o binary`.
+2. **Loop dengan batas konstanta bisa dilipat jadi bentuk tertutup.** `p5_inline`
+   (300 juta iterasi) berjalan 6,8 ms — 48 miliar iterasi/detik, mustahil
+   secara fisik. Disassembly menunjukkan unroll 128x dengan strength reduction
+   ke rumus tertutup, dan hasilnya cocok dengan perhitungan Python. Wajar, bukan
+   miscompile — tapi kalau `n` dijadikan argumen runtime, waktunya kembali
+   linear (364 ms untuk 300 juta), yang membuktikan lipatan itu compile-time.
