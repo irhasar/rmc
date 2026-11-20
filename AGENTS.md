@@ -837,3 +837,23 @@ Measurement notes: `/usr/bin/time` does not exist in this image — use
 `bench/measure.py`. Running `./y.sh test` rebuilds `dist/`, so any binary
 compiled from `dist/bin/rustc-clif` disappears mid-run; never benchmark while a
 test suite is in flight.
+
+### Never trust a stale `dist/`
+
+`rustc-clif` falls back to the LLVM sysroot when its own sysroot has no
+`libstd`, and it does so **silently**. The only symptom is that the "Cranelift"
+binary is ~4.6 MB and behaves exactly like LLVM. This invalidated a whole
+benchmark matrix once (upstream looked 12% smaller than it is).
+
+Before trusting any U-vs-L row, check all three:
+
+```bash
+ls cg_clif_upstream/dist/lib/rustlib/*/lib/libstd-*.rlib   # must exist
+ls cg_clif_mod/dist/lib/rustlib/*/lib/libstd-*.rlib        # must exist
+stat -c%s /tmp/fb/p1_arith_U /tmp/fb/p1_arith_L             # must differ
+```
+
+`fullbench.sh` passes no `--sysroot`, which is correct — each `rustc-clif`
+must use its own. Do not add one; pointing `--sysroot` at
+`dist/lib/rustlib/<triple>` produces `E0463: can't find crate for std`.
+Rebuild with `./y.sh build --sysroot clif` in both trees before measuring.
