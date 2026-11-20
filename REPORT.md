@@ -1647,44 +1647,52 @@ perbandingan backend murni, keduanya memakai std hasil Cranelift sendiri.
 
 | label | compile wall (ms) | compile cpu (ms) | peak RSS (MB) | total size (KB) | run wall (ms) | run cpu (ms) | run RSS (MB) |
 |---|---|---|---|---|---|---|---|
-| LLVM (stock rustc) | 886 | 1153 | 132 | 36.095 | 367 | 363 | 48 |
-| cg_clif upstream | 689 | 863 | 134 | 36.184 | 2493 | 2488 | 48 |
-| **cg_clif modifikasi** | **720** | **945** | **132** | **31.688** | **519** | **517** | **48** |
+| LLVM (stock rustc) | 876 | 1149 | 133 | 36.095 | 365 | 365 | 48 |
+| cg_clif upstream | 707 | 922 | 131 | 45.675 | 2467 | 2461 | 49 |
+| **cg_clif modifikasi** | **726** | **962** | **132** | **31.688** | **517** | **514** | **48** |
 
 Runtime per program:
 
 | program | LLVM | upstream | modifikasi | mod vs up |
 |---|---|---|---|---|
-| p1_arith | 82 | 108 | 104 | −3,5% |
-| p2_mem | 16 | 155 | 66 | **−57,4%** |
-| p3_calls | 37 | 114 | 96 | −15,1% |
-| p4_simd | 56 | 151 | 141 | −6,7% |
-| p5_inline | 58 | 900 | 6 | **−99,3%** |
-| p6_scalar | 58 | 919 | 7 | **−99,3%** |
-| p7_branchy | 43 | 100 | 61 | −38,9% |
-| p8_minmax | 18 | 47 | 38 | −18,6% |
+| p1_arith | 81 | 108 | 104 | −3,7% |
+| p2_mem | 17 | 154 | 66 | **−57,6%** |
+| p3_calls | 37 | 116 | 96 | −17,0% |
+| p4_simd | 55 | 156 | 139 | −11,1% |
+| p5_inline | 58 | 893 | 6 | **−99,3%** |
+| p6_scalar | 58 | 899 | 6 | **−99,3%** |
+| p7_branchy | 42 | 102 | 61 | −40,3% |
+| p8_minmax | 18 | 38 | 38 | +0,5% |
 
 Ringkasan terhadap empat tujuan awal:
 
-- **Ukuran hasil**: modifikasi **31.688 KB vs upstream 36.184 KB (−12,4%)**,
+- **Ukuran hasil**: modifikasi **31.688 KB vs upstream 45.675 KB (−30,6%)**,
   dan **lebih kecil dari LLVM** (36.095 KB, −12,2%). Penyebab utamanya bukan
   §13.2, melainkan patch `cranelift-object` yang memberi tiap fungsi dan objek
   data seksi bernama unik, sehingga `--gc-sections` akhirnya bisa membuang kode
   mati. Buktinya: pada std upstream ada **8.948 seksi `.text.subsection`** yang
   bernama sama (jadi tak bisa dibuang), sedangkan di fork jumlahnya **0**.
   Kontribusi §13.2 terhadap ukuran kecil; ia menang di runtime (§13.6).
-- **Waktu compile**: modifikasi 720 ms vs LLVM 886 ms (**−18,7%**), dan +4,5%
+- **Waktu compile**: modifikasi 726 ms vs LLVM 876 ms (**−17,1%**), dan +2,7%
   vs upstream (biaya dataflow store-forwarding §13.1 serta pass LICM §14,
   keduanya di bawah 1% per program pada A/B terisolasi).
-- **RAM saat compile**: 132 MB vs LLVM 132 MB (setara), vs upstream 134 MB
-  (−1,5%) — praktis setara.
-- **Runtime**: modifikasi 519 ms vs upstream 2493 ms (**−79,2%**), tetapi masih
-  1,41× LLVM. Sisa gap terpusat di p4_simd (141 vs 56 ms), yang persis beban
+- **RAM saat compile**: 132 MB vs LLVM 133 MB (−0,8%), vs upstream 131 MB
+  (+0,8%) — praktis setara.
+- **Runtime**: modifikasi 517 ms vs upstream 2467 ms (**−79,0%**), tetapi masih
+  1,42× LLVM. Sisa gap terpusat di p4_simd (139 vs 55 ms), yang persis beban
   loop scalar tanpa vektorisasi yang diuraikan §11.3.
-- **RAM saat run**: 48 MB, sama dengan upstream dan LLVM.
+- **RAM saat run**: 48 MB, sama dengan LLVM dan 1 MB di bawah upstream.
 
 Kebenaran: kedelapan program menghasilkan output **byte-identik** dengan LLVM
 (diverifikasi `diff`), di samping uji diferensial `[x; N]` di §13.2.
+
+> **Catatan metodologi.** Angka pada versi pertama §13.5 (upstream 36.184 KB)
+> salah karena `cg_clif_upstream/dist` saat itu basi: sysroot-nya sudah tidak
+> memuat `libstd`, sehingga `rustc-clif` diam-diam jatuh ke sysroot LLVM dan
+> menghasilkan biner LLVM berukuran ±4,6 MB yang dikira keluaran Cranelift.
+> Setelah kedua backend dibangun ulang (`./y.sh build --sysroot clif` di
+> keduanya), upstream menjadi 45.675 KB. Selalu cek bahwa `dist/lib/rustlib/
+> */lib/libstd-*.rlib` ada dan ukuran U ≠ ukuran L sebelum memercayai matriks.
 
 ### 13.6 Atribusi perbaikan, diukur satu per satu (§13)
 
@@ -1790,23 +1798,25 @@ pada edge EH.
 ### 14.3 Dampak terukur
 
 A/B dengan `CG_CLIF_NO_LICM=1` vs default, 11 repetisi, median, `opt-level=3`,
-kedelapan program `bench/progs/`:
+kedelapan program `bench/progs/`. Kedua sisi memakai sysroot Cranelift mod
+sendiri (bukan sysroot LLVM — lihat catatan metodologi §13.5).
 
 | program | LICM mati | LICM hidup | delta | ukuran |
 |---|---:|---:|---:|---|
-| p1_arith | 104,8 ms | 104,2 ms | −0,6% | sama |
-| p2_mem | 65,2 ms | 65,5 ms | +0,5% | +208 B |
-| p3_calls | 95,6 ms | 95,5 ms | −0,1% | sama |
-| p4_simd | 135,7 ms | 135,4 ms | −0,2% | sama |
-| p5_inline | 6,8 ms | 6,3 ms | **−8,1%** | sama |
-| p6_scalar | 6,9 ms | 6,3 ms | **−9,0%** | sama |
-| p7_branchy | 60,6 ms | 60,5 ms | −0,2% | sama |
-| p8_minmax | 38,3 ms | 38,7 ms | +1,1% | sama |
-| **total** | **513,9 ms** | **512,4 ms** | **−0,3%** | |
+| p1_arith | 104,3 ms | 104,2 ms | −0,1% | sama |
+| p2_mem | 66,2 ms | 65,1 ms | **−1,7%** | +224 B |
+| p3_calls | 97,2 ms | 96,0 ms | **−1,2%** | +32 B |
+| p4_simd | 141,6 ms | 142,4 ms | +0,6% | +16 B |
+| p5_inline | 6,7 ms | 6,3 ms | **−5,5%** | sama |
+| p6_scalar | 6,7 ms | 6,4 ms | **−4,2%** | sama |
+| p7_branchy | 61,0 ms | 60,6 ms | −0,6% | sama |
+| p8_minmax | 38,2 ms | 38,2 ms | −0,1% | sama |
+| **total** | **521,9 ms** | **519,3 ms** | **−0,5%** | |
 
 Biaya compile: diukur terpisah pada p1/p2/p4/p6, delta antara −0,5% dan +1,1%
-(derau). Jadi pass ini **gratis** dan memberi keuntungan pada kernel yang
-memuat nilai invariant di dalam loop.
+(derau). Jadi pass ini praktis **gratis**: ia menang pada kernel yang memuat
+nilai invariant di dalam loop (p5/p6, juga p2/p3) dan netral pada sisanya.
+Pertambahan ukuran hanya puluhan sampai ratusan byte.
 
 ### 14.4 Verifikasi
 
