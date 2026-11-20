@@ -1118,3 +1118,29 @@ no single hot function to fix; the cost is diffuse across hash and sort code,
 which is consistent with the already-documented conclusion that the remaining
 gap is broad code-quality (no loop rotation, weak regalloc on the partition
 loop, no autovectorizer) rather than one missing optimization.
+
+### `regalloc_algorithm=single_pass` is not a compile-time win
+
+Regalloc is a plausible place to look for compile-time savings, so both
+algorithms were measured on all nine programs (correctness verified on p2_mem
+first; both produce identical output).
+
+| metric (sum of 9) | backtracking | single_pass |
+| --- | --- | --- |
+| compile wall | 843.8 ms | 839.6 ms |
+| compile cpu | 1088.0 ms | 1089.6 ms |
+| compile peak RSS | 1009 MB | 1006 MB |
+| run wall | 478.9 ms | 629.5 ms |
+| artifact size | 36803872 | 36853216 |
+
+Compile time is unchanged (the difference is inside run-to-run noise), because
+for these small single-crate programs regalloc is not the dominant cost — the
+frontend and the rest of the pipeline are. Runtime regresses by 31% and the
+binaries get larger. Rejected; the experimental `CG_CLIF_REGALLOC` tunable was
+removed again rather than left in as dead code.
+
+This also closes out the "compile-time" axis of the investigation: the knobs
+that are actually available (`opt_level`, `regalloc_algorithm`, CGU count,
+inliner budget) all move compile time by at most a few percent. Compile time is
+dominated by work shared with LLVM (parsing, type checking, MIR), which is why
+cg_clif's advantage there is structural rather than tunable.
