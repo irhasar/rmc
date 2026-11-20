@@ -239,7 +239,9 @@ impl CodegenBackend for CraneliftCodegenBackend {
             #[cfg(not(feature = "jit"))]
             tcx.dcx().fatal("jit support was disabled when compiling rustc_codegen_cranelift");
         } else {
-            Box::new(rustc_codegen_ssa::base::codegen_crate(driver::aot::AotDriver, tcx))
+            let out = rustc_codegen_ssa::base::codegen_crate(driver::aot::AotDriver, tcx);
+            crate::passtime::report("aot");
+            Box::new(out)
         }
     }
 

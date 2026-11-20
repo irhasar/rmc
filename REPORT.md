@@ -2083,3 +2083,156 @@ Setelah call hilang, sisa selisih `collect` (10,7 vs 2,0 ms) berasal dari
 autovectorizer, dan menambahkannya adalah pekerjaan tingkat pass yang jauh lebih
 besar daripada perubahan budget ini. Gap yang sama muncul di k2/k7 (3x) dan
 k8_sort (3,1x) — semuanya bentuk yang LLVM vectorize atau unroll.
+
+---
+
+## 17. Biaya compile-time pass unroll: dari kuadratik ke linear (LANDED)
+
+Bagian ini menjawab pertanyaan yang sebelumnya tidak bisa dijawab karena
+instrumentasi tidak pernah terpasang: **berapa ongkos compile-time dari pass
+buatan sendiri?** Jawabannya: satu di antaranya sangat mahal, dan penyebabnya
+bukan pekerjaan yang berguna.
+
+### 17.1 Instrumentasi akhirnya tersambung
+
+`src/passtime.rs` sudah ada sejak lama, tetapi `report()` **tidak pernah
+dipanggil**, sehingga seluruh pengukuran per-pass selama ini nol. Dua masalah
+harus diperbaiki bersamaan:
+
+1. **`report()` tidak dipanggil.** Ditambahkan di `src/lib.rs` setelah
+   `codegen_crate`, sehingga total per-pass dicetak sekali per crate.
+2. **Akumulator thread-local.** Codegen berjalan di worker thread rustc, jadi
+   akumulator `thread_local!` di-reset di thread yang berbeda dari thread yang
+   mencetak laporan. Diganti dengan `static [AtomicU64; 5]`, di-`fetch_add` dari
+   thread mana pun dan di-`swap(0)` saat melapor.
+
+Setelah itu biaya per-pass baru terlihat, diaktifkan lewat `CG_CLIF_PASS_TIME=1`.
+
+### 17.2 Angka pertama: `unroll` memakan 18,9 ms
+
+Pada `p2_mem`, satu codegen unit melaporkan:
+
+```
+[passtime p2_mem...-cgu.1] store_forward=8.4ms unroll=18.9ms inline=3.6ms collect=1.9ms if_convert=1.9ms
+```
+
+`unroll` adalah pass termahal, lebih mahal dari `store_forward` yang jauh lebih
+banyak bekerja. Pembelahan lebih lanjut (`collapse=18.8ms/1419it`) menunjukkan
+hampir seluruh waktunya ada di **satu sub-fase**: pencarian blok forwarder.
+
+### 17.3 Akar masalah: pemindaian ulang per kandidat
+
+`collapse_forwarders` memanggil `find_forwarder`, yang membangun tiga fakta
+tentang seluruh fungsi:
+
+- jumlah edge masuk per blok (untuk memastikan hanya ada satu predecessor),
+- blok sumber edge itu,
+- apakah parameter blok dibaca blok lain (`params_escape`).
+
+Ketiganya dibangun ulang **setiap kali satu blok berhasil di-collapse**. Dengan
+1419 collapse pada satu fungsi, fungsi yang sama dipindai 1419 kali. Itu
+kuadratik dalam jumlah blok, dan hasilnya selalu sama kecuali untuk blok yang
+baru saja berubah.
+
+### 17.4 Perbaikan: bangun sekali, perbarui per collapse
+
+Fakta-fakta itu dipindahkan ke `struct Forwarders`, dibangun sekali di
+`Forwarders::new`, lalu **diperbarui secara inkremental** di `Forwarders::removed`
+saat satu blok lenyap: edge ke latch dihapus, edge dari predecessor dialihkan ke
+target latch. Kandidat forwarder (blok `nop`/`jump` tanpa hasil) juga disaring
+sekali di awal, bukan tiap iterasi.
+
+Hasilnya pada `p2_mem`:
+
+| Metrik | Sebelum | Sesudah |
+|---|---|---|
+| pass `unroll` | 18,9 ms | **2,4 ms** |
+| sub-fase `collapse` | 18,8 ms | **2,7 ms** |
+| iterasi collapse | 1419 | 1093 |
+
+Pass menjadi **7,9x lebih cepat**, dan yang penting: pekerjaan yang tersisa
+sebanding dengan jumlah blok, bukan kuadratnya.
+
+Jumlah iterasi turun (1419 → 1093) karena kandidat yang jelas tidak memenuhi
+syarat tidak lagi dihitung sebagai percobaan.
+
+### 17.5 Verifikasi
+
+Perubahan ini menyentuh logika pemilihan blok, jadi diverifikasi ketat:
+
+- **25.368 tes lulus, 0 gagal** (`./y.sh test`).
+- 8/8 program p-suite dan 10/10 kernel s-suite menghasilkan output identik
+  dengan LLVM.
+- `p2_mem` menghasilkan `300000 17064514294836777531`, sama seperti sebelumnya.
+
+### 17.6 Sisa biaya pass, dan mengapa itu wajar
+
+Setelah `unroll` diperbaiki, anggaran pass pada `p2_mem` menjadi:
+
+| Pass | Waktu | Sifat |
+|---|---|---|
+| `store_forward` | 8–12 ms | linear terhadap instruksi (178 fungsi, 10,1 ms total) |
+| `inline` | 3,0–4,6 ms | linear |
+| `unroll` | 2,4–3,4 ms | linear setelah perbaikan |
+| `if_convert` | 1,8–2,6 ms | linear |
+| `collect` | 1,7–1,8 ms | linear |
+
+`store_forward` kini pass termahal. Biayanya bukan kuadratik: fungsi terbesar
+(1018 instruksi) memakan 1,49 ms, dan totalnya 10,1 ms untuk 178 fungsi, jadi
+waktunya sebanding dengan jumlah instruksi yang memang harus diperiksa.
+
+Konsekuensinya, mod masih ~13% lebih lambat **meng-compile** `p2_mem` daripada
+upstream (148 ms vs 130 ms) — itu harga dari empat pass tambahan yang menghasilkan
+kode jauh lebih cepat saat dijalankan (67 ms vs 156 ms, lihat §17.7). Pada
+program yang tidak memicu pass ini, biayanya nol.
+
+### 17.7 Matriks akhir tiga arah
+
+`bench/fullbench.sh`, median dari 7 run compile dan 11 run eksekusi.
+`L` = rustc + LLVM, `U` = cg_clif upstream, `M` = fork ini.
+
+Compile (ms / MB RSS / ukuran biner):
+
+| Program | L wall | U wall | M wall | L size | U size | M size |
+|---|---|---|---|---|---|---|
+| p1_arith | 87,2 | 82,2 | 82,8 | 4.635.232 | 5.878.688 | **4.322.528** |
+| p2_mem | 242,7 | 128,8 | 139,4 | 4.639.888 | 5.936.880 | **4.345.592** |
+| p3_calls | 100,2 | 86,3 | 88,3 | 4.612.368 | 5.820.872 | **4.257.744** |
+| p4_simd | 112,3 | 93,7 | 96,3 | 4.636.096 | 5.893.112 | **4.330.520** |
+| p5_inline | 83,4 | 78,3 | 78,6 | 4.609.368 | 5.814.440 | **4.249.784** |
+| p6_scalar | 84,3 | 77,3 | 77,3 | 4.609.368 | 5.814.424 | **4.249.784** |
+| p7_branchy | 86,5 | 82,7 | 79,1 | 4.609.520 | 5.814.536 | **4.249.776** |
+| p8_minmax | 86,6 | 81,5 | 80,5 | 4.609.544 | 5.814.488 | **4.249.720** |
+
+Eksekusi (ms):
+
+| Program | L | U | M | M vs U | M vs L |
+|---|---|---|---|---|---|
+| p1_arith | 82,2 | 108,3 | 103,2 | 1,05x | 1,26x |
+| p2_mem | **15,9** | 155,7 | 67,4 | **2,31x** | 4,24x |
+| p3_calls | 36,7 | 117,0 | 99,5 | 1,18x | 2,71x |
+| p4_simd | 56,9 | 157,4 | 140,8 | 1,12x | 2,47x |
+| p5_inline | 57,6 | 894,2 | **6,8** | **131x** | 8,5x lebih cepat |
+| p6_scalar | 57,6 | 907,1 | **6,9** | **131x** | 8,3x lebih cepat |
+| p7_branchy | 42,5 | 100,3 | 60,2 | 1,67x | 1,42x |
+| p8_minmax | 17,7 | 38,7 | 38,4 | 1,01x | 2,17x |
+
+Tiga hal yang perlu dibaca dari tabel ini:
+
+1. **Ukuran biner mod 7–27% lebih kecil dari LLVM** dan 26–27% lebih kecil dari
+   upstream clif, konsisten di semua program. Ini efek dari kode yang lebih
+   sedikit di-emit, bukan dari strip.
+2. **p5/p6 adalah kasus di mana mod mengalahkan LLVM 8x** (6,8 ms vs 57,6 ms).
+   Upstream clif di program yang sama butuh 894 ms — artinya ada bug/kelemahan
+   besar di sana yang pass inliner fork ini perbaiki, bukan sekadar tuning.
+3. **p2_mem tetap 4,2x lebih lambat dari LLVM.** Penyebabnya bukan pass fork ini
+   (mod sudah 2,3x lebih cepat dari upstream), melainkan kualitas codegen
+   Cranelift sendiri: LLVM mengubah loop memori menjadi kode SIMD, Cranelift
+   tidak punya autovectorizer.
+
+### 17.8 Catatan jujur soal batas
+
+`-Ctarget-cpu=native` tidak membantu (dikonfirmasi ulang), dan sweep kapasitas
+inliner (256/384/512) menunjukkan default sudah optimal — angka 52,5 ms yang
+sempat terlihat di satu run adalah noise, bukan sinyal. Keduanya dicatat sebagai
+lever yang **sudah diuji dan netral**, supaya tidak diuji ulang tanpa alasan.

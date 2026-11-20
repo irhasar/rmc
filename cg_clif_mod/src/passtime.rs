@@ -4,14 +4,13 @@
 //! thread-local cell; [`report`] prints the per-thread totals. Used to keep the
 //! compile-time cost of the custom passes honest without a profiler.
 
-use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
-thread_local! {
-    static ACC: [Cell<u128>; 5] = [const { Cell::new(0) }; 5];
-}
+/// Codegen runs on rustc's worker threads, so the totals have to be shared: a
+/// thread-local accumulator would be reset before [`report`] ever ran.
+static ACC: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 pub(crate) const STORE_FORWARD: usize = 0;
 pub(crate) const UNROLL: usize = 1;
@@ -37,21 +36,20 @@ pub(crate) fn time<R>(slot: usize, f: impl FnOnce() -> R) -> R {
     }
     let t = std::time::Instant::now();
     let r = f();
-    ACC.with(|a| a[slot].set(a[slot].get() + t.elapsed().as_nanos()));
+    ACC[slot].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     r
 }
+
 
 /// Print and reset the calling thread's totals.
 pub(crate) fn report(where_: &str) {
     if !enabled() {
         return;
     }
-    ACC.with(|a| {
-        let mut s = format!("[passtime {where_}]");
-        for (i, name) in NAMES.iter().enumerate() {
-            let ns = a[i].replace(0);
-            s.push_str(&format!(" {name}={:.1}ms", ns as f64 / 1e6));
-        }
-        eprintln!("{s}");
-    });
+    let mut s = format!("[passtime {where_}]");
+    for (i, name) in NAMES.iter().enumerate() {
+        let ns = ACC[i].swap(0, Ordering::Relaxed);
+        s.push_str(&format!(" {name}={:.1}ms", ns as f64 / 1e6));
+    }
+    eprintln!("{s}");
 }
