@@ -23,7 +23,7 @@
 - **Tests**: `./y.sh test` → **25368 passed / 0 failed** (65 suites). p-suite
   8/8 and s-suite 10/10 output-identical to LLVM.
 - **Note on remaining compile overhead**: mod is still ~13% slower than upstream
-  to compile `p2_mem` (148 vs 130 ms). That is the honest price of four added
+  to compile `p2_mem` (145 vs 128 ms). That is the honest price of four added
   passes, not a bug — `store_forward` is now the most expensive at 8–12 ms and
   is linear in instruction count (178 funcs → 10.1 ms total). On programs that
   do not trigger the passes the cost is zero.

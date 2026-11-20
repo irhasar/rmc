@@ -2189,7 +2189,7 @@ Setelah `unroll` diperbaiki, anggaran pass pada `p2_mem` menjadi:
 waktunya sebanding dengan jumlah instruksi yang memang harus diperiksa.
 
 Konsekuensinya, mod masih ~13% lebih lambat **meng-compile** `p2_mem` daripada
-upstream (148 ms vs 130 ms) — itu harga dari empat pass tambahan yang menghasilkan
+upstream (145 ms vs 128 ms, median 15 run) — itu harga dari empat pass tambahan yang menghasilkan
 kode jauh lebih cepat saat dijalankan (67 ms vs 156 ms, lihat §17.7). Pada
 program yang tidak memicu pass ini, biayanya nol.
 
