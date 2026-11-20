@@ -800,3 +800,40 @@ Verification pattern that works: print only a hash so memory stays constant,
 compile with both backends, and require identical hashes over all 2^32 f32
 patterns. Also confirm in the disassembly (`cvttss2si` vs `roundss`) that the
 intended code was actually emitted — the symbol table alone cannot tell you.
+
+## LICM in cranelift-codegen
+
+`vendor/cranelift-codegen-0.137.0/src/licm.rs` is the only loop pass in the
+vendored crate. It runs from `Context::compile` **after** the egraph pass, and
+rebuilds `cfg`/`domtree`/`loops` from scratch each round because creating a
+preheader mutates the CFG. Do not "optimise" that into incremental updates: the
+earlier attempt reused a stale dominator tree and surfaced as a regalloc2 ICE
+(`ion/moves.rs:658 unwrap None`), not as a wrong answer.
+
+The three ways this pass was silently wrong, in the order they were found:
+
+1. Splitting an edge discarded the header's phi arguments — forward the edge's
+   block args into the new block.
+2. `BlockArg` is not always a plain `Value`; `TryCallRet`/`TryCallExn` carry
+   exception payloads. Restrict splitting to plain values and give up on EH
+   edges rather than guessing.
+3. `is_pure_for_egraph` accepts **trapping** ops (`sdiv`, `fcvt_to_sint`).
+   Purity is not the same as safety to speculate, so LICM also requires
+   `!op.can_trap()`.
+
+Header block parameters are phi nodes and must never be treated as invariant;
+`bench/tests/t_licm.rs` pins that and the other shapes.
+
+Two knobs exist for bisecting: `CG_CLIF_NO_LICM` and `CG_CLIF_NO_COLLAPSE`
+(the unroller's forwarding-latch collapse, which only unblocks one extra loop
+and is runtime-neutral).
+
+Reading env vars inside a per-function pass is measurable: `std::env::var`
+locks a global map on every call. Cache every knob in a `OnceLock`, as
+`src/tunables.rs` does. The vendored crate cannot see that module, so `licm.rs`
+keeps its own cached copies.
+
+Measurement notes: `/usr/bin/time` does not exist in this image — use
+`bench/measure.py`. Running `./y.sh test` rebuilds `dist/`, so any binary
+compiled from `dist/bin/rustc-clif` disappears mid-run; never benchmark while a
+test suite is in flight.
