@@ -187,14 +187,15 @@ impl Forwarders {
 
     /// Drop `latch`, which `thread_forwarder` has just retargeted away.
     ///
-    /// The predecessor's edge to `latch` now goes straight to the latch's own
-    /// target, so the edge counts move with it. Keeping them current is what
-    /// lets the next `find` run without rescanning the function.
+    /// `latch` leaves the layout, so its own edge to `target` disappears, and
+    /// the predecessor's edge to `latch` now points at `target` instead. The
+    /// edge count of `target` is therefore unchanged; only its recorded source
+    /// moves. Getting this wrong makes the next `find` see a phantom second
+    /// predecessor and stop collapsing early.
     fn removed(&mut self, pred: Block, latch: Block, target: Block) {
         self.candidates.retain(|&b| b != latch);
         self.edges.remove(&latch);
         self.pred_of.remove(&latch);
-        *self.edges.entry(target).or_insert(0) += 1;
         self.pred_of.insert(target, pred);
     }
 
