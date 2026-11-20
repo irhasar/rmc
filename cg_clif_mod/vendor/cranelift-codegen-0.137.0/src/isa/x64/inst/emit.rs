@@ -21,6 +21,12 @@ fn emit_signed_cvt(
     // Handle an unsigned int, which is the "easy" case: a signed conversion
     // will do the right thing.
     let dst = WritableXmm::from_writable_reg(dst).unwrap();
+    // `cvtsi2s{s,d}` is a two-operand SSE instruction: it merges the upper bits
+    // of its destination operand into the result. Without clearing `dst`
+    // first, the instruction carries a false dependency on whatever wrote
+    // `dst` earlier in the block. In a loop this serializes every iteration
+    // behind the previous one. Zeroing the register first breaks that chain.
+    asm::inst::xorps_a::new(dst, dst.to_reg()).emit(sink, info, state);
     if to_f64 {
         asm::inst::cvtsi2sdq_a::new(dst, src).emit(sink, info, state);
     } else {

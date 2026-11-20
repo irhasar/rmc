@@ -1841,3 +1841,130 @@ Pertambahan ukuran hanya puluhan sampai ratusan byte.
 | `CG_CLIF_NO_LICM=1` | matikan pass LICM |
 | `CG_CLIF_LICM_DEBUG=1` | cetak setiap hoist ke stderr |
 | `CG_CLIF_NO_COLLAPSE=1` | matikan collapse forwarding-latch sebelum unroll |
+
+## 15. False dependency pada konversi u64→float (LANDED)
+
+### 15.1 Gejala
+
+`p4_simd` tetap 2,5× lebih lambat dari LLVM meski semua pass cg_clif dimatikan
+satu per satu (NONE 105,5 / NOUNROLL 105,2 / NOINLINE 106,3 / NOLICM 110,4 /
+NOSF 107,0 / NOIFCONV 106,3 ms — semuanya dalam derau). Jumlah panggilan `sinf`
+saat runtime juga identik: interposer `LD_PRELOAD` menghitung **4.000.000**
+panggilan untuk LLVM maupun Cranelift, dengan keluaran byte-identik
+(`-0.9937716`). Jadi bukan jumlah kerja, melainkan **biaya per panggilan**:
+7,4 ns vs 18,9 ns.
+
+### 15.2 Isolasi
+
+Memisahkan loop menjadi dua tahap — isi `a[i] = i as f32` dulu, lalu
+`o[i] = a[i].sin()` — menyusutkan gap dari 2,5× menjadi 1,25×
+(LLVM 39,1 ms vs Cranelift 48,7 ms). Artinya **konversi integer→float** di loop
+panas, bukan `sinf`, yang menjadi biang keladi.
+
+### 15.3 Akar masalah
+
+`cvtsi2ss`/`cvtsi2sd` adalah instruksi SSE dua-operand: selain mengonversi
+sumber integer, ia **mempertahankan bit atas register tujuan**. Bila register
+tujuan belum ditol-kan, instruksi itu membaca register tersebut dan menciptakan
+*dependency* palsu terhadap penulis sebelumnya. Di dalam loop, penulis
+sebelumnya adalah hasil `sinf` iterasi sebelumnya, sehingga setiap iterasi
+harus menunggu panggilan sebelumnya selesai — loop yang seharusnya
+*throughput-bound* berubah menjadi *latency-bound*.
+
+Disassembly Cranelift (sebelum perbaikan):
+
+```
+3792d:  cvtsi2ss %rdi,%xmm0     ; tidak ada xorps sebelum ini
+3795b:  call     *%rax          ; sinf, hasil di xmm0
+```
+
+LLVM menyisipkan pemutus dependency:
+
+```
+xorps   %xmm0,%xmm0
+cvtsi2ss %r14,%xmm0
+call    *%r15
+```
+
+Jumlah `xorps` di seluruh binary: Cranelift **5**, LLVM **46**.
+
+### 15.4 Mengapa hanya jalur unsigned
+
+`fcvt_from_sint` sudah benar: rule ISLE-nya memakai `(xmm_zero $F32X4)` sebagai
+operand pertama `x64_cvtsi2ss`, dan `xmm_zero` di-emit sebagai `xorps tmp,tmp`.
+Komentar di `lower.isle` bahkan menyebut masalah ini secara eksplisit (lihat
+isu #7085).
+
+Jalur **unsigned** (`fcvt_from_uint` untuk `I64`) berbeda: ia tidak memakai
+satu instruksi, melainkan sekuens `CvtUint64ToFloatSeq` yang menangani nilai
+≥ 2^63 dengan membagi dua lalu menskalakan kembali. Sekuens itu memanggil
+`emit_signed_cvt`, yang langsung meng-emit `cvtsi2ssq_a`/`cvtsi2sdq_a` **tanpa
+menol-kan `dst` lebih dulu**. Karena `usize as f32` adalah pola paling umum di
+Rust (`for i in 0..n { ... i as f32 ... }`), cacat ini mengenai kode sehari-hari,
+bukan kasus langka.
+
+### 15.5 Perbaikan
+
+`vendor/cranelift-codegen-0.137.0/src/isa/x64/inst/emit.rs`, di
+`emit_signed_cvt`: emit `xorps dst,dst` sebelum konversi.
+
+```rust
+let dst = WritableXmm::from_writable_reg(dst).unwrap();
+asm::inst::xorps_a::new(dst, dst.to_reg()).emit(sink, info, state);
+if to_f64 {
+    asm::inst::cvtsi2sdq_a::new(dst, src).emit(sink, info, state);
+} else {
+    asm::inst::cvtsi2ssq_a::new(dst, src).emit(sink, info, state);
+}
+```
+
+`xorps` dipilih (bukan `vxorps`) karena jalur ini memakai encoding SSE legacy;
+`xorps r,r` sudah cukup untuk memutus dependency dan tidak menambah kebutuhan
+fitur CPU. Biayanya satu instruksi 3-byte per konversi.
+
+### 15.6 Hasil
+
+Loop `(i as f32).sin()` (`p9_u64f32`), 4 juta iterasi:
+
+| | waktu |
+|---|---|
+| LLVM | 29,7 ms |
+| cg_clif upstream | 75,7 ms |
+| cg_clif modifikasi (sebelum) | 75,6 ms |
+| **cg_clif modifikasi (sesudah)** | **34,1 ms** |
+
+**2,2× lebih cepat**, dan kini hanya 15% di belakang LLVM. Karena upstream
+menunjukkan angka yang sama (75,7 ms), ini defisiensi Cranelift yang berdiri
+sendiri, bukan efek samping perubahan lain di fork ini.
+
+Dampak pada benchmark utama:
+
+| prog | upstream | mod (sebelum) | mod (sesudah) | LLVM |
+|---|---|---|---|---|
+| p4_simd | 155,8 ms | 167 ms | **96,2 ms** | 55,3 ms |
+| p1_arith | 108,9 ms | 106 ms | 105,0 ms | 81,2 ms |
+| p2_mem | 157,2 ms | 66 ms | 65,6 ms | 16,0 ms |
+| p3_calls | 117,0 ms | 96 ms | 96,1 ms | 36,7 ms |
+| p7_branchy | 103,6 ms | 61 ms | 60,6 ms | 42,6 ms |
+
+Ukuran binary **tidak berubah sama sekali** (0 byte pada kedelapan program),
+dan seluruh keluaran tetap byte-identik dengan LLVM.
+
+### 15.7 Verifikasi
+
+- Suite tes cg_clif penuh lulus, tanpa kegagalan.
+- Keluaran kedelapan program bench identik dengan LLVM.
+- `bench/progs/p9_u64f32.rs` ditambahkan sebagai penjaga regresi: kernel ini
+  mengisolasi jalur unsigned, sehingga `xorps` yang hilang muncul sebagai
+  perlambatan besar, bukan kesalahan pembulatan.
+- Loop yang tidak memuat konversi (`pre`: dua tahap terpisah) tetap 48,8 ms
+  sebelum dan sesudah — memastikan perbaikan tidak menyentuh jalur lain.
+
+### 15.8 Sisa gap p4_simd
+
+Sisa selisih p4_simd (96,2 vs 55,3 ms) berasal dari hal lain: LLVM menggabungkan
+`sinf` + `cosf` pada argumen yang sama menjadi satu panggilan `sincosf`
+(`objdump` menunjukkan `sincosf` di binary LLVM, sedangkan Cranelift tetap
+memanggil `sinf@` dan `cosf@` terpisah). Penggabungan itu adalah transformasi
+tingkat IR (loop fusion + common-subexpression), bukan sesuatu yang bisa
+disimpulkan di level mesin.
