@@ -200,6 +200,12 @@ pub(crate) fn compile_fn(
         crate::store_forward::run(&mut context.func, module.isa().endianness())
     });
 
+    // Fold `x % C == 0` into a multiply-compare before Cranelift strength-reduces
+    // the remainder: the remainder itself is dead once only its zero-ness is
+    // tested. Running before `if_convert` lets the resulting comparison join the
+    // same diamond collapse as any other condition.
+    crate::passtime::time(crate::passtime::DIV_TEST, || crate::div_test::run(&mut context.func));
+
     // Collapse short two-way diamonds into a `select` (a `cmove`) so a
     // data-dependent branch cannot mispredict. Running before `unroll` also
     // turns a loop whose body holds such a branch into the single block the

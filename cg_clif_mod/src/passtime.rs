@@ -10,15 +10,23 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Codegen runs on rustc's worker threads, so the totals have to be shared: a
 /// thread-local accumulator would be reset before [`report`] ever ran.
-static ACC: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static ACC: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 pub(crate) const STORE_FORWARD: usize = 0;
 pub(crate) const UNROLL: usize = 1;
 pub(crate) const INLINE: usize = 2;
 pub(crate) const COLLECT: usize = 3;
 pub(crate) const IF_CONVERT: usize = 4;
+pub(crate) const DIV_TEST: usize = 5;
 
-const NAMES: [&str; 5] = ["store_forward", "unroll", "inline", "collect", "if_convert"];
+const NAMES: [&str; 6] = [
+    "store_forward",
+    "unroll",
+    "inline",
+    "collect",
+    "if_convert",
+    "div_test",
+];
 
 fn enabled() -> bool {
     if ENABLED.load(Ordering::Relaxed) {

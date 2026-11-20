@@ -441,29 +441,48 @@ fn cross_block_entry(
     ptr_bases: &FxHashSet<Value>,
     loaded: &FxHashSet<Key>,
 ) -> FxHashMap<Block, Avail> {
+    // Timing is only collected when explicitly requested: `Instant::now()` in a
+    // per-block loop is measurable compile time on its own.
+    let timed = crate::tunables::store_forward_time();
+    let now = |on: bool| on.then(std::time::Instant::now);
+    let elapsed_ns = |t: Option<std::time::Instant>| t.map_or(0, |t| t.elapsed().as_nanos());
+
+    let t_cfg = now(timed);
     let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func);
     let blocks: Vec<Block> = func.layout.blocks().collect();
+    let cfg_ns = elapsed_ns(t_cfg);
     // Decode each block's store events once; the dataflow below revisits blocks.
+    let t_ev = now(timed);
     let events: FxHashMap<Block, Vec<SfEvent>> =
         blocks.iter().map(|&b| (b, block_events(func, b))).collect();
+    let ev_ns = elapsed_ns(t_ev);
     // The entry block is also reached from outside the function, where no store
     // has run. The CFG does not model that edge, so a self-loop on the entry
     // block would otherwise leak facts from the back edge into its own entry.
     let entry_block = func.layout.entry_block();
 
+    // The meet is an intersection, so a single predecessor that contributes no
+    // facts — an unreached back edge, or a path that stores nothing — collapses
+    // the whole result to empty. Returning early in that case avoids cloning a
+    // map for most blocks in a real function.
     let meet = |out: &FxHashMap<Block, Avail>, block: Block| -> Avail {
         if Some(block) == entry_block {
             return Avail::default();
         }
-        let mut acc: Option<Avail> = None;
-        for pred in cfg.pred_iter(block) {
-            let po = out.get(&pred.block).cloned().unwrap_or_default();
-            match &mut acc {
-                None => acc = Some(po),
-                Some(cur) => cur.retain(|k, v| po.get(k) == Some(v)),
+        let preds: Vec<Block> = cfg.pred_iter(block).map(|p| p.block).collect();
+        let Some((first, rest)) = preds.split_first() else { return Avail::default() };
+        let Some(first) = out.get(first).filter(|a| !a.is_empty()) else {
+            return Avail::default();
+        };
+        let mut acc = first.clone();
+        for pred in rest {
+            let Some(po) = out.get(pred) else { return Avail::default() };
+            acc.retain(|k, v| po.get(k) == Some(v));
+            if acc.is_empty() {
+                break;
             }
         }
-        acc.unwrap_or_default()
+        acc
     };
 
     // One reverse-postorder sweep. For a reducible CFG — everything cg_clif
@@ -473,39 +492,81 @@ fn cross_block_entry(
     // conservative under-approximation, which is always safe for forwarding.
     let mut entry: FxHashMap<Block, Avail> = FxHashMap::default();
     let mut out: FxHashMap<Block, Avail> = FxHashMap::default();
+    let mut meet_ns: u128 = 0;
+    let mut trans_ns: u128 = 0;
+    let mut max_avail: usize = 0;
+    let mut meet_work: usize = 0;
+    let t_loop = now(timed);
     for block in reverse_postorder(&cfg, entry_block, &blocks) {
         if Some(block) == entry_block {
             continue;
         }
+        let t_m = now(timed);
         let in_avail = meet(&out, block);
+        meet_ns += elapsed_ns(t_m);
+        max_avail = max_avail.max(in_avail.len());
+        meet_work += in_avail.len();
         entry.insert(block, in_avail.clone());
+        let t_t = now(timed);
         let new_out = transfer(func, &events[&block], in_avail, private, ptr_bases, loaded);
+        trans_ns += elapsed_ns(t_t);
         out.insert(block, new_out);
+    }
+    let loop_ns = elapsed_ns(t_loop);
+    if timed {
+        let nonempty = entry.values().filter(|a| !a.is_empty()).count();
+        let facts: usize = entry.values().map(|a| a.len()).sum();
+        eprintln!(
+            "[cbe] {} blocks={} insts={} cfg={:.0}us events={:.0}us loop={:.0}us \
+             meet={:.0}us transfer={:.0}us maxavail={} avail_sum={} \
+             nonempty_blocks={} total_facts={}",
+            func.name,
+            blocks.len(),
+            func.dfg.num_insts(),
+            cfg_ns as f64 / 1000.0,
+            ev_ns as f64 / 1000.0,
+            loop_ns as f64 / 1000.0,
+            meet_ns as f64 / 1000.0,
+            trans_ns as f64 / 1000.0,
+            max_avail,
+            meet_work,
+            nonempty,
+            facts,
+        );
     }
     entry
 }
 
 /// Blocks in reverse postorder, reachable from the entry block. Blocks that are
 /// not reachable keep their default (empty) entry facts.
+///
+/// `Block` is a dense entity index, so the successor lists live in a `Vec`
+/// indexed by it rather than a map: the DFS revisits this table once per edge,
+/// and hashing a `Block` on every step was a measurable share of the sweep.
 fn reverse_postorder(
     cfg: &cranelift_codegen::flowgraph::ControlFlowGraph,
     entry: Option<Block>,
     blocks: &[Block],
 ) -> Vec<Block> {
     let Some(entry) = entry else { return blocks.to_vec() };
-    let mut visited: FxHashSet<Block> = FxHashSet::default();
+    let num_blocks = blocks.iter().map(|b| b.as_u32() as usize + 1).max().unwrap_or(0);
+    let mut succs: Vec<Vec<Block>> = vec![Vec::new(); num_blocks];
+    for &b in blocks {
+        succs[b.as_u32() as usize] = cfg.succ_iter(b).collect();
+    }
+    let mut visited = vec![false; num_blocks];
     let mut postorder: Vec<Block> = Vec::with_capacity(blocks.len());
     // Iterative DFS; the `(block, next-succ)` stack mirrors the recursion.
     let mut stack: Vec<(Block, usize)> = vec![(entry, 0)];
-    let succs: FxHashMap<Block, Vec<Block>> =
-        blocks.iter().map(|&b| (b, cfg.succ_iter(b).collect())).collect();
-    visited.insert(entry);
+    visited[entry.as_u32() as usize] = true;
     while let Some(&mut (block, ref mut i)) = stack.last_mut() {
-        let next = succs[&block].get(*i).copied();
+        let next = succs[block.as_u32() as usize].get(*i).copied();
         match next {
             Some(succ) => {
                 *i += 1;
-                if visited.insert(succ) {
+                let s = succ.as_u32() as usize;
+                if !visited[s] {
+                    visited[s] = true;
                     stack.push((succ, 0));
                 }
             }

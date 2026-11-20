@@ -67,6 +67,7 @@ mod debuginfo;
 mod discriminant;
 mod driver;
 mod global_asm;
+mod div_test;
 mod if_convert;
 mod inline_asm;
 mod inliner;
