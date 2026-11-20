@@ -1020,3 +1020,101 @@ no amount of ISA work fixes p2_mem.
 Lesson: before touching codegen, profile. Both gaps that looked like codegen
 (block layout, saturation branch) were in fact missing inlining and missing loop
 invariance, i.e. MIR/CLIF-level pass gaps.
+
+## Session 2026-11-17 (later) — the frame pointer trap, and what p3 really measures
+
+Toolchain was reinstalled from scratch (rustup, `nightly-2026-11-17`, components
+`rust-src,rustc-dev,llvm-tools,rustfmt`). The prebuilt `dist/` still worked
+against the fresh toolchain, so all measurements below were done before any
+rebuild.
+
+### `opt_level` is inert on x86_64
+
+`CG_CLIF_OPT_LEVEL=speed` produces a **byte-identical** binary to the default
+`speed_and_size` on all nine programs (same sizes to the byte, run time within
+noise). So the `speed_and_size`-vs-`speed` distinction that the comment in
+`build_isa` worries about does not actually reach the x64 backend. Do not spend
+time on it again.
+
+### `-Z min-function-alignment=16` is a regression
+
+Totals over p1/p2/p3/p7/p8: 340.2 ms at the default vs 353.3 ms at 16-byte
+alignment, and the binaries get slightly larger (20429784 → 20430776). Padding
+costs I-cache and buys nothing here. Rejected.
+
+### `p3_calls` is a tail-call problem, not an inlining problem
+
+Profiling p3 (60 Hz sampler) shows `fib` at **84% of samples** in the cg_clif
+build. Time spent inside `fib` itself is 80 ms vs 28 ms for LLVM — 2.85x on a
+function with no callees to inline into it. The disassembly explains it:
+
+- LLVM rewrites `fib` into a **loop** with a single recursive call per
+  iteration (tail-recursion elimination with an accumulator), 13 instructions
+  of body.
+- cg_clif emits the naive shape: **two** recursive calls per activation, plus
+  `push %rbp; mov %rsp,%rbp; sub $0x10,%rsp`, two spill/reload pairs of
+  `r12`/`r13` around the calls, and the matching epilogue.
+
+The single biggest lever here is turning the second recursive call into a loop
+iteration. That is a MIR-level transformation (LLVM does it in the middle end),
+not something the Cranelift backend can do at the CLIF level, and it is
+therefore out of scope for a backend-only patch.
+
+### The frame pointer is a trap: Cranelift x64 ignores `preserve_frame_pointers`
+
+This cost the most time this session, so record it precisely.
+
+`cg_clif` computes `preserve_frame_pointer` from
+`sess.target.options.frame_pointer.ratchet(sess.opts.cg.force_frame_pointers)`.
+For the default target spec `frame-pointer` is **None**, i.e. `MayOmit`, so
+cg_clif sets `preserve_frame_pointers=false`. Nevertheless every function gets
+`push %rbp; mov %rsp,%rbp`, including leaf functions.
+
+Cause: in `cranelift-codegen-0.137.0`,
+`Callee::gen_prologue` (`machinst/abi.rs:2288`) calls
+`M::gen_prologue_frame_setup` **unconditionally**, and the x64 implementation
+(`isa/x64/abi.rs:538`) emits `push %rbp; mov %rsp,%rbp` with no check of the
+flag at all. Likewise `compute_frame_layout` hardcodes
+`setup_area_size = 16; // RBP, return address`. The flag is consulted only for
+unwind info and for the aarch64/riscv/s390x backends. So on x64 the flag is
+dead code.
+
+Two patches were tried and **both must be reverted if re-attempted**:
+
+1. Guard the prologue on the flag only. Result: `rbp` disappears from the
+   prologue but the epilogue still does `mov %rbp,%rsp; pop %rbp`, so the
+   stack is unbalanced → **segfault** on p2_mem (exit 139).
+2. Guard prologue *and* epilogue and shrink `setup_area_size` 16 → 8.
+   Result: prologue/epilogue look right and small programs print correct
+   output, but p2_mem aborts with
+   `memory allocation of 435733609449752 bytes failed` → a **miscompile**.
+   `setup_area_size` is not only prologue bookkeeping: it is the
+   caller-SP-relative offset used by `gen_clobber_save`/`gen_clobber_restore`
+   and by the unwinder. Changing it without auditing those paths silently
+   corrupts callee-save slots.
+
+Conclusion: making omit-frame-pointer work on x64 means auditing every use of
+`setup_area_size` and the `offset_upward_to_caller_sp` computations, not
+flipping a boolean. Both attempts are reverted; the tree is clean. If this is
+picked up again, the honest first step is a Cranelift-side test that checks
+`rsp` is balanced across a function with callee-saves and a `return_call`.
+
+Important sanity check learned here: after any ABI-level patch, verify output
+of **p2_mem** specifically. It is the program that surfaced both failures,
+while p1/p3/p4 still printed plausible-looking numbers.
+
+### Correctness baseline (clean build, 2026-11-17)
+
+All nine benchmark programs produce byte-identical stdout for
+LLVM (`L`), upstream cg_clif (`U`) and modified cg_clif (`M`). Any mismatch is
+a bug in a patch, not a pre-existing backend defect — the clean tree is sound.
+
+### p2_mem: the remaining 3.3x
+
+Run time 54.8 ms (M) vs 16.8 ms (L). Samples are spread thin: 31%
+`partition_lomuto_branchless_cyclic`, 14% `hashbrown::find_inner`, 10%
+`HashMap::raw_entry`, 9% SipHash `write`, 8% `swap_if_less`. Unlike p3 there is
+no single hot function to fix; the cost is diffuse across hash and sort code,
+which is consistent with the already-documented conclusion that the remaining
+gap is broad code-quality (no loop rotation, weak regalloc on the partition
+loop, no autovectorizer) rather than one missing optimization.
