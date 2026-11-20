@@ -1670,8 +1670,14 @@ Ringkasan terhadap empat tujuan awal:
   dan **lebih kecil dari LLVM** (36.095 KB, −12,2%). Penyebab utamanya bukan
   §13.2, melainkan patch `cranelift-object` yang memberi tiap fungsi dan objek
   data seksi bernama unik, sehingga `--gc-sections` akhirnya bisa membuang kode
-  mati. Buktinya: pada std upstream ada **8.948 seksi `.text.subsection`** yang
-  bernama sama (jadi tak bisa dibuang), sedangkan di fork jumlahnya **0**.
+  mati. Buktinya, dihitung pada berkas objek di dalam `libstd-*.rlib` (bukan
+  pada `.so` hasil link, yang sudah menggabungkan semuanya): upstream punya
+  **8.948 seksi bernama `.text.subsection`** — semuanya identik, jadi linker
+  hanya bisa membuang seluruhnya atau tidak sama sekali — sedangkan fork punya
+  **8.551 seksi `.text.<simbol>` unik dan 0 yang bernama `subsection`**.
+  Efeknya terlihat langsung di linker: dengan `-Wl,--print-gc-sections`,
+  `p1_arith` versi fork membuang **17.512** seksi tak terpakai, upstream hanya
+  **5.682**, dan hasil akhirnya 4,09 MB vs 5,88 MB.
   Kontribusi §13.2 terhadap ukuran kecil; ia menang di runtime (§13.6).
 - **Waktu compile**: modifikasi 726 ms vs LLVM 876 ms (**−17,1%**), dan +2,7%
   vs upstream (biaya dataflow store-forwarding §13.1 serta pass LICM §14,
