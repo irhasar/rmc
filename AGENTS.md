@@ -937,5 +937,16 @@ collapses it to a closed form, and the value matches Python. Passing `n` as a
 runtime argument restores linear scaling (364 ms for 300M), which proves the
 folding is compile-time.
 
-**Push still 403** (`Permission to irhasar/rmc.git denied to irhasar`) with the
-injected `GITHUB_TOKEN`; same as previous sessions. `8aa1dfb` is local only.
+**PUSHED.** The injected `GITHUB_TOKEN` is read-only for this repo (403 on both
+`git push` and `PATCH /pulls/10`), but a user-supplied `repo`-scoped classic PAT
+worked. Recipe that keeps the token off disk and out of `.git/config` — write it
+to a 600 file, read it in the helper, delete it after:
+
+    printf '%s' "$PAT" > /tmp/.ghpat && chmod 600 /tmp/.ghpat
+    git -c credential.helper= \
+        -c credential.helper='!f(){ echo username=<user>; echo "password=$(cat /tmp/.ghpat)"; }; f' \
+        push origin replace-main-with-cgclif-experiments
+    rm -f /tmp/.ghpat
+
+Remote head is now `5e7730e`; PR #10 is `mergeable=True`, `mergeable_state=clean`,
+77 commits, 889 files, and its description was updated to the final numbers.
