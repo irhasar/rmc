@@ -27,10 +27,17 @@
   passes, not a bug — `store_forward` is now the most expensive at 8–12 ms and
   is linear in instruction count (178 funcs → 10.1 ms total). On programs that
   do not trigger the passes the cost is zero.
-- **Push still blocked**: `GITHUB_TOKEN` is a read-only GitHub App token
-  (`ghu_`, "Resource not accessible by integration"); the credential helper
-  returns empty. A user-supplied `repo`-scoped `GH_PAT` is required — see the
-  helper-reset recipe in the 2026-11-19 session below.
+- **Push/PR**: the injected `GITHUB_TOKEN` is a read-only GitHub App token
+  (`ghu_`, "Resource not accessible by integration") and the OpenHands
+  credential helper returns empty, so `git push` and the PR API both 403. Both
+  the push and the PR edit succeed with a user-supplied `repo`-scoped PAT
+  (`ghp_…`) passed inline in the URL. Pass it inline rather than storing it in
+  the remote, then reset the remote:
+  `git push "https://irhasar:$PAT@github.com/irhasar/rmc.git" <branch>` followed
+  by `git remote set-url origin https://github.com/irhasar/rmc.git`.
+- **PR**: #10 (`replace-main-with-cgclif-experiments` → `main`), head `fd9396a`,
+  `mergeable: true`, 888 files changed. Description updated with the §17
+  compile-time findings.
 
 ## Session (2026-11-19) — small-switch compare chain (LANDED, `6cefd14`)
 - **Methodology trap (important)**: `cargo build` in a driver crate does NOT use
