@@ -1959,6 +1959,13 @@ dan seluruh keluaran tetap byte-identik dengan LLVM.
   perlambatan besar, bukan kesalahan pembulatan.
 - Loop yang tidak memuat konversi (`pre`: dua tahap terpisah) tetap 48,8 ms
   sebelum dan sesudah — memastikan perbaikan tidak menyentuh jalur lain.
+- `bench/tests/t_u64f32.rs` menutup kedua cabang sekuens: nilai < 2^63
+  (konversi langsung) dan >= 2^63 (jalur bagi-dua lalu skala). Diuji pada
+  seluruh rentang u64 termasuk `u64::MAX`; hasilnya 0 kesalahan round-trip,
+  0 mismatch f32, dan 64/64 nilai di sekitar batas 2^63 tepat, semuanya
+  identik dengan LLVM. Pemeriksaan disassembly: **20/20** instruksi
+  `cvtsi2ss`/`cvtsi2sd` di binary uji kini didahului pemutus dependency
+  (`xorps`/`xorpd`), termasuk dua yang berasal dari `compiler_builtins`.
 
 ### 15.8 Sisa gap p4_simd
 
