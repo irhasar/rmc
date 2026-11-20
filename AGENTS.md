@@ -973,3 +973,50 @@ instructions. Before attacking one, check that the constants the replacement
 needs are already loop-invariant at the level where you are generating code.
 Do not re-attempt this without first making the constants CLIF values so LICM
 can hoist them; that is the prerequisite, not the sequence itself.
+
+## Three more negative results, and the real shape of the remaining gap
+
+Chased the two worst runtime gaps (p8_minmax 2.2x, p2_mem 3.2x vs LLVM). All
+three candidate fixes measured, all rejected:
+
+1. **Block-order / RPO successor swap** (`dominator_tree.rs`, `ForwardGraph::
+   successors`). Hypothesis: RPO emits `header, exit, body`, so each iteration
+   takes two branches (`jae` out + `jmp` back). Swapping the two-way successor
+   order compiles and produces *different bytes*, but the loop shape is
+   unchanged: Cranelift lowers `brif` + back edge to test-at-top plus an
+   unconditional back jump regardless of which arm is laid out first, and the
+   layout code picks fall-through by its own rules. Runtime unchanged on all 8
+   programs (only p4_simd moved 96->87 ms, which did not reproduce as a
+   structural change; the jump count was identical). Reverted.
+
+2. **Inliner budget/caps** (`CG_CLIF_INLINE_GROWTH`, `INLINE_MAX`,
+   `INLINE_LEAF_MAX`, `INLINE_USES`). Instrumented `CguInliner::inline` and
+   found 206 rejects and 170 not-in-map on the p2 workload; the dominant reason
+   is the *growth budget*, not the size cap (`REJECT size=116 cap=128
+   budget=66`). But raising the budget 150 -> 1000 with every cap lifted only
+   moves p2big 527 -> ~490 ms (~5%) and leaves 37 `call`s inside
+   `partition_lomuto_branchless_cyclic`. The closures that matter are reached
+   through the sort machinery's generic layers, so the budget is not the binding
+   constraint at the sites that are hot. Not worth the compile-time cost
+   (146 -> 165 ms). Reverted.
+
+3. **`CG_CLIF_UNROLL_CLONE`** on p8: 38 -> 46 ms. Actively worse.
+
+### Where the gap actually comes from
+
+`p2_mem` is dominated by `core::slice::sort` and `hashbrown`, not by the loop
+bodies the passes above touch. Profiling (tools/sampler.c + sym.py) shows LLVM
+folding `find_inner`, `Hasher::write`, `swap_if_less` into their callers while
+cg_clif keeps them out of line: the LLVM binary has 601 local symbols on the
+same program, the cg_clif one has 1680. In cg_clif's `partition_lomuto_
+branchless_cyclic` the per-element closure is a real `call`, and the iterator
+state is spilled to `0x30(%rsp)` / `0x38(%rsp)` and reloaded each iteration.
+
+Closing that needs cross-crate inlining (the bodies are not in the same CGU, and
+`-C codegen-units=1` does not change it: 533 vs 531 ms, same 41 calls), or a
+MIR-level inliner in cg_clif itself. Neither is a `cranelift-codegen` change, so
+no amount of ISA work fixes p2_mem.
+
+Lesson: before touching codegen, profile. Both gaps that looked like codegen
+(block layout, saturation branch) were in fact missing inlining and missing loop
+invariance, i.e. MIR/CLIF-level pass gaps.
