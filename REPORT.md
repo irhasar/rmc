@@ -1640,47 +1640,48 @@ tanpa itu berisiko salah-optimasi. Ini arah kerja berikutnya yang konkret.
 
 ### 13.5 Matriks tiga arah final (§13)
 
-Diukur dengan `bench/compare3.sh` (3 repetisi compile, 5 repetisi run, median),
-delapan program `bench/progs/`. Kolom `mod vs up` adalah runtime modifikasi
-terhadap upstream cg_clif — perbandingan backend murni, keduanya memakai std
-hasil Cranelift sendiri.
+Diukur dengan `bench/fullbench.sh` (7 repetisi compile, 9 repetisi run, median
+per program, lalu dijumlahkan), delapan program `bench/progs/`, `opt-level=3`.
+Kolom `mod vs up` adalah runtime modifikasi terhadap upstream cg_clif —
+perbandingan backend murni, keduanya memakai std hasil Cranelift sendiri.
 
 | label | compile wall (ms) | compile cpu (ms) | peak RSS (MB) | total size (KB) | run wall (ms) | run cpu (ms) | run RSS (MB) |
 |---|---|---|---|---|---|---|---|
-| LLVM (stock rustc) | 876 | 1146 | 888 | 36.095 | 371 | 367 | 124 |
-| cg_clif upstream | 718 | 934 | 903 | 45.689 | 2494 | 2495 | 126 |
-| **cg_clif modifikasi** | **737** | **962** | **907** | **31.663** | **530** | **526** | **126** |
+| LLVM (stock rustc) | 886 | 1153 | 132 | 36.095 | 367 | 363 | 48 |
+| cg_clif upstream | 689 | 863 | 134 | 36.184 | 2493 | 2488 | 48 |
+| **cg_clif modifikasi** | **720** | **945** | **132** | **31.688** | **519** | **517** | **48** |
 
 Runtime per program:
 
 | program | LLVM | upstream | modifikasi | mod vs up |
 |---|---|---|---|---|
-| p1_arith | 83 | 108 | 105 | −2,8% |
-| p2_mem | 16 | 156 | 67 | **−57,1%** |
-| p3_calls | 39 | 119 | 100 | −16,0% |
-| p4_simd | 56 | 161 | 143 | −11,2% |
-| p5_inline | 58 | 900 | 7 | **−99,2%** |
-| p6_scalar | 58 | 910 | 8 | **−99,1%** |
-| p7_branchy | 43 | 101 | 61 | −39,6% |
-| p8_minmax | 18 | 39 | 39 | 0,0% |
+| p1_arith | 82 | 108 | 104 | −3,5% |
+| p2_mem | 16 | 155 | 66 | **−57,4%** |
+| p3_calls | 37 | 114 | 96 | −15,1% |
+| p4_simd | 56 | 151 | 141 | −6,7% |
+| p5_inline | 58 | 900 | 6 | **−99,3%** |
+| p6_scalar | 58 | 919 | 7 | **−99,3%** |
+| p7_branchy | 43 | 100 | 61 | −38,9% |
+| p8_minmax | 18 | 47 | 38 | −18,6% |
 
 Ringkasan terhadap empat tujuan awal:
 
-- **Ukuran hasil**: modifikasi **31.663 KB vs upstream 45.689 KB (−30,7%)**,
-  dan **lebih kecil dari LLVM** (36.095 KB). Penyebab utamanya bukan §13.2,
-  melainkan patch `cranelift-object` yang memberi tiap fungsi dan objek data
-  seksi bernama unik, sehingga `--gc-sections` akhirnya bisa membuang kode mati.
-  Buktinya: pada std upstream ada **8.948 seksi `.text.subsection`** yang
+- **Ukuran hasil**: modifikasi **31.688 KB vs upstream 36.184 KB (−12,4%)**,
+  dan **lebih kecil dari LLVM** (36.095 KB, −12,2%). Penyebab utamanya bukan
+  §13.2, melainkan patch `cranelift-object` yang memberi tiap fungsi dan objek
+  data seksi bernama unik, sehingga `--gc-sections` akhirnya bisa membuang kode
+  mati. Buktinya: pada std upstream ada **8.948 seksi `.text.subsection`** yang
   bernama sama (jadi tak bisa dibuang), sedangkan di fork jumlahnya **0**.
   Kontribusi §13.2 terhadap ukuran kecil; ia menang di runtime (§13.6).
-- **Waktu compile**: modifikasi 737 ms vs LLVM 876 ms (**−15,9%**), dan hanya
-  +2,6% vs upstream (biaya dataflow store-forwarding §13.1, sesuai perkiraan
-  3 ms/fungsi terbesar).
-- **RAM saat compile**: 907 MB vs LLVM 888 MB (+2,1%) — praktis setara.
-- **Runtime**: modifikasi 530 ms vs upstream 2494 ms (**−78,7%**), tetapi masih
-  1,43× LLVM. Sisa gap terpusat di p4_simd (143 vs 56 ms), yang persis beban
-  loop scalar tanpa LICM/unrolling yang diuraikan §11.3.
-- **RAM saat run**: 126 MB, sama dengan upstream dan LLVM.
+- **Waktu compile**: modifikasi 720 ms vs LLVM 886 ms (**−18,7%**), dan +4,5%
+  vs upstream (biaya dataflow store-forwarding §13.1 serta pass LICM §14,
+  keduanya di bawah 1% per program pada A/B terisolasi).
+- **RAM saat compile**: 132 MB vs LLVM 132 MB (setara), vs upstream 134 MB
+  (−1,5%) — praktis setara.
+- **Runtime**: modifikasi 519 ms vs upstream 2493 ms (**−79,2%**), tetapi masih
+  1,41× LLVM. Sisa gap terpusat di p4_simd (141 vs 56 ms), yang persis beban
+  loop scalar tanpa vektorisasi yang diuraikan §11.3.
+- **RAM saat run**: 48 MB, sama dengan upstream dan LLVM.
 
 Kebenaran: kedelapan program menghasilkan output **byte-identik** dengan LLVM
 (diverifikasi `diff`), di samping uji diferensial `[x; N]` di §13.2.
@@ -1729,3 +1730,98 @@ tidak terlihat di matriks §13.5.
 
 Tunable `CG_CLIF_NO_REPEAT_MEMSET` ditambahkan khusus agar klaim ini bisa
 direproduksi dan di-bisect.
+
+## 14. LICM: pass loop-invariant code motion yang baru (§14)
+
+Cranelift tidak punya LICM. Pass `egraph` hanya meng-hoist *expression node*
+yang murni dan sengaja **tidak** memindahkan load; `gvn` melakukan value
+numbering tetapi tidak keluar dari blok. Akibatnya loop yang memuat nilai
+invariant setiap iterasi (koefisien, batas, base pointer) menyimpan load itu di
+dalam rantai dependensi loop-carried.
+
+`vendor/cranelift-codegen-0.137.0/src/licm.rs` menambahkan pass tersebut,
+dipanggil dari `Context::compile` **setelah** egraph pass: egraph sudah melipat
+dan menyederhanakan badan loop, jadi yang di-hoist adalah bentuk final, bukan
+bentuk yang nanti ditulis ulang di tempat.
+
+### 14.1 Cara kerja
+
+1. Untuk setiap loop, cari **preheader** (blok tunggal yang masuk ke header dan
+   berakhir dengan `jump`). Bila tidak ada, buat dengan memecah edge dari
+   *immediate dominator* header — idom sebuah header selalu di luar loop,
+   jadi blok baru itu tepat dieksekusi sekali per masuk loop.
+2. Kumpulkan semua store di dalam loop beserta base address-nya (global/stack
+   slot bila diketahui statis).
+3. Telusuri instruksi tiap blok sesuai urutan layout. Sebuah instruksi boleh
+   di-hoist bila:
+   - bukan terminator, dan **tidak bisa trap** (`can_trap() == false`);
+   - bila load: flag-nya `readonly` + `notrap` + `can_move`, **dan** tidak ada
+     store di loop yang bisa meng-alias alamatnya (store opaque membatalkan
+     semua load yang base-nya tidak diketahui);
+   - bila bukan load: murni menurut `is_pure_for_egraph`;
+   - semua operand "tersedia" di preheader.
+4. "Tersedia" berarti: didefinisikan di luar loop **dan** blok definisinya
+   mendominasi preheader, atau didefinisikan oleh instruksi yang sudah
+   di-hoist sebelumnya. Parameter blok **preheader** boleh; parameter blok lain
+   tidak.
+
+### 14.2 Tiga jebakan soundness
+
+Ketiganya muncul sebagai miscompile atau ICE saat pengembangan, dan masing-masing
+kini ditangani eksplisit:
+
+1. **Parameter header adalah phi node.** Parameter blok header mengambil nilai
+   berbeda di back-edge, jadi hanya "tersedia" di jalur masuk — bukan di dalam
+   loop. Menganggapnya invariant adalah bug LICM klasik dan membuat akumulator
+   loop membeku pada nilai awal.
+2. **"Di luar loop" tidak cukup.** Definisi harus **mendominasi preheader**.
+   Nilai yang didefinisikan di cabang saudara berada di luar loop tetapi tidak
+   mendominasi preheader.
+3. **`brif` dengan kedua cabang menuju header.** Hanya satu edge yang bisa
+   dipecah; edge lain harus tetap menuju header. Versi awal hanya mengalihkan
+   satu edge sehingga cabang lain melewati kode yang di-hoist. Pemecahan edge
+   juga **wajib meneruskan argumen phi** edge tersebut.
+
+Selain itu: instruksi yang bisa trap tidak pernah di-hoist (kalau di-hoist, ia
+akan dieksekusi pada jalur yang dulu melewati badan loop — mis. `sdiv` dengan
+pembagi nol), dan `BlockArg::TryCallRet`/`TryCallExn` membuat pass menyerah
+pada edge EH.
+
+### 14.3 Dampak terukur
+
+A/B dengan `CG_CLIF_NO_LICM=1` vs default, 11 repetisi, median, `opt-level=3`,
+kedelapan program `bench/progs/`:
+
+| program | LICM mati | LICM hidup | delta | ukuran |
+|---|---:|---:|---:|---|
+| p1_arith | 104,8 ms | 104,2 ms | −0,6% | sama |
+| p2_mem | 65,2 ms | 65,5 ms | +0,5% | +208 B |
+| p3_calls | 95,6 ms | 95,5 ms | −0,1% | sama |
+| p4_simd | 135,7 ms | 135,4 ms | −0,2% | sama |
+| p5_inline | 6,8 ms | 6,3 ms | **−8,1%** | sama |
+| p6_scalar | 6,9 ms | 6,3 ms | **−9,0%** | sama |
+| p7_branchy | 60,6 ms | 60,5 ms | −0,2% | sama |
+| p8_minmax | 38,3 ms | 38,7 ms | +1,1% | sama |
+| **total** | **513,9 ms** | **512,4 ms** | **−0,3%** | |
+
+Biaya compile: diukur terpisah pada p1/p2/p4/p6, delta antara −0,5% dan +1,1%
+(derau). Jadi pass ini **gratis** dan memberi keuntungan pada kernel yang
+memuat nilai invariant di dalam loop.
+
+### 14.4 Verifikasi
+
+- Suite tes cg_clif penuh: **25.368 tes lulus, 0 gagal**, termasuk rand, regex,
+  graviola, dan portable-simd yang dikompilasi ulang dengan pass aktif.
+- `bench/tests/t_licm.rs` ditambahkan sebagai regresi khusus: lima bentuk yang
+  pernah merusak pass (phi loop-carried, `brif` dua cabang ke header, store yang
+  memblokir hoist, load invariant yang aman, dan pembagian yang bisa trap).
+  Keluarannya **identik dengan LLVM**, baik dengan LICM hidup maupun mati.
+- Kedelapan program benchmark menghasilkan output byte-identik dengan LLVM.
+
+### 14.5 Tunable
+
+| variabel | arti |
+|---|---|
+| `CG_CLIF_NO_LICM=1` | matikan pass LICM |
+| `CG_CLIF_LICM_DEBUG=1` | cetak setiap hoist ke stderr |
+| `CG_CLIF_NO_COLLAPSE=1` | matikan collapse forwarding-latch sebelum unroll |
