@@ -950,3 +950,26 @@ to a 600 file, read it in the helper, delete it after:
 
 Remote head is now `5e7730e`; PR #10 is `mergeable=True`, `mergeable_state=clean`,
 77 commits, 889 files, and its description was updated to the final numbers.
+
+## Negative result: branchless saturating `f64->u64` is not worth it
+
+The "remaining `p1_arith` gap is the branchy saturating conversion" note above
+was tested and is wrong. A branchless sequence was implemented in
+`cranelift-codegen`'s `Inst::CvtFloatToUintSeq` emit arm (two `cvttsd2si`, one
+`subsd`, `sar`/`and`/`or` for the `+2^63`, `cmovs` for `>=2^64`, `ucomisd`+
+`cmovb` for `<0`/NaN), verified bit-exact against LLVM on 81188 inputs, and
+benchmarked A/B against the identical tree with the path disabled:
+
+* `p1_arith` 98 -> 109 ms (**+10%, a regression**), `cast3` +3%, everything else
+  within noise, `pure` conversion loop a wash.
+* LLVM's loop wins because it keeps both float constants in registers outside
+  the loop. In `cranelift-codegen` the constants are materialized in `emit`,
+  which runs after LICM, so they are reloaded every iteration and the extra
+  `movabs`+`movq` outweigh the saved branch. The branchy version is also
+  predicted almost perfectly on the monotonic values real code produces.
+
+Lesson: a "predictable branch" in a hot loop is cheaper than six extra
+instructions. Before attacking one, check that the constants the replacement
+needs are already loop-invariant at the level where you are generating code.
+Do not re-attempt this without first making the constants CLIF values so LICM
+can hoist them; that is the prerequisite, not the sequence itself.
