@@ -1,14 +1,14 @@
-/compiler/target/
-__pycache__/
-*.pyc
-
-# Stray build artifacts
-/a.out
-compiler/c.bin
-compiler/c.err
-
-# rustc codegen-backend build artifacts
-backend/target/
-
-# rustc incremental-compilation directories (never commit build outputs)
-/off/
+# Build artifacts (not tracked)
+/build/
+/dist/
+/target/
+/out/
+bench/out/
+cg_clif_mod/build/
+cg_clif_mod/dist/
+cg_clif_mod/target/
+cg_clif_upstream/build/
+cg_clif_upstream/dist/
+cg_clif_upstream/target/
+tools/sampler
+extbench/out/
