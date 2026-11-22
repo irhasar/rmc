@@ -1,6 +1,37 @@
 # AGENTS.md
 
-## Session (2026-11-22, latest) — u64→float narrowing via dominator (LANDED)
+## Session (2026-11-22, latest) — remaining-gap investigation + fcvt local rules
+- **fcvt narrowing extended** (`src/unroll.rs`): besides the dominator proof, two
+  always-sound LOCAL rules now fire: `fcvt_from_uint(uextend(narrow))` (zero-extend
+  → `< 2^32`) and `fcvt_from_uint(band(x, M<2^63))` (`≤ M`). **Important**: a
+  narrow *type* alone is NOT enough — `fcvt_from_sint` on a raw `i32` is wrong for
+  `u32 ≥ 2^31` (sign bit). Only `uextend` guarantees non-negative. Verified incl
+  `u32::MAX`, `4e9`, `& 0xFFFF` masks; suite 65/65.
+- **Where the remaining gaps really are (profiled this session — do NOT re-tread):**
+  - **p2 (54 vs 17)**: 26% `partition_lomuto`, 31% hashing, 10% `swap_if_less`,
+    all in the prebuilt **Cranelift std**. Diffuse codegen quality (regalloc +
+    cross-CGU inlining + no vectorizer). Not a pass-sized fix.
+  - **p3 (94 vs 37)**: 84% in `fib`. LLVM rewrites `fib(n)=fib(n-1)+fib(n-2)` so
+    the **second** recursive call becomes a loop iteration → ~**half** the calls
+    (verified by disasm: L's loop calls fib(n-1), fib(n-3), …; M does both
+    fib(n-1) and fib(n-2) → tree is ~2×). This is a MIR/algorithmic transform,
+    out of scope for a CLIF pass.
+  - **p4 (100 vs 57)**: LLVM uses `sincosf` (M emits separate `sinf`+`cosf`), and
+    the two remaining loops are vectorized by LLVM (M scalar). BUT the sin/cos
+    calls are in **different basic blocks** (bounds-check `je`/`jae` between them),
+    so same-block sincos fusion won't fire; cross-block fusion is much harder.
+    Also the per-iteration bounds checks (i<a.len()) aren't eliminated because M
+    can't prove a.len()==n. → vectorization + bounds-check-elimination wall.
+  - **p1 (101 vs 82)**: branchy saturating `f64→u64` (`cvttsd2si` pair) — the
+    documented negative-result area (branchless was slower; constants not
+    hoistable). Not fixable without hoisting the constants to CLIF values first.
+  - **p8 (21 vs 19), p9 (37 vs 32)**: residual = cranelift **regalloc** spills
+    (lane loop 6 carried values; p9 reloads a.ptr/a.len from stack each iter).
+- **sincos fusion is NOT worth attempting as a CLIF pass**: declaring the
+  `sincosf` symbol needs `module`/`tcx` (available in `base.rs`, not in a raw
+  `&mut Function` pass), AND the calls are cross-block in real code. Abandoned.
+
+## Session (2026-11-22) — u64→float narrowing via dominator (LANDED)
 - **What**: `narrow_uint_fcvt` in `src/unroll.rs` rewrites `fcvt_from_uint(x)` →
   `fcvt_from_sint(x)` when `x` is provably `< 2^63`. On x86-64 that turns a
   branchy full-range u64→float sequence into a single `cvtsi2ss`/`cvtsi2sd`
