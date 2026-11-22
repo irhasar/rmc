@@ -1233,3 +1233,43 @@ that are actually available (`opt_level`, `regalloc_algorithm`, CGU count,
 inliner budget) all move compile time by at most a few percent. Compile time is
 dominated by work shared with LLVM (parsing, type checking, MIR), which is why
 cg_clif's advantage there is structural rather than tunable.
+
+## Next step (NOT done): LCG lane transform for p8 — exact math
+
+Goal: p8 (`a = a*C + (i|1)`, min) 29 ms → ~20 ms, matching LLVM's 4-lane loop.
+Current `apply_partial` builds each `pre[k]` from the header → O(factor²)
+`imul`s (factor 3 = 6 imuls / 3 iters = 2/iter). LLVM does ~1 imul/iter.
+
+**Why LLVM wins: even factor ⇒ fixed parity per lane.** With `f` lanes, lane `L`
+visits `i = L, L+f, L+2f, …`. For **even** `f`, `i` has the *same parity* as `L`,
+so `(i|1) = i + (L even ? 1 : 0)` is **linear in the lane step** `k`. Hence each
+lane's forcing term is affine in `k` and advances by a **constant add** (no
+`imul`). Lane recurrence:
+  `a_L(k+1) = C^f · a_L(k) + F_L(k)`,   `F_L(k+1) = F_L(k) + slope`,
+  `slope = f · (C^{f-1} + C^{f-2} + … + C + 1)  (mod 2^64)`, same for all lanes;
+  `F_L(0) = Σ_{j=0}^{f-1} C^{f-1-j} · ((L+j)|1)`  — a **compile-time constant**;
+  `a_L(0) = C^L · a_0 + Σ_{j<L} C^{L-1-j}·(j|1)` — one `imul` (C^L·a_0) + const.
+Loop body = f × (1 imul + 1 add + 1 forcing add + 1 min) per f iters ⇒ 1 imul/iter.
+The min over all lane values covers every inner iteration (lanes partition `i`).
+
+**Why factor 3 can't use it:** odd `f` ⇒ `i`'s parity alternates per lane ⇒
+`(i|1)` is not linear. So the lane transform must use an **even** factor (4).
+
+**Hard part = the tail/epilogue.** The lane loop's carried state is f separate
+accs, not "the current acc". When `BOUND % f != 0`, the remainder must fall back
+to a scalar loop, and the scalar loop needs the true `a` at iteration
+`f·⌊BOUND/f⌋` — i.e. one specific lane's last value. Options: (a) run the scalar
+tail from that lane's value (pick lane = `(f·n_last) mod f`); (b) keep the
+existing guard+narrow single-step but only enter the lane path when
+`iv + f <= BOUND`, and after the lane body recompute the scalar acc from the
+lane that is `f-1` steps ahead. Getting this wrong is a silent miscompile, so it
+needs the full differential suite (2^32 f32-style sweeps are overkill here; a
+range of BOUND mod f values × small BOUNDs, compared byte-for-byte to LLVM, is
+the minimum).
+
+**Scope:** only fires for a single LCG state + a single associative reduction
+(min/max/add) with atom `iv | const` and even factor. Everything else keeps the
+current (correct) clone path. This is a *new* emission path in `apply_partial`,
+~200–300 lines, higher risk than the guard/factor tweaks. Deferred because the
+sandbox reset twice this session; land it only with incremental commits + the
+full `./y.sh test` green gate.
