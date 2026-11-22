@@ -2794,3 +2794,38 @@ tipe seragam.
 Diuji: same-block, cross-block (`if`), argumen berbeda (tidak difus), f32 & f64,
 dalam loop, `sin`-saja/`cos`-saja. Semua byte-identik LLVM. `./y.sh test` →
 **65 suite, 0 gagal**.
+
+## 25. Upaya eliminasi bounds check redundan (NEGATIF — ditarik)
+
+### 25.1 Motivasi
+`for i in 0..v.len() { v[i] }` di cg_clif menghasilkan **dua** perbandingan di
+loop: guard `i < len` (lompat ke body) dan, di body, cek bounds `i >= len →
+panic_bounds_check`. Yang kedua redundan (guard sudah membuktikan `i < len`).
+Ini pola sangat umum; LLVM mengeliminasinya.
+
+### 25.2 Yang dicoba
+Pass CLIF `redundant_branch`: untuk tiap `brif (icmp CC x y) T, F`, cari
+dominator dengan `brif (icmp CC x' y')` di mana sisi yang sesuai mendominasi
+blok ini; jika `(x,y) == (x',y')`, kondisi terbukti dan cabang mati → ganti
+dengan `jump`. Ditambah substitusi block-param pada edge langsung (guard
+meneruskan `i` ke body lewat parameter blok).
+
+### 25.3 Mengapa gagal (akar masalah, via dump CLIF)
+- **9 benchmark: 0 perubahan biner.** Pass tidak pernah menyala.
+- Dump CLIF `bcbig` menunjukkan guard loop membandingkan terhadap `v8` (nilai
+  `end` dari `Range`, diteruskan sebagai block-param) sedangkan cek bounds
+  membandingkan terhadap `v75` (hasil `load` `v.len()` yang **terpisah**).
+  `v8 != v75` sebagai SSA value walau keduanya = panjang slice. Aturan
+  "operand sama" tidak bisa menyala.
+- Di kasus kecil (`bc.rs`, `(0..1000).collect()`) pass **menyala** (2→1 cek) —
+  di sana kedua load ter-CSE. Tapi `bcbig` (pola `.map().collect()` + loop
+  bersarang) tidak.
+- **Prasyarat sebenarnya**: CSE/value-numbering atas dua load panjang
+  (`Range::end` vs `v.len()`), plus bukti tak ada `store` ke slot header Vec di
+  antaranya. Itu analisis alias/load, bukan sekadar pass cabang.
+
+### 25.4 Catatan nilai
+Bahkan bila cek tereliminasi, `bcbig` tetap 134 ms vs LLVM 40 ms — gap-nya
+**vektorisasi** (4×), bukan bounds check (~10-20%). Jadi ini bukan tuas utama
+untuk p4/p2. Pass ditarik (dead code); dicatat agar tidak diulang tanpa CSE
+panjang lebih dulu.

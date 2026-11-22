@@ -1,6 +1,28 @@
 # AGENTS.md
 
-## Session (2026-11-22, latest) — sincos fusion (LANDED, p4 100→86ms)
+## Session (2026-11-22) — bounds-check elimination attempt (NEGATIVE, reverted)
+- Tried a `redundant_branch` CLIF pass: eliminate `brif (icmp CC x y)` when a
+  dominator has the same comparison and its matching edge dominates. Target: the
+  redundant `i >= len -> panic_bounds_check` inside `for i in 0..v.len()`.
+- **It fires on tiny cases but NOT on any of the 9 benchmarks (binary unchanged).**
+  Root cause found by dumping CLIF: the loop guard compares against the `Range`'s
+  `end` value (threaded as a **block param**), while the bounds check compares
+  against a **separate** `v.len()` load — different SSA values even though equal.
+  Block-param substitution on the direct edge was added but still doesn't match
+  because the two length loads are not CSE'd.
+- **Prerequisite for a real bounds-check eliminator**: CSE/value-numbering of the
+  two length loads (`Range::end` vs `v.len()`) + proof no store to the Vec header
+  slot between them. That's alias/load analysis, not a branch pass. Don't retry
+  the branch-only approach.
+- **Also not worth it even if it worked**: `bcbig` is 134 vs LLVM 40 ms — a 4x
+  **vectorization** gap, bounds checks are ~10-20%. So bounds checks are not the
+  lever for p4/p2.
+- Pass removed; REPORT §25 records this. `./y.sh build` clean, 9 bench progs match.
+- Useful debugging trick: dump the loop CLIF by iterating `layout.blocks()` +
+  `dfg.display_inst` in a pass gated on an env var — there is no built-in CLIF
+  dump flag.
+
+## Session (2026-11-22) — sincos fusion (LANDED, p4 100→86ms)
 - **New pass `src/sincos.rs`** (runs in `base.rs` after `unroll`, has `module`
   context): fuses `sinf(x)`+`cosf(x)` (and `sin`/`cos`) with the same argument
   into one `sincosf`/`sincos` libcall — LLVM does this, cg_clif didn't. **p4
