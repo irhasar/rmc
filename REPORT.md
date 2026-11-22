@@ -2694,6 +2694,17 @@ LLVM adalah kualitas regalloc `cranelift-codegen` (spill), di luar cakupan.
   12345,30M`) dan reduksi min/max dengan dua multiplier: byte-identik dengan
   LLVM. Bound habis dibagi f → jalur lane; sisanya → fallback clone.
 - `a` setelah loop (=`a_B`), `mn` awal non-MAX, `a` awal ≠ 1: byte-identik.
+### 23.5 Aturan lokal (selalu aman, tanpa dominator)
+
+Selain aturan dominator, dua bentuk lokal pasti `< 2^63` dan langsung disempitkan:
+- `fcvt_from_uint(uextend(y))` dengan `y` bertipe sempit (i32/i16/i8): hasil
+  zero-extend ada di `0..2^32-1` → `fcvt_from_sint` eksak.
+- `fcvt_from_uint(band(x, M))` dengan `M < 2^63`: hasil `& M ≤ M < 2^63`.
+
+Catatan: `fcvt_from_sint` pada **i32 langsung** TIDAK aman (nilai `u32 ≥ 2^31`
+jadi negatif), jadi tipe sempit saja bukan alasan cukup — hanya `uextend` yang
+menjamin non-negatif.
+
 - `./y.sh test --sysroot clif` → **65 suite, 0 gagal**.
 - Semua 9 program benchmark keluaran identik dengan LLVM; tidak ada regresi
   (p1–p9, compile/size/runtime).
@@ -2734,4 +2745,15 @@ konstanta kecil kini memakai satu instruksi konversi, bukan barisan bercabang.
   bound dinamis (`std::env::args`) → fallback; loop `(1<<40)..` (i ≥ 2^31) →
   benar. Semua byte-identik dengan LLVM.
 - Semua 9 program benchmark keluaran identik; tidak ada regresi.
+### 23.5 Aturan lokal (selalu aman, tanpa dominator)
+
+Selain aturan dominator, dua bentuk lokal pasti `< 2^63` dan langsung disempitkan:
+- `fcvt_from_uint(uextend(y))` dengan `y` bertipe sempit (i32/i16/i8): hasil
+  zero-extend ada di `0..2^32-1` → `fcvt_from_sint` eksak.
+- `fcvt_from_uint(band(x, M))` dengan `M < 2^63`: hasil `& M ≤ M < 2^63`.
+
+Catatan: `fcvt_from_sint` pada **i32 langsung** TIDAK aman (nilai `u32 ≥ 2^31`
+jadi negatif), jadi tipe sempit saja bukan alasan cukup — hanya `uextend` yang
+menjamin non-negatif.
+
 - `./y.sh test --sysroot clif` → **65 suite, 0 gagal**.

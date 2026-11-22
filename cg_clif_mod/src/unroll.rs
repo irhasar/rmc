@@ -458,7 +458,7 @@ fn narrow_uint_fcvt(func: &mut ir::Function) {
     let dbg = std::env::var_os("CG_CLIF_UNROLL_DEBUG").is_some();
     let mut changed = 0;
     for (inst, x) in targets {
-        let bound = upper_bound(func, &dom, inst, x);
+        let bound = upper_bound(func, &dom, inst, x).or_else(|| local_bound(func, x));
         if dbg {
             eprintln!("[unroll]   fcvt x={x:?} bound={bound:?}");
         }
@@ -473,6 +473,23 @@ fn narrow_uint_fcvt(func: &mut ir::Function) {
     }
     if dbg && changed > 0 {
         eprintln!("[unroll]   narrowed {changed} fcvt_from_uint -> fcvt_from_sint");
+    }
+}
+
+/// A purely local, always-sound upper bound on `x`: a zero-extend from a
+/// narrower integer is `< 2^src_bits`, and a `band` with a constant mask is
+/// `<= mask`.
+fn local_bound(func: &ir::Function, x: Value) -> Option<u64> {
+    let ir::ValueDef::Result(inst, _) = func.dfg.value_def(x) else { return None };
+    match func.dfg.insts[inst] {
+        ir::InstructionData::Unary { opcode: Opcode::Uextend, arg } => {
+            let bits = func.dfg.value_type(arg).bits();
+            if bits < 64 { Some((1u64 << bits) - 1) } else { None }
+        }
+        ir::InstructionData::Binary { opcode: Opcode::Band, args } => {
+            const_of(func, args[0]).or_else(|| const_of(func, args[1]))
+        }
+        _ => None,
     }
 }
 
