@@ -2639,3 +2639,61 @@ tail-recursion elimination, struktur lane).
 `./y.sh test --sysroot clif` → **65 suite, 0 gagal** (EXIT 0). Semua keluaran
 program benchmark (p1–p9, `t_atom`, `t_loop`, `t_u64f32`, `t_iter`, `t_alias`)
 identik dengan LLVM.
+
+## 22. Transformasi lane untuk loop LCG + reduksi (LANDED)
+
+### 22.1 Masalah: O(faktor²) perkalian
+
+`apply_partial` (§19) membangun `pre[k]` (nilai state setelah `k+1` iterasi)
+langsung dari header, jadi tiap `pre[k]` butuh `C^k·acc` + suku forcing
+`Σ C^j·a_j`. Untuk faktor 3 itu 6 `imul` per 3 iterasi = **2 imul/iterasi**.
+LLVM hanya ~1: ia memakai **4 lane**, tiap lane maju `C^4` per langkah luar.
+
+### 22.2 Kunci: faktor genap → paritas tetap per lane
+
+Lane `L` mengunjungi `i = L, L+f, L+2f, …`. Untuk **f genap**, `i` punya
+**paritas sama** dengan `L`, sehingga `(i|1) = i + (L genap ? 1 : 0)` menjadi
+**linear** terhadap langkah lane `k`. Akibatnya suku forcing tiap lane affine
+pada `k` dan **maju dengan tambahan konstan** (`slope`), bukan `imul` per
+iterasi. Faktor ganjil (3) tidak bisa memakai trik ini karena paritas `i`
+bergantian per lane.
+
+Rekurensi lane (`f` lane, `B` trip count, `B % f == 0`):
+- `a_L(k+1) = C^f · a_L(k) + F_L(k)`, `F_L(k) = fbase(k) + lane_const[L]`,
+  `fbase(k) = k·slope`, `slope = f·S`, `S = Σ_{k<f} C^k`.
+- `F_L(0)` dan `a_L(0)` konstanta compile-time (`a_L(0) = C^L·a_0 + const`).
+Loop: tiap langkah `min` atas `f` lane, lalu `a_L = C^f·a_L + fbase + lane_const[L]`
+dan `fbase += slope`. Total **f imul per f iterasi = 1 imul/iterasi**.
+
+### 22.3 Implementasi (`src/unroll.rs`, `apply_lanes`)
+
+Fungsi baru `apply_lanes`, dipanggil dari `apply` sebelum jalur clone. Deteksi
+(`detect_lane`): header berparameter tepat `(iv, a, mn)`, `a' = C·a + (iv|1)`,
+`mn' = select(icmp(cc,l,r), arm1, arm2)` atas `{a', mn}`, `iv` mulai 0, dan
+`bound` **konstan** habis dibagi `f`. Jika salah satu tidak terpenuhi → jatuh
+ke jalur clone yang lama (aman).
+
+Struktur blok baru: `prologue` (hitung `a_1..a_f` dari `a_0`) → `lane_header`
+(cek `iv < B`) → `lane_body` (min + advance) → kembali. Edge pre-header
+di-redirect ke `prologue`. **Exit memakai header lama sebagai trampolin**: lane
+loop mengembalikan `(iv=B, a=a_cur, mn)` ke header lama, yang mengecek ulang
+`iv<B` (salah) lalu jatuh ke exit asli — exit membaca parameter header lewat
+dominasi, jadi tetap benar tanpa perlu menulis ulang blok exit. `a_cur` (=`a_B`)
+dibawa sebagai state karena lane sudah maju melewati `a_B` saat keluar.
+
+### 22.4 Hasil
+
+`p8_minmax` (30 juta iterasi): **29 → 21 ms** (LLVM 18). Sapuan faktor
+(ms): f=2 **21**, 4 23, 6 22, 8 24. f=2 menang karena tekanan register lebih
+kecil (8 nilai terbawa pada f=4 memicu spill; f=2 tidak). Sisa gap ~1.17× ke
+LLVM adalah kualitas regalloc `cranelift-codegen` (spill), di luar cakupan.
+
+### 22.5 Verifikasi
+
+- Uji diferensial lintas bound konstan (`0,1,2,3,4,5,7,8,12,16,20,100,1000,
+  12345,30M`) dan reduksi min/max dengan dua multiplier: byte-identik dengan
+  LLVM. Bound habis dibagi f → jalur lane; sisanya → fallback clone.
+- `a` setelah loop (=`a_B`), `mn` awal non-MAX, `a` awal ≠ 1: byte-identik.
+- `./y.sh test --sysroot clif` → **65 suite, 0 gagal**.
+- Semua 9 program benchmark keluaran identik dengan LLVM; tidak ada regresi
+  (p1–p9, compile/size/runtime).

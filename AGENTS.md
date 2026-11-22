@@ -1,5 +1,46 @@
 # AGENTS.md
 
+## Session (2026-11-22, latest) — LCG lane transform (LANDED, p8 29→21ms)
+- **What**: new `apply_lanes` in `src/unroll.rs` rewrites `a = a*C + (i|1)` +
+  min/max-reduction loops into `F=2` independent lanes → **1 imul/iter** (was
+  2). p8_minmax **29 → 21 ms** (LLVM 18). Full suite 65/65 green.
+- **The key insight (non-obvious)**: LLVM uses an **even** lane factor so each
+  lane keeps a **fixed parity**; then `(i|1) = i + (lane even ? 1 : 0)` is
+  **linear** in the lane step, so the forcing term advances by a **constant add**
+  (`slope = F·Σ_{k<F}C^k`) instead of a per-step imul. Odd factors (3) can't do
+  this. `F_L(k) = fbase + lane_const[L]`, `fbase = iv·S = k·slope`.
+- **F=2 beats F=4** (21 vs 23 ms): F=4 carries 8 live values → spills; F=2
+  doesn't. F=6=22, F=8=24. Don't assume more lanes = better.
+- **The hard part was the exit, not the math.** cg_clif's exit block reads the
+  header params **by dominance with 0 args** (`brif block7(0 args), block8(0
+  args)`). So you cannot branch straight to the exit block. **Fix: branch the
+  lane loop's exit back to the *old header*** with `(iv=B, a=a_cur, mn)`; it
+  re-checks `iv<B` (false) and falls through to the real exit, which then reads
+  correct params. Works for any exit shape. This also means the old header
+  stays alive as a trampoline and the old body is simply dead.
+- **`a_cur` must be carried**: the lane body advances all lanes past `a_B`
+  before the header re-checks, so `a_B` is not recoverable from the lanes at
+  exit; carry it (set `a_cur = a_last` each step).
+- **Detection (`detect_lane`) is strict and conservative**: header params
+  exactly `(iv, a, mn)`; `a' = C·a + (iv|1)` (one `Bor imm=1` atom over `iv`);
+  `mn' = select(icmp(cc,l,r), arm1, arm2)` over `{a', mn}`; `iv` starts at 0;
+  `bound` **constant** and `% F == 0`. Anything else → returns false → the old
+  clone path runs. So extra loop state (n≠3) or a dynamic bound never risks
+  correctness, only forgoes the speedup.
+- **Constants (mod 2^64)**: `cpow[k]=C^k`; `pro_const[j]=Σ_{l<j}C^{j-1-l}(l|1)`;
+  `lane_const[L]=Σ_{j<F}C^{F-1-j}((L+j)|1)`; `slope=F·Σ_{k<F}C^k`. Verified by
+  hand for F=2,C=3 (const_1=6, const_2=12, F=8k+6).
+- **Testing that matters**: compile-time-constant bounds via a macro
+  (`for i in 0..4u64 {...}`) so the lane path actually fires; sweep bounds
+  `{0,1,2,3,4,5,7,8,12,16,20,100,1000,12345,30M}` (divisible → lane, else
+  fallback), min AND max, two multipliers, plus a case that **prints `a` after
+  the loop** (=a_B), non-MAX initial `mn`, non-1 initial `a`. A bound that is a
+  runtime variable does NOT trigger the path (bound must be `const_of`).
+- **Knob**: `CG_CLIF_NO_LANES=1` disables it. Debug: `CG_CLIF_LANE_DEBUG=1`.
+- **Commits**: detection → full transform → F=2 (4 commits). NOT yet pushed at
+  time of writing (needs the user's `repo` PAT; `GITHUB_TOKEN` is read-only).
+- **Remaining p8 gap (21 vs 18) = cranelift regalloc spills**, not the pass.
+
 ## Session (2026-11-22, later) — constant-bound guard + atom factor 3 (LANDED)
 - **Toolchain reset mid-session** (the documented failure): `$HOME/.cargo`,
   rustc, cargo, rustup all gone while `dist/` survived. Recovery that worked:
