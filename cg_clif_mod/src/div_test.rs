@@ -72,9 +72,24 @@ fn collect(func: &ir::Function) -> Vec<Candidate> {
         for inst in func.layout.block_insts(block) {
             let data = &func.dfg.insts[inst];
             for &arg in data.arguments(&func.dfg.value_lists) {
+                let arg = func.dfg.resolve_aliases(arg);
                 let entry = uses.entry(arg).or_insert((0, None));
                 entry.0 += 1;
                 entry.1 = Some(inst);
+            }
+            // `arguments()` excludes branch (block-call) arguments, so a value
+            // threaded into a successor's phi would otherwise look unused. Left
+            // uncounted, removing the remainder's definition leaves that block
+            // argument dangling and the egraph ICEs on it.
+            for bc in data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables) {
+                for arg in bc.args(&func.dfg.value_lists) {
+                    if let ir::BlockArg::Value(v) = arg {
+                        let v = func.dfg.resolve_aliases(v);
+                        let entry = uses.entry(v).or_insert((0, None));
+                        entry.0 += 1;
+                        entry.1 = Some(inst);
+                    }
+                }
             }
             for &result in func.dfg.inst_results(inst) {
                 uses.entry(result).or_insert((0, None));
@@ -125,14 +140,18 @@ fn classify_use(func: &ir::Function, user: Inst, rem_value: Value) -> Option<Use
     let args = data.arguments(&func.dfg.value_lists);
     match data.opcode() {
         // `switchInt(x)` lowers to a `brif` on `x != 0`.
-        Opcode::Brif => (args[0] == rem_value).then_some(UseSite::Brif { inst: user }),
+        Opcode::Brif => {
+            (func.dfg.resolve_aliases(args[0]) == rem_value).then_some(UseSite::Brif { inst: user })
+        }
         Opcode::Icmp => {
             // Only `eq`/`ne` are accepted below, and both are symmetric, so
             // the operand order does not affect the condition.
-            let (cond, other) = if args[0] == rem_value {
-                (data.cond_code()?, args[1])
-            } else if args[1] == rem_value {
-                (data.cond_code()?, args[0])
+            let arg0 = func.dfg.resolve_aliases(args[0]);
+            let arg1 = func.dfg.resolve_aliases(args[1]);
+            let (cond, other) = if arg0 == rem_value {
+                (data.cond_code()?, arg1)
+            } else if arg1 == rem_value {
+                (data.cond_code()?, arg0)
             } else {
                 return None;
             };

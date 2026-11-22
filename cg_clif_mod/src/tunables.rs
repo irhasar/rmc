@@ -124,6 +124,23 @@ pub(crate) fn unroll_factor() -> u64 {
     })
 }
 
+/// Partial-reassociation factor for loops whose other state is a reduction or a
+/// recomputable atom (`CG_CLIF_PARTIAL`).
+pub(crate) fn partial_factor() -> u64 {
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| match var("CG_CLIF_PARTIAL") {
+        Some(v) => v.parse().unwrap_or(super::unroll::PARTIAL_FACTOR),
+        None => super::unroll::PARTIAL_FACTOR,
+    })
+}
+
+/// Whether the unroller may model a bitwise op (`i | k`) as a recomputable atom
+/// (`CG_CLIF_NO_ATOM` disables it for bisecting).
+pub(crate) fn atom_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| !flag("CG_CLIF_NO_ATOM"))
+}
+
 /// Whether the unroller may clone the loop body (`CG_CLIF_UNROLL_CLONE`).
 pub(crate) fn unroll_clone() -> bool {
     static V: OnceLock<bool> = OnceLock::new();

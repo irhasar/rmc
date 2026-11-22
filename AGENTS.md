@@ -1,5 +1,51 @@
 # AGENTS.md
 
+## Session (2026-11-22) — atom-aware affine reassociation + div_test alias ICE (LANDED locally)
+- **Win**: loops of the shape `acc = acc*C + (i|1)` (LCG, p7/p8) used to be
+  rejected by the unroller for two reasons: (a) the other state is a
+  reduction (`min`) with no closed form, so `power` bailed, and (b) `i|1` is a
+  bitwise op, not a linear form. Both are now handled.
+- **Model** (`src/unroll.rs`): split into `Pure` (linear form, atom operand),
+  `Atom { op, imm, operand: Pure }` (a *recomputable* non-linear term such as
+  `i|1`), and `Affine { coeffs, c, atoms }`. `apply_step(step, state)` evaluates
+  the one-step update at `state`, rebuilding each atom from its operand's value
+  there (`subst_pure`) so `i|1` advances to `(i+delta)|1`. `build_affine`
+  materialises every atom independently from the header params, so atoms stay
+  off the carried `imul` chain.
+- **Equivalence for pure loops**: `power`/`compose` were refactored to use
+  `apply_step`; this is algebraically identical to the old composition
+  (`F^{k+1} = F_j ∘ F^k`), so already-handled loops are unchanged.
+- **Factors**: `ATOM_FACTOR = 2` (rebuilding atoms is O(factor^2), so a small
+  factor wins), `PARTIAL_FACTOR = 6` for pure affine reductions
+  (`CG_CLIF_PARTIAL` overrides). Sweep: atom loops best at 2, pure reductions at
+  6.
+- **Result** (`allaxes.sh`, full matrix in REPORT §19.5): `p7_branchy`
+  U=100→**M=42** ms (LLVM 46) — now faster than LLVM; `p8_minmax` 38→**35** ms.
+  Overall M now beats LLVM runtime on p5/p6 (6 vs 58 ms, ~9.7x) and p7, ties on
+  p9 (35 vs 31), is ~11-12% smaller than LLVM, and compiles p2 1.66x faster.
+  Verified output-identical to LLVM (differential test `t_atom`); full
+  `./y.sh test --sysroot clif` → **65 suites, 0 failed, exit 0** (incl. regex,
+  rand, graviola, portable-simd, stdarch).
+- **Pre-existing ICE fixed** (`src/div_test.rs`): compiling `env_logger 0.9.3`
+  (a `regex` dev-dep) panicked in the egraph with
+  `index out of bounds ... index is 4294967295` (`Value::reserved_value()`).
+  Only `CG_CLIF_NO_DIVTEST=1` avoided it, so `div_test` was the cause — NOT the
+  atom work (ICE persisted with `CG_CLIF_UNROLL=1`). Root cause: `div_test::collect`
+  counted uses only via `InstructionData::arguments()`, which (1) excludes
+  branch/block-call args and (2) does not resolve value aliases (`v420 -> v399`,
+  which cg_clif emits heavily). A `urem` result used through an alias or as a
+  phi arg looked single-use, so `remove_inst` left a dangling reference. Fix:
+  resolve aliases when counting, count `branch_destination(...)` block args too,
+  and resolve aliases in `classify_use`. Purely conservative (only rejects more
+  candidates), so §18 results stand. `env_logger` now compiles clean.
+- **Debugging recipe that worked**: the `#[cfg(false)] PrintOnPanic` block in
+  `base.rs` (around line 221) prints the post-pass CLIF of the panicking
+  function when flipped to `#[cfg(true)]`; the dump shows aliases as `vX -> vY`.
+- **Methodology note**: this ICE was invisible in earlier sessions because
+  `regex`/`env_logger` were never actually compiled — the external crate
+  download (`./y.sh prepare`) had not been done. Always run the full suite
+  including `regex` before claiming "0 failures".
+
 ## Session (2026-11-20, latest) — `unroll` pass was quadratic (LANDED, `f6d2ae5`)
 - **The per-pass instrumentation had never worked.** `passtime::report()` had no
   caller, and its accumulator was `thread_local!` while codegen runs on rustc's

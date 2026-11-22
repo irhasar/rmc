@@ -44,7 +44,12 @@ const MAX_LAST: u64 = 1 << 62;
 /// Widest step the partial-reassociation path will clone. Each iteration costs a
 /// body copy, and the win saturates once the multiply chain is broken, so a small
 /// factor is enough.
-const PARTIAL_FACTOR: u64 = 6;
+pub(crate) const PARTIAL_FACTOR: u64 = 6;
+
+/// Partial factor for a loop whose forcing term is a recomputable atom (`i | 1`).
+/// Rebuilding each atom per step costs O(factor^2) multiplies, so a large factor
+/// is counter-productive; 2 keeps every multiply shallow and independent.
+pub(crate) const ATOM_FACTOR: u64 = 2;
 
 /// Shrink `factor` until `delta * (factor - 1)` cannot overflow, and report the
 /// largest usable factor (>= 2), or `None` when even two iterations overflow.
@@ -672,12 +677,52 @@ fn retarget(func: &mut ir::Function, inst: Inst, target: Block) {
     func.dfg.value_lists = pool;
 }
 
-/// A value expressed as `sum(coeffs[i] * header_param[i]) + c` over the
-/// integers modulo `2^64`.
+/// A pure linear form `sum(coeffs[i] * header_param[i]) + c` over the integers
+/// modulo `2^64`. Used as the operand of an [`Atom`]; it never holds atoms
+/// itself, which keeps atom operands substitutable at every step.
+#[derive(Clone, PartialEq, Eq)]
+struct Pure {
+    coeffs: Vec<u64>,
+    c: u64,
+}
+
+/// A single non-linear but *recomputable* contribution to a state, e.g. the
+/// `i | 1` in `acc = acc*C + (i | 1)`. Its operand is a pure linear form over
+/// the header parameters, so at each unrolled step the atom can be rebuilt from
+/// the operand's value at that step. Because every atom is materialised
+/// independently from the original parameters, they stay off the carried chain.
+#[derive(Clone, PartialEq, Eq)]
+struct Atom {
+    op: Opcode,
+    imm: u64,
+    operand: Pure,
+}
+
+/// A value expressed as `sum(coeffs[i] * header_param[i]) + c` plus a linear
+/// combination of [`Atom`]s, over the integers modulo `2^64`.
 #[derive(Clone)]
 struct Affine {
     coeffs: Vec<u64>,
     c: u64,
+    atoms: Vec<(Atom, u64)>,
+}
+
+impl Affine {
+    fn zero(n: usize) -> Affine {
+        Affine { coeffs: vec![0; n], c: 0, atoms: Vec::new() }
+    }
+
+    /// Add `coeff * atom` to the combination, merging an equal atom.
+    fn add_atom(&mut self, atom: Atom, coeff: u64) {
+        if coeff == 0 {
+            return;
+        }
+        if let Some(slot) = self.atoms.iter_mut().find(|(a, _)| *a == atom) {
+            slot.1 = slot.1.wrapping_add(coeff);
+        } else {
+            self.atoms.push((atom, coeff));
+        }
+    }
 }
 
 /// Compute the affine form of every instruction result in `plan.body`, starting
@@ -694,7 +739,7 @@ fn analyze_affine(func: &ir::Function, plan: &Plan) -> Option<Vec<Option<Affine>
         return None;
     }
 
-    let zero = Affine { coeffs: vec![0; n], c: 0 };
+    let zero = Affine::zero(n);
     let basis = |i: usize| {
         let mut a = zero.clone();
         a.coeffs[i] = 1;
@@ -715,6 +760,9 @@ fn analyze_affine(func: &ir::Function, plan: &Plan) -> Option<Vec<Option<Affine>
             *x = x.wrapping_add(*y);
         }
         r.c = r.c.wrapping_add(b.c);
+        for (atom, k) in &b.atoms {
+            r.add_atom(atom.clone(), *k);
+        }
         r
     };
     let scale = |a: &Affine, k: u64| {
@@ -723,16 +771,32 @@ fn analyze_affine(func: &ir::Function, plan: &Plan) -> Option<Vec<Option<Affine>
             *x = x.wrapping_mul(k);
         }
         r.c = r.c.wrapping_mul(k);
+        for slot in r.atoms.iter_mut() {
+            slot.1 = slot.1.wrapping_mul(k);
+        }
         r
     };
-    let constant = |c: u64| Affine { coeffs: vec![0; n], c };
+    let constant = |c: u64| Affine { coeffs: vec![0; n], c, atoms: Vec::new() };
     let as_const = |a: &Option<Affine>| -> Option<u64> {
         let a = a.as_ref()?;
-        if a.coeffs.iter().all(|&x| x == 0) {
+        if a.atoms.is_empty() && a.coeffs.iter().all(|&x| x == 0) {
             Some(a.c)
         } else {
             None
         }
+    };
+    // Build `op(x, imm)` as an atom when `x` is a pure linear form.
+    let as_atom = |op: Opcode, x: &Option<Affine>, imm: u64| -> Option<Affine> {
+        if !crate::tunables::atom_enabled() {
+            return None;
+        }
+        let x = x.as_ref()?;
+        if !x.atoms.is_empty() {
+            return None;
+        }
+        let mut r = Affine::zero(n);
+        r.add_atom(Atom { op, imm, operand: Pure { coeffs: x.coeffs.clone(), c: x.c } }, 1);
+        Some(r)
     };
 
     for inst in func.layout.block_insts(plan.body) {
@@ -761,6 +825,23 @@ fn analyze_affine(func: &ir::Function, plan: &Plan) -> Option<Vec<Option<Affine>
                 match (as_const(&a), as_const(&b)) {
                     (Some(k), _) => b.map(|b| scale(&b, k)),
                     (_, Some(k)) => a.map(|a| scale(&a, k)),
+                    _ => None,
+                }
+            }
+            // `x | k`, `x & k`, `x ^ k` for a constant `k`: the constant is
+            // folded into a recomputable atom over the affine operand, so an LCG
+            // that adds `i | 1` stays reassociable.
+            ir::InstructionData::Binary { opcode, args, .. }
+                if is_i64(args[0])
+                    && matches!(opcode, Opcode::Bor | Opcode::Band | Opcode::Bxor) =>
+            {
+                let (a, b) = (
+                    forms[dfg.resolve_aliases(args[0]).as_u32() as usize].clone(),
+                    forms[dfg.resolve_aliases(args[1]).as_u32() as usize].clone(),
+                );
+                match (as_const(&a), as_const(&b)) {
+                    (Some(k), _) => as_atom(opcode, &b, k),
+                    (_, Some(k)) => as_atom(opcode, &a, k),
                     _ => None,
                 }
             }
@@ -802,37 +883,67 @@ fn power(
         .map(|&v| forms[dfg.resolve_aliases(v).as_u32() as usize].clone())
         .collect();
 
-    // Row `j` maps state -> state_j after one iteration. Iterate `factor` times.
+    // `rows[j]` is state `j` after one iteration. Each further iteration
+    // evaluates the one-step update at the previous state, which is what lets an
+    // atom's operand advance (`i | 1` becomes `(i+1) | 1`) while its value still
+    // depends only on the original parameters.
     let mut rows: Vec<Option<Affine>> = step.clone();
     for _ in 1..factor {
-        let cur = rows.clone();
-        rows = cur
-            .iter()
-            .map(|row| {
-                let row = row.as_ref()?;
-                let mut acc = Affine { coeffs: vec![0; n], c: row.c };
-                for (i, &k) in row.coeffs.iter().enumerate() {
-                    if k == 0 {
-                        continue;
-                    }
-                    let mut scaled = step[i].as_ref()?.clone();
-                    for x in scaled.coeffs.iter_mut() {
-                        *x = x.wrapping_mul(k);
-                    }
-                    scaled.c = scaled.c.wrapping_mul(k);
-                    for (a, b) in acc.coeffs.iter_mut().zip(&scaled.coeffs) {
-                        *a = a.wrapping_add(*b);
-                    }
-                    acc.c = acc.c.wrapping_add(scaled.c);
-                }
-                Some(acc)
-            })
-            .collect();
+        let prev = rows.clone();
+        rows = step.iter().map(|s| s.as_ref().and_then(|s| apply_step(s, &prev))).collect();
     }
     Some(rows)
 }
 
-/// Materialise `sum(coeffs[i] * params[i]) + c` at the cursor.
+/// Substitute a pure linear form's parameters by `state`, requiring every
+/// parameter it reads to be pure (atom-free) so the result stays pure.
+fn subst_pure(p: &Pure, state: &[Option<Affine>]) -> Option<Pure> {
+    let mut r = Pure { coeffs: vec![0; p.coeffs.len()], c: p.c };
+    for (i, &k) in p.coeffs.iter().enumerate() {
+        if k == 0 {
+            continue;
+        }
+        let s = state[i].as_ref()?;
+        if !s.atoms.is_empty() {
+            return None;
+        }
+        for (x, y) in r.coeffs.iter_mut().zip(&s.coeffs) {
+            *x = x.wrapping_add(y.wrapping_mul(k));
+        }
+        r.c = r.c.wrapping_add(s.c.wrapping_mul(k));
+    }
+    Some(r)
+}
+
+/// Evaluate the one-step update `step` at the current `state`, returning the
+/// next state. Affine coefficients scale `state`; each atom is rebuilt from its
+/// operand's value in `state`, so it tracks the evolving induction variable.
+fn apply_step(step: &Affine, state: &[Option<Affine>]) -> Option<Affine> {
+    let n = state.len();
+    let mut acc = Affine { coeffs: vec![0; n], c: step.c, atoms: Vec::new() };
+    for (i, &k) in step.coeffs.iter().enumerate() {
+        if k == 0 {
+            continue;
+        }
+        let s = state[i].as_ref()?;
+        for (x, y) in acc.coeffs.iter_mut().zip(&s.coeffs) {
+            *x = x.wrapping_add(y.wrapping_mul(k));
+        }
+        acc.c = acc.c.wrapping_add(s.c.wrapping_mul(k));
+        for (atom, ac) in &s.atoms {
+            acc.add_atom(atom.clone(), ac.wrapping_mul(k));
+        }
+    }
+    for (atom, ac) in &step.atoms {
+        let operand = subst_pure(&atom.operand, state)?;
+        acc.add_atom(Atom { op: atom.op, imm: atom.imm, operand }, *ac);
+    }
+    Some(acc)
+}
+
+/// Materialise `sum(coeffs[i] * params[i]) + c + sum(coeff * atom)` at the
+/// cursor. Every term is independent of the others, so an atom never joins the
+/// carried dependency chain.
 fn build_affine(pos: &mut FuncCursor<'_>, params: &[Value], row: &Affine) -> Value {
     let mut acc: Option<Value> = None;
     for (i, &k) in row.coeffs.iter().enumerate() {
@@ -850,8 +961,62 @@ fn build_affine(pos: &mut FuncCursor<'_>, params: &[Value], row: &Affine) -> Val
             None => term,
         });
     }
+    for (atom, coeff) in &row.atoms {
+        if *coeff == 0 {
+            continue;
+        }
+        let mut v = build_pure(pos, params, &atom.operand);
+        let imm = pos.ins().iconst(ir::types::I64, Imm64::new(atom.imm as i64));
+        v = match atom.op {
+            Opcode::Bor => pos.ins().bor(v, imm),
+            Opcode::Band => pos.ins().band(v, imm),
+            Opcode::Bxor => pos.ins().bxor(v, imm),
+            _ => unreachable!("only bitwise atoms are modelled"),
+        };
+        let term = if *coeff == 1 {
+            v
+        } else {
+            let k = pos.ins().iconst(ir::types::I64, Imm64::new(*coeff as i64));
+            pos.ins().imul(v, k)
+        };
+        acc = Some(match acc {
+            Some(a) => pos.ins().iadd(a, term),
+            None => term,
+        });
+    }
     let c = if row.c != 0 {
         Some(pos.ins().iconst(ir::types::I64, Imm64::new(row.c as i64)))
+    } else {
+        None
+    };
+    match (acc, c) {
+        (Some(a), Some(c)) => pos.ins().iadd(a, c),
+        (Some(a), None) => a,
+        (None, Some(c)) => c,
+        (None, None) => pos.ins().iconst(ir::types::I64, Imm64::new(0)),
+    }
+}
+
+/// Materialise a pure linear form.
+fn build_pure(pos: &mut FuncCursor<'_>, params: &[Value], p: &Pure) -> Value {
+    let mut acc: Option<Value> = None;
+    for (i, &k) in p.coeffs.iter().enumerate() {
+        if k == 0 {
+            continue;
+        }
+        let term = if k == 1 {
+            params[i]
+        } else {
+            let c = pos.ins().iconst(ir::types::I64, Imm64::new(k as i64));
+            pos.ins().imul(params[i], c)
+        };
+        acc = Some(match acc {
+            Some(a) => pos.ins().iadd(a, term),
+            None => term,
+        });
+    }
+    let c = if p.c != 0 {
+        Some(pos.ins().iconst(ir::types::I64, Imm64::new(p.c as i64)))
     } else {
         None
     };
@@ -872,17 +1037,24 @@ fn apply(func: &mut ir::Function, plan: &Plan, factor: u64) {
         // Decide which transformation applies before composing anything: the full
         // reassociation composes `factor` (128) times, which is wasted work when a
         // state is not affine and the loop will not be reassociated at all.
-        let all_affine = back_states(func, plan)
-            .iter()
-            .all(|&v| forms[func.dfg.resolve_aliases(v).as_u32() as usize].is_some());
-        if all_affine {
+        let back = back_states(func, plan);
+        let form_of = |v: Value| forms[func.dfg.resolve_aliases(v).as_u32() as usize].clone();
+        let all_affine = back.iter().all(|&v| form_of(v).is_some());
+        // Atoms (`i | 1`) have no closed form to fold over 128 steps; they stay on
+        // the small partial factor so the code does not blow up.
+        let any_atoms =
+            back.iter().any(|&v| form_of(v).is_some_and(|f| !f.atoms.is_empty()));
+        if all_affine && !any_atoms {
             if let Some(rows) = power(func, plan, &forms, factor) {
                 let rows: Vec<Affine> = rows.into_iter().flatten().collect();
                 apply_reassoc(func, plan, factor, &rows);
                 return;
             }
         }
-        let factor = factor.min(PARTIAL_FACTOR);
+        // Atoms cost O(factor^2) multiplies to rebuild per step, so they use a
+        // small factor; a pure affine reduction keeps the larger one.
+        let partial = if any_atoms { ATOM_FACTOR } else { crate::tunables::partial_factor() };
+        let factor = factor.min(partial);
         // Cloning the body only pays when the affine part carries a real
         // dependency chain, i.e. a state whose update multiplies itself.
         // Otherwise the clones would duplicate work for nothing, so the
@@ -946,28 +1118,7 @@ fn compose(
     rows.push(step.clone());
     for _ in 1..steps {
         let prev = rows.last()?.clone();
-        let next = prev
-            .iter()
-            .map(|row| {
-                let row = row.as_ref()?;
-                let mut acc = Affine { coeffs: vec![0; n], c: row.c };
-                for (i, &k) in row.coeffs.iter().enumerate() {
-                    if k == 0 {
-                        continue;
-                    }
-                    let mut scaled = step[i].as_ref()?.clone();
-                    for x in scaled.coeffs.iter_mut() {
-                        *x = x.wrapping_mul(k);
-                    }
-                    scaled.c = scaled.c.wrapping_mul(k);
-                    for (a, b) in acc.coeffs.iter_mut().zip(&scaled.coeffs) {
-                        *a = a.wrapping_add(*b);
-                    }
-                    acc.c = acc.c.wrapping_add(scaled.c);
-                }
-                Some(acc)
-            })
-            .collect();
+        let next = step.iter().map(|s| s.as_ref().and_then(|s| apply_step(s, &prev))).collect();
         rows.push(next);
     }
     Some(rows)

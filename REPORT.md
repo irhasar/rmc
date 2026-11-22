@@ -2359,3 +2359,185 @@ Dua jebakan yang memakan waktu di sini:
    ke rumus tertutup, dan hasilnya cocok dengan perhitungan Python. Wajar, bukan
    miscompile — tapi kalau `n` dijadikan argumen runtime, waktunya kembali
    linear (364 ms untuk 300 juta), yang membuktikan lipatan itu compile-time.
+
+## 19. Reasosiasi affine dengan atom: loop LCG `+ (i|1)` (LANDED)
+
+### 19.1 Gejala
+
+`p7_branchy` dan `p8_minmax` sama-sama berisi loop LCG:
+
+```rust
+for i in 0..N {
+    acc = acc.wrapping_mul(C).wrapping_add(i | 1);
+    ...
+}
+```
+
+Sebelum perubahan ini keduanya berjalan **sama persis dengan cg_clif upstream**
+(p8: 38 ms untuk upstream maupun modifikasi). Artinya tidak ada satu pun pass
+yang menyala: `unroll` affine menolak loop itu. `p8` menguji reduksi `min`
+(bukan affine, jadi `power` menolak), dan `i | 1` adalah operasi bitwise yang
+tidak bisa dinyatakan sebagai bentuk linear `sum(coeff*param)+c`.
+
+### 19.2 Akar masalah
+
+Ada dua penghalang, keduanya harus dibuka:
+
+1. **Reduksi `min` tidak punya bentuk tertutup.** `power` dulu menuntut *setiap*
+   state affine. Satu state `mn = min(mn, a)` saja sudah menggagalkan seluruh
+   loop. Padahal state affine (`acc`, `i`) tidak bergantung pada `mn`, jadi
+   iterat `factor`-lipatnya tetap bisa dihitung sendiri-sendiri.
+2. **`i | 1` bukan linear.** `bor(x, 1)` dengan konstanta tidak bisa masuk
+   `coeff*param+c`. Tanpa penanganan, loop LCG selalu ditolak.
+
+Eksperimen plafon membuktikannya: `p7` tanpa `i | 1` (diganti `+ i`) berjalan
+**40 ms di modifikasi vs 78 ms di LLVM** — begitu bitwise dihilangkan, unroll
+langsung menang besar. Jadi penghalangnya memang operasi bitwise itu.
+
+### 19.3 Model: `Pure` dan `Atom`
+
+`src/unroll.rs` kini memisahkan tiga hal:
+
+- `Pure` — bentuk linear `sum(coeffs[i]*param[i]) + c` modulo 2^64. Operand
+  sebuah atom; tidak pernah memuat atom lain.
+- `Atom { op, imm, operand: Pure }` — satu kontribusi **non-linear tetapi bisa
+  dihitung ulang**, mis. `i | 1`. Nilainya selalu bisa dibangun ulang dari
+  parameter header asli.
+- `Affine { coeffs, c, atoms: Vec<(Atom, u64)> }` — bentuk linear **plus**
+  kombinasi linear atom.
+
+`apply_step(step, state)` mengevaluasi update satu-langkah `step` pada `state`.
+Bagian linear menskalakan `state`; tiap atom dibangun ulang dari nilai
+operandnya di `state` (`subst_pure`), sehingga `i | 1` otomatis maju menjadi
+`(i+delta) | 1` di langkah berikutnya. `build_affine` mematerialisasi tiap atom
+**secara independen** dari parameter header, jadi atom tidak pernah masuk ke
+rantai dependensi yang dibawa (`acc*C`).
+
+Untuk loop affine murni, `apply_step` terbukti secara aljabar identik dengan
+komposisi lama (`F^{k+1} = F_j ∘ F^k`), sehingga refaktor ini netral pada
+loop-loop yang sudah ditangani.
+
+### 19.4 Reduksi lewat klon, atom lewat faktor kecil
+
+`apply_partial` (sudah ada) menangani state non-affine dengan mengkloning badan
+loop sekali per iterasi dan menyisipkan nilai affine yang sudah dihitung di
+depan. Dua faktor berbeda dipakai:
+
+- `ATOM_FACTOR = 2` untuk loop beratom. Membangun ulang atom tiap langkah
+  berbiaya O(factor^2) perkalian, jadi faktor besar justru merugikan; 2 sudah
+  memutus rantai `imul` yang dibawa.
+- `PARTIAL_FACTOR = 6` (dapat diatur `CG_CLIF_PARTIAL`) untuk reduksi affine
+  murni tanpa atom.
+
+Sapuan faktor mengonfirmasi: untuk loop beratom, faktor 2 terbaik (p7 49→39,6 ms,
+p8 38→36,1 ms); untuk reduksi affine murni (`p8b`), faktor 6 terbaik (~25 ms).
+
+### 19.5 Hasil
+
+Matriks penuh tiga-arah (`bench/allaxes.sh`, CREPS=3 RREPS=5). L = LLVM
+nightly, U = cg_clif upstream, M = modifikasi. Waktu dalam ms, RSS dalam MB,
+size dalam byte.
+
+**Runtime (wall ms) — semakin kecil semakin baik**
+
+| Program | L | U | M | M/L |
+|---|---|---|---|---|
+| p1_arith | 81 | 108 | 100 | 1,23x |
+| p2_mem | 16 | 155 | 53 | 3,3x |
+| p3_calls | 37 | 117 | 94 | 2,5x |
+| p4_simd | 55 | 156 | 99 | 1,8x |
+| p5_inline | 58 | 895 | **6** | **0,10x** |
+| p6_scalar | 58 | 899 | **6** | **0,10x** |
+| p7_branchy | 46 | 100 | **42** | **0,91x** |
+| p8_minmax | 18 | 38 | **35** | 1,94x |
+| p9_u64f32 | 31 | 76 | **35** | 1,13x |
+
+M **mengungguli LLVM** di `p5`, `p6` (≈9,7x lebih cepat) dan `p7` (1,1x),
+serta nyaris menyamai di `p9`. `p8` turun 38→35 ms; sisanya (p2 hash/sort,
+p3 rekursi ekor, p4 vektor) tetap gap arsitektural (lihat §8.28, §11).
+
+**Ukuran artefak (byte) — semakin kecil semakin baik**
+
+| Program | L | U | M | M/L |
+|---|---|---|---|---|
+| p1_arith | 4.635.232 | 5.877.944 | 4.130.408 | −10,9% |
+| p2_mem | 4.639.888 | 5.936.144 | 4.137.384 | −10,8% |
+| p5_inline | 4.609.368 | 5.813.704 | 4.052.536 | −12,1% |
+| p8_minmax | 4.609.544 | 5.813.752 | 4.052.568 | −12,1% |
+
+M selalu **lebih kecil dari LLVM (~11-12%)** dan **~30% lebih kecil dari U**.
+
+**Waktu kompilasi (wall ms) dan peak RSS (MB)**
+
+| Program | L wall | U wall | M wall | L rss | U rss | M rss |
+|---|---|---|---|---|---|---|
+| p2_mem | 241 | 127 | 145 | 133 | 132 | 133 |
+| p1_arith | 87 | 78 | 78 | 106 | 109 | 109 |
+| p8_minmax | 87 | 77 | 78 | 105 | 107 | 108 |
+
+M mengompilasi `p2_mem` **1,66x lebih cepat dari LLVM** (145 vs 241 ms) pada
+peak RSS yang sama. Overhead pass atom (§19) hanya ~1 ms wall di atas U.
+Runtime peak RSS identik dengan LLVM di semua program.
+
+### 19.6 Verifikasi
+
+- Uji diferensial (`t_atom`): keluaran modifikasi == LLVM == atom-dimatikan,
+  identik.
+- Suite penuh `./y.sh test --sysroot clif`: **65 suite, 0 gagal, exit 0**
+  (termasuk `regex`, `rand`, `graviola`, `portable-simd`, `stdarch`).
+- Knob: `CG_CLIF_PARTIAL` (faktor reduksi), `CG_CLIF_NO_ATOM` (matikan atom).
+
+## 20. ICE `div_test` pada alias nilai: satu penggunaan yang tak terhitung (LANDED)
+
+### 20.1 Gejala
+
+Menjalankan suite `regex` (lewat dependensi `env_logger`) membuat compiler
+**panic** di `vendor/cranelift-codegen-0.137.0/src/ir/dfg.rs:401`:
+
+```
+index out of bounds: the len is 2440 but the index is 4294967295
+```
+
+di dalam `EgraphPass` → `insert_pure_enode` → `constructor_simplify`. Indeks
+`4294967295` (`u32::MAX`) adalah `Value::reserved_value()`: sebuah instruksi
+memakai nilai yang tidak ada. Mematikan pass lain tidak menolong; hanya
+`CG_CLIF_NO_DIVTEST=1` yang menghilangkan ICE. Jadi `div_test` (§18) yang
+memicunya — **bug pra-ada**, bukan akibat pekerjaan §19 (ICE tetap muncul dengan
+`CG_CLIF_UNROLL=1`).
+
+### 20.2 Akar masalah: penggunaan lewat alias tak terhitung
+
+`div_test::collect` menghitung "berapa kali nilai remainder dipakai" hanya dari
+`InstructionData::arguments()`. Dua jenis penggunaan lolos dari hitungan itu:
+
+1. **Argumen cabang (block-call args).** `arguments()` untuk `brif`/`jump`
+   mengembalikan **hanya kondisi**, bukan argumen blok tujuan. Nilai remainder
+   yang juga diteruskan sebagai argumen phi tidak terhitung.
+2. **Alias nilai.** cg_clif banyak memancarkan alias (`v420 -> v399`). Jika
+   sebuah alias dari nilai remainder dipakai, penggunaan itu tercatat atas nama
+   alias, bukan nilai aslinya.
+
+Karena hitungan tetap `1`, kandidat dianggap aman, `rewrite` me-`remove_inst`
+`urem`-nya, dan argumen blok / alias yang masih menunjuk ke definisi yang baru
+dihapus menjadi menggantung. Egraph lalu membaca nilai `reserved` itu.
+
+### 20.3 Perbaikan
+
+- `collect` sekarang **me-resolve alias** (`dfg.resolve_aliases`) saat menghitung
+  penggunaan, dan **ikut menghitung argumen cabang** lewat
+  `InstructionData::branch_destination(...)` (mencakup `jump`, `brif`,
+  `br_table`, `try_call`). Nilai yang dipakai lewat alias atau lewat phi kini
+  terhitung, sehingga kandidat yang tidak benar-benar sekali-pakai ditolak.
+- `classify_use` juga me-resolve alias pada operand sebelum membandingkan,
+  supaya bentuk `brif (alias dari rem), ..` dikenali dengan benar.
+
+Perbaikan ini murni menambah penolakan (lebih konservatif): tidak ada rewrite
+baru yang diaktifkan, jadi tidak ada risiko miscompile baru. Semua hasil §18
+tetap.
+
+### 20.4 Verifikasi
+
+`env_logger 0.9.3` kini terkompilasi bersih (exit 0, tanpa ICE). Suite `regex`
+kembali lulus. Ini menutup celah yang tidak tertangkap sesi-sesi sebelumnya
+karena `regex`/`env_logger` belum pernah benar-benar dikompilasi (unduhan crate
+eksternal belum tersedia saat itu).
