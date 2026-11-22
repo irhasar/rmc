@@ -386,6 +386,7 @@ pub(crate) fn run(func: &mut ir::Function) {
     if super::tunables::collapse_forwarders_enabled() {
         collapse_forwarders(func);
     }
+    narrow_uint_fcvt(func);
     if std::env::var_os("CG_CLIF_UNROLL_DEBUG").is_some() {
         eprintln!("[unroll] func {:?} blocks={}", func.name, func.layout.blocks().count());
         for b in func.layout.blocks() {
@@ -422,6 +423,118 @@ pub(crate) fn run(func: &mut ir::Function) {
     // steps so that assumption always holds.
     let Some(factor) = safe_factor(plan.delta, factor) else { return };
     apply(func, &plan, factor);
+}
+
+/// Rewrite `fcvt_from_uint(x)` to `fcvt_from_sint(x)` when `x` is provably
+/// `< 2^63`: the signed conversion is then exact, and on x86-64 it is a single
+/// `cvtsi2ss`/`cvtsi2sd` while the unsigned one must emit a branchy full-range
+/// sequence (the backend cannot see any bound). The proof comes from an unsigned
+/// upper-bound compare that guards the conversion's block on the dominator path
+/// (e.g. the `i < N` test of a `for i in 0..N` loop). Dynamic or huge bounds are
+/// left untouched.
+fn narrow_uint_fcvt(func: &mut ir::Function) {
+    if std::env::var_os("CG_CLIF_NO_NARROW_FCVT").is_some() {
+        return;
+    }
+    let targets: Vec<(Inst, Value)> = {
+        let mut t = Vec::new();
+        for block in func.layout.blocks().collect::<Vec<_>>() {
+            for inst in func.layout.block_insts(block).collect::<Vec<_>>() {
+                if let ir::InstructionData::Unary { opcode: Opcode::FcvtFromUint, arg } =
+                    func.dfg.insts[inst]
+                {
+                    t.push((inst, func.dfg.resolve_aliases(arg)));
+                }
+            }
+        }
+        t
+    };
+    if targets.is_empty() {
+        return;
+    }
+    let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func);
+    let mut dom = cranelift_codegen::dominator_tree::DominatorTree::new();
+    dom.compute(func, &cfg);
+    let dbg = std::env::var_os("CG_CLIF_UNROLL_DEBUG").is_some();
+    let mut changed = 0;
+    for (inst, x) in targets {
+        let bound = upper_bound(func, &dom, inst, x);
+        if dbg {
+            eprintln!("[unroll]   fcvt x={x:?} bound={bound:?}");
+        }
+        if let Some(c) = bound {
+            if c < (1u64 << 63) {
+                if let ir::InstructionData::Unary { opcode, .. } = &mut func.dfg.insts[inst] {
+                    *opcode = Opcode::FcvtFromSint;
+                    changed += 1;
+                }
+            }
+        }
+    }
+    if dbg && changed > 0 {
+        eprintln!("[unroll]   narrowed {changed} fcvt_from_uint -> fcvt_from_sint");
+    }
+}
+
+/// If some dominator of `inst`'s block branches on an unsigned `x < C` test with
+/// the taken edge dominating the block, return `C` (an upper bound on `x` there).
+fn upper_bound(
+    func: &ir::Function,
+    dom: &cranelift_codegen::dominator_tree::DominatorTree,
+    inst: Inst,
+    x: Value,
+) -> Option<u64> {
+    let Some(block) = func.layout.inst_block(inst) else { return None };
+    let mut cur = dom.idom(block);
+    while let Some(d) = cur {
+        if let Some(term) = func.layout.last_inst(d) {
+            if let ir::InstructionData::Brif { arg: cond_val, blocks, .. } = func.dfg.insts[term] {
+                if let ir::ValueDef::Result(ci, _) = func.dfg.value_def(cond_val) {
+                    if let ir::InstructionData::IntCompare { cond: cc, args, .. } =
+                        func.dfg.insts[ci]
+                    {
+                        let taken = blocks[0].block(&func.dfg.value_lists);
+                        let nottaken = blocks[1].block(&func.dfg.value_lists);
+                        if dom.dominates(taken, block, &func.layout)
+                            && !dom.dominates(nottaken, block, &func.layout)
+                        {
+                            if let Some(c) =
+                                upper_bound_from_icmp(func, cc, args[0], args[1], x)
+                            {
+                                return Some(c);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cur = dom.idom(d);
+    }
+    None
+}
+
+fn upper_bound_from_icmp(func: &ir::Function, cc: IntCC, a: Value, b: Value, x: Value) -> Option<u64> {
+    let a = func.dfg.resolve_aliases(a);
+    let b = func.dfg.resolve_aliases(b);
+    // `x < C` / `x <= C` (x on the left).
+    if a == x {
+        if let Some(c) = const_of(func, b) {
+            match cc {
+                IntCC::UnsignedLessThan | IntCC::UnsignedLessThanOrEqual => return Some(c),
+                _ => {}
+            }
+        }
+    }
+    // `C > x` / `C >= x` (x on the right).
+    if b == x {
+        if let Some(c) = const_of(func, a) {
+            match cc {
+                IntCC::UnsignedGreaterThan | IntCC::UnsignedGreaterThanOrEqual => return Some(c),
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 fn successors(func: &ir::Function, block: Block) -> Vec<Block> {

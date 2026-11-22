@@ -1,5 +1,38 @@
 # AGENTS.md
 
+## Session (2026-11-22, latest) — u64→float narrowing via dominator (LANDED)
+- **What**: `narrow_uint_fcvt` in `src/unroll.rs` rewrites `fcvt_from_uint(x)` →
+  `fcvt_from_sint(x)` when `x` is provably `< 2^63`. On x86-64 that turns a
+  branchy full-range u64→float sequence into a single `cvtsi2ss`/`cvtsi2sd`
+  (LLVM does this via its range analysis; Cranelift can't see the bound).
+  p9_u64f32 **36 → 35 ms** (LLVM 31). Small win but **general**: every
+  `for i in 0..n { … i as f32/f64 … }` with small const `n` benefits.
+- **The trick is to NOT need loop analysis**: walk the `DominatorTree` up from
+  the conversion's block; if a dominator `brif`s on `icmp ult x, C` (or `ule`,
+  or `C > x` / `C >= x`) with `C < 2^63` and the **taken edge dominates** the
+  block, then `x ≤ C < 2^63` there → safe. Works for **multi-block bodies**,
+  which the `analyze`/`Plan` path (§19) rejects — and p9's `for i in 0..n` loop
+  IS multi-block (range-iterator lowering splits it), so the Plan-based approach
+  never fired; the dominator approach does.
+- **API gotchas**: `func.layout.inst_block(inst)` returns `Option<Block>`;
+  `Icmp` is `InstructionData::IntCompare { opcode, args, cond }` (NOT `Binary`);
+  `Brif { opcode, arg, blocks }` needs `..` in the pattern; `dom.idom(block)`
+  returns `Option<Block>`; build via
+  `cranelift_codegen::flowgraph::ControlFlowGraph::with_function` +
+  `DominatorTree::new()` + `dom.compute(func, &cfg)`.
+- **Soundness**: only narrows when `C < 2^63` AND the true-edge dominates, so
+  `x ≤ C` holds on every path to the conversion. Exit blocks (where the guard is
+  false) are not dominated by the true-edge, so they're skipped.
+- **Knob**: `CG_CLIF_NO_NARROW_FCVT=1`. Debug: `CG_CLIF_UNROLL_DEBUG=1` prints
+  `fcvt x=… bound=…`.
+- **Tests**: `fcvttest.rs` (const bounds narrowed, dynamic bound falls back,
+  `(1<<40)..` i≥2^31 correct) → byte-identical to LLVM; all 9 bench progs match;
+  `./y.sh test` 65/65. This pass touches conversions everywhere in std, so the
+  full suite is the real gate — it passed.
+- **Remaining p9 gap (35 vs 31)** = per-iteration stack reloads of the array
+  ptr / len (cranelift regalloc keeps loop-invariants on the stack), not the
+  conversion.
+
 ## Session (2026-11-22, latest) — LCG lane transform (LANDED, p8 29→21ms)
 - **What**: new `apply_lanes` in `src/unroll.rs` rewrites `a = a*C + (i|1)` +
   min/max-reduction loops into `F=2` independent lanes → **1 imul/iter** (was

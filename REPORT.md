@@ -2697,3 +2697,41 @@ LLVM adalah kualitas regalloc `cranelift-codegen` (spill), di luar cakupan.
 - `./y.sh test --sysroot clif` → **65 suite, 0 gagal**.
 - Semua 9 program benchmark keluaran identik dengan LLVM; tidak ada regresi
   (p1–p9, compile/size/runtime).
+
+## 23. Penyempitan `fcvt_from_uint` berbasis dominator (LANDED)
+
+### 23.1 Masalah
+
+`(i as f32)` untuk `i: usize` menjadi `fcvt_from_uint` (u64→f32). Di x86-64
+konversi u64→float yang benar untuk seluruh rentang butuh **branch**: nilai
+≥ 2^63 harus di-`shr`/`or` dulu. LLVM menghindarinya karena analisis rentang
+tahu `i < N < 2^63` → cukup satu `cvtsi2ss`. Cranelift tak melihat batas itu,
+jadi selalu mengeluarkan barisan bercabang.
+
+### 23.2 Perbaikan (`src/unroll.rs`, `narrow_uint_fcvt`)
+
+Untuk setiap `fcvt_from_uint(x)`, telusuri **dominator** bloknya. Jika ada
+dominator yang mem-`brif` pada `icmp ult x, C` (atau `ule`) dengan `C < 2^63`
+dan **sisi-true-nya mendominasi** blok itu, maka di blok tersebut `x ≤ C < 2^63`
+— aman diganti `fcvt_from_sint`. Ditangani juga `C > x` / `C >= x`. Batas
+dinamis (bukan konstanta) atau ≥ 2^63 dibiarkan. Knob: `CG_CLIF_NO_NARROW_FCVT`.
+
+Kesederhanaan ini penting: transformasi tidak butuh model loop — hanya
+`DominatorTree` dan satu `icmp` penjaga, sehingga bekerja juga untuk loop
+berbadan **banyak blok** (loop `for i in 0..n` di cg_clif sering terpecah
+beberapa blok oleh penurunan iterator rentang, dan `analyze` di §19 menolaknya).
+
+### 23.3 Hasil
+
+`p9_u64f32`: konversi bercabang hilang (disasm: `xorps; cvtsi2ss` saja),
+**36 → 35 ms** (LLVM 31). Keuntungan kecil karena branch-nya memang terprediksi
+baik, tetapi **umum**: setiap `for i in 0..n { … i as f32/f64 … }` dengan `n`
+konstanta kecil kini memakai satu instruksi konversi, bukan barisan bercabang.
+
+### 23.4 Verifikasi
+
+- Uji diferensial: bound konstan (`0,1,4,100,12345,4M`) → jalur sempit;
+  bound dinamis (`std::env::args`) → fallback; loop `(1<<40)..` (i ≥ 2^31) →
+  benar. Semua byte-identik dengan LLVM.
+- Semua 9 program benchmark keluaran identik; tidak ada regresi.
+- `./y.sh test --sysroot clif` → **65 suite, 0 gagal**.
