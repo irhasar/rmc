@@ -2569,3 +2569,73 @@ tetap.
 kembali lulus. Ini menutup celah yang tidak tertangkap sesi-sesi sebelumnya
 karena `regex`/`env_logger` belum pernah benar-benar dikompilasi (unduhan crate
 eksternal belum tersedia saat itu).
+
+## 21. Guard jalur-lebar menjadi satu perbandingan konstan; faktor atom 2 → 3 (LANDED)
+
+### 21.1 Akar masalah sisa `p8_minmax`
+
+§19.7 mencatat dua penyebab gap `p8` (29–35 ms vs LLVM 17.7 ms): guard per
+iterasi dan faktor 2 lawan 4-lane LLVM. Menambah faktor tidak menolong karena
+biaya rebuild atom O(faktor²). Namun guard-nya sendiri bisa diperbaiki tanpa
+menyentuh struktur lane.
+
+`apply_partial` (dan `apply_reassoc`) membangun guard "semua `faktor` iterasi
+masih dalam batas" sebagai `band(no_wrap, last_ok)`: `icmp uge(iv+last, iv)` ∧
+`icmp cc(iv+last, bound)`, yaitu **tiga** instruksi per iterasi, dan keduanya
+dihitung ulang tiap iterasi walau `bound` konstan.
+
+### 21.2 Perbaikan: guard = satu `icmp ult(iv, limit)` konstan
+
+Saat trip-count **konstan** (dan `bound + last` tidak overflow), tes di atas
+setara dengan `iv < limit` dengan `limit` **konstan**:
+
+- `<` ketat: `limit = bound - last` (atau `0` bila `bound < last`);
+- `<=`: `limit = bound - last + 1`.
+
+Satu `icmp` terhadap konstanta menggantikan tiga instruksi, dan konstanta itu
+di-`iconst` sekali. Untuk bound tak-konstan, guard umum lama dipakai sebagai
+fallback. Helper `build_guard` dipakai bersama oleh kedua unroller.
+
+### 21.3 Faktor atom 2 → 3
+
+Dengan guard yang murah, knee faktor bergeser: tiga lane mengalahkan dua.
+Sapuan pada `p8` (ms): faktor 2 = 31.4, **3 = 29.1**, 4 = 33.5, 6 = 39.3,
+8 = 51.3. `p7` serupa: 2 = 38.0, **3 = 35.4**, 4 = 45.1. Faktor 4+ tetap
+memburuk karena O(faktor²) perkalian koefisien di `pre[k]` (bukan karena nilai
+atom — cache nilai atom diuji dan **netral**, jadi dibuang).
+
+### 21.4 Hasil (matriks 3-arah penuh, `bench/allaxes.sh`, CREPS=3 RREPS=7)
+
+Runtime (wall ms) M vs L, sebelum → sesudah sesi ini:
+
+| prog | M sebelum | M sesudah | LLVM | U |
+|------|----------:|----------:|-----:|---:|
+| p7_branchy | 40.3 | **36** | 45 | 100 |
+| p8_minmax  | 35.0 | **29** | 18 | 38 |
+
+Matriks lengkap sesi ini (C = compile wall ms, R = run wall ms, size = byte):
+
+| prog | C L/U/M | R L/U/M | size L/U/M |
+|------|---------|---------|------------|
+| p1 | 86/82/78 | 82/108/100 | 4.63/5.88/4.13 MB |
+| p2 | 247/125/146 | 16/155/52 | 4.64/5.94/4.14 MB |
+| p3 | 99/86/86 | 36/116/94 | 4.61/5.82/4.06 MB |
+| p4 | 107/92/98 | 56/156/99 | 4.64/5.89/4.14 MB |
+| p5 | 83/76/84 | 58/893/**6** | 4.61/5.81/4.05 MB |
+| p6 | 82/76/75 | 58/902/**6** | 4.61/5.81/4.05 MB |
+| p7 | 84/77/76 | 45/100/**36** | 4.61/5.81/4.05 MB |
+| p8 | 84/79/80 | 18/38/**29** | 4.61/5.81/4.05 MB |
+| p9 | 94/86/87 | 30/76/34 | 4.64/5.89/4.13 MB |
+
+M unggul dari LLVM pada: waktu compile (semua kecuali p4/p5 sedikit lebih
+lambat; p2 1.7× lebih cepat), ukuran (≈12% lebih kecil di semua prog), dan
+runtime `p5`/`p6` (≈10× lebih cepat), `p7` (36 vs 45). `p9` hampir seri
+(34 vs 30). Kalah runtime di `p1`/`p2`/`p3`/`p4`/`p8` — semuanya karena
+keterbatasan arsitektural (tanpa vectorizer, tanpa inliner lintas-CGU, tanpa
+tail-recursion elimination, struktur lane).
+
+### 21.5 Verifikasi
+
+`./y.sh test --sysroot clif` → **65 suite, 0 gagal** (EXIT 0). Semua keluaran
+program benchmark (p1–p9, `t_atom`, `t_loop`, `t_u64f32`, `t_iter`, `t_alias`)
+identik dengan LLVM.

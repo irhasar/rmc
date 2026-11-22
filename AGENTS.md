@@ -1,5 +1,42 @@
 # AGENTS.md
 
+## Session (2026-11-22, later) — constant-bound guard + atom factor 3 (LANDED)
+- **Toolchain reset mid-session** (the documented failure): `$HOME/.cargo`,
+  rustc, cargo, rustup all gone while `dist/` survived. Recovery that worked:
+  `curl https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none`,
+  then `rustup toolchain install` (reads `rust-toolchain.toml` =
+  nightly-2026-11-17). The dist server DOES have 2026-11-17 (this sandbox's
+  clock matches the rust dist server). `./y.sh build` then rebuilt in ~12 s
+  (target/ survived).
+- **p8_minmax / p7_branchy remaining gap = the per-iteration guard**, not the
+  atom rebuild. `build_guard` now emits a **single `icmp ult(iv, limit)`**
+  against a constant when the trip count is constant (and `bound+last` can't
+  wrap); `limit = bound-last` (strict) or `bound-last+1` (`<=`), or 0 if
+  `bound < last`. Falls back to the old `band(no_wrap,last_ok)` for
+  non-constant bounds. Shared by `apply_partial` and `apply_reassoc`.
+- **Two dead ends, both measured and reverted (do not re-try):**
+  - Caching atom *values* in `build_affine` (share `(i+jδ)|1` across `pre[k]`):
+    **netral**. The O(factor²) cost is the *coefficient* multiplies
+    `C^k · a_j`, not the atom values.
+  - De-duplicating the body's own single-step `acc_next` against `pre[0]`
+    (remap body uses to `pre[0]`, make both branches use `pre[0]`): **netral**
+    (35.1 vs 35.0). The redundant multiply is not on the critical path.
+- **`ATOM_FACTOR` 2 → 3.** With the cheap guard the knee moved: p8 factor
+  sweep 2=31.4, **3=29.1**, 4=33.5, 6=39.3, 8=51.3 ms; p7 2=38.0, **3=35.4**,
+  4=45.1. Factor 4+ still loses to O(factor²) coefficient multiplies.
+- **Result** (full 3-way, `bench/allaxes.sh` CREPS=3 RREPS=7): p7 40.3→**36**
+  (LLVM 45), p8 35.0→**29** (LLVM 18). M beats LLVM on compile wall (most),
+  size (~12% smaller everywhere), and runtime p5/p6 (~10×), p7. p9 near-tie
+  (34 vs 30). p1/p2/p3/p4/p8 still lose on architectural grounds.
+- **Tests**: `./y.sh test --sysroot clif` → **65 suites, 0 failed** (EXIT 0).
+  All bench outputs byte-identical to LLVM.
+- **Commits**: `253dc80` (cheap guard), `8e49f2b` (factor 3), + docs. NOT
+  pushed (token situation unchanged — needs a user-supplied `repo` PAT).
+- **p8 lane restructure is the real remaining fix**: LLVM uses 4 independent
+  lanes each advancing by `C^4` (O(f) imuls, full ILP); our `pre[k]` builds
+  every step from the header (O(f²) imuls). Matching it needs per-lane carried
+  state in the clones — a structural rewrite, out of scope for a safe change.
+
 ## Session (2026-11-22) — atom-aware affine reassociation + div_test alias ICE (LANDED locally)
 - **Win**: loops of the shape `acc = acc*C + (i|1)` (LCG, p7/p8) used to be
   rejected by the unroller for two reasons: (a) the other state is a
