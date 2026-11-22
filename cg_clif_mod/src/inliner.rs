@@ -45,6 +45,15 @@ const HOT_CALLS: usize = 1;
 /// Extra instruction budget a caller may spend only on hot callees.
 const HOT_BUDGET: usize = 1024;
 
+/// `CG_CLIF_NO_HOT_INLINE` disables the hot-callee budget (bisecting knob).
+fn hot_calls() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        if std::env::var_os("CG_CLIF_NO_HOT_INLINE").is_some() { usize::MAX } else { HOT_CALLS }
+    })
+}
+
 /// Lower bound on the growth budget, so a tiny wrapper can still absorb callees.
 const MIN_GROWTH: usize = 64;
 
@@ -274,7 +283,7 @@ impl Inline for CguInliner<'_> {
         // the ordinary budget cannot cover another copy, let it draw on the hot
         // budget instead. This collapses a sorting network's many small swap
         // calls instead of stopping once the growth budget is spent.
-        let hot = !trivial && self.inlined.get(&id).copied().unwrap_or(0) >= HOT_CALLS;
+        let hot = !trivial && self.inlined.get(&id).copied().unwrap_or(0) >= hot_calls();
         let use_hot = size > budget && hot && size <= self.hot_budget;
         if size > budget && !use_hot {
             return InlineCommand::KeepCall;

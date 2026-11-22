@@ -27,6 +27,16 @@
   blocker was purely the budget, not CGU or ordering. (c) `git checkout --`
   on the two files fully reverted the debug experiments; the only landed change
   is the ~20-line hot-budget patch in `inliner.rs`.
+- **Real-crate validation (extbench / crateworks)** — hot-callee ON vs
+  `CG_CLIF_NO_HOT_INLINE=1`: openlocationcode run −1.5%, holidays-rs −1.0%,
+  stdnum +1.4% (noise), compile ~neutral (−0.4%/+3.6%/−0.9%), size ~neutral. So
+  it generalizes and is **not** overfit to p2_mem. Contrast a prior
+  `MIN_GROWTH=1024` attempt (separate session) that gave p2 −8.7% but +15%
+  compile on real crates and was dropped: raising the *floor* for every caller
+  costs compile, whereas the hot budget only targets repeatedly-inlined callees.
+  `CG_CLIF_NO_HOT_INLINE` disables it (bisecting knob). extbench needs
+  `extbench/crateworks` cloned (`git clone --depth 1
+  https://github.com/cipansor/crateworks.git`).
 
 ## Session (2026-11-22) — `rec_loop`: recursion→loop (LANDED, p3 −38%)
 - New pass `cg_clif_mod/src/rec_loop.rs`: matches a self-recursive linear

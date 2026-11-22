@@ -2925,3 +2925,16 @@ alih-alih berhenti setelah beberapa.
 `HOT_BUDGET=4096` (lebih agresif) memberi p2 −4.1% **dan** p3 −5.3% tetapi p9 +4.3%
 regresi → ditolak; 1024 = titik aman. Jadi "p2 tidak bisa" ternyata **sebagian bisa**
 (sort inlining); sisa p2 tetap codegen (partition 28% sudah 0-call, codegen-bound).
+
+### 28.5 Validasi pada crate nyata (extbench) — generalisasi terbukti
+A/B hot-callee (ON vs `CG_CLIF_NO_HOT_INLINE=1`) pada 3 crate nyata crateworks:
+| crate | run hot/base | Δrun | Δcompile | Δsize |
+|-------|-------------|------|----------|-------|
+| openlocationcode | 10971/11139 | −1.5% | −0.4% | −616 |
+| holidays-rs | 16933/17104 | −1.0% | +3.6% | +48 |
+| stdnum-rs | 1833/1809 | +1.4% (noise) | −0.9% | −504 |
+Menang kecil di 2/3, netral di stdnum, **compile ~netral**. Berbeda dengan
+`MIN_GROWTH=1024` (sesi lain) yang memberi p2 −8.7% tetapi **compile +15%** di
+crate nyata lalu dibuang. Hot-callee menargetkan callee yang di-inline berulang
+(bukan menaikkan lantai semua caller), jadi biaya compile-nya kecil dan
+**bukan overfitting ke p2_mem**. Knob `CG_CLIF_NO_HOT_INLINE` untuk bisect.
