@@ -1,5 +1,24 @@
 # AGENTS.md
 
+## Session (2026-11-22) — loop-invariant load hoisting attempt (NEGATIVE, reverted)
+- Tried `licm_loads` pass: mark loads from private stack slots at
+  `stack_addr(slot)+const`, not stored in their loop, as `readonly+can_move+
+  notrap`, so Cranelift's LICM hoists them out of the loop (target: the `Vec`
+  header `ptr`/`len` reloaded every iteration).
+- **It fires (binaries of p2/p4/p9 change) and is correct, but gives 0 runtime
+  win** (p2 median 54.4 on vs 53.8 off; p4/p9 reload counts identical).
+- **Root cause 1**: Cranelift LICM refuses to hoist any load when the loop has an
+  *opaque store* (e.g. the `sinf` call in p9's loop):
+  `safe = !any_opaque_store && !store_bases.contains(base)`. A private-slot load
+  is still blocked even though the call cannot write the slot. Fixing this needs
+  a `licm.rs` patch (allow private-slot loads past opaque stores).
+- **Root cause 2 (decisive)**: the header reloads are NOT the bottleneck anyway.
+  p9's loop is 85% `sinf`; p4 is vectorization-bound; p2 is sort/hash codegen.
+  Removing two L1-hit reloads is invisible.
+- Pass removed; REPORT §26 records it. `./y.sh build` clean.
+- Lesson: before building a load-hoisting pass, confirm the loop is
+  memory-reload-bound (disasm + profile), not libcall- or vectorization-bound.
+
 ## Session (2026-11-22) — bounds-check elimination attempt (NEGATIVE, reverted)
 - Tried a `redundant_branch` CLIF pass: eliminate `brif (icmp CC x y)` when a
   dominator has the same comparison and its matching edge dominates. Target: the

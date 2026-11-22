@@ -2829,3 +2829,33 @@ Bahkan bila cek tereliminasi, `bcbig` tetap 134 ms vs LLVM 40 ms — gap-nya
 **vektorisasi** (4×), bukan bounds check (~10-20%). Jadi ini bukan tuas utama
 untuk p4/p2. Pass ditarik (dead code); dicatat agar tidak diulang tanpa CSE
 panjang lebih dulu.
+
+## 26. Upaya hoisting load loop-invariant (NEGATIF — ditarik)
+
+### 26.1 Motivasi
+Header `Vec` (`ptr`, `len`) di-emit cg_clif sebagai load slot stack biasa
+(`notrap` saja, tanpa `readonly`/`can_move`) tiap iterasi. Pass CLIF
+`licm_loads` menandai load dari slot privat yang alamatnya `stack_addr+const`
+dan slotnya tak di-store di loop itu menjadi `readonly+can_move+notrap`,
+berharap pass LICM Cranelift (yang jalan kemudian di `Context::compile`)
+mengangkatnya ke preheader.
+
+### 26.2 Hasil (negatif)
+- Pass **menyala** (biner p2/p4/p9 berubah) dan **benar** (output cocok LLVM).
+- Tapi **0 perbaikan runtime**: p2 median 54.4 (on) vs 53.8 (off) ms — noise;
+  p4 51=51 reload `(%rsp)`; p9 13=13 reload. Load header **tidak terangkat**.
+- **Akar 1**: LICM menolak mengangkat load apa pun bila loop punya
+  *opaque store* (mis. panggilan `sinf` di loop p9): `safe = !any_opaque_store
+  && !store_bases.contains(base)`. Jadi load slot-privat tetap diblok walau
+  address-nya tak bisa ditulis panggilan.
+- **Akar 2 (lebih penting)**: bahkan di loop tanpa panggilan (p4 loop 3),
+  reload header **bukan bottleneck**. Gap p9 = `sinf` (85% sampel), p4 =
+  vektorisasi, p2 = codegen sort/hash. Menghapus 2 reload L1 tak terasa.
+
+### 26.3 Kesimpulan
+Hoisting load header bukan tuas yang berguna untuk benchmark ini. Untuk
+membuatnya benar-benar mengangkat perlu mengubah `licm.rs` agar load dari slot
+yang alamatnya tak escape boleh lewat opaque store — tapi dampaknya tetap
+marginal (loop dibatasi hal lain). Pass ditarik. Bila dikerjakan lagi,
+prasyaratnya: (a) patch `licm.rs` untuk private-slot load, (b) buktikan dulu
+loop-nya memang memory-reload-bound, bukan libcall/vektorisasi-bound.
