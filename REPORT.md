@@ -2453,8 +2453,9 @@ size dalam byte.
 | p9_u64f32 | 31 | 76 | **35** | 1,13x |
 
 M **mengungguli LLVM** di `p5`, `p6` (≈9,7x lebih cepat) dan `p7` (1,1x),
-serta nyaris menyamai di `p9`. `p8` turun 38→35 ms; sisanya (p2 hash/sort,
-p3 rekursi ekor, p4 vektor) tetap gap arsitektural (lihat §8.28, §11).
+serta nyaris menyamai di `p9`. `p8` turun 38→35 ms (rantai `imul` terbukti
+terputus; sisa 2x adalah struktur loop, lihat §19.7). Sisa gap lain (p2
+hash/sort, p3 rekursi ekor, p4 vektor) tetap arsitektural (§8.28, §11).
 
 **Ukuran artefak (byte) — semakin kecil semakin baik**
 
@@ -2486,6 +2487,33 @@ Runtime peak RSS identik dengan LLVM di semua program.
 - Suite penuh `./y.sh test --sysroot clif`: **65 suite, 0 gagal, exit 0**
   (termasuk `regex`, `rand`, `graviola`, `portable-simd`, `stdarch`).
 - Knob: `CG_CLIF_PARTIAL` (faktor reduksi), `CG_CLIF_NO_ATOM` (matikan atom).
+
+### 19.7 Sisa gap `p8_minmax` (35 ms vs LLVM 17,7 ms)
+
+Dump CLIF membuktikan reassosiasi **bekerja**: untuk faktor 2, blok badan
+menghitung `v75 = C*acc`, `v89 = C^2*acc + C*(i|1) + (i+1)|1` — keduanya `imul`
+independen dari `acc` header (`imul v59,C` dan `imul v59,C^2`) — dan klon
+meneruskan `v89` ke header, sehingga rantai `acc` terputus menjadi satu `imul`
+per dua iterasi. Recompute serial di klon (`v103`) mati dan dibuang.
+
+Gap 2x tersisa karena **struktur loop**, bukan reassosiasi:
+
+1. **Guard per iterasi.** `apply_partial` memakai satu `brif` guard yang dicek
+   **setiap** iterasi luar (`test/jne` di disassembly) plus jalur fallback
+   satu-langkah yang menghitung ulang `acc_1`. LLVM memakai versioning loop
+   bersih (prolog+epilog, tanpa cabang guard per iterasi).
+2. **Faktor 2 vs 4-lane LLVM.** LLVM memecah rekurensi menjadi **empat** lane
+   independen (masing-masing `imul` oleh `C,C^2,C^3,C^4` di register berbeda),
+   menyembunyikan latensi `imul` 3 siklus penuh. Faktor 2 hanya memberi dua
+   lane. Menaikkan faktor atom tidak menolong: faktor 4 seri (35 ms), faktor
+   8/16/32 **memburuk** (51/87/165 ms) karena tiap atom dibangun ulang dengan
+   O(faktor^2) perkalian.
+
+Menutup gap ini butuh menulis ulang `apply_partial` menjadi versioning loop
+sejati (prolog menghitung sisa ekor, badan utama bersih tanpa guard), lalu
+memakai faktor 4+ dengan biaya rebuild atom yang dijaga linear. Itu perubahan
+struktural yang berisiko, jadi tidak dikerjakan di sesi ini; pass tetap benar
+dan sudah memberi 38→35 ms plus kemenangan penuh di `p7`.
 
 ## 20. ICE `div_test` pada alias nilai: satu penggunaan yang tak terhitung (LANDED)
 
