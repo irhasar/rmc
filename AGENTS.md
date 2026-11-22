@@ -1,5 +1,33 @@
 # AGENTS.md
 
+## Session (2026-11-22, "win everything") — why the remaining p1/p2/p3/p4/p8/p9 gaps are architectural
+Ran the full per-benchmark bottleneck hunt. Every losing benchmark reduces to one
+of four deep compiler gaps; no knob closes them. **Nothing landed this session
+beyond the already-pushed `a51c34b` (simd_splat).** Tree verified clean == a51c34b.
+
+- **p8_minmax (1.15x)**: already unrolled **3×** by the affine atom path
+  (`ATOM_FACTOR=3`); LLVM unrolls **4×**. Both use `cmovb`. cg_clif uses
+  **memory-operand `imul 0x..(%rip)`** (constant from `.rodata` each iter);
+  LLVM hoists it to a register. Bumping `ATOM_FACTOR` to 4 **regressed p7 by 32%**
+  (33.7→44.4 ms) and did not help p8 — reverted. 3 is the tuned optimum.
+- **p9_u64f32 (1.12x)** and **p4_simd (1.53x)**: the `sin()`/`cos()` loops are
+  **multi-block** (bounds check + call). `unroll::analyze` rejects them
+  (`X: then-arm is not body`, 55× on p9) — it only matches a *single-block* body
+  with a canonical `brif` header. LLVM unrolls them 4× for ILP on the independent
+  `sinf` calls. `CG_CLIF_UNROLL_CLONE=1` gave only ~2% (clone is affine-only).
+  Closing needs a **general multi-block unroller** (clone a body subgraph +
+  remainder loop) — a major pass, not a knob.
+- **p1_arith (1.25x)**: memory-operand `imul`/`mulsd` (constants not hoisted) +
+  the branchy saturating `f as u64` (tested before, not worth fixing).
+- **p2_mem (3.0–3.2x)**: regalloc spills (partition 83 rsp refs / 1072 B);
+  SipHasher is scalar compute (3 rsp). Needs cranelift regalloc work.
+- **p3_calls (1.62x)**: `fib` double recursion; LLVM does tail-recursion
+  elimination to a loop (MIR-level, out of cg_clif's reach at CLIF level).
+- **Bottom line**: cg_clif wins p5/p6 (~11×), p7 (0.82×), ties p8/p9 (~1.1×),
+  and loses p1/p2/p3/p4. Beating LLVM on *all* of them requires months of
+  backend work (multi-block unroller + reassociator, tail-recursion elimination,
+  regalloc improvements, autovectorization/sincos fusion), not session-sized knobs.
+
 ## Session (2026-11-22, later) — `simd_splat` scalarization fixed (LANDED, p2 −3.5%)
 - **Found via disassembly of `hashbrown::raw::RawTableInner::find_inner`** (17% of
   p2): `_mm_set1_epi8(tag)` / `Simd::splat` was lowering to **N individual byte
