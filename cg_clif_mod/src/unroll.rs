@@ -1040,6 +1040,11 @@ struct LaneInfo {
     c: u64,
     /// Constant trip count (must be divisible by the lane count).
     bound: u64,
+    /// The reduction is `select(icmp(cc, l, r), arm1, arm2)` over `{a_next, mn}`.
+    /// These capture how to rebuild it for an arbitrary lane value.
+    cc: IntCC,
+    lhs_is_a: bool,
+    arm1_is_a: bool,
 }
 
 fn detect_lane(func: &ir::Function, plan: &Plan, forms: &[Option<Affine>]) -> Option<LaneInfo> {
@@ -1099,7 +1104,8 @@ fn detect_lane(func: &ir::Function, plan: &Plan, forms: &[Option<Affine>]) -> Op
     let a_idx = a_idx?;
     let mn_idx = mn_idx?;
 
-    // The reduction step must be `select(cond, a_next, mn)` (either arm order).
+    // The reduction step must be `select(icmp(cc, l, r), arm1, arm2)` over
+    // `{a_next, mn}`; capture the predicate and arm order to rebuild it per lane.
     let mn_step = dfg.resolve_aliases(back[mn_idx]);
     let a_next = dfg.resolve_aliases(back[a_idx]);
     let mn_param = dfg.resolve_aliases(params[mn_idx]);
@@ -1107,11 +1113,318 @@ fn detect_lane(func: &ir::Function, plan: &Plan, forms: &[Option<Affine>]) -> Op
     let ir::InstructionData::Ternary { opcode: Opcode::Select, args, .. } = dfg.insts[sel_inst] else {
         return None;
     };
-    let (x, y) = (dfg.resolve_aliases(args[1]), dfg.resolve_aliases(args[2]));
-    if !((x == a_next && y == mn_param) || (x == mn_param && y == a_next)) {
+    let (arm1, arm2) = (dfg.resolve_aliases(args[1]), dfg.resolve_aliases(args[2]));
+    let arm1_is_a = arm1 == a_next && arm2 == mn_param;
+    if !(arm1_is_a || (arm1 == mn_param && arm2 == a_next)) {
         return None;
     }
-    Some(LaneInfo { iv_idx, a_idx, mn_idx, c, bound })
+    let cond = dfg.resolve_aliases(args[0]);
+    let ir::ValueDef::Result(cmp_inst, _) = dfg.value_def(cond) else { return None };
+    let ir::InstructionData::IntCompare { opcode: Opcode::Icmp, cond: cc, args: cargs, .. } =
+        dfg.insts[cmp_inst]
+    else {
+        return None;
+    };
+    let (cl, cr) = (dfg.resolve_aliases(cargs[0]), dfg.resolve_aliases(cargs[1]));
+    let lhs_is_a = cl == a_next && cr == mn_param;
+    if !(lhs_is_a || (cl == mn_param && cr == a_next)) {
+        return None;
+    }
+    Some(LaneInfo { iv_idx, a_idx, mn_idx, c, bound, cc, lhs_is_a, arm1_is_a })
+}
+
+fn lane_enabled() -> bool {
+    std::env::var_os("CG_CLIF_NO_LANES").is_none()
+}
+
+/// Rewrite an `a = a*C + (i|1)` loop with a min/max reduction into `F`
+/// independent lanes, each advancing by `C^F` per outer step. Because `F` is
+/// even, each lane keeps a fixed parity, so `(i|1)` becomes linear in the lane
+/// counter and the forcing term advances by a constant (`slope`) instead of a
+/// per-step multiply. This turns O(F^2) multiplies per group into `F`, i.e. ~1
+/// multiply per iteration. Only fires for a constant trip count divisible by
+/// `F`; otherwise it bails and the caller keeps the clone-based path.
+fn apply_lanes(func: &mut ir::Function, plan: &Plan, li: &LaneInfo) -> bool {
+    const F: u64 = 4;
+    let b = li.bound;
+    if b == 0 || b % F != 0 {
+        return false;
+    }
+    let c = li.c;
+    let header = plan.header;
+    let body = plan.body;
+    let n = func.dfg.block_params(header).len();
+    if n != 3 {
+        return false;
+    }
+    let i64t = ir::types::I64;
+
+    // header must end in a brif whose arms are `body` and the loop exit.
+    let Some(brif) = func.layout.last_inst(header) else { return false };
+    let succs = match &func.dfg.insts[brif] {
+        ir::InstructionData::Brif { blocks, .. } => [
+            blocks[0].block(&func.dfg.value_lists),
+            blocks[1].block(&func.dfg.value_lists),
+        ],
+        _ => return false,
+    };
+    let exit = if succs[0] == body {
+        succs[1]
+    } else if succs[1] == body {
+        succs[0]
+    } else {
+        return false;
+    };
+    let dbg = std::env::var_os("CG_CLIF_LANE_DEBUG").is_some();
+    if dbg {
+        let arms: Vec<String> = match &func.dfg.insts[brif] {
+            ir::InstructionData::Brif { blocks, .. } => blocks
+                .iter()
+                .map(|bc| {
+                    format!(
+                        "{:?}({} args)",
+                        bc.block(&func.dfg.value_lists),
+                        bc.args(&func.dfg.value_lists).count()
+                    )
+                })
+                .collect(),
+            _ => vec![],
+        };
+        eprintln!(
+            "[lane] header n={} succs={:?} exit={:?} exit_params={} arms={:?}",
+            n,
+            succs,
+            exit,
+            func.dfg.block_params(exit).len(),
+            arms
+        );
+    }
+    if exit == body {
+        return false;
+    }
+
+    // Exactly one predecessor edge into the header (the pre-header) besides the
+    // body's back edge.
+    let mut pre: Option<Inst> = None;
+    for blk in func.layout.blocks() {
+        if blk == body {
+            continue;
+        }
+        let Some(t) = func.layout.last_inst(blk) else { continue };
+        let goes = match &func.dfg.insts[t] {
+            ir::InstructionData::Jump { destination, .. } => {
+                destination.block(&func.dfg.value_lists) == header
+            }
+            ir::InstructionData::Brif { blocks, .. } => {
+                blocks.iter().any(|bc| bc.block(&func.dfg.value_lists) == header)
+            }
+            _ => false,
+        };
+        if goes {
+            if pre.is_some() {
+                return false;
+            }
+            pre = Some(t);
+        }
+    }
+    let Some(pre_term) = pre else { return false };
+
+    let init_args: Vec<ir::BlockArg> = match &func.dfg.insts[pre_term] {
+        ir::InstructionData::Jump { destination, .. } => {
+            destination.args(&func.dfg.value_lists).collect()
+        }
+        ir::InstructionData::Brif { blocks, .. } => {
+            let arm = blocks
+                .iter()
+                .find(|bc| bc.block(&func.dfg.value_lists) == header)
+                .unwrap();
+            arm.args(&func.dfg.value_lists).collect()
+        }
+        _ => return false,
+    };
+    if init_args.len() != n {
+        return false;
+    }
+    // The lane counter starts at zero; require the initial induction value to be
+    // the constant 0 so `fbase = k*slope` holds.
+    let iv0 = match init_args[li.iv_idx] {
+        ir::BlockArg::Value(v) => func.dfg.resolve_aliases(v),
+        _ => return false,
+    };
+    if const_of(func, iv0) != Some(0) {
+        return false;
+    }
+
+    let fu = F as usize;
+    let mut cpow = vec![1u64; fu + 1];
+    for k in 1..=fu {
+        cpow[k] = cpow[k - 1].wrapping_mul(c);
+    }
+    let s: u64 = (0..fu).fold(0u64, |a, k| a.wrapping_add(cpow[k]));
+    let slope = s.wrapping_mul(F);
+    // `a_j = C^j * a_0 + pro_const[j]` for j = 1..F.
+    let mut pro_const = vec![0u64; fu + 1];
+    for j in 1..=fu {
+        let mut acc = 0u64;
+        for l in 0..j {
+            acc = acc.wrapping_add(cpow[j - 1 - l].wrapping_mul((l as u64) | 1));
+        }
+        pro_const[j] = acc;
+    }
+    // `lane_const[L]` = the constant part of lane L's forcing (L = 1..F).
+    let mut lane_const = vec![0u64; fu + 1];
+    for l_idx in 1..=fu {
+        let mut acc = 0u64;
+        for j in 0..fu {
+            let nn = l_idx as u64 + j as u64;
+            acc = acc.wrapping_add(cpow[fu - 1 - j].wrapping_mul(nn | 1));
+        }
+        lane_const[l_idx] = acc;
+    }
+
+    let pro = func.dfg.make_block();
+    func.layout.append_block(pro);
+    let mut pro_p = Vec::new();
+    for _ in 0..n {
+        pro_p.push(func.dfg.append_block_param(pro, i64t));
+    }
+
+    let lh = func.dfg.make_block();
+    func.layout.append_block(lh);
+    let lh_iv = func.dfg.append_block_param(lh, i64t);
+    let lh_fb = func.dfg.append_block_param(lh, i64t);
+    let mut lh_a = Vec::new();
+    for _ in 0..F {
+        lh_a.push(func.dfg.append_block_param(lh, i64t));
+    }
+    let lh_acur = func.dfg.append_block_param(lh, i64t);
+    let lh_mn = func.dfg.append_block_param(lh, i64t);
+
+    let lb = func.dfg.make_block();
+    func.layout.append_block(lb);
+    let lb_iv = func.dfg.append_block_param(lb, i64t);
+    let lb_fb = func.dfg.append_block_param(lb, i64t);
+    let mut lb_a = Vec::new();
+    for _ in 0..F {
+        lb_a.push(func.dfg.append_block_param(lb, i64t));
+    }
+    let lb_acur = func.dfg.append_block_param(lb, i64t);
+    let lb_mn = func.dfg.append_block_param(lb, i64t);
+
+    // Prologue: compute a_1..a_F from a_0, then enter the lane header.
+    {
+        let mut pos = FuncCursor::new(func);
+        pos.goto_first_insertion_point(pro);
+        let a0 = pro_p[li.a_idx];
+        let mn0 = pro_p[li.mn_idx];
+        let iv_init = pro_p[li.iv_idx];
+        let mut a_vals = Vec::new();
+        for j in 1..=fu {
+            let cj = pos.ins().iconst(i64t, Imm64::new(cpow[j] as i64));
+            let mut v = pos.ins().imul(a0, cj);
+            if pro_const[j] != 0 {
+                v = pos.ins().iadd_imm(v, Imm64::new(pro_const[j] as i64));
+            }
+            a_vals.push(v);
+        }
+        let acur0 = a_vals[fu - 1];
+        let zero = pos.ins().iconst(i64t, Imm64::new(0));
+        let mut args: Vec<ir::BlockArg> = Vec::new();
+        args.push(ir::BlockArg::Value(iv_init));
+        args.push(ir::BlockArg::Value(zero));
+        for &v in &a_vals {
+            args.push(ir::BlockArg::Value(v));
+        }
+        args.push(ir::BlockArg::Value(acur0));
+        args.push(ir::BlockArg::Value(mn0));
+        pos.ins().jump(lh, &args);
+    }
+
+    // Lane header: continue while `iv < bound`, else exit with (iv=bound,
+    // a=a_cur, mn).
+    {
+        let mut pos = FuncCursor::new(func);
+        pos.goto_first_insertion_point(lh);
+        let bconst = pos.ins().iconst(i64t, Imm64::new(b as i64));
+        let cont = pos.ins().icmp(IntCC::UnsignedLessThan, lh_iv, bconst);
+        let mut lb_args: Vec<ir::BlockArg> = Vec::new();
+        lb_args.push(ir::BlockArg::Value(lh_iv));
+        lb_args.push(ir::BlockArg::Value(lh_fb));
+        for &v in &lh_a {
+            lb_args.push(ir::BlockArg::Value(v));
+        }
+        lb_args.push(ir::BlockArg::Value(lh_acur));
+        lb_args.push(ir::BlockArg::Value(lh_mn));
+        // On exit, hand `(iv=bound, a=a_cur, mn)` back to the *old header*, which
+        // re-checks `iv < bound` (false) and falls through to the real exit. The
+        // exit reads the header's params by dominance, so this keeps them correct
+        // regardless of the exit's shape.
+        let mut exit_args = vec![ir::BlockArg::Value(lh_mn); n];
+        exit_args[li.iv_idx] = ir::BlockArg::Value(bconst);
+        exit_args[li.a_idx] = ir::BlockArg::Value(lh_acur);
+        exit_args[li.mn_idx] = ir::BlockArg::Value(lh_mn);
+        pos.ins().brif(cont, lb, &lb_args, header, &exit_args);
+    }
+
+    // Lane body: fold the F lane values into `mn`, then advance each lane by
+    // `C^F * a_L + (fbase + lane_const[L])`.
+    {
+        let mut pos = FuncCursor::new(func);
+        pos.goto_first_insertion_point(lb);
+        let mut mn = lb_mn;
+        for l in 0..fu {
+            let val = lb_a[l];
+            let (cl, cr) = if li.lhs_is_a { (val, mn) } else { (mn, val) };
+            let cmp = pos.ins().icmp(li.cc, cl, cr);
+            let (x, y) = if li.arm1_is_a { (val, mn) } else { (mn, val) };
+            mn = pos.ins().select(cmp, x, y);
+        }
+        let acur_new = lb_a[fu - 1];
+        let fb_new = pos.ins().iadd_imm(lb_fb, Imm64::new(slope as i64));
+        let iv_new = pos.ins().iadd_imm(lb_iv, Imm64::new(F as i64));
+        let cf = pos.ins().iconst(i64t, Imm64::new(cpow[fu] as i64));
+        let mut new_a = Vec::new();
+        for l in 0..fu {
+            let t = pos.ins().imul(lb_a[l], cf);
+            let fl = if lane_const[l + 1] != 0 {
+                pos.ins().iadd_imm(lb_fb, Imm64::new(lane_const[l + 1] as i64))
+            } else {
+                lb_fb
+            };
+            new_a.push(pos.ins().iadd(t, fl));
+        }
+        let mut args: Vec<ir::BlockArg> = Vec::new();
+        args.push(ir::BlockArg::Value(iv_new));
+        args.push(ir::BlockArg::Value(fb_new));
+        for &v in &new_a {
+            args.push(ir::BlockArg::Value(v));
+        }
+        args.push(ir::BlockArg::Value(acur_new));
+        args.push(ir::BlockArg::Value(mn));
+        pos.ins().jump(lh, &args);
+    }
+
+    // Redirect the pre-header edge from the old header to the prologue, reusing
+    // its existing arguments (which are the initial loop state).
+    {
+        let mut pool = std::mem::take(&mut func.dfg.value_lists);
+        match &mut func.dfg.insts[pre_term] {
+            ir::InstructionData::Jump { destination, .. } => {
+                *destination = ir::BlockCall::new(pro, init_args, &mut pool);
+            }
+            ir::InstructionData::Brif { blocks, .. } => {
+                for bc in blocks.iter_mut() {
+                    if bc.block(&pool) == header {
+                        *bc = ir::BlockCall::new(pro, init_args.clone(), &mut pool);
+                    }
+                }
+            }
+            _ => {}
+        }
+        func.dfg.value_lists = pool;
+    }
+    let _ = (lb_acur, lb_mn);
+    true
 }
 
 fn apply(func: &mut ir::Function, plan: &Plan, factor: u64) {
@@ -1127,6 +1440,16 @@ fn apply(func: &mut ir::Function, plan: &Plan, factor: u64) {
                     li.iv_idx, li.a_idx, li.mn_idx, li.c, li.bound, li.bound % 4
                 ),
                 None => eprintln!("[lane] no match"),
+            }
+        }
+        // Lane transform: rewrite the LCG-plus-reduction loop into F independent
+        // lanes (1 multiply/iter) when the shape and a divisible constant trip
+        // count allow it. Falls through to the clone path otherwise.
+        if lane_enabled() {
+            if let Some(li) = detect_lane(func, plan, &forms) {
+                if apply_lanes(func, plan, &li) {
+                    return;
+                }
             }
         }
         // Decide which transformation applies before composing anything: the full
