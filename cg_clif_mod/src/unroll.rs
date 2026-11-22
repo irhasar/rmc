@@ -1124,6 +1124,39 @@ fn compose(
     Some(rows)
 }
 
+/// The guard that enables the wide (`factor`-iteration) path: true iff all
+/// `factor` iterations from `iv` still satisfy the loop test. When the bound is
+/// a compile-time constant (and `iv + last` cannot wrap) this is a single
+/// compare against a constant limit, instead of the general no-wrap test
+/// combined with the last-iteration test.
+fn build_guard(pos: &mut FuncCursor<'_>, plan: &Plan, last: u64, bound_const: Option<u64>) -> Value {
+    let iv = plan.iv;
+    if let Some(b) = bound_const {
+        if b.checked_add(last).is_some() {
+            // `limit` is the largest `iv` for which `iv + last` is still in
+            // bounds; the wide path runs iff `iv < limit`.
+            let strict = matches!(plan.cc, IntCC::UnsignedLessThan | IntCC::UnsignedGreaterThan);
+            let limit = if b < last {
+                0
+            } else if strict {
+                b - last
+            } else {
+                b - last + 1
+            };
+            let c = pos.ins().iconst(ir::types::I64, Imm64::new(limit as i64));
+            return pos.ins().icmp(IntCC::UnsignedLessThan, iv, c);
+        }
+    }
+    let iv_last = pos.ins().iadd_imm_s(iv, Imm64::new(last as i64));
+    let no_wrap = pos.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, iv_last, iv);
+    let last_ok = if plan.iv_left {
+        pos.ins().icmp(plan.cc, iv_last, plan.bound)
+    } else {
+        pos.ins().icmp(plan.cc, plan.bound, iv_last)
+    };
+    pos.ins().band(no_wrap, last_ok)
+}
+
 /// Fold the affine part of a loop whose other state is a reduction.
 ///
 /// A reduction such as `min` has no closed form, so the whole loop used to be
@@ -1151,17 +1184,10 @@ fn apply_partial(func: &mut ir::Function, plan: &Plan, factor: u64, forms: &[Opt
     // independent of each other, so the chain they replace disappears even though
     // the instruction count is unchanged.
     let (guard, pre) = {
+        let bound_const = const_of(func, plan.bound);
         let mut pos = FuncCursor::new(func);
         pos.goto_first_insertion_point(plan.body);
-        let iv = plan.iv;
-        let iv_last = pos.ins().iadd_imm_s(iv, Imm64::new(last as i64));
-        let no_wrap = pos.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, iv_last, iv);
-        let last_ok = if plan.iv_left {
-            pos.ins().icmp(plan.cc, iv_last, plan.bound)
-        } else {
-            pos.ins().icmp(plan.cc, plan.bound, iv_last)
-        };
-        let guard = pos.ins().band(no_wrap, last_ok);
+        let guard = build_guard(&mut pos, plan, last, bound_const);
         let pre: Vec<Vec<Option<Value>>> = (0..factor as usize)
             .map(|k| {
                 at[k].iter()
@@ -1361,18 +1387,10 @@ fn apply_clone(func: &mut ir::Function, plan: &Plan, factor: u64) {
     // iterations satisfy the loop test. `iv + last` must also not wrap, which
     // would otherwise make the test see a small value.
     let guard = {
-        let iv = plan.iv;
-        let bound = plan.bound;
+        let bound_const = const_of(func, plan.bound);
         let mut pos = FuncCursor::new(func);
         pos.goto_first_insertion_point(plan.body);
-        let iv_last = pos.ins().iadd_imm_s(iv, Imm64::new(last as i64));
-        let no_wrap = pos.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, iv_last, iv);
-        let last_ok = if plan.iv_left {
-            pos.ins().icmp(plan.cc, iv_last, bound)
-        } else {
-            pos.ins().icmp(plan.cc, bound, iv_last)
-        };
-        pos.ins().band(no_wrap, last_ok)
+        build_guard(&mut pos, plan, last, bound_const)
     };
 
     // Chain the clones between the body and the header. Every terminator keeps
