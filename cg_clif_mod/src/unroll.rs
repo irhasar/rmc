@@ -1145,7 +1145,7 @@ fn lane_enabled() -> bool {
 /// multiply per iteration. Only fires for a constant trip count divisible by
 /// `F`; otherwise it bails and the caller keeps the clone-based path.
 fn apply_lanes(func: &mut ir::Function, plan: &Plan, li: &LaneInfo) -> bool {
-    const F: u64 = 4;
+    const F: u64 = 2;
     let b = li.bound;
     if b == 0 || b % F != 0 {
         return false;
