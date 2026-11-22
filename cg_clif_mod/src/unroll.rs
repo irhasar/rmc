@@ -49,7 +49,7 @@ pub(crate) const PARTIAL_FACTOR: u64 = 6;
 /// Partial factor for a loop whose forcing term is a recomputable atom (`i | 1`).
 /// Rebuilding each atom per step costs O(factor^2) multiplies, so a large factor
 /// is counter-productive; 2 keeps every multiply shallow and independent.
-pub(crate) const ATOM_FACTOR: u64 = 2;
+pub(crate) const ATOM_FACTOR: u64 = 3;
 
 /// Shrink `factor` until `delta * (factor - 1)` cannot overflow, and report the
 /// largest usable factor (>= 2), or `None` when even two iterations overflow.
