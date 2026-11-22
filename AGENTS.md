@@ -1,6 +1,29 @@
 # AGENTS.md
 
-## Session (2026-11-22, latest) — remaining-gap investigation + fcvt local rules
+## Session (2026-11-22, latest) — sincos fusion (LANDED, p4 100→86ms)
+- **New pass `src/sincos.rs`** (runs in `base.rs` after `unroll`, has `module`
+  context): fuses `sinf(x)`+`cosf(x)` (and `sin`/`cos`) with the same argument
+  into one `sincosf`/`sincos` libcall — LLVM does this, cg_clif didn't. **p4
+  100→86 ms (14%)**, LLVM 59. Knob `CG_CLIF_NO_SINCOS`.
+- **Cross-block works**: sin's block need only **dominate** cos's block (not same
+  block). p4's sin/cos ARE in different blocks (bounds-check branches between),
+  so same-block-only would have missed it. Emit `sincos` at the sin position, load
+  both outputs, `detach_inst_results` + `change_to_alias` to rewire.
+- **BUG that cost the round**: the first version declared ONE func_ref from the
+  *first* pair's type. A function with BOTH a f32 pair and a f64 pair (p4 loop 1
+  does) then calls `sincos` (f64) for the f32 pair → wrong. 9 bench progs still
+  passed (p4 is f32-only); only a dedicated f32+f64 differential test caught it.
+  **Declare `sincosf` and `sincos` separately, pick per pair.** Lesson: never
+  assume a function has a uniform float type across sin/cos sites.
+- API gotchas: `Call { func_ref, args, .. }`; `args.get(0, &dfg.value_lists)`;
+  `dfg.resolve_aliases` (plural); `MemFlagsData::trusted()` (not `MemFlags::new`);
+  `StackSlotData::new(kind, size, align_shift)`; `func.create_sized_stack_slot`;
+  `module.declarations().get_function_decl(FuncId::from_u32(index)).name` to get a
+  callee's name (`FuncId` recovered from the `ExternalName::User` index).
+- **Tests**: `sincostest`/`scloop1`/`scloop2`/`sc1` (same-block, cross-block,
+  different args, f32, f64, in loops) → all byte-identical to LLVM. Suite 65/65.
+
+## Session (2026-11-22) — remaining-gap investigation + fcvt local rules
 - **fcvt narrowing extended** (`src/unroll.rs`): besides the dominator proof, two
   always-sound LOCAL rules now fire: `fcvt_from_uint(uextend(narrow))` (zero-extend
   → `< 2^32`) and `fcvt_from_uint(band(x, M<2^63))` (`≤ M`). **Important**: a

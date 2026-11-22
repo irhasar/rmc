@@ -2757,3 +2757,40 @@ jadi negatif), jadi tipe sempit saja bukan alasan cukup — hanya `uextend` yang
 menjamin non-negatif.
 
 - `./y.sh test --sysroot clif` → **65 suite, 0 gagal**.
+
+## 24. Fusi `sin`+`cos` → `sincos` (LANDED)
+
+### 24.1 Masalah
+LLVM menggabungkan `sin(x)` dan `cos(x)` dengan argumen sama menjadi satu
+panggilan `sincosf`/`sincos` (glibc memakai reduksi argumen bersama, ~30% lebih
+murah dari dua panggilan). cg_clif memanggil `sinf` + `cosf` terpisah. Di
+`p4_simd` (loop `a[i]=sin(i); b[i]=cos(i)`) ini ~14% runtime.
+
+### 24.2 Perbaikan (`src/sincos.rs`, pass CLIF baru)
+Untuk setiap `sinf(x)`/`sin(x)` dan `cosf(x)`/`cos(x)` dengan argumen sama,
+bila blok `sin` **mendominasi** blok `cos` (atau blok yang sama):
+1. buat dua stack slot (keluaran sin & cos),
+2. deklarasikan `sincosf`/`sincos` (sesuai tipe: f32/f64 — **wajib dua
+   deklarasi terpisah**, lihat 24.3),
+3. sisipkan `sincos(x, &sin_out, &cos_out)` di posisi panggilan sin, lalu muat
+   kedua hasil dari stack slot,
+4. alihkan semua penggunaan hasil `sin`/`cos` ke hasil muat itu
+   (`detach_inst_results` + `change_to_alias`), hapus kedua panggilan lama.
+
+Pass berjalan di `base.rs` (punya `module` untuk mendeklarasikan simbol) setelah
+`unroll`. Knob: `CG_CLIF_NO_SINCOS`.
+
+### 24.3 Bug yang ditemukan (penting)
+Versi pertama mendeklarasikan **satu** func_ref berdasarkan tipe pasangan
+*pertama*. Di fungsi yang punya pasangan f32 **dan** f64 (loop 1 `p4`), pasangan
+f32 memanggil `sincos` (f64) → hasil salah. Uji diferensial menangkapnya
+(`sincostest` mismatch) walau 9 benchmark lolos (p4 hanya f32). Perbaikan:
+deklarasikan `sincosf` (f32) dan `sincos` (f64) terpisah, pilih per pasangan.
+Pelajaran: **satu fungsi bisa punya pasangan f32 dan f64** — jangan asumsikan
+tipe seragam.
+
+### 24.4 Hasil & verifikasi
+`p4_simd`: **100 → 86 ms** (LLVM 59), `sincosf` terpakai, keluaran identik.
+Diuji: same-block, cross-block (`if`), argumen berbeda (tidak difus), f32 & f64,
+dalam loop, `sin`-saja/`cos`-saja. Semua byte-identik LLVM. `./y.sh test` →
+**65 suite, 0 gagal**.

@@ -79,6 +79,7 @@ mod optimize;
 mod passtime;
 mod pointer;
 mod pretty_clif;
+mod sincos;
 mod store_forward;
 mod toolchain;
 mod tunables;

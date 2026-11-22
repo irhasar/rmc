@@ -218,6 +218,9 @@ pub(crate) fn compile_fn(
     // shortened. Cranelift has no unrolling pass of its own.
     crate::passtime::time(crate::passtime::UNROLL, || crate::unroll::run(&mut context.func));
 
+    // Fuse `sin(x)` + `cos(x)` of the same argument into one `sincos` libcall.
+    crate::sincos::run(module, &mut context.func);
+
     #[cfg(false)]
     let _clif_guard = {
         let isa = module.isa();
