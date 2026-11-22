@@ -1,5 +1,84 @@
 # AGENTS.md
 
+## Session (2026-11-22, later) — `simd_splat` scalarization fixed (LANDED, p2 −3.5%)
+- **Found via disassembly of `hashbrown::raw::RawTableInner::find_inner`** (17% of
+  p2): `_mm_set1_epi8(tag)` / `Simd::splat` was lowering to **N individual byte
+  stores + a reload**, not a vector broadcast.
+- **Path**: `_mm_set1_epi8` → `Simd::splat` → `std::intrinsics::simd::simd_splat`,
+  lowered in `src/intrinsics/simd.rs`. The `sym::simd_splat` arm wrote the value
+  to *each lane* (`for i in 0..lane_count { place_lane(i).write_cvalue }`) = N
+  scalar stores. Replaced with a single `ins().splat(vec_ty, scalar)`.
+- **Two guards are required** (both learned from real panics):
+  1. `ret.layout().size.bytes() == 16` — the x64 backend only lowers `splat` for
+     the natural 128-bit vector types. `i8x8` (64-bit) and `i8x32` (256-bit) hit
+     `Compilation(Unsupported("should be implemented in ISLE: splat.i8x8"))`.
+     So `<= 16` is wrong; it must be `== 16`.
+  2. skip f16/f128 lanes (no CLIF vector mapping → per-lane fallback).
+- **`fx.clif_type()` returns None for SIMD types** (`clif_type_from_ty` has no
+  SIMD arm — only scalars/pointers). The first attempt used it for the vector
+  type, so the guard `if let Some(vec_ty) = fx.clif_type(...)` silently failed and
+  fell back to per-lane stores — the change looked correct but did nothing.
+  Use `crate::intrinsics::clif_vector_type(tcx, layout)` instead.
+- **Measured** (`p2_slow`, 60x sort+hash loop): 2548 → 2387 ms (**−6.4%**);
+  `p2_mem` 48.1 → 46.4 ms (**−3.5%**). `find_inner` 891 → 640 B with the 16
+  byte-stores gone (0 `mov %sil` byte-splat stores left in the binary); also
+  `simd_contains` closure −540 B, `Mask::to_*` −273 B, `memchr` −119 B,
+  `prepare_rehash` −112 B. Binaries ~1.5 KB smaller.
+- **Correctness**: `./y.sh test --sysroot clif` → **65 suites, 0 failed (incl.
+  portable-simd), exit 0**; p1–p9 byte-identical to LLVM; extbench crate tests
+  (`exttests.sh`, openlocationcode/holidays-rs/stdnum-rs) all **ok for L/U/M**.
+- **Post-fix p2 profile** (`p2_slow`): partition 32.9% (regalloc spills),
+  `raw_entry` 12.6%, `SipHasher::write` 11.5% (697 B, **only 3 rsp refs / 0 calls**
+  — pure scalar SipHash compute, not spill-bound, no easy win), `find_inner`
+  9.8% (was 17.4%), `find` 7.8%, `swap_if_less` 5.5%. The remaining p2 gap is
+  the partition's regalloc spilling (cranelift-codegen) + scalar SipHash; both
+  need deep changes.
+- **Methodology gotcha (cost real time)**: editing the codegen backend does **not**
+  invalidate cargo's std cache — the `.so` is loaded dynamically and is not part
+  of the fingerprint, so `./y.sh build` recompiles libcore *incrementally* and
+  keeps the **old** lowering baked into std. Force it with
+  `rm -rf build/stdlib_target` before `./y.sh build` when validating a lowering
+  change. Also: `nm | grep find_inner | tail -1` picked a stale/second instance
+  and hid the win; diff function sizes (`nm -S` old-vs-new) to confirm.
+
+## Session (2026-11-22, later) — Experiment A (VarN aggregate promotion): NEGATIVE
+- **Goal**: keep the hot `PartitionState<u64>` (32-byte / 4-word aggregate, the
+  46%-spill source in `partition_lomuto_branchless_cyclic`) in registers instead
+  of stack slot `ss2`. cg_clif's `is_ssa` only accepted 1–2 word CLIF types, so a
+  4-word aggregate always became `new_stack_slot`.
+- **Implemented** `CPlaceInner::VarN(Local, [Variable;4], u8)` + `word_aggregate_words`
+  (flat struct/tuple, all fields i64-scalar or i64-pair, 1..=4 words) +
+  `new_var_n` + arms in every `CPlaceInner` match (`to_cvalue`/`to_ptr`/`to_place`/
+  `force_to_stack`/`place_field`/`write_cvalue`/lanes/unsized), and `is_ssa`
+  extended to accept word aggregates. Committed… **no, reverted** (see below).
+- **Two real bugs found and fixed while building it** (kept in notes in case it
+  is retried):
+  1. `place_field` word index must use `layout.fields.offset(i)/8`, **not** the
+     sum of preceding field *sizes* — struct definition order ≠ offset order, and
+     the size-sum gave the wrong var → **segfault** (p2_mem printed nothing).
+  2. Restrict `word_aggregate_words` to `ty::Tuple` / `ty::Adt(def) if
+     def.is_struct()` — enums/unions have a single "variant" field and broke
+     `place_field` (`VarN field width` panic while compiling `core`).
+- **Result: NEUTRAL, reverted.** After fixing both bugs: p1/p2/p3/p4 all
+  byte-identical to LLVM, but `partition_lomuto_branchless_cyclic` spills are
+  **unchanged at 57** (`(%rsp)` refs), fn size 525 B unchanged, and A/B
+  (`CG_CLIF_NO_VARN` kill-switch) on p2/p3 shows no runtime or size change
+  (p2 48.0 vs 48.1 ms; size 4,145,792 vs 4,145,656 — VarN marginally *bigger*).
+- **Why it doesn't help**: the partition takes `&mut` of the `PartitionState`
+  (or its fields), so `analyze` marks it `NotSsa` or codegen `force_to_stack`s
+  it — the aggregate is materialised regardless of the VarN representation. The
+  VarN'd path is only reached for locals that are already `MaybeSsa`, and those
+  either aren't the hot ones or get materialised at the first `&mut`/address use.
+- **Conclusion**: the 3x p2 gap is **not** the aggregate-local representation.
+  Closing it needs either (a) lenient `&mut`-of-field handling in `analyze` so
+  only the borrowed field spills, or (b) register allocation quality inside
+  `cranelift-codegen`. Neither is a quick `VarN` tweak. Do not re-attempt plain
+  VarN without first solving the `&mut` materialisation.
+- **Infra**: the toolchain was wiped mid-session again (no rustc); reinstalled
+  `nightly-2026-11-17` + `rustc-dev,rust-src,llvm-tools,rustfmt`. `./y.sh build`
+  rebuilds `.so` + std + `dist/bin` wrappers (~13 s incremental). If `dist/bin`
+  looks empty, re-run `./y.sh build` (not `prepare`) to recreate the wrappers.
+
 ## Session (2026-11-22) — hot-callee inliner budget (LANDED, p2 −5%)
 - **Experiment "rebuild std 1-CGU" disproved the cross-CGU hypothesis.** std is
   already 1 CGU (`ar t libstd-*.rlib` → 1 `.o`); the sort fns

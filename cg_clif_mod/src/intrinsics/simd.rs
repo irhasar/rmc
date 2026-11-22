@@ -431,9 +431,27 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                 );
             }
 
-            for i in 0..lane_count {
-                let ret_lane = ret.place_lane(fx, i);
-                ret_lane.write_cvalue(fx, value);
+            // A splat is a single vector broadcast. Only fall back to per-lane
+            // writes for lane types without a CLIF vector mapping (f16/f128) and
+            // for anything other than a natural 128-bit vector: the x64 backend
+            // only lowers `splat` for the 16-byte vector types (i8x8/i8x32 and
+            // other widths hit "should be implemented in ISLE").
+            let splat_ok = fx.clif_type(lane_ty).is_some()
+                && !matches!(
+                    lane_ty.kind(),
+                    ty::Float(FloatTy::F16) | ty::Float(FloatTy::F128)
+                )
+                && ret.layout().size.bytes() == 16;
+            if splat_ok {
+                let vec_ty = crate::intrinsics::clif_vector_type(fx.tcx, ret.layout());
+                let scalar = value.load_scalar(fx);
+                let splatted = fx.bcx.ins().splat(vec_ty, scalar);
+                ret.write_cvalue(fx, CValue::by_val(splatted, ret.layout()));
+            } else {
+                for i in 0..lane_count {
+                    let ret_lane = ret.place_lane(fx, i);
+                    ret_lane.write_cvalue(fx, value);
+                }
             }
         }
 
