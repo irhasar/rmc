@@ -45,6 +45,12 @@
   `regex`/`env_logger` were never actually compiled — the external crate
   download (`./y.sh prepare`) had not been done. Always run the full suite
   including `regex` before claiming "0 failures".
+- **The unroller only fires on a compile-time-constant trip count.** A runtime
+  bound (`for i in 0..n` with `n` from args) disables both `unroll` and the atom
+  path entirely (atom/noatom binaries become byte-identical). All bench programs
+  that show wins (p5/p6/p7/p8) use constant bounds. `bench/tests/t_atom.rs`
+  therefore uses `const N`; its reduction states (min/xor/add) stop it folding
+  to a closed form so it actually runs and exercises the atom path.
 
 ## Session (2026-11-20, latest) — `unroll` pass was quadratic (LANDED, `f6d2ae5`)
 - **The per-pass instrumentation had never worked.** `passtime::report()` had no
