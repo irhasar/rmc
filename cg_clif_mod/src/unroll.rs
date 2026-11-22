@@ -1028,12 +1028,107 @@ fn build_pure(pos: &mut FuncCursor<'_>, params: &[Value], p: &Pure) -> Value {
     }
 }
 
+/// A loop matching the LCG-plus-reduction shape the lane transform targets:
+/// one induction variable, one state `a' = C*a + (iv|1)`, and one state whose
+/// step is `select(_, a', mn)` (a min/max reduction over `a`). Header params
+/// are `(iv, a, mn)` in that order after detection.
+struct LaneInfo {
+    iv_idx: usize,
+    a_idx: usize,
+    mn_idx: usize,
+    /// LCG multiplier `C`.
+    c: u64,
+    /// Constant trip count (must be divisible by the lane count).
+    bound: u64,
+}
+
+fn detect_lane(func: &ir::Function, plan: &Plan, forms: &[Option<Affine>]) -> Option<LaneInfo> {
+    let dfg = &func.dfg;
+    let n = dfg.block_params(plan.header).len();
+    if n != 3 || plan.delta != 1 {
+        return None;
+    }
+    let bound = const_of(func, plan.bound)?;
+    if bound == 0 {
+        return None;
+    }
+    let back = back_states(func, plan);
+    if back.len() != n {
+        return None;
+    }
+    let form_of = |v: Value| forms[dfg.resolve_aliases(v).as_u32() as usize].clone();
+    let params = dfg.block_params(plan.header).to_vec();
+    let iv = dfg.resolve_aliases(plan.iv);
+    let iv_idx = params.iter().position(|&p| dfg.resolve_aliases(p) == iv)?;
+
+    let mut a_idx = None;
+    let mut c = 0u64;
+    let mut mn_idx = None;
+    for j in 0..n {
+        match form_of(back[j]) {
+            None => {
+                if mn_idx.is_some() {
+                    return None;
+                }
+                mn_idx = Some(j);
+            }
+            Some(s) if j != iv_idx => {
+                let others_zero = s.coeffs.iter().enumerate().all(|(k, &co)| k == j || co == 0);
+                if !(others_zero && s.c == 0 && s.coeffs[j] != 0 && s.coeffs[j] != 1) {
+                    continue;
+                }
+                let [(atom, coeff)] = s.atoms.as_slice() else { continue };
+                if *coeff != 1 || atom.op != Opcode::Bor || atom.imm != 1 {
+                    continue;
+                }
+                let p = &atom.operand;
+                let pure_ok = p.c == 0
+                    && p.coeffs[iv_idx] == 1
+                    && p.coeffs.iter().enumerate().all(|(k, &co)| k == iv_idx || co == 0);
+                if pure_ok {
+                    if a_idx.is_some() {
+                        return None;
+                    }
+                    a_idx = Some(j);
+                    c = s.coeffs[j];
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    let a_idx = a_idx?;
+    let mn_idx = mn_idx?;
+
+    // The reduction step must be `select(cond, a_next, mn)` (either arm order).
+    let mn_step = dfg.resolve_aliases(back[mn_idx]);
+    let a_next = dfg.resolve_aliases(back[a_idx]);
+    let mn_param = dfg.resolve_aliases(params[mn_idx]);
+    let ir::ValueDef::Result(sel_inst, _) = dfg.value_def(mn_step) else { return None };
+    let ir::InstructionData::Ternary { opcode: Opcode::Select, args, .. } = dfg.insts[sel_inst] else {
+        return None;
+    };
+    let (x, y) = (dfg.resolve_aliases(args[1]), dfg.resolve_aliases(args[2]));
+    if !((x == a_next && y == mn_param) || (x == mn_param && y == a_next)) {
+        return None;
+    }
+    Some(LaneInfo { iv_idx, a_idx, mn_idx, c, bound })
+}
+
 fn apply(func: &mut ir::Function, plan: &Plan, factor: u64) {
     // The profitable transformation is affine reassociation: if the loop state
     // is a linear function of itself, its `factor`-fold iterate is also linear
     // and can be evaluated in a handful of multiplies, collapsing the carried
     // dependency chain. Duplicating the body cannot achieve that.
     if let Some(forms) = analyze_affine(func, plan) {
+        if std::env::var_os("CG_CLIF_LANE_DEBUG").is_some() {
+            match detect_lane(func, plan, &forms) {
+                Some(li) => eprintln!(
+                    "[lane] MATCH iv={} a={} mn={} C={} bound={} bound%4={}",
+                    li.iv_idx, li.a_idx, li.mn_idx, li.c, li.bound, li.bound % 4
+                ),
+                None => eprintln!("[lane] no match"),
+            }
+        }
         // Decide which transformation applies before composing anything: the full
         // reassociation composes `factor` (128) times, which is wasted work when a
         // state is not affine and the loop will not be reassociated at all.
