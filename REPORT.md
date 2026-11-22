@@ -2859,3 +2859,39 @@ yang alamatnya tak escape boleh lewat opaque store — tapi dampaknya tetap
 marginal (loop dibatasi hal lain). Pass ditarik. Bila dikerjakan lagi,
 prasyaratnya: (a) patch `licm.rs` untuk private-slot load, (b) buktikan dulu
 loop-nya memang memory-reload-bound, bukan libcall/vektorisasi-bound.
+
+## 27. Pass `rec_loop`: rekursi linear → loop (p3 −38%)
+
+### 27.1 Kenapa ini bisa padahal saya sempat bilang "tidak bisa"
+Transformasi `fib`→loop **bukan** pekerjaan backend — itu pass **middle-end
+LLVM (`TailCallElim`)** pada LLVM IR. cg_clif melewati middle-end itu, jadi
+bentuk naif (dua call/aktivasi) sampai ke CLIF. Tapi polanya bisa dipulihkan di
+CLIF: pass baru `src/rec_loop.rs` mencocokkan
+`F(x) = if x < base { x } else { F(x-c1) + F(x-c2) }` dan menulis ulang jadi
+loop berakumulator `acc=0; while x>=base { acc += F(x-c1); x -= c2 } return acc+x`.
+Ini meniru `TailCallElim`, hanya untuk pola linear-recurrence (fib-shaped).
+
+### 27.2 Detail implementasi
+- Cocokkan persis: entry 1 param i64 → brif `icmp ult n, base` → blok base
+  `return n` → `t1=call self(n-c1)` → `t2=call self(n-c2)` → `return t1+t2`.
+  Kedua call harus **self-call** (dicek via `user_named_funcs()[reff].index` ==
+  nama fungsi). Base harus identitas (`return n`), penjumlahan harus `iadd` dari
+  kedua hasil. Jika tidak persis → dilewati (konservatif).
+- **Jebakan**: dua self-call memakai **FuncRef berbeda** (`fn0`/`fn1`, sig
+  berbeda, fungsi sama). Jangan cek `fr1 == fr2`; cek `is_self(fr1) && is_self(fr2)`.
+- Bangun 3 blok baru (loop/base/rec) dengan param loop-carried `(n, acc)`,
+  redirect terminator entry ke `jump loop(n, 0)`, hapus 5 blok lama
+  (`remove_block_and_insts`). Dijalankan sebelum `store_forward` (early).
+- Knob `CG_CLIF_NO_REC_LOOP` untuk A/B.
+
+### 27.3 Hasil
+`fib` sekarang **1 call/iterasi** (persis bentuk LLVM). p3_calls
+**92.4 → 57.2 ms (−38%)**, M/L **2.60× → 1.61×**. Benchmark lain tidak berubah
+(tidak ada fungsi fib-shaped). Correctness: `fib(0..40)` identik LLVM, 9 prog
+benchmark identik LLVM, **`./y.sh test` → 25368 passed / 65 suites / 0 failed**.
+
+### 27.4 Cakupan & batas
+Hanya pola linear-recurrence identitas ini. Kelas yang lebih luas (base bukan
+identitas, `k·F(n-1)+c`, dst.) butuh generalisasi seperti `TailCallElim` penuh —
+pekerjaan lanjutan. Ini bukti bahwa gap "middle-end" LLVM bisa dipulihkan
+sebagian dengan pass CLIF bertarget.

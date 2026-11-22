@@ -196,6 +196,9 @@ pub(crate) fn compile_fn(
     // and Cranelift keeps those round-trips because the slot is not `readonly`.
     // This must run before `unroll`, whose affine analysis rejects any loop that
     // still touches memory.
+    // Rewrite self-recursive linear recurrences (fib-shaped) into loops.
+    crate::rec_loop::run(&mut context.func);
+
     crate::passtime::time(crate::passtime::STORE_FORWARD, || {
         crate::store_forward::run(&mut context.func, module.isa().endianness())
     });

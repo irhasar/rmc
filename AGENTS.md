@@ -1,5 +1,33 @@
 # AGENTS.md
 
+## Session (2026-11-22) — `rec_loop`: recursion→loop (LANDED, p3 −38%)
+- New pass `cg_clif_mod/src/rec_loop.rs`: matches a self-recursive linear
+  recurrence `F(x) = if x < base { x } else { F(x-c1) + F(x-c2) }` and rewrites
+  it into a loop `acc=0; while x>=base { acc += F(x-c1); x -= c2 } return acc+x`.
+  This is what LLVM's middle-end `TailCallElim` does on LLVM IR; cg_clif has no
+  middle-end, so the naive two-call form reached CLIF. Knob `CG_CLIF_NO_REC_LOOP`.
+- Wired in `base.rs` **before** `store_forward` (early). Matcher is strict:
+  exact shape, both calls must be **self-calls**, identity base, `iadd` of the
+  two call results; otherwise skipped.
+- **Gotcha**: the two self-calls use **distinct FuncRefs** (`fn0`/`fn1`, same
+  function, different sigs). Do NOT test `fr1 == fr2`; test
+  `is_self(fr1) && is_self(fr2)` via `func.params.user_named_funcs()[reff].index
+  == func.name`'s index. This was the first bug (pass silently didn't fire).
+- **Gotcha**: must call `crate::rec_loop::run` from `base.rs` — writing the module
+  and adding `mod rec_loop;` is not enough (first build "passed" but never ran).
+- CLIF build recipe: `make_block()` does NOT insert into layout; `at_bottom`
+  debug-asserts `is_block_inserted`, so `layout.append_block` first. `jump`/`brif`
+  args need `BlockArg` (`value.into()`). `InstructionData::Return` has no such
+  variant — detect via `opcode() == Opcode::Return` + `arguments()`. `Call`'s
+  args via `arguments(&dfg.value_lists)`, not the `args` field. Add `..` to all
+  `InstructionData` struct patterns (they carry an `opcode` field).
+- **Result**: fib now 1 call/iteration (LLVM shape). p3_calls 92.4 → 57.2 ms
+  (−38%), M/L 2.60× → 1.61×. Other benchmarks unchanged. fib(0..40) identical to
+  LLVM; 9 bench progs identical; `./y.sh test` → **25368 passed / 65 suites / 0
+  failed**.
+- Answers the standing "why can't p3 be done" — it CAN; the transform is a
+  middle-end pass, not a backend one. This recovers one slice of it.
+
 ## Session (2026-11-22) — loop-invariant load hoisting attempt (NEGATIVE, reverted)
 - Tried `licm_loads` pass: mark loads from private stack slots at
   `stack_addr(slot)+const`, not stored in their loop, as `readonly+can_move+
