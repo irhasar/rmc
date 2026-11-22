@@ -1,5 +1,33 @@
 # AGENTS.md
 
+## Session (2026-11-22) — hot-callee inliner budget (LANDED, p2 −5%)
+- **Experiment "rebuild std 1-CGU" disproved the cross-CGU hypothesis.** std is
+  already 1 CGU (`ar t libstd-*.rlib` → 1 `.o`); the sort fns
+  (`partition_*`/`swap_if_less`/`select_unpredictable`) are monomorphized in the
+  **user crate** (mangled names end `_5p2big`); `-Ccodegen-units=1` on the program
+  changes nothing (still 65 calls); removing the `is_final` collection filter
+  changes nothing (all are `final=true`, already in `bodies`).
+- **Real root cause: the per-caller growth budget.** Inliner debug
+  (`reject_size id=35 size=48 cap=128 budget=5 self=36`) showed `sort9_optimal`
+  inlines ~6 `swap_if_less` then `budget=5` rejects the remaining 65 calls.
+- **Fix (`src/inliner.rs`): hot-callee budget.** Once a callee has been inlined
+  `>= HOT_CALLS` times into one caller, further inlines may draw on a separate
+  `HOT_BUDGET` even after the ordinary budget is spent. `HOT_CALLS=1`,
+  `HOT_BUDGET=1024`. Fields: `hot_budget` on `CguInliner`, `use_hot` in `inline`.
+- **Result**: p2 52.6 → 50.0 ms (**−5.0%**), 3.42× → 3.25×. p1/p3–p9 within noise
+  (≤±1.6%), p9 no regression. Size +0.3%, compile same. `./y.sh test` → **25368
+  passed / 65 suites / 0 failed**.
+- `HOT_BUDGET=4096` gave p2 −4.1% **and** p3 −5.3% but p9 +4.3% → rejected; 1024
+  is the safe point. So "p2 can't be improved" was wrong — sort inlining helps
+  ~5%; the rest of p2 is partition codegen (28%, already 0-call, regalloc-bound).
+- **Gotchas**: (a) compile-time measurements on this box are noisy — a p5
+  "compile +18%" vanished with 8 reps (79 vs 80); always use many reps +
+  min/median. (b) `CguBodies` is collected from *all* `codegened_functions` up
+  front (not order-dependent), so the inliner already sees every callee; the
+  blocker was purely the budget, not CGU or ordering. (c) `git checkout --`
+  on the two files fully reverted the debug experiments; the only landed change
+  is the ~20-line hot-budget patch in `inliner.rs`.
+
 ## Session (2026-11-22) — `rec_loop`: recursion→loop (LANDED, p3 −38%)
 - New pass `cg_clif_mod/src/rec_loop.rs`: matches a self-recursive linear
   recurrence `F(x) = if x < base { x } else { F(x-c1) + F(x-c2) }` and rewrites

@@ -2895,3 +2895,33 @@ Hanya pola linear-recurrence identitas ini. Kelas yang lebih luas (base bukan
 identitas, `k·F(n-1)+c`, dst.) butuh generalisasi seperti `TailCallElim` penuh —
 pekerjaan lanjutan. Ini bukti bahwa gap "middle-end" LLVM bisa dipulihkan
 sebagian dengan pass CLIF bertarget.
+
+## 28. Inliner "hot callee" → p2 −5%
+
+### 28.1 Eksperimen "std 1-CGU" membantah hipotesis cross-CGU
+- std **sudah** 1 CGU: `libstd-*.rlib` hanya berisi **1 file `.o`** (`ar t`).
+- Fungsi sort (`partition_*`, `swap_if_less`, `select_unpredictable`) di-monomorphize
+  di **crate user** (nama mangled berakhir `_5p2big`), bukan std; `-Ccodegen-units=1`
+  pada program juga tak mengubah apa pun (tetap 65 call).
+- Filter `is_final` bukan penyebab (dihapus → tetap 65 call); semua `final=true`
+  dan sudah ada di cache `bodies` (swap_if_less 48 insts, select 47/11 insts).
+- **Akar sebenarnya: budget pertumbuhan inliner per-caller.** Debug inliner:
+  `reject_size id=35 size=48 cap=128 budget=5 self=36` — `sort9_optimal`
+  meng-inline ~6 `swap_if_less` lalu budget habis (sisa 5 < 48) → 65 call ditolak.
+
+### 28.2 Perbaikan: budget "hot callee"
+Kalau sebuah callee sudah di-inline ≥ `HOT_CALLS` kali ke satu caller (hot di situ),
+inline berikutnya boleh memakai `HOT_BUDGET` terpisah meski budget biasa habis.
+`HOT_CALLS=1`, `HOT_BUDGET=1024`. Ini melipat banyak call kecil (jaringan sortir)
+alih-alih berhenti setelah beberapa.
+
+### 28.3 Hasil
+- p2_mem **52.6 → 50.0 ms (−5.0%)**, gap 3.42× → **3.25×**.
+- p1/p3–p9 dalam noise (≤±1.6%); **p9 tak regresi**.
+- Size +0.2–0.4% (8–18 KB), compile sama (dalam noise).
+- `./y.sh test --sysroot clif` → **25368 passed / 65 suites / 0 failed**.
+
+### 28.4 Catatan
+`HOT_BUDGET=4096` (lebih agresif) memberi p2 −4.1% **dan** p3 −5.3% tetapi p9 +4.3%
+regresi → ditolak; 1024 = titik aman. Jadi "p2 tidak bisa" ternyata **sebagian bisa**
+(sort inlining); sisa p2 tetap codegen (partition 28% sudah 0-call, codegen-bound).

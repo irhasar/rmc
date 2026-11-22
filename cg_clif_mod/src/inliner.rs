@@ -37,6 +37,14 @@ pub(crate) const MAX_LEAF_INSTS: usize = 384;
 /// Total number of callee instructions we are willing to add to a single caller.
 const INLINE_BUDGET: usize = 512;
 
+/// A callee inlined at least this many times into one caller is "hot" there.
+/// Further inlines may draw on [`HOT_BUDGET`] even after the ordinary growth
+/// budget is spent, so a sorting network's per-element swap calls collapse
+/// instead of stopping after the first handful.
+const HOT_CALLS: usize = 1;
+/// Extra instruction budget a caller may spend only on hot callees.
+const HOT_BUDGET: usize = 1024;
+
 /// Lower bound on the growth budget, so a tiny wrapper can still absorb callees.
 const MIN_GROWTH: usize = 64;
 
@@ -111,6 +119,7 @@ pub(crate) struct CguInliner<'a> {
     inlined: FxHashMap<u32, usize>,
     budget: usize,
     leaf_budget: usize,
+    hot_budget: usize,
     max_uses: usize,
     max_insts: usize,
     max_leaf_insts: usize,
@@ -182,6 +191,7 @@ impl<'a> CguInliner<'a> {
             // *added* to the caller's budget rather than replacing it so a big
             // caller does not lose headroom for its ordinary callees.
             leaf_budget: inline_budget(caller_insts).saturating_add(max_leaf_insts),
+            hot_budget: HOT_BUDGET,
             // Read the knobs once: `inline` runs per call site and a `std::env`
             // lookup on each is pure overhead.
             max_uses: max_callee_uses(),
@@ -257,7 +267,16 @@ impl Inline for CguInliner<'_> {
         } else {
             (self.max_insts, self.budget)
         };
-        if size > cap || size > budget {
+        if size > cap {
+            return InlineCommand::KeepCall;
+        }
+        // A callee already inlined a few times into this caller is hot here: if
+        // the ordinary budget cannot cover another copy, let it draw on the hot
+        // budget instead. This collapses a sorting network's many small swap
+        // calls instead of stopping once the growth budget is spent.
+        let hot = !trivial && self.inlined.get(&id).copied().unwrap_or(0) >= HOT_CALLS;
+        let use_hot = size > budget && hot && size <= self.hot_budget;
+        if size > budget && !use_hot {
             return InlineCommand::KeepCall;
         }
         // A trivial leaf is a single operation, so it must not compete for a
@@ -265,7 +284,9 @@ impl Inline for CguInliner<'_> {
         // last `Add::add` calls in a hot blur loop once the caller had already
         // absorbed its larger callees.
         if !trivial {
-            if leaf {
+            if use_hot {
+                self.hot_budget -= size;
+            } else if leaf {
                 self.leaf_budget -= size;
             } else {
                 self.budget -= size;
