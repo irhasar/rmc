@@ -48,7 +48,7 @@ fn does_not_forward_escaping_slot() {
     let x = b.func().block(e).params[0];
     let slot = b.add_stack_slot(8, 8);
     let addr = b.stack_addr(e, slot, 0);
-    let _escaped = b.bin(e, BinOp::Add, Type::I64, addr, addr);
+    let _escaped = b.bin(e, BinOp::Sub, Type::I64, addr, addr);
     b.store(e, Type::I64, addr, 0, x);
     let y = b.load(e, Type::I64, addr, 0);
     b.ret(e, vec![y]);
@@ -92,4 +92,75 @@ fn keeps_store_with_overlapping_load() {
     assert!(!mem_forward::run(&mut f));
     assert!(f.blocks[0].insts.iter().any(|i| matches!(i, Inst::Store(..))));
     assert_eq!(run(&f, &[Val::I(42)]).unwrap(), vec![Val::I(42)]);
+}
+
+#[test]
+fn forwards_same_dynamic_address() {
+    let mut b = Builder::new(vec![Type::I64], vec![Type::I64, Type::I64]);
+    let e = b.func().entry;
+    let x = b.func().block(e).params[0];
+    let i = b.func().block(e).params[1];
+    let slot = b.add_stack_slot(64, 8);
+    let base = b.stack_addr(e, slot, 0);
+    let eight = b.iconst(e, Type::I64, 8);
+    let scaled = b.bin(e, BinOp::Mul, Type::I64, i, eight);
+    let addr = b.bin(e, BinOp::Add, Type::I64, base, scaled);
+    b.store(e, Type::I64, addr, 0, x);
+    let y = b.load(e, Type::I64, addr, 0);
+    b.ret(e, vec![y]);
+
+    let mut f = b.into_func();
+    assert!(mem_forward::run(&mut f));
+    assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
+    assert_eq!(run(&f, &[Val::I(42), Val::I(1)]).unwrap(), vec![Val::I(42)]);
+    assert!(!f.blocks[0].insts.iter().any(|i| matches!(i, Inst::Load(..))));
+    assert!(!f.blocks[0].insts.iter().any(|i| matches!(i, Inst::Store(..))));
+}
+
+#[test]
+fn does_not_forward_different_dynamic_addresses() {
+    let mut b = Builder::new(vec![Type::I64], vec![Type::I64, Type::I64, Type::I64]);
+    let e = b.func().entry;
+    let x = b.func().block(e).params[0];
+    let i = b.func().block(e).params[1];
+    let j = b.func().block(e).params[2];
+    let slot = b.add_stack_slot(64, 8);
+    let base = b.stack_addr(e, slot, 0);
+    let eight = b.iconst(e, Type::I64, 8);
+    let si = b.bin(e, BinOp::Mul, Type::I64, i, eight);
+    let sj = b.bin(e, BinOp::Mul, Type::I64, j, eight);
+    let ai = b.bin(e, BinOp::Add, Type::I64, base, si);
+    let aj = b.bin(e, BinOp::Add, Type::I64, base, sj);
+    b.store(e, Type::I64, ai, 0, x);
+    let y = b.load(e, Type::I64, aj, 0);
+    b.ret(e, vec![y]);
+
+    let mut f = b.into_func();
+    assert!(!mem_forward::run(&mut f));
+    assert!(f.blocks[0].insts.iter().any(|i| matches!(i, Inst::Store(..))));
+    assert_eq!(
+        run(&f, &[Val::I(42), Val::I(1), Val::I(1)]).unwrap(),
+        vec![Val::I(42)]
+    );
+}
+
+#[test]
+fn constant_store_not_forwarded_to_dynamic_load() {
+    let mut b = Builder::new(vec![Type::I64], vec![Type::I64, Type::I64]);
+    let e = b.func().entry;
+    let x = b.func().block(e).params[0];
+    let i = b.func().block(e).params[1];
+    let slot = b.add_stack_slot(64, 8);
+    let base = b.stack_addr(e, slot, 0);
+    let eight = b.iconst(e, Type::I64, 8);
+    let scaled = b.bin(e, BinOp::Mul, Type::I64, i, eight);
+    let addr = b.bin(e, BinOp::Add, Type::I64, base, scaled);
+    b.store(e, Type::I64, base, 0, x);
+    let y = b.load(e, Type::I64, addr, 0);
+    b.ret(e, vec![y]);
+
+    let mut f = b.into_func();
+    assert!(!mem_forward::run(&mut f));
+    assert!(f.blocks[0].insts.iter().any(|i| matches!(i, Inst::Store(..))));
+    assert_eq!(run(&f, &[Val::I(42), Val::I(0)]).unwrap(), vec![Val::I(42)]);
 }

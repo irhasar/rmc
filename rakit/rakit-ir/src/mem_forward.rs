@@ -1,17 +1,33 @@
-//! Forward stores to later loads of the same private stack slot and remove
+//! Forward stores to later loads of the same private stack address and remove
 //! stores whose bytes are never loaded.
 //!
-//! The pass is deliberately conservative: it only tracks addresses that are
-//! direct `StackAddr` values (possibly through `Copy`), requires every store to
-//! resolve to a non-escaping slot, and skips the whole function if any address
-//! escapes or any access is out of bounds.
+//! Addresses are tracked through `StackAddr`, `Copy`, constant `Add`, and
+//! `Select`. A non-constant index produces a `Dyn` key that is matched only
+//! against the same index expression, so `a[i]` store/load pairs can be
+//! forwarded without assuming anything about `i`. Any dynamic store kills all
+//! facts for its slot, and any dynamic load suppresses dead-store removal for
+//! that slot.
 
 use std::collections::{BTreeMap, HashMap};
 
 use crate::cfg_util::{predecessors, rpo};
-use crate::ir::{Function, Inst, Type, Value};
+use crate::ir::{BinOp, Function, Inst, Type, Value};
 
-type Facts = BTreeMap<(u32, i64), (Value, Type)>;
+type Facts = BTreeMap<Key, (Value, Type)>;
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+enum Key {
+    Const { slot: u32, offset: i64 },
+    Dyn { slot: u32, base: Value, offset: i64 },
+}
+
+impl Key {
+    fn slot(self) -> u32 {
+        match self {
+            Key::Const { slot, .. } | Key::Dyn { slot, .. } => slot,
+        }
+    }
+}
 
 pub fn run(func: &mut Function) -> bool {
     let mut changed = false;
@@ -35,51 +51,131 @@ fn size_of(ty: Type) -> u32 {
     }
 }
 
-fn address_map(func: &Function) -> HashMap<Value, (u32, i64)> {
-    let mut map = HashMap::new();
+fn definitions(func: &Function) -> HashMap<Value, Inst> {
+    let mut defs = HashMap::new();
     for blk in &func.blocks {
         for inst in &blk.insts {
-            if let Inst::StackAddr(r, slot, offset) = inst {
-                map.insert(*r, (slot.0, *offset as i64));
+            if let Some(r) = inst.result_value() {
+                defs.insert(r, inst.clone());
             }
         }
     }
-    loop {
-        let mut changed = false;
-        for blk in &func.blocks {
-            for inst in &blk.insts {
-                if let Inst::Copy(r, _, x) = inst {
-                    if let Some(k) = map.get(x).copied() {
-                        if map.insert(*r, k).is_none() {
-                            changed = true;
-                        }
-                    }
-                }
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    map
+    defs
 }
 
-fn escaping_slots(func: &Function, addrs: &HashMap<Value, (u32, i64)>) -> Vec<bool> {
+fn const_of(defs: &HashMap<Value, Inst>, value: Value) -> Option<i64> {
+    match defs.get(&value)? {
+        Inst::Iconst(_, ty, v) if ty.is_int() => Some(*v),
+        Inst::Copy(_, _, x) => const_of(defs, *x),
+        _ => None,
+    }
+}
+
+fn address_expr(defs: &HashMap<Value, Inst>, value: Value, depth: u32) -> Option<Key> {
+    if depth > 32 {
+        return None;
+    }
+    match defs.get(&value)? {
+        Inst::StackAddr(_, slot, offset) => Some(Key::Const {
+            slot: slot.0,
+            offset: *offset as i64,
+        }),
+        Inst::Copy(_, _, x) => address_expr(defs, *x, depth + 1),
+        Inst::Bin(_, BinOp::Add, _, x, y) => add_expr(defs, value, *x, *y, depth + 1),
+        Inst::Select(_, _, _, x, y) => {
+            let ex = address_expr(defs, *x, depth + 1)?;
+            let ey = address_expr(defs, *y, depth + 1)?;
+            if ex.slot() == ey.slot() {
+                Some(Key::Dyn {
+                    slot: ex.slot(),
+                    base: value,
+                    offset: 0,
+                })
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn add_expr(
+    defs: &HashMap<Value, Inst>,
+    value: Value,
+    x: Value,
+    y: Value,
+    depth: u32,
+) -> Option<Key> {
+    let ex = address_expr(defs, x, depth);
+    let ey = address_expr(defs, y, depth);
+    let cx = const_of(defs, x);
+    let cy = const_of(defs, y);
+    match (ex, ey, cx, cy) {
+        (
+            Some(Key::Const { slot: s1, offset: o1 }),
+            Some(Key::Const { slot: s2, offset: o2 }),
+            _,
+            _,
+        ) if s1 == s2 => Some(Key::Const {
+            slot: s1,
+            offset: o1 + o2,
+        }),
+        (Some(Key::Const { slot, offset }), None, _, Some(c)) => Some(Key::Const {
+            slot,
+            offset: offset + c,
+        }),
+        (None, Some(Key::Const { slot, offset }), Some(c), _) => Some(Key::Const {
+            slot,
+            offset: offset + c,
+        }),
+        (Some(Key::Const { slot, offset }), None, _, None) => Some(Key::Dyn {
+            slot,
+            base: y,
+            offset,
+        }),
+        (None, Some(Key::Const { slot, offset }), None, _) => Some(Key::Dyn {
+            slot,
+            base: x,
+            offset,
+        }),
+        (Some(Key::Dyn { slot, base, offset }), None, _, Some(c)) => Some(Key::Dyn {
+            slot,
+            base,
+            offset: offset + c,
+        }),
+        (None, Some(Key::Dyn { slot, base, offset }), Some(c), _) => Some(Key::Dyn {
+            slot,
+            base,
+            offset: offset + c,
+        }),
+        (Some(a), Some(b), _, _) if a.slot() == b.slot() => Some(Key::Dyn {
+            slot: a.slot(),
+            base: value,
+            offset: 0,
+        }),
+        _ => None,
+    }
+}
+
+fn escaping_slots(func: &Function, defs: &HashMap<Value, Inst>) -> Vec<bool> {
     let mut escaping = vec![false; func.stack_slots.len()];
     for blk in &func.blocks {
         for inst in &blk.insts {
+            let result_addr = inst.result_value().and_then(|r| address_expr(defs, r, 0));
             for u in inst.operands() {
-                let Some(&(slot, _)) = addrs.get(&u) else {
+                let Some(addr) = address_expr(defs, u, 0) else {
                     continue;
                 };
                 let address_use = match inst {
-                    Inst::Load(_, _, addr, _) => *addr == u,
-                    Inst::Store(_, addr, _, _) => *addr == u,
-                    Inst::Copy(r, _, _) => addrs.contains_key(r),
+                    Inst::Load(_, _, a, _) => *a == u,
+                    Inst::Store(_, a, _, _) => *a == u,
+                    Inst::Copy(_, _, _) => result_addr.is_some(),
+                    Inst::Bin(_, BinOp::Add, _, _, _) => result_addr.is_some(),
+                    Inst::Select(_, _, _, _, _) => result_addr.is_some(),
                     _ => false,
                 };
                 if !address_use {
-                    if let Some(e) = escaping.get_mut(slot as usize) {
+                    if let Some(e) = escaping.get_mut(addr.slot() as usize) {
                         *e = true;
                     }
                 }
@@ -90,33 +186,69 @@ fn escaping_slots(func: &Function, addrs: &HashMap<Value, (u32, i64)>) -> Vec<bo
 }
 
 fn key_of(
-    addrs: &HashMap<Value, (u32, i64)>,
+    defs: &HashMap<Value, Inst>,
     func: &Function,
     addr: Value,
     offset: i32,
     ty: Type,
-) -> Option<(u32, i64)> {
-    let &(slot, base) = addrs.get(&addr)?;
-    let data = func.stack_slots.get(slot as usize)?;
-    let offset = base + offset as i64;
-    let size = size_of(ty) as i64;
-    if offset < 0 || offset.checked_add(size)? > data.size as i64 {
-        return None;
+) -> Option<Key> {
+    match address_expr(defs, addr, 0)? {
+        Key::Const { slot, offset: base } => {
+            let data = func.stack_slots.get(slot as usize)?;
+            let offset = base + offset as i64;
+            let size = size_of(ty) as i64;
+            if offset < 0 || offset.checked_add(size)? > data.size as i64 {
+                return None;
+            }
+            Some(Key::Const { slot, offset })
+        }
+        Key::Dyn {
+            slot,
+            base,
+            offset: base_offset,
+        } => Some(Key::Dyn {
+            slot,
+            base,
+            offset: base_offset + offset as i64,
+        }),
     }
-    Some((slot, offset))
+}
+
+fn kill(facts: &mut Facts, key: Key, ty: Type) {
+    let slot = key.slot();
+    match key {
+        Key::Const { offset, .. } => {
+            let size = size_of(ty) as i64;
+            facts.retain(|k, (_, t)| {
+                if k.slot() != slot {
+                    return true;
+                }
+                match *k {
+                    Key::Dyn { .. } => false,
+                    Key::Const { offset: old, .. } => {
+                        let old_size = size_of(*t) as i64;
+                        !(old < offset + size && offset < old + old_size)
+                    }
+                }
+            });
+        }
+        Key::Dyn { .. } => {
+            facts.retain(|k, _| k.slot() != slot);
+        }
+    }
 }
 
 fn forward(func: &mut Function) -> bool {
-    let addrs = address_map(func);
-    let escaping = escaping_slots(func, &addrs);
+    let defs = definitions(func);
+    let escaping = escaping_slots(func, &defs);
 
     for blk in &func.blocks {
         for inst in &blk.insts {
             if let Inst::Store(ty, addr, offset, _) = inst {
-                let Some((slot, _)) = key_of(&addrs, func, *addr, *offset, *ty) else {
+                let Some(key) = key_of(&defs, func, *addr, *offset, *ty) else {
                     return false;
                 };
-                if escaping[slot as usize] {
+                if escaping[key.slot() as usize] {
                     return false;
                 }
             }
@@ -149,7 +281,7 @@ fn forward(func: &mut Function) -> bool {
         for (ii, inst) in func.blocks[bi].insts.iter().enumerate() {
             match inst {
                 Inst::Load(r, ty, addr, offset) => {
-                    if let Some(key) = key_of(&addrs, func, *addr, *offset, *ty) {
+                    if let Some(key) = key_of(&defs, func, *addr, *offset, *ty) {
                         if let Some(&(value, value_ty)) = facts.get(&key) {
                             if value_ty == *ty {
                                 replacements.push((bi, ii, *r, *ty, value));
@@ -158,16 +290,8 @@ fn forward(func: &mut Function) -> bool {
                     }
                 }
                 Inst::Store(ty, addr, offset, value) => {
-                    if let Some(key) = key_of(&addrs, func, *addr, *offset, *ty) {
-                        let (slot, off) = key;
-                        let size = size_of(*ty) as i64;
-                        facts.retain(|&(s, o), (_, t)| {
-                            if s != slot {
-                                return true;
-                            }
-                            let old_size = size_of(*t) as i64;
-                            !(o < off + size && off < o + old_size)
-                        });
+                    if let Some(key) = key_of(&defs, func, *addr, *offset, *ty) {
+                        kill(&mut facts, key, *ty);
                         facts.insert(key, (*value, *ty));
                     }
                 }
@@ -188,30 +312,37 @@ fn forward(func: &mut Function) -> bool {
 }
 
 fn dse(func: &mut Function) -> bool {
-    let addrs = address_map(func);
-    let escaping = escaping_slots(func, &addrs);
+    let defs = definitions(func);
+    let escaping = escaping_slots(func, &defs);
     let mut loads: HashMap<u32, Vec<(i64, i64)>> = HashMap::new();
+    let mut dynamic_load = vec![false; func.stack_slots.len()];
 
     for blk in &func.blocks {
         for inst in &blk.insts {
             match inst {
                 Inst::Load(_, ty, addr, offset) => {
-                    let Some((slot, off)) = key_of(&addrs, func, *addr, *offset, *ty) else {
+                    let Some(key) = key_of(&defs, func, *addr, *offset, *ty) else {
                         return false;
                     };
+                    let slot = key.slot();
                     if escaping[slot as usize] {
                         return false;
                     }
-                    loads
-                        .entry(slot)
-                        .or_default()
-                        .push((off, off + size_of(*ty) as i64));
+                    match key {
+                        Key::Const { offset, .. } => {
+                            loads
+                                .entry(slot)
+                                .or_default()
+                                .push((offset, offset + size_of(*ty) as i64));
+                        }
+                        Key::Dyn { .. } => dynamic_load[slot as usize] = true,
+                    }
                 }
                 Inst::Store(ty, addr, offset, _) => {
-                    let Some((slot, _)) = key_of(&addrs, func, *addr, *offset, *ty) else {
+                    let Some(key) = key_of(&defs, func, *addr, *offset, *ty) else {
                         return false;
                     };
-                    if escaping[slot as usize] {
+                    if escaping[key.slot() as usize] {
                         return false;
                     }
                 }
@@ -226,15 +357,29 @@ fn dse(func: &mut Function) -> bool {
         while ii < func.blocks[bi].insts.len() {
             let dead = match &func.blocks[bi].insts[ii] {
                 Inst::Store(ty, addr, offset, _) => {
-                    let Some((slot, off)) = key_of(&addrs, func, *addr, *offset, *ty) else {
+                    let Some(key) = key_of(&defs, func, *addr, *offset, *ty) else {
                         return false;
                     };
-                    let end = off + size_of(*ty) as i64;
-                    let live = loads
-                        .get(&slot)
-                        .map(|ranges| ranges.iter().any(|&(a, b)| a < end && off < b))
-                        .unwrap_or(false);
-                    !live
+                    let slot = key.slot();
+                    match key {
+                        Key::Const { offset, .. } => {
+                            if dynamic_load[slot as usize] {
+                                false
+                            } else {
+                                let end = offset + size_of(*ty) as i64;
+                                !loads
+                                    .get(&slot)
+                                    .map(|ranges| {
+                                        ranges.iter().any(|&(a, b)| a < end && offset < b)
+                                    })
+                                    .unwrap_or(false)
+                            }
+                        }
+                        Key::Dyn { .. } => {
+                            !loads.get(&slot).map(|r| !r.is_empty()).unwrap_or(false)
+                                && !dynamic_load[slot as usize]
+                        }
+                    }
                 }
                 _ => false,
             };

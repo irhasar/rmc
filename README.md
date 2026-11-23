@@ -127,9 +127,12 @@ sederhana dengan pemeriksaan batas untuk menguji round-trip memori.
 Pass `mem_forward` (`rakit-ir/src/mem_forward.rs`) meneruskan `store` ke `load`
 berikutnya untuk stack slot privat yang alamatnya tidak escape, baik di dalam
 blok maupun lintas blok lewat must-analysis predecessor. Setelah itu pass
-menghapus store yang byte-nya tidak pernah dibaca. Pass dilewati seluruhnya
-bila ada alamat yang escape, store ke alamat tak dikenal, atau akses di luar
-batas slot.
+menghapus store yang byte-nya tidak pernah dibaca. Alamat dilacak lewat
+`Copy`, `Add` dengan konstanta, `Select`, dan indeks dinamis
+(`StackAddr + i*size`). Store dinamis membunuh semua fakta untuk slot itu dan
+load dinamis mencegah DSE untuk slot itu, sehingga `a[i]` hanya di-forward
+saat ekspresi alamatnya identik. Pass dilewati seluruhnya bila ada alamat yang
+escape, store ke alamat tak dikenal, atau akses konstanta di luar batas slot.
 
 Pipeline RIR sekarang:
 `simplify → optimize → mem_forward → optimize → div_test → if_convert → gvn → licm → optimize`.

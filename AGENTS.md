@@ -1,5 +1,14 @@
 # AGENTS.md
 
+## Session (2026-11-23, Fase 2 step 15) — dynamic addresses
+- `mem_forward` now recognizes `Copy`, `Add` with constants, `Select`, and
+  `StackAddr + dynamic index`. `Const` and `Dyn` keys are matched separately.
+- A dynamic store kills all facts for its slot; a dynamic load disables DSE for
+  that slot. Constant stores are removed only without a dynamic load; dynamic
+  stores only when the slot has no loads.
+- Tests: 61 RIR (8 mem_forward) + 8 bridge; `./y.sh build` exit 0; h21
+  (`as_mut_ptr().add(i & 3)`) prints 42 and logs `mem_forward fired`.
+
 ## Session (2026-11-23, Fase 2 step 14) — store forwarding + DSE
 - New `rakit-ir/src/mem_forward.rs`: track direct `StackAddr` values and
   `Copy` aliases, require non-escaping private slots and in-bounds accesses.
