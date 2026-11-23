@@ -68,10 +68,7 @@ fn find_forwarder(func: &Function) -> Option<usize> {
         if !args.is_empty() || target.0 as usize == bi {
             continue;
         }
-        if !block.insts[..block.insts.len() - 1]
-            .iter()
-            .all(|i| matches!(i, Inst::Nop(..)))
-        {
+        if !block.insts[..block.insts.len() - 1].iter().all(|i| matches!(i, Inst::Nop(..))) {
             continue;
         }
         let mut defined = HashSet::new();

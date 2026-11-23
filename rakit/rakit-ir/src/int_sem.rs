@@ -13,18 +13,17 @@ pub fn width(ty: Type) -> Option<u32> {
         Type::I16 => Some(16),
         Type::I32 => Some(32),
         Type::I64 | Type::Ptr => Some(64),
+        Type::I128 => Some(128),
         _ => None,
     }
 }
 
 pub fn mask(ty: Type) -> Option<u64> {
-    width(ty).map(|bits| {
-        if bits == 64 {
-            u64::MAX
-        } else {
-            (1u64 << bits) - 1
-        }
-    })
+    match width(ty)? {
+        64 => Some(u64::MAX),
+        128 => None,
+        bits => Some((1u64 << bits) - 1),
+    }
 }
 
 /// Keep only the low `width(ty)` bits, zero-extended into `i64`.
@@ -115,5 +114,64 @@ pub fn eval_icmp(cc: IntCc, ty: Type, a: i64, b: i64) -> bool {
         IntCc::Ule => (x as u64) <= (y as u64),
         IntCc::Ugt => (x as u64) > (y as u64),
         IntCc::Uge => (x as u64) >= (y as u64),
+    }
+}
+
+/// Evaluate a 128-bit integer binary op with wrapping semantics.
+pub fn eval_bin_i128(op: BinOp, a: u128, b: u128) -> Option<u128> {
+    let shift = (b as u32) & 127;
+    Some(match op {
+        BinOp::Add => a.wrapping_add(b),
+        BinOp::Sub => a.wrapping_sub(b),
+        BinOp::Mul => a.wrapping_mul(b),
+        BinOp::Sdiv => {
+            let (x, y) = (a as i128, b as i128);
+            if y == 0 {
+                return None;
+            }
+            x.wrapping_div(y) as u128
+        }
+        BinOp::Udiv => {
+            if b == 0 {
+                return None;
+            }
+            a.wrapping_div(b)
+        }
+        BinOp::Srem => {
+            let (x, y) = (a as i128, b as i128);
+            if y == 0 {
+                return None;
+            }
+            x.wrapping_rem(y) as u128
+        }
+        BinOp::Urem => {
+            if b == 0 {
+                return None;
+            }
+            a.wrapping_rem(b)
+        }
+        BinOp::And => a & b,
+        BinOp::Or => a | b,
+        BinOp::Xor => a ^ b,
+        BinOp::Shl => a.wrapping_shl(shift),
+        BinOp::Shr => (a as i128).wrapping_shr(shift) as u128,
+        BinOp::Ushr => a.wrapping_shr(shift),
+        _ => return None,
+    })
+}
+
+pub fn eval_icmp_i128(cc: IntCc, a: u128, b: u128) -> bool {
+    let (sa, sb) = (a as i128, b as i128);
+    match cc {
+        IntCc::Eq => a == b,
+        IntCc::Ne => a != b,
+        IntCc::Slt => sa < sb,
+        IntCc::Sle => sa <= sb,
+        IntCc::Sgt => sa > sb,
+        IntCc::Sge => sa >= sb,
+        IntCc::Ult => a < b,
+        IntCc::Ule => a <= b,
+        IntCc::Ugt => a > b,
+        IntCc::Uge => a >= b,
     }
 }

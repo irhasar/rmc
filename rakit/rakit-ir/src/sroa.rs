@@ -10,9 +10,23 @@ use std::collections::{HashMap, HashSet};
 
 use crate::cfg_util::{dominators, predecessors, rpo};
 use crate::ir::{Function, Inst, Type, Value};
-use crate::mem_forward::{definitions, escaping_slots, key_of, size_of, Key};
+use crate::mem_forward::{Key, definitions, escaping_slots, key_of, size_of};
 
 type Loc = (i64, Type);
+
+/// A dynamic address into a one-element slot must be the element itself for
+/// defined programs: any other index is out of bounds. Such accesses are
+/// therefore promoted to the same SSA location as a constant offset zero.
+fn access_loc(func: &Function, key: Key, target: u32, ty: Type) -> Option<Loc> {
+    match key {
+        Key::Const { slot, offset } if slot == target => Some((offset, ty)),
+        Key::Dyn { slot, .. } if slot == target => {
+            let slot = func.stack_slots.get(target as usize)?;
+            (slot.size == size_of(ty)).then_some((0, ty))
+        }
+        _ => None,
+    }
+}
 
 pub fn run(func: &mut Function) -> bool {
     let mut changed = false;
@@ -74,28 +88,19 @@ fn promote_slot(func: &mut Function, target: u32) -> bool {
                     let Some(key) = key_of(&defs, func, *addr, *offset, *ty) else {
                         continue;
                     };
-                    match key {
-                        Key::Const { slot, offset } if slot == target => {
-                            keys.insert((offset, *ty));
-                            access_blocks.insert(bi);
-                        }
-                        Key::Dyn { slot, .. } if slot == target => return false,
-                        _ => {}
+                    if let Some(loc) = access_loc(func, key, target, *ty) {
+                        keys.insert(loc);
+                        access_blocks.insert(bi);
                     }
                 }
                 Inst::Store(ty, addr, offset, _) => {
                     let Some(key) = key_of(&defs, func, *addr, *offset, *ty) else {
                         continue;
                     };
-                    match key {
-                        Key::Const { slot, offset } if slot == target => {
-                            let loc = (offset, *ty);
-                            keys.insert(loc);
-                            def_blocks.entry(loc).or_default().insert(bi);
-                            access_blocks.insert(bi);
-                        }
-                        Key::Dyn { slot, .. } if slot == target => return false,
-                        _ => {}
+                    if let Some(loc) = access_loc(func, key, target, *ty) {
+                        keys.insert(loc);
+                        def_blocks.entry(loc).or_default().insert(bi);
+                        access_blocks.insert(bi);
                     }
                 }
                 _ => {}
@@ -107,10 +112,8 @@ fn promote_slot(func: &mut Function, target: u32) -> bool {
         return false;
     }
 
-    let ranges: Vec<(i64, i64)> = keys
-        .iter()
-        .map(|&(offset, ty)| (offset, offset + size_of(ty) as i64))
-        .collect();
+    let ranges: Vec<(i64, i64)> =
+        keys.iter().map(|&(offset, ty)| (offset, offset + size_of(ty) as i64)).collect();
     for i in 0..ranges.len() {
         for j in i + 1..ranges.len() {
             let (a, b) = ranges[i];
@@ -160,27 +163,15 @@ fn promote_slot(func: &mut Function, target: u32) -> bool {
         }
     }
 
-    let mut renamer = Renamer {
-        func,
-        defs,
-        target,
-        phi,
-        phi_order,
-        children,
-        succ,
-        current: HashMap::new(),
-    };
+    let mut renamer =
+        Renamer { func, defs, target, phi, phi_order, children, succ, current: HashMap::new() };
     if !renamer.block(renamer.func.entry.0 as usize) {
         return false;
     }
     true
 }
 
-fn dominance_frontier(
-    n: usize,
-    idom: &[Option<usize>],
-    preds: &[Vec<usize>],
-) -> Vec<Vec<usize>> {
+fn dominance_frontier(n: usize, idom: &[Option<usize>], preds: &[Vec<usize>]) -> Vec<Vec<usize>> {
     let mut df = vec![Vec::new(); n];
     for b in 0..n {
         if preds[b].len() < 2 {
@@ -253,11 +244,9 @@ impl Renamer<'_> {
         for inst in old_insts {
             match &inst {
                 Inst::Load(r, ty, addr, offset) => {
-                    if let Some(Key::Const { slot, offset }) =
-                        key_of(&self.defs, self.func, *addr, *offset, *ty)
-                    {
-                        if slot == self.target {
-                            let Some(value) = self.current.get(&(offset, *ty)).copied() else {
+                    if let Some(key) = key_of(&self.defs, self.func, *addr, *offset, *ty) {
+                        if let Some(loc) = access_loc(self.func, key, self.target, *ty) {
+                            let Some(value) = self.current.get(&loc).copied() else {
                                 return false;
                             };
                             insts.push(Inst::Copy(*r, *ty, value));
@@ -267,11 +256,9 @@ impl Renamer<'_> {
                     insts.push(inst);
                 }
                 Inst::Store(ty, addr, offset, value) => {
-                    if let Some(Key::Const { slot, offset }) =
-                        key_of(&self.defs, self.func, *addr, *offset, *ty)
-                    {
-                        if slot == self.target {
-                            self.current.insert((offset, *ty), *value);
+                    if let Some(key) = key_of(&self.defs, self.func, *addr, *offset, *ty) {
+                        if let Some(loc) = access_loc(self.func, key, self.target, *ty) {
+                            self.current.insert(loc, *value);
                             continue;
                         }
                     }
@@ -283,10 +270,8 @@ impl Renamer<'_> {
         self.func.blocks[b].insts = insts;
 
         for &next in &self.succ[b] {
-            let args: Option<Vec<Value>> = self.phi_order[next]
-                .iter()
-                .map(|loc| self.current.get(loc).copied())
-                .collect();
+            let args: Option<Vec<Value>> =
+                self.phi_order[next].iter().map(|loc| self.current.get(loc).copied()).collect();
             let Some(args) = args else {
                 return false;
             };

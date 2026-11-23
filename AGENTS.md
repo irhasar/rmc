@@ -300,6 +300,36 @@ the modified tree's source, docs, or scripts.
   `./y.sh build --sysroot rakit` produced `rakit/dist/bin/rustc-rakit` plus
   its Rakit-compiled std sysroot; a hello-world compiled and ran (`sum=5050`).
 
+## Session (2026-11-23) — Phase 3 backend + RIR gap closure (LANDED locally)
+- **Phase 3 implemented** in `rakit/rakit-ir/src/backend/`: `mach.rs`
+  (machine IR), `mod.rs` (`InstructionSelector`, `RegisterAllocator`,
+  `BackendError`), `isel.rs` (`RirSelector`), `regalloc.rs` (`LinearScan` with
+  liveness, graph coloring, spills), `exec.rs` (machine interpreter).
+  Object-safe traits; `RAKIT_CUSTOM_BACKEND=1` runs ISel+regalloc as a
+  validated alternate path (CLIF remains the production emitter).
+- **Gap closure**: `I128` arithmetic/compare in `int_sem` + interpreter;
+  direct/indirect calls, libcalls/known-symbol targets, multi-result calls in
+  RIR/bridge; `run_with` / `run_with_indirect` interpreter callbacks; SROA of
+  dynamic addresses into one-element slots (valid index is necessarily zero).
+  Verifier, DCE, cfg remapping, and `External` now handle all call forms.
+- **RIR default changed**: runs by default for **executable user crates**, but
+  skips std crates (`core`, `std`, `alloc`, `compiler_builtins`, `unwind`,
+  `rustc_*`) until the bridge is validated against the whole stdlib.
+  `RAKIT_RIR=1` forces on; `RAKIT_NO_RIR=1` forces off. Enabling it for std
+  still ICEs in `core`, so the skip is deliberate.
+- **Bug found/fixed**: `RirPass` overwrote `new_func.params` with the old
+  table after export; the new `ExternalName::User` indices then pointed at the
+  wrong names. `h26` (function pointer) segfaulted until that assignment was
+  removed. Multi-result support also needed `result_values()` in the verifier.
+- **Validation**: `./y.sh build` exit 0 (13–14 s); `cargo test` in
+  `rakit-ir` = 85 tests / 0 failed, `rakit-opt` = 11 / 0; `h20`–`h26` output
+  identical for default-RIR, `RAKIT_NO_RIR=1`, and forced `RAKIT_RIR=1`
+  (including `I128` array, direct call, libcall, and indirect-call programs);
+  `RAKIT_CUSTOM_BACKEND=1 RAKIT_RIR_DEBUG=1` logs `custom backend: 8 vregs, 8
+  regs, 0 spills` for `choose` in `h24`.
+- **Docs**: README bridge/SROA/I128/calls and Phase 3 sections updated.
+- **Push**: pending user-supplied PAT; branch `rakit-middle-end`.
+
 ## Session (2026-11-22, "win everything") — why the remaining p1/p2/p3/p4/p8/p9 gaps are architectural
 Ran the full per-benchmark bottleneck hunt (with RAKIT dumps via `--emit=llvm-ir`,
 which writes `<out>.rakit/`). Every losing benchmark reduces to a deep compiler gap;

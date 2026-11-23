@@ -47,11 +47,7 @@ pub fn run(module: &mut dyn Module, func: &mut ir::Function) {
                 result,
                 ty: func.dfg.value_type(arg0),
             };
-            if is_sin {
-                sins.push(site)
-            } else {
-                coss.push(site)
-            }
+            if is_sin { sins.push(site) } else { coss.push(site) }
         }
     }
     if sins.is_empty() || coss.is_empty() {

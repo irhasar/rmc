@@ -18,22 +18,23 @@
 
 pub(crate) mod cfg_util;
 
+pub mod backend;
 pub mod builder;
 pub mod div_test;
 pub mod gvn;
 pub mod if_convert;
-pub mod licm;
-pub mod mem_forward;
 pub mod int_sem;
 pub mod interp;
 pub mod ir;
+pub mod licm;
+pub mod mem_forward;
 pub mod opt;
 pub mod simplify;
 pub mod sroa;
 pub mod verify;
 
 pub use builder::Builder;
-pub use interp::{Val, run};
+pub use interp::{Val, run, run_with, run_with_indirect};
 pub use ir::*;
 pub use opt::optimize;
 pub use verify::verify;

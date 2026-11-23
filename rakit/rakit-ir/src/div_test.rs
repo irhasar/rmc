@@ -43,15 +43,7 @@ pub fn run(func: &mut Function) -> bool {
             if divisor <= 1 {
                 continue;
             }
-            candidates.push(Candidate {
-                bi,
-                ii,
-                rr: *rr,
-                cc: *cc,
-                x,
-                divisor,
-                ty: *ty,
-            });
+            candidates.push(Candidate { bi, ii, rr: *rr, cc: *cc, x, divisor, ty: *ty });
         }
     }
 
@@ -212,11 +204,7 @@ fn rewrite(func: &mut Function, cand: &Candidate) {
 /// `C^-1 mod 2^bits` for odd `C`, by Newton iteration on the 2-adic inverse.
 fn mod_inverse(odd: u64, bits: u32) -> u64 {
     debug_assert!(odd % 2 == 1);
-    let mask = if bits == 64 {
-        u64::MAX
-    } else {
-        (1u64 << bits) - 1
-    };
+    let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
     let mut x = odd & mask;
     for _ in 0..6 {
         x = x.wrapping_mul(2u64.wrapping_sub(odd.wrapping_mul(x))) & mask;
@@ -263,10 +251,11 @@ mod tests {
         assert_eq!(crate::run(&f, &[Val::I(9)]).unwrap(), vec![Val::I(1)]);
         assert_eq!(crate::run(&f, &[Val::I(10)]).unwrap(), vec![Val::I(2)]);
         crate::optimize(&mut f);
-        assert!(!f
-            .blocks
-            .iter()
-            .any(|b| b.insts.iter().any(|i| matches!(i, Inst::Bin(_, BinOp::Urem, ..)))));
+        assert!(
+            !f.blocks
+                .iter()
+                .any(|b| b.insts.iter().any(|i| matches!(i, Inst::Bin(_, BinOp::Urem, ..))))
+        );
     }
 
     #[test]
@@ -283,25 +272,17 @@ mod tests {
     fn handles_even_and_power_of_two_divisors() {
         for (divisor, hit, miss) in [(4i64, 8u64, 9u64), (8, 16, 17), (12, 12, 18)] {
             let mut f = build_mod_test(divisor, false);
-            assert_eq!(
-                crate::run(&f, &[Val::I(hit as i64)]).unwrap(),
-                vec![Val::I(1)]
-            );
+            assert_eq!(crate::run(&f, &[Val::I(hit as i64)]).unwrap(), vec![Val::I(1)]);
             assert!(run(&mut f), "divisor {divisor} not rewritten");
             assert!(crate::verify(&f).is_ok(), "{:?}", crate::verify(&f).err());
-            assert_eq!(
-                crate::run(&f, &[Val::I(hit as i64)]).unwrap(),
-                vec![Val::I(1)]
-            );
-            assert_eq!(
-                crate::run(&f, &[Val::I(miss as i64)]).unwrap(),
-                vec![Val::I(2)]
-            );
+            assert_eq!(crate::run(&f, &[Val::I(hit as i64)]).unwrap(), vec![Val::I(1)]);
+            assert_eq!(crate::run(&f, &[Val::I(miss as i64)]).unwrap(), vec![Val::I(2)]);
             crate::optimize(&mut f);
-            assert!(!f
-                .blocks
-                .iter()
-                .any(|b| b.insts.iter().any(|i| matches!(i, Inst::Bin(_, BinOp::Urem, ..)))));
+            assert!(
+                !f.blocks
+                    .iter()
+                    .any(|b| b.insts.iter().any(|i| matches!(i, Inst::Bin(_, BinOp::Urem, ..))))
+            );
         }
 
         let mut ne = build_mod_test(4, true);
@@ -346,19 +327,14 @@ mod tests {
             );
             assert!(run(&mut f), "{ty:?} divisor {divisor} not rewritten");
             assert!(crate::verify(&f).is_ok(), "{:?}", crate::verify(&f).err());
-            assert_eq!(
-                crate::run(&f, &[Val::I(hit as i64)]).unwrap(),
-                vec![Val::I(1)]
-            );
-            assert_eq!(
-                crate::run(&f, &[Val::I(miss as i64)]).unwrap(),
-                vec![Val::I(2)]
-            );
+            assert_eq!(crate::run(&f, &[Val::I(hit as i64)]).unwrap(), vec![Val::I(1)]);
+            assert_eq!(crate::run(&f, &[Val::I(miss as i64)]).unwrap(), vec![Val::I(2)]);
             crate::optimize(&mut f);
-            assert!(!f
-                .blocks
-                .iter()
-                .any(|b| b.insts.iter().any(|i| matches!(i, Inst::Bin(_, BinOp::Urem, ..)))));
+            assert!(
+                !f.blocks
+                    .iter()
+                    .any(|b| b.insts.iter().any(|i| matches!(i, Inst::Bin(_, BinOp::Urem, ..))))
+            );
         }
     }
 }

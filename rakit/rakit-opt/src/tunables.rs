@@ -21,11 +21,45 @@ pub fn store_forward_enabled() -> bool {
     *V.get_or_init(|| !flag("RAKIT_NO_STORE_FWD"))
 }
 
-/// Whether the experimental RIR round-trip pass runs (`RAKIT_RIR` on). Off by
-/// default until the bridge covers enough of the instruction set.
-pub fn rir_enabled() -> bool {
+/// Whether the RIR round-trip pass runs. It is on by default for user crates
+/// and off for the standard-library crates that are still being validated.
+/// `RAKIT_RIR` forces it on and `RAKIT_NO_RIR` forces it off.
+pub fn rir_enabled(crate_name: &str, user_crate: bool) -> bool {
+    static OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();
+    let override_value = *OVERRIDE.get_or_init(|| {
+        if flag("RAKIT_RIR") {
+            Some(true)
+        } else if flag("RAKIT_NO_RIR") {
+            Some(false)
+        } else {
+            None
+        }
+    });
+    if let Some(value) = override_value {
+        return value;
+    }
+    user_crate
+        && !matches!(
+            crate_name,
+            "core"
+                | "std"
+                | "alloc"
+                | "compiler_builtins"
+                | "panic_abort"
+                | "panic_unwind"
+                | "unwind"
+                | "sysroot"
+                | "proc_macro"
+        )
+        && !crate_name.starts_with("rustc_")
+}
+
+/// Whether the Phase 3 custom ISel/regalloc runs after RIR passes
+/// (`RAKIT_CUSTOM_BACKEND` on). It validates the RIR through the machine-IR
+/// backend but does not replace CLIF emission.
+pub fn custom_backend_enabled() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| flag("RAKIT_RIR"))
+    *V.get_or_init(|| flag("RAKIT_CUSTOM_BACKEND"))
 }
 
 /// Whether the divisibility-test pass runs at all (`RAKIT_NO_DIVTEST` off).

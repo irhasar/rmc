@@ -77,21 +77,16 @@ fn address_expr(defs: &HashMap<Value, Inst>, value: Value, depth: u32) -> Option
         return None;
     }
     match defs.get(&value)? {
-        Inst::StackAddr(_, slot, offset) => Some(Key::Const {
-            slot: slot.0,
-            offset: *offset as i64,
-        }),
+        Inst::StackAddr(_, slot, offset) => {
+            Some(Key::Const { slot: slot.0, offset: *offset as i64 })
+        }
         Inst::Copy(_, _, x) => address_expr(defs, *x, depth + 1),
         Inst::Bin(_, BinOp::Add, _, x, y) => add_expr(defs, value, *x, *y, depth + 1),
         Inst::Select(_, _, _, x, y) => {
             let ex = address_expr(defs, *x, depth + 1)?;
             let ey = address_expr(defs, *y, depth + 1)?;
             if ex.slot() == ey.slot() {
-                Some(Key::Dyn {
-                    slot: ex.slot(),
-                    base: value,
-                    offset: 0,
-                })
+                Some(Key::Dyn { slot: ex.slot(), base: value, offset: 0 })
             } else {
                 None
             }
@@ -117,43 +112,28 @@ fn add_expr(
             Some(Key::Const { slot: s2, offset: o2 }),
             _,
             _,
-        ) if s1 == s2 => Some(Key::Const {
-            slot: s1,
-            offset: o1 + o2,
-        }),
-        (Some(Key::Const { slot, offset }), None, _, Some(c)) => Some(Key::Const {
-            slot,
-            offset: offset + c,
-        }),
-        (None, Some(Key::Const { slot, offset }), Some(c), _) => Some(Key::Const {
-            slot,
-            offset: offset + c,
-        }),
-        (Some(Key::Const { slot, offset }), None, _, None) => Some(Key::Dyn {
-            slot,
-            base: y,
-            offset,
-        }),
-        (None, Some(Key::Const { slot, offset }), None, _) => Some(Key::Dyn {
-            slot,
-            base: x,
-            offset,
-        }),
-        (Some(Key::Dyn { slot, base, offset }), None, _, Some(c)) => Some(Key::Dyn {
-            slot,
-            base,
-            offset: offset + c,
-        }),
-        (None, Some(Key::Dyn { slot, base, offset }), Some(c), _) => Some(Key::Dyn {
-            slot,
-            base,
-            offset: offset + c,
-        }),
-        (Some(a), Some(b), _, _) if a.slot() == b.slot() => Some(Key::Dyn {
-            slot: a.slot(),
-            base: value,
-            offset: 0,
-        }),
+        ) if s1 == s2 => Some(Key::Const { slot: s1, offset: o1 + o2 }),
+        (Some(Key::Const { slot, offset }), None, _, Some(c)) => {
+            Some(Key::Const { slot, offset: offset + c })
+        }
+        (None, Some(Key::Const { slot, offset }), Some(c), _) => {
+            Some(Key::Const { slot, offset: offset + c })
+        }
+        (Some(Key::Const { slot, offset }), None, _, None) => {
+            Some(Key::Dyn { slot, base: y, offset })
+        }
+        (None, Some(Key::Const { slot, offset }), None, _) => {
+            Some(Key::Dyn { slot, base: x, offset })
+        }
+        (Some(Key::Dyn { slot, base, offset }), None, _, Some(c)) => {
+            Some(Key::Dyn { slot, base, offset: offset + c })
+        }
+        (None, Some(Key::Dyn { slot, base, offset }), Some(c), _) => {
+            Some(Key::Dyn { slot, base, offset: offset + c })
+        }
+        (Some(a), Some(b), _, _) if a.slot() == b.slot() => {
+            Some(Key::Dyn { slot: a.slot(), base: value, offset: 0 })
+        }
         _ => None,
     }
 }
@@ -203,15 +183,9 @@ pub(crate) fn key_of(
             }
             Some(Key::Const { slot, offset })
         }
-        Key::Dyn {
-            slot,
-            base,
-            offset: base_offset,
-        } => Some(Key::Dyn {
-            slot,
-            base,
-            offset: base_offset + offset as i64,
-        }),
+        Key::Dyn { slot, base, offset: base_offset } => {
+            Some(Key::Dyn { slot, base, offset: base_offset + offset as i64 })
+        }
     }
 }
 
@@ -478,9 +452,8 @@ fn dse(func: &mut Function) -> bool {
         }
     }
 
-    let effects: Vec<Effects> = (0..func.blocks.len())
-        .map(|bi| block_effects(func, &defs, bi))
-        .collect();
+    let effects: Vec<Effects> =
+        (0..func.blocks.len()).map(|bi| block_effects(func, &defs, bi)).collect();
     let mut live_in = vec![SlotRanges::new(); func.blocks.len()];
     let mut live_out = vec![SlotRanges::new(); func.blocks.len()];
 

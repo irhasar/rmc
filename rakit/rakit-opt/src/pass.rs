@@ -11,6 +11,8 @@ pub struct PassCtx<'a> {
     pub ctx: &'a mut Context,
     pub module: &'a mut dyn Module,
     pub analyses: &'a mut Analyses,
+    pub crate_name: &'a str,
+    pub user_crate: bool,
 }
 
 pub trait Pass {

@@ -137,9 +137,37 @@ impl Builder {
         args: Vec<Value>,
         ret: Option<Type>,
     ) -> Option<Value> {
-        let result = ret.map(|ty| self.new_value(ty));
-        self.push(b, Inst::Call(result, target, args));
-        result
+        let rets = ret.into_iter().collect();
+        self.call_multi(b, target, args, rets).into_iter().next()
+    }
+
+    pub fn call_multi(
+        &mut self,
+        b: Block,
+        target: u32,
+        args: Vec<Value>,
+        rets: Vec<Type>,
+    ) -> Vec<Value> {
+        let results: Vec<Value> = rets.into_iter().map(|ty| self.new_value(ty)).collect();
+        self.push(b, Inst::Call(results.clone(), target, args));
+        results
+    }
+
+    pub fn call_indirect(
+        &mut self,
+        b: Block,
+        params: Vec<Type>,
+        rets: Vec<Type>,
+        call_conv: u8,
+        callee: Value,
+        args: Vec<Value>,
+    ) -> Vec<Value> {
+        let results: Vec<Value> = rets.iter().copied().map(|ty| self.new_value(ty)).collect();
+        self.push(
+            b,
+            Inst::CallIndirect { results: results.clone(), params, rets, call_conv, callee, args },
+        );
+        results
     }
 
     pub fn ret(&mut self, b: Block, args: Vec<Value>) {

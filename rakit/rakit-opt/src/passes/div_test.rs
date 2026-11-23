@@ -29,11 +29,12 @@
 //! zero, so a negative `x` can have remainder zero when `x` is not a multiple
 //! of `C`, and the identity above does not hold.
 
+use std::collections::HashMap as FxHashMap;
+
 use rakit_codegen::cursor::{Cursor, FuncCursor};
 use rakit_codegen::ir::condcodes::IntCC;
 use rakit_codegen::ir::immediates::Imm64;
 use rakit_codegen::ir::{self, Inst, InstBuilder, Opcode, Value, types};
-use std::collections::HashMap as FxHashMap;
 
 /// How the remainder's zero-ness is consumed.
 enum UseSite {

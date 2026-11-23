@@ -22,11 +22,12 @@
 //! carried chain and measured slower, so it is off unless `RAKIT_UNROLL_CLONE`
 //! is set.
 
-use rakit_codegen::cursor::{Cursor, FuncCursor};
-use rakit_codegen::ir::{
-    self, condcodes::IntCC, immediates::Imm64, Block, Inst, InstBuilder, Opcode, Value,
-};
 use std::collections::{HashMap as FxHashMap, HashSet as FxHashSet};
+
+use rakit_codegen::cursor::{Cursor, FuncCursor};
+use rakit_codegen::ir::condcodes::IntCC;
+use rakit_codegen::ir::immediates::Imm64;
+use rakit_codegen::ir::{self, Block, Inst, InstBuilder, Opcode, Value};
 
 /// Number of loop iterations folded into one guarded step.
 pub const UNROLL_FACTOR: u64 = 128;
@@ -248,9 +249,7 @@ impl Forwarders {
             // The latch's parameters must not escape: substituting them with the
             // predecessor's arguments is only sound on this path, so if any other
             // block reads them the block cannot be removed.
-            if self.has_non_value_arg.contains(&latch)
-                || self.params_escape(func, latch)
-            {
+            if self.has_non_value_arg.contains(&latch) || self.params_escape(func, latch) {
                 continue;
             }
             return Some((pred, latch, target));
@@ -358,10 +357,8 @@ fn thread_forwarder(func: &mut ir::Function, pred: Block, latch: Block) -> bool 
     match &mut func.dfg.insts[pred_term] {
         ir::InstructionData::Jump { destination, .. } => *destination = new_call,
         ir::InstructionData::Brif { blocks, .. } => {
-            let idx = blocks
-                .iter()
-                .position(|b| b.block(&pool) == latch)
-                .expect("pred jumps to latch");
+            let idx =
+                blocks.iter().position(|b| b.block(&pool) == latch).expect("pred jumps to latch");
             blocks[idx] = new_call;
         }
         _ => unreachable!("successor edge must be a jump or brif"),
@@ -515,9 +512,7 @@ fn upper_bound(
                         if dom.dominates(taken, block, &func.layout)
                             && !dom.dominates(nottaken, block, &func.layout)
                         {
-                            if let Some(c) =
-                                upper_bound_from_icmp(func, cc, args[0], args[1], x)
-                            {
+                            if let Some(c) = upper_bound_from_icmp(func, cc, args[0], args[1], x) {
                                 return Some(c);
                             }
                         }
@@ -530,7 +525,13 @@ fn upper_bound(
     None
 }
 
-fn upper_bound_from_icmp(func: &ir::Function, cc: IntCC, a: Value, b: Value, x: Value) -> Option<u64> {
+fn upper_bound_from_icmp(
+    func: &ir::Function,
+    cc: IntCC,
+    a: Value,
+    b: Value,
+    x: Value,
+) -> Option<u64> {
     let a = func.dfg.resolve_aliases(a);
     let b = func.dfg.resolve_aliases(b);
     // `x < C` / `x <= C` (x on the left).
@@ -569,7 +570,9 @@ pub fn const_of(func: &ir::Function, v: Value) -> Option<u64> {
     let v = func.dfg.resolve_aliases(v);
     let ir::ValueDef::Result(inst, 0) = func.dfg.value_def(v) else { return None };
     match func.dfg.insts[inst] {
-        ir::InstructionData::UnaryImm { opcode: Opcode::Iconst, imm, .. } => Some(imm.bits() as u64),
+        ir::InstructionData::UnaryImm { opcode: Opcode::Iconst, imm, .. } => {
+            Some(imm.bits() as u64)
+        }
         _ => None,
     }
 }
@@ -615,7 +618,9 @@ fn analyze(func: &ir::Function) -> Option<Plan> {
             );
         }
         if blocks[0].block(&dfg.value_lists) != body {
-            if dbg { eprintln!("[unroll]     X: then-arm is not body"); }
+            if dbg {
+                eprintln!("[unroll]     X: then-arm is not body");
+            }
             continue;
         }
 
@@ -624,7 +629,9 @@ fn analyze(func: &ir::Function) -> Option<Plan> {
         let back_edges =
             loop_blocks.iter().filter(|&&b| successors(func, b).contains(&header)).count();
         if back_edges != 1 {
-            if dbg { eprintln!("[unroll]     X: back_edges={back_edges}"); }
+            if dbg {
+                eprintln!("[unroll]     X: back_edges={back_edges}");
+            }
             continue;
         }
 
@@ -632,19 +639,28 @@ fn analyze(func: &ir::Function) -> Option<Plan> {
         // parameter on one side and a loop-invariant value on the other.
         let cond = dfg.resolve_aliases(cond);
         let ir::ValueDef::Result(icmp_inst, 0) = dfg.value_def(cond) else {
-            if dbg { eprintln!("[unroll]     X: cond not an inst result"); }
+            if dbg {
+                eprintln!("[unroll]     X: cond not an inst result");
+            }
             continue;
         };
         let ir::InstructionData::IntCompare { cond: cc, args, opcode: _ } = dfg.insts[icmp_inst]
         else {
-            if dbg { eprintln!("[unroll]     X: cond not icmp: {:?}", dfg.insts[icmp_inst].opcode()); }
+            if dbg {
+                eprintln!("[unroll]     X: cond not icmp: {:?}", dfg.insts[icmp_inst].opcode());
+            }
             continue;
         };
         // Only increasing loops, so the wide step cannot overshoot the bound.
         let iv_left = match cc {
             IntCC::UnsignedLessThan | IntCC::UnsignedLessThanOrEqual => true,
             IntCC::UnsignedGreaterThan | IntCC::UnsignedGreaterThanOrEqual => false,
-            _ => { if dbg { eprintln!("[unroll]     X: cc={cc:?}"); } continue },
+            _ => {
+                if dbg {
+                    eprintln!("[unroll]     X: cc={cc:?}");
+                }
+                continue;
+            }
         };
         let (lhs, rhs) = (args[0], args[1]);
 
@@ -653,10 +669,20 @@ fn analyze(func: &ir::Function) -> Option<Plan> {
             _ => None,
         };
         let (iv_idx, iv, bound) = if iv_left {
-            let Some(i) = param_of(lhs) else { if dbg { eprintln!("[unroll]     X: lhs not header param"); } continue };
+            let Some(i) = param_of(lhs) else {
+                if dbg {
+                    eprintln!("[unroll]     X: lhs not header param");
+                }
+                continue;
+            };
             (i, lhs, rhs)
         } else {
-            let Some(i) = param_of(rhs) else { if dbg { eprintln!("[unroll]     X: rhs not header param"); } continue };
+            let Some(i) = param_of(rhs) else {
+                if dbg {
+                    eprintln!("[unroll]     X: rhs not header param");
+                }
+                continue;
+            };
             (i, rhs, lhs)
         };
         // The bound must be loop-invariant. A value defined inside the loop is
@@ -664,7 +690,9 @@ fn analyze(func: &ir::Function) -> Option<Plan> {
         // the header for a literal trip count.
         let loop_blocks = [header, body];
         if const_of(func, bound).is_none() && defined_in(func, bound, &loop_blocks) {
-            if dbg { eprintln!("[unroll]     X: bound not invariant"); }
+            if dbg {
+                eprintln!("[unroll]     X: bound not invariant");
+            }
             continue;
         }
 
@@ -676,26 +704,47 @@ fn analyze(func: &ir::Function) -> Option<Plan> {
         };
         let args: Vec<ir::BlockArg> = back_call.args(&dfg.value_lists).collect();
         if args.len() != dfg.block_params(header).len() {
-            if dbg { eprintln!("[unroll]     X: arity mismatch"); }
+            if dbg {
+                eprintln!("[unroll]     X: arity mismatch");
+            }
             continue;
         }
-        let ir::BlockArg::Value(step_val) = args[iv_idx] else { if dbg { eprintln!("[unroll]     X: step not value"); } continue };
+        let ir::BlockArg::Value(step_val) = args[iv_idx] else {
+            if dbg {
+                eprintln!("[unroll]     X: step not value");
+            }
+            continue;
+        };
         let step_val = dfg.resolve_aliases(step_val);
-        let ir::ValueDef::Result(step_inst, 0) = dfg.value_def(step_val) else { if dbg { eprintln!("[unroll]     X: step not inst result"); } continue };
+        let ir::ValueDef::Result(step_inst, 0) = dfg.value_def(step_val) else {
+            if dbg {
+                eprintln!("[unroll]     X: step not inst result");
+            }
+            continue;
+        };
         let ir::InstructionData::Binary { opcode: Opcode::Iadd, args: sargs, .. } =
             dfg.insts[step_inst]
         else {
-            if dbg { eprintln!("[unroll]     X: step not iadd"); }
+            if dbg {
+                eprintln!("[unroll]     X: step not iadd");
+            }
             continue;
         };
         let iv = dfg.resolve_aliases(iv);
         let delta = match (const_of(func, sargs[0]), const_of(func, sargs[1])) {
             (None, Some(d)) if dfg.resolve_aliases(sargs[0]) == iv => d,
             (Some(d), None) if dfg.resolve_aliases(sargs[1]) == iv => d,
-            _ => { if dbg { eprintln!("[unroll]     X: step not iv+const: sargs={sargs:?} iv={iv:?}"); } continue },
+            _ => {
+                if dbg {
+                    eprintln!("[unroll]     X: step not iv+const: sargs={sargs:?} iv={iv:?}");
+                }
+                continue;
+            }
         };
         if delta == 0 || delta > MAX_DELTA {
-            if dbg { eprintln!("[unroll]     X: delta={delta}"); }
+            if dbg {
+                eprintln!("[unroll]     X: delta={delta}");
+            }
             continue;
         }
 
@@ -909,11 +958,7 @@ fn analyze_affine(func: &ir::Function, plan: &Plan) -> Option<Vec<Option<Affine>
     let constant = |c: u64| Affine { coeffs: vec![0; n], c, atoms: Vec::new() };
     let as_const = |a: &Option<Affine>| -> Option<u64> {
         let a = a.as_ref()?;
-        if a.atoms.is_empty() && a.coeffs.iter().all(|&x| x == 0) {
-            Some(a.c)
-        } else {
-            None
-        }
+        if a.atoms.is_empty() && a.coeffs.iter().all(|&x| x == 0) { Some(a.c) } else { None }
     };
     // Build `op(x, imm)` as an atom when `x` is a pure linear form.
     let as_atom = |op: Opcode, x: &Option<Affine>, imm: u64| -> Option<Affine> {
@@ -996,10 +1041,9 @@ fn power(
     let dfg = &func.dfg;
     let n = dfg.block_params(plan.header).len();
     let back_args: Vec<Value> = match dfg.insts[plan.back_edge] {
-        ir::InstructionData::Jump { destination, .. } => destination
-            .args(&dfg.value_lists)
-            .filter_map(|a| a.as_value())
-            .collect(),
+        ir::InstructionData::Jump { destination, .. } => {
+            destination.args(&dfg.value_lists).filter_map(|a| a.as_value()).collect()
+        }
         _ => return None,
     };
     if back_args.len() != n {
@@ -1240,7 +1284,8 @@ fn detect_lane(func: &ir::Function, plan: &Plan, forms: &[Option<Affine>]) -> Op
     let a_next = dfg.resolve_aliases(back[a_idx]);
     let mn_param = dfg.resolve_aliases(params[mn_idx]);
     let ir::ValueDef::Result(sel_inst, _) = dfg.value_def(mn_step) else { return None };
-    let ir::InstructionData::Ternary { opcode: Opcode::Select, args, .. } = dfg.insts[sel_inst] else {
+    let ir::InstructionData::Ternary { opcode: Opcode::Select, args, .. } = dfg.insts[sel_inst]
+    else {
         return None;
     };
     let (arm1, arm2) = (dfg.resolve_aliases(args[1]), dfg.resolve_aliases(args[2]));
@@ -1292,10 +1337,9 @@ fn apply_lanes(func: &mut ir::Function, plan: &Plan, li: &LaneInfo) -> bool {
     // header must end in a brif whose arms are `body` and the loop exit.
     let Some(brif) = func.layout.last_inst(header) else { return false };
     let succs = match &func.dfg.insts[brif] {
-        ir::InstructionData::Brif { blocks, .. } => [
-            blocks[0].block(&func.dfg.value_lists),
-            blocks[1].block(&func.dfg.value_lists),
-        ],
+        ir::InstructionData::Brif { blocks, .. } => {
+            [blocks[0].block(&func.dfg.value_lists), blocks[1].block(&func.dfg.value_lists)]
+        }
         _ => return false,
     };
     let exit = if succs[0] == body {
@@ -1364,10 +1408,7 @@ fn apply_lanes(func: &mut ir::Function, plan: &Plan, li: &LaneInfo) -> bool {
             destination.args(&func.dfg.value_lists).collect()
         }
         ir::InstructionData::Brif { blocks, .. } => {
-            let arm = blocks
-                .iter()
-                .find(|bc| bc.block(&func.dfg.value_lists) == header)
-                .unwrap();
+            let arm = blocks.iter().find(|bc| bc.block(&func.dfg.value_lists) == header).unwrap();
             arm.args(&func.dfg.value_lists).collect()
         }
         _ => return false,
@@ -1567,7 +1608,12 @@ fn apply(func: &mut ir::Function, plan: &Plan, factor: u64) {
             match detect_lane(func, plan, &forms) {
                 Some(li) => eprintln!(
                     "[lane] MATCH iv={} a={} mn={} C={} bound={} bound%4={}",
-                    li.iv_idx, li.a_idx, li.mn_idx, li.c, li.bound, li.bound % 4
+                    li.iv_idx,
+                    li.a_idx,
+                    li.mn_idx,
+                    li.c,
+                    li.bound,
+                    li.bound % 4
                 ),
                 None => eprintln!("[lane] no match"),
             }
@@ -1590,8 +1636,7 @@ fn apply(func: &mut ir::Function, plan: &Plan, factor: u64) {
         let all_affine = back.iter().all(|&v| form_of(v).is_some());
         // Atoms (`i | 1`) have no closed form to fold over 128 steps; they stay on
         // the small partial factor so the code does not blow up.
-        let any_atoms =
-            back.iter().any(|&v| form_of(v).is_some_and(|f| !f.atoms.is_empty()));
+        let any_atoms = back.iter().any(|&v| form_of(v).is_some_and(|f| !f.atoms.is_empty()));
         if all_affine && !any_atoms {
             if let Some(rows) = power(func, plan, &forms, factor) {
                 let rows: Vec<Affine> = rows.into_iter().flatten().collect();
@@ -1620,10 +1665,9 @@ fn apply(func: &mut ir::Function, plan: &Plan, factor: u64) {
 /// The values passed back to the header, in parameter order.
 fn back_states(func: &ir::Function, plan: &Plan) -> Vec<Value> {
     match func.dfg.insts[plan.back_edge] {
-        ir::InstructionData::Jump { destination, .. } => destination
-            .args(&func.dfg.value_lists)
-            .filter_map(|a| a.as_value())
-            .collect(),
+        ir::InstructionData::Jump { destination, .. } => {
+            destination.args(&func.dfg.value_lists).filter_map(|a| a.as_value()).collect()
+        }
         _ => Vec::new(),
     }
 }
@@ -1657,10 +1701,8 @@ fn compose(
     if back.len() != n {
         return None;
     }
-    let step: Vec<Option<Affine>> = back
-        .iter()
-        .map(|&v| forms[dfg.resolve_aliases(v).as_u32() as usize].clone())
-        .collect();
+    let step: Vec<Option<Affine>> =
+        back.iter().map(|&v| forms[dfg.resolve_aliases(v).as_u32() as usize].clone()).collect();
 
     let mut rows: Vec<Vec<Option<Affine>>> = Vec::with_capacity(steps as usize);
     rows.push(step.clone());
@@ -1677,7 +1719,12 @@ fn compose(
 /// a compile-time constant (and `iv + last` cannot wrap) this is a single
 /// compare against a constant limit, instead of the general no-wrap test
 /// combined with the last-iteration test.
-fn build_guard(pos: &mut FuncCursor<'_>, plan: &Plan, last: u64, bound_const: Option<u64>) -> Value {
+fn build_guard(
+    pos: &mut FuncCursor<'_>,
+    plan: &Plan,
+    last: u64,
+    bound_const: Option<u64>,
+) -> Value {
     let iv = plan.iv;
     if let Some(b) = bound_const {
         if b.checked_add(last).is_some() {
@@ -1726,7 +1773,8 @@ fn apply_partial(func: &mut ir::Function, plan: &Plan, factor: u64, forms: &[Opt
     // Snapshot the body before inserting anything, so the clones copy the loop
     // body alone and not the precomputation this function adds to it.
     let body_insts: Vec<Inst> = func.layout.block_insts(plan.body).collect();
-    let single_args: Vec<ir::BlockArg> = (0..n).map(|j| back_arg(func, plan.back_edge, j)).collect();
+    let single_args: Vec<ir::BlockArg> =
+        (0..n).map(|j| back_arg(func, plan.back_edge, j)).collect();
 
     // Guard plus the closed-form affine values, at the top of the body. These are
     // independent of each other, so the chain they replace disappears even though
@@ -1738,7 +1786,8 @@ fn apply_partial(func: &mut ir::Function, plan: &Plan, factor: u64, forms: &[Opt
         let guard = build_guard(&mut pos, plan, last, bound_const);
         let pre: Vec<Vec<Option<Value>>> = (0..factor as usize)
             .map(|k| {
-                at[k].iter()
+                at[k]
+                    .iter()
                     .map(|f| f.as_ref().map(|a| build_affine(&mut pos, &header_params, a)))
                     .collect()
             })

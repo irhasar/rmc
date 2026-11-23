@@ -76,6 +76,11 @@ fn default_val(ty: Type) -> Val {
 }
 
 fn eval_bin(op: BinOp, ty: Type, a: Val, b: Val) -> Result<Val, String> {
+    if ty == Type::I128 {
+        return int_sem::eval_bin_i128(op, a.as_u128(), b.as_u128())
+            .map(Val::I128)
+            .ok_or_else(|| format!("I128 op {op:?} failed (division by zero?)"));
+    }
     if ty.is_float() {
         let (x, y) = (a.as_f(), b.as_f());
         let r = match op {
@@ -144,9 +149,7 @@ fn addr_of(base: u64, offset: i32) -> Result<usize, String> {
 
 fn read_scalar(mem: &[u8], addr: usize, ty: Type) -> Result<Val, String> {
     let size = size_of(ty);
-    let end = addr
-        .checked_add(size)
-        .ok_or_else(|| "address overflow".to_string())?;
+    let end = addr.checked_add(size).ok_or_else(|| "address overflow".to_string())?;
     if end > mem.len() {
         return Err(format!("load at {addr} (+{size}) is out of bounds"));
     }
@@ -167,9 +170,7 @@ fn read_scalar(mem: &[u8], addr: usize, ty: Type) -> Result<Val, String> {
 
 fn write_scalar(mem: &mut [u8], addr: usize, ty: Type, val: Val) -> Result<(), String> {
     let size = size_of(ty);
-    let end = addr
-        .checked_add(size)
-        .ok_or_else(|| "address overflow".to_string())?;
+    let end = addr.checked_add(size).ok_or_else(|| "address overflow".to_string())?;
     if end > mem.len() {
         return Err(format!("store at {addr} (+{size}) is out of bounds"));
     }
@@ -187,35 +188,36 @@ fn write_scalar(mem: &mut [u8], addr: usize, ty: Type, val: Val) -> Result<(), S
     Ok(())
 }
 
-fn eval(
-    env: &[Option<Val>],
-    inst: &Inst,
-    mem: &mut [u8],
-    bases: &[usize],
-) -> Result<Val, String> {
+fn eval(env: &[Option<Val>], inst: &Inst, mem: &mut [u8], bases: &[usize]) -> Result<Val, String> {
     match inst {
         Inst::Nop(_, ty) => Ok(default_val(*ty)),
-        Inst::Iconst(_, ty, v) => Ok(if *ty == Type::Bool {
-            Val::B(*v != 0)
-        } else {
-            Val::I(int_sem::wrap(*ty, *v))
-        }),
+        Inst::Iconst(_, ty, v) => {
+            Ok(if *ty == Type::Bool { Val::B(*v != 0) } else { Val::I(int_sem::wrap(*ty, *v)) })
+        }
         Inst::F32const(_, v) => Ok(Val::F32(*v)),
         Inst::F64const(_, v) => Ok(Val::F64(*v)),
         Inst::Copy(_, _, x) => get(env, *x),
         Inst::Call(..) => Err("external call is not supported by the interpreter".to_string()),
-        Inst::Bin(_, op, ty, x, y) => {
-            eval_bin(*op, *ty, get(env, *x)?, get(env, *y)?)
+        Inst::CallIndirect { .. } => Err("indirect call is not supported by eval".to_string()),
+        Inst::Bin(_, op, ty, x, y) => eval_bin(*op, *ty, get(env, *x)?, get(env, *y)?),
+        Inst::Icmp(_, cc, ty, x, y) => {
+            let a = get(env, *x)?;
+            let b = get(env, *y)?;
+            Ok(Val::B(if *ty == Type::I128 {
+                int_sem::eval_icmp_i128(*cc, a.as_u128(), b.as_u128())
+            } else {
+                int_sem::eval_icmp(*cc, *ty, a.as_i(), b.as_i())
+            }))
         }
-        Inst::Icmp(_, cc, ty, x, y) => Ok(Val::B(int_sem::eval_icmp(
-            *cc,
-            *ty,
-            get(env, *x)?.as_i(),
-            get(env, *y)?.as_i(),
-        ))),
-        Inst::Fcmp(_, cc, _, x, y) => Ok(Val::B(eval_fcmp(*cc, get(env, *x)?.as_f(), get(env, *y)?.as_f()))),
+        Inst::Fcmp(_, cc, _, x, y) => {
+            Ok(Val::B(eval_fcmp(*cc, get(env, *x)?.as_f(), get(env, *y)?.as_f())))
+        }
         Inst::Select(_, _, c, x, y) => {
-            if get(env, *c)?.as_bool() { get(env, *x) } else { get(env, *y) }
+            if get(env, *c)?.as_bool() {
+                get(env, *x)
+            } else {
+                get(env, *y)
+            }
         }
         Inst::StackAddr(_, slot, offset) => {
             let base = *bases
@@ -244,6 +246,30 @@ fn eval(
 
 /// Execute `func` with `args` and return its return values.
 pub fn run(func: &Function, args: &[Val]) -> Result<Vec<Val>, String> {
+    run_with(func, args, &|_, _| {
+        Err("external call is not supported by the interpreter".to_string())
+    })
+}
+
+pub type ExternalFn<'a> = dyn Fn(u32, &[Val]) -> Result<Vec<Val>, String> + 'a;
+pub type IndirectFn<'a> = dyn Fn(Val, &[Val]) -> Result<Vec<Val>, String> + 'a;
+
+pub fn run_with(
+    func: &Function,
+    args: &[Val],
+    externs: &ExternalFn<'_>,
+) -> Result<Vec<Val>, String> {
+    run_with_indirect(func, args, externs, &|_, _| {
+        Err("indirect call is not supported by the interpreter".to_string())
+    })
+}
+
+pub fn run_with_indirect(
+    func: &Function,
+    args: &[Val],
+    externs: &ExternalFn<'_>,
+    indirect: &IndirectFn<'_>,
+) -> Result<Vec<Val>, String> {
     let mut env: Vec<Option<Val>> = vec![None; func.values.len()];
     let (bases, mut mem) = stack_layout(func);
 
@@ -276,6 +302,37 @@ pub fn run(func: &Function, args: &[Val]) -> Result<Vec<Val>, String> {
                     ret = Some(a.clone());
                     break;
                 }
+                Inst::Call(results, target, args) => {
+                    let values =
+                        args.iter().map(|v| get(&env, *v)).collect::<Result<Vec<_>, _>>()?;
+                    let returned = externs(*target, &values)?;
+                    if returned.len() != results.len() {
+                        return Err(format!(
+                            "external call returned {} values for {} results",
+                            returned.len(),
+                            results.len()
+                        ));
+                    }
+                    for (result, value) in results.iter().zip(returned) {
+                        env[result.0 as usize] = Some(value);
+                    }
+                }
+                Inst::CallIndirect { results, callee, args, .. } => {
+                    let callee = get(&env, *callee)?;
+                    let values =
+                        args.iter().map(|v| get(&env, *v)).collect::<Result<Vec<_>, _>>()?;
+                    let returned = indirect(callee, &values)?;
+                    if returned.len() != results.len() {
+                        return Err(format!(
+                            "indirect call returned {} values for {} results",
+                            returned.len(),
+                            results.len()
+                        ));
+                    }
+                    for (result, value) in results.iter().zip(returned) {
+                        env[result.0 as usize] = Some(value);
+                    }
+                }
                 _ => {
                     let v = eval(&env, inst, &mut mem, &bases)?;
                     if let Some(r) = inst.result_value() {
@@ -291,7 +348,11 @@ pub fn run(func: &Function, args: &[Val]) -> Result<Vec<Val>, String> {
         if let Some((t, a)) = next {
             let params = func.block(t).params.clone();
             if params.len() != a.len() {
-                return Err(format!("branch to {t:?} passes {} args for {} params", a.len(), params.len()));
+                return Err(format!(
+                    "branch to {t:?} passes {} args for {} params",
+                    a.len(),
+                    params.len()
+                ));
             }
             let mut new_vals = Vec::with_capacity(a.len());
             for v in &a {

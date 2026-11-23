@@ -1,5 +1,5 @@
 use rakit_ir::ir::{BinOp, Inst, Type};
-use rakit_ir::{run, sroa, verify, Builder, Val};
+use rakit_ir::{Builder, Val, run, sroa, verify};
 
 #[test]
 fn promotes_straight_line_slot() {
@@ -51,14 +51,8 @@ fn promotes_diamond_with_phi() {
     assert!(sroa::run(&mut f));
     assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
     assert!(f.stack_slots.is_empty());
-    assert_eq!(
-        run(&f, &[Val::I(0), Val::B(true)]).unwrap(),
-        vec![Val::I(10)]
-    );
-    assert_eq!(
-        run(&f, &[Val::I(0), Val::B(false)]).unwrap(),
-        vec![Val::I(20)]
-    );
+    assert_eq!(run(&f, &[Val::I(0), Val::B(true)]).unwrap(), vec![Val::I(10)]);
+    assert_eq!(run(&f, &[Val::I(0), Val::B(false)]).unwrap(), vec![Val::I(20)]);
     let _ = x;
 }
 
@@ -185,4 +179,46 @@ fn promotes_i128_slot() {
     assert!(f.stack_slots.is_empty());
     let value = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210u128;
     assert_eq!(run(&f, &[Val::I128(value)]).unwrap(), vec![Val::I128(value)]);
+}
+
+#[test]
+fn promotes_dynamic_one_element_slot() {
+    let mut b = Builder::new(vec![Type::I64], vec![Type::I64]);
+    let e = b.func().entry;
+    let x = b.func().block(e).params[0];
+    let slot = b.add_stack_slot(8, 8);
+    let base = b.stack_addr(e, slot, 0);
+    let zero = b.iconst(e, Type::I64, 0);
+    let eight = b.iconst(e, Type::I64, 8);
+    let scaled = b.bin(e, BinOp::Mul, Type::I64, zero, eight);
+    let addr = b.bin(e, BinOp::Add, Type::I64, base, scaled);
+    b.store(e, Type::I64, addr, 0, x);
+    let y = b.load(e, Type::I64, addr, 0);
+    b.ret(e, vec![y]);
+
+    let mut f = b.into_func();
+    assert!(sroa::run(&mut f));
+    assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
+    assert!(f.stack_slots.is_empty());
+    assert_eq!(run(&f, &[Val::I(37)]).unwrap(), vec![Val::I(37)]);
+}
+
+#[test]
+fn does_not_promote_dynamic_multi_element_slot() {
+    let mut b = Builder::new(vec![Type::I64], vec![Type::I64]);
+    let e = b.func().entry;
+    let x = b.func().block(e).params[0];
+    let slot = b.add_stack_slot(16, 8);
+    let base = b.stack_addr(e, slot, 0);
+    let zero = b.iconst(e, Type::I64, 0);
+    let eight = b.iconst(e, Type::I64, 8);
+    let scaled = b.bin(e, BinOp::Mul, Type::I64, zero, eight);
+    let addr = b.bin(e, BinOp::Add, Type::I64, base, scaled);
+    b.store(e, Type::I64, addr, 0, x);
+    let y = b.load(e, Type::I64, addr, 0);
+    b.ret(e, vec![y]);
+
+    let mut f = b.into_func();
+    sroa::run(&mut f);
+    assert_eq!(f.stack_slots.len(), 1);
 }

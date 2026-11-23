@@ -64,38 +64,34 @@ fn convert_one(func: &mut Function) -> bool {
         let Some(else_end) = arm_end(&func.blocks[eb]) else {
             continue;
         };
-        let (join, then_values, else_values, value_tys, is_return) =
-            match (&then_end, &else_end) {
-                (ArmEnd::Jump(tj, tv), ArmEnd::Jump(ej, ev)) => {
-                    if tj != ej || tv.len() != ev.len() || succs[tb] != 1 || succs[eb] != 1 {
-                        continue;
-                    }
-                    let jb = tj.0 as usize;
-                    if jb >= block_count || jb == head || jb == tb || jb == eb {
-                        continue;
-                    }
-                    let params = &func.blocks[jb].params;
-                    if params.len() != tv.len() {
-                        continue;
-                    }
-                    let tys: Vec<Type> = params
-                        .iter()
-                        .map(|p| func.values[p.0 as usize])
-                        .collect();
-                    (Some(*tj), tv.clone(), ev.clone(), tys, false)
+        let (join, then_values, else_values, value_tys, is_return) = match (&then_end, &else_end) {
+            (ArmEnd::Jump(tj, tv), ArmEnd::Jump(ej, ev)) => {
+                if tj != ej || tv.len() != ev.len() || succs[tb] != 1 || succs[eb] != 1 {
+                    continue;
                 }
-                (ArmEnd::Return(tv), ArmEnd::Return(ev)) => {
-                    if tv.len() != ev.len()
-                        || tv.len() != func.ret.len()
-                        || succs[tb] != 0
-                        || succs[eb] != 0
-                    {
-                        continue;
-                    }
-                    (None, tv.clone(), ev.clone(), func.ret.clone(), true)
+                let jb = tj.0 as usize;
+                if jb >= block_count || jb == head || jb == tb || jb == eb {
+                    continue;
                 }
-                _ => continue,
-            };
+                let params = &func.blocks[jb].params;
+                if params.len() != tv.len() {
+                    continue;
+                }
+                let tys: Vec<Type> = params.iter().map(|p| func.values[p.0 as usize]).collect();
+                (Some(*tj), tv.clone(), ev.clone(), tys, false)
+            }
+            (ArmEnd::Return(tv), ArmEnd::Return(ev)) => {
+                if tv.len() != ev.len()
+                    || tv.len() != func.ret.len()
+                    || succs[tb] != 0
+                    || succs[eb] != 0
+                {
+                    continue;
+                }
+                (None, tv.clone(), ev.clone(), func.ret.clone(), true)
+            }
+            _ => continue,
+        };
         let Some(then_plan) = analyze_arm(&func.blocks[tb], then_values) else {
             continue;
         };
@@ -123,16 +119,8 @@ fn convert_one(func: &mut Function) -> bool {
         let Some(mut else_new) = clone_arm(func, &else_plan, &mut else_map) else {
             continue;
         };
-        let then_vals: Vec<Value> = then_plan
-            .values
-            .iter()
-            .map(|v| remap(*v, &then_map))
-            .collect();
-        let else_vals: Vec<Value> = else_plan
-            .values
-            .iter()
-            .map(|v| remap(*v, &else_map))
-            .collect();
+        let then_vals: Vec<Value> = then_plan.values.iter().map(|v| remap(*v, &then_map)).collect();
+        let else_vals: Vec<Value> = else_plan.values.iter().map(|v| remap(*v, &else_map)).collect();
         let mut selects = Vec::with_capacity(value_tys.len());
         let mut sels = Vec::with_capacity(value_tys.len());
         for i in 0..value_tys.len() {
@@ -151,9 +139,7 @@ fn convert_one(func: &mut Function) -> bool {
         if is_return {
             head_block.insts.push(Inst::Return(sels));
         } else {
-            head_block
-                .insts
-                .push(Inst::Jump(join.expect("jump arm has a join"), sels));
+            head_block.insts.push(Inst::Jump(join.expect("jump arm has a join"), sels));
         }
         remove_blocks(func, &[tb, eb]);
         remove_values(func, &removed_values);
@@ -221,11 +207,7 @@ fn analyze_arm(block: &BlockData, values: Vec<Value>) -> Option<ArmPlan> {
         }
         insts.push(inst.clone());
     }
-    Some(ArmPlan {
-        insts,
-        values,
-        defined,
-    })
+    Some(ArmPlan { insts, values, defined })
 }
 
 fn is_cheap(inst: &Inst) -> bool {
@@ -238,10 +220,9 @@ fn is_cheap(inst: &Inst) -> bool {
         | Inst::Icmp(..)
         | Inst::Fcmp(..)
         | Inst::Select(..) => true,
-        Inst::Bin(_, op, _, _, _) => !matches!(
-            op,
-            BinOp::Sdiv | BinOp::Udiv | BinOp::Srem | BinOp::Urem | BinOp::Fdiv
-        ),
+        Inst::Bin(_, op, _, _, _) => {
+            !matches!(op, BinOp::Sdiv | BinOp::Udiv | BinOp::Srem | BinOp::Urem | BinOp::Fdiv)
+        }
         _ => false,
     }
 }
@@ -270,9 +251,7 @@ fn values_dead_outside(
 }
 
 fn uses_other_arm(plan: &ArmPlan, other: &HashSet<Value>) -> bool {
-    plan.insts
-        .iter()
-        .any(|inst| inst.operands().iter().any(|v| other.contains(v)))
+    plan.insts.iter().any(|inst| inst.operands().iter().any(|v| other.contains(v)))
         || plan.values.iter().any(|v| other.contains(v))
 }
 
@@ -288,11 +267,7 @@ fn clone_arm(
     Some(out)
 }
 
-fn clone_inst(
-    func: &mut Function,
-    inst: &Inst,
-    map: &mut HashMap<Value, Value>,
-) -> Option<Inst> {
+fn clone_inst(func: &mut Function, inst: &Inst, map: &mut HashMap<Value, Value>) -> Option<Inst> {
     let old = inst.result_value()?;
     let ty = *func.values.get(old.0 as usize)?;
     let new = new_value(func, ty);
@@ -303,20 +278,12 @@ fn clone_inst(
         Inst::F64const(_, v) => Inst::F64const(new, *v),
         Inst::Copy(_, ty, x) => Inst::Copy(new, *ty, remap(*x, map)),
         Inst::Bin(_, op, ty, x, y) => Inst::Bin(new, *op, *ty, remap(*x, map), remap(*y, map)),
-        Inst::Icmp(_, cc, ty, x, y) => {
-            Inst::Icmp(new, *cc, *ty, remap(*x, map), remap(*y, map))
+        Inst::Icmp(_, cc, ty, x, y) => Inst::Icmp(new, *cc, *ty, remap(*x, map), remap(*y, map)),
+        Inst::Fcmp(_, cc, ty, x, y) => Inst::Fcmp(new, *cc, *ty, remap(*x, map), remap(*y, map)),
+        Inst::Call(..) | Inst::CallIndirect { .. } => return None,
+        Inst::Select(_, ty, c, x, y) => {
+            Inst::Select(new, *ty, remap(*c, map), remap(*x, map), remap(*y, map))
         }
-        Inst::Fcmp(_, cc, ty, x, y) => {
-            Inst::Fcmp(new, *cc, *ty, remap(*x, map), remap(*y, map))
-        }
-        Inst::Call(..) => return None,
-        Inst::Select(_, ty, c, x, y) => Inst::Select(
-            new,
-            *ty,
-            remap(*c, map),
-            remap(*x, map),
-            remap(*y, map),
-        ),
         Inst::StackAddr(..)
         | Inst::Load(..)
         | Inst::Store(..)
@@ -337,4 +304,3 @@ fn new_value(func: &mut Function, ty: Type) -> Value {
     func.values.push(ty);
     v
 }
-

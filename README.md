@@ -31,7 +31,7 @@ kualitas codegen, bukan semantik.
 `rakit/vendor/` (paket `rakit-codegen`, `rakit-frontend`, `rakit-object`,
 dan seterusnya), sehingga tidak ada lagi dependensi ke paket eksternal bernama
 lama. Sebaliknya, `cg_clif_upstream/` sengaja **tidak diubah** — tetap cg_clif
-asli dengan Cranelift asli, sebagai baseline pembanding.
+asli dengan backend upstream, sebagai baseline pembanding.
 
 ## Arsitektur
 
@@ -58,15 +58,23 @@ mandiri (tanpa dependensi ke backend), verifier (definisi tunggal, dominasi,
 tipe), optimizer pertama (constant folding, branch folding, DCE), dan
 interpreter referensi untuk tes.
 
-Jembatan CLIF↔RIR ada di `rakit-opt/src/rir.rs`. Jembatan ini menerima subset
-scalar (konstanta, aritmetika int/float, `icmp`/`fcmp`, `select`, parameter
-blok, `jump`/`brif`, `return`; tanpa call/memori/stack slot/global) dan menolak
-sisanya, sehingga fungsi yang tidak didukung dibiarkan apa adanya. Pass
-`RirPass` menjalankan round-trip ini dan nonaktif secara default; aktifkan
-dengan `RAKIT_RIR=1`. `RAKIT_RIR_FORCE=1` memaksa export ulang tanpa perubahan
-(untuk validasi), `RAKIT_RIR_DEBUG=1` mencetak keputusan per fungsi.
+Jembatan CLIF↔RIR ada di `rakit-opt/src/rir.rs`. Jembatan ini menerima
+konstanta, aritmetika int/float (termasuk `I128`), `icmp`/`fcmp`, `select`,
+parameter blok, `jump`/`brif`, `return`, stack slot tetap dengan load/store
+skalar, direct call, indirect call, libcall/known-symbol, serta call dengan
+nol, satu, atau banyak hasil. Target dan signature call dipertahankan saat
+import/export; call convention indirect ikut disimpan. Fungsi yang memakai
+fitur di luar subset (mis. global value, dynamic stack slot, exception edge)
+ditolak dan dibiarkan apa adanya.
 
-Optimizer RIR memakai identitas yang belum tentu ada di egraph Cranelift:
+Pass `RirPass` berjalan default untuk **crate executable pengguna**; crate
+standard library (`core`, `std`, `alloc`, `compiler_builtins`, `unwind`, dan
+`rustc_*`) dilewati sampai jembatannya divalidasi penuh terhadap std.
+`RAKIT_RIR=1` memaksa aktif, `RAKIT_NO_RIR=1` memaksa nonaktif.
+`RAKIT_RIR_FORCE=1` memaksa export ulang tanpa perubahan (untuk validasi),
+`RAKIT_RIR_DEBUG=1` mencetak keputusan per fungsi.
+
+Optimizer RIR memakai identitas yang belum tentu ada di egraph backend upstream:
 `x - x`, `x ^ x`, `x & x`, `x | x`, `icmp x, x`, `select(c, x, x)`, dan
 `brif` ke target yang sama. Dengan `RAKIT_RIR=1` ini benar-benar mengubah kode
 (mis. `x & x` → `x`) dan output tetap sama dengan build normal.
@@ -138,25 +146,57 @@ escape, store ke alamat tak dikenal, atau akses konstanta di luar batas slot.
 
 Pass `sroa` (`rakit-ir/src/sroa.rs`) mempromosikan stack slot skalar menjadi
 nilai SSA. Slot hanya dipromosikan bila alamatnya tidak escape dan semua akses
-berupa load/store skalar dengan offset konstan. Phi dibuat sebagai block
-parameter di dominance-frontier join, lalu rename pada dominator tree mengganti
-load dengan nilai SSA saat ini dan membuang store. Slot dengan alamat dinamis,
-load sebelum store, atau akses yang saling tumpang tindih tidak dipromosikan.
-Slot yang tidak lagi punya `StackAddr` dihapus dan slot lain dinomori ulang.
+berupa load/store skalar. Offset konstan dipromosikan per lokasi; alamat
+dinamis juga dipromosikan bila slot hanya berisi **satu elemen** dengan ukuran
+sama dengan tipe akses, karena indeks yang valid untuk slot seperti itu pasti
+nol (indeks lain adalah out-of-bounds, yaitu perilaku tak terdefinisi). Phi
+dibuat sebagai block parameter di dominance-frontier join, lalu rename pada
+dominator tree mengganti load dengan nilai SSA saat ini dan membuang store.
+Load sebelum store, akses yang saling tumpang tindih, dan indeks dinamis ke
+slot multi-elemen tidak dipromosikan. Slot yang tidak lagi punya `StackAddr`
+dihapus dan slot lain dinomori ulang.
 
 RIR juga mendukung memori 16 byte lewat `Type::I128` (load/store 16 byte,
-forwarding, DSE, dan SROA). Operasi aritmetika `I128` tidak didukung di RIR;
-hanya pemindahan nilai dan memori.
+forwarding, DSE, dan SROA). Aritmetika `I128` memakai semantik wrapping 128-bit
+di `int_sem::eval_bin_i128`, dan perbandingan memakai `eval_icmp_i128`; baik
+interpreter maupun folder konstan memakai jalur yang sama.
 
-RIR juga mendukung direct external call lewat `Inst::Call` dan tabel
-`externals` (namespace/index plus signature). Bridge mempertahankan target dan
-signature saat import/export. Call adalah barrier untuk DCE; slot yang
-alamatnya dikirim ke call dianggap escape sehingga tidak di-forward atau
-dipromosikan. Karena setiap `StackAddr` hanya menunjuk satu slot, slot-slot RIR
-selalu disjoint dan tidak ada alias antarslot.
+RIR mendukung direct external call lewat `Inst::Call`, indirect call lewat
+`Inst::CallIndirect`, dan tabel `externals` dengan target user, libcall, atau
+known-symbol plus signature (termasuk multi-return). Bridge mempertahankan
+target, call convention, jumlah parameter, dan jumlah hasil saat import/export.
+Call adalah barrier untuk DCE; slot yang alamatnya dikirim ke call dianggap
+escape sehingga tidak di-forward atau dipromosikan. Karena setiap `StackAddr`
+hanya menunjuk satu slot, slot-slot RIR selalu disjoint dan tidak ada alias
+antarslot. Interpreter menyediakan callback `run_with` untuk call langsung dan
+`run_with_indirect` untuk call tidak langsung, sehingga semantik call bisa diuji
+tanpa menjalankan kode native.
 
 Pipeline RIR sekarang:
 `simplify → optimize → mem_forward → optimize → sroa → optimize → div_test → if_convert → gvn → licm → optimize`.
+
+## Backend instruction selection dan register allocation
+
+`rakit-ir/src/backend/` berisi jalur backend alternatif di atas RIR:
+
+- `mach.rs`: machine IR sederhana (`MachFunction`, `MachInst`, `Operand`,
+  `VReg`) dengan mov, binop, compare, setcc, select, branch, jump, dan return.
+- `mod.rs`: trait `InstructionSelector` dan `RegisterAllocator`, plus
+  `BackendError`. Keduanya object-safe, sehingga implementasi lain bisa
+  ditukar tanpa mengubah pemanggil.
+- `isel.rs`: `RirSelector` menurunkan subset integer RIR ke machine IR.
+- `regalloc.rs`: `LinearScan` melakukan liveness, graph-coloring, dan spill ke
+  slot; hasilnya memetakan setiap `VReg` ke register fisik atau spill slot.
+- `exec.rs`: interpreter machine IR untuk membuktikan semantik hasil seleksi
+  dan alokasi, termasuk jalur spill.
+
+Aktifkan validasi ini dengan `RAKIT_CUSTOM_BACKEND=1`; `RirPass` akan
+menjalankan selector dan register allocator untuk setiap fungsi RIR yang
+didukung dan mencetak statistik dengan `RAKIT_RIR_DEBUG=1`. Jalur ini adalah
+pembuktian backend di belakang trait; emitter produksi masih CLIF sampai
+seluruh instruction set dan ABI selesai. Tes ada di
+`rakit-ir/tests/backend.rs` (aritmetika, branch, select, spill, penolakan
+memori/`I128`, dan object-safety trait).
 
 ## Build
 
@@ -248,4 +288,4 @@ Kode di repo ini dilisensikan **Apache-2.0**; lihat `LICENSE`.
 pendistribusian, termasuk untuk keperluan komersial, dengan kewajiban
 mempertahankan notice lisensi dan mencantumkan perubahan. Daftar perubahan
 terhadap pustaka Rakit ada di `REPORT.md` §2 dan §8; `cg_clif_upstream/` tetap
-memakai Cranelift asli.
+memakai backend upstream.

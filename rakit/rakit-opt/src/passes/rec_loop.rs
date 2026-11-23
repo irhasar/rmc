@@ -9,7 +9,8 @@
 //! The rewrite is only applied when every piece matches exactly (self-call,
 //! identity base, `+` of the two call results), so it is conservative.
 use rakit_codegen::cursor::{Cursor, FuncCursor};
-use rakit_codegen::ir::{self, condcodes::IntCC, Block, Inst, InstBuilder, Opcode, Value};
+use rakit_codegen::ir::condcodes::IntCC;
+use rakit_codegen::ir::{self, Block, Inst, InstBuilder, Opcode, Value};
 
 pub fn run(func: &mut ir::Function) {
     if std::env::var_os("RAKIT_NO_REC_LOOP").is_some() {
@@ -41,7 +42,8 @@ fn try_match(func: &ir::Function) -> Option<Pat> {
         return None;
     }
     let h = jump_target(func, entry)?;
-    let ir::InstructionData::Brif { arg: cond, blocks, .. } = dfg.insts[func.layout.last_inst(h)?]
+    let ir::InstructionData::Brif { arg: cond, blocks, .. } =
+        dfg.insts[func.layout.last_inst(h)?]
     else {
         return None;
     };
@@ -70,7 +72,8 @@ fn try_match(func: &ir::Function) -> Option<Pat> {
     }
     let sum = dfg.resolve_aliases(rargs[0]);
     let ir::ValueDef::Result(si, _) = dfg.value_def(sum) else { return None };
-    let ir::InstructionData::Binary { opcode: Opcode::Iadd, args: sargs, .. } = dfg.insts[si] else {
+    let ir::InstructionData::Binary { opcode: Opcode::Iadd, args: sargs, .. } = dfg.insts[si]
+    else {
         return None;
     };
     let (sa, sb) = (dfg.resolve_aliases(sargs[0]), dfg.resolve_aliases(sargs[1]));
@@ -149,7 +152,8 @@ fn is_self(func: &ir::Function, fr: ir::FuncRef) -> bool {
 }
 
 fn jump_target(func: &ir::Function, block: Block) -> Option<Block> {
-    let ir::InstructionData::Jump { destination, .. } = func.dfg.insts[func.layout.last_inst(block)?]
+    let ir::InstructionData::Jump { destination, .. } =
+        func.dfg.insts[func.layout.last_inst(block)?]
     else {
         return None;
     };
@@ -166,7 +170,11 @@ fn ret_args<'a>(func: &'a ir::Function, block: Block) -> Option<&'a [Value]> {
 }
 
 /// Match a block that holds exactly one `call F(n - c)` and then jumps on.
-fn call_sub(func: &ir::Function, block: Block, n: Value) -> Option<(ir::FuncRef, Value, i64, Block)> {
+fn call_sub(
+    func: &ir::Function,
+    block: Block,
+    n: Value,
+) -> Option<(ir::FuncRef, Value, i64, Block)> {
     let next = jump_target(func, block)?;
     let mut found = None;
     for inst in func.layout.block_insts(block) {

@@ -14,9 +14,12 @@
 //! restricted to stack slots whose address never escapes the function, so no
 //! call or indirect store can observe the slot between the store and the load.
 
-use rakit_codegen::cursor::{Cursor, FuncCursor};
-use rakit_codegen::ir::{self, Block, Inst, MemFlagsData, Opcode, StackSlot, Value, types, InstBuilder};
 use std::collections::{HashMap as FxHashMap, HashSet as FxHashSet};
+
+use rakit_codegen::cursor::{Cursor, FuncCursor};
+use rakit_codegen::ir::{
+    self, Block, Inst, InstBuilder, MemFlagsData, Opcode, StackSlot, Value, types,
+};
 
 /// A memory location a store writes or a load reads: either a private stack
 /// slot or a non-escaping pointer value, each with a byte offset.
@@ -105,7 +108,8 @@ fn slot_of_resolved(dfg: &ir::DataFlowGraph, arg: Value) -> Option<StackSlot> {
 fn mem_key(func: &ir::Function, inst: Inst, addr: Value) -> Option<Key> {
     let addr = func.dfg.resolve_aliases(addr);
     if let ir::ValueDef::Result(def_inst, 0) = func.dfg.value_def(addr) {
-        if let ir::InstructionData::StackAddr { stack_slot, offset, .. } = func.dfg.insts[def_inst] {
+        if let ir::InstructionData::StackAddr { stack_slot, offset, .. } = func.dfg.insts[def_inst]
+        {
             let off = i64::from(offset) + offset_of(func, inst)?;
             return Some((Base::Slot(stack_slot), off));
         }
@@ -120,7 +124,6 @@ fn tracked(key: &Key, private: &FxHashSet<StackSlot>, ptr_bases: &FxHashSet<Valu
         Base::Ptr(p) => ptr_bases.contains(&p),
     }
 }
-
 
 /// The two escape analyses plus the set of byte ranges any load reads.
 ///
@@ -170,7 +173,8 @@ fn analyze(func: &ir::Function) -> Bases {
             // escaping address by this pass, so treat it as one: otherwise a load
             // that reads the slot through the parameter is invisible and the
             // store it depends on is wrongly deleted.
-            for dest in dfg.insts[inst].branch_destination(&dfg.jump_tables, &dfg.exception_tables) {
+            for dest in dfg.insts[inst].branch_destination(&dfg.jump_tables, &dfg.exception_tables)
+            {
                 for arg in dest.args(&dfg.value_lists) {
                     if let Some(v) = arg.as_value() {
                         let v = dfg.resolve_aliases(v);
@@ -259,7 +263,6 @@ fn cbe_within_budget(func: &ir::Function) -> bool {
 /// Largest function (in RAKIT instructions) the cross-block dataflow runs on.
 pub const CBE_MAX_INSTS: usize = 16_384;
 
-
 /// Record the fact that `inst` stores its data operand to `avail`, invalidating
 /// the facts it may overwrite.
 fn record_store(
@@ -333,14 +336,12 @@ fn offset_of(func: &ir::Function, inst: Inst) -> Option<i64> {
 fn stack_key(func: &ir::Function, inst: Inst, addr: Value) -> Option<(StackSlot, i64)> {
     let addr = func.dfg.resolve_aliases(addr);
     let ir::ValueDef::Result(def_inst, 0) = func.dfg.value_def(addr) else { return None };
-    let ir::InstructionData::StackAddr { stack_slot, offset, .. } = func.dfg.insts[def_inst]
-    else {
+    let ir::InstructionData::StackAddr { stack_slot, offset, .. } = func.dfg.insts[def_inst] else {
         return None;
     };
     let off = i64::from(offset) + offset_of(func, inst)?;
     Some((stack_slot, off))
 }
-
 
 /// Forward stores to loads within a single block. A store is only remembered for
 /// a private slot, so an intervening call or indirect store cannot invalidate it.
@@ -387,10 +388,7 @@ fn forward_block(
                 func.dfg.detach_inst_results(inst);
                 func.dfg.change_to_alias(result, value);
                 func.layout.remove_inst(inst);
-            } else if result_ty.bytes() == ty.bytes()
-                && result_ty.is_vector()
-                && ty.is_vector()
-            {
+            } else if result_ty.bytes() == ty.bytes() && result_ty.is_vector() && ty.is_vector() {
                 // A store and a load of the same bytes but different vector types is
                 // exactly how a SIMD bitcast (`__m128i` <-> `Simd<i8, 16>`) compiles:
                 // the value is stored as one lane type and read back as another.
@@ -625,9 +623,9 @@ fn drop_dead_stores(func: &mut ir::Function, private: &FxHashSet<StackSlot>) {
                 continue;
             }
             let size = i64::from(func.dfg.value_type(args[0]).bytes());
-            let overlaps = reads
-                .get(&key.0)
-                .is_some_and(|rs| rs.iter().any(|&(off, len)| off < key.1 + size && key.1 < off + len));
+            let overlaps = reads.get(&key.0).is_some_and(|rs| {
+                rs.iter().any(|&(off, len)| off < key.1 + size && key.1 < off + len)
+            });
             if !overlaps {
                 dead.push(inst);
             }

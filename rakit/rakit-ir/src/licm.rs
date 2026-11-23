@@ -109,11 +109,7 @@ fn find_loops(func: &Function, preds: &[Vec<usize>], idom: &[Option<usize>]) -> 
             }
         }
 
-        let outside: Vec<usize> = preds[h]
-            .iter()
-            .copied()
-            .filter(|p| !body.contains(p))
-            .collect();
+        let outside: Vec<usize> = preds[h].iter().copied().filter(|p| !body.contains(p)).collect();
         if outside.len() != 1 {
             continue;
         }
@@ -150,10 +146,9 @@ fn def_blocks(func: &Function) -> Vec<Option<usize>> {
 fn is_hoistable(inst: &Inst) -> bool {
     match inst {
         Inst::Iconst(..) | Inst::F32const(..) | Inst::F64const(..) | Inst::Copy(..) => true,
-        Inst::Bin(_, op, _, _, _) => !matches!(
-            op,
-            BinOp::Sdiv | BinOp::Udiv | BinOp::Srem | BinOp::Urem | BinOp::Fdiv
-        ),
+        Inst::Bin(_, op, _, _, _) => {
+            !matches!(op, BinOp::Sdiv | BinOp::Udiv | BinOp::Srem | BinOp::Urem | BinOp::Fdiv)
+        }
         Inst::Icmp(..) | Inst::Fcmp(..) | Inst::Select(..) => true,
         _ => false,
     }

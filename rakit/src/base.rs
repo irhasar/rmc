@@ -30,6 +30,8 @@ pub(crate) struct CodegenedFunction {
     rakit_comments: CommentWriter,
     func_debug_cx: Option<FunctionDebugContext>,
     inline_asm: String,
+    crate_name: String,
+    user_crate: bool,
 }
 
 pub(crate) fn codegen_fn<'tcx>(
@@ -96,11 +98,8 @@ pub(crate) fn codegen_fn<'tcx>(
     // Read before `module` moves into the struct below. Cached here because
     // `isa_flags()` allocates and the rounding intrinsics consult it per call
     // site.
-    let has_sse41 = module
-        .isa()
-        .isa_flags()
-        .iter()
-        .any(|f| f.name == "has_sse41" && f.as_bool() == Some(true));
+    let has_sse41 =
+        module.isa().isa_flags().iter().any(|f| f.name == "has_sse41" && f.as_bool() == Some(true));
 
     let mut fx = FunctionCx {
         module,
@@ -155,7 +154,16 @@ pub(crate) fn codegen_fn<'tcx>(
     // Verify function
     verify_func(tcx, &rakit_comments, &func);
 
-    CodegenedFunction { symbol_name, func_id, func, rakit_comments, func_debug_cx, inline_asm }
+    CodegenedFunction {
+        symbol_name,
+        func_id,
+        func,
+        rakit_comments,
+        func_debug_cx,
+        inline_asm,
+        crate_name: tcx.crate_name(LOCAL_CRATE).to_string(),
+        user_crate: format!("{:?}", tcx.crate_types()).contains("Executable"),
+    }
 }
 
 pub(crate) fn compile_fn(
@@ -209,6 +217,8 @@ pub(crate) fn compile_fn(
         ctx: &mut *context,
         module: &mut *module,
         analyses: &mut analyses,
+        crate_name: &codegened_func.crate_name,
+        user_crate: codegened_func.user_crate,
     };
     pipeline.run(&mut pctx);
 
@@ -939,7 +949,9 @@ fn codegen_stmt<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, cur_block: Block, stmt:
                         .monomorphize(times)
                         .try_to_target_usize(fx.tcx)
                         .expect("expected monomorphic const in codegen");
-                    let byte = crate::tunables::repeat_memset().then(|| bytewise_repeat_value(fx, operand)).flatten();
+                    let byte = crate::tunables::repeat_memset()
+                        .then(|| bytewise_repeat_value(fx, operand))
+                        .flatten();
                     let operand = codegen_operand(fx, operand);
                     if operand.layout().size.bytes() == 0 {
                         // Do nothing for ZST's

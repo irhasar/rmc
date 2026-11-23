@@ -193,8 +193,13 @@ fn remap_inst_values(inst: &mut Inst, map: &[Option<Value>]) {
         | Inst::Select(v, _, _, _, _)
         | Inst::StackAddr(v, _, _)
         | Inst::Load(v, _, _, _) => r(map, v),
-        Inst::Call(res, _, _) => {
-            if let Some(v) = res {
+        Inst::Call(results, _, _) => {
+            for v in results {
+                *v = map[v.0 as usize].expect("value removed but still used");
+            }
+        }
+        Inst::CallIndirect { results, .. } => {
+            for v in results {
                 *v = map[v.0 as usize].expect("value removed but still used");
             }
         }
@@ -218,6 +223,12 @@ fn remap_inst_values(inst: &mut Inst, map: &[Option<Value>]) {
         }
         Inst::Load(_, _, a, _) => r(map, a),
         Inst::Call(_, _, args) => {
+            for a in args {
+                r(map, a);
+            }
+        }
+        Inst::CallIndirect { callee, args, .. } => {
+            r(map, callee);
             for a in args {
                 r(map, a);
             }

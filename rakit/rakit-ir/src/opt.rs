@@ -105,8 +105,13 @@ fn fold(func: &mut Function) -> bool {
                                 eval_bin(op, ty, a, b).and_then(|c| const_inst(r, ty, c))
                             }
                             (None, Some(Const::I(0))) => match op {
-                                BinOp::Add | BinOp::Sub | BinOp::Or | BinOp::Xor | BinOp::Shl
-                                | BinOp::Shr | BinOp::Ushr => Some(Inst::Copy(r, ty, x)),
+                                BinOp::Add
+                                | BinOp::Sub
+                                | BinOp::Or
+                                | BinOp::Xor
+                                | BinOp::Shl
+                                | BinOp::Shr
+                                | BinOp::Ushr => Some(Inst::Copy(r, ty, x)),
                                 BinOp::Mul => Some(Inst::Iconst(r, ty, 0)),
                                 BinOp::And => Some(Inst::Iconst(r, ty, 0)),
                                 _ => None,
@@ -127,22 +132,16 @@ fn fold(func: &mut Function) -> bool {
                     if x == y && ty.is_int() {
                         let v = matches!(
                             cc,
-                            IntCc::Eq
-                                | IntCc::Sle
-                                | IntCc::Sge
-                                | IntCc::Ule
-                                | IntCc::Uge
+                            IntCc::Eq | IntCc::Sle | IntCc::Sge | IntCc::Ule | IntCc::Uge
                         );
                         Some(Inst::Iconst(r, Type::Bool, v as i64))
                     } else {
                         match (consts.get(&x), consts.get(&y)) {
-                            (Some(Const::I(a)), Some(Const::I(b))) => {
-                                Some(Inst::Iconst(
-                                    r,
-                                    Type::Bool,
-                                    int_sem::eval_icmp(cc, ty, *a, *b) as i64,
-                                ))
-                            }
+                            (Some(Const::I(a)), Some(Const::I(b))) => Some(Inst::Iconst(
+                                r,
+                                Type::Bool,
+                                int_sem::eval_icmp(cc, ty, *a, *b) as i64,
+                            )),
                             _ => None,
                         }
                     }
@@ -222,7 +221,10 @@ fn dce(func: &mut Function) -> bool {
     for bi in 0..func.blocks.len() {
         for ii in 0..func.blocks[bi].insts.len() {
             let inst = &func.blocks[bi].insts[ii];
-            if matches!(inst, Inst::Load(..) | Inst::Store(..) | Inst::Call(..)) {
+            if matches!(
+                inst,
+                Inst::Load(..) | Inst::Store(..) | Inst::Call(..) | Inst::CallIndirect { .. }
+            ) {
                 continue;
             }
             if let Some(r) = inst.result_value() {

@@ -8,8 +8,10 @@ pub mod sincos;
 pub mod store_forward;
 pub mod unroll;
 
-use crate::passtime;
+use rakit_ir::backend::{InstructionSelector, RegisterAllocator};
+
 use crate::pass::{Pass, PassCtx};
+use crate::passtime;
 
 /// Optional round trip through the Rakit mid-level IR. It only fires for
 /// functions the CLIF<->RIR bridge supports (scalar, no memory/calls) and only
@@ -22,7 +24,7 @@ impl Pass for RirPass {
     }
 
     fn run(&mut self, pctx: &mut PassCtx<'_>) -> bool {
-        if !crate::tunables::rir_enabled() {
+        if !crate::tunables::rir_enabled(pctx.crate_name, pctx.user_crate) {
             return false;
         }
         let debug = std::env::var_os("RAKIT_RIR_DEBUG").is_some();
@@ -94,6 +96,31 @@ impl Pass for RirPass {
         if debug && licm_changed {
             eprintln!("[rir] licm fired");
         }
+        if crate::tunables::custom_backend_enabled() {
+            let selector = rakit_ir::backend::RirSelector;
+            match selector.select(&rir_func) {
+                Ok(mut mach) => match rakit_ir::backend::LinearScan.allocate(&mut mach) {
+                    Ok(stats) => {
+                        if debug {
+                            eprintln!(
+                                "[rir] custom backend: {} vregs, {} regs, {} spills",
+                                stats.vregs, stats.registers, stats.spills
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        if debug {
+                            eprintln!("[rir] custom regalloc skip: {err}");
+                        }
+                    }
+                },
+                Err(err) => {
+                    if debug {
+                        eprintln!("[rir] custom isel skip: {err}");
+                    }
+                }
+            }
+        }
         if !changed && std::env::var_os("RAKIT_RIR_FORCE").is_none() {
             if debug {
                 eprintln!("[rir] no-change {:?}", pctx.ctx.func.name);
@@ -106,7 +133,6 @@ impl Pass for RirPass {
             return false;
         };
         new_func.name = pctx.ctx.func.name.clone();
-        new_func.params = pctx.ctx.func.params.clone();
         if std::env::var_os("RAKIT_RIR_DEBUG").is_some() {
             let what = if changed { "optimized" } else { "roundtrip" };
             eprintln!("[rir] {} {:?}", what, pctx.ctx.func.name);
@@ -166,9 +192,7 @@ impl Pass for IfConvertPass {
     }
 
     fn run(&mut self, pctx: &mut PassCtx<'_>) -> bool {
-        passtime::time(passtime::IF_CONVERT, || {
-            if_convert::run(&mut pctx.ctx.func)
-        });
+        passtime::time(passtime::IF_CONVERT, || if_convert::run(&mut pctx.ctx.func));
         true
     }
 }

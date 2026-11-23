@@ -37,11 +37,17 @@ pub enum Type {
 pub struct StackSlot(pub u32);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExternalTarget {
+    User { namespace: u32, index: u32 },
+    LibCall(String),
+    KnownSymbol(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct External {
-    pub namespace: u32,
-    pub index: u32,
+    pub target: ExternalTarget,
     pub params: Vec<Type>,
-    pub ret: Option<Type>,
+    pub rets: Vec<Type>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -52,10 +58,7 @@ pub struct StackSlotData {
 
 impl Type {
     pub fn is_int(self) -> bool {
-        matches!(
-            self,
-            Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128 | Type::Ptr
-        )
+        matches!(self, Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128 | Type::Ptr)
     }
 
     pub fn is_float(self) -> bool {
@@ -138,8 +141,17 @@ pub enum Inst {
     Load(Value, Type, Value, i32),
     /// Store a scalar to `addr + offset`.
     Store(Type, Value, i32, Value),
-    /// Direct external call: optional result, external index, arguments.
-    Call(Option<Value>, u32, Vec<Value>),
+    /// Direct external call: results, external index, arguments.
+    Call(Vec<Value>, u32, Vec<Value>),
+    /// Indirect call: results, parameter types, return types, callee, arguments.
+    CallIndirect {
+        results: Vec<Value>,
+        params: Vec<Type>,
+        rets: Vec<Type>,
+        call_conv: u8,
+        callee: Value,
+        args: Vec<Value>,
+    },
     Jump(Block, Vec<Value>),
     Brif(Value, Block, Vec<Value>, Block, Vec<Value>),
     Return(Vec<Value>),
@@ -159,13 +171,22 @@ impl Inst {
             | Inst::Select(v, _, _, _, _)
             | Inst::StackAddr(v, _, _)
             | Inst::Load(v, _, _, _) => Some(*v),
-            Inst::Call(r, _, _) => *r,
+            Inst::Call(results, _, _) | Inst::CallIndirect { results, .. } => {
+                results.first().copied()
+            }
             Inst::Store(..) | Inst::Jump(..) | Inst::Brif(..) | Inst::Return(..) => None,
         }
     }
 
     pub fn is_terminator(&self) -> bool {
         matches!(self, Inst::Jump(..) | Inst::Brif(..) | Inst::Return(..))
+    }
+
+    pub fn result_values(&self) -> Vec<Value> {
+        match self {
+            Inst::Call(results, _, _) | Inst::CallIndirect { results, .. } => results.clone(),
+            _ => self.result_value().into_iter().collect(),
+        }
     }
 
     pub fn operands(&self) -> Vec<Value> {
@@ -183,6 +204,12 @@ impl Inst {
             Inst::Load(_, _, a, _) => vec![*a],
             Inst::Store(_, a, _, v) => vec![*a, *v],
             Inst::Call(_, _, args) => args.clone(),
+            Inst::CallIndirect { callee, args, .. } => {
+                let mut v = Vec::with_capacity(args.len() + 1);
+                v.push(*callee);
+                v.extend_from_slice(args);
+                v
+            }
             Inst::Jump(_, args) | Inst::Return(args) => args.clone(),
             Inst::Brif(cond, _, targs, _, fargs) => {
                 let mut v = Vec::with_capacity(targs.len() + fargs.len() + 1);

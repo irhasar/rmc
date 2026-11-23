@@ -10,10 +10,10 @@
 //! cannot loop forever.
 
 use std::borrow::Cow;
-
-use rakit_codegen::ir;
-use rakit_codegen::inline::{Inline, InlineCommand};
 use std::collections::HashMap as FxHashMap;
+
+use rakit_codegen::inline::{Inline, InlineCommand};
+use rakit_codegen::ir;
 
 /// Largest callee (in RAKIT instructions) we are willing to inline.
 pub const MAX_CALLEE_INSTS: usize = 128;
@@ -180,11 +180,8 @@ impl<'a> CguInliner<'a> {
         let caller_insts = caller.dfg.num_insts();
         // `RAKIT_INLINE_MAX=0` keeps its documented meaning: inlining is off,
         // including the leaf tier, so the knob can still bisect it away.
-        let (max_insts, max_leaf_insts) = if max_callee_insts() == 0 {
-            (0, 0)
-        } else {
-            (max_callee_insts(), max_leaf_insts())
-        };
+        let (max_insts, max_leaf_insts) =
+            if max_callee_insts() == 0 { (0, 0) } else { (max_callee_insts(), max_leaf_insts()) };
         CguInliner {
             bodies,
             self_id,

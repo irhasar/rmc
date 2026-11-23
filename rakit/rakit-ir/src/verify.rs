@@ -52,7 +52,7 @@ pub fn verify(func: &Function) -> Result<(), Vec<String>> {
             if !inst.is_terminator() && last {
                 errs.push(format!("block {b:?} does not end in a terminator"));
             }
-            if let Some(r) = inst.result_value() {
+            for r in inst.result_values() {
                 define(&mut errs, r, Def { block: b, index: ii, is_param: false });
             }
         }
@@ -66,9 +66,7 @@ pub fn verify(func: &Function) -> Result<(), Vec<String>> {
 
     let dom = dominators(func);
 
-    let ty_of = |v: Value| -> Option<Type> {
-        func.values.get(v.0 as usize).copied()
-    };
+    let ty_of = |v: Value| -> Option<Type> { func.values.get(v.0 as usize).copied() };
 
     for (bi, blk) in func.blocks.iter().enumerate() {
         let b = Block(bi as u32);
@@ -85,9 +83,7 @@ pub fn verify(func: &Function) -> Result<(), Vec<String>> {
                                 ));
                             }
                         } else if !d.is_param && d.index >= ii {
-                            errs.push(format!(
-                                "use of {u:?} in {b:?} before its definition"
-                            ));
+                            errs.push(format!("use of {u:?} in {b:?} before its definition"));
                         }
                     }
                 }
@@ -188,7 +184,7 @@ pub fn verify(func: &Function) -> Result<(), Vec<String>> {
                         errs.push(format!("load result {r:?} type mismatch"));
                     }
                 }
-                Inst::Call(result, target, args) => {
+                Inst::Call(results, target, args) => {
                     let Some(ext) = func.externals.get(*target as usize) else {
                         errs.push(format!("call target {target} out of range"));
                         continue;
@@ -202,14 +198,38 @@ pub fn verify(func: &Function) -> Result<(), Vec<String>> {
                             }
                         }
                     }
-                    match (result, ext.ret) {
-                        (Some(r), Some(ty)) => {
-                            if ty_of(*r) != Some(ty) {
+                    if results.len() != ext.rets.len() {
+                        errs.push("call result arity mismatch".to_string());
+                    } else {
+                        for (r, ty) in results.iter().zip(&ext.rets) {
+                            if ty_of(*r) != Some(*ty) {
                                 errs.push(format!("call result {r:?} type mismatch"));
                             }
                         }
-                        (None, None) => {}
-                        _ => errs.push("call result arity mismatch".to_string()),
+                    }
+                }
+                Inst::CallIndirect { results, params, rets, callee, args, .. } => {
+                    if !ty_of(*callee).map(|t| matches!(t, Type::Ptr | Type::I64)).unwrap_or(false)
+                    {
+                        errs.push(format!("indirect callee {callee:?} is not a pointer"));
+                    }
+                    if args.len() != params.len() {
+                        errs.push("indirect call argument arity mismatch".to_string());
+                    } else {
+                        for (arg, ty) in args.iter().zip(params) {
+                            if ty_of(*arg) != Some(*ty) {
+                                errs.push(format!("indirect argument {arg:?} type mismatch"));
+                            }
+                        }
+                    }
+                    if results.len() != rets.len() {
+                        errs.push("indirect call result arity mismatch".to_string());
+                    } else {
+                        for (r, ty) in results.iter().zip(rets) {
+                            if ty_of(*r) != Some(*ty) {
+                                errs.push(format!("indirect result {r:?} type mismatch"));
+                            }
+                        }
                     }
                 }
                 Inst::Store(ty, addr, _, value) => {
@@ -261,7 +281,11 @@ fn check_args(
     }
     let params = &func.block(target).params;
     if params.len() != args.len() {
-        errs.push(format!("branch to {target:?} passes {} args for {} params", args.len(), params.len()));
+        errs.push(format!(
+            "branch to {target:?} passes {} args for {} params",
+            args.len(),
+            params.len()
+        ));
         return;
     }
     for (a, p) in args.iter().zip(params) {
