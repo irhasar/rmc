@@ -406,7 +406,7 @@ fn block_param_owner(func: &Function, value: Value) -> Option<Block> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cursor::FuncCursor;
+    use crate::cursor::{Cursor, FuncCursor};
     use crate::ir::types::{I32, I64};
     use crate::ir::{InstBuilder, ValueDef};
 

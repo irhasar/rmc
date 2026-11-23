@@ -3093,3 +3093,34 @@ Semua temuan review ditindaklanjuti. Perubahan yang mendarat:
 - **Regression gate tidak bisa jatuh ke LLVM.** `bench/regressions.sh`
   menambahkan `--target` eksplisit, menghapus `RAKIT_HOST_LLVM` untuk backend
   Rakit, dan menolak binary Rakit yang byte-identik dengan LLVM.
+
+### 29.3 Audit eksternal PR 9–11 (2026-11-23)
+
+Audit eksternal menemukan tiga kelas masalah yang tidak tertangkap review
+sebelumnya. Yang bisa diperbaiki tanpa mengubah arah proyek sudah mendarat:
+
+- **Crash LICM pada header multi-entry (DIPERBAIKI).** `ensure_preheader`
+  dulu memecah satu sisi `idom → header` walaupun header punya entry kedua dari
+  luar loop; nilai yang di-hoist tidak terdefinisi di jalur itu. Sekarang
+  preheader hanya dibuat bila header punya paling banyak satu predecessor di
+  luar loop. Regresi
+  `licm::tests::licm_does_not_split_a_multi_entry_loop_header` memeriksa tidak
+  ada blok preheader baru dan SSA dominance tetap terjaga. `serde_json 1.0.154` + `regex` kini
+  dikompilasi dan dijalankan Rakit tanpa `RAKIT_NO_LICM=1`.
+- **Intrinsik SSE2 `pmulhu.w` belum ada.** Program yang mencetak `f64` lewat
+  formatter serde_json masih abort di runtime. Ini warisan cg_clif dan perlu
+  implementasi intrinsik, bukan perbaikan pass.
+- **Jembatan RIR membuang `MemFlags`.** Load/store diekspor ulang dengan
+  `MemFlagsData::new()`, sehingga `notrap`/`aligned`/`readonly` hilang. Ini
+  perubahan tipe `RIR Inst::Load/Store` dan seluruh pass; belum dikerjakan.
+- **Transformasi ganda dan biaya RIR.** Pipeline masih menjalankan rec_loop,
+  inliner, div_test, if_convert, sincos di RIR lalu lagi di CLIF. `if_convert`
+  RIR juga mengubah cabang `if sum > 1e9` menjadi `cmov` yang memperlambat
+  `forloops` (1,09 → 1,93 ms). Ini keputusan arsitektur (satu implementasi per
+  transformasi, cost model prediktabilitas), bukan tambalan kecil.
+- **Atribusi backend asal.** Audit meminta nama dan NOTICE backend asal
+  dikembalikan. Itu bertentangan dengan permintaan rebrand sebelumnya
+  (“tidak ada referensi backend asal”); perlu keputusan eksplisit pemilik repo
+  sebelum diubah.
+- **Benchmark tune tanpa input runtime.** p1–p9 masih memakai konstanta; set
+  held-out dan input runtime belum dipisahkan. Perlu harness baru.
