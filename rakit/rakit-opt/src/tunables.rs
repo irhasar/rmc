@@ -58,10 +58,12 @@ pub fn rir_inline_enabled() -> bool {
     *V.get_or_init(|| !flag("RAKIT_NO_RIR_INLINE"))
 }
 
-/// Whether RIR loop unrolling runs (`RAKIT_NO_RIR_UNROLL` off).
+/// Whether RIR loop unrolling runs. Off by default: the codegen IR unroller
+/// implements affine reassociation, while the RIR unroller only duplicates
+/// the body and regresses loop-carried chains. Enable with `RAKIT_RIR_UNROLL=1`.
 pub fn rir_unroll_enabled() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| !flag("RAKIT_NO_RIR_UNROLL"))
+    *V.get_or_init(|| flag("RAKIT_RIR_UNROLL"))
 }
 
 /// Whether RIR `sincos` fusion runs (`RAKIT_NO_RIR_SINCOS` off).

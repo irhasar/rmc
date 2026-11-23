@@ -131,7 +131,6 @@ fn rewrite(func: &mut Function, p: Pat) {
     let n1 = new_value(func, Type::I64);
     let n2 = new_value(func, Type::I64);
     let t1 = new_value(func, Type::I64);
-    let t2 = new_value(func, Type::I64);
     let acc1 = new_value(func, Type::I64);
     let sum = new_value(func, Type::I64);
 
@@ -160,7 +159,6 @@ fn rewrite(func: &mut Function, p: Pat) {
         Inst::Call(vec![t1], p.target, vec![n1]),
         Inst::Iconst(cn2, Type::I64, p.c2),
         Inst::Bin(n2, BinOp::Sub, Type::I64, rec_n, cn2),
-        Inst::Call(vec![t2], p.target, vec![n2]),
         Inst::Bin(acc1, BinOp::Add, Type::I64, rec_acc, t1),
         Inst::Jump(crate::ir::Block(loop_b), vec![n2, acc1]),
     ];

@@ -2938,3 +2938,45 @@ Menang kecil di 2/3, netral di stdnum, **compile ~netral**. Berbeda dengan
 crate nyata lalu dibuang. Hot-callee menargetkan callee yang di-inline berulang
 (bukan menaikkan lantai semua caller), jadi biaya compile-nya kecil dan
 **bukan overfitting ke p2_mem**. Knob `RAKIT_NO_HOT_INLINE` untuk bisect.
+
+## 29. Audit regresi RIR (2026-11-23)
+
+Benchmark penuh `bench/allaxes.sh` (CREPS=3, RREPS=7) mengungkap dua regresi
+besar pada jalur RIR default:
+
+- **`rec_loop` RIR** masih memancarkan **dua** panggilan diri per iterasi
+  (panggilan kedua hasilnya mati). `p3_calls` menjadi **7.731 ms**; setelah
+  ditulis ulang menjadi satu panggilan per iterasi (seperti pass codegen),
+  menjadi **57 ms** dan keluaran tetap identik dengan LLVM.
+- **`unroll` RIR** menduplikasi badan loop tetapi tidak melakukan reassociation
+  affine, sehingga menghalangi unroller codegen yang sudah dioptimalkan.
+  `p5_inline`/`p6_scalar` menjadi **358/401 ms**. Pass ini sekarang **opt-in**
+  (`RAKIT_RIR_UNROLL=1`); default codegen unroller kembali aktif dan keduanya
+  menjadi **7 ms**.
+
+Matriks 3-arah terakhir (C = compile wall, R = run wall, size = byte):
+
+| prog | C L/U/M | R L/U/M | size L/U/M |
+|------|---------|---------|------------|
+| p1 | 92/87/88 | 82/109/101 | 4.64/5.88/4.06 MB |
+| p2 | 270/146/194 | 18/159/53 | 4.64/5.94/4.05 MB |
+| p3 | 109/93/100 | 37/117/58 | 4.61/5.82/3.98 MB |
+| p4 | 118/101/109 | 57/160/86 | 4.64/5.89/4.06 MB |
+| p5 | 88/81/91 | 58/896/7 | 4.61/5.81/3.97 MB |
+| p6 | 90/83/83 | 58/904/7 | 4.61/5.81/3.97 MB |
+| p7 | 91/83/86 | 43/101/36 | 4.61/5.81/3.97 MB |
+| p8 | 93/85/86 | 18/39/21 | 4.61/5.81/3.97 MB |
+| p9 | 103/92/100 | 31/77/36 | 4.64/5.89/4.06 MB |
+
+Dibanding matriks §21.4: runtime `p3` 94→57, `p4` 99→86, `p8` 29→21;
+`p1`/`p2`/`p7`/`p9` dalam ±2 ms (p9 34→36 adalah variasi run), `p5`/`p6`
+6→7 ms karena pembulatan. Ukuran artefak M sedikit lebih kecil. Compile absolut
+naik di semua backend pada run ini (mesin lebih lambat), tetapi `p2` naik lebih
+tajam: M 146→194 ms, U 125→146, L 247→270; rasio M/L 0.59→0.72. Itu biaya
+pipeline RIR default pada p2, yang juga tidak mendapat manfaat runtime dari RIR
+(53 vs 50.5 ms dengan `RAKIT_NO_RIR=1`). Backend lain tidak menunjukkan regresi
+runtime, dan M tetap lebih cepat compile daripada LLVM di semua program.
+
+Verifikasi: seluruh keluaran p1–p9 byte-identik dengan LLVM; `./y.sh test`
+65 suite `ok`, 0 failure; `rakit-ir` dan `rakit-opt` lulus; test regresi baru
+`rakit-ir/tests/rec_loop.rs` memastikan hanya satu self-call per iterasi.
