@@ -135,14 +135,17 @@ fn rejects_memory_and_i128() {
     let loaded = b.load(e, Type::I64, addr, 0);
     b.ret(e, vec![loaded]);
     let f = b.into_func();
-    assert!(RirSelector.select(&f).is_err());
+    let selected = RirSelector.select(&f).unwrap();
+    assert!(selected.is_fallback());
+    assert_eq!(rakit_ir::backend::to_rir(&selected).unwrap().blocks.len(), f.blocks.len());
 
     let mut b = Builder::new(vec![Type::I128], vec![Type::I128]);
     let e = b.func().entry;
     let x = b.func().block(e).params[0];
     b.ret(e, vec![x]);
     let f = b.into_func();
-    assert!(RirSelector.select(&f).is_err());
+    let selected = RirSelector.select(&f).unwrap();
+    assert!(selected.is_fallback());
 }
 
 #[test]

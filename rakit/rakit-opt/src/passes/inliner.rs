@@ -11,6 +11,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap as FxHashMap;
+use std::sync::OnceLock;
 
 use rakit_codegen::inline::{Inline, InlineCommand};
 use rakit_codegen::ir;
@@ -144,6 +145,7 @@ pub struct CguInliner<'a> {
 #[derive(Default)]
 pub struct CguBodies {
     funcs: FxHashMap<u32, CguBody>,
+    rir: OnceLock<Vec<rakit_ir::Function>>,
 }
 
 struct CguBody {
@@ -167,7 +169,23 @@ impl CguBodies {
             }
             out.insert(id, CguBody { func: func.clone(), is_leaf: is_leaf(func) });
         }
-        CguBodies { funcs: out }
+        CguBodies { funcs: out, rir: OnceLock::new() }
+    }
+
+    /// Import the collected bodies once for the RIR inliner.  A codegen unit
+    /// is compiled many times (once per function), so the conversion must be
+    /// shared rather than repeated per caller.
+    pub fn rir_bodies(&self) -> &[rakit_ir::Function] {
+        self.rir.get_or_init(|| {
+            self.funcs
+                .values()
+                .filter_map(|body| {
+                    let mut f = crate::rir::import(&body.func)?;
+                    rakit_ir::simplify::run(&mut f);
+                    Some(f)
+                })
+                .collect()
+        })
     }
 
     pub fn is_empty(&self) -> bool {

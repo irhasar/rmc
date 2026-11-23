@@ -8,8 +8,8 @@
 //!
 //! This module rewrites `icmp eq/ne (urem x, C), 0` for odd `C > 1` on `I64`.
 //! Even divisors, narrower integer types and `brif`-on-remainder are still
-//! handled by the CLIF pass: RIR's `brif` takes a `Bool`, so the remainder
-//! always reaches it through an `icmp`, and the CLIF pass keeps covering the
+//! handled by the codegen IR pass: RIR's `brif` takes a `Bool`, so the remainder
+//! always reaches it through an `icmp`, and the codegen IR pass keeps covering the
 //! rest of the instruction set.
 
 use std::collections::HashMap;

@@ -204,6 +204,19 @@ fn eval(env: &[Option<Val>], inst: &Inst, mem: &mut [u8], bases: &[usize]) -> Re
         Inst::GlobalValue(..) => Err("global value is not supported by eval".to_string()),
         Inst::FuncAddr(..) => Err("function address is not supported by eval".to_string()),
         Inst::DynamicStackAddr(..) => Err("dynamic stack address is not supported by eval".to_string()),
+        Inst::Unary(_, op, ty, x) => {
+            let v = get(env, *x)?;
+            match op {
+                crate::ir::UnOp::Uextend | crate::ir::UnOp::Bint => {
+                    Ok(Val::I(int_sem::wrap(*ty, v.as_u64() as i64)))
+                }
+                crate::ir::UnOp::Sextend => Ok(Val::I(int_sem::wrap(*ty, v.as_i()))),
+                crate::ir::UnOp::Ireduce => Ok(Val::I(int_sem::wrap(*ty, v.as_i()))),
+                crate::ir::UnOp::Bnot => Ok(Val::I(int_sem::wrap(*ty, !v.as_i()))),
+                crate::ir::UnOp::Bitcast => Ok(Val::I(int_sem::wrap(*ty, v.as_i()))),
+                _ => Err(format!("unary op {op:?} is not supported by eval")),
+            }
+        }
         Inst::Bin(_, op, ty, x, y) => eval_bin(*op, *ty, get(env, *x)?, get(env, *y)?),
         Inst::Icmp(_, cc, ty, x, y) => {
             let a = get(env, *x)?;

@@ -1,4 +1,4 @@
-//! CLIF <-> RIR bridge for a conservative scalar subset.
+//! codegen IR <-> RIR bridge for a conservative scalar subset.
 //!
 //! The bridge is intentionally partial: it accepts functions that use only
 //! scalar constants, integer/float arithmetic, comparisons, `select`, block
@@ -8,16 +8,16 @@
 
 use std::collections::HashMap;
 
-use rakit_codegen::ir::condcodes::{FloatCC as ClifFloatCC, IntCC as ClifIntCC};
+use rakit_codegen::ir::condcodes::{FloatCC as CgFloatCC, IntCC as CgIntCC};
 use rakit_codegen::ir::immediates::{Ieee32, Ieee64, Imm64, Offset32};
 use rakit_codegen::ir::{
-    AbiParam, Block as ClifBlock, BlockArg, BlockCall, DynamicStackSlot, DynamicStackSlotData, DynamicType,
+    AbiParam, Block as CgBlock, BlockArg, BlockCall, DynamicStackSlot, DynamicStackSlotData, DynamicType,
     DynamicTypeData,
     ExceptionTableData, ExceptionTableItem, ExceptionTag, ExtFuncData, ExternalName,
-    Function as ClifFunction, GlobalValue, GlobalValueData, Inst as ClifInst, InstructionData,
-    KnownSymbol, LibCall, MemFlagsData, Opcode, Signature, StackSlot as ClifStackSlot,
-    StackSlotData as ClifStackSlotData, StackSlotKind, Type as ClifType, UserExternalName,
-    Value as ClifValue, ValueList, types,
+    Function as CgFunction, GlobalValue, GlobalValueData, Inst as CgInst, InstructionData,
+    KnownSymbol, LibCall, MemFlagsData, Opcode, Signature, StackSlot as CgStackSlot,
+    StackSlotData as CgStackSlotData, StackSlotKind, Type as CgType, UserExternalName,
+    Value as CgValue, ValueList, types,
 };
 use rakit_codegen::isa::CallConv;
 use rakit_ir::{
@@ -26,7 +26,7 @@ use rakit_ir::{
     ExternalTarget as RirExternalTarget, FloatCc as RirFloatCc, Function as RirFunction,
     GlobalData as RirGlobalData, Inst as RirInst, IntCc as RirIntCc,
     StackSlot as RirStackSlot, TryArg as RirTryArg, TryBlockCall as RirTryBlockCall,
-    Type as RirType, Value as RirValue,
+    Type as RirType, UnOp as RirUnOp, Value as RirValue,
 };
 
 fn call_conv_to_rir(cc: CallConv) -> u8 {
@@ -53,9 +53,9 @@ fn call_conv_from_rir(value: u8) -> Option<CallConv> {
     })
 }
 
-/// Import a CLIF function into RIR, or `None` if it uses anything outside the
+/// Import a codegen IR function into RIR, or `None` if it uses anything outside the
 /// supported scalar subset.
-pub fn import(func: &ClifFunction) -> Option<RirFunction> {
+pub fn import(func: &CgFunction) -> Option<RirFunction> {
     let entry = func.layout.entry_block()?;
     let ret: Vec<RirType> = func
         .signature
@@ -81,7 +81,7 @@ pub fn import(func: &ClifFunction) -> Option<RirFunction> {
 
     let mut builder = Builder::new(ret, entry_params);
     let mut externals: Vec<RirExternal> = Vec::new();
-    let mut slot_map: HashMap<ClifStackSlot, RirStackSlot> = HashMap::new();
+    let mut slot_map: HashMap<CgStackSlot, RirStackSlot> = HashMap::new();
     for (cs, data) in func.sized_stack_slots.iter() {
         if !matches!(data.kind, StackSlotKind::ExplicitSlot) {
             return None;
@@ -112,7 +112,7 @@ pub fn import(func: &ClifFunction) -> Option<RirFunction> {
         });
     }
     let stack_limit = func.stack_limit.map(|g| g.as_u32());
-    let mut block_map: HashMap<ClifBlock, RirBlock> = HashMap::new();
+    let mut block_map: HashMap<CgBlock, RirBlock> = HashMap::new();
     block_map.insert(entry, RirBlock(0));
 
     for b in func.layout.blocks() {
@@ -129,7 +129,7 @@ pub fn import(func: &ClifFunction) -> Option<RirFunction> {
         block_map.insert(b, rb);
     }
 
-    let mut vmap: HashMap<ClifValue, RirValue> = HashMap::new();
+    let mut vmap: HashMap<CgValue, RirValue> = HashMap::new();
     for (cb, rb) in &block_map {
         let cparams = func.dfg.block_params(*cb);
         let rparams = builder.func().block(*rb).params.clone();
@@ -160,6 +160,14 @@ pub fn import(func: &ClifFunction) -> Option<RirFunction> {
                 InstructionData::UnaryIeee64 { opcode: Opcode::F64const, imm } => {
                     let r = single_result(func, inst)?;
                     let v = builder.f64const(rb, imm.as_f64());
+                    map_value(func, &mut vmap, r, v);
+                }
+                InstructionData::Unary { opcode, arg } => {
+                    let op = map_unop(opcode)?;
+                    let r = single_result(func, inst)?;
+                    let ty = map_type_to_rir(func.dfg.value_type(r))?;
+                    let x = lookup(func, &vmap, arg)?;
+                    let v = builder.unary(rb, op, ty, x);
                     map_value(func, &mut vmap, r, v);
                 }
                 InstructionData::Binary { opcode, args } => {
@@ -273,8 +281,8 @@ pub fn import(func: &ClifFunction) -> Option<RirFunction> {
                         .map(|r| map_type_to_rir(func.dfg.value_type(*r)))
                         .collect::<Option<Vec<_>>>()?;
                     let rir_results = builder.call_multi(rb, target, args, rets);
-                    for (clif, rir) in results.iter().zip(rir_results) {
-                        map_value(func, &mut vmap, *clif, rir);
+                    for (cg, rir) in results.iter().zip(rir_results) {
+                        map_value(func, &mut vmap, *cg, rir);
                     }
                 }
                 InstructionData::CallIndirect { sig_ref, args, .. } => {
@@ -311,8 +319,8 @@ pub fn import(func: &ClifFunction) -> Option<RirFunction> {
                         callee,
                         call_args,
                     );
-                    for (clif, rir) in results.iter().zip(rir_results) {
-                        map_value(func, &mut vmap, *clif, rir);
+                    for (cg, rir) in results.iter().zip(rir_results) {
+                        map_value(func, &mut vmap, *cg, rir);
                     }
                 }
                 InstructionData::UnaryGlobalValue { global_value, .. } => {
@@ -352,8 +360,8 @@ pub fn import(func: &ClifFunction) -> Option<RirFunction> {
                     let normal = map_try_block(func, table.normal_return(), &vmap, &block_map)?;
                     let exception = map_exception(func, table, &vmap, &block_map)?;
                     let rir_results = builder.try_call(rb, target, args, rets, normal, exception);
-                    for (clif, rir) in results.iter().zip(rir_results) {
-                        map_value(func, &mut vmap, *clif, rir);
+                    for (cg, rir) in results.iter().zip(rir_results) {
+                        map_value(func, &mut vmap, *cg, rir);
                     }
                 }
                 InstructionData::TryCallIndirect { args, exception, .. } => {
@@ -387,8 +395,8 @@ pub fn import(func: &ClifFunction) -> Option<RirFunction> {
                         normal,
                         exception,
                     );
-                    for (clif, rir) in results.iter().zip(rir_results) {
-                        map_value(func, &mut vmap, *clif, rir);
+                    for (cg, rir) in results.iter().zip(rir_results) {
+                        map_value(func, &mut vmap, *cg, rir);
                     }
                 }
                 InstructionData::Jump { destination, .. } => {
@@ -419,6 +427,13 @@ pub fn import(func: &ClifFunction) -> Option<RirFunction> {
     }
 
     let mut out = builder.into_func();
+    out.self_target = match &func.name {
+        rakit_codegen::ir::UserFuncName::User(name) => Some(RirExternalTarget::User {
+            namespace: name.namespace,
+            index: name.index,
+        }),
+        _ => None,
+    };
     out.externals = externals;
     out.globals = globals;
     out.dynamic_types = dynamic_types;
@@ -428,35 +443,35 @@ pub fn import(func: &ClifFunction) -> Option<RirFunction> {
     Some(out)
 }
 
-/// Lower an RIR function back to CLIF, reusing `sig` for the calling convention
+/// Lower an RIR function back to codegen IR, reusing `sig` for the calling convention
 /// and ABI parameter details. Returns `None` on any inconsistency.
-pub fn export(rir: &RirFunction, sig: &Signature) -> Option<ClifFunction> {
+pub fn export(rir: &RirFunction, sig: &Signature) -> Option<CgFunction> {
     let entry_params = &rir.block(rir.entry).params;
     if sig.params.len() != entry_params.len() || sig.returns.len() != rir.ret.len() {
         return None;
     }
     for (p, rv) in sig.params.iter().zip(entry_params) {
-        if map_type_to_clif(rir.ty(*rv))? != p.value_type {
+        if map_type_to_cg(rir.ty(*rv))? != p.value_type {
             return None;
         }
     }
     for (p, t) in sig.returns.iter().zip(&rir.ret) {
-        if map_type_to_clif(*t)? != p.value_type {
+        if map_type_to_cg(*t)? != p.value_type {
             return None;
         }
     }
 
-    let mut func = ClifFunction::new();
+    let mut func = CgFunction::new();
     func.signature = sig.clone();
 
     let mut call_refs = Vec::with_capacity(rir.externals.len());
     for ext in &rir.externals {
         let mut callee = Signature::new(CallConv::SystemV);
         for ty in &ext.params {
-            callee.params.push(AbiParam::new(map_type_to_clif(*ty)?));
+            callee.params.push(AbiParam::new(map_type_to_cg(*ty)?));
         }
         for ty in &ext.rets {
-            callee.returns.push(AbiParam::new(map_type_to_clif(*ty)?));
+            callee.returns.push(AbiParam::new(map_type_to_cg(*ty)?));
         }
         let sig_ref = func.import_signature(callee);
         let name = match &ext.target {
@@ -482,13 +497,13 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<ClifFunction> {
             RirGlobalData::Load { base, offset, ty, .. } => GlobalValueData::Load {
                 base: GlobalValue::from_u32(*base),
                 offset: Offset32::try_from_i64(*offset)?,
-                global_type: map_type_to_clif(*ty)?,
+                global_type: map_type_to_cg(*ty)?,
                 flags: func.dfg.mem_flags.insert_unchecked(MemFlagsData::trusted()),
             },
             RirGlobalData::IAddImm { base, offset, ty } => GlobalValueData::IAddImm {
                 base: GlobalValue::from_u32(*base),
                 offset: Imm64::new(*offset),
-                global_type: map_type_to_clif(*ty)?,
+                global_type: map_type_to_cg(*ty)?,
             },
             RirGlobalData::Symbol { target, offset, colocated, tls } => GlobalValueData::Symbol {
                 name: external_name(&mut func, target)?,
@@ -498,7 +513,7 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<ClifFunction> {
             },
             RirGlobalData::DynScaleTargetConst { vector_type } => {
                 GlobalValueData::DynScaleTargetConst {
-                    vector_type: ClifType::from_bits(*vector_type),
+                    vector_type: CgType::from_bits(*vector_type),
                 }
             }
         };
@@ -506,7 +521,7 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<ClifFunction> {
     }
     func.stack_limit = rir.stack_limit.map(GlobalValue::from_u32);
     for ty in &rir.dynamic_types {
-        let base = ClifType::from_bits(ty.base_vector_ty);
+        let base = CgType::from_bits(ty.base_vector_ty);
         let scale = GlobalValue::from_u32(ty.dynamic_scale);
         func.dfg.dynamic_types.push(DynamicTypeData::new(base, scale));
     }
@@ -516,20 +531,20 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<ClifFunction> {
         func.create_dynamic_stack_slot(data);
     }
 
-    let mut slot_map: Vec<ClifStackSlot> = Vec::with_capacity(rir.stack_slots.len());
+    let mut slot_map: Vec<CgStackSlot> = Vec::with_capacity(rir.stack_slots.len());
     for slot in &rir.stack_slots {
         let align_shift = slot.align.max(1).trailing_zeros() as u8;
-        let data = ClifStackSlotData::new(StackSlotKind::ExplicitSlot, slot.size, align_shift);
+        let data = CgStackSlotData::new(StackSlotKind::ExplicitSlot, slot.size, align_shift);
         slot_map.push(func.create_sized_stack_slot(data));
     }
 
-    let mut block_map: Vec<ClifBlock> = Vec::with_capacity(rir.blocks.len());
-    let mut vmap: HashMap<RirValue, ClifValue> = HashMap::new();
+    let mut block_map: Vec<CgBlock> = Vec::with_capacity(rir.blocks.len());
+    let mut vmap: HashMap<RirValue, CgValue> = HashMap::new();
     for rb in &rir.blocks {
         let cb = func.dfg.make_block();
         func.layout.append_block(cb);
         for p in &rb.params {
-            let ty = map_type_to_clif(rir.ty(*p))?;
+            let ty = map_type_to_cg(rir.ty(*p))?;
             let cv = func.dfg.append_block_param(cb, ty);
             vmap.insert(*p, cv);
         }
@@ -541,7 +556,7 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<ClifFunction> {
         for inst in &rb.insts {
             match inst {
                 RirInst::Nop(r, ty) => {
-                    let ct = map_type_to_clif(*ty)?;
+                    let ct = map_type_to_cg(*ty)?;
                     let data = match ty {
                         RirType::F32 => InstructionData::UnaryIeee32 {
                             opcode: Opcode::F32const,
@@ -563,7 +578,7 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<ClifFunction> {
                     vmap.insert(*r, func.dfg.inst_results(ci)[0]);
                 }
                 RirInst::Iconst(r, ty, v) => {
-                    let ct = map_type_to_clif(*ty)?;
+                    let ct = map_type_to_cg(*ty)?;
                     let ci = func.dfg.make_inst(InstructionData::UnaryImm {
                         opcode: Opcode::Iconst,
                         imm: Imm64::new(*v),
@@ -600,10 +615,22 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<ClifFunction> {
                     let cv = *vmap.get(x)?;
                     vmap.insert(*r, cv);
                 }
+                RirInst::Unary(r, op, ty, x) => {
+                    let ct = map_type_to_cg(*ty)?;
+                    let ci = func.dfg.make_inst(InstructionData::Unary {
+                        opcode: map_unop_to_cg(*op)?,
+                        arg: *vmap.get(x)?,
+                    });
+                    if func.dfg.make_inst_results(ci, ct) != 1 {
+                        return None;
+                    }
+                    func.layout.append_inst(ci, cb);
+                    vmap.insert(*r, func.dfg.inst_results(ci)[0]);
+                }
                 RirInst::Bin(r, op, ty, x, y) => {
-                    let ct = map_type_to_clif(*ty)?;
+                    let ct = map_type_to_cg(*ty)?;
                     let ci = func.dfg.make_inst(InstructionData::Binary {
-                        opcode: map_binop_to_clif(*op)?,
+                        opcode: map_binop_to_cg(*op)?,
                         args: [*vmap.get(x)?, *vmap.get(y)?],
                     });
                     if func.dfg.make_inst_results(ci, ct) != 1 {
@@ -616,7 +643,7 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<ClifFunction> {
                     let ci = func.dfg.make_inst(InstructionData::IntCompare {
                         opcode: Opcode::Icmp,
                         args: [*vmap.get(x)?, *vmap.get(y)?],
-                        cond: map_intcc_to_clif(*cc)?,
+                        cond: map_intcc_to_cg(*cc)?,
                     });
                     if func.dfg.make_inst_results(ci, types::I8) != 1 {
                         return None;
@@ -628,7 +655,7 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<ClifFunction> {
                     let ci = func.dfg.make_inst(InstructionData::FloatCompare {
                         opcode: Opcode::Fcmp,
                         args: [*vmap.get(x)?, *vmap.get(y)?],
-                        cond: map_floatcc_to_clif(*cc)?,
+                        cond: map_floatcc_to_cg(*cc)?,
                     });
                     if func.dfg.make_inst_results(ci, types::I8) != 1 {
                         return None;
@@ -637,7 +664,7 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<ClifFunction> {
                     vmap.insert(*r, func.dfg.inst_results(ci)[0]);
                 }
                 RirInst::Select(r, ty, c, x, y) => {
-                    let ct = map_type_to_clif(*ty)?;
+                    let ct = map_type_to_cg(*ty)?;
                     let ci = func.dfg.make_inst(InstructionData::Ternary {
                         opcode: Opcode::Select,
                         args: [*vmap.get(c)?, *vmap.get(x)?, *vmap.get(y)?],
@@ -662,7 +689,7 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<ClifFunction> {
                     vmap.insert(*r, func.dfg.inst_results(ci)[0]);
                 }
                 RirInst::Load(r, ty, addr, offset) => {
-                    let ct = map_type_to_clif(*ty)?;
+                    let ct = map_type_to_cg(*ty)?;
                     let flags = func.dfg.mem_flags.insert(MemFlagsData::new()).ok()?;
                     let ci = func.dfg.make_inst(InstructionData::Load {
                         opcode: Opcode::Load,
@@ -677,7 +704,7 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<ClifFunction> {
                     vmap.insert(*r, func.dfg.inst_results(ci)[0]);
                 }
                 RirInst::Store(ty, addr, offset, value) => {
-                    let _ = map_type_to_clif(*ty)?;
+                    let _ = map_type_to_cg(*ty)?;
                     let flags = func.dfg.mem_flags.insert(MemFlagsData::new()).ok()?;
                     let ci = func.dfg.make_inst(InstructionData::Store {
                         opcode: Opcode::Store,
@@ -700,7 +727,7 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<ClifFunction> {
                     });
                     let ext = &rir.externals[*target as usize];
                     let ctrl = match ext.rets.first() {
-                        Some(ty) => map_type_to_clif(*ty)?,
+                        Some(ty) => map_type_to_cg(*ty)?,
                         None => types::I8,
                     };
                     let count = func.dfg.make_inst_results(ci, ctrl);
@@ -708,18 +735,18 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<ClifFunction> {
                         return None;
                     }
                     func.layout.append_inst(ci, cb);
-                    let clif_results: Vec<_> = func.dfg.inst_results(ci).to_vec();
-                    for (rir, clif) in results.iter().zip(clif_results) {
-                        vmap.insert(*rir, clif);
+                    let cg_results: Vec<_> = func.dfg.inst_results(ci).to_vec();
+                    for (rir, cg) in results.iter().zip(cg_results) {
+                        vmap.insert(*rir, cg);
                     }
                 }
                 RirInst::CallIndirect { results, params, rets, call_conv, callee, args } => {
                     let mut callee_sig = Signature::new(call_conv_from_rir(*call_conv)?);
                     for ty in params {
-                        callee_sig.params.push(AbiParam::new(map_type_to_clif(*ty)?));
+                        callee_sig.params.push(AbiParam::new(map_type_to_cg(*ty)?));
                     }
                     for ty in rets {
-                        callee_sig.returns.push(AbiParam::new(map_type_to_clif(*ty)?));
+                        callee_sig.returns.push(AbiParam::new(map_type_to_cg(*ty)?));
                     }
                     let sig_ref = func.import_signature(callee_sig);
                     let mut list = ValueList::default();
@@ -733,7 +760,7 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<ClifFunction> {
                         args: list,
                     });
                     let ctrl = match rets.first() {
-                        Some(ty) => map_type_to_clif(*ty)?,
+                        Some(ty) => map_type_to_cg(*ty)?,
                         None => types::I8,
                     };
                     let count = func.dfg.make_inst_results(ci, ctrl);
@@ -741,9 +768,9 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<ClifFunction> {
                         return None;
                     }
                     func.layout.append_inst(ci, cb);
-                    let clif_results: Vec<_> = func.dfg.inst_results(ci).to_vec();
-                    for (rir, clif) in results.iter().zip(clif_results) {
-                        vmap.insert(*rir, clif);
+                    let cg_results: Vec<_> = func.dfg.inst_results(ci).to_vec();
+                    for (rir, cg) in results.iter().zip(cg_results) {
+                        vmap.insert(*rir, cg);
                     }
                 }
                 RirInst::GlobalValue(r, index) => {
@@ -822,10 +849,10 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<ClifFunction> {
                 } => {
                     let mut callee_sig = Signature::new(call_conv_from_rir(*call_conv)?);
                     for ty in params {
-                        callee_sig.params.push(AbiParam::new(map_type_to_clif(*ty)?));
+                        callee_sig.params.push(AbiParam::new(map_type_to_cg(*ty)?));
                     }
                     for ty in rets {
-                        callee_sig.returns.push(AbiParam::new(map_type_to_clif(*ty)?));
+                        callee_sig.returns.push(AbiParam::new(map_type_to_cg(*ty)?));
                     }
                     let sig_ref = func.import_signature(callee_sig);
                     let mut list = ValueList::default();
@@ -896,9 +923,9 @@ fn as_bool(builder: &mut Builder, block: RirBlock, v: RirValue) -> RirValue {
 }
 
 fn map_value(
-    func: &ClifFunction,
-    vmap: &mut HashMap<ClifValue, RirValue>,
-    c: ClifValue,
+    func: &CgFunction,
+    vmap: &mut HashMap<CgValue, RirValue>,
+    c: CgValue,
     r: RirValue,
 ) {
     vmap.insert(c, r);
@@ -909,22 +936,22 @@ fn map_value(
 }
 
 fn lookup(
-    func: &ClifFunction,
-    vmap: &HashMap<ClifValue, RirValue>,
-    v: ClifValue,
+    func: &CgFunction,
+    vmap: &HashMap<CgValue, RirValue>,
+    v: CgValue,
 ) -> Option<RirValue> {
     vmap.get(&func.dfg.resolve_aliases(v)).copied().or_else(|| vmap.get(&v).copied())
 }
 
-fn single_result(func: &ClifFunction, inst: ClifInst) -> Option<ClifValue> {
+fn single_result(func: &CgFunction, inst: CgInst) -> Option<CgValue> {
     let results = func.dfg.inst_results(inst);
     if results.len() == 1 { Some(results[0]) } else { None }
 }
 
 fn block_args(
-    func: &ClifFunction,
+    func: &CgFunction,
     bc: &BlockCall,
-    vmap: &HashMap<ClifValue, RirValue>,
+    vmap: &HashMap<CgValue, RirValue>,
 ) -> Option<Vec<RirValue>> {
     bc.args(&func.dfg.value_lists)
         .map(|a| match a {
@@ -935,17 +962,17 @@ fn block_args(
 }
 
 fn make_block_call(
-    func: &mut ClifFunction,
-    target: ClifBlock,
+    func: &mut CgFunction,
+    target: CgBlock,
     args: &[RirValue],
-    vmap: &HashMap<RirValue, ClifValue>,
+    vmap: &HashMap<RirValue, CgValue>,
 ) -> Option<BlockCall> {
     let barg: Vec<BlockArg> =
         args.iter().map(|v| vmap.get(v).copied().map(BlockArg::Value)).collect::<Option<_>>()?;
     Some(BlockCall::new(target, barg, &mut func.dfg.value_lists))
 }
 
-fn external_name(func: &mut ClifFunction, target: &RirExternalTarget) -> Option<ExternalName> {
+fn external_name(func: &mut CgFunction, target: &RirExternalTarget) -> Option<ExternalName> {
     Some(match target {
         RirExternalTarget::User { namespace, index } => {
             let name_ref =
@@ -961,7 +988,7 @@ fn external_name(func: &mut ClifFunction, target: &RirExternalTarget) -> Option<
 
 fn export_try_arg(
     arg: &RirTryArg,
-    vmap: &HashMap<RirValue, ClifValue>,
+    vmap: &HashMap<RirValue, CgValue>,
 ) -> Option<BlockArg> {
     Some(match arg {
         RirTryArg::Value(v) => BlockArg::Value(*vmap.get(v)?),
@@ -971,10 +998,10 @@ fn export_try_arg(
 }
 
 fn export_try_block(
-    func: &mut ClifFunction,
+    func: &mut CgFunction,
     call: &RirTryBlockCall,
-    vmap: &HashMap<RirValue, ClifValue>,
-    block_map: &[ClifBlock],
+    vmap: &HashMap<RirValue, CgValue>,
+    block_map: &[CgBlock],
 ) -> Option<BlockCall> {
     let block = *block_map.get(call.block.0 as usize)?;
     let args = call
@@ -986,10 +1013,10 @@ fn export_try_block(
 }
 
 fn export_exception(
-    func: &mut ClifFunction,
+    func: &mut CgFunction,
     exception: &[RirExceptionItem],
-    vmap: &HashMap<RirValue, ClifValue>,
-    block_map: &[ClifBlock],
+    vmap: &HashMap<RirValue, CgValue>,
+    block_map: &[CgBlock],
 ) -> Option<Vec<ExceptionTableItem>> {
     exception
         .iter()
@@ -1010,7 +1037,7 @@ fn export_exception(
         .collect()
 }
 
-fn map_external_target(func: &ClifFunction, name: ExternalName) -> Option<RirExternalTarget> {
+fn map_external_target(func: &CgFunction, name: ExternalName) -> Option<RirExternalTarget> {
     Some(match name {
         ExternalName::User(name_ref) => {
             let name = &func.params.user_named_funcs()[name_ref];
@@ -1023,7 +1050,7 @@ fn map_external_target(func: &ClifFunction, name: ExternalName) -> Option<RirExt
 }
 
 fn external_index(
-    func: &ClifFunction,
+    func: &CgFunction,
     externals: &mut Vec<RirExternal>,
     ext_data: &ExtFuncData,
 ) -> Option<u32> {
@@ -1048,7 +1075,7 @@ fn external_index(
     })
 }
 
-fn map_global_data(func: &ClifFunction, data: &GlobalValueData) -> Option<RirGlobalData> {
+fn map_global_data(func: &CgFunction, data: &GlobalValueData) -> Option<RirGlobalData> {
     Some(match data {
         GlobalValueData::VMContext => RirGlobalData::VMContext,
         GlobalValueData::Load { base, offset, global_type, .. } => RirGlobalData::Load {
@@ -1074,7 +1101,7 @@ fn map_global_data(func: &ClifFunction, data: &GlobalValueData) -> Option<RirGlo
     })
 }
 
-fn map_try_arg(func: &ClifFunction, arg: BlockArg, vmap: &HashMap<ClifValue, RirValue>) -> Option<RirTryArg> {
+fn map_try_arg(func: &CgFunction, arg: BlockArg, vmap: &HashMap<CgValue, RirValue>) -> Option<RirTryArg> {
     Some(match arg {
         BlockArg::Value(v) => RirTryArg::Value(lookup(func, vmap, v)?),
         BlockArg::TryCallRet(i) => RirTryArg::Ret(i),
@@ -1083,10 +1110,10 @@ fn map_try_arg(func: &ClifFunction, arg: BlockArg, vmap: &HashMap<ClifValue, Rir
 }
 
 fn map_try_block(
-    func: &ClifFunction,
+    func: &CgFunction,
     call: &BlockCall,
-    vmap: &HashMap<ClifValue, RirValue>,
-    block_map: &HashMap<ClifBlock, RirBlock>,
+    vmap: &HashMap<CgValue, RirValue>,
+    block_map: &HashMap<CgBlock, RirBlock>,
 ) -> Option<RirTryBlockCall> {
     let block = *block_map.get(&call.block(&func.dfg.value_lists))?;
     let args = call
@@ -1097,10 +1124,10 @@ fn map_try_block(
 }
 
 fn map_exception(
-    func: &ClifFunction,
+    func: &CgFunction,
     table: &ExceptionTableData,
-    vmap: &HashMap<ClifValue, RirValue>,
-    block_map: &HashMap<ClifBlock, RirBlock>,
+    vmap: &HashMap<CgValue, RirValue>,
+    block_map: &HashMap<CgBlock, RirBlock>,
 ) -> Option<Vec<RirExceptionItem>> {
     let mut out = Vec::new();
     for item in table.items() {
@@ -1117,7 +1144,7 @@ fn map_exception(
     Some(out)
 }
 
-fn map_type_to_rir(t: ClifType) -> Option<RirType> {
+fn map_type_to_rir(t: CgType) -> Option<RirType> {
     Some(if t == types::I8 {
         RirType::I8
     } else if t == types::I16 {
@@ -1137,7 +1164,7 @@ fn map_type_to_rir(t: ClifType) -> Option<RirType> {
     })
 }
 
-fn map_type_to_clif(t: RirType) -> Option<ClifType> {
+fn map_type_to_cg(t: RirType) -> Option<CgType> {
     Some(match t {
         RirType::I8 => types::I8,
         RirType::I16 => types::I16,
@@ -1148,6 +1175,32 @@ fn map_type_to_clif(t: RirType) -> Option<ClifType> {
         RirType::F64 => types::F64,
         RirType::Bool => types::I8,
         RirType::Ptr => types::I64,
+    })
+}
+
+fn map_unop(op: Opcode) -> Option<RirUnOp> {
+    Some(match op {
+        Opcode::Uextend => RirUnOp::Uextend,
+        Opcode::Sextend => RirUnOp::Sextend,
+        Opcode::Ireduce => RirUnOp::Ireduce,
+        Opcode::Bnot => RirUnOp::Bnot,
+        Opcode::Bitcast => RirUnOp::Bitcast,
+        Opcode::Fpromote => RirUnOp::Fpromote,
+        Opcode::Fdemote => RirUnOp::Fdemote,
+        _ => return None,
+    })
+}
+
+fn map_unop_to_cg(op: RirUnOp) -> Option<Opcode> {
+    Some(match op {
+        RirUnOp::Uextend => Opcode::Uextend,
+        RirUnOp::Sextend => Opcode::Sextend,
+        RirUnOp::Ireduce => Opcode::Ireduce,
+        RirUnOp::Bnot => Opcode::Bnot,
+        RirUnOp::Bitcast => Opcode::Bitcast,
+        RirUnOp::Fpromote => Opcode::Fpromote,
+        RirUnOp::Fdemote => Opcode::Fdemote,
+        _ => return None,
     })
 }
 
@@ -1174,7 +1227,7 @@ fn map_binop(op: Opcode) -> Option<BinOp> {
     })
 }
 
-fn map_binop_to_clif(op: BinOp) -> Option<Opcode> {
+fn map_binop_to_cg(op: BinOp) -> Option<Opcode> {
     Some(match op {
         BinOp::Add => Opcode::Iadd,
         BinOp::Sub => Opcode::Isub,
@@ -1196,56 +1249,56 @@ fn map_binop_to_clif(op: BinOp) -> Option<Opcode> {
     })
 }
 
-fn map_intcc(cc: ClifIntCC) -> Option<RirIntCc> {
+fn map_intcc(cc: CgIntCC) -> Option<RirIntCc> {
     Some(match cc {
-        ClifIntCC::Equal => RirIntCc::Eq,
-        ClifIntCC::NotEqual => RirIntCc::Ne,
-        ClifIntCC::SignedLessThan => RirIntCc::Slt,
-        ClifIntCC::SignedLessThanOrEqual => RirIntCc::Sle,
-        ClifIntCC::SignedGreaterThan => RirIntCc::Sgt,
-        ClifIntCC::SignedGreaterThanOrEqual => RirIntCc::Sge,
-        ClifIntCC::UnsignedLessThan => RirIntCc::Ult,
-        ClifIntCC::UnsignedLessThanOrEqual => RirIntCc::Ule,
-        ClifIntCC::UnsignedGreaterThan => RirIntCc::Ugt,
-        ClifIntCC::UnsignedGreaterThanOrEqual => RirIntCc::Uge,
+        CgIntCC::Equal => RirIntCc::Eq,
+        CgIntCC::NotEqual => RirIntCc::Ne,
+        CgIntCC::SignedLessThan => RirIntCc::Slt,
+        CgIntCC::SignedLessThanOrEqual => RirIntCc::Sle,
+        CgIntCC::SignedGreaterThan => RirIntCc::Sgt,
+        CgIntCC::SignedGreaterThanOrEqual => RirIntCc::Sge,
+        CgIntCC::UnsignedLessThan => RirIntCc::Ult,
+        CgIntCC::UnsignedLessThanOrEqual => RirIntCc::Ule,
+        CgIntCC::UnsignedGreaterThan => RirIntCc::Ugt,
+        CgIntCC::UnsignedGreaterThanOrEqual => RirIntCc::Uge,
     })
 }
 
-fn map_intcc_to_clif(cc: RirIntCc) -> Option<ClifIntCC> {
+fn map_intcc_to_cg(cc: RirIntCc) -> Option<CgIntCC> {
     Some(match cc {
-        RirIntCc::Eq => ClifIntCC::Equal,
-        RirIntCc::Ne => ClifIntCC::NotEqual,
-        RirIntCc::Slt => ClifIntCC::SignedLessThan,
-        RirIntCc::Sle => ClifIntCC::SignedLessThanOrEqual,
-        RirIntCc::Sgt => ClifIntCC::SignedGreaterThan,
-        RirIntCc::Sge => ClifIntCC::SignedGreaterThanOrEqual,
-        RirIntCc::Ult => ClifIntCC::UnsignedLessThan,
-        RirIntCc::Ule => ClifIntCC::UnsignedLessThanOrEqual,
-        RirIntCc::Ugt => ClifIntCC::UnsignedGreaterThan,
-        RirIntCc::Uge => ClifIntCC::UnsignedGreaterThanOrEqual,
+        RirIntCc::Eq => CgIntCC::Equal,
+        RirIntCc::Ne => CgIntCC::NotEqual,
+        RirIntCc::Slt => CgIntCC::SignedLessThan,
+        RirIntCc::Sle => CgIntCC::SignedLessThanOrEqual,
+        RirIntCc::Sgt => CgIntCC::SignedGreaterThan,
+        RirIntCc::Sge => CgIntCC::SignedGreaterThanOrEqual,
+        RirIntCc::Ult => CgIntCC::UnsignedLessThan,
+        RirIntCc::Ule => CgIntCC::UnsignedLessThanOrEqual,
+        RirIntCc::Ugt => CgIntCC::UnsignedGreaterThan,
+        RirIntCc::Uge => CgIntCC::UnsignedGreaterThanOrEqual,
     })
 }
 
-fn map_floatcc(cc: ClifFloatCC) -> Option<RirFloatCc> {
+fn map_floatcc(cc: CgFloatCC) -> Option<RirFloatCc> {
     Some(match cc {
-        ClifFloatCC::Equal => RirFloatCc::Eq,
-        ClifFloatCC::NotEqual => RirFloatCc::Ne,
-        ClifFloatCC::LessThan => RirFloatCc::Lt,
-        ClifFloatCC::LessThanOrEqual => RirFloatCc::Le,
-        ClifFloatCC::GreaterThan => RirFloatCc::Gt,
-        ClifFloatCC::GreaterThanOrEqual => RirFloatCc::Ge,
+        CgFloatCC::Equal => RirFloatCc::Eq,
+        CgFloatCC::NotEqual => RirFloatCc::Ne,
+        CgFloatCC::LessThan => RirFloatCc::Lt,
+        CgFloatCC::LessThanOrEqual => RirFloatCc::Le,
+        CgFloatCC::GreaterThan => RirFloatCc::Gt,
+        CgFloatCC::GreaterThanOrEqual => RirFloatCc::Ge,
         _ => return None,
     })
 }
 
-fn map_floatcc_to_clif(cc: RirFloatCc) -> Option<ClifFloatCC> {
+fn map_floatcc_to_cg(cc: RirFloatCc) -> Option<CgFloatCC> {
     Some(match cc {
-        RirFloatCc::Eq => ClifFloatCC::Equal,
-        RirFloatCc::Ne => ClifFloatCC::NotEqual,
-        RirFloatCc::Lt => ClifFloatCC::LessThan,
-        RirFloatCc::Le => ClifFloatCC::LessThanOrEqual,
-        RirFloatCc::Gt => ClifFloatCC::GreaterThan,
-        RirFloatCc::Ge => ClifFloatCC::GreaterThanOrEqual,
+        RirFloatCc::Eq => CgFloatCC::Equal,
+        RirFloatCc::Ne => CgFloatCC::NotEqual,
+        RirFloatCc::Lt => CgFloatCC::LessThan,
+        RirFloatCc::Le => CgFloatCC::LessThanOrEqual,
+        RirFloatCc::Gt => CgFloatCC::GreaterThan,
+        RirFloatCc::Ge => CgFloatCC::GreaterThanOrEqual,
     })
 }
 
@@ -1634,8 +1687,8 @@ mod call_tests {
 
     use super::*;
 
-    fn new_func(params: &[ClifType], rets: &[ClifType]) -> (ClifFunction, ClifBlock) {
-        let mut func = ClifFunction::new();
+    fn new_func(params: &[CgType], rets: &[CgType]) -> (CgFunction, CgBlock) {
+        let mut func = CgFunction::new();
         func.signature.params = params.iter().map(|t| AbiParam::new(*t)).collect();
         func.signature.returns = rets.iter().map(|t| AbiParam::new(*t)).collect();
         let entry = func.dfg.make_block();

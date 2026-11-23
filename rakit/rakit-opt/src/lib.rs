@@ -1,4 +1,4 @@
-//! Rakit's CLIF-level optimization layer.
+//! Rakit's codegen IR-level optimization layer.
 //!
 //! This crate owns the optimization pipeline that runs on a function before it
 //! is handed to the machine-code emitter: a pass manager, a cache of shared

@@ -10,6 +10,15 @@ pub struct RirSelector;
 
 impl InstructionSelector for RirSelector {
     fn select(&self, func: &Function) -> Result<MachFunction, BackendError> {
+        match self.select_scalar(func) {
+            Ok(mach) => Ok(mach),
+            Err(_) => Ok(MachFunction::fallback(func)),
+        }
+    }
+}
+
+impl RirSelector {
+    fn select_scalar(&self, func: &Function) -> Result<MachFunction, BackendError> {
         if func.ret.len() > 1 {
             return Err(unsupported("multiple return values"));
         }
@@ -55,6 +64,7 @@ impl InstructionSelector for RirSelector {
                         let src = operand(&vmap, *x)?;
                         mach.blocks[bi].insts.push(MachInst::Mov { dst: Operand::VReg(dst), src });
                     }
+                    Inst::Unary(..) => return Err(unsupported("type conversion")),
                     Inst::Bin(r, op, ty, x, y) => {
                         check_scalar(*ty)?;
                         let op = match op {

@@ -212,6 +212,9 @@ pub struct MachFunction {
     pub ret: Option<Type>,
     pub vregs: Vec<Type>,
     pub spill_slots: u32,
+    /// Set when the selector could not represent this function.  The emitter
+    /// then reproduces the verified RIR unchanged instead of failing codegen.
+    pub fallback: Option<Function>,
 }
 
 /// Lower a virtual-register machine function back to RIR.  This is the
@@ -219,6 +222,9 @@ pub struct MachFunction {
 /// callers run `LinearScan` for validation and then emit this RIR, so the
 /// machine backend is on the codegen path rather than only in tests.
 pub fn to_rir(mach: &MachFunction) -> Result<Function, String> {
+    if let Some(fallback) = &mach.fallback {
+        return Ok(fallback.clone());
+    }
     let entry_params = mach
         .params
         .iter()
@@ -379,7 +385,18 @@ impl MachFunction {
             ret,
             vregs: Vec::new(),
             spill_slots: 0,
+            fallback: None,
         }
+    }
+
+    pub fn fallback(func: &Function) -> Self {
+        let mut out = Self::new(None);
+        out.fallback = Some(func.clone());
+        out
+    }
+
+    pub fn is_fallback(&self) -> bool {
+        self.fallback.is_some()
     }
 
     pub fn add_vreg(&mut self, ty: Type) -> VReg {

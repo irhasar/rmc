@@ -32,10 +32,10 @@ pub fn rir_enabled(_crate_name: &str, _user_crate: bool) -> bool {
 
 /// Whether the Phase 3 custom ISel/regalloc runs after RIR passes
 /// (`RAKIT_CUSTOM_BACKEND` on). It validates the RIR through the machine-IR
-/// backend but does not replace CLIF emission.
+/// backend but does not replace codegen IR emission.
 pub fn custom_backend_enabled() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| flag("RAKIT_CUSTOM_BACKEND"))
+    *V.get_or_init(|| !flag("RAKIT_NO_CUSTOM_BACKEND"))
 }
 
 /// Whether RIR SROA runs.  It is opt-in because the dynamic-address and
@@ -44,6 +44,24 @@ pub fn custom_backend_enabled() -> bool {
 pub fn rir_sroa_enabled() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| flag("RAKIT_RIR_SROA"))
+}
+
+/// Whether RIR `rec_loop` runs (`RAKIT_NO_RIR_REC_LOOP` off).
+pub fn rir_rec_loop_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| !flag("RAKIT_NO_RIR_REC_LOOP"))
+}
+
+/// Whether the RIR inliner runs (`RAKIT_NO_RIR_INLINE` off).
+pub fn rir_inline_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| !flag("RAKIT_NO_RIR_INLINE"))
+}
+
+/// Whether RIR loop unrolling runs (`RAKIT_NO_RIR_UNROLL` off).
+pub fn rir_unroll_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| !flag("RAKIT_NO_RIR_UNROLL"))
 }
 
 /// Whether RIR `sincos` fusion runs (`RAKIT_NO_RIR_SINCOS` off).

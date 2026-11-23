@@ -23,7 +23,7 @@ fn promotes_straight_line_slot() {
 }
 
 #[test]
-fn promotes_diamond_with_phi() {
+fn does_not_promote_cross_block_diamond() {
     let mut b = Builder::new(vec![Type::I64], vec![Type::I64, Type::Bool]);
     let e = b.func().entry;
     let x = b.func().block(e).params[0];
@@ -48,9 +48,9 @@ fn promotes_diamond_with_phi() {
     b.ret(join, vec![y]);
 
     let mut f = b.into_func();
-    assert!(sroa::run(&mut f));
+    assert!(!sroa::run(&mut f));
     assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
-    assert!(f.stack_slots.is_empty());
+    assert_eq!(f.stack_slots.len(), 1);
     assert_eq!(run(&f, &[Val::I(0), Val::B(true)]).unwrap(), vec![Val::I(10)]);
     assert_eq!(run(&f, &[Val::I(0), Val::B(false)]).unwrap(), vec![Val::I(20)]);
     let _ = x;
@@ -109,7 +109,7 @@ fn removes_unused_slot() {
 }
 
 #[test]
-fn promotes_loop_carried_slot() {
+fn does_not_promote_cross_block_loop() {
     let mut b = Builder::new(vec![Type::I64], vec![Type::I64]);
     let e = b.func().entry;
     let x = b.func().block(e).params[0];
@@ -137,9 +137,9 @@ fn promotes_loop_carried_slot() {
     b.ret(exit, vec![out]);
 
     let mut f = b.into_func();
-    assert!(sroa::run(&mut f));
+    assert!(!sroa::run(&mut f));
     assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
-    assert!(f.stack_slots.is_empty());
+    assert_eq!(f.stack_slots.len(), 1);
     assert_eq!(run(&f, &[Val::I(0)]).unwrap(), vec![Val::I(2)]);
 }
 

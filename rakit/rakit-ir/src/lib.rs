@@ -13,7 +13,7 @@
 //!   elimination);
 //! - [`interp`]: a reference interpreter used by the tests.
 //!
-//! A later step will add the CLIF bridge (import/export) and move existing
+//! A later step will add the codegen IR bridge (import/export) and move existing
 //! passes onto this IR.
 
 pub(crate) mod cfg_util;
@@ -23,15 +23,18 @@ pub mod builder;
 pub mod div_test;
 pub mod gvn;
 pub mod if_convert;
+pub mod inliner;
 pub mod int_sem;
 pub mod interp;
 pub mod ir;
 pub mod licm;
 pub mod mem_forward;
 pub mod opt;
+pub mod rec_loop;
 pub mod simplify;
 pub mod sincos;
 pub mod sroa;
+pub mod unroll;
 pub mod verify;
 
 pub use builder::Builder;

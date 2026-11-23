@@ -23,16 +23,16 @@ pub trait Pass {
 }
 
 #[derive(Default)]
-pub struct PassManager {
-    passes: Vec<Box<dyn Pass>>,
+pub struct PassManager<'a> {
+    passes: Vec<Box<dyn Pass + 'a>>,
 }
 
-impl PassManager {
+impl<'a> PassManager<'a> {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn push(&mut self, pass: Box<dyn Pass>) -> &mut Self {
+    pub fn push(&mut self, pass: Box<dyn Pass + 'a>) -> &mut Self {
         self.passes.push(pass);
         self
     }

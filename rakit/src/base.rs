@@ -190,7 +190,7 @@ pub(crate) fn compile_fn(
 
     // Inline small callees that live in the same codegen unit before optimizing. Rakit only
     // provides the mechanics; the heuristic lives in `crate::inliner`.
-    if !bodies.is_empty() {
+    if !bodies.is_empty() && std::env::var_os("RAKIT_NO_CODEGEN_INLINE").is_none() {
         let inliner =
             crate::inliner::CguInliner::new(bodies, codegened_func.func_id.as_u32(), &context.func);
         if let Err(err) = crate::passtime::time(crate::passtime::INLINE, || context.inline(inliner))
@@ -199,13 +199,13 @@ pub(crate) fn compile_fn(
         }
     }
 
-    // Run Rakit's CLIF optimization pipeline. The pass manager owns the order
+    // Run Rakit's codegen IR optimization pipeline. The pass manager owns the order
     // and the shared analysis cache; each pass is independent of the others.
     // `rec_loop` and `store_forward` must precede `unroll`, whose affine
     // analysis rejects any loop that still contains a call or touches memory.
     let mut pipeline = rakit_opt::PassManager::new();
     pipeline
-        .push(Box::new(rakit_opt::RirPass))
+        .push(Box::new(rakit_opt::RirPass::new(bodies)))
         .push(Box::new(rakit_opt::RecLoopPass))
         .push(Box::new(rakit_opt::StoreForwardPass))
         .push(Box::new(rakit_opt::DivTestPass))

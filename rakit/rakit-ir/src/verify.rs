@@ -141,6 +141,14 @@ pub fn verify(func: &Function) -> Result<(), Vec<String>> {
                         errs.push(format!("binary result {r:?} type mismatch"));
                     }
                 }
+                Inst::Unary(r, _, ty, x) => {
+                    if ty_of(*x).is_none() {
+                        errs.push(format!("unary operand {x:?} is undefined"));
+                    }
+                    if ty_of(*r) != Some(*ty) {
+                        errs.push(format!("unary result {r:?} type mismatch"));
+                    }
+                }
                 Inst::Icmp(r, _, ty, x, y) => {
                     check_same(&mut errs, *x, *y);
                     if !ty.is_int() {

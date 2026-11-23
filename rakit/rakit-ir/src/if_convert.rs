@@ -278,6 +278,7 @@ fn clone_inst(func: &mut Function, inst: &Inst, map: &mut HashMap<Value, Value>)
         Inst::F64const(_, v) => Inst::F64const(new, *v),
         Inst::Copy(_, ty, x) => Inst::Copy(new, *ty, remap(*x, map)),
         Inst::Bin(_, op, ty, x, y) => Inst::Bin(new, *op, *ty, remap(*x, map), remap(*y, map)),
+        Inst::Unary(_, op, ty, x) => Inst::Unary(new, *op, *ty, remap(*x, map)),
         Inst::Icmp(_, cc, ty, x, y) => Inst::Icmp(new, *cc, *ty, remap(*x, map), remap(*y, map)),
         Inst::Fcmp(_, cc, ty, x, y) => Inst::Fcmp(new, *cc, *ty, remap(*x, map), remap(*y, map)),
         Inst::Call(..)

@@ -1,6 +1,6 @@
 //! RIR port of the `sin(x)`/`cos(x)` fusion pass.
 //!
-//! LLVM (and the CLIF pass in `rakit-opt`) replaces a pair of libcalls with a
+//! LLVM (and the codegen IR pass in `rakit-opt`) replaces a pair of libcalls with a
 //! single `sincos`/`sincosf` call.  This RIR version handles the same-block
 //! case: both calls must use the identical argument and the sine call must
 //! precede the cosine call.

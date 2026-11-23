@@ -29,6 +29,7 @@ fn access_loc(_func: &Function, key: Key, target: u32, ty: Type) -> Option<Loc> 
 }
 
 pub fn run(func: &mut Function) -> bool {
+    let original = func.clone();
     let mut changed = false;
     let slots = func.stack_slots.len();
     for slot in 0..slots {
@@ -44,6 +45,13 @@ pub fn run(func: &mut Function) -> bool {
     if remove_unused_slots(func) {
         changed = true;
     }
+    if changed {
+        crate::optimize(func);
+    }
+    if changed && crate::verify(func).is_err() {
+        *func = original;
+        return false;
+    }
     changed
 }
 
@@ -55,6 +63,31 @@ fn new_value(func: &mut Function, ty: Type) -> Value {
 
 fn promote_slot(func: &mut Function, target: u32) -> bool {
     if func.stack_slots.get(target as usize).is_none() {
+        return false;
+    }
+    // Keep promotion to a single straight-line block.  The std slice-pattern
+    // suite exposed a miscompile when an entry block was also a loop header,
+    // so a function with any control flow is left alone until the cross-block
+    // must-store proof lands.
+    if func.blocks.len() != 1
+        || !matches!(func.blocks[0].insts.last(), Some(Inst::Return(_)))
+    {
+        return false;
+    }
+    // A call can observe memory through an alias that the address-use scan
+    // cannot prove private.  Keep promotion to leaf code until alias analysis
+    // exists.
+    if func.blocks.iter().any(|b| {
+        b.insts.iter().any(|i| {
+            matches!(
+                i,
+                Inst::Call(..)
+                    | Inst::CallIndirect { .. }
+                    | Inst::TryCall { .. }
+                    | Inst::TryCallIndirect { .. }
+            )
+        })
+    }) {
         return false;
     }
     let defs = definitions(func);
@@ -93,7 +126,10 @@ fn promote_slot(func: &mut Function, target: u32) -> bool {
                         access_blocks.insert(bi);
                     }
                 }
-                Inst::Store(ty, addr, offset, _) => {
+                Inst::Store(ty, addr, offset, value) => {
+                    if func.ty(*value) != *ty {
+                        continue;
+                    }
                     let Some(key) = key_of(&defs, func, *addr, *offset, *ty) else {
                         continue;
                     };
@@ -109,6 +145,12 @@ fn promote_slot(func: &mut Function, target: u32) -> bool {
     }
 
     if keys.is_empty() || access_blocks.iter().any(|b| !reachable.contains(b)) {
+        return false;
+    }
+    // Cross-block promotion needs a complete must-store proof at every phi
+    // edge.  Until that is in place, keep SROA to straight-line blocks; the
+    // std slice-pattern suite exposed a cross-block case this pass got wrong.
+    if access_blocks.len() != 1 || !access_blocks.contains(&(func.entry.0 as usize)) {
         return false;
     }
 
@@ -289,6 +331,10 @@ impl Renamer<'_> {
                     insts.push(inst);
                 }
                 Inst::Store(ty, addr, offset, value) => {
+                    if self.func.ty(*value) != *ty {
+                        insts.push(inst);
+                        continue;
+                    }
                     if let Some(key) = key_of(&self.defs, self.func, *addr, *offset, *ty) {
                         if let Some(loc) = access_loc(self.func, key, self.target, *ty) {
                             self.current.insert(loc, *value);

@@ -262,6 +262,7 @@ fn remap_inst_values(inst: &mut Inst, map: &[Option<Value>]) {
         | Inst::F64const(..)
         | Inst::StackAddr(..) => {}
         Inst::Copy(_, _, x) => r(map, x),
+        Inst::Unary(_, _, _, x) => r(map, x),
         Inst::Bin(_, _, _, x, y) | Inst::Icmp(_, _, _, x, y) | Inst::Fcmp(_, _, _, x, y) => {
             r(map, x);
             r(map, y);

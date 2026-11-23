@@ -29,10 +29,18 @@ fn verified(rir: &rakit_ir::Function, label: &str, debug: bool) -> bool {
 }
 
 /// Round trip through the Rakit mid-level IR. It fires for functions the
-/// CLIF<->RIR bridge supports; unsupported functions are left untouched.
-pub struct RirPass;
+/// codegen IR<->RIR bridge supports; unsupported functions are left untouched.
+pub struct RirPass<'a> {
+    bodies: Option<&'a crate::passes::inliner::CguBodies>,
+}
 
-impl Pass for RirPass {
+impl<'a> RirPass<'a> {
+    pub fn new(bodies: &'a crate::passes::inliner::CguBodies) -> Self {
+        Self { bodies: Some(bodies) }
+    }
+}
+
+impl Pass for RirPass<'_> {
     fn name(&self) -> &'static str {
         "rir"
     }
@@ -71,8 +79,46 @@ impl Pass for RirPass {
                 return false;
             }
         }
+        let rec_changed =
+            crate::tunables::rir_rec_loop_enabled() && rakit_ir::rec_loop::run(&mut rir_func);
+        if rec_changed {
+            rakit_ir::optimize(&mut rir_func);
+            changed = true;
+        }
+        if rec_changed && !verified(&rir_func, "rec_loop", debug) {
+            return false;
+        }
+        if debug && rec_changed {
+            eprintln!("[rir] rec_loop fired");
+        }
+        let unroll_changed =
+            crate::tunables::rir_unroll_enabled() && rakit_ir::unroll::run(&mut rir_func);
+        if unroll_changed {
+            rakit_ir::optimize(&mut rir_func);
+            changed = true;
+        }
+        if unroll_changed && !verified(&rir_func, "unroll", debug) {
+            return false;
+        }
+        if debug && unroll_changed {
+            eprintln!("[rir] unroll fired");
+        }
         if debug && simplify_changed {
             eprintln!("[rir] simplify fired");
+        }
+        if let Some(bodies) = self.bodies {
+            let inline_changed = crate::tunables::rir_inline_enabled()
+                && rakit_ir::inliner::run(&mut rir_func, bodies.rir_bodies());
+            if inline_changed {
+                rakit_ir::optimize(&mut rir_func);
+                changed = true;
+            }
+            if inline_changed && !verified(&rir_func, "inliner", debug) {
+                return false;
+            }
+            if debug && inline_changed {
+                eprintln!("[rir] inliner fired");
+            }
         }
         let mem_changed = rakit_ir::mem_forward::run(&mut rir_func);
         if mem_changed {
@@ -95,7 +141,7 @@ impl Pass for RirPass {
             return false;
         }
         if debug && sroa_changed {
-            eprintln!("[rir] sroa fired");
+            eprintln!("[rir] sroa fired {:?}", pctx.ctx.func.name);
         }
         let div_changed = rakit_ir::div_test::run(&mut rir_func);
         if div_changed {
@@ -159,6 +205,27 @@ impl Pass for RirPass {
         if crate::tunables::custom_backend_enabled() {
             let selector = rakit_ir::backend::RirSelector;
             match selector.select(&rir_func) {
+                Ok(prealloc) if prealloc.is_fallback() => {
+                    match rakit_ir::backend::mach::to_rir(&prealloc) {
+                        Ok(emitted) if rakit_ir::verify(&emitted).is_ok() => {
+                            rir_func = emitted;
+                            changed = true;
+                            if debug {
+                                eprintln!("[rir] custom backend fallback emitted");
+                            }
+                        }
+                        Ok(_) => {
+                            if debug {
+                                eprintln!("[rir] custom fallback emitter produced invalid RIR");
+                            }
+                        }
+                        Err(err) => {
+                            if debug {
+                                eprintln!("[rir] custom fallback emitter skip: {err}");
+                            }
+                        }
+                    }
+                }
                 Ok(prealloc) => {
                     let mut mach = prealloc.clone();
                     match rakit_ir::backend::LinearScan.allocate(&mut mach) {

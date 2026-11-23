@@ -155,6 +155,22 @@ impl BinOp {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum UnOp {
+    Uextend,
+    Sextend,
+    Ireduce,
+    Bint,
+    Bnot,
+    Bitcast,
+    Fpromote,
+    Fdemote,
+    FcvtFromInt,
+    FcvtToInt,
+    FcvtFromUint,
+    FcvtToUint,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum IntCc {
     Eq,
     Ne,
@@ -189,6 +205,8 @@ pub enum Inst {
     /// Copy of another value (used by folding to avoid renumbering values).
     Copy(Value, Type, Value),
     Bin(Value, BinOp, Type, Value, Value),
+    /// Type conversion: result, opcode, result type, operand.
+    Unary(Value, UnOp, Type, Value),
     Icmp(Value, IntCc, Type, Value, Value),
     Fcmp(Value, FloatCc, Type, Value, Value),
     Select(Value, Type, Value, Value, Value),
@@ -248,6 +266,7 @@ impl Inst {
             | Inst::F64const(v, _)
             | Inst::Copy(v, _, _)
             | Inst::Bin(v, _, _, _, _)
+            | Inst::Unary(v, _, _, _)
             | Inst::Icmp(v, _, _, _, _)
             | Inst::Fcmp(v, _, _, _, _)
             | Inst::Select(v, _, _, _, _)
@@ -294,6 +313,7 @@ impl Inst {
             | Inst::StackAddr(..) => Vec::new(),
             Inst::Copy(_, _, x) => vec![*x],
             Inst::Bin(_, _, _, x, y) => vec![*x, *y],
+            Inst::Unary(_, _, _, x) => vec![*x],
             Inst::Icmp(_, _, _, x, y) => vec![*x, *y],
             Inst::Fcmp(_, _, _, x, y) => vec![*x, *y],
             Inst::Select(_, _, c, x, y) => vec![*c, *x, *y],
@@ -394,6 +414,7 @@ impl Inst {
                 r(x, old, new);
                 r(y, old, new);
             }
+            Inst::Unary(_, _, _, x) => r(x, old, new),
             Inst::Select(_, _, c, x, y) => {
                 r(c, old, new);
                 r(x, old, new);
@@ -477,6 +498,8 @@ pub struct Function {
     pub stack_limit: Option<u32>,
     /// Direct external functions referenced by `Call`/`FuncAddr`.
     pub externals: Vec<External>,
+    /// Target name of this function when it can call itself.
+    pub self_target: Option<ExternalTarget>,
 }
 
 impl Function {
@@ -501,6 +524,7 @@ impl Function {
             globals: Vec::new(),
             stack_limit: None,
             externals: Vec::new(),
+            self_target: None,
         }
     }
 

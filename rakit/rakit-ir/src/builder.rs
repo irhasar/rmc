@@ -2,7 +2,7 @@
 
 use crate::ir::{
     BinOp, Block, BlockData, ExceptionItem, FloatCc, Function, Inst, IntCc, StackSlot,
-    StackSlotData, TryBlockCall, Type, Value,
+    StackSlotData, TryBlockCall, Type, UnOp, Value,
 };
 
 pub struct Builder {
@@ -72,6 +72,12 @@ impl Builder {
     pub fn bin(&mut self, b: Block, op: BinOp, ty: Type, x: Value, y: Value) -> Value {
         let r = self.new_value(ty);
         self.push(b, Inst::Bin(r, op, ty, x, y));
+        r
+    }
+
+    pub fn unary(&mut self, b: Block, op: UnOp, ty: Type, x: Value) -> Value {
+        let r = self.new_value(ty);
+        self.push(b, Inst::Unary(r, op, ty, x));
         r
     }
 
