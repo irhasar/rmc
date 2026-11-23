@@ -17,6 +17,7 @@
 //! passes onto this IR.
 
 pub mod builder;
+pub mod div_test;
 pub mod interp;
 pub mod ir;
 pub mod opt;

@@ -40,7 +40,15 @@ impl Pass for RirPass {
             }
             return false;
         };
-        let changed = rakit_ir::optimize(&mut rir_func);
+        let mut changed = rakit_ir::optimize(&mut rir_func);
+        let div_changed = rakit_ir::div_test::run(&mut rir_func);
+        if div_changed {
+            rakit_ir::optimize(&mut rir_func);
+            changed = true;
+        }
+        if debug && div_changed {
+            eprintln!("[rir] div_test fired");
+        }
         if !changed && std::env::var_os("RAKIT_RIR_FORCE").is_none() {
             if debug {
                 eprintln!("[rir] no-change {:?}", pctx.ctx.func.name);

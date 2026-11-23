@@ -1,5 +1,19 @@
 # AGENTS.md
 
+## Session (2026-11-23, Fase 2 step 4) — `div_test` migrated to RIR
+- `rakit-ir/src/div_test.rs`: RIR port of the CLIF divisibility fold for `I64`
+  and odd `C > 1`: `icmp eq/ne (urem x, C), 0` -> `imul x, C^-1` +
+  `icmp ule` (and `select` for `ne`). `run()` resolves `Copy` chains and finds
+  the defining `urem`; `RirPass` calls it after `optimize` and runs `optimize`
+  again to DCE the now-dead `urem`.
+- Even divisors, narrower types and `brif`-on-remainder stay in the CLIF pass:
+  RIR `brif` takes `Bool`, and RIR has no `uextend`/Bool-`band` yet.
+- Tests: `cargo test --manifest-path rakit-ir/Cargo.toml` -> 15/15 (4 new:
+  odd `eq`, odd `ne`, even/power-of-two skipped, inverse sweep).
+- End-to-end: `RAKIT_RIR=1 RAKIT_NO_DIVTEST=1` (CLIF pass disabled) on
+  `fn f(x: u64) -> u64 { if x % 3 == 0 {1} else {2} }` logs `[rir] div_test
+  fired` + `[rir] optimized` and prints `1 2 1`, same as the normal build.
+
 ## Session (2026-11-23, Fase 2 step 3) — RIR-only folds that fire end-to-end
 - `rakit-ir/src/opt.rs` now also folds, for integer types:
   `x - x -> 0`, `x ^ x -> 0`, `x & x -> x`, `x | x -> x`, `icmp x, x` to
