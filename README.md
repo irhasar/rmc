@@ -72,11 +72,12 @@ Optimizer RIR memakai identitas yang belum tentu ada di egraph Cranelift:
 (mis. `x & x` → `x`) dan output tetap sama dengan build normal.
 
 Pass RIR `div_test` (`rakit-ir/src/div_test.rs`) memindahkan fold `x % C == 0`
-ke RIR untuk `I64` dan `C` ganjil > 1: `icmp eq/ne (urem x, C), 0` →
-`imul x, C^-1` + `icmp ule` (dan `select` untuk `ne`). Dengan
+ke RIR untuk `I64`: `C` ganjil > 1 memakai `imul x, C^-1` + `icmp ule`;
+`C = 2^s * odd` memakai mask `x & (2^s - 1)` lalu uji `odd`; `C` pangkat dua
+hanya memakai mask. `eq`/`ne` dan kombinasi Bool memakai `select`. Dengan
 `RAKIT_RIR=1 RAKIT_NO_DIVTEST=1`, rewrite ini dikerjakan RIR dan output tetap
-sama. Pembagi genap, tipe lebih sempit, dan `brif` langsung pada remainder
-masih ditangani pass CLIF.
+sama. Tipe lebih sempit dan `brif` langsung pada remainder masih ditangani
+pass CLIF.
 
 ## Build
 

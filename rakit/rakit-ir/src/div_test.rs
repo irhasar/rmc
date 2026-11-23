@@ -37,7 +37,7 @@ pub fn run(func: &mut Function) -> bool {
             let Some((x, divisor)) = find_urem(func, &consts, &copies, rem) else {
                 continue;
             };
-            if divisor <= 1 || divisor % 2 == 0 {
+            if divisor <= 1 {
                 continue;
             }
             candidates.push(Candidate { bi, ii, rr: *rr, cc: *cc, x, divisor });
@@ -134,49 +134,63 @@ fn new_value(func: &mut Function, ty: Type) -> Value {
 }
 
 fn rewrite(func: &mut Function, cand: &Candidate) {
-    let inv = mod_inverse_u64(cand.divisor);
-    let threshold = u64::MAX / cand.divisor;
-    let inv_v = new_value(func, Type::I64);
-    let thr_v = new_value(func, Type::I64);
-    let prod = new_value(func, Type::I64);
-    let extra = if cand.cc == IntCc::Ne {
-        Some((
-            new_value(func, Type::Bool),
-            new_value(func, Type::Bool),
-            new_value(func, Type::Bool),
-        ))
-    } else {
-        None
-    };
+    let pow2 = cand.divisor.trailing_zeros();
+    let odd = cand.divisor >> pow2;
+    let mut prologue = Vec::new();
+    let zero_v = new_value(func, Type::I64);
+    prologue.push(Inst::Iconst(zero_v, Type::I64, 0));
 
-    let blk = &mut func.blocks[cand.bi];
-    blk.insts
-        .insert(cand.ii, Inst::Iconst(inv_v, Type::I64, inv as i64));
-    blk.insts.insert(
-        cand.ii + 1,
-        Inst::Bin(prod, BinOp::Mul, Type::I64, cand.x, inv_v),
-    );
-    blk.insts
-        .insert(cand.ii + 2, Inst::Iconst(thr_v, Type::I64, threshold as i64));
-
-    match cand.cc {
-        IntCc::Eq => {
-            blk.insts[cand.ii + 3] = Inst::Icmp(cand.rr, IntCc::Ule, Type::I64, prod, thr_v);
-        }
-        IntCc::Ne => {
-            let (tmp, false_v, true_v) = extra.unwrap();
-            blk.insts[cand.ii + 3] = Inst::Icmp(tmp, IntCc::Ule, Type::I64, prod, thr_v);
-            blk.insts
-                .insert(cand.ii + 4, Inst::Iconst(false_v, Type::Bool, 0));
-            blk.insts
-                .insert(cand.ii + 5, Inst::Iconst(true_v, Type::Bool, 1));
-            blk.insts.insert(
-                cand.ii + 6,
-                Inst::Select(cand.rr, Type::Bool, tmp, false_v, true_v),
-            );
-        }
-        _ => unreachable!("candidate conditions are eq/ne"),
+    let mut is_zero = None;
+    if pow2 > 0 {
+        let mask = (1u64 << pow2) - 1;
+        let mask_v = new_value(func, Type::I64);
+        let low = new_value(func, Type::I64);
+        let div = new_value(func, Type::Bool);
+        prologue.push(Inst::Iconst(mask_v, Type::I64, mask as i64));
+        prologue.push(Inst::Bin(low, BinOp::And, Type::I64, cand.x, mask_v));
+        prologue.push(Inst::Icmp(div, IntCc::Eq, Type::I64, low, zero_v));
+        is_zero = Some(div);
     }
+    if odd > 1 {
+        let inv = mod_inverse_u64(odd);
+        let threshold = u64::MAX / odd;
+        let inv_v = new_value(func, Type::I64);
+        let prod = new_value(func, Type::I64);
+        let thr_v = new_value(func, Type::I64);
+        let odd_tmp = new_value(func, Type::Bool);
+        prologue.push(Inst::Iconst(inv_v, Type::I64, inv as i64));
+        prologue.push(Inst::Bin(prod, BinOp::Mul, Type::I64, cand.x, inv_v));
+        prologue.push(Inst::Iconst(thr_v, Type::I64, threshold as i64));
+        prologue.push(Inst::Icmp(odd_tmp, IntCc::Ule, Type::I64, prod, thr_v));
+        is_zero = Some(match is_zero {
+            Some(div) => {
+                let both = new_value(func, Type::Bool);
+                let false_v = new_value(func, Type::Bool);
+                prologue.push(Inst::Iconst(false_v, Type::Bool, 0));
+                prologue.push(Inst::Select(both, Type::Bool, div, odd_tmp, false_v));
+                both
+            }
+            None => odd_tmp,
+        });
+    }
+
+    let mut is_zero = is_zero.expect("divisor > 1 has a test");
+    if cand.cc == IntCc::Ne {
+        let neg = new_value(func, Type::Bool);
+        let false_v = new_value(func, Type::Bool);
+        let true_v = new_value(func, Type::Bool);
+        prologue.push(Inst::Iconst(false_v, Type::Bool, 0));
+        prologue.push(Inst::Iconst(true_v, Type::Bool, 1));
+        prologue.push(Inst::Select(neg, Type::Bool, is_zero, false_v, true_v));
+        is_zero = neg;
+    }
+
+    let n = prologue.len();
+    let blk = &mut func.blocks[cand.bi];
+    for (k, inst) in prologue.into_iter().enumerate() {
+        blk.insts.insert(cand.ii + k, inst);
+    }
+    blk.insts[cand.ii + n] = Inst::Copy(cand.rr, Type::Bool, is_zero);
 }
 
 /// `C^-1 mod 2^64` for odd `C`, by Newton iteration on the 2-adic inverse.
@@ -241,14 +255,35 @@ mod tests {
     }
 
     #[test]
-    fn skips_even_and_power_of_two_divisors() {
-        let mut even = build_mod_test(4, false);
-        assert!(!run(&mut even));
-        assert_eq!(crate::run(&even, &[Val::I(8)]).unwrap(), vec![Val::I(1)]);
+    fn handles_even_and_power_of_two_divisors() {
+        for (divisor, hit, miss) in [(4i64, 8u64, 9u64), (8, 16, 17), (12, 12, 18)] {
+            let mut f = build_mod_test(divisor, false);
+            assert_eq!(
+                crate::run(&f, &[Val::I(hit as i64)]).unwrap(),
+                vec![Val::I(1)]
+            );
+            assert!(run(&mut f), "divisor {divisor} not rewritten");
+            assert!(crate::verify(&f).is_ok(), "{:?}", crate::verify(&f).err());
+            assert_eq!(
+                crate::run(&f, &[Val::I(hit as i64)]).unwrap(),
+                vec![Val::I(1)]
+            );
+            assert_eq!(
+                crate::run(&f, &[Val::I(miss as i64)]).unwrap(),
+                vec![Val::I(2)]
+            );
+            crate::optimize(&mut f);
+            assert!(!f
+                .blocks
+                .iter()
+                .any(|b| b.insts.iter().any(|i| matches!(i, Inst::Bin(_, BinOp::Urem, ..)))));
+        }
 
-        let mut pow2 = build_mod_test(8, false);
-        assert!(!run(&mut pow2));
-        assert_eq!(crate::run(&pow2, &[Val::I(8)]).unwrap(), vec![Val::I(1)]);
+        let mut ne = build_mod_test(4, true);
+        assert!(run(&mut ne));
+        assert!(crate::verify(&ne).is_ok(), "{:?}", crate::verify(&ne).err());
+        assert_eq!(crate::run(&ne, &[Val::I(8)]).unwrap(), vec![Val::I(2)]);
+        assert_eq!(crate::run(&ne, &[Val::I(9)]).unwrap(), vec![Val::I(1)]);
     }
 
     #[test]

@@ -1,5 +1,19 @@
 # AGENTS.md
 
+## Session (2026-11-23, Fase 2 step 5) — `div_test` covers even divisors in RIR
+- `rakit-ir/src/div_test.rs` now also handles `C = 2^s * odd` and powers of two
+  for `I64`: mask `x & (2^s - 1)` must be zero, plus the odd-divisor
+  multiply-compare; the two Bool tests combine with `select(a, b, false)` and
+  `ne` inverts with `select(is_zero, false, true)`.
+- The rewrite now inserts a prologue of new instructions and replaces the
+  original `icmp` with `Copy(rr, Bool, is_zero)`; `optimize` then DCEs the
+  `urem`.
+- Tests: 15/15 (the even/power-of-two test now asserts the rewrite fires for
+  `4`, `8`, `12` and for `ne` on `4`).
+- End-to-end: `RAKIT_RIR=1 RAKIT_NO_DIVTEST=1` on `x % 12 == 0` and
+  `x % 8 == 0` logs `[rir] div_test fired` for both and prints `1 2 1 1 2`,
+  identical to the normal build.
+
 ## Session (2026-11-23, Fase 2 step 4) — `div_test` migrated to RIR
 - `rakit-ir/src/div_test.rs`: RIR port of the CLIF divisibility fold for `I64`
   and odd `C > 1`: `icmp eq/ne (urem x, C), 0` -> `imul x, C^-1` +
