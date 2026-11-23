@@ -283,3 +283,83 @@ fn narrow_constant_folding_wraps() {
         vec![Val::I(0), Val::B(true), Val::B(false)]
     );
 }
+
+#[test]
+fn dce_keeps_division_by_zero() {
+    let mut b = Builder::new(vec![Type::I64], vec![Type::I64, Type::I64]);
+    let e = b.func().entry;
+    let x = b.func().block(e).params[0];
+    let zero = b.func().block(e).params[1];
+    let _dead = b.bin(e, BinOp::Udiv, Type::I64, x, zero);
+    let seven = b.iconst(e, Type::I64, 7);
+    b.ret(e, vec![seven]);
+
+    let mut f = b.into_func();
+    assert!(run(&f, &[Val::I(1), Val::I(0)]).is_err());
+    optimize(&mut f);
+    assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
+    assert!(f.blocks[0]
+        .insts
+        .iter()
+        .any(|i| matches!(i, Inst::Bin(_, BinOp::Udiv, ..))));
+    assert!(run(&f, &[Val::I(1), Val::I(0)]).is_err());
+}
+
+#[test]
+fn pointer_identity_fold_preserves_pointer_value() {
+    let mut b = Builder::new(vec![Type::Ptr], vec![Type::Ptr]);
+    let e = b.func().entry;
+    let x = b.func().block(e).params[0];
+    let zero = b.iconst(e, Type::Ptr, 0);
+    let sum = b.bin(e, BinOp::Add, Type::Ptr, x, zero);
+    b.ret(e, vec![sum]);
+
+    let mut f = b.into_func();
+    assert_eq!(run(&f, &[Val::P(42)]).unwrap(), vec![Val::P(42)]);
+    optimize(&mut f);
+    assert_eq!(run(&f, &[Val::P(42)]).unwrap(), vec![Val::P(42)]);
+}
+
+#[test]
+fn verifier_ignores_unreachable_join_predecessor() {
+    let mut b = Builder::new(vec![Type::I64], vec![Type::I64]);
+    let e = b.func().entry;
+    let x = b.func().block(e).params[0];
+    let then_b = b.add_block(vec![]);
+    let else_b = b.add_block(vec![]);
+    let join = b.add_block(vec![]);
+    let cond = b.iconst(e, Type::Bool, 1);
+    b.brif(e, cond, then_b, vec![], else_b, vec![]);
+    b.jump(then_b, join, vec![]);
+    b.jump(else_b, join, vec![]);
+    b.ret(join, vec![x]);
+
+    let mut f = b.into_func();
+    assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
+    optimize(&mut f);
+    assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
+    assert_eq!(run(&f, &[Val::I(9)]).unwrap(), vec![Val::I(9)]);
+}
+
+#[test]
+fn verifier_reports_invalid_branch_target_without_panicking() {
+    let mut f = Function::new(vec![], vec![]);
+    let e = f.entry;
+    f.block_mut(e).insts.push(Inst::Jump(Block(99), vec![]));
+    let err = verify(&f).unwrap_err();
+    assert!(err.iter().any(|e| e.contains("out of range")), "{err:?}");
+}
+
+#[test]
+fn verifier_rejects_comparison_declared_with_wrong_type() {
+    let mut b = Builder::new(vec![Type::Bool], vec![]);
+    let e = b.func().entry;
+    let x = b.f64const(e, 1.25);
+    let y = b.f64const(e, 1.75);
+    let c = b.icmp(e, rakit_ir::ir::IntCc::Eq, Type::I64, x, y);
+    b.ret(e, vec![c]);
+
+    let f = b.into_func();
+    let err = verify(&f).unwrap_err();
+    assert!(err.iter().any(|e| e.contains("declared")), "{err:?}");
+}

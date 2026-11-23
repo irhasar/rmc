@@ -51,14 +51,15 @@ fn match_loop(func: &Function, factor: usize) -> Option<Plan> {
             continue;
         }
         let iv = block.params[0];
-        let bound = match block.insts.as_slice() {
-            [Inst::Iconst(_b, Type::I64, bound), Inst::Icmp(c, IntCc::Ult, Type::I64, x, y), ..]
-                if c == cond && *x == iv && *y == *_b =>
-            {
-                *bound
-            }
-            _ => continue,
-        };
+        let bound = block
+            .insts
+            .iter()
+            .find_map(|i| match i {
+                Inst::Icmp(c, IntCc::Ult, Type::I64, x, y) if c == cond && *x == iv => {
+                    const_i64(func, *y)
+                }
+                _ => None,
+            })?;
         let step = func
             .blocks
             .iter()
@@ -81,7 +82,7 @@ fn match_loop(func: &Function, factor: usize) -> Option<Plan> {
                 _ => None,
             })
             .unwrap_or(0);
-        let start = initial_iv(func, header, iv)?;
+        let start = initial_iv(func, header, body, iv)?;
         if step <= 0 || start >= bound || (bound - start) % step != 0 {
             continue;
         }
@@ -101,22 +102,46 @@ fn match_loop(func: &Function, factor: usize) -> Option<Plan> {
     None
 }
 
-fn initial_iv(func: &Function, header: usize, iv: Value) -> Option<i64> {
-    for block in &func.blocks {
+fn const_i64(func: &Function, mut v: Value) -> Option<i64> {
+    for _ in 0..64 {
+        if let Some(Inst::Iconst(_, Type::I64, value)) = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find(|i| matches!(i, Inst::Iconst(r, Type::I64, _) if *r == v))
+        {
+            return Some(*value);
+        }
+        v = match func.blocks.iter().flat_map(|b| &b.insts).find_map(|i| match i {
+            Inst::Copy(r, _, src) if *r == v => Some(*src),
+            _ => None,
+        }) {
+            Some(next) => next,
+            None => return None,
+        };
+    }
+    None
+}
+
+fn initial_iv(func: &Function, header: usize, body: usize, iv: Value) -> Option<i64> {
+    let pos = func.blocks[header].params.iter().position(|p| *p == iv)?;
+    let mut start = None;
+    for (bi, block) in func.blocks.iter().enumerate() {
+        if bi == body {
+            continue;
+        }
         let Some(Inst::Jump(target, args)) = block.insts.last() else { continue };
         if target.0 as usize != header {
             continue;
         }
-        let pos = func.blocks[header].params.iter().position(|p| *p == iv)?;
-        let arg = *args.get(pos)?;
-        return match func.blocks.iter().flat_map(|b| &b.insts).find(|i| {
-            matches!(i, Inst::Iconst(v, Type::I64, _) if *v == arg)
-        }) {
-            Some(Inst::Iconst(_, _, v)) => Some(*v),
-            _ => None,
-        };
+        let value = const_i64(func, *args.get(pos)?)?;
+        match start {
+            Some(old) if old != value => return None,
+            Some(_) => {}
+            None => start = Some(value),
+        }
     }
-    None
+    start
 }
 
 fn rewrite(func: &mut Function, plan: Plan) {
@@ -141,9 +166,10 @@ fn rewrite(func: &mut Function, plan: Plan) {
             map.insert(*old, *new);
         }
         let old_insts = func.blocks[plan.body].insts.clone();
+        let src_types = func.values.clone();
         let mut insts = Vec::new();
         for inst in old_insts.iter().take(old_insts.len().saturating_sub(1)) {
-            if let Some(cloned) = remap_inst(func, inst, &mut map) {
+            if let Some(cloned) = remap_inst(func, &src_types, inst, &mut map) {
                 insts.push(cloned);
             }
         }
@@ -196,52 +222,53 @@ fn rewrite(func: &mut Function, plan: Plan) {
 
 pub(crate) fn remap_inst(
     func: &mut Function,
+    src_types: &[Type],
     inst: &Inst,
     map: &mut std::collections::HashMap<Value, Value>,
 ) -> Option<Inst> {
     let out = match inst {
-        Inst::Nop(r, ty) => Inst::Nop(new_result(func, *r, map), *ty),
-        Inst::Iconst(r, ty, v) => Inst::Iconst(new_result(func, *r, map), *ty, *v),
-        Inst::F32const(r, v) => Inst::F32const(new_result(func, *r, map), *v),
-        Inst::F64const(r, v) => Inst::F64const(new_result(func, *r, map), *v),
+        Inst::Nop(r, ty) => Inst::Nop(new_result(func, src_types, *r, map), *ty),
+        Inst::Iconst(r, ty, v) => Inst::Iconst(new_result(func, src_types, *r, map), *ty, *v),
+        Inst::F32const(r, v) => Inst::F32const(new_result(func, src_types, *r, map), *v),
+        Inst::F64const(r, v) => Inst::F64const(new_result(func, src_types, *r, map), *v),
         Inst::Copy(r, ty, x) => {
-            let nr = new_result(func, *r, map);
+            let nr = new_result(func, src_types, *r, map);
             Inst::Copy(nr, *ty, map_value(map, *x))
         }
         Inst::Bin(r, op, ty, x, y) => {
-            let nr = new_result(func, *r, map);
+            let nr = new_result(func, src_types, *r, map);
             Inst::Bin(nr, *op, *ty, map_value(map, *x), map_value(map, *y))
         }
         Inst::Unary(r, op, ty, x) => {
-            let nr = new_result(func, *r, map);
+            let nr = new_result(func, src_types, *r, map);
             Inst::Unary(nr, *op, *ty, map_value(map, *x))
         }
         Inst::Icmp(r, cc, ty, x, y) => {
-            let nr = new_result(func, *r, map);
+            let nr = new_result(func, src_types, *r, map);
             Inst::Icmp(nr, *cc, *ty, map_value(map, *x), map_value(map, *y))
         }
         Inst::Fcmp(r, cc, ty, x, y) => {
-            let nr = new_result(func, *r, map);
+            let nr = new_result(func, src_types, *r, map);
             Inst::Fcmp(nr, *cc, *ty, map_value(map, *x), map_value(map, *y))
         }
         Inst::Select(r, ty, c, x, y) => {
-            let nr = new_result(func, *r, map);
+            let nr = new_result(func, src_types, *r, map);
             Inst::Select(nr, *ty, map_value(map, *c), map_value(map, *x), map_value(map, *y))
         }
-        Inst::StackAddr(r, s, o) => Inst::StackAddr(new_result(func, *r, map), *s, *o),
+        Inst::StackAddr(r, s, o) => Inst::StackAddr(new_result(func, src_types, *r, map), *s, *o),
         Inst::Load(r, ty, a, o) => {
-            let nr = new_result(func, *r, map);
+            let nr = new_result(func, src_types, *r, map);
             Inst::Load(nr, *ty, map_value(map, *a), *o)
         }
         Inst::Store(ty, a, o, v) => {
             Inst::Store(*ty, map_value(map, *a), *o, map_value(map, *v))
         }
         Inst::Call(results, target, args) => {
-            let nr = results.iter().map(|r| new_result(func, *r, map)).collect();
+            let nr = results.iter().map(|r| new_result(func, src_types, *r, map)).collect();
             Inst::Call(nr, *target, args.iter().map(|v| map_value(map, *v)).collect())
         }
         Inst::CallIndirect { results, params, rets, call_conv, callee, args } => {
-            let nr = results.iter().map(|r| new_result(func, *r, map)).collect();
+            let nr = results.iter().map(|r| new_result(func, src_types, *r, map)).collect();
             Inst::CallIndirect {
                 results: nr,
                 params: params.clone(),
@@ -251,9 +278,9 @@ pub(crate) fn remap_inst(
                 args: args.iter().map(|v| map_value(map, *v)).collect(),
             }
         }
-        Inst::GlobalValue(r, g) => Inst::GlobalValue(new_result(func, *r, map), *g),
-        Inst::FuncAddr(r, f) => Inst::FuncAddr(new_result(func, *r, map), *f),
-        Inst::DynamicStackAddr(r, s) => Inst::DynamicStackAddr(new_result(func, *r, map), *s),
+        Inst::GlobalValue(r, g) => Inst::GlobalValue(new_result(func, src_types, *r, map), *g),
+        Inst::FuncAddr(r, f) => Inst::FuncAddr(new_result(func, src_types, *r, map), *f),
+        Inst::DynamicStackAddr(r, s) => Inst::DynamicStackAddr(new_result(func, src_types, *r, map), *s),
         Inst::Jump(..) | Inst::Brif(..) | Inst::Return(..) | Inst::Trap(..) => return None,
         Inst::TryCall { .. } | Inst::TryCallIndirect { .. } => return None,
     };
@@ -266,10 +293,12 @@ pub(crate) fn map_value(map: &std::collections::HashMap<Value, Value>, v: Value)
 
 fn new_result(
     func: &mut Function,
+    src_types: &[Type],
     old: Value,
     map: &mut std::collections::HashMap<Value, Value>,
 ) -> Value {
-    let v = new_value(func, func.ty(old));
+    let ty = src_types[old.0 as usize];
+    let v = new_value(func, ty);
     map.insert(old, v);
     v
 }

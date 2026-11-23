@@ -221,3 +221,30 @@ fn selects_block_parameters_and_branch_arguments() {
     assert_eq!(run(&emitted, &[Val::I(5)]).unwrap(), vec![Val::I(5)]);
     assert_eq!(run(&emitted, &[Val::I(-5)]).unwrap(), vec![Val::I(0)]);
 }
+
+#[test]
+fn edge_moves_survive_swapped_loop_parameters() {
+    let mut b = Builder::new(vec![Type::I64], vec![Type::I64, Type::I64]);
+    let e = b.func().entry;
+    let x = b.func().block(e).params[0];
+    let y = b.func().block(e).params[1];
+    let t = b.iconst(e, Type::Bool, 1);
+    let header = b.add_block(vec![Type::I64, Type::I64, Type::Bool]);
+    let body = b.add_block(vec![]);
+    let exit = b.add_block(vec![]);
+    b.jump(e, header, vec![x, y, t]);
+    let hp = b.func().block(header).params.clone();
+    b.brif(header, hp[2], body, vec![], exit, vec![]);
+    let f0 = b.iconst(body, Type::Bool, 0);
+    b.jump(body, header, vec![hp[1], hp[0], f0]);
+    let ten = b.iconst(exit, Type::I64, 10);
+    let a10 = b.bin(exit, BinOp::Mul, Type::I64, hp[0], ten);
+    let sum = b.bin(exit, BinOp::Add, Type::I64, a10, hp[1]);
+    b.ret(exit, vec![sum]);
+    let f = b.into_func();
+    assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
+    assert_eq!(run(&f, &[Val::I(1), Val::I(2)]).unwrap(), vec![Val::I(21)]);
+
+    let mach = select_alloc(&f);
+    assert_eq!(run_machine(&mach, &[1, 2]).unwrap(), Some(21));
+}

@@ -43,7 +43,7 @@ fn convert_one(func: &mut Function) -> bool {
             continue;
         };
         let (tb, eb) = (then_b.0 as usize, else_b.0 as usize);
-        if tb >= block_count || eb >= block_count {
+        if tb >= block_count || eb >= block_count || tb == func.entry.0 as usize || eb == func.entry.0 as usize {
             continue;
         }
         if then_b == else_b || tb == head || eb == head {
@@ -156,15 +156,35 @@ fn cfg(func: &Function) -> (Vec<usize>, Vec<usize>) {
         let Some(term) = block.insts.last() else {
             continue;
         };
+        let valid = |b: Block| (b.0 as usize) < n;
         match term {
-            Inst::Jump(t, _) => {
+            Inst::Jump(t, _) if valid(*t) => {
                 preds[t.0 as usize] += 1;
                 succs[bi] += 1;
             }
-            Inst::Brif(_, t, _, f, _) => {
+            Inst::Brif(_, t, _, f, _) if valid(*t) && valid(*f) => {
                 preds[t.0 as usize] += 1;
                 preds[f.0 as usize] += 1;
                 succs[bi] += 2;
+            }
+            Inst::TryCall { normal, exception, .. }
+            | Inst::TryCallIndirect { normal, exception, .. }
+                if valid(normal.block) =>
+            {
+                preds[normal.block.0 as usize] += 1;
+                succs[bi] += 1;
+                for item in exception {
+                    match item {
+                        crate::ir::ExceptionItem::Tag(_, call)
+                        | crate::ir::ExceptionItem::Default(call)
+                            if valid(call.block) =>
+                        {
+                            preds[call.block.0 as usize] += 1;
+                            succs[bi] += 1;
+                        }
+                        _ => {}
+                    }
+                }
             }
             _ => {}
         }

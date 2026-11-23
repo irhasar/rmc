@@ -24,22 +24,32 @@ pub(crate) fn remove_blocks(func: &mut Function, remove: &[usize]) {
         for inst in &mut block.insts {
             match inst {
                 Inst::Jump(t, _) => {
-                    t.0 = map[t.0 as usize].expect("branch to removed block");
+                    if let Some(new) = map.get(t.0 as usize).copied().flatten() {
+                        t.0 = new;
+                    }
                 }
                 Inst::Brif(_, t, _, f, _) => {
-                    t.0 = map[t.0 as usize].expect("branch to removed block");
-                    f.0 = map[f.0 as usize].expect("branch to removed block");
+                    if let Some(new) = map.get(t.0 as usize).copied().flatten() {
+                        t.0 = new;
+                    }
+                    if let Some(new) = map.get(f.0 as usize).copied().flatten() {
+                        f.0 = new;
+                    }
                 }
                 Inst::TryCall { normal, exception, .. }
                 | Inst::TryCallIndirect { normal, exception, .. } => {
-                    normal.block.0 = map[normal.block.0 as usize]
-                        .expect("branch to removed block");
+                    if let Some(new) = map.get(normal.block.0 as usize).copied().flatten() {
+                        normal.block.0 = new;
+                    }
                     for item in exception {
                         match item {
                             crate::ir::ExceptionItem::Tag(_, call)
                             | crate::ir::ExceptionItem::Default(call) => {
-                                call.block.0 = map[call.block.0 as usize]
-                                    .expect("branch to removed block")
+                                if let Some(new) =
+                                    map.get(call.block.0 as usize).copied().flatten()
+                                {
+                                    call.block.0 = new;
+                                }
                             }
                             crate::ir::ExceptionItem::Context(_) => {}
                         }
@@ -51,7 +61,9 @@ pub(crate) fn remove_blocks(func: &mut Function, remove: &[usize]) {
         blocks.push(block);
     }
     func.blocks = blocks;
-    func.entry.0 = map[func.entry.0 as usize].expect("entry block was removed");
+    if let Some(new) = map.get(func.entry.0 as usize).copied().flatten() {
+        func.entry.0 = new;
+    }
 }
 
 pub(crate) fn remove_values(func: &mut Function, removed: &HashSet<Value>) {

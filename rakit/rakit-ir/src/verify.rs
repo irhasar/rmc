@@ -64,6 +64,7 @@ pub fn verify(func: &Function) -> Result<(), Vec<String>> {
         }
     }
 
+    let reachable = reachable_blocks(func);
     let dom = dominators(func);
 
     let ty_of = |v: Value| -> Option<Type> { func.values.get(v.0 as usize).copied() };
@@ -76,7 +77,10 @@ pub fn verify(func: &Function) -> Result<(), Vec<String>> {
                     None => errs.push(format!("use of undefined value {u:?}")),
                     Some(d) => {
                         if d.block != b {
-                            if !dominates(&dom, d.block, b) {
+                            if reachable[bi]
+                                && reachable[d.block.0 as usize]
+                                && !dominates(&dom, d.block, b)
+                            {
                                 errs.push(format!(
                                     "use of {u:?} in {b:?} is not dominated by its definition in {:?}",
                                     d.block
@@ -156,6 +160,9 @@ pub fn verify(func: &Function) -> Result<(), Vec<String>> {
                 }
                 Inst::Icmp(r, _, ty, x, y) => {
                     check_same(&mut errs, *x, *y);
+                    if ty_of(*x) != Some(*ty) || ty_of(*y) != Some(*ty) {
+                        errs.push(format!("icmp operand type differs from declared {ty:?}"));
+                    }
                     if !ty.is_int() {
                         errs.push(format!("icmp on non-integer type {ty:?}"));
                     }
@@ -165,6 +172,9 @@ pub fn verify(func: &Function) -> Result<(), Vec<String>> {
                 }
                 Inst::Fcmp(r, _, ty, x, y) => {
                     check_same(&mut errs, *x, *y);
+                    if ty_of(*x) != Some(*ty) || ty_of(*y) != Some(*ty) {
+                        errs.push(format!("fcmp operand type differs from declared {ty:?}"));
+                    }
                     if !ty.is_float() {
                         errs.push(format!("fcmp on non-float type {ty:?}"));
                     }
@@ -432,16 +442,83 @@ fn check_args(
     }
 }
 
+fn reachable_blocks(func: &Function) -> Vec<bool> {
+    let n = func.num_blocks();
+    let mut seen = vec![false; n];
+    if func.entry.0 as usize >= n {
+        return seen;
+    }
+    let mut stack = vec![func.entry.0 as usize];
+    seen[func.entry.0 as usize] = true;
+    while let Some(b) = stack.pop() {
+        let Some(term) = func.blocks[b].terminator() else { continue };
+        let mut push = |target: Block| {
+            if (target.0 as usize) < n && !seen[target.0 as usize] {
+                seen[target.0 as usize] = true;
+                stack.push(target.0 as usize);
+            }
+        };
+        match term {
+            Inst::Jump(t, _) => push(*t),
+            Inst::Brif(_, t, _, f, _) => {
+                push(*t);
+                push(*f);
+            }
+            Inst::TryCall { normal, exception, .. }
+            | Inst::TryCallIndirect { normal, exception, .. } => {
+                push(normal.block);
+                for item in exception {
+                    match item {
+                        crate::ir::ExceptionItem::Tag(_, call)
+                        | crate::ir::ExceptionItem::Default(call) => push(call.block),
+                        crate::ir::ExceptionItem::Context(_) => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    seen
+}
+
 fn dominators(func: &Function) -> Vec<HashSet<Block>> {
     let n = func.num_blocks();
+    let reachable = reachable_blocks(func);
     let mut preds = vec![Vec::new(); n];
     for (bi, blk) in func.blocks.iter().enumerate() {
+        if !reachable[bi] {
+            continue;
+        }
         if let Some(term) = blk.terminator() {
             match term {
-                Inst::Jump(t, _) => preds[t.0 as usize].push(Block(bi as u32)),
+                Inst::Jump(t, _) => {
+                    if let Some(p) = preds.get_mut(t.0 as usize) {
+                        p.push(Block(bi as u32));
+                    }
+                }
                 Inst::Brif(_, t, _, f, _) => {
-                    preds[t.0 as usize].push(Block(bi as u32));
-                    preds[f.0 as usize].push(Block(bi as u32));
+                    for target in [t, f] {
+                        if let Some(p) = preds.get_mut(target.0 as usize) {
+                            p.push(Block(bi as u32));
+                        }
+                    }
+                }
+                Inst::TryCall { normal, exception, .. }
+                | Inst::TryCallIndirect { normal, exception, .. } => {
+                    if let Some(p) = preds.get_mut(normal.block.0 as usize) {
+                        p.push(Block(bi as u32));
+                    }
+                    for item in exception {
+                        match item {
+                            crate::ir::ExceptionItem::Tag(_, call)
+                            | crate::ir::ExceptionItem::Default(call) => {
+                                if let Some(p) = preds.get_mut(call.block.0 as usize) {
+                                    p.push(Block(bi as u32));
+                                }
+                            }
+                            crate::ir::ExceptionItem::Context(_) => {}
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -450,12 +527,14 @@ fn dominators(func: &Function) -> Vec<HashSet<Block>> {
 
     let all: HashSet<Block> = (0..n).map(|i| Block(i as u32)).collect();
     let mut dom: Vec<HashSet<Block>> = vec![all; n];
-    dom[func.entry.0 as usize] = HashSet::from([func.entry]);
+    if (func.entry.0 as usize) < n {
+        dom[func.entry.0 as usize] = HashSet::from([func.entry]);
+    }
 
     loop {
         let mut changed = false;
         for b in 0..n {
-            if Block(b as u32) == func.entry {
+            if !reachable[b] || Block(b as u32) == func.entry {
                 continue;
             }
             let mut new: HashSet<Block> = if preds[b].is_empty() {

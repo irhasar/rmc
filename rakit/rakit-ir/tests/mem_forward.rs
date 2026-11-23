@@ -230,3 +230,60 @@ fn keeps_store_read_in_successor() {
     assert!(f.blocks[0].insts.iter().any(|i| matches!(i, Inst::Store(..))));
     assert_eq!(run(&f, &[Val::I(42)]).unwrap(), vec![Val::I(42)]);
 }
+
+#[test]
+fn dynamic_store_does_not_erase_other_elements() {
+    let mut b = Builder::new(vec![Type::I64], vec![Type::I64]);
+    let e = b.func().entry;
+    let i = b.func().block(e).params[0];
+    let slot = b.add_stack_slot(16, 8);
+    let base = b.stack_addr(e, slot, 0);
+    let ten = b.iconst(e, Type::I64, 10);
+    let twenty = b.iconst(e, Type::I64, 20);
+    b.store(e, Type::I64, base, 0, ten);
+    b.store(e, Type::I64, base, 8, twenty);
+    let one = b.iconst(e, Type::I64, 1);
+    let idx = b.bin(e, BinOp::And, Type::I64, i, one);
+    let eight = b.iconst(e, Type::I64, 8);
+    let off = b.bin(e, BinOp::Mul, Type::I64, idx, eight);
+    let dyn_addr = b.bin(e, BinOp::Add, Type::I64, base, off);
+    let n = b.iconst(e, Type::I64, 99);
+    b.store(e, Type::I64, dyn_addr, 0, n);
+    let y = b.load(e, Type::I64, base, 0);
+    b.ret(e, vec![y]);
+
+    let mut f = b.into_func();
+    mem_forward::run(&mut f);
+    assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
+    assert_eq!(run(&f, &[Val::I(1)]).unwrap(), vec![Val::I(10)]);
+    assert_eq!(run(&f, &[Val::I(0)]).unwrap(), vec![Val::I(99)]);
+}
+
+#[test]
+fn loop_header_does_not_use_preheader_store() {
+    let mut b = Builder::new(vec![Type::I64], vec![Type::Bool]);
+    let e = b.func().entry;
+    let flag = b.func().block(e).params[0];
+    let slot = b.add_stack_slot(8, 8);
+    let addr = b.stack_addr(e, slot, 0);
+    let ten = b.iconst(e, Type::I64, 10);
+    b.store(e, Type::I64, addr, 0, ten);
+    let header = b.add_block(vec![Type::Bool]);
+    let body = b.add_block(vec![]);
+    let exit = b.add_block(vec![]);
+    b.jump(e, header, vec![flag]);
+    let hp = b.func().block(header).params[0];
+    let _at_header = b.load(header, Type::I64, addr, 0);
+    b.brif(header, hp, body, vec![], exit, vec![]);
+    let twenty = b.iconst(body, Type::I64, 20);
+    b.store(body, Type::I64, addr, 0, twenty);
+    let f0 = b.iconst(body, Type::Bool, 0);
+    b.jump(body, header, vec![f0]);
+    let out = b.load(exit, Type::I64, addr, 0);
+    b.ret(exit, vec![out]);
+
+    let mut f = b.into_func();
+    mem_forward::run(&mut f);
+    assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
+    assert_eq!(run(&f, &[Val::B(true)]).unwrap(), vec![Val::I(20)]);
+}

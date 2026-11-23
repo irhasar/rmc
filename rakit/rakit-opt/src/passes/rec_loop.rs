@@ -10,7 +10,7 @@
 //! identity base, `+` of the two call results), so it is conservative.
 use rakit_codegen::cursor::{Cursor, FuncCursor};
 use rakit_codegen::ir::condcodes::IntCC;
-use rakit_codegen::ir::{self, Block, Inst, InstBuilder, Opcode, Value};
+use rakit_codegen::ir::{self, Block, InstBuilder, Opcode, Value};
 
 pub fn run(func: &mut ir::Function) {
     if std::env::var_os("RAKIT_NO_REC_LOOP").is_some() {

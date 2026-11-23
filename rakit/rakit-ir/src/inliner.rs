@@ -34,7 +34,7 @@ pub fn run(func: &mut Function, bodies: &[Function]) -> bool {
             };
             let mut cloned = Vec::new();
             for body_inst in &body_insts[..body_insts.len() - 1] {
-                if let Some(i) = remap_inst(func, body_inst, &mut map) {
+                if let Some(i) = remap_inst(func, &callee.values, body_inst, &mut map) {
                     cloned.push(i);
                 } else {
                     cloned.clear();

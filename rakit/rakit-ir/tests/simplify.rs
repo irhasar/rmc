@@ -213,3 +213,39 @@ fn does_not_merge_two_preds() {
     assert!(!simplify::run(&mut f));
     assert_eq!(f.blocks.len(), 4);
 }
+
+#[test]
+fn redirects_try_call_continuation() {
+    use rakit_ir::ir::{ExceptionItem, External, ExternalTarget, TryBlockCall};
+
+    let mut b = Builder::new(vec![Type::I64], vec![]);
+    let e = b.func().entry;
+    let normal = b.add_block(vec![]);
+    let target = b.add_block(vec![]);
+    b.try_call(
+        e,
+        0,
+        vec![],
+        vec![],
+        TryBlockCall { block: normal, args: vec![] },
+        Vec::<ExceptionItem>::new(),
+    );
+    b.jump(normal, target, vec![]);
+    let one = b.iconst(target, Type::I64, 1);
+    b.ret(target, vec![one]);
+    let mut f = b.into_func();
+    f.externals.push(External {
+        target: ExternalTarget::User { namespace: 0, index: 4 },
+        params: vec![],
+        rets: vec![],
+    });
+
+    assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
+    assert!(simplify::run(&mut f));
+    assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
+    assert_eq!(f.blocks.len(), 2);
+    match f.blocks[0].terminator().unwrap() {
+        Inst::TryCall { normal, .. } => assert_eq!(normal.block.0 as usize, 1),
+        other => panic!("expected try-call, got {other:?}"),
+    }
+}

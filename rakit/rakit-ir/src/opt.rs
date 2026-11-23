@@ -91,7 +91,7 @@ fn fold(func: &mut Function) -> bool {
             let inst = func.blocks[bi].insts[ii].clone();
             let replacement = match inst {
                 Inst::Bin(r, op, ty, x, y) => {
-                    if x == y && ty.is_int() {
+                    if x == y && ty.is_int() && ty != Type::Ptr {
                         match op {
                             BinOp::Sub | BinOp::Xor => Some(Inst::Iconst(r, ty, 0)),
                             BinOp::And | BinOp::Or => Some(Inst::Copy(r, ty, x)),
@@ -208,6 +208,7 @@ fn fold(func: &mut Function) -> bool {
 }
 
 fn dce(func: &mut Function) -> bool {
+    let consts = const_map(func);
     let mut uses: HashMap<Value, usize> = HashMap::new();
     for blk in &func.blocks {
         for inst in &blk.insts {
@@ -226,6 +227,14 @@ fn dce(func: &mut Function) -> bool {
                 Inst::Load(..) | Inst::Store(..) | Inst::Call(..) | Inst::CallIndirect { .. }
             ) {
                 continue;
+            }
+            if let Inst::Bin(_, op, _, _, y) = inst {
+                if matches!(op, BinOp::Sdiv | BinOp::Udiv | BinOp::Srem | BinOp::Urem)
+                    && !matches!(consts.get(y), Some(Const::I(v)) if *v != 0)
+                {
+                    // Removing a division by zero would erase an observable trap.
+                    continue;
+                }
             }
             if let Some(r) = inst.result_value() {
                 if !matches!(inst, Inst::Nop(..)) && uses.get(&r).copied().unwrap_or(0) == 0 {

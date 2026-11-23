@@ -333,10 +333,21 @@ fn edge_target(
         return Err(unsupported("branch argument arity"));
     }
     let edge = mach.add_block();
-    for (param, arg) in params.iter().zip(args) {
-        let dst = *vmap.get(param).ok_or_else(|| unsupported("missing block parameter"))?;
+    let mut temps = Vec::with_capacity(args.len());
+    for arg in args {
+        let ty = func.ty(*arg);
+        temps.push(mach.add_vreg(ty));
+    }
+    for (temp, arg) in temps.iter().zip(args) {
         let src = operand(vmap, *arg)?;
-        mach.blocks[edge].insts.push(MachInst::Mov { dst: Operand::VReg(dst), src });
+        mach.blocks[edge].insts.push(MachInst::Mov { dst: Operand::VReg(*temp), src });
+    }
+    for (param, temp) in params.iter().zip(&temps) {
+        let dst = *vmap.get(param).ok_or_else(|| unsupported("missing block parameter"))?;
+        mach.blocks[edge].insts.push(MachInst::Mov {
+            dst: Operand::VReg(dst),
+            src: Operand::VReg(*temp),
+        });
     }
     mach.blocks[edge].insts.push(MachInst::Jmp { target: target.0 as usize });
     Ok(edge)

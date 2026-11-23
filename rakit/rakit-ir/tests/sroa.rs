@@ -221,3 +221,23 @@ fn does_not_promote_dynamic_multi_element_slot() {
     sroa::run(&mut f);
     assert_eq!(f.stack_slots.len(), 1);
 }
+
+#[test]
+fn does_not_promote_slot_that_stores_its_own_address() {
+    let mut b = Builder::new(vec![Type::I64], vec![Type::I64]);
+    let e = b.func().entry;
+    let x = b.func().block(e).params[0];
+    let slot = b.add_stack_slot(16, 8);
+    let addr = b.stack_addr(e, slot, 0);
+    // The stored value is also the address operand; this is an escaping use.
+    b.store(e, Type::I64, addr, 0, addr);
+    b.store(e, Type::I64, addr, 8, x);
+    let recovered = b.load(e, Type::I64, addr, 0);
+    let y = b.load(e, Type::I64, recovered, 8);
+    b.ret(e, vec![y]);
+
+    let mut f = b.into_func();
+    assert!(!sroa::run(&mut f));
+    assert_eq!(f.stack_slots.len(), 1);
+    assert_eq!(run(&f, &[Val::I(7)]).unwrap(), vec![Val::I(7)]);
+}

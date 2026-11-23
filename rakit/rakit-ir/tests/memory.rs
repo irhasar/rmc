@@ -76,3 +76,30 @@ fn loads_and_stores_i128() {
     let value = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210u128;
     assert_eq!(run(&f, &[Val::I128(value)]).unwrap(), vec![Val::I128(value)]);
 }
+
+#[test]
+fn narrow_loads_zero_extend() {
+    let mut b = Builder::new(vec![Type::I8], vec![Type::I64]);
+    let e = b.func().entry;
+    let x = b.func().block(e).params[0];
+    let slot = b.add_stack_slot(8, 8);
+    let addr = b.stack_addr(e, slot, 0);
+    b.store(e, Type::I64, addr, 0, x);
+    let y = b.load(e, Type::I8, addr, 0);
+    b.ret(e, vec![y]);
+
+    let f = b.into_func();
+    assert_eq!(run(&f, &[Val::I(0xFF)]).unwrap(), vec![Val::I(255)]);
+}
+
+#[test]
+fn signed_i128_cast_does_not_overflow_interpreter() {
+    let mut b = Builder::new(vec![Type::I128], vec![Type::I64]);
+    let e = b.func().entry;
+    let x = b.func().block(e).params[0];
+    let y = b.unary(e, rakit_ir::ir::UnOp::Sextend, Type::I128, x);
+    b.ret(e, vec![y]);
+
+    let f = b.into_func();
+    assert_eq!(run(&f, &[Val::I(-1)]).unwrap(), vec![Val::I128(u128::MAX)]);
+}

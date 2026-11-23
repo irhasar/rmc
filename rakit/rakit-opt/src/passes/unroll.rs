@@ -932,6 +932,18 @@ fn analyze_affine(func: &ir::Function, plan: &Plan) -> Option<Vec<Option<Affine>
     for (i, &p) in dfg.block_params(plan.header).iter().enumerate() {
         forms[p.as_u32() as usize] = Some(basis(i));
     }
+    // LICM may have hoisted literal increments/multipliers to a preheader.
+    // Seed every 64-bit constant, not only those still inside the body.
+    for block in func.layout.blocks() {
+        for inst in func.layout.block_insts(block) {
+            let results = dfg.inst_results(inst);
+            if let ir::InstructionData::UnaryImm { opcode: Opcode::Iconst, imm, .. } = dfg.insts[inst] {
+                if results.len() == 1 && is_i64(results[0]) {
+                    forms[results[0].as_u32() as usize] = Some(Affine { coeffs: vec![0; n], c: imm.bits() as u64, atoms: Vec::new() });
+                }
+            }
+        }
+    }
 
     let add = |a: &Affine, b: &Affine| {
         let mut r = a.clone();
@@ -955,7 +967,6 @@ fn analyze_affine(func: &ir::Function, plan: &Plan) -> Option<Vec<Option<Affine>
         }
         r
     };
-    let constant = |c: u64| Affine { coeffs: vec![0; n], c, atoms: Vec::new() };
     let as_const = |a: &Option<Affine>| -> Option<u64> {
         let a = a.as_ref()?;
         if a.atoms.is_empty() && a.coeffs.iter().all(|&x| x == 0) { Some(a.c) } else { None }
@@ -980,7 +991,7 @@ fn analyze_affine(func: &ir::Function, plan: &Plan) -> Option<Vec<Option<Affine>
             ir::InstructionData::UnaryImm { opcode: Opcode::Iconst, imm, .. }
                 if is_i64(results[0]) =>
             {
-                Some(constant(imm.bits() as u64))
+                Some(Affine { coeffs: vec![0; n], c: imm.bits() as u64, atoms: Vec::new() })
             }
             ir::InstructionData::Binary { opcode: Opcode::Iadd, args, .. } if is_i64(args[0]) => {
                 let (a, b) = (

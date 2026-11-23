@@ -129,12 +129,12 @@ fn add_expr(
             Some(Key::Const { slot: s2, offset: o2 }),
             _,
             _,
-        ) if s1 == s2 => Some(Key::Const { slot: s1, offset: o1 + o2 }),
+        ) if s1 == s2 => Some(Key::Const { slot: s1, offset: o1.checked_add(o2)? }),
         (Some(Key::Const { slot, offset }), None, _, Some(c)) => {
-            Some(Key::Const { slot, offset: offset + c })
+            Some(Key::Const { slot, offset: offset.checked_add(c)? })
         }
         (None, Some(Key::Const { slot, offset }), Some(c), _) => {
-            Some(Key::Const { slot, offset: offset + c })
+            Some(Key::Const { slot, offset: offset.checked_add(c)? })
         }
         (Some(Key::Const { slot, offset }), None, _, None) => {
             Some(Key::Dyn { slot, base: y, offset })
@@ -143,10 +143,10 @@ fn add_expr(
             Some(Key::Dyn { slot, base: x, offset })
         }
         (Some(Key::Dyn { slot, base, offset }), None, _, Some(c)) => {
-            Some(Key::Dyn { slot, base, offset: offset + c })
+            Some(Key::Dyn { slot, base, offset: offset.checked_add(c)? })
         }
         (None, Some(Key::Dyn { slot, base, offset }), Some(c), _) => {
-            Some(Key::Dyn { slot, base, offset: offset + c })
+            Some(Key::Dyn { slot, base, offset: offset.checked_add(c)? })
         }
         (Some(a), Some(b), _, _) if a.slot() == b.slot() => {
             Some(Key::Dyn { slot: a.slot(), base: value, offset: 0 })
@@ -166,6 +166,15 @@ pub(crate) fn escaping_slots(func: &Function, defs: &HashMap<Value, Inst>) -> Ve
                 };
                 let address_use = match inst {
                     Inst::Load(_, _, a, _) => *a == u,
+                    // A store whose value is the address (possibly through a
+                    // copy/offset expression) stores an escaping pointer, even
+                    // though the same value is also the address operand.
+                    Inst::Store(_, a, _, v)
+                        if *a == *v
+                            || address_expr(defs, *a, 0) == address_expr(defs, *v, 0) =>
+                    {
+                        false
+                    }
                     Inst::Store(_, a, _, _) => *a == u,
                     Inst::Copy(_, _, _) => result_addr.is_some(),
                     Inst::Bin(_, BinOp::Add, _, _, _) => result_addr.is_some(),
@@ -257,7 +266,8 @@ fn forward(func: &mut Function) -> bool {
         let mut first = true;
         for &p in &preds[bi] {
             let Some(pf) = &out[p] else {
-                continue;
+                facts.clear();
+                break;
             };
             if first {
                 facts = pf.clone();
@@ -422,6 +432,11 @@ fn block_effects(func: &Function, defs: &HashMap<Value, Inst>, bi: usize) -> Eff
             }
             Inst::Store(ty, addr, offset, _) => {
                 if let Some(key) = key_of(defs, func, *addr, *offset, *ty) {
+                    if matches!(key, Key::Dyn { .. }) {
+                        // A dynamic store may write only part of the slot, so it
+                        // cannot define the whole range for liveness purposes.
+                        continue;
+                    }
                     let (start, end) = key_range(func, key, *ty);
                     add_slot(&mut defined, key.slot(), start, end);
                 }
@@ -510,12 +525,17 @@ fn dse(func: &mut Function) -> bool {
                     if let Some(key) = key_of(&defs, func, *addr, *offset, *ty) {
                         let (start, end) = key_range(func, key, *ty);
                         let slot = key.slot();
+                        let dynamic = matches!(key, Key::Dyn { .. });
                         let needed = live
                             .get(&slot)
                             .map(|ranges| intersects(ranges, start, end))
                             .unwrap_or(false);
                         if needed {
-                            sub_slot(&mut live, slot, start, end);
+                            // A dynamic store only may-write the whole slot; it
+                            // must not kill unrelated bytes still needed earlier.
+                            if !dynamic {
+                                sub_slot(&mut live, slot, start, end);
+                            }
                         } else {
                             func.blocks[bi].insts.remove(ii);
                             changed = true;

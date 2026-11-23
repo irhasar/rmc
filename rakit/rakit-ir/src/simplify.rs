@@ -171,6 +171,23 @@ fn redirect_to_target(func: &mut Function, b: usize) {
                         *f = target;
                     }
                 }
+                Inst::TryCall { normal, exception, .. }
+                | Inst::TryCallIndirect { normal, exception, .. } => {
+                    if normal.block.0 as usize == b {
+                        normal.block = target;
+                    }
+                    for item in exception {
+                        match item {
+                            crate::ir::ExceptionItem::Tag(_, call)
+                            | crate::ir::ExceptionItem::Default(call) => {
+                                if call.block.0 as usize == b {
+                                    call.block = target;
+                                }
+                            }
+                            crate::ir::ExceptionItem::Context(_) => {}
+                        }
+                    }
+                }
                 _ => {}
             }
         }

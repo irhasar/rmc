@@ -19,6 +19,7 @@ use rakit_codegen::ir::{
     StackSlotData as CgStackSlotData, StackSlotKind, TrapCode, Type as CgType, UserExternalName,
     Value as CgValue, ValueList, types,
 };
+use rakit_codegen::ir::{ArgumentExtension, ArgumentPurpose};
 use rakit_codegen::isa::CallConv;
 use rakit_ir::{
     BinOp, Block as RirBlock, Builder, DynamicSlotData, DynamicTypeData as RirDynamicTypeData,
@@ -51,6 +52,17 @@ fn call_conv_from_rir(value: u8) -> Option<CallConv> {
         5 => CallConv::Probestack,
         _ => return None,
     })
+}
+
+fn memory_flags_supported(func: &CgFunction, flags: rakit_codegen::ir::MemFlags) -> bool {
+    func.dfg.mem_flags[flags].explicit_endianness().is_none()
+}
+
+fn signature_supported(sig: &Signature) -> bool {
+    sig.call_conv == CallConv::SystemV
+        && sig.params.iter().chain(sig.returns.iter()).all(|p| {
+            p.purpose == ArgumentPurpose::Normal && p.extension == ArgumentExtension::None
+        })
 }
 
 /// Import a codegen IR function into RIR, or `None` if it uses anything outside the
@@ -247,27 +259,39 @@ pub fn import(func: &CgFunction) -> Option<RirFunction> {
                     let v = builder.stack_addr(rb, slot, offset.into());
                     map_value(func, &mut vmap, r, v);
                 }
-                InstructionData::Load { opcode: Opcode::Load, arg, offset, .. } => {
+                InstructionData::Load { opcode: Opcode::Load, arg, offset, flags } => {
+                    if !memory_flags_supported(func, flags) {
+                        return None;
+                    }
                     let r = single_result(func, inst)?;
                     let ty = map_type_to_rir(func.dfg.value_type(r))?;
                     let addr = lookup(func, &vmap, arg)?;
                     let v = builder.load(rb, ty, addr, offset.into());
                     map_value(func, &mut vmap, r, v);
                 }
-                InstructionData::LoadNoOffset { opcode: Opcode::Load, arg, .. } => {
+                InstructionData::LoadNoOffset { opcode: Opcode::Load, arg, flags } => {
+                    if !memory_flags_supported(func, flags) {
+                        return None;
+                    }
                     let r = single_result(func, inst)?;
                     let ty = map_type_to_rir(func.dfg.value_type(r))?;
                     let addr = lookup(func, &vmap, arg)?;
                     let v = builder.load(rb, ty, addr, 0);
                     map_value(func, &mut vmap, r, v);
                 }
-                InstructionData::Store { opcode: Opcode::Store, args, offset, .. } => {
+                InstructionData::Store { opcode: Opcode::Store, args, offset, flags } => {
+                    if !memory_flags_supported(func, flags) {
+                        return None;
+                    }
                     let ty = map_type_to_rir(func.dfg.value_type(args[0]))?;
                     let value = as_int(&mut builder, rb, lookup(func, &vmap, args[0])?, ty);
                     let addr = lookup(func, &vmap, args[1])?;
                     builder.store(rb, ty, addr, offset.into(), value);
                 }
-                InstructionData::StoreNoOffset { opcode: Opcode::Store, args, .. } => {
+                InstructionData::StoreNoOffset { opcode: Opcode::Store, args, flags } => {
+                    if !memory_flags_supported(func, flags) {
+                        return None;
+                    }
                     let ty = map_type_to_rir(func.dfg.value_type(args[0]))?;
                     let value = as_int(&mut builder, rb, lookup(func, &vmap, args[0])?, ty);
                     let addr = lookup(func, &vmap, args[1])?;
@@ -276,6 +300,9 @@ pub fn import(func: &CgFunction) -> Option<RirFunction> {
                 InstructionData::Call { func_ref, args, .. } => {
                     let ext_data = &func.dfg.ext_funcs[func_ref];
                     let callee = &func.dfg.signatures[ext_data.signature];
+                    if !signature_supported(callee) {
+                        return None;
+                    }
                     let params = callee
                         .params
                         .iter()
@@ -327,6 +354,9 @@ pub fn import(func: &CgFunction) -> Option<RirFunction> {
                     let callee = args.as_slice(&func.dfg.value_lists)[0];
                     let callee = lookup(func, &vmap, callee)?;
                     let callee_sig = &func.dfg.signatures[sig_ref];
+                    if !signature_supported(callee_sig) {
+                        return None;
+                    }
                     let params = callee_sig
                         .params
                         .iter()
@@ -385,6 +415,9 @@ pub fn import(func: &CgFunction) -> Option<RirFunction> {
                 }
                 InstructionData::TryCall { func_ref, args, exception, .. } => {
                     let ext_data = &func.dfg.ext_funcs[func_ref];
+                    if !signature_supported(&func.dfg.signatures[ext_data.signature]) {
+                        return None;
+                    }
                     let target = external_index(func, &mut externals, ext_data)?;
                     let args = args
                         .as_slice(&func.dfg.value_lists)
@@ -393,6 +426,9 @@ pub fn import(func: &CgFunction) -> Option<RirFunction> {
                         .collect::<Option<Vec<_>>>()?;
                     let results: Vec<_> = func.dfg.inst_results(inst).to_vec();
                     let table = &func.dfg.exception_tables[exception];
+                    if !signature_supported(&func.dfg.signatures[table.signature()]) {
+                        return None;
+                    }
                     let rets = func.dfg.signatures[table.signature()]
                         .returns
                         .iter()
@@ -414,6 +450,9 @@ pub fn import(func: &CgFunction) -> Option<RirFunction> {
                         .collect::<Option<Vec<_>>>()?;
                     let results: Vec<_> = func.dfg.inst_results(inst).to_vec();
                     let table = &func.dfg.exception_tables[exception];
+                    if !signature_supported(&func.dfg.signatures[table.signature()]) {
+                        return None;
+                    }
                     let rets = func.dfg.signatures[table.signature()]
                         .returns
                         .iter()
@@ -554,6 +593,27 @@ pub fn import(func: &CgFunction) -> Option<RirFunction> {
 
 /// Lower an RIR function back to codegen IR, reusing `sig` for the calling convention
 /// and ABI parameter details. Returns `None` on any inconsistency.
+fn emit_i128_const(func: &mut CgFunction, cb: CgBlock, value: i64, signed: bool) -> Option<CgValue> {
+    let lo = func.dfg.make_inst(InstructionData::UnaryImm {
+        opcode: Opcode::Iconst,
+        imm: Imm64::new(value),
+    });
+    if func.dfg.make_inst_results(lo, types::I64) != 1 {
+        return None;
+    }
+    func.layout.append_inst(lo, cb);
+    let lo = func.dfg.first_result(lo);
+    let ext = func.dfg.make_inst(InstructionData::Unary {
+        opcode: if signed { Opcode::Sextend } else { Opcode::Uextend },
+        arg: lo,
+    });
+    if func.dfg.make_inst_results(ext, types::I128) != 1 {
+        return None;
+    }
+    func.layout.append_inst(ext, cb);
+    Some(func.dfg.first_result(ext))
+}
+
 pub fn export(rir: &RirFunction, sig: &Signature) -> Option<CgFunction> {
     let entry_params = &rir.block(rir.entry).params;
     if sig.params.len() != entry_params.len() || sig.returns.len() != rir.ret.len() {
@@ -647,24 +707,40 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<CgFunction> {
         slot_map.push(func.create_sized_stack_slot(data));
     }
 
+    let entry_idx = rir.entry.0 as usize;
+    if entry_idx >= rir.blocks.len() {
+        return None;
+    }
+    let mut order = Vec::with_capacity(rir.blocks.len());
+    order.push(entry_idx);
+    order.extend((0..rir.blocks.len()).filter(|&i| i != entry_idx));
     let mut block_map: Vec<CgBlock> = Vec::with_capacity(rir.blocks.len());
+    for _ in 0..rir.blocks.len() {
+        block_map.push(func.dfg.make_block());
+    }
     let mut vmap: HashMap<RirValue, CgValue> = HashMap::new();
-    for rb in &rir.blocks {
-        let cb = func.dfg.make_block();
+    for &bi in &order {
+        let rb = &rir.blocks[bi];
+        let cb = block_map[bi];
         func.layout.append_block(cb);
         for p in &rb.params {
             let ty = map_type_to_cg(rir.ty(*p))?;
             let cv = func.dfg.append_block_param(cb, ty);
             vmap.insert(*p, cv);
         }
-        block_map.push(cb);
     }
 
-    for (bi, rb) in rir.blocks.iter().enumerate() {
+    for &bi in &order {
+        let rb = &rir.blocks[bi];
         let cb = block_map[bi];
         for inst in &rb.insts {
             match inst {
                 RirInst::Nop(r, ty) => {
+                    if *ty == RirType::I128 {
+                        let v = emit_i128_const(&mut func, cb, 0, false)?;
+                        vmap.insert(*r, v);
+                        continue;
+                    }
                     let ct = map_type_to_cg(*ty)?;
                     let data = match ty {
                         RirType::F32 => InstructionData::UnaryIeee32 {
@@ -687,6 +763,11 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<CgFunction> {
                     vmap.insert(*r, func.dfg.inst_results(ci)[0]);
                 }
                 RirInst::Iconst(r, ty, v) => {
+                    if *ty == RirType::I128 {
+                        let v = emit_i128_const(&mut func, cb, *v, true)?;
+                        vmap.insert(*r, v);
+                        continue;
+                    }
                     if !matches!(
                         ty,
                         RirType::I8 | RirType::I16 | RirType::I32 | RirType::I64
@@ -1080,7 +1161,7 @@ fn as_width(builder: &mut Builder, block: RirBlock, v: RirValue, ty: RirType, si
     if src == ty {
         return v;
     }
-    if src == RirType::Bool {
+    if src == RirType::Bool && ty.is_int() {
         return as_int(builder, block, v, ty);
     }
     if !src.is_int() || !ty.is_int() {
@@ -1101,6 +1182,9 @@ fn as_width(builder: &mut Builder, block: RirBlock, v: RirValue, ty: RirType, si
 
 fn as_int(builder: &mut Builder, block: RirBlock, v: RirValue, ty: RirType) -> RirValue {
     if builder.func().ty(v) == ty {
+        return v;
+    }
+    if builder.func().ty(v) == RirType::Bool && !ty.is_int() {
         return v;
     }
     if builder.func().ty(v) == RirType::Bool && ty.is_int() {
@@ -1135,19 +1219,6 @@ fn lookup(
 fn single_result(func: &CgFunction, inst: CgInst) -> Option<CgValue> {
     let results = func.dfg.inst_results(inst);
     if results.len() == 1 { Some(results[0]) } else { None }
-}
-
-fn block_args(
-    func: &CgFunction,
-    bc: &BlockCall,
-    vmap: &HashMap<CgValue, RirValue>,
-) -> Option<Vec<RirValue>> {
-    bc.args(&func.dfg.value_lists)
-        .map(|a| match a {
-            BlockArg::Value(v) => lookup(func, vmap, v),
-            _ => None,
-        })
-        .collect()
 }
 
 fn typed_block_args(
@@ -1443,16 +1514,16 @@ pub fn unsupported_reason(func: &CgFunction) -> String {
                         return format!("store type {ty}");
                     }
                 }
+                InstructionData::Unary { opcode, .. }
+                    if opcode != Opcode::Ineg && map_unop(opcode).is_none() =>
+                {
+                    return format!("unary {opcode}");
+                }
                 InstructionData::Unary { arg, .. } => {
                     let ty = func.dfg.value_type(arg);
                     if map_type_to_rir(ty).is_none() {
                         return format!("unary operand type {ty}");
                     }
-                }
-                InstructionData::Unary { opcode, .. }
-                    if opcode != Opcode::Ineg && map_unop(opcode).is_none() =>
-                {
-                    return format!("unary {opcode}");
                 }
                 InstructionData::Binary { opcode, .. }
                     if !matches!(opcode, Opcode::Umin | Opcode::Umax)
@@ -1661,7 +1732,7 @@ mod tests {
 
     use super::*;
 
-    fn new_func(params: &[Type], rets: &[Type]) -> (Function, Block) {
+    pub(crate) fn new_func(params: &[Type], rets: &[Type]) -> (Function, Block) {
         let mut func = Function::new();
         func.signature.params =
             params.iter().map(|t| rakit_codegen::ir::AbiParam::new(*t)).collect();
@@ -1684,7 +1755,7 @@ mod tests {
         b
     }
 
-    fn iconst(func: &mut Function, b: Block, ty: Type, v: i64) -> Value {
+    pub(crate) fn iconst(func: &mut Function, b: Block, ty: Type, v: i64) -> Value {
         let inst = func
             .dfg
             .make_inst(InstructionData::UnaryImm { opcode: Opcode::Iconst, imm: Imm64::new(v) });
@@ -1728,7 +1799,7 @@ mod tests {
         func.dfg.inst_results(inst)[0]
     }
 
-    fn ret(func: &mut Function, b: Block, vals: &[Value]) {
+    pub(crate) fn ret(func: &mut Function, b: Block, vals: &[Value]) {
         let mut list = ValueList::default();
         for v in vals {
             list.push(*v, &mut func.dfg.value_lists);
@@ -1908,6 +1979,22 @@ mod tests {
         let out = export(&rir, &f.signature).expect("export bool truthy");
         let rir2 = import(&out).expect("re-import bool truthy");
         assert_eq!(run(&rir2, &[]).unwrap(), vec![Val::I(2)]);
+    }
+
+    #[test]
+    fn comparison_to_float_cast_roundtrip() {
+        let (mut f, e) = new_func(&[], &[types::F64]);
+        let a = iconst(&mut f, e, types::I64, 5);
+        let b = iconst(&mut f, e, types::I64, 3);
+        let cond = icmp(&mut f, e, IntCC::SignedGreaterThan, a, b);
+        let v = unary(&mut f, e, Opcode::FcvtFromUint, types::F64, cond);
+        ret(&mut f, e, &[v]);
+
+        let rir = import(&f).expect("import comparison-to-float");
+        assert_eq!(run(&rir, &[]).unwrap(), vec![Val::F64(1.0)]);
+        let out = export(&rir, &f.signature).expect("export comparison-to-float");
+        let rir2 = import(&out).expect("re-import comparison-to-float");
+        assert_eq!(run(&rir2, &[]).unwrap(), vec![Val::F64(1.0)]);
     }
 
     #[test]
@@ -2093,6 +2180,22 @@ mod tests {
     }
 
     #[test]
+    fn i128_folded_zero_export_is_legal() {
+        let (mut f, e) = new_func(&[types::I128], &[types::I128]);
+        let x = f.dfg.block_params(e)[0];
+        let v = bin(&mut f, e, Opcode::Bxor, types::I128, x, x);
+        ret(&mut f, e, &[v]);
+
+        let mut rir = import(&f).expect("import i128 xor");
+        assert!(rakit_ir::optimize(&mut rir));
+        let out = export(&rir, &f.signature).expect("export folded i128 zero");
+        let flags = rakit_codegen::settings::Flags::new(rakit_codegen::settings::builder());
+        rakit_codegen::verifier::verify_function(&out, &flags)
+            .expect("exported i128 zero must verify");
+        assert_eq!(run(&rir, &[Val::I128(7)]).unwrap(), vec![Val::I128(0)]);
+    }
+
+    #[test]
     fn unsupported_opcode_is_rejected() {
         let (mut f, e) = new_func(&[types::F64], &[types::F64]);
         let p = f.dfg.block_params(e)[0];
@@ -2113,6 +2216,7 @@ mod call_tests {
     };
 
     use super::*;
+    use super::tests::{iconst, ret};
 
     fn new_func(params: &[CgType], rets: &[CgType]) -> (CgFunction, CgBlock) {
         let mut func = CgFunction::new();
@@ -2244,5 +2348,31 @@ mod call_tests {
         let out = export(&rir, &func.signature).expect("export indirect call");
         let rir2 = import(&out).expect("re-import indirect call");
         assert!(rir2.blocks[0].insts.iter().any(|i| matches!(i, RirInst::CallIndirect { .. })));
+    }
+
+    #[test]
+    fn rejects_non_systemv_external_signature() {
+        let (mut f, e) = new_func(&[], &[types::I64]);
+        let mut callee = Signature::new(CallConv::WindowsFastcall);
+        callee.params.push(AbiParam::new(types::I64));
+        callee.returns.push(AbiParam::new(types::I64));
+        let sig_ref = f.import_signature(callee);
+        let name_ref = f.params.ensure_user_func_name(UserExternalName::new(0, 3));
+        let func_ref = f.import_function(ExtFuncData {
+            name: ExternalName::User(name_ref),
+            signature: sig_ref,
+            colocated: false,
+            patchable: false,
+        });
+        let one = iconst(&mut f, e, types::I64, 1);
+        let mut args = ValueList::default();
+        args.push(one, &mut f.dfg.value_lists);
+        let call =
+            f.dfg.make_inst(InstructionData::Call { opcode: Opcode::Call, func_ref, args });
+        assert_eq!(f.dfg.make_inst_results(call, types::I64), 1);
+        f.layout.append_inst(call, e);
+        let r = f.dfg.first_result(call);
+        ret(&mut f, e, &[r]);
+        assert!(import(&f).is_none(), "win64 signature must not be round-tripped as SysV");
     }
 }

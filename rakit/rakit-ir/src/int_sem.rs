@@ -37,7 +37,7 @@ pub fn wrap(ty: Type, v: i64) -> i64 {
 /// Sign-extend the low `width(ty)` bits into `i64`.
 pub fn sign_extend(ty: Type, v: i64) -> i64 {
     match width(ty) {
-        Some(64) | None => v,
+        Some(64) | Some(128) | None => v,
         Some(bits) => {
             let shift = 64 - bits;
             (v << shift) >> shift

@@ -361,7 +361,11 @@ impl Renamer<'_> {
         }
         self.func.blocks[b].insts = insts;
 
+        let mut seen = HashSet::new();
         for &next in &self.succ[b] {
+            if !seen.insert(next) {
+                continue;
+            }
             let args: Option<Vec<Value>> =
                 self.phi_order[next].iter().map(|loc| self.current.get(loc).copied()).collect();
             let Some(args) = args else {

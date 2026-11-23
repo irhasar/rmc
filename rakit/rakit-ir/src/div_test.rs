@@ -50,7 +50,7 @@ pub fn run(func: &mut Function) -> bool {
     if candidates.is_empty() {
         return false;
     }
-    for cand in candidates {
+    for cand in candidates.into_iter().rev() {
         rewrite(func, &cand);
     }
     true
@@ -336,5 +336,45 @@ mod tests {
                     .any(|b| b.insts.iter().any(|i| matches!(i, Inst::Bin(_, BinOp::Urem, ..))))
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod multiple_candidates_tests {
+    use super::*;
+    use crate::ir::{BinOp, IntCc, Type};
+    use crate::{Builder, Val};
+
+    #[test]
+    fn rewrites_two_comparisons_in_one_block() {
+        let mut b = Builder::new(vec![Type::I64], vec![Type::I64, Type::I64]);
+        let e = b.func().entry;
+        let x = b.func().block(e).params[0];
+        let y = b.func().block(e).params[1];
+        let three = b.iconst(e, Type::I64, 3);
+        let five = b.iconst(e, Type::I64, 5);
+        let zero = b.iconst(e, Type::I64, 0);
+        let one = b.iconst(e, Type::I64, 1);
+        let r1 = b.bin(e, BinOp::Urem, Type::I64, x, three);
+        let c1 = b.icmp(e, IntCc::Eq, Type::I64, r1, zero);
+        let r2 = b.bin(e, BinOp::Urem, Type::I64, y, five);
+        let c2 = b.icmp(e, IntCc::Eq, Type::I64, r2, zero);
+        let s1 = b.select(e, Type::I64, c1, one, zero);
+        let s2 = b.select(e, Type::I64, c2, one, zero);
+        let sum = b.bin(e, BinOp::Add, Type::I64, s1, s2);
+        b.ret(e, vec![sum]);
+        let mut f = b.into_func();
+
+        assert_eq!(crate::run(&f, &[Val::I(9), Val::I(10)]).unwrap(), vec![Val::I(2)]);
+        assert!(run(&mut f));
+        assert!(crate::verify(&f).is_ok(), "{:?}", crate::verify(&f).err());
+        crate::optimize(&mut f);
+        assert!(
+            !f.blocks
+                .iter()
+                .any(|b| b.insts.iter().any(|i| matches!(i, Inst::Bin(_, BinOp::Urem, ..))))
+        );
+        assert_eq!(crate::run(&f, &[Val::I(9), Val::I(10)]).unwrap(), vec![Val::I(2)]);
+        assert_eq!(crate::run(&f, &[Val::I(10), Val::I(10)]).unwrap(), vec![Val::I(1)]);
     }
 }

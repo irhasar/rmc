@@ -96,6 +96,24 @@ fn eval_bin(op: BinOp, ty: Type, a: Val, b: Val) -> Result<Val, String> {
         });
     }
 
+    if ty == Type::Ptr {
+        let (x, y) = (a.as_u64(), b.as_u64());
+        let r = match op {
+            BinOp::Add => x.wrapping_add(y),
+            BinOp::Sub => x.wrapping_sub(y),
+            BinOp::Mul => x.wrapping_mul(y),
+            BinOp::And => x & y,
+            BinOp::Or => x | y,
+            BinOp::Xor => x ^ y,
+            BinOp::Shl => x.wrapping_shl(y as u32),
+            BinOp::Shr | BinOp::Ushr => x.wrapping_shr(y as u32),
+            BinOp::Udiv if y != 0 => x / y,
+            BinOp::Urem if y != 0 => x % y,
+            _ => return Err(format!("pointer op {op:?} failed")),
+        };
+        return Ok(Val::P(r));
+    }
+
     match int_sem::eval_bin(op, ty, a.as_i(), b.as_i()) {
         Some(r) => Ok(Val::I(r)),
         None => Err(format!("integer op {op:?} failed (division by zero?)")),
@@ -156,9 +174,9 @@ fn read_scalar(mem: &[u8], addr: usize, ty: Type) -> Result<Val, String> {
     let mut buf = [0u8; 16];
     buf[..size].copy_from_slice(&mem[addr..end]);
     Ok(match ty {
-        Type::I8 => Val::I(i8::from_le_bytes([buf[0]]) as i64),
-        Type::I16 => Val::I(i16::from_le_bytes(buf[..2].try_into().unwrap()) as i64),
-        Type::I32 => Val::I(i32::from_le_bytes(buf[..4].try_into().unwrap()) as i64),
+        Type::I8 => Val::I(i64::from(buf[0])),
+        Type::I16 => Val::I(i64::from(u16::from_le_bytes(buf[..2].try_into().unwrap()))),
+        Type::I32 => Val::I(i64::from(u32::from_le_bytes(buf[..4].try_into().unwrap()))),
         Type::I64 => Val::I(i64::from_le_bytes(buf[..8].try_into().unwrap())),
         Type::I128 => Val::I128(u128::from_le_bytes(buf)),
         Type::F32 => Val::F32(f32::from_le_bytes(buf[..4].try_into().unwrap())),
@@ -191,9 +209,11 @@ fn write_scalar(mem: &mut [u8], addr: usize, ty: Type, val: Val) -> Result<(), S
 fn eval(func: &crate::ir::Function, env: &[Option<Val>], inst: &Inst, mem: &mut [u8], bases: &[usize]) -> Result<Val, String> {
     match inst {
         Inst::Nop(_, ty) => Ok(default_val(*ty)),
-        Inst::Iconst(_, ty, v) => {
-            Ok(if *ty == Type::Bool { Val::B(*v != 0) } else { Val::I(int_sem::wrap(*ty, *v)) })
-        }
+        Inst::Iconst(_, ty, v) => Ok(match ty {
+            Type::Bool => Val::B(*v != 0),
+            Type::I128 => Val::I128((*v as i128) as u128),
+            _ => Val::I(int_sem::wrap(*ty, *v)),
+        }),
         Inst::F32const(_, v) => Ok(Val::F32(*v)),
         Inst::F64const(_, v) => Ok(Val::F64(*v)),
         Inst::Copy(_, _, x) => get(env, *x),
@@ -211,14 +231,33 @@ fn eval(func: &crate::ir::Function, env: &[Option<Val>], inst: &Inst, mem: &mut 
                 crate::ir::UnOp::Uextend | crate::ir::UnOp::Bint => {
                     Ok(Val::I(int_sem::wrap(*ty, v.as_u64() as i64)))
                 }
-                crate::ir::UnOp::Sextend => Ok(Val::I(int_sem::wrap(
-                    *ty,
-                    int_sem::sign_extend(func.ty(*x), v.as_i()),
-                ))),
+                crate::ir::UnOp::Sextend => {
+                    if *ty == Type::I128 {
+                        Ok(Val::I128((v.as_i() as i128) as u128))
+                    } else {
+                        Ok(Val::I(int_sem::wrap(
+                            *ty,
+                            int_sem::sign_extend(func.ty(*x), v.as_i()),
+                        )))
+                    }
+                }
                 crate::ir::UnOp::Ireduce => Ok(Val::I(int_sem::wrap(*ty, v.as_i()))),
                 crate::ir::UnOp::Bnot => Ok(Val::I(int_sem::wrap(*ty, !v.as_i()))),
                 crate::ir::UnOp::Bitcast => Ok(Val::I(int_sem::wrap(*ty, v.as_i()))),
-                _ => Err(format!("unary op {op:?} is not supported by eval")),
+                crate::ir::UnOp::Fpromote => Ok(Val::F64(v.as_f())),
+                crate::ir::UnOp::Fdemote => Ok(Val::F32(v.as_f() as f32)),
+                crate::ir::UnOp::FcvtFromInt => match ty {
+                    Type::F32 => Ok(Val::F32(v.as_i() as f32)),
+                    Type::F64 => Ok(Val::F64(v.as_i() as f64)),
+                    _ => Err(format!("fcvt_from_sint result type {ty:?}")),
+                },
+                crate::ir::UnOp::FcvtFromUint => match ty {
+                    Type::F32 => Ok(Val::F32(v.as_u64() as f32)),
+                    Type::F64 => Ok(Val::F64(v.as_u64() as f64)),
+                    _ => Err(format!("fcvt_from_uint result type {ty:?}")),
+                },
+                crate::ir::UnOp::FcvtToInt => Ok(Val::I(v.as_f() as i64)),
+                crate::ir::UnOp::FcvtToUint => Ok(Val::I(v.as_f() as u64 as i64)),
             }
         }
         Inst::Bin(_, op, ty, x, y) => eval_bin(*op, *ty, get(env, *x)?, get(env, *y)?),
