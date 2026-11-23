@@ -49,11 +49,20 @@ impl Pass for RirPass<'_> {
         if !crate::tunables::rir_enabled(pctx.crate_name, pctx.user_crate) {
             return false;
         }
-        let large_cgu =
-            self.bodies.is_some_and(|b| b.len() > crate::tunables::rir_large_cgu_functions());
+        // The bridge exports a fresh function and does not carry per-instruction
+        // source locations. Replacing a function that has debug locations would
+        // lose statement-level stepping, so leave it in CLIF until export can
+        // preserve them.
+        if !pctx.ctx.func.params.base_srcloc().is_default() {
+            return false;
+        }
+        let force = crate::tunables::rir_force();
+        let large_cgu = self
+            .bodies
+            .is_some_and(|b| b.rir_eligible() > crate::tunables::rir_large_cgu_functions());
         let max_insts = crate::tunables::rir_max_insts()
             .or_else(|| large_cgu.then(crate::tunables::rir_large_cgu_max_insts));
-        if max_insts.is_some_and(|max| pctx.ctx.func.dfg.num_insts() > max) {
+        if !force && max_insts.is_some_and(|max| pctx.ctx.func.dfg.num_insts() > max) {
             return false;
         }
         let debug = std::env::var_os("RAKIT_RIR_DEBUG").is_some();
@@ -76,7 +85,9 @@ impl Pass for RirPass<'_> {
                     pctx.ctx.func.stack_limit.is_some(),
                 );
                 if stats_mode {
-                    eprintln!("[rir] skip reason: {}", crate::rir::unsupported_reason(&pctx.ctx.func));
+                    if let Some(reason) = crate::rir::unsupported_reason(&pctx.ctx.func) {
+                        eprintln!("[rir] skip reason: {reason}");
+                    }
                 }
             }
             if debug {
@@ -285,7 +296,7 @@ impl Pass for RirPass<'_> {
                 }
             }
         }
-        if !changed && std::env::var_os("RAKIT_RIR_FORCE").is_none() {
+        if !changed && !force {
             if debug {
                 eprintln!("[rir] no-change {:?}", pctx.ctx.func.name);
                 eprintln!("{}", pctx.ctx.func.display());

@@ -904,6 +904,28 @@ impl Affine {
     }
 }
 
+/// Whether `plan.body` contains an instruction whose repeated execution is
+/// observable or can trap. Full reassociation and lane lowering skip the body
+/// for the intermediate iterations, so they are only sound for a body that is
+/// free of calls, memory effects and traps. Partial/clone unrolling executes
+/// every clone, so it remains valid for such bodies.
+fn body_has_observable_effect(func: &ir::Function, plan: &Plan) -> bool {
+    func.layout.block_insts(plan.body).any(|inst| {
+        if inst == plan.back_edge {
+            return false;
+        }
+        let op = func.dfg.insts[inst].opcode();
+        op.is_call()
+            || op.is_branch()
+            || op.is_terminator()
+            || op.is_return()
+            || op.can_trap()
+            || op.other_side_effects()
+            || op.can_store()
+            || op.can_load()
+    })
+}
+
 /// Compute the affine form of every instruction result in `plan.body`, starting
 /// from the header parameters as the basis. Returns `None` if the body is not a
 /// pure affine update of the loop state (it reads or writes memory, calls out, or
@@ -1615,6 +1637,7 @@ fn apply(func: &mut ir::Function, plan: &Plan, factor: u64) {
     // and can be evaluated in a handful of multiplies, collapsing the carried
     // dependency chain. Duplicating the body cannot achieve that.
     if let Some(forms) = analyze_affine(func, plan) {
+        let pure_body = !body_has_observable_effect(func, plan);
         if std::env::var_os("RAKIT_LANE_DEBUG").is_some() {
             match detect_lane(func, plan, &forms) {
                 Some(li) => eprintln!(
@@ -1632,7 +1655,7 @@ fn apply(func: &mut ir::Function, plan: &Plan, factor: u64) {
         // Lane transform: rewrite the LCG-plus-reduction loop into F independent
         // lanes (1 multiply/iter) when the shape and a divisible constant trip
         // count allow it. Falls through to the clone path otherwise.
-        if lane_enabled() {
+        if pure_body && lane_enabled() {
             if let Some(li) = detect_lane(func, plan, &forms) {
                 if apply_lanes(func, plan, &li) {
                     return;
@@ -1648,7 +1671,7 @@ fn apply(func: &mut ir::Function, plan: &Plan, factor: u64) {
         // Atoms (`i | 1`) have no closed form to fold over 128 steps; they stay on
         // the small partial factor so the code does not blow up.
         let any_atoms = back.iter().any(|&v| form_of(v).is_some_and(|f| !f.atoms.is_empty()));
-        if all_affine && !any_atoms {
+        if pure_body && all_affine && !any_atoms {
             if let Some(rows) = power(func, plan, &forms, factor) {
                 let rows: Vec<Affine> = rows.into_iter().flatten().collect();
                 apply_reassoc(func, plan, factor, &rows);

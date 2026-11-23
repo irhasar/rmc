@@ -58,11 +58,20 @@ fn memory_flags_supported(func: &CgFunction, flags: rakit_codegen::ir::MemFlags)
     func.dfg.mem_flags[flags].explicit_endianness().is_none()
 }
 
+fn abi_params_supported(sig: &Signature) -> bool {
+    sig.params.iter().chain(sig.returns.iter()).all(|p| {
+        p.purpose == ArgumentPurpose::Normal && p.extension == ArgumentExtension::None
+    })
+}
+
 fn signature_supported(sig: &Signature) -> bool {
-    sig.call_conv == CallConv::SystemV
-        && sig.params.iter().chain(sig.returns.iter()).all(|p| {
-            p.purpose == ArgumentPurpose::Normal && p.extension == ArgumentExtension::None
-        })
+    sig.call_conv == CallConv::SystemV && abi_params_supported(sig)
+}
+
+/// Indirect calls carry their calling convention through RIR, so any convention
+/// the bridge can encode is safe as long as the ABI parameters are ordinary.
+fn indirect_signature_supported(sig: &Signature) -> bool {
+    call_conv_to_rir(sig.call_conv) != 255 && abi_params_supported(sig)
 }
 
 /// Import a codegen IR function into RIR, or `None` if it uses anything outside the
@@ -354,7 +363,7 @@ pub fn import(func: &CgFunction) -> Option<RirFunction> {
                     let callee = args.as_slice(&func.dfg.value_lists)[0];
                     let callee = lookup(func, &vmap, callee)?;
                     let callee_sig = &func.dfg.signatures[sig_ref];
-                    if !signature_supported(callee_sig) {
+                    if !indirect_signature_supported(callee_sig) {
                         return None;
                     }
                     let params = callee_sig
@@ -450,7 +459,7 @@ pub fn import(func: &CgFunction) -> Option<RirFunction> {
                         .collect::<Option<Vec<_>>>()?;
                     let results: Vec<_> = func.dfg.inst_results(inst).to_vec();
                     let table = &func.dfg.exception_tables[exception];
-                    if !signature_supported(&func.dfg.signatures[table.signature()]) {
+                    if !indirect_signature_supported(&func.dfg.signatures[table.signature()]) {
                         return None;
                     }
                     let rets = func.dfg.signatures[table.signature()]
@@ -1433,39 +1442,39 @@ fn map_exception(
 
 /// Best-effort reason for `import` rejecting a function.  Used by
 /// `RAKIT_RIR_STATS` diagnostics, never for correctness decisions.
-pub fn unsupported_reason(func: &CgFunction) -> String {
+pub fn unsupported_reason(func: &CgFunction) -> Option<String> {
     for p in func.signature.returns.iter().chain(func.signature.params.iter()) {
         if map_type_to_rir(p.value_type).is_none() {
-            return format!("signature type {}", p.value_type);
+            return Some(format!("signature type {}", p.value_type));
         }
     }
     let entry = match func.layout.entry_block() {
         Some(entry) => entry,
-        None => return "no entry block".to_string(),
+        None => return Some("no entry block".to_string()),
     };
     if func.signature.params.len() != func.dfg.block_params(entry).len() {
-        return "signature/entry parameter count".to_string();
+        return Some("signature/entry parameter count".to_string());
     }
     for (_, data) in func.sized_stack_slots.iter() {
         if !matches!(data.kind, StackSlotKind::ExplicitSlot) {
-            return format!("stack slot kind {:?}", data.kind);
+            return Some(format!("stack slot kind {:?}", data.kind));
         }
     }
     for (_, data) in func.dynamic_stack_slots.iter() {
         if !matches!(data.kind, StackSlotKind::ExplicitDynamicSlot) {
-            return format!("dynamic slot kind {:?}", data.kind);
+            return Some(format!("dynamic slot kind {:?}", data.kind));
         }
     }
     for (_, data) in func.global_values.iter() {
         if map_global_data(func, data).is_none() {
-            return "global data".to_string();
+            return Some("global data".to_string());
         }
     }
     for b in func.layout.blocks() {
         for v in func.dfg.block_params(b) {
             let ty = func.dfg.value_type(*v);
             if map_type_to_rir(ty).is_none() {
-                return format!("block param type {ty}");
+                return Some(format!("block param type {ty}"));
             }
         }
     }
@@ -1474,14 +1483,14 @@ pub fn unsupported_reason(func: &CgFunction) -> String {
             for r in func.dfg.inst_results(inst) {
                 let ty = func.dfg.value_type(*r);
                 if map_type_to_rir(ty).is_none() {
-                    return format!("result type {ty}");
+                    return Some(format!("result type {ty}"));
                 }
             }
             match func.dfg.insts[inst] {
                 InstructionData::UnaryImm { opcode: Opcode::Iconst, .. } => {
                     if let Some(r) = func.dfg.inst_results(inst).first() {
                         if map_type_to_rir(func.dfg.value_type(*r)) == Some(RirType::I128) {
-                            return "i128 constant".to_string();
+                            return Some("i128 constant".to_string());
                         }
                     }
                 }
@@ -1489,69 +1498,85 @@ pub fn unsupported_reason(func: &CgFunction) -> String {
                     let ext = &func.dfg.ext_funcs[func_ref];
                     let sig = &func.dfg.signatures[ext.signature];
                     if sig.params.iter().chain(sig.returns.iter()).any(|p| map_type_to_rir(p.value_type).is_none()) {
-                        return "call signature type".to_string();
+                        return Some("call signature type".to_string());
+                    }
+                    if !signature_supported(sig) {
+                        return Some("call ABI".to_string());
                     }
                     if map_external_target(func, ext.name.clone()).is_none() {
-                        return "call external target".to_string();
+                        return Some("call external target".to_string());
                     }
                 }
                 InstructionData::CallIndirect { sig_ref, .. } => {
                     let sig = &func.dfg.signatures[sig_ref];
                     if sig.params.iter().chain(sig.returns.iter()).any(|p| map_type_to_rir(p.value_type).is_none()) {
-                        return "indirect signature type".to_string();
+                        return Some("indirect signature type".to_string());
+                    }
+                    if !indirect_signature_supported(sig) {
+                        return Some("indirect ABI".to_string());
                     }
                 }
                 InstructionData::TryCall { func_ref, .. } => {
                     let ext = &func.dfg.ext_funcs[func_ref];
                     let sig = &func.dfg.signatures[ext.signature];
                     if sig.params.iter().chain(sig.returns.iter()).any(|p| map_type_to_rir(p.value_type).is_none()) {
-                        return "try call signature type".to_string();
+                        return Some("try call signature type".to_string());
+                    }
+                    if !signature_supported(sig) {
+                        return Some("try call ABI".to_string());
                     }
                 }
                 InstructionData::Store { args, .. } | InstructionData::StoreNoOffset { args, .. } => {
                     let ty = func.dfg.value_type(args[0]);
                     if map_type_to_rir(ty).is_none() {
-                        return format!("store type {ty}");
+                        return Some(format!("store type {ty}"));
                     }
                 }
                 InstructionData::Unary { opcode, .. }
                     if opcode != Opcode::Ineg && map_unop(opcode).is_none() =>
                 {
-                    return format!("unary {opcode}");
+                    return Some(format!("unary {opcode}"));
                 }
                 InstructionData::Unary { arg, .. } => {
                     let ty = func.dfg.value_type(arg);
                     if map_type_to_rir(ty).is_none() {
-                        return format!("unary operand type {ty}");
+                        return Some(format!("unary operand type {ty}"));
                     }
                 }
                 InstructionData::Binary { opcode, .. }
                     if !matches!(opcode, Opcode::Umin | Opcode::Umax)
                         && map_binop(opcode).is_none() =>
                 {
-                    return format!("binary {opcode}");
+                    return Some(format!("binary {opcode}"));
                 }
                 InstructionData::Ternary { opcode, .. } if opcode != Opcode::Select => {
-                    return format!("ternary {opcode}");
+                    return Some(format!("ternary {opcode}"));
                 }
                 InstructionData::MultiAry { opcode, .. } if opcode != Opcode::Return => {
-                    return format!("multiary {opcode}");
+                    return Some(format!("multiary {opcode}"));
                 }
-                InstructionData::UnaryConst { opcode, .. } => return format!("const {opcode}"),
-                InstructionData::BinaryImm8 { opcode, .. } => return format!("imm8 {opcode}"),
-                InstructionData::TernaryImm8 { opcode, .. } => return format!("ternary imm8 {opcode}"),
-                InstructionData::Shuffle { opcode, .. } => return format!("shuffle {opcode}"),
+                InstructionData::UnaryConst { opcode, .. } => return Some(format!("const {opcode}")),
+                InstructionData::BinaryImm8 { opcode, .. } => return Some(format!("imm8 {opcode}")),
+                InstructionData::TernaryImm8 { opcode, .. } => return Some(format!("ternary imm8 {opcode}")),
+                InstructionData::Shuffle { opcode, .. } => return Some(format!("shuffle {opcode}")),
                 InstructionData::AtomicCas { opcode, .. }
-                | InstructionData::AtomicRmw { opcode, .. } => return format!("atomic {opcode}"),
-                InstructionData::IntAddTrap { opcode, .. } => return format!("add trap {opcode}"),
+                | InstructionData::AtomicRmw { opcode, .. } => return Some(format!("atomic {opcode}")),
+                InstructionData::IntAddTrap { opcode, .. } => return Some(format!("add trap {opcode}")),
                 InstructionData::ExceptionHandlerAddress { opcode, .. } => {
-                    return format!("exception address {opcode}");
+                    return Some(format!("exception address {opcode}"));
                 }
                 _ => {}
             }
         }
     }
-    "unsupported signature/type".to_string()
+    None
+}
+
+/// Lightweight preflight used to count RIR-eligible functions for the CGU
+/// budget. This deliberately mirrors the checks in `import` but does not build
+/// an RIR function.
+pub fn is_supported(func: &CgFunction) -> bool {
+    unsupported_reason(func).is_none()
 }
 
 fn map_type_to_rir(t: CgType) -> Option<RirType> {
@@ -2348,6 +2373,42 @@ mod call_tests {
         let out = export(&rir, &func.signature).expect("export indirect call");
         let rir2 = import(&out).expect("re-import indirect call");
         assert!(rir2.blocks[0].insts.iter().any(|i| matches!(i, RirInst::CallIndirect { .. })));
+    }
+
+    #[test]
+    fn import_export_indirect_call_preserves_non_systemv_abi() {
+        let (mut func, entry) = new_func(&[types::I64, types::I64], &[types::I64]);
+        let params = func.dfg.block_params(entry).to_vec();
+
+        let mut callee = Signature::new(CallConv::Fast);
+        callee.params.push(AbiParam::new(types::I64));
+        callee.returns.push(AbiParam::new(types::I64));
+        let sig_ref = func.import_signature(callee);
+
+        let mut args = ValueList::default();
+        args.push(params[0], &mut func.dfg.value_lists);
+        args.push(params[1], &mut func.dfg.value_lists);
+        let call = func.dfg.make_inst(InstructionData::CallIndirect {
+            opcode: Opcode::CallIndirect,
+            sig_ref,
+            args,
+        });
+        assert_eq!(func.dfg.make_inst_results(call, types::I64), 1);
+        func.layout.append_inst(call, entry);
+        let result = func.dfg.first_result(call);
+        ret(&mut func, entry, &[result]);
+
+        let rir = import(&func).expect("import fast indirect call");
+        assert!(rir.blocks[0].insts.iter().any(|i| matches!(
+            i,
+            RirInst::CallIndirect { call_conv, .. } if *call_conv == call_conv_to_rir(CallConv::Fast)
+        )));
+        let out = export(&rir, &func.signature).expect("export fast indirect call");
+        let rir2 = import(&out).expect("re-import fast indirect call");
+        assert!(rir2.blocks[0].insts.iter().any(|i| matches!(
+            i,
+            RirInst::CallIndirect { call_conv, .. } if *call_conv == call_conv_to_rir(CallConv::Fast)
+        )));
     }
 
     #[test]

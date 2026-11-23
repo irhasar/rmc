@@ -2954,28 +2954,47 @@ besar pada jalur RIR default:
   (`RAKIT_RIR_UNROLL=1`); default codegen unroller kembali aktif dan keduanya
   menjadi **7 ms**.
 
-Matriks 3-arah terakhir (C = compile wall, R = run wall, size = byte):
+Matriks 3-arah terakhir (`bench/allaxes.sh`, CREPS=3, RREPS=7; C = compile,
+R = run; wall/CPU dalam ms, RSS dalam MB, size dalam byte):
 
-| prog | C L/U/M | R L/U/M | size L/U/M |
-|------|---------|---------|------------|
-| p1 | 100/89/88 | 82/109/101 | 4.64/5.88/4.11 MB |
-| p2 | 263/146/173 | 18/158/50 | 4.64/5.94/4.11 MB |
-| p3 | 105/92/98 | 37/118/60 | 4.61/5.82/4.04 MB |
-| p4 | 125/106/114 | 58/158/86 | 4.64/5.89/4.12 MB |
-| p5 | 92/87/86 | 58/895/7 | 4.61/5.81/4.03 MB |
-| p6 | 90/88/85 | 58/902/7 | 4.61/5.81/4.03 MB |
-| p7 | 95/84/88 | 43/101/35 | 4.61/5.81/4.03 MB |
-| p8 | 91/84/84 | 18/39/21 | 4.61/5.81/4.03 MB |
-| p9 | 103/102/100 | 31/77/35 | 4.64/5.89/4.12 MB |
+| prog | bk | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
+|------|----|------:|-----:|-----:|-----:|------:|-----:|-----:|
+| p1_arith | L | 84 | 102 | 105.5 | 4,635,232 | 82 | 82 | 10.5 |
+| p1_arith | U | 81 | 104 | 107.2 | 5,877,944 | 110 | 109 | 10.7 |
+| p1_arith | M | 78 | 100 | 109.6 | 4,146,240 | 102 | 101 | 10.7 |
+| p2_mem | L | 245 | 378 | 133.8 | 4,639,888 | 16 | 16 | 10.5 |
+| p2_mem | U | 128 | 174 | 130.8 | 5,936,144 | 157 | 158 | 10.7 |
+| p2_mem | M | 161 | 224 | 133.1 | 4,143,704 | 48 | 47 | 10.8 |
+| p3_calls | L | 102 | 125 | 116.1 | 4,612,368 | 37 | 36 | 10.7 |
+| p3_calls | U | 85 | 112 | 116.4 | 5,820,136 | 116 | 116 | 10.7 |
+| p3_calls | M | 96 | 123 | 118.6 | 4,067,168 | 59 | 60 | 10.5 |
+| p4_simd | L | 108 | 133 | 116.4 | 4,636,096 | 58 | 58 | 48.1 |
+| p4_simd | U | 90 | 114 | 117.0 | 5,892,376 | 156 | 155 | 49.5 |
+| p4_simd | M | 100 | 124 | 119.2 | 4,152,832 | 82 | 82 | 48.8 |
+| p5_inline | L | 82 | 101 | 104.9 | 4,609,368 | 58 | 57 | 10.7 |
+| p5_inline | U | 75 | 100 | 106.5 | 5,813,704 | 893 | 892 | 10.8 |
+| p5_inline | M | 76 | 101 | 108.3 | 4,060,088 | 7 | 6 | 10.5 |
+| p6_scalar | L | 82 | 101 | 101.2 | 4,609,368 | 58 | 57 | 10.3 |
+| p6_scalar | U | 75 | 98 | 103.0 | 5,813,688 | 902 | 901 | 10.7 |
+| p6_scalar | M | 75 | 96 | 104.6 | 4,060,088 | 6 | 6 | 10.7 |
+| p7_branchy | L | 84 | 102 | 104.9 | 4,609,520 | 43 | 42 | 10.7 |
+| p7_branchy | U | 77 | 100 | 106.6 | 5,813,800 | 100 | 100 | 10.7 |
+| p7_branchy | M | 76 | 98 | 108.4 | 4,060,248 | 35 | 35 | 10.7 |
+| p8_minmax | L | 84 | 104 | 104.9 | 4,609,544 | 18 | 18 | 10.7 |
+| p8_minmax | U | 77 | 103 | 106.6 | 5,813,752 | 38 | 38 | 10.7 |
+| p8_minmax | M | 77 | 100 | 108.4 | 4,060,216 | 20 | 20 | 10.5 |
+| p9_u64f32 | L | 94 | 114 | 110.9 | 4,635,448 | 30 | 30 | 17.8 |
+| p9_u64f32 | U | 83 | 104 | 112.6 | 5,886,872 | 76 | 76 | 18.9 |
+| p9_u64f32 | M | 90 | 113 | 114.7 | 4,149,856 | 33 | 32 | 18.2 |
 
-Dibanding matriks §21.4: runtime `p3` 94→60, `p4` 99→86, `p8` 29→21;
-`p2` 52→50, `p7` 36→35; `p1`/`p9` dalam ±1 ms; `p5`/`p6` 6→7 ms karena
-pembulatan. Ukuran artefak M sedikit lebih kecil. Compile absolut naik di semua
-backend pada run ini (mesin lebih lambat), tetapi setelah anggaran RIR CGU besar
-`p2` M hanya 146→173 ms (U 146, L 263), bukan 194 ms; `p5`/`p6` M 86/85 ms
-malah lebih cepat dari U 87/88 dan L 92/90. `p2` masih ~18% lebih lambat
-compile daripada U, tetapi runtime-nya kini lebih baik dari run sebelumnya dan
-jauh lebih cepat dari U (50 vs 158 ms).
+Dibanding matriks §21.4: runtime `p3` 94→59, `p4` 99→82, `p8` 29→20;
+`p2` 52→48, `p7` 36→35; `p1`/`p9` dalam ±1 ms; `p5`/`p6` 6→7 ms karena
+pembulatan. Ukuran artefak M lebih kecil dari L dan U pada semua program
+(4.06–4.15 MB vs L 4.61–4.64 MB, U 5.81–5.94 MB). Compile absolut naik di
+semua backend pada run ini (mesin lebih lambat), tetapi dengan anggaran RIR CGU
+besar `p2` M 161 ms (U 128, L 245); `p5`/`p6` M 76/75 ms, setara U (75/75)
+dan lebih cepat dari L (82/82). `p2` masih ~26% lebih lambat compile daripada
+U, tetapi runtime-nya jauh lebih cepat dari U (48 vs 157 ms).
 
 ### 29.1 Anggaran RIR untuk CGU besar (p2/p5 compile)
 
@@ -3017,3 +3036,43 @@ Eksperimen yang **ditolak** (diukur, bukan diasumsikan):
 Verifikasi: seluruh keluaran p1–p9 byte-identik dengan LLVM; `./y.sh test`
 65 suite `ok`, 0 failure; `rakit-ir` dan `rakit-opt` lulus; test regresi baru
 `rakit-ir/tests/rec_loop.rs` memastikan hanya satu self-call per iterasi.
+
+### 29.2 Audit correctness hasil review (2026-11-23)
+
+Semua temuan review ditindaklanjuti. Perubahan yang mendarat:
+
+- **Affine unroll tidak lagi melewati efek samping.** `body_has_observable_effect`
+  menolak reassociation penuh dan lane lowering bila badan loop berisi call,
+  load/store, trap, atau opcode berefek lain; partial/clone unrolling tetap
+  tersedia karena setiap clone mengeksekusi badan. Regresi:
+  `bench/tests/t_loop_side_effect.rs` (64 call `tick()`), keluaran L dan M
+  identik `2016 64`.
+- **RIR unroll tidak memakai nilai header yang basi.** `header_supported`
+  menolak badan yang membaca hasil header yang bergantung pada induksi, dan
+  menolak header dengan efek samping. Test:
+  `header_value_used_by_body_is_not_reused_stale` (sebelumnya 8, sekarang 12).
+- **Entry kondisional tidak overshoot.** `initial_iv` mensyaratkan tepat satu
+  edge preheader `Jump`; edge `Brif`/try-call ke header ditolak. Test:
+  `conditional_second_entry_does_not_overshoot`.
+- **Interpreter**: `Sextend` ke I128 memakai lebar sumber; `FcvtFromInt/Uint`
+  menangani sumber sempit bertanda dan payload I128 penuh; `FcvtToInt/Uint`
+  memotong ke arah nol, memeriksa range tujuan, dan menolak NaN/overflow;
+  operasi pointer memakai semantik integer bertanda; `Iconst` Ptr menghasilkan
+  `Val::P`. Test baru `rakit-ir/tests/interp.rs` (6 kasus).
+- **Anggaran RIR CGU** menghitung fungsi eligible lewat preflight bridge
+  (`rir::is_supported`), bukan panjang cache inliner yang sudah difilter ukuran.
+  `RAKIT_RIR_FORCE=1` kini juga melewati batas ukuran untuk validasi.
+- **Debug info**: fungsi dengan `base_srcloc` tidak di-export ulang oleh RIR,
+  sehingga line table/stepping tidak hilang saat export belum membawa srcloc.
+- **Verifier** menolak use live dari nilai yang hanya didefinisikan di blok
+  unreachable; test `rakit-ir/tests/verify.rs`.
+- **Matcher RIR** melanjutkan scan setelah header loop yang tidak memenuhi
+  syarat, sehingga loop konstan berikutnya tetap bisa di-unroll.
+- **Test `rec_loop`** memakai decrement berbeda (c1=1, c2=2) dan memeriksa
+  operand call serta induksi, bukan hanya jumlah call.
+- **LICM RIR** menghitung predecessors/dominator/loop sekali per pemanggilan;
+  hanya peta definisi yang di-refresh setiap ronde.
+- **Indirect call non-System V** diterima bila semua parameter ABI normal dan
+  convention dapat di-encode RIR; test round-trip `CallConv::Fast`.
+- **Matriks benchmark** §29 sekarang memuat wall, CPU, peak RSS, dan ukuran
+  artefak dalam byte untuk setiap backend dan program.

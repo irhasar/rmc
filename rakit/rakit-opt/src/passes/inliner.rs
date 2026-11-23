@@ -146,6 +146,7 @@ pub struct CguInliner<'a> {
 pub struct CguBodies {
     funcs: FxHashMap<u32, CguBody>,
     rir: OnceLock<Vec<rakit_ir::Function>>,
+    rir_eligible: usize,
 }
 
 struct CguBody {
@@ -169,7 +170,7 @@ impl CguBodies {
             }
             out.insert(id, CguBody { func: func.clone(), is_leaf: is_leaf(func) });
         }
-        CguBodies { funcs: out, rir: OnceLock::new() }
+        CguBodies { funcs: out, rir: OnceLock::new(), rir_eligible: 0 }
     }
 
     /// Import the collected bodies once for the RIR inliner.  A codegen unit
@@ -194,6 +195,16 @@ impl CguBodies {
 
     pub fn len(&self) -> usize {
         self.funcs.len()
+    }
+
+    /// Number of functions in the whole CGU that the RIR bridge supports. This
+    /// is independent of the inliner's size-filtered cache.
+    pub fn rir_eligible(&self) -> usize {
+        self.rir_eligible
+    }
+
+    pub fn set_rir_eligible(&mut self, count: usize) {
+        self.rir_eligible = count;
     }
 }
 

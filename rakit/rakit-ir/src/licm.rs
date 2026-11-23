@@ -13,11 +13,14 @@ struct Loop {
 
 pub fn run(func: &mut Function) -> bool {
     let mut changed = false;
+    // Hoisting only moves instructions between existing blocks; it never changes
+    // the CFG. Compute the loop structure once and refresh only the definition
+    // map each round.
+    let preds = predecessors(func);
+    let order = rpo(func);
+    let idom = dominators(func, &preds, &order);
+    let loops = find_loops(func, &preds, &idom);
     loop {
-        let preds = predecessors(func);
-        let order = rpo(func);
-        let idom = dominators(func, &preds, &order);
-        let loops = find_loops(func, &preds, &idom);
         let def = def_blocks(func);
         let mut moved_any = false;
 

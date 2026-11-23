@@ -5,7 +5,7 @@
 //! initial value, bound and step are compile-time constants and the trip count
 //! is an exact multiple of the factor, so no remainder loop is needed.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::cfg_util::remove_values;
 use crate::ir::{BinOp, Block, BlockData, Function, Inst, IntCc, Type, Value};
@@ -51,15 +51,14 @@ fn match_loop(func: &Function, factor: usize) -> Option<Plan> {
             continue;
         }
         let iv = block.params[0];
-        let bound = block
-            .insts
-            .iter()
-            .find_map(|i| match i {
-                Inst::Icmp(c, IntCc::Ult, Type::I64, x, y) if c == cond && *x == iv => {
-                    const_i64(func, *y)
-                }
-                _ => None,
-            })?;
+        let Some(bound) = block.insts.iter().find_map(|i| match i {
+            Inst::Icmp(c, IntCc::Ult, Type::I64, x, y) if c == cond && *x == iv => {
+                const_i64(func, *y)
+            }
+            _ => None,
+        }) else {
+            continue;
+        };
         let step = func
             .blocks
             .iter()
@@ -82,7 +81,12 @@ fn match_loop(func: &Function, factor: usize) -> Option<Plan> {
                 _ => None,
             })
             .unwrap_or(0);
-        let start = initial_iv(func, header, body, iv)?;
+        let Some(start) = initial_iv(func, header, body, iv) else {
+            continue;
+        };
+        if !header_supported(func, header, body) {
+            continue;
+        }
         if step <= 0 || start >= bound || (bound - start) % step != 0 {
             continue;
         }
@@ -123,25 +127,105 @@ fn const_i64(func: &Function, mut v: Value) -> Option<i64> {
     None
 }
 
-fn initial_iv(func: &Function, header: usize, body: usize, iv: Value) -> Option<i64> {
-    let pos = func.blocks[header].params.iter().position(|p| *p == iv)?;
-    let mut start = None;
+/// Whether an instruction may be executed once per loop iteration without an
+/// observable effect or a trap. The RIR unroller skips intermediate header
+/// executions, so only pure header computations are safe to leave in place.
+fn pure_header_inst(inst: &Inst) -> bool {
+    match inst {
+        Inst::Iconst(..)
+        | Inst::F32const(..)
+        | Inst::F64const(..)
+        | Inst::Copy(..)
+        | Inst::Icmp(..)
+        | Inst::Fcmp(..)
+        | Inst::Select(..)
+        | Inst::StackAddr(..)
+        | Inst::FuncAddr(..)
+        | Inst::DynamicStackAddr(..) => true,
+        Inst::Bin(_, op, ..) => !matches!(op, BinOp::Sdiv | BinOp::Udiv | BinOp::Srem | BinOp::Urem),
+        Inst::Unary(_, op, ..) => !matches!(
+            op,
+            crate::ir::UnOp::FcvtFromInt
+                | crate::ir::UnOp::FcvtToInt
+                | crate::ir::UnOp::FcvtFromUint
+                | crate::ir::UnOp::FcvtToUint
+        ),
+        _ => false,
+    }
+}
+
+/// Reject loops whose body reads a header result that changes with the
+/// induction variable, or whose header has a side effect. The rewrite clones
+/// only the body, so such a header value would be reused for every unrolled
+/// iteration and produce stale results.
+fn header_supported(func: &Function, header: usize, body: usize) -> bool {
+    let header_block = &func.blocks[header];
+    let Some((_, header_insts)) = header_block.insts.split_last() else {
+        return false;
+    };
+    let params: HashSet<Value> = header_block.params.iter().copied().collect();
+    let mut header_results: HashMap<Value, Inst> = HashMap::new();
+    let mut invariant: HashSet<Value> = HashSet::new();
+
+    // Values defined outside the loop are available and immutable for the whole
+    // loop, so they are invariant inputs to the header computation.
     for (bi, block) in func.blocks.iter().enumerate() {
-        if bi == body {
+        if bi == header || bi == body {
             continue;
         }
-        let Some(Inst::Jump(target, args)) = block.insts.last() else { continue };
-        if target.0 as usize != header {
-            continue;
-        }
-        let value = const_i64(func, *args.get(pos)?)?;
-        match start {
-            Some(old) if old != value => return None,
-            Some(_) => {}
-            None => start = Some(value),
+        invariant.extend(block.params.iter().copied());
+        for inst in &block.insts {
+            invariant.extend(inst.result_values());
         }
     }
-    start
+
+    for inst in header_insts {
+        if !pure_header_inst(inst) {
+            return false;
+        }
+        let results = inst.result_values();
+        for &r in &results {
+            header_results.insert(r, inst.clone());
+        }
+        if inst.operands().iter().all(|v| invariant.contains(v)) {
+            invariant.extend(results);
+        }
+    }
+
+    let Some((_, body_insts)) = func.blocks[body].insts.split_last() else {
+        return false;
+    };
+    for inst in body_insts {
+        for v in inst.operands() {
+            if params.contains(&v) || invariant.contains(&v) {
+                continue;
+            }
+            if header_results.contains_key(&v) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn initial_iv(func: &Function, header: usize, body: usize, iv: Value) -> Option<i64> {
+    let pos = func.blocks[header].params.iter().position(|p| *p == iv)?;
+    let preds = crate::cfg_util::predecessors(func);
+    let incoming: Vec<usize> =
+        preds[header].iter().copied().filter(|&p| p != body).collect();
+    // Multiple or conditional entries can have different trip counts. The
+    // rewrite has no remainder/entry guard, so only a single unconditional
+    // preheader edge is safe.
+    if incoming.len() != 1 {
+        return None;
+    }
+    let Some(Inst::Jump(target, args)) = func.blocks[incoming[0]].insts.last() else {
+        return None;
+    };
+    if target.0 as usize != header {
+        return None;
+    }
+    const_i64(func, *args.get(pos)?)
 }
 
 fn rewrite(func: &mut Function, plan: Plan) {

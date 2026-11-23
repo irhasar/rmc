@@ -227,6 +227,13 @@ pub fn rir_max_insts() -> Option<usize> {
     *V.get_or_init(|| std::env::var("RAKIT_RIR_MAX_INSTS").ok()?.parse().ok())
 }
 
+/// Whether `RAKIT_RIR_FORCE` is set: validation mode that exports even when no
+/// RIR pass changed the function and ignores the per-CGU size budget.
+pub fn rir_force() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| flag("RAKIT_RIR_FORCE"))
+}
+
 /// A CGU with more than this many RIR-eligible functions is treated as large.
 pub fn rir_large_cgu_functions() -> usize {
     static V: OnceLock<usize> = OnceLock::new();

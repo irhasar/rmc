@@ -77,7 +77,12 @@ pub fn verify(func: &Function) -> Result<(), Vec<String>> {
                     None => errs.push(format!("use of undefined value {u:?}")),
                     Some(d) => {
                         if d.block != b {
-                            if reachable[bi]
+                            if reachable[bi] && !reachable[d.block.0 as usize] {
+                                errs.push(format!(
+                                    "use of {u:?} in {b:?} is defined in unreachable block {:?}",
+                                    d.block
+                                ));
+                            } else if reachable[bi]
                                 && reachable[d.block.0 as usize]
                                 && !dominates(&dom, d.block, b)
                             {

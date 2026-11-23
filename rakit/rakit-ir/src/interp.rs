@@ -97,21 +97,9 @@ fn eval_bin(op: BinOp, ty: Type, a: Val, b: Val) -> Result<Val, String> {
     }
 
     if ty == Type::Ptr {
-        let (x, y) = (a.as_u64(), b.as_u64());
-        let r = match op {
-            BinOp::Add => x.wrapping_add(y),
-            BinOp::Sub => x.wrapping_sub(y),
-            BinOp::Mul => x.wrapping_mul(y),
-            BinOp::And => x & y,
-            BinOp::Or => x | y,
-            BinOp::Xor => x ^ y,
-            BinOp::Shl => x.wrapping_shl(y as u32),
-            BinOp::Shr | BinOp::Ushr => x.wrapping_shr(y as u32),
-            BinOp::Udiv if y != 0 => x / y,
-            BinOp::Urem if y != 0 => x % y,
-            _ => return Err(format!("pointer op {op:?} failed")),
-        };
-        return Ok(Val::P(r));
+        return int_sem::eval_bin(op, ty, a.as_i(), b.as_i())
+            .map(|r| Val::P(r as u64))
+            .ok_or_else(|| format!("pointer op {op:?} failed"));
     }
 
     match int_sem::eval_bin(op, ty, a.as_i(), b.as_i()) {
@@ -212,6 +200,7 @@ fn eval(func: &crate::ir::Function, env: &[Option<Val>], inst: &Inst, mem: &mut 
         Inst::Iconst(_, ty, v) => Ok(match ty {
             Type::Bool => Val::B(*v != 0),
             Type::I128 => Val::I128((*v as i128) as u128),
+            Type::Ptr => Val::P(*v as u64),
             _ => Val::I(int_sem::wrap(*ty, *v)),
         }),
         Inst::F32const(_, v) => Ok(Val::F32(*v)),
@@ -232,13 +221,16 @@ fn eval(func: &crate::ir::Function, env: &[Option<Val>], inst: &Inst, mem: &mut 
                     Ok(Val::I(int_sem::wrap(*ty, v.as_u64() as i64)))
                 }
                 crate::ir::UnOp::Sextend => {
-                    if *ty == Type::I128 {
-                        Ok(Val::I128((v.as_i() as i128) as u128))
+                    let src_ty = func.ty(*x);
+                    let signed = if src_ty == Type::I128 {
+                        v.as_u128() as i128
                     } else {
-                        Ok(Val::I(int_sem::wrap(
-                            *ty,
-                            int_sem::sign_extend(func.ty(*x), v.as_i()),
-                        )))
+                        int_sem::sign_extend(src_ty, v.as_i()) as i128
+                    };
+                    if *ty == Type::I128 {
+                        Ok(Val::I128(signed as u128))
+                    } else {
+                        Ok(Val::I(int_sem::wrap(*ty, signed as i64)))
                     }
                 }
                 crate::ir::UnOp::Ireduce => Ok(Val::I(int_sem::wrap(*ty, v.as_i()))),
@@ -246,18 +238,77 @@ fn eval(func: &crate::ir::Function, env: &[Option<Val>], inst: &Inst, mem: &mut 
                 crate::ir::UnOp::Bitcast => Ok(Val::I(int_sem::wrap(*ty, v.as_i()))),
                 crate::ir::UnOp::Fpromote => Ok(Val::F64(v.as_f())),
                 crate::ir::UnOp::Fdemote => Ok(Val::F32(v.as_f() as f32)),
-                crate::ir::UnOp::FcvtFromInt => match ty {
-                    Type::F32 => Ok(Val::F32(v.as_i() as f32)),
-                    Type::F64 => Ok(Val::F64(v.as_i() as f64)),
-                    _ => Err(format!("fcvt_from_sint result type {ty:?}")),
-                },
-                crate::ir::UnOp::FcvtFromUint => match ty {
-                    Type::F32 => Ok(Val::F32(v.as_u64() as f32)),
-                    Type::F64 => Ok(Val::F64(v.as_u64() as f64)),
-                    _ => Err(format!("fcvt_from_uint result type {ty:?}")),
-                },
-                crate::ir::UnOp::FcvtToInt => Ok(Val::I(v.as_f() as i64)),
-                crate::ir::UnOp::FcvtToUint => Ok(Val::I(v.as_f() as u64 as i64)),
+                crate::ir::UnOp::FcvtFromInt => {
+                    let src_ty = func.ty(*x);
+                    let signed = if src_ty == Type::I128 {
+                        (v.as_u128() as i128) as f64
+                    } else {
+                        int_sem::sign_extend(src_ty, v.as_i()) as f64
+                    };
+                    match ty {
+                        Type::F32 => Ok(Val::F32(signed as f32)),
+                        Type::F64 => Ok(Val::F64(signed)),
+                        _ => Err(format!("fcvt_from_sint result type {ty:?}")),
+                    }
+                }
+                crate::ir::UnOp::FcvtFromUint => {
+                    let src_ty = func.ty(*x);
+                    let unsigned = if src_ty == Type::I128 {
+                        v.as_u128() as f64
+                    } else {
+                        int_sem::wrap(src_ty, v.as_i()) as u64 as f64
+                    };
+                    match ty {
+                        Type::F32 => Ok(Val::F32(unsigned as f32)),
+                        Type::F64 => Ok(Val::F64(unsigned)),
+                        _ => Err(format!("fcvt_from_uint result type {ty:?}")),
+                    }
+                }
+                crate::ir::UnOp::FcvtToInt => {
+                    let f = v.as_f();
+                    if !f.is_finite() {
+                        return Err(format!("fcvt_to_sint({f}) is NaN or infinite"));
+                    }
+                    let t = f.trunc();
+                    if *ty == Type::I128 {
+                        let min = -(2f64.powi(127));
+                        let max = 2f64.powi(127);
+                        if t < min || t >= max {
+                            return Err(format!("fcvt_to_sint({f}) overflows {ty:?}"));
+                        }
+                        Ok(Val::I128((t as i128) as u128))
+                    } else {
+                        let bits = int_sem::width(*ty)
+                            .ok_or_else(|| format!("fcvt_to_sint result type {ty:?}"))?;
+                        let min = -(2f64.powi(bits as i32 - 1));
+                        let max = 2f64.powi(bits as i32 - 1);
+                        if t < min || t >= max {
+                            return Err(format!("fcvt_to_sint({f}) overflows {ty:?}"));
+                        }
+                        Ok(Val::I(int_sem::wrap(*ty, t as i64)))
+                    }
+                }
+                crate::ir::UnOp::FcvtToUint => {
+                    let f = v.as_f();
+                    if !f.is_finite() {
+                        return Err(format!("fcvt_to_uint({f}) is NaN or infinite"));
+                    }
+                    let t = f.trunc();
+                    if *ty == Type::I128 {
+                        if t < 0.0 || t >= 2f64.powi(128) {
+                            return Err(format!("fcvt_to_uint({f}) overflows {ty:?}"));
+                        }
+                        Ok(Val::I128(t as u128))
+                    } else {
+                        let bits = int_sem::width(*ty)
+                            .ok_or_else(|| format!("fcvt_to_uint result type {ty:?}"))?;
+                        let max = 2f64.powi(bits as i32);
+                        if t < 0.0 || t >= max {
+                            return Err(format!("fcvt_to_uint({f}) overflows {ty:?}"));
+                        }
+                        Ok(Val::I(int_sem::wrap(*ty, t as u64 as i64)))
+                    }
+                }
             }
         }
         Inst::Bin(_, op, ty, x, y) => eval_bin(*op, *ty, get(env, *x)?, get(env, *y)?),
