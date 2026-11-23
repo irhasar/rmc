@@ -1,5 +1,18 @@
 # AGENTS.md
 
+## Session (2026-11-23, Fase 2 step 1) — `rakit-ir` mid-level IR foundation
+- New pure crate `rakit/rakit-ir` (no dependencies): SSA IR (`ir.rs`), builder,
+  verifier (single definition, dominance, types), optimizer (`opt.rs`:
+  constant folding + algebraic identities + branch folding + DCE), and a
+  reference interpreter (`interp.rs`).
+- Values keep stable indices, so folding rewrites an instruction in place and
+  DCE turns dead instructions into `Inst::Nop`; no renumbering yet.
+- `cargo test --manifest-path rakit-ir/Cargo.toml` → 7/7 pass (integer/float
+  folding, branch folding, DCE, use-before-def rejection, block params/branch
+  args, icmp+select).
+- Not wired into the compiler yet: next step is the CLIF↔RIR bridge, then move
+  passes onto RIR one at a time.
+
 ## Session (2026-11-23, later) — extract the optimization pipeline into `rakit-opt`
 - New crate `rakit/rakit-opt/` (package `rakit-opt`) owns the CLIF-level
   optimization layer: `PassManager`, `Analyses` (CFG/dominator/loop, cached and

@@ -53,6 +53,13 @@ urutan pipeline terpusat di satu tempat (bukan rangkaian pemanggilan ad-hoc di
 `base.rs`). Inliner tetap dijalankan lebih dulu karena memakai
 `Context::inline`, di luar pipeline `rakit-opt`.
 
+`rakit-ir` (`rakit/rakit-ir/`) adalah fondasi IR mid-level milik Rakit: IR SSA
+mandiri (tanpa dependensi ke backend), verifier (definisi tunggal, dominasi,
+tipe), optimizer pertama (constant folding, branch folding, DCE), dan
+interpreter referensi untuk tes. Crate ini belum dihubungkan ke pipeline
+kompilasi; langkah berikutnya adalah jembatan CLIF↔RIR lalu memindahkan pass
+satu per satu ke IR ini.
+
 ## Build
 
 Prasyarat: toolchain `nightly-2026-11-17` dengan komponen `rust-src`,

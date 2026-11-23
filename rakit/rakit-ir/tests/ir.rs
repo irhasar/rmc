@@ -1,0 +1,142 @@
+use rakit_ir::*;
+
+#[test]
+fn fold_and_interpret_integer() {
+    let mut b = Builder::new(vec![Type::I64], vec![]);
+    let e = b.func().entry;
+    let two = b.iconst(e, Type::I64, 2);
+    let three = b.iconst(e, Type::I64, 3);
+    let sum = b.bin(e, BinOp::Add, Type::I64, two, three);
+    let four = b.iconst(e, Type::I64, 4);
+    let prod = b.bin(e, BinOp::Mul, Type::I64, sum, four);
+    b.ret(e, vec![prod]);
+
+    let mut f = b.into_func();
+    assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
+    assert_eq!(run(&f, &[]).unwrap(), vec![Val::I(20)]);
+
+    assert!(optimize(&mut f));
+    assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
+    assert_eq!(run(&f, &[]).unwrap(), vec![Val::I(20)]);
+
+    let ret = f.blocks[0].terminator().unwrap().clone();
+    let args = match ret {
+        Inst::Return(a) => a,
+        other => panic!("expected return, got {other:?}"),
+    };
+    let def = f.blocks[0]
+        .insts
+        .iter()
+        .find(|i| i.result_value() == Some(args[0]))
+        .unwrap();
+    assert!(matches!(def, Inst::Iconst(_, _, 20)), "got {def:?}");
+}
+
+#[test]
+fn branch_folding_picks_the_taken_edge() {
+    let mut b = Builder::new(vec![Type::I64], vec![]);
+    let e = b.func().entry;
+    let t = b.add_block(vec![]);
+    let f = b.add_block(vec![]);
+    let cond = b.iconst(e, Type::Bool, 1);
+    b.brif(e, cond, t, vec![], f, vec![]);
+    let one = b.iconst(t, Type::I64, 1);
+    b.ret(t, vec![one]);
+    let two = b.iconst(f, Type::I64, 2);
+    b.ret(f, vec![two]);
+
+    let mut func = b.into_func();
+    assert!(verify(&func).is_ok(), "{:?}", verify(&func).err());
+    assert_eq!(run(&func, &[]).unwrap(), vec![Val::I(1)]);
+
+    assert!(optimize(&mut func));
+    assert!(verify(&func).is_ok(), "{:?}", verify(&func).err());
+    assert_eq!(run(&func, &[]).unwrap(), vec![Val::I(1)]);
+    assert!(matches!(func.blocks[0].terminator().unwrap(), Inst::Jump(t2, _) if *t2 == t));
+}
+
+#[test]
+fn verifier_rejects_use_before_def() {
+    let mut f = Function::new(vec![Type::I64], vec![]);
+    f.values.push(Type::I64); // v0
+    f.values.push(Type::I64); // v1
+    let e = f.entry;
+    f.block_mut(e)
+        .insts
+        .push(Inst::Bin(Value(0), BinOp::Add, Type::I64, Value(1), Value(1)));
+    f.block_mut(e).insts.push(Inst::Iconst(Value(1), Type::I64, 1));
+    f.block_mut(e).insts.push(Inst::Return(vec![Value(0)]));
+
+    let err = verify(&f).unwrap_err();
+    assert!(err.iter().any(|e| e.contains("before")), "{err:?}");
+}
+
+#[test]
+fn dce_removes_dead_code() {
+    let mut b = Builder::new(vec![Type::I64], vec![]);
+    let e = b.func().entry;
+    let a = b.iconst(e, Type::I64, 1);
+    let c = b.iconst(e, Type::I64, 2);
+    let _dead = b.bin(e, BinOp::Add, Type::I64, a, c);
+    let k = b.iconst(e, Type::I64, 7);
+    b.ret(e, vec![k]);
+
+    let mut f = b.into_func();
+    assert!(optimize(&mut f));
+    assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
+    assert!(f.blocks[0].insts.iter().any(|i| matches!(i, Inst::Nop(..))));
+    assert_eq!(run(&f, &[]).unwrap(), vec![Val::I(7)]);
+}
+
+#[test]
+fn float_folding() {
+    let mut b = Builder::new(vec![Type::F64], vec![]);
+    let e = b.func().entry;
+    let x = b.f64const(e, 1.5);
+    let y = b.f64const(e, 2.5);
+    let sum = b.bin(e, BinOp::Fadd, Type::F64, x, y);
+    let two = b.f64const(e, 2.0);
+    let prod = b.bin(e, BinOp::Fmul, Type::F64, sum, two);
+    b.ret(e, vec![prod]);
+
+    let mut f = b.into_func();
+    assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
+    assert!(optimize(&mut f));
+    assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
+    assert_eq!(run(&f, &[]).unwrap(), vec![Val::F64(8.0)]);
+}
+
+#[test]
+fn block_params_and_branch_args() {
+    let mut b = Builder::new(vec![Type::I64], vec![]);
+    let e = b.func().entry;
+    let t = b.add_block(vec![Type::I64]);
+    let one = b.iconst(e, Type::I64, 1);
+    b.jump(e, t, vec![one]);
+    let p = b.func().block(t).params[0];
+    b.ret(t, vec![p]);
+
+    let f = b.into_func();
+    assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
+    assert_eq!(run(&f, &[]).unwrap(), vec![Val::I(1)]);
+}
+
+#[test]
+fn icmp_folding_and_select() {
+    let mut b = Builder::new(vec![Type::I64], vec![]);
+    let e = b.func().entry;
+    let a = b.iconst(e, Type::I64, 5);
+    let c = b.iconst(e, Type::I64, 3);
+    let cond = b.icmp(e, IntCc::Sgt, Type::I64, a, c);
+    let x = b.iconst(e, Type::I64, 10);
+    let y = b.iconst(e, Type::I64, 20);
+    let sel = b.select(e, Type::I64, cond, x, y);
+    b.ret(e, vec![sel]);
+
+    let mut f = b.into_func();
+    assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
+    assert_eq!(run(&f, &[]).unwrap(), vec![Val::I(10)]);
+    assert!(optimize(&mut f));
+    assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
+    assert_eq!(run(&f, &[]).unwrap(), vec![Val::I(10)]);
+}
