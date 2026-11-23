@@ -2936,41 +2936,41 @@ R = run; wall/CPU dalam ms, RSS dalam MB, size dalam byte):
 
 | prog | bk | Cwall | Ccpu | Crss | size | Rwall | Rcpu | Rrss |
 |------|----|------:|-----:|-----:|-----:|------:|-----:|-----:|
-| p1_arith | L | 90 | 106 | 105.6 | 4,635,232 | 81 | 81 | 10.5 |
-| p1_arith | U | 76 | 98 | 107.8 | 5,877,944 | 108 | 108 | 10.7 |
-| p1_arith | M | 78 | 100 | 109.6 | 4,146,240 | 101 | 101 | 10.5 |
-| p2_mem | L | 255 | 390 | 133.9 | 4,639,888 | 17 | 17 | 10.5 |
-| p2_mem | U | 147 | 203 | 130.9 | 5,936,144 | 160 | 160 | 10.8 |
-| p2_mem | M | 155 | 218 | 132.8 | 4,143,704 | 49 | 48 | 10.7 |
-| p3_calls | L | 98 | 121 | 115.9 | 4,612,368 | 37 | 36 | 10.7 |
-| p3_calls | U | 83 | 109 | 116.4 | 5,820,136 | 117 | 116 | 10.7 |
-| p3_calls | M | 89 | 117 | 118.4 | 4,067,168 | 59 | 59 | 10.7 |
-| p4_simd | L | 106 | 125 | 116.5 | 4,636,096 | 55 | 55 | 48.2 |
-| p4_simd | U | 91 | 117 | 117.0 | 5,892,376 | 157 | 158 | 49.5 |
-| p4_simd | M | 103 | 129 | 119.2 | 4,152,832 | 83 | 85 | 48.8 |
-| p5_inline | L | 89 | 106 | 104.9 | 4,609,368 | 58 | 57 | 10.7 |
-| p5_inline | U | 74 | 96 | 106.4 | 5,813,704 | 893 | 893 | 10.7 |
-| p5_inline | M | 88 | 105 | 108.6 | 4,060,088 | 7 | 6 | 10.7 |
-| p6_scalar | L | 82 | 99 | 101.4 | 4,609,368 | 58 | 57 | 10.8 |
-| p6_scalar | U | 100 | 114 | 103.2 | 5,813,688 | 900 | 899 | 10.5 |
-| p6_scalar | M | 76 | 98 | 104.7 | 4,060,088 | 6 | 6 | 10.8 |
-| p7_branchy | L | 83 | 101 | 105.1 | 4,609,520 | 43 | 43 | 10.5 |
-| p7_branchy | U | 77 | 98 | 106.5 | 5,813,800 | 100 | 100 | 10.8 |
-| p7_branchy | M | 76 | 99 | 108.4 | 4,060,248 | 36 | 35 | 10.7 |
-| p8_minmax | L | 84 | 102 | 105.1 | 4,609,544 | 18 | 17 | 10.5 |
-| p8_minmax | U | 77 | 99 | 106.5 | 5,813,752 | 38 | 38 | 10.5 |
-| p8_minmax | M | 78 | 99 | 108.3 | 4,060,216 | 20 | 20 | 10.7 |
-| p9_u64f32 | L | 92 | 115 | 110.7 | 4,635,448 | 30 | 29 | 17.8 |
-| p9_u64f32 | U | 86 | 109 | 112.7 | 5,886,872 | 76 | 75 | 18.9 |
-| p9_u64f32 | M | 94 | 116 | 114.6 | 4,149,856 | 33 | 32 | 18.2 |
+| p1_arith | L | 84 | 103 | 105.5 | 4,635,232 | 81 | 81 | 10.5 |
+| p1_arith | U | 81 | 105 | 107.9 | 5,877,944 | 109 | 108 | 10.6 |
+| p1_arith | M | 80 | 103 | 109.8 | 4,146,240 | 102 | 101 | 10.3 |
+| p2_mem | L | 241 | 371 | 133.5 | 4,639,888 | 16 | 16 | 10.5 |
+| p2_mem | U | 128 | 172 | 130.8 | 5,936,144 | 157 | 159 | 10.5 |
+| p2_mem | M | 160 | 223 | 133.2 | 4,143,704 | 49 | 49 | 10.6 |
+| p3_calls | L | 99 | 121 | 116.1 | 4,612,368 | 37 | 38 | 10.3 |
+| p3_calls | U | 86 | 112 | 116.4 | 5,820,136 | 117 | 117 | 10.3 |
+| p3_calls | M | 90 | 117 | 118.3 | 4,067,168 | 59 | 59 | 10.3 |
+| p4_simd | L | 111 | 132 | 116.6 | 4,636,096 | 56 | 56 | 48.2 |
+| p4_simd | U | 92 | 115 | 117.1 | 5,892,376 | 157 | 157 | 49.4 |
+| p4_simd | M | 105 | 129 | 119.1 | 4,152,832 | 83 | 83 | 48.8 |
+| p5_inline | L | 82 | 103 | 104.8 | 4,609,368 | 58 | 57 | 10.3 |
+| p5_inline | U | 76 | 99 | 106.5 | 5,813,704 | 893 | 893 | 10.5 |
+| p5_inline | M | 78 | 102 | 108.5 | 4,060,088 | 6 | 6 | 10.5 |
+| p6_scalar | L | 83 | 99 | 101.4 | 4,609,368 | 58 | 57 | 10.3 |
+| p6_scalar | U | 76 | 96 | 103.0 | 5,813,688 | 903 | 901 | 10.6 |
+| p6_scalar | M | 77 | 98 | 104.7 | 4,060,088 | 6 | 6 | 10.5 |
+| p7_branchy | L | 85 | 104 | 104.9 | 4,609,520 | 43 | 42 | 10.4 |
+| p7_branchy | U | 79 | 100 | 106.6 | 5,813,800 | 101 | 101 | 10.6 |
+| p7_branchy | M | 81 | 104 | 108.6 | 4,060,248 | 35 | 35 | 10.6 |
+| p8_minmax | L | 84 | 104 | 105.1 | 4,609,544 | 21 | 20 | 10.3 |
+| p8_minmax | U | 78 | 100 | 106.5 | 5,813,752 | 38 | 39 | 10.5 |
+| p8_minmax | M | 78 | 101 | 108.4 | 4,060,216 | 21 | 20 | 10.3 |
+| p9_u64f32 | L | 100 | 117 | 111.0 | 4,635,448 | 31 | 31 | 17.8 |
+| p9_u64f32 | U | 89 | 113 | 112.5 | 5,886,872 | 76 | 76 | 18.8 |
+| p9_u64f32 | M | 93 | 117 | 114.7 | 4,149,856 | 33 | 32 | 18.2 |
 
-Dibanding matriks §21.4: runtime `p3` 94→59, `p4` 99→83, `p8` 29→20;
-`p2` 52→49, `p7` 36→35; `p1`/`p9` dalam ±1 ms; `p5`/`p6` 6→7 ms karena
-pembulatan. Ukuran artefak M lebih kecil dari L dan U pada semua program
-(4.06–4.15 MB vs L 4.61–4.64 MB, U 5.81–5.94 MB). Compile absolut berubah
-sedikit karena noise mesin, tetapi dengan anggaran RIR CGU besar `p2` M 155 ms
-(U 147, L 255); `p5`/`p6` M 88/76 ms, mendekati U (74/100) dan lebih cepat dari
-L (89/82). Runtime `p2` M 49 ms, ~3.3× lebih cepat dari U (160 ms).
+Dibanding matriks §21.4: runtime `p3` 94→59, `p4` 99→83, `p8` 29→21;
+`p2` 52→49, `p7` 36→35; `p1`/`p9` dalam ±1 ms; `p5`/`p6` 6→6 ms.
+Ukuran artefak M lebih kecil dari L dan U pada semua program (4.06–4.15 MB vs
+L 4.61–4.64 MB, U 5.81–5.94 MB). Compile absolut berubah sedikit karena noise
+mesin, tetapi dengan anggaran RIR CGU besar `p2` M 160 ms (U 128, L 241);
+`p5`/`p6` M 78/77 ms, mendekati U (76/76) dan lebih cepat dari L (82/83).
+Runtime `p2` M 49 ms, ~3.2× lebih cepat dari U (157 ms).
 
 ### 29.1 Anggaran RIR untuk CGU besar (p2/p5 compile)
 
@@ -3082,3 +3082,14 @@ Semua temuan review ditindaklanjuti. Perubahan yang mendarat:
 - **Clone back-edge tidak menggandakan salinan argumen.** `clone_body` hanya
   menyalin branch table/exception table; `deep_clone` sudah menyalin
   `Jump`/`Brif`.
+- **FuncAddr memakai pemeriksaan external yang sama dengan import.** Helper
+  `external_data` dipakai oleh `external_index` dan preflight `FuncAddr`,
+  sehingga wrapper yang mengembalikan pointer skalar tetapi signature targetnya
+  memakai vektor tidak lagi dihitung eligible. Test
+  `func_addr_with_vector_signature_is_rejected`.
+- **Branch table/exception table di-clone sebelum di-remap.** `clone_body`
+  membuat salinan `JumpTableData`/`ExceptionTableData` baru dan mengganti index
+  pada instruksi clone; entri tabel sumber tidak lagi ikut berubah.
+- **Regression gate tidak bisa jatuh ke LLVM.** `bench/regressions.sh`
+  menambahkan `--target` eksplisit, menghapus `RAKIT_HOST_LLVM` untuk backend
+  Rakit, dan menolak binary Rakit yang byte-identik dengan LLVM.

@@ -820,7 +820,20 @@ fn clone_body(
         // call's shared argument list and later clones remap the wrong values.
         let mut data = original.deep_clone(&mut value_lists);
         // `deep_clone` already copies Jump/Brif destinations. Branch tables and
-        // exception tables keep their branches out of line, so copy only those.
+        // exception tables keep their branches out of line, and `data` still
+        // refers to the source table, so clone the table before mutating it.
+        match &mut data {
+            ir::InstructionData::BranchTable { table, .. } => {
+                let cloned = jump_tables[*table].clone();
+                *table = jump_tables.push(cloned);
+            }
+            ir::InstructionData::TryCall { exception, .. }
+            | ir::InstructionData::TryCallIndirect { exception, .. } => {
+                let cloned = exception_tables[*exception].clone();
+                *exception = exception_tables.push(cloned);
+            }
+            _ => {}
+        }
         if matches!(
             data,
             ir::InstructionData::BranchTable { .. }

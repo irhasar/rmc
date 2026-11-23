@@ -1345,11 +1345,7 @@ fn map_external_target(func: &CgFunction, name: ExternalName) -> Option<RirExter
     })
 }
 
-fn external_index(
-    func: &CgFunction,
-    externals: &mut Vec<RirExternal>,
-    ext_data: &ExtFuncData,
-) -> Option<u32> {
+fn external_data(func: &CgFunction, ext_data: &ExtFuncData) -> Option<RirExternal> {
     let callee = &func.dfg.signatures[ext_data.signature];
     let params = callee
         .params
@@ -1361,7 +1357,15 @@ fn external_index(
         .iter()
         .map(|p| map_type_to_rir(p.value_type))
         .collect::<Option<Vec<_>>>()?;
-    let external = RirExternal { target: map_external_target(func, ext_data.name.clone())?, params, rets };
+    Some(RirExternal { target: map_external_target(func, ext_data.name.clone())?, params, rets })
+}
+
+fn external_index(
+    func: &CgFunction,
+    externals: &mut Vec<RirExternal>,
+    ext_data: &ExtFuncData,
+) -> Option<u32> {
+    let external = external_data(func, ext_data)?;
     Some(match externals.iter().position(|e| *e == external) {
         Some(i) => i as u32,
         None => {
@@ -1591,6 +1595,11 @@ pub fn unsupported_reason(func: &CgFunction) -> Option<String> {
                 InstructionData::UnaryImm { opcode, .. } => {
                     return Some(format!("unary imm {opcode}"));
                 }
+                InstructionData::FuncAddr { opcode: Opcode::FuncAddr, func_ref } => {
+                    if external_data(func, &func.dfg.ext_funcs[func_ref]).is_none() {
+                        return Some("func addr external".to_string());
+                    }
+                }
                 InstructionData::UnaryIeee32 { opcode: Opcode::F32const, .. }
                 | InstructionData::UnaryIeee64 { opcode: Opcode::F64const, .. }
                 | InstructionData::IntCompare { opcode: Opcode::Icmp, .. }
@@ -1599,7 +1608,6 @@ pub fn unsupported_reason(func: &CgFunction) -> Option<String> {
                 | InstructionData::Load { opcode: Opcode::Load, .. }
                 | InstructionData::LoadNoOffset { opcode: Opcode::Load, .. }
                 | InstructionData::UnaryGlobalValue { .. }
-                | InstructionData::FuncAddr { opcode: Opcode::FuncAddr, .. }
                 | InstructionData::DynamicStackAddr { opcode: Opcode::DynamicStackAddr, .. }
                 | InstructionData::CondTrap { opcode: Opcode::Trapz | Opcode::Trapnz, .. }
                 | InstructionData::BranchTable { .. }
@@ -2402,6 +2410,34 @@ mod call_tests {
         let out = export(&rir, &func.signature).expect("export multi-result call");
         let rir2 = import(&out).expect("re-import multi-result call");
         assert_eq!(rir2.externals, rir.externals);
+    }
+
+    #[test]
+    fn func_addr_with_vector_signature_is_rejected() {
+        let (mut func, entry) = new_func(&[], &[types::I64]);
+        let mut callee = Signature::new(CallConv::SystemV);
+        callee.params.push(AbiParam::new(types::I8X16));
+        callee.returns.push(AbiParam::new(types::I8X16));
+        let sig_ref = func.import_signature(callee);
+        let name_ref = func.params.ensure_user_func_name(UserExternalName::new(0, 77));
+        let func_ref = func.import_function(ExtFuncData {
+            name: ExternalName::User(name_ref),
+            signature: sig_ref,
+            colocated: false,
+            patchable: false,
+        });
+        let inst = func.dfg.make_inst(InstructionData::FuncAddr {
+            opcode: Opcode::FuncAddr,
+            func_ref,
+        });
+        assert_eq!(func.dfg.make_inst_results(inst, types::I64), 1);
+        func.layout.append_inst(inst, entry);
+        let addr = func.dfg.inst_results(inst)[0];
+        ret(&mut func, entry, &[addr]);
+
+        assert!(!is_supported(&func), "vector FuncAddr must not count as eligible");
+        assert!(unsupported_reason(&func).is_some());
+        assert!(import(&func).is_none(), "import must agree with preflight");
     }
 
     #[test]
