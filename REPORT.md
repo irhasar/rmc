@@ -3004,6 +3004,15 @@ Eksperimen yang **ditolak** (diukur, bukan diasumsikan):
   karena output RIR lebih besar; tidak ada keuntungan runtime.
 - Verifikasi import/export bukan penyebab: mematikannya tidak mengubah waktu
   p2/p5 secara terukur.
+- Melewati RIR sepenuhnya di CGU besar (`RAKIT_RIR_LARGE_MAX_INSTS=0`):
+  compile p2 180 vs 181 ms, runtime 52,8 vs 51,1 ms — tidak ada manfaat.
+- A/B pass codegen p2: `RAKIT_NO_STORE_FWD=1` compile 185/run 75 ms;
+  `RAKIT_NO_CODEGEN_INLINE=1` 170/112 ms; `RAKIT_INLINE_GROWTH=10` 174/54 ms
+  vs default 183/51 ms. Jadi sisa gap compile p2 ada di pass codegen/inliner,
+  bukan RIR; memotongnya merusak runtime.
+- p5: default 89 ms; mematikan store-forward 91, codegen inline 92,
+  if-convert 93, div-test 91, unroll 93 ms. Tidak ada pass yang bisa dimatikan
+  tanpa memperlambat compile; p5 sudah setara U pada matriks penuh.
 
 Verifikasi: seluruh keluaran p1–p9 byte-identik dengan LLVM; `./y.sh test`
 65 suite `ok`, 0 failure; `rakit-ir` dan `rakit-opt` lulus; test regresi baru
