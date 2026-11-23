@@ -24,6 +24,10 @@ mb() { python3 -c "print('%.1f'%($1/1024.0))"; }
 
 declare -A CMD=( [L]="$RUSTC_LLVM" [U]="$CG_UP" [M]="$CG_MOD" )
 
+if [ "${SKIP_REGRESSIONS:-0}" != "1" ]; then
+  "$BENCH/regressions.sh" || exit 1
+fi
+
 hdr="prog       bk | Cwall   Ccpu    Crss   size      | Rwall   Rcpu    Rrss"
 printf '%s\n' "$hdr"
 printf '%s\n' "---------------------------------------------------------------------------"

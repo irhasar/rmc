@@ -1517,7 +1517,7 @@ pub fn unsupported_reason(func: &CgFunction) -> Option<String> {
                         return Some("indirect ABI".to_string());
                     }
                 }
-                InstructionData::TryCall { func_ref, .. } => {
+                InstructionData::TryCall { func_ref, exception, .. } => {
                     let ext = &func.dfg.ext_funcs[func_ref];
                     let sig = &func.dfg.signatures[ext.signature];
                     if sig.params.iter().chain(sig.returns.iter()).any(|p| map_type_to_rir(p.value_type).is_none()) {
@@ -1525,6 +1525,24 @@ pub fn unsupported_reason(func: &CgFunction) -> Option<String> {
                     }
                     if !signature_supported(sig) {
                         return Some("try call ABI".to_string());
+                    }
+                    let table = &func.dfg.exception_tables[exception];
+                    let table_sig = &func.dfg.signatures[table.signature()];
+                    if table_sig.params.iter().chain(table_sig.returns.iter()).any(|p| map_type_to_rir(p.value_type).is_none()) {
+                        return Some("try call exception signature type".to_string());
+                    }
+                    if !signature_supported(table_sig) {
+                        return Some("try call exception ABI".to_string());
+                    }
+                }
+                InstructionData::TryCallIndirect { exception, .. } => {
+                    let table = &func.dfg.exception_tables[exception];
+                    let sig = &func.dfg.signatures[table.signature()];
+                    if sig.params.iter().chain(sig.returns.iter()).any(|p| map_type_to_rir(p.value_type).is_none()) {
+                        return Some("try indirect signature type".to_string());
+                    }
+                    if !indirect_signature_supported(sig) {
+                        return Some("try indirect ABI".to_string());
                     }
                 }
                 InstructionData::Store { opcode: Opcode::Store, args, .. }
@@ -1551,12 +1569,15 @@ pub fn unsupported_reason(func: &CgFunction) -> Option<String> {
                 {
                     return Some(format!("binary {opcode}"));
                 }
+                InstructionData::Binary { .. } => {}
                 InstructionData::Ternary { opcode, .. } if opcode != Opcode::Select => {
                     return Some(format!("ternary {opcode}"));
                 }
+                InstructionData::Ternary { .. } => {}
                 InstructionData::MultiAry { opcode, .. } if opcode != Opcode::Return => {
                     return Some(format!("multiary {opcode}"));
                 }
+                InstructionData::MultiAry { .. } => {}
                 InstructionData::UnaryConst { opcode, .. } => return Some(format!("const {opcode}")),
                 InstructionData::BinaryImm8 { opcode, .. } => return Some(format!("imm8 {opcode}")),
                 InstructionData::TernaryImm8 { opcode, .. } => return Some(format!("ternary imm8 {opcode}")),
@@ -2217,6 +2238,7 @@ mod tests {
         let exception_param = f.dfg.block_params(exception_block)[0];
         ret(&mut f, exception_block, &[exception_param]);
 
+        assert!(is_supported(&f), "{:?}", unsupported_reason(&f));
         let rir = import(&f).expect("import try call");
         assert!(rir.blocks[0].insts.iter().any(|i| matches!(i, RirInst::TryCall { .. })));
         let out = export(&rir, &f.signature).expect("export try call");
@@ -2239,6 +2261,27 @@ mod tests {
         rakit_codegen::verifier::verify_function(&out, &flags)
             .expect("exported i128 zero must verify");
         assert_eq!(run(&rir, &[Val::I128(7)]).unwrap(), vec![Val::I128(0)]);
+    }
+
+    #[test]
+    fn preflight_accepts_supported_binary_select_and_return() {
+        let (mut f, e) = new_func(&[], &[types::I64]);
+        let one = iconst(&mut f, e, types::I64, 1);
+        let two = iconst(&mut f, e, types::I64, 2);
+        let sum = bin(&mut f, e, Opcode::Iadd, types::I64, one, two);
+        let cond = icmp(&mut f, e, IntCC::UnsignedLessThan, one, two);
+        let select = f.dfg.make_inst(InstructionData::Ternary {
+            opcode: Opcode::Select,
+            args: [cond, sum, one],
+        });
+        assert_eq!(f.dfg.make_inst_results(select, types::I64), 1);
+        f.layout.append_inst(select, e);
+        let selected = f.dfg.inst_results(select)[0];
+        ret(&mut f, e, &[selected]);
+
+        assert!(unsupported_reason(&f).is_none(), "{:?}", unsupported_reason(&f));
+        assert!(is_supported(&f));
+        assert!(import(&f).is_some(), "preflight must agree with import");
     }
 
     #[test]

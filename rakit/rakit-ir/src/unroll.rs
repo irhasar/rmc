@@ -193,7 +193,7 @@ fn header_supported(func: &Function, header: usize, body: usize) -> bool {
         }
     }
 
-    let Some((_, body_insts)) = func.blocks[body].insts.split_last() else {
+    let Some((back_edge, body_insts)) = func.blocks[body].insts.split_last() else {
         return false;
     };
     for inst in body_insts {
@@ -204,6 +204,17 @@ fn header_supported(func: &Function, header: usize, body: usize) -> bool {
             if header_results.contains_key(&v) {
                 return false;
             }
+        }
+    }
+    // The back edge is the loop update. It is not cloned, so a header result
+    // passed here would be reused for every unrolled iteration instead of being
+    // recomputed. Only invariant values (or the body's own results) are safe.
+    for v in back_edge.operands() {
+        if params.contains(&v) || invariant.contains(&v) {
+            continue;
+        }
+        if header_results.contains_key(&v) {
+            return false;
         }
     }
     true

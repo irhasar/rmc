@@ -13,5 +13,8 @@ fn main() {
         tick();
         sum += i;
     }
-    println!("{} {}", sum, TICKS.load(Ordering::Relaxed));
+    let ticks = TICKS.load(Ordering::Relaxed);
+    assert_eq!(sum, 2016);
+    assert_eq!(ticks, 64);
+    println!("{sum} {ticks}");
 }

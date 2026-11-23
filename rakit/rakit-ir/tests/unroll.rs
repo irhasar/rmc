@@ -134,3 +134,35 @@ fn dead_nop_in_header_does_not_block_unrolling() {
     assert!(verify(&f).is_ok(), "{:?}", verify(&f));
     assert_eq!(run(&f, &[]).unwrap(), vec![Val::I(6)]);
 }
+
+#[test]
+fn back_edge_header_update_is_not_reused_stale() {
+    let mut b = Builder::new(vec![Type::I64], vec![]);
+    let e = b.func().entry;
+    let zero = b.iconst(e, Type::I64, 0);
+    let header = b.add_block(vec![Type::I64, Type::I64]);
+    let body = b.add_block(vec![]);
+    let exit = b.add_block(vec![Type::I64]);
+    b.jump(e, header, vec![zero, zero]);
+
+    let iv = b.func().block(header).params[0];
+    let acc = b.func().block(header).params[1];
+    let one = b.iconst(header, Type::I64, 1);
+    let next_acc = b.bin(header, BinOp::Add, Type::I64, acc, one);
+    let bound = b.iconst(header, Type::I64, 4);
+    let cond = b.icmp(header, IntCc::Ult, Type::I64, iv, bound);
+    b.brif(header, cond, body, vec![], exit, vec![acc]);
+
+    // The body only advances iv; the header-computed `acc + 1` is the loop
+    // update. Cloned bodies must not reuse a single header result.
+    let iv2 = b.bin(body, BinOp::Add, Type::I64, iv, one);
+    b.jump(body, header, vec![iv2, next_acc]);
+
+    let out = b.func().block(exit).params[0];
+    b.ret(exit, vec![out]);
+
+    let mut f = b.into_func();
+    assert!(!unroll::run(&mut f), "unroll must reject a changing header update");
+    assert!(verify(&f).is_ok(), "{:?}", verify(&f));
+    assert_eq!(run(&f, &[]).unwrap(), vec![Val::I(4)]);
+}
