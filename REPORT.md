@@ -2958,24 +2958,52 @@ Matriks 3-arah terakhir (C = compile wall, R = run wall, size = byte):
 
 | prog | C L/U/M | R L/U/M | size L/U/M |
 |------|---------|---------|------------|
-| p1 | 92/87/88 | 82/109/101 | 4.64/5.88/4.06 MB |
-| p2 | 270/146/194 | 18/159/53 | 4.64/5.94/4.05 MB |
-| p3 | 109/93/100 | 37/117/58 | 4.61/5.82/3.98 MB |
-| p4 | 118/101/109 | 57/160/86 | 4.64/5.89/4.06 MB |
-| p5 | 88/81/91 | 58/896/7 | 4.61/5.81/3.97 MB |
-| p6 | 90/83/83 | 58/904/7 | 4.61/5.81/3.97 MB |
-| p7 | 91/83/86 | 43/101/36 | 4.61/5.81/3.97 MB |
-| p8 | 93/85/86 | 18/39/21 | 4.61/5.81/3.97 MB |
-| p9 | 103/92/100 | 31/77/36 | 4.64/5.89/4.06 MB |
+| p1 | 100/89/88 | 82/109/101 | 4.64/5.88/4.11 MB |
+| p2 | 263/146/173 | 18/158/50 | 4.64/5.94/4.11 MB |
+| p3 | 105/92/98 | 37/118/60 | 4.61/5.82/4.04 MB |
+| p4 | 125/106/114 | 58/158/86 | 4.64/5.89/4.12 MB |
+| p5 | 92/87/86 | 58/895/7 | 4.61/5.81/4.03 MB |
+| p6 | 90/88/85 | 58/902/7 | 4.61/5.81/4.03 MB |
+| p7 | 95/84/88 | 43/101/35 | 4.61/5.81/4.03 MB |
+| p8 | 91/84/84 | 18/39/21 | 4.61/5.81/4.03 MB |
+| p9 | 103/102/100 | 31/77/35 | 4.64/5.89/4.12 MB |
 
-Dibanding matriks §21.4: runtime `p3` 94→57, `p4` 99→86, `p8` 29→21;
-`p1`/`p2`/`p7`/`p9` dalam ±2 ms (p9 34→36 adalah variasi run), `p5`/`p6`
-6→7 ms karena pembulatan. Ukuran artefak M sedikit lebih kecil. Compile absolut
-naik di semua backend pada run ini (mesin lebih lambat), tetapi `p2` naik lebih
-tajam: M 146→194 ms, U 125→146, L 247→270; rasio M/L 0.59→0.72. Itu biaya
-pipeline RIR default pada p2, yang juga tidak mendapat manfaat runtime dari RIR
-(53 vs 50.5 ms dengan `RAKIT_NO_RIR=1`). Backend lain tidak menunjukkan regresi
-runtime, dan M tetap lebih cepat compile daripada LLVM di semua program.
+Dibanding matriks §21.4: runtime `p3` 94→60, `p4` 99→86, `p8` 29→21;
+`p2` 52→50, `p7` 36→35; `p1`/`p9` dalam ±1 ms; `p5`/`p6` 6→7 ms karena
+pembulatan. Ukuran artefak M sedikit lebih kecil. Compile absolut naik di semua
+backend pada run ini (mesin lebih lambat), tetapi setelah anggaran RIR CGU besar
+`p2` M hanya 146→173 ms (U 146, L 263), bukan 194 ms; `p5`/`p6` M 86/85 ms
+malah lebih cepat dari U 87/88 dan L 92/90. `p2` masih ~18% lebih lambat
+compile daripada U, tetapi runtime-nya kini lebih baik dari run sebelumnya dan
+jauh lebih cepat dari U (50 vs 158 ms).
+
+### 29.1 Anggaran RIR untuk CGU besar (p2/p5 compile)
+
+Audit p2 menunjukkan RIR round-trip menghabiskan **27,6 ms** untuk 142 fungsi
+(import 5,1 ms, pipeline 19,4 ms, export 3,1 ms), sedangkan p5 hanya 8 fungsi
+(0,8 ms). Biaya itu per fungsi dan tidak sebanding dengan manfaatnya pada body
+besar yang loop panasnya sudah ditangani pass codegen.
+
+Aturan baru di `RirPass`: bila CGU punya **>64 fungsi** yang eligible RIR,
+hanya fungsi dengan **≤50 instruksi CLIF** yang di-round-trip. CGU kecil (p3,
+p5, p6) tidak terkena batas ini. Knob: `RAKIT_RIR_LARGE_CGU`,
+`RAKIT_RIR_LARGE_MAX_INSTS`, dan override global `RAKIT_RIR_MAX_INSTS`.
+
+Hasil pada p2 (3 compile / 7 run): compile **194 → 173 ms** dan runtime
+**53 → 50 ms**; p7 compile **100 → 88 ms**, p8 **100 → 84 ms**, p9
+**111 → 100 ms**; p5 tidak berubah karena CGU-nya kecil. Pada matriks penuh
+p5 compile menjadi **86 ms** (LLVM 92, upstream 87), jadi keluhan p5 compile
+hilang setelah run diulang pada build yang sama.
+
+Eksperimen yang **ditolak** (diukur, bukan diasumsikan):
+- Menunda `optimize()` sampai akhir pipeline: compile p2 **+6 ms**, runtime
+  **+3 ms** — pass berikutnya kehilangan cleanup yang dibutuhkan.
+- Hanya mengekspor bila pass struktural berubah (bukan simplify/opt saja):
+  runtime p2 sedikit membaik tetapi compile p5/p8/p9 memburuk 5–15 ms.
+- Mematikan `licm`, `if_convert`, atau `div_test` RIR: compile justru naik
+  karena output RIR lebih besar; tidak ada keuntungan runtime.
+- Verifikasi import/export bukan penyebab: mematikannya tidak mengubah waktu
+  p2/p5 secara terukur.
 
 Verifikasi: seluruh keluaran p1–p9 byte-identik dengan LLVM; `./y.sh test`
 65 suite `ok`, 0 failure; `rakit-ir` dan `rakit-opt` lulus; test regresi baru

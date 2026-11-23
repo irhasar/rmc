@@ -219,3 +219,28 @@ pub fn inline_growth_pct() -> usize {
         None => crate::passes::inliner::GROWTH_PCT,
     })
 }
+
+/// Maximum number of CLIF instructions for an RIR round-trip when explicitly set.
+/// `None` leaves the decision to the large-CGU budget below.
+pub fn rir_max_insts() -> Option<usize> {
+    static V: OnceLock<Option<usize>> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("RAKIT_RIR_MAX_INSTS").ok()?.parse().ok())
+}
+
+/// A CGU with more than this many RIR-eligible functions is treated as large.
+pub fn rir_large_cgu_functions() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RAKIT_RIR_LARGE_CGU").ok().and_then(|v| v.parse().ok()).unwrap_or(64)
+    })
+}
+
+/// In a large CGU, only round-trip functions at or below this size.  The RIR
+/// pipeline cost is per function and does not pay off for large bodies whose
+/// hot loops are already handled by the codegen passes.
+pub fn rir_large_cgu_max_insts() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RAKIT_RIR_LARGE_MAX_INSTS").ok().and_then(|v| v.parse().ok()).unwrap_or(50)
+    })
+}

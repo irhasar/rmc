@@ -49,6 +49,13 @@ impl Pass for RirPass<'_> {
         if !crate::tunables::rir_enabled(pctx.crate_name, pctx.user_crate) {
             return false;
         }
+        let large_cgu =
+            self.bodies.is_some_and(|b| b.len() > crate::tunables::rir_large_cgu_functions());
+        let max_insts = crate::tunables::rir_max_insts()
+            .or_else(|| large_cgu.then(crate::tunables::rir_large_cgu_max_insts));
+        if max_insts.is_some_and(|max| pctx.ctx.func.dfg.num_insts() > max) {
+            return false;
+        }
         let debug = std::env::var_os("RAKIT_RIR_DEBUG").is_some();
         let stats_mode = std::env::var_os("RAKIT_RIR_STATS").is_some();
         let dump_match = std::env::var("RAKIT_RIR_DUMP").ok();

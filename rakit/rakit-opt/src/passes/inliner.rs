@@ -191,6 +191,10 @@ impl CguBodies {
     pub fn is_empty(&self) -> bool {
         self.funcs.is_empty()
     }
+
+    pub fn len(&self) -> usize {
+        self.funcs.len()
+    }
 }
 
 impl<'a> CguInliner<'a> {
