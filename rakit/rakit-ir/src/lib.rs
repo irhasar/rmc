@@ -18,6 +18,7 @@
 
 pub mod builder;
 pub mod div_test;
+pub mod int_sem;
 pub mod interp;
 pub mod ir;
 pub mod opt;

@@ -72,12 +72,16 @@ Optimizer RIR memakai identitas yang belum tentu ada di egraph Cranelift:
 (mis. `x & x` → `x`) dan output tetap sama dengan build normal.
 
 Pass RIR `div_test` (`rakit-ir/src/div_test.rs`) memindahkan fold `x % C == 0`
-ke RIR untuk `I64`: `C` ganjil > 1 memakai `imul x, C^-1` + `icmp ule`;
-`C = 2^s * odd` memakai mask `x & (2^s - 1)` lalu uji `odd`; `C` pangkat dua
-hanya memakai mask. `eq`/`ne` dan kombinasi Bool memakai `select`. Dengan
-`RAKIT_RIR=1 RAKIT_NO_DIVTEST=1`, rewrite ini dikerjakan RIR dan output tetap
-sama. Tipe lebih sempit dan `brif` langsung pada remainder masih ditangani
-pass CLIF.
+ke RIR untuk `I8/I16/I32/I64`: `C` ganjil > 1 memakai `imul x, C^-1` +
+`icmp ule`; `C = 2^s * odd` memakai mask `x & (2^s - 1)` lalu uji `odd`;
+`C` pangkat dua hanya memakai mask. `eq`/`ne` dan kombinasi Bool memakai
+`select`. Dengan `RAKIT_RIR=1 RAKIT_NO_DIVTEST=1`, rewrite ini dikerjakan RIR
+dan output tetap sama. `brif` langsung pada remainder masih ditangani pass CLIF.
+
+Semantik integer RIR (`rakit-ir/src/int_sem.rs`) memakai representasi bit
+zero-extended per lebar tipe: operasi unsigned langsung benar, operasi signed
+melakukan sign-extend, dan shift memakai `width-1`. Interpreter dan constant
+folder memakai modul yang sama, sehingga `I8/I16/I32` konsisten.
 
 ## Build
 

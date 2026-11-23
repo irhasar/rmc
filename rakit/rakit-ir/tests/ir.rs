@@ -220,3 +220,66 @@ fn brif_to_same_target_folds_to_jump() {
     assert_eq!(run(&f, &[Val::I(1), Val::I(2)]).unwrap(), vec![Val::I(5)]);
     assert!(matches!(f.blocks[0].terminator().unwrap(), Inst::Jump(t2, _) if *t2 == t));
 }
+
+#[test]
+fn narrow_integers_wrap_and_sign_extend() {
+    let mut b = Builder::new(vec![Type::I8, Type::Bool], vec![Type::I8]);
+    let e = b.func().entry;
+    let x = b.func().block(e).params[0];
+    let one = b.iconst(e, Type::I8, 1);
+    let sum = b.bin(e, BinOp::Add, Type::I8, x, one);
+    let neg_one = b.iconst(e, Type::I8, 255);
+    let neg = b.icmp(e, IntCc::Slt, Type::I8, neg_one, one);
+    b.ret(e, vec![sum, neg]);
+
+    let f = b.into_func();
+    assert_eq!(
+        run(&f, &[Val::I(127)]).unwrap(),
+        vec![Val::I(128), Val::B(true)]
+    );
+}
+
+#[test]
+fn narrow_shift_amount_wraps_to_width() {
+    let mut b = Builder::new(vec![Type::I8], vec![Type::I8]);
+    let e = b.func().entry;
+    let x = b.func().block(e).params[0];
+    let eight = b.iconst(e, Type::I8, 8);
+    let shifted = b.bin(e, BinOp::Shl, Type::I8, x, eight);
+    b.ret(e, vec![shifted]);
+
+    let f = b.into_func();
+    assert_eq!(run(&f, &[Val::I(1)]).unwrap(), vec![Val::I(1)]);
+}
+
+#[test]
+fn i32_add_wraps() {
+    let mut b = Builder::new(vec![Type::I32], vec![Type::I32]);
+    let e = b.func().entry;
+    let x = b.func().block(e).params[0];
+    let one = b.iconst(e, Type::I32, 1);
+    let sum = b.bin(e, BinOp::Add, Type::I32, x, one);
+    b.ret(e, vec![sum]);
+
+    let f = b.into_func();
+    assert_eq!(run(&f, &[Val::I(0xFFFF_FFFF)]).unwrap(), vec![Val::I(0)]);
+}
+
+#[test]
+fn narrow_constant_folding_wraps() {
+    let mut b = Builder::new(vec![Type::I8, Type::Bool, Type::Bool], vec![]);
+    let e = b.func().entry;
+    let a = b.iconst(e, Type::I8, 255);
+    let one = b.iconst(e, Type::I8, 1);
+    let sum = b.bin(e, BinOp::Add, Type::I8, a, one);
+    let slt = b.icmp(e, IntCc::Slt, Type::I8, a, one);
+    let ult = b.icmp(e, IntCc::Ult, Type::I8, a, one);
+    b.ret(e, vec![sum, slt, ult]);
+
+    let mut f = b.into_func();
+    assert!(optimize(&mut f));
+    assert_eq!(
+        run(&f, &[]).unwrap(),
+        vec![Val::I(0), Val::B(true), Val::B(false)]
+    );
+}

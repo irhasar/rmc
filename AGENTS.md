@@ -1,5 +1,21 @@
 # AGENTS.md
 
+## Session (2026-11-23, Fase 2 step 6) — narrow-type semantics + div_test
+- New `rakit-ir/src/int_sem.rs`: `width`/`mask`/`wrap`/`sign_extend`/
+  `shift_amount` plus shared `eval_bin`/`eval_icmp`. Values are zero-extended
+  bit patterns per type; signed ops sign-extend, shifts mask by `width-1`.
+- `interp.rs` and `opt.rs` now use `int_sem` for integers, so `I8/I16/I32`
+  arithmetic wraps and signed compares are correct in both execution and
+  constant folding.
+- `div_test` now covers `I8/I16/I32/I64` and computes a width-specific inverse
+  (`C^-1 mod 2^bits`) and threshold (`(2^bits-1)/odd`).
+- Tests: `cargo test --manifest-path rakit-ir/Cargo.toml` -> 21/21 (6 div_test
+  + 15 ir; new: narrow wrap/sign-extend, shift amount, I32 wrap, narrow
+  constant folding, narrow inverse, narrow div_test).
+- End-to-end: `RAKIT_RIR=1 RAKIT_NO_DIVTEST=1` on `u32 % 3` and `u8 % 3` logs
+  `[rir] div_test fired` for both and prints `1 2 4294967295 1 2`, identical
+  to the normal build.
+
 ## Session (2026-11-23, Fase 2 step 5) — `div_test` covers even divisors in RIR
 - `rakit-ir/src/div_test.rs` now also handles `C = 2^s * odd` and powers of two
   for `I64`: mask `x & (2^s - 1)` must be zero, plus the odd-divisor

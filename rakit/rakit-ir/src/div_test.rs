@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 
+use crate::int_sem;
 use crate::ir::{BinOp, Function, Inst, IntCc, Type, Value};
 
 pub fn run(func: &mut Function) -> bool {
@@ -24,7 +25,9 @@ pub fn run(func: &mut Function) -> bool {
     for (bi, blk) in func.blocks.iter().enumerate() {
         for (ii, inst) in blk.insts.iter().enumerate() {
             let Inst::Icmp(rr, cc, ty, a, b) = inst else { continue };
-            if *ty != Type::I64 || !matches!(cc, IntCc::Eq | IntCc::Ne) {
+            if !matches!(*ty, Type::I8 | Type::I16 | Type::I32 | Type::I64)
+                || !matches!(cc, IntCc::Eq | IntCc::Ne)
+            {
                 continue;
             }
             let rem = if resolve_u64(&consts, &copies, *b) == Some(0) {
@@ -34,13 +37,21 @@ pub fn run(func: &mut Function) -> bool {
             } else {
                 continue;
             };
-            let Some((x, divisor)) = find_urem(func, &consts, &copies, rem) else {
+            let Some((x, divisor)) = find_urem(func, &consts, &copies, rem, *ty) else {
                 continue;
             };
             if divisor <= 1 {
                 continue;
             }
-            candidates.push(Candidate { bi, ii, rr: *rr, cc: *cc, x, divisor });
+            candidates.push(Candidate {
+                bi,
+                ii,
+                rr: *rr,
+                cc: *cc,
+                x,
+                divisor,
+                ty: *ty,
+            });
         }
     }
 
@@ -60,6 +71,7 @@ struct Candidate {
     cc: IntCc,
     x: Value,
     divisor: u64,
+    ty: Type,
 }
 
 fn collect_consts(func: &Function) -> HashMap<Value, i64> {
@@ -108,13 +120,14 @@ fn find_urem(
     consts: &HashMap<Value, i64>,
     copies: &HashMap<Value, Value>,
     mut v: Value,
+    ty: Type,
 ) -> Option<(Value, u64)> {
     for _ in 0..64 {
         for blk in &func.blocks {
             for inst in &blk.insts {
-                if let Inst::Bin(r, BinOp::Urem, Type::I64, x, c) = inst {
-                    if *r == v {
-                        return Some((*x, *consts.get(c)? as u64));
+                if let Inst::Bin(r, BinOp::Urem, bin_ty, x, c) = inst {
+                    if *r == v && *bin_ty == ty {
+                        return Some((*x, int_sem::wrap(ty, *consts.get(c)?) as u64));
                     }
                 }
             }
@@ -134,34 +147,37 @@ fn new_value(func: &mut Function, ty: Type) -> Value {
 }
 
 fn rewrite(func: &mut Function, cand: &Candidate) {
+    let ty = cand.ty;
+    let bits = int_sem::width(ty).expect("candidate is an integer type");
+    let full_mask = int_sem::mask(ty).expect("candidate is an integer type");
     let pow2 = cand.divisor.trailing_zeros();
     let odd = cand.divisor >> pow2;
     let mut prologue = Vec::new();
-    let zero_v = new_value(func, Type::I64);
-    prologue.push(Inst::Iconst(zero_v, Type::I64, 0));
+    let zero_v = new_value(func, ty);
+    prologue.push(Inst::Iconst(zero_v, ty, 0));
 
     let mut is_zero = None;
     if pow2 > 0 {
         let mask = (1u64 << pow2) - 1;
-        let mask_v = new_value(func, Type::I64);
-        let low = new_value(func, Type::I64);
+        let mask_v = new_value(func, ty);
+        let low = new_value(func, ty);
         let div = new_value(func, Type::Bool);
-        prologue.push(Inst::Iconst(mask_v, Type::I64, mask as i64));
-        prologue.push(Inst::Bin(low, BinOp::And, Type::I64, cand.x, mask_v));
-        prologue.push(Inst::Icmp(div, IntCc::Eq, Type::I64, low, zero_v));
+        prologue.push(Inst::Iconst(mask_v, ty, mask as i64));
+        prologue.push(Inst::Bin(low, BinOp::And, ty, cand.x, mask_v));
+        prologue.push(Inst::Icmp(div, IntCc::Eq, ty, low, zero_v));
         is_zero = Some(div);
     }
     if odd > 1 {
-        let inv = mod_inverse_u64(odd);
-        let threshold = u64::MAX / odd;
-        let inv_v = new_value(func, Type::I64);
-        let prod = new_value(func, Type::I64);
-        let thr_v = new_value(func, Type::I64);
+        let inv = mod_inverse(odd, bits);
+        let threshold = full_mask / odd;
+        let inv_v = new_value(func, ty);
+        let prod = new_value(func, ty);
+        let thr_v = new_value(func, ty);
         let odd_tmp = new_value(func, Type::Bool);
-        prologue.push(Inst::Iconst(inv_v, Type::I64, inv as i64));
-        prologue.push(Inst::Bin(prod, BinOp::Mul, Type::I64, cand.x, inv_v));
-        prologue.push(Inst::Iconst(thr_v, Type::I64, threshold as i64));
-        prologue.push(Inst::Icmp(odd_tmp, IntCc::Ule, Type::I64, prod, thr_v));
+        prologue.push(Inst::Iconst(inv_v, ty, inv as i64));
+        prologue.push(Inst::Bin(prod, BinOp::Mul, ty, cand.x, inv_v));
+        prologue.push(Inst::Iconst(thr_v, ty, threshold as i64));
+        prologue.push(Inst::Icmp(odd_tmp, IntCc::Ule, ty, prod, thr_v));
         is_zero = Some(match is_zero {
             Some(div) => {
                 let both = new_value(func, Type::Bool);
@@ -193,14 +209,19 @@ fn rewrite(func: &mut Function, cand: &Candidate) {
     blk.insts[cand.ii + n] = Inst::Copy(cand.rr, Type::Bool, is_zero);
 }
 
-/// `C^-1 mod 2^64` for odd `C`, by Newton iteration on the 2-adic inverse.
-fn mod_inverse_u64(odd: u64) -> u64 {
+/// `C^-1 mod 2^bits` for odd `C`, by Newton iteration on the 2-adic inverse.
+fn mod_inverse(odd: u64, bits: u32) -> u64 {
     debug_assert!(odd % 2 == 1);
-    let mut x = odd;
+    let mask = if bits == 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
+    let mut x = odd & mask;
     for _ in 0..6 {
-        x = x.wrapping_mul(2u64.wrapping_sub(odd.wrapping_mul(x)));
+        x = x.wrapping_mul(2u64.wrapping_sub(odd.wrapping_mul(x))) & mask;
     }
-    debug_assert_eq!(odd.wrapping_mul(x), 1);
+    debug_assert_eq!((odd.wrapping_mul(x)) & mask, 1);
     x
 }
 
@@ -211,20 +232,24 @@ mod tests {
     use crate::{Builder, Val};
 
     fn build_mod_test(c: i64, ne: bool) -> Function {
-        let mut b = Builder::new(vec![Type::I64], vec![Type::I64]);
+        build_mod_test_ty(Type::I64, c, ne)
+    }
+
+    fn build_mod_test_ty(ty: Type, c: i64, ne: bool) -> Function {
+        let mut b = Builder::new(vec![ty], vec![ty]);
         let e = b.func().entry;
         let x = b.func().block(e).params[0];
-        let d = b.iconst(e, Type::I64, c);
-        let rem = b.bin(e, BinOp::Urem, Type::I64, x, d);
-        let zero = b.iconst(e, Type::I64, 0);
+        let d = b.iconst(e, ty, c);
+        let rem = b.bin(e, BinOp::Urem, ty, x, d);
+        let zero = b.iconst(e, ty, 0);
         let cc = if ne { IntCc::Ne } else { IntCc::Eq };
-        let cond = b.icmp(e, cc, Type::I64, rem, zero);
+        let cond = b.icmp(e, cc, ty, rem, zero);
         let t = b.add_block(vec![]);
         let f = b.add_block(vec![]);
         b.brif(e, cond, t, vec![], f, vec![]);
-        let one = b.iconst(t, Type::I64, 1);
+        let one = b.iconst(t, ty, 1);
         b.ret(t, vec![one]);
-        let two = b.iconst(f, Type::I64, 2);
+        let two = b.iconst(f, ty, 2);
         b.ret(f, vec![two]);
         b.into_func()
     }
@@ -289,8 +314,51 @@ mod tests {
     #[test]
     fn inverse_is_correct_for_all_odd_divisors_up_to_4095() {
         for d in (1..4096u64).step_by(2) {
-            let m = mod_inverse_u64(d);
+            let m = mod_inverse(d, 64);
             assert_eq!(d.wrapping_mul(m), 1, "inverse wrong for {d}");
+        }
+    }
+
+    #[test]
+    fn inverse_is_correct_for_narrow_widths() {
+        for bits in [8u32, 16, 32] {
+            let mask = (1u64 << bits) - 1;
+            for d in (1..512u64).step_by(2) {
+                let m = mod_inverse(d, bits);
+                assert_eq!((d.wrapping_mul(m)) & mask, 1, "bits {bits} d {d}");
+            }
+        }
+    }
+
+    #[test]
+    fn handles_narrow_types() {
+        for (ty, divisor, hit, miss) in [
+            (Type::I8, 3i64, 255u64, 254u64),
+            (Type::I8, 4, 252, 253),
+            (Type::I16, 3, 65535, 65534),
+            (Type::I32, 3, 0xFFFF_FFFF, 0xFFFF_FFFE),
+        ] {
+            let mut f = build_mod_test_ty(ty, divisor, false);
+            assert_eq!(
+                crate::run(&f, &[Val::I(hit as i64)]).unwrap(),
+                vec![Val::I(1)],
+                "{ty:?} divisor {divisor} hit {hit}"
+            );
+            assert!(run(&mut f), "{ty:?} divisor {divisor} not rewritten");
+            assert!(crate::verify(&f).is_ok(), "{:?}", crate::verify(&f).err());
+            assert_eq!(
+                crate::run(&f, &[Val::I(hit as i64)]).unwrap(),
+                vec![Val::I(1)]
+            );
+            assert_eq!(
+                crate::run(&f, &[Val::I(miss as i64)]).unwrap(),
+                vec![Val::I(2)]
+            );
+            crate::optimize(&mut f);
+            assert!(!f
+                .blocks
+                .iter()
+                .any(|b| b.insts.iter().any(|i| matches!(i, Inst::Bin(_, BinOp::Urem, ..)))));
         }
     }
 }

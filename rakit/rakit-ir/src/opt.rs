@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 
+use crate::int_sem;
 use crate::ir::{BinOp, FloatCc, Function, Inst, IntCc, Type, Value};
 
 #[derive(Clone, Copy)]
@@ -18,8 +19,8 @@ fn const_map(func: &Function) -> HashMap<Value, Const> {
     for blk in &func.blocks {
         for inst in &blk.insts {
             match inst {
-                Inst::Iconst(r, _, v) => {
-                    map.insert(*r, Const::I(*v));
+                Inst::Iconst(r, ty, v) => {
+                    map.insert(*r, Const::I(int_sem::wrap(*ty, *v)));
                 }
                 Inst::F32const(r, v) => {
                     map.insert(*r, Const::F32(*v));
@@ -57,60 +58,9 @@ fn eval_bin(op: BinOp, ty: Type, a: Const, b: Const) -> Option<Const> {
             Some(Const::F64(r))
         }
         (ty, Const::I(x), Const::I(y)) if ty.is_int() => {
-            let r = match op {
-                BinOp::Add => x.wrapping_add(y),
-                BinOp::Sub => x.wrapping_sub(y),
-                BinOp::Mul => x.wrapping_mul(y),
-                BinOp::Sdiv => {
-                    if y == 0 {
-                        return None;
-                    }
-                    x.wrapping_div(y)
-                }
-                BinOp::Udiv => {
-                    if y == 0 {
-                        return None;
-                    }
-                    (x as u64).wrapping_div(y as u64) as i64
-                }
-                BinOp::Srem => {
-                    if y == 0 {
-                        return None;
-                    }
-                    x.wrapping_rem(y)
-                }
-                BinOp::Urem => {
-                    if y == 0 {
-                        return None;
-                    }
-                    (x as u64).wrapping_rem(y as u64) as i64
-                }
-                BinOp::And => x & y,
-                BinOp::Or => x | y,
-                BinOp::Xor => x ^ y,
-                BinOp::Shl => x.wrapping_shl((y as u32) & 63),
-                BinOp::Shr => x.wrapping_shr((y as u32) & 63),
-                BinOp::Ushr => (x as u64).wrapping_shr((y as u32) & 63) as i64,
-                _ => return None,
-            };
-            Some(Const::I(r))
+            int_sem::eval_bin(op, ty, x, y).map(Const::I)
         }
         _ => None,
-    }
-}
-
-fn eval_icmp(cc: IntCc, a: i64, b: i64) -> bool {
-    match cc {
-        IntCc::Eq => a == b,
-        IntCc::Ne => a != b,
-        IntCc::Slt => a < b,
-        IntCc::Sle => a <= b,
-        IntCc::Sgt => a > b,
-        IntCc::Sge => a >= b,
-        IntCc::Ult => (a as u64) < (b as u64),
-        IntCc::Ule => (a as u64) <= (b as u64),
-        IntCc::Ugt => (a as u64) > (b as u64),
-        IntCc::Uge => (a as u64) >= (b as u64),
     }
 }
 
@@ -187,7 +137,11 @@ fn fold(func: &mut Function) -> bool {
                     } else {
                         match (consts.get(&x), consts.get(&y)) {
                             (Some(Const::I(a)), Some(Const::I(b))) => {
-                                Some(Inst::Iconst(r, Type::Bool, eval_icmp(cc, *a, *b) as i64))
+                                Some(Inst::Iconst(
+                                    r,
+                                    Type::Bool,
+                                    int_sem::eval_icmp(cc, ty, *a, *b) as i64,
+                                ))
                             }
                             _ => None,
                         }

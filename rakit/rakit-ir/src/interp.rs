@@ -1,7 +1,8 @@
 //! A reference interpreter for Rakit IR, used by tests to check that the IR and
 //! the optimizer preserve semantics. It covers the scalar subset.
 
-use crate::ir::{BinOp, Block, FloatCc, Function, Inst, IntCc, Type, Value};
+use crate::int_sem;
+use crate::ir::{BinOp, Block, FloatCc, Function, Inst, Type, Value};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Val {
@@ -70,58 +71,9 @@ fn eval_bin(op: BinOp, ty: Type, a: Val, b: Val) -> Result<Val, String> {
         });
     }
 
-    let (x, y) = (a.as_i(), b.as_i());
-    let r = match op {
-        BinOp::Add => x.wrapping_add(y),
-        BinOp::Sub => x.wrapping_sub(y),
-        BinOp::Mul => x.wrapping_mul(y),
-        BinOp::Sdiv => {
-            if y == 0 {
-                return Err("division by zero".to_string());
-            }
-            x.wrapping_div(y)
-        }
-        BinOp::Udiv => {
-            if y == 0 {
-                return Err("division by zero".to_string());
-            }
-            (x as u64).wrapping_div(y as u64) as i64
-        }
-        BinOp::Srem => {
-            if y == 0 {
-                return Err("division by zero".to_string());
-            }
-            x.wrapping_rem(y)
-        }
-        BinOp::Urem => {
-            if y == 0 {
-                return Err("division by zero".to_string());
-            }
-            (x as u64).wrapping_rem(y as u64) as i64
-        }
-        BinOp::And => x & y,
-        BinOp::Or => x | y,
-        BinOp::Xor => x ^ y,
-        BinOp::Shl => x.wrapping_shl((y as u32) & 63),
-        BinOp::Shr => x.wrapping_shr((y as u32) & 63),
-        BinOp::Ushr => (x as u64).wrapping_shr((y as u32) & 63) as i64,
-        _ => return Err(format!("integer op {op:?} on float operands")),
-    };
-    Ok(Val::I(r))
-}
-
-fn eval_icmp(cc: IntCc, a: i64, b: i64) -> bool {
-    match cc {
-        IntCc::Eq => a == b,
-        IntCc::Ne => a != b,
-        IntCc::Slt => a < b,
-        IntCc::Sle => a <= b,
-        IntCc::Sgt => a > b,
-        IntCc::Sge => a >= b,
-        IntCc::Ult => (a as u64) < (b as u64),
-        IntCc::Ule => (a as u64) <= (b as u64),
-        IntCc::Ugt => (a as u64) > (b as u64),
-        IntCc::Uge => (a as u64) >= (b as u64),
+    match int_sem::eval_bin(op, ty, a.as_i(), b.as_i()) {
+        Some(r) => Ok(Val::I(r)),
+        None => Err(format!("integer op {op:?} failed (division by zero?)")),
     }
 }
 
@@ -143,14 +95,23 @@ fn get(env: &[Option<Val>], v: Value) -> Result<Val, String> {
 fn eval(env: &[Option<Val>], inst: &Inst) -> Result<Val, String> {
     match inst {
         Inst::Nop(_, ty) => Ok(default_val(*ty)),
-        Inst::Iconst(_, ty, v) => Ok(if *ty == Type::Bool { Val::B(*v != 0) } else { Val::I(*v) }),
+        Inst::Iconst(_, ty, v) => Ok(if *ty == Type::Bool {
+            Val::B(*v != 0)
+        } else {
+            Val::I(int_sem::wrap(*ty, *v))
+        }),
         Inst::F32const(_, v) => Ok(Val::F32(*v)),
         Inst::F64const(_, v) => Ok(Val::F64(*v)),
         Inst::Copy(_, _, x) => get(env, *x),
         Inst::Bin(_, op, ty, x, y) => {
             eval_bin(*op, *ty, get(env, *x)?, get(env, *y)?)
         }
-        Inst::Icmp(_, cc, _, x, y) => Ok(Val::B(eval_icmp(*cc, get(env, *x)?.as_i(), get(env, *y)?.as_i()))),
+        Inst::Icmp(_, cc, ty, x, y) => Ok(Val::B(int_sem::eval_icmp(
+            *cc,
+            *ty,
+            get(env, *x)?.as_i(),
+            get(env, *y)?.as_i(),
+        ))),
         Inst::Fcmp(_, cc, _, x, y) => Ok(Val::B(eval_fcmp(*cc, get(env, *x)?.as_f(), get(env, *y)?.as_f()))),
         Inst::Select(_, _, c, x, y) => {
             if get(env, *c)?.as_bool() { get(env, *x) } else { get(env, *y) }
