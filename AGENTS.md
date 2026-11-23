@@ -1,3 +1,39 @@
+## Session (2026-11-23, audit iteration 2) — RIR production path
+- **RIR now covers std crates.** `tunables::rir_enabled` returns true for all
+  crates, not only user executables. Forcing a core rebuild with
+  `RAKIT_RIR_DEBUG=1` logged 5,266 `[rir] optimized` functions and 8,761 skips
+  (unsupported instruction subsets), proving std actually goes through RIR.
+- **Bridge is no longer partial for globals/dynamic/exception.** `rakit-opt/src/rir.rs`
+  imports/exports `GlobalValueData` (VMContext, Load, IAddImm, Symbol,
+  DynScaleTargetConst), `dynamic_types`, `dynamic_stack_slots`, `stack_limit`,
+  `UnaryGlobalValue`, `FuncAddr`, `DynamicStackAddr`, `TryCall`, and
+  `TryCallIndirect` including exception tables and `TryArg::{Value,Ret,Exn}`.
+  `try_call` has no direct SSA results (normal values are `TryArg::Ret`), which
+  the verifier now enforces. Round-trip tests: `global_value_roundtrip`,
+  `dynamic_stack_roundtrip`, `try_call_roundtrip` in `rakit-opt/src/rir.rs`.
+- **SROA soundness fix + opt-in.** `sroa` now rejects a promoted load
+  replacement when the replacement value does not dominate the load, and
+  dynamic-address promotion is disabled. The pass is opt-in
+  (`RAKIT_RIR_SROA=1`); default off until the alias proof is stronger, because
+  a std slice-pattern test (`slice::subslice_patterns`) exposed a remaining
+  cross-block issue.
+- **Custom backend is now an emitter, not validation-only.**
+  `rakit-ir/src/backend/mach.rs::to_rir` lowers virtual-register machine IR back
+  to RIR. `RirPass` runs `RirSelector` + `LinearScan`, then emits RIR from the
+  pre-allocation machine IR and uses that as the CLIF export input. Scalar
+  subset; unsupported functions stay on the direct RIR path.
+- **New RIR pass:** `rakit-ir/src/sincos.rs` fuses same-block `sin`/`cos` libcalls
+  into `sincos`/`sincosf`, wired into the RIR pipeline. Tests:
+  `rakit-ir/tests/sincos.rs`.
+- **Verification:** `cargo test` in `rakit-ir` and `rakit-opt` green;
+  `./y.sh build` exit 0; h20–h26 byte-identical under default RIR,
+  `RAKIT_NO_RIR=1`, and `RAKIT_CUSTOM_BACKEND=1`; h27 (`sin`/`cos`) matches
+  LLVM output. `./y.sh test` reaches the long-running std IO tests without the
+  former `slice::subslice_patterns` failure once RIR SROA is opt-in.
+- **Still open:** `rec_loop`, `unroll`, and `inliner` remain CLIF-only;
+  RIR coverage is intentionally conservative (unsupported functions skip).
+  Push to `irhasar/rmc:rakit-middle-end` remains blocked by token permissions.
+
 # AGENTS.md
 
 ## Session (2026-11-23, Fase 2 step 19) — calls

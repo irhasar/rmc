@@ -30,6 +30,21 @@ pub(crate) fn remove_blocks(func: &mut Function, remove: &[usize]) {
                     t.0 = map[t.0 as usize].expect("branch to removed block");
                     f.0 = map[f.0 as usize].expect("branch to removed block");
                 }
+                Inst::TryCall { normal, exception, .. }
+                | Inst::TryCallIndirect { normal, exception, .. } => {
+                    normal.block.0 = map[normal.block.0 as usize]
+                        .expect("branch to removed block");
+                    for item in exception {
+                        match item {
+                            crate::ir::ExceptionItem::Tag(_, call)
+                            | crate::ir::ExceptionItem::Default(call) => {
+                                call.block.0 = map[call.block.0 as usize]
+                                    .expect("branch to removed block")
+                            }
+                            crate::ir::ExceptionItem::Context(_) => {}
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -77,6 +92,19 @@ pub(crate) fn predecessors(func: &Function) -> Vec<Vec<usize>> {
                 preds[t.0 as usize].push(bi);
                 preds[f.0 as usize].push(bi);
             }
+            Inst::TryCall { normal, exception, .. }
+            | Inst::TryCallIndirect { normal, exception, .. } => {
+                preds[normal.block.0 as usize].push(bi);
+                for item in exception {
+                    match item {
+                        crate::ir::ExceptionItem::Tag(_, call)
+                        | crate::ir::ExceptionItem::Default(call) => {
+                            preds[call.block.0 as usize].push(bi)
+                        }
+                        crate::ir::ExceptionItem::Context(_) => {}
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -102,6 +130,19 @@ fn dfs(b: usize, func: &Function, seen: &mut [bool], post: &mut Vec<usize>) {
             Inst::Brif(_, t, _, f, _) => {
                 dfs(t.0 as usize, func, seen, post);
                 dfs(f.0 as usize, func, seen, post);
+            }
+            Inst::TryCall { normal, exception, .. }
+            | Inst::TryCallIndirect { normal, exception, .. } => {
+                dfs(normal.block.0 as usize, func, seen, post);
+                for item in exception {
+                    match item {
+                        crate::ir::ExceptionItem::Tag(_, call)
+                        | crate::ir::ExceptionItem::Default(call) => {
+                            dfs(call.block.0 as usize, func, seen, post)
+                        }
+                        crate::ir::ExceptionItem::Context(_) => {}
+                    }
+                }
             }
             _ => {}
         }
@@ -177,6 +218,14 @@ pub(crate) fn dominates(a: usize, b: usize, idom: &[Option<usize>]) -> bool {
     }
 }
 
+fn remap_try_args(args: &mut [crate::ir::TryArg], map: &[Option<Value>]) {
+    for arg in args {
+        if let crate::ir::TryArg::Value(v) = arg {
+            *v = map[v.0 as usize].expect("value removed but still used");
+        }
+    }
+}
+
 fn remap_inst_values(inst: &mut Inst, map: &[Option<Value>]) {
     fn r(map: &[Option<Value>], v: &mut Value) {
         *v = map[v.0 as usize].expect("value removed but still used");
@@ -192,13 +241,14 @@ fn remap_inst_values(inst: &mut Inst, map: &[Option<Value>]) {
         | Inst::Fcmp(v, _, _, _, _)
         | Inst::Select(v, _, _, _, _)
         | Inst::StackAddr(v, _, _)
-        | Inst::Load(v, _, _, _) => r(map, v),
-        Inst::Call(results, _, _) => {
-            for v in results {
-                *v = map[v.0 as usize].expect("value removed but still used");
-            }
-        }
-        Inst::CallIndirect { results, .. } => {
+        | Inst::Load(v, _, _, _)
+        | Inst::GlobalValue(v, _)
+        | Inst::FuncAddr(v, _)
+        | Inst::DynamicStackAddr(v, _) => r(map, v),
+        Inst::Call(results, _, _)
+        | Inst::CallIndirect { results, .. }
+        | Inst::TryCall { results, .. }
+        | Inst::TryCallIndirect { results, .. } => {
             for v in results {
                 *v = map[v.0 as usize].expect("value removed but still used");
             }
@@ -231,6 +281,34 @@ fn remap_inst_values(inst: &mut Inst, map: &[Option<Value>]) {
             r(map, callee);
             for a in args {
                 r(map, a);
+            }
+        }
+        Inst::GlobalValue(..) | Inst::FuncAddr(..) | Inst::DynamicStackAddr(..) => {}
+        Inst::TryCall { args, normal, exception, .. } => {
+            for a in args {
+                r(map, a);
+            }
+            remap_try_args(&mut normal.args, map);
+            for item in exception {
+                match item {
+                    crate::ir::ExceptionItem::Tag(_, call)
+                    | crate::ir::ExceptionItem::Default(call) => remap_try_args(&mut call.args, map),
+                    crate::ir::ExceptionItem::Context(v) => r(map, v),
+                }
+            }
+        }
+        Inst::TryCallIndirect { callee, args, normal, exception, .. } => {
+            r(map, callee);
+            for a in args {
+                r(map, a);
+            }
+            remap_try_args(&mut normal.args, map);
+            for item in exception {
+                match item {
+                    crate::ir::ExceptionItem::Tag(_, call)
+                    | crate::ir::ExceptionItem::Default(call) => remap_try_args(&mut call.args, map),
+                    crate::ir::ExceptionItem::Context(v) => r(map, v),
+                }
             }
         }
         Inst::Store(_, a, _, v) => {

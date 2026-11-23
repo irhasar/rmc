@@ -30,6 +30,7 @@ pub mod licm;
 pub mod mem_forward;
 pub mod opt;
 pub mod simplify;
+pub mod sincos;
 pub mod sroa;
 pub mod verify;
 

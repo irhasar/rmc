@@ -13,9 +13,23 @@ use rakit_ir::backend::{InstructionSelector, RegisterAllocator};
 use crate::pass::{Pass, PassCtx};
 use crate::passtime;
 
-/// Optional round trip through the Rakit mid-level IR. It only fires for
-/// functions the CLIF<->RIR bridge supports (scalar, no memory/calls) and only
-/// when `RAKIT_RIR` is set, so it cannot affect a normal build.
+fn verified(rir: &rakit_ir::Function, label: &str, debug: bool) -> bool {
+    if !debug && std::env::var_os("RAKIT_RIR_VERIFY").is_none() {
+        return true;
+    }
+    match rakit_ir::verify(rir) {
+        Ok(()) => true,
+        Err(errors) => {
+            if debug {
+                eprintln!("[rir] invalid after {label}: {errors:?}");
+            }
+            false
+        }
+    }
+}
+
+/// Round trip through the Rakit mid-level IR. It fires for functions the
+/// CLIF<->RIR bridge supports; unsupported functions are left untouched.
 pub struct RirPass;
 
 impl Pass for RirPass {
@@ -28,6 +42,13 @@ impl Pass for RirPass {
             return false;
         }
         let debug = std::env::var_os("RAKIT_RIR_DEBUG").is_some();
+        let dump_match = std::env::var("RAKIT_RIR_DUMP").ok();
+        let dump = dump_match.as_ref().is_some_and(|m| {
+            format!("{:?}", pctx.ctx.func.name).contains(m)
+        });
+        if dump {
+            eprintln!("[rir] IN {:?}\n{}", pctx.ctx.func.name, pctx.ctx.func.display());
+        }
         let Some(mut rir_func) = crate::rir::import(&pctx.ctx.func) else {
             if debug {
                 eprintln!(
@@ -45,6 +66,11 @@ impl Pass for RirPass {
         let simplify_changed = rakit_ir::simplify::run(&mut rir_func);
         let opt_changed = rakit_ir::optimize(&mut rir_func);
         let mut changed = simplify_changed || opt_changed;
+        if simplify_changed {
+            if !verified(&rir_func, "simplify", debug) {
+                return false;
+            }
+        }
         if debug && simplify_changed {
             eprintln!("[rir] simplify fired");
         }
@@ -53,13 +79,20 @@ impl Pass for RirPass {
             rakit_ir::optimize(&mut rir_func);
             changed = true;
         }
+        if mem_changed && !verified(&rir_func, "mem_forward", debug) {
+            return false;
+        }
         if debug && mem_changed {
             eprintln!("[rir] mem_forward fired");
         }
-        let sroa_changed = rakit_ir::sroa::run(&mut rir_func);
+        let sroa_changed =
+            crate::tunables::rir_sroa_enabled() && rakit_ir::sroa::run(&mut rir_func);
         if sroa_changed {
             rakit_ir::optimize(&mut rir_func);
             changed = true;
+        }
+        if sroa_changed && !verified(&rir_func, "sroa", debug) {
+            return false;
         }
         if debug && sroa_changed {
             eprintln!("[rir] sroa fired");
@@ -69,6 +102,9 @@ impl Pass for RirPass {
             rakit_ir::optimize(&mut rir_func);
             changed = true;
         }
+        if div_changed && !verified(&rir_func, "div_test", debug) {
+            return false;
+        }
         if debug && div_changed {
             eprintln!("[rir] div_test fired");
         }
@@ -76,6 +112,9 @@ impl Pass for RirPass {
         if ifconv_changed {
             rakit_ir::optimize(&mut rir_func);
             changed = true;
+        }
+        if ifconv_changed && !verified(&rir_func, "if_convert", debug) {
+            return false;
         }
         if debug && ifconv_changed {
             eprintln!("[rir] if_convert fired");
@@ -85,6 +124,9 @@ impl Pass for RirPass {
             rakit_ir::optimize(&mut rir_func);
             changed = true;
         }
+        if gvn_changed && !verified(&rir_func, "gvn", debug) {
+            return false;
+        }
         if debug && gvn_changed {
             eprintln!("[rir] gvn fired");
         }
@@ -93,27 +135,62 @@ impl Pass for RirPass {
             rakit_ir::optimize(&mut rir_func);
             changed = true;
         }
+        if licm_changed && !verified(&rir_func, "licm", debug) {
+            return false;
+        }
         if debug && licm_changed {
             eprintln!("[rir] licm fired");
+        }
+        let sincos_changed =
+            crate::tunables::rir_sincos_enabled() && rakit_ir::sincos::run(&mut rir_func);
+        if sincos_changed {
+            rakit_ir::optimize(&mut rir_func);
+            changed = true;
+        }
+        if sincos_changed && !verified(&rir_func, "sincos", debug) {
+            return false;
+        }
+        if debug && sincos_changed {
+            eprintln!("[rir] sincos fired");
+        }
+        if !verified(&rir_func, "pipeline", debug) {
+            return false;
         }
         if crate::tunables::custom_backend_enabled() {
             let selector = rakit_ir::backend::RirSelector;
             match selector.select(&rir_func) {
-                Ok(mut mach) => match rakit_ir::backend::LinearScan.allocate(&mut mach) {
-                    Ok(stats) => {
-                        if debug {
-                            eprintln!(
-                                "[rir] custom backend: {} vregs, {} regs, {} spills",
-                                stats.vregs, stats.registers, stats.spills
-                            );
+                Ok(prealloc) => {
+                    let mut mach = prealloc.clone();
+                    match rakit_ir::backend::LinearScan.allocate(&mut mach) {
+                        Ok(stats) => match rakit_ir::backend::mach::to_rir(&prealloc) {
+                            Ok(emitted) if rakit_ir::verify(&emitted).is_ok() => {
+                                rir_func = emitted;
+                                changed = true;
+                                if debug {
+                                    eprintln!(
+                                        "[rir] custom backend emitted: {} vregs, {} regs, {} spills",
+                                        stats.vregs, stats.registers, stats.spills
+                                    );
+                                }
+                            }
+                            Ok(_) => {
+                                if debug {
+                                    eprintln!("[rir] custom emitter produced invalid RIR");
+                                }
+                            }
+                            Err(err) => {
+                                if debug {
+                                    eprintln!("[rir] custom emitter skip: {err}");
+                                }
+                            }
+                        },
+                        Err(err) => {
+                            if debug {
+                                eprintln!("[rir] custom regalloc skip: {err}");
+                            }
                         }
                     }
-                    Err(err) => {
-                        if debug {
-                            eprintln!("[rir] custom regalloc skip: {err}");
-                        }
-                    }
-                },
+                }
                 Err(err) => {
                     if debug {
                         eprintln!("[rir] custom isel skip: {err}");
@@ -128,11 +205,17 @@ impl Pass for RirPass {
             }
             return false;
         }
+        if dump {
+            eprintln!("[rir] RIR\n{rir_func:?}");
+        }
         let sig = pctx.ctx.func.signature.clone();
         let Some(mut new_func) = crate::rir::export(&rir_func, &sig) else {
             return false;
         };
         new_func.name = pctx.ctx.func.name.clone();
+        if dump {
+            eprintln!("[rir] OUT {:?}\n{}", pctx.ctx.func.name, new_func.display());
+        }
         if std::env::var_os("RAKIT_RIR_DEBUG").is_some() {
             let what = if changed { "optimized" } else { "roundtrip" };
             eprintln!("[rir] {} {:?}", what, pctx.ctx.func.name);

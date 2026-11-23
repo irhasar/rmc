@@ -147,9 +147,16 @@ impl InstructionSelector for RirSelector {
                     }
                     Inst::Call(..) => return Err(unsupported("calls")),
                     Inst::CallIndirect { .. } => return Err(unsupported("indirect calls")),
+                    Inst::TryCall { .. } => return Err(unsupported("try calls")),
+                    Inst::TryCallIndirect { .. } => {
+                        return Err(unsupported("indirect try calls"))
+                    }
                     Inst::Fcmp(..) => return Err(unsupported("float compare")),
                     Inst::Load(..) | Inst::Store(..) | Inst::StackAddr(..) => {
                         return Err(unsupported("memory"));
+                    }
+                    Inst::GlobalValue(..) | Inst::FuncAddr(..) | Inst::DynamicStackAddr(..) => {
+                        return Err(unsupported("global/dynamic address"));
                     }
                 }
             }

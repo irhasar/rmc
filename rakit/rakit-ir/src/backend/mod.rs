@@ -45,5 +45,5 @@ pub trait RegisterAllocator {
 
 pub use exec::run as run_machine;
 pub use isel::RirSelector;
-pub use mach::{MachFunction, Operand, PReg, VReg};
+pub use mach::{to_rir, MachFunction, Operand, PReg, VReg};
 pub use regalloc::LinearScan;

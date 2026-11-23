@@ -1,7 +1,8 @@
 //! An ergonomic builder for Rakit IR functions.
 
 use crate::ir::{
-    BinOp, Block, BlockData, FloatCc, Function, Inst, IntCc, StackSlot, StackSlotData, Type, Value,
+    BinOp, Block, BlockData, ExceptionItem, FloatCc, Function, Inst, IntCc, StackSlot,
+    StackSlotData, TryBlockCall, Type, Value,
 };
 
 pub struct Builder {
@@ -112,6 +113,69 @@ impl Builder {
 
     pub fn store(&mut self, b: Block, ty: Type, addr: Value, offset: i32, value: Value) {
         self.push(b, Inst::Store(ty, addr, offset, value));
+    }
+
+    pub fn global_value(&mut self, b: Block, index: u32) -> Value {
+        let r = self.new_value(Type::I64);
+        self.push(b, Inst::GlobalValue(r, index));
+        r
+    }
+
+    pub fn func_addr(&mut self, b: Block, target: u32) -> Value {
+        let r = self.new_value(Type::I64);
+        self.push(b, Inst::FuncAddr(r, target));
+        r
+    }
+
+    pub fn dynamic_stack_addr(&mut self, b: Block, slot: u32) -> Value {
+        let r = self.new_value(Type::I64);
+        self.push(b, Inst::DynamicStackAddr(r, slot));
+        r
+    }
+
+    pub fn try_call(
+        &mut self,
+        b: Block,
+        target: u32,
+        args: Vec<Value>,
+        _rets: Vec<Type>,
+        normal: TryBlockCall,
+        exception: Vec<ExceptionItem>,
+    ) -> Vec<Value> {
+        // A `try_call` has no direct SSA results: its normal-return values are
+        // passed to `normal` as `TryArg::Ret`.
+        self.push(
+            b,
+            Inst::TryCall { results: Vec::new(), target, args, normal, exception },
+        );
+        Vec::new()
+    }
+
+    pub fn try_call_indirect(
+        &mut self,
+        b: Block,
+        params: Vec<Type>,
+        rets: Vec<Type>,
+        call_conv: u8,
+        callee: Value,
+        args: Vec<Value>,
+        normal: TryBlockCall,
+        exception: Vec<ExceptionItem>,
+    ) -> Vec<Value> {
+        self.push(
+            b,
+            Inst::TryCallIndirect {
+                results: Vec::new(),
+                params,
+                rets,
+                call_conv,
+                callee,
+                args,
+                normal,
+                exception,
+            },
+        );
+        Vec::new()
     }
 
     pub fn jump(&mut self, b: Block, target: Block, args: Vec<Value>) {

@@ -64,13 +64,16 @@ parameter blok, `jump`/`brif`, `return`, stack slot tetap dengan load/store
 skalar, direct call, indirect call, libcall/known-symbol, serta call dengan
 nol, satu, atau banyak hasil. Target dan signature call dipertahankan saat
 import/export; call convention indirect ikut disimpan. Fungsi yang memakai
-fitur di luar subset (mis. global value, dynamic stack slot, exception edge)
-ditolak dan dibiarkan apa adanya.
+fitur global value (`GlobalValueData`), dynamic stack slot/type, dan exception
+edge (`try_call`, `try_call_indirect`, `ExceptionTable`) sekarang ikut
+di-import/export. Fungsi yang memakai instruksi di luar subset tetap ditolak
+dan dibiarkan apa adanya; tidak ada round-trip parsial.
 
-Pass `RirPass` berjalan default untuk **crate executable pengguna**; crate
-standard library (`core`, `std`, `alloc`, `compiler_builtins`, `unwind`, dan
-`rustc_*`) dilewati sampai jembatannya divalidasi penuh terhadap std.
-`RAKIT_RIR=1` memaksa aktif, `RAKIT_NO_RIR=1` memaksa nonaktif.
+Pass `RirPass` berjalan default untuk **semua crate**, termasuk `core`, `std`,
+`alloc`, `compiler_builtins`, `unwind`, dan `rustc_*`. Rebuild std dengan
+`RAKIT_RIR_DEBUG=1` menunjukkan ribuan fungsi std benar-benar melewati RIR
+(bukan hanya user crate). `RAKIT_RIR=1` memaksa aktif, `RAKIT_NO_RIR=1`
+memaksa nonaktif.
 `RAKIT_RIR_FORCE=1` memaksa export ulang tanpa perubahan (untuk validasi),
 `RAKIT_RIR_DEBUG=1` mencetak keputusan per fungsi.
 
@@ -146,18 +149,17 @@ escape, store ke alamat tak dikenal, atau akses konstanta di luar batas slot.
 
 Pass `sroa` (`rakit-ir/src/sroa.rs`) mempromosikan stack slot skalar menjadi
 nilai SSA. Slot hanya dipromosikan bila alamatnya tidak escape dan semua akses
-berupa load/store skalar. Offset konstan dipromosikan per lokasi; alamat
-dinamis juga dipromosikan bila slot hanya berisi **satu elemen** dengan ukuran
-sama dengan tipe akses, karena indeks yang valid untuk slot seperti itu pasti
-nol (indeks lain adalah out-of-bounds, yaitu perilaku tak terdefinisi). Phi
-dibuat sebagai block parameter di dominance-frontier join, lalu rename pada
-dominator tree mengganti load dengan nilai SSA saat ini dan membuang store.
-Load sebelum store, akses yang saling tumpang tindih, dan indeks dinamis ke
-slot multi-elemen tidak dipromosikan. Slot yang tidak lagi punya `StackAddr`
+berupa load/store skalar dengan offset konstan; akses dinamis sengaja
+dibiarkan ke `mem_forward` karena satu slot dapat ditulis lewat satu alamat
+dinamis dan dibaca lewat alamat lain. Phi dibuat sebagai block parameter di
+dominance-frontier join, lalu rename pada dominator tree mengganti load dengan
+nilai SSA saat ini dan membuang store; nilai pengganti wajib mendominasi load.
+Pass ini sekarang **opt-in** dengan `RAKIT_RIR_SROA=1`; default mati sampai
+bukti alias untuk kode std diperkuat. Slot yang tidak lagi punya `StackAddr`
 dihapus dan slot lain dinomori ulang.
 
 RIR juga mendukung memori 16 byte lewat `Type::I128` (load/store 16 byte,
-forwarding, DSE, dan SROA). Aritmetika `I128` memakai semantik wrapping 128-bit
+forwarding, DSE, dan SROA opt-in). Aritmetika `I128` memakai semantik wrapping 128-bit
 di `int_sem::eval_bin_i128`, dan perbandingan memakai `eval_icmp_i128`; baik
 interpreter maupun folder konstan memakai jalur yang sama.
 
@@ -173,7 +175,12 @@ antarslot. Interpreter menyediakan callback `run_with` untuk call langsung dan
 tanpa menjalankan kode native.
 
 Pipeline RIR sekarang:
-`simplify → optimize → mem_forward → optimize → sroa → optimize → div_test → if_convert → gvn → licm → optimize`.
+`simplify → optimize → mem_forward → optimize → sroa → optimize → div_test → if_convert → gvn → licm → sincos → optimize`.
+
+Pass `sincos` (`rakit-ir/src/sincos.rs`) adalah port RIR dari fusi
+`sin`/`cos` → `sincos`/`sincosf`; ia menangani pasangan call dengan argumen
+identik di blok yang sama, mengganti dua hasil call dengan satu call dua hasil,
+lalu menghapus nilai lama.
 
 ## Backend instruction selection dan register allocation
 
@@ -189,14 +196,18 @@ Pipeline RIR sekarang:
   slot; hasilnya memetakan setiap `VReg` ke register fisik atau spill slot.
 - `exec.rs`: interpreter machine IR untuk membuktikan semantik hasil seleksi
   dan alokasi, termasuk jalur spill.
+- `mach::to_rir`: emitter machine IR → RIR. Setelah selector dan register
+  allocator berhasil, `RirPass` memakai emitter ini untuk mengganti RIR asal
+  dengan RIR hasil backend sebelum di-export ke CLIF.
 
-Aktifkan validasi ini dengan `RAKIT_CUSTOM_BACKEND=1`; `RirPass` akan
-menjalankan selector dan register allocator untuk setiap fungsi RIR yang
-didukung dan mencetak statistik dengan `RAKIT_RIR_DEBUG=1`. Jalur ini adalah
-pembuktian backend di belakang trait; emitter produksi masih CLIF sampai
-seluruh instruction set dan ABI selesai. Tes ada di
-`rakit-ir/tests/backend.rs` (aritmetika, branch, select, spill, penolakan
-memori/`I128`, dan object-safety trait).
+Aktifkan jalur ini dengan `RAKIT_CUSTOM_BACKEND=1`; `RirPass` menjalankan
+selector dan register allocator untuk setiap fungsi RIR yang didukung, lalu
+meng-emit RIR dari machine IR (bukan sekadar validasi). `RAKIT_RIR_DEBUG=1`
+mencetak statistik vreg/register/spill. Subset emitter saat ini adalah integer
+skalar; fungsi dengan memori, call, atau parameter blok non-entry tetap
+memakai jalur RIR langsung. Tes ada di `rakit-ir/tests/backend.rs`
+(aritmetika, branch, select, spill, penolakan memori/`I128`, object-safety
+trait, dan round-trip emitter).
 
 ## Build
 

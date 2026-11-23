@@ -17,13 +17,13 @@ type Loc = (i64, Type);
 /// A dynamic address into a one-element slot must be the element itself for
 /// defined programs: any other index is out of bounds. Such accesses are
 /// therefore promoted to the same SSA location as a constant offset zero.
-fn access_loc(func: &Function, key: Key, target: u32, ty: Type) -> Option<Loc> {
+fn access_loc(_func: &Function, key: Key, target: u32, ty: Type) -> Option<Loc> {
     match key {
         Key::Const { slot, offset } if slot == target => Some((offset, ty)),
-        Key::Dyn { slot, .. } if slot == target => {
-            let slot = func.stack_slots.get(target as usize)?;
-            (slot.size == size_of(ty)).then_some((0, ty))
-        }
+        // Dynamic indexing is left to `mem_forward`; a slot can be written
+        // through one dynamic address and read through another, so promoting
+        // it to a single SSA location is not sound in general.
+        Key::Dyn { .. } => None,
         _ => None,
     }
 }
@@ -163,8 +163,29 @@ fn promote_slot(func: &mut Function, target: u32) -> bool {
         }
     }
 
-    let mut renamer =
-        Renamer { func, defs, target, phi, phi_order, children, succ, current: HashMap::new() };
+    let mut value_block = HashMap::new();
+    for (b, block) in func.blocks.iter().enumerate() {
+        for p in &block.params {
+            value_block.insert(*p, b);
+        }
+        for inst in &block.insts {
+            if let Some(r) = inst.result_value() {
+                value_block.insert(r, b);
+            }
+        }
+    }
+    let mut renamer = Renamer {
+        func,
+        defs,
+        target,
+        phi,
+        phi_order,
+        children,
+        succ,
+        idom,
+        value_block,
+        current: HashMap::new(),
+    };
     if !renamer.block(renamer.func.entry.0 as usize) {
         return false;
     }
@@ -227,10 +248,19 @@ struct Renamer<'a> {
     phi_order: Vec<Vec<Loc>>,
     children: Vec<Vec<usize>>,
     succ: Vec<Vec<usize>>,
+    idom: Vec<Option<usize>>,
+    value_block: HashMap<Value, usize>,
     current: HashMap<Loc, Value>,
 }
 
 impl Renamer<'_> {
+    fn available(&self, value: Value, b: usize) -> bool {
+        match self.value_block.get(&value) {
+            Some(&def) => def == b || crate::cfg_util::dominates(def, b, &self.idom),
+            None => false,
+        }
+    }
+
     fn block(&mut self, b: usize) -> bool {
         let order = self.phi_order[b].clone();
         let mut saved = Vec::new();
@@ -249,6 +279,9 @@ impl Renamer<'_> {
                             let Some(value) = self.current.get(&loc).copied() else {
                                 return false;
                             };
+                            if !self.available(value, b) {
+                                return false;
+                            }
                             insts.push(Inst::Copy(*r, *ty, value));
                             continue;
                         }

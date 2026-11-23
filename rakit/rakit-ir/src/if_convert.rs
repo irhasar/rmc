@@ -280,7 +280,13 @@ fn clone_inst(func: &mut Function, inst: &Inst, map: &mut HashMap<Value, Value>)
         Inst::Bin(_, op, ty, x, y) => Inst::Bin(new, *op, *ty, remap(*x, map), remap(*y, map)),
         Inst::Icmp(_, cc, ty, x, y) => Inst::Icmp(new, *cc, *ty, remap(*x, map), remap(*y, map)),
         Inst::Fcmp(_, cc, ty, x, y) => Inst::Fcmp(new, *cc, *ty, remap(*x, map), remap(*y, map)),
-        Inst::Call(..) | Inst::CallIndirect { .. } => return None,
+        Inst::Call(..)
+        | Inst::CallIndirect { .. }
+        | Inst::TryCall { .. }
+        | Inst::TryCallIndirect { .. }
+        | Inst::GlobalValue(..)
+        | Inst::FuncAddr(..)
+        | Inst::DynamicStackAddr(..) => return None,
         Inst::Select(_, ty, c, x, y) => {
             Inst::Select(new, *ty, remap(*c, map), remap(*x, map), remap(*y, map))
         }

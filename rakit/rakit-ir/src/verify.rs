@@ -232,6 +232,63 @@ pub fn verify(func: &Function) -> Result<(), Vec<String>> {
                         }
                     }
                 }
+                Inst::GlobalValue(r, index) => {
+                    if *index as usize >= func.globals.len() {
+                        errs.push(format!("global value {index} out of range"));
+                    }
+                    if ty_of(*r) != Some(Type::I64) {
+                        errs.push(format!("global value result {r:?} is not I64"));
+                    }
+                }
+                Inst::FuncAddr(r, target) => {
+                    if *target as usize >= func.externals.len() {
+                        errs.push(format!("function address target {target} out of range"));
+                    }
+                    if ty_of(*r) != Some(Type::I64) {
+                        errs.push(format!("function address result {r:?} is not I64"));
+                    }
+                }
+                Inst::DynamicStackAddr(r, slot) => {
+                    if *slot as usize >= func.dynamic_stack_slots.len() {
+                        errs.push(format!("dynamic stack slot {slot} out of range"));
+                    }
+                    if ty_of(*r) != Some(Type::I64) {
+                        errs.push(format!("dynamic stack address {r:?} is not I64"));
+                    }
+                }
+                Inst::TryCall { results, target, args, normal, exception } => {
+                    let Some(ext) = func.externals.get(*target as usize) else {
+                        errs.push(format!("try-call target {target} out of range"));
+                        continue;
+                    };
+                    check_call_args(&mut errs, args, &ext.params, ty_of);
+                    if !results.is_empty() {
+                        errs.push("try-call has direct SSA results".to_string());
+                    }
+                    check_try_call(&mut errs, func, normal, &ext.rets, ty_of);
+                    check_exception(&mut errs, func, exception, &ext.rets, ty_of);
+                }
+                Inst::TryCallIndirect {
+                    results,
+                    params,
+                    rets,
+                    callee,
+                    args,
+                    normal,
+                    exception,
+                    ..
+                } => {
+                    if !ty_of(*callee).map(|t| matches!(t, Type::Ptr | Type::I64)).unwrap_or(false)
+                    {
+                        errs.push(format!("indirect callee {callee:?} is not a pointer"));
+                    }
+                    check_call_args(&mut errs, args, params, ty_of);
+                    if !results.is_empty() {
+                        errs.push("indirect try-call has direct SSA results".to_string());
+                    }
+                    check_try_call(&mut errs, func, normal, rets, ty_of);
+                    check_exception(&mut errs, func, exception, rets, ty_of);
+                }
                 Inst::Store(ty, addr, _, value) => {
                     if !ty_of(*addr).map(|t| t.is_int()).unwrap_or(false) {
                         errs.push(format!("store address {addr:?} is not an integer pointer"));
@@ -266,6 +323,72 @@ pub fn verify(func: &Function) -> Result<(), Vec<String>> {
     }
 
     if errs.is_empty() { Ok(()) } else { Err(errs) }
+}
+
+fn check_call_args(
+    errs: &mut Vec<String>,
+    args: &[Value],
+    params: &[Type],
+    ty_of: impl Fn(Value) -> Option<Type>,
+) {
+    if args.len() != params.len() {
+        errs.push("call argument arity mismatch".to_string());
+        return;
+    }
+    for (arg, ty) in args.iter().zip(params) {
+        if ty_of(*arg) != Some(*ty) {
+            errs.push(format!("call argument {arg:?} type mismatch"));
+        }
+    }
+}
+
+fn check_try_call(
+    errs: &mut Vec<String>,
+    func: &Function,
+    call: &crate::ir::TryBlockCall,
+    rets: &[Type],
+    ty_of: impl Fn(Value) -> Option<Type>,
+) {
+    if call.block.0 as usize >= func.num_blocks() {
+        errs.push(format!("try-call target {:?} out of range", call.block));
+        return;
+    }
+    let params = &func.block(call.block).params;
+    if params.len() != call.args.len() {
+        errs.push("try-call block argument arity mismatch".to_string());
+        return;
+    }
+    for (arg, param) in call.args.iter().zip(params) {
+        let expected = match arg {
+            crate::ir::TryArg::Value(v) => ty_of(*v),
+            crate::ir::TryArg::Ret(i) => rets.get(*i as usize).copied(),
+            crate::ir::TryArg::Exn(_) => Some(Type::I64),
+        };
+        if expected != ty_of(*param) {
+            errs.push(format!("try-call block argument {arg:?} type mismatch"));
+        }
+    }
+}
+
+fn check_exception(
+    errs: &mut Vec<String>,
+    func: &Function,
+    exception: &[crate::ir::ExceptionItem],
+    rets: &[Type],
+    ty_of: impl Fn(Value) -> Option<Type>,
+) {
+    for item in exception {
+        match item {
+            crate::ir::ExceptionItem::Tag(_, call) | crate::ir::ExceptionItem::Default(call) => {
+                check_try_call(errs, func, call, rets, &ty_of)
+            }
+            crate::ir::ExceptionItem::Context(v) => {
+                if ty_of(*v).is_none() {
+                    errs.push(format!("exception context {v:?} has no type"));
+                }
+            }
+        }
+    }
 }
 
 fn check_args(

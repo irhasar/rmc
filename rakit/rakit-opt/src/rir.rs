@@ -9,20 +9,24 @@
 use std::collections::HashMap;
 
 use rakit_codegen::ir::condcodes::{FloatCC as ClifFloatCC, IntCC as ClifIntCC};
-use rakit_codegen::ir::immediates::{Ieee32, Ieee64, Imm64};
+use rakit_codegen::ir::immediates::{Ieee32, Ieee64, Imm64, Offset32};
 use rakit_codegen::ir::{
-    AbiParam, Block as ClifBlock, BlockArg, BlockCall, ExtFuncData, ExternalName,
-    Function as ClifFunction, Inst as ClifInst, InstructionData, KnownSymbol, LibCall,
-    MemFlagsData, Opcode, Signature, StackSlot as ClifStackSlot,
+    AbiParam, Block as ClifBlock, BlockArg, BlockCall, DynamicStackSlot, DynamicStackSlotData, DynamicType,
+    DynamicTypeData,
+    ExceptionTableData, ExceptionTableItem, ExceptionTag, ExtFuncData, ExternalName,
+    Function as ClifFunction, GlobalValue, GlobalValueData, Inst as ClifInst, InstructionData,
+    KnownSymbol, LibCall, MemFlagsData, Opcode, Signature, StackSlot as ClifStackSlot,
     StackSlotData as ClifStackSlotData, StackSlotKind, Type as ClifType, UserExternalName,
     Value as ClifValue, ValueList, types,
 };
 use rakit_codegen::isa::CallConv;
 use rakit_ir::{
-    BinOp, Block as RirBlock, Builder, External as RirExternal,
+    BinOp, Block as RirBlock, Builder, DynamicSlotData, DynamicTypeData as RirDynamicTypeData,
+    ExceptionItem as RirExceptionItem, External as RirExternal,
     ExternalTarget as RirExternalTarget, FloatCc as RirFloatCc, Function as RirFunction,
-    Inst as RirInst, IntCc as RirIntCc, StackSlot as RirStackSlot, Type as RirType,
-    Value as RirValue,
+    GlobalData as RirGlobalData, Inst as RirInst, IntCc as RirIntCc,
+    StackSlot as RirStackSlot, TryArg as RirTryArg, TryBlockCall as RirTryBlockCall,
+    Type as RirType, Value as RirValue,
 };
 
 fn call_conv_to_rir(cc: CallConv) -> u8 {
@@ -52,13 +56,6 @@ fn call_conv_from_rir(value: u8) -> Option<CallConv> {
 /// Import a CLIF function into RIR, or `None` if it uses anything outside the
 /// supported scalar subset.
 pub fn import(func: &ClifFunction) -> Option<RirFunction> {
-    if func.global_values.len() != 0
-        || func.dynamic_stack_slots.len() != 0
-        || func.stack_limit.is_some()
-    {
-        return None;
-    }
-
     let entry = func.layout.entry_block()?;
     let ret: Vec<RirType> = func
         .signature
@@ -93,6 +90,28 @@ pub fn import(func: &ClifFunction) -> Option<RirFunction> {
         let rs = builder.add_stack_slot(data.size, align);
         slot_map.insert(cs, rs);
     }
+    let mut globals = Vec::with_capacity(func.global_values.len());
+    for (_, data) in func.global_values.iter() {
+        globals.push(map_global_data(func, data)?);
+    }
+    let mut dynamic_types = Vec::with_capacity(func.dfg.dynamic_types.len());
+    for (_, data) in func.dfg.dynamic_types.iter() {
+        dynamic_types.push(RirDynamicTypeData {
+            base_vector_ty: data.base_vector_ty.as_u32(),
+            dynamic_scale: data.dynamic_scale.as_u32(),
+        });
+    }
+    let mut dynamic_stack_slots = Vec::with_capacity(func.dynamic_stack_slots.len());
+    for (_, data) in func.dynamic_stack_slots.iter() {
+        if !matches!(data.kind, StackSlotKind::ExplicitDynamicSlot) {
+            return None;
+        }
+        dynamic_stack_slots.push(DynamicSlotData {
+            kind: 0,
+            dyn_ty: data.dyn_ty.as_u32(),
+        });
+    }
+    let stack_limit = func.stack_limit.map(|g| g.as_u32());
     let mut block_map: HashMap<ClifBlock, RirBlock> = HashMap::new();
     block_map.insert(entry, RirBlock(0));
 
@@ -296,6 +315,82 @@ pub fn import(func: &ClifFunction) -> Option<RirFunction> {
                         map_value(func, &mut vmap, *clif, rir);
                     }
                 }
+                InstructionData::UnaryGlobalValue { global_value, .. } => {
+                    let r = single_result(func, inst)?;
+                    let v = builder.global_value(rb, global_value.as_u32());
+                    map_value(func, &mut vmap, r, v);
+                }
+                InstructionData::FuncAddr { opcode: Opcode::FuncAddr, func_ref } => {
+                    let r = single_result(func, inst)?;
+                    let target = external_index(func, &mut externals, &func.dfg.ext_funcs[func_ref])?;
+                    let v = builder.func_addr(rb, target);
+                    map_value(func, &mut vmap, r, v);
+                }
+                InstructionData::DynamicStackAddr {
+                    opcode: Opcode::DynamicStackAddr,
+                    dynamic_stack_slot,
+                } => {
+                    let r = single_result(func, inst)?;
+                    let v = builder.dynamic_stack_addr(rb, dynamic_stack_slot.as_u32());
+                    map_value(func, &mut vmap, r, v);
+                }
+                InstructionData::TryCall { func_ref, args, exception, .. } => {
+                    let ext_data = &func.dfg.ext_funcs[func_ref];
+                    let target = external_index(func, &mut externals, ext_data)?;
+                    let args = args
+                        .as_slice(&func.dfg.value_lists)
+                        .iter()
+                        .map(|v| lookup(func, &vmap, *v))
+                        .collect::<Option<Vec<_>>>()?;
+                    let results: Vec<_> = func.dfg.inst_results(inst).to_vec();
+                    let table = &func.dfg.exception_tables[exception];
+                    let rets = func.dfg.signatures[table.signature()]
+                        .returns
+                        .iter()
+                        .map(|p| map_type_to_rir(p.value_type))
+                        .collect::<Option<Vec<_>>>()?;
+                    let normal = map_try_block(func, table.normal_return(), &vmap, &block_map)?;
+                    let exception = map_exception(func, table, &vmap, &block_map)?;
+                    let rir_results = builder.try_call(rb, target, args, rets, normal, exception);
+                    for (clif, rir) in results.iter().zip(rir_results) {
+                        map_value(func, &mut vmap, *clif, rir);
+                    }
+                }
+                InstructionData::TryCallIndirect { args, exception, .. } => {
+                    let all = args.as_slice(&func.dfg.value_lists);
+                    let callee = lookup(func, &vmap, all[0])?;
+                    let call_args = all[1..]
+                        .iter()
+                        .map(|v| lookup(func, &vmap, *v))
+                        .collect::<Option<Vec<_>>>()?;
+                    let results: Vec<_> = func.dfg.inst_results(inst).to_vec();
+                    let table = &func.dfg.exception_tables[exception];
+                    let rets = func.dfg.signatures[table.signature()]
+                        .returns
+                        .iter()
+                        .map(|p| map_type_to_rir(p.value_type))
+                        .collect::<Option<Vec<_>>>()?;
+                    let params = func.dfg.signatures[table.signature()]
+                        .params
+                        .iter()
+                        .map(|p| map_type_to_rir(p.value_type))
+                        .collect::<Option<Vec<_>>>()?;
+                    let normal = map_try_block(func, table.normal_return(), &vmap, &block_map)?;
+                    let exception = map_exception(func, table, &vmap, &block_map)?;
+                    let rir_results = builder.try_call_indirect(
+                        rb,
+                        params,
+                        rets,
+                        call_conv_to_rir(func.dfg.signatures[table.signature()].call_conv),
+                        callee,
+                        call_args,
+                        normal,
+                        exception,
+                    );
+                    for (clif, rir) in results.iter().zip(rir_results) {
+                        map_value(func, &mut vmap, *clif, rir);
+                    }
+                }
                 InstructionData::Jump { destination, .. } => {
                     let target = *block_map.get(&destination.block(&func.dfg.value_lists))?;
                     let args = block_args(func, &destination, &vmap)?;
@@ -325,6 +420,10 @@ pub fn import(func: &ClifFunction) -> Option<RirFunction> {
 
     let mut out = builder.into_func();
     out.externals = externals;
+    out.globals = globals;
+    out.dynamic_types = dynamic_types;
+    out.dynamic_stack_slots = dynamic_stack_slots;
+    out.stack_limit = stack_limit;
     rakit_ir::verify(&out).ok()?;
     Some(out)
 }
@@ -375,6 +474,46 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<ClifFunction> {
         };
         let data = ExtFuncData { name, signature: sig_ref, colocated: false, patchable: false };
         call_refs.push(func.import_function(data));
+    }
+
+    for global in &rir.globals {
+        let data = match global {
+            RirGlobalData::VMContext => GlobalValueData::VMContext,
+            RirGlobalData::Load { base, offset, ty, .. } => GlobalValueData::Load {
+                base: GlobalValue::from_u32(*base),
+                offset: Offset32::try_from_i64(*offset)?,
+                global_type: map_type_to_clif(*ty)?,
+                flags: func.dfg.mem_flags.insert_unchecked(MemFlagsData::trusted()),
+            },
+            RirGlobalData::IAddImm { base, offset, ty } => GlobalValueData::IAddImm {
+                base: GlobalValue::from_u32(*base),
+                offset: Imm64::new(*offset),
+                global_type: map_type_to_clif(*ty)?,
+            },
+            RirGlobalData::Symbol { target, offset, colocated, tls } => GlobalValueData::Symbol {
+                name: external_name(&mut func, target)?,
+                offset: Imm64::new(*offset),
+                colocated: *colocated,
+                tls: *tls,
+            },
+            RirGlobalData::DynScaleTargetConst { vector_type } => {
+                GlobalValueData::DynScaleTargetConst {
+                    vector_type: ClifType::from_bits(*vector_type),
+                }
+            }
+        };
+        func.create_global_value(data);
+    }
+    func.stack_limit = rir.stack_limit.map(GlobalValue::from_u32);
+    for ty in &rir.dynamic_types {
+        let base = ClifType::from_bits(ty.base_vector_ty);
+        let scale = GlobalValue::from_u32(ty.dynamic_scale);
+        func.dfg.dynamic_types.push(DynamicTypeData::new(base, scale));
+    }
+    for slot in &rir.dynamic_stack_slots {
+        let dyn_ty = DynamicType::from_u32(slot.dyn_ty);
+        let data = DynamicStackSlotData::new(StackSlotKind::ExplicitDynamicSlot, dyn_ty);
+        func.create_dynamic_stack_slot(data);
     }
 
     let mut slot_map: Vec<ClifStackSlot> = Vec::with_capacity(rir.stack_slots.len());
@@ -607,6 +746,107 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<ClifFunction> {
                         vmap.insert(*rir, clif);
                     }
                 }
+                RirInst::GlobalValue(r, index) => {
+                    let opcode = match rir.globals.get(*index as usize)? {
+                        RirGlobalData::Symbol { tls: true, .. } => Opcode::TlsValue,
+                        _ => Opcode::SymbolValue,
+                    };
+                    let ci = func.dfg.make_inst(InstructionData::UnaryGlobalValue {
+                        opcode,
+                        global_value: GlobalValue::from_u32(*index),
+                    });
+                    if func.dfg.make_inst_results(ci, types::I64) != 1 {
+                        return None;
+                    }
+                    func.layout.append_inst(ci, cb);
+                    vmap.insert(*r, func.dfg.inst_results(ci)[0]);
+                }
+                RirInst::FuncAddr(r, target) => {
+                    let func_ref = *call_refs.get(*target as usize)?;
+                    let ci = func.dfg.make_inst(InstructionData::FuncAddr {
+                        opcode: Opcode::FuncAddr,
+                        func_ref,
+                    });
+                    if func.dfg.make_inst_results(ci, types::I64) != 1 {
+                        return None;
+                    }
+                    func.layout.append_inst(ci, cb);
+                    vmap.insert(*r, func.dfg.inst_results(ci)[0]);
+                }
+                RirInst::DynamicStackAddr(r, slot) => {
+                    let dynamic_stack_slot = func
+                        .dynamic_stack_slots
+                        .get(DynamicStackSlot::from_u32(*slot))
+                        .map(|_| DynamicStackSlot::from_u32(*slot))?;
+                    let ci = func.dfg.make_inst(InstructionData::DynamicStackAddr {
+                        opcode: Opcode::DynamicStackAddr,
+                        dynamic_stack_slot,
+                    });
+                    if func.dfg.make_inst_results(ci, types::I64) != 1 {
+                        return None;
+                    }
+                    func.layout.append_inst(ci, cb);
+                    vmap.insert(*r, func.dfg.inst_results(ci)[0]);
+                }
+                RirInst::TryCall { results, target, args, normal, exception } => {
+                    let func_ref = *call_refs.get(*target as usize)?;
+                    let mut list = ValueList::default();
+                    for v in args {
+                        list.push(*vmap.get(v)?, &mut func.dfg.value_lists);
+                    }
+                    let normal = export_try_block(&mut func, normal, &vmap, &block_map)?;
+                    let items = export_exception(&mut func, exception, &vmap, &block_map)?;
+                    let sig_ref = func.dfg.ext_funcs[func_ref].signature;
+                    let table = ExceptionTableData::new(sig_ref, normal, items);
+                    let exception = func.dfg.exception_tables.push(table);
+                    let ci = func.dfg.make_inst(InstructionData::TryCall {
+                        opcode: Opcode::TryCall,
+                        args: list,
+                        func_ref,
+                        exception,
+                    });
+                    if !results.is_empty() {
+                        return None;
+                    }
+                    func.layout.append_inst(ci, cb);
+                }
+                RirInst::TryCallIndirect {
+                    results,
+                    params,
+                    rets,
+                    call_conv,
+                    callee,
+                    args,
+                    normal,
+                    exception,
+                } => {
+                    let mut callee_sig = Signature::new(call_conv_from_rir(*call_conv)?);
+                    for ty in params {
+                        callee_sig.params.push(AbiParam::new(map_type_to_clif(*ty)?));
+                    }
+                    for ty in rets {
+                        callee_sig.returns.push(AbiParam::new(map_type_to_clif(*ty)?));
+                    }
+                    let sig_ref = func.import_signature(callee_sig);
+                    let mut list = ValueList::default();
+                    list.push(*vmap.get(callee)?, &mut func.dfg.value_lists);
+                    for arg in args {
+                        list.push(*vmap.get(arg)?, &mut func.dfg.value_lists);
+                    }
+                    let normal = export_try_block(&mut func, normal, &vmap, &block_map)?;
+                    let items = export_exception(&mut func, exception, &vmap, &block_map)?;
+                    let table = ExceptionTableData::new(sig_ref, normal, items);
+                    let exception = func.dfg.exception_tables.push(table);
+                    let ci = func.dfg.make_inst(InstructionData::TryCallIndirect {
+                        opcode: Opcode::TryCallIndirect,
+                        args: list,
+                        exception,
+                    });
+                    if !results.is_empty() {
+                        return None;
+                    }
+                    func.layout.append_inst(ci, cb);
+                }
                 RirInst::Jump(target, args) => {
                     let bc = make_block_call(&mut func, block_map[target.0 as usize], args, &vmap)?;
                     let ci = func
@@ -703,6 +943,178 @@ fn make_block_call(
     let barg: Vec<BlockArg> =
         args.iter().map(|v| vmap.get(v).copied().map(BlockArg::Value)).collect::<Option<_>>()?;
     Some(BlockCall::new(target, barg, &mut func.dfg.value_lists))
+}
+
+fn external_name(func: &mut ClifFunction, target: &RirExternalTarget) -> Option<ExternalName> {
+    Some(match target {
+        RirExternalTarget::User { namespace, index } => {
+            let name_ref =
+                func.params.ensure_user_func_name(UserExternalName::new(*namespace, *index));
+            ExternalName::User(name_ref)
+        }
+        RirExternalTarget::LibCall(name) => ExternalName::LibCall(name.parse::<LibCall>().ok()?),
+        RirExternalTarget::KnownSymbol(name) => {
+            ExternalName::KnownSymbol(name.parse::<KnownSymbol>().ok()?)
+        }
+    })
+}
+
+fn export_try_arg(
+    arg: &RirTryArg,
+    vmap: &HashMap<RirValue, ClifValue>,
+) -> Option<BlockArg> {
+    Some(match arg {
+        RirTryArg::Value(v) => BlockArg::Value(*vmap.get(v)?),
+        RirTryArg::Ret(i) => BlockArg::TryCallRet(*i),
+        RirTryArg::Exn(i) => BlockArg::TryCallExn(*i),
+    })
+}
+
+fn export_try_block(
+    func: &mut ClifFunction,
+    call: &RirTryBlockCall,
+    vmap: &HashMap<RirValue, ClifValue>,
+    block_map: &[ClifBlock],
+) -> Option<BlockCall> {
+    let block = *block_map.get(call.block.0 as usize)?;
+    let args = call
+        .args
+        .iter()
+        .map(|arg| export_try_arg(arg, vmap))
+        .collect::<Option<Vec<_>>>()?;
+    Some(BlockCall::new(block, args, &mut func.dfg.value_lists))
+}
+
+fn export_exception(
+    func: &mut ClifFunction,
+    exception: &[RirExceptionItem],
+    vmap: &HashMap<RirValue, ClifValue>,
+    block_map: &[ClifBlock],
+) -> Option<Vec<ExceptionTableItem>> {
+    exception
+        .iter()
+        .map(|item| {
+            Some(match item {
+                RirExceptionItem::Tag(tag, call) => ExceptionTableItem::Tag(
+                    ExceptionTag::with_number(*tag)?,
+                    export_try_block(func, call, vmap, block_map)?,
+                ),
+                RirExceptionItem::Default(call) => {
+                    ExceptionTableItem::Default(export_try_block(func, call, vmap, block_map)?)
+                }
+                RirExceptionItem::Context(v) => {
+                    ExceptionTableItem::Context(*vmap.get(v)?)
+                }
+            })
+        })
+        .collect()
+}
+
+fn map_external_target(func: &ClifFunction, name: ExternalName) -> Option<RirExternalTarget> {
+    Some(match name {
+        ExternalName::User(name_ref) => {
+            let name = &func.params.user_named_funcs()[name_ref];
+            RirExternalTarget::User { namespace: name.namespace, index: name.index }
+        }
+        ExternalName::LibCall(call) => RirExternalTarget::LibCall(call.to_string()),
+        ExternalName::KnownSymbol(symbol) => RirExternalTarget::KnownSymbol(symbol.to_string()),
+        _ => return None,
+    })
+}
+
+fn external_index(
+    func: &ClifFunction,
+    externals: &mut Vec<RirExternal>,
+    ext_data: &ExtFuncData,
+) -> Option<u32> {
+    let callee = &func.dfg.signatures[ext_data.signature];
+    let params = callee
+        .params
+        .iter()
+        .map(|p| map_type_to_rir(p.value_type))
+        .collect::<Option<Vec<_>>>()?;
+    let rets = callee
+        .returns
+        .iter()
+        .map(|p| map_type_to_rir(p.value_type))
+        .collect::<Option<Vec<_>>>()?;
+    let external = RirExternal { target: map_external_target(func, ext_data.name.clone())?, params, rets };
+    Some(match externals.iter().position(|e| *e == external) {
+        Some(i) => i as u32,
+        None => {
+            externals.push(external);
+            (externals.len() - 1) as u32
+        }
+    })
+}
+
+fn map_global_data(func: &ClifFunction, data: &GlobalValueData) -> Option<RirGlobalData> {
+    Some(match data {
+        GlobalValueData::VMContext => RirGlobalData::VMContext,
+        GlobalValueData::Load { base, offset, global_type, .. } => RirGlobalData::Load {
+            base: base.as_u32(),
+            offset: (*offset).into(),
+            ty: map_type_to_rir(*global_type)?,
+            flags: 0,
+        },
+        GlobalValueData::IAddImm { base, offset, global_type } => RirGlobalData::IAddImm {
+            base: base.as_u32(),
+            offset: offset.bits(),
+            ty: map_type_to_rir(*global_type)?,
+        },
+        GlobalValueData::Symbol { name, offset, colocated, tls } => RirGlobalData::Symbol {
+            target: map_external_target(func, name.clone())?,
+            offset: offset.bits(),
+            colocated: *colocated,
+            tls: *tls,
+        },
+        GlobalValueData::DynScaleTargetConst { vector_type } => {
+            RirGlobalData::DynScaleTargetConst { vector_type: vector_type.bits() }
+        }
+    })
+}
+
+fn map_try_arg(func: &ClifFunction, arg: BlockArg, vmap: &HashMap<ClifValue, RirValue>) -> Option<RirTryArg> {
+    Some(match arg {
+        BlockArg::Value(v) => RirTryArg::Value(lookup(func, vmap, v)?),
+        BlockArg::TryCallRet(i) => RirTryArg::Ret(i),
+        BlockArg::TryCallExn(i) => RirTryArg::Exn(i),
+    })
+}
+
+fn map_try_block(
+    func: &ClifFunction,
+    call: &BlockCall,
+    vmap: &HashMap<ClifValue, RirValue>,
+    block_map: &HashMap<ClifBlock, RirBlock>,
+) -> Option<RirTryBlockCall> {
+    let block = *block_map.get(&call.block(&func.dfg.value_lists))?;
+    let args = call
+        .args(&func.dfg.value_lists)
+        .map(|arg| map_try_arg(func, arg, vmap))
+        .collect::<Option<Vec<_>>>()?;
+    Some(RirTryBlockCall { block, args })
+}
+
+fn map_exception(
+    func: &ClifFunction,
+    table: &ExceptionTableData,
+    vmap: &HashMap<ClifValue, RirValue>,
+    block_map: &HashMap<ClifBlock, RirBlock>,
+) -> Option<Vec<RirExceptionItem>> {
+    let mut out = Vec::new();
+    for item in table.items() {
+        out.push(match item {
+            ExceptionTableItem::Tag(tag, call) => {
+                RirExceptionItem::Tag(tag.as_u32(), map_try_block(func, &call, vmap, block_map)?)
+            }
+            ExceptionTableItem::Default(call) => {
+                RirExceptionItem::Default(map_try_block(func, &call, vmap, block_map)?)
+            }
+            ExceptionTableItem::Context(v) => RirExceptionItem::Context(lookup(func, vmap, v)?),
+        });
+    }
+    Some(out)
 }
 
 fn map_type_to_rir(t: ClifType) -> Option<RirType> {
@@ -1087,6 +1499,117 @@ mod tests {
         let out = export(&rir, &f.signature).expect("export");
         let rir2 = import(&out).expect("re-import");
         assert_eq!(run(&rir2, &[]).unwrap(), vec![Val::F64(4.0)]);
+    }
+
+
+    #[test]
+    fn global_value_roundtrip() {
+        let (mut f, e) = new_func(&[], &[types::I64]);
+        let name_ref = f.params.ensure_user_func_name(UserExternalName::new(0, 41));
+        let global = f.create_global_value(GlobalValueData::Symbol {
+            name: ExternalName::User(name_ref),
+            offset: Imm64::new(4),
+            colocated: false,
+            tls: false,
+        });
+        let inst = f.dfg.make_inst(InstructionData::UnaryGlobalValue {
+            opcode: Opcode::SymbolValue,
+            global_value: global,
+        });
+        assert_eq!(f.dfg.make_inst_results(inst, types::I64), 1);
+        f.layout.append_inst(inst, e);
+        let value = f.dfg.inst_results(inst)[0];
+        ret(&mut f, e, &[value]);
+
+        let rir = import(&f).expect("import global");
+        assert_eq!(rir.globals.len(), 1);
+        assert!(rir.blocks[0].insts.iter().any(|i| matches!(i, RirInst::GlobalValue(..))));
+        let out = export(&rir, &f.signature).expect("export global");
+        let rir2 = import(&out).expect("re-import global");
+        assert_eq!(rir2.globals, rir.globals);
+        assert_eq!(rir2.externals, rir.externals);
+    }
+
+    #[test]
+    fn dynamic_stack_roundtrip() {
+        let (mut f, e) = new_func(&[], &[types::I64]);
+        let scale = f.create_global_value(GlobalValueData::VMContext);
+        let dyn_ty = f
+            .dfg
+            .dynamic_types
+            .push(DynamicTypeData::new(types::I8X16, scale));
+        let slot = f.create_dynamic_stack_slot(DynamicStackSlotData::new(
+            StackSlotKind::ExplicitDynamicSlot,
+            dyn_ty,
+        ));
+        let inst = f.dfg.make_inst(InstructionData::DynamicStackAddr {
+            opcode: Opcode::DynamicStackAddr,
+            dynamic_stack_slot: slot,
+        });
+        assert_eq!(f.dfg.make_inst_results(inst, types::I64), 1);
+        f.layout.append_inst(inst, e);
+        let value = f.dfg.inst_results(inst)[0];
+        ret(&mut f, e, &[value]);
+
+        let rir = import(&f).expect("import dynamic stack");
+        assert_eq!(rir.dynamic_stack_slots.len(), 1);
+        assert_eq!(rir.dynamic_types.len(), 1);
+        let out = export(&rir, &f.signature).expect("export dynamic stack");
+        let rir2 = import(&out).expect("re-import dynamic stack");
+        assert_eq!(rir2.dynamic_stack_slots, rir.dynamic_stack_slots);
+        assert_eq!(rir2.dynamic_types, rir.dynamic_types);
+    }
+
+    #[test]
+    fn try_call_roundtrip() {
+        let (mut f, e) = new_func(&[], &[types::I64]);
+        let mut callee = Signature::new(CallConv::SystemV);
+        callee.returns.push(AbiParam::new(types::I64));
+        let sig_ref = f.import_signature(callee);
+        let name_ref = f.params.ensure_user_func_name(UserExternalName::new(0, 42));
+        let func_ref = f.import_function(ExtFuncData {
+            name: ExternalName::User(name_ref),
+            signature: sig_ref,
+            colocated: false,
+            patchable: false,
+        });
+        let normal = new_block(&mut f, &[types::I64]);
+        let exception_block = new_block(&mut f, &[types::I64]);
+        let normal_call = BlockCall::new(
+            normal,
+            [BlockArg::TryCallRet(0)],
+            &mut f.dfg.value_lists,
+        );
+        let exception_call = BlockCall::new(
+            exception_block,
+            [BlockArg::TryCallExn(0)],
+            &mut f.dfg.value_lists,
+        );
+        let table = ExceptionTableData::new(
+            sig_ref,
+            normal_call,
+            [ExceptionTableItem::Default(exception_call)],
+        );
+        let exception_table = f.dfg.exception_tables.push(table);
+        let inst = f.dfg.make_inst(InstructionData::TryCall {
+            opcode: Opcode::TryCall,
+            args: ValueList::default(),
+            func_ref,
+            exception: exception_table,
+        });
+        assert_eq!(f.dfg.make_inst_results(inst, types::I64), 0);
+        f.layout.append_inst(inst, e);
+        let normal_param = f.dfg.block_params(normal)[0];
+        ret(&mut f, normal, &[normal_param]);
+        let exception_param = f.dfg.block_params(exception_block)[0];
+        ret(&mut f, exception_block, &[exception_param]);
+
+        let rir = import(&f).expect("import try call");
+        assert!(rir.blocks[0].insts.iter().any(|i| matches!(i, RirInst::TryCall { .. })));
+        let out = export(&rir, &f.signature).expect("export try call");
+        let rir2 = import(&out).expect("re-import try call");
+        assert_eq!(rir2.externals, rir.externals);
+        assert!(rir2.blocks[0].insts.iter().any(|i| matches!(i, RirInst::TryCall { .. })));
     }
 
     #[test]

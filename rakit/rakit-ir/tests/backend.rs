@@ -1,6 +1,6 @@
 use rakit_ir::backend::exec::run as run_machine;
 use rakit_ir::backend::isel::RirSelector;
-use rakit_ir::backend::mach::Operand;
+use rakit_ir::backend::mach::{Operand, to_rir};
 use rakit_ir::backend::regalloc::LinearScan;
 use rakit_ir::backend::{InstructionSelector, RegisterAllocator};
 use rakit_ir::ir::{BinOp, IntCc, Type};
@@ -52,6 +52,11 @@ fn selects_and_allocates_arithmetic() {
     let mach = select_alloc(&f);
     assert_eq!(run_machine(&mach, &[5, 3]).unwrap(), Some(13));
     assert_eq!(expected, vec![Val::I(13)]);
+
+    let prealloc = RirSelector.select(&f).unwrap();
+    let emitted = to_rir(&prealloc).expect("machine emitter");
+    assert!(verify(&emitted).is_ok());
+    assert_eq!(run(&emitted, &[Val::I(5), Val::I(3)]).unwrap(), vec![Val::I(13)]);
 }
 
 #[test]
@@ -89,6 +94,10 @@ fn selects_branch_and_runs_both_arms() {
     assert_eq!(run_machine(&mach, &[3, 9]).unwrap(), Some(3));
     assert_eq!(run_machine(&mach, &[9, 3]).unwrap(), Some(3));
     assert_eq!(run(&f, &[Val::I(3), Val::I(9)]).unwrap(), vec![Val::I(3)]);
+    let prealloc = RirSelector.select(&f).unwrap();
+    let emitted = to_rir(&prealloc).expect("machine emitter");
+    assert!(verify(&emitted).is_ok(), "{:?}", verify(&emitted));
+    assert_eq!(run(&emitted, &[Val::I(3), Val::I(9)]).unwrap(), vec![Val::I(3)]);
 }
 
 #[test]

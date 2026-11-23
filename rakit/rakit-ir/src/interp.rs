@@ -199,6 +199,11 @@ fn eval(env: &[Option<Val>], inst: &Inst, mem: &mut [u8], bases: &[usize]) -> Re
         Inst::Copy(_, _, x) => get(env, *x),
         Inst::Call(..) => Err("external call is not supported by the interpreter".to_string()),
         Inst::CallIndirect { .. } => Err("indirect call is not supported by eval".to_string()),
+        Inst::TryCall { .. } => Err("try-call is not supported by eval".to_string()),
+        Inst::TryCallIndirect { .. } => Err("indirect try-call is not supported by eval".to_string()),
+        Inst::GlobalValue(..) => Err("global value is not supported by eval".to_string()),
+        Inst::FuncAddr(..) => Err("function address is not supported by eval".to_string()),
+        Inst::DynamicStackAddr(..) => Err("dynamic stack address is not supported by eval".to_string()),
         Inst::Bin(_, op, ty, x, y) => eval_bin(*op, *ty, get(env, *x)?, get(env, *y)?),
         Inst::Icmp(_, cc, ty, x, y) => {
             let a = get(env, *x)?;

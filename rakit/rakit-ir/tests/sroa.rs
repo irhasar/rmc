@@ -182,7 +182,7 @@ fn promotes_i128_slot() {
 }
 
 #[test]
-fn promotes_dynamic_one_element_slot() {
+fn does_not_promote_dynamic_one_element_slot() {
     let mut b = Builder::new(vec![Type::I64], vec![Type::I64]);
     let e = b.func().entry;
     let x = b.func().block(e).params[0];
@@ -197,10 +197,9 @@ fn promotes_dynamic_one_element_slot() {
     b.ret(e, vec![y]);
 
     let mut f = b.into_func();
-    assert!(sroa::run(&mut f));
+    assert!(!sroa::run(&mut f));
     assert!(verify(&f).is_ok(), "{:?}", verify(&f).err());
-    assert!(f.stack_slots.is_empty());
-    assert_eq!(run(&f, &[Val::I(37)]).unwrap(), vec![Val::I(37)]);
+    assert_eq!(f.stack_slots.len(), 1);
 }
 
 #[test]
