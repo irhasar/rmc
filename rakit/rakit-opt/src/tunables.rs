@@ -38,12 +38,12 @@ pub fn custom_backend_enabled() -> bool {
     *V.get_or_init(|| !flag("RAKIT_NO_CUSTOM_BACKEND"))
 }
 
-/// Whether RIR SROA runs.  It is opt-in because the dynamic-address and
-/// cross-block promotion cases still need a stronger alias proof on std code;
-/// `RAKIT_RIR_SROA=1` enables it for experiments.
+/// Whether RIR SROA runs.  The default tier promotes only whole scalar slots
+/// in straight-line leaf functions; `RAKIT_NO_RIR_SROA=1` disables it for
+/// bisecting and `RAKIT_RIR_SROA=1` remains accepted for compatibility.
 pub fn rir_sroa_enabled() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| flag("RAKIT_RIR_SROA"))
+    *V.get_or_init(|| !flag("RAKIT_NO_RIR_SROA"))
 }
 
 /// Whether RIR `rec_loop` runs (`RAKIT_NO_RIR_REC_LOOP` off).

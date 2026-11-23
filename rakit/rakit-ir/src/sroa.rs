@@ -153,6 +153,13 @@ fn promote_slot(func: &mut Function, target: u32) -> bool {
     if keys.is_empty() || access_blocks.iter().any(|b| !reachable.contains(b)) {
         return false;
     }
+    // Keep the first promotion tier to a whole scalar slot.  Sub-slot and
+    // aggregate promotion needs a field-sensitive proof that std slice
+    // patterns exposed as unsound.
+    let slot_size = func.stack_slots[target as usize].size;
+    if keys.iter().any(|&(offset, ty)| offset != 0 || size_of(ty) != slot_size) {
+        return false;
+    }
     // Cross-block promotion needs a complete must-store proof at every phi
     // edge.  Until that is in place, keep SROA to straight-line blocks; the
     // std slice-pattern suite exposed a cross-block case this pass got wrong.
