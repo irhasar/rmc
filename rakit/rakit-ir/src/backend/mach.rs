@@ -288,6 +288,9 @@ pub struct MachFunction {
     pub blocks: Vec<MachBlock>,
     /// Entry parameters, still virtual until register allocation.
     pub params: Vec<VReg>,
+    /// Non-entry block parameters, in target-block order.  Edge blocks
+    /// materialise these with moves so the machine IR stays phi-free.
+    pub block_params: Vec<Vec<VReg>>,
     /// Allocated location for each entry parameter.
     pub param_locs: Vec<Operand>,
     pub ret: Option<Type>,
@@ -331,9 +334,16 @@ pub fn to_rir(mach: &MachFunction) -> Result<Function, String> {
         func.values.push(*ty);
         vmap.insert(vreg, value);
     }
-    for _ in 1..mach.blocks.len() {
+    for i in 1..mach.blocks.len() {
+        let params = mach
+            .block_params
+            .get(i)
+            .into_iter()
+            .flatten()
+            .map(|v| vmap.get(v).copied().ok_or("bad block parameter vreg"))
+            .collect::<Result<Vec<_>, _>>()?;
         let b = Block(func.blocks.len() as u32);
-        func.blocks.push(BlockData { params: Vec::new(), insts: Vec::new() });
+        func.blocks.push(BlockData { params, insts: Vec::new() });
         debug_assert_eq!(b.0 as usize, func.blocks.len() - 1);
     }
 
@@ -361,6 +371,15 @@ pub fn to_rir(mach: &MachFunction) -> Result<Function, String> {
         let rb = Block(bi as u32);
         let mut pending_cmp: Option<(Operand, Operand)> = None;
         let mut skip_next_jmp = false;
+        let target_params = match block.insts.last() {
+            Some(MachInst::Jmp { target }) => mach
+                .block_params
+                .get(*target)
+                .cloned()
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let mut edge_args: Vec<Value> = Vec::new();
         for (ii, inst) in block.insts.iter().enumerate() {
             if skip_next_jmp {
                 skip_next_jmp = false;
@@ -369,6 +388,12 @@ pub fn to_rir(mach: &MachFunction) -> Result<Function, String> {
             match inst {
                 MachInst::Cmp { lhs, rhs } => pending_cmp = Some((*lhs, *rhs)),
                 MachInst::Mov { dst, src } => {
+                    if let Operand::VReg(d) = dst {
+                        if target_params.contains(d) {
+                            edge_args.push(value_of(&mut func, rb, &vmap, *src)?);
+                            continue;
+                        }
+                    }
                     let d = value_of(&mut func, rb, &vmap, *dst)?;
                     let ty = func.ty(d);
                     match *src {
@@ -445,7 +470,15 @@ pub fn to_rir(mach: &MachFunction) -> Result<Function, String> {
                     ));
                 }
                 MachInst::Jmp { target } => {
-                    func.blocks[bi].insts.push(Inst::Jump(Block(*target as u32), Vec::new()));
+                    let args = if target_params.is_empty() {
+                        Vec::new()
+                    } else {
+                        if edge_args.len() != target_params.len() {
+                            return Err("edge block parameter arity".to_string());
+                        }
+                        edge_args.clone()
+                    };
+                    func.blocks[bi].insts.push(Inst::Jump(Block(*target as u32), args));
                 }
                 MachInst::Ret { value } => {
                     let value = match value {
@@ -531,6 +564,7 @@ impl MachFunction {
         Self {
             blocks: Vec::new(),
             params: Vec::new(),
+            block_params: Vec::new(),
             param_locs: Vec::new(),
             ret,
             vregs: Vec::new(),
@@ -563,6 +597,7 @@ impl MachFunction {
     pub fn add_block(&mut self) -> usize {
         let b = self.blocks.len();
         self.blocks.push(MachBlock::default());
+        self.block_params.push(Vec::new());
         b
     }
 

@@ -79,7 +79,7 @@ pub fn import(func: &CgFunction) -> Option<RirFunction> {
         }
     }
 
-    let mut builder = Builder::new(ret, entry_params);
+    let mut builder = Builder::new(ret.clone(), entry_params);
     let mut externals: Vec<RirExternal> = Vec::new();
     let mut slot_map: HashMap<CgStackSlot, RirStackSlot> = HashMap::new();
     for (cs, data) in func.sized_stack_slots.iter() {
@@ -142,13 +142,16 @@ pub fn import(func: &CgFunction) -> Option<RirFunction> {
     }
 
     for b in func.layout.blocks() {
-        let rb = *block_map.get(&b)?;
+        let mut rb = *block_map.get(&b)?;
         for inst in func.layout.block_insts(b) {
             let data = func.dfg.insts[inst];
             match data {
                 InstructionData::UnaryImm { opcode: Opcode::Iconst, imm } => {
                     let r = single_result(func, inst)?;
                     let ty = map_type_to_rir(func.dfg.value_type(r))?;
+                    if ty == RirType::I128 {
+                        return None;
+                    }
                     let v = builder.iconst(rb, ty, imm.bits());
                     map_value(func, &mut vmap, r, v);
                 }
@@ -163,28 +166,55 @@ pub fn import(func: &CgFunction) -> Option<RirFunction> {
                     map_value(func, &mut vmap, r, v);
                 }
                 InstructionData::Unary { opcode, arg } => {
-                    let op = map_unop(opcode)?;
                     let r = single_result(func, inst)?;
                     let ty = map_type_to_rir(func.dfg.value_type(r))?;
-                    let x = lookup(func, &vmap, arg)?;
-                    let v = builder.unary(rb, op, ty, x);
+                    let x = as_int(&mut builder, rb, lookup(func, &vmap, arg)?, ty);
+                    let v = if opcode == Opcode::Ineg {
+                        let zero = builder.iconst(rb, ty, 0);
+                        builder.bin(rb, BinOp::Sub, ty, zero, x)
+                    } else {
+                        let op = map_unop(opcode)?;
+                        builder.unary(rb, op, ty, x)
+                    };
                     map_value(func, &mut vmap, r, v);
                 }
                 InstructionData::Binary { opcode, args } => {
-                    let op = map_binop(opcode)?;
                     let r = single_result(func, inst)?;
                     let ty = map_type_to_rir(func.dfg.value_type(r))?;
-                    let x = lookup(func, &vmap, args[0])?;
-                    let y = lookup(func, &vmap, args[1])?;
-                    let v = builder.bin(rb, op, ty, x, y);
+                    let x = as_int(&mut builder, rb, lookup(func, &vmap, args[0])?, ty);
+                    let y = if matches!(opcode, Opcode::Umin | Opcode::Umax) {
+                        as_int(&mut builder, rb, lookup(func, &vmap, args[1])?, ty)
+                    } else {
+                        let op = map_binop(opcode)?;
+                        if matches!(op, BinOp::Shl | BinOp::Shr | BinOp::Ushr) {
+                            as_width(&mut builder, rb, lookup(func, &vmap, args[1])?, ty, false)
+                        } else {
+                            as_int(&mut builder, rb, lookup(func, &vmap, args[1])?, ty)
+                        }
+                    };
+                    let v = match opcode {
+                        Opcode::Umin => {
+                            let c = builder.icmp(rb, RirIntCc::Ult, ty, x, y);
+                            builder.select(rb, ty, c, x, y)
+                        }
+                        Opcode::Umax => {
+                            let c = builder.icmp(rb, RirIntCc::Ugt, ty, x, y);
+                            builder.select(rb, ty, c, x, y)
+                        }
+                        _ => {
+                            let op = map_binop(opcode)?;
+                            builder.bin(rb, op, ty, x, y)
+                        }
+                    };
                     map_value(func, &mut vmap, r, v);
                 }
                 InstructionData::IntCompare { opcode: Opcode::Icmp, args, cond } => {
                     let cc = map_intcc(cond)?;
                     let r = single_result(func, inst)?;
                     let ty = map_type_to_rir(func.dfg.value_type(args[0]))?;
-                    let x = lookup(func, &vmap, args[0])?;
-                    let y = lookup(func, &vmap, args[1])?;
+                    let signed = matches!(cc, RirIntCc::Slt | RirIntCc::Sle | RirIntCc::Sgt | RirIntCc::Sge);
+                    let x = as_int(&mut builder, rb, lookup(func, &vmap, args[0])?, ty);
+                    let y = as_width(&mut builder, rb, lookup(func, &vmap, args[1])?, ty, signed);
                     let v = builder.icmp(rb, cc, ty, x, y);
                     map_value(func, &mut vmap, r, v);
                 }
@@ -201,8 +231,8 @@ pub fn import(func: &CgFunction) -> Option<RirFunction> {
                     let r = single_result(func, inst)?;
                     let ty = map_type_to_rir(func.dfg.value_type(r))?;
                     let c = as_bool(&mut builder, rb, lookup(func, &vmap, args[0])?);
-                    let x = lookup(func, &vmap, args[1])?;
-                    let y = lookup(func, &vmap, args[2])?;
+                    let x = as_int(&mut builder, rb, lookup(func, &vmap, args[1])?, ty);
+                    let y = as_int(&mut builder, rb, lookup(func, &vmap, args[2])?, ty);
                     let v = builder.select(rb, ty, c, x, y);
                     map_value(func, &mut vmap, r, v);
                 }
@@ -227,15 +257,15 @@ pub fn import(func: &CgFunction) -> Option<RirFunction> {
                     map_value(func, &mut vmap, r, v);
                 }
                 InstructionData::Store { opcode: Opcode::Store, args, offset, .. } => {
-                    let value = lookup(func, &vmap, args[0])?;
-                    let addr = lookup(func, &vmap, args[1])?;
                     let ty = map_type_to_rir(func.dfg.value_type(args[0]))?;
+                    let value = as_int(&mut builder, rb, lookup(func, &vmap, args[0])?, ty);
+                    let addr = lookup(func, &vmap, args[1])?;
                     builder.store(rb, ty, addr, offset.into(), value);
                 }
                 InstructionData::StoreNoOffset { opcode: Opcode::Store, args, .. } => {
-                    let value = lookup(func, &vmap, args[0])?;
-                    let addr = lookup(func, &vmap, args[1])?;
                     let ty = map_type_to_rir(func.dfg.value_type(args[0]))?;
+                    let value = as_int(&mut builder, rb, lookup(func, &vmap, args[0])?, ty);
+                    let addr = lookup(func, &vmap, args[1])?;
                     builder.store(rb, ty, addr, 0, value);
                 }
                 InstructionData::Call { func_ref, args, .. } => {
@@ -262,7 +292,7 @@ pub fn import(func: &CgFunction) -> Option<RirFunction> {
                         }
                         _ => return None,
                     };
-                    let external = RirExternal { target, params, rets };
+                    let external = RirExternal { target, params: params.clone(), rets: rets.clone() };
                     let target = match externals.iter().position(|e| *e == external) {
                         Some(i) => i as u32,
                         None => {
@@ -273,7 +303,10 @@ pub fn import(func: &CgFunction) -> Option<RirFunction> {
                     let args = args
                         .as_slice(&func.dfg.value_lists)
                         .iter()
-                        .map(|v| lookup(func, &vmap, *v))
+                        .zip(&params)
+                        .map(|(v, ty)| {
+                            lookup(func, &vmap, *v).map(|v| as_int(&mut builder, rb, v, *ty))
+                        })
                         .collect::<Option<Vec<_>>>()?;
                     let results: Vec<_> = func.dfg.inst_results(inst).to_vec();
                     let rets = results
@@ -288,15 +321,18 @@ pub fn import(func: &CgFunction) -> Option<RirFunction> {
                 InstructionData::CallIndirect { sig_ref, args, .. } => {
                     let callee = args.as_slice(&func.dfg.value_lists)[0];
                     let callee = lookup(func, &vmap, callee)?;
-                    let call_args = args.as_slice(&func.dfg.value_lists)[1..]
-                        .iter()
-                        .map(|v| lookup(func, &vmap, *v))
-                        .collect::<Option<Vec<_>>>()?;
                     let callee_sig = &func.dfg.signatures[sig_ref];
                     let params = callee_sig
                         .params
                         .iter()
                         .map(|p| map_type_to_rir(p.value_type))
+                        .collect::<Option<Vec<_>>>()?;
+                    let call_args = args.as_slice(&func.dfg.value_lists)[1..]
+                        .iter()
+                        .zip(&params)
+                        .map(|(v, ty)| {
+                            lookup(func, &vmap, *v).map(|v| as_int(&mut builder, rb, v, *ty))
+                        })
                         .collect::<Option<Vec<_>>>()?;
                     let rets = callee_sig
                         .returns
@@ -399,24 +435,66 @@ pub fn import(func: &CgFunction) -> Option<RirFunction> {
                         map_value(func, &mut vmap, *cg, rir);
                     }
                 }
+                InstructionData::CondTrap { opcode, arg, code } => {
+                    let ty = map_type_to_rir(func.dfg.value_type(arg))?;
+                    let x = as_int(&mut builder, rb, lookup(func, &vmap, arg)?, ty);
+                    let zero = builder.iconst(rb, ty, 0);
+                    let cc = match opcode {
+                        Opcode::Trapz => RirIntCc::Eq,
+                        Opcode::Trapnz => RirIntCc::Ne,
+                        _ => return None,
+                    };
+                    let cond = builder.icmp(rb, cc, ty, x, zero);
+                    let trap_block = builder.add_block(Vec::new());
+                    let cont_block = builder.add_block(Vec::new());
+                    builder.brif(rb, cond, trap_block, Vec::new(), cont_block, Vec::new());
+                    builder.trap(trap_block, code.as_raw().get());
+                    rb = cont_block;
+                }
+                InstructionData::BranchTable { arg, table, .. } => {
+                    let ty = map_type_to_rir(func.dfg.value_type(arg))?;
+                    let discr = lookup(func, &vmap, arg)?;
+                    let table = &func.dfg.jump_tables[table];
+                    let default = table.default_block();
+                    let default_block = *block_map.get(&default.block(&func.dfg.value_lists))?;
+                    let default_args =
+                        typed_block_args(func, &default, &vmap, &mut builder, rb, default_block)?;
+                    let entries = table.as_slice().to_vec();
+                    let mut current = rb;
+                    for (index, entry) in entries.iter().enumerate() {
+                        let target = *block_map.get(&entry.block(&func.dfg.value_lists))?;
+                        let args = typed_block_args(func, entry, &vmap, &mut builder, current, target)?;
+                        let value = builder.iconst(current, ty, index as i64);
+                        let cond = builder.icmp(current, RirIntCc::Eq, ty, discr, value);
+                        let next = builder.add_block(Vec::new());
+                        builder.brif(current, cond, target, args, next, Vec::new());
+                        current = next;
+                    }
+                    builder.jump(current, default_block, default_args);
+                }
                 InstructionData::Jump { destination, .. } => {
                     let target = *block_map.get(&destination.block(&func.dfg.value_lists))?;
-                    let args = block_args(func, &destination, &vmap)?;
+                    let args = typed_block_args(func, &destination, &vmap, &mut builder, rb, target)?;
                     builder.jump(rb, target, args);
                 }
                 InstructionData::Brif { arg, blocks, .. } => {
                     let c = as_bool(&mut builder, rb, lookup(func, &vmap, arg)?);
                     let then_block = *block_map.get(&blocks[0].block(&func.dfg.value_lists))?;
-                    let then_args = block_args(func, &blocks[0], &vmap)?;
+                    let then_args =
+                        typed_block_args(func, &blocks[0], &vmap, &mut builder, rb, then_block)?;
                     let else_block = *block_map.get(&blocks[1].block(&func.dfg.value_lists))?;
-                    let else_args = block_args(func, &blocks[1], &vmap)?;
+                    let else_args =
+                        typed_block_args(func, &blocks[1], &vmap, &mut builder, rb, else_block)?;
                     builder.brif(rb, c, then_block, then_args, else_block, else_args);
                 }
                 InstructionData::MultiAry { opcode: Opcode::Return, args } => {
                     let vals = args
                         .as_slice(&func.dfg.value_lists)
                         .iter()
-                        .map(|v| lookup(func, &vmap, *v))
+                        .zip(&ret)
+                        .map(|(v, ty)| {
+                            lookup(func, &vmap, *v).map(|v| as_int(&mut builder, rb, v, *ty))
+                        })
                         .collect::<Option<Vec<_>>>()?;
                     builder.ret(rb, vals);
                 }
@@ -454,7 +532,18 @@ pub fn import(func: &CgFunction) -> Option<RirFunction> {
     out.dynamic_types = dynamic_types;
     out.dynamic_stack_slots = dynamic_stack_slots;
     out.stack_limit = stack_limit;
-    rakit_ir::verify(&out).ok()?;
+    if std::env::var_os("RAKIT_NO_RIR_IMPORT_VERIFY").is_none() {
+        if let Err(errors) = rakit_ir::verify(&out) {
+            if std::env::var_os("RAKIT_RIR_IMPORT_DEBUG").is_some() {
+                eprintln!("[rir] import verify failed in {:?}: {errors:?}", func.name);
+            }
+            if std::env::var_os("RAKIT_RIR_IMPORT_DUMP").is_some() {
+                eprintln!("[rir] CLIF\n{}", func.display());
+                eprintln!("[rir] RIR\n{out:?}");
+            }
+            return None;
+        }
+    }
     Some(out)
 }
 
@@ -593,6 +682,13 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<CgFunction> {
                     vmap.insert(*r, func.dfg.inst_results(ci)[0]);
                 }
                 RirInst::Iconst(r, ty, v) => {
+                    if !matches!(
+                        ty,
+                        RirType::I8 | RirType::I16 | RirType::I32 | RirType::I64
+                            | RirType::Bool | RirType::Ptr
+                    ) {
+                        return None;
+                    }
                     let ct = map_type_to_cg(*ty)?;
                     let ci = func.dfg.make_inst(InstructionData::UnaryImm {
                         opcode: Opcode::Iconst,
@@ -944,6 +1040,48 @@ fn as_bool(builder: &mut Builder, block: RirBlock, v: RirValue) -> RirValue {
     }
 }
 
+fn int_bits(ty: RirType) -> Option<u32> {
+    Some(match ty {
+        RirType::I8 => 8,
+        RirType::I16 => 16,
+        RirType::I32 => 32,
+        RirType::I64 | RirType::Ptr => 64,
+        RirType::I128 => 128,
+        RirType::Bool => 1,
+        RirType::F32 | RirType::F64 => return None,
+    })
+}
+
+fn as_width(builder: &mut Builder, block: RirBlock, v: RirValue, ty: RirType, signed: bool) -> RirValue {
+    let src = builder.func().ty(v);
+    if src == ty || !src.is_int() || !ty.is_int() {
+        return v;
+    }
+    let (Some(from), Some(to)) = (int_bits(src), int_bits(ty)) else {
+        return v;
+    };
+    if from < to {
+        let op = if signed { RirUnOp::Sextend } else { RirUnOp::Uextend };
+        builder.unary(block, op, ty, v)
+    } else if from > to {
+        builder.unary(block, RirUnOp::Ireduce, ty, v)
+    } else {
+        v
+    }
+}
+
+fn as_int(builder: &mut Builder, block: RirBlock, v: RirValue, ty: RirType) -> RirValue {
+    if builder.func().ty(v) == ty {
+        return v;
+    }
+    if builder.func().ty(v) == RirType::Bool && ty.is_int() {
+        let one = builder.iconst(block, ty, 1);
+        let zero = builder.iconst(block, ty, 0);
+        return builder.select(block, ty, v, one, zero);
+    }
+    as_width(builder, block, v, ty, false)
+}
+
 fn map_value(
     func: &CgFunction,
     vmap: &mut HashMap<CgValue, RirValue>,
@@ -981,6 +1119,33 @@ fn block_args(
             _ => None,
         })
         .collect()
+}
+
+fn typed_block_args(
+    func: &CgFunction,
+    bc: &BlockCall,
+    vmap: &HashMap<CgValue, RirValue>,
+    builder: &mut Builder,
+    rb: RirBlock,
+    target: RirBlock,
+) -> Option<Vec<RirValue>> {
+    let params = builder.func().block(target).params.clone();
+    let args = bc.args(&func.dfg.value_lists).collect::<Vec<_>>();
+    if args.len() != params.len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(args.len());
+    for (arg, param) in args.iter().zip(params) {
+        let BlockArg::Value(v) = arg else { return None };
+        let v = lookup(func, vmap, *v)?;
+        let ty = builder.func().ty(param);
+        out.push(if ty == RirType::Bool {
+            as_bool(builder, rb, v)
+        } else {
+            as_int(builder, rb, v, ty)
+        });
+    }
+    Some(out)
 }
 
 fn make_block_call(
@@ -1166,6 +1331,129 @@ fn map_exception(
     Some(out)
 }
 
+/// Best-effort reason for `import` rejecting a function.  Used by
+/// `RAKIT_RIR_STATS` diagnostics, never for correctness decisions.
+pub fn unsupported_reason(func: &CgFunction) -> String {
+    for p in func.signature.returns.iter().chain(func.signature.params.iter()) {
+        if map_type_to_rir(p.value_type).is_none() {
+            return format!("signature type {}", p.value_type);
+        }
+    }
+    let entry = match func.layout.entry_block() {
+        Some(entry) => entry,
+        None => return "no entry block".to_string(),
+    };
+    if func.signature.params.len() != func.dfg.block_params(entry).len() {
+        return "signature/entry parameter count".to_string();
+    }
+    for (_, data) in func.sized_stack_slots.iter() {
+        if !matches!(data.kind, StackSlotKind::ExplicitSlot) {
+            return format!("stack slot kind {:?}", data.kind);
+        }
+    }
+    for (_, data) in func.dynamic_stack_slots.iter() {
+        if !matches!(data.kind, StackSlotKind::ExplicitDynamicSlot) {
+            return format!("dynamic slot kind {:?}", data.kind);
+        }
+    }
+    for (_, data) in func.global_values.iter() {
+        if map_global_data(func, data).is_none() {
+            return "global data".to_string();
+        }
+    }
+    for b in func.layout.blocks() {
+        for v in func.dfg.block_params(b) {
+            let ty = func.dfg.value_type(*v);
+            if map_type_to_rir(ty).is_none() {
+                return format!("block param type {ty}");
+            }
+        }
+    }
+    for b in func.layout.blocks() {
+        for inst in func.layout.block_insts(b) {
+            for r in func.dfg.inst_results(inst) {
+                let ty = func.dfg.value_type(*r);
+                if map_type_to_rir(ty).is_none() {
+                    return format!("result type {ty}");
+                }
+            }
+            match func.dfg.insts[inst] {
+                InstructionData::UnaryImm { opcode: Opcode::Iconst, .. } => {
+                    if let Some(r) = func.dfg.inst_results(inst).first() {
+                        if map_type_to_rir(func.dfg.value_type(*r)) == Some(RirType::I128) {
+                            return "i128 constant".to_string();
+                        }
+                    }
+                }
+                InstructionData::Call { func_ref, .. } => {
+                    let ext = &func.dfg.ext_funcs[func_ref];
+                    let sig = &func.dfg.signatures[ext.signature];
+                    if sig.params.iter().chain(sig.returns.iter()).any(|p| map_type_to_rir(p.value_type).is_none()) {
+                        return "call signature type".to_string();
+                    }
+                    if map_external_target(func, ext.name.clone()).is_none() {
+                        return "call external target".to_string();
+                    }
+                }
+                InstructionData::CallIndirect { sig_ref, .. } => {
+                    let sig = &func.dfg.signatures[sig_ref];
+                    if sig.params.iter().chain(sig.returns.iter()).any(|p| map_type_to_rir(p.value_type).is_none()) {
+                        return "indirect signature type".to_string();
+                    }
+                }
+                InstructionData::TryCall { func_ref, .. } => {
+                    let ext = &func.dfg.ext_funcs[func_ref];
+                    let sig = &func.dfg.signatures[ext.signature];
+                    if sig.params.iter().chain(sig.returns.iter()).any(|p| map_type_to_rir(p.value_type).is_none()) {
+                        return "try call signature type".to_string();
+                    }
+                }
+                InstructionData::Store { args, .. } | InstructionData::StoreNoOffset { args, .. } => {
+                    let ty = func.dfg.value_type(args[0]);
+                    if map_type_to_rir(ty).is_none() {
+                        return format!("store type {ty}");
+                    }
+                }
+                InstructionData::Unary { arg, .. } => {
+                    let ty = func.dfg.value_type(arg);
+                    if map_type_to_rir(ty).is_none() {
+                        return format!("unary operand type {ty}");
+                    }
+                }
+                InstructionData::Unary { opcode, .. }
+                    if opcode != Opcode::Ineg && map_unop(opcode).is_none() =>
+                {
+                    return format!("unary {opcode}");
+                }
+                InstructionData::Binary { opcode, .. }
+                    if !matches!(opcode, Opcode::Umin | Opcode::Umax)
+                        && map_binop(opcode).is_none() =>
+                {
+                    return format!("binary {opcode}");
+                }
+                InstructionData::Ternary { opcode, .. } if opcode != Opcode::Select => {
+                    return format!("ternary {opcode}");
+                }
+                InstructionData::MultiAry { opcode, .. } if opcode != Opcode::Return => {
+                    return format!("multiary {opcode}");
+                }
+                InstructionData::UnaryConst { opcode, .. } => return format!("const {opcode}"),
+                InstructionData::BinaryImm8 { opcode, .. } => return format!("imm8 {opcode}"),
+                InstructionData::TernaryImm8 { opcode, .. } => return format!("ternary imm8 {opcode}"),
+                InstructionData::Shuffle { opcode, .. } => return format!("shuffle {opcode}"),
+                InstructionData::AtomicCas { opcode, .. }
+                | InstructionData::AtomicRmw { opcode, .. } => return format!("atomic {opcode}"),
+                InstructionData::IntAddTrap { opcode, .. } => return format!("add trap {opcode}"),
+                InstructionData::ExceptionHandlerAddress { opcode, .. } => {
+                    return format!("exception address {opcode}");
+                }
+                _ => {}
+            }
+        }
+    }
+    "unsupported signature/type".to_string()
+}
+
 fn map_type_to_rir(t: CgType) -> Option<RirType> {
     Some(if t == types::I8 {
         RirType::I8
@@ -1209,6 +1497,10 @@ fn map_unop(op: Opcode) -> Option<RirUnOp> {
         Opcode::Bitcast => RirUnOp::Bitcast,
         Opcode::Fpromote => RirUnOp::Fpromote,
         Opcode::Fdemote => RirUnOp::Fdemote,
+        Opcode::FcvtFromSint => RirUnOp::FcvtFromInt,
+        Opcode::FcvtToSint => RirUnOp::FcvtToInt,
+        Opcode::FcvtFromUint => RirUnOp::FcvtFromUint,
+        Opcode::FcvtToUint => RirUnOp::FcvtToUint,
         _ => return None,
     })
 }
@@ -1222,6 +1514,10 @@ fn map_unop_to_cg(op: RirUnOp) -> Option<Opcode> {
         RirUnOp::Bitcast => Opcode::Bitcast,
         RirUnOp::Fpromote => Opcode::Fpromote,
         RirUnOp::Fdemote => Opcode::Fdemote,
+        RirUnOp::FcvtFromInt => Opcode::FcvtFromSint,
+        RirUnOp::FcvtToInt => Opcode::FcvtToSint,
+        RirUnOp::FcvtFromUint => Opcode::FcvtFromUint,
+        RirUnOp::FcvtToUint => Opcode::FcvtToUint,
         _ => return None,
     })
 }
@@ -1558,6 +1854,55 @@ mod tests {
         let out = export(&rir, &f.signature).expect("export");
         let rir2 = import(&out).expect("re-import");
         assert_eq!(run(&rir2, &[]).unwrap(), vec![Val::I(1)]);
+    }
+
+    #[test]
+    fn bool_truthy_integer_use_roundtrip() {
+        let (mut f, e) = new_func(&[], &[types::I8]);
+        let a = iconst(&mut f, e, types::I64, 5);
+        let b = iconst(&mut f, e, types::I64, 3);
+        let cond = icmp(&mut f, e, IntCC::SignedGreaterThan, a, b);
+        let one = iconst(&mut f, e, types::I8, 1);
+        let sum = bin(&mut f, e, Opcode::Iadd, types::I8, cond, one);
+        ret(&mut f, e, &[sum]);
+
+        let mut rir = import(&f).expect("import bool truthy");
+        assert_eq!(run(&rir, &[]).unwrap(), vec![Val::I(2)]);
+        assert!(rakit_ir::optimize(&mut rir));
+        let out = export(&rir, &f.signature).expect("export bool truthy");
+        let rir2 = import(&out).expect("re-import bool truthy");
+        assert_eq!(run(&rir2, &[]).unwrap(), vec![Val::I(2)]);
+    }
+
+    #[test]
+    fn shift_amount_width_roundtrip() {
+        let (mut f, e) = new_func(&[], &[types::I64]);
+        let x = iconst(&mut f, e, types::I64, 8);
+        let y = iconst(&mut f, e, types::I32, 3);
+        let shifted = bin(&mut f, e, Opcode::Ishl, types::I64, x, y);
+        ret(&mut f, e, &[shifted]);
+
+        let rir = import(&f).expect("import shift width");
+        assert_eq!(run(&rir, &[]).unwrap(), vec![Val::I(64)]);
+        let out = export(&rir, &f.signature).expect("export shift width");
+        let rir2 = import(&out).expect("re-import shift width");
+        assert_eq!(run(&rir2, &[]).unwrap(), vec![Val::I(64)]);
+    }
+
+    #[test]
+    fn branch_arg_width_coercion_roundtrip() {
+        let (mut f, e) = new_func(&[], &[types::I64]);
+        let target = new_block(&mut f, &[types::I64]);
+        let small = iconst(&mut f, e, types::I32, 7);
+        jump(&mut f, e, target, &[small]);
+        let param = f.dfg.block_params(target)[0];
+        ret(&mut f, target, &[param]);
+
+        let rir = import(&f).expect("import branch width");
+        assert_eq!(run(&rir, &[]).unwrap(), vec![Val::I(7)]);
+        let out = export(&rir, &f.signature).expect("export branch width");
+        let rir2 = import(&out).expect("re-import branch width");
+        assert_eq!(run(&rir2, &[]).unwrap(), vec![Val::I(7)]);
     }
 
     #[test]

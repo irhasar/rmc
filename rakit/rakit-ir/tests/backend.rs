@@ -179,3 +179,45 @@ fn i128_arithmetic_and_compare() {
     assert_eq!(run(&f, &[Val::I128(5), Val::I128(9)]).unwrap(), vec![Val::B(true)]);
     assert_eq!(run(&f, &[Val::I128(9), Val::I128(5)]).unwrap(), vec![Val::B(false)]);
 }
+
+#[test]
+fn selects_block_parameters_and_branch_arguments() {
+    let mut b = Builder::new(vec![Type::I64], vec![Type::I64]);
+    let e = b.func().entry;
+    let x = b.func().block(e).params[0];
+    let join = b.add_block(vec![Type::I64]);
+    b.jump(e, join, vec![x]);
+    let p = b.func().block(join).params[0];
+    b.ret(join, vec![p]);
+    let f = b.into_func();
+    assert!(verify(&f).is_ok());
+
+    let mach = select_alloc(&f);
+    assert_eq!(run_machine(&mach, &[41]).unwrap(), Some(41));
+    let emitted = to_rir(&RirSelector.select(&f).unwrap()).expect("machine emitter");
+    assert!(verify(&emitted).is_ok(), "{:?}", verify(&emitted));
+    assert_eq!(run(&emitted, &[Val::I(41)]).unwrap(), vec![Val::I(41)]);
+
+    let mut b = Builder::new(vec![Type::I64], vec![Type::I64]);
+    let e = b.func().entry;
+    let x = b.func().block(e).params[0];
+    let then = b.add_block(vec![Type::I64]);
+    let otherwise = b.add_block(vec![Type::I64]);
+    let zero = b.iconst(e, Type::I64, 0);
+    let cond = b.icmp(e, IntCc::Slt, Type::I64, x, zero);
+    b.brif(e, cond, then, vec![zero], otherwise, vec![x]);
+    let tp = b.func().block(then).params[0];
+    let ep = b.func().block(otherwise).params[0];
+    b.ret(then, vec![tp]);
+    b.ret(otherwise, vec![ep]);
+    let f = b.into_func();
+    assert!(verify(&f).is_ok());
+
+    let mach = select_alloc(&f);
+    assert_eq!(run_machine(&mach, &[5]).unwrap(), Some(5));
+    assert_eq!(run_machine(&mach, &[-5]).unwrap(), Some(0));
+    let emitted = to_rir(&RirSelector.select(&f).unwrap()).expect("machine emitter");
+    assert!(verify(&emitted).is_ok(), "{:?}", verify(&emitted));
+    assert_eq!(run(&emitted, &[Val::I(5)]).unwrap(), vec![Val::I(5)]);
+    assert_eq!(run(&emitted, &[Val::I(-5)]).unwrap(), vec![Val::I(0)]);
+}

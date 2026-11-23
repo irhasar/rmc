@@ -50,6 +50,7 @@ impl Pass for RirPass<'_> {
             return false;
         }
         let debug = std::env::var_os("RAKIT_RIR_DEBUG").is_some();
+        let stats_mode = std::env::var_os("RAKIT_RIR_STATS").is_some();
         let dump_match = std::env::var("RAKIT_RIR_DUMP").ok();
         let dump = dump_match.as_ref().is_some_and(|m| {
             format!("{:?}", pctx.ctx.func.name).contains(m)
@@ -58,7 +59,7 @@ impl Pass for RirPass<'_> {
             eprintln!("[rir] IN {:?}\n{}", pctx.ctx.func.name, pctx.ctx.func.display());
         }
         let Some(mut rir_func) = crate::rir::import(&pctx.ctx.func) else {
-            if debug {
+            if debug || stats_mode {
                 eprintln!(
                     "[rir] skip {:?}: globals={} sized={} dyn={} stack_limit={}",
                     pctx.ctx.func.name,
@@ -67,6 +68,11 @@ impl Pass for RirPass<'_> {
                     pctx.ctx.func.dynamic_stack_slots.len(),
                     pctx.ctx.func.stack_limit.is_some(),
                 );
+                if stats_mode {
+                    eprintln!("[rir] skip reason: {}", crate::rir::unsupported_reason(&pctx.ctx.func));
+                }
+            }
+            if debug {
                 eprintln!("{}", pctx.ctx.func.display());
             }
             return false;
@@ -229,7 +235,7 @@ impl Pass for RirPass<'_> {
                     // The selector could not represent this function.  Keep the
                     // existing RIR/CLIF body; re-exporting a copied RIR body is
                     // not a production emitter and can lose bridge-only details.
-                    if debug {
+                    if debug || stats_mode {
                         eprintln!("[rir] custom isel fallback");
                     }
                 }
@@ -240,7 +246,7 @@ impl Pass for RirPass<'_> {
                             Ok(emitted) if rakit_ir::verify(&emitted).is_ok() => {
                                 rir_func = emitted;
                                 changed = true;
-                                if debug {
+                                if debug || stats_mode {
                                     eprintln!(
                                         "[rir] custom backend emitted: {} vregs, {} regs, {} spills",
                                         stats.vregs, stats.registers, stats.spills
@@ -286,11 +292,30 @@ impl Pass for RirPass<'_> {
         let Some(mut new_func) = crate::rir::export(&rir_func, &sig) else {
             return false;
         };
+        let flags = rakit_codegen::settings::Flags::new(rakit_codegen::settings::builder());
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rakit_codegen::verify_function(&new_func, &flags)
+        }));
+        match verified {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                if debug || stats_mode {
+                    eprintln!("[rir] export verify failed in {:?}: {err:?}", pctx.ctx.func.name);
+                }
+                return false;
+            }
+            Err(_) => {
+                if debug || stats_mode {
+                    eprintln!("[rir] export verifier panicked in {:?}", pctx.ctx.func.name);
+                }
+                return false;
+            }
+        }
         new_func.name = pctx.ctx.func.name.clone();
         if dump {
             eprintln!("[rir] OUT {:?}\n{}", pctx.ctx.func.name, new_func.display());
         }
-        if std::env::var_os("RAKIT_RIR_DEBUG").is_some() {
+        if debug || stats_mode {
             let what = if changed { "optimized" } else { "roundtrip" };
             eprintln!("[rir] {} {:?}", what, pctx.ctx.func.name);
         }
@@ -307,7 +332,9 @@ impl Pass for RecLoopPass {
     }
 
     fn run(&mut self, pctx: &mut PassCtx<'_>) -> bool {
-        rec_loop::run(&mut pctx.ctx.func);
+        if std::env::var_os("RAKIT_NO_REC_LOOP").is_none() {
+            rec_loop::run(&mut pctx.ctx.func);
+        }
         true
     }
 }
@@ -375,7 +402,9 @@ impl Pass for SincosPass {
     }
 
     fn run(&mut self, pctx: &mut PassCtx<'_>) -> bool {
-        sincos::run(&mut *pctx.module, &mut pctx.ctx.func);
+        if std::env::var_os("RAKIT_NO_SINCOS").is_none() {
+            sincos::run(&mut *pctx.module, &mut pctx.ctx.func);
+        }
         true
     }
 }

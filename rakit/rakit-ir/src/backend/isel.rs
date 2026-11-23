@@ -25,9 +25,6 @@ impl RirSelector {
         if func.ret.len() > 1 {
             return Err(unsupported("multiple return values"));
         }
-        if func.blocks.iter().skip(1).any(|block| !block.params.is_empty()) {
-            return Err(unsupported("non-entry block parameters"));
-        }
 
         let ret = func.ret.first().copied();
         let mut mach = MachFunction::new(ret);
@@ -49,6 +46,18 @@ impl RirSelector {
             let vreg = mach.add_vreg(ty);
             mach.params.push(vreg);
             vmap.insert(*param, vreg);
+        }
+        for (bi, block) in func.blocks.iter().enumerate() {
+            if bi == func.entry.0 as usize {
+                continue;
+            }
+            for param in &block.params {
+                let ty = func.ty(*param);
+                check_scalar(ty)?;
+                let vreg = mach.add_vreg(ty);
+                vmap.insert(*param, vreg);
+                mach.block_params[bi].push(vreg);
+            }
         }
 
         for (bi, block) in func.blocks.iter().enumerate() {
@@ -111,18 +120,27 @@ impl RirSelector {
                         icmp_defs.insert(*r, (*cc, lhs, rhs));
                     }
                     Inst::Brif(cond, then, then_args, otherwise, else_args) => {
-                        if !then_args.is_empty() || !else_args.is_empty() {
-                            return Err(unsupported("branch block arguments"));
-                        }
-                        let then = then.0 as usize;
-                        let otherwise = otherwise.0 as usize;
-                        if then == otherwise {
-                            mach.blocks[bi].insts.push(MachInst::Jmp { target: then });
+                        let then_target = edge_target(
+                            &mut mach,
+                            &vmap,
+                            func,
+                            *then,
+                            then_args,
+                        )?;
+                        let else_target = edge_target(
+                            &mut mach,
+                            &vmap,
+                            func,
+                            *otherwise,
+                            else_args,
+                        )?;
+                        if then_target == else_target {
+                            mach.blocks[bi].insts.push(MachInst::Jmp { target: then_target });
                             continue;
                         }
                         if let Some((cc, lhs, rhs)) = icmp_defs.get(cond) {
                             mach.blocks[bi].insts.push(MachInst::Cmp { lhs: *lhs, rhs: *rhs });
-                            mach.blocks[bi].insts.push(MachInst::Jcc { cc: *cc, target: then });
+                            mach.blocks[bi].insts.push(MachInst::Jcc { cc: *cc, target: then_target });
                         } else {
                             let cond = operand(&vmap, *cond)?;
                             mach.blocks[bi]
@@ -130,15 +148,13 @@ impl RirSelector {
                                 .push(MachInst::Cmp { lhs: cond, rhs: Operand::Imm(0) });
                             mach.blocks[bi]
                                 .insts
-                                .push(MachInst::Jcc { cc: IntCc::Ne, target: then });
+                                .push(MachInst::Jcc { cc: IntCc::Ne, target: then_target });
                         }
-                        mach.blocks[bi].insts.push(MachInst::Jmp { target: otherwise });
+                        mach.blocks[bi].insts.push(MachInst::Jmp { target: else_target });
                     }
                     Inst::Jump(target, args) => {
-                        if !args.is_empty() {
-                            return Err(unsupported("jump block arguments"));
-                        }
-                        mach.blocks[bi].insts.push(MachInst::Jmp { target: target.0 as usize });
+                        let target = edge_target(&mut mach, &vmap, func, *target, args)?;
+                        mach.blocks[bi].insts.push(MachInst::Jmp { target });
                     }
                     Inst::Return(args) => {
                         if args.len() > 1 {
@@ -300,6 +316,30 @@ impl RirSelector {
 
         Ok(mach)
     }
+}
+
+fn edge_target(
+    mach: &mut MachFunction,
+    vmap: &HashMap<Value, VReg>,
+    func: &Function,
+    target: crate::ir::Block,
+    args: &[Value],
+) -> Result<usize, BackendError> {
+    if args.is_empty() {
+        return Ok(target.0 as usize);
+    }
+    let params = &func.block(target).params;
+    if params.len() != args.len() {
+        return Err(unsupported("branch argument arity"));
+    }
+    let edge = mach.add_block();
+    for (param, arg) in params.iter().zip(args) {
+        let dst = *vmap.get(param).ok_or_else(|| unsupported("missing block parameter"))?;
+        let src = operand(vmap, *arg)?;
+        mach.blocks[edge].insts.push(MachInst::Mov { dst: Operand::VReg(dst), src });
+    }
+    mach.blocks[edge].insts.push(MachInst::Jmp { target: target.0 as usize });
+    Ok(edge)
 }
 
 fn disabled(name: &str) -> bool {

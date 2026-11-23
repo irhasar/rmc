@@ -558,7 +558,10 @@ fn codegen_fn_body(fx: &mut FunctionCx<'_, '_, '_>, start_block: Block) {
                     // (i128/f128 bit patterns) has to keep the jump table.
                     const SMALL_SWITCH: usize = 8;
                     let narrow = fx.bcx.func.dfg.value_type(discr).bits() <= 64;
-                    if narrow && targets.iter().count() <= SMALL_SWITCH {
+                    if narrow
+                        && targets.iter().count() <= SMALL_SWITCH
+                        && std::env::var_os("RAKIT_NO_SMALL_SWITCH").is_none()
+                    {
                         let cases: Vec<_> =
                             targets.iter().map(|(v, b)| (v, fx.get_block(b))).collect();
                         if let Some((last, init)) = cases.split_last() {

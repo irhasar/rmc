@@ -126,6 +126,7 @@ impl CargoProject {
 
         cmd.env("RUSTC", &compiler.rustc);
         cmd.env("RUSTDOC", &compiler.rustdoc);
+        cmd.env("RAKIT_HOST_LLVM", "1");
         rustflags_to_cmd_env(&mut cmd, "RUSTFLAGS", &compiler.rustflags);
         rustflags_to_cmd_env(&mut cmd, "RUSTDOCFLAGS", &compiler.rustdocflags);
         if !compiler.runner.is_empty() {
