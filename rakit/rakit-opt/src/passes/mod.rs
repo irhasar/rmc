@@ -71,8 +71,16 @@ impl Pass for RirPass<'_> {
             }
             return false;
         };
-        let simplify_changed = rakit_ir::simplify::run(&mut rir_func);
-        let opt_changed = rakit_ir::optimize(&mut rir_func);
+        let simplify_changed = if std::env::var_os("RAKIT_NO_RIR_SIMPLIFY").is_some() {
+            false
+        } else {
+            rakit_ir::simplify::run(&mut rir_func)
+        };
+        let opt_changed = if std::env::var_os("RAKIT_NO_RIR_OPT").is_some() {
+            false
+        } else {
+            rakit_ir::optimize(&mut rir_func)
+        };
         let mut changed = simplify_changed || opt_changed;
         if simplify_changed {
             if !verified(&rir_func, "simplify", debug) {
@@ -120,7 +128,11 @@ impl Pass for RirPass<'_> {
                 eprintln!("[rir] inliner fired");
             }
         }
-        let mem_changed = rakit_ir::mem_forward::run(&mut rir_func);
+        let mem_changed = if std::env::var_os("RAKIT_NO_RIR_MEM").is_some() {
+            false
+        } else {
+            rakit_ir::mem_forward::run(&mut rir_func)
+        };
         if mem_changed {
             rakit_ir::optimize(&mut rir_func);
             changed = true;
@@ -165,7 +177,11 @@ impl Pass for RirPass<'_> {
         if debug && ifconv_changed {
             eprintln!("[rir] if_convert fired");
         }
-        let gvn_changed = rakit_ir::gvn::run(&mut rir_func);
+        let gvn_changed = if std::env::var_os("RAKIT_NO_RIR_GVN").is_some() {
+            false
+        } else {
+            rakit_ir::gvn::run(&mut rir_func)
+        };
         if gvn_changed {
             rakit_ir::optimize(&mut rir_func);
             changed = true;
@@ -176,7 +192,11 @@ impl Pass for RirPass<'_> {
         if debug && gvn_changed {
             eprintln!("[rir] gvn fired");
         }
-        let licm_changed = rakit_ir::licm::run(&mut rir_func);
+        let licm_changed = if std::env::var_os("RAKIT_NO_RIR_LICM").is_some() {
+            false
+        } else {
+            rakit_ir::licm::run(&mut rir_func)
+        };
         if licm_changed {
             rakit_ir::optimize(&mut rir_func);
             changed = true;
@@ -206,24 +226,11 @@ impl Pass for RirPass<'_> {
             let selector = rakit_ir::backend::RirSelector;
             match selector.select(&rir_func) {
                 Ok(prealloc) if prealloc.is_fallback() => {
-                    match rakit_ir::backend::mach::to_rir(&prealloc) {
-                        Ok(emitted) if rakit_ir::verify(&emitted).is_ok() => {
-                            rir_func = emitted;
-                            changed = true;
-                            if debug {
-                                eprintln!("[rir] custom backend fallback emitted");
-                            }
-                        }
-                        Ok(_) => {
-                            if debug {
-                                eprintln!("[rir] custom fallback emitter produced invalid RIR");
-                            }
-                        }
-                        Err(err) => {
-                            if debug {
-                                eprintln!("[rir] custom fallback emitter skip: {err}");
-                            }
-                        }
+                    // The selector could not represent this function.  Keep the
+                    // existing RIR/CLIF body; re-exporting a copied RIR body is
+                    // not a production emitter and can lose bridge-only details.
+                    if debug {
+                        eprintln!("[rir] custom isel fallback");
                     }
                 }
                 Ok(prealloc) => {

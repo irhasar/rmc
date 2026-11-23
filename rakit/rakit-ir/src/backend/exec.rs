@@ -92,6 +92,7 @@ pub fn run(func: &MachFunction, args: &[i64]) -> Result<Option<i64>, String> {
                     None => Ok(None),
                 };
             }
+            other => return Err(format!("machine interpreter does not support {other:?}")),
         }
     }
 }

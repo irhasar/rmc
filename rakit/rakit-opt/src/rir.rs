@@ -16,7 +16,7 @@ use rakit_codegen::ir::{
     ExceptionTableData, ExceptionTableItem, ExceptionTag, ExtFuncData, ExternalName,
     Function as CgFunction, GlobalValue, GlobalValueData, Inst as CgInst, InstructionData,
     KnownSymbol, LibCall, MemFlagsData, Opcode, Signature, StackSlot as CgStackSlot,
-    StackSlotData as CgStackSlotData, StackSlotKind, Type as CgType, UserExternalName,
+    StackSlotData as CgStackSlotData, StackSlotKind, TrapCode, Type as CgType, UserExternalName,
     Value as CgValue, ValueList, types,
 };
 use rakit_codegen::isa::CallConv;
@@ -421,7 +421,22 @@ pub fn import(func: &CgFunction) -> Option<RirFunction> {
                     builder.ret(rb, vals);
                 }
                 InstructionData::NullAry { opcode: Opcode::Nop } => {}
-                _ => return None,
+                InstructionData::Trap { code, .. } => {
+                    if std::env::var_os("RAKIT_NO_RIR_TRAP").is_some() {
+                        return None;
+                    }
+                    builder.trap(rb, code.as_raw().get());
+                }
+                _ => {
+                    if std::env::var_os("RAKIT_RIR_DEBUG").is_some() {
+                        eprintln!(
+                            "[rir] unsupported inst {} in {:?}",
+                            data.opcode(),
+                            func.name
+                        );
+                    }
+                    return None;
+                }
             }
         }
     }
@@ -890,6 +905,13 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<CgFunction> {
                         opcode: Opcode::Brif,
                         arg: *vmap.get(c)?,
                         blocks: [then_bc, else_bc],
+                    });
+                    func.layout.append_inst(ci, cb);
+                }
+                RirInst::Trap(code) => {
+                    let ci = func.dfg.make_inst(InstructionData::Trap {
+                        opcode: Opcode::Trap,
+                        code: TrapCode::unwrap_user(*code),
                     });
                     func.layout.append_inst(ci, cb);
                 }

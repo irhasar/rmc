@@ -7,6 +7,7 @@ use crate::cfg_util::{predecessors, remove_blocks, remove_values};
 use crate::ir::{Function, Inst, Value};
 
 pub fn run(func: &mut Function) -> bool {
+    let original = func.clone();
     let mut changed = false;
     loop {
         let unreachable = unreachable_blocks(func);
@@ -27,6 +28,10 @@ pub fn run(func: &mut Function) -> bool {
         merge_blocks(func, p, b);
         changed = true;
     }
+    if changed && crate::verify(func).is_err() {
+        *func = original;
+        return false;
+    }
     changed
 }
 
@@ -43,6 +48,19 @@ fn unreachable_blocks(func: &Function) -> Vec<usize> {
             Inst::Brif(_, t, _, f, _) => {
                 push(t.0 as usize, &mut seen, &mut stack);
                 push(f.0 as usize, &mut seen, &mut stack);
+            }
+            Inst::TryCall { normal, exception, .. }
+            | Inst::TryCallIndirect { normal, exception, .. } => {
+                push(normal.block.0 as usize, &mut seen, &mut stack);
+                for item in exception {
+                    match item {
+                        crate::ir::ExceptionItem::Tag(_, call)
+                        | crate::ir::ExceptionItem::Default(call) => {
+                            push(call.block.0 as usize, &mut seen, &mut stack)
+                        }
+                        crate::ir::ExceptionItem::Context(_) => {}
+                    }
+                }
             }
             _ => {}
         }
@@ -65,7 +83,10 @@ fn find_forwarder(func: &Function) -> Option<usize> {
         let Some(Inst::Jump(target, args)) = block.insts.last() else {
             continue;
         };
-        if !args.is_empty() || target.0 as usize == bi {
+        if !args.is_empty()
+            || target.0 as usize == bi
+            || !func.blocks[target.0 as usize].params.is_empty()
+        {
             continue;
         }
         if !block.insts[..block.insts.len() - 1].iter().all(|i| matches!(i, Inst::Nop(..))) {

@@ -31,7 +31,14 @@ fn inst_operands(inst: &rakit_ir::backend::mach::MachInst) -> Vec<Operand> {
         SetCC { dst, .. } => vec![*dst],
         Select { dst, cond, then, otherwise } => vec![*dst, *cond, *then, *otherwise],
         Ret { value } => value.iter().copied().collect(),
-        Jcc { .. } | Jmp { .. } => Vec::new(),
+        StackAddr { dst, .. } | Load { dst, .. } | GlobalValue { dst, .. } | FuncAddr { dst, .. }
+        | DynamicStackAddr { dst, .. } => vec![*dst],
+        Store { addr, value, .. } => vec![*addr, *value],
+        Call { results, args, .. } => results.iter().chain(args).copied().collect(),
+        CallIndirect { results, callee, args, .. } => {
+            results.iter().chain(std::iter::once(callee)).chain(args).copied().collect()
+        }
+        Jcc { .. } | Jmp { .. } | Trap(..) => Vec::new(),
     }
 }
 
@@ -125,7 +132,7 @@ fn spills_under_register_pressure() {
 }
 
 #[test]
-fn rejects_memory_and_i128() {
+fn selects_memory_and_falls_back_for_i128() {
     let mut b = Builder::new(vec![Type::I64], vec![Type::I64]);
     let e = b.func().entry;
     let x = b.func().block(e).params[0];
@@ -136,8 +143,10 @@ fn rejects_memory_and_i128() {
     b.ret(e, vec![loaded]);
     let f = b.into_func();
     let selected = RirSelector.select(&f).unwrap();
-    assert!(selected.is_fallback());
-    assert_eq!(rakit_ir::backend::to_rir(&selected).unwrap().blocks.len(), f.blocks.len());
+    assert!(!selected.is_fallback());
+    let emitted = rakit_ir::backend::to_rir(&selected).unwrap();
+    assert!(verify(&emitted).is_ok(), "{:?}", verify(&emitted));
+    assert_eq!(run(&emitted, &[Val::I(42)]).unwrap(), vec![Val::I(42)]);
 
     let mut b = Builder::new(vec![Type::I128], vec![Type::I128]);
     let e = b.func().entry;

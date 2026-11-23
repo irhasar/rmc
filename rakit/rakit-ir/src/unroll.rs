@@ -254,7 +254,7 @@ pub(crate) fn remap_inst(
         Inst::GlobalValue(r, g) => Inst::GlobalValue(new_result(func, *r, map), *g),
         Inst::FuncAddr(r, f) => Inst::FuncAddr(new_result(func, *r, map), *f),
         Inst::DynamicStackAddr(r, s) => Inst::DynamicStackAddr(new_result(func, *r, map), *s),
-        Inst::Jump(..) | Inst::Brif(..) | Inst::Return(..) => return None,
+        Inst::Jump(..) | Inst::Brif(..) | Inst::Return(..) | Inst::Trap(..) => return None,
         Inst::TryCall { .. } | Inst::TryCallIndirect { .. } => return None,
     };
     Some(out)

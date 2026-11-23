@@ -19,6 +19,9 @@ impl InstructionSelector for RirSelector {
 
 impl RirSelector {
     fn select_scalar(&self, func: &Function) -> Result<MachFunction, BackendError> {
+        if disabled("RAKIT_NO_CUSTOM_SCALAR") {
+            return Err(unsupported("scalar disabled"));
+        }
         if func.ret.len() > 1 {
             return Err(unsupported("multiple return values"));
         }
@@ -28,6 +31,11 @@ impl RirSelector {
 
         let ret = func.ret.first().copied();
         let mut mach = MachFunction::new(ret);
+        mach.externals = func.externals.clone();
+        mach.globals = func.globals.clone();
+        mach.stack_slots = func.stack_slots.clone();
+        mach.dynamic_stack_slots = func.dynamic_stack_slots.clone();
+        mach.dynamic_types = func.dynamic_types.clone();
         let mut vmap: HashMap<Value, VReg> = HashMap::new();
         let mut icmp_defs: HashMap<Value, (IntCc, Operand, Operand)> = HashMap::new();
 
@@ -155,24 +163,136 @@ impl RirSelector {
                             otherwise,
                         });
                     }
-                    Inst::Call(..) => return Err(unsupported("calls")),
-                    Inst::CallIndirect { .. } => return Err(unsupported("indirect calls")),
+                    Inst::Call(results, target, args) => {
+                        if disabled("RAKIT_NO_CUSTOM_CALL") {
+                            return Err(unsupported("calls disabled"));
+                        }
+                        let results = results
+                            .iter()
+                            .map(|r| result_vreg(&mut mach, &mut vmap, func, *r))
+                            .collect::<Vec<_>>();
+                        let args = args
+                            .iter()
+                            .map(|a| operand(&vmap, *a))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        mach.blocks[bi].insts.push(MachInst::Call {
+                            results: results.into_iter().map(Operand::VReg).collect(),
+                            target: *target,
+                            args,
+                        });
+                    }
+                    Inst::CallIndirect {
+                        results,
+                        params,
+                        rets,
+                        call_conv,
+                        callee,
+                        args,
+                    } => {
+                        if disabled("RAKIT_NO_CUSTOM_CALL") {
+                            return Err(unsupported("calls disabled"));
+                        }
+                        let results = results
+                            .iter()
+                            .map(|r| result_vreg(&mut mach, &mut vmap, func, *r))
+                            .collect::<Vec<_>>();
+                        let callee = operand(&vmap, *callee)?;
+                        let args = args
+                            .iter()
+                            .map(|a| operand(&vmap, *a))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        mach.blocks[bi].insts.push(MachInst::CallIndirect {
+                            results: results.into_iter().map(Operand::VReg).collect(),
+                            params: params.clone(),
+                            rets: rets.clone(),
+                            call_conv: *call_conv,
+                            callee,
+                            args,
+                        });
+                    }
                     Inst::TryCall { .. } => return Err(unsupported("try calls")),
                     Inst::TryCallIndirect { .. } => {
                         return Err(unsupported("indirect try calls"))
                     }
                     Inst::Fcmp(..) => return Err(unsupported("float compare")),
-                    Inst::Load(..) | Inst::Store(..) | Inst::StackAddr(..) => {
-                        return Err(unsupported("memory"));
+                    Inst::StackAddr(r, slot, offset) => {
+                        if disabled("RAKIT_NO_CUSTOM_MEM") {
+                            return Err(unsupported("memory disabled"));
+                        }
+                        let dst = result_vreg(&mut mach, &mut vmap, func, *r);
+                        mach.blocks[bi].insts.push(MachInst::StackAddr {
+                            dst: Operand::VReg(dst),
+                            slot: *slot,
+                            offset: *offset,
+                        });
                     }
-                    Inst::GlobalValue(..) | Inst::FuncAddr(..) | Inst::DynamicStackAddr(..) => {
-                        return Err(unsupported("global/dynamic address"));
+                    Inst::Load(r, ty, addr, offset) => {
+                        if disabled("RAKIT_NO_CUSTOM_MEM") {
+                            return Err(unsupported("memory disabled"));
+                        }
+                        let dst = result_vreg(&mut mach, &mut vmap, func, *r);
+                        let addr = operand(&vmap, *addr)?;
+                        mach.blocks[bi].insts.push(MachInst::Load {
+                            dst: Operand::VReg(dst),
+                            addr,
+                            offset: *offset,
+                            ty: *ty,
+                        });
+                    }
+                    Inst::Store(ty, addr, offset, value) => {
+                        if disabled("RAKIT_NO_CUSTOM_MEM") {
+                            return Err(unsupported("memory disabled"));
+                        }
+                        let addr = operand(&vmap, *addr)?;
+                        let value = operand(&vmap, *value)?;
+                        mach.blocks[bi].insts.push(MachInst::Store {
+                            addr,
+                            offset: *offset,
+                            value,
+                            ty: *ty,
+                        });
+                    }
+                    Inst::GlobalValue(r, index) => {
+                        if disabled("RAKIT_NO_CUSTOM_GLOBAL") {
+                            return Err(unsupported("globals disabled"));
+                        }
+                        let dst = result_vreg(&mut mach, &mut vmap, func, *r);
+                        mach.blocks[bi].insts.push(MachInst::GlobalValue {
+                            dst: Operand::VReg(dst),
+                            index: *index,
+                        });
+                    }
+                    Inst::FuncAddr(r, target) => {
+                        if disabled("RAKIT_NO_CUSTOM_GLOBAL") {
+                            return Err(unsupported("globals disabled"));
+                        }
+                        let dst = result_vreg(&mut mach, &mut vmap, func, *r);
+                        mach.blocks[bi].insts.push(MachInst::FuncAddr {
+                            dst: Operand::VReg(dst),
+                            target: *target,
+                        });
+                    }
+                    Inst::DynamicStackAddr(r, index) => {
+                        if disabled("RAKIT_NO_CUSTOM_GLOBAL") {
+                            return Err(unsupported("globals disabled"));
+                        }
+                        let dst = result_vreg(&mut mach, &mut vmap, func, *r);
+                        mach.blocks[bi].insts.push(MachInst::DynamicStackAddr {
+                            dst: Operand::VReg(dst),
+                            index: *index,
+                        });
+                    }
+                    Inst::Trap(code) => {
+                        if disabled("RAKIT_NO_CUSTOM_TRAP") {
+                            return Err(unsupported("trap disabled"));
+                        }
+                        mach.blocks[bi].insts.push(MachInst::Trap(*code));
                     }
                 }
             }
             if !matches!(
                 block.insts.last(),
-                Some(Inst::Jump(..) | Inst::Brif(..) | Inst::Return(..))
+                Some(Inst::Jump(..) | Inst::Brif(..) | Inst::Return(..) | Inst::Trap(..))
             ) {
                 return Err(unsupported("block without terminator"));
             }
@@ -180,6 +300,10 @@ impl RirSelector {
 
         Ok(mach)
     }
+}
+
+fn disabled(name: &str) -> bool {
+    std::env::var_os(name).is_some()
 }
 
 fn unsupported(what: &str) -> BackendError {

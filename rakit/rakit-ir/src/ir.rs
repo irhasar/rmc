@@ -255,6 +255,8 @@ pub enum Inst {
     Jump(Block, Vec<Value>),
     Brif(Value, Block, Vec<Value>, Block, Vec<Value>),
     Return(Vec<Value>),
+    /// Trap with a non-zero trap code; this terminates the block.
+    Trap(u8),
 }
 
 impl Inst {
@@ -279,7 +281,11 @@ impl Inst {
             | Inst::CallIndirect { results, .. }
             | Inst::TryCall { results, .. }
             | Inst::TryCallIndirect { results, .. } => results.first().copied(),
-            Inst::Store(..) | Inst::Jump(..) | Inst::Brif(..) | Inst::Return(..) => None,
+            Inst::Store(..)
+            | Inst::Jump(..)
+            | Inst::Brif(..)
+            | Inst::Return(..)
+            | Inst::Trap(..) => None,
         }
     }
 
@@ -289,6 +295,7 @@ impl Inst {
             Inst::Jump(..)
                 | Inst::Brif(..)
                 | Inst::Return(..)
+                | Inst::Trap(..)
                 | Inst::TryCall { .. }
                 | Inst::TryCallIndirect { .. }
         )
@@ -372,6 +379,7 @@ impl Inst {
                 v
             }
             Inst::Jump(_, args) | Inst::Return(args) => args.clone(),
+            Inst::Trap(_) => Vec::new(),
             Inst::Brif(cond, _, targs, _, fargs) => {
                 let mut v = Vec::with_capacity(targs.len() + fargs.len() + 1);
                 v.push(*cond);
@@ -456,6 +464,7 @@ impl Inst {
                 }
             }
             Inst::Jump(_, args) | Inst::Return(args) => r_args(args, old, new),
+            Inst::Trap(_) => {}
             Inst::Brif(c, _, ta, _, fa) => {
                 r(c, old, new);
                 r_args(ta, old, new);

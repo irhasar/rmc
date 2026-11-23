@@ -99,6 +99,11 @@ pub fn verify(func: &Function) -> Result<(), Vec<String>> {
 
             match inst {
                 Inst::Nop(_, _) => {}
+                Inst::Trap(code) => {
+                    if *code == 0 {
+                        errs.push("trap code must be non-zero".to_string());
+                    }
+                }
                 Inst::Iconst(r, ty, _) => {
                     if !ty.is_int() && !ty.is_bool() {
                         errs.push(format!("integer constant has non-integer type {ty:?}"));

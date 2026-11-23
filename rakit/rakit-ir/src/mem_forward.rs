@@ -22,7 +22,7 @@ pub(crate) enum Key {
 }
 
 impl Key {
-    fn slot(self) -> u32 {
+    pub(crate) fn slot(self) -> u32 {
         match self {
             Key::Const { slot, .. } | Key::Dyn { slot, .. } => slot,
         }
@@ -30,6 +30,23 @@ impl Key {
 }
 
 pub fn run(func: &mut Function) -> bool {
+    // Trap blocks are cold panic paths, but forwarding across them exposed a
+    // std btree miscompile.  Keep the pass off functions that contain traps
+    // until the must-store proof models trap edges explicitly.
+    if func.blocks.iter().any(|b| {
+        b.insts.iter().any(|i| {
+            matches!(
+                i,
+                Inst::Trap(..)
+                    | Inst::Call(..)
+                    | Inst::CallIndirect { .. }
+                    | Inst::TryCall { .. }
+                    | Inst::TryCallIndirect { .. }
+            )
+        })
+    }) {
+        return false;
+    }
     let mut changed = false;
     for _ in 0..8 {
         let forwarded = forward(func);

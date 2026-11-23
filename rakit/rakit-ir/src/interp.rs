@@ -204,6 +204,7 @@ fn eval(env: &[Option<Val>], inst: &Inst, mem: &mut [u8], bases: &[usize]) -> Re
         Inst::GlobalValue(..) => Err("global value is not supported by eval".to_string()),
         Inst::FuncAddr(..) => Err("function address is not supported by eval".to_string()),
         Inst::DynamicStackAddr(..) => Err("dynamic stack address is not supported by eval".to_string()),
+        Inst::Trap(code) => Err(format!("trap {}", code)),
         Inst::Unary(_, op, ty, x) => {
             let v = get(env, *x)?;
             match op {

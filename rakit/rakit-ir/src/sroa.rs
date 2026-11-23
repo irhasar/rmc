@@ -121,6 +121,9 @@ fn promote_slot(func: &mut Function, target: u32) -> bool {
                     let Some(key) = key_of(&defs, func, *addr, *offset, *ty) else {
                         continue;
                     };
+                    if key.slot() == target && !matches!(key, Key::Const { .. }) {
+                        return false;
+                    }
                     if let Some(loc) = access_loc(func, key, target, *ty) {
                         keys.insert(loc);
                         access_blocks.insert(bi);
@@ -133,6 +136,9 @@ fn promote_slot(func: &mut Function, target: u32) -> bool {
                     let Some(key) = key_of(&defs, func, *addr, *offset, *ty) else {
                         continue;
                     };
+                    if key.slot() == target && !matches!(key, Key::Const { .. }) {
+                        return false;
+                    }
                     if let Some(loc) = access_loc(func, key, target, *ty) {
                         keys.insert(loc);
                         def_blocks.entry(loc).or_default().insert(bi);

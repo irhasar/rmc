@@ -243,4 +243,8 @@ impl Builder {
     pub fn ret(&mut self, b: Block, args: Vec<Value>) {
         self.push(b, Inst::Return(args));
     }
+
+    pub fn trap(&mut self, b: Block, code: u8) {
+        self.push(b, Inst::Trap(code));
+    }
 }

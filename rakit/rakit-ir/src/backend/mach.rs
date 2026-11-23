@@ -5,7 +5,10 @@
 
 use std::fmt;
 
-use crate::ir::{BinOp, Block, BlockData, Function, Inst, IntCc, Type, Value};
+use crate::ir::{
+    BinOp, Block, BlockData, DynamicSlotData, DynamicTypeData, External, Function, GlobalData, Inst,
+    IntCc, StackSlot, StackSlotData, Type, Value,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct VReg(pub u32);
@@ -90,27 +93,50 @@ pub enum MachInst {
     Jcc { cc: IntCc, target: usize },
     Jmp { target: usize },
     Ret { value: Option<Operand> },
+    StackAddr { dst: Operand, slot: StackSlot, offset: i32 },
+    Load { dst: Operand, addr: Operand, offset: i32, ty: Type },
+    Store { addr: Operand, offset: i32, value: Operand, ty: Type },
+    Call { results: Vec<Operand>, target: u32, args: Vec<Operand> },
+    CallIndirect {
+        results: Vec<Operand>,
+        params: Vec<Type>,
+        rets: Vec<Type>,
+        call_conv: u8,
+        callee: Operand,
+        args: Vec<Operand>,
+    },
+    GlobalValue { dst: Operand, index: u32 },
+    FuncAddr { dst: Operand, target: u32 },
+    DynamicStackAddr { dst: Operand, index: u32 },
+    Trap(u8),
 }
 
 impl MachInst {
     pub fn defs(&self) -> Vec<VReg> {
         let mut out = Vec::new();
         match self {
-            MachInst::Mov { dst, .. } | MachInst::SetCC { dst, .. } => {
+            MachInst::Mov { dst, .. }
+            | MachInst::SetCC { dst, .. }
+            | MachInst::Bin { dst, .. }
+            | MachInst::StackAddr { dst, .. }
+            | MachInst::Load { dst, .. }
+            | MachInst::GlobalValue { dst, .. }
+            | MachInst::FuncAddr { dst, .. }
+            | MachInst::DynamicStackAddr { dst, .. } => {
                 if let Some(v) = dst.vreg() {
                     out.push(v);
                 }
             }
-            MachInst::Bin { dst, .. } => {
-                if let Some(v) = dst.vreg() {
-                    out.push(v);
-                }
+            MachInst::Call { results, .. } | MachInst::CallIndirect { results, .. } => {
+                out.extend(results.iter().filter_map(|r| r.vreg()));
             }
             MachInst::Cmp { .. }
             | MachInst::Select { .. }
             | MachInst::Jcc { .. }
             | MachInst::Jmp { .. }
-            | MachInst::Ret { .. } => {}
+            | MachInst::Ret { .. }
+            | MachInst::Store { .. }
+            | MachInst::Trap(..) => {}
         }
         out
     }
@@ -149,6 +175,33 @@ impl MachInst {
                 if let Some(v) = otherwise.vreg() {
                     out.push(v);
                 }
+            }
+            MachInst::StackAddr { .. }
+            | MachInst::GlobalValue { .. }
+            | MachInst::FuncAddr { .. }
+            | MachInst::DynamicStackAddr { .. }
+            | MachInst::Trap(..) => {}
+            MachInst::Load { addr, .. } => {
+                if let Some(v) = addr.vreg() {
+                    out.push(v);
+                }
+            }
+            MachInst::Store { addr, value, .. } => {
+                if let Some(v) = addr.vreg() {
+                    out.push(v);
+                }
+                if let Some(v) = value.vreg() {
+                    out.push(v);
+                }
+            }
+            MachInst::Call { args, .. } => {
+                out.extend(args.iter().filter_map(|a| a.vreg()));
+            }
+            MachInst::CallIndirect { callee, args, .. } => {
+                if let Some(v) = callee.vreg() {
+                    out.push(v);
+                }
+                out.extend(args.iter().filter_map(|a| a.vreg()));
             }
             MachInst::Ret { value: Some(v) } => {
                 if let Some(v) = v.vreg() {
@@ -192,7 +245,35 @@ impl MachInst {
                     *v = v.map_vreg(f);
                 }
             }
-            MachInst::Jcc { .. } | MachInst::Jmp { .. } => {}
+            MachInst::StackAddr { dst, .. }
+            | MachInst::Load { dst, .. }
+            | MachInst::GlobalValue { dst, .. }
+            | MachInst::FuncAddr { dst, .. }
+            | MachInst::DynamicStackAddr { dst, .. } => {
+                *dst = dst.map_vreg(f);
+            }
+            MachInst::Store { addr, value, .. } => {
+                *addr = addr.map_vreg(f);
+                *value = value.map_vreg(f);
+            }
+            MachInst::Call { results, args, .. } => {
+                for r in results {
+                    *r = r.map_vreg(f);
+                }
+                for a in args {
+                    *a = a.map_vreg(f);
+                }
+            }
+            MachInst::CallIndirect { results, callee, args, .. } => {
+                for r in results {
+                    *r = r.map_vreg(f);
+                }
+                *callee = callee.map_vreg(f);
+                for a in args {
+                    *a = a.map_vreg(f);
+                }
+            }
+            MachInst::Jcc { .. } | MachInst::Jmp { .. } | MachInst::Trap(..) => {}
         }
     }
 }
@@ -212,6 +293,11 @@ pub struct MachFunction {
     pub ret: Option<Type>,
     pub vregs: Vec<Type>,
     pub spill_slots: u32,
+    pub externals: Vec<External>,
+    pub globals: Vec<GlobalData>,
+    pub stack_slots: Vec<StackSlotData>,
+    pub dynamic_stack_slots: Vec<DynamicSlotData>,
+    pub dynamic_types: Vec<DynamicTypeData>,
     /// Set when the selector could not represent this function.  The emitter
     /// then reproduces the verified RIR unchanged instead of failing codegen.
     pub fallback: Option<Function>,
@@ -370,9 +456,73 @@ pub fn to_rir(mach: &MachFunction) -> Result<Function, String> {
                         .insts
                         .push(Inst::Return(value.into_iter().collect()));
                 }
+                MachInst::StackAddr { dst, slot, offset } => {
+                    let d = value_of(&mut func, rb, &vmap, *dst)?;
+                    func.blocks[bi].insts.push(Inst::StackAddr(d, *slot, *offset));
+                }
+                MachInst::Load { dst, addr, offset, ty } => {
+                    let d = value_of(&mut func, rb, &vmap, *dst)?;
+                    let a = value_of(&mut func, rb, &vmap, *addr)?;
+                    func.blocks[bi].insts.push(Inst::Load(d, *ty, a, *offset));
+                }
+                MachInst::Store { addr, offset, value, ty } => {
+                    let a = value_of(&mut func, rb, &vmap, *addr)?;
+                    let v = value_of(&mut func, rb, &vmap, *value)?;
+                    func.blocks[bi].insts.push(Inst::Store(*ty, a, *offset, v));
+                }
+                MachInst::Call { results, target, args } => {
+                    let results = results
+                        .iter()
+                        .map(|r| value_of(&mut func, rb, &vmap, *r))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let args = args
+                        .iter()
+                        .map(|a| value_of(&mut func, rb, &vmap, *a))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    func.blocks[bi].insts.push(Inst::Call(results, *target, args));
+                }
+                MachInst::CallIndirect { results, params, rets, call_conv, callee, args } => {
+                    let results = results
+                        .iter()
+                        .map(|r| value_of(&mut func, rb, &vmap, *r))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let callee = value_of(&mut func, rb, &vmap, *callee)?;
+                    let args = args
+                        .iter()
+                        .map(|a| value_of(&mut func, rb, &vmap, *a))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    func.blocks[bi].insts.push(Inst::CallIndirect {
+                        results,
+                        params: params.clone(),
+                        rets: rets.clone(),
+                        call_conv: *call_conv,
+                        callee,
+                        args,
+                    });
+                }
+                MachInst::GlobalValue { dst, index } => {
+                    let d = value_of(&mut func, rb, &vmap, *dst)?;
+                    func.blocks[bi].insts.push(Inst::GlobalValue(d, *index));
+                }
+                MachInst::FuncAddr { dst, target } => {
+                    let d = value_of(&mut func, rb, &vmap, *dst)?;
+                    func.blocks[bi].insts.push(Inst::FuncAddr(d, *target));
+                }
+                MachInst::DynamicStackAddr { dst, index } => {
+                    let d = value_of(&mut func, rb, &vmap, *dst)?;
+                    func.blocks[bi].insts.push(Inst::DynamicStackAddr(d, *index));
+                }
+                MachInst::Trap(code) => {
+                    func.blocks[bi].insts.push(Inst::Trap(*code));
+                }
             }
         }
     }
+    func.externals = mach.externals.clone();
+    func.globals = mach.globals.clone();
+    func.stack_slots = mach.stack_slots.clone();
+    func.dynamic_stack_slots = mach.dynamic_stack_slots.clone();
+    func.dynamic_types = mach.dynamic_types.clone();
     Ok(func)
 }
 
@@ -385,6 +535,11 @@ impl MachFunction {
             ret,
             vregs: Vec::new(),
             spill_slots: 0,
+            externals: Vec::new(),
+            globals: Vec::new(),
+            stack_slots: Vec::new(),
+            dynamic_stack_slots: Vec::new(),
+            dynamic_types: Vec::new(),
             fallback: None,
         }
     }

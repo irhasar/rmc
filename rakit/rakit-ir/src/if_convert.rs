@@ -296,7 +296,8 @@ fn clone_inst(func: &mut Function, inst: &Inst, map: &mut HashMap<Value, Value>)
         | Inst::Store(..)
         | Inst::Jump(..)
         | Inst::Brif(..)
-        | Inst::Return(..) => return None,
+        | Inst::Return(..)
+        | Inst::Trap(..) => return None,
     };
     map.insert(old, new);
     Some(out)
