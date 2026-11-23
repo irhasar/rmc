@@ -16,62 +16,62 @@ fn flag(name: &str) -> bool {
 }
 
 /// Whether the store-forwarding pass runs at all (`RAKIT_NO_STORE_FWD` off).
-pub(crate) fn store_forward_enabled() -> bool {
+pub fn store_forward_enabled() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| !flag("RAKIT_NO_STORE_FWD"))
 }
 
 /// Whether the divisibility-test pass runs at all (`RAKIT_NO_DIVTEST` off).
-pub(crate) fn div_test_enabled() -> bool {
+pub fn div_test_enabled() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| !flag("RAKIT_NO_DIVTEST"))
 }
 
 /// Whether the if-conversion pass runs at all (`RAKIT_NO_IFCONV` off).
-pub(crate) fn if_convert_enabled() -> bool {
+pub fn if_convert_enabled() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| !flag("RAKIT_NO_IFCONV"))
 }
 
 /// Per-function store-forwarding timing output (`RAKIT_SF_TIME`).
-pub(crate) fn store_forward_time() -> bool {
+pub fn store_forward_time() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| flag("RAKIT_SF_TIME"))
 }
 
 /// Substring of function names the store-forwarding pass skips (`RAKIT_SF_SKIP`).
-pub(crate) fn store_forward_skip() -> Option<&'static str> {
+pub fn store_forward_skip() -> Option<&'static str> {
     static V: OnceLock<Option<String>> = OnceLock::new();
     V.get_or_init(|| var("RAKIT_SF_SKIP")).as_deref()
 }
 
 /// Whether the cross-block dataflow of store forwarding is enabled.
-pub(crate) fn store_forward_cross_block() -> bool {
+pub fn store_forward_cross_block() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| !flag("RAKIT_SF_NO_CBE"))
 }
 
 /// Whether `Rvalue::Repeat` may lower to a memset (`RAKIT_NO_REPEAT_MEMSET`).
-pub(crate) fn repeat_memset() -> bool {
+pub fn repeat_memset() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| !flag("RAKIT_NO_REPEAT_MEMSET"))
 }
 
 /// Instruction-count budget above which the cross-block dataflow is skipped.
-pub(crate) fn store_forward_cbe_max() -> usize {
+pub fn store_forward_cbe_max() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
     *V.get_or_init(|| match var("RAKIT_SF_CBE_MAX") {
         Some(v) => v.parse().unwrap_or(usize::MAX),
-        None => super::store_forward::CBE_MAX_INSTS,
+        None => crate::passes::store_forward::CBE_MAX_INSTS,
     })
 }
 
 /// Largest callee (in RAKIT instructions) the inliner accepts (`RAKIT_INLINE_MAX`).
-pub(crate) fn inline_max_insts() -> usize {
+pub fn inline_max_insts() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
     *V.get_or_init(|| match var("RAKIT_INLINE_MAX") {
-        Some(v) => v.parse().unwrap_or(super::inliner::MAX_CALLEE_INSTS),
-        None => super::inliner::MAX_CALLEE_INSTS,
+        Some(v) => v.parse().unwrap_or(crate::passes::inliner::MAX_CALLEE_INSTS),
+        None => crate::passes::inliner::MAX_CALLEE_INSTS,
     })
 }
 
@@ -83,88 +83,88 @@ pub(crate) fn inline_max_insts() -> usize {
 /// across the former call boundary, which is where the runtime win comes from.
 /// Non-leaf bodies mainly move a call around and can still be duplicated
 /// cheaply, so they keep the smaller [`inline_max_insts`] cap.
-pub(crate) fn inline_leaf_max_insts() -> usize {
+pub fn inline_leaf_max_insts() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
     *V.get_or_init(|| match var("RAKIT_INLINE_LEAF_MAX") {
-        Some(v) => v.parse().unwrap_or(super::inliner::MAX_LEAF_INSTS),
-        None => super::inliner::MAX_LEAF_INSTS,
+        Some(v) => v.parse().unwrap_or(crate::passes::inliner::MAX_LEAF_INSTS),
+        None => crate::passes::inliner::MAX_LEAF_INSTS,
     })
 }
 
 /// Maximum times one callee may be inlined per caller (`RAKIT_INLINE_USES`).
-pub(crate) fn inline_max_uses() -> usize {
+pub fn inline_max_uses() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
     *V.get_or_init(|| match var("RAKIT_INLINE_USES") {
-        Some(v) => v.parse().unwrap_or(super::inliner::MAX_CALLEE_USES),
-        None => super::inliner::MAX_CALLEE_USES,
+        Some(v) => v.parse().unwrap_or(crate::passes::inliner::MAX_CALLEE_USES),
+        None => crate::passes::inliner::MAX_CALLEE_USES,
     })
 }
 
 /// Whether trivial leaves bypass the per-caller use cap (`RAKIT_INLINE_NO_TRIVIAL` off).
-pub(crate) fn inline_trivial_leaf() -> bool {
+pub fn inline_trivial_leaf() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| !flag("RAKIT_INLINE_NO_TRIVIAL"))
 }
 
 /// Instruction cap for the trivial-leaf exemption (`RAKIT_INLINE_TRIVIAL_MAX`).
-pub(crate) fn inline_trivial_max_insts() -> usize {
+pub fn inline_trivial_max_insts() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
     *V.get_or_init(|| match var("RAKIT_INLINE_TRIVIAL_MAX") {
-        Some(v) => v.parse().unwrap_or(super::inliner::TRIVIAL_LEAF_INSTS),
-        None => super::inliner::TRIVIAL_LEAF_INSTS,
+        Some(v) => v.parse().unwrap_or(crate::passes::inliner::TRIVIAL_LEAF_INSTS),
+        None => crate::passes::inliner::TRIVIAL_LEAF_INSTS,
     })
 }
 
 /// Loop unroll factor (`RAKIT_UNROLL`).
-pub(crate) fn unroll_factor() -> u64 {
+pub fn unroll_factor() -> u64 {
     static V: OnceLock<u64> = OnceLock::new();
     *V.get_or_init(|| match var("RAKIT_UNROLL") {
-        Some(v) => v.parse().unwrap_or(super::unroll::UNROLL_FACTOR),
-        None => super::unroll::UNROLL_FACTOR,
+        Some(v) => v.parse().unwrap_or(crate::passes::unroll::UNROLL_FACTOR),
+        None => crate::passes::unroll::UNROLL_FACTOR,
     })
 }
 
 /// Partial-reassociation factor for loops whose other state is a reduction or a
 /// recomputable atom (`RAKIT_PARTIAL`).
-pub(crate) fn partial_factor() -> u64 {
+pub fn partial_factor() -> u64 {
     static V: OnceLock<u64> = OnceLock::new();
     *V.get_or_init(|| match var("RAKIT_PARTIAL") {
-        Some(v) => v.parse().unwrap_or(super::unroll::PARTIAL_FACTOR),
-        None => super::unroll::PARTIAL_FACTOR,
+        Some(v) => v.parse().unwrap_or(crate::passes::unroll::PARTIAL_FACTOR),
+        None => crate::passes::unroll::PARTIAL_FACTOR,
     })
 }
 
 /// Whether the unroller may model a bitwise op (`i | k`) as a recomputable atom
 /// (`RAKIT_NO_ATOM` disables it for bisecting).
-pub(crate) fn atom_enabled() -> bool {
+pub fn atom_enabled() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| !flag("RAKIT_NO_ATOM"))
 }
 
 /// Whether the unroller may clone the loop body (`RAKIT_UNROLL_CLONE`).
-pub(crate) fn unroll_clone() -> bool {
+pub fn unroll_clone() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| flag("RAKIT_UNROLL_CLONE"))
 }
 
 /// Whether the unroller collapses trivial forwarding latches
 /// (`RAKIT_NO_COLLAPSE` off).
-pub(crate) fn collapse_forwarders_enabled() -> bool {
+pub fn collapse_forwarders_enabled() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| !flag("RAKIT_NO_COLLAPSE"))
 }
 
 /// Rakit `opt_level` override (`RAKIT_OPT_LEVEL`).
-pub(crate) fn opt_level() -> Option<&'static str> {
+pub fn opt_level() -> Option<&'static str> {
     static V: OnceLock<Option<String>> = OnceLock::new();
     V.get_or_init(|| var("RAKIT_OPT_LEVEL")).as_deref()
 }
 
 /// Inliner growth budget as a percentage of the caller size (`RAKIT_INLINE_GROWTH`).
-pub(crate) fn inline_growth_pct() -> usize {
+pub fn inline_growth_pct() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
     *V.get_or_init(|| match var("RAKIT_INLINE_GROWTH") {
-        Some(v) => v.parse().unwrap_or(super::inliner::GROWTH_PCT),
-        None => super::inliner::GROWTH_PCT,
+        Some(v) => v.parse().unwrap_or(crate::passes::inliner::GROWTH_PCT),
+        None => crate::passes::inliner::GROWTH_PCT,
     })
 }

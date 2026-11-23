@@ -21,7 +21,7 @@
 
 use rakit_codegen::cursor::{Cursor, FuncCursor};
 use rakit_codegen::ir::{self, Block, Inst, InstBuilder, InstructionData, Opcode, Value};
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use std::collections::{HashMap as FxHashMap, HashSet as FxHashSet};
 
 /// Cap on the number of instructions an arm may contain. Short arms are the
 /// ones that pay off as a `cmove`; a long arm would rather keep its branch.
@@ -193,7 +193,7 @@ fn arm_values_are_dead_outside(
     true
 }
 
-pub(crate) fn run(func: &mut ir::Function) {
+pub fn run(func: &mut ir::Function) {
     if !crate::tunables::if_convert_enabled() {
         return;
     }

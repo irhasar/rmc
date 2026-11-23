@@ -1,5 +1,23 @@
 # AGENTS.md
 
+## Session (2026-11-23, later) — extract the optimization pipeline into `rakit-opt`
+- New crate `rakit/rakit-opt/` (package `rakit-opt`) owns the CLIF-level
+  optimization layer: `PassManager`, `Analyses` (CFG/dominator/loop, cached and
+  invalidated per pass), `tunables`, `passtime`, and the seven first-party
+  passes (inliner, rec_loop, store_forward, div_test, if_convert, unroll,
+  sincos).
+- `rakit/src/base.rs` now builds a `PassManager` and runs it, instead of calling
+  the passes ad hoc. The inliner stays out of the pipeline because it uses
+  `Context::inline`.
+- Moved files had `rustc_data_structures::fx` replaced by `std::collections`
+  aliases, and `pub(crate)` widened to `pub`, so `rakit-opt` has no
+  rustc-private dependency and can be built/tested on its own.
+- `Cargo.lock` regenerated (only the `rakit-opt` entry added). Verified:
+  `./y.sh build --sysroot rakit` succeeds, `dist/bin/rustc-rakit` compiles and
+  runs a sort/filter program (`sum=499500 div3=33`), and `RAKIT_PASS_TIME=1`
+  shows store_forward/unroll/if_convert/div_test running via the manager.
+- Branch `rakit-middle-end`, PR targets `replace-main-with-cgclif-experiments`.
+
 ## Session (2026-11-23) — rebrand the modified fork to Rakit
 Only the **modified** backend was rebranded to **Rakit**; the upstream baseline
 (`cg_clif_upstream/`) is intentionally left untouched as the original cg_clif /

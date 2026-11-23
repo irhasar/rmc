@@ -16,7 +16,7 @@
 
 use rakit_codegen::cursor::{Cursor, FuncCursor};
 use rakit_codegen::ir::{self, Block, Inst, MemFlagsData, Opcode, StackSlot, Value, types, InstBuilder};
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use std::collections::{HashMap as FxHashMap, HashSet as FxHashSet};
 
 /// A memory location a store writes or a load reads: either a private stack
 /// slot or a non-escaping pointer value, each with a byte offset.
@@ -32,7 +32,7 @@ type Key = (Base, i64);
 /// For each byte range, the SSA value last stored to it.
 type Avail = FxHashMap<Key, (Value, types::Type)>;
 
-pub(crate) fn run(func: &mut ir::Function, endianness: ir::Endianness) {
+pub fn run(func: &mut ir::Function, endianness: ir::Endianness) {
     if !crate::tunables::store_forward_enabled() {
         return;
     }
@@ -257,7 +257,7 @@ fn cbe_within_budget(func: &ir::Function) -> bool {
 }
 
 /// Largest function (in RAKIT instructions) the cross-block dataflow runs on.
-pub(crate) const CBE_MAX_INSTS: usize = 16_384;
+pub const CBE_MAX_INSTS: usize = 16_384;
 
 
 /// Record the fact that `inst` stores its data operand to `avail`, invalidating

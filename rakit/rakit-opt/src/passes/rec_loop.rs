@@ -11,7 +11,7 @@
 use rakit_codegen::cursor::{Cursor, FuncCursor};
 use rakit_codegen::ir::{self, condcodes::IntCC, Block, Inst, InstBuilder, Opcode, Value};
 
-pub(crate) fn run(func: &mut ir::Function) {
+pub fn run(func: &mut ir::Function) {
     if std::env::var_os("RAKIT_NO_REC_LOOP").is_some() {
         return;
     }

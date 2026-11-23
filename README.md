@@ -33,6 +33,26 @@ dan seterusnya), sehingga tidak ada lagi dependensi ke paket eksternal bernama
 lama. Sebaliknya, `cg_clif_upstream/` sengaja **tidak diubah** — tetap cg_clif
 asli dengan Cranelift asli, sebagai baseline pembanding.
 
+## Arsitektur
+
+```
+rustc MIR
+  └─ rakit/src          frontend MIR → CLIF
+        └─ rakit-opt    pass manager + analisis bersama + pass first-party
+              rec_loop → store_forward → div_test → if_convert
+              → unroll (reassoc/LCG) → sincos
+        └─ rakit-codegen  CLIF → ISel (ISLE) → regalloc2 → machin
+        └─ rakit-object   emisi objek
+```
+
+`rakit-opt` adalah crate terpisah (`rakit/rakit-opt/`) yang memiliki
+`PassManager` dan `Analyses`: CFG, dominator tree, dan loop forest dihitung
+sekali lalu dipakai bersama, dan di-invalidasi otomatis setiap kali sebuah pass
+mengubah fungsi. Setiap optimisasi adalah implementasi trait `Pass`, sehingga
+urutan pipeline terpusat di satu tempat (bukan rangkaian pemanggilan ad-hoc di
+`base.rs`). Inliner tetap dijalankan lebih dulu karena memakai
+`Context::inline`, di luar pipeline `rakit-opt`.
+
 ## Build
 
 Prasyarat: toolchain `nightly-2026-11-17` dengan komponen `rust-src`,

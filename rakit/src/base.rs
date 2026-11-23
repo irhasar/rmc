@@ -191,38 +191,25 @@ pub(crate) fn compile_fn(
         }
     }
 
-    // Forward stack-slot stores into the loads that read them back, and drop
-    // stores nothing reads. rakit materialises aggregates through stack slots,
-    // and Rakit keeps those round-trips because the slot is not `readonly`.
-    // This must run before `unroll`, whose affine analysis rejects any loop that
-    // still touches memory.
-    // Rewrite self-recursive linear recurrences (fib-shaped) into loops.
-    crate::rec_loop::run(&mut context.func);
-
-    crate::passtime::time(crate::passtime::STORE_FORWARD, || {
-        crate::store_forward::run(&mut context.func, module.isa().endianness())
-    });
-
-    // Fold `x % C == 0` into a multiply-compare before Rakit strength-reduces
-    // the remainder: the remainder itself is dead once only its zero-ness is
-    // tested. Running before `if_convert` lets the resulting comparison join the
-    // same diamond collapse as any other condition.
-    crate::passtime::time(crate::passtime::DIV_TEST, || crate::div_test::run(&mut context.func));
-
-    // Collapse short two-way diamonds into a `select` (a `cmove`) so a
-    // data-dependent branch cannot mispredict. Running before `unroll` also
-    // turns a loop whose body holds such a branch into the single block the
-    // unroller accepts.
-    crate::passtime::time(crate::passtime::IF_CONVERT, || {
-        crate::if_convert::run(&mut context.func)
-    });
-
-    // Widen canonical counted loops so their carried dependency chains are
-    // shortened. Rakit has no unrolling pass of its own.
-    crate::passtime::time(crate::passtime::UNROLL, || crate::unroll::run(&mut context.func));
-
-    // Fuse `sin(x)` + `cos(x)` of the same argument into one `sincos` libcall.
-    crate::sincos::run(module, &mut context.func);
+    // Run Rakit's CLIF optimization pipeline. The pass manager owns the order
+    // and the shared analysis cache; each pass is independent of the others.
+    // `rec_loop` and `store_forward` must precede `unroll`, whose affine
+    // analysis rejects any loop that still contains a call or touches memory.
+    let mut pipeline = rakit_opt::PassManager::new();
+    pipeline
+        .push(Box::new(rakit_opt::RecLoopPass))
+        .push(Box::new(rakit_opt::StoreForwardPass))
+        .push(Box::new(rakit_opt::DivTestPass))
+        .push(Box::new(rakit_opt::IfConvertPass))
+        .push(Box::new(rakit_opt::UnrollPass))
+        .push(Box::new(rakit_opt::SincosPass));
+    let mut analyses = rakit_opt::Analyses::new();
+    let mut pctx = rakit_opt::PassCtx {
+        ctx: &mut *context,
+        module: &mut *module,
+        analyses: &mut analyses,
+    };
+    pipeline.run(&mut pctx);
 
     #[cfg(false)]
     let _rakit_guard = {

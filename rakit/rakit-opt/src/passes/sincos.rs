@@ -10,7 +10,7 @@ use rakit_codegen::ir::{
 };
 use rakit_module::{Linkage, Module};
 
-pub(crate) fn run(module: &mut dyn Module, func: &mut ir::Function) {
+pub fn run(module: &mut dyn Module, func: &mut ir::Function) {
     if std::env::var_os("RAKIT_NO_SINCOS").is_some() {
         return;
     }

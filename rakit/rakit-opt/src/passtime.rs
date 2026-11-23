@@ -12,12 +12,12 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 /// thread-local accumulator would be reset before [`report`] ever ran.
 static ACC: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
-pub(crate) const STORE_FORWARD: usize = 0;
-pub(crate) const UNROLL: usize = 1;
-pub(crate) const INLINE: usize = 2;
-pub(crate) const COLLECT: usize = 3;
-pub(crate) const IF_CONVERT: usize = 4;
-pub(crate) const DIV_TEST: usize = 5;
+pub const STORE_FORWARD: usize = 0;
+pub const UNROLL: usize = 1;
+pub const INLINE: usize = 2;
+pub const COLLECT: usize = 3;
+pub const IF_CONVERT: usize = 4;
+pub const DIV_TEST: usize = 5;
 
 const NAMES: [&str; 6] = [
     "store_forward",
@@ -38,7 +38,7 @@ fn enabled() -> bool {
 }
 
 /// Run `f`, charging its wall time to `slot` when accounting is on.
-pub(crate) fn time<R>(slot: usize, f: impl FnOnce() -> R) -> R {
+pub fn time<R>(slot: usize, f: impl FnOnce() -> R) -> R {
     if !enabled() {
         return f();
     }
@@ -50,7 +50,7 @@ pub(crate) fn time<R>(slot: usize, f: impl FnOnce() -> R) -> R {
 
 
 /// Print and reset the calling thread's totals.
-pub(crate) fn report(where_: &str) {
+pub fn report(where_: &str) {
     if !enabled() {
         return;
     }

@@ -350,6 +350,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rakit-opt"
+version = "0.1.0"
+dependencies = [
+ "rakit-codegen",
+ "rakit-module",
+]
+
+[[package]]
 name = "rakit-srcgen"
 version = "0.137.0"
 
@@ -399,6 +407,7 @@ dependencies = [
  "rakit-module",
  "rakit-native",
  "rakit-object",
+ "rakit-opt",
  "smallvec",
  "target-lexicon",
 ]

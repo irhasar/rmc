@@ -26,10 +26,10 @@ use rakit_codegen::cursor::{Cursor, FuncCursor};
 use rakit_codegen::ir::{
     self, condcodes::IntCC, immediates::Imm64, Block, Inst, InstBuilder, Opcode, Value,
 };
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use std::collections::{HashMap as FxHashMap, HashSet as FxHashSet};
 
 /// Number of loop iterations folded into one guarded step.
-pub(crate) const UNROLL_FACTOR: u64 = 128;
+pub const UNROLL_FACTOR: u64 = 128;
 
 /// Upper bound on the induction step we are willing to scale, so that the
 /// arithmetic stays well clear of the type's range.
@@ -44,12 +44,12 @@ const MAX_LAST: u64 = 1 << 62;
 /// Widest step the partial-reassociation path will clone. Each iteration costs a
 /// body copy, and the win saturates once the multiply chain is broken, so a small
 /// factor is enough.
-pub(crate) const PARTIAL_FACTOR: u64 = 6;
+pub const PARTIAL_FACTOR: u64 = 6;
 
 /// Partial factor for a loop whose forcing term is a recomputable atom (`i | 1`).
 /// Rebuilding each atom per step costs O(factor^2) multiplies, so a large factor
 /// is counter-productive; 2 keeps every multiply shallow and independent.
-pub(crate) const ATOM_FACTOR: u64 = 3;
+pub const ATOM_FACTOR: u64 = 3;
 
 /// Shrink `factor` until `delta * (factor - 1)` cannot overflow, and report the
 /// largest usable factor (>= 2), or `None` when even two iterations overflow.
@@ -378,12 +378,12 @@ fn thread_forwarder(func: &mut ir::Function, pred: Block, latch: Block) -> bool 
     true
 }
 
-pub(crate) fn run(func: &mut ir::Function) {
+pub fn run(func: &mut ir::Function) {
     let factor = unroll_factor();
     if factor < 2 {
         return;
     }
-    if super::tunables::collapse_forwarders_enabled() {
+    if crate::tunables::collapse_forwarders_enabled() {
         collapse_forwarders(func);
     }
     narrow_uint_fcvt(func);
@@ -565,7 +565,7 @@ fn successors(func: &ir::Function, block: Block) -> Vec<Block> {
     out
 }
 
-pub(crate) fn const_of(func: &ir::Function, v: Value) -> Option<u64> {
+pub fn const_of(func: &ir::Function, v: Value) -> Option<u64> {
     let v = func.dfg.resolve_aliases(v);
     let ir::ValueDef::Result(inst, 0) = func.dfg.value_def(v) else { return None };
     match func.dfg.insts[inst] {

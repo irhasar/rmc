@@ -13,10 +13,10 @@ use std::borrow::Cow;
 
 use rakit_codegen::ir;
 use rakit_codegen::inline::{Inline, InlineCommand};
-use rustc_data_structures::fx::FxHashMap;
+use std::collections::HashMap as FxHashMap;
 
 /// Largest callee (in RAKIT instructions) we are willing to inline.
-pub(crate) const MAX_CALLEE_INSTS: usize = 128;
+pub const MAX_CALLEE_INSTS: usize = 128;
 
 /// Largest *leaf* callee (no calls of its own) we are willing to inline.
 ///
@@ -32,7 +32,7 @@ pub(crate) const MAX_CALLEE_INSTS: usize = 128;
 /// instructions together, above the old 192 cap, so the loop kept two real calls
 /// per element along with the spill and reload of the iterator state around each
 /// one. Raising the cap lets the loop become straight-line code.
-pub(crate) const MAX_LEAF_INSTS: usize = 384;
+pub const MAX_LEAF_INSTS: usize = 384;
 
 /// Total number of callee instructions we are willing to add to a single caller.
 const INLINE_BUDGET: usize = 512;
@@ -58,7 +58,7 @@ fn hot_calls() -> usize {
 const MIN_GROWTH: usize = 64;
 
 /// Maximum number of times a single callee may be inlined into one caller.
-pub(crate) const MAX_CALLEE_USES: usize = 5;
+pub const MAX_CALLEE_USES: usize = 5;
 
 /// Trivial leaves are exempt from [`MAX_CALLEE_USES`].
 ///
@@ -73,15 +73,15 @@ pub(crate) const MAX_CALLEE_USES: usize = 5;
 /// bounds-checked loop lowers to (`__iterator_get_unchecked`) are 12-13 RAKIT
 /// instructions, just above the smaller value; inlining them removed the last
 /// calls from the hot blur loops and was worth another 16%.
-pub(crate) const TRIVIAL_LEAF_INSTS: usize = 16;
+pub const TRIVIAL_LEAF_INSTS: usize = 16;
 
 /// `RAKIT_INLINE_TRIVIAL_MAX` overrides [`TRIVIAL_LEAF_INSTS`]; used to bisect.
-pub(crate) fn trivial_leaf_insts() -> usize {
+pub fn trivial_leaf_insts() -> usize {
     crate::tunables::inline_trivial_max_insts()
 }
 
 /// Default growth budget, as a percentage of the caller's instruction count.
-pub(crate) const GROWTH_PCT: usize = 150;
+pub const GROWTH_PCT: usize = 150;
 
 /// `RAKIT_INLINE_USES` overrides [`MAX_CALLEE_USES`] (0 disables inlining); used for bisecting.
 fn max_callee_uses() -> usize {
@@ -89,12 +89,12 @@ fn max_callee_uses() -> usize {
 }
 
 /// `RAKIT_INLINE_MAX` overrides [`MAX_CALLEE_INSTS`] (0 disables inlining); used for bisecting.
-pub(crate) fn max_callee_insts() -> usize {
+pub fn max_callee_insts() -> usize {
     crate::tunables::inline_max_insts()
 }
 
 /// `RAKIT_INLINE_LEAF_MAX` overrides [`MAX_LEAF_INSTS`].
-pub(crate) fn max_leaf_insts() -> usize {
+pub fn max_leaf_insts() -> usize {
     crate::tunables::inline_leaf_max_insts()
 }
 
@@ -122,7 +122,7 @@ fn is_leaf(body: &ir::Function) -> bool {
     })
 }
 
-pub(crate) struct CguInliner<'a> {
+pub struct CguInliner<'a> {
     bodies: &'a CguBodies,
     self_id: u32,
     inlined: FxHashMap<u32, usize>,
@@ -142,7 +142,7 @@ pub(crate) struct CguInliner<'a> {
 /// into the same scan repeated hundreds of times per function; measuring showed
 /// the scan, not the inlining itself, as the dominant cost of the pass.
 #[derive(Default)]
-pub(crate) struct CguBodies {
+pub struct CguBodies {
     funcs: FxHashMap<u32, CguBody>,
 }
 
@@ -156,7 +156,7 @@ impl CguBodies {
     ///
     /// Only small, final (non-interposable) callees are kept, to bound memory and
     /// to avoid changing the semantics of separately compiled symbols.
-    pub(crate) fn collect<'f>(
+    pub fn collect<'f>(
         funcs: impl Iterator<Item = (u32, &'f ir::Function)>,
         max_insts: usize,
     ) -> Self {
@@ -170,13 +170,13 @@ impl CguBodies {
         CguBodies { funcs: out }
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.funcs.is_empty()
     }
 }
 
 impl<'a> CguInliner<'a> {
-    pub(crate) fn new(bodies: &'a CguBodies, self_id: u32, caller: &ir::Function) -> Self {
+    pub fn new(bodies: &'a CguBodies, self_id: u32, caller: &ir::Function) -> Self {
         let caller_insts = caller.dfg.num_insts();
         // `RAKIT_INLINE_MAX=0` keeps its documented meaning: inlining is off,
         // including the leaf tier, so the knob can still bisect it away.
