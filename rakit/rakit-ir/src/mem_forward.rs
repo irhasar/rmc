@@ -165,17 +165,17 @@ pub(crate) fn escaping_slots(func: &Function, defs: &HashMap<Value, Inst>) -> Ve
                     continue;
                 };
                 let address_use = match inst {
-                    Inst::Load(_, _, a, _) => *a == u,
+                    Inst::Load(_, _, a, ..) => *a == u,
                     // A store whose value is the address (possibly through a
                     // copy/offset expression) stores an escaping pointer, even
                     // though the same value is also the address operand.
-                    Inst::Store(_, a, _, v)
+                    Inst::Store(_, a, _, v, _)
                         if *a == *v
                             || address_expr(defs, *a, 0) == address_expr(defs, *v, 0) =>
                     {
                         false
                     }
-                    Inst::Store(_, a, _, _) => *a == u,
+                    Inst::Store(_, a, _, _, _) => *a == u,
                     Inst::Copy(_, _, _) => result_addr.is_some(),
                     Inst::Bin(_, BinOp::Add, _, _, _) => result_addr.is_some(),
                     Inst::Select(_, _, _, _, _) => result_addr.is_some(),
@@ -245,7 +245,7 @@ fn forward(func: &mut Function) -> bool {
 
     for blk in &func.blocks {
         for inst in &blk.insts {
-            if let Inst::Store(ty, addr, offset, _) = inst {
+            if let Inst::Store(ty, addr, offset, _, _) = inst {
                 let Some(key) = key_of(&defs, func, *addr, *offset, *ty) else {
                     return false;
                 };
@@ -282,7 +282,7 @@ fn forward(func: &mut Function) -> bool {
 
         for (ii, inst) in func.blocks[bi].insts.iter().enumerate() {
             match inst {
-                Inst::Load(r, ty, addr, offset) => {
+                Inst::Load(r, ty, addr, offset, _) => {
                     if let Some(key) = key_of(&defs, func, *addr, *offset, *ty) {
                         if let Some(&(value, value_ty)) = facts.get(&key) {
                             if value_ty == *ty {
@@ -291,7 +291,7 @@ fn forward(func: &mut Function) -> bool {
                         }
                     }
                 }
-                Inst::Store(ty, addr, offset, value) => {
+                Inst::Store(ty, addr, offset, value, _) => {
                     if let Some(key) = key_of(&defs, func, *addr, *offset, *ty) {
                         kill(&mut facts, key, *ty);
                         facts.insert(key, (*value, *ty));
@@ -411,7 +411,7 @@ fn block_effects(func: &Function, defs: &HashMap<Value, Inst>, bi: usize) -> Eff
     let mut defined = SlotRanges::new();
     for inst in &func.blocks[bi].insts {
         match inst {
-            Inst::Load(_, ty, addr, offset) => {
+            Inst::Load(_, ty, addr, offset, _) => {
                 if let Some(key) = key_of(defs, func, *addr, *offset, *ty) {
                     let slot = key.slot();
                     let (start, end) = key_range(func, key, *ty);
@@ -430,7 +430,7 @@ fn block_effects(func: &Function, defs: &HashMap<Value, Inst>, bi: usize) -> Eff
                     }
                 }
             }
-            Inst::Store(ty, addr, offset, _) => {
+            Inst::Store(ty, addr, offset, _, _) => {
                 if let Some(key) = key_of(defs, func, *addr, *offset, *ty) {
                     if matches!(key, Key::Dyn { .. }) {
                         // A dynamic store may write only part of the slot, so it
@@ -454,7 +454,7 @@ fn dse(func: &mut Function) -> bool {
     for blk in &func.blocks {
         for inst in &blk.insts {
             match inst {
-                Inst::Load(_, ty, addr, offset) => {
+                Inst::Load(_, ty, addr, offset, _) => {
                     let Some(key) = key_of(&defs, func, *addr, *offset, *ty) else {
                         return false;
                     };
@@ -462,7 +462,7 @@ fn dse(func: &mut Function) -> bool {
                         return false;
                     }
                 }
-                Inst::Store(ty, addr, offset, _) => {
+                Inst::Store(ty, addr, offset, _, _) => {
                     let Some(key) = key_of(&defs, func, *addr, *offset, *ty) else {
                         return false;
                     };
@@ -515,13 +515,13 @@ fn dse(func: &mut Function) -> bool {
         while ii > 0 {
             ii -= 1;
             match &func.blocks[bi].insts[ii] {
-                Inst::Load(_, ty, addr, offset) => {
+                Inst::Load(_, ty, addr, offset, _) => {
                     if let Some(key) = key_of(&defs, func, *addr, *offset, *ty) {
                         let (start, end) = key_range(func, key, *ty);
                         add_slot(&mut live, key.slot(), start, end);
                     }
                 }
-                Inst::Store(ty, addr, offset, _) => {
+                Inst::Store(ty, addr, offset, _, _) => {
                     if let Some(key) = key_of(&defs, func, *addr, *offset, *ty) {
                         let (start, end) = key_range(func, key, *ty);
                         let slot = key.slot();

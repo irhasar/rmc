@@ -26,7 +26,8 @@ use rakit_ir::{
     ExceptionItem as RirExceptionItem, External as RirExternal,
     ExternalTarget as RirExternalTarget, FloatCc as RirFloatCc, Function as RirFunction,
     GlobalData as RirGlobalData, Inst as RirInst, IntCc as RirIntCc,
-    StackSlot as RirStackSlot, TryArg as RirTryArg, TryBlockCall as RirTryBlockCall,
+    MemFlags as RirMemFlags, StackSlot as RirStackSlot, TryArg as RirTryArg,
+    TryBlockCall as RirTryBlockCall,
     Type as RirType, UnOp as RirUnOp, Value as RirValue,
 };
 
@@ -275,7 +276,8 @@ pub fn import(func: &CgFunction) -> Option<RirFunction> {
                     let r = single_result(func, inst)?;
                     let ty = map_type_to_rir(func.dfg.value_type(r))?;
                     let addr = lookup(func, &vmap, arg)?;
-                    let v = builder.load(rb, ty, addr, offset.into());
+                    let flags = RirMemFlags(func.dfg.mem_flags[flags].bits());
+                    let v = builder.load_with_flags(rb, ty, addr, offset.into(), flags);
                     map_value(func, &mut vmap, r, v);
                 }
                 InstructionData::LoadNoOffset { opcode: Opcode::Load, arg, flags } => {
@@ -285,7 +287,8 @@ pub fn import(func: &CgFunction) -> Option<RirFunction> {
                     let r = single_result(func, inst)?;
                     let ty = map_type_to_rir(func.dfg.value_type(r))?;
                     let addr = lookup(func, &vmap, arg)?;
-                    let v = builder.load(rb, ty, addr, 0);
+                    let flags = RirMemFlags(func.dfg.mem_flags[flags].bits());
+                    let v = builder.load_with_flags(rb, ty, addr, 0, flags);
                     map_value(func, &mut vmap, r, v);
                 }
                 InstructionData::Store { opcode: Opcode::Store, args, offset, flags } => {
@@ -295,7 +298,8 @@ pub fn import(func: &CgFunction) -> Option<RirFunction> {
                     let ty = map_type_to_rir(func.dfg.value_type(args[0]))?;
                     let value = as_int(&mut builder, rb, lookup(func, &vmap, args[0])?, ty);
                     let addr = lookup(func, &vmap, args[1])?;
-                    builder.store(rb, ty, addr, offset.into(), value);
+                    let flags = RirMemFlags(func.dfg.mem_flags[flags].bits());
+                    builder.store_with_flags(rb, ty, addr, offset.into(), value, flags);
                 }
                 InstructionData::StoreNoOffset { opcode: Opcode::Store, args, flags } => {
                     if !memory_flags_supported(func, flags) {
@@ -304,7 +308,8 @@ pub fn import(func: &CgFunction) -> Option<RirFunction> {
                     let ty = map_type_to_rir(func.dfg.value_type(args[0]))?;
                     let value = as_int(&mut builder, rb, lookup(func, &vmap, args[0])?, ty);
                     let addr = lookup(func, &vmap, args[1])?;
-                    builder.store(rb, ty, addr, 0, value);
+                    let flags = RirMemFlags(func.dfg.mem_flags[flags].bits());
+                    builder.store_with_flags(rb, ty, addr, 0, value, flags);
                 }
                 InstructionData::Call { func_ref, args, .. } => {
                     let ext_data = &func.dfg.ext_funcs[func_ref];
@@ -912,9 +917,13 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<CgFunction> {
                     func.layout.append_inst(ci, cb);
                     vmap.insert(*r, func.dfg.inst_results(ci)[0]);
                 }
-                RirInst::Load(r, ty, addr, offset) => {
+                RirInst::Load(r, ty, addr, offset, flags) => {
                     let ct = map_type_to_cg(*ty)?;
-                    let flags = func.dfg.mem_flags.insert(MemFlagsData::new()).ok()?;
+                    let flags = func
+                        .dfg
+                        .mem_flags
+                        .insert(MemFlagsData::from_bits(flags.0))
+                        .ok()?;
                     let ci = func.dfg.make_inst(InstructionData::Load {
                         opcode: Opcode::Load,
                         flags,
@@ -927,9 +936,13 @@ pub fn export(rir: &RirFunction, sig: &Signature) -> Option<CgFunction> {
                     func.layout.append_inst(ci, cb);
                     vmap.insert(*r, func.dfg.inst_results(ci)[0]);
                 }
-                RirInst::Store(ty, addr, offset, value) => {
+                RirInst::Store(ty, addr, offset, value, flags) => {
                     let _ = map_type_to_cg(*ty)?;
-                    let flags = func.dfg.mem_flags.insert(MemFlagsData::new()).ok()?;
+                    let flags = func
+                        .dfg
+                        .mem_flags
+                        .insert(MemFlagsData::from_bits(flags.0))
+                        .ok()?;
                     let ci = func.dfg.make_inst(InstructionData::Store {
                         opcode: Opcode::Store,
                         flags,
@@ -1982,6 +1995,56 @@ mod tests {
         let out = export(&rir, &f.signature).expect("export");
         let rir2 = import(&out).expect("re-import");
         assert_eq!(run(&rir2, &[Val::I(42)]).unwrap(), vec![Val::I(42)]);
+    }
+
+    #[test]
+    fn memory_flags_roundtrip() {
+        let (mut f, e) = new_func(&[types::I64], &[types::I64]);
+        let x = f.dfg.block_params(e)[0];
+        let slot = stack_slot(&mut f, 16, 3);
+        let addr = stack_addr(&mut f, e, slot, 0);
+        let flags_data = MemFlagsData::trusted().with_readonly().with_can_move();
+        let flags = f.dfg.mem_flags.insert(flags_data).unwrap();
+        let store = f.dfg.make_inst(InstructionData::Store {
+            opcode: Opcode::Store,
+            flags,
+            args: [x, addr],
+            offset: 0.into(),
+        });
+        f.layout.append_inst(store, e);
+        let load = f.dfg.make_inst(InstructionData::Load {
+            opcode: Opcode::Load,
+            flags,
+            arg: addr,
+            offset: 0.into(),
+        });
+        assert_eq!(f.dfg.make_inst_results(load, types::I64), 1);
+        f.layout.append_inst(load, e);
+        let y = f.dfg.inst_results(load)[0];
+        ret(&mut f, e, &[y]);
+
+        let rir = import(&f).expect("import");
+        let expected = RirMemFlags(flags_data.bits());
+        assert!(rir.blocks.iter().flat_map(|b| &b.insts).any(|inst| {
+            matches!(inst, RirInst::Store(.., flags) if *flags == expected)
+        }));
+        assert!(rir.blocks.iter().flat_map(|b| &b.insts).any(|inst| {
+            matches!(inst, RirInst::Load(.., flags) if *flags == expected)
+        }));
+
+        let out = export(&rir, &f.signature).expect("export");
+        let bits: Vec<u16> = out
+            .layout
+            .blocks()
+            .flat_map(|b| out.layout.block_insts(b))
+            .filter_map(|inst| match out.dfg.insts[inst] {
+                InstructionData::Store { flags, .. } | InstructionData::Load { flags, .. } => {
+                    Some(out.dfg.mem_flags[flags].bits())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bits, vec![expected.0, expected.0]);
     }
 
     #[test]

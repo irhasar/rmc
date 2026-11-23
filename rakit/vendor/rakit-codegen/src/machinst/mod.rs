@@ -108,6 +108,16 @@ pub struct MachMemFlags {
 }
 
 impl MachMemFlags {
+    /// Return the raw bit representation.
+    pub const fn bits(self) -> u16 {
+        self.bits
+    }
+
+    /// Reconstruct flags from a raw bit representation.
+    pub const fn from_bits(bits: u16) -> Self {
+        Self { bits }
+    }
+
     /// Create a new empty set of flags.
     pub const fn new() -> Self {
         Self { bits: 0 }.with_trap_code(Some(TrapCode::HEAP_OUT_OF_BOUNDS))

@@ -204,7 +204,7 @@ pub fn verify(func: &Function) -> Result<(), Vec<String>> {
                         errs.push(format!("stack address {r:?} is not I64"));
                     }
                 }
-                Inst::Load(r, ty, addr, _) => {
+                Inst::Load(r, ty, addr, _, _) => {
                     if !ty_of(*addr).map(|t| t.is_int()).unwrap_or(false) {
                         errs.push(format!("load address {addr:?} is not an integer pointer"));
                     }
@@ -317,7 +317,7 @@ pub fn verify(func: &Function) -> Result<(), Vec<String>> {
                     check_try_call(&mut errs, func, normal, rets, ty_of);
                     check_exception(&mut errs, func, exception, rets, ty_of);
                 }
-                Inst::Store(ty, addr, _, value) => {
+                Inst::Store(ty, addr, _, value, _) => {
                     if !ty_of(*addr).map(|t| t.is_int()).unwrap_or(false) {
                         errs.push(format!("store address {addr:?} is not an integer pointer"));
                     }

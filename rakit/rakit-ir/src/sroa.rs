@@ -117,7 +117,7 @@ fn promote_slot(func: &mut Function, target: u32) -> bool {
     for (bi, block) in func.blocks.iter().enumerate() {
         for inst in &block.insts {
             match inst {
-                Inst::Load(_, ty, addr, offset) => {
+                Inst::Load(_, ty, addr, offset, _) => {
                     let Some(key) = key_of(&defs, func, *addr, *offset, *ty) else {
                         continue;
                     };
@@ -129,7 +129,7 @@ fn promote_slot(func: &mut Function, target: u32) -> bool {
                         access_blocks.insert(bi);
                     }
                 }
-                Inst::Store(ty, addr, offset, value) => {
+                Inst::Store(ty, addr, offset, value, _) => {
                     if func.ty(*value) != *ty {
                         continue;
                     }
@@ -328,7 +328,7 @@ impl Renamer<'_> {
         let mut insts = Vec::with_capacity(old_insts.len());
         for inst in old_insts {
             match &inst {
-                Inst::Load(r, ty, addr, offset) => {
+                Inst::Load(r, ty, addr, offset, _) => {
                     if let Some(key) = key_of(&self.defs, self.func, *addr, *offset, *ty) {
                         if let Some(loc) = access_loc(self.func, key, self.target, *ty) {
                             let Some(value) = self.current.get(&loc).copied() else {
@@ -343,7 +343,7 @@ impl Renamer<'_> {
                     }
                     insts.push(inst);
                 }
-                Inst::Store(ty, addr, offset, value) => {
+                Inst::Store(ty, addr, offset, value, _) => {
                     if self.func.ty(*value) != *ty {
                         insts.push(inst);
                         continue;

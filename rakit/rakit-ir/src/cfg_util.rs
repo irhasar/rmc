@@ -254,7 +254,7 @@ fn remap_inst_values(inst: &mut Inst, map: &[Option<Value>]) {
         | Inst::Fcmp(v, _, _, _, _)
         | Inst::Select(v, _, _, _, _)
         | Inst::StackAddr(v, _, _)
-        | Inst::Load(v, _, _, _)
+        | Inst::Load(v, ..)
         | Inst::GlobalValue(v, _)
         | Inst::FuncAddr(v, _)
         | Inst::DynamicStackAddr(v, _) => r(map, v),
@@ -286,7 +286,7 @@ fn remap_inst_values(inst: &mut Inst, map: &[Option<Value>]) {
             r(map, x);
             r(map, y);
         }
-        Inst::Load(_, _, a, _) => r(map, a),
+        Inst::Load(_, _, a, ..) => r(map, a),
         Inst::Call(_, _, args) => {
             for a in args {
                 r(map, a);
@@ -326,7 +326,7 @@ fn remap_inst_values(inst: &mut Inst, map: &[Option<Value>]) {
                 }
             }
         }
-        Inst::Store(_, a, _, v) => {
+        Inst::Store(_, a, _, v, _) => {
             r(map, a);
             r(map, v);
         }

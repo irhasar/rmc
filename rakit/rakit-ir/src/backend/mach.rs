@@ -7,7 +7,7 @@ use std::fmt;
 
 use crate::ir::{
     BinOp, Block, BlockData, DynamicSlotData, DynamicTypeData, External, Function, GlobalData, Inst,
-    IntCc, StackSlot, StackSlotData, Type, Value,
+    IntCc, MemFlags, StackSlot, StackSlotData, Type, Value,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -94,8 +94,8 @@ pub enum MachInst {
     Jmp { target: usize },
     Ret { value: Option<Operand> },
     StackAddr { dst: Operand, slot: StackSlot, offset: i32 },
-    Load { dst: Operand, addr: Operand, offset: i32, ty: Type },
-    Store { addr: Operand, offset: i32, value: Operand, ty: Type },
+    Load { dst: Operand, addr: Operand, offset: i32, ty: Type, flags: MemFlags },
+    Store { addr: Operand, offset: i32, value: Operand, ty: Type, flags: MemFlags },
     Call { results: Vec<Operand>, target: u32, args: Vec<Operand> },
     CallIndirect {
         results: Vec<Operand>,
@@ -493,15 +493,15 @@ pub fn to_rir(mach: &MachFunction) -> Result<Function, String> {
                     let d = value_of(&mut func, rb, &vmap, *dst)?;
                     func.blocks[bi].insts.push(Inst::StackAddr(d, *slot, *offset));
                 }
-                MachInst::Load { dst, addr, offset, ty } => {
+                MachInst::Load { dst, addr, offset, ty, flags } => {
                     let d = value_of(&mut func, rb, &vmap, *dst)?;
                     let a = value_of(&mut func, rb, &vmap, *addr)?;
-                    func.blocks[bi].insts.push(Inst::Load(d, *ty, a, *offset));
+                    func.blocks[bi].insts.push(Inst::Load(d, *ty, a, *offset, *flags));
                 }
-                MachInst::Store { addr, offset, value, ty } => {
+                MachInst::Store { addr, offset, value, ty, flags } => {
                     let a = value_of(&mut func, rb, &vmap, *addr)?;
                     let v = value_of(&mut func, rb, &vmap, *value)?;
-                    func.blocks[bi].insts.push(Inst::Store(*ty, a, *offset, v));
+                    func.blocks[bi].insts.push(Inst::Store(*ty, a, *offset, v, *flags));
                 }
                 MachInst::Call { results, target, args } => {
                     let results = results

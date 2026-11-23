@@ -3108,20 +3108,56 @@ sebelumnya. Yang bisa diperbaiki tanpa mengubah arah proyek sudah mendarat:
   ada blok preheader baru dan SSA dominance tetap terjaga. `serde_json 1.0.154`
   + `regex` kini dikompilasi tanpa `RAKIT_NO_LICM=1`; jalur u64 berjalan, tetapi
   serialisasi `f64` masih abort karena `pmulhu.w` belum didukung.
-- **Intrinsik SSE2 `pmulhu.w` belum ada.** Program yang mencetak `f64` lewat
-  formatter serde_json masih abort di runtime. Ini warisan cg_clif dan perlu
-  implementasi intrinsik, bukan perbaikan pass.
-- **Jembatan RIR membuang `MemFlags`.** Load/store diekspor ulang dengan
-  `MemFlagsData::new()`, sehingga `notrap`/`aligned`/`readonly` hilang. Ini
-  perubahan tipe `RIR Inst::Load/Store` dan seluruh pass; belum dikerjakan.
-- **Transformasi ganda dan biaya RIR.** Pipeline masih menjalankan rec_loop,
-  inliner, div_test, if_convert, sincos di RIR lalu lagi di CLIF. `if_convert`
-  RIR juga mengubah cabang `if sum > 1e9` menjadi `cmov` yang memperlambat
-  `forloops` (1,09 → 1,93 ms). Ini keputusan arsitektur (satu implementasi per
-  transformasi, cost model prediktabilitas), bukan tambalan kecil.
+- **Intrinsik SSE2 `pmulhu.w` (DIPERBAIKI).** Lowering baru di
+  `src/intrinsics/llvm_x86.rs` menghitung high 16 bit dari perkalian unsigned
+  16x16 per lane (`uextend → imul → ushr 16 → ireduce`), untuk SSE2 dan AVX2.
+  `serde_json 1.0.154` yang menyerialisasi `f64` kini berjalan; sebelumnya abort
+  dengan `llvm.x86.sse2.pmulhu.w is not yet supported`. Regresi
+  `bench/tests/t_pmulhu.rs` mencakup lane nol, overflow, dan nilai tinggi.
+- **Jembatan RIR membuang `MemFlags` (DIPERBAIKI).** `RIR Inst::Load/Store`
+  sekarang membawa `MemFlags(u16)`; bridge mengekspor `MemFlagsData::bits()` dan
+  mengimpor `MemFlagsData::from_bits()`. Pass RIR yang tidak memahami flag tetap
+  meneruskannya. Alias-region tidak termasuk bit dan sengaja dilepas (lebih
+  konservatif, aman). Test `memory_flags_roundtrip` memeriksa round-trip
+  `trusted + readonly + can_move`.
+- **Transformasi ganda dan biaya RIR (DIPERBAIKI).** rec_loop, inliner,
+  div_test, if_convert, dan sincos versi RIR kini **opt-in**; implementasi CLIF
+  yang memiliki cost model menjadi pemilik default. `RAKIT_RIR_DUPLICATE=1`
+  mengaktifkan semuanya untuk eksperimen, atau pilih satu dengan
+  `RAKIT_RIR_{REC_LOOP,INLINE,DIVTEST,IFCONV,SINCOS}=1`. Ini menghapus regresi
+  `forloops` akibat if_convert RIR dan kerja pass ganda.
+- **Custom backend aktif secara default (DIPERBAIKI).** `RirSelector` +
+  regalloc sekarang hanya berjalan dengan `RAKIT_CUSTOM_BACKEND=1`; default
+  tidak mengalokasikan atau membuang hasilnya. `RAKIT_NO_CUSTOM_BACKEND` tetap
+  menang.
+- **Benchmark tune tanpa input runtime (DIPERBAIKI).** `bench/heldout/` berisi
+  enam program yang membaca trip count/seed dari argv, dan `bench/heldout.sh`
+  melaporkan matriks compile/run lengkap serta membandingkan output dengan LLVM.
 - **Atribusi backend asal.** Audit meminta nama dan NOTICE backend asal
   dikembalikan. Itu bertentangan dengan permintaan rebrand sebelumnya
   (“tidak ada referensi backend asal”); perlu keputusan eksplisit pemilik repo
   sebelum diubah.
-- **Benchmark tune tanpa input runtime.** p1–p9 masih memakai konstanta; set
-  held-out dan input runtime belum dipisahkan. Perlu harness baru.
+
+
+### 29.4 Implementasi lanjutan audit (2026-11-23)
+
+Lima item audit dikerjakan dan diverifikasi:
+
+1. **`pmulhu.w`.** Lowering SSE2/AVX2 ditambahkan. `t_pmulhu` menghasilkan
+   `0 0 0 0 65534 32767 0 1` identik dengan LLVM; program serde_json `f64`
+   (setelah `cargo clean`, karena rlib lama tidak di-rebuild saat `.so` berubah)
+   mencetak `{"a":1.5,"b":"x"} 1.5 123`.
+2. **`MemFlags` RIR.** Tipe baru `rakit_ir::MemFlags`, method builder
+   `load_with_flags`/`store_with_flags`, bit accessor di
+   `MemFlagsData`/`MachMemFlags`, dan flags di `MachInst::Load/Store`.
+3. **Custom backend.** Gate default berubah menjadi opt-in; tidak ada biaya
+   isel/regalloc saat validasi tidak diminta.
+4. **Pass ganda.** Lima pass RIR duplikat dinonaktifkan secara default; RIR
+   tetap menjalankan simplify/opt/mem_forward/SROA/GVN/LICM yang tidak punya
+   padanan CLIF langsung. `forloops` tidak lagi melewati if_convert RIR.
+5. **Held-out.** `bench/heldout.sh` + `bench/heldout/h_*.rs`; input runtime
+   `n:seed`, output harus sama dengan LLVM, dan semua sumbu compile/run dicatat.
+
+Verifikasi: `./y.sh test --sysroot rakit` → 65 suite `ok`, 0 failed;
+`rakit-codegen` 202 unit test lulus; `bench/regressions.sh` lulus;
+`bench/heldout.sh` lulus untuk enam program. Test `rakit-opt --lib` 26 lulus.

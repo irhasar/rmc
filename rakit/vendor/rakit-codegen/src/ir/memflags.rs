@@ -174,6 +174,21 @@ impl MemFlagsData {
         }
     }
 
+    /// Return the raw backend-facing bits of these flags.
+    pub const fn bits(self) -> u16 {
+        self.flags.bits()
+    }
+
+    /// Reconstruct flags from raw backend-facing bits.
+    ///
+    /// Alias-region metadata is not part of the raw bits and is dropped.
+    pub const fn from_bits(bits: u16) -> Self {
+        Self {
+            flags: MachMemFlags::from_bits(bits),
+            region: no_alias_region(),
+        }
+    }
+
     /// Create a set of flags representing an access from a "trusted" address, meaning it's
     /// known to be aligned and non-trapping.
     pub const fn trusted() -> Self {

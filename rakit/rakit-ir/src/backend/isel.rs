@@ -242,7 +242,7 @@ impl RirSelector {
                             offset: *offset,
                         });
                     }
-                    Inst::Load(r, ty, addr, offset) => {
+                    Inst::Load(r, ty, addr, offset, flags) => {
                         if disabled("RAKIT_NO_CUSTOM_MEM") {
                             return Err(unsupported("memory disabled"));
                         }
@@ -253,9 +253,10 @@ impl RirSelector {
                             addr,
                             offset: *offset,
                             ty: *ty,
+                            flags: *flags,
                         });
                     }
-                    Inst::Store(ty, addr, offset, value) => {
+                    Inst::Store(ty, addr, offset, value, flags) => {
                         if disabled("RAKIT_NO_CUSTOM_MEM") {
                             return Err(unsupported("memory disabled"));
                         }
@@ -266,6 +267,7 @@ impl RirSelector {
                             offset: *offset,
                             value,
                             ty: *ty,
+                            flags: *flags,
                         });
                     }
                     Inst::GlobalValue(r, index) => {

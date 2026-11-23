@@ -341,11 +341,11 @@ fn eval(func: &crate::ir::Function, env: &[Option<Val>], inst: &Inst, mem: &mut 
             }
             Ok(Val::P(addr as u64))
         }
-        Inst::Load(_, ty, addr, offset) => {
+        Inst::Load(_, ty, addr, offset, _) => {
             let base = get(env, *addr)?.as_u64();
             read_scalar(mem, addr_of(base, *offset)?, *ty)
         }
-        Inst::Store(ty, addr, offset, value) => {
+        Inst::Store(ty, addr, offset, value, _) => {
             let base = get(env, *addr)?.as_u64();
             write_scalar(mem, addr_of(base, *offset)?, *ty, get(env, *value)?)?;
             Ok(Val::I(0))

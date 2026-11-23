@@ -36,6 +36,14 @@ pub enum Type {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct StackSlot(pub u32);
 
+/// Raw memory-operation flags carried across the codegen IR bridge.
+///
+/// The bit layout is owned by the codegen layer. RIR only stores and forwards
+/// the value, so `notrap`, `aligned`, `readonly` and `can_move` survive passes
+/// that do not reason about memory flags.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash, Debug)]
+pub struct MemFlags(pub u16);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExternalTarget {
     User { namespace: u32, index: u32 },
@@ -212,10 +220,10 @@ pub enum Inst {
     Select(Value, Type, Value, Value, Value),
     /// Address of a stack slot plus a constant byte offset.
     StackAddr(Value, StackSlot, i32),
-    /// Load a scalar from `addr + offset`.
-    Load(Value, Type, Value, i32),
-    /// Store a scalar to `addr + offset`.
-    Store(Type, Value, i32, Value),
+    /// Load a scalar from `addr + offset` with memory flags.
+    Load(Value, Type, Value, i32, MemFlags),
+    /// Store a scalar to `addr + offset` with memory flags.
+    Store(Type, Value, i32, Value, MemFlags),
     /// Direct external call: results, external index, arguments.
     Call(Vec<Value>, u32, Vec<Value>),
     /// Indirect call: results, parameter types, return types, callee, arguments.
@@ -273,7 +281,7 @@ impl Inst {
             | Inst::Fcmp(v, _, _, _, _)
             | Inst::Select(v, _, _, _, _)
             | Inst::StackAddr(v, _, _)
-            | Inst::Load(v, _, _, _)
+            | Inst::Load(v, ..)
             | Inst::GlobalValue(v, _)
             | Inst::FuncAddr(v, _)
             | Inst::DynamicStackAddr(v, _) => Some(*v),
@@ -324,8 +332,8 @@ impl Inst {
             Inst::Icmp(_, _, _, x, y) => vec![*x, *y],
             Inst::Fcmp(_, _, _, x, y) => vec![*x, *y],
             Inst::Select(_, _, c, x, y) => vec![*c, *x, *y],
-            Inst::Load(_, _, a, _) => vec![*a],
-            Inst::Store(_, a, _, v) => vec![*a, *v],
+            Inst::Load(_, _, a, ..) => vec![*a],
+            Inst::Store(_, a, _, v, _) => vec![*a, *v],
             Inst::Call(_, _, args) => args.clone(),
             Inst::CallIndirect { callee, args, .. } => {
                 let mut v = Vec::with_capacity(args.len() + 1);
@@ -428,8 +436,8 @@ impl Inst {
                 r(x, old, new);
                 r(y, old, new);
             }
-            Inst::Load(_, _, a, _) => r(a, old, new),
-            Inst::Store(_, a, _, v) => {
+            Inst::Load(_, _, a, ..) => r(a, old, new),
+            Inst::Store(_, a, _, v, _) => {
                 r(a, old, new);
                 r(v, old, new);
             }

@@ -1,7 +1,7 @@
 //! An ergonomic builder for Rakit IR functions.
 
 use crate::ir::{
-    BinOp, Block, BlockData, ExceptionItem, FloatCc, Function, Inst, IntCc, StackSlot,
+    BinOp, Block, BlockData, ExceptionItem, FloatCc, Function, Inst, IntCc, MemFlags, StackSlot,
     StackSlotData, TryBlockCall, Type, UnOp, Value,
 };
 
@@ -112,13 +112,36 @@ impl Builder {
     }
 
     pub fn load(&mut self, b: Block, ty: Type, addr: Value, offset: i32) -> Value {
+        self.load_with_flags(b, ty, addr, offset, MemFlags::default())
+    }
+
+    pub fn load_with_flags(
+        &mut self,
+        b: Block,
+        ty: Type,
+        addr: Value,
+        offset: i32,
+        flags: MemFlags,
+    ) -> Value {
         let r = self.new_value(ty);
-        self.push(b, Inst::Load(r, ty, addr, offset));
+        self.push(b, Inst::Load(r, ty, addr, offset, flags));
         r
     }
 
     pub fn store(&mut self, b: Block, ty: Type, addr: Value, offset: i32, value: Value) {
-        self.push(b, Inst::Store(ty, addr, offset, value));
+        self.store_with_flags(b, ty, addr, offset, value, MemFlags::default());
+    }
+
+    pub fn store_with_flags(
+        &mut self,
+        b: Block,
+        ty: Type,
+        addr: Value,
+        offset: i32,
+        value: Value,
+        flags: MemFlags,
+    ) {
+        self.push(b, Inst::Store(ty, addr, offset, value, flags));
     }
 
     pub fn global_value(&mut self, b: Block, index: u32) -> Value {

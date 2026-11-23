@@ -628,6 +628,34 @@ pub(super) fn codegen_x86_llvm_intrinsic_call<'tcx>(
             }
         }
 
+        "llvm.x86.sse2.pmulhu.w" | "llvm.x86.avx2.pmulhu.w" => {
+            // https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=_mm_mulhi_epu16&ig_expand=4783
+            // https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=_mm256_mulhi_epu16&ig_expand=4784
+            intrinsic_args!(fx, args => (a, b); intrinsic);
+
+            assert_eq!(a.layout(), b.layout());
+            let layout = a.layout();
+            let (lane_count, lane_ty) = layout.ty.simd_size_and_type(fx.tcx);
+            let (ret_lane_count, ret_lane_ty) = ret.layout().ty.simd_size_and_type(fx.tcx);
+            assert_eq!(lane_ty, fx.tcx.types.u16);
+            assert_eq!(ret_lane_ty, fx.tcx.types.u16);
+            assert_eq!(lane_count, ret_lane_count);
+
+            let ret_lane_layout = fx.layout_of(fx.tcx.types.u16);
+            for out_lane_idx in 0..lane_count {
+                let a_lane = a.value_lane(fx, out_lane_idx).load_scalar(fx);
+                let a_lane = fx.bcx.ins().uextend(types::I32, a_lane);
+                let b_lane = b.value_lane(fx, out_lane_idx).load_scalar(fx);
+                let b_lane = fx.bcx.ins().uextend(types::I32, b_lane);
+
+                let mul = fx.bcx.ins().imul(a_lane, b_lane);
+                let hi = fx.bcx.ins().ushr_imm_u(mul, 16);
+                let res_lane = fx.bcx.ins().ireduce(types::I16, hi);
+                ret.place_lane(fx, out_lane_idx)
+                    .write_cvalue(fx, CValue::by_val(res_lane, ret_lane_layout));
+            }
+        }
+
         "llvm.x86.ssse3.pmul.hr.sw.128" => {
             // https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=_mm_mulhrs_epi16&ig_expand=4782
             intrinsic_args!(fx, args => (a, b); intrinsic);

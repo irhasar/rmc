@@ -86,8 +86,9 @@ Pass RIR `div_test` (`rakit-ir/src/div_test.rs`) memindahkan fold `x % C == 0`
 ke RIR untuk `I8/I16/I32/I64`: `C` ganjil > 1 memakai `imul x, C^-1` +
 `icmp ule`; `C = 2^s * odd` memakai mask `x & (2^s - 1)` lalu uji `odd`;
 `C` pangkat dua hanya memakai mask. `eq`/`ne` dan kombinasi Bool memakai
-`select`. Dengan `RAKIT_RIR=1 RAKIT_NO_DIVTEST=1`, rewrite ini dikerjakan RIR
-dan output tetap sama. `brif` langsung pada remainder masih ditangani pass CLIF.
+`select`. Pass ini opt-in: `RAKIT_RIR_DIVTEST=1 RAKIT_NO_DIVTEST=1` membuat RIR
+mengerjakan rewrite dan output tetap sama. `brif` langsung pada remainder masih
+ditangani pass CLIF.
 
 Semantik integer RIR (`rakit-ir/src/int_sem.rs`) memakai representasi bit
 zero-extended per lebar tipe: operasi unsigned langsung benar, operasi signed
@@ -99,9 +100,11 @@ dua arm pendek → join/return menjadi `select` di blok head, lalu menghapus arm
 dan nilai yang menjadi mati. Join/return boleh membawa banyak nilai (termasuk
 nol), jadi dua `if` identik yang menghasilkan dua nilai ikut dikonversi.
 Batasannya konservatif: arm tanpa parameter, satu predecessor, maksimal 8
-instruksi, tanpa div/rem, dan nilai arm tidak dipakai di luar arm. Dengan
-`RAKIT_RIR=1 RAKIT_NO_IFCONV=1`, `if c { x + 1 } else { x + 2 }` dikonversi di
-RIR dan output tetap sama.
+instruksi, tanpa div/rem, dan nilai arm tidak dipakai di luar arm. Pass ini
+opt-in: `RAKIT_RIR_IFCONV=1 RAKIT_NO_IFCONV=1` mengonversi `if c { x + 1 } else
+{ x + 2 }` di RIR. Default-nya pass CLIF yang berjalan karena ia memiliki cost
+model prediktabilitas; menjalankan versi RIR secara default sempat memperlambat
+loop bercabang.
 
 Pass `gvn` (`rakit-ir/src/gvn.rs`) melakukan value numbering global: tabel
 ekspresi diwarisi sepanjang dominator tree, jadi instruksi murni duplikat
@@ -174,8 +177,14 @@ antarslot. Interpreter menyediakan callback `run_with` untuk call langsung dan
 `run_with_indirect` untuk call tidak langsung, sehingga semantik call bisa diuji
 tanpa menjalankan kode native.
 
-Pipeline RIR sekarang:
-`simplify → optimize → mem_forward → optimize → sroa → optimize → div_test → if_convert → gvn → licm → sincos → optimize`.
+Pipeline RIR default:
+`simplify → optimize → mem_forward → optimize → sroa → optimize → gvn → licm → optimize`.
+
+Pass `rec_loop`, inliner, `div_test`, `if_convert`, dan `sincos` versi RIR
+adalah duplikat dari pass CLIF dan **opt-in** (`RAKIT_RIR_DUPLICATE=1` untuk
+semuanya, atau `RAKIT_RIR_{REC_LOOP,INLINE,DIVTEST,IFCONV,SINCOS}=1`). Implementasi
+CLIF menjadi pemilik default karena memiliki cost model yang sudah dituning.
+RIR tetap menjadi jalur produksi untuk simplify/opt/mem_forward/SROA/GVN/LICM.
 
 Pass `sincos` (`rakit-ir/src/sincos.rs`) adalah port RIR dari fusi
 `sin`/`cos` → `sincos`/`sincosf`; ia menangani pasangan call dengan argumen

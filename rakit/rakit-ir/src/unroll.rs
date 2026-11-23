@@ -352,12 +352,12 @@ pub(crate) fn remap_inst(
             Inst::Select(nr, *ty, map_value(map, *c), map_value(map, *x), map_value(map, *y))
         }
         Inst::StackAddr(r, s, o) => Inst::StackAddr(new_result(func, src_types, *r, map), *s, *o),
-        Inst::Load(r, ty, a, o) => {
+        Inst::Load(r, ty, a, o, f) => {
             let nr = new_result(func, src_types, *r, map);
-            Inst::Load(nr, *ty, map_value(map, *a), *o)
+            Inst::Load(nr, *ty, map_value(map, *a), *o, *f)
         }
-        Inst::Store(ty, a, o, v) => {
-            Inst::Store(*ty, map_value(map, *a), *o, map_value(map, *v))
+        Inst::Store(ty, a, o, v, f) => {
+            Inst::Store(*ty, map_value(map, *a), *o, map_value(map, *v), *f)
         }
         Inst::Call(results, target, args) => {
             let nr = results.iter().map(|r| new_result(func, src_types, *r, map)).collect();

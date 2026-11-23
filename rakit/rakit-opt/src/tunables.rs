@@ -30,12 +30,14 @@ pub fn rir_enabled(_crate_name: &str, _user_crate: bool) -> bool {
     *V.get_or_init(|| !flag("RAKIT_NO_RIR"))
 }
 
-/// Whether the Phase 3 custom ISel/regalloc runs after RIR passes
-/// (`RAKIT_CUSTOM_BACKEND` on). It validates the RIR through the machine-IR
-/// backend but does not replace codegen IR emission.
+/// Whether the Phase 3 custom ISel/regalloc runs after RIR passes.
+///
+/// Off by default: it is a validation/experiment path, not the production
+/// emitter. Enable with `RAKIT_CUSTOM_BACKEND=1`; `RAKIT_NO_CUSTOM_BACKEND`
+/// always wins.
 pub fn custom_backend_enabled() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| !flag("RAKIT_NO_CUSTOM_BACKEND"))
+    *V.get_or_init(|| !flag("RAKIT_NO_CUSTOM_BACKEND") && flag("RAKIT_CUSTOM_BACKEND"))
 }
 
 /// Whether RIR SROA runs.  The default tier promotes only whole scalar slots
@@ -46,16 +48,26 @@ pub fn rir_sroa_enabled() -> bool {
     *V.get_or_init(|| !flag("RAKIT_NO_RIR_SROA"))
 }
 
-/// Whether RIR `rec_loop` runs (`RAKIT_NO_RIR_REC_LOOP` off).
+/// Whether RIR `rec_loop` runs.
+///
+/// Off by default: the codegen-IR pass owns this transform. `RAKIT_RIR_DUPLICATE`
+/// enables every RIR duplicate pass for experiments; `RAKIT_RIR_REC_LOOP=1`
+/// enables only this one. `RAKIT_NO_RIR_REC_LOOP` always wins.
 pub fn rir_rec_loop_enabled() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| !flag("RAKIT_NO_RIR_REC_LOOP"))
+    *V.get_or_init(|| {
+        !flag("RAKIT_NO_RIR_REC_LOOP")
+            && (flag("RAKIT_RIR_DUPLICATE") || flag("RAKIT_RIR_REC_LOOP"))
+    })
 }
 
-/// Whether the RIR inliner runs (`RAKIT_NO_RIR_INLINE` off).
+/// Whether the RIR inliner runs. Off by default; see [`rir_rec_loop_enabled`].
 pub fn rir_inline_enabled() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| !flag("RAKIT_NO_RIR_INLINE"))
+    *V.get_or_init(|| {
+        !flag("RAKIT_NO_RIR_INLINE")
+            && (flag("RAKIT_RIR_DUPLICATE") || flag("RAKIT_RIR_INLINE"))
+    })
 }
 
 /// Whether RIR loop unrolling runs. Off by default: the codegen IR unroller
@@ -66,10 +78,36 @@ pub fn rir_unroll_enabled() -> bool {
     *V.get_or_init(|| flag("RAKIT_RIR_UNROLL"))
 }
 
-/// Whether RIR `sincos` fusion runs (`RAKIT_NO_RIR_SINCOS` off).
+/// Whether RIR `sincos` fusion runs. Off by default; see [`rir_rec_loop_enabled`].
 pub fn rir_sincos_enabled() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| !flag("RAKIT_NO_RIR_SINCOS"))
+    *V.get_or_init(|| {
+        !flag("RAKIT_NO_RIR_SINCOS")
+            && (flag("RAKIT_RIR_DUPLICATE") || flag("RAKIT_RIR_SINCOS"))
+    })
+}
+
+/// Whether the RIR divisibility-test pass runs. Off by default; see
+/// [`rir_rec_loop_enabled`].
+pub fn rir_div_test_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        !flag("RAKIT_NO_RIR_DIVTEST")
+            && (flag("RAKIT_RIR_DUPLICATE") || flag("RAKIT_RIR_DIVTEST"))
+    })
+}
+
+/// Whether RIR if-conversion runs. Off by default; see [`rir_rec_loop_enabled`].
+///
+/// The codegen-IR implementation has the predictability/speculation cost model
+/// and owns this transform. Running the RIR version as well duplicated the work
+/// and regressed branch-heavy loops.
+pub fn rir_if_convert_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        !flag("RAKIT_NO_RIR_IFCONV")
+            && (flag("RAKIT_RIR_DUPLICATE") || flag("RAKIT_RIR_IFCONV"))
+    })
 }
 
 /// Whether the divisibility-test pass runs at all (`RAKIT_NO_DIVTEST` off).

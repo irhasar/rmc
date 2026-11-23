@@ -179,7 +179,8 @@ impl Pass for RirPass<'_> {
         if debug && sroa_changed {
             eprintln!("[rir] sroa fired {:?}", pctx.ctx.func.name);
         }
-        let div_changed = rakit_ir::div_test::run(&mut rir_func);
+        let div_changed =
+            crate::tunables::rir_div_test_enabled() && rakit_ir::div_test::run(&mut rir_func);
         if div_changed {
             rakit_ir::optimize(&mut rir_func);
             changed = true;
@@ -190,7 +191,8 @@ impl Pass for RirPass<'_> {
         if debug && div_changed {
             eprintln!("[rir] div_test fired");
         }
-        let ifconv_changed = rakit_ir::if_convert::run(&mut rir_func);
+        let ifconv_changed =
+            crate::tunables::rir_if_convert_enabled() && rakit_ir::if_convert::run(&mut rir_func);
         if ifconv_changed {
             rakit_ir::optimize(&mut rir_func);
             changed = true;

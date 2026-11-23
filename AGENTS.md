@@ -1,3 +1,24 @@
+## Session (2026-11-23, audit iteration 3) — five audit fixes
+- **`pmulhu.w` landed** in `src/intrinsics/llvm_x86.rs` (SSE2 + AVX2):
+  per-lane `uextend i32 -> imul -> ushr 16 -> ireduce i16`. `serde_json` f64
+  now runs after a `cargo clean` (old rlibs cache the old lowering). Regression:
+  `bench/tests/t_pmulhu.rs`.
+- **RIR `MemFlags` preserved.** `rakit_ir::MemFlags(u16)` is carried on
+  `Inst::Load/Store`; `MemFlagsData::bits/from_bits` and
+  `MachMemFlags::bits/from_bits` expose the raw bits. Alias regions are dropped
+  (conservative). Test: `memory_flags_roundtrip`.
+- **Custom backend opt-in.** `custom_backend_enabled()` now requires
+  `RAKIT_CUSTOM_BACKEND`; `RAKIT_NO_CUSTOM_BACKEND` still wins.
+- **Duplicate RIR passes off by default.** rec_loop, inliner, div_test,
+  if_convert, sincos RIR versions require `RAKIT_RIR_DUPLICATE` or the specific
+  `RAKIT_RIR_*` flag. CLIF owns them (has the cost model); this removes the
+  `forloops` if_convert regression. RIR-only passes (simplify, opt,
+  mem_forward, SROA, GVN, LICM) still run.
+- **Held-out harness.** `bench/heldout.sh` and `bench/heldout/h_*.rs` use
+  runtime `n:seed`; full compile/run axes and LLVM output comparison.
+- Verification: full `./y.sh test --sysroot rakit` 65 suites / 0 failed;
+  `rakit-codegen` 202; `rakit-opt` 26; regressions and heldout pass.
+
 ## Session (2026-11-23, audit iteration 2) — RIR production path
 - **RIR now covers std crates.** `tunables::rir_enabled` returns true for all
   crates, not only user executables. Forcing a core rebuild with
